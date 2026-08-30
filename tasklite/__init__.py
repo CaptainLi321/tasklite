@@ -4,7 +4,7 @@ A lightweight, battle-hardened task orchestration engine with zero external
 dependencies, process isolation, and ACID persistence.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # Public API - Core
 from .models.context import TaskContext
