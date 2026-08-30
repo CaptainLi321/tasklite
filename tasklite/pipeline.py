@@ -1,0 +1,914 @@
+"""Core pipeline engine for tasklite."""
+
+import logging
+import math
+import multiprocessing as mp
+import pickle
+import signal
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+
+from .backend.base import AbstractStateBackend, classify_error_type
+from .backend.sqlite_backend import SQLiteStateBackend
+from .models.context import TaskContext
+from .engine.executor import ExecutionResult, MultiprocessingExecutor
+from .engine.completion import CompletionMachine
+from .engine.dispatch import DispatchMachine
+from .engine.failure import FailureMachine
+from .engine.inflight import InFlightJob as _InFlightJob
+from .engine.loop import LoopRunner
+from .engine.recovery import RecoveryMachine
+from .engine.resource import CapacityResource, Resource
+from .engine.retry import apply_discovery_rerun, rerun_skips
+from .engine.runtime import (
+    META_RESOURCE_SUSPENDS as _META_RESOURCE_SUSPENDS,
+    RunContext, StopMode, TaskStats, WORKER_RESOURCE, inject_worker_resource,
+    RT_BACKOFF_UNTIL,
+    RT_BACKOFF_WALL_DEADLINE,
+)
+from .engine.scheduler import JobScheduler
+from .exceptions import (
+    TransientRegistry, _CommitCrashSignal, _JobTerminated,
+)
+from .models.job import Job
+from .models.state import PipelineState, uid_from_job_dict
+from .utils.jsonutil import dumps, loads
+from .utils.lockfile import release_lock, try_acquire_lock
+from .utils.validation import validate_resource_amounts
+
+logger = logging.getLogger("tasklite")
+
+
+class DLQEntry(NamedTuple):
+    """DLQ 只读查询（``pipeline.list_dlq()``）返回的结构化条目。
+
+    - ``error_type``：结构化分类（fatal / dependency / deadlock /
+      transient_exhausted / no_handler / validation / commit_failure /
+      dispatch / unknown）。
+    - ``error``：原始错误消息/错误码。
+    - ``attempts``：写入 DLQ 的次数（``_attempt`` 计数）。
+    - ``failed_at``：最近一次失败时间（UTC ISO 8601；历史行可能为 None）。
+    - ``meta``：完整 DLQ payload（只读视图）。
+    """
+
+    uid: str
+    error_type: str
+    error: str
+    attempts: int
+    failed_at: Optional[str]
+    meta: Dict[str, Any]
+
+
+class HandlerEntry(NamedTuple):
+    """注册 handler 的结构化条目——调度器与派发路径按字段名访问。"""
+    func: Callable
+    default_resources: Dict[str, float]
+    payload_schema: Optional[type]
+
+_BACKEND_SQLITE = "sqlite"
+
+# 内部 worker 资源名：每个 job 默认占用 1 个 worker 槽位。
+# 通过 CapacityResource 实现，复用现有资源调度逻辑控制并发度。
+# 常量本体在 engine.runtime（机器模块不反向 import pipeline）。
+_DEFAULT_MAX_WORKERS = 4
+
+
+class TaskLite:
+    """Main pipeline orchestrator for task execution."""
+
+    def __init__(
+        self,
+        name: str,
+        state_dir: Union[str, Path],
+        backend: Union[str, AbstractStateBackend] = "sqlite",
+        output_root: Union[str, Path, Sequence[Union[str, Path]], None] = None,
+        max_workers: int = _DEFAULT_MAX_WORKERS,
+        on_run_start: Optional[Callable[[], None]] = None,
+        on_run_end: Optional[Callable[[str], None]] = None,
+        on_job_completed: Optional[Callable[[str, dict, bool, bool], None]] = None,
+        strict_picklable: bool = False,
+        fatal_exceptions: Optional[tuple] = None,
+        transient_exceptions: Optional[tuple] = None,
+        dep_grace_seconds: Optional[float] = None,
+        commit_failure_dlq_threshold: Optional[int] = None,
+        deadlock_gap_max_rounds: Optional[int] = None,
+    ):
+        """Initialize the pipeline.
+
+        Args:
+            name: Pipeline name, used for state file naming (e.g. ``{name}_state.db``).
+            state_dir: Directory for persistent state files. Created if not exists.
+            backend: ``"sqlite"`` (default) or an ``AbstractStateBackend`` instance.
+                Production must use ``"sqlite"`` for ACID guarantees.
+            output_root: Root directory for declared outputs. If set, ``declare_output``
+                paths are sandboxed under this root. If ``None``, no sandboxing.
+            max_workers: Max concurrent subprocesses. Implemented as internal
+                ``CapacityResource("__workers__", N)``; override via ``add_resource``.
+            on_run_start: 生命周期钩子——run() 开始前同步调用（无参数）。
+            on_run_end: 生命周期钩子——run() 结束时调用（统一 finally，
+                覆盖正常/中断/崩溃全部退出路径），参数为 exit_reason:
+                ``"completed"`` | ``"stopped_draining"``（stop 请求，等完
+                在途后退出）| ``"stopped_aborting"``（stop(force)/二次信号，
+                强杀在途立即退出）| ``"interrupted"`` | ``"error"``。
+            on_job_completed: 生命周期钩子——每次 attempt 完成时同步调用
+                （同一 job 跨重试生命周期会触发多次），参数 (uid, result_meta,
+                success, going_to_retry)；``going_to_retry=True`` 表示将退避重试、
+                ``False`` 才是终局（成功/DLQ）。在 stats 更新之后、下一 job
+                派发之前调用；钩子内读 stats 保证一致。
+            strict_picklable: 代码级预检——True 时 run() 前对全部
+                handler 做 pickle 预检（fail-loud），False 为默认（保留单测
+                lambda 兼容）。
+
+            钩子契约（与防御层同原则）：同步、主线程执行、必须轻量
+            非阻塞（重活业务方自丢线程池）；抛异常 → catch + warning +
+            ``stats["hook_errors"]`` 计数，**绝不影响主循环**——钩子按不可信
+            代码对待。多方订阅由业务自封装分发器，框架不维护监听器列表。
+        """
+        self.name = name
+        self.state_dir = Path(state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
+        self._mp_ctx = mp.get_context("spawn")
+
+        if output_root is not None:
+            # 多根支持——list 时声明路径属于任一根即通过
+            # 沙盒校验（跨盘输出场景）。
+            if isinstance(output_root, (list, tuple)):
+                self.output_root = [Path(r).resolve() for r in output_root]
+                for r in self.output_root:
+                    r.mkdir(parents=True, exist_ok=True)
+            else:
+                self.output_root = Path(output_root).resolve()
+                self.output_root.mkdir(parents=True, exist_ok=True)
+        else:
+            self.output_root = None
+
+        if isinstance(backend, str):
+            self.backend_type = backend
+            if backend != _BACKEND_SQLITE:
+                raise ValueError(
+                    f"Unknown backend: {backend!r}. Supported backend is 'sqlite'."
+                )
+            try:
+                self._backend = SQLiteStateBackend(self.state_dir / f"{name}_state.db")
+            except Exception as e:
+                logger.critical(
+                    f"Failed to initialize SQLite backend for '{name}' at "
+                    f"{self.state_dir}: {e}. "
+                    f"Check disk space, directory permissions, and filesystem health."
+                )
+                raise RuntimeError(
+                    f"SQLite backend initialization failed for '{name}': {e}"
+                ) from e
+        elif isinstance(backend, AbstractStateBackend):
+            # 内置 SQLite 实例与字符串 "sqlite" 统一命名，避免同一后端两种 backend_type。
+            self.backend_type = (
+                "sqlite" if isinstance(backend, SQLiteStateBackend)
+                else backend.__class__.__name__
+            )
+            self._backend = backend
+        else:
+            raise TypeError(
+                f"backend must be 'sqlite' or AbstractStateBackend instance, "
+                f"got {type(backend).__name__}"
+            )
+
+        # handler -> (func, default_resources, payload_schema)
+        self.handlers: Dict[str, HandlerEntry] = {}
+        # discovery task_type -> 默认 rerun 策略——enqueue/spawn
+        # 时经 apply_discovery_rerun 注入（见 enqueue docstring），使「固定
+        # uid 每会话重扫」成为默认。
+        self._discovery_rerun: Dict[str, str] = {}
+        # 瞬态异常注册表是 **per-pipeline 实例态**——不跨 pipeline/run
+        # 累积；子进程只消费 ctx 携带的不可变快照（见
+        # register_transient_exception / _dispatch_job）。
+        self.transient_registry = TransientRegistry()
+        # per-pipeline 异常分类覆盖（None=用 exceptions 模块内置元组）：
+        # 确定性/瞬态启发式的成员集合可按 pipeline 定制，快照经 ctx 下发
+        # 子进程——与瞬态注册表同一作用域纪律。
+        self._fatal_exceptions: Optional[tuple] = (
+            tuple(fatal_exceptions) if fatal_exceptions is not None else None)
+        self._transient_exceptions: Optional[tuple] = (
+            tuple(transient_exceptions) if transient_exceptions is not None else None)
+        self.resources: Dict[str, Resource] = {}
+        # 内部 worker 资源：控制并发度。每个 job 默认占用 1 个 worker 槽位，
+        # CapacityResource.used 实时反映 in-flight 占用，scheduler 的
+        # can_acquire 自然阻止过度派发。用户可通过 add_resource 覆盖。
+        # 防御 bool 类型：bool 是 int 子类，True<1 为 False 会静默通过
+        # 再被 float(True) 变成 1 worker——显式拒绝 bool 保持类型严格。
+        if (not isinstance(max_workers, int) or isinstance(max_workers, bool)
+                or max_workers < 1):
+            raise ValueError(f"max_workers must be an int >= 1, got {max_workers!r}")
+        self.resources[WORKER_RESOURCE] = CapacityResource(
+            WORKER_RESOURCE, float(max_workers)
+        )
+        # IPC 落盘目录（state_dir/ipc）——子进程结果/信号写文件，
+        # 主进程轮询文件存在（无 mp.Queue 伪阻塞点）。
+        self.ipc_dir = str(self.state_dir / "ipc")
+        Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
+        self.executor = MultiprocessingExecutor(mp_ctx=self._mp_ctx, ipc_dir=self.ipc_dir)
+        # 传入 handlers 引用，调度器按「handler 默认资源 ∪ job 资源」检查
+        # 可用性，与 _dispatch_job 的实际 acquire 一致（堵住限速/容量绕过）。
+        self.scheduler = JobScheduler(self.resources, self.handlers)
+
+        # 生命周期钩子（单 callable，构造注册；异常隔离见钩子契约）
+        # on_run_start/on_run_end/on_job_completed 统一经 RunContext 持有。
+        self.strict_picklable = strict_picklable
+        # 代码级限制：run 进行中禁止管理 API / enqueue；
+        # 同 state_dir 并发 run 由 pipeline 级文件锁阻止。
+        self._run_started = False
+        self._run_lock_fd: Optional[int] = None
+        # 运行上下文是「一次 run 的运行时真相源」——
+        # 常驻服务引用 + 每-run 可变状态都在这里；各机器只依赖 ctx，
+        # 不反向引用宿主 pipeline。下方同名属性（stats/_state/_in_flight/...）
+        # 是兼容测试与旧调用面的代理。
+        self._ctx = RunContext(
+            name=self.name,
+            backend=self.backend,
+            scheduler=self.scheduler,
+            resources=self.resources,
+            handlers=self.handlers,
+            executor=self.executor,
+            ipc_dir=self.ipc_dir,
+            output_root=self.output_root,
+            on_run_start=on_run_start,
+            on_job_completed=on_job_completed,
+            on_run_end=on_run_end,
+            transient_registry=self.transient_registry,
+            fatal_exceptions=self._fatal_exceptions,
+            transient_exceptions=self._transient_exceptions,
+            dep_grace_seconds=dep_grace_seconds,
+            commit_failure_dlq_threshold=commit_failure_dlq_threshold,
+            deadlock_gap_max_rounds=deadlock_gap_max_rounds,
+            discovery_rerun=self._discovery_rerun,
+        )
+        # 失败机器（3-strike/级联/死锁归因/宽限）注入 RunContext；完成/
+        # 派发机器同样只依赖 RunContext + 失败机器。本类保留同名薄转发
+        # （测试直调面 + 生产路径兼容），职责是「配置 + 加载修复 + 主循环编排」。
+        self._failure = FailureMachine(self._ctx)
+        self._completion = CompletionMachine(self._ctx, self._failure)
+        self._dispatch = DispatchMachine(self._ctx, self._failure, self._completion)
+        self._recovery = RecoveryMachine(self._ctx, self._completion)
+        self._loop = LoopRunner(
+            self._ctx, self._recovery, self._dispatch, self._failure, self._completion,
+        )
+
+    # ── RunContext 代理属性 ───────────────────────────────────────
+    # 运行态真相源在 self._ctx；这些属性代理保留 TaskLite 的调用面
+    # （生产方法、测试直调、monkeypatch 赋值），代理写入即时同步真相源。
+    @property
+    def backend(self):
+        return self._backend
+
+    @backend.setter
+    def backend(self, value) -> None:
+        # 测试/运维可能替换 backend（如注入 FailingBackend）——RunContext
+        # 是运行时真相源，必须同步，避免失败机器仍持旧引用。
+        self._backend = value
+        if hasattr(self, "_ctx"):
+            self._ctx.backend = value
+
+    @property
+    def stats(self) -> TaskStats:
+        return self._ctx.stats
+
+    @stats.setter
+    def stats(self, value: dict) -> None:
+        self._ctx.stats = value
+
+    @property
+    def _state(self):
+        return self._ctx.state
+
+    @_state.setter
+    def _state(self, value) -> None:
+        self._ctx.state = value
+
+    @property
+    def _in_flight(self) -> Dict[str, _InFlightJob]:
+        return self._ctx.in_flight
+
+    @_in_flight.setter
+    def _in_flight(self, value: Dict[str, _InFlightJob]) -> None:
+        self._ctx.in_flight = value
+
+    @property
+    def _deadlock_gap_rounds(self) -> int:
+        return self._ctx.deadlock_gap_rounds
+
+    @_deadlock_gap_rounds.setter
+    def _deadlock_gap_rounds(self, value: int) -> None:
+        self._ctx.deadlock_gap_rounds = value
+
+    @property
+    def _dep_grace_missing(self):
+        return self._ctx.dep_grace_missing
+
+    @_dep_grace_missing.setter
+    def _dep_grace_missing(self, value) -> None:
+        self._ctx.dep_grace_missing = value
+
+    @property
+    def _dep_grace_deadline(self):
+        return self._ctx.dep_grace_deadline
+
+    @_dep_grace_deadline.setter
+    def _dep_grace_deadline(self, value) -> None:
+        self._ctx.dep_grace_deadline = value
+
+    # 停机状态机经 self._ctx.stop_mode（StopMode 枚举）直接读写。
+
+    @property
+    def _run_id(self):
+        return self._ctx.run_id
+
+    @_run_id.setter
+    def _run_id(self, value) -> None:
+        self._ctx.run_id = value
+
+    @property
+    def _dispatch_seq(self) -> int:
+        return self._ctx.dispatch_seq
+
+    @_dispatch_seq.setter
+    def _dispatch_seq(self, value: int) -> None:
+        self._ctx.dispatch_seq = value
+
+    @property
+    def on_run_start(self):
+        return self._ctx.on_run_start
+
+    @on_run_start.setter
+    def on_run_start(self, value) -> None:
+        self._ctx.on_run_start = value
+
+    @property
+    def on_job_completed(self):
+        return self._ctx.on_job_completed
+
+    @on_job_completed.setter
+    def on_job_completed(self, value) -> None:
+        self._ctx.on_job_completed = value
+
+    @property
+    def on_run_end(self):
+        return self._ctx.on_run_end
+
+    @on_run_end.setter
+    def on_run_end(self, value) -> None:
+        self._ctx.on_run_end = value
+
+    def _ensure_not_running(self, api_name: str) -> None:
+        """管理/入队 API 的 run 期间守卫（把文档限制变成代码级 RuntimeError）。"""
+        if self._run_started:
+            raise RuntimeError(
+                f"{api_name}() is only allowed outside run(); "
+                f"current run is in progress. See README『开发与 Agent 约束』."
+            )
+
+    def _preflight_picklable_callbacks(self) -> None:
+        """strict_picklable=True 时，run 前校验全部 handler 可 pickle（fail-loud）。"""
+        if not self.strict_picklable:
+            return
+        for task_type, entry in self.handlers.items():
+            try:
+                pickle.dumps(entry.func)
+            except Exception as e:
+                raise TypeError(
+                    f"strict_picklable: handler for task_type '{task_type}' is not "
+                    f"module-level picklable: {e}"
+                ) from e
+
+    def add_resource(self, resource: Resource) -> None:
+        """Add a resource scheduler to the pipeline.
+
+        If ``resource.name`` already exists (including the internal ``__workers__``),
+        it is overwritten with a warning. Overriding ``__workers__`` changes the
+        max concurrency of the pipeline.
+        """
+        if not isinstance(resource, Resource):
+            raise TypeError(
+                f"add_resource expects a Resource instance, "
+                f"got {type(resource).__name__}"
+            )
+        if resource.name in self.resources:
+            logger.warning(f"Overwriting existing resource '{resource.name}'")
+        self.resources[resource.name] = resource
+
+    def register_handler(
+        self,
+        task_type: str,
+        handler_func: Callable[[Job, TaskContext], Any],
+        default_resources: Optional[Dict[str, float]] = None,
+        payload_schema: Optional[type] = None,
+    ) -> None:
+        """
+        Register a handler for a task type.
+
+        Handler can return:
+        - None (Implies success)
+        - True / False
+        - dict (Metadata for success)
+        - Tuple[bool, dict]
+        Raise RetryError to push back to queue.
+        Raise FatalError for non-retryable bugs (direct DLQ, no retries).
+        Raise Exception to fail and push to DLQ.
+
+        payload_schema: Optional TypedDict class for runtime payload validation.
+        Validated BEFORE forking the subprocess. Validation failures go directly to DLQ.
+        """
+        if not isinstance(task_type, str) or not task_type:
+            raise TypeError(
+                f"task_type must be a non-empty str, got {type(task_type).__name__} ({task_type!r})"
+            )
+        if "::" in task_type:
+            raise ValueError(f"task_type must not contain '::', got {task_type!r}")
+        if not callable(handler_func):
+            raise TypeError(f"handler_func must be callable, got {type(handler_func).__name__}")
+        if task_type in self.handlers:
+            logger.warning(f"Overwriting existing handler for task_type '{task_type}'")
+        # 与 Job.__init__ 同级校验 handler 默认资源——负值/NaN 会绕过 Job 构造
+        # 校验，在派发时导致 acquire 崩溃或 NaN 污染调度（管线无限空转）；
+        # 非 dict 类型与 Job.__init__ 的显式 dict 守卫（job.py）对称，入口拒绝。
+        if default_resources is not None and not isinstance(default_resources, dict):
+            raise TypeError(
+                f"default_resources must be a dict or None, "
+                f"got {type(default_resources).__name__}"
+            )
+        if default_resources:
+            self._validate_resource_amounts(default_resources, "default_resources")
+        if payload_schema is not None and not isinstance(payload_schema, type):
+            # 代码级限制：文档约定 payload_schema 必须是 TypedDict 类；
+            # 传实例/字符串等会在运行时校验时静默失效，入口 fail-loud。
+            raise TypeError(
+                f"payload_schema must be a type (e.g. TypedDict class), "
+                f"got {type(payload_schema).__name__}"
+            )
+        self.handlers[task_type] = HandlerEntry(handler_func, default_resources or {}, payload_schema)
+
+    def set_discovery_rerun(self, task_type: str, rerun: str) -> None:
+        """登记 discovery task_type 的默认 rerun 策略。
+
+        ``wrappers.discovery.register_discovery`` 的框架无关适配经本公开方法
+        写入默认 rerun——宿主实现细节（`_discovery_rerun` 私有字典）不
+        暴露给 discovery 模块。enqueue/spawn 时若 job 未指定 rerun
+        （Job.rerun=None 哨兵）则经
+        ``apply_discovery_rerun`` 注入该默认值，使固定 uid 的 discovery
+        job 每会话重扫；显式值（含 "never"）一律尊重。
+        """
+        if not isinstance(task_type, str) or not task_type:
+            raise TypeError(
+                f"task_type must be a non-empty str, got {type(task_type).__name__} ({task_type!r})"
+            )
+        if "::" in task_type:
+            raise ValueError(f"task_type must not contain '::', got {task_type!r}")
+        if rerun not in ("never", "on_failure", "every_run", "on_input_change"):
+            raise ValueError(
+                f"rerun must be one of 'never'/'on_failure'/'every_run'/"
+                f"'on_input_change', got {rerun!r}"
+            )
+        if task_type in self._discovery_rerun:
+            logger.warning(
+                f"Overwriting discovery rerun for task_type '{task_type}'"
+            )
+        self._discovery_rerun[task_type] = rerun
+
+    def register_transient_exception(self, exception_cls: type) -> None:
+        """把业务自有异常类注册为瞬态（自动重试），**per-pipeline 语义**。
+
+        注册表是本 pipeline 实例态——不同 pipeline 的注册互不可见、
+        跨 run 不累积。分类决策发生在子进程，因此类必须为模块级
+        可 pickle（入口 fail-loud 预检）；注册表快照随 ``TaskContext``
+        显式下发子进程。
+        """
+        self.transient_registry.register(exception_cls)
+
+    def enqueue(self, jobs: Union[Job, Sequence[Job]], front: bool = False) -> None:
+        """Add jobs to the queue.
+
+        Args:
+            jobs: Job 或 Job 列表（单个 Job 会自动包成列表）。重复 uid 静默跳过。
+            front: If ``True``, insert at queue head (for requeue-style usage);
+                else append to tail (default).
+
+        Note:
+            Not thread-safe. Do not call concurrently with ``run()``（见
+            README 已知限制）. Use ``ctx.spawn()`` for runtime
+            child job generation inside handlers.
+
+        写入走后端 ``enqueue_jobs`` 增量 API（单事务原子插入，不做
+        DELETE 全表重写）——与 run() 的 delta commit 并发时互不覆盖。
+
+        discovery task_type 的 job 在入队时注入该 discovery
+        注册的默认 rerun（通常 "every_run"）——用户**未指定**（Job.rerun=None，
+        哨兵语义）时注入 discovery 默认，使「固定 uid 每会话重扫」成为
+        默认姿势；显式指定（含 "never"）一律尊重，不覆盖、不告警。
+        """
+        self._ensure_not_running("enqueue")
+        # 兼容单个 Job 与 list/tuple——与 add_resource/
+        # ctx.spawn 的单数语义对齐，避免“必须包一层 []”的非直觉用法。
+        if isinstance(jobs, Job):
+            jobs_list = [jobs]
+        elif isinstance(jobs, (list, tuple)):
+            jobs_list = list(jobs)
+        else:
+            raise TypeError(
+                "enqueue() expects a Job or a list of Job objects, "
+                f"got {type(jobs).__name__}"
+            )
+        if not jobs_list:
+            return
+
+        jobs_dicts = []
+        for j in jobs_list:
+            if not isinstance(j, Job):
+                raise TypeError(
+                    "enqueue() expects Job objects, "
+                    f"got {type(j).__name__}"
+                )
+            # 预检 payload JSON 可序列化，避免子进程 IPC 时崩溃。
+            # allow_nan=False 与 ctx.spawn 的 JSON 序列化预检对齐——默认
+            # allow_nan=True 会让 float('nan') 通过预检，产出非标准 JSON
+            # "Infinity"，下游 json.loads 反序列化出 NaN 污染计算。
+            try:
+                dumps(j.payload)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"Payload for job {j.uid} is not JSON-serializable: {e}"
+                ) from e
+            # enqueue 不合并 handler 默认 resources——合并会把注册时的
+            # 默认值烤进持久化 job_dict（handler 默认资源变更后磁盘留旧值）；
+            # 运行时由 scheduler 的 _effective_resources（扫描可见性）与
+            # _dispatch_job（acquire 实际值）两处合并。浅拷贝避免修改传入的 Job 对象。
+            job_dict = j.to_dict()
+            # discovery 默认 rerun 注入（单点函数；None=未指定
+            # 哨兵才注入，显式值含 "never" 一律尊重）
+            apply_discovery_rerun(job_dict, j.task_type, self._discovery_rerun)
+            self._inject_worker_resource(job_dict)
+            jobs_dicts.append(job_dict)
+
+        if not jobs_dicts:
+            return
+
+        # 增量入队（后端在单事务内去重 + 插入），返回实际插入 uid
+        inserted = self.backend.enqueue_jobs(jobs_dicts, front=front)
+        skipped = len(jobs_dicts) - len(inserted)
+        if skipped:
+            logger.info(f"Enqueued {len(inserted)} job(s), skipped {skipped} duplicate(s).")
+        elif inserted:
+            logger.info(f"Enqueued {len(inserted)} job(s).")
+
+    def list_dlq(self) -> List[DLQEntry]:
+        """只读查询 DLQ，返回结构化条目（uid / error_type / error / attempts / failed_at / meta）。
+
+        error_type 分类：fatal（FatalError）/ dependency（级联）/
+        deadlock / transient_exhausted（重试耗尽）/ no_handler /
+        validation / commit_failure / dispatch / unknown（见 ``backend.base.classify_error_type``）。
+        只读，不改变任何状态；仅限 run() 之外调用。
+        """
+        self._ensure_not_running("list_dlq")
+        failed = self.backend.load_failed()
+        entries: List[DLQEntry] = []
+        for uid, meta in sorted(failed.items()):
+            if not isinstance(meta, dict):
+                # 与 classify_error_type 同款防御：手改/遗留损坏行不炸掉整个
+                # 排障工具——合法 JSON 标量（"boom"/42/true
+                # 等）也要兜底：dict(标量) 会抛 TypeError/ValueError，此处
+                # 统一按未知分类展示，排障者可修复。
+                entries.append(DLQEntry(
+                    uid=uid,
+                    error_type=classify_error_type(meta),
+                    error="",
+                    attempts=0,
+                    failed_at=None,
+                    meta={},
+                ))
+                continue
+            attempts = meta.get("_attempt", 0)
+            if not isinstance(attempts, int):
+                attempts = 0  # 非 int 的 _attempt（手改/遗留行）不炸 list_dlq()
+            entries.append(DLQEntry(
+                uid=uid,
+                error_type=classify_error_type(meta),
+                error=str(meta.get("error", "")),
+                attempts=attempts,
+                failed_at=meta.get("failed_at"),
+                meta=dict(meta),
+            ))
+        return entries
+
+    def clear_dlq(
+        self,
+        task_types: Optional[Sequence[str]] = None,
+        *,
+        keep_fatal: bool = True,
+    ) -> int:
+        """从 DLQ 删除匹配条目（默认保留 fatal=true 的确定性失败），返回删除数。
+
+        清除 = 删 DLQ + 调用方随后 enqueue 同名任务重跑（is_known 不再
+        把该 uid 算「已知」）。``task_types`` 过滤只删这些 task_type 前缀的
+        条目（str 列表/tuple）；None = 全部。``keep_fatal=False`` 连 FatalError
+        条目一并删除。仅限 run() 之外调用（改变 is_known 判定基础，与 enqueue 同纪律）。
+        """
+        self._ensure_not_running("clear_dlq")
+        if task_types is not None:
+            if not isinstance(task_types, (list, tuple)):
+                raise TypeError(
+                    f"task_types must be a list/tuple of str or None, "
+                    f"got {type(task_types).__name__}"
+                )
+            for t in task_types:
+                if not isinstance(t, str) or not t:
+                    raise TypeError(
+                        f"task_types must contain only non-empty str, got {t!r}"
+                    )
+            task_types = list(task_types)
+        failed = self.backend.load_failed()
+        to_delete = [
+            uid for uid, meta in failed.items()
+            if (task_types is None
+                or any(uid.startswith(t + "::") for t in task_types))
+            # 非 dict 损坏行（合法 JSON 标量）不炸 revive——
+            # 无 fatal 标志可读，按「可删除」处理（删除本身就是修复手段）。
+            and not (keep_fatal and isinstance(meta, dict) and meta.get("fatal"))
+        ]
+        if not to_delete:
+            return 0
+        return self.backend.delete_failed(to_delete)
+
+    def clear_history(
+        self,
+        targets: Union[str, Sequence[str]],
+        *,
+        where: Sequence[str] = ("wall", "failed"),
+    ) -> int:
+        """从 wall 和/或 DLQ 删除条目——「误删文件强制重下」「历史垃圾清理」的官方通道。
+
+        ``targets``：str 或 str 列表。完整 uid 精确删除；**以 ``::``
+        结尾的字符串按前缀匹配**（如 ``"download::"`` 删全部 download 任务）
+        ——防止 ``"download"`` 误匹配 ``"downloads::"``（前缀误匹配痛点 ）。
+        ``where``：含 ``"wall"`` / ``"failed"`` 的序列，默认两者都清。
+        返回删除总数。仅限 run() 之外调用（改变 is_known 判定基础）。
+        """
+        self._ensure_not_running("clear_history")
+        if isinstance(targets, str):
+            patterns = [targets]
+        elif isinstance(targets, (list, tuple)):
+            patterns = list(targets)
+        else:
+            raise TypeError(
+                f"targets must be a str or a list/tuple of str, "
+                f"got {type(targets).__name__}"
+            )
+        for p in patterns:
+            if not isinstance(p, str):
+                raise TypeError(
+                    f"targets must contain only str, got {type(p).__name__} ({p!r})"
+                )
+        if not isinstance(where, (list, tuple)):
+            raise TypeError(
+                f"where must be a sequence of 'wall'/'failed', got {type(where).__name__}"
+            )
+        where_set = set(where)
+        unknown = where_set - {"wall", "failed"}
+        if unknown:
+            raise ValueError(
+                f"where contains unknown target(s): {sorted(unknown)!r}; "
+                f"allowed: 'wall', 'failed'"
+            )
+
+        def _matches(uid: str) -> bool:
+            return any(
+                uid == p or (p.endswith("::") and uid.startswith(p))
+                for p in patterns
+            )
+
+        total = 0
+        if "wall" in where:
+            wall = self.backend.load_wall()
+            matched = [u for u in wall if _matches(u)]
+            if matched:
+                total += self.backend.delete_wall(matched)
+        if "failed" in where:
+            failed = self.backend.load_failed()
+            matched = [u for u in failed if _matches(u)]
+            if matched:
+                total += self.backend.delete_failed(matched)
+        return total
+
+    def seed_wall(self, uids: Sequence[str]) -> int:
+        """把 uid 批量写入 wall（存档迁移标记「已处理」），返回实际写入数。
+
+        媒体/数据资产存档迁移（硬链接 + wall 种子）从此不用裸 SQL。
+        uid 必须为 ``"task_type::job_id"`` 形式 str，且 task_type/job_id 均
+        非空、不含额外 ``::``；meta 为空 dict。仅限 run() 之外调用。
+        """
+        self._ensure_not_running("seed_wall")
+        if not isinstance(uids, (list, tuple)):
+            raise TypeError(
+                f"uids must be a list/tuple of str, got {type(uids).__name__}"
+            )
+        for u in uids:
+            if not isinstance(u, str) or u.count("::") != 1:
+                raise ValueError(
+                    f"seed_wall uid must be 'task_type::job_id' str with exactly "
+                    f"one '::' separator, got {u!r}"
+                )
+            task_type, job_id = u.split("::", 1)
+            if not task_type or not job_id:
+                raise ValueError(
+                    f"seed_wall uid must have non-empty task_type and job_id, got {u!r}"
+                )
+        return self.backend.seed_wall(list(uids))
+
+    def seed_cursor(self, key: str, value: str) -> None:
+        """预填一个 cursor（幂等）——存档迁移/进度书签恢复。
+
+        注意：discovery 的已见判定走 wall/failed（见
+        ``wrappers/discovery.py`` 头部），不再使用 cursor——「已见预填」请用
+        ``seed_wall``（把 process 任务的 uid 写入 wall）。本方法服务
+        通用业务 cursor（``ctx.get_cursor`` 可读）。仅限 run() 之外调用。
+        """
+        self._ensure_not_running("seed_cursor")
+        self.backend.seed_cursor(key, value)
+
+    def _validate_resource_amounts(self, resources: Dict[str, float], where: str) -> None:
+        """数值校验转发（与 Job.__init__ 共用 utils.validation 单点）。
+
+        handler 默认资源在注册时即校验，防止负值/NaN/Inf 绕过 Job 构造
+        校验后在派发时引发 acquire 崩溃（负值）或调度 NaN 污染（无限空转）。
+        """
+        validate_resource_amounts(resources, where)
+
+    def _inject_worker_resource(self, job_dict: dict) -> None:
+        """给 job_dict 注入默认 worker 槽位（单点实现见 engine.runtime）。"""
+        inject_worker_resource(job_dict)
+
+    def stop(self, force: bool = False) -> None:
+        """请求管线停止（停机状态机）。
+
+        - ``stop(force=False)``（默认）：**DRAINING**——不再派发新 job，
+          允许当前 in-flight 自然完成后再退出（优雅停机）。
+        - ``stop(force=True)``：**ABORTING**——分类消费在途任务：**已完成**
+          （结果文件已落盘、只差 drain 回收）的 job 走 ``_complete_job`` 提交
+          （进 wall/failed，不 kill、不删产出、不 requeue），仅对**进行中**
+          的 job 执行 kill + 清半成品 + requeue 后退出。
+        """
+        self._ctx.stop_mode = StopMode.ABORTING if force else StopMode.DRAINING
+
+    def _handle_stop_signal(self, signum, frame) -> None:
+        """SIGTERM/SIGINT 信号处理器：请求 DRAINING 优雅停机；二次强制 ABORTING。
+
+        容器编排（docker stop / k8s pod 终止）默认发 SIGTERM；终端 Ctrl+C
+        发 SIGINT。两者复用同一处理器：
+        首次信号 → DRAINING：不派发新 job，等 in-flight 自然完成。
+        二次信号（含两种信号交叉）→ ABORTING：分类消费在途任务——**已完成**
+        （结果文件已落盘）的 job 被消费提交（进 wall/failed，不重跑），仅对
+        **进行中**的 job 执行 kill + 清半成品 + requeue，快速退出（对应容器
+        优雅停机超时后的强杀信号 / 用户第二次 Ctrl+C）。
+        """
+        try:
+            sig_name = signal.Signals(signum).name
+        except (ValueError, AttributeError):
+            sig_name = str(signum)
+        if self._ctx.stop_mode is not StopMode.NONE:
+            logger.warning(f"Second {sig_name} received, forcing abort.")
+            self._ctx.stop_mode = StopMode.ABORTING
+        else:
+            logger.warning(
+                f"Received {sig_name}, requesting graceful shutdown (draining)."
+            )
+            self._ctx.stop_mode = StopMode.DRAINING
+
+
+
+
+    def run(self) -> None:
+        """Start the pipeline and run until queue is empty (or a drain/abort stop is requested)."""
+        logger.info(f"=== Starting Pipeline: {self.name} (Backend: {self.backend_type}) ===")
+        self._ctx.stop_mode = StopMode.NONE
+        # 代码级限制：run 进行中禁止 enqueue / list_dlq / clear_dlq / clear_history /
+        # seed_wall / seed_cursor；on_run_start 也在保护范围内。
+        self._run_started = True
+        # 预置全部已知键——hook_errors/deferred_orphan 是运行期动态键，
+        # 预置后累加不再依赖拼写正确（.get(...,0)+1 会静默容忍拼错）。
+        self.stats = TaskStats()
+        # on_run_end 钩子幂等标志重置（run 只触发一次）。
+        self._ctx.reset_run_end_fired()
+        # 同 state_dir 并发 run 防护：pipeline 级文件锁（锁文件常驻，
+        # 由 fd 生命周期保证；进程崩溃内核自动释放）。
+        self._run_lock_fd = try_acquire_lock(self.ipc_dir, "__pipeline_run__", timeout=0)
+        if self._run_lock_fd is None:
+            self._run_started = False
+            raise RuntimeError(
+                f"Another run() is in progress for state_dir {self.state_dir}; "
+                f"concurrent runs on the same state are forbidden."
+            )
+        # episode 治理态重置（依赖宽限截止、缺失集合追踪、死锁缺口轮数）
+        self._ctx.reset_episode()
+
+        # 注册 SIGTERM/SIGINT handler（两种信号复用同一优雅停机路径：
+        # DRAINING/ABORTING 状态机，与容器 stop 语义一致；SIGINT 不以
+        # KeyboardInterrupt 穿透主循环）。
+        # 信号只能在主线程注册；子线程调用 run 会抛 ValueError，安全跳过。
+        # run 退出后恢复原 handler，避免影响进程其他部分。
+        old_sigterm = None
+        old_sigint = None
+        try:
+            old_sigterm = signal.signal(signal.SIGTERM, self._handle_stop_signal)
+        except (ValueError, OSError):
+            logger.debug("Could not install SIGTERM handler (non-main thread or unsupported platform).")
+        try:
+            old_sigint = signal.signal(signal.SIGINT, self._handle_stop_signal)
+        except (ValueError, OSError):
+            logger.debug("Could not install SIGINT handler (non-main thread or unsupported platform).")
+
+        try:
+            self._preflight_picklable_callbacks()
+            # on_run_start 异常隔离——钩子按不可信代码对待
+            if self.on_run_start is not None:
+                try:
+                    self.on_run_start()
+                except Exception as e:
+                    logger.warning(f"on_run_start hook raised: {e}")
+                    self.stats["hook_errors"] += 1
+            self._run_body()
+        except BaseException as e:
+            # 未进入主循环/主循环未覆盖的退出路径也触发 on_run_end。
+            self._ctx.fire_run_end(
+                "interrupted" if isinstance(e, KeyboardInterrupt) else "error"
+            )
+            raise
+        finally:
+            # 正常完成路径的兜底触发；若上面 except 已触发，幂等忽略。
+            self._ctx.fire_run_end("completed")
+            release_lock(self._run_lock_fd)
+            self._run_lock_fd = None
+            self._run_started = False
+            if old_sigterm is not None:
+                signal.signal(signal.SIGTERM, old_sigterm)
+            if old_sigint is not None:
+                signal.signal(signal.SIGINT, old_sigint)
+
+    def _run_body(self) -> None:
+        """run() 的实际执行体，由 run() 包裹在 SIGTERM 安装/恢复之间调用。"""
+        # 调度缓存按 run 生命周期清空——跨 run 的
+        # clear_history + 重新 enqueue 同 uid 不同内容场景需在加载期覆盖陈旧缓存。
+        self.scheduler.begin_round()
+        wall = self.backend.load_wall()
+        failed = self.backend.load_failed()
+        cursors = self.backend.load_cursors()
+        q_data = self.backend.load_queue()
+
+        # fencing：每次 run 生成新的 run_id 并持久化到 meta 表
+        # （记录上次 run 的 id，供运维排障/未来清理残留），seq 计数器重置。
+        self._run_id = uuid.uuid4().hex
+        self._dispatch_seq = 0
+        # run_id 持久化失败必须 fail-loud——静默降级 = 无 fence 运行，
+        # 孤儿 fencing 承诺形同虚设（且 meta 表写失败说明 DB 已故障，
+        # 队列持久化同样不可靠，启动即应失败而非带病运行）。
+        try:
+            self.backend.set_meta("last_run_id", self._run_id)
+        except Exception as e:
+            logger.critical(
+                f"Failed to persist run_id to meta table — fencing disabled, "
+                f"refusing to run degraded: {e}"
+            )
+            raise
+
+        # 加载期队列整理：退避换算 + 残留过滤 + 去重（统一由 RecoveryMachine 原子执行）。
+        q_data = self._recovery.repair_queue_on_load(q_data, wall, failed)
+
+        # 加载持久化的资源 suspend 状态（meta 表 wall-clock 截止换算回 monotonic）
+        self._recovery.load_resource_suspends()
+
+        self._ctx.set_state(PipelineState(wall, failed, cursors, q_data))
+
+        # 启动主事件循环
+        self._run_loop()
+
+    # ── 内部组件委托方法（供测试与生命周期直调）─────────────────
+
+    def _run_loop(self) -> None:
+        return self._loop.run_loop()
+
+    def _save_queue_crash_safe(self) -> None:
+        return self._recovery.save_queue_crash_safe()
+
+    def _abort_in_flight(self) -> None:
+        return self._recovery.abort_in_flight()
+
+    def _release_acquired(self, acquired, uid=None) -> None:
+        return self._completion.release_acquired(acquired, uid=uid)
+
+    def _dispatch_job(self, sched):
+        return self._dispatch.dispatch_job(sched)
+
+    def _apply_result(self, uid, job, job_dict, result, job_start=None, expect_in_flight=True):
+        return self._completion.apply_result(
+            uid, job, job_dict, result, job_start=job_start, expect_in_flight=expect_in_flight,
+        )
+
+

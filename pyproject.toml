@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tasklite-engine"
+version = "1.0.0"
+description = "A lightweight task orchestration engine with zero external dependencies, process isolation, and ACID persistence"
+requires-python = ">=3.9"
+license = "MIT"
+readme = "README.md"
+
+[project.optional-dependencies]
+dev = ["pytest", "hypothesis>=6.0", "mutmut>=3.0", "pytest-timeout>=2.0", "pytest-cov>=4.0"]
+
+[tool.setuptools.packages.find]
+include = ["tasklite", "tasklite.*"]
+exclude = ["tests"]
+
+# PEP 561：py.typed 标记随包分发，下游 mypy/pyright 可消费内联类型注解
+[tool.setuptools.package-data]
+tasklite = ["py.typed"]
+
+[tool.pytest.ini_options]
+markers = [
+    "hypothesis: property-based tests using hypothesis (can be deselected with -m \"not hypothesis\")",
+]
+addopts = "--strict-markers"
+timeout = 60
+norecursedirs = ["mutants", ".git", ".hypothesis", "__pycache__"]
+
+[tool.coverage.run]
+source = ["tasklite"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = false
+
+[tool.mutmut]
+source_paths = [
+    "tasklite/backend/",
+    "tasklite/engine/",
+    "tasklite/models/",
+    "tasklite/utils/",
+    "tasklite/wrappers/",
+    "tasklite/exceptions.py",
+    "tasklite/pipeline.py",
+    "tasklite/pipeline_util.py",
+]
+also_copy = ["tasklite/"]
+pytest_add_cli_args = ["--import-mode=importlib"]

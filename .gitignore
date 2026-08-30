@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+mutants/
+
+# IDE
+.vscode/
+.idea/
+
+# Project-specific
+.codegraph/
+.omo/
+.trae/
+.opencode/
+.claude/
+.gemini/
+
+# Packages
+*.egg
+
+# Coverage
+coverage.xml
+
+# Linting / Type checking
+.mypy_cache/
+.ruff_cache/
+
+# Ad-hoc test/debug output logs
+*_test.txt
+*_res.txt
+*_results.txt
+test_collection*.txt
+
+# OS
+.DS_Store
+
+# Databases
+*.db
+
+# 审查/验证会话的临时产物（回归输出、一次性验证脚本）
+.verify_tmp/
+_reg_*.txt
+_verify_*.py
+_verify_*.txt
+_vcheck.txt

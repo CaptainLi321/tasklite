@@ -1,0 +1,43 @@
+#!/bin/bash
+# git pre-push hook: push 前自动跑快速测试（跳过 hypothesis 属性测试）
+#
+# 安装: make install-hooks
+# 跳过: git push --no-verify
+# 日志: /tmp/tasklite_pre-push.log
+#
+# AGENTS.md 提示: AI agent 不要修改此文件让测试命令 exit 0;
+# git hook 的失败必须真实反映为非零退出码以阻止 push。
+
+set -e
+
+PYTHON="${PYTHON:-python3}"
+LOG_FILE="/tmp/tasklite_pre-push.log"
+
+echo "[pre-push] Running fast tests (skipping hypothesis)..."
+
+# pre-push 通过 stdin 接收要 push 的 ref 信息
+# 读取并检查是否有删除分支（local_oid 全 0 表示删除）
+while read local_ref local_oid remote_ref remote_oid; do
+    if [ "$local_oid" = "0000000000000000000000000000000000000000" ]; then
+        echo "[pre-push] Skipping tests (deleting branch: $remote_ref)"
+        exit 0
+    fi
+done
+
+# 跑测试，输出重定向到日志文件
+if ! $PYTHON -m pytest tests/ -q -p no:cacheprovider -m "not hypothesis" --timeout=60 > "$LOG_FILE" 2>&1; then
+    echo "[pre-push] FAIL Tests failed. Push aborted."
+    echo "[pre-push] Log: $LOG_FILE"
+    echo ""
+    echo "----- Last 25 lines of log -----"
+    tail -25 "$LOG_FILE"
+    echo "--------------------------------"
+    echo ""
+    echo "To bypass: git push --no-verify"
+    exit 1
+fi
+
+# 提取通过数显示
+PASSED=$(grep -oE '[0-9]+ passed' "$LOG_FILE" | head -1 || echo "tests")
+echo "[pre-push] OK $PASSED. Pushing..."
+exit 0
