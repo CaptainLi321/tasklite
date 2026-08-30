@@ -36,7 +36,6 @@ from ..error_codes import (
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job
 from ..models.state import uid_from_job_dict
-from .deadlock import split_deadlock
 
 logger = logging.getLogger("tasklite")
 
@@ -370,6 +369,25 @@ class FailureMachine:
         )
         return True
 
+    @staticmethod
+    def _split_deadlock(
+        queue: List[dict],
+        error: str,
+        *,
+        extract_uid,
+        include,
+    ) -> Tuple[List[Tuple[str, dict]], List[dict]]:
+        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」。"""
+        uids_metas = []
+        remaining_queue = []
+        for idx, jd in enumerate(queue):
+            uid = extract_uid(jd)
+            if include(idx, uid):
+                uids_metas.append((uid, {"error": error, "root_cause": True}))
+            else:
+                remaining_queue.append(jd)
+        return uids_metas, remaining_queue
+
     def handle_deadlock(self, sched) -> bool:
         """处理死锁：细粒度归因 + bulk_failure + cascade。原位操作 self._ctx.state。
 
@@ -380,7 +398,7 @@ class FailureMachine:
             # 畸形 job dict 优先处理 — 无法反序列化的 job 直接入 DLQ
             logger.error(f"Deadlock: {len(sched.malformed_indices)} job(s) have malformed dict (unparseable).")
             root = set(sched.malformed_indices)
-            uids_metas, remaining_queue = split_deadlock(
+            uids_metas, remaining_queue = self._split_deadlock(
                 list(state.queue),
                 _ERR_MALFORMED_JOB,
                 extract_uid=uid_from_job_dict,
@@ -389,7 +407,7 @@ class FailureMachine:
         elif sched.unknown_resource_indices:
             logger.error(f"Deadlock: {len(sched.unknown_resource_indices)} job(s) reference unknown resource(s).")
             root = set(sched.unknown_resource_indices)
-            uids_metas, remaining_queue = split_deadlock(
+            uids_metas, remaining_queue = self._split_deadlock(
                 list(state.queue),
                 _ERR_RESOURCE_DEADLOCK,
                 extract_uid=lambda jd: Job.from_dict(jd).uid,
@@ -403,7 +421,7 @@ class FailureMachine:
                 return False  # 宽限中：主循环继续（等 spawner 产出依赖）
             logger.error(f"Deadlock: {len(sched.missing_dependency_indices)} job(s) have unresolvable (missing) dependencies.")
             root = set(sched.missing_dependency_indices)
-            uids_metas, remaining_queue = split_deadlock(
+            uids_metas, remaining_queue = self._split_deadlock(
                 list(state.queue),
                 _ERR_DEPENDENCY_DEADLOCK,
                 extract_uid=lambda jd: Job.from_dict(jd).uid,
@@ -415,7 +433,7 @@ class FailureMachine:
             # 根因，比"依赖环"归因更准确，且只失败肇事者、让被阻断者走 cascade。
             logger.error(f"Deadlock: {len(sched.impossible_resource_indices)} job(s) request impossible resource amounts (exceeds capacity).")
             root = set(sched.impossible_resource_indices)
-            uids_metas, remaining_queue = split_deadlock(
+            uids_metas, remaining_queue = self._split_deadlock(
                 list(state.queue),
                 _ERR_RESOURCE_DEADLOCK,
                 extract_uid=lambda jd: Job.from_dict(jd).uid,
@@ -453,7 +471,7 @@ class FailureMachine:
                     f"Deadlock detected: dependency cycle among {len(cycle_uids)} job(s): "
                     f"{sorted(cycle_uids)}"
                 )
-                uids_metas, remaining_queue = split_deadlock(
+                uids_metas, remaining_queue = self._split_deadlock(
                     list(state.queue),
                     _ERR_DEPENDENCY_DEADLOCK,
                     extract_uid=lambda jd: Job.from_dict(jd).uid,
