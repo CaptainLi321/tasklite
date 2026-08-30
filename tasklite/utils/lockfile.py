@@ -16,55 +16,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# uid → 文件名安全形式：task_type::job_id → task_type%3A%3Ajob_id
-# （百分号编码 `::`，先转义 `%` 保证单射——见 safe_uid_filename docstring）
-_UID_ESCAPE = "::"
-_UID_ESCAPED = "%3A%3A"
-_PERCENT_ESCAPE = "%"
-_PERCENT_ESCAPED = "%25"
-# 文件系统危险字符——路径分隔符（POSIX `/`、Windows `\`）、
-# NUL（os.open 拒绝）、glob 元字符（`*?[]` 会注入 _iter_stale_result_paths 的
-# glob 匹配、跨 uid 删除他人结果文件）。全部转义为 %XX 保持单射可逆。
-# 单冒号 `:` 同样加入——Windows 文件名禁 `:`（NTFS 保留
-# 字符），job_id 只禁 `::` 可合法含单冒号（如 "id:with:colons"），不转义则
-# Windows 派发路径非法；`::` 由 _UID_ESCAPED 替换处理（单冒号先于 `::`
-# 替换逐字符转义，二者结果一致：`::` → `%3A%3A`，单射保持）。
-_FS_ESCAPE_CHARS = {
-    "/": "%2F",
-    "\\": "%5C",
-    "\x00": "%00",
-    "*": "%2A",
-    "?": "%3F",
-    "[": "%5B",
-    "]": "%5D",
-    ":": "%3A",
-}
+from .injective import safe_uid_filename
 
-
-def safe_uid_filename(uid: str) -> str:
-    """把 job uid 映射为对任意文件系统安全（无 ``:`` 等保留字符）的文件名。
-
-    与 executor 的 result/signals/outputs 路径函数共享——统一映射，不得
-    另造一套。
-
-    直接 ``uid.replace("::", "_%3A%3A_")`` 非单射——
-    job_id 可合法含 ``%``，当 job_id 恰含字面 ``_%3A%3A_`` 时（如
-    ``t::x::y`` 与 ``t::x_%3A%3A_y``）两个不同 uid 映射到同一文件名，
-    锁文件/signals/outputs/结果文件全碰撞。本实现先转义 ``%`` 为
-    ``%25`` 再转义 ``::``——编码序列中的 ``%`` 永不与用户输入的
-    ``%`` 混淆（后者已被 %25 吸收），映射单射且可逆。
-
-    job_id 只禁止 ``::``，可含 ``/``、``..``、
-    ``*`` 等——若不转义，uid 派生的 IPC 文件路径可逃逸 state_dir
-    （``os.open`` 创建/``os.replace`` 覆盖/``unlink`` 删除任意路径），
-    且 ``t::a//b`` 与 ``t::a/b`` 在文件系统级碰撞。转义全部文件系统
-    危险字符后：映射仍单射（%XX 可逆），且派生路径不含分隔符——
-    ``..`` 无法成为路径组件、glob 元字符不参与匹配。
-    """
-    escaped = uid.replace(_PERCENT_ESCAPE, _PERCENT_ESCAPED)
-    for ch, enc in _FS_ESCAPE_CHARS.items():
-        escaped = escaped.replace(ch, enc)
-    return escaped
 
 
 def _lock_path(ipc_dir: str, uid: str) -> Path:
