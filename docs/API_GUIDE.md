@@ -207,25 +207,26 @@ register_discovery(
 
 ### 6.1 通用管线脚手架（pipeline_util）
 
-`tasklite.pipeline_util` 是各类任务编排消费方共用的**非领域
-通用脚手架**：
+`tasklite.pipeline_util` 是各类任务编排消费方共用的**数据与展示工具**：
 
 ```python
 from tasklite.pipeline_util import (
-    run_pipeline, clear_dlq, content_fingerprint, sanitize_job_component,
-    progress_hook, job_ref, slice_list, register_file_transients,
+    content_fingerprint, sanitize_job_component,
+    progress_hook, job_ref, slice_list,
 )
 ```
 
-- `run_pipeline(pipeline)`：统一 run + 优雅停机包装（Ctrl+C 转 DRAINING，不做进程退出——退出码由 CLI 层决定）；
-  - **运行期限制（代码级强制）**：所有管理 API 与 `enqueue` 仅限 `run()` 之外调用，运行中调用抛 `RuntimeError`——本引擎是「声明式批次」语义：任务集合在启动前声明完毕，不支持运行期动态入队；需要动态性的场景应在 handler 内经 `ctx.spawn()` 派生子任务。
-- `clear_dlq(pipeline, task_types=..., keep_fatal=...)`：`TaskLite.clear_dlq` 的便捷包装；
 - `content_fingerprint(parts, version="")`：确定性内容指纹（sha1 截 16 位，
   任何输入/版本盐变化 → job_id 变化 → wall 重跑）；
-- `sanitize_job_component(s)`：净化任意串为无 `::`/路径分隔/控制字符的 job_id 成分；
+- `sanitize_job_component(s)`：净化任意串为无 `::`/路径分隔/控制字符的 job_id 成分（单射转义，底层委托 `utils.injective`）；
 - `progress_hook` / `job_ref`：父进程进度回调；
-- `register_file_transients(pipeline)`：把 `PermissionError/BlockingIOError/
-  ConnectionResetError` 注册为本 pipeline 瞬态（`FileNotFoundError` 不注册）。
+- `slice_list(items, start, count, limit)`：分批切片工具。
+
+> **主机生命周期与瞬态注册（直接由 `TaskLite` 原生提供）**：
+> - `pipeline.run_graceful()`：统一 run + 优雅停机包装（Ctrl+C 转 DRAINING，自然等在途完成后安全退出）；
+> - `pipeline.register_transient_exceptions([cls1, cls2])`：批量注册业务瞬态异常；
+> - `pipeline.register_file_transients()`：把常见文件系统异常批量注册为瞬态（`PermissionError/BlockingIOError/ConnectionResetError`）。
+
 
 ---
 

@@ -12,6 +12,8 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 from .backend.base import AbstractStateBackend, classify_error_type
 from .backend.sqlite_backend import SQLiteStateBackend
+
+
 from .models.context import TaskContext
 from .engine.executor import ExecutionResult, MultiprocessingExecutor
 from .engine.completion import CompletionMachine
@@ -174,6 +176,8 @@ class TaskLite:
                 f"backend must be 'sqlite' or AbstractStateBackend instance, "
                 f"got {type(backend).__name__}"
             )
+
+
 
         # handler -> (func, default_resources, payload_schema)
         self.handlers: Dict[str, HandlerEntry] = {}
@@ -484,6 +488,19 @@ class TaskLite:
         显式下发子进程。
         """
         self.transient_registry.register(exception_cls)
+
+    def register_transient_exceptions(self, classes: Sequence[type]) -> None:
+        """批量注册瞬态异常类。"""
+        for cls in classes:
+            self.register_transient_exception(cls)
+
+    def register_file_transients(
+        self,
+        classes: Sequence[type] = (PermissionError, BlockingIOError, ConnectionResetError),
+    ) -> None:
+        """把常见文件系统环境异常批量注册为瞬态（可重试）。"""
+        self.register_transient_exceptions(classes)
+
 
     def enqueue(self, jobs: Union[Job, Sequence[Job]], front: bool = False) -> None:
         """Add jobs to the queue.
@@ -851,6 +868,23 @@ class TaskLite:
                 signal.signal(signal.SIGTERM, old_sigterm)
             if old_sigint is not None:
                 signal.signal(signal.SIGINT, old_sigint)
+
+    def run_graceful(self) -> None:
+        """统一 run + 优雅停机包装：捕获 KeyboardInterrupt 并触发 DRAINING 优雅停机。
+
+        库函数不改变退出码（无 sys.exit）。收到 KeyboardInterrupt 时请求 stop()
+        转为优雅停机，等待在途任务完成并收尾。
+        """
+        try:
+            self.run()
+        except KeyboardInterrupt:
+            logger.info("收到 KeyboardInterrupt，请求优雅停机（DRAINING）……")
+        finally:
+            try:
+                self.stop()
+            except Exception:
+                logger.exception("run_graceful 收尾 stop 失败")
+
 
     def _run_body(self) -> None:
         """run() 的实际执行体，由 run() 包裹在 SIGTERM 安装/恢复之间调用。"""
