@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 from .backend.base import AbstractStateBackend, classify_error_type
+from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
+
 
 
 from .models.context import TaskContext
@@ -149,33 +151,38 @@ class TaskLite:
 
         if isinstance(backend, str):
             self.backend_type = backend
-            if backend != _BACKEND_SQLITE:
+            if backend == _BACKEND_SQLITE:
+                try:
+                    self._backend = SQLiteStateBackend(self.state_dir / f"{name}_state.db")
+                except Exception as e:
+                    logger.critical(
+                        f"Failed to initialize SQLite backend for '{name}' at "
+                        f"{self.state_dir}: {e}. "
+                        f"Check disk space, directory permissions, and filesystem health."
+                    )
+                    raise RuntimeError(
+                        f"SQLite backend initialization failed for '{name}': {e}"
+                    ) from e
+            elif backend == "memory":
+                self._backend = InMemoryStateBackend()
+            else:
                 raise ValueError(
-                    f"Unknown backend: {backend!r}. Supported backend is 'sqlite'."
+                    f"Unknown backend: {backend!r}. Supported backends are 'sqlite' and 'memory'."
                 )
-            try:
-                self._backend = SQLiteStateBackend(self.state_dir / f"{name}_state.db")
-            except Exception as e:
-                logger.critical(
-                    f"Failed to initialize SQLite backend for '{name}' at "
-                    f"{self.state_dir}: {e}. "
-                    f"Check disk space, directory permissions, and filesystem health."
-                )
-                raise RuntimeError(
-                    f"SQLite backend initialization failed for '{name}': {e}"
-                ) from e
         elif isinstance(backend, AbstractStateBackend):
-            # 内置 SQLite 实例与字符串 "sqlite" 统一命名，避免同一后端两种 backend_type。
+            # 命名标准化：内置 SQLite/Memory 实例使用标准名称
             self.backend_type = (
                 "sqlite" if isinstance(backend, SQLiteStateBackend)
+                else "memory" if isinstance(backend, InMemoryStateBackend)
                 else backend.__class__.__name__
             )
             self._backend = backend
         else:
             raise TypeError(
-                f"backend must be 'sqlite' or AbstractStateBackend instance, "
+                f"backend must be 'sqlite', 'memory', or AbstractStateBackend instance, "
                 f"got {type(backend).__name__}"
             )
+
 
 
 
