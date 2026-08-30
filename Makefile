@@ -25,7 +25,7 @@ test-matrix:  ## 多解释器矩阵冒烟（遍历本地 3.9/3.10/3.11/3.12/3.13
 	@for py in python3.9 python3.10 python3.11 python3.12 python3.13 python3.14; do \
 		if command -v $$py >/dev/null 2>&1; then \
 			echo "=== Testing import & typing with $$py ==="; \
-			$$py -c 'import tasklite; from tasklite import pipeline_util; import typing; typing.get_type_hints(pipeline_util.run_pipeline)' || exit 1; \
+			$$py -c 'import tasklite; from tasklite import TaskLite; import typing; typing.get_type_hints(TaskLite.run_graceful)' || exit 1; \
 			if $$py -c 'import pytest' >/dev/null 2>&1; then \
 				echo "=== Running pytest with $$py ==="; \
 				$$py -m pytest tests/ -q -p no:cacheprovider -m "not hypothesis" || exit 1; \

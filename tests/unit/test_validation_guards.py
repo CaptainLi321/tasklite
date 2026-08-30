@@ -22,13 +22,17 @@ from tests.helpers import make_pipeline
 
 class TestBackendTypeGuard:
     def test_constructor_rejects_non_sqlite_object(self, tmp_path):
-        """backend 必须是 'sqlite' 或 AbstractStateBackend 实例，否则 TypeError。"""
+        """backend 必须是 'sqlite'、'memory' 或 AbstractStateBackend 实例，否则 TypeError。"""
         with pytest.raises(TypeError, match="backend must be"):
             TaskLite(name="t", state_dir=tmp_path / "s", backend=42)
     def test_constructor_rejects_unrecognized_string(self, tmp_path):
         # 非法字符串走 ValueError（Unknown backend），非字符串对象走 TypeError
         with pytest.raises(ValueError, match="Unknown backend"):
             TaskLite(name="t", state_dir=tmp_path / "s", backend="mysql")
+    def test_constructor_accepts_memory_backend(self, tmp_path):
+        p = TaskLite(name="t", state_dir=tmp_path / "s", backend="memory")
+        assert p.backend_type == "memory"
+
 
 # ─── TaskLite 构造：max_workers 非法 ─────────────────────────
 

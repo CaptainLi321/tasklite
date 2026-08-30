@@ -94,7 +94,7 @@
 
 ---
 
-## 四、执行机器职责划分（12 模块）
+## 四、执行机器职责划分（11 模块）
 
 | 模块 | 职责定位 | 核心接口 / 概念 |
 |---|---|---|
@@ -108,7 +108,6 @@
 | `recovery.py` | 崩溃恢复、TOCTOU 闭环 abort、信号排空 | `RecoveryMachine.abort_in_flight`, `save_queue_crash_safe` |
 | `resource.py` | 限速与容量资源抽象与挂起语义 | `Resource`, `RateLimitResource`, `CapacityResource` |
 | `retry.py` | 退避时延计算与 rerun 策略判定（纯逻辑） | `compute_backoff`, `rerun_skips`, `input_changed` |
-| `deadlock.py` | 死锁队列细粒度拆分原语（纯逻辑） | `split_deadlock` |
 | `inflight.py` | 在途任务条目共享数据结构 | `InFlightJob` |
 
 ---
