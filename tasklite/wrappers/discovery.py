@@ -183,69 +183,9 @@ class DiscoveryHost(Protocol):
 
     def set_discovery_rerun(self, task_type: str, rerun: str) -> None: ...
 
-# 单射转义：job_id 派生采用「百分号转义」。
-# 干净 id 原样输出；脏 id 逐字符按 **UTF-8 字节** → %XX（每字节固定 2 位 hex）。
-# 与 lockfile 的 safe_uid_filename 同款单射论证（见 sanitize_content_id docstring）。
-_JOB_ID_MAX = 120
-_CLEAN_CHARS = re.compile(r"^[A-Za-z0-9\-_.]+$")
-_CLEAN_SINGLE = re.compile(r"[A-Za-z0-9\-_.]")
+# 内容 id 单射净化：实现已统一收敛至 utils.injective
+from ..utils.injective import sanitize_content_id
 
-
-def _escape_content_id(content_id: str) -> str:
-    """单射转义：非 ``[A-Za-z0-9-_.]`` 字符按 UTF-8 字节 → ``%XX``（固定 2 位）。
-
-    必须按字节而非码点转义：``ord(ch)`` 的 hex 变长（码点 0x100+ 产生
-    4+ 位 hex），前缀歧义破坏单射（如 U+04E2+'D' 与 U+04E2D 都映射 %4E2D，
-    违背「不同 content_id 永远派生不同 job_id」的核心不变量）。本函数按
-    UTF-8 字节转义：每个非干净字符 → 其 UTF-8 字节序列逐字节 %XX（固定 2 位），
-    不同字符映射不同字节序列 → 单射；``%`` 本身字节 0x25 → ``%25``，编码
-    序列中的 ``%`` 永不与用户输入混淆。
-    """
-    parts = []
-    for ch in content_id:
-        if _CLEAN_SINGLE.fullmatch(ch):
-            parts.append(ch)
-        else:
-            parts.append("".join(f"%{b:02X}" for b in ch.encode("utf-8")))
-    return "".join(parts)
-
-
-
-# 内容 id 净化 —— 单点函数（唯一事实来源）。指纹格式变更会使同一内容
-# 派生新 job_id（存量 wall 去重失效、历史内容一次性重复处理）——该迁移
-# 代价随版本发布说明明示（与 README 承诺一致）。
-
-
-
-def sanitize_content_id(content_id: str) -> str:
-    """净化内容 id 以符合 Job.job_id 约束（不含 "::"、长度合理）。
-
-    公共 API：存档迁移、job_id 派生等需要与框架同规则净化 content_id
-    的场景，一律用本函数（不要 import 私有函数/裸 SQL）。
-
-    单射转义——**不同 content_id 永远派生不同 job_id**：
-      - 干净 id（只含 ``[A-Za-z0-9-_.]`` 且 ≤120）→ **原样输出，零后缀**
-        （可读性满分，如画廊数字 id ``12345`` 净化后还是 ``12345``）；
-      - 脏 id → 百分号转义（先 ``%``→``%25`` 再非干净字符→``%XX``），
-        可读、确定、**单射可逆**——与 ``lockfile.safe_uid_filename`` 同款
-        论证：编码序列中的 ``%`` 永不与用户输入的 ``%`` 混淆（后者已被
-        ``%25`` 吸收），故映射数学上单射；
-      - 长度超限 → 截断 + 8 位 SHA256 指纹（**唯一保留 hash 的场景**；
-        截断破坏单射是显式接受的工程权衡，32bit 碰撞概率可忽略）。
-
-    派生规则是单射的 → 业务方**不需要也不允许**自行追加 hash 后缀防碰撞
-    （内容变化触发重跑的需求由 rerun 策略承接，见 README/REFACTOR 文档）。
-    规则变更会使同一内容派生新 job_id（存量 wall 去重失效、历史内容一次性
-    重复处理）——该迁移代价随版本发布说明明示（幂等下游可吸收）。
-    """
-    if _CLEAN_CHARS.fullmatch(content_id) and len(content_id) <= _JOB_ID_MAX:
-        return content_id
-    escaped = _escape_content_id(content_id)
-    if len(escaped) <= _JOB_ID_MAX:
-        return escaped
-    digest = hashlib.sha256(content_id.encode()).hexdigest()[:8]
-    base_limit = _JOB_ID_MAX - 9  # "_" 分隔符 + 8 位指纹
-    return f"{escaped[:base_limit]}_{digest}"
 
 
 class DiscoveryHandler:
