@@ -92,6 +92,21 @@ def test_rate_suspended_until_none_when_idle(monkeypatch):
     assert r.suspended_until() is None
 
 
+def test_capacity_suspended_until_none_when_idle(monkeypatch):
+    """CapacityResource 无挂起或挂起过期时 suspended_until 返回 None。"""
+    clock = FakeClock()
+    monkeypatch.setattr(_RESOURCE_TIME, clock)
+
+    r = CapacityResource("test", max_capacity=10.0)
+    assert r.suspended_until() is None
+
+    r.suspend(5.0)
+    assert r.suspended_until() is not None
+
+    clock.advance(5.0)
+    assert r.suspended_until() is None
+
+
 def test_rate_amount_multiplies_interval(monkeypatch):
     """acquire(3.0) pushes next_available by 6.0s (interval * amount)."""
     clock = FakeClock()

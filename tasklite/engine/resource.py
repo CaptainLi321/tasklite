@@ -232,9 +232,8 @@ class CapacityResource(Resource):
         self.suspend_until = max(self.suspend_until, now + seconds)
 
     def suspended_until(self) -> Optional[float]:
-        # Capacity 的挂起字段初始 0.0（无挂起）→ None；挂起后为
-        # monotonic 截止时刻
-        return self.suspend_until if self.suspend_until > 0 else None
+        # 仅在存在有效挂起（未来截止时刻）时返回；过期或无挂起返回 None
+        return self.suspend_until if self.suspend_until > time.monotonic() else None
 
     def __repr__(self) -> str:
         return f"CapacityResource(name={self.name!r}, used={self.used}, capacity={self.capacity})"
