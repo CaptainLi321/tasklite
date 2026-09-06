@@ -1,112 +1,62 @@
-"""一次 run() 的运行上下文（RunContext）——一次 run 内跨职责共享的
-可变运行态真相源。
-
-把「一次 run 内跨职责共享的可变运行态」从 TaskLite 宿主属性收敛为
-独立的 ``RunContext``：调度循环 / 派发 / 完成 / 失败机器从同一个
-``RunContext`` 取依赖，不依赖宿主类杂散属性。
-
-归属划分：
-- 常驻服务引用（构造注入，跨 run 存活）：``backend``/``scheduler``/
-  ``resources``/``handlers``/``executor``/``ipc_dir``/``output_root``/
-  ``transient_registry``/``discovery_rerun``。
-- 每-run 可变运行态（``run()`` 建立）：``state``（PipelineState）、
-  ``in_flight``、``run_id``/``dispatch_seq``（fencing）、``stop_mode``
-  （停机状态机，单枚举）、``stats``（计数）、episode 态
-  ``dep_grace_*``/``deadlock_gap_rounds``。
-- 钩子单一出口：``fire_job_completed``（异常隔离 + hook_errors 计数）。
-"""
+from __future__ import annotations
 
 import enum
 import logging
+import pickle
+import signal
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING, Tuple, Union
-
-if TYPE_CHECKING:
-    from pathlib import Path
-    from ..backend.base import AbstractStateBackend
-    from .scheduler import Scheduler
-    from ..models.resource import Resource
-    from ..models.handler import HandlerEntry
-    from .executor import SubprocessExecutor
-    from ..models.exceptions_registry import TransientExceptionRegistry
-
-from .failure import (
-    COMMIT_FAILURE_DLQ_THRESHOLD,
-    DEADLOCK_GAP_MAX_ROUNDS,
-    DEP_GRACE_SECONDS,
-)
-from .channel import ExecutionChannel
-from .inflight import InFlightTracker
-from .policy import PreflightPolicy
-from .resource import Resource, ResourceManager, WORKER_RESOURCE
-from .store import StateStore
-from ..models.state import PipelineState
-from ..utils.jsonutil import dumps
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 logger = logging.getLogger("tasklite")
 
+# 资源与运行时常量（提前定义避免模块环形导入）
+WORKER_RESOURCE = "__workers__"
+META_RESOURCE_SUSPENDS = "resource_suspends"
+RT_BACKOFF_UNTIL = "_backoff_until"
+RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
+RT_COMMIT_FAILURES = "_commit_failures"
+
+EMPTY_STATS = {
+    "completed": 0,
+    "failed": 0,
+    "retried": 0,
+    "skipped": 0,
+    "hook_errors": 0,
+    "deferred_orphan": 0,
+    "interrupted_reruns": 0,
+    "cascade_failed": 0,
+}
 
 
-@dataclass
-class EpisodeState:
-    """一次 run 内跨轮累计的治理状态（死锁宽限与缺口升级跟踪）。"""
-
-    dep_grace_deadline: Optional[float] = None
-    dep_grace_missing: Optional[frozenset] = None
-    deadlock_gap_rounds: int = 0
-
-    def reset(self) -> None:
-        """重置所有 episode 状态。"""
-        self.dep_grace_deadline = None
-        self.dep_grace_missing = None
-        self.deadlock_gap_rounds = 0
+def inject_worker_resource(job_dict: dict) -> None:
+    """给 job_dict 的 resources 注入默认 worker 槽位。"""
+    resources = dict(job_dict.get("resources", {}))
+    if WORKER_RESOURCE not in resources:
+        resources[WORKER_RESOURCE] = 1.0
+    job_dict["resources"] = resources
 
 
 class StopMode(enum.Enum):
-    """停机状态机三态。
-
-    - NONE：正常运行；
-    - DRAINING：请求优雅停机——不派发新 job，等 in-flight 自然完成后退出
-      （stop / 首次 SIGTERM/SIGINT）；
-    - ABORTING：强制停机——分类消费在途任务（已完成者照常提交），进行中
-      者 kill + 清半成品 + requeue（stop(force=True) / 二次信号）。
-    """
-
+    """停机状态机三态。"""
     NONE = "none"
     DRAINING = "draining"
     ABORTING = "aborting"
 
 
-# 内部 worker 资源名：每个 job 默认占用 1 个 worker 槽位（放 runtime
-# 避免 dispatch/completion 反向 import pipeline）。
-WORKER_RESOURCE = "__workers__"
-
-# 资源 suspend 状态在 meta 表的存储键（{资源名: wall-clock 截止时刻}）。
-META_RESOURCE_SUSPENDS = "resource_suspends"
-
-# 运行统计初始值（放 runtime 避免循环 import；hook_errors/deferred_orphan
-# 是运行期动态键，预置后累加不依赖拼写正确）。
-# job_dict["runtime"] 框架寄生键（常量集中管理：字符串字面量散落各处
-# 易拼错且无 IDE 提示，统一常量并集中于此）。下划线前缀=框架内部命名空间，
-# 业务不得读写。
-RT_BACKOFF_UNTIL = "_backoff_until" # monotonic 退避截止（内存态）
-RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline" # wall-clock 退避截止（持久化）
-RT_COMMIT_FAILURES = "_commit_failures" # commit 失败 3-strike 计数
-
-EMPTY_STATS = {"completed": 0, "failed": 0, "retried": 0, "skipped": 0,
-               "hook_errors": 0, "deferred_orphan": 0, "interrupted_reruns": 0,
-               # 因上游失败被级联阻断的下游数（JOB_DEPENDENCY）——与真正
-               # 执行失败的 failed 分开统计，DLQ 规模不被无辜下游膨胀。
-               "cascade_failed": 0}
+class ExitReason(str, enum.Enum):
+    """引擎退出原因。"""
+    COMPLETED = "completed"
+    STOPPED_DRAINING = "stopped_draining"
+    STOPPED_ABORTING = "stopped_aborting"
+    INTERRUPTED = "interrupted"
+    ERROR = "error"
 
 
 class TaskStats(dict):
-    """运行统计的 dict 子类（仍是 dict，但提供类型化只读属性）。
-
-    ``stats["completed"]`` 与 ``stats.completed`` 两种写法并存（属性
-    改善可读性与 IDE 提示）；值始终为 int。
-    """
+    """运行统计字典。"""
 
     def __init__(self) -> None:
         super().__init__(EMPTY_STATS)
@@ -144,48 +94,110 @@ class TaskStats(dict):
         return self["cascade_failed"]
 
 
-def inject_worker_resource(job_dict: dict) -> None:
-    """给 job_dict 的 resources 注入默认 worker 槽位（若未显式声明）。
+from .failure import (
+    COMMIT_FAILURE_DLQ_THRESHOLD,
+    DEADLOCK_GAP_MAX_ROUNDS,
+    DEP_GRACE_SECONDS,
+)
+from .channel import ExecutionChannel
+from .inflight import InFlightTracker
+from .policy import PreflightPolicy
+from .resource import CapacityResource, Resource, ResourceManager
+from .scheduler import JobScheduler
+from .store import StateStore
+from ..backend.base import AbstractStateBackend
+from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..models.context import TaskContext
+from ..models.job import Job
+from ..models.state import PipelineState, uid_from_job_dict
+from ..utils.jsonutil import dumps, loads
+from ..utils.lockfile import release_lock, try_acquire_lock
 
-    这样 ``__workers__`` 进入 job_dict 的 resources，scheduler 的
-    ``can_acquire`` 检查和 DispatchMachine 的 acquire/release 自然处理它。
-    用户可显式声明 ``resources={"__workers__": 2.0}`` 占多槽位。
 
-    ``Job.to_dict()`` 返回的 ``resources`` 是原 Job 对象的引用，这里必须
-    用 ``dict(...)`` 拷贝后替换，避免污染传入的 Job 对象。
-    """
-    resources = dict(job_dict.get("resources", {}))
-    if WORKER_RESOURCE not in resources:
-        resources[WORKER_RESOURCE] = 1.0
-    job_dict["resources"] = resources
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """EngineRuntime 的静态装配配置规范。"""
+    name: str
+    ipc_dir: str
+    output_root: Optional[Union[Path, Sequence[Path]]] = None
+    strict_picklable: bool = False
+    dep_grace_seconds: float = DEP_GRACE_SECONDS
+    commit_failure_dlq_threshold: int = COMMIT_FAILURE_DLQ_THRESHOLD
+    deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
+    fatal_exceptions: Optional[Tuple[type, ...]] = None
+    transient_exceptions: Optional[Tuple[type, ...]] = None
+    on_run_start: Optional[Callable[[], None]] = None
+    on_run_end: Optional[Callable[[str], None]] = None
+    on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None
+
+
+@dataclass(frozen=True)
+class ExecutionOptions:
+    """execute() 单次运行的动态选项。"""
+    install_signals: bool = True
+    acquire_run_lock: bool = True
+
+
+@dataclass(frozen=True)
+class StepOutcome:
+    """step() 单步事件泵的执行产物。"""
+    dispatched_count: int
+    completed_count: int
+    is_idle: bool
+    should_wait: bool
+    wait_time: float
+    deadlock_detected: bool
+    stop_mode: StopMode
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """引擎执行完成后的不可变运行摘要。"""
+    exit_reason: ExitReason
+    stats: "TaskStats"
+    run_id: str
+    duration_seconds: float
+    unhandled_exception: Optional[BaseException] = None
+
+
+@dataclass
+class EpisodeState:
+    """一次 run 内跨轮累计的治理状态。"""
+    dep_grace_deadline: Optional[float] = None
+    dep_grace_missing: Optional[frozenset] = None
+    deadlock_gap_rounds: int = 0
+
+    def reset(self) -> None:
+        self.dep_grace_deadline = None
+        self.dep_grace_missing = None
+        self.deadlock_gap_rounds = 0
 
 
 class RunContext:
-    """一次 run() 的运行上下文：跨职责共享的可变运行态容器。"""
+    """一次 run() 的运行上下文容器。"""
 
     def __init__(
         self,
         *,
         name: str,
-        backend: "AbstractStateBackend",
-        scheduler: "Scheduler",
-        resources: Dict[str, "Resource"],
-        handlers: Dict[str, "HandlerEntry"],
-        executor: "SubprocessExecutor",
+        backend: AbstractStateBackend,
+        scheduler: JobScheduler,
+        resources: Union[ResourceManager, Dict[str, Resource]],
+        handlers: Dict[str, Any],
+        executor: Any,
         ipc_dir: str,
-        output_root: Optional[Union[str, "Path"]],
-        on_run_start: Optional[Callable[[], None]],
-        on_job_completed: Optional[Callable[[str, dict, bool, bool], None]],
-        on_run_end: Optional[Callable[[str], None]],
-        transient_registry: "TransientExceptionRegistry",
-        discovery_rerun: Dict[str, str],
+        output_root: Optional[Union[str, Path, Sequence[Path]]] = None,
+        on_run_start: Optional[Callable[[], None]] = None,
+        on_job_completed: Optional[Callable[[str, dict, bool, bool], None]] = None,
+        on_run_end: Optional[Callable[[str], None]] = None,
+        transient_registry: Any = None,
+        discovery_rerun: Optional[Dict[str, str]] = None,
         fatal_exceptions: Optional[Tuple[type, ...]] = None,
         transient_exceptions: Optional[Tuple[type, ...]] = None,
         dep_grace_seconds: Optional[float] = None,
         commit_failure_dlq_threshold: Optional[int] = None,
         deadlock_gap_max_rounds: Optional[int] = None,
     ) -> None:
-        # ── 常驻服务引用（构造注入，跨 run 存活）──────────────────
         self.name = name
         self.backend = backend
         self.scheduler = scheduler
@@ -200,31 +212,27 @@ class RunContext:
         self.ipc_dir = ipc_dir
         self.output_root = output_root
         self.transient_registry = transient_registry
-        # per-pipeline 异常分类覆盖（None=用 exceptions 模块默认元组）。
-        # 与瞬态注册表同纪律：快照随 ctx pickle 下发子进程，分类决策
-        # 不读模块级可变全局。
-        self.fatal_exceptions: Optional[tuple] = (
-            tuple(fatal_exceptions) if fatal_exceptions is not None else None)
-        self.transient_exceptions: Optional[tuple] = (
-            tuple(transient_exceptions) if transient_exceptions is not None else None)
-        self.discovery_rerun = discovery_rerun
+        self.fatal_exceptions = tuple(fatal_exceptions) if fatal_exceptions is not None else None
+        self.transient_exceptions = tuple(transient_exceptions) if transient_exceptions is not None else None
+        self.discovery_rerun = discovery_rerun if discovery_rerun is not None else {}
         self.policy: PreflightPolicy = PreflightPolicy(self.discovery_rerun)
 
-        # 引擎阈值可配（支持外部配置：None=沿用 failure.py 模块默认）——
-        # 不同业务对「依赖宽限时长 / commit 崩溃容忍度 / 死锁观察轮数」
-        # 的合理值差异很大，不应硬编码。
         self.dep_grace_seconds: float = (
-            float(dep_grace_seconds) if dep_grace_seconds is not None else DEP_GRACE_SECONDS)
+            float(dep_grace_seconds) if dep_grace_seconds is not None else DEP_GRACE_SECONDS
+        )
         self.commit_failure_dlq_threshold: int = (
             int(commit_failure_dlq_threshold)
-            if commit_failure_dlq_threshold is not None else COMMIT_FAILURE_DLQ_THRESHOLD)
+            if commit_failure_dlq_threshold is not None else COMMIT_FAILURE_DLQ_THRESHOLD
+        )
         self.deadlock_gap_max_rounds: int = (
             int(deadlock_gap_max_rounds)
-            if deadlock_gap_max_rounds is not None else DEADLOCK_GAP_MAX_ROUNDS)
-        # ── 钩子（单一出口 fire_job_completed/fire_run_end，异常隔离）──
+            if deadlock_gap_max_rounds is not None else DEADLOCK_GAP_MAX_ROUNDS
+        )
+
         self.on_run_start = on_run_start
         self.on_job_completed = on_job_completed
         self.on_run_end = on_run_end
+
         self.store: StateStore = StateStore(
             self.backend,
             commit_failure_dlq_threshold=self.commit_failure_dlq_threshold,
@@ -233,19 +241,14 @@ class RunContext:
             self.ipc_dir,
             executor=self.executor,
         )
-        # ── 每-run 可变运行态（run 建立）────────────────────
+
         self.state: Optional[PipelineState] = None
         self._in_flight: InFlightTracker = InFlightTracker()
         self.run_id: Optional[str] = None
         self.dispatch_seq: int = 0
-        # 停机状态机：单枚举——双独立 bool 可组合出非法状态（force 而未
-        # 请求停机），枚举从类型上保证状态合法且互斥。
         self.stop_mode: StopMode = StopMode.NONE
         self.stats: TaskStats = TaskStats()
-        # episode 态（一次 run 内跨轮累计，独立容器存储）
         self.episode: EpisodeState = EpisodeState()
-        # on_run_end 幂等标志——run 的 finally 与 LoopRunner 都可能触发，
-        # 保证整个 run 只调用一次。
         self._run_end_fired = False
 
     @property
@@ -287,30 +290,13 @@ class RunContext:
         self.episode.deadlock_gap_rounds = value
 
     def reset_episode(self) -> None:
-        """重置 episode 态（新 run 开始时调用）。"""
         self.episode.reset()
 
     def set_state(self, state: PipelineState) -> None:
-        """装载本次 run 的 PipelineState（``_run_body`` 加载修复后调用）。"""
         self.state = state
         self.store.set_state(state)
 
     def persist_resource_suspends_now(self) -> None:
-        """把资源挂起截止**即时**持久化到 meta 表。
-
-        挂起的应用点（completion.apply_result /
-        recovery.apply_pending_signals）调用本方法即时落盘——仅靠 run
-        收尾持久化的话，kill -9/OOM/断电时运行中累计的挂起全部丢失，
-        重启后全速重打正在限流本机的 API（README 主打的崩溃安全场景
-        失效）。幂等 UPSERT，成本一次小事务，仅在确有挂起时写入。
-        RecoveryMachine.persist_resource_suspends（run 收尾单点）保留为
-        薄转发以兼容既有调用面与既有契约测试。
-
-        suspend_until/next_available 是 monotonic 时钟（系统重启归零），
-        换算为 wall-clock 截止（time.time + 剩余秒），加载时反向换算；
-        全部无挂起时写空映射清除旧数据。失败 error 级日志（与
-        last_run_id 的 fail-loud 策略对齐——静默丢失正是要消除的）。
-        """
         deadlines = self.resource_mgr.collect_suspensions()
         try:
             self.backend.set_meta(META_RESOURCE_SUSPENDS, dumps(deadlines))
@@ -320,11 +306,6 @@ class RunContext:
     def fire_job_completed(
         self, uid: str, meta: Dict[str, Any], success: bool, going_to_retry: bool,
     ) -> None:
-        """钩子单一出口：所有 job 终结路径都经此触发。
-
-        钩子按不可信代码对待：抛异常 catch + ``stats["hook_errors"]`` 计数，
-        绝不影响主循环。``on_job_completed is None`` 时直接返回。
-        """
         if self.on_job_completed is None:
             return
         try:
@@ -334,15 +315,9 @@ class RunContext:
             self.stats["hook_errors"] += 1
 
     def reset_run_end_fired(self) -> None:
-        """重置 on_run_end 幂等标志（新 run 开始时由宿主 pipeline 调用）。
-
-        幂等标志是 RunContext 的私有运行态——跨模块直写私有属性属
-        违规访问，经本方法收敛为公开出口。
-        """
         self._run_end_fired = False
 
     def fire_run_end(self, reason: str) -> None:
-        """on_run_end 钩子单一出口（run 正常/中断/崩溃统一触发，幂等）。"""
         if self._run_end_fired:
             return
         self._run_end_fired = True
@@ -353,3 +328,288 @@ class RunContext:
         except Exception as e:
             logger.warning(f"on_run_end hook raised: {e}")
             self.stats["hook_errors"] += 1
+
+
+class EngineRuntime:
+    """TaskLite 核心运行期深模块。"""
+
+    def __init__(
+        self,
+        config: RuntimeConfig,
+        backend: AbstractStateBackend,
+        resources: Union[ResourceManager, Dict[str, Resource]],
+        handlers: Dict[str, Any],
+        executor: Any,
+        transient_registry: Any,
+        discovery_rerun: Dict[str, str],
+    ) -> None:
+        from .completion import CompletionMachine
+        from .dispatch import DispatchMachine
+        from .failure import FailureMachine
+        from .loop import LoopRunner
+        from .recovery import RecoveryMachine
+
+        self.config = config
+        self.backend = backend
+        self.handlers = handlers
+        self.discovery_rerun = discovery_rerun
+        self.transient_registry = transient_registry
+
+        # 构建调度器
+        self.scheduler = JobScheduler(resources=resources, handlers=self.handlers)
+
+        # 构建运行上下文
+        self._ctx = RunContext(
+            name=config.name,
+            backend=self.backend,
+            scheduler=self.scheduler,
+            resources=resources,
+            handlers=self.handlers,
+            executor=executor,
+            ipc_dir=config.ipc_dir,
+            output_root=config.output_root,
+            on_run_start=config.on_run_start,
+            on_job_completed=config.on_job_completed,
+            on_run_end=config.on_run_end,
+            transient_registry=transient_registry,
+            discovery_rerun=discovery_rerun,
+            fatal_exceptions=config.fatal_exceptions,
+            transient_exceptions=config.transient_exceptions,
+            dep_grace_seconds=config.dep_grace_seconds,
+            commit_failure_dlq_threshold=config.commit_failure_dlq_threshold,
+            deadlock_gap_max_rounds=config.deadlock_gap_max_rounds,
+        )
+
+        # 构建机器依赖拓扑
+        self._failure = FailureMachine(self._ctx)
+        self._completion = CompletionMachine(self._ctx, self._failure)
+        self._dispatch = DispatchMachine(self._ctx, self._failure, self._completion)
+        self._recovery = RecoveryMachine(self._ctx, self._completion)
+        self._loop = LoopRunner(
+            self._ctx, self._recovery, self._dispatch, self._failure, self._completion
+        )
+
+        self._run_lock_fd: Optional[int] = None
+        self._is_running: bool = False
+
+    @property
+    def ctx(self) -> RunContext:
+        return self._ctx
+
+    @property
+    def stats(self) -> TaskStats:
+        return self._ctx.stats
+
+    @property
+    def stop_mode(self) -> StopMode:
+        return self._ctx.stop_mode
+
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
+    @property
+    def state(self) -> Optional[PipelineState]:
+        return self._ctx.state
+
+    @property
+    def store(self) -> StateStore:
+        return self._ctx.store
+
+    @property
+    def channel(self) -> ExecutionChannel:
+        return self._ctx.channel
+
+    def request_stop(self, force: bool = False) -> StopMode:
+        """停机请求接口（单调状态转移）。"""
+        if force or self._ctx.stop_mode == StopMode.DRAINING:
+            self._ctx.stop_mode = StopMode.ABORTING
+            logger.info("停机状态升级为 ABORTING（强制终止在途任务）")
+        elif self._ctx.stop_mode == StopMode.NONE:
+            self._ctx.stop_mode = StopMode.DRAINING
+            logger.info("停机状态设置为 DRAINING（等待在途任务完成）")
+        return self._ctx.stop_mode
+
+    def execute(self, options: Optional[ExecutionOptions] = None) -> RunSummary:
+        """完整执行管线生命周期。"""
+        opts = options or ExecutionOptions()
+        start_time = time.monotonic()
+        exit_reason = ExitReason.COMPLETED
+        unhandled_exc: Optional[BaseException] = None
+
+        if self._is_running:
+            raise RuntimeError("Pipeline run() already in progress on this instance.")
+        self._is_running = True
+
+        # 1. 单运行排他文件锁
+        if opts.acquire_run_lock:
+            lock_fd = try_acquire_lock(self._ctx.ipc_dir, "__pipeline_run__", timeout=0)
+            if lock_fd is None:
+                self._is_running = False
+                raise RuntimeError(
+                    f"Another run() is in progress for state_dir {self._ctx.ipc_dir}; "
+                    f"concurrent runs on the same state are forbidden."
+                )
+            self._run_lock_fd = lock_fd
+
+        # 2. 信号陷阱
+        old_sigterm = None
+        old_sigint = None
+        if opts.install_signals:
+            try:
+                old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
+            except (ValueError, OSError):
+                pass
+            try:
+                old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
+            except (ValueError, OSError):
+                pass
+
+        try:
+            self._preflight_picklable_callbacks()
+            self._ctx.stats = TaskStats()
+            self._ctx.reset_episode()
+            self._ctx.reset_run_end_fired()
+            self._ctx.stop_mode = StopMode.NONE
+
+            # on_run_start 钩子
+            if self.config.on_run_start is not None:
+                try:
+                    self.config.on_run_start()
+                except Exception as e:
+                    logger.warning(f"on_run_start hook raised: {e}")
+                    self._ctx.stats["hook_errors"] += 1
+
+            self._run_body()
+
+            if self._ctx.stop_mode == StopMode.ABORTING:
+                exit_reason = ExitReason.STOPPED_ABORTING
+            elif self._ctx.stop_mode == StopMode.DRAINING:
+                exit_reason = ExitReason.STOPPED_DRAINING
+            else:
+                exit_reason = ExitReason.COMPLETED
+
+        except KeyboardInterrupt as e:
+            exit_reason = ExitReason.INTERRUPTED
+            unhandled_exc = e
+            self._ctx.fire_run_end("interrupted")
+            raise
+        except BaseException as e:
+            exit_reason = ExitReason.ERROR
+            unhandled_exc = e
+            self._ctx.fire_run_end("error")
+            raise
+        finally:
+            self._ctx.fire_run_end(exit_reason.value)
+            if self._run_lock_fd is not None:
+                release_lock(self._run_lock_fd)
+                self._run_lock_fd = None
+            self._is_running = False
+
+            if old_sigterm is not None:
+                signal.signal(signal.SIGTERM, old_sigterm)
+            if old_sigint is not None:
+                signal.signal(signal.SIGINT, old_sigint)
+
+        duration = time.monotonic() - start_time
+        return RunSummary(
+            exit_reason=exit_reason,
+            stats=self._ctx.stats,
+            run_id=self._ctx.run_id or "",
+            duration_seconds=duration,
+            unhandled_exception=unhandled_exc,
+        )
+
+    def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
+        """单步推进事件泵（确定性步进测试接缝）。"""
+        if self._ctx.state is None:
+            # 自动初始化测试状态
+            self._ctx.run_id = self._ctx.run_id or uuid.uuid4().hex
+            self._ctx.set_state(PipelineState({}, {}, {}, []))
+
+        # 1. Drain 回收
+        handles = [entry.handle for entry in self._ctx.in_flight.values() if entry.handle is not None]
+        completed_pairs = self._ctx.channel.poll_completed(handles)
+        for handle, result in completed_pairs:
+            entry = self._ctx.in_flight.pop(handle.uid, None)
+            if entry is not None:
+                self._completion.apply_result(
+                    handle.uid, entry.job, entry.job_dict, result, job_start=entry.start_time
+                )
+
+        # 2. 填池派发
+        dispatched = 0
+        limit = max_dispatch if max_dispatch is not None else 1000
+        while dispatched < limit and self._ctx.stop_mode == StopMode.NONE:
+            ok, _ = self._ctx.resource_mgr.can_acquire_worker(1.0)
+            if not ok:
+                break
+            sched = self.scheduler.pop_next_runnable(
+                self._ctx.state, self._ctx.state.in_flight_uids
+            )
+            if sched.runnable_idx is None:
+                break
+            entry = self._dispatch.dispatch_job(sched)
+            if entry is not None:
+                dispatched += 1
+
+        is_idle = self._ctx.state.is_empty and not self._ctx.in_flight
+        return StepOutcome(
+            dispatched_count=dispatched,
+            completed_count=len(completed_pairs),
+            is_idle=is_idle,
+            should_wait=not is_idle and dispatched == 0,
+            wait_time=0.0,
+            deadlock_detected=False,
+            stop_mode=self._ctx.stop_mode,
+        )
+
+    def prepare_run_state(self) -> PipelineState:
+        """加载持久化状态、初始化 run_id 屏障、执行恢复修复并构建内存 PipelineState。"""
+        self.scheduler.begin_round()
+        wall = self.backend.load_wall()
+        failed = self.backend.load_failed()
+        cursors = self.backend.load_cursors()
+        q_data = self.backend.load_queue()
+
+        # Fencing 屏障
+        self._ctx.run_id = uuid.uuid4().hex
+        self._ctx.dispatch_seq = 0
+        try:
+            self.backend.set_meta("last_run_id", self._ctx.run_id)
+        except Exception as e:
+            logger.critical(f"Failed to persist run_id to meta table: {e}")
+            raise
+
+        # 启动期队列整理与资源挂起加载
+        q_data = self._recovery.repair_queue_on_load(q_data, wall, failed)
+        self._recovery.load_resource_suspends()
+
+        state = PipelineState(wall, failed, cursors, q_data)
+        self._ctx.set_state(state)
+        return state
+
+    def _run_loop(self) -> None:
+        """运行主事件循环。"""
+        self._loop.run_loop()
+
+    def _run_body(self) -> None:
+        """主执行体。"""
+        self.prepare_run_state()
+        self._run_loop()
+
+    def _handle_signal(self, signum: int, frame: Any) -> None:
+        logger.info(f"收到信号 {signum}，更新停机状态机……")
+        self.request_stop()
+
+    def _preflight_picklable_callbacks(self) -> None:
+        if not self.config.strict_picklable:
+            return
+        for task_type, entry in self.handlers.items():
+            try:
+                pickle.dumps(entry.func)
+            except Exception as e:
+                raise TypeError(
+                    f"Handler for task_type '{task_type}' is not picklable: {entry.func!r} ({e}). "
+                    f"Functions must be module-level."
+                ) from e
