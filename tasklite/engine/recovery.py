@@ -32,12 +32,25 @@ from .runtime import (
 logger = logging.getLogger("tasklite")
 
 
-class RecoveryMachine:
-    """崩溃恢复 + 强制停机收尾 + 启动期修复。"""
+class RecoveryOrchestrator:
+    """统一故障恢复、启动修复与在途任务收尾编排深模块（RecoveryOrchestrator）。
+
+    统一内敛：
+    1. 启动期队列修复（repair_queue_on_load：退避换算、残留过滤、去重整理）；
+    2. 资源挂起状态加载与持久化恢复（load_resource_suspends / persist_resource_suspends）；
+    3. 崩溃/异常路径安全保存队列（save_queue_crash_safe：以磁盘真相合并内存队列）；
+    4. 实时 suspend 信号排空与应用（apply_pending_signals）；
+    5. 异常/停机在途任务 TOCTOU 闭环中止与收尾（abort_in_flight）；
+    6. 陈旧孤儿结果认领与收尾（reclaim_stale_result）。
+    """
 
     def __init__(self, ctx: "RunContext", completion: "CompletionMachine") -> None:
         self._ctx = ctx
         self._completion = completion
+
+    def reclaim_stale_result(self, uid: str, job: Job, job_dict: dict) -> bool:
+        """启动或派发前认领并消费历史残留结果文件。"""
+        return self._completion.restore_stale_result(uid, job, job_dict)
 
     def repair_queue_on_load(
         self, q_data: list, wall: dict, failed: dict
@@ -371,3 +384,12 @@ class RecoveryMachine:
         self._ctx.state.clear_in_flight()
         if commit_crash is not None:
             raise commit_crash
+
+
+# 向下兼容别名
+RecoveryMachine = RecoveryOrchestrator
+
+__all__ = [
+    "RecoveryOrchestrator",
+    "RecoveryMachine",
+]
