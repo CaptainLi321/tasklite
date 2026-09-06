@@ -28,9 +28,6 @@ from .utils.injective import (
 # Public API - Contrib ecosystem
 from . import contrib
 
-# Public API - Generic pipeline scaffolding (run/revive/job-id/progress)
-from . import pipeline_util
-
 # Public API - Resources
 from .engine.resource import CapacityResource, RateLimitResource, Resource
 
@@ -63,8 +60,6 @@ __all__ = [
     "safe_uid_filename",
     # Contrib
     "contrib",
-    # Generic pipeline scaffolding
-    "pipeline_util",
     # Resources
     "Resource",
     "RateLimitResource",

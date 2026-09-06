@@ -410,8 +410,8 @@ class TestInputChangedDefense:
     """
 
     def _import_input_changed(self):
-        from tasklite.engine.retry import input_changed
-        return input_changed
+        from tasklite.engine.policy import PreflightPolicy
+        return PreflightPolicy().check_input_changed
 
     def test_non_dict_element_returns_true_not_crash(self):
         input_changed = self._import_input_changed()
