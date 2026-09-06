@@ -3,11 +3,14 @@
 import hashlib
 import pytest
 from tasklite.utils.injective import (
+    content_fingerprint,
     escape_injective,
-    sanitize_identifier,
-    sanitize_content_id,
     safe_uid_filename,
+    sanitize_content_id,
+    sanitize_identifier,
+    sanitize_job_component,
 )
+
 
 
 def test_escape_injective_basic_and_utf8():
@@ -91,3 +94,19 @@ def test_safe_uid_filename_escapes_filesystem_hazards():
     # Glob 元字符
     for ch in "*?[]":
         assert ch not in safe_uid_filename(f"t::a{ch}b")
+
+
+def test_content_fingerprint_deterministic_and_version_salted():
+    a = content_fingerprint(["encode", "dir/a.mkv", 100, "sub.ass"], version="2")
+    assert a == content_fingerprint(["encode", "dir/a.mkv", 100, "sub.ass"], version="2")
+    assert a != content_fingerprint(["encode", "dir/a.mkv", 100, "sub.ass"], version="3")
+    assert a != content_fingerprint(["encode", "dir/a.mkv", 101, "sub.ass"], version="2")
+    assert len(a) == 16
+
+
+def test_sanitize_job_component_delegation_and_invariants():
+    assert sanitize_job_component("a::b/c\\d") == "a%3A%3Ab%2Fc%5Cd"
+    assert sanitize_job_component("") == "untitled"
+    assert "::" not in sanitize_job_component("x::y")
+    assert sanitize_job_component("abc-_.123") == "abc-_.123"
+
