@@ -27,11 +27,9 @@ from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
 from ..models.job import Job
 from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE
+from .channel import ArtifactCleanupMode
 from .executor import JobHandle
 from .inflight import InFlightJob
-from ..utils.ipc import inputs_path, outputs_path, signals_path
-
-from ..utils.lockfile import probe_lock
 from ..utils.validation import validate_payload
 
 logger = logging.getLogger("tasklite")
@@ -151,7 +149,7 @@ class DispatchMachine:
         # probe 必须**先于** restore 与声明清理——
         # 孤儿存活时提前 return，绝不删孤儿实时声明；probe 通过后
         # restore 消费孤儿残留结果 → 不派发（无双跑）。
-        if not probe_lock(self._ctx.ipc_dir, uid):
+        if not self._ctx.channel.probe_orphan_lock(uid):
             logger.warning(
                 f"Deferring {uid}: orphan execution body still holds lock; "
                 f"requeue with short backoff."
@@ -206,30 +204,8 @@ class DispatchMachine:
         if self._completion.restore_stale_result(uid, job, job_dict):
             return None
 
-        # 崩溃残留声明文件污染——崩溃时序「drain 消费
-        # 结果后 _complete_job finally 前 SIGKILL」残留 outputs.jsonl，重派发
-        # 时新 worker **append** 声明 → [旧声明, 新声明] → 成功路径存在性
-        # 校验读到旧声明 → "Missing output" 假 DLQ。此处 _restore_stale_result
-        # 已返回 False（无残留结果可消费，只剩崩溃残留声明）→ submit 前
-        # 清残留；与 _complete_job finally 的防御一致（try/except OSError，
-        # FileNotFound 忽略），正常路径无残留时幂等 no-op。
-        # 清理块**必须在 probe 之后**——probe 失败（孤儿
-        # 存活）时已提前 return，绝不会走到这里删孤儿实时声明；probe 通过
-        # + restore 无果 = 无存活执行体且无残留结果，声明文件只可能是
-        # 已死执行留下的崩溃残留。
-        for _stale_decl in (
-            outputs_path(self._ctx.ipc_dir, uid), inputs_path(self._ctx.ipc_dir, uid),
-            # signals 文件同属已死执行的崩溃残留——上一执行
-            # 体写了 suspend 信号但主进程未及消费即崩，残留信号会在此刻
-            # （新 incarnation 派发前）被 apply_pending_signals 误应用到本轮
-            # 上下文（资源挂起与新执行体无关）。随声明文件一并清理。
-            signals_path(self._ctx.ipc_dir, uid),
-        ):
-            try:
-                if _stale_decl.exists():
-                    _stale_decl.unlink()
-            except OSError:
-                pass
+        # 派发前清理已死孤儿残留声明与信号文件
+        self._ctx.channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
 
         # Acquire resources via two-phase lease
         handle: Optional[JobHandle] = None

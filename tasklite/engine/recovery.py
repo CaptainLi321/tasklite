@@ -21,10 +21,6 @@ from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job
 from ..models.state import uid_from_job_dict
 from ..utils.jsonutil import loads
-from .executor import (
-    _decode_ipc_result, cleanup_ipc_files, read_result_file, read_signals,
-    result_path,
-)
 from .inflight import InFlightJob, InFlightTracker
 from .runtime import (
     META_RESOURCE_SUSPENDS,
@@ -205,17 +201,21 @@ class RecoveryOrchestrator:
 
         ``suspend()`` 使用 ``max`` 语义，重复应用同一信号是幂等的。
         """
-        for entry in self._ctx.in_flight.values():
-            signals = read_signals(self._ctx.ipc_dir, entry.uid)
-            for r_name, secs in signals:
-                if self._ctx.resource_mgr.suspend_resource(r_name, secs):
-                    logger.info(f"Applied suspend signal from {entry.uid}: {r_name} for {secs}s")
-                    self._ctx.persist_resource_suspends_now()
-                else:
-                    logger.warning(
-                        f"Skipping suspend signal for unregistered resource "
-                        f"{r_name!r} (from {entry.uid})"
-                    )
+        signals = self._ctx.channel.drain_active_signals(
+            entry.uid for entry in self._ctx.in_flight.values()
+        )
+        applied = False
+        for uid, r_name, secs in signals:
+            if self._ctx.resource_mgr.suspend_resource(r_name, secs):
+                logger.info(f"Applied suspend signal from {uid}: {r_name} for {secs}s")
+                applied = True
+            else:
+                logger.warning(
+                    f"Skipping suspend signal for unregistered resource "
+                    f"{r_name!r} (from {uid})"
+                )
+        if applied:
+            self._ctx.persist_resource_suspends_now()
 
 
 
@@ -226,164 +226,55 @@ class RecoveryOrchestrator:
         """异常/强制停机时：kill 进行中的子进程、消费已完成的结果、requeue。
 
         在 ``_run_loop`` 的 except 块和 ABORTING 停机路径调用。
-        kill 子进程避免泄漏 fd；清理半成品输出（与 ``_complete_job``
-        finally 共用 ``_cleanup_outputs``，被 kill job 的输出不残留）；
-        requeue 保证未 commit 的 job 不丢
-        （磁盘 queue 本就含它们，这里同步内存状态便于 save_queue）。
-        务必在 clear() 前释放已 acquire 的资源，避免资源计数器永久抬高。
-
-        时序契约：**先 kill 子进程、再清理输出**——子进程仍可能
-        正在写 declared_outputs，先清理会与写入并发交错（读到半截文件/
-        删除后被重新创建）。与正常路径（``_complete_job``：先等子进程死、
-        再清理）时序对齐。
-
-        按「当前 incarnation 的结果文件是否存在」分类：
-        「已完成」entry（结果文件已原子落盘、只差 drain 轮询回收）不得按
-        失败处理——若走「kill + 删结果文件 + 删已成功产出的物理文件 +
-        requeue」→ 重启必重跑，非幂等副作用（API POST/外发邮件）被重复执行
-        （窗口「job 完成至下一次 drain ≤50ms + 本轮调度」，在受控中止路径
-        确定性可命中）。结果文件存在的 entry 不 kill（进程已自然退出或
-        即将退出），改走 ``_complete_job`` 伪 entry 提交（与
-        ``_restore_stale_result`` 同模式）消费结果；只有无结果文件的 entry
-        才执行 kill + 清半成品 + requeue。该时序只适用于进行中 entry。
-
-        分类（读结果文件）与 kill 之间存在竞态窗口：分类读到无结果
-        （归 pending）→ worker 恰在 kill 前完成 ``write_result_atomic``
-        （结果文件出现）——若 kill 后立即删结果文件 + 删成功产出 +
-        requeue，重启必重跑，非幂等副作用被重复执行。由「kill 后重查」
-        兜底：先对全部 pending 只 kill + join（``executor.finalize_processes``，
-        不删结果文件），随后**重查** pending 的结果文件——kill 后新出现的
-        entry（worker 恰在分类与 kill 之间完成）移入 done 消费（走
-        ``_complete_job`` 伪 entry，不删成功输出、不 requeue），与 drain()
-        超时路径的「kill 后重读」（``executor._collect_outcome``）对称；
-        剩余 pending 才是真正「未完成」——此刻写入已因 kill/join 停止，
-        再统一 ``cleanup_ipc_files`` + ``_cleanup_outputs`` + requeue。
-        时序（先 kill 再清理）不变。
+        委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理），
+        本方法收敛状态机编排：排空信号 -> 释放资源 -> 重入队未完成 -> 伪 entry 提交已完成。
         """
         if not self._ctx.in_flight:
             return
-        # abort 前先消费所有 in-flight 的 suspend 信号——
-        # _apply_pending_signals 是 read_signals 的唯一消费点，只在正常主循环
-        # drain 阶段调用；abort 路径若直接 kill + cleanup_ipc_files（targets
-        # 含 signals 文件），未被读取的 suspend 限流信息会随文件删除丢失，
-        # 违反「崩溃/强制停机也要保留 429 限流状态」的已文档化承诺。在
-        # 分类/kill 前统一 drain 一次（排空语义：读后删，幂等），被杀 job
-        # 的挂起状态在 apply_pending_signals 内应用后即时持久化
-        # （RunContext.persist_resource_suspends_now 保证即时持久化）。
+
+        # 1. 消费所有 in-flight 的 suspend 信号
         self.apply_pending_signals()
-        # 分类——结果文件已落盘 = 执行已完成，只差提交。
-        # 只读一次并缓存 result dict（复用消费，避免双读 TOCTOU）；损坏/
-        # 非标准结果（read_result_file 返回 None 或无 "status" 键）按「未完成」
-        # 处理（与 consume_stale_result 的「损坏 = 无残留」语义一致：宁可重跑，不可
-        # 误判；且 _decode_ipc_result 遇无 status 的 dict 会访问 p.exitcode
-        # 崩 run——分类保证进入消费的 res 必为合法结果 dict）。
-        done_entries: List[Tuple[InFlightJob, dict]] = []
-        pending_entries: List[InFlightJob] = []
-        for entry in self._ctx.in_flight.values():
-            res_path = result_path(
-                entry.handle.ipc_dir, entry.uid, entry.handle.incarnation
-            )
-            if res_path.exists():
-                res = read_result_file(res_path)
-                # status=="interrupted"（worker 被 Ctrl+C/
-                # SIGTERM 中断）不视为已完成——abort 语义是「全部进行中
-                # job 视为未完成」，interrupted 归 pending requeue（不进
-                # DLQ、不级联），与 README「仅进行中 job requeue」一致。
-                if (res is not None and isinstance(res, dict) and "status" in res
-                        and res.get("status") != "interrupted"):
-                    done_entries.append((entry, res))
-                    continue
-            pending_entries.append(entry)
-        # 先释放资源（务必在 clear 前）
+
+        # 2. 释放已占用的资源（务必在 clear 前）
         self._ctx.in_flight.release_all_acquired(self._ctx.resource_mgr)
-        # 先 kill 全部**进行中**子进程（确保输出写入停止），
-        # 再清理半成品输出（与 _complete_job 的正常路径时序对齐）。
-        # 「已完成」entry 不 kill——结果已落盘，子进程已自然退出或即将退出。
-        # **先只 kill + join、不删 IPC 文件**
-        # （executor.finalize_processes）——分类（上方读结果文件判 done/
-        # pending）与 kill 之间，worker 可能恰好完成 write_result_atomic：
-        # 若 kill 后立即 cleanup_ipc_files 删结果文件，刚写好的成功结果被
-        # 清掉 → 成功 job 被误判未完成 → requeue → 重启必重跑，非幂等
-        # 副作用被重复执行。kill/join 后进程写入已停止，此刻重查结果文件
-        # 才无竞态。
-        handles = [entry.handle for entry in pending_entries]
-        self._ctx.channel.finalize_processes(handles)
-        # kill 后重查 pending 的结果文件——worker 恰在分类与 kill
-        # 之间完成写结果的 entry（结果文件此刻才出现）移入 done 消费
-        # （不删成功输出、不 requeue）；与 drain 超时路径的「kill 后
-        # 重读」对称。
-        still_pending: List[InFlightJob] = []
-        for entry in pending_entries:
-            res_path = result_path(
-                entry.handle.ipc_dir, entry.uid, entry.handle.incarnation
-            )
-            if res_path.exists():
-                res = read_result_file(res_path)
-                # 同初查——interrupted 结果归 pending requeue
-                if (res is not None and isinstance(res, dict) and "status" in res
-                        and res.get("status") != "interrupted"):
-                    done_entries.append((entry, res))
-                    continue
-            still_pending.append(entry)
-        pending_entries = still_pending
-        # 此刻进程已 kill/join（写入停止），对真正「未完成」的 entry
-        # 统一清理 IPC 文件（结果/signals/tmp——cleanup_ipc_files 语义）
-        # 与半成品输出。清理动作与 executor.cleanup 相同，但推迟到
-        # 重查之后，消除 TOCTOU 窗口。
-        for entry in pending_entries:
-            try:
-                cleanup_ipc_files(entry.handle.ipc_dir, entry.uid)
-            except Exception:
-                pass
-        # 清理被 kill job 的半成品输出（与 _complete_job 一致）。
-        # 输出从落盘 outputs.jsonl 读取（kill 前 handler 已落盘声明）。
-        for entry in pending_entries:
-            self._completion.cleanup_outputs(entry.uid)
-        # self._ctx.state 的 queue 不含 in-flight job（已 pop），requeue 后含它们，
-        # 与磁盘一致（commit 才删，它们未 commit）。requeue 到队首。
-        # 注意：只 requeue 进行中的 job——「已完成」entry 的结果将被
-        # _complete_job 提交到 wall/failed，不 requeue（否则重启必重跑，
-        # 非幂等副作用被重复执行，避免重复提交造成副作用重复）。
-        job_dicts = [entry.job_dict for entry in pending_entries]
-        # requeue 前先把 pending 从 in-flight 集合注销——
-        # 否则 pending 同时属于 queue（requeue 后）与 _in_flight_uids，随后
-        # done entry 消费（_complete_job → unregister_in_flight）触发
-        # `_assert_state_consistent` 的「queue ∩ in_flight 互斥」断言崩溃，
-        # 恢复路径被替换原异常（身份非真空的集合互斥被破坏）。
-        # 此处 unregister 的 pending 在 requeue 前仅在 in-flight（不在
-        # queue），断言通过；requeue 后 pending 只在 queue，互斥保持。rerun
-        # 任务经 spawn_jobs 重新登记 _rerun_active_uids，不泄漏豁免。
-        for pentry in pending_entries:
+
+        # 3. 委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理）
+        handles = [
+            entry.handle for entry in self._ctx.in_flight.values()
+            if entry.handle is not None
+        ]
+        outcome = self._ctx.channel.abort_in_flight(handles)
+
+        completed_map = {h.uid: res for h, res in outcome.completed}
+        cancelled_entries: List[InFlightJob] = []
+        done_entries: List[Tuple[InFlightJob, Any]] = []
+
+        for entry in self._ctx.in_flight.values():
+            if entry.uid in completed_map:
+                done_entries.append((entry, completed_map[entry.uid]))
+            else:
+                cancelled_entries.append(entry)
+
+        # 4. 未完成任务注销 in-flight 并 requeue 到队首
+        job_dicts = [entry.job_dict for entry in cancelled_entries]
+        for pentry in cancelled_entries:
             self._ctx.state.unregister_in_flight(pentry.uid)
         self._ctx.state.requeue_jobs(job_dicts, front=True)
-        # 消费「已完成」entry 的结果——走 _complete_job 伪
-        # entry 提交（acquired=[] 防二次释放、handle=None 使
-        # expect_in_flight=False 跳过 DEBUG 断言），复用单一出口收尾
-        # （成功进 wall / 失败进 DLQ / retry 退避重入队；失败清理与 IPC
-        # 文件清理由 _complete_job finally 统一执行）。
-        # commit 连续失败达阈值时 _complete_job 内层已转 _JobTerminated
-        # （job 已 DLQ 终结，消费语义视为完成）；_CommitCrashSignal（未达
-        # 阈值）保留到 abort 收尾后重抛——requeue 已由 _commit_failed_crash
+
+        # 5. 消费「已完成」entry 的结果（走伪 entry 统一出口）
         commit_crash: Optional[BaseException] = None
-        for entry, res in done_entries:
-            result = _decode_ipc_result(
-                res, None, entry.job, entry.handle.ipc_dir
-            )
+        for entry, result in done_entries:
             pseudo = InFlightTracker.create_pseudo_entry(
                 entry.uid, entry.job_dict, entry.job
             )
             try:
                 self._completion.complete_job(pseudo, result)
             except _JobTerminated:
-                # commit 连续失败达阈值 → job 已 DLQ 终结（正常终态）。
-                # 与 _restore_stale_result 的消费语义一致：视为完成，继续收尾。
                 pass
             except _CommitCrashSignal as e:
-                # 完成 abort 收尾（clear 后续 entry）后再重抛，
-                # 避免中途 raise 使 _in_flight 残留、其余 entry 不处理。
                 commit_crash = e
+
         self._ctx.in_flight.clear()
-        # 同步清空 state 的 in-flight 集合
         self._ctx.state.clear_in_flight()
         if commit_crash is not None:
             raise commit_crash

@@ -126,3 +126,36 @@ class TestExecutionChannelStaleResultClaim:
         assert result is not None
         assert result.success is True
         assert result.result_meta == {"status": "ok"}
+
+
+class TestExecutionChannelAbortInFlight:
+    def test_abort_with_completed_and_cancelled(self, tmp_path):
+        channel = ExecutionChannel(tmp_path)
+        job1 = Job("task", "j1")
+        job2 = Job("task", "j2")
+
+        # j1 has written result
+        res1 = result_path(str(tmp_path), job1.uid, "inc1")
+        res1.write_text(json.dumps({"status": "success", "raw_result": {"done": 1}}))
+
+        # create mock handles
+        class MockProcess:
+            def is_alive(self):
+                return False
+            def kill(self):
+                pass
+            def join(self, timeout=None):
+                pass
+
+        h1 = ExecutionHandle(uid=job1.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job1, incarnation="inc1")
+        h2 = ExecutionHandle(uid=job2.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job2, incarnation="inc2")
+
+        outcome = channel.abort_in_flight([h1, h2])
+        assert len(outcome.completed) == 1
+        assert outcome.completed[0][0].uid == job1.uid
+        assert outcome.completed[0][1].success is True
+        assert outcome.completed[0][1].result_meta == {"done": 1}
+
+        assert len(outcome.cancelled) == 1
+        assert outcome.cancelled[0].uid == job2.uid
+
