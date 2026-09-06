@@ -65,14 +65,15 @@ class StateStore:
         self,
         backend: AbstractStateBackend,
         state: Optional[PipelineState] = None,
-        *,
         commit_failure_dlq_threshold: int = 3,
         taxonomy: Optional[ErrorTaxonomy] = None,
+        on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None,
     ) -> None:
         self._backend = backend
         self._state = state or PipelineState({}, {}, {}, [])
         self._threshold = commit_failure_dlq_threshold
         self._taxonomy = taxonomy or _DEFAULT_TAXONOMY
+        self._on_job_completed = on_job_completed
 
     @property
     def state(self) -> PipelineState:
@@ -84,9 +85,19 @@ class StateStore:
         """底层持久化后端引用。"""
         return self._backend
 
-    def set_state(self, state: PipelineState) -> None:
+    def set_state(self, state: Optional[PipelineState]) -> None:
         """重新设置内存状态（run 启动加载期使用）。"""
-        self._state = state
+        self._state = state if state is not None else PipelineState({}, {}, {}, [])
+
+    def set_backend(self, backend: AbstractStateBackend) -> None:
+        """重新设置持久化后端。"""
+        self._backend = backend
+
+    def set_on_job_completed(
+        self, cb: Optional[Callable[[str, Dict[str, Any], bool, bool], None]]
+    ) -> None:
+        """设置终态完成事件回调。"""
+        self._on_job_completed = cb
 
     # ── 1. 事务性原子终态转移 ──────────────────────────────────────────────
 
@@ -111,9 +122,14 @@ class StateStore:
             if deduped:
                 wall_meta["inputs"] = list(deduped.values())
 
-        # 增量记录 run_count
+        # 增量记录 run_count（防御非 int 脏数据）
         prev_meta = self._state.wall.get(uid) or self._state.failed.get(uid)
-        prev_count = prev_meta.get("run_count", 0) if isinstance(prev_meta, dict) else 0
+        prev_count = 0
+        if isinstance(prev_meta, dict):
+            try:
+                prev_count = int(prev_meta.get("run_count", 0))
+            except (TypeError, ValueError):
+                prev_count = 0
         wall_meta["run_count"] = prev_count + 1
 
         spawned_list = list(spawned_jobs)
@@ -156,16 +172,7 @@ class StateStore:
             self._state.unregister_in_flight(uid)
             cascaded_uids: List[str] = []
             if cascade:
-                cascaded_uids = self._state.fail_cascade(uid)
-                if cascaded_uids:
-                    cascade_metas = [
-                        (cuid, {"error": ERR_JOB_DEPENDENCY, "failed_dependency": uid})
-                        for cuid in cascaded_uids
-                    ]
-                    c_committed = self._backend.commit_bulk_failure(cascade_metas)
-                    if c_committed:
-                        for cuid, cm in cascade_metas:
-                            self._state.mark_failed(cuid, self._taxonomy.normalize_dlq_meta(cm))
+                cascaded_uids = self.cascade_fail(uid)
             return FailureOutcome(uid=uid, error_meta=sanitized_meta, cascaded_uids=cascaded_uids)
 
         self._handle_commit_failure(uid, sanitized_meta.get("error", "commit_job_failure"), job_dict)
@@ -233,6 +240,8 @@ class StateStore:
             for uid, meta in sanitized_metas:
                 self._state.mark_failed(uid, meta)
                 self._state.unregister_in_flight(uid)
+                if self._on_job_completed:
+                    self._on_job_completed(uid, meta, False, False)
             return BulkFailureOutcome(
                 failed_uids=[u for u, _ in sanitized_metas],
                 remaining_queue_count=len(self._state.queue),
@@ -248,11 +257,13 @@ class StateStore:
             jd["_commit_failures"] = failures
             if failures >= self._threshold:
                 single_committed = self._backend.commit_job_failure(
-                    uid, {"error": f"{ERR_COMMIT_FAILURE_DLQ}:{reason}", "commit_failures": failures, "fatal": True}
+                    uid, {"error": ERR_COMMIT_FAILURE_DLQ, "commit_failures": failures, "fatal": True}
                 )
                 if single_committed:
                     queue = [j for j in queue if uid_from_job_dict(j) != uid]
                     self._state.mark_failed(uid, {"error": ERR_COMMIT_FAILURE_DLQ, "fatal": True})
+                    if self._on_job_completed:
+                        self._on_job_completed(uid, {"error": ERR_COMMIT_FAILURE_DLQ, "fatal": True}, False, False)
                 else:
                     kept_any = True
             else:
@@ -269,6 +280,88 @@ class StateStore:
             remaining_queue_count=len(self._state.queue),
         )
 
+    def cascade_fail(self, failed_uid: str) -> List[str]:
+        """父 job 失败后 O(1) 级联标记全部下游为依赖失败。"""
+        cascade_uids = self._state.fail_cascade(failed_uid)
+        if not cascade_uids:
+            return []
+        cascade_metas = [
+            (cuid, {"error": ERR_JOB_DEPENDENCY, "failed_dependency": failed_uid})
+            for cuid in cascade_uids
+        ]
+        committed = self._backend.commit_bulk_failure(cascade_metas)
+        if committed:
+            cascade_set = set(cascade_uids)
+            remaining = [jd for jd in self._state.queue if uid_from_job_dict(jd) not in cascade_set]
+            self._state.replace_queue(remaining)
+            for cuid, cm in cascade_metas:
+                sanitized_cm = self._taxonomy.normalize_dlq_meta(cm)
+                self._state.mark_failed(cuid, sanitized_cm)
+                if self._on_job_completed:
+                    self._on_job_completed(cuid, sanitized_cm, False, False)
+            return cascade_uids
+
+        # commit_bulk_failure 失败走 3-strike 崩溃契约
+        remaining, kept = self.commit_bulk_failed_crash(
+            "commit_bulk_failure", cascade_metas, list(self._state.queue)
+        )
+        self._state.replace_queue(remaining)
+        if kept:
+            raise _CommitCrashSignal(
+                f"Backend commit_bulk_failure returned False for "
+                f"{len(cascade_metas)} cascade job(s); {len(remaining)} kept in queue. "
+                f"Crashing to retry; on-disk queue preserved."
+            )
+        return cascade_uids
+
+    def commit_failed_crash(self, uid: str, reason: str, job_dict: Optional[Dict[str, Any]] = None) -> None:
+        """对外暴露的 3-strike commit 失败收敛处理。"""
+        self._handle_commit_failure(uid, reason, job_dict)
+
+    def commit_bulk_failed_crash(
+        self, reason: str, uids_metas: List[Tuple[str, Dict[str, Any]]], queue_job_dicts: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """bulk commit 失败的 3-strike 处理。"""
+        affected = {uid for uid, _ in uids_metas}
+        meta_by_uid = dict(uids_metas)
+        remaining: List[Dict[str, Any]] = []
+        has_kept_affected = False
+        for jd in queue_job_dicts:
+            uid = uid_from_job_dict(jd)
+            if uid not in affected:
+                remaining.append(jd)
+                continue
+            rt = jd.setdefault("runtime", {})
+            if not isinstance(rt, dict):
+                rt = {}
+                jd["runtime"] = rt
+            failures = rt.get("_commit_failures", 0) + 1
+            rt["_commit_failures"] = failures
+            if failures >= self._threshold:
+                dlq_meta = meta_by_uid[uid]
+                single_committed = self._backend.commit_job_failure(uid, dlq_meta)
+                if single_committed:
+                    self.apply_failed(uid, dlq_meta, unregister=False)
+                    if self._on_job_completed:
+                        self._on_job_completed(uid, dlq_meta, False, False)
+                    continue
+                logger.critical(
+                    f"Bulk 3-strike: DLQ also failed for {uid} ({reason}); "
+                    f"keeping in queue for next boot."
+                )
+            has_kept_affected = True
+            remaining.append(jd)
+        return remaining, has_kept_affected
+
+    def apply_failed(
+        self, uid: str, meta: Dict[str, Any], *, unregister: bool = True
+    ) -> None:
+        """失败登记的内存尾段。"""
+        sanitized = self._taxonomy.normalize_dlq_meta(meta)
+        self._state.mark_failed(uid, sanitized)
+        if unregister:
+            self._state.unregister_in_flight(uid)
+
     # ── 2. 3-Strike 崩溃契约内部实现 ─────────────────────────────────────
 
     def _handle_commit_failure(
@@ -281,32 +374,41 @@ class StateStore:
         if job_dict is None:
             job_dict = {"task_type": uid.split("::")[0], "job_id": uid.split("::")[1]}
 
-        failures = job_dict.get("_commit_failures", 0) + 1
+        raw_rt = job_dict.get("runtime")
+        if not isinstance(raw_rt, dict):
+            raw_rt = {}
+            job_dict["runtime"] = raw_rt
+
+        failures = raw_rt.get("_commit_failures", job_dict.get("_commit_failures", 0)) + 1
+        raw_rt["_commit_failures"] = failures
         job_dict["_commit_failures"] = failures
 
         if failures >= self._threshold:
             logger.critical(
-                f"Job {uid} commit failed {failures} times (threshold {self._threshold}); "
-                f"giving up, writing to DLQ as {ERR_COMMIT_FAILURE_DLQ}."
+                f"Backend commit failed {failures} times for {uid} ({reason}); "
+                f"treating as deterministic bad input, sending to DLQ instead of crashing."
             )
             dlq_meta = {
-                "error": f"{ERR_COMMIT_FAILURE_DLQ}:{reason}",
-                "commit_failures": failures,
+                "error": ERR_COMMIT_FAILURE_DLQ,
                 "fatal": True,
+                "commit_failures": failures,
             }
             dlq_committed = self._backend.commit_job_failure(uid, dlq_meta)
-            self._state.unregister_in_flight(uid)
             if dlq_committed:
-                self._state.mark_failed(uid, dlq_meta)
-                raise _JobTerminated(f"Job {uid} permanently failed after {failures} commit attempts.")
+                self.apply_failed(uid, dlq_meta)
+                if self._on_job_completed:
+                    self._on_job_completed(uid, dlq_meta, False, False)
+                raise _JobTerminated(
+                    f"Job {uid} permanently failed after {failures} commit attempts."
+                )
 
         # 未达阈值或单条 DLQ 仍失败：requeue 并上抛崩溃信号
-        self._state.requeue_jobs([job_dict], front=True)
         self._state.unregister_in_flight(uid)
+        self._state.requeue_jobs([job_dict], front=True)
         raise _CommitCrashSignal(
-            f"Backend {reason} returned False for {uid}; "
+            f"Backend commit returned False for {uid} ({reason}); "
             f"_commit_failures={failures}/{self._threshold}. "
-            f"Requeued to front and crashing to retry; on-disk queue preserved."
+            f"On-disk queue preserved; crashing to avoid unbounded retry loop."
         )
 
     # ── 3. 内存状态与查询代理 ────────────────────────────────────────────

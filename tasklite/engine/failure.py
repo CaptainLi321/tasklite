@@ -87,200 +87,30 @@ class FailureMachine:
         self._requeue_and_crash(uid, job_dict, "commit_skip")
 
     def commit_failed_crash(self, uid: str, reason: str, job_dict: dict) -> None:
-        """commit 返回 False 时：requeue 保持内存一致，然后崩溃。
-
-        后端契约保证 on-disk 队列未变（popped job 仍在磁盘上）。
-        将内存状态 requeue 到与磁盘一致后 raise _CommitCrashSignal，
-        避免 commit 失败时无限重试（紧循环 → 对外部 API 的 DDoS）。
-
-        崩溃循环防护：若同一 job 的 commit 已连续失败达
-        ``COMMIT_FAILURE_DLQ_THRESHOLD`` 次（记录于 job_dict 的
-        ``_commit_failures`` 计数并持久化），说明这是**确定性坏输入**
-        （如 handler 返回不可序列化 meta 但预检漏网）而非环境故障——
-        继续 crash 只会无限重启循环。此时改走 DLQ，job 被标记失败而非
-        永远重跑。
-
-        控制流异常通道唯一化：本方法**永不正常返回**——DLQ 分支 commit
-        成功后抛 ``_JobTerminated``（job 已终结需停止处理）而非返回
-        None。DLQ 分支若正常返回，调用方（no-handler/payload-validation
-        等分支）在 ``_commit_failed_crash(...)`` 之后没有 return，
-        fall-through 继续 acquire + submit 已失败的 job（资源泄漏 +
-        双重副作用）。调用方以 ``except _JobTerminated`` 承接，无需
-        记忆检查返回值。
-        """
-        raw_rt = job_dict.get("runtime")
-        if not isinstance(raw_rt, dict):
-            raw_rt = {}
-            job_dict["runtime"] = raw_rt
-        rt = raw_rt
-        failures = rt.get("_commit_failures", 0) + 1
-        if failures >= self._ctx.commit_failure_dlq_threshold:
-            logger.critical(
-                f"Backend commit failed {failures} times for {uid} ({reason}); "
-                f"treating as deterministic bad input, sending to DLQ instead of crashing."
-            )
-            rt["_commit_failures"] = failures
-            committed = self._ctx.backend.commit_job_failure(
-                uid, {"error": ERR_COMMIT_FAILURE_DLQ,
-                      "reason": reason,
-                      "failures": failures}
-            )
-            if committed:
-                # 三连收敛——_mark_failed + stats + unregister
-                self.apply_failed(uid, {"error": ERR_COMMIT_FAILURE_DLQ,
-                                         "reason": reason, "failures": failures})
-                # 3-strike commit 失败 DLQ 终态触发钩子——
-                # on_job_completed 承诺「每个 job 终结」应覆盖此终态。
-                self._ctx.fire_job_completed(
-                    uid, {"error": ERR_COMMIT_FAILURE_DLQ,
-                          "reason": reason, "failures": failures},
-                    False, False,
-                )
-                raise _JobTerminated(
-                    f"Job {uid} terminated: {reason} after {failures} consecutive "
-                    f"commit failures (deterministic bad input → DLQ)."
-                )
-            # DLQ 也失败（环境故障）→ 仍走 crash 路径
-        rt["_commit_failures"] = failures
-        self._requeue_and_crash(uid, job_dict, reason)
+        """commit 返回 False 时：requeue 保持内存一致，然后崩溃。"""
+        self._ctx.store.commit_failed_crash(uid, reason, job_dict)
 
     def mark_failed(self, uid: str, meta: dict) -> None:
-        """统一失败登记：清 wall 旧记录 + mark_failed。
-
-        rerun 任务（every_run/on_failure/on_input_change）重跑失败时，wall
-        里可能有上次的成功记录——不清理则 uid 同时属于 wall 和 failed：
-        DEBUG 互斥断言崩、ctx.is_completed/is_failed 同时 True（身份语义被破坏）。
-        本 helper 收敛所有 DLQ 登记路径（单条/批量/3-strike/级联/死锁），
-        保证「最终状态唯一」。
-
-        磁盘 wall 清理由 commit_job_failure /
-        commit_bulk_failure 的同一事务完成（原子、单出口、幂等）——此处
-        只做内存镜像（pop wall + mark_failed）；独立非原子调用
-        delete_wall 失败会磁盘 wall∩failed 并存。
-        """
-        state = self._ctx.state
-        state.mark_failed(uid, meta)
+        """统一失败登记：清 wall 旧记录 + mark_failed。"""
+        self._ctx.state.mark_failed(uid, meta)
 
     def apply_failed(self, uid: str, meta: dict, *, unregister: bool = True,
                      count_as: str = "failed") -> None:
-        """失败登记的内存尾段。
-
-        收敛「_mark_failed + stats 计数 + unregister_in_flight」三连——
-        分散复制易漏同步（漏 discard 豁免、漏 cascade、漏钩子、漏计数）。
-        ``cascade`` 与 ``fire_hook`` **留在调用点**——两者是有正确边界的
-        语义决策而非复制漂移：业务失败级联 / commit 环境故障不级联；
-        钩子两套触发位置（序列内直调 / ``_complete_job`` 尾部）均为合法出口。
-
-        ``unregister`` 边界：**批量路径（级联/死锁/批量
-        3-strike）必须传 False**——这些 uid 仍在队列中（replace_queue 尚未
-        执行），若此时 discard ``_rerun_active_uids`` 会破坏 rerun 任务的
-        豁免集合 → DEBUG 互斥断言崩（rerun 任务合法 wall∩queue 无豁免）。
-        豁免集合由 ``replace_queue`` 重建（被移除的 uid 自然脱离豁免）。
-
-        身份契约：先 ``_mark_failed``（mark_failed）再 unregister——注销必须
-        严格排在目标集合登记之后（身份非真空）。单条路径的 uid 已 pop 出队，
-        unregister 是 no-op（discard）但必要（discard 豁免集合）。
-        """
-        self.mark_failed(uid, meta)
-        # count_as：统计桶选择——"failed"=真正执行失败；"cascade_failed"=
-        # 因上游失败被阻断的下游（JOB_DEPENDENCY），单独计数使 DLQ 规模
-        # 与故障规模可区分（下游本身没有错）。
+        """失败登记的内存尾段。"""
+        self._ctx.store.apply_failed(uid, meta, unregister=unregister)
         self._ctx.stats[count_as] += 1
-        if unregister:
-            self._ctx.state.unregister_in_flight(uid)
 
     def commit_bulk_failed_crash(
         self, reason: str, uids_metas: List[Tuple[str, dict]], queue_job_dicts: List[dict]
     ) -> Tuple[List[dict], bool]:
-        """bulk commit 失败的 3-strike 处理。
-
-        单条路径（``_commit_failed_crash``）对 commit 失败逐 job 计数、达
-        阈值转 DLQ——bulk 路径（死锁/级联）与单条路径同等对待：
-
-        - ``_commit_failures`` 计数 +1（持久化于 job_dict，随队列落盘，
-          重启后继续累计）；
-        - 达阈值 → 尝试单条 ``commit_job_failure``（成功则内存 mark_failed、
-          移出队列）；未达阈值或 DLQ 也失败 → 保留在队列。
-
-        返回 ``(remaining_queue, has_kept_affected)``。调用方须
-        ``replace_queue(remaining_queue)``；``has_kept_affected=True`` 时
-        继续 raise ``_CommitCrashSignal``（计数已持久化，重启后累计，
-        最终达阈值转 DLQ——无限循环被切断）。
-        """
-        affected = {uid for uid, _ in uids_metas}
-        meta_by_uid = dict(uids_metas)
-        remaining: List[dict] = []
-        has_kept_affected = False
-        for jd in queue_job_dicts:
-            uid = uid_from_job_dict(jd)
-            if uid not in affected:
-                remaining.append(jd)
-                continue
-            rt = jd.setdefault("runtime", {})
-            failures = rt.get("_commit_failures", 0) + 1
-            rt["_commit_failures"] = failures
-            if failures >= self._ctx.commit_failure_dlq_threshold:
-                committed = self._ctx.backend.commit_job_failure(uid, meta_by_uid[uid])
-                if committed:
-                    # 批量 3-strike：uid 在队列中（replace_queue 未执行），
-                    # 豁免集合由调用方 replace_queue 重建——不 unregister。
-                    self.apply_failed(uid, meta_by_uid[uid], unregister=False)
-                    # bulk 3-strike 单条 DLQ 终态触发钩子
-                    self._ctx.fire_job_completed(uid, meta_by_uid[uid], False, False)
-                    continue
-                logger.critical(
-                    f"Bulk 3-strike: DLQ also failed for {uid} ({reason}); "
-                    f"keeping in queue for next boot."
-                )
-            has_kept_affected = True
-            remaining.append(jd)
-        return remaining, has_kept_affected
+        """bulk commit 失败的 3-strike 处理。"""
+        return self._ctx.store.commit_bulk_failed_crash(reason, uids_metas, queue_job_dicts)
 
     def cascade_fail(self, failed_uid: str) -> None:
-        """父 job 失败后 O(1) 级联标记全部下游为依赖失败。
-
-        沿 ``state.fail_cascade`` 的反向依赖索引一次性找到全部下游，逐条
-        commit_bulk_failure 到 DLQ 并同步内存。commit 失败走崩溃契约，
-        绝不静默。
-
-        复用点：``_dispatch_job`` 的 pending_dep_failure 路径 与
-        ``_apply_result`` 的 DLQ 失败路径。
-        """
-        state = self._ctx.state
-        cascade_uids = state.fail_cascade(failed_uid)
-        if not cascade_uids:
-            return
-        cascade_metas = [
-            (cuid, {"error": _ERR_JOB_DEPENDENCY, "failed_dependency": failed_uid})
-            for cuid in cascade_uids
-        ]
-        c_committed = self._ctx.backend.commit_bulk_failure(cascade_metas)
-        if c_committed:
-            for cuid, cmeta in cascade_metas:
-                # 级联批量：uid 在队列中，豁免集合由下方 replace_queue 重建
-                self.apply_failed(cuid, cmeta, unregister=False,
-                                  count_as="cascade_failed")
-                # 级联批量 DLQ 路径同样触发钩子——
-                # on_job_completed 承诺「每个 job 终结」应覆盖批量终态。
-                self._ctx.fire_job_completed(cuid, cmeta, False, False)
-            remaining = [jd for jd in state.queue
-                         if uid_from_job_dict(jd) not in set(cascade_uids)]
-            state.replace_queue(remaining)
-        else:
-            # 3-strike：与死锁路径同款——逐 job 计数，
-            # 达阈值单条 DLQ，未达保留；保留则崩溃重启继续累计。
-            queue, kept = self.commit_bulk_failed_crash(
-                "commit_bulk_failure", cascade_metas, list(state.queue)
-            )
-            state.replace_queue(queue)
-            if kept:
-                raise _CommitCrashSignal(
-                    f"Backend commit_bulk_failure returned False for "
-                    f"{len(cascade_metas)} cascaded job(s) of {failed_uid}; "
-                    f"{len(queue)} kept in queue with incremented "
-                    f"_commit_failures (3-strike will DLQ them). "
-                    f"Crashing to retry; on-disk queue preserved."
-                )
+        """父 job 失败后 O(1) 级联标记全部下游为依赖失败。"""
+        cascaded = self._ctx.store.cascade_fail(failed_uid)
+        if cascaded:
+            self._ctx.stats["cascade_failed"] += len(cascaded)
 
     def _dependency_grace(self, missing_indices) -> bool:
         """宽限：缺失依赖的 job 是否应等待而非立即 DLQ。

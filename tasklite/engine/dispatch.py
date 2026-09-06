@@ -59,24 +59,21 @@ class DispatchMachine:
         正常返回 = 处理完成（commit 成功或 3-strike DLQ 成功）；
         _CommitCrashSignal 穿透上抛 = 后端环境故障（由 run_loop 崩溃处理）。
         """
-        committed = self._ctx.backend.commit_job_failure(uid, meta)
-        if committed:
-            self._failure.apply_failed(uid, meta, count_as=count_as)
-            self._failure.cascade_fail(uid)
-            self._ctx.fire_job_completed(uid, meta, False, False)
-            return
-        # commit 失败 → 3-strike / 崩溃路径。commit_failed_crash 要么抛
-        # _JobTerminated（3-strike DLQ 成功，job 已终结），要么抛
-        # _CommitCrashSignal（后端环境故障，需崩溃重启）。
         try:
-            self._failure.commit_failed_crash(
-                uid, meta.get("error", "unknown"), job_dict,
-            )
+            committed = self._ctx.backend.commit_job_failure(uid, meta)
+            if committed:
+                self._ctx.store.apply_failed(uid, meta, unregister=True)
+                self._ctx.stats[count_as] += 1
+                cascaded = self._ctx.store.cascade_fail(uid)
+                if cascaded:
+                    self._ctx.stats["cascade_failed"] += len(cascaded)
+                self._ctx.fire_job_completed(uid, meta, False, False)
+                return
+            self._failure.commit_failed_crash(uid, meta.get("error", "reject"), job_dict)
         except _JobTerminated:
-            # 3-strike DLQ 成功——job 已终结，正常返回即可
+            # 3-strike DLQ 成功——job 已终结，统计递增后正常返回即可
+            self._ctx.stats[count_as] += 1
             return
-        # _CommitCrashSignal 继承 BaseException，不被上方 except 捕获，
-        # 自动穿透上抛到 run_loop 的崩溃处理分支。
 
     def dispatch_dedup(self, state, uid: str, job_dict: dict) -> bool:
         """派发预检关 1——去重（is_known 命中 → rerun 策略 → skip/放行）。
@@ -85,12 +82,6 @@ class DispatchMachine:
         表示未命中（调用方继续后续预检关）。统一 is_known 谓词；
         rerun 策略豁免 every_run/on_failure 的 wall/failed 命中。
         """
-        # Dedup check (job already completed or failed since queue was loaded)
-        # 统一 is_known 谓词。pop 自 queue 的 uid
-        # 不可能在 queue/in-flight（已出队）。命中时对后端做 commit_skip——
-        # 否则磁盘条目残留，每次 run 重复 pop→skip→drift。
-        # rerun 策略豁免——every_run/on_failure 任务命中
-        # wall/failed 时**放行重跑**（不 skip；磁盘残留由后续 commit 清理）。
         if state.is_known(uid):
             decision = self._ctx.policy.evaluate(
                 job_dict,
@@ -102,25 +93,11 @@ class DispatchMachine:
                 self._ctx.stats["skipped"] += 1
                 committed = self._ctx.backend.commit_skip(uid)
                 if not committed:
-                    # commit_skip 终态模型：skip 命中 = uid 已有
-                    # wall/failed 终态，此处只是清理磁盘残留。commit_skip 失败
-                    # 是环境故障——走「requeue + 崩溃」契约，**绝不走 3-strike
-                    # DLQ**（那会把 wall 成功记录翻转成失败）。下一次 run 的
-                    # 加载期过滤或 commit_skip 重试消化残留。
                     self._failure.commit_skip_crash(uid, job_dict)
-                    # 与 dep-failed/no-handler 分支同款：
-                    # _commit_skip_crash 契约上永不正常返回；fall-through 仅当
-                    # 契约被破坏时可达——fail-loud 优于静默「装作已处理」。
                     raise AssertionError(
-                        "_commit_skip_crash unexpectedly returned normally"
+                        f"_commit_skip_crash for {uid} unexpectedly returned normally; "
+                        f"contract requires raising _CommitCrashSignal."
                     )
-                else:
-                    # pop_job 对 rerun 任务把 uid 加入
-                    # _rerun_active_uids（豁免集合），skip 成功路径配对
-                    # discard——否则豁免集合泄漏并永久弱化 DEBUG 互斥断言。
-                    # 与 dep-failure/no-handler 直接 commit 路径的 discard
-                    # 对称；对未注册 uid 是 no-op。
-                    state.unregister_in_flight(uid)
                 return True
         return False
 

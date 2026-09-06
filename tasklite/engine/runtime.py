@@ -199,7 +199,7 @@ class RunContext:
         deadlock_gap_max_rounds: Optional[int] = None,
     ) -> None:
         self.name = name
-        self.backend = backend
+        self._backend = backend
         self.scheduler = scheduler
         self.handlers = handlers
         if isinstance(resources, ResourceManager):
@@ -234,15 +234,15 @@ class RunContext:
         self.on_run_end = on_run_end
 
         self.store: StateStore = StateStore(
-            self.backend,
+            self._backend,
             commit_failure_dlq_threshold=self.commit_failure_dlq_threshold,
+            on_job_completed=lambda uid, meta, s, r: self.fire_job_completed(uid, meta, s, r),
         )
         self.channel: ExecutionChannel = ExecutionChannel(
             self.ipc_dir,
             executor=self.executor,
         )
 
-        self.state: Optional[PipelineState] = None
         self._in_flight: InFlightTracker = InFlightTracker()
         self.run_id: Optional[str] = None
         self.dispatch_seq: int = 0
@@ -250,6 +250,23 @@ class RunContext:
         self.stats: TaskStats = TaskStats()
         self.episode: EpisodeState = EpisodeState()
         self._run_end_fired = False
+
+    @property
+    def state(self) -> PipelineState:
+        return self.store.state
+
+    @state.setter
+    def state(self, value: Optional[PipelineState]) -> None:
+        self.store.set_state(value)
+
+    @property
+    def backend(self) -> AbstractStateBackend:
+        return self._backend
+
+    @backend.setter
+    def backend(self, value: AbstractStateBackend) -> None:
+        self._backend = value
+        self.store.set_backend(value)
 
     @property
     def in_flight(self) -> InFlightTracker:
