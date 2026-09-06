@@ -137,7 +137,7 @@ class LoopRunner:
         循环直到队列空且 in-flight 空。
         """
         state = self._ctx.state
-        self._ctx.in_flight = {}
+        self._ctx.in_flight.clear()
         while not state.is_empty or self._ctx.in_flight:
             # 调度缓存为 run 生命周期（_run_body
             # 加载期清空），主循环不每轮清空——阻塞/慢 job 阶段不重复反
@@ -219,7 +219,7 @@ class LoopRunner:
                 # 读取 in-flight 的 suspend 信号文件，即时应用
                 # （handler 崩溃/超时也不丢失限流信息——文件落盘）
                 self._recovery.apply_pending_signals()
-                handles = [entry.handle for entry in self._ctx.in_flight.values()]
+                handles = self._ctx.in_flight.active_handles()
                 completed = self._ctx.executor.reap_completed(handles)
                 for handle, result in completed:
                     # 先 complete 再 pop：complete 与 pop 之间被
@@ -277,5 +277,5 @@ class LoopRunner:
         logger.info(f"Pipeline {self._ctx.name} finished.")
         # run 结束时统一持久化一次资源挂起状态——由 _run_loop 的
         # finally 统一执行（正常/崩溃路径一致，见 _run_loop）。
-        self._ctx.in_flight = {}
+        self._ctx.in_flight.clear()
 
