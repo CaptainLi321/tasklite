@@ -167,34 +167,15 @@ class LoopRunner:
             worker_wait = 0.0
             if not draining:
                 while True:
-                    # workers 耗尽预检——本轮不可能
-                    # 有可派发 job（需 worker 槽的），跳过全队列扫描
-                    # （N=10 万时每轮 ~300ms CPU 空烧，慢 job 阶段 20Hz
-                    # 轮询 ~85% 单核）。no-subprocess 路径（dedup/dep-failed/
-                    # no-handler）的清理延迟至 worker 释放，最终仍会处理。
-                    ok, worker_wait = self._ctx.resource_mgr.can_acquire_worker(1.0)
-                    if not ok:
-                        # 忙循环护栏：第三方自定义资源在
-                        # 不可用态可能返回 wait=0（内置 CapacityResource /
-                        # RateLimitResource 恒返回 >0，不受影响）。若此处不
-                        # 钳制下界，下方 `elif worker_wait > 0` 睡眠分支全部
-                        # 不命中 → 无限忙循环空烧 CPU（stop 响应也下降）。
-                        # 钳制为最小轮询间隔保证至少有一次睡眠。
-                        if worker_wait <= 0:
-                            worker_wait = 0.05
+                    outcome = self._dispatch.dispatch_next()
+                    if outcome.worker_wait > 0:
+                        worker_wait = outcome.worker_wait
+                    if outcome.sched is not None:
+                        sched = outcome.sched
+                    if outcome.entry is not None:
+                        continue
+                    if not outcome.should_continue:
                         break
-                    # in_flight 以 state 集合为事实源（与 is_known 一致）
-                    in_flight_uids = state.in_flight_uids
-                    sched = self._ctx.scheduler.pop_next_runnable(
-                        state, in_flight_uids
-                    )
-                    if sched.runnable_idx is None:
-                        break
-                    entry = self._dispatch.dispatch_job(sched)
-                    if entry is None:
-                        continue  # 依赖失败/no-handler/payload 校验失败：已直接处理
-                    # entry 已在 _dispatch_job 内注册到 _in_flight（避免窗口泄漏）
-                    # __workers__ 资源耗尽时下一轮扫描无 runnable，自然退出
 
             # 处理无可运行 job 的情况
             if sched is not None and sched.runnable_idx is None:

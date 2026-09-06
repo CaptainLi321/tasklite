@@ -10,7 +10,8 @@ import logging
 import random
 import time
 import traceback
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .runtime import RunContext
@@ -35,6 +36,15 @@ from ..utils.validation import validate_payload
 logger = logging.getLogger("tasklite")
 
 
+@dataclass(frozen=True)
+class DispatchOutcome:
+    """一次调度派发周期的不可变决策结果。"""
+    entry: Optional[InFlightJob] = None
+    sched: Optional[Any] = None
+    should_continue: bool = True
+    worker_wait: float = 0.0
+
+
 class DispatchMachine:
     """派发预检 + 资源 acquire + 子进程 submit 的编排器。"""
 
@@ -44,6 +54,49 @@ class DispatchMachine:
         self._ctx = ctx
         self._failure = failure
         self._completion = completion
+
+    def dispatch_next(self) -> DispatchOutcome:
+        """统一扫描与派发接缝：工人资源预检 -> 队列扫描 -> 预检五关 -> 资源锁定 -> 子进程派发。
+
+        返回 DispatchOutcome：
+        - entry 非 None：成功派发子进程并登记 in-flight；
+        - entry 为 None 且 should_continue 为 True：处理了无需子进程的作业（去重/依赖失败/无 handler/校验失败），调用方可继续填池；
+        - should_continue 为 False：工人资源耗尽或无可运行作业，调用方应退出填池循环。
+        """
+        state = self._ctx.state
+        ok, worker_wait = self._ctx.resource_mgr.can_acquire_worker(1.0)
+        if not ok:
+            if worker_wait <= 0:
+                worker_wait = 0.05
+            return DispatchOutcome(
+                entry=None,
+                sched=None,
+                should_continue=False,
+                worker_wait=worker_wait,
+            )
+
+        in_flight_uids = state.in_flight_uids
+        sched = self._ctx.scheduler.pop_next_runnable(state, in_flight_uids)
+        if sched.runnable_idx is None:
+            return DispatchOutcome(
+                entry=None,
+                sched=sched,
+                should_continue=False,
+            )
+
+        entry = self.dispatch_job(sched)
+        if entry is None:
+            return DispatchOutcome(
+                entry=None,
+                sched=sched,
+                should_continue=True,
+            )
+
+        return DispatchOutcome(
+            entry=entry,
+            sched=sched,
+            should_continue=True,
+        )
 
     def _reject_and_commit(
         self, uid: str, job_dict: dict, meta: dict, *,
