@@ -29,8 +29,8 @@ from ..models.job import Job
 from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE
 from .executor import JobHandle
 from .inflight import InFlightJob
-from .retry import rerun_skips
 from ..utils.ipc import inputs_path, outputs_path, signals_path
+
 from ..utils.lockfile import probe_lock
 from ..utils.validation import validate_payload
 
@@ -92,12 +92,13 @@ class DispatchMachine:
         # rerun 策略豁免——every_run/on_failure 任务命中
         # wall/failed 时**放行重跑**（不 skip；磁盘残留由后续 commit 清理）。
         if state.is_known(uid):
-            wall_hit = uid in state.wall
-            failed_hit = uid in state.failed
-            if rerun_skips(
-                job_dict, wall_hit=wall_hit, failed_hit=failed_hit,
+            decision = self._ctx.policy.evaluate(
+                job_dict,
                 wall_meta=state.wall.get(uid),
-            ):
+                is_wall=(uid in state.wall),
+                is_failed=(uid in state.failed),
+            )
+            if decision.should_skip:
                 self._ctx.stats["skipped"] += 1
                 committed = self._ctx.backend.commit_skip(uid)
                 if not committed:
@@ -144,15 +145,15 @@ class DispatchMachine:
 
 
     def dispatch_no_handler(self, uid: str, job_dict: dict, task_type: str) -> bool:
-        """派发预检关 3——handler 未注册（NO_HANDLER 直接 DLQ）。
+        """派发预检关 3——无对应 handler 注册（配置级错误 → FatalError DLQ）。
 
-        返回 True = 已处理；仅当 task_type 未注册时调用。
+        返回 True = 已处理（直接 commit 到 DLQ 并 cascade 下游）；
+        仅当 task_type not in handlers 时调用。commit 失败走 3-strike / 崩溃路径。
         """
         if task_type not in self._ctx.handlers:
-            logger.error(f"No handler for: {task_type}")
-            self._reject_and_commit(
-                uid, job_dict, {"error": _ERR_NO_HANDLER},
-            )
+            logger.error(f"SKIP: {uid} (No handler for task_type '{task_type}')")
+            fail_meta = {"error": _ERR_NO_HANDLER, "fatal": True}
+            self._reject_and_commit(uid, job_dict, fail_meta)
             return True
         return False
 
@@ -179,16 +180,10 @@ class DispatchMachine:
                 f"requeue with short backoff."
             )
             self._ctx.stats["deferred_orphan"] += 1
-            # 与 retry 路径（_apply_result）对称写
-            # wall_deadline——只写 monotonic _backoff_until 的话，崩溃持久化后
-            # 重启 monotonic 归零 → 残留旧值被调度器误判为未来退避（阻塞数小时）。
-            # wall_deadline 由 _run_body 加载换算为 monotonic，跨崩溃安全。
-            # 抖动防热循环：compute_backoff(1,1,1) 恒 ∈ [0.75,1.25] 截顶到
-            # 1.0 即 [0.75,1.0] 常量抖动——与重试计数无关，直接写意图。
-            delay = random.uniform(0.75, 1.0)
+            # 策略深模块生成孤儿退避时间表并原子填充 runtime
+            sched = self._ctx.policy.compute_orphan_schedule()
             rt = job_dict.setdefault("runtime", {})
-            rt[RT_BACKOFF_UNTIL] = time.monotonic() + delay
-            rt[RT_BACKOFF_WALL_DEADLINE] = time.time() + delay
+            sched.populate_runtime(rt)
             state.requeue_jobs([job_dict], front=True)
             return True
         return False

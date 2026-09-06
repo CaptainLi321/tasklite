@@ -25,7 +25,6 @@ from .engine.inflight import InFlightJob as _InFlightJob
 from .engine.loop import LoopRunner
 from .engine.recovery import RecoveryMachine
 from .engine.resource import CapacityResource, Resource
-from .engine.retry import apply_discovery_rerun, rerun_skips
 from .engine.runtime import (
     META_RESOURCE_SUSPENDS as _META_RESOURCE_SUSPENDS,
     RunContext, StopMode, TaskStats, WORKER_RESOURCE, inject_worker_resource,
@@ -567,11 +566,13 @@ class TaskLite:
             # 运行时由 scheduler 的 _effective_resources（扫描可见性）与
             # _dispatch_job（acquire 实际值）两处合并。浅拷贝避免修改传入的 Job 对象。
             job_dict = j.to_dict()
-            # discovery 默认 rerun 注入（单点函数；None=未指定
+            # discovery 默认 rerun 规范化（策略深模块；None=未指定
             # 哨兵才注入，显式值含 "never" 一律尊重）
-            apply_discovery_rerun(job_dict, j.task_type, self._discovery_rerun)
+            self._ctx.policy.normalize_job_dict(job_dict, j.task_type)
             self._inject_worker_resource(job_dict)
             jobs_dicts.append(job_dict)
+
+
 
         if not jobs_dicts:
             return
