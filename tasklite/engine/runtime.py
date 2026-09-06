@@ -39,6 +39,7 @@ from .failure import (
 from .inflight import InFlightTracker
 from .policy import PreflightPolicy
 from .resource import Resource, ResourceManager, WORKER_RESOURCE
+from .store import StateStore
 from ..models.state import PipelineState
 from ..utils.jsonutil import dumps
 
@@ -223,6 +224,10 @@ class RunContext:
         self.on_run_start = on_run_start
         self.on_job_completed = on_job_completed
         self.on_run_end = on_run_end
+        self.store: StateStore = StateStore(
+            self.backend,
+            commit_failure_dlq_threshold=self.commit_failure_dlq_threshold,
+        )
         # ── 每-run 可变运行态（run 建立）────────────────────
         self.state: Optional[PipelineState] = None
         self._in_flight: InFlightTracker = InFlightTracker()
@@ -283,6 +288,7 @@ class RunContext:
     def set_state(self, state: PipelineState) -> None:
         """装载本次 run 的 PipelineState（``_run_body`` 加载修复后调用）。"""
         self.state = state
+        self.store.set_state(state)
 
     def persist_resource_suspends_now(self) -> None:
         """把资源挂起截止**即时**持久化到 meta 表。
