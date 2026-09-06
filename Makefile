@@ -24,8 +24,8 @@ test-hypothesis:  ## 仅跑 hypothesis 属性测试
 test-matrix:  ## 多解释器矩阵冒烟（遍历本地 3.9/3.10/3.11/3.12/3.13/3.14 执行快速测试与类型提示求值冒烟）
 	@for py in python3.9 python3.10 python3.11 python3.12 python3.13 python3.14; do \
 		if command -v $$py >/dev/null 2>&1; then \
-			echo "=== Testing import & typing with $$py ==="; \
-			$$py -c 'import tasklite; from tasklite import TaskLite; import typing; typing.get_type_hints(TaskLite.run_graceful)' || exit 1; \
+			echo "=== Testing import, typing & multi-process E2E with $$py ==="; \
+			PYTHONPATH=. $$py scripts/verify_matrix.py || exit 1; \
 			if $$py -c 'import pytest' >/dev/null 2>&1; then \
 				echo "=== Running pytest with $$py ==="; \
 				$$py -m pytest tests/ -q -p no:cacheprovider -m "not hypothesis" || exit 1; \
