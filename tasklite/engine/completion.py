@@ -20,13 +20,11 @@ if TYPE_CHECKING:
 from ..error_codes import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 from ..exceptions import _JobTerminated
 from ..models.job import Job
-from .executor import (
-    ExecutionResult, cleanup_ipc_files, read_inputs, read_outputs,
-)
+from .channel import ArtifactCleanupMode
+from .executor import ExecutionResult
 from .inflight import InFlightJob
 from .policy import BackoffSchedule
 from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE, inject_worker_resource
-from ..utils.ipc import inputs_path, outputs_path
 
 
 logger = logging.getLogger("tasklite")
@@ -80,46 +78,12 @@ class CompletionMachine:
             # Release resources (无论成功/失败/重试/崩溃，都释放)
             self.release_acquired(entry.acquired, uid=uid)
 
-            # Cleanup outputs on failure AND retry (intermediate products
-            # from a failed retry attempt should not persist)。
-            # result 总是非 None（_complete_job 只在有结果时调用）。
-            # 输出从落盘 outputs.jsonl 读取（handler 声明时已落盘）。
-            if not result.success:
-                self.cleanup_outputs(uid)
-            else:
-                # 成功路径：不删输出文件（cleanup_on_fail 只对失败生效），
-                # 仅删除落盘声明文件（outputs.jsonl 生命周期结束）。
-                # kind=="cache" 的临时文件在成功路径也要
-                # 清理（语义：任务结束时该文件不应存在；.part 已 rename 则
-                # no-op）。outputs.jsonl 最后删除，先读完再删。
-                try:
-                    for out_path, _, kind in read_outputs(self._ctx.ipc_dir, uid):
-                        if kind == "cache":
-                            out_obj = Path(out_path)
-                            if out_obj.exists():
-                                out_obj.unlink()
-                                logger.info(f"Cleaned cache file: {out_obj}")
-                    op = outputs_path(self._ctx.ipc_dir, uid)
-                    if op.exists():
-                        op.unlink()
-                    # inputs.jsonl 生命周期与 outputs.jsonl 一致——
-                    # 成功路径已读入 wall meta，落盘文件可删。失败/重试路径
-                    # 同样删除：不删则重试时 handler 重新 append，旧指纹残留
-                    # → input_changed 误判无限重跑（见 _cleanup_outputs 的 finally）。
-                    ip = inputs_path(self._ctx.ipc_dir, uid)
-                    if ip.exists():
-                        ip.unlink()
-                except OSError:
-                    pass
-
-            # （单一出口）：IPC 文件（result/signals/tmp）生命周期集中
-            # 在此 finally——正常路径 drain 已删（重复删除无害，FileNotFound
-            # 忽略），恢复路径（_restore_stale_result 伪 entry）也经此
-            # 清理，两条路径一致，孤儿 signals 文件不残留。
-            try:
-                cleanup_ipc_files(self._ctx.ipc_dir, uid)
-            except Exception:
-                pass
+            # Cleanup outputs and IPC artifacts via channel deep module
+            cleanup_mode = (
+                ArtifactCleanupMode.SUCCESS if result.success
+                else ArtifactCleanupMode.FAILURE_OR_RETRY
+            )
+            self._ctx.channel.cleanup_artifacts(uid, mode=cleanup_mode)
 
         # on_job_completed 在 stats 更新之后（_apply_result
         # 已 +1）调用——钩子内读 stats 保证一致。单一出口：正常提交与
@@ -276,10 +240,7 @@ class CompletionMachine:
 
         # 构建 wall meta
         wall_meta = dict(result.result_meta or {})
-        try:
-            declared_inputs = read_inputs(self._ctx.ipc_dir, uid)
-        except Exception:
-            declared_inputs = []
+        declared_inputs = self._ctx.channel.read_declared_inputs(uid)
 
         self._ctx.store.apply_success(
             uid,
@@ -349,52 +310,8 @@ class CompletionMachine:
         return True
 
     def cleanup_outputs(self, uid: str) -> None:
-        """清理失败/中断 job 的半成品输出（abort 路径复用）。
-
-        遍历 handler 声明的输出（从落盘 ``{uid}.outputs.jsonl`` 读取，
-        handler 崩溃/kill 后声明仍可读），对 ``cleanup_on_fail=True`` 且
-        物理存在的路径执行删除（文件 unlink / 目录 rmtree）。
-        读后**删除落盘文件**（消费语义，与 read_signals 一致）——
-        outputs.jsonl 生命周期在此结束，drain 的 cleanup_ipc_files
-        不覆盖它。
-
-        ``_complete_job`` 与 ``_abort_in_flight`` 共用同一清理：被 kill 的
-        in-flight job 半成品输出若不清理，重启后 handler 若「文件已存在
-        则跳过」会读到半残文件。
-        """
-        outputs = read_outputs(self._ctx.ipc_dir, uid)
-        try:
-            for out_path, cleanup, kind in outputs:
-                # kind=="cache" 的临时文件**无条件删除**
-                # （语义：任务结束时该文件不应存在；成功路径 rename 已发生
-                # 则是 no-op）。kind=="output" 按 cleanup_on_fail 删除。
-                if kind == "cache" or cleanup:
-                    out_path_obj = Path(out_path)
-                    if out_path_obj.exists():
-                        if out_path_obj.is_dir():
-                            shutil.rmtree(out_path_obj)
-                        else:
-                            out_path_obj.unlink()
-                        logger.info(f"Cleaned broken output: {out_path_obj}")
-        except Exception as e:
-            logger.error(f"Could not remove outputs for {uid}: {e}")
-        finally:
-            try:
-                # 兼容测试对 Path.unlink 的无参 monkeypatch：
-                # 避免 missing_ok keyword 触发 TypeError。
-                p = outputs_path(self._ctx.ipc_dir, uid)
-                if p.exists():
-                    p.unlink()
-                # inputs.jsonl 生命周期与 outputs.jsonl 一致——
-                # 失败/重试路径也消费删除：不删则重试时 handler 重新 append，
-                # 旧指纹残留 → input_changed 任一 entry 不匹配 →
-                # on_input_change 无限重跑。输入文件本身不是框架产物（不删），
-                # 但声明文件（inputs.jsonl）属于本次执行。
-                ip = inputs_path(self._ctx.ipc_dir, uid)
-                if ip.exists():
-                    ip.unlink()
-            except OSError:
-                pass
+        """清理失败/中断 job 的半成品输出（向后兼容委托给 channel）。"""
+        self._ctx.channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
 
     def release_acquired(
         self, acquired: List[Tuple[str, float]], uid: Optional[str] = None

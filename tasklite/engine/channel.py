@@ -198,20 +198,26 @@ class ExecutionChannel:
                 signals.append((uid, r_name, secs))
         return signals
 
-    def abort_in_flight(self, handles: Sequence[ExecutionHandle]) -> AbortOutcome:
+    def abort_in_flight(self, handles: Sequence[Any]) -> AbortOutcome:
         """TOCTOU 闭环中止：排空信号 -> 初查分类 -> 进程终止 -> 重探测闭环 -> 残留清理。"""
         if not handles:
             return AbortOutcome(completed=[], cancelled=[])
 
-        done_pairs: List[Tuple[ExecutionHandle, ExecutionResult]] = []
-        pending_handles: List[ExecutionHandle] = []
+        done_pairs: List[Tuple[Any, ExecutionResult]] = []
+        pending_handles: List[Any] = []
 
-        # 1. 信号排空与初查
+        # 1. 初查分类
         for h in handles:
-            res_p = result_path(self.ipc_dir, h.uid, h.incarnation)
+            incarnation = getattr(h, "incarnation", None)
+            res_p = result_path(self.ipc_dir, h.uid, incarnation)
             if res_p.exists():
                 raw_res = read_result_file(res_p)
-                if raw_res and raw_res.get("status") != "interrupted":
+                if (
+                    raw_res is not None
+                    and isinstance(raw_res, dict)
+                    and "status" in raw_res
+                    and raw_res.get("status") != "interrupted"
+                ):
                     decoded = _decode_ipc_result(raw_res, None, h.job, self.ipc_dir)
                     done_pairs.append((h, decoded))
                     continue
@@ -223,13 +229,19 @@ class ExecutionChannel:
             self._executor.finalize_processes(raw_pending)
 
         # 3. 重查 TOCTOU 闭环：kill 期间可能恰好写入了结果
-        truly_cancelled: List[ExecutionHandle] = []
+        truly_cancelled: List[Any] = []
         for h in pending_handles:
-            res_p = result_path(self.ipc_dir, h.uid, h.incarnation)
+            incarnation = getattr(h, "incarnation", None)
+            res_p = result_path(self.ipc_dir, h.uid, incarnation)
             consumed = False
             if res_p.exists():
                 raw_res = read_result_file(res_p)
-                if raw_res and raw_res.get("status") != "interrupted":
+                if (
+                    raw_res is not None
+                    and isinstance(raw_res, dict)
+                    and "status" in raw_res
+                    and raw_res.get("status") != "interrupted"
+                ):
                     decoded = _decode_ipc_result(raw_res, None, h.job, self.ipc_dir)
                     done_pairs.append((h, decoded))
                     consumed = True
@@ -251,7 +263,8 @@ class ExecutionChannel:
                     pass
             for sp in _iter_stale_result_paths(self.ipc_dir, uid):
                 try:
-                    sp.unlink()
+                    if sp.exists():
+                        sp.unlink()
                 except OSError:
                     pass
             return
@@ -260,12 +273,22 @@ class ExecutionChannel:
             try:
                 for out_path, _, kind in read_outputs(self.ipc_dir, uid):
                     if kind == "cache":
-                        Path(out_path).unlink(missing_ok=True)
-                outputs_path(self.ipc_dir, uid).unlink(missing_ok=True)
-                inputs_path(self.ipc_dir, uid).unlink(missing_ok=True)
-            except (OSError, Exception):
+                        out_obj = Path(out_path)
+                        if out_obj.exists():
+                            out_obj.unlink()
+                            logger.info(f"Cleaned cache file: {out_obj}")
+                op = outputs_path(self.ipc_dir, uid)
+                if op.exists():
+                    op.unlink()
+                ip = inputs_path(self.ipc_dir, uid)
+                if ip.exists():
+                    ip.unlink()
+            except OSError:
                 pass
-            cleanup_ipc_files(self.ipc_dir, uid)
+            try:
+                cleanup_ipc_files(self.ipc_dir, uid)
+            except Exception:
+                pass
             return
 
         if mode == ArtifactCleanupMode.FAILURE_OR_RETRY:
@@ -275,19 +298,26 @@ class ExecutionChannel:
                         out_path_obj = Path(out_path)
                         if out_path_obj.exists():
                             if out_path_obj.is_dir():
-                                shutil.rmtree(out_path_obj, ignore_errors=True)
+                                shutil.rmtree(out_path_obj)
                             else:
-                                out_path_obj.unlink(missing_ok=True)
-            except Exception:
-                pass
+                                out_path_obj.unlink()
+                            logger.info(f"Cleaned broken output: {out_path_obj}")
+            except Exception as e:
+                logger.error(f"Could not remove outputs for {uid}: {e}")
             finally:
-                for p in (outputs_path(self.ipc_dir, uid), inputs_path(self.ipc_dir, uid)):
-                    try:
-                        if p.exists():
-                            p.unlink()
-                    except OSError:
-                        pass
-                cleanup_ipc_files(self.ipc_dir, uid)
+                try:
+                    p = outputs_path(self.ipc_dir, uid)
+                    if p.exists():
+                        p.unlink()
+                    ip = inputs_path(self.ipc_dir, uid)
+                    if ip.exists():
+                        ip.unlink()
+                except OSError:
+                    pass
+                try:
+                    cleanup_ipc_files(self.ipc_dir, uid)
+                except Exception:
+                    pass
 
     def read_declared_inputs(self, uid: str) -> List[dict]:
         """读取任务声明的输入清单。"""
@@ -296,8 +326,10 @@ class ExecutionChannel:
         except Exception:
             return []
 
-    def _to_raw_handle(self, handle: ExecutionHandle) -> Any:
+    def _to_raw_handle(self, handle: Any) -> Any:
         from .executor import JobHandle
+        if isinstance(handle, JobHandle):
+            return handle
         return JobHandle(
             uid=handle.uid,
             process=handle.process,
@@ -305,5 +337,5 @@ class ExecutionChannel:
             timeout=handle.timeout,
             job=handle.job,
             ipc_dir=self.ipc_dir,
-            incarnation=handle.incarnation,
+            incarnation=getattr(handle, "incarnation", None),
         )
