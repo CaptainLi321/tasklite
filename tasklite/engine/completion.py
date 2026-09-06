@@ -354,7 +354,7 @@ class CompletionMachine:
             True 表示已消费残留（job 已提交/重入队，调用方应返回 None，
             不再派发子进程）；False 表示无残留，照常派发。
         """
-        result = self._ctx.executor.consume_stale_result(uid, job)
+        result = self._ctx.channel.consume_stale_result(uid, job)
         if result is None:
             return False
         logger.info(f"RESTORE: {uid} (stale result from previous run, no subprocess)")

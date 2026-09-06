@@ -150,6 +150,38 @@ class ExecutionChannel:
                 results.append((handle_map[raw_h.uid], res))
         return results
 
+    def submit(
+        self,
+        handler_func: Callable[[Job, TaskContext], Any],
+        job: Job,
+        ctx: TaskContext,
+        timeout: float,
+        *,
+        ipc_dir: Optional[str] = None,
+    ) -> Any:
+        """提交任务到子进程执行通道，返回底层 JobHandle。"""
+        return self._executor.submit(
+            handler_func, job, ctx, timeout, ipc_dir=ipc_dir or self.ipc_dir
+        )
+
+    def cleanup(self, handles: Sequence[Any]) -> None:
+        """清理已完成或失败的句柄列表。"""
+        self._executor.cleanup(handles)
+
+    def finalize_processes(self, handles: Sequence[Any]) -> None:
+        """终结并回收正在运行的子进程列表。"""
+        self._executor.finalize_processes(handles)
+
+    def reap_completed(
+        self, handles: Sequence[Any]
+    ) -> List[Tuple[Any, ExecutionResult]]:
+        """非阻塞收割已完成的执行体（兼容 JobHandle 列表）。"""
+        return self._executor.reap_completed(handles)
+
+    def consume_stale_result(self, uid: str, job: Job) -> Optional[ExecutionResult]:
+        """认领并消费陈旧结果。"""
+        return self.claim_stale_result(uid, job)
+
     def probe_orphan_lock(self, uid: str) -> bool:
         """非阻塞探测执行锁。True 表示无孤儿持锁可安全执行；False 表示孤儿活跃需 defer。"""
         return probe_lock(self.ipc_dir, uid)

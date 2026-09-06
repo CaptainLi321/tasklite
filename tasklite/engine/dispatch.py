@@ -301,7 +301,7 @@ class DispatchMachine:
 
                 logger.info(f"RUN: {uid}")
                 job_start = time.monotonic()
-                handle = self._ctx.executor.submit(
+                handle = self._ctx.channel.submit(
                     self._ctx.handlers[job.task_type].func, job, ctx, job.timeout,
                     ipc_dir=self._ctx.ipc_dir,
                 )
@@ -333,7 +333,7 @@ class DispatchMachine:
                 # 避免对同一 entry 二次释放资源、二次 requeue 同一作业。
                 raise
             if handle is not None:
-                self._ctx.executor.cleanup([handle])
+                self._ctx.channel.cleanup([handle])
             state.requeue_jobs([job_dict], front=True)
             # 不在此 save_queue：内存此刻缺其他 in-flight 作业，
             # 交给 _run_loop 的 _save_queue_crash_safe 合并磁盘真相后统一保存。
@@ -341,7 +341,7 @@ class DispatchMachine:
         except Exception as e:
             logger.error(f"Error dispatching job {uid}: {e}\n{traceback.format_exc()}")
             if handle is not None:
-                self._ctx.executor.cleanup([handle])
+                self._ctx.channel.cleanup([handle])
             # dispatch 阶段失败（submit 的 pickle/启动报错、
             # 资源 acquire 校验失败）：确定性失败（如不可 pickle 的
             # lambda handler）若只 requeue + 崩溃会触发**无限重启循环**。

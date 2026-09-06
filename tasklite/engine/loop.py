@@ -220,7 +220,7 @@ class LoopRunner:
                 # （handler 崩溃/超时也不丢失限流信息——文件落盘）
                 self._recovery.apply_pending_signals()
                 handles = self._ctx.in_flight.active_handles()
-                completed = self._ctx.executor.reap_completed(handles)
+                completed = self._ctx.channel.reap_completed(handles)
                 for handle, result in completed:
                     # 先 complete 再 pop：complete 与 pop 之间被
                     # Ctrl+C/KI 打断时 entry 仍在 in_flight——abort_in_flight
