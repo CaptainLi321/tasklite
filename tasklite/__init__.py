@@ -15,7 +15,15 @@ from .exceptions import (
     is_transient_exception,
 )
 from .models.job import Job, JobRuntimeState
-from .pipeline import DLQEntry, TaskLite, WORKER_RESOURCE
+from .pipeline import DLQEntry, TaskLite, WORKER_RESOURCE, job_ref, progress_hook, slice_list
+from .utils.injective import (
+    content_fingerprint,
+    escape_injective,
+    safe_uid_filename,
+    sanitize_content_id,
+    sanitize_identifier,
+    sanitize_job_component,
+)
 
 # Public API - Contrib ecosystem
 from . import contrib
@@ -43,6 +51,16 @@ __all__ = [
     "is_transient_exception",
     "WORKER_RESOURCE",
     "DLQEntry",
+    "job_ref",
+    "progress_hook",
+    "slice_list",
+    # Injective & Fingerprint
+    "content_fingerprint",
+    "escape_injective",
+    "sanitize_identifier",
+    "sanitize_job_component",
+    "sanitize_content_id",
+    "safe_uid_filename",
     # Contrib
     "contrib",
     # Generic pipeline scaffolding
@@ -54,3 +72,4 @@ __all__ = [
     # Version
     "__version__",
 ]
+

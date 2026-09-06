@@ -97,3 +97,13 @@ def test_tasklite_run_graceful(tmp_path):
     # run_graceful 应能正常执行无任务管线并自然收尾
     p.run_graceful()
     assert p.stats.completed == 0
+
+
+def test_tasklite_root_exports_equivalence():
+    import tasklite
+    assert tasklite.content_fingerprint is content_fingerprint
+    assert tasklite.sanitize_job_component is sanitize_job_component
+    assert tasklite.job_ref is job_ref
+    assert tasklite.progress_hook is progress_hook
+    assert tasklite.slice_list is slice_list
+

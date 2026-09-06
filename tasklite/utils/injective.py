@@ -9,7 +9,7 @@
 """
 
 import hashlib
-from typing import Any, Dict, Sequence, Union
+from typing import Any, Dict, Iterable, Sequence, Union
 
 _PERCENT_ESCAPE = "%"
 _PERCENT_ESCAPED = "%25"
@@ -94,6 +94,14 @@ def sanitize_identifier(
     return f"{prefix}_{digest}"
 
 
+def sanitize_job_component(value: Any, *, max_len: int = 120) -> str:
+    r"""把任意字符串**转义**净化为可作 job_id 成分的串（单射，不删字符）。
+
+    单射转义与长度截断统一委托底层 sanitize_identifier。
+    """
+    return sanitize_identifier(value, max_len=max_len)
+
+
 def sanitize_content_id(content_id: str, *, max_len: int = 120) -> str:
     """按严密 allowlist 净化 content_id（如用于 discovery 子任务派发）。"""
     text = str(content_id)
@@ -105,6 +113,25 @@ def sanitize_content_id(content_id: str, *, max_len: int = 120) -> str:
     return sanitize_identifier(text, max_len=max_len, allowed=CONTENT_ID_ALLOWED)
 
 
+def content_fingerprint(
+    parts: Iterable[Union[str, int, float]],
+    *,
+    version: str = "",
+) -> str:
+    """内容指纹 → 确定性 job_id 片段（sha1，截 16 位，可读）。
+
+    任何输入变化（含 bump version 盐）→ 指纹变化 → wall 不命中 → 重跑。
+    与“job_id 确定性、禁止随机后缀”红线一致：给定输入恒同指纹。
+    """
+    h = hashlib.sha1()
+    if version:
+        h.update(str(version).encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+    for p in parts:
+        h.update(str(p).encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
 
 def safe_uid_filename(uid: str) -> str:
     """把 job uid 映射为对任意文件系统安全（无 : 等保留字符）的文件名。
@@ -115,3 +142,4 @@ def safe_uid_filename(uid: str) -> str:
     for ch, enc in FS_ESCAPE_CHARS.items():
         escaped = escaped.replace(ch, enc)
     return escaped
+
