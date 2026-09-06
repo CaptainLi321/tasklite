@@ -10,11 +10,15 @@
 ## 一、核心红线与开发纪律（必须遵守）
 
 1. **测试全绿才允许提交**：
-   - 提交前必须执行全量测试：`python -m pytest tests/ -q -p no:cacheprovider`（必须 100% 绿灯，约 1167 个测试）。
+   - 提交前必须执行全量测试：`python -m pytest tests/ -q -p no:cacheprovider`（必须 100% 绿灯，约 1170 个测试）。
    - 涉及类型注解、API 签名或模块导入修改时，必须运行多解释器矩阵：`make test-matrix`（验证 Python 3.9/3.10/3.11/3.12/3.13/3.14 兼容性与类型求值）。
    - **测试命令必须真实 exit code 判定**：不得修改 `scripts/pre-push` 让测试恒 exit 0。
 2. **始终使用中文**：中文回答、中文代码注释与规范中文 Commit 提交信息。
-3. **改完当场提交**：一批修改完成并通过测试验证后，**当场 `git commit`**，不得让改动长期滞留工作区；遇 `index.lock` 冲突 `sleep 2` 重试最多 5 次。
+3. **严禁混合提交（独立原子化提交）**：
+   - 多个独立的问题修复、特性演进或重构，**严禁揉杂在同一个 Commit 中**；
+   - 必须按功能/缺陷单元拆分为独立的原子提交（Atomic Commit），每个 Commit 仅包含该单元的实现代码及其对应的回归测试；
+   - 保证每个 Commit 独立自洽，在 `git bisect` 或 `cherry-pick` 时具备独立可验证性与可回滚性；
+   - 单元改完并跑通对应测试后**当场 `git commit`**，不得长期堆积滞留工作区后一次性大包提交；遇 `index.lock` 冲突 `sleep 2` 重试最多 5 次。
 4. **分层单向依赖红线**：
    - `models/` 严禁反向 import `engine/`（IPC 声明读写一律下沉 `utils/ipc.py`）；
    - `utils/` 严禁反向 import `wrappers/`（无历史垫片）；
