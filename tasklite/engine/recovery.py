@@ -23,7 +23,6 @@ from .executor import (
     result_path,
 )
 from .inflight import InFlightJob
-from .retry import rerun_skips
 from .runtime import (
     META_RESOURCE_SUSPENDS,
     RT_BACKOFF_UNTIL,
@@ -80,13 +79,16 @@ class RecoveryMachine:
             u = uid_from_job_dict(jd)
             wall_hit = u in wall
             failed_hit = u in failed
-            if (wall_hit or failed_hit) and rerun_skips(
-                jd,
-                wall_hit=wall_hit,
-                failed_hit=failed_hit,
-                wall_meta=wall.get(u),
-            ):
-                continue
+            if wall_hit or failed_hit:
+                decision = self._ctx.policy.evaluate(
+                    jd,
+                    wall_meta=wall.get(u),
+                    is_wall=wall_hit,
+                    is_failed=failed_hit,
+                )
+                if decision.should_skip:
+                    continue
+
 
             # 3. 去重（保留首条）
             if u in seen_uid:

@@ -24,9 +24,11 @@ from .executor import (
     ExecutionResult, cleanup_ipc_files, read_inputs, read_outputs,
 )
 from .inflight import InFlightJob
-from .retry import apply_discovery_rerun, compute_backoff, rerun_skips
+from .policy import BackoffSchedule
+from .retry import compute_backoff
 from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE, inject_worker_resource
 from ..utils.ipc import inputs_path, outputs_path
+
 
 logger = logging.getLogger("tasklite")
 
@@ -205,17 +207,20 @@ class CompletionMachine:
             self._failure.commit_failed_crash(uid, "commit_job_failure", job_dict)
 
         lock_conflict = result.lock_conflict
-        if result.interrupted:
-            delay = 1.0
-            self._ctx.stats["interrupted_reruns"] += 1
-        elif lock_conflict:
-            delay = 1.0
-            self._ctx.stats["deferred_orphan"] += 1
+        if result.interrupted or lock_conflict:
+            sched = self._ctx.policy.compute_orphan_schedule()
+            if result.interrupted:
+                self._ctx.stats["interrupted_reruns"] += 1
+            else:
+                self._ctx.stats["deferred_orphan"] += 1
         else:
             job.retries += 1
-            delay = compute_backoff(job.retries, job.backoff_base, job.backoff_max)
+            delay = compute_backoff(
+                job.retries, job.backoff_base, job.backoff_max
+            )
+            sched = BackoffSchedule.from_delay(delay)
 
-        logger.info(f"RETRY: {uid} (attempt {job.retries}/{job.max_retries}, backoff {delay:.1f}s)")
+        logger.info(f"RETRY: {uid} (attempt {job.retries}/{job.max_retries}, backoff {sched.delay:.1f}s)")
         retry_dict = job.to_dict()
         retry_dict["resources"] = dict(job_dict.get("resources", {}))
         raw_rt = job_dict.get("runtime")
@@ -224,8 +229,7 @@ class CompletionMachine:
         retry_rt.setdefault("_last_retry_error", "")
         if result.retry_error and not (lock_conflict or result.interrupted):
             retry_rt["_last_retry_error"] = result.retry_error
-        retry_rt[RT_BACKOFF_UNTIL] = time.monotonic() + delay
-        retry_rt[RT_BACKOFF_WALL_DEADLINE] = time.time() + delay
+        sched.populate_runtime(retry_rt)
 
         committed = self._ctx.backend.commit_retry(uid, retry_dict, front=False)
         if not committed:
@@ -262,20 +266,24 @@ class CompletionMachine:
                     wall_hit = nj_uid in state.wall
                     failed_hit = nj_uid in state.failed
                     if wall_hit or failed_hit:
-                        if rerun_skips(
-                            nj.to_dict(), wall_hit=wall_hit, failed_hit=failed_hit,
+                        decision = self._ctx.policy.evaluate(
+                            nj.to_dict(),
                             wall_meta=state.wall.get(nj_uid),
-                        ):
+                            is_wall=wall_hit,
+                            is_failed=failed_hit,
+                        )
+                        if decision.should_skip:
                             continue
                 seen_in_batch.add(nj_uid)
                 unique_new_jobs.append(nj)
 
             for nj in unique_new_jobs:
                 jd = nj.to_dict()
-                apply_discovery_rerun(jd, nj.task_type, self._ctx.discovery_rerun)
+                self._ctx.policy.normalize_job_dict(jd, nj.task_type)
                 inject_worker_resource(jd)
                 spawned_dicts.append(jd)
             logger.debug(f"Spawned {len(spawned_dicts)} jobs for {uid}.")
+
 
         # 构建 wall meta
         wall_meta = dict(result.result_meta or {})

@@ -36,10 +36,12 @@ from .failure import (
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
 )
+from .policy import PreflightPolicy
 from ..models.state import PipelineState
 from ..utils.jsonutil import dumps
 
 logger = logging.getLogger("tasklite")
+
 
 
 @dataclass
@@ -197,6 +199,8 @@ class RunContext:
         self.transient_exceptions: Optional[tuple] = (
             tuple(transient_exceptions) if transient_exceptions is not None else None)
         self.discovery_rerun = discovery_rerun
+        self.policy: PreflightPolicy = PreflightPolicy(self.discovery_rerun)
+
         # 引擎阈值可配（支持外部配置：None=沿用 failure.py 模块默认）——
         # 不同业务对「依赖宽限时长 / commit 崩溃容忍度 / 死锁观察轮数」
         # 的合理值差异很大，不应硬编码。
