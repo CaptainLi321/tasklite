@@ -182,7 +182,6 @@ class CompletionMachine:
         self, uid: str, job: Job, job_dict: dict, result: ExecutionResult
     ) -> None:
         """处理重试分支：max_retries 预算检查、指数退避计算与队尾重入队。"""
-        state = self._ctx.state
         # 中断信号与孤儿锁冲突都不消耗预算：中断源于外部信号，锁冲突源于
         # 同 uid 孤儿执行体仍持锁（handler 未执行，孤儿死后重跑本可成功）。
         # 二者即使撞上已耗尽的重试预算也豁免 DLQ，走下方零计数短退避回队
@@ -196,13 +195,12 @@ class CompletionMachine:
                 fail_meta["last_retry_error"] = last_retry_error
             if result.retry_error:
                 fail_meta["retry_error"] = result.retry_error
-            committed = self._ctx.backend.commit_job_failure(uid, fail_meta)
-            if committed:
-                self._failure.apply_failed(uid, fail_meta)
-                self._failure.cascade_fail(uid)
-                result.going_to_retry = False
-                return
-            self._failure.commit_failed_crash(uid, "commit_job_failure", job_dict)
+            outcome = self._ctx.store.apply_failure(uid, fail_meta, job_dict=job_dict, cascade=True)
+            self._ctx.stats["failed"] += 1
+            if outcome.cascaded_uids:
+                self._ctx.stats["cascade_failed"] += len(outcome.cascaded_uids)
+            result.going_to_retry = False
+            return
 
         lock_conflict = result.lock_conflict
         if result.interrupted or lock_conflict:
@@ -228,12 +226,7 @@ class CompletionMachine:
             retry_rt["_last_retry_error"] = result.retry_error
         sched.populate_runtime(retry_rt)
 
-        committed = self._ctx.backend.commit_retry(uid, retry_dict, front=False)
-        if not committed:
-            self._failure.commit_failed_crash(uid, "commit_retry", job_dict)
-
-        state.unregister_in_flight(uid)
-        state.requeue_jobs([retry_dict], front=False)
+        self._ctx.store.apply_retry(uid, job_dict, retry_dict, front=False)
         self._ctx.stats["retried"] += 1
         result.going_to_retry = True
 
@@ -281,47 +274,24 @@ class CompletionMachine:
                 spawned_dicts.append(jd)
             logger.debug(f"Spawned {len(spawned_dicts)} jobs for {uid}.")
 
-
         # 构建 wall meta
         wall_meta = dict(result.result_meta or {})
-        prev = state.wall.get(uid)
-        raw_count = prev.get("run_count", 0) if isinstance(prev, dict) else 0
-        try:
-            prev_count = int(raw_count)
-        except (TypeError, ValueError):
-            logger.warning(
-                f"Corrupt run_count for {uid} in wall meta ({raw_count!r}); treating as 0"
-            )
-            prev_count = 0
-        wall_meta["run_count"] = prev_count + 1
-        wall_meta["last_run_at"] = datetime.now(timezone.utc).isoformat()
-        wall_meta["last_run_id"] = self._ctx.run_id
         try:
             declared_inputs = read_inputs(self._ctx.ipc_dir, uid)
-            deduped: dict = {}
-            for entry in declared_inputs:
-                deduped[entry.get("path")] = entry
-            if deduped:
-                wall_meta["inputs"] = list(deduped.values())
         except Exception:
-            pass
+            declared_inputs = []
 
-        committed = self._ctx.backend.commit_job_success(
-            uid, wall_meta,
+        self._ctx.store.apply_success(
+            uid,
+            wall_meta,
             spawned_jobs=spawned_dicts,
             cursor_updates=result.cursor_updates,
+            declared_inputs=declared_inputs,
+            run_id=self._ctx.run_id,
+            job_dict=job_dict,
         )
-        if committed:
-            if spawned_dicts:
-                state.spawn_jobs(spawned_dicts, front=True)
-            if result.cursor_updates:
-                state.update_cursors(result.cursor_updates)
-            state.mark_success(uid, wall_meta)
-            state.unregister_in_flight(uid)
-            self._ctx.stats["completed"] += 1
-            result.going_to_retry = False
-            return
-        self._failure.commit_failed_crash(uid, "commit_job_success", job_dict)
+        self._ctx.stats["completed"] += 1
+        result.going_to_retry = False
 
     def _apply_failure(
         self, uid: str, job_dict: dict, result: ExecutionResult,
@@ -330,15 +300,13 @@ class CompletionMachine:
         """处理永久失败分支：写入 DLQ 与级联阻断下游。"""
         duration = (time.monotonic() - job_start) if job_start is not None else 0.0
         logger.error(f"FAIL: {uid} (duration {duration:.2f}s, Sent to DLQ). Meta: {result.result_meta}")
-        committed = self._ctx.backend.commit_job_failure(
-            uid, result.result_meta
+        outcome = self._ctx.store.apply_failure(
+            uid, result.result_meta, job_dict=job_dict, cascade=True
         )
-        if committed:
-            self._failure.apply_failed(uid, result.result_meta)
-            self._failure.cascade_fail(uid)
-            result.going_to_retry = False
-            return
-        self._failure.commit_failed_crash(uid, "commit_job_failure", job_dict)
+        self._ctx.stats["failed"] += 1
+        if outcome.cascaded_uids:
+            self._ctx.stats["cascade_failed"] += len(outcome.cascaded_uids)
+        result.going_to_retry = False
 
 
 
