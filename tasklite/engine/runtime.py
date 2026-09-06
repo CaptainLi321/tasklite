@@ -36,6 +36,7 @@ from .failure import (
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
 )
+from .inflight import InFlightTracker
 from .policy import PreflightPolicy
 from .resource import Resource, ResourceManager, WORKER_RESOURCE
 from ..models.state import PipelineState
@@ -224,7 +225,7 @@ class RunContext:
         self.on_run_end = on_run_end
         # ── 每-run 可变运行态（run 建立）────────────────────
         self.state: Optional[PipelineState] = None
-        self.in_flight: Dict[str, Any] = {}
+        self._in_flight: InFlightTracker = InFlightTracker()
         self.run_id: Optional[str] = None
         self.dispatch_seq: int = 0
         # 停机状态机：单枚举——双独立 bool 可组合出非法状态（force 而未
@@ -236,6 +237,20 @@ class RunContext:
         # on_run_end 幂等标志——run 的 finally 与 LoopRunner 都可能触发，
         # 保证整个 run 只调用一次。
         self._run_end_fired = False
+
+    @property
+    def in_flight(self) -> InFlightTracker:
+        return self._in_flight
+
+    @in_flight.setter
+    def in_flight(self, value: Any) -> None:
+        if isinstance(value, InFlightTracker):
+            self._in_flight = value
+        elif isinstance(value, Mapping):
+            self._in_flight.clear()
+            self._in_flight.update(value)
+        else:
+            self._in_flight.clear()
 
     @property
     def dep_grace_deadline(self) -> Optional[float]:

@@ -315,11 +315,8 @@ class DispatchMachine:
                 handle=handle,
                 job_start=job_start,
             )
-            # 在 return 前注册到 _in_flight，避免 return 后到调用方注册之间
-            # 命中 KeyboardInterrupt 导致子进程泄漏 + 资源泄漏 + job 丢失。
-            self._ctx.in_flight[uid] = entry
-            # 同步登记到 state 的 in-flight 集合（统一 is_known 事实源）
-            state.register_in_flight(uid)
+            # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
+            self._ctx.in_flight.register(entry, state=state)
             return entry
 
         except _CommitCrashSignal:

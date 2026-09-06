@@ -22,7 +22,7 @@ from .executor import (
     _decode_ipc_result, cleanup_ipc_files, read_result_file, read_signals,
     result_path,
 )
-from .inflight import InFlightJob
+from .inflight import InFlightJob, InFlightTracker
 from .runtime import (
     META_RESOURCE_SUSPENDS,
     RT_BACKOFF_UNTIL,
@@ -279,8 +279,7 @@ class RecoveryMachine:
                     continue
             pending_entries.append(entry)
         # 先释放资源（务必在 clear 前）
-        for entry in self._ctx.in_flight.values():
-            self._completion.release_acquired(entry.acquired, uid=entry.uid)
+        self._ctx.in_flight.release_all_acquired(self._ctx.resource_mgr)
         # 先 kill 全部**进行中**子进程（确保输出写入停止），
         # 再清理半成品输出（与 _complete_job 的正常路径时序对齐）。
         # 「已完成」entry 不 kill——结果已落盘，子进程已自然退出或即将退出。
@@ -354,13 +353,8 @@ class RecoveryMachine:
             result = _decode_ipc_result(
                 res, None, entry.job, entry.handle.ipc_dir
             )
-            pseudo = InFlightJob(
-                uid=entry.uid,
-                job_dict=entry.job_dict,
-                job=entry.job,
-                acquired=[],
-                handle=None,
-                job_start=None,
+            pseudo = InFlightTracker.create_pseudo_entry(
+                entry.uid, entry.job_dict, entry.job
             )
             try:
                 self._completion.complete_job(pseudo, result)

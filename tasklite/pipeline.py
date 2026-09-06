@@ -21,7 +21,7 @@ from .engine.executor import ExecutionResult, MultiprocessingExecutor
 from .engine.completion import CompletionMachine
 from .engine.dispatch import DispatchMachine
 from .engine.failure import FailureMachine
-from .engine.inflight import InFlightJob as _InFlightJob
+from .engine.inflight import InFlightJob as _InFlightJob, InFlightTracker
 from .engine.loop import LoopRunner
 from .engine.recovery import RecoveryMachine
 from .engine.resource import CapacityResource, Resource, ResourceManager
@@ -297,12 +297,17 @@ class TaskLite:
         self._ctx.state = value
 
     @property
-    def _in_flight(self) -> Dict[str, _InFlightJob]:
+    def _in_flight(self) -> InFlightTracker:
         return self._ctx.in_flight
 
     @_in_flight.setter
-    def _in_flight(self, value: Dict[str, _InFlightJob]) -> None:
-        self._ctx.in_flight = value
+    def _in_flight(self, value: Any) -> None:
+        if isinstance(value, InFlightTracker):
+            self._ctx.in_flight = value
+        else:
+            self._ctx.in_flight.clear()
+            if value:
+                self._ctx.in_flight.update(value)
 
     @property
     def _deadlock_gap_rounds(self) -> int:
