@@ -53,6 +53,22 @@ def test_sanitize_identifier_fallbacks_and_limits():
     assert res_a.endswith("_" + hashlib.sha256(long_a.encode()).hexdigest()[:8])
 
 
+def test_sanitize_identifier_truncation_aligns_percent_escape():
+    # 截断命中 %XX 序列内部时，对齐修剪不完整碎片
+    res1 = sanitize_identifier("aaaa////", max_len=20)
+    prefix1 = res1.rsplit("_", 1)[0]
+    assert not prefix1.endswith("%")
+    assert not (len(prefix1) >= 2 and prefix1[-2] == "%")
+    assert len(res1) <= 20
+
+    res2 = sanitize_identifier("aaaa////", max_len=21)
+    prefix2 = res2.rsplit("_", 1)[0]
+    assert not prefix2.endswith("%")
+    assert not (len(prefix2) >= 2 and prefix2[-2] == "%")
+    assert len(res2) <= 21
+
+
+
 def test_sanitize_content_id_strict_allowlist():
     # 干净字符完全零转义
     assert sanitize_content_id("12345") == "12345"
