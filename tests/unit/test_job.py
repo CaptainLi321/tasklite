@@ -64,10 +64,18 @@ class TestJobCreation:
         job = Job("fetch", "j1", resources=None)
         assert job.resources == {}
 
+    def test_resources_shallow_copied(self):
+        """Job.resources 初始化时进行浅拷贝，防止外部就地变异。"""
+        res = {"gpu": 1.0}
+        job = Job("scan", "s1", resources=res)
+        res["gpu"] = 2.0
+        assert job.resources == {"gpu": 1.0}
+
     def test_depends_on_none_defaults_to_empty_list(self):
         """When depends_on is None, it defaults to an empty list."""
         job = Job("fetch", "j1", depends_on=None)
         assert job.depends_on == []
+
 
 
 class TestJobToDict:

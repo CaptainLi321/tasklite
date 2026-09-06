@@ -153,7 +153,7 @@ class Job:
             raise TypeError(
                 f"resources must be a dict or None, got {type(resources).__name__} ({resources!r})"
             )
-        self.resources = resources or {}
+        self.resources = dict(resources) if resources else {}
         # 数值校验单点化（与 pipeline.register_handler 的默认资源
         # 校验共用 utils.validation.validate_resource_amounts）——负值/NaN/Inf
         # 会在调度器 acquire 时抛 ValueError（若抛在 try 之外，部分资源
