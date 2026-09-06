@@ -22,15 +22,17 @@ from tasklite import (
 )
 ```
 
-三个例外（顶层不导出，须从子模块导入）：
+从子模块导入的扩展与包装工具：
 
 | 符号 | 导入位置 | 说明 |
 |------|---------|------|
 | `register_discovery` | `from tasklite.wrappers.discovery import register_discovery` | 增量发现注册 |
 | `validate_payload` | `from tasklite.utils import validate_payload` | payload schema 校验 |
 | `sanitize_content_id` | `from tasklite.wrappers.discovery import sanitize_content_id` | content_id 净化（job_id 派生单点） |
+| `http_guard`, `SnapshotStore` 等 | `from tasklite.wrappers.http import http_guard, SQLiteSnapshotStore, ...` | 官方轻量网络守卫与快照工具（见 §16） |
 
 `engine/` 与 `backend/` 子包不做再导出（如 `SQLiteStateBackend` 须从 `tasklite.backend.sqlite_backend` 导入）。
+
 
 **标准调用顺序（六步，顺序本身是设计的一部分）**：
 
@@ -482,3 +484,84 @@ wall 条目除业务 meta 外携带：`run_count`（成功次数）、`last_run_
 | 其余 / 非 dict meta | `unknown` |
 
 新增 DLQ 写入路径前必须先在此登记错误码（AGENTS.md 纪律）。
+
+---
+
+## 16. 官方网络工具库（HTTP Wrappers）
+
+> 详见架构决策记录 [`docs/adr/0001-composable-http-wrappers.md`](./adr/0001-composable-http-wrappers.md)。
+
+TaskLite 官方提供 `tasklite.wrappers.http` 模块，为各种爬虫与网络请求业务提供轻量、组合式、正交解耦的工具库。
+
+### 16.1 核心设计原则
+
+1. **用户自主优先**：用户可完全自由选用 `requests`、`httpx`、`urllib` 或第三方 SDK；
+2. **正交独立**：快照去重（`SnapshotStore`）与 429 异常守卫（`http_guard` / `HttpPolicy`）互不依赖，可自由组合；
+3. **限速全权复用引擎**：多进程限速统一由 `RateLimitResource` 声明管理，不建冗余抽象；
+4. **零外部强制依赖**：默认基于 Python 标准库，软适配 `requests`。
+
+### 16.2 典型用法范例
+
+#### 范例一：配合 `http_guard` 与 `RateLimitResource` 实现 429 自动挂起与退避
+
+```python
+from tasklite import TaskLite, RateLimitResource
+from tasklite.wrappers.http import http_guard, fetch_urllib
+
+pipeline = TaskLite("crawler", state_dir="./states")
+# 1. 注册全局限速资源（每 2 秒最多派发 1 个请求）
+pipeline.add_resource(RateLimitResource("api_twitter", interval_seconds=2.0))
+
+def fetch_user_handler(job, ctx):
+    # 2. 用 http_guard 守卫任意网络调用
+    # 遇到 429 时：自动提取 Retry-After，自动执行 ctx.suspend_resource("api_twitter", ttl)，抛出 RateLimitHit
+    # 遇到 5xx/超时：抛出 RetryError（消耗任务重试预算）
+    # 遇到 404/403：抛出 FatalError（直送 DLQ）
+    with http_guard(ctx=ctx, resource="api_twitter"):
+        resp = fetch_urllib(job.payload["url"])
+        return resp.json()
+
+pipeline.register_handler("fetch_user", fetch_user_handler, default_resources={"api_twitter": 1.0})
+```
+
+#### 范例二：集成自定义 `requests.Session` 或平台专属客户端
+
+```python
+import requests
+from tasklite.wrappers.http import http_guard, parse_netscape_cookies
+
+# 加载 Mozilla/Netscape cookies.txt
+cookies = parse_netscape_cookies("./cookies.txt")
+
+def custom_api_handler(job, ctx):
+    # 子进程内部创建 Session（禁止跨进程 pickle 共享 Session）
+    session = requests.Session()
+    session.cookies.update(cookies)
+    
+    with http_guard(ctx=ctx, resource="api_custom"):
+        r = session.get(job.payload["url"], timeout=20)
+        # 显式校验响应状态码
+        if r.status_code != 200:
+            raise requests.HTTPError(response=r)
+        return r.json()
+```
+
+#### 范例三：使用 `SQLiteSnapshotStore` 原始 HTTP 快照实现离线幂等重放
+
+```python
+from tasklite.wrappers.http import SQLiteSnapshotStore, fetch_urllib
+
+# 创建/打开独立的快照数据库（与 tasklite 主状态库解耦）
+store = SQLiteSnapshotStore("./snapshots.db")
+
+# 方式 A：使用 @store.cached 装饰/包装 fetch 函数（自动拦截命中或落盘）
+cached_fetch = store.cached(fetch_urllib)
+resp = cached_fetch("https://api.example.com/user/100")
+
+# 方式 B：显式操作底层 CRUD
+key = store.make_key("https://api.example.com/user/100", method="GET")
+if not store.has(key):
+    resp = fetch_urllib("https://api.example.com/user/100")
+    store.put(key, url=resp.url, status_code=resp.status_code, headers=resp.headers, body=resp.body)
+```
+
