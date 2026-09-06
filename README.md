@@ -109,7 +109,14 @@ flowchart TD
 - `ctx.declare_output()` 声明产出文件，内置路径遍历防御 (`../` 拒绝)；
 - 任务成功时校验物理产出完整性，任务失败时自动清理半成品文件，避免残留。
 
+### 7. 🌐 组合式 HTTP 网络工具与快照守卫 (HTTP Wrappers)
+- 开放 Callable 设计，支持原生 `urllib`、`requests`、`httpx` 或平台自定义签名 SDK；
+- `http_guard` 自动捕获 429、解析 `Retry-After` 并触发 `ctx.suspend_resource` 全管线退避，收敛异常三分类；
+- `SQLiteSnapshotStore` 提供单射键原始响应快照持久化，支持全离线幂等重放；
+- 内置标准 Netscape `cookies.txt` 解析工具。
+
 ---
+
 
 ## 🚀 快速上手 (Quickstart)
 
@@ -257,7 +264,30 @@ pipeline.enqueue([
 pipeline.run()
 ```
 
+### Recipe 5: 官方 HTTP 守卫与原始响应快照重放 (HTTP Wrappers)
+
+```python
+from tasklite import TaskLite, RateLimitResource
+from tasklite.wrappers.http import SQLiteSnapshotStore, http_guard, fetch_urllib
+
+pipeline = TaskLite("crawler", state_dir="./states")
+pipeline.add_resource(RateLimitResource("api", interval_seconds=1.0))
+
+# 原始 HTTP 响应持久化快照（独立 snapshots.db，支持全离线重放与反爬保护）
+snapshot_store = SQLiteSnapshotStore("./snapshots.db")
+cached_fetch = snapshot_store.cached(fetch_urllib)
+
+def crawler_handler(job, ctx):
+    # 429 时自动挂起 api 资源、5xx 瞬态重试、4xx 直接 DLQ
+    with http_guard(ctx=ctx, resource="api", default_suspend_ttl=60.0):
+        resp = cached_fetch(job.payload["url"])
+        return resp.json()
+
+pipeline.register_handler("fetch", crawler_handler, default_resources={"api": 1.0})
+```
+
 ---
+
 
 ## 🛠️ 死信队列与运维 (DLQ & Ops)
 
