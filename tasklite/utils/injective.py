@@ -86,7 +86,12 @@ def sanitize_identifier(
         return escaped
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
     base_limit = max(max_len - 9, 0)
-    return f"{escaped[:base_limit]}_{digest}"
+    prefix = escaped[:base_limit]
+    if prefix.endswith("%"):
+        prefix = prefix[:-1]
+    elif len(prefix) >= 2 and prefix[-2] == "%":
+        prefix = prefix[:-2]
+    return f"{prefix}_{digest}"
 
 
 def sanitize_content_id(content_id: str, *, max_len: int = 120) -> str:
