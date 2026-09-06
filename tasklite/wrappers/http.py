@@ -1,58 +1,11 @@
-"""组合式官方 HTTP 网络工具库（Composable HTTP Wrappers & Utilities）。
+"""TaskLite 官方轻量 HTTP 网络工具库。
 
-================================================================================
-需求契约与设计手册（REQUIREMENTS & DESIGN CONTRACT —— 任何实现/重构必须逐条满足）
-================================================================================
-
-------------------------------------------------------------------------------
-一、架构定位与设计哲学（Architecture & Philosophy）
-------------------------------------------------------------------------------
-1. **用户自主权第一（User Autonomy First）**：
-   - 坚决不重造重量级统一客户端抽象层；
-   - 赋予用户 100% 网络请求选型自主权：用户可自由选用 Python 标准库 `urllib`、
-     `requests`、`httpx`、`curl_cffi`、GraphQL 客户端或第三方平台专用 SDK。
-2. **正交双引擎解耦（Orthogonal Dual-Engine Decoupling）**：
-   - **快照去重（`SnapshotStore`）**：专职内容寻址的原始 HTTP 响应持久化与离线
-     幂等重放，零引擎依赖，可在任何离线分析或独立脚本中单用；
-   - **429 与异常守卫（`http_guard` / `HttpPolicy`）**：专职将底层传输故障与
-     HTTP 状态码收敛为 TaskLite 三分类异常，自动解析 `Retry-After` 并触发
-     `ctx.suspend_resource` 资源挂起；
-   - 两者互不依赖，亦可自由正交嵌套。
-3. **全局限速复用（Global Rate Limiting Reuse）**：
-   - 绝不新建独立的 `Pacer` 概念，多 Worker / 多进程速率限制统一复用 TaskLite
-     原生 `RateLimitResource` 与 `ResourceManager`；
-   - 429 挂起时经由 `ctx.suspend_resource` 实现 IPC 单一出口下发。
-4. **零外部强制依赖（Zero Mandatory Dependencies）**：
-   - 默认基于 Python 标准库（`urllib` / `http.cookiejar` / `sqlite3`），软支持
-     `requests`。
-
-------------------------------------------------------------------------------
-二、异常三分类收敛映射契约（Exception Tri-Classification Matrix）
-------------------------------------------------------------------------------
-| 网络信号 / 状态码 | 对应引擎异常 | 引擎调度行为 | 重试预算消耗 |
-| :--- | :--- | :--- | :--- |
-| **HTTP 429 / 限流** | `RateLimitHit` | 自动解析 Retry-After，挂起资源，本任务放回队列等待 | ❌ 不烧预算（零污染） |
-| **HTTP 5xx / 传输抖动** | `RetryError` | 触发框架指数退避重试，耗尽 max_retries 进 DLQ | ⚠️ 消耗 retry 预算 |
-| **网络超时 / 连接重置** | `RetryError` | 判定为瞬态网络故障，触发框架退避重试 | ⚠️ 消耗 retry 预算 |
-| **HTTP 4xx（非 429）** | `FatalError` | 判定为确定性客户端错误/认证失效，直送 DLQ 归档 | 🛑 立即终止，不空转 |
-
-------------------------------------------------------------------------------
-三、进程隔离与会话军规（Process Isolation & Session Discipline）
-------------------------------------------------------------------------------
-- **严禁跨进程共享 Session**：`requests.Session` 或底层套接字句柄包含未导出的
-  内部锁与套接字，跨进程 pickle 传递会导致死锁或连接竞争崩溃；
-- **子进程自洽构建**：每个 Worker 子进程在执行 Handler 时自行按需创建与回收
-  连接或通过上下文管理器安全清理。
-
-------------------------------------------------------------------------------
-四、快照单射性与存储规范（Injective Snapshot Specification）
-------------------------------------------------------------------------------
-- 请求键生成遵循单射规范化：`make_key(url, method, params, body)`：
-  1. URL 规范化（去除 Fragment、Query 参数字典排序转义）；
-  2. HTTP 方法强制大写；
-  3. Body 单射摘要（JSON 排序键序列化或字节 SHA-256 哈希）；
-- `SQLiteSnapshotStore` 必须启用 `PRAGMA journal_mode=WAL`，保证读写并发与断电保护；
-- 429、5xx 瞬态故障默认禁止写入快照库，防止污染离线缓存。
+本模块提供面向批处理、数据同步与爬虫任务的通用 HTTP 辅助工具，主要包含：
+- http_guard: 上下文管理器，自动将 HTTP 状态码与网络异常映射为 TaskLite 三分类异常，并在遇到 429 时自动挂起对应资源；
+- HttpPolicy: HTTP 状态码与异常分类策略器，支持自定义状态码与异常分类钩子；
+- SnapshotStore / SQLiteSnapshotStore: 原始 HTTP 响应快照存储，支持基于请求单射哈希的幂等缓存与离线重放；
+- parse_netscape_cookies / format_cookie_header: Netscape 格式 cookies.txt 解析与请求头格式化工具；
+- fetch_urllib / fetch_requests: 开箱即用的轻量请求实现。
 """
 from __future__ import annotations
 
@@ -96,21 +49,16 @@ logger = logging.getLogger("tasklite.wrappers.http")
 def parse_netscape_cookies(file_or_content: Union[str, Path]) -> Dict[str, str]:
     """解析 Netscape / MozillaCookieJar 格式 cookies.txt 为字典。
 
-    规约契约：
-    1. 自动跳过空行与 '#' 注释行；
-    2. 兼容包含 '#HttpOnly_' 前缀的特殊声明行；
-    3. 同名 Cookie 后出现的覆盖先出现的（严格遵循浏览器覆盖规则）；
-    4. 若文件不存在或为空，安全返回空字典 `{}`。
+    - 自动跳过空行与 '#' 注释行；
+    - 兼容包含 '#HttpOnly_' 前缀的行；
+    - 同名 Cookie 后出现的覆盖先出现的（符合浏览器覆盖规则）；
+    - 若文件不存在或为空，返回空字典。
 
     Args:
         file_or_content: cookies.txt 文件路径（Path 或 str）或直接传入的文本内容。
 
     Returns:
         Dict[str, str]: 解析提取的 Cookie 字典 `{cookie_name: cookie_value}`。
-
-    Examples:
-        >>> cookies = parse_netscape_cookies("./cookies.txt")
-        >>> auth = cookies.get("session_id")
     """
     if isinstance(file_or_content, Path):
         if not file_or_content.exists():
@@ -164,17 +112,15 @@ def format_cookie_header(cookies: Mapping[str, str]) -> str:
         cookies: Cookie 键值对映射。
 
     Returns:
-        str: 适合作为 HTTP Headers 中 'Cookie' 值的格式化字符串。
+        str: 格式化后的 Cookie 请求头字符串。
     """
     return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
 
 class HttpResponse:
-    """轻量标准化不可变 HTTP 响应容器。
+    """不可变 HTTP 响应容器。
 
-    设计目标：
-    为不同底层后端（urllib、requests、httpx 等）提供完全统一的只读响应访问视图，
-    避免业务代码因切换底层请求库而产生重构开销。
+    为不同底层请求库（urllib、requests、httpx 等）提供统一的只读响应数据视图。
     """
 
     __slots__ = ("_status_code", "_headers", "_body", "_url", "_text_cache")
@@ -186,13 +132,13 @@ class HttpResponse:
         body: Union[bytes, str],
         url: str = "",
     ) -> None:
-        """初始化 HttpResponse 容器。
+        """初始化 HttpResponse。
 
         Args:
-            status_code: HTTP 状态码（如 200, 404, 429）。
-            headers: 响应头字典（内部自动归一化为小写键）。
-            body: 响应体内容（字节或 UTF-8 文本）。
-            url: 产生该响应的最终请求 URL。
+            status_code: HTTP 状态码。
+            headers: 响应头字典（内部自动归一化为小写键名）。
+            body: 响应体内容（字节或 UTF-8 字符串）。
+            url: 产生该响应的请求 URL。
         """
         self._status_code = int(status_code)
         # 归一化 headers 为全小写键名
@@ -211,17 +157,17 @@ class HttpResponse:
 
     @property
     def headers(self) -> Dict[str, str]:
-        """HTTP 响应头字典（小写键名副本）。"""
+        """HTTP 响应头字典（小写键名）。"""
         return dict(self._headers)
 
     @property
     def body(self) -> bytes:
-        """原始响应体字节数组。"""
+        """原始响应体字节。"""
         return self._body
 
     @property
     def url(self) -> str:
-        """最终响应的请求 URL。"""
+        """请求 URL。"""
         return self._url
 
     @property
@@ -231,13 +177,13 @@ class HttpResponse:
 
     @property
     def text(self) -> str:
-        """UTF-8 解码后的响应文本（自动缓存，带替换容错）。"""
+        """UTF-8 解码后的文本内容（带替换容错）。"""
         if self._text_cache is None:
             self._text_cache = self._body.decode("utf-8", errors="replace")
         return self._text_cache
 
     def json(self) -> Any:
-        """将响应文本解析为 JSON 对象（使用 tasklite.utils.jsonutil 保证安全）。"""
+        """解析响应文本为 JSON 对象。"""
         return _json_loads(self.text)
 
     def header(self, name: str, default: Optional[str] = None) -> Optional[str]:
@@ -249,7 +195,7 @@ class HttpResponse:
 
 
 # ==============================================================================
-# 2. 状态码与异常三分类守卫（HttpPolicy & http_guard）
+# 2. 状态码与异常分类守卫（HttpPolicy & http_guard）
 # ==============================================================================
 
 _DEFAULT_RATE_LIMIT_STATUSES = frozenset({429})
@@ -258,12 +204,12 @@ _DEFAULT_RETRY_STATUSES = frozenset({500, 502, 503, 504, 520, 521, 522, 524})
 
 
 class HttpPolicy:
-    """HTTP 响应状态码与传输层异常三分类规则器。
+    """HTTP 状态码与传输异常分类规则器。
 
-    负责将复杂的 HTTP 协议响应与网络异常收敛为 TaskLite 标准三分类异常：
-    - `RateLimitHit`: 429 / 限流（挂起资源，不烧预算）；
-    - `FatalError`: 4xx / 认证过期（确定性失败，直送 DLQ）；
-    - `RetryError`: 5xx / 网络超时 / 连接重置（瞬态重试）。
+    将 HTTP 状态码与底层异常分类为 TaskLite 三分类异常：
+    - RateLimitHit: 限流（触发资源挂起，不扣减重试预算）；
+    - FatalError: 确定性错误（如 4xx，直接进入死信队列）；
+    - RetryError: 瞬态错误（如 5xx、超时，触发重试）。
     """
 
     def __init__(
@@ -274,14 +220,14 @@ class HttpPolicy:
         status_classifier: Optional[Callable[[int, Any], Optional[Type[BaseException]]]] = None,
         exception_classifier: Optional[Callable[[BaseException], Optional[Type[BaseException]]]] = None,
     ) -> None:
-        """初始化分类策略。
+        """初始化分类规则器。
 
         Args:
-            rate_limit_statuses: 视为限流的状态码集合（默认 {429}）。
-            fatal_statuses: 视为确定性失败的状态码集合（默认 400/401/403/404/405/410/422）。
-            retry_statuses: 视为服务端瞬态错误的状态码集合（默认 500/502/503/504 等）。
-            status_classifier: 自定义状态码分类钩子 `(code, resp) -> ExceptionType | None`。
-            exception_classifier: 自定义异常分类钩子 `(exc) -> ExceptionType | None`。
+            rate_limit_statuses: 判定为限流的状态码集合（默认 {429}）。
+            fatal_statuses: 判定为确定性失败的状态码集合（默认 400/401/403/404 等）。
+            retry_statuses: 判定为瞬态服务端错误的状态码集合（默认 500/502/503 等）。
+            status_classifier: 自定义状态码分类函数 `(code, resp) -> ExceptionType | None`。
+            exception_classifier: 自定义异常分类函数 `(exc) -> ExceptionType | None`。
         """
         self.rate_limit_statuses = set(rate_limit_statuses if rate_limit_statuses is not None else _DEFAULT_RATE_LIMIT_STATUSES)
         self.fatal_statuses = set(fatal_statuses if fatal_statuses is not None else _DEFAULT_FATAL_STATUSES)
@@ -290,13 +236,15 @@ class HttpPolicy:
         self.exception_classifier = exception_classifier
 
     def extract_retry_after(self, headers: Any) -> Optional[float]:
-        """从响应头中解析 Retry-After 字段（支持秒数与 HTTP-Date 格式）。
+        """从响应头中提取 Retry-After 字段值并解析为秒数。
+
+        支持整型秒数与标准 HTTP-Date 格式。
 
         Args:
             headers: 响应头 Mapping 对象。
 
         Returns:
-            Optional[float]: 解析出的休眠秒数；若未提供或格式无效返回 None。
+            Optional[float]: 解析出的秒数；未提供或无法解析时返回 None。
         """
         if not headers:
             return None
@@ -325,7 +273,7 @@ class HttpPolicy:
         """分类 HTTP 状态码。
 
         Returns:
-            Type[BaseException] | None: RateLimitHit / FatalError / RetryError 或 None（成功）。
+            Type[BaseException] | None: 对应的异常类，或 None（表示请求正常）。
         """
         if self.status_classifier is not None:
             custom = self.status_classifier(status_code, response)
@@ -348,7 +296,7 @@ class HttpPolicy:
         return None
 
     def classify_exception(self, exc: BaseException) -> Optional[Type[BaseException]]:
-        """分类底层网络传输异常。
+        """分类底层网络异常。
 
         Returns:
             Type[BaseException] | None: 对应的 TaskLite 异常类型或 None。
@@ -392,18 +340,17 @@ class HttpPolicy:
 
 
 class http_guard:
-    """HTTP 请求执行守卫（上下文管理器）。
+    """HTTP 请求守卫（上下文管理器）。
 
-    单一出口契约：
-    1. 捕获执行块内抛出的网络异常，或通过 `check_response` 校验返回的状态码；
-    2. 遭遇 429 时：从 headers 自动解析 Retry-After，自动调用 `ctx.suspend_resource`
-       挂起全管线指定的限速资源，并抛出 `RateLimitHit`；
-    3. 遭遇 5xx/超时：收敛为 `RetryError` 触发调度器退避重试；
-    4. 遭遇 4xx：收敛为 `FatalError` 直送 DLQ，防止空耗重试预算。
+    功能：
+    1. 捕获代码块内抛出的异常，或通过 `check_response` 检查响应状态码；
+    2. 遭遇 429 限流时：自动解析 Retry-After，自动调用 `ctx.suspend_resource` 挂起对应的限速资源，并抛出 `RateLimitHit`；
+    3. 遭遇 5xx/超时等瞬态错误：转换为 `RetryError` 触发调度器退避重试；
+    4. 遭遇 4xx 等客户端错误：转换为 `FatalError` 直送死信队列。
 
     Examples:
-        >>> with http_guard(ctx=ctx, resource="api_pixiv"):
-        ...     resp = my_custom_client.get("https://api.pixiv.net/v1/...")
+        >>> with http_guard(ctx=ctx, resource="api_custom"):
+        ...     resp = my_request(...)
         ...     if resp.status_code != 200:
         ...         raise requests.HTTPError(response=resp)
     """
@@ -419,9 +366,9 @@ class http_guard:
 
         Args:
             ctx: 当前任务的 TaskContext（用于调用 `ctx.suspend_resource`）。
-            resource: 关联的限速资源名（如 'api_twitter'）。
-            policy: 异常与状态码分类策略器（缺省使用默认策略）。
-            default_suspend_ttl: 遭遇 429 且未提供 Retry-After 时的默认挂起秒数（默认 60s）。
+            resource: 关联的限速资源名称（如 'api_pixiv'）。
+            policy: 状态码与异常分类规则器（默认使用标准 HttpPolicy）。
+            default_suspend_ttl: 遭遇 429 且未提供 Retry-After 时的默认挂起秒数。
         """
         self.ctx = ctx
         self.resource = resource
@@ -432,7 +379,7 @@ class http_guard:
         return self
 
     def check_response(self, response: Any) -> None:
-        """显式检查响应对象（支持 HttpResponse、requests.Response、urllib 响应）。"""
+        """显式检查响应对象的状态码。"""
         status_code = getattr(response, "status_code", None)
         if status_code is None and hasattr(response, "getcode"):
             status_code = response.getcode()
@@ -464,7 +411,6 @@ class http_guard:
                 retry_after = self.policy.extract_retry_after(headers)
                 ttl = retry_after if retry_after is not None else self.default_suspend_ttl
 
-            # 单一出口保证挂起只调用一次
             if not getattr(exc_val, "_suspended", False):
                 if self.ctx is not None and self.resource is not None and hasattr(self.ctx, "suspend_resource"):
                     self.ctx.suspend_resource(self.resource, ttl)
@@ -484,7 +430,7 @@ class http_guard:
                 raise exc_val
             raise RetryError(f"Transient request error: {exc_val}") from exc_val
 
-        # 未被策略识别的代码异常原样向外抛出
+        # 未被策略识别的代码异常原样抛出
         return False
 
 
@@ -499,21 +445,21 @@ def guard_request(
     default_suspend_ttl: float = 60.0,
     **kwargs: Any,
 ) -> Any:
-    """包装执行任意 HTTP 请求函数，提供单任务内轻量就地重试与异常守卫收敛。
+    """包装执行 HTTP 请求函数，提供就地快速重试与异常守卫。
 
     Args:
-        func: 目标请求函数。
-        *args: 传递给目标函数的位置参数。
-        max_retries: 单任务内就地快速重试次数（默认 0：立即转交 TaskLite 引擎调度器退避）。
-        backoff: 就地重试基数秒（默认 1.0s）。
-        ctx: 任务上下文（用于 429 挂起）。
-        resource: 限速资源标识。
-        policy: 分类策略。
+        func: 待执行的请求函数。
+        *args: 传递给请求函数的位置参数。
+        max_retries: 就地重试次数（默认 0：立即转交 TaskLite 引擎调度器退避）。
+        backoff: 就地重试等待间隔基数秒（默认 1.0s）。
+        ctx: 任务上下文。
+        resource: 限速资源名称。
+        policy: 分类规则器。
         default_suspend_ttl: 429 挂起秒数。
-        **kwargs: 传递给目标函数的关键字参数。
+        **kwargs: 传递给请求函数的关键字参数。
 
     Returns:
-        Any: 目标函数执行成功的返回值。
+        Any: 请求函数成功时的返回值。
     """
     pol = policy or HttpPolicy()
     for attempt in range(max(0, max_retries) + 1):
@@ -563,9 +509,9 @@ def guarded_fetch(
 # ==============================================================================
 
 class SnapshotStore:
-    """快照去重抽象基类协议。
+    """快照存储基类协议。
 
-    定位：独立的内容寻址缓存，不依赖 TaskLite 引擎上下文，支持跨 run 离线幂等重放。
+    内容寻址的原始 HTTP 响应缓存，支持断点重试与离线重放。
     """
 
     @staticmethod
@@ -575,21 +521,16 @@ class SnapshotStore:
         params: Optional[Mapping[str, Any]] = None,
         body: Optional[Union[bytes, str, Mapping[str, Any]]] = None,
     ) -> str:
-        """单射生成请求唯一键（URL 规范化 + 参数排序 + Body 单射哈希）。
-
-        数学证明不变式：
-        - 消除 Query 顺序差异：`?b=2&a=1` 与 `?a=1&b=2` 产生完全相同的 Key；
-        - 单射百分号转义：URL 路径中的特殊字符经 injective 单射转义，防止跨组碰撞；
-        - Body 单射哈希：携带请求体时附加 SHA-256 16 位摘要，杜绝跨 Payload 碰撞。
+        """规范化生成请求唯一键（URL 参数排序 + Method 大写 + Body 哈希）。
 
         Args:
             url: 目标 URL。
-            method: HTTP 方法（GET / POST 等，自动大写）。
+            method: HTTP 方法（GET、POST 等）。
             params: 查询参数字典。
-            body: 请求体内容（bytes, str, 或 JSON 字典）。
+            body: 请求体内容（bytes、str 或 dict）。
 
         Returns:
-            str: 格式为 `"{METHOD}::{normalized_url}_{body_hash}"` 的单射键。
+            str: 规范化的请求键。
         """
         clean_url = url.strip()
         parsed = urllib.parse.urlparse(clean_url)
@@ -624,11 +565,11 @@ class SnapshotStore:
         return f"{norm_method}::{url_component}{body_hash}"
 
     def has(self, key: str) -> bool:
-        """检查指定 key 是否已存在有效快照。"""
+        """检查是否存在有效快照。"""
         raise NotImplementedError
 
     def get(self, key: str) -> Optional[HttpResponse]:
-        """获取指定 key 的缓存响应，不存在返回 None。"""
+        """获取快照响应，不存在返回 None。"""
         raise NotImplementedError
 
     def put(
@@ -640,7 +581,7 @@ class SnapshotStore:
         body: Union[bytes, str, Mapping[str, Any]],
         method: str = "GET",
     ) -> None:
-        """写入原始响应快照。"""
+        """保存快照。"""
         raise NotImplementedError
 
     def cached(
@@ -649,15 +590,15 @@ class SnapshotStore:
         key_func: Optional[Callable[..., str]] = None,
         ignore_statuses: Sequence[int] = (429, 500, 502, 503, 504, 520, 521, 522, 524),
     ) -> Callable[..., HttpResponse]:
-        """将任意 fetch 函数包装为带快照缓存透明拦截的高阶函数。
+        """包装请求函数，提供透明的快照缓存拦截。
 
         Args:
-            fetch_fn: 底层网络请求函数 `(url, **kwargs) -> HttpResponse | Any`。
-            key_func: 自定义 Key 派生函数（缺省使用 `SnapshotStore.make_key`）。
-            ignore_statuses: 不落盘缓存的异常状态码（默认忽略 429 与 5xx 故障）。
+            fetch_fn: 底层网络请求函数。
+            key_func: 自定义 Key 生成函数（默认使用 make_key）。
+            ignore_statuses: 不写入快照的状态码（默认忽略 429 与 5xx 故障）。
 
         Returns:
-            Callable: 包装后的透明缓存抓取函数。
+            Callable: 包装后的缓存函数。
         """
         def wrapped(url: str, *args: Any, **kwargs: Any) -> HttpResponse:
             method = kwargs.get("method", "GET")
@@ -713,17 +654,14 @@ class SnapshotStore:
 class SQLiteSnapshotStore(SnapshotStore):
     """基于 SQLite WAL 模式的持久化快照存储。
 
-    特性：
-    1. 独立 SQLite 数据库文件（与 TaskLite 主状态库严格隔离，不干扰调度 WAL）；
-    2. 启用 WAL + NORMAL 事务模式，提供高并发读写与断电安全；
-    3. 支持跨会话、跨生命周期完全离线重放。
+    使用独立的 SQLite 数据库文件保存原始 HTTP 响应，支持断电保护与并发读取。
     """
 
     def __init__(self, db_path: Union[str, Path]) -> None:
         """初始化 SQLite 快照库。
 
         Args:
-            db_path: 快照数据库文件路径（例如 './snapshots.db'）。
+            db_path: 数据库文件路径（如 './snapshots.db'）。
         """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -812,7 +750,7 @@ class SQLiteSnapshotStore(SnapshotStore):
 
 
 class MemorySnapshotStore(SnapshotStore):
-    """纯内存快照存储（适合单次运行、微基准与无 IO 单元测试）。"""
+    """纯内存快照存储（适合测试与临时会话）。"""
 
     def __init__(self) -> None:
         self._data: Dict[str, HttpResponse] = {}
@@ -864,28 +802,23 @@ def fetch_urllib(
     default_suspend_ttl: float = 60.0,
     proxies: Optional[Mapping[str, str]] = None,
 ) -> HttpResponse:
-    """零依赖标准库 HTTP 请求开箱即用实现。
+    """基于 Python 标准库 urllib 的 HTTP 请求实现（零外部依赖）。
 
     Args:
-        url: 请求目标 URL。
-        method: HTTP 方法（GET / POST / PUT 等）。
-        headers: 请求头映射。
-        params: URL 查询参数映射。
-        data: 请求体数据（支持 dict/list 自动 JSON 序列化并补齐 Content-Type、文本或 bytes）。
-        timeout: 超时时间秒数（默认 30.0s）。
-        policy: 状态码与异常分类策略。
-        ctx: 任务上下文（用于 429 挂起）。
-        resource: 限速资源标识。
-        default_suspend_ttl: 429 默认挂起秒数。
-        proxies: 显式代理配置（未指定且请求为 localhost/127.0.0.1 时自动屏蔽环境变量代理干扰）。
+        url: 目标 URL。
+        method: HTTP 方法（GET、POST 等）。
+        headers: 请求头。
+        params: 查询参数。
+        data: 请求体（支持 dict/list 自动序列化为 JSON、字符串或 bytes）。
+        timeout: 超时秒数（默认 30.0s）。
+        policy: 状态码与异常分类规则器。
+        ctx: 任务上下文。
+        resource: 限速资源名称。
+        default_suspend_ttl: 429 挂起秒数。
+        proxies: 显式代理配置（访问 localhost/127.0.0.1 时默认不走环境变量代理）。
 
     Returns:
-        HttpResponse: 标准响应容器。
-
-    Raises:
-        RateLimitHit: 遭遇 429 且完成资源挂起。
-        RetryError: 遭遇 5xx 或网络超时/连接重置。
-        FatalError: 遭遇 4xx 客户端错误。
+        HttpResponse: 响应容器对象。
     """
     final_url = url
     if params:
@@ -960,27 +893,27 @@ def fetch_requests(
     trust_env: Optional[bool] = None,
     **kwargs: Any,
 ) -> HttpResponse:
-    """基于 requests 的 HTTP 请求包装（当环境中安装了 requests 时可用）。
+    """基于 requests 库的 HTTP 请求实现（当环境中安装了 requests 时可用）。
 
     Args:
-        url: 请求目标 URL。
-        session: 可选的 requests.Session 实例（必须在当前子进程内创建）。
+        url: 目标 URL。
+        session: requests.Session 实例（必须在当前子进程内创建）。
         method: HTTP 方法。
-        headers: 请求头映射。
+        headers: 请求头。
         params: 查询参数。
         data: 表单或原始数据。
-        json_data: JSON 数据（对应 requests 的 `json` 参数）。
+        json_data: JSON 数据（对应 requests 的 json 参数）。
         timeout: 超时秒数。
-        policy: 分类策略。
+        policy: 分类规则器。
         ctx: 任务上下文。
-        resource: 限速资源标识。
+        resource: 限速资源名称。
         default_suspend_ttl: 429 挂起秒数。
         proxies: 显式代理配置。
-        trust_env: 是否继承环境变量中的代理配置。
+        trust_env: 是否使用环境变量中的代理设置。
         **kwargs: 透传给 requests 的其它参数。
 
     Returns:
-        HttpResponse: 标准响应容器。
+        HttpResponse: 响应容器对象。
     """
     try:
         import requests

@@ -323,7 +323,7 @@ tasklite/
 │   └── resource.py      # 令牌桶限速与并发容量资源
 ├── backend/             # SQLite WAL 强一致事务持久化后端
 ├── models/              # Job / TaskContext / PipelineState 数据模型
-├── wrappers/            # discovery.py（增量扫描封装）
+├── wrappers/            # discovery.py（增量扫描）/ http.py（网络守卫与快照）
 ├── pipeline_util.py     # 通用脚手架（任务指纹 / 进度钩子 / 瞬态错误注册）
 └── utils/               # jsonutil (禁NaN) / lockfile / validation
 ```
