@@ -489,79 +489,248 @@ wall 条目除业务 meta 外携带：`run_count`（成功次数）、`last_run_
 
 ## 16. 官方网络工具库（HTTP Wrappers）
 
-> 详见架构决策记录 [`docs/adr/0001-composable-http-wrappers.md`](./adr/0001-composable-http-wrappers.md)。
+> 架构决策记录见 [`docs/adr/0001-composable-http-wrappers.md`](./adr/0001-composable-http-wrappers.md)。  
+> 导入路径：`from tasklite.wrappers.http import http_guard, HttpPolicy, SnapshotStore, SQLiteSnapshotStore, MemorySnapshotStore, parse_netscape_cookies, format_cookie_header, fetch_urllib, fetch_requests, guard_request, guarded_fetch`
 
-TaskLite 官方提供 `tasklite.wrappers.http` 模块，为各种爬虫与网络请求业务提供轻量、组合式、正交解耦的工具库。
+TaskLite 官方提供 `tasklite.wrappers.http` 模块，为各种爬虫采集、数据同步与多媒体下载任务提供轻量、组合式、正交解耦的官方网络工具库。
 
-### 16.1 核心设计原则
+---
 
-1. **用户自主优先**：用户可完全自由选用 `requests`、`httpx`、`urllib` 或第三方 SDK；
-2. **正交独立**：快照去重（`SnapshotStore`）与 429 异常守卫（`http_guard` / `HttpPolicy`）互不依赖，可自由组合；
-3. **限速全权复用引擎**：多进程限速统一由 `RateLimitResource` 声明管理，不建冗余抽象；
-4. **零外部强制依赖**：默认基于 Python 标准库，软适配 `requests`。
+### 16.1 核心设计哲学与四大铁律
 
-### 16.2 典型用法范例
+1. **用户选型自主（User Autonomy First）**：
+   - 坚决不重造重量级统一客户端抽象层；
+   - 赋予用户 100% 网络请求选型自主权：用户可自由选用 Python 标准库 `urllib`、`requests`、`httpx`、`curl_cffi`、GraphQL 客户端或平台专用 SDK。
+2. **正交双引擎解耦（Orthogonal Dual-Engine Decoupling）**：
+   - **快照去重（`SnapshotStore`）**：专职内容寻址的原始 HTTP 响应持久化与离线幂等重放，零引擎依赖，可在独立分析脚本中单用；
+   - **429 与异常守卫（`http_guard` / `HttpPolicy`）**：专职将底层传输故障与 HTTP 状态码收敛为 TaskLite 三分类异常，自动解析 `Retry-After` 并触发 `ctx.suspend_resource` 资源挂起；
+   - 两者互不依赖，亦可自由正交嵌套。
+3. **全局限速复用（Global Rate Limiting Reuse）**：
+   - 绝不新建独立的 `Pacer` 概念，多 Worker / 多进程速率限制统一复用 TaskLite 原生 `RateLimitResource` 与 `ResourceManager`；
+   - 429 挂起时经由 `ctx.suspend_resource` 实现 IPC 单一出口下发。
+4. **零外部强制依赖（Zero Mandatory Dependencies）**：
+   - 默认基于 Python 标准库（`urllib` / `http.cookiejar` / `sqlite3`），软支持 `requests`。
 
-#### 范例一：配合 `http_guard` 与 `RateLimitResource` 实现 429 自动挂起与退避
+---
+
+### 16.2 异常三分类收敛与引擎调度映射矩阵
+
+`HttpPolicy` 与 `http_guard` 将复杂的 HTTP 协议响应与网络异常收敛为 TaskLite 标准三分类异常：
+
+| HTTP 状态 / 传输异常 | 映射引擎异常 | 引擎调度与状态机行为 | 重试预算消耗 | 典型场景 |
+| :--- | :--- | :--- | :--- | :--- |
+| **HTTP 429 / WAF 封锁** | `RateLimitHit` | 自动解析 `Retry-After`，调用 `ctx.suspend_resource` 挂起全管线，本任务放回队列等待 | ❌ **不烧预算**（零污染） | 目标 API 触发速率限制、IP 频控 |
+| **HTTP 5xx（500/502/503/504 等）** | `RetryError` | 标记瞬态故障，调度器执行指数退避重试（按 `backoff_base` / `backoff_max`），耗尽进 DLQ | ⚠️ **消耗预算** | 源站临时过载、网关超时、服务重启 |
+| **连接超时 / 连接重置 / DNS 失败** | `RetryError` | 判定为瞬态网络抖动，触发框架退避重试 | ⚠️ **消耗预算** | 本地网络波动、TCP RST、TLS 握手超时 |
+| **HTTP 4xx（400/401/403/404/422）** | `FatalError` | 判定为确定性客户端错误或认证失效，**直接归档至 DLQ** | 🛑 **立即终止**，不空转重试 | Token 过期、资源已被源站物理删除、参数非法 |
+
+---
+
+### 16.3 429 速率限制、Retry-After 解析与 RateLimitResource 闭环
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 1. 注册阶段 (主进程)                                                          │
+│    pipeline.add_resource(RateLimitResource("api_x", interval_seconds=2.0))   │
+│    pipeline.register_handler("fetch", handler, default_resources={"api_x":1})│
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ 派发（调度器严格按 2.0s 节奏出队）
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 2. Worker 执行体 (子进程)                                                    │
+│    with http_guard(ctx=ctx, resource="api_x"):                               │
+│        resp = do_request(...)  ───► [收到 HTTP 429，Header: Retry-After: 60] │
+│                                                                             │
+│    a) 自动解析 Retry-After: 60.0s (支持整数秒与 HTTP-Date 格式)              │
+│    b) 自动调用 ctx.suspend_resource("api_x", 60.0) 写入 IPC 信号            │
+│    c) 抛出 RateLimitHit 信号终止当前子进程                                   │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ IPC 原子落盘 (.result.json)
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 3. 主进程收尾与调度联动 (Completion & Scheduler)                             │
+│    a) ResourceManager.suspend_resource("api_x", 60.0) 挂起资源               │
+│    b) 持久化挂起状态至 DB (跨重启恢复，上限 24h)                            │
+│    c) 本 Job 不记失败、不烧 max_retries 预算，原地保留在队列等待解封         │
+│    d) 所有依赖 "api_x" 资源的任务全部安全进入休眠，不占 CPU/Worker 槽位      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 16.4 快照去重协议（SnapshotStore）与单射哈希规范
+
+`SnapshotStore` 解决「爬虫调试、全量重跑与多阶段分析时重复请求源站」的问题。
+
+#### 1. 单射请求键生成（`SnapshotStore.make_key`）
+通过数学单射规范化保证完全消除请求伪差异，且杜绝不同参数间的碰撞：
+- **Query 字典排序**：`?b=2&a=1` 与 `?a=1&b=2` 产生完全一致的规范化 Query 字符串；
+- **Method 大写归一**：`get` 与 `GET` 统一为 `GET`；
+- **Injective 转义**：URL 路径中的特殊字符经百分号单射编码，防止跨命名空间碰撞；
+- **Body 单射哈希**：当携带 Request Body 时，自动计算 UTF-8 JSON 排序序列化或字节 SHA-256 16 位摘要附于键尾。
+
+#### 2. 快照存储后端对比
+- **`SQLiteSnapshotStore(db_path)`**：
+  - 基于独立的 SQLite 文件（`snapshots.db`），**严禁混入 TaskLite 主状态库**；
+  - 自动启用 `PRAGMA journal_mode=WAL` 与 `PRAGMA synchronous=NORMAL`，提供极高的单机读写性能与断电保护；
+  - 429 与 5xx 瞬态故障**默认不写入快照**，防止污染离线缓存库。
+- **`MemorySnapshotStore()`**：纯内存字典实现，适用于无 IO 单元测试与轻量短会话。
+
+---
+
+### 16.5 进程隔离与会话管理军规
+
+> [!CAUTION]
+> **严禁跨进程共享 Session 或 Socket 句柄**
+> 
+> Python `requests.Session`、`httpx.Client` 或底层套接字内部持有线程锁与非跨进程句柄。如果在主进程中创建 Session 并试图通过 `Job.payload` 或闭包传递给 Worker 子进程，会导致：
+> 1. 子进程间 TCP 连接争用与数据交叉污染；
+> 2. `pickle.PicklingError` 序列化崩溃；
+> 3. 子进程卡死在套接字死锁上。
+> 
+> **正确实践**：每个 Worker 子进程在执行 Handler 时，在函数内部局部创建 Session / Client，或使用上下文管理器自动 `close()`。
+
+---
+
+### 16.6 API 完整参考字典
+
+#### 1. Cookie 与辅助工具
+- `parse_netscape_cookies(file_or_content: Union[str, Path]) -> Dict[str, str]`  
+  解析 Mozilla/Netscape 格式 `cookies.txt` 为 `{name: value}` 字典，自动过滤 `#` 注释，兼容 `#HttpOnly_`，遵循同名覆盖规则。文件缺失安全返回 `{}`。
+- `format_cookie_header(cookies: Mapping[str, str]) -> str`  
+  将 Cookie 字典格式化为 `k=v; k2=v2` 字符串。
+- `HttpResponse`（不可变容器）  
+  属性：`.status_code: int`, `.headers: Dict[str, str]`, `.body: bytes`, `.url: str`, `.ok: bool`, `.text: str` (UTF-8 replace 解码)。方法：`.json() -> Any`, `.header(name, default=None) -> str`。
+
+#### 2. 异常策略与守卫
+- `HttpPolicy(rate_limit_statuses={429}, fatal_statuses={400..422}, retry_statuses={500..524}, status_classifier=None, exception_classifier=None)`  
+  三分类规则引擎。方法：`extract_retry_after(headers) -> float | None`, `classify_status(code, resp) -> Type[BaseException] | None`, `classify_exception(exc) -> Type[BaseException] | None`。
+- `http_guard(ctx=None, resource=None, policy=None, default_suspend_ttl=60.0)`  
+  上下文管理器。拦截 429 并自动调用 `ctx.suspend_resource`，将底层异常转换为 `RateLimitHit` / `RetryError` / `FatalError`。方法：`check_response(resp)`。
+- `guard_request(func, *args, max_retries=0, backoff=1.0, ctx=None, resource=None, policy=None, default_suspend_ttl=60.0, **kwargs) -> Any`  
+  函数包装器。支持单任务内部快速就地重试 `max_retries` 次，耗尽后转交 `RetryError`。
+- `@guarded_fetch(ctx=None, resource=None, policy=None, max_retries=0, backoff=1.0, default_suspend_ttl=60.0)`  
+  装饰器形态。
+
+#### 3. 快照存储（SnapshotStore）
+- `SnapshotStore.make_key(url, method="GET", params=None, body=None) -> str`（静态方法，单射键生成）。
+- `store.has(key) -> bool`, `store.get(key) -> HttpResponse | None`, `store.put(key, url, status_code, headers, body, method="GET") -> None`。
+- `store.cached(fetch_fn, key_func=None, ignore_statuses=(429, 500..524)) -> Callable`  
+  高阶装饰器，透明提供「命中查缓存 -> 未命中发起请求 -> 结果落盘」全流程。
+
+#### 4. 内置请求实现
+- `fetch_urllib(url, *, method="GET", headers=None, params=None, data=None, timeout=30.0, policy=None, ctx=None, resource=None, default_suspend_ttl=60.0, proxies=None) -> HttpResponse`  
+  零三方依赖标准库实现。自动检测 `127.0.0.1` 规避本地系统代理干扰。
+- `fetch_requests(url, *, session=None, method="GET", headers=None, params=None, data=None, json_data=None, timeout=30.0, policy=None, ctx=None, resource=None, default_suspend_ttl=60.0, proxies=None, trust_env=None, **kwargs) -> HttpResponse`  
+  基于 `requests` 的便捷实现。
+
+---
+
+### 16.7 四大生产实战场景全代码范例
+
+#### 场景 1：零依赖标准库 + 全局限速 + 429 自动挂起
 
 ```python
 from tasklite import TaskLite, RateLimitResource
 from tasklite.wrappers.http import http_guard, fetch_urllib
 
-pipeline = TaskLite("crawler", state_dir="./states")
-# 1. 注册全局限速资源（每 2 秒最多派发 1 个请求）
-pipeline.add_resource(RateLimitResource("api_twitter", interval_seconds=2.0))
+pipeline = TaskLite("zero_dep_crawler", state_dir="./states", max_workers=8)
 
-def fetch_user_handler(job, ctx):
-    # 2. 用 http_guard 守卫任意网络调用
-    # 遇到 429 时：自动提取 Retry-After，自动执行 ctx.suspend_resource("api_twitter", ttl)，抛出 RateLimitHit
-    # 遇到 5xx/超时：抛出 RetryError（消耗任务重试预算）
-    # 遇到 404/403：抛出 FatalError（直送 DLQ）
-    with http_guard(ctx=ctx, resource="api_twitter"):
-        resp = fetch_urllib(job.payload["url"])
+# 1. 声明 API 全局限速：每秒最多向该平台发送 2 次请求
+pipeline.add_resource(RateLimitResource("api_platform", interval_seconds=0.5))
+
+def fetch_item_handler(job, ctx):
+    # 2. 用 http_guard 包裹请求，429 时自动挂起 api_platform 资源
+    with http_guard(ctx=ctx, resource="api_platform", default_suspend_ttl=120.0):
+        resp = fetch_urllib(job.payload["url"], timeout=15.0)
         return resp.json()
 
-pipeline.register_handler("fetch_user", fetch_user_handler, default_resources={"api_twitter": 1.0})
+pipeline.register_handler(
+    "fetch_item",
+    fetch_item_handler,
+    default_resources={"api_platform": 1.0}
+)
 ```
 
-#### 范例二：集成自定义 `requests.Session` 或平台专属客户端
+#### 场景 2：基于 `requests.Session` 与 Netscape Cookies 的带鉴权签名爬虫
 
 ```python
 import requests
+from tasklite import TaskLite, RateLimitResource
 from tasklite.wrappers.http import http_guard, parse_netscape_cookies
 
-# 加载 Mozilla/Netscape cookies.txt
-cookies = parse_netscape_cookies("./cookies.txt")
+# 1. 预先解析浏览器导出的 cookies.txt
+COOKIES = parse_netscape_cookies("./cookies.txt")
 
-def custom_api_handler(job, ctx):
-    # 子进程内部创建 Session（禁止跨进程 pickle 共享 Session）
+def auth_api_handler(job, ctx):
+    # 2. 子进程执行体内局部构建 Session，杜绝跨进程共享
     session = requests.Session()
-    session.cookies.update(cookies)
-    
-    with http_guard(ctx=ctx, resource="api_custom"):
-        r = session.get(job.payload["url"], timeout=20)
-        # 显式校验响应状态码
-        if r.status_code != 200:
-            raise requests.HTTPError(response=r)
-        return r.json()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+        "Referer": "https://example.com/",
+    })
+    session.cookies.update(COOKIES)
+
+    try:
+        with http_guard(ctx=ctx, resource="api_auth"):
+            r = session.get(job.payload["url"], timeout=20.0)
+            if r.status_code == 403 and "LOGIN_REQUIRED" in r.text:
+                from tasklite.exceptions import FatalError
+                raise FatalError("登录态失效，需重新导出 cookies.txt")
+            if r.status_code != 200:
+                raise requests.HTTPError(response=r)
+            return r.json()
+    finally:
+        session.close()
 ```
 
-#### 范例三：使用 `SQLiteSnapshotStore` 原始 HTTP 快照实现离线幂等重放
+#### 场景 3：使用 `SQLiteSnapshotStore` 实现原始 HTTP 响应离线幂等重放
 
 ```python
 from tasklite.wrappers.http import SQLiteSnapshotStore, fetch_urllib
 
-# 创建/打开独立的快照数据库（与 tasklite 主状态库解耦）
-store = SQLiteSnapshotStore("./snapshots.db")
+# 1. 创建独立的持久化快照存储库
+store = SQLiteSnapshotStore("./data/snapshots.db")
 
-# 方式 A：使用 @store.cached 装饰/包装 fetch 函数（自动拦截命中或落盘）
+# 2. 包装任意网络请求函数为带快照缓存的高阶函数
 cached_fetch = store.cached(fetch_urllib)
-resp = cached_fetch("https://api.example.com/user/100")
 
-# 方式 B：显式操作底层 CRUD
-key = store.make_key("https://api.example.com/user/100", method="GET")
-if not store.has(key):
-    resp = fetch_urllib("https://api.example.com/user/100")
-    store.put(key, url=resp.url, status_code=resp.status_code, headers=resp.headers, body=resp.body)
+def scrape_profile_handler(job, ctx):
+    url = f"https://api.example.com/users/{job.job_id}"
+    
+    # 第一次运行：发起真实网络请求并落盘 snapshots.db
+    # 第二次运行/断点重试：直接从 SQLite 命中返回，零网络消耗、零风控风险
+    resp = cached_fetch(url)
+    return resp.json()
 ```
+
+#### 场景 4：组合流 —— 离线快照 + 429 资源守卫 + 增量发现（Discovery）
+
+```python
+from tasklite import TaskLite, RateLimitResource
+from tasklite.wrappers.discovery import register_discovery, sanitize_content_id
+from tasklite.wrappers.http import SQLiteSnapshotStore, http_guard, fetch_urllib
+
+pipeline = TaskLite("discovery_pipeline", state_dir="./states")
+pipeline.add_resource(RateLimitResource("api_feed", interval_seconds=1.0))
+store = SQLiteSnapshotStore("./snapshots.db")
+cached_fetch = store.cached(fetch_urllib)
+
+def fetch_feed_page(page: int, ctx=None):
+    url = f"https://api.example.com/feed?page={page}"
+    with http_guard(ctx=ctx, resource="api_feed"):
+        resp = cached_fetch(url)
+        return resp.json().get("items", [])
+
+register_discovery(
+    host=pipeline,
+    task_type="discover_feed",
+    fetch_func=fetch_feed_page,
+    id_func=lambda item: str(item["id"]),
+    process_item_func=lambda item, ctx: ctx.spawn(pipeline.create_job("process_item", job_id=sanitize_content_id(str(item["id"])), payload=item)),
+    process_task_type="process_item",
+    default_resources={"api_feed": 1.0},
+)
+```
+
 
