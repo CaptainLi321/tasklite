@@ -69,3 +69,15 @@ _Avoid_: MockBackend, FakeDB, MemoryStorage
 **InjectiveEncoder**:
 Reversible mathematical `%XX` percent-encoding and SHA-256 fingerprinting utility guaranteeing zero naming collisions across file paths, job IDs, and discovery namespaces.
 _Avoid_: Sanitizer, Slugger, Escaper
+
+### Official Wrappers & Utilities
+
+**HttpPolicy**:
+Rule-based response classifier translating HTTP statuses and transport faults into TaskLite exception tri-classification (`RateLimitHit`, `RetryError`, `FatalError`).
+_Avoid_: ErrorStrategy, RetryPolicy, StatusMapper
+
+**SnapshotStore**:
+Content-addressable raw HTTP transaction cache enabling offline deterministic replays and anti-crawl protection without re-fetching remote endpoints.
+_Avoid_: ResponseCache, HttpCache, PayloadStore
+
+
