@@ -36,6 +36,7 @@ from .failure import (
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
 )
+from .channel import ExecutionChannel
 from .inflight import InFlightTracker
 from .policy import PreflightPolicy
 from .resource import Resource, ResourceManager, WORKER_RESOURCE
@@ -227,6 +228,10 @@ class RunContext:
         self.store: StateStore = StateStore(
             self.backend,
             commit_failure_dlq_threshold=self.commit_failure_dlq_threshold,
+        )
+        self.channel: ExecutionChannel = ExecutionChannel(
+            self.ipc_dir,
+            executor=self.executor,
         )
         # ── 每-run 可变运行态（run 建立）────────────────────
         self.state: Optional[PipelineState] = None
