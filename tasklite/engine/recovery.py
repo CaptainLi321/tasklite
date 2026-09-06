@@ -291,7 +291,7 @@ class RecoveryMachine:
         # 副作用被重复执行。kill/join 后进程写入已停止，此刻重查结果文件
         # 才无竞态。
         handles = [entry.handle for entry in pending_entries]
-        self._ctx.executor.finalize_processes(handles)
+        self._ctx.channel.finalize_processes(handles)
         # kill 后重查 pending 的结果文件——worker 恰在分类与 kill
         # 之间完成写结果的 entry（结果文件此刻才出现）移入 done 消费
         # （不删成功输出、不 requeue）；与 drain 超时路径的「kill 后
