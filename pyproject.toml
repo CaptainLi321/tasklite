@@ -48,7 +48,6 @@ source_paths = [
     "tasklite/wrappers/",
     "tasklite/exceptions.py",
     "tasklite/pipeline.py",
-    "tasklite/pipeline_util.py",
 ]
 also_copy = ["tasklite/"]
 pytest_add_cli_args = ["--import-mode=importlib"]

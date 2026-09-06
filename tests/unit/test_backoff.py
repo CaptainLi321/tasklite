@@ -1,4 +1,4 @@
-"""Tests for mission-critical compute_backoff() from tasklite.engine.retry.
+"""Tests for mission-critical compute_backoff() from tasklite.engine.policy.
 
 Tests the actual production function — not a duplicate.
 Formula verified:
@@ -11,12 +11,13 @@ Formula verified:
 import time
 from unittest.mock import patch
 
-from tasklite.engine.retry import compute_backoff
+from tasklite.engine.policy import PreflightPolicy
 
+_DEFAULT_POLICY = PreflightPolicy()
+compute_backoff = _DEFAULT_POLICY.compute_backoff
 
 # ── compute_backoff monkeypatch target ─────────────────────────────────
-# retry.py does `import random` at module level, then `random.uniform(...)`.
-_BACKOFF_RANDOM = "tasklite.engine.retry.random.uniform"
+_BACKOFF_RANDOM = "tasklite.engine.policy.random.uniform"
 
 
 # ── tests ─────────────────────────────────────────────────────────────
@@ -160,10 +161,12 @@ class TestBackoffUntil:
 class TestProductionPipelineBehavior:
     """Verify compute_backoff() is the function used in production code paths."""
 
-    def test_compute_backoff_in_pipeline_namespace(self) -> None:
-        """compute_backoff is importable from tasklite.pipeline (canonical location)."""
-        from tasklite.engine.retry import compute_backoff as cb
-        assert callable(cb)
+    def test_compute_backoff_in_policy_namespace(self) -> None:
+        """compute_backoff is available on PreflightPolicy."""
+        from tasklite.engine.policy import PreflightPolicy
+        policy = PreflightPolicy()
+        assert callable(policy.compute_backoff)
+        assert callable(policy.compute_backoff_schedule)
 
     def test_retry_computation_matches_pipeline(self) -> None:
         """Default job values → compute_backoff(1, 2.0, 300.0) matches pipeline default."""
@@ -414,78 +417,73 @@ class TestScheduleResultKind:
 
 
 class TestRerunSkipsDirect:
-    """rerun_skips 策略矩阵直接单测——此前仅经 pipeline
-    集成路径间接覆盖，Rule 4 防御测试缺口。"""
+    """rerun_skips 策略矩阵直接单测。"""
+
+    def _rerun_skips(self, jd, *, wall_hit, failed_hit, wall_meta=None):
+        decision = _DEFAULT_POLICY.evaluate(jd, wall_meta=wall_meta, is_wall=wall_hit, is_failed=failed_hit)
+        return decision.should_skip
 
     def test_never_skips_both(self):
-        from tasklite.engine.retry import rerun_skips
         jd = {"rerun": "never"}
-        assert rerun_skips(jd, wall_hit=True, failed_hit=False) is True
-        assert rerun_skips(jd, wall_hit=False, failed_hit=True) is True
+        assert self._rerun_skips(jd, wall_hit=True, failed_hit=False) is True
+        assert self._rerun_skips(jd, wall_hit=False, failed_hit=True) is True
 
     def test_every_run_allows_both(self):
-        from tasklite.engine.retry import rerun_skips
         jd = {"rerun": "every_run"}
-        assert rerun_skips(jd, wall_hit=True, failed_hit=False) is False
-        assert rerun_skips(jd, wall_hit=False, failed_hit=True) is False
+        assert self._rerun_skips(jd, wall_hit=True, failed_hit=False) is False
+        assert self._rerun_skips(jd, wall_hit=False, failed_hit=True) is False
 
     def test_on_failure_only_failed_allows(self):
-        from tasklite.engine.retry import rerun_skips
         jd = {"rerun": "on_failure"}
-        assert rerun_skips(jd, wall_hit=True, failed_hit=False) is True
-        assert rerun_skips(jd, wall_hit=False, failed_hit=True) is False
+        assert self._rerun_skips(jd, wall_hit=True, failed_hit=False) is True
+        assert self._rerun_skips(jd, wall_hit=False, failed_hit=True) is False
 
     def test_on_input_change_wall_compares_fingerprint(self, tmp_path):
-        from tasklite.engine.retry import rerun_skips, input_changed
-        # 建立指纹文件
         f = tmp_path / "in.txt"
         f.write_text("hello")
         st = f.stat()
         wall_meta = {"inputs": [{"path": str(f), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
         jd = {"rerun": "on_input_change"}
         # 未变化 → 拦截（跳过）
-        assert rerun_skips(jd, wall_hit=True, failed_hit=False, wall_meta=wall_meta) is True
+        assert self._rerun_skips(jd, wall_hit=True, failed_hit=False, wall_meta=wall_meta) is True
         # 文件变化 → 豁免（重跑）
         f.write_text("hello changed")
-        assert rerun_skips(jd, wall_hit=True, failed_hit=False, wall_meta=wall_meta) is False
+        assert self._rerun_skips(jd, wall_hit=True, failed_hit=False, wall_meta=wall_meta) is False
         # failed 命中 → 豁免
-        assert rerun_skips(jd, wall_hit=False, failed_hit=True) is False
+        assert self._rerun_skips(jd, wall_hit=False, failed_hit=True) is False
 
 
 class TestInputChangedDirect:
     """input_changed 语义分支直接单测。"""
 
+    def _input_changed(self, wall_meta):
+        return _DEFAULT_POLICY.check_input_changed(wall_meta)
+
     def test_no_prev_inputs_means_changed(self):
-        from tasklite.engine.retry import input_changed
-        assert input_changed({}) is True
-        assert input_changed(None) is True
+        assert self._input_changed({}) is True
+        assert self._input_changed(None) is True
 
     def test_corrupt_inputs_non_list_defensive(self):
-        """meta["inputs"] 非 list 脏数据（dict/str）→ 视为变化，
-        不 AttributeError 崩溃（加载期 _filter_residual_jobs 保护）。"""
-        from tasklite.engine.retry import input_changed
-        assert input_changed({"inputs": "garbage"}) is True
-        assert input_changed({"inputs": {"path": "/x"}}) is True
+        """meta["inputs"] 非 list 脏数据（dict/str）→ 视为变化，不 AttributeError 崩溃。"""
+        assert self._input_changed({"inputs": "garbage"}) is True
+        assert self._input_changed({"inputs": {"path": "/x"}}) is True
 
     def test_uri_entries_skipped(self):
-        from tasklite.engine.retry import input_changed
         wall_meta = {"inputs": [{"kind": "uri", "path": "https://x"}]}
         # 只有 uri → 无文件变化 → 未变化
-        assert input_changed(wall_meta) is False
+        assert self._input_changed(wall_meta) is False
 
     def test_missing_fingerprint_means_changed(self):
-        from tasklite.engine.retry import input_changed
         wall_meta = {"inputs": [{"path": "/x"}]}  # 缺 size/mtime_ns
-        assert input_changed(wall_meta) is True
+        assert self._input_changed(wall_meta) is True
 
     def test_file_disappeared_means_changed(self, tmp_path):
-        from tasklite.engine.retry import input_changed
         f = tmp_path / "gone.txt"
         f.write_text("x")
         st = f.stat()
         wall_meta = {"inputs": [{"path": str(f), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
         f.unlink()
-        assert input_changed(wall_meta) is True
+        assert self._input_changed(wall_meta) is True
 
 
 class TestSplitDeadlockDirect:

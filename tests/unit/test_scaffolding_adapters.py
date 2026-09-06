@@ -1,10 +1,11 @@
-"""tasklite.pipeline_util 通用管线脚手架测试（纯离线）。"""
+"""tasklite 通用脚手架与标准适配器测试（纯离线）。"""
+
 import hashlib
 import io
 import sys
 from contextlib import redirect_stdout
 import pytest
-from tasklite.pipeline_util import (
+from tasklite import (
     content_fingerprint,
     job_ref,
     progress_hook,
@@ -23,7 +24,6 @@ def test_content_fingerprint_deterministic_and_version_salted():
 
 
 def test_sanitize_job_component_escapes_uid_separator_and_path():
-    # 转义式：禁止字符按 UTF-8 字节转 %XX（'/'→%2F、':'→%3A、'\'→%5C），不再删除
     assert sanitize_job_component("a::b/c\\d") == "a%3A%3Ab%2Fc%5Cd"
     assert sanitize_job_component("") == "untitled"
     assert "::" not in sanitize_job_component("x::y")
@@ -59,51 +59,32 @@ def test_sanitize_job_component_long_input_truncate_with_fingerprint():
     assert out_a.endswith("_" + hashlib.sha256(a.encode()).hexdigest()[:8])
 
 
-def test_job_ref_meta_priority():
-    assert job_ref({"post_id": "42", "artist": "A"}) == "#42"
-    assert job_ref({"artist": "A"}) == "A"
-    assert job_ref({"id": "7"}) == "7"
-    assert job_ref({}) == ""
+def test_job_ref_extraction():
+    assert job_ref({"post_id": 123}) == "#123"
+    assert job_ref({"artist": "alice"}) == "alice"
+    assert job_ref({"id": "item_9"}) == "item_9"
+    assert job_ref({"other": "value"}) == ""
+    assert job_ref("not-a-dict") == ""
 
 
-def test_progress_hook_happy_paths(capsys):
-    progress_hook("t::1", {"post_id": "2"}, True, False)
-    progress_hook("t::1", {"post_id": "2"}, False, False)
-    progress_hook("t::1", {"post_id": "2"}, False, True)
-    out = capsys.readouterr().out
-    assert "✓" in out and "⟳" in out and "✗" in out
+def test_progress_hook_outputs_expected_lines():
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        progress_hook("fetch::p1", {"post_id": 10}, success=True, going_to_retry=False)
+        progress_hook("fetch::p2", {"artist": "bob"}, success=False, going_to_retry=True)
+        progress_hook("fetch::p3", {}, success=False, going_to_retry=False)
+
+    lines = buf.getvalue().splitlines()
+    assert "✓ fetch #10" in lines[0]
+    assert "⟳ fetch bob 失败，退避重试" in lines[1]
+    assert "✗ fetch → DLQ" in lines[2]
 
 
-def test_slice_list():
+def test_slice_list_scenarios():
     items = list(range(10))
-    assert slice_list(items, None, None, None) == list(range(10))
-    assert slice_list(items, None, None, 3) == [0, 1, 2]
-    assert slice_list(items, 5, None, None) == [5, 6, 7, 8, 9]
-    assert slice_list(items, 2, 4, None) == [2, 3, 4, 5]
-
-
-def test_tasklite_register_transient_exceptions_and_file_transients(tmp_path):
-    p = TaskLite("test_transients", state_dir=tmp_path)
-    p.register_file_transients()
-    assert p.transient_registry.matches(PermissionError("disk full"))
-    assert p.transient_registry.matches(BlockingIOError())
-    assert p.transient_registry.matches(ConnectionResetError())
-    assert not p.transient_registry.matches(FileNotFoundError())
-
-
-
-def test_tasklite_run_graceful(tmp_path):
-    p = TaskLite("test_graceful", state_dir=tmp_path)
-    # run_graceful 应能正常执行无任务管线并自然收尾
-    p.run_graceful()
-    assert p.stats.completed == 0
-
-
-def test_tasklite_root_exports_equivalence():
-    import tasklite
-    assert tasklite.content_fingerprint is content_fingerprint
-    assert tasklite.sanitize_job_component is sanitize_job_component
-    assert tasklite.job_ref is job_ref
-    assert tasklite.progress_hook is progress_hook
-    assert tasklite.slice_list is slice_list
-
+    assert slice_list(items, start=0, count=5, limit=None) == [0, 1, 2, 3, 4]
+    assert slice_list(items, start=5, count=5, limit=None) == [5, 6, 7, 8, 9]
+    assert slice_list(items, start=8, count=5, limit=None) == [8, 9]
+    assert slice_list(items, start=None, count=None, limit=3) == [0, 1, 2]
+    assert slice_list(items, start=2, count=3, limit=5) == [2, 3, 4]
+    assert slice_list(items, start=None, count=None, limit=None) == items

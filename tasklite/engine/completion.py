@@ -25,7 +25,6 @@ from .executor import (
 )
 from .inflight import InFlightJob
 from .policy import BackoffSchedule
-from .retry import compute_backoff
 from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE, inject_worker_resource
 from ..utils.ipc import inputs_path, outputs_path
 
@@ -214,10 +213,9 @@ class CompletionMachine:
                 self._ctx.stats["deferred_orphan"] += 1
         else:
             job.retries += 1
-            delay = compute_backoff(
+            sched = self._ctx.policy.compute_backoff_schedule(
                 job.retries, job.backoff_base, job.backoff_max
             )
-            sched = BackoffSchedule.from_delay(delay)
 
         logger.info(f"RETRY: {uid} (attempt {job.retries}/{job.max_retries}, backoff {sched.delay:.1f}s)")
         retry_dict = job.to_dict()
