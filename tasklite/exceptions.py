@@ -97,11 +97,14 @@ def classify_exception(
 ) -> str:
     """异常三分类的生产语义，返回 retry/fatal/error。"""
     classes = registry.snapshot() if isinstance(registry, TransientRegistry) else tuple(registry or ())
-    taxonomy = ErrorTaxonomy(
-        fatal_exceptions=fatal_exceptions,
-        transient_exceptions=transient_exceptions,
-        transient_registry=classes,
-    )
+    if fatal_exceptions is None and transient_exceptions is None and not classes:
+        taxonomy = _DEFAULT_TAXONOMY
+    else:
+        taxonomy = ErrorTaxonomy(
+            fatal_exceptions=fatal_exceptions,
+            transient_exceptions=transient_exceptions,
+            transient_registry=classes,
+        )
     cl = taxonomy.classify(exc)
     if cl.is_retry or cl.is_transient:
         return "retry"
