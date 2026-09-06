@@ -65,8 +65,20 @@ class TestInMemoryStateBackendContract:
         assert entry["error"] == "NETWORK_TIMEOUT"
         assert entry["_attempt"] == 1
         assert "failed_at" in entry
-        assert entry["error_type"] == "transient_exhausted" or "error_type" in entry
+        assert entry["error_type"] == "unknown"
         assert b.load_queue() == []
+
+        # 结构化错误与 fatal 分类测试
+        b.commit_job_failure("t::fatal", {"error": "Boom", "fatal": True})
+        b.commit_job_failure("t::deadlock", {"error": "DEADLOCK_CLASSIFICATION_GAP"})
+        b.commit_job_failure("t::dep", {"error": "JOB_DEPENDENCY"})
+        b.commit_job_failure("t::retries", {"error": "MAX_RETRIES_EXCEEDED"})
+
+        res = b.load_failed()
+        assert res["t::fatal"]["error_type"] == "fatal"
+        assert res["t::deadlock"]["error_type"] == "deadlock"
+        assert res["t::dep"]["error_type"] == "dependency"
+        assert res["t::retries"]["error_type"] == "transient_exhausted"
 
     def test_commit_retry(self):
         b = InMemoryStateBackend()
