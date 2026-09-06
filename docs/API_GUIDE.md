@@ -489,24 +489,23 @@ wall 条目除业务 meta 外携带：`run_count`（成功次数）、`last_run_
 
 ## 16. 官方网络工具库（HTTP Wrappers）
 
-> 架构决策记录见 [`docs/adr/0001-composable-http-wrappers.md`](./adr/0001-composable-http-wrappers.md)。  
 > 导入路径：`from tasklite.wrappers.http import http_guard, HttpPolicy, SnapshotStore, SQLiteSnapshotStore, MemorySnapshotStore, parse_netscape_cookies, format_cookie_header, fetch_urllib, fetch_requests, guard_request, guarded_fetch`
 
 TaskLite 官方提供 `tasklite.wrappers.http` 模块，为各种爬虫采集、数据同步与多媒体下载任务提供轻量、组合式、正交解耦的官方网络工具库。
 
 ---
 
-### 16.1 核心设计哲学与四大铁律
+### 16.1 模块特性与设计原则
 
 1. **用户选型自主（User Autonomy First）**：
-   - 坚决不重造重量级统一客户端抽象层；
+   - 不强行封装重型统一网络客户端；
    - 赋予用户 100% 网络请求选型自主权：用户可自由选用 Python 标准库 `urllib`、`requests`、`httpx`、`curl_cffi`、GraphQL 客户端或平台专用 SDK。
-2. **正交双引擎解耦（Orthogonal Dual-Engine Decoupling）**：
-   - **快照去重（`SnapshotStore`）**：专职内容寻址的原始 HTTP 响应持久化与离线幂等重放，零引擎依赖，可在独立分析脚本中单用；
+2. **正交功能解耦（Orthogonal Decoupling）**：
+   - **快照去重（`SnapshotStore`）**：专职内容寻址的原始 HTTP 响应持久化与离线幂等重放，零引擎依赖，可在独立分析脚本中单独使用；
    - **429 与异常守卫（`http_guard` / `HttpPolicy`）**：专职将底层传输故障与 HTTP 状态码收敛为 TaskLite 三分类异常，自动解析 `Retry-After` 并触发 `ctx.suspend_resource` 资源挂起；
-   - 两者互不依赖，亦可自由正交嵌套。
+   - 两者互不依赖，亦可自由正交组合。
 3. **全局限速复用（Global Rate Limiting Reuse）**：
-   - 绝不新建独立的 `Pacer` 概念，多 Worker / 多进程速率限制统一复用 TaskLite 原生 `RateLimitResource` 与 `ResourceManager`；
+   - 速率限制统一复用 TaskLite 原生 `RateLimitResource` 与 `ResourceManager`，不引入冗余的限速抽象；
    - 429 挂起时经由 `ctx.suspend_resource` 实现 IPC 单一出口下发。
 4. **零外部强制依赖（Zero Mandatory Dependencies）**：
    - 默认基于 Python 标准库（`urllib` / `http.cookiejar` / `sqlite3`），软支持 `requests`。
@@ -571,14 +570,14 @@ TaskLite 官方提供 `tasklite.wrappers.http` 模块，为各种爬虫采集、
 
 #### 2. 快照存储后端对比
 - **`SQLiteSnapshotStore(db_path)`**：
-  - 基于独立的 SQLite 文件（`snapshots.db`），**严禁混入 TaskLite 主状态库**；
+  - 基于独立的 SQLite 文件（`snapshots.db`），**独立于 TaskLite 主状态库**；
   - 自动启用 `PRAGMA journal_mode=WAL` 与 `PRAGMA synchronous=NORMAL`，提供极高的单机读写性能与断电保护；
   - 429 与 5xx 瞬态故障**默认不写入快照**，防止污染离线缓存库。
 - **`MemorySnapshotStore()`**：纯内存字典实现，适用于无 IO 单元测试与轻量短会话。
 
 ---
 
-### 16.5 进程隔离与会话管理军规
+### 16.5 多进程环境下的会话管理注意事项
 
 > [!CAUTION]
 > **严禁跨进程共享 Session 或 Socket 句柄**
