@@ -146,3 +146,59 @@ class TestResourceManagerSuspensionAndWorker:
         ok2, wait2 = rm.can_acquire_worker(1.0)
         assert not ok2
         assert wait2 > 0.0
+
+
+class TestResourceLeaseAndReservation:
+    def test_two_phase_lease_capacity_and_rate_limit(self):
+        gpu = CapacityResource("gpu", 4.0)
+        api = RateLimitResource("api", interval_seconds=10.0)
+        rm = ResourceManager({"gpu": gpu, "api": api})
+
+        # 1. 预约阶段：gpu 立即扣减，api 暂不推进 next_available
+        t_before = api.next_available
+        lease = rm.reserve("task", {"gpu": 2.0, "api": 1.0}, uid="j1")
+        assert lease.status.value == "reserved"
+        assert gpu.used == 2.0
+        assert api.next_available == t_before
+
+        # 2. 兑现阶段：api 时间片推进
+        lease.claim()
+        assert lease.status.value == "claimed"
+        assert api.next_available > t_before
+
+        # 3. 释放阶段：gpu 容量归还
+        lease.release()
+        assert lease.status.value == "released"
+        assert gpu.used == 0.0
+
+        # 幂等释放
+        lease.release()
+        assert gpu.used == 0.0
+
+    def test_try_reserve_returns_none_when_unavailable(self):
+        gpu = CapacityResource("gpu", 2.0)
+        rm = ResourceManager({"gpu": gpu})
+
+        lease1 = rm.try_reserve("task", {"gpu": 2.0})
+        assert lease1 is not None
+        assert gpu.used == 2.0
+
+        # 容量耗尽，try_reserve 返回 None，不抛出异常
+        lease2 = rm.try_reserve("task", {"gpu": 1.0})
+        assert lease2 is None
+        assert gpu.used == 2.0
+
+        lease1.release()
+        assert gpu.used == 0.0
+
+    def test_lease_context_manager_auto_rollback_on_exception(self):
+        gpu = CapacityResource("gpu", 4.0)
+        rm = ResourceManager({"gpu": gpu})
+
+        with pytest.raises(RuntimeError):
+            with rm.reserve("task", {"gpu": 3.0}, uid="err_job"):
+                assert gpu.used == 3.0
+                raise RuntimeError("Dispatch failed")
+
+        # 退出上下文后应自动 release
+        assert gpu.used == 0.0

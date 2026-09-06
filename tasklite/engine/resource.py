@@ -249,6 +249,16 @@ class CapacityResource(Resource):
         return f"CapacityResource(name={self.name!r}, used={self.used}, capacity={self.capacity})"
 
 
+from enum import Enum
+
+
+class LeaseStatus(str, Enum):
+    """资源租约状态。"""
+    RESERVED = "reserved"
+    CLAIMED = "claimed"
+    RELEASED = "released"
+
+
 @dataclass(frozen=True)
 class ResourceEvaluation:
     """资源可用性与死锁归因评估结果（不可变值对象）。"""
@@ -259,6 +269,55 @@ class ResourceEvaluation:
     is_impossible: bool = False
     unknown_name: Optional[str] = None
     impossible_name: Optional[str] = None
+
+
+@dataclass
+class ResourceLease:
+    """两阶段资源租约。
+
+    封装原子预扣（Capacity 占用 / RateLimit 校验）与正式兑现（RateLimit 推进）。
+    支持上下文管理器：派发阶段遇异常自动回滚释放。
+    """
+
+    manager: "ResourceManager"
+    job_uid: str
+    acquired: List[Tuple[str, float]]
+    rate_limits: List[Tuple[str, float]]
+    status: LeaseStatus = LeaseStatus.RESERVED
+
+    def claim(self) -> None:
+        """正式兑现租约（子进程真正派发时调用）。
+
+        推进速率限制资源的时间片。幂等保护：仅在 RESERVED 状态下生效。
+        """
+        if self.status != LeaseStatus.RESERVED:
+            return
+        for res_name, amount in self.rate_limits:
+            res = self.manager.get(res_name)
+            if res is not None:
+                res.acquire(amount)
+        self.status = LeaseStatus.CLAIMED
+
+    def release(self) -> None:
+        """归还已占用的资源（任务完成或异常时调用）。
+
+        幂等保护：仅在 RESERVED 或 CLAIMED 状态下执行一次释放。
+        """
+        if self.status == LeaseStatus.RELEASED:
+            return
+        self.manager.release_all(self.acquired, uid=self.job_uid)
+        self.status = LeaseStatus.RELEASED
+
+    def cancel(self) -> None:
+        """取消租约并释放已占资源（等价于 release）。"""
+        self.release()
+
+    def __enter__(self) -> "ResourceLease":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if exc_type is not None and self.status != LeaseStatus.RELEASED:
+            self.release()
 
 
 class ResourceManager(MutableMapping[str, Resource]):
@@ -353,6 +412,59 @@ class ResourceManager(MutableMapping[str, Resource]):
             is_available=True,
             wait_time=0.0,
         )
+
+    def reserve(
+        self,
+        task_type: str,
+        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
+        *,
+        uid: Optional[str] = None,
+    ) -> ResourceLease:
+        """两阶段原子预约：立即占用 CapacityResource，预检 RateLimitResource。"""
+        eff = self.effective_resources(task_type, declared_resources)
+        acquired: List[Tuple[str, float]] = []
+        rate_limits: List[Tuple[str, float]] = []
+        try:
+            for res_name, amount in eff.items():
+                res = self._resources.get(res_name)
+                if res is None:
+                    raise KeyError(f"Resource '{res_name}' not registered")
+                if isinstance(res, RateLimitResource):
+                    ok, wait_time = res.can_acquire(amount)
+                    if not ok:
+                        raise RuntimeError(
+                            f"RateLimitResource '{res_name}' not available (wait {wait_time:.2f}s)"
+                        )
+                    rate_limits.append((res_name, amount))
+                else:
+                    res.acquire(amount)
+                    acquired.append((res_name, amount))
+            return ResourceLease(
+                manager=self,
+                job_uid=uid or "",
+                acquired=acquired,
+                rate_limits=rate_limits,
+                status=LeaseStatus.RESERVED,
+            )
+        except BaseException:
+            self.release_all(acquired, uid=uid)
+            raise
+
+    def try_reserve(
+        self,
+        task_type: str,
+        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
+        *,
+        uid: Optional[str] = None,
+    ) -> Optional[ResourceLease]:
+        """试探性预约资源。不可用时返回 None（不抛异常、不产生副作用）。"""
+        eval_res = self.evaluate(task_type, declared_resources)
+        if not eval_res.is_available:
+            return None
+        try:
+            return self.reserve(task_type, declared_resources, uid=uid)
+        except Exception:
+            return None
 
     def acquire_effective(
         self,
@@ -462,6 +574,8 @@ __all__ = [
     "CapacityResource",
     "ResourceEvaluation",
     "ResourceManager",
+    "LeaseStatus",
+    "ResourceLease",
     "WORKER_RESOURCE",
 ]
 

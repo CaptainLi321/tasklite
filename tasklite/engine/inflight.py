@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from ..models.job import Job
     from ..models.state import PipelineState
     from .executor import JobHandle
-    from .resource import ResourceManager
+    from .resource import ResourceManager, ResourceLease
 
 from ..models.job import Job
 from .executor import JobHandle
@@ -32,11 +32,17 @@ class InFlightJob:
     acquired: List[Tuple[str, float]]
     handle: Optional[JobHandle]
     job_start: Optional[float]
+    lease: Optional["ResourceLease"] = None
 
     @property
     def is_pseudo(self) -> bool:
         """是否为伪条目（崩溃恢复或 abort 消费路径）。"""
         return self.handle is None
+
+    def release_resources(self) -> None:
+        """释放关联的资源租约或 acquired 列表。"""
+        if self.lease is not None:
+            self.lease.release()
 
 
 class InFlightTracker(MutableMapping[str, InFlightJob]):

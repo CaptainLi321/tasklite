@@ -254,70 +254,71 @@ class DispatchMachine:
             except OSError:
                 pass
 
-        # Acquire resources（由 ResourceManager 深模块统一事务性合并与获取）
-        acquired: List[Tuple[str, float]] = []
+        # Acquire resources via two-phase lease
         handle: Optional[JobHandle] = None
         try:
-            acquired = self._ctx.resource_mgr.acquire_effective(
-                job.task_type, job.resources
+            lease = self._ctx.resource_mgr.reserve(
+                job.task_type, job.resources, uid=uid
             )
+            with lease:
+                # Payload validation
+                _handler_entry = self._ctx.handlers[job.task_type]
+                _payload_schema = _handler_entry.payload_schema
+                if _payload_schema is not None:
+                    _errors = validate_payload(job.payload, _payload_schema)
+                    if _errors:
+                        logger.error(f"Payload validation failed for {uid}: {_errors}")
+                        # 校验失败不走子进程，release 租约后直接 commit
+                        lease.release()
+                        fail_meta = {"error": _ERR_PAYLOAD_VALIDATION, "details": _errors}
+                        self._reject_and_commit(uid, job_dict, fail_meta)
+                        return None
+                # Build context + submit (non-blocking)
+                # 增量 uid 索引（PipelineState._wall_uids/_failed_uids）避免
+                # 每次派发 ``set(state.wall.keys())`` 的 O(W) 重建；这里是单线程
+                # 派发路径，活引用在 submit 内立即 pickle 为子进程快照。
+                wall_keys = state.wall_uids
+                failed_keys = state.failed_uids
+                # 输出声明走落盘 outputs.jsonl——handler 子进程内声明的
+                # 输出经落盘文件传回主进程。
+                # fencing：分配本 job 的执行代标识（run_id.seq）。
+                # seq 每次 submit 递增——同 uid 重试再派发也获得新 incarnation，
+                # 与上次尝试的结果文件隔离（旧尝试的残留不被本次 drain 看见）。
+                self._ctx.dispatch_seq += 1
+                incarnation = f"{self._ctx.run_id}.{self._ctx.dispatch_seq}"
+                # 注册表快照契约：per-pipeline 瞬态异常注册表快照随 ctx pickle
+                # 下发——分类决策在子进程，注册表必须显式传递（不可依赖父进程
+                # 作用域，更不存在模块级可变全局）。
+                ctx = TaskContext(
+                    job, wall_keys, failed_keys, dict(state.cursors),
+                    output_root=self._ctx.output_root,
+                    ipc_dir=self._ctx.ipc_dir, incarnation=incarnation,
+                    transient_registry=self._ctx.transient_registry.snapshot(),
+                    # 资源名注册集快照随 ctx 下发——
+                    # suspend_resource 对未注册名 fail-loud（typo 不静默失效）。
+                    resource_names=frozenset(self._ctx.resources),
+                )
 
-            # Payload validation
-            _handler_entry = self._ctx.handlers[job.task_type]
-            _payload_schema = _handler_entry.payload_schema
-            if _payload_schema is not None:
-                _errors = validate_payload(job.payload, _payload_schema)
-                if _errors:
-                    logger.error(f"Payload validation failed for {uid}: {_errors}")
-                    # 校验失败不走子进程，release 已 acquire 的资源后直接 commit
-                    self._completion.release_acquired(acquired)
-                    fail_meta = {"error": _ERR_PAYLOAD_VALIDATION, "details": _errors}
-                    self._reject_and_commit(uid, job_dict, fail_meta)
-                    return None
-            # Build context + submit (non-blocking)
-            # 增量 uid 索引（PipelineState._wall_uids/_failed_uids）避免
-            # 每次派发 ``set(state.wall.keys())`` 的 O(W) 重建；这里是单线程
-            # 派发路径，活引用在 submit 内立即 pickle 为子进程快照。
-            wall_keys = state.wall_uids
-            failed_keys = state.failed_uids
-            # 输出声明走落盘 outputs.jsonl——handler 子进程内声明的
-            # 输出经落盘文件传回主进程。
-            # fencing：分配本 job 的执行代标识（run_id.seq）。
-            # seq 每次 submit 递增——同 uid 重试再派发也获得新 incarnation，
-            # 与上次尝试的结果文件隔离（旧尝试的残留不被本次 drain 看见）。
-            self._ctx.dispatch_seq += 1
-            incarnation = f"{self._ctx.run_id}.{self._ctx.dispatch_seq}"
-            # 注册表快照契约：per-pipeline 瞬态异常注册表快照随 ctx pickle
-            # 下发——分类决策在子进程，注册表必须显式传递（不可依赖父进程
-            # 作用域，更不存在模块级可变全局）。
-            ctx = TaskContext(
-                job, wall_keys, failed_keys, dict(state.cursors),
-                output_root=self._ctx.output_root,
-                ipc_dir=self._ctx.ipc_dir, incarnation=incarnation,
-                transient_registry=self._ctx.transient_registry.snapshot(),
-                # 资源名注册集快照随 ctx 下发——
-                # suspend_resource 对未注册名 fail-loud（typo 不静默失效）。
-                resource_names=frozenset(self._ctx.resources),
-            )
+                logger.info(f"RUN: {uid}")
+                job_start = time.monotonic()
+                handle = self._ctx.executor.submit(
+                    self._ctx.handlers[job.task_type].func, job, ctx, job.timeout,
+                    ipc_dir=self._ctx.ipc_dir,
+                )
+                lease.claim()
 
-            logger.info(f"RUN: {uid}")
-            job_start = time.monotonic()
-            handle = self._ctx.executor.submit(
-                self._ctx.handlers[job.task_type].func, job, ctx, job.timeout,
-                ipc_dir=self._ctx.ipc_dir,
-            )
-
-            entry = InFlightJob(
-                uid=uid,
-                job_dict=job_dict,
-                job=job,
-                acquired=acquired,
-                handle=handle,
-                job_start=job_start,
-            )
-            # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
-            self._ctx.in_flight.register(entry, state=state)
-            return entry
+                entry = InFlightJob(
+                    uid=uid,
+                    job_dict=job_dict,
+                    job=job,
+                    acquired=lease.acquired,
+                    handle=handle,
+                    job_start=job_start,
+                    lease=lease,
+                )
+                # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
+                self._ctx.in_flight.register(entry, state=state)
+                return entry
 
         except _CommitCrashSignal:
             # _CommitCrashSignal 继承 BaseException——「commit 失败需崩溃」
@@ -333,7 +334,6 @@ class DispatchMachine:
                 raise
             if handle is not None:
                 self._ctx.executor.cleanup([handle])
-            self._completion.release_acquired(acquired)
             state.requeue_jobs([job_dict], front=True)
             # 不在此 save_queue：内存此刻缺其他 in-flight 作业，
             # 交给 _run_loop 的 _save_queue_crash_safe 合并磁盘真相后统一保存。
@@ -342,7 +342,6 @@ class DispatchMachine:
             logger.error(f"Error dispatching job {uid}: {e}\n{traceback.format_exc()}")
             if handle is not None:
                 self._ctx.executor.cleanup([handle])
-            self._completion.release_acquired(acquired)
             # dispatch 阶段失败（submit 的 pickle/启动报错、
             # 资源 acquire 校验失败）：确定性失败（如不可 pickle 的
             # lambda handler）若只 requeue + 崩溃会触发**无限重启循环**。
