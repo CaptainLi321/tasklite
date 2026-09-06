@@ -122,32 +122,7 @@ class RecoveryMachine:
         if not isinstance(deadlines, dict):
             logger.warning("resource_suspends meta is not a dict, ignoring")
             return
-        now = time.time()
-        for name, deadline in deadlines.items():
-            try:
-                if name not in self._ctx.resources:
-                    logger.warning(
-                        f"Skipping persisted suspend for unknown resource '{name}'"
-                    )
-                    continue
-                if (
-                    not isinstance(deadline, (int, float))
-                    or isinstance(deadline, bool)
-                    or not math.isfinite(deadline)
-                ):
-                    logger.warning(
-                        f"Skipping invalid suspend deadline for resource '{name}'"
-                    )
-                    continue
-                remaining = deadline - now
-                if remaining <= 0:
-                    continue  # 已过期：放行
-                self._ctx.resources[name].suspend(remaining)
-            except Exception as e:
-                logger.warning(
-                    f"Skipping persisted suspend for resource '{name}' "
-                    f"(corrupt entry {deadline!r}): {e}"
-                )
+        self._ctx.resource_mgr.restore_suspensions(deadlines)
 
     def persist_resource_suspends(self) -> None:
         """run 结束时把资源挂起截止持久化到 meta 表。
@@ -217,17 +192,10 @@ class RecoveryMachine:
         for entry in self._ctx.in_flight.values():
             signals = read_signals(self._ctx.ipc_dir, entry.uid)
             for r_name, secs in signals:
-                if r_name in self._ctx.resources:
-                    self._ctx.resources[r_name].suspend(secs)
+                if self._ctx.resource_mgr.suspend_resource(r_name, secs):
                     logger.info(f"Applied suspend signal from {entry.uid}: {r_name} for {secs}s")
-                    # 挂起应用后即时持久化——kill -9/OOM 时已应用的
-                    # 限流不丢（否则重启后全速重打正在限流的 API）。幂等
-                    # UPSERT，仅在确有应用动作时触发（本循环体内有应用即写，
-                    # 无应用零开销）。
                     self._ctx.persist_resource_suspends_now()
                 else:
-                    # 纵深防御对称：未注册资源名告警跳过
-                    # （入口已 fail-loud，此为结果文件/旧信号文件通道兜底）。
                     logger.warning(
                         f"Skipping suspend signal for unregistered resource "
                         f"{r_name!r} (from {entry.uid})"

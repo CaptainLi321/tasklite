@@ -24,7 +24,7 @@ from .engine.failure import FailureMachine
 from .engine.inflight import InFlightJob as _InFlightJob
 from .engine.loop import LoopRunner
 from .engine.recovery import RecoveryMachine
-from .engine.resource import CapacityResource, Resource
+from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import (
     META_RESOURCE_SUSPENDS as _META_RESOURCE_SUSPENDS,
     RunContext, StopMode, TaskStats, WORKER_RESOURCE, inject_worker_resource,
@@ -202,7 +202,7 @@ class TaskLite:
             tuple(fatal_exceptions) if fatal_exceptions is not None else None)
         self._transient_exceptions: Optional[tuple] = (
             tuple(transient_exceptions) if transient_exceptions is not None else None)
-        self.resources: Dict[str, Resource] = {}
+        self.resources: ResourceManager = ResourceManager(handlers=self.handlers)
         # 内部 worker 资源：控制并发度。每个 job 默认占用 1 个 worker 槽位，
         # CapacityResource.used 实时反映 in-flight 占用，scheduler 的
         # can_acquire 自然阻止过度派发。用户可通过 add_resource 覆盖。

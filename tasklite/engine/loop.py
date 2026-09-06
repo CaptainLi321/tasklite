@@ -172,7 +172,7 @@ class LoopRunner:
                     # （N=10 万时每轮 ~300ms CPU 空烧，慢 job 阶段 20Hz
                     # 轮询 ~85% 单核）。no-subprocess 路径（dedup/dep-failed/
                     # no-handler）的清理延迟至 worker 释放，最终仍会处理。
-                    ok, worker_wait = self._ctx.resources[WORKER_RESOURCE].can_acquire(1.0)
+                    ok, worker_wait = self._ctx.resource_mgr.can_acquire_worker(1.0)
                     if not ok:
                         # 忙循环护栏：第三方自定义资源在
                         # 不可用态可能返回 wait=0（内置 CapacityResource /
