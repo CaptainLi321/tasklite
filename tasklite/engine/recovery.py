@@ -6,6 +6,8 @@
 注入、经 CompletionMachine 复用收尾契约，不反向引用 TaskLite。
 """
 
+from __future__ import annotations
+
 import logging
 import math
 import time
@@ -16,6 +18,7 @@ if TYPE_CHECKING:
     from .completion import CompletionMachine
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..models.job import Job
 from ..models.state import uid_from_job_dict
 from ..utils.jsonutil import loads
 from .executor import (
