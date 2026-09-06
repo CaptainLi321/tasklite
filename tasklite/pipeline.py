@@ -18,16 +18,21 @@ from .backend.sqlite_backend import SQLiteStateBackend
 
 from .models.context import TaskContext
 from .engine.executor import ExecutionResult, MultiprocessingExecutor
-from .engine.completion import CompletionMachine
-from .engine.dispatch import DispatchMachine
-from .engine.failure import FailureMachine
 from .engine.inflight import InFlightJob as _InFlightJob, InFlightTracker
-from .engine.loop import LoopRunner
-from .engine.recovery import RecoveryMachine
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import (
+    EngineRuntime,
+    ExecutionOptions,
+    ExitReason,
     META_RESOURCE_SUSPENDS as _META_RESOURCE_SUSPENDS,
-    RunContext, StopMode, TaskStats, WORKER_RESOURCE, inject_worker_resource,
+    RunContext,
+    RunSummary,
+    RuntimeConfig,
+    StepOutcome,
+    StopMode,
+    TaskStats,
+    WORKER_RESOURCE,
+    inject_worker_resource,
     RT_BACKOFF_UNTIL,
     RT_BACKOFF_WALL_DEADLINE,
 )
@@ -223,49 +228,57 @@ class TaskLite:
         # 可用性，与 _dispatch_job 的实际 acquire 一致（堵住限速/容量绕过）。
         self.scheduler = JobScheduler(self.resources, self.handlers)
 
-        # 生命周期钩子（单 callable，构造注册；异常隔离见钩子契约）
-        # on_run_start/on_run_end/on_job_completed 统一经 RunContext 持有。
         self.strict_picklable = strict_picklable
-        # 代码级限制：run 进行中禁止管理 API / enqueue；
-        # 同 state_dir 并发 run 由 pipeline 级文件锁阻止。
-        self._run_started = False
-        self._run_lock_fd: Optional[int] = None
-        # 运行上下文是「一次 run 的运行时真相源」——
-        # 常驻服务引用 + 每-run 可变状态都在这里；各机器只依赖 ctx，
-        # 不反向引用宿主 pipeline。下方同名属性（stats/_state/_in_flight/...）
-        # 是兼容测试与旧调用面的代理。
-        self._ctx = RunContext(
+
+        # 构建 EngineRuntime 静态装配配置
+        self.runtime_config = RuntimeConfig(
             name=self.name,
-            backend=self.backend,
-            scheduler=self.scheduler,
+            ipc_dir=self.ipc_dir,
+            output_root=self.output_root,
+            strict_picklable=strict_picklable,
+            dep_grace_seconds=dep_grace_seconds if dep_grace_seconds is not None else 60.0,
+            commit_failure_dlq_threshold=commit_failure_dlq_threshold if commit_failure_dlq_threshold is not None else 3,
+            deadlock_gap_max_rounds=deadlock_gap_max_rounds if deadlock_gap_max_rounds is not None else 3,
+            fatal_exceptions=self._fatal_exceptions,
+            transient_exceptions=self._transient_exceptions,
+            on_run_start=on_run_start,
+            on_run_end=on_run_end,
+            on_job_completed=on_job_completed,
+        )
+
+        # 核心运行期深模块
+        self._runtime = EngineRuntime(
+            config=self.runtime_config,
+            backend=self._backend,
             resources=self.resources,
             handlers=self.handlers,
             executor=self.executor,
-            ipc_dir=self.ipc_dir,
-            output_root=self.output_root,
-            on_run_start=on_run_start,
-            on_job_completed=on_job_completed,
-            on_run_end=on_run_end,
             transient_registry=self.transient_registry,
-            fatal_exceptions=self._fatal_exceptions,
-            transient_exceptions=self._transient_exceptions,
-            dep_grace_seconds=dep_grace_seconds,
-            commit_failure_dlq_threshold=commit_failure_dlq_threshold,
-            deadlock_gap_max_rounds=deadlock_gap_max_rounds,
             discovery_rerun=self._discovery_rerun,
         )
-        # 失败机器（3-strike/级联/死锁归因/宽限）注入 RunContext；完成/
-        # 派发机器同样只依赖 RunContext + 失败机器。本类保留同名薄转发
-        # （测试直调面 + 生产路径兼容），职责是「配置 + 加载修复 + 主循环编排」。
-        self._failure = FailureMachine(self._ctx)
-        self._completion = CompletionMachine(self._ctx, self._failure)
-        self._dispatch = DispatchMachine(self._ctx, self._failure, self._completion)
-        self._recovery = RecoveryMachine(self._ctx, self._completion)
-        self._loop = LoopRunner(
-            self._ctx, self._recovery, self._dispatch, self._failure, self._completion,
-        )
 
-    # ── RunContext 代理属性 ───────────────────────────────────────
+        # 运行上下文与拓扑机器均由 EngineRuntime 统一装配
+        self._ctx = self._runtime.ctx
+        self.scheduler = self._runtime.scheduler
+        self._failure = self._runtime._failure
+        self._completion = self._runtime._completion
+        self._dispatch = self._runtime._dispatch
+        self._recovery = self._runtime._recovery
+        self._loop = self._runtime._loop
+
+    # ── 核心深模块与 RunContext 代理属性 ────────────────────────────
+    @property
+    def runtime(self) -> EngineRuntime:
+        """核心运行期深模块接缝。"""
+        return self._runtime
+
+    @property
+    def _run_started(self) -> bool:
+        return self._runtime.is_running
+
+    @_run_started.setter
+    def _run_started(self, value: bool) -> None:
+        self._runtime._is_running = value
     # 运行态真相源在 self._ctx；这些属性代理保留 TaskLite 的调用面
     # （生产方法、测试直调、monkeypatch 赋值），代理写入即时同步真相源。
     @property
@@ -279,6 +292,8 @@ class TaskLite:
         self._backend = value
         if hasattr(self, "_ctx"):
             self._ctx.backend = value
+        if hasattr(self, "_runtime"):
+            self._runtime.backend = value
 
     @property
     def stats(self) -> TaskStats:
@@ -786,101 +801,16 @@ class TaskLite:
           （进 wall/failed，不 kill、不删产出、不 requeue），仅对**进行中**
           的 job 执行 kill + 清半成品 + requeue 后退出。
         """
-        self._ctx.stop_mode = StopMode.ABORTING if force else StopMode.DRAINING
+        self._runtime.request_stop(force=force)
 
     def _handle_stop_signal(self, signum, frame) -> None:
-        """SIGTERM/SIGINT 信号处理器：请求 DRAINING 优雅停机；二次强制 ABORTING。
-
-        容器编排（docker stop / k8s pod 终止）默认发 SIGTERM；终端 Ctrl+C
-        发 SIGINT。两者复用同一处理器：
-        首次信号 → DRAINING：不派发新 job，等 in-flight 自然完成。
-        二次信号（含两种信号交叉）→ ABORTING：分类消费在途任务——**已完成**
-        （结果文件已落盘）的 job 被消费提交（进 wall/failed，不重跑），仅对
-        **进行中**的 job 执行 kill + 清半成品 + requeue，快速退出（对应容器
-        优雅停机超时后的强杀信号 / 用户第二次 Ctrl+C）。
-        """
-        try:
-            sig_name = signal.Signals(signum).name
-        except (ValueError, AttributeError):
-            sig_name = str(signum)
-        if self._ctx.stop_mode is not StopMode.NONE:
-            logger.warning(f"Second {sig_name} received, forcing abort.")
-            self._ctx.stop_mode = StopMode.ABORTING
-        else:
-            logger.warning(
-                f"Received {sig_name}, requesting graceful shutdown (draining)."
-            )
-            self._ctx.stop_mode = StopMode.DRAINING
-
-
-
+        """SIGTERM/SIGINT 信号处理器：请求 DRAINING 优雅停机；二次强制 ABORTING。"""
+        self._runtime._handle_signal(signum, frame)
 
     def run(self) -> None:
         """Start the pipeline and run until queue is empty (or a drain/abort stop is requested)."""
         logger.info(f"=== Starting Pipeline: {self.name} (Backend: {self.backend_type}) ===")
-        self._ctx.stop_mode = StopMode.NONE
-        # 代码级限制：run 进行中禁止 enqueue / list_dlq / clear_dlq / clear_history /
-        # seed_wall / seed_cursor；on_run_start 也在保护范围内。
-        self._run_started = True
-        # 预置全部已知键——hook_errors/deferred_orphan 是运行期动态键，
-        # 预置后累加不再依赖拼写正确（.get(...,0)+1 会静默容忍拼错）。
-        self.stats = TaskStats()
-        # on_run_end 钩子幂等标志重置（run 只触发一次）。
-        self._ctx.reset_run_end_fired()
-        # 同 state_dir 并发 run 防护：pipeline 级文件锁（锁文件常驻，
-        # 由 fd 生命周期保证；进程崩溃内核自动释放）。
-        self._run_lock_fd = try_acquire_lock(self.ipc_dir, "__pipeline_run__", timeout=0)
-        if self._run_lock_fd is None:
-            self._run_started = False
-            raise RuntimeError(
-                f"Another run() is in progress for state_dir {self.state_dir}; "
-                f"concurrent runs on the same state are forbidden."
-            )
-        # episode 治理态重置（依赖宽限截止、缺失集合追踪、死锁缺口轮数）
-        self._ctx.reset_episode()
-
-        # 注册 SIGTERM/SIGINT handler（两种信号复用同一优雅停机路径：
-        # DRAINING/ABORTING 状态机，与容器 stop 语义一致；SIGINT 不以
-        # KeyboardInterrupt 穿透主循环）。
-        # 信号只能在主线程注册；子线程调用 run 会抛 ValueError，安全跳过。
-        # run 退出后恢复原 handler，避免影响进程其他部分。
-        old_sigterm = None
-        old_sigint = None
-        try:
-            old_sigterm = signal.signal(signal.SIGTERM, self._handle_stop_signal)
-        except (ValueError, OSError):
-            logger.debug("Could not install SIGTERM handler (non-main thread or unsupported platform).")
-        try:
-            old_sigint = signal.signal(signal.SIGINT, self._handle_stop_signal)
-        except (ValueError, OSError):
-            logger.debug("Could not install SIGINT handler (non-main thread or unsupported platform).")
-
-        try:
-            self._preflight_picklable_callbacks()
-            # on_run_start 异常隔离——钩子按不可信代码对待
-            if self.on_run_start is not None:
-                try:
-                    self.on_run_start()
-                except Exception as e:
-                    logger.warning(f"on_run_start hook raised: {e}")
-                    self.stats["hook_errors"] += 1
-            self._run_body()
-        except BaseException as e:
-            # 未进入主循环/主循环未覆盖的退出路径也触发 on_run_end。
-            self._ctx.fire_run_end(
-                "interrupted" if isinstance(e, KeyboardInterrupt) else "error"
-            )
-            raise
-        finally:
-            # 正常完成路径的兜底触发；若上面 except 已触发，幂等忽略。
-            self._ctx.fire_run_end("completed")
-            release_lock(self._run_lock_fd)
-            self._run_lock_fd = None
-            self._run_started = False
-            if old_sigterm is not None:
-                signal.signal(signal.SIGTERM, old_sigterm)
-            if old_sigint is not None:
-                signal.signal(signal.SIGINT, old_sigint)
+        self._runtime.execute()
 
     def run_graceful(self) -> None:
         """统一 run + 优雅停机包装：捕获 KeyboardInterrupt 并触发 DRAINING 优雅停机。
@@ -898,48 +828,15 @@ class TaskLite:
             except Exception:
                 logger.exception("run_graceful 收尾 stop 失败")
 
-
     def _run_body(self) -> None:
         """run() 的实际执行体，由 run() 包裹在 SIGTERM 安装/恢复之间调用。"""
-        # 调度缓存按 run 生命周期清空——跨 run 的
-        # clear_history + 重新 enqueue 同 uid 不同内容场景需在加载期覆盖陈旧缓存。
-        self.scheduler.begin_round()
-        wall = self.backend.load_wall()
-        failed = self.backend.load_failed()
-        cursors = self.backend.load_cursors()
-        q_data = self.backend.load_queue()
-
-        # fencing：每次 run 生成新的 run_id 并持久化到 meta 表
-        # （记录上次 run 的 id，供运维排障/未来清理残留），seq 计数器重置。
-        self._run_id = uuid.uuid4().hex
-        self._dispatch_seq = 0
-        # run_id 持久化失败必须 fail-loud——静默降级 = 无 fence 运行，
-        # 孤儿 fencing 承诺形同虚设（且 meta 表写失败说明 DB 已故障，
-        # 队列持久化同样不可靠，启动即应失败而非带病运行）。
-        try:
-            self.backend.set_meta("last_run_id", self._run_id)
-        except Exception as e:
-            logger.critical(
-                f"Failed to persist run_id to meta table — fencing disabled, "
-                f"refusing to run degraded: {e}"
-            )
-            raise
-
-        # 加载期队列整理：退避换算 + 残留过滤 + 去重（统一由 RecoveryMachine 原子执行）。
-        q_data = self._recovery.repair_queue_on_load(q_data, wall, failed)
-
-        # 加载持久化的资源 suspend 状态（meta 表 wall-clock 截止换算回 monotonic）
-        self._recovery.load_resource_suspends()
-
-        self._ctx.set_state(PipelineState(wall, failed, cursors, q_data))
-
-        # 启动主事件循环
+        self._runtime.prepare_run_state()
         self._run_loop()
 
     # ── 内部组件委托方法（供测试与生命周期直调）─────────────────
 
     def _run_loop(self) -> None:
-        return self._loop.run_loop()
+        return self._runtime._run_loop()
 
     def _save_queue_crash_safe(self) -> None:
         return self._recovery.save_queue_crash_safe()
