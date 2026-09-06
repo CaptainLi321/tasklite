@@ -161,8 +161,7 @@ class CompletionMachine:
         # 1. 全局应用资源挂起
         applied_suspension = False
         for r_name, secs in result.resource_suspensions:
-            if r_name in self._ctx.resources:
-                self._ctx.resources[r_name].suspend(secs)
+            if self._ctx.resource_mgr.suspend_resource(r_name, secs):
                 applied_suspension = True
             else:
                 logger.warning(
@@ -434,14 +433,6 @@ class CompletionMachine:
     def release_acquired(
         self, acquired: List[Tuple[str, float]], uid: Optional[str] = None
     ) -> None:
-        """释放已 acquire 的资源列表。
-
-        逐资源 try/except：单个资源的 ``release()`` 失败不中断循环，
-        确保其余资源也被释放（否则资源计数器永久抬高，形成泄漏）。
-        """
-        for res_name, amount in acquired:
-            try:
-                self._ctx.resources[res_name].release(amount)
-            except Exception as e:
-                logger.error(f"Error releasing resource '{res_name}' for {uid}: {e}")
+        """释放已 acquire 的资源列表（委托给 ResourceManager 深模块）。"""
+        self._ctx.resource_mgr.release_all(acquired, uid=uid)
 

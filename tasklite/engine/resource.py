@@ -2,9 +2,19 @@ import logging
 import math
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from collections.abc import MutableMapping
+from dataclasses import dataclass
+from typing import (
+    Any, Dict, Iterable, Iterator, List, Mapping, Optional,
+    Tuple, Union, TYPE_CHECKING
+)
+
+if TYPE_CHECKING:
+    from ..pipeline import HandlerEntry
 
 logger = logging.getLogger("tasklite")
+
+WORKER_RESOURCE = "__workers__"
 
 # 单次 suspend 的上限（秒）：防止子进程传入 1e12 等超大值永久停摆管线
 _MAX_SUSPEND_SECONDS = 86400.0  # 24h
@@ -237,3 +247,221 @@ class CapacityResource(Resource):
 
     def __repr__(self) -> str:
         return f"CapacityResource(name={self.name!r}, used={self.used}, capacity={self.capacity})"
+
+
+@dataclass(frozen=True)
+class ResourceEvaluation:
+    """资源可用性与死锁归因评估结果（不可变值对象）。"""
+
+    is_available: bool
+    wait_time: float
+    is_unknown: bool = False
+    is_impossible: bool = False
+    unknown_name: Optional[str] = None
+    impossible_name: Optional[str] = None
+
+
+class ResourceManager(MutableMapping[str, Resource]):
+    """统一资源管理器深模块。
+
+    统一内敛：
+    1. 资源注册表与生命周期管理（支持 Dict-like 访问，向下完全兼容）；
+    2. Handler 默认资源的动态单点合并（消除调度与派发双重维护）；
+    3. 细粒度资源合法性与可用性评估（unknown、impossible、wait_time）；
+    4. 事务性原子获取（acquire_effective）与安全幂等释放（release_all）；
+    5. 统一挂起与跨崩溃状态持久化/恢复。
+    """
+
+    def __init__(
+        self,
+        resources: Optional[Mapping[str, Resource]] = None,
+        handlers: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self._resources: Dict[str, Resource] = dict(resources) if resources is not None else {}
+        self.handlers: Mapping[str, Any] = handlers if handlers is not None else {}
+
+    def __getitem__(self, key: str) -> Resource:
+        return self._resources[key]
+
+    def __setitem__(self, key: str, value: Resource) -> None:
+        self._resources[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._resources[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._resources)
+
+    def __len__(self) -> int:
+        return len(self._resources)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._resources
+
+    def effective_resources(
+        self,
+        task_type: str,
+        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
+    ) -> Dict[str, float]:
+        """合并 Handler 默认资源与 Job 声明资源。"""
+        if declared_resources is None:
+            base: Dict[str, float] = {}
+        elif isinstance(declared_resources, Mapping):
+            base = dict(declared_resources)
+        else:
+            base = dict(declared_resources)
+        entry = self.handlers.get(task_type)
+        defaults = getattr(entry, "default_resources", None) if entry is not None else None
+        if not defaults:
+            return base
+        return {**defaults, **base}
+
+    def evaluate(
+        self,
+        task_type: str,
+        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
+    ) -> ResourceEvaluation:
+        """评估作业所需资源的可用性与合法性。"""
+        eff = self.effective_resources(task_type, declared_resources)
+        min_wait = 0.0
+        for res_name, amount in eff.items():
+            res = self._resources.get(res_name)
+            if res is None:
+                return ResourceEvaluation(
+                    is_available=False,
+                    wait_time=float("inf"),
+                    is_unknown=True,
+                    unknown_name=res_name,
+                )
+            ok, wait_time = res.can_acquire(amount)
+            if not ok:
+                if wait_time == float("inf"):
+                    return ResourceEvaluation(
+                        is_available=False,
+                        wait_time=float("inf"),
+                        is_impossible=True,
+                        impossible_name=res_name,
+                    )
+                min_wait = max(min_wait, wait_time)
+
+        if min_wait > 0.0:
+            return ResourceEvaluation(
+                is_available=False,
+                wait_time=min_wait,
+            )
+        return ResourceEvaluation(
+            is_available=True,
+            wait_time=0.0,
+        )
+
+    def acquire_effective(
+        self,
+        task_type: str,
+        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
+    ) -> List[Tuple[str, float]]:
+        """事务性 acquire 所有合并后的资源（异常时自动释放已获取的部分）。"""
+        eff = self.effective_resources(task_type, declared_resources)
+        acquired: List[Tuple[str, float]] = []
+        try:
+            for res_name, amount in eff.items():
+                res = self._resources.get(res_name)
+                if res is None:
+                    raise KeyError(f"Resource '{res_name}' not registered")
+                res.acquire(amount)
+                acquired.append((res_name, amount))
+            return acquired
+        except BaseException:
+            self.release_all(acquired)
+            raise
+
+    def release_all(
+        self,
+        acquired: Iterable[Tuple[str, float]],
+        *,
+        uid: Optional[str] = None,
+    ) -> None:
+        """释放已获取的资源集合（异常安全）。"""
+        for item in acquired:
+            try:
+                res_name, amount = item
+            except (TypeError, ValueError):
+                continue
+            res = self._resources.get(res_name)
+            if res is None:
+                continue
+            try:
+                res.release(amount)
+            except Exception as e:
+                logger.warning(
+                    f"Error releasing resource '{res_name}' for {uid or 'unknown'}: {e}"
+                )
+
+    def suspend_resource(self, name: str, seconds: float) -> bool:
+        """挂起指定资源。"""
+        res = self._resources.get(name)
+        if res is None:
+            logger.warning(f"Cannot suspend unknown resource '{name}'")
+            return False
+        res.suspend(seconds)
+        return True
+
+    def can_acquire_worker(self, amount: float = 1.0) -> Tuple[bool, float]:
+        """检查工作者槽位可用性。"""
+        worker_res = self._resources.get(WORKER_RESOURCE)
+        if worker_res is None:
+            return True, 0.0
+        return worker_res.can_acquire(amount)
+
+    def collect_suspensions(
+        self,
+        now_mono: Optional[float] = None,
+        now_wall: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """收集当前所有资源的挂起截止（挂钟时间戳，用于跨崩溃持久化）。"""
+        if now_mono is None:
+            now_mono = time.monotonic()
+        if now_wall is None:
+            now_wall = time.time()
+        suspensions: Dict[str, float] = {}
+        for res_name, res in self._resources.items():
+            deadline = res.suspended_until()
+            if deadline is not None and deadline > now_mono:
+                remaining = deadline - now_mono
+                suspensions[res_name] = now_wall + remaining
+        return suspensions
+
+    def restore_suspensions(
+        self,
+        suspensions: Mapping[str, float],
+        now_wall: Optional[float] = None,
+    ) -> None:
+        """从挂钟时间戳恢复资源挂起状态。"""
+        if now_wall is None:
+            now_wall = time.time()
+        for name, wall_deadline in suspensions.items():
+            if not isinstance(wall_deadline, (int, float)) or isinstance(wall_deadline, bool):
+                logger.warning(f"Suspension restore: invalid non-numeric deadline for {name!r}, ignoring")
+                continue
+            if not math.isfinite(wall_deadline):
+                logger.warning(f"Suspension restore: non-finite deadline for {name!r}, ignoring")
+                continue
+            remaining = wall_deadline - now_wall
+            if remaining <= 0:
+                continue
+            if name not in self._resources:
+                logger.warning(
+                    f"Suspension restore: resource '{name}' not found on pipeline, ignoring"
+                )
+                continue
+            self._resources[name].suspend(remaining)
+
+
+__all__ = [
+    "Resource",
+    "RateLimitResource",
+    "CapacityResource",
+    "ResourceEvaluation",
+    "ResourceManager",
+    "WORKER_RESOURCE",
+]
+

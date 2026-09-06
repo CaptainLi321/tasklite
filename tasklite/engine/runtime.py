@@ -37,6 +37,7 @@ from .failure import (
     DEP_GRACE_SECONDS,
 )
 from .policy import PreflightPolicy
+from .resource import Resource, ResourceManager, WORKER_RESOURCE
 from ..models.state import PipelineState
 from ..utils.jsonutil import dumps
 
@@ -185,8 +186,13 @@ class RunContext:
         self.name = name
         self.backend = backend
         self.scheduler = scheduler
-        self.resources = resources
         self.handlers = handlers
+        if isinstance(resources, ResourceManager):
+            self.resource_mgr = resources
+            self.resources = resources
+        else:
+            self.resource_mgr = ResourceManager(resources, handlers=handlers)
+            self.resources = self.resource_mgr
         self.executor = executor
         self.ipc_dir = ipc_dir
         self.output_root = output_root
@@ -279,19 +285,7 @@ class RunContext:
         全部无挂起时写空映射清除旧数据。失败 error 级日志（与
         last_run_id 的 fail-loud 策略对齐——静默丢失正是要消除的）。
         """
-        now = time.monotonic()
-        wall_now = time.time()
-        deadlines = {}
-        for res_name, res in self.resources.items():
-            # 统一协议访问器 suspended_until（防新增 Resource 实现
-            # 静默漏持久化）
-            deadline = res.suspended_until()
-            if deadline is None:
-                continue
-            remaining = deadline - now
-            if remaining <= 0:
-                continue
-            deadlines[res_name] = wall_now + remaining
+        deadlines = self.resource_mgr.collect_suspensions()
         try:
             self.backend.set_meta(META_RESOURCE_SUSPENDS, dumps(deadlines))
         except Exception as e:

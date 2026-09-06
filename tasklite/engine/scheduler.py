@@ -8,8 +8,12 @@ actual acquisition happens in the pipeline after the job is popped.
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Tuple, Union, TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from ..models.handler import HandlerEntry
+
+from .resource import Resource, ResourceManager, ResourceEvaluation
 from .runtime import RT_BACKOFF_UNTIL
 from ..models.job import Job
 
@@ -78,27 +82,18 @@ class ScheduleResult:
 class JobScheduler:
     """Read-only scanner that locates the next runnable job in the queue."""
 
-    def __init__(self, resources: Dict[str, "Resource"], handlers: Optional[Dict[str, "HandlerEntry"]] = None):
-        self.resources = resources
-        # handler 注册表（task_type -> HandlerEntry）的引用，用于把
-        # handler 默认资源合并进扫描的资源检查（调度器必须看到
-        # 与 _dispatch_job 实际 acquire 完全一致的资源集，否则 handler 注册前
-        # 入队的作业会绕过限速/容量检查）。
-        # 不能写 `handlers or {}`——空 dict 是 falsy，or 会换成
-        # **新**空 dict，register_handler 的写入对 scheduler 不可见（handler
-        # 默认资源从扫描资源集消失）。
-        self.handlers = handlers if handlers is not None else {}
-        # Job 反序列化缓存——pop_next_runnable 每轮对每条 job_dict
-        # 全量 Job.from_dict（含全部字段校验），W 槽位填池 = W×N 次解析；
-        # 万级队列 + 高完成频率下纯烧 CPU。
-        # 缓存键为内容键 (task_type, job_id)——id(job_dict) 键有
-        # id-reuse-after-free 风险：dict 被 pop 释放后地址
-        # 可被新队列条目复用，cached_job 返回陈旧 Job → 调度决策错误；
-        # 内容键天然免疫地址复用。queue 中 uid 唯一（_queue_uids set），
-        # (task_type, job_id) 与 uid 一一对应，无碰撞。
-        # 缓存值为不可变 JobFacts（调度投影）——
-        # 缓存不透出、可变字段走活 dict、派发重解析三重约定中的前两重
-        # 由不可变类型直接保证。
+    def __init__(
+        self,
+        resources: Union[Dict[str, "Resource"], ResourceManager],
+        handlers: Optional[Dict[str, "HandlerEntry"]] = None,
+    ):
+        if isinstance(resources, ResourceManager):
+            self.resource_mgr = resources
+            self.resources = resources
+        else:
+            self.resources = resources
+            self.resource_mgr = ResourceManager(resources, handlers=handlers)
+        self.handlers = handlers if handlers is not None else getattr(self.resource_mgr, "handlers", {})
         self._job_cache: Dict[Tuple[str, str], JobFacts] = {}
         self._JOB_CACHE_MAX = 100_000
 
@@ -170,20 +165,12 @@ class JobScheduler:
         return list(job.depends_on) == job_dep and cached_res == job_res
 
     def _effective_resources(self, job) -> Dict[str, float]:
-        """job 实际会 acquire 的资源集 = handler 默认资源 ∪ job 自身 resources。
-
-        接受 ``JobFacts``（扫描路径）或 ``Job``（测试/兼容直调）——两者都有
-        ``task_type``/``resources`` 只读字段。
-        """
+        """job 实际会 acquire 的资源集（委托给 ResourceManager 单点真相源）。"""
         if isinstance(job, JobFacts):
             job_resources = job.resource_map()
         else:
             job_resources = dict(job.resources)
-        entry = self.handlers.get(job.task_type)
-        defaults = entry.default_resources if entry is not None else {}
-        if not defaults:
-            return job_resources
-        return {**defaults, **job_resources}
+        return self.resource_mgr.effective_resources(job.task_type, job_resources)
 
     def pop_next_runnable(
         self,
@@ -237,61 +224,39 @@ class JobScheduler:
                         break
 
             if failed_dependency:
-                # 不在此 break——排在 dep-failed job 后面的**可运行** job
-                # 本轮会失去调度机会（且 malformed/impossible 等归因信息收集
-                # 被截断）。记录首个 pending_dep_failure，继续扫描：优先把
-                # 可运行 job 挑出来；若整轮没有可运行 job，runnable_idx 落回
-                # 最后一个 dep-failed 位置（_dispatch_job 会处理它）。
+                # 记录首个 pending_dep_failure，继续扫描优先挑出可运行 job
                 if pending_dep_failure is None:
                     pending_dep_failure = failed_dependency
                     dep_failed_idx = i
                 continue
 
-            # 2. Unknown resource detection (permanent deadlock regardless of dependencies)
-            # 用合并后资源集检查（含 handler 默认资源），与 _dispatch_job 的 acquire 一致
-            eff_resources = self._effective_resources(job)
-            for res_name in eff_resources:
-                if res_name not in self.resources:
-                    logger.error(f"Job {job.uid} references unknown resource '{res_name}'.")
-                    unknown_resource_indices.append(i)
-                    min_wait = float('inf')  # Deadlock: Unknown resource
-                    can_run = False
-                    break
-
-            # 3. Missing dependency: not runnable
+            # 2. Missing dependency: not runnable
             if job.depends_on:
                 for dep_uid in job.depends_on:
                     if dep_uid not in wall_data:
                         can_run = False
                         waiting_for_dependency = True
-                        # 不在第一个缺失依赖处 break——排在前面
-                        # 的 pending 依赖会遮蔽后面真正缺失的依赖（死锁漏检
-                        # → 无限轮询）。逐个检查全部依赖，把「不在 wall 也
-                        # 不在 queue/in-flight」的依赖全部记录为 missing。
                         if dep_uid not in pending_or_running:
                             missing_dependency_indices.append(i)
+
+            # 3. 资源评估（unknown / impossible / wait_time 由 ResourceManager 深模块统一裁决）
+            eval_res = self.resource_mgr.evaluate(job.task_type, job.resources)
+            if eval_res.is_unknown:
+                logger.error(f"Job {job.uid} references unknown resource '{eval_res.unknown_name}'.")
+                unknown_resource_indices.append(i)
+                min_wait = float('inf')  # Deadlock: Unknown resource
+                can_run = False
+            elif eval_res.is_impossible:
+                impossible_resource_indices.append(i)
+                can_run = False
+            elif not eval_res.is_available:
+                can_run = False
+                min_wait = min(min_wait, eval_res.wait_time)
 
             if not can_run:
                 continue
 
-            # 4. Resource availability（必须在本轮检查，
-            # 不能因退避跳过——否则退避中的 job 引用的 unknown/impossible
-            # 资源死锁会被无限推迟到退避结束）
-            for res_name, amount in eff_resources.items():
-                ok, wait_time = self.resources[res_name].can_acquire(amount)
-                if ok:
-                    continue
-                can_run = False
-                if wait_time == float('inf'):
-                    # 不可达资源（amount > capacity）→ 永久死锁，细粒度记录
-                    impossible_resource_indices.append(i)
-                else:
-                    min_wait = min(min_wait, wait_time)
-
-            # 5. Backoff — 复用循环顶部的 now 值，避免双重 time.monotonic 调用。
-            # 类型防御：脏数据（字符串等非数值 _backoff_until）直接视为无退避，
-            # 避免加载期崩溃（_run_body 只清理数值脏数据）。
-            # 注意：退避只影响「本轮可运行」，不影响上述资源死锁归因。
+            # 4. Backoff — 复用循环顶部的 now 值，避免双重 time.monotonic 调用
             raw_rt = job_dict.get("runtime")
             _backoff = raw_rt.get(RT_BACKOFF_UNTIL) if isinstance(raw_rt, dict) else None
             if isinstance(_backoff, (int, float)) and _backoff > now:

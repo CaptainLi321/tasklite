@@ -254,26 +254,13 @@ class DispatchMachine:
             except OSError:
                 pass
 
-        # 合并 handler 默认 resources（确保 handler 注册前入队的
-        # job 也能拿到默认资源）。合并结果落在局部
-        # dict，**不回写 Job 对象**——与 runtime.inject_worker_resource
-        # 同纪律：Job 是调用方资产，派发侧不得改变其字段（否则 requeue/
-        # 复用同一 Job 实例时默认资源被永久烤入并随 to_dict 扩散）。
-        merged_resources = dict(job.resources)
-        handler_default_resources = self._ctx.handlers[job.task_type].default_resources
-        if handler_default_resources:
-            merged_resources = {**handler_default_resources, **merged_resources}
-
-        # Acquire resources (transactional: release on partial failure)
-        # acquire 循环必须在 try 块内——若第 N 个资源 acquire 抛异常
-        # （负值/NaN/自定义 Resource 校验失败），except 处理器会释放已 acquire
-        # 的前 N-1 个资源，避免永久泄漏。
+        # Acquire resources（由 ResourceManager 深模块统一事务性合并与获取）
         acquired: List[Tuple[str, float]] = []
         handle: Optional[JobHandle] = None
         try:
-            for res_name, amount in merged_resources.items():
-                self._ctx.resources[res_name].acquire(amount)
-                acquired.append((res_name, amount))
+            acquired = self._ctx.resource_mgr.acquire_effective(
+                job.task_type, job.resources
+            )
 
             # Payload validation
             _handler_entry = self._ctx.handlers[job.task_type]
