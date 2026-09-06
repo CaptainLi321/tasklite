@@ -64,7 +64,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         new_meta["_attempt"] = prev_attempts + 1
 
         if "error_type" not in new_meta:
-            new_meta["error_type"] = classify_error_type(new_meta.get("error", "unknown"))
+            new_meta["error_type"] = classify_error_type(new_meta)
 
         if "failed_at" not in new_meta:
             new_meta["failed_at"] = datetime.now(timezone.utc).isoformat()
