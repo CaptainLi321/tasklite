@@ -455,6 +455,47 @@ class StateStore:
 
     # ── 3. 死锁归因与宽限分析 ────────────────────────────────────────────
 
+    def _extract_deadlock_uids(self, sched: Any, field_name: str, index_name: str) -> Set[str]:
+        """统一提取归因 UID 集合（优先从 attribution/uids 属性直读，兜底按 index 反查）。"""
+        attr = getattr(sched, "attribution", None)
+        if attr is not None and hasattr(attr, field_name):
+            uids = getattr(attr, field_name)
+            if uids:
+                return set(uids)
+        if hasattr(sched, field_name):
+            uids = getattr(sched, field_name)
+            if uids:
+                return set(uids)
+        if hasattr(sched, index_name):
+            indices = getattr(sched, index_name)
+            if indices:
+                res: Set[str] = set()
+                for i in indices:
+                    if 0 <= i < len(self._state.queue):
+                        try:
+                            res.add(uid_from_job_dict(self._state.queue[i]))
+                        except Exception:
+                            pass
+                return res
+        return set()
+
+    @staticmethod
+    def _split_deadlock_by_uids(
+        queue: List[Dict[str, Any]],
+        target_uids: Set[str],
+        error: str,
+    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Dict[str, Any]]]:
+        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」（O(1) UID 集合判定）。"""
+        uids_metas: List[Tuple[str, Dict[str, Any]]] = []
+        remaining_queue: List[Dict[str, Any]] = []
+        for jd in queue:
+            uid = uid_from_job_dict(jd)
+            if uid in target_uids:
+                uids_metas.append((uid, {"error": error, "root_cause": True}))
+            else:
+                remaining_queue.append(jd)
+        return uids_metas, remaining_queue
+
     @staticmethod
     def _split_deadlock(
         queue: List[Dict[str, Any]],
@@ -463,7 +504,7 @@ class StateStore:
         extract_uid: Callable[[Dict[str, Any]], str],
         include: Callable[[int, str], bool],
     ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Dict[str, Any]]]:
-        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」。"""
+        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」（向后兼容签名）。"""
         uids_metas: List[Tuple[str, Dict[str, Any]]] = []
         remaining_queue: List[Dict[str, Any]] = []
         for idx, jd in enumerate(queue):
@@ -476,7 +517,7 @@ class StateStore:
 
     def _dependency_grace(
         self,
-        missing_indices: Sequence[int],
+        missing_identifiers: Union[Sequence[int], Set[str], Sequence[str]],
         *,
         ctx: Optional[Any] = None,
         scheduler: Optional[Any] = None,
@@ -484,15 +525,19 @@ class StateStore:
     ) -> bool:
         """宽限：缺失依赖的 job 是否应等待而非立即 DLQ。"""
         effective_ctx = ctx or self._ctx
-        missing_set = set(missing_indices)
         state = self._state
         missing_uids: Set[str] = set()
-        for i in missing_indices:
-            if 0 <= i < len(state.queue):
+        for item in missing_identifiers:
+            if isinstance(item, str):
+                missing_uids.add(item)
+            elif isinstance(item, int) and 0 <= item < len(state.queue):
                 try:
-                    missing_uids.add(Job.from_dict(state.queue[i]).uid)
+                    missing_uids.add(uid_from_job_dict(state.queue[item]))
                 except (KeyError, TypeError, ValueError):
                     pass
+
+        if not missing_uids:
+            return False
 
         episode = getattr(effective_ctx, "episode", None) if effective_ctx is not None else None
         if episode is not None:
@@ -502,8 +547,9 @@ class StateStore:
             if hasattr(effective_ctx, "dep_grace_seconds"):
                 grace_seconds = effective_ctx.dep_grace_seconds
 
-        for i, jd in enumerate(state.queue):
-            if i in missing_set:
+        for jd in state.queue:
+            uid = uid_from_job_dict(jd)
+            if uid in missing_uids:
                 continue
             try:
                 if scheduler is None and effective_ctx is not None and hasattr(effective_ctx, "scheduler"):
@@ -522,7 +568,7 @@ class StateStore:
                     if episode is not None:
                         episode.dep_grace_deadline = deadline
                     logger.warning(
-                        f"DEPENDENCY GRACE: {len(missing_indices)} job(s) waiting "
+                        f"DEPENDENCY GRACE: {len(missing_uids)} job(s) waiting "
                         f"on missing deps; granting {grace_seconds}s "
                         f"grace (runnable job(s) may spawn them)."
                     )
@@ -530,7 +576,7 @@ class StateStore:
                     time.sleep(0.5)
                     return True
                 logger.error(
-                    f"DEPENDENCY GRACE EXPIRED: {len(missing_indices)} job(s) "
+                    f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
                     f"still waiting on missing deps after "
                     f"{grace_seconds}s; treating as deadlock (DLQ)."
                 )
@@ -587,50 +633,39 @@ class StateStore:
             if hasattr(effective_ctx, "deadlock_gap_max_rounds"):
                 deadlock_gap_max_rounds = effective_ctx.deadlock_gap_max_rounds
 
-        if sched.malformed_indices:
-            logger.error(f"Deadlock: {len(sched.malformed_indices)} job(s) have malformed dict (unparseable).")
-            root = set(sched.malformed_indices)
-            uids_metas, remaining_queue = self._split_deadlock(
-                list(state.queue),
-                ERR_MALFORMED_JOB,
-                extract_uid=uid_from_job_dict,
-                include=lambda idx, uid, root=root: idx in root,
+        malformed_uids = self._extract_deadlock_uids(sched, "malformed_uids", "malformed_indices")
+        unknown_uids = self._extract_deadlock_uids(sched, "unknown_resource_uids", "unknown_resource_indices")
+        missing_uids = self._extract_deadlock_uids(sched, "missing_dependency_uids", "missing_dependency_indices")
+        impossible_uids = self._extract_deadlock_uids(sched, "impossible_resource_uids", "impossible_resource_indices")
+
+        if malformed_uids:
+            logger.error(f"Deadlock: {len(malformed_uids)} job(s) have malformed dict (unparseable).")
+            uids_metas, remaining_queue = self._split_deadlock_by_uids(
+                list(state.queue), malformed_uids, ERR_MALFORMED_JOB
             )
-        elif sched.unknown_resource_indices:
-            logger.error(f"Deadlock: {len(sched.unknown_resource_indices)} job(s) reference unknown resource(s).")
-            root = set(sched.unknown_resource_indices)
-            uids_metas, remaining_queue = self._split_deadlock(
-                list(state.queue),
-                ERR_RESOURCE_DEADLOCK,
-                extract_uid=lambda jd: Job.from_dict(jd).uid,
-                include=lambda idx, uid, root=root: idx in root,
+        elif unknown_uids:
+            logger.error(f"Deadlock: {len(unknown_uids)} job(s) reference unknown resource(s).")
+            uids_metas, remaining_queue = self._split_deadlock_by_uids(
+                list(state.queue), unknown_uids, ERR_RESOURCE_DEADLOCK
             )
-        elif sched.missing_dependency_indices:
+        elif missing_uids:
             if self._dependency_grace(
-                sched.missing_dependency_indices,
+                missing_uids,
                 ctx=effective_ctx,
                 scheduler=scheduler,
                 grace_seconds=dep_grace_seconds,
             ):
                 return False
-            logger.error(f"Deadlock: {len(sched.missing_dependency_indices)} job(s) have unresolvable (missing) dependencies.")
-            root = set(sched.missing_dependency_indices)
-            uids_metas, remaining_queue = self._split_deadlock(
-                list(state.queue),
-                ERR_DEPENDENCY_DEADLOCK,
-                extract_uid=lambda jd: Job.from_dict(jd).uid,
-                include=lambda idx, uid, root=root: idx in root,
+            logger.error(f"Deadlock: {len(missing_uids)} job(s) have unresolvable (missing) dependencies.")
+            uids_metas, remaining_queue = self._split_deadlock_by_uids(
+                list(state.queue), missing_uids, ERR_DEPENDENCY_DEADLOCK
             )
-        elif sched.impossible_resource_indices:
-            logger.error(f"Deadlock: {len(sched.impossible_resource_indices)} job(s) request impossible resource amounts (exceeds capacity).")
-            root = set(sched.impossible_resource_indices)
-            uids_metas, remaining_queue = self._split_deadlock(
-                list(state.queue),
-                ERR_RESOURCE_DEADLOCK,
-                extract_uid=lambda jd: Job.from_dict(jd).uid,
-                include=lambda idx, uid, root=root: idx in root,
+        elif impossible_uids:
+            logger.error(f"Deadlock: {len(impossible_uids)} job(s) request impossible resource amounts (exceeds capacity).")
+            uids_metas, remaining_queue = self._split_deadlock_by_uids(
+                list(state.queue), impossible_uids, ERR_RESOURCE_DEADLOCK
             )
-        elif sched.waiting_for_dependency:
+        elif getattr(sched, "waiting_for_dependency", False):
             cycle_uids = set(state.find_dependency_cycles())
             if not cycle_uids:
                 escalated = self._deadlock_gap_or_escalate(
@@ -641,7 +676,7 @@ class StateStore:
                 if not escalated:
                     return False
                 uids_metas = [
-                    (Job.from_dict(jd).uid,
+                    (uid_from_job_dict(jd),
                      {"error": ERR_DEADLOCK_GAP, "root_cause": True})
                     for jd in state.queue
                 ]
@@ -651,11 +686,8 @@ class StateStore:
                     f"Deadlock detected: dependency cycle among {len(cycle_uids)} job(s): "
                     f"{sorted(cycle_uids)}"
                 )
-                uids_metas, remaining_queue = self._split_deadlock(
-                    list(state.queue),
-                    ERR_DEPENDENCY_DEADLOCK,
-                    extract_uid=lambda jd: Job.from_dict(jd).uid,
-                    include=lambda idx, uid, roots=cycle_uids: uid in roots,
+                uids_metas, remaining_queue = self._split_deadlock_by_uids(
+                    list(state.queue), cycle_uids, ERR_DEPENDENCY_DEADLOCK
                 )
         else:
             escalated = self._deadlock_gap_or_escalate(
@@ -666,7 +698,7 @@ class StateStore:
             if not escalated:
                 return False
             uids_metas = [
-                (Job.from_dict(jd).uid,
+                (uid_from_job_dict(jd),
                  {"error": ERR_DEADLOCK_GAP, "root_cause": True})
                 for jd in state.queue
             ]
