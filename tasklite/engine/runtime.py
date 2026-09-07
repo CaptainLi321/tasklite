@@ -148,6 +148,8 @@ class StepOutcome:
     wait_time: float
     deadlock_detected: bool
     stop_mode: StopMode
+    should_terminate: bool = False
+    exit_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -543,48 +545,13 @@ class EngineRuntime:
         )
 
     def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
-        """单步推进事件泵（确定性步进测试接缝）。"""
+        """单步推进事件泵（确定性步进测试接缝，与生产主循环 100% 同构）。"""
         if self._ctx.state is None:
             # 自动初始化测试状态
             self._ctx.run_id = self._ctx.run_id or uuid.uuid4().hex
             self._ctx.set_state(PipelineState({}, {}, {}, []))
 
-        # 1. Drain 回收
-        handles = [entry.handle for entry in self._ctx.in_flight.values() if entry.handle is not None]
-        completed_pairs = self._ctx.channel.poll_completed(handles)
-        for handle, result in completed_pairs:
-            entry = self._ctx.in_flight.pop(handle.uid, None)
-            if entry is not None:
-                self._completion.apply_result(
-                    handle.uid, entry.job, entry.job_dict, result, job_start=entry.start_time
-                )
-
-        # 2. 填池派发
-        dispatched = 0
-        limit = max_dispatch if max_dispatch is not None else 1000
-        while dispatched < limit and self._ctx.stop_mode == StopMode.NONE:
-            ok, _ = self._ctx.resource_mgr.can_acquire_worker(1.0)
-            if not ok:
-                break
-            sched = self.scheduler.pop_next_runnable(
-                self._ctx.state, self._ctx.state.in_flight_uids
-            )
-            if sched.runnable_idx is None:
-                break
-            entry = self._dispatch.dispatch_job(sched)
-            if entry is not None:
-                dispatched += 1
-
-        is_idle = self._ctx.state.is_empty and not self._ctx.in_flight
-        return StepOutcome(
-            dispatched_count=dispatched,
-            completed_count=len(completed_pairs),
-            is_idle=is_idle,
-            should_wait=not is_idle and dispatched == 0,
-            wait_time=0.0,
-            deadlock_detected=False,
-            stop_mode=self._ctx.stop_mode,
-        )
+        return self._loop.step(max_dispatch=max_dispatch)
 
     def prepare_run_state(self) -> PipelineState:
         """加载持久化状态、初始化 run_id 屏障、执行恢复修复并构建内存 PipelineState。"""
