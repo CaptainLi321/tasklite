@@ -19,35 +19,13 @@ from .engine.runtime import (
     inject_worker_resource,
 )
 from .engine.scheduler import JobScheduler
-from .engine.store import StateStore
+from .engine.store import DLQEntry, StateStore
 from .exceptions import _CommitCrashSignal, _JobTerminated
-from .models.context import TaskContext
 from .models.job import Job
-from .models.state import PipelineState, uid_from_job_dict
-from .taxonomy import ErrorTaxonomy, TransientRegistry, validate_resource_amounts
-from .utils.jsonutil import dumps, loads
+from .taxonomy import ErrorTaxonomy, validate_resource_amounts
+from .utils.jsonutil import dumps
 
 logger = logging.getLogger("tasklite")
-
-
-class DLQEntry(NamedTuple):
-    """DLQ 只读查询（``pipeline.list_dlq()``）返回的结构化条目。
-
-    - ``error_type``：结构化分类（fatal / dependency / deadlock /
-      transient_exhausted / no_handler / validation / commit_failure /
-      dispatch / unknown）。
-    - ``error``：原始错误消息/错误码。
-    - ``attempts``：写入 DLQ 的次数（``_attempt`` 计数）。
-    - ``failed_at``：最近一次失败时间（UTC ISO 8601；历史行可能为 None）。
-    - ``meta``：完整 DLQ payload（只读视图）。
-    """
-
-    uid: str
-    error_type: str
-    error: str
-    attempts: int
-    failed_at: Optional[str]
-    meta: Dict[str, Any]
 
 
 class HandlerEntry(NamedTuple):
@@ -615,43 +593,9 @@ class TaskLite:
             logger.info(f"Enqueued {len(inserted)} job(s).")
 
     def list_dlq(self) -> List[DLQEntry]:
-        """只读查询 DLQ，返回结构化条目（uid / error_type / error / attempts / failed_at / meta）。
-
-        error_type 分类：fatal（FatalError）/ dependency（级联）/
-        deadlock / transient_exhausted（重试耗尽）/ no_handler /
-        validation / commit_failure / dispatch / unknown（见 ``backend.base.classify_error_type``）。
-        只读，不改变任何状态；仅限 run() 之外调用。
-        """
+        """只读查询 DLQ，返回结构化条目。委托 StateStore。"""
         self._ensure_not_running("list_dlq")
-        failed = self.backend.load_failed()
-        entries: List[DLQEntry] = []
-        for uid, meta in sorted(failed.items()):
-            if not isinstance(meta, dict):
-                # 与 classify_error_type 同款防御：手改/遗留损坏行不炸掉整个
-                # 排障工具——合法 JSON 标量（"boom"/42/true
-                # 等）也要兜底：dict(标量) 会抛 TypeError/ValueError，此处
-                # 统一按未知分类展示，排障者可修复。
-                entries.append(DLQEntry(
-                    uid=uid,
-                    error_type=classify_error_type(meta),
-                    error="",
-                    attempts=0,
-                    failed_at=None,
-                    meta={},
-                ))
-                continue
-            attempts = meta.get("_attempt", 0)
-            if not isinstance(attempts, int):
-                attempts = 0  # 非 int 的 _attempt（手改/遗留行）不炸 list_dlq()
-            entries.append(DLQEntry(
-                uid=uid,
-                error_type=classify_error_type(meta),
-                error=str(meta.get("error", "")),
-                attempts=attempts,
-                failed_at=meta.get("failed_at"),
-                meta=dict(meta),
-            ))
-        return entries
+        return self.store.list_dlq()
 
     def clear_dlq(
         self,
@@ -659,38 +603,9 @@ class TaskLite:
         *,
         keep_fatal: bool = True,
     ) -> int:
-        """从 DLQ 删除匹配条目（默认保留 fatal=true 的确定性失败），返回删除数。
-
-        清除 = 删 DLQ + 调用方随后 enqueue 同名任务重跑（is_known 不再
-        把该 uid 算「已知」）。``task_types`` 过滤只删这些 task_type 前缀的
-        条目（str 列表/tuple）；None = 全部。``keep_fatal=False`` 连 FatalError
-        条目一并删除。仅限 run() 之外调用（改变 is_known 判定基础，与 enqueue 同纪律）。
-        """
+        """从 DLQ 删除匹配条目。委托 StateStore。"""
         self._ensure_not_running("clear_dlq")
-        if task_types is not None:
-            if not isinstance(task_types, (list, tuple)):
-                raise TypeError(
-                    f"task_types must be a list/tuple of str or None, "
-                    f"got {type(task_types).__name__}"
-                )
-            for t in task_types:
-                if not isinstance(t, str) or not t:
-                    raise TypeError(
-                        f"task_types must contain only non-empty str, got {t!r}"
-                    )
-            task_types = list(task_types)
-        failed = self.backend.load_failed()
-        to_delete = [
-            uid for uid, meta in failed.items()
-            if (task_types is None
-                or any(uid.startswith(t + "::") for t in task_types))
-            # 非 dict 损坏行（合法 JSON 标量）不炸 revive——
-            # 无 fatal 标志可读，按「可删除」处理（删除本身就是修复手段）。
-            and not (keep_fatal and isinstance(meta, dict) and meta.get("fatal"))
-        ]
-        if not to_delete:
-            return 0
-        return self.backend.delete_failed(to_delete)
+        return self.store.clear_dlq(task_types, keep_fatal=keep_fatal)
 
     def clear_history(
         self,
@@ -698,95 +613,19 @@ class TaskLite:
         *,
         where: Sequence[str] = ("wall", "failed"),
     ) -> int:
-        """从 wall 和/或 DLQ 删除条目——「误删文件强制重下」「历史垃圾清理」的官方通道。
-
-        ``targets``：str 或 str 列表。完整 uid 精确删除；**以 ``::``
-        结尾的字符串按前缀匹配**（如 ``"download::"`` 删全部 download 任务）
-        ——防止 ``"download"`` 误匹配 ``"downloads::"``（前缀误匹配痛点 ）。
-        ``where``：含 ``"wall"`` / ``"failed"`` 的序列，默认两者都清。
-        返回删除总数。仅限 run() 之外调用（改变 is_known 判定基础）。
-        """
+        """从 wall 和/或 DLQ 删除条目。委托 StateStore。"""
         self._ensure_not_running("clear_history")
-        if isinstance(targets, str):
-            patterns = [targets]
-        elif isinstance(targets, (list, tuple)):
-            patterns = list(targets)
-        else:
-            raise TypeError(
-                f"targets must be a str or a list/tuple of str, "
-                f"got {type(targets).__name__}"
-            )
-        for p in patterns:
-            if not isinstance(p, str):
-                raise TypeError(
-                    f"targets must contain only str, got {type(p).__name__} ({p!r})"
-                )
-        if not isinstance(where, (list, tuple)):
-            raise TypeError(
-                f"where must be a sequence of 'wall'/'failed', got {type(where).__name__}"
-            )
-        where_set = set(where)
-        unknown = where_set - {"wall", "failed"}
-        if unknown:
-            raise ValueError(
-                f"where contains unknown target(s): {sorted(unknown)!r}; "
-                f"allowed: 'wall', 'failed'"
-            )
-
-        def _matches(uid: str) -> bool:
-            return any(
-                uid == p or (p.endswith("::") and uid.startswith(p))
-                for p in patterns
-            )
-
-        total = 0
-        if "wall" in where:
-            wall = self.backend.load_wall()
-            matched = [u for u in wall if _matches(u)]
-            if matched:
-                total += self.backend.delete_wall(matched)
-        if "failed" in where:
-            failed = self.backend.load_failed()
-            matched = [u for u in failed if _matches(u)]
-            if matched:
-                total += self.backend.delete_failed(matched)
-        return total
+        return self.store.clear_history(targets, where=where)
 
     def seed_wall(self, uids: Sequence[str]) -> int:
-        """把 uid 批量写入 wall（存档迁移标记「已处理」），返回实际写入数。
-
-        媒体/数据资产存档迁移（硬链接 + wall 种子）从此不用裸 SQL。
-        uid 必须为 ``"task_type::job_id"`` 形式 str，且 task_type/job_id 均
-        非空、不含额外 ``::``；meta 为空 dict。仅限 run() 之外调用。
-        """
+        """把 uid 批量写入 wall。委托 StateStore。"""
         self._ensure_not_running("seed_wall")
-        if not isinstance(uids, (list, tuple)):
-            raise TypeError(
-                f"uids must be a list/tuple of str, got {type(uids).__name__}"
-            )
-        for u in uids:
-            if not isinstance(u, str) or u.count("::") != 1:
-                raise ValueError(
-                    f"seed_wall uid must be 'task_type::job_id' str with exactly "
-                    f"one '::' separator, got {u!r}"
-                )
-            task_type, job_id = u.split("::", 1)
-            if not task_type or not job_id:
-                raise ValueError(
-                    f"seed_wall uid must have non-empty task_type and job_id, got {u!r}"
-                )
-        return self.backend.seed_wall(list(uids))
+        return self.store.seed_wall(uids)
 
     def seed_cursor(self, key: str, value: str) -> None:
-        """预填一个 cursor（幂等）——存档迁移/进度书签恢复。
-
-        注意：discovery 的已见判定走 wall/failed（见
-        ``wrappers/discovery.py`` 头部），不再使用 cursor——「已见预填」请用
-        ``seed_wall``（把 process 任务的 uid 写入 wall）。本方法服务
-        通用业务 cursor（``ctx.get_cursor`` 可读）。仅限 run() 之外调用。
-        """
+        """预填一个 cursor。委托 StateStore。"""
         self._ensure_not_running("seed_cursor")
-        self.backend.seed_cursor(key, value)
+        self.store.seed_cursor(key, value)
 
     def _validate_resource_amounts(self, resources: Dict[str, float], where: str) -> None:
         """数值校验转发（与 Job.__init__ 共用 taxonomy 单点）。
