@@ -61,7 +61,7 @@ class TestInvariants:
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
         pipeline.run()
-        in_memory_uids = set(Job.from_dict(j).uid for j in pipeline._state.queue)
+        in_memory_uids = set(Job.from_dict(j).uid for j in pipeline.runtime.state.queue)
         on_disk_uids = set(Job.from_dict(j).uid for j in pipeline.backend.load_queue())
         assert in_memory_uids == on_disk_uids, (
             f"In-memory queue {in_memory_uids} != on-disk queue {on_disk_uids}"

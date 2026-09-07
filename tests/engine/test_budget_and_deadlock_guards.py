@@ -143,8 +143,9 @@ class TestMalformedNotMaskedByBackoff:
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
 
         # 直接构造 state + 主循环（绕过 enqueue 便于注入退避字段与畸形条目）
-        pipeline._state = PipelineState({}, {}, {}, [malformed, backing_off])
-        pipeline._run_loop()
+        state = PipelineState({}, {}, {}, [malformed, backing_off])
+        pipeline.runtime.ctx.set_state(state)
+        pipeline.runtime._run_loop()
 
         malformed_uid = uid_from_job_dict(malformed)
         failed = pipeline.backend.load_failed()

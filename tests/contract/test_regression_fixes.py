@@ -35,14 +35,15 @@ def test_crash_safe_save_recovers_popped_job(request, fixture_name):
 
     # 模拟 _dispatch_job 的 pop 之后、进入 try 之前命中 KeyboardInterrupt：
     # 作业已从内存队列弹出，未 commit、未 requeue、未注册 in-flight。
-    p._state = PipelineState(
+    state = PipelineState(
         p.backend.load_wall(), p.backend.load_failed(),
         p.backend.load_cursors(), p.backend.load_queue(),
     )
-    p._state.pop_job(0)
-    assert p._state.queue == []  # 内存已丢
+    p.runtime.ctx.set_state(state)
+    state.pop_job(0)
+    assert state.queue == []  # 内存已丢
 
-    p._save_queue_crash_safe()
+    p.runtime._recovery.save_queue_crash_safe()
 
     disk_q = p.backend.load_queue()
     assert any(uid_from_job_dict(jd) == job.uid for jd in disk_q), (
@@ -56,16 +57,17 @@ def test_crash_safe_save_dedups_double_requeue(pipeline_sqlite):
     job = Job("t", "a", payload={})
     p.enqueue([job])
 
-    p._state = PipelineState(
+    state = PipelineState(
         p.backend.load_wall(), p.backend.load_failed(),
         p.backend.load_cursors(), p.backend.load_queue(),
     )
+    p.runtime.ctx.set_state(state)
     # 模拟窗口：同一 job 被 requeue 两次
-    p._state.requeue_jobs([job.to_dict()], front=True)
-    p._state.requeue_jobs([job.to_dict()], front=True)
-    assert len(p._state.queue) == 3  # 磁盘原 1 + 重复 requeue 2
+    state.requeue_jobs([job.to_dict()], front=True)
+    state.requeue_jobs([job.to_dict()], front=True)
+    assert len(state.queue) == 3  # 磁盘原 1 + 重复 requeue 2
 
-    p._save_queue_crash_safe()
+    p.runtime._recovery.save_queue_crash_safe()
 
     disk_uids = [uid_from_job_dict(jd) for jd in p.backend.load_queue()]
     assert disk_uids.count(job.uid) == 1, (
@@ -86,7 +88,7 @@ def test_crash_safe_save_load_failure_preserves_disk(pipeline_sqlite, monkeypatc
     monkeypatch.setattr(p.backend, "save_queue", lambda q: calls.append(list(q)))
     monkeypatch.setattr(p.backend, "load_queue", lambda: (_ for _ in ()).throw(IOError("disk read error")))
 
-    p._save_queue_crash_safe()
+    p.runtime._recovery.save_queue_crash_safe()
 
     assert calls == [], f"load 失败不得触发覆盖保存: {calls}"
     # 磁盘原样保留（enqueue 落盘仍在，load 失败未覆盖）——用原始读法绕开 patch
@@ -140,7 +142,7 @@ def test_release_acquired_continues_after_single_failure(pipeline_sqlite):
     p.resources["boom"].acquire(1.0)
     p.resources["ok"].acquire(1.0)
 
-    p._release_acquired([("boom", 1.0), ("ok", 1.0)])
+    p.runtime._completion.release_acquired([("boom", 1.0), ("ok", 1.0)])
 
     assert p.resources["ok"].used == 0.0, "ok resource must still be released"
 

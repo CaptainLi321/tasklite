@@ -137,13 +137,13 @@ class TestCommitCrashSignalCleanup:
         pipeline.enqueue([Job("t", "j1", payload={})])
 
         aborted = []
-        original_abort = pipeline._recovery.abort_in_flight
+        original_abort = pipeline.runtime._recovery.abort_in_flight
 
         def spy_abort():
             aborted.append(True)
             return original_abort()
 
-        monkeypatch.setattr(pipeline._recovery, "abort_in_flight", spy_abort)
+        monkeypatch.setattr(pipeline.runtime._recovery, "abort_in_flight", spy_abort)
 
         # 模拟后端 commit 失败 → _commit_failed_crash → _CommitCrashSignal。
         # 先捕获真实后端引用（替换后 pipeline.backend 指向伪造对象自身，
@@ -436,13 +436,13 @@ class TestDeadlockBulkFailureCrashes:
         pipeline.enqueue([Job("t", "j1", depends_on=["t::j1"])])
 
         aborted = []
-        original_abort = pipeline._recovery.abort_in_flight
+        original_abort = pipeline.runtime._recovery.abort_in_flight
 
         def spy_abort():
             aborted.append(True)
             return original_abort()
 
-        monkeypatch.setattr(pipeline._recovery, "abort_in_flight", spy_abort)
+        monkeypatch.setattr(pipeline.runtime._recovery, "abort_in_flight", spy_abort)
         pipeline.backend = FailingBulkBackend(pipeline.backend.path)
 
         with pytest.raises(_CommitCrashSignal, match="commit_bulk_failure"):
@@ -807,7 +807,7 @@ class TestDispatchExceptionEntryRegistered:
         # 内存队列不得出现重复 uid（变异体：二次 requeue → 两条 t::j1）。
         # 注意：不能断言磁盘队列——_save_queue_crash_safe 按 uid 去重把
         # 重复条目合并成一条，变异体下磁盘仍为 1 条（断言被掩盖）。
-        q = pipeline._state.queue
+        q = pipeline.runtime.state.queue
         uids = [f"{jd['task_type']}::{jd['job_id']}" for jd in q]
         assert uids.count("t::j1") <= 1, f"队列不得出现重复 uid: {uids}"
 
@@ -855,9 +855,9 @@ class TestDispatchExceptionEntryRegistered:
         # _apply_result 身份断言崩 → 此处抛 AssertionError（测试红 = 变异体被杀）。
         pipeline.run()
 
-        # DLQ 分支必须从 _in_flight 移除 entry（变异体删 pop 后残留）
-        assert "t::j1" not in pipeline._in_flight, \
-            f"DLQ 分支必须移除 _in_flight entry: {list(pipeline._in_flight)}"
+        # DLQ 分支必须从 in_flight 移除 entry（变异体删 pop 后残留）
+        assert "t::j1" not in pipeline.runtime.ctx.in_flight, \
+            f"DLQ 分支必须移除 in_flight entry: {list(pipeline.runtime.ctx.in_flight)}"
         # job 进 DLQ（failed 集合 + 后端记录）
         failed = pipeline.backend.load_failed()
         assert "t::j1" in failed, f"3-strike 应 DLQ: {failed}"
@@ -999,8 +999,8 @@ class TestRunLoopJobTerminatedNet:
 
         aborted = []
         saved = []
-        original_abort = pipeline._recovery.abort_in_flight
-        original_save = pipeline._recovery.save_queue_crash_safe
+        original_abort = pipeline.runtime._recovery.abort_in_flight
+        original_save = pipeline.runtime._recovery.save_queue_crash_safe
 
         def spy_abort():
             aborted.append(True)
@@ -1010,14 +1010,14 @@ class TestRunLoopJobTerminatedNet:
             saved.append(True)
             return original_save()
 
-        monkeypatch.setattr(pipeline._recovery, "abort_in_flight", spy_abort)
-        monkeypatch.setattr(pipeline._recovery, "save_queue_crash_safe", spy_save)
+        monkeypatch.setattr(pipeline.runtime._recovery, "abort_in_flight", spy_abort)
+        monkeypatch.setattr(pipeline.runtime._recovery, "save_queue_crash_safe", spy_save)
 
         # 模拟未来新直调点漏承接：_JobTerminated 直接从 run 主体逃逸到承重网。
         # 后主循环实现迁至 engine/loop.py::LoopRunner——patch 其实现方法。
         def boom():
             raise _JobTerminated("job terminated outside expected handlers")
-        monkeypatch.setattr(pipeline._loop, "run_loop_impl", boom)
+        monkeypatch.setattr(pipeline.runtime._loop, "run_loop_impl", boom)
 
         # 修复后应按崩溃契约 fail-loud re-raise _JobTerminated，
         # 而非抛 NameError（原 bug：{e} 引用了未绑定的 e）。
@@ -1061,13 +1061,13 @@ class TestCascadeBulkFailureCrash:
         pipeline.enqueue([b, c])
 
         aborted = []
-        original_abort = pipeline._recovery.abort_in_flight
+        original_abort = pipeline.runtime._recovery.abort_in_flight
 
         def spy_abort():
             aborted.append(True)
             return original_abort()
 
-        monkeypatch.setattr(pipeline._recovery, "abort_in_flight", spy_abort)
+        monkeypatch.setattr(pipeline.runtime._recovery, "abort_in_flight", spy_abort)
         pipeline.backend = FailingBulkBackend(pipeline.backend.path)
 
         # 级联批量 DLQ 失败 → _commit_failed_crash → _CommitCrashSignal
