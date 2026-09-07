@@ -40,9 +40,9 @@ _Avoid_: Submitter, Launcher, DispatcherService
 Specialized machine handling subprocess result collection, output cleanup, resource release, and atomic backend commits.
 _Avoid_: Collector, ResultHandler, Finalizer
 
-**FailureMachine**:
-Specialized machine managing 3-strike crash contracts, cascade downstream failures, and deadlock attribution policies.
-_Avoid_: ErrorManager, DeadlockResolver, FailureHandler
+**StateStore**:
+Specialized deep module unifying memory state machines, transactional backend persistence, 3-strike crash contracts, cascade downstream failures, and deadlock attribution policies.
+_Avoid_: ErrorManager, DeadlockResolver, StateRepository
 
 **RecoveryMachine**:
 Specialized machine responsible for startup repairs, TOCTOU-safe aborting, and crash-safe queue persistence.

@@ -6,7 +6,6 @@ import pytest
 
 from tasklite.engine.dispatch import DispatchMachine, DispatchOutcome
 from tasklite.engine.runtime import RunContext
-from tasklite.engine.failure import FailureMachine
 from tasklite.engine.completion import CompletionMachine
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.resource import ResourceManager, CapacityResource
@@ -31,9 +30,8 @@ def test_dispatch_next_empty_queue(tmp_path):
         ipc_dir=str(tmp_path / "ipc"),
         output_root=str(tmp_path / "out"),
     )
-    failure = FailureMachine(ctx)
-    completion = CompletionMachine(ctx, failure)
-    dispatch = DispatchMachine(ctx, failure, completion)
+    completion = CompletionMachine(ctx)
+    dispatch = DispatchMachine(ctx, completion)
 
     outcome = dispatch.dispatch_next()
     assert outcome.entry is None
@@ -59,9 +57,8 @@ def test_dispatch_next_workers_exhausted(tmp_path):
         ipc_dir=str(tmp_path / "ipc"),
         output_root=str(tmp_path / "out"),
     )
-    failure = FailureMachine(ctx)
-    completion = CompletionMachine(ctx, failure)
-    dispatch = DispatchMachine(ctx, failure, completion)
+    completion = CompletionMachine(ctx)
+    dispatch = DispatchMachine(ctx, completion)
 
     outcome = dispatch.dispatch_next()
     assert outcome.entry is None

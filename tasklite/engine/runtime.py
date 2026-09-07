@@ -94,17 +94,17 @@ class TaskStats(dict):
         return self["cascade_failed"]
 
 
-from .failure import (
+from .store import (
     COMMIT_FAILURE_DLQ_THRESHOLD,
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
+    StateStore,
 )
 from .channel import ExecutionChannel
 from .inflight import InFlightTracker
 from .policy import PreflightPolicy
 from .resource import CapacityResource, Resource, ResourceManager
 from .scheduler import JobScheduler
-from .store import StateStore
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
@@ -237,6 +237,7 @@ class RunContext:
             self._backend,
             commit_failure_dlq_threshold=self.commit_failure_dlq_threshold,
             on_job_completed=lambda uid, meta, s, r: self.fire_job_completed(uid, meta, s, r),
+            ctx=self,
         )
         self.channel: ExecutionChannel = ExecutionChannel(
             self.ipc_dir,
@@ -250,6 +251,11 @@ class RunContext:
         self.stats: TaskStats = TaskStats()
         self.episode: EpisodeState = EpisodeState()
         self._run_end_fired = False
+
+    @property
+    def _failure(self) -> StateStore:
+        """向后兼容属性：委托给 StateStore。"""
+        return self.store
 
     @property
     def state(self) -> PipelineState:
@@ -362,7 +368,6 @@ class EngineRuntime:
     ) -> None:
         from .completion import CompletionMachine
         from .dispatch import DispatchMachine
-        from .failure import FailureMachine
         from .loop import LoopRunner
         from .recovery import RecoveryMachine
 
@@ -398,12 +403,11 @@ class EngineRuntime:
         )
 
         # 构建机器依赖拓扑
-        self._failure = FailureMachine(self._ctx)
-        self._completion = CompletionMachine(self._ctx, self._failure)
-        self._dispatch = DispatchMachine(self._ctx, self._failure, self._completion)
+        self._completion = CompletionMachine(self._ctx)
+        self._dispatch = DispatchMachine(self._ctx, self._completion)
         self._recovery = RecoveryMachine(self._ctx, self._completion)
         self._loop = LoopRunner(
-            self._ctx, self._recovery, self._dispatch, self._failure, self._completion
+            self._ctx, self._recovery, self._dispatch, self._completion
         )
 
         self._run_lock_fd: Optional[int] = None

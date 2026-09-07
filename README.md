@@ -313,19 +313,21 @@ pipeline.clear_history("download::")
 tasklite/
 ├── pipeline.py          # TaskLite / TaskLite 核心门面与配置
 ├── engine/              # 核心执行机器群
+│   ├── store.py         # 状态事务、3-strike 崩溃与死锁归因 (StateStore)
 │   ├── loop.py          # 主调度事件循环 (LoopRunner)
 │   ├── dispatch.py      # 任务派发状态机 (DispatchMachine)
 │   ├── completion.py    # 任务完成与提交 (CompletionMachine)
 │   ├── recovery.py      # 崩溃检测与恢复 (RecoveryMachine)
-│   ├── failure.py       # 失败收敛与死信归因 (FailureMachine)
+│   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel)
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler)
 │   ├── executor.py      # 子进程隔离执行器与看门狗
 │   └── resource.py      # 令牌桶限速与并发容量资源
 ├── backend/             # SQLite WAL 强一致事务持久化后端
 ├── models/              # Job / TaskContext / PipelineState 数据模型
+├── taxonomy.py          # 错误分类法与校验分类深模块 (ErrorTaxonomy)
 ├── wrappers/            # discovery.py（增量扫描）/ http.py（网络守卫与快照）
 ├── pipeline_util.py     # 通用脚手架（任务指纹 / 进度钩子 / 瞬态错误注册）
-└── utils/               # jsonutil (禁NaN) / lockfile / validation
+└── utils/               # jsonutil (禁NaN) / lockfile
 ```
 
 ---

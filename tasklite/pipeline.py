@@ -260,7 +260,6 @@ class TaskLite:
         # 运行上下文与拓扑机器均由 EngineRuntime 统一装配
         self._ctx = self._runtime.ctx
         self.scheduler = self._runtime.scheduler
-        self._failure = self._runtime._failure
         self._completion = self._runtime._completion
         self._dispatch = self._runtime._dispatch
         self._recovery = self._runtime._recovery
@@ -271,6 +270,16 @@ class TaskLite:
     def runtime(self) -> EngineRuntime:
         """核心运行期深模块接缝。"""
         return self._runtime
+
+    @property
+    def store(self) -> StateStore:
+        """状态与事务深模块。"""
+        return self._ctx.store
+
+    @property
+    def _failure(self) -> StateStore:
+        """向后兼容属性：委托给 StateStore。"""
+        return self._ctx.store
 
     @property
     def _run_started(self) -> bool:
