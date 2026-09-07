@@ -43,6 +43,7 @@ class DispatchOutcome:
     worker_wait: float = 0.0
     min_wait: float = 0.0
     waiting_for_dependency: bool = False
+    has_potential_spawners: bool = False
     deadlock_attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
     dispatched: bool = False
     handled: bool = False
@@ -97,6 +98,7 @@ class DispatchMachine:
                 worker_wait=0.0,
                 min_wait=sched.min_wait,
                 waiting_for_dependency=sched.waiting_for_dependency,
+                has_potential_spawners=sched.has_potential_spawners,
                 deadlock_attribution=sched.attribution,
                 dispatched=False,
                 handled=False,

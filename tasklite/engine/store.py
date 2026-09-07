@@ -638,6 +638,7 @@ class StateStore:
         self,
         missing_identifiers: Union[Sequence[int], Set[str], Sequence[str]],
         *,
+        has_potential_spawners: Optional[bool] = None,
         ctx: Optional[Any] = None,
         scheduler: Optional[Any] = None,
         grace_seconds: float = DEP_GRACE_SECONDS,
@@ -648,6 +649,7 @@ class StateStore:
         return gov.check_dependency_grace(
             self._state,
             missing_identifiers,
+            has_potential_spawners=has_potential_spawners,
             scheduler=effective_scheduler,
             grace_seconds=grace_seconds,
         )

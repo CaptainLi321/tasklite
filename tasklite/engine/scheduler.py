@@ -86,6 +86,7 @@ class ScheduleResult:
     pending_dep_failure: Optional[str] = None
     min_wait: float = float('inf')
     waiting_for_dependency: bool = False
+    has_potential_spawners: bool = False
     # 结果类型（runnable / dep_failed / none）
     kind: str = "none"
     # 死锁归因值对象（UID 集合）
@@ -220,15 +221,17 @@ class JobScheduler:
         集合。在 missing dependency 判定时，依赖正在运行的 job 不算 missing
         （待其完成 commit 到 wall 后自然解锁），避免并发模型下误判死锁。
         """
-        q_data = state.queue
-        wall_data = state.wall
-        failed_data = state.failed
-        queue_uids = state.queue_uids
+        effective_state = getattr(state, "state", state)
+        q_data = effective_state.queue
+        wall_data = effective_state.wall
+        failed_data = effective_state.failed
+        queue_uids = effective_state.queue_uids
         pending_or_running = queue_uids | set(in_flight_uids)
 
         runnable_idx = None
         min_wait = float('inf')
         waiting_for_dependency = False
+        has_potential_spawners = False
         pending_dep_failure: Optional[str] = None
         dep_failed_idx: int = -1  # 首个 dep-failed job 的索引（兜底）
         unknown_resource_indices: List[int] = []
@@ -270,14 +273,19 @@ class JobScheduler:
                 continue
 
             # 2. Missing dependency: not runnable
+            has_missing_dep = False
             if job.depends_on:
                 for dep_uid in job.depends_on:
                     if dep_uid not in wall_data:
                         can_run = False
                         waiting_for_dependency = True
+                        has_missing_dep = True
                         if dep_uid not in pending_or_running:
                             missing_dependency_indices.append(i)
                             missing_dependency_uids.append(job.uid)
+
+            if not has_missing_dep:
+                has_potential_spawners = True
 
             # 3. 资源评估（unknown / impossible / wait_time 由 ResourceManager 深模块统一裁决）
             eval_res = self.resource_mgr.evaluate(job.task_type, job.resources)
@@ -357,6 +365,7 @@ class JobScheduler:
             pending_dep_failure=pending_dep_failure,
             min_wait=min_wait,
             waiting_for_dependency=waiting_for_dependency,
+            has_potential_spawners=has_potential_spawners,
             kind=kind,
             attribution=attribution,
             unknown_resource_indices=unknown_resource_indices,

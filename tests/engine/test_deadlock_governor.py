@@ -57,3 +57,26 @@ def test_deadlock_governor_grace_period(monkeypatch):
 
     # After expiry: grace expired
     assert gov.check_dependency_grace(state, ["t::b"], now=106.0) is False
+
+
+def test_deadlock_governor_spawner_fast_path(monkeypatch):
+    """验证提供 has_potential_spawners 时直接依据单趟事实裁决，零扫描 state.queue。"""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    gov = DeadlockGovernor(dep_grace_seconds=5.0)
+    # 构造空队列或不含可运行 job 的 state
+    state = PipelineState(wall={}, failed={}, cursors={}, queue=[])
+
+    # 1. has_potential_spawners=False -> 立即返回 False
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=False, now=100.0) is False
+    assert gov.dep_grace_deadline is None
+
+    # 2. has_potential_spawners=True -> 进入宽限
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
+    assert gov.dep_grace_deadline == 105.0
+
+    # 3. 宽限期内持续返回 True
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=102.0) is True
+
+    # 4. 超时返回 False
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=106.0) is False
+
