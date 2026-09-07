@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..models.state import PipelineState
     from .channel import JobHandle
     from .resource import ResourceManager, ResourceLease
+    from .store import StateStore
 
 from ..models.job import Job
 from .channel import JobHandle
@@ -98,7 +99,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         self,
         entry: InFlightJob,
         *,
-        state: Optional["PipelineState"] = None,
+        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
     ) -> None:
         """原子登记在途任务到内存与 PipelineState 索引。"""
         self._entries[entry.uid] = entry
@@ -109,7 +110,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         self,
         entry: InFlightJob,
         *,
-        state: Optional["PipelineState"] = None,
+        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
     ) -> InFlightJob:
         """语义化派发接缝：原子登记在途任务并同步内存状态。"""
         self.register(entry, state=state)
@@ -119,7 +120,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         self,
         uid: str,
         *,
-        state: Optional["PipelineState"] = None,
+        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
     ) -> Optional[InFlightJob]:
         """注销在途任务。"""
         entry = self._entries.pop(uid, None)
@@ -131,7 +132,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         self,
         uid: str,
         *,
-        state: Optional["PipelineState"] = None,
+        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
     ) -> Optional[InFlightJob]:
         """语义化结算接缝：注销在途任务并同步内存状态。"""
         return self.unregister(uid, state=state)

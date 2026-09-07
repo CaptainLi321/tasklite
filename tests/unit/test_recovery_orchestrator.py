@@ -14,6 +14,7 @@ from tasklite.engine.runtime import (
     RT_BACKOFF_UNTIL,
     RT_BACKOFF_WALL_DEADLINE,
 )
+from tasklite.engine.store import StateStore
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
 
@@ -22,6 +23,7 @@ class DummyRunContext:
     def __init__(self, backend, state=None, resource_mgr=None):
         self.backend = backend
         self.state = state or PipelineState({}, {}, {}, [])
+        self.store = StateStore(self.backend, state=self.state)
         self.resource_mgr = resource_mgr or ResourceManager()
         self.policy = PreflightPolicy()
         self.stats = {
