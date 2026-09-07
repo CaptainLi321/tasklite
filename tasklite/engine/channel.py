@@ -34,11 +34,18 @@ from ..utils.ipc import (
     append_input,
     append_output,
     append_signal,
+    cleanup_ipc_files,
+    decode_raw_result as _decode_raw_result,
+    encode_raw_result as _encode_raw_result,
     inputs_path,
+    iter_stale_result_paths as _iter_stale_result_paths,
     outputs_path,
     read_inputs,
     read_outputs,
+    read_result_file,
     read_signals,
+    result_path,
+    result_tmp_path,
     signals_path,
 )
 from ..utils.jsonutil import dump, dumps, loads, load as json_load
@@ -60,79 +67,10 @@ _RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
 _RAW_TUPLE_SENTINEL = "__tl_tuple_v1"
 
 
-def _encode_raw_result(raw_result: Any) -> Any:
-    """编码 handler 返回值以便 JSON 落盘。"""
-    if isinstance(raw_result, tuple):
-        return [_RAW_TUPLE_SENTINEL, list(raw_result)]
-    return raw_result
-
-
-def _decode_raw_result(encoded: Any) -> Any:
-    """读取结果文件后还原 handler 返回值。"""
-    if (
-        isinstance(encoded, list)
-        and len(encoded) == 2
-        and encoded[0] == _RAW_TUPLE_SENTINEL
-        and isinstance(encoded[1], (list, tuple))
-    ):
-        return tuple(encoded[1])
-    return encoded
-
-
-def result_path(ipc_dir: Union[str, Path], uid: str, incarnation: Optional[str] = None) -> Path:
-    """某个 job 的最终结果文件路径。"""
-    suffix = f".{incarnation}{_RESULT_SUFFIX}" if incarnation else _RESULT_SUFFIX
-    return Path(ipc_dir) / f"{safe_uid_filename(uid)}{suffix}"
-
-
-def result_tmp_path(ipc_dir: Union[str, Path], uid: str, incarnation: Optional[str] = None) -> Path:
-    """某个 job 的结果临时文件路径。"""
-    suffix = f".{incarnation}{_RESULT_TMP_SUFFIX}" if incarnation else _RESULT_TMP_SUFFIX
-    return Path(ipc_dir) / f"{safe_uid_filename(uid)}{suffix}"
-
-
-def _iter_stale_result_paths(ipc_dir: Union[str, Path], uid: str) -> List[Path]:
-    """枚举某个 uid 的全部残留结果文件路径。"""
-    d = Path(ipc_dir)
-    base = f"{safe_uid_filename(uid)}"
-    found: List[Path] = []
-    try:
-        for pat in (f"{base}.*{_RESULT_SUFFIX}", f"{base}.*{_RESULT_TMP_SUFFIX}"):
-            for p in d.glob(pat):
-                if _INCARNATION_RE.match(p.name, pos=len(base)):
-                    found.append(p)
-    except OSError:
-        pass
-    return found
-
-
 def write_result_atomic(
     ipc_dir: Union[str, Path], uid: str, result_dict: dict, incarnation: Optional[str] = None
 ) -> None:
-    """原子写结果：先写 .tmp 再 os.replace。失败时清理 .tmp。"""
-    tmp = result_tmp_path(ipc_dir, uid, incarnation)
-    final = result_path(ipc_dir, uid, incarnation)
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            dump(result_dict, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, final)
-        try:
-            dir_fd = os.open(str(final.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    ArtifactJournal(ipc_dir).write_result_atomic(uid, result_dict, incarnation=incarnation)
 
 
 def _write_result_with_degradation(
@@ -169,37 +107,6 @@ def _write_result_with_degradation(
         logger.error(
             f"degraded result write also failed for {uid}: {e2}; worker exiting without IPC result"
         )
-
-
-def read_result_file(path: Path) -> Optional[dict]:
-    """读取结果文件；损坏/不存在返回 None。"""
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json_load(f)
-        if isinstance(data, dict):
-            return data
-        logger.warning(f"Corrupt result file {path}: not a dict, ignoring")
-        return None
-    except FileNotFoundError:
-        return None
-    except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
-        logger.warning(f"Corrupt result file {path}: {e}, ignoring")
-        return None
-
-def cleanup_ipc_files(ipc_dir: Union[str, Path], uid: str, incarnation: Optional[str] = None) -> None:
-    """删除某个 job 的结果/信号/临时文件（不含 outputs.jsonl）。"""
-    targets = [signals_path(ipc_dir, uid)]
-    if incarnation is not None:
-        targets += [
-            result_path(ipc_dir, uid, incarnation),
-            result_tmp_path(ipc_dir, uid, incarnation),
-        ]
-    targets += _iter_stale_result_paths(ipc_dir, uid)
-    for p in targets:
-        try:
-            p.unlink()
-        except (FileNotFoundError, OSError):
-            pass
 
 
 def _normalize_handler_result(result: Any) -> Tuple[bool, Dict[str, Any]]:
@@ -591,12 +498,24 @@ class ExecutionChannel:
 
         self._mp_ctx = ctx_candidate or mp.get_context("spawn")
         self.ipc_dir = str(dir_candidate) if dir_candidate is not None else None
-        self.journal = ArtifactJournal(self.ipc_dir)
         if self.ipc_dir:
             try:
                 Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
             except OSError:
                 pass
+
+    @property
+    def journal(self) -> ArtifactJournal:
+        ipc = getattr(self, "ipc_dir", None)
+        j = getattr(self, "_journal", None)
+        if j is None or j.ipc_dir != ipc:
+            j = ArtifactJournal(ipc)
+            self._journal = j
+        return j
+
+    @journal.setter
+    def journal(self, value: ArtifactJournal) -> None:
+        self._journal = value
 
     @staticmethod
     def _finalize_process(p: Any) -> None:
@@ -667,15 +586,15 @@ class ExecutionChannel:
         for handle in handles:
             now = time.monotonic()
             p = handle.process
-            res_path = result_path(handle.ipc_dir, handle.uid, handle.incarnation)
+            res_path = self.journal.result_path(handle.uid, handle.incarnation)
 
-            res = read_result_file(res_path) if res_path.exists() else None
+            res = self.journal.read_result(res_path) if res_path.exists() else None
             if res is not None:
                 completed.append((handle, self._collect_outcome(handle, res)))
                 continue
 
             if not p.is_alive():
-                res = read_result_file(res_path) if res_path.exists() else None
+                res = self.journal.read_result(res_path) if res_path.exists() else None
                 completed.append((handle, self._collect_outcome(handle, res)))
                 continue
 
@@ -689,7 +608,7 @@ class ExecutionChannel:
                     is_timeout = True
                 else:
                     is_timeout = p.exitcode == 0 or p.exitcode is None
-                res = read_result_file(res_path) if res_path.exists() else None
+                res = self.journal.read_result(res_path) if res_path.exists() else None
                 completed.append(
                     (handle, self._collect_outcome(handle, res, is_timeout=is_timeout))
                 )
@@ -713,7 +632,7 @@ class ExecutionChannel:
         finally:
             self._finalize_process(p)
             try:
-                pending_signals = read_signals(handle.ipc_dir, handle.uid)
+                pending_signals = self.journal.drain_signals(handle.uid)
                 if pending_signals:
                     if result is not None:
                         result.resource_suspensions = (
@@ -725,36 +644,13 @@ class ExecutionChannel:
                         )
             except Exception as e:
                 logger.warning(f"Failed to salvage signals for {handle.uid}: {e}")
-            cleanup_ipc_files(handle.ipc_dir, handle.uid, handle.incarnation)
+            self.journal.cleanup_ipc_files(handle.uid, handle.incarnation)
         return result
 
     def claim_stale_result(self, uid: str, job: Job) -> Optional[ExecutionResult]:
         """启动/派发前崩溃恢复：认领并消费上次 run 遗留的已落盘残留结果。"""
-        res_paths = _iter_stale_result_paths(self.ipc_dir, uid)
-        res_paths = [p for p in res_paths if p.name.endswith(_RESULT_SUFFIX)]
-        if not res_paths:
-            return None
-
-        def _freshness_key(p: Path) -> Tuple[int, int]:
-            st = p.stat()
-            try:
-                seq = int(p.name.removesuffix(_RESULT_SUFFIX).rsplit(".", 1)[-1])
-            except (ValueError, IndexError):
-                seq = -1
-            return (st.st_mtime_ns, seq)
-
-        res_path = max(res_paths, key=_freshness_key)
-        res = read_result_file(res_path)
-        for p in res_paths:
-            try:
-                p.unlink()
-            except OSError:
-                pass
-
-        if not isinstance(res, dict) or "status" not in res:
-            logger.warning(
-                f"Discarding stale result file for {uid}: not a valid result dict: {res!r}"
-            )
+        res = self.journal.claim_stale_result(uid)
+        if res is None:
             return None
         return _decode_ipc_result(res, None, job, self.ipc_dir)
 
@@ -826,9 +722,9 @@ class ExecutionChannel:
 
         for h in handles:
             incarnation = getattr(h, "incarnation", None)
-            res_p = result_path(self.ipc_dir, h.uid, incarnation)
+            res_p = self.journal.result_path(h.uid, incarnation)
             if res_p.exists():
-                raw_res = read_result_file(res_p)
+                raw_res = self.journal.read_result(res_p)
                 if (
                     raw_res is not None
                     and isinstance(raw_res, dict)
@@ -846,9 +742,9 @@ class ExecutionChannel:
         truly_cancelled: List[JobHandle] = []
         for h in pending_handles:
             incarnation = getattr(h, "incarnation", None)
-            res_p = result_path(self.ipc_dir, h.uid, incarnation)
+            res_p = self.journal.result_path(h.uid, incarnation)
             if res_p.exists():
-                raw_res = read_result_file(res_p)
+                raw_res = self.journal.read_result(res_p)
                 if (
                     raw_res is not None
                     and isinstance(raw_res, dict)
@@ -868,7 +764,7 @@ class ExecutionChannel:
         for handle in handles:
             try:
                 self._finalize_process(handle.process)
-                cleanup_ipc_files(handle.ipc_dir, handle.uid, handle.incarnation)
+                self.journal.cleanup_ipc_files(handle.uid, handle.incarnation)
             except Exception as e:
                 logger.error(f"Error cleaning up in-flight job {handle.uid}: {e}")
 
@@ -886,18 +782,6 @@ class ExecutionChannel:
     def cleanup_artifacts(self, uid: str, *, mode: ArtifactCleanupMode) -> None:
         """统一收敛产物与 IPC 临时文件的生命周期清理。"""
         self.journal.cleanup(uid, mode=mode)
-        if mode == ArtifactCleanupMode.PRE_SUBMIT:
-            for sp in _iter_stale_result_paths(self.ipc_dir, uid):
-                try:
-                    if sp.exists():
-                        sp.unlink()
-                except OSError:
-                    pass
-        elif mode in (ArtifactCleanupMode.SUCCESS, ArtifactCleanupMode.FAILURE_OR_RETRY):
-            try:
-                cleanup_ipc_files(self.ipc_dir, uid)
-            except Exception:
-                pass
 
     def read_declared_inputs(self, uid: str) -> List[dict]:
         """读取任务声明的输入清单。"""
