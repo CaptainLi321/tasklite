@@ -212,7 +212,7 @@ class RecoveryOrchestrator:
         self.apply_pending_signals()
 
         # 2. 释放已占用的资源（务必在 clear 前）
-        self._ctx.in_flight.release_all_acquired(self._ctx.resource_mgr)
+        self._ctx.in_flight.release_all_resources(self._ctx.resource_mgr)
 
         # 3. 委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理）
         handles = [

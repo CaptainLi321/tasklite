@@ -352,13 +352,12 @@ class DispatchMachine:
                     uid=uid,
                     job_dict=job_dict,
                     job=job,
-                    acquired=lease.acquired,
                     handle=handle,
                     job_start=job_start,
                     lease=lease,
                 )
                 # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
-                self._ctx.in_flight.register(entry, state=state)
+                self._ctx.in_flight.dispatch(entry, state=state)
                 return entry
 
         except _CommitCrashSignal:
