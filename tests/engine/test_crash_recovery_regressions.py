@@ -529,7 +529,7 @@ class TestDispatchFailureThreeStrike:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.executor, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
 
         # run 必须正常返回（DLQ 而非崩溃）
         pipeline.run()
@@ -550,7 +550,7 @@ class TestDispatchFailureThreeStrike:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.executor, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
 
         import pytest as pytest_mod
         with pytest_mod.raises(pickle_mod.PicklingError):
@@ -634,7 +634,7 @@ class TestCommitFailuresPreservation:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.executor, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
 
         pipeline.run()
 
@@ -893,7 +893,7 @@ class TestDispatchCommitCountersIndependent:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.executor, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
 
         # 本次 dispatch 失败 → _dispatch_failures=3 → 达 dispatch 阈值 DLQ
         pipeline.run()
@@ -922,7 +922,7 @@ class TestDispatchCommitCountersIndependent:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.executor, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
 
         # 本次 dispatch 失败 → _dispatch_failures=1（独立）→ 未达阈值 → requeue
         # 但 submit 每次抛异常，run 会崩溃（requeue + re-raise）——验证

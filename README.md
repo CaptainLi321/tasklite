@@ -325,7 +325,6 @@ tasklite/
 ├── models/              # Job / TaskContext / PipelineState 数据模型
 ├── taxonomy.py          # 错误分类法与校验分类深模块 (ErrorTaxonomy)
 ├── wrappers/            # discovery.py（增量扫描）/ http.py（网络守卫与快照）
-├── pipeline_util.py     # 通用脚手架（任务指纹 / 进度钩子 / 瞬态错误注册）
 └── utils/               # jsonutil (禁NaN) / lockfile
 ```
 

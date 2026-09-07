@@ -26,7 +26,7 @@ def test_dispatch_next_empty_queue(tmp_path):
         scheduler=scheduler,
         resources=resources,
         handlers={},
-        executor=channel.executor,
+        channel=channel,
         ipc_dir=str(tmp_path / "ipc"),
         output_root=str(tmp_path / "out"),
     )
@@ -53,7 +53,7 @@ def test_dispatch_next_workers_exhausted(tmp_path):
         scheduler=scheduler,
         resources=resources,
         handlers={},
-        executor=channel.executor,
+        channel=channel,
         ipc_dir=str(tmp_path / "ipc"),
         output_root=str(tmp_path / "out"),
     )

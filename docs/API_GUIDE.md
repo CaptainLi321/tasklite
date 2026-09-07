@@ -207,12 +207,12 @@ register_discovery(
 
 **scan_mode="full"**：跳过整页命中终止，一路扫到空页或 `max_pages`——全量成本只在 fetch（已见内容仍逐条跳过，不重复 spawn）。配合 `on_missing` 回调可做**源端删除/缺失检测**：扫描结束把「已见但本次未扫到」的 content_id 差集交给业务（`(job, ctx, missing_ids)`）。
 
-### 6.1 通用管线脚手架（pipeline_util）
+### 6.1 通用脚手架与工具函数
 
-`tasklite.pipeline_util` 是各类任务编排消费方共用的**数据与展示工具**：
+`tasklite` 顶层导出了各类任务编排消费方共用的**数据与展示工具**：
 
 ```python
-from tasklite.pipeline_util import (
+from tasklite import (
     content_fingerprint, sanitize_job_component,
     progress_hook, job_ref, slice_list,
 )

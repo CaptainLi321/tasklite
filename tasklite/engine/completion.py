@@ -2,8 +2,8 @@
 
 ``complete_job`` 是子进程结果的唯一收尾入口；``apply_result`` 承载
 retry/success/failure 三态事务提交；restore/cleanup/release 是崩溃恢复与
-资源释放的共享助手。依赖经 RunContext 注入，经 ``self._failure`` 复用
-失败机器（3-strike/级联），不反向引用 TaskLite。
+资源释放的共享助手。依赖经 RunContext 注入，经 ``self.store`` 复用
+状态与事务深模块（3-strike/级联），不反向引用 TaskLite。
 """
 
 import logging

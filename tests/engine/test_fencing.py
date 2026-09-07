@@ -252,7 +252,7 @@ class TestDrainStaleTmpIgnore:
         tmp_file = _Path(p.ipc_dir) / f"{base}{_RESULT_TMP_SUFFIX}"
         tmp_file.write_text('{"status": "suc')  # 部分 JSON
 
-        result = p.executor.consume_stale_result(job.uid, job)
+        result = p.channel.consume_stale_result(job.uid, job)
         assert result is None, "consume_stale_result 必须忽略 .tmp（孤儿仍在写，无 final 可消费）"
         assert tmp_file.exists(), "consume_stale_result 不得 unlink 正在写的 .tmp 文件"
 

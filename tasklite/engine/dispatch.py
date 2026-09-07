@@ -2,7 +2,7 @@
 
 五关顺序即契约（顺序即时序约束）：dedup → dep-failed → no-handler →
 orphan-probe → stale-restore。依赖经 RunContext（``self._ctx``）注入，
-经 ``self._failure``/``self._completion`` 复用失败机器与完成机器，
+经 ``self.store``/``self._completion`` 复用状态深模块与完成机器，
 不反向引用 TaskLite。
 """
 

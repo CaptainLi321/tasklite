@@ -270,7 +270,7 @@ class TestRerunEveryRun:
         from tasklite.pipeline import TaskLite
         from tasklite.taxonomy import ERR_NO_HANDLER
         p.backend.commit_job_failure("nohandler::x", {"error": ERR_NO_HANDLER})
-        p._failure.mark_failed("nohandler::x", {"error": ERR_NO_HANDLER})
+        p.store.mark_failed("nohandler::x", {"error": ERR_NO_HANDLER})
         p._state.unregister_in_flight("nohandler::x")
         assert "nohandler::x" not in p._state._rerun_active_uids, \
             "直接 commit 失败后豁免集合必须移除该 uid"
