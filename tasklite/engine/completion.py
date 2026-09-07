@@ -18,11 +18,10 @@ if TYPE_CHECKING:
 
 from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 from ..exceptions import _JobTerminated
-from ..models.job import Job, JobRuntimeState
+from ..models.job import Job
 from .channel import ArtifactCleanupMode, ExecutionResult
 from .inflight import InFlightJob
-from .policy import BackoffSchedule
-from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE, inject_worker_resource
+from .runtime import inject_worker_resource
 
 
 logger = logging.getLogger("tasklite")
@@ -142,49 +141,27 @@ class CompletionMachine:
     def _apply_retry(
         self, uid: str, job: Job, job_dict: dict, result: ExecutionResult
     ) -> None:
-        """处理重试分支：max_retries 预算检查、指数退避计算与队尾重入队。"""
-        # 中断信号与孤儿锁冲突都不消耗预算：中断源于外部信号，锁冲突源于
-        # 同 uid 孤儿执行体仍持锁（handler 未执行，孤儿死后重跑本可成功）。
-        # 二者即使撞上已耗尽的重试预算也豁免 DLQ，走下方零计数短退避回队
-        # 自恢复；其余超限则进入 DLQ。
-        if job.retries >= job.max_retries and not (result.interrupted or result.lock_conflict):
+        """处理重试分支：委托策略深模块规划重试并同步存储与统计。"""
+        plan = self._ctx.policy.plan_retry(job, job_dict, result)
+        if not plan.going_to_retry:
             logger.error(f"FAIL: {uid} exceeded max retries ({job.max_retries}). Sent to DLQ.")
-            fail_meta = {"error": _ERR_MAX_RETRIES}
-            rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
-            if rt_state.last_retry_error:
-                fail_meta["last_retry_error"] = rt_state.last_retry_error
-            if result.retry_error:
-                fail_meta["retry_error"] = result.retry_error
-            outcome = self._ctx.store.apply_failure(uid, fail_meta, job_dict=job_dict, cascade=True)
+            outcome = self._ctx.store.apply_failure(
+                uid, plan.fail_meta or {"error": _ERR_MAX_RETRIES}, job_dict=job_dict, cascade=True
+            )
             self._ctx.stats["failed"] += 1
             if outcome.cascaded_uids:
                 self._ctx.stats["cascade_failed"] += len(outcome.cascaded_uids)
             result.going_to_retry = False
             return
 
-        lock_conflict = result.lock_conflict
-        if result.interrupted or lock_conflict:
-            sched = self._ctx.policy.compute_orphan_schedule()
-            if result.interrupted:
-                self._ctx.stats["interrupted_reruns"] += 1
-            else:
-                self._ctx.stats["deferred_orphan"] += 1
-        else:
-            job.retries += 1
-            sched = self._ctx.policy.compute_backoff_schedule(
-                job.retries, job.backoff_base, job.backoff_max
-            )
+        if plan.is_interrupted:
+            self._ctx.stats["interrupted_reruns"] += 1
+        elif plan.is_lock_conflict:
+            self._ctx.stats["deferred_orphan"] += 1
 
-        logger.info(f"RETRY: {uid} (attempt {job.retries}/{job.max_retries}, backoff {sched.delay:.1f}s)")
-        retry_dict = job.to_dict()
-        retry_dict["resources"] = dict(job_dict.get("resources", {}))
-        retry_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
-        if result.retry_error and not (lock_conflict or result.interrupted):
-            retry_state.last_retry_error = result.retry_error
-        sched.populate_runtime(retry_state)
-        retry_dict["runtime"] = retry_state.to_dict()
-
-        self._ctx.store.apply_retry(uid, job_dict, retry_dict, front=False)
+        logger.info(f"RETRY: {uid} (attempt {job.retries}/{job.max_retries}, backoff {plan.delay:.1f}s)")
+        assert plan.retry_dict is not None
+        self._ctx.store.apply_retry(uid, job_dict, plan.retry_dict, front=False)
         self._ctx.stats["retried"] += 1
         result.going_to_retry = True
 

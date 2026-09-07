@@ -1,10 +1,11 @@
-"""预检与重试深模块（Deep Preflight Policy Module）。
+"""执行策略深模块（Deep Execution Policy Module）。
 
-负责统一管理：
+负责统一管理作业运行前后全生命周期策略：
 1. Rerun 策略矩阵评估（never / on_failure / every_run / on_input_change）；
-2. 磁盘文件输入指纹（stat）比对；
+2. 磁盘文件输入指纹（stat）比对与 StatCache 缓存；
 3. Discovery 默认策略兜底与规范化；
-4. 指数退避抖动时延与双时钟截止时间计算。
+4. 指数退避抖动时延与双时钟截止时间计算；
+5. 重试状态机规划（plan_retry / plan_orphan_defer）与 DLQ 归因装配。
 """
 
 from dataclasses import dataclass
@@ -15,6 +16,9 @@ import os
 import random
 import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+
+from ..models.job import Job, JobRuntimeState
+from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 
 logger = logging.getLogger("tasklite")
 
@@ -76,14 +80,31 @@ class BackoffSchedule:
             wall_deadline=now_wall + delay,
         )
 
-    def populate_runtime(self, runtime_dict: dict) -> None:
-        """将双时钟截止时间原子写入 Job 的 runtime 字典。"""
-        runtime_dict["_backoff_until"] = self.backoff_until
-        runtime_dict["_backoff_wall_deadline"] = self.wall_deadline
+    def populate_runtime(self, runtime_obj: Union[dict, JobRuntimeState]) -> None:
+        """将双时钟截止时间原子写入 Job 的 runtime（支持 dict 或 JobRuntimeState）。"""
+        if isinstance(runtime_obj, JobRuntimeState):
+            runtime_obj.backoff_until = self.backoff_until
+            runtime_obj.backoff_wall_deadline = self.wall_deadline
+        elif isinstance(runtime_obj, dict):
+            runtime_obj["_backoff_until"] = self.backoff_until
+            runtime_obj["_backoff_wall_deadline"] = self.wall_deadline
 
 
-class PreflightPolicy:
-    """预检与重试深模块。"""
+@dataclass(frozen=True)
+class RetryPlan:
+    """重试规划不可变值对象（封装是否重试、退避时延、预组装的字典与 DLQ 元数据）。"""
+
+    going_to_retry: bool
+    delay: float = 0.0
+    retry_dict: Optional[Dict[str, Any]] = None
+    fail_meta: Optional[Dict[str, Any]] = None
+    is_interrupted: bool = False
+    is_lock_conflict: bool = False
+    schedule: Optional[BackoffSchedule] = None
+
+
+class ExecutionPolicy:
+    """执行与预检深模块（统一负责预检评估、指纹比对、指数退避与重试规划）。"""
 
     def __init__(
         self,
@@ -299,3 +320,90 @@ class PreflightPolicy:
             backoff_until=mono + delay,
             wall_deadline=wall + delay,
         )
+
+    def plan_orphan_defer(self, job_dict: dict) -> BackoffSchedule:
+        """为孤儿锁探测 defer 生成短退避计划，原子填充 job_dict['runtime']。"""
+        sched = self.compute_orphan_schedule()
+        rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+        sched.populate_runtime(rt_state)
+        job_dict["runtime"] = rt_state.to_dict()
+        return sched
+
+    def plan_retry(
+        self,
+        job: Job,
+        job_dict: dict,
+        retry_error_or_result: Any = None,
+        *,
+        retry_error: Optional[str] = None,
+        interrupted: bool = False,
+        lock_conflict: bool = False,
+    ) -> RetryPlan:
+        """规划重试决策与退避状态机（单一出口：计算预算、退避时延与双时钟状态）。
+
+        契约：
+        1. 外部中断（interrupted）与孤儿锁冲突（lock_conflict）为瞬态信号：
+           - 不消耗重试预算（不递增 job.retries）；
+           - 即使 job.retries 已达 max_retries 也豁免 DLQ；
+           - 采用 [0.75, 1.0]s 短退避回队自恢复；
+           - 不污染 last_retry_error。
+        2. 正常业务失败重试：
+           - 检查 job.retries >= job.max_retries：超限则装配 DLQ fail_meta 并返回 going_to_retry=False；
+           - 未超限则 job.retries += 1，按指数退避计算 BackoffSchedule；
+           - 记录 retry_error 到 last_retry_error。
+        3. 组装待入队的 retry_dict 并对齐双时钟截止时间。
+        """
+        # 支持直接传入 ExecutionResult 结构体
+        if retry_error_or_result is not None:
+            if hasattr(retry_error_or_result, "retry_error"):
+                retry_error = getattr(retry_error_or_result, "retry_error", retry_error)
+            elif isinstance(retry_error_or_result, str):
+                retry_error = retry_error_or_result
+            if hasattr(retry_error_or_result, "interrupted"):
+                interrupted = bool(getattr(retry_error_or_result, "interrupted", False))
+            if hasattr(retry_error_or_result, "lock_conflict"):
+                lock_conflict = bool(getattr(retry_error_or_result, "lock_conflict", False))
+
+        if job.retries >= job.max_retries and not (interrupted or lock_conflict):
+            fail_meta: Dict[str, Any] = {"error": _ERR_MAX_RETRIES}
+            rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+            if rt_state.last_retry_error:
+                fail_meta["last_retry_error"] = rt_state.last_retry_error
+            if retry_error:
+                fail_meta["retry_error"] = retry_error
+            return RetryPlan(
+                going_to_retry=False,
+                delay=0.0,
+                fail_meta=fail_meta,
+                is_interrupted=interrupted,
+                is_lock_conflict=lock_conflict,
+            )
+
+        if interrupted or lock_conflict:
+            sched = self.compute_orphan_schedule()
+        else:
+            job.retries += 1
+            sched = self.compute_backoff_schedule(
+                job.retries, job.backoff_base, job.backoff_max
+            )
+
+        retry_dict = job.to_dict()
+        retry_dict["resources"] = dict(job_dict.get("resources", {}))
+        retry_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+        if retry_error and not (interrupted or lock_conflict):
+            retry_state.last_retry_error = retry_error
+        sched.populate_runtime(retry_state)
+        retry_dict["runtime"] = retry_state.to_dict()
+
+        return RetryPlan(
+            going_to_retry=True,
+            delay=sched.delay,
+            retry_dict=retry_dict,
+            is_interrupted=interrupted,
+            is_lock_conflict=lock_conflict,
+            schedule=sched,
+        )
+
+
+# 向后兼容别名
+PreflightPolicy = ExecutionPolicy
