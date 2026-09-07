@@ -119,10 +119,11 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         self,
         resource_mgr: "ResourceManager",
     ) -> None:
-        """释放所有在途任务已占用的资源（防泄漏）。"""
+        """释放所有在途任务已占用的资源（防泄漏并清空 acquired 列表以防二次释放）。"""
         for entry in self._entries.values():
             if entry.acquired:
                 resource_mgr.release_all(entry.acquired, uid=entry.uid)
+                entry.acquired = []
 
     @staticmethod
     def create_pseudo_entry(
