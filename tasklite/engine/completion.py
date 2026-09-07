@@ -71,8 +71,8 @@ class CompletionMachine:
             # 钩子恰好调用一次」是 _fire_job_completed docstring 的明文承诺。
             terminated = True
         finally:
-            # Release resources (无论成功/失败/重试/崩溃，都释放)
-            self.release_acquired(entry.acquired, uid=uid)
+            # Release resources (无论成功/失败/重试/崩溃，由 entry 自归还)
+            entry.release_resources(self._ctx.resource_mgr)
 
             # Cleanup outputs and IPC artifacts via channel deep module
             cleanup_mode = (
@@ -285,8 +285,13 @@ class CompletionMachine:
         self._ctx.channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
 
     def release_acquired(
-        self, acquired: List[Tuple[str, float]], uid: Optional[str] = None
+        self,
+        acquired_or_entry: Union[InFlightJob, List[Tuple[str, float]], Any],
+        uid: Optional[str] = None,
     ) -> None:
-        """释放已 acquire 的资源列表（委托给 ResourceManager 深模块）。"""
-        self._ctx.resource_mgr.release_all(acquired, uid=uid)
+        """释放已 acquire 的资源（支持 InFlightJob 或元组列表）。"""
+        if isinstance(acquired_or_entry, InFlightJob):
+            acquired_or_entry.release_resources(self._ctx.resource_mgr)
+        else:
+            self._ctx.resource_mgr.release_all(acquired_or_entry, uid=uid)
 

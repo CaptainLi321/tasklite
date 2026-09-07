@@ -1,9 +1,9 @@
 """在途作业与生命周期跟踪深模块（Deep Execution Lifecycle Module）。"""
 
 from collections.abc import MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
-    Dict, Iterator, List, Mapping, Optional, Tuple, TYPE_CHECKING
+    Dict, Iterator, List, Mapping, Optional, Tuple, Union, TYPE_CHECKING
 )
 
 if TYPE_CHECKING:
@@ -21,7 +21,7 @@ class InFlightJob:
     """一个已派发到子进程、尚未 commit 的 job 的上下文。
 
     由 DispatchMachine 创建，传给 CompletionMachine 处理结果。
-    ``acquired`` 记录已 acquire 的资源，``complete_job`` 的 finally 块释放。
+    内敛持有 ResourceLease 或 acquired 列表，提供自归还的 release_resources 接缝。
     ``handle is None`` 表示伪 entry（崩溃恢复/abort 消费路径），此时
     ``expect_in_flight=False``、``acquired=[]``。
     """
@@ -29,20 +29,29 @@ class InFlightJob:
     uid: str
     job_dict: dict
     job: Job
-    acquired: List[Tuple[str, float]]
-    handle: Optional[JobHandle]
-    job_start: Optional[float]
+    acquired: List[Tuple[str, float]] = field(default_factory=list)
+    handle: Optional[JobHandle] = None
+    job_start: Optional[float] = None
     lease: Optional["ResourceLease"] = None
+
+    def __post_init__(self) -> None:
+        if self.lease is not None and not self.acquired:
+            self.acquired = list(self.lease.acquired)
 
     @property
     def is_pseudo(self) -> bool:
         """是否为伪条目（崩溃恢复或 abort 消费路径）。"""
         return self.handle is None
 
-    def release_resources(self) -> None:
-        """释放关联的资源租约或 acquired 列表。"""
+    def release_resources(self, resource_mgr: Optional["ResourceManager"] = None) -> None:
+        """释放关联的资源租约或 acquired 列表（幂等归还）。"""
         if self.lease is not None:
             self.lease.release()
+            self.acquired = []
+        elif self.acquired:
+            if resource_mgr is not None:
+                resource_mgr.release_all(self.acquired, uid=self.uid)
+            self.acquired = []
 
 
 class InFlightTracker(MutableMapping[str, InFlightJob]):
@@ -96,6 +105,16 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         if state is not None:
             state.register_in_flight(entry.uid)
 
+    def dispatch(
+        self,
+        entry: InFlightJob,
+        *,
+        state: Optional["PipelineState"] = None,
+    ) -> InFlightJob:
+        """语义化派发接缝：原子登记在途任务并同步内存状态。"""
+        self.register(entry, state=state)
+        return entry
+
     def unregister(
         self,
         uid: str,
@@ -108,6 +127,15 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
             state.unregister_in_flight(uid)
         return entry
 
+    def settle(
+        self,
+        uid: str,
+        *,
+        state: Optional["PipelineState"] = None,
+    ) -> Optional[InFlightJob]:
+        """语义化结算接缝：注销在途任务并同步内存状态。"""
+        return self.unregister(uid, state=state)
+
     def active_handles(self) -> List[JobHandle]:
         """收集所有活动的真实子进程句柄（排除 handle=None 的伪条目）。"""
         return [
@@ -115,15 +143,20 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
             if entry.handle is not None
         ]
 
+    def release_all_resources(
+        self,
+        resource_mgr: Optional["ResourceManager"] = None,
+    ) -> None:
+        """释放所有在途任务已占用的资源（防泄漏并清空 acquired 列表以防二次释放）。"""
+        for entry in self._entries.values():
+            entry.release_resources(resource_mgr)
+
     def release_all_acquired(
         self,
         resource_mgr: "ResourceManager",
     ) -> None:
-        """释放所有在途任务已占用的资源（防泄漏并清空 acquired 列表以防二次释放）。"""
-        for entry in self._entries.values():
-            if entry.acquired:
-                resource_mgr.release_all(entry.acquired, uid=entry.uid)
-                entry.acquired = []
+        """向后兼容别名：释放所有在途任务已占用的资源。"""
+        self.release_all_resources(resource_mgr)
 
     @staticmethod
     def create_pseudo_entry(
@@ -139,6 +172,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
             acquired=[],
             handle=None,
             job_start=None,
+            lease=None,
         )
 
 
@@ -146,4 +180,3 @@ __all__ = [
     "InFlightJob",
     "InFlightTracker",
 ]
-

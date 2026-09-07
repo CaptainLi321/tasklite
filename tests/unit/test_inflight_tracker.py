@@ -49,6 +49,23 @@ class TestInFlightTrackerLifecycleAndStateSync:
         assert "t::j1" not in tracker
         assert "t::j1" not in state.in_flight_uids
 
+    def test_dispatch_and_settle_semantic_seams(self):
+        tracker = InFlightTracker()
+        state = PipelineState(wall={}, failed={}, cursors={}, queue=[])
+
+        job = Job("t", "j1", {})
+        entry = InFlightJob("t::j1", job.to_dict(), job, [("gpu", 1.0)], None, 100.0)
+
+        dispatched = tracker.dispatch(entry, state=state)
+        assert dispatched is entry
+        assert "t::j1" in tracker
+        assert "t::j1" in state.in_flight_uids
+
+        settled = tracker.settle("t::j1", state=state)
+        assert settled is entry
+        assert "t::j1" not in tracker
+        assert "t::j1" not in state.in_flight_uids
+
 
 class TestInFlightTrackerHandlesAndPseudo:
     def test_active_handles_filters_pseudo_entries(self):
@@ -94,3 +111,17 @@ class TestInFlightTrackerResourceRelease:
         assert gpu.used == 4.0
         tracker.release_all_acquired(rm)
         assert gpu.used == 0.0
+
+    def test_entry_self_release_with_lease(self):
+        gpu = CapacityResource("gpu", 10.0)
+        rm = ResourceManager({"gpu": gpu})
+        lease = rm.reserve("t", {"gpu": 3.0}, uid="t::j1")
+        assert gpu.used == 3.0
+
+        j1 = Job("t", "j1", {"gpu": 3.0})
+        entry = InFlightJob(uid="t::j1", job_dict=j1.to_dict(), job=j1, lease=lease)
+        assert entry.acquired == [("gpu", 3.0)]
+
+        entry.release_resources(rm)
+        assert gpu.used == 0.0
+        assert entry.acquired == []
