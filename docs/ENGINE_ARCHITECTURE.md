@@ -85,9 +85,9 @@
 - `queue` $\to$ `failed_dlq`（达到最大重试 / 依赖失败 / 无 Handler / 畸形数据 / 确定性输入错误）
 
 ### 3. 死锁归因与宽限机理
-- **畸形数据（`malformed_indices`）**：反序列化失败，最高优先级直接入 DLQ；
+- **畸形数据（`malformed_uids`）**：反序列化失败，最高优先级直接入 DLQ；
 - **未知/超限资源（`unknown`/`impossible`）**：强制 `min_wait=inf`，仅失败肇事者，下游走正常 cascade；
-- **缺失依赖（`missing_dependency_indices`）**：
+- **缺失依赖（`missing_dependency_uids`）**：
   - 若队列中存在潜在 spawner，授予 `dep_grace_seconds` 宽限期；
   - 宽限期满仍缺失，判为死锁入 DLQ 并级联标记；
 - **保守兜底（`deadlock_gap_rounds`）**：连续多轮无已知根因时升级整队列 DLQ（`ERR_DEADLOCK_GAP`），恢复终止性。

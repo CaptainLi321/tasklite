@@ -108,7 +108,7 @@ class TestMalformedNotMaskedByBackoff:
             PipelineState({}, {}, {}, [malformed, backing_off])
         )
 
-        assert 0 in result.malformed_indices, "缺 job_id 的条目必须归因为畸形"
+        assert len(result.malformed_uids) == 1 and result.malformed_uids[0].startswith("_unknown::"), "缺 job_id 的条目必须归因为畸形"
         assert result.min_wait == float('inf'), (
             "畸形归因必须强制 min_wait=inf——退避中另一 job 的有限退避"
             "不得遮蔽畸形死锁判定"

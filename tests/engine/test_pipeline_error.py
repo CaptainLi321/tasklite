@@ -809,8 +809,8 @@ class TestDeadlockFallbackConservative:
     def _sched(self, **kwargs):
         import types
         base = dict(
-            malformed_indices=[], unknown_resource_indices=[],
-            missing_dependency_indices=[], impossible_resource_indices=[],
+            malformed_uids=(), unknown_resource_uids=(),
+            missing_dependency_uids=(), impossible_resource_uids=(),
             waiting_for_dependency=False,
         )
         base.update(kwargs)
@@ -907,8 +907,8 @@ class TestDeadlockGapEscalation:
         monkeypatch.setattr(state, "find_dependency_cycles", lambda: [])
         monkeypatch.setattr("time.sleep", lambda s: None)
         sched = types.SimpleNamespace(
-            malformed_indices=[], unknown_resource_indices=[],
-            missing_dependency_indices=[], impossible_resource_indices=[],
+            malformed_uids=(), unknown_resource_uids=(),
+            missing_dependency_uids=(), impossible_resource_uids=(),
             waiting_for_dependency=True,
         )
         should_break = pipeline.store.handle_deadlock(sched)

@@ -106,7 +106,7 @@ def test_scheduler_unknown_resource_from_handler_defaults():
     sched = JobScheduler({}, handlers)  # 空资源表
     job_dict = Job("fetch", "x", payload={}).to_dict()
     result = sched.pop_next_runnable(PipelineState({}, {}, {}, [job_dict]))
-    assert result.unknown_resource_indices == [0]
+    assert result.unknown_resource_uids == ("fetch::x",)
 
 
 def test_scheduler_capacity_check_uses_merged_resources():
@@ -366,7 +366,7 @@ def test_scheduler_missing_dependency_not_shadowed_by_pending():
     result = sched.pop_next_runnable(state, in_flight_uids=frozenset({"t::pending"}))
     assert result.runnable_idx is None
     assert result.waiting_for_dependency is True
-    assert 0 in result.missing_dependency_indices, (
+    assert "t::x" in result.missing_dependency_uids, (
         "truly-missing dep must be recorded even when an earlier dep is pending"
     )
 
@@ -376,7 +376,7 @@ def test_scheduler_missing_dependency_not_shadowed_by_pending():
 
 def test_scheduler_impossible_resource_not_shadowed_by_finite_wait():
     """前面资源的有限等待不再遮蔽后面不可达（inf）资源——
-    记录 impossible_resource_indices 并触发死锁判定（min_wait=inf），
+    记录 impossible_resource_uids 并触发死锁判定（min_wait=inf），
     而非无限轮询。"""
     cap1 = CapacityResource("slot1", 1.0)
     cap1.acquire(1.0)  # 已满 → 有限等待
@@ -385,7 +385,7 @@ def test_scheduler_impossible_resource_not_shadowed_by_finite_wait():
         sched = JobScheduler({"slot1": cap1, "slot2": cap2})
         jd = Job("t", "x", payload={}, resources={"slot1": 1.0, "slot2": 200.0}).to_dict()
         result = sched.pop_next_runnable(PipelineState({}, {}, {}, [jd]))
-        assert 0 in result.impossible_resource_indices, (
+        assert "t::x" in result.impossible_resource_uids, (
             "impossible resource must be recorded despite the finite wait"
         )
         assert result.min_wait == float('inf'), (
