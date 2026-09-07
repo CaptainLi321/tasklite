@@ -465,7 +465,7 @@ class StateStore:
 
     def _extract_deadlock_uids(self, sched: Any, field_name: str, index_name: str) -> Set[str]:
         """统一提取归因 UID 集合（优先从 attribution/uids 属性直读，兜底按 index 反查）。"""
-        attr = getattr(sched, "attribution", None)
+        attr = getattr(sched, "attribution", None) or getattr(sched, "deadlock_attribution", None)
         if attr is not None and hasattr(attr, field_name):
             uids = getattr(attr, field_name)
             if uids:
