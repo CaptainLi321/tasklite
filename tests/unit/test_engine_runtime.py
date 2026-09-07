@@ -281,6 +281,8 @@ class TestTaskLiteRuntimeFacadeIntegration:
         assert p.runtime.config.name == "facade_test"
         assert p.runtime.ctx is p._ctx
         assert p.runtime.scheduler is p.scheduler
+        assert p.store is p._ctx.store
+        assert p.channel is p._ctx.channel
 
         p.register_handler("dummy", dummy_runtime_handler)
         p.enqueue([Job("dummy", "1")])
@@ -289,3 +291,26 @@ class TestTaskLiteRuntimeFacadeIntegration:
         p.run()
         assert p.stats["completed"] == 1
         assert "dummy::1" in p.backend.load_wall()
+
+    def test_tasklite_lifecycle_management_guards(self, tmp_path):
+        p = TaskLite(name="guard_test", state_dir=str(tmp_path), backend="memory")
+        p.register_handler("dummy", dummy_runtime_handler)
+
+        # 模拟运行中状态
+        p._runtime._is_running = True
+        try:
+            with pytest.raises(RuntimeError, match="outside run"):
+                p.enqueue([Job("dummy", "1")])
+            with pytest.raises(RuntimeError, match="outside run"):
+                p.list_dlq()
+            with pytest.raises(RuntimeError, match="outside run"):
+                p.clear_dlq()
+            with pytest.raises(RuntimeError, match="outside run"):
+                p.clear_history("dummy::1")
+            with pytest.raises(RuntimeError, match="outside run"):
+                p.seed_wall(["dummy::1"])
+            with pytest.raises(RuntimeError, match="outside run"):
+                p.seed_cursor("k", "v")
+        finally:
+            p._runtime._is_running = False
+
