@@ -12,6 +12,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+from .governor import (
+    DEADLOCK_GAP_MAX_ROUNDS,
+    DEP_GRACE_SECONDS,
+    DeadlockGovernor,
+)
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
@@ -30,8 +35,6 @@ from ..taxonomy import (
 logger = logging.getLogger("tasklite")
 
 COMMIT_FAILURE_DLQ_THRESHOLD = 3
-DEP_GRACE_SECONDS = 60.0
-DEADLOCK_GAP_MAX_ROUNDS = 5
 
 
 class DLQEntry(NamedTuple):
@@ -59,6 +62,7 @@ __all__ = [
     "DEADLOCK_GAP_MAX_ROUNDS",
     "DEP_GRACE_SECONDS",
     "DLQEntry",
+    "DeadlockGovernor",
     "FailureOutcome",
     "RetryOutcome",
     "SkipOutcome",
@@ -116,6 +120,7 @@ class StateStore:
         taxonomy: Optional[ErrorTaxonomy] = None,
         on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None,
         ctx: Optional[Any] = None,
+        governor: Optional[DeadlockGovernor] = None,
     ) -> None:
         self._backend = backend
         self._state = state or PipelineState({}, {}, {}, [])
@@ -123,6 +128,7 @@ class StateStore:
         self._taxonomy = taxonomy or _DEFAULT_TAXONOMY
         self._on_job_completed = on_job_completed
         self._ctx = ctx
+        self._governor = governor or getattr(ctx, "governor", None) or DeadlockGovernor()
 
     def mark_failed(self, uid: str, meta: Dict[str, Any]) -> None:
         """统一失败登记：清 wall 旧记录 + mark_failed。"""
@@ -303,6 +309,8 @@ class StateStore:
             for uid, meta in sanitized_metas:
                 self._state.mark_failed(uid, meta)
                 self._state.unregister_in_flight(uid)
+                if self._ctx is not None and hasattr(self._ctx, "stats"):
+                    self._ctx.stats["failed"] += 1
                 if self._on_job_completed:
                     self._on_job_completed(uid, meta, False, False)
             return BulkFailureOutcome(
@@ -332,6 +340,8 @@ class StateStore:
                 if single_committed:
                     queue = [j for j in queue if uid_from_job_dict(j) != uid]
                     self._state.mark_failed(uid, {"error": ERR_COMMIT_FAILURE_DLQ, "fatal": True})
+                    if self._ctx is not None and hasattr(self._ctx, "stats"):
+                        self._ctx.stats["failed"] += 1
                     if self._on_job_completed:
                         self._on_job_completed(uid, {"error": ERR_COMMIT_FAILURE_DLQ, "fatal": True}, False, False)
                 else:
@@ -412,6 +422,8 @@ class StateStore:
                 single_committed = self._backend.commit_job_failure(uid, dlq_meta)
                 if single_committed:
                     self.apply_failed(uid, dlq_meta, unregister=False)
+                    if self._ctx is not None and hasattr(self._ctx, "stats"):
+                        self._ctx.stats["failed"] += 1
                     if self._on_job_completed:
                         self._on_job_completed(uid, dlq_meta, False, False)
                     continue
@@ -482,31 +494,16 @@ class StateStore:
             f"On-disk queue preserved; crashing to avoid unbounded retry loop."
         )
 
-    # ── 3. 死锁归因与宽限分析 ────────────────────────────────────────────
+    # ── 3. 死锁归因与宽限分析（委托 DeadlockGovernor 深模块）───────────
+
+    @property
+    def governor(self) -> DeadlockGovernor:
+        """关联的死锁治理状态机深模块。"""
+        return self._governor
 
     def _extract_deadlock_uids(self, sched: Any, field_name: str, index_name: str) -> Set[str]:
-        """统一提取归因 UID 集合（优先从 attribution/uids 属性直读，兜底按 index 反查）。"""
-        attr = getattr(sched, "attribution", None) or getattr(sched, "deadlock_attribution", None)
-        if attr is not None and hasattr(attr, field_name):
-            uids = getattr(attr, field_name)
-            if uids:
-                return set(uids)
-        if hasattr(sched, field_name):
-            uids = getattr(sched, field_name)
-            if uids:
-                return set(uids)
-        if hasattr(sched, index_name):
-            indices = getattr(sched, index_name)
-            if indices:
-                res: Set[str] = set()
-                for i in indices:
-                    if 0 <= i < len(self._state.queue):
-                        try:
-                            res.add(uid_from_job_dict(self._state.queue[i]))
-                        except Exception:
-                            pass
-                return res
-        return set()
+        """统一提取归因 UID 集合（向后兼容委托给 governor）。"""
+        return self._governor._extract_deadlock_uids(sched, field_name, index_name, self._state)
 
     @staticmethod
     def _split_deadlock_by_uids(
@@ -514,16 +511,8 @@ class StateStore:
         target_uids: Set[str],
         error: str,
     ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Dict[str, Any]]]:
-        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」（O(1) UID 集合判定）。"""
-        uids_metas: List[Tuple[str, Dict[str, Any]]] = []
-        remaining_queue: List[Dict[str, Any]] = []
-        for jd in queue:
-            uid = uid_from_job_dict(jd)
-            if uid in target_uids:
-                uids_metas.append((uid, {"error": error, "root_cause": True}))
-            else:
-                remaining_queue.append(jd)
-        return uids_metas, remaining_queue
+        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」（委托 DeadlockGovernor）。"""
+        return DeadlockGovernor._split_deadlock_by_uids(queue, target_uids, error)
 
     @staticmethod
     def _split_deadlock(
@@ -552,65 +541,15 @@ class StateStore:
         scheduler: Optional[Any] = None,
         grace_seconds: float = DEP_GRACE_SECONDS,
     ) -> bool:
-        """宽限：缺失依赖的 job 是否应等待而非立即 DLQ。"""
-        effective_ctx = ctx or self._ctx
-        state = self._state
-        missing_uids: Set[str] = set()
-        for item in missing_identifiers:
-            if isinstance(item, str):
-                missing_uids.add(item)
-            elif isinstance(item, int) and 0 <= item < len(state.queue):
-                try:
-                    missing_uids.add(uid_from_job_dict(state.queue[item]))
-                except (KeyError, TypeError, ValueError):
-                    pass
-
-        if not missing_uids:
-            return False
-
-        episode = getattr(effective_ctx, "episode", None) if effective_ctx is not None else None
-        if episode is not None:
-            if episode.dep_grace_missing is not None and episode.dep_grace_missing != missing_uids:
-                episode.dep_grace_deadline = None
-            episode.dep_grace_missing = frozenset(missing_uids)
-            if hasattr(effective_ctx, "dep_grace_seconds"):
-                grace_seconds = effective_ctx.dep_grace_seconds
-
-        for jd in state.queue:
-            uid = uid_from_job_dict(jd)
-            if uid in missing_uids:
-                continue
-            try:
-                if scheduler is None and effective_ctx is not None and hasattr(effective_ctx, "scheduler"):
-                    scheduler = effective_ctx.scheduler
-                if scheduler is not None and hasattr(scheduler, "cached_job"):
-                    job = scheduler.cached_job(jd)
-                else:
-                    job = Job.from_dict(jd)
-            except (KeyError, TypeError, ValueError):
-                continue
-            if all(dep in state.wall for dep in job.depends_on):
-                now = time.monotonic()
-                deadline = episode.dep_grace_deadline if episode is not None else None
-                if deadline is None:
-                    deadline = now + grace_seconds
-                    if episode is not None:
-                        episode.dep_grace_deadline = deadline
-                    logger.warning(
-                        f"DEPENDENCY GRACE: {len(missing_uids)} job(s) waiting "
-                        f"on missing deps; granting {grace_seconds}s "
-                        f"grace (runnable job(s) may spawn them)."
-                    )
-                if now < deadline:
-                    time.sleep(0.5)
-                    return True
-                logger.error(
-                    f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
-                    f"still waiting on missing deps after "
-                    f"{grace_seconds}s; treating as deadlock (DLQ)."
-                )
-                return False
-        return False
+        """宽限：缺失依赖的 job 是否应等待而非立即 DLQ（委托 DeadlockGovernor）。"""
+        gov = getattr(ctx, "governor", None) or self._governor
+        effective_scheduler = scheduler or (getattr(ctx, "scheduler", None) if ctx is not None else getattr(self._ctx, "scheduler", None))
+        return gov.check_dependency_grace(
+            self._state,
+            missing_identifiers,
+            scheduler=effective_scheduler,
+            grace_seconds=grace_seconds,
+        )
 
     def _deadlock_gap_or_escalate(
         self,
@@ -619,28 +558,9 @@ class StateStore:
         ctx: Optional[Any] = None,
         max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS,
     ) -> bool:
-        """死锁分类缺口的连续轮次升级逻辑。"""
-        effective_ctx = ctx or self._ctx
-        episode = getattr(effective_ctx, "episode", None) if effective_ctx is not None else None
-        if effective_ctx is not None and hasattr(effective_ctx, "deadlock_gap_max_rounds"):
-            max_rounds = effective_ctx.deadlock_gap_max_rounds
-
-        current_rounds = (episode.deadlock_gap_rounds if episode is not None else 0) + 1
-        if episode is not None:
-            episode.deadlock_gap_rounds = current_rounds
-
-        if current_rounds < max_rounds:
-            logger.error(
-                f"{log_prefix}: refusing to fail the whole queue, retrying next round "
-                f"({current_rounds}/{max_rounds})."
-            )
-            time.sleep(0.5)
-            return False
-        logger.critical(
-            f"{log_prefix} persisted for {max_rounds} rounds; "
-            f"escalating to whole-queue DLQ ({ERR_DEADLOCK_GAP})."
-        )
-        return True
+        """死锁分类缺口的连续轮次升级逻辑（委托 DeadlockGovernor）。"""
+        gov = getattr(ctx, "governor", None) or self._governor
+        return gov.check_gap_or_escalate(log_prefix, max_rounds=max_rounds)
 
     def handle_deadlock(
         self,
@@ -651,116 +571,18 @@ class StateStore:
         dep_grace_seconds: float = DEP_GRACE_SECONDS,
         deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS,
     ) -> bool:
-        """处理死锁：细粒度归因 + bulk_failure + cascade。"""
-        effective_ctx = ctx or self._ctx
-        state = self._state
-        if effective_ctx is not None:
-            if hasattr(effective_ctx, "scheduler"):
-                scheduler = effective_ctx.scheduler
-            if hasattr(effective_ctx, "dep_grace_seconds"):
-                dep_grace_seconds = effective_ctx.dep_grace_seconds
-            if hasattr(effective_ctx, "deadlock_gap_max_rounds"):
-                deadlock_gap_max_rounds = effective_ctx.deadlock_gap_max_rounds
-
-        malformed_uids = self._extract_deadlock_uids(sched, "malformed_uids", "malformed_indices")
-        unknown_uids = self._extract_deadlock_uids(sched, "unknown_resource_uids", "unknown_resource_indices")
-        missing_uids = self._extract_deadlock_uids(sched, "missing_dependency_uids", "missing_dependency_indices")
-        impossible_uids = self._extract_deadlock_uids(sched, "impossible_resource_uids", "impossible_resource_indices")
-
-        if malformed_uids:
-            logger.error(f"Deadlock: {len(malformed_uids)} job(s) have malformed dict (unparseable).")
-            uids_metas, remaining_queue = self._split_deadlock_by_uids(
-                list(state.queue), malformed_uids, ERR_MALFORMED_JOB
-            )
-        elif unknown_uids:
-            logger.error(f"Deadlock: {len(unknown_uids)} job(s) reference unknown resource(s).")
-            uids_metas, remaining_queue = self._split_deadlock_by_uids(
-                list(state.queue), unknown_uids, ERR_RESOURCE_DEADLOCK
-            )
-        elif missing_uids:
-            if self._dependency_grace(
-                missing_uids,
-                ctx=effective_ctx,
-                scheduler=scheduler,
-                grace_seconds=dep_grace_seconds,
-            ):
-                return False
-            logger.error(f"Deadlock: {len(missing_uids)} job(s) have unresolvable (missing) dependencies.")
-            uids_metas, remaining_queue = self._split_deadlock_by_uids(
-                list(state.queue), missing_uids, ERR_DEPENDENCY_DEADLOCK
-            )
-        elif impossible_uids:
-            logger.error(f"Deadlock: {len(impossible_uids)} job(s) request impossible resource amounts (exceeds capacity).")
-            uids_metas, remaining_queue = self._split_deadlock_by_uids(
-                list(state.queue), impossible_uids, ERR_RESOURCE_DEADLOCK
-            )
-        elif getattr(sched, "waiting_for_dependency", False):
-            cycle_uids = set(state.find_dependency_cycles())
-            if not cycle_uids:
-                escalated = self._deadlock_gap_or_escalate(
-                    "Deadlock classification gap (waiting_for_dependency without cycle)",
-                    ctx=effective_ctx,
-                    max_rounds=deadlock_gap_max_rounds,
-                )
-                if not escalated:
-                    return False
-                uids_metas = [
-                    (uid_from_job_dict(jd),
-                     {"error": ERR_DEADLOCK_GAP, "root_cause": True})
-                    for jd in state.queue
-                ]
-                remaining_queue = []
-            else:
-                logger.error(
-                    f"Deadlock detected: dependency cycle among {len(cycle_uids)} job(s): "
-                    f"{sorted(cycle_uids)}"
-                )
-                uids_metas, remaining_queue = self._split_deadlock_by_uids(
-                    list(state.queue), cycle_uids, ERR_DEPENDENCY_DEADLOCK
-                )
-        else:
-            escalated = self._deadlock_gap_or_escalate(
-                "Deadlock: unclassifiable deadlock (no known root cause)",
-                ctx=effective_ctx,
-                max_rounds=deadlock_gap_max_rounds,
-            )
-            if not escalated:
-                return False
-            uids_metas = [
-                (uid_from_job_dict(jd),
-                 {"error": ERR_DEADLOCK_GAP, "root_cause": True})
-                for jd in state.queue
-            ]
-            remaining_queue = []
-
-        committed = self._backend.commit_bulk_failure(uids_metas)
-        if committed:
-            episode = getattr(effective_ctx, "episode", None) if effective_ctx is not None else None
-            if episode is not None:
-                episode.deadlock_gap_rounds = 0
-            for uid, meta in uids_metas:
-                self.apply_failed(uid, meta, unregister=False)
-                if effective_ctx is not None and hasattr(effective_ctx, "stats"):
-                    effective_ctx.stats["failed"] += 1
-                if effective_ctx is not None and hasattr(effective_ctx, "fire_job_completed"):
-                    effective_ctx.fire_job_completed(uid, meta, False, False)
-                elif self._on_job_completed:
-                    self._on_job_completed(uid, meta, False, False)
-            state.replace_queue(remaining_queue)
-            return not remaining_queue
-
-        queue, kept = self.commit_bulk_failed_crash(
-            "commit_bulk_failure", uids_metas, list(state.queue)
+        """处理死锁：细粒度归因 + bulk_failure + cascade（委托 DeadlockGovernor）。"""
+        gov = getattr(ctx, "governor", None) or self._governor
+        effective_scheduler = scheduler or (getattr(ctx, "scheduler", None) if ctx is not None else getattr(self._ctx, "scheduler", None))
+        return gov.resolve_deadlock(
+            sched,
+            store=self,
+            state=self._state,
+            scheduler=effective_scheduler,
+            ctx=ctx or self._ctx,
+            dep_grace_seconds=dep_grace_seconds,
+            deadlock_gap_max_rounds=deadlock_gap_max_rounds,
         )
-        state.replace_queue(queue)
-        if kept:
-            raise _CommitCrashSignal(
-                f"Backend commit_bulk_failure returned False for "
-                f"{len(uids_metas)} deadlock job(s); {len(queue)} kept in queue "
-                f"with incremented _commit_failures (3-strike will DLQ them). "
-                f"Crashing to retry; on-disk queue preserved."
-            )
-        return not queue
 
     # ── 4. 内存状态与查询代理 ────────────────────────────────────────────
 
