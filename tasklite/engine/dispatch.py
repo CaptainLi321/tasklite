@@ -27,7 +27,6 @@ from ..taxonomy import (
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
 from ..models.job import Job, JobRuntimeState
-from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE
 from .channel import ArtifactCleanupMode, JobHandle
 from .inflight import InFlightJob
 from .scheduler import DeadlockAttribution
@@ -238,10 +237,7 @@ class DispatchMachine:
                 f"requeue with short backoff."
             )
             self._ctx.stats["deferred_orphan"] += 1
-            # 策略深模块生成孤儿退避时间表并原子填充 runtime
-            sched = self._ctx.policy.compute_orphan_schedule()
-            rt = job_dict.setdefault("runtime", {})
-            sched.populate_runtime(rt)
+            self._ctx.policy.plan_orphan_defer(job_dict)
             state.requeue_jobs([job_dict], front=True)
             return True
         return False

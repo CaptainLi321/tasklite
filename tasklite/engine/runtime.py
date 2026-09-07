@@ -102,7 +102,7 @@ from .store import (
 )
 from .channel import ExecutionChannel
 from .inflight import InFlightTracker
-from .policy import PreflightPolicy
+from .policy import ExecutionPolicy, PreflightPolicy
 from .resource import CapacityResource, Resource, ResourceManager
 from .scheduler import JobScheduler
 from ..backend.base import AbstractStateBackend
@@ -232,7 +232,7 @@ class RunContext:
             )
         self.transient_registry = self.taxonomy
         self.discovery_rerun = discovery_rerun if discovery_rerun is not None else {}
-        self.policy: PreflightPolicy = PreflightPolicy(self.discovery_rerun)
+        self.policy: ExecutionPolicy = ExecutionPolicy(self.discovery_rerun)
 
         self.dep_grace_seconds: float = (
             float(dep_grace_seconds) if dep_grace_seconds is not None else DEP_GRACE_SECONDS

@@ -159,3 +159,73 @@ class TestBackoffScheduleInvariants:
         assert 0.75 <= sched.delay <= 1.0
         assert math.isclose(sched.backoff_until - now_mono, sched.delay, abs_tol=1e-6)
         assert math.isclose(sched.wall_deadline - now_wall, sched.delay, abs_tol=1e-6)
+
+
+class TestRetryPlanStateMachine:
+    def test_plan_retry_within_budget(self):
+        from tasklite.engine.policy import ExecutionPolicy
+        from tasklite.models.job import Job
+
+        policy = ExecutionPolicy()
+        job = Job("t", "1", max_retries=3, retries=0)
+        job_dict = job.to_dict()
+
+        plan = policy.plan_retry(job, job_dict, retry_error="transient network")
+        assert plan.going_to_retry is True
+        assert job.retries == 1
+        assert plan.delay > 0.0
+        assert plan.retry_dict is not None
+        assert plan.retry_dict["retries"] == 1
+        assert plan.retry_dict["runtime"]["_last_retry_error"] == "transient network"
+        assert "_backoff_until" in plan.retry_dict["runtime"]
+        assert "_backoff_wall_deadline" in plan.retry_dict["runtime"]
+
+    def test_plan_retry_exceeded_budget_returns_dlq_meta(self):
+        from tasklite.engine.policy import ExecutionPolicy
+        from tasklite.models.job import Job
+
+        policy = ExecutionPolicy()
+        job = Job("t", "1", max_retries=3, retries=3)
+        job_dict = job.to_dict()
+        job_dict["runtime"] = {"_last_retry_error": "prev error"}
+
+        plan = policy.plan_retry(job, job_dict, retry_error="final error")
+        assert plan.going_to_retry is False
+        assert job.retries == 3
+        assert plan.fail_meta is not None
+        assert plan.fail_meta["error"] == "MAX_RETRIES_EXCEEDED"
+        assert plan.fail_meta["last_retry_error"] == "prev error"
+        assert plan.fail_meta["retry_error"] == "final error"
+
+    def test_plan_retry_interrupted_and_lock_conflict_exempt_from_dlq(self):
+        from tasklite.engine.policy import ExecutionPolicy
+        from tasklite.models.job import Job
+
+        policy = ExecutionPolicy()
+        job = Job("t", "1", max_retries=3, retries=3)
+        job_dict = job.to_dict()
+
+        # 即使 retries == 3，interrupted 也豁免 DLQ 且不消耗重试预算
+        plan_int = policy.plan_retry(job, job_dict, interrupted=True)
+        assert plan_int.going_to_retry is True
+        assert plan_int.is_interrupted is True
+        assert job.retries == 3  # 不增加
+        assert 0.75 <= plan_int.delay <= 1.0
+
+        # lock_conflict 同样豁免 DLQ 且不消耗重试预算
+        plan_lock = policy.plan_retry(job, job_dict, lock_conflict=True)
+        assert plan_lock.going_to_retry is True
+        assert plan_lock.is_lock_conflict is True
+        assert job.retries == 3  # 不增加
+        assert 0.75 <= plan_lock.delay <= 1.0
+
+    def test_plan_orphan_defer_populates_runtime(self):
+        from tasklite.engine.policy import ExecutionPolicy
+
+        policy = ExecutionPolicy()
+        job_dict = {"task_type": "t", "job_id": "1"}
+        sched = policy.plan_orphan_defer(job_dict)
+        assert 0.75 <= sched.delay <= 1.0
+        assert "_backoff_until" in job_dict["runtime"]
+        assert "_backoff_wall_deadline" in job_dict["runtime"]
+

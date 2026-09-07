@@ -8,6 +8,7 @@
 3. 结果必须 JSON 可序列化（由落盘强制）+ IPC 文件原子写。
 """
 
+import pickle as pickle_mod
 import queue as queue_mod
 import time
 from datetime import datetime

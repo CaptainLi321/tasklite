@@ -22,11 +22,7 @@ from ..models.job import Job, JobRuntimeState
 from ..models.state import uid_from_job_dict
 from ..utils.jsonutil import loads
 from .inflight import InFlightJob, InFlightTracker
-from .runtime import (
-    META_RESOURCE_SUSPENDS,
-    RT_BACKOFF_UNTIL,
-    RT_BACKOFF_WALL_DEADLINE,
-)
+from .runtime import META_RESOURCE_SUSPENDS
 
 logger = logging.getLogger("tasklite")
 
