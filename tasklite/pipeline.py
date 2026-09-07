@@ -1,50 +1,32 @@
-"""Core pipeline engine for tasklite."""
-
 import logging
-import math
 import multiprocessing as mp
 import pickle
-import signal
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 from .backend.base import AbstractStateBackend, classify_error_type
 from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
-
-
-
-from .models.context import TaskContext
-from .engine.executor import ExecutionResult, MultiprocessingExecutor
+from .engine.channel import ExecutionChannel
+from .engine.executor import MultiprocessingExecutor
 from .engine.inflight import InFlightJob as _InFlightJob, InFlightTracker
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import (
     EngineRuntime,
-    ExecutionOptions,
-    ExitReason,
-    META_RESOURCE_SUSPENDS as _META_RESOURCE_SUSPENDS,
-    RunContext,
-    RunSummary,
     RuntimeConfig,
-    StepOutcome,
-    StopMode,
     TaskStats,
     WORKER_RESOURCE,
     inject_worker_resource,
-    RT_BACKOFF_UNTIL,
-    RT_BACKOFF_WALL_DEADLINE,
 )
 from .engine.scheduler import JobScheduler
-from .exceptions import (
-    TransientRegistry, _CommitCrashSignal, _JobTerminated,
-)
+from .engine.store import StateStore
+from .exceptions import TransientRegistry, _CommitCrashSignal, _JobTerminated
+from .models.context import TaskContext
 from .models.job import Job
 from .models.state import PipelineState, uid_from_job_dict
-from .utils.jsonutil import dumps, loads
-from .utils.lockfile import release_lock, try_acquire_lock
 from .taxonomy import validate_resource_amounts
+from .utils.jsonutil import dumps, loads
 
 logger = logging.getLogger("tasklite")
 
@@ -275,6 +257,11 @@ class TaskLite:
     def store(self) -> StateStore:
         """状态与事务深模块。"""
         return self._ctx.store
+
+    @property
+    def channel(self) -> ExecutionChannel:
+        """执行通道深模块。"""
+        return self._ctx.channel
 
     @property
     def _failure(self) -> StateStore:
