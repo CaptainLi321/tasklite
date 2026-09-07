@@ -20,7 +20,7 @@
 `tasklite` 采用「单一宿主编排 + 职责特化机器群 + 单向共享运行态」的解耦架构：
 
 - **单向依赖中心**：`RunContext` 承载单次 `run()` 的全部运行态（state / in_flight / stats / stop_mode / run_id / episode），机器模块从 `RunContext` 获取服务，不反向持有 `TaskLite`。
-- **单一出口原则**：所有 job 终结（成功/失败/重试）统一由 `CompletionMachine.complete_job` 收尾；所有失败终态登记统一由 `FailureMachine.apply_failed` 收敛；所有运行钩子统一由 `RunContext.fire_*` 出口。
+- **单一出口原则**：所有 job 终结（成功/失败/重试）统一由 `CompletionMachine.complete_job` 收尾；所有失败终态登记统一由 `StateStore.apply_failed` / `StateStore.apply_failure` 收敛；所有运行钩子统一由 `RunContext.fire_*` 出口。
 - **文件 IPC 与执行身份隔离**：结果走落盘原子文件而非 `multiprocessing.Queue`（消除管道伪非阻塞卡死风险）；结果文件携带 `run_id` + `seq` 组成的 `incarnation` 执行身份隔离，避免孤儿进程结果污染新会话。
 - **fail-loud 纪律**：WAL 模式必须验证生效；Job 入参严格校验；单射转义拒绝静默碰撞；未知错误码与死锁即时归因。
 
@@ -94,21 +94,20 @@
 
 ---
 
-## 四、执行机器职责划分（11 模块）
+## 四、执行机器职责划分（10 模块）
 
 | 模块 | 职责定位 | 核心接口 / 概念 |
 |---|---|---|
 | `runtime.py` | 跨模块单向共享运行态容器 | `RunContext`, `EpisodeState`, `StopMode`, `TaskStats` |
+| `store.py` | 统一状态事务、3-strike 崩溃与死锁归因 | `StateStore.apply_failure`, `apply_success`, `handle_deadlock` |
+| `channel.py` | IPC 通道、孤儿锁探测与产物清理 | `ExecutionChannel.submit`, `probe_orphan_lock`, `cleanup_artifacts` |
 | `executor.py` | 子进程生命周期与文件 IPC 协议 | `SubprocessExecutor`, `JobHandle`, `write_result_atomic` |
 | `scheduler.py` | 队列只读扫描与不可变投影缓存 | `JobScheduler`, `JobFacts`, `ScheduleResult` |
-| `dispatch.py` | 派发五关预检与子进程 submit 编排 | `DispatchMachine.dispatch_job` |
+| `dispatch.py` | 派发五关预检与子进程 submit 编排 | `DispatchMachine.dispatch_job`, `dispatch_next` |
 | `loop.py` | 事件驱动主循环与异常承重网 | `LoopRunner.run_loop`, `run_loop_impl` |
 | `completion.py`| 结果提交、清理、释放与恢复收尾 | `CompletionMachine.complete_job`, `apply_result` |
-| `failure.py` | 崩溃契约、级联失败、死锁归因与宽限 | `FailureMachine.apply_failed`, `handle_deadlock` |
 | `recovery.py` | 崩溃恢复、TOCTOU 闭环 abort、信号排空 | `RecoveryMachine.abort_in_flight`, `save_queue_crash_safe` |
 | `resource.py` | 限速与容量资源抽象与挂起语义 | `Resource`, `RateLimitResource`, `CapacityResource` |
-| `retry.py` | 退避时延计算与 rerun 策略判定（纯逻辑） | `compute_backoff`, `rerun_skips`, `input_changed` |
-| `inflight.py` | 在途任务条目共享数据结构 | `InFlightJob` |
 
 ---
 

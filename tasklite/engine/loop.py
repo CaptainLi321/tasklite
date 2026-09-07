@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from .runtime import RunContext
     from .recovery import RecoveryMachine
     from .dispatch import DispatchMachine
-    from .failure import FailureMachine
     from .completion import CompletionMachine
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
@@ -33,13 +32,11 @@ class LoopRunner:
         ctx: "RunContext",
         recovery: "RecoveryMachine",
         dispatch: "DispatchMachine",
-        failure: "FailureMachine",
         completion: "CompletionMachine",
     ) -> None:
         self._ctx = ctx
         self._recovery = recovery
         self._dispatch = dispatch
-        self._failure = failure
         self._completion = completion
 
     def run_loop(self) -> None:
@@ -189,7 +186,7 @@ class LoopRunner:
                     # 死锁判定：仅当 in_flight 为空时才是真死锁。
                     # in_flight 非空时资源可能被释放解锁，不判死锁，落到 drain 等待。
                     if not self._ctx.in_flight:
-                        should_break = self._failure.handle_deadlock(sched)
+                        should_break = self._ctx.store.handle_deadlock(sched, ctx=self._ctx)
                         if should_break:
                             break
                         continue
@@ -238,7 +235,7 @@ class LoopRunner:
                             f"{sorted(set(cycle_uids))} masked by finite min_wait."
                         )
                         sched.min_wait = float('inf')
-                        should_break = self._failure.handle_deadlock(sched)
+                        should_break = self._ctx.store.handle_deadlock(sched, ctx=self._ctx)
                         if should_break:
                             break
                         continue

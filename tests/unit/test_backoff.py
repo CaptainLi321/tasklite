@@ -490,10 +490,10 @@ class TestSplitDeadlockDirect:
     """_split_deadlock 直接单测——两种谓词类型（索引/uid）。"""
 
     def test_index_based_split(self):
-        from tasklite.engine.failure import FailureMachine
+        from tasklite.engine.store import StateStore
         queue = [{"task_type": "t", "job_id": "a"},
                  {"task_type": "t", "job_id": "b"}]
-        uids_metas, remaining = FailureMachine._split_deadlock(
+        uids_metas, remaining = StateStore._split_deadlock(
             queue, "MALFORMED_JOB",
             extract_uid=lambda jd: f"{jd['task_type']}::{jd['job_id']}",
             include=lambda idx, uid, root={0}: idx in root,
@@ -502,11 +502,11 @@ class TestSplitDeadlockDirect:
         assert remaining == [{"task_type": "t", "job_id": "b"}]
 
     def test_uid_based_split_preserves_order(self):
-        from tasklite.engine.failure import FailureMachine
+        from tasklite.engine.store import StateStore
         queue = [{"task_type": "t", "job_id": "a"},
                  {"task_type": "t", "job_id": "b"},
                  {"task_type": "t", "job_id": "c"}]
-        uids_metas, remaining = FailureMachine._split_deadlock(
+        uids_metas, remaining = StateStore._split_deadlock(
             queue, "DEPENDENCY_DEADLOCK",
             extract_uid=lambda jd: f"{jd['task_type']}::{jd['job_id']}",
             include=lambda idx, uid, roots={"t::b"}: uid in roots,

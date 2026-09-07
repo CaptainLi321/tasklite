@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .runtime import RunContext
-    from .failure import FailureMachine
 
 from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 from ..exceptions import _JobTerminated
@@ -33,9 +32,8 @@ logger = logging.getLogger("tasklite")
 class CompletionMachine:
     """结果提交 / 输出清理 / 资源释放 / 崩溃恢复的完成侧机器。"""
 
-    def __init__(self, ctx: "RunContext", failure: "FailureMachine") -> None:
+    def __init__(self, ctx: "RunContext") -> None:
         self._ctx = ctx
-        self._failure = failure
 
     def complete_job(self, entry: InFlightJob, result: ExecutionResult) -> None:
         """处理一个 in-flight job 的完成结果（薄包装）。

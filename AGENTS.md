@@ -28,7 +28,7 @@
    - 严禁丢弃式非单射净化（非单射净化会导致多对一碰撞，在 wall 去重时静默吞任务）。
 6. **单一出口原则**：
    - Job 终结（成功/失败/重试）必须唯一经由 `CompletionMachine.complete_job` 收尾；
-   - 失败终态登记必须唯一经由 `FailureMachine.apply_failed` 收敛（保证 wall/failed 互斥）；
+   - 失败终态登记必须唯一经由 `StateStore.apply_failed` / `StateStore.apply_failure` 收敛（保证 wall/failed 互斥）；
    - 运行态事件钩子必须唯一经由 `RunContext.fire_*` 单一出口触发。
 7. **持久化与并发事务纪律**：
    - SQLite `journal_mode=WAL` 必须在启动时验证生效（fail-loud，拒绝在断电可损坏模式下启动）；

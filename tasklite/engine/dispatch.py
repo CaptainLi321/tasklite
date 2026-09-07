@@ -15,7 +15,6 @@ from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .runtime import RunContext
-    from .failure import FailureMachine
     from .completion import CompletionMachine
 
 from ..taxonomy import (
@@ -49,10 +48,9 @@ class DispatchMachine:
     """派发预检 + 资源 acquire + 子进程 submit 的编排器。"""
 
     def __init__(
-        self, ctx: "RunContext", failure: "FailureMachine", completion: "CompletionMachine"
+        self, ctx: "RunContext", completion: "CompletionMachine"
     ) -> None:
         self._ctx = ctx
-        self._failure = failure
         self._completion = completion
 
     def dispatch_next(self) -> DispatchOutcome:
@@ -120,7 +118,7 @@ class DispatchMachine:
                     self._ctx.stats["cascade_failed"] += len(cascaded)
                 self._ctx.fire_job_completed(uid, meta, False, False)
                 return
-            self._failure.commit_failed_crash(uid, meta.get("error", "reject"), job_dict)
+            self._ctx.store.commit_failed_crash(uid, meta.get("error", "reject"), job_dict)
         except _JobTerminated:
             # 3-strike DLQ 成功——job 已终结，统计递增后正常返回即可
             self._ctx.stats[count_as] += 1
@@ -144,7 +142,7 @@ class DispatchMachine:
                 self._ctx.stats["skipped"] += 1
                 committed = self._ctx.backend.commit_skip(uid)
                 if not committed:
-                    self._failure.commit_skip_crash(uid, job_dict)
+                    self._ctx.store.commit_skip_crash(uid, job_dict)
                     raise AssertionError(
                         f"_commit_skip_crash for {uid} unexpectedly returned normally; "
                         f"contract requires raising _CommitCrashSignal."
@@ -379,20 +377,18 @@ class DispatchMachine:
                     # 重复 DLQ / 断言崩）。未注册时 pop/unregister 均安全。
                     self._ctx.in_flight.pop(uid, None)
                     # dispatch 失败达阈值视为业务侧确定性坏输入，下游自动级联跳过。
-                    self._failure.apply_failed(
-                        uid, {"error": _ERR_DISPATCH_FAILURE,
-                              "failures": failures, "detail": str(e)[:200]}
-                    )
-                    self._failure.cascade_fail(uid)
-                    # dispatch 3-strike 终态触发钩子——
-                    # 承诺「每个 job 终结时钩子恰好调用一次」（否则监控
-                    # 漏报该类失败）。与 _commit_failed_crash /
-                    # payload 校验等直接 commit 路径对称。
-                    self._ctx.fire_job_completed(
-                        uid, {"error": _ERR_DISPATCH_FAILURE,
-                              "failures": failures, "detail": str(e)[:200]},
-                        False, False,
-                    )
+                    fail_meta = {
+                        "error": _ERR_DISPATCH_FAILURE,
+                        "failures": failures,
+                        "detail": str(e)[:200],
+                    }
+                    self._ctx.store.apply_failed(uid, fail_meta)
+                    self._ctx.stats["failed"] += 1
+                    cascaded = self._ctx.store.cascade_fail(uid)
+                    if cascaded:
+                        self._ctx.stats["cascade_failed"] += len(cascaded)
+                    # dispatch 3-strike 终态触发钩子
+                    self._ctx.fire_job_completed(uid, fail_meta, False, False)
                     return
                 # DLQ 也失败（环境故障）→ 走 crash 路径
             # 与 KeyboardInterrupt 分支对称——若 entry 已

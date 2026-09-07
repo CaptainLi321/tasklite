@@ -8,15 +8,42 @@ from __future__ import annotations
 import copy
 import datetime
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
-from ..taxonomy import ERR_COMMIT_FAILURE_DLQ, ERR_JOB_DEPENDENCY, ErrorTaxonomy, _DEFAULT_TAXONOMY
+from ..taxonomy import (
+    ERR_COMMIT_FAILURE_DLQ,
+    ERR_DEADLOCK_GAP,
+    ERR_DEPENDENCY_DEADLOCK,
+    ERR_JOB_DEPENDENCY,
+    ERR_MALFORMED_JOB,
+    ERR_RESOURCE_DEADLOCK,
+    ErrorTaxonomy,
+    _DEFAULT_TAXONOMY,
+)
 
 logger = logging.getLogger("tasklite")
+
+COMMIT_FAILURE_DLQ_THRESHOLD = 3
+DEP_GRACE_SECONDS = 60.0
+DEADLOCK_GAP_MAX_ROUNDS = 5
+
+__all__ = [
+    "BulkFailureOutcome",
+    "COMMIT_FAILURE_DLQ_THRESHOLD",
+    "DEADLOCK_GAP_MAX_ROUNDS",
+    "DEP_GRACE_SECONDS",
+    "FailureOutcome",
+    "RetryOutcome",
+    "SkipOutcome",
+    "StateStore",
+    "SuccessOutcome",
+]
 
 
 @dataclass(frozen=True)
@@ -67,12 +94,19 @@ class StateStore:
         commit_failure_dlq_threshold: int = 3,
         taxonomy: Optional[ErrorTaxonomy] = None,
         on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None,
+        ctx: Optional[Any] = None,
     ) -> None:
         self._backend = backend
         self._state = state or PipelineState({}, {}, {}, [])
         self._threshold = commit_failure_dlq_threshold
         self._taxonomy = taxonomy or _DEFAULT_TAXONOMY
         self._on_job_completed = on_job_completed
+        self._ctx = ctx
+
+    def mark_failed(self, uid: str, meta: Dict[str, Any]) -> None:
+        """统一失败登记：清 wall 旧记录 + mark_failed。"""
+        sanitized = self._taxonomy.normalize_dlq_meta(meta)
+        self._state.mark_failed(uid, sanitized)
 
     @property
     def state(self) -> PipelineState:
@@ -195,6 +229,20 @@ class StateStore:
         self._handle_commit_failure(uid, "commit_retry", job_dict)
         return RetryOutcome(uid=uid, retry_dict=retry_dict)
 
+    def _requeue_and_crash(self, uid: str, job_dict: Optional[Dict[str, Any]], reason: str) -> None:
+        """单一出口：所有「commit 失败 → requeue 内存 + 崩溃」路径的收敛点。"""
+        self._state.unregister_in_flight(uid)
+        if job_dict is not None:
+            self._state.requeue_jobs([job_dict], front=True)
+        raise _CommitCrashSignal(
+            f"Backend commit returned False for {uid} ({reason}). "
+            f"On-disk queue preserved; crashing to avoid unbounded retry loop."
+        )
+
+    def commit_skip_crash(self, uid: str, job_dict: Optional[Dict[str, Any]] = None) -> None:
+        """commit_skip 失败时的终态：只 requeue + 崩溃，绝不写 DLQ。"""
+        self._requeue_and_crash(uid, job_dict, "commit_skip")
+
     def apply_skip(
         self,
         uid: str,
@@ -206,13 +254,8 @@ class StateStore:
             self._state.unregister_in_flight(uid)
             return SkipOutcome(uid=uid, was_known=True)
 
-        if job_dict is not None:
-            self._state.requeue_jobs([job_dict], front=True)
-        self._state.unregister_in_flight(uid)
-        raise _CommitCrashSignal(
-            f"Backend commit_skip returned False for {uid}; requeued to front. "
-            f"Crashing to retry; on-disk queue preserved."
-        )
+        self.commit_skip_crash(uid, job_dict)
+        return SkipOutcome(uid=uid, was_known=False)
 
     def apply_bulk_failure(
         self,
@@ -410,7 +453,255 @@ class StateStore:
             f"On-disk queue preserved; crashing to avoid unbounded retry loop."
         )
 
-    # ── 3. 内存状态与查询代理 ────────────────────────────────────────────
+    # ── 3. 死锁归因与宽限分析 ────────────────────────────────────────────
+
+    @staticmethod
+    def _split_deadlock(
+        queue: List[Dict[str, Any]],
+        error: str,
+        *,
+        extract_uid: Callable[[Dict[str, Any]], str],
+        include: Callable[[int, str], bool],
+    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Dict[str, Any]]]:
+        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」。"""
+        uids_metas: List[Tuple[str, Dict[str, Any]]] = []
+        remaining_queue: List[Dict[str, Any]] = []
+        for idx, jd in enumerate(queue):
+            uid = extract_uid(jd)
+            if include(idx, uid):
+                uids_metas.append((uid, {"error": error, "root_cause": True}))
+            else:
+                remaining_queue.append(jd)
+        return uids_metas, remaining_queue
+
+    def _dependency_grace(
+        self,
+        missing_indices: Sequence[int],
+        *,
+        ctx: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        grace_seconds: float = DEP_GRACE_SECONDS,
+    ) -> bool:
+        """宽限：缺失依赖的 job 是否应等待而非立即 DLQ。"""
+        effective_ctx = ctx or self._ctx
+        missing_set = set(missing_indices)
+        state = self._state
+        missing_uids: Set[str] = set()
+        for i in missing_indices:
+            if 0 <= i < len(state.queue):
+                try:
+                    missing_uids.add(Job.from_dict(state.queue[i]).uid)
+                except (KeyError, TypeError, ValueError):
+                    pass
+
+        episode = getattr(effective_ctx, "episode", None) if effective_ctx is not None else None
+        if episode is not None:
+            if episode.dep_grace_missing is not None and episode.dep_grace_missing != missing_uids:
+                episode.dep_grace_deadline = None
+            episode.dep_grace_missing = frozenset(missing_uids)
+            if hasattr(effective_ctx, "dep_grace_seconds"):
+                grace_seconds = effective_ctx.dep_grace_seconds
+
+        for i, jd in enumerate(state.queue):
+            if i in missing_set:
+                continue
+            try:
+                if scheduler is None and effective_ctx is not None and hasattr(effective_ctx, "scheduler"):
+                    scheduler = effective_ctx.scheduler
+                if scheduler is not None and hasattr(scheduler, "cached_job"):
+                    job = scheduler.cached_job(jd)
+                else:
+                    job = Job.from_dict(jd)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if all(dep in state.wall for dep in job.depends_on):
+                now = time.monotonic()
+                deadline = episode.dep_grace_deadline if episode is not None else None
+                if deadline is None:
+                    deadline = now + grace_seconds
+                    if episode is not None:
+                        episode.dep_grace_deadline = deadline
+                    logger.warning(
+                        f"DEPENDENCY GRACE: {len(missing_indices)} job(s) waiting "
+                        f"on missing deps; granting {grace_seconds}s "
+                        f"grace (runnable job(s) may spawn them)."
+                    )
+                if now < deadline:
+                    time.sleep(0.5)
+                    return True
+                logger.error(
+                    f"DEPENDENCY GRACE EXPIRED: {len(missing_indices)} job(s) "
+                    f"still waiting on missing deps after "
+                    f"{grace_seconds}s; treating as deadlock (DLQ)."
+                )
+                return False
+        return False
+
+    def _deadlock_gap_or_escalate(
+        self,
+        log_prefix: str,
+        *,
+        ctx: Optional[Any] = None,
+        max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS,
+    ) -> bool:
+        """死锁分类缺口的连续轮次升级逻辑。"""
+        effective_ctx = ctx or self._ctx
+        episode = getattr(effective_ctx, "episode", None) if effective_ctx is not None else None
+        if effective_ctx is not None and hasattr(effective_ctx, "deadlock_gap_max_rounds"):
+            max_rounds = effective_ctx.deadlock_gap_max_rounds
+
+        current_rounds = (episode.deadlock_gap_rounds if episode is not None else 0) + 1
+        if episode is not None:
+            episode.deadlock_gap_rounds = current_rounds
+
+        if current_rounds < max_rounds:
+            logger.error(
+                f"{log_prefix}: refusing to fail the whole queue, retrying next round "
+                f"({current_rounds}/{max_rounds})."
+            )
+            time.sleep(0.5)
+            return False
+        logger.critical(
+            f"{log_prefix} persisted for {max_rounds} rounds; "
+            f"escalating to whole-queue DLQ ({ERR_DEADLOCK_GAP})."
+        )
+        return True
+
+    def handle_deadlock(
+        self,
+        sched: Any,
+        *,
+        ctx: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        dep_grace_seconds: float = DEP_GRACE_SECONDS,
+        deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS,
+    ) -> bool:
+        """处理死锁：细粒度归因 + bulk_failure + cascade。"""
+        effective_ctx = ctx or self._ctx
+        state = self._state
+        if effective_ctx is not None:
+            if hasattr(effective_ctx, "scheduler"):
+                scheduler = effective_ctx.scheduler
+            if hasattr(effective_ctx, "dep_grace_seconds"):
+                dep_grace_seconds = effective_ctx.dep_grace_seconds
+            if hasattr(effective_ctx, "deadlock_gap_max_rounds"):
+                deadlock_gap_max_rounds = effective_ctx.deadlock_gap_max_rounds
+
+        if sched.malformed_indices:
+            logger.error(f"Deadlock: {len(sched.malformed_indices)} job(s) have malformed dict (unparseable).")
+            root = set(sched.malformed_indices)
+            uids_metas, remaining_queue = self._split_deadlock(
+                list(state.queue),
+                ERR_MALFORMED_JOB,
+                extract_uid=uid_from_job_dict,
+                include=lambda idx, uid, root=root: idx in root,
+            )
+        elif sched.unknown_resource_indices:
+            logger.error(f"Deadlock: {len(sched.unknown_resource_indices)} job(s) reference unknown resource(s).")
+            root = set(sched.unknown_resource_indices)
+            uids_metas, remaining_queue = self._split_deadlock(
+                list(state.queue),
+                ERR_RESOURCE_DEADLOCK,
+                extract_uid=lambda jd: Job.from_dict(jd).uid,
+                include=lambda idx, uid, root=root: idx in root,
+            )
+        elif sched.missing_dependency_indices:
+            if self._dependency_grace(
+                sched.missing_dependency_indices,
+                ctx=effective_ctx,
+                scheduler=scheduler,
+                grace_seconds=dep_grace_seconds,
+            ):
+                return False
+            logger.error(f"Deadlock: {len(sched.missing_dependency_indices)} job(s) have unresolvable (missing) dependencies.")
+            root = set(sched.missing_dependency_indices)
+            uids_metas, remaining_queue = self._split_deadlock(
+                list(state.queue),
+                ERR_DEPENDENCY_DEADLOCK,
+                extract_uid=lambda jd: Job.from_dict(jd).uid,
+                include=lambda idx, uid, root=root: idx in root,
+            )
+        elif sched.impossible_resource_indices:
+            logger.error(f"Deadlock: {len(sched.impossible_resource_indices)} job(s) request impossible resource amounts (exceeds capacity).")
+            root = set(sched.impossible_resource_indices)
+            uids_metas, remaining_queue = self._split_deadlock(
+                list(state.queue),
+                ERR_RESOURCE_DEADLOCK,
+                extract_uid=lambda jd: Job.from_dict(jd).uid,
+                include=lambda idx, uid, root=root: idx in root,
+            )
+        elif sched.waiting_for_dependency:
+            cycle_uids = set(state.find_dependency_cycles())
+            if not cycle_uids:
+                escalated = self._deadlock_gap_or_escalate(
+                    "Deadlock classification gap (waiting_for_dependency without cycle)",
+                    ctx=effective_ctx,
+                    max_rounds=deadlock_gap_max_rounds,
+                )
+                if not escalated:
+                    return False
+                uids_metas = [
+                    (Job.from_dict(jd).uid,
+                     {"error": ERR_DEADLOCK_GAP, "root_cause": True})
+                    for jd in state.queue
+                ]
+                remaining_queue = []
+            else:
+                logger.error(
+                    f"Deadlock detected: dependency cycle among {len(cycle_uids)} job(s): "
+                    f"{sorted(cycle_uids)}"
+                )
+                uids_metas, remaining_queue = self._split_deadlock(
+                    list(state.queue),
+                    ERR_DEPENDENCY_DEADLOCK,
+                    extract_uid=lambda jd: Job.from_dict(jd).uid,
+                    include=lambda idx, uid, roots=cycle_uids: uid in roots,
+                )
+        else:
+            escalated = self._deadlock_gap_or_escalate(
+                "Deadlock: unclassifiable deadlock (no known root cause)",
+                ctx=effective_ctx,
+                max_rounds=deadlock_gap_max_rounds,
+            )
+            if not escalated:
+                return False
+            uids_metas = [
+                (Job.from_dict(jd).uid,
+                 {"error": ERR_DEADLOCK_GAP, "root_cause": True})
+                for jd in state.queue
+            ]
+            remaining_queue = []
+
+        committed = self._backend.commit_bulk_failure(uids_metas)
+        if committed:
+            episode = getattr(effective_ctx, "episode", None) if effective_ctx is not None else None
+            if episode is not None:
+                episode.deadlock_gap_rounds = 0
+            for uid, meta in uids_metas:
+                self.apply_failed(uid, meta, unregister=False)
+                if effective_ctx is not None and hasattr(effective_ctx, "stats"):
+                    effective_ctx.stats["failed"] += 1
+                if effective_ctx is not None and hasattr(effective_ctx, "fire_job_completed"):
+                    effective_ctx.fire_job_completed(uid, meta, False, False)
+                elif self._on_job_completed:
+                    self._on_job_completed(uid, meta, False, False)
+            state.replace_queue(remaining_queue)
+            return not remaining_queue
+
+        queue, kept = self.commit_bulk_failed_crash(
+            "commit_bulk_failure", uids_metas, list(state.queue)
+        )
+        state.replace_queue(queue)
+        if kept:
+            raise _CommitCrashSignal(
+                f"Backend commit_bulk_failure returned False for "
+                f"{len(uids_metas)} deadlock job(s); {len(queue)} kept in queue "
+                f"with incremented _commit_failures (3-strike will DLQ them). "
+                f"Crashing to retry; on-disk queue preserved."
+            )
+        return not queue
+
+    # ── 4. 内存状态与查询代理 ────────────────────────────────────────────
 
     @property
     def queue(self) -> List[Dict[str, Any]]:
