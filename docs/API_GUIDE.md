@@ -249,7 +249,7 @@ n = pipeline.clear_history("t::a", where=("wall",))   # 精确 uid；where 可�
 - **`list_dlq()`**：只读查询，返回结构化条目 `DLQEntry(uid, error_type, error, attempts, failed_at, meta)`。损坏行（非 dict meta / 非 int `_attempt`）被兜底为 unknown 分类展示，不炸查询。
 - **`clear_dlq`**：清除 = 删 DLQ（**不自动 enqueue**，由调用方随后 `enqueue` 同名任务重跑）。默认保留 `fatal=true` 的确定性失败（`FatalError`），`keep_fatal=False` 一并删除；`task_types` 按 task_type 前缀过滤。
 - **`clear_history`**：完整 uid 精确删除；**以 `::` 结尾**的字符串按前缀匹配（防 `"download"` 误匹配 `"downloads::"`）。用于「手动误删文件强制重下」（wall 清掉该 uid）与历史垃圾清理。
-- **DLQ 结构化字段**：每条 DLQ 记录统一带 `error_type`（`fatal` / `dependency` / `deadlock` / `transient_exhausted` / `no_handler` / `validation` / `commit_failure` / `dispatch` / `unknown`）与 `failed_at`（UTC ISO 时间戳）——排障不用再翻整份日志。错误码登记于 `tasklite/error_codes.py`。
+- **DLQ 结构化字段**：每条 DLQ 记录统一带 `error_type`（`fatal` / `dependency` / `deadlock` / `transient_exhausted` / `no_handler` / `validation` / `commit_failure` / `dispatch` / `unknown`）与 `failed_at`（UTC ISO 时间戳）——排障不用再翻整份日志。错误码登记于 `tasklite/taxonomy.py`。
 
 ### 7.2 种子化 API（存档迁移官方通道）
 
@@ -469,7 +469,7 @@ wall 条目除业务 meta 外携带：`run_count`（成功次数）、`last_run_
 
 ## 15. 错误码与 DLQ 字段参考
 
-`tasklite/error_codes.py` 是错误码单一事实来源：
+`tasklite/taxonomy.py` 是错误码单一事实来源：
 
 | 错误码 | error_type |
 |--------|-----------|

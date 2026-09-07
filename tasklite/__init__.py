@@ -25,6 +25,37 @@ from .utils.injective import (
     sanitize_job_component,
 )
 
+# Public API - Taxonomy & Validation
+from .taxonomy import (
+    ERR_COMMIT_FAILURE_DLQ,
+    ERR_DEADLOCK_GAP,
+    ERR_DEPENDENCY_DEADLOCK,
+    ERR_DISPATCH_FAILURE,
+    ERR_JOB_DEPENDENCY,
+    ERR_MALFORMED_JOB,
+    ERR_MAX_RETRIES,
+    ERR_NO_HANDLER,
+    ERR_PAYLOAD_VALIDATION,
+    ERR_RESOURCE_DEADLOCK,
+    ERROR_TYPE_COMMIT_FAILURE,
+    ERROR_TYPE_DEADLOCK,
+    ERROR_TYPE_DEPENDENCY,
+    ERROR_TYPE_DISPATCH,
+    ERROR_TYPE_FATAL,
+    ERROR_TYPE_NO_HANDLER,
+    ERROR_TYPE_TRANSIENT_EXHAUSTED,
+    ERROR_TYPE_UNKNOWN,
+    ERROR_TYPE_VALIDATION,
+    ErrorCategory,
+    ErrorClassification,
+    ErrorTaxonomy,
+    ValidationErrorItem,
+    ValidationResult,
+    classify_error_type,
+    validate_payload,
+    validate_resource_amounts,
+)
+
 # Public API - Contrib ecosystem
 from . import contrib
 
@@ -51,6 +82,34 @@ __all__ = [
     "job_ref",
     "progress_hook",
     "slice_list",
+    # Taxonomy, Errors & Validation
+    "ErrorTaxonomy",
+    "ErrorCategory",
+    "ErrorClassification",
+    "ValidationErrorItem",
+    "ValidationResult",
+    "classify_error_type",
+    "validate_payload",
+    "validate_resource_amounts",
+    "ERR_DEPENDENCY_DEADLOCK",
+    "ERR_JOB_DEPENDENCY",
+    "ERR_PAYLOAD_VALIDATION",
+    "ERR_MAX_RETRIES",
+    "ERR_NO_HANDLER",
+    "ERR_RESOURCE_DEADLOCK",
+    "ERR_MALFORMED_JOB",
+    "ERR_COMMIT_FAILURE_DLQ",
+    "ERR_DISPATCH_FAILURE",
+    "ERR_DEADLOCK_GAP",
+    "ERROR_TYPE_FATAL",
+    "ERROR_TYPE_TRANSIENT_EXHAUSTED",
+    "ERROR_TYPE_DEPENDENCY",
+    "ERROR_TYPE_DEADLOCK",
+    "ERROR_TYPE_NO_HANDLER",
+    "ERROR_TYPE_VALIDATION",
+    "ERROR_TYPE_COMMIT_FAILURE",
+    "ERROR_TYPE_DISPATCH",
+    "ERROR_TYPE_UNKNOWN",
     # Injective & Fingerprint
     "content_fingerprint",
     "escape_injective",
@@ -67,4 +126,5 @@ __all__ = [
     # Version
     "__version__",
 ]
+
 

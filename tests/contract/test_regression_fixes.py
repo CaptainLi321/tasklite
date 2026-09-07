@@ -19,7 +19,7 @@ from tasklite.engine.scheduler import JobScheduler
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState, uid_from_job_dict
-from tasklite.utils.validation import validate_payload
+from tasklite.taxonomy import validate_payload
 from tests.helpers import make_fake_process_class, patch_multiprocessing_for_fakes
 
 

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from .runtime import RunContext
     from .failure import FailureMachine
 
-from ..error_codes import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
+from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 from ..exceptions import _JobTerminated
 from ..models.job import Job
 from .channel import ArtifactCleanupMode

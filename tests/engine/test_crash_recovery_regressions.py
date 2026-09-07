@@ -111,7 +111,7 @@ class TestPartialAcquireRelease:
                                   default_resources={"slot": 1.0})
         pipeline.enqueue([Job("t", "j1", payload={}, resources={"bad": 1.0})])
 
-        from tasklite.error_codes import ERR_NO_HANDLER as _ERR_NO_HANDLER  # noqa: F401
+        from tasklite.taxonomy import ERR_NO_HANDLER as _ERR_NO_HANDLER  # noqa: F401
 
         # 合并后 resources = {slot:1, bad:1}；acquire slot 成功、acquire bad 抛异常
         with pytest.raises(Exception):
@@ -210,7 +210,7 @@ class TestCommitCrashSignalCleanup:
         抛 ``_CommitCrashSignal``。若被 ``except Exception`` 捕获会**二次释放**
         资源（used 变负）。本测试断言资源账目恰好释放一次（used==0）。
         """
-        from tasklite.utils.validation import validate_payload  # noqa: F401
+        from tasklite.taxonomy import validate_payload  # noqa: F401
 
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("slot", max_capacity=4.0))

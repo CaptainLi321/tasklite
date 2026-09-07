@@ -18,7 +18,7 @@ from tasklite.engine.executor import (
 from tasklite.engine.resource import CapacityResource
 from tasklite.models.job import Job
 from tasklite.pipeline import TaskLite
-from tasklite.utils.validation import validate_payload
+from tasklite.taxonomy import validate_payload
 
 SRC_DIR = Path(__file__).resolve().parent.parent.parent / "tasklite"
 

@@ -44,7 +44,7 @@ from .models.job import Job
 from .models.state import PipelineState, uid_from_job_dict
 from .utils.jsonutil import dumps, loads
 from .utils.lockfile import release_lock, try_acquire_lock
-from .utils.validation import validate_resource_amounts
+from .taxonomy import validate_resource_amounts
 
 logger = logging.getLogger("tasklite")
 
@@ -780,7 +780,7 @@ class TaskLite:
         self.backend.seed_cursor(key, value)
 
     def _validate_resource_amounts(self, resources: Dict[str, float], where: str) -> None:
-        """数值校验转发（与 Job.__init__ 共用 utils.validation 单点）。
+        """数值校验转发（与 Job.__init__ 共用 taxonomy 单点）。
 
         handler 默认资源在注册时即校验，防止负值/NaN/Inf 绕过 Job 构造
         校验后在派发时引发 acquire 崩溃（负值）或调度 NaN 污染（无限空转）。

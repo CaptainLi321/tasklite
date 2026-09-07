@@ -5,7 +5,7 @@ import math
 from typing import Any, Dict, List, Optional
 
 from ..utils.lockfile import safe_uid_filename
-from ..utils.validation import validate_resource_amounts
+from ..taxonomy import validate_resource_amounts
 
 # uid 派生的 IPC 文件名（锁 / result / signals / outputs）
 # 无截断——job_id/task_type 超长时文件名超 255 字节（EXT4 单文件名字节
@@ -155,7 +155,7 @@ class Job:
             )
         self.resources = dict(resources) if resources else {}
         # 数值校验单点化（与 pipeline.register_handler 的默认资源
-        # 校验共用 utils.validation.validate_resource_amounts）——负值/NaN/Inf
+        # 校验共用 taxonomy.validate_resource_amounts）——负值/NaN/Inf
         # 会在调度器 acquire 时抛 ValueError（若抛在 try 之外，部分资源
         # 永久泄漏），且 NaN 会毒化 CapacityResource 的 used 账目导致 livelock。
         # 构造时即拒绝（bool 是 int 子类，isinstance(True,(int,float)) 为
