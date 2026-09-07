@@ -28,8 +28,7 @@ from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
 from ..models.job import Job
 from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE
-from .channel import ArtifactCleanupMode
-from .executor import JobHandle
+from .channel import ArtifactCleanupMode, JobHandle
 from .inflight import InFlightJob
 
 logger = logging.getLogger("tasklite")

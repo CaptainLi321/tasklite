@@ -9,11 +9,11 @@ from typing import (
 if TYPE_CHECKING:
     from ..models.job import Job
     from ..models.state import PipelineState
-    from .executor import JobHandle
+    from .channel import JobHandle
     from .resource import ResourceManager, ResourceLease
 
 from ..models.job import Job
-from .executor import JobHandle
+from .channel import JobHandle
 
 
 @dataclass

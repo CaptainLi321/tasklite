@@ -15,7 +15,7 @@ import json
 
 import pytest
 
-from tasklite.engine.executor import (
+from tasklite.engine.channel import (
     _decode_ipc_result,
 )
 from tasklite.models.job import Job
@@ -49,7 +49,7 @@ class TestDecodeIpcsResultDefense:
         """哨兵碰撞防御：用户 handler 返回 ["__tl_tuple_v1", 123] 撞哨兵
         且还原段非 list/tuple → 原样返回 list，下游以 invalid-return-type
         明确失败进 DLQ——绝不 tuple(123) 抛 TypeError 穿透 drain 崩 run。"""
-        from tasklite.engine.executor import _decode_raw_result
+        from tasklite.engine.channel import _decode_raw_result
         for bad in (123, {"a": 1}, "text", None):
             out = _decode_raw_result(["__tl_tuple_v1", bad])
             assert out == ["__tl_tuple_v1", bad] # 原样返回，不抛异常
@@ -62,7 +62,7 @@ class TestDecodeIpcsResultDefense:
         一级）。KeyboardInterrupt/SystemExit 不被吞（只捕 Exception）。"""
         res = dict(_BASE_OK)
         monkeypatch.setattr(
-            "tasklite.engine.executor._normalize_handler_result",
+            "tasklite.engine.channel._normalize_handler_result",
             lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
         )
         result = _decode(res)
@@ -140,7 +140,7 @@ class TestDecodeIpcsResultDefense:
     def test_missing_output_marks_failed(self, tmp_path):
         """防御分支（mutmut_208）：成功但声明输出文件不存在 → Missing output
         失败（输出存在性校验）。"""
-        from tasklite.engine.executor import append_output
+        from tasklite.engine.channel import append_output
         ipc = str(tmp_path)
         uid = "t::a"
         append_output(ipc, uid, str(tmp_path / "missing.jpg"), True)
@@ -151,7 +151,7 @@ class TestDecodeIpcsResultDefense:
     def test_present_output_passes(self, tmp_path):
         """对偶路径：声明输出文件存在 → 校验通过（防「缺失→失败」误伤
         正常路径）。"""
-        from tasklite.engine.executor import append_output
+        from tasklite.engine.channel import append_output
         ipc = str(tmp_path)
         uid = "t::a"
         out = tmp_path / "present.jpg"
@@ -163,7 +163,7 @@ class TestDecodeIpcsResultDefense:
     def test_cache_output_skips_existence_check(self, tmp_path):
         """对偶路径：kind=cache 的临时文件跳过存在性校验（原子产出的 .part
         已被 os.replace，校验必然失败——跳过是设计而非漏洞）。"""
-        from tasklite.engine.executor import append_output
+        from tasklite.engine.channel import append_output
         ipc = str(tmp_path)
         uid = "t::a"
         append_output(ipc, uid, str(tmp_path / "cache.part"), True, kind="cache")
@@ -178,8 +178,8 @@ class TestBuildTerminalFailureDefense:
     def test_timeout_transient_requests_retry(self):
         """防御分支（mutmut_11/17）：timeout_is_transient=True 时超时 → 按
         瞬态重试（success=False + retry_requested=True）而非直接 DLQ。"""
-        from tasklite.engine.executor import (
-            MultiprocessingExecutor, JobHandle,
+        from tasklite.engine.channel import (
+            ExecutionChannel, JobHandle,
         )
 
         class _P:
@@ -192,7 +192,7 @@ class TestBuildTerminalFailureDefense:
             uid="t::a", process=_P(), deadline=1.0, timeout=5.0,
             job=_Job(), ipc_dir="/tmp",
         )
-        result = MultiprocessingExecutor._build_terminal_failure(
+        result = ExecutionChannel._build_terminal_failure(
             _P(), handle, is_timeout=True,
         )
         assert result.success is False
@@ -202,8 +202,8 @@ class TestBuildTerminalFailureDefense:
     def test_timeout_not_transient_marks_failed(self):
         """对偶路径：timeout_is_transient=False（默认）时超时 → 直接失败
         （TIMEOUT 错误，不重试）。"""
-        from tasklite.engine.executor import (
-            MultiprocessingExecutor, JobHandle,
+        from tasklite.engine.channel import (
+            ExecutionChannel, JobHandle,
         )
 
         class _P:
@@ -216,7 +216,7 @@ class TestBuildTerminalFailureDefense:
             uid="t::a", process=_P(), deadline=1.0, timeout=5.0,
             job=_Job(), ipc_dir="/tmp",
         )
-        result = MultiprocessingExecutor._build_terminal_failure(
+        result = ExecutionChannel._build_terminal_failure(
             _P(), handle, is_timeout=True,
         )
         assert result.success is False
@@ -226,8 +226,8 @@ class TestBuildTerminalFailureDefense:
     def test_crash_exitcode_classified(self):
         """对偶路径：非超时且 exitcode != 0 → PROCESS_CRASH 分类（mutmut_34
         的 success=False→None 变异点）。"""
-        from tasklite.engine.executor import (
-            MultiprocessingExecutor, JobHandle,
+        from tasklite.engine.channel import (
+            ExecutionChannel, JobHandle,
         )
 
         class _P:
@@ -240,7 +240,7 @@ class TestBuildTerminalFailureDefense:
             uid="t::a", process=_P(), deadline=1.0, timeout=5.0,
             job=_Job(), ipc_dir="/tmp",
         )
-        result = MultiprocessingExecutor._build_terminal_failure(
+        result = ExecutionChannel._build_terminal_failure(
             _P(), handle, is_timeout=False,
         )
         assert result.success is False
@@ -249,8 +249,8 @@ class TestBuildTerminalFailureDefense:
     def test_no_ipc_result_classified(self):
         """对偶路径：非超时、exitcode 为 0/None → NO_IPC_RESULT（mutmut_34
         的 success=False→None 另一变异点）。"""
-        from tasklite.engine.executor import (
-            MultiprocessingExecutor, JobHandle,
+        from tasklite.engine.channel import (
+            ExecutionChannel, JobHandle,
         )
 
         class _P:
@@ -263,7 +263,7 @@ class TestBuildTerminalFailureDefense:
             uid="t::a", process=_P(), deadline=1.0, timeout=5.0,
             job=_Job(), ipc_dir="/tmp",
         )
-        result = MultiprocessingExecutor._build_terminal_failure(
+        result = ExecutionChannel._build_terminal_failure(
             _P(), handle, is_timeout=False,
         )
         assert result.success is False
@@ -277,7 +277,7 @@ class TestReadDeclarationsSkipBadLines:
 
     def test_read_outputs_skips_bad_line_keeps_good_ones(self, tmp_path):
         """坏行 + 后随好行 → 坏行跳过、好行保留（continue→break 变异点）。"""
-        from tasklite.engine.executor import read_outputs
+        from tasklite.engine.channel import read_outputs
         ipc = str(tmp_path)
         uid = "t::a"
         p = tmp_path / f"t%3A%3Aa.outputs.jsonl"
@@ -293,7 +293,7 @@ class TestReadDeclarationsSkipBadLines:
 
     def test_read_outputs_skips_empty_line(self, tmp_path):
         """空行跳过（continue→break 的另一变异点：空行后仍有数据）。"""
-        from tasklite.engine.executor import read_outputs
+        from tasklite.engine.channel import read_outputs
         ipc = str(tmp_path)
         uid = "t::a"
         p = tmp_path / f"t%3A%3Aa.outputs.jsonl"
@@ -308,7 +308,7 @@ class TestReadDeclarationsSkipBadLines:
 
     def test_read_signals_skips_bad_line_keeps_good_ones(self, tmp_path):
         """signals 坏行跳过 + 后随好行保留（continue→break 变异点）。"""
-        from tasklite.engine.executor import read_signals
+        from tasklite.engine.channel import read_signals
         ipc = str(tmp_path)
         uid = "t::a"
         p = tmp_path / f"t%3A%3Aa.signals.jsonl"
@@ -324,7 +324,7 @@ class TestReadDeclarationsSkipBadLines:
 
     def test_read_inputs_skips_bad_line_keeps_good_ones(self, tmp_path):
         """inputs 坏行跳过 + 后随好行保留（continue→break 变异点）。"""
-        from tasklite.engine.executor import read_inputs
+        from tasklite.engine.channel import read_inputs
         ipc = str(tmp_path)
         uid = "t::a"
         p = tmp_path / f"t%3A%3Aa.inputs.jsonl"

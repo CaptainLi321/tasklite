@@ -2,7 +2,7 @@
 
 import pytest
 
-from tasklite.engine.executor import JobHandle
+from tasklite.engine.channel import JobHandle
 from tasklite.engine.inflight import InFlightJob, InFlightTracker
 from tasklite.engine.resource import CapacityResource, ResourceManager
 from tasklite.models.job import Job

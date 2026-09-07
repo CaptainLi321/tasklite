@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from tasklite.engine.executor import (
-    MultiprocessingExecutor,
+from tasklite.engine.channel import (
+    ExecutionChannel,
     _normalize_handler_result,
     append_signal,
     cleanup_ipc_files,
@@ -278,7 +278,7 @@ class TestFileBasedIPC:
 
     def test_write_result_no_tmp_leftover(self, tmp_path):
         """原子写后 .tmp 文件被 rename 掉，不留残留。"""
-        from tasklite.engine.executor import result_tmp_path
+        from tasklite.engine.channel import result_tmp_path
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
         write_result_atomic(
             str(tmp_path), "t::j1", {"status": "success"}, incarnation=inc
@@ -346,7 +346,7 @@ class TestFinalizeProcessKillRace:
                 self.closed = True
 
         p = RaceProcess()
-        MultiprocessingExecutor._finalize_process(p)
+        ExecutionChannel._finalize_process(p)
         assert p.joined, "join must still be called after kill race (reap zombie)"
         assert p.closed, "close must still be called after kill race"
 
@@ -363,14 +363,14 @@ class TestSubmitStartFailureCleanup:
             def Process(self, *args, **kwargs):
                 raise RuntimeError("process start failed")
 
-        exec_ = MultiprocessingExecutor(mp_ctx=ExplodingCtx(), ipc_dir=str(tmp_path))
+        exec_ = ExecutionChannel(mp_ctx=ExplodingCtx(), ipc_dir=str(tmp_path))
         ctx = TaskContext(Job("t", "j1", payload={}), set(), set(), {})
         with pytest.raises(RuntimeError, match="process start failed"):
             exec_.submit(lambda j, c: True, Job("t", "j1", payload={}), ctx, 60, [])
 
     def test_submit_requires_ipc_dir(self):
         """未配置 ipc_dir → 明确报错（不静默 fallback）。"""
-        exec_ = MultiprocessingExecutor(mp_ctx=type("Ctx", (), {"Process": lambda *a, **k: None})())
+        exec_ = ExecutionChannel(mp_ctx=type("Ctx", (), {"Process": lambda *a, **k: None})())
         ctx = TaskContext(Job("t", "j1", payload={}), set(), set(), {})
         with pytest.raises(ValueError, match="ipc_dir"):
             exec_.submit(lambda j, c: True, Job("t", "j1", payload={}), ctx, 60, [])
@@ -474,21 +474,21 @@ class TestDeadlockBulkFailureCrashes:
         allow_nan=False 确保 NaN/Infinity 在子进程侧即判失败，
         防止非标准 JSON 写入结果文件。
         """
-        from tasklite.engine.executor import _normalize_handler_result
+        from tasklite.engine.channel import _normalize_handler_result
         ok, meta = _normalize_handler_result({"size": float("nan")})
         assert ok is False, "NaN result_meta 必须被拒绝"
         assert "not JSON-serializable" in meta["error"]
 
     def test_nan_in_result_tuple_rejected(self):
         """ 回归：tuple(bool, dict) 的 dict 含 NaN 同样被拒绝。"""
-        from tasklite.engine.executor import _normalize_handler_result
+        from tasklite.engine.channel import _normalize_handler_result
         ok, meta = _normalize_handler_result((True, {"v": float("inf")}))
         assert ok is False, "Inf result_meta 必须被拒绝"
         assert "not JSON-serializable" in meta["error"]
 
     def test_write_result_atomic_rejects_nan(self, tmp_path):
         """ 回归：write_result_atomic 写含 NaN 的结果必须抛（不落非标准 JSON）。"""
-        from tasklite.engine.executor import write_result_atomic, result_path
+        from tasklite.engine.channel import write_result_atomic, result_path
         import json as _json
         ipc_dir = str(tmp_path / "ipc")
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"

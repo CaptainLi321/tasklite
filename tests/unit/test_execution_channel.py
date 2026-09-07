@@ -9,8 +9,9 @@ from tasklite.engine.channel import (
     ArtifactCleanupMode,
     ExecutionChannel,
     ExecutionHandle,
+    ExecutionResult,
+    result_path,
 )
-from tasklite.engine.executor import ExecutionResult, result_path
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
 from tasklite.utils.ipc import (

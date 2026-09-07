@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
-from tasklite.engine.executor import (
+from tasklite.engine.channel import (
     _decode_ipc_result,
     _decode_raw_result,
     _encode_raw_result,
@@ -153,7 +153,7 @@ class TestIdentityNonVacuity:
         in-flight 后才进 queue，_abort_in_flight 不会二次 requeue 同 uid。
         直接调用验证（不跑完整 pipeline，避免 commit_retry 走真后端）。"""
         from tasklite.pipeline import _CommitCrashSignal, _InFlightJob
-        from tasklite.engine.executor import ExecutionResult
+        from tasklite.engine.channel import ExecutionResult
 
         # 构造已 dispatch 的 job（uid 在 in-flight）
         from tasklite.models.state import PipelineState
@@ -345,7 +345,7 @@ class TestSerializationContract:
         写 "error"，decoder 本就处理 "retry"）——错层，不 kill 变异。
         本测试真实持锁 → 调 _mp_worker_wrapper → 断言其结果文件 status。
         """
-        from tasklite.engine.executor import (
+        from tasklite.engine.channel import (
             _mp_worker_wrapper, read_result_file, result_path,
         )
         from tasklite.models.context import TaskContext

@@ -15,7 +15,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
-from tasklite.engine.executor import _normalize_handler_result
+from tasklite.engine.channel import _normalize_handler_result
 from tasklite.models.job import Job
 from tasklite.pipeline import TaskLite
 from tests.helpers import make_pipeline

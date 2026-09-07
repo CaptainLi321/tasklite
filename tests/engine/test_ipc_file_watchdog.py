@@ -17,7 +17,7 @@ from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
 
 from tests.helpers import make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes
-from tasklite.engine.executor import (
+from tasklite.engine.channel import (
     write_result_atomic, result_path, _normalize_handler_result,
     _encode_raw_result,
 )
@@ -274,7 +274,7 @@ class TestStaleResultRestore:
 
     def test_success_missing_raw_result_direct_decode_does_not_crash(self):
         """ 回归（drain 路径）：decode 直接收到缺 raw_result 的 dict 不抛 KeyError。"""
-        from tasklite.engine.executor import _decode_ipc_result
+        from tasklite.engine.channel import _decode_ipc_result
         from tasklite.models.job import Job
         job = Job("h", "a")
         res = _decode_ipc_result({"status": "success"}, None, job, [])
@@ -297,12 +297,12 @@ class TestSignalsFileTruncateSemantics:
         重复消费）。注意 open 必须是 "r+"——只读模式 truncate 抛
         io.UnsupportedOperation（OSError 子类）会被静默吞掉沦为死代码。
         """
-        from tasklite.engine.executor import append_signal, read_signals
+        from tasklite.engine.channel import append_signal, read_signals
 
         append_signal(str(tmp_path), "t::x", "api", 30.0)
         append_signal(str(tmp_path), "t::x", "db", 60.0)
 
-        from tasklite.engine.executor import signals_path
+        from tasklite.engine.channel import signals_path
         leftover = signals_path(str(tmp_path), "t::x")
 
         real_unlink_ref = leftover # noqa: F841（可读性：被测文件即下方断言对象）
@@ -329,8 +329,8 @@ class TestSignalsFileTruncateSemantics:
         """
         import os
 
-        from tasklite.engine.executor import (
-            MultiprocessingExecutor, write_result_atomic,
+        from tasklite.engine.channel import (
+            ExecutionChannel, write_result_atomic,
         )
 
         run_id = "a" * 32
@@ -347,7 +347,7 @@ class TestSignalsFileTruncateSemantics:
         for p in tmp_path.glob("*.result.json"):
             os.utime(p, ns=(1234567890, 1234567890))
 
-        ex = MultiprocessingExecutor.__new__(MultiprocessingExecutor)
+        ex = ExecutionChannel.__new__(ExecutionChannel)
         ex.ipc_dir = str(tmp_path)
         job = Job("h", "x")
         result = ex.consume_stale_result("t::x", job)
@@ -359,7 +359,7 @@ class TestSignalsFileTruncateSemantics:
 
     def test_worker_rejects_missing_incarnation(self, tmp_path):
         """incarnation 缺失 fail-loud（防 .None.result.json 垃圾路径）。"""
-        from tasklite.engine.executor import _mp_worker_wrapper
+        from tasklite.engine.channel import _mp_worker_wrapper
 
         ctx = TaskContext(Job("t", "x"), set, set, {}) # 无 incarnation
         with pytest.raises(RuntimeError, match="incarnation"):

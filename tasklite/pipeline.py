@@ -9,7 +9,6 @@ from .backend.base import AbstractStateBackend, classify_error_type
 from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
 from .engine.channel import ExecutionChannel
-from .engine.executor import MultiprocessingExecutor
 from .engine.inflight import InFlightJob as _InFlightJob, InFlightTracker
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import (
@@ -205,7 +204,7 @@ class TaskLite:
         # 主进程轮询文件存在（无 mp.Queue 伪阻塞点）。
         self.ipc_dir = str(self.state_dir / "ipc")
         Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
-        self.executor = MultiprocessingExecutor(mp_ctx=self._mp_ctx, ipc_dir=self.ipc_dir)
+        channel = ExecutionChannel(mp_ctx=self._mp_ctx, ipc_dir=self.ipc_dir)
         # 传入 handlers 引用，调度器按「handler 默认资源 ∪ job 资源」检查
         # 可用性，与 _dispatch_job 的实际 acquire 一致（堵住限速/容量绕过）。
         self.scheduler = JobScheduler(self.resources, self.handlers)
@@ -234,7 +233,7 @@ class TaskLite:
             backend=self._backend,
             resources=self.resources,
             handlers=self.handlers,
-            executor=self.executor,
+            channel=channel,
             transient_registry=self.transient_registry,
             discovery_rerun=self._discovery_rerun,
         )
@@ -262,6 +261,19 @@ class TaskLite:
     def channel(self) -> ExecutionChannel:
         """执行通道深模块。"""
         return self._ctx.channel
+
+    @channel.setter
+    def channel(self, value: ExecutionChannel) -> None:
+        self._ctx.channel = value
+
+    @property
+    def executor(self) -> ExecutionChannel:
+        """向后兼容属性：统一返回 ExecutionChannel。"""
+        return self._ctx.channel
+
+    @executor.setter
+    def executor(self, value: ExecutionChannel) -> None:
+        self._ctx.channel = value
 
     @property
     def _failure(self) -> StateStore:

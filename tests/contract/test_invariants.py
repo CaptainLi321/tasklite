@@ -8,7 +8,7 @@ import sqlite3
 from unittest import mock
 import pytest
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
-from tasklite.engine.executor import _normalize_handler_result
+from tasklite.engine.channel import _normalize_handler_result
 from tasklite.models.job import Job
 from tasklite.pipeline import TaskLite
 from tests.helpers import make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes

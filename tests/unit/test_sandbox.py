@@ -76,7 +76,7 @@ class TestOutputSandbox:
         ctx = self._ctx(tmp_path, ipc_dir=str(ipc_dir))
         resolved = ctx.declare_output("file.txt", cleanup_on_fail=False)
         assert resolved == str(tmp_path / "file.txt")
-        from tasklite.engine.executor import read_outputs
+        from tasklite.engine.channel import read_outputs
         outputs = read_outputs(str(ipc_dir), ctx.job.uid)
         assert [(p, cl, k) for p, cl, k in outputs] == [(str(tmp_path / "file.txt"), False, "output")]
     def test_unicode_path_accepted(self, tmp_path):
@@ -193,7 +193,7 @@ class TestSandboxAdversarialInputs:
         ctx.declare_output("file1.txt")
         ctx.declare_output("file2.txt")
         ctx.declare_output("file3.txt")
-        from tasklite.engine.executor import read_outputs
+        from tasklite.engine.channel import read_outputs
         outputs = read_outputs(str(ipc_dir), ctx.job.uid)
         names = [Path(r).name for r, _, _ in outputs]
         assert set(names) == {"file1.txt", "file2.txt", "file3.txt"}
@@ -230,7 +230,7 @@ class TestSandboxAdversarialInputs:
         ctx.ipc_dir = str(ipc_dir)
         ctx.declare_output("a.txt", cleanup_on_fail=True)
         ctx.declare_output("b.txt", cleanup_on_fail=False)
-        from tasklite.engine.executor import read_outputs
+        from tasklite.engine.channel import read_outputs
         outputs = read_outputs(str(ipc_dir), ctx.job.uid)
         flags = [cl for _, cl, _ in outputs]
         assert flags == [True, False]

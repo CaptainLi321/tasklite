@@ -55,14 +55,7 @@ _RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
 _RAW_TUPLE_SENTINEL = "__tl_tuple_v1"
 
 
-def _get_executor_patch(name: str, default: Any) -> Any:
-    """动态获取 executor 兼容模块可能被测试 monkeypatch 的符号。"""
-    mod = sys.modules.get("tasklite.engine.executor")
-    if mod is not None:
-        val = getattr(mod, name, default)
-        if val is not default:
-            return val
-    return default
+
 
 
 
@@ -196,9 +189,8 @@ def _write_result_with_degradation(
     ipc_dir: Union[str, Path], uid: str, payload: Dict[str, Any], incarnation: Optional[str] = None
 ) -> None:
     """worker 结果落盘的唯一出口：完整写失败时两级降级，绝不裸抛 OSError。"""
-    atomic_fn = _get_executor_patch("write_result_atomic", write_result_atomic)
     try:
-        atomic_fn(ipc_dir, uid, payload, incarnation=incarnation)
+        write_result_atomic(ipc_dir, uid, payload, incarnation=incarnation)
         return
     except OSError as e:
         logger.warning(
@@ -206,7 +198,7 @@ def _write_result_with_degradation(
         )
     time.sleep(0.05)
     try:
-        atomic_fn(ipc_dir, uid, payload, incarnation=incarnation)
+        write_result_atomic(ipc_dir, uid, payload, incarnation=incarnation)
         return
     except OSError as e:
         write_err = str(e)
@@ -222,7 +214,7 @@ def _write_result_with_degradation(
     if payload.get("lock_conflict"):
         degraded["lock_conflict"] = True
     try:
-        atomic_fn(ipc_dir, uid, degraded, incarnation=incarnation)
+        write_result_atomic(ipc_dir, uid, degraded, incarnation=incarnation)
     except OSError as e2:
         logger.error(
             f"degraded result write also failed for {uid}: {e2}; worker exiting without IPC result"
@@ -354,10 +346,8 @@ def _decode_ipc_result(
                 result_meta = {"error": "CORRUPT_RESULT_FILE: missing raw_result"}
             else:
                 try:
-                    decode_raw_fn = _get_executor_patch("_decode_raw_result", _decode_raw_result)
-                    normalize_fn = _get_executor_patch("_normalize_handler_result", _normalize_handler_result)
-                    raw_result = decode_raw_fn(res["raw_result"])
-                    success, result_meta = normalize_fn(raw_result)
+                    raw_result = _decode_raw_result(res["raw_result"])
+                    success, result_meta = _normalize_handler_result(raw_result)
                 except Exception as e:
                     success = False
                     result_meta = {

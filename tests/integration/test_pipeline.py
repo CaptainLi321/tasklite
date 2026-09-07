@@ -580,7 +580,7 @@ class TestNormalizeHandlerResult:
         ],
     )
     def test_normalize_contract(self, raw, expected):
-        from tasklite.engine.executor import _normalize_handler_result
+        from tasklite.engine.channel import _normalize_handler_result
 
         success, meta = _normalize_handler_result(raw)
         exp_success, exp_meta = expected
@@ -593,7 +593,7 @@ class TestNormalizeHandlerResult:
     def test_ordered_dict_and_job_instance(self):
         """OrderedDict 视作 dict；Job 实例视作未识别类型。"""
         from collections import OrderedDict
-        from tasklite.engine.executor import _normalize_handler_result
+        from tasklite.engine.channel import _normalize_handler_result
         from tasklite.models.job import Job as _J
 
         success, meta = _normalize_handler_result(OrderedDict([("a", 1), ("b", 2)]))
