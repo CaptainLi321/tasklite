@@ -371,7 +371,7 @@ class TestSpawnDeduplication:
         旧逻辑先查 wall 命中的 rerun 豁免（every_run 放行）→ 绕过 queue 检查 →
         同 uid 重复入队 → commit 时 INSERT 冲突 → rowcount 守卫崩溃循环。
         修复后：queue/in-flight 命中无条件拦截（同轮不重复派发）。"""
-        from tasklite.engine.executor import ExecutionResult
+        from tasklite.engine.channel import ExecutionResult
         from tasklite.models.state import PipelineState
 
         pipeline = make_pipeline(tmp_path)

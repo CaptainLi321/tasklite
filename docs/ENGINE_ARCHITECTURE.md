@@ -94,14 +94,13 @@
 
 ---
 
-## 四、执行机器职责划分（10 模块）
+## 四、执行机器职责划分（9 模块）
 
 | 模块 | 职责定位 | 核心接口 / 概念 |
 |---|---|---|
 | `runtime.py` | 跨模块单向共享运行态容器 | `RunContext`, `EpisodeState`, `StopMode`, `TaskStats` |
 | `store.py` | 统一状态事务、3-strike 崩溃与死锁归因 | `StateStore.apply_failure`, `apply_success`, `handle_deadlock` |
-| `channel.py` | IPC 通道、孤儿锁探测与产物清理 | `ExecutionChannel.submit`, `probe_orphan_lock`, `cleanup_artifacts` |
-| `executor.py` | 子进程生命周期与文件 IPC 协议 | `SubprocessExecutor`, `JobHandle`, `write_result_atomic` |
+| `channel.py` | 子进程生命周期、阶梯看门狗、IPC 通道与产物清理 | `ExecutionChannel`, `JobHandle`, `write_result_atomic`, `probe_orphan_lock` |
 | `scheduler.py` | 队列只读扫描与不可变投影缓存 | `JobScheduler`, `JobFacts`, `ScheduleResult` |
 | `dispatch.py` | 派发五关预检与子进程 submit 编排 | `DispatchMachine.dispatch_job`, `dispatch_next` |
 | `loop.py` | 事件驱动主循环与异常承重网 | `LoopRunner.run_loop`, `run_loop_impl` |

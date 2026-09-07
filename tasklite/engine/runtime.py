@@ -186,7 +186,8 @@ class RunContext:
         scheduler: JobScheduler,
         resources: Union[ResourceManager, Dict[str, Resource]],
         handlers: Dict[str, Any],
-        executor: Any,
+        channel: Optional[ExecutionChannel] = None,
+        executor: Any = None,
         ipc_dir: str,
         output_root: Optional[Union[str, Path, Sequence[Path]]] = None,
         on_run_start: Optional[Callable[[], None]] = None,
@@ -210,8 +211,13 @@ class RunContext:
         else:
             self.resource_mgr = ResourceManager(resources, handlers=handlers)
             self.resources = self.resource_mgr
-        self.executor = executor
         self.ipc_dir = ipc_dir
+        if channel is not None:
+            self.channel = channel
+        elif executor is not None:
+            self.channel = executor
+        else:
+            self.channel = ExecutionChannel(self.ipc_dir)
         self.output_root = output_root
         self.transient_registry = transient_registry
         self.fatal_exceptions = tuple(fatal_exceptions) if fatal_exceptions is not None else None
@@ -241,11 +247,6 @@ class RunContext:
             on_job_completed=lambda uid, meta, s, r: self.fire_job_completed(uid, meta, s, r),
             ctx=self,
         )
-        if self.executor is not None:
-            self.channel = self.executor
-        else:
-            self.channel = ExecutionChannel(self.ipc_dir)
-            self.executor = self.channel
 
         self._in_flight: InFlightTracker = InFlightTracker()
         self.run_id: Optional[str] = None
@@ -254,6 +255,15 @@ class RunContext:
         self.stats: TaskStats = TaskStats()
         self.episode: EpisodeState = EpisodeState()
         self._run_end_fired = False
+
+    @property
+    def executor(self) -> ExecutionChannel:
+        """向后兼容属性：返回 ExecutionChannel。"""
+        return self.channel
+
+    @executor.setter
+    def executor(self, value: ExecutionChannel) -> None:
+        self.channel = value
 
     @property
     def _failure(self) -> StateStore:
@@ -365,9 +375,10 @@ class EngineRuntime:
         backend: AbstractStateBackend,
         resources: Union[ResourceManager, Dict[str, Resource]],
         handlers: Dict[str, Any],
-        executor: Any,
         transient_registry: Any,
         discovery_rerun: Dict[str, str],
+        channel: Optional[ExecutionChannel] = None,
+        executor: Any = None,
     ) -> None:
         from .completion import CompletionMachine
         from .dispatch import DispatchMachine
@@ -390,6 +401,7 @@ class EngineRuntime:
             scheduler=self.scheduler,
             resources=resources,
             handlers=self.handlers,
+            channel=channel,
             executor=executor,
             ipc_dir=config.ipc_dir,
             output_root=config.output_root,
@@ -419,6 +431,15 @@ class EngineRuntime:
     @property
     def ctx(self) -> RunContext:
         return self._ctx
+
+    @property
+    def channel(self) -> ExecutionChannel:
+        return self._ctx.channel
+
+    @property
+    def executor(self) -> ExecutionChannel:
+        """向后兼容属性：返回 ExecutionChannel。"""
+        return self._ctx.channel
 
     @property
     def stats(self) -> TaskStats:

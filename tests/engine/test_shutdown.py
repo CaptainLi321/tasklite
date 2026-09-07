@@ -239,7 +239,7 @@ class TestForceAbort:
             # 模拟 handler 副作用：把输出声明写入落盘 outputs.jsonl
             # （后真实 handler 的 declare_output 即落盘；FakeProcess
             # 不执行 handler，此处直接写文件模拟）。
-            from tasklite.engine.executor import append_output
+            from tasklite.engine.channel import append_output
             for entry in pipeline._in_flight.values():
                 append_output(pipeline.ipc_dir, entry.uid, str(partial), True)
                 injected["done"] = True
@@ -327,7 +327,7 @@ class TestAbortConsumesCompletedResult:
 
     def _inject_completed_result(self, pipeline, out_file):
         """模拟 handler 已完成：物理输出 + 声明 + 当前 incarnation 成功结果落盘。"""
-        from tasklite.engine.executor import write_result_atomic, append_output, result_path
+        from tasklite.engine.channel import write_result_atomic, append_output, result_path
         entry = next(iter(pipeline._in_flight.values()))
         out_file.write_text("done")
         append_output(pipeline.ipc_dir, entry.uid, str(out_file), True)
@@ -395,7 +395,7 @@ class TestAbortConsumesCompletedResult:
         （结果文件 + 声明 + 物理输出均已落盘、entry 已注册），直接触发
         _abort_in_flight。修复前：kill + 删结果文件 + 删成功输出 + requeue。
         """
-        from tasklite.engine.executor import (
+        from tasklite.engine.channel import (
             JobHandle, write_result_atomic, append_output,
         )
         from tasklite.models.state import PipelineState
@@ -479,7 +479,7 @@ class TestAbortTOCTOU:
         join/kill 回调里写入）。变异体（删 kill 后重查逻辑）下：结果被删 +
         成功输出被清 + requeue → 本断言失败。
         """
-        from tasklite.engine.executor import (
+        from tasklite.engine.channel import (
             JobHandle, write_result_atomic, append_output, result_path,
         )
         from tasklite.models.state import PipelineState
@@ -561,7 +561,7 @@ class TestAbortTOCTOU:
 
         requeue 前先 unregister pending，全程保持活动集合互斥。
         """
-        from tasklite.engine.executor import (
+        from tasklite.engine.channel import (
             JobHandle, write_result_atomic,
         )
         from tasklite.models.state import PipelineState
@@ -652,7 +652,7 @@ class TestAbortTOCTOU:
         _persist_resource_suspends 持久化。
         """
         import time as time_mod
-        from tasklite.engine.executor import (
+        from tasklite.engine.channel import (
             JobHandle, append_signal,
         )
         from tasklite.engine.resource import CapacityResource

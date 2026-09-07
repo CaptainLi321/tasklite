@@ -19,8 +19,7 @@ if TYPE_CHECKING:
 from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 from ..exceptions import _JobTerminated
 from ..models.job import Job
-from .channel import ArtifactCleanupMode
-from .executor import ExecutionResult
+from .channel import ArtifactCleanupMode, ExecutionResult
 from .inflight import InFlightJob
 from .policy import BackoffSchedule
 from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE, inject_worker_resource

@@ -39,7 +39,7 @@ class TestDeclareCacheCtx:
 
     def test_cache_kind_persisted(self, tmp_path):
         """cache 声明落盘带 kind='cache'；output 声明 kind='output'。"""
-        from tasklite.engine.executor import read_outputs
+        from tasklite.engine.channel import read_outputs
         ctx = _ctx(tmp_path, job_id="j9")
         ctx.ipc_dir = str(tmp_path / "ipc")
         ctx.declare_cache("tmp.part")

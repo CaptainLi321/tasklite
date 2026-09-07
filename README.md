@@ -320,7 +320,6 @@ tasklite/
 │   ├── recovery.py      # 崩溃检测与恢复 (RecoveryMachine)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel)
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler)
-│   ├── executor.py      # 子进程隔离执行器与看门狗
 │   └── resource.py      # 令牌桶限速与并发容量资源
 ├── backend/             # SQLite WAL 强一致事务持久化后端
 ├── models/              # Job / TaskContext / PipelineState 数据模型

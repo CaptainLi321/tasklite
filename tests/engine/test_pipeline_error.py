@@ -594,21 +594,21 @@ class TestExceptionSubclassesAndEmpty:
         结构化 signal/oom_hint meta；确定性崩溃（exitcode=1）保持判死不变。"""
         from types import SimpleNamespace
 
-        from tasklite.engine.executor import (
-            JobHandle, MultiprocessingExecutor,
+        from tasklite.engine.channel import (
+            JobHandle, ExecutionChannel,
         )
 
         handle = JobHandle(uid="t::s", process=None, deadline=0.0, timeout=10,
                            job=Job("t", "s"), ipc_dir=str(tmp_path))
  # 信号死亡：环境性瞬态 → 重试
-        result = MultiprocessingExecutor._build_terminal_failure(
+        result = ExecutionChannel._build_terminal_failure(
             SimpleNamespace(exitcode=-9), handle, is_timeout=False)
         assert result.retry_requested is True
         assert result.result_meta["signal"] == "SIGKILL"
         assert result.result_meta["oom_hint"] is True
         assert "PROCESS_SIGNAL_DEATH" in (result.retry_error or "")
  # 对照：确定性退出码（handler sys.exit(1)/异常退出）维持判死
-        result1 = MultiprocessingExecutor._build_terminal_failure(
+        result1 = ExecutionChannel._build_terminal_failure(
             SimpleNamespace(exitcode=1), handle, is_timeout=False)
         assert result1.retry_requested is False
         assert "signal" not in result1.result_meta

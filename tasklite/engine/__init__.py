@@ -1,7 +1,7 @@
 """Engine subpackage for tasklite.
 
 执行机器模块（11 个）：
-- ``executor``: 子进程生命周期与 IPC 结果处理（落盘文件模型）；
+- ``channel``: 子进程生命周期、看门狗与 IPC 结果处理（落盘文件模型）；
 - ``scheduler``: 队列只读扫描，找下一个 runnable job；
 - ``dispatch``: 派发预检关（去重/依赖/资源）与子进程派发；
 - ``loop``: 事件驱动主循环（填池 → drain → 等待）；

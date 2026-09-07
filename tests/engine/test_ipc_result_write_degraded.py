@@ -17,8 +17,8 @@ IO 故障时 OSError 直接穿透 → worker 裸崩退出（无结果文件）�
 
 import pytest
 
-from tasklite.engine import executor as executor_mod
-from tasklite.engine.executor import (
+from tasklite.engine import channel as channel_mod
+from tasklite.engine.channel import (
     _mp_worker_wrapper, read_result_file, result_path,
 )
 from tasklite.models.context import TaskContext
@@ -51,7 +51,7 @@ class TestWorkerResultWriteDegraded:
         但 job 走重跑（at-least-once 契约以重跑吸收副作用），而非被
         父进程按崩溃收割误判 DLQ。
         """
-        real_write = executor_mod.write_result_atomic
+        real_write = channel_mod.write_result_atomic
         calls = []
 
         def flaky_write(ipc_dir, uid, result_dict, incarnation):
@@ -63,7 +63,7 @@ class TestWorkerResultWriteDegraded:
             return real_write(ipc_dir, uid, result_dict,
                               incarnation=incarnation)
 
-        monkeypatch.setattr(executor_mod, "write_result_atomic", flaky_write)
+        monkeypatch.setattr(channel_mod, "write_result_atomic", flaky_write)
 
         job = Job("h", "a")
         # worker 不得让 OSError 穿透（裸崩 = 成功 job 被误判 DLQ）
@@ -92,7 +92,7 @@ class TestWorkerResultWriteDegraded:
         可能撞 "LOCK_CONFLICT" 前缀）——降级写丢字段会把框架锁冲突误当
         业务 retry，烧 max_retries 预算。
         """
-        real_write = executor_mod.write_result_atomic
+        real_write = channel_mod.write_result_atomic
 
         def flaky_write(ipc_dir, uid, result_dict, incarnation):
             if _is_full_payload(result_dict):
@@ -100,7 +100,7 @@ class TestWorkerResultWriteDegraded:
             return real_write(ipc_dir, uid, result_dict,
                               incarnation=incarnation)
 
-        monkeypatch.setattr(executor_mod, "write_result_atomic", flaky_write)
+        monkeypatch.setattr(channel_mod, "write_result_atomic", flaky_write)
         # 拿锁失败 = 另有执行体持锁 → 走锁冲突分支
         monkeypatch.setattr(
             "tasklite.utils.lockfile.try_acquire_lock",
@@ -130,7 +130,7 @@ class TestWorkerResultWriteDegraded:
         def refusing_write(ipc_dir, uid, result_dict, incarnation):
             raise OSError(28, "No space left on device")
 
-        monkeypatch.setattr(executor_mod, "write_result_atomic", refusing_write)
+        monkeypatch.setattr(channel_mod, "write_result_atomic", refusing_write)
 
         job = Job("h", "a")
         # 不得抛异常：穿透会让 worker 以未分类崩溃退出
@@ -154,7 +154,7 @@ class TestDegradedRetryRequeuesNotDlq:
         """
         from tasklite import TaskLite
 
-        real_write = executor_mod.write_result_atomic
+        real_write = channel_mod.write_result_atomic
         # 完整写的失败预算恰好两次：worker 的初次完整写 + 停顿后重试；
         # 随后的降级写（小 payload）与重跑后的完整写恢复正常
         full_fail_budget = [2]
@@ -166,7 +166,7 @@ class TestDegradedRetryRequeuesNotDlq:
             return real_write(ipc_dir, uid, result_dict,
                               incarnation=incarnation)
 
-        monkeypatch.setattr(executor_mod, "write_result_atomic", flaky_write)
+        monkeypatch.setattr(channel_mod, "write_result_atomic", flaky_write)
 
         # 内联执行 worker 包装：start() 在测试进程内直接运行真实
         # _mp_worker_wrapper（含降级写），drain 统一走文件轮询消费

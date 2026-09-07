@@ -256,7 +256,7 @@ class TestInFlightStateConsistency:
         公式（tautology，断言自己算出的结果）——改为走真实 _apply_result 的
         spawn 去重路径，断言 C 不被重复入队。
         """
-        from tasklite.engine.executor import ExecutionResult
+        from tasklite.engine.channel import ExecutionResult
 
         pipeline = make_pipeline(tmp_path)
         pipeline.register_handler("parent", lambda j, c: True)

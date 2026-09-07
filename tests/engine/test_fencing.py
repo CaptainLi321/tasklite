@@ -20,7 +20,7 @@ from tests.helpers import (
     make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes,
     _write_fake_result, _ctx_incarnation,
 )
-from tasklite.engine.executor import (
+from tasklite.engine.channel import (
     write_result_atomic, result_path, _iter_stale_result_paths,
     append_output, append_input, outputs_path, inputs_path,
 )
@@ -113,7 +113,7 @@ class TestIncarnationFencing:
                 self._alive = True
                 ctx = self.args[2]
                 captured["incarnation"] = ctx.incarnation
-                from tasklite.engine.executor import write_result_atomic
+                from tasklite.engine.channel import write_result_atomic
                 write_result_atomic(self.args[3], self.args[1].uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
@@ -165,7 +165,7 @@ class TestIncarnationFencing:
                 self._alive = True
                 ctx = self.args[2]
                 seqs.append(ctx.incarnation)
-                from tasklite.engine.executor import write_result_atomic
+                from tasklite.engine.channel import write_result_atomic
                 write_result_atomic(self.args[3], self.args[1].uid, {
                     "status": "retry", "error": "transient",
                 }, incarnation=ctx.incarnation)
@@ -220,7 +220,7 @@ class TestStalePathPrefixCollision:
 
     def test_cleanup_does_not_delete_sibling_result(self, tmp_path):
         """cleanup_ipc_files 不得删除点后缀兄弟 uid 的结果文件（全链路）。"""
-        from tasklite.engine.executor import cleanup_ipc_files
+        from tasklite.engine.channel import cleanup_ipc_files
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.5"
         write_result_atomic(str(tmp_path), "h::page.1", {
             "status": "success", "raw_result": True,
@@ -228,7 +228,7 @@ class TestStalePathPrefixCollision:
         }, incarnation=inc)
         cleanup_ipc_files(str(tmp_path), "h::page", inc)
         # 兄弟 uid 的结果文件必须保留
-        from tasklite.engine.executor import result_path
+        from tasklite.engine.channel import result_path
         assert result_path(str(tmp_path), "h::page.1", inc).exists(), \
             "cleanup 不得删除兄弟 uid 的结果文件"
 
@@ -242,7 +242,7 @@ class TestDrainStaleTmpIgnore:
 
     def test_drain_stale_ignores_tmp_leftover(self, tmp_path):
         from pathlib import Path as _Path
-        from tasklite.engine.executor import _RESULT_TMP_SUFFIX
+        from tasklite.engine.channel import _RESULT_TMP_SUFFIX
         from tasklite.utils.lockfile import safe_uid_filename
 
         p = make_pipeline(tmp_path)

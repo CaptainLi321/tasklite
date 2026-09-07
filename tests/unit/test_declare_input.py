@@ -42,7 +42,7 @@ class TestDeclareInputCtx:
         ctx.ipc_dir = str(tmp_path / "ipc")
         ctx.declare_input(str(f))
 
-        from tasklite.engine.executor import read_inputs
+        from tasklite.engine.channel import read_inputs
         entries = read_inputs(ctx.ipc_dir, "test::j1")
         assert len(entries) == 1
         e = entries[0]
@@ -55,7 +55,7 @@ class TestDeclareInputCtx:
         ctx = _ctx()
         ctx.ipc_dir = str(tmp_path / "ipc")
         ctx.declare_input(str(tmp_path / "nope.bin"))
-        from tasklite.engine.executor import read_inputs
+        from tasklite.engine.channel import read_inputs
         entries = read_inputs(ctx.ipc_dir, "test::j1")
         assert entries[0]["kind"] == "file"
         assert "size" not in entries[0], "stat 失败 → 不落指纹"
@@ -64,7 +64,7 @@ class TestDeclareInputCtx:
         ctx = _ctx()
         ctx.ipc_dir = str(tmp_path / "ipc")
         ctx.declare_input_uri("https://example/fonts.zip", uri_fingerprint="etag-abc")
-        from tasklite.engine.executor import read_inputs
+        from tasklite.engine.channel import read_inputs
         entries = read_inputs(ctx.ipc_dir, "test::j1")
         assert entries[0]["kind"] == "uri"
         assert entries[0]["uri_fingerprint"] == "etag-abc"
@@ -76,7 +76,7 @@ class TestDeclareInputCtx:
         url = Path("/tmp/example.txt")
         result = ctx.declare_input_uri(url)
         assert result == str(url)
-        from tasklite.engine.executor import read_inputs
+        from tasklite.engine.channel import read_inputs
         entries = read_inputs(ctx.ipc_dir, "test::j1")
         assert entries[0]["path"] == str(url)
 
