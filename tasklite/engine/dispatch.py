@@ -41,6 +41,8 @@ class DispatchOutcome:
     sched: Optional[Any] = None
     should_continue: bool = True
     worker_wait: float = 0.0
+    dispatched: bool = False
+    handled: bool = False
 
 
 class DispatchMachine:
@@ -56,8 +58,8 @@ class DispatchMachine:
         """统一扫描与派发接缝：工人资源预检 -> 队列扫描 -> 预检五关 -> 资源锁定 -> 子进程派发。
 
         返回 DispatchOutcome：
-        - entry 非 None：成功派发子进程并登记 in-flight；
-        - entry 为 None 且 should_continue 为 True：处理了无需子进程的作业（去重/依赖失败/无 handler/校验失败），调用方可继续填池；
+        - entry 非 None：成功派发子进程并登记 in-flight（dispatched=True, handled=True）；
+        - entry 为 None 且 should_continue 为 True：处理了无需子进程的作业（去重/依赖失败/无 handler/校验失败，handled=True），调用方可继续填池；
         - should_continue 为 False：工人资源耗尽或无可运行作业，调用方应退出填池循环。
         """
         state = self._ctx.state
@@ -70,6 +72,8 @@ class DispatchMachine:
                 sched=None,
                 should_continue=False,
                 worker_wait=worker_wait,
+                dispatched=False,
+                handled=False,
             )
 
         in_flight_uids = state.in_flight_uids
@@ -79,6 +83,8 @@ class DispatchMachine:
                 entry=None,
                 sched=sched,
                 should_continue=False,
+                dispatched=False,
+                handled=False,
             )
 
         entry = self.dispatch_job(sched)
@@ -87,12 +93,16 @@ class DispatchMachine:
                 entry=None,
                 sched=sched,
                 should_continue=True,
+                dispatched=False,
+                handled=True,
             )
 
         return DispatchOutcome(
             entry=entry,
             sched=sched,
             should_continue=True,
+            dispatched=True,
+            handled=True,
         )
 
     def _reject_and_commit(
@@ -214,22 +224,30 @@ class DispatchMachine:
         return False
 
 
-    def dispatch_job(self, sched) -> Optional[InFlightJob]:
-        """Pop job → 预检查 → acquire 资源 → submit 到子进程。直接操作 self._ctx.state。
+    def dispatch_job(self, sched: Any) -> Optional[InFlightJob]:
+        """统一派发单个作业：出队 -> 五关预检 -> 两阶段资源租约 -> 子进程启动 -> in-flight 原子登记。
 
-        返回 entry。entry 为 None 表示 job 走了「不走子进程」路径
-        （dedup/依赖失败/no-handler/payload 校验失败），已直接 commit 并返回。
-        entry 非 None 表示已 submit，需由 ``_complete_job`` 处理结果。
+        参数 sched 可以为 ScheduleResult、Job 实例或 job_dict 字典。
+        返回 InFlightJob 条目；若被预检五关拦截（去重/依赖失败/无handler/孤儿延迟/残留恢复）或校验失败，返回 None。
         """
         state = self._ctx.state
-        runnable_idx = sched.runnable_idx
-        # kind 显式表达调度契约——"dep_failed" 表示 runnable_idx 指向
-        # dep-failed 兜底位置（pending_dep_failure 携带失败依赖），"runnable"
-        # 表示真正可运行的 job。消费方按 kind 走分支。
-        pending_dep_failure = sched.pending_dep_failure if sched.kind == "dep_failed" else None
+        if isinstance(sched, Job):
+            job = sched
+            job_dict = job.to_dict()
+            pending_dep_failure = None
+        elif isinstance(sched, dict):
+            job_dict = sched
+            job = Job.from_dict(job_dict)
+            pending_dep_failure = None
+        else:
+            runnable_idx = getattr(sched, "runnable_idx", 0)
+            if runnable_idx is None:
+                return None
+            kind = getattr(sched, "kind", "runnable")
+            pending_dep_failure = getattr(sched, "pending_dep_failure", None) if kind == "dep_failed" else None
+            job_dict = state.pop_job(runnable_idx)
+            job = Job.from_dict(job_dict)
 
-        job_dict = state.pop_job(runnable_idx)
-        job = Job.from_dict(job_dict)
         uid = job.uid
         # 预检五关以调用顺序表达时序契约，每关返回 True=已处理。
         # 关 1-4（dedup/dep-failed/no-handler/orphan-probe）+ 关 5（stale-restore）。
