@@ -213,6 +213,20 @@ class StateStore:
         """检查作业是否已在 failed 失败集合中。"""
         return uid in self._state.failed
 
+    @property
+    def attempted_uids(self) -> Set[str]:
+        """wall∪failed 终态 UID 集合快照。"""
+        return self._state.attempted_uids
+
+    @property
+    def is_empty(self) -> bool:
+        """队列是否为空。"""
+        return self._state.is_empty
+
+    def find_dependency_cycles(self) -> List[str]:
+        """找出当前队列依赖图中的环成员。"""
+        return self._state.find_dependency_cycles()
+
     def all_known_uids(self) -> Set[str]:
         """返回当前系统已知全部 UID 集合。"""
         return self._state.all_known_uids()
@@ -668,77 +682,6 @@ class StateStore:
             deadlock_gap_max_rounds=deadlock_gap_max_rounds,
         )
 
-    # ── 4. 内存状态与查询代理 ────────────────────────────────────────────
-
-    @property
-    def queue(self) -> List[Dict[str, Any]]:
-        return self._state.queue
-
-    @property
-    def wall(self) -> Dict[str, Dict[str, Any]]:
-        return self._state.wall
-
-    @property
-    def failed(self) -> Dict[str, Dict[str, Any]]:
-        return self._state.failed
-
-    @property
-    def cursors(self) -> Dict[str, str]:
-        return self._state.cursors
-
-    @property
-    def queue_uids(self) -> Set[str]:
-        return self._state.queue_uids
-
-    @property
-    def wall_uids(self) -> Set[str]:
-        return self._state.wall_uids
-
-    @property
-    def failed_uids(self) -> Set[str]:
-        return self._state.failed_uids
-
-    @property
-    def attempted_uids(self) -> Set[str]:
-        return self._state.attempted_uids
-
-    @property
-    def in_flight_uids(self) -> FrozenSet[str]:
-        return self._state.in_flight_uids
-
-    @property
-    def is_empty(self) -> bool:
-        return self._state.is_empty
-
-    def is_known(self, uid: str) -> bool:
-        return self._state.is_known(uid)
-
-    def find_dependency_cycles(self) -> List[str]:
-        return self._state.find_dependency_cycles()
-
-    def fail_cascade(self, failed_uid: str) -> List[str]:
-        return self._state.fail_cascade(failed_uid)
-
-    def pop_job(self, idx: int) -> Dict[str, Any]:
-        return self._state.pop_job(idx)
-
-    def spawn_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None:
-        self._state.spawn_jobs(job_dicts, front=front)
-
-    def requeue_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None:
-        self._state.requeue_jobs(job_dicts, front=front)
-
-    def register_in_flight(self, uid: str) -> None:
-        self._state.register_in_flight(uid)
-
-    def unregister_in_flight(self, uid: str) -> None:
-        self._state.unregister_in_flight(uid)
-
-    def clear_in_flight(self) -> None:
-        self._state.clear_in_flight()
-
-    def replace_queue(self, job_dicts: List[Dict[str, Any]]) -> None:
-        self._state.replace_queue(job_dicts)
 
     # ── 5. 统一状态查询与管理接缝 ────────────────────────────────────────
 

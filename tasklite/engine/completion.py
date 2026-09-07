@@ -51,7 +51,6 @@ class CompletionMachine:
         正常路径（drain 已删 result/signals）与恢复路径（``_restore_stale_result``
         伪 entry）统一走 ``cleanup_ipc_files``。
         """
-        state = self._ctx.state
         uid = entry.uid
         terminated = False
         try:
@@ -111,9 +110,9 @@ class CompletionMachine:
           - success -> _apply_success
           - failure -> _apply_failure
         """
-        state = self._ctx.state
+        store = self._ctx.store
         if expect_in_flight:
-            assert uid in state.in_flight_uids, (
+            assert uid in store.in_flight_uids, (
                 f"identity vacuity violation: {uid} not in-flight at _apply_result entry"
             )
 
@@ -170,7 +169,7 @@ class CompletionMachine:
         job_start: Optional[float] = None
     ) -> None:
         """处理成功分支：子任务去重、wall 记录与 cursor 推进。"""
-        state = self._ctx.state
+        store = self._ctx.store
         duration = (time.monotonic() - job_start) if job_start is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
@@ -185,15 +184,15 @@ class CompletionMachine:
                 if nj_uid in seen_in_batch:
                     logger.debug(f"Skipping duplicate spawn for {nj_uid}.")
                     continue
-                if state.is_known(nj_uid):
-                    if nj_uid in state.queue_uids or nj_uid in state.in_flight_uids:
+                if store.is_known(nj_uid):
+                    if nj_uid in store.queue_uids or nj_uid in store.in_flight_uids:
                         continue
-                    wall_hit = nj_uid in state.wall
-                    failed_hit = nj_uid in state.failed
+                    wall_hit = nj_uid in store.wall
+                    failed_hit = nj_uid in store.failed
                     if wall_hit or failed_hit:
                         decision = self._ctx.policy.evaluate(
                             nj.to_dict(),
-                            wall_meta=state.wall.get(nj_uid),
+                            wall_meta=store.wall.get(nj_uid),
                             is_wall=wall_hit,
                             is_failed=failed_hit,
                         )

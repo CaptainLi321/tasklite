@@ -128,8 +128,8 @@ class LoopRunner:
 
     def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
         """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。"""
-        state = self._ctx.state
-        if state is None:
+        store = self._ctx.store
+        if store is None:
             return StepOutcome(
                 dispatched_count=0,
                 completed_count=0,
@@ -177,7 +177,7 @@ class LoopRunner:
                     exit_reason="stopped_draining",
                 )
 
-        if state.is_empty and not self._ctx.in_flight:
+        if store.is_empty and not self._ctx.in_flight:
             return StepOutcome(
                 dispatched_count=0,
                 completed_count=0,
@@ -211,7 +211,7 @@ class LoopRunner:
         deadlock_detected = False
         should_terminate = False
         if last_outcome is not None and not last_outcome.has_runnable:
-            if state.is_empty and not self._ctx.in_flight:
+            if store.is_empty and not self._ctx.in_flight:
                 should_terminate = True
             elif last_outcome.min_wait == float("inf"):
                 if not self._ctx.in_flight:
@@ -235,7 +235,7 @@ class LoopRunner:
                     self._ctx.in_flight.pop(handle.uid, None)
 
         # 4. 计算等待时延与空闲状态
-        is_idle = state.is_empty and not self._ctx.in_flight
+        is_idle = store.is_empty and not self._ctx.in_flight
         if is_idle or should_terminate:
             wait_time = 0.0
             should_wait = False
@@ -248,7 +248,7 @@ class LoopRunner:
                 should_wait = False
         elif last_outcome is not None and not last_outcome.has_runnable and last_outcome.min_wait != float("inf"):
             if not self._ctx.in_flight and last_outcome.waiting_for_dependency:
-                cycle_uids = state.find_dependency_cycles()
+                cycle_uids = store.find_dependency_cycles()
                 if cycle_uids:
                     logger.error(
                         f"Deadlock detected during backoff/wait: dependency cycle "
@@ -299,9 +299,9 @@ class LoopRunner:
 
     def run_loop_impl(self) -> None:
         """事件驱动主循环：以 step() 统一驱动填池、回收与等待。"""
-        state = self._ctx.state
+        store = self._ctx.store
         self._ctx.in_flight.clear()
-        while not state.is_empty or self._ctx.in_flight:
+        while not store.is_empty or self._ctx.in_flight:
             outcome = self.step()
             if outcome.should_terminate:
                 break

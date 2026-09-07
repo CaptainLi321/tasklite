@@ -146,7 +146,7 @@ class RecoveryOrchestrator:
                 f"skipping overwrite to preserve disk truth: {e}"
             )
             return
-        mem_q = self._ctx.state.queue
+        mem_q = self._ctx.store.queue
         mem_uids = {uid_from_job_dict(jd) for jd in mem_q}
         # 磁盘有而内存没有的作业（commit/pop 窗口内丢失的）补回队首
         extra = [jd for jd in disk_q if uid_from_job_dict(jd) not in mem_uids]
@@ -234,8 +234,8 @@ class RecoveryOrchestrator:
         # 4. 未完成任务注销 in-flight 并 requeue 到队首
         job_dicts = [entry.job_dict for entry in cancelled_entries]
         for pentry in cancelled_entries:
-            self._ctx.state.unregister_in_flight(pentry.uid)
-        self._ctx.state.requeue_jobs(job_dicts, front=True)
+            self._ctx.store.unregister_in_flight(pentry.uid)
+        self._ctx.store.requeue_jobs(job_dicts, front=True)
 
         # 5. 消费「已完成」entry 的结果（统一出口）
         commit_crash: Optional[BaseException] = None
@@ -248,7 +248,7 @@ class RecoveryOrchestrator:
                 commit_crash = e
 
         self._ctx.in_flight.clear()
-        self._ctx.state.clear_in_flight()
+        self._ctx.store.clear_in_flight()
         if commit_crash is not None:
             raise commit_crash
 

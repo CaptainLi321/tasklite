@@ -71,7 +71,7 @@ class DispatchMachine:
         - entry 为 None 且 should_continue 为 True：处理了无需子进程的作业（去重/依赖失败/无 handler/校验失败，has_runnable=True, handled=True），调用方可继续填池；
         - should_continue 为 False：工人资源耗尽或无可运行作业，调用方应退出填池循环。
         """
-        state = self._ctx.state
+        store = self._ctx.store
         ok, worker_wait = self._ctx.resource_mgr.can_acquire_worker(1.0)
         if not ok:
             if worker_wait <= 0:
@@ -87,8 +87,8 @@ class DispatchMachine:
                 sched=None,
             )
 
-        in_flight_uids = state.in_flight_uids
-        sched = self._ctx.scheduler.pop_next_runnable(state, in_flight_uids)
+        in_flight_uids = store.in_flight_uids
+        sched = self._ctx.scheduler.pop_next_runnable(store, in_flight_uids)
         if sched.runnable_idx is None:
             return DispatchOutcome(
                 entry=None,
@@ -155,19 +155,19 @@ class DispatchMachine:
             self._ctx.stats[count_as] += 1
             return
 
-    def dispatch_dedup(self, state, uid: str, job_dict: dict) -> bool:
+    def dispatch_dedup(self, store, uid: str, job_dict: dict) -> bool:
         """派发预检关 1——去重（is_known 命中 → rerun 策略 → skip/放行）。
 
         返回 True = 已处理（job 被 skip 或放行后本关终结）；返回 False
         表示未命中（调用方继续后续预检关）。统一 is_known 谓词；
         rerun 策略豁免 every_run/on_failure 的 wall/failed 命中。
         """
-        if state.is_known(uid):
+        if store.is_known(uid):
             decision = self._ctx.policy.evaluate(
                 job_dict,
-                wall_meta=state.wall.get(uid),
-                is_wall=(uid in state.wall),
-                is_failed=(uid in state.failed),
+                wall_meta=store.wall.get(uid),
+                is_wall=(uid in store.wall),
+                is_failed=(uid in store.failed),
             )
             if decision.should_skip:
                 self._ctx.stats["skipped"] += 1
@@ -215,7 +215,7 @@ class DispatchMachine:
         return False
 
 
-    def dispatch_orphan_probe(self, state, uid: str, job_dict: dict) -> bool:
+    def dispatch_orphan_probe(self, store, uid: str, job_dict: dict) -> bool:
         """派发预检关 4——孤儿探测（probe 先于 restore）。
 
         主进程仅探测（非阻塞试锁）。锁被占 = 同 uid 孤儿 worker 仍持锁
@@ -238,7 +238,7 @@ class DispatchMachine:
             )
             self._ctx.stats["deferred_orphan"] += 1
             self._ctx.policy.plan_orphan_defer(job_dict)
-            state.requeue_jobs([job_dict], front=True)
+            store.requeue_jobs([job_dict], front=True)
             return True
         return False
 
@@ -261,7 +261,7 @@ class DispatchMachine:
         参数 sched 可以为 ScheduleResult、Job 实例或 job_dict 字典。
         返回 InFlightJob 条目；若被预检五关拦截（去重/依赖失败/无handler/孤儿延迟/残留恢复）或校验失败，返回 None。
         """
-        state = self._ctx.state
+        store = self._ctx.store
         if isinstance(sched, Job):
             job = sched
             job_dict = job.to_dict()
@@ -276,13 +276,13 @@ class DispatchMachine:
                 return None
             kind = getattr(sched, "kind", "runnable")
             pending_dep_failure = getattr(sched, "pending_dep_failure", None) if kind == "dep_failed" else None
-            job_dict = state.pop_job(runnable_idx)
+            job_dict = store.pop_job(runnable_idx)
             job = Job.from_dict(job_dict)
 
         uid = job.uid
         # 预检五关以调用顺序表达时序契约，每关返回 True=已处理。
         # 关 1-4（dedup/dep-failed/no-handler/orphan-probe）+ 关 5（stale-restore）。
-        if self.dispatch_dedup(state, uid, job_dict):
+        if self.dispatch_dedup(store, uid, job_dict):
             return None
         if pending_dep_failure is not None:
             if self.dispatch_dep_failed(uid, job_dict, pending_dep_failure):
@@ -290,7 +290,7 @@ class DispatchMachine:
         if job.task_type not in self._ctx.handlers:
             if self.dispatch_no_handler(uid, job_dict, job.task_type):
                 return None
-        if self.dispatch_orphan_probe(state, uid, job_dict):
+        if self.dispatch_orphan_probe(store, uid, job_dict):
             return None
         if self.dispatch_stale_restore(uid, job, job_dict):
             return None
@@ -315,11 +315,8 @@ class DispatchMachine:
                         self._reject_and_commit(uid, job_dict, fail_meta)
                         return None
                 # Build context + submit (non-blocking)
-                # 增量 uid 索引（PipelineState._wall_uids/_failed_uids）避免
-                # 每次派发 ``set(state.wall.keys())`` 的 O(W) 重建；这里是单线程
-                # 派发路径，活引用在 submit 内立即 pickle 为子进程快照。
-                wall_keys = state.wall_uids
-                failed_keys = state.failed_uids
+                wall_keys = store.wall_uids
+                failed_keys = store.failed_uids
                 # 输出声明走落盘 outputs.jsonl——handler 子进程内声明的
                 # 输出经落盘文件传回主进程。
                 # fencing：分配本 job 的执行代标识（run_id.seq）。
@@ -331,7 +328,7 @@ class DispatchMachine:
                 # 下发——分类决策在子进程，注册表必须显式传递（不可依赖父进程
                 # 作用域，更不存在模块级可变全局）。
                 ctx = TaskContext(
-                    job, wall_keys, failed_keys, dict(state.cursors),
+                    job, wall_keys, failed_keys, dict(store.cursors),
                     output_root=self._ctx.output_root,
                     ipc_dir=self._ctx.ipc_dir, incarnation=incarnation,
                     transient_registry=self._ctx.transient_registry.snapshot(),
@@ -357,7 +354,7 @@ class DispatchMachine:
                     lease=lease,
                 )
                 # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
-                self._ctx.in_flight.dispatch(entry, state=state)
+                self._ctx.in_flight.dispatch(entry, state=store)
                 return entry
 
         except _CommitCrashSignal:
@@ -374,7 +371,7 @@ class DispatchMachine:
                 raise
             if handle is not None:
                 self._ctx.channel.cleanup([handle])
-            state.requeue_jobs([job_dict], front=True)
+            store.requeue_jobs([job_dict], front=True)
             # 不在此 save_queue：内存此刻缺其他 in-flight 作业，
             # 交给 _run_loop 的 _save_queue_crash_safe 合并磁盘真相后统一保存。
             raise
@@ -382,12 +379,6 @@ class DispatchMachine:
             logger.error(f"Error dispatching job {uid}: {e}\n{traceback.format_exc()}")
             if handle is not None:
                 self._ctx.channel.cleanup([handle])
-            # dispatch 阶段失败（submit 的 pickle/启动报错、
-            # 资源 acquire 校验失败）：确定性失败（如不可 pickle 的
-            # lambda handler）若只 requeue + 崩溃会触发**无限重启循环**。
-            # 独立 `_dispatch_failures` 计数——不复用
-            # `_commit_failures`（混用计数的话，dispatch 失败几次后任意一次
-            # commit 失败即达阈值进 DLQ，错误码 COMMIT_FAILURE_DLQ 误导
             rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
             failures = rt_state.record_dispatch_failure()
             job_dict["runtime"] = rt_state.to_dict()
@@ -402,11 +393,6 @@ class DispatchMachine:
                           "failures": failures, "detail": str(e)[:200]},
                 )
                 if committed:
-                    # 与下方 requeue 分支对称——DLQ 分支
-                    # return 前也移除 entry：若 entry 已注册（register_in_flight
-                    # 的 DEBUG 断言失败时可达），残留的 entry 会在后续 drain
-                    # 中被当 in-flight 处理（死 handle → 二次 _complete_job →
-                    # 重复 DLQ / 断言崩）。未注册时 pop/unregister 均安全。
                     self._ctx.in_flight.pop(uid, None)
                     # dispatch 失败达阈值视为业务侧确定性坏输入，下游自动级联跳过。
                     fail_meta = {
@@ -423,15 +409,9 @@ class DispatchMachine:
                     self._ctx.fire_job_completed(uid, fail_meta, False, False)
                     return
                 # DLQ 也失败（环境故障）→ 走 crash 路径
-            # 与 KeyboardInterrupt 分支对称——若 entry 已
-            # 注册到 _in_flight（仅 register_in_flight 的 DEBUG 断言失败时
-            # 可达，此时状态已损坏），requeue 后 raise 会被 _run_loop 的
-            # _abort_in_flight 对该 entry **二次 requeue**（内存队列重复 uid）。
-            # 先移除 entry（未注册时 pop/unregister 均安全），requeue 交给
-            # 下方统一执行。
             self._ctx.in_flight.pop(uid, None)
-            state.unregister_in_flight(uid)
-            state.requeue_jobs([job_dict], front=True)
+            store.unregister_in_flight(uid)
+            store.requeue_jobs([job_dict], front=True)
             # 不在此 save_queue：内存此刻缺其他 in-flight 作业，
             # 交给 _run_loop 的 _save_queue_crash_safe 合并磁盘真相后统一保存。
             raise
