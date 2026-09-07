@@ -1,8 +1,8 @@
 """Job data model for tasklite."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from ..utils.lockfile import safe_uid_filename
 from ..taxonomy import validate_resource_amounts
@@ -25,32 +25,235 @@ class JobRuntimeState:
     commit_failures: int = 0
     dispatch_failures: int = 0
     last_retry_error: str = ""
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def is_backed_off(self, now: float) -> bool:
+        """判断是否处于退避期。"""
+        if self.backoff_until is None:
+            return False
+        if not isinstance(self.backoff_until, (int, float)):
+            return False
+        return self.backoff_until > now
+
+    def remaining_backoff(self, now: float) -> float:
+        """返回剩余退避时长（秒），非退避中返回 0.0。"""
+        if not self.is_backed_off(now):
+            return 0.0
+        return max(0.0, float(self.backoff_until) - now)
+
+    def record_retry(
+        self,
+        monotonic_now: float,
+        wall_now: float,
+        delay: float,
+        error: str = "",
+    ) -> None:
+        """记录重试退避状态。"""
+        self.backoff_until = monotonic_now + delay
+        self.backoff_wall_deadline = wall_now + delay
+        self.last_retry_error = str(error or "")
+
+    def record_commit_failure(self) -> int:
+        """记录一次 commit 失败并返回累计失败次数。"""
+        self.commit_failures += 1
+        return self.commit_failures
+
+    def record_dispatch_failure(self) -> int:
+        """记录一次 dispatch 失败并返回累计失败次数。"""
+        self.dispatch_failures += 1
+        return self.dispatch_failures
+
+    def align_wall_clock(self, monotonic_now: float, wall_now: float) -> None:
+        """从持久化的 wall_deadline 换算为内存 monotonic 退避时间。"""
+        if (
+            self.backoff_wall_deadline is not None
+            and isinstance(self.backoff_wall_deadline, (int, float))
+            and not isinstance(self.backoff_wall_deadline, bool)
+            and math.isfinite(self.backoff_wall_deadline)
+        ):
+            if self.backoff_wall_deadline > wall_now:
+                self.backoff_until = monotonic_now + (self.backoff_wall_deadline - wall_now)
+            else:
+                self.backoff_until = None
+                self.backoff_wall_deadline = None
+        else:
+            self.backoff_until = None
+            self.backoff_wall_deadline = None
 
     def to_dict(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {}
+        """导出持久化字典（完全保留 _ 开头与任意 extra 字段）。"""
+        d = dict(self.extra)
         if self.backoff_until is not None:
             d["_backoff_until"] = self.backoff_until
+        elif "_backoff_until" in d:
+            del d["_backoff_until"]
+
         if self.backoff_wall_deadline is not None:
             d["_backoff_wall_deadline"] = self.backoff_wall_deadline
+        elif "_backoff_wall_deadline" in d:
+            del d["_backoff_wall_deadline"]
+
         if self.commit_failures:
             d["_commit_failures"] = self.commit_failures
+        elif "_commit_failures" in d:
+            del d["_commit_failures"]
+
         if self.dispatch_failures:
             d["_dispatch_failures"] = self.dispatch_failures
+        elif "_dispatch_failures" in d:
+            del d["_dispatch_failures"]
+
         if self.last_retry_error:
             d["_last_retry_error"] = self.last_retry_error
+        elif "_last_retry_error" in d:
+            del d["_last_retry_error"]
         return d
 
     @classmethod
-    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "JobRuntimeState":
+    def from_dict(cls, data: Optional[Union[Dict[str, Any], "JobRuntimeState"]]) -> "JobRuntimeState":
+        if isinstance(data, JobRuntimeState):
+            return cls(
+                backoff_until=data.backoff_until,
+                backoff_wall_deadline=data.backoff_wall_deadline,
+                commit_failures=data.commit_failures,
+                dispatch_failures=data.dispatch_failures,
+                last_retry_error=data.last_retry_error,
+                extra=dict(data.extra),
+            )
         if not isinstance(data, dict):
             return cls()
-        return cls(
-            backoff_until=data.get("_backoff_until") or data.get("backoff_until"),
-            backoff_wall_deadline=data.get("_backoff_wall_deadline") or data.get("backoff_wall_deadline"),
-            commit_failures=int(data.get("_commit_failures") or data.get("commit_failures") or 0),
-            dispatch_failures=int(data.get("_dispatch_failures") or data.get("dispatch_failures") or 0),
-            last_retry_error=str(data.get("_last_retry_error") or data.get("last_retry_error") or ""),
+
+        extra = dict(data)
+
+        def _pop_val(*keys: str) -> Any:
+            for k in keys:
+                if k in extra:
+                    return extra.pop(k)
+            return None
+
+        raw_bu = _pop_val("_backoff_until", "backoff_until")
+        backoff_until = (
+            float(raw_bu)
+            if isinstance(raw_bu, (int, float)) and not isinstance(raw_bu, bool) and math.isfinite(raw_bu)
+            else None
         )
+
+        raw_wd = _pop_val("_backoff_wall_deadline", "backoff_wall_deadline")
+        backoff_wall_deadline = (
+            float(raw_wd)
+            if isinstance(raw_wd, (int, float)) and not isinstance(raw_wd, bool) and math.isfinite(raw_wd)
+            else None
+        )
+
+        raw_cf = _pop_val("_commit_failures", "commit_failures")
+        try:
+            commit_failures = int(raw_cf) if raw_cf is not None else 0
+        except (ValueError, TypeError):
+            commit_failures = 0
+
+        raw_df = _pop_val("_dispatch_failures", "dispatch_failures")
+        try:
+            dispatch_failures = int(raw_df) if raw_df is not None else 0
+        except (ValueError, TypeError):
+            dispatch_failures = 0
+
+        raw_re = _pop_val("_last_retry_error", "last_retry_error")
+        last_retry_error = str(raw_re or "")
+
+        return cls(
+            backoff_until=backoff_until,
+            backoff_wall_deadline=backoff_wall_deadline,
+            commit_failures=commit_failures,
+            dispatch_failures=dispatch_failures,
+            last_retry_error=last_retry_error,
+            extra=extra,
+        )
+
+    def __getitem__(self, key: str) -> Any:
+        if key in ("_backoff_until", "backoff_until"):
+            if self.backoff_until is not None:
+                return self.backoff_until
+            raise KeyError(key)
+        if key in ("_backoff_wall_deadline", "backoff_wall_deadline"):
+            if self.backoff_wall_deadline is not None:
+                return self.backoff_wall_deadline
+            raise KeyError(key)
+        if key in ("_commit_failures", "commit_failures"):
+            return self.commit_failures
+        if key in ("_dispatch_failures", "dispatch_failures"):
+            return self.dispatch_failures
+        if key in ("_last_retry_error", "last_retry_error"):
+            return self.last_retry_error
+        return self.extra[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key in ("_backoff_until", "backoff_until"):
+            self.backoff_until = (
+                float(value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+                else None
+            )
+        elif key in ("_backoff_wall_deadline", "backoff_wall_deadline"):
+            self.backoff_wall_deadline = (
+                float(value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+                else None
+            )
+        elif key in ("_commit_failures", "commit_failures"):
+            self.commit_failures = int(value or 0)
+        elif key in ("_dispatch_failures", "dispatch_failures"):
+            self.dispatch_failures = int(value or 0)
+        elif key in ("_last_retry_error", "last_retry_error"):
+            self.last_retry_error = str(value or "")
+        else:
+            self.extra[key] = value
+
+    def __contains__(self, key: str) -> bool:
+        if key in ("_backoff_until", "backoff_until"):
+            return self.backoff_until is not None
+        if key in ("_backoff_wall_deadline", "backoff_wall_deadline"):
+            return self.backoff_wall_deadline is not None
+        if key in ("_commit_failures", "commit_failures"):
+            return bool(self.commit_failures)
+        if key in ("_dispatch_failures", "dispatch_failures"):
+            return bool(self.dispatch_failures)
+        if key in ("_last_retry_error", "last_retry_error"):
+            return bool(self.last_retry_error)
+        return key in self.extra
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def pop(self, key: str, default: Any = None) -> Any:
+        if key in ("_backoff_until", "backoff_until"):
+            val = self.backoff_until
+            self.backoff_until = None
+            return val if val is not None else default
+        if key in ("_backoff_wall_deadline", "backoff_wall_deadline"):
+            val = self.backoff_wall_deadline
+            self.backoff_wall_deadline = None
+            return val if val is not None else default
+        if key in ("_commit_failures", "commit_failures"):
+            val = self.commit_failures
+            self.commit_failures = 0
+            return val if val else default
+        if key in ("_dispatch_failures", "dispatch_failures"):
+            val = self.dispatch_failures
+            self.dispatch_failures = 0
+            return val if val else default
+        if key in ("_last_retry_error", "last_retry_error"):
+            val = self.last_retry_error
+            self.last_retry_error = ""
+            return val if val else default
+        return self.extra.pop(key, default)
 
 
 class Job:
@@ -245,7 +448,19 @@ class Job:
         # 运行时边带状态（退避截止/3-strike 计数/最近重试错误）收敛到
         # `runtime` 单一命名空间，随 job_dict 落盘持久化——序列化只此
         # 一处，新增状态不会因散装下划线键漏写 to_dict 而丢失。
-        self.runtime = dict(runtime) if runtime else {}
+        self.runtime = runtime  # type: ignore
+
+    @property
+    def runtime(self) -> JobRuntimeState:
+        """Job 运行期内部边带状态（强类型结构化存储）。"""
+        return self._runtime
+
+    @runtime.setter
+    def runtime(self, value: Union[Dict[str, Any], JobRuntimeState, None]) -> None:
+        if isinstance(value, JobRuntimeState):
+            self._runtime = value
+        else:
+            self._runtime = JobRuntimeState.from_dict(value)
 
     def to_dict(self) -> dict:
         """Serialize job to dictionary.
@@ -267,7 +482,7 @@ class Job:
             "backoff_max": self.backoff_max,
             "timeout_is_transient": self.timeout_is_transient,
             "rerun": self.rerun,
-            "runtime": dict(self.runtime),
+            "runtime": self.runtime.to_dict(),
         }
 
     @classmethod
