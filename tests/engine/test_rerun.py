@@ -161,7 +161,7 @@ class TestRerunEveryRun:
 
     def test_rerun_failure_clears_wall_payload_validation_path(self, tmp_path):
         """ 补强：rerun 任务经 **payload-validation** 直接 commit 失败 → wall 作废。"""
-        from tasklite.utils.validation import validate_payload
+        from tasklite.taxonomy import validate_payload
         from typing import TypedDict
 
         class _Schema(TypedDict):
@@ -268,7 +268,7 @@ class TestRerunEveryRun:
         # 直接 commit 路径（no-handler）内部会调 _mark_failed + unregister——
         # 这里手动模拟该路径的终止动作，验证豁免被移除
         from tasklite.pipeline import TaskLite
-        from tasklite.error_codes import ERR_NO_HANDLER
+        from tasklite.taxonomy import ERR_NO_HANDLER
         p.backend.commit_job_failure("nohandler::x", {"error": ERR_NO_HANDLER})
         p._failure.mark_failed("nohandler::x", {"error": ERR_NO_HANDLER})
         p._state.unregister_in_flight("nohandler::x")

@@ -18,11 +18,12 @@ if TYPE_CHECKING:
     from .failure import FailureMachine
     from .completion import CompletionMachine
 
-from ..error_codes import (
+from ..taxonomy import (
     ERR_DISPATCH_FAILURE as _ERR_DISPATCH_FAILURE,
     ERR_JOB_DEPENDENCY as _ERR_JOB_DEPENDENCY,
     ERR_NO_HANDLER as _ERR_NO_HANDLER,
     ERR_PAYLOAD_VALIDATION as _ERR_PAYLOAD_VALIDATION,
+    validate_payload,
 )
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
@@ -31,7 +32,6 @@ from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE
 from .channel import ArtifactCleanupMode
 from .executor import JobHandle
 from .inflight import InFlightJob
-from ..utils.validation import validate_payload
 
 logger = logging.getLogger("tasklite")
 

@@ -13,7 +13,7 @@ from tasklite.engine.store import (
     StateStore,
     SuccessOutcome,
 )
-from tasklite.error_codes import ERR_COMMIT_FAILURE_DLQ, ERR_JOB_DEPENDENCY
+from tasklite.taxonomy import ERR_COMMIT_FAILURE_DLQ, ERR_JOB_DEPENDENCY
 from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState

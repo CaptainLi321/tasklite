@@ -25,7 +25,7 @@ from typing import List, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     from .runtime import RunContext
 
-from ..error_codes import (
+from ..taxonomy import (
     ERR_COMMIT_FAILURE_DLQ,
     ERR_DEADLOCK_GAP as _ERR_DEADLOCK_GAP,
     ERR_DEPENDENCY_DEADLOCK as _ERR_DEPENDENCY_DEADLOCK,

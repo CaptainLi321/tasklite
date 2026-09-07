@@ -101,7 +101,7 @@ class TestJobTerminatedNoFallThrough:
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=TrackingProcess)
 
-        from tasklite.utils.validation import validate_payload
+        from tasklite.taxonomy import validate_payload
         from typing import TypedDict
 
         class Schema(TypedDict):

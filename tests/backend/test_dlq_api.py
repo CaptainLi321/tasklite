@@ -11,7 +11,7 @@ import pytest
 from tasklite import TaskLite, Job
 from tasklite.backend.base import classify_error_type
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
-from tasklite.error_codes import (
+from tasklite.taxonomy import (
     ERR_DEPENDENCY_DEADLOCK, ERR_DISPATCH_FAILURE, ERR_JOB_DEPENDENCY, ERR_MAX_RETRIES,
     ERROR_TYPE_DEADLOCK, ERROR_TYPE_DEPENDENCY, ERROR_TYPE_DISPATCH,
     ERROR_TYPE_FATAL, ERROR_TYPE_TRANSIENT_EXHAUSTED, ERROR_TYPE_UNKNOWN,

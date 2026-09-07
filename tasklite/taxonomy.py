@@ -735,3 +735,58 @@ class ErrorTaxonomy:
 
 
 _DEFAULT_TAXONOMY = ErrorTaxonomy()
+
+
+def validate_resource_amounts(resources: dict, where: str = "resources") -> None:
+    """校验资源 amount 数值（Job.__init__ 与 pipeline 注册路径共用单点）。"""
+    _DEFAULT_TAXONOMY.ensure_resources_valid(resources, where)
+
+
+def validate_payload(payload: dict, schema: Any) -> list:
+    """Validate payload against a TypedDict schema using runtime type hints."""
+    return _DEFAULT_TAXONOMY.validate_payload(payload, schema).as_error_strings()
+
+
+def classify_error_type(meta: dict) -> str:
+    """从 DLQ meta 推导结构化 error_type（list_dlq() 查询与 _write_dlq_row 落库共用）。"""
+    return _DEFAULT_TAXONOMY.classify(meta).dlq_error_type
+
+
+__all__ = [
+    # 错误码常量
+    "ERR_DEPENDENCY_DEADLOCK",
+    "ERR_JOB_DEPENDENCY",
+    "ERR_PAYLOAD_VALIDATION",
+    "ERR_MAX_RETRIES",
+    "ERR_NO_HANDLER",
+    "ERR_RESOURCE_DEADLOCK",
+    "ERR_MALFORMED_JOB",
+    "ERR_COMMIT_FAILURE_DLQ",
+    "ERR_DISPATCH_FAILURE",
+    "ERR_DEADLOCK_GAP",
+    # DLQ error_type 常量
+    "ERROR_TYPE_FATAL",
+    "ERROR_TYPE_TRANSIENT_EXHAUSTED",
+    "ERROR_TYPE_DEPENDENCY",
+    "ERROR_TYPE_DEADLOCK",
+    "ERROR_TYPE_NO_HANDLER",
+    "ERROR_TYPE_VALIDATION",
+    "ERROR_TYPE_COMMIT_FAILURE",
+    "ERROR_TYPE_DISPATCH",
+    "ERROR_TYPE_UNKNOWN",
+    # 默认异常元组
+    "FATAL_EXCEPTIONS",
+    "TRANSIENT_EXCEPTIONS",
+    # 类与值对象
+    "ErrorCategory",
+    "ValidationErrorItem",
+    "ValidationResult",
+    "ErrorClassification",
+    "ErrorTaxonomy",
+    "_DEFAULT_TAXONOMY",
+    # 模块级工具函数
+    "validate_resource_amounts",
+    "validate_payload",
+    "classify_error_type",
+]
+

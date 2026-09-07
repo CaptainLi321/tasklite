@@ -2,7 +2,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..error_codes import (
+from ..taxonomy import (
     ERR_COMMIT_FAILURE_DLQ,
     ERR_DEADLOCK_GAP,
     ERR_DEPENDENCY_DEADLOCK,
