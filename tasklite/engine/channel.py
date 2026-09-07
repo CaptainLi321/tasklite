@@ -25,6 +25,7 @@ from ..utils.ipc import (
 from ..utils.lockfile import probe_lock, safe_uid_filename
 from .executor import (
     ExecutionResult,
+    JobHandle,
     MultiprocessingExecutor,
     _decode_ipc_result,
     _iter_stale_result_paths,
@@ -46,22 +47,25 @@ class ArtifactCleanupMode(str, enum.Enum):
     FAILURE_OR_RETRY = "failure_retry" # 任务失败/重试：清理 cleanup_on_fail 产物、cache 临时文件与 IPC 文件
 
 
-@dataclass(frozen=True)
-class ExecutionHandle:
-    """in-flight 正在执行的执行体句柄（不可变值对象）。"""
-    uid: str
-    process: Any
-    deadline: float
-    timeout: float
-    job: Job
-    incarnation: str
+# 统一句柄类型：向后兼容别名，消灭 ExecutionHandle ↔ JobHandle 双重句柄
+ExecutionHandle = JobHandle
 
 
 @dataclass(frozen=True)
 class AbortOutcome:
     """强制终止/异常停机时的收尾结果。"""
-    completed: List[Tuple[ExecutionHandle, ExecutionResult]]
-    cancelled: List[ExecutionHandle]
+    completed: List[Tuple[JobHandle, ExecutionResult]]
+    cancelled: List[JobHandle]
+
+
+__all__ = [
+    "AbortOutcome",
+    "ArtifactCleanupMode",
+    "ExecutionChannel",
+    "ExecutionChannelProtocol",
+    "ExecutionHandle",
+    "JobHandle",
+]
 
 
 class ExecutionChannelProtocol(Protocol):
@@ -73,11 +77,11 @@ class ExecutionChannelProtocol(Protocol):
         job: Job,
         ctx: TaskContext,
         timeout: float,
-    ) -> ExecutionHandle: ...
+    ) -> JobHandle: ...
 
     def poll_completed(
-        self, handles: Sequence[ExecutionHandle]
-    ) -> List[Tuple[ExecutionHandle, ExecutionResult]]: ...
+        self, handles: Sequence[JobHandle]
+    ) -> List[Tuple[JobHandle, ExecutionResult]]: ...
 
     def probe_orphan_lock(self, uid: str) -> bool: ...
 
@@ -85,7 +89,7 @@ class ExecutionChannelProtocol(Protocol):
 
     def drain_active_signals(self, uids: Iterable[str]) -> List[Tuple[str, str, float]]: ...
 
-    def abort_in_flight(self, handles: Sequence[ExecutionHandle]) -> AbortOutcome: ...
+    def abort_in_flight(self, handles: Sequence[JobHandle]) -> AbortOutcome: ...
 
     def cleanup_artifacts(self, uid: str, *, mode: ArtifactCleanupMode) -> None: ...
 
@@ -116,39 +120,19 @@ class ExecutionChannel:
         job: Job,
         ctx: TaskContext,
         timeout: float,
-    ) -> ExecutionHandle:
+    ) -> JobHandle:
         """启动隔离子进程执行 handler，建立 incarnation fencing，立即返回句柄。"""
-        raw_handle = self._executor.submit(
+        return self._executor.submit(
             handler_func, job, ctx, timeout, ipc_dir=self.ipc_dir
-        )
-        return ExecutionHandle(
-            uid=raw_handle.uid,
-            process=raw_handle.process,
-            deadline=raw_handle.deadline,
-            timeout=raw_handle.timeout,
-            job=raw_handle.job,
-            incarnation=ctx.incarnation,
         )
 
     def poll_completed(
-        self, handles: Sequence[ExecutionHandle]
-    ) -> List[Tuple[ExecutionHandle, ExecutionResult]]:
+        self, handles: Sequence[JobHandle]
+    ) -> List[Tuple[JobHandle, ExecutionResult]]:
         """非阻塞轮询已完成的执行体（正常完成/崩溃收割/看门狗阶梯终止）。"""
         if not handles:
             return []
-
-        # 适配底层 executor 的 handle 结构
-        raw_handles = [
-            self._to_raw_handle(h) for h in handles
-        ]
-        completed_raw = self._executor.reap_completed(raw_handles)
-
-        handle_map = {h.uid: h for h in handles}
-        results: List[Tuple[ExecutionHandle, ExecutionResult]] = []
-        for raw_h, res in completed_raw:
-            if raw_h.uid in handle_map:
-                results.append((handle_map[raw_h.uid], res))
-        return results
+        return self._executor.reap_completed(handles)
 
     def submit(
         self,
@@ -225,11 +209,10 @@ class ExecutionChannel:
 
         # 2. 终止未完成的子进程
         if pending_handles:
-            raw_pending = [self._to_raw_handle(h) for h in pending_handles]
-            self._executor.finalize_processes(raw_pending)
+            self._executor.finalize_processes(pending_handles)
 
         # 3. 重查 TOCTOU 闭环：kill 期间可能恰好写入了结果
-        truly_cancelled: List[Any] = []
+        truly_cancelled: List[JobHandle] = []
         for h in pending_handles:
             incarnation = getattr(h, "incarnation", None)
             res_p = result_path(self.ipc_dir, h.uid, incarnation)
@@ -325,17 +308,3 @@ class ExecutionChannel:
             return read_inputs(self.ipc_dir, uid)
         except Exception:
             return []
-
-    def _to_raw_handle(self, handle: Any) -> Any:
-        from .executor import JobHandle
-        if isinstance(handle, JobHandle):
-            return handle
-        return JobHandle(
-            uid=handle.uid,
-            process=handle.process,
-            deadline=handle.deadline,
-            timeout=handle.timeout,
-            job=handle.job,
-            ipc_dir=self.ipc_dir,
-            incarnation=getattr(handle, "incarnation", None),
-        )
