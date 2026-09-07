@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import multiprocessing as mp
 import pickle
@@ -21,6 +23,7 @@ from .engine.runtime import (
 from .engine.scheduler import JobScheduler
 from .engine.store import DLQEntry, StateStore
 from .exceptions import _CommitCrashSignal, _JobTerminated
+from .models.context import TaskContext
 from .models.job import Job
 from .taxonomy import ErrorTaxonomy, validate_resource_amounts
 from .utils.jsonutil import dumps
