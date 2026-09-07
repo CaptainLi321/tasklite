@@ -34,6 +34,9 @@ from ..utils.ipc import (
     append_signal,
     inputs_path,
     outputs_path,
+    read_inputs,
+    read_outputs,
+    read_signals,
     signals_path,
 )
 from ..utils.jsonutil import dump, dumps, loads, load as json_load
@@ -53,10 +56,6 @@ _RESULT_SUFFIX = ".result.json"
 _INCARNATION_RE = re.compile(r"\.([0-9a-f]{32})\.(\d+)\.result\.json$")
 _RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
 _RAW_TUPLE_SENTINEL = "__tl_tuple_v1"
-
-
-
-
 
 
 def _encode_raw_result(raw_result: Any) -> Any:
@@ -103,57 +102,6 @@ def _iter_stale_result_paths(ipc_dir: Union[str, Path], uid: str) -> List[Path]:
     except OSError:
         pass
     return found
-
-
-def read_inputs(ipc_dir: Union[str, Path], uid: str) -> List[dict]:
-    """读取一个 job 的全部输入声明（落盘文件）。"""
-    path = inputs_path(ipc_dir, uid)
-    entries: List[dict] = []
-    try:
-        if path.exists():
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = loads(line)
-                        if isinstance(data, dict) and isinstance(data.get("path"), str):
-                            entries.append(data)
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        continue
-    except OSError:
-        pass
-    return entries
-
-
-def read_outputs(ipc_dir: Union[str, Path], uid: str) -> List[Tuple[str, bool, str]]:
-    """读取一个 job 的全部已声明输出（落盘文件）。"""
-    path = outputs_path(ipc_dir, uid)
-    outputs: List[Tuple[str, bool, str]] = []
-    try:
-        if path.exists():
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = loads(line)
-                        if isinstance(data, dict) and isinstance(data.get("path"), str):
-                            kind = data.get("kind")
-                            if not isinstance(kind, str):
-                                continue
-                            outputs.append((
-                                data["path"],
-                                bool(data.get("cleanup", True)),
-                                kind,
-                            ))
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        continue
-    except OSError:
-        pass
-    return outputs
 
 
 def write_result_atomic(
@@ -235,39 +183,6 @@ def read_result_file(path: Path) -> Optional[dict]:
     except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
         logger.warning(f"Corrupt result file {path}: {e}, ignoring")
         return None
-
-
-def read_signals(ipc_dir: Union[str, Path], uid: str) -> List[Tuple[str, float]]:
-    """读取并删除一个 job 的 suspend 信号文件（排空语义）。"""
-    path = signals_path(ipc_dir, uid)
-    signals: List[Tuple[str, float]] = []
-    try:
-        if path.exists():
-            with open(path, "r+", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = loads(line)
-                        if isinstance(data, dict) and "suspend" in data:
-                            r_name, secs = data["suspend"]
-                            signals.append((r_name, secs))
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        continue
-                try:
-                    f.seek(0)
-                    f.truncate(0)
-                except OSError:
-                    pass
-            try:
-                path.unlink()
-            except (FileNotFoundError, OSError):
-                pass
-    except OSError:
-        pass
-    return signals
-
 
 def cleanup_ipc_files(ipc_dir: Union[str, Path], uid: str, incarnation: Optional[str] = None) -> None:
     """删除某个 job 的结果/信号/临时文件（不含 outputs.jsonl）。"""
