@@ -102,3 +102,42 @@ def test_sched_fields_match_null_safe(tmp_path):
     jd_bad["resources"] = "not-a-dict"
     assert sched._sched_fields_match(job_null, jd_bad) is False, \
         "非 dict resources 应判定不一致（不抛 TypeError）"
+
+
+def test_scheduler_has_potential_spawners():
+    """验证 JobScheduler 在单趟扫描中准确识别潜在 spawner 事实。"""
+    from tasklite.engine.scheduler import JobScheduler
+    from tasklite.engine.resource import CapacityResource
+    from tasklite.models.state import PipelineState
+    from unittest.mock import MagicMock
+
+    res = CapacityResource("gpu", max_capacity=1.0)
+    res.used = 1.0  # 暂时占满资源
+    sched = JobScheduler(resources={"gpu": res})
+
+    # 1. 只有缺失依赖的 job -> has_potential_spawners=False
+    mock_store = MagicMock()
+    mock_store.state = PipelineState(
+        wall={},
+        failed={},
+        cursors={},
+        queue=[Job("t", "a", depends_on=["t::missing"]).to_dict()],
+    )
+    result = sched.pop_next_runnable(mock_store, set())
+    assert result.runnable_idx is None
+    assert result.has_potential_spawners is False
+
+    # 2. 队列中含有依赖已满足（但暂时受限于资源）的 job -> has_potential_spawners=True
+    mock_store.state = PipelineState(
+        wall={},
+        failed={},
+        cursors={},
+        queue=[
+            Job("t", "a", depends_on=["t::missing"]).to_dict(),
+            Job("t", "spawner", resources={"gpu": 1.0}).to_dict(),
+        ],
+    )
+    result = sched.pop_next_runnable(mock_store, set())
+    assert result.runnable_idx is None
+    assert result.has_potential_spawners is True
+

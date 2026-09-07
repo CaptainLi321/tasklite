@@ -58,6 +58,7 @@ class DeadlockGovernor:
         state: PipelineState,
         missing_identifiers: Union[Sequence[int], Set[str], Sequence[str]],
         *,
+        has_potential_spawners: Optional[bool] = None,
         scheduler: Optional[Any] = None,
         now: Optional[float] = None,
         grace_seconds: Optional[float] = None,
@@ -90,7 +91,30 @@ class DeadlockGovernor:
 
         now_mono = time.monotonic() if now is None else now
 
-        # 检查队列中是否存在「全部已知依赖已在 wall 中」的潜在可运行作业
+        # 若调度器已单趟给出潜在 spawner 裁决，直接复用事实（避免二次扫描队列及重复反序列化）
+        if has_potential_spawners is not None:
+            if not has_potential_spawners:
+                return False
+            deadline = self.dep_grace_deadline
+            if deadline is None:
+                deadline = now_mono + effective_grace
+                self.dep_grace_deadline = deadline
+                logger.warning(
+                    f"DEPENDENCY GRACE: {len(missing_uids)} job(s) waiting "
+                    f"on missing deps; granting {effective_grace}s "
+                    f"grace (runnable job(s) may spawn them)."
+                )
+            if now_mono < deadline:
+                time.sleep(0.5)
+                return True
+            logger.error(
+                f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
+                f"still waiting on missing deps after "
+                f"{effective_grace}s; treating as deadlock (DLQ)."
+            )
+            return False
+
+        # 兼容回退：检查队列中是否存在「全部已知依赖已在 wall 中」的潜在可运行作业
         for jd in state.queue:
             uid = uid_from_job_dict(jd)
             if uid in missing_uids:
@@ -229,9 +253,11 @@ class DeadlockGovernor:
                 list(effective_state.queue), unknown_uids, ERR_RESOURCE_DEADLOCK
             )
         elif missing_uids:
+            has_spawners = getattr(sched, "has_potential_spawners", None)
             if self.check_dependency_grace(
                 effective_state,
                 missing_uids,
+                has_potential_spawners=has_spawners,
                 scheduler=scheduler,
                 grace_seconds=effective_grace,
             ):
