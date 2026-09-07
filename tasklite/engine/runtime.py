@@ -239,10 +239,11 @@ class RunContext:
             on_job_completed=lambda uid, meta, s, r: self.fire_job_completed(uid, meta, s, r),
             ctx=self,
         )
-        self.channel: ExecutionChannel = ExecutionChannel(
-            self.ipc_dir,
-            executor=self.executor,
-        )
+        if self.executor is not None:
+            self.channel = self.executor
+        else:
+            self.channel = ExecutionChannel(self.ipc_dir)
+            self.executor = self.channel
 
         self._in_flight: InFlightTracker = InFlightTracker()
         self.run_id: Optional[str] = None
