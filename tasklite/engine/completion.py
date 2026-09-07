@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 from ..exceptions import _JobTerminated
-from ..models.job import Job
+from ..models.job import Job, JobRuntimeState
 from .channel import ArtifactCleanupMode, ExecutionResult
 from .inflight import InFlightJob
 from .policy import BackoffSchedule
@@ -150,10 +150,9 @@ class CompletionMachine:
         if job.retries >= job.max_retries and not (result.interrupted or result.lock_conflict):
             logger.error(f"FAIL: {uid} exceeded max retries ({job.max_retries}). Sent to DLQ.")
             fail_meta = {"error": _ERR_MAX_RETRIES}
-            raw_rt = job_dict.get("runtime")
-            last_retry_error = raw_rt.get("_last_retry_error") if isinstance(raw_rt, dict) else None
-            if last_retry_error:
-                fail_meta["last_retry_error"] = last_retry_error
+            rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+            if rt_state.last_retry_error:
+                fail_meta["last_retry_error"] = rt_state.last_retry_error
             if result.retry_error:
                 fail_meta["retry_error"] = result.retry_error
             outcome = self._ctx.store.apply_failure(uid, fail_meta, job_dict=job_dict, cascade=True)
@@ -179,13 +178,11 @@ class CompletionMachine:
         logger.info(f"RETRY: {uid} (attempt {job.retries}/{job.max_retries}, backoff {sched.delay:.1f}s)")
         retry_dict = job.to_dict()
         retry_dict["resources"] = dict(job_dict.get("resources", {}))
-        raw_rt = job_dict.get("runtime")
-        retry_dict["runtime"] = dict(raw_rt) if isinstance(raw_rt, dict) else {}
-        retry_rt = retry_dict["runtime"]
-        retry_rt.setdefault("_last_retry_error", "")
+        retry_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
         if result.retry_error and not (lock_conflict or result.interrupted):
-            retry_rt["_last_retry_error"] = result.retry_error
-        sched.populate_runtime(retry_rt)
+            retry_state.last_retry_error = result.retry_error
+        sched.populate_runtime(retry_state)
+        retry_dict["runtime"] = retry_state.to_dict()
 
         self._ctx.store.apply_retry(uid, job_dict, retry_dict, front=False)
         self._ctx.stats["retried"] += 1

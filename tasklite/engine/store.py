@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequ
 
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
-from ..models.job import Job
+from ..models.job import Job, JobRuntimeState
 from ..models.state import PipelineState, uid_from_job_dict
 from ..taxonomy import (
     ERR_COMMIT_FAILURE_DLQ,
@@ -295,7 +295,14 @@ class StateStore:
         for uid, meta in sanitized_metas:
             matching = [j for j in queue if uid_from_job_dict(j) == uid]
             jd = matching[0] if matching else {"task_type": uid.split("::")[0], "job_id": uid.split("::")[1]}
-            failures = jd.get("_commit_failures", 0) + 1
+            rt_state = JobRuntimeState.from_dict(jd.get("runtime"))
+            if "_commit_failures" in jd and not rt_state.commit_failures:
+                try:
+                    rt_state.commit_failures = int(jd["_commit_failures"])
+                except (ValueError, TypeError):
+                    pass
+            failures = rt_state.record_commit_failure()
+            jd["runtime"] = rt_state.to_dict()
             jd["_commit_failures"] = failures
             if failures >= self._threshold:
                 single_committed = self._backend.commit_job_failure(
@@ -416,13 +423,14 @@ class StateStore:
         if job_dict is None:
             job_dict = {"task_type": uid.split("::")[0], "job_id": uid.split("::")[1]}
 
-        raw_rt = job_dict.get("runtime")
-        if not isinstance(raw_rt, dict):
-            raw_rt = {}
-            job_dict["runtime"] = raw_rt
-
-        failures = raw_rt.get("_commit_failures", job_dict.get("_commit_failures", 0)) + 1
-        raw_rt["_commit_failures"] = failures
+        rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+        if "_commit_failures" in job_dict and not rt_state.commit_failures:
+            try:
+                rt_state.commit_failures = int(job_dict["_commit_failures"])
+            except (ValueError, TypeError):
+                pass
+        failures = rt_state.record_commit_failure()
+        job_dict["runtime"] = rt_state.to_dict()
         job_dict["_commit_failures"] = failures
 
         if failures >= self._threshold:

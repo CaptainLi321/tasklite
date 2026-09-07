@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 from .resource import Resource, ResourceManager, ResourceEvaluation
 from .runtime import RT_BACKOFF_UNTIL
-from ..models.job import Job
+from ..models.job import Job, JobRuntimeState
 from ..models.state import uid_from_job_dict
 
 logger = logging.getLogger("tasklite")
@@ -300,11 +300,16 @@ class JobScheduler:
 
             # 4. Backoff — 复用循环顶部的 now 值，避免双重 time.monotonic 调用
             raw_rt = job_dict.get("runtime")
-            _backoff = raw_rt.get(RT_BACKOFF_UNTIL) if isinstance(raw_rt, dict) else None
-            if isinstance(_backoff, (int, float)) and _backoff > now:
-                remaining = _backoff - now
-                min_wait = min(min_wait, max(0.0, remaining))
-                continue
+            if isinstance(raw_rt, JobRuntimeState):
+                if raw_rt.is_backed_off(now):
+                    min_wait = min(min_wait, raw_rt.remaining_backoff(now))
+                    continue
+            elif isinstance(raw_rt, dict):
+                _backoff = raw_rt.get(RT_BACKOFF_UNTIL)
+                if isinstance(_backoff, (int, float)) and _backoff > now:
+                    remaining = _backoff - now
+                    min_wait = min(min_wait, max(0.0, remaining))
+                    continue
 
             if can_run:
                 runnable_idx = i

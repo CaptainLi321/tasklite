@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from .completion import CompletionMachine
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
-from ..models.job import Job
+from ..models.job import Job, JobRuntimeState
 from ..models.state import uid_from_job_dict
 from ..utils.jsonutil import loads
 from .inflight import InFlightJob, InFlightTracker
@@ -67,25 +67,10 @@ class RecoveryOrchestrator:
         clean_q = []
 
         for jd in q_data:
-            # 1. 退避换算
-            rt = jd.setdefault("runtime", {})
-            if not isinstance(rt, dict):
-                rt = {}
-                jd["runtime"] = rt
-            wall_deadline = rt.get(RT_BACKOFF_WALL_DEADLINE)
-            if (
-                isinstance(wall_deadline, (int, float))
-                and not isinstance(wall_deadline, bool)
-                and math.isfinite(wall_deadline)
-            ):
-                if wall_now >= wall_deadline:
-                    rt.pop(RT_BACKOFF_WALL_DEADLINE, None)
-                    rt.pop(RT_BACKOFF_UNTIL, None)
-                else:
-                    rt[RT_BACKOFF_UNTIL] = now + (wall_deadline - wall_now)
-            else:
-                rt.pop(RT_BACKOFF_WALL_DEADLINE, None)
-                rt.pop(RT_BACKOFF_UNTIL, None)
+            # 1. 退避换算（委托强类型 JobRuntimeState 对齐双时钟）
+            rt_state = JobRuntimeState.from_dict(jd.get("runtime"))
+            rt_state.align_wall_clock(now, wall_now)
+            jd["runtime"] = rt_state.to_dict()
 
             # 2. 过滤残留
             u = uid_from_job_dict(jd)

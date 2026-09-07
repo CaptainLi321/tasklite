@@ -26,7 +26,7 @@ from ..taxonomy import (
 )
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
-from ..models.job import Job
+from ..models.job import Job, JobRuntimeState
 from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE
 from .channel import ArtifactCleanupMode, JobHandle
 from .inflight import InFlightJob
@@ -351,13 +351,9 @@ class DispatchMachine:
             # 独立 `_dispatch_failures` 计数——不复用
             # `_commit_failures`（混用计数的话，dispatch 失败几次后任意一次
             # commit 失败即达阈值进 DLQ，错误码 COMMIT_FAILURE_DLQ 误导
-            raw_rt = job_dict.get("runtime")
-            if not isinstance(raw_rt, dict):
-                raw_rt = {}
-                job_dict["runtime"] = raw_rt
-            rt = raw_rt
-            failures = rt.get("_dispatch_failures", 0) + 1
-            rt["_dispatch_failures"] = failures
+            rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+            failures = rt_state.record_dispatch_failure()
+            job_dict["runtime"] = rt_state.to_dict()
             if failures >= self._ctx.commit_failure_dlq_threshold:
                 logger.critical(
                     f"Dispatch failed {failures} times for {uid} ({e}); "
