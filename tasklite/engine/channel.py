@@ -24,8 +24,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequ
 from ..exceptions import (
     FatalError,
     RetryError,
-    classify_exception,
 )
+from ..taxonomy import classify_exception
 from ..models.context import TaskContext
 from ..models.job import Job
 from ..utils.ipc import (

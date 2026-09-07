@@ -110,6 +110,7 @@ from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
 from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
+from ..taxonomy import ErrorTaxonomy
 from ..utils.jsonutil import dumps, loads
 from ..utils.lockfile import release_lock, try_acquire_lock
 
@@ -219,9 +220,17 @@ class RunContext:
         else:
             self.channel = ExecutionChannel(self.ipc_dir)
         self.output_root = output_root
-        self.transient_registry = transient_registry
         self.fatal_exceptions = tuple(fatal_exceptions) if fatal_exceptions is not None else None
         self.transient_exceptions = tuple(transient_exceptions) if transient_exceptions is not None else None
+        if isinstance(transient_registry, ErrorTaxonomy):
+            self.taxonomy = transient_registry
+        else:
+            self.taxonomy = ErrorTaxonomy(
+                fatal_exceptions=self.fatal_exceptions,
+                transient_exceptions=self.transient_exceptions,
+                transient_registry=transient_registry.snapshot() if hasattr(transient_registry, "snapshot") else transient_registry,
+            )
+        self.transient_registry = self.taxonomy
         self.discovery_rerun = discovery_rerun if discovery_rerun is not None else {}
         self.policy: PreflightPolicy = PreflightPolicy(self.discovery_rerun)
 
@@ -244,6 +253,7 @@ class RunContext:
         self.store: StateStore = StateStore(
             self._backend,
             commit_failure_dlq_threshold=self.commit_failure_dlq_threshold,
+            taxonomy=self.taxonomy,
             on_job_completed=lambda uid, meta, s, r: self.fire_job_completed(uid, meta, s, r),
             ctx=self,
         )
@@ -462,8 +472,8 @@ class EngineRuntime:
         return self._ctx.store
 
     @property
-    def channel(self) -> ExecutionChannel:
-        return self._ctx.channel
+    def taxonomy(self) -> ErrorTaxonomy:
+        return self._ctx.taxonomy
 
     def request_stop(self, force: bool = False) -> StopMode:
         """停机请求接口（单调状态转移）。"""

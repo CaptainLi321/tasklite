@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Union
 
+from .exceptions import FatalError, RateLimitHit, RetryError
+
 _UnionType = getattr(types, "UnionType", None)
 
 # ── 框架错误码常量 ────────────────────────────────────────────────────────
@@ -165,6 +167,29 @@ class ErrorClassification:
         return meta
 
 
+def _validate_transient_class(exception_cls: type) -> None:
+    """注册入口校验（fail-loud）——per-pipeline 注册表与外部直调共用。"""
+    if not isinstance(exception_cls, type) or not issubclass(exception_cls, Exception):
+        raise TypeError(
+            f"register_transient_exception requires an Exception subclass, got {exception_cls!r}"
+        )
+    if issubclass(exception_cls, (RetryError, FatalError)):
+        raise TypeError(
+            f"register_transient_exception cannot register a "
+            f"{'RetryError' if issubclass(exception_cls, RetryError) else 'FatalError'} "
+            f"subclass ({exception_cls!r}) — these have dedicated except branches "
+            f"that bypass the registry; registration would silently no-op."
+        )
+    try:
+        import pickle
+        pickle.dumps(exception_cls)
+    except (pickle.PicklingError, AttributeError, TypeError) as e:
+        raise TypeError(
+            f"register_transient_exception requires a module-level (picklable) "
+            f"Exception class for spawn-subprocess propagation, got {exception_cls!r}: {e}"
+        ) from e
+
+
 class ErrorTaxonomy:
     """错误归因、异常判定、输入防御与元数据规范化的深模块。"""
 
@@ -236,8 +261,6 @@ class ErrorTaxonomy:
         )
 
     def _classify_exception(self, exc: BaseException) -> ErrorClassification:
-        from .exceptions import FatalError, RetryError
-
         raw_err = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
         is_retry = isinstance(exc, RetryError)
         is_fatal = isinstance(exc, FatalError)
@@ -720,10 +743,13 @@ class ErrorTaxonomy:
 
     def register_transient(self, exception_cls: type) -> None:
         """注册业务自有异常类为瞬态（Fail-loud 校验）。"""
-        from .exceptions import _validate_transient_class
         _validate_transient_class(exception_cls)
         if exception_cls not in self._registry:
             self._registry.append(exception_cls)
+
+    def register(self, exception_cls: type) -> None:
+        """register_transient 的快捷别名方法。"""
+        self.register_transient(exception_cls)
 
     def snapshot(self) -> Tuple[Type[BaseException], ...]:
         """生成不可变 tuple 快照。"""
@@ -732,6 +758,25 @@ class ErrorTaxonomy:
     def matches(self, exc: BaseException) -> bool:
         """exc 是否命中注册表。"""
         return any(isinstance(exc, cls) for cls in self._registry)
+
+
+class TransientRegistry:
+    """瞬态异常注册表向后兼容门面（底层统一委托 ErrorTaxonomy）。"""
+
+    def __init__(self, classes: Optional[Sequence[type]] = None) -> None:
+        self._taxonomy = ErrorTaxonomy(transient_registry=classes)
+
+    def register(self, exception_cls: type) -> None:
+        """把业务自有异常类注册为瞬态（自动重试），幂等。"""
+        self._taxonomy.register_transient(exception_cls)
+
+    def snapshot(self) -> Tuple[Type[BaseException], ...]:
+        """返回不可变注册表快照（随 ctx 显式下发子进程）。"""
+        return self._taxonomy.snapshot()
+
+    def matches(self, exc: BaseException) -> bool:
+        """exc 是否命中本注册表。"""
+        return self._taxonomy.matches(exc)
 
 
 _DEFAULT_TAXONOMY = ErrorTaxonomy()
@@ -750,6 +795,41 @@ def validate_payload(payload: dict, schema: Any) -> list:
 def classify_error_type(meta: dict) -> str:
     """从 DLQ meta 推导结构化 error_type（list_dlq() 查询与 _write_dlq_row 落库共用）。"""
     return _DEFAULT_TAXONOMY.classify(meta).dlq_error_type
+
+
+def classify_exception(
+    exc: BaseException,
+    registry: Union[ErrorTaxonomy, TransientRegistry, Tuple[type, ...], Sequence[type], Any] = (),
+    *,
+    fatal_exceptions: Optional[Tuple[type, ...]] = None,
+    transient_exceptions: Optional[Tuple[type, ...]] = None,
+) -> str:
+    """异常三分类的生产语义，返回 retry/fatal/error。"""
+    if isinstance(registry, ErrorTaxonomy):
+        cl = registry.classify(exc)
+    elif fatal_exceptions is None and transient_exceptions is None and not registry:
+        cl = _DEFAULT_TAXONOMY.classify(exc)
+    else:
+        classes = registry.snapshot() if hasattr(registry, "snapshot") else tuple(registry or ())
+        taxonomy = ErrorTaxonomy(
+            fatal_exceptions=fatal_exceptions,
+            transient_exceptions=transient_exceptions,
+            transient_registry=classes,
+        )
+        cl = taxonomy.classify(exc)
+    if cl.is_retry or cl.is_transient:
+        return "retry"
+    if cl.is_fatal:
+        return "fatal"
+    return "error"
+
+
+def is_transient_exception(
+    exc: BaseException,
+    registry: Union[ErrorTaxonomy, TransientRegistry, Tuple[type, ...], Sequence[type], Any] = (),
+) -> bool:
+    """判断异常是否属于瞬态（应自动重试）。"""
+    return classify_exception(exc, registry) == "retry"
 
 
 __all__ = [
@@ -783,10 +863,14 @@ __all__ = [
     "ValidationResult",
     "ErrorClassification",
     "ErrorTaxonomy",
+    "TransientRegistry",
     "_DEFAULT_TAXONOMY",
     # 模块级工具函数
+    "_validate_transient_class",
     "validate_resource_amounts",
     "validate_payload",
     "classify_error_type",
+    "classify_exception",
+    "is_transient_exception",
 ]
 

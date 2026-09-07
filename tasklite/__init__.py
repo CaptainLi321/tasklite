@@ -10,9 +10,7 @@ __version__ = "1.1.0"
 # Public API - Core
 from .models.context import TaskContext
 from .exceptions import (
-    FatalError, FATAL_EXCEPTIONS, PipelineError, RateLimitHit, RetryError,
-    TRANSIENT_EXCEPTIONS, TransientRegistry, classify_exception,
-    is_transient_exception,
+    FatalError, PipelineError, RateLimitHit, RetryError,
 )
 from .models.job import Job, JobRuntimeState
 from .pipeline import DLQEntry, TaskLite, WORKER_RESOURCE, job_ref, progress_hook, slice_list
@@ -46,12 +44,17 @@ from .taxonomy import (
     ERROR_TYPE_TRANSIENT_EXHAUSTED,
     ERROR_TYPE_UNKNOWN,
     ERROR_TYPE_VALIDATION,
+    FATAL_EXCEPTIONS,
+    TRANSIENT_EXCEPTIONS,
     ErrorCategory,
     ErrorClassification,
     ErrorTaxonomy,
+    TransientRegistry,
     ValidationErrorItem,
     ValidationResult,
     classify_error_type,
+    classify_exception,
+    is_transient_exception,
     validate_payload,
     validate_resource_amounts,
 )
