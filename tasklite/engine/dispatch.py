@@ -243,6 +243,18 @@ class DispatchMachine:
         return False
 
 
+    def dispatch_stale_restore(self, uid: str, job: Job, job_dict: dict) -> bool:
+        """派发预检关 5——陈旧结果认领与派发前残留清理（stale-restore）。
+
+        1. 若存在上一轮崩溃遗留的结果文件，直接通过完成机器提交（返回 True，不派发子进程）。
+        2. 若无残留结果文件，清理已死孤儿残留声明与信号文件，准备派发新子进程（返回 False）。
+        """
+        if self._completion.restore_stale_result(uid, job, job_dict):
+            return True
+        self._ctx.channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
+        return False
+
+
     def dispatch_job(self, sched: Any) -> Optional[InFlightJob]:
         """统一派发单个作业：出队 -> 五关预检 -> 两阶段资源租约 -> 子进程启动 -> in-flight 原子登记。
 
@@ -280,19 +292,8 @@ class DispatchMachine:
                 return None
         if self.dispatch_orphan_probe(state, uid, job_dict):
             return None
-        # 关 5：stale-restore（崩溃残留消费）
-
-        # 崩溃恢复：派发子进程前先消费该 uid 的残留结果文件
-        # （上次 run 崩溃前已执行完成但未 commit）。有残留 → 直接提交，不派发。
-        # restore 在 probe **之后**——probe 通过意味着
-        # 无存活孤儿（锁生命周期 = 执行体生命周期，孤儿已死才会释放锁），
-        # 此时残留结果文件若存在必然来自已死执行的孤儿，消费它即吸收
-        # 「孤儿已完成但主进程崩溃未 commit」的执行成果，不派发（无双跑）。
-        if self._completion.restore_stale_result(uid, job, job_dict):
+        if self.dispatch_stale_restore(uid, job, job_dict):
             return None
-
-        # 派发前清理已死孤儿残留声明与信号文件
-        self._ctx.channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
 
         # Acquire resources via two-phase lease
         handle: Optional[JobHandle] = None
