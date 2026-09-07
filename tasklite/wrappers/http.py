@@ -445,37 +445,15 @@ def guard_request(
     default_suspend_ttl: float = 60.0,
     **kwargs: Any,
 ) -> Any:
-    """包装执行 HTTP 请求函数，提供就地快速重试与异常守卫。
-
-    Args:
-        func: 待执行的请求函数。
-        *args: 传递给请求函数的位置参数。
-        max_retries: 就地重试次数（默认 0：立即转交 TaskLite 引擎调度器退避）。
-        backoff: 就地重试等待间隔基数秒（默认 1.0s）。
-        ctx: 任务上下文。
-        resource: 限速资源名称。
-        policy: 分类规则器。
-        default_suspend_ttl: 429 挂起秒数。
-        **kwargs: 传递给请求函数的关键字参数。
-
-    Returns:
-        Any: 请求函数成功时的返回值。
-    """
-    pol = policy or HttpPolicy()
-    for attempt in range(max(0, max_retries) + 1):
-        if attempt > 0:
-            time.sleep(backoff * attempt)
-        try:
-            with http_guard(ctx=ctx, resource=resource, policy=pol, default_suspend_ttl=default_suspend_ttl) as g:
-                res = func(*args, **kwargs)
-                g.check_response(res)
-                return res
-        except RetryError:
-            if attempt >= max_retries:
-                raise
-        except (RateLimitHit, FatalError):
-            raise
-    raise RetryError(f"Request retries exhausted ({max_retries} retries)")
+    """包装执行 HTTP 请求函数，提供就地快速重试与异常守卫（委托 HttpExecutor）。"""
+    return HttpExecutor(
+        ctx=ctx,
+        resource=resource,
+        policy=policy,
+        max_retries=max_retries,
+        backoff=backoff,
+        default_suspend_ttl=default_suspend_ttl,
+    ).execute(func, *args, **kwargs)
 
 
 def guarded_fetch(
@@ -486,22 +464,15 @@ def guarded_fetch(
     backoff: float = 1.0,
     default_suspend_ttl: float = 60.0,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """用于修饰请求函数的守卫装饰器。"""
-    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-        def wrapped(*args: Any, **kwargs: Any) -> Any:
-            return guard_request(
-                fn,
-                *args,
-                max_retries=max_retries,
-                backoff=backoff,
-                ctx=ctx,
-                resource=resource,
-                policy=policy,
-                default_suspend_ttl=default_suspend_ttl,
-                **kwargs,
-            )
-        return wrapped
-    return decorator
+    """用于修饰请求函数的守卫装饰器（委托 HttpExecutor.wrap）。"""
+    return HttpExecutor(
+        ctx=ctx,
+        resource=resource,
+        policy=policy,
+        max_retries=max_retries,
+        backoff=backoff,
+        default_suspend_ttl=default_suspend_ttl,
+    ).wrap
 
 
 # ==============================================================================
@@ -830,17 +801,25 @@ class HttpExecutor:
         target_fn = fetch_fn
         if self.snapshot_store is not None:
             target_fn = self.snapshot_store.cached(target_fn)
-        return guard_request(
-            target_fn,
-            *args,
-            max_retries=self.max_retries,
-            backoff=self.backoff,
-            ctx=self.ctx,
-            resource=self.resource,
-            policy=self.policy,
-            default_suspend_ttl=self.default_suspend_ttl,
-            **kwargs,
-        )
+        for attempt in range(max(0, self.max_retries) + 1):
+            if attempt > 0:
+                time.sleep(self.backoff * attempt)
+            try:
+                with http_guard(
+                    ctx=self.ctx,
+                    resource=self.resource,
+                    policy=self.policy,
+                    default_suspend_ttl=self.default_suspend_ttl,
+                ) as g:
+                    res = target_fn(*args, **kwargs)
+                    g.check_response(res)
+                    return res
+            except RetryError:
+                if attempt >= self.max_retries:
+                    raise
+            except (RateLimitHit, FatalError):
+                raise
+        raise RetryError(f"Request retries exhausted ({self.max_retries} retries)")
 
     def wrap(self, fetch_fn: Callable[..., Any]) -> Callable[..., Any]:
         """将请求函数包装为绑定当前执行器配置的函数。"""
