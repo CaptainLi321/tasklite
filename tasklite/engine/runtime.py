@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 logger = logging.getLogger("tasklite")
 
@@ -94,6 +94,7 @@ class TaskStats(dict):
         return self["cascade_failed"]
 
 
+from .governor import DeadlockGovernor, EpisodeState
 from .store import (
     COMMIT_FAILURE_DLQ_THRESHOLD,
     DEADLOCK_GAP_MAX_ROUNDS,
@@ -163,19 +164,6 @@ class RunSummary:
     unhandled_exception: Optional[BaseException] = None
 
 
-@dataclass
-class EpisodeState:
-    """一次 run 内跨轮累计的治理状态。"""
-    dep_grace_deadline: Optional[float] = None
-    dep_grace_missing: Optional[frozenset] = None
-    deadlock_gap_rounds: int = 0
-
-    def reset(self) -> None:
-        self.dep_grace_deadline = None
-        self.dep_grace_missing = None
-        self.deadlock_gap_rounds = 0
-
-
 class RunContext:
     """一次 run() 的运行上下文容器。"""
 
@@ -240,6 +228,12 @@ class RunContext:
             if deadlock_gap_max_rounds is not None else DEADLOCK_GAP_MAX_ROUNDS
         )
 
+        self.governor: DeadlockGovernor = DeadlockGovernor(
+            dep_grace_seconds=self.dep_grace_seconds,
+            deadlock_gap_max_rounds=self.deadlock_gap_max_rounds,
+        )
+        self.episode: EpisodeState = self.governor
+
         self.on_run_start = on_run_start
         self.on_job_completed = on_job_completed
         self.on_run_end = on_run_end
@@ -250,6 +244,7 @@ class RunContext:
             taxonomy=self.taxonomy,
             on_job_completed=lambda uid, meta, s, r: self.fire_job_completed(uid, meta, s, r),
             ctx=self,
+            governor=self.governor,
         )
 
         self._in_flight: InFlightTracker = InFlightTracker()
@@ -257,7 +252,6 @@ class RunContext:
         self.dispatch_seq: int = 0
         self.stop_mode: StopMode = StopMode.NONE
         self.stats: TaskStats = TaskStats()
-        self.episode: EpisodeState = EpisodeState()
         self._run_end_fired = False
 
     @property
@@ -293,30 +287,30 @@ class RunContext:
 
     @property
     def dep_grace_deadline(self) -> Optional[float]:
-        return self.episode.dep_grace_deadline
+        return self.governor.dep_grace_deadline
 
     @dep_grace_deadline.setter
     def dep_grace_deadline(self, value: Optional[float]) -> None:
-        self.episode.dep_grace_deadline = value
+        self.governor.dep_grace_deadline = value
 
     @property
-    def dep_grace_missing(self) -> Optional[frozenset]:
-        return self.episode.dep_grace_missing
+    def dep_grace_missing(self) -> Optional[FrozenSet[str]]:
+        return self.governor.dep_grace_missing
 
     @dep_grace_missing.setter
-    def dep_grace_missing(self, value: Optional[frozenset]) -> None:
-        self.episode.dep_grace_missing = value
+    def dep_grace_missing(self, value: Optional[FrozenSet[str]]) -> None:
+        self.governor.dep_grace_missing = value
 
     @property
     def deadlock_gap_rounds(self) -> int:
-        return self.episode.deadlock_gap_rounds
+        return self.governor.deadlock_gap_rounds
 
     @deadlock_gap_rounds.setter
     def deadlock_gap_rounds(self, value: int) -> None:
-        self.episode.deadlock_gap_rounds = value
+        self.governor.deadlock_gap_rounds = value
 
     def reset_episode(self) -> None:
-        self.episode.reset()
+        self.governor.reset()
 
     def set_state(self, state: PipelineState) -> None:
         self.state = state
