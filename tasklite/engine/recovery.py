@@ -35,17 +35,12 @@ class RecoveryOrchestrator:
     2. 资源挂起状态加载与持久化恢复（load_resource_suspends / persist_resource_suspends）；
     3. 崩溃/异常路径安全保存队列（save_queue_crash_safe：以磁盘真相合并内存队列）；
     4. 实时 suspend 信号排空与应用（apply_pending_signals）；
-    5. 异常/停机在途任务 TOCTOU 闭环中止与收尾（abort_in_flight）；
-    6. 陈旧孤儿结果认领与收尾（reclaim_stale_result）。
+    5. 异常/停机在途任务 TOCTOU 闭环中止与收尾（abort_in_flight）。
     """
 
     def __init__(self, ctx: "RunContext", completion: "CompletionMachine") -> None:
         self._ctx = ctx
         self._completion = completion
-
-    def reclaim_stale_result(self, uid: str, job: Job, job_dict: dict) -> bool:
-        """启动或派发前认领并消费历史残留结果文件。"""
-        return self._completion.restore_stale_result(uid, job, job_dict)
 
     def repair_queue_on_load(
         self, q_data: list, wall: dict, failed: dict
