@@ -167,7 +167,7 @@ class TestIdentityNonVacuity:
         p._state.register_in_flight("t::a")
 
         with pytest.raises(_CommitCrashSignal):
-            p._failure.commit_failed_crash("t::a", "test_commit_failure", job_dict)
+            p.store.commit_failed_crash("t::a", "test_commit_failure", job_dict)
 
         # 断言：requeue 前已 unregister——uid 不在 in-flight（防 _abort 二次 requeue）
         assert "t::a" not in p._state.in_flight_uids
@@ -597,14 +597,14 @@ class TestDispatchInterruptResources:
         p.register_handler("t", lambda j, c: True, default_resources={"slot": 1.0})
         p.enqueue([Job("t", "a")])
 
-        real_submit = p.executor.submit
+        real_submit = p.channel.submit
         raised = {}
 
         def interrupting_submit(*a, **k):
             # 模拟：acquire 之后、submit 完成前命中 KeyboardInterrupt
             raise KeyboardInterrupt()
 
-        monkeypatch.setattr(p.executor, "submit", interrupting_submit)
+        monkeypatch.setattr(p.channel, "submit", interrupting_submit)
         from tasklite.pipeline import _CommitCrashSignal
         with pytest.raises(KeyboardInterrupt):
             try:

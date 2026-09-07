@@ -188,7 +188,6 @@ class RunContext:
         resources: Union[ResourceManager, Dict[str, Resource]],
         handlers: Dict[str, Any],
         channel: Optional[ExecutionChannel] = None,
-        executor: Any = None,
         ipc_dir: str,
         output_root: Optional[Union[str, Path, Sequence[Path]]] = None,
         on_run_start: Optional[Callable[[], None]] = None,
@@ -213,12 +212,7 @@ class RunContext:
             self.resource_mgr = ResourceManager(resources, handlers=handlers)
             self.resources = self.resource_mgr
         self.ipc_dir = ipc_dir
-        if channel is not None:
-            self.channel = channel
-        elif executor is not None:
-            self.channel = executor
-        else:
-            self.channel = ExecutionChannel(self.ipc_dir)
+        self.channel = channel if channel is not None else ExecutionChannel(self.ipc_dir)
         self.output_root = output_root
         self.fatal_exceptions = tuple(fatal_exceptions) if fatal_exceptions is not None else None
         self.transient_exceptions = tuple(transient_exceptions) if transient_exceptions is not None else None
@@ -265,20 +259,6 @@ class RunContext:
         self.stats: TaskStats = TaskStats()
         self.episode: EpisodeState = EpisodeState()
         self._run_end_fired = False
-
-    @property
-    def executor(self) -> ExecutionChannel:
-        """向后兼容属性：返回 ExecutionChannel。"""
-        return self.channel
-
-    @executor.setter
-    def executor(self, value: ExecutionChannel) -> None:
-        self.channel = value
-
-    @property
-    def _failure(self) -> StateStore:
-        """向后兼容属性：委托给 StateStore。"""
-        return self.store
 
     @property
     def state(self) -> PipelineState:
@@ -412,7 +392,6 @@ class EngineRuntime:
             resources=resources,
             handlers=self.handlers,
             channel=channel,
-            executor=executor,
             ipc_dir=config.ipc_dir,
             output_root=config.output_root,
             on_run_start=config.on_run_start,
@@ -444,11 +423,6 @@ class EngineRuntime:
 
     @property
     def channel(self) -> ExecutionChannel:
-        return self._ctx.channel
-
-    @property
-    def executor(self) -> ExecutionChannel:
-        """向后兼容属性：返回 ExecutionChannel。"""
         return self._ctx.channel
 
     @property

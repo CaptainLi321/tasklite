@@ -2,8 +2,6 @@
 
 - discovery：通用增量扫描回调封装（register_discovery + DiscoveryHandler + 协议）。
 - http：官方轻量网络工具库（HttpResponse, HttpPolicy, http_guard, SnapshotStore 等）。
-
-公共脚手架见 ``tasklite.pipeline_util``。
 """
 
 from . import discovery, http

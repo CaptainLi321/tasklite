@@ -246,20 +246,6 @@ class TaskLite:
         self._ctx.channel = value
 
     @property
-    def executor(self) -> ExecutionChannel:
-        """向后兼容属性：统一返回 ExecutionChannel。"""
-        return self._ctx.channel
-
-    @executor.setter
-    def executor(self, value: ExecutionChannel) -> None:
-        self._ctx.channel = value
-
-    @property
-    def _failure(self) -> StateStore:
-        """向后兼容属性：委托给 StateStore。"""
-        return self._ctx.store
-
-    @property
     def _run_started(self) -> bool:
         return self._runtime.is_running
 
@@ -697,11 +683,6 @@ class TaskLite:
 
     def _dispatch_job(self, sched):
         return self._dispatch.dispatch_job(sched)
-
-    def _apply_result(self, uid, job, job_dict, result, job_start=None, expect_in_flight=True):
-        return self._completion.apply_result(
-            uid, job, job_dict, result, job_start=job_start, expect_in_flight=expect_in_flight,
-        )
 
 
 def job_ref(meta: Any) -> str:

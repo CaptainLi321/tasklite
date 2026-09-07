@@ -605,11 +605,6 @@ class ExecutionChannel:
             except OSError:
                 pass
 
-    @property
-    def executor(self) -> "ExecutionChannel":
-        """消除浅层漏油：自我引用以兼容旧 pipeline.executor 属性。"""
-        return self
-
     @staticmethod
     def _finalize_process(p: Any) -> None:
         """清理单个子进程：kill + join + close。"""

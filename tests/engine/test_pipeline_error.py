@@ -836,7 +836,7 @@ class TestDeadlockFallbackConservative:
         monkeypatch.setattr(pipeline._state, "find_dependency_cycles", lambda: [])
         monkeypatch.setattr("time.sleep", lambda s: None)  # 防 0.5s 慢
         sched = self._sched(waiting_for_dependency=True)
-        should_break = pipeline._failure.handle_deadlock(sched)
+        should_break = pipeline.store.handle_deadlock(sched)
         assert should_break is False
         assert len(pipeline._state.queue) == 2
         assert pipeline.backend.load_failed() == {}
@@ -846,7 +846,7 @@ class TestDeadlockFallbackConservative:
         pipeline = self._queue_two_jobs(tmp_path)
         monkeypatch.setattr("time.sleep", lambda s: None)
         sched = self._sched()
-        should_break = pipeline._failure.handle_deadlock(sched)
+        should_break = pipeline.store.handle_deadlock(sched)
         assert should_break is False
         assert len(pipeline._state.queue) == 2
         assert pipeline.backend.load_failed() == {}
@@ -910,7 +910,7 @@ class TestDeadlockGapEscalation:
             missing_dependency_indices=[], impossible_resource_indices=[],
             waiting_for_dependency=True,
         )
-        should_break = pipeline._failure.handle_deadlock(sched)
+        should_break = pipeline.store.handle_deadlock(sched)
         assert should_break is False
         assert len(pipeline._state.queue) == 2
         assert pipeline.backend.load_failed() == {}
