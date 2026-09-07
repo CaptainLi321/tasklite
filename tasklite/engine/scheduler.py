@@ -91,11 +91,6 @@ class ScheduleResult:
     kind: str = "none"
     # 死锁归因值对象（UID 集合）
     attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
-    # 向后兼容整型索引（由 ScheduleResult 自动同步）
-    unknown_resource_indices: List[int] = field(default_factory=list)
-    missing_dependency_indices: List[int] = field(default_factory=list)
-    malformed_indices: List[int] = field(default_factory=list)
-    impossible_resource_indices: List[int] = field(default_factory=list)
 
     @property
     def unknown_resource_uids(self) -> Tuple[str, ...]:
@@ -234,10 +229,6 @@ class JobScheduler:
         has_potential_spawners = False
         pending_dep_failure: Optional[str] = None
         dep_failed_idx: int = -1  # 首个 dep-failed job 的索引（兜底）
-        unknown_resource_indices: List[int] = []
-        missing_dependency_indices: List[int] = []
-        malformed_indices: List[int] = []
-        impossible_resource_indices: List[int] = []
         unknown_resource_uids: List[str] = []
         missing_dependency_uids: List[str] = []
         malformed_uids: List[str] = []
@@ -246,12 +237,11 @@ class JobScheduler:
         now = time.monotonic()
 
         for i, job_dict in enumerate(q_data):
-            # 捕获畸形 job dict（缺 task_type/job_id 等），记录索引与 UID 避免整个扫描崩溃
+            # 捕获畸形 job dict（缺 task_type/job_id 等），记录 UID 避免整个扫描崩溃
             try:
                 job = self.cached_job(job_dict)
             except (KeyError, TypeError, ValueError) as e:
                 logger.error(f"Malformed job dict at index {i}: {e}")
-                malformed_indices.append(i)
                 malformed_uids.append(uid_from_job_dict(job_dict))
                 continue
             can_run = True
@@ -281,7 +271,6 @@ class JobScheduler:
                         waiting_for_dependency = True
                         has_missing_dep = True
                         if dep_uid not in pending_or_running:
-                            missing_dependency_indices.append(i)
                             missing_dependency_uids.append(job.uid)
 
             if not has_missing_dep:
@@ -291,12 +280,10 @@ class JobScheduler:
             eval_res = self.resource_mgr.evaluate(job.task_type, job.resources)
             if eval_res.is_unknown:
                 logger.error(f"Job {job.uid} references unknown resource '{eval_res.unknown_name}'.")
-                unknown_resource_indices.append(i)
                 unknown_resource_uids.append(job.uid)
                 min_wait = float('inf')  # Deadlock: Unknown resource
                 can_run = False
             elif eval_res.is_impossible:
-                impossible_resource_indices.append(i)
                 impossible_resource_uids.append(job.uid)
                 can_run = False
             elif not eval_res.is_available:
@@ -334,14 +321,20 @@ class JobScheduler:
         if runnable_idx != dep_failed_idx:
             pending_dep_failure = None
 
+        attribution = DeadlockAttribution(
+            unknown_resource_uids=tuple(unknown_resource_uids),
+            missing_dependency_uids=tuple(missing_dependency_uids),
+            malformed_uids=tuple(malformed_uids),
+            impossible_resource_uids=tuple(impossible_resource_uids),
+        )
+
         # 死锁归因类集合（impossible/unknown/missing/malformed）任一非空时
         # 强制 min_wait=inf：这些类别的判定不依赖任何等待——impossible/
         # unknown 是永久性死锁，missing 由宽限逻辑单独裁决，malformed 无法
         # 反序列化、永远不可能变为可运行。若被队列中另一 job 的有限退避/
         # 资源等待覆盖 min_wait，死锁判定被逐轮推迟到该等待终结（退避逐轮
         # 放大时可拖数十分钟，管线表现为卡死无日志）。
-        if (impossible_resource_indices or unknown_resource_indices
-                or missing_dependency_indices or malformed_indices) and min_wait != float('inf'):
+        if attribution.has_deadlock_causes and min_wait != float('inf'):
             min_wait = float('inf')
 
         # 显式表达结果类型——兜底后 runnable_idx 与 pending_dep_failure
@@ -353,13 +346,6 @@ class JobScheduler:
         else:
             kind = "none"
 
-        attribution = DeadlockAttribution(
-            unknown_resource_uids=tuple(unknown_resource_uids),
-            missing_dependency_uids=tuple(missing_dependency_uids),
-            malformed_uids=tuple(malformed_uids),
-            impossible_resource_uids=tuple(impossible_resource_uids),
-        )
-
         return ScheduleResult(
             runnable_idx=runnable_idx,
             pending_dep_failure=pending_dep_failure,
@@ -368,8 +354,4 @@ class JobScheduler:
             has_potential_spawners=has_potential_spawners,
             kind=kind,
             attribution=attribution,
-            unknown_resource_indices=unknown_resource_indices,
-            missing_dependency_indices=missing_dependency_indices,
-            malformed_indices=malformed_indices,
-            impossible_resource_indices=impossible_resource_indices,
         )

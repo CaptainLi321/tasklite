@@ -56,7 +56,7 @@ class DeadlockGovernor:
     def check_dependency_grace(
         self,
         state: PipelineState,
-        missing_identifiers: Union[Sequence[int], Set[str], Sequence[str]],
+        missing_identifiers: Union[Sequence[Union[int, str]], Set[str], Sequence[str]],
         *,
         has_potential_spawners: Optional[bool] = None,
         scheduler: Optional[Any] = None,
@@ -178,8 +178,6 @@ class DeadlockGovernor:
         self,
         sched: Any,
         field_name: str,
-        index_name: str,
-        state: PipelineState,
     ) -> Set[str]:
         """统一提取归因 UID 集合。"""
         attr = getattr(sched, "attribution", None) or getattr(sched, "deadlock_attribution", None)
@@ -191,17 +189,6 @@ class DeadlockGovernor:
             uids = getattr(sched, field_name)
             if uids:
                 return set(uids)
-        if hasattr(sched, index_name):
-            indices = getattr(sched, index_name)
-            if indices:
-                res: Set[str] = set()
-                for i in indices:
-                    if 0 <= i < len(state.queue):
-                        try:
-                            res.add(uid_from_job_dict(state.queue[i]))
-                        except Exception:
-                            pass
-                return res
         return set()
 
     @staticmethod
@@ -237,10 +224,10 @@ class DeadlockGovernor:
         effective_grace = dep_grace_seconds if dep_grace_seconds is not None else self.dep_grace_seconds
         effective_gap_max = deadlock_gap_max_rounds if deadlock_gap_max_rounds is not None else self.deadlock_gap_max_rounds
 
-        malformed_uids = self._extract_deadlock_uids(sched, "malformed_uids", "malformed_indices", effective_state)
-        unknown_uids = self._extract_deadlock_uids(sched, "unknown_resource_uids", "unknown_resource_indices", effective_state)
-        missing_uids = self._extract_deadlock_uids(sched, "missing_dependency_uids", "missing_dependency_indices", effective_state)
-        impossible_uids = self._extract_deadlock_uids(sched, "impossible_resource_uids", "impossible_resource_indices", effective_state)
+        malformed_uids = self._extract_deadlock_uids(sched, "malformed_uids")
+        unknown_uids = self._extract_deadlock_uids(sched, "unknown_resource_uids")
+        missing_uids = self._extract_deadlock_uids(sched, "missing_dependency_uids")
+        impossible_uids = self._extract_deadlock_uids(sched, "impossible_resource_uids")
 
         if malformed_uids:
             logger.error(f"Deadlock: {len(malformed_uids)} job(s) have malformed dict (unparseable).")

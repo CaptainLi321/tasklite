@@ -134,7 +134,7 @@ class TestBackoffDoesNotShadowDeadlock:
         # 退避状态在 runtime 子 dict；用大数退避（超过 now）
         jd["runtime"] = {"_backoff_until": 10**18}
         result = sched.pop_next_runnable(PipelineState({}, {}, {}, [jd]))
-        assert 0 in result.unknown_resource_indices, \
+        assert "t::x" in result.unknown_resource_uids, \
             "退避中的 job 引用未知资源必须立即归因"
         assert result.min_wait == float('inf'), "unknown 资源 → min_wait=inf 触发死锁"
 
@@ -145,7 +145,7 @@ class TestBackoffDoesNotShadowDeadlock:
         jd = Job("t", "x", payload={}, resources={"r": 99.0}).to_dict()
         jd["runtime"] = {"_backoff_until": 10**18}  # 退避中
         result = sched.pop_next_runnable(PipelineState({}, {}, {}, [jd]))
-        assert 0 in result.impossible_resource_indices
+        assert "t::x" in result.impossible_resource_uids
         assert result.min_wait == float('inf')
 
     def test_cycle_with_backoff_pipeline_detects_deadlock(self, tmp_path, caplog):

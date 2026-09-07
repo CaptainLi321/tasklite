@@ -419,7 +419,8 @@ class TestSchedulerDeadlockClassification:
             PipelineState({}, {}, {}, [job.to_dict()]),
         )
         assert result.runnable_idx is None
-        assert len(result.unknown_resource_indices) == 1
+        assert len(result.unknown_resource_uids) == 1
+        assert "t::j1" in result.unknown_resource_uids
         assert result.waiting_for_dependency is True
 
 

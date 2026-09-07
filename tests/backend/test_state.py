@@ -863,7 +863,7 @@ class TestSchedulerMalformedHandling:
 
     def test_malformed_job_dict_does_not_crash_scheduler(self):
         """畸形 job dict（缺 task_type）不会让 scheduler 崩溃，
-        返回 malformed_indices 指向问题条目，跳过它继续扫描后续 job。"""
+        返回 malformed_uids 指向问题条目，跳过它继续扫描后续 job。"""
         from tasklite.engine.scheduler import JobScheduler
 
         # 构造一个永远可获得的资源，使 valid job 直接 runnable
@@ -884,7 +884,8 @@ class TestSchedulerMalformedHandling:
         ]
         from tasklite.models.state import PipelineState
         result = scheduler.pop_next_runnable(PipelineState({}, {}, {}, q_data), frozenset())
-        # 畸形 job 索引被记录
-        assert 0 in result.malformed_indices
+        # 畸形 job UID 被记录
+        assert len(result.malformed_uids) == 1
+        assert result.malformed_uids[0].startswith("_unknown::")
         # 跳过畸形 job 后第一个 valid job (index 1) 是 runnable
         assert result.runnable_idx == 1
