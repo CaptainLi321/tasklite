@@ -147,8 +147,8 @@ class TestExecutionChannelAbortInFlight:
             def join(self, timeout=None):
                 pass
 
-        h1 = ExecutionHandle(uid=job1.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job1, incarnation="inc1")
-        h2 = ExecutionHandle(uid=job2.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job2, incarnation="inc2")
+        h1 = ExecutionHandle(uid=job1.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job1, ipc_dir=str(tmp_path), incarnation="inc1")
+        h2 = ExecutionHandle(uid=job2.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job2, ipc_dir=str(tmp_path), incarnation="inc2")
 
         outcome = channel.abort_in_flight([h1, h2])
         assert len(outcome.completed) == 1
