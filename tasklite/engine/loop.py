@@ -191,17 +191,16 @@ class LoopRunner:
             )
 
         # 1. 填池派发（仅非 DRAINING 状态且未超过单步限制）
-        sched = None
+        last_outcome: Optional[Any] = None
         worker_wait = 0.0
         dispatched = 0
         limit = max_dispatch if max_dispatch is not None else 1000000
         if not draining:
             while dispatched < limit:
                 outcome = self._dispatch.dispatch_next()
+                last_outcome = outcome
                 if outcome.worker_wait > 0:
                     worker_wait = outcome.worker_wait
-                if outcome.sched is not None:
-                    sched = outcome.sched
                 if outcome.entry is not None:
                     dispatched += 1
                     continue
@@ -211,13 +210,13 @@ class LoopRunner:
         # 2. 处理无可运行 job 与死锁判定
         deadlock_detected = False
         should_terminate = False
-        if sched is not None and sched.runnable_idx is None:
+        if last_outcome is not None and not last_outcome.has_runnable:
             if state.is_empty and not self._ctx.in_flight:
                 should_terminate = True
-            elif sched.min_wait == float("inf"):
+            elif last_outcome.min_wait == float("inf"):
                 if not self._ctx.in_flight:
                     deadlock_detected = True
-                    should_break = self._ctx.store.handle_deadlock(sched, ctx=self._ctx)
+                    should_break = self._ctx.store.handle_deadlock(last_outcome, ctx=self._ctx)
                     if should_break:
                         should_terminate = True
 
@@ -247,17 +246,16 @@ class LoopRunner:
             else:
                 wait_time = 0.0
                 should_wait = False
-        elif sched is not None and sched.runnable_idx is None and sched.min_wait != float("inf"):
-            if not self._ctx.in_flight and sched.waiting_for_dependency:
+        elif last_outcome is not None and not last_outcome.has_runnable and last_outcome.min_wait != float("inf"):
+            if not self._ctx.in_flight and last_outcome.waiting_for_dependency:
                 cycle_uids = state.find_dependency_cycles()
                 if cycle_uids:
                     logger.error(
                         f"Deadlock detected during backoff/wait: dependency cycle "
                         f"{sorted(set(cycle_uids))} masked by finite min_wait."
                     )
-                    sched.min_wait = float("inf")
                     deadlock_detected = True
-                    should_break = self._ctx.store.handle_deadlock(sched, ctx=self._ctx)
+                    should_break = self._ctx.store.handle_deadlock(last_outcome, ctx=self._ctx)
                     if should_break:
                         should_terminate = True
                         wait_time = 0.0
@@ -266,10 +264,10 @@ class LoopRunner:
                         wait_time = 0.0
                         should_wait = False
                 else:
-                    wait_time = min(sched.min_wait, 1.0)
+                    wait_time = min(last_outcome.min_wait, 1.0)
                     should_wait = True
             else:
-                wait_time = min(sched.min_wait, 1.0)
+                wait_time = min(last_outcome.min_wait, 1.0)
                 should_wait = True
         elif worker_wait > 0 and not self._ctx.in_flight:
             wait_time = min(worker_wait, 1.0)

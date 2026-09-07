@@ -10,7 +10,7 @@ import logging
 import random
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -30,19 +30,29 @@ from ..models.job import Job, JobRuntimeState
 from .runtime import RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE
 from .channel import ArtifactCleanupMode, JobHandle
 from .inflight import InFlightJob
+from .scheduler import DeadlockAttribution
 
 logger = logging.getLogger("tasklite")
 
 
 @dataclass(frozen=True)
 class DispatchOutcome:
-    """一次调度派发周期的不可变决策结果。"""
+    """一次调度派发周期的不可变决策结果（彻底解耦整型下标与底层调度 DTO）。"""
     entry: Optional[InFlightJob] = None
-    sched: Optional[Any] = None
+    has_runnable: bool = False
     should_continue: bool = True
     worker_wait: float = 0.0
+    min_wait: float = 0.0
+    waiting_for_dependency: bool = False
+    deadlock_attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
     dispatched: bool = False
     handled: bool = False
+    sched: Optional[Any] = None
+
+    @property
+    def attribution(self) -> DeadlockAttribution:
+        """死锁归因值对象属性别名（兼容 StateStore.handle_deadlock 读取）。"""
+        return self.deadlock_attribution
 
 
 class DispatchMachine:
@@ -58,8 +68,8 @@ class DispatchMachine:
         """统一扫描与派发接缝：工人资源预检 -> 队列扫描 -> 预检五关 -> 资源锁定 -> 子进程派发。
 
         返回 DispatchOutcome：
-        - entry 非 None：成功派发子进程并登记 in-flight（dispatched=True, handled=True）；
-        - entry 为 None 且 should_continue 为 True：处理了无需子进程的作业（去重/依赖失败/无 handler/校验失败，handled=True），调用方可继续填池；
+        - entry 非 None：成功派发子进程并登记 in-flight（has_runnable=True, dispatched=True, handled=True）；
+        - entry 为 None 且 should_continue 为 True：处理了无需子进程的作业（去重/依赖失败/无 handler/校验失败，has_runnable=True, handled=True），调用方可继续填池；
         - should_continue 为 False：工人资源耗尽或无可运行作业，调用方应退出填池循环。
         """
         state = self._ctx.state
@@ -69,11 +79,13 @@ class DispatchMachine:
                 worker_wait = 0.05
             return DispatchOutcome(
                 entry=None,
-                sched=None,
+                has_runnable=True,
                 should_continue=False,
                 worker_wait=worker_wait,
+                min_wait=0.0,
                 dispatched=False,
                 handled=False,
+                sched=None,
             )
 
         in_flight_uids = state.in_flight_uids
@@ -81,28 +93,39 @@ class DispatchMachine:
         if sched.runnable_idx is None:
             return DispatchOutcome(
                 entry=None,
-                sched=sched,
+                has_runnable=False,
                 should_continue=False,
+                worker_wait=0.0,
+                min_wait=sched.min_wait,
+                waiting_for_dependency=sched.waiting_for_dependency,
+                deadlock_attribution=sched.attribution,
                 dispatched=False,
                 handled=False,
+                sched=sched,
             )
 
         entry = self.dispatch_job(sched)
         if entry is None:
             return DispatchOutcome(
                 entry=None,
-                sched=sched,
+                has_runnable=True,
                 should_continue=True,
+                worker_wait=0.0,
+                min_wait=0.0,
                 dispatched=False,
                 handled=True,
+                sched=sched,
             )
 
         return DispatchOutcome(
             entry=entry,
-            sched=sched,
+            has_runnable=True,
             should_continue=True,
+            worker_wait=0.0,
+            min_wait=0.0,
             dispatched=True,
             handled=True,
+            sched=sched,
         )
 
     def _reject_and_commit(
