@@ -20,11 +20,11 @@ from .engine.runtime import (
 )
 from .engine.scheduler import JobScheduler
 from .engine.store import StateStore
-from .exceptions import TransientRegistry, _CommitCrashSignal, _JobTerminated
+from .exceptions import _CommitCrashSignal, _JobTerminated
 from .models.context import TaskContext
 from .models.job import Job
 from .models.state import PipelineState, uid_from_job_dict
-from .taxonomy import validate_resource_amounts
+from .taxonomy import ErrorTaxonomy, TransientRegistry, validate_resource_amounts
 from .utils.jsonutil import dumps, loads
 
 logger = logging.getLogger("tasklite")
@@ -177,17 +177,18 @@ class TaskLite:
         # 时经 apply_discovery_rerun 注入（见 enqueue docstring），使「固定
         # uid 每会话重扫」成为默认。
         self._discovery_rerun: Dict[str, str] = {}
-        # 瞬态异常注册表是 **per-pipeline 实例态**——不跨 pipeline/run
+        # 错误分类与瞬态注册是 **per-pipeline 实例态**——不跨 pipeline/run
         # 累积；子进程只消费 ctx 携带的不可变快照（见
         # register_transient_exception / _dispatch_job）。
-        self.transient_registry = TransientRegistry()
-        # per-pipeline 异常分类覆盖（None=用 exceptions 模块内置元组）：
-        # 确定性/瞬态启发式的成员集合可按 pipeline 定制，快照经 ctx 下发
-        # 子进程——与瞬态注册表同一作用域纪律。
         self._fatal_exceptions: Optional[tuple] = (
             tuple(fatal_exceptions) if fatal_exceptions is not None else None)
         self._transient_exceptions: Optional[tuple] = (
             tuple(transient_exceptions) if transient_exceptions is not None else None)
+        self.taxonomy = ErrorTaxonomy(
+            fatal_exceptions=self._fatal_exceptions,
+            transient_exceptions=self._transient_exceptions,
+        )
+        self.transient_registry = self.taxonomy
         self.resources: ResourceManager = ResourceManager(handlers=self.handlers)
         # 内部 worker 资源：控制并发度。每个 job 默认占用 1 个 worker 槽位，
         # CapacityResource.used 实时反映 in-flight 占用，scheduler 的
@@ -521,7 +522,7 @@ class TaskLite:
         可 pickle（入口 fail-loud 预检）；注册表快照随 ``TaskContext``
         显式下发子进程。
         """
-        self.transient_registry.register(exception_cls)
+        self.taxonomy.register_transient(exception_cls)
 
     def register_transient_exceptions(self, classes: Sequence[type]) -> None:
         """批量注册瞬态异常类。"""
