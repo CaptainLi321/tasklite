@@ -333,7 +333,7 @@ class StateStore:
                 cascaded_uids = self.cascade_fail(uid)
             return FailureOutcome(uid=uid, error_meta=sanitized_meta, cascaded_uids=cascaded_uids)
 
-        self._handle_commit_failure(uid, sanitized_meta.get("error", "commit_job_failure"), job_dict)
+        self.commit_failed_crash(uid, sanitized_meta.get("error", "commit_job_failure"), job_dict)
         return FailureOutcome(uid=uid, error_meta=sanitized_meta)
 
     def apply_retry(
@@ -351,7 +351,7 @@ class StateStore:
             self._state.requeue_jobs([retry_dict], front=front)
             return RetryOutcome(uid=uid, retry_dict=retry_dict)
 
-        self._handle_commit_failure(uid, "commit_retry", job_dict)
+        self.commit_failed_crash(uid, "commit_retry", job_dict)
         return RetryOutcome(uid=uid, retry_dict=retry_dict)
 
     def _requeue_and_crash(self, uid: str, job_dict: Optional[Dict[str, Any]], reason: str) -> None:
@@ -380,7 +380,10 @@ class StateStore:
             return SkipOutcome(uid=uid, was_known=True)
 
         self.commit_skip_crash(uid, job_dict)
-        return SkipOutcome(uid=uid, was_known=False)
+        raise AssertionError(
+            f"_commit_skip_crash for {uid} unexpectedly returned normally; "
+            f"contract requires raising _CommitCrashSignal."
+        )
 
     def apply_bulk_failure(
         self,

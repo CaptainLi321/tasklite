@@ -131,25 +131,22 @@ class DispatchMachine:
         self, uid: str, job_dict: dict, meta: dict, *,
         count_as: str = "failed",
     ) -> None:
-        """拒绝 job 的统一出口：commit 失败 → 三连收敛 → 级联 → 钩子。
+        """拒绝 job 的统一出口：委托 StateStore.apply_failure 原子终态转移。
 
-        三处拒绝路径（依赖失败 / no-handler / payload 校验失败）共用本方法，
-        消除重复的 commit + apply_failed + cascade_fail + fire_hook 样板。
+        四处拒绝路径（依赖失败 / no-handler / payload 校验失败 / dispatch 3-strike）
+        共用本方法，彻底收敛 commit + apply_failed + cascade_fail + fire_hook 至 StateStore。
 
         正常返回 = 处理完成（commit 成功或 3-strike DLQ 成功）；
         _CommitCrashSignal 穿透上抛 = 后端环境故障（由 run_loop 崩溃处理）。
         """
         try:
-            committed = self._ctx.backend.commit_job_failure(uid, meta)
-            if committed:
-                self._ctx.store.apply_failed(uid, meta, unregister=True)
-                self._ctx.stats[count_as] += 1
-                cascaded = self._ctx.store.cascade_fail(uid)
-                if cascaded:
-                    self._ctx.stats["cascade_failed"] += len(cascaded)
-                self._ctx.fire_job_completed(uid, meta, False, False)
-                return
-            self._ctx.store.commit_failed_crash(uid, meta.get("error", "reject"), job_dict)
+            outcome = self._ctx.store.apply_failure(
+                uid, meta, job_dict=job_dict, count_as=count_as, cascade=True
+            )
+            self._ctx.stats[count_as] += 1
+            if outcome.cascaded_uids:
+                self._ctx.stats["cascade_failed"] += len(outcome.cascaded_uids)
+            self._ctx.fire_job_completed(uid, outcome.error_meta, False, False)
         except _JobTerminated:
             # 3-strike DLQ 成功——job 已终结，统计递增后正常返回即可
             self._ctx.stats[count_as] += 1
@@ -170,14 +167,8 @@ class DispatchMachine:
                 is_failed=(uid in store.failed),
             )
             if decision.should_skip:
+                self._ctx.store.apply_skip(uid, job_dict)
                 self._ctx.stats["skipped"] += 1
-                committed = self._ctx.backend.commit_skip(uid)
-                if not committed:
-                    self._ctx.store.commit_skip_crash(uid, job_dict)
-                    raise AssertionError(
-                        f"_commit_skip_crash for {uid} unexpectedly returned normally; "
-                        f"contract requires raising _CommitCrashSignal."
-                    )
                 return True
         return False
 
@@ -388,27 +379,14 @@ class DispatchMachine:
                     f"treating as deterministic bad input (e.g. unpickleable "
                     f"handler), sending to DLQ."
                 )
-                committed = self._ctx.backend.commit_job_failure(
-                    uid, {"error": _ERR_DISPATCH_FAILURE,
-                          "failures": failures, "detail": str(e)[:200]},
-                )
-                if committed:
-                    self._ctx.in_flight.pop(uid, None)
-                    # dispatch 失败达阈值视为业务侧确定性坏输入，下游自动级联跳过。
-                    fail_meta = {
-                        "error": _ERR_DISPATCH_FAILURE,
-                        "failures": failures,
-                        "detail": str(e)[:200],
-                    }
-                    self._ctx.store.apply_failed(uid, fail_meta)
-                    self._ctx.stats["failed"] += 1
-                    cascaded = self._ctx.store.cascade_fail(uid)
-                    if cascaded:
-                        self._ctx.stats["cascade_failed"] += len(cascaded)
-                    # dispatch 3-strike 终态触发钩子
-                    self._ctx.fire_job_completed(uid, fail_meta, False, False)
-                    return
-                # DLQ 也失败（环境故障）→ 走 crash 路径
+                fail_meta = {
+                    "error": _ERR_DISPATCH_FAILURE,
+                    "failures": failures,
+                    "detail": str(e)[:200],
+                }
+                self._ctx.in_flight.pop(uid, None)
+                self._reject_and_commit(uid, job_dict, fail_meta)
+                return None
             self._ctx.in_flight.pop(uid, None)
             store.unregister_in_flight(uid)
             store.requeue_jobs([job_dict], front=True)
