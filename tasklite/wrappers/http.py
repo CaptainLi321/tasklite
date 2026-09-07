@@ -785,7 +785,72 @@ class MemorySnapshotStore(SnapshotStore):
 
 
 # ==============================================================================
-# 4. 内置标准请求辅助函数（fetch_urllib & fetch_requests）
+# 4. 组合式执行器（HttpExecutor 深模块）
+# ==============================================================================
+
+class HttpExecutor:
+    """组合式轻量 HTTP 执行器深模块（开放 Callable 包装与策略绑定）。
+
+    统一绑定：
+    1. HttpPolicy 异常与状态码分类规则；
+    2. TaskContext / 限速资源 429 自动挂起与退避；
+    3. 可选 SnapshotStore 内容寻址快照透明拦截；
+    4. 本地就地快速重试。
+
+    零引擎强耦合：严格遵循 ADR-0001 架构契约，仅面向开放 Callable 统一提供
+    execute 与 wrap 接缝，不引入任何重型单体 Client，可在独立离线脚本或
+    TaskLite handler 中自由选用。
+    """
+
+    def __init__(
+        self,
+        ctx: Optional[Any] = None,
+        resource: Optional[str] = None,
+        policy: Optional[HttpPolicy] = None,
+        snapshot_store: Optional[SnapshotStore] = None,
+        max_retries: int = 0,
+        backoff: float = 1.0,
+        default_suspend_ttl: float = 60.0,
+    ) -> None:
+        self.ctx = ctx
+        self.resource = resource
+        self.policy = policy or HttpPolicy()
+        self.snapshot_store = snapshot_store
+        self.max_retries = max_retries
+        self.backoff = backoff
+        self.default_suspend_ttl = default_suspend_ttl
+
+    def execute(
+        self,
+        fetch_fn: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """执行任意底层请求函数，自动应用快照缓存、429 守卫与本地重试。"""
+        target_fn = fetch_fn
+        if self.snapshot_store is not None:
+            target_fn = self.snapshot_store.cached(target_fn)
+        return guard_request(
+            target_fn,
+            *args,
+            max_retries=self.max_retries,
+            backoff=self.backoff,
+            ctx=self.ctx,
+            resource=self.resource,
+            policy=self.policy,
+            default_suspend_ttl=self.default_suspend_ttl,
+            **kwargs,
+        )
+
+    def wrap(self, fetch_fn: Callable[..., Any]) -> Callable[..., Any]:
+        """将请求函数包装为绑定当前执行器配置的函数。"""
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            return self.execute(fetch_fn, *args, **kwargs)
+        return _wrapped
+
+
+# ==============================================================================
+# 5. 内置标准请求辅助函数（fetch_urllib & fetch_requests）
 # ==============================================================================
 
 def fetch_urllib(
@@ -969,6 +1034,7 @@ __all__ = [
     "http_guard",
     "guard_request",
     "guarded_fetch",
+    "HttpExecutor",
     "SnapshotStore",
     "SQLiteSnapshotStore",
     "MemorySnapshotStore",

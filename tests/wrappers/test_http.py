@@ -17,6 +17,7 @@ import pytest
 
 from tasklite.exceptions import FatalError, RateLimitHit, RetryError
 from tasklite.wrappers.http import (
+    HttpExecutor,
     HttpPolicy,
     HttpResponse,
     MemorySnapshotStore,
@@ -388,4 +389,65 @@ def test_fetch_requests_429_suspension(local_http_server: str) -> None:
     with pytest.raises(RateLimitHit):
         fetch_requests(f"{local_http_server}/429", ctx=mock_ctx, resource="api_req")
     mock_ctx.suspend_resource.assert_called_once_with("api_req", 15.0)
+
+
+# ==============================================================================
+# 5. HttpExecutor 深模块测试
+# ==============================================================================
+
+class TestHttpExecutor:
+    def test_execute_and_wrap_basic(self):
+        executor = HttpExecutor(max_retries=0)
+        call_count = 0
+
+        def sample_fetch(url: str):
+            nonlocal call_count
+            call_count += 1
+            return HttpResponse(status_code=200, headers={}, body=b"ok", url=url)
+
+        resp = executor.execute(sample_fetch, "https://example.com/api")
+        assert resp.status_code == 200
+        assert resp.text == "ok"
+        assert call_count == 1
+
+        wrapped = executor.wrap(sample_fetch)
+        resp2 = wrapped("https://example.com/api")
+        assert resp2.status_code == 200
+        assert call_count == 2
+
+    def test_execute_with_snapshot_store(self):
+        store = MemorySnapshotStore()
+        executor = HttpExecutor(snapshot_store=store)
+        call_count = 0
+
+        def sample_fetch(url: str, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return HttpResponse(status_code=200, headers={}, body=b"data", url=url)
+
+        resp1 = executor.execute(sample_fetch, "https://example.com/cached")
+        assert resp1.status_code == 200
+        assert call_count == 1
+
+        # 第二次请求直接命中快照缓存，不调用底层 sample_fetch
+        resp2 = executor.execute(sample_fetch, "https://example.com/cached")
+        assert resp2.status_code == 200
+        assert resp2.text == "data"
+        assert call_count == 1
+
+    def test_execute_with_rate_limit_and_retry(self):
+        mock_ctx = MagicMock()
+        executor = HttpExecutor(ctx=mock_ctx, resource="api_custom", default_suspend_ttl=30.0)
+
+        def failing_fetch(url: str):
+            resp = MagicMock()
+            resp.status_code = 429
+            resp.headers = {"Retry-After": "45"}
+            return resp
+
+        with pytest.raises(RateLimitHit):
+            executor.execute(failing_fetch, "https://example.com/rate_limited")
+
+        mock_ctx.suspend_resource.assert_called_once_with("api_custom", 45.0)
+
 
