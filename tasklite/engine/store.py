@@ -145,6 +145,90 @@ class StateStore:
         """底层持久化后端引用。"""
         return self._backend
 
+    @property
+    def queue(self) -> List[Dict[str, Any]]:
+        """内存作业队列视图。"""
+        return self._state.queue
+
+    @property
+    def wall(self) -> Dict[str, Dict[str, Any]]:
+        """成功历史集合视图。"""
+        return self._state.wall
+
+    @property
+    def failed(self) -> Dict[str, Dict[str, Any]]:
+        """死信队列集合视图。"""
+        return self._state.failed
+
+    @property
+    def cursors(self) -> Dict[str, str]:
+        """游标字典视图。"""
+        return self._state.cursors
+
+    @property
+    def in_flight_uids(self) -> FrozenSet[str]:
+        """当前在途作业 UID 集合快照。"""
+        return self._state.in_flight_uids
+
+    @property
+    def wall_uids(self) -> FrozenSet[str]:
+        """已成功作业 UID 集合快照。"""
+        return self._state.wall_uids
+
+    @property
+    def failed_uids(self) -> FrozenSet[str]:
+        """已失败作业 UID 集合快照。"""
+        return self._state.failed_uids
+
+    @property
+    def queue_uids(self) -> FrozenSet[str]:
+        """排队作业 UID 集合快照。"""
+        return self._state.queue_uids
+
+    def pop_job(self, idx: int) -> dict:
+        """弹出指定位置作业并同步 UID 索引。"""
+        return self._state.pop_job(idx)
+
+    def spawn_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None:
+        """批量入队作业并同步 UID 索引。"""
+        self._state.spawn_jobs(job_dicts, front=front)
+
+    def requeue_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None:
+        """重入队作业（崩溃恢复/重试）并同步 UID 索引。"""
+        self._state.requeue_jobs(job_dicts, front=front)
+
+    def replace_queue(self, job_dicts: List[Dict[str, Any]]) -> None:
+        """整体替换队列并重建 UID 索引。"""
+        self._state.replace_queue(job_dicts)
+
+    def is_known(self, uid: str) -> bool:
+        """检查作业是否已在系统任一集合（wall/failed/queue/in_flight）中。"""
+        return self._state.is_known(uid)
+
+    def is_completed(self, uid: str) -> bool:
+        """检查作业是否已在 wall 成功集合中。"""
+        return uid in self._state.wall
+
+    def is_failed(self, uid: str) -> bool:
+        """检查作业是否已在 failed 失败集合中。"""
+        return uid in self._state.failed
+
+    def all_known_uids(self) -> Set[str]:
+        """返回当前系统已知全部 UID 集合。"""
+        return self._state.all_known_uids()
+
+    def clear_in_flight(self) -> None:
+        """清空在途集合并维护重跑豁免集合。"""
+        self._state.clear_in_flight()
+
+    def register_in_flight(self, uid: str) -> None:
+        """登记在途 UID。"""
+        self._state.register_in_flight(uid)
+
+    def unregister_in_flight(self, uid: str) -> None:
+        """注销在途 UID。"""
+        self._state.unregister_in_flight(uid)
+
     def set_state(self, state: Optional[PipelineState]) -> None:
         """重新设置内存状态（run 启动加载期使用）。"""
         self._state = state if state is not None else PipelineState({}, {}, {}, [])

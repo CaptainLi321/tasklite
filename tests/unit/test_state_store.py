@@ -168,3 +168,38 @@ class TestStateStoreBulkFailure:
         assert "cycle::1" in store.failed
         assert "cycle::2" in store.failed
         assert "safe::1" in store.queue_uids
+
+
+class TestStateStoreQueueAndMembership:
+    """测试 StateStore 对 queue/wall/failed/in_flight 与成员判定的统合接缝。"""
+
+    def test_queue_and_membership_delegation(self):
+        backend = InMemoryStateBackend()
+        state = PipelineState(wall={"w::1": {}}, failed={"f::1": {}}, cursors={"c": "v"}, queue=[{"task_type": "q", "job_id": "1"}])
+        store = StateStore(backend, state)
+
+        assert store.is_completed("w::1") is True
+        assert store.is_failed("f::1") is True
+        assert store.is_known("w::1") is True
+        assert store.is_known("q::1") is True
+        assert store.is_known("unknown::1") is False
+
+        assert "w::1" in store.wall_uids
+        assert "f::1" in store.failed_uids
+        assert "q::1" in store.queue_uids
+
+        # pop_job
+        popped = store.pop_job(0)
+        assert popped["job_id"] == "1"
+        assert "q::1" not in store.queue_uids
+
+        # requeue_jobs
+        store.requeue_jobs([{"task_type": "q", "job_id": "2"}], front=True)
+        assert "q::2" in store.queue_uids
+
+        # pop and register in_flight
+        store.pop_job(0)
+        store.register_in_flight("q::2")
+        assert "q::2" in store.in_flight_uids
+        store.unregister_in_flight("q::2")
+        assert "q::2" not in store.in_flight_uids
