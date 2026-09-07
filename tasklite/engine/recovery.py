@@ -237,14 +237,11 @@ class RecoveryOrchestrator:
             self._ctx.state.unregister_in_flight(pentry.uid)
         self._ctx.state.requeue_jobs(job_dicts, front=True)
 
-        # 5. 消费「已完成」entry 的结果（走伪 entry 统一出口）
+        # 5. 消费「已完成」entry 的结果（统一出口）
         commit_crash: Optional[BaseException] = None
         for entry, result in done_entries:
-            pseudo = InFlightTracker.create_pseudo_entry(
-                entry.uid, entry.job_dict, entry.job
-            )
             try:
-                self._completion.complete_job(pseudo, result)
+                self._completion.complete_job(entry, result)
             except _JobTerminated:
                 pass
             except _CommitCrashSignal as e:
