@@ -149,9 +149,6 @@ class TaskLite:
                 f"got {type(backend).__name__}"
             )
 
-
-
-
         # handler -> (func, default_resources, payload_schema)
         self.handlers: Dict[str, HandlerEntry] = {}
         # discovery task_type -> 默认 rerun 策略——enqueue/spawn
@@ -333,17 +330,8 @@ class TaskLite:
             )
 
     def _preflight_picklable_callbacks(self) -> None:
-        """strict_picklable=True 时，run 前校验全部 handler 可 pickle（fail-loud）。"""
-        if not self.strict_picklable:
-            return
-        for task_type, entry in self.handlers.items():
-            try:
-                pickle.dumps(entry.func)
-            except Exception as e:
-                raise TypeError(
-                    f"strict_picklable: handler for task_type '{task_type}' is not "
-                    f"module-level picklable: {e}"
-                ) from e
+        """strict_picklable=True 时，run 前校验全部 handler 可 pickle（fail-loud，委托 EngineRuntime）。"""
+        self._runtime._preflight_picklable_callbacks()
 
     def add_resource(self, resource: Resource) -> None:
         """Add a resource scheduler to the pipeline.
@@ -525,8 +513,6 @@ class TaskLite:
             self._ctx.policy.normalize_job_dict(job_dict, j.task_type)
             self._inject_worker_resource(job_dict)
             jobs_dicts.append(job_dict)
-
-
 
         if not jobs_dicts:
             return
