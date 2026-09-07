@@ -10,7 +10,7 @@
 import logging
 import time
 import traceback
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .runtime import RunContext
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from .completion import CompletionMachine
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
-from .runtime import StopMode, WORKER_RESOURCE
+from .runtime import StepOutcome, StopMode, WORKER_RESOURCE
 
 logger = logging.getLogger("tasklite")
 
@@ -126,134 +126,190 @@ class LoopRunner:
             # 异常隔离——钩子按不可信代码对待，不遮蔽原异常。
             self._ctx.fire_run_end(exit_reason)
 
+    def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
+        """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。"""
+        state = self._ctx.state
+        if state is None:
+            return StepOutcome(
+                dispatched_count=0,
+                completed_count=0,
+                is_idle=True,
+                should_wait=False,
+                wait_time=0.0,
+                deadlock_detected=False,
+                stop_mode=self._ctx.stop_mode,
+                should_terminate=True,
+                exit_reason="completed",
+            )
+
+        # 0. 停机模式检查
+        draining = False
+        if self._ctx.stop_mode is not StopMode.NONE:
+            if self._ctx.stop_mode is StopMode.ABORTING:
+                logger.warning("Force abort requested. Killing in-flight jobs.")
+                self._recovery.abort_in_flight()
+                self._recovery.save_queue_crash_safe()
+                return StepOutcome(
+                    dispatched_count=0,
+                    completed_count=0,
+                    is_idle=True,
+                    should_wait=False,
+                    wait_time=0.0,
+                    deadlock_detected=False,
+                    stop_mode=self._ctx.stop_mode,
+                    should_terminate=True,
+                    exit_reason="stopped_aborting",
+                )
+            if self._ctx.in_flight:
+                draining = True
+            else:
+                logger.info("Pipeline drained. Saving queue and exiting.")
+                self._recovery.save_queue_crash_safe()
+                return StepOutcome(
+                    dispatched_count=0,
+                    completed_count=0,
+                    is_idle=True,
+                    should_wait=False,
+                    wait_time=0.0,
+                    deadlock_detected=False,
+                    stop_mode=self._ctx.stop_mode,
+                    should_terminate=True,
+                    exit_reason="stopped_draining",
+                )
+
+        if state.is_empty and not self._ctx.in_flight:
+            return StepOutcome(
+                dispatched_count=0,
+                completed_count=0,
+                is_idle=True,
+                should_wait=False,
+                wait_time=0.0,
+                deadlock_detected=False,
+                stop_mode=self._ctx.stop_mode,
+                should_terminate=True,
+                exit_reason="completed",
+            )
+
+        # 1. 填池派发（仅非 DRAINING 状态且未超过单步限制）
+        sched = None
+        worker_wait = 0.0
+        dispatched = 0
+        limit = max_dispatch if max_dispatch is not None else 1000000
+        if not draining:
+            while dispatched < limit:
+                outcome = self._dispatch.dispatch_next()
+                if outcome.worker_wait > 0:
+                    worker_wait = outcome.worker_wait
+                if outcome.sched is not None:
+                    sched = outcome.sched
+                if outcome.entry is not None:
+                    dispatched += 1
+                    continue
+                if not outcome.should_continue:
+                    break
+
+        # 2. 处理无可运行 job 与死锁判定
+        deadlock_detected = False
+        should_terminate = False
+        if sched is not None and sched.runnable_idx is None:
+            if state.is_empty and not self._ctx.in_flight:
+                should_terminate = True
+            elif sched.min_wait == float("inf"):
+                if not self._ctx.in_flight:
+                    deadlock_detected = True
+                    should_break = self._ctx.store.handle_deadlock(sched, ctx=self._ctx)
+                    if should_break:
+                        should_terminate = True
+
+        # 3. Drain 回收在途结果
+        completed_count = 0
+        if self._ctx.in_flight:
+            self._recovery.apply_pending_signals()
+            handles = self._ctx.in_flight.active_handles()
+            completed = self._ctx.channel.reap_completed(handles)
+            completed_count = len(completed)
+            for handle, result in completed:
+                entry = self._ctx.in_flight.get(handle.uid)
+                try:
+                    self._completion.complete_job(entry, result)
+                finally:
+                    self._ctx.in_flight.pop(handle.uid, None)
+
+        # 4. 计算等待时延与空闲状态
+        is_idle = state.is_empty and not self._ctx.in_flight
+        if is_idle or should_terminate:
+            wait_time = 0.0
+            should_wait = False
+        elif self._ctx.in_flight:
+            if completed_count == 0:
+                wait_time = 0.05
+                should_wait = True
+            else:
+                wait_time = 0.0
+                should_wait = False
+        elif sched is not None and sched.runnable_idx is None and sched.min_wait != float("inf"):
+            if not self._ctx.in_flight and sched.waiting_for_dependency:
+                cycle_uids = state.find_dependency_cycles()
+                if cycle_uids:
+                    logger.error(
+                        f"Deadlock detected during backoff/wait: dependency cycle "
+                        f"{sorted(set(cycle_uids))} masked by finite min_wait."
+                    )
+                    sched.min_wait = float("inf")
+                    deadlock_detected = True
+                    should_break = self._ctx.store.handle_deadlock(sched, ctx=self._ctx)
+                    if should_break:
+                        should_terminate = True
+                        wait_time = 0.0
+                        should_wait = False
+                    else:
+                        wait_time = 0.0
+                        should_wait = False
+                else:
+                    wait_time = min(sched.min_wait, 1.0)
+                    should_wait = True
+            else:
+                wait_time = min(sched.min_wait, 1.0)
+                should_wait = True
+        elif worker_wait > 0 and not self._ctx.in_flight:
+            wait_time = min(worker_wait, 1.0)
+            should_wait = True
+        else:
+            wait_time = 0.0
+            should_wait = not is_idle and dispatched == 0 and completed_count == 0
+
+        exit_reason = None
+        if is_idle or should_terminate:
+            if self._ctx.stop_mode is StopMode.ABORTING:
+                exit_reason = "stopped_aborting"
+            elif self._ctx.stop_mode is StopMode.DRAINING:
+                exit_reason = "stopped_draining"
+            else:
+                exit_reason = "completed"
+
+        return StepOutcome(
+            dispatched_count=dispatched,
+            completed_count=completed_count,
+            is_idle=is_idle,
+            should_wait=should_wait,
+            wait_time=wait_time,
+            deadlock_detected=deadlock_detected,
+            stop_mode=self._ctx.stop_mode,
+            should_terminate=should_terminate or is_idle,
+            exit_reason=exit_reason,
+        )
 
     def run_loop_impl(self) -> None:
-        """事件驱动主循环：填池 → drain → 等待。直接操作 self._ctx.state。
-
-        ``self._ctx.in_flight`` 记录已派发到子进程、尚未 commit 的 job。
-        循环直到队列空且 in-flight 空。
-        """
+        """事件驱动主循环：以 step() 统一驱动填池、回收与等待。"""
         state = self._ctx.state
         self._ctx.in_flight.clear()
         while not state.is_empty or self._ctx.in_flight:
-            # 调度缓存为 run 生命周期（_run_body
-            # 加载期清空），主循环不每轮清空——阻塞/慢 job 阶段不重复反
-            # 序列化全队列。
-            draining = False
-            if self._ctx.stop_mode is not StopMode.NONE:
-                if self._ctx.stop_mode is StopMode.ABORTING:
-                    # ABORTING：kill 全部 in-flight + 清理半成品输出 + requeue
-                    logger.warning("Force abort requested. Killing in-flight jobs.")
-                    self._recovery.abort_in_flight()
-                    self._recovery.save_queue_crash_safe()
-                    break
-                if self._ctx.in_flight:
-                    # DRAINING：等 in-flight 自然完成——本轮不派发新 job，
-                    # 也不 kill，落到下方 drain 回收结果；队列中未派发的
-                    # job 保留到下次 run。
-                    draining = True
-                else:
-                    # DRAINING 且 in-flight 已空：保存队列退出
-                    logger.info("Pipeline drained. Saving queue and exiting.")
-                    self._recovery.save_queue_crash_safe()
-                    break
-
-            # 1. 填池：循环派发直到 __workers__ 资源耗尽或无 runnable
-            # DRAINING 时跳过填池——不再派发新 job，只等 in-flight 回收。
-            sched = None
-            worker_wait = 0.0
-            if not draining:
-                while True:
-                    outcome = self._dispatch.dispatch_next()
-                    if outcome.worker_wait > 0:
-                        worker_wait = outcome.worker_wait
-                    if outcome.sched is not None:
-                        sched = outcome.sched
-                    if outcome.entry is not None:
-                        continue
-                    if not outcome.should_continue:
-                        break
-
-            # 处理无可运行 job 的情况
-            if sched is not None and sched.runnable_idx is None:
-                if state.is_empty and not self._ctx.in_flight:
-                    # 队列已排空且无 in-flight：正常完成，非死锁。
-                    # 走「不走子进程」路径（stale 恢复/校验失败）清空队列时，
-                    # 外层 while 条件只在循环头检查，此处需显式退出，
-                    # 避免空队列被误判为死锁（假日志 + 空操作 break）。
-                    break
-                if sched.min_wait == float('inf'):
-                    # 死锁判定：仅当 in_flight 为空时才是真死锁。
-                    # in_flight 非空时资源可能被释放解锁，不判死锁，落到 drain 等待。
-                    if not self._ctx.in_flight:
-                        should_break = self._ctx.store.handle_deadlock(sched, ctx=self._ctx)
-                        if should_break:
-                            break
-                        continue
-                # min_wait 有限（资源暂不可用/backoff）或 in_flight 非空：drain 等待
-
-            # 2. drain：非阻塞收集已完成结果
-            if self._ctx.in_flight:
-                # 读取 in-flight 的 suspend 信号文件，即时应用
-                # （handler 崩溃/超时也不丢失限流信息——文件落盘）
-                self._recovery.apply_pending_signals()
-                handles = self._ctx.in_flight.active_handles()
-                completed = self._ctx.channel.reap_completed(handles)
-                for handle, result in completed:
-                    # 先 complete 再 pop：complete 与 pop 之间被
-                    # Ctrl+C/KI 打断时 entry 仍在 in_flight——abort_in_flight
-                    # 会正确释放资源并 requeue（job 未 commit，at-least-once）。
-                    # 若先 pop，entry 已离开 in_flight 而
-                    # CapacityResource.used 要到 complete_job 内部才释放
-                    # → 跨 run 泄漏 worker 槽位，管线静默活锁。
-                    # pop 放 try/finally：commit 失败路径 complete_job 内
-                    # commit_failed_crash 已自行 requeue 并抛
-                    # _CommitCrashSignal——若不 pop，stale entry 会被 abort
-                    # 二次 requeue（无 wall 记录可吸收，同一 job 双重入队）。
-                    entry = self._ctx.in_flight.get(handle.uid)
-                    try:
-                        self._completion.complete_job(entry, result)
-                    finally:
-                        self._ctx.in_flight.pop(handle.uid, None)
-
-                # 3. 无新完成且仍有 in-flight → 短轮询等待。
-                # 用短间隔（50ms）而非 sched.min_wait，因为 job 可能在任意时刻
-                # 完成需要及时回收；长 sleep 会抵消并发收益。
-                if not completed and self._ctx.in_flight:
-                    time.sleep(0.05)
-            elif sched is not None and sched.runnable_idx is None and sched.min_wait != float('inf'):
-                # 退避/资源等待可能遮蔽依赖环死锁——环成员处于退避时
-                # min_wait 有限，主循环无限 sleep，死锁判定被推迟到退避结束
-                # （指数退避可拖数十分钟）。
-                # 无 in-flight 且存在等待依赖时，即使 min_wait 有限也先做环检测；
-                # 确认有环才走死锁处理（只失败环成员），否则是合法依赖链尾退避，照常等待。
-                if not self._ctx.in_flight and sched.waiting_for_dependency:
-                    cycle_uids = state.find_dependency_cycles()
-                    if cycle_uids:
-                        logger.error(
-                            f"Deadlock detected during backoff/wait: dependency cycle "
-                            f"{sorted(set(cycle_uids))} masked by finite min_wait."
-                        )
-                        sched.min_wait = float('inf')
-                        should_break = self._ctx.store.handle_deadlock(sched, ctx=self._ctx)
-                        if should_break:
-                            break
-                        continue
-                # 无 in-flight 但需等待（backoff / 资源限流释放）：sleep(min_wait)。
-                # 支持 backoff 作业的等待路径。
-                # cap 1.0s 避免 backoff 时间过长时无法响应停机请求。
-                time.sleep(min(sched.min_wait, 1.0))
-            elif worker_wait > 0 and not self._ctx.in_flight:
-                # workers 预检 break 且无 in-flight 可
-                # drain——__workers__ 被 suspend（ctx.suspend_resource 或
-                # 持久化恢复）或用户覆盖为 capacity<1 / RateLimitResource 时，
-                # can_acquire 返回 False 且队列无在途 job：无此分支则
-                # sched=None 使两个等待分支都跳过 → 无限忙循环。
-                # cap 1.0s 保持停机请求响应性。
-                time.sleep(min(worker_wait, 1.0))
+            outcome = self.step()
+            if outcome.should_terminate:
+                break
+            if outcome.should_wait and outcome.wait_time > 0:
+                time.sleep(outcome.wait_time)
 
         logger.info(f"Pipeline {self._ctx.name} finished.")
-        # run 结束时统一持久化一次资源挂起状态——由 _run_loop 的
-        # finally 统一执行（正常/崩溃路径一致，见 _run_loop）。
         self._ctx.in_flight.clear()
 
