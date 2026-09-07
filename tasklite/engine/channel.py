@@ -29,6 +29,8 @@ from ..taxonomy import classify_exception
 from ..models.context import TaskContext
 from ..models.job import Job
 from ..utils.ipc import (
+    ArtifactCleanupMode,
+    ArtifactJournal,
     append_input,
     append_output,
     append_signal,
@@ -351,14 +353,11 @@ def _decode_ipc_result(
         result_meta = {"error": "NO_IPC_RESULT"}
 
     if success and ipc_dir is not None:
-        for out_path, _, kind in read_outputs(ipc_dir, job.uid):
-            if kind == "cache":
-                continue
-            if not Path(out_path).exists():
-                logger.error(f"Verification failed for {job.uid}: Missing output -> {out_path}")
-                success = False
-                result_meta = {"error": f"Missing output {out_path}"}
-                break
+        ok, err = ArtifactJournal(ipc_dir).verify_outputs(job.uid)
+        if not ok:
+            logger.error(f"Verification failed for {job.uid}: {err}")
+            success = False
+            result_meta = {"error": err}
 
     return ExecutionResult(
         success=success,
@@ -517,13 +516,6 @@ class JobHandle:
 ExecutionHandle = JobHandle
 
 
-class ArtifactCleanupMode(str, enum.Enum):
-    """产物与声明清理模式。"""
-    PRE_SUBMIT = "pre_submit"
-    SUCCESS = "success"
-    FAILURE_OR_RETRY = "failure_retry"
-
-
 @dataclass(frozen=True)
 class AbortOutcome:
     """强制终止/异常停机时的收尾结果。"""
@@ -599,6 +591,7 @@ class ExecutionChannel:
 
         self._mp_ctx = ctx_candidate or mp.get_context("spawn")
         self.ipc_dir = str(dir_candidate) if dir_candidate is not None else None
+        self.journal = ArtifactJournal(self.ipc_dir)
         if self.ipc_dir:
             try:
                 Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
@@ -819,7 +812,7 @@ class ExecutionChannel:
         """原子排空所有在途任务追加的 suspend 信号。"""
         signals: List[Tuple[str, str, float]] = []
         for uid in uids:
-            for r_name, secs in read_signals(self.ipc_dir, uid):
+            for r_name, secs in self.journal.drain_signals(uid):
                 signals.append((uid, r_name, secs))
         return signals
 
@@ -854,7 +847,6 @@ class ExecutionChannel:
         for h in pending_handles:
             incarnation = getattr(h, "incarnation", None)
             res_p = result_path(self.ipc_dir, h.uid, incarnation)
-            consumed = False
             if res_p.exists():
                 raw_res = read_result_file(res_p)
                 if (
@@ -865,10 +857,9 @@ class ExecutionChannel:
                 ):
                     decoded = _decode_ipc_result(raw_res, None, h.job, self.ipc_dir)
                     done_pairs.append((h, decoded))
-                    consumed = True
-            if not consumed:
-                self.cleanup_artifacts(h.uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
-                truly_cancelled.append(h)
+                    continue
+            self.cleanup_artifacts(h.uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
+            truly_cancelled.append(h)
 
         return AbortOutcome(completed=done_pairs, cancelled=truly_cancelled)
 
@@ -894,79 +885,24 @@ class ExecutionChannel:
 
     def cleanup_artifacts(self, uid: str, *, mode: ArtifactCleanupMode) -> None:
         """统一收敛产物与 IPC 临时文件的生命周期清理。"""
+        self.journal.cleanup(uid, mode=mode)
         if mode == ArtifactCleanupMode.PRE_SUBMIT:
-            for p in (
-                outputs_path(self.ipc_dir, uid),
-                inputs_path(self.ipc_dir, uid),
-                signals_path(self.ipc_dir, uid),
-            ):
-                try:
-                    if p.exists():
-                        p.unlink()
-                except OSError:
-                    pass
             for sp in _iter_stale_result_paths(self.ipc_dir, uid):
                 try:
                     if sp.exists():
                         sp.unlink()
                 except OSError:
                     pass
-            return
-
-        if mode == ArtifactCleanupMode.SUCCESS:
-            try:
-                for out_path, _, kind in read_outputs(self.ipc_dir, uid):
-                    if kind == "cache":
-                        out_obj = Path(out_path)
-                        if out_obj.exists():
-                            out_obj.unlink()
-                            logger.info(f"Cleaned cache file: {out_obj}")
-                op = outputs_path(self.ipc_dir, uid)
-                if op.exists():
-                    op.unlink()
-                ip = inputs_path(self.ipc_dir, uid)
-                if ip.exists():
-                    ip.unlink()
-            except OSError:
-                pass
+        elif mode in (ArtifactCleanupMode.SUCCESS, ArtifactCleanupMode.FAILURE_OR_RETRY):
             try:
                 cleanup_ipc_files(self.ipc_dir, uid)
             except Exception:
                 pass
-            return
-
-        if mode == ArtifactCleanupMode.FAILURE_OR_RETRY:
-            try:
-                for out_path, cleanup, kind in read_outputs(self.ipc_dir, uid):
-                    if kind == "cache" or cleanup:
-                        out_path_obj = Path(out_path)
-                        if out_path_obj.exists():
-                            if out_path_obj.is_dir():
-                                shutil.rmtree(out_path_obj)
-                            else:
-                                out_path_obj.unlink()
-                            logger.info(f"Cleaned broken output: {out_path_obj}")
-            except Exception as e:
-                logger.error(f"Could not remove outputs for {uid}: {e}")
-            finally:
-                try:
-                    p = outputs_path(self.ipc_dir, uid)
-                    if p.exists():
-                        p.unlink()
-                    ip = inputs_path(self.ipc_dir, uid)
-                    if ip.exists():
-                        ip.unlink()
-                except OSError:
-                    pass
-                try:
-                    cleanup_ipc_files(self.ipc_dir, uid)
-                except Exception:
-                    pass
 
     def read_declared_inputs(self, uid: str) -> List[dict]:
         """读取任务声明的输入清单。"""
         try:
-            return read_inputs(self.ipc_dir, uid)
+            return self.journal.read_inputs(uid)
         except Exception:
             return []
 
