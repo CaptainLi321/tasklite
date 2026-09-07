@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 from .job import Job
-from ..utils.ipc import append_input, append_output, append_signal
+from ..utils.ipc import ArtifactJournal, append_input, append_output, append_signal
 from ..utils.jsonutil import dumps
 
 logger = logging.getLogger("tasklite")
@@ -54,6 +54,11 @@ class TaskContext:
         # 在 submit 前写入。worker 写结果文件时用它构造带 incarnation 的
         # 文件名——崩溃后孤儿进程的旧 incarnation 文件不被新 run 看见。
         self.incarnation = incarnation
+
+    @property
+    def _journal(self) -> Optional[ArtifactJournal]:
+        """动态获取当前 ipc_dir 对应的产物清单深模块实例。"""
+        return ArtifactJournal(self.ipc_dir) if self.ipc_dir is not None else None
 
     def spawn(self, job: Job) -> None:
         """Enqueue a child job.
@@ -112,28 +117,13 @@ class TaskContext:
         return self._declare(path, True, sandbox, "cache")
 
     def _declare(self, path: Union[str, Path], cleanup_on_fail: bool, sandbox: bool, kind: str) -> str:
-        """declare_output/declare_cache 的共享实现（消除重复）。
-
-        kind 为 "output" 或 "cache"——仅影响 append_output 落盘的声明
-        kind（成功路径的校验/清理行为差异由 executor 侧按 kind 分发）。
-        """
+        """declare_output/declare_cache 的共享实现（消除重复）。"""
         raw = str(path)
-        if "\x00" in raw:
-            raise ValueError(f"Output path contains a null byte: {raw!r}")
-
-        resolved = self._resolve_path(raw, sandbox)
+        resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_root, sandbox=sandbox)
         parent = Path(resolved).parent
         parent.mkdir(parents=True, exist_ok=True)
-        # 输出声明立即落盘（{ipc_dir}/{uid}.outputs.jsonl）——主进程的
-        # 输出校验与失败清理从落盘文件读，不依赖 mp.Manager 共享 list
-        # （Manager 是独立 server 进程的隐性单点 + 每次声明一次 RPC 往返）。
-        # handler 崩溃/kill 后声明仍可读取（与 signals 同款语义）。
-        if self.ipc_dir is not None:
-            try:
-                append_output(self.ipc_dir, self.job.uid, resolved, cleanup_on_fail, kind=kind)
-            except OSError:
-                pass  # 落盘失败静默：声明丢失只影响失败清理，不影响执行
-        # 返回解析后的规范绝对路径，handler 应使用返回值写文件
+        if self._journal is not None:
+            self._journal.record_output(self.job.uid, resolved, cleanup_on_fail, kind=kind)
         return resolved
 
     def declare_input(self, path: Union[str, Path]) -> str:
@@ -158,19 +148,9 @@ class TaskContext:
         变化 → 重跑，避免误跳过）。
         """
         raw = str(path)
-        resolved = self._resolve_path(raw, sandbox=False)
-        entry: dict = {"path": resolved, "kind": "file"}
-        try:
-            st = os.stat(resolved)
-            entry["size"] = st.st_size
-            entry["mtime_ns"] = st.st_mtime_ns
-        except OSError:
-            pass  # 输入缺失：记录 path，指纹留空（on_input_change 视为变化）
-        if self.ipc_dir is not None:
-            try:
-                append_input(self.ipc_dir, self.job.uid, entry)
-            except OSError:
-                pass  # 只捕获 OSError：编程错误不静默吞
+        resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_root, sandbox=False)
+        if self._journal is not None:
+            self._journal.record_input_file(self.job.uid, resolved)
         return resolved
 
     def declare_input_uri(self, url: Union[str, Path], uri_fingerprint: Optional[str] = None) -> str:
@@ -187,45 +167,14 @@ class TaskContext:
                 f"uri_fingerprint must be a str or None, "
                 f"got {type(uri_fingerprint).__name__}"
             )
-        url = str(url)
-        entry: dict = {"path": url, "kind": "uri"}
-        if uri_fingerprint is not None:
-            entry["uri_fingerprint"] = uri_fingerprint
-        if self.ipc_dir is not None:
-            try:
-                append_input(self.ipc_dir, self.job.uid, entry)
-            except OSError:
-                pass  # 只捕获 OSError：子进程内编程错误不静默吞
-        return url
+        url_str = str(url)
+        if self._journal is not None:
+            self._journal.record_input_uri(self.job.uid, url_str, uri_fingerprint)
+        return url_str
 
     def _resolve_path(self, raw: str, sandbox: bool) -> str:
-        """解析声明路径为规范绝对路径（沙盒校验 + 相对重定位共用逻辑）。"""
-        if self.output_root is not None and sandbox:
-            p = Path(raw)
-            roots = self.output_root if isinstance(self.output_root, (list, tuple)) else [self.output_root]
-            if not p.is_absolute():
-                # 相对路径按**第一个**根重定位（兼容语义）
-                p = roots[0] / p
-            # REQ-10: Path sandbox — reject paths outside every output_root
-            resolved_path = Path(os.path.abspath(str(p)))
-            try:
-                resolved_path = resolved_path.resolve()
-            except (OSError, RuntimeError):
-                logger.debug(f"Could not resolve output path '{raw}', using abspath fallback.")
-            if not any(resolved_path.is_relative_to(r) for r in roots):
-                raise ValueError(
-                    f"Output path '{raw}' resolves outside output_root "
-                    f"{roots!r}"
-                )
-            return str(resolved_path)
-        # Always resolve parent directory if possible, fall back to absolute
-        p = Path(raw)
-        try:
-            if p.parent.exists():
-                return str(p.resolve())
-            return os.path.abspath(str(p))  # 折叠 ..，存储规范路径
-        except (OSError, RuntimeError):
-            return os.path.abspath(str(p))
+        """解析声明路径为规范绝对路径（委托 ArtifactJournal）。"""
+        return ArtifactJournal.resolve_and_validate_path(raw, self.output_root, sandbox=sandbox)
 
     def is_completed(self, uid: str) -> bool:
         """Check if a job is already in wall 快照（已成功完成过的内容）。
