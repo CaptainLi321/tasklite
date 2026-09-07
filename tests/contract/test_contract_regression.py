@@ -410,12 +410,11 @@ class TestBackoffReloadTruthTable:
         jd["runtime"]["_backoff_wall_deadline"] = _t.time() + 60
         p.backend.enqueue_jobs([jd])
 
-        # 只走真实 _run_body 的加载/换算段（跳过 _run_loop 避免退避 sleep 60s）
-        monkeypatch.setattr(p, "_run_loop", lambda: None)
-        p._run_body()
+        # 只走真实 prepare_run_state 的加载/换算段（无需启动事件循环）
+        p.runtime.prepare_run_state()
 
         now = _t.monotonic()
-        converted = p._state.queue[0]
+        converted = p.runtime.state.queue[0]
         rt = converted["runtime"]
         assert "_backoff_until" in rt, "加载换算必须设置 monotonic _backoff_until"
         assert 55 < (rt["_backoff_until"] - now) < 65, (
@@ -438,10 +437,9 @@ class TestBackoffReloadTruthTable:
         jd["runtime"]["_backoff_until"] = 1e18  # 残留 monotonic 退避（孤儿 defer，一并清除）
         p.backend.enqueue_jobs([jd])
 
-        monkeypatch.setattr(p, "_run_loop", lambda: None)
-        p._run_body()
+        p.runtime.prepare_run_state()
 
-        loaded = p._state.queue[0]
+        loaded = p.runtime.state.queue[0]
         rt = loaded.get("runtime", {})
         assert "_backoff_wall_deadline" not in rt, \
             "脏 wall_deadline 必须被清除（否则残留阻塞调度）"
@@ -462,10 +460,9 @@ class TestBackoffReloadTruthTable:
         jd["runtime"]["_backoff_until"] = 1e18  # 残留 monotonic 退避
         p.backend.enqueue_jobs([jd])
 
-        monkeypatch.setattr(p, "_run_loop", lambda: None)
-        p._run_body()
+        p.runtime.prepare_run_state()
 
-        loaded = p._state.queue[0]
+        loaded = p.runtime.state.queue[0]
         rt = loaded.get("runtime", {})
         assert "_backoff_wall_deadline" not in rt, \
             "过期的 wall_deadline 必须被清除（放行）"

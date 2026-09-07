@@ -821,24 +821,24 @@ class TestDeadlockFallbackConservative:
         pipeline.add_resource(CapacityResource("slot", max_capacity=1.0))
         pipeline.register_handler("t", lambda j, c: True)
         pipeline.enqueue([Job("t", "a"), Job("t", "b")])
-        # _state 只在 run 内创建——单测直接按 _run_body 的加载逻辑构造
-        pipeline._state = PipelineState(
+        state = PipelineState(
             pipeline.backend.load_wall(),
             pipeline.backend.load_failed(),
             pipeline.backend.load_cursors(),
             pipeline.backend.load_queue(),
         )
+        pipeline.runtime.ctx.set_state(state)
         return pipeline
 
     def test_cycle_gap_fallback_keeps_queue(self, tmp_path, monkeypatch):
         """环检测空兜底：队列原样保留、不误杀；返回 False（非终态）。"""
         pipeline = self._queue_two_jobs(tmp_path)
-        monkeypatch.setattr(pipeline._state, "find_dependency_cycles", lambda: [])
+        monkeypatch.setattr(pipeline.runtime.state, "find_dependency_cycles", lambda: [])
         monkeypatch.setattr("time.sleep", lambda s: None)  # 防 0.5s 慢
         sched = self._sched(waiting_for_dependency=True)
         should_break = pipeline.store.handle_deadlock(sched)
         assert should_break is False
-        assert len(pipeline._state.queue) == 2
+        assert len(pipeline.runtime.state.queue) == 2
         assert pipeline.backend.load_failed() == {}
 
     def test_unclassifiable_fallback_keeps_queue(self, tmp_path, monkeypatch):
@@ -848,7 +848,7 @@ class TestDeadlockFallbackConservative:
         sched = self._sched()
         should_break = pipeline.store.handle_deadlock(sched)
         assert should_break is False
-        assert len(pipeline._state.queue) == 2
+        assert len(pipeline.runtime.state.queue) == 2
         assert pipeline.backend.load_failed() == {}
 
 
@@ -899,11 +899,12 @@ class TestDeadlockGapEscalation:
         pipeline.enqueue([Job("t", "a", payload={}, depends_on=["t::b"]),
                           Job("t", "b", payload={}, depends_on=["t::a"])])
         # 手动加载 state（_run_body 的加载逻辑）
-        pipeline._state = PipelineState(
+        state = PipelineState(
             pipeline.backend.load_wall(), pipeline.backend.load_failed(),
             pipeline.backend.load_cursors(), pipeline.backend.load_queue(),
         )
-        monkeypatch.setattr(pipeline._state, "find_dependency_cycles", lambda: [])
+        pipeline.runtime.ctx.set_state(state)
+        monkeypatch.setattr(state, "find_dependency_cycles", lambda: [])
         monkeypatch.setattr("time.sleep", lambda s: None)
         sched = types.SimpleNamespace(
             malformed_indices=[], unknown_resource_indices=[],
@@ -912,5 +913,5 @@ class TestDeadlockGapEscalation:
         )
         should_break = pipeline.store.handle_deadlock(sched)
         assert should_break is False
-        assert len(pipeline._state.queue) == 2
+        assert len(pipeline.runtime.state.queue) == 2
         assert pipeline.backend.load_failed() == {}

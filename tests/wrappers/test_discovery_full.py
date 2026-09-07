@@ -381,7 +381,8 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),  # 可运行候选
         ]
         self._init_state(p, queue)
-        p._dep_grace_deadline = None
+        gov = p.runtime.ctx.governor
+        gov.dep_grace_deadline = None
         assert p.store._dependency_grace([0]) is True, "存在可运行候选必须宽限"
 
     def test_grace_denied_when_all_waiting(self, tmp_path):
@@ -393,7 +394,8 @@ class TestDependencyGrace:
             J("t", "j_downstream", depends_on=["t::j_missing"]).to_dict(),
         ]
         self._init_state(p, queue)
-        p._dep_grace_deadline = None
+        gov = p.runtime.ctx.governor
+        gov.dep_grace_deadline = None
         # j_downstream 依赖 t::j_missing（在队列，不在 wall）→ 非可运行候选
         assert p.store._dependency_grace([0]) is False, "无候选不得宽限"
 
@@ -408,7 +410,8 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),
         ]
         self._init_state(p, queue)
-        p._dep_grace_deadline = _t.monotonic() - 1.0  # 已过期
+        gov = p.runtime.ctx.governor
+        gov.dep_grace_deadline = _t.monotonic() - 1.0  # 已过期
         assert p.store._dependency_grace([0]) is False, "宽限超时必须判死锁"
 
     def test_same_index_different_uid_resets_grace(self, tmp_path):
@@ -424,9 +427,10 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),
         ]
         self._init_state(p, queue)
-        p._dep_grace_deadline = None
+        gov = p.runtime.ctx.governor
+        gov.dep_grace_deadline = None
         assert p.store._dependency_grace([0]) is True
-        deadline_after_first = p._dep_grace_deadline
+        deadline_after_first = gov.dep_grace_deadline
 
         # 第二个 episode：consumerB 缺 child::b1（**同索引 0**，但 uid 不同）
         queue2 = [
@@ -435,9 +439,9 @@ class TestDependencyGrace:
         ]
         self._init_state(p, queue2)
         assert p.store._dependency_grace([0]) is True
-        assert p._dep_grace_deadline is not None
+        assert gov.dep_grace_deadline is not None
         import time as _t4
-        assert p._dep_grace_deadline > deadline_after_first, \
+        assert gov.dep_grace_deadline > deadline_after_first, \
             "同索引不同 uid 必须重置截止（新 episode），不得复用旧 deadline"
 
     def test_grace_resets_on_new_missing_episode(self, tmp_path):
@@ -452,10 +456,11 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),
         ]
         self._init_state(p, queue)
-        p._dep_grace_deadline = None
+        gov = p.runtime.ctx.governor
+        gov.dep_grace_deadline = None
         # 第一个 episode：缺失 [0] → 授权（deadline 设置）
         assert p.store._dependency_grace([0]) is True
-        deadline_after_first = p._dep_grace_deadline
+        deadline_after_first = gov.dep_grace_deadline
         assert deadline_after_first is not None
 
         # 模拟第一个 episode 解决：队列换成 B 组（缺失集合 [1]，同候选）
@@ -466,10 +471,10 @@ class TestDependencyGrace:
         self._init_state(p, queue2)
         # 第二个 episode：缺失集合变化 → 截止重置 → 重新授权
         assert p.store._dependency_grace([1]) is True
-        assert p._dep_grace_deadline is not None
+        assert gov.dep_grace_deadline is not None
         # 截止应被重置为新的 60s（明显晚于第一个 deadline）
         import time as _t2
-        assert p._dep_grace_deadline > deadline_after_first, \
+        assert gov.dep_grace_deadline > deadline_after_first, \
             "新 episode 必须重新授权（截止重置），而非沿用旧截止"
 
     def test_same_episode_deadline_kept(self, tmp_path):
@@ -483,14 +488,15 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),
         ]
         self._init_state(p, queue)
-        p._dep_grace_deadline = None
+        gov = p.runtime.ctx.governor
+        gov.dep_grace_deadline = None
         assert p.store._dependency_grace([0]) is True
-        deadline = p._dep_grace_deadline
+        deadline = gov.dep_grace_deadline
         # 同集合再次请求 → 截止不变（仍在宽限内）
         assert p.store._dependency_grace([0]) is True
-        assert p._dep_grace_deadline == deadline
+        assert gov.dep_grace_deadline == deadline
         # 截止已过 → 判死锁
-        p._dep_grace_deadline = _t3.monotonic() - 1.0
+        gov.dep_grace_deadline = _t3.monotonic() - 1.0
         assert p.store._dependency_grace([0]) is False
 
 

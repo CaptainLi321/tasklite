@@ -251,7 +251,8 @@ class TestCommitSkipCrashTerminalPreservation:
         else:
             wall = {}
             failed = {"h::j1": {"error": "earlier"}}
-        pipeline._state = PipelineState(wall, failed, {}, [jd])
+        state = PipelineState(wall, failed, {}, [jd])
+        pipeline.runtime.ctx.set_state(state)
         monkeypatch.setattr(pipeline.backend, "commit_skip", lambda uid: False)
         return pipeline, SimpleNamespace(
             runnable_idx=0, pending_dep_failure=None, kind="runnable",
@@ -265,8 +266,8 @@ class TestCommitSkipCrashTerminalPreservation:
             tmp_path, monkeypatch, terminal_in_wall=True,
         )
         with pytest.raises(_CommitCrashSignal, match="commit_skip"):
-            pipeline._dispatch.dispatch_job(sched)
-        state = pipeline._state
+            pipeline.runtime._dispatch.dispatch_job(sched)
+        state = pipeline.runtime.state
         assert "h::j1" in state.wall, "wall 成功记录必须保留，不得被清理失败翻转"
         assert state.wall["h::j1"]["run_count"] == 7
         assert "h::j1" not in state.failed
@@ -282,8 +283,8 @@ class TestCommitSkipCrashTerminalPreservation:
             tmp_path, monkeypatch, terminal_in_wall=False,
         )
         with pytest.raises(_CommitCrashSignal):
-            pipeline._dispatch.dispatch_job(sched)
-        state = pipeline._state
+            pipeline.runtime._dispatch.dispatch_job(sched)
+        state = pipeline.runtime.state
         assert state.failed["h::j1"] == {"error": "earlier"}
         assert "h::j1" not in state.wall
         assert [d.get("job_id") for d in state.queue] == ["j1"]
@@ -296,7 +297,7 @@ class TestCommitSkipCrashTerminalPreservation:
         monkeypatch.setattr(pipeline.store, "commit_skip_crash", lambda uid, jd: None)
         import pytest
         with pytest.raises(AssertionError, match="unexpectedly returned normally"):
-            pipeline._dispatch.dispatch_job(sched)
+            pipeline.runtime._dispatch.dispatch_job(sched)
 
 
 class TestCommitFailedCrashContractBreach:
@@ -314,7 +315,8 @@ class TestCommitFailedCrashContractBreach:
         pipeline = make_pipeline(tmp_path)
         jd = Job("t", "j1", payload={}).to_dict()
         jd["runtime"] = {"_commit_failures": 0}
-        pipeline._state = PipelineState({}, {}, {}, [jd])
+        state = PipelineState({}, {}, {}, [jd])
+        pipeline.runtime.ctx.set_state(state)
         return pipeline, jd
 
     def test_dep_failed_commit_failure_handled(self, tmp_path, monkeypatch):
@@ -327,7 +329,7 @@ class TestCommitFailedCrashContractBreach:
             lambda uid, reason, job_dict: None,
         )
         # 不再抛异常，正常返回 True 表示已处理
-        result = pipeline._dispatch.dispatch_dep_failed("t::j1", jd, "parent::p1")
+        result = pipeline.runtime._dispatch.dispatch_dep_failed("t::j1", jd, "parent::p1")
         assert result is True
 
     def test_no_handler_commit_failure_handled(self, tmp_path, monkeypatch):
@@ -339,7 +341,7 @@ class TestCommitFailedCrashContractBreach:
             pipeline.store, "commit_failed_crash",
             lambda uid, reason, job_dict: None,
         )
-        result = pipeline._dispatch.dispatch_no_handler("t::j1", jd, "t")
+        result = pipeline.runtime._dispatch.dispatch_no_handler("t::j1", jd, "t")
         assert result is True
 
     def test_payload_validation_commit_failure_handled(self, tmp_path, monkeypatch):
@@ -361,6 +363,6 @@ class TestCommitFailedCrashContractBreach:
         )
 
         sched = SimpleNamespace(runnable_idx=0, pending_dep_failure=None, kind="runnable")
-        result = pipeline._dispatch.dispatch_job(sched)
+        result = pipeline.runtime._dispatch.dispatch_job(sched)
         assert result is None
 

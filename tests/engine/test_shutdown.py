@@ -118,11 +118,11 @@ class TestGracefulDraining:
         def controller():
             # 等 job 派发进 in-flight
             for _ in range(200):
-                if pipeline._in_flight:
+                if pipeline.runtime.ctx.in_flight:
                     break
                 time.sleep(0.01)
-            observed["inflight_at_stop"] = len(pipeline._in_flight)
-            entry = next(iter(pipeline._in_flight.values()))
+            observed["inflight_at_stop"] = len(pipeline.runtime.ctx.in_flight)
+            entry = next(iter(pipeline.runtime.ctx.in_flight.values()))
             proc = entry.handle.process
             pipeline.stop()  # 默认 DRAINING：不 kill
             # DRAINING 窗口内 in-flight 进程必须仍存活（未被 kill）
@@ -167,13 +167,13 @@ class TestGracefulDraining:
 
         def controller():
             for _ in range(200):
-                if pipeline._in_flight:
+                if pipeline.runtime.ctx.in_flight:
                     break
                 time.sleep(0.01)
             pipeline.stop()
             time.sleep(0.1)
             observed["queue_during_draining"] = [
-                j.get("job_id") for j in pipeline._state.queue
+                j.get("job_id") for j in pipeline.runtime.state.queue
             ]
             release.set()
 
@@ -182,51 +182,39 @@ class TestGracefulDraining:
         pipeline.run()
         t.join()
 
-        # DRAINING 期间 j2 未派发（仍在内存队列）
         assert observed["queue_during_draining"] == ["j2"], \
-            f"DRAINING 不得派发新 job, queue={observed['queue_during_draining']}"
-        wall = pipeline.backend.load_wall()
+            "DRAINING 期间不得派发 j2，j2 必须保留在队列"
+        # run 退出后：j1 进 wall，j2 仍在磁盘队列（下次 run 继续）
+        assert "fast::j1" in pipeline.backend.load_wall(), "j1 必须正常完成进 wall"
+        assert "fast::j2" not in pipeline.backend.load_wall(), "j2 绝不得在本次 run 运行"
         remaining = pipeline.backend.load_queue()
-        # j1 完成进 wall；j2 保留在磁盘队列（未丢、未误执行）
-        assert "fast::j1" in wall, f"j1 应在 DRAINING 后完成, wall={wall}"
-        assert "fast::j2" not in wall, "DRAINING 不得派发 j2"
-        remaining_uids = [Job.from_dict(j).uid for j in remaining]
-        assert "fast::j2" in remaining_uids, \
-            f"DRAINING 后未派发 job 必须保留在队列, queue={remaining_uids}"
+        assert any(j.get("job_id") == "j2" for j in remaining), \
+            "j2 必须保留在磁盘队列（下次 run 恢复）"
 
 
 class TestForceAbort:
-    def test_force_abort_cleans_partial_outputs(self, tmp_path, monkeypatch):
-        """ABORTING：stop(force=True) kill in-flight 并清理其半成品输出。
+    def test_force_abort_cleans_partial_outputs_and_keeps_in_queue(self, tmp_path, monkeypatch):
+        """ABORTING：stop(force=True) 清理被 kill 的 in-flight job 半成品输出。
 
-        用 make_ipc_process_class(results=[None], stay_alive=True) 模拟
-        「job 已派发、在 in-flight、永不返回」：stop(force=True) 触发
-        _abort_in_flight → kill + 清理输出 + requeue（未 commit）。
+        语义不变式：被 kill 的 job 产物（outputs.jsonl 声明的物理路径）必须
+        被清理（防止半成品残留脏数据），job 未 commit 保留在磁盘队列。
         """
+        # stay-alive fake：job 永远运行中，模拟被 kill 的长任务
         patch_multiprocessing_for_fakes(
             monkeypatch,
             fake_process_class=make_ipc_process_class(results=[None], stay_alive=True),
         )
-
         out_dir = tmp_path / "out"
         out_dir.mkdir()
-
         pipeline = TaskLite(
-            name="test_abort", state_dir=tmp_path / "state", backend="sqlite",
+            name="test_abort_clean", state_dir=tmp_path / "state", backend="sqlite",
             max_workers=1, output_root=str(out_dir),
         )
         pipeline.register_handler("out", _fast_handler)
         pipeline.enqueue([Job("out", "j1", payload={})])
 
-        # 模拟 handler 已声明输出并写了一半（真实 handler 不执行，手动注入声明）
-        partial = out_dir / "partial.bin"
-        partial.write_text("partial data")
-
-        # 派发后：在 in-flight 期间手动把输出声明挂到 entry（模拟 handler 副作用）
-        # 通过 run 前注册一个「声明输出」的 handler 更贴近真实，但
-        # FakeProcess 不执行 handler；此处直接验证 _abort_in_flight 的清理语义：
-        # 让 run 派发后（stop 前）把 entry.shared_outputs 补上声明。
-        # 由于 FakeProcess 立即保持 alive 且无结果，_abort_in_flight 会清理它。
+        partial = out_dir / "partial.txt"
+        partial.write_text("half-written")
 
         import threading
         injected = {}
@@ -234,13 +222,13 @@ class TestForceAbort:
         def inject_output():
             # 轮询派发完成（上限 5s），再注入 + stop，避免竞态失败。
             deadline = time.time() + 5.0
-            while not pipeline._in_flight and time.time() < deadline:
+            while not pipeline.runtime.ctx.in_flight and time.time() < deadline:
                 time.sleep(0.01)
             # 模拟 handler 副作用：把输出声明写入落盘 outputs.jsonl
             # （后真实 handler 的 declare_output 即落盘；FakeProcess
             # 不执行 handler，此处直接写文件模拟）。
             from tasklite.engine.channel import append_output
-            for entry in pipeline._in_flight.values():
+            for entry in pipeline.runtime.ctx.in_flight.values():
                 append_output(pipeline.ipc_dir, entry.uid, str(partial), True)
                 injected["done"] = True
             pipeline.stop(force=True)
@@ -264,13 +252,13 @@ class TestForceAbort:
         """stop 置 DRAINING；stop(force=True) 置 ABORTING（单枚举状态机）。"""
         from tasklite.engine.runtime import StopMode
         pipeline = TaskLite(name="t", state_dir=tmp_path / "state", backend="sqlite")
-        assert pipeline._ctx.stop_mode is StopMode.NONE
+        assert pipeline.runtime.stop_mode is StopMode.NONE
         pipeline.stop()
-        assert pipeline._ctx.stop_mode is StopMode.DRAINING
+        assert pipeline.runtime.stop_mode is StopMode.DRAINING
 
         pipeline2 = TaskLite(name="t2", state_dir=tmp_path / "s2", backend="sqlite")
         pipeline2.stop(force=True)
-        assert pipeline2._ctx.stop_mode is StopMode.ABORTING
+        assert pipeline2.runtime.stop_mode is StopMode.ABORTING
 
     def test_force_abort_during_inflight_kills_and_requeues(self, tmp_path, monkeypatch):
         """ABORTING：stop(force=True) 在 in-flight 期间 kill 子进程并 requeue。
@@ -295,10 +283,10 @@ class TestForceAbort:
 
         def controller():
             for _ in range(200):
-                if pipeline._in_flight:
+                if pipeline.runtime.ctx.in_flight:
                     break
                 time.sleep(0.01)
-            observed["proc"] = next(iter(pipeline._in_flight.values())).handle.process
+            observed["proc"] = next(iter(pipeline.runtime.ctx.in_flight.values())).handle.process
             pipeline.stop(force=True)
 
         t = threading.Thread(target=controller)
@@ -328,7 +316,7 @@ class TestAbortConsumesCompletedResult:
     def _inject_completed_result(self, pipeline, out_file):
         """模拟 handler 已完成：物理输出 + 声明 + 当前 incarnation 成功结果落盘。"""
         from tasklite.engine.channel import write_result_atomic, append_output, result_path
-        entry = next(iter(pipeline._in_flight.values()))
+        entry = next(iter(pipeline.runtime.ctx.in_flight.values()))
         out_file.write_text("done")
         append_output(pipeline.ipc_dir, entry.uid, str(out_file), True)
         write_result_atomic(pipeline.ipc_dir, entry.uid, {
@@ -363,7 +351,7 @@ class TestAbortConsumesCompletedResult:
         def controller():
             # 等 job 派发进 in-flight（drain 轮询前）
             for _ in range(300):
-                if pipeline._in_flight:
+                if pipeline.runtime.ctx.in_flight:
                     break
                 time.sleep(0.01)
             observed["result_at_abort"] = self._inject_completed_result(
@@ -405,8 +393,9 @@ class TestAbortConsumesCompletedResult:
             name="test_abort_sim", state_dir=tmp_path / "state", backend="sqlite",
             output_root=str(tmp_path / "out"),
         )
-        pipeline._state = PipelineState({}, {}, {}, [])
-        pipeline._in_flight = {}
+        state = PipelineState({}, {}, {}, [])
+        pipeline.runtime.ctx.set_state(state)
+        pipeline.runtime.ctx.in_flight.clear()
 
         job = Job("fast", "j1", payload={})
         job_dict = job.to_dict()
@@ -447,10 +436,10 @@ class TestAbortConsumesCompletedResult:
             uid="fast::j1", job_dict=job_dict, job=job,
             acquired=[], handle=handle, job_start=None,
         )
-        pipeline._in_flight["fast::j1"] = entry
-        pipeline._state.register_in_flight("fast::j1")
+        pipeline.runtime.ctx.in_flight["fast::j1"] = entry
+        state.register_in_flight("fast::j1")
 
-        pipeline._abort_in_flight()
+        pipeline.runtime._recovery.abort_in_flight()
 
         assert killed == [], "已完成 entry 不得被 kill（进程已自然退出或即将退出）"
         assert "fast::j1" in pipeline.backend.load_wall(), \
@@ -459,7 +448,7 @@ class TestAbortConsumesCompletedResult:
         remaining = pipeline.backend.load_queue()
         assert all(Job.from_dict(j).uid != "fast::j1" for j in remaining), \
             "已完成 job 不得 requeue（否则重启重跑、非幂等副作用双跑）"
-        assert not pipeline._state.in_flight_uids and not pipeline._in_flight, \
+        assert not state.in_flight_uids and not pipeline.runtime.ctx.in_flight, \
             "abort 后 in-flight 必须清空（state + 内存 dict）"
 
 
@@ -489,8 +478,9 @@ class TestAbortTOCTOU:
             name="test_abort_toctou", state_dir=tmp_path / "state", backend="sqlite",
             output_root=str(tmp_path / "out"),
         )
-        pipeline._state = PipelineState({}, {}, {}, [])
-        pipeline._in_flight = {}
+        state = PipelineState({}, {}, {}, [])
+        pipeline.runtime.ctx.set_state(state)
+        pipeline.runtime.ctx.in_flight.clear()
 
         job = Job("fast", "j1", payload={})
         job_dict = job.to_dict()
@@ -536,15 +526,15 @@ class TestAbortTOCTOU:
             uid="fast::j1", job_dict=job_dict, job=job,
             acquired=[], handle=handle, job_start=None,
         )
-        pipeline._in_flight["fast::j1"] = entry
-        pipeline._state.register_in_flight("fast::j1")
+        pipeline.runtime.ctx.in_flight["fast::j1"] = entry
+        state.register_in_flight("fast::j1")
 
         # 前置断言：分类时（_abort_in_flight 内）结果文件尚不存在——
         # 保证入口确实走「pending → finalize → 重查」路径而非「直接 done」。
         assert not result_path(pipeline.ipc_dir, "fast::j1", inc).exists(), \
             "前置：结果文件必须在 abort 前不存在（TOCTOU 触发条件）"
 
-        pipeline._abort_in_flight()
+        pipeline.runtime._recovery.abort_in_flight()
 
         assert written_in_kill == [1], "进程桩必须模拟 kill 窗口内的结果写入"
         # 结果被消费：进 wall 而非 requeue
@@ -571,8 +561,9 @@ class TestAbortTOCTOU:
             name="test_mixed_abort", state_dir=tmp_path / "state", backend="sqlite",
             output_root=str(tmp_path / "out"),
         )
-        pipeline._state = PipelineState({}, {}, {}, [])
-        pipeline._in_flight = {}
+        state = PipelineState({}, {}, {}, [])
+        pipeline.runtime.ctx.set_state(state)
+        pipeline.runtime.ctx.in_flight.clear()
 
         # ── done entry：结果已落盘（无结果文件则归 pending）──
         job_done = Job("a", "done", payload={})
@@ -599,7 +590,7 @@ class TestAbortTOCTOU:
             uid="a::done", job_dict=done_dict, job=job_done,
             acquired=[], handle=handle_done, job_start=None,
         )
-        pipeline._in_flight["a::done"] = entry_done
+        pipeline.runtime.ctx.in_flight["a::done"] = entry_done
 
         # ── pending entry：无结果文件（走 kill + requeue）──
         job_pend = Job("b", "pending", payload={})
@@ -622,20 +613,20 @@ class TestAbortTOCTOU:
             uid="b::pending", job_dict=pend_dict, job=job_pend,
             acquired=[], handle=handle_pend, job_start=None,
         )
-        pipeline._in_flight["b::pending"] = entry_pend
+        pipeline.runtime.ctx.in_flight["b::pending"] = entry_pend
 
-        pipeline._state.register_in_flight("a::done")
-        pipeline._state.register_in_flight("b::pending")
+        state.register_in_flight("a::done")
+        state.register_in_flight("b::pending")
 
         # 修复前此调用抛 AssertionError（queue∩in_flight 互斥被破坏）
-        pipeline._abort_in_flight()
+        pipeline.runtime._recovery.abort_in_flight()
 
         # done 被消费进 wall；pending 被 requeue（内存 queue）。
         # 注意：本测试用手工构造的 PipelineState（未走真实后端加载），
         # requeue 只进内存 state.queue；故用内存断言而非 backend.load_queue。
         assert "a::done" in pipeline.backend.load_wall(), \
             "done entry 的结果必须被消费提交（进 wall）"
-        q_uids = [Job.from_dict(j).uid for j in pipeline._state.queue]
+        q_uids = [Job.from_dict(j).uid for j in pipeline.runtime.state.queue]
         assert "b::pending" in q_uids, \
             f"pending entry 必须被 requeue（at-least-once）: {q_uids}"
         assert "a::done" not in pipeline.backend.load_failed(), \
@@ -664,8 +655,9 @@ class TestAbortTOCTOU:
             output_root=str(tmp_path / "out"),
         )
         pipeline.add_resource(CapacityResource("api", max_capacity=10.0))
-        pipeline._state = PipelineState({}, {}, {}, [])
-        pipeline._in_flight = {}
+        state = PipelineState({}, {}, {}, [])
+        pipeline.runtime.ctx.set_state(state)
+        pipeline.runtime.ctx.in_flight.clear()
 
         job = Job("x", "j1", payload={}, resources={"api": 1.0})
         job_dict = job.to_dict()
@@ -687,14 +679,14 @@ class TestAbortTOCTOU:
             uid="x::j1", job_dict=job_dict, job=job,
             acquired=[], handle=handle, job_start=None,
         )
-        pipeline._in_flight["x::j1"] = entry
-        pipeline._state.register_in_flight("x::j1")
+        pipeline.runtime.ctx.in_flight["x::j1"] = entry
+        state.register_in_flight("x::j1")
 
         # handler 落盘的 suspend 信号（写文件、flush）
         append_signal(pipeline.ipc_dir, "x::j1", "api", 60.0)
 
         now = time_mod.monotonic()
-        pipeline._abort_in_flight()
+        pipeline.runtime._recovery.abort_in_flight()
 
         # 资源必须已被挂起（信号被消费应用，而非随文件删除丢失）
         suspended_until = pipeline.resources["api"].suspended_until()

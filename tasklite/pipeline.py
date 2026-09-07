@@ -220,15 +220,10 @@ class TaskLite:
             discovery_rerun=self._discovery_rerun,
         )
 
-        # 运行上下文与拓扑机器均由 EngineRuntime 统一装配
         self._ctx = self._runtime.ctx
         self.scheduler = self._runtime.scheduler
-        self._completion = self._runtime._completion
-        self._dispatch = self._runtime._dispatch
-        self._recovery = self._runtime._recovery
-        self._loop = self._runtime._loop
 
-    # ── 核心深模块与 RunContext 代理属性 ────────────────────────────
+    # ── 核心深模块与运行期接缝 ──────────────────────────────────────
     @property
     def runtime(self) -> EngineRuntime:
         """核心运行期深模块接缝。"""
@@ -255,16 +250,13 @@ class TaskLite:
     @_run_started.setter
     def _run_started(self, value: bool) -> None:
         self._runtime._is_running = value
-    # 运行态真相源在 self._ctx；这些属性代理保留 TaskLite 的调用面
-    # （生产方法、测试直调、monkeypatch 赋值），代理写入即时同步真相源。
+
     @property
-    def backend(self):
+    def backend(self) -> AbstractStateBackend:
         return self._backend
 
     @backend.setter
-    def backend(self, value) -> None:
-        # 测试/运维可能替换 backend（如注入 FailingBackend）——RunContext
-        # 是运行时真相源，必须同步，避免失败机器仍持旧引用。
+    def backend(self, value: AbstractStateBackend) -> None:
         self._backend = value
         if hasattr(self, "_ctx"):
             self._ctx.backend = value
@@ -280,12 +272,20 @@ class TaskLite:
         self._ctx.stats = value
 
     @property
-    def _state(self):
+    def state(self) -> Optional[PipelineState]:
+        return self._ctx.state
+
+    @property
+    def _state(self) -> Optional[PipelineState]:
         return self._ctx.state
 
     @_state.setter
-    def _state(self, value) -> None:
+    def _state(self, value: Optional[PipelineState]) -> None:
         self._ctx.state = value
+
+    @property
+    def in_flight(self) -> InFlightTracker:
+        return self._ctx.in_flight
 
     @property
     def _in_flight(self) -> InFlightTracker:
@@ -299,48 +299,6 @@ class TaskLite:
             self._ctx.in_flight.clear()
             if value:
                 self._ctx.in_flight.update(value)
-
-    @property
-    def _deadlock_gap_rounds(self) -> int:
-        return self._ctx.deadlock_gap_rounds
-
-    @_deadlock_gap_rounds.setter
-    def _deadlock_gap_rounds(self, value: int) -> None:
-        self._ctx.deadlock_gap_rounds = value
-
-    @property
-    def _dep_grace_missing(self):
-        return self._ctx.dep_grace_missing
-
-    @_dep_grace_missing.setter
-    def _dep_grace_missing(self, value) -> None:
-        self._ctx.dep_grace_missing = value
-
-    @property
-    def _dep_grace_deadline(self):
-        return self._ctx.dep_grace_deadline
-
-    @_dep_grace_deadline.setter
-    def _dep_grace_deadline(self, value) -> None:
-        self._ctx.dep_grace_deadline = value
-
-    # 停机状态机经 self._ctx.stop_mode（StopMode 枚举）直接读写。
-
-    @property
-    def _run_id(self):
-        return self._ctx.run_id
-
-    @_run_id.setter
-    def _run_id(self, value) -> None:
-        self._ctx.run_id = value
-
-    @property
-    def _dispatch_seq(self) -> int:
-        return self._ctx.dispatch_seq
-
-    @_dispatch_seq.setter
-    def _dispatch_seq(self, value: int) -> None:
-        self._ctx.dispatch_seq = value
 
     @property
     def on_run_start(self):
@@ -666,26 +624,8 @@ class TaskLite:
                 logger.exception("run_graceful 收尾 stop 失败")
 
     def _run_body(self) -> None:
-        """run() 的实际执行体，由 run() 包裹在 SIGTERM 安装/恢复之间调用。"""
-        self._runtime.prepare_run_state()
-        self._run_loop()
-
-    # ── 内部组件委托方法（供测试与生命周期直调）─────────────────
-
-    def _run_loop(self) -> None:
-        return self._runtime._run_loop()
-
-    def _save_queue_crash_safe(self) -> None:
-        return self._recovery.save_queue_crash_safe()
-
-    def _abort_in_flight(self) -> None:
-        return self._recovery.abort_in_flight()
-
-    def _release_acquired(self, acquired, uid=None) -> None:
-        return self._completion.release_acquired(acquired, uid=uid)
-
-    def _dispatch_job(self, sched):
-        return self._dispatch.dispatch_job(sched)
+        """run() 的实际执行体（委托 EngineRuntime）。"""
+        self._runtime._run_body()
 
 
 def job_ref(meta: Any) -> str:

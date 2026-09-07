@@ -173,8 +173,9 @@ class TestBackoffDoesNotShadowDeadlock:
             c["runtime"] = {"_backoff_until": time.monotonic() + 0.5}
 
             # 直接构造 PipelineState + 主循环（绕过 enqueue 便于注入退避字段）
-            pipeline._state = PipelineState({}, {}, {}, [a, b, c])
-            pipeline._run_loop()
+            state = PipelineState({}, {}, {}, [a, b, c])
+            pipeline.runtime.ctx.set_state(state)
+            pipeline.runtime._run_loop()
 
             failed = pipeline.backend.load_failed()
             wall = pipeline.backend.load_wall()
