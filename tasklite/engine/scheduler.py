@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Tuple, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..models.handler import HandlerEntry
+    from ..pipeline import HandlerEntry
 
 from .resource import Resource, ResourceManager, ResourceEvaluation
 from .runtime import RT_BACKOFF_UNTIL
