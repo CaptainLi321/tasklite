@@ -11,6 +11,8 @@
   与 executor 的 result/signals/outputs 文件名共享（不得另造一套映射；
   同时保证 fence 结果文件名的 Windows 兼容）。
 """
+from __future__ import annotations
+
 import os
 import time
 from pathlib import Path

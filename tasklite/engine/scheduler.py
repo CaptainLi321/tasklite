@@ -4,6 +4,7 @@ The scheduler performs a read-only scan over the queue to find the next
 runnable job. It does NOT acquire resources (only ``can_acquire``); the
 actual acquisition happens in the pipeline after the job is popped.
 """
+from __future__ import annotations
 
 import logging
 import time

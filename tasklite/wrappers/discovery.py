@@ -125,6 +125,7 @@ V1. 契约正确性必须由回归测试固定，至少覆盖：首次全量扫�
     on_missing；多 cursor_key 组共享 process_task_type 时 on_missing
     只报本组。
 """
+from __future__ import annotations
 
 import hashlib
 import logging

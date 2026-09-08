@@ -418,12 +418,15 @@ class ArtifactJournal:
             return None
 
         def _freshness_key(p: Path) -> Tuple[int, int]:
-            st = p.stat()
+            try:
+                mtime_ns = p.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = -1
             try:
                 seq = int(p.name.removesuffix(_RESULT_SUFFIX).rsplit(".", 1)[-1])
             except (ValueError, IndexError):
                 seq = -1
-            return (st.st_mtime_ns, seq)
+            return (mtime_ns, seq)
 
         res_path = max(res_paths, key=_freshness_key)
         res = self.read_result(res_path)

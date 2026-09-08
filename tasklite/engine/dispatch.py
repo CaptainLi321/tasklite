@@ -5,6 +5,7 @@ orphan-probe → stale-restore。依赖经 RunContext（``self._ctx``）注入�
 经 ``self.store``/``self._completion`` 复用状态深模块与完成机器，
 不反向引用 TaskLite。
 """
+from __future__ import annotations
 
 import logging
 import random

@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import email.utils
 import hashlib
 import http.client
@@ -23,6 +24,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterator,
     Mapping,
     Optional,
     Sequence,
@@ -638,11 +640,15 @@ class SQLiteSnapshotStore(SnapshotStore):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._get_conn() as conn:

@@ -7,6 +7,7 @@
 2. 转义符优先转义：% 必须首先转义为 %25，因此输出中的 % 唯一且确定地引导一个 %XX 序列。
 3. 超长截断单射兜底：截断时附加 SHA-256 摘要（8 字符），保证同前缀不同尾部的长字符串不碰撞。
 """
+from __future__ import annotations
 
 import hashlib
 from typing import Any, Dict, Iterable, Sequence, Union

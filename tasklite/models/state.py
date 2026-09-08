@@ -10,6 +10,7 @@ govern consistency:
 All mutations are in-place; queue changes go through the three methods
 (``pop_job``/``spawn_jobs``/``requeue_jobs``) so ``_queue_uids`` never drifts.
 """
+from __future__ import annotations
 
 import copy
 from typing import Any, Dict, FrozenSet, List, Mapping
