@@ -10,7 +10,7 @@ import datetime
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Protocol, Sequence, Set, Tuple, Union
 
 from .governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
@@ -59,16 +59,141 @@ class DLQEntry(NamedTuple):
 __all__ = [
     "BulkFailureOutcome",
     "COMMIT_FAILURE_DLQ_THRESHOLD",
+    "CommitView",
     "DEADLOCK_GAP_MAX_ROUNDS",
     "DEP_GRACE_SECONDS",
     "DLQEntry",
     "DeadlockGovernor",
+    "DispatchView",
     "FailureOutcome",
+    "RecoveryView",
     "RetryOutcome",
     "SkipOutcome",
     "StateStore",
     "SuccessOutcome",
 ]
+
+
+class DispatchView(Protocol):
+    """派发器与调度器所需的只读/局部状态与派发前变异视图。"""
+
+    @property
+    def in_flight_uids(self) -> FrozenSet[str]: ...
+
+    @property
+    def wall_uids(self) -> FrozenSet[str]: ...
+
+    @property
+    def failed_uids(self) -> FrozenSet[str]: ...
+
+    @property
+    def cursors(self) -> Dict[str, str]: ...
+
+    @property
+    def queue(self) -> List[Dict[str, Any]]: ...
+
+    @property
+    def wall(self) -> Dict[str, Dict[str, Any]]: ...
+
+    @property
+    def failed(self) -> Dict[str, Dict[str, Any]]: ...
+
+    @property
+    def queue_uids(self) -> FrozenSet[str]: ...
+
+    def pop_job(self, idx: int) -> dict: ...
+
+    def requeue_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None: ...
+
+    def is_known(self, uid: str) -> bool: ...
+
+    def unregister_in_flight(self, uid: str) -> None: ...
+
+    def register_in_flight(self, uid: str) -> None: ...
+
+    def apply_failure(
+        self,
+        uid: str,
+        error_meta: Dict[str, Any],
+        job_dict: Optional[Dict[str, Any]] = None,
+        *,
+        count_as: str = "failed",
+        cascade: bool = True,
+    ) -> FailureOutcome: ...
+
+    def apply_skip(
+        self,
+        uid: str,
+        job_dict: Optional[Dict[str, Any]] = None,
+    ) -> SkipOutcome: ...
+
+
+class CommitView(Protocol):
+    """结算机器所需的事务提交与状态转移视图。"""
+
+    @property
+    def in_flight_uids(self) -> FrozenSet[str]: ...
+
+    @property
+    def queue_uids(self) -> FrozenSet[str]: ...
+
+    @property
+    def wall(self) -> Dict[str, Dict[str, Any]]: ...
+
+    @property
+    def failed(self) -> Dict[str, Dict[str, Any]]: ...
+
+    def is_known(self, uid: str) -> bool: ...
+
+    def apply_success(
+        self,
+        uid: str,
+        result_meta: Dict[str, Any],
+        *,
+        spawned_jobs: Sequence[Dict[str, Any]] = (),
+        cursor_updates: Optional[Mapping[str, Optional[str]]] = None,
+        declared_inputs: Sequence[Dict[str, Any]] = (),
+        run_id: Optional[str] = None,
+        job_dict: Optional[Dict[str, Any]] = None,
+    ) -> SuccessOutcome: ...
+
+    def apply_failure(
+        self,
+        uid: str,
+        error_meta: Dict[str, Any],
+        job_dict: Optional[Dict[str, Any]] = None,
+        *,
+        count_as: str = "failed",
+        cascade: bool = True,
+    ) -> FailureOutcome: ...
+
+    def apply_retry(
+        self,
+        uid: str,
+        job_dict: Dict[str, Any],
+        retry_dict: Dict[str, Any],
+        *,
+        front: bool = False,
+    ) -> RetryOutcome: ...
+
+    def cascade_fail(self, failed_uid: str) -> List[str]: ...
+
+
+class RecoveryView(Protocol):
+    """崩溃恢复编排器所需的队列与在途清理视图。"""
+
+    @property
+    def queue(self) -> List[Dict[str, Any]]: ...
+
+    def requeue_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None: ...
+
+    def clear_in_flight(self) -> None: ...
+
+    def unregister_in_flight(self, uid: str) -> None: ...
+
+    def commit_failed_crash(
+        self, uid: str, reason: str, job_dict: Optional[Dict[str, Any]] = None
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
