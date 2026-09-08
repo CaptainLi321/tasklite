@@ -1014,10 +1014,9 @@ class TestRunLoopJobTerminatedNet:
         monkeypatch.setattr(pipeline.runtime._recovery, "save_queue_crash_safe", spy_save)
 
         # 模拟未来新直调点漏承接：_JobTerminated 直接从 run 主体逃逸到承重网。
-        # 后主循环实现迁至 engine/loop.py::LoopRunner——patch 其实现方法。
         def boom():
             raise _JobTerminated("job terminated outside expected handlers")
-        monkeypatch.setattr(pipeline.runtime._loop, "run_loop_impl", boom)
+        monkeypatch.setattr(pipeline.runtime, "run_loop_impl", boom)
 
         # 修复后应按崩溃契约 fail-loud re-raise _JobTerminated，
         # 而非抛 NameError（原 bug：{e} 引用了未绑定的 e）。

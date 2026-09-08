@@ -311,10 +311,10 @@ pipeline.clear_history("download::")
 
 ```
 tasklite/
-├── pipeline.py          # TaskLite / TaskLite 核心门面与配置
+├── pipeline.py          # TaskLite 核心门面与配置
 ├── engine/              # 核心执行机器群
+│   ├── runtime.py       # 核心运行期深模块、主循环事件泵与上下文 (EngineRuntime)
 │   ├── store.py         # 状态事务、3-strike 崩溃与死锁归因 (StateStore)
-│   ├── loop.py          # 主调度事件循环 (LoopRunner)
 │   ├── dispatch.py      # 任务派发状态机 (DispatchMachine)
 │   ├── completion.py    # 任务完成与提交 (CompletionMachine)
 │   ├── recovery.py      # 崩溃检测与恢复 (RecoveryMachine)

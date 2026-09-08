@@ -153,6 +153,33 @@ class TestEngineRuntimeStepPump:
         assert outcome.dispatched_count == 0
         assert outcome.completed_count == 0
 
+    def test_step_draining_and_aborting_modes(self, tmp_path):
+        ipc_dir = str(tmp_path / "ipc")
+        Path(ipc_dir).mkdir(parents=True, exist_ok=True)
+        config = RuntimeConfig(name="test_step_modes", ipc_dir=ipc_dir)
+        backend = InMemoryStateBackend()
+        resources = ResourceManager()
+        resources[WORKER_RESOURCE] = CapacityResource(WORKER_RESOURCE, 2.0)
+        runtime = EngineRuntime(
+            config=config,
+            backend=backend,
+            resources=resources,
+            handlers={},
+            executor=None,
+            transient_registry=None,
+            discovery_rerun={},
+        )
+
+        runtime.request_stop(force=False)
+        outcome_draining = runtime.step()
+        assert outcome_draining.exit_reason == "stopped_draining"
+        assert outcome_draining.should_terminate is True
+
+        runtime.request_stop(force=True)
+        outcome_aborting = runtime.step()
+        assert outcome_aborting.exit_reason == "stopped_aborting"
+        assert outcome_aborting.should_terminate is True
+
 
 class TestEngineRuntimeExecutionLifecycle:
     """测试 EngineRuntime 完整生命周期 execute() 与安全网。"""
