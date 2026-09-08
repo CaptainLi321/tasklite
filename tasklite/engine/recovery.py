@@ -16,6 +16,7 @@ from typing import List, Optional, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     from .runtime import RunContext
     from .completion import CompletionMachine
+    from .store import RecoveryView
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
