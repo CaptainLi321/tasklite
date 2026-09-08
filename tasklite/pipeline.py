@@ -241,6 +241,11 @@ class TaskLite:
         self._ctx.channel = value
 
     @property
+    def is_running(self) -> bool:
+        """检查当前管线是否正在执行中。"""
+        return self._runtime.is_running
+
+    @property
     def _run_started(self) -> bool:
         return self._runtime.is_running
 
