@@ -1,16 +1,16 @@
 """Engine subpackage for tasklite.
 
-执行机器模块（11 个）：
-- ``channel``: 子进程生命周期、看门狗与 IPC 结果处理（落盘文件模型）；
-- ``scheduler``: 队列只读扫描，找下一个 runnable job；
-- ``dispatch``: 派发预检关（去重/依赖/资源）与子进程派发；
-- ``loop``: 事件驱动主循环（填池 → drain → 等待）；
-- ``completion``: 成功/retry/失败的事务性提交与内存 apply；
-- ``failure``: 3-strike 崩溃契约 / 级联 / 死锁归因 / 宽限；
-- ``recovery``: 崩溃恢复 / suspend 信号排空 / abort 分类消费；
-- ``runtime``: ``RunContext``（一次 run 的运行态真相源）；
-- ``resource``: 资源抽象（限速/容量）与挂起语义；
-- ``retry``: 退避计算与 rerun 策略判定（纯逻辑）；
-- ``inflight``: in-flight job 的运行时条目（三机器共享数据类）。
+核心执行与深模块架构：
+- ``runtime``: 核心运行期深模块、主循环事件泵与共享运行态容器 (EngineRuntime / RunContext)；
+- ``store``: 统一状态事务、3-strike 崩溃与死锁归因深模块 (StateStore)；
+- ``dispatch``: 派发预检关与子进程派发编排 (DispatchMachine)；
+- ``completion``: 结果提交、清理、释放与恢复收尾 (CompletionMachine)；
+- ``recovery``: 崩溃恢复、TOCTOU 闭环 abort 与信号排空 (RecoveryOrchestrator)；
+- ``channel``: 子进程生命周期、阶梯看门狗、IPC 通道与产物清理 (ExecutionChannel)；
+- ``scheduler``: 队列只读扫描与不可变投影缓存 (JobScheduler)；
+- ``resource``: 限速与容量资源抽象与挂起语义 (ResourceManager / Resource)；
+- ``governor``: 死锁归因与依赖宽限治理 (DeadlockGovernor)；
+- ``policy``: Rerun 决策、指纹缓存与退避状态机 (ExecutionPolicy)；
+- ``inflight``: 在途作业生命周期跟踪与资源租约 (InFlightTracker)。
 """
 

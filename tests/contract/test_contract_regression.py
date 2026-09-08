@@ -90,17 +90,17 @@ class TestSingleExitContract:
         )
 
     def test_persist_suspends_in_run_loop_finally(self):
-        """ 验收：persist_resource_suspends 在 run_loop 的 finally 中（崩溃路径也持久化）。"""
-        src = (SRC_DIR / "engine" / "loop.py").read_text()
-        run_loop_start = src.find("def run_loop")
-        run_loop_end = src.find("def run_loop_impl", run_loop_start)
+        """ 验收：persist_resource_suspends 在 _run_loop 的 finally 中（崩溃路径也持久化）。"""
+        src = (SRC_DIR / "engine" / "runtime.py").read_text()
+        run_loop_start = src.find("def _run_loop")
+        run_loop_end = src.find("def _run_body", run_loop_start)
         run_loop_body = src[run_loop_start:run_loop_end]
         # finally 块应包含 persist_resource_suspends
         assert "finally:" in run_loop_body
         assert "persist_resource_suspends" in run_loop_body.split("finally:")[1]
-        # run_loop_impl 末尾不应再单独调用（收编到 run_loop）
+        # run_loop_impl 末尾不应再单独调用（收编到 _run_loop）
         impl_start = src.find("def run_loop_impl")
-        impl_end = src.find("class ", impl_start)
+        impl_end = src.find("def prepare_run_state", impl_start)
         impl_body = src[impl_start:impl_end if impl_end != -1 else len(src)]
         # 正常退出路径的调用注释可以存在，但实际调用应已移除
         assert "persist_resource_suspends()" not in impl_body.replace(
