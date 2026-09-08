@@ -174,8 +174,8 @@ class TestBackoffDoesNotShadowDeadlock:
 
             # 直接构造 PipelineState + 主循环（绕过 enqueue 便于注入退避字段）
             state = PipelineState({}, {}, {}, [a, b, c])
-            pipeline.runtime.ctx.set_state(state)
-            pipeline.runtime._run_loop()
+            pipeline._runtime.ctx.set_state(state)
+            pipeline._runtime._run_loop()
 
             failed = pipeline.backend.load_failed()
             wall = pipeline.backend.load_wall()

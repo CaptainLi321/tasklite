@@ -411,10 +411,10 @@ class TestBackoffReloadTruthTable:
         p.backend.enqueue_jobs([jd])
 
         # 只走真实 prepare_run_state 的加载/换算段（无需启动事件循环）
-        p.runtime.prepare_run_state()
+        p._runtime.prepare_run_state()
 
         now = _t.monotonic()
-        converted = p.runtime.state.queue[0]
+        converted = p._runtime.state.queue[0]
         rt = converted["runtime"]
         assert "_backoff_until" in rt, "加载换算必须设置 monotonic _backoff_until"
         assert 55 < (rt["_backoff_until"] - now) < 65, (
@@ -437,9 +437,9 @@ class TestBackoffReloadTruthTable:
         jd["runtime"]["_backoff_until"] = 1e18  # 残留 monotonic 退避（孤儿 defer，一并清除）
         p.backend.enqueue_jobs([jd])
 
-        p.runtime.prepare_run_state()
+        p._runtime.prepare_run_state()
 
-        loaded = p.runtime.state.queue[0]
+        loaded = p._runtime.state.queue[0]
         rt = loaded.get("runtime", {})
         assert "_backoff_wall_deadline" not in rt, \
             "脏 wall_deadline 必须被清除（否则残留阻塞调度）"
@@ -460,9 +460,9 @@ class TestBackoffReloadTruthTable:
         jd["runtime"]["_backoff_until"] = 1e18  # 残留 monotonic 退避
         p.backend.enqueue_jobs([jd])
 
-        p.runtime.prepare_run_state()
+        p._runtime.prepare_run_state()
 
-        loaded = p.runtime.state.queue[0]
+        loaded = p._runtime.state.queue[0]
         rt = loaded.get("runtime", {})
         assert "_backoff_wall_deadline" not in rt, \
             "过期的 wall_deadline 必须被清除（放行）"

@@ -222,11 +222,6 @@ class TaskLite:
 
     # ── 核心深模块与运行期接缝 ──────────────────────────────────────
     @property
-    def runtime(self) -> EngineRuntime:
-        """核心运行期深模块接缝。"""
-        return self._runtime
-
-    @property
     def store(self) -> StateStore:
         """状态与事务深模块。"""
         return self._ctx.store

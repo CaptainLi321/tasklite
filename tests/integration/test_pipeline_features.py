@@ -148,16 +148,16 @@ class TestOrphanLockDetection:
         from tasklite.engine.scheduler import JobScheduler
         state = PipelineState(p.backend.load_wall(), p.backend.load_failed(),
                               p.backend.load_cursors(), p.backend.load_queue())
-        p.runtime.ctx.set_state(state)
+        p._runtime.ctx.set_state(state)
         sched = JobScheduler(p.resources, p.handlers).pop_next_runnable(state, frozenset())
         assert sched.runnable_idx is not None, "job should be runnable (probe is the gate)"
-        entry = p.runtime._dispatch.dispatch_job(sched)
+        entry = p._runtime._dispatch.dispatch_job(sched)
         assert entry is None, "orphan lock → dispatch must defer (no subprocess)"
         # (a) 拦截生效：计数增长、job 未执行
         assert p.stats.get("deferred_orphan", 0) >= 1
         assert "t::a" not in p.backend.load_wall(), "job must not execute while orphan holds lock"
         # (b) job 保留在队列（requeue，at-least-once 不丢）
-        assert "t::a" in [Job.from_dict(j).uid for j in p.runtime.state.queue]
+        assert "t::a" in [Job.from_dict(j).uid for j in p._runtime.state.queue]
         # (c) 释放锁 → 探测恢复
         release_lock(orphan_fd)
         from tasklite.utils.lockfile import probe_lock
@@ -232,7 +232,7 @@ class TestLifecycleHooks:
         # 注入 KeyboardInterrupt 在派发时（后派发实现迁至 DispatchMachine）
         def exploding(*a, **k):
             raise KeyboardInterrupt()
-        monkeypatch.setattr(p.runtime._dispatch, "dispatch_job", exploding)
+        monkeypatch.setattr(p._runtime._dispatch, "dispatch_job", exploding)
         import pytest as _pt
         with _pt.raises(KeyboardInterrupt):
             p.run()
