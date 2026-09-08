@@ -125,3 +125,23 @@ class TestInFlightTrackerResourceRelease:
         entry.release_resources(rm)
         assert gpu.used == 0.0
         assert entry.acquired == []
+
+    def test_active_uids_and_classify_aborted(self):
+        tracker = InFlightTracker()
+        j1 = Job("t", "j1", {})
+        e1 = InFlightJob("t::j1", j1.to_dict(), j1, [], None, None)
+        j2 = Job("t", "j2", {})
+        e2 = InFlightJob("t::j2", j2.to_dict(), j2, [], None, None)
+
+        tracker.register(e1)
+        tracker.register(e2)
+
+        assert set(tracker.active_uids()) == {"t::j1", "t::j2"}
+
+        cancelled, done = tracker.classify_aborted({"t::j1": {"status": "ok"}})
+        assert len(cancelled) == 1
+        assert cancelled[0].uid == "t::j2"
+        assert len(done) == 1
+        assert done[0][0].uid == "t::j1"
+        assert done[0][1] == {"status": "ok"}
+

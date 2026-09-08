@@ -179,7 +179,7 @@ class RecoveryOrchestrator:
         ``suspend()`` 使用 ``max`` 语义，重复应用同一信号是幂等的。
         """
         signals = self._ctx.channel.drain_active_signals(
-            entry.uid for entry in self._ctx.in_flight.values()
+            self._ctx.in_flight.active_uids()
         )
         applied = False
         for uid, r_name, secs in signals:
@@ -216,21 +216,11 @@ class RecoveryOrchestrator:
         self._ctx.in_flight.release_all_resources(self._ctx.resource_mgr)
 
         # 3. 委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理）
-        handles = [
-            entry.handle for entry in self._ctx.in_flight.values()
-            if entry.handle is not None
-        ]
+        handles = self._ctx.in_flight.active_handles()
         outcome = self._ctx.channel.abort_in_flight(handles)
 
         completed_map = {h.uid: res for h, res in outcome.completed}
-        cancelled_entries: List[InFlightJob] = []
-        done_entries: List[Tuple[InFlightJob, Any]] = []
-
-        for entry in self._ctx.in_flight.values():
-            if entry.uid in completed_map:
-                done_entries.append((entry, completed_map[entry.uid]))
-            else:
-                cancelled_entries.append(entry)
+        cancelled_entries, done_entries = self._ctx.in_flight.classify_aborted(completed_map)
 
         # 4. 未完成任务注销 in-flight 并 requeue 到队首
         job_dicts = [entry.job_dict for entry in cancelled_entries]
