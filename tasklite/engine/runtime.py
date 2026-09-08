@@ -101,15 +101,15 @@ from .store import (
     DEP_GRACE_SECONDS,
     StateStore,
 )
-from .channel import ExecutionChannel
-from .inflight import InFlightTracker
+from .channel import ArtifactCleanupMode, ExecutionChannel, ExecutionResult, JobHandle
+from .inflight import InFlightJob, InFlightTracker
 from .policy import ExecutionPolicy, PreflightPolicy
 from .resource import CapacityResource, Resource, ResourceManager
-from .scheduler import JobScheduler
+from .scheduler import DeadlockAttribution, JobScheduler, ScheduleResult
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
-from ..models.job import Job
+from ..models.job import Job, JobRuntimeState
 from ..models.state import PipelineState, uid_from_job_dict
 from ..taxonomy import ErrorTaxonomy
 from ..utils.jsonutil import dumps, loads
@@ -351,7 +351,10 @@ class RunContext:
 
 
 class EngineRuntime:
-    """TaskLite 核心运行期深模块。"""
+    """TaskLite 核心运行期深模块。
+
+    统一聚合主循环事件泵、五关预检派发、结果收敛事务、崩溃/停机恢复与在途追踪。
+    """
 
     def __init__(
         self,
@@ -544,9 +547,8 @@ class EngineRuntime:
         )
 
     def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
-        """单步推进事件泵（确定性步进测试接缝，与生产主循环 100% 同构）。"""
+        """单步推进事件泵（主循环与单步测试共用的统一事件泵）。"""
         if self._ctx.state is None:
-            # 自动初始化测试状态
             self._ctx.run_id = self._ctx.run_id or uuid.uuid4().hex
             self._ctx.set_state(PipelineState({}, {}, {}, []))
 
@@ -601,3 +603,44 @@ class EngineRuntime:
                     f"Handler for task_type '{task_type}' is not picklable: {entry.func!r} ({e}). "
                     f"Functions must be module-level."
                 ) from e
+
+    # ── 统一深模块操作接口（向外暴露核心引擎方法）──────────
+
+    def dispatch_next(self) -> Any:
+        return self._dispatch.dispatch_next()
+
+    def dispatch_job(self, sched: Any) -> Any:
+        return self._dispatch.dispatch_job(sched)
+
+    def complete_job(self, entry: Any, result: Any) -> None:
+        return self._completion.complete_job(entry, result)
+
+    def apply_result(self, uid: str, job: Any, job_dict: dict, result: Any, job_start: Optional[float] = None, expect_in_flight: bool = True) -> None:
+        return self._completion.apply_result(uid, job, job_dict, result, job_start=job_start, expect_in_flight=expect_in_flight)
+
+    def restore_stale_result(self, uid: str, job: Any, job_dict: dict) -> bool:
+        return self._completion.restore_stale_result(uid, job, job_dict)
+
+    def cleanup_outputs(self, uid: str) -> None:
+        return self._completion.cleanup_outputs(uid)
+
+    def release_acquired(self, acquired_or_entry: Any, uid: Optional[str] = None) -> None:
+        return self._completion.release_acquired(acquired_or_entry, uid=uid)
+
+    def abort_in_flight(self) -> None:
+        return self._recovery.abort_in_flight()
+
+    def save_queue_crash_safe(self) -> None:
+        return self._recovery.save_queue_crash_safe()
+
+    def repair_queue_on_load(self, q_data: list, wall: dict, failed: dict) -> list:
+        return self._recovery.repair_queue_on_load(q_data, wall, failed)
+
+    def load_resource_suspends(self) -> None:
+        return self._recovery.load_resource_suspends()
+
+    def persist_resource_suspends(self) -> None:
+        return self._recovery.persist_resource_suspends()
+
+    def apply_pending_signals(self) -> None:
+        return self._recovery.apply_pending_signals()
