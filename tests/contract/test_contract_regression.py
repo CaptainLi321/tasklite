@@ -160,19 +160,19 @@ class TestIdentityNonVacuity:
         p = TaskLite(name="t", state_dir=str(tmp_path), backend="sqlite", max_workers=1)
         job = Job("t", "a")
         job_dict = job.to_dict()
-        p._state = PipelineState(
+        p._runtime.ctx.state = PipelineState(
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), [],
         )
-        p._state.register_in_flight("t::a")
+        p.state.register_in_flight("t::a")
 
         with pytest.raises(_CommitCrashSignal):
             p.store.commit_failed_crash("t::a", "test_commit_failure", job_dict)
 
         # 断言：requeue 前已 unregister——uid 不在 in-flight（防 _abort 二次 requeue）
-        assert "t::a" not in p._state.in_flight_uids
+        assert "t::a" not in p.state.in_flight_uids
         # 且已 requeue 到 queue（恰好一次）
-        uids = [x.get("job_id") for x in p._state.queue]
+        uids = [x.get("job_id") for x in p.state.queue]
         assert uids.count("a") == 1
 
 
@@ -613,7 +613,7 @@ class TestDispatchInterruptResources:
         slot = p.resources["slot"]
         assert slot.used == 0, f"resource leaked after KeyboardInterrupt: used={slot.used}"
         # job 已 requeue（内存队列可重新调度）
-        assert p.backend.load_queue() != [] or p._state.queue != []
+        assert p.backend.load_queue() != [] or p.state.queue != []
 
 
 

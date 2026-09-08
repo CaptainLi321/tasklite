@@ -231,22 +231,10 @@ class TaskLite:
         """执行通道深模块。"""
         return self._ctx.channel
 
-    @channel.setter
-    def channel(self, value: ExecutionChannel) -> None:
-        self._ctx.channel = value
-
     @property
     def is_running(self) -> bool:
         """检查当前管线是否正在执行中。"""
         return self._runtime.is_running
-
-    @property
-    def _run_started(self) -> bool:
-        return self._runtime.is_running
-
-    @_run_started.setter
-    def _run_started(self, value: bool) -> None:
-        self._runtime._is_running = value
 
     @property
     def backend(self) -> AbstractStateBackend:
@@ -273,29 +261,8 @@ class TaskLite:
         return self._ctx.state
 
     @property
-    def _state(self) -> Optional[PipelineState]:
-        return self._ctx.state
-
-    @_state.setter
-    def _state(self, value: Optional[PipelineState]) -> None:
-        self._ctx.state = value
-
-    @property
     def in_flight(self) -> InFlightTracker:
         return self._ctx.in_flight
-
-    @property
-    def _in_flight(self) -> InFlightTracker:
-        return self._ctx.in_flight
-
-    @_in_flight.setter
-    def _in_flight(self, value: Any) -> None:
-        if isinstance(value, InFlightTracker):
-            self._ctx.in_flight = value
-        else:
-            self._ctx.in_flight.clear()
-            if value:
-                self._ctx.in_flight.update(value)
 
     @property
     def on_run_start(self):
@@ -323,15 +290,11 @@ class TaskLite:
 
     def _ensure_not_running(self, api_name: str) -> None:
         """管理/入队 API 的 run 期间守卫（把文档限制变成代码级 RuntimeError）。"""
-        if self._run_started:
+        if self.is_running:
             raise RuntimeError(
                 f"{api_name}() is only allowed outside run(); "
                 f"current run is in progress. See README『开发与 Agent 约束』."
             )
-
-    def _preflight_picklable_callbacks(self) -> None:
-        """strict_picklable=True 时，run 前校验全部 handler 可 pickle（fail-loud，委托 EngineRuntime）。"""
-        self._runtime._preflight_picklable_callbacks()
 
     def add_resource(self, resource: Resource) -> None:
         """Add a resource scheduler to the pipeline.
@@ -584,10 +547,6 @@ class TaskLite:
         """
         self._runtime.request_stop(force=force)
 
-    def _handle_stop_signal(self, signum, frame) -> None:
-        """SIGTERM/SIGINT 信号处理器：请求 DRAINING 优雅停机；二次强制 ABORTING。"""
-        self._runtime._handle_signal(signum, frame)
-
     def run(self) -> None:
         """Start the pipeline and run until queue is empty (or a drain/abort stop is requested)."""
         logger.info(f"=== Starting Pipeline: {self.name} (Backend: {self.backend_type}) ===")
@@ -609,9 +568,6 @@ class TaskLite:
             except Exception:
                 logger.exception("run_graceful 收尾 stop 失败")
 
-    def _run_body(self) -> None:
-        """run() 的实际执行体（委托 EngineRuntime）。"""
-        self._runtime._run_body()
 
 
 def job_ref(meta: Any) -> str:

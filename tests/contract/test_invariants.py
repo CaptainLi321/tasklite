@@ -46,7 +46,7 @@ class TestInvariants:
     # ── in-memory state matches on-disk state after run ────────
     def test_pipeline_run_in_memory_matches_on_disk(self, tmp_path, monkeypatch):
         """After a successful pipeline run, the in-memory queue
-        (``pipeline._state.queue``) matches the on-disk queue loaded
+        (``pipeline.state.queue``) matches the on-disk queue loaded
         from the backend. With all jobs completed, both must be empty.
         This guards against drift between the pipeline's in-memory state
         snapshot and the durable backend state.
