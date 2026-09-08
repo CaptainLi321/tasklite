@@ -13,6 +13,7 @@ from typing import Dict, FrozenSet, List, Optional, Tuple, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..pipeline import HandlerEntry
+    from .store import DispatchView
 
 from .resource import Resource, ResourceManager, ResourceEvaluation
 from .runtime import RT_BACKOFF_UNTIL
@@ -205,23 +206,22 @@ class JobScheduler:
 
     def pop_next_runnable(
         self,
-        state,
+        state: Union[DispatchView, Any],
         in_flight_uids: FrozenSet[str] = frozenset(),
     ) -> ScheduleResult:
         """Scan queue read-only. Returns index and wait info. Does NOT acquire resources.
 
-        ``state`` 是 PipelineState 实例（读取 queue/wall/failed/queue_uids——
+        ``state`` 满足 DispatchView 协议（读取 queue/wall/failed/queue_uids——
         ``queue_uids`` 返回活索引引用，提供 O(1) 索引，无 O(N) 拷贝）。
 
         ``in_flight_uids`` 是当前正在子进程中执行（已 pop 但未 commit）的 job uid
         集合。在 missing dependency 判定时，依赖正在运行的 job 不算 missing
         （待其完成 commit 到 wall 后自然解锁），避免并发模型下误判死锁。
         """
-        effective_state = getattr(state, "state", state)
-        q_data = effective_state.queue
-        wall_data = effective_state.wall
-        failed_data = effective_state.failed
-        queue_uids = effective_state.queue_uids
+        q_data = state.queue
+        wall_data = state.wall
+        failed_data = state.failed
+        queue_uids = state.queue_uids
         pending_or_running = queue_uids | set(in_flight_uids)
 
         runnable_idx = None
