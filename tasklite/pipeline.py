@@ -353,7 +353,7 @@ class TaskLite:
                 f"got {type(default_resources).__name__}"
             )
         if default_resources:
-            self._validate_resource_amounts(default_resources, "default_resources")
+            validate_resource_amounts(default_resources, "default_resources")
         if payload_schema is not None and not isinstance(payload_schema, type):
             # 代码级限制：文档约定 payload_schema 必须是 TypedDict 类；
             # 传实例/字符串等会在运行时校验时静默失效，入口 fail-loud。
@@ -474,7 +474,7 @@ class TaskLite:
             # discovery 默认 rerun 规范化（策略深模块；None=未指定
             # 哨兵才注入，显式值含 "never" 一律尊重）
             self._ctx.policy.normalize_job_dict(job_dict, j.task_type)
-            self._inject_worker_resource(job_dict)
+            inject_worker_resource(job_dict)
             jobs_dicts.append(job_dict)
 
         if not jobs_dicts:
@@ -522,18 +522,6 @@ class TaskLite:
         """预填一个 cursor。委托 StateStore。"""
         self._ensure_not_running("seed_cursor")
         self.store.seed_cursor(key, value)
-
-    def _validate_resource_amounts(self, resources: Dict[str, float], where: str) -> None:
-        """数值校验转发（与 Job.__init__ 共用 taxonomy 单点）。
-
-        handler 默认资源在注册时即校验，防止负值/NaN/Inf 绕过 Job 构造
-        校验后在派发时引发 acquire 崩溃（负值）或调度 NaN 污染（无限空转）。
-        """
-        validate_resource_amounts(resources, where)
-
-    def _inject_worker_resource(self, job_dict: dict) -> None:
-        """给 job_dict 注入默认 worker 槽位（单点实现见 engine.runtime）。"""
-        inject_worker_resource(job_dict)
 
     def stop(self, force: bool = False) -> None:
         """请求管线停止（停机状态机）。
