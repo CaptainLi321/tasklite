@@ -8,11 +8,8 @@ from collections.abc import MutableMapping
 from dataclasses import dataclass
 from typing import (
     Any, Dict, Iterable, Iterator, List, Mapping, Optional,
-    Tuple, Union, TYPE_CHECKING
+    Tuple, Union
 )
-
-if TYPE_CHECKING:
-    from ..pipeline import HandlerEntry
 
 logger = logging.getLogger("tasklite")
 
