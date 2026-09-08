@@ -385,7 +385,7 @@ class TestSpawnDeduplication:
             pipeline.backend.load_wall(), pipeline.backend.load_failed(),
             pipeline.backend.load_cursors(), pipeline.backend.load_queue(),
         )
-        pipeline.runtime.ctx.set_state(state)
+        pipeline._runtime.ctx.set_state(state)
 
         # parent::p1 成功并 spawn 同 uid X
         from tasklite.engine.runtime import inject_worker_resource
@@ -396,7 +396,7 @@ class TestSpawnDeduplication:
             success=True,
             new_jobs=[Job("child", "x", payload={}, rerun="every_run")],
         )
-        pipeline.runtime._completion.apply_result("parent::p1", job, job_dict, result, expect_in_flight=False)
+        pipeline._runtime._completion.apply_result("parent::p1", job, job_dict, result, expect_in_flight=False)
 
         q = pipeline.backend.load_queue()
         x_count = sum(1 for jd in q

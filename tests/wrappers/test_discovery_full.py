@@ -381,7 +381,7 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),  # 可运行候选
         ]
         self._init_state(p, queue)
-        gov = p.runtime.ctx.governor
+        gov = p._runtime.ctx.governor
         gov.dep_grace_deadline = None
         assert p.store._dependency_grace([0]) is True, "存在可运行候选必须宽限"
 
@@ -394,7 +394,7 @@ class TestDependencyGrace:
             J("t", "j_downstream", depends_on=["t::j_missing"]).to_dict(),
         ]
         self._init_state(p, queue)
-        gov = p.runtime.ctx.governor
+        gov = p._runtime.ctx.governor
         gov.dep_grace_deadline = None
         # j_downstream 依赖 t::j_missing（在队列，不在 wall）→ 非可运行候选
         assert p.store._dependency_grace([0]) is False, "无候选不得宽限"
@@ -410,7 +410,7 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),
         ]
         self._init_state(p, queue)
-        gov = p.runtime.ctx.governor
+        gov = p._runtime.ctx.governor
         gov.dep_grace_deadline = _t.monotonic() - 1.0  # 已过期
         assert p.store._dependency_grace([0]) is False, "宽限超时必须判死锁"
 
@@ -427,7 +427,7 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),
         ]
         self._init_state(p, queue)
-        gov = p.runtime.ctx.governor
+        gov = p._runtime.ctx.governor
         gov.dep_grace_deadline = None
         assert p.store._dependency_grace([0]) is True
         deadline_after_first = gov.dep_grace_deadline
@@ -456,7 +456,7 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),
         ]
         self._init_state(p, queue)
-        gov = p.runtime.ctx.governor
+        gov = p._runtime.ctx.governor
         gov.dep_grace_deadline = None
         # 第一个 episode：缺失 [0] → 授权（deadline 设置）
         assert p.store._dependency_grace([0]) is True
@@ -488,7 +488,7 @@ class TestDependencyGrace:
             J("t", "waiter", depends_on=["driver::spawner"]).to_dict(),
         ]
         self._init_state(p, queue)
-        gov = p.runtime.ctx.governor
+        gov = p._runtime.ctx.governor
         gov.dep_grace_deadline = None
         assert p.store._dependency_grace([0]) is True
         deadline = gov.dep_grace_deadline

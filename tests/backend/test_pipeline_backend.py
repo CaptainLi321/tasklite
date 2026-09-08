@@ -87,7 +87,7 @@ class TestBackoffPersistence:
         pipeline.run()
 
         # Cross-state consistency: in-memory state agrees with on-disk
-        assert pipeline.runtime.state.queue == pipeline.backend.load_queue()
+        assert pipeline._runtime.state.queue == pipeline.backend.load_queue()
 
         # Job NOT in wall (skipped due to backoff)
         wall = pipeline.backend.load_wall()

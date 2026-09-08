@@ -74,13 +74,13 @@ class TestPipelineStateCommitContract:
             pipeline.run()
 
         # Wall must NOT contain the job (commit returned False)
-        assert "test::j1" not in pipeline.runtime.state.wall, (
+        assert "test::j1" not in pipeline._runtime.state.wall, (
             "wall must not be updated when commit_job_success returns False"
         )
         # Job must be re-queued in the in-memory state
-        uids = [Job.from_dict(j).uid for j in pipeline.runtime.state.queue]
+        uids = [Job.from_dict(j).uid for j in pipeline._runtime.state.queue]
         assert set(uids) == {"test::j1"}, (
-            "job must be re-queued in pipeline.runtime.state.queue when commit fails"
+            "job must be re-queued in pipeline._runtime.state.queue when commit fails"
         )
         # Spawned job must NOT leak into the queue on commit failure
         assert "test::spawned" not in uids, (
@@ -91,7 +91,7 @@ class TestPipelineStateCommitContract:
             "cursor updates must not persist when commit_job_success returns False"
         )
         # Cross-state consistency: in-memory queue must match on-disk queue
-        assert pipeline.runtime.state.queue == pipeline.backend.load_queue(), (
+        assert pipeline._runtime.state.queue == pipeline.backend.load_queue(), (
             "in-memory queue must match on-disk queue after commit failure"
         )
 
@@ -112,12 +112,12 @@ class TestPipelineStateCommitContract:
         with pytest.raises(_CommitCrashSignal, match="Backend commit returned False"):
             pipeline.run()
 
-        assert "test::j1" not in pipeline.runtime.state.failed, (
+        assert "test::j1" not in pipeline._runtime.state.failed, (
             "job must not be in failed when commit_job_failure returns False"
         )
-        uids = [Job.from_dict(j).uid for j in pipeline.runtime.state.queue]
+        uids = [Job.from_dict(j).uid for j in pipeline._runtime.state.queue]
         assert uids == ["test::j1"], f"job must be re-queued at front, got: {uids}"
-        assert pipeline.runtime.state.queue == pipeline.backend.load_queue()
+        assert pipeline._runtime.state.queue == pipeline.backend.load_queue()
 
     def test_pipeline_reinserts_job_on_executor_exception(self, tmp_path, monkeypatch):
         """Test B: executor.submit raises RuntimeError -> job re-inserted, NOT in failed.
@@ -141,16 +141,16 @@ class TestPipelineStateCommitContract:
             pipeline.run()
 
         # Job must be re-inserted in queue (full-set: only j1, nothing else)
-        uids = [Job.from_dict(j).uid for j in pipeline.runtime.state.queue]
+        uids = [Job.from_dict(j).uid for j in pipeline._runtime.state.queue]
         assert set(uids) == {"test::j1"}, (
             "job must be re-inserted in queue when executor raises"
         )
         # Cross-state consistency: in-memory queue must match on-disk queue
-        assert pipeline.runtime.state.queue == pipeline.backend.load_queue(), (
+        assert pipeline._runtime.state.queue == pipeline.backend.load_queue(), (
             "in-memory queue must match on-disk queue after executor exception"
         )
         # Job must NOT be in failed (exception path, not failure path)
-        assert "test::j1" not in pipeline.runtime.state.failed, (
+        assert "test::j1" not in pipeline._runtime.state.failed, (
             "job must not be marked as failed when executor raises an exception"
         )
 
@@ -189,7 +189,7 @@ class TestPipelineStateCommitContract:
             f"both j1 and j2 must remain in queue, got {uids}"
         )
         # Cross-state consistency: in-memory queue must match on-disk queue
-        assert pipeline.runtime.state.queue == pipeline.backend.load_queue(), (
+        assert pipeline._runtime.state.queue == pipeline.backend.load_queue(), (
             "in-memory queue must match on-disk queue after KeyboardInterrupt"
         )
 
@@ -211,14 +211,14 @@ class TestPipelineStateCommitContract:
         pipeline.run()
 
         # Job must be in failed with RESOURCE_DEADLOCK error
-        assert "test::j1" in pipeline.runtime.state.failed, (
+        assert "test::j1" in pipeline._runtime.state.failed, (
             "job requiring unknown resource must be marked as failed, not silently dropped"
         )
-        assert pipeline.runtime.state.failed["test::j1"]["error"] == "RESOURCE_DEADLOCK", (
-            f"error must be RESOURCE_DEADLOCK, got {pipeline.runtime.state.failed['test::j1']}"
+        assert pipeline._runtime.state.failed["test::j1"]["error"] == "RESOURCE_DEADLOCK", (
+            f"error must be RESOURCE_DEADLOCK, got {pipeline._runtime.state.failed['test::j1']}"
         )
         # Queue must be empty (cleared by commit_bulk_failure)
-        assert pipeline.runtime.state.queue == [], (
+        assert pipeline._runtime.state.queue == [], (
             "queue must be emptied after resource deadlock"
         )
         # Also verify on-disk state matches in-memory state
@@ -267,7 +267,7 @@ class TestInFlightStateConsistency:
             pipeline.backend.load_wall(), pipeline.backend.load_failed(),
             pipeline.backend.load_cursors(), pipeline.backend.load_queue(),
         )
-        pipeline.runtime.ctx.set_state(state)
+        pipeline._runtime.ctx.set_state(state)
         # C 已被 A spawn 且派发：不在队列（pop 出队）、在 in-flight
         state.pop_job(0)
         state.register_in_flight("child::c")
@@ -277,7 +277,7 @@ class TestInFlightStateConsistency:
         job_dict = job.to_dict()
         inject_worker_resource(job_dict)
         result = ExecutionResult(success=True, new_jobs=[Job("child", "c", payload={})])
-        pipeline.runtime._completion.apply_result("parent::b", job, job_dict, result, expect_in_flight=False)
+        pipeline._runtime._completion.apply_result("parent::b", job, job_dict, result, expect_in_flight=False)
 
         # C 未被重复入队（in-flight 命中拦截，spawn 的 C 未新增）：
         # 磁盘 queue 仍只有最初 enqueue 的那 1 条 C（pop_job 只改内存，

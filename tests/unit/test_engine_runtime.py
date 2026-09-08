@@ -304,10 +304,10 @@ class TestTaskLiteRuntimeFacadeIntegration:
 
     def test_tasklite_exposes_runtime_and_delegates(self, tmp_path):
         p = TaskLite(name="facade_test", state_dir=str(tmp_path), backend="memory")
-        assert isinstance(p.runtime, EngineRuntime)
-        assert p.runtime.config.name == "facade_test"
-        assert p.runtime.ctx is p._ctx
-        assert p.runtime.scheduler is p.scheduler
+        assert isinstance(p._runtime, EngineRuntime)
+        assert p._runtime.config.name == "facade_test"
+        assert p._runtime.ctx is p._ctx
+        assert p._runtime.scheduler is p.scheduler
         assert p.store is p._ctx.store
         assert p.channel is p._ctx.channel
 
