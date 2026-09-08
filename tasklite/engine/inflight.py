@@ -145,6 +145,23 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
             if entry.handle is not None
         ]
 
+    def active_uids(self) -> List[str]:
+        """收集所有在途任务的 uid 列表。"""
+        return list(self._entries.keys())
+
+    def classify_aborted(
+        self, completed_map: Mapping[str, Any]
+    ) -> Tuple[List[InFlightJob], List[Tuple[InFlightJob, Any]]]:
+        """将当前在途任务分类为（已取消待重入队列表, 已完成待提交列表）。"""
+        cancelled_entries: List[InFlightJob] = []
+        done_entries: List[Tuple[InFlightJob, Any]] = []
+        for entry in self._entries.values():
+            if entry.uid in completed_map:
+                done_entries.append((entry, completed_map[entry.uid]))
+            else:
+                cancelled_entries.append(entry)
+        return cancelled_entries, done_entries
+
     def release_all_resources(
         self,
         resource_mgr: Optional["ResourceManager"] = None,
