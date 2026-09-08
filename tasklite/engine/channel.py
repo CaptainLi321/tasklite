@@ -76,37 +76,8 @@ def write_result_atomic(
 def _write_result_with_degradation(
     ipc_dir: Union[str, Path], uid: str, payload: Dict[str, Any], incarnation: Optional[str] = None
 ) -> None:
-    """worker 结果落盘的唯一出口：完整写失败时两级降级，绝不裸抛 OSError。"""
-    try:
-        write_result_atomic(ipc_dir, uid, payload, incarnation=incarnation)
-        return
-    except OSError as e:
-        logger.warning(
-            f"result write failed for {uid}: {e}; retrying full payload once after brief pause"
-        )
-    time.sleep(0.05)
-    try:
-        write_result_atomic(ipc_dir, uid, payload, incarnation=incarnation)
-        return
-    except OSError as e:
-        write_err = str(e)
-        logger.warning(
-            f"full result write retry also failed for {uid}: {e}; falling back to degraded result"
-        )
-    orig_status = payload.get("status")
-    degraded_status = "retry" if orig_status in (None, "success") else orig_status
-    degraded: Dict[str, Any] = {
-        "status": degraded_status,
-        "error": f"IPC_RESULT_WRITE_DEGRADED: {write_err}",
-    }
-    if payload.get("lock_conflict"):
-        degraded["lock_conflict"] = True
-    try:
-        write_result_atomic(ipc_dir, uid, degraded, incarnation=incarnation)
-    except OSError as e2:
-        logger.error(
-            f"degraded result write also failed for {uid}: {e2}; worker exiting without IPC result"
-        )
+    """worker 结果落盘的唯一出口：委托 ArtifactJournal 两级降级深模块。"""
+    ArtifactJournal(ipc_dir).write_result_with_degradation(uid, payload, incarnation=incarnation)
 
 
 def _normalize_handler_result(result: Any) -> Tuple[bool, Dict[str, Any]]:
