@@ -94,19 +94,19 @@
 
 ---
 
-## 四、执行机器职责划分（9 模块）
+## 四、执行核心与深模块职责划分
 
 | 模块 | 职责定位 | 核心接口 / 概念 |
 |---|---|---|
-| `runtime.py` | 跨模块单向共享运行态容器 | `RunContext`, `EpisodeState`, `StopMode`, `TaskStats` |
-| `store.py` | 统一状态事务、3-strike 崩溃与死锁归因 | `StateStore.apply_failure`, `apply_success`, `handle_deadlock` |
-| `channel.py` | 子进程生命周期、阶梯看门狗、IPC 通道与产物清理 | `ExecutionChannel`, `JobHandle`, `write_result_atomic`, `probe_orphan_lock` |
+| `runtime.py` | 统一运行期深模块与共享运行态容器 | `EngineRuntime`, `RunContext`, `RuntimeConfig`, `StepOutcome`, `RunSummary`, `StopMode`, `TaskStats` |
+| `store.py` | 统一状态事务、3-strike 崩溃与死锁归因深模块 | `StateStore.apply_failure`, `apply_success`, `apply_retry`, `apply_skip`, `apply_bulk_failure`, `handle_deadlock` |
+| `channel.py` | 子进程生命周期、阶梯看门狗、IPC 通道与产物清理深模块 | `ExecutionChannel`, `JobHandle`, `write_result_atomic`, `probe_orphan_lock`, `abort_in_flight` |
 | `scheduler.py` | 队列只读扫描与不可变投影缓存 | `JobScheduler`, `JobFacts`, `ScheduleResult` |
 | `dispatch.py` | 派发五关预检与子进程 submit 编排 | `DispatchMachine.dispatch_job`, `dispatch_next` |
-| `loop.py` | 事件驱动主循环与异常承重网 | `LoopRunner.run_loop`, `run_loop_impl` |
+| `loop.py` | 事件驱动主循环与异常承重网 | `LoopRunner.run_loop`, `step`, `run_loop_impl` |
 | `completion.py`| 结果提交、清理、释放与恢复收尾 | `CompletionMachine.complete_job`, `apply_result` |
-| `recovery.py` | 崩溃恢复、TOCTOU 闭环 abort、信号排空 | `RecoveryMachine.abort_in_flight`, `save_queue_crash_safe` |
-| `resource.py` | 限速与容量资源抽象与挂起语义 | `Resource`, `RateLimitResource`, `CapacityResource` |
+| `recovery.py` | 崩溃恢复、TOCTOU 闭环 abort、信号排空 | `RecoveryOrchestrator`, `RecoveryMachine.abort_in_flight`, `save_queue_crash_safe` |
+| `resource.py` | 限速与容量资源抽象与挂起语义 | `Resource`, `RateLimitResource`, `CapacityResource`, `ResourceManager` |
 
 ---
 

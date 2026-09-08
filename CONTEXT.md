@@ -18,8 +18,12 @@ _Avoid_: PipelineEngine, Runner, Master, Coordinator
 The single-run mutable runtime container holding transient state (`PipelineState`, `in_flight`, stats, and episode tracking) across specialized engine machines.
 _Avoid_: Session, ExecutionScope, ContextBag
 
+**EngineRuntime**:
+The deep execution engine unifying the 4-phase event pump, step advances, dispatch preflights, result settlement, crash recoveries, and process isolation.
+_Avoid_: RunnerHelper, LoopExecutor, ExecutionService
+
 **PipelineState**:
-In-memory fast lookup container holding active collections (`queue`, `wall`, `failed`, `cursors`, and `in_flight`) with invariant consistency checks.
+In-memory fast lookup container holding active collections (`_queue`, `_wall`, `_failed`, `_cursors`, and `_in_flight`) with invariant consistency checks and encapsulated mutation interfaces.
 _Avoid_: StateHolder, Store, MemoryState
 
 **Wall**:
@@ -45,7 +49,7 @@ Specialized deep module unifying memory state machines, transactional backend pe
 _Avoid_: ErrorManager, DeadlockResolver, StateRepository
 
 **RecoveryMachine**:
-Specialized machine responsible for startup repairs, TOCTOU-safe aborting, and crash-safe queue persistence.
+Specialized machine responsible for startup repairs, TOCTOU-safe aborting, and crash-safe queue persistence (alias `RecoveryOrchestrator`).
 _Avoid_: RepairService, AbortHandler, Rescuer
 
 **InFlightJob**:
