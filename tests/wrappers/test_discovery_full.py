@@ -366,7 +366,7 @@ class TestMissingDetection:
 
 class TestDependencyGrace:
     def _init_state(self, p, queue):
-        p._state = PipelineState(
+        p._runtime.ctx.state = PipelineState(
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), queue,
         )

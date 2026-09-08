@@ -145,12 +145,12 @@ class TestRunStateGuards:
     def test_enqueue_during_run_rejected(self, tmp_path):
         from tasklite.models.job import Job
         p = make_pipeline(tmp_path)
-        p._run_started = True
+        p._runtime._is_running = True
         with pytest.raises(RuntimeError, match="enqueue"):
             p.enqueue(Job("t", "j1"))
     def test_management_apis_during_run_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p._run_started = True
+        p._runtime._is_running = True
         for api, call in [
             ("list_dlq", lambda: p.list_dlq()),
             ("clear_dlq", lambda: p.clear_dlq()),
@@ -164,8 +164,8 @@ class TestRunStateGuards:
         from tasklite.models.job import Job
         p = make_pipeline(tmp_path)
         # 模拟 run 完成：守卫标志被 finally 清除
-        p._run_started = True
-        p._run_started = False
+        p._runtime._is_running = True
+        p._runtime._is_running = False
         p.enqueue(Job("t", "j1"))  # 不应抛
 
 class TestRunLockGuard:

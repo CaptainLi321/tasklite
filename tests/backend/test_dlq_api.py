@@ -318,7 +318,7 @@ class TestBulkFailureThreeStrike:
     def _init_state(self, p):
         """初始化 _state（run() 内才做；单元测试直调 _commit_bulk_failed_crash 需要）。"""
         from tasklite.models.state import PipelineState
-        p._state = PipelineState(
+        p._runtime.ctx.state = PipelineState(
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), p.backend.load_queue(),
         )
@@ -383,7 +383,7 @@ class TestBulkFailureThreeStrike:
         with pytest.raises(_CommitCrashSignal):
             p.store.commit_failed_crash("t::a", "test", jd)
         # job 必须 requeue 到内存队列（不静默丢失），计数递增到 3
-        q = p._state.queue
+        q = p.state.queue
         assert len(q) == 1, f"job must be requeued after DLQ-also-fails, got {q}"
         assert q[0]["runtime"]["_commit_failures"] == 3
 

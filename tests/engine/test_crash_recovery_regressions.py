@@ -784,7 +784,7 @@ class TestDispatchExceptionEntryRegistered:
         **二次 requeue** → 内存队列出现两条 t::j1。磁盘断言被掩盖：
         ``_save_queue_crash_safe`` 以磁盘为基准、按 uid 把内存重复条目
         合并成一条 → 磁盘恒 1 条 → 变异体存活。
-        内存队列 ``pipeline._state.queue`` 无去重掩盖，直接暴露二次 requeue。"""
+        内存队列 ``pipeline.state.queue`` 无去重掩盖，直接暴露二次 requeue。"""
         from tasklite.models.state import PipelineState
         import pytest as pytest_mod
 
