@@ -218,6 +218,8 @@ class JobScheduler:
         集合。在 missing dependency 判定时，依赖正在运行的 job 不算 missing
         （待其完成 commit 到 wall 后自然解锁），避免并发模型下误判死锁。
         """
+        if not hasattr(state, "queue") and hasattr(state, "state"):
+            state = state.state
         q_data = state.queue
         wall_data = state.wall
         failed_data = state.failed

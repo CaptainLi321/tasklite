@@ -17,6 +17,7 @@ from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     from .runtime import RunContext
     from .completion import CompletionMachine
+    from .store import DispatchView
 
 from ..taxonomy import (
     ERR_DISPATCH_FAILURE as _ERR_DISPATCH_FAILURE,
@@ -155,7 +156,7 @@ class DispatchMachine:
             self._ctx.stats[count_as] += 1
             return
 
-    def dispatch_dedup(self, store, uid: str, job_dict: dict) -> bool:
+    def dispatch_dedup(self, store: DispatchView, uid: str, job_dict: dict) -> bool:
         """派发预检关 1——去重（is_known 命中 → rerun 策略 → skip/放行）。
 
         返回 True = 已处理（job 被 skip 或放行后本关终结）；返回 False
@@ -209,7 +210,7 @@ class DispatchMachine:
         return False
 
 
-    def dispatch_orphan_probe(self, store, uid: str, job_dict: dict) -> bool:
+    def dispatch_orphan_probe(self, store: DispatchView, uid: str, job_dict: dict) -> bool:
         """派发预检关 4——孤儿探测（probe 先于 restore）。
 
         主进程仅探测（非阻塞试锁）。锁被占 = 同 uid 孤儿 worker 仍持锁
