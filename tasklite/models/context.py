@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 from .job import Job
-from ..utils.ipc import ArtifactJournal, append_input, append_output, append_signal
+from ..utils.ipc import ArtifactJournal
 from ..utils.jsonutil import dumps
 
 logger = logging.getLogger("tasklite")
@@ -255,9 +255,6 @@ class TaskContext:
         if not math.isfinite(seconds) or seconds <= 0:
             raise ValueError(f"seconds must be finite and > 0, got {seconds!r}")
         self.resource_suspensions.append((resource_name, seconds))
-        if self.ipc_dir is not None:
-            try:
-                append_signal(self.ipc_dir, self.job.uid, resource_name, seconds)
-            except OSError:
-                pass  # 文件写失败静默丢弃，不影响 handler 执行
+        if self._journal is not None:
+            self._journal.record_signal(self.job.uid, resource_name, seconds)
         logger.info(f"Task requested global suspension of resource '{resource_name}' for {seconds}s.")
