@@ -5,13 +5,14 @@ retry/success/failure 三态事务提交；restore/cleanup/release 是崩溃恢�
 资源释放的共享助手。依赖经 RunContext 注入，经 ``self.store`` 复用
 状态与事务深模块（3-strike/级联），不反向引用 TaskLite。
 """
+from __future__ import annotations
 
 import logging
 import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .runtime import RunContext

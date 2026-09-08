@@ -6,6 +6,7 @@
 依赖经 RunContext 注入，经 recovery/dispatch/completion/failure 机器
 协同，不反向引用 TaskLite。
 """
+from __future__ import annotations
 
 import logging
 import time

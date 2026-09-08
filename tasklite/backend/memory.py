@@ -3,6 +3,7 @@
 实现 AbstractStateBackend 完整契约，提供零文件系统 IO 的纯内存状态存储。
 适用于瞬态管线、单元测试、沙盒执行与 CI 矩阵测试。
 """
+from __future__ import annotations
 
 import copy
 import logging

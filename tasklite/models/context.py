@@ -1,4 +1,5 @@
 """TaskContext for handler execution in tasklite."""
+from __future__ import annotations
 
 import logging
 import math

@@ -7,6 +7,7 @@
 4. 指数退避抖动时延与双时钟截止时间计算；
 5. 重试状态机规划（plan_retry / plan_orphan_defer）与 DLQ 归因装配。
 """
+from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum

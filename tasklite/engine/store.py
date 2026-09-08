@@ -602,9 +602,11 @@ class StateStore:
         """关联的死锁治理状态机深模块。"""
         return self._governor
 
-    def _extract_deadlock_uids(self, sched: Any, field_name: str, index_name: str) -> Set[str]:
+    def _extract_deadlock_uids(
+        self, sched: Any, field_name: str, *args: Any, **kwargs: Any
+    ) -> Set[str]:
         """统一提取归因 UID 集合（向后兼容委托给 governor）。"""
-        return self._governor._extract_deadlock_uids(sched, field_name, index_name, self._state)
+        return self._governor._extract_deadlock_uids(sched, field_name)
 
     @staticmethod
     def _split_deadlock_by_uids(

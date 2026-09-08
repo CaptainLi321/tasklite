@@ -1,9 +1,10 @@
 """在途作业与生命周期跟踪深模块（Deep Execution Lifecycle Module）。"""
+from __future__ import annotations
 
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from typing import (
-    Dict, Iterator, List, Mapping, Optional, Tuple, Union, TYPE_CHECKING
+    Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union, TYPE_CHECKING
 )
 
 if TYPE_CHECKING:

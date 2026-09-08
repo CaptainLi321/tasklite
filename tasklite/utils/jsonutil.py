@@ -15,6 +15,8 @@
 静态契约：tests 扫描源码断言本模块之外无裸 ``json.dumps``/``json.loads``
 （豁免：``models/state.py`` 的 hash 计算——非落盘/传输用途）。
 """
+from __future__ import annotations
+
 import json
 import math
 
