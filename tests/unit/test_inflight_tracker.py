@@ -59,12 +59,29 @@ class TestInFlightTrackerLifecycleAndStateSync:
         dispatched = tracker.dispatch(entry, state=state)
         assert dispatched is entry
         assert "t::j1" in tracker
+        assert "t::j1" in tracker.uids
         assert "t::j1" in state.in_flight_uids
 
         settled = tracker.settle("t::j1", state=state)
         assert settled is entry
         assert "t::j1" not in tracker
+        assert "t::j1" not in tracker.uids
         assert "t::j1" not in state.in_flight_uids
+
+    def test_single_source_of_truth_without_state_param(self):
+        """测试 InFlightTracker 自闭环作为在途状态单一真相源（无需显式透传 state）。"""
+        tracker = InFlightTracker()
+        job = Job("t", "j1", {})
+        entry = InFlightJob("t::j1", job.to_dict(), job, [], None, None)
+
+        tracker.track(entry)
+        assert tracker.uids == frozenset(["t::j1"])
+        assert "t::j1" in tracker
+
+        settled = tracker.settle("t::j1")
+        assert settled is entry
+        assert tracker.uids == frozenset()
+        assert "t::j1" not in tracker
 
 
 class TestInFlightTrackerHandlesAndPseudo:

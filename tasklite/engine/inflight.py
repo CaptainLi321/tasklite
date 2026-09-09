@@ -97,8 +97,25 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
     def pop(self, uid: str, default: Optional[InFlightJob] = None) -> Optional[InFlightJob]:
         return self._entries.pop(uid, default)
 
+    @property
+    def uids(self) -> FrozenSet[str]:
+        """当前在途作业 UID 集合的不可变快照（单一真相源）。"""
+        return frozenset(self._entries.keys())
+
     def clear(self) -> None:
         self._entries.clear()
+
+    def track(
+        self,
+        entry: InFlightJob,
+        *,
+        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
+    ) -> InFlightJob:
+        """登记在途作业条目（单一真相源入口）。"""
+        self._entries[entry.uid] = entry
+        if state is not None and hasattr(state, "register_in_flight"):
+            state.register_in_flight(entry.uid)
+        return entry
 
     def register(
         self,
@@ -106,10 +123,8 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         *,
         state: Optional[Union["PipelineState", "StateStore", Any]] = None,
     ) -> None:
-        """原子登记在途任务到内存与 PipelineState 索引。"""
-        self._entries[entry.uid] = entry
-        if state is not None:
-            state.register_in_flight(entry.uid)
+        """原子登记在途任务到内存与 PipelineState 索引（别名委托 track）。"""
+        self.track(entry, state=state)
 
     def dispatch(
         self,
@@ -117,8 +132,19 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         *,
         state: Optional[Union["PipelineState", "StateStore", Any]] = None,
     ) -> InFlightJob:
-        """语义化派发接缝：原子登记在途任务并同步内存状态。"""
-        self.register(entry, state=state)
+        """语义化派发接缝：原子登记在途任务并同步内存状态（别名委托 track）。"""
+        return self.track(entry, state=state)
+
+    def settle(
+        self,
+        uid: str,
+        *,
+        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
+    ) -> Optional[InFlightJob]:
+        """语义化结算接缝：注销在途任务并同步内存状态（单一真相源出口）。"""
+        entry = self._entries.pop(uid, None)
+        if state is not None and hasattr(state, "unregister_in_flight"):
+            state.unregister_in_flight(uid)
         return entry
 
     def unregister(
@@ -127,20 +153,8 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         *,
         state: Optional[Union["PipelineState", "StateStore", Any]] = None,
     ) -> Optional[InFlightJob]:
-        """注销在途任务。"""
-        entry = self._entries.pop(uid, None)
-        if state is not None:
-            state.unregister_in_flight(uid)
-        return entry
-
-    def settle(
-        self,
-        uid: str,
-        *,
-        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
-    ) -> Optional[InFlightJob]:
-        """语义化结算接缝：注销在途任务并同步内存状态。"""
-        return self.unregister(uid, state=state)
+        """注销在途任务（别名委托 settle）。"""
+        return self.settle(uid, state=state)
 
     def active_handles(self) -> List[JobHandle]:
         """收集所有活动的真实子进程句柄（排除 handle=None 的伪条目）。"""

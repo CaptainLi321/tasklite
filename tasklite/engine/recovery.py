@@ -225,7 +225,7 @@ class RecoveryOrchestrator:
         # 4. 未完成任务注销 in-flight 并 requeue 到队首
         job_dicts = [entry.job_dict for entry in cancelled_entries]
         for pentry in cancelled_entries:
-            self._ctx.store.unregister_in_flight(pentry.uid)
+            self._ctx.in_flight.settle(pentry.uid, state=self._ctx.store)
         self._ctx.store.requeue_jobs(job_dicts, front=True)
 
         # 5. 消费「已完成」entry 的结果（统一出口）
