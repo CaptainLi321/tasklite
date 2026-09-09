@@ -104,9 +104,9 @@
 | `inflight.py`| 在途任务生命周期跟踪与单一真相源深模块 | `InFlightTracker.track`, `settle`, `uids`, `active_handles`, `InFlightJob` |
 | `policy.py`  | 准入重跑矩阵与指数退避规划治理深模块 | `AdmissionPolicy.admit`, `evaluate`, `BackoffGovernor.plan_retry`, `ExecutionPolicy` |
 | `channel.py` | 子进程生命周期、阶梯看门狗、IPC 通道与产物清理深模块 | `ExecutionChannel`, `JobHandle`, `write_result_atomic`, `probe_orphan_lock`, `abort_in_flight` |
-| `scheduler.py` | 队列只读扫描与不可变投影缓存 | `JobScheduler`, `JobFacts`, `ScheduleResult` |
+| `scheduler.py` | 队列只读扫描与不可变投影缓存 | `JobScheduler`, `JobFacts`, `ScheduleResult` (`is_runnable`, `candidate_uid`), `DeadlockAttribution` |
 | `dispatch.py` | 派发五关预检与子进程 submit 编排 | `DispatchMachine.dispatch_job`, `dispatch_next` |
-| `completion.py`| 结果提交、清理、释放与恢复收尾 | `CompletionMachine.complete_job`, `apply_result` |
+| `completion.py`| 结果提交、清理、释放与恢复收尾 | `CompletionMachine.complete_job`, `settle_reaped`, `settle_aborted`, `apply_result` |
 | `recovery.py` | 崩溃恢复、TOCTOU 闭环 abort、信号排空 | `RecoveryOrchestrator`, `RecoveryMachine.abort_in_flight`, `save_queue_crash_safe` |
 | `resource.py` | 限速与容量资源抽象与挂起语义 | `Resource`, `RateLimitResource`, `CapacityResource`, `ResourceManager` |
 
