@@ -16,6 +16,16 @@ from ..taxonomy import validate_resource_amounts
 # 255 - 56 = 199：56 为最坏结果文件后缀 ``.{32-hex run_id}.{seq}.result.json``。
 _MAX_SAFE_UID_BYTES = 199
 
+WORKER_RESOURCE = "__workers__"
+
+
+def inject_worker_resource(job_dict: dict) -> None:
+    """给 job_dict 的 resources 注入默认 worker 槽位。"""
+    resources = dict(job_dict.get("resources", {}))
+    if WORKER_RESOURCE not in resources:
+        resources[WORKER_RESOURCE] = 1.0
+    job_dict["resources"] = resources
+
 
 @dataclass
 class JobRuntimeState:
