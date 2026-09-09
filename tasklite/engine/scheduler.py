@@ -92,6 +92,22 @@ class ScheduleResult:
     kind: str = "none"
     # 死锁归因值对象（UID 集合）
     attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
+    candidate_uid: Optional[str] = None
+
+    @property
+    def is_runnable(self) -> bool:
+        """是否选出了真正可运行的作业。"""
+        return self.kind == "runnable"
+
+    @property
+    def is_dep_failed(self) -> bool:
+        """是否选出了依赖已失败待拒绝的作业。"""
+        return self.kind == "dep_failed"
+
+    @property
+    def has_candidate(self) -> bool:
+        """是否存在选中的候选作业下标。"""
+        return self.runnable_idx is not None
 
     @property
     def unknown_resource_uids(self) -> Tuple[str, ...]:
@@ -345,6 +361,10 @@ class JobScheduler:
         else:
             kind = "none"
 
+        candidate_uid: Optional[str] = None
+        if runnable_idx is not None and runnable_idx < len(q_data):
+            candidate_uid = uid_from_job_dict(q_data[runnable_idx])
+
         return ScheduleResult(
             runnable_idx=runnable_idx,
             pending_dep_failure=pending_dep_failure,
@@ -353,4 +373,5 @@ class JobScheduler:
             has_potential_spawners=has_potential_spawners,
             kind=kind,
             attribution=attribution,
+            candidate_uid=candidate_uid,
         )
