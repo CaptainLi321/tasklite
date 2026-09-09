@@ -53,6 +53,32 @@ class TestPreflightEvaluationMatrix:
         assert dec_wall.should_skip
         assert dec_wall.reason == DecisionReason.WALL_BLOCKED
 
+    def test_admit_narrow_interface(self):
+        """测试 AdmissionPolicy.admit 统一极窄接口。"""
+        from types import SimpleNamespace
+        from tasklite.engine.policy import AdmissionPolicy
+
+        policy = AdmissionPolicy()
+        store_mock = SimpleNamespace(
+            wall={"t::wall_job": {}},
+            failed={"t::failed_job": {}},
+        )
+
+        # 1. 未命中历史 -> fresh -> run
+        d1 = policy.admit({"task_type": "t", "job_id": "new_job", "rerun": "never"}, store_mock)
+        assert d1.should_run
+        assert d1.reason == DecisionReason.FRESH
+
+        # 2. 命中 wall 且 never -> wall_blocked -> skip
+        d2 = policy.admit({"task_type": "t", "job_id": "wall_job", "rerun": "never"}, store_mock)
+        assert d2.should_skip
+        assert d2.reason == DecisionReason.WALL_BLOCKED
+
+        # 3. 命中 failed 且 on_failure -> on_failure_match -> run
+        d3 = policy.admit({"task_type": "t", "job_id": "failed_job", "rerun": "on_failure"}, store_mock)
+        assert d3.should_run
+        assert d3.reason == DecisionReason.ON_FAILURE_MATCH
+
 
 class TestInputChangeAndStatCache:
     def test_input_changed_detects_mtime_and_size(self, tmp_path):

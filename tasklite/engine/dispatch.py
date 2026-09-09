@@ -164,12 +164,7 @@ class DispatchMachine:
         rerun 策略豁免 every_run/on_failure 的 wall/failed 命中。
         """
         if store.is_known(uid):
-            decision = self._ctx.policy.evaluate(
-                job_dict,
-                wall_meta=store.wall.get(uid),
-                is_wall=(uid in store.wall),
-                is_failed=(uid in store.failed),
-            )
+            decision = self._ctx.policy.admit(job_dict, store)
             if decision.should_skip:
                 self._ctx.store.apply_skip(uid, job_dict)
                 self._ctx.stats["skipped"] += 1

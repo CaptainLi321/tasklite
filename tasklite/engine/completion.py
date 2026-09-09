@@ -189,17 +189,9 @@ class CompletionMachine:
                 if store.is_known(nj_uid):
                     if nj_uid in store.queue_uids or nj_uid in store.in_flight_uids:
                         continue
-                    wall_hit = nj_uid in store.wall
-                    failed_hit = nj_uid in store.failed
-                    if wall_hit or failed_hit:
-                        decision = self._ctx.policy.evaluate(
-                            nj.to_dict(),
-                            wall_meta=store.wall.get(nj_uid),
-                            is_wall=wall_hit,
-                            is_failed=failed_hit,
-                        )
-                        if decision.should_skip:
-                            continue
+                    decision = self._ctx.policy.admit(nj.to_dict(), store)
+                    if decision.should_skip:
+                        continue
                 seen_in_batch.add(nj_uid)
                 unique_new_jobs.append(nj)
 
