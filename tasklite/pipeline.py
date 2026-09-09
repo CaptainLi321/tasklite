@@ -442,11 +442,14 @@ class TaskLite:
         默认姿势；显式指定（含 "never"）一律尊重，不覆盖、不告警。
         """
         self._ensure_not_running("enqueue")
-        # 兼容单个 Job 与 list/tuple——与 add_resource/
-        # ctx.spawn 的单数语义对齐，避免“必须包一层 []”的非直觉用法。
         if isinstance(jobs, Job):
             jobs_list = [jobs]
         elif isinstance(jobs, (list, tuple)):
+            for j in jobs:
+                if not isinstance(j, Job):
+                    raise TypeError(
+                        f"enqueue() expects Job objects, got {type(j).__name__}"
+                    )
             jobs_list = list(jobs)
         else:
             raise TypeError(
@@ -456,40 +459,8 @@ class TaskLite:
         if not jobs_list:
             return
 
-        jobs_dicts = []
-        for j in jobs_list:
-            if not isinstance(j, Job):
-                raise TypeError(
-                    "enqueue() expects Job objects, "
-                    f"got {type(j).__name__}"
-                )
-            # 预检 payload JSON 可序列化，避免子进程 IPC 时崩溃。
-            # allow_nan=False 与 ctx.spawn 的 JSON 序列化预检对齐——默认
-            # allow_nan=True 会让 float('nan') 通过预检，产出非标准 JSON
-            # "Infinity"，下游 json.loads 反序列化出 NaN 污染计算。
-            try:
-                dumps(j.payload)
-            except (TypeError, ValueError) as e:
-                raise ValueError(
-                    f"Payload for job {j.uid} is not JSON-serializable: {e}"
-                ) from e
-            # enqueue 不合并 handler 默认 resources——合并会把注册时的
-            # 默认值烤进持久化 job_dict（handler 默认资源变更后磁盘留旧值）；
-            # 运行时由 scheduler 的 _effective_resources（扫描可见性）与
-            # _dispatch_job（acquire 实际值）两处合并。浅拷贝避免修改传入的 Job 对象。
-            job_dict = j.to_dict()
-            # discovery 默认 rerun 规范化（策略深模块；None=未指定
-            # 哨兵才注入，显式值含 "never" 一律尊重）
-            self._ctx.policy.normalize_job_dict(job_dict, j.task_type)
-            inject_worker_resource(job_dict)
-            jobs_dicts.append(job_dict)
-
-        if not jobs_dicts:
-            return
-
-        # 增量入队（后端在单事务内去重 + 插入），返回实际插入 uid
-        inserted = self.backend.enqueue_jobs(jobs_dicts, front=front)
-        skipped = len(jobs_dicts) - len(inserted)
+        inserted = self.store.enqueue_jobs(jobs_list, front=front)
+        skipped = len(jobs_list) - len(inserted)
         if skipped:
             logger.info(f"Enqueued {len(inserted)} job(s), skipped {skipped} duplicate(s).")
         elif inserted:

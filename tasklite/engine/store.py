@@ -13,9 +13,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Protocol, Sequence, Set, Tuple, Union
 
 from .governor import DeadlockGovernor
+from .policy import ExecutionPolicy
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
-from ..models.job import Job, JobRuntimeState
+from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, uid_from_job_dict
 from ..taxonomy import (
     ERR_COMMIT_FAILURE_DLQ,
@@ -23,6 +24,7 @@ from ..taxonomy import (
     ErrorTaxonomy,
     _DEFAULT_TAXONOMY,
 )
+from ..utils.jsonutil import dumps
 
 logger = logging.getLogger("tasklite")
 
@@ -241,6 +243,7 @@ class StateStore:
         ctx: Optional[Any] = None,
         governor: Optional[DeadlockGovernor] = None,
         stats: Optional[Any] = None,
+        policy: Optional[ExecutionPolicy] = None,
     ) -> None:
         self._backend = backend
         self._state = state or PipelineState({}, {}, {}, [])
@@ -250,6 +253,7 @@ class StateStore:
         self._ctx = ctx
         self._governor = governor or getattr(ctx, "governor", None) or DeadlockGovernor()
         self._stats = stats if stats is not None else (getattr(ctx, "stats", None) if ctx is not None else None)
+        self._policy = policy or getattr(ctx, "policy", None) or ExecutionPolicy()
 
     def _record_stat(self, key: str, amount: int = 1) -> None:
         """更新统计指标（单一真相源）。"""
@@ -266,6 +270,73 @@ class StateStore:
 
     def set_stats(self, stats: Any) -> None:
         self._stats = stats
+
+    def normalize_and_validate_job(self, job: Union[Job, Dict[str, Any]]) -> Dict[str, Any]:
+        """规范化并校验单个作业（JSON 可序列化预检、discovery 策略规范化、工人资源注入）。"""
+        if isinstance(job, Job):
+            try:
+                dumps(job.payload)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"Payload for job {job.uid} is not JSON-serializable: {e}"
+                ) from e
+            job_dict = job.to_dict()
+            task_type = job.task_type
+        elif isinstance(job, dict):
+            if "task_type" not in job or "job_id" not in job:
+                raise ValueError("Job dict must contain 'task_type' and 'job_id'")
+            payload = job.get("payload", {})
+            try:
+                dumps(payload)
+            except (TypeError, ValueError) as e:
+                uid = uid_from_job_dict(job)
+                raise ValueError(
+                    f"Payload for job {uid} is not JSON-serializable: {e}"
+                ) from e
+            job_dict = copy.deepcopy(job)
+            task_type = str(job_dict["task_type"])
+        else:
+            raise TypeError(
+                f"Expected Job or dict, got {type(job).__name__}"
+            )
+
+        self._policy.normalize_job_dict(job_dict, task_type)
+        inject_worker_resource(job_dict)
+        return job_dict
+
+    def enqueue_jobs(
+        self,
+        jobs: Union[Job, Sequence[Job], Dict[str, Any], Sequence[Dict[str, Any]]],
+        *,
+        front: bool = False,
+    ) -> List[str]:
+        """统一作业入队摄入管道（类型校验、序列化预检、策略规范化、资源注入、单事务原子插入）。
+
+        返回实际插入后端的作业 UID 列表（自动去重）。
+        """
+        if isinstance(jobs, (Job, dict)):
+            jobs_list = [jobs]
+        elif isinstance(jobs, (list, tuple)):
+            jobs_list = list(jobs)
+        else:
+            raise TypeError(
+                "enqueue_jobs() expects a Job or a list of Job objects/dicts, "
+                f"got {type(jobs).__name__}"
+            )
+
+        if not jobs_list:
+            return []
+
+        jobs_dicts: List[Dict[str, Any]] = []
+        for j in jobs_list:
+            jd = self.normalize_and_validate_job(j)
+            jobs_dicts.append(jd)
+
+        if not jobs_dicts:
+            return []
+
+        inserted = self._backend.enqueue_jobs(jobs_dicts, front=front)
+        return inserted
 
     def mark_failed(self, uid: str, meta: Dict[str, Any]) -> None:
         """统一失败登记：清 wall 旧记录 + mark_failed。"""

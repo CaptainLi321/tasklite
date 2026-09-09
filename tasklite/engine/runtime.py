@@ -32,14 +32,6 @@ EMPTY_STATS = {
 }
 
 
-def inject_worker_resource(job_dict: dict) -> None:
-    """给 job_dict 的 resources 注入默认 worker 槽位。"""
-    resources = dict(job_dict.get("resources", {}))
-    if WORKER_RESOURCE not in resources:
-        resources[WORKER_RESOURCE] = 1.0
-    job_dict["resources"] = resources
-
-
 class StopMode(enum.Enum):
     """停机状态机三态。"""
     NONE = "none"
@@ -113,7 +105,7 @@ from .scheduler import DeadlockAttribution, JobScheduler, ScheduleResult
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
-from ..models.job import Job, JobRuntimeState
+from ..models.job import Job, JobRuntimeState, WORKER_RESOURCE, inject_worker_resource
 from ..models.state import PipelineState, uid_from_job_dict
 from ..taxonomy import ErrorTaxonomy
 from ..utils.jsonutil import dumps, loads
@@ -251,6 +243,7 @@ class RunContext:
             ctx=self,
             governor=self.governor,
             stats=self._stats,
+            policy=self.policy,
         )
 
         self._in_flight: InFlightTracker = InFlightTracker()
