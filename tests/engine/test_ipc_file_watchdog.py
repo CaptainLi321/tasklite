@@ -18,9 +18,10 @@ from tasklite.models.job import Job
 
 from tests.helpers import make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes
 from tasklite.engine.channel import (
-    write_result_atomic, result_path, _normalize_handler_result,
+    _normalize_handler_result,
     _encode_raw_result,
 )
+from tasklite.utils.ipc import ArtifactJournal
 
 
 def _hang_handler(job, ctx):
@@ -153,7 +154,8 @@ class TestStaleResultRestore:
         p.enqueue([Job("h", "a")])
         # 模拟上次崩溃：残留 success 结果文件（job 已执行完成但未 commit）
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(p.ipc_dir, "h::a", {
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.write_result_atomic("h::a", {
             "status": "success",
             "raw_result": True,
             "new_jobs": [],
@@ -167,7 +169,7 @@ class TestStaleResultRestore:
 
         assert handler_calls == [], "stale 结果已消费，handler 不应再执行"
         assert "h::a" in p.backend.load_wall()
-        assert not result_path(p.ipc_dir, "h::a", inc).exists(), "残留文件消费后应删除"
+        assert not journal.result_path("h::a", inc).exists(), "残留文件消费后应删除"
 
     def test_stale_retry_increments_retries(self, tmp_path, monkeypatch):
         """残留 retry 结果 → job 重试计数 +1 重入队，退避后重新执行成功。"""
@@ -176,8 +178,9 @@ class TestStaleResultRestore:
 
         p.enqueue([Job("h", "a")])
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(
-            p.ipc_dir, "h::a", {"status": "retry", "error": "stale-retry"},
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.write_result_atomic(
+            "h::a", {"status": "retry", "error": "stale-retry"},
             incarnation=inc,
         )
 
@@ -190,7 +193,7 @@ class TestStaleResultRestore:
             f"stale retry 应被消费并计入重试: {p.stats}"
         assert "h::a" in p.backend.load_wall(), "重试后应成功进 wall"
         assert "h::a" not in p.backend.load_failed()
-        assert not result_path(p.ipc_dir, "h::a", inc).exists(), "残留文件消费后应删除"
+        assert not journal.result_path("h::a", inc).exists(), "残留文件消费后应删除"
 
     def test_stale_fatal_goes_to_dlq(self, tmp_path, monkeypatch):
         """残留 fatal 结果 → job 直接进 DLQ，不启动子进程。"""
@@ -200,7 +203,8 @@ class TestStaleResultRestore:
 
         p.enqueue([Job("h", "a")])
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(p.ipc_dir, "h::a", {
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.write_result_atomic("h::a", {
             "status": "fatal", "error": "TypeError: stale bug", "traceback": "tb",
         }, incarnation=inc)
 
@@ -220,7 +224,8 @@ class TestStaleResultRestore:
 
         p.enqueue([Job("h", "a")])
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(p.ipc_dir, "h::a", {
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.write_result_atomic("h::a", {
             "status": "error", "error": "boom", "traceback": "tb",
         }, incarnation=inc)
 
@@ -240,7 +245,8 @@ class TestStaleResultRestore:
         p.enqueue([Job("h", "a")])
         # 非标准结果文件：有内容但缺 status 键
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(p.ipc_dir, "h::a", {"not": "a result"}, incarnation=inc)
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.write_result_atomic("h::a", {"not": "a result"}, incarnation=inc)
 
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
@@ -249,7 +255,7 @@ class TestStaleResultRestore:
         # 损坏残留被丢弃（日志含 "Discarding stale result file"），job 正常执行进 wall
         assert "h::a" in p.backend.load_wall(), "损坏残留应丢弃，job 应正常执行进 wall"
         assert p.stats["completed"] == 1
-        assert not result_path(p.ipc_dir, "h::a", inc).exists(), "损坏残留文件应被清理"
+        assert not journal.result_path("h::a", inc).exists(), "损坏残留文件应被清理"
 
     def test_stale_success_missing_raw_result_does_not_crash(self, tmp_path, monkeypatch):
         """success 状态但缺 raw_result 键的残留文件不得崩掉整个 run。
@@ -262,7 +268,8 @@ class TestStaleResultRestore:
         p.enqueue([Job("h", "a")])
         # status=success 但缺 raw_result（模拟损坏/旧版本残留）
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(p.ipc_dir, "h::a", {"status": "success"}, incarnation=inc)
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.write_result_atomic("h::a", {"status": "success"}, incarnation=inc)
 
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
@@ -297,13 +304,11 @@ class TestSignalsFileTruncateSemantics:
         重复消费）。注意 open 必须是 "r+"——只读模式 truncate 抛
         io.UnsupportedOperation（OSError 子类）会被静默吞掉沦为死代码。
         """
-        from tasklite.engine.channel import append_signal, read_signals
+        journal = ArtifactJournal(tmp_path)
+        journal.record_signal("t::x", "api", 30.0)
+        journal.record_signal("t::x", "db", 60.0)
 
-        append_signal(str(tmp_path), "t::x", "api", 30.0)
-        append_signal(str(tmp_path), "t::x", "db", 60.0)
-
-        from tasklite.engine.channel import signals_path
-        leftover = signals_path(str(tmp_path), "t::x")
+        leftover = journal.signals_path("t::x")
 
         real_unlink_ref = leftover # noqa: F841（可读性：被测文件即下方断言对象）
 
@@ -311,13 +316,13 @@ class TestSignalsFileTruncateSemantics:
             raise OSError("permission denied (simulated)")
 
         monkeypatch.setattr(Path, "unlink", refusing_unlink)
-        got = read_signals(str(tmp_path), "t::x")
+        got = journal.drain_signals("t::x")
         assert ("api", 30.0) in got and ("db", 60.0) in got
         assert leftover.stat().st_size == 0, (
-            f"截空失败，size={leftover.stat.st_size}——truncate 死代码复发"
+            f"截空失败，size={leftover.stat().st_size}——truncate 死代码复发"
         )
  # 截空后二次读取为空（不重复消费）
-        assert read_signals(str(tmp_path), "t::x") == []
+        assert journal.drain_signals("t::x") == []
 
     def test_drain_stale_prefers_latest_incarnation_same_instant(
         self, tmp_path, monkeypatch,
@@ -329,17 +334,16 @@ class TestSignalsFileTruncateSemantics:
         """
         import os
 
-        from tasklite.engine.channel import (
-            ExecutionChannel, write_result_atomic,
-        )
+        from tasklite.engine.channel import ExecutionChannel
 
         run_id = "a" * 32
+        journal = ArtifactJournal(tmp_path)
  # worker 正常路径写的是 _encode_raw_result 编码后的 raw_result
-        write_result_atomic(str(tmp_path), "t::x",
+        journal.write_result_atomic("t::x",
                             {"status": "success",
                              "raw_result": _encode_raw_result((True, {"v": 1}))},
                             incarnation=f"{run_id}.1")
-        write_result_atomic(str(tmp_path), "t::x",
+        journal.write_result_atomic("t::x",
                             {"status": "success",
                              "raw_result": _encode_raw_result((True, {"v": 2}))},
                             incarnation=f"{run_id}.2")

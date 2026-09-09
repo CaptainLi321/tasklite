@@ -6,15 +6,6 @@ import pytest
 from tasklite.utils.ipc import (
     ArtifactCleanupMode,
     ArtifactJournal,
-    append_input,
-    append_output,
-    append_signal,
-    inputs_path,
-    outputs_path,
-    read_inputs,
-    read_outputs,
-    read_signals,
-    signals_path,
 )
 
 

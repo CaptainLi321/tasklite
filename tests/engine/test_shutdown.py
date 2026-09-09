@@ -13,6 +13,7 @@ import time
 
 from tasklite.pipeline import TaskLite
 from tasklite.models.job import Job
+from tasklite.utils.ipc import ArtifactJournal
 from tests.helpers import make_ipc_process_class, patch_multiprocessing_for_fakes
 
 # ══════════════════════════════════════════════════════════════════════
@@ -227,9 +228,8 @@ class TestForceAbort:
             # 模拟 handler 副作用：把输出声明写入落盘 outputs.jsonl
             # （后真实 handler 的 declare_output 即落盘；FakeProcess
             # 不执行 handler，此处直接写文件模拟）。
-            from tasklite.engine.channel import append_output
             for entry in pipeline._runtime.ctx.in_flight.values():
-                append_output(pipeline.ipc_dir, entry.uid, str(partial), True)
+                ArtifactJournal(pipeline.ipc_dir).record_output(entry.uid, str(partial), True)
                 injected["done"] = True
             pipeline.stop(force=True)
 
@@ -315,15 +315,15 @@ class TestAbortConsumesCompletedResult:
 
     def _inject_completed_result(self, pipeline, out_file):
         """模拟 handler 已完成：物理输出 + 声明 + 当前 incarnation 成功结果落盘。"""
-        from tasklite.engine.channel import write_result_atomic, append_output, result_path
+        journal = ArtifactJournal(pipeline.ipc_dir)
         entry = next(iter(pipeline._runtime.ctx.in_flight.values()))
         out_file.write_text("done")
-        append_output(pipeline.ipc_dir, entry.uid, str(out_file), True)
-        write_result_atomic(pipeline.ipc_dir, entry.uid, {
+        journal.record_output(entry.uid, str(out_file), True)
+        journal.write_result_atomic(entry.uid, {
             "status": "success", "raw_result": True,
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
         }, incarnation=entry.handle.incarnation)
-        return result_path(pipeline.ipc_dir, entry.uid, entry.handle.incarnation).exists()
+        return journal.result_path(entry.uid, entry.handle.incarnation).exists()
 
     def test_force_abort_consumes_completed_result(self, tmp_path, monkeypatch):
         """ABORTING：job 完成（结果+输出存在）后、drain 前 stop(force=True)。
@@ -383,9 +383,7 @@ class TestAbortConsumesCompletedResult:
         （结果文件 + 声明 + 物理输出均已落盘、entry 已注册），直接触发
         _abort_in_flight。修复前：kill + 删结果文件 + 删成功输出 + requeue。
         """
-        from tasklite.engine.channel import (
-            JobHandle, write_result_atomic, append_output,
-        )
+        from tasklite.engine.channel import JobHandle
         from tasklite.models.state import PipelineState
         from tasklite.pipeline import _InFlightJob
 
@@ -403,8 +401,9 @@ class TestAbortConsumesCompletedResult:
         out_file = tmp_path / "out" / "result.txt"
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text("done")
-        append_output(pipeline.ipc_dir, "fast::j1", str(out_file), True)
-        write_result_atomic(pipeline.ipc_dir, "fast::j1", {
+        journal = ArtifactJournal(pipeline.ipc_dir)
+        journal.record_output("fast::j1", str(out_file), True)
+        journal.write_result_atomic("fast::j1", {
             "status": "success", "raw_result": True,
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
         }, incarnation=inc)
@@ -468,9 +467,7 @@ class TestAbortTOCTOU:
         join/kill 回调里写入）。变异体（删 kill 后重查逻辑）下：结果被删 +
         成功输出被清 + requeue → 本断言失败。
         """
-        from tasklite.engine.channel import (
-            JobHandle, write_result_atomic, append_output, result_path,
-        )
+        from tasklite.engine.channel import JobHandle
         from tasklite.models.state import PipelineState
         from tasklite.pipeline import _InFlightJob
 
@@ -488,10 +485,11 @@ class TestAbortTOCTOU:
         out_file = tmp_path / "out" / "result.txt"
         out_file.parent.mkdir(parents=True, exist_ok=True)
 
+        journal = ArtifactJournal(pipeline.ipc_dir)
         # 前置：输出已物理写完（handler 已完成产出），但结果文件**尚未**落盘
         # （worker 还在 write_result_atomic 之前）。声明也先落盘——模拟
         # handler 已执行完毕、只差结果写入的最后一步。
-        append_output(pipeline.ipc_dir, "fast::j1", str(out_file), True)
+        journal.record_output("fast::j1", str(out_file), True)
 
         # 进程桩：kill/join 时（finalize_processes 收割窗口）才完成结果写入——
         # 精确复现「分类读到无结果 → kill 窗口内结果出现」的 TOCTOU。
@@ -508,7 +506,7 @@ class TestAbortTOCTOU:
             def join(self, timeout=None):
                 # 模拟 worker 在收割窗口内完成 write_result_atomic
                 out_file.write_text("done")
-                write_result_atomic(pipeline.ipc_dir, "fast::j1", {
+                journal.write_result_atomic("fast::j1", {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
                 }, incarnation=inc)
@@ -531,7 +529,7 @@ class TestAbortTOCTOU:
 
         # 前置断言：分类时（_abort_in_flight 内）结果文件尚不存在——
         # 保证入口确实走「pending → finalize → 重查」路径而非「直接 done」。
-        assert not result_path(pipeline.ipc_dir, "fast::j1", inc).exists(), \
+        assert not journal.result_path("fast::j1", inc).exists(), \
             "前置：结果文件必须在 abort 前不存在（TOCTOU 触发条件）"
 
         pipeline._runtime._recovery.abort_in_flight()
@@ -551,9 +549,7 @@ class TestAbortTOCTOU:
 
         requeue 前先 unregister pending，全程保持活动集合互斥。
         """
-        from tasklite.engine.channel import (
-            JobHandle, write_result_atomic,
-        )
+        from tasklite.engine.channel import JobHandle
         from tasklite.models.state import PipelineState
         from tasklite.pipeline import _InFlightJob
 
@@ -569,7 +565,7 @@ class TestAbortTOCTOU:
         job_done = Job("a", "done", payload={})
         done_dict = job_done.to_dict()
         inc_done = "d0000000000000000000000000000000.1"
-        write_result_atomic(pipeline.ipc_dir, "a::done", {
+        ArtifactJournal(pipeline.ipc_dir).write_result_atomic("a::done", {
             "status": "success", "raw_result": True,
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
         }, incarnation=inc_done)
@@ -643,9 +639,7 @@ class TestAbortTOCTOU:
         _persist_resource_suspends 持久化。
         """
         import time as time_mod
-        from tasklite.engine.channel import (
-            JobHandle, append_signal,
-        )
+        from tasklite.engine.channel import JobHandle
         from tasklite.engine.resource import CapacityResource
         from tasklite.models.state import PipelineState
         from tasklite.pipeline import _InFlightJob
@@ -683,7 +677,7 @@ class TestAbortTOCTOU:
         state.register_in_flight("x::j1")
 
         # handler 落盘的 suspend 信号（写文件、flush）
-        append_signal(pipeline.ipc_dir, "x::j1", "api", 60.0)
+        ArtifactJournal(pipeline.ipc_dir).record_signal("x::j1", "api", 60.0)
 
         now = time_mod.monotonic()
         pipeline._runtime._recovery.abort_in_flight()
