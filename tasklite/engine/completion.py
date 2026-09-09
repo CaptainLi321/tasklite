@@ -22,7 +22,7 @@ from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 from ..exceptions import _JobTerminated
 from ..models.job import Job
 from .channel import ArtifactCleanupMode, ExecutionResult
-from .inflight import InFlightJob
+from .inflight import InFlightJob, InFlightTracker
 from .runtime import inject_worker_resource
 
 
@@ -235,6 +235,66 @@ class CompletionMachine:
 
 
 
+    def settle_reaped(
+        self, reaped: Sequence[Tuple[JobHandle, ExecutionResult]]
+    ) -> int:
+        """统一结算从执行通道收割的已完成作业列表。
+
+        为每个已完成作业原子执行：
+        1. 提取 in-flight 条目；
+        2. complete_job 事务提交、释放资源租约、清理产物、触发完成钩子；
+        3. 确保在 finally 中从 InFlightTracker 与 StateStore 中注销；
+        返回成功结算的作业数。
+        """
+        store = self._ctx.store
+        completed_count = 0
+        for handle, result in reaped:
+            entry = self._ctx.in_flight.get(handle.uid)
+            if entry is None:
+                continue
+            try:
+                self.complete_job(entry, result)
+                completed_count += 1
+            finally:
+                self._ctx.in_flight.settle(handle.uid, state=store)
+        return completed_count
+
+    def settle_aborted(
+        self,
+        cancelled_entries: Sequence[InFlightJob],
+        done_entries: Sequence[Tuple[InFlightJob, ExecutionResult]],
+    ) -> None:
+        """统一结算异常或停机时分类的在途作业。
+
+        1. 未完成任务：注销 in-flight 并回滚 requeue 到队首；
+        2. 已完成任务：通过 complete_job 事务提交（不重跑、不误杀）；
+        3. 彻底清空在途集合并透传可能的 commit 崩溃信号。
+        """
+        store = self._ctx.store
+        # 1. 未完成任务注销并重入队
+        for pentry in cancelled_entries:
+            self._ctx.in_flight.settle(pentry.uid, state=store)
+        job_dicts = [entry.job_dict for entry in cancelled_entries]
+        if job_dicts:
+            store.requeue_jobs(job_dicts, front=True)
+
+        # 2. 已完成任务提交
+        commit_crash: Optional[BaseException] = None
+        for entry, result in done_entries:
+            try:
+                self.complete_job(entry, result)
+            except _JobTerminated:
+                pass
+            except _CommitCrashSignal as e:
+                commit_crash = e
+            finally:
+                self._ctx.in_flight.settle(entry.uid, state=store)
+
+        self._ctx.in_flight.clear()
+        store.clear_in_flight()
+        if commit_crash is not None:
+            raise commit_crash
+
     def restore_stale_result(self, uid: str, job: Job, job_dict: dict) -> bool:
         """崩溃恢复：派发子进程前消费该 uid 的残留结果文件。
 
@@ -251,20 +311,10 @@ class CompletionMachine:
         if result is None:
             return False
         logger.info(f"RESTORE: {uid} (stale result from previous run, no subprocess)")
-        # （单一出口）：构造伪 entry 走 _complete_job 同一条路径
+        # （单一出口）：构造安全伪 entry 走 _complete_job 同一条路径
         # （acquired=[] 无资源、handle=None 无进程），复用完整的收尾契约：
-        # 失败输出清理（_cleanup_outputs）、IPC 文件清理（cleanup_ipc_files）、
-        # 身份注销。
-        # expect_in_flight=False：uid 从未注册 in-flight（restore 在派发前），
-        # _apply_result 内的 unregister 对未注册 uid 是 no-op，断言跳过。
-        entry = InFlightJob(
-            uid=uid,
-            job_dict=job_dict,
-            job=job,
-            acquired=[],
-            handle=None,
-            job_start=None,
-        )
+        # 失败输出清理、IPC 文件清理、身份注销。
+        entry = InFlightTracker.create_pseudo_entry(uid, job_dict, job)
         try:
             self.complete_job(entry, result)
         except _JobTerminated:
