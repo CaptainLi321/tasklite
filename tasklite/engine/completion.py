@@ -146,24 +146,22 @@ class CompletionMachine:
         plan = self._ctx.policy.plan_retry(job, job_dict, result)
         if not plan.going_to_retry:
             logger.error(f"FAIL: {uid} exceeded max retries ({job.max_retries}). Sent to DLQ.")
-            outcome = self._ctx.store.apply_failure(
+            self._ctx.store.apply_failure(
                 uid, plan.fail_meta or {"error": _ERR_MAX_RETRIES}, job_dict=job_dict, cascade=True
             )
-            self._ctx.stats["failed"] += 1
-            if outcome.cascaded_uids:
-                self._ctx.stats["cascade_failed"] += len(outcome.cascaded_uids)
             result.going_to_retry = False
             return
 
-        if plan.is_interrupted:
-            self._ctx.stats["interrupted_reruns"] += 1
-        elif plan.is_lock_conflict:
-            self._ctx.stats["deferred_orphan"] += 1
-
         logger.info(f"RETRY: {uid} (attempt {job.retries}/{job.max_retries}, backoff {plan.delay:.1f}s)")
         assert plan.retry_dict is not None
-        self._ctx.store.apply_retry(uid, job_dict, plan.retry_dict, front=False)
-        self._ctx.stats["retried"] += 1
+        self._ctx.store.apply_retry(
+            uid,
+            job_dict,
+            plan.retry_dict,
+            front=False,
+            is_interrupted=plan.is_interrupted,
+            is_lock_conflict=plan.is_lock_conflict,
+        )
         result.going_to_retry = True
 
     def _apply_success(
@@ -215,7 +213,6 @@ class CompletionMachine:
             run_id=self._ctx.run_id,
             job_dict=job_dict,
         )
-        self._ctx.stats["completed"] += 1
         result.going_to_retry = False
 
     def _apply_failure(
@@ -225,12 +222,9 @@ class CompletionMachine:
         """处理永久失败分支：写入 DLQ 与级联阻断下游。"""
         duration = (time.monotonic() - job_start) if job_start is not None else 0.0
         logger.error(f"FAIL: {uid} (duration {duration:.2f}s, Sent to DLQ). Meta: {result.result_meta}")
-        outcome = self._ctx.store.apply_failure(
+        self._ctx.store.apply_failure(
             uid, result.result_meta, job_dict=job_dict, cascade=True
         )
-        self._ctx.stats["failed"] += 1
-        if outcome.cascaded_uids:
-            self._ctx.stats["cascade_failed"] += len(outcome.cascaded_uids)
         result.going_to_retry = False
 
 

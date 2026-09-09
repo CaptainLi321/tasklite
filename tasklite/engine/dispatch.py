@@ -147,13 +147,9 @@ class DispatchMachine:
             outcome = self._ctx.store.apply_failure(
                 uid, meta, job_dict=job_dict, count_as=count_as, cascade=True
             )
-            self._ctx.stats[count_as] += 1
-            if outcome.cascaded_uids:
-                self._ctx.stats["cascade_failed"] += len(outcome.cascaded_uids)
             self._ctx.fire_job_completed(uid, outcome.error_meta, False, False)
         except _JobTerminated:
-            # 3-strike DLQ 成功——job 已终结，统计递增后正常返回即可
-            self._ctx.stats[count_as] += 1
+            # 3-strike DLQ 成功——job 已终结（StateStore 内部已计入指标）
             return
 
     def dispatch_dedup(self, store: DispatchView, uid: str, job_dict: dict) -> bool:
@@ -167,7 +163,6 @@ class DispatchMachine:
             decision = self._ctx.policy.admit(job_dict, store)
             if decision.should_skip:
                 self._ctx.store.apply_skip(uid, job_dict)
-                self._ctx.stats["skipped"] += 1
                 return True
         return False
 
@@ -226,7 +221,7 @@ class DispatchMachine:
                 f"Deferring {uid}: orphan execution body still holds lock; "
                 f"requeue with short backoff."
             )
-            self._ctx.stats["deferred_orphan"] += 1
+            self._ctx.store.record_stat("deferred_orphan", 1)
             self._ctx.policy.plan_orphan_defer(job_dict)
             store.requeue_jobs([job_dict], front=True)
             return True
