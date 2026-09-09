@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 from ..models.job import Job
 from .channel import JobHandle
+from .resource import NullResourceLease, ResourceLease
 
 
 @dataclass
@@ -37,7 +38,10 @@ class InFlightJob:
     lease: Optional["ResourceLease"] = None
 
     def __post_init__(self) -> None:
-        if self.lease is not None and not self.acquired:
+        if self.lease is None:
+            if not self.acquired:
+                self.lease = NullResourceLease(job_uid=self.uid)
+        elif not self.acquired:
             self.acquired = list(self.lease.acquired)
 
     @property
@@ -191,7 +195,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
             acquired=[],
             handle=None,
             job_start=None,
-            lease=None,
+            lease=NullResourceLease(job_uid=uid),
         )
 
 

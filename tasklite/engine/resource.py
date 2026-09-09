@@ -5,7 +5,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from collections.abc import MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any, Dict, Iterable, Iterator, List, Mapping, Optional,
     Tuple, Union
@@ -319,6 +319,26 @@ class ResourceLease:
             self.release()
 
 
+@dataclass
+class NullResourceLease(ResourceLease):
+    """空资源租约（用于伪条目或无资源占用的作业，所有生命周期操作均为 no-op）。"""
+
+    manager: Any = None
+    job_uid: str = ""
+    acquired: List[Tuple[str, float]] = field(default_factory=list)
+    rate_limits: List[Tuple[str, float]] = field(default_factory=list)
+    status: LeaseStatus = LeaseStatus.RELEASED
+
+    def claim(self) -> None:
+        pass
+
+    def release(self) -> None:
+        pass
+
+    def cancel(self) -> None:
+        pass
+
+
 class ResourceManager(MutableMapping[str, Resource]):
     """统一资源管理器深模块。
 
@@ -575,6 +595,7 @@ __all__ = [
     "ResourceManager",
     "LeaseStatus",
     "ResourceLease",
+    "NullResourceLease",
     "WORKER_RESOURCE",
 ]
 
