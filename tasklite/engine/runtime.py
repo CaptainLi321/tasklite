@@ -651,9 +651,6 @@ class EngineRuntime:
                 decision = self._ctx.governor.arbitrate(
                     last_outcome,
                     store=self._ctx.store,
-                    state=self._ctx.state,
-                    scheduler=self._ctx.scheduler,
-                    ctx=self._ctx,
                 )
                 if decision.action == "resolved":
                     deadlock_detected = True
