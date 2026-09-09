@@ -99,7 +99,10 @@
 | 模块 | 职责定位 | 核心接口 / 概念 |
 |---|---|---|
 | `runtime.py` | 统一运行期深模块、主循环事件泵与共享运行态容器 | `EngineRuntime.execute`, `step`, `run_loop_impl`, `RunContext`, `RuntimeConfig`, `StepOutcome`, `RunSummary`, `StopMode`, `TaskStats` |
-| `store.py` | 统一状态事务、3-strike 崩溃与死锁归因深模块 | `StateStore.apply_failure`, `apply_success`, `apply_retry`, `apply_skip`, `apply_bulk_failure`, `handle_deadlock` |
+| `store.py` | 统一状态事务、3-strike 崩溃与单出口持久化深模块 | `StateStore.apply_failure`, `apply_success`, `apply_retry`, `apply_skip`, `apply_bulk_failure` |
+| `governor.py`| 死锁归因、依赖宽限与缺口升级治理深模块 | `DeadlockGovernor.arbitrate`, `resolve_deadlock`, `check_dependency_grace`, `DeadlockDecision` |
+| `inflight.py`| 在途任务生命周期跟踪与单一真相源深模块 | `InFlightTracker.track`, `settle`, `uids`, `active_handles`, `InFlightJob` |
+| `policy.py`  | 准入重跑矩阵与指数退避规划治理深模块 | `AdmissionPolicy.admit`, `evaluate`, `BackoffGovernor.plan_retry`, `ExecutionPolicy` |
 | `channel.py` | 子进程生命周期、阶梯看门狗、IPC 通道与产物清理深模块 | `ExecutionChannel`, `JobHandle`, `write_result_atomic`, `probe_orphan_lock`, `abort_in_flight` |
 | `scheduler.py` | 队列只读扫描与不可变投影缓存 | `JobScheduler`, `JobFacts`, `ScheduleResult` |
 | `dispatch.py` | 派发五关预检与子进程 submit 编排 | `DispatchMachine.dispatch_job`, `dispatch_next` |
