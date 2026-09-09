@@ -33,8 +33,7 @@ def test_deadlock_governor_gap_escalation():
     assert gov.deadlock_gap_rounds == 3
 
 
-def test_deadlock_governor_grace_period(monkeypatch):
-    monkeypatch.setattr("time.sleep", lambda s: None)
+def test_deadlock_governor_grace_period():
     gov = DeadlockGovernor(dep_grace_seconds=5.0)
     # job a depends on missing b, but job c has no missing dependencies
     state = PipelineState(
@@ -59,9 +58,8 @@ def test_deadlock_governor_grace_period(monkeypatch):
     assert gov.check_dependency_grace(state, ["t::b"], now=106.0) is False
 
 
-def test_deadlock_governor_spawner_fast_path(monkeypatch):
+def test_deadlock_governor_spawner_fast_path():
     """验证提供 has_potential_spawners 时直接依据单趟事实裁决，零扫描 state.queue。"""
-    monkeypatch.setattr("time.sleep", lambda s: None)
     gov = DeadlockGovernor(dep_grace_seconds=5.0)
     # 构造空队列或不含可运行 job 的 state
     state = PipelineState(wall={}, failed={}, cursors={}, queue=[])
@@ -79,4 +77,23 @@ def test_deadlock_governor_spawner_fast_path(monkeypatch):
 
     # 4. 超时返回 False
     assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=106.0) is False
+
+
+def test_deadlock_decision_structure():
+    """DeadlockDecision 纯值对象属性与布尔兼容性验证。"""
+    from tasklite.engine.governor import DeadlockDecision
+
+    d1 = DeadlockDecision(action="grace_waiting", should_terminate=False, wait_time=0.5)
+    assert not d1
+    assert d1.action == "grace_waiting"
+    assert d1.wait_time == 0.5
+    assert d1.failed_uids == []
+
+    d2 = DeadlockDecision(
+        action="resolved", should_terminate=True, wait_time=0.0, failed_uids=["t::a"]
+    )
+    assert d2
+    assert d2.action == "resolved"
+    assert d2.should_terminate is True
+    assert d2.failed_uids == ["t::a"]
 

@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Op
 from .governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
+    DeadlockDecision,
     DeadlockGovernor,
 )
 from ..backend.base import AbstractStateBackend
@@ -63,6 +64,7 @@ __all__ = [
     "DEADLOCK_GAP_MAX_ROUNDS",
     "DEP_GRACE_SECONDS",
     "DLQEntry",
+    "DeadlockDecision",
     "DeadlockGovernor",
     "DispatchView",
     "FailureOutcome",
@@ -800,7 +802,7 @@ class StateStore:
         scheduler: Optional[Any] = None,
         dep_grace_seconds: float = DEP_GRACE_SECONDS,
         deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS,
-    ) -> bool:
+    ) -> DeadlockDecision:
         """处理死锁：细粒度归因 + bulk_failure + cascade（委托 DeadlockGovernor）。"""
         gov = getattr(ctx, "governor", None) or self._governor
         effective_scheduler = scheduler or (getattr(ctx, "scheduler", None) if ctx is not None else getattr(self._ctx, "scheduler", None))

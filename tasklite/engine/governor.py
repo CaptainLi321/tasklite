@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union, TYPE_CHECKING
 )
@@ -35,6 +35,28 @@ logger = logging.getLogger("tasklite")
 
 DEP_GRACE_SECONDS = 60.0
 DEADLOCK_GAP_MAX_ROUNDS = 5
+
+
+@dataclass(frozen=True)
+class DeadlockDecision:
+    """死锁治理裁决结果（纯值对象，无阻塞副作用）。
+
+    - action: "resolved" (已归因并移入 DLQ) | "grace_waiting" (正在依赖宽限期中) | "gap_retrying" (分类缺口重试中) | "none" (未检测到死锁)
+    - should_terminate: bool (是否应终止主循环，如全队列 DLQ 完毕且队列清空)
+    - wait_time: float (建议外层事件泵等待的时延秒数，如宽限或重试时为 0.5s，否则为 0.0s)
+    - failed_uids: List[str] (本轮判定失败的 UID 列表)
+    - cascaded_uids: List[str] (本轮级联失败的 UID 列表)
+    """
+
+    action: str
+    should_terminate: bool
+    wait_time: float = 0.0
+    failed_uids: List[str] = field(default_factory=list)
+    cascaded_uids: List[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        """保持向后兼容布尔求值 (bool(decision) == should_terminate)。"""
+        return self.should_terminate
 
 
 @dataclass
@@ -66,6 +88,7 @@ class DeadlockGovernor:
         """评估缺失依赖的作业是否应授予宽限期（等待潜在 spawner 产出而非立即 DLQ）。
 
         返回 True 表示正在宽限中（主循环应继续等待）；False 表示无候选或宽限已超时。
+        （纯逻辑计算，不产生 sleep 副作用）。
         """
         missing_uids: Set[str] = set()
         for item in missing_identifiers:
@@ -105,7 +128,6 @@ class DeadlockGovernor:
                     f"grace (runnable job(s) may spawn them)."
                 )
             if now_mono < deadline:
-                time.sleep(0.5)
                 return True
             logger.error(
                 f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
@@ -137,7 +159,6 @@ class DeadlockGovernor:
                         f"grace (runnable job(s) may spawn them)."
                     )
                 if now_mono < deadline:
-                    time.sleep(0.5)
                     return True
                 logger.error(
                     f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
@@ -156,6 +177,7 @@ class DeadlockGovernor:
         """死锁分类缺口的连续轮次升级逻辑。
 
         返回 True 表示已达上限需升级为全队列 DLQ；False 表示未达上限，等待下一轮重试。
+        （纯计数逻辑，不产生 sleep 副作用）。
         """
         effective_max = (
             int(max_rounds) if max_rounds is not None else self.deadlock_gap_max_rounds
@@ -166,7 +188,6 @@ class DeadlockGovernor:
                 f"{log_prefix}: refusing to fail the whole queue, retrying next round "
                 f"({self.deadlock_gap_rounds}/{effective_max})."
             )
-            time.sleep(0.5)
             return False
         logger.critical(
             f"{log_prefix} persisted for {effective_max} rounds; "
@@ -218,8 +239,8 @@ class DeadlockGovernor:
         ctx: Optional[Any] = None,
         dep_grace_seconds: Optional[float] = None,
         deadlock_gap_max_rounds: Optional[int] = None,
-    ) -> bool:
-        """处理死锁：细粒度归因 + bulk_failure + cascade。"""
+    ) -> DeadlockDecision:
+        """处理死锁：细粒度归因 + bulk_failure + cascade（纯计算求值，无阻塞副作用）。"""
         effective_state = state or store.state
         effective_grace = dep_grace_seconds if dep_grace_seconds is not None else self.dep_grace_seconds
         effective_gap_max = deadlock_gap_max_rounds if deadlock_gap_max_rounds is not None else self.deadlock_gap_max_rounds
@@ -248,7 +269,11 @@ class DeadlockGovernor:
                 scheduler=scheduler,
                 grace_seconds=effective_grace,
             ):
-                return False
+                return DeadlockDecision(
+                    action="grace_waiting",
+                    should_terminate=False,
+                    wait_time=0.5,
+                )
             logger.error(f"Deadlock: {len(missing_uids)} job(s) have unresolvable (missing) dependencies.")
             uids_metas, remaining_queue = self._split_deadlock_by_uids(
                 list(effective_state.queue), missing_uids, ERR_DEPENDENCY_DEADLOCK
@@ -266,7 +291,11 @@ class DeadlockGovernor:
                     max_rounds=effective_gap_max,
                 )
                 if not escalated:
-                    return False
+                    return DeadlockDecision(
+                        action="gap_retrying",
+                        should_terminate=False,
+                        wait_time=0.5,
+                    )
                 uids_metas = [
                     (uid_from_job_dict(jd),
                      {"error": ERR_DEADLOCK_GAP, "root_cause": True})
@@ -287,7 +316,11 @@ class DeadlockGovernor:
                 max_rounds=effective_gap_max,
             )
             if not escalated:
-                return False
+                return DeadlockDecision(
+                    action="gap_retrying",
+                    should_terminate=False,
+                    wait_time=0.5,
+                )
             uids_metas = [
                 (uid_from_job_dict(jd),
                  {"error": ERR_DEADLOCK_GAP, "root_cause": True})
@@ -298,13 +331,21 @@ class DeadlockGovernor:
         # 提交批量死锁失败
         outcome = store.apply_bulk_failure(uids_metas, remaining_queue=remaining_queue)
         self.deadlock_gap_rounds = 0
-        return len(outcome.failed_uids) > 0 and len(effective_state.queue) == 0
+        should_terminate = len(outcome.failed_uids) > 0 and len(effective_state.queue) == 0
+        return DeadlockDecision(
+            action="resolved",
+            should_terminate=should_terminate,
+            wait_time=0.0,
+            failed_uids=outcome.failed_uids,
+            cascaded_uids=outcome.cascaded_uids,
+        )
 
 
 # 向后兼容别名
 EpisodeState = DeadlockGovernor
 
 __all__ = [
+    "DeadlockDecision",
     "DeadlockGovernor",
     "EpisodeState",
     "DEP_GRACE_SECONDS",
