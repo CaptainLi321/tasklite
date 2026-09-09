@@ -222,26 +222,8 @@ class RecoveryOrchestrator:
         completed_map = {h.uid: res for h, res in outcome.completed}
         cancelled_entries, done_entries = self._ctx.in_flight.classify_aborted(completed_map)
 
-        # 4. 未完成任务注销 in-flight 并 requeue 到队首
-        job_dicts = [entry.job_dict for entry in cancelled_entries]
-        for pentry in cancelled_entries:
-            self._ctx.in_flight.settle(pentry.uid, state=self._ctx.store)
-        self._ctx.store.requeue_jobs(job_dicts, front=True)
-
-        # 5. 消费「已完成」entry 的结果（统一出口）
-        commit_crash: Optional[BaseException] = None
-        for entry, result in done_entries:
-            try:
-                self._completion.complete_job(entry, result)
-            except _JobTerminated:
-                pass
-            except _CommitCrashSignal as e:
-                commit_crash = e
-
-        self._ctx.in_flight.clear()
-        self._ctx.store.clear_in_flight()
-        if commit_crash is not None:
-            raise commit_crash
+        # 4. 委托 CompletionMachine 统一结算已取消与已完成条目
+        self._completion.settle_aborted(cancelled_entries, done_entries)
 
 
 # 向下兼容别名

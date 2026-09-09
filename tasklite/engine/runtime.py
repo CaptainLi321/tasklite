@@ -652,19 +652,13 @@ class EngineRuntime:
                     if decision.wait_time > 0:
                         deadlock_wait = decision.wait_time
 
-        # 3. Drain 回收在途结果
+        # 3. Drain 回收在途结果并统一结算
         completed_count = 0
         if self._ctx.in_flight:
             self._recovery.apply_pending_signals()
             handles = self._ctx.in_flight.active_handles()
             completed = self._ctx.channel.reap_completed(handles)
-            completed_count = len(completed)
-            for handle, result in completed:
-                entry = self._ctx.in_flight.get(handle.uid)
-                try:
-                    self._completion.complete_job(entry, result)
-                finally:
-                    self._ctx.in_flight.settle(handle.uid, state=store)
+            completed_count = self._completion.settle_reaped(completed)
 
         # 4. 计算等待时延与空闲状态
         is_idle = store.is_empty and not self._ctx.in_flight
