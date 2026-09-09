@@ -164,6 +164,8 @@ class CommitView(Protocol):
         retry_dict: Dict[str, Any],
         *,
         front: bool = False,
+        is_interrupted: bool = False,
+        is_lock_conflict: bool = False,
     ) -> RetryOutcome: ...
 
     def cascade_fail(self, failed_uid: str) -> List[str]: ...
@@ -207,6 +209,8 @@ class RetryOutcome:
     """apply_retry 原子转移结果。"""
     uid: str
     retry_dict: Dict[str, Any]
+    is_interrupted: bool = False
+    is_lock_conflict: bool = False
 
 
 @dataclass(frozen=True)
@@ -236,6 +240,7 @@ class StateStore:
         on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None,
         ctx: Optional[Any] = None,
         governor: Optional[DeadlockGovernor] = None,
+        stats: Optional[Any] = None,
     ) -> None:
         self._backend = backend
         self._state = state or PipelineState({}, {}, {}, [])
@@ -244,6 +249,23 @@ class StateStore:
         self._on_job_completed = on_job_completed
         self._ctx = ctx
         self._governor = governor or getattr(ctx, "governor", None) or DeadlockGovernor()
+        self._stats = stats if stats is not None else (getattr(ctx, "stats", None) if ctx is not None else None)
+
+    def _record_stat(self, key: str, amount: int = 1) -> None:
+        """更新统计指标（单一真相源）。"""
+        if self._stats is not None:
+            self._stats[key] = self._stats.get(key, 0) + amount
+
+    def record_stat(self, key: str, amount: int = 1) -> None:
+        """公开统计指标记录接缝（供孤儿延迟等特殊派发事件使用）。"""
+        self._record_stat(key, amount)
+
+    @property
+    def stats(self) -> Any:
+        return self._stats
+
+    def set_stats(self, stats: Any) -> None:
+        self._stats = stats
 
     def mark_failed(self, uid: str, meta: Dict[str, Any]) -> None:
         """统一失败登记：清 wall 旧记录 + mark_failed。"""
@@ -420,6 +442,7 @@ class StateStore:
                 self._state.update_cursors(cursor_updates)
             self._state.mark_success(uid, wall_meta)
             self._state.unregister_in_flight(uid)
+            self._record_stat("completed", 1)
             spawned_uids = [uid_from_job_dict(j) for j in spawned_list]
             return SuccessOutcome(uid=uid, wall_meta=wall_meta, spawned_uids=spawned_uids)
 
@@ -443,6 +466,7 @@ class StateStore:
         if committed:
             self._state.mark_failed(uid, sanitized_meta)
             self._state.unregister_in_flight(uid)
+            self._record_stat(count_as, 1)
             cascaded_uids: List[str] = []
             if cascade:
                 cascaded_uids = self.cascade_fail(uid)
@@ -458,16 +482,33 @@ class StateStore:
         retry_dict: Dict[str, Any],
         *,
         front: bool = False,
+        is_interrupted: bool = False,
+        is_lock_conflict: bool = False,
     ) -> RetryOutcome:
         """原子状态转移：重试重入队。"""
         committed = self._backend.commit_retry(uid, retry_dict, front=front)
         if committed:
             self._state.unregister_in_flight(uid)
             self._state.requeue_jobs([retry_dict], front=front)
-            return RetryOutcome(uid=uid, retry_dict=retry_dict)
+            self._record_stat("retried", 1)
+            if is_interrupted:
+                self._record_stat("interrupted_reruns", 1)
+            elif is_lock_conflict:
+                self._record_stat("deferred_orphan", 1)
+            return RetryOutcome(
+                uid=uid,
+                retry_dict=retry_dict,
+                is_interrupted=is_interrupted,
+                is_lock_conflict=is_lock_conflict,
+            )
 
         self.commit_failed_crash(uid, "commit_retry", job_dict)
-        return RetryOutcome(uid=uid, retry_dict=retry_dict)
+        return RetryOutcome(
+            uid=uid,
+            retry_dict=retry_dict,
+            is_interrupted=is_interrupted,
+            is_lock_conflict=is_lock_conflict,
+        )
 
     def _requeue_and_crash(self, uid: str, job_dict: Optional[Dict[str, Any]], reason: str) -> None:
         """单一出口：所有「commit 失败 → requeue 内存 + 崩溃」路径的收敛点。"""
@@ -492,6 +533,7 @@ class StateStore:
         committed = self._backend.commit_skip(uid)
         if committed:
             self._state.unregister_in_flight(uid)
+            self._record_stat("skipped", 1)
             return SkipOutcome(uid=uid, was_known=True)
 
         self.commit_skip_crash(uid, job_dict)
@@ -522,11 +564,10 @@ class StateStore:
                     if uid_from_job_dict(jd) not in failed_set
                 ]
             self._state.replace_queue(list(remaining_queue))
+            self._record_stat("failed", len(sanitized_metas))
             for uid, meta in sanitized_metas:
                 self._state.mark_failed(uid, meta)
                 self._state.unregister_in_flight(uid)
-                if self._ctx is not None and hasattr(self._ctx, "stats"):
-                    self._ctx.stats["failed"] += 1
                 if self._on_job_completed:
                     self._on_job_completed(uid, meta, False, False)
             return BulkFailureOutcome(
@@ -556,8 +597,7 @@ class StateStore:
                 if single_committed:
                     queue = [j for j in queue if uid_from_job_dict(j) != uid]
                     self._state.mark_failed(uid, {"error": ERR_COMMIT_FAILURE_DLQ, "fatal": True})
-                    if self._ctx is not None and hasattr(self._ctx, "stats"):
-                        self._ctx.stats["failed"] += 1
+                    self._record_stat("failed", 1)
                     if self._on_job_completed:
                         self._on_job_completed(uid, {"error": ERR_COMMIT_FAILURE_DLQ, "fatal": True}, False, False)
                 else:
@@ -590,6 +630,7 @@ class StateStore:
             cascade_set = set(cascade_uids)
             remaining = [jd for jd in self._state.queue if uid_from_job_dict(jd) not in cascade_set]
             self._state.replace_queue(remaining)
+            self._record_stat("cascade_failed", len(cascade_uids))
             for cuid, cm in cascade_metas:
                 sanitized_cm = self._taxonomy.normalize_dlq_meta(cm)
                 self._state.mark_failed(cuid, sanitized_cm)
@@ -638,8 +679,7 @@ class StateStore:
                 single_committed = self._backend.commit_job_failure(uid, dlq_meta)
                 if single_committed:
                     self.apply_failed(uid, dlq_meta, unregister=False)
-                    if self._ctx is not None and hasattr(self._ctx, "stats"):
-                        self._ctx.stats["failed"] += 1
+                    self._record_stat("failed", 1)
                     if self._on_job_completed:
                         self._on_job_completed(uid, dlq_meta, False, False)
                     continue
@@ -695,6 +735,7 @@ class StateStore:
             dlq_committed = self._backend.commit_job_failure(uid, dlq_meta)
             if dlq_committed:
                 self.apply_failed(uid, dlq_meta)
+                self._record_stat("failed", 1)
                 if self._on_job_completed:
                     self._on_job_completed(uid, dlq_meta, False, False)
                 raise _JobTerminated(

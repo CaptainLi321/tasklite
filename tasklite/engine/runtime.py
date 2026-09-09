@@ -242,6 +242,7 @@ class RunContext:
         self.on_job_completed = on_job_completed
         self.on_run_end = on_run_end
 
+        self._stats: TaskStats = TaskStats()
         self.store: StateStore = StateStore(
             self._backend,
             commit_failure_dlq_threshold=self.commit_failure_dlq_threshold,
@@ -249,14 +250,24 @@ class RunContext:
             on_job_completed=lambda uid, meta, s, r: self.fire_job_completed(uid, meta, s, r),
             ctx=self,
             governor=self.governor,
+            stats=self._stats,
         )
 
         self._in_flight: InFlightTracker = InFlightTracker()
         self.run_id: Optional[str] = None
         self.dispatch_seq: int = 0
         self.stop_mode: StopMode = StopMode.NONE
-        self.stats: TaskStats = TaskStats()
         self._run_end_fired = False
+
+    @property
+    def stats(self) -> TaskStats:
+        return self._stats
+
+    @stats.setter
+    def stats(self, value: TaskStats) -> None:
+        self._stats = value
+        if hasattr(self, "store") and self.store is not None:
+            self.store.set_stats(value)
 
     @property
     def state(self) -> PipelineState:
