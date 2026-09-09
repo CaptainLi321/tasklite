@@ -185,9 +185,6 @@ class TaskLite:
         self.ipc_dir = str(self.state_dir / "ipc")
         Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
         channel = ExecutionChannel(mp_ctx=self._mp_ctx, ipc_dir=self.ipc_dir)
-        # 传入 handlers 引用，调度器按「handler 默认资源 ∪ job 资源」检查
-        # 可用性，与 _dispatch_job 的实际 acquire 一致（堵住限速/容量绕过）。
-        self.scheduler = JobScheduler(self.resources, self.handlers)
 
         self.strict_picklable = strict_picklable
 
@@ -219,9 +216,13 @@ class TaskLite:
         )
 
         self._ctx = self._runtime.ctx
-        self.scheduler = self._runtime.scheduler
 
     # ── 核心深模块与运行期接缝 ──────────────────────────────────────
+    @property
+    def scheduler(self) -> JobScheduler:
+        """调度器深模块。"""
+        return self._runtime.scheduler
+
     @property
     def store(self) -> StateStore:
         """状态与事务深模块。"""
