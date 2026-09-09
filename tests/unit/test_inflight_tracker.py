@@ -4,7 +4,7 @@ import pytest
 
 from tasklite.engine.channel import JobHandle
 from tasklite.engine.inflight import InFlightJob, InFlightTracker
-from tasklite.engine.resource import CapacityResource, ResourceManager
+from tasklite.engine.resource import CapacityResource, NullResourceLease, ResourceManager
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
 
@@ -126,6 +126,18 @@ class TestInFlightTrackerResourceRelease:
         assert gpu.used == 0.0
         assert entry.acquired == []
 
+    def test_pseudo_entry_has_null_lease_and_safe_release(self):
+        j1 = Job("t", "j1", {})
+        pseudo = InFlightTracker.create_pseudo_entry("t::j1", j1.to_dict(), j1)
+        assert isinstance(pseudo.lease, NullResourceLease)
+        assert pseudo.lease.acquired == []
+        assert pseudo.acquired == []
+        # release / claim / cancel 均为安全 no-op
+        pseudo.lease.claim()
+        pseudo.lease.cancel()
+        pseudo.release_resources()
+        assert pseudo.acquired == []
+
     def test_active_uids_and_classify_aborted(self):
         tracker = InFlightTracker()
         j1 = Job("t", "j1", {})
@@ -144,4 +156,6 @@ class TestInFlightTrackerResourceRelease:
         assert len(done) == 1
         assert done[0][0].uid == "t::j1"
         assert done[0][1] == {"status": "ok"}
+
+
 
