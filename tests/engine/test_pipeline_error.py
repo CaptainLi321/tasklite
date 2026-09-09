@@ -830,24 +830,26 @@ class TestDeadlockFallbackConservative:
         pipeline._runtime.ctx.set_state(state)
         return pipeline
 
-    def test_cycle_gap_fallback_keeps_queue(self, tmp_path, monkeypatch):
+    def test_cycle_gap_fallback_keeps_queue(self, tmp_path):
         """环检测空兜底：队列原样保留、不误杀；返回 False（非终态）。"""
         pipeline = self._queue_two_jobs(tmp_path)
-        monkeypatch.setattr(pipeline._runtime.state, "find_dependency_cycles", lambda: [])
-        monkeypatch.setattr("time.sleep", lambda s: None)  # 防 0.5s 慢
+        pipeline._runtime.state.find_dependency_cycles = lambda: []
         sched = self._sched(waiting_for_dependency=True)
-        should_break = pipeline.store.handle_deadlock(sched)
-        assert should_break is False
+        decision = pipeline.store.handle_deadlock(sched)
+        assert not decision
+        assert decision.should_terminate is False
+        assert decision.wait_time == 0.5
         assert len(pipeline._runtime.state.queue) == 2
         assert pipeline.backend.load_failed() == {}
 
-    def test_unclassifiable_fallback_keeps_queue(self, tmp_path, monkeypatch):
+    def test_unclassifiable_fallback_keeps_queue(self, tmp_path):
         """分类链全空（不可归因）兜底：队列原样保留、不误杀；返回 False。"""
         pipeline = self._queue_two_jobs(tmp_path)
-        monkeypatch.setattr("time.sleep", lambda s: None)
         sched = self._sched()
-        should_break = pipeline.store.handle_deadlock(sched)
-        assert should_break is False
+        decision = pipeline.store.handle_deadlock(sched)
+        assert not decision
+        assert decision.should_terminate is False
+        assert decision.wait_time == 0.5
         assert len(pipeline._runtime.state.queue) == 2
         assert pipeline.backend.load_failed() == {}
 
@@ -888,9 +890,10 @@ class TestDeadlockGapEscalation:
         assert pipeline.backend.load_queue() == []
         assert pipeline.stats["failed"] == 2
 
-    def test_cycle_gap_below_threshold_keeps_queue(self, tmp_path, monkeypatch):
+    def test_cycle_gap_below_threshold_keeps_queue(self, tmp_path):
         """未达阈值前保持保守（不误杀）：单轮 _handle_deadlock 调用返回 False、
         队列保留——升级只在连续达阈值后发生。"""
+        import types
         from tasklite.models.state import PipelineState
 
         pipeline = make_pipeline(tmp_path)
@@ -904,14 +907,15 @@ class TestDeadlockGapEscalation:
             pipeline.backend.load_cursors(), pipeline.backend.load_queue(),
         )
         pipeline._runtime.ctx.set_state(state)
-        monkeypatch.setattr(state, "find_dependency_cycles", lambda: [])
-        monkeypatch.setattr("time.sleep", lambda s: None)
+        state.find_dependency_cycles = lambda: []
         sched = types.SimpleNamespace(
             malformed_uids=(), unknown_resource_uids=(),
             missing_dependency_uids=(), impossible_resource_uids=(),
             waiting_for_dependency=True,
         )
-        should_break = pipeline.store.handle_deadlock(sched)
-        assert should_break is False
+        decision = pipeline.store.handle_deadlock(sched)
+        assert not decision
+        assert decision.should_terminate is False
+        assert decision.wait_time == 0.5
         assert len(pipeline._runtime.state.queue) == 2
         assert pipeline.backend.load_failed() == {}
