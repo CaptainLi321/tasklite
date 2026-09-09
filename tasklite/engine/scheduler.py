@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from .store import DispatchView
 
 from .resource import Resource, ResourceManager, ResourceEvaluation
-from .runtime import RT_BACKOFF_UNTIL
 from ..models.job import Job, JobRuntimeState
 from ..models.state import uid_from_job_dict
 
@@ -297,16 +296,14 @@ class JobScheduler:
 
             # 4. Backoff — 复用循环顶部的 now 值，避免双重 time.monotonic 调用
             raw_rt = job_dict.get("runtime")
-            if isinstance(raw_rt, JobRuntimeState):
-                if raw_rt.is_backed_off(now):
-                    min_wait = min(min_wait, raw_rt.remaining_backoff(now))
-                    continue
-            elif isinstance(raw_rt, dict):
-                _backoff = raw_rt.get(RT_BACKOFF_UNTIL)
-                if isinstance(_backoff, (int, float)) and _backoff > now:
-                    remaining = _backoff - now
-                    min_wait = min(min_wait, max(0.0, remaining))
-                    continue
+            rt_state = (
+                raw_rt
+                if isinstance(raw_rt, JobRuntimeState)
+                else (JobRuntimeState.from_dict(raw_rt) if isinstance(raw_rt, dict) else None)
+            )
+            if rt_state is not None and rt_state.is_backed_off(now):
+                min_wait = min(min_wait, rt_state.remaining_backoff(now))
+                continue
 
             if can_run:
                 runnable_idx = i

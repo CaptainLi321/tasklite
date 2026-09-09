@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import math
 from typing import Any, Dict, List, Optional, Union
 
-from ..utils.lockfile import safe_uid_filename
+from ..utils.injective import safe_uid_filename
 from ..taxonomy import validate_resource_amounts
 
 # uid 派生的 IPC 文件名（锁 / result / signals / outputs）
