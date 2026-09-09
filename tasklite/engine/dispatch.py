@@ -388,11 +388,10 @@ class DispatchMachine:
                     "failures": failures,
                     "detail": str(e)[:200],
                 }
-                self._ctx.in_flight.pop(uid, None)
+                self._ctx.in_flight.settle(uid, state=store)
                 self._reject_and_commit(uid, job_dict, fail_meta)
                 return None
-            self._ctx.in_flight.pop(uid, None)
-            store.unregister_in_flight(uid)
+            self._ctx.in_flight.settle(uid, state=store)
             store.requeue_jobs([job_dict], front=True)
             # 不在此 save_queue：内存此刻缺其他 in-flight 作业，
             # 交给 _run_loop 的 _save_queue_crash_safe 合并磁盘真相后统一保存。

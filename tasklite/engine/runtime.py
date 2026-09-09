@@ -664,7 +664,7 @@ class EngineRuntime:
                 try:
                     self._completion.complete_job(entry, result)
                 finally:
-                    self._ctx.in_flight.pop(handle.uid, None)
+                    self._ctx.in_flight.settle(handle.uid, state=store)
 
         # 4. 计算等待时延与空闲状态
         is_idle = store.is_empty and not self._ctx.in_flight
