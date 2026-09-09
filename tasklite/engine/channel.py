@@ -6,15 +6,10 @@
 
 from __future__ import annotations
 
-import enum
-import json
 import logging
 import multiprocessing as mp
 import os
-import re
-import shutil
 import signal
-import sys
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -34,23 +29,15 @@ from ..utils.ipc import (
     decode_raw_result as _decode_raw_result,
     encode_raw_result as _encode_raw_result,
 )
-from ..utils.jsonutil import dump, dumps, loads, load as json_load
+from ..utils.jsonutil import dumps
 from ..utils import lockfile
-from ..utils.lockfile import (
-    probe_lock,
-    release_lock,
-    safe_uid_filename,
-    try_acquire_lock,
-)
 
 logger = logging.getLogger("tasklite")
 
 _KEY_TRACEBACK = "traceback"
+_RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
 _RESULT_TMP_SUFFIX = ".result.json.tmp"
 _RESULT_SUFFIX = ".result.json"
-_INCARNATION_RE = re.compile(r"\.([0-9a-f]{32})\.(\d+)\.result\.json$")
-_RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
-_RAW_TUPLE_SENTINEL = "__tl_tuple_v1"
 
 
 def _normalize_handler_result(result: Any) -> Tuple[bool, Dict[str, Any]]:
@@ -405,36 +392,20 @@ class ExecutionChannel:
     def __init__(
         self,
         ipc_dir: Optional[Union[str, Path, Any]] = None,
-        *args: Any,
+        *,
         mp_ctx: Optional[Any] = None,
-        executor: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
-        ctx_candidate = None
-        dir_candidate = None
+        if ipc_dir is not None and hasattr(ipc_dir, "Process") and mp_ctx is None:
+            mp_ctx = ipc_dir
+            ipc_dir = None
+        if ipc_dir is None and "ipc_dir" in kwargs:
+            ipc_dir = kwargs["ipc_dir"]
+        if mp_ctx is None and "mp_ctx" in kwargs:
+            mp_ctx = kwargs["mp_ctx"]
 
-        if ipc_dir is not None:
-            if isinstance(ipc_dir, (str, Path)):
-                dir_candidate = ipc_dir
-            elif hasattr(ipc_dir, "Process"):
-                ctx_candidate = ipc_dir
-            else:
-                dir_candidate = str(ipc_dir)
-
-        if args:
-            for arg in args:
-                if isinstance(arg, (str, Path)) and dir_candidate is None:
-                    dir_candidate = arg
-                elif hasattr(arg, "Process") and ctx_candidate is None:
-                    ctx_candidate = arg
-
-        if mp_ctx is not None:
-            ctx_candidate = mp_ctx
-        if "ipc_dir" in kwargs:
-            dir_candidate = kwargs["ipc_dir"]
-
-        self._mp_ctx = ctx_candidate or mp.get_context("spawn")
-        self.ipc_dir = str(dir_candidate) if dir_candidate is not None else None
+        self._mp_ctx = mp_ctx or mp.get_context("spawn")
+        self.ipc_dir = str(ipc_dir) if ipc_dir is not None else None
         if self.ipc_dir:
             try:
                 Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
