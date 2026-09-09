@@ -20,8 +20,8 @@ import shutil
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from .injective import safe_uid_filename
 from .jsonutil import dump, dumps, load, loads
-from .lockfile import safe_uid_filename
 
 logger = logging.getLogger("tasklite")
 
