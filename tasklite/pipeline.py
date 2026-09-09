@@ -11,6 +11,7 @@ from .backend.base import AbstractStateBackend, classify_error_type
 from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
 from .engine.channel import ExecutionChannel
+from .engine.governor import DeadlockGovernor
 from .engine.inflight import InFlightJob as _InFlightJob, InFlightTracker
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import (
@@ -225,6 +226,11 @@ class TaskLite:
     def store(self) -> StateStore:
         """状态与事务深模块。"""
         return self._ctx.store
+
+    @property
+    def governor(self) -> DeadlockGovernor:
+        """死锁归因与宽限治理深模块。"""
+        return self._ctx.governor
 
     @property
     def channel(self) -> ExecutionChannel:
