@@ -22,6 +22,8 @@ DLQ（failed）；good 资源仍可用（回归保护）。
 import pytest
 from tasklite import Job
 from tasklite.engine.resource import CapacityResource
+from tasklite.engine.scheduler import JobScheduler
+from tasklite.models.state import PipelineState
 
 from tests.helpers import make_pipeline, make_ipc_process_class, patch_multiprocessing_for_fakes
 
@@ -140,4 +142,43 @@ def test_scheduler_has_potential_spawners():
     result = sched.pop_next_runnable(mock_store, set())
     assert result.runnable_idx is None
     assert result.has_potential_spawners is True
+
+
+def test_schedule_result_semantics_and_candidate_uid():
+    """测试 ScheduleResult 的 is_runnable / is_dep_failed / candidate_uid 语义属性。"""
+    gpu = CapacityResource("gpu", 10.0)
+    sched = JobScheduler({"gpu": gpu})
+
+    # 1. 正常 runnable 作业
+    j1 = Job("t", "j1", {})
+    state = PipelineState(wall={}, failed={}, cursors={}, queue=[j1.to_dict()])
+    res1 = sched.pop_next_runnable(state, frozenset())
+    assert res1.is_runnable is True
+    assert res1.is_dep_failed is False
+    assert res1.has_candidate is True
+    assert res1.candidate_uid == "t::j1"
+
+    # 2. 依赖失败 dep_failed 作业
+    j2 = Job("t", "j2", depends_on=["t::failed_parent"])
+    state2 = PipelineState(
+        wall={},
+        failed={"t::failed_parent": {"error": "fatal"}},
+        cursors={},
+        queue=[j2.to_dict()],
+    )
+    res2 = sched.pop_next_runnable(state2, frozenset())
+    assert res2.is_runnable is False
+    assert res2.is_dep_failed is True
+    assert res2.has_candidate is True
+    assert res2.candidate_uid == "t::j2"
+    assert res2.pending_dep_failure == "t::failed_parent"
+
+    # 3. 空队列
+    state3 = PipelineState(wall={}, failed={}, cursors={}, queue=[])
+    res3 = sched.pop_next_runnable(state3, frozenset())
+    assert res3.is_runnable is False
+    assert res3.is_dep_failed is False
+    assert res3.has_candidate is False
+    assert res3.candidate_uid is None
+
 
