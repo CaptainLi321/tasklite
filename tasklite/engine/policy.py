@@ -19,6 +19,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from ..models.job import Job, JobRuntimeState
+from ..models.state import uid_from_job_dict
 from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 
 logger = logging.getLogger("tasklite")
@@ -104,8 +105,8 @@ class RetryPlan:
     schedule: Optional[BackoffSchedule] = None
 
 
-class ExecutionPolicy:
-    """执行与预检深模块（统一负责预检评估、指纹比对、指数退避与重试规划）。"""
+class AdmissionPolicy:
+    """准入与预检策略深模块（统一负责 Rerun 矩阵、输入指纹比对与 Discovery 注入）。"""
 
     def __init__(
         self,
@@ -113,7 +114,9 @@ class ExecutionPolicy:
         *,
         enable_stat_cache: bool = False,
     ) -> None:
-        self.discovery_rerun: Mapping[str, str] = discovery_rerun if discovery_rerun is not None else {}
+        self.discovery_rerun: Mapping[str, str] = (
+            discovery_rerun if discovery_rerun is not None else {}
+        )
         self.enable_stat_cache: bool = enable_stat_cache
         self._stat_cache: Dict[str, Optional[os.stat_result]] = {}
 
@@ -264,6 +267,29 @@ class ExecutionPolicy:
             effective_rerun=rerun,
         )
 
+    def admit(
+        self,
+        job_dict: dict,
+        store_or_state: Any,
+    ) -> PreflightDecision:
+        """统一极窄准入判定入口：自动从 store/state 提取历史上下文并执行评估。"""
+        uid = uid_from_job_dict(job_dict)
+        wall = getattr(store_or_state, "wall", {})
+        failed = getattr(store_or_state, "failed", {})
+        wall_hit = uid in wall
+        failed_hit = uid in failed
+        wall_meta = wall.get(uid) if wall_hit else None
+        return self.evaluate(
+            job_dict,
+            wall_meta=wall_meta,
+            is_wall=wall_hit,
+            is_failed=failed_hit,
+        )
+
+
+class BackoffGovernor:
+    """退避与重试规划治理深模块（统一负责指数退避计算、双时钟调度与重试状态机）。"""
+
     def compute_backoff(
         self,
         retries: int,
@@ -406,5 +432,29 @@ class ExecutionPolicy:
         )
 
 
+class ExecutionPolicy(AdmissionPolicy, BackoffGovernor):
+    """执行与预检深模块组合门面（统合准入矩阵、文件指纹、指数退避与重试规划）。"""
+
+    def __init__(
+        self,
+        discovery_rerun: Optional[Mapping[str, str]] = None,
+        *,
+        enable_stat_cache: bool = False,
+    ) -> None:
+        super().__init__(discovery_rerun=discovery_rerun, enable_stat_cache=enable_stat_cache)
+
+
 # 向后兼容别名
 PreflightPolicy = ExecutionPolicy
+
+__all__ = [
+    "AdmissionPolicy",
+    "BackoffGovernor",
+    "BackoffSchedule",
+    "DecisionReason",
+    "ExecutionPolicy",
+    "PreflightAction",
+    "PreflightDecision",
+    "PreflightPolicy",
+    "RetryPlan",
+]
