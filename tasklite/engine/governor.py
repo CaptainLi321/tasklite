@@ -200,10 +200,19 @@ class DeadlockGovernor:
         sched: Any,
         field_name: str,
     ) -> Set[str]:
-        """统一提取归因 UID 集合。"""
-        attr = getattr(sched, "attribution", None) or getattr(sched, "deadlock_attribution", None)
+        """统一提取归因 UID 集合（支持 ScheduleResult 与 DispatchOutcome 透明解包）。"""
+        inner_sched = getattr(sched, "sched", None) or sched
+        attr = (
+            getattr(inner_sched, "attribution", None)
+            or getattr(inner_sched, "deadlock_attribution", None)
+            or getattr(sched, "deadlock_attribution", None)
+        )
         if attr is not None and hasattr(attr, field_name):
             uids = getattr(attr, field_name)
+            if uids:
+                return set(uids)
+        if hasattr(inner_sched, field_name):
+            uids = getattr(inner_sched, field_name)
             if uids:
                 return set(uids)
         if hasattr(sched, field_name):
@@ -236,9 +245,9 @@ class DeadlockGovernor:
         *,
         state: Optional[PipelineState] = None,
         scheduler: Optional[Any] = None,
-        ctx: Optional[Any] = None,
         dep_grace_seconds: Optional[float] = None,
         deadlock_gap_max_rounds: Optional[int] = None,
+        **kwargs: Any,
     ) -> DeadlockDecision:
         """自闭环死锁仲裁单一入口。
 
@@ -251,21 +260,22 @@ class DeadlockGovernor:
         if sched is None:
             return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
 
-        effective_state = state or (ctx.state if ctx is not None else store.state)
-        min_wait = getattr(sched, "min_wait", float("inf"))
+        effective_state = state if state is not None else getattr(store, "state", None)
+        inner_sched = getattr(sched, "sched", None) or sched
+        min_wait = getattr(inner_sched, "min_wait", getattr(sched, "min_wait", float("inf")))
 
         if min_wait == float("inf"):
             return self.resolve_deadlock(
                 sched,
                 store=store,
                 state=effective_state,
-                scheduler=scheduler or (getattr(ctx, "scheduler", None) if ctx is not None else None),
-                ctx=ctx,
+                scheduler=scheduler,
                 dep_grace_seconds=dep_grace_seconds,
                 deadlock_gap_max_rounds=deadlock_gap_max_rounds,
             )
 
-        if getattr(sched, "waiting_for_dependency", False) and effective_state is not None:
+        waiting_for_dep = getattr(inner_sched, "waiting_for_dependency", getattr(sched, "waiting_for_dependency", False))
+        if waiting_for_dep and effective_state is not None:
             cycle_uids = effective_state.find_dependency_cycles()
             if cycle_uids:
                 logger.error(
@@ -276,8 +286,7 @@ class DeadlockGovernor:
                     sched,
                     store=store,
                     state=effective_state,
-                    scheduler=scheduler or (getattr(ctx, "scheduler", None) if ctx is not None else None),
-                    ctx=ctx,
+                    scheduler=scheduler,
                     dep_grace_seconds=dep_grace_seconds,
                     deadlock_gap_max_rounds=deadlock_gap_max_rounds,
                 )
@@ -291,15 +300,16 @@ class DeadlockGovernor:
         *,
         state: Optional[PipelineState] = None,
         scheduler: Optional[Any] = None,
-        ctx: Optional[Any] = None,
         dep_grace_seconds: Optional[float] = None,
         deadlock_gap_max_rounds: Optional[int] = None,
+        **kwargs: Any,
     ) -> DeadlockDecision:
         """处理死锁：细粒度归因 + bulk_failure + cascade（纯计算求值，无阻塞副作用）。"""
-        effective_state = state or store.state
+        effective_state = state if state is not None else getattr(store, "state", None)
         effective_grace = dep_grace_seconds if dep_grace_seconds is not None else self.dep_grace_seconds
         effective_gap_max = deadlock_gap_max_rounds if deadlock_gap_max_rounds is not None else self.deadlock_gap_max_rounds
 
+        inner_sched = getattr(sched, "sched", None) or sched
         malformed_uids = self._extract_deadlock_uids(sched, "malformed_uids")
         unknown_uids = self._extract_deadlock_uids(sched, "unknown_resource_uids")
         missing_uids = self._extract_deadlock_uids(sched, "missing_dependency_uids")
@@ -316,7 +326,7 @@ class DeadlockGovernor:
                 list(effective_state.queue), unknown_uids, ERR_RESOURCE_DEADLOCK
             )
         elif missing_uids:
-            has_spawners = getattr(sched, "has_potential_spawners", None)
+            has_spawners = getattr(inner_sched, "has_potential_spawners", getattr(sched, "has_potential_spawners", None))
             if self.check_dependency_grace(
                 effective_state,
                 missing_uids,
@@ -338,7 +348,7 @@ class DeadlockGovernor:
             uids_metas, remaining_queue = self._split_deadlock_by_uids(
                 list(effective_state.queue), impossible_uids, ERR_RESOURCE_DEADLOCK
             )
-        elif getattr(sched, "waiting_for_dependency", False):
+        elif getattr(inner_sched, "waiting_for_dependency", getattr(sched, "waiting_for_dependency", False)):
             cycle_uids = set(effective_state.find_dependency_cycles())
             if not cycle_uids:
                 escalated = self.check_gap_or_escalate(
