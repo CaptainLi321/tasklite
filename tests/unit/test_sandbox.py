@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
+from tasklite.utils.ipc import ArtifactJournal
 
 class TestOutputSandbox:
     """Output path sandbox (REQ-10) tests."""
@@ -76,8 +77,7 @@ class TestOutputSandbox:
         ctx = self._ctx(tmp_path, ipc_dir=str(ipc_dir))
         resolved = ctx.declare_output("file.txt", cleanup_on_fail=False)
         assert resolved == str(tmp_path / "file.txt")
-        from tasklite.engine.channel import read_outputs
-        outputs = read_outputs(str(ipc_dir), ctx.job.uid)
+        outputs = ArtifactJournal(ipc_dir).read_outputs(ctx.job.uid)
         assert [(p, cl, k) for p, cl, k in outputs] == [(str(tmp_path / "file.txt"), False, "output")]
     def test_unicode_path_accepted(self, tmp_path):
         """Unicode (Chinese) path within output_root → accepted."""
@@ -185,16 +185,15 @@ class TestSandboxAdversarialInputs:
         resolved = ctx.declare_output("subdir\\file.txt")
         # Should be accepted — backslash is part of the filename on Linux
         assert "subdir\\file.txt" in resolved
-    def test_declare_output_multiple_calls_same_ctx(self, tmp_path):
-        """Declaring 3 outputs in one ctx → all 3 persisted to outputs.jsonl."""
+    def test_multiple_outputs_persisted(self, tmp_path):
+        """Calling declare_output multiple times persists all paths to outputs.jsonl."""
         ipc_dir = tmp_path / "ipc"
         ctx = self._ctx(tmp_path)
         ctx.ipc_dir = str(ipc_dir)
         ctx.declare_output("file1.txt")
         ctx.declare_output("file2.txt")
         ctx.declare_output("file3.txt")
-        from tasklite.engine.channel import read_outputs
-        outputs = read_outputs(str(ipc_dir), ctx.job.uid)
+        outputs = ArtifactJournal(ipc_dir).read_outputs(ctx.job.uid)
         names = [Path(r).name for r, _, _ in outputs]
         assert set(names) == {"file1.txt", "file2.txt", "file3.txt"}
     def test_declare_output_path_object_within_root(self, tmp_path):
@@ -230,7 +229,6 @@ class TestSandboxAdversarialInputs:
         ctx.ipc_dir = str(ipc_dir)
         ctx.declare_output("a.txt", cleanup_on_fail=True)
         ctx.declare_output("b.txt", cleanup_on_fail=False)
-        from tasklite.engine.channel import read_outputs
-        outputs = read_outputs(str(ipc_dir), ctx.job.uid)
+        outputs = ArtifactJournal(ipc_dir).read_outputs(ctx.job.uid)
         flags = [cl for _, cl, _ in outputs]
         assert flags == [True, False]

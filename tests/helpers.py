@@ -20,8 +20,8 @@ def _write_fake_result(ipc_dir, uid, result_dict, incarnation=None):
     incarnation 由 ctx 携带——fake 与真实子进程共享
     同一路径构造逻辑，保证 drain 能读到 fake 写的结果。
     """
-    from tasklite.engine.channel import write_result_atomic
-    write_result_atomic(ipc_dir, uid, result_dict, incarnation=incarnation)
+    from tasklite.utils.ipc import ArtifactJournal
+    ArtifactJournal(ipc_dir).write_result_atomic(uid, result_dict, incarnation=incarnation)
 
 
 def _ctx_incarnation(args):

@@ -20,10 +20,7 @@ from tests.helpers import (
     make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes,
     _write_fake_result, _ctx_incarnation,
 )
-from tasklite.engine.channel import (
-    write_result_atomic, result_path, _iter_stale_result_paths,
-    append_output, append_input, outputs_path, inputs_path,
-)
+from tasklite.utils.ipc import ArtifactJournal
 
 
 class TestIncarnationFencing:
@@ -48,7 +45,7 @@ class TestIncarnationFencing:
         # 文件名格式 {uid}.{old_run_id}.{seq}.result.json——与当前 run 的
         # run_id 不同）。
         old_incarnation = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(p.ipc_dir, "h::a", {
+        ArtifactJournal(p.ipc_dir).write_result_atomic("h::a", {
             "status": "success",
             "raw_result": True,
             "new_jobs": [],
@@ -82,11 +79,12 @@ class TestIncarnationFencing:
         p.run()
 
         # 现在 ipc_dir 中应无残留（正常路径消费后清理）
-        assert _iter_stale_result_paths(p.ipc_dir, "h::a") == []
+        journal = ArtifactJournal(p.ipc_dir)
+        assert journal.iter_stale_result_paths("h::a") == []
 
         # 模拟孤儿在 run 结束前悄悄写入旧 incarnation 文件
         old_incarnation = "deadbeefdeadbeefdeadbeefdeadbeef.99"
-        write_result_atomic(p.ipc_dir, "h::a", {
+        journal.write_result_atomic("h::a", {
             "status": "success",
             "raw_result": True,
             "new_jobs": [],
@@ -113,8 +111,8 @@ class TestIncarnationFencing:
                 self._alive = True
                 ctx = self.args[2]
                 captured["incarnation"] = ctx.incarnation
-                from tasklite.engine.channel import write_result_atomic
-                write_result_atomic(self.args[3], self.args[1].uid, {
+                from tasklite.utils.ipc import ArtifactJournal
+                ArtifactJournal(self.args[3]).write_result_atomic(self.args[1].uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
                 }, incarnation=ctx.incarnation)
@@ -134,9 +132,10 @@ class TestIncarnationFencing:
         assert len(run_id) == 32, f"run_id 应为 32-hex uuid: {run_id!r}"
         assert int(seq) >= 1, f"seq 应从 1 递增: {seq!r}"
         # 结果文件应以该 incarnation 命名，且正常消费后应被清理（不留残留）
-        assert result_path(p.ipc_dir, "h::a", inc).exists() is False, \
+        journal = ArtifactJournal(p.ipc_dir)
+        assert journal.result_path("h::a", inc).exists() is False, \
             "run 完成后当前 incarnation 的结果文件应被消费清理"
-        assert _iter_stale_result_paths(p.ipc_dir, "h::a") == [], \
+        assert journal.iter_stale_result_paths("h::a") == [], \
             "run 完成后 ipc 目录不应有残留结果文件"
 
     def test_meta_table_persists_run_id(self, tmp_path, monkeypatch):
@@ -165,8 +164,8 @@ class TestIncarnationFencing:
                 self._alive = True
                 ctx = self.args[2]
                 seqs.append(ctx.incarnation)
-                from tasklite.engine.channel import write_result_atomic
-                write_result_atomic(self.args[3], self.args[1].uid, {
+                from tasklite.utils.ipc import ArtifactJournal
+                ArtifactJournal(self.args[3]).write_result_atomic(self.args[1].uid, {
                     "status": "retry", "error": "transient",
                 }, incarnation=ctx.incarnation)
 
@@ -191,45 +190,47 @@ class TestStalePathPrefixCollision:
     def test_sibling_uid_dot_suffix_not_matched(self, tmp_path):
         """`h::page` 的残留枚举不得匹配 `h::page.1` 的结果文件。"""
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(str(tmp_path), "h::page.1", {
+        journal = ArtifactJournal(tmp_path)
+        journal.write_result_atomic("h::page.1", {
             "status": "success", "raw_result": True,
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
         }, incarnation=inc)
         # 兄弟 uid 的结果文件存在，但 h::page 的枚举必须为空
-        assert _iter_stale_result_paths(str(tmp_path), "h::page") == [], \
+        assert journal.iter_stale_result_paths("h::page") == [], \
             "点后缀兄弟 uid 的结果文件不得被误判为本 uid 的残留"
 
     def test_sibling_uid_deep_dot_suffix_not_matched(self, tmp_path):
         """多级点后缀（`h::a.b.c` vs `h::a`）同样不得误匹配。"""
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.7"
-        write_result_atomic(str(tmp_path), "h::a.b.c", {
+        journal = ArtifactJournal(tmp_path)
+        journal.write_result_atomic("h::a.b.c", {
             "status": "success", "raw_result": True,
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
         }, incarnation=inc)
-        assert _iter_stale_result_paths(str(tmp_path), "h::a") == []
+        assert journal.iter_stale_result_paths("h::a") == []
 
     def test_same_uid_incarnation_still_matched(self, tmp_path):
         """本 uid 自己的 incarnation 残留仍须被枚举（修复不能误伤正常路径）。"""
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.3"
-        write_result_atomic(str(tmp_path), "h::a", {
+        journal = ArtifactJournal(tmp_path)
+        journal.write_result_atomic("h::a", {
             "status": "success", "raw_result": True,
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
         }, incarnation=inc)
-        found = _iter_stale_result_paths(str(tmp_path), "h::a")
+        found = journal.iter_stale_result_paths("h::a")
         assert len(found) == 1, f"本 uid 残留应被枚举: {found}"
 
     def test_cleanup_does_not_delete_sibling_result(self, tmp_path):
         """cleanup_ipc_files 不得删除点后缀兄弟 uid 的结果文件（全链路）。"""
-        from tasklite.engine.channel import cleanup_ipc_files
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.5"
-        write_result_atomic(str(tmp_path), "h::page.1", {
+        journal = ArtifactJournal(tmp_path)
+        journal.write_result_atomic("h::page.1", {
             "status": "success", "raw_result": True,
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
         }, incarnation=inc)
-        cleanup_ipc_files(str(tmp_path), "h::page", inc)
+        journal.cleanup_ipc_files("h::page", inc)
         # 兄弟 uid 的结果文件必须保留
-        from tasklite.engine.channel import result_path
-        assert result_path(str(tmp_path), "h::page.1", inc).exists(), \
+        assert journal.result_path("h::page.1", inc).exists(), \
             "cleanup 不得删除兄弟 uid 的结果文件"
 
 
@@ -285,8 +286,9 @@ class TestStaleDeclarationCleanup:
 
         # 预置崩溃残留：上一次执行声明了 /tmp/nonexistent_old_output.txt
         #（临时产物/已清理 → 物理不存在），残留至本次重派发。
-        append_output(p.ipc_dir, "h::a", "/tmp/nonexistent_old_output.txt", cleanup=True)
-        stale_op = outputs_path(p.ipc_dir, "h::a")
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.record_output("h::a", "/tmp/nonexistent_old_output.txt", cleanup=True)
+        stale_op = journal.outputs_path("h::a")
         assert stale_op.exists(), "预置崩溃残留声明文件"
 
         cleaned_at_submit = []
@@ -333,11 +335,12 @@ class TestStaleDeclarationCleanup:
         p.register_handler("h", lambda job, ctx: (True, {}))
         p.enqueue([Job("h", "a")])
 
-        append_input(p.ipc_dir, "h::a", {
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.record_input_entry("h::a", {
             "path": "/tmp/stale_input.txt", "kind": "file",
             "size": 0, "mtime_ns": 0,
         })
-        stale_ip = inputs_path(p.ipc_dir, "h::a")
+        stale_ip = journal.inputs_path("h::a")
         assert stale_ip.exists(), "预置崩溃残留输入声明文件"
 
         seen_at_submit = []
@@ -398,13 +401,14 @@ class TestDispatchOrderFencing:
         # 模拟孤儿 worker：持有 {uid}.lock + 正在实时 append 的声明文件
         lock_fd = try_acquire_lock(p.ipc_dir, "h::a")
         assert lock_fd is not None, "测试前置：孤儿持锁"
-        append_output(p.ipc_dir, "h::a", "/tmp/orphan_live_output.txt", True)
-        append_input(p.ipc_dir, "h::a", {
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.record_output("h::a", "/tmp/orphan_live_output.txt", True)
+        journal.record_input_entry("h::a", {
             "path": "/tmp/orphan_live_input.txt", "kind": "file",
             "size": 0, "mtime_ns": 0,
         })
-        op = outputs_path(p.ipc_dir, "h::a")
-        ip = inputs_path(p.ipc_dir, "h::a")
+        op = journal.outputs_path("h::a")
+        ip = journal.inputs_path("h::a")
         assert op.exists() and ip.exists(), "前置：孤儿实时声明文件已落盘"
 
         observed = {}
@@ -458,8 +462,9 @@ class TestDispatchOrderFencing:
         out_file = tmp_path / "out" / "result.txt"
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text("done")
-        append_output(p.ipc_dir, "h::a", str(out_file), True)
-        write_result_atomic(p.ipc_dir, "h::a", {
+        journal = ArtifactJournal(p.ipc_dir)
+        journal.record_output("h::a", str(out_file), True)
+        journal.write_result_atomic("h::a", {
             "status": "success", "raw_result": True,
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
         }, incarnation=inc)

@@ -111,19 +111,19 @@ class TestOrphanLockDetection:
 
     def test_lock_file_survives_cleanup_ipc_files(self, tmp_path, monkeypatch):
         """cleanup_ipc_files 不误删 .lock（unlink-recreate 竞争）。"""
-        from tasklite.engine.channel import cleanup_ipc_files
+        from tasklite.utils.ipc import ArtifactJournal
         ipc = tmp_path
+        journal = ArtifactJournal(ipc)
         fd = try_acquire_lock(str(ipc), "t::a")
         assert fd is not None
         lock_path = ipc / f"{safe_uid_filename('t::a')}.lock"
         assert lock_path.exists()
         # 模拟 job 完成后的 IPC 清理
-        from tasklite.engine.channel import signals_path, result_path
-        signals_path(str(ipc), "t::a").touch()
-        result_path(str(ipc), "t::a", "abc").touch()
-        cleanup_ipc_files(str(ipc), "t::a", "abc")
+        journal.signals_path("t::a").touch()
+        journal.result_path("t::a", "abc").touch()
+        journal.cleanup_ipc_files("t::a", incarnation="abc")
         # 结果/信号被清理，锁文件保留
-        assert not signals_path(str(ipc), "t::a").exists()
+        assert not journal.signals_path("t::a").exists()
         assert lock_path.exists(), "lock file must survive cleanup"
         release_lock(fd)
 

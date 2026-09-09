@@ -39,13 +39,13 @@ class TestDeclareCacheCtx:
 
     def test_cache_kind_persisted(self, tmp_path):
         """cache 声明落盘带 kind='cache'；output 声明 kind='output'。"""
-        from tasklite.engine.channel import read_outputs
+        from tasklite.utils.ipc import ArtifactJournal
         ctx = _ctx(tmp_path, job_id="j9")
         ctx.ipc_dir = str(tmp_path / "ipc")
         ctx.declare_cache("tmp.part")
         ctx.declare_output("final.jpg")
 
-        outputs = read_outputs(ctx.ipc_dir, "test::j9")
+        outputs = ArtifactJournal(ctx.ipc_dir).read_outputs("test::j9")
         kinds = {k for _, _, k in outputs}
         assert kinds == {"cache", "output"}
 

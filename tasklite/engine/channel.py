@@ -31,22 +31,8 @@ from ..models.job import Job
 from ..utils.ipc import (
     ArtifactCleanupMode,
     ArtifactJournal,
-    append_input,
-    append_output,
-    append_signal,
-    cleanup_ipc_files,
     decode_raw_result as _decode_raw_result,
     encode_raw_result as _encode_raw_result,
-    inputs_path,
-    iter_stale_result_paths as _iter_stale_result_paths,
-    outputs_path,
-    read_inputs,
-    read_outputs,
-    read_result_file,
-    read_signals,
-    result_path,
-    result_tmp_path,
-    signals_path,
 )
 from ..utils.jsonutil import dump, dumps, loads, load as json_load
 from ..utils import lockfile
@@ -65,19 +51,6 @@ _RESULT_SUFFIX = ".result.json"
 _INCARNATION_RE = re.compile(r"\.([0-9a-f]{32})\.(\d+)\.result\.json$")
 _RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
 _RAW_TUPLE_SENTINEL = "__tl_tuple_v1"
-
-
-def write_result_atomic(
-    ipc_dir: Union[str, Path], uid: str, result_dict: dict, incarnation: Optional[str] = None
-) -> None:
-    ArtifactJournal(ipc_dir).write_result_atomic(uid, result_dict, incarnation=incarnation)
-
-
-def _write_result_with_degradation(
-    ipc_dir: Union[str, Path], uid: str, payload: Dict[str, Any], incarnation: Optional[str] = None
-) -> None:
-    """worker 结果落盘的唯一出口：委托 ArtifactJournal 两级降级深模块。"""
-    ArtifactJournal(ipc_dir).write_result_with_degradation(uid, payload, incarnation=incarnation)
 
 
 def _normalize_handler_result(result: Any) -> Tuple[bool, Dict[str, Any]]:
@@ -259,11 +232,11 @@ def _mp_worker_wrapper(handler_func: Callable, job: Job, ctx: TaskContext, ipc_d
             f"worker started without incarnation for {uid}: "
             f"fencing requires ctx.incarnation set by submit"
         )
+    journal = ArtifactJournal(ipc_dir)
     transient_registry = getattr(ctx, "transient_registry", ()) or ()
     _lock_fd = lockfile.try_acquire_lock(ipc_dir, uid, timeout=2.0)
     if _lock_fd is None:
-        _write_result_with_degradation(
-            ipc_dir,
+        journal.write_result_with_degradation(
             uid,
             {
                 "status": "retry",
@@ -275,8 +248,7 @@ def _mp_worker_wrapper(handler_func: Callable, job: Job, ctx: TaskContext, ipc_d
         return
     try:
         raw_result = handler_func(job, ctx)
-        _write_result_with_degradation(
-            ipc_dir,
+        journal.write_result_with_degradation(
             uid,
             {
                 "status": "success",
@@ -288,12 +260,11 @@ def _mp_worker_wrapper(handler_func: Callable, job: Job, ctx: TaskContext, ipc_d
             incarnation=incarnation,
         )
     except RetryError as e:
-        _write_result_with_degradation(
-            ipc_dir, uid, {"status": "retry", "error": str(e)}, incarnation=incarnation
+        journal.write_result_with_degradation(
+            uid, {"status": "retry", "error": str(e)}, incarnation=incarnation
         )
     except FatalError as e:
-        _write_result_with_degradation(
-            ipc_dir,
+        journal.write_result_with_degradation(
             uid,
             {
                 "status": "fatal",
@@ -310,15 +281,13 @@ def _mp_worker_wrapper(handler_func: Callable, job: Job, ctx: TaskContext, ipc_d
             transient_exceptions=getattr(ctx, "transient_exceptions", None),
         )
         if kind == "retry":
-            _write_result_with_degradation(
-                ipc_dir,
+            journal.write_result_with_degradation(
                 uid,
                 {"status": "retry", "error": f"{type(e).__name__}: {e}"},
                 incarnation=incarnation,
             )
         elif kind == "fatal":
-            _write_result_with_degradation(
-                ipc_dir,
+            journal.write_result_with_degradation(
                 uid,
                 {
                     "status": "fatal",
@@ -328,8 +297,7 @@ def _mp_worker_wrapper(handler_func: Callable, job: Job, ctx: TaskContext, ipc_d
                 incarnation=incarnation,
             )
         else:
-            _write_result_with_degradation(
-                ipc_dir,
+            journal.write_result_with_degradation(
                 uid,
                 {
                     "status": "error",
@@ -339,8 +307,7 @@ def _mp_worker_wrapper(handler_func: Callable, job: Job, ctx: TaskContext, ipc_d
                 incarnation=incarnation,
             )
     except KeyboardInterrupt as e:
-        _write_result_with_degradation(
-            ipc_dir,
+        journal.write_result_with_degradation(
             uid,
             {
                 "status": "interrupted",
@@ -350,8 +317,7 @@ def _mp_worker_wrapper(handler_func: Callable, job: Job, ctx: TaskContext, ipc_d
             incarnation=incarnation,
         )
     except SystemExit as e:
-        _write_result_with_degradation(
-            ipc_dir,
+        journal.write_result_with_degradation(
             uid,
             {
                 "status": "error",
@@ -776,16 +742,6 @@ __all__ = [
     "_decode_ipc_result",
     "_decode_raw_result",
     "_encode_raw_result",
-    "_iter_stale_result_paths",
     "_mp_worker_wrapper",
     "_normalize_handler_result",
-    "_write_result_with_degradation",
-    "cleanup_ipc_files",
-    "read_inputs",
-    "read_outputs",
-    "read_result_file",
-    "read_signals",
-    "result_path",
-    "result_tmp_path",
-    "write_result_atomic",
 ]

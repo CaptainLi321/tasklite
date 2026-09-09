@@ -19,13 +19,8 @@ import pytest
 from tasklite.engine.channel import (
     ExecutionChannel,
     _normalize_handler_result,
-    append_signal,
-    cleanup_ipc_files,
-    read_result_file,
-    read_signals,
-    result_path,
-    write_result_atomic,
 )
+from tasklite.utils.ipc import ArtifactJournal
 from tasklite.engine.resource import CapacityResource, Resource
 from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.context import TaskContext
@@ -269,55 +264,60 @@ class TestFileBasedIPC:
 
     def test_write_and_read_result_roundtrip(self, tmp_path):
         """结果原子写 → 可读回（无部分消息问题）。"""
+        journal = ArtifactJournal(tmp_path)
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(
-            str(tmp_path), "t::j1", {"status": "success", "x": 1}, incarnation=inc
+        journal.write_result_atomic(
+            "t::j1", {"status": "success", "x": 1}, incarnation=inc
         )
-        assert result_path(str(tmp_path), "t::j1", inc).exists()
-        data = read_result_file(result_path(str(tmp_path), "t::j1", inc))
+        assert journal.result_path("t::j1", inc).exists()
+        data = journal.read_result(journal.result_path("t::j1", inc))
         assert data == {"status": "success", "x": 1}
 
     def test_write_result_no_tmp_leftover(self, tmp_path):
         """原子写后 .tmp 文件被 rename 掉，不留残留。"""
-        from tasklite.engine.channel import result_tmp_path
+        journal = ArtifactJournal(tmp_path)
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(
-            str(tmp_path), "t::j1", {"status": "success"}, incarnation=inc
+        journal.write_result_atomic(
+            "t::j1", {"status": "success"}, incarnation=inc
         )
-        assert not result_tmp_path(str(tmp_path), "t::j1", inc).exists()
+        assert not journal.result_tmp_path("t::j1", inc).exists()
 
     def test_read_missing_returns_none(self, tmp_path):
         """结果文件不存在 → None（父进程轮询未完成状态）。"""
+        journal = ArtifactJournal(tmp_path)
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        assert read_result_file(result_path(str(tmp_path), "t::ghost", inc)) is None
+        assert journal.read_result(journal.result_path("t::ghost", inc)) is None
 
     def test_read_corrupt_returns_none(self, tmp_path):
         """损坏的结果文件 → None（宁可重跑，不可崩）。"""
+        journal = ArtifactJournal(tmp_path)
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        p = result_path(str(tmp_path), "t::j1", inc)
+        p = journal.result_path("t::j1", inc)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("not json {{{")
-        assert read_result_file(p) is None
+        assert journal.read_result(p) is None
 
     def test_append_and_read_signals(self, tmp_path):
         """suspend 信号追加 → 读取并删除（排空语义）。"""
-        append_signal(str(tmp_path), "t::j1", "api", 30.0)
-        append_signal(str(tmp_path), "t::j1", "api", 5.0)
-        signals = read_signals(str(tmp_path), "t::j1")
+        journal = ArtifactJournal(tmp_path)
+        journal.record_signal("t::j1", "api", 30.0)
+        journal.record_signal("t::j1", "api", 5.0)
+        signals = journal.drain_signals("t::j1")
         assert signals == [("api", 30.0), ("api", 5.0)]
         # 排空后文件删除
         assert not (tmp_path / "t::j1.signals.jsonl").exists()
         # 再次读取为空
-        assert read_signals(str(tmp_path), "t::j1") == []
+        assert journal.drain_signals("t::j1") == []
 
     def test_cleanup_removes_all_files(self, tmp_path):
         """cleanup 删除结果 + 信号 + 临时文件。"""
+        journal = ArtifactJournal(tmp_path)
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-        write_result_atomic(
-            str(tmp_path), "t::j1", {"status": "success"}, incarnation=inc
+        journal.write_result_atomic(
+            "t::j1", {"status": "success"}, incarnation=inc
         )
-        append_signal(str(tmp_path), "t::j1", "api", 1.0)
-        cleanup_ipc_files(str(tmp_path), "t::j1")
+        journal.record_signal("t::j1", "api", 1.0)
+        journal.cleanup_ipc_files("t::j1")
         assert list(Path(tmp_path).iterdir()) == []
 
 
@@ -489,18 +489,17 @@ class TestDeadlockBulkFailureCrashes:
 
     def test_write_result_atomic_rejects_nan(self, tmp_path):
         """ 回归：write_result_atomic 写含 NaN 的结果必须抛（不落非标准 JSON）。"""
-        from tasklite.engine.channel import write_result_atomic, result_path
-        import json as _json
-        ipc_dir = str(tmp_path / "ipc")
+        ipc_dir = tmp_path / "ipc"
+        journal = ArtifactJournal(ipc_dir)
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
         with pytest.raises(ValueError):
-            write_result_atomic(
-                ipc_dir, "t::j1",
+            journal.write_result_atomic(
+                "t::j1",
                 {"status": "success", "raw_result": {"v": float("nan")}},
                 incarnation=inc,
             )
         # 原子写失败 → 无残留文件（tmp 被清理）
-        assert not result_path(ipc_dir, "t::j1", inc).exists()
+        assert not journal.result_path("t::j1", inc).exists()
 
 
 class TestDispatchFailureThreeStrike:

@@ -18,9 +18,7 @@ IO 故障时 OSError 直接穿透 → worker 裸崩退出（无结果文件）�
 import pytest
 
 from tasklite.engine import channel as channel_mod
-from tasklite.engine.channel import (
-    _mp_worker_wrapper, read_result_file, result_path,
-)
+from tasklite.engine.channel import _mp_worker_wrapper
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
 from tasklite.utils.ipc import ArtifactJournal
@@ -71,7 +69,8 @@ class TestWorkerResultWriteDegraded:
         _mp_worker_wrapper(lambda j, c: (True, {"v": 1}), job,
                            _make_ctx(job), str(tmp_path))
 
-        res = read_result_file(result_path(str(tmp_path), "h::a", _INCARNATION))
+        journal = ArtifactJournal(str(tmp_path))
+        res = journal.read_result("h::a", incarnation=_INCARNATION)
         assert res is not None, "降级写必须成功落盘（小 payload 可写）"
         assert res["status"] == "retry", (
             f"success 降级必须改写 retry（重跑而非丢失）: {res}"
@@ -112,7 +111,8 @@ class TestWorkerResultWriteDegraded:
         _mp_worker_wrapper(lambda j, c: (True, {}), job,
                            _make_ctx(job), str(tmp_path))
 
-        res = read_result_file(result_path(str(tmp_path), "h::a", _INCARNATION))
+        journal = ArtifactJournal(str(tmp_path))
+        res = journal.read_result("h::a", incarnation=_INCARNATION)
         assert res is not None, "锁冲突完整写失败后必须降级写最小 retry 结果"
         assert res["status"] == "retry"
         assert res.get("lock_conflict") is True, (
@@ -138,7 +138,8 @@ class TestWorkerResultWriteDegraded:
         _mp_worker_wrapper(lambda j, c: (True, {}), job,
                            _make_ctx(job), str(tmp_path))
 
-        assert not result_path(str(tmp_path), "h::a", _INCARNATION).exists(), (
+        journal = ArtifactJournal(str(tmp_path))
+        assert not journal.result_path("h::a", _INCARNATION).exists(), (
             "全部写失败时不应存在结果文件"
         )
 

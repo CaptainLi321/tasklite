@@ -19,6 +19,7 @@ from tasklite.engine.channel import (
     _decode_ipc_result,
 )
 from tasklite.models.job import Job
+from tasklite.utils.ipc import ArtifactJournal
 
 # 合法的成功结果基线（其余字段全部正常，只变异目标字段）
 _BASE_OK = {
@@ -140,10 +141,9 @@ class TestDecodeIpcsResultDefense:
     def test_missing_output_marks_failed(self, tmp_path):
         """防御分支（mutmut_208）：成功但声明输出文件不存在 → Missing output
         失败（输出存在性校验）。"""
-        from tasklite.engine.channel import append_output
         ipc = str(tmp_path)
         uid = "t::a"
-        append_output(ipc, uid, str(tmp_path / "missing.jpg"), True)
+        ArtifactJournal(ipc).record_output(uid, str(tmp_path / "missing.jpg"), True)
         result = _decode(dict(_BASE_OK), ipc_dir=ipc)
         assert result.success is False
         assert "Missing output" in result.result_meta["error"]
@@ -151,22 +151,20 @@ class TestDecodeIpcsResultDefense:
     def test_present_output_passes(self, tmp_path):
         """对偶路径：声明输出文件存在 → 校验通过（防「缺失→失败」误伤
         正常路径）。"""
-        from tasklite.engine.channel import append_output
         ipc = str(tmp_path)
         uid = "t::a"
         out = tmp_path / "present.jpg"
         out.write_bytes(b"x")
-        append_output(ipc, uid, str(out), True)
+        ArtifactJournal(ipc).record_output(uid, str(out), True)
         result = _decode(dict(_BASE_OK), ipc_dir=ipc)
         assert result.success is True
 
     def test_cache_output_skips_existence_check(self, tmp_path):
         """对偶路径：kind=cache 的临时文件跳过存在性校验（原子产出的 .part
         已被 os.replace，校验必然失败——跳过是设计而非漏洞）。"""
-        from tasklite.engine.channel import append_output
         ipc = str(tmp_path)
         uid = "t::a"
-        append_output(ipc, uid, str(tmp_path / "cache.part"), True, kind="cache")
+        ArtifactJournal(ipc).record_output(uid, str(tmp_path / "cache.part"), True, kind="cache")
         result = _decode(dict(_BASE_OK), ipc_dir=ipc)
         assert result.success is True
 
@@ -277,7 +275,6 @@ class TestReadDeclarationsSkipBadLines:
 
     def test_read_outputs_skips_bad_line_keeps_good_ones(self, tmp_path):
         """坏行 + 后随好行 → 坏行跳过、好行保留（continue→break 变异点）。"""
-        from tasklite.engine.channel import read_outputs
         ipc = str(tmp_path)
         uid = "t::a"
         p = tmp_path / f"t%3A%3Aa.outputs.jsonl"
@@ -287,13 +284,12 @@ class TestReadDeclarationsSkipBadLines:
             '{"path": "/ok2", "cleanup": true, "kind": "output"}\n',  # 坏行后的好行
             encoding="utf-8",
         )
-        outputs = read_outputs(ipc, uid)
+        outputs = ArtifactJournal(ipc).read_outputs(uid)
         assert len(outputs) == 2, "坏行应被跳过而非终止读取"
         assert outputs[0][0] == "/ok1" and outputs[1][0] == "/ok2"
 
     def test_read_outputs_skips_empty_line(self, tmp_path):
         """空行跳过（continue→break 的另一变异点：空行后仍有数据）。"""
-        from tasklite.engine.channel import read_outputs
         ipc = str(tmp_path)
         uid = "t::a"
         p = tmp_path / f"t%3A%3Aa.outputs.jsonl"
@@ -303,12 +299,11 @@ class TestReadDeclarationsSkipBadLines:
             '{"path": "/b", "cleanup": true, "kind": "output"}\n',
             encoding="utf-8",
         )
-        outputs = read_outputs(ipc, uid)
+        outputs = ArtifactJournal(ipc).read_outputs(uid)
         assert [o[0] for o in outputs] == ["/a", "/b"]
 
     def test_read_signals_skips_bad_line_keeps_good_ones(self, tmp_path):
         """signals 坏行跳过 + 后随好行保留（continue→break 变异点）。"""
-        from tasklite.engine.channel import read_signals
         ipc = str(tmp_path)
         uid = "t::a"
         p = tmp_path / f"t%3A%3Aa.signals.jsonl"
@@ -318,13 +313,12 @@ class TestReadDeclarationsSkipBadLines:
             '{"suspend": ["api", 2.0]}\n',
             encoding="utf-8",
         )
-        signals = read_signals(ipc, uid)
+        signals = ArtifactJournal(ipc).drain_signals(uid)
         assert len(signals) == 2, "坏行应被跳过而非终止读取"
         assert signals[0] == ("api", 1.0) and signals[1] == ("api", 2.0)
 
     def test_read_inputs_skips_bad_line_keeps_good_ones(self, tmp_path):
         """inputs 坏行跳过 + 后随好行保留（continue→break 变异点）。"""
-        from tasklite.engine.channel import read_inputs
         ipc = str(tmp_path)
         uid = "t::a"
         p = tmp_path / f"t%3A%3Aa.inputs.jsonl"
@@ -334,7 +328,7 @@ class TestReadDeclarationsSkipBadLines:
             '{"path": "/in2", "kind": "file", "size": 2, "mtime_ns": 2}\n',
             encoding="utf-8",
         )
-        entries = read_inputs(ipc, uid)
+        entries = ArtifactJournal(ipc).read_inputs(uid)
         assert len(entries) == 2, "坏行应被跳过而非终止读取"
         assert entries[0]["path"] == "/in1" and entries[1]["path"] == "/in2"
 

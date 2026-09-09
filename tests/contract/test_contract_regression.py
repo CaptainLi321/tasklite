@@ -80,12 +80,12 @@ class TestSingleExitContract:
         )
 
     def test_complete_job_finally_cleans_ipc_files(self):
-        """ 验收：complete_job finally 调用 cleanup_ipc_files。"""
+        """ 验收：complete_job finally 调用 cleanup_artifacts。"""
         src = (SRC_DIR / "engine" / "completion.py").read_text()
         complete_start = src.find("def complete_job")
         complete_end = src.find("def apply_result", complete_start)
         complete_body = src[complete_start:complete_end]
-        assert "cleanup_ipc_files" in complete_body, (
+        assert "cleanup_artifacts" in complete_body, (
             "P-2 violation: complete_job does not centralize IPC file cleanup"
         )
 
@@ -345,9 +345,8 @@ class TestSerializationContract:
         写 "error"，decoder 本就处理 "retry"）——错层，不 kill 变异。
         本测试真实持锁 → 调 _mp_worker_wrapper → 断言其结果文件 status。
         """
-        from tasklite.engine.channel import (
-            _mp_worker_wrapper, read_result_file, result_path,
-        )
+        from tasklite.engine.channel import _mp_worker_wrapper
+        from tasklite.utils.ipc import ArtifactJournal
         from tasklite.models.context import TaskContext
         from tasklite.models.job import Job
         from tasklite.utils.lockfile import release_lock, try_acquire_lock
@@ -368,7 +367,7 @@ class TestSerializationContract:
         finally:
             release_lock(fd)
 
-        res = read_result_file(result_path(ipc, "t::a", "test.1"))
+        res = ArtifactJournal(ipc).read_result("t::a", incarnation="test.1")
         assert res is not None, "worker 必须写结果文件"
         assert res.get("status") == "retry", (
             f"LOCK_CONFLICT 应写 retry（自恢复），got status={res.get('status')!r}"
