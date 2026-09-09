@@ -97,3 +97,52 @@ def test_deadlock_decision_structure():
     assert d2.should_terminate is True
     assert d2.failed_uids == ["t::a"]
 
+
+def test_deadlock_governor_arbitrate(tmp_path):
+    """验证 arbitrate 门面对于 None、正常等待、无限等待死锁、有限等待拓扑成环的统一裁决。"""
+    import types
+    from unittest.mock import MagicMock
+    from tasklite.engine.governor import DeadlockGovernor, DeadlockDecision
+
+    gov = DeadlockGovernor(dep_grace_seconds=5.0)
+    mock_store = MagicMock()
+
+    # 1. sched 为 None -> action="none"
+    d_none = gov.arbitrate(None, mock_store)
+    assert d_none.action == "none"
+    assert d_none.should_terminate is False
+    assert d_none.wait_time == 0.0
+
+    # 2. 正常有限等待（非成环）-> action="none"
+    state = PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[Job("t", "a", depends_on=["t::b"]).to_dict()],
+    )
+    sched_backoff = types.SimpleNamespace(
+        min_wait=2.0,
+        waiting_for_dependency=False,
+    )
+    d_backoff = gov.arbitrate(sched_backoff, mock_store, state=state)
+    assert d_backoff.action == "none"
+    assert d_backoff.should_terminate is False
+
+    # 3. 有限等待但拓扑成环（掩盖死锁）-> 触发 resolve_deadlock
+    mock_store.apply_bulk_failure.return_value = types.SimpleNamespace(
+        failed_uids=["t::a", "t::b"], cascaded_uids=[]
+    )
+    cycle_state = PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[
+            Job("t", "a", depends_on=["t::b"]).to_dict(),
+            Job("t", "b", depends_on=["t::a"]).to_dict(),
+        ],
+    )
+    sched_cycle = types.SimpleNamespace(
+        min_wait=1.5,
+        waiting_for_dependency=True,
+    )
+    d_cycle = gov.arbitrate(sched_cycle, mock_store, state=cycle_state)
+    assert d_cycle.action == "resolved"
+    assert "t::a" in d_cycle.failed_uids
+    assert mock_store.apply_bulk_failure.called
+

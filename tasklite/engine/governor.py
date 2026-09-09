@@ -229,6 +229,61 @@ class DeadlockGovernor:
                 remaining_queue.append(jd)
         return uids_metas, remaining_queue
 
+    def arbitrate(
+        self,
+        sched: Any,
+        store: "StateStore",
+        *,
+        state: Optional[PipelineState] = None,
+        scheduler: Optional[Any] = None,
+        ctx: Optional[Any] = None,
+        dep_grace_seconds: Optional[float] = None,
+        deadlock_gap_max_rounds: Optional[int] = None,
+    ) -> DeadlockDecision:
+        """自闭环死锁仲裁单一入口。
+
+        评估调度结果：
+        1. 若 min_wait == inf，直接触发 resolve_deadlock 进行细粒度归因与批量熔断；
+        2. 若 min_wait 为有限值，但处于 waiting_for_dependency 且存在拓扑成环（find_dependency_cycles），
+           自动识别隐式死锁并触发 resolve_deadlock；
+        3. 否则认定为正常等待或背压，返回 action="none"。
+        """
+        if sched is None:
+            return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
+
+        effective_state = state or (ctx.state if ctx is not None else store.state)
+        min_wait = getattr(sched, "min_wait", float("inf"))
+
+        if min_wait == float("inf"):
+            return self.resolve_deadlock(
+                sched,
+                store=store,
+                state=effective_state,
+                scheduler=scheduler or (getattr(ctx, "scheduler", None) if ctx is not None else None),
+                ctx=ctx,
+                dep_grace_seconds=dep_grace_seconds,
+                deadlock_gap_max_rounds=deadlock_gap_max_rounds,
+            )
+
+        if getattr(sched, "waiting_for_dependency", False) and effective_state is not None:
+            cycle_uids = effective_state.find_dependency_cycles()
+            if cycle_uids:
+                logger.error(
+                    f"Deadlock detected during backoff/wait: dependency cycle "
+                    f"{sorted(set(cycle_uids))} masked by finite min_wait."
+                )
+                return self.resolve_deadlock(
+                    sched,
+                    store=store,
+                    state=effective_state,
+                    scheduler=scheduler or (getattr(ctx, "scheduler", None) if ctx is not None else None),
+                    ctx=ctx,
+                    dep_grace_seconds=dep_grace_seconds,
+                    deadlock_gap_max_rounds=deadlock_gap_max_rounds,
+                )
+
+        return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
+
     def resolve_deadlock(
         self,
         sched: Any,

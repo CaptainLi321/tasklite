@@ -12,23 +12,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Protocol, Sequence, Set, Tuple, Union
 
-from .governor import (
-    DEADLOCK_GAP_MAX_ROUNDS,
-    DEP_GRACE_SECONDS,
-    DeadlockDecision,
-    DeadlockGovernor,
-)
+from .governor import DeadlockGovernor
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
 from ..models.state import PipelineState, uid_from_job_dict
 from ..taxonomy import (
     ERR_COMMIT_FAILURE_DLQ,
-    ERR_DEADLOCK_GAP,
-    ERR_DEPENDENCY_DEADLOCK,
     ERR_JOB_DEPENDENCY,
-    ERR_MALFORMED_JOB,
-    ERR_RESOURCE_DEADLOCK,
     ErrorTaxonomy,
     _DEFAULT_TAXONOMY,
 )
@@ -61,10 +52,7 @@ __all__ = [
     "BulkFailureOutcome",
     "COMMIT_FAILURE_DLQ_THRESHOLD",
     "CommitView",
-    "DEADLOCK_GAP_MAX_ROUNDS",
-    "DEP_GRACE_SECONDS",
     "DLQEntry",
-    "DeadlockDecision",
     "DeadlockGovernor",
     "DispatchView",
     "FailureOutcome",
@@ -722,99 +710,12 @@ class StateStore:
             f"On-disk queue preserved; crashing to avoid unbounded retry loop."
         )
 
-    # ── 3. 死锁归因与宽限分析（委托 DeadlockGovernor 深模块）───────────
+    # ── 3. 死锁治理深模块引用 ──────────────────────────────────────────
 
     @property
     def governor(self) -> DeadlockGovernor:
         """关联的死锁治理状态机深模块。"""
         return self._governor
-
-    def _extract_deadlock_uids(
-        self, sched: Any, field_name: str, *args: Any, **kwargs: Any
-    ) -> Set[str]:
-        """统一提取归因 UID 集合（向后兼容委托给 governor）。"""
-        return self._governor._extract_deadlock_uids(sched, field_name)
-
-    @staticmethod
-    def _split_deadlock_by_uids(
-        queue: List[Dict[str, Any]],
-        target_uids: Set[str],
-        error: str,
-    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Dict[str, Any]]]:
-        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」（委托 DeadlockGovernor）。"""
-        return DeadlockGovernor._split_deadlock_by_uids(queue, target_uids, error)
-
-    @staticmethod
-    def _split_deadlock(
-        queue: List[Dict[str, Any]],
-        error: str,
-        *,
-        extract_uid: Callable[[Dict[str, Any]], str],
-        include: Callable[[int, str], bool],
-    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Dict[str, Any]]]:
-        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」（向后兼容签名）。"""
-        uids_metas: List[Tuple[str, Dict[str, Any]]] = []
-        remaining_queue: List[Dict[str, Any]] = []
-        for idx, jd in enumerate(queue):
-            uid = extract_uid(jd)
-            if include(idx, uid):
-                uids_metas.append((uid, {"error": error, "root_cause": True}))
-            else:
-                remaining_queue.append(jd)
-        return uids_metas, remaining_queue
-
-    def _dependency_grace(
-        self,
-        missing_identifiers: Union[Sequence[int], Set[str], Sequence[str]],
-        *,
-        has_potential_spawners: Optional[bool] = None,
-        ctx: Optional[Any] = None,
-        scheduler: Optional[Any] = None,
-        grace_seconds: float = DEP_GRACE_SECONDS,
-    ) -> bool:
-        """宽限：缺失依赖的 job 是否应等待而非立即 DLQ（委托 DeadlockGovernor）。"""
-        gov = getattr(ctx, "governor", None) or self._governor
-        effective_scheduler = scheduler or (getattr(ctx, "scheduler", None) if ctx is not None else getattr(self._ctx, "scheduler", None))
-        return gov.check_dependency_grace(
-            self._state,
-            missing_identifiers,
-            has_potential_spawners=has_potential_spawners,
-            scheduler=effective_scheduler,
-            grace_seconds=grace_seconds,
-        )
-
-    def _deadlock_gap_or_escalate(
-        self,
-        log_prefix: str,
-        *,
-        ctx: Optional[Any] = None,
-        max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS,
-    ) -> bool:
-        """死锁分类缺口的连续轮次升级逻辑（委托 DeadlockGovernor）。"""
-        gov = getattr(ctx, "governor", None) or self._governor
-        return gov.check_gap_or_escalate(log_prefix, max_rounds=max_rounds)
-
-    def handle_deadlock(
-        self,
-        sched: Any,
-        *,
-        ctx: Optional[Any] = None,
-        scheduler: Optional[Any] = None,
-        dep_grace_seconds: float = DEP_GRACE_SECONDS,
-        deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS,
-    ) -> DeadlockDecision:
-        """处理死锁：细粒度归因 + bulk_failure + cascade（委托 DeadlockGovernor）。"""
-        gov = getattr(ctx, "governor", None) or self._governor
-        effective_scheduler = scheduler or (getattr(ctx, "scheduler", None) if ctx is not None else getattr(self._ctx, "scheduler", None))
-        return gov.resolve_deadlock(
-            sched,
-            store=self,
-            state=self._state,
-            scheduler=effective_scheduler,
-            ctx=ctx or self._ctx,
-            dep_grace_seconds=dep_grace_seconds,
-            deadlock_gap_max_rounds=deadlock_gap_max_rounds,
-        )
 
 
     # ── 5. 统一状态查询与管理接缝 ────────────────────────────────────────

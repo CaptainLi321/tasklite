@@ -95,11 +95,14 @@ class TaskStats(dict):
         return self["cascade_failed"]
 
 
-from .governor import DeadlockGovernor, EpisodeState
-from .store import (
-    COMMIT_FAILURE_DLQ_THRESHOLD,
+from .governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
+    DeadlockGovernor,
+    EpisodeState,
+)
+from .store import (
+    COMMIT_FAILURE_DLQ_THRESHOLD,
     StateStore,
 )
 from .channel import ArtifactCleanupMode, ExecutionChannel, ExecutionResult, JobHandle
@@ -633,13 +636,20 @@ class EngineRuntime:
         if last_outcome is not None and not last_outcome.has_runnable:
             if store.is_empty and not self._ctx.in_flight:
                 should_terminate = True
-            elif last_outcome.min_wait == float("inf"):
-                if not self._ctx.in_flight:
+            elif not self._ctx.in_flight:
+                decision = self._ctx.governor.arbitrate(
+                    last_outcome,
+                    store=self._ctx.store,
+                    state=self._ctx.state,
+                    scheduler=self._ctx.scheduler,
+                    ctx=self._ctx,
+                )
+                if decision.action == "resolved":
                     deadlock_detected = True
-                    decision = self._ctx.store.handle_deadlock(last_outcome, ctx=self._ctx)
                     if decision.should_terminate:
                         should_terminate = True
-                    elif decision.wait_time > 0:
+                elif decision.action in ("grace_waiting", "gap_retrying"):
+                    if decision.wait_time > 0:
                         deadlock_wait = decision.wait_time
 
         # 3. Drain 回收在途结果
@@ -668,34 +678,11 @@ class EngineRuntime:
             else:
                 wait_time = 0.0
                 should_wait = False
-        elif last_outcome is not None and not last_outcome.has_runnable and last_outcome.min_wait != float("inf"):
-            if not self._ctx.in_flight and last_outcome.waiting_for_dependency:
-                cycle_uids = store.find_dependency_cycles()
-                if cycle_uids:
-                    logger.error(
-                        f"Deadlock detected during backoff/wait: dependency cycle "
-                        f"{sorted(set(cycle_uids))} masked by finite min_wait."
-                    )
-                    deadlock_detected = True
-                    decision = self._ctx.store.handle_deadlock(last_outcome, ctx=self._ctx)
-                    if decision.should_terminate:
-                        should_terminate = True
-                        wait_time = 0.0
-                        should_wait = False
-                    elif decision.wait_time > 0:
-                        wait_time = decision.wait_time
-                        should_wait = True
-                    else:
-                        wait_time = 0.0
-                        should_wait = False
-                else:
-                    wait_time = min(last_outcome.min_wait, 1.0)
-                    should_wait = True
-            else:
-                wait_time = min(last_outcome.min_wait, 1.0)
-                should_wait = True
         elif deadlock_wait > 0 and not self._ctx.in_flight:
             wait_time = min(deadlock_wait, 1.0)
+            should_wait = True
+        elif last_outcome is not None and not last_outcome.has_runnable and last_outcome.min_wait != float("inf"):
+            wait_time = min(last_outcome.min_wait, 1.0)
             should_wait = True
         elif worker_wait > 0 and not self._ctx.in_flight:
             wait_time = min(worker_wait, 1.0)

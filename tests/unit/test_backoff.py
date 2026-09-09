@@ -487,29 +487,25 @@ class TestInputChangedDirect:
 
 
 class TestSplitDeadlockDirect:
-    """_split_deadlock 直接单测——两种谓词类型（索引/uid）。"""
+    """_split_deadlock_by_uids 直接单测。"""
 
-    def test_index_based_split(self):
-        from tasklite.engine.store import StateStore
+    def test_uid_based_split(self):
+        from tasklite.engine.governor import DeadlockGovernor
         queue = [{"task_type": "t", "job_id": "a"},
                  {"task_type": "t", "job_id": "b"}]
-        uids_metas, remaining = StateStore._split_deadlock(
-            queue, "MALFORMED_JOB",
-            extract_uid=lambda jd: f"{jd['task_type']}::{jd['job_id']}",
-            include=lambda idx, uid, root={0}: idx in root,
+        uids_metas, remaining = DeadlockGovernor._split_deadlock_by_uids(
+            queue, {"t::a"}, "MALFORMED_JOB"
         )
         assert uids_metas == [("t::a", {"error": "MALFORMED_JOB", "root_cause": True})]
         assert remaining == [{"task_type": "t", "job_id": "b"}]
 
     def test_uid_based_split_preserves_order(self):
-        from tasklite.engine.store import StateStore
+        from tasklite.engine.governor import DeadlockGovernor
         queue = [{"task_type": "t", "job_id": "a"},
                  {"task_type": "t", "job_id": "b"},
                  {"task_type": "t", "job_id": "c"}]
-        uids_metas, remaining = StateStore._split_deadlock(
-            queue, "DEPENDENCY_DEADLOCK",
-            extract_uid=lambda jd: f"{jd['task_type']}::{jd['job_id']}",
-            include=lambda idx, uid, roots={"t::b"}: uid in roots,
+        uids_metas, remaining = DeadlockGovernor._split_deadlock_by_uids(
+            queue, {"t::b"}, "DEPENDENCY_DEADLOCK"
         )
         assert [u for u, _ in uids_metas] == ["t::b"]
         assert [j["job_id"] for j in remaining] == ["a", "c"]
