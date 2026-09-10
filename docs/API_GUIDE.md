@@ -31,7 +31,7 @@ from tasklite import (
 | `sanitize_content_id` | `from tasklite.wrappers.discovery import sanitize_content_id` | content_id 净化（job_id 派生单点） |
 | `http_guard`, `SnapshotStore` 等 | `from tasklite.wrappers.http import http_guard, SQLiteSnapshotStore, ...` | 官方轻量网络守卫与快照工具（见 §16） |
 
-`engine/` 与 `backend/` 子包不做再导出（如 `SQLiteStateBackend` 须从 `tasklite.backend.sqlite_backend` 导入）。
+`engine/` 与 `backend/` 子包不做再导出（如 `SQLiteStateBackend` 须从 `tasklite.backend.sqlite_backend` 导入）。`engine/config`（RunConfig 装配快照）、`engine/session`（RunSession 生命周期）、`engine/pacing`（等待决策）、`engine/console`（OpsConsole 运维委托）等引擎内部接缝模块不对用户开放——等价公共能力一律经 `TaskLite` 门面与本章 API 提供。
 
 
 **标准调用顺序（六步，顺序本身是设计的一部分）**：
@@ -51,6 +51,10 @@ from tasklite import (
 | ④ 入队 | `enqueue(Job(...))` 或 `enqueue([Job(...)], front=False)` | 单 Job 自动包成列表；在 `run()` 启动前完成；同 uid 静默去重；payload 必须 JSON 可序列化 |
 | ⑤ 点火 | `run()` | 阻塞至队列排空；首次 SIGTERM 优雅 DRAINING、二次强制 ABORTING；同一 `state_dir` 并发 `run()` 由 pipeline 级文件锁 fail-loud 拒绝 |
 | ⑥ 停机 | `stop(force=False)` / `stop(force=True)` | **请求**停机（非阻塞，由 `run()` 消费）：生产用 DRAINING；`force=True` → ABORTING（见 §7） |
+
+> **run() 期守卫（1.2.0 起代码级强制）**：②③④ 的全部装配/入队 API（`add_resource` / `register_handler` / `register_discovery` / `register_transient_exception` / `enqueue`）以及 §7 全部管理 API，在 `run()` 进行中调用一律抛 `RuntimeError`——「装配仅限 run() 之外」从文档约定升级为代码强制。
+>
+> **门面内部属性弃用预告（1.2.0 起发 `DeprecationWarning`，次版本移除）**：`pipeline.store` / `scheduler` / `governor` / `channel` / `state` / `in_flight` 六个内部深模块只读属性访问会告警——运维操作请改用 §7 管理 API（`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`），其余能力经本章公共 API 等价获得；`pipeline.on_run_start = ...` 等钩子 setter 同样告警，钩子应在构造期参数传入（见 §10.1）。`pipeline.backend`（含 setter）保留不发警告。
 
 ---
 
@@ -224,6 +228,8 @@ from tasklite import (
 - `progress_hook` / `job_ref`：父进程进度回调；
 - `slice_list(items, start, count, limit)`：分批切片工具。
 
+> 三个工具函数（`progress_hook` / `job_ref` / `slice_list`）本体位于 `tasklite/hooks.py`（自 pipeline 门面迁出），顶层 `from tasklite import ...` 导出面不变。
+
 > **主机生命周期与瞬态注册（直接由 `TaskLite` 原生提供）**：
 > - `pipeline.run_graceful()`：统一 run + 优雅停机包装（Ctrl+C 转 DRAINING，自然等在途完成后安全退出）；
 > - `pipeline.register_transient_exceptions([cls1, cls2])`：批量注册业务瞬态异常；
@@ -272,7 +278,7 @@ from tasklite.wrappers.discovery import sanitize_content_id  # 公开的 content
 | 二次 `stop(force=True)` 或 SIGTERM | **ABORTING**：**已完成**（结果文件已落盘、只差 drain 回收）的 job 被消费提交（进 wall/failed，不 kill、不删产出、不 requeue）；仅对**进行中** job 执行 kill + 清半成品 + requeue 后退出 |
 | Ctrl+C（KeyboardInterrupt） | 立即中止：已完成 job 同样被消费提交，仅进行中 job requeue（不进 DLQ） |
 
-**崩溃恢复三层防线**：结果文件携带执行代标识（`{uid}.{run_id}.{seq}.result.json`，孤儿进程的旧结果对新 run 不可见）；派发前消费上次崩溃残留的结果文件（drain_stale）；`{uid}.lock` 文件锁探测孤儿执行体（同 uid 同时只有一个执行体）。执行代标识（incarnation）由 `WorkerLaunchSpec`——跨进程 seam 的 frozen 具名契约（handler/job/task_ctx/incarnation/ipc_dir/timeout）——携带，不借道 TaskContext。
+**崩溃恢复三层防线**：结果文件携带执行代标识（`{uid}.{run_id}.{seq}.result.json`，孤儿进程的旧结果对新 run 不可见）；派发前认领上次崩溃残留的结果文件（派发预检关 5 stale-restore，经 `channel.claim_stale_result`）；`{uid}.lock` 文件锁探测孤儿执行体（同 uid 同时只有一个执行体）。执行代标识（incarnation）由 `WorkerLaunchSpec`——跨进程 seam 的 frozen 具名契约（handler/job/task_ctx/incarnation/ipc_dir/timeout）——携带，不借道 TaskContext。
 
 ---
 
@@ -378,11 +384,11 @@ wall 条目除业务 meta 外携带：`run_count`（成功次数）、`last_run_
 
 1. **双实例并发（代码级强制）**：同一 `state_dir` 并发 `run()` 会被 pipeline 级文件锁 fail-loud 拒绝（`RuntimeError`），不再只是文档约定；历史语义是去重被击穿、commit 互相打崩。不同业务线仍请用不同 `state_dir`。
 2. **`backoff_max` 是软上限**：抖动后实际退避可达 `1.25 × backoff_max`。需硬上限请按 `backoff_max / 1.25` 设置。
-3. **`enqueue()` 与 `run()` 不可并发**：运行中的 `run()` 看不到之后入队的任务（无告警）。正确用法：`run()` 前完成 enqueue，或在 handler 内 `ctx.spawn()`。
+3. **`enqueue()` 与 `run()` 不可并发（1.2.0 起代码级强制）**：运行中的 `run()` 看不到之后入队的任务——run() 期间调用 `enqueue()` 直接抛 `RuntimeError`（装配/管理 API 同守卫，见 §1）。正确用法：`run()` 前完成 enqueue，或在 handler 内 `ctx.spawn()`。
 4. **路径沙盒 TOCTOU 窗口**：路径检查与实际写文件之间存在理论性 symlink 替换窗口。不可信环境下在 handler 内用 `os.open(..., O_NOFOLLOW)`。
-5. **依赖「动态 spawn 的 uid」死锁宽限**：`DEPENDENCY_DEADLOCK` 判定加了宽限期（`_dependency_grace`，60s）——队列中存在可运行候选（潜在 spawner）时给宽限而非立即 DLQ，spawner 退避/阻塞期间依赖其未来子任务的 job 不会被误杀；宽限超时才判死锁。极端场景（spawner 长时间不可运行）仍建议「同批先 spawn 再引用」。
-6. **3-strike commit 守卫覆盖 bulk 路径**：死锁/级联的批量提交失败现在同样计数（`_commit_bulk_failed_crash`，`_commit_failures` 持久化），达阈值转单条 DLQ——持久性 DB 故障下不再无限崩溃重启循环（达阈值后单条 DLQ 也失败时仍需人工介入）。
-7. **job_id 结尾含 `.<32hex>.<数字>` 的残留结果文件歧义（理论）**：结果文件命名 `{safe_uid}.{run_id}.{seq}.result.json` 的孵化段用 32-hex + 数字——若某 job 的 `job_id` 恰好以 `.<32hex>.<数字>` 结尾（如 `t::a.abcdef01234567890123456789012345.3`），其残留文件与 `t::a` 的孵化文件路径形状重合，`_iter_stale_result_paths` 可能把兄弟 uid 的残留误收为该 uid 的（崩溃恢复时跨 uid 消费结果）。触发需 job_id 恰好满足该形状（正常内容 id 极少 32-hex 结尾），且仅在崩溃恢复的 drain_stale 路径——低概率理论缺陷，记录为已知限制。
+5. **依赖「动态 spawn 的 uid」死锁宽限**：`DEPENDENCY_DEADLOCK` 判定加了宽限期（`DEP_GRACE_SECONDS`，默认 60s，构造参数 `dep_grace_seconds` 可调）——队列中存在可运行候选（潜在 spawner）时给宽限而非立即 DLQ，spawner 退避/阻塞期间依赖其未来子任务的 job 不会被误杀；宽限超时才判死锁。极端场景（spawner 长时间不可运行）仍建议「同批先 spawn 再引用」。
+6. **3-strike commit 守卫覆盖 bulk 路径**：死锁/级联的批量提交失败现在同样计数（`StateStore.commit_bulk_failed_crash`，`_commit_failures` 持久化），达阈值转单条 DLQ——持久性 DB 故障下不再无限崩溃重启循环（达阈值后单条 DLQ 也失败时仍需人工介入）。
+7. **job_id 结尾含 `.<32hex>.<数字>` 的残留结果文件歧义（理论）**：结果文件命名 `{safe_uid}.{run_id}.{seq}.result.json` 的孵化段用 32-hex + 数字——若某 job 的 `job_id` 恰好以 `.<32hex>.<数字>` 结尾（如 `t::a.abcdef01234567890123456789012345.3`），其残留文件与 `t::a` 的孵化文件路径形状重合，`ArtifactJournal.iter_stale_result_paths`（`utils/ipc.py`）可能把兄弟 uid 的残留误收为该 uid 的（崩溃恢复时跨 uid 消费结果）。触发需 job_id 恰好满足该形状（正常内容 id 极少 32-hex 结尾），且仅在崩溃恢复的 stale-restore 路径——低概率理论缺陷，记录为已知限制。
 8. **孤儿 defer 无升级路径（只写不修）**：派发前 `probe_lock` 探测到孤儿执行体持锁时，job 以约 0.75–1s 短退避 requeue 等待（抖动截顶 ≤1s），**无连续 defer 计数、无升级到 DLQ 的路径**。极端场景——D-state 孤儿（NFS/网盘挂起的 IO，SIGKILL 无效）——可导致该 uid **无限 defer**：管线永不排空、job 永不执行也永不进 DLQ，`min_wait` 有限使死锁检测不触发，唯一信号是每秒一条 warning 日志。根因：flock API 不暴露持有者 PID，无法可靠判定「孤儿永久卡死」；即便拿到 PID，D-state 进程 SIGKILL 也无效（`_JOIN_REAP_TIMEOUT=5s` 已防主循环被 join 拖死）。**运维逃生口**：停 pipeline 后整目录离线清理 `ipc/` 下残留的 `{uid}.lock` 锁文件与孤儿进程。长线改进（`{uid}.lock` 记录 PID + 活性探测 + 超时升级 DLQ）需改锁定机制，单独立项，不做小补丁。
 
 ---
@@ -430,7 +436,7 @@ wall 条目除业务 meta 外携带：`run_count`（成功次数）、`last_run_
 
 ## 13. 性能调优
 
-> 本章涉及的调优参数（`dep_grace_seconds` / `commit_failure_dlq_threshold` / `deadlock_gap_max_rounds` 等）一律经 `RunConfig.resolve()` 作为默认值唯一解析点规范化——业务侧透传 Optional 原始值即可，引擎内不存在二次默认值判断。
+> 本章涉及的调优参数（`dep_grace_seconds` / `commit_failure_dlq_threshold` / `deadlock_gap_max_rounds` 等）一律经 `RunConfig.resolve()` 作为默认值唯一解析点规范化——业务侧透传 Optional 原始值即可，引擎内不存在二次默认值判断。默认值以 governor 常量为唯一真相源（`DEP_GRACE_SECONDS=60` / `DEADLOCK_GAP_MAX_ROUNDS=5`）；**行为变更（1.2.0）**：`deadlock_gap_max_rounds` 生效默认由 3 改为 5（旧门面字面量 3 与常量 5 的双默认值冲突，按常量收敛）——依赖 gap 重试轮数的管线如需旧行为，构造时显式传 `deadlock_gap_max_rounds=3`。
 
 ### 13.1 并发度
 
@@ -454,7 +460,7 @@ wall 条目除业务 meta 外携带：`run_count`（成功次数）、`last_run_
 
 - SQLite WAL + `synchronous=FULL`（默认）：断电不丢已应答事务——enqueue 应答后的任务不会静默蒸发（NORMAL 下会）。FULL 在 WAL 下每次 commit 仅多一次 WAL fsync。
 - 需要更高吞吐且接受「enqueue 应答后断电可能丢任务」时：自行子类化 backend 设 `synchronous=NORMAL`（纯持久化微基准下单事务开销可降一个数量级；端到端吞吐收益取决于 handler 执行时间占比）。
-- 高吞吐（>500 job/s）下每个 commit 新建连接的代价可感知——考虑批量提交（`_cascade_fail`/`_handle_deadlock` 的 bulk 路径已合并事务）。
+- 高吞吐（>500 job/s）下每个 commit 新建连接的代价可感知——考虑批量提交（死锁与级联的批量终态经 `StateStore.apply_bulk_failure` / `cascade_fail` 单事务提交，governor 仲裁后由 store 六个 `apply_*` 转移出口族统一收尾）。
 
 ### 13.4 资源挂起持久化
 
