@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import pickle
+import warnings
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -232,24 +233,54 @@ class TaskLite:
         )
 
     # ── 核心深模块与运行期接缝 ──────────────────────────────────────
+    #
+    # 按手册 §4.1 去留表：store / scheduler / governor / channel / state /
+    # in_flight 为内部深模块，过渡期保留只读 + DeprecationWarning，
+    # 次版本移除。is_running / backend（只读）/ stats（只读）保留。
+    #
+
     @property
     def scheduler(self) -> JobScheduler:
         """调度器深模块。"""
+        warnings.warn(
+            "TaskLite.scheduler 为内部深模块属性，将在次版本移除，"
+            "请经 TaskLite 公共 API 使用等价能力",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._runtime.scheduler
 
     @property
     def store(self) -> StateStore:
         """状态与事务深模块。"""
+        warnings.warn(
+            "TaskLite.store 为内部深模块属性，将在次版本移除，"
+            "运维操作请经 list_dlq/clear_dlq 等 TaskLite 管理 API",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._runtime.store
 
     @property
     def governor(self) -> DeadlockGovernor:
         """死锁归因与宽限治理深模块。"""
+        warnings.warn(
+            "TaskLite.governor 为内部深模块属性，将在次版本移除，"
+            "请经 TaskLite 公共 API 使用等价能力",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._runtime.governor
 
     @property
     def channel(self) -> ExecutionChannel:
         """执行通道深模块。"""
+        warnings.warn(
+            "TaskLite.channel 为内部深模块属性，将在次版本移除，"
+            "请经 TaskLite 公共 API 使用等价能力",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._runtime.channel
 
     @property
@@ -274,19 +305,38 @@ class TaskLite:
 
     @property
     def state(self) -> Optional[PipelineState]:
+        warnings.warn(
+            "TaskLite.state 为内部深模块属性，将在次版本移除，"
+            "请经 TaskLite 公共 API 使用等价能力",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._runtime.state
 
     @property
     def in_flight(self) -> InFlightTracker:
+        warnings.warn(
+            "TaskLite.in_flight 为内部深模块属性，将在次版本移除，"
+            "请经 TaskLite 公共 API 使用等价能力",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._runtime.in_flight
 
-    # 钩子读写直达 RunSession（会话持久，后置变更即时生效）
+    # 钩子读写直达 RunSession（会话持久，后置变更即时生效）；
+    # setter 触发 DeprecationWarning（钩子应在构造期参数传入）。
     @property
     def on_run_start(self):
         return self._runtime.session.on_run_start
 
     @on_run_start.setter
     def on_run_start(self, value) -> None:
+        warnings.warn(
+            "TaskLite.on_run_start setter 将在次版本移除，"
+            "请在构造期通过参数传入钩子",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._runtime.session.on_run_start = value
 
     @property
@@ -295,6 +345,12 @@ class TaskLite:
 
     @on_job_completed.setter
     def on_job_completed(self, value) -> None:
+        warnings.warn(
+            "TaskLite.on_job_completed setter 将在次版本移除，"
+            "请在构造期通过参数传入钩子",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._runtime.session.on_job_completed = value
 
     @property
@@ -303,6 +359,12 @@ class TaskLite:
 
     @on_run_end.setter
     def on_run_end(self, value) -> None:
+        warnings.warn(
+            "TaskLite.on_run_end setter 将在次版本移除，"
+            "请在构造期通过参数传入钩子",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._runtime.session.on_run_end = value
 
     def _ensure_not_running(self, api_name: str) -> None:
@@ -551,45 +613,5 @@ class TaskLite:
 
 
 
-def job_ref(meta: Any) -> str:
-    """从 result_meta 提取人类可读引用（#作品id / 画师名 / 任意 id 字段）。"""
-    if isinstance(meta, dict):
-        if "post_id" in meta:
-            return f"#{meta['post_id']}"
-        if "artist" in meta:
-            return str(meta["artist"])
-        if "id" in meta:
-            return str(meta["id"])
-    return ""
-
-
-def progress_hook(uid: str, meta: Any, success: bool, going_to_retry: bool) -> None:
-    """控制台每 job 终结回调：一行进度输出（标准钩子适配器）。"""
-    task_type = uid.split("::", 1)[0]
-    ref = job_ref(meta)
-    label = f"{task_type} {ref}" if ref else task_type
-    if going_to_retry:
-        print(f"  ⟳ {label} 失败，退避重试", flush=True)
-    elif success:
-        print(f"  ✓ {label}", flush=True)
-    else:
-        print(f"  ✗ {label} → DLQ", flush=True)
-
-
-def slice_list(
-    items: List[Any],
-    start: Optional[int],
-    count: Optional[int],
-    limit: Optional[int],
-) -> List[Any]:
-    """分批切片：先 limit，再 [start:start+count]。"""
-    if limit is not None:
-        items = items[:limit]
-    if start is not None or count is not None:
-        s = start if start is not None else 0
-        c = count if count is not None else len(items)
-        items = items[s:s + c]
-    return items
-
-
-
+# 用户工具函数已迁至 hooks.py，此处 re-export 维持历史导入路径。
+from .hooks import job_ref, progress_hook, slice_list  # noqa: F401, E402
