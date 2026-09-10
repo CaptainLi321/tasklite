@@ -32,6 +32,7 @@ RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
 RT_COMMIT_FAILURES = "_commit_failures"
 
 
+from .config import RunConfig
 from .governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
@@ -55,22 +56,8 @@ from ..taxonomy import ErrorTaxonomy
 from ..utils.jsonutil import dumps, loads
 from ..utils.lockfile import release_lock, try_acquire_lock
 
-
-@dataclass(frozen=True)
-class RuntimeConfig:
-    """EngineRuntime 的静态装配配置规范。"""
-    name: str
-    ipc_dir: str
-    output_root: Optional[Union[Path, Sequence[Path]]] = None
-    strict_picklable: bool = False
-    dep_grace_seconds: float = DEP_GRACE_SECONDS
-    commit_failure_dlq_threshold: int = COMMIT_FAILURE_DLQ_THRESHOLD
-    deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
-    fatal_exceptions: Optional[Tuple[type, ...]] = None
-    transient_exceptions: Optional[Tuple[type, ...]] = None
-    on_run_start: Optional[Callable[[], None]] = None
-    on_run_end: Optional[Callable[[str], None]] = None
-    on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None
+# 兼容垫片：历史名称经 runtime 导入的调用方继续可用，随次版本移除。
+RuntimeConfig = RunConfig
 
 
 class RunContext:
@@ -94,9 +81,9 @@ class RunContext:
         discovery_rerun: Optional[Dict[str, str]] = None,
         fatal_exceptions: Optional[Tuple[type, ...]] = None,
         transient_exceptions: Optional[Tuple[type, ...]] = None,
-        dep_grace_seconds: Optional[float] = None,
-        commit_failure_dlq_threshold: Optional[int] = None,
-        deadlock_gap_max_rounds: Optional[int] = None,
+        dep_grace_seconds: float = DEP_GRACE_SECONDS,
+        commit_failure_dlq_threshold: int = COMMIT_FAILURE_DLQ_THRESHOLD,
+        deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS,
     ) -> None:
         self.name = name
         self._backend = backend
@@ -125,17 +112,9 @@ class RunContext:
         self.discovery_rerun = discovery_rerun if discovery_rerun is not None else {}
         self.policy: ExecutionPolicy = ExecutionPolicy(self.discovery_rerun)
 
-        self.dep_grace_seconds: float = (
-            float(dep_grace_seconds) if dep_grace_seconds is not None else DEP_GRACE_SECONDS
-        )
-        self.commit_failure_dlq_threshold: int = (
-            int(commit_failure_dlq_threshold)
-            if commit_failure_dlq_threshold is not None else COMMIT_FAILURE_DLQ_THRESHOLD
-        )
-        self.deadlock_gap_max_rounds: int = (
-            int(deadlock_gap_max_rounds)
-            if deadlock_gap_max_rounds is not None else DEADLOCK_GAP_MAX_ROUNDS
-        )
+        self.dep_grace_seconds: float = dep_grace_seconds
+        self.commit_failure_dlq_threshold: int = commit_failure_dlq_threshold
+        self.deadlock_gap_max_rounds: int = deadlock_gap_max_rounds
 
         self.governor: DeadlockGovernor = DeadlockGovernor(
             dep_grace_seconds=self.dep_grace_seconds,
@@ -278,7 +257,7 @@ class EngineRuntime:
 
     def __init__(
         self,
-        config: RuntimeConfig,
+        config: RunConfig,
         backend: AbstractStateBackend,
         resources: Union[ResourceManager, Dict[str, Resource]],
         handlers: Dict[str, Any],
