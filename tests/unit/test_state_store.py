@@ -7,10 +7,7 @@ import pytest
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.store import (
     BulkFailureOutcome,
-    CommitView,
-    DispatchView,
     FailureOutcome,
-    RecoveryView,
     RetryOutcome,
     SkipOutcome,
     StateStore,
@@ -206,48 +203,3 @@ class TestStateStoreQueueAndMembership:
         assert "q::2" in store.in_flight_uids
         store.unregister_in_flight("q::2")
         assert "q::2" not in store.in_flight_uids
-
-
-class TestStateStoreProtocolCompliance:
-    """验证 StateStore 实例完整满足 DispatchView, CommitView, RecoveryView 三个角色窄视图。"""
-
-    def test_protocol_attributes_and_methods(self):
-        backend = InMemoryStateBackend()
-        state = PipelineState({}, {}, {}, [])
-        store = StateStore(backend, state)
-
-        # 1. DispatchView 属性与方法验证
-        dispatch_attrs = [
-            "in_flight_uids", "wall_uids", "failed_uids", "cursors",
-            "queue", "wall", "failed", "queue_uids",
-        ]
-        for attr in dispatch_attrs:
-            assert hasattr(store, attr), f"DispatchView missing attribute: {attr}"
-
-        dispatch_methods = [
-            "pop_job", "requeue_jobs", "is_known",
-            "unregister_in_flight", "register_in_flight",
-            "apply_failure", "apply_skip",
-        ]
-        for method in dispatch_methods:
-            assert callable(getattr(store, method)), f"DispatchView missing method: {method}"
-
-        # 2. CommitView 属性与方法验证
-        commit_attrs = ["in_flight_uids", "queue_uids", "wall", "failed"]
-        for attr in commit_attrs:
-            assert hasattr(store, attr), f"CommitView missing attribute: {attr}"
-
-        commit_methods = [
-            "is_known", "apply_success", "apply_failure", "apply_retry", "cascade_fail",
-        ]
-        for method in commit_methods:
-            assert callable(getattr(store, method)), f"CommitView missing method: {method}"
-
-        # 3. RecoveryView 属性与方法验证
-        assert hasattr(store, "queue"), "RecoveryView missing attribute: queue"
-        recovery_methods = [
-            "requeue_jobs", "clear_in_flight", "unregister_in_flight", "commit_failed_crash",
-        ]
-        for method in recovery_methods:
-            assert callable(getattr(store, method)), f"RecoveryView missing method: {method}"
-

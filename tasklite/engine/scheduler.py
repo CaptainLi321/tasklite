@@ -13,7 +13,6 @@ from typing import Dict, FrozenSet, List, Optional, Tuple, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .types import HandlerEntry
-    from .store import DispatchView
 
 from .resource import Resource, ResourceManager, ResourceEvaluation
 from ..models.job import Job, JobRuntimeState
@@ -221,12 +220,12 @@ class JobScheduler:
 
     def pop_next_runnable(
         self,
-        state: Union[DispatchView, Any],
+        state: Any,
         in_flight_uids: FrozenSet[str] = frozenset(),
     ) -> ScheduleResult:
         """Scan queue read-only. Returns index and wait info. Does NOT acquire resources.
 
-        ``state`` 满足 DispatchView 协议（读取 queue/wall/failed/queue_uids——
+        ``state`` 提供队列只读事实（queue/wall/failed/queue_uids——
         ``queue_uids`` 返回活索引引用，提供 O(1) 索引，无 O(N) 拷贝）。
 
         ``in_flight_uids`` 是当前正在子进程中执行（已 pop 但未 commit）的 job uid
