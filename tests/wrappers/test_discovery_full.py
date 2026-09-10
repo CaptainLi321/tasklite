@@ -366,10 +366,10 @@ class TestMissingDetection:
 
 class TestDependencyGrace:
     def _init_state(self, p, queue):
-        p._runtime.ctx.state = PipelineState(
+        p._runtime.store.set_state(PipelineState(
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), queue,
-        )
+        ))
 
     def test_grace_granted_when_runnable_candidate_exists(self, tmp_path):
         """有可运行候选（依赖在 wall）→ 宽限（等它 spawn 出依赖）。"""

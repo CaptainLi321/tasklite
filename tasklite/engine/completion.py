@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..backend.base import AbstractStateBackend
     from .channel import ExecutionChannel
     from .inflight import InFlightTracker
     from .policy import ExecutionPolicy
@@ -45,7 +44,6 @@ class CompletionMachine:
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
         session: Any,
-        backend: "AbstractStateBackend",
     ) -> None:
         # session 暂收 RunContext（run_id / fire_job_completed 供给者），
         # RunSession 抽取后原位替换。
@@ -55,7 +53,6 @@ class CompletionMachine:
         self._resources = resources
         self._in_flight = in_flight
         self._session = session
-        self._backend = backend
 
     def complete_job(self, entry: InFlightJob, result: ExecutionResult) -> None:
         """处理一个 in-flight job 的完成结果（薄包装）。
@@ -151,7 +148,7 @@ class CompletionMachine:
                     f"(requested by {uid})"
                 )
         if applied_suspension:
-            persist_resource_suspensions(self._backend, self._resources)
+            persist_resource_suspensions(self._store.backend, self._resources)
 
         # 2. 状态分发
         if result.retry_requested:

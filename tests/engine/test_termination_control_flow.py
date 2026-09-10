@@ -252,7 +252,7 @@ class TestCommitSkipCrashTerminalPreservation:
             wall = {}
             failed = {"h::j1": {"error": "earlier"}}
         state = PipelineState(wall, failed, {}, [jd])
-        pipeline._runtime.ctx.set_state(state)
+        pipeline._runtime.store.set_state(state)
         monkeypatch.setattr(pipeline.backend, "commit_skip", lambda uid: False)
         return pipeline, SimpleNamespace(
             runnable_idx=0, pending_dep_failure=None, kind="runnable",
@@ -316,7 +316,7 @@ class TestCommitFailedCrashContractBreach:
         jd = Job("t", "j1", payload={}).to_dict()
         jd["runtime"] = {"_commit_failures": 0}
         state = PipelineState({}, {}, {}, [jd])
-        pipeline._runtime.ctx.set_state(state)
+        pipeline._runtime.store.set_state(state)
         return pipeline, jd
 
     def test_dep_failed_commit_failure_handled(self, tmp_path, monkeypatch):

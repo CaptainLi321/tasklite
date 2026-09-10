@@ -199,7 +199,6 @@ HandlerEntry(NamedTuple)   # func / default_resources / payload_schema
 class RunConfig:
     name: str; ipc_dir: str
     backend: AbstractStateBackend
-    store: StateStore              # 构造期即建并随快照携带（enqueue/OpsConsole 在 run 前可用）
     governor: DeadlockGovernor     # 构造期即建（StateStore 结算依赖 + 主循环仲裁共用）
     policy: ExecutionPolicy        # 构造期即建（内部持有 discovery_rerun 共享引用）
     resources: ResourceManager
@@ -216,21 +215,27 @@ class RunConfig:
 
     @classmethod
     def resolve(cls, **raw) -> RunConfig   # 唯一规范化入口：None → 常量默认
+    # 另有 resolve_tuning()：三参数调优标量的已解析形态，供 governor 等
+    # 前置构造场景与 resolve 共用同一真相源
 ```
+
+StateStore **不随快照携带**——由 EngineRuntime 构造期创建（其
+`on_job_completed` 回调绑定 `RunSession.fire_job_completed`，钩子后置变更即时
+生效；`enqueue()` 与 OpsConsole 经门面 `store` 属性在 run 前可用）。
 
 **装配时序（三段式，frozen 的真实语义）**：
 
 1. **构造期**（`TaskLite.__init__`）：backend、ResourceManager、ErrorTaxonomy、
-   ExecutionChannel、StateStore（含 governor / policy）即行构造——`enqueue()` 与
-   OpsConsole 在 run() 之前可用；随后经 `RunConfig.resolve()` 一次性装配并**持久
-   构造 EngineRuntime**；
+   ExecutionChannel、governor、policy 即行构造——随后经 `RunConfig.resolve()`
+   一次性装配并**持久构造 EngineRuntime**（StateStore 于其构造期创建）；
 2. **装配期**（构造后 → 首次 run() 前，以及相邻 run() 之间）：装配 API 生效于共享
    注册表（`handlers` / `discovery_rerun` 按引用共享，变更对机器可见），全部带
    run 期守卫；
 3. **run 期**：**冻结的是引用而非拷贝**——`resources` 含挂起时刻与 used 计数，
-   本就不可深拷贝；内容不变性由「run 期守卫禁止装配 API」独立保证。每次 `run()`
-   （`execute()`）**新建 RunSession**（run_id / dispatch_seq / stats / stop_mode
-   归零），run 结束后装配期重新开放。
+   本就不可深拷贝；内容不变性由「run 期守卫禁止装配 API」独立保证。每次
+   `run()`（`execute()`）经 `RunSession.begin()` 复位会话（持久会话实例，
+   语义等价于每次新建：run_id / dispatch_seq / stats / stop_mode 归零，store
+   记账切换至新 stats），run 结束后装配期重新开放。
 
 #### 4.2.3 `engine/session.py` — `RunSession`（单次 run 生命周期状态 + 钩子单一出口）
 
@@ -238,7 +243,7 @@ class RunConfig:
 class RunSession:
     run_id: Optional[str]; dispatch_seq: int
     stop_mode: StopMode; stats: TaskStats      # 无 public setter
-    def begin(self, run_id: str) -> None       # 重置 stats / 宽限轮次 / run_end 标志
+    def begin(self, run_id: Optional[str] = None) -> None  # 新 run 复位：全部生命周期状态归零
     def next_dispatch_seq(self) -> int         # fence 序号单调递增
     def request_stop(self, force: bool) -> StopMode   # 单调状态机唯一入口
     def exit_reason(self, exc: Optional[BaseException] = None) -> ExitReason
@@ -302,19 +307,23 @@ class DispatchMachine:
     def dispatch_next(self) -> DispatchOutcome        # 五关预检 + spawn
 
 class CompletionMachine:
-    def __init__(self, *, store, policy, channel, resources, in_flight, session,
-                 backend) -> None
+    def __init__(self, *, store, policy, channel, resources, in_flight,
+                 session) -> None
     def complete_job(self, entry: InFlightJob, result: ExecutionResult) -> None
         # Job 终结唯一出口
     def settle_reaped(self, completed) -> int
     def settle_aborted(self, handles) -> None
 
 class RecoveryMachine:
-    def __init__(self, *, store, backend, channel, resources, in_flight, policy,
+    def __init__(self, *, store, channel, resources, in_flight, policy,
                  completion) -> None
     def repair_queue_on_load(...) / load_resource_suspends() / persist_resource_suspends()
     def save_queue_crash_safe() / apply_pending_signals() / abort_in_flight()
 ```
+
+**backend 活引用裁定**：两机器不持有 backend 字段，一律经 `store.backend`
+读取——`TaskLite.backend = new_backend` 热切换（崩溃注入场景）对机器即时可见，
+不产生陈旧引用。
 
 **资源挂起持久化的归属（C2 裁决）**：收敛为 `resource.py` 模块级函数
 `persist_resource_suspensions(backend, resource_mgr)`，completion 与 recovery 共用，
@@ -362,7 +371,6 @@ class OpsConsole:
 | 依赖 | Dispatch | Completion | Recovery |
 |---|:-:|:-:|:-:|
 | `store` | ✓ | ✓ | ✓ |
-| `backend` | | ✓ | ✓ |
 | `scheduler` | ✓ | | |
 | `policy` | ✓ | ✓ | ✓ |
 | `resources` | ✓ | ✓ | ✓ |
@@ -374,6 +382,7 @@ class OpsConsole:
 | `taxonomy` | ✓ | | |
 | `output_root` / `ipc_dir` | ✓ | | |
 | `commit_failure_dlq_threshold` | ✓ | | |
+| `backend`（活引用） | 经 store.backend | 经 store.backend | 经 store.backend |
 
 #### 4.2.10 `engine/channel.py` — `ExecutionChannel` + `WorkerLaunchSpec`
 

@@ -385,7 +385,7 @@ class TestSpawnDeduplication:
             pipeline.backend.load_wall(), pipeline.backend.load_failed(),
             pipeline.backend.load_cursors(), pipeline.backend.load_queue(),
         )
-        pipeline._runtime.ctx.set_state(state)
+        pipeline._runtime.store.set_state(state)
 
         # parent::p1 成功并 spawn 同 uid X
         from tasklite.engine.runtime import inject_worker_resource

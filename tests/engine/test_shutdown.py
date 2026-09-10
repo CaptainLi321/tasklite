@@ -119,11 +119,11 @@ class TestGracefulDraining:
         def controller():
             # 等 job 派发进 in-flight
             for _ in range(200):
-                if pipeline._runtime.ctx.in_flight:
+                if pipeline._runtime.in_flight:
                     break
                 time.sleep(0.01)
-            observed["inflight_at_stop"] = len(pipeline._runtime.ctx.in_flight)
-            entry = next(iter(pipeline._runtime.ctx.in_flight.values()))
+            observed["inflight_at_stop"] = len(pipeline._runtime.in_flight)
+            entry = next(iter(pipeline._runtime.in_flight.values()))
             proc = entry.handle.process
             pipeline.stop()  # 默认 DRAINING：不 kill
             # DRAINING 窗口内 in-flight 进程必须仍存活（未被 kill）
@@ -168,7 +168,7 @@ class TestGracefulDraining:
 
         def controller():
             for _ in range(200):
-                if pipeline._runtime.ctx.in_flight:
+                if pipeline._runtime.in_flight:
                     break
                 time.sleep(0.01)
             pipeline.stop()
@@ -223,12 +223,12 @@ class TestForceAbort:
         def inject_output():
             # 轮询派发完成（上限 5s），再注入 + stop，避免竞态失败。
             deadline = time.time() + 5.0
-            while not pipeline._runtime.ctx.in_flight and time.time() < deadline:
+            while not pipeline._runtime.in_flight and time.time() < deadline:
                 time.sleep(0.01)
             # 模拟 handler 副作用：把输出声明写入落盘 outputs.jsonl
             # （后真实 handler 的 declare_output 即落盘；FakeProcess
             # 不执行 handler，此处直接写文件模拟）。
-            for entry in pipeline._runtime.ctx.in_flight.values():
+            for entry in pipeline._runtime.in_flight.values():
                 ArtifactJournal(pipeline.ipc_dir).record_output(entry.uid, str(partial), True)
                 injected["done"] = True
             pipeline.stop(force=True)
@@ -283,10 +283,10 @@ class TestForceAbort:
 
         def controller():
             for _ in range(200):
-                if pipeline._runtime.ctx.in_flight:
+                if pipeline._runtime.in_flight:
                     break
                 time.sleep(0.01)
-            observed["proc"] = next(iter(pipeline._runtime.ctx.in_flight.values())).handle.process
+            observed["proc"] = next(iter(pipeline._runtime.in_flight.values())).handle.process
             pipeline.stop(force=True)
 
         t = threading.Thread(target=controller)
@@ -316,7 +316,7 @@ class TestAbortConsumesCompletedResult:
     def _inject_completed_result(self, pipeline, out_file):
         """模拟 handler 已完成：物理输出 + 声明 + 当前 incarnation 成功结果落盘。"""
         journal = ArtifactJournal(pipeline.ipc_dir)
-        entry = next(iter(pipeline._runtime.ctx.in_flight.values()))
+        entry = next(iter(pipeline._runtime.in_flight.values()))
         out_file.write_text("done")
         journal.record_output(entry.uid, str(out_file), True)
         journal.write_result_atomic(entry.uid, {
@@ -351,7 +351,7 @@ class TestAbortConsumesCompletedResult:
         def controller():
             # 等 job 派发进 in-flight（drain 轮询前）
             for _ in range(300):
-                if pipeline._runtime.ctx.in_flight:
+                if pipeline._runtime.in_flight:
                     break
                 time.sleep(0.01)
             observed["result_at_abort"] = self._inject_completed_result(
@@ -392,8 +392,8 @@ class TestAbortConsumesCompletedResult:
             output_root=str(tmp_path / "out"),
         )
         state = PipelineState({}, {}, {}, [])
-        pipeline._runtime.ctx.set_state(state)
-        pipeline._runtime.ctx.in_flight.clear()
+        pipeline._runtime.store.set_state(state)
+        pipeline._runtime.in_flight.clear()
 
         job = Job("fast", "j1", payload={})
         job_dict = job.to_dict()
@@ -435,7 +435,7 @@ class TestAbortConsumesCompletedResult:
             uid="fast::j1", job_dict=job_dict, job=job,
             acquired=[], handle=handle, job_start=None,
         )
-        pipeline._runtime.ctx.in_flight["fast::j1"] = entry
+        pipeline._runtime.in_flight["fast::j1"] = entry
         state.register_in_flight("fast::j1")
 
         pipeline._runtime._recovery.abort_in_flight()
@@ -447,7 +447,7 @@ class TestAbortConsumesCompletedResult:
         remaining = pipeline.backend.load_queue()
         assert all(Job.from_dict(j).uid != "fast::j1" for j in remaining), \
             "已完成 job 不得 requeue（否则重启重跑、非幂等副作用双跑）"
-        assert not state.in_flight_uids and not pipeline._runtime.ctx.in_flight, \
+        assert not state.in_flight_uids and not pipeline._runtime.in_flight, \
             "abort 后 in-flight 必须清空（state + 内存 dict）"
 
 
@@ -476,8 +476,8 @@ class TestAbortTOCTOU:
             output_root=str(tmp_path / "out"),
         )
         state = PipelineState({}, {}, {}, [])
-        pipeline._runtime.ctx.set_state(state)
-        pipeline._runtime.ctx.in_flight.clear()
+        pipeline._runtime.store.set_state(state)
+        pipeline._runtime.in_flight.clear()
 
         job = Job("fast", "j1", payload={})
         job_dict = job.to_dict()
@@ -524,7 +524,7 @@ class TestAbortTOCTOU:
             uid="fast::j1", job_dict=job_dict, job=job,
             acquired=[], handle=handle, job_start=None,
         )
-        pipeline._runtime.ctx.in_flight["fast::j1"] = entry
+        pipeline._runtime.in_flight["fast::j1"] = entry
         state.register_in_flight("fast::j1")
 
         # 前置断言：分类时（_abort_in_flight 内）结果文件尚不存在——
@@ -558,8 +558,8 @@ class TestAbortTOCTOU:
             output_root=str(tmp_path / "out"),
         )
         state = PipelineState({}, {}, {}, [])
-        pipeline._runtime.ctx.set_state(state)
-        pipeline._runtime.ctx.in_flight.clear()
+        pipeline._runtime.store.set_state(state)
+        pipeline._runtime.in_flight.clear()
 
         # ── done entry：结果已落盘（无结果文件则归 pending）──
         job_done = Job("a", "done", payload={})
@@ -586,7 +586,7 @@ class TestAbortTOCTOU:
             uid="a::done", job_dict=done_dict, job=job_done,
             acquired=[], handle=handle_done, job_start=None,
         )
-        pipeline._runtime.ctx.in_flight["a::done"] = entry_done
+        pipeline._runtime.in_flight["a::done"] = entry_done
 
         # ── pending entry：无结果文件（走 kill + requeue）──
         job_pend = Job("b", "pending", payload={})
@@ -609,7 +609,7 @@ class TestAbortTOCTOU:
             uid="b::pending", job_dict=pend_dict, job=job_pend,
             acquired=[], handle=handle_pend, job_start=None,
         )
-        pipeline._runtime.ctx.in_flight["b::pending"] = entry_pend
+        pipeline._runtime.in_flight["b::pending"] = entry_pend
 
         state.register_in_flight("a::done")
         state.register_in_flight("b::pending")
@@ -650,8 +650,8 @@ class TestAbortTOCTOU:
         )
         pipeline.add_resource(CapacityResource("api", max_capacity=10.0))
         state = PipelineState({}, {}, {}, [])
-        pipeline._runtime.ctx.set_state(state)
-        pipeline._runtime.ctx.in_flight.clear()
+        pipeline._runtime.store.set_state(state)
+        pipeline._runtime.in_flight.clear()
 
         job = Job("x", "j1", payload={}, resources={"api": 1.0})
         job_dict = job.to_dict()
@@ -673,7 +673,7 @@ class TestAbortTOCTOU:
             uid="x::j1", job_dict=job_dict, job=job,
             acquired=[], handle=handle, job_start=None,
         )
-        pipeline._runtime.ctx.in_flight["x::j1"] = entry
+        pipeline._runtime.in_flight["x::j1"] = entry
         state.register_in_flight("x::j1")
 
         # handler 落盘的 suspend 信号（写文件、flush）

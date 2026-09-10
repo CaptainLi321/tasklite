@@ -11,7 +11,8 @@ from .backend.base import AbstractStateBackend, classify_error_type
 from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
 from .engine.channel import ExecutionChannel
-from .engine.config import RunConfig
+from .engine.config import RunConfig, resolve_tuning
+from .engine.policy import ExecutionPolicy
 from .engine.governor import DeadlockGovernor
 from .engine.inflight import InFlightJob as _InFlightJob, InFlightTracker
 from .engine.resource import CapacityResource, Resource, ResourceManager
@@ -181,17 +182,37 @@ class TaskLite:
 
         self.strict_picklable = strict_picklable
 
-        # 构建 EngineRuntime 静态装配配置——Optional 一律透传，
-        # 默认值唯一解析点是 RunConfig.resolve（含 deadlock_gap 以 governor
-        # 常量为准，纠正早期门面字面量 3 与常量 5 的双默认值冲突）。
-        self.runtime_config = RunConfig.resolve(
-            name=self.name,
-            ipc_dir=self.ipc_dir,
-            output_root=self.output_root,
-            strict_picklable=strict_picklable,
+        # 构造期即建 governor/policy（装配快照前置件）；默认值唯一解析点
+        # 在 config.resolve_tuning（含 deadlock_gap 以 governor 常量为准，
+        # 纠正早期门面字面量 3 与常量 5 的双默认值冲突）。
+        tuning = resolve_tuning(
             dep_grace_seconds=dep_grace_seconds,
             commit_failure_dlq_threshold=commit_failure_dlq_threshold,
             deadlock_gap_max_rounds=deadlock_gap_max_rounds,
+        )
+        governor = DeadlockGovernor(
+            dep_grace_seconds=tuning.dep_grace_seconds,
+            deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
+        )
+        policy = ExecutionPolicy(self._discovery_rerun)
+
+        # EngineRuntime 静态装配快照（冻结引用而非拷贝）
+        self.runtime_config = RunConfig.resolve(
+            name=self.name,
+            ipc_dir=self.ipc_dir,
+            backend=self._backend,
+            resources=self.resources,
+            handlers=self.handlers,
+            channel=channel,
+            taxonomy=self.taxonomy,
+            discovery_rerun=self._discovery_rerun,
+            governor=governor,
+            policy=policy,
+            output_root=self.output_root,
+            strict_picklable=strict_picklable,
+            dep_grace_seconds=tuning.dep_grace_seconds,
+            commit_failure_dlq_threshold=tuning.commit_failure_dlq_threshold,
+            deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
             fatal_exceptions=self._fatal_exceptions,
             transient_exceptions=self._transient_exceptions,
             on_run_start=on_run_start,
@@ -199,18 +220,8 @@ class TaskLite:
             on_job_completed=on_job_completed,
         )
 
-        # 核心运行期深模块
-        self._runtime = EngineRuntime(
-            config=self.runtime_config,
-            backend=self._backend,
-            resources=self.resources,
-            handlers=self.handlers,
-            channel=channel,
-            transient_registry=self.transient_registry,
-            discovery_rerun=self._discovery_rerun,
-        )
-
-        self._ctx = self._runtime.ctx
+        # 核心运行期深模块（StateStore 于其构造期创建，run 前即可经门面使用）
+        self._runtime = EngineRuntime(config=self.runtime_config)
 
     # ── 核心深模块与运行期接缝 ──────────────────────────────────────
     @property
@@ -221,17 +232,17 @@ class TaskLite:
     @property
     def store(self) -> StateStore:
         """状态与事务深模块。"""
-        return self._ctx.store
+        return self._runtime.store
 
     @property
     def governor(self) -> DeadlockGovernor:
         """死锁归因与宽限治理深模块。"""
-        return self._ctx.governor
+        return self._runtime.governor
 
     @property
     def channel(self) -> ExecutionChannel:
         """执行通道深模块。"""
-        return self._ctx.channel
+        return self._runtime.channel
 
     @property
     def is_running(self) -> bool:
@@ -245,50 +256,46 @@ class TaskLite:
     @backend.setter
     def backend(self, value: AbstractStateBackend) -> None:
         self._backend = value
-        if hasattr(self, "_ctx"):
-            self._ctx.backend = value
         if hasattr(self, "_runtime"):
             self._runtime.backend = value
+            self._runtime.store.set_backend(value)
 
     @property
     def stats(self) -> TaskStats:
-        return self._ctx.stats
-
-    @stats.setter
-    def stats(self, value: dict) -> None:
-        self._ctx.stats = value
+        return self._runtime.stats
 
     @property
     def state(self) -> Optional[PipelineState]:
-        return self._ctx.state
+        return self._runtime.state
 
     @property
     def in_flight(self) -> InFlightTracker:
-        return self._ctx.in_flight
+        return self._runtime.in_flight
 
+    # 钩子读写直达 RunSession（会话持久，后置变更即时生效）
     @property
     def on_run_start(self):
-        return self._ctx.on_run_start
+        return self._runtime.session.on_run_start
 
     @on_run_start.setter
     def on_run_start(self, value) -> None:
-        self._ctx.on_run_start = value
+        self._runtime.session.on_run_start = value
 
     @property
     def on_job_completed(self):
-        return self._ctx.on_job_completed
+        return self._runtime.session.on_job_completed
 
     @on_job_completed.setter
     def on_job_completed(self, value) -> None:
-        self._ctx.on_job_completed = value
+        self._runtime.session.on_job_completed = value
 
     @property
     def on_run_end(self):
-        return self._ctx.on_run_end
+        return self._runtime.session.on_run_end
 
     @on_run_end.setter
     def on_run_end(self, value) -> None:
-        self._ctx.on_run_end = value
+        self._runtime.session.on_run_end = value
 
     def _ensure_not_running(self, api_name: str) -> None:
         """管理/入队 API 的 run 期间守卫（把文档限制变成代码级 RuntimeError）。"""

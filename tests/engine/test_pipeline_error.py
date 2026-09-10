@@ -827,7 +827,7 @@ class TestDeadlockFallbackConservative:
             pipeline.backend.load_cursors(),
             pipeline.backend.load_queue(),
         )
-        pipeline._runtime.ctx.set_state(state)
+        pipeline._runtime.store.set_state(state)
         return pipeline
 
     def test_cycle_gap_fallback_keeps_queue(self, tmp_path):
@@ -906,7 +906,7 @@ class TestDeadlockGapEscalation:
             pipeline.backend.load_wall(), pipeline.backend.load_failed(),
             pipeline.backend.load_cursors(), pipeline.backend.load_queue(),
         )
-        pipeline._runtime.ctx.set_state(state)
+        pipeline._runtime.store.set_state(state)
         state.find_dependency_cycles = lambda: []
         sched = types.SimpleNamespace(
             malformed_uids=(), unknown_resource_uids=(),

@@ -267,7 +267,7 @@ class TestInFlightStateConsistency:
             pipeline.backend.load_wall(), pipeline.backend.load_failed(),
             pipeline.backend.load_cursors(), pipeline.backend.load_queue(),
         )
-        pipeline._runtime.ctx.set_state(state)
+        pipeline._runtime.store.set_state(state)
         # C 已被 A spawn 且派发：不在队列（pop 出队）、在 in-flight
         state.pop_job(0)
         state.register_in_flight("child::c")

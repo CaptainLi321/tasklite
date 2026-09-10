@@ -160,10 +160,10 @@ class TestIdentityNonVacuity:
         p = TaskLite(name="t", state_dir=str(tmp_path), backend="sqlite", max_workers=1)
         job = Job("t", "a")
         job_dict = job.to_dict()
-        p._runtime.ctx.state = PipelineState(
+        p._runtime.store.set_state(PipelineState(
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), [],
-        )
+        ))
         p.state.register_in_flight("t::a")
 
         with pytest.raises(_CommitCrashSignal):

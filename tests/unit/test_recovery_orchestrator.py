@@ -27,7 +27,6 @@ def make_orchestrator(backend, state=None, resource_mgr=None):
     state = state or PipelineState({}, {}, {}, [])
     return RecoveryOrchestrator(
         store=StateStore(backend, state=state),
-        backend=backend,
         channel=MagicMock(),
         resources=resource_mgr or ResourceManager(),
         in_flight=MagicMock(),
@@ -127,7 +126,6 @@ class TestRecoveryOrchestratorSuspendPersistence:
 
         orchestrator = RecoveryOrchestrator(
             store=StateStore(backend),
-            backend=backend,
             channel=channel,
             resources=rm,
             in_flight=in_flight,

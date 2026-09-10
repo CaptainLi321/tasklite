@@ -31,8 +31,9 @@ v1.1.0 之后 4 天内落了 91 个深模块化提交（日均 23 个），对 g
 ### D1. 静态装配与生命周期状态彻底分离（RunContext 退场）
 
 - **`RunConfig`**（frozen dataclass）：TaskLite 构造期经 `resolve()` 装配的不可变
-  快照（**冻结的是字段引用**；`store` / `governor` / `policy` 亦构造期即建并随快照
-  携带，保证 `enqueue()` 与 OpsConsole 在 run() 前可用）；`RunConfig.resolve()`
+  快照（**冻结的是字段引用**；`governor` / `policy` 亦构造期即建并随快照携带；
+  StateStore 由 EngineRuntime 构造期创建——其 on_job_completed 回调需绑定
+  RunSession，随会话存活）；`RunConfig.resolve()` / `resolve_tuning()`
   是全部调优参数默认值的**唯一解析点**；
 - **`RunSession`**：一次 `run()` 唯一的可变状态容器（`run_id` / `dispatch_seq` /
   `stop_mode` / `stats`），`fire_*` 钩子单一出口，`exit_reason()` 唯一推导实现；
@@ -55,7 +56,8 @@ v1.1.0 之后 4 天内落了 91 个深模块化提交（日均 23 个），对 g
    守卫**（run 期间抛 RuntimeError）；
 3. **run 期**：**冻结的是引用而非拷贝**（resources 含挂起时刻与 used 计数，本就
    不可深拷贝）；内容不变性由「run 期守卫禁止装配 API」独立保证。每次 `run()`
-   （`execute()`）**新建 RunSession**，run 结束后装配期重新开放。
+   （`execute()`）经 `RunSession.begin()` 复位会话（持久会话实例，语义等价于
+   每次新建——机器持有的 session 引用跨 run 稳定），run 结束后装配期重新开放。
 
 ### D2. 单一真相源清单
 
@@ -146,3 +148,11 @@ v1.1.0 之后 4 天内落了 91 个深模块化提交（日均 23 个），对 g
   引用而非拷贝，内容不变性由 run 期守卫独立保证」（保留测试状态注入接缝）；
   `TaskContext.attempted_uids()` 裁定保留为子进程侧只读 API——子进程内 ctx 是
   唯一状态视图，DiscoveryContext 协议依赖之，「迁 discovery adapter」不可实现。
+- **修订 3（2026-09-10，S4 施工修订）**：StateStore 不随 RunConfig 携带，改由
+  EngineRuntime 构造期创建（其 on_job_completed 回调绑定 RunSession.fire_job_
+  completed，钩子后置变更即时生效；enqueue/OpsConsole 经门面 store 属性在 run
+  前依旧可用）；Completion/Recovery 机器不持有 backend 字段，一律经
+  store.backend 活引用读取（TaskLite.backend 热切换对机器即时可见）；RunSession
+  落地为持久实例 + execute() 经 begin() 复位（语义等价于每次新建，机器持有的
+  session 引用跨 run 稳定）；config 增设 resolve_tuning() 供 governor 前置
+  构造与 resolve 共用同一默认值真相源。

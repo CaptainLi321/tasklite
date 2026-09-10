@@ -221,10 +221,10 @@ class TestRerunEveryRun:
         # wall 有历史成功 + queue 有 every_run 任务
         p.seed_wall(["t::scan"])
         queue = [Job("t", "scan", rerun="every_run").to_dict()]
-        p._runtime.ctx.state = PipelineState(
+        p._runtime.store.set_state(PipelineState(
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), queue,
-        )
+        ))
         # 模拟 abort：requeue（已含）+ clear_in_flight
         p.state.clear_in_flight()
         # 断言通过即无 DEBUG 崩溃；豁免集合保留 queue 中的 rerun 任务
@@ -236,10 +236,10 @@ class TestRerunEveryRun:
 
         p = _pipeline(tmp_path)
         queue = [Job("t", "plain").to_dict()]
-        p._runtime.ctx.state = PipelineState(
+        p._runtime.store.set_state(PipelineState(
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), queue,
-        )
+        ))
         p.state.clear_in_flight()
         assert "t::plain" not in p.state._rerun_active_uids
 
@@ -258,10 +258,10 @@ class TestRerunEveryRun:
         # "nohandler"——走 no-handler 直接 commit 路径
         p.seed_wall(["nohandler::x"])  # rerun 任务历史成功（wall）
         queue = [Job("nohandler", "x", rerun="every_run").to_dict()]
-        p._runtime.ctx.state = PipelineState(
+        p._runtime.store.set_state(PipelineState(
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), queue,
-        )
+        ))
         # 模拟 dispatch 的 pop：rerun 任务加入豁免集合
         p.state.pop_job(0)
         assert "nohandler::x" in p.state._rerun_active_uids
