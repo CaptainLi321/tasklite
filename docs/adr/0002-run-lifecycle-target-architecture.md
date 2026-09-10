@@ -156,3 +156,28 @@ v1.1.0 之后 4 天内落了 91 个深模块化提交（日均 23 个），对 g
   落地为持久实例 + execute() 经 begin() 复位（语义等价于每次新建，机器持有的
   session 引用跨 run 稳定）；config 增设 resolve_tuning() 供 governor 前置
   构造与 resolve 共用同一默认值真相源。
+- **修订 4（2026-09-10，施工完成记录）**：S1–S8 全部落地，本 ADR 与手册 §6
+  自此转为历史记录，终态即现状。提交清单：S1 `a97e3ad`（engine/types.py 单一
+  真相源 + HandlerEntry / WORKER_RESOURCE 收敛）→ S2 `2fbd169`（RunConfig.resolve
+  默认值唯一化 + 装配 API run 期守卫）→ S3a `7e51b5f`（StateStore 显式依赖、
+  四个单实现 Protocol 删除）→ S3b `d1bc733`（DispatchMachine 13 参数窄依赖）→
+  S3c `c32b148`（Completion / Recovery 窄依赖 + governor.arbitrate 收形）→
+  S4 `a30b727`（RunSession 抽取、RunContext 整体删除、EngineRuntime(config)
+  单参装配、持久会话 + begin() 复位）→ S5 `9645ffd`（decide_wait 纯函数、
+  exit_reason 22 处收敛至 session.exit_reason）→ S6 `0f64897`（WorkerLaunchSpec
+  进程 seam 具名契约、channel 别名清算）→ S7 `eeb9c5a`（OpsConsole 拆分、
+  PipelineState 补公共方法）→ S8 `5455c22`（门面外泄属性与钩子 setter 加
+  DeprecationWarning、用户工具函数迁 tasklite/hooks.py）→ 本提交（S8 文档同步）。
+  行为变更重述（均已随对应提交信息留痕）：`deadlock_gap_max_rounds` 默认值
+  3→5（S2，以 governor 常量为准）；`worker_wait` 聚合 last-write-wins→min
+  （S5，多次挂起恢复取最早者）；装配 API run 期守卫从无到有（S2，run 期间调用
+  抛 RuntimeError）。
+  S6 兼容面变更重申：ExecutionChannel 四组历史别名（submit / poll_completed /
+  consume_stale_result / cleanup）已删除，主名为 spawn / reap_completed /
+  claim_stale_result / cleanup_in_flight；`TaskContext.incarnation` 字段已
+  移除——下游如有直用须迁移至 `WorkerLaunchSpec`（incarnation 归 spec 携带）。
+  backend setter 保留裁定：手册 §4.1 原列「setter 删除」，施工裁定**保留只读 +
+  setter 且不发 DeprecationWarning**——`tests/engine/test_crash_recovery_
+  regressions.py` 4 处依赖 `pipeline.backend = Failing*Backend()` 热切换做崩溃
+  注入，属载荷测试接缝而非外泄门面属性；且修订 3 已确立机器经 store.backend
+  活引用读取、热切换对机器即时可见的语义。§4.1 去留表已随本提交同步改写。

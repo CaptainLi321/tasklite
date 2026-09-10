@@ -235,6 +235,7 @@ from tasklite import (
 ## 7. 状态管理 API（DLQ / 运维通道 / 种子化）
 
 > 仅限 `run()` 之外调用——改变 `is_known` 判定基础，与 `enqueue` 同纪律。**由代码强制**：run() 进行中调用这些方法会抛 `RuntimeError`。
+> 本章各方法在门面签名不变的前提下，内部经 `OpsConsole`（`engine/console.py`，显式依赖 backend/store/taxonomy）委托实现。
 
 ### 7.1 DLQ 查询与清除
 
@@ -271,7 +272,7 @@ from tasklite.wrappers.discovery import sanitize_content_id  # 公开的 content
 | 二次 `stop(force=True)` 或 SIGTERM | **ABORTING**：**已完成**（结果文件已落盘、只差 drain 回收）的 job 被消费提交（进 wall/failed，不 kill、不删产出、不 requeue）；仅对**进行中** job 执行 kill + 清半成品 + requeue 后退出 |
 | Ctrl+C（KeyboardInterrupt） | 立即中止：已完成 job 同样被消费提交，仅进行中 job requeue（不进 DLQ） |
 
-**崩溃恢复三层防线**：结果文件携带执行代标识（`{uid}.{run_id}.{seq}.result.json`，孤儿进程的旧结果对新 run 不可见）；派发前消费上次崩溃残留的结果文件（drain_stale）；`{uid}.lock` 文件锁探测孤儿执行体（同 uid 同时只有一个执行体）。
+**崩溃恢复三层防线**：结果文件携带执行代标识（`{uid}.{run_id}.{seq}.result.json`，孤儿进程的旧结果对新 run 不可见）；派发前消费上次崩溃残留的结果文件（drain_stale）；`{uid}.lock` 文件锁探测孤儿执行体（同 uid 同时只有一个执行体）。执行代标识（incarnation）由 `WorkerLaunchSpec`——跨进程 seam 的 frozen 具名契约（handler/job/task_ctx/incarnation/ipc_dir/timeout）——携带，不借道 TaskContext。
 
 ---
 
@@ -331,6 +332,7 @@ pipeline = TaskLite(
 
 - **`on_job_completed(uid, result_meta, success, going_to_retry)`**：**每次 attempt 完成时同步调用**（同一 job 跨重试生命周期会触发多次）——`going_to_retry=True` 表示将退避重试、`False` 才是终局（成功/DLQ）。在 stats 更新之后、下一 job 派发之前调用；钩子内读 stats 保证一致。监控计数器应只在 `going_to_retry=False` 时累加「终结」指标。
 - 钩子契约：同步、主线程执行、必须轻量非阻塞（重活业务方自丢线程池）；抛异常 → catch + warning + `stats["hook_errors"]` 计数，**绝不影响主循环**——钩子按不可信代码对待。多方订阅由业务自封装分发器，框架不维护监听器列表。
+- 钩子在引擎内部由 `RunSession`（单次 run 生命周期状态）作为唯一出口触发；推荐**构造期参数传入**，run 开始后再对 `pipeline.on_run_start` 等 setter 赋值已发 `DeprecationWarning`（次版本移除）。
 
 ### 10.2 stats 运行指标
 
@@ -428,6 +430,8 @@ wall 条目除业务 meta 外携带：`run_count`（成功次数）、`last_run_
 
 ## 13. 性能调优
 
+> 本章涉及的调优参数（`dep_grace_seconds` / `commit_failure_dlq_threshold` / `deadlock_gap_max_rounds` 等）一律经 `RunConfig.resolve()` 作为默认值唯一解析点规范化——业务侧透传 Optional 原始值即可，引擎内不存在二次默认值判断。
+
 ### 13.1 并发度
 
 - `max_workers`（默认 4）或 `add_resource(CapacityResource("__workers__", N))` 覆盖——子进程数是吞吐主调节旋钮。
@@ -440,6 +444,7 @@ wall 条目除业务 meta 外携带：`run_count`（成功次数）、`last_run_
 - **workers 耗尽预检**：workers 满时跳过全队列扫描（避免 CPU 空烧）。
 - **反序列化缓存按 run 生命周期**：阻塞/退避阶段不重复解析队列（`scheduler.cached_job` 内容键缓存）。
 - 依赖缺失宽限（`_dependency_grace`）复用缓存而非裸反序列化。
+- 每拍的等待/空闲决策由 `engine/pacing.py` 的 `decide_wait` 纯函数唯一实现（输入为 LoopFacts 现场快照），轮询间隔与受控等待上限均收敛于此。
 
 大队列（N ≥ 10 万）注意事项：
 - 每轮首次扫描仍需一次全量 `Job.from_dict` 成本（约 240ms/10 万）——正常。
