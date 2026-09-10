@@ -12,7 +12,7 @@ import signal
 import time
 import traceback
 import uuid
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 logger = logging.getLogger("tasklite")
 
@@ -248,79 +248,34 @@ class EngineRuntime:
             unhandled_exception=unhandled_exc,
         )
 
-    def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
-        """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。"""
-        if self.store.state is None:
-            self._session.run_id = self._session.run_id or uuid.uuid4().hex
-            self.store.set_state(PipelineState({}, {}, {}, []))
+    def _terminal_outcome(self) -> StepOutcome:
+        """三个终态早退（ABORTING / 排空完毕 / 空闲完成）的统一形状：
+        全零计数 + should_terminate=True + 当前停机态与退出原因透传。"""
+        return StepOutcome(
+            dispatched_count=0,
+            completed_count=0,
+            is_idle=True,
+            should_wait=False,
+            wait_time=0.0,
+            deadlock_detected=False,
+            stop_mode=self._session.stop_mode,
+            should_terminate=True,
+            exit_reason=self._session.exit_reason().value,
+        )
 
-        store = self.store
-        if store is None:
-            return StepOutcome(
-                dispatched_count=0,
-                completed_count=0,
-                is_idle=True,
-                should_wait=False,
-                wait_time=0.0,
-                deadlock_detected=False,
-                stop_mode=self._session.stop_mode,
-                should_terminate=True,
-                exit_reason=self._session.exit_reason().value,
-            )
+    def _fill_dispatch_pool(
+        self, limit: int, draining: bool
+    ) -> Tuple[Optional[Any], float, int]:
+        """填池派发（仅非 DRAINING 且未超单步上限）：逐个 dispatch_next，
+        有候选则计数继续，断流/无候选即停；worker_wait 聚合取 min
+        （多次资源挂起恢复取最早者）。
 
-        # 0. 停机模式检查
-        draining = False
-        if self._session.stop_mode is not StopMode.NONE:
-            if self._session.stop_mode is StopMode.ABORTING:
-                logger.warning("Force abort requested. Killing in-flight jobs.")
-                self._recovery.abort_in_flight()
-                self._recovery.save_queue_crash_safe()
-                return StepOutcome(
-                    dispatched_count=0,
-                    completed_count=0,
-                    is_idle=True,
-                    should_wait=False,
-                    wait_time=0.0,
-                    deadlock_detected=False,
-                    stop_mode=self._session.stop_mode,
-                    should_terminate=True,
-                    exit_reason=self._session.exit_reason().value,
-                )
-            if self._in_flight:
-                draining = True
-            else:
-                logger.info("Pipeline drained. Saving queue and exiting.")
-                self._recovery.save_queue_crash_safe()
-                return StepOutcome(
-                    dispatched_count=0,
-                    completed_count=0,
-                    is_idle=True,
-                    should_wait=False,
-                    wait_time=0.0,
-                    deadlock_detected=False,
-                    stop_mode=self._session.stop_mode,
-                    should_terminate=True,
-                    exit_reason=self._session.exit_reason().value,
-                )
-
-        if store.is_empty and not self._in_flight:
-            return StepOutcome(
-                dispatched_count=0,
-                completed_count=0,
-                is_idle=True,
-                should_wait=False,
-                wait_time=0.0,
-                deadlock_detected=False,
-                stop_mode=self._session.stop_mode,
-                should_terminate=True,
-                exit_reason=self._session.exit_reason().value,
-            )
-
-        # 1. 填池派发（仅非 DRAINING 状态且未超过单步限制）
+        Returns:
+            (最后一次派发结果或 None, worker_wait 最小值或 0, 派发计数)
+        """
         last_outcome: Optional[Any] = None
         worker_wait = 0.0
         dispatched = 0
-        limit = max_dispatch if max_dispatch is not None else 1000000
         if not draining:
             while dispatched < limit:
                 outcome = self._dispatch.dispatch_next()
@@ -332,8 +287,16 @@ class EngineRuntime:
                     continue
                 if not outcome.should_continue:
                     break
+        return last_outcome, worker_wait, dispatched
 
-        # 2. 处理无可运行 job 与死锁判定
+    def _arbitrate_deadlock(
+        self, last_outcome: Optional[Any], store: StateStore
+    ) -> Tuple[bool, bool, float]:
+        """无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。
+
+        Returns:
+            (是否判定死锁, 是否应终止, 宽限/间隙重试等待秒数)
+        """
         deadlock_detected = False
         should_terminate = False
         deadlock_wait = 0.0
@@ -349,46 +312,74 @@ class EngineRuntime:
                 elif decision.action in ("grace_waiting", "gap_retrying"):
                     if decision.wait_time > 0:
                         deadlock_wait = decision.wait_time
+        return deadlock_detected, should_terminate, deadlock_wait
+
+    def _drain_and_settle(self) -> int:
+        """Drain 回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
+        if not self._in_flight:
+            return 0
+        self._recovery.apply_pending_signals()
+        handles = self._in_flight.active_handles()
+        completed = self.channel.reap_completed(handles)
+        return self._completion.settle_reaped(completed)
+
+    def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
+        """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。"""
+        if self.store.state is None:
+            self._session.run_id = self._session.run_id or uuid.uuid4().hex
+            self.store.set_state(PipelineState({}, {}, {}, []))
+        store = self.store
+
+        # 0. 停机门：ABORTING 强杀在途、DRAINING 排空完毕、空闲完成三早退
+        draining = False
+        if self._session.stop_mode is not StopMode.NONE:
+            if self._session.stop_mode is StopMode.ABORTING:
+                logger.warning("Force abort requested. Killing in-flight jobs.")
+                self._recovery.abort_in_flight()
+                self._recovery.save_queue_crash_safe()
+                return self._terminal_outcome()
+            if self._in_flight:
+                draining = True
+            else:
+                logger.info("Pipeline drained. Saving queue and exiting.")
+                self._recovery.save_queue_crash_safe()
+                return self._terminal_outcome()
+        if store.is_empty and not self._in_flight:
+            return self._terminal_outcome()
+
+        # 1. 填池派发（仅非 DRAINING 状态且未超过单步限制）
+        limit = max_dispatch if max_dispatch is not None else 1000000
+        last_outcome, worker_wait, dispatched = self._fill_dispatch_pool(limit, draining)
+
+        # 2. 处理无可运行 job 与死锁判定
+        deadlock_detected, should_terminate, deadlock_wait = (
+            self._arbitrate_deadlock(last_outcome, store)
+        )
 
         # 3. Drain 回收在途结果并统一结算
-        completed_count = 0
-        if self._in_flight:
-            self._recovery.apply_pending_signals()
-            handles = self._in_flight.active_handles()
-            completed = self.channel.reap_completed(handles)
-            completed_count = self._completion.settle_reaped(completed)
+        completed_count = self._drain_and_settle()
 
         # 4. 等待/空闲决策（唯一实现见 pacing.decide_wait）
         is_idle = store.is_empty and not self._in_flight
         decision = decide_wait(LoopFacts(
-            stop_mode=self._session.stop_mode,
-            has_in_flight=bool(self._in_flight),
-            store_empty=store.is_empty,
-            dispatched=dispatched,
-            completed=completed_count,
+            stop_mode=self._session.stop_mode, has_in_flight=bool(self._in_flight),
+            store_empty=store.is_empty, dispatched=dispatched, completed=completed_count,
             has_runnable=last_outcome.has_runnable if last_outcome is not None else True,
             min_wait=last_outcome.min_wait if last_outcome is not None else float("inf"),
-            worker_wait=worker_wait,
-            deadlock_wait=deadlock_wait,
+            worker_wait=worker_wait, deadlock_wait=deadlock_wait,
             should_terminate=should_terminate,
         ))
-        wait_time = decision.wait_time
-        should_wait = decision.should_wait
 
-        exit_reason = None
-        if is_idle or should_terminate:
-            exit_reason = self._session.exit_reason().value
+        exit_reason = (
+            self._session.exit_reason().value if (is_idle or should_terminate) else None
+        )
 
         return StepOutcome(
-            dispatched_count=dispatched,
-            completed_count=completed_count,
-            is_idle=is_idle,
-            should_wait=should_wait,
-            wait_time=wait_time,
-            deadlock_detected=deadlock_detected,
+            dispatched_count=dispatched, completed_count=completed_count,
+            is_idle=is_idle, should_wait=decision.should_wait,
+            wait_time=decision.wait_time, deadlock_detected=deadlock_detected,
             stop_mode=self._session.stop_mode,
-            should_terminate=should_terminate or is_idle,
-            exit_reason=exit_reason,
+            should_terminate=should_terminate or is_idle, exit_reason=exit_reason,
         )
 
     def run_loop_impl(self) -> None:
