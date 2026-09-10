@@ -30,8 +30,10 @@ v1.1.0 之后 4 天内落了 91 个深模块化提交（日均 23 个），对 g
 
 ### D1. 静态装配与生命周期状态彻底分离（RunContext 退场）
 
-- **`RunConfig`**（frozen dataclass）：`run()` 入口拍下的不可变装配快照；
-  `RunConfig.resolve()` 是全部调优参数默认值的**唯一解析点**；
+- **`RunConfig`**（frozen dataclass）：TaskLite 构造期经 `resolve()` 装配的不可变
+  快照（**冻结的是字段引用**；`store` / `governor` / `policy` 亦构造期即建并随快照
+  携带，保证 `enqueue()` 与 OpsConsole 在 run() 前可用）；`RunConfig.resolve()`
+  是全部调优参数默认值的**唯一解析点**；
 - **`RunSession`**：一次 `run()` 唯一的可变状态容器（`run_id` / `dispatch_seq` /
   `stop_mode` / `stats`），`fire_*` 钩子单一出口，`exit_reason()` 唯一推导实现；
 - Dispatch / Completion / Recovery 三台机器以**显式窄依赖**构造，依赖清单以
@@ -45,15 +47,15 @@ v1.1.0 之后 4 天内落了 91 个深模块化提交（日均 23 个），对 g
 
 1. **构造期**（`TaskLite.__init__`）：backend、ResourceManager、ErrorTaxonomy、
    ExecutionChannel、StateStore（含 policy / governor）即行构造——`enqueue()` 与
-   OpsConsole 在 run() 之前就可用；
-2. **装配期**（构造后 → run() 前）：`add_resource` / `register_handler` /
-   `set_discovery_rerun` / `register_transient_exception` 生效于共享注册表；
-   **全部装配 API 必须带 run 期守卫**（run 期间抛 RuntimeError）；
-3. **run 期**：入口经 `RunConfig.resolve()` 拍快照——`handlers` /
-   `discovery_rerun` 做一层浅拷贝隔离后续注册；`resources` / `channel` /
-   `taxonomy` / `backend` / `store` 传引用（resources 含挂起时刻与 used 计数，
-   不可深拷贝）。**frozen 仅保证字段引用不变，内容不变性由「装配期结束 + run 期
-   守卫」共同保证**；多次 run() 各拍各的快照。
+   OpsConsole 在 run() 之前就可用；随后经 `RunConfig.resolve()` 一次性装配并
+   **持久构造 EngineRuntime**；
+2. **装配期**（构造后 → 首次 run() 前，以及相邻 run() 之间）：`add_resource` /
+   `register_handler` / `set_discovery_rerun` / `register_transient_exception`
+   生效于共享注册表（按引用共享，变更对机器可见）；**全部装配 API 必须带 run 期
+   守卫**（run 期间抛 RuntimeError）；
+3. **run 期**：**冻结的是引用而非拷贝**（resources 含挂起时刻与 used 计数，本就
+   不可深拷贝）；内容不变性由「run 期守卫禁止装配 API」独立保证。每次 `run()`
+   （`execute()`）**新建 RunSession**，run 结束后装配期重新开放。
 
 ### D2. 单一真相源清单
 
@@ -133,7 +135,14 @@ v1.1.0 之后 4 天内落了 91 个深模块化提交（日均 23 个），对 g
   与 `deadlock_gap_max_rounds` 双默认值冲突（3 vs 5）的收敛裁决；D3
   WorkerLaunchSpec 增补 `timeout` 字段并扩大 S6 迁移面（hygiene AST 守卫）；
   D4 事实前提修正（三个 View Protocol 存在注解方与兼容测试）并扩及
-  `ExecutionChannelProtocol`；D5-4 增补装配 API 守卫义务。迁移序列重排为
-  S1→S2→S4→S3（原 S3/S4 顺序矛盾：删 RunContext 的前提是机器已不再持 ctx）；
+  `ExecutionChannelProtocol`；D5-4 增补装配 API 守卫义务。迁移序列重排：**机器
+  窄依赖化必须先于 RunContext 删除**（新编号 S3→S4；原草案顺序相反，按旧编号
+  执行会使三机器的 ctx 悬空）；
   http 拆包降级为基线外可选项。评审原文结论：方向正确、无结构性缺陷，
   修订后可施工。
+- **修订 2（2026-09-10）**：施工勘察后修订——RunConfig 字段面补 `store` /
+  `governor` / `policy`（装配时序要求构造期即建并随快照携带）；EngineRuntime
+  定为「构造期持久装配 + 每次 execute() 新建 RunSession」，冻结语义改为「冻结
+  引用而非拷贝，内容不变性由 run 期守卫独立保证」（保留测试状态注入接缝）；
+  `TaskContext.attempted_uids()` 裁定保留为子进程侧只读 API——子进程内 ctx 是
+  唯一状态视图，DiscoveryContext 协议依赖之，「迁 discovery adapter」不可实现。
