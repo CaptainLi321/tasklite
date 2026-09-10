@@ -167,15 +167,15 @@ class TaskLite:
 门面红线：不解析默认值、不持有运行态可写属性、run() 期间仅响应 `stop()`。
 用户工具函数（`job_ref` / `progress_hook` / `slice_list`）不放在门面文件。
 
-**门面属性去留表**（现状外泄属性的处置与 deprecation 计划）：
+**门面属性去留表**（现状外泄属性的处置记录）：
 
 | 属性 | 处置 |
 |---|---|
 | `is_running` | 保留 |
 | `backend`（只读） | 保留（只读+setter：崩溃注入测试接缝，`tests/engine/test_crash_recovery_regressions.py` 依赖热切换） |
 | `stats`（只读） | 保留；setter 删除 |
-| `store` / `scheduler` / `governor` / `channel` / `state` / `in_flight` | 内部深模块不外泄：过渡期保留只读 + `DeprecationWarning`，次版本移除 |
-| 钩子三件套（`on_run_start` 等）setter | 删除（钩子仅构造期参数）；过渡期 setter 发 `DeprecationWarning` |
+| `store` / `scheduler` / `governor` / `channel` / `state` / `in_flight` | 已于 1.2.0 移除（零外部消费方，弃用窗口豁免）；深模块经 `pipeline._runtime` 直达 |
+| 钩子三件套（`on_run_start` 等）setter | 已于 1.2.0 移除（零外部消费方，弃用窗口豁免）；钩子仅构造期参数，属性只读 |
 
 ### 4.2 引擎层
 
@@ -288,14 +288,15 @@ class EngineRuntime:
     def __init__(self, config: RunConfig) -> None   # 内部装配机器群，不外泄 ctx
     def execute(self, options: Optional[ExecutionOptions] = None) -> RunSummary
         # 锁 / 信号 / 钩子 / 异常承重网；exit_reason 一律委托 session.exit_reason(exc)
-    def step(self, max_dispatch: Optional[int] = None) -> StepOutcome  # 目标 <60 行
+    def step(self, max_dispatch: Optional[int] = None) -> StepOutcome  # 主体 <60 行已兑现（58 行）
     def request_stop(self, force: bool = False) -> StopMode            # 委托 session
     @property is_running / stats / stop_mode / store
 ```
 
 `step()` 顺序管道：停机门（ABORTING / 排空完毕 / 空闲完成三个早退统一走
-`_terminal_outcome(reason)`）→ 填池派发 → 死锁仲裁（仅无 in-flight 时）→ 回收结算
-→ `decide_wait` → `StepOutcome`。
+`_terminal_outcome()`）→ 填池派发（`_fill_dispatch_pool`，worker_wait 聚合取 min）
+→ 死锁仲裁（`_arbitrate_deadlock`，仅无 in-flight 时）→ 回收结算
+（`_drain_and_settle`）→ `decide_wait` → `StepOutcome`。
 
 #### 4.2.6 三台机器 — 显式窄依赖构造（禁止 Context 整袋）
 

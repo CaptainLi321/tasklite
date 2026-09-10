@@ -54,7 +54,7 @@ from tasklite import (
 
 > **run() 期守卫（1.2.0 起代码级强制）**：②③④ 的全部装配/入队 API（`add_resource` / `register_handler` / `register_discovery` / `register_transient_exception` / `enqueue`）以及 §7 全部管理 API，在 `run()` 进行中调用一律抛 `RuntimeError`——「装配仅限 run() 之外」从文档约定升级为代码强制。
 >
-> **门面内部属性弃用预告（1.2.0 起发 `DeprecationWarning`，次版本移除）**：`pipeline.store` / `scheduler` / `governor` / `channel` / `state` / `in_flight` 六个内部深模块只读属性访问会告警——运维操作请改用 §7 管理 API（`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`），其余能力经本章公共 API 等价获得；`pipeline.on_run_start = ...` 等钩子 setter 同样告警，钩子应在构造期参数传入（见 §10.1）。`pipeline.backend`（含 setter）保留不发警告。
+> **门面内部属性已于 1.2.0 移除**：`pipeline.store` / `scheduler` / `governor` / `channel` / `state` / `in_flight` 六个内部深模块只读属性与 `pipeline.on_run_start = ...` 等钩子 setter 已随 1.2.0 删除（零外部消费方，弃用窗口豁免）——运维操作请经 §7 管理 API（`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`），其余能力经本章公共 API 等价获得；钩子请在构造期参数传入（见 §10.1），读取可经只读属性。`pipeline.backend`（含 setter）保留。
 
 ---
 
@@ -338,7 +338,7 @@ pipeline = TaskLite(
 
 - **`on_job_completed(uid, result_meta, success, going_to_retry)`**：**每次 attempt 完成时同步调用**（同一 job 跨重试生命周期会触发多次）——`going_to_retry=True` 表示将退避重试、`False` 才是终局（成功/DLQ）。在 stats 更新之后、下一 job 派发之前调用；钩子内读 stats 保证一致。监控计数器应只在 `going_to_retry=False` 时累加「终结」指标。
 - 钩子契约：同步、主线程执行、必须轻量非阻塞（重活业务方自丢线程池）；抛异常 → catch + warning + `stats["hook_errors"]` 计数，**绝不影响主循环**——钩子按不可信代码对待。多方订阅由业务自封装分发器，框架不维护监听器列表。
-- 钩子在引擎内部由 `RunSession`（单次 run 生命周期状态）作为唯一出口触发；推荐**构造期参数传入**，run 开始后再对 `pipeline.on_run_start` 等 setter 赋值已发 `DeprecationWarning`（次版本移除）。
+- 钩子在引擎内部由 `RunSession`（单次 run 生命周期状态）作为唯一出口触发；钩子**仅构造期参数传入**（`on_run_start` / `on_run_end` / `on_job_completed`，setter 已于 1.2.0 移除），构造后经同名只读属性读取。
 
 ### 10.2 stats 运行指标
 
