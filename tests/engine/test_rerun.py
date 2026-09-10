@@ -226,9 +226,9 @@ class TestRerunEveryRun:
             p.backend.load_cursors(), queue,
         ))
         # 模拟 abort：requeue（已含）+ clear_in_flight
-        p.state.clear_in_flight()
+        p._runtime.state.clear_in_flight()
         # 断言通过即无 DEBUG 崩溃；豁免集合保留 queue 中的 rerun 任务
-        assert "t::scan" in p.state._rerun_active_uids
+        assert "t::scan" in p._runtime.state._rerun_active_uids
 
     def test_clear_in_flight_removes_plain_tasks(self, tmp_path):
         """非 rerun 任务不被豁免集合保留。"""
@@ -240,8 +240,8 @@ class TestRerunEveryRun:
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), queue,
         ))
-        p.state.clear_in_flight()
-        assert "t::plain" not in p.state._rerun_active_uids
+        p._runtime.state.clear_in_flight()
+        assert "t::plain" not in p._runtime.state._rerun_active_uids
 
     def test_direct_commit_failure_does_not_leak_rerun_exemption(self, tmp_path):
         """ 回归：rerun 任务经 no-handler 直接 commit 失败 → 从豁免集合移除。
@@ -263,16 +263,16 @@ class TestRerunEveryRun:
             p.backend.load_cursors(), queue,
         ))
         # 模拟 dispatch 的 pop：rerun 任务加入豁免集合
-        p.state.pop_job(0)
-        assert "nohandler::x" in p.state._rerun_active_uids
+        p._runtime.state.pop_job(0)
+        assert "nohandler::x" in p._runtime.state._rerun_active_uids
         # 直接 commit 路径（no-handler）内部会调 _mark_failed + unregister——
         # 这里手动模拟该路径的终止动作，验证豁免被移除
         from tasklite.pipeline import TaskLite
         from tasklite.taxonomy import ERR_NO_HANDLER
         p.backend.commit_job_failure("nohandler::x", {"error": ERR_NO_HANDLER})
-        p.store.mark_failed("nohandler::x", {"error": ERR_NO_HANDLER})
-        p.state.unregister_in_flight("nohandler::x")
-        assert "nohandler::x" not in p.state._rerun_active_uids, \
+        p._runtime.store.mark_failed("nohandler::x", {"error": ERR_NO_HANDLER})
+        p._runtime.state.unregister_in_flight("nohandler::x")
+        assert "nohandler::x" not in p._runtime.state._rerun_active_uids, \
             "直接 commit 失败后豁免集合必须移除该 uid"
 
 

@@ -178,10 +178,9 @@ class TestTaskLiteRuntimeFacadeIntegration:
         p = TaskLite(name="facade_test", state_dir=str(tmp_path), backend="memory")
         assert isinstance(p._runtime, EngineRuntime)
         assert p._runtime.config.name == "facade_test"
-        assert p._runtime.scheduler is p.scheduler
-        assert p.store is p._runtime.store
-        assert p.channel is p._runtime.channel
-        assert p.in_flight is p._runtime.in_flight
+        # 深模块唯一持有点是 EngineRuntime（装配引用一致性见本文件
+        # TestEngineRuntimeConfiguration；门面不再外泄深模块属性）
+        assert p._runtime.store.backend is p.backend
 
         p.register_handler("dummy", dummy_runtime_handler)
         p.enqueue([Job("dummy", "1")])

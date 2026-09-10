@@ -61,9 +61,6 @@ from ..models.state import PipelineState  # noqa: E402
 from ..taxonomy import ErrorTaxonomy  # noqa: E402
 from ..utils.lockfile import release_lock, try_acquire_lock  # noqa: E402
 
-# 兼容垫片：历史名称经 runtime 导入的调用方继续可用，随次版本移除。
-RuntimeConfig = RunConfig
-
 
 class EngineRuntime:
     """TaskLite 核心运行期深模块。

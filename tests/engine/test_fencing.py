@@ -253,7 +253,7 @@ class TestDrainStaleTmpIgnore:
         tmp_file = _Path(p.ipc_dir) / f"{base}{_RESULT_TMP_SUFFIX}"
         tmp_file.write_text('{"status": "suc')  # 部分 JSON
 
-        result = p.channel.claim_stale_result(job.uid, job)
+        result = p._runtime.channel.claim_stale_result(job.uid, job)
         assert result is None, "claim_stale_result 必须忽略 .tmp（孤儿仍在写，无 final 可消费）"
         assert tmp_file.exists(), "claim_stale_result 不得 unlink 正在写的 .tmp 文件"
 
@@ -471,7 +471,7 @@ class TestDispatchOrderFencing:
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
         }, incarnation=inc)
 
-        sched = p.scheduler.pop_next_runnable(state, state.in_flight_uids)
+        sched = p._runtime.scheduler.pop_next_runnable(state, state.in_flight_uids)
         assert sched.runnable_idx is not None, "job 应可运行"
         entry = p._runtime._dispatch.dispatch_job(sched)
 

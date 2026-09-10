@@ -123,14 +123,12 @@ class TestMalformedNotMaskedByBackoff:
         300s，累计可达数十分钟）。用 on_job_completed 的调用顺序区分
         两者（变异体下顺序颠倒，本测试红）。
         """
-        pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
-
         calls = []
-        pipeline.on_job_completed = (
+        pipeline = make_pipeline(tmp_path, on_job_completed=(
             lambda uid, meta, success, going_to_retry:
                 calls.append((uid, bool(success)))
-        )
+        ))
+        pipeline.register_handler("t", lambda j, c: True)
 
         malformed = {"task_type": "t"}  # 缺 job_id → 无法反序列化
         backing_off = Job("t", "c", payload={}).to_dict()

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from .policy import ExecutionPolicy
     from .resource import ResourceManager
     from .scheduler import JobScheduler
+    from .session import RunSession
     from .store import StateStore
 
 from ..taxonomy import (
@@ -74,7 +75,7 @@ class DispatchMachine:
         resources: "ResourceManager",
         channel: "ExecutionChannel",
         in_flight: "InFlightTracker",
-        session: Any,
+        session: "RunSession",
         completion: "CompletionMachine",
         handlers: Mapping[str, Any],
         taxonomy: ErrorTaxonomy,
@@ -82,8 +83,6 @@ class DispatchMachine:
         ipc_dir: str,
         commit_failure_dlq_threshold: int,
     ) -> None:
-        # session 暂收 RunContext（dispatch_seq / run_id / fire_job_completed
-        # 的供给者），RunSession 抽取后原位替换，机器代码不再感知。
         self._store = store
         self._scheduler = scheduler
         self._policy = policy

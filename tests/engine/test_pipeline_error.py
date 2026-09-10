@@ -835,7 +835,7 @@ class TestDeadlockFallbackConservative:
         pipeline = self._queue_two_jobs(tmp_path)
         pipeline._runtime.state.find_dependency_cycles = lambda: []
         sched = self._sched(waiting_for_dependency=True)
-        decision = pipeline.governor.resolve_deadlock(sched, store=pipeline.store)
+        decision = pipeline._runtime.governor.resolve_deadlock(sched, store=pipeline._runtime.store)
         assert not decision
         assert decision.should_terminate is False
         assert decision.wait_time == 0.5
@@ -846,7 +846,7 @@ class TestDeadlockFallbackConservative:
         """分类链全空（不可归因）兜底：队列原样保留、不误杀；返回 False。"""
         pipeline = self._queue_two_jobs(tmp_path)
         sched = self._sched()
-        decision = pipeline.governor.resolve_deadlock(sched, store=pipeline.store)
+        decision = pipeline._runtime.governor.resolve_deadlock(sched, store=pipeline._runtime.store)
         assert not decision
         assert decision.should_terminate is False
         assert decision.wait_time == 0.5
@@ -913,7 +913,7 @@ class TestDeadlockGapEscalation:
             missing_dependency_uids=(), impossible_resource_uids=(),
             waiting_for_dependency=True,
         )
-        decision = pipeline.governor.resolve_deadlock(sched, store=pipeline.store)
+        decision = pipeline._runtime.governor.resolve_deadlock(sched, store=pipeline._runtime.store)
         assert not decision
         assert decision.should_terminate is False
         assert decision.wait_time == 0.5

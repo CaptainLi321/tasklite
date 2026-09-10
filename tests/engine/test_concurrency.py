@@ -42,12 +42,12 @@ def test_scheduler_sees_handler_default_resources(tmp_state_dir):
     pipeline.add_resource(CapacityResource("mem", max_capacity=2.0))
     pipeline.register_handler("slow", fast_handler, default_resources={"mem": 1.0})
     # 引用必须一致——否则 handler 默认资源对 scheduler 不可见
-    assert pipeline.scheduler.handlers is pipeline.handlers
+    assert pipeline._runtime.scheduler.handlers is pipeline.handlers
     # 合并语义：handler 默认 ∪ job 自身
-    eff = pipeline.scheduler._effective_resources(Job("slow", "j1"))
+    eff = pipeline._runtime.scheduler._effective_resources(Job("slow", "j1"))
     assert eff.get("mem") == 1.0
     # job 显式资源覆盖 handler 默认
-    eff2 = pipeline.scheduler._effective_resources(
+    eff2 = pipeline._runtime.scheduler._effective_resources(
         Job("slow", "j2", resources={"mem": 3.0})
     )
     assert eff2["mem"] == 3.0

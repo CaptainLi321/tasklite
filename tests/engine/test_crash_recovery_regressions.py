@@ -543,7 +543,7 @@ class TestDispatchFailureThreeStrike:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
+        monkeypatch.setattr(pipeline._runtime.channel, "spawn", boom_submit)
 
         # run 必须正常返回（DLQ 而非崩溃）
         pipeline.run()
@@ -564,7 +564,7 @@ class TestDispatchFailureThreeStrike:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
+        monkeypatch.setattr(pipeline._runtime.channel, "spawn", boom_submit)
 
         import pytest as pytest_mod
         with pytest_mod.raises(pickle_mod.PicklingError):
@@ -632,10 +632,9 @@ class TestCommitFailuresPreservation:
         import json as json_mod
 
         calls = []
-        pipeline = make_pipeline(tmp_path)
-        pipeline.on_job_completed = (
+        pipeline = make_pipeline(tmp_path, on_job_completed=(
             lambda uid, meta, success, going_to_retry: calls.append((uid, meta, success, going_to_retry))
-        )
+        ))
         pipeline.register_handler("t", lambda j, c: True)
         jd = Job("t", "j1", payload={}).to_dict()
         jd["runtime"] = {"_dispatch_failures": 2}
@@ -648,7 +647,7 @@ class TestCommitFailuresPreservation:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
+        monkeypatch.setattr(pipeline._runtime.channel, "spawn", boom_submit)
 
         pipeline.run()
 
@@ -798,7 +797,7 @@ class TestDispatchExceptionEntryRegistered:
         **二次 requeue** → 内存队列出现两条 t::j1。磁盘断言被掩盖：
         ``_save_queue_crash_safe`` 以磁盘为基准、按 uid 把内存重复条目
         合并成一条 → 磁盘恒 1 条 → 变异体存活。
-        内存队列 ``pipeline.state.queue`` 无去重掩盖，直接暴露二次 requeue。"""
+        内存队列 ``pipeline._runtime.state.queue`` 无去重掩盖，直接暴露二次 requeue。"""
         from tasklite.models.state import PipelineState
         import pytest as pytest_mod
 
@@ -891,7 +890,7 @@ class TestDispatchCommitCountersIndependent:
         DISPATCH_FAILURE（commit 计数不参与 dispatch 阈值判定——独立计数）。"""
         import sqlite3 as sqlite3_mod
         import json as json_mod
-        from tasklite.pipeline import _CommitCrashSignal
+        from tasklite.exceptions import _CommitCrashSignal
 
         pipeline = make_pipeline(tmp_path)
         pipeline.register_handler("t", lambda j, c: True)
@@ -907,7 +906,7 @@ class TestDispatchCommitCountersIndependent:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
+        monkeypatch.setattr(pipeline._runtime.channel, "spawn", boom_submit)
 
         # 本次 dispatch 失败 → _dispatch_failures=3 → 达 dispatch 阈值 DLQ
         pipeline.run()
@@ -936,7 +935,7 @@ class TestDispatchCommitCountersIndependent:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
+        monkeypatch.setattr(pipeline._runtime.channel, "spawn", boom_submit)
 
         # 本次 dispatch 失败 → _dispatch_failures=1（独立）→ 未达阈值 → requeue
         # 但 submit 每次抛异常，run 会崩溃（requeue + re-raise）——验证

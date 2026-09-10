@@ -135,7 +135,7 @@ class TestPipelineStateCommitContract:
         def raising_submit(*args, **kwargs):
             raise RuntimeError("executor crashed")
 
-        monkeypatch.setattr(pipeline.channel, "spawn", raising_submit)
+        monkeypatch.setattr(pipeline._runtime.channel, "spawn", raising_submit)
 
         with pytest.raises(RuntimeError, match="executor crashed"):
             pipeline.run()
@@ -173,7 +173,7 @@ class TestPipelineStateCommitContract:
         def interrupt_submit(*args, **kwargs):
             raise KeyboardInterrupt()
 
-        monkeypatch.setattr(pipeline.channel, "spawn", interrupt_submit)
+        monkeypatch.setattr(pipeline._runtime.channel, "spawn", interrupt_submit)
 
         with pytest.raises(KeyboardInterrupt):
             pipeline.run()

@@ -152,7 +152,7 @@ class TestIdentityNonVacuity:
         """ 交互：_commit_failed_crash 先 unregister 再 requeue——uid 离开
         in-flight 后才进 queue，_abort_in_flight 不会二次 requeue 同 uid。
         直接调用验证（不跑完整 pipeline，避免 commit_retry 走真后端）。"""
-        from tasklite.pipeline import _CommitCrashSignal, _InFlightJob
+        from tasklite.exceptions import _CommitCrashSignal
         from tasklite.engine.channel import ExecutionResult
 
         # 构造已 dispatch 的 job（uid 在 in-flight）
@@ -164,15 +164,15 @@ class TestIdentityNonVacuity:
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), [],
         ))
-        p.state.register_in_flight("t::a")
+        p._runtime.state.register_in_flight("t::a")
 
         with pytest.raises(_CommitCrashSignal):
-            p.store.commit_failed_crash("t::a", "test_commit_failure", job_dict)
+            p._runtime.store.commit_failed_crash("t::a", "test_commit_failure", job_dict)
 
         # 断言：requeue 前已 unregister——uid 不在 in-flight（防 _abort 二次 requeue）
-        assert "t::a" not in p.state.in_flight_uids
+        assert "t::a" not in p._runtime.state.in_flight_uids
         # 且已 requeue 到 queue（恰好一次）
-        uids = [x.get("job_id") for x in p.state.queue]
+        uids = [x.get("job_id") for x in p._runtime.state.queue]
         assert uids.count("a") == 1
 
 
@@ -598,8 +598,8 @@ class TestDispatchInterruptResources:
             # 模拟：acquire 之后、spawn 完成前命中 KeyboardInterrupt
             raise KeyboardInterrupt()
 
-        monkeypatch.setattr(p.channel, "spawn", interrupting_spawn)
-        from tasklite.pipeline import _CommitCrashSignal
+        monkeypatch.setattr(p._runtime.channel, "spawn", interrupting_spawn)
+        from tasklite.exceptions import _CommitCrashSignal
         with pytest.raises(KeyboardInterrupt):
             try:
                 p.run()
@@ -610,7 +610,7 @@ class TestDispatchInterruptResources:
         slot = p.resources["slot"]
         assert slot.used == 0, f"resource leaked after KeyboardInterrupt: used={slot.used}"
         # job 已 requeue（内存队列可重新调度）
-        assert p.backend.load_queue() != [] or p.state.queue != []
+        assert p.backend.load_queue() != [] or p._runtime.state.queue != []
 
 
 
