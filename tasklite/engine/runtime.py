@@ -131,7 +131,6 @@ class RunContext:
             commit_failure_dlq_threshold=self.commit_failure_dlq_threshold,
             taxonomy=self.taxonomy,
             on_job_completed=lambda uid, meta, s, r: self.fire_job_completed(uid, meta, s, r),
-            ctx=self,
             governor=self.governor,
             stats=self._stats,
             policy=self.policy,

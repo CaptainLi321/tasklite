@@ -1,6 +1,6 @@
 """ExecutionChannel: 统一子进程执行、阶梯看门狗、IPC 通信与跨平台文件锁的深模块。
 
-提供极简接缝（ExecutionChannelProtocol），内敛子进程派发、看门狗阶梯终止、
+内敛子进程派发、看门狗阶梯终止、
 两级降级落盘、跨平台排他文件锁与 TOCTOU 闭环清理的底层复杂性。
 """
 
@@ -14,7 +14,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from ..exceptions import (
     FatalError,
@@ -354,36 +354,6 @@ class AbortOutcome:
     cancelled: List[JobHandle]
 
 
-class ExecutionChannelProtocol(Protocol):
-    """ExecutionChannel 统一协议接口。"""
-
-    def spawn(
-        self,
-        handler_func: Callable[[Job, TaskContext], Any],
-        job: Job,
-        ctx: TaskContext,
-        timeout: float,
-    ) -> JobHandle: ...
-
-    def poll_completed(
-        self, handles: Sequence[JobHandle]
-    ) -> List[Tuple[JobHandle, ExecutionResult]]: ...
-
-    def probe_orphan_lock(self, uid: str) -> bool: ...
-
-    def claim_stale_result(self, uid: str, job: Job) -> Optional[ExecutionResult]: ...
-
-    def drain_active_signals(self, uids: Iterable[str]) -> List[Tuple[str, str, float]]: ...
-
-    def abort_in_flight(self, handles: Sequence[JobHandle]) -> AbortOutcome: ...
-
-    def cleanup_in_flight(self, handles: Sequence[JobHandle]) -> None: ...
-
-    def cleanup_artifacts(self, uid: str, *, mode: ArtifactCleanupMode) -> None: ...
-
-    def read_declared_inputs(self, uid: str) -> List[dict]: ...
-
-
 class ExecutionChannel:
     """标准子进程执行通道深模块实现。"""
 
@@ -705,7 +675,6 @@ __all__ = [
     "AbortOutcome",
     "ArtifactCleanupMode",
     "ExecutionChannel",
-    "ExecutionChannelProtocol",
     "ExecutionHandle",
     "ExecutionResult",
     "JobHandle",
