@@ -405,14 +405,9 @@ class DeadlockGovernor:
             cascaded_uids=outcome.cascaded_uids,
         )
 
-
-# 向后兼容别名
-EpisodeState = DeadlockGovernor
-
 __all__ = [
     "DeadlockDecision",
     "DeadlockGovernor",
-    "EpisodeState",
     "DEP_GRACE_SECONDS",
     "DEADLOCK_GAP_MAX_ROUNDS",
 ]

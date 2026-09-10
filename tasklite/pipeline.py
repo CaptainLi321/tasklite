@@ -5,7 +5,7 @@ import multiprocessing as mp
 import pickle
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from .backend.base import AbstractStateBackend, classify_error_type
 from .backend.memory import InMemoryStateBackend
@@ -18,31 +18,24 @@ from .engine.runtime import (
     EngineRuntime,
     RuntimeConfig,
     TaskStats,
-    WORKER_RESOURCE,
-    inject_worker_resource,
 )
 from .engine.scheduler import JobScheduler
 from .engine.store import DLQEntry, StateStore
+from .engine.types import HandlerEntry
 from .exceptions import _CommitCrashSignal, _JobTerminated
 from .models.context import TaskContext
-from .models.job import Job
+from .models.job import Job, WORKER_RESOURCE
 from .taxonomy import ErrorTaxonomy, validate_resource_amounts
 from .utils.jsonutil import dumps
 
 logger = logging.getLogger("tasklite")
 
 
-class HandlerEntry(NamedTuple):
-    """注册 handler 的结构化条目——调度器与派发路径按字段名访问。"""
-    func: Callable
-    default_resources: Dict[str, float]
-    payload_schema: Optional[type]
-
 _BACKEND_SQLITE = "sqlite"
 
 # 内部 worker 资源名：每个 job 默认占用 1 个 worker 槽位。
 # 通过 CapacityResource 实现，复用现有资源调度逻辑控制并发度。
-# 常量本体在 engine.runtime（机器模块不反向 import pipeline）。
+# 常量本体在 models/job.py（全仓库唯一定义点）。
 _DEFAULT_MAX_WORKERS = 4
 
 

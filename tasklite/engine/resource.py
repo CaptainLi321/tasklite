@@ -13,7 +13,7 @@ from typing import (
 
 logger = logging.getLogger("tasklite")
 
-WORKER_RESOURCE = "__workers__"
+from ..models.job import WORKER_RESOURCE  # noqa: E402
 
 # 单次 suspend 的上限（秒）：防止子进程传入 1e12 等超大值永久停摆管线
 _MAX_SUSPEND_SECONDS = 86400.0  # 24h
