@@ -14,9 +14,13 @@ _Avoid_: Task (overloaded), Message, Item, Record
 The host orchestrator and primary user-facing facade configuring handlers, resources, and executing runs.
 _Avoid_: PipelineEngine, Runner, Master, Coordinator
 
-**RunContext**:
-The single-run mutable runtime container holding transient state (`PipelineState`, `in_flight`, stats, and episode tracking) across specialized engine machines.
-_Avoid_: Session, ExecutionScope, ContextBag
+**RunConfig**:
+The immutable static assembly snapshot resolved once by `RunConfig.resolve()` as the single point of default-value resolution (callers pass raw Optionals, no module re-derives defaults), carried into `EngineRuntime`.
+_Avoid_: ConfigBag, SettingsDict
+
+**RunSession**:
+The per-`run()` lifecycle state holder (stop-mode transitions, stats, dispatch sequencing) serving as the single outlet for run-phase event hooks (`fire_*`) and exit-reason derivation.
+_Avoid_: RunContext, SessionState
 
 **EngineRuntime**:
 The deep execution engine unifying the 4-phase event pump, step advances, dispatch preflights, result settlement, crash recoveries, and process isolation.
@@ -55,6 +59,18 @@ _Avoid_: RepairService, AbortHandler, Rescuer
 **InFlightJob**:
 Runtime tracked context for a job dispatched to an active subprocess before completion or commit.
 _Avoid_: RunningTask, ActiveProcess, WorkerHandle
+
+**WorkerLaunchSpec**:
+The frozen named contract crossing the process seam, carrying the full spawn payload (handler, job, task context, incarnation, ipc_dir, timeout) for worker subprocess launch; incarnation belongs to the spec, not to TaskContext.
+_Avoid_: SpawnArgs, ProcessPayload
+
+**OpsConsole**:
+The pure operations seam for management APIs used outside `run()` (list_dlq / clear_dlq / clear_history / seed_wall / seed_cursor), constructed with explicit `(backend, store, taxonomy)` dependencies and delegated to by the TaskLite facade.
+_Avoid_: AdminAPI, MaintenanceService
+
+**pacing / decide_wait**:
+The pure wait/idle decision function in `engine/pacing.py` consuming a `LoopFacts` snapshot per event-pump tick — the single implementation of wait semantics in the run loop.
+_Avoid_: WaitStrategy, SleepPolicy
 
 ### Persistence & Encoders
 

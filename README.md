@@ -312,13 +312,19 @@ pipeline.clear_history("download::")
 ```
 tasklite/
 ├── pipeline.py          # TaskLite 核心门面与配置
+├── hooks.py             # 用户工具函数（job_ref / progress_hook / slice_list）
 ├── engine/              # 核心执行机器群
-│   ├── runtime.py       # 核心运行期深模块、主循环事件泵与上下文 (EngineRuntime)
+│   ├── runtime.py       # 核心运行期深模块、主循环事件泵 (EngineRuntime)
+│   ├── config.py        # RunConfig 静态装配快照、默认值唯一解析点
+│   ├── session.py       # RunSession 单次 run 生命周期状态与钩子单一出口
+│   ├── pacing.py        # 事件泵等待/空闲决策纯函数（decide_wait）
+│   ├── types.py         # 引擎公共值对象单一真相源
 │   ├── store.py         # 状态事务、3-strike 崩溃与死锁归因 (StateStore)
+│   ├── console.py       # OpsConsole：run() 外纯运维接缝（管理 API 委托目标）
 │   ├── dispatch.py      # 任务派发状态机 (DispatchMachine)
 │   ├── completion.py    # 任务完成与提交 (CompletionMachine)
 │   ├── recovery.py      # 崩溃检测与恢复 (RecoveryMachine)
-│   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel)
+│   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel / WorkerLaunchSpec)
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler)
 │   └── resource.py      # 令牌桶限速与并发容量资源
 ├── backend/             # SQLite WAL 强一致事务持久化后端

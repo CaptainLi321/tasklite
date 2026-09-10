@@ -172,7 +172,7 @@ class TaskLite:
 | 属性 | 处置 |
 |---|---|
 | `is_running` | 保留 |
-| `backend`（只读） | 保留；setter 删除 |
+| `backend`（只读） | 保留（只读+setter：崩溃注入测试接缝，`tests/engine/test_crash_recovery_regressions.py` 依赖热切换） |
 | `stats`（只读） | 保留；setter 删除 |
 | `store` / `scheduler` / `governor` / `channel` / `state` / `in_flight` | 内部深模块不外泄：过渡期保留只读 + `DeprecationWarning`，次版本移除 |
 | 钩子三件套（`on_run_start` 等）setter | 删除（钩子仅构造期参数）；过渡期 setter 发 `DeprecationWarning` |
@@ -494,4 +494,4 @@ class ExecutionChannel:
 | **S8** | 门面外泄属性与钩子 setter；README/API_GUIDE 未同步新概念 | 按门面属性去留表执行 deprecation；`job_ref`/`progress_hook`/`slice_list` 迁出；README / API_GUIDE / CONTEXT.md（RunConfig/RunSession/WorkerLaunchSpec/OpsConsole/pacing 词条）同步 | 文档与兼容面收尾 |
 | **S9**（可选，基线外） | `wrappers/http.py` 1028 行五概念 | 物理拆包 | **须先有独立 ADR**（ADR-0001 未裁决拆包）+ pickle 兼容别名；触发条件：新增第六概念或子模块需独立演化；无触发则不做 |
 
-完成 S1–S8 后本章仅保留历史记录，终态即现状。
+**S1–S8 已全部落地（a97e3ad → 本次文档提交），本章转为历史记录，终态即现状**；原「完成 S1–S8 后本章仅保留历史记录，终态即现状」之约定就此兑现。
