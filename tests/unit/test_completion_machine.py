@@ -21,7 +21,8 @@ class FakeProcess:
         self.pid = pid
 
 
-def _make_context(tmp_path):
+def _make_machine(tmp_path):
+    """显式装配 CompletionMachine 的窄依赖（RunContext 仅作 session/装配源）。"""
     backend = InMemoryStateBackend()
     gpu = CapacityResource("gpu", 10.0)
     rm = ResourceManager({"gpu": gpu})
@@ -36,13 +37,21 @@ def _make_context(tmp_path):
         ipc_dir=str(tmp_path / "ipc"),
     )
     ctx.set_state(PipelineState({}, {}, {}, []))
-    return ctx
+    completion = CompletionMachine(
+        store=ctx.store,
+        policy=ctx.policy,
+        channel=ctx.channel,
+        resources=ctx.resource_mgr,
+        in_flight=ctx.in_flight,
+        session=ctx,
+        backend=backend,
+    )
+    return ctx, completion
 
 
 class TestCompletionMachineBasicSettlement:
     def test_complete_job_success_lifecycle(self, tmp_path):
-        ctx = _make_context(tmp_path)
-        completion = CompletionMachine(ctx)
+        ctx, completion = _make_machine(tmp_path)
 
         gpu = ctx.resource_mgr["gpu"]
         lease = ctx.resource_mgr.reserve("t", {"gpu": 2.0}, uid="t::j1")
@@ -73,8 +82,7 @@ class TestCompletionMachineBasicSettlement:
         assert completed_events[0] == ("t::j1", {"score": 100}, True, False)
 
     def test_settle_reaped_batch(self, tmp_path):
-        ctx = _make_context(tmp_path)
-        completion = CompletionMachine(ctx)
+        ctx, completion = _make_machine(tmp_path)
 
         j1 = Job("t", "j1", {})
         h1 = JobHandle("t::j1", FakeProcess(101), 100.0, 10.0, j1, ctx.ipc_dir, "run1.1")
@@ -100,8 +108,7 @@ class TestCompletionMachineBasicSettlement:
         assert ctx.store.in_flight_uids == frozenset()
 
     def test_settle_aborted_classification(self, tmp_path):
-        ctx = _make_context(tmp_path)
-        completion = CompletionMachine(ctx)
+        ctx, completion = _make_machine(tmp_path)
 
         j1 = Job("t", "j1", {})
         e1 = InFlightJob("t::j1", j1.to_dict(), j1, [], None, None)
@@ -126,12 +133,11 @@ class TestCompletionMachineBasicSettlement:
         assert ctx.store.in_flight_uids == frozenset()
 
     def test_restore_stale_result_creates_pseudo_and_settles(self, tmp_path):
-        ctx = _make_context(tmp_path)
-        completion = CompletionMachine(ctx)
+        ctx, completion = _make_machine(tmp_path)
 
         job = Job("t", "stale_job", {})
         channel = ctx.channel
-        channel.consume_stale_result = lambda uid, j: ExecutionResult(
+        channel.claim_stale_result = lambda uid, j: ExecutionResult(
             success=True, result_meta={"restored": True}
         )
 

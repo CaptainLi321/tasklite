@@ -32,7 +32,15 @@ def make_env(tmp_path, capacity=2):
         ipc_dir=str(tmp_path / "ipc"),
         output_root=str(tmp_path / "out"),
     )
-    completion = CompletionMachine(ctx)
+    completion = CompletionMachine(
+        store=ctx.store,
+        policy=ctx.policy,
+        channel=channel,
+        resources=ctx.resource_mgr,
+        in_flight=ctx.in_flight,
+        session=ctx,
+        backend=backend,
+    )
     dispatch = DispatchMachine(
         store=ctx.store,
         scheduler=scheduler,

@@ -14,9 +14,25 @@ from typing import (
 logger = logging.getLogger("tasklite")
 
 from ..models.job import WORKER_RESOURCE  # noqa: E402
+from ..utils.jsonutil import dumps  # noqa: E402
 
 # 单次 suspend 的上限（秒）：防止子进程传入 1e12 等超大值永久停摆管线
 _MAX_SUSPEND_SECONDS = 86400.0  # 24h
+
+# 资源挂起截止时刻在 meta 表的持久化键
+META_RESOURCE_SUSPENDS = "resource_suspends"
+
+
+def persist_resource_suspensions(backend: Any, resource_mgr: "ResourceManager") -> None:
+    """把资源挂起截止时刻原子落盘到 meta 表（completion/recovery 共享助手）。
+
+    挂起的应用点即时持久化，消除 kill -9/OOM 时挂起丢失窗口。
+    """
+    deadlines = resource_mgr.collect_suspensions()
+    try:
+        backend.set_meta(META_RESOURCE_SUSPENDS, dumps(deadlines))
+    except Exception as e:
+        logger.error(f"Failed to persist resource suspends to meta: {e}")
 
 
 class Resource(ABC):

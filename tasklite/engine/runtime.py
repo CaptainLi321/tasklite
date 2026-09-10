@@ -26,7 +26,6 @@ from .types import (  # noqa: E402
 )
 
 # 资源与运行时常量（提前定义避免模块环形导入）
-META_RESOURCE_SUSPENDS = "resource_suspends"
 RT_BACKOFF_UNTIL = "_backoff_until"
 RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
 RT_COMMIT_FAILURES = "_commit_failures"
@@ -45,7 +44,13 @@ from .store import (
 from .channel import ArtifactCleanupMode, ExecutionChannel, ExecutionResult, JobHandle
 from .inflight import InFlightJob, InFlightTracker
 from .policy import ExecutionPolicy, PreflightPolicy
-from .resource import CapacityResource, Resource, ResourceManager
+from .resource import (
+    META_RESOURCE_SUSPENDS,
+    CapacityResource,
+    Resource,
+    ResourceManager,
+    persist_resource_suspensions,
+)
 from .scheduler import DeadlockAttribution, JobScheduler, ScheduleResult
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
@@ -214,13 +219,6 @@ class RunContext:
         self.state = state
         self.store.set_state(state)
 
-    def persist_resource_suspends_now(self) -> None:
-        deadlines = self.resource_mgr.collect_suspensions()
-        try:
-            self.backend.set_meta(META_RESOURCE_SUSPENDS, dumps(deadlines))
-        except Exception as e:
-            logger.error(f"Failed to persist resource suspends to meta: {e}")
-
     def fire_job_completed(
         self, uid: str, meta: Dict[str, Any], success: bool, going_to_retry: bool,
     ) -> None:
@@ -300,7 +298,15 @@ class EngineRuntime:
         )
 
         # 构建机器依赖拓扑
-        self._completion = CompletionMachine(self._ctx)
+        self._completion = CompletionMachine(
+            store=self._ctx.store,
+            policy=self._ctx.policy,
+            channel=self._ctx.channel,
+            resources=self._ctx.resource_mgr,
+            in_flight=self._ctx.in_flight,
+            session=self._ctx,
+            backend=self.backend,
+        )
         self._dispatch = DispatchMachine(
             store=self._ctx.store,
             scheduler=self.scheduler,
@@ -316,7 +322,15 @@ class EngineRuntime:
             ipc_dir=self._ctx.ipc_dir,
             commit_failure_dlq_threshold=self._ctx.commit_failure_dlq_threshold,
         )
-        self._recovery = RecoveryMachine(self._ctx, self._completion)
+        self._recovery = RecoveryMachine(
+            store=self._ctx.store,
+            backend=self.backend,
+            channel=self._ctx.channel,
+            resources=self._ctx.resource_mgr,
+            in_flight=self._ctx.in_flight,
+            policy=self._ctx.policy,
+            completion=self._completion,
+        )
 
         self._run_lock_fd: Optional[int] = None
         self._is_running: bool = False

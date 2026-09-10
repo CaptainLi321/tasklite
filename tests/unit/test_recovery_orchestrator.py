@@ -8,9 +8,12 @@ import pytest
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.policy import PreflightPolicy
 from tasklite.engine.recovery import RecoveryOrchestrator, RecoveryMachine
-from tasklite.engine.resource import CapacityResource, ResourceManager
-from tasklite.engine.runtime import (
+from tasklite.engine.resource import (
     META_RESOURCE_SUSPENDS,
+    RateLimitResource,
+    ResourceManager,
+)
+from tasklite.engine.runtime import (
     RT_BACKOFF_UNTIL,
     RT_BACKOFF_WALL_DEADLINE,
 )
@@ -19,31 +22,24 @@ from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
 
 
-class DummyRunContext:
-    def __init__(self, backend, state=None, resource_mgr=None):
-        self.backend = backend
-        self.state = state or PipelineState({}, {}, {}, [])
-        self.store = StateStore(self.backend, state=self.state)
-        self.resource_mgr = resource_mgr or ResourceManager()
-        self.policy = PreflightPolicy()
-        self.stats = {
-            "skipped": 0,
-            "failed": 0,
-            "retried": 0,
-        }
-        self.ipc_dir = "/tmp/dummy_ipc"
-        self.in_flight = MagicMock()
-        self._persisted = False
-
-    def persist_resource_suspends_now(self):
-        self._persisted = True
+def make_orchestrator(backend, state=None, resource_mgr=None):
+    """显式装配 RecoveryOrchestrator 的窄依赖集合。"""
+    state = state or PipelineState({}, {}, {}, [])
+    return RecoveryOrchestrator(
+        store=StateStore(backend, state=state),
+        backend=backend,
+        channel=MagicMock(),
+        resources=resource_mgr or ResourceManager(),
+        in_flight=MagicMock(),
+        policy=PreflightPolicy(),
+        completion=MagicMock(),
+    )
 
 
 class TestRecoveryOrchestratorQueueRepair:
     def test_repair_queue_backoff_conversion(self):
         backend = InMemoryStateBackend()
-        ctx = DummyRunContext(backend)
-        orchestrator = RecoveryOrchestrator(ctx, MagicMock())
+        orchestrator = make_orchestrator(backend)
 
         now_wall = time.time()
         # 1. 过去已过期截止时间 -> 应当被清除
@@ -65,8 +61,7 @@ class TestRecoveryOrchestratorQueueRepair:
 
     def test_repair_queue_filters_wall_and_failed_unless_rerun(self):
         backend = InMemoryStateBackend()
-        ctx = DummyRunContext(backend)
-        orchestrator = RecoveryOrchestrator(ctx, MagicMock())
+        orchestrator = make_orchestrator(backend)
 
         # 在 wall 中且 rerun="never" -> 过滤
         job_wall = {"task_type": "t", "job_id": "w1", "rerun": "never"}
@@ -97,8 +92,7 @@ class TestRecoveryOrchestratorCrashSafeSave:
 
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "j2"}])
 
-        ctx = DummyRunContext(backend, state=state)
-        orchestrator = RecoveryOrchestrator(ctx, MagicMock())
+        orchestrator = make_orchestrator(backend, state=state)
 
         orchestrator.save_queue_crash_safe()
 
@@ -115,11 +109,35 @@ class TestRecoveryOrchestratorCrashSafeSave:
         backend.load_queue = MagicMock(side_effect=IOError("Disk corruption"))
 
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "in_mem"}])
-        ctx = DummyRunContext(backend, state=state)
-        orchestrator = RecoveryOrchestrator(ctx, MagicMock())
+        orchestrator = make_orchestrator(backend, state=state)
 
         # 不应抛出异常，也不应覆盖磁盘
         orchestrator.save_queue_crash_safe()
+
+
+class TestRecoveryOrchestratorSuspendPersistence:
+    def test_apply_pending_signals_persists_suspensions(self):
+        backend = InMemoryStateBackend()
+        rm = ResourceManager({"api": RateLimitResource("api", 1.0)})
+        in_flight = MagicMock()
+        in_flight.active_uids.return_value = ["t::j1"]
+        channel = MagicMock()
+        # channel.drain_active_signals 返回一条挂起信号
+        channel.drain_active_signals.return_value = [("t::j1", "api", 30.0)]
+
+        orchestrator = RecoveryOrchestrator(
+            store=StateStore(backend),
+            backend=backend,
+            channel=channel,
+            resources=rm,
+            in_flight=in_flight,
+            policy=PreflightPolicy(),
+            completion=MagicMock(),
+        )
+
+        orchestrator.apply_pending_signals()
+
+        assert backend.get_meta(META_RESOURCE_SUSPENDS) is not None
 
 
 class TestRecoveryOrchestratorCompatibility:
