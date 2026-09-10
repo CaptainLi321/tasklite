@@ -54,7 +54,6 @@ class TestEngineRuntimeConfiguration:
             backend=backend,
             resources=resources,
             handlers=handlers,
-            executor=None,
             transient_registry=None,
             discovery_rerun={},
         )
@@ -83,7 +82,6 @@ class TestEngineRuntimeStopStateMachine:
             backend=backend,
             resources=resources,
             handlers={},
-            executor=None,
             transient_registry=None,
             discovery_rerun={},
         )
@@ -116,7 +114,6 @@ class TestEngineRuntimeStopStateMachine:
             backend=backend,
             resources=resources,
             handlers={},
-            executor=None,
             transient_registry=None,
             discovery_rerun={},
         )
@@ -142,7 +139,6 @@ class TestEngineRuntimeStepPump:
             backend=backend,
             resources=resources,
             handlers={},
-            executor=None,
             transient_registry=None,
             discovery_rerun={},
         )
@@ -165,7 +161,6 @@ class TestEngineRuntimeStepPump:
             backend=backend,
             resources=resources,
             handlers={},
-            executor=None,
             transient_registry=None,
             discovery_rerun={},
         )
@@ -210,7 +205,6 @@ class TestEngineRuntimeExecutionLifecycle:
             backend=backend,
             resources=resources,
             handlers={},
-            executor=None,
             transient_registry=None,
             discovery_rerun={},
         )
@@ -248,7 +242,6 @@ class TestEngineRuntimeExecutionLifecycle:
             backend=backend,
             resources=resources,
             handlers=handlers,
-            executor=None,
             transient_registry=None,
             discovery_rerun={},
         )
@@ -272,7 +265,6 @@ class TestEngineRuntimeExecutionLifecycle:
             backend=backend,
             resources=resources,
             handlers={},
-            executor=None,
             transient_registry=None,
             discovery_rerun={},
         )
@@ -282,7 +274,6 @@ class TestEngineRuntimeExecutionLifecycle:
             backend=backend,
             resources=resources,
             handlers={},
-            executor=None,
             transient_registry=None,
             discovery_rerun={},
         )

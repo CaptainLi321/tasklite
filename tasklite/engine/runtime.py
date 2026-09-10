@@ -13,85 +13,29 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequ
 
 logger = logging.getLogger("tasklite")
 
+# 引擎公共值对象单一真相源见 engine/types.py；此处 re-export 维持历史导入路径。
+from .types import (  # noqa: E402
+    EMPTY_STATS,
+    ExecutionOptions,
+    ExitReason,
+    HandlerEntry,
+    RunSummary,
+    StepOutcome,
+    StopMode,
+    TaskStats,
+)
+
 # 资源与运行时常量（提前定义避免模块环形导入）
-WORKER_RESOURCE = "__workers__"
 META_RESOURCE_SUSPENDS = "resource_suspends"
 RT_BACKOFF_UNTIL = "_backoff_until"
 RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
 RT_COMMIT_FAILURES = "_commit_failures"
-
-EMPTY_STATS = {
-    "completed": 0,
-    "failed": 0,
-    "retried": 0,
-    "skipped": 0,
-    "hook_errors": 0,
-    "deferred_orphan": 0,
-    "interrupted_reruns": 0,
-    "cascade_failed": 0,
-}
-
-
-class StopMode(enum.Enum):
-    """停机状态机三态。"""
-    NONE = "none"
-    DRAINING = "draining"
-    ABORTING = "aborting"
-
-
-class ExitReason(str, enum.Enum):
-    """引擎退出原因。"""
-    COMPLETED = "completed"
-    STOPPED_DRAINING = "stopped_draining"
-    STOPPED_ABORTING = "stopped_aborting"
-    INTERRUPTED = "interrupted"
-    ERROR = "error"
-
-
-class TaskStats(dict):
-    """运行统计字典。"""
-
-    def __init__(self) -> None:
-        super().__init__(EMPTY_STATS)
-
-    @property
-    def completed(self) -> int:
-        return self["completed"]
-
-    @property
-    def failed(self) -> int:
-        return self["failed"]
-
-    @property
-    def retried(self) -> int:
-        return self["retried"]
-
-    @property
-    def skipped(self) -> int:
-        return self["skipped"]
-
-    @property
-    def hook_errors(self) -> int:
-        return self["hook_errors"]
-
-    @property
-    def deferred_orphan(self) -> int:
-        return self["deferred_orphan"]
-
-    @property
-    def interrupted_reruns(self) -> int:
-        return self["interrupted_reruns"]
-
-    @property
-    def cascade_failed(self) -> int:
-        return self["cascade_failed"]
 
 
 from .governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
     DeadlockGovernor,
-    EpisodeState,
 )
 from .store import (
     COMMIT_FAILURE_DLQ_THRESHOLD,
@@ -127,37 +71,6 @@ class RuntimeConfig:
     on_run_start: Optional[Callable[[], None]] = None
     on_run_end: Optional[Callable[[str], None]] = None
     on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None
-
-
-@dataclass(frozen=True)
-class ExecutionOptions:
-    """execute() 单次运行的动态选项。"""
-    install_signals: bool = True
-    acquire_run_lock: bool = True
-
-
-@dataclass(frozen=True)
-class StepOutcome:
-    """step() 单步事件泵的执行产物。"""
-    dispatched_count: int
-    completed_count: int
-    is_idle: bool
-    should_wait: bool
-    wait_time: float
-    deadlock_detected: bool
-    stop_mode: StopMode
-    should_terminate: bool = False
-    exit_reason: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class RunSummary:
-    """引擎执行完成后的不可变运行摘要。"""
-    exit_reason: ExitReason
-    stats: "TaskStats"
-    run_id: str
-    duration_seconds: float
-    unhandled_exception: Optional[BaseException] = None
 
 
 class RunContext:
@@ -228,7 +141,6 @@ class RunContext:
             dep_grace_seconds=self.dep_grace_seconds,
             deadlock_gap_max_rounds=self.deadlock_gap_max_rounds,
         )
-        self.episode: EpisodeState = self.governor
 
         self.on_run_start = on_run_start
         self.on_job_completed = on_job_completed
@@ -373,7 +285,6 @@ class EngineRuntime:
         transient_registry: Any,
         discovery_rerun: Dict[str, str],
         channel: Optional[ExecutionChannel] = None,
-        executor: Any = None,
     ) -> None:
         from .completion import CompletionMachine
         from .dispatch import DispatchMachine
