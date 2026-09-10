@@ -181,3 +181,16 @@ v1.1.0 之后 4 天内落了 91 个深模块化提交（日均 23 个），对 g
   regressions.py` 4 处依赖 `pipeline.backend = Failing*Backend()` 热切换做崩溃
   注入，属载荷测试接缝而非外泄门面属性；且修订 3 已确立机器经 store.backend
   活引用读取、热切换对机器即时可见的语义。§4.1 去留表已随本提交同步改写。
+- **修订 5（2026-09-10，维护者裁定）**：本仓库无外部消费方（仅维护者自用），
+  弃用窗口原则豁免——修订 4 所登记的九处弃用面（门面六个深模块只读属性
+  `store` / `scheduler` / `governor` / `channel` / `state` / `in_flight` 与
+  三个钩子 setter）与两处零消费 re-export（`runtime.RuntimeConfig = RunConfig`
+  垫片、`pipeline.py` 尾部 hooks 三件套 noqa 导入）随 1.2.0 **直接移除**，
+  不经历「次版本移除」的弃用窗口；钩子属性收敛为只读（getter 委托 session），
+  深模块消费点（测试）迁移至 `pipeline._runtime.*` 直达路径。连带修复：
+  `enqueue()` 内部路径经 `self.store` 过渡期属性委托导致用户调用点误触
+  DeprecationWarning 的缺陷（改走 `self._runtime.store`，附回归测试）。
+  事件泵瘦身兑现手册 §4.2.5 既定契约：`step()` 主体 142→58 行（<60），
+  删除不可达的 `store is None` 早退，三组同形终态早退统一 `_terminal_outcome()`，
+  填池派发 / 死锁仲裁 / drain 回收结算抽取为私有方法，行为零变更
+  （1397 测试 + fencing/shutdown 时序测试全绿，未改任何断言）。
