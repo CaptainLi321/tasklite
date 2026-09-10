@@ -16,7 +16,7 @@ from tasklite.taxonomy import (
     ERROR_TYPE_DEADLOCK, ERROR_TYPE_DEPENDENCY, ERROR_TYPE_DISPATCH,
     ERROR_TYPE_FATAL, ERROR_TYPE_TRANSIENT_EXHAUSTED, ERROR_TYPE_UNKNOWN,
 )
-from tasklite.pipeline import _CommitCrashSignal
+from tasklite.exceptions import _CommitCrashSignal
 from tasklite.wrappers.discovery import sanitize_content_id
 
 
@@ -332,14 +332,14 @@ class TestBulkFailureThreeStrike:
         uids_metas = [("t::a", {"error": ERR_DEPENDENCY_DEADLOCK})]
 
         # 同 jd 对象连续调用（计数原地递增，模拟跨 boot 持久化累计）
-        queue, kept = p.store.commit_bulk_failed_crash("test", uids_metas, [jd])
+        queue, kept = p._runtime.store.commit_bulk_failed_crash("test", uids_metas, [jd])
         assert kept is True
         assert queue[0]["runtime"]["_commit_failures"] == 1
-        queue, kept = p.store.commit_bulk_failed_crash("test", uids_metas, [jd])
+        queue, kept = p._runtime.store.commit_bulk_failed_crash("test", uids_metas, [jd])
         assert kept is True
         assert queue[0]["runtime"]["_commit_failures"] == 2
         # 达阈值 → 单条 DLQ 成功 → 不保留
-        queue, kept = p.store.commit_bulk_failed_crash("test", uids_metas, [jd])
+        queue, kept = p._runtime.store.commit_bulk_failed_crash("test", uids_metas, [jd])
         assert kept is False
         assert queue == []
         assert "t::a" in p.backend.load_failed()
@@ -353,7 +353,7 @@ class TestBulkFailureThreeStrike:
         jd["runtime"] = {"_commit_failures": 3}  # 已连续失败 3 次
         monkeypatch.setattr(p.backend, "commit_job_failure", lambda uid, meta: False)
 
-        queue, kept = p.store.commit_bulk_failed_crash(
+        queue, kept = p._runtime.store.commit_bulk_failed_crash(
             "test", [("t::a", {"error": "x"})], [jd]
         )
         assert kept is True, "DLQ 失败必须保留（不静默丢失）"
@@ -381,9 +381,9 @@ class TestBulkFailureThreeStrike:
 
         # _commit_failures=2 → failures=3 达阈值 → DLQ 也失败 → 回 crash
         with pytest.raises(_CommitCrashSignal):
-            p.store.commit_failed_crash("t::a", "test", jd)
+            p._runtime.store.commit_failed_crash("t::a", "test", jd)
         # job 必须 requeue 到内存队列（不静默丢失），计数递增到 3
-        q = p.state.queue
+        q = p._runtime.state.queue
         assert len(q) == 1, f"job must be requeued after DLQ-also-fails, got {q}"
         assert q[0]["runtime"]["_commit_failures"] == 3
 

@@ -3,10 +3,9 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import pickle
-import warnings
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 from .backend.base import AbstractStateBackend, classify_error_type
 from .backend.memory import InMemoryStateBackend
@@ -15,21 +14,17 @@ from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig, resolve_tuning
 from .engine.policy import ExecutionPolicy
 from .engine.governor import DeadlockGovernor
-from .engine.inflight import InFlightJob as _InFlightJob, InFlightTracker
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import (
     EngineRuntime,
     TaskStats,
 )
-from .engine.scheduler import JobScheduler
-from .engine.store import DLQEntry, StateStore
+from .engine.store import DLQEntry
 from .engine.console import OpsConsole
 from .engine.types import HandlerEntry
-from .exceptions import _CommitCrashSignal, _JobTerminated
 from .models.context import TaskContext
 from .models.job import Job, WORKER_RESOURCE
 from .taxonomy import ErrorTaxonomy, validate_resource_amounts
-from .utils.jsonutil import dumps
 
 logger = logging.getLogger("tasklite")
 
@@ -232,56 +227,10 @@ class TaskLite:
             taxonomy=self.taxonomy,
         )
 
-    # ── 核心深模块与运行期接缝 ──────────────────────────────────────
+    # ── 运行期只读接缝 ─────────────────────────────────────────────
     #
-    # 按手册 §4.1 去留表：store / scheduler / governor / channel / state /
-    # in_flight 为内部深模块，过渡期保留只读 + DeprecationWarning，
-    # 次版本移除。is_running / backend（只读）/ stats（只读）保留。
-    #
-
-    @property
-    def scheduler(self) -> JobScheduler:
-        """调度器深模块。"""
-        warnings.warn(
-            "TaskLite.scheduler 为内部深模块属性，将在次版本移除，"
-            "请经 TaskLite 公共 API 使用等价能力",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._runtime.scheduler
-
-    @property
-    def store(self) -> StateStore:
-        """状态与事务深模块。"""
-        warnings.warn(
-            "TaskLite.store 为内部深模块属性，将在次版本移除，"
-            "运维操作请经 list_dlq/clear_dlq 等 TaskLite 管理 API",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._runtime.store
-
-    @property
-    def governor(self) -> DeadlockGovernor:
-        """死锁归因与宽限治理深模块。"""
-        warnings.warn(
-            "TaskLite.governor 为内部深模块属性，将在次版本移除，"
-            "请经 TaskLite 公共 API 使用等价能力",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._runtime.governor
-
-    @property
-    def channel(self) -> ExecutionChannel:
-        """执行通道深模块。"""
-        warnings.warn(
-            "TaskLite.channel 为内部深模块属性，将在次版本移除，"
-            "请经 TaskLite 公共 API 使用等价能力",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._runtime.channel
+    # 深模块（store / scheduler / governor / channel / state / in_flight）
+    # 为内部实现，经 self._runtime 直达（手册 §4.1 去留表已登记移除）。
 
     @property
     def is_running(self) -> bool:
@@ -303,69 +252,18 @@ class TaskLite:
     def stats(self) -> TaskStats:
         return self._runtime.stats
 
-    @property
-    def state(self) -> Optional[PipelineState]:
-        warnings.warn(
-            "TaskLite.state 为内部深模块属性，将在次版本移除，"
-            "请经 TaskLite 公共 API 使用等价能力",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._runtime.state
-
-    @property
-    def in_flight(self) -> InFlightTracker:
-        warnings.warn(
-            "TaskLite.in_flight 为内部深模块属性，将在次版本移除，"
-            "请经 TaskLite 公共 API 使用等价能力",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._runtime.in_flight
-
-    # 钩子读写直达 RunSession（会话持久，后置变更即时生效）；
-    # setter 触发 DeprecationWarning（钩子应在构造期参数传入）。
+    # 钩子只读直达 RunSession（钩子仅在构造期参数传入）。
     @property
     def on_run_start(self):
         return self._runtime.session.on_run_start
-
-    @on_run_start.setter
-    def on_run_start(self, value) -> None:
-        warnings.warn(
-            "TaskLite.on_run_start setter 将在次版本移除，"
-            "请在构造期通过参数传入钩子",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._runtime.session.on_run_start = value
 
     @property
     def on_job_completed(self):
         return self._runtime.session.on_job_completed
 
-    @on_job_completed.setter
-    def on_job_completed(self, value) -> None:
-        warnings.warn(
-            "TaskLite.on_job_completed setter 将在次版本移除，"
-            "请在构造期通过参数传入钩子",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._runtime.session.on_job_completed = value
-
     @property
     def on_run_end(self):
         return self._runtime.session.on_run_end
-
-    @on_run_end.setter
-    def on_run_end(self, value) -> None:
-        warnings.warn(
-            "TaskLite.on_run_end setter 将在次版本移除，"
-            "请在构造期通过参数传入钩子",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._runtime.session.on_run_end = value
 
     def _ensure_not_running(self, api_name: str) -> None:
         """管理/入队 API 的 run 期间守卫（把文档限制变成代码级 RuntimeError）。"""
@@ -610,8 +508,3 @@ class TaskLite:
                 self.stop()
             except Exception:
                 logger.exception("run_graceful 收尾 stop 失败")
-
-
-
-# 用户工具函数已迁至 hooks.py，此处 re-export 维持历史导入路径。
-from .hooks import job_ref, progress_hook, slice_list  # noqa: F401, E402

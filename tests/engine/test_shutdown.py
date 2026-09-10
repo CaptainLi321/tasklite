@@ -383,7 +383,7 @@ class TestAbortConsumesCompletedResult:
         """
         from tasklite.engine.channel import JobHandle
         from tasklite.models.state import PipelineState
-        from tasklite.pipeline import _InFlightJob
+        from tasklite.engine.inflight import InFlightJob as _InFlightJob
 
         pipeline = TaskLite(
             name="test_abort_sim", state_dir=tmp_path / "state", backend="sqlite",
@@ -467,7 +467,7 @@ class TestAbortTOCTOU:
         """
         from tasklite.engine.channel import JobHandle
         from tasklite.models.state import PipelineState
-        from tasklite.pipeline import _InFlightJob
+        from tasklite.engine.inflight import InFlightJob as _InFlightJob
 
         pipeline = TaskLite(
             name="test_abort_toctou", state_dir=tmp_path / "state", backend="sqlite",
@@ -549,7 +549,7 @@ class TestAbortTOCTOU:
         """
         from tasklite.engine.channel import JobHandle
         from tasklite.models.state import PipelineState
-        from tasklite.pipeline import _InFlightJob
+        from tasklite.engine.inflight import InFlightJob as _InFlightJob
 
         pipeline = TaskLite(
             name="test_mixed_abort", state_dir=tmp_path / "state", backend="sqlite",
@@ -640,7 +640,7 @@ class TestAbortTOCTOU:
         from tasklite.engine.channel import JobHandle
         from tasklite.engine.resource import CapacityResource
         from tasklite.models.state import PipelineState
-        from tasklite.pipeline import _InFlightJob
+        from tasklite.engine.inflight import InFlightJob as _InFlightJob
 
         pipeline = TaskLite(
             name="test_abort_suspend", state_dir=tmp_path / "state", backend="sqlite",

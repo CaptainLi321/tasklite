@@ -199,9 +199,18 @@ def patch_pipeline_manager(pipeline, monkeypatch):
     monkeypatch.setattr(pipeline._mp_ctx, "Manager", lambda: FakeManager())
 
 
-def make_pipeline(tmp_path, name="test_pipeline"):
-    """Create a pipeline with sqlite backend and temp directory."""
-    return TaskLite(name=name, state_dir=tmp_path / "state", backend="sqlite", output_root=tmp_path / "output")
+def make_pipeline(tmp_path, name="test_pipeline",
+                  on_run_start=None, on_run_end=None, on_job_completed=None):
+    """Create a pipeline with sqlite backend and temp directory.
+
+    钩子一律经构造期参数传入（门面钩子属性只读）。
+    """
+    return TaskLite(
+        name=name, state_dir=tmp_path / "state", backend="sqlite",
+        output_root=tmp_path / "output",
+        on_run_start=on_run_start, on_run_end=on_run_end,
+        on_job_completed=on_job_completed,
+    )
 
 
 def make_runtime(tmp_path, name="test_runtime", capacity=2.0, handlers=None,

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from .inflight import InFlightTracker
     from .policy import ExecutionPolicy
     from .resource import ResourceManager
+    from .session import RunSession
     from .store import StateStore
 
 from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
@@ -43,10 +44,8 @@ class CompletionMachine:
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
-        session: Any,
+        session: "RunSession",
     ) -> None:
-        # session 暂收 RunContext（run_id / fire_job_completed 供给者），
-        # RunSession 抽取后原位替换。
         self._store = store
         self._policy = policy
         self._channel = channel

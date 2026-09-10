@@ -294,7 +294,7 @@ class TestCommitSkipCrashTerminalPreservation:
         pipeline, sched = self._make_pipeline(
             tmp_path, monkeypatch, terminal_in_wall=False,
         )
-        monkeypatch.setattr(pipeline.store, "commit_skip_crash", lambda uid, jd: None)
+        monkeypatch.setattr(pipeline._runtime.store, "commit_skip_crash", lambda uid, jd: None)
         import pytest
         with pytest.raises(AssertionError, match="unexpectedly returned normally"):
             pipeline._runtime._dispatch.dispatch_job(sched)
@@ -325,7 +325,7 @@ class TestCommitFailedCrashContractBreach:
         pipeline, jd = self._pipeline_with_state(tmp_path)
         monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta: False)
         monkeypatch.setattr(
-            pipeline.store, "commit_failed_crash",
+            pipeline._runtime.store, "commit_failed_crash",
             lambda uid, reason, job_dict: None,
         )
         # 不再抛异常，正常返回 True 表示已处理
@@ -338,7 +338,7 @@ class TestCommitFailedCrashContractBreach:
         pipeline, jd = self._pipeline_with_state(tmp_path)
         monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta: False)
         monkeypatch.setattr(
-            pipeline.store, "commit_failed_crash",
+            pipeline._runtime.store, "commit_failed_crash",
             lambda uid, reason, job_dict: None,
         )
         result = pipeline._runtime._dispatch.dispatch_no_handler("t::j1", jd, "t")
@@ -358,7 +358,7 @@ class TestCommitFailedCrashContractBreach:
         jd["payload"] = {"nope": 1}
         monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta: False)
         monkeypatch.setattr(
-            pipeline.store, "commit_failed_crash",
+            pipeline._runtime.store, "commit_failed_crash",
             lambda uid, reason, job_dict: None,
         )
 

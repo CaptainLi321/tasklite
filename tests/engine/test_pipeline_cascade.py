@@ -433,10 +433,9 @@ class TestOnJobCompletedBatchPaths:
 
     def _recording_pipeline(self, tmp_path):
         calls = []
-        pipeline = make_pipeline(tmp_path)
-        pipeline.on_job_completed = (
+        pipeline = make_pipeline(tmp_path, on_job_completed=(
             lambda uid, meta, success, going_to_retry: calls.append((uid, success, going_to_retry))
-        )
+        ))
         return pipeline, calls
 
     def test_cascade_dlq_fires_hook(self, tmp_path, monkeypatch):
@@ -477,15 +476,15 @@ class TestOnJobCompletedBatchPaths:
     def test_deadlock_dlq_hook_isolates_errors(self, tmp_path):
         """钩子抛异常必须被隔离（契约 2）——批量 DLQ 路径下异常不阻断主循环，
         stats["hook_errors"] 计数。"""
-        pipeline, calls = self._recording_pipeline(tmp_path)
-        pipeline.add_resource(CapacityResource("gpu", max_capacity=5.0))
-        pipeline.register_handler("heavy", lambda j, c: (True, {}))
+        calls = []
 
         def _boom(uid, meta, success, going_to_retry):
             calls.append((uid, success, going_to_retry))
             raise RuntimeError("hook failure")
 
-        pipeline.on_job_completed = _boom
+        pipeline = make_pipeline(tmp_path, on_job_completed=_boom)
+        pipeline.add_resource(CapacityResource("gpu", max_capacity=5.0))
+        pipeline.register_handler("heavy", lambda j, c: (True, {}))
         pipeline.enqueue([Job("heavy", "j1", payload={}, resources={"gpu": 10.0})])
         pipeline.run()
 
@@ -500,11 +499,10 @@ class TestOnJobCompletedBatchPaths:
         再触发一次（第二次 success 标志还与实际 DLQ 矛盾）。 修复：
         except 分支标记终结、跳过尾部触发。本测试锁死「恰好一次」+ meta 完整。
         """
-        pipeline, _ = self._recording_pipeline(tmp_path)
         calls = []
-        pipeline.on_job_completed = (
+        pipeline = make_pipeline(tmp_path, on_job_completed=(
             lambda uid, meta, success, going_to_retry: calls.append((uid, meta, success, going_to_retry))
-        )
+        ))
         pipeline.register_handler("t", lambda j, c: (True, {"size": 1}))
 
         # 注入 _commit_failures=2：本次 commit_job_success 失败即达 3-strike
