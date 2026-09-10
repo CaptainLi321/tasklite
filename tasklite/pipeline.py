@@ -22,6 +22,7 @@ from .engine.runtime import (
 )
 from .engine.scheduler import JobScheduler
 from .engine.store import DLQEntry, StateStore
+from .engine.console import OpsConsole
 from .engine.types import HandlerEntry
 from .exceptions import _CommitCrashSignal, _JobTerminated
 from .models.context import TaskContext
@@ -222,6 +223,13 @@ class TaskLite:
 
         # 核心运行期深模块（StateStore 于其构造期创建，run 前即可经门面使用）
         self._runtime = EngineRuntime(config=self.runtime_config)
+
+        # 管理段运维接缝（run() 外管理 API 委托目标）
+        self._console = OpsConsole(
+            backend=self._backend,
+            store=self._runtime.store,
+            taxonomy=self.taxonomy,
+        )
 
     # ── 核心深模块与运行期接缝 ──────────────────────────────────────
     @property
@@ -474,9 +482,9 @@ class TaskLite:
             logger.info(f"Enqueued {len(inserted)} job(s).")
 
     def list_dlq(self) -> List[DLQEntry]:
-        """只读查询 DLQ，返回结构化条目。委托 StateStore。"""
+        """只读查询 DLQ，返回结构化条目。委托 OpsConsole。"""
         self._ensure_not_running("list_dlq")
-        return self.store.list_dlq()
+        return self._console.list_dlq()
 
     def clear_dlq(
         self,
@@ -484,9 +492,9 @@ class TaskLite:
         *,
         keep_fatal: bool = True,
     ) -> int:
-        """从 DLQ 删除匹配条目。委托 StateStore。"""
+        """从 DLQ 删除匹配条目。委托 OpsConsole。"""
         self._ensure_not_running("clear_dlq")
-        return self.store.clear_dlq(task_types, keep_fatal=keep_fatal)
+        return self._console.clear_dlq(task_types, keep_fatal=keep_fatal)
 
     def clear_history(
         self,
@@ -494,19 +502,19 @@ class TaskLite:
         *,
         where: Sequence[str] = ("wall", "failed"),
     ) -> int:
-        """从 wall 和/或 DLQ 删除条目。委托 StateStore。"""
+        """从 wall 和/或 DLQ 删除条目。委托 OpsConsole。"""
         self._ensure_not_running("clear_history")
-        return self.store.clear_history(targets, where=where)
+        return self._console.clear_history(targets, where=where)
 
     def seed_wall(self, uids: Sequence[str]) -> int:
-        """把 uid 批量写入 wall。委托 StateStore。"""
+        """把 uid 批量写入 wall。委托 OpsConsole。"""
         self._ensure_not_running("seed_wall")
-        return self.store.seed_wall(uids)
+        return self._console.seed_wall(uids)
 
     def seed_cursor(self, key: str, value: str) -> None:
-        """预填一个 cursor。委托 StateStore。"""
+        """预填一个 cursor。委托 OpsConsole。"""
         self._ensure_not_running("seed_cursor")
-        self.store.seed_cursor(key, value)
+        self._console.seed_cursor(key, value)
 
     def stop(self, force: bool = False) -> None:
         """请求管线停止（停机状态机）。
