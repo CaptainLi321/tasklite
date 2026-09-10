@@ -34,6 +34,7 @@ RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
 RT_COMMIT_FAILURES = "_commit_failures"
 
 from .config import RunConfig  # noqa: E402
+from .pacing import LoopFacts, decide_wait  # noqa: E402
 from .governor import (  # noqa: E402
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
@@ -219,19 +220,14 @@ class EngineRuntime:
 
             self._run_body()
 
-            if self._session.stop_mode == StopMode.ABORTING:
-                exit_reason = ExitReason.STOPPED_ABORTING
-            elif self._session.stop_mode == StopMode.DRAINING:
-                exit_reason = ExitReason.STOPPED_DRAINING
-            else:
-                exit_reason = ExitReason.COMPLETED
+            exit_reason = self._session.exit_reason()
 
         except KeyboardInterrupt as e:
-            exit_reason = ExitReason.INTERRUPTED
+            exit_reason = self._session.exit_reason(e)
             unhandled_exc = e
             raise
         except BaseException as e:
-            exit_reason = ExitReason.ERROR
+            exit_reason = self._session.exit_reason(e)
             unhandled_exc = e
             raise
         finally:
@@ -272,7 +268,7 @@ class EngineRuntime:
                 deadlock_detected=False,
                 stop_mode=self._session.stop_mode,
                 should_terminate=True,
-                exit_reason="completed",
+                exit_reason=self._session.exit_reason().value,
             )
 
         # 0. 停机模式检查
@@ -291,7 +287,7 @@ class EngineRuntime:
                     deadlock_detected=False,
                     stop_mode=self._session.stop_mode,
                     should_terminate=True,
-                    exit_reason="stopped_aborting",
+                    exit_reason=self._session.exit_reason().value,
                 )
             if self._in_flight:
                 draining = True
@@ -307,7 +303,7 @@ class EngineRuntime:
                     deadlock_detected=False,
                     stop_mode=self._session.stop_mode,
                     should_terminate=True,
-                    exit_reason="stopped_draining",
+                    exit_reason=self._session.exit_reason().value,
                 )
 
         if store.is_empty and not self._in_flight:
@@ -320,7 +316,7 @@ class EngineRuntime:
                 deadlock_detected=False,
                 stop_mode=self._session.stop_mode,
                 should_terminate=True,
-                exit_reason="completed",
+                exit_reason=self._session.exit_reason().value,
             )
 
         # 1. 填池派发（仅非 DRAINING 状态且未超过单步限制）
@@ -333,7 +329,7 @@ class EngineRuntime:
                 outcome = self._dispatch.dispatch_next()
                 last_outcome = outcome
                 if outcome.worker_wait > 0:
-                    worker_wait = outcome.worker_wait
+                    worker_wait = outcome.worker_wait if worker_wait <= 0 else min(worker_wait, outcome.worker_wait)
                 if outcome.entry is not None:
                     dispatched += 1
                     continue
@@ -365,39 +361,26 @@ class EngineRuntime:
             completed = self.channel.reap_completed(handles)
             completed_count = self._completion.settle_reaped(completed)
 
-        # 4. 计算等待时延与空闲状态
+        # 4. 等待/空闲决策（唯一实现见 pacing.decide_wait）
         is_idle = store.is_empty and not self._in_flight
-        if is_idle or should_terminate:
-            wait_time = 0.0
-            should_wait = False
-        elif self._in_flight:
-            if completed_count == 0:
-                wait_time = 0.05
-                should_wait = True
-            else:
-                wait_time = 0.0
-                should_wait = False
-        elif deadlock_wait > 0 and not self._in_flight:
-            wait_time = min(deadlock_wait, 1.0)
-            should_wait = True
-        elif last_outcome is not None and not last_outcome.has_runnable and last_outcome.min_wait != float("inf"):
-            wait_time = min(last_outcome.min_wait, 1.0)
-            should_wait = True
-        elif worker_wait > 0 and not self._in_flight:
-            wait_time = min(worker_wait, 1.0)
-            should_wait = True
-        else:
-            wait_time = 0.0
-            should_wait = not is_idle and dispatched == 0 and completed_count == 0
+        decision = decide_wait(LoopFacts(
+            stop_mode=self._session.stop_mode,
+            has_in_flight=bool(self._in_flight),
+            store_empty=store.is_empty,
+            dispatched=dispatched,
+            completed=completed_count,
+            has_runnable=last_outcome.has_runnable if last_outcome is not None else True,
+            min_wait=last_outcome.min_wait if last_outcome is not None else float("inf"),
+            worker_wait=worker_wait,
+            deadlock_wait=deadlock_wait,
+            should_terminate=should_terminate,
+        ))
+        wait_time = decision.wait_time
+        should_wait = decision.should_wait
 
         exit_reason = None
         if is_idle or should_terminate:
-            if self._session.stop_mode is StopMode.ABORTING:
-                exit_reason = "stopped_aborting"
-            elif self._session.stop_mode is StopMode.DRAINING:
-                exit_reason = "stopped_draining"
-            else:
-                exit_reason = "completed"
+            exit_reason = self._session.exit_reason().value
 
         return StepOutcome(
             dispatched_count=dispatched,
@@ -452,40 +435,37 @@ class EngineRuntime:
 
     def _run_loop(self) -> None:
         """运行主事件循环与统一异常承重网。"""
-        exit_reason = "completed"
+        exit_reason = self._session.exit_reason().value
         try:
             self.run_loop_impl()
-            if self._session.stop_mode is StopMode.ABORTING:
-                exit_reason = "stopped_aborting"
-            elif self._session.stop_mode is StopMode.DRAINING:
-                exit_reason = "stopped_draining"
+            exit_reason = self._session.exit_reason().value
         except _JobTerminated as e:
             logger.critical(f"Job terminated outside expected handlers: {e}")
-            exit_reason = "error"
+            exit_reason = self._session.exit_reason(e).value
             self._recovery.abort_in_flight()
             self._recovery.save_queue_crash_safe()
             raise
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as e:
             logger.warning("Pipeline interrupted by user.")
-            exit_reason = "interrupted"
+            exit_reason = self._session.exit_reason(e).value
             self._recovery.abort_in_flight()
             self._recovery.save_queue_crash_safe()
             raise
         except _CommitCrashSignal as e:
             logger.critical(f"Backend commit failure; aborting in-flight jobs: {e}")
-            exit_reason = "error"
+            exit_reason = self._session.exit_reason(e).value
             self._recovery.abort_in_flight()
             self._recovery.save_queue_crash_safe()
             raise
         except Exception as e:
             logger.critical(f"Pipeline scheduler crashed with unhandled exception: {e}\n{traceback.format_exc()}")
-            exit_reason = "error"
+            exit_reason = self._session.exit_reason(e).value
             self._recovery.abort_in_flight()
             self._recovery.save_queue_crash_safe()
             raise
         except BaseException as e:
             logger.critical(f"Pipeline terminated by {type(e).__name__}: {e}")
-            exit_reason = "error"
+            exit_reason = self._session.exit_reason(e).value
             self._recovery.abort_in_flight()
             self._recovery.save_queue_crash_safe()
             raise
