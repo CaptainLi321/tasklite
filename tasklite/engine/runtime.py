@@ -301,7 +301,21 @@ class EngineRuntime:
 
         # 构建机器依赖拓扑
         self._completion = CompletionMachine(self._ctx)
-        self._dispatch = DispatchMachine(self._ctx, self._completion)
+        self._dispatch = DispatchMachine(
+            store=self._ctx.store,
+            scheduler=self.scheduler,
+            policy=self._ctx.policy,
+            resources=self._ctx.resource_mgr,
+            channel=self._ctx.channel,
+            in_flight=self._ctx.in_flight,
+            session=self._ctx,
+            completion=self._completion,
+            handlers=self.handlers,
+            taxonomy=self._ctx.taxonomy,
+            output_root=self._ctx.output_root,
+            ipc_dir=self._ctx.ipc_dir,
+            commit_failure_dlq_threshold=self._ctx.commit_failure_dlq_threshold,
+        )
         self._recovery = RecoveryMachine(self._ctx, self._completion)
 
         self._run_lock_fd: Optional[int] = None
