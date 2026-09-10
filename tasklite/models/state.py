@@ -241,6 +241,33 @@ class PipelineState:
             else:
                 self._cursors[k] = v
 
+    # 运维管理受控变更（OpsConsole 公共接缝）--------------------------
+
+    def discard_wall(self, uid: str) -> None:
+        """从 wall 集合移除指定 uid（运维接缝，幂等）。"""
+        self._wall.pop(uid, None)
+        self._wall_uids.discard(uid)
+        if __debug__:
+            self._assert_terminal_uids_consistent()
+
+    def discard_failed(self, uid: str) -> None:
+        """从 failed 集合移除指定 uid（运维接缝，幂等）。"""
+        self._failed.pop(uid, None)
+        self._failed_uids.discard(uid)
+        if __debug__:
+            self._assert_terminal_uids_consistent()
+
+    def add_wall(self, uid: str, meta: Dict[str, Any]) -> None:
+        """向 wall 集合添加 uid（运维接缝，seed_wall 场景）。"""
+        self._wall[uid] = meta
+        self._wall_uids.add(uid)
+        if __debug__:
+            self._assert_terminal_uids_consistent()
+
+    def set_cursor(self, key: str, value: str) -> None:
+        """设置单个游标键值（运维接缝，seed_cursor 场景）。"""
+        self._cursors[key] = value
+
     # 只读访问 ----------------------------------------------------
 
     @property
