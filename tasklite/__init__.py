@@ -13,7 +13,8 @@ from .exceptions import (
     FatalError, PipelineError, RateLimitHit, RetryError,
 )
 from .models.job import Job, JobRuntimeState
-from .pipeline import DLQEntry, TaskLite, WORKER_RESOURCE, job_ref, progress_hook, slice_list
+from .hooks import job_ref, progress_hook, slice_list
+from .pipeline import DLQEntry, TaskLite, WORKER_RESOURCE
 from .utils.injective import (
     content_fingerprint,
     escape_injective,
