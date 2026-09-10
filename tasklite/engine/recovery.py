@@ -2,8 +2,8 @@
 
 ``abort_in_flight`` 是异常退出与强制停机的统一收尾：先排空信号，再按
 「结果文件是否已原子落盘」分类——已完成走完成机器提交（不重跑），
-未完成 kill + 清半成品 + requeue（at-least-once）。依赖经 RunContext
-注入、经 CompletionMachine 复用收尾契约，不反向引用 TaskLite。
+未完成 kill + 清半成品 + requeue（at-least-once）。依赖以显式窄清单注入
+（无共享袋）、经 CompletionMachine 复用收尾契约，不反向引用 TaskLite。
 """
 
 from __future__ import annotations
@@ -11,19 +11,23 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .runtime import RunContext
+    from ..backend.base import AbstractStateBackend
+    from .channel import ExecutionChannel
     from .completion import CompletionMachine
-    from .store import RecoveryView
+    from .inflight import InFlightTracker
+    from .policy import ExecutionPolicy
+    from .resource import ResourceManager
+    from .store import StateStore
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
 from ..models.state import uid_from_job_dict
 from ..utils.jsonutil import loads
 from .inflight import InFlightJob, InFlightTracker
-from .runtime import META_RESOURCE_SUSPENDS
+from .resource import META_RESOURCE_SUSPENDS, persist_resource_suspensions
 
 logger = logging.getLogger("tasklite")
 
@@ -39,8 +43,23 @@ class RecoveryOrchestrator:
     5. 异常/停机在途任务 TOCTOU 闭环中止与收尾（abort_in_flight）。
     """
 
-    def __init__(self, ctx: "RunContext", completion: "CompletionMachine") -> None:
-        self._ctx = ctx
+    def __init__(
+        self,
+        *,
+        store: "StateStore",
+        backend: "AbstractStateBackend",
+        channel: "ExecutionChannel",
+        resources: "ResourceManager",
+        in_flight: "InFlightTracker",
+        policy: "ExecutionPolicy",
+        completion: "CompletionMachine",
+    ) -> None:
+        self._store = store
+        self._backend = backend
+        self._channel = channel
+        self._resources = resources
+        self._in_flight = in_flight
+        self._policy = policy
         self._completion = completion
 
     def repair_queue_on_load(
@@ -69,7 +88,7 @@ class RecoveryOrchestrator:
             wall_hit = u in wall
             failed_hit = u in failed
             if wall_hit or failed_hit:
-                decision = self._ctx.policy.evaluate(
+                decision = self._policy.evaluate(
                     jd,
                     wall_meta=wall.get(u),
                     is_wall=wall_hit,
@@ -91,13 +110,13 @@ class RecoveryOrchestrator:
 
         # 4. 单次原子落盘
         if len(clean_q) < len(q_data):
-            self._ctx.backend.save_queue(clean_q)
+            self._backend.save_queue(clean_q)
         return clean_q
 
     def load_resource_suspends(self) -> None:
         """从 meta 表恢复资源 suspend 状态（换算回 monotonic 挂起时刻）。"""
         try:
-            raw = self._ctx.backend.get_meta(META_RESOURCE_SUSPENDS)
+            raw = self._backend.get_meta(META_RESOURCE_SUSPENDS)
         except Exception as e:
             logger.warning(f"Failed to load resource suspends from meta: {e}")
             return
@@ -111,16 +130,15 @@ class RecoveryOrchestrator:
         if not isinstance(deadlines, dict):
             logger.warning("resource_suspends meta is not a dict, ignoring")
             return
-        self._ctx.resource_mgr.restore_suspensions(deadlines)
+        self._resources.restore_suspensions(deadlines)
 
     def persist_resource_suspends(self) -> None:
         """run 结束时把资源挂起截止持久化到 meta 表。
 
-        薄转发到 RunContext.persist_resource_suspends_now——挂起的每个
-        应用点即时持久化（消除 kill -9/OOM 时挂起丢失窗口）见该方法；
-        本入口保留 run 收尾调用面与既有契约测试的兼容。
+        挂起的应用点即时持久化（消除 kill -9/OOM 时挂起丢失窗口）
+        经 resource.persist_resource_suspensions 共享助手落盘。
         """
-        self._ctx.persist_resource_suspends_now()
+        persist_resource_suspensions(self._backend, self._resources)
 
 
     def save_queue_crash_safe(self) -> None:
@@ -136,7 +154,7 @@ class RecoveryOrchestrator:
         再按 uid 去重保存（含内存自身的重复，来自异常路径的双 requeue）。
         """
         try:
-            disk_q = self._ctx.backend.load_queue()
+            disk_q = self._backend.load_queue()
         except Exception as e:
             # load 失败不得用空列表继续覆盖——磁盘上「已
             # commit 但内存未同步」的作业会在此次保存中被永久抹除（覆盖
@@ -147,7 +165,7 @@ class RecoveryOrchestrator:
                 f"skipping overwrite to preserve disk truth: {e}"
             )
             return
-        mem_q = self._ctx.store.queue
+        mem_q = self._store.queue
         mem_uids = {uid_from_job_dict(jd) for jd in mem_q}
         # 磁盘有而内存没有的作业（commit/pop 窗口内丢失的）补回队首
         extra = [jd for jd in disk_q if uid_from_job_dict(jd) not in mem_uids]
@@ -165,7 +183,7 @@ class RecoveryOrchestrator:
                 continue
             seen.add(u)
             dedup_mem.append(jd)
-        self._ctx.backend.save_queue(extra + dedup_mem)
+        self._backend.save_queue(extra + dedup_mem)
 
 
     def apply_pending_signals(self) -> None:
@@ -178,12 +196,12 @@ class RecoveryOrchestrator:
 
         ``suspend()`` 使用 ``max`` 语义，重复应用同一信号是幂等的。
         """
-        signals = self._ctx.channel.drain_active_signals(
-            self._ctx.in_flight.active_uids()
+        signals = self._channel.drain_active_signals(
+            self._in_flight.active_uids()
         )
         applied = False
         for uid, r_name, secs in signals:
-            if self._ctx.resource_mgr.suspend_resource(r_name, secs):
+            if self._resources.suspend_resource(r_name, secs):
                 logger.info(f"Applied suspend signal from {uid}: {r_name} for {secs}s")
                 applied = True
             else:
@@ -192,7 +210,7 @@ class RecoveryOrchestrator:
                     f"{r_name!r} (from {uid})"
                 )
         if applied:
-            self._ctx.persist_resource_suspends_now()
+            persist_resource_suspensions(self._backend, self._resources)
 
 
 
@@ -206,21 +224,21 @@ class RecoveryOrchestrator:
         委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理），
         本方法收敛状态机编排：排空信号 -> 释放资源 -> 重入队未完成 -> 伪 entry 提交已完成。
         """
-        if not self._ctx.in_flight:
+        if not self._in_flight:
             return
 
         # 1. 消费所有 in-flight 的 suspend 信号
         self.apply_pending_signals()
 
         # 2. 释放已占用的资源（务必在 clear 前）
-        self._ctx.in_flight.release_all_resources(self._ctx.resource_mgr)
+        self._in_flight.release_all_resources(self._resources)
 
         # 3. 委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理）
-        handles = self._ctx.in_flight.active_handles()
-        outcome = self._ctx.channel.abort_in_flight(handles)
+        handles = self._in_flight.active_handles()
+        outcome = self._channel.abort_in_flight(handles)
 
         completed_map = {h.uid: res for h, res in outcome.completed}
-        cancelled_entries, done_entries = self._ctx.in_flight.classify_aborted(completed_map)
+        cancelled_entries, done_entries = self._in_flight.classify_aborted(completed_map)
 
         # 4. 委托 CompletionMachine 统一结算已取消与已完成条目
         self._completion.settle_aborted(cancelled_entries, done_entries)

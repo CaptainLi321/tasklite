@@ -242,12 +242,6 @@ class DeadlockGovernor:
         self,
         sched: Any,
         store: "StateStore",
-        *,
-        state: Optional[PipelineState] = None,
-        scheduler: Optional[Any] = None,
-        dep_grace_seconds: Optional[float] = None,
-        deadlock_gap_max_rounds: Optional[int] = None,
-        **kwargs: Any,
     ) -> DeadlockDecision:
         """自闭环死锁仲裁单一入口。
 
@@ -260,36 +254,22 @@ class DeadlockGovernor:
         if sched is None:
             return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
 
-        effective_state = state if state is not None else getattr(store, "state", None)
+        # DispatchOutcome → ScheduleResult 透明解包（输入多态，非状态回查）
         inner_sched = getattr(sched, "sched", None) or sched
         min_wait = getattr(inner_sched, "min_wait", getattr(sched, "min_wait", float("inf")))
 
         if min_wait == float("inf"):
-            return self.resolve_deadlock(
-                sched,
-                store=store,
-                state=effective_state,
-                scheduler=scheduler,
-                dep_grace_seconds=dep_grace_seconds,
-                deadlock_gap_max_rounds=deadlock_gap_max_rounds,
-            )
+            return self.resolve_deadlock(sched, store=store)
 
         waiting_for_dep = getattr(inner_sched, "waiting_for_dependency", getattr(sched, "waiting_for_dependency", False))
-        if waiting_for_dep and effective_state is not None:
-            cycle_uids = effective_state.find_dependency_cycles()
+        if waiting_for_dep and store.state is not None:
+            cycle_uids = store.state.find_dependency_cycles()
             if cycle_uids:
                 logger.error(
                     f"Deadlock detected during backoff/wait: dependency cycle "
                     f"{sorted(set(cycle_uids))} masked by finite min_wait."
                 )
-                return self.resolve_deadlock(
-                    sched,
-                    store=store,
-                    state=effective_state,
-                    scheduler=scheduler,
-                    dep_grace_seconds=dep_grace_seconds,
-                    deadlock_gap_max_rounds=deadlock_gap_max_rounds,
-                )
+                return self.resolve_deadlock(sched, store=store)
 
         return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
 
@@ -298,16 +278,12 @@ class DeadlockGovernor:
         sched: Any,
         store: "StateStore",
         *,
-        state: Optional[PipelineState] = None,
         scheduler: Optional[Any] = None,
-        dep_grace_seconds: Optional[float] = None,
-        deadlock_gap_max_rounds: Optional[int] = None,
-        **kwargs: Any,
     ) -> DeadlockDecision:
         """处理死锁：细粒度归因 + bulk_failure + cascade（纯计算求值，无阻塞副作用）。"""
-        effective_state = state if state is not None else getattr(store, "state", None)
-        effective_grace = dep_grace_seconds if dep_grace_seconds is not None else self.dep_grace_seconds
-        effective_gap_max = deadlock_gap_max_rounds if deadlock_gap_max_rounds is not None else self.deadlock_gap_max_rounds
+        effective_state = store.state
+        effective_grace = self.dep_grace_seconds
+        effective_gap_max = self.deadlock_gap_max_rounds
 
         inner_sched = getattr(sched, "sched", None) or sched
         malformed_uids = self._extract_deadlock_uids(sched, "malformed_uids")

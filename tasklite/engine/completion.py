@@ -2,8 +2,8 @@
 
 ``complete_job`` 是子进程结果的唯一收尾入口；``apply_result`` 承载
 retry/success/failure 三态事务提交；restore/cleanup/release 是崩溃恢复与
-资源释放的共享助手。依赖经 RunContext 注入，经 ``self.store`` 复用
-状态与事务深模块（3-strike/级联），不反向引用 TaskLite。
+资源释放的共享助手。依赖以显式窄清单注入（无共享袋），经 ``self._store``
+复用状态与事务深模块（3-strike/级联），不反向引用 TaskLite。
 """
 from __future__ import annotations
 
@@ -12,18 +12,22 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .runtime import RunContext
-    from .store import CommitView
+    from ..backend.base import AbstractStateBackend
+    from .channel import ExecutionChannel
+    from .inflight import InFlightTracker
+    from .policy import ExecutionPolicy
+    from .resource import ResourceManager
+    from .store import StateStore
 
 from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
-from ..exceptions import _JobTerminated
-from ..models.job import Job
-from .channel import ArtifactCleanupMode, ExecutionResult
+from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..models.job import Job, inject_worker_resource
+from .channel import ArtifactCleanupMode, ExecutionResult, JobHandle
 from .inflight import InFlightJob, InFlightTracker
-from .runtime import inject_worker_resource
+from .resource import persist_resource_suspensions
 
 
 logger = logging.getLogger("tasklite")
@@ -32,8 +36,26 @@ logger = logging.getLogger("tasklite")
 class CompletionMachine:
     """结果提交 / 输出清理 / 资源释放 / 崩溃恢复的完成侧机器。"""
 
-    def __init__(self, ctx: "RunContext") -> None:
-        self._ctx = ctx
+    def __init__(
+        self,
+        *,
+        store: "StateStore",
+        policy: "ExecutionPolicy",
+        channel: "ExecutionChannel",
+        resources: "ResourceManager",
+        in_flight: "InFlightTracker",
+        session: Any,
+        backend: "AbstractStateBackend",
+    ) -> None:
+        # session 暂收 RunContext（run_id / fire_job_completed 供给者），
+        # RunSession 抽取后原位替换。
+        self._store = store
+        self._policy = policy
+        self._channel = channel
+        self._resources = resources
+        self._in_flight = in_flight
+        self._session = session
+        self._backend = backend
 
     def complete_job(self, entry: InFlightJob, result: ExecutionResult) -> None:
         """处理一个 in-flight job 的完成结果（薄包装）。
@@ -73,14 +95,14 @@ class CompletionMachine:
             terminated = True
         finally:
             # Release resources (无论成功/失败/重试/崩溃，由 entry 自归还)
-            entry.release_resources(self._ctx.resource_mgr)
+            entry.release_resources(self._resources)
 
             # Cleanup outputs and IPC artifacts via channel deep module
             cleanup_mode = (
                 ArtifactCleanupMode.SUCCESS if result.success
                 else ArtifactCleanupMode.FAILURE_OR_RETRY
             )
-            self._ctx.channel.cleanup_artifacts(uid, mode=cleanup_mode)
+            self._channel.cleanup_artifacts(uid, mode=cleanup_mode)
 
         # on_job_completed 在 stats 更新之后（_apply_result
         # 已 +1）调用——钩子内读 stats 保证一致。单一出口：正常提交与
@@ -90,7 +112,7 @@ class CompletionMachine:
         # 3-strike 终结路径（except _JobTerminated）
         # 的钩子已在 _commit_failed_crash 内触发过，此处跳过防双触发。
         if not terminated:
-            self._ctx.fire_job_completed(
+            self._session.fire_job_completed(
                 uid, dict(result.result_meta),
                 bool(result.success), bool(result.going_to_retry),
             )
@@ -112,7 +134,7 @@ class CompletionMachine:
           - success -> _apply_success
           - failure -> _apply_failure
         """
-        store = self._ctx.store
+        store = self._store
         if expect_in_flight:
             assert uid in store.in_flight_uids, (
                 f"identity vacuity violation: {uid} not in-flight at _apply_result entry"
@@ -121,7 +143,7 @@ class CompletionMachine:
         # 1. 全局应用资源挂起
         applied_suspension = False
         for r_name, secs in result.resource_suspensions:
-            if self._ctx.resource_mgr.suspend_resource(r_name, secs):
+            if self._resources.suspend_resource(r_name, secs):
                 applied_suspension = True
             else:
                 logger.warning(
@@ -129,7 +151,7 @@ class CompletionMachine:
                     f"(requested by {uid})"
                 )
         if applied_suspension:
-            self._ctx.persist_resource_suspends_now()
+            persist_resource_suspensions(self._backend, self._resources)
 
         # 2. 状态分发
         if result.retry_requested:
@@ -143,10 +165,10 @@ class CompletionMachine:
         self, uid: str, job: Job, job_dict: dict, result: ExecutionResult
     ) -> None:
         """处理重试分支：委托策略深模块规划重试并同步存储与统计。"""
-        plan = self._ctx.policy.plan_retry(job, job_dict, result)
+        plan = self._policy.plan_retry(job, job_dict, result)
         if not plan.going_to_retry:
             logger.error(f"FAIL: {uid} exceeded max retries ({job.max_retries}). Sent to DLQ.")
-            self._ctx.store.apply_failure(
+            self._store.apply_failure(
                 uid, plan.fail_meta or {"error": _ERR_MAX_RETRIES}, job_dict=job_dict, cascade=True
             )
             result.going_to_retry = False
@@ -154,7 +176,7 @@ class CompletionMachine:
 
         logger.info(f"RETRY: {uid} (attempt {job.retries}/{job.max_retries}, backoff {plan.delay:.1f}s)")
         assert plan.retry_dict is not None
-        self._ctx.store.apply_retry(
+        self._store.apply_retry(
             uid,
             job_dict,
             plan.retry_dict,
@@ -169,7 +191,7 @@ class CompletionMachine:
         job_start: Optional[float] = None
     ) -> None:
         """处理成功分支：子任务去重、wall 记录与 cursor 推进。"""
-        store = self._ctx.store
+        store = self._store
         duration = (time.monotonic() - job_start) if job_start is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
@@ -187,7 +209,7 @@ class CompletionMachine:
                 if store.is_known(nj_uid):
                     if nj_uid in store.queue_uids or nj_uid in store.in_flight_uids:
                         continue
-                    decision = self._ctx.policy.admit(nj.to_dict(), store)
+                    decision = self._policy.admit(nj.to_dict(), store)
                     if decision.should_skip:
                         continue
                 seen_in_batch.add(nj_uid)
@@ -195,22 +217,22 @@ class CompletionMachine:
 
             for nj in unique_new_jobs:
                 jd = nj.to_dict()
-                self._ctx.policy.normalize_job_dict(jd, nj.task_type)
+                self._policy.normalize_job_dict(jd, nj.task_type)
                 inject_worker_resource(jd)
                 spawned_dicts.append(jd)
             logger.debug(f"Spawned {len(spawned_dicts)} jobs for {uid}.")
 
         # 构建 wall meta
         wall_meta = dict(result.result_meta or {})
-        declared_inputs = self._ctx.channel.read_declared_inputs(uid)
+        declared_inputs = self._channel.read_declared_inputs(uid)
 
-        self._ctx.store.apply_success(
+        self._store.apply_success(
             uid,
             wall_meta,
             spawned_jobs=spawned_dicts,
             cursor_updates=result.cursor_updates,
             declared_inputs=declared_inputs,
-            run_id=self._ctx.run_id,
+            run_id=self._session.run_id,
             job_dict=job_dict,
         )
         result.going_to_retry = False
@@ -222,7 +244,7 @@ class CompletionMachine:
         """处理永久失败分支：写入 DLQ 与级联阻断下游。"""
         duration = (time.monotonic() - job_start) if job_start is not None else 0.0
         logger.error(f"FAIL: {uid} (duration {duration:.2f}s, Sent to DLQ). Meta: {result.result_meta}")
-        self._ctx.store.apply_failure(
+        self._store.apply_failure(
             uid, result.result_meta, job_dict=job_dict, cascade=True
         )
         result.going_to_retry = False
@@ -240,17 +262,17 @@ class CompletionMachine:
         3. 确保在 finally 中从 InFlightTracker 与 StateStore 中注销；
         返回成功结算的作业数。
         """
-        store = self._ctx.store
+        store = self._store
         completed_count = 0
         for handle, result in reaped:
-            entry = self._ctx.in_flight.get(handle.uid)
+            entry = self._in_flight.get(handle.uid)
             if entry is None:
                 continue
             try:
                 self.complete_job(entry, result)
                 completed_count += 1
             finally:
-                self._ctx.in_flight.settle(handle.uid, state=store)
+                self._in_flight.settle(handle.uid, state=store)
         return completed_count
 
     def settle_aborted(
@@ -264,10 +286,10 @@ class CompletionMachine:
         2. 已完成任务：通过 complete_job 事务提交（不重跑、不误杀）；
         3. 彻底清空在途集合并透传可能的 commit 崩溃信号。
         """
-        store = self._ctx.store
+        store = self._store
         # 1. 未完成任务注销并重入队
         for pentry in cancelled_entries:
-            self._ctx.in_flight.settle(pentry.uid, state=store)
+            self._in_flight.settle(pentry.uid, state=store)
         job_dicts = [entry.job_dict for entry in cancelled_entries]
         if job_dicts:
             store.requeue_jobs(job_dicts, front=True)
@@ -282,9 +304,9 @@ class CompletionMachine:
             except _CommitCrashSignal as e:
                 commit_crash = e
             finally:
-                self._ctx.in_flight.settle(entry.uid, state=store)
+                self._in_flight.settle(entry.uid, state=store)
 
-        self._ctx.in_flight.clear()
+        self._in_flight.clear()
         store.clear_in_flight()
         if commit_crash is not None:
             raise commit_crash
@@ -301,7 +323,7 @@ class CompletionMachine:
             True 表示已消费残留（job 已提交/重入队，调用方应返回 None，
             不再派发子进程）；False 表示无残留，照常派发。
         """
-        result = self._ctx.channel.consume_stale_result(uid, job)
+        result = self._channel.claim_stale_result(uid, job)
         if result is None:
             return False
         logger.info(f"RESTORE: {uid} (stale result from previous run, no subprocess)")
@@ -319,7 +341,7 @@ class CompletionMachine:
 
     def cleanup_outputs(self, uid: str) -> None:
         """清理失败/中断 job 的半成品输出（向后兼容委托给 channel）。"""
-        self._ctx.channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
+        self._channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
 
     def release_acquired(
         self,
@@ -328,7 +350,7 @@ class CompletionMachine:
     ) -> None:
         """释放已 acquire 的资源（支持 InFlightJob 或元组列表）。"""
         if isinstance(acquired_or_entry, InFlightJob):
-            acquired_or_entry.release_resources(self._ctx.resource_mgr)
+            acquired_or_entry.release_resources(self._resources)
         else:
-            self._ctx.resource_mgr.release_all(acquired_or_entry, uid=uid)
+            self._resources.release_all(acquired_or_entry, uid=uid)
 

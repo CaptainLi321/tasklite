@@ -122,7 +122,8 @@ def test_deadlock_governor_arbitrate(tmp_path):
         min_wait=2.0,
         waiting_for_dependency=False,
     )
-    d_backoff = gov.arbitrate(sched_backoff, mock_store, state=state)
+    mock_store.state = state
+    d_backoff = gov.arbitrate(sched_backoff, mock_store)
     assert d_backoff.action == "none"
     assert d_backoff.should_terminate is False
 
@@ -141,7 +142,8 @@ def test_deadlock_governor_arbitrate(tmp_path):
         min_wait=1.5,
         waiting_for_dependency=True,
     )
-    d_cycle = gov.arbitrate(sched_cycle, mock_store, state=cycle_state)
+    mock_store.state = cycle_state
+    d_cycle = gov.arbitrate(sched_cycle, mock_store)
     assert d_cycle.action == "resolved"
     assert "t::a" in d_cycle.failed_uids
     assert mock_store.apply_bulk_failure.called
