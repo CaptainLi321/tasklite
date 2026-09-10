@@ -312,7 +312,7 @@ class CompletionMachine:
         """崩溃恢复：派发子进程前消费该 uid 的残留结果文件。
 
         上次 run 主进程 SIGKILL/OOM/断电 崩溃时，子进程可能已写好结果文件
-        但未及 commit。本方法在 ``_dispatch_job`` 的 acquire/submit 之前
+        但未及 commit。本方法在 ``_dispatch_job`` 的 acquire/spawn 之前
         调用：若有残留结果，直接经 ``_apply_result`` 提交（不启动子进程），
         避免「新子进程已启动、却被旧结果文件误判完成而 kill」的双重执行窗口。
 

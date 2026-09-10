@@ -114,12 +114,12 @@ class TestOutputVerification:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
+                ctx = self.args[0].task_ctx
                 ctx.declare_output(str(Path(fake_file)), cleanup_on_fail=True)
-                _write_fake_result(self.args[3], self.args[1].uid, {
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-                }, incarnation=getattr(self.args[2], "incarnation", None))
+                }, incarnation=self.args[0].incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -154,9 +154,9 @@ class TestOutputVerification:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
+                ctx = self.args[0].task_ctx
                 ctx.declare_output(str(cleanup_file), cleanup_on_fail=True)
-                _write_fake_result(self.args[3], self.args[1].uid, {"status": "error", "error": "crash", "traceback": "tb"}, incarnation=getattr(self.args[2], "incarnation", None))
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "crash", "traceback": "tb"}, incarnation=self.args[0].incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -294,12 +294,12 @@ class TestProcessErrorPaths:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
+                ctx = self.args[0].task_ctx
                 dummy = tmp_path / "output" / "doomed.txt"
                 dummy.parent.mkdir(parents=True, exist_ok=True)
                 dummy.write_text("temp")
                 ctx.declare_output(str(dummy), cleanup_on_fail=True)
-                _write_fake_result(self.args[3], self.args[1].uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=getattr(self.args[2], "incarnation", None))
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=self.args[0].incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -656,9 +656,9 @@ class TestOutputCleanupVariants:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
+                ctx = self.args[0].task_ctx
                 ctx.declare_output(str(keep_file), cleanup_on_fail=False)  # cleanup=False
-                _write_fake_result(self.args[3], self.args[1].uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=getattr(self.args[2], "incarnation", None))
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=self.args[0].incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -691,9 +691,9 @@ class TestOutputCleanupVariants:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
+                ctx = self.args[0].task_ctx
                 ctx.declare_output(str(out_dir), cleanup_on_fail=True)  # cleanup=True
-                _write_fake_result(self.args[3], self.args[1].uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=getattr(self.args[2], "incarnation", None))
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=self.args[0].incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -726,14 +726,14 @@ class TestOutputCleanupVariants:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
+                ctx = self.args[0].task_ctx
                 ctx.declare_output(str(existing_file), cleanup_on_fail=True)
                 ctx.declare_output(str(missing_file), cleanup_on_fail=True)
                 # Handler claims success, but missing_file doesn't exist
-                _write_fake_result(self.args[3], self.args[1].uid, {
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-                }, incarnation=getattr(self.args[2], "incarnation", None))
+                }, incarnation=self.args[0].incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -770,13 +770,13 @@ class TestOutputCleanupVariants:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
+                ctx = self.args[0].task_ctx
                 ctx.declare_output(str(file_a), cleanup_on_fail=True)
                 ctx.declare_output(str(file_b), cleanup_on_fail=True)
-                _write_fake_result(self.args[3], self.args[1].uid, {
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-                }, incarnation=getattr(self.args[2], "incarnation", None))
+                }, incarnation=self.args[0].incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive

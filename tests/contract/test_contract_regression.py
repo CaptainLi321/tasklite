@@ -345,7 +345,7 @@ class TestSerializationContract:
         写 "error"，decoder 本就处理 "retry"）——错层，不 kill 变异。
         本测试真实持锁 → 调 _mp_worker_wrapper → 断言其结果文件 status。
         """
-        from tasklite.engine.channel import _mp_worker_wrapper
+        from tasklite.engine.channel import WorkerLaunchSpec, _mp_worker_wrapper
         from tasklite.utils.ipc import ArtifactJournal
         from tasklite.models.context import TaskContext
         from tasklite.models.job import Job
@@ -353,17 +353,16 @@ class TestSerializationContract:
 
         ipc = str(tmp_path)
         job = Job("t", "a")
-        ctx = TaskContext(
-            job, set(), set(), {},
-            output_root=None,
-            ipc_dir=ipc, incarnation="test.1",
-        )
+        ctx = TaskContext(job, set(), set(), {}, output_root=None, ipc_dir=ipc)
 
         # 父进程持锁 → worker try_acquire_lock(timeout=2.0) 失败
         fd = try_acquire_lock(ipc, "t::a")
         assert fd is not None
         try:
-            _mp_worker_wrapper(lambda j, c: True, job, ctx, ipc)
+            _mp_worker_wrapper(WorkerLaunchSpec(
+                handler=lambda j, c: True, job=job, task_ctx=ctx,
+                incarnation="test.1", ipc_dir=ipc, timeout=60.0,
+            ))
         finally:
             release_lock(fd)
 
@@ -593,14 +592,13 @@ class TestDispatchInterruptResources:
         p.register_handler("t", lambda j, c: True, default_resources={"slot": 1.0})
         p.enqueue([Job("t", "a")])
 
-        real_submit = p.channel.submit
         raised = {}
 
-        def interrupting_submit(*a, **k):
-            # 模拟：acquire 之后、submit 完成前命中 KeyboardInterrupt
+        def interrupting_spawn(spec):
+            # 模拟：acquire 之后、spawn 完成前命中 KeyboardInterrupt
             raise KeyboardInterrupt()
 
-        monkeypatch.setattr(p.channel, "submit", interrupting_submit)
+        monkeypatch.setattr(p.channel, "spawn", interrupting_spawn)
         from tasklite.pipeline import _CommitCrashSignal
         with pytest.raises(KeyboardInterrupt):
             try:

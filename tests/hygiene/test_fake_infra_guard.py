@@ -9,10 +9,10 @@ fake 测试体系由三层耦合构成，任一层被生产侧或测试侧重构
 2. tests/helpers.py 的 ``patch_multiprocessing_for_fakes`` 必须同时 patch
    全局 ``multiprocessing.Process`` 与 ``tasklite.pipeline.mp.Process``
    双路径（Manager 同理）——漏任一路径即真实子进程逃逸 fake 替换；
-3. helpers 的 ``_ctx_incarnation`` 按 FakeProcess args 元组布局
-   ``(handler_func, job, ctx, ipc_dir)`` 从 ``args[2]`` 取 ctx.incarnation，
-   FakeProcess ``start()`` 从 ``args[1]``/``args[3]`` 取 job/ipc_dir 写
-   fake 结果——子进程入口签名变更会静默错位。
+3. helpers 的 ``_spec_incarnation`` 按 FakeProcess args 元组布局
+   ``(WorkerLaunchSpec,)`` 从 ``args[0]`` 取 spec.incarnation，
+   FakeProcess ``start()`` 从 ``args[0]`` 取 spec.job/spec.ipc_dir/
+   spec.incarnation 写 fake 结果——进程 seam 契约字段增删会静默错位。
 """
 
 import ast
@@ -161,46 +161,39 @@ def test_helpers_patch_covers_global_and_pipeline_mp_paths():
         )
 
 
-def test_ctx_incarnation_parses_fake_args_layout():
-    """契约 3：_ctx_incarnation 按 (handler_func, job, ctx, ipc_dir) 布局取 args[2]。"""
+def test_spec_incarnation_parses_fake_args_layout():
+    """契约 3：_spec_incarnation 按 (WorkerLaunchSpec,) 布局取 args[0].incarnation。"""
     tree = _parse(HELPERS)
-    funcs = _functions(tree, "_ctx_incarnation")
-    assert funcs, "helpers._ctx_incarnation 必须存在（fake 进程 incarnation 提取）"
+    funcs = _functions(tree, "_spec_incarnation")
+    assert funcs, "helpers._spec_incarnation 必须存在（fake 进程 incarnation 提取）"
     inc = funcs[0]
 
-    assert _accesses_arg_index(inc, 2), (
-        "_ctx_incarnation 必须从 args[2] 取 ctx——FakeProcess args 布局 "
-        "(handler_func, job, ctx, ipc_dir) 的第 3 位；子进程入口签名变更"
-        "（新增/删除前置参数）会静默取错 incarnation，fencing 全部失效"
+    assert _accesses_arg_index(inc, 0), (
+        "_spec_incarnation 必须从 args[0] 取 spec——FakeProcess args 布局 "
+        "(WorkerLaunchSpec,) 的第 1 位；进程 seam 契约字段增删"
+        "会静默取错 incarnation，fencing 全部失效"
     )
 
     has_length_guard = any(
-        isinstance(node, ast.Compare)
-        and isinstance(node.left, ast.Call)
-        and isinstance(node.left.func, ast.Name)
-        and node.left.func.id == "len"
+        isinstance(node, ast.If)
         for node in ast.walk(inc)
     )
     assert has_length_guard, (
-        "_ctx_incarnation 必须带 len(args) 长度防御（短元组返回 None 而非 IndexError）"
+        "_spec_incarnation 必须带空元组防御（args 为空返回 None 而非 IndexError）"
     )
 
     reads_incarnation = any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "getattr"
-        and node.args
-        and isinstance(node.args[1], ast.Constant)
-        and node.args[1].value == "incarnation"
+        isinstance(node, ast.Attribute)
+        and node.attr == "incarnation"
         for node in ast.walk(inc)
     )
     assert reads_incarnation, (
-        "_ctx_incarnation 必须读取 ctx.incarnation（fencing 契约的核心属性）"
+        "_spec_incarnation 必须读取 spec.incarnation（fencing 契约的核心字段）"
     )
 
 
-def test_fake_process_classes_read_job_and_ipc_dir_from_args_layout():
-    """契约 3b：FakeProcess 从 args[1]/args[3] 取 job/ipc_dir 写 fake 结果。"""
+def test_fake_process_classes_read_spec_fields_from_args_layout():
+    """契约 3b：FakeProcess 从 args[0] 解 WorkerLaunchSpec 字段写 fake 结果。"""
     tree = _parse(HELPERS)
     for factory_name in (
         "make_fake_process_class",
@@ -209,12 +202,16 @@ def test_fake_process_classes_read_job_and_ipc_dir_from_args_layout():
         funcs = _functions(tree, factory_name)
         assert funcs, f"helpers.{factory_name} 必须存在"
         factory = funcs[0]
-        assert _accesses_arg_index(factory, 1), (
-            f"{factory_name} 的 FakeProcess 必须从 self.args[1] 取 job——"
-            "args 布局 (handler_func, job, ctx, ipc_dir) 第 2 位"
+        assert _accesses_arg_index(factory, 0), (
+            f"{factory_name} 的 FakeProcess 必须从 self.args[0] 取 spec——"
+            "args 布局 (WorkerLaunchSpec,) 第 1 位"
         )
-        assert _accesses_arg_index(factory, 3), (
-            f"{factory_name} 的 FakeProcess 必须从 self.args[3] 取 ipc_dir——"
-            "args 布局 (handler_func, job, ctx, ipc_dir) 第 4 位，错位则 "
-            "fake 结果写入错误目录、drain 永远读不到"
-        )
+        for field in ("job", "ipc_dir", "incarnation"):
+            reads_field = any(
+                isinstance(node, ast.Attribute) and node.attr == field
+                for node in ast.walk(factory)
+            )
+            assert reads_field, (
+                f"{factory_name} 的 FakeProcess 必须读取 spec.{field}——"
+                "按具名契约字段取值，字段改名时此处编译期即错"
+            )

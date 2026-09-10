@@ -17,17 +17,18 @@ from tasklite.pipeline import TaskLite
 def _write_fake_result(ipc_dir, uid, result_dict, incarnation=None):
     """FakeProcess 用：把 IPC 结果原子写入结果文件（与真实子进程同路径）。
 
-    incarnation 由 ctx 携带——fake 与真实子进程共享
+    incarnation 由 WorkerLaunchSpec 携带——fake 与真实子进程共享
     同一路径构造逻辑，保证 drain 能读到 fake 写的结果。
     """
     from tasklite.utils.ipc import ArtifactJournal
     ArtifactJournal(ipc_dir).write_result_atomic(uid, result_dict, incarnation=incarnation)
 
 
-def _ctx_incarnation(args):
-    """从 FakeProcess args=(handler_func, job, ctx, ipc_dir) 提取 ctx.incarnation。"""
-    ctx = args[2] if len(args) >= 3 else None
-    return getattr(ctx, "incarnation", None) if ctx is not None else None
+def _spec_incarnation(args):
+    """从 FakeProcess args=(WorkerLaunchSpec,) 提取 incarnation。"""
+    if not args:
+        return None
+    return args[0].incarnation
 
 
 def make_fake_process_class(outcome="success"):
@@ -50,11 +51,12 @@ def make_fake_process_class(outcome="success"):
 
         def start(self):
             self._alive = True
-            # args = (handler_func, job, ctx, ipc_dir)
-            if len(self.args) >= 4:
-                job = self.args[1]
-                ipc_dir = self.args[3]
-                incarnation = _ctx_incarnation(self.args)
+            # args = (WorkerLaunchSpec,)——进程 seam 具名契约
+            if self.args:
+                spec = self.args[0]
+                job = spec.job
+                ipc_dir = spec.ipc_dir
+                incarnation = spec.incarnation
                 if outcome == "success":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "success",
@@ -132,11 +134,12 @@ def make_ipc_process_class(results=(), exitcode=0, stay_alive=False):
             idx = min(call_count[0], len(results) - 1)
             call_count[0] += 1
             payload = results[idx]
-            if payload is not None and len(self.args) >= 4:
-                job = self.args[1]
-                ipc_dir = self.args[3]
-                incarnation = _ctx_incarnation(self.args)
-                _write_fake_result(ipc_dir, job.uid, payload, incarnation=incarnation)
+            if payload is not None and self.args:
+                spec = self.args[0]
+                _write_fake_result(
+                    spec.ipc_dir, spec.job.uid, payload,
+                    incarnation=spec.incarnation,
+                )
 
         def join(self, timeout=None):
             if not stay_alive:

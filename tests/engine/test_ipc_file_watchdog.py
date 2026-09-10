@@ -140,7 +140,7 @@ class TestStaleResultRestore:
     """ 修复：主进程 SIGKILL/OOM/断电 崩溃后，重启不重复执行已完成的 job。
 
     残留结果文件（{uid}.{incarnation}.result.json）在 ``_dispatch_job``
-    派发子进程**之前**被 ``consume_stale_result`` 消费：成功 → 直接进 wall；
+    派发子进程**之前**被 ``claim_stale_result`` 消费：成功 → 直接进 wall；
     retry → 重试计数+1 重入队；fatal/error → 直接 DLQ；损坏文件 → 丢弃并
     正常执行。handler 一律不再执行。
     """
@@ -354,18 +354,21 @@ class TestSignalsFileTruncateSemantics:
         ex = ExecutionChannel.__new__(ExecutionChannel)
         ex.ipc_dir = str(tmp_path)
         job = Job("h", "x")
-        result = ex.consume_stale_result("t::x", job)
+        result = ex.claim_stale_result("t::x", job)
         assert result is not None and result.success, (
-            f"consume_stale_result 应消费最新执行代成功结果: {result.result_meta if result else None}")
+            f"claim_stale_result 应消费最新执行代成功结果: {result.result_meta if result else None}")
  # 成功路径的 result_meta 即归一化后的 handler 返回值 dict
         assert result.result_meta == {"v": 2}, (
             f"同刻冲突必须取最新执行代: {result.result_meta}")
 
     def test_worker_rejects_missing_incarnation(self, tmp_path):
         """incarnation 缺失 fail-loud（防 .None.result.json 垃圾路径）。"""
-        from tasklite.engine.channel import _mp_worker_wrapper
+        from tasklite.engine.channel import WorkerLaunchSpec, _mp_worker_wrapper
 
-        ctx = TaskContext(Job("t", "x"), set, set, {}) # 无 incarnation
+        # incarnation 缺失（None）——spec 契约破坏必须 fail-loud
         with pytest.raises(RuntimeError, match="incarnation"):
-            _mp_worker_wrapper(lambda j, c: (True, {}), Job("t", "x"), ctx,
-                               str(tmp_path))
+            _mp_worker_wrapper(WorkerLaunchSpec(
+                handler=lambda j, c: (True, {}), job=Job("t", "x"),
+                task_ctx=TaskContext(Job("t", "x"), set(), set(), {}),
+                incarnation=None, ipc_dir=str(tmp_path), timeout=60.0,
+            ))
