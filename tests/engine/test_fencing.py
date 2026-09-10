@@ -18,7 +18,7 @@ from tasklite.models.state import PipelineState
 
 from tests.helpers import (
     make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes,
-    _write_fake_result, _ctx_incarnation,
+    _write_fake_result,
 )
 from tasklite.utils.ipc import ArtifactJournal
 
@@ -57,21 +57,21 @@ class TestIncarnationFencing:
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
         p.run()
 
- # consume_stale_result 会消费旧 incarnation 残留（崩溃恢复语义：省一次重跑）
+ # claim_stale_result 会消费旧 incarnation 残留（崩溃恢复语义：省一次重跑）
         assert "h::a" in p.backend.load_wall()
-        assert handler_calls == [], "旧 incarnation 残留应在派发前被 consume_stale_result 消费"
+        assert handler_calls == [], "旧 incarnation 残留应在派发前被 claim_stale_result 消费"
 
     def test_orphan_file_ignored_when_stale_consumption_skipped(self, tmp_path, monkeypatch):
         """关键回归：孤儿文件在**派发之后**才写入 → 必须对 drain 不可见。
 
-        模拟最危险的时序：consume_stale_result 检查时孤儿还没写完（无残留可消费）
+        模拟最危险的时序：claim_stale_result 检查时孤儿还没写完（无残留可消费）
         → 派发新子进程 → 孤儿此时才写完旧 incarnation 文件。若 drain 阶段 1
         读到该文件，会 commit 孤儿上下文并 kill 新子进程（造成错误提交与误杀危害）。
         """
         p = make_pipeline(tmp_path)
         p.register_handler("h", lambda job, ctx: (True, {}))
 
- # 手工触发一次派发（不消费残留）——通过让 consume_stale_result 找不到文件：
+ # 手工触发一次派发（不消费残留）——通过让 claim_stale_result 找不到文件：
         # 先跑完一个正常 run，确认其结果文件使用**当前 run 的 incarnation**。
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
@@ -109,13 +109,13 @@ class TestIncarnationFencing:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
-                captured["incarnation"] = ctx.incarnation
+                spec = self.args[0]
+                captured["incarnation"] = spec.incarnation
                 from tasklite.utils.ipc import ArtifactJournal
-                ArtifactJournal(self.args[3]).write_result_atomic(self.args[1].uid, {
+                ArtifactJournal(spec.ipc_dir).write_result_atomic(spec.job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-                }, incarnation=ctx.incarnation)
+                }, incarnation=spec.incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -127,7 +127,7 @@ class TestIncarnationFencing:
         p.run()
 
         inc = captured.get("incarnation")
-        assert inc is not None and "." in inc, f"ctx 必须携带 incarnation: {inc!r}"
+        assert inc is not None and "." in inc, f"spec 必须携带 incarnation: {inc!r}"
         run_id, seq = inc.split(".")
         assert len(run_id) == 32, f"run_id 应为 32-hex uuid: {run_id!r}"
         assert int(seq) >= 1, f"seq 应从 1 递增: {seq!r}"
@@ -162,12 +162,12 @@ class TestIncarnationFencing:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
-                seqs.append(ctx.incarnation)
+                spec = self.args[0]
+                seqs.append(spec.incarnation)
                 from tasklite.utils.ipc import ArtifactJournal
-                ArtifactJournal(self.args[3]).write_result_atomic(self.args[1].uid, {
+                ArtifactJournal(spec.ipc_dir).write_result_atomic(spec.job.uid, {
                     "status": "retry", "error": "transient",
-                }, incarnation=ctx.incarnation)
+                }, incarnation=spec.incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -235,7 +235,7 @@ class TestStalePathPrefixCollision:
 
 
 class TestDrainStaleTmpIgnore:
-    """/consume_stale_result 必须忽略 .tmp 残留（孤儿 worker 正在写）。
+    """/claim_stale_result 必须忽略 .tmp 残留（孤儿 worker 正在写）。
 
     变异体（删除 .tmp 过滤行）会消费 .tmp——读部分 JSON 返回 None 后 unlink
     正在写的文件 → 孤儿 os.replace 抛 FileNotFoundError → 写 error 结果 →
@@ -253,9 +253,9 @@ class TestDrainStaleTmpIgnore:
         tmp_file = _Path(p.ipc_dir) / f"{base}{_RESULT_TMP_SUFFIX}"
         tmp_file.write_text('{"status": "suc')  # 部分 JSON
 
-        result = p.channel.consume_stale_result(job.uid, job)
-        assert result is None, "consume_stale_result 必须忽略 .tmp（孤儿仍在写，无 final 可消费）"
-        assert tmp_file.exists(), "consume_stale_result 不得 unlink 正在写的 .tmp 文件"
+        result = p.channel.claim_stale_result(job.uid, job)
+        assert result is None, "claim_stale_result 必须忽略 .tmp（孤儿仍在写，无 final 可消费）"
+        assert tmp_file.exists(), "claim_stale_result 不得 unlink 正在写的 .tmp 文件"
 
 
 class TestStaleDeclarationCleanup:
@@ -304,13 +304,14 @@ class TestStaleDeclarationCleanup:
 
             def start(self):
                 self._alive = True
-                _write_fake_result(self.args[3], self.args[1].uid, {
+                _spec = self.args[0]
+                _write_fake_result(_spec.ipc_dir, _spec.job.uid, {
                     "status": "success",
                     "raw_result": True,
                     "new_jobs": [],
                     "resource_suspensions": [],
                     "cursor_updates": {},
-                }, incarnation=_ctx_incarnation(self.args))
+                }, incarnation=_spec.incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -354,13 +355,14 @@ class TestStaleDeclarationCleanup:
 
             def start(self):
                 self._alive = True
-                _write_fake_result(self.args[3], self.args[1].uid, {
+                _spec = self.args[0]
+                _write_fake_result(_spec.ipc_dir, _spec.job.uid, {
                     "status": "success",
                     "raw_result": True,
                     "new_jobs": [],
                     "resource_suspensions": [],
                     "cursor_updates": {},
-                }, incarnation=_ctx_incarnation(self.args))
+                }, incarnation=_spec.incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive

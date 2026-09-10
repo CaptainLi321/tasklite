@@ -18,6 +18,7 @@ import pytest
 
 from tasklite.engine.channel import (
     ExecutionChannel,
+    WorkerLaunchSpec,
     _normalize_handler_result,
 )
 from tasklite.utils.ipc import ArtifactJournal
@@ -169,8 +170,8 @@ class TestCommitCrashSignalCleanup:
             def start(self):
                 # 写入完整 IPC 结果 → drain 拿到结果 → _complete_job →
                 # commit_job_success 返回 False → _CommitCrashSignal
-                if len(self.args) >= 4:
-                    _write_fake_result(self.args[3], self.args[1].uid, {
+                if self.args:
+                    _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {
                         "status": "success",
                         "raw_result": True,
                         "new_jobs": [],
@@ -365,16 +366,30 @@ class TestSubmitStartFailureCleanup:
                 raise RuntimeError("process start failed")
 
         exec_ = ExecutionChannel(mp_ctx=ExplodingCtx(), ipc_dir=str(tmp_path))
-        ctx = TaskContext(Job("t", "j1", payload={}), set(), set(), {})
+        spec = WorkerLaunchSpec(
+            handler=lambda j, c: True,
+            job=Job("t", "j1", payload={}),
+            task_ctx=TaskContext(Job("t", "j1", payload={}), set(), set(), {}),
+            incarnation="run.1",
+            ipc_dir=str(tmp_path),
+            timeout=60,
+        )
         with pytest.raises(RuntimeError, match="process start failed"):
-            exec_.submit(lambda j, c: True, Job("t", "j1", payload={}), ctx, 60, [])
+            exec_.spawn(spec)
 
     def test_submit_requires_ipc_dir(self):
-        """未配置 ipc_dir → 明确报错（不静默 fallback）。"""
+        """未配置 ipc_dir（spec 与 channel 均无）→ 明确报错（不静默 fallback）。"""
         exec_ = ExecutionChannel(mp_ctx=type("Ctx", (), {"Process": lambda *a, **k: None})())
-        ctx = TaskContext(Job("t", "j1", payload={}), set(), set(), {})
+        spec = WorkerLaunchSpec(
+            handler=lambda j, c: True,
+            job=Job("t", "j1", payload={}),
+            task_ctx=TaskContext(Job("t", "j1", payload={}), set(), set(), {}),
+            incarnation="run.1",
+            ipc_dir=None,
+            timeout=60,
+        )
         with pytest.raises(ValueError, match="ipc_dir"):
-            exec_.submit(lambda j, c: True, Job("t", "j1", payload={}), ctx, 60, [])
+            exec_.spawn(spec)
 
 
 # ─── result_meta JSON 可序列化预检 ─────────────────────────────
@@ -528,7 +543,7 @@ class TestDispatchFailureThreeStrike:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
 
         # run 必须正常返回（DLQ 而非崩溃）
         pipeline.run()
@@ -549,7 +564,7 @@ class TestDispatchFailureThreeStrike:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
 
         import pytest as pytest_mod
         with pytest_mod.raises(pickle_mod.PicklingError):
@@ -633,7 +648,7 @@ class TestCommitFailuresPreservation:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
 
         pipeline.run()
 
@@ -892,7 +907,7 @@ class TestDispatchCommitCountersIndependent:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
 
         # 本次 dispatch 失败 → _dispatch_failures=3 → 达 dispatch 阈值 DLQ
         pipeline.run()
@@ -921,7 +936,7 @@ class TestDispatchCommitCountersIndependent:
 
         def boom_submit(*a, **kw):
             raise pickle_mod.PicklingError("cannot pickle lambda handler")
-        monkeypatch.setattr(pipeline.channel, "submit", boom_submit)
+        monkeypatch.setattr(pipeline.channel, "spawn", boom_submit)
 
         # 本次 dispatch 失败 → _dispatch_failures=1（独立）→ 未达阈值 → requeue
         # 但 submit 每次抛异常，run 会崩溃（requeue + re-raise）——验证

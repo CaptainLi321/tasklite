@@ -28,14 +28,15 @@ class CursorSetterFakeProcess:
 
     def start(self):
         self._alive = True
-        if len(self.args) >= 4:
-            _write_fake_result(self.args[3], self.args[1].uid, {
+        if self.args:
+            spec = self.args[0]
+            _write_fake_result(spec.ipc_dir, spec.job.uid, {
                 "status": "success",
                 "raw_result": True,
                 "new_jobs": [],
                 "resource_suspensions": [],
                 "cursor_updates": {"high_water": "999"},
-            }, incarnation=getattr(self.args[2], "incarnation", None))
+            }, incarnation=spec.incarnation)
 
     def join(self, timeout=None):
         self._alive = False

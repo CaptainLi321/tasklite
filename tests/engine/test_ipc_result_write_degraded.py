@@ -36,8 +36,12 @@ def _is_full_payload(result_dict):
     return str(result_dict.get("error", "")).startswith("LOCK_CONFLICT:")
 
 
-def _make_ctx(job):
-    return TaskContext(job, set(), set(), {}, incarnation=_INCARNATION)
+def _make_spec(job, handler, ipc_dir, incarnation=_INCARNATION):
+    from tasklite.engine.channel import WorkerLaunchSpec
+    return WorkerLaunchSpec(
+        handler=handler, job=job, task_ctx=TaskContext(job, set(), set(), {}),
+        incarnation=incarnation, ipc_dir=ipc_dir, timeout=60.0,
+    )
 
 
 class TestWorkerResultWriteDegraded:
@@ -66,8 +70,7 @@ class TestWorkerResultWriteDegraded:
 
         job = Job("h", "a")
         # worker 不得让 OSError 穿透（裸崩 = 成功 job 被误判 DLQ）
-        _mp_worker_wrapper(lambda j, c: (True, {"v": 1}), job,
-                           _make_ctx(job), str(tmp_path))
+        _mp_worker_wrapper(_make_spec(job, lambda j, c: (True, {"v": 1}), str(tmp_path)))
 
         journal = ArtifactJournal(str(tmp_path))
         res = journal.read_result("h::a", incarnation=_INCARNATION)
@@ -108,8 +111,7 @@ class TestWorkerResultWriteDegraded:
         )
 
         job = Job("h", "a")
-        _mp_worker_wrapper(lambda j, c: (True, {}), job,
-                           _make_ctx(job), str(tmp_path))
+        _mp_worker_wrapper(_make_spec(job, lambda j, c: (True, {}), str(tmp_path)))
 
         journal = ArtifactJournal(str(tmp_path))
         res = journal.read_result("h::a", incarnation=_INCARNATION)
@@ -135,8 +137,7 @@ class TestWorkerResultWriteDegraded:
 
         job = Job("h", "a")
         # 不得抛异常：穿透会让 worker 以未分类崩溃退出
-        _mp_worker_wrapper(lambda j, c: (True, {}), job,
-                           _make_ctx(job), str(tmp_path))
+        _mp_worker_wrapper(_make_spec(job, lambda j, c: (True, {}), str(tmp_path)))
 
         journal = ArtifactJournal(str(tmp_path))
         assert not journal.result_path("h::a", _INCARNATION).exists(), (

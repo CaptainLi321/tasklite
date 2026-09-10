@@ -46,7 +46,7 @@ def _make_releasable_process_class(release_event):
     DRAINING 测试专用：模拟「真实 handler 仍在运行、stop() 时 in-flight 非空」，
     之后由测试主动放行完成——验证 DRAINING 等 in-flight 自然完成并 commit。
     """
-    from tests.helpers import _ctx_incarnation, _write_fake_result
+    from tests.helpers import _write_fake_result
 
     class ReleasableProcess:
         def __init__(self, target=None, args=(), kwargs=None, **_kw):
@@ -63,17 +63,15 @@ def _make_releasable_process_class(release_event):
             if not release_event.is_set() or self._written:
                 return
             self._written = True
-            if len(self.args) >= 4:
-                job = self.args[1]
-                ipc_dir = self.args[3]
-                incarnation = _ctx_incarnation(self.args)
-                _write_fake_result(ipc_dir, job.uid, {
+            if self.args:
+                _spec = self.args[0]
+                _write_fake_result(_spec.ipc_dir, _spec.job.uid, {
                     "status": "success",
                     "raw_result": True,
                     "new_jobs": [],
                     "resource_suspensions": [],
                     "cursor_updates": {},
-                }, incarnation=incarnation)
+                }, incarnation=_spec.incarnation)
             self._alive = False
 
         def is_alive(self):

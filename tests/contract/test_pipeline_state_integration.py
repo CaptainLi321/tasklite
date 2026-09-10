@@ -44,14 +44,14 @@ class TestPipelineStateCommitContract:
 
             def start(self):
                 self._alive = True
-                if len(self.args) >= 4:
-                    _write_fake_result(self.args[3], self.args[1].uid, {
+                if self.args:
+                    _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {
                         "status": "success",
                         "raw_result": True,
                         "new_jobs": [{"task_type": "test", "job_id": "spawned"}],
                         "resource_suspensions": [],
                         "cursor_updates": {"cursor_key": "cursor_value"},
-                    }, incarnation=getattr(self.args[2], "incarnation", None))
+                    }, incarnation=self.args[0].incarnation)
 
             def join(self, timeout=None):
                 self._alive = False
@@ -135,7 +135,7 @@ class TestPipelineStateCommitContract:
         def raising_submit(*args, **kwargs):
             raise RuntimeError("executor crashed")
 
-        monkeypatch.setattr(pipeline.channel, "submit", raising_submit)
+        monkeypatch.setattr(pipeline.channel, "spawn", raising_submit)
 
         with pytest.raises(RuntimeError, match="executor crashed"):
             pipeline.run()
@@ -173,7 +173,7 @@ class TestPipelineStateCommitContract:
         def interrupt_submit(*args, **kwargs):
             raise KeyboardInterrupt()
 
-        monkeypatch.setattr(pipeline.channel, "submit", interrupt_submit)
+        monkeypatch.setattr(pipeline.channel, "spawn", interrupt_submit)
 
         with pytest.raises(KeyboardInterrupt):
             pipeline.run()

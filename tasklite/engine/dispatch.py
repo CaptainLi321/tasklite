@@ -1,4 +1,4 @@
-"""派发机器：派发预检与 submit 编排。
+"""派发机器：派发预检与 spawn 编排。
 
 五关顺序即契约（顺序即时序约束）：dedup → dep-failed → no-handler →
 orphan-probe → stale-restore。依赖以显式窄清单注入（无共享袋），
@@ -34,7 +34,7 @@ from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.context import TaskContext
 from ..models.job import Job, JobRuntimeState
 from ..taxonomy import ErrorTaxonomy
-from .channel import ArtifactCleanupMode, JobHandle
+from .channel import ArtifactCleanupMode, JobHandle, WorkerLaunchSpec
 from .inflight import InFlightJob
 from .scheduler import DeadlockAttribution
 
@@ -63,7 +63,7 @@ class DispatchOutcome:
 
 
 class DispatchMachine:
-    """派发预检 + 资源 acquire + 子进程 submit 的编排器。"""
+    """派发预检 + 资源 acquire + 子进程 spawn 的编排器。"""
 
     def __init__(
         self,
@@ -239,7 +239,7 @@ class DispatchMachine:
         → requeue + 短退避（上限 ~1s 防热循环）本轮不派发。
         probe 必须**先于** _restore_stale_result 与残留声明清理——
         孤儿存活时提前 return，绝不删孤儿实时声明。返回 True = 已处理
-        （孤儿存活 defer）；否则调用方继续 restore/submit。
+        （孤儿存活 defer）；否则调用方继续 restore/spawn。
         """
         # 主进程仅探测——非阻塞试锁，成功即释放。
         # 锁生命周期 = 执行体生命周期：主进程崩溃不释放 worker 的锁，
@@ -331,23 +331,24 @@ class DispatchMachine:
                         fail_meta = {"error": _ERR_PAYLOAD_VALIDATION, "details": _errors}
                         self._reject_and_commit(uid, job_dict, fail_meta)
                         return None
-                # Build context + submit (non-blocking)
+                # Build context + spawn (non-blocking)
                 wall_keys = store.wall_uids
                 failed_keys = store.failed_uids
                 # 输出声明走落盘 outputs.jsonl——handler 子进程内声明的
                 # 输出经落盘文件传回主进程。
                 # fencing：分配本 job 的执行代标识（run_id.seq）。
-                # seq 每次 submit 递增——同 uid 重试再派发也获得新 incarnation，
+                # seq 每次 spawn 递增——同 uid 重试再派发也获得新 incarnation，
                 # 与上次尝试的结果文件隔离（旧尝试的残留不被本次 drain 看见）。
-                self._session.dispatch_seq += 1
-                incarnation = f"{self._session.run_id}.{self._session.dispatch_seq}"
+                incarnation = (
+                    f"{self._session.run_id}.{self._session.next_dispatch_seq()}"
+                )
                 # 注册表快照契约：per-pipeline 瞬态异常注册表快照随 ctx pickle
                 # 下发——分类决策在子进程，注册表必须显式传递（不可依赖父进程
                 # 作用域，更不存在模块级可变全局）。
                 ctx = TaskContext(
                     job, wall_keys, failed_keys, dict(store.cursors),
                     output_root=self._output_root,
-                    ipc_dir=self._ipc_dir, incarnation=incarnation,
+                    ipc_dir=self._ipc_dir,
                     transient_registry=self._taxonomy.snapshot(),
                     # 资源名注册集快照随 ctx 下发——
                     # suspend_resource 对未注册名 fail-loud（typo 不静默失效）。
@@ -356,10 +357,14 @@ class DispatchMachine:
 
                 logger.info(f"RUN: {uid}")
                 job_start = time.monotonic()
-                handle = self._channel.submit(
-                    self._handlers[job.task_type].func, job, ctx, job.timeout,
+                handle = self._channel.spawn(WorkerLaunchSpec(
+                    handler=self._handlers[job.task_type].func,
+                    job=job,
+                    task_ctx=ctx,
+                    incarnation=incarnation,
                     ipc_dir=self._ipc_dir,
-                )
+                    timeout=job.timeout,
+                ))
                 lease.claim()
 
                 entry = InFlightJob(

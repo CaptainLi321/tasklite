@@ -731,12 +731,12 @@ class TestPipelineWeirdCases:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
-                _write_fake_result(self.args[3], self.args[1].uid, {
+                spec = self.args[0]
+                _write_fake_result(spec.ipc_dir, spec.job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [],
                     "cursor_updates": {"shared_key": "shared_val"},
-                }, incarnation=getattr(ctx, "incarnation", None))
+                }, incarnation=spec.incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -750,12 +750,12 @@ class TestPipelineWeirdCases:
 
             def start(self):
                 self._alive = True
-                ctx = self.args[2]
-                observed_cursor[0] = ctx.get_cursor("shared_key")
-                _write_fake_result(self.args[3], self.args[1].uid, {
+                spec = self.args[0]
+                observed_cursor[0] = spec.task_ctx.get_cursor("shared_key")
+                _write_fake_result(spec.ipc_dir, spec.job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-                }, incarnation=getattr(ctx, "incarnation", None))
+                }, incarnation=spec.incarnation)
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive

@@ -210,14 +210,18 @@ def _decode_ipc_result(
     )
 
 
-def _mp_worker_wrapper(handler_func: Callable, job: Job, ctx: TaskContext, ipc_dir: str) -> None:
+def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
     """Wrapper for multiprocessing worker execution."""
+    handler_func = spec.handler
+    job = spec.job
+    ctx = spec.task_ctx
+    ipc_dir = spec.ipc_dir
     uid = job.uid
-    incarnation = getattr(ctx, "incarnation", None)
+    incarnation = spec.incarnation
     if not incarnation:
         raise RuntimeError(
             f"worker started without incarnation for {uid}: "
-            f"fencing requires ctx.incarnation set by submit"
+            f"fencing requires WorkerLaunchSpec.incarnation"
         )
     journal = ArtifactJournal(ipc_dir)
     transient_registry = getattr(ctx, "transient_registry", ()) or ()
@@ -348,6 +352,22 @@ ExecutionHandle = JobHandle
 
 
 @dataclass(frozen=True)
+class WorkerLaunchSpec:
+    """进程 seam 具名契约——spawn 下发子进程执行体的全部载荷。
+
+    incarnation（{run_id}.{dispatch_seq} 执行身份）归本 spec，
+    不借道 TaskContext 属性穿透进程边界。
+    """
+
+    handler: Callable[[Job, TaskContext], Any]
+    job: Job
+    task_ctx: TaskContext
+    incarnation: str
+    ipc_dir: str
+    timeout: float
+
+
+@dataclass(frozen=True)
 class AbortOutcome:
     """强制终止/异常停机时的收尾结果。"""
     completed: List[Tuple[JobHandle, ExecutionResult]]
@@ -414,48 +434,33 @@ class ExecutionChannel:
         except Exception:
             pass
 
-    def spawn(
-        self,
-        handler_func: Callable[[Job, TaskContext], Any],
-        job: Job,
-        ctx: TaskContext,
-        timeout: float,
-        acquired_resources: Optional[Any] = None,
-        ipc_dir: Optional[str] = None,
-        **kwargs: Any,
-    ) -> JobHandle:
+    def spawn(self, spec: WorkerLaunchSpec) -> JobHandle:
         """启动隔离子进程执行 handler，建立 incarnation fencing，立即返回句柄。"""
-        effective_ipc_dir = ipc_dir or self.ipc_dir or os.environ.get(_RESULT_DIR_ENV)
+        effective_ipc_dir = spec.ipc_dir or self.ipc_dir or os.environ.get(_RESULT_DIR_ENV)
         if not effective_ipc_dir:
             raise ValueError("ipc_dir is required for ExecutionChannel.spawn()")
         Path(effective_ipc_dir).mkdir(parents=True, exist_ok=True)
-        ctx.ipc_dir = effective_ipc_dir
-        incarnation = getattr(ctx, "incarnation", None)
+        spec.task_ctx.ipc_dir = effective_ipc_dir
         p = None
         try:
-            p = self._mp_ctx.Process(
-                target=_mp_worker_wrapper, args=(handler_func, job, ctx, effective_ipc_dir)
-            )
+            p = self._mp_ctx.Process(target=_mp_worker_wrapper, args=(spec,))
             p.start()
         except Exception:
             if p is not None:
                 self._finalize_process(p)
             raise
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + spec.timeout
         return JobHandle(
-            uid=job.uid,
+            uid=spec.job.uid,
             process=p,
             deadline=deadline,
-            timeout=timeout,
-            job=job,
+            timeout=spec.timeout,
+            job=spec.job,
             ipc_dir=effective_ipc_dir,
-            incarnation=incarnation,
+            incarnation=spec.incarnation,
         )
 
-    # 兼容别名
-    submit = spawn
-
-    def poll_completed(
+    def reap_completed(
         self, handles: Sequence[JobHandle]
     ) -> List[Tuple[JobHandle, ExecutionResult]]:
         """非阻塞扫描所有 in-flight handle，返回本次已完成的 (handle, result)。"""
@@ -493,9 +498,6 @@ class ExecutionChannel:
 
         return completed
 
-    # 兼容别名
-    reap_completed = poll_completed
-
     def _collect_outcome(
         self, handle: JobHandle, res: Optional[dict], *, is_timeout: bool = False
     ) -> ExecutionResult:
@@ -531,9 +533,6 @@ class ExecutionChannel:
         if res is None:
             return None
         return _decode_ipc_result(res, None, job, self.ipc_dir)
-
-    # 兼容别名
-    consume_stale_result = claim_stale_result
 
     @staticmethod
     def _build_terminal_failure(
@@ -646,8 +645,6 @@ class ExecutionChannel:
             except Exception as e:
                 logger.error(f"Error cleaning up in-flight job {handle.uid}: {e}")
 
-    # 兼容别名
-    cleanup = cleanup_in_flight
 
     def finalize_processes(self, handles: Sequence[JobHandle]) -> None:
         """只 kill + join 残留子进程，不删 IPC 文件。"""
@@ -678,6 +675,7 @@ __all__ = [
     "ExecutionHandle",
     "ExecutionResult",
     "JobHandle",
+    "WorkerLaunchSpec",
     "MultiprocessingExecutor",
     "_decode_ipc_result",
     "_decode_raw_result",

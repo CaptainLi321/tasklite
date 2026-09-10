@@ -25,7 +25,6 @@ class TaskContext:
         cursors: Dict[str, str],
         output_root: Optional[Path] = None,
         ipc_dir: Optional[str] = None,
-        incarnation: Optional[str] = None,
         transient_registry: Tuple = (),
         resource_names: Optional[Union[frozenset, set]] = None,
     ):
@@ -51,15 +50,22 @@ class TaskContext:
         # suspend 信号走落盘文件（{ipc_dir}/{uid}.signals.jsonl）——
         # 进程被 kill 后文件仍在，信号不丢。
         self.ipc_dir = ipc_dir
-        # fencing：当前执行代标识 {run_id}.{seq}，由 _dispatch_job
-        # 在 submit 前写入。worker 写结果文件时用它构造带 incarnation 的
-        # 文件名——崩溃后孤儿进程的旧 incarnation 文件不被新 run 看见。
-        self.incarnation = incarnation
+        # fencing 的执行代标识（{run_id}.{seq}）不经 TaskContext 携带——
+        # 归 WorkerLaunchSpec（进程 seam 具名契约），worker 据它构造带
+        # incarnation 的结果文件名，孤儿进程的旧 incarnation 文件不被
+        # 新 run 看见。
+        self._journal_instance: Optional[ArtifactJournal] = None
+        self._journal_instance_dir: Optional[str] = None
 
     @property
     def _journal(self) -> Optional[ArtifactJournal]:
-        """动态获取当前 ipc_dir 对应的产物清单深模块实例。"""
-        return ArtifactJournal(self.ipc_dir) if self.ipc_dir is not None else None
+        """当前 ipc_dir 对应的产物清单深模块实例（按目录缓存单例）。"""
+        if self.ipc_dir is None:
+            return None
+        if self._journal_instance is None or self._journal_instance_dir != self.ipc_dir:
+            self._journal_instance = ArtifactJournal(self.ipc_dir)
+            self._journal_instance_dir = self.ipc_dir
+        return self._journal_instance
 
     def spawn(self, job: Job) -> None:
         """Enqueue a child job.
