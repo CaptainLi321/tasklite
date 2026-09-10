@@ -11,12 +11,12 @@ from .backend.base import AbstractStateBackend, classify_error_type
 from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
 from .engine.channel import ExecutionChannel
+from .engine.config import RunConfig
 from .engine.governor import DeadlockGovernor
 from .engine.inflight import InFlightJob as _InFlightJob, InFlightTracker
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import (
     EngineRuntime,
-    RuntimeConfig,
     TaskStats,
 )
 from .engine.scheduler import JobScheduler
@@ -181,15 +181,17 @@ class TaskLite:
 
         self.strict_picklable = strict_picklable
 
-        # 构建 EngineRuntime 静态装配配置
-        self.runtime_config = RuntimeConfig(
+        # 构建 EngineRuntime 静态装配配置——Optional 一律透传，
+        # 默认值唯一解析点是 RunConfig.resolve（含 deadlock_gap 以 governor
+        # 常量为准，纠正早期门面字面量 3 与常量 5 的双默认值冲突）。
+        self.runtime_config = RunConfig.resolve(
             name=self.name,
             ipc_dir=self.ipc_dir,
             output_root=self.output_root,
             strict_picklable=strict_picklable,
-            dep_grace_seconds=dep_grace_seconds if dep_grace_seconds is not None else 60.0,
-            commit_failure_dlq_threshold=commit_failure_dlq_threshold if commit_failure_dlq_threshold is not None else 3,
-            deadlock_gap_max_rounds=deadlock_gap_max_rounds if deadlock_gap_max_rounds is not None else 3,
+            dep_grace_seconds=dep_grace_seconds,
+            commit_failure_dlq_threshold=commit_failure_dlq_threshold,
+            deadlock_gap_max_rounds=deadlock_gap_max_rounds,
             fatal_exceptions=self._fatal_exceptions,
             transient_exceptions=self._transient_exceptions,
             on_run_start=on_run_start,
@@ -303,6 +305,7 @@ class TaskLite:
         it is overwritten with a warning. Overriding ``__workers__`` changes the
         max concurrency of the pipeline.
         """
+        self._ensure_not_running("add_resource")
         if not isinstance(resource, Resource):
             raise TypeError(
                 f"add_resource expects a Resource instance, "
@@ -334,6 +337,7 @@ class TaskLite:
         payload_schema: Optional TypedDict class for runtime payload validation.
         Validated BEFORE forking the subprocess. Validation failures go directly to DLQ.
         """
+        self._ensure_not_running("register_handler")
         if not isinstance(task_type, str) or not task_type:
             raise TypeError(
                 f"task_type must be a non-empty str, got {type(task_type).__name__} ({task_type!r})"
@@ -373,6 +377,7 @@ class TaskLite:
         ``apply_discovery_rerun`` 注入该默认值，使固定 uid 的 discovery
         job 每会话重扫；显式值（含 "never"）一律尊重。
         """
+        self._ensure_not_running("set_discovery_rerun")
         if not isinstance(task_type, str) or not task_type:
             raise TypeError(
                 f"task_type must be a non-empty str, got {type(task_type).__name__} ({task_type!r})"
@@ -398,10 +403,12 @@ class TaskLite:
         可 pickle（入口 fail-loud 预检）；注册表快照随 ``TaskContext``
         显式下发子进程。
         """
+        self._ensure_not_running("register_transient_exception")
         self.taxonomy.register_transient(exception_cls)
 
     def register_transient_exceptions(self, classes: Sequence[type]) -> None:
         """批量注册瞬态异常类。"""
+        self._ensure_not_running("register_transient_exceptions")
         for cls in classes:
             self.register_transient_exception(cls)
 
