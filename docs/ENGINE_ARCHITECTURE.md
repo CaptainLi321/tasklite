@@ -199,6 +199,9 @@ HandlerEntry(NamedTuple)   # func / default_resources / payload_schema
 class RunConfig:
     name: str; ipc_dir: str
     backend: AbstractStateBackend
+    store: StateStore              # 构造期即建并随快照携带（enqueue/OpsConsole 在 run 前可用）
+    governor: DeadlockGovernor     # 构造期即建（StateStore 结算依赖 + 主循环仲裁共用）
+    policy: ExecutionPolicy        # 构造期即建（内部持有 discovery_rerun 共享引用）
     resources: ResourceManager
     handlers: Mapping[str, HandlerEntry]
     channel: ExecutionChannel
@@ -218,13 +221,16 @@ class RunConfig:
 **装配时序（三段式，frozen 的真实语义）**：
 
 1. **构造期**（`TaskLite.__init__`）：backend、ResourceManager、ErrorTaxonomy、
-   ExecutionChannel、StateStore（含 policy / governor）即行构造——`enqueue()` 与
-   OpsConsole 在 run() 之前可用；
-2. **装配期**（构造后 → run() 前）：装配 API 生效于共享注册表，全部带 run 期守卫；
-3. **run 期**：入口拍快照——`handlers` / `discovery_rerun` 浅拷贝隔离后续注册；
-   `resources` / `channel` / `taxonomy` / `backend` / `store` 传引用（resources 含
-   挂起时刻与 used 计数，不可深拷贝）。**frozen 仅保证字段引用不变，内容不变性由
-   「装配期结束 + run 期守卫」共同保证**；多次 run() 各拍各的快照。
+   ExecutionChannel、StateStore（含 governor / policy）即行构造——`enqueue()` 与
+   OpsConsole 在 run() 之前可用；随后经 `RunConfig.resolve()` 一次性装配并**持久
+   构造 EngineRuntime**；
+2. **装配期**（构造后 → 首次 run() 前，以及相邻 run() 之间）：装配 API 生效于共享
+   注册表（`handlers` / `discovery_rerun` 按引用共享，变更对机器可见），全部带
+   run 期守卫；
+3. **run 期**：**冻结的是引用而非拷贝**——`resources` 含挂起时刻与 used 计数，
+   本就不可深拷贝；内容不变性由「run 期守卫禁止装配 API」独立保证。每次 `run()`
+   （`execute()`）**新建 RunSession**（run_id / dispatch_seq / stats / stop_mode
+   归零），run 结束后装配期重新开放。
 
 #### 4.2.3 `engine/session.py` — `RunSession`（单次 run 生命周期状态 + 钩子单一出口）
 
@@ -410,7 +416,7 @@ class ExecutionChannel:
 | 模块 | 职能 | interface 要点 |
 |---|---|---|
 | `models/job.py` | Job 领域数据 + 边带运行态 | `Job`（uid / deps / resources / rerun 哨兵）、`JobRuntimeState`（退避 / strike 计数）；**`WORKER_RESOURCE` 唯一定义点** |
-| `models/context.py` | 子进程侧 handler API（纯） | `TaskContext.spawn / declare_output / declare_cache / declare_input(_uri) / is_completed / is_failed / get_cursor / set_cursor / suspend_resource`；`incarnation` 字段与 `attempted_uids()` 不存在（归 `WorkerLaunchSpec` 与 discovery adapter）；journal **构造时缓存一次**（现状为 property 每次新建，迁移收敛） |
+| `models/context.py` | 子进程侧 handler API（纯） | `TaskContext.spawn / declare_output / declare_cache / declare_input(_uri) / is_completed / is_failed / get_cursor / set_cursor / suspend_resource`；`incarnation` 字段不存在（归 `WorkerLaunchSpec`）；`attempted_uids()` **保留**为子进程侧只读 API——子进程内 TaskContext 是唯一状态视图，DiscoveryContext 协议（`wrappers/discovery.py`）消费 wall∪failed 快照；journal **构造时缓存一次**（现状为 property 每次新建，迁移收敛） |
 | `models/state.py` | StateStore 私有实现细节 | `PipelineState` 六集合容器 + 一致性断言 + 公共 discard / add（OpsConsole 前置）；外部只经 StateStore 受控方法访问 |
 
 ### 4.4 持久层、工具层与独立模块
@@ -472,9 +478,9 @@ class ExecutionChannel:
 | **S1** | `engine/types.py` 零导入死代码 vs `runtime.py:23-160` 重复定义；`WORKER_RESOURCE` 三处定义；死参数 `executor`（runtime.py:376）与死别名 `episode` | types.py 单一真相 + re-export 兼容；`HandlerEntry` 迁入；常量收敛 `models/job.py`；死参数/死别名清除 | 机械、零风险，先行 |
 | **S2** | 默认值三层解析，且 `deadlock_gap_max_rounds` 双默认值冲突（TaskLite 字面量 3 vs governor 常量 5，实际生效 3） | `RunConfig.resolve()` 唯一化，**以 governor 常量为准**；TaskLite 全部透传 Optional | 冲突收敛属行为变更，提交信息留痕 |
 | **S3** | 三机器以 ctx 整袋构造；`DispatchView`/`CommitView`/`RecoveryView`（有注解方 dispatch.py:155/203、scheduler.py:224 与兼容测试 test_state_store.py:212-252）；`ExecutionChannelProtocol`（单 implementor 零注解） | 机器改显式窄依赖（§4.2.6 签名与 §4.2.9 矩阵）；四个 Protocol 连同注解方与兼容测试**同一提交**删除；governor.arbitrate 的 `**kwargs`/getattr 回查一并清除 | 可按机器拆 3–4 个原子提交；测试改为直接装配 |
-| **S4** | `RunContext` 全局可变袋（26 公共字段 + 6 可写 setter 代理） | `RunSession` 抽取（含 `exit_reason(exc)` 新签名）+ `RunConfig` 装配时序落地，**单提交删除 RunContext** | 前置于本步的 S3 已完成；大提交本身是单一语义单元，不违 D5-1 |
+| **S4** | `RunContext` 全局可变袋（26 公共字段 + 6 可写 setter 代理） | `RunSession` 抽取（含 `exit_reason(exc)` 新签名）+ `RunConfig` 装配时序落地（store / governor / policy 构造期即建并随 RunConfig 携带），**单提交删除 RunContext** | 前置于本步的 S3 已完成；大提交本身是单一语义单元，不违 D5-1 |
 | **S5** | `exit_reason` 22 处推导点；`step()` 158 行含 6 分支等待 if-elif | `decide_wait` 纯函数 + LoopFacts 十字段；表驱动测试先行锁定（含「二次信号后 KeyboardInterrupt」「stop() 后正常排空」两 case 与 `worker_wait` min 聚合的行为变更） | pacing 作 S4 伴生收敛，非独立架构目标 |
-| **S6** | spawn 位置参数 `(handler, job, ctx, timeout, …, ipc_dir=…)`；incarnation 借道 TaskContext；channel 4 组方法别名；`TaskContext.attempted_uids` 单消费者 seam；journal property 每次新建 | `WorkerLaunchSpec`（含 timeout）落地 + 别名删除 + incarnation 归 spec + `attempted_uids` 迁 discovery adapter + journal 构造缓存；`tests/helpers.py`、`tests/hygiene/test_fake_infra_guard.py`（AST 布局守卫）、`tests/backend/test_pipeline_backend.py` 同提交改造 | 进程 seam 一步到位 |
+| **S6** | spawn 位置参数 `(handler, job, ctx, timeout, …, ipc_dir=…)`；incarnation 借道 TaskContext；channel 4 组方法别名；journal property 每次新建 | `WorkerLaunchSpec`（含 timeout）落地 + 别名删除 + incarnation 归 spec + journal 构造缓存（`attempted_uids` 经勘察裁定**保留**为 TaskContext 只读 API，见 §4.3）；`tests/helpers.py`、`tests/hygiene/test_fake_infra_guard.py`（AST 布局守卫）、`tests/backend/test_pipeline_backend.py` 同提交改造 | 进程 seam 一步到位 |
 | **S7** | StateStore 混运维 ~150 行（list_dlq 依赖 taxonomy；clear/seed 直触 `_failed_uids`/`_wall_uids`） | `OpsConsole(backend, store, taxonomy)` 拆出；`PipelineState` 补公共 discard/add；门面管理 API 改委托 | — |
 | **S8** | 门面外泄属性与钩子 setter；README/API_GUIDE 未同步新概念 | 按门面属性去留表执行 deprecation；`job_ref`/`progress_hook`/`slice_list` 迁出；README / API_GUIDE / CONTEXT.md（RunConfig/RunSession/WorkerLaunchSpec/OpsConsole/pacing 词条）同步 | 文档与兼容面收尾 |
 | **S9**（可选，基线外） | `wrappers/http.py` 1028 行五概念 | 物理拆包 | **须先有独立 ADR**（ADR-0001 未裁决拆包）+ pickle 兼容别名；触发条件：新增第六概念或子模块需独立演化；无触发则不做 |
