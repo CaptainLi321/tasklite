@@ -57,6 +57,24 @@ class TestEmptyQueue:
         pipeline.enqueue([])
         assert pipeline.backend.load_queue() == []
 
+    def test_register_and_enqueue_emit_no_deprecation_warning(self, tmp_path):
+        """标准六步调用序列（构造→注册→入队）在用户调用点不得收到
+        DeprecationWarning——内部路径不得触达过渡期门面属性。"""
+        import warnings as warnings_mod
+
+        with warnings_mod.catch_warnings(record=True) as caught:
+            warnings_mod.simplefilter("always")
+            pipeline = make_pipeline(tmp_path)
+            pipeline.register_handler("test", lambda j, c: (True, {}))
+            pipeline.enqueue([Job("test", "j1", payload={})])
+
+        deprecations = [w for w in caught
+                        if issubclass(w.category, DeprecationWarning)]
+        assert deprecations == [], (
+            "register_handler/enqueue 泄漏 DeprecationWarning 至用户调用点: "
+            f"{[str(w.message) for w in deprecations]}"
+        )
+
     def test_run_called_twice_idempotent(self, tmp_path, monkeypatch):
         """Calling run() twice on a finished pipeline is a no-op.
 

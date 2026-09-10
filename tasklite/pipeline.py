@@ -536,7 +536,7 @@ class TaskLite:
         if not jobs_list:
             return
 
-        inserted = self.store.enqueue_jobs(jobs_list, front=front)
+        inserted = self._runtime.store.enqueue_jobs(jobs_list, front=front)
         skipped = len(jobs_list) - len(inserted)
         if skipped:
             logger.info(f"Enqueued {len(inserted)} job(s), skipped {skipped} duplicate(s).")
