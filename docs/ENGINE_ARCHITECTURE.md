@@ -1,8 +1,8 @@
 # tasklite 引擎架构总览与设计手册
 
 > 模块路径：`tasklite.engine`
-> 本文为 **ADR-0002 固化的终态架构基线**（防漂移规范）；现状与终态的差异见
-> [第六章·现状偏差与迁移基线](#六现状偏差与迁移基线)。
+> 本文为 **ADR-0002 固化的终态架构基线**（防漂移规范，经独立评审修订，见 ADR 修订记录）；
+> 现状与终态的差异见 [第六章·现状偏差与迁移基线](#六现状偏差与迁移基线)。
 > 适用版本：v1.1.0+（迁移期）
 
 ---
@@ -27,9 +27,10 @@
   于 `RunSession` 一个模块。机器从显式窄依赖获取服务，不反向持有 `TaskLite`，也不
   经共享袋互见。
 - **单一出口原则**：Job 终结唯一经 `CompletionMachine.complete_job`；失败终态登记
-  唯一经 `StateStore.apply_failure` / `apply_failed`（wall / failed 互斥）；运行钩子
-  唯一经 `RunSession.fire_*`；`exit_reason` 推导唯一经 `RunSession.exit_reason()`；
-  等待决策唯一经 `pacing.decide_wait`。
+  唯一经 `StateStore.apply_failure` / `apply_failed`（wall / failed 互斥）；状态转移
+  唯一出口族为六个 `apply_*`（见 §4.2）；运行钩子唯一经 `RunSession.fire_*`；
+  `exit_reason` 推导唯一经 `RunSession.exit_reason()`；等待决策唯一经
+  `pacing.decide_wait`。
 - **fail-loud 纪律**：WAL 模式必须验证生效；Job 入参严格校验；单射转义拒绝静默碰撞；
   未知错误码与死锁即时归因。
 
@@ -44,6 +45,12 @@ pipeline.py ──► engine/* ──► models/* ──► (stdlib / 无)
 
 补充分层红线（继承自 `AGENTS.md`）：`models/` 严禁反向 import `engine/`；
 `utils/` 严禁反向 import `wrappers/`；核心层严禁依赖 `contrib/`。
+
+机器间依赖方向（唯一允许的形状，C3 裁决）：
+
+```
+Dispatch ──► Completion ◄── Recovery        （completion 不反向依赖任何机器）
+```
 
 ---
 
@@ -102,8 +109,11 @@ pipeline.py ──► engine/* ──► models/* ──► (stdlib / 无)
 - `ABORTING`：强制停机（二次信号或 `stop(force=True)`）——对 in-flight 分类消费：
   已写好结果者正常提交，未完成者终止进程、清理半成品并 requeue 磁盘队列。
 - 转移单调：`NONE → DRAINING → ABORTING`，不可逆。终局原因由
-  `RunSession.exit_reason()` 唯一推导（execute / step / 主循环三处共用同一实现，
-  禁止另写分支）。
+  `RunSession.exit_reason(exc)` 唯一推导，语义为**异常类型优先**：
+  `KeyboardInterrupt → INTERRUPTED`（即使信号 handler 已把 stop_mode 置为
+  DRAINING/ABORTING——现状 `execute` / `_run_loop` 即此语义）；其余非 None 异常 →
+  `ERROR`；无异常按 stop_mode 三态。execute / step / 主循环三处共用同一实现，
+  禁止另写分支。
 
 ### 2. 任务生命周期转移
 
@@ -128,6 +138,7 @@ pipeline.py ──► engine/* ──► models/* ──► (stdlib / 无)
 ## 四、目标模块职责与接口规范
 
 > 签名为**契约规范**（参数顺序与命名以此为准）；实现细节由各模块自行内聚。
+> 机器依赖以 §4.2.9 依赖矩阵为可验证依据，矩阵变更须修订 ADR-0002。
 
 ### 4.1 门面层
 
@@ -140,12 +151,12 @@ class TaskLite:
                  strict_picklable=False, fatal_exceptions=None, transient_exceptions=None,
                  dep_grace_seconds=None, commit_failure_dlq_threshold=None,
                  deadlock_gap_max_rounds=None)   # Optional 一律透传，不做默认值解析
-    def add_resource(self, resource: Resource) -> None
+    def add_resource(self, resource: Resource) -> None            # run 期守卫
     def register_handler(self, task_type, handler_func,
-                         default_resources=None, payload_schema=None) -> None
-    def set_discovery_rerun(self, task_type, rerun) -> None
-    def register_transient_exception(self, exception_cls: type) -> None
-    def enqueue(self, jobs, front=False) -> None
+                         default_resources=None, payload_schema=None) -> None  # run 期守卫
+    def set_discovery_rerun(self, task_type, rerun) -> None       # run 期守卫
+    def register_transient_exception(self, exception_cls: type) -> None        # run 期守卫
+    def enqueue(self, jobs, front=False) -> None                  # run 期守卫
     def run(self) -> None            # 入口拍 RunConfig.resolve(...) 快照 → EngineRuntime
     def stop(self, force=False) -> None
     def run_graceful(self) -> None
@@ -153,12 +164,22 @@ class TaskLite:
     def list_dlq / clear_dlq / clear_history / seed_wall / seed_cursor  # 委托 OpsConsole
 ```
 
-门面红线：不解析默认值、不持有运行态可写属性、`run()` 期间仅响应 `stop()`。
+门面红线：不解析默认值、不持有运行态可写属性、run() 期间仅响应 `stop()`。
 用户工具函数（`job_ref` / `progress_hook` / `slice_list`）不放在门面文件。
+
+**门面属性去留表**（现状外泄属性的处置与 deprecation 计划）：
+
+| 属性 | 处置 |
+|---|---|
+| `is_running` | 保留 |
+| `backend`（只读） | 保留；setter 删除 |
+| `stats`（只读） | 保留；setter 删除 |
+| `store` / `scheduler` / `governor` / `channel` / `state` / `in_flight` | 内部深模块不外泄：过渡期保留只读 + `DeprecationWarning`，次版本移除 |
+| 钩子三件套（`on_run_start` 等）setter | 删除（钩子仅构造期参数）；过渡期 setter 发 `DeprecationWarning` |
 
 ### 4.2 引擎层
 
-#### `engine/types.py` — 引擎公共值对象（零内部依赖叶子，单一真相源）
+#### 4.2.1 `engine/types.py` — 引擎公共值对象（零内部依赖叶子，单一真相源）
 
 ```python
 StopMode(Enum)             # NONE / DRAINING / ABORTING
@@ -171,7 +192,7 @@ RunSummary                 # frozen: 终局摘要
 HandlerEntry(NamedTuple)   # func / default_resources / payload_schema
 ```
 
-#### `engine/config.py` — `RunConfig`（静态装配快照 + 默认值唯一落点）
+#### 4.2.2 `engine/config.py` — `RunConfig`（静态装配快照 + 默认值唯一落点）
 
 ```python
 @dataclass(frozen=True)
@@ -194,7 +215,18 @@ class RunConfig:
     def resolve(cls, **raw) -> RunConfig   # 唯一规范化入口：None → 常量默认
 ```
 
-#### `engine/session.py` — `RunSession`（单次 run 生命周期状态 + 钩子单一出口）
+**装配时序（三段式，frozen 的真实语义）**：
+
+1. **构造期**（`TaskLite.__init__`）：backend、ResourceManager、ErrorTaxonomy、
+   ExecutionChannel、StateStore（含 policy / governor）即行构造——`enqueue()` 与
+   OpsConsole 在 run() 之前可用；
+2. **装配期**（构造后 → run() 前）：装配 API 生效于共享注册表，全部带 run 期守卫；
+3. **run 期**：入口拍快照——`handlers` / `discovery_rerun` 浅拷贝隔离后续注册；
+   `resources` / `channel` / `taxonomy` / `backend` / `store` 传引用（resources 含
+   挂起时刻与 used 计数，不可深拷贝）。**frozen 仅保证字段引用不变，内容不变性由
+   「装配期结束 + run 期守卫」共同保证**；多次 run() 各拍各的快照。
+
+#### 4.2.3 `engine/session.py` — `RunSession`（单次 run 生命周期状态 + 钩子单一出口）
 
 ```python
 class RunSession:
@@ -203,7 +235,9 @@ class RunSession:
     def begin(self, run_id: str) -> None       # 重置 stats / 宽限轮次 / run_end 标志
     def next_dispatch_seq(self) -> int         # fence 序号单调递增
     def request_stop(self, force: bool) -> StopMode   # 单调状态机唯一入口
-    def exit_reason(self, fallback: ExitReason) -> ExitReason  # 唯一推导实现
+    def exit_reason(self, exc: Optional[BaseException] = None) -> ExitReason
+        # 唯一推导实现：KeyboardInterrupt→INTERRUPTED；其余异常→ERROR；
+        # 无异常按 stop_mode 三态。覆盖现状全部 22 处推导点。
     def fire_run_start(self) -> None
     def fire_job_completed(self, uid, meta, success, going_to_retry) -> None
     def fire_run_end(self, reason: str) -> None         # 幂等，只发一次
@@ -212,16 +246,18 @@ class RunSession:
 禁止复活物：governor 代理属性、`episode` 双名、`stats` setter 双写、`in_flight`
 setter 测试后门、`state` / `backend` 可写属性（ADR-0002 D1）。
 
-#### `engine/pacing.py` — 等待决策纯函数
+#### 4.2.4 `engine/pacing.py` — 等待决策纯函数
 
 ```python
 @dataclass(frozen=True)
-class LoopFacts:        # 一拍事件泵的纯数据快照
+class LoopFacts:        # 一拍事件泵的纯数据快照（十字段）
     stop_mode: StopMode; has_in_flight: bool; store_empty: bool
-    dispatched: int; completed: int; has_runnable: bool
-    min_wait: float     # 调度器候选最早可运行时刻（inf = 无候选）
-    worker_wait: float  # 资源挂起最早恢复时刻
-    deadlock_wait: float  # governor 宽限/gap 裁决等待
+    dispatched: int; completed: int
+    has_runnable: bool         # 本拍是否存在调度候选；draining 无派发时为 False
+    min_wait: float            # 候选最早可运行时刻；inf = 无候选，或死锁成因被强制置 inf
+    worker_wait: float         # 资源挂起恢复时刻，按 min 聚合（见下）
+    deadlock_wait: float       # governor 宽限/gap 裁决等待
+    should_terminate: bool     # governor 仲裁的独立终止信号（区别于 is_idle）
 
 @dataclass(frozen=True)
 class WaitDecision:
@@ -230,13 +266,17 @@ class WaitDecision:
 def decide_wait(facts: LoopFacts) -> WaitDecision   # 纯函数，表驱动单测锁定
 ```
 
-#### `engine/runtime.py` — `EngineRuntime`（装配 + 薄事件泵）
+语义裁定：`worker_wait` 聚合采用 **min**（现状为 last-write-wins，属行为变更，迁移
+时提交信息须留痕）；`min_wait` 的 inf 为双语义（无候选 / 死锁强制），表驱动测试须
+覆盖两种。
+
+#### 4.2.5 `engine/runtime.py` — `EngineRuntime`（装配 + 薄事件泵）
 
 ```python
 class EngineRuntime:
     def __init__(self, config: RunConfig) -> None   # 内部装配机器群，不外泄 ctx
     def execute(self, options: Optional[ExecutionOptions] = None) -> RunSummary
-        # 锁 / 信号 / 钩子 / 异常承重网；exit_reason 一律委托 session
+        # 锁 / 信号 / 钩子 / 异常承重网；exit_reason 一律委托 session.exit_reason(exc)
     def step(self, max_dispatch: Optional[int] = None) -> StepOutcome  # 目标 <60 行
     def request_stop(self, force: bool = False) -> StopMode            # 委托 session
     @property is_running / stats / stop_mode / store
@@ -246,54 +286,61 @@ class EngineRuntime:
 `_terminal_outcome(reason)`）→ 填池派发 → 死锁仲裁（仅无 in-flight 时）→ 回收结算
 → `decide_wait` → `StepOutcome`。
 
-#### 三台机器 — 显式窄依赖构造（禁止 Context 整袋）
+#### 4.2.6 三台机器 — 显式窄依赖构造（禁止 Context 整袋）
 
 ```python
 class DispatchMachine:
-    def __init__(self, store, scheduler, policy, resources, channel,
-                 in_flight, session, completion) -> None
+    def __init__(self, *, store, scheduler, policy, resources, channel, in_flight,
+                 session, completion, handlers, taxonomy, output_root, ipc_dir,
+                 commit_failure_dlq_threshold) -> None
     def dispatch_next(self) -> DispatchOutcome        # 五关预检 + spawn
 
 class CompletionMachine:
-    def __init__(self, store, policy, channel, resources, in_flight,
-                 session) -> None
+    def __init__(self, *, store, policy, channel, resources, in_flight, session,
+                 backend) -> None
     def complete_job(self, entry: InFlightJob, result: ExecutionResult) -> None
         # Job 终结唯一出口
     def settle_reaped(self, completed) -> int
     def settle_aborted(self, handles) -> None
 
 class RecoveryMachine:
-    def __init__(self, store, backend, channel, resources, in_flight,
-                 session, completion) -> None
+    def __init__(self, *, store, backend, channel, resources, in_flight, policy,
+                 completion) -> None
     def repair_queue_on_load(...) / load_resource_suspends() / persist_resource_suspends()
     def save_queue_crash_safe() / apply_pending_signals() / abort_in_flight()
 ```
 
-#### `engine/store.py` — `StateStore`（入队规范化 + 转移事务 + 3-strike）
+**资源挂起持久化的归属（C2 裁决）**：收敛为 `resource.py` 模块级函数
+`persist_resource_suspensions(backend, resource_mgr)`，completion 与 recovery 共用，
+**不新增机器间耦合**（completion 的 backend 依赖仅为此用途与终局收尾）。
+
+#### 4.2.7 `engine/store.py` — `StateStore`（入队规范化 + 转移事务 + 3-strike）
 
 ```python
 class StateStore:
-    def __init__(self, backend, *, taxonomy, governor, policy, stats,
-                 on_job_completed) -> None      # 显式依赖，禁止 getattr 回查
-    def enqueue_jobs(self, jobs, *, front=False) -> List[Job]   # 规范化 + wall 去重
+    def __init__(self, backend, *, commit_failure_dlq_threshold, taxonomy, governor,
+                 policy, stats, on_job_completed) -> None   # 显式依赖，禁止 getattr 回查
+    def enqueue_jobs(self, jobs, *, front=False) -> List[str]   # 返回插入的 UID；规范化 + wall 去重
     @property state / is_empty
     wall_uids() / failed_uids() / queue_uids() / in_flight_uids() / cursors()
     pop_job(idx) / requeue_jobs(job_dicts, *, front)
     register_in_flight(uid) / unregister_in_flight(uid) / clear_in_flight()
-    # 结算：状态转移唯一出口（wall / failed 互斥在此保证）
+    # 结算：状态转移唯一出口族（六个；wall / failed 互斥在此保证）
     def apply_success(...) -> SuccessOutcome
     def apply_failure(...) -> FailureOutcome
+    def apply_failed(...) -> FailureOutcome        # 内部失败登记路径（红线 6 点名）
     def apply_retry(...) -> RetryOutcome
     def apply_skip(...) -> SkipOutcome
+    def apply_bulk_failure(...)                    # 死锁批量熔断（governor 调用）
     def cascade_fail(uid) -> List[str]
-    def commit_failed_crash(...)               # 3-strike 崩溃契约
+    def commit_failed_crash(...)                   # 3-strike 崩溃契约
 ```
 
-#### `engine/console.py` — `OpsConsole`（run() 外运维接缝）
+#### 4.2.8 `engine/console.py` — `OpsConsole`（run() 外运维接缝）
 
 ```python
 class OpsConsole:
-    def __init__(self, backend, store) -> None
+    def __init__(self, backend, store, taxonomy) -> None   # list_dlq 分类依赖 taxonomy
     def list_dlq(self) -> List[DLQEntry]
     def clear_dlq(self, task_types=None, *, keep_fatal=True) -> int
     def clear_history(self, targets, *, where=("wall", "failed")) -> int
@@ -301,14 +348,35 @@ class OpsConsole:
     def seed_cursor(self, key, value) -> None
 ```
 
-#### `engine/channel.py` — `ExecutionChannel` + `WorkerLaunchSpec`
+拆分前置：给 `PipelineState` 补公共 discard / add 方法，禁止把直触
+`_failed_uids` / `_wall_uids` 私有属性原样搬入。
+
+#### 4.2.9 机器 × 依赖矩阵（签名的可验证依据，变更须修订 ADR-0002）
+
+| 依赖 | Dispatch | Completion | Recovery |
+|---|:-:|:-:|:-:|
+| `store` | ✓ | ✓ | ✓ |
+| `backend` | | ✓ | ✓ |
+| `scheduler` | ✓ | | |
+| `policy` | ✓ | ✓ | ✓ |
+| `resources` | ✓ | ✓ | ✓ |
+| `channel` | ✓ | ✓ | ✓ |
+| `in_flight` | ✓ | ✓ | ✓ |
+| `session` | ✓ | ✓ | |
+| `completion`（机器） | ✓ | | ✓ |
+| `handlers` | ✓ | | |
+| `taxonomy` | ✓ | | |
+| `output_root` / `ipc_dir` | ✓ | | |
+| `commit_failure_dlq_threshold` | ✓ | | |
+
+#### 4.2.10 `engine/channel.py` — `ExecutionChannel` + `WorkerLaunchSpec`
 
 ```python
 @dataclass(frozen=True)
 class WorkerLaunchSpec:
-    """进程 seam 具名契约——取代位置参数元组。"""
+    """进程 seam 具名契约——取代位置参数元组（含 timeout，防其漏回位置约定）。"""
     handler: Callable; job: Job; task_ctx: TaskContext
-    incarnation: str; ipc_dir: str
+    incarnation: str; ipc_dir: str; timeout: Optional[float]
 
 class ExecutionChannel:
     def spawn(self, spec: WorkerLaunchSpec) -> JobHandle
@@ -317,39 +385,48 @@ class ExecutionChannel:
     def claim_stale_result(self, uid, job) -> Optional[ExecutionResult]
     def drain_active_signals(self, uids) -> List[Tuple[str, str, float]]
     def abort_in_flight(self, handles) -> AbortOutcome
+    def cleanup_in_flight(self, handles) -> None
     def cleanup_artifacts(self, uid, *, mode: ArtifactCleanupMode) -> None
     def read_declared_inputs(self, uid) -> List[dict]
 ```
 
-#### 已收敛深模块（interface 冻结，内部演进照常）
+方法主名单一定（ADR-0002 D2）：`spawn` / `reap_completed` / `claim_stale_result` /
+`cleanup_in_flight`——现存别名 `submit` / `poll_completed` / `consume_stale_result` /
+`cleanup` 在迁移中删除。子进程执行体从 `spec.incarnation` 取执行身份（现状经
+`getattr(ctx, "incarnation")`）。
+
+#### 4.2.11 已收敛深模块（interface 连签名形状一起冻结）
 
 | 模块 | 冻结的核心 interface |
 |---|---|
 | `scheduler.py` | `JobScheduler.pop_next_runnable` / `begin_round` / `cached_job`；`JobFacts` / `ScheduleResult` / `DeadlockAttribution` |
-| `governor.py` | `DeadlockGovernor.arbitrate` / `resolve_deadlock` / `reset`；`DeadlockDecision`；常量 `DEP_GRACE_SECONDS` / `DEADLOCK_GAP_MAX_ROUNDS` |
+| `governor.py` | `DeadlockGovernor.arbitrate` / `resolve_deadlock` / `reset`；`DeadlockDecision`；常量 `DEP_GRACE_SECONDS` / `DEADLOCK_GAP_MAX_ROUNDS`。**冻结含形状**：`arbitrate` 的 `**kwargs` 与 `getattr(store, ...)` 回查在机器窄依赖化时一并清除，防止再成「收窄接缝」提交的种子 |
 | `policy.py` | `ExecutionPolicy.admit` / `evaluate` / `plan_retry` / `compute_backoff_schedule`；`PreflightDecision` / `RetryPlan` / `BackoffSchedule` |
 | `inflight.py` | `InFlightTracker.track / register / dispatch / settle / unregister / active_handles`；`InFlightJob`（租约生命周期内聚） |
-| `resource.py` | `ResourceManager`（MutableMapping 语义 + 挂起收集）；`Resource` / `RateLimitResource` / `CapacityResource`；`ResourceLease` / `NullResourceLease`（两阶段租约） |
+| `resource.py` | `ResourceManager`（MutableMapping 语义 + 挂起收集 + `persist_resource_suspensions` 模块函数）；`Resource` / `RateLimitResource` / `CapacityResource`；`ResourceLease` / `NullResourceLease`（两阶段租约） |
 
 ### 4.3 模型层
 
 | 模块 | 职能 | interface 要点 |
 |---|---|---|
 | `models/job.py` | Job 领域数据 + 边带运行态 | `Job`（uid / deps / resources / rerun 哨兵）、`JobRuntimeState`（退避 / strike 计数）；**`WORKER_RESOURCE` 唯一定义点** |
-| `models/context.py` | 子进程侧 handler API（纯） | `TaskContext.spawn / declare_output / declare_cache / declare_input(_uri) / is_completed / is_failed / get_cursor / set_cursor / suspend_resource`；`incarnation` 字段与 `attempted_uids()` 不存在（归 `WorkerLaunchSpec` 与 discovery adapter）；journal 构造时缓存 |
-| `models/state.py` | StateStore 私有实现细节 | `PipelineState` 六集合容器 + 一致性断言；外部只经 StateStore 受控方法访问 |
+| `models/context.py` | 子进程侧 handler API（纯） | `TaskContext.spawn / declare_output / declare_cache / declare_input(_uri) / is_completed / is_failed / get_cursor / set_cursor / suspend_resource`；`incarnation` 字段与 `attempted_uids()` 不存在（归 `WorkerLaunchSpec` 与 discovery adapter）；journal **构造时缓存一次**（现状为 property 每次新建，迁移收敛） |
+| `models/state.py` | StateStore 私有实现细节 | `PipelineState` 六集合容器 + 一致性断言 + 公共 discard / add（OpsConsole 前置）；外部只经 StateStore 受控方法访问 |
 
-### 4.4 持久层与工具层
+### 4.4 持久层、工具层与独立模块
 
 | 模块 | 职能 |
 |---|---|
 | `backend/base.py` | `AbstractStateBackend`：delta commit 抽象（load_* / commit_* / enqueue_jobs / meta / seed_*）——**双 adapter 真 seam** |
 | `backend/sqlite_backend.py` | WAL + `BEGIN IMMEDIATE` ACID adapter |
 | `backend/memory.py` | 零 IO 快照隔离 adapter（测试专用） |
+| `tasklite/taxonomy.py` | `ErrorTaxonomy`：错误三分类 + 瞬态注册的**全引擎单一真相**；`validate_resource_amounts` 入口校验 |
+| `tasklite/exceptions.py` | 异常层次叶子：三分类异常 + 承重网信号（`_CommitCrashSignal` / `_JobTerminated`，继承 `BaseException` 的理由见 lockfile 级注释纪律） |
 | `utils/ipc.py` | `ArtifactJournal`：产物清单、两级降级落盘、残留认领、IPC 生命周期 |
 | `utils/injective.py` | `InjectiveEncoder`：可逆 `%XX` 单射转义与指纹 |
 | `utils/lockfile.py` | 跨平台文件锁（含单射转义关键点） |
-| `wrappers/http/` | 按概念拆包：`policy`（HttpPolicy）/ `guard`（http_guard）/ `cookies` / `snapshot`（SnapshotStore 族）/ `fetch`（HttpExecutor）；包导出面保持 `tasklite.wrappers.http` 不变（ADR-0001） |
+| `utils/jsonutil.py` | 序列化落盘格式（dumps / loads） |
+| `wrappers/http.py` | 组合式 HTTP 积木（HttpPolicy / http_guard / cookies / SnapshotStore 族 / fetch），概念正交性由 ADR-0001 裁决；**物理拆包为基线外可选项**，须自带 ADR 与 pickle 兼容别名（见 §6 S8） |
 | `wrappers/discovery.py` | Discovery 需求契约 + 宿主 adapter（消费 wall/failed 快照，不要求 TaskContext 定制方法） |
 
 ---
@@ -360,11 +437,11 @@ class ExecutionChannel:
 
 | seam | 契约 | adapter |
 |---|---|---|
-| 进程边界 | `WorkerLaunchSpec`（frozen 值对象） | 真 `Process` / 测试 FakeProcess |
+| 进程边界 | `WorkerLaunchSpec`（frozen 值对象，含 timeout） | 真 `Process` / 测试 FakeProcess（解 spec 字段，禁止位置反解） |
 | 持久化 | `AbstractStateBackend` | SQLite / InMemory |
 | 资源语义 | `Resource` 抽象 | `RateLimitResource` / `CapacityResource` |
 | HTTP 快照 | `SnapshotStore` 接口 | 目录版 / 单文件版等（见 ADR-0001） |
-| 状态转移 | `StateStore.apply_*`（唯一出口，非 Protocol） | 单实现，无假想 Protocol |
+| 状态转移 | `StateStore.apply_*` 六出口族（唯一，非 Protocol） | 单实现，无假想 Protocol |
 
 ### 不变式契约
 
@@ -387,16 +464,19 @@ class ExecutionChannel:
 
 > 本章是终态与当前工作树的**受控偏差登记表**；每完成一步即在表中勾销并原子提交。
 > 迁移纪律（一步到位 / 两份真相禁令 / 反转留痕）见 ADR-0002 D5。
+> 序列经独立评审重排：**机器窄依赖化（S3）必须先于 RunContext 删除（S4）**，
+> 否则三机器的 `self._ctx` 在 S4 处悬空。
 
-| # | 偏差 | 终态 | 迁移步骤（原子提交序列） |
+| 步骤 | 偏差（现状证据） | 终态动作 | 备注 |
 |---|---|---|---|
-| 1 | `engine/types.py` 零导入死代码，`runtime.py:23-160` 重复定义 | types.py 单一真相 | **S1** 完成 re-export 迁移 + `HandlerEntry` 迁入 + `WORKER_RESOURCE` 收敛 `models/job.py` |
-| 2 | `RunContext` 全局可变袋（20+ 字段、三机器整袋构造、StateStore `getattr` 回查） | `RunConfig` + `RunSession` | **S2** `RunConfig.resolve` 默认值唯一化；**S3** `RunSession` 抽取后删除 RunContext |
-| 3 | 机器以 ctx 构造，View Protocol 三件（单 implementor） | 显式窄依赖，删 Protocol | **S4** 机器构造签名改造 + 测试改直接装配 |
-| 4 | `exit_reason` 三处推导；`step()` 158 行含 6 分支等待 if-elif | `session.exit_reason()` + `decide_wait` | **S5** 表驱动单测先行锁定语义，再瘦编排 |
-| 5 | spawn 位置参数 `(handler, job, ctx, ipc_dir)`；incarnation 借道 TaskContext | `WorkerLaunchSpec` | **S6** channel + tests/helpers 同提交切换 |
-| 6 | StateStore 混运维管理（list_dlq 等 ~150 行） | `OpsConsole` 拆分 | **S7** 门面管理 API 改委托 |
-| 7 | `wrappers/http.py` 单文件 1028 行五概念 | `wrappers/http/` 按概念拆包 | **S8** 独立可做，导出面不变 |
-| 8 | 默认值三层解析；TaskLite 持运行态可写属性 | 门面只透传 Optional | S2 一并完成 |
+| **S1** | `engine/types.py` 零导入死代码 vs `runtime.py:23-160` 重复定义；`WORKER_RESOURCE` 三处定义；死参数 `executor`（runtime.py:376）与死别名 `episode` | types.py 单一真相 + re-export 兼容；`HandlerEntry` 迁入；常量收敛 `models/job.py`；死参数/死别名清除 | 机械、零风险，先行 |
+| **S2** | 默认值三层解析，且 `deadlock_gap_max_rounds` 双默认值冲突（TaskLite 字面量 3 vs governor 常量 5，实际生效 3） | `RunConfig.resolve()` 唯一化，**以 governor 常量为准**；TaskLite 全部透传 Optional | 冲突收敛属行为变更，提交信息留痕 |
+| **S3** | 三机器以 ctx 整袋构造；`DispatchView`/`CommitView`/`RecoveryView`（有注解方 dispatch.py:155/203、scheduler.py:224 与兼容测试 test_state_store.py:212-252）；`ExecutionChannelProtocol`（单 implementor 零注解） | 机器改显式窄依赖（§4.2.6 签名与 §4.2.9 矩阵）；四个 Protocol 连同注解方与兼容测试**同一提交**删除；governor.arbitrate 的 `**kwargs`/getattr 回查一并清除 | 可按机器拆 3–4 个原子提交；测试改为直接装配 |
+| **S4** | `RunContext` 全局可变袋（26 公共字段 + 6 可写 setter 代理） | `RunSession` 抽取（含 `exit_reason(exc)` 新签名）+ `RunConfig` 装配时序落地，**单提交删除 RunContext** | 前置于本步的 S3 已完成；大提交本身是单一语义单元，不违 D5-1 |
+| **S5** | `exit_reason` 22 处推导点；`step()` 158 行含 6 分支等待 if-elif | `decide_wait` 纯函数 + LoopFacts 十字段；表驱动测试先行锁定（含「二次信号后 KeyboardInterrupt」「stop() 后正常排空」两 case 与 `worker_wait` min 聚合的行为变更） | pacing 作 S4 伴生收敛，非独立架构目标 |
+| **S6** | spawn 位置参数 `(handler, job, ctx, timeout, …, ipc_dir=…)`；incarnation 借道 TaskContext；channel 4 组方法别名；`TaskContext.attempted_uids` 单消费者 seam；journal property 每次新建 | `WorkerLaunchSpec`（含 timeout）落地 + 别名删除 + incarnation 归 spec + `attempted_uids` 迁 discovery adapter + journal 构造缓存；`tests/helpers.py`、`tests/hygiene/test_fake_infra_guard.py`（AST 布局守卫）、`tests/backend/test_pipeline_backend.py` 同提交改造 | 进程 seam 一步到位 |
+| **S7** | StateStore 混运维 ~150 行（list_dlq 依赖 taxonomy；clear/seed 直触 `_failed_uids`/`_wall_uids`） | `OpsConsole(backend, store, taxonomy)` 拆出；`PipelineState` 补公共 discard/add；门面管理 API 改委托 | — |
+| **S8** | 门面外泄属性与钩子 setter；README/API_GUIDE 未同步新概念 | 按门面属性去留表执行 deprecation；`job_ref`/`progress_hook`/`slice_list` 迁出；README / API_GUIDE / CONTEXT.md（RunConfig/RunSession/WorkerLaunchSpec/OpsConsole/pacing 词条）同步 | 文档与兼容面收尾 |
+| **S9**（可选，基线外） | `wrappers/http.py` 1028 行五概念 | 物理拆包 | **须先有独立 ADR**（ADR-0001 未裁决拆包）+ pickle 兼容别名；触发条件：新增第六概念或子模块需独立演化；无触发则不做 |
 
 完成 S1–S8 后本章仅保留历史记录，终态即现状。
