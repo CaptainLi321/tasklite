@@ -1,19 +1,24 @@
 """CompletionMachine 完成与结算深模块单元测试套件。"""
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.channel import ArtifactCleanupMode, ExecutionChannel, ExecutionResult, JobHandle
 from tasklite.engine.completion import CompletionMachine
 from tasklite.engine.inflight import InFlightJob, InFlightTracker
+from tasklite.engine.policy import ExecutionPolicy
 from tasklite.engine.resource import CapacityResource, ResourceManager
-from tasklite.engine.runtime import RunContext
 from tasklite.engine.scheduler import JobScheduler
+from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
+from tasklite.engine.types import TaskStats
 from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
+from tasklite.taxonomy import ErrorTaxonomy
 
 
 class FakeProcess:
@@ -22,29 +27,34 @@ class FakeProcess:
 
 
 def _make_machine(tmp_path):
-    """显式装配 CompletionMachine 的窄依赖（RunContext 仅作 session/装配源）。"""
+    """显式装配 CompletionMachine 的窄依赖集合。"""
     backend = InMemoryStateBackend()
     gpu = CapacityResource("gpu", 10.0)
     rm = ResourceManager({"gpu": gpu})
-    handlers = {}
-    scheduler = JobScheduler(rm, handlers)
-    ctx = RunContext(
-        name="test_pipeline",
-        backend=backend,
-        scheduler=scheduler,
-        resources=rm,
-        handlers=handlers,
-        ipc_dir=str(tmp_path / "ipc"),
+    channel = ExecutionChannel(str(tmp_path / "ipc"))
+    stats = TaskStats()
+    policy = ExecutionPolicy()
+    store = StateStore(
+        backend,
+        state=PipelineState({}, {}, {}, []),
+        taxonomy=ErrorTaxonomy(),
+        stats=stats,
+        policy=policy,
     )
-    ctx.set_state(PipelineState({}, {}, {}, []))
+    session = RunSession()
+    session.run_id = "test_run"
+    in_flight = InFlightTracker()
     completion = CompletionMachine(
-        store=ctx.store,
-        policy=ctx.policy,
-        channel=ctx.channel,
-        resources=ctx.resource_mgr,
-        in_flight=ctx.in_flight,
-        session=ctx,
-        backend=backend,
+        store=store,
+        policy=policy,
+        channel=channel,
+        resources=rm,
+        in_flight=in_flight,
+        session=session,
+    )
+    ctx = types.SimpleNamespace(
+        store=store, stats=stats, resource_mgr=rm, in_flight=in_flight,
+        channel=channel, session=session, ipc_dir=str(tmp_path / "ipc"),
     )
     return ctx, completion
 
@@ -68,7 +78,7 @@ class TestCompletionMachineBasicSettlement:
         )
 
         completed_events = []
-        ctx.on_job_completed = lambda uid, meta, success, retry: completed_events.append(
+        ctx.session.on_job_completed = lambda uid, meta, success, retry: completed_events.append(
             (uid, meta, success, retry)
         )
 

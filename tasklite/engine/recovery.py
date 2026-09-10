@@ -14,7 +14,6 @@ import time
 from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..backend.base import AbstractStateBackend
     from .channel import ExecutionChannel
     from .completion import CompletionMachine
     from .inflight import InFlightTracker
@@ -47,7 +46,6 @@ class RecoveryOrchestrator:
         self,
         *,
         store: "StateStore",
-        backend: "AbstractStateBackend",
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
@@ -55,7 +53,6 @@ class RecoveryOrchestrator:
         completion: "CompletionMachine",
     ) -> None:
         self._store = store
-        self._backend = backend
         self._channel = channel
         self._resources = resources
         self._in_flight = in_flight
@@ -110,13 +107,13 @@ class RecoveryOrchestrator:
 
         # 4. 单次原子落盘
         if len(clean_q) < len(q_data):
-            self._backend.save_queue(clean_q)
+            self._store.backend.save_queue(clean_q)
         return clean_q
 
     def load_resource_suspends(self) -> None:
         """从 meta 表恢复资源 suspend 状态（换算回 monotonic 挂起时刻）。"""
         try:
-            raw = self._backend.get_meta(META_RESOURCE_SUSPENDS)
+            raw = self._store.backend.get_meta(META_RESOURCE_SUSPENDS)
         except Exception as e:
             logger.warning(f"Failed to load resource suspends from meta: {e}")
             return
@@ -138,7 +135,7 @@ class RecoveryOrchestrator:
         挂起的应用点即时持久化（消除 kill -9/OOM 时挂起丢失窗口）
         经 resource.persist_resource_suspensions 共享助手落盘。
         """
-        persist_resource_suspensions(self._backend, self._resources)
+        persist_resource_suspensions(self._store.backend, self._resources)
 
 
     def save_queue_crash_safe(self) -> None:
@@ -154,7 +151,7 @@ class RecoveryOrchestrator:
         再按 uid 去重保存（含内存自身的重复，来自异常路径的双 requeue）。
         """
         try:
-            disk_q = self._backend.load_queue()
+            disk_q = self._store.backend.load_queue()
         except Exception as e:
             # load 失败不得用空列表继续覆盖——磁盘上「已
             # commit 但内存未同步」的作业会在此次保存中被永久抹除（覆盖
@@ -183,7 +180,7 @@ class RecoveryOrchestrator:
                 continue
             seen.add(u)
             dedup_mem.append(jd)
-        self._backend.save_queue(extra + dedup_mem)
+        self._store.backend.save_queue(extra + dedup_mem)
 
 
     def apply_pending_signals(self) -> None:
@@ -210,7 +207,7 @@ class RecoveryOrchestrator:
                     f"{r_name!r} (from {uid})"
                 )
         if applied:
-            persist_resource_suspensions(self._backend, self._resources)
+            persist_resource_suspensions(self._store.backend, self._resources)
 
 
 

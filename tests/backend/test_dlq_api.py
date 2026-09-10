@@ -318,10 +318,10 @@ class TestBulkFailureThreeStrike:
     def _init_state(self, p):
         """初始化 _state（run() 内才做；单元测试直调 _commit_bulk_failed_crash 需要）。"""
         from tasklite.models.state import PipelineState
-        p._runtime.ctx.state = PipelineState(
+        p._runtime.store.set_state(PipelineState(
             p.backend.load_wall(), p.backend.load_failed(),
             p.backend.load_cursors(), p.backend.load_queue(),
-        )
+        ))
 
     def test_commit_bulk_failed_crash_counts_then_dlqs(self, tmp_path):
         """_commit_bulk_failed_crash：逐 job 计数，达阈值单条 DLQ 成功。"""

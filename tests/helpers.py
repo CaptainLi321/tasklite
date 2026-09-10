@@ -199,3 +199,44 @@ def patch_pipeline_manager(pipeline, monkeypatch):
 def make_pipeline(tmp_path, name="test_pipeline"):
     """Create a pipeline with sqlite backend and temp directory."""
     return TaskLite(name=name, state_dir=tmp_path / "state", backend="sqlite", output_root=tmp_path / "output")
+
+
+def make_runtime(tmp_path, name="test_runtime", capacity=2.0, handlers=None,
+                 on_run_start=None, on_run_end=None, strict_picklable=False):
+    """显式装配 EngineRuntime 的 RunConfig 快照（InMemory 后端零 IO）。"""
+    from pathlib import Path
+
+    from tasklite.backend.memory import InMemoryStateBackend
+    from tasklite.engine.channel import ExecutionChannel
+    from tasklite.engine.config import RunConfig
+    from tasklite.engine.governor import DeadlockGovernor
+    from tasklite.engine.policy import ExecutionPolicy
+    from tasklite.engine.resource import CapacityResource, ResourceManager
+    from tasklite.engine.runtime import EngineRuntime
+    from tasklite.models.job import WORKER_RESOURCE
+    from tasklite.taxonomy import ErrorTaxonomy
+
+    ipc_dir = str(tmp_path / "ipc")
+    Path(ipc_dir).mkdir(parents=True, exist_ok=True)
+    backend = InMemoryStateBackend()
+    resources = ResourceManager()
+    resources[WORKER_RESOURCE] = CapacityResource(WORKER_RESOURCE, capacity)
+    runtime = EngineRuntime(
+        config=RunConfig.resolve(
+            name=name,
+            ipc_dir=ipc_dir,
+            backend=backend,
+            resources=resources,
+            handlers=handlers or {},
+            channel=ExecutionChannel(ipc_dir),
+            taxonomy=ErrorTaxonomy(),
+            discovery_rerun={},
+            governor=DeadlockGovernor(),
+            policy=ExecutionPolicy(),
+            output_root=tmp_path,
+            strict_picklable=strict_picklable,
+            on_run_start=on_run_start,
+            on_run_end=on_run_end,
+        ),
+    )
+    return runtime

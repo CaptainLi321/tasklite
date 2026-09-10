@@ -855,8 +855,8 @@ class TestDispatchExceptionEntryRegistered:
         pipeline.run()
 
         # DLQ 分支必须从 in_flight 移除 entry（变异体删 pop 后残留）
-        assert "t::j1" not in pipeline._runtime.ctx.in_flight, \
-            f"DLQ 分支必须移除 in_flight entry: {list(pipeline._runtime.ctx.in_flight)}"
+        assert "t::j1" not in pipeline._runtime.in_flight, \
+            f"DLQ 分支必须移除 in_flight entry: {list(pipeline._runtime.in_flight)}"
         # job 进 DLQ（failed 集合 + 后端记录）
         failed = pipeline.backend.load_failed()
         assert "t::j1" in failed, f"3-strike 应 DLQ: {failed}"

@@ -1,15 +1,18 @@
+"""EngineRuntime：TaskLite 核心运行期深模块（装配 + 薄事件泵）。
+
+统一聚合主循环事件泵、五关预检派发、结果收敛事务、崩溃/停机恢复与在途追踪。
+装配快照见 RunConfig（engine/config.py）；一次 run 的生命周期状态与钩子
+单一出口见 RunSession（engine/session.py）。
+"""
 from __future__ import annotations
 
-import enum
 import logging
 import pickle
 import signal
 import time
 import traceback
 import uuid
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Optional
 
 logger = logging.getLogger("tasklite")
 
@@ -30,220 +33,35 @@ RT_BACKOFF_UNTIL = "_backoff_until"
 RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
 RT_COMMIT_FAILURES = "_commit_failures"
 
-
-from .config import RunConfig
-from .governor import (
+from .config import RunConfig  # noqa: E402
+from .governor import (  # noqa: E402
     DEADLOCK_GAP_MAX_ROUNDS,
     DEP_GRACE_SECONDS,
     DeadlockGovernor,
 )
-from .store import (
+from .store import (  # noqa: E402
     COMMIT_FAILURE_DLQ_THRESHOLD,
     StateStore,
 )
-from .channel import ArtifactCleanupMode, ExecutionChannel, ExecutionResult, JobHandle
-from .inflight import InFlightJob, InFlightTracker
-from .policy import ExecutionPolicy, PreflightPolicy
-from .resource import (
-    META_RESOURCE_SUSPENDS,
+from .channel import ExecutionChannel  # noqa: E402
+from .inflight import InFlightTracker  # noqa: E402
+from .policy import ExecutionPolicy  # noqa: E402
+from .resource import (  # noqa: E402
     CapacityResource,
     Resource,
     ResourceManager,
-    persist_resource_suspensions,
 )
-from .scheduler import DeadlockAttribution, JobScheduler, ScheduleResult
-from ..backend.base import AbstractStateBackend
-from ..exceptions import _CommitCrashSignal, _JobTerminated
-from ..models.context import TaskContext
-from ..models.job import Job, JobRuntimeState, WORKER_RESOURCE, inject_worker_resource
-from ..models.state import PipelineState, uid_from_job_dict
-from ..taxonomy import ErrorTaxonomy
-from ..utils.jsonutil import dumps, loads
-from ..utils.lockfile import release_lock, try_acquire_lock
+from .scheduler import JobScheduler  # noqa: E402
+from .session import RunSession  # noqa: E402
+from ..backend.base import AbstractStateBackend  # noqa: E402
+from ..exceptions import _CommitCrashSignal, _JobTerminated  # noqa: E402
+from ..models.job import Job, JobRuntimeState, WORKER_RESOURCE, inject_worker_resource  # noqa: E402,F401
+from ..models.state import PipelineState  # noqa: E402
+from ..taxonomy import ErrorTaxonomy  # noqa: E402
+from ..utils.lockfile import release_lock, try_acquire_lock  # noqa: E402
 
 # 兼容垫片：历史名称经 runtime 导入的调用方继续可用，随次版本移除。
 RuntimeConfig = RunConfig
-
-
-class RunContext:
-    """一次 run() 的运行上下文容器。"""
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        backend: AbstractStateBackend,
-        scheduler: JobScheduler,
-        resources: Union[ResourceManager, Dict[str, Resource]],
-        handlers: Dict[str, Any],
-        channel: Optional[ExecutionChannel] = None,
-        ipc_dir: str,
-        output_root: Optional[Union[str, Path, Sequence[Path]]] = None,
-        on_run_start: Optional[Callable[[], None]] = None,
-        on_job_completed: Optional[Callable[[str, dict, bool, bool], None]] = None,
-        on_run_end: Optional[Callable[[str], None]] = None,
-        transient_registry: Any = None,
-        discovery_rerun: Optional[Dict[str, str]] = None,
-        fatal_exceptions: Optional[Tuple[type, ...]] = None,
-        transient_exceptions: Optional[Tuple[type, ...]] = None,
-        dep_grace_seconds: float = DEP_GRACE_SECONDS,
-        commit_failure_dlq_threshold: int = COMMIT_FAILURE_DLQ_THRESHOLD,
-        deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS,
-    ) -> None:
-        self.name = name
-        self._backend = backend
-        self.scheduler = scheduler
-        self.handlers = handlers
-        if isinstance(resources, ResourceManager):
-            self.resource_mgr = resources
-            self.resources = resources
-        else:
-            self.resource_mgr = ResourceManager(resources, handlers=handlers)
-            self.resources = self.resource_mgr
-        self.ipc_dir = ipc_dir
-        self.channel = channel if channel is not None else ExecutionChannel(self.ipc_dir)
-        self.output_root = output_root
-        self.fatal_exceptions = tuple(fatal_exceptions) if fatal_exceptions is not None else None
-        self.transient_exceptions = tuple(transient_exceptions) if transient_exceptions is not None else None
-        if isinstance(transient_registry, ErrorTaxonomy):
-            self.taxonomy = transient_registry
-        else:
-            self.taxonomy = ErrorTaxonomy(
-                fatal_exceptions=self.fatal_exceptions,
-                transient_exceptions=self.transient_exceptions,
-                transient_registry=transient_registry.snapshot() if hasattr(transient_registry, "snapshot") else transient_registry,
-            )
-        self.transient_registry = self.taxonomy
-        self.discovery_rerun = discovery_rerun if discovery_rerun is not None else {}
-        self.policy: ExecutionPolicy = ExecutionPolicy(self.discovery_rerun)
-
-        self.dep_grace_seconds: float = dep_grace_seconds
-        self.commit_failure_dlq_threshold: int = commit_failure_dlq_threshold
-        self.deadlock_gap_max_rounds: int = deadlock_gap_max_rounds
-
-        self.governor: DeadlockGovernor = DeadlockGovernor(
-            dep_grace_seconds=self.dep_grace_seconds,
-            deadlock_gap_max_rounds=self.deadlock_gap_max_rounds,
-        )
-
-        self.on_run_start = on_run_start
-        self.on_job_completed = on_job_completed
-        self.on_run_end = on_run_end
-
-        self._stats: TaskStats = TaskStats()
-        self.store: StateStore = StateStore(
-            self._backend,
-            commit_failure_dlq_threshold=self.commit_failure_dlq_threshold,
-            taxonomy=self.taxonomy,
-            on_job_completed=lambda uid, meta, s, r: self.fire_job_completed(uid, meta, s, r),
-            governor=self.governor,
-            stats=self._stats,
-            policy=self.policy,
-        )
-
-        self._in_flight: InFlightTracker = InFlightTracker()
-        self.run_id: Optional[str] = None
-        self.dispatch_seq: int = 0
-        self.stop_mode: StopMode = StopMode.NONE
-        self._run_end_fired = False
-
-    @property
-    def stats(self) -> TaskStats:
-        return self._stats
-
-    @stats.setter
-    def stats(self, value: TaskStats) -> None:
-        self._stats = value
-        if hasattr(self, "store") and self.store is not None:
-            self.store.set_stats(value)
-
-    @property
-    def state(self) -> PipelineState:
-        return self.store.state
-
-    @state.setter
-    def state(self, value: Optional[PipelineState]) -> None:
-        self.store.set_state(value)
-
-    @property
-    def backend(self) -> AbstractStateBackend:
-        return self._backend
-
-    @backend.setter
-    def backend(self, value: AbstractStateBackend) -> None:
-        self._backend = value
-        self.store.set_backend(value)
-
-    @property
-    def in_flight(self) -> InFlightTracker:
-        return self._in_flight
-
-    @in_flight.setter
-    def in_flight(self, value: Any) -> None:
-        if isinstance(value, InFlightTracker):
-            self._in_flight = value
-        elif isinstance(value, Mapping):
-            self._in_flight.clear()
-            self._in_flight.update(value)
-        else:
-            self._in_flight.clear()
-
-    @property
-    def dep_grace_deadline(self) -> Optional[float]:
-        return self.governor.dep_grace_deadline
-
-    @dep_grace_deadline.setter
-    def dep_grace_deadline(self, value: Optional[float]) -> None:
-        self.governor.dep_grace_deadline = value
-
-    @property
-    def dep_grace_missing(self) -> Optional[FrozenSet[str]]:
-        return self.governor.dep_grace_missing
-
-    @dep_grace_missing.setter
-    def dep_grace_missing(self, value: Optional[FrozenSet[str]]) -> None:
-        self.governor.dep_grace_missing = value
-
-    @property
-    def deadlock_gap_rounds(self) -> int:
-        return self.governor.deadlock_gap_rounds
-
-    @deadlock_gap_rounds.setter
-    def deadlock_gap_rounds(self, value: int) -> None:
-        self.governor.deadlock_gap_rounds = value
-
-    def reset_episode(self) -> None:
-        self.governor.reset()
-
-    def set_state(self, state: PipelineState) -> None:
-        self.state = state
-        self.store.set_state(state)
-
-    def fire_job_completed(
-        self, uid: str, meta: Dict[str, Any], success: bool, going_to_retry: bool,
-    ) -> None:
-        if self.on_job_completed is None:
-            return
-        try:
-            self.on_job_completed(uid, meta, success, going_to_retry)
-        except Exception as e:
-            logger.warning(f"on_job_completed hook raised for {uid}: {e}")
-            self.stats["hook_errors"] += 1
-
-    def reset_run_end_fired(self) -> None:
-        self._run_end_fired = False
-
-    def fire_run_end(self, reason: str) -> None:
-        if self._run_end_fired:
-            return
-        self._run_end_fired = True
-        if self.on_run_end is None:
-            return
-        try:
-            self.on_run_end(reason)
-        except Exception as e:
-            logger.warning(f"on_run_end hook raised: {e}")
-            self.stats["hook_errors"] += 1
 
 
 class EngineRuntime:
@@ -252,83 +70,70 @@ class EngineRuntime:
     统一聚合主循环事件泵、五关预检派发、结果收敛事务、崩溃/停机恢复与在途追踪。
     """
 
-    def __init__(
-        self,
-        config: RunConfig,
-        backend: AbstractStateBackend,
-        resources: Union[ResourceManager, Dict[str, Resource]],
-        handlers: Dict[str, Any],
-        transient_registry: Any,
-        discovery_rerun: Dict[str, str],
-        channel: Optional[ExecutionChannel] = None,
-    ) -> None:
+    def __init__(self, config: RunConfig) -> None:
         from .completion import CompletionMachine
         from .dispatch import DispatchMachine
         from .recovery import RecoveryMachine
 
         self.config = config
-        self.backend = backend
-        self.handlers = handlers
-        self.discovery_rerun = discovery_rerun
-        self.transient_registry = transient_registry
+        self.backend = config.backend
+        self.handlers = config.handlers
+        self.scheduler = JobScheduler(resources=config.resources, handlers=config.handlers)
+        self.governor = config.governor
 
-        # 构建调度器
-        self.scheduler = JobScheduler(resources=resources, handlers=self.handlers)
-
-        # 构建运行上下文
-        self._ctx = RunContext(
-            name=config.name,
-            backend=self.backend,
-            scheduler=self.scheduler,
-            resources=resources,
-            handlers=self.handlers,
-            channel=channel,
-            ipc_dir=config.ipc_dir,
-            output_root=config.output_root,
+        # 持久会话：execute() 经 begin() 复位（语义等价于每次新建会话，
+        # 同时保证机器持有的 session 引用跨 run 稳定）。
+        self._session = RunSession(
             on_run_start=config.on_run_start,
             on_job_completed=config.on_job_completed,
             on_run_end=config.on_run_end,
-            transient_registry=transient_registry,
-            discovery_rerun=discovery_rerun,
-            fatal_exceptions=config.fatal_exceptions,
-            transient_exceptions=config.transient_exceptions,
-            dep_grace_seconds=config.dep_grace_seconds,
-            commit_failure_dlq_threshold=config.commit_failure_dlq_threshold,
-            deadlock_gap_max_rounds=config.deadlock_gap_max_rounds,
         )
+
+        # 构造期即建 StateStore（enqueue/OpsConsole 在 run 前可用）；
+        # on_job_completed 绑定会话方法——钩子后置变更即时生效。
+        self.store: StateStore = StateStore(
+            self.backend,
+            commit_failure_dlq_threshold=config.commit_failure_dlq_threshold,
+            taxonomy=config.taxonomy,
+            on_job_completed=self._session.fire_job_completed,
+            governor=config.governor,
+            stats=self._session.stats,
+            policy=config.policy,
+        )
+
+        self.channel: ExecutionChannel = config.channel
+        self._in_flight: InFlightTracker = InFlightTracker()
 
         # 构建机器依赖拓扑
         self._completion = CompletionMachine(
-            store=self._ctx.store,
-            policy=self._ctx.policy,
-            channel=self._ctx.channel,
-            resources=self._ctx.resource_mgr,
-            in_flight=self._ctx.in_flight,
-            session=self._ctx,
-            backend=self.backend,
+            store=self.store,
+            policy=config.policy,
+            channel=self.channel,
+            resources=config.resources,
+            in_flight=self._in_flight,
+            session=self._session,
         )
         self._dispatch = DispatchMachine(
-            store=self._ctx.store,
+            store=self.store,
             scheduler=self.scheduler,
-            policy=self._ctx.policy,
-            resources=self._ctx.resource_mgr,
-            channel=self._ctx.channel,
-            in_flight=self._ctx.in_flight,
-            session=self._ctx,
+            policy=config.policy,
+            resources=config.resources,
+            channel=self.channel,
+            in_flight=self._in_flight,
+            session=self._session,
             completion=self._completion,
-            handlers=self.handlers,
-            taxonomy=self._ctx.taxonomy,
-            output_root=self._ctx.output_root,
-            ipc_dir=self._ctx.ipc_dir,
-            commit_failure_dlq_threshold=self._ctx.commit_failure_dlq_threshold,
+            handlers=config.handlers,
+            taxonomy=config.taxonomy,
+            output_root=config.output_root,
+            ipc_dir=config.ipc_dir,
+            commit_failure_dlq_threshold=config.commit_failure_dlq_threshold,
         )
         self._recovery = RecoveryMachine(
-            store=self._ctx.store,
-            backend=self.backend,
-            channel=self._ctx.channel,
-            resources=self._ctx.resource_mgr,
-            in_flight=self._ctx.in_flight,
-            policy=self._ctx.policy,
+            store=self.store,
+            channel=self.channel,
+            resources=config.resources,
+            in_flight=self._in_flight,
+            policy=config.policy,
             completion=self._completion,
         )
 
@@ -336,20 +141,20 @@ class EngineRuntime:
         self._is_running: bool = False
 
     @property
-    def ctx(self) -> RunContext:
-        return self._ctx
+    def session(self) -> RunSession:
+        return self._session
 
     @property
-    def channel(self) -> ExecutionChannel:
-        return self._ctx.channel
+    def in_flight(self) -> InFlightTracker:
+        return self._in_flight
 
     @property
     def stats(self) -> TaskStats:
-        return self._ctx.stats
+        return self._session.stats
 
     @property
     def stop_mode(self) -> StopMode:
-        return self._ctx.stop_mode
+        return self._session.stop_mode
 
     @property
     def is_running(self) -> bool:
@@ -357,25 +162,15 @@ class EngineRuntime:
 
     @property
     def state(self) -> Optional[PipelineState]:
-        return self._ctx.state
-
-    @property
-    def store(self) -> StateStore:
-        return self._ctx.store
+        return self.store.state
 
     @property
     def taxonomy(self) -> ErrorTaxonomy:
-        return self._ctx.taxonomy
+        return self.config.taxonomy
 
     def request_stop(self, force: bool = False) -> StopMode:
-        """停机请求接口（单调状态转移）。"""
-        if force or self._ctx.stop_mode == StopMode.DRAINING:
-            self._ctx.stop_mode = StopMode.ABORTING
-            logger.info("停机状态升级为 ABORTING（强制终止在途任务）")
-        elif self._ctx.stop_mode == StopMode.NONE:
-            self._ctx.stop_mode = StopMode.DRAINING
-            logger.info("停机状态设置为 DRAINING（等待在途任务完成）")
-        return self._ctx.stop_mode
+        """停机请求接口（单调状态转移，委托 RunSession）。"""
+        return self._session.request_stop(force=force)
 
     def execute(self, options: Optional[ExecutionOptions] = None) -> RunSummary:
         """完整执行管线生命周期。"""
@@ -390,11 +185,11 @@ class EngineRuntime:
 
         # 1. 单运行排他文件锁
         if opts.acquire_run_lock:
-            lock_fd = try_acquire_lock(self._ctx.ipc_dir, "__pipeline_run__", timeout=0)
+            lock_fd = try_acquire_lock(self.config.ipc_dir, "__pipeline_run__", timeout=0)
             if lock_fd is None:
                 self._is_running = False
                 raise RuntimeError(
-                    f"Another run() is in progress for state_dir {self._ctx.ipc_dir}; "
+                    f"Another run() is in progress for state_dir {self.config.ipc_dir}; "
                     f"concurrent runs on the same state are forbidden."
                 )
             self._run_lock_fd = lock_fd
@@ -414,24 +209,19 @@ class EngineRuntime:
 
         try:
             self._preflight_picklable_callbacks()
-            self._ctx.stats = TaskStats()
-            self._ctx.reset_episode()
-            self._ctx.reset_run_end_fired()
-            self._ctx.stop_mode = StopMode.NONE
+            # 新 run 复位：统计/序号/停机态/幂等标志归零；store 记账换新 stats。
+            self._session.begin()
+            self.store.set_stats(self._session.stats)
+            self.governor.reset()
 
-            # on_run_start 钩子
-            if self.config.on_run_start is not None:
-                try:
-                    self.config.on_run_start()
-                except Exception as e:
-                    logger.warning(f"on_run_start hook raised: {e}")
-                    self._ctx.stats["hook_errors"] += 1
+            # on_run_start 钩子（单一出口在 RunSession）
+            self._session.fire_run_start()
 
             self._run_body()
 
-            if self._ctx.stop_mode == StopMode.ABORTING:
+            if self._session.stop_mode == StopMode.ABORTING:
                 exit_reason = ExitReason.STOPPED_ABORTING
-            elif self._ctx.stop_mode == StopMode.DRAINING:
+            elif self._session.stop_mode == StopMode.DRAINING:
                 exit_reason = ExitReason.STOPPED_DRAINING
             else:
                 exit_reason = ExitReason.COMPLETED
@@ -445,7 +235,7 @@ class EngineRuntime:
             unhandled_exc = e
             raise
         finally:
-            self._ctx.fire_run_end(exit_reason.value)
+            self._session.fire_run_end(exit_reason.value)
             if self._run_lock_fd is not None:
                 release_lock(self._run_lock_fd)
                 self._run_lock_fd = None
@@ -459,19 +249,19 @@ class EngineRuntime:
         duration = time.monotonic() - start_time
         return RunSummary(
             exit_reason=exit_reason,
-            stats=self._ctx.stats,
-            run_id=self._ctx.run_id or "",
+            stats=self._session.stats,
+            run_id=self._session.run_id or "",
             duration_seconds=duration,
             unhandled_exception=unhandled_exc,
         )
 
     def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
         """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。"""
-        if self._ctx.state is None:
-            self._ctx.run_id = self._ctx.run_id or uuid.uuid4().hex
-            self._ctx.set_state(PipelineState({}, {}, {}, []))
+        if self.store.state is None:
+            self._session.run_id = self._session.run_id or uuid.uuid4().hex
+            self.store.set_state(PipelineState({}, {}, {}, []))
 
-        store = self._ctx.store
+        store = self.store
         if store is None:
             return StepOutcome(
                 dispatched_count=0,
@@ -480,15 +270,15 @@ class EngineRuntime:
                 should_wait=False,
                 wait_time=0.0,
                 deadlock_detected=False,
-                stop_mode=self._ctx.stop_mode,
+                stop_mode=self._session.stop_mode,
                 should_terminate=True,
                 exit_reason="completed",
             )
 
         # 0. 停机模式检查
         draining = False
-        if self._ctx.stop_mode is not StopMode.NONE:
-            if self._ctx.stop_mode is StopMode.ABORTING:
+        if self._session.stop_mode is not StopMode.NONE:
+            if self._session.stop_mode is StopMode.ABORTING:
                 logger.warning("Force abort requested. Killing in-flight jobs.")
                 self._recovery.abort_in_flight()
                 self._recovery.save_queue_crash_safe()
@@ -499,11 +289,11 @@ class EngineRuntime:
                     should_wait=False,
                     wait_time=0.0,
                     deadlock_detected=False,
-                    stop_mode=self._ctx.stop_mode,
+                    stop_mode=self._session.stop_mode,
                     should_terminate=True,
                     exit_reason="stopped_aborting",
                 )
-            if self._ctx.in_flight:
+            if self._in_flight:
                 draining = True
             else:
                 logger.info("Pipeline drained. Saving queue and exiting.")
@@ -515,12 +305,12 @@ class EngineRuntime:
                     should_wait=False,
                     wait_time=0.0,
                     deadlock_detected=False,
-                    stop_mode=self._ctx.stop_mode,
+                    stop_mode=self._session.stop_mode,
                     should_terminate=True,
                     exit_reason="stopped_draining",
                 )
 
-        if store.is_empty and not self._ctx.in_flight:
+        if store.is_empty and not self._in_flight:
             return StepOutcome(
                 dispatched_count=0,
                 completed_count=0,
@@ -528,7 +318,7 @@ class EngineRuntime:
                 should_wait=False,
                 wait_time=0.0,
                 deadlock_detected=False,
-                stop_mode=self._ctx.stop_mode,
+                stop_mode=self._session.stop_mode,
                 should_terminate=True,
                 exit_reason="completed",
             )
@@ -555,13 +345,10 @@ class EngineRuntime:
         should_terminate = False
         deadlock_wait = 0.0
         if last_outcome is not None and not last_outcome.has_runnable:
-            if store.is_empty and not self._ctx.in_flight:
+            if store.is_empty and not self._in_flight:
                 should_terminate = True
-            elif not self._ctx.in_flight:
-                decision = self._ctx.governor.arbitrate(
-                    last_outcome,
-                    store=self._ctx.store,
-                )
+            elif not self._in_flight:
+                decision = self.governor.arbitrate(last_outcome, store=self.store)
                 if decision.action == "resolved":
                     deadlock_detected = True
                     if decision.should_terminate:
@@ -572,31 +359,31 @@ class EngineRuntime:
 
         # 3. Drain 回收在途结果并统一结算
         completed_count = 0
-        if self._ctx.in_flight:
+        if self._in_flight:
             self._recovery.apply_pending_signals()
-            handles = self._ctx.in_flight.active_handles()
-            completed = self._ctx.channel.reap_completed(handles)
+            handles = self._in_flight.active_handles()
+            completed = self.channel.reap_completed(handles)
             completed_count = self._completion.settle_reaped(completed)
 
         # 4. 计算等待时延与空闲状态
-        is_idle = store.is_empty and not self._ctx.in_flight
+        is_idle = store.is_empty and not self._in_flight
         if is_idle or should_terminate:
             wait_time = 0.0
             should_wait = False
-        elif self._ctx.in_flight:
+        elif self._in_flight:
             if completed_count == 0:
                 wait_time = 0.05
                 should_wait = True
             else:
                 wait_time = 0.0
                 should_wait = False
-        elif deadlock_wait > 0 and not self._ctx.in_flight:
+        elif deadlock_wait > 0 and not self._in_flight:
             wait_time = min(deadlock_wait, 1.0)
             should_wait = True
         elif last_outcome is not None and not last_outcome.has_runnable and last_outcome.min_wait != float("inf"):
             wait_time = min(last_outcome.min_wait, 1.0)
             should_wait = True
-        elif worker_wait > 0 and not self._ctx.in_flight:
+        elif worker_wait > 0 and not self._in_flight:
             wait_time = min(worker_wait, 1.0)
             should_wait = True
         else:
@@ -605,9 +392,9 @@ class EngineRuntime:
 
         exit_reason = None
         if is_idle or should_terminate:
-            if self._ctx.stop_mode is StopMode.ABORTING:
+            if self._session.stop_mode is StopMode.ABORTING:
                 exit_reason = "stopped_aborting"
-            elif self._ctx.stop_mode is StopMode.DRAINING:
+            elif self._session.stop_mode is StopMode.DRAINING:
                 exit_reason = "stopped_draining"
             else:
                 exit_reason = "completed"
@@ -619,24 +406,24 @@ class EngineRuntime:
             should_wait=should_wait,
             wait_time=wait_time,
             deadlock_detected=deadlock_detected,
-            stop_mode=self._ctx.stop_mode,
+            stop_mode=self._session.stop_mode,
             should_terminate=should_terminate or is_idle,
             exit_reason=exit_reason,
         )
 
     def run_loop_impl(self) -> None:
         """事件驱动主循环：以 step() 统一驱动填池、回收与等待。"""
-        store = self._ctx.store
-        self._ctx.in_flight.clear()
-        while not store.is_empty or self._ctx.in_flight:
+        store = self.store
+        self._in_flight.clear()
+        while not store.is_empty or self._in_flight:
             outcome = self.step()
             if outcome.should_terminate:
                 break
             if outcome.should_wait and outcome.wait_time > 0:
                 time.sleep(outcome.wait_time)
 
-        logger.info(f"Pipeline {self._ctx.name} finished.")
-        self._ctx.in_flight.clear()
+        logger.info(f"Pipeline {self.config.name} finished.")
+        self._in_flight.clear()
 
     def prepare_run_state(self) -> PipelineState:
         """加载持久化状态、初始化 run_id 屏障、执行恢复修复并构建内存 PipelineState。"""
@@ -647,10 +434,10 @@ class EngineRuntime:
         q_data = self.backend.load_queue()
 
         # Fencing 屏障
-        self._ctx.run_id = uuid.uuid4().hex
-        self._ctx.dispatch_seq = 0
+        self._session.run_id = uuid.uuid4().hex
+        self._session.dispatch_seq = 0
         try:
-            self.backend.set_meta("last_run_id", self._ctx.run_id)
+            self.backend.set_meta("last_run_id", self._session.run_id)
         except Exception as e:
             logger.critical(f"Failed to persist run_id to meta table: {e}")
             raise
@@ -660,7 +447,7 @@ class EngineRuntime:
         self._recovery.load_resource_suspends()
 
         state = PipelineState(wall, failed, cursors, q_data)
-        self._ctx.set_state(state)
+        self.store.set_state(state)
         return state
 
     def _run_loop(self) -> None:
@@ -668,9 +455,9 @@ class EngineRuntime:
         exit_reason = "completed"
         try:
             self.run_loop_impl()
-            if self._ctx.stop_mode is StopMode.ABORTING:
+            if self._session.stop_mode is StopMode.ABORTING:
                 exit_reason = "stopped_aborting"
-            elif self._ctx.stop_mode is StopMode.DRAINING:
+            elif self._session.stop_mode is StopMode.DRAINING:
                 exit_reason = "stopped_draining"
         except _JobTerminated as e:
             logger.critical(f"Job terminated outside expected handlers: {e}")
@@ -707,7 +494,7 @@ class EngineRuntime:
                 self._recovery.persist_resource_suspends()
             except Exception as e:
                 logger.warning(f"Failed to persist resource suspends: {e}")
-            self._ctx.fire_run_end(exit_reason)
+            self._session.fire_run_end(exit_reason)
 
     def _run_body(self) -> None:
         """主执行体。"""

@@ -39,7 +39,7 @@ def test_crash_safe_save_recovers_popped_job(request, fixture_name):
         p.backend.load_wall(), p.backend.load_failed(),
         p.backend.load_cursors(), p.backend.load_queue(),
     )
-    p._runtime.ctx.set_state(state)
+    p._runtime.store.set_state(state)
     state.pop_job(0)
     assert state.queue == []  # 内存已丢
 
@@ -61,7 +61,7 @@ def test_crash_safe_save_dedups_double_requeue(pipeline_sqlite):
         p.backend.load_wall(), p.backend.load_failed(),
         p.backend.load_cursors(), p.backend.load_queue(),
     )
-    p._runtime.ctx.set_state(state)
+    p._runtime.store.set_state(state)
     # 模拟窗口：同一 job 被 requeue 两次
     state.requeue_jobs([job.to_dict()], front=True)
     state.requeue_jobs([job.to_dict()], front=True)

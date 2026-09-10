@@ -144,7 +144,7 @@ class TestMalformedNotMaskedByBackoff:
 
         # 直接构造 state + 主循环（绕过 enqueue 便于注入退避字段与畸形条目）
         state = PipelineState({}, {}, {}, [malformed, backing_off])
-        pipeline._runtime.ctx.set_state(state)
+        pipeline._runtime.store.set_state(state)
         pipeline._runtime._run_loop()
 
         malformed_uid = uid_from_job_dict(malformed)

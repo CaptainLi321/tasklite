@@ -148,7 +148,7 @@ class TestOrphanLockDetection:
         from tasklite.engine.scheduler import JobScheduler
         state = PipelineState(p.backend.load_wall(), p.backend.load_failed(),
                               p.backend.load_cursors(), p.backend.load_queue())
-        p._runtime.ctx.set_state(state)
+        p._runtime.store.set_state(state)
         sched = JobScheduler(p.resources, p.handlers).pop_next_runnable(state, frozenset())
         assert sched.runnable_idx is not None, "job should be runnable (probe is the gate)"
         entry = p._runtime._dispatch.dispatch_job(sched)

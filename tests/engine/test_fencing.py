@@ -454,8 +454,8 @@ class TestDispatchOrderFencing:
         p.enqueue([Job("h", "a")])
         # 直接驱动派发需要内存状态（enqueue 只写磁盘）——从后端装载
         state = PipelineState({}, {}, {}, p.backend.load_queue())
-        p._runtime.ctx.set_state(state)
-        p._runtime.ctx.dispatch_seq = 0
+        p._runtime.store.set_state(state)
+        p._runtime.session.dispatch_seq = 0
 
         # 模拟孤儿已死（无锁）：其成功结果文件 + 声明 + 物理输出均已落盘
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
@@ -474,7 +474,7 @@ class TestDispatchOrderFencing:
         entry = p._runtime._dispatch.dispatch_job(sched)
 
         assert entry is None, "restore 消费残留结果后不得派发新 worker（无双跑）"
-        assert p._runtime.ctx.dispatch_seq == 0, "不得 submit（无新 incarnation 分配）"
+        assert p._runtime.session.dispatch_seq == 0, "不得 submit（无新 incarnation 分配）"
         assert "h::a" in p.backend.load_wall(), "残留结果应被消费提交到 wall"
         assert out_file.exists(), \
             "成功产出的物理输出必须保留（restore 消费非失败清理）"
