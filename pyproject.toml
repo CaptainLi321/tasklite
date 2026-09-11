@@ -11,6 +11,25 @@ requires-python = ">=3.9"
 license = "MIT"
 readme = "README.md"
 
+# PEP 639：license 以 SPDX 表达式声明，与 License 分类器互斥，不得再列 MIT classifier
+keywords = ["task-queue", "task-orchestration", "background-jobs", "subprocess", "process-isolation", "acid", "workflow"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/CaptainLi321/tasklite"
+Repository = "https://github.com/CaptainLi321/tasklite"
+
 [project.optional-dependencies]
 dev = ["pytest", "hypothesis>=6.0", "mutmut>=3.0", "pytest-timeout>=2.0", "pytest-cov>=4.0"]
 
