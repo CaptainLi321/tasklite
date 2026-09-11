@@ -2,9 +2,10 @@
 
 被测契约范围（严格按各函数 docstring 声称）：
 - ``escape_injective`` / ``safe_uid_filename``：全域单射（任意 x != y ⟹ f(x) != f(y)）；
-- ``sanitize_identifier`` / ``sanitize_content_id``：仅对「转义后不超 max_len 的非空输入」
-  声称单射；超长截断路径声称「同前缀不同尾部长串不碰撞」与「输出 ≤ max_len（max_len ≥ 9）」。
-  超长截断路径的全域单射不在声称范围内，不做全域断言。
+- ``sanitize_identifier`` / ``sanitize_content_id``：转义后 ≤ max_len 的非空输入全域
+  单射；空值哨兵处于像集外（零碰撞）；超长截断输出带像集外标记 "%_" + 16 位 hex
+  全文指纹，与直通域结构性不相交，同前缀长输入之间为概率防撞；需截断而
+  max_len < 18 时抛 ValueError。
 """
 
 from __future__ import annotations
@@ -145,21 +146,24 @@ def test_sanitize_short_inputs_injective_within_claimed_scope(pair, max_len):
 @pytest.mark.hypothesis
 @settings(max_examples=50, deadline=None)
 @example(text="x" * 500, max_len=120)
-@example(text="aaaa////", max_len=20)
-@given(text=any_text, max_len=st.integers(min_value=9, max_value=200))
+@example(text="aaaaaaaa/////", max_len=20)
+@example(text="y", max_len=18)
+@given(text=any_text, max_len=st.integers(min_value=18, max_value=200))
 def test_sanitize_output_respects_length_cap_and_aligned_prefix(text, max_len):
-    """max_len ≥ 9 时输出恒 ≤ max_len；截断路径带 8 位指纹后缀且无悬挂 % 碎片。"""
+    """max_len ≥ 18 时输出恒 ≤ max_len；截断路径带 "%_" 标记 + 16 位指纹且前缀无悬挂 % 碎片。"""
     out = sanitize_identifier(text, max_len=max_len)
     assert len(out) <= max_len
     escaped = escape_injective(text)
     if text and len(escaped) > max_len:
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
-        assert out.endswith("_" + digest)
-        prefix = out[: -(len(digest) + 1)]
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        assert out.endswith("%_" + digest)
+        assert not _percent_only_as_escapes(out)
+        prefix = out[: -(len(digest) + 2)]
         assert not prefix.endswith("%")
         assert not (len(prefix) >= 2 and prefix[-2] == "%")
     elif text:
         assert out == escaped
+        assert _percent_only_as_escapes(out)
 
 
 @pytest.mark.hypothesis
@@ -184,6 +188,69 @@ def test_truncated_same_prefix_different_tail_never_collides(prefix, tail_a, tai
     assert out_a != out_b
 
 
+@pytest.mark.hypothesis
+@settings(max_examples=50, deadline=None)
+@example(text="y" * 500, max_len=120)
+@given(text=any_text, max_len=st.integers(min_value=18, max_value=200))
+def test_truncation_output_never_self_collides_via_passthrough(text, max_len):
+    """原反例形态：f(f(y)) != f(y)——截断输出不得落入直通域成为定点。"""
+    escaped = escape_injective(text)
+    if len(escaped) <= max_len:
+        return
+    out = sanitize_identifier(text, max_len=max_len)
+    # f(out) 只可能走两条路：out 中标记的孤立 % 被再转义为 %25（恒等直通被排除）；
+    # 或再次截断，指纹取自全文 out。两者均不与 f(y)=out 相等——除非 out 与 y 全文
+    # 相等，而那要求构造出 SHA-256 前像固定点（密码学上不可行）。
+    assert sanitize_identifier(out, max_len=max_len) != out
+
+
+@pytest.mark.hypothesis
+@settings(max_examples=50, deadline=None)
+@example(pair=("u", "y" * 500), max_len=120)
+@given(pair=distinct_pair, max_len=st.integers(min_value=18, max_value=200))
+def test_truncation_domain_disjoint_from_passthrough_domain(pair, max_len):
+    """短输入（直通域）与超长输入（截断域）的输出结构性不相交：f(x) != f(y)。"""
+    x, y = pair
+    if not x or not y or x == y:
+        return
+    ex = escape_injective(x)
+    ey = escape_injective(y)
+    if len(ex) > max_len or len(ey) <= max_len:
+        return
+    out_x = sanitize_identifier(x, max_len=max_len)
+    out_y = sanitize_identifier(y, max_len=max_len)
+    # 直通输出无孤立 %；截断输出必带 "%_" 标记（孤立 %），两域不相交
+    assert _percent_only_as_escapes(out_x)
+    assert not _percent_only_as_escapes(out_y)
+    assert out_x != out_y
+
+
+@pytest.mark.hypothesis
+@settings(max_examples=30, deadline=None)
+@example(text="x" * 100, max_len=5)
+@example(text="y", max_len=17)
+@given(text=any_text, max_len=st.integers(min_value=1, max_value=17))
+def test_small_max_len_passthrough_only_or_fails_loud(text, max_len):
+    """max_len < 18：直通输入恒等且守上限；需截断时 fail-loud 拒绝，绝不静默破上限。"""
+    if not text:
+        # 空值哨兵为固定形态，不受 max_len 收缩（docstring 明示）
+        assert sanitize_identifier(text, max_len=max_len) == EMPTY_SENTINEL
+        assert sanitize_content_id(text, max_len=max_len) == EMPTY_SENTINEL
+        return
+    escaped = escape_injective(text)
+    escaped_cid = escape_injective(text, allowed=CONTENT_ID_ALLOWED)
+    if len(escaped) <= max_len:
+        assert sanitize_identifier(text, max_len=max_len) == escaped
+    else:
+        with pytest.raises(ValueError):
+            sanitize_identifier(text, max_len=max_len)
+    if len(escaped_cid) <= max_len:
+        assert sanitize_content_id(text, max_len=max_len) == escaped_cid
+    else:
+        with pytest.raises(ValueError):
+            sanitize_content_id(text, max_len=max_len)
+
+
 # ── sanitize_content_id：allowlist 直通与输出字符域 ────────────────────
 
 
@@ -192,7 +259,7 @@ def test_truncated_same_prefix_different_tail_never_collides(prefix, tail_a, tai
 @example(text="normal-1.2_abc", max_len=120)
 @example(text="a::b", max_len=120)
 @example(text="中", max_len=120)
-@given(text=any_text, max_len=st.integers(min_value=9, max_value=200))
+@given(text=any_text, max_len=st.integers(min_value=18, max_value=200))
 def test_content_id_output_charset_is_allowlist_or_escapes(text, max_len):
     """干净输入恒等直通；其余输出字符全部落在 allowlist ∪ {%}，且 % 后跟两位大写 hex。"""
     out = sanitize_content_id(text, max_len=max_len)
@@ -204,7 +271,11 @@ def test_content_id_output_charset_is_allowlist_or_escapes(text, max_len):
     else:
         assert out
         assert all(c in CONTENT_ID_ALLOWED or c == "%" for c in out)
-        assert _percent_only_as_escapes(out)
+        if len(escape_injective(text, allowed=CONTENT_ID_ALLOWED)) > max_len:
+            # 截断输出带像集外标记（孤立 %），豁免「% 只以 %XX 出现」约束
+            assert not _percent_only_as_escapes(out)
+        else:
+            assert _percent_only_as_escapes(out)
 
 
 @pytest.mark.hypothesis
