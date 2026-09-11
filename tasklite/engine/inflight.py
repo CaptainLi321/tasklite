@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from typing import (
-    Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union, TYPE_CHECKING
+    Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Tuple, Union, TYPE_CHECKING
 )
 
 if TYPE_CHECKING:
