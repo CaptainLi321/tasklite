@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tasklite-engine"
-version = "1.2.0"
+dynamic = ["version"]
 
 description = "A lightweight task orchestration engine with zero external dependencies, process isolation, and ACID persistence"
 requires-python = ">=3.9"
@@ -17,6 +17,10 @@ dev = ["pytest", "hypothesis>=6.0", "mutmut>=3.0", "pytest-timeout>=2.0", "pytes
 [tool.setuptools.packages.find]
 include = ["tasklite", "tasklite.*"]
 exclude = ["tests"]
+
+# 版本单一事实源：tasklite/__init__.py 的 __version__，构建时动态读取
+[tool.setuptools.dynamic]
+version = { attr = "tasklite.__version__" }
 
 # PEP 561：py.typed 标记随包分发，下游 mypy/pyright 可消费内联类型注解
 [tool.setuptools.package-data]
