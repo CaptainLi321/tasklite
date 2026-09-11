@@ -139,10 +139,6 @@ class StateStore:
     def stats(self) -> Any:
         return self._stats
 
-    @property
-    def backend(self) -> AbstractStateBackend:
-        return self._backend
-
     def set_stats(self, stats: Any) -> None:
         self._stats = stats
 
