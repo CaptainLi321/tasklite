@@ -1,0 +1,49 @@
+# 发版流水线：推送 v* 标签自动执行 构建 → twine check → PyPI 受信发布 → GitHub Release
+#
+# 首次启用前置条件（一次性，手工完成）：
+#   PyPI → 项目 Settings → Publishing → 添加 GitHub Trusted Publisher：
+#     owner=CaptainLi321  repository=tasklite  workflow=release.yml  environment 留空
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # PyPI 受信发布的 OIDC 凭证，替代 API token
+      contents: write # 创建 GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 构建 sdist 与 wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      - name: 发布前校验
+        run: python -m twine check dist/*
+
+      - name: 从 CHANGELOG 提取当前版本的发布说明
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -n "/^## \\[${VERSION}\\]/,/^## \\[/p" CHANGELOG.md | sed '$d' > release_notes.md
+          [ -s release_notes.md ] || {
+            echo "CHANGELOG.md 中缺少 [${VERSION}] 段落，请先补充再打标签"
+            exit 1
+          }
+
+      - name: 发布到 PyPI（受信发布，免 token）
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: 创建 GitHub Release 并附构建产物
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md
+          files: dist/*
