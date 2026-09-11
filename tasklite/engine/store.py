@@ -251,18 +251,22 @@ class StateStore:
 
     @property
     def wall_uids(self) -> FrozenSet[str]:
-        """已成功作业 UID 集合快照。"""
-        return self._state.wall_uids
+        """已成功作业 UID 集合快照。
+
+        不变式：对外只交不可变快照——PipelineState 内部活索引绝不被
+        调用方持有引用（误改会静默破坏 wall 去重一致性）。
+        """
+        return frozenset(self._state.wall_uids)
 
     @property
     def failed_uids(self) -> FrozenSet[str]:
-        """已失败作业 UID 集合快照。"""
-        return self._state.failed_uids
+        """已失败作业 UID 集合快照（不可变契约同 wall_uids）。"""
+        return frozenset(self._state.failed_uids)
 
     @property
     def queue_uids(self) -> FrozenSet[str]:
-        """排队作业 UID 集合快照。"""
-        return self._state.queue_uids
+        """排队作业 UID 集合快照（不可变契约同 wall_uids）。"""
+        return frozenset(self._state.queue_uids)
 
     def pop_job(self, idx: int) -> dict:
         """弹出指定位置作业并同步 UID 索引。"""
