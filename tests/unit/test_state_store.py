@@ -203,3 +203,44 @@ class TestStateStoreQueueAndMembership:
         assert "q::2" in store.in_flight_uids
         store.unregister_in_flight("q::2")
         assert "q::2" not in store.in_flight_uids
+
+
+class TestStoreUidSnapshotContract:
+    """快照契约：StateStore.uid 系列属性必须返回不可变集合。
+
+    docstring 与返回注解承诺「快照」且类型为 FrozenSet——若透传
+    PipelineState 内部活索引（可变 set），调用方按契约做的 add/discard
+    会静默改写引擎内部 uid 索引，破坏 wall 去重与队列索引一致性。
+    """
+
+    @staticmethod
+    def _make_store() -> StateStore:
+        backend = InMemoryStateBackend()
+        state = PipelineState(
+            {"w::1": {}},
+            {"f::1": {}},
+            {},
+            [{"task_type": "q", "job_id": "1"}],
+        )
+        return StateStore(backend, state)
+
+    @pytest.mark.parametrize("prop", ["wall_uids", "failed_uids", "queue_uids", "in_flight_uids"])
+    def test_uid_properties_return_frozenset(self, prop):
+        store = self._make_store()
+        value = getattr(store, prop)
+        assert isinstance(value, frozenset)
+
+    def test_mutating_returned_set_cannot_corrupt_internal_index(self):
+        store = self._make_store()
+        snapshot = store.wall_uids
+        with pytest.raises(AttributeError):
+            snapshot.add("intruder::1")
+        assert "intruder::1" not in store._state.wall_uids
+
+    def test_snapshot_isolation(self):
+        """快照与内部索引不共享存储：索引后续演进不影响已取出的快照。"""
+        store = self._make_store()
+        snapshot = store.queue_uids
+        store.pop_job(0)
+        assert "q::1" in snapshot
+        assert "q::1" not in store.queue_uids
