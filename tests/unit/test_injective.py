@@ -3,6 +3,7 @@
 import hashlib
 import pytest
 from tasklite.utils.injective import (
+    EMPTY_SENTINEL,
     content_fingerprint,
     escape_injective,
     safe_uid_filename,
@@ -41,8 +42,14 @@ def test_escape_injective_bijection_no_collisions():
 
 
 def test_sanitize_identifier_fallbacks_and_limits():
-    assert sanitize_identifier("") == "untitled"
-    assert sanitize_identifier(None) == "untitled"
+    # 空值哨兵处于单射转义像集之外：与字面 "untitled" 等任何真实输入零碰撞
+    assert sanitize_identifier("") == EMPTY_SENTINEL
+    assert sanitize_identifier(None) == EMPTY_SENTINEL
+    assert sanitize_identifier("untitled") == "untitled"
+    assert sanitize_identifier("") != sanitize_identifier("untitled")
+    assert sanitize_content_id("") == EMPTY_SENTINEL
+    assert sanitize_content_id("untitled") == "untitled"
+    assert sanitize_content_id("") != sanitize_content_id("untitled")
     assert sanitize_identifier("", fallback="custom") == "custom"
 
     # 超长截断带 SHA-256 后缀
@@ -106,7 +113,7 @@ def test_content_fingerprint_deterministic_and_version_salted():
 
 def test_sanitize_job_component_delegation_and_invariants():
     assert sanitize_job_component("a::b/c\\d") == "a%3A%3Ab%2Fc%5Cd"
-    assert sanitize_job_component("") == "untitled"
+    assert sanitize_job_component("") == EMPTY_SENTINEL
     assert "::" not in sanitize_job_component("x::y")
     assert sanitize_job_component("abc-_.123") == "abc-_.123"
 
