@@ -8,6 +8,7 @@ build/
 
 # Testing
 .pytest_cache/
+.hypothesis/
 .coverage
 htmlcov/
 mutants/
@@ -23,6 +24,7 @@ mutants/
 .opencode/
 .claude/
 .gemini/
+.zcode/
 
 # Packages
 *.egg
