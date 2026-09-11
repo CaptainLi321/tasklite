@@ -59,7 +59,7 @@ def test_sanitize_job_component_long_input_truncate_with_fingerprint():
     out_a, out_b = sanitize_job_component(a), sanitize_job_component(b)
     assert len(out_a) <= 120 and len(out_b) <= 120
     assert out_a != out_b
-    assert out_a.endswith("_" + hashlib.sha256(a.encode()).hexdigest()[:8])
+    assert out_a.endswith("%_" + hashlib.sha256(a.encode()).hexdigest()[:16])
 
 
 def test_job_ref_extraction():

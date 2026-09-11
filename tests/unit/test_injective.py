@@ -52,7 +52,7 @@ def test_sanitize_identifier_fallbacks_and_limits():
     assert sanitize_content_id("") != sanitize_content_id("untitled")
     assert sanitize_identifier("", fallback="custom") == "custom"
 
-    # 超长截断带 SHA-256 后缀
+    # 超长截断带像集外标记 + 64 位 SHA-256 全文指纹后缀
     long_a = "x" * 200
     long_b = "x" * 150 + "y" + "x" * 49
     res_a = sanitize_identifier(long_a, max_len=120)
@@ -60,7 +60,7 @@ def test_sanitize_identifier_fallbacks_and_limits():
     assert len(res_a) <= 120
     assert len(res_b) <= 120
     assert res_a != res_b
-    assert res_a.endswith("_" + hashlib.sha256(long_a.encode()).hexdigest()[:8])
+    assert res_a.endswith("%_" + hashlib.sha256(long_a.encode()).hexdigest()[:16])
 
 
 def test_sanitize_identifier_truncation_aligns_percent_escape():

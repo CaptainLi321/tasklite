@@ -5,7 +5,12 @@
    任何非单射净化（如丢弃字符、简单多对一替换）在拼装 UID 或文件路径时会导致碰撞，
    进而导致 wall 去重静默吞任务或锁竞争错乱。
 2. 转义符优先转义：% 必须首先转义为 %25，因此输出中的 % 唯一且确定地引导一个 %XX 序列。
-3. 超长截断单射兜底：截断时附加 SHA-256 摘要（8 字符），保证同前缀不同尾部的长字符串不碰撞。
+   推论：含孤立 %（% 后不跟两位大写 hex）的串不在像集中——哨兵与截断标记均利用此性质
+   选取「任何输入都映射不出」的形态。
+3. 超长截断兜底：截断输出 = 前缀 + "%_" + 64 位 SHA-256 指纹。标记 "%_" 使截断输出
+   落在转义像集之外，与「转义后 ≤ max_len 直通域」结构性不相交（无定点自碰撞）；
+   同前缀长输入之间依赖 64 位指纹概率防撞（生日界约 2^32 条）。有界输出对无限定义域
+   的全域单射数学上不可能，此处为工程实用界而非数学保证。
 """
 from __future__ import annotations
 
@@ -25,6 +30,18 @@ CONTENT_ID_ALLOWED = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012345
 # %XX 成对出现，故任何非空输入都不可能映射出该形态——空值与真实输入（含字面
 # "untitled"）零碰撞。哨兵为固定最短安全形态，不随 max_len 收缩。
 EMPTY_SENTINEL = "%untitled"
+
+# 截断指纹宽度：64 位 hex。同前缀长输入之间为概率防撞，生日界约 2^32 条（50% 碰撞
+# 概率所需的同前缀长 ID 量级），工程上视为实用安全界而非数学保证。
+_TRUNC_DIGEST_HEX = 16
+
+# 截断标记：含孤立 %（_ 非 hex 位），处于转义像集之外。不变式：直通域输出继承
+# escape_injective 的「% 只以 %XX 成对出现」形态，故截断输出与直通域结构性不相交，
+# 杜绝「截断输出自身作为输入再次净化」时的定点自碰撞。
+_TRUNC_MARKER = "%_"
+
+# 截断形态的固定开销（标记 + 指纹），max_len 低于此值时截断无法在不破上限的前提下完成
+_TRUNC_FIXED_LEN = len(_TRUNC_MARKER) + _TRUNC_DIGEST_HEX
 
 # 文件系统危险字符映射（POSIX /、Windows \、NUL、glob *?[]、冒号 :）
 FS_ESCAPE_CHARS: Dict[str, str] = {
@@ -78,14 +95,18 @@ def sanitize_identifier(
     allowed: Union[str, Sequence[str], None] = None,
     fallback: str = EMPTY_SENTINEL,
 ) -> str:
-    """净化任意值为确定性、单射安全的标识符（如 job_id 或 content_id）。
+    """净化任意值为确定性、单射安全的标识符（如 job_id 或 content_id）。单射契约分级：
 
     - 空值（None/""）返回 fallback；默认哨兵 EMPTY_SENTINEL 处于单射转义像集之外，
       任何非空输入都映射不出该值（零碰撞）。自定义 fallback 必须同样选用像集外
       形态（含孤立 %），否则与字面输入的碰撞由调用方自负；哨兵形态固定，不随
       max_len 收缩；
-    - 禁止字符与不可打印字符可逆单射转义；
-    - 超长输入（转义后 > max_len）：截断 + 8 位 SHA-256 指纹后缀。
+    - 转义后 ≤ max_len 的输入：直通输出，全域单射（继承 escape_injective）；
+    - 转义后 > max_len 的输入：截断 + "%_" + 64 位 SHA-256 全文指纹。输出带像集外
+      标记，与直通域结构性不相交；同前缀长输入之间为概率防撞（生日界约 2^32 条
+      同前缀长 ID），非数学全域保证；
+    - 需截断而 max_len < _TRUNC_FIXED_LEN 时抛 ValueError（截断形态无法压入上限，
+      fail-loud）；直通输入对任意 max_len 均可用。
     """
     text = str(value) if value is not None else ""
     if not text:
@@ -93,26 +114,36 @@ def sanitize_identifier(
     escaped = escape_injective(text, forbidden=forbidden, allowed=allowed)
     if len(escaped) <= max_len:
         return escaped
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
-    base_limit = max(max_len - 9, 0)
+    # 指纹覆盖全文（非截断前缀），同前缀不同尾部的长输入由此区分
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:_TRUNC_DIGEST_HEX]
+    base_limit = max_len - _TRUNC_FIXED_LEN
+    if base_limit < 0:
+        raise ValueError(
+            f"max_len={max_len} 不足以容纳截断指纹形态"
+            f"（标记与指纹固定占 {_TRUNC_FIXED_LEN} 字符），拒绝静默突破长度上限"
+        )
     prefix = escaped[:base_limit]
     if prefix.endswith("%"):
         prefix = prefix[:-1]
     elif len(prefix) >= 2 and prefix[-2] == "%":
         prefix = prefix[:-2]
-    return f"{prefix}_{digest}"
+    return f"{prefix}{_TRUNC_MARKER}{digest}"
 
 
 def sanitize_job_component(value: Any, *, max_len: int = 120) -> str:
-    r"""把任意字符串**转义**净化为可作 job_id 成分的串（单射，不删字符）。
+    r"""把任意字符串**转义**净化为可作 job_id 成分的串（不删字符）。
 
-    单射转义与长度截断统一委托底层 sanitize_identifier。
+    单射契约分级见 sanitize_identifier：直通域全域单射；截断输出带像集外标记，
+    与直通域结构性不相交，截断域内为 64 位指纹概率防撞。
     """
     return sanitize_identifier(value, max_len=max_len)
 
 
 def sanitize_content_id(content_id: str, *, max_len: int = 120) -> str:
-    """按严密 allowlist 净化 content_id（如用于 discovery 子任务派发）。"""
+    """按严密 allowlist 净化 content_id（如用于 discovery 子任务派发）。
+
+    空值返回像集外哨兵；单射契约分级与截断行为同 sanitize_identifier。
+    """
     text = str(content_id)
     if not text:
         return EMPTY_SENTINEL
