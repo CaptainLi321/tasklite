@@ -25,7 +25,10 @@ def test_content_fingerprint_deterministic_and_version_salted():
 
 def test_sanitize_job_component_escapes_uid_separator_and_path():
     assert sanitize_job_component("a::b/c\\d") == "a%3A%3Ab%2Fc%5Cd"
-    assert sanitize_job_component("") == "untitled"
+    # 空值哨兵含孤立 %，处于转义像集之外（不再与字面输入碰撞）
+    assert sanitize_job_component("") == "%untitled"
+    assert sanitize_job_component("untitled") == "untitled"
+    assert sanitize_job_component("") != sanitize_job_component("untitled")
     assert "::" not in sanitize_job_component("x::y")
 
 

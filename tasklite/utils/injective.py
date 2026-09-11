@@ -21,6 +21,11 @@ DEFAULT_FORBIDDEN = "/\\:%"
 # 内容 ID 允许字符集（仅字母、数字、短横线、下划线、点）
 CONTENT_ID_ALLOWED = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
 
+# 空值哨兵：含孤立 %（% 后不跟两位大写 hex）。不变式：单射转义的像集中 % 只以
+# %XX 成对出现，故任何非空输入都不可能映射出该形态——空值与真实输入（含字面
+# "untitled"）零碰撞。哨兵为固定最短安全形态，不随 max_len 收缩。
+EMPTY_SENTINEL = "%untitled"
+
 # 文件系统危险字符映射（POSIX /、Windows \、NUL、glob *?[]、冒号 :）
 FS_ESCAPE_CHARS: Dict[str, str] = {
     "/": "%2F",
@@ -71,11 +76,14 @@ def sanitize_identifier(
     max_len: int = 120,
     forbidden: Union[str, Sequence[str], None] = DEFAULT_FORBIDDEN,
     allowed: Union[str, Sequence[str], None] = None,
-    fallback: str = "untitled",
+    fallback: str = EMPTY_SENTINEL,
 ) -> str:
     """净化任意值为确定性、单射安全的标识符（如 job_id 或 content_id）。
 
-    - 空值返回 fallback（默认 "untitled"）；
+    - 空值（None/""）返回 fallback；默认哨兵 EMPTY_SENTINEL 处于单射转义像集之外，
+      任何非空输入都映射不出该值（零碰撞）。自定义 fallback 必须同样选用像集外
+      形态（含孤立 %），否则与字面输入的碰撞由调用方自负；哨兵形态固定，不随
+      max_len 收缩；
     - 禁止字符与不可打印字符可逆单射转义；
     - 超长输入（转义后 > max_len）：截断 + 8 位 SHA-256 指纹后缀。
     """
@@ -107,7 +115,7 @@ def sanitize_content_id(content_id: str, *, max_len: int = 120) -> str:
     """按严密 allowlist 净化 content_id（如用于 discovery 子任务派发）。"""
     text = str(content_id)
     if not text:
-        return "untitled"
+        return EMPTY_SENTINEL
     # 若全部是 clean 字符且未超长，直接返回
     if all(c in CONTENT_ID_ALLOWED for c in text) and len(text) <= max_len:
         return text

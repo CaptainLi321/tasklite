@@ -17,6 +17,7 @@ from hypothesis import example, given, settings, strategies as st
 
 from tasklite.utils.injective import (
     CONTENT_ID_ALLOWED,
+    EMPTY_SENTINEL,
     escape_injective,
     safe_uid_filename,
     sanitize_content_id,
@@ -197,6 +198,9 @@ def test_content_id_output_charset_is_allowlist_or_escapes(text, max_len):
     out = sanitize_content_id(text, max_len=max_len)
     if text and all(c in CONTENT_ID_ALLOWED for c in text) and len(text) <= max_len:
         assert out == text
+    elif not text:
+        # 空值哨兵为像集外形态（含孤立 %），不适用「% 只以 %XX 出现」约束
+        assert out == EMPTY_SENTINEL
     else:
         assert out
         assert all(c in CONTENT_ID_ALLOWED or c == "%" for c in out)
@@ -215,6 +219,32 @@ def test_content_id_short_inputs_injective_within_claimed_scope(pair, max_len):
     if not x or not y or len(ex) > max_len or len(ey) > max_len:
         return
     assert sanitize_content_id(x, max_len=max_len) != sanitize_content_id(y, max_len=max_len)
+
+
+# ── 空值哨兵：像集外形态与零碰撞 ──────────────────────────────────────
+
+
+@pytest.mark.hypothesis
+@settings(max_examples=50, deadline=None)
+@example("")
+@example("untitled")
+@example("%untitled")
+@example("%25untitled")
+@example("untitled\x00")
+@given(text=any_text)
+def test_empty_sentinel_outside_image_never_collides(text):
+    """空值哨兵处于单射转义像集之外：任何非空输入（含字面 untitled）都映射不出哨兵。"""
+    sentinel_id = sanitize_identifier("")
+    sentinel_cid = sanitize_content_id("")
+    assert sanitize_identifier(None) == sentinel_id
+    assert sanitize_content_id("") == sentinel_cid
+    # 哨兵含孤立 %（像集外形态的充要特征）
+    assert not _percent_only_as_escapes(sentinel_id)
+    assert not _percent_only_as_escapes(sentinel_cid)
+    if not text:
+        return
+    assert sanitize_identifier(text) != sentinel_id
+    assert sanitize_content_id(text) != sentinel_cid
 
 
 # ── safe_uid_filename 与 _lock_path 组合单射 ──────────────────────────
