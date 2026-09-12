@@ -177,7 +177,14 @@ class PipelineState:
         return cascade
 
     def find_dependency_cycles(self) -> List[str]:
-        """在当前 _queue 的依赖图中找出所有依赖环成员。"""
+        """在当前 _queue 的依赖图中找出所有依赖环成员。
+
+        不变式：返回值为每次回边命中时「DFS 当前路径自闭点起的切片 + 闭点重复」
+        按遍历序的拼接，governor 死锁归因依赖该精确口径（成员、顺序、重复闭点）。
+        实现为显式栈仿真调用栈：栈帧持有节点的依赖迭代器，弹帧即回溯置黑，
+        遍历序与递归形式逐一致且深度不受解释器递归上限约束——深链队列
+        （深度超递归限制）不得因环检测本身崩溃。
+        """
         edges: Dict[str, set] = {}
         for jd in self._queue:
             try:
@@ -189,28 +196,35 @@ class PipelineState:
         color: Dict[str, int] = {}
         cycle_members: List[str] = []
         path_stack: List[str] = []
+        frame_deps: List[Any] = []
 
-        def dfs(uid: str) -> None:
-            color[uid] = 1
-            path_stack.append(uid)
-            for dep in edges.get(uid, ()):
+        for root in list(edges):
+            if color.get(root, 0) != 0:
+                continue
+            color[root] = 1
+            path_stack.append(root)
+            frame_deps.append(iter(edges.get(root, ())))
+            while frame_deps:
+                try:
+                    dep = next(frame_deps[-1])
+                except StopIteration:
+                    frame_deps.pop()
+                    color[path_stack.pop()] = 2
+                    continue
                 if dep not in edges:
                     continue
-                if color.get(dep, 0) == 1:
+                dep_color = color.get(dep, 0)
+                if dep_color == 1:
                     try:
                         start = path_stack.index(dep)
                     except ValueError:
                         start = 0
                     cycle_members.extend(path_stack[start:])
                     cycle_members.append(dep)
-                elif color.get(dep, 0) == 0:
-                    dfs(dep)
-            path_stack.pop()
-            color[uid] = 2
-
-        for uid in list(edges):
-            if color.get(uid, 0) == 0:
-                dfs(uid)
+                elif dep_color == 0:
+                    color[dep] = 1
+                    path_stack.append(dep)
+                    frame_deps.append(iter(edges.get(dep, ())))
         return cycle_members
 
     # 完成/失败记录 ------------------------------------------------
