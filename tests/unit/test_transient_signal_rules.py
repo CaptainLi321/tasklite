@@ -1,10 +1,10 @@
-"""瞬态信号军规回归测试（interrupted / lock_conflict「不烧重试预算 + 零污染」）。
+"""瞬态信号军规回归测试（interrupted / lock_conflict / rate_limited「不烧重试预算 + 零污染」）。
 
-不变式（红线 8）：外部中断与孤儿锁冲突为瞬态信号——
+不变式（红线 8）：外部中断、孤儿锁冲突与限流为瞬态信号——
 - 经 ExecutionResult 结果对象属性识别（生产路径唯一形态）；
 - 不消耗重试预算（job.retries 不递增）；
 - 即使已达 max_retries 也豁免 DLQ；
-- 短退避 [0.75, 1.0]s 回队自恢复；
+- 短退避 [0.75, 1.0]s 回队自恢复（限流的实际等待由资源挂起 TTL 承担）；
 - 不污染 last_retry_error；
 - 无瞬态属性时不误判（默认 False 分支）。
 """
@@ -44,6 +44,40 @@ class TestTransientSignalViaResultObject:
         assert job.retries == 2, "锁冲突重试不得消耗重试预算"
         assert 0.75 <= plan.delay <= 1.0
 
+    def test_rate_limited_result_preserves_budget_and_clean_runtime(self):
+        """rate_limited 结果对象：不烧预算、豁免 DLQ、零污染、短退避。"""
+        policy = ExecutionPolicy()
+        job = _job(max_retries=3, retries=2)
+        res = ExecutionResult(retry_error="HTTP 429 RateLimit hit", rate_limited=True)
+        plan = policy.plan_retry(job, job.to_dict(), res)
+        assert plan.going_to_retry is True, "限流瞬态信号必须豁免 DLQ 继续重试"
+        assert plan.is_rate_limited is True
+        assert job.retries == 2, "限流重试不得消耗重试预算"
+        assert 0.75 <= plan.delay <= 1.0, "限流重试必须走短退避（等待由资源挂起承担）"
+        rt = plan.retry_dict["runtime"]
+        assert not rt.get("_last_retry_error"), \
+            f"限流信号不得污染 last_retry_error: {rt.get('_last_retry_error')!r}"
+
+    def test_rate_limited_exhausted_budget_still_exempt(self):
+        """retries 已达上限时限流结果对象仍豁免 DLQ（429 风暴不误终结）。"""
+        policy = ExecutionPolicy()
+        job = _job(max_retries=3, retries=3)
+        res = ExecutionResult(retry_error="HTTP 429 RateLimit hit", rate_limited=True)
+        plan = policy.plan_retry(job, job.to_dict(), res)
+        assert plan.going_to_retry is True, "限流达预算上限也必须豁免 DLQ（持续 429 应挂起等待）"
+        assert plan.fail_meta is None
+
+    def test_rate_limited_keyword_form_preserves_budget(self):
+        """plan_retry 显式 rate_limited 关键字：与结果对象属性同语义。"""
+        policy = ExecutionPolicy()
+        job = _job(max_retries=3, retries=3)
+        plan = policy.plan_retry(
+            job, job.to_dict(), retry_error="HTTP 429 RateLimit hit", rate_limited=True,
+        )
+        assert plan.going_to_retry is True
+        assert plan.is_rate_limited is True
+        assert job.retries == 3, "关键字形态的限流豁免同样不得消耗预算"
+
     def test_exhausted_budget_still_exempt_via_result_object(self):
         """retries 已达上限时，瞬态结果对象仍豁免 DLQ（识别链贯通）。"""
         policy = ExecutionPolicy()
@@ -62,6 +96,7 @@ class TestTransientSignalViaResultObject:
         assert plan.going_to_retry is True
         assert plan.is_interrupted is False
         assert plan.is_lock_conflict is False
+        assert plan.is_rate_limited is False
         assert job.retries == 2, "普通失败重试必须消耗重试预算"
         assert plan.retry_dict["runtime"]["_last_retry_error"] == "real failure"
 

@@ -17,6 +17,7 @@ EMPTY_STATS = {
     "hook_errors": 0,
     "deferred_orphan": 0,
     "interrupted_reruns": 0,
+    "rate_limited_reruns": 0,
     "cascade_failed": 0,
 }
 
@@ -70,6 +71,10 @@ class TaskStats(dict):
     @property
     def interrupted_reruns(self) -> int:
         return self["interrupted_reruns"]
+
+    @property
+    def rate_limited_reruns(self) -> int:
+        return self["rate_limited_reruns"]
 
     @property
     def cascade_failed(self) -> int:

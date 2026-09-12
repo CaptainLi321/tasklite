@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from ..exceptions import (
     FatalError,
+    RateLimitHit,
     RetryError,
 )
 from ..taxonomy import classify_exception
@@ -92,6 +93,7 @@ def _decode_ipc_result(
     cursor_updates: Dict[str, str] = {}
     resource_suspensions: List[Tuple[str, float]] = []
     lock_conflict = False
+    rate_limited = False
     interrupted = False
 
     if isinstance(res, dict) and "status" in res:
@@ -165,6 +167,7 @@ def _decode_ipc_result(
             retry_requested = True
             retry_error = res.get("error")
             lock_conflict = bool(res.get("lock_conflict", False))
+            rate_limited = bool(res.get("rate_limited", False))
         elif res["status"] == "interrupted":
             retry_requested = True
             retry_error = res.get("error")
@@ -206,6 +209,7 @@ def _decode_ipc_result(
         cursor_updates=cursor_updates,
         resource_suspensions=resource_suspensions,
         lock_conflict=lock_conflict,
+        rate_limited=rate_limited,
         interrupted=interrupted,
     )
 
@@ -251,8 +255,14 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
             incarnation=incarnation,
         )
     except RetryError as e:
+        # 限流瞬态判定必须在子进程编码侧完成：RateLimitHit 是 RetryError
+        # 子类、与本类共享 status="retry" 通道，父进程侧已无异常类型可辨；
+        # 预算豁免依赖该结构化字段（与 lock_conflict 同构）。
+        retry_payload: Dict[str, Any] = {"status": "retry", "error": str(e)}
+        if isinstance(e, RateLimitHit):
+            retry_payload["rate_limited"] = True
         journal.write_result_with_degradation(
-            uid, {"status": "retry", "error": str(e)}, incarnation=incarnation
+            uid, retry_payload, incarnation=incarnation
         )
     except FatalError as e:
         journal.write_result_with_degradation(
@@ -332,6 +342,7 @@ class ExecutionResult:
     cursor_updates: Dict[str, str] = field(default_factory=dict)
     resource_suspensions: List[Tuple[str, float]] = field(default_factory=list)
     lock_conflict: bool = False
+    rate_limited: bool = False
     interrupted: bool = False
     going_to_retry: Optional[bool] = None
 

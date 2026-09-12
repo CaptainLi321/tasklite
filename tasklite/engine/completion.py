@@ -179,6 +179,7 @@ class CompletionMachine:
             front=False,
             is_interrupted=plan.is_interrupted,
             is_lock_conflict=plan.is_lock_conflict,
+            is_rate_limited=plan.is_rate_limited,
         )
         result.going_to_retry = True
 

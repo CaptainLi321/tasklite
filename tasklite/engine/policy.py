@@ -102,6 +102,7 @@ class RetryPlan:
     fail_meta: Optional[Dict[str, Any]] = None
     is_interrupted: bool = False
     is_lock_conflict: bool = False
+    is_rate_limited: bool = False
     schedule: Optional[BackoffSchedule] = None
 
 
@@ -365,14 +366,17 @@ class BackoffGovernor:
         retry_error: Optional[str] = None,
         interrupted: bool = False,
         lock_conflict: bool = False,
+        rate_limited: bool = False,
     ) -> RetryPlan:
         """规划重试决策与退避状态机（单一出口：计算预算、退避时延与双时钟状态）。
 
         契约：
-        1. 外部中断（interrupted）与孤儿锁冲突（lock_conflict）为瞬态信号：
+        1. 外部中断（interrupted）、孤儿锁冲突（lock_conflict）与限流
+           （rate_limited）为瞬态信号：
            - 不消耗重试预算（不递增 job.retries）；
            - 即使 job.retries 已达 max_retries 也豁免 DLQ；
-           - 采用 [0.75, 1.0]s 短退避回队自恢复；
+           - 采用 [0.75, 1.0]s 短退避回队自恢复（限流的实际等待由资源
+             挂起 TTL 承担，退避只负责回队节奏）；
            - 不污染 last_retry_error。
         2. 正常业务失败重试：
            - 检查 job.retries >= job.max_retries：超限则装配 DLQ fail_meta 并返回 going_to_retry=False；
@@ -390,8 +394,12 @@ class BackoffGovernor:
                 interrupted = bool(getattr(retry_error_or_result, "interrupted", False))
             if hasattr(retry_error_or_result, "lock_conflict"):
                 lock_conflict = bool(getattr(retry_error_or_result, "lock_conflict", False))
+            if hasattr(retry_error_or_result, "rate_limited"):
+                rate_limited = bool(getattr(retry_error_or_result, "rate_limited", False))
 
-        if job.retries >= job.max_retries and not (interrupted or lock_conflict):
+        transient = interrupted or lock_conflict or rate_limited
+
+        if job.retries >= job.max_retries and not transient:
             fail_meta: Dict[str, Any] = {"error": _ERR_MAX_RETRIES}
             rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
             if rt_state.last_retry_error:
@@ -404,9 +412,10 @@ class BackoffGovernor:
                 fail_meta=fail_meta,
                 is_interrupted=interrupted,
                 is_lock_conflict=lock_conflict,
+                is_rate_limited=rate_limited,
             )
 
-        if interrupted or lock_conflict:
+        if transient:
             sched = self.compute_orphan_schedule()
         else:
             job.retries += 1
@@ -417,7 +426,7 @@ class BackoffGovernor:
         retry_dict = job.to_dict()
         retry_dict["resources"] = dict(job_dict.get("resources", {}))
         retry_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
-        if retry_error and not (interrupted or lock_conflict):
+        if retry_error and not transient:
             retry_state.last_retry_error = retry_error
         sched.populate_runtime(retry_state)
         retry_dict["runtime"] = retry_state.to_dict()
@@ -428,6 +437,7 @@ class BackoffGovernor:
             retry_dict=retry_dict,
             is_interrupted=interrupted,
             is_lock_conflict=lock_conflict,
+            is_rate_limited=rate_limited,
             schedule=sched,
         )
 
