@@ -471,6 +471,31 @@ def test_make_key_identity_headers_injective() -> None:
     assert len(keys) == 5
 
 
+def test_make_key_params_fingerprint_injective() -> None:
+    """params 值指纹须类型前缀隔离，None 与 "None" 等不同形态不得共享快照 key。
+
+    norm_query 以 str(v) 镜像线上 URL 形态，但 requests 后端对 None 参数
+    直接丢弃——str() 强转的多对一映射会让不同线上请求静默命中同一快照。
+    """
+    base = SnapshotStore.make_key("https://api.test/a")
+    k_none = SnapshotStore.make_key("https://api.test/a", params={"a": None})
+    k_str = SnapshotStore.make_key("https://api.test/a", params={"a": "None"})
+    assert k_none != k_str
+
+    # str() 同串的其它类型对（int 1 vs "1"）同样不得碰撞
+    assert SnapshotStore.make_key("https://api.test/a", params={"a": 1}) != SnapshotStore.make_key(
+        "https://api.test/a", params={"a": "1"}
+    )
+    # 携带 params 与不携带 params 互不碰撞
+    assert base != k_none
+    assert base != k_str
+    # dict 插入顺序不影响 key，相同 params 稳定同 key
+    assert SnapshotStore.make_key("https://api.test/a", params={"a": 1, "b": 2}) == SnapshotStore.make_key(
+        "https://api.test/a", params={"b": 2, "a": 1}
+    )
+    assert SnapshotStore.make_key("https://api.test/a", params={"a": None}) == k_none
+
+
 def test_sqlite_snapshot_store_crud(tmp_path: Path) -> None:
     db_file = tmp_path / "snapshots.db"
     store = SQLiteSnapshotStore(db_file)
@@ -695,6 +720,30 @@ def test_snapshot_cached_wrapped_fetch_urllib_429_suspension_reaches_outer_guard
             cached_fetch(f"{local_http_server}/429")
 
     assert ctx.calls == [("api_feed", 15.0)]
+
+
+def test_snapshot_cached_distinguishes_params_value_types() -> None:
+    """同 URL 下 params 值不同形态必须各发一次真实请求，禁止静默命中同一快照。"""
+    call_count = 0
+
+    def mock_fetch(url: str, **kwargs: Any) -> HttpResponse:
+        nonlocal call_count
+        call_count += 1
+        params = kwargs.get("params") or {}
+        return HttpResponse(status_code=200, headers={}, body=f"val={params.get('a')!r}".encode("utf-8"))
+
+    store = MemorySnapshotStore()
+    cached_fetch = store.cached(mock_fetch)
+
+    r1 = cached_fetch("https://api.test/a", params={"a": None})
+    r2 = cached_fetch("https://api.test/a", params={"a": "None"})
+    assert call_count == 2
+    assert r1.text == "val=None"
+    assert r2.text == "val='None'"
+
+    # 相同形态仍命中快照，不重复请求
+    cached_fetch("https://api.test/a", params={"a": "None"})
+    assert call_count == 2
 
 
 def test_snapshot_cached_skips_transient_statuses() -> None:
