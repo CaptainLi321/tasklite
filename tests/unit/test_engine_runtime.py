@@ -171,6 +171,87 @@ class TestEngineRuntimeExecutionLifecycle:
             release_lock(lock_fd)
 
 
+class TestEngineRuntimeInitFailureSafety:
+    """初始化段（run 锁获取 + 信号陷阱）异常安全回归。
+
+    不变式：任何离开 execute() 的路径都必须复位 _is_running 并释放已获取
+    的锁 fd；同实例随后可正常复跑。try_acquire_lock 契约：环境故障抛
+    OSError（语义上抛不吞），仅「锁被占」返回 None。
+    """
+
+    def test_lock_env_failure_resets_running_and_allows_rerun(self, tmp_path, monkeypatch):
+        """锁获取抛 OSError（权限/磁盘满类环境故障）后标志复位、锁无泄漏、可复跑。"""
+        import tasklite.engine.runtime as runtime_module
+
+        events: list = []
+        runtime = make_runtime(
+            tmp_path, name="test_env_failure",
+            on_run_end=lambda reason: events.append(reason),
+        )
+
+        with monkeypatch.context() as m:
+            def _raise_env_failure(ipc_dir, uid, *, timeout=0):
+                raise OSError(13, "Permission denied")
+
+            m.setattr(runtime_module, "try_acquire_lock", _raise_env_failure)
+            with pytest.raises(OSError):
+                runtime.execute()
+
+        # 故障路径收尾：运行标志复位、无锁 fd 残留、未开始的 run 不发 on_run_end
+        assert not runtime.is_running
+        assert runtime._run_lock_fd is None
+        assert events == []
+
+        # 故障注入解除后，同实例可正常启动并完成（复跑成功同时证明锁已释放：
+        # 遗留 fd 的 flock 会让下一次 try_acquire_lock 返回 None）
+        summary = runtime.execute()
+        assert summary.exit_reason is ExitReason.COMPLETED
+        assert not runtime.is_running
+        assert runtime._run_lock_fd is None
+
+    def test_keyboard_interrupt_during_init_releases_lock_and_resets_flag(
+        self, tmp_path, monkeypatch,
+    ):
+        """初始化中途 KeyboardInterrupt 后标志复位、真实锁 fd 已释放、可复跑。"""
+        import signal as signal_module
+
+        import tasklite.engine.runtime as runtime_module
+        from tasklite.utils.lockfile import release_lock, try_acquire_lock
+
+        runtime = make_runtime(tmp_path, name="test_init_interrupt")
+
+        class _InstallSignalInterrupt:
+            """信号陷阱安装点抛 KeyboardInterrupt 的确定性故障注入。
+
+            此刻 run 锁已获取并注册，覆盖「锁已持、主循环未启」的中断窗口。
+            """
+
+            SIGTERM = signal_module.SIGTERM
+            SIGINT = signal_module.SIGINT
+
+            @staticmethod
+            def signal(signum, handler):
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(runtime_module, "signal", _InstallSignalInterrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            runtime.execute()
+
+        monkeypatch.undo()
+        assert not runtime.is_running
+        assert runtime._run_lock_fd is None
+
+        # 直接验证 __pipeline_run__ 锁可再次获取（无 fd 泄漏），探测后即释放
+        lock_fd = try_acquire_lock(runtime.config.ipc_dir, "__pipeline_run__", timeout=0)
+        assert lock_fd is not None
+        release_lock(lock_fd)
+
+        summary = runtime.execute()
+        assert summary.exit_reason is ExitReason.COMPLETED
+        assert not runtime.is_running
+
+
 class TestTaskLiteRuntimeFacadeIntegration:
     """测试 TaskLite 宿主门面与 EngineRuntime 架构一致性。"""
 
