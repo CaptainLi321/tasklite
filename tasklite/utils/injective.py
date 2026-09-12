@@ -145,11 +145,14 @@ def sanitize_job_component(value: Any, *, max_len: int = 120) -> str:
     return sanitize_identifier(value, max_len=max_len)
 
 
-def sanitize_content_id(content_id: str, *, max_len: int = 120) -> str:
+def sanitize_content_id(content_id: Union[str, None], *, max_len: int = 120) -> str:
     """按严密 allowlist 净化 content_id（如用于 discovery 子任务派发）。
 
-    空值返回像集外哨兵；单射契约分级与截断行为同 sanitize_identifier。
+    None/空值返回像集外哨兵（固定形态，不随 max_len 收缩）；单射契约分级
+    与截断行为同 sanitize_identifier。
     """
+    if content_id is None:
+        return EMPTY_SENTINEL
     text = str(content_id)
     if not text:
         return EMPTY_SENTINEL
