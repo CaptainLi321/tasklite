@@ -101,6 +101,16 @@ def test_sanitize_content_id_strict_allowlist():
     assert sanitize_content_id("///") == "%2F%2F%2F"
 
 
+def test_sanitize_content_id_none_returns_sentinel_outside_image():
+    # None 与空值同路返回像集外哨兵：不再 str() 成字面 "None" 与
+    # sanitize_content_id("None") 碰撞；哨兵固定形态不受 max_len 收缩
+    assert sanitize_content_id(None) == EMPTY_SENTINEL
+    assert sanitize_content_id(None) != sanitize_content_id("None")
+    # max_len=3 时旧路径 str(None)="None" 走截断失败抛 ValueError，哨兵须不受 max_len 影响
+    assert sanitize_content_id(None, max_len=3) == EMPTY_SENTINEL
+    assert sanitize_content_id(None, max_len=3) != sanitize_content_id("None", max_len=4)
+
+
 def test_safe_uid_filename_escapes_filesystem_hazards():
     # 路径穿越
     assert "/" not in safe_uid_filename("t::a/../../../etc/passwd")
