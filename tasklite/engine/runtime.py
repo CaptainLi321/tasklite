@@ -184,8 +184,11 @@ class EngineRuntime:
         old_sigterm = None
         old_sigint = None
         # 不变式：任何离开 execute() 的路径都必须复位 _is_running 并释放已
-        # 获取的锁 fd。初始化段（锁获取 + 信号陷阱）故障同样走该收尾，但
-        # 不触发 fire_run_end——run 尚未 begin，on_run_end 只属于已开始的 run。
+        # 获取的锁 fd。初始化段（锁获取 + 信号陷阱）与 begin 前预检
+        # （strict_picklable）故障同样走该收尾，但不触发 fire_run_end——
+        # run 尚未 begin，on_run_end 只属于已开始的 run（与 on_run_start
+        # 起止对称）。
+        session_begun = False
         try:
             # 1. 单运行排他文件锁（try_acquire_lock 契约：仅「锁被占」返回
             #    None，权限/磁盘满等环境故障抛 OSError，语义必须上抛不吞）。
@@ -226,6 +229,7 @@ class EngineRuntime:
             self._preflight_picklable_callbacks()
             # 新 run 复位：统计/序号/停机态/幂等标志归零；store 记账换新 stats。
             self._session.begin()
+            session_begun = True
             self.store.set_stats(self._session.stats)
             self.governor.reset()
 
@@ -245,7 +249,10 @@ class EngineRuntime:
             unhandled_exc = e
             raise
         finally:
-            self._session.fire_run_end(exit_reason.value)
+            # on_run_end 仅在对应 on_run_start 已可能触发的 run（已 begin）
+            # 上触发：begin 前失败不发 end，杜绝起止不对称。
+            if session_begun:
+                self._session.fire_run_end(exit_reason.value)
             if self._run_lock_fd is not None:
                 release_lock(self._run_lock_fd)
                 self._run_lock_fd = None

@@ -135,6 +135,12 @@ class TestEngineRuntimeExecutionLifecycle:
         assert runtime.session.stats["completed"] == 0
 
     def test_strict_picklable_unpicklable_handler_fails(self, tmp_path):
+        """strict_picklable 预检失败：TypeError 上抛且起止钩子均不触发。
+
+        不变式：on_run_start/on_run_end 起止对称——预检发生在 session
+        begin 之前，run 尚未开始，fire_run_end 不得触发（与初始化段故障
+        同纪律）；错误传播语义不变，实例可复跑。
+        """
         events = []
 
         # 使用不可 pickle 的 local lambda
@@ -146,13 +152,25 @@ class TestEngineRuntimeExecutionLifecycle:
         runtime = make_runtime(
             tmp_path, name="test_picklable", handlers=handlers,
             strict_picklable=True,
-            on_run_end=lambda reason: events.append(reason),
+            on_run_start=lambda: events.append("start"),
+            on_run_end=lambda reason: events.append(f"end:{reason}"),
         )
 
         with pytest.raises(TypeError, match="not picklable"):
             runtime.execute()
 
-        assert "error" in events
+        # run 未 begin：起止钩子均不触发（起止对称），运行态已复位
+        assert events == []
+        assert not runtime.is_running
+        assert runtime._run_lock_fd is None
+
+        # 预检故障不留残留状态：换可 pickle handler 后同实例正常复跑，
+        # 起止钩子一对一配对触发
+        runtime.handlers.clear()
+        runtime.handlers["dummy"] = HandlerEntry(dummy_runtime_handler, {}, None)
+        summary = runtime.execute()
+        assert summary.exit_reason is ExitReason.COMPLETED
+        assert events == ["start", "end:completed"]
 
     def test_concurrent_run_lock_rejection(self, tmp_path):
         runtime1 = make_runtime(tmp_path, name="test_lock")
