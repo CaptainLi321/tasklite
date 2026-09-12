@@ -246,7 +246,9 @@ class HttpPolicy:
             headers: 响应头 Mapping 对象。
 
         Returns:
-            Optional[float]: 解析出的秒数；未提供或无法解析时返回 None。
+            Optional[float]: 解析出的正秒数；未提供、无法解析，或不具备挂起语义
+            （0、负数、非有限数、已过期的 HTTP-Date）时返回 None，由调用方回落
+            default_suspend_ttl。
         """
         if not headers:
             return None
@@ -258,15 +260,19 @@ class HttpPolicy:
         val_str = str(val).strip()
         try:
             sec = float(val_str)
-            return max(0.0, sec) if math.isfinite(sec) else None
         except ValueError:
-            pass
+            sec = None
+        if sec is not None:
+            # 不变式：仅正值具备挂起语义。0/负数/非有限值必须回落 default_suspend_ttl
+            # （None 契约），clamp 放行 0.0 会击穿 TaskContext.suspend_resource 的
+            # seconds>0 入口校验，ValueError 在守卫 __exit__ 内替换掉限流信号。
+            return sec if math.isfinite(sec) and sec > 0 else None
         try:
             parsed_tuple = email.utils.parsedate_tz(val_str)
             if parsed_tuple is not None:
-                timestamp = email.utils.mktime_tz(parsed_tuple)
-                diff = timestamp - time.time()
-                return max(0.0, diff)
+                diff = email.utils.mktime_tz(parsed_tuple) - time.time()
+                # 已过期日期与 0/负数秒同语义：无有效等待时长，回落而非 clamp
+                return diff if diff > 0 else None
         except Exception:
             pass
         return None
