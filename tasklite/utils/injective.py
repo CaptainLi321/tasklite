@@ -153,6 +153,28 @@ def sanitize_content_id(content_id: str, *, max_len: int = 120) -> str:
     return sanitize_identifier(text, max_len=max_len, allowed=CONTENT_ID_ALLOWED)
 
 
+def _fingerprint_token(value: Any) -> str:
+    """指纹项 → 带类型标记的确定性 token。
+
+    类型标记隔离跨型碰撞（1 与 "1" 编码必不同）；repr 把内容中的控制字符
+    （含 \\x00）转义为字面反斜杠序列，token 中不出现裸 \\x00，项内注入
+    定界符伪装项边界的碰撞被结构性排除。dict 按键排序序列化，序无关。
+    """
+    if isinstance(value, bool):
+        return "b" + repr(value)
+    if isinstance(value, int):
+        return "i" + repr(value)
+    if isinstance(value, float):
+        return "f" + repr(value)
+    if isinstance(value, str):
+        return "s" + repr(value)
+    if isinstance(value, dict):
+        return "d" + repr(sorted(value.items(), key=lambda kv: repr(kv[0])))
+    if isinstance(value, (list, tuple)):
+        return "l" + repr([_fingerprint_token(v) for v in value])
+    return "o" + repr(value)
+
+
 def content_fingerprint(
     parts: Iterable[Union[str, int, float]],
     *,
@@ -165,10 +187,10 @@ def content_fingerprint(
     """
     h = hashlib.sha1()
     if version:
-        h.update(str(version).encode("utf-8", errors="replace"))
+        h.update(_fingerprint_token(version).encode("utf-8", errors="replace"))
         h.update(b"\x00")
     for p in parts:
-        h.update(str(p).encode("utf-8", errors="replace"))
+        h.update(_fingerprint_token(p).encode("utf-8", errors="replace"))
         h.update(b"\x00")
     return h.hexdigest()[:16]
 
