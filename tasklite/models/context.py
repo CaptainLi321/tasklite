@@ -26,6 +26,8 @@ class TaskContext:
         output_root: Optional[Path] = None,
         ipc_dir: Optional[str] = None,
         transient_registry: Tuple = (),
+        fatal_exceptions: Optional[Tuple] = None,
+        transient_exceptions: Optional[Tuple] = None,
         resource_names: Optional[Union[frozenset, set]] = None,
     ):
         self.job = job
@@ -47,6 +49,16 @@ class TaskContext:
         # spawn 子进程不继承父进程函数作用域的注册，分类决策在子进程发生，
         # 快照在此携带、worker 入口重放（见 executor._mp_worker_wrapper）。
         self.transient_registry = tuple(transient_registry)
+        # 启发式异常元组快照契约：与 transient_registry 同构随 ctx 下发。
+        # 不变式：必须保真 None 与空元组的区别——None 表示未声明（worker
+        # 回退内置默认启发式），空元组表示「整体替换为空」（关闭该侧启发
+        # 式）；None 被误存为空元组会让子进程静默关闭全部默认启发式。
+        self.fatal_exceptions = (
+            tuple(fatal_exceptions) if fatal_exceptions is not None else None
+        )
+        self.transient_exceptions = (
+            tuple(transient_exceptions) if transient_exceptions is not None else None
+        )
         # suspend 信号走落盘文件（{ipc_dir}/{uid}.signals.jsonl）——
         # 进程被 kill 后文件仍在，信号不丢。
         self.ipc_dir = ipc_dir

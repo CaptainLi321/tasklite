@@ -645,6 +645,199 @@ class TestClassificationProtocol:
         )
 
 
+# 构造器声明 fatal/transient 元组的子进程分类契约
+
+class _DeclaredTransientError(Exception):
+    """模块级异常：构造器 transient_exceptions 声明路径测试用。"""
+
+
+class _DeclaredFatalError(Exception):
+    """模块级异常：构造器 fatal_exceptions 声明路径测试用。"""
+
+
+class _RegistrySideTransientError(Exception):
+    """模块级异常：与构造器声明叠加的注册表路径测试用。"""
+
+
+class _UndeclaredError(Exception):
+    """模块级异常：无任何声明时的默认启发式基线测试用。"""
+
+
+def _declared_transient_flaky_handler(job, ctx):
+    """handler：首轮抛构造器声明的瞬态异常，次轮成功（标记文件判别轮次）。"""
+    marker = Path(job.payload["marker"])
+    if not marker.exists():
+        marker.write_text("1")
+        raise _DeclaredTransientError("declared transient first attempt")
+    return True
+
+
+def _registry_transient_flaky_handler(job, ctx):
+    """handler：首轮抛注册表注册的瞬态异常，次轮成功。"""
+    marker = Path(job.payload["marker"])
+    if not marker.exists():
+        marker.write_text("1")
+        raise _RegistrySideTransientError("registry transient first attempt")
+    return True
+
+
+def _declared_fatal_handler(job, ctx):
+    """handler：恒抛构造器声明的 fatal 异常。"""
+    raise _DeclaredFatalError("declared fatal")
+
+
+def _undeclared_error_handler(job, ctx):
+    """handler：恒抛未声明异常（默认启发式下为 unknown）。"""
+    raise _UndeclaredError("undeclared")
+
+
+def _raise_declared_transient(job, ctx):
+    """handler：抛构造器声明的瞬态异常（worker 直调用）。"""
+    raise _DeclaredTransientError("declared transient")
+
+
+def _raise_declared_fatal(job, ctx):
+    """handler：抛构造器声明的 fatal 异常（worker 直调用）。"""
+    raise _DeclaredFatalError("declared fatal")
+
+
+class TestDeclaredExceptionClassification:
+    """构造器声明 fatal/transient 元组在子进程分类中真实生效。
+
+    不变式：分类决策发生在 spawn 子进程——构造器声明的启发式元组必须
+    随 ctx 快照下发 worker，并与 register_transient_exception 注册表
+    并集生效；任一路径缺失都会让用户声明被静默忽略（瞬态被判 unknown
+    直接 DLQ 零重试）。
+    """
+
+    def test_worker_writes_retry_for_declared_transient(self, tmp_path):
+        """快照接缝直测：ctx 携带声明元组 → worker 侧分类写 status="retry"。"""
+        from tasklite.engine.channel import WorkerLaunchSpec, _mp_worker_wrapper
+        from tasklite.models.context import TaskContext
+        from tasklite.utils.ipc import ArtifactJournal
+
+        ipc = str(tmp_path)
+        job = Job("t", "dt")
+        ctx = TaskContext(
+            job, set(), set(), {}, ipc_dir=ipc,
+            transient_exceptions=(_DeclaredTransientError,),
+        )
+        _mp_worker_wrapper(WorkerLaunchSpec(
+            handler=_raise_declared_transient, job=job, task_ctx=ctx,
+            incarnation="declared.1", ipc_dir=ipc, timeout=60.0,
+        ))
+        res = ArtifactJournal(ipc).read_result("t::dt", incarnation="declared.1")
+        assert res is not None, "worker 必须写结果文件"
+        assert res.get("status") == "retry", (
+            f"声明瞬态应分类为 retry，got {res!r}"
+        )
+
+    def test_worker_writes_fatal_for_declared_fatal(self, tmp_path):
+        """快照接缝直测：ctx 携带声明元组 → worker 侧分类写 status="fatal"。"""
+        from tasklite.engine.channel import WorkerLaunchSpec, _mp_worker_wrapper
+        from tasklite.models.context import TaskContext
+        from tasklite.utils.ipc import ArtifactJournal
+
+        ipc = str(tmp_path)
+        job = Job("t", "df")
+        ctx = TaskContext(
+            job, set(), set(), {}, ipc_dir=ipc,
+            fatal_exceptions=(_DeclaredFatalError,),
+        )
+        _mp_worker_wrapper(WorkerLaunchSpec(
+            handler=_raise_declared_fatal, job=job, task_ctx=ctx,
+            incarnation="declared.1", ipc_dir=ipc, timeout=60.0,
+        ))
+        res = ArtifactJournal(ipc).read_result("t::df", incarnation="declared.1")
+        assert res is not None, "worker 必须写结果文件"
+        assert res.get("status") == "fatal", (
+            f"声明 fatal 应分类为 fatal，got {res!r}"
+        )
+
+    def test_declared_transient_retries_then_completes(self, tmp_path):
+        """端到端：构造器声明的瞬态异常在 spawn 子进程触发重试并最终完成（不进 DLQ）。"""
+        marker = tmp_path / "declared.marker"
+        p = TaskLite(
+            name="declared_transient", state_dir=str(tmp_path), backend="sqlite",
+            transient_exceptions=(_DeclaredTransientError,),
+        )
+        p.register_handler("t", _declared_transient_flaky_handler)
+        p.enqueue([Job("t", "a", payload={"marker": str(marker)}, backoff_base=0.01)])
+        p.run()
+        failed = p.backend.load_failed()
+        wall = p.backend.load_wall()
+        assert "t::a" in wall, f"重试未发生或未成功: wall={wall} failed={failed}"
+        assert "t::a" not in failed
+        assert p.stats["retried"] >= 1, f"重试计数异常: {dict(p.stats)}"
+
+    def test_declared_fatal_settles_fatal_without_retry(self, tmp_path):
+        """端到端：构造器声明的 fatal 异常按 fatal 结算（零重试直达 DLQ）。"""
+        p = TaskLite(
+            name="declared_fatal", state_dir=str(tmp_path), backend="sqlite",
+            fatal_exceptions=(_DeclaredFatalError,),
+        )
+        p.register_handler("t", _declared_fatal_handler)
+        p.enqueue([Job("t", "a", backoff_base=0.01)])
+        p.run()
+        failed = p.backend.load_failed()
+        assert "t::a" in failed, failed
+        meta = failed["t::a"]
+        assert meta.get("fatal") is True, meta
+        assert meta.get("error_type") == "fatal", meta
+        assert p.stats["retried"] == 0, f"fatal 不得烧重试预算: {dict(p.stats)}"
+
+    def test_declared_and_registry_union_in_spawn(self, tmp_path):
+        """端到端：构造器声明与注册表两条路径并集生效，互不挤占。"""
+        marker_d = tmp_path / "union_declared.marker"
+        marker_r = tmp_path / "union_registry.marker"
+        p = TaskLite(
+            name="declared_union", state_dir=str(tmp_path), backend="sqlite",
+            transient_exceptions=(_DeclaredTransientError,),
+        )
+        p.register_transient_exception(_RegistrySideTransientError)
+        p.register_handler("d", _declared_transient_flaky_handler)
+        p.register_handler("r", _registry_transient_flaky_handler)
+        p.enqueue([
+            Job("d", "j1", payload={"marker": str(marker_d)}, backoff_base=0.01),
+            Job("r", "j2", payload={"marker": str(marker_r)}, backoff_base=0.01),
+        ])
+        p.run()
+        failed = p.backend.load_failed()
+        wall = p.backend.load_wall()
+        assert "d::j1" in wall and "r::j2" in wall, f"wall={wall} failed={failed}"
+        assert not failed
+
+    def test_undeclared_exception_keeps_default_unknown_dlq(self, tmp_path):
+        """基线：无任何声明时未声明异常维持默认启发式（unknown 直达 DLQ 零重试）。"""
+        p = TaskLite(name="undeclared", state_dir=str(tmp_path), backend="sqlite")
+        p.register_handler("t", _undeclared_error_handler)
+        p.enqueue([Job("t", "a", backoff_base=0.01)])
+        p.run()
+        failed = p.backend.load_failed()
+        assert "t::a" in failed, failed
+        meta = failed["t::a"]
+        assert "_UndeclaredError" in meta.get("error", ""), meta
+        assert meta.get("error_type") == "unknown", meta
+        assert not meta.get("fatal"), meta
+        assert p.stats["retried"] == 0, f"unknown 不得触发重试: {dict(p.stats)}"
+
+    def test_declared_tuple_rejects_unpicklable_class(self, tmp_path):
+        """声明元组随 ctx pickle 下发——局部类在构造期 fail-loud（与注册表入口同规）。"""
+        class _LocalTransient(Exception):
+            pass
+
+        with pytest.raises(TypeError, match="transient_exceptions"):
+            TaskLite(
+                name="bad_transient", state_dir=str(tmp_path), backend="memory",
+                transient_exceptions=(_LocalTransient,),
+            )
+        with pytest.raises(TypeError, match="fatal_exceptions"):
+            TaskLite(
+                name="bad_fatal", state_dir=str(tmp_path), backend="memory",
+                fatal_exceptions=(_LocalTransient,),
+            )
+
+
 
 # 中断资源清理与可观测性
 

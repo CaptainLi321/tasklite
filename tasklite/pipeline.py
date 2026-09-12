@@ -24,7 +24,11 @@ from .engine.console import OpsConsole
 from .engine.types import HandlerEntry
 from .models.context import TaskContext
 from .models.job import Job, WORKER_RESOURCE
-from .taxonomy import ErrorTaxonomy, validate_resource_amounts
+from .taxonomy import (
+    ErrorTaxonomy,
+    validate_declared_exception_classes,
+    validate_resource_amounts,
+)
 
 logger = logging.getLogger("tasklite")
 
@@ -154,6 +158,12 @@ class TaskLite:
             tuple(fatal_exceptions) if fatal_exceptions is not None else None)
         self._transient_exceptions: Optional[tuple] = (
             tuple(transient_exceptions) if transient_exceptions is not None else None)
+        # 声明元组随 ctx pickle 下发子进程——非 Exception / 不可 pickle 类
+        # 与注册表路径同规在构造期 fail-loud，不滞后到 spawn 派发才失败。
+        validate_declared_exception_classes(
+            self._fatal_exceptions, "fatal_exceptions")
+        validate_declared_exception_classes(
+            self._transient_exceptions, "transient_exceptions")
         self.taxonomy = ErrorTaxonomy(
             fatal_exceptions=self._fatal_exceptions,
             transient_exceptions=self._transient_exceptions,
