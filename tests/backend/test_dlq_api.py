@@ -271,6 +271,42 @@ class TestSeeding:
         with pytest.raises(ValueError, match="task_type::job_id"):
             p.seed_wall(["no-colon"])
 
+    def test_seed_wall_rejects_uid_already_in_failed(self, tmp_path):
+        """seed 已 failed 的 uid 被整体拒绝（wall/failed 全局互斥契约）。
+
+        seed 链路（console 预检 → backend 持久层 → 内存 state）双腿零写入：
+        静默覆盖会留下 wall∩failed 重叠，令后续派发的状态一致性断言崩溃；
+        DLQ 记录须先显式清除，不静默吞失败历史。
+        """
+        p = _pipeline(tmp_path)
+        p.register_handler("t", _ok_handler)
+        p.backend.append_failed("t::dlq_1", {"error": "boom"})
+
+        with pytest.raises(ValueError, match="already in failed"):
+            p.seed_wall(["t::dlq_1", "t::fresh"])
+
+        # 双腿零写入：持久层与内存 state 均不含种子，failed 记录原样保留
+        assert p.backend.load_wall() == {}
+        assert set(p.backend.load_failed()) == {"t::dlq_1"}
+        mem_state = p._runtime.store.state
+        assert "t::dlq_1" not in mem_state.wall
+        assert "t::fresh" not in mem_state.wall
+
+        # 互斥不变式成立：拒绝后正常派发不触发状态一致性断言
+        p.enqueue([Job("t", "fresh")])
+        p.run()
+        assert "t::fresh" in p.backend.load_wall()
+        assert not (set(p.backend.load_wall()) & set(p.backend.load_failed()))
+
+    def test_seed_wall_after_clear_dlq_succeeds(self, tmp_path):
+        """先显式清除 DLQ 再种子：合法存档迁移路径不受拒绝语义波及。"""
+        p = _pipeline(tmp_path)
+        p.backend.append_failed("t::dlq_1", {"error": "boom"})
+        assert p.clear_dlq() == 1
+        assert p.seed_wall(["t::dlq_1"]) == 1
+        assert p.backend.load_wall()["t::dlq_1"] == {}
+        assert set(p.backend.load_failed()) == set()
+
     def test_seed_cursor_readable_via_get_cursor(self, tmp_path):
         p = _pipeline(tmp_path)
         p.seed_cursor("progress", "2026-01-01")

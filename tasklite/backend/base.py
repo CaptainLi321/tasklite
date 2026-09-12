@@ -254,6 +254,9 @@ class AbstractStateBackend(ABC):
         用途：媒体/数据资产项目的存档迁移（硬链接 + wall 种子），
         不必裸 SQL INSERT 框架内部表。返回实际写入行数。
         幂等：已存在的 uid 被覆盖（meta 重置为空）。
+        不变式（wall/failed 全局互斥）：已在 failed 的 uid 拒绝种子——
+        冲突整体拒绝（零写入、抛 ValueError），不静默清除 DLQ 记录；
+        持久层与管理 API（OpsConsole.seed_wall）两层同契约。
         """
 
     @abstractmethod
