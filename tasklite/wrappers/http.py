@@ -547,22 +547,38 @@ class SnapshotStore:
     # urllib/httpx 风格: body/content）。files 等文件对象参数无法稳定序列化，不参与指纹。
     _BODY_KEY_PARAMS: Tuple[str, ...] = ("body", "content", "data", "json", "json_data")
 
-    @classmethod
-    def _body_fingerprint(cls, kwargs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-        """聚合全部 body 类请求参数，生成参与快照 key 的语义指纹。
+    @staticmethod
+    def _value_fingerprint(value: Any) -> str:
+        """单值指纹（单射）：类型前缀隔离不同形态，bytes 与同内容 str 零碰撞；
+        不可 JSON 化对象（含 NaN）退化 repr 指纹（进程内确定性），保底不同请求
+        不得静默共享快照。"""
+        if isinstance(value, (bytes, bytearray)):
+            return "bytes:" + bytes(value).hex()
+        try:
+            return "json:" + _json_dumps(value)
+        except (TypeError, ValueError):
+            return "repr:" + repr(value)
 
-        不变式（单射）：不同 body 参数组合必须映射到不同指纹——不能只取第一个非空
-        参数，须按参数名聚合全部已提供项；bytes 值带类型标记转 hex，避免与同内容
-        str 在 JSON 序列化后碰撞。
+    @classmethod
+    def _request_fingerprint(
+        cls,
+        args: Tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """聚合位置实参与 body 类关键字实参，生成参与快照 key 的语义指纹。
+
+        不变式（单射）：不同实参组合必须映射到不同指纹——位置实参按序号进入
+        arg{i} 命名空间（与 _BODY_KEY_PARAMS 参数名结构性不相交），body 类参数
+        按参数名聚合全部已提供项（不能只取第一个非空项）。
         """
         parts: Dict[str, Any] = {}
+        for idx, value in enumerate(args):
+            parts[f"arg{idx}"] = cls._value_fingerprint(value)
         for name in cls._BODY_KEY_PARAMS:
             value = kwargs.get(name)
             if value is None:
                 continue
-            parts[name] = (
-                {"__bytes_hex__": bytes(value).hex()} if isinstance(value, (bytes, bytearray)) else value
-            )
+            parts[name] = cls._value_fingerprint(value)
         return parts or None
 
     def has(self, key: str) -> bool:
@@ -604,7 +620,7 @@ class SnapshotStore:
         def wrapped(url: str, *args: Any, **kwargs: Any) -> HttpResponse:
             method = kwargs.get("method", "GET")
             params = kwargs.get("params", None)
-            body = self._body_fingerprint(kwargs)
+            body = self._request_fingerprint(args, kwargs)
 
             if key_func is not None:
                 key = key_func(url, *args, **kwargs)
