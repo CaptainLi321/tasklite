@@ -208,6 +208,35 @@ def test_http_guard_rate_limit_and_suspend() -> None:
     mock_ctx.suspend_resource.assert_called_once_with("api_twitter", 75.0)
 
 
+def test_http_guard_nested_inner_without_ctx_defers_suspension_to_outer() -> None:
+    """内层守卫无 ctx/resource 时不得置位 _suspended，挂起信号须由外层守卫落盘。
+
+    API_GUIDE 场景 4 官方组合（外层带 ctx 守卫 + store.cached(fetch_urllib)）：
+    fetch_urllib 的内层守卫 ctx=None，若其无条件置位 _suspended，外层会误判
+    「已挂起」而跳过 suspend_resource——限流闭环静默失效，管线全速猛打被限流 API。
+    """
+    ctx = _StrictSuspendCtx()
+    with pytest.raises(RateLimitHit):
+        with http_guard(ctx=ctx, resource="api_feed", default_suspend_ttl=60.0):
+            with http_guard(default_suspend_ttl=60.0):
+                raise RateLimitHit("HTTP 429 RateLimit hit")
+    assert ctx.calls == [("api_feed", 60.0)]
+
+
+def test_http_guard_nested_both_bound_suspends_exactly_once() -> None:
+    """内外层守卫均绑定 ctx/resource 时挂起信号恰好落盘一次（去重语义）。
+
+    _suspended 标志的唯一职责是向更外层守卫传播「挂起已完成」，防止同一
+    限流信号逐层重复下发 suspend_resource。
+    """
+    ctx = _StrictSuspendCtx()
+    with pytest.raises(RateLimitHit):
+        with http_guard(ctx=ctx, resource="api_outer", default_suspend_ttl=60.0):
+            with http_guard(ctx=ctx, resource="api_inner", default_suspend_ttl=30.0):
+                raise RateLimitHit("HTTP 429 RateLimit hit")
+    assert ctx.calls == [("api_inner", 30.0)]
+
+
 def test_http_guard_requests_style_retry_after_from_response() -> None:
     """requests 风格异常无 headers 属性，Retry-After 须从 exc_val.response.headers 提取。
 
@@ -560,6 +589,25 @@ def test_snapshot_cached_distinguishes_identity_headers() -> None:
     r_anon = cached_fetch("https://api.test/me")
     assert r_anon.text == "resp-anon"
     assert call_count == 3
+
+
+def test_snapshot_cached_wrapped_fetch_urllib_429_suspension_reaches_outer_guard(
+    local_http_server: str,
+) -> None:
+    """store.cached(fetch_urllib) 嵌套外层带 ctx 守卫时，429 挂起信号必须穿透内层落盘。
+
+    fetch_urllib 自带 ctx=None 内层守卫，该组合是 API_GUIDE 场景 4 的官方
+    推荐用法；挂起时长取自真实 Retry-After 响应头。
+    """
+    store = MemorySnapshotStore()
+    ctx = _StrictSuspendCtx()
+    cached_fetch = store.cached(fetch_urllib)
+
+    with pytest.raises(RateLimitHit):
+        with http_guard(ctx=ctx, resource="api_feed", default_suspend_ttl=60.0):
+            cached_fetch(f"{local_http_server}/429")
+
+    assert ctx.calls == [("api_feed", 15.0)]
 
 
 def test_snapshot_cached_skips_transient_statuses() -> None:
