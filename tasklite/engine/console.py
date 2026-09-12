@@ -28,6 +28,14 @@ class OpsConsole:
         self._store = store
         self._taxonomy = taxonomy
 
+    def set_backend(self, backend: AbstractStateBackend) -> None:
+        """重新绑定持久化后端（与 StateStore.set_backend 同步调用）。
+
+        不变式：凡持有后端引用的组件必须随换库同步重绑定，否则管理 API
+        静默读写旧库。
+        """
+        self._backend = backend
+
     # ── 只读查询 ──────────────────────────────────────────────────────
 
     def list_dlq(self) -> List[DLQEntry]:
