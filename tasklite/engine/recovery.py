@@ -65,8 +65,9 @@ class RecoveryOrchestrator:
         """加载期队列整理：磁盘合并重读 + 退避换算 + 过滤残留 + UID 去重，差量定向清理。
 
         1. 磁盘合并重读：捕获「load 之后、repair 期间」并发进程合法入队的
-           作业，补进本次 run 的内存队列（重读失败仅放弃合并并告警，清理
-           正确性不受影响；不基于重读结果做任何写盘）。
+           作业，补进本次 run 的内存队列；合并以磁盘真相序为权威序（窗口期
+           front 入队作业保持其磁盘队首位置，快照独有行让位队尾）。重读失败
+           仅放弃合并并告警，清理正确性不受影响；不基于重读结果做任何写盘。
         2. 退避换算：以 wall_deadline 换算为单调时钟 monotonic _backoff_until。
            monotonic 值跨进程/重启无意义（每次加载由持久化 wall_deadline
            重推导），保留行无需回写磁盘——这正是消除覆盖窗口的前提。
@@ -95,13 +96,23 @@ class RecoveryOrchestrator:
         clean_q = []
         dropped_uids: list = []
 
-        # 快照在前、磁盘重读在后：磁盘行与快照行的同 uid 重逢属合并预期内
-        # 的镜像行（快照必然先到并保首条），静默跳过；仅快照内部的真实重复
-        # 走告警分支（磁盘内重复被 uid 主键排除）——否则每次启动对队列每条
-        # 存量作业误报一条 duplicate，日志洪水淹没真实漂移信号。
-        snapshot_len = len(q_data)
+        # 合并以磁盘真相序为权威序（与 save_queue_crash_safe 的「磁盘独有行
+        # 补回队首」语义对齐）：窗口期他进程 front 入队的行保持其磁盘队首
+        # 位置，不得 append 到内存队尾后被停机落盘固化（磁盘/内存序分叉）。
+        # 镜像行（快照∩磁盘）经集合合并收敛、不进告警分支；快照独有行
+        # （窗口期被他进程消费的行）保底追加队尾维持 at-least-once，不丢行。
+        disk_uids: set = set()
+        merged_rows: list = []
+        for jd in disk_q:
+            u = uid_from_job_dict(jd)
+            if u not in disk_uids:  # uid 主键下磁盘重复不可达，防御性收敛
+                disk_uids.add(u)
+                merged_rows.append(jd)
+        for jd in q_data:
+            if uid_from_job_dict(jd) not in disk_uids:
+                merged_rows.append(jd)
 
-        for idx, jd in enumerate(list(q_data) + disk_q):
+        for jd in merged_rows:
             # 1. 退避换算（委托强类型 JobRuntimeState 对齐双时钟）
             rt_state = JobRuntimeState.from_dict(jd.get("runtime"))
             rt_state.align_wall_clock(now, wall_now)
@@ -122,11 +133,10 @@ class RecoveryOrchestrator:
                     dropped_uids.append(u)
                     continue
 
-            # 3. 去重（保留首条）。去重命中项不参与磁盘删除：uid 主键约束下
+            # 3. 去重（保留首条）。集合合并已收敛镜像行，此分支仅剩快照内部
+            # 的真实重复告警。去重命中项不参与磁盘删除：uid 主键约束下
             # 磁盘不存在重复行，按 uid 删除会连同保留首条一并误删。
             if u in seen_uid:
-                if idx >= snapshot_len:
-                    continue
                 logger.warning(
                     f"Loading duplicate uid {u} in queue; keeping first occurrence "
                     f"(dropping {len(clean_q)}-th)."

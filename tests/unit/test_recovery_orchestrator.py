@@ -218,6 +218,74 @@ class TestRecoveryOrchestratorRepairDuplicateWarning:
         assert [j["job_id"] for j in repaired] == ["j1"]
 
 
+class TestRecoveryOrchestratorRepairFrontPriority:
+    """repair 窗口期 front 入队的队首优先语义（磁盘真相序权威）。
+
+    窗口期他进程 front 入队的作业在磁盘真相中位于队首（seq 最小），合并
+    必须保持其磁盘位置而非 append 到内存队尾——否则队首优先失效，且随后
+    停机 crash-safe 落盘会把错误顺序固化到磁盘（磁盘/内存序分叉）。
+    """
+
+    def test_front_enqueued_during_window_keeps_head_position(self, tmp_path):
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([{"task_type": "t", "job_id": "k1"}])
+        q_data = backend.load_queue()
+        # 窗口期他进程 front 入队：磁盘真相中位于队首
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "front_job"}], front=True)
+
+        orchestrator = make_orchestrator(backend)
+        repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+        assert [j["job_id"] for j in repaired] == ["front_job", "k1"]
+
+        # 停机落盘固化验证：合并序写入 store 后经 crash-safe 落盘，磁盘序
+        # 不得被内存中的错误队尾 append 翻转
+        state = PipelineState(
+            backend.load_wall(),
+            backend.load_failed(),
+            backend.load_cursors(),
+            repaired,
+        )
+        orchestrator = make_orchestrator(backend, state=state)
+        orchestrator.save_queue_crash_safe()
+        assert [j["job_id"] for j in backend.load_queue()] == ["front_job", "k1"]
+
+    def test_back_enqueued_during_window_appends_after_existing(self, tmp_path):
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([{"task_type": "t", "job_id": "k1"}])
+        q_data = backend.load_queue()
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "tail_job"}])
+
+        orchestrator = make_orchestrator(backend)
+        repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+        assert [j["job_id"] for j in repaired] == ["k1", "tail_job"]
+
+    def test_snapshot_rows_missing_on_disk_are_kept_at_tail(self, tmp_path):
+        """快照独有行（窗口期被他进程消费）不丢行，但让位磁盘真相序队尾。"""
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([
+            {"task_type": "t", "job_id": "k1"},
+            {"task_type": "t", "job_id": "k2"},
+        ])
+        q_data = backend.load_queue()
+        # 窗口期他进程消费 k1（delta 删除），并 front 入队新作业
+        backend.delete_queue_uids(["t::k1"])
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "front_job"}], front=True)
+
+        orchestrator = make_orchestrator(backend)
+        repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+        assert [j["job_id"] for j in repaired] == ["front_job", "k2", "k1"]
+
+    def test_front_window_priority_aligned_on_memory_backend(self):
+        backend = InMemoryStateBackend()
+        backend.save_queue([{"task_type": "t", "job_id": "k1"}])
+        q_data = backend.load_queue()
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "front_job"}], front=True)
+
+        orchestrator = make_orchestrator(backend)
+        repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+        assert [j["job_id"] for j in repaired] == ["front_job", "k1"]
+
+
 class TestRecoveryOrchestratorCrashSafeSave:
     def test_crash_safe_save_recovers_missing_jobs_from_disk(self):
         backend = InMemoryStateBackend()
