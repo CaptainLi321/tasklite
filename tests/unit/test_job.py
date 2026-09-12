@@ -664,3 +664,26 @@ class TestJobRuntimeState:
         st = JobRuntimeState.from_dict(None)
         assert st.commit_failures == 0
         assert st.to_dict() == {}
+
+
+class TestOversizedIntNumberValidation:
+    """超出 float 范围的超大 int（如 10**400）走既有 ValueError 通道明确报错，
+    不得以裸 OverflowError 逃逸（ArithmeticError 子类会命中 FATAL 启发式）。"""
+
+    def test_job_number_fields_reject_oversized_int_as_value_error(self):
+        huge = 10 ** 400
+        for field in ("timeout", "backoff_base", "backoff_max"):
+            with pytest.raises(ValueError):
+                Job("t", "j", **{field: huge})
+
+    def test_runtime_state_and_suspend_resource_reject_oversized_int(self):
+        from tasklite.models.context import TaskContext
+
+        huge = 10 ** 400
+        # 持久化恢复容灾：溢出值按非有限降级为 None，与 NaN/inf 同路
+        st = JobRuntimeState.from_dict({"_backoff_until": huge, "_backoff_wall_deadline": huge})
+        assert st.backoff_until is None
+        assert st.backoff_wall_deadline is None
+        ctx = TaskContext(Job("t", "j"), set(), set(), {})
+        with pytest.raises(ValueError):
+            ctx.suspend_resource("api", huge)

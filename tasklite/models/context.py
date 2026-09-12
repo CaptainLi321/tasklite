@@ -270,7 +270,14 @@ class TaskContext:
             )
         if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
             raise TypeError(f"seconds must be a number, got {type(seconds).__name__} ({seconds!r})")
-        if not math.isfinite(seconds) or seconds <= 0:
+        # 超大 int（如 10**400）使 isfinite 转 float 溢出抛 OverflowError
+        # （ArithmeticError 子类，会命中 FATAL 启发式）——与非法值同路收敛
+        # 为 ValueError 明确报错，而非异常类型漂移
+        try:
+            finite = math.isfinite(seconds)
+        except OverflowError:
+            finite = False
+        if not finite or seconds <= 0:
             raise ValueError(f"seconds must be finite and > 0, got {seconds!r}")
         self.resource_suspensions.append((resource_name, seconds))
         if self._journal is not None:
