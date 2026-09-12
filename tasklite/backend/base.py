@@ -28,6 +28,29 @@ from ..taxonomy import (
 )
 
 
+def validate_queue_replacement(jobs: Any) -> None:
+    """整表替换集统一形状校验（save_queue / replace_queue_atomic 共用）。
+
+    契约：替换集必须是 job dict 的 list/tuple（与 load_queue 行形态一致）；
+    None（compute 漏写 return 的笔误形态）或非序列、元素非 dict 均属契约
+    违约，fail-loud 抛 TypeError。
+    不变式：双腿必须在任何写变（DELETE / 赋值）之前调用本校验——None 若
+    混过校验，SQLite 腿「DELETE 全表成功 + INSERT 全跳过」会静默清空整条
+    队列且事务正常提交，与 Memory 腿抛 TypeError 且队列原状形成行为分叉。
+    """
+    if not isinstance(jobs, (list, tuple)):
+        raise TypeError(
+            f"queue replacement must be a list of job dicts, "
+            f"got {type(jobs).__name__}"
+        )
+    for i, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            raise TypeError(
+                f"queue replacement item #{i} must be a job dict, "
+                f"got {type(job).__name__}"
+            )
+
+
 
 class AbstractStateBackend(ABC):
     """Abstract interface for pipeline state persistence.
@@ -57,6 +80,9 @@ class AbstractStateBackend(ABC):
         任何「先读磁盘真相再决定写什么」的合并保存（崩溃恢复路径）严禁
         直接调用本方法，必须走 ``replace_queue_atomic`` 把读-改-写收敛进
         单个写事务。
+
+        替换集经 ``validate_queue_replacement`` 在写变前校验：None / 非序列 /
+        元素非 dict 抛 TypeError，队列保持调用前状态（双腿一致）。
         """
 
     @abstractmethod
@@ -74,7 +100,9 @@ class AbstractStateBackend(ABC):
 
         ``compute`` 必须是纯计算（锁内执行，不得调用任何后端写方法，否则
         跨连接写请求会以写锁互斥死等）。单事务原子：``compute`` 抛异常或
-        写失败时整体回滚，磁盘保持调用前状态，异常向外传播。
+        写失败时整体回滚，磁盘保持调用前状态，异常向外传播。``compute``
+        返回的替换集经 ``validate_queue_replacement`` 在写变前校验（None /
+        非序列 / 元素非 dict 抛 TypeError，双腿一致，磁盘保持原状）。
         """
 
     @abstractmethod

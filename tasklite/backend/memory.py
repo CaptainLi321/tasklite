@@ -11,7 +11,11 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .base import AbstractStateBackend, classify_error_type
+from .base import (
+    AbstractStateBackend,
+    classify_error_type,
+    validate_queue_replacement,
+)
 from ..models.state import uid_from_job_dict
 
 logger = logging.getLogger("tasklite")
@@ -47,10 +51,13 @@ class InMemoryStateBackend(AbstractStateBackend):
     def _dedup_copy(self, jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """整表替换行的单一出口（save_queue 与 replace_queue_atomic 共用）。
 
+        替换集先经 ``validate_queue_replacement`` 校验（与 SQLite 腿同一出口、
+        同一时机——赋值之前 fail-loud，`_queue` 保持调用前状态）。
         保存兜底去重：重复 uid 保留首条 + 告警，与 SQLite 腿
         _rewrite_queue_rows 同语义；条目一律 deepcopy，杜绝外部可变别名
         穿透快照隔离。
         """
+        validate_queue_replacement(jobs)
         seen = set()
         clean = []
         for j in jobs:
