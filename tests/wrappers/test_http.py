@@ -424,6 +424,41 @@ def test_snapshot_cached_body_params_fingerprint() -> None:
     assert call_count == len(combos)
 
 
+def test_snapshot_cached_distinguishes_positional_args() -> None:
+    """以位置实参传参的请求必须各自真实发起，禁止静默命中同一快照。
+
+    默认 key 纳入 bind 后的全部位置实参（与关键字参数同权重）：
+    遗漏位置实参时 page-2 会零网络零告警地命中 page-1 的快照。
+    """
+    call_count = 0
+
+    def mock_fetch(url: str, *args: Any, **kwargs: Any) -> HttpResponse:
+        nonlocal call_count
+        call_count += 1
+        page = args[0] if args else "default"
+        return HttpResponse(status_code=200, headers={}, body=f"page-{page}".encode("utf-8"))
+
+    store = MemorySnapshotStore()
+    cached_fetch = store.cached(mock_fetch)
+
+    r1 = cached_fetch("https://api.test/list", 1)
+    r2 = cached_fetch("https://api.test/list", 2)
+    assert r1.text == "page-1"
+    assert r2.text == "page-2"
+    assert call_count == 2
+
+    # 相同位置实参命中快照，不再发起底层请求
+    cached_fetch("https://api.test/list", 1)
+    assert call_count == 2
+
+    # 位置实参与 body 类关键字实参组合语义各自独立，不得跨组合碰撞
+    cached_fetch("https://api.test/list", 1, data={"k": 1})
+    cached_fetch("https://api.test/list", 2, data={"k": 1})
+    assert call_count == 4
+    cached_fetch("https://api.test/list", 1, data={"k": 1})
+    assert call_count == 4
+
+
 def test_snapshot_cached_skips_transient_statuses() -> None:
     """429 与全部 5xx 属瞬态故障，保底不写入快照；ignore_statuses 仅可追加。"""
     store = MemorySnapshotStore()
