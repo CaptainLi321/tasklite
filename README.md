@@ -240,6 +240,7 @@ def fetch_handler(job, ctx):
 
 ```python
 import json
+from pathlib import Path
 from tasklite import TaskLite, Job, RateLimitResource
 
 def agent_worker(job: Job, ctx):
@@ -247,9 +248,10 @@ def agent_worker(job: Job, ctx):
     prompt = job.payload["prompt"]
     result = call_llm(prompt)
     
-    # 声明产物，失败时自动清理
-    out_file = ctx.declare_output(f"./results/{job.job_id}.json", cleanup_on_fail=True)
-    out_file.write_text(json.dumps(result, ensure_ascii=False))
+    # declare_output 返回解析后的绝对路径字符串（str），用 Path 包装后写文件，
+    # 保证写入位置与框架校验/清理位置一致
+    out_path = Path(ctx.declare_output(f"./results/{job.job_id}.json", cleanup_on_fail=True))
+    out_path.write_text(json.dumps(result, ensure_ascii=False))
     return True, {"tokens": result.get("usage", 0)}
 
 pipeline = TaskLite(name="agent_batch", state_dir="./agent_state", max_workers=8)
