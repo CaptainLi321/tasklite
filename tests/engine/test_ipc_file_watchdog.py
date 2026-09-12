@@ -294,23 +294,23 @@ class TestStaleResultRestore:
 # ══════════════════════════════════════════════════════════════════════
 
 
-class TestSignalsFileTruncateSemantics:
-    def test_read_signals_truncates_before_unlink(self, tmp_path, monkeypatch):
-        """unlink 失败时残留信号文件必须已截空。
+class TestSignalsFileDrainSemantics:
+    def test_read_signals_no_reconsumption_when_unlink_refused(
+        self, tmp_path, monkeypatch,
+    ):
+        """unlink 失败时被摘除 inode 已脱离规范名，下轮 drain 不重复消费。
 
-        增量消费信号文件保障并发追加不丢失：
-        丢失。返工版读后先 seek(0)+truncate(0) 再删——本用例模拟 unlink
-        被拒，断言：a) 本轮信号完整读出；b) 残留文件为空（下轮 drain 不
-        重复消费）。注意 open 必须是 "r+"——只读模式 truncate 抛
-        io.UnsupportedOperation（OSError 子类）会被静默吞掉沦为死代码。
+        摘除式排空：先以原子 rename 把信号文件摘出规范名再读——unlink 被
+        拒时残留的只是摘除后的临时名，规范路径已不存在，下轮排空读不到
+        任何重复信号。旧「读后 seek(0)+truncate(0) 再删」机制正是「读后
+        truncate 抹写并发追加」丢信号窗口本体，已由摘除式读取取代；本用例
+        锁定其替换语义：a) 本轮信号完整读出；b) 规范名消失、二次排空为空。
         """
         journal = ArtifactJournal(tmp_path)
         journal.record_signal("t::x", "api", 30.0)
         journal.record_signal("t::x", "db", 60.0)
 
-        leftover = journal.signals_path("t::x")
-
-        real_unlink_ref = leftover # noqa: F841（可读性：被测文件即下方断言对象）
+        canonical = journal.signals_path("t::x")
 
         def refusing_unlink(self, *a, **k):
             raise OSError("permission denied (simulated)")
@@ -318,10 +318,9 @@ class TestSignalsFileTruncateSemantics:
         monkeypatch.setattr(Path, "unlink", refusing_unlink)
         got = journal.drain_signals("t::x")
         assert ("api", 30.0) in got and ("db", 60.0) in got
-        assert leftover.stat().st_size == 0, (
-            f"截空失败，size={leftover.stat().st_size}——truncate 死代码复发"
-        )
- # 截空后二次读取为空（不重复消费）
+        assert not canonical.exists(), "规范名必须已被 rename 摘除"
+        monkeypatch.undo()
+        # 二次读取为空（不重复消费）
         assert journal.drain_signals("t::x") == []
 
     def test_drain_stale_prefers_latest_incarnation_same_instant(

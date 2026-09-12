@@ -356,36 +356,47 @@ class ArtifactJournal:
         return outputs
 
     def drain_signals(self, uid: str) -> List[Tuple[str, float]]:
-        """读取并删除一个 job 的 suspend 信号文件（排空语义）。"""
+        """读取并删除一个 job 的 suspend 信号文件（排空语义）。
+
+        不变式：先以原子 rename 把信号文件摘出命名空间，再读摘除后的稳定
+        inode——活跃 worker 的 O_APPEND 追加要么落在 rename 前的旧 inode
+        （本次读得），要么经按名新建落入同名新文件（下轮排空读得）。
+        「读后 truncate 抹写」与「unlink 后按名写孤儿 inode」两类丢失窗口
+        由该摘除序消除；残余窗口仅剩「worker 持旧 inode 的未落盘写跨过
+        rename 且在读取 EOF 之后才 flush」，已收窄至微秒级。
+        """
         if self.ipc_dir is None:
             return []
         path = self.signals_path(uid)
+        # 摘除名须与原文件同目录（同文件系统是 rename 原子性的前提）
+        draining = path.with_name(
+            f"{path.name}.{os.getpid()}.{time.monotonic_ns()}.draining"
+        )
+        try:
+            os.rename(path, draining)
+        except OSError:
+            return []
         signals: List[Tuple[str, float]] = []
         try:
-            if path.exists():
-                with open(path, "r+", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            data = loads(line)
-                            if isinstance(data, dict) and "suspend" in data:
-                                r_name, secs = data["suspend"]
-                                signals.append((r_name, float(secs)))
-                        except (json.JSONDecodeError, TypeError, ValueError):
-                            continue
+            with open(draining, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
-                        f.seek(0)
-                        f.truncate(0)
-                    except OSError:
-                        pass
-                try:
-                    path.unlink()
-                except (FileNotFoundError, OSError):
-                    pass
+                        data = loads(line)
+                        if isinstance(data, dict) and "suspend" in data:
+                            r_name, secs = data["suspend"]
+                            signals.append((r_name, float(secs)))
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        continue
         except OSError:
             pass
+        finally:
+            try:
+                draining.unlink()
+            except OSError:
+                pass
         return signals
 
     def read_result(

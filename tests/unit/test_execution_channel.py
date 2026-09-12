@@ -151,3 +151,90 @@ class TestExecutionChannelAbortInFlight:
         assert len(outcome.cancelled) == 1
         assert outcome.cancelled[0].uid == job2.uid
 
+    def test_abort_salvages_signal_written_before_kill(self, tmp_path):
+        """杀进程后补排空：「先排空后杀」窗口内终前写入的 suspend 信号捞回。
+
+        受控注入：stub 进程在 kill() 时向信号文件追加一条信号（模拟 worker
+        在上层预排空之后、被终止之前落盘的 suspend）。abort 的最终排空必须
+        把它带回 AbortOutcome.salvaged_signals，且不得被随后的半成品清理
+        一并删除（旧实现 cancelled 分支直接清 IPC 文件，信号静默丢失）。
+        """
+        channel = ExecutionChannel(tmp_path)
+        job = Job("task", "j9")
+
+        class KillWritingProcess:
+            """kill() 时写入 suspend 信号的 stub：确定性复现终前写窗口。"""
+
+            def __init__(self):
+                self._alive = True
+
+            def is_alive(self):
+                return self._alive
+
+            def kill(self):
+                self._alive = False
+                channel.journal.record_signal(job.uid, "gpu", 30.0)
+
+            def join(self, timeout=None):
+                pass
+
+        h = ExecutionHandle(
+            uid=job.uid, process=KillWritingProcess(),
+            deadline=time.monotonic() + 10, timeout=10, job=job,
+            ipc_dir=str(tmp_path), incarnation="inc9",
+        )
+
+        outcome = channel.abort_in_flight([h])
+
+        assert [h.uid for h in outcome.cancelled] == [job.uid]
+        assert outcome.salvaged_signals == [(job.uid, "gpu", 30.0)]
+        # 信号已被消费带走，半成品清理照常执行（不留残留文件）
+        assert not channel.journal.signals_path(job.uid).exists()
+
+    def test_abort_reprobe_completed_merges_post_drain_signals(self, tmp_path):
+        """重探测完成分支：终前写入的结果与信号都被消费。
+
+        stub 进程在 kill() 时同时写结果文件与 suspend 信号（worker 终前
+        恰好完成的时序）。重探测按结果分类为已完成，最终排空捞回的信号
+        并入 ExecutionResult.resource_suspensions（与常规收割路径
+        _collect_outcome 的 salvage 行为对齐），随 complete_job 提交链应用。
+        """
+        import json
+
+        channel = ExecutionChannel(tmp_path)
+        job = Job("task", "j10")
+
+        class FinishOnKillProcess:
+            """kill() 时写最终结果 + suspend 信号的 stub。"""
+
+            def __init__(self):
+                self._alive = True
+
+            def is_alive(self):
+                return self._alive
+
+            def kill(self):
+                self._alive = False
+                channel.journal.write_result_atomic(
+                    job.uid,
+                    {"status": "success", "raw_result": {"done": 1}},
+                    incarnation="inc10",
+                )
+                channel.journal.record_signal(job.uid, "api", 5.0)
+
+            def join(self, timeout=None):
+                pass
+
+        h = ExecutionHandle(
+            uid=job.uid, process=FinishOnKillProcess(),
+            deadline=time.monotonic() + 10, timeout=10, job=job,
+            ipc_dir=str(tmp_path), incarnation="inc10",
+        )
+
+        outcome = channel.abort_in_flight([h])
+
+        assert [h.uid for h, _ in outcome.completed] == [job.uid]
+        assert outcome.completed[0][1].success is True
+        assert outcome.completed[0][1].resource_suspensions == [("api", 5.0)]
+        assert outcome.salvaged_signals == []
+

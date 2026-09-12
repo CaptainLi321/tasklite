@@ -380,9 +380,15 @@ class WorkerLaunchSpec:
 
 @dataclass(frozen=True)
 class AbortOutcome:
-    """强制终止/异常停机时的收尾结果。"""
+    """强制终止/异常停机时的收尾结果。
+
+    salvaged_signals：杀进程后补排空捞回的 (uid, resource, seconds)——
+    cancelled 任务的信号文件已随半成品清理删除，其 suspend 信号只能经
+    本列表带回上层应用（suspend 的 max 语义保证重复应用幂等）。
+    """
     completed: List[Tuple[JobHandle, ExecutionResult]]
     cancelled: List[JobHandle]
+    salvaged_signals: List[Tuple[str, str, float]] = field(default_factory=list)
 
 
 class ExecutionChannel:
@@ -627,6 +633,11 @@ class ExecutionChannel:
         if pending_handles:
             self.finalize_processes(pending_handles)
 
+        # 杀进程后补排空（不变式：收尾排空必须晚于进程终止）。abort 序列
+        # 「先排空后杀」窗口内 worker 终生前写入的 suspend 信号，唯一可靠
+        # 捞回点是进程死亡后的最终排空（无并发写者，排空无损）；缺此步时
+        # cancelled 分支的半成品清理会把信号文件连同信号一起删除。
+        salvaged: List[Tuple[str, str, float]] = []
         truly_cancelled: List[JobHandle] = []
         for h in pending_handles:
             incarnation = getattr(h, "incarnation", None)
@@ -640,12 +651,28 @@ class ExecutionChannel:
                     and raw_res.get("status") != "interrupted"
                 ):
                     decoded = _decode_ipc_result(raw_res, None, h.job, self.ipc_dir)
+                    try:
+                        decoded.resource_suspensions = (
+                            list(decoded.resource_suspensions)
+                            + self.journal.drain_signals(h.uid)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to salvage signals for {h.uid}: {e}")
                     done_pairs.append((h, decoded))
                     continue
+            try:
+                for r_name, secs in self.journal.drain_signals(h.uid):
+                    salvaged.append((h.uid, r_name, secs))
+            except Exception as e:
+                logger.warning(f"Failed to salvage signals for {h.uid}: {e}")
             self.cleanup_artifacts(h.uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
             truly_cancelled.append(h)
 
-        return AbortOutcome(completed=done_pairs, cancelled=truly_cancelled)
+        return AbortOutcome(
+            completed=done_pairs,
+            cancelled=truly_cancelled,
+            salvaged_signals=salvaged,
+        )
 
     def cleanup_in_flight(self, handles: Sequence[JobHandle]) -> None:
         """主循环异常退出时 kill + join 所有残留 in-flight 子进程并清理 IPC。"""
