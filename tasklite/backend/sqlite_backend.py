@@ -594,11 +594,28 @@ class SQLiteStateBackend(AbstractStateBackend):
         """把 uid 批量写入 wall（meta 空 dict）——存档迁移标记「已处理」。
 
         幂等：已存在的 uid 被覆盖（meta 重置为空）。
+        不变式：wall/failed 全局互斥——已在 failed_dlq 的 uid 拒绝种子；
+        冲突检查与写入收敛进同一 ``BEGIN IMMEDIATE`` 写事务（先取写锁再读，
+        详见 _get_conn），冲突时零写入（整体拒绝），不静默清除 DLQ 记录。
         """
         if not uids:
             return 0
+        unique_uids = list(dict.fromkeys(uids))
         try:
             with self._get_conn() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                placeholders = ','.join('?' * len(unique_uids))
+                conflict = sorted(
+                    row[0] for row in conn.execute(
+                        f'SELECT uid FROM failed_dlq WHERE uid IN ({placeholders})',
+                        unique_uids,
+                    )
+                )
+                if conflict:
+                    raise ValueError(
+                        f"seed_wall refuses uid(s) already in failed: {conflict}; "
+                        f"wall/failed must stay disjoint"
+                    )
                 cur = conn.executemany(
                     'INSERT OR REPLACE INTO wall (uid, payload) VALUES (?, ?)',
                     [(u, dumps({})) for u in uids],

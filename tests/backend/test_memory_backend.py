@@ -472,3 +472,43 @@ class TestQueueReplacementShapeValidation:
 
         b.save_queue([])
         assert b.load_queue() == []
+
+
+class TestSeedWallFailedMutualExclusion:
+    """seed_wall 拒绝已存在 failed 的 uid（wall/failed 全局互斥，两后端同契约）。
+
+    seed 链路若静默覆盖会留下 wall∩failed 重叠：下一次派发时状态一致性
+    断言崩溃、配合崩溃恢复形成重启循环。语义定为整体拒绝（零写入）——
+    DLQ 记录须先经 delete_failed/clear_dlq 显式清除，静默清除会丢失败历史。
+    """
+
+    def test_seed_wall_rejects_uid_already_in_failed(self, dual_backend):
+        b = dual_backend
+        b.append_failed("t::x", {"error": "boom"})
+
+        with pytest.raises(ValueError, match="already in failed"):
+            b.seed_wall(["t::x"])
+
+        # 零写入：拒绝后 wall 不含该 uid，failed 记录原样保留
+        assert "t::x" not in b.load_wall()
+        assert "t::x" in b.load_failed()
+
+    def test_seed_wall_conflict_is_atomic_no_partial_write(self, dual_backend):
+        """冲突批次整体拒绝：batch 内非冲突 uid 亦不得部分写入。"""
+        b = dual_backend
+        b.append_failed("t::bad", {"error": "boom"})
+
+        with pytest.raises(ValueError, match="already in failed"):
+            b.seed_wall(["t::ok1", "t::bad", "t::ok2"])
+
+        assert set(b.load_wall()) == set()
+        assert "t::bad" in b.load_failed()
+
+    def test_seed_wall_fresh_uid_unaffected(self, dual_backend):
+        """正常 seed（无 failed 冲突）行为不变：幂等覆盖写入。"""
+        b = dual_backend
+        assert b.seed_wall(["t::fresh1", "t::fresh2"]) == 2
+        assert set(b.load_wall()) == {"t::fresh1", "t::fresh2"}
+        # 幂等：重复 seed 仍成功（meta 重置为空）
+        assert b.seed_wall(["t::fresh1"]) == 1
+        assert b.load_wall()["t::fresh1"] == {}

@@ -310,7 +310,18 @@ class InMemoryStateBackend(AbstractStateBackend):
             return count
 
     def seed_wall(self, uids: List[str]) -> int:
+        """把 uid 批量写入 wall（meta 空 dict）。
+
+        不变式：wall/failed 全局互斥——已在 failed 的 uid 拒绝种子；
+        先查后写（同锁内），冲突整体拒绝、零写入，不静默清除 DLQ 记录。
+        """
         with self._lock:
+            conflict = sorted({u for u in uids if u in self._failed})
+            if conflict:
+                raise ValueError(
+                    f"seed_wall refuses uid(s) already in failed: {conflict}; "
+                    f"wall/failed must stay disjoint"
+                )
             count = 0
             for u in uids:
                 self._wall[u] = {}
