@@ -19,6 +19,16 @@ _MAX_SAFE_UID_BYTES = 199
 WORKER_RESOURCE = "__workers__"
 
 
+def _is_finite(value: Any) -> bool:
+    """math.isfinite 的溢出安全版：超出 float 范围的超大 int（如 10**400）
+    转换溢出抛 OverflowError（ArithmeticError 子类，会命中 FATAL 启发式），
+    此处按「非有限」收敛，交由调用方既有 ValueError/TypeError 通道明确报错。"""
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def inject_worker_resource(job_dict: dict) -> None:
     """给 job_dict 的 resources 注入默认 worker 槽位。"""
     resources = dict(job_dict.get("resources", {}))
@@ -80,7 +90,7 @@ class JobRuntimeState:
             self.backoff_wall_deadline is not None
             and isinstance(self.backoff_wall_deadline, (int, float))
             and not isinstance(self.backoff_wall_deadline, bool)
-            and math.isfinite(self.backoff_wall_deadline)
+            and _is_finite(self.backoff_wall_deadline)
         ):
             if self.backoff_wall_deadline > wall_now:
                 self.backoff_until = monotonic_now + (self.backoff_wall_deadline - wall_now)
@@ -145,14 +155,14 @@ class JobRuntimeState:
         raw_bu = _pop_val("_backoff_until", "backoff_until")
         backoff_until = (
             float(raw_bu)
-            if isinstance(raw_bu, (int, float)) and not isinstance(raw_bu, bool) and math.isfinite(raw_bu)
+            if isinstance(raw_bu, (int, float)) and not isinstance(raw_bu, bool) and _is_finite(raw_bu)
             else None
         )
 
         raw_wd = _pop_val("_backoff_wall_deadline", "backoff_wall_deadline")
         backoff_wall_deadline = (
             float(raw_wd)
-            if isinstance(raw_wd, (int, float)) and not isinstance(raw_wd, bool) and math.isfinite(raw_wd)
+            if isinstance(raw_wd, (int, float)) and not isinstance(raw_wd, bool) and _is_finite(raw_wd)
             else None
         )
 
@@ -201,13 +211,13 @@ class JobRuntimeState:
         if key in ("_backoff_until", "backoff_until"):
             self.backoff_until = (
                 float(value)
-                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and _is_finite(value)
                 else None
             )
         elif key in ("_backoff_wall_deadline", "backoff_wall_deadline"):
             self.backoff_wall_deadline = (
                 float(value)
-                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and _is_finite(value)
                 else None
             )
         elif key in ("_commit_failures", "commit_failures"):
@@ -413,7 +423,7 @@ class Job:
             raise TypeError(
                 f"timeout must be a number, got {type(timeout).__name__} ({timeout!r})"
             )
-        if not math.isfinite(timeout) or timeout <= 0:
+        if not _is_finite(timeout) or timeout <= 0:
             raise ValueError(f"timeout must be finite and > 0, got {timeout}")
         # backoff_base/backoff_max 与 timeout 的校验对称——
         # 仅 math.isfinite + < 0 不够：字符串 "2.0" 抛原始 TypeError
@@ -422,7 +432,7 @@ class Job:
             raise TypeError(
                 f"backoff_base must be a number, got {type(backoff_base).__name__} ({backoff_base!r})"
             )
-        if not math.isfinite(backoff_base) or backoff_base < 0:
+        if not _is_finite(backoff_base) or backoff_base < 0:
             raise ValueError(
                 f"backoff_base must be finite and non-negative, got {backoff_base}"
             )
@@ -430,7 +440,7 @@ class Job:
             raise TypeError(
                 f"backoff_max must be a number, got {type(backoff_max).__name__} ({backoff_max!r})"
             )
-        if not math.isfinite(backoff_max) or backoff_max < 0:
+        if not _is_finite(backoff_max) or backoff_max < 0:
             raise ValueError(
                 f"backoff_max must be finite and non-negative, got {backoff_max}"
             )
