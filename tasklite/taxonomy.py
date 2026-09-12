@@ -167,15 +167,19 @@ class ErrorClassification:
         return meta
 
 
-def _validate_transient_class(exception_cls: type) -> None:
-    """注册入口校验（fail-loud）——per-pipeline 注册表与外部直调共用。"""
+def _validate_policy_exception_class(exception_cls: type, api_name: str) -> None:
+    """异常分类声明入口校验（fail-loud）——注册表与构造器元组两条声明路径共用。
+
+    不变式：声明类必须可 pickle——分类决策在 spawn 子进程发生，
+    声明元组随 ctx pickle 下发，非模块级类会让 spawn 派发整体失败。
+    """
     if not isinstance(exception_cls, type) or not issubclass(exception_cls, Exception):
         raise TypeError(
-            f"register_transient_exception requires an Exception subclass, got {exception_cls!r}"
+            f"{api_name} requires an Exception subclass, got {exception_cls!r}"
         )
     if issubclass(exception_cls, (RetryError, FatalError)):
         raise TypeError(
-            f"register_transient_exception cannot register a "
+            f"{api_name} cannot register a "
             f"{'RetryError' if issubclass(exception_cls, RetryError) else 'FatalError'} "
             f"subclass ({exception_cls!r}) — these have dedicated except branches "
             f"that bypass the registry; registration would silently no-op."
@@ -185,9 +189,26 @@ def _validate_transient_class(exception_cls: type) -> None:
         pickle.dumps(exception_cls)
     except (pickle.PicklingError, AttributeError, TypeError) as e:
         raise TypeError(
-            f"register_transient_exception requires a module-level (picklable) "
+            f"{api_name} requires a module-level (picklable) "
             f"Exception class for spawn-subprocess propagation, got {exception_cls!r}: {e}"
         ) from e
+
+
+def _validate_transient_class(exception_cls: type) -> None:
+    """注册入口校验（fail-loud）——per-pipeline 注册表与外部直调共用。"""
+    _validate_policy_exception_class(exception_cls, "register_transient_exception")
+
+
+def validate_declared_exception_classes(
+    classes: Optional[Sequence[type]], param_name: str
+) -> None:
+    """构造器声明的 fatal/transient 异常元组入口校验（fail-loud）。
+
+    与注册表路径同规：非 Exception / RetryError-FatalError 子类 /
+    不可 pickle 类在构造期即拒绝，而非滞后到 spawn 派发才失败。
+    """
+    for exception_cls in tuple(classes) if classes is not None else ():
+        _validate_policy_exception_class(exception_cls, param_name)
 
 
 class ErrorTaxonomy:
@@ -759,6 +780,16 @@ class ErrorTaxonomy:
         """exc 是否命中注册表。"""
         return any(isinstance(exc, cls) for cls in self._registry)
 
+    @property
+    def fatal_exceptions(self) -> Tuple[Type[BaseException], ...]:
+        """已解析 fatal 启发式元组（构造器声明或内置默认）——派发侧下发子进程的唯一读口。"""
+        return self._fatal_exceptions
+
+    @property
+    def transient_exceptions(self) -> Tuple[Type[BaseException], ...]:
+        """已解析 transient 启发式元组（构造器声明或内置默认）——派发侧下发子进程的唯一读口。"""
+        return self._transient_exceptions
+
 
 class TransientRegistry:
     """瞬态异常注册表向后兼容门面（底层统一委托 ErrorTaxonomy）。"""
@@ -867,6 +898,7 @@ __all__ = [
     "_DEFAULT_TAXONOMY",
     # 模块级工具函数
     "_validate_transient_class",
+    "validate_declared_exception_classes",
     "validate_resource_amounts",
     "validate_payload",
     "classify_error_type",

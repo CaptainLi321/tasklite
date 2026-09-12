@@ -349,6 +349,11 @@ class DispatchMachine:
                     output_root=self._output_root,
                     ipc_dir=self._ipc_dir,
                     transient_registry=self._taxonomy.snapshot(),
+                    # 构造器声明的 fatal/transient 启发式元组同一契约随 ctx
+                    # 下发（取已解析形态，与注册表快照在 worker 侧并集生效）；
+                    # 元组与注册表同源于本 taxonomy 实例，父子两侧分类语义一致。
+                    fatal_exceptions=self._taxonomy.fatal_exceptions,
+                    transient_exceptions=self._taxonomy.transient_exceptions,
                     # 资源名注册集快照随 ctx 下发——
                     # suspend_resource 对未注册名 fail-loud（typo 不静默失效）。
                     resource_names=frozenset(self._resources),
