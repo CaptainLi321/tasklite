@@ -208,6 +208,52 @@ def test_http_guard_rate_limit_and_suspend() -> None:
     mock_ctx.suspend_resource.assert_called_once_with("api_twitter", 75.0)
 
 
+def test_http_guard_requests_style_retry_after_from_response() -> None:
+    """requests 风格异常无 headers 属性，Retry-After 须从 exc_val.response.headers 提取。
+
+    遗漏该回退时，requests.HTTPError 携带的 Retry-After 被静默丢弃，
+    挂起时长退化为 default_suspend_ttl。
+    """
+
+    class _RequestsStyleHTTPError(Exception):
+        """模拟官方 requests.HTTPError：仅携带 response，无 headers 属性。"""
+
+        def __init__(self, response: Any) -> None:
+            super().__init__("429 Too Many Requests")
+            self.response = response
+
+    class _Response:
+        status_code = 429
+        headers = {"Retry-After": "20"}
+
+    ctx = _StrictSuspendCtx()
+    with pytest.raises(RateLimitHit):
+        with http_guard(ctx=ctx, resource="api_x", default_suspend_ttl=60.0):
+            raise _RequestsStyleHTTPError(_Response())
+    assert ctx.calls == [("api_x", 20.0)]
+
+
+def test_default_suspend_ttl_construction_validation() -> None:
+    """default_suspend_ttl 构造期 fail-loud：非数值 TypeError，非有限/非正值 ValueError。
+
+    坏配置必须在构造期暴露，而非延迟到 429 命中时才在守卫 __exit__ 内
+    以 ValueError 替换限流信号。
+    """
+    with pytest.raises(TypeError):
+        http_guard(default_suspend_ttl="60")
+    with pytest.raises(TypeError):
+        HttpExecutor(default_suspend_ttl=True)
+    with pytest.raises(ValueError):
+        http_guard(default_suspend_ttl=0)
+    with pytest.raises(ValueError):
+        HttpExecutor(default_suspend_ttl=-1.0)
+    with pytest.raises(ValueError):
+        http_guard(default_suspend_ttl=float("inf"))
+    # 合法值构造通过
+    assert http_guard(default_suspend_ttl=1.5).default_suspend_ttl == 1.5
+    assert HttpExecutor(default_suspend_ttl=90).default_suspend_ttl == 90.0
+
+
 def test_http_guard_transient_and_fatal() -> None:
     # 500 转换为 RetryError
     with pytest.raises(RetryError):
@@ -286,6 +332,27 @@ def test_snapshot_store_make_key() -> None:
     k3 = SnapshotStore.make_key("https://api.test/v1", method="POST", body=b'{"payload": 1}')
     k4 = SnapshotStore.make_key("https://api.test/v1", method="POST", body=b'{"payload": 2}')
     assert k3 != k4
+
+
+def test_make_key_identity_headers_injective() -> None:
+    """快照 key 的身份头段：凭证头变化必改 key，易变头不影响，与 body 段无歧义拼接。"""
+    k_base = SnapshotStore.make_key("https://api.test/a")
+    k_cookie = SnapshotStore.make_key("https://api.test/a", headers={"Cookie": "sid=1"})
+    assert k_base != k_cookie
+
+    # 归一化：header 名大小写不影响 key
+    assert SnapshotStore.make_key("https://api.test/a", headers={"cookie": "sid=1"}) == k_cookie
+    # 白名单外易变头不参与指纹
+    assert SnapshotStore.make_key("https://api.test/a", headers={"User-Agent": "ua"}) == k_base
+    # url / body / 身份头三维组合互不碰撞
+    keys = {
+        k_base,
+        k_cookie,
+        SnapshotStore.make_key("https://api.test/a", body=b"x"),
+        SnapshotStore.make_key("https://api.test/a", body=b"x", headers={"Cookie": "sid=1"}),
+        SnapshotStore.make_key("https://api.test/a", body=b"x", headers={"Cookie": "sid=2"}),
+    }
+    assert len(keys) == 5
 
 
 def test_sqlite_snapshot_store_crud(tmp_path: Path) -> None:
@@ -457,6 +524,42 @@ def test_snapshot_cached_distinguishes_positional_args() -> None:
     assert call_count == 4
     cached_fetch("https://api.test/list", 1, data={"k": 1})
     assert call_count == 4
+
+
+def test_snapshot_cached_distinguishes_identity_headers() -> None:
+    """换 Cookie/Authorization 后不得命中旧身份的快照（身份头纳入 key 指纹）。
+
+    取舍：仅凭证/协商类头参与指纹，白名单外易变头（User-Agent 等）不参与——
+    纳入全量 headers 会把同语义请求碎片化，摧毁命中率。
+    """
+    call_count = 0
+
+    def mock_fetch(url: str, headers: Any = None, **kwargs: Any) -> HttpResponse:
+        nonlocal call_count
+        call_count += 1
+        who = "anon"
+        if headers:
+            h = dict(headers)
+            who = str(h.get("Authorization") or h.get("Cookie") or "anon").replace(" ", "")
+        return HttpResponse(status_code=200, headers={}, body=f"resp-{who}".encode("utf-8"))
+
+    store = MemorySnapshotStore()
+    cached_fetch = store.cached(mock_fetch)
+
+    r1 = cached_fetch("https://api.test/me", headers={"Authorization": "Bearer token-a"})
+    r2 = cached_fetch("https://api.test/me", headers={"Authorization": "Bearer token-b"})
+    assert r1.text == "resp-Bearertoken-a"
+    assert r2.text == "resp-Bearertoken-b"
+    assert call_count == 2
+
+    # 白名单外易变头变化不触发重新请求（同 key 命中）
+    cached_fetch("https://api.test/me", headers={"Authorization": "Bearer token-a", "User-Agent": "x"})
+    assert call_count == 2
+
+    # 无凭证头与携带凭证头 key 不同
+    r_anon = cached_fetch("https://api.test/me")
+    assert r_anon.text == "resp-anon"
+    assert call_count == 3
 
 
 def test_snapshot_cached_skips_transient_statuses() -> None:
