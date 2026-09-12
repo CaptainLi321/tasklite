@@ -224,6 +224,17 @@ class InMemoryStateBackend(AbstractStateBackend):
             self._queue = [j for j in self._queue if uid_from_job_dict(j) != uid]
             return True
 
+    def delete_queue_uids(self, uids: List[str]) -> int:
+        """按 uid 定向批量删除队列条目，与 SQLite 腿同语义：不触碰其余条目。"""
+        if not uids:
+            return 0
+        with self._lock:
+            del_set = set(uids)
+            kept = [j for j in self._queue if uid_from_job_dict(j) not in del_set]
+            removed = len(self._queue) - len(kept)
+            self._queue = kept
+            return removed
+
     def get_meta(self, key: str) -> Optional[str]:
         with self._lock:
             return self._meta.get(key)
