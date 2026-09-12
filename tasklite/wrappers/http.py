@@ -558,7 +558,10 @@ class SnapshotStore:
             headers: 请求头 Mapping（仅身份头白名单参与指纹）。
 
         Returns:
-            str: 规范化的请求键。
+            str: 规范化的请求键。params 非空时附加类型前缀指纹段：
+            norm_query 以 str(v) 镜像线上 URL 形态，但 str() 强转是多对一映射
+            （None 与 "None" 同串），且 requests 后端对 None 参数直接丢弃，
+            线上请求不同而 key 相同会静默串快照。
         """
         clean_url = url.strip()
         parsed = urllib.parse.urlparse(clean_url)
@@ -590,8 +593,9 @@ class SnapshotStore:
             body_hash = f"_{hashlib.sha256(raw_bytes).hexdigest()[:16]}"
 
         url_component = sanitize_job_component(norm_url)
+        params_hash = SnapshotStore._params_fingerprint(params)
         header_hash = SnapshotStore._identity_headers_fingerprint(headers)
-        return f"{norm_method}::{url_component}{body_hash}{header_hash}"
+        return f"{norm_method}::{url_component}{body_hash}{params_hash}{header_hash}"
 
     # 纳入快照 key 的身份头白名单：仅取真正改变响应语义的凭证/协商头。
     # 取舍：不纳入全量 headers——User-Agent/Accept-Encoding/Date 等易变头会把
@@ -624,6 +628,23 @@ class SnapshotStore:
         if not present:
             return ""
         return "::h" + hashlib.sha256(_json_dumps(present).encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def _params_fingerprint(cls, params: Any) -> str:
+        """params 指纹段（单射）：值统一经 _value_fingerprint 类型前缀出口。
+
+        不变式：同一 params 映射的不同序列化形态不得共享快照 key——None 与
+        "None" 的 str() 强转同串，但 requests 后端对 None 参数直接丢弃，
+        线上请求实际不同。排序后序列化以消除 dict 插入顺序差异（_json_dumps
+        不做键排序，直接序列化整个映射会使同语义映射因顺序不同而 key 漂移）。
+        """
+        if not params:
+            return ""
+        try:
+            items = sorted((str(k), cls._value_fingerprint(v)) for k, v in dict(params).items())
+        except (TypeError, ValueError):
+            return ""
+        return "::p" + hashlib.sha256(_json_dumps(items).encode("utf-8")).hexdigest()[:16]
 
     # 参与 key 语义指纹的 body 类参数名（requests: data/json；本仓库 fetch_requests: json_data；
     # urllib/httpx 风格: body/content）。files 等文件对象参数无法稳定序列化，不参与指纹。
