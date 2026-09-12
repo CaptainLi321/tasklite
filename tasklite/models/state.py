@@ -311,6 +311,14 @@ class PipelineState:
 
     # 内部 ---------------------------------------------------------
 
+    def _rerun_exempt_uids_from_queue(self) -> set:
+        """从 queue 事实源直接取重跑豁免集合，不依赖派生缓存
+        ``_rerun_active_uids``（缓存被瞬态路径误删时断言不得误报）。"""
+        return {
+            uid_from_job_dict(j) for j in self._queue
+            if j.get("rerun") in ("every_run", "on_failure", "on_input_change")
+        }
+
     def _assert_uids_consistent(self) -> None:
         """DEBUG 不变式：_queue_uids 与 _queue 完全一致。"""
         recomputed = {uid_from_job_dict(j) for j in self._queue}
@@ -334,17 +342,18 @@ class PipelineState:
             f"uid in both queue and in_flight: {overlap!r} "
             f"(queue={self._queue_uids!r} in_flight={self._in_flight_uids!r})"
         )
+        exempt = self._rerun_active_uids | self._rerun_exempt_uids_from_queue()
         done_overlap = (set(self._wall) | set(self._failed)) & self._in_flight_uids
-        assert not (done_overlap - self._rerun_active_uids), (
-            f"uid in wall/failed and in_flight: {done_overlap - self._rerun_active_uids!r}"
+        assert not (done_overlap - exempt), (
+            f"uid in wall/failed and in_flight: {done_overlap - exempt!r}"
         )
         wall_failed = set(self._wall) & set(self._failed)
         assert not wall_failed, (
             f"uid in both wall and failed: {wall_failed!r}"
         )
         done_queue = (set(self._wall) | set(self._failed)) & self._queue_uids
-        assert not (done_queue - self._rerun_active_uids), (
-            f"uid in wall/failed and queue: {done_queue - self._rerun_active_uids!r}"
+        assert not (done_queue - exempt), (
+            f"uid in wall/failed and queue: {done_queue - exempt!r}"
         )
         self._assert_uids_consistent()
         self._assert_terminal_uids_consistent()
