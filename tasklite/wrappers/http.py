@@ -537,6 +537,28 @@ class SnapshotStore:
         url_component = sanitize_job_component(norm_url)
         return f"{norm_method}::{url_component}{body_hash}"
 
+    # 参与 key 语义指纹的 body 类参数名（requests: data/json；本仓库 fetch_requests: json_data；
+    # urllib/httpx 风格: body/content）。files 等文件对象参数无法稳定序列化，不参与指纹。
+    _BODY_KEY_PARAMS: Tuple[str, ...] = ("body", "content", "data", "json", "json_data")
+
+    @classmethod
+    def _body_fingerprint(cls, kwargs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """聚合全部 body 类请求参数，生成参与快照 key 的语义指纹。
+
+        不变式（单射）：不同 body 参数组合必须映射到不同指纹——不能只取第一个非空
+        参数，须按参数名聚合全部已提供项；bytes 值带类型标记转 hex，避免与同内容
+        str 在 JSON 序列化后碰撞。
+        """
+        parts: Dict[str, Any] = {}
+        for name in cls._BODY_KEY_PARAMS:
+            value = kwargs.get(name)
+            if value is None:
+                continue
+            parts[name] = (
+                {"__bytes_hex__": bytes(value).hex()} if isinstance(value, (bytes, bytearray)) else value
+            )
+        return parts or None
+
     def has(self, key: str) -> bool:
         """检查是否存在有效快照。"""
         raise NotImplementedError
@@ -568,7 +590,7 @@ class SnapshotStore:
         Args:
             fetch_fn: 底层网络请求函数。
             key_func: 自定义 Key 生成函数（默认使用 make_key）。
-            ignore_statuses: 不写入快照的状态码（默认忽略 429 与 5xx 故障）。
+            ignore_statuses: 额外不写入快照的状态码（429 与全部 5xx 始终保底跳过）。
 
         Returns:
             Callable: 包装后的缓存函数。
@@ -576,7 +598,7 @@ class SnapshotStore:
         def wrapped(url: str, *args: Any, **kwargs: Any) -> HttpResponse:
             method = kwargs.get("method", "GET")
             params = kwargs.get("params", None)
-            body = kwargs.get("data") or kwargs.get("json") or kwargs.get("body")
+            body = self._body_fingerprint(kwargs)
 
             if key_func is not None:
                 key = key_func(url, *args, **kwargs)
@@ -609,7 +631,9 @@ class SnapshotStore:
                 else:
                     raw_body = str(res).encode("utf-8")
 
-            if status_code not in ignore_statuses:
+            # 不变式：429 与全部 5xx 属瞬态故障，保底不写入快照（防离线重放污染）；
+            # ignore_statuses 仅可在此基础上追加豁免状态码，不可收缩保底谓词。
+            if not (status_code == 429 or status_code >= 500 or status_code in ignore_statuses):
                 self.put(
                     key=key,
                     url=url,

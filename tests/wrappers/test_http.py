@@ -297,6 +297,102 @@ def test_snapshot_store_cached_decorator(tmp_path: Path) -> None:
     assert fetch_count == 1
 
 
+def test_snapshot_cached_distinguishes_json_data_posts() -> None:
+    """同 URL 不同 json_data 的 POST 必须各发一次真实网络请求（Body 单射哈希契约）。
+
+    json_data 是 fetch_requests 的 JSON 请求体参数名，若未纳入快照 key，
+    不同 JSON 体将共享同一 key 并静默命中首个请求的响应。
+    """
+    request_count = {"n": 0}
+
+    class _CountingHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_len = int(self.headers.get("Content-Length", 0))
+            post_body = self.rfile.read(content_len)
+            request_count["n"] += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"echo_len": ' + str(len(post_body)).encode() + b'}')
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), _CountingHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        store = MemorySnapshotStore()
+        cached_fetch = store.cached(fetch_requests)
+
+        r1 = cached_fetch(f"{base_url}/api", method="POST", json_data={"action": "a"})
+        r2 = cached_fetch(f"{base_url}/api", method="POST", json_data={"action": "another-with-longer-body"})
+        assert request_count["n"] == 2
+        assert r1.json()["echo_len"] != r2.json()["echo_len"]
+
+        # 相同 json_data 重放命中快照，不再发网络请求
+        r3 = cached_fetch(f"{base_url}/api", method="POST", json_data={"action": "a"})
+        assert request_count["n"] == 2
+        assert r3.json()["echo_len"] == r1.json()["echo_len"]
+    finally:
+        server.shutdown()
+
+
+def test_snapshot_cached_body_params_fingerprint() -> None:
+    """快照 key 的 body 指纹须按参数名聚合全部 body 类参数，混用互不碰撞。"""
+    store = MemorySnapshotStore()
+    call_count = 0
+
+    def mock_fetch(url: str, **kwargs: Any) -> HttpResponse:
+        nonlocal call_count
+        call_count += 1
+        return HttpResponse(status_code=200, headers={}, body=f"resp-{call_count}".encode("utf-8"))
+
+    cached_fetch = store.cached(mock_fetch)
+
+    # 同 URL 下不同 body 参数组合（含同内容 bytes 与 str）语义不同，key 不得碰撞
+    combos: list = [
+        {"data": {"k": 1}},
+        {"json": {"k": 1}},
+        {"json_data": {"k": 1}},
+        {"body": {"k": 1}},
+        {"data": {"k": 1}, "json_data": {"k": 2}},
+        {"data": b"raw-bytes"},
+        {"data": "raw-bytes"},
+    ]
+    for combo in combos:
+        cached_fetch("https://api.test/post", method="POST", **combo)
+    assert call_count == len(combos)
+
+    # 完全相同的参数组合命中快照
+    cached_fetch("https://api.test/post", method="POST", data={"k": 1})
+    assert call_count == len(combos)
+
+
+def test_snapshot_cached_skips_transient_statuses() -> None:
+    """429 与全部 5xx 属瞬态故障，保底不写入快照；ignore_statuses 仅可追加。"""
+    store = MemorySnapshotStore()
+
+    def mock_fetch(url: str, **kwargs: Any) -> HttpResponse:
+        return HttpResponse(status_code=int(kwargs["status"]), headers={}, body=b"err")
+
+    # ignore_statuses 传空元组，验证 429 与离散集遗漏的 5xx（如 501/511）同样被保底谓词拦截
+    cached_fetch = store.cached(mock_fetch, ignore_statuses=())
+    for status in (429, 500, 501, 511, 530):
+        resp = cached_fetch("https://api.test/flaky", method="GET", status=status)
+        assert resp.status_code == status
+        assert store.has(store.make_key("https://api.test/flaky", method="GET")) is False
+
+    # 正常响应仍写入快照
+    def ok_fetch(url: str, **kwargs: Any) -> HttpResponse:
+        return HttpResponse(status_code=200, headers={}, body=b"ok")
+
+    cached_ok = store.cached(ok_fetch, ignore_statuses=())
+    cached_ok("https://api.test/ok")
+    assert store.has(store.make_key("https://api.test/ok", method="GET")) is True
+
+
 # ==============================================================================
 # 6. 内置 fetch_urllib 与 本地 HTTP 服务测试
 # ==============================================================================
