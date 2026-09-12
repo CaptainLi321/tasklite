@@ -75,6 +75,17 @@ class DeadlockGovernor:
         self.dep_grace_missing = None
         self.deadlock_gap_rounds = 0
 
+    def _end_grace_episode(self) -> None:
+        """终结当前宽限 episode（deadline 与缺失集快照一并清除）。
+
+        不变式：宽限裁决一旦给出 False（超时或无潜在 spawner），episode 即
+        告终结——过期 deadline 严禁泄漏进后续 episode，否则同缺失依赖
+        （同 uid 集合，如 retry 原样 requeue）的新等待者继承过期 deadline
+        被零宽限立即误判死锁 DLQ，即使面对全新 spawner 也无等待机会。
+        """
+        self.dep_grace_deadline = None
+        self.dep_grace_missing = None
+
     def check_dependency_grace(
         self,
         state: PipelineState,
@@ -117,6 +128,7 @@ class DeadlockGovernor:
         # 若调度器已单趟给出潜在 spawner 裁决，直接复用事实（避免二次扫描队列及重复反序列化）
         if has_potential_spawners is not None:
             if not has_potential_spawners:
+                self._end_grace_episode()
                 return False
             deadline = self.dep_grace_deadline
             if deadline is None:
@@ -129,6 +141,7 @@ class DeadlockGovernor:
                 )
             if now_mono < deadline:
                 return True
+            self._end_grace_episode()
             logger.error(
                 f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
                 f"still waiting on missing deps after "
@@ -160,6 +173,7 @@ class DeadlockGovernor:
                     )
                 if now_mono < deadline:
                     return True
+                self._end_grace_episode()
                 logger.error(
                     f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
                     f"still waiting on missing deps after "
