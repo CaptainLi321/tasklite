@@ -148,3 +148,67 @@ def test_deadlock_governor_arbitrate(tmp_path):
     assert "t::a" in d_cycle.failed_uids
     assert mock_store.apply_bulk_failure.called
 
+
+
+def test_deadlock_governor_grace_episode_ends_on_expiry():
+    """宽限超时即终结 episode：过期 deadline 不泄漏进同缺失集的新等待者。
+
+    同缺失依赖（同 uid 集合，如 retry 原样 requeue）的新等待者面对全新
+    spawner 时必须获得全新宽限，不得继承已过期 deadline 被零宽限立即
+    误判死锁 DLQ。
+    """
+    gov = DeadlockGovernor(dep_grace_seconds=5.0)
+    state = PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[
+            Job("t", "b", depends_on=["t::x"]).to_dict(),
+            Job("t", "sp").to_dict(),
+        ],
+    )
+
+    # episode 1：授予宽限并到期
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=106.0) is False
+    assert gov.dep_grace_deadline is None
+    assert gov.dep_grace_missing is None
+
+    # episode 2：同缺失集的新等待者 + 全新 spawner → 全新宽限（非零宽限误判）
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=107.0) is True
+    assert gov.dep_grace_deadline == 112.0
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=110.0) is True
+
+
+def test_deadlock_governor_grace_episode_ends_on_no_spawner():
+    """无潜在 spawner 的立即裁决同样终结 episode，重启后重新授予完整宽限。"""
+    gov = DeadlockGovernor(dep_grace_seconds=5.0)
+    state = PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[Job("t", "b", depends_on=["t::x"]).to_dict()],
+    )
+
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=False, now=101.0) is False
+    assert gov.dep_grace_deadline is None
+    assert gov.dep_grace_missing is None
+
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=102.0) is True
+    assert gov.dep_grace_deadline == 107.0
+
+
+def test_deadlock_governor_grace_expiry_clears_deadline_fallback_path():
+    """兼容回退路径（无 spawner 快道事实）的超时裁决同样终结 episode。"""
+    gov = DeadlockGovernor(dep_grace_seconds=5.0)
+    state = PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[
+            Job("t", "b", depends_on=["t::x"]).to_dict(),
+            Job("t", "sp").to_dict(),
+        ],
+    )
+
+    assert gov.check_dependency_grace(state, ["t::b"], now=100.0) is True
+    assert gov.check_dependency_grace(state, ["t::b"], now=106.0) is False
+    assert gov.dep_grace_deadline is None
+    # 同缺失集新 episode 重新授予完整宽限
+    assert gov.check_dependency_grace(state, ["t::b"], now=107.0) is True
+    assert gov.dep_grace_deadline == 112.0
