@@ -850,11 +850,15 @@ class HttpExecutor:
                     res = target_fn(*args, **kwargs)
                     g.check_response(res)
                     return res
+            except (RateLimitHit, FatalError):
+                # 不变式：RateLimitHit 是 RetryError 子类，必须先于 RetryError 匹配。
+                # 限流等待唯一交由引擎挂起收敛（不烧预算、全管线休眠），本地不得
+                # 就地微退避重试限流端点——既无视 Retry-After，又逐 attempt 重复
+                # 下发挂起信号。
+                raise
             except RetryError:
                 if attempt >= self.max_retries:
                     raise
-            except (RateLimitHit, FatalError):
-                raise
         raise RetryError(f"Request retries exhausted ({self.max_retries} retries)")
 
     def wrap(self, fetch_fn: Callable[..., Any]) -> Callable[..., Any]:
