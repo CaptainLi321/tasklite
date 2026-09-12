@@ -111,6 +111,16 @@ def test_content_fingerprint_deterministic_and_version_salted():
     assert len(a) == 16
 
 
+def test_content_fingerprint_rejects_type_and_delimiter_collisions():
+    # 跨型隔离：逐项 str() 强转使 1 与 "1" 不可区分，类型标记后必不同
+    assert content_fingerprint([1, "2"]) != content_fingerprint(["1", 2])
+    # 定界符注入隔离：项内 \x00 不得伪装项边界
+    assert content_fingerprint(["a\x00"]) != content_fingerprint(["a", ""])
+    assert content_fingerprint(["a\x00s:b"]) != content_fingerprint(["a", "b"])
+    # dict 项按键排序，插入序无关
+    assert content_fingerprint([{"a": 1, "b": 2}]) == content_fingerprint([{"b": 2, "a": 1}])
+
+
 def test_sanitize_job_component_delegation_and_invariants():
     assert sanitize_job_component("a::b/c\\d") == "a%3A%3Ab%2Fc%5Cd"
     assert sanitize_job_component("") == EMPTY_SENTINEL
