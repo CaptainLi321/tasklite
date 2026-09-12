@@ -717,8 +717,8 @@ def scrape_profile_handler(job, ctx):
 #### 场景 4：组合流 —— 离线快照 + 429 资源守卫 + 增量发现（Discovery）
 
 ```python
-from tasklite import TaskLite, RateLimitResource
-from tasklite.wrappers.discovery import register_discovery, sanitize_content_id
+from tasklite import TaskLite, Job, RateLimitResource
+from tasklite.wrappers.discovery import register_discovery
 from tasklite.wrappers.http import SQLiteSnapshotStore, http_guard, fetch_urllib
 
 pipeline = TaskLite("discovery_pipeline", state_dir="./states")
@@ -726,21 +726,41 @@ pipeline.add_resource(RateLimitResource("api_feed", interval_seconds=1.0))
 store = SQLiteSnapshotStore("./snapshots.db")
 cached_fetch = store.cached(fetch_urllib)
 
-def fetch_feed_page(page: int, ctx=None):
+# 全部回调必须为模块级可 pickle 函数——lambda/闭包在注册期即被
+# pickle 预检拒绝（spawn 子进程隔离约束）。
+def fetch_feed_page(job, ctx, page):
+    # 框架从 page=1 起逐页调用本函数；返回空列表表示页尾
     url = f"https://api.example.com/feed?page={page}"
     with http_guard(ctx=ctx, resource="api_feed"):
         resp = cached_fetch(url)
         return resp.json().get("items", [])
 
+def feed_item_id(item):
+    return str(item["id"])
+
+def process_feed_item(job, ctx, item, content_id):
+    # content_id 已由框架单射净化，直接用作子任务 job_id（与已见判定
+    # f"{process_task_type}::{content_id}" 同源，保证整页命中可终止）
+    ctx.spawn(Job("process_item", content_id, payload=item))
+
+def process_item_handler(job, ctx):
+    # process 子任务业务体：重试 / DLQ / wall 去重全套生效
+    return {"processed": job.job_id}
+
 register_discovery(
-    host=pipeline,
+    pipeline,
     task_type="discover_feed",
     fetch_func=fetch_feed_page,
-    id_func=lambda item: str(item["id"]),
-    process_item_func=lambda item, ctx: ctx.spawn(pipeline.create_job("process_item", job_id=sanitize_content_id(str(item["id"])), payload=item)),
+    id_func=feed_item_id,
+    process_item_func=process_feed_item,
     process_task_type="process_item",
     default_resources={"api_feed": 1.0},
 )
+pipeline.register_handler("process_item", process_item_handler)
+
+# 固定 uid 入队发现任务——discovery 默认 rerun="every_run"，每会话自动重扫
+pipeline.enqueue(Job("discover_feed", "feed", payload={}))
+pipeline.run()
 ```
 
 
