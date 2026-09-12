@@ -75,23 +75,28 @@ def test_crash_safe_save_dedups_double_requeue(pipeline_sqlite):
     )
 
 
-def test_crash_safe_save_load_failure_preserves_disk(pipeline_sqlite, monkeypatch):
-    """load_queue 失败时不得用空列表覆盖磁盘——磁盘上「已 commit 但
-    内存未同步」的作业会在此次保存中被永久抹除。pre-fix：disk_q=[] 兜底 →
-    save_queue(内存) 覆盖 → 磁盘队列被清空/截断。修复：跳过覆盖保留磁盘真相。"""
+def test_crash_safe_save_backend_failure_preserves_disk(pipeline_sqlite, monkeypatch):
+    """保存原语失败时不得覆盖磁盘——磁盘上「已 commit 但内存未同步」的
+    作业会在覆盖保存中被永久抹除。失败必须整体回滚保持磁盘原状并降级
+    告警（不打断停机收尾），内存独有作业由下次启动的 at-least-once 重扫
+    吸收；保存路径严禁退化为独立 load/save 两段式整表覆盖。"""
     p = pipeline_sqlite
     job = Job("t", "a", payload={})
     p.enqueue([job])
 
     orig_load = p.backend.load_queue  # monkeypatch 前保存原始读法（断言用）
-    calls = []
-    monkeypatch.setattr(p.backend, "save_queue", lambda q: calls.append(list(q)))
-    monkeypatch.setattr(p.backend, "load_queue", lambda: (_ for _ in ()).throw(IOError("disk read error")))
+    save_calls = []
+    monkeypatch.setattr(p.backend, "save_queue", lambda q: save_calls.append(list(q)))
+
+    def _boom(compute):
+        raise IOError("backend io failure")
+
+    monkeypatch.setattr(p.backend, "replace_queue_atomic", _boom)
 
     p._runtime._recovery.save_queue_crash_safe()
 
-    assert calls == [], f"load 失败不得触发覆盖保存: {calls}"
-    # 磁盘原样保留（enqueue 落盘仍在，load 失败未覆盖）——用原始读法绕开 patch
+    assert save_calls == [], f"保存失败不得经 save_queue 覆盖: {save_calls}"
+    # 磁盘原样保留（enqueue 落盘仍在，保存失败未覆盖）——用原始读法绕开 patch
     disk_uids = [uid_from_job_dict(jd) for jd in orig_load()]
     assert job.uid in disk_uids
 

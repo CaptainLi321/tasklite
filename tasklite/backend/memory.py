@@ -9,7 +9,7 @@ import copy
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .base import AbstractStateBackend, classify_error_type
 from ..models.state import uid_from_job_dict
@@ -44,18 +44,36 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             return copy.deepcopy(self._queue)
 
+    def _dedup_copy(self, jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """整表替换行的单一出口（save_queue 与 replace_queue_atomic 共用）。
+
+        保存兜底去重：重复 uid 保留首条 + 告警，与 SQLite 腿
+        _rewrite_queue_rows 同语义；条目一律 deepcopy，杜绝外部可变别名
+        穿透快照隔离。
+        """
+        seen = set()
+        clean = []
+        for j in jobs:
+            u = uid_from_job_dict(j)
+            if u in seen:
+                logger.warning(f"save_queue: duplicate uid {u} dropped (kept first).")
+                continue
+            seen.add(u)
+            clean.append(copy.deepcopy(j))
+        return clean
+
     def save_queue(self, jobs: List[Dict[str, Any]]) -> None:
         with self._lock:
-            seen = set()
-            clean = []
-            for j in jobs:
-                u = uid_from_job_dict(j)
-                if u in seen:
-                    logger.warning(f"save_queue: duplicate uid {u} dropped (kept first).")
-                    continue
-                seen.add(u)
-                clean.append(copy.deepcopy(j))
-            self._queue = clean
+            self._queue = self._dedup_copy(jobs)
+
+    def replace_queue_atomic(
+        self,
+        compute: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]],
+    ) -> None:
+        with self._lock:
+            # 锁内读真相 → 纯计算 → 替换：compute 抛异常时 _queue 赋值
+            # 未发生，队列保持调用前状态（对齐 SQLite 腿事务回滚）。
+            self._queue = self._dedup_copy(compute(copy.deepcopy(self._queue)))
 
     def _build_dlq_meta(self, meta: Optional[dict], prev: Any) -> Dict[str, Any]:
         """计算 DLQ 行终值（纯函数，不变更任何状态）：_attempt 计数 + error_type + failed_at。

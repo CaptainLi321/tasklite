@@ -685,6 +685,64 @@ class TestSQLiteBackendRobustness:
         assert q[0]["retries"] == 1
 
 
+class TestReplaceQueueAtomicWriteTransaction:
+    """replace_queue_atomic 的写事务收敛契约（SQLite 腿特有）。
+
+    不变式：磁盘真相读取、compute 合并、写回都在同一 BEGIN IMMEDIATE
+    写事务内——并发方（跨进程 enqueue/commit）要么先于本事务提交（进入
+    磁盘真相、参与合并），要么排队等事务提交后再落盘，绝无中间态覆盖。
+    """
+
+    def test_compute_runs_inside_write_transaction(self, tmp_path):
+        """compute 执行期间写锁必须已被本事务持有。
+
+        用零 busy-timeout 的探针连接尝试 BEGIN IMMEDIATE：拿到锁 = 本事务
+        未持锁（读-改-写存在无锁窗口，缺陷结构）；立即 busy 失败 = 窗口
+        已被写事务消除。确定性判定，不依赖真实多进程竞速。
+        """
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([Job("t", "k1").to_dict()])
+        observed = {}
+
+        def compute(disk_q):
+            probe = sqlite3.connect(backend.path, timeout=0.0)
+            try:
+                probe.execute('BEGIN IMMEDIATE')
+                observed["lock_free"] = True
+                probe.rollback()
+            except sqlite3.OperationalError:
+                observed["lock_free"] = False
+            finally:
+                probe.close()
+            return disk_q
+
+        backend.replace_queue_atomic(compute)
+
+        assert observed["lock_free"] is False, (
+            "compute 期间他进程连接必须拿不到写锁（读-改-写已收敛进写事务）"
+        )
+
+    def test_replace_raises_and_preserves_disk_on_corrupted_payload(self, tmp_path):
+        """读阶段失败（队列行损坏）→ 异常传播 + 整体回滚保持磁盘原状，
+        compute 不获得执行机会（杜绝以部分真相继续合并/覆盖）。"""
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([Job("t", "k1").to_dict()])
+        with sqlite3.connect(backend.path) as conn:
+            conn.execute("UPDATE queue SET job_data = 'not-json'")
+            conn.commit()
+
+        compute_called = []
+        with pytest.raises(Exception):
+            backend.replace_queue_atomic(
+                lambda disk_q: compute_called.append(disk_q) or []
+            )
+
+        assert compute_called == []
+        with sqlite3.connect(backend.path) as conn:
+            rows = conn.execute("SELECT job_data FROM queue").fetchall()
+        assert rows == [("not-json",)], "读失败必须回滚，磁盘行原样保留"
+
+
 # ============================================================
 # PipelineState (mutable container) tests
 # ============================================================

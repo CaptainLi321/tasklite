@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .base import AbstractStateBackend, classify_error_type
 from ..models.state import uid_from_job_dict
@@ -237,34 +237,64 @@ class SQLiteStateBackend(AbstractStateBackend):
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Corrupted queue payload in {self.path.name}: {e}") from e
 
-    def save_queue(self, jobs: List[Dict[str, Any]]) -> None:
-        """全量重写队列（bootstrap / 崩溃恢复用，罕见 O(N)）。
+    def _rewrite_queue_rows(self, conn, jobs: List[Dict[str, Any]]) -> None:
+        """queue 表整表重写的单一出口（save_queue 与 replace_queue_atomic 共用）。
 
         保存兜底去重：传入重复 uid 时保留首条 + 告警（而非 REPLACE 静默
         覆盖为最后一条）——与加载期去重策略一致，杜绝 `_queue_uids` set 与
-        queue list 的漂移。
+        queue list 的漂移。调用方必须已持写事务（显式或隐式）。
+        """
+        conn.execute('DELETE FROM queue')
+        if jobs:
+            seen: set = set()
+            rows = []
+            for i, j in enumerate(jobs):
+                u = uid_from_job_dict(j)
+                if u in seen:
+                    logger.warning(
+                        f"save_queue: duplicate uid {u} dropped (kept first)."
+                    )
+                    continue
+                seen.add(u)
+                rows.append((u, len(rows), dumps(j)))
+            conn.executemany(
+                'INSERT OR REPLACE INTO queue (uid, seq, job_data) VALUES (?, ?, ?)',
+                rows,
+            )
+
+    def save_queue(self, jobs: List[Dict[str, Any]]) -> None:
+        """全量重写队列（测试装配 / replace_queue_atomic 事务内步骤，罕见 O(N)）。
+
+        红线：无读基准的整表覆盖——崩溃恢复路径的「合并保存」严禁直接
+        调用本方法（读-改-写窗口会抹除窗口期他进程已应答的入队），
+        必须经 replace_queue_atomic 收敛进单个写事务。
         """
         try:
             with self._get_conn() as conn:
-                conn.execute('DELETE FROM queue')
-                if jobs:
-                    seen: set = set()
-                    rows = []
-                    for i, j in enumerate(jobs):
-                        u = uid_from_job_dict(j)
-                        if u in seen:
-                            logger.warning(
-                                f"save_queue: duplicate uid {u} dropped (kept first)."
-                            )
-                            continue
-                        seen.add(u)
-                        rows.append((u, len(rows), dumps(j)))
-                    conn.executemany(
-                        'INSERT OR REPLACE INTO queue (uid, seq, job_data) VALUES (?, ?, ?)',
-                        rows,
-                    )
+                self._rewrite_queue_rows(conn, jobs)
         except Exception as e:
             logger.critical(f"Failed to save queue to {self.path.name}: {e}")
+            raise
+
+    def replace_queue_atomic(
+        self,
+        compute: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]],
+    ) -> None:
+        try:
+            with self._get_conn() as conn:
+                # 读-改-写事务纪律：先取写锁再读磁盘真相，compute 与写回
+                # 同事务——并发 enqueue 要么先于本事务提交（进入磁盘真相、
+                # 参与合并），要么等本事务提交后再落盘，绝无中间态覆盖。
+                conn.execute('BEGIN IMMEDIATE')
+                disk_q = [
+                    loads(row[0])
+                    for row in conn.execute(
+                        'SELECT job_data FROM queue ORDER BY seq ASC'
+                    )
+                ]
+                self._rewrite_queue_rows(conn, compute(disk_q))
+        except Exception as e:
+            logger.critical(f"Failed to replace queue atomically in {self.path.name}: {e}")
             raise
 
     def enqueue_jobs(self, jobs: List[Dict[str, Any]], *, front: bool = False) -> List[str]:
