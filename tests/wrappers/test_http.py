@@ -746,6 +746,49 @@ def test_snapshot_cached_distinguishes_params_value_types() -> None:
     assert call_count == 2
 
 
+def test_snapshot_cached_distinguishes_cookies_and_auth_identity() -> None:
+    """cookies/auth 关键字实参变化必须各发真实请求，禁止跨身份静默命中同一快照。
+
+    身份经 kwargs 而非请求头传递（requests 风格 session.request 的
+    cookies=/auth=）时同样改变响应语义，必须与身份头白名单同机制进入指纹，
+    否则换身份方零网络消耗地拿到旧身份的响应。
+    """
+    call_count = 0
+
+    def mock_fetch(url: str, **kwargs: Any) -> HttpResponse:
+        nonlocal call_count
+        call_count += 1
+        who = (kwargs.get("cookies") or {}).get("session", "anon")
+        return HttpResponse(status_code=200, headers={}, body=f"resp-{who}".encode("utf-8"))
+
+    store = MemorySnapshotStore()
+    cached_fetch = store.cached(mock_fetch)
+
+    r_alice = cached_fetch("https://api.test/me", cookies={"session": "alice"})
+    r_bob = cached_fetch("https://api.test/me", cookies={"session": "bob"})
+    assert call_count == 2
+    assert r_alice.text == "resp-alice"
+    assert r_bob.text == "resp-bob"
+
+    # 相同 cookies 身份命中快照
+    cached_fetch("https://api.test/me", cookies={"session": "alice"})
+    assert call_count == 2
+
+    # auth 变化同样隔离身份，且与 cookies 维度互不碰撞
+    cached_fetch("https://api.test/me", auth=("user", "pw-a"))
+    cached_fetch("https://api.test/me", auth=("user", "pw-b"))
+    cached_fetch("https://api.test/me", cookies={"session": "alice"}, auth=("user", "pw-a"))
+    assert call_count == 5
+    cached_fetch("https://api.test/me", auth=("user", "pw-a"))
+    cached_fetch("https://api.test/me", cookies={"session": "alice"}, auth=("user", "pw-a"))
+    assert call_count == 5
+
+    # 不携带身份与携带身份互不碰撞
+    r_anon = cached_fetch("https://api.test/me")
+    assert r_anon.text == "resp-anon"
+    assert call_count == 6
+
+
 def test_snapshot_cached_skips_transient_statuses() -> None:
     """429 与全部 5xx 属瞬态故障，保底不写入快照；ignore_statuses 仅可追加。"""
     store = MemorySnapshotStore()

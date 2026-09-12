@@ -650,6 +650,14 @@ class SnapshotStore:
     # urllib/httpx 风格: body/content）。files 等文件对象参数无法稳定序列化，不参与指纹。
     _BODY_KEY_PARAMS: Tuple[str, ...] = ("body", "content", "data", "json", "json_data")
 
+    # 请求身份类关键字实参（requests 风格 cookies=/auth=）：与身份头白名单同
+    # 机制进入指纹，换身份必须换 key，否则换身份方会零网络消耗地静默命中
+    # 旧身份的快照响应。取舍：Session 级身份（session.headers / session.cookies）
+    # 不参与 key——会话对象跨请求可变（cookie jar 随响应演化）会使 key 漂移，
+    # 且异构 session 对象无统一内省接口；需要身份隔离的调用方应经
+    # headers/cookies 关键字实参显式传递身份。
+    _IDENTITY_KEY_KWARGS: Tuple[str, ...] = ("cookies", "auth")
+
     @staticmethod
     def _value_fingerprint(value: Any) -> str:
         """单值指纹（单射）：类型前缀隔离不同形态，bytes 与同内容 str 零碰撞；
@@ -668,10 +676,10 @@ class SnapshotStore:
         args: Tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """聚合位置实参与 body 类关键字实参，生成参与快照 key 的语义指纹。
+        """聚合位置实参与 body 类/身份类关键字实参，生成参与快照 key 的语义指纹。
 
         不变式（单射）：不同实参组合必须映射到不同指纹——位置实参按序号进入
-        arg{i} 命名空间（与 _BODY_KEY_PARAMS 参数名结构性不相交），body 类参数
+        arg{i} 命名空间（与 body/身份类参数名结构性不相交），body 类参数
         按参数名聚合全部已提供项（不能只取第一个非空项）。
         """
         parts: Dict[str, Any] = {}
@@ -680,6 +688,12 @@ class SnapshotStore:
         for name in cls._BODY_KEY_PARAMS:
             value = kwargs.get(name)
             if value is None:
+                continue
+            parts[name] = cls._value_fingerprint(value)
+        for name in cls._IDENTITY_KEY_KWARGS:
+            value = kwargs.get(name)
+            # 身份语义与身份头白名单同机制：空值等价于未携带身份，不参与指纹
+            if not value:
                 continue
             parts[name] = cls._value_fingerprint(value)
         return parts or None
