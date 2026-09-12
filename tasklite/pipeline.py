@@ -253,10 +253,19 @@ class TaskLite:
 
     @backend.setter
     def backend(self, value: AbstractStateBackend) -> None:
-        self._backend = value
         if hasattr(self, "_runtime"):
+            # 换库属管理段操作，仅限 run() 外调用（对齐 add_resource /
+            # register_handler 守卫惯例）：运行期换库会撕裂主循环已装配的
+            # 后端引用。
+            self._ensure_not_running("backend")
             self._runtime.backend = value
             self._runtime.store.set_backend(value)
+        self._backend = value
+        if hasattr(self, "_console"):
+            # 不变式：凡持有后端引用的组件必须随换库同步重绑定，漏绑会使
+            # 管理 API（list_dlq/clear_dlq/clear_history/seed_wall/seed_cursor）
+            # 静默读写旧库。
+            self._console.set_backend(value)
 
     @property
     def stats(self) -> TaskStats:
