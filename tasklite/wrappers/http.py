@@ -347,12 +347,26 @@ class HttpPolicy:
         return None
 
 
+def _validate_suspend_ttl(value: Any) -> float:
+    """default_suspend_ttl 构造期校验：非数值 TypeError，非有限/非正值 ValueError。
+
+    与 TaskContext.suspend_resource 入口校验同构——坏配置在构造期 fail-loud，
+    而非延迟到 429 命中时才在守卫 __exit__ 内爆炸并替换限流信号。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"default_suspend_ttl must be a number, got {type(value).__name__} ({value!r})")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"default_suspend_ttl must be finite and > 0, got {value!r}")
+    return float(value)
+
+
 class http_guard:
     """HTTP 请求守卫（上下文管理器）。
 
     功能：
     1. 捕获代码块内抛出的异常，或通过 `check_response` 检查响应状态码；
-    2. 遭遇 429 限流时：自动解析 Retry-After，自动调用 `ctx.suspend_resource` 挂起对应的限速资源，并抛出 `RateLimitHit`；
+    2. 遭遇 429 限流时：自动解析 Retry-After（依次取异常 `headers` 与 requests 风格
+       `exc_val.response.headers`），自动调用 `ctx.suspend_resource` 挂起对应的限速资源，并抛出 `RateLimitHit`；
     3. 遭遇 5xx/超时等瞬态错误：转换为 `RetryError` 触发调度器退避重试；
     4. 遭遇 4xx 等客户端错误：转换为 `FatalError` 直送死信队列。
 
@@ -381,7 +395,7 @@ class http_guard:
         self.ctx = ctx
         self.resource = resource
         self.policy = policy or HttpPolicy()
-        self.default_suspend_ttl = default_suspend_ttl
+        self.default_suspend_ttl = _validate_suspend_ttl(default_suspend_ttl)
 
     def __enter__(self) -> "http_guard":
         return self
@@ -416,6 +430,9 @@ class http_guard:
             ttl = getattr(exc_val, "_retry_after", None)
             if ttl is None:
                 headers = getattr(exc_val, "headers", None)
+                if headers is None:
+                    # requests.HTTPError 等官方异常无 headers 属性，Retry-After 挂在其 response 上
+                    headers = getattr(getattr(exc_val, "response", None), "headers", None)
                 retry_after = self.policy.extract_retry_after(headers)
                 ttl = retry_after if retry_after is not None else self.default_suspend_ttl
 
@@ -499,14 +516,16 @@ class SnapshotStore:
         method: str = "GET",
         params: Optional[Mapping[str, Any]] = None,
         body: Optional[Union[bytes, str, Mapping[str, Any]]] = None,
+        headers: Optional[Mapping[str, str]] = None,
     ) -> str:
-        """规范化生成请求唯一键（URL 参数排序 + Method 大写 + Body 哈希）。
+        """规范化生成请求唯一键（URL 参数排序 + Method 大写 + Body/身份头哈希）。
 
         Args:
             url: 目标 URL。
             method: HTTP 方法（GET、POST 等）。
             params: 查询参数字典。
             body: 请求体内容（bytes、str 或 dict）。
+            headers: 请求头 Mapping（仅身份头白名单参与指纹）。
 
         Returns:
             str: 规范化的请求键。
@@ -541,7 +560,40 @@ class SnapshotStore:
             body_hash = f"_{hashlib.sha256(raw_bytes).hexdigest()[:16]}"
 
         url_component = sanitize_job_component(norm_url)
-        return f"{norm_method}::{url_component}{body_hash}"
+        header_hash = SnapshotStore._identity_headers_fingerprint(headers)
+        return f"{norm_method}::{url_component}{body_hash}{header_hash}"
+
+    # 纳入快照 key 的身份头白名单：仅取真正改变响应语义的凭证/协商头。
+    # 取舍：不纳入全量 headers——User-Agent/Accept-Encoding/Date 等易变头会把
+    # 同语义请求碎片化为不同 key，摧毁命中率且无正确性收益；漏纳凭证头则会在
+    # 换 Cookie/Authorization 后串号返回旧身份的响应。
+    _IDENTITY_KEY_HEADERS: Tuple[str, ...] = (
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "x-api-key",
+        "api-key",
+        "content-type",
+    )
+
+    @classmethod
+    def _identity_headers_fingerprint(cls, headers: Any) -> str:
+        """身份头指纹段（单射）：白名单内非空头归一化小写排序后哈希。
+
+        `::h` 标记处于像集安全位——url_component 经单射转义后不含字面 `:`
+        （forbidden 集 `/:\\%` 全部 %XX 转义），key 中 `::` 仅出现于 METHOD
+        分隔与本标记，段结构无歧义，与 url/body 段组合不引入碰撞。
+        """
+        if not headers:
+            return ""
+        try:
+            items = {str(k).lower(): str(v) for k, v in dict(headers).items()}
+        except (TypeError, ValueError):
+            return ""
+        present = sorted((name, items[name]) for name in cls._IDENTITY_KEY_HEADERS if items.get(name))
+        if not present:
+            return ""
+        return "::h" + hashlib.sha256(_json_dumps(present).encode("utf-8")).hexdigest()[:16]
 
     # 参与 key 语义指纹的 body 类参数名（requests: data/json；本仓库 fetch_requests: json_data；
     # urllib/httpx 风格: body/content）。files 等文件对象参数无法稳定序列化，不参与指纹。
@@ -625,7 +677,7 @@ class SnapshotStore:
             if key_func is not None:
                 key = key_func(url, *args, **kwargs)
             else:
-                key = self.make_key(url, method=method, params=params, body=body)
+                key = self.make_key(url, method=method, params=params, body=body, headers=kwargs.get("headers"))
 
             cached_resp = self.get(key)
             if cached_resp is not None:
@@ -841,7 +893,7 @@ class HttpExecutor:
         self.snapshot_store = snapshot_store
         self.max_retries = max_retries
         self.backoff = backoff
-        self.default_suspend_ttl = default_suspend_ttl
+        self.default_suspend_ttl = _validate_suspend_ttl(default_suspend_ttl)
 
     def execute(
         self,
