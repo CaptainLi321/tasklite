@@ -91,3 +91,30 @@ class TestInFlightSettleConditionalForwarding:
         state.requeue_jobs([Job("t", "x", rerun="every_run").to_dict()], front=True)
         tracker.settle("t::x", state=state)
         assert "t::x" in state._rerun_active_uids, "豁免不得被结算二次注销误删"
+
+
+class TestStateAssertionFactSource:
+    """断言豁免判定直接取 queue 事实源（rerun 字段），不依赖派生缓存。"""
+
+    def _make_state(self, queue=(), wall=()):
+        from tasklite.models.state import PipelineState
+        return PipelineState(dict.fromkeys(wall, {}), {}, {}, list(queue))
+
+    def test_rerun_exempt_even_if_cache_drained(self):
+        """缓存 _rerun_active_uids 被误删时，queue 中 rerun 作业仍豁免不误报。"""
+        state = self._make_state(queue=[Job("t", "x", rerun="every_run").to_dict()],
+                                wall=["t::x"])
+        state._rerun_active_uids.clear()
+        state._assert_state_consistent()  # 不抛即通过
+
+    def test_non_rerun_collision_still_asserts(self):
+        """非 rerun 作业撞 queue∩wall → 必须断言失败（门禁不得被弱化）。"""
+        state = self._make_state(queue=[Job("t", "y").to_dict()], wall=["t::y"])
+        with pytest.raises(AssertionError, match="uid in wall/failed and queue"):
+            state._assert_state_consistent()
+
+    def test_rerun_collision_with_cache_ok_but_direct_gate(self):
+        """缓存失效时非 rerun 作业仍被门禁拦截（事实源兜底）。"""
+        state = self._make_state(queue=[Job("t", "z").to_dict()], wall=["t::z"])
+        with pytest.raises(AssertionError, match="uid in wall/failed and queue"):
+            state._assert_state_consistent()
