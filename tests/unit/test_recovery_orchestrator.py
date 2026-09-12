@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
+from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.engine.policy import PreflightPolicy
 from tasklite.engine.recovery import RecoveryOrchestrator, RecoveryMachine
 from tasklite.engine.resource import (
@@ -78,6 +79,94 @@ class TestRecoveryOrchestratorQueueRepair:
         assert "t::w1" not in uids
         assert "t::w2" in uids
         assert "t::f1" in uids
+
+
+class TestRecoveryOrchestratorRepairDeltaPersist:
+    """repair 落盘必须是差量定向删除：陈旧加载快照不得全表覆盖磁盘真相。
+
+    并发语义以受控注入模拟：在 load 之后、repair 落盘之前注入一次
+    enqueue_jobs（等价于他进程已应答成功的一次单事务入队），不依赖真实
+    多进程竞速。
+    """
+
+    @staticmethod
+    def _uids(jobs):
+        return [j["task_type"] + "::" + j["job_id"] for j in jobs]
+
+    def test_repair_preserves_job_enqueued_during_repair_window(self, tmp_path):
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([
+            {"task_type": "t", "job_id": "r1", "rerun": "never"},  # wall 残留，应清理
+            {"task_type": "t", "job_id": "k1"},
+        ])
+        q_data = backend.load_queue()
+        # 注入「load 之后、repair 落盘之前」他进程已应答成功的入队
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
+
+        # 全表重写即回归本缺陷：一旦回退为 save_queue(clean_q) 此处立即失败
+        def _poison_full_rewrite(jobs):
+            raise AssertionError("repair 不得以陈旧快照全表重写队列")
+
+        backend.save_queue = _poison_full_rewrite
+
+        orchestrator = make_orchestrator(backend)
+        repaired = orchestrator.repair_queue_on_load(
+            q_data, wall={"t::r1": {}}, failed={}
+        )
+
+        disk_uids = set(self._uids(backend.load_queue()))
+        assert "t::late" in disk_uids
+        assert "t::k1" in disk_uids
+        assert "t::r1" not in disk_uids
+        # 窗口期入队的作业同时并入本次 run 的内存队列
+        assert set(self._uids(repaired)) == {"t::k1", "t::late"}
+
+    def test_repair_deletes_only_residual_rows_from_disk(self, tmp_path):
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([
+            {"task_type": "t", "job_id": "r1", "rerun": "never"},
+            {"task_type": "t", "job_id": "k1"},
+            {"task_type": "t", "job_id": "r2", "rerun": "never"},
+            {"task_type": "t", "job_id": "k2"},
+        ])
+        q_data = backend.load_queue()
+
+        deleted_calls = []
+        orig_delete = backend.delete_queue_uids
+
+        def _recording_delete(uids):
+            deleted_calls.append(list(uids))
+            return orig_delete(uids)
+
+        backend.delete_queue_uids = _recording_delete
+
+        orchestrator = make_orchestrator(backend)
+        repaired = orchestrator.repair_queue_on_load(
+            q_data, wall={"t::r1": {}}, failed={"t::r2": {}}
+        )
+
+        # 只定向删除残留行，保留行保持原序
+        assert self._uids(backend.load_queue()) == ["t::k1", "t::k2"]
+        assert self._uids(repaired) == ["t::k1", "t::k2"]
+        assert set(deleted_calls[0]) == {"t::r1", "t::r2"}
+
+    def test_repair_delta_persist_aligned_on_memory_backend(self):
+        backend = InMemoryStateBackend()
+        backend.save_queue([
+            {"task_type": "t", "job_id": "r1", "rerun": "never"},
+            {"task_type": "t", "job_id": "k1"},
+        ])
+        q_data = backend.load_queue()
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
+
+        orchestrator = make_orchestrator(backend)
+        repaired = orchestrator.repair_queue_on_load(
+            q_data, wall={"t::r1": {}}, failed={}
+        )
+
+        disk_uids = set(self._uids(backend.load_queue()))
+        assert disk_uids == {"t::k1", "t::late"}
+        assert set(self._uids(repaired)) == {"t::k1", "t::late"}
 
 
 class TestRecoveryOrchestratorCrashSafeSave:

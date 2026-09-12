@@ -459,6 +459,20 @@ class SQLiteStateBackend(AbstractStateBackend):
             return False
         return True
 
+    def delete_queue_uids(self, uids: List[str]) -> int:
+        """按 uid 定向批量删除队列行（repair 差量落盘），不触碰其余行。"""
+        if not uids:
+            return 0
+        try:
+            with self._get_conn() as conn:
+                cur = conn.executemany(
+                    'DELETE FROM queue WHERE uid = ?', [(u,) for u in uids]
+                )
+                return cur.rowcount if cur.rowcount is not None else 0
+        except Exception as e:
+            logger.critical(f"Failed to delete queue uids in {self.path.name}: {e}")
+            raise
+
     def commit_retry(self, popped_uid: str, requeued_job: Dict[str, Any], *, front: bool = False) -> bool:
         """原子 delta：删除 popped_uid + 按 front 插入 requeued_job。不写 wall/DLQ。
 

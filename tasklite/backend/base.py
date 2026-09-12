@@ -139,6 +139,17 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
+    def delete_queue_uids(self, uids: List[str]) -> int:
+        """按 uid 定向批量删除队列行（加载期 repair 的差量落盘唯一出口）。
+
+        与 save_queue 的全表重写相对：只 DELETE 指定 uid 的行，其余行原样
+        保留。不变式：删除集在调用前确定，不在删除集内的行（含并发进程
+        刚入队的新行）无论与本事务先后提交都必然存活——陈旧加载快照永远
+        不会覆盖他进程的新写入。单事务原子；失败抛异常（不吞），磁盘保持
+        调用前状态（残留行由下次加载重新判定，天然幂等）。返回实际删除行数。
+        """
+
+    @abstractmethod
     def get_meta(self, key: str) -> Optional[str]:
         """读取一条框架级元数据（如 fencing 的 last_run_id）。无则返回 None。"""
 

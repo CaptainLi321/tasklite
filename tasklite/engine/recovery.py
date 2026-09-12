@@ -62,19 +62,39 @@ class RecoveryOrchestrator:
     def repair_queue_on_load(
         self, q_data: list, wall: dict, failed: dict
     ) -> list:
-        """加载期队列整理：退避换算 + 过滤残留 + UID 去重，并执行单次原子持久化。
+        """加载期队列整理：磁盘合并重读 + 退避换算 + 过滤残留 + UID 去重，差量定向清理。
 
-        1. 退避换算：以 wall_deadline 换算为单调时钟 monotonic _backoff_until。
-        2. 残留过滤：过滤已在 wall/failed 中且不符合 rerun 策略的残留。
-        3. UID 去重：同一 UID 重复条目保留首条。
-        4. 变更持久化：若有过滤或去重发生，单次原子落盘，避免多次保存出现中间状态。
+        1. 磁盘合并重读：捕获「load 之后、repair 期间」并发进程合法入队的
+           作业，补进本次 run 的内存队列（重读失败仅放弃合并并告警，清理
+           正确性不受影响；不基于重读结果做任何写盘）。
+        2. 退避换算：以 wall_deadline 换算为单调时钟 monotonic _backoff_until。
+           monotonic 值跨进程/重启无意义（每次加载由持久化 wall_deadline
+           重推导），保留行无需回写磁盘——这正是消除覆盖窗口的前提。
+        3. 残留过滤：过滤已在 wall/failed 中且不符合 rerun 策略的残留。
+        4. UID 去重：同一 UID 重复条目保留首条。
+        5. 差量落盘：仅对残留行按 uid 定向 DELETE（delete_queue_uids）。
+           不变式：修复基准是加载时刻的陈旧快照，严禁以其全表 save_queue
+           重写——重写会静默吞掉窗口期他进程已应答成功的入队（磁盘与内存
+           双失、永不再现，at-least-once 被击穿）；定向 DELETE 的删除集不含
+           并发新行，无覆盖窗口，且删除失败时磁盘保持原状、下次加载重判（幂等）。
         """
         now = time.monotonic()
         wall_now = time.time()
+
+        try:
+            disk_q = self._store.backend.load_queue()
+        except Exception as e:
+            logger.warning(
+                f"Failed to reload queue for repair merge; "
+                f"proceeding with load-time snapshot only: {e}"
+            )
+            disk_q = []
+
         seen_uid: set = set()
         clean_q = []
+        dropped_uids: list = []
 
-        for jd in q_data:
+        for jd in list(q_data) + disk_q:
             # 1. 退避换算（委托强类型 JobRuntimeState 对齐双时钟）
             rt_state = JobRuntimeState.from_dict(jd.get("runtime"))
             rt_state.align_wall_clock(now, wall_now)
@@ -92,10 +112,11 @@ class RecoveryOrchestrator:
                     is_failed=failed_hit,
                 )
                 if decision.should_skip:
+                    dropped_uids.append(u)
                     continue
 
-
-            # 3. 去重（保留首条）
+            # 3. 去重（保留首条）。去重命中项不参与磁盘删除：uid 主键约束下
+            # 磁盘不存在重复行，按 uid 删除会连同保留首条一并误删。
             if u in seen_uid:
                 logger.warning(
                     f"Loading duplicate uid {u} in queue; keeping first occurrence "
@@ -105,9 +126,9 @@ class RecoveryOrchestrator:
             seen_uid.add(u)
             clean_q.append(jd)
 
-        # 4. 单次原子落盘
-        if len(clean_q) < len(q_data):
-            self._store.backend.save_queue(clean_q)
+        # 4. 差量落盘：只删除需要移除的残留行，其余行原样保留
+        if dropped_uids:
+            self._store.backend.delete_queue_uids(dropped_uids)
         return clean_q
 
     def load_resource_suspends(self) -> None:
