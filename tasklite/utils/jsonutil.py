@@ -7,10 +7,11 @@
 - ``loads``：``parse_constant`` 拒绝 NaN/Infinity/-Infinity 字面 token；
   ``parse_float`` 拒绝溢出为无穷的浮点字面量（如 ``1e400``——不经过
   parse_constant，默认解析静默产出 inf，下游 ``dumps(allow_nan=False)``
-  回写时才炸或比较语义失真），且两类拒绝都抛 ``json.JSONDecodeError``
-  （非裸 ``ValueError``）——调用方既有的 ``except json.JSONDecodeError``
-  分支（sqlite_backend.load_* 等）才能真正捕获；裸 ValueError 会逃逸
-  既有 except 分支。
+  回写时才炸或比较语义失真）；``parse_int`` 把超长整数字面量解析限制的
+  裸 ``ValueError`` 包装为 ``json.JSONDecodeError``——且所有拒绝均抛
+  ``json.JSONDecodeError``（非裸 ``ValueError``）——调用方既有的
+  ``except json.JSONDecodeError`` 分支（sqlite_backend.load_* 等）才能
+  真正捕获；裸 ValueError 会逃逸既有 except 分支。
 
 静态契约：tests 扫描源码断言本模块之外无裸 ``json.dumps``/``json.loads``
 （豁免：``models/state.py`` 的 hash 计算——非落盘/传输用途）。
@@ -47,6 +48,22 @@ def _finite_float(s: str) -> float:
     return val
 
 
+def _bounded_int(s: str) -> int:
+    """parse_int 回调：把整数字面量解析限制的裸 ValueError 包装为 JSONDecodeError。
+
+    Python 3.11+ 对超过 int↔str 转换位数上限（默认 4300 位）的整数字面量，
+    ``int(s)`` 抛裸 ``ValueError``——逃逸调用方既有的 ``except
+    json.JSONDecodeError`` 损坏数据分支（sqlite_backend.load_* 等）。
+    统一按损坏数据拒绝，doc 参数携带字面量供定位。
+    """
+    try:
+        return int(s)
+    except ValueError as exc:
+        raise json.JSONDecodeError(
+            f"JSON integer literal {s!r} exceeds int conversion limit: {exc}", s, 0
+        ) from exc
+
+
 def dumps(obj) -> str:
     """序列化（ensure_ascii=False 保中文可读 + allow_nan=False 拒 NaN）。"""
     return json.dumps(obj, ensure_ascii=False, allow_nan=False)
@@ -58,10 +75,14 @@ def dump(obj, fp):
 
 
 def loads(s: str):
-    """反序列化（拒绝 NaN/Infinity/溢出浮点，抛 JSONDecodeError）。"""
-    return json.loads(s, parse_constant=_reject_constant, parse_float=_finite_float)
+    """反序列化（拒绝 NaN/Infinity/溢出浮点/超限整数，抛 JSONDecodeError）。"""
+    return json.loads(
+        s, parse_constant=_reject_constant, parse_float=_finite_float, parse_int=_bounded_int
+    )
 
 
 def load(fp):
     """从文件对象反序列化（同 loads 的拒绝语义）。"""
-    return json.load(fp, parse_constant=_reject_constant, parse_float=_finite_float)
+    return json.load(
+        fp, parse_constant=_reject_constant, parse_float=_finite_float, parse_int=_bounded_int
+    )
