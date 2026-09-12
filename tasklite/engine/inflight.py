@@ -144,7 +144,11 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         """语义化结算接缝：注销在途任务并同步内存状态（单一真相源出口）。"""
         entry = self._entries.pop(uid, None)
         if state is not None and hasattr(state, "unregister_in_flight"):
-            state.unregister_in_flight(uid)
+            # 三态提交内部已注销 in-flight（retry 分支注销后立即 requeue 并
+            # 重建 rerun 豁免）；此处仅在 uid 仍在途索引时才兜底转发注销，
+            # 防止二次注销误删刚重建的豁免（安全网语义不变）。
+            if uid in state.in_flight_uids:
+                state.unregister_in_flight(uid)
         return entry
 
     def unregister(
