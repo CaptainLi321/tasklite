@@ -105,6 +105,44 @@ class TestArtifactJournalDeclarations:
         signals_after = journal.drain_signals(uid)
         assert signals_after == []
 
+        # 排空后无任何残留（规范名与摘除临时名均不存在）
+        assert not journal.signals_path(uid).exists()
+        assert list(tmp_path.glob("*.draining")) == []
+
+    def test_drain_signals_keeps_signal_appended_during_read(self, tmp_path, monkeypatch):
+        """排空读取期间的并发追加不得被抹除（摘除式排空契约）。
+
+        注入点：解析首行时向同名信号文件追加一条新信号（模拟活跃 worker
+        的 O_APPEND 追加与排空读并发）。摘除式排空下，追加经按名新建落入
+        新文件、下轮排空必须读回；「读后 truncate」旧实现会把该追加连同
+        原内容一并抹除（丢信号）。
+        """
+        import tasklite.utils.ipc as ipc_module
+
+        journal = ArtifactJournal(tmp_path)
+        uid = "job_sig_race"
+        journal.record_signal(uid, "gpu", 30.0)
+
+        real_loads = ipc_module.loads
+        signals_path = journal.signals_path(uid)
+        appended = {"done": False}
+
+        def loads_with_concurrent_append(line):
+            data = real_loads(line)
+            if not appended["done"]:
+                appended["done"] = True
+                with open(signals_path, "a", encoding="utf-8") as f:
+                    f.write('{"suspend": ["api", 5.0]}\n')
+                    f.flush()
+            return data
+
+        monkeypatch.setattr(ipc_module, "loads", loads_with_concurrent_append)
+
+        assert journal.drain_signals(uid) == [("gpu", 30.0)]
+
+        # 排空期间追加的信号在下一轮排空捞回（不丢）
+        assert journal.drain_signals(uid) == [("api", 5.0)]
+
 
 class TestArtifactJournalCleanupModes:
     def test_cleanup_pre_submit(self, tmp_path):

@@ -684,3 +684,138 @@ class TestAbortTOCTOU:
         suspended_until = pipeline.resources["api"].suspended_until()
         assert suspended_until is not None and suspended_until > now, \
             f"abort 必须消费并应用 suspend 信号，实际 suspended_until={suspended_until}"
+
+
+class TestAbortSalvagedSignalApplication:
+    """abort 收尾「杀进程后补排空」的应用点契约。
+
+    cancelled 任务的信号文件已随半成品清理删除，channel 捞回的 suspend
+    信号只能经 AbortOutcome.salvaged_signals 带回；recovery 必须将其应用
+    到 ResourceManager 并即时持久化（suspend 不丢承诺的最后一环）。
+    """
+
+    def test_salvaged_signals_applied_and_persisted(self):
+        from types import SimpleNamespace
+
+        from tasklite.backend.memory import InMemoryStateBackend
+        from tasklite.engine.channel import AbortOutcome
+        from tasklite.engine.inflight import InFlightJob, InFlightTracker
+        from tasklite.engine.recovery import RecoveryOrchestrator
+        from tasklite.engine.resource import (
+            META_RESOURCE_SUSPENDS,
+            CapacityResource,
+            ResourceManager,
+        )
+        from tasklite.engine.store import StateStore
+        from tasklite.engine.policy import ExecutionPolicy
+        from tasklite.models.job import Job
+        from tasklite.taxonomy import ErrorTaxonomy
+        from tasklite.utils.jsonutil import loads
+
+        backend = InMemoryStateBackend()
+        store = StateStore(
+            backend,
+            commit_failure_dlq_threshold=3,
+            taxonomy=ErrorTaxonomy(),
+        )
+        resources = ResourceManager()
+        resources["gpu"] = CapacityResource("gpu", 1.0)
+
+        job = Job("t", "j1")
+        in_flight = InFlightTracker()
+        in_flight.track(
+            InFlightJob(
+                uid=job.uid,
+                job_dict=job.to_dict(),
+                job=job,
+            )
+        )
+
+        def fake_abort(handles):
+            assert [h for h in handles] == []
+            return AbortOutcome(
+                completed=[],
+                cancelled=[],
+                salvaged_signals=[(job.uid, "gpu", 30.0)],
+            )
+
+        channel = SimpleNamespace(
+            drain_active_signals=lambda uids: [],
+            abort_in_flight=fake_abort,
+        )
+        settled = {}
+        completion = SimpleNamespace(
+            settle_aborted=lambda cancelled, done: settled.update(
+                cancelled=[e.uid for e in cancelled]
+            )
+        )
+        recovery = RecoveryOrchestrator(
+            store=store,
+            channel=channel,
+            resources=resources,
+            in_flight=in_flight,
+            policy=ExecutionPolicy(),
+            completion=completion,
+        )
+
+        recovery.abort_in_flight()
+
+        # 信号已应用（资源挂起生效）并即时持久化到 meta
+        assert "gpu" in resources.collect_suspensions()
+        persisted = loads(backend.get_meta(META_RESOURCE_SUSPENDS))
+        assert "gpu" in persisted
+        # 收尾结算照常进行（cancelled 分支 requeue）
+        assert settled["cancelled"] == [job.uid]
+
+    def test_unregistered_resource_salvaged_signal_skipped(self):
+        """未注册资源的捞回信号告警跳过，不中断 abort 收尾。"""
+        from types import SimpleNamespace
+
+        from tasklite.backend.memory import InMemoryStateBackend
+        from tasklite.engine.channel import AbortOutcome
+        from tasklite.engine.inflight import InFlightJob, InFlightTracker
+        from tasklite.engine.recovery import RecoveryOrchestrator
+        from tasklite.engine.resource import (
+            META_RESOURCE_SUSPENDS,
+            CapacityResource,
+            ResourceManager,
+        )
+        from tasklite.engine.store import StateStore
+        from tasklite.engine.policy import ExecutionPolicy
+        from tasklite.models.job import Job
+        from tasklite.taxonomy import ErrorTaxonomy
+
+        backend = InMemoryStateBackend()
+        store = StateStore(
+            backend,
+            commit_failure_dlq_threshold=3,
+            taxonomy=ErrorTaxonomy(),
+        )
+        resources = ResourceManager()
+        resources["gpu"] = CapacityResource("gpu", 1.0)
+
+        job = Job("t", "j2")
+        in_flight = InFlightTracker()
+        in_flight.track(InFlightJob(uid=job.uid, job_dict=job.to_dict(), job=job))
+
+        channel = SimpleNamespace(
+            drain_active_signals=lambda uids: [],
+            abort_in_flight=lambda handles: AbortOutcome(
+                completed=[],
+                cancelled=[],
+                salvaged_signals=[(job.uid, "no_such_resource", 9.0)],
+            ),
+        )
+        recovery = RecoveryOrchestrator(
+            store=store,
+            channel=channel,
+            resources=resources,
+            in_flight=in_flight,
+            policy=ExecutionPolicy(),
+            completion=SimpleNamespace(settle_aborted=lambda c, d: None),
+        )
+
+        recovery.abort_in_flight()
+
+        assert backend.get_meta(META_RESOURCE_SUSPENDS) is None
+        assert "gpu" not in resources.collect_suspensions()
