@@ -600,4 +600,26 @@ class TestHttpExecutor:
 
         mock_ctx.suspend_resource.assert_called_once_with("api_custom", 45.0)
 
+    def test_execute_rate_limit_not_locally_retried(self):
+        """429 必须命中 RateLimitHit 专用分支直接上抛，禁止落入本地重试循环。
+
+        不变式：RateLimitHit 是 RetryError 子类，except 顺序颠倒会把限流吞进
+        本地线性微退避——无视 Retry-After 猛打限流端点，且挂起信号逐 attempt
+        重复落盘。限流等待唯一交由引擎挂起收敛。
+        """
+        mock_ctx = MagicMock()
+        executor = HttpExecutor(ctx=mock_ctx, resource="api_x", max_retries=5, backoff=0.0)
+        call_count = 0
+
+        def rate_limited_fetch(url: str):
+            nonlocal call_count
+            call_count += 1
+            return HttpResponse(status_code=429, headers={"Retry-After": "30"}, body=b"rate limited", url=url)
+
+        with pytest.raises(RateLimitHit):
+            executor.execute(rate_limited_fetch, "https://example.com/rl")
+
+        assert call_count == 1
+        mock_ctx.suspend_resource.assert_called_once_with("api_x", 30.0)
+
 
