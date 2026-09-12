@@ -380,6 +380,77 @@ class TestSerializationContract:
             f"got {res.get('lock_conflict')!r}"
         )
 
+    def test_mp_worker_wrapper_rate_limit_writes_structured_flag(self, tmp_path):
+        """worker 侧限流判定：handler 抛 RateLimitHit → 结果文件带 rate_limited=True。
+
+        判定必须在子进程编码侧以 isinstance 完成——RateLimitHit 是 RetryError
+        子类、共享 status="retry" 通道，父进程侧无异常类型可辨；缺该字段时
+        plan_retry 会把限流当普通业务失败烧重试预算，429 风暴下任务被误送 DLQ。
+        """
+        from tasklite.engine.channel import WorkerLaunchSpec, _mp_worker_wrapper
+        from tasklite.utils.ipc import ArtifactJournal
+        from tasklite.models.context import TaskContext
+        from tasklite.exceptions import RateLimitHit
+
+        ipc = str(tmp_path)
+        job = Job("t", "rl")
+        ctx = TaskContext(job, set(), set(), {}, output_root=None, ipc_dir=ipc)
+
+        def rate_limited_handler(j, c):
+            raise RateLimitHit("HTTP 429 RateLimit hit (resource=api, ttl=60.0s)")
+
+        _mp_worker_wrapper(WorkerLaunchSpec(
+            handler=rate_limited_handler, job=job, task_ctx=ctx,
+            incarnation="test.1", ipc_dir=ipc, timeout=60.0,
+        ))
+
+        res = ArtifactJournal(ipc).read_result("t::rl", incarnation="test.1")
+        assert res is not None, "worker 必须写结果文件"
+        assert res.get("status") == "retry", (
+            f"限流应走 retry 通道（自恢复），got status={res.get('status')!r}"
+        )
+        assert res.get("rate_limited") is True, (
+            f"限流结果必须携带结构化字段 rate_limited=True，got {res.get('rate_limited')!r}"
+        )
+
+    def test_mp_worker_wrapper_plain_retry_omits_rate_limit_flag(self, tmp_path):
+        """业务 RetryError 不得被误标 rate_limited（豁免面不可扩大）。"""
+        from tasklite.engine.channel import WorkerLaunchSpec, _mp_worker_wrapper
+        from tasklite.utils.ipc import ArtifactJournal
+        from tasklite.models.context import TaskContext
+        from tasklite.exceptions import RetryError
+
+        ipc = str(tmp_path)
+        job = Job("t", "re")
+        ctx = TaskContext(job, set(), set(), {}, output_root=None, ipc_dir=ipc)
+
+        def plain_retry_handler(j, c):
+            raise RetryError("HTTP 503 Transient server error")
+
+        _mp_worker_wrapper(WorkerLaunchSpec(
+            handler=plain_retry_handler, job=job, task_ctx=ctx,
+            incarnation="test.1", ipc_dir=ipc, timeout=60.0,
+        ))
+
+        res = ArtifactJournal(ipc).read_result("t::re", incarnation="test.1")
+        assert res is not None and res.get("status") == "retry"
+        assert not res.get("rate_limited"), (
+            f"业务 RetryError 不得携带 rate_limited 标志，got {res.get('rate_limited')!r}"
+        )
+
+    def test_decode_ipc_result_rate_limited_flag(self):
+        """解码侧对称：status="retry" + rate_limited=True → 结构化标志贯通。"""
+        res = {"status": "retry", "rate_limited": True, "error": "HTTP 429 RateLimit hit"}
+        result = _decode_ipc_result(res, None, Job("t", "a"))
+        assert result.retry_requested, "限流结果必须按瞬态重试处理"
+        assert result.rate_limited is True, "解码侧必须还原 rate_limited 结构化标志"
+        assert result.lock_conflict is False
+
+        plain = _decode_ipc_result(
+            {"status": "retry", "error": "transient"}, None, Job("t", "a"),
+        )
+        assert plain.rate_limited is False, "无标志的 retry 结果不得误判为限流"
+
 
 
 # Batch 5 / （退避换算真值表）+ （缓存内容键）+ （历史迁移）

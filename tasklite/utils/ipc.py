@@ -291,6 +291,8 @@ class ArtifactJournal:
         }
         if payload.get("lock_conflict"):
             degraded["lock_conflict"] = True
+        if payload.get("rate_limited"):
+            degraded["rate_limited"] = True
         try:
             self.write_result_atomic(uid, degraded, incarnation=incarnation)
         except OSError as e2:

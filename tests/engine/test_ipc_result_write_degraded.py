@@ -11,6 +11,7 @@ IO 故障时 OSError 直接穿透 → worker 裸崩退出（无结果文件）�
 覆盖矩阵：
 - success 完整写两连败 → 降级 retry 结果落盘（重跑而非静默丢失）
 - 锁冲突分支完整写失败 → 降级结果保留 lock_conflict 结构化字段
+- 限流分支完整写失败 → 降级结果保留 rate_limited 结构化字段
 - 全部写失败（含降级写）→ worker 不抛 OSError、无结果文件
 - 端到端：降级 retry 结果被 drain 消费 → job 回队重跑成功，不进 DLQ
 """
@@ -119,6 +120,43 @@ class TestWorkerResultWriteDegraded:
         assert res["status"] == "retry"
         assert res.get("lock_conflict") is True, (
             f"降级写必须保留 lock_conflict 结构化字段: {res}"
+        )
+        assert "IPC_RESULT_WRITE_DEGRADED" in res["error"]
+
+    def test_rate_limit_payload_write_failure_keeps_structured_field(
+        self, tmp_path, monkeypatch,
+    ):
+        """限流分支完整写失败 → 降级结果保留 rate_limited 结构化字段。
+
+        判定端读 rate_limited 结构化字段做预算豁免——降级写丢字段会把
+        限流当普通业务 retry 烧 max_retries 预算，429 风暴下任务被误送 DLQ。
+        """
+        from tasklite.exceptions import RateLimitHit
+
+        real_write = ArtifactJournal.write_result_atomic
+
+        def flaky_write(journal_self, uid, result_dict, incarnation=None):
+            # 仅放行降级 payload（error 带 DEGRADED 标记），完整写一律模拟磁盘满
+            if "IPC_RESULT_WRITE_DEGRADED" not in str(result_dict.get("error", "")):
+                raise OSError(28, "No space left on device")
+            return real_write(journal_self, uid, result_dict,
+                              incarnation=incarnation)
+
+        monkeypatch.setattr(ArtifactJournal, "write_result_atomic", flaky_write)
+
+        job = Job("h", "rl")
+
+        def rate_limited_handler(j, c):
+            raise RateLimitHit("HTTP 429 RateLimit hit (resource=api, ttl=60.0s)")
+
+        _mp_worker_wrapper(_make_spec(job, rate_limited_handler, str(tmp_path)))
+
+        journal = ArtifactJournal(str(tmp_path))
+        res = journal.read_result("h::rl", incarnation=_INCARNATION)
+        assert res is not None, "限流完整写失败后必须降级写最小 retry 结果"
+        assert res["status"] == "retry"
+        assert res.get("rate_limited") is True, (
+            f"降级写必须保留 rate_limited 结构化字段: {res}"
         )
         assert "IPC_RESULT_WRITE_DEGRADED" in res["error"]
 

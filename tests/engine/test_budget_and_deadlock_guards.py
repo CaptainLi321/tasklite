@@ -1,12 +1,15 @@
 """预算豁免与死锁归因遮蔽的防御分支回归测试。
 
-覆盖两个 engine 层防御分支：
+覆盖三个 engine 层防御分支：
 1. 重试预算耗尽的 job 撞孤儿锁（lock_conflict=True 的 retry 结果）必须
    回队自恢复而非直接进 DLQ——与派发侧 probe defer「孤儿死后自恢复、
    不烧预算」的设计意图对称（判定端读结构化字段，与 error 前缀无关）。
 2. 队列同时含畸形 job 与处于退避的 job 时，调度扫描必须把 min_wait
    强制为 inf——畸形归因不依赖任何等待，被有限退避遮蔽会逐轮推迟
    （指数退避放大时可拖数十分钟，管线表现为卡死无日志）。
+3. 重试预算耗尽的 job 连续撞限流（RateLimitHit → rate_limited=True 的
+   retry 结果）必须挂起回队而非进 DLQ——限流等待由资源挂起 TTL 承担，
+   429 风暴下任务不得被误终结。
 """
 
 import time
@@ -85,6 +88,106 @@ class TestLockConflictBudgetExemption:
         # 走锁冲突 defer 分支（与中断/计数退避区分的独有统计）
         assert pipeline.stats.get("deferred_orphan", 0) >= 1, \
             "预算耗尽的锁冲突必须走零计数 defer 分支（deferred_orphan 计数）"
+
+
+class TestRateLimitBudgetExemption:
+    """预算判定豁免 rate_limited：限流瞬态不烧预算、不误进 DLQ。"""
+
+    def test_rate_limit_storm_suspends_and_requeues_not_dlq(
+        self, tmp_path, monkeypatch,
+    ):
+        """429 风暴下预算已耗尽的 job 必须挂起回队，风暴过后自愈不进 DLQ。
+
+        场景：retries 预算已耗尽（== max_retries == 3），随后连续两轮真实
+        限流（handler 先挂起资源再抛 RateLimitHit），第三轮放行成功。
+        限流的等待由资源挂起 TTL 承担，若按超限判 DLQ，与「瞬态信号
+        不烧预算」军规矛盾。变异体（豁免条件缺 rate_limited）下第一轮
+        限流即进 DLQ，本测试红。
+        """
+        import json as json_mod
+        import sqlite3 as sqlite3_mod
+
+        from tasklite.engine.resource import CapacityResource
+        from tasklite.exceptions import RateLimitHit
+
+        pipeline = make_pipeline(tmp_path)
+        pipeline.add_resource(CapacityResource("api", 1.0))
+
+        attempts = []
+
+        def rate_limit_then_success(job, ctx):
+            attempts.append(1)
+            if len(attempts) <= 2:
+                ctx.suspend_resource("api", 60.0)
+                raise RateLimitHit("HTTP 429 RateLimit hit (resource=api, ttl=60.0s)")
+            return True
+
+        pipeline.register_handler("t", rate_limit_then_success)
+
+        # retries 预算已由此前业务失败耗尽
+        jd = Job("t", "j1", payload={}).to_dict()
+        jd["retries"] = 3
+        jd["max_retries"] = 3
+        conn = sqlite3_mod.connect(tmp_path / "state" / "test_pipeline_state.db")
+        conn.execute("DELETE FROM queue")
+        conn.execute("INSERT INTO queue (uid, seq, job_data) VALUES ('t::j1', 0, ?)",
+                     (json_mod.dumps(jd),))
+        conn.commit()
+        conn.close()
+
+        captured = []
+        real_commit_retry = pipeline.backend.commit_retry
+
+        def fake_commit_retry(uid, retry_dict, front=False):
+            captured.append(retry_dict)
+            return real_commit_retry(uid, retry_dict, front=front)
+        monkeypatch.setattr(pipeline.backend, "commit_retry", fake_commit_retry)
+
+        # worker 内联执行：编码侧 isinstance 判定与资源挂起信号落盘走真实路径
+        class InlineWorkerProcess:
+            def __init__(self, target=None, args=(), kwargs=None, **_kw):
+                self.target = target
+                self.args = args
+                self._alive = False
+                self.exitcode = 0
+
+            def start(self):
+                self.target(*self.args)
+
+            def join(self, timeout=None):
+                self._alive = False
+
+            def is_alive(self):
+                return self._alive
+
+            def kill(self):
+                self._alive = False
+                self.exitcode = -9
+
+        patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=InlineWorkerProcess)
+        monkeypatch.setattr("time.sleep", lambda s: None)  # 跳过退避等待（短退避到期即回队）
+
+        pipeline.run()
+
+        # 限流豁免预算判定：两轮 429 后自愈成功进 wall，绝不进 DLQ
+        dlq_uids = {e.uid for e in pipeline.list_dlq()}
+        assert "t::j1" not in dlq_uids, \
+            f"限流瞬态不得把预算耗尽的 job 误送 DLQ，实际 DLQ: {dlq_uids}"
+        wall = pipeline.backend.load_wall()
+        assert "t::j1" in wall, "429 风暴过后重跑应成功进 wall"
+        assert len(attempts) == 3, \
+            f"应恰好执行 3 轮（2 轮限流 + 1 轮成功），实际: {len(attempts)}"
+        # 零计数回队 + 零污染：retries 保持 3，last_retry_error 不被限流污染
+        assert captured and all(rd["retries"] == 3 for rd in captured), \
+            f"限流回队不得递增重试计数: {[rd.get('retries') for rd in captured]}"
+        assert all(not rd["runtime"].get("_last_retry_error") for rd in captured), \
+            "限流重试不得污染 last_retry_error"
+        # 走限流零计数回队分支（与中断/锁冲突区分的独有统计）
+        assert pipeline.stats.get("rate_limited_reruns", 0) == 2, \
+            f"两轮限流必须走零计数回队分支，实际: {pipeline.stats}"
+        # 限流挂起生效：handler 的 suspend_resource 信号经 drain 打捞后全局生效
+        assert pipeline.resources["api"].suspended_until() is not None, \
+            "限流必须触发资源全局挂起（Retry-After TTL 语义）"
 
 
 class TestMalformedNotMaskedByBackoff:

@@ -86,6 +86,7 @@ class RetryOutcome:
     retry_dict: Dict[str, Any]
     is_interrupted: bool = False
     is_lock_conflict: bool = False
+    is_rate_limited: bool = False
 
 
 @dataclass(frozen=True)
@@ -430,6 +431,7 @@ class StateStore:
         front: bool = False,
         is_interrupted: bool = False,
         is_lock_conflict: bool = False,
+        is_rate_limited: bool = False,
     ) -> RetryOutcome:
         """原子状态转移：重试重入队。"""
         committed = self._backend.commit_retry(uid, retry_dict, front=front)
@@ -441,11 +443,14 @@ class StateStore:
                 self._record_stat("interrupted_reruns", 1)
             elif is_lock_conflict:
                 self._record_stat("deferred_orphan", 1)
+            elif is_rate_limited:
+                self._record_stat("rate_limited_reruns", 1)
             return RetryOutcome(
                 uid=uid,
                 retry_dict=retry_dict,
                 is_interrupted=is_interrupted,
                 is_lock_conflict=is_lock_conflict,
+                is_rate_limited=is_rate_limited,
             )
 
         self.commit_failed_crash(uid, "commit_retry", job_dict)
@@ -454,6 +459,7 @@ class StateStore:
             retry_dict=retry_dict,
             is_interrupted=is_interrupted,
             is_lock_conflict=is_lock_conflict,
+            is_rate_limited=is_rate_limited,
         )
 
     def _requeue_and_crash(self, uid: str, job_dict: Optional[Dict[str, Any]], reason: str) -> None:
