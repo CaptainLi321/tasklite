@@ -312,6 +312,93 @@ def test_http_guard_transient_and_fatal() -> None:
             )
 
 
+class _CustomFatal(FatalError):
+    """模拟用户分类器返回的自定义 FatalError 子类（签名的自然用法）。"""
+
+
+class _CustomRateLimit(RateLimitHit):
+    pass
+
+
+class _CustomRetry(RetryError):
+    pass
+
+
+def test_check_response_accepts_classifier_subclasses() -> None:
+    """分类器返回三分类子类时必须命中对应分支，identity 比较会静默当成功。
+
+    status_classifier 返回自定义 FatalError 子类属签名的自然用法；若以
+    `cls is FatalError` 分派则三分类全不命中，401 错误响应被静默作为
+    成功返回，错误既不上抛也不进死信队列。
+    """
+    fatal_policy = HttpPolicy(
+        status_classifier=lambda code, resp: _CustomFatal if code == 401 else None
+    )
+    with pytest.raises(FatalError):
+        http_guard(policy=fatal_policy).check_response(
+            HttpResponse(status_code=401, headers={}, body=b"unauthorized")
+        )
+
+    rl_policy = HttpPolicy(
+        status_classifier=lambda code, resp: _CustomRateLimit if code == 429 else None
+    )
+    with pytest.raises(RateLimitHit) as exc_info:
+        http_guard(policy=rl_policy).check_response(
+            HttpResponse(status_code=429, headers={}, body=b"rate limited")
+        )
+    # RateLimitHit 分支的 Retry-After 挂起语义不得因子类返回而丢失
+    assert getattr(exc_info.value, "_retry_after", None) == 60.0
+
+    retry_policy = HttpPolicy(
+        status_classifier=lambda code, resp: _CustomRetry if code == 503 else None
+    )
+    with pytest.raises(RetryError):
+        http_guard(policy=retry_policy).check_response(
+            HttpResponse(status_code=503, headers={}, body=b"down")
+        )
+
+
+def test_guard_exit_converts_custom_classifier_subclass() -> None:
+    """exception_classifier 返回三分类子类时守卫必须完成对应转换与挂起联动。"""
+    ctx = _StrictSuspendCtx()
+    with pytest.raises(RateLimitHit):
+        with http_guard(
+            ctx=ctx,
+            resource="api_x",
+            default_suspend_ttl=45.0,
+            policy=HttpPolicy(exception_classifier=lambda exc: _CustomRateLimit),
+        ):
+            raise ValueError("boom")
+    assert ctx.calls == [("api_x", 45.0)]
+
+    with pytest.raises(FatalError):
+        with http_guard(policy=HttpPolicy(exception_classifier=lambda exc: _CustomFatal)):
+            raise ValueError("boom")
+
+    with pytest.raises(RetryError):
+        with http_guard(policy=HttpPolicy(exception_classifier=lambda exc: _CustomRetry)):
+            raise ValueError("boom")
+
+
+def test_policy_classifier_invalid_return_fails_loud() -> None:
+    """分类器返回与三分类无关的异常类或非异常类必须 fail-loud，禁止静默当成功。"""
+    unrelated_class_policy = HttpPolicy(
+        status_classifier=lambda code, resp: ValueError if code == 500 else None
+    )
+    with pytest.raises(TypeError):
+        http_guard(policy=unrelated_class_policy).check_response(
+            HttpResponse(status_code=500, headers={}, body=b"err")
+        )
+
+    non_class_policy = HttpPolicy(
+        status_classifier=lambda code, resp: "FatalError" if code == 500 else None
+    )
+    with pytest.raises(TypeError):
+        http_guard(policy=non_class_policy).check_response(
+            HttpResponse(status_code=500, headers={}, body=b"err")
+        )
+
+
 def test_guard_request_retry_loop() -> None:
     attempts = 0
 

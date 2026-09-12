@@ -360,6 +360,33 @@ def _validate_suspend_ttl(value: Any) -> float:
     return float(value)
 
 
+def _resolve_category(cls: Any) -> Optional[Type[BaseException]]:
+    """将策略分类器返回值归一为三分类基类（支持子类），非法返回值 fail-loud。
+
+    status_classifier / exception_classifier 的签名允许返回三分类异常的子类；
+    消费端若以 identity 比较分派，子类会全分支不命中——4xx 错误响应被静默
+    当成功返回。返回值与三分类均无子类关系（或根本不是异常类）属违反
+    HttpPolicy 契约的编程错误，必须显式报错而非静默吞掉。
+    """
+    if cls is None:
+        return None
+    if not isinstance(cls, type) or not issubclass(cls, BaseException):
+        raise TypeError(
+            f"policy classifier must return an exception class or None, got {cls!r}"
+        )
+    # RateLimitHit 是 RetryError 子类，必须先于 RetryError 判定。
+    if issubclass(cls, RateLimitHit):
+        return RateLimitHit
+    if issubclass(cls, FatalError):
+        return FatalError
+    if issubclass(cls, RetryError):
+        return RetryError
+    raise TypeError(
+        "policy classifier must return RateLimitHit/FatalError/RetryError "
+        f"or a subclass thereof, or None; got {cls!r}"
+    )
+
+
 class http_guard:
     """HTTP 请求守卫（上下文管理器）。
 
@@ -408,7 +435,7 @@ class http_guard:
         if status_code is None:
             return
 
-        cls = self.policy.classify_status(status_code, response)
+        cls = _resolve_category(self.policy.classify_status(status_code, response))
         if cls is RateLimitHit:
             headers = getattr(response, "headers", None)
             retry_after = self.policy.extract_retry_after(headers)
@@ -425,7 +452,7 @@ class http_guard:
         if exc_val is None:
             return False
 
-        cls = self.policy.classify_exception(exc_val)
+        cls = _resolve_category(self.policy.classify_exception(exc_val))
         if cls is RateLimitHit or isinstance(exc_val, RateLimitHit):
             ttl = getattr(exc_val, "_retry_after", None)
             if ttl is None:
