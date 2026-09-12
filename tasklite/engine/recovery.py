@@ -71,7 +71,8 @@ class RecoveryOrchestrator:
            monotonic 值跨进程/重启无意义（每次加载由持久化 wall_deadline
            重推导），保留行无需回写磁盘——这正是消除覆盖窗口的前提。
         3. 残留过滤：过滤已在 wall/failed 中且不符合 rerun 策略的残留。
-        4. UID 去重：同一 UID 重复条目保留首条。
+        4. UID 去重：同一 UID 重复条目保留首条；磁盘重读与快照的同 uid
+           重逢属合并预期内的镜像行（静默收敛），仅快照内部的真实异常重复告警。
         5. 差量落盘：仅对残留行按 uid 定向 DELETE（delete_queue_uids）。
            不变式：修复基准是加载时刻的陈旧快照，严禁以其全表 save_queue
            重写——重写会静默吞掉窗口期他进程已应答成功的入队（磁盘与内存
@@ -94,7 +95,13 @@ class RecoveryOrchestrator:
         clean_q = []
         dropped_uids: list = []
 
-        for jd in list(q_data) + disk_q:
+        # 快照在前、磁盘重读在后：磁盘行与快照行的同 uid 重逢属合并预期内
+        # 的镜像行（快照必然先到并保首条），静默跳过；仅快照内部的真实重复
+        # 走告警分支（磁盘内重复被 uid 主键排除）——否则每次启动对队列每条
+        # 存量作业误报一条 duplicate，日志洪水淹没真实漂移信号。
+        snapshot_len = len(q_data)
+
+        for idx, jd in enumerate(list(q_data) + disk_q):
             # 1. 退避换算（委托强类型 JobRuntimeState 对齐双时钟）
             rt_state = JobRuntimeState.from_dict(jd.get("runtime"))
             rt_state.align_wall_clock(now, wall_now)
@@ -118,6 +125,8 @@ class RecoveryOrchestrator:
             # 3. 去重（保留首条）。去重命中项不参与磁盘删除：uid 主键约束下
             # 磁盘不存在重复行，按 uid 删除会连同保留首条一并误删。
             if u in seen_uid:
+                if idx >= snapshot_len:
+                    continue
                 logger.warning(
                     f"Loading duplicate uid {u} in queue; keeping first occurrence "
                     f"(dropping {len(clean_q)}-th)."
