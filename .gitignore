@@ -58,4 +58,4 @@ _vcheck.txt
 # 本地工具环境与审计支线产物（不入库）
 .venv*/
 security_audit/
-reports/bughunt/02_mutmut_run.log
+reports/
