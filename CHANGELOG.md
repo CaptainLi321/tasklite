@@ -8,6 +8,22 @@
 
 暂无。
 
+## [1.2.1] - 2026-09-12
+
+缺陷修复版本：收敛夜间 bug 检查批次（静态检查、变异测试分诊、性质测试扩容）确认的缺陷，并修复下游反馈的 every_run 重试断言崩溃。
+
+### 修复
+
+- 修复 `every_run`/`on_failure` 等重跑任务带 wall/failed 历史行进入重试时，`InFlightTracker.settle` 对已注销并重入队的作业做第二次注销、抹掉 rerun 豁免集合，导致主循环 `AssertionError: uid in wall/failed and queue` 崩溃的问题；同时将 DEBUG 六集合互斥断言的豁免判定锚定到 queue 中 job dict 的 `rerun` 事实源（运行时语义无变化，无需数据迁移）。
+- 修复 `sanitize_identifier` 家族两处单射性破坏（多对一碰撞会在 wall 去重时静默吞任务）：空值哨兵与字面输入 `"untitled"` 碰撞（改为像集外形态 `%untitled`，既有输入映射不变）；截断输出落入恒等域形成确定性自碰撞，且 8 位十六进制指纹生日界过弱（改为 `%_` 像集外标记 + 16 位十六进制全文指纹，`max_len` 不足以容纳截断形态时 fail-loud 抛 `ValueError`）。注意：空串与超长标识符的派生路径/UID 会与旧版本不同，其他输入的既有映射不受影响。
+- 补齐 `engine/scheduler.py`、`engine/inflight.py` 注解引用的缺失 typing 导入（此前被惰性求值掩盖，内省时即 `NameError`），并新增核心层注解可内省性卫生门禁。
+- 删除 `StateStore.backend` 同名重复 property 定义（后者静默覆盖前者），并新增类成员重名 AST 门禁。
+- `StateStore.wall_uids` / `failed_uids` / `queue_uids` 兑现不可变快照契约（返回 frozenset，此前实际返回活引用集合）。
+
+### 测试
+
+- 新增 21 个 hypothesis 性质测试（单射转义全域单射与往返、RunSession 钩子契约与幂等、wall/failed 终态互斥）与 38 个「变异必红」回归测试（flock 锁互斥、`apply_failed` 与 in-flight 注销联动、`run()` 防重入、瞬态信号不烧重试预算零污染、DLQ `_attempt` 合并语义、rerun 策略矩阵与依赖环检测）。
+
 ## [1.2.0] - 2026-09-10
 
 架构深化版本：引擎全面完成深模块收敛，移除全部内部弃用面，并新增官方 HTTP 网络工具库。
