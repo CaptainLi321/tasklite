@@ -439,7 +439,10 @@ class http_guard:
             if not getattr(exc_val, "_suspended", False):
                 if self.ctx is not None and self.resource is not None and hasattr(self.ctx, "suspend_resource"):
                     self.ctx.suspend_resource(self.resource, ttl)
-                setattr(exc_val, "_suspended", True)
+                    # 不变式：_suspended 仅在本守卫真实执行挂起后置位。内层守卫
+                    # 因 ctx/resource 缺失未挂起时不得置位，否则外层守卫误判
+                    # 「已挂起」而跳过，挂起信号既不进内存列表也不落盘。
+                    setattr(exc_val, "_suspended", True)
 
             if isinstance(exc_val, RateLimitHit):
                 raise exc_val
