@@ -181,29 +181,46 @@ class EngineRuntime:
             raise RuntimeError("Pipeline run() already in progress on this instance.")
         self._is_running = True
 
-        # 1. 单运行排他文件锁
-        if opts.acquire_run_lock:
-            lock_fd = try_acquire_lock(self.config.ipc_dir, "__pipeline_run__", timeout=0)
-            if lock_fd is None:
-                self._is_running = False
-                raise RuntimeError(
-                    f"Another run() is in progress for state_dir {self.config.ipc_dir}; "
-                    f"concurrent runs on the same state are forbidden."
-                )
-            self._run_lock_fd = lock_fd
-
-        # 2. 信号陷阱
         old_sigterm = None
         old_sigint = None
-        if opts.install_signals:
-            try:
-                old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
-            except (ValueError, OSError):
-                pass
-            try:
-                old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
-            except (ValueError, OSError):
-                pass
+        # 不变式：任何离开 execute() 的路径都必须复位 _is_running 并释放已
+        # 获取的锁 fd。初始化段（锁获取 + 信号陷阱）故障同样走该收尾，但
+        # 不触发 fire_run_end——run 尚未 begin，on_run_end 只属于已开始的 run。
+        try:
+            # 1. 单运行排他文件锁（try_acquire_lock 契约：仅「锁被占」返回
+            #    None，权限/磁盘满等环境故障抛 OSError，语义必须上抛不吞）。
+            #    fd 返回值立即注册（None 注册无害）：注册前的 KI 窗口是解释器
+            #    字节码级、纯 Python 无法消除，此处收敛到最小。
+            if opts.acquire_run_lock:
+                self._run_lock_fd = try_acquire_lock(
+                    self.config.ipc_dir, "__pipeline_run__", timeout=0
+                )
+                if self._run_lock_fd is None:
+                    raise RuntimeError(
+                        f"Another run() is in progress for state_dir {self.config.ipc_dir}; "
+                        f"concurrent runs on the same state are forbidden."
+                    )
+
+            # 2. 信号陷阱
+            if opts.install_signals:
+                try:
+                    old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
+                except (ValueError, OSError):
+                    pass
+                try:
+                    old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
+                except (ValueError, OSError):
+                    pass
+        except BaseException:
+            if old_sigterm is not None:
+                signal.signal(signal.SIGTERM, old_sigterm)
+            if old_sigint is not None:
+                signal.signal(signal.SIGINT, old_sigint)
+            if self._run_lock_fd is not None:
+                release_lock(self._run_lock_fd)
+                self._run_lock_fd = None
+            self._is_running = False
+            raise
 
         try:
             self._preflight_picklable_callbacks()
