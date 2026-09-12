@@ -162,46 +162,50 @@ class RecoveryOrchestrator:
     def save_queue_crash_safe(self) -> None:
         """崩溃路径保存队列：以「磁盘真相」合并「内存队列」，避免丢失作业。
 
-        崩溃处理器不能盲目用内存队列全量覆盖磁盘——在以下窗口内，内存队列
-        会缺失磁盘上仍存在的作业：
+        崩溃处理器不能盲目用内存队列全量覆盖磁盘——内存队列在以下窗口会
+        缺失磁盘上仍存在的作业：
           - ``_dispatch_job`` 的 pop 之后、try 之前（作业既不在内存也不在 in-flight）；
           - ``_complete_job`` 的 commit 成功之后、apply 到内存之前（spawned 子任务、
             retry 重入队已在磁盘提交但内存未同步）。
 
-        此方法重新加载磁盘队列，把「磁盘有而内存没有」的作业补回队首，
-        再按 uid 去重保存（含内存自身的重复，来自异常路径的双 requeue）。
+        读真相 → 合并 → 写回必须收敛进单个写事务
+        （``replace_queue_atomic``）：跨进程 enqueue 与本保存并发时，其
+        要么先于事务提交（进入磁盘真相、被合并保留），要么等事务提交后
+        再落盘——两段式独立 load/save 的中间态会把窗口期他进程已应答
+        成功的入队静默抹除（磁盘内存双失、永不再现，at-least-once 击穿）。
+
+        保存失败（读/写/合并任一）由原语整体回滚保持磁盘原状，此处降级
+        告警且不打断停机收尾序列——内存独有作业的丢失由下次启动的
+        at-least-once 重扫吸收。
         """
+        def _merge(disk_q: list) -> list:
+            mem_q = self._store.queue
+            mem_uids = {uid_from_job_dict(jd) for jd in mem_q}
+            # 磁盘有而内存没有的作业（commit/pop 窗口内丢失的）补回队首
+            extra = [jd for jd in disk_q if uid_from_job_dict(jd) not in mem_uids]
+            if extra:
+                logger.warning(
+                    f"Crash-safe save: recovered {len(extra)} job(s) from disk "
+                    f"that were missing in memory."
+                )
+            # 内存内按 uid 去重（异常路径可能重复 requeue 同一作业）
+            seen: set = set()
+            dedup_mem = []
+            for jd in mem_q:
+                u = uid_from_job_dict(jd)
+                if u in seen:
+                    continue
+                seen.add(u)
+                dedup_mem.append(jd)
+            return extra + dedup_mem
+
         try:
-            disk_q = self._store.backend.load_queue()
+            self._store.backend.replace_queue_atomic(_merge)
         except Exception as e:
-            # load 失败不得用空列表继续覆盖——磁盘上「已
-            # commit 但内存未同步」的作业会在此次保存中被永久抹除（覆盖
-            # 用空 disk 基准）。磁盘至少是上次成功保存的状态，保留原样
-            # 比覆盖更安全；内存丢失由 at-least-once 重跑吸收。
             logger.error(
-                f"Failed to reload queue from disk for crash-safe save; "
-                f"skipping overwrite to preserve disk truth: {e}"
+                f"Crash-safe queue save failed; disk preserved as-is, "
+                f"in-memory-only jobs will be re-run by at-least-once: {e}"
             )
-            return
-        mem_q = self._store.queue
-        mem_uids = {uid_from_job_dict(jd) for jd in mem_q}
-        # 磁盘有而内存没有的作业（commit/pop 窗口内丢失的）补回队首
-        extra = [jd for jd in disk_q if uid_from_job_dict(jd) not in mem_uids]
-        if extra:
-            logger.warning(
-                f"Crash-safe save: recovered {len(extra)} job(s) from disk "
-                f"that were missing in memory."
-            )
-        # 内存内按 uid 去重（异常路径可能重复 requeue 同一作业）
-        seen: set = set()
-        dedup_mem = []
-        for jd in mem_q:
-            u = uid_from_job_dict(jd)
-            if u in seen:
-                continue
-            seen.add(u)
-            dedup_mem.append(jd)
-        self._store.backend.save_queue(extra + dedup_mem)
 
 
     def apply_pending_signals(self) -> None:

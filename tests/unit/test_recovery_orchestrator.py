@@ -189,18 +189,69 @@ class TestRecoveryOrchestratorCrashSafeSave:
         # j1 必须被补回队首
         assert disk_uids == ["t::j1", "t::j2"]
 
+    def test_crash_safe_save_preserves_job_enqueued_in_merge_window(self, tmp_path, monkeypatch):
+        """合并窗口内他进程已应答成功的入队必须在保存后仍存在于磁盘。
+
+        磁盘上的 ``late`` 等价于「读磁盘真相与写回之间」他进程 enqueue
+        已提交的作业（已落盘、本进程内存未感知）：整表覆盖保存会将其
+        静默抹除（磁盘内存双失、永不再现）。同时结构锁定：合并保存必须
+        经单事务原语收敛读-改-写，禁止退化为独立 load/save 两段式。
+        """
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([{"task_type": "t", "job_id": "k1"}])
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
+        orig_load = backend.load_queue  # monkeypatch 前保存原始读法（断言用）
+
+        # 内存队列持 k1 的更新版本（runtime/payload 演进），未感知 late
+        state = PipelineState(
+            {}, {}, {}, [{"task_type": "t", "job_id": "k1", "payload": {"v": 2}}]
+        )
+        orchestrator = make_orchestrator(backend, state=state)
+
+        legacy_calls = []
+        monkeypatch.setattr(backend, "load_queue", lambda: legacy_calls.append("load"))
+        monkeypatch.setattr(backend, "save_queue", lambda jobs: legacy_calls.append("save"))
+
+        orchestrator.save_queue_crash_safe()
+
+        assert legacy_calls == [], "合并保存必须经单事务原语，不得两段式 load/save"
+        disk_q = orig_load()
+        disk_uids = [j["task_type"] + "::" + j["job_id"] for j in disk_q]
+        # 窗口期入队被磁盘真相合并保留并补回队首；k1 以内存版本内容落盘
+        assert disk_uids == ["t::late", "t::k1"]
+        assert disk_q[1]["payload"] == {"v": 2}
+
+    def test_crash_safe_save_merge_window_aligned_on_memory_backend(self):
+        backend = InMemoryStateBackend()
+        backend.save_queue([{"task_type": "t", "job_id": "k1"}])
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
+
+        state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "k1"}])
+        orchestrator = make_orchestrator(backend, state=state)
+
+        orchestrator.save_queue_crash_safe()
+
+        disk_uids = [j["task_type"] + "::" + j["job_id"] for j in backend.load_queue()]
+        assert disk_uids == ["t::late", "t::k1"]
+
     def test_crash_safe_save_skips_overwrite_if_disk_load_fails(self):
         backend = InMemoryStateBackend()
         backend.save_queue([{"task_type": "t", "job_id": "safe_on_disk"}])
 
-        # 模拟磁盘读取异常
-        backend.load_queue = MagicMock(side_effect=IOError("Disk corruption"))
+        # 模拟保存原语失败（读真相/写回任一阶段）
+        def _boom(compute):
+            raise IOError("Disk corruption")
+
+        backend.replace_queue_atomic = _boom
 
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "in_mem"}])
         orchestrator = make_orchestrator(backend, state=state)
 
-        # 不应抛出异常，也不应覆盖磁盘
+        # 不应抛出异常，也不应覆盖磁盘（内存独有作业由 at-least-once 吸收）
         orchestrator.save_queue_crash_safe()
+
+        disk_uids = [j["task_type"] + "::" + j["job_id"] for j in backend.load_queue()]
+        assert disk_uids == ["t::safe_on_disk"]
 
 
 class TestRecoveryOrchestratorSuspendPersistence:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..taxonomy import (
     ERR_COMMIT_FAILURE_DLQ,
@@ -49,7 +49,33 @@ class AbstractStateBackend(ABC):
     def load_queue(self) -> List[Dict[str, Any]]: ...
 
     @abstractmethod
-    def save_queue(self, jobs: List[Dict[str, Any]]) -> None: ...
+    def save_queue(self, jobs: List[Dict[str, Any]]) -> None:
+        """整表重写队列（测试装配 / replace_queue_atomic 的事务内步骤）。
+
+        红线：这是「无读基准的整表覆盖」——跨进程并发的 enqueue/commit
+        若提交在本方法执行前的任意时刻，其已落盘行会被无条件抹除。进程内
+        任何「先读磁盘真相再决定写什么」的合并保存（崩溃恢复路径）严禁
+        直接调用本方法，必须走 ``replace_queue_atomic`` 把读-改-写收敛进
+        单个写事务。
+        """
+
+    @abstractmethod
+    def replace_queue_atomic(
+        self,
+        compute: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]],
+    ) -> None:
+        """读-改-写收敛的整表替换：磁盘真相读取与写回在单个写事务内完成。
+
+        ``compute`` 在写锁内接收按序排列的磁盘队列快照，返回替换后的完整
+        队列。不变式：并发方（跨进程 enqueue / delta commit）要么先于本
+        事务提交（其行进入磁盘真相、参与合并，绝不丢失），要么排队等本
+        事务提交后再落盘——「读真相 → 计算 → 写回」之间不存在无锁窗口，
+        陈旧快照永远无法覆盖窗口期他进程已应答的新写入。
+
+        ``compute`` 必须是纯计算（锁内执行，不得调用任何后端写方法，否则
+        跨连接写请求会以写锁互斥死等）。单事务原子：``compute`` 抛异常或
+        写失败时整体回滚，磁盘保持调用前状态，异常向外传播。
+        """
 
     @abstractmethod
     def commit_job_success(

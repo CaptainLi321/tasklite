@@ -354,3 +354,63 @@ class TestBackendCommitAtomicity:
 
         assert ok is True
         assert b.load_failed()["t::1"]["_attempt"] == 7
+
+
+class TestReplaceQueueAtomic:
+    """读-改-写收敛的整表替换原语契约（双腿对齐）。
+
+    不变式：compute 在写锁内接收磁盘真相快照；compute 抛异常 ⇒ 队列与
+    调用前完全一致（对齐 SQLite 事务回滚）；替换以 compute 返回值为准。
+    """
+
+    def test_replace_result_wins_and_absent_rows_are_removed(self, dual_backend):
+        b = dual_backend
+        b.save_queue([
+            {"task_type": "t", "job_id": "k1"},
+            {"task_type": "t", "job_id": "gone"},
+        ])
+
+        def compute(disk_q):
+            assert [uid_from_job_dict(j) for j in disk_q] == ["t::k1", "t::gone"]
+            updated = dict(disk_q[0], payload={"v": 2})
+            fresh = {"task_type": "t", "job_id": "n1"}
+            return [updated, fresh]
+
+        b.replace_queue_atomic(compute)
+
+        q = b.load_queue()
+        assert [uid_from_job_dict(j) for j in q] == ["t::k1", "t::n1"]
+        assert q[0]["payload"] == {"v": 2}
+
+    def test_compute_receives_rows_enqueued_before_replace(self, dual_backend):
+        """替换前已提交（已应答成功）的入队必须进入磁盘真相快照，
+        不得被内存态或陈旧快照替代——这是窗口期入队存活的前提。"""
+        b = dual_backend
+        b.save_queue([{"task_type": "t", "job_id": "k1"}])
+        b.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
+
+        seen = {}
+
+        def compute(disk_q):
+            seen["uids"] = [uid_from_job_dict(j) for j in disk_q]
+            return disk_q
+
+        b.replace_queue_atomic(compute)
+
+        assert seen["uids"] == ["t::k1", "t::late"]
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1", "t::late"]
+
+    def test_replace_rolls_back_when_compute_raises(self, dual_backend):
+        b = dual_backend
+        b.save_queue([
+            {"task_type": "t", "job_id": "k1"},
+            {"task_type": "t", "job_id": "k2"},
+        ])
+
+        def boom(disk_q):
+            raise RuntimeError("merge failed")
+
+        with pytest.raises(RuntimeError):
+            b.replace_queue_atomic(boom)
+
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1", "t::k2"]
