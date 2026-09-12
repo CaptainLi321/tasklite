@@ -66,21 +66,27 @@ def escape_injective(
     - 若指定 allowed：仅 allowed 中的字符原样保留，其余字符转为 UTF-8 %XX；
     - 若指定 forbidden：可打印且非 forbidden 的字符原样保留，其余字符转为 UTF-8 %XX。
 
-    转义符 % 总是优先按 %25 处理，保证输出中的 %XX 序列无二义性。
+    转义符 % 无条件优先按 %25 处理（不依赖 % 是否落在 forbidden/allowed 集内），
+    保证任意配置下输出中的 %XX 序列无二义性——否则自定义 forbidden="/" 时
+    "/" 与字面 "%2F" 输出同形碰撞。
     """
     parts = []
     text_str = str(text)
     if allowed is not None:
         allowed_set = set(allowed)
         for ch in text_str:
-            if ch in allowed_set:
+            if ch == _PERCENT_ESCAPE:
+                parts.append(_PERCENT_ESCAPED)
+            elif ch in allowed_set:
                 parts.append(ch)
             else:
                 parts.append("".join(f"%{b:02X}" for b in ch.encode("utf-8")))
     else:
         forbidden_set = set(forbidden or DEFAULT_FORBIDDEN)
         for ch in text_str:
-            if ch.isprintable() and ch not in forbidden_set:
+            if ch == _PERCENT_ESCAPE:
+                parts.append(_PERCENT_ESCAPED)
+            elif ch.isprintable() and ch not in forbidden_set:
                 parts.append(ch)
             else:
                 parts.append("".join(f"%{b:02X}" for b in ch.encode("utf-8")))

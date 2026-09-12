@@ -41,6 +41,17 @@ def test_escape_injective_bijection_no_collisions():
     assert len(set(outputs)) == len(outputs), "All distinct inputs must produce distinct outputs"
 
 
+def test_escape_injective_percent_escapes_first_under_custom_charset():
+    # % 无条件先行转义，不依赖其是否落入自定义 forbidden/allowed 集：
+    # 否则 forbidden="/" 时 "/" 与字面 "%2F" 输出同形碰撞
+    assert escape_injective("/", forbidden="/") == "%2F"
+    assert escape_injective("%2F", forbidden="/") == "%252F"
+    assert escape_injective("%", forbidden="/") == "%25"
+    assert escape_injective("a/%", forbidden="/") == "a%2F%25"
+    # allowed 模式同样先行转义
+    assert escape_injective("a%b", allowed="ab") == "a%25b"
+
+
 def test_sanitize_identifier_fallbacks_and_limits():
     # 空值哨兵处于单射转义像集之外：与字面 "untitled" 等任何真实输入零碰撞
     assert sanitize_identifier("") == EMPTY_SENTINEL
