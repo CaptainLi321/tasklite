@@ -8,7 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from .base import AbstractStateBackend, classify_error_type
+from .base import (
+    AbstractStateBackend,
+    classify_error_type,
+    validate_queue_replacement,
+)
 from ..models.state import uid_from_job_dict
 from ..utils.jsonutil import dumps, loads
 
@@ -240,10 +244,15 @@ class SQLiteStateBackend(AbstractStateBackend):
     def _rewrite_queue_rows(self, conn, jobs: List[Dict[str, Any]]) -> None:
         """queue 表整表重写的单一出口（save_queue 与 replace_queue_atomic 共用）。
 
+        写变前先经 ``validate_queue_replacement`` 校验替换集（None/非法形状
+        fail-loud 抛 TypeError，不触发 DELETE）——否则 None 会让「DELETE
+        全表 + INSERT 全跳」静默清空队列且事务正常提交。
+
         保存兜底去重：传入重复 uid 时保留首条 + 告警（而非 REPLACE 静默
         覆盖为最后一条）——与加载期去重策略一致，杜绝 `_queue_uids` set 与
         queue list 的漂移。调用方必须已持写事务（显式或隐式）。
         """
+        validate_queue_replacement(jobs)
         conn.execute('DELETE FROM queue')
         if jobs:
             seen: set = set()

@@ -414,3 +414,61 @@ class TestReplaceQueueAtomic:
             b.replace_queue_atomic(boom)
 
         assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1", "t::k2"]
+
+
+class TestQueueReplacementShapeValidation:
+    """整表替换集形状契约（双腿一致）。
+
+    不变式：替换集非法（None / 非序列 / 元素非 dict）必须在任何写变之前
+    fail-loud 抛 TypeError——SQLite 腿若在 DELETE 后才察觉，会静默清空
+    整条队列且事务正常提交；Memory 腿对同一输入必须行为一致。
+    """
+
+    def test_replace_with_none_compute_result_fails_loud(self, dual_backend):
+        """compute 漏写 return（返回 None）→ TypeError，队列原状。"""
+        b = dual_backend
+        b.save_queue([
+            {"task_type": "t", "job_id": "k1"},
+            {"task_type": "t", "job_id": "k2"},
+        ])
+
+        with pytest.raises(TypeError):
+            b.replace_queue_atomic(lambda disk_q: None)
+
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1", "t::k2"]
+
+    def test_replace_with_non_sequence_fails_loud(self, dual_backend):
+        """替换集为非序列（int / 单个 dict）→ TypeError，队列原状。"""
+        b = dual_backend
+        b.save_queue([{"task_type": "t", "job_id": "k1"}])
+
+        with pytest.raises(TypeError):
+            b.replace_queue_atomic(lambda disk_q: 42)
+        with pytest.raises(TypeError):
+            b.replace_queue_atomic(lambda disk_q: {"task_type": "t", "job_id": "x"})
+
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1"]
+
+    def test_replace_with_non_dict_item_fails_loud(self, dual_backend):
+        """替换集元素非 job dict → TypeError，队列原状。"""
+        b = dual_backend
+        b.save_queue([{"task_type": "t", "job_id": "k1"}])
+
+        with pytest.raises(TypeError):
+            b.replace_queue_atomic(
+                lambda disk_q: [{"task_type": "t", "job_id": "ok"}, "not-a-dict"]
+            )
+
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1"]
+
+    def test_save_queue_none_fails_loud(self, dual_backend):
+        """save_queue(None) → TypeError，队列原状（空列表仍合法清空）。"""
+        b = dual_backend
+        b.save_queue([{"task_type": "t", "job_id": "k1"}])
+
+        with pytest.raises(TypeError):
+            b.save_queue(None)
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1"]
+
+        b.save_queue([])
+        assert b.load_queue() == []
