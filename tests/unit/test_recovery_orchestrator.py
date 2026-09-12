@@ -1,5 +1,6 @@
 """RecoveryOrchestrator 故障恢复编排深模块单元测试套件。"""
 
+import logging
 import math
 import time
 from unittest.mock import MagicMock
@@ -167,6 +168,54 @@ class TestRecoveryOrchestratorRepairDeltaPersist:
         disk_uids = set(self._uids(backend.load_queue()))
         assert disk_uids == {"t::k1", "t::late"}
         assert set(self._uids(repaired)) == {"t::k1", "t::late"}
+
+
+class TestRecoveryOrchestratorRepairDuplicateWarning:
+    """repair 合并的去重告警语义：仅真实异常重复告警。
+
+    磁盘合并重读必然与加载快照全员重逢（镜像行）——镜像行不得进入
+    duplicate 告警分支，否则每次启动对队列每条存量作业误报一条，大队列
+    日志洪水淹没真实漂移信号；合并结果（行集与顺序）不受告警语义修正影响。
+    """
+
+    def test_disk_mirror_rows_do_not_emit_duplicate_warnings(self, tmp_path, caplog):
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([
+            {"task_type": "t", "job_id": "j1"},
+            {"task_type": "t", "job_id": "j2"},
+            {"task_type": "t", "job_id": "j3"},
+        ])
+        q_data = backend.load_queue()
+        # 窗口期并发入队：磁盘重读比快照多一行（合并预期内的新增，非重复）
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
+
+        orchestrator = make_orchestrator(backend)
+        with caplog.at_level(logging.WARNING, logger="tasklite"):
+            repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+
+        dup_msgs = [
+            r.getMessage() for r in caplog.records if "duplicate uid" in r.getMessage()
+        ]
+        assert dup_msgs == [], f"磁盘镜像行不得触发 duplicate 告警: {dup_msgs}"
+        assert [j["job_id"] for j in repaired] == ["j1", "j2", "j3", "late"]
+
+    def test_snapshot_internal_duplicate_still_warns(self, caplog):
+        backend = InMemoryStateBackend()
+        orchestrator = make_orchestrator(backend)
+        q_data = [
+            {"task_type": "t", "job_id": "j1"},
+            {"task_type": "t", "job_id": "j1"},
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="tasklite"):
+            repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+
+        dup_msgs = [
+            r.getMessage() for r in caplog.records if "duplicate uid" in r.getMessage()
+        ]
+        assert len(dup_msgs) == 1, f"快照内部真实重复必须恰好告警一次: {dup_msgs}"
+        assert "t::j1" in dup_msgs[0]
+        assert [j["job_id"] for j in repaired] == ["j1"]
 
 
 class TestRecoveryOrchestratorCrashSafeSave:
