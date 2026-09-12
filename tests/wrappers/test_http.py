@@ -3,6 +3,7 @@ from __future__ import annotations
 import email.utils
 import io
 import json
+import math
 import socket
 import threading
 import time
@@ -129,6 +130,59 @@ def test_http_policy_retry_after_parsing() -> None:
     # 无效格式
     assert policy.extract_retry_after({}) is None
     assert policy.extract_retry_after({"Retry-After": "invalid-val"}) is None
+
+
+def test_extract_retry_after_non_positive_returns_none() -> None:
+    """0/负数/非有限数/过期 HTTP-Date 均为「无有效时长」，返回 None 而非 clamp 0.0。
+
+    不变式：仅正值具备挂起语义。TaskContext.suspend_resource 对 seconds<=0
+    fail-loud，clamp 放行的 0.0 会在守卫 __exit__ 内以 ValueError 替换限流信号。
+    """
+    policy = HttpPolicy()
+
+    assert policy.extract_retry_after({"Retry-After": "0"}) is None
+    assert policy.extract_retry_after({"Retry-After": "-5"}) is None
+    assert policy.extract_retry_after({"Retry-After": "inf"}) is None
+    assert policy.extract_retry_after({"Retry-After": "nan"}) is None
+
+    past_date = email.utils.formatdate(time.time() - 600, usegmt=True)
+    assert policy.extract_retry_after({"Retry-After": past_date}) is None
+
+    # 有效正值语义不回归
+    assert policy.extract_retry_after({"Retry-After": "2.5"}) == 2.5
+
+
+class _StrictSuspendCtx:
+    """与引擎 TaskContext.suspend_resource 入口校验同构的最小上下文。"""
+
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    def suspend_resource(self, name: str, seconds: float) -> None:
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError(f"seconds must be finite and > 0, got {seconds!r}")
+        self.calls.append((name, seconds))
+
+
+@pytest.mark.parametrize("hdrs", [{"Retry-After": "0"}, {"Retry-After": "-3"}])
+def test_http_guard_invalid_retry_after_falls_back_to_default_ttl(hdrs: dict) -> None:
+    """429 携带非法 Retry-After 时必须回落 default_suspend_ttl 并保持限流信号原样抛出。
+
+    挂起信号必须以正时长落盘：若 0.0 直达 suspend_resource，入口 ValueError
+    会替换 RateLimitHit，worker 兜底改写 error 终态——限流信号零落盘且任务
+    以 UNKNOWN 终态误入 DLQ 不再重试。
+    """
+    ctx = _StrictSuspendCtx()
+    with pytest.raises(RateLimitHit):
+        with http_guard(ctx=ctx, resource="api_x", default_suspend_ttl=60.0):
+            raise urllib.error.HTTPError(
+                url="https://x.com",
+                code=429,
+                msg="Too Many Requests",
+                hdrs=hdrs,
+                fp=None,
+            )
+    assert ctx.calls == [("api_x", 60.0)]
 
 
 # ==============================================================================
