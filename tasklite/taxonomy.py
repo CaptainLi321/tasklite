@@ -879,6 +879,14 @@ def classify_exception(
 ) -> str:
     """异常三分类的生产语义，返回 retry/fatal/error。"""
     if isinstance(registry, ErrorTaxonomy):
+        # 不变式：taxonomy 实例已持完整分类策略，显式 kwargs 与其互斥——
+        # 静默忽略会让同一调用仅因 registry 形态不同而语义翻转。
+        if fatal_exceptions is not None or transient_exceptions is not None:
+            raise TypeError(
+                "fatal_exceptions/transient_exceptions cannot be combined with an "
+                "ErrorTaxonomy instance — it already carries the resolved policy; "
+                "pass a registry snapshot tuple instead"
+            )
         cl = registry.classify(exc)
     elif fatal_exceptions is None and transient_exceptions is None and not registry:
         cl = _DEFAULT_TAXONOMY.classify(exc)

@@ -29,6 +29,7 @@ from tasklite.taxonomy import (
     ErrorClassification,
     ErrorTaxonomy,
     ValidationResult,
+    classify_exception,
 )
 
 
@@ -294,3 +295,32 @@ class TestConstructorPolicyValidation:
         assert taxonomy.classify(KeyError("k")).is_fatal is True
         assert taxonomy.classify(TimeoutError("t")).is_transient is True
         assert taxonomy.classify(ConnectionError("c")).is_retry is True
+
+
+class TestClassifyExceptionKwargsContract:
+    """classify_exception 的 registry 形态与显式 kwargs 契约。"""
+
+    def test_taxonomy_with_explicit_kwargs_rejected(self):
+        """ErrorTaxonomy 已持完整分类策略：显式 kwargs 与其互斥，fail-loud 而非静默清零。
+
+        静默忽略会让同一调用仅因 registry 形态不同（taxonomy vs 元组）
+        语义翻转——taxonomy 分支返回 error、空元组分支返回 fatal。
+        """
+        taxonomy = ErrorTaxonomy()
+        with pytest.raises(TypeError, match="fatal_exceptions"):
+            classify_exception(ValueError("boom"), taxonomy, fatal_exceptions=(ValueError,))
+        with pytest.raises(TypeError, match="transient_exceptions"):
+            classify_exception(
+                ValueError("boom"), taxonomy, transient_exceptions=(ValueError,)
+            )
+
+    def test_taxonomy_without_kwargs_uses_taxonomy_policy(self):
+        taxonomy = ErrorTaxonomy()
+        assert classify_exception(ValueError("boom"), taxonomy) == "error"
+        assert classify_exception(KeyError("k"), taxonomy) == "fatal"
+
+    def test_tuple_registry_with_kwargs_still_effective(self):
+        assert (
+            classify_exception(ValueError("boom"), (), fatal_exceptions=(ValueError,))
+            == "fatal"
+        )
