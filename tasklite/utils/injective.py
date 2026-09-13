@@ -68,13 +68,15 @@ def escape_injective(
 
     转义符 % 无条件优先按 %25 处理（不依赖 % 是否落在 forbidden/allowed 集内），
     保证任意配置下输出中的 %XX 序列无二义性——否则自定义 forbidden="/" 时
-    "/" 与字面 "%2F" 输出同形碰撞。
+    "/" 与字面 "%2F" 输出同形碰撞。非 str 输入显式 TypeError 拒绝：隐式
+    str() 强转会让 None 与字面 "None" 同像碰撞，破坏单射契约。
     """
+    if not isinstance(text, str):
+        raise TypeError(f"text must be a str, got {type(text).__name__} ({text!r})")
     parts = []
-    text_str = str(text)
     if allowed is not None:
         allowed_set = set(allowed)
-        for ch in text_str:
+        for ch in text:
             if ch == _PERCENT_ESCAPE:
                 parts.append(_PERCENT_ESCAPED)
             elif ch in allowed_set:
@@ -83,7 +85,7 @@ def escape_injective(
                 parts.append("".join(f"%{b:02X}" for b in ch.encode("utf-8")))
     else:
         forbidden_set = set(forbidden or DEFAULT_FORBIDDEN)
-        for ch in text_str:
+        for ch in text:
             if ch == _PERCENT_ESCAPE:
                 parts.append(_PERCENT_ESCAPED)
             elif ch.isprintable() and ch not in forbidden_set:

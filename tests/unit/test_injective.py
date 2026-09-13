@@ -52,6 +52,15 @@ def test_escape_injective_percent_escapes_first_under_custom_charset():
     assert escape_injective("a%b", allowed="ab") == "a%25b"
 
 
+def test_escape_injective_rejects_non_str():
+    # 隐式 str() 强转会让 None 与字面 "None" 同像碰撞（多对一，破坏单射契约），
+    # 非 str 输入入口显式拒绝，不做静默强转
+    with pytest.raises(TypeError):
+        escape_injective(None)
+    with pytest.raises(TypeError):
+        escape_injective(123)
+
+
 def test_sanitize_identifier_fallbacks_and_limits():
     # 空值哨兵处于单射转义像集之外：与字面 "untitled" 等任何真实输入零碰撞
     assert sanitize_identifier("") == EMPTY_SENTINEL
