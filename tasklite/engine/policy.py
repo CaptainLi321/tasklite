@@ -423,7 +423,11 @@ class BackoffGovernor:
                 job.retries, job.backoff_base, job.backoff_max
             )
 
-        retry_dict = job.to_dict()
+        # 不变式：重试 = 原作业原样重入队——job_dict 顶层自定义字段随重试
+        # 往返保留；受管键以 job 权威状态覆写（retries 已递增等），runtime
+        # 单独重建。
+        retry_dict = dict(job_dict)
+        retry_dict.update(job.to_dict())
         retry_dict["resources"] = dict(job_dict.get("resources", {}))
         retry_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
         if retry_error and not transient:

@@ -245,6 +245,37 @@ class TestRetryPlanStateMachine:
         assert job.retries == 3  # 不增加
         assert 0.75 <= plan_lock.delay <= 1.0
 
+    def test_plan_retry_preserves_top_level_custom_fields(self):
+        """重试 = 原作业原样重入队：job_dict 顶层自定义字段随重试往返保留。
+
+        enqueue 对用户入队 dict 全量保留（自定义顶层字段合法落盘），重试
+        字典若只从 Job 固定 schema 序列化重建，自定义字段即静默丢失，落盘
+        的持久化队列行与用户原始入队不再一致。
+        """
+        from tasklite.engine.policy import ExecutionPolicy
+        from tasklite.models.job import Job
+
+        policy = ExecutionPolicy()
+        job_dict = {
+            "task_type": "t",
+            "job_id": "1",
+            "payload": {"k": "v"},
+            "resources": {"__workers__": 1.0},
+            "custom_field": "keepme",
+            "priority_hint": 7,
+        }
+        job = Job.from_dict(job_dict)
+
+        plan = policy.plan_retry(job, job_dict, retry_error="boom")
+        assert plan.going_to_retry is True
+        rd = plan.retry_dict
+        # 受管键以 job 权威状态为准（retries 已递增）
+        assert rd["retries"] == 1
+        assert rd["task_type"] == "t" and rd["job_id"] == "1"
+        # 顶层自定义字段原样保留
+        assert rd["custom_field"] == "keepme"
+        assert rd["priority_hint"] == 7
+
     def test_plan_orphan_defer_populates_runtime(self):
         from tasklite.engine.policy import ExecutionPolicy
 
