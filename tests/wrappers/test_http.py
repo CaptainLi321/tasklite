@@ -312,6 +312,31 @@ def test_http_guard_transient_and_fatal() -> None:
             )
 
 
+def test_http_policy_http_exception_family_transient() -> None:
+    """http.client.HTTPException 家族整体按瞬态传输故障分类。
+
+    BadStatusLine/LineTooLong 等 getresponse/read 阶段故障（代理/源站
+    提前断连的典型形态）不是 OSError，漏判会裸逃逸为零重试致命错误。
+    """
+    import http.client
+
+    policy = HttpPolicy()
+    for exc in (
+        http.client.HTTPException("base"),
+        http.client.BadStatusLine("''"),
+        http.client.LineTooLong("header"),
+        http.client.ResponseNotReady("x"),
+        http.client.CannotSendRequest(),
+        http.client.IncompleteRead(b"partial"),
+        http.client.RemoteDisconnected("x"),
+    ):
+        assert policy.classify_exception(exc) is RetryError, type(exc).__name__
+
+    # HTTPError 同属该家族，但仍按状态码精确分类，不落入家族兜底
+    err = urllib.error.HTTPError("https://api.test", 404, "Not Found", None, io.BytesIO(b""))
+    assert policy.classify_exception(err) is FatalError
+
+
 class _CustomFatal(FatalError):
     """模拟用户分类器返回的自定义 FatalError 子类（签名的自然用法）。"""
 
@@ -890,6 +915,43 @@ def test_fetch_urllib_500_retry(local_http_server: str) -> None:
 def test_fetch_urllib_404_fatal(local_http_server: str) -> None:
     with pytest.raises(FatalError):
         fetch_urllib(f"{local_http_server}/non_existent")
+
+
+def test_fetch_urllib_bad_status_line_raises_retry_error() -> None:
+    """残缺状态行（源站/代理提前断连）必须转换为 RetryError 退避重试。
+
+    urllib 的 do_open 只把 OSError 包装为 URLError，残缺状态行在
+    getresponse 阶段以裸 BadStatusLine 抛出——守卫必须将其归为瞬态，
+    不得放行裸异常（零重试直送死信队列）。
+    """
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    started = threading.Event()
+
+    def _broken_server() -> None:
+        try:
+            started.set()
+            conn, _ = server.accept()
+            try:
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.1 x\r\n\r\n")
+            finally:
+                conn.close()
+        except OSError:
+            pass
+        finally:
+            server.close()
+
+    t = threading.Thread(target=_broken_server, daemon=True)
+    t.start()
+    assert started.wait(timeout=5)
+    try:
+        with pytest.raises(RetryError):
+            fetch_urllib(f"http://127.0.0.1:{port}/x", timeout=5.0)
+    finally:
+        t.join(timeout=5)
 
 
 def test_fetch_requests_success(local_http_server: str) -> None:

@@ -325,15 +325,18 @@ class HttpPolicy:
         if hasattr(exc, "response") and getattr(exc.response, "status_code", None) is not None:
             return self.classify_status(exc.response.status_code, exc.response)
 
-        # 瞬态传输层错误（超时、连接重置、DNS 解析失败等）
+        # 瞬态传输层错误（超时、连接重置、DNS 解析失败等）。
+        # http.client.HTTPException 基类整体纳入：BadStatusLine/LineTooLong 等
+        # getresponse/read 阶段故障（代理/源站提前断连的典型形态）不是 OSError，
+        # 遗漏即裸逃逸为零重试致命错误；HTTPError 虽同为该家族成员，但已在
+        # 前置分支按状态码精确分类，不受此兜底影响。
         if isinstance(
             exc,
             (
                 urllib.error.URLError,
                 TimeoutError,
                 ConnectionError,
-                http.client.RemoteDisconnected,
-                http.client.IncompleteRead,
+                http.client.HTTPException,
                 OSError,
             ),
         ):
