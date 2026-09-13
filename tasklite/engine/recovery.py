@@ -132,6 +132,11 @@ class RecoveryOrchestrator:
                 if decision.should_skip:
                     dropped_uids.append(u)
                     continue
+                # 不变式：放行保留的重跑行必须落字面 rerun 键——PipelineState
+                # 构造期豁免登记以行内键为事实源，discovery 默认晚于入队注册
+                # 的动态兜底放行不得在加载态丢失豁免（否则任意其他作业的
+                # in-flight 登记即触发互斥断言）。
+                jd["rerun"] = decision.effective_rerun
 
             # 3. 去重（保留首条）。集合合并已收敛镜像行，此分支仅剩快照内部
             # 的真实重复告警。去重命中项不参与磁盘删除：uid 主键约束下

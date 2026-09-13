@@ -200,6 +200,10 @@ class DispatchMachine:
                 # 队列行无键而由动态兜底放行的重跑必须在此补登记，否则
                 # in-flight 登记的全量互斥断言会击落本关放行的作业。
                 store.mark_rerun_active(uid)
+                # 不变式：准入层放行的重跑，其有效策略必须落为行内字面键——
+                # 豁免事实随行持久，abort/retry/崩溃回滚的按字面键豁免重建
+                # （requeue/clear_in_flight/replace_queue）才不丢失动态放行事实。
+                job_dict["rerun"] = decision.effective_rerun
         return False
 
 

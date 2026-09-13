@@ -377,6 +377,77 @@ class TestDiscoveryDynamicFallbackRerun:
         assert "t::x" not in p.backend.load_failed(), "成功后 DLQ 残行清除"
         assert wall["t::x"]["run_count"] == 1
 
+    def test_abort_of_inflight_dynamic_rerun_preserves_exemption(self, tmp_path, monkeypatch):
+        """动态兜底重跑在途时 abort：豁免不得被按字面键的重建冲掉。
+
+        不变式：豁免事实随行持久——准入层放行的重跑把有效策略落为行内
+        字面键，abort 收尾的 settle→requeue→clear_in_flight 按字面键重建
+        豁免后，六集合互斥断言仍不得击落重入队的重跑作业；作业保持队列
+        （at-least-once），run() 以正常停机收尾而非 AssertionError。
+        """
+        import threading
+        import time
+
+        from tests.helpers import make_ipc_process_class, patch_multiprocessing_for_fakes
+
+        p = _pipeline(tmp_path, name="dyn_abort")
+        p.register_handler("t", _fail_then_ok_by_payload)
+        p.enqueue([Job("t", "x", payload={"attempt": 1}, max_retries=0)])
+        p.run()
+        assert "t::x" in p.backend.load_failed()
+
+        # 关键时序：先入队（discovery 默认未注册 → 队列行无字面 rerun 键），
+        # 后注册策略 → 派发期动态兜底放行 failed 命中重跑并派发在途。
+        p.enqueue([Job("t", "x", payload={"attempt": 2}, max_retries=0)])
+        p.set_discovery_rerun("t", "on_failure")
+
+        patch_multiprocessing_for_fakes(
+            monkeypatch,
+            fake_process_class=make_ipc_process_class(results=[None], stay_alive=True),
+        )
+
+        def controller():
+            for _ in range(500):
+                if p._runtime.in_flight:
+                    break
+                time.sleep(0.01)
+            p.stop(force=True)
+
+        t = threading.Thread(target=controller)
+        t.start()
+        p.run()
+        t.join()
+
+        assert "t::x" not in p.backend.load_wall(), "被 abort 的重跑不得误提交 wall"
+        assert "t::x" in p._runtime.state._rerun_active_uids, \
+            "abort 收尾后重入队的动态重跑必须保留豁免登记"
+        remaining = [j for j in p.backend.load_queue() if j.get("job_id") == "x"]
+        assert remaining, "被 abort 的重跑作业必须保留在磁盘队列（at-least-once）"
+        assert remaining[0].get("rerun") == "on_failure", \
+            "动态放行的有效策略必须落为行内字面键，豁免重建才不丢失"
+
+    def test_loaded_dynamic_rerun_row_exempt_before_any_dispatch(self, tmp_path):
+        """加载期滞留的动态重跑行：任何 in-flight 登记前必须已有豁免。
+
+        策略晚于入队注册时，repair 保留的 failed 命中无字面键行若不携带
+        豁免，先派发的任意其他作业在 in-flight 登记处即触发互斥断言。
+        """
+        p = _pipeline(tmp_path, name="dyn_load")
+        p.register_handler("t", _fail_then_ok_by_payload)
+        p.enqueue([Job("t", "x", payload={"attempt": 1}, max_retries=0)])
+        p.run()
+        assert "t::x" in p.backend.load_failed()
+
+        # y 先入队（先派发）；x 的队列行无字面 rerun 键且命中 failed。
+        p.enqueue([Job("t", "y", payload={"attempt": 2}, max_retries=0)])
+        p.enqueue([Job("t", "x", payload={"attempt": 2}, max_retries=0)])
+        p.set_discovery_rerun("t", "on_failure")
+        p.run()
+        wall = p.backend.load_wall()
+        assert "t::y" in wall
+        assert "t::x" in wall, "动态兜底放行的重跑必须真实执行并转 wall"
+        assert "t::x" not in p.backend.load_failed(), "成功后 DLQ 残行清除"
+
     def test_invariant_assertion_bypasses_dispatch_failure_budget(self, tmp_path, monkeypatch):
         """不变式断言穿透派发异常链：不记账、不误送 DLQ，作业保持队列。"""
         import tasklite.engine.dispatch as dispatch_mod
