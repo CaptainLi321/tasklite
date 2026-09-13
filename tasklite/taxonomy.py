@@ -666,6 +666,21 @@ class ErrorTaxonomy:
 
         errors: List[ValidationErrorItem] = []
         for res_name, amount in resources.items():
+            # 资源名必须为非空 str——非 str 键在调度侧判为未知资源（永不可跑）
+            # 且经 JSON 落盘后键强转为 str，同一作业跨重启从死锁翻转为可跑，
+            # 身份与账目漂移；与 suspend_resource 的资源名校验对称。
+            if not isinstance(res_name, str) or not res_name:
+                errors.append(
+                    ValidationErrorItem(
+                        field_path=f"{where}.{res_name!r}",
+                        code="INVALID_RESOURCE_NAME",
+                        expected="non-empty str",
+                        actual=type(res_name).__name__,
+                        message=f"resource name in {where} must be a non-empty str, "
+                        f"got {type(res_name).__name__} ({res_name!r})",
+                    )
+                )
+                continue
             if not isinstance(amount, (int, float)) or isinstance(amount, bool):
                 errors.append(
                     ValidationErrorItem(
@@ -722,7 +737,10 @@ class ErrorTaxonomy:
         res = self.validate_resources(resources, where)
         if not res.is_valid:
             first_err = res.errors[0]
-            if first_err.code in ("NOT_A_NUMBER", "BOOL_FORBIDDEN", "INVALID_RESOURCE_CONTAINER"):
+            if first_err.code in (
+                "NOT_A_NUMBER", "BOOL_FORBIDDEN", "INVALID_RESOURCE_CONTAINER",
+                "INVALID_RESOURCE_NAME",
+            ):
                 raise TypeError(first_err.message)
             raise ValueError(first_err.message)
 

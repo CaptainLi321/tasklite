@@ -354,6 +354,24 @@ class TestJobEdgeCases:
         with pytest.raises(TypeError, match="resources must be a dict"):
             Job("t", "id", resources=["cpu", 1.0])
 
+    def test_non_str_resource_name_rejected(self):
+        """非 str 资源名：调度侧判为未知资源（永不可跑），且 JSON 落盘后
+        键强转为 str，同一作业跨重启从死锁翻转为可跑（身份与账目漂移）；
+        构造期入口拒绝，与 suspend_resource 的资源名校验对称。"""
+        with pytest.raises(TypeError, match="must be a non-empty str"):
+            Job("t", "id", resources={1: 2.0})
+        with pytest.raises(TypeError, match="must be a non-empty str"):
+            Job("t", "id", resources={"": 2.0})
+
+    def test_non_str_resource_name_rejected_via_from_dict(self):
+        data = {
+            "task_type": "t", "job_id": "id", "payload": {},
+            "resources": {1: 2.0}, "retries": 0, "max_retries": 3,
+            "depends_on": [], "timeout": 60, "backoff_base": 2.0, "backoff_max": 300.0,
+        }
+        with pytest.raises(TypeError):
+            Job.from_dict(data)
+
     def test_zero_timeout_raises_valueerror(self):
         """timeout=0 now raises ValueError per  contract (timeout must be > 0)."""
         with pytest.raises(ValueError, match="timeout must be finite and > 0"):

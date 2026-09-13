@@ -230,6 +230,27 @@ class TestResourceValidation:
         assert res.is_valid is False
         assert res.errors[0].code == "OVERFLOW"
 
+    def test_invalid_resource_name_rejected(self):
+        taxonomy = ErrorTaxonomy()
+
+        # 非 str 资源名：调度侧判为未知资源（永不可跑），且 JSON 落盘后
+        # 键强转为 str，同一作业跨重启从死锁翻转为可跑——入口拒绝
+        res = taxonomy.validate_resources({1: 2.0})
+        assert res.is_valid is False
+        assert res.errors[0].code == "INVALID_RESOURCE_NAME"
+
+        # 空资源名同样拒绝
+        res = taxonomy.validate_resources({"": 2.0})
+        assert res.is_valid is False
+        assert res.errors[0].code == "INVALID_RESOURCE_NAME"
+
+        # 名称非法时不做 amount 校验（避免重复报告）
+        res = taxonomy.validate_resources({2: "bad"})
+        assert res.errors[0].code == "INVALID_RESOURCE_NAME"
+
+        with pytest.raises(TypeError, match="must be a non-empty str"):
+            taxonomy.ensure_resources_valid({1: 2.0})
+
     def test_ensure_resources_valid_exceptions(self):
         taxonomy = ErrorTaxonomy()
         with pytest.raises(TypeError, match="must be a number"):
