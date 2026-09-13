@@ -143,6 +143,88 @@ class TestArtifactJournalDeclarations:
         # 排空期间追加的信号在下一轮排空捞回（不丢）
         assert journal.drain_signals(uid) == [("api", 5.0)]
 
+    def test_drain_signals_salvages_orphan_draining_file(self, tmp_path, monkeypatch):
+        """排空中途读者死亡遗留的 .draining 孤儿必须在下次排空回收（先读后删）。
+
+        注入点：排空的 unlink 抛 OSError，模拟读者进程在 rename 后、unlink
+        前被 SIGKILL/断电（同一窗口）。此刻信号内容已脱离规范命名空间、困在
+        孤儿文件中——回收协议必须先读取分发孤儿内容再删除，直接丢弃会把
+        崩溃窗口放大成永久丢信号；孤儿文件本身不得在 ipc_dir 永久累积。
+        """
+        journal = ArtifactJournal(tmp_path)
+        uid = "job_sig_orphan"
+        journal.record_signal(uid, "api", 30.0)
+
+        def dying_unlink(self, *args, **kwargs):
+            raise OSError("reader died between rename and unlink")
+
+        monkeypatch.setattr(Path, "unlink", dying_unlink)
+        # 本次读取成功，但 unlink 失败遗留孤儿
+        assert journal.drain_signals(uid) == [("api", 30.0)]
+        monkeypatch.undo()
+
+        orphans = list(tmp_path.glob("*.draining"))
+        assert len(orphans) == 1, f"unlink 失败应遗留恰好一个孤儿，实际: {orphans}"
+
+        # 重启后的下一轮排空：孤儿信号捞回且孤儿清除（不丢不重）
+        assert journal.drain_signals(uid) == [("api", 30.0)]
+        assert list(tmp_path.glob("*.draining")) == []
+        assert journal.drain_signals(uid) == []
+
+    def test_drain_signals_merges_orphan_and_live_signals(self, tmp_path):
+        """孤儿与活跃信号文件并存时两者都必须读到，孤儿先于活跃内容。
+
+        排空读者死亡后 worker 按名新建规范信号文件继续追加，重启后的
+        首轮排空须同时回收孤儿内容与活跃文件内容，且不得遗留任何文件。
+        """
+        import os as os_mod
+        import time as time_mod
+
+        journal = ArtifactJournal(tmp_path)
+        uid = "job_sig_mixed"
+        signals_path = journal.signals_path(uid)
+        journal.record_signal(uid, "gpu", 30.0)
+        orphan = signals_path.with_name(
+            f"{signals_path.name}.{os_mod.getpid()}.{time_mod.monotonic_ns()}.draining"
+        )
+        os_mod.rename(signals_path, orphan)
+        journal.record_signal(uid, "api", 5.0)
+
+        assert journal.drain_signals(uid) == [("gpu", 30.0), ("api", 5.0)]
+        assert list(tmp_path.glob("*.draining")) == []
+        assert not signals_path.exists()
+        assert journal.drain_signals(uid) == []
+
+    def test_drain_signals_orphan_salvage_is_uid_scoped(self, tmp_path):
+        """孤儿回收按 uid 严格定界，不得回收前缀重叠的其他 uid 的孤儿。"""
+        import os as os_mod
+        import time as time_mod
+
+        journal = ArtifactJournal(tmp_path)
+        uid_a, uid_b = "job::a", "job::a::sibling"
+        journal.record_signal(uid_b, "gpu", 2.0)
+        b_path = journal.signals_path(uid_b)
+        orphan_b = b_path.with_name(
+            f"{b_path.name}.{os_mod.getpid()}.{time_mod.monotonic_ns()}.draining"
+        )
+        os_mod.rename(b_path, orphan_b)
+
+        # a 的排空不得触及 b 的孤儿
+        assert journal.drain_signals(uid_a) == []
+        assert orphan_b.exists()
+
+        # b 的排空回收自己的孤儿
+        assert journal.drain_signals(uid_b) == [("gpu", 2.0)]
+        assert not orphan_b.exists()
+
+        # 前缀恰好重叠的 uid（job::a.signals.jsonl）孤儿不得被 a 误回收
+        intruder = tmp_path / "job%3A%3Aa.signals.jsonl.signals.jsonl.7.8.draining"
+        intruder.write_text('{"suspend": ["api", 9.0]}\n', encoding="utf-8")
+        assert journal.drain_signals(uid_a) == []
+        assert intruder.exists()
+        assert journal.drain_signals("job::a.signals.jsonl") == [("api", 9.0)]
+        assert not intruder.exists()
+
 
 class TestArtifactJournalCleanupModes:
     def test_cleanup_pre_submit(self, tmp_path):

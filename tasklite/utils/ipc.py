@@ -32,6 +32,7 @@ _INPUTS_SUFFIX = ".inputs.jsonl"
 _RESULT_TMP_SUFFIX = ".result.json.tmp"
 _RESULT_SUFFIX = ".result.json"
 _INCARNATION_RE = re.compile(r"\.([0-9a-f]{32})\.(\d+)\.result\.json$")
+_DRAINING_RE = re.compile(r"\.(\d+)\.(\d+)\.draining$")
 _RAW_TUPLE_SENTINEL = "__tl_tuple_v1"
 
 
@@ -364,9 +365,13 @@ class ArtifactJournal:
         「读后 truncate 抹写」与「unlink 后按名写孤儿 inode」两类丢失窗口
         由该摘除序消除；残余窗口仅剩「worker 持旧 inode 的未落盘写跨过
         rename 且在读取 EOF 之后才 flush」，已收窄至微秒级。
+        不变式：读者自身在 rename 后、unlink 前死亡会把信号内容困在
+        .draining 孤儿中，每次排空必须先回收同名孤儿（先读取分发再删除，
+        直接丢弃会把崩溃窗口放大成永久丢信号），保证信号不丢不重。
         """
         if self.ipc_dir is None:
             return []
+        signals = self._salvage_draining_files(uid)
         path = self.signals_path(uid)
         # 摘除名须与原文件同目录（同文件系统是 rename 原子性的前提）
         draining = path.with_name(
@@ -375,10 +380,20 @@ class ArtifactJournal:
         try:
             os.rename(path, draining)
         except OSError:
-            return []
+            return signals
+        signals.extend(self._read_suspend_lines(draining))
+        try:
+            draining.unlink()
+        except OSError:
+            pass
+        return signals
+
+    @staticmethod
+    def _read_suspend_lines(path: Path) -> List[Tuple[str, float]]:
+        """读取单个信号文件中的全部 suspend 记录（坏行容灾跳过）。"""
         signals: List[Tuple[str, float]] = []
         try:
-            with open(draining, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -392,9 +407,32 @@ class ArtifactJournal:
                         continue
         except OSError:
             pass
-        finally:
+        return signals
+
+    def _salvage_draining_files(self, uid: str) -> List[Tuple[str, float]]:
+        """回收 uid 名下排空中途读者死亡遗留的 .draining 孤儿（先读后删）。
+
+        孤儿名形状为 {base}.signals.jsonl.{pid}.{monotonic_ns}.draining，
+        glob 先按 uid 前缀 + 信号后缀收敛，再以正则锚定 {pid}.{ns} 段，
+        防止前缀恰好重叠的其他 uid（如 a 与 a.signals.jsonl）互串。
+        """
+        if self.ipc_dir is None:
+            return []
+        base = safe_uid_filename(uid)
+        anchor = len(base) + len(_SIGNALS_SUFFIX)
+        signals: List[Tuple[str, float]] = []
+        try:
+            orphans = [
+                p
+                for p in Path(self.ipc_dir).glob(f"{base}{_SIGNALS_SUFFIX}.*.draining")
+                if _DRAINING_RE.match(p.name, pos=anchor)
+            ]
+        except OSError:
+            return []
+        for orphan in orphans:
+            signals.extend(self._read_suspend_lines(orphan))
             try:
-                draining.unlink()
+                orphan.unlink()
             except OSError:
                 pass
         return signals

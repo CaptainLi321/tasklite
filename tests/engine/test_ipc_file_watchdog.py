@@ -295,16 +295,17 @@ class TestStaleResultRestore:
 
 
 class TestSignalsFileDrainSemantics:
-    def test_read_signals_no_reconsumption_when_unlink_refused(
+    def test_read_signals_orphan_recovered_when_unlink_refused(
         self, tmp_path, monkeypatch,
     ):
-        """unlink 失败时被摘除 inode 已脱离规范名，下轮 drain 不重复消费。
+        """unlink 失败时本轮信号完整读出、规范名已摘除，孤儿由下轮排空回收。
 
         摘除式排空：先以原子 rename 把信号文件摘出规范名再读——unlink 被
-        拒时残留的只是摘除后的临时名，规范路径已不存在，下轮排空读不到
-        任何重复信号。旧「读后 seek(0)+truncate(0) 再删」机制正是「读后
-        truncate 抹写并发追加」丢信号窗口本体，已由摘除式读取取代；本用例
-        锁定其替换语义：a) 本轮信号完整读出；b) 规范名消失、二次排空为空。
+        拒时信号内容困在摘除后的临时名（孤儿）中，规范路径已不存在。孤儿
+        是读者在 rename 后、unlink 前死亡场景下信号内容的唯一存续副本，
+        必须经下轮排空先读取分发再删除，不得静默滞留；suspend 消费为 max
+        语义，孤儿内容的再次分发幂等。本用例锁定：a) 本轮信号完整读出；
+        b) 规范名消失；c) 下轮排空回收孤儿且仅回收一次。
         """
         journal = ArtifactJournal(tmp_path)
         journal.record_signal("t::x", "api", 30.0)
@@ -320,8 +321,10 @@ class TestSignalsFileDrainSemantics:
         assert ("api", 30.0) in got and ("db", 60.0) in got
         assert not canonical.exists(), "规范名必须已被 rename 摘除"
         monkeypatch.undo()
-        # 二次读取为空（不重复消费）
+        # 下轮排空回收孤儿内容（不丢），且仅回收一次（不重）
+        assert journal.drain_signals("t::x") == [("api", 30.0), ("db", 60.0)]
         assert journal.drain_signals("t::x") == []
+        assert list(tmp_path.glob("*.draining")) == []
 
     def test_drain_stale_prefers_latest_incarnation_same_instant(
         self, tmp_path, monkeypatch,
