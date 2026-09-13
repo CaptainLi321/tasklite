@@ -130,8 +130,8 @@ Job(
 
 | 类型 | 用途 | 示例 |
 |------|------|------|
-| `RateLimitResource(name, interval)` | 频率控制（任务派发粒度） | `RateLimitResource("api", 2.0)` — 每 2 秒 1 次 |
-| `CapacityResource(name, max)` | 并发限制 | `CapacityResource("gpu", 5.0)` — 最多 5 个并行 |
+| `RateLimitResource(name, interval_seconds)` | 频率控制（任务派发粒度） | `RateLimitResource("api", 2.0)` — 每 2 秒 1 次 |
+| `CapacityResource(name, max_capacity)` | 并发限制 | `CapacityResource("gpu", 5.0)` — 最多 5 个并行 |
 | `__workers__`（内部） | 并发子进程数 | `add_resource(CapacityResource("__workers__", 8))` 覆盖 `max_workers` |
 
 注意：`RateLimitResource` 只串行化**任务派发**粒度；一个任务内部的多次请求（如逐页拉取）需在 handler 内自行控制节奏。
@@ -353,6 +353,7 @@ pipeline = TaskLite(
 | `hook_errors` | 钩子抛异常计数 |
 | `deferred_orphan` | 孤儿锁探测 defer 计数（短退避等待） |
 | `interrupted_reruns` | worker 被中断（Ctrl+C/SIGTERM）零计数回队数 |
+| `rate_limited_reruns` | 限流（RateLimitHit）信号零预算回队数——等待资源解封后重跑 |
 | `cascade_failed` | 因上游失败被级联阻断进 DLQ 的下游数（JOB_DEPENDENCY）——与 `failed` 分开，DLQ 总量 = failed + cascade_failed + 死锁等批量终态 |
 
 ### 10.3 关键日志行
@@ -360,7 +361,7 @@ pipeline = TaskLite(
 | 日志（logger `tasklite`，默认 WARNING） | 含义 / 排障提示 |
 |------|------|
 | `SKIP: {uid} (Dependency {dep} failed)` | 依赖已失败，job 直接 JOB_DEPENDENCY 进 DLQ |
-| `No handler for: {task_type}` | NO_HANDLER——handler 未注册 |
+| `SKIP: {uid} (No handler for task_type '{task_type}')` | NO_HANDLER——handler 未注册（嵌在 SKIP 行内） |
 | `Payload validation failed for {uid}` | 校验失败进 DLQ |
 | `FAIL: {uid} (... Sent to DLQ)` | 运行期失败，meta 含 error/traceback |
 | `FAIL: {uid} exceeded max retries` | MAX_RETRIES_EXCEEDED |

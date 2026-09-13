@@ -184,7 +184,7 @@ class TaskLite:
 ```python
 StopMode(Enum)             # NONE / DRAINING / ABORTING
 ExitReason(str, Enum)      # COMPLETED / STOPPED_DRAINING / STOPPED_ABORTING / INTERRUPTED / ERROR
-TaskStats(dict)            # 8 计数器 + 只读属性
+TaskStats(dict)            # 9 计数器 + 只读属性
 EMPTY_STATS: Mapping[str, int]
 ExecutionOptions           # frozen: install_signals / acquire_run_lock
 StepOutcome                # frozen: 单步事件泵产物
