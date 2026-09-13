@@ -8,6 +8,44 @@
 
 暂无。
 
+## [1.2.2] - 2026-09-13
+
+缺陷修复与鲁棒性加固版本：全面修复单射转义与指纹碰撞、HTTP 快照与限流守卫、IPC 信号原子排空、依赖宽限与环检测、状态机互斥不变式以及并发队列事务等多项潜在缺陷。
+
+### 修复
+
+- **单射编码与指纹安全**：
+  - `escape_injective` 在任意字符集配置下对 `%` 无条件先行转义为 `%25`，彻底杜绝自定义 `forbidden` 字符集下的输出同形碰撞。
+  - `sanitize_content_id(None)` 统一返回像集外固定长度哨兵，与字面量 `"None"` 严格隔离，且不受 `max_len` 截断收缩影响。
+  - `content_fingerprint` 序列化引入类型标记与 `repr` 转义，消除跨类型与定界符注入导致的哈希碰撞。
+  - `jsonutil.loads` 对 Python 3.11+ 超长整数字面量转换触发的 `ValueError` 统一包装为 `JSONDecodeError`，保证容灾解析分支正常生效。
+  - `math.isfinite` 针对超大整数溢出抛出的 `OverflowError` 统一收敛为非有限值处理（校验入口报 `ValueError`，持久化恢复降级为 `None`）。
+
+- **HTTP 守卫与快照治理**：
+  - `http_guard` 快照 key 全面纳入位置实参、body（`json_data` 等）、params 类型前缀单射指纹以及凭证/身份头（`Authorization` / `Cookie` 等）与 `cookies` / `auth` 关键字实参，杜绝跨身份与跨请求串号命中相同快照。
+  - `_resolve_category` 归一化解析状态码与异常分类器返回值，支持用户自定义三分类子类，非法返回值 fail-loud 抛 `TypeError`。
+  - 修正嵌套 `http_guard` 下 `_suspended` 标志置位时机，确保无资源绑定的内层守卫放行挂起信号由外层守卫正确持久化落盘。
+  - `RateLimitHit` 瞬态信号在 worker 与主进程间保持结构化标记，纳入瞬态豁免集合（不消耗重试预算、短退避回队、不污染 DLQ），防止 429 风暴下任务被误终结。
+  - `Retry-After` 非正数值（<= 0）自动回落到默认挂起时长，防止 0.0 秒击穿挂起入口校验；从 requests 异常的 `response.headers` 正确提取退避时间。
+  - `default_suspend_ttl` 增加构造期 fail-loud 类型与正数值校验。
+
+- **引擎运行时与并发事务**：
+  - `drain_signals` 改用原子 rename 摘除文件后读取，消除 worker 并发追加写导致的信号丢失窗口；`abort_in_flight` 在终止子进程后执行最终排空并捞回挂起信号。
+  - `execute()` 初始化段（锁获取与信号陷阱）纳入 `try/except BaseException` 保护，发生环境故障时自动复位 `_is_running` 标志并释放文件锁，防止实例永久处于不可用状态。
+  - `on_run_end` 生命周期钩子仅在 `session.begin()` 成功后触发，与 `on_run_start` 恢复严格对称。
+  - 构造器声明的 `fatal_exceptions` 与 `transient_exceptions` 元组随 `TaskContext` 下发至 worker 子进程并真实生效，且在构造期进行类型校验。
+  - `find_dependency_cycles` 改为显式栈迭代 DFS 实现，消除深链队列下的 `RecursionError` 崩溃。
+  - `DeadlockGovernor` 在依赖宽限超时裁决后立即终结当前 episode 并清理 deadline，防止后续相同缺失依赖的新等待者被误判死锁。
+  - `seed_wall` 在持久层与内存层均增加已失败 UID 冲突预检，拒绝向已存在于 failed 集合的 UID 植入 wall，维护六集合全局互斥。
+  - `repair_queue_on_load` 改为差量定向删除并以磁盘真实顺序为权威序，保证窗口期 `front=True` 入队作业队首优先，同时消除启动期磁盘镜像行的虚假重复告警。
+  - `replace_queue_atomic` 与 `save_queue` 写变前增加 `validate_queue_replacement` 形状校验，防止因返回值异常静默清空队列。
+  - `TaskLite.backend` setter 同步重绑定 `OpsConsole` 的后端引用，并增加运行期禁止换库守卫。
+
+### 文档
+
+- 修正 README Recipe 4 示例中对 `declare_output` 字符串返回值的路径包装调用。
+- 修正 API 指南 §16.7 场景 4 中 Discovery 注册示例的代码签名与派发调用。
+
 ## [1.2.1] - 2026-09-12
 
 缺陷修复版本：收敛夜间 bug 检查批次（静态检查、变异测试分诊、性质测试扩容）确认的缺陷，并修复下游反馈的 every_run 重试断言崩溃。
@@ -119,7 +157,9 @@
 - 运维 API：`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`。
 - 优雅停机状态机：首次信号 DRAINING 停止派发并排空在途任务，二次信号 ABORTING 分类回收在途任务。
 
-[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/CaptainLi321/tasklite/compare/v1.2.1...v1.2.2
+[1.2.1]: https://github.com/CaptainLi321/tasklite/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/CaptainLi321/tasklite/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/CaptainLi321/tasklite/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/CaptainLi321/tasklite/compare/v1.0.0...v1.0.1
