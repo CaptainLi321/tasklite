@@ -178,6 +178,33 @@ def test_deadlock_governor_grace_episode_ends_on_expiry():
     assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=110.0) is True
 
 
+def test_deadlock_governor_grace_episode_ends_on_resolution():
+    """宽限成功消解（等待者转为可运行、仲裁停摆）同样终结 episode。
+
+    消解路径无 False 裁决出口，残留 deadline 以过期形态存活；同 uid 集合
+    复发（如 every_run 同 uid 重入队等待新缺失依赖）且全新 spawner 在场时
+    必须重新授予完整宽限，而非继承残留 deadline 被零宽限批量误判 DLQ。
+    """
+    gov = DeadlockGovernor(dep_grace_seconds=5.0)
+    state = PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[Job("t", "b", depends_on=["t::x"]).to_dict()],
+    )
+
+    # episode：授予宽限并持续在宽限中，随后依赖产出、等待者消解（无裁决出口）
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
+    assert gov.dep_grace_deadline == 105.0
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=101.0) is True
+
+    # 同 uid 集合远超宽限窗后复发 + 全新 spawner → 全新宽限（非零宽限误判）
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=500.0) is True
+    assert gov.dep_grace_deadline == 505.0
+    # 新 episode 内正常计时并按期超时终结
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=503.0) is True
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=506.0) is False
+    assert gov.dep_grace_deadline is None
+
+
 def test_deadlock_governor_grace_episode_ends_on_no_spawner():
     """无潜在 spawner 的立即裁决同样终结 episode，重启后重新授予完整宽限。"""
     gov = DeadlockGovernor(dep_grace_seconds=5.0)

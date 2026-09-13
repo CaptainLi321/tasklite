@@ -78,8 +78,7 @@ class DeadlockGovernor:
     def _end_grace_episode(self) -> None:
         """终结当前宽限 episode（deadline 与缺失集快照一并清除）。
 
-        不变式：宽限裁决一旦给出 False（超时或无潜在 spawner），episode 即
-        告终结——过期 deadline 严禁泄漏进后续 episode，否则同缺失依赖
+        不变式：过期/残留 deadline 严禁泄漏进后续 episode——否则同缺失依赖
         （同 uid 集合，如 retry 原样 requeue）的新等待者继承过期 deadline
         被零宽限立即误判死锁 DLQ，即使面对全新 spawner 也无等待机会。
         """
@@ -124,6 +123,15 @@ class DeadlockGovernor:
         self.dep_grace_missing = frozenset(missing_uids)
 
         now_mono = time.monotonic() if now is None else now
+
+        # 不变式：存活 deadline 一旦过期超过一个完整宽限窗，必为轮询中断后
+        # 的残留（等待者已消解、仲裁停摆，episode 无裁决出口终结）——严禁
+        # 复用，按新 episode 重新计账，防同 uid 集合复发时零宽限批量误杀。
+        if (
+            self.dep_grace_deadline is not None
+            and now_mono - self.dep_grace_deadline > effective_grace
+        ):
+            self._end_grace_episode()
 
         # 若调度器已单趟给出潜在 spawner 裁决，直接复用事实（避免二次扫描队列及重复反序列化）
         if has_potential_spawners is not None:
