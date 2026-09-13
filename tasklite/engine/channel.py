@@ -614,6 +614,10 @@ class ExecutionChannel:
                 signals.append((uid, r_name, secs))
         return signals
 
+    def drain_all_signals(self) -> List[Tuple[str, str, float]]:
+        """启动期清扫 ipc_dir 全部残留 suspend 信号（含 .draining 孤儿回收）。"""
+        return self.journal.drain_all_signals()
+
     def abort_in_flight(self, handles: Sequence[JobHandle]) -> AbortOutcome:
         """TOCTOU 闭环中止：排空信号 -> 初查分类 -> 进程终止 -> 重探测闭环 -> 残留清理。"""
         if not handles:

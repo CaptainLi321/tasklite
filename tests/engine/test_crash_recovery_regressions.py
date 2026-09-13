@@ -1140,3 +1140,115 @@ class TestTerminalOverlapConvergenceOnLoad:
             if "both wall and failed" in r.getMessage()
         ]
         assert overlap_warns == []
+
+
+# ─── 跨 run 崩溃残留 suspend 信号回收 ─────────────────────
+
+
+class TestResidueSignalRecovery:
+    """跨 run 崩溃残留 suspend 信号的回收契约。
+
+    主进程在 worker ``record_signal`` 之后、同 run 任一排空点之前崩溃时，
+    信号文件存活但再无排空触点：下次派发的 stale-restore 两条分支收尾
+    （完成机器清理 / PRE_SUBMIT 清理）都会未读删除信号文件。任何清理
+    动作必须先排空读取并应用（suspend 的 max 语义保证幂等）。
+    """
+
+    def test_gate5_drains_residue_signals_before_cleanup(self, tmp_path):
+        """关 5 在 restore/PRE_SUBMIT 清理之前排空残留信号并即时持久化。"""
+        from types import SimpleNamespace
+
+        from tasklite.backend.memory import InMemoryStateBackend
+        from tasklite.engine.dispatch import DispatchMachine
+        from tasklite.engine.resource import (
+            META_RESOURCE_SUSPENDS,
+            CapacityResource,
+            ResourceManager,
+        )
+        from tasklite.engine.store import StateStore
+        from tasklite.taxonomy import ErrorTaxonomy
+        from tasklite.utils.jsonutil import loads
+
+        ipc = str(tmp_path / "ipc")
+        Path(ipc).mkdir(parents=True)
+        journal = ArtifactJournal(ipc)
+        journal.record_signal("t::j1", "api", 60.0)
+
+        backend = InMemoryStateBackend()
+        store = StateStore(backend, commit_failure_dlq_threshold=3,
+                           taxonomy=ErrorTaxonomy())
+        resources = ResourceManager()
+        resources["api"] = CapacityResource("api", 1.0)
+        channel = SimpleNamespace(
+            drain_active_signals=lambda uids: [
+                (u, r, s) for u in uids for r, s in journal.drain_signals(u)
+            ],
+            cleanup_artifacts=lambda uid, *, mode: journal.cleanup(uid, mode=mode),
+        )
+        completion = SimpleNamespace(restore_stale_result=lambda uid, job, jd: False)
+        dispatch = DispatchMachine(
+            store=store, scheduler=None, policy=None, resources=resources,
+            channel=channel, in_flight=None, session=None, completion=completion,
+            handlers={}, taxonomy=ErrorTaxonomy(), output_root=None, ipc_dir=ipc,
+            commit_failure_dlq_threshold=3,
+        )
+        job = Job("t", "j1")
+
+        handled = dispatch.dispatch_stale_restore("t::j1", job, job.to_dict())
+
+        assert handled is False
+        assert "api" in resources.collect_suspensions()
+        persisted = loads(backend.get_meta(META_RESOURCE_SUSPENDS))
+        assert "api" in persisted
+        # PRE_SUBMIT 清理照常完成：信号文件已随排空消失
+        assert not journal.signals_path("t::j1").exists()
+
+    def test_retry_residue_signal_salvaged_on_next_run(self, tmp_path, monkeypatch):
+        """残留「信号文件 + retry 结果」：retry payload 不携带挂起，信号不得丢。"""
+        pipeline = make_pipeline(tmp_path)
+        pipeline.add_resource(CapacityResource("api", max_capacity=1.0))
+        pipeline.register_handler("t", lambda j, c: (True, {}))
+        journal = ArtifactJournal(pipeline.ipc_dir)
+        journal.record_signal("t::j1", "api", 60.0)
+        journal.write_result_atomic(
+            "t::j1", {"status": "retry", "error": "HTTP 429"},
+            incarnation="a" * 32 + ".1",
+        )
+        pipeline.enqueue([Job("t", "j1", payload={}, max_retries=0)])
+
+        fake_cls = make_ipc_process_class([{
+            "status": "success", "raw_result": True, "new_jobs": [],
+            "resource_suspensions": [], "cursor_updates": {},
+        }])
+        patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=fake_cls)
+
+        now = time.monotonic()
+        pipeline.run()
+
+        api = pipeline.resources["api"]
+        assert api.suspended_until() is not None and api.suspended_until() > now, (
+            "跨 run 残留的 suspend 信号必须被应用，而非随残留结果清理丢失"
+        )
+        assert list(Path(pipeline.ipc_dir).glob("*.signals.jsonl")) == []
+
+    def test_signal_only_residue_survives_pre_submit_cleanup(self, tmp_path, monkeypatch):
+        """无残留结果时信号文件曾被 PRE_SUBMIT 未读删除——排空须先于清理。"""
+        pipeline = make_pipeline(tmp_path)
+        pipeline.add_resource(CapacityResource("api", max_capacity=1.0))
+        pipeline.register_handler("t", lambda j, c: (True, {}))
+        ArtifactJournal(pipeline.ipc_dir).record_signal("t::j1", "api", 60.0)
+        pipeline.enqueue([Job("t", "j1", payload={}, max_retries=0)])
+
+        fake_cls = make_ipc_process_class([{
+            "status": "success", "raw_result": True, "new_jobs": [],
+            "resource_suspensions": [], "cursor_updates": {},
+        }])
+        patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=fake_cls)
+
+        now = time.monotonic()
+        pipeline.run()
+
+        api = pipeline.resources["api"]
+        assert api.suspended_until() is not None and api.suspended_until() > now, (
+            "PRE_SUBMIT 清理不得未读删除残留 suspend 信号"
+        )

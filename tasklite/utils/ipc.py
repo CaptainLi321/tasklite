@@ -18,7 +18,8 @@ from pathlib import Path
 import re
 import shutil
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from urllib.parse import unquote
 
 from .injective import safe_uid_filename
 from .jsonutil import dump, dumps, load, loads
@@ -387,6 +388,61 @@ class ArtifactJournal:
         except OSError:
             pass
         return signals
+
+    def drain_all_signals(self) -> List[Tuple[str, str, float]]:
+        """清扫 ipc_dir 全部 suspend 信号残留并排空（含 .draining 孤儿）。
+
+        不变式：任何清理动作前先读取并按语义分发内容——本方法只负责
+        排空（先读后删），应用由调用方完成。跨 run 崩溃可能遗留「已落盘
+        信号却无任何再消费路径」的残留：后续派发预检清理与完成收尾清理
+        都会未读删除信号文件，启动期全量清扫是该不变式的兜底回收点。
+        每个文件名还原 uid 后复用 ``drain_signals`` 的摘除式排空与孤儿
+        回收协议；文件名 → uid 取 ``safe_uid_filename`` 的百分号解码逆
+        映射，往返校验失败（像集外形态）不触碰。
+        """
+        if self.ipc_dir is None:
+            return []
+        try:
+            d = Path(self.ipc_dir)
+            candidates = [p.name for p in d.glob(f"*{_SIGNALS_SUFFIX}")]
+            candidates += [
+                p.name for p in d.glob(f"*{_SIGNALS_SUFFIX}.*.draining")
+            ]
+        except OSError:
+            return []
+        out: List[Tuple[str, str, float]] = []
+        seen: Set[str] = set()
+        for name in candidates:
+            uid = self._uid_from_signals_filename(name)
+            if uid is None or uid in seen:
+                continue
+            seen.add(uid)
+            for r_name, secs in self.drain_signals(uid):
+                out.append((uid, r_name, secs))
+        return out
+
+    @staticmethod
+    def _uid_from_signals_filename(name: str) -> Optional[str]:
+        """信号文件名（含 .draining 摘除名）→ uid；非协议域形态返回 None。
+
+        摘除名形状为 {base}.signals.jsonl.{pid}.{ns}.draining，与
+        ``_salvage_draining_files`` 的锚定正则同域。
+        """
+        if name.endswith(_SIGNALS_SUFFIX):
+            base = name[: -len(_SIGNALS_SUFFIX)]
+        elif name.endswith(".draining"):
+            parts = name[: -len(".draining")].rsplit(".", 2)
+            if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+                return None
+            if not parts[0].endswith(_SIGNALS_SUFFIX):
+                return None
+            base = parts[0][: -len(_SIGNALS_SUFFIX)]
+        else:
+            return None
+        uid = unquote(base)
+        if safe_uid_filename(uid) != base:
+            return None
+        return uid
 
     @staticmethod
     def _read_suspend_lines(path: Path) -> List[Tuple[str, float]]:

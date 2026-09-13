@@ -469,6 +469,67 @@ class TestRecoveryOrchestratorSuspendPersistence:
         assert backend.get_meta(META_RESOURCE_SUSPENDS) is not None
 
 
+class TestRecoveryOrchestratorResidueSalvage:
+    """启动期残留信号回收：排空应用 + 即时持久化 + 异常隔离。"""
+
+    def test_salvage_residue_signals_applies_and_persists(self):
+        from tasklite.utils.jsonutil import loads
+
+        backend = InMemoryStateBackend()
+        rm = ResourceManager({"api": RateLimitResource("api", 1.0)})
+        channel = MagicMock()
+        channel.drain_all_signals.return_value = [("t::j1", "api", 30.0)]
+        orchestrator = RecoveryOrchestrator(
+            store=StateStore(backend),
+            channel=channel,
+            resources=rm,
+            in_flight=MagicMock(),
+            policy=PreflightPolicy(),
+            completion=MagicMock(),
+        )
+
+        orchestrator.salvage_residue_signals()
+
+        assert "api" in rm.collect_suspensions()
+        persisted = loads(backend.get_meta(META_RESOURCE_SUSPENDS))
+        assert "api" in persisted
+
+    def test_salvage_residue_signals_channel_failure_is_isolated(self):
+        """清扫原语异常只降级告警，不得打断启动序列。"""
+        backend = InMemoryStateBackend()
+        channel = MagicMock()
+        channel.drain_all_signals.side_effect = OSError("ipc dir unavailable")
+        orchestrator = RecoveryOrchestrator(
+            store=StateStore(backend),
+            channel=channel,
+            resources=ResourceManager({"api": RateLimitResource("api", 1.0)}),
+            in_flight=MagicMock(),
+            policy=PreflightPolicy(),
+            completion=MagicMock(),
+        )
+
+        orchestrator.salvage_residue_signals()
+
+        assert backend.get_meta(META_RESOURCE_SUSPENDS) is None
+
+    def test_salvage_residue_signals_skips_unregistered_resource(self):
+        channel = MagicMock()
+        channel.drain_all_signals.return_value = [("t::j1", "no_such", 9.0)]
+        backend = InMemoryStateBackend()
+        orchestrator = RecoveryOrchestrator(
+            store=StateStore(backend),
+            channel=channel,
+            resources=ResourceManager({"api": RateLimitResource("api", 1.0)}),
+            in_flight=MagicMock(),
+            policy=PreflightPolicy(),
+            completion=MagicMock(),
+        )
+
+        orchestrator.salvage_residue_signals()
+
+        assert backend.get_meta(META_RESOURCE_SUSPENDS) is None
+
+
 class TestRecoveryOrchestratorCompatibility:
     def test_alias_equivalence(self):
         assert RecoveryMachine is RecoveryOrchestrator

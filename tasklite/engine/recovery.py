@@ -210,6 +210,36 @@ class RecoveryOrchestrator:
         """
         persist_resource_suspensions(self._store.backend, self._resources)
 
+    def salvage_residue_signals(self) -> None:
+        """启动期回收 ipc_dir 全部跨 run 残留 suspend 信号并即时应用。
+
+        主进程在 worker ``record_signal`` 之后、同 run 任一排空点之前
+        崩溃时，信号文件存活但同 run 再无排空触点；后续派发预检清理与
+        完成收尾清理都会未读删除信号文件。启动期全量清扫（先读分发后
+        删除）是该不变式的兜底回收点；``suspend()`` 的 max 语义保证与
+        meta 恢复的挂起幂等合并。清扫原语异常只降级告警，不打断启动。
+        """
+        try:
+            signals = self._channel.drain_all_signals()
+        except Exception as e:
+            logger.warning(f"Failed to salvage residue signals: {e}")
+            return
+        applied = False
+        for uid, r_name, secs in signals:
+            if self._resources.suspend_resource(r_name, secs):
+                logger.info(
+                    f"Applied suspend signal salvaged from residue of {uid}: "
+                    f"{r_name} for {secs}s"
+                )
+                applied = True
+            else:
+                logger.warning(
+                    f"Skipping suspend signal for unregistered resource "
+                    f"{r_name!r} (from residue of {uid})"
+                )
+        if applied:
+            persist_resource_suspensions(self._store.backend, self._resources)
+
 
     def save_queue_crash_safe(self) -> None:
         """崩溃路径保存队列：以「磁盘真相」合并「内存队列」，避免丢失作业。

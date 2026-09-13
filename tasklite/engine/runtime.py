@@ -443,6 +443,7 @@ class EngineRuntime:
         self._recovery.converge_terminal_overlap(wall, failed)
         q_data = self._recovery.repair_queue_on_load(q_data, wall, failed)
         self._recovery.load_resource_suspends()
+        self._recovery.salvage_residue_signals()
 
         state = PipelineState(wall, failed, cursors, q_data)
         self.store.set_state(state)

@@ -37,6 +37,7 @@ from ..models.job import Job, JobRuntimeState
 from ..taxonomy import ErrorTaxonomy
 from .channel import ArtifactCleanupMode, JobHandle, WorkerLaunchSpec
 from .inflight import InFlightJob
+from .resource import persist_resource_suspensions
 from .scheduler import DeadlockAttribution
 
 logger = logging.getLogger("tasklite")
@@ -273,11 +274,35 @@ class DispatchMachine:
 
         1. 若存在上一轮崩溃遗留的结果文件，直接通过完成机器提交（返回 True，不派发子进程）。
         2. 若无残留结果文件，清理已死孤儿残留声明与信号文件，准备派发新子进程（返回 False）。
+
+        不变式：两条分支的收尾（完成机器清理 / PRE_SUBMIT 清理）都会未读
+        删除信号文件，残留的 suspend 信号必须先排空应用。调用前提：关 4
+        探测已通过（锁空闲 ⇒ 无活跃追加写者），排空无损。
         """
+        self._salvage_residue_signals(uid)
         if self._completion.restore_stale_result(uid, job, job_dict):
             return True
         self._channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
         return False
+
+    def _salvage_residue_signals(self, uid: str) -> None:
+        """排空并应用单个 uid 跨 run 崩溃残留的 suspend 信号（先读后删）。"""
+        try:
+            signals = self._channel.drain_active_signals([uid])
+        except Exception as e:
+            logger.warning(f"Failed to salvage residue signals for {uid}: {e}")
+            return
+        applied = False
+        for _residue_uid, r_name, secs in signals:
+            if self._resources.suspend_resource(r_name, secs):
+                applied = True
+            else:
+                logger.warning(
+                    f"Skipping suspend signal for unregistered resource "
+                    f"{r_name!r} (from residue of {uid})"
+                )
+        if applied:
+            persist_resource_suspensions(self._store.backend, self._resources)
 
 
     def dispatch_job(self, sched: Any) -> Optional[InFlightJob]:

@@ -226,6 +226,50 @@ class TestArtifactJournalDeclarations:
         assert not intruder.exists()
 
 
+class TestArtifactJournalResidueSweep:
+    """启动期残留信号清扫：ipc_dir 全量排空（先读分发后删除，含 .draining 孤儿）。
+
+    跨 run 崩溃可能遗留「已落盘信号却无任何再消费路径」的残留——后续
+    派发预检清理与完成收尾清理都会未读删除信号文件，启动期统一清扫
+    是该不变式的兜底回收点。
+    """
+
+    def test_drain_all_signals_recovers_residue_and_orphans(self, tmp_path):
+        import os as os_mod
+        import time as time_mod
+
+        journal = ArtifactJournal(tmp_path)
+        journal.record_signal("t::a", "api", 30.0)
+        # b 的信号文件已摘除为孤儿（排空中途读者死亡，无同名活跃文件）
+        journal.record_signal("t::b", "gpu", 5.0)
+        b_path = journal.signals_path("t::b")
+        orphan = b_path.with_name(
+            f"{b_path.name}.{os_mod.getpid()}.{time_mod.monotonic_ns()}.draining"
+        )
+        os_mod.rename(b_path, orphan)
+
+        got = journal.drain_all_signals()
+
+        assert ("t::a", "api", 30.0) in got
+        assert ("t::b", "gpu", 5.0) in got
+        assert list(tmp_path.iterdir()) == []
+        # 幂等：二次清扫为空
+        assert journal.drain_all_signals() == []
+
+    def test_drain_all_signals_skips_names_outside_injective_image(self, tmp_path):
+        """文件名还原不出合法 uid（safe_uid_filename 像集外）时不触碰。
+
+        裸冒号不可能由 safe_uid_filename 产生（必被转义为 %3A），
+        该形态不在协议域内，清扫不得误删。
+        """
+        journal = ArtifactJournal(tmp_path)
+        foreign = tmp_path / "weird:uid.signals.jsonl"
+        foreign.write_text('{"suspend": ["api", 1.0]}\n', encoding="utf-8")
+
+        assert journal.drain_all_signals() == []
+        assert foreign.exists()
+
+
 class TestArtifactJournalCleanupModes:
     def test_cleanup_pre_submit(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
