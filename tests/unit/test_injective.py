@@ -142,6 +142,24 @@ def test_content_fingerprint_rejects_type_and_delimiter_collisions():
     assert content_fingerprint([{"a": 1, "b": 2}]) == content_fingerprint([{"b": 2, "a": 1}])
 
 
+def test_content_fingerprint_nested_containers_order_insensitive():
+    # 嵌套结构全 token 化：任意层级 dict（含 dict 作 value）插入序无关，
+    # 逻辑相等必同指纹（否则确定性 job_id 分叉 → wall 不命中 → 重复执行）
+    assert content_fingerprint([{"k": {"a": 1, "b": 2}}]) == content_fingerprint(
+        [{"k": {"b": 2, "a": 1}}]
+    )
+    assert content_fingerprint([{"a": [{"x": 1, "y": 2}, "s"]}]) == content_fingerprint(
+        [{"a": [{"y": 2, "x": 1}, "s"]}]
+    )
+    assert content_fingerprint([{"k": {"deep": {"z": 0, "a": [1, {"m": 3, "n": 4}]}}}]) == (
+        content_fingerprint([{"k": {"deep": {"a": [1, {"n": 4, "m": 3}], "z": 0}}}])
+    )
+    # 序无关不放宽单射方向：内容不同的嵌套结构、跨型 value 仍必不同
+    assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": {"a": 2}}])
+    assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": {"a": "1"}}])
+    assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": [["a", 1]]}])
+
+
 def test_sanitize_job_component_delegation_and_invariants():
     assert sanitize_job_component("a::b/c\\d") == "a%3A%3Ab%2Fc%5Cd"
     assert sanitize_job_component("") == EMPTY_SENTINEL

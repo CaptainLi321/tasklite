@@ -167,7 +167,9 @@ def _fingerprint_token(value: Any) -> str:
 
     类型标记隔离跨型碰撞（1 与 "1" 编码必不同）；repr 把内容中的控制字符
     （含 \\x00）转义为字面反斜杠序列，token 中不出现裸 \\x00，项内注入
-    定界符伪装项边界的碰撞被结构性排除。dict 按键排序序列化，序无关。
+    定界符伪装项边界的碰撞被结构性排除。dict 递归 token 化后按键 token
+    排序——键 token 含类型标记且对任意不同键必不同，排序仅由键决定；
+    任意嵌套层级（含 dict 作 value）均序无关。
     """
     if isinstance(value, bool):
         return "b" + repr(value)
@@ -178,7 +180,10 @@ def _fingerprint_token(value: Any) -> str:
     if isinstance(value, str):
         return "s" + repr(value)
     if isinstance(value, dict):
-        return "d" + repr(sorted(value.items(), key=lambda kv: repr(kv[0])))
+        return "d" + repr(sorted(
+            (_fingerprint_token(k), _fingerprint_token(v))
+            for k, v in value.items()
+        ))
     if isinstance(value, (list, tuple)):
         return "l" + repr([_fingerprint_token(v) for v in value])
     return "o" + repr(value)
