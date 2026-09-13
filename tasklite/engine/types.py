@@ -104,7 +104,13 @@ class StepOutcome:
 
 @dataclass(frozen=True)
 class RunSummary:
-    """引擎执行完成后的不可变运行摘要。"""
+    """引擎执行完成后的不可变运行摘要。
+
+    契约：execute() 的未处理异常一律经 raise 通道原样上抛，摘要仅在
+    无异常终结（完成/优雅停机）时返回——execute() 自身永不回填
+    unhandled_exception（恒为 None）；该字段供包装层构造异常 run 的
+    摘要时显式回填。
+    """
     exit_reason: ExitReason
     stats: "TaskStats"
     run_id: str

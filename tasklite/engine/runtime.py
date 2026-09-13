@@ -175,7 +175,6 @@ class EngineRuntime:
         opts = options or ExecutionOptions()
         start_time = time.monotonic()
         exit_reason = ExitReason.COMPLETED
-        unhandled_exc: Optional[BaseException] = None
 
         if self._is_running:
             raise RuntimeError("Pipeline run() already in progress on this instance.")
@@ -242,11 +241,9 @@ class EngineRuntime:
 
         except KeyboardInterrupt as e:
             exit_reason = self._session.exit_reason(e)
-            unhandled_exc = e
             raise
         except BaseException as e:
             exit_reason = self._session.exit_reason(e)
-            unhandled_exc = e
             raise
         finally:
             # on_run_end 仅在对应 on_run_start 已可能触发的 run（已 begin）
@@ -269,7 +266,6 @@ class EngineRuntime:
             stats=self._session.stats,
             run_id=self._session.run_id or "",
             duration_seconds=duration,
-            unhandled_exception=unhandled_exc,
         )
 
     def _terminal_outcome(self) -> StepOutcome:

@@ -119,6 +119,26 @@ class TestEngineRuntimeExecutionLifecycle:
         assert summary.unhandled_exception is None
         assert events == ["start", "end:completed"]
 
+    def test_unhandled_exception_propagates_via_raise_channel(self, tmp_path, monkeypatch):
+        """异常通道契约：run 体内未处理异常一律经 raise 通道原样上抛，
+        execute() 不返回异常摘要（摘要仅在无异常终结时构造，字段恒为
+        None；异常信息不借道 RunSummary 二次传递）。"""
+        runtime = make_runtime(tmp_path, name="test_exc_channel")
+
+        def _boom():
+            raise RuntimeError("run body exploded")
+
+        monkeypatch.setattr(runtime, "prepare_run_state", _boom)
+        with pytest.raises(RuntimeError, match="run body exploded"):
+            runtime.execute()
+        monkeypatch.undo()
+        assert not runtime.is_running, "异常路径必须复位运行标志"
+
+        # 故障解除后同实例可复跑；无异常终结的摘要不携带异常对象
+        summary = runtime.execute()
+        assert summary.exit_reason is ExitReason.COMPLETED
+        assert summary.unhandled_exception is None
+
     def test_execute_resets_session_state_between_runs(self, tmp_path):
         runtime = make_runtime(tmp_path, name="test_exec_reset")
 
