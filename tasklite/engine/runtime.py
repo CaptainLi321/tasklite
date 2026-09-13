@@ -371,6 +371,11 @@ class EngineRuntime:
         limit = max_dispatch if max_dispatch is not None else 1000000
         last_outcome, worker_wait, dispatched = self._fill_dispatch_pool(limit, draining)
 
+        # 前进信号终结宽限 episode（须先于死锁仲裁）：任何成功派发都证明
+        # 等待者已消解，同缺失集合复发按新 episode 重新授予完整宽限
+        if dispatched > 0:
+            self.governor.note_dispatch_progress()
+
         # 2. 处理无可运行 job 与死锁判定
         deadlock_detected, should_terminate, deadlock_wait = (
             self._arbitrate_deadlock(last_outcome, store)

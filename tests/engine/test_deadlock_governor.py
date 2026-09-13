@@ -239,3 +239,104 @@ def test_deadlock_governor_grace_expiry_clears_deadline_fallback_path():
     # 同缺失集新 episode 重新授予完整宽限
     assert gov.check_dependency_grace(state, ["t::b"], now=107.0) is True
     assert gov.dep_grace_deadline == 112.0
+
+
+def test_deadlock_governor_grace_episode_ends_on_dispatch_progress():
+    """派发前进信号终结宽限 episode：盲区 (deadline, deadline+宽限窗] 内的
+    同缺失集复发必须获得完整新宽限，不得继承残留 deadline 被零宽限批量误杀。
+
+    消解路径（等待者获得依赖、转为可运行被派发）无任何 False 裁决出口，
+    deadline 以过期形态残留；复发时刻距残留 deadline 不超过一个宽限窗时，
+    时间启发式无法区分「刚过期的残留」与「活跃 episode」。任何成功派发
+    都证明等待者已消解，episode 应当终结，复发自然是新 episode。
+    """
+    gov = DeadlockGovernor(dep_grace_seconds=60.0)
+    state = PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[Job("t", "b", depends_on=["t::x"]).to_dict()],
+    )
+
+    # episode：授予宽限（deadline=160），随后等待者消解并被派发
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
+    assert gov.dep_grace_deadline == 160.0
+    gov.note_dispatch_progress()
+    assert gov.dep_grace_deadline is None
+    assert gov.dep_grace_missing is None
+
+    # 同缺失集在 (160, 220] 盲区内复发 + spawner 在场 → 完整新宽限而非误杀
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=170.0) is True
+    assert gov.dep_grace_deadline == 230.0
+    # 新 episode 内正常计时并按期超时终结（超时语义不变）
+    assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=290.0) is False
+    assert gov.dep_grace_deadline is None
+
+
+def test_resolve_deadlock_relapse_after_progress_gets_full_grace():
+    """死锁仲裁路径同样受益于前进终结点：盲区复发裁决为 grace_waiting 而非批量 DLQ。"""
+    import time as time_mod
+    import types
+    from unittest.mock import MagicMock
+
+    gov = DeadlockGovernor(dep_grace_seconds=60.0)
+    state = PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[Job("t", "b", depends_on=["t::x"]).to_dict()],
+    )
+    mock_store = MagicMock()
+    mock_store.state = state
+    sched = types.SimpleNamespace(
+        min_wait=float("inf"),
+        missing_dependency_uids={"t::b"},
+        has_potential_spawners=True,
+    )
+
+    # episode 授予宽限后消解（时钟锚定真实单调时钟，复发落在真实盲区内）
+    t0 = time_mod.monotonic()
+    assert gov.check_dependency_grace(state, {"t::b"}, has_potential_spawners=True, now=t0) is True
+    assert gov.dep_grace_deadline == t0 + 60.0
+
+    # 等待者消解被派发 → 前进信号终结 episode → 仲裁授予完整新宽限
+    gov.note_dispatch_progress()
+    decision = gov.resolve_deadlock(sched, mock_store)
+    assert decision.action == "grace_waiting"
+    assert decision.wait_time > 0
+    assert not mock_store.apply_bulk_failure.called
+
+
+def test_runtime_step_dispatch_progress_ends_grace_episode(tmp_path, monkeypatch):
+    """step() 观测到派发前进即终结宽限 episode（runtime 接线契约）。"""
+    import types
+
+    from tests.helpers import make_runtime
+
+    runtime = make_runtime(tmp_path, name="test_grace_progress")
+    gov = runtime.governor
+    gov.dep_grace_deadline = 160.0
+    gov.dep_grace_missing = frozenset({"t::x"})
+
+    from tasklite.models.state import PipelineState
+
+    runtime.store.set_state(PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[Job("t", "b", depends_on=["t::x"]).to_dict()],
+    ))
+    calls = {"n": 0}
+
+    def fake_dispatch_next():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return types.SimpleNamespace(
+                entry=object(), has_runnable=True, worker_wait=0.0,
+                min_wait=0.0, should_continue=True,
+            )
+        return types.SimpleNamespace(
+            entry=None, has_runnable=False, worker_wait=0.0,
+            min_wait=float("inf"), should_continue=False,
+        )
+
+    monkeypatch.setattr(runtime._dispatch, "dispatch_next", fake_dispatch_next)
+
+    outcome = runtime.step()
+    assert outcome.dispatched_count == 1
+    assert gov.dep_grace_deadline is None
+    assert gov.dep_grace_missing is None

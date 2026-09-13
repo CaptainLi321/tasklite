@@ -85,6 +85,17 @@ class DeadlockGovernor:
         self.dep_grace_deadline = None
         self.dep_grace_missing = None
 
+    def note_dispatch_progress(self) -> None:
+        """派发前进信号终结当前宽限 episode（消解侧唯一终结点）。
+
+        不变式：任何成功派发都证明此前的等待者已消解，残留 deadline 严禁
+        泄漏进同缺失集合的后续 episode——复发落在 (deadline, deadline+宽限窗]
+        内时时间启发式无法区分残留与活跃 episode，零宽限批量误杀只能靠
+        消解侧终结点消除。
+        """
+        if self.dep_grace_deadline is not None:
+            self._end_grace_episode()
+
     def check_dependency_grace(
         self,
         state: PipelineState,
