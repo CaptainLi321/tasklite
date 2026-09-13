@@ -259,3 +259,38 @@ class TestResourceValidation:
             taxonomy.ensure_resources_valid({"cpu": -5})
         with pytest.raises(ValueError, match="is too large"):
             taxonomy.ensure_resources_valid({"cpu": 10**400})
+
+
+class TestConstructorPolicyValidation:
+    """构造器策略序列入口校验：与注册/声明路径同规（fail-loud）。
+
+    不变式：classify() 标注 Never-Raise 契约，注册表/fatal/transient
+    序列若混入非 type 成员，matches() 的 isinstance 会让 TypeError 从
+    classify() 逸出——构造期即拒绝。
+    """
+
+    def test_transient_registry_rejects_non_type(self):
+        with pytest.raises(TypeError, match="transient_registry"):
+            ErrorTaxonomy(transient_registry=[42])
+
+    def test_fatal_exceptions_rejects_non_type(self):
+        with pytest.raises(TypeError, match="fatal_exceptions"):
+            ErrorTaxonomy(fatal_exceptions=["ConnectionError"])
+
+    def test_transient_exceptions_rejects_non_exception_subclass(self):
+        with pytest.raises(TypeError, match="transient_exceptions"):
+            ErrorTaxonomy(transient_exceptions=[int])
+
+    def test_transient_registry_facade_validates_classes(self):
+        with pytest.raises(TypeError, match="transient_registry"):
+            TransientRegistry(classes=[42])
+
+    def test_valid_sequences_still_accepted(self):
+        taxonomy = ErrorTaxonomy(
+            fatal_exceptions=(KeyError,),
+            transient_exceptions=(TimeoutError,),
+            transient_registry=(ConnectionError,),
+        )
+        assert taxonomy.classify(KeyError("k")).is_fatal is True
+        assert taxonomy.classify(TimeoutError("t")).is_transient is True
+        assert taxonomy.classify(ConnectionError("c")).is_retry is True

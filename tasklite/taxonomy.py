@@ -167,16 +167,36 @@ class ErrorClassification:
         return meta
 
 
+def _ensure_exception_class(exception_cls: type, api_name: str) -> None:
+    """分类序列成员底座校验（fail-loud）：必须是 Exception 子类。"""
+    if not isinstance(exception_cls, type) or not issubclass(exception_cls, Exception):
+        raise TypeError(
+            f"{api_name} requires an Exception subclass, got {exception_cls!r}"
+        )
+
+
+def _ensure_exception_classes(
+    classes: Optional[Sequence[type]], api_name: str
+) -> None:
+    """构造器策略序列的逐成员校验（fail-loud）。
+
+    不变式：classify() 标注 Never-Raise 契约，其实现依赖序列成员可安全
+    参与 isinstance——非 type 成员会让 TypeError 从 classify() 逸出，
+    故全部构造路径（fatal/transient 序列与瞬态注册表）在构造期即拒绝；
+    可 pickle 与专用分支约束由声明（validate_declared_exception_classes）
+    与注册（register_transient）路径叠加。
+    """
+    for exception_cls in tuple(classes) if classes is not None else ():
+        _ensure_exception_class(exception_cls, api_name)
+
+
 def _validate_policy_exception_class(exception_cls: type, api_name: str) -> None:
     """异常分类声明入口校验（fail-loud）——注册表与构造器元组两条声明路径共用。
 
     不变式：声明类必须可 pickle——分类决策在 spawn 子进程发生，
     声明元组随 ctx pickle 下发，非模块级类会让 spawn 派发整体失败。
     """
-    if not isinstance(exception_cls, type) or not issubclass(exception_cls, Exception):
-        raise TypeError(
-            f"{api_name} requires an Exception subclass, got {exception_cls!r}"
-        )
+    _ensure_exception_class(exception_cls, api_name)
     if issubclass(exception_cls, (RetryError, FatalError)):
         raise TypeError(
             f"{api_name} cannot register a "
@@ -221,6 +241,10 @@ class ErrorTaxonomy:
         transient_exceptions: Optional[Sequence[Type[BaseException]]] = None,
         transient_registry: Optional[Sequence[Type[BaseException]]] = None,
     ) -> None:
+        # 构造期 fail-loud（Never-Raise 契约前置）：与注册/声明路径同规
+        _ensure_exception_classes(fatal_exceptions, "fatal_exceptions")
+        _ensure_exception_classes(transient_exceptions, "transient_exceptions")
+        _ensure_exception_classes(transient_registry, "transient_registry")
         self._fatal_exceptions: Tuple[Type[BaseException], ...] = (
             tuple(fatal_exceptions) if fatal_exceptions is not None else FATAL_EXCEPTIONS
         )
