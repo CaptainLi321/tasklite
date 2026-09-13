@@ -759,10 +759,14 @@ class SnapshotStore:
                 headers = res.headers
                 raw_body = res.body
             else:
-                status_code = getattr(res, "status_code", 200)
+                # 默认 None 使 getcode 回退可达（urllib 原生 HTTPResponse 只有
+                # getcode()）：默认 200 会把真实状态恒记为 200 并写入快照。
+                status_code = getattr(res, "status_code", None)
                 if status_code is None and hasattr(res, "getcode"):
                     status_code = res.getcode()
-                status_code = status_code or 200
+                if status_code is None:
+                    # 无状态语义的返回值（dict/list 数据体等）按成功记录
+                    status_code = 200
                 headers = dict(getattr(res, "headers", {}))
                 if hasattr(res, "content"):
                     raw_body = res.content

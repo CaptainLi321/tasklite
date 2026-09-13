@@ -837,6 +837,38 @@ def test_snapshot_cached_skips_transient_statuses() -> None:
     assert store.has(store.make_key("https://api.test/ok", method="GET")) is True
 
 
+def test_snapshot_cached_urllib_native_response_status_passthrough() -> None:
+    """urllib 原生响应（仅 getcode()，无 status_code 属性）真实状态必须透传。
+
+    状态提取默认 200 会让 getcode 回退成为死代码，非 200 响应以 200 身份
+    永久写入快照，崩溃重试/离线重放恒命中失真内容。
+    """
+    class _FakeUrllibResponse:
+        """模拟 http.client.HTTPResponse：只有 getcode/read/headers。"""
+
+        def getcode(self) -> int:
+            return 404
+
+        def read(self) -> bytes:
+            return b"not found"
+
+        headers = {"content-type": "text/html"}
+
+    store = MemorySnapshotStore()
+    cached_fetch = store.cached(lambda url, **kwargs: _FakeUrllibResponse())
+
+    resp = cached_fetch("https://api.test/item")
+    assert resp.status_code == 404
+
+    key = store.make_key("https://api.test/item")
+    assert store.has(key) is True
+    assert store.get(key).status_code == 404
+
+    # 无状态语义的返回值（数据体）仍按成功记录
+    cached_data = store.cached(lambda url, **kwargs: {"ok": True})
+    assert cached_data("https://api.test/data").status_code == 200
+
+
 # ==============================================================================
 # 6. 内置 fetch_urllib 与 本地 HTTP 服务测试
 # ==============================================================================
