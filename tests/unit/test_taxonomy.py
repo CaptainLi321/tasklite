@@ -296,6 +296,34 @@ class TestConstructorPolicyValidation:
         assert taxonomy.classify(TimeoutError("t")).is_transient is True
         assert taxonomy.classify(ConnectionError("c")).is_retry is True
 
+    def test_generator_and_iterator_inputs_materialize_once(self):
+        """生成器/一次性迭代器入参与序列语义一致：校验物化结果复用于赋值。
+
+        若校验先行消费迭代器而赋值处二次物化，用户策略会静默变空且不回退
+        内置默认，classify 将本应 fatal 的异常误判为可重试、白烧重试预算。
+        """
+        taxonomy = ErrorTaxonomy(
+            fatal_exceptions=(c for c in [KeyError]),
+            transient_exceptions=iter([TimeoutError]),
+        )
+        assert taxonomy.fatal_exceptions == (KeyError,)
+        assert taxonomy.transient_exceptions == (TimeoutError,)
+        assert taxonomy.classify(KeyError("k")).is_fatal is True
+        assert taxonomy.classify(TimeoutError("t")).is_transient is True
+
+    def test_transient_registry_accepts_one_shot_iterator(self):
+        registry = TransientRegistry(classes=iter([ConnectionError]))
+        assert registry.snapshot() == (ConnectionError,)
+        assert registry.matches(ConnectionError("c")) is True
+
+    def test_list_input_and_generator_member_validation(self):
+        assert ErrorTaxonomy(fatal_exceptions=[ValueError]).fatal_exceptions == (
+            ValueError,
+        )
+        # 生成器入参的非法成员仍在构造期 fail-loud，校验语义不变
+        with pytest.raises(TypeError, match="transient_registry"):
+            ErrorTaxonomy(transient_registry=(c for c in [42]))
+
 
 class TestClassifyExceptionKwargsContract:
     """classify_exception 的 registry 形态与显式 kwargs 契约。"""

@@ -241,18 +241,28 @@ class ErrorTaxonomy:
         transient_exceptions: Optional[Sequence[Type[BaseException]]] = None,
         transient_registry: Optional[Sequence[Type[BaseException]]] = None,
     ) -> None:
-        # 构造期 fail-loud（Never-Raise 契约前置）：与注册/声明路径同规
-        _ensure_exception_classes(fatal_exceptions, "fatal_exceptions")
-        _ensure_exception_classes(transient_exceptions, "transient_exceptions")
-        _ensure_exception_classes(transient_registry, "transient_registry")
+        # 构造期 fail-loud（Never-Raise 契约前置）：与注册/声明路径同规。
+        # 不变式：入参先一次性物化，物化结果复用于校验与赋值——若校验先行
+        # 消费一次性迭代器（生成器/iterator）而赋值处二次物化，用户策略会
+        # 静默变空且不回退内置默认。
+        fatal_seq = tuple(fatal_exceptions) if fatal_exceptions is not None else None
+        transient_seq = (
+            tuple(transient_exceptions) if transient_exceptions is not None else None
+        )
+        registry_seq = (
+            list(transient_registry) if transient_registry is not None else None
+        )
+        _ensure_exception_classes(fatal_seq, "fatal_exceptions")
+        _ensure_exception_classes(transient_seq, "transient_exceptions")
+        _ensure_exception_classes(registry_seq, "transient_registry")
         self._fatal_exceptions: Tuple[Type[BaseException], ...] = (
-            tuple(fatal_exceptions) if fatal_exceptions is not None else FATAL_EXCEPTIONS
+            fatal_seq if fatal_seq is not None else FATAL_EXCEPTIONS
         )
         self._transient_exceptions: Tuple[Type[BaseException], ...] = (
-            tuple(transient_exceptions) if transient_exceptions is not None else TRANSIENT_EXCEPTIONS
+            transient_seq if transient_seq is not None else TRANSIENT_EXCEPTIONS
         )
         self._registry: List[Type[BaseException]] = (
-            list(transient_registry) if transient_registry is not None else []
+            registry_seq if registry_seq is not None else []
         )
 
     # ── 1. 统一分类接缝 ──────────────────────────────────────────────────
