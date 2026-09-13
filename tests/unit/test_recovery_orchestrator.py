@@ -218,6 +218,80 @@ class TestRecoveryOrchestratorRepairDuplicateWarning:
         assert [j["job_id"] for j in repaired] == ["j1"]
 
 
+class TestRecoveryOrchestratorTerminalOverlapConvergence:
+    """加载期终态交集收敛：wall∩failed 违例数据在构建运行态前确定性收敛。
+
+    不变式：wall/failed 全局互斥；违例交集若流入运行态，首个作业派发的
+    in-flight 登记触发的全量互斥断言即崩溃循环。收敛必须 failed 优先
+    （DLQ 保留失败证据供人工核查重跑）、按 uid 差量定向删除（磁盘其余
+    行原样保留），并留 WARNING 诊断证据。
+    """
+
+    def test_overlap_converged_to_failed_in_memory_and_disk(self, tmp_path):
+        backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.seed_wall(["t::x", "t::clean"])
+        backend.append_failed("t::x", {"error": "boom"})
+        wall = backend.load_wall()
+        failed = backend.load_failed()
+        orchestrator = make_orchestrator(backend)
+
+        orchestrator.converge_terminal_overlap(wall, failed)
+
+        # failed 优先：交集 uid 从内存 wall 剔除，DLQ 证据保留
+        assert "t::x" not in wall
+        assert "t::clean" in wall
+        assert "t::x" in failed
+        # 磁盘差量收敛：仅违例行剔除，其余行原样保留
+        assert "t::x" not in backend.load_wall()
+        assert "t::clean" in backend.load_wall()
+        assert "t::x" in backend.load_failed()
+
+    def test_convergence_emits_warning_listing_conflict_uids(self, caplog):
+        backend = InMemoryStateBackend()
+        orchestrator = make_orchestrator(backend)
+        wall = {"t::x": {}, "t::y": {}}
+        failed = {"t::x": {}}
+
+        with caplog.at_level(logging.WARNING, logger="tasklite"):
+            orchestrator.converge_terminal_overlap(wall, failed)
+
+        warns = [
+            r.getMessage() for r in caplog.records
+            if "both wall and failed" in r.getMessage()
+        ]
+        assert len(warns) == 1, f"交集收敛必须留恰好一条 WARNING 证据: {warns}"
+        assert "t::x" in warns[0]
+
+    def test_disjoint_terminal_sets_untouched_and_silent(self, caplog):
+        backend = InMemoryStateBackend()
+        orchestrator = make_orchestrator(backend)
+        wall = {"t::w": {}}
+        failed = {"t::f": {}}
+
+        with caplog.at_level(logging.WARNING, logger="tasklite"):
+            orchestrator.converge_terminal_overlap(wall, failed)
+
+        assert wall == {"t::w": {}}
+        assert failed == {"t::f": {}}
+        assert caplog.records == []
+
+    def test_backend_delete_failure_degrades_without_losing_convergence(self, caplog):
+        backend = MagicMock()
+        backend.delete_wall.side_effect = RuntimeError("disk gone")
+        orchestrator = make_orchestrator(backend)
+        wall = {"t::x": {}}
+        failed = {"t::x": {}}
+
+        with caplog.at_level(logging.WARNING, logger="tasklite"):
+            orchestrator.converge_terminal_overlap(wall, failed)
+
+        # 落盘失败不回退内存收敛（本次 run 不受影响），磁盘下次加载重判
+        assert "t::x" not in wall
+        assert any(
+            "re-converge on next load" in r.getMessage() for r in caplog.records
+        )
+
+
 class TestRecoveryOrchestratorRepairFrontPriority:
     """repair 窗口期 front 入队的队首优先语义（磁盘真相序权威）。
 

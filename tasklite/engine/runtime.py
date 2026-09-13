@@ -437,7 +437,9 @@ class EngineRuntime:
             logger.critical(f"Failed to persist run_id to meta table: {e}")
             raise
 
-        # 启动期队列整理与资源挂起加载
+        # 启动期队列整理与资源挂起加载（终态交集先收敛，后续 repair 与
+        # 六集合互斥断言都依赖 wall/failed 互斥前提）
+        self._recovery.converge_terminal_overlap(wall, failed)
         q_data = self._recovery.repair_queue_on_load(q_data, wall, failed)
         self._recovery.load_resource_suspends()
 

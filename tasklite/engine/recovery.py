@@ -155,6 +155,34 @@ class RecoveryOrchestrator:
             self._store.backend.delete_queue_uids(dropped_uids)
         return clean_q
 
+    def converge_terminal_overlap(self, wall: dict, failed: dict) -> None:
+        """加载期收敛存量 wall∩failed 终态交集（failed 优先，内存 + 磁盘同步）。
+
+        不变式：wall/failed 全局互斥；交集属终态违例数据，不收敛则首次
+        派发的六集合互斥断言对任意作业全局触发。收敛语义与 ``mark_failed``
+        清 wall 一致（failed/DLQ 保留失败证据，可人工核查重跑，优于静默
+        视为成功）。落盘为按 uid 定向 ``delete_wall`` 差量删除（磁盘其余
+        行原样保留），失败仅降级告警——内存态已收敛，本次 run 不受影响，
+        磁盘保持原状、下次加载重判（幂等）。
+        """
+        overlap = sorted(set(wall) & set(failed))
+        if not overlap:
+            return
+        for uid in overlap:
+            del wall[uid]
+        logger.warning(
+            f"Loaded {len(overlap)} uid(s) present in both wall and failed "
+            f"(terminal-state violation); converged to failed and removed "
+            f"from wall: {overlap}"
+        )
+        try:
+            self._store.backend.delete_wall(overlap)
+        except Exception as e:
+            logger.warning(
+                f"Failed to persist terminal-overlap convergence to backend; "
+                f"in-memory state is converged, disk will re-converge on next load: {e}"
+            )
+
     def load_resource_suspends(self) -> None:
         """从 meta 表恢复资源 suspend 状态（换算回 monotonic 挂起时刻）。"""
         try:

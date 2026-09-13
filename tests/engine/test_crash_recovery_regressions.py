@@ -1091,3 +1091,52 @@ class TestCascadeBulkFailureCrash:
         # at-least-once：下游 job 保留在 on-disk 队列（3-strike 未达阈值时保留）
         uids = [Job.from_dict(j).uid for j in pipeline.backend.load_queue()]
         assert c.uid in uids, "级联下游 c 必须保留在 on-disk 队列（崩溃后 at-least-once）"
+
+
+# ─── 存量 wall∩failed 终态交集的加载期收敛 ─────────────────
+
+
+class TestTerminalOverlapConvergenceOnLoad:
+    """存量 wall∩failed 交集在加载期确定性收敛（failed 优先）。
+
+    违例交集若流入运行态，首个作业派发时 in-flight 登记触发的
+    六集合全量互斥断言对本进程任意后续派发全局复现——加载期不收敛
+    即崩溃循环，无自愈、无诊断输出。
+    """
+
+    def test_prepare_run_state_converges_overlap_before_dispatch(self, tmp_path):
+        p = make_pipeline(tmp_path)
+        p.backend.seed_wall(["t::x"])
+        p.backend.append_failed("t::x", {"error": "legacy"})
+        p.backend.enqueue_jobs([Job("t", "fresh").to_dict()])
+
+        state = p._runtime.prepare_run_state()
+
+        # failed 优先：交集 uid 从 wall 剔除、DLQ 失败证据保留，内存与磁盘一致
+        assert "t::x" not in state.wall
+        assert "t::x" in state.failed
+        assert "t::x" not in p.backend.load_wall()
+        assert "t::x" in p.backend.load_failed()
+
+        # 派发首个队列作业不再触发六集合互斥断言（收敛前必现崩溃）
+        job_dict = state.pop_job(0)
+        state.register_in_flight(Job.from_dict(job_dict).uid)
+
+    def test_converged_run_survives_reload_without_new_overlap(self, tmp_path, caplog):
+        import logging as logging_mod
+
+        p = make_pipeline(tmp_path)
+        p.backend.seed_wall(["t::x"])
+        p.backend.append_failed("t::x", {"error": "legacy"})
+
+        p._runtime.prepare_run_state()
+        # 重启（同一库再次加载）：收敛幂等，无新违例、无重复告警
+        caplog.clear()
+        with caplog.at_level(logging_mod.WARNING, logger="tasklite"):
+            p._runtime.prepare_run_state()
+
+        overlap_warns = [
+            r.getMessage() for r in caplog.records
+            if "both wall and failed" in r.getMessage()
+        ]
+        assert overlap_warns == []
