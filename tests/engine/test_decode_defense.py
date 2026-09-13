@@ -2,6 +2,7 @@
 
 防御矩阵（触发输入）：
 - new_jobs 坏 dict                    → res["new_jobs"] 含缺 job_id 的 dict
+- new_jobs 标量                       → new_jobs 为 int/float/bool（非 list）
 - cursor_updates 值非法               → int 值
 - cursor_updates 类型非法             → cursor_updates 非 dict
 - resource_suspensions 元素非法       → [("api", "x")] 值非数字
@@ -71,6 +72,15 @@ class TestDecodeIpcsResultDefense:
         assert result.result_meta["error"].startswith("CORRUPT_RESULT_FILE: decode failed")
         assert "traceback" in result.result_meta
 
+    def test_new_jobs_scalar_marks_failed_not_crash(self):
+        """防御分支：new_jobs 字段本身为 int/float/bool 等 JSON 标量（损坏
+        文件注入）→ 与姊妹字段同构，归一为任务级失败而非以 TypeError
+        穿透 drain/claim 崩 run。"""
+        for scalar in (7, 3.5, True):
+            result = _decode(dict(_BASE_OK, new_jobs=scalar))
+            assert result.success is False
+            assert "invalid new_jobs type" in result.result_meta["error"]
+
     def test_malformed_spawned_job_marks_failed(self):
         """防御分支（mutmut_44/45）：new_jobs 含坏 dict（缺 job_id）→ 失败
         而非上抛崩 run（宁可 DLQ，不可崩）；坏条目**不阻断**后续 cursor/
@@ -79,6 +89,70 @@ class TestDecodeIpcsResultDefense:
         result = _decode(res)
         assert result.success is False
         assert "invalid spawned job dict" in result.result_meta["error"]
+
+    # 损坏结果统一形状：status=success 但 new_jobs 为 JSON 标量（磁盘位
+    # 翻转/外部误写可合法落盘，read_result 仅要求 JSON dict）
+    _SCALAR_CORRUPT = {
+        "status": "success",
+        "raw_result": None,
+        "new_jobs": 7,
+        "cursor_updates": {},
+        "resource_suspensions": [],
+    }
+
+    def test_reap_completed_contains_scalar_new_jobs_corruption(self, tmp_path):
+        """reap 路径收敛：收割前结果文件损坏为 new_jobs 标量 →
+        reap_completed 返回该任务的失败结果并照常清场，绝不以 TypeError
+        穿透打断整轮收割（单任务损坏不得放大为整管 run 崩溃）。"""
+        from tasklite.engine.channel import ExecutionChannel, JobHandle
+
+        class _DeadProcess:
+            exitcode = 0
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                pass
+
+        ipc = str(tmp_path)
+        job = Job("t", "a")
+        inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
+        ArtifactJournal(ipc).write_result_atomic(
+            job.uid, dict(self._SCALAR_CORRUPT), incarnation=inc,
+        )
+        handle = JobHandle(
+            uid=job.uid, process=_DeadProcess(), deadline=1.0, timeout=5.0,
+            job=job, ipc_dir=ipc, incarnation=inc,
+        )
+        completed = ExecutionChannel(ipc).reap_completed([handle])
+        assert len(completed) == 1, "损坏任务必须被收割而非打断收割循环"
+        result = completed[0][1]
+        assert result.success is False
+        assert "invalid new_jobs type" in result.result_meta["error"]
+        assert not ArtifactJournal(ipc).result_path(job.uid, inc).exists(), (
+            "收割后 IPC 结果文件必须照常清理"
+        )
+
+    def test_claim_stale_result_contains_scalar_new_jobs_corruption(self, tmp_path):
+        """claim/restore 路径收敛：崩溃残留结果文件带 new_jobs 标量 →
+        claim_stale_result 归一为该任务的失败结果（dispatch 记账），绝不以
+        TypeError 穿透崩 run；残留文件照常被消费清理（无崩溃循环）。"""
+        from tasklite.engine.channel import ExecutionChannel
+
+        ipc = str(tmp_path)
+        job = Job("t", "a")
+        inc = "deadbeefdeadbeefdeadbeefdeadbeef.2"
+        ArtifactJournal(ipc).write_result_atomic(
+            job.uid, dict(self._SCALAR_CORRUPT), incarnation=inc,
+        )
+        result = ExecutionChannel(ipc).claim_stale_result(job.uid, job)
+        assert result is not None, "含 status 键的残留结果必须被认领"
+        assert result.success is False
+        assert "invalid new_jobs type" in result.result_meta["error"]
+        assert not ArtifactJournal(ipc).result_path(job.uid, inc).exists(), (
+            "认领后残留文件必须照常消费清理"
+        )
 
     def test_cursor_updates_type_not_dict_marks_failed(self):
         """防御分支（mutmut_82）：cursor_updates 非 dict（损坏文件注入

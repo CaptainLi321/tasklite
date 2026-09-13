@@ -113,17 +113,25 @@ def _decode_ipc_result(
                     }
                     logger.error(f"Result decode failed for {job.uid}: {e}")
             new_jobs = []
-            for jd in res.get("new_jobs") or []:
-                try:
-                    new_jobs.append(Job.from_dict(jd))
-                except (KeyError, TypeError, ValueError) as e:
-                    success = False
-                    result_meta = {
-                        "error": f"invalid spawned job dict: {e}",
-                        _KEY_TRACEBACK: traceback.format_exc(),
-                    }
-                    logger.error(f"Malformed spawned job in {job.uid}: {e}")
-                    break
+            _nj = res.get("new_jobs", [])
+            # 不变式：结果文件任何异常形态都收敛为任务级失败记账，
+            # 不得以 TypeError 穿透 drain/claim 使单任务损坏放大为整管崩溃。
+            if isinstance(_nj, list):
+                for jd in _nj:
+                    try:
+                        new_jobs.append(Job.from_dict(jd))
+                    except (KeyError, TypeError, ValueError) as e:
+                        success = False
+                        result_meta = {
+                            "error": f"invalid spawned job dict: {e}",
+                            _KEY_TRACEBACK: traceback.format_exc(),
+                        }
+                        logger.error(f"Malformed spawned job in {job.uid}: {e}")
+                        break
+            else:
+                success = False
+                result_meta = {"error": f"invalid new_jobs type: {type(_nj).__name__}"}
+                logger.error(f"Invalid new_jobs type in {job.uid}: {type(_nj).__name__}")
             if success:
                 _cu = res.get("cursor_updates", {})
                 _rs = res.get("resource_suspensions", [])
