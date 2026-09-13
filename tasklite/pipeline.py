@@ -64,6 +64,7 @@ class TaskLite:
 
         Args:
             name: Pipeline name, used for state file naming (e.g. ``{name}_state.db``).
+                Must be a non-empty str without path separators (fail-loud).
             state_dir: Directory for persistent state files. Created if not exists.
             backend: ``"sqlite"`` (default) or an ``AbstractStateBackend`` instance.
                 Production must use ``"sqlite"`` for ACID guarantees.
@@ -91,6 +92,15 @@ class TaskLite:
             ``stats["hook_errors"]`` 计数，**绝不影响主循环**——钩子按不可信
             代码对待。多方订阅由业务自封装分发器，框架不维护监听器列表。
         """
+        # name 派生状态库文件名（{name}_state.db）——含路径分隔符时
+        # SQLite 库逃逸 state_dir（持久态与 ipc/ 分离，备份/巡检漏库）；
+        # 校验先于任何目录/库文件副作用，与 task_type 的入口校验惯例同规。
+        if not isinstance(name, str) or not name:
+            raise TypeError(
+                f"name must be a non-empty str, got {type(name).__name__} ({name!r})"
+            )
+        if "/" in name or "\\" in name:
+            raise ValueError(f"name must not contain path separators, got {name!r}")
         self.name = name
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)

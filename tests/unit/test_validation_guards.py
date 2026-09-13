@@ -34,6 +34,37 @@ class TestBackendTypeGuard:
         assert p.backend_type == "memory"
 
 
+# ─── TaskLite 构造：name 非法 ─────────────────────────────────
+
+class TestPipelineNameGuard:
+    """name 派生状态库文件名（{name}_state.db）：含路径分隔符会让
+    SQLite 库逃逸 state_dir（持久态与 ipc/ 分离，备份/巡检漏库），
+    构造期 fail-loud，与 task_type 的入口校验惯例同规。"""
+
+    def test_rejects_empty_name(self, tmp_path):
+        with pytest.raises(TypeError, match="name must be a non-empty str"):
+            TaskLite(name="", state_dir=tmp_path / "s")
+
+    def test_rejects_non_str_name(self, tmp_path):
+        with pytest.raises(TypeError, match="name must be a non-empty str"):
+            TaskLite(name=42, state_dir=tmp_path / "s")  # type: ignore
+
+    def test_rejects_path_separators(self, tmp_path):
+        for bad in ("../escaped", "a/b", "a\\b"):
+            with pytest.raises(ValueError, match="path separators"):
+                TaskLite(name=bad, state_dir=tmp_path / "s")
+
+    def test_rejection_leaves_no_state_dir_side_effects(self, tmp_path):
+        with pytest.raises(ValueError):
+            TaskLite(name="../escaped", state_dir=tmp_path / "s")
+        assert not (tmp_path / "s").exists(), "校验失败不得产生目录副作用"
+
+    def test_valid_name_keeps_state_db_inside_state_dir(self, tmp_path):
+        p = TaskLite(name="ok_name", state_dir=tmp_path / "s")
+        assert (tmp_path / "s" / "ok_name_state.db").exists()
+        assert p.name == "ok_name"
+
+
 # ─── TaskLite 构造：max_workers 非法 ─────────────────────────
 
 class TestMaxWorkersGuard:
