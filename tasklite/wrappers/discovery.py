@@ -16,22 +16,17 @@
 覆盖」的前提在本模型下不存在）：wall 由后端事务写入，最坏代价
 是重复 fetch，正确性不受影响。
 
-与旧 API 的差异（迁移须知）：
-- 新增必填 ``process_task_type``：process 子任务的 task_type。整页命中判定
-  需要构造 ``f"{process_task_type}::{content_id}"`` 查询 wall/failed 快照。
-- ``cursor_key_func`` 从必填改为可选：仅作 job_id 命名空间前缀（防止跨分组
-  内容 id 碰撞导致 wall 去重误吞），不再有任何游标语义。
-- ``poison_max_attempts`` 删除：坏 item 由 process 子任务的任务层
-  retry/DLQ 天然吸收——子任务进 DLQ 即 ``is_failed`` = 已见，不再重新 spawn。
-
-与旧版相比的有意语义差异：
-- 旧版 seen 在扫描时立即更新；本版 wall 快照在 discovery job 派发时固定。同一内容
-  本次 run 内跨页重复出现时会重复 spawn（框架 wall 去重吸收，仅浪费一次
-  spawn 调用）。
-- 旧版含毒 item 的页永不整页命中（整页命中判定不含 poison 检查）；本版
-  DLQ 内容在 failed 快照中算「已见」，含坏 item 的页可正常整页命中。
-- 旧版达 ``max_pages`` 写 ``partial:<page>`` 游标（观测用）；本版仅记日志。
-  下次 run 的 fetch 量与旧版等价——两者都每 run 从第 1 页完整重扫。
+参数与行为要点：
+- ``process_task_type``（必填）：process 子任务的 task_type——整页命中判定
+  按 ``f"{process_task_type}::{content_id}"`` 查询 wall/failed 快照。
+- ``cursor_key_func``（可选）：仅作 job_id 命名空间前缀（防止跨分组内容 id
+  碰撞导致 wall 去重误吞），无游标语义。
+- 坏 item 由 process 子任务的任务层 retry/DLQ 吸收——子任务进 DLQ 即
+  ``is_failed`` = 已见，不再重新 spawn；DLQ 内容在 failed 快照中算「已见」，
+  含坏 item 的页可正常整页命中。
+- wall/failed 快照在 discovery job 派发时固定：同一内容本次 run 内跨页重复
+  出现时会重复 spawn（框架 wall 去重吸收，仅浪费一次 spawn 调用）。
+- 达 ``max_pages`` 截断仅记日志、不落任何游标：下次 run 仍从第 1 页完整重扫。
 
 回调必须为模块级可 pickle 函数（spawn 进程隔离约束，与普通 handler 一致）。
 

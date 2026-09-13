@@ -204,8 +204,9 @@ _DEFAULT_RATE_LIMIT_STATUSES = frozenset({429})
 _DEFAULT_FATAL_STATUSES = frozenset({400, 401, 403, 404, 405, 410, 422})
 _DEFAULT_RETRY_STATUSES = frozenset({500, 502, 503, 504, 520, 521, 522, 524})
 
-# 快照保底不写入的瞬态状态：408（请求超时）/425（过早）与 429/5xx 同属
-# 可重试故障，被永久快照后离线重放会持续命中过期的错误响应。
+# 快照保底不写入的状态：429/5xx 属瞬态故障；408（请求超时）/425（过早）
+# 按默认分类走 4xx 兜底判 FatalError，但均为疑似过期的错误响应——被永久
+# 快照后离线重放会持续命中同一过期响应，故一律不落盘。
 _TRANSIENT_NO_SNAPSHOT_STATUSES = frozenset({408, 425, 429})
 
 
@@ -332,8 +333,8 @@ class HttpPolicy:
         # 瞬态传输层错误（超时、连接重置、DNS 解析失败等）。
         # http.client.HTTPException 基类整体纳入：BadStatusLine/LineTooLong 等
         # getresponse/read 阶段故障（代理/源站提前断连的典型形态）不是 OSError，
-        # 遗漏即裸逃逸为零重试致命错误；HTTPError 虽同为该家族成员，但已在
-        # 前置分支按状态码精确分类，不受此兜底影响。
+        # 遗漏即裸逃逸为零重试致命错误；HTTPError 属 URLError/OSError 族而非
+        # HTTPException 家族，已在上方前置分支按状态码精确分类，不落本兜底。
         if isinstance(
             exc,
             (

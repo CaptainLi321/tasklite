@@ -1,7 +1,7 @@
-"""用户工具函数（从 pipeline.py 门面迁出）。
+"""面向业务方的展示与切片工具。
 
-提供 job_ref / progress_hook / slice_list 三个面向业务方的便利工具，
-保持对外公共 API 面不变（经 tasklite/__init__.py 统一导出）。
+提供 job_ref / progress_hook / slice_list 三个便利工具，
+经 tasklite/__init__.py 统一导出。
 """
 from __future__ import annotations
 
