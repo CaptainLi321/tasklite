@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20external-brightgreen.svg)]()
 [![ACID Persistence](https://img.shields.io/badge/persistence-SQLite%20WAL%20(ACID)-orange.svg)]()
-[![Tests](https://img.shields.io/badge/tests-1160%2B%20passed-success.svg)]()
+[![Tests](https://img.shields.io/badge/tests-2000%2B%20passed-success.svg)]()
 
 ---
 
@@ -328,12 +328,15 @@ tasklite/
 │   ├── recovery.py      # 崩溃检测与恢复 (RecoveryMachine)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel / WorkerLaunchSpec)
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler)
+│   ├── policy.py        # 准入预检、重试退避与 rerun 决策 (ExecutionPolicy)
+│   ├── governor.py      # 死锁归因仲裁与依赖宽限 (DeadlockGovernor)
+│   ├── inflight.py      # 在途作业租约追踪 (InFlightTracker)
 │   └── resource.py      # 令牌桶限速与并发容量资源
 ├── backend/             # SQLite WAL 强一致事务持久化后端
 ├── models/              # Job / TaskContext / PipelineState 数据模型
 ├── taxonomy.py          # 错误分类法与校验分类深模块 (ErrorTaxonomy)
 ├── wrappers/            # discovery.py（增量扫描）/ http.py（网络守卫与快照）
-└── utils/               # jsonutil (禁NaN) / lockfile
+└── utils/               # injective（单射 %XX 转义）/ ipc（IPC 信号与降级落盘）/ jsonutil（禁NaN）/ lockfile
 ```
 
 ---
