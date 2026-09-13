@@ -323,6 +323,10 @@ class StateStore:
         """登记在途 UID。"""
         self._state.register_in_flight(uid)
 
+    def mark_rerun_active(self, uid: str) -> None:
+        """登记重跑豁免 UID（派发期准入放行的 wall/failed 命中重跑）。"""
+        self._state.mark_rerun_active(uid)
+
     def unregister_in_flight(self, uid: str) -> None:
         """注销在途 UID。"""
         self._state.unregister_in_flight(uid)

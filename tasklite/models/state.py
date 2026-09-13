@@ -109,6 +109,16 @@ class PipelineState:
         """重入队（崩溃恢复/重试），语义同 spawn_jobs 队首插入。"""
         self.spawn_jobs(job_dicts, front=front)
 
+    def mark_rerun_active(self, uid: str) -> None:
+        """登记派发期准入放行的重跑豁免 uid。
+
+        不变式：豁免集合与准入判定同源——字面 rerun 键由 pop_job/
+        spawn_jobs 登记，准入层按含 discovery 默认策略的有效策略放行的
+        重跑由此登记；缺任一登记，in-flight 登记的全量互斥断言都会把
+        合法重跑误判为 wall/failed ∩ in-flight 违例。
+        """
+        self._rerun_active_uids.add(uid)
+
     # in-flight 集合（唯一修改 _in_flight_uids 的路径）-------------
 
     def register_in_flight(self, uid: str) -> None:

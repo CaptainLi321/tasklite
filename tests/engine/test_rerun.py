@@ -34,6 +34,11 @@ def _child_ok(job, ctx):
     return True
 
 
+def _fail_then_ok_by_payload(job, ctx):
+    # attempt>1 才成功：同 uid 重跑换新 payload 后必须真实执行才转 wall。
+    return job.payload["attempt"] > 1
+
+
 def _always_retry_handler(job, ctx):
     from tasklite.exceptions import RetryError
     raise RetryError("transient forever")
@@ -337,6 +342,58 @@ class TestDiscoveryDefaultRerun:
         with pytest.raises(ValueError, match="rerun"):
             register_discovery(p, "disc", _fetch_empty, _item_id, _process,
                                "child", rerun="sometimes")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# discovery 动态兜底放行与豁免登记的同源性
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestDiscoveryDynamicFallbackRerun:
+    """策略晚于入队注册时，队列行无字面 rerun 键，派发期动态兜底放行的
+    wall/failed 命中重跑必须与豁免登记同源。
+
+    不变式：
+    1. 凡准入层放行的重跑，其 uid 必须在 in-flight 登记前进入豁免
+       集合——六集合互斥断言不得击落准入层自己放行的作业；
+    2. DEBUG 断言是引擎不变式破坏信号，不是作业坏输入——不得计入
+       派发失败预算（3-strike 会把可正常执行的作业误送 DLQ）。
+    """
+
+    def test_failed_hit_rerun_without_literal_key_executes(self, tmp_path):
+        p = _pipeline(tmp_path, name="dyn_fb")
+        p.register_handler("t", _fail_then_ok_by_payload)
+        p.enqueue([Job("t", "x", payload={"attempt": 1}, max_retries=0)])
+        p.run()
+        assert "t::x" in p.backend.load_failed()
+
+        # 关键时序：先入队（此刻 discovery 默认未注册 → 队列行无 rerun 键），
+        # 后注册策略 → 派发期经动态兜底放行 failed 命中重跑。
+        p.enqueue([Job("t", "x", payload={"attempt": 2}, max_retries=0)])
+        p.set_discovery_rerun("t", "on_failure")
+        p.run()
+        wall = p.backend.load_wall()
+        assert "t::x" in wall, "动态兜底放行的重跑必须真实执行并转 wall"
+        assert "t::x" not in p.backend.load_failed(), "成功后 DLQ 残行清除"
+        assert wall["t::x"]["run_count"] == 1
+
+    def test_invariant_assertion_bypasses_dispatch_failure_budget(self, tmp_path, monkeypatch):
+        """不变式断言穿透派发异常链：不记账、不误送 DLQ，作业保持队列。"""
+        import tasklite.engine.dispatch as dispatch_mod
+
+        p = _pipeline(tmp_path, name="assert_gate")
+        p.register_handler("t", _ok_handler)
+        p.enqueue([Job("t", "x")])
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("simulated invariant violation")
+
+        monkeypatch.setattr(dispatch_mod, "TaskContext", _boom)
+        with pytest.raises(AssertionError):
+            p.run()
+        jd = p.backend.load_queue()[0]
+        rt = jd.get("runtime") or {}
+        assert not rt.get("_dispatch_failures"), "不变式断言不得计入派发失败预算"
 
 
 # ══════════════════════════════════════════════════════════════════════

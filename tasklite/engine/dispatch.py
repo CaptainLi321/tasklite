@@ -195,6 +195,11 @@ class DispatchMachine:
             if decision.should_skip:
                 self._store.apply_skip(uid, job_dict)
                 return True
+            if decision.should_run and (uid in store.wall_uids or uid in store.failed_uids):
+                # 豁免登记与准入判定同源：pop_job 只按字面 rerun 键登记豁免，
+                # 队列行无键而由动态兜底放行的重跑必须在此补登记，否则
+                # in-flight 登记的全量互斥断言会击落本关放行的作业。
+                store.mark_rerun_active(uid)
         return False
 
 
@@ -387,6 +392,11 @@ class DispatchMachine:
             # _CommitCrashSignal 继承 BaseException——「commit 失败需崩溃」
             # 的信号不会被 except Exception 兜底误吞。re-raise 让它穿透到
             # run_loop 的崩溃处理分支（已 requeue 当前 job，不在此二次处理）。
+            raise
+        except AssertionError:
+            # DEBUG 断言是引擎不变式破坏信号，不是作业坏输入——不得计入
+            # 派发失败预算（3-strike 会把可正常执行的作业误送 DLQ），
+            # 原样穿透交 run_loop 崩溃网统一收尾。
             raise
         except KeyboardInterrupt:
             logger.warning(f"Pipeline interrupted while dispatching {uid}.")

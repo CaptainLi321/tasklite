@@ -786,8 +786,8 @@ class TestDispatchExceptionEntryRegistered:
 
     变异体（删 _in_flight.pop / unregister 行）下：entry 留在 _in_flight →
     raise 后 _abort_in_flight 对该 entry 二次 requeue → 内存队列重复 uid。
-    触发面：register_in_flight 的 DEBUG 断言失败（状态已损坏）——本测试
-    用 monkeypatch 模拟该断言失败。"""
+    触发面：注册后 state.register_in_flight 抛非断言异常——本测试
+    用 monkeypatch 模拟该异常（DEBUG 断言走独立穿透路径，不入本分支）。"""
 
     def test_dispatch_exception_entry_registered_no_double_requeue(self, tmp_path, monkeypatch):
         """断言必须读**内存队列**而非磁盘队列。
@@ -805,16 +805,16 @@ class TestDispatchExceptionEntryRegistered:
         pipeline.register_handler("t", lambda j, c: True)
         pipeline.enqueue([Job("t", "j1", payload={})])
 
-        # 模拟 register_in_flight 的 DEBUG 断言失败：self._in_flight[uid]=entry
-        # 已执行、state.register_in_flight 抛 AssertionError → except Exception
+        # 模拟注册后的派发期异常：self._in_flight[uid]=entry 已执行、
+        # state.register_in_flight 抛非断言异常 → except Exception requeue 分支
         def boom_register(self, uid):
-            raise AssertionError("simulated DEBUG assertion failure")
+            raise RuntimeError("simulated dispatch-stage failure")
         monkeypatch.setattr(PipelineState, "register_in_flight", boom_register)
 
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
 
-        with pytest_mod.raises(AssertionError):
+        with pytest_mod.raises(RuntimeError):
             pipeline.run()
 
         # 内存队列不得出现重复 uid（变异体：二次 requeue → 两条 t::j1）。
@@ -827,8 +827,9 @@ class TestDispatchExceptionEntryRegistered:
     def test_dispatch_exception_dlq_branch_pops_entry(self, tmp_path, monkeypatch):
         """DLQ 分支的 ``_in_flight.pop`` 无防御测试覆盖。
 
-        触发条件：entry 已注册（``self._in_flight`` 含 uid——register_in_flight
-        的 DEBUG 断言失败）+ failures≥3（注入 ``_dispatch_failures=2`` →
+        触发条件：entry 已注册（``self._in_flight`` 含 uid——注册后
+        state.register_in_flight 抛非断言异常，走 except Exception 分支）+
+        failures≥3（注入 ``_dispatch_failures=2`` →
         本次 dispatch 失败即达 3-strike，独立计数）→ 走 DLQ 分支而非
         requeue 分支。此前
         failures=1 只走 requeue 分支；boom_submit 在 submit 抛异常时 entry
@@ -854,10 +855,10 @@ class TestDispatchExceptionEntryRegistered:
         conn.commit()
         conn.close()
 
-        # 模拟 register_in_flight 的 DEBUG 断言失败：self._in_flight[uid]=entry
-        # 已执行、state.register_in_flight 抛 AssertionError → except Exception
+        # 模拟 entry 注册后的派发期异常：self._in_flight[uid]=entry
+        # 已执行、state.register_in_flight 抛非断言异常 → except Exception
         def boom_register(self, uid):
-            raise AssertionError("simulated DEBUG assertion failure")
+            raise RuntimeError("simulated dispatch-stage failure")
         monkeypatch.setattr(PipelineState, "register_in_flight", boom_register)
 
         FakeP = make_fake_process_class("success")
