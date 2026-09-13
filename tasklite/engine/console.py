@@ -165,10 +165,11 @@ class OpsConsole:
     def seed_wall(self, uids: Sequence[str]) -> int:
         """把 uid 批量写入 wall（存档迁移标记「已处理」），返回实际写入数。
 
-        不变式（wall/failed 全局互斥）：已在 failed（DLQ）的 uid 拒绝种子。
-        预检先于任何写入（backend 持久层与内存 state 双腿零写入），冲突
-        整体拒绝——静默覆盖会留下 wall∩failed 重叠，令下一次派发的状态
-        一致性断言崩溃；DLQ 记录须先经 clear_dlq/clear_history 显式清除。
+        不变式（六集合互斥）：已在 failed（DLQ）或驻留内存队列的 uid 拒绝
+        种子。预检先于任何写入（backend 持久层与内存 state 双腿零写入），
+        冲突整体拒绝——静默写入会留下 wall∩failed / wall∩queue 非豁免重叠，
+        令下一次状态变更的一致性断言崩溃；DLQ 记录须先经 clear_dlq/
+        clear_history 显式清除，队列驻留须待 run 排空或显式清理后再种子。
         """
         if not isinstance(uids, (list, tuple)):
             raise TypeError(
@@ -186,12 +187,20 @@ class OpsConsole:
                     f"seed_wall uid must have non-empty task_type and job_id, got {u!r}"
                 )
         failed = self._backend.load_failed()
-        conflict = sorted({u for u in uids if u in failed})
-        if conflict:
+        queue_uids = self._store.queue_uids
+        conflict_failed = sorted({u for u in uids if u in failed})
+        conflict_queue = sorted({u for u in uids if u in queue_uids})
+        if conflict_failed:
             raise ValueError(
-                f"seed_wall refuses uid(s) already in failed (DLQ): {conflict}; "
+                f"seed_wall refuses uid(s) already in failed (DLQ): {conflict_failed}; "
                 f"wall/failed must stay disjoint. Clear the DLQ entries first "
                 f"(clear_dlq/clear_history) if archiving is intended."
+            )
+        if conflict_queue:
+            raise ValueError(
+                f"seed_wall refuses uid(s) still resident in the queue: "
+                f"{conflict_queue}; wall/queue must stay disjoint. Drain or "
+                f"clear the queue entries first if archiving is intended."
             )
         written = self._backend.seed_wall(list(uids))
         state = self._store.state

@@ -240,3 +240,33 @@ class TestSeedWallUidGuard:
         p = make_pipeline(tmp_path)
         with pytest.raises(ValueError, match="exactly one '::'|non-empty"):
             p.seed_wall(["::"])
+
+    def test_rejects_uid_resident_in_queue(self):
+        """wall/queue 必须互斥：驻留内存队列的 uid 拒绝种子。
+
+        上次 run 中断后内存队列仍驻留作业（内存态不重建，仅由 set_state
+        整体重建），对此类 uid 种子会在内存态制造 wall∩queue 非豁免重叠，
+        违反六集合互斥不变式——step() 直驱下后续任意状态变更即触发一致性
+        断言崩溃。预检先于任何写入，冲突整体拒绝。
+        """
+        from tasklite.backend.memory import InMemoryStateBackend
+        from tasklite.engine.console import OpsConsole
+        from tasklite.engine.store import StateStore
+        from tasklite.models.state import PipelineState
+        from tasklite.taxonomy import _DEFAULT_TAXONOMY
+
+        backend = InMemoryStateBackend()
+        store = StateStore(backend)
+        # 模拟中断 run 的残留：内存队列驻留一个 rerun=never 的作业
+        store.set_state(PipelineState({}, {}, {}, [
+            {"task_type": "download", "job_id": "1", "payload": {}, "rerun": "never"},
+        ]))
+        console = OpsConsole(backend, store, _DEFAULT_TAXONOMY)
+
+        with pytest.raises(ValueError, match="queue"):
+            console.seed_wall(["download::1"])
+        # 双腿零写入：backend 持久层与内存 state 均无 wall 残留
+        assert "download::1" not in backend.load_wall()
+        assert "download::1" not in store.state.wall
+        # 非队列驻留 uid 种子不受波及
+        assert console.seed_wall(["download::2"]) == 1
