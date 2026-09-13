@@ -6,7 +6,44 @@
 
 ## [Unreleased]
 
-暂无。
+缺陷修复版本：收敛 HTTP 传输异常分类与快照写入谓词、错误分类法构造契约、单射转义与内容指纹、状态机六集合互斥以及依赖宽限与挂起信号排空等多项缺陷。
+
+### 修复
+
+- **HTTP 守卫与快照**：
+  - `http.client.HTTPException` 家族（`BadStatusLine` / `LineTooLong` / `ResponseNotReady` 等）整体归为瞬态传输故障，残缺状态行等协议故障不再零重试直接进死信队列。
+  - 快照缓存的状态提取默认值由 200 改为 `None`，`fetch_fn` 返回 urllib 原生响应时真实状态码得以透传，不再被恒记为 200 落盘。
+  - 瞬态 4xx（408/425）纳入快照保底不写入谓词，防止过期的错误响应被永久快照后离线重放持续命中。
+  - `params` 中 `None` 值的丢弃语义与 `requests` 全链路对齐（请求键指纹与 urllib wire 同步），消除跨后端同请求串快照。
+- **Discovery**：
+  - `on_missing` 组过滤改用未截断转义前缀匹配并辅以截断头部互补匹配，超长 `cursor_key` 的分组不再静默失效（源端缺失检测不再漏报本组成员）。
+- **错误分类法**：
+  - `classify_exception` 同时收到位置与关键字实参（`ErrorTaxonomy` 实例形态）时显式抛 `TypeError`（fail-loud，破坏性收紧），不再静默忽略其一。
+  - 构造器策略序列逐成员 fail-loud 校验，`classify_*` 的「永不抛错」契约不再可被构造路径注入的坏成员击穿。
+  - `tasklite.exceptions` 动态转发以 taxonomy `__all__` 为白名单，私有符号不再泄漏至公共导出面。
+  - 资源名校验补非空 `str` 约束，非 `str` 键不再跨重启发生类型漂移。
+- **单射转义与内容指纹**：
+  - `escape_injective` 拒绝非 `str` 输入（fail-loud，破坏性收紧），`None` 不再被强转为字面 `"None"` 的同像碰撞。
+  - `content_fingerprint` 对嵌套 `dict` 全 token 化，任意层级容器的键序不再影响指纹。
+- **数据模型**：
+  - `Job` runtime 命名空间仅认 `_` 前缀规范键，extra 中的同名键往返无损。
+- **状态机互斥与加载期收敛**：
+  - 加载期确定性收敛存量 wall∩failed 终态交集，受影响状态库升级后不再「派发即崩溃」循环。
+  - `seed_wall` 预检扩展至内存队列驻留 uid，杜绝 wall∩queue 互斥重叠。
+  - 准入放行的重跑同步登记豁免，动态兜底重跑不再被互斥断言击落。
+  - 准入放行的动态重跑落行内字面键，豁免登记免遭按字面键重建冲掉。
+- **依赖宽限与死锁治理**：
+  - 依赖宽限 episode 在派发前进与消解两条路径上正确终结残留 deadline，同 uid 复发不再被零宽限批量误杀。
+- **挂起信号与 IPC 排空**：
+  - `.draining` 标记文件随排空回收，读者中途死亡不再丢失 suspend 信号。
+  - 跨 run 崩溃残留的 suspend 信号在启动期回收并在派发前排空。
+  - abort 初扫对已完成 job 补排空 suspend 信号，收尾清理不再未读删除。
+- **重试与运行时**：
+  - 重试字典以原 job_dict 为基重建，job_dict 顶层自定义字段随重试往返保留。
+  - 损坏结果中 `new_jobs` 的标量形态收敛为单任务失败，不再穿透 drain/claim 使整管崩溃。
+  - `RunSummary.unhandled_exception` 死赋值收敛，契约固化为 raise 通道异常语义。
+  - `TaskLite.name` 构造期校验，含路径分隔符时状态库不再逃逸 `state_dir`。
+  - 清理零使用的 `pickle` 与 `classify_error_type` 死导入。
 
 ## [1.2.2] - 2026-09-13
 
