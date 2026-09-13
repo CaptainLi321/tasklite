@@ -499,8 +499,8 @@ def test_make_key_identity_headers_injective() -> None:
 def test_make_key_params_fingerprint_injective() -> None:
     """params 值指纹须类型前缀隔离，None 与 "None" 等不同形态不得共享快照 key。
 
-    norm_query 以 str(v) 镜像线上 URL 形态，但 requests 后端对 None 参数
-    直接丢弃——str() 强转的多对一映射会让不同线上请求静默命中同一快照。
+    None 值参数与 requests 语义对齐全链路丢弃（wire、norm_query、指纹一致），
+    与省略该参数同 key；字面 "None" 值保留参与指纹，二者不碰撞。
     """
     base = SnapshotStore.make_key("https://api.test/a")
     k_none = SnapshotStore.make_key("https://api.test/a", params={"a": None})
@@ -511,14 +511,17 @@ def test_make_key_params_fingerprint_injective() -> None:
     assert SnapshotStore.make_key("https://api.test/a", params={"a": 1}) != SnapshotStore.make_key(
         "https://api.test/a", params={"a": "1"}
     )
-    # 携带 params 与不携带 params 互不碰撞
-    assert base != k_none
+    # None 值丢弃后与省略参数同 key；字面 "None" 值仍独立成 key
+    assert k_none == base
     assert base != k_str
+    # 混合 None 值与实值的 params 与剔除 None 后等价
+    assert SnapshotStore.make_key("https://api.test/a", params={"a": 1, "b": None}) == SnapshotStore.make_key(
+        "https://api.test/a", params={"a": 1}
+    )
     # dict 插入顺序不影响 key，相同 params 稳定同 key
     assert SnapshotStore.make_key("https://api.test/a", params={"a": 1, "b": 2}) == SnapshotStore.make_key(
         "https://api.test/a", params={"b": 2, "a": 1}
     )
-    assert SnapshotStore.make_key("https://api.test/a", params={"a": None}) == k_none
 
 
 def test_sqlite_snapshot_store_crud(tmp_path: Path) -> None:
@@ -889,6 +892,10 @@ class _TestHttpHandler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             self.wfile.write(b"server error")
+        elif self.path.startswith("/echo"):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(self.path.encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -947,6 +954,17 @@ def test_fetch_urllib_500_retry(local_http_server: str) -> None:
 def test_fetch_urllib_404_fatal(local_http_server: str) -> None:
     with pytest.raises(FatalError):
         fetch_urllib(f"{local_http_server}/non_existent")
+
+
+def test_fetch_urllib_drops_none_params_like_requests(local_http_server: str) -> None:
+    """params None 值与 requests 语义对齐丢弃：不上链，快照 key 与省略等价。
+
+    requests 对 params={"k": None} 直接丢弃该参数；若 fetch_urllib 以
+    str(v) 拼接上链，同一 params 映射在两后端线上请求不同而快照 key 相同，
+    共用同一 SnapshotStore 的混用脚本会静默串快照。
+    """
+    resp = fetch_urllib(f"{local_http_server}/echo", params={"k": None, "a": "1"})
+    assert resp.text == "/echo?a=1"
 
 
 def test_fetch_urllib_bad_status_line_raises_retry_error() -> None:

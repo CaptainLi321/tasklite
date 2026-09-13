@@ -565,10 +565,9 @@ class SnapshotStore:
             headers: 请求头 Mapping（仅身份头白名单参与指纹）。
 
         Returns:
-            str: 规范化的请求键。params 非空时附加类型前缀指纹段：
-            norm_query 以 str(v) 镜像线上 URL 形态，但 str() 强转是多对一映射
-            （None 与 "None" 同串），且 requests 后端对 None 参数直接丢弃，
-            线上请求不同而 key 相同会静默串快照。
+            str: 规范化的请求键。params 非空时附加类型前缀指纹段；
+            None 值参数与 requests 语义对齐全链路丢弃（线上请求与省略该
+            参数等价，key 亦相同），norm_query 以 str(v) 镜像线上 URL 形态。
         """
         clean_url = url.strip()
         parsed = urllib.parse.urlparse(clean_url)
@@ -579,6 +578,8 @@ class SnapshotStore:
             query_items.extend(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
         if params:
             for k, v in params.items():
+                if v is None:
+                    continue
                 query_items.append((str(k), str(v)))
         query_items.sort()
         norm_query = urllib.parse.urlencode(query_items)
@@ -640,16 +641,24 @@ class SnapshotStore:
     def _params_fingerprint(cls, params: Any) -> str:
         """params 指纹段（单射）：值统一经 _value_fingerprint 类型前缀出口。
 
-        不变式：同一 params 映射的不同序列化形态不得共享快照 key——None 与
-        "None" 的 str() 强转同串，但 requests 后端对 None 参数直接丢弃，
-        线上请求实际不同。排序后序列化以消除 dict 插入顺序差异（_json_dumps
-        不做键排序，直接序列化整个映射会使同语义映射因顺序不同而 key 漂移）。
+        不变式：同一 params 映射的不同序列化形态不得共享快照 key。None 值
+        参数在指纹、norm_query 与两侧 fetch 的 wire 上一致丢弃（requests
+        语义），丢弃后与省略该参数同 key 同 wire；字面 "None" 值仍保留参与
+        指纹，与 None 不碰撞。排序后序列化以消除 dict 插入顺序差异
+        （_json_dumps 不做键排序，直接序列化整个映射会使同语义映射因顺序
+        不同而 key 漂移）。
         """
         if not params:
             return ""
         try:
-            items = sorted((str(k), cls._value_fingerprint(v)) for k, v in dict(params).items())
+            items = sorted(
+                (str(k), cls._value_fingerprint(v))
+                for k, v in dict(params).items()
+                if v is not None
+            )
         except (TypeError, ValueError):
+            return ""
+        if not items:
             return ""
         return "::p" + hashlib.sha256(_json_dumps(items).encode("utf-8")).hexdigest()[:16]
 
@@ -1058,6 +1067,11 @@ def fetch_urllib(
         parsed = urllib.parse.urlparse(url)
         q = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         for k, v in params.items():
+            # None 值参数与 requests 语义对齐丢弃——否则 k=None 上链而
+            # requests 侧同名参数被丢弃，同 params 映射跨后端线上请求不同
+            # 却共享同一快照 key，静默串快照。
+            if v is None:
+                continue
             q.append((str(k), str(v)))
         new_query = urllib.parse.urlencode(q)
         final_url = urllib.parse.urlunparse(
