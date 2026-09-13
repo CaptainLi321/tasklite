@@ -638,6 +638,18 @@ class ExecutionChannel:
                     and raw_res.get("status") != "interrupted"
                 ):
                     decoded = _decode_ipc_result(raw_res, None, h.job, self.ipc_dir)
+                    # 不变式：结果文件已原子落盘 ⇒ 本执行体的信号追加全部
+                    # 早于落盘（record_signal 只发生在 handler 执行期内），
+                    # 此刻排空无并发写者、无损；非 success payload 不携带
+                    # 挂起字段，缺此步时 done 对经完成机器的收尾清理会把
+                    # 「先排空阶段之后写入」的信号文件未读删除。
+                    try:
+                        decoded.resource_suspensions = (
+                            list(decoded.resource_suspensions)
+                            + self.journal.drain_signals(h.uid)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to salvage signals for {h.uid}: {e}")
                     done_pairs.append((h, decoded))
                     continue
             pending_handles.append(h)

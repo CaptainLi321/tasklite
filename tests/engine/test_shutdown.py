@@ -819,3 +819,171 @@ class TestAbortSalvagedSignalApplication:
 
         assert backend.get_meta(META_RESOURCE_SUSPENDS) is None
         assert "gpu" not in resources.collect_suspensions()
+
+
+class TestAbortInitialScanDonePairSignalDrain:
+    """abort 初扫「结果已落盘」分类的信号排空契约。
+
+    不变式：初扫检出结果文件 ⇒ 该执行体的信号追加必然全部早于结果原子
+    落盘（record_signal 只发生在 handler 执行期内），此刻排空无并发写者、
+    无损；缺此步时 done 对经 settle_aborted → complete_job 的收尾清理会把
+    「abort 先排空阶段之后写入」的信号文件未读删除。
+    """
+
+    @staticmethod
+    def _make_handle(tmp_path, uid="t::victim", inc="a" * 32 + ".1", alive=False):
+        from tasklite.engine.channel import JobHandle
+
+        class _Proc:
+            def __init__(self):
+                self._alive = bool(alive)
+                self.exitcode = 0
+
+            def is_alive(self):
+                return self._alive
+
+            def join(self, timeout=None):
+                self._alive = False
+
+            def kill(self):
+                self._alive = False
+
+            def close(self):
+                pass
+
+        return JobHandle(
+            uid=uid, process=_Proc(), deadline=0.0, timeout=60.0,
+            job=Job("t", uid.split("::", 1)[1]),
+            ipc_dir=str(tmp_path), incarnation=inc,
+        )
+
+    def test_retry_done_pair_drains_signal_file(self, tmp_path):
+        """retry done 对：结果 payload 不携带挂起，文件信号必须随初扫排空带出。"""
+        from tasklite.engine.channel import ExecutionChannel
+
+        ch = ExecutionChannel(ipc_dir=tmp_path)
+        journal = ArtifactJournal(tmp_path)
+        handle = self._make_handle(tmp_path)
+        journal.record_signal(handle.uid, "api", 60.0)
+        journal.write_result_atomic(handle.uid, {
+            "status": "retry", "error": "HTTP 429", "rate_limited": True,
+        }, incarnation=handle.incarnation)
+
+        outcome = ch.abort_in_flight([handle])
+
+        assert len(outcome.completed) == 1
+        suspensions = outcome.completed[0][1].resource_suspensions
+        assert ("api", 60.0) in suspensions, (
+            "初扫 done 对必须排空信号文件并合并进结果挂起"
+        )
+        # 排空先于收尾清理：信号文件不残留
+        assert not journal.signals_path(handle.uid).exists()
+
+    def test_pending_path_salvage_control(self, tmp_path):
+        """对照：初扫无结果（pending）路径的杀后补排空不受影响。"""
+        from tasklite.engine.channel import ExecutionChannel
+
+        ch = ExecutionChannel(ipc_dir=tmp_path)
+        journal = ArtifactJournal(tmp_path)
+        handle = self._make_handle(tmp_path, alive=True)
+        journal.record_signal(handle.uid, "api", 60.0)
+
+        outcome = ch.abort_in_flight([handle])
+
+        assert outcome.completed == []
+        assert outcome.salvaged_signals == [(handle.uid, "api", 60.0)]
+
+    def test_success_done_pair_merges_payload_and_file_signals(self, tmp_path):
+        """success payload 挂起与文件信号并存时两者都带入（max 语义幂等）。"""
+        from tasklite.engine.channel import ExecutionChannel
+
+        ch = ExecutionChannel(ipc_dir=tmp_path)
+        journal = ArtifactJournal(tmp_path)
+        handle = self._make_handle(tmp_path)
+        journal.record_signal(handle.uid, "api", 10.0)
+        journal.write_result_atomic(handle.uid, {
+            "status": "success", "raw_result": True, "new_jobs": [],
+            "resource_suspensions": [["api", 60.0]], "cursor_updates": {},
+        }, incarnation=handle.incarnation)
+
+        outcome = ch.abort_in_flight([handle])
+
+        suspensions = outcome.completed[0][1].resource_suspensions
+        assert ("api", 60.0) in suspensions
+        assert ("api", 10.0) in suspensions
+
+
+class TestAbortDonePairSignalDrainOrchestration:
+    """abort 编排层 done 对信号回收端到端。
+
+    注入点取 ``channel.abort_in_flight`` 调用沿，确定性等价于「worker 在
+    recovery 第 1 步排空之后、初扫之前完成 record_signal + 结果落盘」：
+    该 handle 初扫即落 done 对；不排空则 settle_aborted → complete_job 的
+    收尾清理把信号文件未读删除。对照（只写信号不写结果）走 pending 路径。
+    """
+
+    def _run_abort_scenario(self, tmp_path, monkeypatch, with_retry_result):
+        from pathlib import Path
+        from unittest import mock
+
+        from tasklite.engine.resource import CapacityResource
+
+        fake_cls = make_ipc_process_class(results=[None], stay_alive=True)
+        patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=fake_cls)
+        pipeline = TaskLite(
+            name="abort_donepair", state_dir=tmp_path / "state",
+            backend="sqlite", max_workers=2,
+        )
+        pipeline.add_resource(CapacityResource("api", max_capacity=1.0))
+        pipeline.register_handler("t", _fast_handler)
+        pipeline.enqueue([Job("t", "victim", payload={}, max_retries=3)])
+
+        ctx = mock.MagicMock()
+        ctx.Process = lambda target, args, **kw: fake_cls(target=target, args=args)
+        patcher = mock.patch.object(pipeline._runtime.channel, "_mp_ctx", ctx)
+        patcher.start()
+        try:
+            pipeline._runtime.prepare_run_state()
+            pipeline._runtime.step()
+            assert pipeline._runtime.in_flight, "dispatch failed"
+            entry = next(iter(pipeline._runtime.in_flight.values()))
+            uid, inc = entry.uid, entry.handle.incarnation
+
+            journal = ArtifactJournal(pipeline.ipc_dir)
+            real_abort = pipeline._runtime.channel.abort_in_flight
+
+            def injecting_abort(handles):
+                # 模拟 worker 在第 1 步排空之后的终前写入
+                journal.record_signal(uid, "api", 60.0)
+                if with_retry_result:
+                    journal.write_result_atomic(uid, {
+                        "status": "retry", "error": "HTTP 429", "rate_limited": True,
+                    }, incarnation=inc)
+                return real_abort(handles)
+
+            pipeline.stop(force=True)
+            with mock.patch.object(
+                pipeline._runtime.channel, "abort_in_flight", injecting_abort
+            ):
+                pipeline._runtime.step()
+
+            deadline = pipeline.resources["api"].suspended_until()
+            applied = deadline is not None and deadline > time.monotonic()
+            leftover = list(Path(pipeline.ipc_dir).glob("*.signals.jsonl"))
+            return applied, leftover
+        finally:
+            patcher.stop()
+
+    def test_retry_done_pair_signal_applied_not_deleted(self, tmp_path, monkeypatch):
+        applied, leftover = self._run_abort_scenario(
+            tmp_path, monkeypatch, with_retry_result=True
+        )
+        assert applied, "abort done 对的 suspend 信号必须被应用而非随清理丢失"
+        assert leftover == []
+
+    def test_pending_path_control_salvaged(self, tmp_path, monkeypatch):
+        applied, leftover = self._run_abort_scenario(
+            tmp_path, monkeypatch, with_retry_result=False
+        )
+        assert applied
+        assert leftover == []
