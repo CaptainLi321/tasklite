@@ -185,7 +185,22 @@ class DiscoveryHost(Protocol):
     def set_discovery_rerun(self, task_type: str, rerun: str) -> None: ...
 
 # 内容 id 单射净化：实现已统一收敛至 utils.injective
-from ..utils.injective import sanitize_content_id
+from ..utils.injective import CONTENT_ID_ALLOWED, escape_injective, sanitize_content_id
+
+
+
+def _in_cursor_group(content_part: str, group_prefix: str) -> bool:
+    """判定净化后的 content 片段是否派生自本 cursor_key 组的未截断转义前缀。
+
+    直通域成员恰为 ``group_prefix + escape(cid)``，前缀比较精确；截断域成员
+    尾部是「%_ + 全文指纹」，其保留头部仍是转义全文的前缀，故互补以
+    「组前缀以该头部为前缀」判定。不同组仅当转义前缀共享约百字符以上时才
+    可能误判——这是截断域残留信息的边界，组前缀侧永不截断使其收窄到极限。
+    """
+    if content_part.startswith(group_prefix):
+        return True
+    head = content_part.split("%_", 1)[0]
+    return len(head) < len(content_part) and group_prefix.startswith(head)
 
 
 
@@ -406,11 +421,14 @@ class DiscoveryHandler:
             try:
                 known = set()
                 ptype_prefix = f"{self.process_task_type}::"
-                group_prefix = sanitize_content_id(prefix) if prefix else ""
+                # 组前缀必须用未截断的单射转义形态：净化输出的截断形态尾部
+                # 带全文指纹，两个独立净化值之间不存在前缀关系，组过滤只能
+                # 依托未截断前缀 + 截断头部互补匹配保持精确（_in_cursor_group）。
+                group_prefix = escape_injective(prefix, allowed=CONTENT_ID_ALLOWED) if prefix else ""
                 for uid in ctx.attempted_uids():
                     if uid.startswith(ptype_prefix):
                         c = uid[len(ptype_prefix):]
-                        if not group_prefix or c.startswith(group_prefix):
+                        if not group_prefix or _in_cursor_group(c, group_prefix):
                             known.add(c)
                 missing = sorted(known - seen_this_run)
                 if missing:

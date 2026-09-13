@@ -319,6 +319,47 @@ class TestMissingDetection:
         # pre-fix：known 含 A+B → B 的 3%3Ag_B_8/9 误报混入
         assert missing == {"3%3Ag_A0", "3%3Ag_A1"}, f"本组已删应报全、跨组不得误报: {missing}"
 
+    def test_on_missing_long_cursor_key_truncated_domain(self, tmp_path):
+        """回归：超长 cursor_key（组前缀进入净化截断域）下 on_missing 仍须生效。
+
+        截断形态尾部带全文指纹，组前缀与成员各自净化后恒不互为前缀——
+        startswith 过滤会把本组内容全部漏出差集，missing 恒空，
+        源端删除检测对该组静默永久失效。"""
+        from tasklite.wrappers.discovery import sanitize_content_id
+
+        p = _pipeline(tmp_path)
+        p.register_handler("child", _child_ok)
+        report = tmp_path / "missing.txt"
+        register_discovery(p, "disc", _fetch, _item_id, _process, "child",
+                           cursor_key_func=_group_key,
+                           scan_mode="full", rerun="never", on_missing=_on_missing)
+
+        long_a = "a" * 200
+        long_b = "b" * 200
+        prefix_a = f"{len('g_' + long_a)}:g_{long_a}"
+        prefix_b = f"{len('g_' + long_b)}:g_{long_b}"
+
+        # 组 A（超长 key）：完整扫描 4 条 → wall
+        p.enqueue([Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
+                                                 "group": long_a, "missing_report": str(report)})])
+        p.run()
+        assert not report.exists()
+        # 组 B（另一超长 key，共享 process_task_type）：完整扫描 2 条 → wall
+        p.enqueue([Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
+                                                 "group": long_b, "missing_report": str(report)})])
+        p.run()
+        assert not report.exists()
+
+        # 组 A 只剩 0、1 → missing 应恰为 A 的已删 2、3，不混入 B 的 8、9
+        p.enqueue([Job("disc", "seedA2", payload={"posts": [{"id": 1}, {"id": 0}],
+                                                  "group": long_a, "missing_report": str(report)})])
+        p.run()
+        missing = set(report.read_text().splitlines()) if report.exists() else set()
+        expected = {sanitize_content_id(prefix_a + cid) for cid in ("2", "3")}
+        other = {sanitize_content_id(prefix_b + cid) for cid in ("8", "9")}
+        assert missing == expected, f"超长 key 组的已删内容必须报出: {missing}"
+        assert not (missing & other), f"跨组内容不得误报: {missing & other}"
+
     def test_on_missing_exception_is_swallowed(self, tmp_path):
         """on_missing 回调抛异常必须被框架吞掉
         （logger.error + 继续）——否则 discovery job 崩溃 → 发现链死亡。
