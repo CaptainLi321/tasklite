@@ -665,6 +665,38 @@ class TestJobRuntimeState:
         assert st.commit_failures == 0
         assert st.to_dict() == {}
 
+    def test_extra_same_name_keys_stay_lossless(self):
+        # runtime 命名空间仅 `_` 前缀名为框架字段；与字段同名的无下划线键
+        # 属用户 extra 数据——非数值不静默丢弃、数值不被劫持为框架字段
+        data = {"backoff_until": "user-data", "commit_failures": "note", "note": "x"}
+        st = JobRuntimeState.from_dict(data)
+        assert st.backoff_until is None
+        assert st.commit_failures == 0
+        assert st.extra == data
+        assert st.to_dict() == data
+
+        st2 = JobRuntimeState.from_dict({"backoff_until": 123.5})
+        assert st2.backoff_until is None
+        assert st2.extra == {"backoff_until": 123.5}
+        # 映射协议读取同名键直达 extra，不被字段别名遮蔽
+        assert st2["backoff_until"] == 123.5
+        st2["backoff_until"] = 1
+        assert st2.backoff_until is None
+        assert st2.extra["backoff_until"] == 1
+
+    def test_stale_loose_same_name_key_cannot_revive_field(self):
+        # 同时含规范键与无下划线同名键：字段只认规范键；规范键清空后，
+        # 滞留的同名 extra 键不得在下次反序列化时复活陈旧框架值
+        st = JobRuntimeState.from_dict({"_backoff_until": 5.0, "backoff_until": 99.0})
+        assert st.backoff_until == 5.0
+        assert st.extra == {"backoff_until": 99.0}
+
+        st.backoff_until = None
+        back = st.to_dict()
+        assert back == {"backoff_until": 99.0}
+        st2 = JobRuntimeState.from_dict(back)
+        assert st2.backoff_until is None
+
 
 class TestOversizedIntNumberValidation:
     """超出 float 范围的超大 int（如 10**400）走既有 ValueError 通道明确报错，

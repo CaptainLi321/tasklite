@@ -39,7 +39,12 @@ def inject_worker_resource(job_dict: dict) -> None:
 
 @dataclass
 class JobRuntimeState:
-    """Job 运行期内部边带状态（强类型结构化存储，替代散装字典）。"""
+    """Job 运行期内部边带状态（强类型结构化存储，替代散装字典）。
+
+    不变式：runtime 命名空间内仅 `_` 前缀名为框架字段，其余任意键（含与
+    字段同名的无下划线形态）一律是用户的 extra 数据——to_dict/from_dict
+    往返对 extra 命名空间无损，框架读写永不劫持或丢弃 extra 键。
+    """
 
     backoff_until: Optional[float] = None
     backoff_wall_deadline: Optional[float] = None
@@ -146,39 +151,36 @@ class JobRuntimeState:
 
         extra = dict(data)
 
-        def _pop_val(*keys: str) -> Any:
-            for k in keys:
-                if k in extra:
-                    return extra.pop(k)
-            return None
+        def _pop_val(key: str) -> Any:
+            return extra.pop(key, None)
 
-        raw_bu = _pop_val("_backoff_until", "backoff_until")
+        raw_bu = _pop_val("_backoff_until")
         backoff_until = (
             float(raw_bu)
             if isinstance(raw_bu, (int, float)) and not isinstance(raw_bu, bool) and _is_finite(raw_bu)
             else None
         )
 
-        raw_wd = _pop_val("_backoff_wall_deadline", "backoff_wall_deadline")
+        raw_wd = _pop_val("_backoff_wall_deadline")
         backoff_wall_deadline = (
             float(raw_wd)
             if isinstance(raw_wd, (int, float)) and not isinstance(raw_wd, bool) and _is_finite(raw_wd)
             else None
         )
 
-        raw_cf = _pop_val("_commit_failures", "commit_failures")
+        raw_cf = _pop_val("_commit_failures")
         try:
             commit_failures = int(raw_cf) if raw_cf is not None else 0
         except (ValueError, TypeError):
             commit_failures = 0
 
-        raw_df = _pop_val("_dispatch_failures", "dispatch_failures")
+        raw_df = _pop_val("_dispatch_failures")
         try:
             dispatch_failures = int(raw_df) if raw_df is not None else 0
         except (ValueError, TypeError):
             dispatch_failures = 0
 
-        raw_re = _pop_val("_last_retry_error", "last_retry_error")
+        raw_re = _pop_val("_last_retry_error")
         last_retry_error = str(raw_re or "")
 
         return cls(
@@ -191,54 +193,54 @@ class JobRuntimeState:
         )
 
     def __getitem__(self, key: str) -> Any:
-        if key in ("_backoff_until", "backoff_until"):
+        if key == "_backoff_until":
             if self.backoff_until is not None:
                 return self.backoff_until
             raise KeyError(key)
-        if key in ("_backoff_wall_deadline", "backoff_wall_deadline"):
+        if key == "_backoff_wall_deadline":
             if self.backoff_wall_deadline is not None:
                 return self.backoff_wall_deadline
             raise KeyError(key)
-        if key in ("_commit_failures", "commit_failures"):
+        if key == "_commit_failures":
             return self.commit_failures
-        if key in ("_dispatch_failures", "dispatch_failures"):
+        if key == "_dispatch_failures":
             return self.dispatch_failures
-        if key in ("_last_retry_error", "last_retry_error"):
+        if key == "_last_retry_error":
             return self.last_retry_error
         return self.extra[key]
 
     def __setitem__(self, key: str, value: Any) -> None:
-        if key in ("_backoff_until", "backoff_until"):
+        if key == "_backoff_until":
             self.backoff_until = (
                 float(value)
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and _is_finite(value)
                 else None
             )
-        elif key in ("_backoff_wall_deadline", "backoff_wall_deadline"):
+        elif key == "_backoff_wall_deadline":
             self.backoff_wall_deadline = (
                 float(value)
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and _is_finite(value)
                 else None
             )
-        elif key in ("_commit_failures", "commit_failures"):
+        elif key == "_commit_failures":
             self.commit_failures = int(value or 0)
-        elif key in ("_dispatch_failures", "dispatch_failures"):
+        elif key == "_dispatch_failures":
             self.dispatch_failures = int(value or 0)
-        elif key in ("_last_retry_error", "last_retry_error"):
+        elif key == "_last_retry_error":
             self.last_retry_error = str(value or "")
         else:
             self.extra[key] = value
 
     def __contains__(self, key: str) -> bool:
-        if key in ("_backoff_until", "backoff_until"):
+        if key == "_backoff_until":
             return self.backoff_until is not None
-        if key in ("_backoff_wall_deadline", "backoff_wall_deadline"):
+        if key == "_backoff_wall_deadline":
             return self.backoff_wall_deadline is not None
-        if key in ("_commit_failures", "commit_failures"):
+        if key == "_commit_failures":
             return bool(self.commit_failures)
-        if key in ("_dispatch_failures", "dispatch_failures"):
+        if key == "_dispatch_failures":
             return bool(self.dispatch_failures)
-        if key in ("_last_retry_error", "last_retry_error"):
+        if key == "_last_retry_error":
             return bool(self.last_retry_error)
         return key in self.extra
 
@@ -254,23 +256,23 @@ class JobRuntimeState:
         return self[key]
 
     def pop(self, key: str, default: Any = None) -> Any:
-        if key in ("_backoff_until", "backoff_until"):
+        if key == "_backoff_until":
             val = self.backoff_until
             self.backoff_until = None
             return val if val is not None else default
-        if key in ("_backoff_wall_deadline", "backoff_wall_deadline"):
+        if key == "_backoff_wall_deadline":
             val = self.backoff_wall_deadline
             self.backoff_wall_deadline = None
             return val if val is not None else default
-        if key in ("_commit_failures", "commit_failures"):
+        if key == "_commit_failures":
             val = self.commit_failures
             self.commit_failures = 0
             return val if val else default
-        if key in ("_dispatch_failures", "dispatch_failures"):
+        if key == "_dispatch_failures":
             val = self.dispatch_failures
             self.dispatch_failures = 0
             return val if val else default
-        if key in ("_last_retry_error", "last_retry_error"):
+        if key == "_last_retry_error":
             val = self.last_retry_error
             self.last_retry_error = ""
             return val if val else default
