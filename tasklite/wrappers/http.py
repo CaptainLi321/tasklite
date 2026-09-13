@@ -204,6 +204,10 @@ _DEFAULT_RATE_LIMIT_STATUSES = frozenset({429})
 _DEFAULT_FATAL_STATUSES = frozenset({400, 401, 403, 404, 405, 410, 422})
 _DEFAULT_RETRY_STATUSES = frozenset({500, 502, 503, 504, 520, 521, 522, 524})
 
+# 快照保底不写入的瞬态状态：408（请求超时）/425（过早）与 429/5xx 同属
+# 可重试故障，被永久快照后离线重放会持续命中过期的错误响应。
+_TRANSIENT_NO_SNAPSHOT_STATUSES = frozenset({408, 425, 429})
+
 
 class HttpPolicy:
     """HTTP 状态码与传输异常分类规则器。
@@ -732,7 +736,7 @@ class SnapshotStore:
         Args:
             fetch_fn: 底层网络请求函数。
             key_func: 自定义 Key 生成函数（默认使用 make_key）。
-            ignore_statuses: 额外不写入快照的状态码（429 与全部 5xx 始终保底跳过）。
+            ignore_statuses: 额外不写入快照的状态码（408/425/429 与全部 5xx 始终保底跳过）。
 
         Returns:
             Callable: 包装后的缓存函数。
@@ -777,9 +781,14 @@ class SnapshotStore:
                 else:
                     raw_body = str(res).encode("utf-8")
 
-            # 不变式：429 与全部 5xx 属瞬态故障，保底不写入快照（防离线重放污染）；
-            # ignore_statuses 仅可在此基础上追加豁免状态码，不可收缩保底谓词。
-            if not (status_code == 429 or status_code >= 500 or status_code in ignore_statuses):
+            # 不变式：瞬态状态（408/425/429 与全部 5xx）保底不写入快照
+            # （防离线重放污染）；ignore_statuses 仅可在此基础上追加豁免
+            # 状态码，不可收缩保底谓词。
+            if not (
+                status_code in _TRANSIENT_NO_SNAPSHOT_STATUSES
+                or status_code >= 500
+                or status_code in ignore_statuses
+            ):
                 self.put(
                     key=key,
                     url=url,

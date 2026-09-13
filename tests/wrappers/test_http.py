@@ -815,15 +815,15 @@ def test_snapshot_cached_distinguishes_cookies_and_auth_identity() -> None:
 
 
 def test_snapshot_cached_skips_transient_statuses() -> None:
-    """429 与全部 5xx 属瞬态故障，保底不写入快照；ignore_statuses 仅可追加。"""
+    """瞬态状态（408/425/429 与全部 5xx）保底不写入快照；ignore_statuses 仅可追加。"""
     store = MemorySnapshotStore()
 
     def mock_fetch(url: str, **kwargs: Any) -> HttpResponse:
         return HttpResponse(status_code=int(kwargs["status"]), headers={}, body=b"err")
 
-    # ignore_statuses 传空元组，验证 429 与离散集遗漏的 5xx（如 501/511）同样被保底谓词拦截
+    # ignore_statuses 传空元组，验证瞬态 4xx（408/425）与离散集遗漏的 5xx（如 501/511）同样被保底谓词拦截
     cached_fetch = store.cached(mock_fetch, ignore_statuses=())
-    for status in (429, 500, 501, 511, 530):
+    for status in (408, 425, 429, 500, 501, 511, 530):
         resp = cached_fetch("https://api.test/flaky", method="GET", status=status)
         assert resp.status_code == status
         assert store.has(store.make_key("https://api.test/flaky", method="GET")) is False
