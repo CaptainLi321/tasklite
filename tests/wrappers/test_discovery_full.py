@@ -44,6 +44,20 @@ def _item_id_fail(item):
     raise KeyError("boom")  # 模块级：模拟源结构异常（整页 id_func 全失败）
 
 
+def _item_id_partial_raise(item):
+    """模块级：仅 id=5 抛异常，其余正常（部分失败，非整页全失败）。"""
+    if item["id"] == 5:
+        raise KeyError("broken item")
+    return str(item["id"])
+
+
+def _item_id_partial_invalid(item):
+    """模块级：仅 id=5 返回非 str，其余正常。"""
+    if item["id"] == 5:
+        return 42
+    return str(item["id"])
+
+
 def _process(job, ctx, item, content_id):
     ctx.spawn(Job("child", content_id))
 
@@ -287,6 +301,49 @@ class TestMissingDetection:
         p.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
         p.run()
         assert not report.exists(), "id_func 全失败早停不得误报 missing"
+
+    def test_partial_id_func_raise_no_missing_report(self, tmp_path):
+        """回归：full 模式单条 item 的 id_func 抛异常（同页其余成功）也是
+        不完整扫描——失败 item 无法入 seen_this_run，若扫描仍以空页完整
+        结束，差集会把仍在源上的它确定性误报为「已删除」。"""
+        p = _pipeline(tmp_path)
+        p.register_handler("child", _child_ok)
+        report = tmp_path / "missing.txt"
+
+        # Run 1：正常完整扫描 → 6 条进入 wall（known 非空）
+        register_discovery(p, "disc", _fetch, _item_id, _process, "child",
+                           scan_mode="full", rerun="never", on_missing=_on_missing)
+        p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p.run()
+        assert not report.exists()
+
+        # Run 2：源上 6 条全在，但 id=5 的 id_func 抛异常（同页 id=4 成功，
+        # 不触发整页全失败早停）——pre-fix：completed_full 恒 True，
+        # seen 缺 id=5 → 误报「已删除」；post-fix：本轮 on_missing 失效。
+        register_discovery(p, "disc", _fetch, _item_id_partial_raise, _process, "child",
+                           scan_mode="full", rerun="never", on_missing=_on_missing)
+        p.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p.run()
+        assert not report.exists(), "id_func 部分失败的不完整扫描不得误报 missing"
+
+    def test_partial_id_func_invalid_return_no_missing_report(self, tmp_path):
+        """回归：id_func 返回非 str 的部分失败与抛异常同责——失败 item 不入
+        seen_this_run，本轮差集不可信，不得触发 on_missing。"""
+        p = _pipeline(tmp_path)
+        p.register_handler("child", _child_ok)
+        report = tmp_path / "missing.txt"
+
+        register_discovery(p, "disc", _fetch, _item_id, _process, "child",
+                           scan_mode="full", rerun="never", on_missing=_on_missing)
+        p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p.run()
+        assert not report.exists()
+
+        register_discovery(p, "disc", _fetch, _item_id_partial_invalid, _process, "child",
+                           scan_mode="full", rerun="never", on_missing=_on_missing)
+        p.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p.run()
+        assert not report.exists(), "id_func 非法返回的不完整扫描不得误报 missing"
 
     def test_on_missing_filters_own_cursor_key_group(self, tmp_path):
         """ 回归：full 模式 on_missing 只报**本组**（cursor_key 命名空间）——

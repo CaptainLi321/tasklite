@@ -308,9 +308,11 @@ class DiscoveryHandler:
         # full 模式收集「本次扫描见过的 content_id」——
         # 扫描结束后与已见集合做差集 = 源站删除检测（missing）。
         seen_this_run: set = set()
-        # max_pages 截断 ≠ 完整扫描——未扫到的更深页内容
-        # 仍在源上，此时差集会误报为「已删除」。仅当扫到空页（完整结束）
-        # 时 on_missing 差集才语义成立。
+        # 不变式：on_missing 差集仅在完整扫描（空页终止）时语义成立。
+        # max_pages 截断与 id_func 部分失败都意味着源上仍有本轮无法归位的
+        # 内容——失败 item 无法入 seen_this_run，差集会把它确定性误报为
+        # 「已删除」。任何不完整因素必须置 completed_full=False 使本轮
+        # on_missing 失效（宁可不报，不可误报破坏性动作）。
         completed_full = True
         while True:
             if page > effective_max_pages:
@@ -341,12 +343,15 @@ class DiscoveryHandler:
                 try:
                     cid = self.id_func(item)
                 except Exception as e:
+                    # 部分失败同样使本轮差集失效（见 completed_full 不变式）
+                    completed_full = False
                     logger.error(
                         f"Discovery: id_func raised for an item; "
                         f"skipping (will retry next run): {e}"
                     )
                     continue
                 if not isinstance(cid, str) or not cid:
+                    completed_full = False
                     logger.error(
                         f"Discovery: id_func returned non-empty str? "
                         f"{cid!r}; skipping (will retry next run)"
@@ -407,8 +412,8 @@ class DiscoveryHandler:
 
         # full 模式 + on_missing 回调 → 已见但本次未扫到 =
         # 源站删除检测。已见集合从 wall/failed 快照筛 process_task_type 前缀。
-        # 仅当完整扫到空页才计算差集——max_pages 截断时未扫的更深页
-        # 内容仍在源上，误报「已删除」会触发业务的破坏性动作。
+        # 仅当完整扫到空页才计算差集——max_pages 截断、id_func 部分失败
+        # 时源上仍有本轮无法归位的内容，误报「已删除」会触发业务的破坏性动作。
         # 只取本组（cursor_key 命名空间）的已见内容——多组共享
         # process_task_type 时，他组内容在本组 seen_this_run 之外，不过滤
         # 会被误报为「已删除」。

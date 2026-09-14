@@ -24,6 +24,7 @@
   - `params` 中 `None` 值的丢弃语义与 `requests` 全链路对齐（请求键指纹与 urllib wire 同步），消除跨后端同请求串快照。
 - **Discovery**：
   - `on_missing` 组过滤改用未截断转义前缀匹配并辅以截断头部互补匹配，超长 `cursor_key` 的分组不再静默失效（源端缺失检测不再漏报本组成员）。
+  - full 模式下单条 item 的 `id_func` 失败（抛异常或非法返回，同页其余成功）现在使本轮 `on_missing` 差集失效（与整页全失败早停同策略）：失败 item 无法进入 `seen_this_run`，扫描若仍以空页完整结束，差集会把仍在源上的它确定性误报为「已删除」并触发业务破坏性动作。
 - **错误分类法**：
   - `classify_exception` 同时收到位置与关键字实参（`ErrorTaxonomy` 实例形态）时显式抛 `TypeError`（fail-loud，破坏性收紧），不再静默忽略其一。
   - 构造器策略序列逐成员 fail-loud 校验，`classify_*` 的「永不抛错」契约不再可被构造路径注入的坏成员击穿。
