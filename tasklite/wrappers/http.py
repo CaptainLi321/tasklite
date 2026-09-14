@@ -473,11 +473,22 @@ class http_guard:
 
             if not getattr(exc_val, "_suspended", False):
                 if self.ctx is not None and self.resource is not None and hasattr(self.ctx, "suspend_resource"):
-                    self.ctx.suspend_resource(self.resource, ttl)
-                    # 不变式：_suspended 仅在本守卫真实执行挂起后置位。内层守卫
-                    # 因 ctx/resource 缺失未挂起时不得置位，否则外层守卫误判
-                    # 「已挂起」而跳过，挂起信号既不进内存列表也不落盘。
-                    setattr(exc_val, "_suspended", True)
+                    # 挂起入口故障（未注册资源名的 ValueError、非法 ttl 的
+                    # TypeError 等）与限流信号解耦：瞬态 RateLimitHit 是
+                    # 「不烧重试预算」的信号，被入口校验异常覆盖即烧预算
+                    # 进 DLQ 且挂起信息丢失——失败降级为告警，信号原样抛出。
+                    try:
+                        self.ctx.suspend_resource(self.resource, ttl)
+                        # 不变式：_suspended 仅在本守卫真实执行挂起后置位。内层守卫
+                        # 因 ctx/resource 缺失未挂起时不得置位，否则外层守卫误判
+                        # 「已挂起」而跳过，挂起信号既不进内存列表也不落盘。
+                        setattr(exc_val, "_suspended", True)
+                    except Exception as suspend_err:
+                        logger.warning(
+                            "suspend_resource(%r, %s) failed for rate-limit hit; "
+                            "suspending skipped (%s)",
+                            self.resource, ttl, suspend_err,
+                        )
 
             if isinstance(exc_val, RateLimitHit):
                 raise exc_val

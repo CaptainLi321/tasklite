@@ -1100,3 +1100,47 @@ class TestHttpExecutor:
         mock_ctx.suspend_resource.assert_called_once_with("api_x", 30.0)
 
 
+
+
+def test_http_guard_suspend_failure_preserves_rate_limit_signal() -> None:
+    """suspend_resource 抛 ValueError 时守卫__exit__ 不得以其覆盖限流信号。
+
+    资源名 typo（未注册名 fail-loud 的 ValueError）等挂起入口故障必须与
+    限流信号本身解耦：ValueError 从 __exit__ 直接穿透会把瞬态 RateLimitHit
+    替换为普通异常（烧重试预算进 DLQ），且挂起信号丢失。挂起失败降级为
+    日志告警，_suspended 不置位，RateLimitHit 原样抛出。
+    """
+
+    class _RejectingCtx:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def suspend_resource(self, name: str, seconds: float) -> None:
+            self.calls.append((name, seconds))
+            raise ValueError(
+                f"Unknown resource {name!r}; suspend request ignored"
+            )
+
+    ctx = _RejectingCtx()
+    hit = RateLimitHit("HTTP 429 RateLimit hit")
+    with pytest.raises(RateLimitHit) as exc_info:
+        with http_guard(ctx=ctx, resource="api_typo", default_suspend_ttl=60.0):
+            raise hit
+    assert exc_info.value is hit
+    assert ctx.calls == [("api_typo", 60.0)]
+    # 挂起未真实发生：不得置位 _suspended（外层守卫语义依赖）
+    assert getattr(hit, "_suspended", False) is False
+
+
+def test_http_guard_suspend_type_error_preserves_rate_limit_signal() -> None:
+    """挂起入口的 TypeError（如非法 ttl 形态）同样不覆盖限流信号。"""
+
+    class _BrokenCtx:
+        def suspend_resource(self, name: str, seconds: float) -> None:
+            raise TypeError("seconds must be a number")
+
+    hit = RateLimitHit("HTTP 429 RateLimit hit")
+    with pytest.raises(RateLimitHit) as exc_info:
+        with http_guard(ctx=_BrokenCtx(), resource="api_x", default_suspend_ttl=60.0):
+            raise hit
+    assert exc_info.value is hit

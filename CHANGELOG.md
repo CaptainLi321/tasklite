@@ -16,6 +16,7 @@
 - **调优标量合法性**：
   - `resolve_tuning` 对三参数调优标量增加合法性域校验（fail-loud）：`dep_grace_seconds` 必须为有限正值（`0`/负值/`NaN`/`inf` 会导致依赖宽限立即误杀或永不裁决活锁）；`commit_failure_dlq_threshold` 与 `deadlock_gap_max_rounds` 必须为 `>= 1` 的整数（`0` 会导致零轮即升级整队列死锁）。
 - **HTTP 守卫与快照**：
+  - `http_guard` 的 429 挂起入口故障（如未注册资源名的 `ValueError`、非法时长的 `TypeError`）与限流信号解耦：挂起失败降级为告警日志，瞬态 `RateLimitHit` 原样抛出，不再被入口校验异常覆盖（避免烧重试预算进死信队列且挂起信号丢失）。
   - `http.client.HTTPException` 家族（`BadStatusLine` / `LineTooLong` / `ResponseNotReady` 等）整体归为瞬态传输故障，残缺状态行等协议故障不再零重试直接进死信队列。
   - 快照缓存的状态提取默认值由 200 改为 `None`，`fetch_fn` 返回 urllib 原生响应时真实状态码得以透传，不再被恒记为 200 落盘。
   - 瞬态 4xx（408/425）纳入快照保底不写入谓词，防止过期的错误响应被永久快照后离线重放持续命中。
