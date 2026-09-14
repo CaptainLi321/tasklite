@@ -167,6 +167,20 @@ class ErrorClassification:
         return meta
 
 
+def _safe_str(obj: Any) -> str:
+    """``str()`` 的 Never-Raise 变体：``__str__`` 抛异常的对象降级为类型占位串。
+
+    不变式：classify()/validate_payload()/normalize_dlq_meta() 标注
+    Never-Raise 契约，raw_error/expected 等字段对不可信对象取串必须吞掉
+    用户 ``__str__`` 的任意异常——分类边界内取串失败不得逸出
+    （子进程分类路径无外层兜底，逸出即 worker 无结果文件崩溃）。
+    """
+    try:
+        return str(obj)
+    except Exception:
+        return f"<unprintable {type(obj).__name__}>"
+
+
 def _ensure_exception_class(exception_cls: type, api_name: str) -> None:
     """分类序列成员底座校验（fail-loud）：必须是 Exception 子类。"""
     if not isinstance(exception_cls, type) or not issubclass(exception_cls, Exception):
@@ -294,7 +308,7 @@ class ErrorTaxonomy:
 
         # 3. 进程退出码
         if exitcode is not None:
-            return self._classify_exitcode(exitcode, timeout_is_transient, raw_error=str(target or ""))
+            return self._classify_exitcode(exitcode, timeout_is_transient, raw_error=_safe_str(target or ""))
 
         # 4. 字典（IPC 字典或 DLQ meta 字典）
         if isinstance(target, dict):
@@ -312,11 +326,12 @@ class ErrorTaxonomy:
             is_transient=False,
             is_fatal=False,
             is_retry=False,
-            raw_error=str(target) if target is not None else "",
+            raw_error=_safe_str(target) if target is not None else "",
         )
 
     def _classify_exception(self, exc: BaseException) -> ErrorClassification:
-        raw_err = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        msg = _safe_str(exc)
+        raw_err = f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
         is_retry = isinstance(exc, RetryError)
         is_fatal = isinstance(exc, FatalError)
         is_interrupted = isinstance(exc, KeyboardInterrupt)
@@ -411,7 +426,7 @@ class ErrorTaxonomy:
                 is_fatal=False,
                 is_retry=True,
                 lock_conflict=bool(meta.get("lock_conflict")),
-                raw_error=str(meta.get("error", "")),
+                raw_error=_safe_str(meta.get("error", "")),
                 traceback_str=meta.get("traceback"),
             )
         if status == "fatal":
@@ -422,7 +437,7 @@ class ErrorTaxonomy:
                 is_transient=False,
                 is_fatal=True,
                 is_retry=False,
-                raw_error=str(meta.get("error", "")),
+                raw_error=_safe_str(meta.get("error", "")),
                 traceback_str=meta.get("traceback"),
             )
         if status == "interrupted":
@@ -434,12 +449,12 @@ class ErrorTaxonomy:
                 is_fatal=False,
                 is_retry=False,
                 is_interrupted=True,
-                raw_error=str(meta.get("error", "")),
+                raw_error=_safe_str(meta.get("error", "")),
             )
 
         # DLQ meta 字典
         is_fatal = bool(meta.get("fatal"))
-        error_str = str(meta.get("error", ""))
+        error_str = _safe_str(meta.get("error", ""))
         dlq_type = meta.get("error_type")
 
         if is_fatal:
@@ -534,7 +549,7 @@ class ErrorTaxonomy:
             item = ValidationErrorItem(
                 field_path="__root__",
                 code="SCHEMA_RESOLUTION_ERROR",
-                expected=str(schema),
+                expected=_safe_str(schema),
                 actual=type(payload).__name__,
                 message=f"schema error: {type(e).__name__}: {e}",
             )
@@ -557,7 +572,7 @@ class ErrorTaxonomy:
             item = ValidationErrorItem(
                 field_path="__root__",
                 code="SCHEMA_RESOLUTION_ERROR",
-                expected=str(schema),
+                expected=_safe_str(schema),
                 actual="unresolvable",
                 message=f"schema resolution failed: {e}",
             )
@@ -789,7 +804,7 @@ class ErrorTaxonomy:
     ) -> Dict[str, Any]:
         """DLQ 元数据清洗与规范化的唯一出口。"""
         if not isinstance(meta, dict):
-            raw_err = str(meta) if meta is not None else default_error
+            raw_err = _safe_str(meta) if meta is not None else default_error
             return {
                 "error": raw_err,
                 "error_type": ERROR_TYPE_UNKNOWN,

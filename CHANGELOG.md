@@ -26,6 +26,7 @@
   - `on_missing` 组过滤改用未截断转义前缀匹配并辅以截断头部互补匹配，超长 `cursor_key` 的分组不再静默失效（源端缺失检测不再漏报本组成员）。
   - full 模式下单条 item 的 `id_func` 失败（抛异常或非法返回，同页其余成功）现在使本轮 `on_missing` 差集失效（与整页全失败早停同策略）：失败 item 无法进入 `seen_this_run`，扫描若仍以空页完整结束，差集会把仍在源上的它确定性误报为「已删除」并触发业务破坏性动作。
 - **错误分类法**：
+  - `classify` / `validate_payload` / `normalize_dlq_meta` 的 Never-Raise 契约不再被「`__str__` 会抛异常的对象」击穿：契约边界内所有对不可信对象的取串统一经安全降级（`_safe_str`，异常时返回类型占位串），子进程分类路径不再因取串失败携 traceback 崩溃（无结果文件、可重试失败被误归因为环境故障）。
   - `classify_exception` 同时收到位置与关键字实参（`ErrorTaxonomy` 实例形态）时显式抛 `TypeError`（fail-loud，破坏性收紧），不再静默忽略其一。
   - 构造器策略序列逐成员 fail-loud 校验，`classify_*` 的「永不抛错」契约不再可被构造路径注入的坏成员击穿。
   - `tasklite.exceptions` 动态转发以 taxonomy `__all__` 为白名单，私有符号不再泄漏至公共导出面。

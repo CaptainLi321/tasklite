@@ -147,13 +147,81 @@ class TestErrorTaxonomyClassification:
     def test_never_raise_contract(self):
         """Never-Raise 契约测试：传入任何脏数据均返回结构化对象，绝不上抛异常。"""
         taxonomy = ErrorTaxonomy()
-        for garbage in [None, 42, "unknown string", [], object(), float("nan")]:
+        for garbage in [None, 42, "unknown string", [], object(), float("nan"),
+                        _BrokenStrError("x"), _BrokenStrObject()]:
             cl = taxonomy.classify(garbage)
             assert isinstance(cl, ErrorClassification)
             norm = taxonomy.normalize_dlq_meta(garbage)
             assert isinstance(norm, dict)
             assert "error_type" in norm
             assert "failed_at" in norm
+
+
+class _BrokenStrError(Exception):
+    """``__str__`` 必然抛异常的异常实例样本。"""
+
+    def __str__(self):
+        raise RuntimeError("broken __str__")
+
+
+class _BrokenStrObject:
+    """``__str__`` 必然抛异常的普通对象样本。"""
+
+    def __str__(self):
+        raise RuntimeError("broken __str__")
+
+
+class _BrokenStrSchema:
+    """``__str__`` 必然抛异常的 schema 对象样本。"""
+
+    def __str__(self):
+        raise RuntimeError("broken __str__")
+
+
+class TestNeverRaiseAgainstBrokenStr:
+    """``__str__`` 会抛异常的对象不得击穿 Never-Raise 契约。
+
+    classify()/validate_payload()/normalize_dlq_meta() 的 raw_error/expected
+    等字段对不可信对象取 ``str()`` 时，用户 ``__str__`` 的任意异常必须被
+    吞掉并降级为占位串——分类边界内的取串失败不得让 worker 携 traceback
+    崩溃（无结果文件、失败被误归因为环境故障）。
+    """
+
+    def test_classify_swallows_broken_str_across_all_target_shapes(self):
+        taxonomy = ErrorTaxonomy()
+
+        # 异常实例路径（_classify_exception）
+        cl = taxonomy.classify(_BrokenStrError("x"))
+        assert isinstance(cl, ErrorClassification)
+        assert cl.raw_error
+        # 普通对象路径（未知标量兜底分支）
+        cl_obj = taxonomy.classify(_BrokenStrObject())
+        assert isinstance(cl_obj, ErrorClassification)
+        assert cl_obj.category == ErrorCategory.UNKNOWN
+        # exitcode 路径
+        cl_exit = taxonomy.classify(_BrokenStrObject(), exitcode=1)
+        assert isinstance(cl_exit, ErrorClassification)
+        # 字典路径（IPC/DLQ meta 的 error 值不可信）
+        cl_dict = taxonomy.classify({"status": "retry", "error": _BrokenStrObject()})
+        assert isinstance(cl_dict, ErrorClassification)
+        assert cl_dict.is_retry is True
+        cl_dlq = taxonomy.classify({"error": _BrokenStrError("x"), "fatal": True})
+        assert isinstance(cl_dlq, ErrorClassification)
+        assert cl_dlq.is_fatal is True
+
+    def test_validate_payload_swallows_broken_str_schema(self):
+        taxonomy = ErrorTaxonomy()
+        res = taxonomy.validate_payload({}, _BrokenStrSchema())
+        assert isinstance(res, ValidationResult)
+        assert res.is_valid is False
+        assert res.errors[0].expected
+
+    def test_normalize_dlq_meta_swallows_broken_str_meta(self):
+        taxonomy = ErrorTaxonomy()
+        norm = taxonomy.normalize_dlq_meta(_BrokenStrObject())
+        assert isinstance(norm, dict)
+        assert norm["error"]
+        assert norm["error_type"] == ERROR_TYPE_UNKNOWN
 
 
 class TestPayloadValidation:
