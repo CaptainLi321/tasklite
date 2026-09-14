@@ -82,11 +82,8 @@ class TestErrorTaxonomyClassification:
         assert cl_unk.category == ErrorCategory.UNKNOWN
 
     def test_classify_user_transient_registry(self):
-        class CustomNetworkError(Exception):
-            pass
-
-        taxonomy = ErrorTaxonomy(transient_registry=[CustomNetworkError])
-        cl = taxonomy.classify(CustomNetworkError("custom drop"))
+        taxonomy = ErrorTaxonomy(transient_registry=[_CustomNetworkError])
+        cl = taxonomy.classify(_CustomNetworkError("custom drop"))
         assert cl.is_transient is True
         assert cl.is_retry is True
         assert cl.category == ErrorCategory.TRANSIENT_EXHAUSTED
@@ -155,6 +152,10 @@ class TestErrorTaxonomyClassification:
             assert isinstance(norm, dict)
             assert "error_type" in norm
             assert "failed_at" in norm
+
+
+class _CustomNetworkError(Exception):
+    """模块级瞬态注册样本类（构造/注册路径均要求可 pickle 的模块级类）。"""
 
 
 class _BrokenStrError(Exception):
@@ -391,6 +392,73 @@ class TestConstructorPolicyValidation:
         # 生成器入参的非法成员仍在构造期 fail-loud，校验语义不变
         with pytest.raises(TypeError, match="transient_registry"):
             ErrorTaxonomy(transient_registry=(c for c in [42]))
+
+
+class TestConstructorRejectsDedicatedAndUnpicklableClasses:
+    """构造路径与注册/声明路径同规：专用分支异常类与不可 pickle 类构造期拒绝。
+
+    RetryError/FatalError 拥有专用 except 分支且 ``_classify_exception`` 中
+    注册表命中判定先于 fatal 判定——构造器若接受其子类进入注册表，
+    fatal 异常会被翻转为可重试（白烧重试预算）；函数作用域类不可随
+    ctx pickle 下发，spawn 派发期才失败的滞后错误必须在构造期消灭。
+    """
+
+    def test_transient_registry_rejects_retry_error_subclass(self):
+        class MyRetry(RetryError):
+            pass
+
+        with pytest.raises(TypeError, match="RetryError"):
+            ErrorTaxonomy(transient_registry=[MyRetry])
+
+    def test_transient_registry_rejects_fatal_error_subclass(self):
+        class MyFatal(FatalError):
+            pass
+
+        with pytest.raises(TypeError, match="FatalError"):
+            ErrorTaxonomy(transient_registry=[MyFatal])
+
+    def test_fatal_exceptions_rejects_retry_error_subclass(self):
+        class MyRetry(RetryError):
+            pass
+
+        with pytest.raises(TypeError, match="fatal_exceptions.*RetryError"):
+            ErrorTaxonomy(fatal_exceptions=(MyRetry,))
+
+    def test_transient_exceptions_rejects_fatal_error_subclass(self):
+        class MyFatal(FatalError):
+            pass
+
+        with pytest.raises(TypeError, match="transient_exceptions.*FatalError"):
+            ErrorTaxonomy(transient_exceptions=(MyFatal,))
+
+    def test_facade_constructor_rejects_dedicated_subclass(self):
+        class MyFatal(FatalError):
+            pass
+
+        with pytest.raises(TypeError, match="transient_registry.*FatalError"):
+            TransientRegistry(classes=[MyFatal])
+
+    def test_transient_registry_rejects_unpicklable_class(self):
+        class LocalError(Exception):
+            pass
+
+        with pytest.raises(TypeError, match="module-level"):
+            ErrorTaxonomy(transient_registry=[LocalError])
+
+    def test_fatal_exceptions_rejects_unpicklable_class(self):
+        class LocalError(Exception):
+            pass
+
+        with pytest.raises(TypeError, match="module-level"):
+            ErrorTaxonomy(fatal_exceptions=(LocalError,))
+
+    def test_classify_keeps_fatal_priority_for_legal_policies(self):
+        """合法策略下 fatal 判定不受注册表污染：FatalError 子类恒 fatal，
+        不得因注册表命中先于 fatal 判定而翻转为可重试。"""
+        taxonomy = ErrorTaxonomy(transient_registry=(ConnectionError,))
+        assert taxonomy.classify(FatalError("f")).is_fatal is True
+        assert taxonomy.classify(FatalError("f")).is_retry is False
+        assert taxonomy.classify(ConnectionError("c")).is_retry is True
 
 
 class TestClassifyExceptionKwargsContract:

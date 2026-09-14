@@ -27,6 +27,7 @@
   - full 模式下单条 item 的 `id_func` 失败（抛异常或非法返回，同页其余成功）现在使本轮 `on_missing` 差集失效（与整页全失败早停同策略）：失败 item 无法进入 `seen_this_run`，扫描若仍以空页完整结束，差集会把仍在源上的它确定性误报为「已删除」并触发业务破坏性动作。
 - **错误分类法**：
   - `classify` / `validate_payload` / `normalize_dlq_meta` 的 Never-Raise 契约不再被「`__str__` 会抛异常的对象」击穿：契约边界内所有对不可信对象的取串统一经安全降级（`_safe_str`，异常时返回类型占位串），子进程分类路径不再因取串失败携 traceback 崩溃（无结果文件、可重试失败被误归因为环境故障）。
+  - `ErrorTaxonomy`/`TransientRegistry` 构造路径与注册/声明路径同规（fail-loud，破坏性收紧）：`RetryError`/`FatalError` 子类与不可 pickle 类在构造期即拒绝——此前构造器仅做底座校验，`RetryError`/`FatalError` 子类经构造进入注册表后，`classify` 的注册表命中判定先于 fatal 判定，fatal 异常被翻转为可重试（白烧重试预算）；函数作用域类滞后到 spawn 派发期才失败。
   - `classify_exception` 同时收到位置与关键字实参（`ErrorTaxonomy` 实例形态）时显式抛 `TypeError`（fail-loud，破坏性收紧），不再静默忽略其一。
   - 构造器策略序列逐成员 fail-loud 校验，`classify_*` 的「永不抛错」契约不再可被构造路径注入的坏成员击穿。
   - `tasklite.exceptions` 动态转发以 taxonomy `__all__` 为白名单，私有符号不再泄漏至公共导出面。

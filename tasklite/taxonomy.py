@@ -189,21 +189,6 @@ def _ensure_exception_class(exception_cls: type, api_name: str) -> None:
         )
 
 
-def _ensure_exception_classes(
-    classes: Optional[Sequence[type]], api_name: str
-) -> None:
-    """构造器策略序列的逐成员校验（fail-loud）。
-
-    不变式：classify() 标注 Never-Raise 契约，其实现依赖序列成员可安全
-    参与 isinstance——非 type 成员会让 TypeError 从 classify() 逸出，
-    故全部构造路径（fatal/transient 序列与瞬态注册表）在构造期即拒绝；
-    可 pickle 与专用分支约束由声明（validate_declared_exception_classes）
-    与注册（register_transient）路径叠加。
-    """
-    for exception_cls in tuple(classes) if classes is not None else ():
-        _ensure_exception_class(exception_cls, api_name)
-
-
 def _validate_policy_exception_class(exception_cls: type, api_name: str) -> None:
     """异常分类声明入口校验（fail-loud）——注册表与构造器元组两条声明路径共用。
 
@@ -255,7 +240,10 @@ class ErrorTaxonomy:
         transient_exceptions: Optional[Sequence[Type[BaseException]]] = None,
         transient_registry: Optional[Sequence[Type[BaseException]]] = None,
     ) -> None:
-        # 构造期 fail-loud（Never-Raise 契约前置）：与注册/声明路径同规。
+        # 构造期 fail-loud（Never-Raise 契约前置）：与注册路径同规——
+        # 专用分支异常类（RetryError/FatalError 子类，注册表命中先于
+        # fatal 判定会把 fatal 翻转为可重试）与不可 pickle 类（声明元组
+        # 随 ctx pickle 下发，spawn 派发期才失败）在构造期即拒绝。
         # 不变式：入参先一次性物化，物化结果复用于校验与赋值——若校验先行
         # 消费一次性迭代器（生成器/iterator）而赋值处二次物化，用户策略会
         # 静默变空且不回退内置默认。
@@ -266,9 +254,9 @@ class ErrorTaxonomy:
         registry_seq = (
             list(transient_registry) if transient_registry is not None else None
         )
-        _ensure_exception_classes(fatal_seq, "fatal_exceptions")
-        _ensure_exception_classes(transient_seq, "transient_exceptions")
-        _ensure_exception_classes(registry_seq, "transient_registry")
+        validate_declared_exception_classes(fatal_seq, "fatal_exceptions")
+        validate_declared_exception_classes(transient_seq, "transient_exceptions")
+        validate_declared_exception_classes(registry_seq, "transient_registry")
         self._fatal_exceptions: Tuple[Type[BaseException], ...] = (
             fatal_seq if fatal_seq is not None else FATAL_EXCEPTIONS
         )
