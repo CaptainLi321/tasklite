@@ -12,6 +12,7 @@
 
 - **运维接缝与后端一致性**：
   - `seed_cursor` 入口（`OpsConsole`）与 `InMemoryStateBackend` 统一 fail-loud 校验（key 非空 `str`、value 必须 `str`），修复同一非法入参在 SQLite 腿抛异常、memory 腿静默 `str()` 强转的跨后端行为分歧，以及 console 双写（库存 `'123'` / 内存镜像 `123`）的值型漂移。
+  - `TaskLite.backend` setter 入口类型校验：非 `AbstractStateBackend` 实例（如后端名字符串、`None`）构造期即抛 `TypeError`，不再延迟到管理 API 调用才以 `AttributeError` 爆发。
 - **HTTP 守卫与快照**：
   - `http.client.HTTPException` 家族（`BadStatusLine` / `LineTooLong` / `ResponseNotReady` 等）整体归为瞬态传输故障，残缺状态行等协议故障不再零重试直接进死信队列。
   - 快照缓存的状态提取默认值由 200 改为 `None`，`fetch_fn` 返回 urllib 原生响应时真实状态码得以透传，不再被恒记为 200 落盘。

@@ -262,6 +262,22 @@ class TaskLite:
 
     @backend.setter
     def backend(self, value: AbstractStateBackend) -> None:
+        # 入口即校验：非后端对象（后端名字符串、None 等）fail-loud，失败
+        # 不延迟到管理 API 调用才以 AttributeError 爆发。除 AbstractStateBackend
+        # 实例外接受提供读写核心方法的鸭子类型对象（崩溃注入测试的部分
+        # 伪造后端 seam，见 tests/engine/test_crash_recovery_regressions.py）。
+        if not (
+            isinstance(value, AbstractStateBackend)
+            or (
+                callable(getattr(value, "load_queue", None))
+                and callable(getattr(value, "commit_job_success", None))
+            )
+        ):
+            raise TypeError(
+                f"backend must be an AbstractStateBackend instance "
+                f"(use the `backend` constructor argument for 'sqlite'/'memory'), "
+                f"got {type(value).__name__}"
+            )
         if hasattr(self, "_runtime"):
             # 换库属管理段操作，仅限 run() 外调用（对齐 add_resource /
             # register_handler 守卫惯例）：运行期换库会撕裂主循环已装配的

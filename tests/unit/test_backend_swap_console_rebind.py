@@ -94,3 +94,28 @@ class TestBackendSwapRunGuard:
                 p.backend = InMemoryStateBackend()
         finally:
             p._runtime._is_running = False
+
+
+class TestBackendSwapTypeGuard:
+    """backend setter 入口类型校验：非 AbstractStateBackend 实例 fail-loud。
+
+    零校验时 ``tl.backend = "sqlite"`` / None 被静默接受，失败延迟到
+    管理 API 调用才以 AttributeError 爆发（归因断裂）；拒绝时原后端
+    引用链（runtime / store / console）零扰动。
+    """
+
+    @pytest.mark.parametrize("bad", ["sqlite", "memory", None, 42])
+    def test_setter_rejects_non_backend_object(self, tmp_path, bad):
+        p = make_pipeline(tmp_path)
+        original = p.backend
+        with pytest.raises(TypeError, match="AbstractStateBackend"):
+            p.backend = bad
+        assert p.backend is original
+        assert p._runtime.backend is original
+        assert p._console._backend is original
+
+    def test_setter_accepts_backend_instance(self, tmp_path):
+        p = make_pipeline(tmp_path)
+        new = InMemoryStateBackend()
+        p.backend = new
+        assert p.backend is new
