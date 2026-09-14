@@ -472,6 +472,10 @@ class ExecutionChannel:
         if not effective_ipc_dir:
             raise ValueError("ipc_dir is required for ExecutionChannel.spawn()")
         Path(effective_ipc_dir).mkdir(parents=True, exist_ok=True)
+        # 不变式：收割路径（journal/probe/drain）以实例属性为事实源，实例
+        # 属性为空而经兜底解析成功时必须回写，保证与 handle 派发路径同源
+        if self.ipc_dir is None:
+            self.ipc_dir = str(effective_ipc_dir)
         spec.task_ctx.ipc_dir = effective_ipc_dir
         p = None
         try:
