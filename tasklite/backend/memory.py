@@ -329,5 +329,15 @@ class InMemoryStateBackend(AbstractStateBackend):
             return count
 
     def seed_cursor(self, key: str, value: str) -> None:
+        """预填一个 cursor（UPSERT，幂等）。
+
+        与 SQLiteStateBackend.seed_cursor 同契约 fail-loud：key 非空 str、
+        value 必须 str——静默 str() 强转会让同一非法入参在本腿写 '123'、
+        sqlite 腿抛异常（跨后端行为分歧），且与内存镜像值型漂移。
+        """
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+        if not isinstance(value, str):
+            raise TypeError(f"cursor value must be str, got {type(value).__name__}")
         with self._lock:
-            self._cursors[key] = str(value)
+            self._cursors[key] = value

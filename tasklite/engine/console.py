@@ -209,6 +209,15 @@ class OpsConsole:
         return written
 
     def seed_cursor(self, key: str, value: str) -> None:
-        """预填一个 cursor（幂等）——存档迁移/进度书签恢复。"""
+        """预填一个 cursor（幂等）——存档迁移/进度书签恢复。
+
+        入口即校验（与 SQLiteStateBackend.seed_cursor 同契约）：key 非空
+        str、value 必须 str。委托前拒绝，保证持久层与内存镜像双腿零写入
+        且双写值一致。
+        """
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+        if not isinstance(value, str):
+            raise TypeError(f"cursor value must be str, got {type(value).__name__}")
         self._backend.seed_cursor(key, value)
         self._store.state.set_cursor(key, value)
