@@ -301,3 +301,51 @@ class TestSeedWallUidGuard:
         assert "download::1" not in store.state.wall
         # 非队列驻留 uid 种子不受波及
         assert console.seed_wall(["download::2"]) == 1
+
+
+class TestTuningScalarGuard:
+    """调优标量合法性校验（resolve_tuning 唯一规范化入口）。
+
+    dep_grace_seconds 非有限/非正值会让依赖宽限立即判死（0/负）或永不
+    裁决（NaN 比较恒 False → 永不裁决；inf 宽限 → 活锁）；commit_failure_dlq_threshold 与
+    deadlock_gap_max_rounds 为 0 时提交失败/无根因零轮即升级整队列 DLQ。
+    入口 fail-loud，而非延迟为运行期误杀/活锁。
+    """
+
+    @pytest.mark.parametrize("bad", [0, -1.0, -0.5, float("nan"), float("inf"), float("-inf")])
+    def test_rejects_invalid_dep_grace_seconds(self, bad):
+        from tasklite.engine.config import resolve_tuning
+        with pytest.raises(ValueError, match="dep_grace_seconds"):
+            resolve_tuning(dep_grace_seconds=bad)
+
+    def test_rejects_invalid_commit_failure_threshold(self, tmp_path):
+        with pytest.raises(ValueError, match="commit_failure_dlq_threshold"):
+            TaskLite(name="t", state_dir=tmp_path / "s", commit_failure_dlq_threshold=0)
+
+    def test_rejects_negative_commit_failure_threshold(self, tmp_path):
+        with pytest.raises(ValueError, match="commit_failure_dlq_threshold"):
+            TaskLite(name="t", state_dir=tmp_path / "s", commit_failure_dlq_threshold=-1)
+
+    def test_rejects_zero_deadlock_gap_rounds(self, tmp_path):
+        with pytest.raises(ValueError, match="deadlock_gap_max_rounds"):
+            TaskLite(name="t", state_dir=tmp_path / "s", deadlock_gap_max_rounds=0)
+
+    def test_rejects_negative_deadlock_gap_rounds(self):
+        from tasklite.engine.config import resolve_tuning
+        with pytest.raises(ValueError, match="deadlock_gap_max_rounds"):
+            resolve_tuning(deadlock_gap_max_rounds=-2)
+
+    def test_rejects_non_positive_dep_grace_via_constructor(self, tmp_path):
+        with pytest.raises(ValueError, match="dep_grace_seconds"):
+            TaskLite(name="t", state_dir=tmp_path / "s", dep_grace_seconds=0)
+
+    def test_valid_tuning_values_pass(self, tmp_path):
+        from tasklite.engine.config import resolve_tuning
+        tuning = resolve_tuning(
+            dep_grace_seconds=1.0,
+            commit_failure_dlq_threshold=1,
+            deadlock_gap_max_rounds=1,
+        )
+        assert tuning.dep_grace_seconds == 1.0
+        assert tuning.commit_failure_dlq_threshold == 1
+        assert tuning.deadlock_gap_max_rounds == 1

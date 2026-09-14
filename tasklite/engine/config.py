@@ -7,6 +7,7 @@ RunConfig 是调优参数默认值的唯一解析点：调用方一律透传 Opt
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
@@ -37,20 +38,48 @@ def resolve_tuning(
     commit_failure_dlq_threshold: Optional[int] = None,
     deadlock_gap_max_rounds: Optional[int] = None,
 ) -> Tuning:
-    """调优标量规范化（与 RunConfig.resolve 共用同一真相源）。"""
+    """调优标量规范化（与 RunConfig.resolve 共用同一真相源）。
+
+    合法性域：dep_grace_seconds 有限正值（0/负 → 依赖宽限立即判死；
+    NaN 比较恒 False / inf → 宽限永不裁决活锁）；两个轮次阈值为正整数
+    （0 → 提交失败或无根因零轮即升级整队列 DLQ，丧失恢复窗口）。
+    """
+    grace = (
+        float(dep_grace_seconds)
+        if dep_grace_seconds is not None else DEP_GRACE_SECONDS
+    )
+    # 超大 int 转 float 溢出抛 OverflowError（ArithmeticError 子类），
+    # 收敛为 ValueError 与其余非法值同路 fail-loud
+    try:
+        finite_grace = math.isfinite(grace)
+    except OverflowError:
+        finite_grace = False
+    if not finite_grace or grace <= 0:
+        raise ValueError(
+            f"dep_grace_seconds must be a finite number > 0, got {dep_grace_seconds!r}"
+        )
+    threshold = (
+        int(commit_failure_dlq_threshold)
+        if commit_failure_dlq_threshold is not None else COMMIT_FAILURE_DLQ_THRESHOLD
+    )
+    if threshold < 1:
+        raise ValueError(
+            f"commit_failure_dlq_threshold must be an int >= 1, "
+            f"got {commit_failure_dlq_threshold!r}"
+        )
+    gap_rounds = (
+        int(deadlock_gap_max_rounds)
+        if deadlock_gap_max_rounds is not None else DEADLOCK_GAP_MAX_ROUNDS
+    )
+    if gap_rounds < 1:
+        raise ValueError(
+            f"deadlock_gap_max_rounds must be an int >= 1, "
+            f"got {deadlock_gap_max_rounds!r}"
+        )
     return Tuning(
-        dep_grace_seconds=(
-            float(dep_grace_seconds)
-            if dep_grace_seconds is not None else DEP_GRACE_SECONDS
-        ),
-        commit_failure_dlq_threshold=(
-            int(commit_failure_dlq_threshold)
-            if commit_failure_dlq_threshold is not None else COMMIT_FAILURE_DLQ_THRESHOLD
-        ),
-        deadlock_gap_max_rounds=(
-            int(deadlock_gap_max_rounds)
-            if deadlock_gap_max_rounds is not None else DEADLOCK_GAP_MAX_ROUNDS
-        ),
+        dep_grace_seconds=grace,
+        commit_failure_dlq_threshold=threshold,
+        deadlock_gap_max_rounds=gap_rounds,
     )
 
 
