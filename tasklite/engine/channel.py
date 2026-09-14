@@ -198,8 +198,15 @@ def _decode_ipc_result(
     elif p is not None and getattr(p, "exitcode", None) is not None and p.exitcode != 0:
         success = False
         result_meta = {"error": f"PROCESS_CRASH_EXITCODE_{p.exitcode}"}
+        # 环境故障与信号死亡同属瞬态：正退出码死亡（解释器启动失败/
+        # 导入段崩溃等）走重试预算，与信号死亡路径对称，不再零重试直判 DLQ
+        retry_requested = True
+        retry_error = f"PROCESS_CRASH_EXIT: worker exited with code {p.exitcode}"
     else:
         result_meta = {"error": "NO_IPC_RESULT"}
+        # 结果文件缺失/半写（含 claim 路径认领的残留）同属环境瞬态故障
+        retry_requested = True
+        retry_error = "NO_IPC_RESULT: worker exited without writing a result file"
 
     if success and ipc_dir is not None:
         ok, err = ArtifactJournal(ipc_dir).verify_outputs(job.uid)
@@ -592,8 +599,14 @@ class ExecutionChannel:
             )
         elif exitcode is not None and exitcode != 0:
             result_meta = {"error": f"PROCESS_CRASH_EXITCODE_{exitcode}"}
+            # 环境故障与信号死亡同属瞬态：正退出码死亡走重试预算，
+            # 与信号死亡路径对称，不再零重试直判 DLQ
+            retry_requested = True
+            retry_error = f"PROCESS_CRASH_EXIT: worker exited with code {exitcode}"
         else:
             result_meta = {"error": "NO_IPC_RESULT"}
+            retry_requested = True
+            retry_error = "NO_IPC_RESULT: worker exited without writing a result file"
 
         return ExecutionResult(
             success=False,

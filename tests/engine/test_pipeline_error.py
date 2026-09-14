@@ -202,10 +202,16 @@ class TestProcessErrorPaths:
     """Tests for error handling in the run main loop."""
 
     def test_process_crash_nonzero_exitcode(self, tmp_path, monkeypatch):
-        """Child exits with non-zero exitcode (not killed) → DLQ."""
+        """正退出码死亡 → 环境瞬态重试路径。
+
+        旧契约：零重试直接 DLQ（error 即 PROCESS_CRASH_EXITCODE_1）。
+        新契约：与信号死亡对称走重试预算；本用例 max_retries=0 使首次
+        崩溃即耗尽预算，终态应为 MAX_RETRIES_EXCEEDED + retry_error
+        记录崩溃退出码，而非无重试直判。
+        """
         pipeline = make_pipeline(tmp_path)
         pipeline.register_handler("crash", lambda j, c: (True, {}))
-        pipeline.enqueue([Job("crash", "j1", payload={})])
+        pipeline.enqueue([Job("crash", "j1", payload={}, max_retries=0)])
 
         CrashProcess = make_ipc_process_class(exitcode=1)  # non-zero, not killed
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=CrashProcess)
@@ -214,13 +220,20 @@ class TestProcessErrorPaths:
 
         failed = pipeline.backend.load_failed()
         assert "crash::j1" in failed
-        assert "PROCESS_CRASH_EXITCODE_1" in failed["crash::j1"]["error"]
+        entry = failed["crash::j1"]
+        assert entry["error"] == "MAX_RETRIES_EXCEEDED"
+        assert "PROCESS_CRASH_EXIT" in entry.get("retry_error", "")
 
     def test_no_ipc_result_empty_queue(self, tmp_path, monkeypatch):
-        """Child exits cleanly (exitcode=0) but Queue empty → DLQ."""
+        """正常退出但无结果文件 → 环境瞬态重试路径。
+
+        旧契约：零重试直接 DLQ（error 即 NO_IPC_RESULT）。新契约：与
+        信号死亡对称走重试预算；max_retries=0 使首次即耗尽预算，终态
+        应为 MAX_RETRIES_EXCEEDED + retry_error 记录结果文件缺失。
+        """
         pipeline = make_pipeline(tmp_path)
         pipeline.register_handler("noresult", lambda j, c: (True, {}))
-        pipeline.enqueue([Job("noresult", "j1", payload={})])
+        pipeline.enqueue([Job("noresult", "j1", payload={}, max_retries=0)])
 
         NoResultProcess = make_ipc_process_class()  # clean exit, no IPC put
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=NoResultProcess)
@@ -229,7 +242,9 @@ class TestProcessErrorPaths:
 
         failed = pipeline.backend.load_failed()
         assert "noresult::j1" in failed
-        assert "NO_IPC_RESULT" in failed["noresult::j1"]["error"]
+        entry = failed["noresult::j1"]
+        assert entry["error"] == "MAX_RETRIES_EXCEEDED"
+        assert "NO_IPC_RESULT" in entry.get("retry_error", "")
 
     def test_capacity_impossible_request_deadlock(self, tmp_path):
         """Job requests > max_capacity → pipeline detects deadlock, job to DLQ."""
@@ -607,17 +622,19 @@ class TestExceptionSubclassesAndEmpty:
         assert result.result_meta["signal"] == "SIGKILL"
         assert result.result_meta["oom_hint"] is True
         assert "PROCESS_SIGNAL_DEATH" in (result.retry_error or "")
- # 对照：确定性退出码（handler sys.exit(1)/异常退出）维持判死
+ # 对照：确定性退出码（handler sys.exit(1)/异常退出）同为环境瞬态 →
+ # 重试预算路径（与信号死亡对称，区别仅在 meta 不含 signal/oom_hint）
         result1 = ExecutionChannel._build_terminal_failure(
             SimpleNamespace(exitcode=1), handle, is_timeout=False)
-        assert result1.retry_requested is False
+        assert result1.retry_requested is True
         assert "signal" not in result1.result_meta
+        assert "oom_hint" not in result1.result_meta
 
     def test_systemexit_in_subprocess_crash(self, tmp_path, monkeypatch):
         """SystemExit (BaseException, not Exception) → subprocess dies, crash exitcode."""
         pipeline = make_pipeline(tmp_path)
         pipeline.register_handler("sysexit", lambda j, c: (True, {}))
-        pipeline.enqueue([Job("sysexit", "j1", payload={})])
+        pipeline.enqueue([Job("sysexit", "j1", payload={}, max_retries=0)])
 
         SystemExitProcess = make_ipc_process_class(exitcode=1)  # no IPC result
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=SystemExitProcess)
@@ -626,7 +643,9 @@ class TestExceptionSubclassesAndEmpty:
 
         failed = pipeline.backend.load_failed()
         assert "sysexit::j1" in failed
-        assert "PROCESS_CRASH_EXITCODE_1" in failed["sysexit::j1"]["error"]
+        entry = failed["sysexit::j1"]
+        assert entry["error"] == "MAX_RETRIES_EXCEEDED"
+        assert "PROCESS_CRASH_EXIT" in entry.get("retry_error", "")
 
 
 # ─── output cleanup variants ────────────────────────────────
