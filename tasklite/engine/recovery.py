@@ -150,9 +150,17 @@ class RecoveryOrchestrator:
             seen_uid.add(u)
             clean_q.append(jd)
 
-        # 4. 差量落盘：只删除需要移除的残留行，其余行原样保留
+        # 4. 差量落盘：只删除需要移除的残留行，其余行原样保留。
+        # 落盘失败仅降级告警——内存态已收敛，本次 run 不受影响，磁盘保持
+        # 原状、下次加载重判（幂等），与 converge_terminal_overlap 同策略。
         if dropped_uids:
-            self._store.backend.delete_queue_uids(dropped_uids)
+            try:
+                self._store.backend.delete_queue_uids(dropped_uids)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to persist queue repair deletions to backend; "
+                    f"in-memory state is converged, disk will re-converge on next load: {e}"
+                )
         return clean_q
 
     def converge_terminal_overlap(self, wall: dict, failed: dict) -> None:

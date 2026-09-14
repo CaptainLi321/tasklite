@@ -12,6 +12,8 @@
 
 - **执行通道（ExecutionChannel）**：
   - `spawn` 经 `TASKLITE_IPC_DIR` 环境变量兜底解析出执行目录后回写实例属性 `ipc_dir`：journal 构造、孤儿锁探测、信号排空等收割路径以实例属性为事实源，此前仅 handle 携带 env 目录导致 spawn 成功而 reap/`probe_orphan_lock`/drain 全部崩溃（`ValueError`/`TypeError`）。
+- **启动恢复**：
+  - `repair_queue_on_load` 差量落盘（`delete_queue_uids`）失败降级为告警而非 re-raise：内存态已收敛、磁盘保持原状下次加载重判（幂等），与 `converge_terminal_overlap` 同策略——后端瞬态故障（锁忙、磁盘瞬时只读）不再炸掉整个 run 启动。
 - **运维接缝与后端一致性**：
   - `seed_cursor` 入口（`OpsConsole`）与 `InMemoryStateBackend` 统一 fail-loud 校验（key 非空 `str`、value 必须 `str`），修复同一非法入参在 SQLite 腿抛异常、memory 腿静默 `str()` 强转的跨后端行为分歧，以及 console 双写（库存 `'123'` / 内存镜像 `123`）的值型漂移。
   - `TaskLite.backend` setter 入口类型校验：非 `AbstractStateBackend` 实例（如后端名字符串、`None`）构造期即抛 `TypeError`，不再延迟到管理 API 调用才以 `AttributeError` 爆发。
