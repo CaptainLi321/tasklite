@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, inject_worker_resource
+from ..models.state import uid_from_job_dict
+from ..utils.jsonutil import dumps
 from .channel import ArtifactCleanupMode, ExecutionResult, JobHandle
 from .inflight import InFlightJob, InFlightTracker
 from .resource import persist_resource_suspensions
@@ -216,6 +218,14 @@ class CompletionMachine:
                 jd = nj.to_dict()
                 self._policy.normalize_job_dict(jd, nj.task_type)
                 inject_worker_resource(jd)
+                # 序列化预检与入队管道同规：后端落盘对 job dict 做 dumps，
+                # 不可序列化的坏子作业在提交前独立登记失败终态（派发拒绝
+                # 语义），不连坐父作业的成功提交、不触发 3-strike 崩溃契约
+                try:
+                    dumps(jd)
+                except (TypeError, ValueError) as e:
+                    self._reject_spawned_job(jd, e)
+                    continue
                 spawned_dicts.append(jd)
             logger.debug(f"Spawned {len(spawned_dicts)} jobs for {uid}.")
 
@@ -233,6 +243,26 @@ class CompletionMachine:
             job_dict=job_dict,
         )
         result.going_to_retry = False
+
+    def _reject_spawned_job(self, job_dict: dict, err: Exception) -> None:
+        """坏子作业（不可 JSON 序列化）独立登记失败终态并触发完成事件。
+
+        失败终态登记唯一经 ``StateStore.apply_failure`` 收敛；登记自身
+        3-strike DLQ 成功时作业已终结、跳过事件。``_CommitCrashSignal``
+        （后端环境故障）穿透上抛，交由崩溃契约处理。
+        """
+        child_uid = uid_from_job_dict(job_dict)
+        meta = {
+            "error": f"INVALID_SPAWNED_JOB: job dict is not JSON-serializable: {err}"
+        }
+        logger.error(f"Spawned job {child_uid} rejected: {meta['error']}")
+        try:
+            outcome = self._store.apply_failure(
+                child_uid, meta, job_dict=job_dict, cascade=True
+            )
+        except _JobTerminated:
+            return
+        self._session.fire_job_completed(child_uid, outcome.error_meta, False, False)
 
     def _apply_failure(
         self, uid: str, job_dict: dict, result: ExecutionResult,

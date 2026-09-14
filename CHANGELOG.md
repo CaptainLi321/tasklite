@@ -10,6 +10,8 @@
 
 ### 修复
 
+- **完成机器（CompletionMachine）**：
+  - 动态 spawn 子作业管道补 JSON 序列化预检（与入队管道同规）：payload 不可序列化的坏子作业在提交前独立登记失败终态（`INVALID_SPAWNED_JOB` 进 DLQ，级联下游并触发完成事件），不再连坐已成功的父作业——此前 SQLite 后端落盘 `dumps` 失败返回 False，父作业被推入 3-strike 崩溃契约（整 run 崩溃重启、handler 副作用重复后误标 `ERR_COMMIT_FAILURE_DLQ`），Memory 后端则静默接受坏 payload 到队列（双后端行为分歧就此消除）。
 - **执行通道（ExecutionChannel）**：
   - `spawn` 经 `TASKLITE_IPC_DIR` 环境变量兜底解析出执行目录后回写实例属性 `ipc_dir`：journal 构造、孤儿锁探测、信号排空等收割路径以实例属性为事实源，此前仅 handle 携带 env 目录导致 spawn 成功而 reap/`probe_orphan_lock`/drain 全部崩溃（`ValueError`/`TypeError`）。
 - **启动恢复**：
