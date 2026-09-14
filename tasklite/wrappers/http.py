@@ -18,6 +18,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import random
 import sqlite3
 import time
 from typing import (
@@ -42,6 +43,10 @@ from ..utils.injective import sanitize_job_component
 from ..utils.jsonutil import dumps as _json_dumps, loads as _json_loads
 
 logger = logging.getLogger("tasklite.wrappers.http")
+
+# 本地就地重试的单次等待封顶（与引擎指数退避默认上限一致）——
+# 大 max_retries 下线性/无封顶退避会累计出巨量不可中断睡眠。
+_LOCAL_BACKOFF_MAX_SECONDS = 300.0
 
 
 # ==============================================================================
@@ -997,6 +1002,20 @@ class HttpExecutor:
         self.backoff = backoff
         self.default_suspend_ttl = _validate_suspend_ttl(default_suspend_ttl)
 
+    @staticmethod
+    def _retry_delay(attempt: int, base: float) -> float:
+        """本地重试第 attempt 次的等待秒数（与引擎指数退避同形）。
+
+        形状：min(base, 封顶) × 2^(attempt-1) 再封顶，±25% 抖动——
+        先封顶基数再乘幂，杜绝大 base 大幂次的浮点溢出。
+        """
+        if not math.isfinite(base) or base <= 0:
+            return 0.0
+        exp = min(attempt - 1, 60)
+        delay = min(min(base, _LOCAL_BACKOFF_MAX_SECONDS) * (2 ** exp), _LOCAL_BACKOFF_MAX_SECONDS)
+        jitter = random.uniform(-0.25, 0.25) * delay
+        return max(0.0, delay + jitter)
+
     def execute(
         self,
         fetch_fn: Callable[..., Any],
@@ -1009,7 +1028,7 @@ class HttpExecutor:
             target_fn = self.snapshot_store.cached(target_fn)
         for attempt in range(max(0, self.max_retries) + 1):
             if attempt > 0:
-                time.sleep(self.backoff * attempt)
+                time.sleep(self._retry_delay(attempt, self.backoff))
             try:
                 with http_guard(
                     ctx=self.ctx,

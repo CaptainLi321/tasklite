@@ -1144,3 +1144,72 @@ def test_http_guard_suspend_type_error_preserves_rate_limit_signal() -> None:
         with http_guard(ctx=_BrokenCtx(), resource="api_x", default_suspend_ttl=60.0):
             raise hit
     assert exc_info.value is hit
+
+
+class TestHttpExecutorBackoffShape:
+    """HttpExecutor 本地重试退避形态（与引擎指数退避策略同形）。
+
+    线性无上限退避（backoff*attempt）在大 max_retries 下累计睡眠巨大且
+    与引擎 backoff_base*2^n（封顶+抖动）策略不一致。
+    """
+
+    def _run_with_capture(self, monkeypatch, max_retries, backoff):
+        import tasklite.wrappers.http as http_mod
+
+        sleeps: list = []
+
+        def _fake_sleep(secs):
+            sleeps.append(secs)
+
+        monkeypatch.setattr(http_mod.time, "sleep", _fake_sleep)
+        # 抖动归零以锁定确定性形状（jitter 行为单独验证）
+        monkeypatch.setattr(http_mod.random, "uniform", lambda a, b: 0.0)
+
+        calls = {"n": 0}
+
+        def _flaky(*args, **kwargs):
+            calls["n"] += 1
+            raise RetryError(f"transient #{calls['n']}")
+
+        executor = http_mod.HttpExecutor(max_retries=max_retries, backoff=backoff)
+        with pytest.raises(RetryError):
+            executor.execute(_flaky)
+        return sleeps
+
+    def test_retry_delays_follow_exponential_shape(self, monkeypatch):
+        """第 n 次重试等待 backoff*2^(n-1)（指数），而非线性 backoff*n。"""
+        sleeps = self._run_with_capture(monkeypatch, max_retries=4, backoff=1.0)
+        assert sleeps == [1.0, 2.0, 4.0, 8.0]
+
+    def test_retry_delay_capped(self, monkeypatch):
+        """单次等待封顶，大 backoff/大 max_retries 不再产生巨量睡眠。"""
+        sleeps = self._run_with_capture(monkeypatch, max_retries=30, backoff=1000.0)
+        assert sleeps
+        assert all(s <= 300.0 for s in sleeps)
+        assert len(sleeps) == 30
+
+    def test_retry_delay_jittered(self, monkeypatch):
+        """抖动以 ±25% 延迟幅度作用于每次等待（与引擎抖动幅度一致）。"""
+        import tasklite.wrappers.http as http_mod
+
+        jitter_calls: list = []
+        captured = {"delay": 0.0}
+
+        def _fake_uniform(a, b):
+            jitter_calls.append((a, b))
+            return 0.0
+
+        monkeypatch.setattr(http_mod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(http_mod.random, "uniform", _fake_uniform)
+
+        def _flaky(*args, **kwargs):
+            raise RetryError("transient")
+
+        executor = http_mod.HttpExecutor(max_retries=2, backoff=4.0)
+        with pytest.raises(RetryError):
+            executor.execute(_flaky)
+
+        # 与引擎 compute_backoff 同写法：uniform(-0.25, 0.25) 后乘延迟 d=4, 8
+        assert len(jitter_calls) == 2
+        assert jitter_calls[0] == (-0.25, 0.25)
+        assert jitter_calls[1] == (-0.25, 0.25)
