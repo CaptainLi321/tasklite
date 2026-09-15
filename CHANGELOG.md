@@ -20,6 +20,7 @@
   - 动态 spawn 子作业管道补 JSON 序列化预检（与入队管道同规）：payload 不可序列化的坏子作业在提交前独立登记失败终态（`INVALID_SPAWNED_JOB` 进 DLQ，级联下游并触发完成事件），不再连坐已成功的父作业——此前 SQLite 后端落盘 `dumps` 失败返回 False，父作业被推入 3-strike 崩溃契约（整 run 崩溃重启、handler 副作用重复后误标 `ERR_COMMIT_FAILURE_DLQ`），Memory 后端则静默接受坏 payload 到队列（双后端行为分歧就此消除）。
 - **执行通道（ExecutionChannel）**：
   - `spawn` 经 `TASKLITE_IPC_DIR` 环境变量兜底解析出执行目录后回写实例属性 `ipc_dir`：journal 构造、孤儿锁探测、信号排空等收割路径以实例属性为事实源，此前仅 handle 携带 env 目录导致 spawn 成功而 reap/`probe_orphan_lock`/drain 全部崩溃（`ValueError`/`TypeError`）。
+  - 锁文件环境故障（权限损坏/目录占位/路径超长等 `OSError`）按孤儿锁冲突瞬态信号同构降级：主进程派发孤儿探测关捕获 `OSError` 后走既有 defer 通道（零重试预算、降级写盘回队、零污染，日志保留 errno 归因），worker 入口锁获取失败落盘 `retry` + `lock_conflict` 降级结果——此前单作业锁文件异常即穿透派发链炸掉整 run，且作业经 crash-safe 保存留在磁盘，跨重启持续崩溃循环。
 - **启动恢复**：
   - `repair_queue_on_load` 差量落盘（`delete_queue_uids`）失败降级为告警而非 re-raise：内存态已收敛、磁盘保持原状下次加载重判（幂等），与 `converge_terminal_overlap` 同策略——后端瞬态故障（锁忙、磁盘瞬时只读）不再炸掉整个 run 启动。
 - **运维接缝与后端一致性**：

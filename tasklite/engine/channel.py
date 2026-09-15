@@ -251,7 +251,19 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         journal.write_result_with_degradation(uid, payload, incarnation=incarnation)
 
     transient_registry = getattr(ctx, "transient_registry", ()) or ()
-    _lock_fd = lockfile.try_acquire_lock(ipc_dir, uid, timeout=2.0)
+    try:
+        _lock_fd = lockfile.try_acquire_lock(ipc_dir, uid, timeout=2.0)
+    except OSError as e:
+        # 锁文件环境故障（权限/目录占位）写降级重试结果：与「锁被占」
+        # 同走瞬态 defer 通道（零预算、零污染），不让单作业环境故障
+        # 炸穿执行体；errno 归因保留供运维区分两种语义。
+        _write_result({
+            "status": "retry",
+            "lock_conflict": True,
+            "error": f"LOCK_ENV_FAULT: cannot open lock file for {uid} "
+                     f"(errno={getattr(e, 'errno', None)}): {e}",
+        })
+        return
     if _lock_fd is None:
         _write_result({
             "status": "retry",

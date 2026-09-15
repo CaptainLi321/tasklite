@@ -257,7 +257,18 @@ class DispatchMachine:
         # probe 必须**先于** restore 与声明清理——
         # 孤儿存活时提前 return，绝不删孤儿实时声明；probe 通过后
         # restore 消费孤儿残留结果 → 不派发（无双跑）。
-        if not self._channel.probe_orphan_lock(uid):
+        try:
+            probe_ok = self._channel.probe_orphan_lock(uid)
+        except OSError as e:
+            # 锁文件环境故障（权限/目录占位/路径超长）与「锁被占」语义
+            # 不同，但同属非作业自身故障：按孤儿锁冲突瞬态信号同构 defer
+            # （零重试预算、降级写盘回队、零污染），绝不放大为整 run 崩溃。
+            logger.warning(
+                f"Lock probe environment fault for {uid} "
+                f"(errno={getattr(e, 'errno', None)}): {e}; deferring."
+            )
+            probe_ok = False
+        if not probe_ok:
             logger.warning(
                 f"Deferring {uid}: orphan execution body still holds lock; "
                 f"requeue with short backoff."
