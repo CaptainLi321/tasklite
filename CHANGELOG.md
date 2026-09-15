@@ -10,6 +10,8 @@
 
 ### 修复
 
+- **IPC 产物清理安全**：
+  - 清理消费侧对 `.outputs.jsonl` 声明路径补沙盒归属复检（解析符号链接与 `..` 后须落在 `output_roots ∪ ipc_dir` 内）：成功清 cache 与失败清半成品两分支在 unlink/rmtree 前复检，越界路径拒绝删除、仅告警（fail-safe）——此前读出即信任，伪造声明可驱动 `rmtree` 删除沙盒外任意目录（含 `/`、用户 home、state_dir 自身），实现任意路径数据破坏与引擎自毁。`sandbox=False` 豁免声明的信任随之收紧到「不删」为止（豁免路径不再参与自动清理）；`output_roots` 未注入时信任根退化为 ipc_dir 自身。
 - **完成机器（CompletionMachine）**：
   - 动态 spawn 子作业管道补 JSON 序列化预检（与入队管道同规）：payload 不可序列化的坏子作业在提交前独立登记失败终态（`INVALID_SPAWNED_JOB` 进 DLQ，级联下游并触发完成事件），不再连坐已成功的父作业——此前 SQLite 后端落盘 `dumps` 失败返回 False，父作业被推入 3-strike 崩溃契约（整 run 崩溃重启、handler 副作用重复后误标 `ERR_COMMIT_FAILURE_DLQ`），Memory 后端则静默接受坏 payload 到队列（双后端行为分歧就此消除）。
 - **执行通道（ExecutionChannel）**：

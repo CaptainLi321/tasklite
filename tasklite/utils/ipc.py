@@ -70,8 +70,18 @@ class ArtifactJournal:
     原子清空、结果原子落盘/降级与多模式文件生命周期清理逻辑。
     """
 
-    def __init__(self, ipc_dir: Optional[Union[str, Path]] = None) -> None:
+    def __init__(
+        self,
+        ipc_dir: Optional[Union[str, Path]] = None,
+        output_roots: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
+    ) -> None:
         self.ipc_dir: Optional[str] = str(ipc_dir) if ipc_dir is not None else None
+        if output_roots is None:
+            self.output_roots: Optional[List[Path]] = None
+        elif isinstance(output_roots, (str, Path)):
+            self.output_roots = [Path(output_roots).resolve()]
+        else:
+            self.output_roots = [Path(r).resolve() for r in output_roots]
 
     # ── 路径构造 ──────────────────────────────────────────────────
 
@@ -552,6 +562,25 @@ class ArtifactJournal:
 
     # ── 产物校验与生命周期清理 ────────────────────────────────────
 
+    def _in_cleanup_sandbox(self, raw_path: str) -> bool:
+        """删除前的消费侧沙盒归属复检（解析符号链接与 ``..`` 后判定）。
+
+        不变式：``.outputs.jsonl`` 是 ipc_dir 上的不可信输入，声明侧校验
+        可被伪造声明绕过——任何 unlink/rmtree 前必须复检路径归属，信任
+        根为 output_roots 与 ipc_dir 的并集；无任何信任根或解析越界一律
+        拒绝清理（fail-safe 方向：漏删可人工补救，误删不可逆）。
+        """
+        candidates: List[Path] = list(self.output_roots or [])
+        if self.ipc_dir:
+            candidates.append(Path(self.ipc_dir).resolve())
+        if not candidates:
+            return False
+        try:
+            self.resolve_and_validate_path(raw_path, candidates, sandbox=True)
+        except ValueError:
+            return False
+        return True
+
     def verify_outputs(self, uid: str) -> Tuple[bool, Optional[str]]:
         """校验 job 的产物是否存在（忽略临时 cache）。
 
@@ -608,6 +637,11 @@ class ArtifactJournal:
             try:
                 for out_path, _, kind in self.read_outputs(uid):
                     if kind == "cache":
+                        if not self._in_cleanup_sandbox(out_path):
+                            logger.error(
+                                f"Refusing to clean declared path outside sandbox for {uid}: {out_path}"
+                            )
+                            continue
                         out_obj = Path(out_path)
                         if out_obj.exists():
                             out_obj.unlink()
@@ -627,6 +661,11 @@ class ArtifactJournal:
             try:
                 for out_path, cleanup, kind in self.read_outputs(uid):
                     if kind == "cache" or cleanup:
+                        if not self._in_cleanup_sandbox(out_path):
+                            logger.error(
+                                f"Refusing to clean declared path outside sandbox for {uid}: {out_path}"
+                            )
+                            continue
                         out_path_obj = Path(out_path)
                         if out_path_obj.exists():
                             if out_path_obj.is_dir():

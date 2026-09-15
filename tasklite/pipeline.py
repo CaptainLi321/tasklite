@@ -194,7 +194,9 @@ class TaskLite:
         # 主进程轮询文件存在（无 mp.Queue 伪阻塞点）。
         self.ipc_dir = str(self.state_dir / "ipc")
         Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
-        channel = ExecutionChannel(mp_ctx=self._mp_ctx, ipc_dir=self.ipc_dir)
+        channel = ExecutionChannel(
+            mp_ctx=self._mp_ctx, ipc_dir=self.ipc_dir, output_roots=self.output_root
+        )
 
         self.strict_picklable = strict_picklable
 

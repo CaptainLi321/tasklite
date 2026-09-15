@@ -99,7 +99,7 @@ Job(
 | 方法 | 用途 |
 |------|------|
 | `ctx.spawn(job)` | 入队子任务（立即 JSON 预检） |
-| `ctx.declare_output(path, cleanup_on_fail=True, sandbox=True)` | 声明输出文件。**返回解析后的绝对路径**（相对路径按 `output_root` 重定位——多根（list）时固定拼到**第一个**根）——用返回值写文件。`sandbox=False` 显式豁免路径沙盒（跨盘） |
+| `ctx.declare_output(path, cleanup_on_fail=True, sandbox=True)` | 声明输出文件。**返回解析后的绝对路径**（相对路径按 `output_root` 重定位——多根（list）时固定拼到**第一个**根）——用返回值写文件。`sandbox=False` 显式豁免路径沙盒（跨盘）。清理消费侧（成功清 cache、失败清半成品）对声明路径复做沙盒归属复检（解析符号链接与 `..` 后须落在 `output_root`/`ipc_dir` 内），越界路径拒绝删除、仅告警（含 `sandbox=False` 豁免声明） |
 | `ctx.declare_cache(path)` | 声明**临时文件**：任务结束时（无论成败）该文件不应存在——成功跳过存在性校验 + 尝试删除，失败/中止删半成品。原子产出的 `.part` 用它声明 |
 | `ctx.declare_input(path)` | 声明**输入文件**：采集指纹 `{path, size, mtime_ns}` 落 wall meta——排障/审计可追溯；与 `rerun="on_input_change"` 联动做变更检测；返回规范绝对路径 |
 | `ctx.declare_input_uri(url, uri_fingerprint=None)` | 声明**输入 URI**：仅记录（可追溯）；URI 变更检测默认关闭（需网络请求），留给业务；返回 url 字符串 |

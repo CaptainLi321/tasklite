@@ -1,5 +1,6 @@
 """ArtifactJournal 产物清单与文件级 IPC 深模块独立单元测试套件。"""
 
+import os
 from pathlib import Path
 import pytest
 
@@ -268,6 +269,99 @@ class TestArtifactJournalResidueSweep:
 
         assert journal.drain_all_signals() == []
         assert foreign.exists()
+
+
+class TestCleanupSandboxRecheck:
+    """清理消费侧的沙盒归属复检：outputs 声明是 ipc_dir 上的不可信输入。
+
+    声明侧的沙盒校验可被伪造的 `.outputs.jsonl` 声明绕过，任何删除动作
+    （unlink / rmtree）执行前必须复检路径归属——解析符号链接与 `..` 后
+    落在 output_roots 或 ipc_dir 之外的一律拒绝清理，绝不 rmtree。
+    """
+
+    def _make_journal(self, tmp_path, with_output_root=True):
+        ipc_dir = tmp_path / "ipc"
+        ipc_dir.mkdir()
+        roots = None
+        if with_output_root:
+            roots = tmp_path / "outputs"
+            roots.mkdir()
+        return ArtifactJournal(ipc_dir, output_roots=roots), ipc_dir, roots
+
+    def test_failure_cleanup_refuses_out_of_sandbox_tree(self, tmp_path):
+        """失败清理对沙盒外声明路径拒绝删除（含整树 rmtree），声明文件照常清。"""
+        journal, _, _ = self._make_journal(tmp_path)
+        victim = tmp_path / "victim_dir"
+        victim.mkdir()
+        (victim / "precious.txt").write_text("data")
+        uid = "t::poison"
+        journal.record_output(uid, str(victim), cleanup=True, kind="output")
+
+        journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
+
+        assert victim.exists(), "沙盒外目录绝不能被 rmtree"
+        assert (victim / "precious.txt").exists()
+        assert not journal.outputs_path(uid).exists(), "损坏声明文件本身照常清理"
+
+    def test_failure_cleanup_still_removes_in_sandbox_entries(self, tmp_path):
+        """沙盒内合法声明的半成品文件与目录照常清理（复检不误伤合法清理）。"""
+        journal, _, roots = self._make_journal(tmp_path)
+        broken_file = roots / "broken.txt"
+        broken_file.write_text("half")
+        broken_dir = roots / "half_baked"
+        broken_dir.mkdir()
+        (broken_dir / "sub.txt").write_text("sub")
+        uid = "t::normal"
+        journal.record_output(uid, str(broken_file), cleanup=True, kind="output")
+        journal.record_output(uid, str(broken_dir), cleanup=True, kind="output")
+
+        journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
+
+        assert not broken_file.exists()
+        assert not broken_dir.exists()
+
+    def test_success_cleanup_refuses_out_of_sandbox_cache(self, tmp_path):
+        """成功清理对沙盒外 cache 声明拒绝 unlink。"""
+        journal, _, _ = self._make_journal(tmp_path)
+        victim = tmp_path / "outside.cache"
+        victim.write_text("data")
+        uid = "t::cache"
+        journal.record_output(uid, str(victim), cleanup=True, kind="cache")
+
+        journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
+
+        assert victim.exists(), "沙盒外 cache 文件绝不能被 unlink"
+
+    def test_cleanup_without_output_roots_confines_to_ipc_dir(self, tmp_path):
+        """未注入 output_roots 时沙盒退化为 ipc_dir 自身（缺信任根即默认拒绝）。"""
+        journal, ipc_dir, _ = self._make_journal(tmp_path, with_output_root=False)
+        inside = ipc_dir / "scratch.tmp"
+        inside.write_text("data")
+        victim = tmp_path / "outside.txt"
+        victim.write_text("data")
+        uid = "t::noipcroots"
+        journal.record_output(uid, str(inside), cleanup=True, kind="cache")
+        journal.record_output(uid, str(victim), cleanup=True, kind="cache")
+
+        journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
+
+        assert not inside.exists(), "ipc_dir 内声明路径照常清理"
+        assert victim.exists(), "无信任根时沙盒外路径必须拒绝清理"
+
+    def test_failure_cleanup_rejects_dotdot_escape_and_symlink(self, tmp_path):
+        """`..` 穿越与符号链接间接逃逸的声明路径同样拒绝清理。"""
+        journal, _, roots = self._make_journal(tmp_path)
+        target = tmp_path / "real_target"
+        target.mkdir()
+        (target / "f.txt").write_text("data")
+        link = roots / "link"
+        os.symlink(target, link)
+        uid = "t::escape"
+        journal.record_output(uid, str(roots / "link" / ".." / ".." / "real_target"), cleanup=True, kind="output")
+
+        journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
+
+        assert target.exists(), "经符号链接与 .. 逃逸出沙盒的路径必须拒绝清理"
 
 
 class TestArtifactJournalCleanupModes:

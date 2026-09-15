@@ -416,6 +416,7 @@ class ExecutionChannel:
         ipc_dir: Optional[Union[str, Path, Any]] = None,
         *,
         mp_ctx: Optional[Any] = None,
+        output_roots: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
         **kwargs: Any,
     ) -> None:
         if ipc_dir is not None and hasattr(ipc_dir, "Process") and mp_ctx is None:
@@ -425,9 +426,13 @@ class ExecutionChannel:
             ipc_dir = kwargs["ipc_dir"]
         if mp_ctx is None and "mp_ctx" in kwargs:
             mp_ctx = kwargs["mp_ctx"]
+        if output_roots is None and "output_roots" in kwargs:
+            output_roots = kwargs["output_roots"]
 
         self._mp_ctx = mp_ctx or mp.get_context("spawn")
         self.ipc_dir = str(ipc_dir) if ipc_dir is not None else None
+        # 输出沙盒信任根随 channel 注入 journal——清理消费侧的删除复检依赖
+        self.output_roots = output_roots
         if self.ipc_dir:
             try:
                 Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
@@ -439,7 +444,7 @@ class ExecutionChannel:
         ipc = getattr(self, "ipc_dir", None)
         j = getattr(self, "_journal", None)
         if j is None or j.ipc_dir != ipc:
-            j = ArtifactJournal(ipc)
+            j = ArtifactJournal(ipc, output_roots=getattr(self, "output_roots", None))
             self._journal = j
         return j
 

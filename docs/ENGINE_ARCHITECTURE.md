@@ -473,6 +473,9 @@ class ExecutionChannel:
    写事务。
 6. **瞬态信号军规**：`lock_conflict` / `interrupted` / `RateLimitHit` 等瞬态信号
    「不烧重试预算 + 降级写盘 + 零污染」。
+7. **产物清理沙盒复检**：`.outputs.jsonl` 属 ipc_dir 上的不可信输入，删除动作
+   （unlink/rmtree）前必须复检路径归属（解析符号链接与 `..` 后须落在
+   `output_roots ∪ ipc_dir` 内），越界路径拒绝清理、仅告警（fail-safe：漏删可补救，误删不可逆）。
 
 ---
 
