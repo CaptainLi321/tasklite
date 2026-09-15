@@ -46,6 +46,7 @@
   - 资源名校验补非空 `str` 约束，非 `str` 键不再跨重启发生类型漂移。
 - **单射转义与内容指纹**：
   - `escape_injective` 拒绝非 `str` 输入（fail-loud，破坏性收紧），`None` 不再被强转为字面 `"None"` 的同像碰撞。
+  - `sanitize_identifier` / `sanitize_job_component` / `sanitize_content_id` 同步拒绝非 `str` 非 `None` 输入（fail-loud，破坏性收紧）：隐式 `str()` 强转使 `int 123` 与 `str "123"` 同像碰撞，公共导出 API 的 job_id 派生防线（wall 去重）破缺——跨型同像会静默吞任务；`None`/空值仍走像集外哨兵。
   - `content_fingerprint` 对嵌套 `dict` 全 token 化，任意层级容器的键序不再影响指纹。
 - **数据模型**：
   - `Job` runtime 命名空间仅认 `_` 前缀规范键，extra 中的同名键往返无损。

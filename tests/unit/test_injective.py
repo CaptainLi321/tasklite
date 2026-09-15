@@ -175,3 +175,23 @@ def test_sanitize_job_component_delegation_and_invariants():
     assert "::" not in sanitize_job_component("x::y")
     assert sanitize_job_component("abc-_.123") == "abc-_.123"
 
+
+def test_sanitize_family_rejects_non_str_non_none():
+    """非 str 非 None 入参显式 TypeError 拒绝，与 escape_injective 拒绝原则对齐。
+
+    隐式 str() 强转会让 int 123 与 str "123" 同像碰撞（多对一，破坏单射
+    契约）——三个派生净化函数是公共导出 API 的 job_id 派生防线，wall 去
+    重依赖其单射性，跨型同像会静默吞任务。
+    """
+    for fn in (sanitize_identifier, sanitize_job_component, sanitize_content_id):
+        for bad in (123, 1.5, True, b"123", ["123"], ("123",)):
+            with pytest.raises(TypeError):
+                fn(bad)
+    # None 与空串仍走哨兵（不拒绝）
+    assert sanitize_identifier(None) == EMPTY_SENTINEL
+    assert sanitize_job_component(None) == EMPTY_SENTINEL
+    assert sanitize_content_id(None) == EMPTY_SENTINEL
+    # 拒绝发生在哨兵与截断逻辑之前：即便 max_len 非法也先报 TypeError
+    with pytest.raises(TypeError):
+        sanitize_identifier(123, max_len=10)
+

@@ -115,8 +115,19 @@ def sanitize_identifier(
       同前缀长 ID），非数学全域保证；
     - 需截断而 max_len < _TRUNC_FIXED_LEN 时抛 ValueError（截断形态无法压入上限，
       fail-loud）；直通输入对任意 max_len 均可用。
+
+    非 str 非 None 输入显式 TypeError 拒绝（与 escape_injective 拒绝原则同源）：
+    隐式 str() 强转会让 int 123 与 str "123" 同像碰撞，wall 去重依赖本函数族
+    的单射性，跨型同像即静默吞任务。
     """
-    text = str(value) if value is not None else ""
+    if value is None:
+        text = ""
+    elif not isinstance(value, str):
+        raise TypeError(
+            f"value must be a str or None, got {type(value).__name__} ({value!r})"
+        )
+    else:
+        text = value
     if not text:
         return fallback
     escaped = escape_injective(text, forbidden=forbidden, allowed=allowed)
@@ -151,11 +162,17 @@ def sanitize_content_id(content_id: Union[str, None], *, max_len: int = 120) -> 
     """按严密 allowlist 净化 content_id（如用于 discovery 子任务派发）。
 
     None/空值返回像集外哨兵（固定形态，不随 max_len 收缩）；单射契约分级
-    与截断行为同 sanitize_identifier。
+    与截断行为同 sanitize_identifier。非 str 非 None 输入显式 TypeError
+    拒绝（隐式 str() 强转的跨型同像碰撞破坏单射契约）。
     """
     if content_id is None:
         return EMPTY_SENTINEL
-    text = str(content_id)
+    if not isinstance(content_id, str):
+        raise TypeError(
+            f"content_id must be a str or None, "
+            f"got {type(content_id).__name__} ({content_id!r})"
+        )
+    text = content_id
     if not text:
         return EMPTY_SENTINEL
     # 若全部是 clean 字符且未超长，直接返回
