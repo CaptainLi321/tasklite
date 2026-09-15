@@ -402,6 +402,7 @@ class DispatchMachine:
                     incarnation=incarnation,
                     ipc_dir=self._ipc_dir,
                     timeout=job.timeout,
+                    result_token=self._session.result_token,
                 ))
                 lease.claim()
 

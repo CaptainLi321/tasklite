@@ -243,32 +243,31 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
             f"fencing requires WorkerLaunchSpec.incarnation"
         )
     journal = ArtifactJournal(ipc_dir)
+    result_token = spec.result_token
+
+    def _write_result(payload: Dict[str, Any]) -> None:
+        # 结果认证令牌随全部状态通道落盘，主进程读取侧强校验
+        payload["auth"] = result_token
+        journal.write_result_with_degradation(uid, payload, incarnation=incarnation)
+
     transient_registry = getattr(ctx, "transient_registry", ()) or ()
     _lock_fd = lockfile.try_acquire_lock(ipc_dir, uid, timeout=2.0)
     if _lock_fd is None:
-        journal.write_result_with_degradation(
-            uid,
-            {
-                "status": "retry",
-                "lock_conflict": True,
-                "error": f"LOCK_CONFLICT: another execution body holds {uid} lock",
-            },
-            incarnation=incarnation,
-        )
+        _write_result({
+            "status": "retry",
+            "lock_conflict": True,
+            "error": f"LOCK_CONFLICT: another execution body holds {uid} lock",
+        })
         return
     try:
         raw_result = handler_func(job, ctx)
-        journal.write_result_with_degradation(
-            uid,
-            {
-                "status": "success",
-                "raw_result": _encode_raw_result(raw_result),
-                "new_jobs": [j.to_dict() for j in ctx.new_jobs],
-                "resource_suspensions": ctx.resource_suspensions,
-                "cursor_updates": ctx.cursor_updates,
-            },
-            incarnation=incarnation,
-        )
+        _write_result({
+            "status": "success",
+            "raw_result": _encode_raw_result(raw_result),
+            "new_jobs": [j.to_dict() for j in ctx.new_jobs],
+            "resource_suspensions": ctx.resource_suspensions,
+            "cursor_updates": ctx.cursor_updates,
+        })
     except RetryError as e:
         # 限流瞬态判定必须在子进程编码侧完成：RateLimitHit 是 RetryError
         # 子类、与本类共享 status="retry" 通道，父进程侧已无异常类型可辨；
@@ -276,19 +275,13 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         retry_payload: Dict[str, Any] = {"status": "retry", "error": str(e)}
         if isinstance(e, RateLimitHit):
             retry_payload["rate_limited"] = True
-        journal.write_result_with_degradation(
-            uid, retry_payload, incarnation=incarnation
-        )
+        _write_result(retry_payload)
     except FatalError as e:
-        journal.write_result_with_degradation(
-            uid,
-            {
-                "status": "fatal",
-                "error": str(e),
-                _KEY_TRACEBACK: traceback.format_exc(),
-            },
-            incarnation=incarnation,
-        )
+        _write_result({
+            "status": "fatal",
+            "error": str(e),
+            _KEY_TRACEBACK: traceback.format_exc(),
+        })
     except Exception as e:
         kind = classify_exception(
             e,
@@ -297,51 +290,34 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
             transient_exceptions=getattr(ctx, "transient_exceptions", None),
         )
         if kind == "retry":
-            journal.write_result_with_degradation(
-                uid,
-                {"status": "retry", "error": f"{type(e).__name__}: {e}"},
-                incarnation=incarnation,
-            )
+            _write_result({
+                "status": "retry",
+                "error": f"{type(e).__name__}: {e}",
+            })
         elif kind == "fatal":
-            journal.write_result_with_degradation(
-                uid,
-                {
-                    "status": "fatal",
-                    "error": f"{type(e).__name__}: {e}",
-                    _KEY_TRACEBACK: traceback.format_exc(),
-                },
-                incarnation=incarnation,
-            )
+            _write_result({
+                "status": "fatal",
+                "error": f"{type(e).__name__}: {e}",
+                _KEY_TRACEBACK: traceback.format_exc(),
+            })
         else:
-            journal.write_result_with_degradation(
-                uid,
-                {
-                    "status": "error",
-                    "error": f"{type(e).__name__}: {e}",
-                    _KEY_TRACEBACK: traceback.format_exc(),
-                },
-                incarnation=incarnation,
-            )
-    except KeyboardInterrupt as e:
-        journal.write_result_with_degradation(
-            uid,
-            {
-                "status": "interrupted",
-                "error": f"WORKER_INTERRUPTED: {type(e).__name__}",
-                _KEY_TRACEBACK: traceback.format_exc(),
-            },
-            incarnation=incarnation,
-        )
-    except SystemExit as e:
-        journal.write_result_with_degradation(
-            uid,
-            {
+            _write_result({
                 "status": "error",
-                "error": f"WORKER_INTERRUPTED: {type(e).__name__}",
+                "error": f"{type(e).__name__}: {e}",
                 _KEY_TRACEBACK: traceback.format_exc(),
-            },
-            incarnation=incarnation,
-        )
+            })
+    except KeyboardInterrupt as e:
+        _write_result({
+            "status": "interrupted",
+            "error": f"WORKER_INTERRUPTED: {type(e).__name__}",
+            _KEY_TRACEBACK: traceback.format_exc(),
+        })
+    except SystemExit as e:
+        _write_result({
+            "status": "error",
+            "error": f"WORKER_INTERRUPTED: {type(e).__name__}",
+            _KEY_TRACEBACK: traceback.format_exc(),
+        })
     finally:
         lockfile.release_lock(_lock_fd)
 
@@ -381,7 +357,7 @@ ExecutionHandle = JobHandle
 class WorkerLaunchSpec:
     """进程 seam 具名契约——spawn 下发子进程执行体的全部载荷。
 
-    incarnation（{run_id}.{dispatch_seq} 执行身份）归本 spec，
+    incarnation（{run_id}.{dispatch_seq} 执行身份）与结果认证令牌归本 spec，
     不借道 TaskContext 属性穿透进程边界。
     """
 
@@ -391,6 +367,7 @@ class WorkerLaunchSpec:
     incarnation: str
     ipc_dir: str
     timeout: float
+    result_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -433,6 +410,8 @@ class ExecutionChannel:
         self.ipc_dir = str(ipc_dir) if ipc_dir is not None else None
         # 输出沙盒信任根随 channel 注入 journal——清理消费侧的删除复检依赖
         self.output_roots = output_roots
+        # 每 run 随机结果认证令牌（run 启动屏障由 runtime 同步）；None 表示未启用
+        self.result_token: Optional[str] = None
         if self.ipc_dir:
             try:
                 Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
@@ -501,6 +480,21 @@ class ExecutionChannel:
             incarnation=spec.incarnation,
         )
 
+    def _read_authenticated_result(self, path: Path) -> Optional[dict]:
+        """读取侧强校验结果认证令牌，不匹配按无结果丢弃（瞬态、零预算）。
+
+        威胁模型：ipc_dir 写入者可伪造结果文件驱动 wall 投毒、new_jobs
+        子任务注入与 cursor 投毒；令牌不匹配的结果绝不进入解码管线。
+        """
+        res = self.journal.read_result(path)
+        token = getattr(self, "result_token", None)
+        if res is not None and token is not None and res.get("auth") != token:
+            logger.error(
+                f"Result auth token mismatch, discarding untrusted result: {path.name}"
+            )
+            return None
+        return res
+
     def reap_completed(
         self, handles: Sequence[JobHandle]
     ) -> List[Tuple[JobHandle, ExecutionResult]]:
@@ -512,13 +506,19 @@ class ExecutionChannel:
             p = handle.process
             res_path = self.journal.result_path(handle.uid, handle.incarnation)
 
-            res = self.journal.read_result(res_path) if res_path.exists() else None
+            res = (
+                self._read_authenticated_result(res_path)
+                if res_path.exists() else None
+            )
             if res is not None:
                 completed.append((handle, self._collect_outcome(handle, res)))
                 continue
 
             if not p.is_alive():
-                res = self.journal.read_result(res_path) if res_path.exists() else None
+                res = (
+                    self._read_authenticated_result(res_path)
+                    if res_path.exists() else None
+                )
                 completed.append((handle, self._collect_outcome(handle, res)))
                 continue
 
@@ -532,7 +532,10 @@ class ExecutionChannel:
                     is_timeout = True
                 else:
                     is_timeout = p.exitcode == 0 or p.exitcode is None
-                res = self.journal.read_result(res_path) if res_path.exists() else None
+                res = (
+                    self._read_authenticated_result(res_path)
+                    if res_path.exists() else None
+                )
                 completed.append(
                     (handle, self._collect_outcome(handle, res, is_timeout=is_timeout))
                 )
@@ -569,8 +572,19 @@ class ExecutionChannel:
         return result
 
     def claim_stale_result(self, uid: str, job: Job) -> Optional[ExecutionResult]:
-        """启动/派发前崩溃恢复：认领并消费上次 run 遗留的已落盘残留结果。"""
+        """启动/派发前崩溃恢复：认领并消费上次 run 遗留的已落盘残留结果。
+
+        残留结果必须携带本 run 的认证令牌——跨 run 残留与伪造残留一律
+        丢弃（崩溃恢复退化为重跑，保守正确；伪造残留的注入链不可达）。
+        """
         res = self.journal.claim_stale_result(uid)
+        token = getattr(self, "result_token", None)
+        if res is not None and token is not None and res.get("auth") != token:
+            logger.error(
+                f"Stale result auth token mismatch for {uid}; "
+                f"discarding untrusted result"
+            )
+            return None
         if res is None:
             return None
         return _decode_ipc_result(res, None, job, self.ipc_dir)
@@ -652,7 +666,7 @@ class ExecutionChannel:
             incarnation = getattr(h, "incarnation", None)
             res_p = self.journal.result_path(h.uid, incarnation)
             if res_p.exists():
-                raw_res = self.journal.read_result(res_p)
+                raw_res = self._read_authenticated_result(res_p)
                 if (
                     raw_res is not None
                     and isinstance(raw_res, dict)
@@ -689,7 +703,7 @@ class ExecutionChannel:
             incarnation = getattr(h, "incarnation", None)
             res_p = self.journal.result_path(h.uid, incarnation)
             if res_p.exists():
-                raw_res = self.journal.read_result(res_p)
+                raw_res = self._read_authenticated_result(res_p)
                 if (
                     raw_res is not None
                     and isinstance(raw_res, dict)

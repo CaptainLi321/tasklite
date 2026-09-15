@@ -115,6 +115,7 @@ class TestIncarnationFencing:
                 ArtifactJournal(spec.ipc_dir).write_result_atomic(spec.job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
+                    "auth": getattr(spec, "result_token", None),
                 }, incarnation=spec.incarnation)
 
             def join(self, timeout=None): self._alive = False
@@ -167,6 +168,7 @@ class TestIncarnationFencing:
                 from tasklite.utils.ipc import ArtifactJournal
                 ArtifactJournal(spec.ipc_dir).write_result_atomic(spec.job.uid, {
                     "status": "retry", "error": "transient",
+                    "auth": getattr(spec, "result_token", None),
                 }, incarnation=spec.incarnation)
 
             def join(self, timeout=None): self._alive = False
@@ -311,7 +313,7 @@ class TestStaleDeclarationCleanup:
                     "new_jobs": [],
                     "resource_suspensions": [],
                     "cursor_updates": {},
-                }, incarnation=_spec.incarnation)
+                }, incarnation=_spec.incarnation, auth_token=getattr(_spec, "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -362,7 +364,7 @@ class TestStaleDeclarationCleanup:
                     "new_jobs": [],
                     "resource_suspensions": [],
                     "cursor_updates": {},
-                }, incarnation=_spec.incarnation)
+                }, incarnation=_spec.incarnation, auth_token=getattr(_spec, "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive

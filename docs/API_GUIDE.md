@@ -278,7 +278,7 @@ from tasklite.wrappers.discovery import sanitize_content_id  # 公开的 content
 | 二次 `stop(force=True)` 或 SIGTERM | **ABORTING**：**已完成**（结果文件已落盘、只差 drain 回收）的 job 被消费提交（进 wall/failed，不 kill、不删产出、不 requeue）；仅对**进行中** job 执行 kill + 清半成品 + requeue 后退出 |
 | Ctrl+C（KeyboardInterrupt） | 立即中止：已完成 job 同样被消费提交，仅进行中 job requeue（不进 DLQ） |
 
-**崩溃恢复三层防线**：结果文件携带执行代标识（`{uid}.{run_id}.{seq}.result.json`，孤儿进程的旧结果对新 run 不可见）；派发前认领上次崩溃残留的结果文件（派发预检关 5 stale-restore，经 `channel.claim_stale_result`）；`{uid}.lock` 文件锁探测孤儿执行体（同 uid 同时只有一个执行体）。执行代标识（incarnation）由 `WorkerLaunchSpec`——跨进程 seam 的 frozen 具名契约（handler/job/task_ctx/incarnation/ipc_dir/timeout）——携带，不借道 TaskContext。
+**崩溃恢复三层防线**：结果文件携带执行代标识（`{uid}.{run_id}.{seq}.result.json`，孤儿进程的旧结果对新 run 不可见）；派发前认领上次崩溃残留的结果文件（派发预检关 5 stale-restore，经 `channel.claim_stale_result`）；`{uid}.lock` 文件锁探测孤儿执行体（同 uid 同时只有一个执行体）。执行代标识（incarnation）由 `WorkerLaunchSpec`——跨进程 seam 的 frozen 具名契约（handler/job/task_ctx/incarnation/ipc_dir/timeout/result_token）——携带，不借道 TaskContext。结果文件同时携带每 run 轮换的认证令牌（`auth` 键，经 `WorkerLaunchSpec.result_token` 下发 worker），收割/认领/中止三条读取路径强校验，不匹配按无结果丢弃（瞬态、零预算）——伪造结果文件的 wall 投毒、子任务注入与游标投毒链不可达；跨 run 残留因令牌轮换一律丢弃重跑（保守正确）。
 
 ---
 

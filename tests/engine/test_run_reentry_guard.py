@@ -47,7 +47,7 @@ def _make_gate_process_class(enter_event, release_event):
                     "new_jobs": [],
                     "resource_suspensions": [],
                     "cursor_updates": {},
-                }, incarnation=_spec.incarnation)
+                }, incarnation=_spec.incarnation, auth_token=getattr(_spec, "result_token", None))
             self._alive = False
 
         def is_alive(self):

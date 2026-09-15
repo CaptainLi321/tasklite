@@ -14,13 +14,16 @@ from pathlib import Path
 from tasklite.pipeline import TaskLite
 
 
-def _write_fake_result(ipc_dir, uid, result_dict, incarnation=None):
+def _write_fake_result(ipc_dir, uid, result_dict, incarnation=None, auth_token=None):
     """FakeProcess 用：把 IPC 结果原子写入结果文件（与真实子进程同路径）。
 
-    incarnation 由 WorkerLaunchSpec 携带——fake 与真实子进程共享
-    同一路径构造逻辑，保证 drain 能读到 fake 写的结果。
+    incarnation 与结果认证令牌均由 WorkerLaunchSpec 携带——fake 与真实
+    子进程共享同一路径构造逻辑与令牌落盘行为，保证 drain 能读到 fake
+    写的结果且通过读取侧强校验。
     """
     from tasklite.utils.ipc import ArtifactJournal
+    if auth_token is not None:
+        result_dict["auth"] = auth_token
     ArtifactJournal(ipc_dir).write_result_atomic(uid, result_dict, incarnation=incarnation)
 
 
@@ -29,6 +32,20 @@ def _spec_incarnation(args):
     if not args:
         return None
     return args[0].incarnation
+
+
+FIXED_AUTH_TOKEN = "c" * 64
+
+
+def pin_result_token(monkeypatch, token=FIXED_AUTH_TOKEN):
+    """固定本 run 的结果认证令牌。
+
+    预写跨 run 残留结果文件的测试用：令牌在 run 启动屏障才生成，pin 后
+    测试可与预写文件携带同一令牌（认证启用下的认领记账语义保持可测）。
+    """
+    import secrets as _secrets
+    monkeypatch.setattr(_secrets, "token_hex", lambda n=32: token)
+    return token
 
 
 def make_fake_process_class(outcome="success"):
@@ -57,6 +74,7 @@ def make_fake_process_class(outcome="success"):
                 job = spec.job
                 ipc_dir = spec.ipc_dir
                 incarnation = spec.incarnation
+                auth_token = getattr(spec, "result_token", None)
                 if outcome == "success":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "success",
@@ -64,27 +82,27 @@ def make_fake_process_class(outcome="success"):
                         "new_jobs": [],
                         "resource_suspensions": [],
                         "cursor_updates": {},
-                    }, incarnation=incarnation)
+                    }, incarnation=incarnation, auth_token=auth_token)
                 elif outcome == "retry":
-                    _write_fake_result(ipc_dir, job.uid, {"status": "retry", "error": "transient"}, incarnation=incarnation)
+                    _write_fake_result(ipc_dir, job.uid, {"status": "retry", "error": "transient"}, incarnation=incarnation, auth_token=auth_token)
                 elif outcome == "fatal":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "fatal",
                         "error": "FatalError: bug",
                         "traceback": "traceback",
-                    }, incarnation=incarnation)
+                    }, incarnation=incarnation, auth_token=auth_token)
                 elif outcome == "fatal_exception":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "fatal",
                         "error": "TypeError: bad type",
                         "traceback": "traceback",
-                    }, incarnation=incarnation)
+                    }, incarnation=incarnation, auth_token=auth_token)
                 elif outcome == "error":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "error",
                         "error": "something broke",
                         "traceback": "traceback",
-                    }, incarnation=incarnation)
+                    }, incarnation=incarnation, auth_token=auth_token)
 
         def join(self, timeout=None):
             self._alive = False
@@ -139,6 +157,7 @@ def make_ipc_process_class(results=(), exitcode=0, stay_alive=False):
                 _write_fake_result(
                     spec.ipc_dir, spec.job.uid, payload,
                     incarnation=spec.incarnation,
+                    auth_token=getattr(spec, "result_token", None),
                 )
 
         def join(self, timeout=None):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import pickle
+import secrets
 import signal
 import time
 import traceback
@@ -347,6 +348,10 @@ class EngineRuntime:
         """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。"""
         if self.store.state is None:
             self._session.run_id = self._session.run_id or uuid.uuid4().hex
+            # 绕过 run() 直达 step 的路径在此补齐认证身份（与 run_id 同生命周期）
+            if self._session.result_token is None:
+                self._session.result_token = secrets.token_hex(32)
+            self.channel.result_token = self._session.result_token
             self.store.set_state(PipelineState({}, {}, {}, []))
         store = self.store
 
@@ -429,8 +434,11 @@ class EngineRuntime:
         cursors = self.backend.load_cursors()
         q_data = self.backend.load_queue()
 
-        # Fencing 屏障
+        # Fencing 屏障（结果认证令牌与 run_id 同生命周期：每 run 轮换并
+        # 同步到执行通道，收割/认领/中止三条读取路径共用同一信任锚）
         self._session.run_id = uuid.uuid4().hex
+        self._session.result_token = secrets.token_hex(32)
+        self.channel.result_token = self._session.result_token
         self._session.dispatch_seq = 0
         try:
             self.backend.set_meta("last_run_id", self._session.run_id)

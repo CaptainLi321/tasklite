@@ -476,6 +476,11 @@ class ExecutionChannel:
 7. **产物清理沙盒复检**：`.outputs.jsonl` 属 ipc_dir 上的不可信输入，删除动作
    （unlink/rmtree）前必须复检路径归属（解析符号链接与 `..` 后须落在
    `output_roots ∪ ipc_dir` 内），越界路径拒绝清理、仅告警（fail-safe：漏删可补救，误删不可逆）。
+8. **结果文件认证令牌**：每 run 随机令牌经 `WorkerLaunchSpec.result_token` 下发
+   worker、随全部状态通道的结果 payload 落盘（含两级降级），收割/认领/中止三条
+   读取路径强校验，不匹配按无结果丢弃（瞬态、零预算）——ipc_dir 写入者伪造
+   结果文件的 wall 投毒 / 子任务注入 / 游标投毒链不可达；跨 run 残留因令牌
+   轮换一律丢弃重跑（保守正确）。
 
 ---
 

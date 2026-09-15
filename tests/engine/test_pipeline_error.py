@@ -119,7 +119,7 @@ class TestOutputVerification:
                 _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-                }, incarnation=self.args[0].incarnation)
+                }, incarnation=self.args[0].incarnation, auth_token=getattr(self.args[0], "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -156,7 +156,7 @@ class TestOutputVerification:
                 self._alive = True
                 ctx = self.args[0].task_ctx
                 ctx.declare_output(str(cleanup_file), cleanup_on_fail=True)
-                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "crash", "traceback": "tb"}, incarnation=self.args[0].incarnation)
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "crash", "traceback": "tb"}, incarnation=self.args[0].incarnation, auth_token=getattr(self.args[0], "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -314,7 +314,7 @@ class TestProcessErrorPaths:
                 dummy.parent.mkdir(parents=True, exist_ok=True)
                 dummy.write_text("temp")
                 ctx.declare_output(str(dummy), cleanup_on_fail=True)
-                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=self.args[0].incarnation)
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=self.args[0].incarnation, auth_token=getattr(self.args[0], "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -677,7 +677,7 @@ class TestOutputCleanupVariants:
                 self._alive = True
                 ctx = self.args[0].task_ctx
                 ctx.declare_output(str(keep_file), cleanup_on_fail=False)  # cleanup=False
-                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=self.args[0].incarnation)
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=self.args[0].incarnation, auth_token=getattr(self.args[0], "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -712,7 +712,7 @@ class TestOutputCleanupVariants:
                 self._alive = True
                 ctx = self.args[0].task_ctx
                 ctx.declare_output(str(out_dir), cleanup_on_fail=True)  # cleanup=True
-                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=self.args[0].incarnation)
+                _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {"status": "error", "error": "boom", "traceback": "tb"}, incarnation=self.args[0].incarnation, auth_token=getattr(self.args[0], "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -752,7 +752,7 @@ class TestOutputCleanupVariants:
                 _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-                }, incarnation=self.args[0].incarnation)
+                }, incarnation=self.args[0].incarnation, auth_token=getattr(self.args[0], "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -795,7 +795,7 @@ class TestOutputCleanupVariants:
                 _write_fake_result(self.args[0].ipc_dir, self.args[0].job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-                }, incarnation=self.args[0].incarnation)
+                }, incarnation=self.args[0].incarnation, auth_token=getattr(self.args[0], "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive

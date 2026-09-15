@@ -36,7 +36,7 @@ class CursorSetterFakeProcess:
                 "new_jobs": [],
                 "resource_suspensions": [],
                 "cursor_updates": {"high_water": "999"},
-            }, incarnation=spec.incarnation)
+            }, incarnation=spec.incarnation, auth_token=getattr(spec, "result_token", None))
 
     def join(self, timeout=None):
         self._alive = False

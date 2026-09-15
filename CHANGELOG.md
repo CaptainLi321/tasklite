@@ -10,6 +10,8 @@
 
 ### 修复
 
+- **IPC 结果文件认证**：
+  - 结果文件补每 run 随机认证令牌（`secrets` 标准库生成，经 `WorkerLaunchSpec.result_token` 下发 worker，随全部状态通道的 payload 落盘，两级降级写继承令牌），主进程收割/残留认领/中止分类三条读取路径强校验，不匹配按无结果处理（瞬态、零预算）——此前 IPC 结果文件零认证，具备 ipc_dir 写权限的本地攻击者可伪造 `status=success` 结果文件，经崩溃恢复认领实现 wall 投毒、`new_jobs` 子任务注入与游标投毒。行为变化：跨 run 崩溃残留结果因令牌轮换不再被认领（一律丢弃重跑，保守正确）；相关契约测试断言已按新安全契约更新。
 - **IPC 产物清理安全**：
   - 清理消费侧对 `.outputs.jsonl` 声明路径补沙盒归属复检（解析符号链接与 `..` 后须落在 `output_roots ∪ ipc_dir` 内）：成功清 cache 与失败清半成品两分支在 unlink/rmtree 前复检，越界路径拒绝删除、仅告警（fail-safe）——此前读出即信任，伪造声明可驱动 `rmtree` 删除沙盒外任意目录（含 `/`、用户 home、state_dir 自身），实现任意路径数据破坏与引擎自毁。`sandbox=False` 豁免声明的信任随之收紧到「不删」为止（豁免路径不再参与自动清理）；`output_roots` 未注入时信任根退化为 ipc_dir 自身。
 - **完成机器（CompletionMachine）**：

@@ -71,7 +71,7 @@ def _make_releasable_process_class(release_event):
                     "new_jobs": [],
                     "resource_suspensions": [],
                     "cursor_updates": {},
-                }, incarnation=_spec.incarnation)
+                }, incarnation=_spec.incarnation, auth_token=getattr(_spec, "result_token", None))
             self._alive = False
 
         def is_alive(self):
@@ -320,6 +320,8 @@ class TestAbortConsumesCompletedResult:
         journal.write_result_atomic(entry.uid, {
             "status": "success", "raw_result": True,
             "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
+            # 真实 worker 经 spec 拿到的本 run 认证令牌（读取侧强校验的合法形态）
+            "auth": getattr(pipeline._runtime.channel, "result_token", None),
         }, incarnation=entry.handle.incarnation)
         return journal.result_path(entry.uid, entry.handle.incarnation).exists()
 

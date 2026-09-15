@@ -16,7 +16,12 @@ from tasklite.pipeline import TaskLite
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
 
-from tests.helpers import make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes
+from tests.helpers import (
+    make_fake_process_class,
+    make_pipeline,
+    patch_multiprocessing_for_fakes,
+    pin_result_token,
+)
 from tasklite.engine.channel import (
     _normalize_handler_result,
     _encode_raw_result,
@@ -178,9 +183,10 @@ class TestStaleResultRestore:
 
         p.enqueue([Job("h", "a")])
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
+        token = pin_result_token(monkeypatch)
         journal = ArtifactJournal(p.ipc_dir)
         journal.write_result_atomic(
-            "h::a", {"status": "retry", "error": "stale-retry"},
+            "h::a", {"status": "retry", "error": "stale-retry", "auth": token},
             incarnation=inc,
         )
 
@@ -203,9 +209,11 @@ class TestStaleResultRestore:
 
         p.enqueue([Job("h", "a")])
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
+        token = pin_result_token(monkeypatch)
         journal = ArtifactJournal(p.ipc_dir)
         journal.write_result_atomic("h::a", {
             "status": "fatal", "error": "TypeError: stale bug", "traceback": "tb",
+            "auth": token,
         }, incarnation=inc)
 
         FakeP = make_fake_process_class("success")
@@ -224,9 +232,11 @@ class TestStaleResultRestore:
 
         p.enqueue([Job("h", "a")])
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
+        token = pin_result_token(monkeypatch)
         journal = ArtifactJournal(p.ipc_dir)
         journal.write_result_atomic("h::a", {
             "status": "error", "error": "boom", "traceback": "tb",
+            "auth": token,
         }, incarnation=inc)
 
         FakeP = make_fake_process_class("success")
@@ -268,8 +278,11 @@ class TestStaleResultRestore:
         p.enqueue([Job("h", "a")])
         # status=success 但缺 raw_result（模拟损坏/旧版本残留）
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
+        token = pin_result_token(monkeypatch)
         journal = ArtifactJournal(p.ipc_dir)
-        journal.write_result_atomic("h::a", {"status": "success"}, incarnation=inc)
+        journal.write_result_atomic(
+            "h::a", {"status": "success", "auth": token}, incarnation=inc
+        )
 
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)

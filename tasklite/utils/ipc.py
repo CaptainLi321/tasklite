@@ -301,6 +301,10 @@ class ArtifactJournal:
             "status": degraded_status,
             "error": f"IPC_RESULT_WRITE_DEGRADED: {write_err}",
         }
+        # 认证令牌随降级继承：读取侧强校验下丢令牌的降级结果会被误拒，
+        # lock_conflict / rate_limited 的瞬态保真语义随之失效
+        if "auth" in payload:
+            degraded["auth"] = payload["auth"]
         if payload.get("lock_conflict"):
             degraded["lock_conflict"] = True
         if payload.get("rate_limited"):
