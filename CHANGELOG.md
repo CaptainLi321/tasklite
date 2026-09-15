@@ -64,6 +64,7 @@
   - abort 初扫对已完成 job 补排空 suspend 信号，收尾清理不再未读删除。
 - **重试与运行时**：
   - 子进程环境性死亡（正退出码崩溃、正常退出但无结果文件 `NO_IPC_RESULT`）与信号死亡路径对称，纳入瞬态重试预算（`retry_requested`），不再零重试直接进死信队列；重试耗尽后的 DLQ 行经 `retry_error` 携带终态原因。
+  - 收割超时分支归因修正：deadline 后 join 窗口内已自然退出的执行体死亡分类全权交 exitcode 分簇（0 → `NO_IPC_RESULT` 瞬态、<0 信号、>0 正码崩溃），与 deadline 前同因事件同果；仅 join 后仍存活被击杀的执行体才归 `TIMEOUT`——此前窗口内 exitcode=0 的环境性无结果被误判 `TIMEOUT` 零重试直落死信队列，DLQ 归因偏离真实故障（结果写盘失败）。
   - 重试字典以原 job_dict 为基重建，job_dict 顶层自定义字段随重试往返保留。
   - 损坏结果中 `new_jobs` 的标量形态收敛为单任务失败，不再穿透 drain/claim 使整管崩溃。
   - `RunSummary.unhandled_exception` 死赋值收敛，契约固化为 raise 通道异常语义。

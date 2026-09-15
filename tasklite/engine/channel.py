@@ -543,7 +543,11 @@ class ExecutionChannel:
                         pass
                     is_timeout = True
                 else:
-                    is_timeout = p.exitcode == 0 or p.exitcode is None
+                    # join 窗口内已自然退出：死亡归因全权交 exitcode 分簇
+                    # （0 → NO_IPC_RESULT 瞬态、<0 信号、>0 正码崩溃），与
+                    # deadline 前同因事件同果，不折入 TIMEOUT；仅 kill 后
+                    # 仍存活/被击杀的执行体才归 TIMEOUT。
+                    is_timeout = False
                 res = (
                     self._read_authenticated_result(res_path)
                     if res_path.exists() else None
