@@ -10,6 +10,8 @@
 
 ### 修复
 
+- **IPC 结果解析容灾**：
+  - `read_result` 与逐行声明/信号读取（`read_inputs`/`read_outputs`/`_read_suspend_lines`）的容灾 except 家族纳入 `RecursionError`：深嵌套 JSON 使解析器抛出的递归失控异常不再逃逸「损坏返回 None/跳过坏行」承诺——此前损坏结果文件可沿 `claim_stale_result` → `restore_stale_result` → 主循环穿透致整管崩溃，且残留文件在认领删除前即抛、重启后崩溃循环。
 - **IPC 结果文件认证**：
   - 结果文件补每 run 随机认证令牌（`secrets` 标准库生成，经 `WorkerLaunchSpec.result_token` 下发 worker，随全部状态通道的 payload 落盘，两级降级写继承令牌），主进程收割/残留认领/中止分类三条读取路径强校验，不匹配按无结果处理（瞬态、零预算）——此前 IPC 结果文件零认证，具备 ipc_dir 写权限的本地攻击者可伪造 `status=success` 结果文件，经崩溃恢复认领实现 wall 投毒、`new_jobs` 子任务注入与游标投毒。行为变化：跨 run 崩溃残留结果因令牌轮换不再被认领（一律丢弃重跑，保守正确）；相关契约测试断言已按新安全契约更新。
 - **IPC 产物清理安全**：

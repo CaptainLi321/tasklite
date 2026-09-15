@@ -1,5 +1,6 @@
 """ArtifactJournal 产物清单与文件级 IPC 深模块独立单元测试套件。"""
 
+import json
 import os
 from pathlib import Path
 import pytest
@@ -269,6 +270,68 @@ class TestArtifactJournalResidueSweep:
 
         assert journal.drain_all_signals() == []
         assert foreign.exists()
+
+
+class TestResultParseContainment:
+    """结果/声明文件读取容灾的捕获面完整性：解析失控异常按损坏降级。
+
+    深嵌套 JSON 使 json 解析器抛 RecursionError——它不是 ValueError 子类，
+    容灾 except 家族漏接会让「损坏返回 None」承诺被击穿，异常沿认领/
+    收割链穿透至主循环崩溃（残留文件 claim 前即抛未及 unlink，重启后
+    崩溃循环）。
+    """
+
+    def test_read_result_deep_nesting_returns_none(self, tmp_path):
+        journal = ArtifactJournal(tmp_path)
+        deep = tmp_path / "deep.result.json"
+        deep.write_text("[" * 200000 + "]" * 200000, encoding="utf-8")
+
+        assert journal.read_result(deep) is None, "解析失控必须按损坏结果降级为 None"
+
+    def test_read_outputs_deep_nesting_line_skipped(self, tmp_path):
+        journal = ArtifactJournal(tmp_path)
+        uid = "t::deep_outputs"
+        op = journal.outputs_path(uid)
+        good = tmp_path / "ok.txt"
+        op.write_text(
+            json.dumps({"path": str(good), "cleanup": True, "kind": "output"}) + "\n"
+            + json.dumps({"path": "[" * 200000, "cleanup": True, "kind": "output"}) + "\n"
+            + "[" * 200000 + "\n",
+            encoding="utf-8",
+        )
+
+        outputs = journal.read_outputs(uid)
+
+        assert len(outputs) == 2, "深嵌套行按坏行跳过，其余行正常解析"
+        assert outputs[0][0] == str(good)
+        assert outputs[1][1] is False or outputs[1][0]  # 第二行 path 字符串形态保留
+
+    def test_read_inputs_deep_nesting_line_skipped(self, tmp_path):
+        journal = ArtifactJournal(tmp_path)
+        uid = "t::deep_inputs"
+        ip = journal.inputs_path(uid)
+        ip.write_text(
+            json.dumps({"path": "/tmp/a", "kind": "file"}) + "\n"
+            + "[" * 200000 + "\n",
+            encoding="utf-8",
+        )
+
+        entries = journal.read_inputs(uid)
+
+        assert len(entries) == 1, "深嵌套行按坏行跳过"
+        assert entries[0]["path"] == "/tmp/a"
+
+    def test_read_suspend_lines_deep_nesting_line_skipped(self, tmp_path):
+        journal = ArtifactJournal(tmp_path)
+        uid = "t::deep_signals"
+        sp = journal.signals_path(uid)
+        sp.write_text(
+            json.dumps({"suspend": ["gpu", 5.0]}) + "\n"
+            + "[" * 200000 + "\n",
+            encoding="utf-8",
+        )
+
+        assert journal.drain_signals(uid) == [("gpu", 5.0)], "深嵌套行按坏行跳过，合法信号保留"
 
 
 class TestCleanupSandboxRecheck:

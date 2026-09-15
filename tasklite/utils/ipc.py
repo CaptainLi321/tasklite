@@ -335,7 +335,7 @@ class ArtifactJournal:
                             data = loads(line)
                             if isinstance(data, dict) and isinstance(data.get("path"), str):
                                 entries.append(data)
-                        except (json.JSONDecodeError, TypeError, ValueError):
+                        except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
                             continue
         except OSError:
             pass
@@ -365,7 +365,7 @@ class ArtifactJournal:
                                         bool(data.get("cleanup", True)),
                                         kind,
                                 ))
-                        except (json.JSONDecodeError, TypeError, ValueError):
+                        except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
                             continue
         except OSError:
             pass
@@ -473,7 +473,7 @@ class ArtifactJournal:
                         if isinstance(data, dict) and "suspend" in data:
                             r_name, secs = data["suspend"]
                             signals.append((r_name, float(secs)))
-                    except (json.JSONDecodeError, TypeError, ValueError):
+                    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
                         continue
         except OSError:
             pass
@@ -527,7 +527,7 @@ class ArtifactJournal:
             return None
         except FileNotFoundError:
             return None
-        except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+        except (json.JSONDecodeError, OSError, RecursionError, TypeError, ValueError) as e:
             logger.warning(f"Corrupt result file {path}: {e}, ignoring")
             return None
 
