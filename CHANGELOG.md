@@ -28,6 +28,7 @@
 - **启动恢复**：
   - `repair_queue_on_load` 差量落盘（`delete_queue_uids`）失败降级为告警而非 re-raise：内存态已收敛、磁盘保持原状下次加载重判（幂等），与 `converge_terminal_overlap` 同策略——后端瞬态故障（锁忙、磁盘瞬时只读）不再炸掉整个 run 启动。
 - **运维接缝与后端一致性**：
+  - `seed_wall` 的队列驻留预检补后端持久腿：queue 腿改为内存队列与后端 `load_queue()` 提取的 uid 集合合并对账（failed 腿原本即查后端）——此前 run 前内存 state 为空占位，跨进程场景（进程崩溃后队列落盘、新进程首次 run 前 seed_wall）预检漏掉落盘队列驻留，uid 写入 wall 后在下次加载时被残留过滤从队列静默删除（作业被吞）；内存/SQLite 双后端同语义，冲突仍整体拒绝零写入。
   - `seed_cursor` 入口（`OpsConsole`）与 `InMemoryStateBackend` 统一 fail-loud 校验（key 非空 `str`、value 必须 `str`），修复同一非法入参在 SQLite 腿抛异常、memory 腿静默 `str()` 强转的跨后端行为分歧，以及 console 双写（库存 `'123'` / 内存镜像 `123`）的值型漂移。
   - `TaskLite.backend` setter 入口类型校验：非 `AbstractStateBackend` 实例（如后端名字符串、`None`）构造期即抛 `TypeError`，不再延迟到管理 API 调用才以 `AttributeError` 爆发。
 - **调优标量合法性**：

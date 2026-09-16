@@ -302,6 +302,40 @@ class TestSeedWallUidGuard:
         # 非队列驻留 uid 种子不受波及
         assert console.seed_wall(["download::2"]) == 1
 
+    @pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
+    def test_rejects_uid_resident_in_backend_queue_only(self, tmp_path, backend_kind):
+        """队列驻留预检补后端持久腿：run 前内存占位为空时以后端队列为真相。
+
+        进程崩溃后队列落盘、新进程重启后在首次 run() 前 seed_wall——内存
+        state 是空占位，若不查后端队列，uid 会写入 wall 并在下次加载时被
+        残留过滤从队列静默删除（作业被吞）。内存/SQLite 双后端同语义。
+        """
+        from tasklite.backend.memory import InMemoryStateBackend
+        from tasklite.backend.sqlite_backend import SQLiteStateBackend
+        from tasklite.engine.console import OpsConsole
+        from tasklite.engine.store import StateStore
+        from tasklite.taxonomy import _DEFAULT_TAXONOMY
+
+        if backend_kind == "memory":
+            backend = InMemoryStateBackend()
+        else:
+            backend = SQLiteStateBackend(tmp_path / "state.db")
+        backend.save_queue([
+            {"task_type": "download", "job_id": "1", "payload": {}, "rerun": "never"},
+        ])
+        # 模拟新进程：store 内存腿保持构造期空占位（队列尚未加载）
+        store = StateStore(backend)
+        assert "download::1" not in store.queue_uids
+        console = OpsConsole(backend, store, _DEFAULT_TAXONOMY)
+
+        with pytest.raises(ValueError, match="queue"):
+            console.seed_wall(["download::1"])
+        # 双腿零写入：后端 wall 无残留，队列行原样保留
+        assert "download::1" not in backend.load_wall()
+        assert len(backend.load_queue()) == 1
+        # 非队列驻留 uid 种子不受波及
+        assert console.seed_wall(["download::2"]) == 1
+
 
 class TestTuningScalarGuard:
     """调优标量合法性校验（resolve_tuning 唯一规范化入口）。

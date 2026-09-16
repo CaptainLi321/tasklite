@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 from .store import DLQEntry, StateStore
 from ..backend.base import AbstractStateBackend
+from ..models.state import uid_from_job_dict
 from ..taxonomy import ErrorTaxonomy, _DEFAULT_TAXONOMY
 
 
@@ -165,11 +166,13 @@ class OpsConsole:
     def seed_wall(self, uids: Sequence[str]) -> int:
         """把 uid 批量写入 wall（存档迁移标记「已处理」），返回实际写入数。
 
-        不变式（六集合互斥）：已在 failed（DLQ）或驻留内存队列的 uid 拒绝
-        种子。预检先于任何写入（backend 持久层与内存 state 双腿零写入），
-        冲突整体拒绝——静默写入会留下 wall∩failed / wall∩queue 非豁免重叠，
-        令下一次状态变更的一致性断言崩溃；DLQ 记录须先经 clear_dlq/
-        clear_history 显式清除，队列驻留须待 run 排空或显式清理后再种子。
+        不变式（六集合互斥）：已在 failed（DLQ）或驻留队列的 uid 拒绝
+        种子。failed 与 queue 两腿均以后端持久层为真相（run 前内存 state
+        是空占位，仅查内存腿会漏掉落盘队列驻留）。预检先于任何写入
+        （backend 持久层与内存 state 双腿零写入），冲突整体拒绝——静默
+        写入会留下 wall∩failed / wall∩queue 非豁免重叠，令下一次状态
+        变更的一致性断言崩溃；DLQ 记录须先经 clear_dlq/clear_history
+        显式清除，队列驻留须待 run 排空或显式清理后再种子。
         """
         if not isinstance(uids, (list, tuple)):
             raise TypeError(
@@ -187,7 +190,8 @@ class OpsConsole:
                     f"seed_wall uid must have non-empty task_type and job_id, got {u!r}"
                 )
         failed = self._backend.load_failed()
-        queue_uids = self._store.queue_uids
+        queue_uids = set(self._store.queue_uids)
+        queue_uids.update(uid_from_job_dict(jd) for jd in self._backend.load_queue())
         conflict_failed = sorted({u for u in uids if u in failed})
         conflict_queue = sorted({u for u in uids if u in queue_uids})
         if conflict_failed:
