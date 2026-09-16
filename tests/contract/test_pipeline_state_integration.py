@@ -51,7 +51,8 @@ class TestPipelineStateCommitContract:
                         "new_jobs": [{"task_type": "test", "job_id": "spawned"}],
                         "resource_suspensions": [],
                         "cursor_updates": {"cursor_key": "cursor_value"},
-                    }, incarnation=self.args[0].incarnation)
+                    }, incarnation=self.args[0].incarnation,
+                       auth_token=getattr(self.args[0], "result_token", None))
 
             def join(self, timeout=None):
                 self._alive = False

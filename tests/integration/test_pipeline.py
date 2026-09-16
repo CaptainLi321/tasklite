@@ -754,7 +754,8 @@ class TestPipelineWeirdCases:
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [],
                     "cursor_updates": {"shared_key": "shared_val"},
-                }, incarnation=spec.incarnation)
+                }, incarnation=spec.incarnation,
+                   auth_token=getattr(spec, "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive
@@ -773,7 +774,8 @@ class TestPipelineWeirdCases:
                 _write_fake_result(spec.ipc_dir, spec.job.uid, {
                     "status": "success", "raw_result": True,
                     "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-                }, incarnation=spec.incarnation)
+                }, incarnation=spec.incarnation,
+                   auth_token=getattr(spec, "result_token", None))
 
             def join(self, timeout=None): self._alive = False
             def is_alive(self): return self._alive

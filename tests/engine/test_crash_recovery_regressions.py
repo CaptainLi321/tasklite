@@ -177,7 +177,8 @@ class TestCommitCrashSignalCleanup:
                         "new_jobs": [],
                         "resource_suspensions": [],
                         "cursor_updates": {},
-                    })
+                    }, incarnation=self.args[0].incarnation,
+                       auth_token=getattr(self.args[0], "result_token", None))
 
             def join(self, timeout=None): pass
             def is_alive(self): return False
