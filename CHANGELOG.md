@@ -10,6 +10,8 @@
 
 ### 修复
 
+- **派发与资源租约**：
+  - `reserve` 的限流二次检查失败改抛专用 `RateLimitUnavailable`（`RuntimeError` 子类，消息不变），派发侧按瞬态信号 defer（零重试预算、`rate_limited_reruns` 计数、短退避降级写盘回队、零污染，实际等待由资源挂起 TTL 承担）——此前调度评估与预约之间恰有残留挂起信号被排空应用时，良性的限流等待被误判为派发故障：计入 3-strike 崩溃预算且异常上抛，穿透事件泵以崩溃终结整 run 并误杀全部在途子进程。
 - **IPC 结果解析容灾**：
   - `read_result` 与逐行声明/信号读取（`read_inputs`/`read_outputs`/`_read_suspend_lines`）的容灾 except 家族纳入 `RecursionError`：深嵌套 JSON 使解析器抛出的递归失控异常不再逃逸「损坏返回 None/跳过坏行」承诺——此前损坏结果文件可沿 `claim_stale_result` → `restore_stale_result` → 主循环穿透致整管崩溃，且残留文件在认领删除前即抛、重启后崩溃循环。
 - **IPC 结果文件认证**：

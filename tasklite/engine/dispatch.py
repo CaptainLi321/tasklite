@@ -37,7 +37,7 @@ from ..models.job import Job, JobRuntimeState
 from ..taxonomy import ErrorTaxonomy
 from .channel import ArtifactCleanupMode, JobHandle, WorkerLaunchSpec
 from .inflight import InFlightJob
-from .resource import persist_resource_suspensions
+from .resource import RateLimitUnavailable, persist_resource_suspensions
 from .scheduler import DeadlockAttribution
 
 logger = logging.getLogger("tasklite")
@@ -452,6 +452,18 @@ class DispatchMachine:
             # 不在此 save_queue：内存此刻缺其他 in-flight 作业，
             # 交给 _run_loop 的 _save_queue_crash_safe 合并磁盘真相后统一保存。
             raise
+        except RateLimitUnavailable as e:
+            # 评估与预约之间应用的限流挂起（关 5 残留信号排空）使二次检查
+            # 失败——瞬态等待信号：零预算 + 短退避降级写盘回队 + 零污染，
+            # 实际等待由资源挂起 TTL 承担，绝不计入 3-strike 崩溃计数。
+            logger.warning(
+                f"Deferring {uid}: rate limit re-check failed at reserve "
+                f"({e}); requeue with short backoff."
+            )
+            self._store.record_stat("rate_limited_reruns", 1)
+            self._policy.plan_orphan_defer(job_dict)
+            store.requeue_jobs([job_dict], front=True)
+            return None
         except Exception as e:
             logger.error(f"Error dispatching job {uid}: {e}\n{traceback.format_exc()}")
             if handle is not None:

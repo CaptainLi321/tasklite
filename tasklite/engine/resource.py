@@ -23,6 +23,15 @@ _MAX_SUSPEND_SECONDS = 86400.0  # 24h
 META_RESOURCE_SUSPENDS = "resource_suspends"
 
 
+class RateLimitUnavailable(RuntimeError):
+    """reserve 预检发现 RateLimitResource 处于限流等待窗（瞬态信号）。
+
+    语义边界：只表达「此刻不可预约、稍后自动恢复」——等待由资源挂起
+    TTL / 令牌窗承担，调用方必须按瞬态信号处理（短退避回队、不烧
+    重试预算），不得与派发故障混流计崩溃计数。
+    """
+
+
 def persist_resource_suspensions(backend: Any, resource_mgr: "ResourceManager") -> None:
     """把资源挂起截止时刻原子落盘到 meta 表（completion/recovery 共享助手）。
 
@@ -467,7 +476,7 @@ class ResourceManager(MutableMapping[str, Resource]):
                 if isinstance(res, RateLimitResource):
                     ok, wait_time = res.can_acquire(amount)
                     if not ok:
-                        raise RuntimeError(
+                        raise RateLimitUnavailable(
                             f"RateLimitResource '{res_name}' not available (wait {wait_time:.2f}s)"
                         )
                     rate_limits.append((res_name, amount))
