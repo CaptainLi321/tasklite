@@ -33,6 +33,7 @@
   - `TaskLite.backend` setter 入口类型校验：非 `AbstractStateBackend` 实例（如后端名字符串、`None`）构造期即抛 `TypeError`，不再延迟到管理 API 调用才以 `AttributeError` 爆发。
 - **调优标量合法性**：
   - `resolve_tuning` 对三参数调优标量增加合法性域校验（fail-loud）：`dep_grace_seconds` 必须为有限正值（`0`/负值/`NaN`/`inf` 会导致依赖宽限立即误杀或永不裁决活锁）；`commit_failure_dlq_threshold` 与 `deadlock_gap_max_rounds` 必须为 `>= 1` 的整数（`0` 会导致零轮即升级整队列死锁）。
+  - `resolve_tuning` 类型严格化：轮次阈值仅接受真 `int`（bool、任意浮点与数字字符串 `TypeError` 拒绝），`dep_grace_seconds` 仅接受数值类型（bool/str 等拒绝）——此前 `int()`/`float()` 强转使 `deadlock_gap_max_rounds=1.9` 静默截断为 1（零恢复窗口，无根因死锁首轮即整队 DLQ），`"5"` 等数字字符串让类型漂移无告警穿透合法性域。
 - **HTTP 守卫与快照**：
   - `HttpExecutor` 本地就地重试退避改为指数形状（基数 × 2^(n-1)）并封顶 300 秒、叠加 ±25% 抖动，与引擎重试退避策略一致；线性无上限退避在大 `max_retries` 下不再累计出巨量睡眠。
   - `http_guard` 的 429 挂起入口故障（如未注册资源名的 `ValueError`、非法时长的 `TypeError`）与限流信号解耦：挂起失败降级为告警日志，瞬态 `RateLimitHit` 原样抛出，不再被入口校验异常覆盖（避免烧重试预算进死信队列且挂起信号丢失）。

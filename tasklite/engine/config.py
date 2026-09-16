@@ -40,14 +40,21 @@ def resolve_tuning(
 ) -> Tuning:
     """调优标量规范化（与 RunConfig.resolve 共用同一真相源）。
 
-    合法性域：dep_grace_seconds 有限正值（0/负 → 依赖宽限立即判死；
-    NaN 比较恒 False / inf → 宽限永不裁决活锁）；两个轮次阈值为正整数
-    （0 → 提交失败或无根因零轮即升级整队列 DLQ，丧失恢复窗口）。
+    合法性域：dep_grace_seconds 有限正实数（仅 int/float，bool/str 等
+    非数值类型 TypeError；0/负 → 依赖宽限立即判死；NaN 比较恒 False /
+    inf → 宽限永不裁决活锁）；两个轮次阈值为正整数（仅真 int——bool、
+    浮点与数字字符串一律 TypeError：浮点截断（如 1.9 → 1）会静默落入
+    「零恢复窗口」致命域，字符串强转则让类型漂移无告警穿透）。
     """
-    grace = (
-        float(dep_grace_seconds)
-        if dep_grace_seconds is not None else DEP_GRACE_SECONDS
-    )
+    if dep_grace_seconds is None:
+        grace = DEP_GRACE_SECONDS
+    else:
+        if isinstance(dep_grace_seconds, bool) or not isinstance(dep_grace_seconds, (int, float)):
+            raise TypeError(
+                f"dep_grace_seconds must be a real number, got "
+                f"{type(dep_grace_seconds).__name__} ({dep_grace_seconds!r})"
+            )
+        grace = float(dep_grace_seconds)
     # 超大 int 转 float 溢出抛 OverflowError（ArithmeticError 子类），
     # 收敛为 ValueError 与其余非法值同路 fail-loud
     try:
@@ -58,19 +65,31 @@ def resolve_tuning(
         raise ValueError(
             f"dep_grace_seconds must be a finite number > 0, got {dep_grace_seconds!r}"
         )
-    threshold = (
-        int(commit_failure_dlq_threshold)
-        if commit_failure_dlq_threshold is not None else COMMIT_FAILURE_DLQ_THRESHOLD
-    )
+    if commit_failure_dlq_threshold is None:
+        threshold = COMMIT_FAILURE_DLQ_THRESHOLD
+    else:
+        if not isinstance(commit_failure_dlq_threshold, int) or isinstance(commit_failure_dlq_threshold, bool):
+            raise TypeError(
+                f"commit_failure_dlq_threshold must be an int, got "
+                f"{type(commit_failure_dlq_threshold).__name__} "
+                f"({commit_failure_dlq_threshold!r})"
+            )
+        threshold = commit_failure_dlq_threshold
     if threshold < 1:
         raise ValueError(
             f"commit_failure_dlq_threshold must be an int >= 1, "
             f"got {commit_failure_dlq_threshold!r}"
         )
-    gap_rounds = (
-        int(deadlock_gap_max_rounds)
-        if deadlock_gap_max_rounds is not None else DEADLOCK_GAP_MAX_ROUNDS
-    )
+    if deadlock_gap_max_rounds is None:
+        gap_rounds = DEADLOCK_GAP_MAX_ROUNDS
+    else:
+        if not isinstance(deadlock_gap_max_rounds, int) or isinstance(deadlock_gap_max_rounds, bool):
+            raise TypeError(
+                f"deadlock_gap_max_rounds must be an int, got "
+                f"{type(deadlock_gap_max_rounds).__name__} "
+                f"({deadlock_gap_max_rounds!r})"
+            )
+        gap_rounds = deadlock_gap_max_rounds
     if gap_rounds < 1:
         raise ValueError(
             f"deadlock_gap_max_rounds must be an int >= 1, "

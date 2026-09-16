@@ -352,6 +352,31 @@ class TestTuningScalarGuard:
         with pytest.raises(ValueError, match="dep_grace_seconds"):
             resolve_tuning(dep_grace_seconds=bad)
 
+    @pytest.mark.parametrize("bad", [2.9, 1.5, 3.0, "3", True, b"3", object()])
+    def test_rejects_non_int_commit_failure_threshold(self, bad):
+        """轮次阈值仅真 int 合法：浮点截断（2.9 → 2）与数字字符串强转均为类型错误。"""
+        from tasklite.engine.config import resolve_tuning
+        with pytest.raises(TypeError, match="commit_failure_dlq_threshold"):
+            resolve_tuning(commit_failure_dlq_threshold=bad)
+
+    @pytest.mark.parametrize("bad", [1.9, 1.0, "5", True])
+    def test_rejects_non_int_deadlock_gap_rounds(self, bad):
+        """gap 阈值仅真 int 合法：1.9 截断为 1 即零恢复窗口，必须显式拒绝。"""
+        from tasklite.engine.config import resolve_tuning
+        with pytest.raises(TypeError, match="deadlock_gap_max_rounds"):
+            resolve_tuning(deadlock_gap_max_rounds=bad)
+
+    @pytest.mark.parametrize("bad", ["5", True, object()])
+    def test_rejects_non_numeric_dep_grace_seconds(self, bad):
+        """宽限秒仅数值类型合法（int/float），bool 与数字字符串为类型错误。"""
+        from tasklite.engine.config import resolve_tuning
+        with pytest.raises(TypeError, match="dep_grace_seconds"):
+            resolve_tuning(dep_grace_seconds=bad)
+
+    def test_dep_grace_accepts_integral_seconds(self):
+        from tasklite.engine.config import resolve_tuning
+        assert resolve_tuning(dep_grace_seconds=5).dep_grace_seconds == 5.0
+
     def test_rejects_invalid_commit_failure_threshold(self, tmp_path):
         with pytest.raises(ValueError, match="commit_failure_dlq_threshold"):
             TaskLite(name="t", state_dir=tmp_path / "s", commit_failure_dlq_threshold=0)
