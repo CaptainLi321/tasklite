@@ -10,6 +10,8 @@
 
 ### 修复
 
+- **死锁治理（DeadlockGovernor）**：
+  - 缺口升级计数（`deadlock_gap_rounds`）改为随 episode 终结清零：仲裁回到正常等待结论（`none`）、依赖宽限裁决（`grace_waiting`）或派发前进信号（`note_dispatch_progress`）时计数归零——此前计数跨 episode 累积，长运行中两次不相关的分类缺口（队列拓扑抖动即可产生非连续缺口）累计达阈值后，新缺口第 1 轮即把整个存活队列误升级 DLQ（`DEADLOCK_CLASSIFICATION_GAP`），「连续 N 轮才升级」的恢复窗口承诺失真。
 - **派发与资源租约**：
   - `reserve` 的限流二次检查失败改抛专用 `RateLimitUnavailable`（`RuntimeError` 子类，消息不变），派发侧按瞬态信号 defer（零重试预算、`rate_limited_reruns` 计数、短退避降级写盘回队、零污染，实际等待由资源挂起 TTL 承担）——此前调度评估与预约之间恰有残留挂起信号被排空应用时，良性的限流等待被误判为派发故障：计入 3-strike 崩溃预算且异常上抛，穿透事件泵以崩溃终结整 run 并误杀全部在途子进程。
 - **IPC 结果解析容灾**：

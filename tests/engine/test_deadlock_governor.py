@@ -33,6 +33,87 @@ def test_deadlock_governor_gap_escalation():
     assert gov.deadlock_gap_rounds == 3
 
 
+def test_gap_rounds_reset_on_normal_wait_arbitration():
+    """缺口升级计数只统计连续轮次：仲裁回到正常等待结论即终结 gap episode。
+
+    缺口（分类盲区）轮次间队列若恢复为有限等待/退避（仲裁裁决 none），
+    说明上一缺口已消解——计数跨 episode 累积会让全新成因的缺口第 1 轮
+    即升级整队列 DLQ，恢复窗口承诺（连续 N 轮才升级）失真。
+    """
+    import types
+    from unittest.mock import MagicMock
+
+    gov = DeadlockGovernor(deadlock_gap_max_rounds=5)
+    mock_store = MagicMock()
+    sched_gap = types.SimpleNamespace(min_wait=float("inf"))
+    sched_normal = types.SimpleNamespace(min_wait=2.0, waiting_for_dependency=False)
+
+    # episode 1：4 轮缺口（未达阈值）
+    for _ in range(4):
+        assert gov.arbitrate(sched_gap, mock_store).action == "gap_retrying"
+    assert gov.deadlock_gap_rounds == 4
+
+    # 队列恢复为正常有限等待（仲裁裁决 none）→ 上一缺口 episode 终结
+    assert gov.arbitrate(sched_normal, mock_store).action == "none"
+    assert gov.deadlock_gap_rounds == 0
+
+    # episode 2：全新成因的缺口第 1 轮必须从零计数，不得立即升级
+    decision = gov.arbitrate(sched_gap, mock_store)
+    assert decision.action == "gap_retrying"
+    assert gov.deadlock_gap_rounds == 1
+
+
+def test_gap_rounds_reset_on_dispatch_progress():
+    """派发前进信号终结 gap episode：缺口轮次间队列有作业被派发即重新计数。
+
+    缺口消解后仲裁可能不再被触发（队列恢复可运行、持续派发），计数若
+    不随前进信号清零，长运行中两次不相关缺口会累计触发整队列误 DLQ。
+    """
+    gov = DeadlockGovernor(deadlock_gap_max_rounds=5)
+    for _ in range(4):
+        assert gov.check_gap_or_escalate("gap") is False
+    assert gov.deadlock_gap_rounds == 4
+
+    # 缺口消解：队列恢复派发前进
+    gov.note_dispatch_progress()
+    assert gov.deadlock_gap_rounds == 0
+
+    # 全新缺口 episode 第 1 轮不升级
+    assert gov.check_gap_or_escalate("gap") is False
+    assert gov.deadlock_gap_rounds == 1
+
+
+def test_gap_rounds_reset_on_grace_waiting_conclusion():
+    """缺口轮次间的依赖宽限裁决（非缺口结论）同样终结 gap episode。"""
+    import types
+    from unittest.mock import MagicMock
+
+    gov = DeadlockGovernor(dep_grace_seconds=60.0, deadlock_gap_max_rounds=5)
+    state = PipelineState(
+        wall={}, failed={}, cursors={},
+        queue=[Job("t", "b", depends_on=["t::x"]).to_dict()],
+    )
+    mock_store = MagicMock()
+    mock_store.state = state
+    sched_gap = types.SimpleNamespace(min_wait=float("inf"))
+    sched_missing = types.SimpleNamespace(
+        min_wait=float("inf"),
+        missing_dependency_uids={"t::b"},
+        has_potential_spawners=True,
+    )
+
+    for _ in range(4):
+        assert gov.arbitrate(sched_gap, mock_store).action == "gap_retrying"
+
+    # 缺口转为可归因的缺失依赖等待（宽限裁决，非缺口结论）→ 计数终结
+    assert gov.resolve_deadlock(sched_missing, mock_store).action == "grace_waiting"
+    assert gov.deadlock_gap_rounds == 0
+
+    # 宽限到期后缺口复发 → 从零计数，不立即升级
+    assert gov.arbitrate(sched_gap, mock_store).action == "gap_retrying"
+    assert gov.deadlock_gap_rounds == 1
+
+
 def test_deadlock_governor_grace_period():
     gov = DeadlockGovernor(dep_grace_seconds=5.0)
     # job a depends on missing b, but job c has no missing dependencies

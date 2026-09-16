@@ -91,10 +91,12 @@ class DeadlockGovernor:
         不变式：任何成功派发都证明此前的等待者已消解，残留 deadline 严禁
         泄漏进同缺失集合的后续 episode——复发落在 (deadline, deadline+宽限窗]
         内时时间启发式无法区分残留与活跃 episode，零宽限批量误杀只能靠
-        消解侧终结点消除。
+        消解侧终结点消除。缺口升级计数同理随前进清零（缺口升级只统计
+        连续轮次，见 check_gap_or_escalate）。
         """
         if self.dep_grace_deadline is not None:
             self._end_grace_episode()
+        self.deadlock_gap_rounds = 0
 
     def check_dependency_grace(
         self,
@@ -285,6 +287,7 @@ class DeadlockGovernor:
         3. 否则认定为正常等待或背压，返回 action="none"。
         """
         if sched is None:
+            self.deadlock_gap_rounds = 0
             return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
 
         # DispatchOutcome → ScheduleResult 透明解包（输入多态，非状态回查）
@@ -304,6 +307,9 @@ class DeadlockGovernor:
                 )
                 return self.resolve_deadlock(sched, store=store)
 
+        # 正常等待/背压结论（有限等待且无环）证明上一缺口 episode 已消解——
+        # 缺口升级只统计连续轮次，非连续缺口从零计数
+        self.deadlock_gap_rounds = 0
         return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
 
     def resolve_deadlock(
@@ -343,6 +349,8 @@ class DeadlockGovernor:
                 scheduler=scheduler,
                 grace_seconds=effective_grace,
             ):
+                # 可归因的宽限等待（非缺口结论）终结上一缺口 episode
+                self.deadlock_gap_rounds = 0
                 return DeadlockDecision(
                     action="grace_waiting",
                     should_terminate=False,
