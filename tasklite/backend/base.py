@@ -4,28 +4,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..taxonomy import (
-    ERR_COMMIT_FAILURE_DLQ,
-    ERR_DEADLOCK_GAP,
-    ERR_DEPENDENCY_DEADLOCK,
-    ERR_DISPATCH_FAILURE,
-    ERR_JOB_DEPENDENCY,
-    ERR_MALFORMED_JOB,
-    ERR_MAX_RETRIES,
-    ERR_NO_HANDLER,
-    ERR_PAYLOAD_VALIDATION,
-    ERR_RESOURCE_DEADLOCK,
-    ERROR_TYPE_COMMIT_FAILURE,
-    ERROR_TYPE_DEADLOCK,
-    ERROR_TYPE_DEPENDENCY,
-    ERROR_TYPE_DISPATCH,
-    ERROR_TYPE_FATAL,
-    ERROR_TYPE_NO_HANDLER,
-    ERROR_TYPE_TRANSIENT_EXHAUSTED,
-    ERROR_TYPE_UNKNOWN,
-    ERROR_TYPE_VALIDATION,
-    classify_error_type,
-)
+from ..taxonomy import classify_error_type
 
 
 def validate_queue_replacement(jobs: Any) -> None:
