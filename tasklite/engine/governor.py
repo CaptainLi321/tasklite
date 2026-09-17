@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
+from .scheduler import StandstillFacts
 from ..taxonomy import (
     ERR_DEADLOCK_GAP,
     ERR_DEPENDENCY_DEADLOCK,
@@ -230,32 +231,6 @@ class DeadlockGovernor:
         )
         return True
 
-    def _extract_deadlock_uids(
-        self,
-        sched: Any,
-        field_name: str,
-    ) -> Set[str]:
-        """统一提取归因 UID 集合（支持 ScheduleResult 与 DispatchOutcome 透明解包）。"""
-        inner_sched = getattr(sched, "sched", None) or sched
-        attr = (
-            getattr(inner_sched, "attribution", None)
-            or getattr(inner_sched, "deadlock_attribution", None)
-            or getattr(sched, "deadlock_attribution", None)
-        )
-        if attr is not None and hasattr(attr, field_name):
-            uids = getattr(attr, field_name)
-            if uids:
-                return set(uids)
-        if hasattr(inner_sched, field_name):
-            uids = getattr(inner_sched, field_name)
-            if uids:
-                return set(uids)
-        if hasattr(sched, field_name):
-            uids = getattr(sched, field_name)
-            if uids:
-                return set(uids)
-        return set()
-
     @staticmethod
     def _split_deadlock_by_uids(
         queue: List[Dict[str, Any]],
@@ -275,37 +250,32 @@ class DeadlockGovernor:
 
     def arbitrate(
         self,
-        sched: Any,
+        facts: Optional[StandstillFacts],
         store: "StateStore",
     ) -> DeadlockDecision:
         """自闭环死锁仲裁单一入口。
 
-        评估调度结果：
+        评估停摆事实：
         1. 若 min_wait == inf，直接触发 resolve_deadlock 进行细粒度归因与批量熔断；
         2. 若 min_wait 为有限值，但处于 waiting_for_dependency 且存在拓扑成环（find_dependency_cycles），
            自动识别隐式死锁并触发 resolve_deadlock；
         3. 否则认定为正常等待或背压，返回 action="none"。
         """
-        if sched is None:
+        if facts is None:
             self.deadlock_gap_rounds = 0
             return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
 
-        # DispatchOutcome → ScheduleResult 透明解包（输入多态，非状态回查）
-        inner_sched = getattr(sched, "sched", None) or sched
-        min_wait = getattr(inner_sched, "min_wait", getattr(sched, "min_wait", float("inf")))
+        if facts.min_wait == float("inf"):
+            return self.resolve_deadlock(facts, store=store)
 
-        if min_wait == float("inf"):
-            return self.resolve_deadlock(sched, store=store)
-
-        waiting_for_dep = getattr(inner_sched, "waiting_for_dependency", getattr(sched, "waiting_for_dependency", False))
-        if waiting_for_dep and store.state is not None:
+        if facts.waiting_for_dependency and store.state is not None:
             cycle_uids = store.state.find_dependency_cycles()
             if cycle_uids:
                 logger.error(
                     f"Deadlock detected during backoff/wait: dependency cycle "
                     f"{sorted(set(cycle_uids))} masked by finite min_wait."
                 )
-                return self.resolve_deadlock(sched, store=store)
+                return self.resolve_deadlock(facts, store=store)
 
         # 正常等待/背压结论（有限等待且无环）证明上一缺口 episode 已消解——
         # 缺口升级只统计连续轮次，非连续缺口从零计数
@@ -314,7 +284,7 @@ class DeadlockGovernor:
 
     def resolve_deadlock(
         self,
-        sched: Any,
+        facts: StandstillFacts,
         store: "StateStore",
         *,
         scheduler: Optional[Any] = None,
@@ -324,11 +294,11 @@ class DeadlockGovernor:
         effective_grace = self.dep_grace_seconds
         effective_gap_max = self.deadlock_gap_max_rounds
 
-        inner_sched = getattr(sched, "sched", None) or sched
-        malformed_uids = self._extract_deadlock_uids(sched, "malformed_uids")
-        unknown_uids = self._extract_deadlock_uids(sched, "unknown_resource_uids")
-        missing_uids = self._extract_deadlock_uids(sched, "missing_dependency_uids")
-        impossible_uids = self._extract_deadlock_uids(sched, "impossible_resource_uids")
+        attr = facts.attribution
+        malformed_uids = set(attr.malformed_uids)
+        unknown_uids = set(attr.unknown_resource_uids)
+        missing_uids = set(attr.missing_dependency_uids)
+        impossible_uids = set(attr.impossible_resource_uids)
 
         if malformed_uids:
             logger.error(f"Deadlock: {len(malformed_uids)} job(s) have malformed dict (unparseable).")
@@ -341,7 +311,7 @@ class DeadlockGovernor:
                 list(effective_state.queue), unknown_uids, ERR_RESOURCE_DEADLOCK
             )
         elif missing_uids:
-            has_spawners = getattr(inner_sched, "has_potential_spawners", getattr(sched, "has_potential_spawners", None))
+            has_spawners = facts.has_potential_spawners
             if self.check_dependency_grace(
                 effective_state,
                 missing_uids,
@@ -365,7 +335,7 @@ class DeadlockGovernor:
             uids_metas, remaining_queue = self._split_deadlock_by_uids(
                 list(effective_state.queue), impossible_uids, ERR_RESOURCE_DEADLOCK
             )
-        elif getattr(inner_sched, "waiting_for_dependency", getattr(sched, "waiting_for_dependency", False)):
+        elif facts.waiting_for_dependency:
             cycle_uids = set(effective_state.find_dependency_cycles())
             if not cycle_uids:
                 escalated = self.check_gap_or_escalate(

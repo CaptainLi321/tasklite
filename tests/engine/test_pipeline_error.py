@@ -826,14 +826,13 @@ class TestDeadlockFallbackConservative:
     """
 
     def _sched(self, **kwargs):
-        import types
+        from tasklite.engine.scheduler import DeadlockAttribution, StandstillFacts
         base = dict(
-            malformed_uids=(), unknown_resource_uids=(),
-            missing_dependency_uids=(), impossible_resource_uids=(),
+            attribution=DeadlockAttribution(),
             waiting_for_dependency=False,
         )
         base.update(kwargs)
-        return types.SimpleNamespace(**base)
+        return StandstillFacts(**base)
 
     def _queue_two_jobs(self, tmp_path):
         pipeline = make_pipeline(tmp_path)
@@ -927,11 +926,8 @@ class TestDeadlockGapEscalation:
         )
         pipeline._runtime.store.set_state(state)
         state.find_dependency_cycles = lambda: []
-        sched = types.SimpleNamespace(
-            malformed_uids=(), unknown_resource_uids=(),
-            missing_dependency_uids=(), impossible_resource_uids=(),
-            waiting_for_dependency=True,
-        )
+        from tasklite.engine.scheduler import StandstillFacts
+        sched = StandstillFacts(waiting_for_dependency=True)
         decision = pipeline._runtime.governor.resolve_deadlock(sched, store=pipeline._runtime.store)
         assert not decision
         assert decision.should_terminate is False

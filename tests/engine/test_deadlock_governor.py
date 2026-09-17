@@ -2,6 +2,7 @@
 
 from tasklite import Job
 from tasklite.engine.governor import DeadlockGovernor
+from tasklite.engine.scheduler import DeadlockAttribution, StandstillFacts
 from tasklite.models.state import PipelineState
 from tasklite.taxonomy import (
     ERR_DEADLOCK_GAP,
@@ -45,8 +46,8 @@ def test_gap_rounds_reset_on_normal_wait_arbitration():
 
     gov = DeadlockGovernor(deadlock_gap_max_rounds=5)
     mock_store = MagicMock()
-    sched_gap = types.SimpleNamespace(min_wait=float("inf"))
-    sched_normal = types.SimpleNamespace(min_wait=2.0, waiting_for_dependency=False)
+    sched_gap = StandstillFacts(min_wait=float("inf"))
+    sched_normal = StandstillFacts(min_wait=2.0, waiting_for_dependency=False)
 
     # episode 1：4 轮缺口（未达阈值）
     for _ in range(4):
@@ -95,10 +96,10 @@ def test_gap_rounds_reset_on_grace_waiting_conclusion():
     )
     mock_store = MagicMock()
     mock_store.state = state
-    sched_gap = types.SimpleNamespace(min_wait=float("inf"))
-    sched_missing = types.SimpleNamespace(
+    sched_gap = StandstillFacts(min_wait=float("inf"))
+    sched_missing = StandstillFacts(
         min_wait=float("inf"),
-        missing_dependency_uids={"t::b"},
+        attribution=DeadlockAttribution(missing_dependency_uids=("t::b",)),
         has_potential_spawners=True,
     )
 
@@ -199,7 +200,7 @@ def test_deadlock_governor_arbitrate(tmp_path):
         wall={}, failed={}, cursors={},
         queue=[Job("t", "a", depends_on=["t::b"]).to_dict()],
     )
-    sched_backoff = types.SimpleNamespace(
+    sched_backoff = StandstillFacts(
         min_wait=2.0,
         waiting_for_dependency=False,
     )
@@ -219,7 +220,7 @@ def test_deadlock_governor_arbitrate(tmp_path):
             Job("t", "b", depends_on=["t::a"]).to_dict(),
         ],
     )
-    sched_cycle = types.SimpleNamespace(
+    sched_cycle = StandstillFacts(
         min_wait=1.5,
         waiting_for_dependency=True,
     )
@@ -365,9 +366,9 @@ def test_resolve_deadlock_relapse_after_progress_gets_full_grace():
     )
     mock_store = MagicMock()
     mock_store.state = state
-    sched = types.SimpleNamespace(
+    sched = StandstillFacts(
         min_wait=float("inf"),
-        missing_dependency_uids={"t::b"},
+        attribution=DeadlockAttribution(missing_dependency_uids=("t::b",)),
         has_potential_spawners=True,
     )
 
@@ -403,16 +404,19 @@ def test_runtime_step_dispatch_progress_ends_grace_episode(tmp_path, monkeypatch
     ))
     calls = {"n": 0}
 
+    from tasklite.engine.dispatch import DispatchOutcome
+    from tasklite.engine.scheduler import StandstillFacts
+
     def fake_dispatch_next():
         calls["n"] += 1
         if calls["n"] == 1:
-            return types.SimpleNamespace(
+            return DispatchOutcome(
                 entry=object(), has_runnable=True, worker_wait=0.0,
-                min_wait=0.0, should_continue=True,
+                standstill=StandstillFacts(min_wait=0.0), should_continue=True,
             )
-        return types.SimpleNamespace(
+        return DispatchOutcome(
             entry=None, has_runnable=False, worker_wait=0.0,
-            min_wait=float("inf"), should_continue=False,
+            standstill=StandstillFacts(min_wait=float("inf")), should_continue=False,
         )
 
     monkeypatch.setattr(runtime._dispatch, "dispatch_next", fake_dispatch_next)

@@ -38,30 +38,26 @@ from ..taxonomy import ErrorTaxonomy
 from .channel import ArtifactCleanupMode, JobHandle, WorkerLaunchSpec
 from .inflight import InFlightJob
 from .resource import RateLimitUnavailable, apply_suspend_signals
-from .scheduler import DeadlockAttribution
+from .scheduler import StandstillFacts
 
 logger = logging.getLogger("tasklite")
 
 
 @dataclass(frozen=True)
 class DispatchOutcome:
-    """一次调度派发周期的不可变决策结果（彻底解耦整型下标与底层调度 DTO）。"""
+    """一次调度派发周期的不可变决策结果（彻底解耦整型下标与底层调度 DTO）。
+
+    ``standstill`` 是 ScheduleResult 的停摆投影（governor 仲裁输入唯一
+    形状），构造期一次性投影——pacing 与 governor 从同一份事实读取，
+    不存在扁平字段与内嵌 sched 的两份真相。
+    """
     entry: Optional[InFlightJob] = None
     has_runnable: bool = False
     should_continue: bool = True
     worker_wait: float = 0.0
-    min_wait: float = 0.0
-    waiting_for_dependency: bool = False
-    has_potential_spawners: bool = False
-    deadlock_attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
+    standstill: StandstillFacts = field(default_factory=StandstillFacts)
     dispatched: bool = False
     handled: bool = False
-    sched: Optional[Any] = None
-
-    @property
-    def attribution(self) -> DeadlockAttribution:
-        """死锁归因值对象属性别名（兼容 StateStore.handle_deadlock 读取）。"""
-        return self.deadlock_attribution
 
 
 class DispatchMachine:
@@ -116,10 +112,9 @@ class DispatchMachine:
                 has_runnable=True,
                 should_continue=False,
                 worker_wait=worker_wait,
-                min_wait=0.0,
+                standstill=StandstillFacts(min_wait=0.0),
                 dispatched=False,
                 handled=False,
-                sched=None,
             )
 
         in_flight_uids = store.in_flight_uids
@@ -130,13 +125,9 @@ class DispatchMachine:
                 has_runnable=False,
                 should_continue=False,
                 worker_wait=0.0,
-                min_wait=sched.min_wait,
-                waiting_for_dependency=sched.waiting_for_dependency,
-                has_potential_spawners=sched.has_potential_spawners,
-                deadlock_attribution=sched.attribution,
+                standstill=sched.standstill_facts(),
                 dispatched=False,
                 handled=False,
-                sched=sched,
             )
 
         entry = self.dispatch_job(sched)
@@ -146,10 +137,9 @@ class DispatchMachine:
                 has_runnable=True,
                 should_continue=True,
                 worker_wait=0.0,
-                min_wait=0.0,
+                standstill=StandstillFacts(min_wait=0.0),
                 dispatched=False,
                 handled=True,
-                sched=sched,
             )
 
         return DispatchOutcome(
@@ -157,10 +147,9 @@ class DispatchMachine:
             has_runnable=True,
             should_continue=True,
             worker_wait=0.0,
-            min_wait=0.0,
+            standstill=StandstillFacts(min_wait=0.0),
             dispatched=True,
             handled=True,
-            sched=sched,
         )
 
     def _reject_and_commit(

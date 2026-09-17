@@ -54,6 +54,7 @@ from .resource import (  # noqa: E402
     ResourceManager,
 )
 from .scheduler import JobScheduler  # noqa: E402
+from .dispatch import DispatchMachine, DispatchOutcome  # noqa: E402
 from .session import RunSession  # noqa: E402
 from ..backend.base import AbstractStateBackend  # noqa: E402
 from ..exceptions import _CommitCrashSignal, _JobTerminated  # noqa: E402
@@ -71,7 +72,6 @@ class EngineRuntime:
 
     def __init__(self, config: RunConfig) -> None:
         from .completion import CompletionMachine
-        from .dispatch import DispatchMachine
         from .recovery import RecoveryMachine
 
         self.config = config
@@ -286,7 +286,7 @@ class EngineRuntime:
 
     def _fill_dispatch_pool(
         self, limit: int, draining: bool
-    ) -> Tuple[Optional[Any], float, int]:
+    ) -> Tuple[Optional[DispatchOutcome], float, int]:
         """填池派发（仅非 DRAINING 且未超单步上限）：逐个 dispatch_next，
         有候选则计数继续，断流/无候选即停；worker_wait 聚合取 min
         （多次资源挂起恢复取最早者）。
@@ -294,7 +294,7 @@ class EngineRuntime:
         Returns:
             (最后一次派发结果或 None, worker_wait 最小值或 0, 派发计数)
         """
-        last_outcome: Optional[Any] = None
+        last_outcome: Optional[DispatchOutcome] = None
         worker_wait = 0.0
         dispatched = 0
         if not draining:
@@ -311,7 +311,7 @@ class EngineRuntime:
         return last_outcome, worker_wait, dispatched
 
     def _arbitrate_deadlock(
-        self, last_outcome: Optional[Any], store: StateStore
+        self, last_outcome: Optional[DispatchOutcome], store: StateStore
     ) -> Tuple[bool, bool, float]:
         """无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。
 
@@ -325,7 +325,7 @@ class EngineRuntime:
             if store.is_empty and not self._in_flight:
                 should_terminate = True
             elif not self._in_flight:
-                decision = self.governor.arbitrate(last_outcome, store=self.store)
+                decision = self.governor.arbitrate(last_outcome.standstill, store=self.store)
                 if decision.action == "resolved":
                     deadlock_detected = True
                     if decision.should_terminate:
@@ -395,7 +395,8 @@ class EngineRuntime:
             stop_mode=self._session.stop_mode, has_in_flight=bool(self._in_flight),
             store_empty=store.is_empty, dispatched=dispatched, completed=completed_count,
             has_runnable=last_outcome.has_runnable if last_outcome is not None else True,
-            min_wait=last_outcome.min_wait if last_outcome is not None else float("inf"),
+            min_wait=(last_outcome.standstill.min_wait
+                      if last_outcome is not None else float("inf")),
             worker_wait=worker_wait, deadlock_wait=deadlock_wait,
             should_terminate=should_terminate,
         ))

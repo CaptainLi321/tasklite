@@ -70,6 +70,22 @@ class DeadlockAttribution:
         )
 
 
+@dataclass(frozen=True)
+class StandstillFacts:
+    """停摆投影值对象——死锁仲裁输入的唯一形状（LoopFacts 模式）。
+
+    只携带仲裁评估所需事实（min_wait / 依赖等待 / 潜在派生者 / 归因），
+    不含派发侧字段；DispatchOutcome 构造期从 ScheduleResult 一次性投影，
+    governor 不再鸭子解包多态入参形状。等待决策仍归 pacing.decide_wait，
+    本对象只承载事实不产出决策。
+    """
+
+    min_wait: float = float("inf")
+    waiting_for_dependency: bool = False
+    has_potential_spawners: bool = False
+    attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
+
+
 @dataclass
 class ScheduleResult:
     """Outcome of a read-only scan over the queue.
@@ -123,6 +139,15 @@ class ScheduleResult:
     @property
     def impossible_resource_uids(self) -> Tuple[str, ...]:
         return self.attribution.impossible_resource_uids
+
+    def standstill_facts(self) -> StandstillFacts:
+        """投影为 governor 仲裁输入的停摆事实（剔除派发侧字段）。"""
+        return StandstillFacts(
+            min_wait=self.min_wait,
+            waiting_for_dependency=self.waiting_for_dependency,
+            has_potential_spawners=self.has_potential_spawners,
+            attribution=self.attribution,
+        )
 
 
 class JobScheduler:

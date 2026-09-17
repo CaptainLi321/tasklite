@@ -70,8 +70,7 @@ def test_dispatch_next_empty_queue(tmp_path):
     outcome = dispatch.dispatch_next()
     assert outcome.entry is None
     assert outcome.should_continue is False
-    assert outcome.sched is not None
-    assert outcome.sched.runnable_idx is None
+    assert outcome.standstill.min_wait == float("inf")
 
 
 def test_dispatch_next_workers_exhausted(tmp_path):

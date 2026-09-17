@@ -50,7 +50,8 @@ class TestGovernorArbitrateDeepChain:
         gov = DeadlockGovernor()
         state = PipelineState({}, {}, {}, _chain_queue(CHAIN_N))
         store = StateStore(InMemoryStateBackend(), state=state)
-        sched = types.SimpleNamespace(min_wait=1.0, waiting_for_dependency=True)
+        from tasklite.engine.scheduler import StandstillFacts
+        sched = StandstillFacts(min_wait=1.0, waiting_for_dependency=True)
 
         decision = gov.arbitrate(sched, store=store)
 
@@ -68,7 +69,8 @@ class TestGovernorArbitrateDeepChain:
         ]
         store = StateStore(InMemoryStateBackend(), state=PipelineState({}, {}, {}, queue))
         gov = DeadlockGovernor()
-        sched = types.SimpleNamespace(min_wait=1.0, waiting_for_dependency=True)
+        from tasklite.engine.scheduler import StandstillFacts
+        sched = StandstillFacts(min_wait=1.0, waiting_for_dependency=True)
 
         decision = gov.arbitrate(sched, store=store)
 
