@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ..utils.injective import safe_uid_filename
 from ..taxonomy import validate_resource_amounts
@@ -109,30 +109,12 @@ class JobRuntimeState:
     def to_dict(self) -> Dict[str, Any]:
         """导出持久化字典（完全保留 _ 开头与任意 extra 字段）。"""
         d = dict(self.extra)
-        if self.backoff_until is not None:
-            d["_backoff_until"] = self.backoff_until
-        elif "_backoff_until" in d:
-            del d["_backoff_until"]
-
-        if self.backoff_wall_deadline is not None:
-            d["_backoff_wall_deadline"] = self.backoff_wall_deadline
-        elif "_backoff_wall_deadline" in d:
-            del d["_backoff_wall_deadline"]
-
-        if self.commit_failures:
-            d["_commit_failures"] = self.commit_failures
-        elif "_commit_failures" in d:
-            del d["_commit_failures"]
-
-        if self.dispatch_failures:
-            d["_dispatch_failures"] = self.dispatch_failures
-        elif "_dispatch_failures" in d:
-            del d["_dispatch_failures"]
-
-        if self.last_retry_error:
-            d["_last_retry_error"] = self.last_retry_error
-        elif "_last_retry_error" in d:
-            del d["_last_retry_error"]
+        for key, (attr, empty) in _RUNTIME_FIELDS.items():
+            val = getattr(self, attr)
+            if val != empty:
+                d[key] = val
+            else:
+                d.pop(key, None)
         return d
 
     @classmethod
@@ -155,18 +137,10 @@ class JobRuntimeState:
             return extra.pop(key, None)
 
         raw_bu = _pop_val("_backoff_until")
-        backoff_until = (
-            float(raw_bu)
-            if isinstance(raw_bu, (int, float)) and not isinstance(raw_bu, bool) and _is_finite(raw_bu)
-            else None
-        )
+        backoff_until = _coerce_deadline(raw_bu)
 
         raw_wd = _pop_val("_backoff_wall_deadline")
-        backoff_wall_deadline = (
-            float(raw_wd)
-            if isinstance(raw_wd, (int, float)) and not isinstance(raw_wd, bool) and _is_finite(raw_wd)
-            else None
-        )
+        backoff_wall_deadline = _coerce_deadline(raw_wd)
 
         raw_cf = _pop_val("_commit_failures")
         try:
@@ -193,35 +167,19 @@ class JobRuntimeState:
         )
 
     def __getitem__(self, key: str) -> Any:
-        if key == "_backoff_until":
-            if self.backoff_until is not None:
-                return self.backoff_until
+        spec = _RUNTIME_FIELDS.get(key)
+        if spec is not None:
+            val = getattr(self, spec[0])
+            if val is not None:
+                return val
             raise KeyError(key)
-        if key == "_backoff_wall_deadline":
-            if self.backoff_wall_deadline is not None:
-                return self.backoff_wall_deadline
-            raise KeyError(key)
-        if key == "_commit_failures":
-            return self.commit_failures
-        if key == "_dispatch_failures":
-            return self.dispatch_failures
-        if key == "_last_retry_error":
-            return self.last_retry_error
         return self.extra[key]
 
     def __setitem__(self, key: str, value: Any) -> None:
         if key == "_backoff_until":
-            self.backoff_until = (
-                float(value)
-                if isinstance(value, (int, float)) and not isinstance(value, bool) and _is_finite(value)
-                else None
-            )
+            self.backoff_until = _coerce_deadline(value)
         elif key == "_backoff_wall_deadline":
-            self.backoff_wall_deadline = (
-                float(value)
-                if isinstance(value, (int, float)) and not isinstance(value, bool) and _is_finite(value)
-                else None
-            )
+            self.backoff_wall_deadline = _coerce_deadline(value)
         elif key == "_commit_failures":
             self.commit_failures = int(value or 0)
         elif key == "_dispatch_failures":
@@ -232,16 +190,9 @@ class JobRuntimeState:
             self.extra[key] = value
 
     def __contains__(self, key: str) -> bool:
-        if key == "_backoff_until":
-            return self.backoff_until is not None
-        if key == "_backoff_wall_deadline":
-            return self.backoff_wall_deadline is not None
-        if key == "_commit_failures":
-            return bool(self.commit_failures)
-        if key == "_dispatch_failures":
-            return bool(self.dispatch_failures)
-        if key == "_last_retry_error":
-            return bool(self.last_retry_error)
+        spec = _RUNTIME_FIELDS.get(key)
+        if spec is not None:
+            return getattr(self, spec[0]) != spec[1]
         return key in self.extra
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -256,27 +207,33 @@ class JobRuntimeState:
         return self[key]
 
     def pop(self, key: str, default: Any = None) -> Any:
-        if key == "_backoff_until":
-            val = self.backoff_until
-            self.backoff_until = None
-            return val if val is not None else default
-        if key == "_backoff_wall_deadline":
-            val = self.backoff_wall_deadline
-            self.backoff_wall_deadline = None
-            return val if val is not None else default
-        if key == "_commit_failures":
-            val = self.commit_failures
-            self.commit_failures = 0
-            return val if val else default
-        if key == "_dispatch_failures":
-            val = self.dispatch_failures
-            self.dispatch_failures = 0
-            return val if val else default
-        if key == "_last_retry_error":
-            val = self.last_retry_error
-            self.last_retry_error = ""
-            return val if val else default
+        spec = _RUNTIME_FIELDS.get(key)
+        if spec is not None:
+            attr, empty = spec
+            val = getattr(self, attr)
+            setattr(self, attr, empty)
+            return val if val != empty else default
         return self.extra.pop(key, default)
+
+
+# runtime 规范键注册表：框架字段的单一事实源。empty 为「未设置」哨兵
+# （读取等于哨兵时视同缺省、pop 清空回哨兵、to_dict 导出时省略）；
+# 写入侧的规范化（deadline 校验 / 计数与取串）语义各异，保留在各
+# 写入方法内显式表达。
+_RUNTIME_FIELDS: Dict[str, Tuple[str, Any]] = {
+    "_backoff_until": ("backoff_until", None),
+    "_backoff_wall_deadline": ("backoff_wall_deadline", None),
+    "_commit_failures": ("commit_failures", 0),
+    "_dispatch_failures": ("dispatch_failures", 0),
+    "_last_retry_error": ("last_retry_error", ""),
+}
+
+
+def _coerce_deadline(value: Any) -> Optional[float]:
+    """deadline 型规范值在写入校验与容灾解析间共用的规范化：仅有限实数放行。"""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and _is_finite(value):
+        return float(value)
+    return None
 
 
 class Job:
