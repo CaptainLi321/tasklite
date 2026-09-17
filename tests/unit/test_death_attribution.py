@@ -132,3 +132,53 @@ class TestDeathStringClassification:
             error = att.result_meta.get("error")
             if error:
                 assert classify_error_type({"error": error}) == att.dlq_error_type
+
+
+class TestHarvestPathParity:
+    """收割路径对拍不变式：同一根因经「有结果文件解码路径」与「无结果文件
+    终局构造路径」必须得到相同的 meta 形状 / retry_error / 瞬态语义。"""
+
+    @pytest.fixture()
+    def channel(self):
+        from tasklite.engine.channel import ExecutionChannel
+        return ExecutionChannel()
+
+    @staticmethod
+    def _handle(job):
+        from tasklite.engine.channel import JobHandle
+        import time
+        return JobHandle(
+            uid=job.uid, process=None,
+            deadline=time.monotonic() + 60, timeout=30.0,
+            job=job, ipc_dir=None, incarnation="inc",
+        )
+
+    @pytest.mark.parametrize("exitcode", [-9, -11, 1, 0, None])
+    def test_decode_and_terminal_paths_agree(self, channel, exitcode):
+        from types import SimpleNamespace
+
+        from tasklite.engine.channel import _decode_ipc_result
+        from tasklite.models.job import Job
+
+        job = Job("t", "a")
+        p = SimpleNamespace(exitcode=exitcode)
+
+        decoded = _decode_ipc_result({}, p, job)
+        terminal = channel._build_terminal_failure(p, self._handle(job), is_timeout=False)
+
+        assert decoded.result_meta == terminal.result_meta
+        assert decoded.retry_error == terminal.retry_error
+        assert decoded.retry_requested == terminal.retry_requested
+
+    def test_signal_death_meta_is_uniform(self, channel):
+        """-9 双路径均携带 signal/oom_hint 结构化键(形状分歧消除)。"""
+        from types import SimpleNamespace
+
+        from tasklite.engine.channel import _decode_ipc_result
+        from tasklite.models.job import Job
+
+        job = Job("t", "a")
+        p = SimpleNamespace(exitcode=-9)
+        decoded = _decode_ipc_result({}, p, job)
+        assert decoded.result_meta["signal"] == "SIGKILL"
+        assert decoded.result_meta["oom_hint"] is True

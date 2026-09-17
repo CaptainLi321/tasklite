@@ -21,7 +21,7 @@ from ..exceptions import (
     RateLimitHit,
     RetryError,
 )
-from ..taxonomy import classify_exception
+from ..taxonomy import _DEFAULT_TAXONOMY, classify_exception
 from ..models.context import TaskContext
 from ..models.job import Job
 from ..utils.ipc import (
@@ -77,24 +77,6 @@ def _normalize_handler_result(result: Any) -> Tuple[bool, Dict[str, Any]]:
         f"Job will be marked as failed."
     )
     return False, {"error": f"invalid handler return type: {type(result).__name__}"}
-
-
-def _env_death_retry(exitcode: Optional[int]) -> Tuple[Dict[str, Any], str]:
-    """环境性死亡的瞬态归因（result_meta + retry_error）。
-
-    归因契约：正退出码死亡（解释器启动失败/导入段崩溃等）与结果文件
-    缺失/半写（含 claim 路径认领的残留）同属环境瞬态故障，与信号死亡
-    路径对称地消耗重试预算；``exitcode`` 为 None/0 时按无结果归因。
-    """
-    if exitcode is not None and exitcode != 0:
-        return (
-            {"error": f"PROCESS_CRASH_EXITCODE_{exitcode}"},
-            f"PROCESS_CRASH_EXIT: worker exited with code {exitcode}",
-        )
-    return (
-        {"error": "NO_IPC_RESULT"},
-        "NO_IPC_RESULT: worker exited without writing a result file",
-    )
 
 
 def _decode_ipc_result(
@@ -216,11 +198,14 @@ def _decode_ipc_result(
                 _KEY_TRACEBACK: res.get(_KEY_TRACEBACK),
             }
             logger.error(f"Worker Crashed for {job.uid}:\n{res.get(_KEY_TRACEBACK, '')}")
-    elif p is not None and getattr(p, "exitcode", None) is not None and p.exitcode != 0:
-        result_meta, retry_error = _env_death_retry(p.exitcode)
-        retry_requested = True
     else:
-        result_meta, retry_error = _env_death_retry(None)
+        # 无有效结果文件 → 死亡归因全权交决策表（信号死亡与正码崩溃同表同形）
+        att = _DEFAULT_TAXONOMY.attribute_process_death(
+            getattr(p, "exitcode", None), timed_out=False
+        )
+        result_meta = att.result_meta
+        retry_error = att.retry_error
+        retry_requested = att.retry_requested
         retry_requested = True
 
     if success and ipc_dir is not None:
@@ -617,44 +602,22 @@ class ExecutionChannel:
         p: Any, handle: JobHandle, *, is_timeout: bool
     ) -> ExecutionResult:
         """构造进程终止（崩溃/超时）但无结果文件时的 ExecutionResult。"""
-        exitcode = p.exitcode
-        retry_requested = False
-        retry_error: Optional[str] = None
-        if is_timeout:
-            if getattr(handle.job, "timeout_is_transient", False):
-                return ExecutionResult(
-                    success=False,
-                    retry_requested=True,
-                    retry_error=f"TIMEOUT ({handle.timeout}s)",
-                )
-            result_meta = {"error": f"TIMEOUT ({handle.timeout}s)"}
-        elif exitcode is not None and exitcode < 0:
-            try:
-                sig_name = signal.Signals(-exitcode).name
-            except (ValueError, AttributeError):
-                sig_name = f"SIGNO{-exitcode}"
-            result_meta = {
-                "error": f"PROCESS_CRASH_EXITCODE_{exitcode}",
-                "signal": sig_name,
-                "oom_hint": -exitcode == int(signal.SIGKILL),
-            }
-            retry_requested = True
-            retry_error = f"PROCESS_SIGNAL_DEATH: killed by {sig_name} ({exitcode})"
+        att = _DEFAULT_TAXONOMY.attribute_process_death(
+            p.exitcode,
+            timed_out=is_timeout,
+            timeout_seconds=handle.timeout,
+            timeout_is_transient=getattr(handle.job, "timeout_is_transient", False),
+        )
+        if att.retry_requested and "signal" in att.result_meta:
             logger.warning(
-                f"Worker for {handle.uid} died by {sig_name}; will retry with backoff"
+                f"Worker for {handle.uid} died by {att.result_meta['signal']}; "
+                f"will retry with backoff"
             )
-        elif exitcode is not None and exitcode != 0:
-            result_meta, retry_error = _env_death_retry(exitcode)
-            retry_requested = True
-        else:
-            result_meta, retry_error = _env_death_retry(None)
-            retry_requested = True
-
         return ExecutionResult(
             success=False,
-            result_meta=result_meta,
-            retry_requested=retry_requested,
-            retry_error=retry_error,
+            result_meta=att.result_meta,
+            retry_requested=att.retry_requested,
+            retry_error=att.retry_error,
         )
 
     def probe_orphan_lock(self, uid: str) -> bool:
