@@ -105,3 +105,57 @@ class TestSpawnedJobSerializationPrecheck:
 
         # 好子作业正常入队
         assert "t::good" in ctx.store.queue_uids
+
+
+class TestRejectedSpawnedJobSingleExit:
+    def test_completion_hook_fires_exactly_once_per_job(self, tmp_path):
+        """拒绝路径与正常路径共用 complete_job 单一出口。
+
+        父作业（成功）与坏子作业（INVALID_SPAWNED_JOB 终结）各恰好
+        触发一次 on_job_completed，success 标志与实际终态一致——
+        「每个 job 终结时钩子恰好调用一次」是完成事件的明文承诺。
+        """
+        events: list = []
+
+        def hook(uid, meta, success, going_to_retry):
+            events.append((uid, success, going_to_retry))
+
+        gpu = CapacityResource("gpu", 10.0)
+        rm = ResourceManager({"gpu": gpu})
+        channel = ExecutionChannel(str(tmp_path / "ipc"))
+        stats = TaskStats()
+        policy = ExecutionPolicy()
+        backend = InMemoryStateBackend()
+        store = StateStore(
+            backend,
+            state=PipelineState({}, {}, {}, []),
+            taxonomy=ErrorTaxonomy(),
+            stats=stats,
+            policy=policy,
+        )
+        session = RunSession(on_job_completed=hook)
+        session.run_id = "test_run"
+        completion = CompletionMachine(
+            store=store,
+            policy=policy,
+            channel=channel,
+            resources=rm,
+            in_flight=InFlightTracker(),
+            session=session,
+        )
+
+        lease = rm.reserve("t", {"gpu": 1.0}, uid="t::parent")
+        job = Job("t", "parent", resources={"gpu": 1.0})
+        entry = InFlightJob(uid="t::parent", job_dict=job.to_dict(), job=job, lease=lease)
+        completion.complete_job(
+            entry,
+            ExecutionResult(
+                success=True,
+                result_meta={"v": 1},
+                new_jobs=[
+                    Job("t", "bad", payload={"k": {1, 2}}),
+                ],
+            ),
+        )
+
+        assert events == [("t::bad", False, False), ("t::parent", True, False)]
