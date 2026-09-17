@@ -81,6 +81,24 @@ def _normalize_handler_result(result: Any) -> Tuple[bool, Dict[str, Any]]:
     return False, {"error": f"invalid handler return type: {type(result).__name__}"}
 
 
+def _env_death_retry(exitcode: Optional[int]) -> Tuple[Dict[str, Any], str]:
+    """环境性死亡的瞬态归因（result_meta + retry_error）。
+
+    归因契约：正退出码死亡（解释器启动失败/导入段崩溃等）与结果文件
+    缺失/半写（含 claim 路径认领的残留）同属环境瞬态故障，与信号死亡
+    路径对称地消耗重试预算；``exitcode`` 为 None/0 时按无结果归因。
+    """
+    if exitcode is not None and exitcode != 0:
+        return (
+            {"error": f"PROCESS_CRASH_EXITCODE_{exitcode}"},
+            f"PROCESS_CRASH_EXIT: worker exited with code {exitcode}",
+        )
+    return (
+        {"error": "NO_IPC_RESULT"},
+        "NO_IPC_RESULT: worker exited without writing a result file",
+    )
+
+
 def _decode_ipc_result(
     res: dict, p: Any, job: Job, ipc_dir: Optional[str] = None
 ) -> "ExecutionResult":
@@ -196,17 +214,11 @@ def _decode_ipc_result(
             }
             logger.error(f"Worker Crashed for {job.uid}:\n{res.get(_KEY_TRACEBACK, '')}")
     elif p is not None and getattr(p, "exitcode", None) is not None and p.exitcode != 0:
-        success = False
-        result_meta = {"error": f"PROCESS_CRASH_EXITCODE_{p.exitcode}"}
-        # 环境故障与信号死亡同属瞬态：正退出码死亡（解释器启动失败/
-        # 导入段崩溃等）走重试预算，与信号死亡路径对称，不再零重试直判 DLQ
+        result_meta, retry_error = _env_death_retry(p.exitcode)
         retry_requested = True
-        retry_error = f"PROCESS_CRASH_EXIT: worker exited with code {p.exitcode}"
     else:
-        result_meta = {"error": "NO_IPC_RESULT"}
-        # 结果文件缺失/半写（含 claim 路径认领的残留）同属环境瞬态故障
+        result_meta, retry_error = _env_death_retry(None)
         retry_requested = True
-        retry_error = "NO_IPC_RESULT: worker exited without writing a result file"
 
     if success and ipc_dir is not None:
         ok, err = ArtifactJournal(ipc_dir).verify_outputs(job.uid)
@@ -637,15 +649,11 @@ class ExecutionChannel:
                 f"Worker for {handle.uid} died by {sig_name}; will retry with backoff"
             )
         elif exitcode is not None and exitcode != 0:
-            result_meta = {"error": f"PROCESS_CRASH_EXITCODE_{exitcode}"}
-            # 环境故障与信号死亡同属瞬态：正退出码死亡走重试预算，
-            # 与信号死亡路径对称，不再零重试直判 DLQ
+            result_meta, retry_error = _env_death_retry(exitcode)
             retry_requested = True
-            retry_error = f"PROCESS_CRASH_EXIT: worker exited with code {exitcode}"
         else:
-            result_meta = {"error": "NO_IPC_RESULT"}
+            result_meta, retry_error = _env_death_retry(None)
             retry_requested = True
-            retry_error = "NO_IPC_RESULT: worker exited without writing a result file"
 
         return ExecutionResult(
             success=False,
