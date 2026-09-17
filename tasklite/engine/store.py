@@ -298,11 +298,6 @@ class StateStore:
         return uid in self._state.failed
 
     @property
-    def attempted_uids(self) -> Set[str]:
-        """wall∪failed 终态 UID 集合快照。"""
-        return self._state.attempted_uids
-
-    @property
     def is_empty(self) -> bool:
         """队列是否为空。"""
         return self._state.is_empty
@@ -310,10 +305,6 @@ class StateStore:
     def find_dependency_cycles(self) -> List[str]:
         """找出当前队列依赖图中的环成员。"""
         return self._state.find_dependency_cycles()
-
-    def all_known_uids(self) -> Set[str]:
-        """返回当前系统已知全部 UID 集合。"""
-        return self._state.all_known_uids()
 
     def clear_in_flight(self) -> None:
         """清空在途集合并维护重跑豁免集合。"""

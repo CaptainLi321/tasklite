@@ -316,11 +316,6 @@ class PipelineState:
         return self._failed_uids
 
     @property
-    def attempted_uids(self) -> set:
-        """wall∪failed 终态 uid 活索引。"""
-        return self._wall_uids | self._failed_uids
-
-    @property
     def in_flight_uids(self) -> FrozenSet[str]:
         """in-flight 作业 uid 集合。"""
         return frozenset(self._in_flight_uids)
