@@ -30,6 +30,7 @@ from tasklite import (
 | `validate_payload` | `from tasklite.utils import validate_payload` | payload schema 校验 |
 | `sanitize_content_id` | `from tasklite.wrappers.discovery import sanitize_content_id` | content_id 净化（job_id 派生单点） |
 | `http_guard`, `SnapshotStore` 等 | `from tasklite.wrappers.http import http_guard, SQLiteSnapshotStore, ...` | 官方轻量网络守卫与快照工具（见 §16） |
+| `fake_ctx` | `from tasklite.testing import fake_ctx` | handler 单测的官方 TaskContext 构造器（见 §3 末尾） |
 
 `engine/` 与 `backend/` 子包不做再导出（如 `SQLiteStateBackend` 须从 `tasklite.backend.sqlite_backend` 导入）。`engine/config`（RunConfig 装配快照）、`engine/session`（RunSession 生命周期）、`engine/pacing`（等待决策）、`engine/console`（OpsConsole 运维委托）等引擎内部接缝模块不对用户开放——等价公共能力一律经 `TaskLite` 门面与本章 API 提供。
 
@@ -48,11 +49,11 @@ from tasklite import (
 | ③a handler | `register_handler(task_type, fn, default_resources=..., payload_schema=...)` | 签名 `(job, ctx)`；返回 None/True/False/dict/(bool, dict) |
 | ③b discovery | `register_discovery(host, task_type, fetch_func, id_func, process_item_func, process_task_type, ...)` | `host` 实现 `DiscoveryHost` 协议（TaskLite 为默认）；回调必须模块级可 pickle——**注册期即做 pickle 预检**（fail-loud） |
 | ③c 瞬态异常 | `pipeline.register_transient_exception(cls)` | per-pipeline 注册表；模块级 `Exception` 子类；`RetryError`/`FatalError` 子类入口即拒 |
-| ④ 入队 | `enqueue(Job(...))` 或 `enqueue([Job(...)], front=False)` | 单 Job 自动包成列表；在 `run()` 启动前完成；同 uid 静默去重；payload 必须 JSON 可序列化 |
+| ④ 入队 | `enqueue(Job(...))` 或 `enqueue([Job(...)], front=False)` | 单 Job 自动包成列表；在 `run()` 启动前完成；同 uid 静默去重；payload 必须 JSON 可序列化。回溯/增量批量入队先经 `pipeline.uncompleted(jobs)` 过滤已完成（见 §2） |
 | ⑤ 点火 | `run()` | 阻塞至队列排空；首次 SIGTERM 优雅 DRAINING、二次强制 ABORTING；同一 `state_dir` 并发 `run()` 由 pipeline 级文件锁 fail-loud 拒绝 |
 | ⑥ 停机 | `stop(force=False)` / `stop(force=True)` | **请求**停机（非阻塞，由 `run()` 消费）：生产用 DRAINING；`force=True` → ABORTING（见 §7） |
 
-> **run() 期守卫（1.2.0 起代码级强制）**：②③④ 的全部装配/入队 API（`add_resource` / `register_handler` / `register_discovery` / `register_transient_exception` / `enqueue`）以及 §7 全部管理 API，在 `run()` 进行中调用一律抛 `RuntimeError`——「装配仅限 run() 之外」从文档约定升级为代码强制。
+> **run() 期守卫（1.2.0 起代码级强制）**：②③④ 的全部装配/入队 API（`add_resource` / `register_handler` / `register_discovery` / `register_transient_exception` / `enqueue` / `uncompleted`）以及 §7 全部管理 API，在 `run()` 进行中调用一律抛 `RuntimeError`——「装配仅限 run() 之外」从文档约定升级为代码强制。
 >
 > **门面内部属性已于 1.2.0 移除**：`pipeline.store` / `scheduler` / `governor` / `channel` / `state` / `in_flight` 六个内部深模块只读属性与 `pipeline.on_run_start = ...` 等钩子 setter 已随 1.2.0 删除（零外部消费方，弃用窗口豁免）——运维操作请经 §7 管理 API（`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`），其余能力经本章公共 API 等价获得；钩子请在构造期参数传入（见 §10.1），读取可经只读属性。`pipeline.backend`（含 setter）保留。
 
@@ -76,7 +77,20 @@ Job(
 )
 ```
 
-**身份与去重**：Job 的 `uid`（`task_type::job_id`）是身份，`payload` 不参与——enqueue 两个同 uid 不同 payload 的 job 时，后者静默跳过。
+**身份与去重**：Job 的 `uid`（`task_type::job_id`）是身份，`payload` 不参与——enqueue 两个同 uid 不同 payload 的 job 时，后者静默跳过；wall 命中的重入队同样只按 uid 拦截，`payload` 变更**不**触发重跑（`rerun="on_input_change"` 的变更检测也只比对 `declare_input` 的文件指纹，不含 payload）。
+
+**「改了配置为什么不重跑」标准操作**：修改检索式/参数后以同名 job 重跑会被 wall 静默吞掉（身份未变，skip 只计 skipped 统计）。两种官方姿势：
+
+```python
+# 姿势一（推荐）：参数指纹拼进 job_id——参数变 → uid 变 → 自然当新任务执行
+from tasklite import content_fingerprint
+Job("fetch", f"{source}_{content_fingerprint(params)}", payload=params)
+
+# 姿势二：前缀强制重跑——清掉 wall 后重新 enqueue
+pipeline.clear_history("fetch::", where=("wall",))
+```
+
+**回溯/增量的入队前过滤**：批量入队历史 chunk 时，已完成的 uid 应先过滤——不过滤虽不会重复执行（wall 会拦住），但整批以 skipped 统计空转、浪费一轮派发。标准姿势 `pipeline.enqueue(pipeline.uncompleted(jobs))`：`uncompleted` 返回 uid 不在 wall 的子集（保留输入顺序）；DLQ 条目不排除（是否重跑由 `rerun` 策略在派发层裁决），队列驻留重复不排除（`enqueue` 自身按 uid 去重）。
 
 **构造硬约束**（违反即入口抛错，fail-fast）：
 
@@ -124,6 +138,21 @@ Job(
 | 状态查询 | `ctx.is_completed(uid)` / `ctx.is_failed(uid)` | 自己拼 wall/failed 集合 |
 | 下游副作用 | `job.uid`（`task_type::job_id`）作幂等键 | 假设重跑后副作用只执行一次（框架保证 at-least-once，不保证副作用恰好一次） |
 
+**handler 单测的官方构造器**：不要以位置参数直接构造 `TaskContext(job, set(), set(), {})`——内部容器形态属非公开契约，随框架演进变更会击碎下游测试。统一使用：
+
+```python
+from tasklite.testing import fake_ctx
+
+ctx = fake_ctx(job, wall={"download::done"}, resources={"api_x"})
+# tmp_root 模式：在其下创建一次性目录作 output_root（并建 ipc 子目录，
+# declare_output / declare_cache 的产物清单记录随之可用）
+ctx = fake_ctx(job, tmp_root=tmp_path)
+```
+
+- `wall` / `failed` / `cursors`：任意可迭代/映射，内部容器由构造器兜底装配（`is_completed` / `is_failed` / `get_cursor` 的命中源）。
+- `resources`：提供时 `suspend_resource` 按名单 fail-loud 校验（与生产派发路径同语义）；缺省不校验。
+- `fake_ctx` 的参数形态与公开 API 同等对待——变更视为破坏性变更。
+
 ---
 
 ## 4. 资源（Resources）
@@ -159,6 +188,26 @@ pipeline.register_transient_exception(MyApiClientError)   # 此后该异常自�
 - 注册的异常类必须**模块级定义**（可 pickle）——函数内定义的类注册时立即抛 `TypeError`（fail-loud，避免「注册只在父进程生效、子进程静默判死」）。
 - 第三方库异常（如 `requests.exceptions.ConnectionError`）**不是**内置 `ConnectionError` 的子类，需显式注册才会自动重试。
 - 用户注册的瞬态类判定**先于** `FATAL_EXCEPTIONS` 兜底——注册了 FATAL 子类会按瞬态重试。
+
+**长期不可用依赖的耐心重试**：`RetryError` 默认 3 次预算、分钟级退避——对「预期内会长时间离线」的依赖（如桌面端同步服务可能连关数日）会烧完预算进 DLQ。官方组合姿势（依赖恢复后自愈，无需人工 `dlq-clear`）：
+
+```python
+# ① 挂起承担等待：连接失败时先挂起资源再抛瞬态——挂起期间该资源的
+#    队列任务在派发层等待（不烧重试预算，跨重启持久化，上限 24h）
+def handler(job, ctx):
+    try:
+        ...
+    except MyDepUnavailableError:
+        ctx.suspend_resource("zotero", 3600.0)
+        raise RetryError("zotero offline; suspended for 1h")
+
+# ② 放宽该类任务的预算与退避上限
+Job("push", item_id, max_retries=50, backoff_max=3600.0,
+    # ③ 兜底：万一仍烧完进 DLQ，下一次会话 enqueue 同 uid 自动重跑
+    rerun="on_failure")
+```
+
+三者叠加的语义：等待期由资源挂起吸收——挂起期间 `can_acquire` 让需要该资源的队列 job 原地等待（单次挂起上限 24h，重复挂起取 max），重试退避只负责回队节奏，等待成本不由逐次重试承担；实际执行的失败按放宽的预算与小时级退避重试；极端情况下进了 DLQ，`rerun="on_failure"` 使后续会话的例行 enqueue（如 daily cron 重新入队同 uid）直接重跑——依赖恢复后的下一个周期即自愈，全程零人工干预。
 
 ---
 
@@ -198,6 +247,8 @@ register_discovery(
 **语义**（完整契约见 `tasklite/wrappers/discovery.py` 头部注释）：框架从第 1 页逐页调用 `fetch_func`，「已见」判定直接用框架 wall/failed 集合（`ctx.is_completed` / `ctx.is_failed` 快照）——**无 cursor、无 seen 持久化、无互斥注入**；**整页命中**或空页时终止本次扫描；每个新内容以确定性 job_id 交给 `process_item_func`。重新发现只处理新增内容、免疫源端删除带来的游标漂移，崩溃重跑由确定性 job_id 经 wall 去重吸收。**回调必须为模块级可 pickle 函数**（spawn 进程隔离约束——lambda/闭包在子进程 import 时失败）；**`register_discovery()` 注册期即做 pickle 预检**（fail-loud，不再等到 spawn）。
 
 **架构性质（框架无关）**：扫描核心是 `DiscoveryHandler`——运行时**不 import 任何 tasklite 框架模块**，只依赖 `DiscoveryJob`（`payload`）与 `DiscoveryContext`（`is_completed`/`is_failed`/`attempted_uids`）两个最小协议。`register_discovery` 是框架提供的默认封装函数，只通过 `DiscoveryHost` 公开协议（`register_handler` + `set_discovery_rerun`）挂载扫描器；任何实现该协议的宿主/测试桩都可直接复用。`TaskLite` 只是默认宿主实现。
+
+**适用边界**：discovery 的需求契约是「内容源按**时间倒序**分页、最新内容在第 1 页」——整页命中即「本页及以后全是旧内容」的终止判定依赖该前提。**不适用**于服务端日期/参数过滤型源（按任意历史区间查询，如学术库的 date-range 检索）：这类源无需翻页发现，正确做法是在业务侧把历史区间切分为确定性 chunk job（`job_id` 拼区间端点，如 `f"{source}_{start}_{end}"`），入队前经 `pipeline.uncompleted` 过滤、断点续推交给 wall 去重天然获得（见 §2）。列表页型源（期刊官网增量、社交流水）才是 discovery 的主场。
 
 **回调契约**：
 
@@ -247,6 +298,7 @@ from tasklite import (
 
 ```python
 entries = pipeline.list_dlq()            # 只读查询：[(uid, error_type, error, attempts, failed_at, meta)]
+suspends = pipeline.list_suspends()      # 只读查询：当前仍生效的资源挂起（SuspendEntry 列表）
 n = pipeline.clear_dlq()        # 清除：删 DLQ 条目（默认保留 fatal=true），随后由调用方 enqueue 同名任务重跑
 n = pipeline.clear_dlq(task_types=["download"], keep_fatal=False)
 n = pipeline.clear_history("download::")   # 删除 wall/DLQ 条目（强制重下/垃圾清理）；"download::" 前缀匹配
@@ -254,6 +306,7 @@ n = pipeline.clear_history("t::a", where=("wall",))   # 精确 uid；where 可�
 ```
 
 - **`list_dlq()`**：只读查询，返回结构化条目 `DLQEntry(uid, error_type, error, attempts, failed_at, meta)`。损坏行（非 dict meta / 非 int `_attempt`）被兜底为 unknown 分类展示，不炸查询。
+- **`list_suspends()`**：只读查询当前仍生效的资源挂起（如 IEEE 配额挂起到次日午夜的「现在挂了谁、何时解封」）。返回 `SuspendEntry(resource, resume_at, remaining_seconds)` 列表，按解封时刻升序；已解封条目不返回。真相源是 meta 表（挂起只在 `run()` 启动期恢复进内存，run 外查内存恒为空）；坏数据降级告警跳过，不炸查询。
 - **`clear_dlq`**：清除 = 删 DLQ（**不自动 enqueue**，由调用方随后 `enqueue` 同名任务重跑）。默认保留 `fatal=true` 的确定性失败（`FatalError`），`keep_fatal=False` 一并删除；`task_types` 按 task_type 前缀过滤。
 - **`clear_history`**：完整 uid 精确删除；**以 `::` 结尾**的字符串按前缀匹配（防 `"download"` 误匹配 `"downloads::"`）。用于「手动误删文件强制重下」（wall 清掉该 uid）与历史垃圾清理。
 - **DLQ 结构化字段**：每条 DLQ 记录统一带 `error_type`（`fatal` / `dependency` / `deadlock` / `transient_exhausted` / `no_handler` / `validation` / `commit_failure` / `dispatch` / `unknown`）与 `failed_at`（UTC ISO 时间戳）——排障不用再翻整份日志。错误码登记于 `tasklite/taxonomy.py`。
@@ -296,7 +349,7 @@ from tasklite.wrappers.discovery import sanitize_content_id  # 公开的 content
 **语义要点**：
 - **queue/in-flight 永远算数**——同一轮内不重复派发/并发双跑，互斥语义不受影响（策略只豁免 wall/failed）。
 - **运行历史落 wall meta**：每次成功在 wall 条目写 `run_count`（成功次数）、`last_run_at`、`last_run_id`——debug 时看 wall 一行就知道「跑过几次、最近一次什么时候」。
-- **输入指纹落 wall meta**：`ctx.declare_input(path)` 采集的 `{path, size, mtime_ns}` 随成功写入 `meta["inputs"]`——审计可追溯，且是 `on_input_change` 的比对依据（下次 enqueue 时框架对旧指纹重新 stat，任一文件变化/消失 → 重跑；无历史指纹 → 视为变化重跑）。URI 声明不参与比对（变更检测默认关闭，需网络请求，留给业务）。
+- **输入指纹落 wall meta**：`ctx.declare_input(path)` 采集的 `{path, size, mtime_ns}` 随成功写入 `meta["inputs"]`——审计可追溯，且是 `on_input_change` 的比对依据（下次 enqueue 时框架对旧指纹重新 stat，任一文件变化/消失 → 重跑；无历史指纹 → 视为变化重跑）。URI 声明不参与比对（变更检测默认关闭，需网络请求，留给业务）；**payload 同样不在指纹内**——参数变更后的重跑姿势见 §2「改了配置为什么不重跑」。
 - **策略随 job_dict 持久化**，加载期修复（契约 3）对 every_run/on_failure/on_input_change 任务豁免「残留清理」——跨崩溃重启后策略仍生效。
 - **discovery 默认 every_run**：`register_discovery(...)` 的 `rerun` 参数（默认 `"every_run"`）在 enqueue 时自动注入——discovery 任务用固定 uid（如 `discover::favorites`）每会话重扫，不再需要时间戳后缀。Job 默认 `rerun=None`（未指定哨兵）——未指定时注入 discovery 默认；**显式指定（含 `rerun="never"`）一律尊重、不再覆盖告警**。
 - **失败语义不变**：rerun 只影响跨会话要不要再次执行，单次执行内部的 RetryError 退避/max_retries/DLQ 流程一字不改。rerun 任务重跑失败 → wall 旧成功记录作废（最终状态唯一）。
@@ -534,6 +587,8 @@ TaskLite 官方提供 `tasklite.wrappers.http` 模块，为各种爬虫采集、
 | **HTTP 5xx（500/502/503/504 等）** | `RetryError` | 标记瞬态故障，调度器执行指数退避重试（按 `backoff_base` / `backoff_max`），耗尽进 DLQ | ⚠️ **消耗预算** | 源站临时过载、网关超时、服务重启 |
 | **连接超时 / 连接重置 / DNS 失败** | `RetryError` | 判定为瞬态网络抖动，触发框架退避重试 | ⚠️ **消耗预算** | 本地网络波动、TCP RST、TLS 握手超时 |
 | **HTTP 4xx（400/401/403/404/422）** | `FatalError` | 判定为确定性客户端错误或认证失效，**直接归档至 DLQ** | 🛑 **立即终止**，不空转重试 | Token 过期、资源已被源站物理删除、参数非法 |
+
+**守卫接管契约**：守卫块内抛出的任何携带 `response.status_code` 的异常——包括用户主动 `resp.raise_for_status()` 抛出的 `httpx.HTTPStatusError` / `requests.HTTPError`——一律按状态码走上表分类（429 → `RateLimitHit` + 挂起 + Retry-After 从 `exc.response.headers` 提取），不落传输层模块兜底。两个前提：raise 必须发生在 `with http_guard(...)` 块**内**（守卫只覆盖 with 块，块外异常不经守卫、直接按 §5 三分类判定）；`http_guard` 需绑定 `ctx` 与 `resource` 才能完成 429 的资源挂起。非 raise 姿势可显式检查：`with http_guard(...) as g: ...; g.check_response(resp)`（按同一 `HttpPolicy` 分类）。
 
 ---
 

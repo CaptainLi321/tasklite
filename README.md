@@ -123,10 +123,12 @@ flowchart TD
 ### 安装
 
 要求 **Python ≥ 3.9**，零外部依赖：
- 
+
 ```bash
 pip install tasklite-engine
 ```
+
+> **三方命名对照**：仓库名 `tasklite`，PyPI 包名 `tasklite-engine`（PyPI 的 `tasklite` 名已被无关项目占用），Python 导入名 `tasklite`——安装 `tasklite-engine`、`import tasklite`。
 
 ### 最小示例
 
@@ -335,6 +337,7 @@ tasklite/
 ├── backend/             # SQLite WAL 强一致事务持久化后端
 ├── models/              # Job / TaskContext / PipelineState 数据模型
 ├── taxonomy.py          # 错误分类法与校验分类深模块 (ErrorTaxonomy)
+├── testing.py          # fake_ctx：handler 单测的官方 TaskContext 构造器
 ├── wrappers/            # discovery.py（增量扫描）/ http.py（网络守卫与快照）
 └── utils/               # injective（单射 %XX 转义）/ ipc（IPC 信号与降级落盘）/ jsonutil（禁NaN）/ lockfile
 ```

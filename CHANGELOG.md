@@ -8,6 +8,13 @@
 
 缺陷修复版本：收敛 HTTP 传输异常分类与快照写入谓词、错误分类法构造契约、单射转义与内容指纹、状态机六集合互斥以及依赖宽限与挂起信号排空等多项缺陷。
 
+### 新增
+
+- **运维挂起视图（`OpsConsole.list_suspends` / 门面 `TaskLite.list_suspends`）**：run() 外只读查询当前仍生效的资源挂起（限流/配额熔断期间「现在挂了谁、何时解封」）——返回 `SuspendEntry(resource, resume_at, remaining_seconds)` 按解封时刻升序；真相源为 meta 表（挂起仅在 run() 启动期恢复进内存，管理段查内存恒为空），已解封条目过滤、坏数据降级告警跳过。
+- **入队前过滤辅助（`TaskLite.uncompleted(jobs)`）**：返回 uid 不在 wall 的 job 子集（保留输入顺序），标准姿势 `pipeline.enqueue(pipeline.uncompleted(jobs))`——此前调用方须自行 `backend.load_wall()` 过滤，漏接时整批 job 撞 wall 以 skipped 统计静默空转。DLQ 条目不排除（重跑与否由 `rerun` 策略在派发层裁决），队列驻留重复不排除（去重是 `enqueue` 自身职责）。
+- **官方测试构造器（`tasklite.testing.fake_ctx`）**：handler 单测的 TaskContext 具名参数构造器（`wall`/`failed`/`cursors`/`resources`/`tmp_root`），兜底装配内部容器结构——下游不再以位置参数硬编码 `TaskContext(job, set(), set(), {})`（内部形态属非公开契约，随框架演进碎裂）；`tmp_root` 模式创建一次性沙盒 output_root 与 ipc 目录使产物声明在单测可用。参数形态与公开 API 同等对待。
+- **`http_guard` 接管契约文档化**：守卫块内任何携带 `response.status_code` 的异常（含用户 `raise_for_status()` 主动抛出的 `httpx.HTTPStatusError` / `requests.HTTPError`）一律按状态码三分类接管（429 → `RateLimitHit` + 挂起，Retry-After 从 `exc.response.headers` 提取），不落传输层模块兜底——机制自软适配分支引入起即存在，本次补契约承诺（docstring/注释/API_GUIDE §16.2）并以参数化测试锁定三分类。
+
 ### 修复
 
 - **死锁治理（DeadlockGovernor）**：
