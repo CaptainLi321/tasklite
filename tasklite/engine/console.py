@@ -1,16 +1,36 @@
 """OpsConsole：run() 外纯运维接缝。
 
 从 StateStore 剥离管理段逻辑（list_dlq / clear_dlq / clear_history / seed_wall /
-seed_cursor），供门面 TaskLite 管理 API 委托。
+seed_cursor / list_suspends），供门面 TaskLite 管理 API 委托。
 """
 from __future__ import annotations
 
+import logging
+import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from .store import DLQEntry, StateStore
+from .resource import META_RESOURCE_SUSPENDS
 from ..backend.base import AbstractStateBackend
 from ..models.state import uid_from_job_dict
 from ..taxonomy import ErrorTaxonomy, _DEFAULT_TAXONOMY
+from ..utils.jsonutil import loads
+
+logger = logging.getLogger("tasklite")
+
+
+@dataclass(frozen=True)
+class SuspendEntry:
+    """资源挂起条目（只读运维视图值对象）。
+
+    ``resume_at`` 为挂钟时间戳（epoch 秒），``remaining_seconds`` 为查询
+    时刻快照——耗时操作后应以 ``resume_at`` 为准重新换算。
+    """
+
+    resource: str
+    resume_at: float
+    remaining_seconds: float
 
 
 class OpsConsole:
@@ -38,6 +58,52 @@ class OpsConsole:
         self._backend = backend
 
     # ── 只读查询 ──────────────────────────────────────────────────────
+
+    def list_suspends(self) -> List[SuspendEntry]:
+        """只读查询当前仍生效的资源挂起（跨重启持久化的限流/离线等待）。
+
+        真相源是 meta 表（``resource_suspends``）而非内存 ResourceManager——
+        挂起仅在 ``run()`` 启动时恢复进内存，run() 外查询内存态恒为空。
+        已过期（解封时刻早于查询时刻）的条目过滤不返回；坏数据降级为
+        告警 + 跳过，与启动期恢复路径的 fail-soft 语义一致。
+
+        Returns:
+            List[SuspendEntry]: 按 ``resume_at`` 升序（最先解封在前）。
+        """
+        try:
+            raw = self._backend.get_meta(META_RESOURCE_SUSPENDS)
+        except Exception as e:
+            logger.warning(f"Failed to load resource suspends from meta: {e}")
+            return []
+        if raw is None:
+            return []
+        try:
+            deadlines = loads(raw)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Corrupted resource_suspends meta, ignoring: {e}")
+            return []
+        if not isinstance(deadlines, dict):
+            logger.warning("resource_suspends meta is not a dict, ignoring")
+            return []
+
+        now_wall = time.time()
+        entries: List[SuspendEntry] = []
+        for name, deadline in deadlines.items():
+            # loads 契约保证键恒为 str、数值恒有限——仅需防字符串/布尔
+            # 等合法 JSON 但语义非法的值（bool 是 int 子类，须先判）。
+            if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+                logger.warning(f"Suspension query: non-numeric deadline for {name!r}, skipping")
+                continue
+            remaining = deadline - now_wall
+            if remaining <= 0:
+                continue
+            entries.append(SuspendEntry(
+                resource=name,
+                resume_at=float(deadline),
+                remaining_seconds=float(remaining),
+            ))
+        entries.sort(key=lambda e: e.resume_at)
+        return entries
 
     def list_dlq(self) -> List[DLQEntry]:
         """只读查询 DLQ，返回结构化条目（uid / error_type / error / attempts / failed_at / meta）。"""

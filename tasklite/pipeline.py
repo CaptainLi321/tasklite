@@ -19,7 +19,7 @@ from .engine.runtime import (
     TaskStats,
 )
 from .engine.store import DLQEntry
-from .engine.console import OpsConsole
+from .engine.console import OpsConsole, SuspendEntry
 from .engine.types import HandlerEntry
 from .models.context import TaskContext
 from .models.job import Job, WORKER_RESOURCE
@@ -486,6 +486,16 @@ class TaskLite:
             logger.info(f"Enqueued {len(inserted)} job(s), skipped {skipped} duplicate(s).")
         elif inserted:
             logger.info(f"Enqueued {len(inserted)} job(s).")
+
+    def list_suspends(self) -> List[SuspendEntry]:
+        """只读查询当前仍生效的资源挂起。委托 OpsConsole。
+
+        Returns:
+            List[SuspendEntry]: 每条含 ``resource`` / ``resume_at``（epoch
+            秒）/ ``remaining_seconds``（查询时刻快照），按解封时刻升序。
+        """
+        self._ensure_not_running("list_suspends")
+        return self._console.list_suspends()
 
     def list_dlq(self) -> List[DLQEntry]:
         """只读查询 DLQ，返回结构化条目。委托 OpsConsole。"""
