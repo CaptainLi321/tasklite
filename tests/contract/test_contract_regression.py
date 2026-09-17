@@ -332,7 +332,7 @@ class TestSerializationContract:
         瞬态重试（自恢复）而非永久 DLQ——修复前 status="error" → Unknown
         → DLQ，与注释声称的「按进程崩溃分类走正常重试」矛盾。"""
         res = {"status": "retry",
-               "lock_conflict": True,  # 结构化字段（判定端不再 startswith 前缀）
+               "transient_kind": "lock_conflict",  # 结构化字段（判定端不再 startswith 前缀）
                "error": "LOCK_CONFLICT: another execution body holds t::a lock"}
         result = _decode_ipc_result(res, None, Job("t", "a"))
         assert result.retry_requested, "LOCK_CONFLICT 必须按瞬态重试处理"
@@ -372,12 +372,11 @@ class TestSerializationContract:
             f"LOCK_CONFLICT 应写 retry（自恢复），got status={res.get('status')!r}"
         )
         assert "LOCK_CONFLICT" in res.get("error", "")
-        # worker 写端必须写结构化字段 lock_conflict=True——
-        # 结构化读取 error_code 字段避免前缀字符串误匹配
-        # 撞前缀消息误判为零计数重试）。
-        assert res.get("lock_conflict") is True, (
-            f"LOCK_CONFLICT 应写结构化字段 lock_conflict=True，"
-            f"got {res.get('lock_conflict')!r}"
+        # worker 写端必须写结构化字段 transient_kind="lock_conflict"——
+        # 结构化读取字段避免 error 前缀字符串误判为零计数重试。
+        assert res.get("transient_kind") == "lock_conflict", (
+            f"LOCK_CONFLICT 应写结构化字段 transient_kind，"
+            f"got {res.get('transient_kind')!r}"
         )
 
     def test_mp_worker_wrapper_rate_limit_writes_structured_flag(self, tmp_path):
@@ -409,8 +408,8 @@ class TestSerializationContract:
         assert res.get("status") == "retry", (
             f"限流应走 retry 通道（自恢复），got status={res.get('status')!r}"
         )
-        assert res.get("rate_limited") is True, (
-            f"限流结果必须携带结构化字段 rate_limited=True，got {res.get('rate_limited')!r}"
+        assert res.get("transient_kind") == "rate_limited", (
+            f"限流结果必须携带结构化字段 transient_kind，got {res.get('transient_kind')!r}"
         )
 
     def test_mp_worker_wrapper_plain_retry_omits_rate_limit_flag(self, tmp_path):
@@ -434,22 +433,22 @@ class TestSerializationContract:
 
         res = ArtifactJournal(ipc).read_result("t::re", incarnation="test.1")
         assert res is not None and res.get("status") == "retry"
-        assert not res.get("rate_limited"), (
-            f"业务 RetryError 不得携带 rate_limited 标志，got {res.get('rate_limited')!r}"
+        assert res.get("transient_kind") is None, (
+            f"业务 RetryError 不得携带 transient_kind，got {res.get('transient_kind')!r}"
         )
 
     def test_decode_ipc_result_rate_limited_flag(self):
-        """解码侧对称：status="retry" + rate_limited=True → 结构化标志贯通。"""
-        res = {"status": "retry", "rate_limited": True, "error": "HTTP 429 RateLimit hit"}
+        """解码侧对称：status="retry" + transient_kind → 结构化标志贯通。"""
+        res = {"status": "retry", "transient_kind": "rate_limited", "error": "HTTP 429 RateLimit hit"}
         result = _decode_ipc_result(res, None, Job("t", "a"))
         assert result.retry_requested, "限流结果必须按瞬态重试处理"
-        assert result.rate_limited is True, "解码侧必须还原 rate_limited 结构化标志"
-        assert result.lock_conflict is False
+        assert result.transient_kind == "rate_limited", "解码侧必须还原 transient_kind"
+        assert result.transient_kind != "lock_conflict"
 
         plain = _decode_ipc_result(
             {"status": "retry", "error": "transient"}, None, Job("t", "a"),
         )
-        assert plain.rate_limited is False, "无标志的 retry 结果不得误判为限流"
+        assert plain.transient_kind is None, "无标志的 retry 结果不得误判为限流"
 
 
 

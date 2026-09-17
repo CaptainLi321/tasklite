@@ -432,7 +432,7 @@ class TestMiscellaneous:
         # 第一次：LOCK_CONFLICT retry（零计数）；第二次：成功（孤儿死后自愈）
         LockRetryProcess = make_ipc_process_class(results=[
             {"status": "retry",
-             "lock_conflict": True,  # 结构化字段（判定端不再 startswith 前缀）
+             "transient_kind": "lock_conflict",  # 结构化字段（判定端不再 startswith 前缀）
              "error": "LOCK_CONFLICT: another execution body holds t::j1 lock"},
             {"status": "success", "raw_result": True,
              "new_jobs": [], "resource_suspensions": [], "cursor_updates": {}},
@@ -458,7 +458,7 @@ class TestMiscellaneous:
         修复前：判定端 `retry_error.startswith("LOCK_CONFLICT")` 把业务消息
         误判为框架锁冲突 → 零计数重试 + 不覆盖 _last_retry_error（与
         test_lock_conflict_retry_does_not_consume_budget 为零计数的对偶路径）。
-        修复后：判定端只读结构化 lock_conflict 字段（本测试的结果 dict 故意
+        修复后：判定端只读结构化 transient_kind 字段（本测试的结果 dict 故意
         **不带**该字段）→ 业务撞前缀不再误判。"""
         pipeline = make_pipeline(tmp_path)
         pipeline.register_handler("t", lambda j, c: (True, {}))
@@ -473,7 +473,7 @@ class TestMiscellaneous:
         monkeypatch.setattr(pipeline.backend, "commit_retry", fake_commit_retry)
 
         # 业务 RetryError 消息撞 "LOCK_CONFLICT" 前缀，但**不带**结构化字段
-        # lock_conflict（区别于框架锁冲突）→ 必须走正常计数重试。
+        # transient_kind（区别于框架锁冲突）→ 必须走正常计数重试。
         backoff_calls = []
 
         def fake_backoff(*args, **kwargs):

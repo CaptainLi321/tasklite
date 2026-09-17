@@ -21,6 +21,16 @@ EMPTY_STATS = {
     "cascade_failed": 0,
 }
 
+# 瞬态信号种类登记表：kind → 统计键。瞬态军规（不烧预算 + 豁免 DLQ +
+# 短退避 + 零污染）按 kind 单值判定，新信号在此登记一行并同步 wire 写端
+# （channel worker 侧）与降级保真（utils/ipc）即可全链生效；
+# 完备性由 test_transient_signal_rules 的注册表遍历锁定。
+TRANSIENT_KIND_STAT_KEYS = {
+    "interrupted": "interrupted_reruns",
+    "lock_conflict": "deferred_orphan",
+    "rate_limited": "rate_limited_reruns",
+}
+
 
 class StopMode(enum.Enum):
     """停机状态机三态。"""

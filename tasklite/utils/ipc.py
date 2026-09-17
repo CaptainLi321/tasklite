@@ -302,13 +302,11 @@ class ArtifactJournal:
             "error": f"IPC_RESULT_WRITE_DEGRADED: {write_err}",
         }
         # 认证令牌随降级继承：读取侧强校验下丢令牌的降级结果会被误拒，
-        # lock_conflict / rate_limited 的瞬态保真语义随之失效
+        # transient_kind 的瞬态保真语义随之失效
         if "auth" in payload:
             degraded["auth"] = payload["auth"]
-        if payload.get("lock_conflict"):
-            degraded["lock_conflict"] = True
-        if payload.get("rate_limited"):
-            degraded["rate_limited"] = True
+        if payload.get("transient_kind"):
+            degraded["transient_kind"] = payload["transient_kind"]
         try:
             self.write_result_atomic(uid, degraded, incarnation=incarnation)
         except OSError as e2:

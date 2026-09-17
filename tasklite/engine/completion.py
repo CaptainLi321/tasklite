@@ -178,9 +178,7 @@ class CompletionMachine:
             job_dict,
             plan.retry_dict,
             front=False,
-            is_interrupted=plan.is_interrupted,
-            is_lock_conflict=plan.is_lock_conflict,
-            is_rate_limited=plan.is_rate_limited,
+            transient_kind=plan.transient_kind,
         )
         result.going_to_retry = True
 

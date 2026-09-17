@@ -232,16 +232,16 @@ class TestRetryPlanStateMachine:
         job_dict = job.to_dict()
 
         # 即使 retries == 3，interrupted 也豁免 DLQ 且不消耗重试预算
-        plan_int = policy.plan_retry(job, job_dict, interrupted=True)
+        plan_int = policy.plan_retry(job, job_dict, transient_kind="interrupted")
         assert plan_int.going_to_retry is True
-        assert plan_int.is_interrupted is True
+        assert plan_int.transient_kind == "interrupted"
         assert job.retries == 3  # 不增加
         assert 0.75 <= plan_int.delay <= 1.0
 
         # lock_conflict 同样豁免 DLQ 且不消耗重试预算
-        plan_lock = policy.plan_retry(job, job_dict, lock_conflict=True)
+        plan_lock = policy.plan_retry(job, job_dict, transient_kind="lock_conflict")
         assert plan_lock.going_to_retry is True
-        assert plan_lock.is_lock_conflict is True
+        assert plan_lock.transient_kind == "lock_conflict"
         assert job.retries == 3  # 不增加
         assert 0.75 <= plan_lock.delay <= 1.0
 

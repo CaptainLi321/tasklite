@@ -100,9 +100,7 @@ class RetryPlan:
     delay: float = 0.0
     retry_dict: Optional[Dict[str, Any]] = None
     fail_meta: Optional[Dict[str, Any]] = None
-    is_interrupted: bool = False
-    is_lock_conflict: bool = False
-    is_rate_limited: bool = False
+    transient_kind: Optional[str] = None
     schedule: Optional[BackoffSchedule] = None
 
 
@@ -364,15 +362,13 @@ class BackoffGovernor:
         retry_error_or_result: Any = None,
         *,
         retry_error: Optional[str] = None,
-        interrupted: bool = False,
-        lock_conflict: bool = False,
-        rate_limited: bool = False,
+        transient_kind: Optional[str] = None,
     ) -> RetryPlan:
         """规划重试决策与退避状态机（单一出口：计算预算、退避时延与双时钟状态）。
 
         契约：
-        1. 外部中断（interrupted）、孤儿锁冲突（lock_conflict）与限流
-           （rate_limited）为瞬态信号：
+        1. 瞬态信号（transient_kind 登记于 engine.types.TRANSIENT_KIND_STAT_KEYS：
+           interrupted / lock_conflict / rate_limited）：
            - 不消耗重试预算（不递增 job.retries）；
            - 即使 job.retries 已达 max_retries 也豁免 DLQ；
            - 采用 [0.75, 1.0]s 短退避回队自恢复（限流的实际等待由资源
@@ -390,14 +386,11 @@ class BackoffGovernor:
                 retry_error = getattr(retry_error_or_result, "retry_error", retry_error)
             elif isinstance(retry_error_or_result, str):
                 retry_error = retry_error_or_result
-            if hasattr(retry_error_or_result, "interrupted"):
-                interrupted = bool(getattr(retry_error_or_result, "interrupted", False))
-            if hasattr(retry_error_or_result, "lock_conflict"):
-                lock_conflict = bool(getattr(retry_error_or_result, "lock_conflict", False))
-            if hasattr(retry_error_or_result, "rate_limited"):
-                rate_limited = bool(getattr(retry_error_or_result, "rate_limited", False))
+            kind = getattr(retry_error_or_result, "transient_kind", None)
+            if kind:
+                transient_kind = kind
 
-        transient = interrupted or lock_conflict or rate_limited
+        transient = transient_kind is not None
 
         if job.retries >= job.max_retries and not transient:
             fail_meta: Dict[str, Any] = {"error": _ERR_MAX_RETRIES}
@@ -410,9 +403,7 @@ class BackoffGovernor:
                 going_to_retry=False,
                 delay=0.0,
                 fail_meta=fail_meta,
-                is_interrupted=interrupted,
-                is_lock_conflict=lock_conflict,
-                is_rate_limited=rate_limited,
+                transient_kind=transient_kind,
             )
 
         if transient:
@@ -439,9 +430,7 @@ class BackoffGovernor:
             going_to_retry=True,
             delay=sched.delay,
             retry_dict=retry_dict,
-            is_interrupted=interrupted,
-            is_lock_conflict=lock_conflict,
-            is_rate_limited=rate_limited,
+            transient_kind=transient_kind,
             schedule=sched,
         )
 

@@ -868,7 +868,7 @@ class TestAbortInitialScanDonePairSignalDrain:
         handle = self._make_handle(tmp_path)
         journal.record_signal(handle.uid, "api", 60.0)
         journal.write_result_atomic(handle.uid, {
-            "status": "retry", "error": "HTTP 429", "rate_limited": True,
+            "status": "retry", "error": "HTTP 429", "transient_kind": "rate_limited",
         }, incarnation=handle.incarnation)
 
         outcome = ch.abort_in_flight([handle])
@@ -959,7 +959,7 @@ class TestAbortDonePairSignalDrainOrchestration:
                 journal.record_signal(uid, "api", 60.0)
                 if with_retry_result:
                     journal.write_result_atomic(uid, {
-                        "status": "retry", "error": "HTTP 429", "rate_limited": True,
+                        "status": "retry", "error": "HTTP 429", "transient_kind": "rate_limited",
                     }, incarnation=inc)
                 return real_abort(handles)
 

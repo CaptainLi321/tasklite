@@ -67,7 +67,7 @@ class TestLockConflictBudgetExemption:
         LockThenSuccess = make_ipc_process_class(results=[
             {"status": "retry",
              "error": "LOCK_CONFLICT: another execution body holds t::j1 lock",
-             "lock_conflict": True},
+             "transient_kind": "lock_conflict"},
             {"status": "success", "raw_result": True,
              "new_jobs": [], "resource_suspensions": [], "cursor_updates": {}},
         ])

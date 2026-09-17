@@ -18,6 +18,7 @@ from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, uid_from_job_dict
+from .types import TRANSIENT_KIND_STAT_KEYS
 from ..taxonomy import (
     ERR_COMMIT_FAILURE_DLQ,
     ERR_JOB_DEPENDENCY,
@@ -84,9 +85,7 @@ class RetryOutcome:
     """apply_retry 原子转移结果。"""
     uid: str
     retry_dict: Dict[str, Any]
-    is_interrupted: bool = False
-    is_lock_conflict: bool = False
-    is_rate_limited: bool = False
+    transient_kind: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -424,9 +423,7 @@ class StateStore:
         retry_dict: Dict[str, Any],
         *,
         front: bool = False,
-        is_interrupted: bool = False,
-        is_lock_conflict: bool = False,
-        is_rate_limited: bool = False,
+        transient_kind: Optional[str] = None,
     ) -> RetryOutcome:
         """原子状态转移：重试重入队。"""
         committed = self._backend.commit_retry(uid, retry_dict, front=front)
@@ -434,28 +431,13 @@ class StateStore:
             self._state.unregister_in_flight(uid)
             self._state.requeue_jobs([retry_dict], front=front)
             self._record_stat("retried", 1)
-            if is_interrupted:
-                self._record_stat("interrupted_reruns", 1)
-            elif is_lock_conflict:
-                self._record_stat("deferred_orphan", 1)
-            elif is_rate_limited:
-                self._record_stat("rate_limited_reruns", 1)
-            return RetryOutcome(
-                uid=uid,
-                retry_dict=retry_dict,
-                is_interrupted=is_interrupted,
-                is_lock_conflict=is_lock_conflict,
-                is_rate_limited=is_rate_limited,
-            )
+            stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
+            if stat_key:
+                self._record_stat(stat_key, 1)
+            return RetryOutcome(uid=uid, retry_dict=retry_dict, transient_kind=transient_kind)
 
         self.commit_failed_crash(uid, "commit_retry", job_dict)
-        return RetryOutcome(
-            uid=uid,
-            retry_dict=retry_dict,
-            is_interrupted=is_interrupted,
-            is_lock_conflict=is_lock_conflict,
-            is_rate_limited=is_rate_limited,
-        )
+        return RetryOutcome(uid=uid, retry_dict=retry_dict, transient_kind=transient_kind)
 
     def _requeue_and_crash(self, uid: str, job_dict: Optional[Dict[str, Any]], reason: str) -> None:
         """单一出口：所有「commit 失败 → requeue 内存 + 崩溃」路径的收敛点。"""

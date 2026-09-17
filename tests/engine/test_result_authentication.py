@@ -101,12 +101,12 @@ class TestResultAuthTokenWorkerSide:
 
         monkeypatch.setattr(j, "write_result_atomic", fail_full_then_degrade)
         j.write_result_with_degradation(
-            job.uid, {"status": "retry", "lock_conflict": True, "auth": _TOKEN}
+            job.uid, {"status": "retry", "transient_kind": "lock_conflict", "auth": _TOKEN}
         )
         p = tmp_path / f"{safe_uid_filename(job.uid)}.result.json"
         data = json.loads(p.read_text(encoding="utf-8"))
         assert data["auth"] == _TOKEN, "降级结果丢失令牌会被读取侧误拒"
-        assert data["lock_conflict"] is True
+        assert data["transient_kind"] == "lock_conflict"
 
 
 class TestResultAuthTokenReaderSide:

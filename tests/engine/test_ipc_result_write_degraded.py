@@ -5,13 +5,13 @@ IO 故障时 OSError 直接穿透 → worker 裸崩退出（无结果文件）�
 崩溃收割且不设 retry_requested → **成功执行的 job 被误判 DLQ、成果永久
 丢失**。现全部出口统一走 _write_result_with_degradation：完整写 →
 短暂停顿后重试完整写 → 降级写最小结果（success 改写 retry 让 job 重跑，
-其他 status 保持原语义，lock_conflict 结构化字段保留）→ 仍失败记 error
+其他 status 保持原语义，transient_kind 结构化字段保留）→ 仍失败记 error
 后放弃（worker 无结果退出，drain 按崩溃语义收割）。
 
 覆盖矩阵：
 - success 完整写两连败 → 降级 retry 结果落盘（重跑而非静默丢失）
-- 锁冲突分支完整写失败 → 降级结果保留 lock_conflict 结构化字段
-- 限流分支完整写失败 → 降级结果保留 rate_limited 结构化字段
+- 锁冲突分支完整写失败 → 降级结果保留 transient_kind 结构化字段
+- 限流分支完整写失败 → 降级结果保留 transient_kind 结构化字段
 - 全部写失败（含降级写）→ worker 不抛 OSError、无结果文件
 - 端到端：降级 retry 结果被 drain 消费 → job 回队重跑成功，不进 DLQ
 """
@@ -90,9 +90,9 @@ class TestWorkerResultWriteDegraded:
     def test_lock_conflict_payload_write_failure_keeps_structured_field(
         self, tmp_path, monkeypatch,
     ):
-        """锁冲突分支完整写失败 → 降级结果保留 lock_conflict 结构化字段。
+        """锁冲突分支完整写失败 → 降级结果保留 transient_kind 结构化字段。
 
-        判定端读 lock_conflict 字段而非 error 前缀（业务 RetryError 消息
+        判定端读 transient_kind 字段而非 error 前缀（业务 RetryError 消息
         可能撞 "LOCK_CONFLICT" 前缀）——降级写丢字段会把框架锁冲突误当
         业务 retry，烧 max_retries 预算。
         """
@@ -118,17 +118,17 @@ class TestWorkerResultWriteDegraded:
         res = journal.read_result("h::a", incarnation=_INCARNATION)
         assert res is not None, "锁冲突完整写失败后必须降级写最小 retry 结果"
         assert res["status"] == "retry"
-        assert res.get("lock_conflict") is True, (
-            f"降级写必须保留 lock_conflict 结构化字段: {res}"
+        assert res.get("transient_kind") == "lock_conflict", (
+            f"降级写必须保留 transient_kind 结构化字段: {res}"
         )
         assert "IPC_RESULT_WRITE_DEGRADED" in res["error"]
 
     def test_rate_limit_payload_write_failure_keeps_structured_field(
         self, tmp_path, monkeypatch,
     ):
-        """限流分支完整写失败 → 降级结果保留 rate_limited 结构化字段。
+        """限流分支完整写失败 → 降级结果保留 transient_kind 结构化字段。
 
-        判定端读 rate_limited 结构化字段做预算豁免——降级写丢字段会把
+        判定端读 transient_kind 结构化字段做预算豁免——降级写丢字段会把
         限流当普通业务 retry 烧 max_retries 预算，429 风暴下任务被误送 DLQ。
         """
         from tasklite.exceptions import RateLimitHit
@@ -155,8 +155,8 @@ class TestWorkerResultWriteDegraded:
         res = journal.read_result("h::rl", incarnation=_INCARNATION)
         assert res is not None, "限流完整写失败后必须降级写最小 retry 结果"
         assert res["status"] == "retry"
-        assert res.get("rate_limited") is True, (
-            f"降级写必须保留 rate_limited 结构化字段: {res}"
+        assert res.get("transient_kind") == "rate_limited", (
+            f"降级写必须保留 transient_kind 结构化字段: {res}"
         )
         assert "IPC_RESULT_WRITE_DEGRADED" in res["error"]
 

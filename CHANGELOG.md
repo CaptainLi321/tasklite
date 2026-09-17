@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### 变更（重构）
+
+- **瞬态信号具名化（`transient_kind`）**：worker 结果文件 `retry` 通道的 `lock_conflict` / `rate_limited` 两个旁挂布尔键合并为单一结构化字段 `transient_kind`（`"lock_conflict"` / `"rate_limited"`；`interrupted` 维持独立 status 通道，解码侧归一为 kind）；`ExecutionResult` / `RetryPlan` / `RetryOutcome` 三份平行布尔字段收敛为 `transient_kind: Optional[str]` 单字段，`plan_retry` 关键字参数同步收敛（鸭子类型反射提取删除）；登记表 `engine.types.TRANSIENT_KIND_STAT_KEYS`（kind → 统计键）为新增瞬态信号的唯一登记点，`apply_retry` 统计映射改查表；降级写盘按 kind 单键保真。统计键名不变（公开 API 兼容）；父子进程同版本部署且跨 run 残留结果经令牌轮换丢弃，wire 变更无兼容矩阵。
+
 缺陷修复版本：收敛 HTTP 传输异常分类与快照写入谓词、错误分类法构造契约、单射转义与内容指纹、状态机六集合互斥以及依赖宽限与挂起信号排空等多项缺陷。
 
 ### 新增

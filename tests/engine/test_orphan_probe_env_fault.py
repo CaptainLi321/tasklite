@@ -79,5 +79,5 @@ class TestWorkerEntryLockEnvFault:
         res = journal.read_result(journal.result_path(uid, "r.1"))
         assert res is not None
         assert res["status"] == "retry"
-        assert res["lock_conflict"] is True
+        assert res["transient_kind"] == "lock_conflict"
         assert "LOCK_ENV_FAULT" in res["error"]

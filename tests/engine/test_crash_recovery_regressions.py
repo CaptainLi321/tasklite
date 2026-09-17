@@ -693,8 +693,8 @@ class TestLastRetryErrorPreservation:
         result = {"status": "retry", "error": retry_error}
         if is_lock_conflict:
             # 结构化字段（判定端不再 startswith 前缀）——框架锁冲突须
-            # 带 lock_conflict=True 才会被识别为零计数重试。
-            result["lock_conflict"] = True
+            # 带 transient_kind 才会被识别为零计数重试。
+            result["transient_kind"] = "lock_conflict"
         LockRetryProcess = make_ipc_process_class(results=[
             result,
             {"status": "success", "raw_result": True,
@@ -730,7 +730,7 @@ class TestLockConflictBudgetExhaustedSelfRecovers:
 
     场景：handler 一次都没跑、retries 预算由**此前业务失败**耗尽（如孤儿
     锁的上一轮业务 RetryError 已把 retries 推到 max_retries），最后一次
-    尝试撞上孤儿锁（lock_conflict=True 的 retry 结果）。锁冲突是框架瞬态
+    尝试撞上孤儿锁（transient_kind="lock_conflict" 的 retry 结果）。锁冲突是框架瞬态
     （同 uid 孤儿执行体仍持锁，孤儿死后重跑本可成功），预算耗尽也必须
     豁免 DLQ 回队自恢复——否则与「孤儿死后自恢复、不烧预算」的设计意图
     矛盾。变异体（预算检查删去 lock_conflict 豁免）下 job 直接进 DLQ，
@@ -759,7 +759,7 @@ class TestLockConflictBudgetExhaustedSelfRecovers:
         LockConflictProcess = make_ipc_process_class(results=[
             {"status": "retry",
              "error": "LOCK_CONFLICT: another execution body holds t::j1 lock",
-             "lock_conflict": True},
+             "transient_kind": "lock_conflict"},
             {"status": "success", "raw_result": True,
              "new_jobs": [], "resource_suspensions": [], "cursor_updates": {}},
         ])

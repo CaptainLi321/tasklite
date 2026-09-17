@@ -95,9 +95,7 @@ def _decode_ipc_result(
     new_jobs: List[Job] = []
     cursor_updates: Dict[str, str] = {}
     resource_suspensions: List[Tuple[str, float]] = []
-    lock_conflict = False
-    rate_limited = False
-    interrupted = False
+    transient_kind: Optional[str] = None
 
     if isinstance(res, dict) and "status" in res:
         if res["status"] == "success":
@@ -177,12 +175,12 @@ def _decode_ipc_result(
         elif res["status"] == "retry":
             retry_requested = True
             retry_error = res.get("error")
-            lock_conflict = bool(res.get("lock_conflict", False))
-            rate_limited = bool(res.get("rate_limited", False))
+            kind = res.get("transient_kind")
+            transient_kind = kind if isinstance(kind, str) else None
         elif res["status"] == "interrupted":
             retry_requested = True
             retry_error = res.get("error")
-            interrupted = True
+            transient_kind = "interrupted"
         elif res["status"] == "fatal":
             success = False
             result_meta = {
@@ -223,9 +221,7 @@ def _decode_ipc_result(
         new_jobs=new_jobs,
         cursor_updates=cursor_updates,
         resource_suspensions=resource_suspensions,
-        lock_conflict=lock_conflict,
-        rate_limited=rate_limited,
-        interrupted=interrupted,
+        transient_kind=transient_kind,
     )
 
 
@@ -259,7 +255,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         # 炸穿执行体；errno 归因保留供运维区分两种语义。
         _write_result({
             "status": "retry",
-            "lock_conflict": True,
+            "transient_kind": "lock_conflict",
             "error": f"LOCK_ENV_FAULT: cannot open lock file for {uid} "
                      f"(errno={getattr(e, 'errno', None)}): {e}",
         })
@@ -267,7 +263,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
     if _lock_fd is None:
         _write_result({
             "status": "retry",
-            "lock_conflict": True,
+            "transient_kind": "lock_conflict",
             "error": f"LOCK_CONFLICT: another execution body holds {uid} lock",
         })
         return
@@ -286,7 +282,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         # 预算豁免依赖该结构化字段（与 lock_conflict 同构）。
         retry_payload: Dict[str, Any] = {"status": "retry", "error": str(e)}
         if isinstance(e, RateLimitHit):
-            retry_payload["rate_limited"] = True
+            retry_payload["transient_kind"] = "rate_limited"
         _write_result(retry_payload)
     except FatalError as e:
         _write_result({
@@ -344,9 +340,7 @@ class ExecutionResult:
     new_jobs: List[Job] = field(default_factory=list)
     cursor_updates: Dict[str, str] = field(default_factory=dict)
     resource_suspensions: List[Tuple[str, float]] = field(default_factory=list)
-    lock_conflict: bool = False
-    rate_limited: bool = False
-    interrupted: bool = False
+    transient_kind: Optional[str] = None
     going_to_retry: Optional[bool] = None
 
 
