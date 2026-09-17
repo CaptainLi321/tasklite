@@ -37,8 +37,6 @@ logger = logging.getLogger("tasklite")
 
 _KEY_TRACEBACK = "traceback"
 _RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
-_RESULT_TMP_SUFFIX = ".result.json.tmp"
-_RESULT_SUFFIX = ".result.json"
 
 
 def _normalize_handler_result(result: Any) -> Tuple[bool, Dict[str, Any]]:
@@ -100,7 +98,12 @@ def _env_death_retry(exitcode: Optional[int]) -> Tuple[Dict[str, Any], str]:
 
 
 def _decode_ipc_result(
-    res: dict, p: Any, job: Job, ipc_dir: Optional[str] = None
+    res: dict,
+    p: Any,
+    job: Job,
+    ipc_dir: Optional[str] = None,
+    *,
+    output_roots: Optional[Sequence[Union[str, Path]]] = None,
 ) -> "ExecutionResult":
     """解析子进程通过结果文件回传的结果字典。"""
     success = False
@@ -221,7 +224,7 @@ def _decode_ipc_result(
         retry_requested = True
 
     if success and ipc_dir is not None:
-        ok, err = ArtifactJournal(ipc_dir).verify_outputs(job.uid)
+        ok, err = ArtifactJournal(ipc_dir, output_roots=output_roots).verify_outputs(job.uid)
         if not ok:
             logger.error(f"Verification failed for {job.uid}: {err}")
             success = False
@@ -374,9 +377,6 @@ class JobHandle:
     incarnation: Optional[str] = None
 
 
-ExecutionHandle = JobHandle
-
-
 @dataclass(frozen=True)
 class WorkerLaunchSpec:
     """进程 seam 具名契约——spawn 下发子进程执行体的全部载荷。
@@ -414,22 +414,11 @@ class ExecutionChannel:
 
     def __init__(
         self,
-        ipc_dir: Optional[Union[str, Path, Any]] = None,
+        ipc_dir: Optional[Union[str, Path]] = None,
         *,
         mp_ctx: Optional[Any] = None,
         output_roots: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
-        **kwargs: Any,
     ) -> None:
-        if ipc_dir is not None and hasattr(ipc_dir, "Process") and mp_ctx is None:
-            mp_ctx = ipc_dir
-            ipc_dir = None
-        if ipc_dir is None and "ipc_dir" in kwargs:
-            ipc_dir = kwargs["ipc_dir"]
-        if mp_ctx is None and "mp_ctx" in kwargs:
-            mp_ctx = kwargs["mp_ctx"]
-        if output_roots is None and "output_roots" in kwargs:
-            output_roots = kwargs["output_roots"]
-
         self._mp_ctx = mp_ctx or mp.get_context("spawn")
         self.ipc_dir = str(ipc_dir) if ipc_dir is not None else None
         # 输出沙盒信任根随 channel 注入 journal——清理消费侧的删除复检依赖
@@ -578,7 +567,10 @@ class ExecutionChannel:
         result: Optional[ExecutionResult] = None
         try:
             if res is not None:
-                result = _decode_ipc_result(res, p, handle.job, handle.ipc_dir)
+                result = _decode_ipc_result(
+                    res, p, handle.job, handle.ipc_dir,
+                    output_roots=getattr(self, "output_roots", None),
+                )
             else:
                 result = self._build_terminal_failure(p, handle, is_timeout=is_timeout)
         finally:
@@ -615,7 +607,10 @@ class ExecutionChannel:
             return None
         if res is None:
             return None
-        return _decode_ipc_result(res, None, job, self.ipc_dir)
+        return _decode_ipc_result(
+            res, None, job, self.ipc_dir,
+            output_roots=getattr(self, "output_roots", None),
+        )
 
     @staticmethod
     def _build_terminal_failure(
@@ -697,7 +692,10 @@ class ExecutionChannel:
                     and "status" in raw_res
                     and raw_res.get("status") != "interrupted"
                 ):
-                    decoded = _decode_ipc_result(raw_res, None, h.job, self.ipc_dir)
+                    decoded = _decode_ipc_result(
+                        raw_res, None, h.job, self.ipc_dir,
+                        output_roots=getattr(self, "output_roots", None),
+                    )
                     # 不变式：结果文件已原子落盘 ⇒ 本执行体的信号追加全部
                     # 早于落盘（record_signal 只发生在 handler 执行期内），
                     # 此刻排空无并发写者、无损；非 success payload 不携带
@@ -734,7 +732,10 @@ class ExecutionChannel:
                     and "status" in raw_res
                     and raw_res.get("status") != "interrupted"
                 ):
-                    decoded = _decode_ipc_result(raw_res, None, h.job, self.ipc_dir)
+                    decoded = _decode_ipc_result(
+                        raw_res, None, h.job, self.ipc_dir,
+                        output_roots=getattr(self, "output_roots", None),
+                    )
                     try:
                         decoded.resource_suspensions = (
                             list(decoded.resource_suspensions)
@@ -788,17 +789,13 @@ class ExecutionChannel:
             return []
 
 
-MultiprocessingExecutor = ExecutionChannel
-
 __all__ = [
     "AbortOutcome",
     "ArtifactCleanupMode",
     "ExecutionChannel",
-    "ExecutionHandle",
     "ExecutionResult",
     "JobHandle",
     "WorkerLaunchSpec",
-    "MultiprocessingExecutor",
     "_decode_ipc_result",
     "_decode_raw_result",
     "_encode_raw_result",

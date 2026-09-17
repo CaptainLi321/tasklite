@@ -245,7 +245,7 @@ class TestDrainStaleTmpIgnore:
 
     def test_drain_stale_ignores_tmp_leftover(self, tmp_path):
         from pathlib import Path as _Path
-        from tasklite.engine.channel import _RESULT_TMP_SUFFIX
+        from tasklite.utils.ipc import _RESULT_TMP_SUFFIX
         from tasklite.utils.lockfile import safe_uid_filename
 
         p = make_pipeline(tmp_path)

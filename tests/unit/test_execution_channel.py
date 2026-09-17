@@ -8,8 +8,8 @@ import pytest
 from tasklite.engine.channel import (
     ArtifactCleanupMode,
     ExecutionChannel,
-    ExecutionHandle,
     ExecutionResult,
+    JobHandle,
 )
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
@@ -139,8 +139,8 @@ class TestExecutionChannelAbortInFlight:
             def join(self, timeout=None):
                 pass
 
-        h1 = ExecutionHandle(uid=job1.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job1, ipc_dir=str(tmp_path), incarnation="inc1")
-        h2 = ExecutionHandle(uid=job2.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job2, ipc_dir=str(tmp_path), incarnation="inc2")
+        h1 = JobHandle(uid=job1.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job1, ipc_dir=str(tmp_path), incarnation="inc1")
+        h2 = JobHandle(uid=job2.uid, process=MockProcess(), deadline=time.monotonic() + 10, timeout=10, job=job2, ipc_dir=str(tmp_path), incarnation="inc2")
 
         outcome = channel.abort_in_flight([h1, h2])
         assert len(outcome.completed) == 1
@@ -178,7 +178,7 @@ class TestExecutionChannelAbortInFlight:
             def join(self, timeout=None):
                 pass
 
-        h = ExecutionHandle(
+        h = JobHandle(
             uid=job.uid, process=KillWritingProcess(),
             deadline=time.monotonic() + 10, timeout=10, job=job,
             ipc_dir=str(tmp_path), incarnation="inc9",
@@ -225,7 +225,7 @@ class TestExecutionChannelAbortInFlight:
             def join(self, timeout=None):
                 pass
 
-        h = ExecutionHandle(
+        h = JobHandle(
             uid=job.uid, process=FinishOnKillProcess(),
             deadline=time.monotonic() + 10, timeout=10, job=job,
             ipc_dir=str(tmp_path), incarnation="inc10",
