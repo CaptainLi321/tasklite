@@ -37,7 +37,7 @@
 - **运维接缝与后端一致性**：
   - `seed_wall` 的队列驻留预检补后端持久腿：queue 腿改为内存队列与后端 `load_queue()` 提取的 uid 集合合并对账（failed 腿原本即查后端）——此前 run 前内存 state 为空占位，跨进程场景（进程崩溃后队列落盘、新进程首次 run 前 seed_wall）预检漏掉落盘队列驻留，uid 写入 wall 后在下次加载时被残留过滤从队列静默删除（作业被吞）；内存/SQLite 双后端同语义，冲突仍整体拒绝零写入。
   - `seed_cursor` 入口（`OpsConsole`）与 `InMemoryStateBackend` 统一 fail-loud 校验（key 非空 `str`、value 必须 `str`），修复同一非法入参在 SQLite 腿抛异常、memory 腿静默 `str()` 强转的跨后端行为分歧，以及 console 双写（库存 `'123'` / 内存镜像 `123`）的值型漂移。
-  - `TaskLite.backend` setter 入口类型校验：非 `AbstractStateBackend` 实例（如后端名字符串、`None`）构造期即抛 `TypeError`，不再延迟到管理 API 调用才以 `AttributeError` 爆发。
+  - `TaskLite.backend` setter 入口类型校验：非后端对象（如后端名字符串、`None`）构造期即抛 `TypeError`，不再延迟到管理 API 调用才以 `AttributeError` 爆发；除 `AbstractStateBackend` 实例外，对提供读写核心方法（可调用 `load_queue` + `commit_job_success`）的鸭子类型对象放行（崩溃注入测试的部分伪造后端接缝）。
 - **调优标量合法性**：
   - `resolve_tuning` 对三参数调优标量增加合法性域校验（fail-loud）：`dep_grace_seconds` 必须为有限正值（`0`/负值/`NaN`/`inf` 会导致依赖宽限立即误杀或永不裁决活锁）；`commit_failure_dlq_threshold` 与 `deadlock_gap_max_rounds` 必须为 `>= 1` 的整数（`0` 会导致零轮即升级整队列死锁）。
   - `resolve_tuning` 类型严格化：轮次阈值仅接受真 `int`（bool、任意浮点与数字字符串 `TypeError` 拒绝），`dep_grace_seconds` 仅接受数值类型（bool/str 等拒绝）——此前 `int()`/`float()` 强转使 `deadlock_gap_max_rounds=1.9` 静默截断为 1（零恢复窗口，无根因死锁首轮即整队 DLQ），`"5"` 等数字字符串让类型漂移无告警穿透合法性域。
