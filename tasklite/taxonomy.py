@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import signal
 import types
 import typing
 from dataclasses import dataclass, field
@@ -29,6 +30,14 @@ ERR_MALFORMED_JOB = "MALFORMED_JOB"
 ERR_COMMIT_FAILURE_DLQ = "COMMIT_FAILURE_DLQ"
 ERR_DISPATCH_FAILURE = "DISPATCH_FAILURE"
 ERR_DEADLOCK_GAP = "DEADLOCK_CLASSIFICATION_GAP"
+
+# ── 子进程死亡归因错误串前缀（attribute_process_death 决策表产出，
+#    与 _classify_string 映射同源；DLQ 落盘串按前缀匹配分类） ─────────────
+ERR_TIMEOUT_PREFIX = "TIMEOUT ("
+ERR_PROCESS_CRASH_PREFIX = "PROCESS_CRASH_EXITCODE_"
+ERR_NO_IPC_RESULT = "NO_IPC_RESULT"
+ERR_PROCESS_SIGNAL_DEATH = "PROCESS_SIGNAL_DEATH"
+ERR_IPC_WRITE_DEGRADED_PREFIX = "IPC_RESULT_WRITE_DEGRADED"
 
 # ── DLQ error_type 分类常量 ──────────────────────────────────────────────
 ERROR_TYPE_FATAL = "fatal"
@@ -165,6 +174,22 @@ class ErrorClassification:
         if attempt is not None:
             meta["_attempt"] = attempt
         return meta
+
+
+@dataclass(frozen=True)
+class DeathAttribution:
+    """子进程死亡归因决策表的行值（不可变）。
+
+    attribute_process_death 是「exitcode × 超时 × timeout_is_transient →
+    瞬态/终局、result_meta、retry_error、dlq_error_type」的单一裁决点；
+    收割路径（有结果文件解码、无结果文件终局构造、stale 认领）对同一
+    根因必须经本表得到相同形状。
+    """
+
+    retry_requested: bool
+    result_meta: Dict[str, Any]
+    retry_error: Optional[str]
+    dlq_error_type: str
 
 
 def _safe_str(obj: Any) -> str:
@@ -402,6 +427,68 @@ class ErrorTaxonomy:
             raw_error=err_msg,
         )
 
+    def attribute_process_death(
+        self,
+        exitcode: Optional[int],
+        *,
+        timed_out: bool,
+        timeout_seconds: float = 0.0,
+        timeout_is_transient: bool = False,
+    ) -> DeathAttribution:
+        """子进程死亡归因决策表（Never-Raise 契约）。
+
+        收割侧的唯一裁决点：有结果文件解码路径与无结果文件终局构造路径
+        对同一 exitcode 必须得到相同的 meta 形状与错误串。决策列：
+
+        - timed_out ∧ timeout_is_transient → 瞬态重试（meta 留空，仅 retry_error）
+        - timed_out ∧ ¬timeout_is_transient → 终局（DLQ 落 fatal 型）
+        - exitcode < 0 → 信号死亡（signal/oom_hint 结构化键，烧预算瞬态）
+        - exitcode > 0 → 解释器/导入段崩溃（烧预算瞬态）
+        - exitcode ∈ {None, 0} → 无结果文件（烧预算瞬态）
+        """
+        if timed_out:
+            if timeout_is_transient:
+                return DeathAttribution(
+                    retry_requested=True,
+                    result_meta={},
+                    retry_error=f"{ERR_TIMEOUT_PREFIX}{timeout_seconds}s)",
+                    dlq_error_type=ERROR_TYPE_TRANSIENT_EXHAUSTED,
+                )
+            return DeathAttribution(
+                retry_requested=False,
+                result_meta={"error": f"{ERR_TIMEOUT_PREFIX}{timeout_seconds}s)"},
+                retry_error=None,
+                dlq_error_type=ERROR_TYPE_FATAL,
+            )
+        if exitcode is not None and exitcode < 0:
+            try:
+                sig_name = signal.Signals(-exitcode).name
+            except (ValueError, AttributeError):
+                sig_name = f"SIGNO{-exitcode}"
+            return DeathAttribution(
+                retry_requested=True,
+                result_meta={
+                    "error": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}",
+                    "signal": sig_name,
+                    "oom_hint": -exitcode == int(signal.SIGKILL),
+                },
+                retry_error=f"{ERR_PROCESS_SIGNAL_DEATH}: killed by {sig_name} ({exitcode})",
+                dlq_error_type=ERROR_TYPE_TRANSIENT_EXHAUSTED,
+            )
+        if exitcode:
+            return DeathAttribution(
+                retry_requested=True,
+                result_meta={"error": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}"},
+                retry_error=f"PROCESS_CRASH_EXIT: worker exited with code {exitcode}",
+                dlq_error_type=ERROR_TYPE_TRANSIENT_EXHAUSTED,
+            )
+        return DeathAttribution(
+            retry_requested=True,
+            result_meta={"error": ERR_NO_IPC_RESULT},
+            retry_error=f"{ERR_NO_IPC_RESULT}: worker exited without writing a result file",
+            dlq_error_type=ERROR_TYPE_TRANSIENT_EXHAUSTED,
+        )
+
     def _classify_dict(self, meta: Dict[str, Any]) -> ErrorClassification:
         # IPC 状态字典
         status = meta.get("status")
@@ -482,6 +569,13 @@ class ErrorTaxonomy:
             (ERR_MAX_RETRIES, ErrorCategory.TRANSIENT_EXHAUSTED, ERROR_TYPE_TRANSIENT_EXHAUSTED, False, False),
             (ERR_NO_HANDLER, ErrorCategory.NO_HANDLER, ERROR_TYPE_NO_HANDLER, False, True),
             (ERR_PAYLOAD_VALIDATION, ErrorCategory.VALIDATION, ERROR_TYPE_VALIDATION, False, False),
+            # 子进程死亡族（与 attribute_process_death 产出串同源）——
+            # 非瞬态超时终局落 fatal 型；其余死亡/降级串落瞬态型
+            (ERR_TIMEOUT_PREFIX, ErrorCategory.FATAL, ERROR_TYPE_FATAL, False, True),
+            (ERR_PROCESS_CRASH_PREFIX, ErrorCategory.TRANSIENT_EXHAUSTED, ERROR_TYPE_TRANSIENT_EXHAUSTED, True, False),
+            (ERR_NO_IPC_RESULT, ErrorCategory.TRANSIENT_EXHAUSTED, ERROR_TYPE_TRANSIENT_EXHAUSTED, True, False),
+            (ERR_PROCESS_SIGNAL_DEATH, ErrorCategory.TRANSIENT_EXHAUSTED, ERROR_TYPE_TRANSIENT_EXHAUSTED, True, False),
+            (ERR_IPC_WRITE_DEGRADED_PREFIX, ErrorCategory.TRANSIENT_EXHAUSTED, ERROR_TYPE_TRANSIENT_EXHAUSTED, True, False),
         )
         for code, cat, etype, trans, fatal in mapping:
             if error == code or error.startswith(code):
