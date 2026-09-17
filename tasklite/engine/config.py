@@ -32,6 +32,23 @@ class Tuning:
     deadlock_gap_max_rounds: int
 
 
+def _positive_int_rounds(value: Optional[int], default: int, name: str) -> int:
+    """轮次阈值规范化：仅真 int（bool/浮点/数字字符串 TypeError）且 >= 1。
+
+    浮点截断（如 1.9 → 1）会静默落入「零恢复窗口」致命域，字符串强转
+    则让类型漂移无告警穿透，一律 fail-loud。
+    """
+    if value is None:
+        value = default
+    elif not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(
+            f"{name} must be an int, got {type(value).__name__} ({value!r})"
+        )
+    if value < 1:
+        raise ValueError(f"{name} must be an int >= 1, got {value!r}")
+    return value
+
+
 def resolve_tuning(
     *,
     dep_grace_seconds: Optional[float] = None,
@@ -65,36 +82,14 @@ def resolve_tuning(
         raise ValueError(
             f"dep_grace_seconds must be a finite number > 0, got {dep_grace_seconds!r}"
         )
-    if commit_failure_dlq_threshold is None:
-        threshold = COMMIT_FAILURE_DLQ_THRESHOLD
-    else:
-        if not isinstance(commit_failure_dlq_threshold, int) or isinstance(commit_failure_dlq_threshold, bool):
-            raise TypeError(
-                f"commit_failure_dlq_threshold must be an int, got "
-                f"{type(commit_failure_dlq_threshold).__name__} "
-                f"({commit_failure_dlq_threshold!r})"
-            )
-        threshold = commit_failure_dlq_threshold
-    if threshold < 1:
-        raise ValueError(
-            f"commit_failure_dlq_threshold must be an int >= 1, "
-            f"got {commit_failure_dlq_threshold!r}"
-        )
-    if deadlock_gap_max_rounds is None:
-        gap_rounds = DEADLOCK_GAP_MAX_ROUNDS
-    else:
-        if not isinstance(deadlock_gap_max_rounds, int) or isinstance(deadlock_gap_max_rounds, bool):
-            raise TypeError(
-                f"deadlock_gap_max_rounds must be an int, got "
-                f"{type(deadlock_gap_max_rounds).__name__} "
-                f"({deadlock_gap_max_rounds!r})"
-            )
-        gap_rounds = deadlock_gap_max_rounds
-    if gap_rounds < 1:
-        raise ValueError(
-            f"deadlock_gap_max_rounds must be an int >= 1, "
-            f"got {deadlock_gap_max_rounds!r}"
-        )
+    threshold = _positive_int_rounds(
+        commit_failure_dlq_threshold, COMMIT_FAILURE_DLQ_THRESHOLD,
+        "commit_failure_dlq_threshold",
+    )
+    gap_rounds = _positive_int_rounds(
+        deadlock_gap_max_rounds, DEADLOCK_GAP_MAX_ROUNDS,
+        "deadlock_gap_max_rounds",
+    )
     return Tuning(
         dep_grace_seconds=grace,
         commit_failure_dlq_threshold=threshold,

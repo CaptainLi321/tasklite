@@ -585,6 +585,15 @@ class ArtifactJournal:
             return False
         return True
 
+    def _cleanup_sandbox_guard(self, uid: str, raw_path: str) -> bool:
+        """清理卫兵：归属复检失败时告警一次并示意调用方跳过该路径。"""
+        if self._in_cleanup_sandbox(raw_path):
+            return True
+        logger.error(
+            f"Refusing to clean declared path outside sandbox for {uid}: {raw_path}"
+        )
+        return False
+
     def verify_outputs(self, uid: str) -> Tuple[bool, Optional[str]]:
         """校验 job 的产物是否存在（忽略临时 cache）。
 
@@ -641,10 +650,7 @@ class ArtifactJournal:
             try:
                 for out_path, _, kind in self.read_outputs(uid):
                     if kind == "cache":
-                        if not self._in_cleanup_sandbox(out_path):
-                            logger.error(
-                                f"Refusing to clean declared path outside sandbox for {uid}: {out_path}"
-                            )
+                        if not self._cleanup_sandbox_guard(uid, out_path):
                             continue
                         out_obj = Path(out_path)
                         if out_obj.exists():
@@ -665,10 +671,7 @@ class ArtifactJournal:
             try:
                 for out_path, cleanup, kind in self.read_outputs(uid):
                     if kind == "cache" or cleanup:
-                        if not self._in_cleanup_sandbox(out_path):
-                            logger.error(
-                                f"Refusing to clean declared path outside sandbox for {uid}: {out_path}"
-                            )
+                        if not self._cleanup_sandbox_guard(uid, out_path):
                             continue
                         out_path_obj = Path(out_path)
                         if out_path_obj.exists():
