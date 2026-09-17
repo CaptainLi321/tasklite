@@ -191,10 +191,6 @@ class TaskContext:
             self._journal.record_input_uri(self.job.uid, url_str, uri_fingerprint)
         return url_str
 
-    def _resolve_path(self, raw: str, sandbox: bool) -> str:
-        """解析声明路径为规范绝对路径（委托 ArtifactJournal）。"""
-        return ArtifactJournal.resolve_and_validate_path(raw, self.output_root, sandbox=sandbox)
-
     def is_completed(self, uid: str) -> bool:
         """Check if a job is already in wall 快照（已成功完成过的内容）。
 
