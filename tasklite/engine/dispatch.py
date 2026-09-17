@@ -37,7 +37,7 @@ from ..models.job import Job, JobRuntimeState
 from ..taxonomy import ErrorTaxonomy
 from .channel import ArtifactCleanupMode, JobHandle, WorkerLaunchSpec
 from .inflight import InFlightJob
-from .resource import RateLimitUnavailable, persist_resource_suspensions
+from .resource import RateLimitUnavailable, apply_suspend_signals
 from .scheduler import DeadlockAttribution
 
 logger = logging.getLogger("tasklite")
@@ -303,17 +303,9 @@ class DispatchMachine:
         except Exception as e:
             logger.warning(f"Failed to salvage residue signals for {uid}: {e}")
             return
-        applied = False
-        for _residue_uid, r_name, secs in signals:
-            if self._resources.suspend_resource(r_name, secs):
-                applied = True
-            else:
-                logger.warning(
-                    f"Skipping suspend signal for unregistered resource "
-                    f"{r_name!r} (from residue of {uid})"
-                )
-        if applied:
-            persist_resource_suspensions(self._store.backend, self._resources)
+        apply_suspend_signals(
+            signals, self._store.backend, self._resources, origin="residue of "
+        )
 
 
     def dispatch_job(self, sched: Any) -> Optional[InFlightJob]:

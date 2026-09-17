@@ -26,7 +26,9 @@ from ..models.job import Job, JobRuntimeState
 from ..models.state import uid_from_job_dict
 from ..utils.jsonutil import loads
 from .inflight import InFlightJob, InFlightTracker
-from .resource import META_RESOURCE_SUSPENDS, persist_resource_suspensions
+from .resource import (
+    META_RESOURCE_SUSPENDS, apply_suspend_signals, persist_resource_suspensions
+)
 
 logger = logging.getLogger("tasklite")
 
@@ -232,21 +234,12 @@ class RecoveryOrchestrator:
         except Exception as e:
             logger.warning(f"Failed to salvage residue signals: {e}")
             return
-        applied = False
-        for uid, r_name, secs in signals:
-            if self._resources.suspend_resource(r_name, secs):
-                logger.info(
-                    f"Applied suspend signal salvaged from residue of {uid}: "
-                    f"{r_name} for {secs}s"
-                )
-                applied = True
-            else:
-                logger.warning(
-                    f"Skipping suspend signal for unregistered resource "
-                    f"{r_name!r} (from residue of {uid})"
-                )
-        if applied:
-            persist_resource_suspensions(self._store.backend, self._resources)
+        apply_suspend_signals(
+            signals,
+            self._store.backend,
+            self._resources,
+            origin="salvaged from residue of ",
+        )
 
 
     def save_queue_crash_safe(self) -> None:
@@ -311,18 +304,9 @@ class RecoveryOrchestrator:
         signals = self._channel.drain_active_signals(
             self._in_flight.active_uids()
         )
-        applied = False
-        for uid, r_name, secs in signals:
-            if self._resources.suspend_resource(r_name, secs):
-                logger.info(f"Applied suspend signal from {uid}: {r_name} for {secs}s")
-                applied = True
-            else:
-                logger.warning(
-                    f"Skipping suspend signal for unregistered resource "
-                    f"{r_name!r} (from {uid})"
-                )
-        if applied:
-            persist_resource_suspensions(self._store.backend, self._resources)
+        apply_suspend_signals(
+            signals, self._store.backend, self._resources, origin="from "
+        )
 
 
 
@@ -352,21 +336,12 @@ class RecoveryOrchestrator:
         # 3.5 杀进程后补排空的应用点：cancelled 任务的信号文件已随半成品
         # 清理删除，channel 捞回的 suspend 信号只能经 AbortOutcome 带回；
         # suspend 为 max 语义，与「先排空」阶段已应用项幂等合并。
-        applied = False
-        for uid, r_name, secs in outcome.salvaged_signals:
-            if self._resources.suspend_resource(r_name, secs):
-                logger.info(
-                    f"Applied suspend signal salvaged from aborted {uid}: "
-                    f"{r_name} for {secs}s"
-                )
-                applied = True
-            else:
-                logger.warning(
-                    f"Skipping suspend signal for unregistered resource "
-                    f"{r_name!r} (from aborted {uid})"
-                )
-        if applied:
-            persist_resource_suspensions(self._store.backend, self._resources)
+        apply_suspend_signals(
+            outcome.salvaged_signals,
+            self._store.backend,
+            self._resources,
+            origin="salvaged from aborted ",
+        )
 
         completed_map = {h.uid: res for h, res in outcome.completed}
         cancelled_entries, done_entries = self._in_flight.classify_aborted(completed_map)

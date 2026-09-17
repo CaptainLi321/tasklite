@@ -44,6 +44,33 @@ def persist_resource_suspensions(backend: Any, resource_mgr: "ResourceManager") 
         logger.error(f"Failed to persist resource suspends to meta: {e}")
 
 
+def apply_suspend_signals(
+    signals: Iterable[Tuple[str, str, float]],
+    backend: Any,
+    resource_mgr: "ResourceManager",
+    origin: str = "",
+) -> None:
+    """应用一批排空回收的 ``(uid, resource, seconds)`` 挂起信号并按需持久化。
+
+    ``suspend()`` 为 max 语义，重复应用幂等。单条应用失败（资源未注册）
+    降级告警跳过、不打断批处理；任一条应用成功即整体落盘一次。
+    ``origin`` 是信号来源描述前缀（如 ``"from "`` / ``"salvaged from
+    aborted "``），仅用于日志归因。
+    """
+    applied = False
+    for uid, r_name, secs in signals:
+        if resource_mgr.suspend_resource(r_name, secs):
+            logger.info(f"Applied suspend signal {origin}{uid}: {r_name} for {secs}s")
+            applied = True
+        else:
+            logger.warning(
+                f"Skipping suspend signal for unregistered resource "
+                f"{r_name!r} ({origin}{uid})"
+            )
+    if applied:
+        persist_resource_suspensions(backend, resource_mgr)
+
+
 class Resource(ABC):
     def __init__(self, name: str):
         self.name = name
