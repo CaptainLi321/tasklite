@@ -38,7 +38,7 @@ from ..taxonomy import ErrorTaxonomy
 from .channel import ArtifactCleanupMode, JobHandle, WorkerLaunchSpec
 from .inflight import InFlightJob
 from .resource import RateLimitUnavailable, apply_suspend_signals
-from .scheduler import StandstillFacts
+from .scheduler import ScheduleResult, StandstillFacts
 
 logger = logging.getLogger("tasklite")
 
@@ -297,29 +297,20 @@ class DispatchMachine:
         )
 
 
-    def dispatch_job(self, sched: Any) -> Optional[InFlightJob]:
+    def dispatch_job(self, sched: ScheduleResult) -> Optional[InFlightJob]:
         """统一派发单个作业：出队 -> 五关预检 -> 两阶段资源租约 -> 子进程启动 -> in-flight 原子登记。
 
-        参数 sched 可以为 ScheduleResult、Job 实例或 job_dict 字典。
         返回 InFlightJob 条目；若被预检五关拦截（去重/依赖失败/无handler/孤儿延迟/残留恢复）或校验失败，返回 None。
         """
         store = self._store
-        if isinstance(sched, Job):
-            job = sched
-            job_dict = job.to_dict()
-            pending_dep_failure = None
-        elif isinstance(sched, dict):
-            job_dict = sched
-            job = Job.from_dict(job_dict)
-            pending_dep_failure = None
-        else:
-            runnable_idx = getattr(sched, "runnable_idx", 0)
-            if runnable_idx is None:
-                return None
-            kind = getattr(sched, "kind", "runnable")
-            pending_dep_failure = getattr(sched, "pending_dep_failure", None) if kind == "dep_failed" else None
-            job_dict = store.pop_job(runnable_idx)
-            job = Job.from_dict(job_dict)
+        runnable_idx = sched.runnable_idx
+        if runnable_idx is None:
+            return None
+        pending_dep_failure = (
+            sched.pending_dep_failure if sched.kind == "dep_failed" else None
+        )
+        job_dict = store.pop_job(runnable_idx)
+        job = Job.from_dict(job_dict)
 
         uid = job.uid
         # 预检五关以调用顺序表达时序契约，每关返回 True=已处理。

@@ -136,6 +136,7 @@ def test_dispatch_job_rate_limit_recheck_defers_transiently(tmp_path, monkeypatc
     )
 
     job = Job("demo", "1", resources={"api": 1.0})
+    ctx.store.requeue_jobs([job.to_dict()])
     # 评估时点资源可用（调度器据此判可运行），随后挂起信号在预约前被排空应用
     assert dispatch._resources.evaluate("demo", {"api": 1.0}).is_available
     monkeypatch.setattr(
@@ -144,7 +145,9 @@ def test_dispatch_job_rate_limit_recheck_defers_transiently(tmp_path, monkeypatc
         lambda uids: [("demo::1", "api", 30.0)],
     )
 
-    entry = dispatch.dispatch_job(job)
+    sched = dispatch._scheduler.pop_next_runnable(ctx.store, ctx.store.in_flight_uids)
+    assert sched.runnable_idx is not None
+    entry = dispatch.dispatch_job(sched)
 
     assert entry is None
     assert "demo::1" in ctx.store.queue_uids, "瞬态 defer 后作业必须降级写盘回队"

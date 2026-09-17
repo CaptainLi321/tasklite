@@ -254,9 +254,8 @@ class TestCommitSkipCrashTerminalPreservation:
         state = PipelineState(wall, failed, {}, [jd])
         pipeline._runtime.store.set_state(state)
         monkeypatch.setattr(pipeline.backend, "commit_skip", lambda uid: False)
-        return pipeline, SimpleNamespace(
-            runnable_idx=0, pending_dep_failure=None, kind="runnable",
-        )
+        from tasklite.engine.scheduler import ScheduleResult
+        return pipeline, ScheduleResult(runnable_idx=0, kind="runnable")
 
     def test_commit_skip_failure_preserves_wall_success(self, tmp_path, monkeypatch):
         """wall 成功终态 + commit_skip 失败 → _CommitCrashSignal，wall 不翻 DLQ。"""
@@ -348,7 +347,8 @@ class TestCommitFailedCrashContractBreach:
         """payload 校验失败路径：commit 失败 + commit_failed_crash 正常返回
         → dispatch_job 正常返回 None。"""
         from typing import TypedDict
-        from types import SimpleNamespace
+
+        from tasklite.engine.scheduler import ScheduleResult
 
         class Schema(TypedDict):
             url: str
@@ -362,7 +362,7 @@ class TestCommitFailedCrashContractBreach:
             lambda uid, reason, job_dict: None,
         )
 
-        sched = SimpleNamespace(runnable_idx=0, pending_dep_failure=None, kind="runnable")
+        sched = ScheduleResult(runnable_idx=0, kind="runnable")
         result = pipeline._runtime._dispatch.dispatch_job(sched)
         assert result is None
 
