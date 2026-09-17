@@ -141,25 +141,6 @@ class ErrorClassification:
     raw_error: str = ""
     diagnostic_details: Optional[Dict[str, Any]] = None
 
-    def to_worker_ipc_dict(self) -> Dict[str, Any]:
-        """Worker 子进程写入 IPC 结果文件的紧凑字典。"""
-        if self.is_interrupted:
-            res: Dict[str, Any] = {"status": "interrupted", "error": self.raw_error}
-        elif self.lock_conflict:
-            res = {"status": "retry", "lock_conflict": True, "error": self.raw_error}
-        elif self.is_retry or self.is_transient:
-            res = {"status": "retry", "error": self.raw_error}
-        elif self.is_fatal:
-            res = {"status": "fatal", "error": self.raw_error}
-        else:
-            res = {"status": "error", "error": self.raw_error}
-
-        if self.traceback_str:
-            res["traceback"] = self.traceback_str
-        if self.diagnostic_details:
-            res["details"] = self.diagnostic_details
-        return res
-
     def to_dlq_meta(self, *, attempt: Optional[int] = None) -> Dict[str, Any]:
         """构建落入 failed_dlq 表的标准元数据字典。"""
         meta: Dict[str, Any] = {
@@ -297,11 +278,12 @@ class ErrorTaxonomy:
     def classify(
         self,
         target: Union[BaseException, ValidationResult, Dict[str, Any], str, None],
-        *,
-        timeout_is_transient: bool = False,
-        exitcode: Optional[int] = None,
     ) -> ErrorClassification:
-        """错误分类单一入口（Never-Raise 契约保证）。"""
+        """错误分类单一入口（Never-Raise 契约保证）。
+
+        进程死亡归因不经本入口——收割侧统一走 attribute_process_death
+        决策表（exitcode 归因与异常/字符串分类是两套正交裁决）。
+        """
         # 1. 校验失败对象
         if isinstance(target, ValidationResult):
             return ErrorClassification(
@@ -319,11 +301,7 @@ class ErrorTaxonomy:
         if isinstance(target, BaseException):
             return self._classify_exception(target)
 
-        # 3. 进程退出码
-        if exitcode is not None:
-            return self._classify_exitcode(exitcode, timeout_is_transient, raw_error=_safe_str(target or ""))
-
-        # 4. 字典（IPC 字典或 DLQ meta 字典）
+        # 3. 字典（IPC 字典或 DLQ meta 字典）
         if isinstance(target, dict):
             return self._classify_dict(target)
 
@@ -407,24 +385,6 @@ class ErrorTaxonomy:
             is_fatal=False,
             is_retry=False,
             raw_error=raw_err,
-        )
-
-    def _classify_exitcode(
-        self, exitcode: int, timeout_is_transient: bool, raw_error: str
-    ) -> ErrorClassification:
-        is_oom = exitcode == -9
-        is_sig = exitcode < 0
-        err_msg = raw_error or f"Process terminated with exitcode {exitcode}"
-        is_trans = timeout_is_transient or is_oom
-
-        return ErrorClassification(
-            category=ErrorCategory.TRANSIENT_EXHAUSTED if is_trans else ErrorCategory.FATAL,
-            error_code=ERR_MAX_RETRIES if is_trans else "",
-            dlq_error_type=ERROR_TYPE_TRANSIENT_EXHAUSTED if is_trans else ERROR_TYPE_FATAL,
-            is_transient=is_trans,
-            is_fatal=not is_trans and not is_sig,
-            is_retry=is_trans,
-            raw_error=err_msg,
         )
 
     def attribute_process_death(

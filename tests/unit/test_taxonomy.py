@@ -88,22 +88,12 @@ class TestErrorTaxonomyClassification:
         assert cl.is_retry is True
         assert cl.category == ErrorCategory.TRANSIENT_EXHAUSTED
 
-    def test_classify_exitcodes(self):
+    def test_classify_no_longer_takes_exitcode(self):
+        """进程死亡归因不经 classify——收割侧统一走 attribute_process_death
+        决策表(test_death_attribution.py 锁定全组合)。"""
         taxonomy = ErrorTaxonomy()
-
-        # OOM (-9)
-        cl_oom = taxonomy.classify(None, exitcode=-9)
-        assert cl_oom.is_transient is True
-        assert cl_oom.category == ErrorCategory.TRANSIENT_EXHAUSTED
-
-        # SIGSEGV (-11)
-        cl_segv = taxonomy.classify(None, exitcode=-11)
-        assert cl_segv.is_transient is False
-        assert cl_segv.category == ErrorCategory.FATAL
-
-        # 超时被标记为瞬态
-        cl_timeout = taxonomy.classify(None, exitcode=-9, timeout_is_transient=True)
-        assert cl_timeout.is_transient is True
+        with pytest.raises(TypeError):
+            taxonomy.classify(None, exitcode=-9)
 
     def test_classify_meta_dictionaries_and_ipc(self):
         taxonomy = ErrorTaxonomy()
@@ -199,9 +189,6 @@ class TestNeverRaiseAgainstBrokenStr:
         cl_obj = taxonomy.classify(_BrokenStrObject())
         assert isinstance(cl_obj, ErrorClassification)
         assert cl_obj.category == ErrorCategory.UNKNOWN
-        # exitcode 路径
-        cl_exit = taxonomy.classify(_BrokenStrObject(), exitcode=1)
-        assert isinstance(cl_exit, ErrorClassification)
         # 字典路径（IPC/DLQ meta 的 error 值不可信）
         cl_dict = taxonomy.classify({"status": "retry", "error": _BrokenStrObject()})
         assert isinstance(cl_dict, ErrorClassification)
