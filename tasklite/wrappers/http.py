@@ -331,7 +331,10 @@ class HttpPolicy:
         if isinstance(exc, urllib.error.HTTPError):
             return self.classify_status(exc.code, exc)
 
-        # requests.exceptions.HTTPError 软适配
+        # 契约：任何携带 ``response.status_code`` 的库异常——
+        # requests.HTTPError、httpx.HTTPStatusError（含用户在守卫块内
+        # ``raise_for_status()`` 主动 raise 的形态）、curl_cffi 同构——
+        # 一律按状态码接管分类，不落下方传输层模块兜底。
         if hasattr(exc, "response") and getattr(exc.response, "status_code", None) is not None:
             return self.classify_status(exc.response.status_code, exc.response)
 
@@ -404,7 +407,10 @@ class http_guard:
     """HTTP 请求守卫（上下文管理器）。
 
     功能：
-    1. 捕获代码块内抛出的异常，或通过 `check_response` 检查响应状态码；
+    1. 捕获代码块内抛出的异常，或通过 `check_response` 检查响应状态码。
+       块内用户主动 raise 的状态异常（如 ``resp.raise_for_status()`` 抛出
+       的 ``httpx.HTTPStatusError`` / ``requests.HTTPError``）同样按
+       ``response.status_code`` 接管分类——raise 必须发生在守卫块内；
     2. 遭遇 429 限流时：自动解析 Retry-After（依次取异常 `headers` 与 requests 风格
        `exc_val.response.headers`），自动调用 `ctx.suspend_resource` 挂起对应的限速资源，并抛出 `RateLimitHit`；
     3. 遭遇 5xx/超时等瞬态错误：转换为 `RetryError` 触发调度器退避重试；

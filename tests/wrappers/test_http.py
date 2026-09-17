@@ -262,6 +262,49 @@ def test_http_guard_requests_style_retry_after_from_response() -> None:
     assert ctx.calls == [("api_x", 20.0)]
 
 
+@pytest.mark.parametrize(
+    "status_code, expected_exc, retry_after",
+    [
+        (429, RateLimitHit, "20"),
+        (503, RetryError, None),
+        (404, FatalError, None),
+    ],
+)
+def test_http_guard_httpx_status_error_style_takeover(
+    status_code: int, expected_exc: type, retry_after: Any,
+) -> None:
+    """httpx.HTTPStatusError 形态（``raise_for_status`` 主动 raise）按状态码三分类接管。
+
+    契约：守卫块内任何携带 ``response.status_code`` 的库异常一律走状态码
+    分类，不落传输层模块兜底——429 的挂起退避不因「用户自己 raise」而
+    丢失，且 Retry-After 从 ``exc.response.headers`` 提取（httpx 异常
+    同样无顶层 headers 属性）。
+    """
+
+    class _HTTPXStatusError(Exception):
+        """模拟 httpx.HTTPStatusError：携带 request/response，无 headers 属性。"""
+
+        def __init__(self, response: Any) -> None:
+            super().__init__(f"HTTP status {response.status_code}")
+            self.request = object()
+            self.response = response
+
+    class _Response:
+        def __init__(self, code: int, headers: Any) -> None:
+            self.status_code = code
+            self.headers = headers
+
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    ctx = _StrictSuspendCtx()
+    with pytest.raises(expected_exc):
+        with http_guard(ctx=ctx, resource="api_x", default_suspend_ttl=60.0):
+            raise _HTTPXStatusError(_Response(status_code, headers))
+    if expected_exc is RateLimitHit:
+        assert ctx.calls == [("api_x", 20.0)]
+    else:
+        assert ctx.calls == []
+
+
 def test_default_suspend_ttl_construction_validation() -> None:
     """default_suspend_ttl 构造期 fail-loud：非数值 TypeError，非有限/非正值 ValueError。
 
