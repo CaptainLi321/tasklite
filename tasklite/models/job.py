@@ -18,6 +18,13 @@ _MAX_SAFE_UID_BYTES = 199
 
 WORKER_RESOURCE = "__workers__"
 
+# rerun 策略合法值（校验点：Job 构造 / set_discovery_rerun / register_discovery）
+# 与「豁免重跑」子集（判定点：PipelineState 六集合互斥豁免）的单一真相；
+# 豁免集 = 合法集 − {"never"}，新增策略值漏改任一消费点即静默丢豁免。
+RERUN_VALUES = ("never", "on_failure", "every_run", "on_input_change")
+RERUN_EXEMPT_VALUES = ("every_run", "on_failure", "on_input_change")
+assert set(RERUN_EXEMPT_VALUES) == set(RERUN_VALUES) - {"never"}
+
 
 def _is_finite(value: Any) -> bool:
     """math.isfinite 的溢出安全版：超出 float 范围的超大 int（如 10**400）
@@ -417,12 +424,10 @@ class Job:
         # rerun 策略入口校验（fail-loud）——非法值会被静默当 "never" 处理。
         # None 是「未指定」哨兵（可被 discovery 默认注入），
         # 显式字符串一律尊重；仅拒绝未知字符串值。
-        if rerun is not None and rerun not in (
-            "never", "on_failure", "every_run", "on_input_change",
-        ):
+        if rerun is not None and rerun not in RERUN_VALUES:
             raise ValueError(
                 f"rerun must be None (unspecified) or one of "
-                f"'never'/'on_failure'/'every_run'/'on_input_change', got {rerun!r}"
+                f"{'/'.join(repr(v) for v in RERUN_VALUES)}, got {rerun!r}"
             )
         self.rerun = rerun
         # 运行时边带状态（退避截止/3-strike 计数/最近重试错误）收敛到

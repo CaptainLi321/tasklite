@@ -22,7 +22,7 @@ from .engine.store import DLQEntry
 from .engine.console import OpsConsole, SuspendEntry
 from .engine.types import HandlerEntry
 from .models.context import TaskContext
-from .models.job import Job, WORKER_RESOURCE
+from .models.job import Job, RERUN_VALUES, WORKER_RESOURCE
 from .taxonomy import (
     ErrorTaxonomy,
     validate_declared_exception_classes,
@@ -405,10 +405,10 @@ class TaskLite:
             )
         if "::" in task_type:
             raise ValueError(f"task_type must not contain '::', got {task_type!r}")
-        if rerun not in ("never", "on_failure", "every_run", "on_input_change"):
+        if rerun not in RERUN_VALUES:
             raise ValueError(
-                f"rerun must be one of 'never'/'on_failure'/'every_run'/"
-                f"'on_input_change', got {rerun!r}"
+                f"rerun must be one of "
+                f"{'/'.join(repr(v) for v in RERUN_VALUES)}, got {rerun!r}"
             )
         if task_type in self._discovery_rerun:
             logger.warning(

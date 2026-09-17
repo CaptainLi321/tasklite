@@ -128,6 +128,8 @@ import pickle
 import re
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol
 
+from ..models.job import RERUN_VALUES
+
 logger = logging.getLogger("tasklite")
 
 
@@ -556,10 +558,10 @@ def register_discovery(
             ) from e
     if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
         raise ValueError(f"max_pages must be a positive int, got {max_pages!r}")
-    if rerun not in ("never", "on_failure", "every_run", "on_input_change"):
+    if rerun not in RERUN_VALUES:
         raise ValueError(
-            f"rerun must be one of 'never'/'on_failure'/'every_run'/"
-            f"'on_input_change', got {rerun!r}"
+            f"rerun must be one of "
+            f"{'/'.join(repr(v) for v in RERUN_VALUES)}, got {rerun!r}"
         )
 
     handler = DiscoveryHandler(

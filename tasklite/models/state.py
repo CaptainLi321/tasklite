@@ -15,7 +15,13 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, FrozenSet, List, Mapping
 
-from .job import Job
+from .job import Job, RERUN_EXEMPT_VALUES
+
+
+def _is_rerun_exempt(job_dict: dict) -> bool:
+    """rerun 策略允许越过终态重跑的作业可合法落在 wall/failed ∩ 队列
+    交集——六集合互斥断言对此类作业豁免。"""
+    return job_dict.get("rerun") in RERUN_EXEMPT_VALUES
 
 
 def uid_from_job_dict(job_dict: dict) -> str:
@@ -56,7 +62,7 @@ class PipelineState:
         self._in_flight_uids: set = set()
         self._rerun_active_uids: set = set()
         for j in self._queue:
-            if j.get("rerun") in ("every_run", "on_failure", "on_input_change"):
+            if _is_rerun_exempt(j):
                 self._rerun_active_uids.add(uid_from_job_dict(j))
 
     @property
@@ -85,7 +91,7 @@ class PipelineState:
         """弹出并返回 job dict，同步从 _queue_uids 移除其 uid。"""
         job_dict = self._queue.pop(idx)
         uid = uid_from_job_dict(job_dict)
-        if job_dict.get("rerun") in ("every_run", "on_failure", "on_input_change"):
+        if _is_rerun_exempt(job_dict):
             self._rerun_active_uids.add(uid)
         self._queue_uids.discard(uid)
         if __debug__:
@@ -100,7 +106,7 @@ class PipelineState:
             self._queue.extend(job_dicts)
         self._queue_uids.update(uid_from_job_dict(j) for j in job_dicts)
         for j in job_dicts:
-            if j.get("rerun") in ("every_run", "on_failure", "on_input_change"):
+            if _is_rerun_exempt(j):
                 self._rerun_active_uids.add(uid_from_job_dict(j))
         if __debug__:
             self._assert_uids_consistent()
@@ -139,7 +145,7 @@ class PipelineState:
         self._in_flight_uids.clear()
         self._rerun_active_uids = {
             uid_from_job_dict(j) for j in self._queue
-            if j.get("rerun") in ("every_run", "on_failure", "on_input_change")
+            if _is_rerun_exempt(j)
         }
         if __debug__:
             self._assert_state_consistent()
@@ -150,7 +156,7 @@ class PipelineState:
         self._queue_uids = {uid_from_job_dict(j) for j in self._queue}
         self._rerun_active_uids = {
             uid_from_job_dict(j) for j in self._queue
-            if j.get("rerun") in ("every_run", "on_failure", "on_input_change")
+            if _is_rerun_exempt(j)
         }
         if __debug__:
             self._assert_uids_consistent()
@@ -340,7 +346,7 @@ class PipelineState:
         ``_rerun_active_uids``（缓存被瞬态路径误删时断言不得误报）。"""
         return {
             uid_from_job_dict(j) for j in self._queue
-            if j.get("rerun") in ("every_run", "on_failure", "on_input_change")
+            if _is_rerun_exempt(j)
         }
 
     def _assert_uids_consistent(self) -> None:
