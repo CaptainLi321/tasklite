@@ -441,6 +441,25 @@ class TaskLite:
         self.register_transient_exceptions(classes)
 
 
+    def uncompleted(self, jobs: Sequence[Job]) -> List[Job]:
+        """过滤出尚未成功完成的 job（uid 不在 wall 的子集，保留输入顺序）。
+
+        回溯/增量场景的入队前过滤辅助——调用方自行查 wall 过滤时，漏掉
+        这一步的 job 会整批撞 wall 以 skipped 统计空转。标准姿势：
+        ``pipeline.enqueue(pipeline.uncompleted(jobs))``。
+
+        边界语义：
+        - 只按 wall（成功历史）过滤；DLQ（failed）中的 job **不**排除——
+          重新入队后是否重跑由 ``Job(rerun=...)`` 在派发层裁决（默认
+          ``never`` 静默跳过，``on_failure`` 重跑），此处抢先过滤会吞掉
+          重跑策略的豁免语义；
+        - 已驻留队列的重复 uid 不排除——队列去重是 ``enqueue`` 自身的
+          职责（重复 uid 静默跳过）。
+        """
+        self._ensure_not_running("uncompleted")
+        wall = self._backend.load_wall()
+        return [j for j in jobs if j.uid not in wall]
+
     def enqueue(self, jobs: Union[Job, Sequence[Job]], front: bool = False) -> None:
         """Add jobs to the queue.
 
