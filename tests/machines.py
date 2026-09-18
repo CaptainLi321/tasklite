@@ -26,7 +26,7 @@ from tasklite.engine.store import StateStore
 from tasklite.engine.types import TaskStats
 from tasklite.models.job import WORKER_RESOURCE
 from tasklite.models.state import PipelineState
-from tasklite.taxonomy import ErrorTaxonomy
+from tasklite.taxonomy import ERR_COMMIT_FAILURE_DLQ, ErrorTaxonomy
 
 __all__ = [
     "MachineEnv",
@@ -35,6 +35,50 @@ __all__ = [
     "FakeChannel",
     "FakeInFlight",
 ]
+
+
+class CommitFailureBackend:
+    """commit 故障注入 backend：列名方法恒返 False，其余委托真实后端。
+
+    因 pipeline.backend 热切换后对象自身被引用，读路径（load_*/get_meta
+    等）经 __getattr__ 委托真实后端防递归。``dlq_pass_through`` 时
+    commit_job_failure 对 COMMIT_FAILURE_DLQ 熔断 meta 放行 True
+    （3-strike 单条 DLQ 熔断路径需要 DLQ 写入成功才能走到终态分支）。
+    """
+
+    FAILING_ALL = (
+        "commit_job_success", "commit_job_failure", "commit_retry",
+        "commit_bulk_failure",
+    )
+
+    def __init__(self, real_backend, *, failing=FAILING_ALL, dlq_pass_through=False):
+        self._real = real_backend
+        self._failing = frozenset(failing)
+        self._dlq_pass_through = dlq_pass_through
+
+    def _commit(self, name, *args, **kwargs):
+        if name in self._failing:
+            if name == "commit_job_failure" and self._dlq_pass_through:
+                meta = args[1] if len(args) > 1 else kwargs.get("failed_meta", {})
+                if str(meta.get("error", "")).startswith(ERR_COMMIT_FAILURE_DLQ):
+                    return True
+            return False
+        return getattr(self._real, name)(*args, **kwargs)
+
+    def commit_job_success(self, *a, **k):
+        return self._commit("commit_job_success", *a, **k)
+
+    def commit_job_failure(self, *a, **k):
+        return self._commit("commit_job_failure", *a, **k)
+
+    def commit_retry(self, *a, **k):
+        return self._commit("commit_retry", *a, **k)
+
+    def commit_bulk_failure(self, *a, **k):
+        return self._commit("commit_bulk_failure", *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 class FakeChannel:

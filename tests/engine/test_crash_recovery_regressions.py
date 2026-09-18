@@ -27,6 +27,7 @@ from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
 from tasklite.pipeline import TaskLite
+from tests.machines import CommitFailureBackend
 from tests.helpers import (
     _write_fake_result,
     FakeManager,
@@ -145,21 +146,7 @@ class TestCommitCrashSignalCleanup:
         # 先捕获真实后端引用（替换后 pipeline.backend 指向伪造对象自身，
         # 委托 load_queue/save_queue 需指向真实后端避免递归）。
         real_backend = pipeline.backend
-        class FailingBackend:
-            def load_wall(self): return {}
-            def load_failed(self): return {}
-            def load_cursors(self): return {}
-            def load_queue(self): return real_backend.load_queue()
-            def save_queue(self, jobs): real_backend.save_queue(jobs)
-            def commit_job_success(self, *a, **k): return False
-            def commit_job_failure(self, *a, **k): return False
-            def commit_retry(self, *a, **k): return False
-            def commit_bulk_failure(self, *a, **k): return False
-            def append_failed(self, *a, **k): return None
-            def get_meta(self, key): return None
-            def set_meta(self, key, value): return None
-
-        pipeline.backend = FailingBackend()
+        pipeline.backend = CommitFailureBackend(real_backend)
 
         class StartFakeProcess:
             def __init__(self, target=None, args=(), **kwargs):
@@ -229,21 +216,7 @@ class TestCommitCrashSignalCleanup:
         # 先捕获真实后端引用（替换后 pipeline.backend 指向伪造对象自身，
         # 委托 load_queue/save_queue 需指向真实后端避免递归）。
         real_backend = pipeline.backend
-        class FailingFailureBackend:
-            def load_wall(self): return {}
-            def load_failed(self): return {}
-            def load_cursors(self): return {}
-            def load_queue(self): return real_backend.load_queue()
-            def save_queue(self, jobs): real_backend.save_queue(jobs)
-            def commit_job_success(self, *a, **k): return False
-            def commit_job_failure(self, *a, **k): return False
-            def commit_retry(self, *a, **k): return False
-            def commit_bulk_failure(self, *a, **k): return False
-            def append_failed(self, *a, **k): return None
-            def get_meta(self, key): return None
-            def set_meta(self, key, value): return None
-
-        pipeline.backend = FailingFailureBackend()
+        pipeline.backend = CommitFailureBackend(real_backend)
         monkeypatch.setattr("multiprocessing.Manager", lambda: FakeManager())
         monkeypatch.setattr("tasklite.pipeline.mp.Manager", lambda: FakeManager())
 
@@ -442,10 +415,6 @@ class TestDeadlockBulkFailureCrashes:
     def test_deadlock_bulk_failure_raises(self, tmp_path, monkeypatch):
         from tasklite.backend.sqlite_backend import SQLiteStateBackend
 
-        class FailingBulkBackend(SQLiteStateBackend):
-            def commit_bulk_failure(self, uids_metas):
-                return False  # 模拟环境故障（磁盘满/锁）
-
         pipeline = make_pipeline(tmp_path)
         pipeline.register_handler("t", lambda j, c: True)
         # 自依赖 → 确定性死锁 → _handle_deadlock → commit_bulk_failure
@@ -459,7 +428,9 @@ class TestDeadlockBulkFailureCrashes:
             return original_abort()
 
         monkeypatch.setattr(pipeline._runtime._recovery, "abort_in_flight", spy_abort)
-        pipeline.backend = FailingBulkBackend(pipeline.backend.path)
+        pipeline.backend = CommitFailureBackend(
+            pipeline.backend, failing=("commit_bulk_failure",)
+        )
 
         with pytest.raises(_CommitCrashSignal, match="commit_bulk_failure"):
             pipeline.run()
@@ -1057,10 +1028,6 @@ class TestCascadeBulkFailureCrash:
     def test_cascade_bulk_failure_raises(self, tmp_path, monkeypatch):
         from tasklite.backend.sqlite_backend import SQLiteStateBackend
 
-        class FailingBulkBackend(SQLiteStateBackend):
-            def commit_bulk_failure(self, uids_metas):
-                return False  # 级联批量 DLQ 落盘失败（磁盘满/锁）
-
         pipeline = make_pipeline(tmp_path)
         pipeline.register_handler("t", lambda j, c: True)
 
@@ -1082,7 +1049,9 @@ class TestCascadeBulkFailureCrash:
             return original_abort()
 
         monkeypatch.setattr(pipeline._runtime._recovery, "abort_in_flight", spy_abort)
-        pipeline.backend = FailingBulkBackend(pipeline.backend.path)
+        pipeline.backend = CommitFailureBackend(
+            pipeline.backend, failing=("commit_bulk_failure",)
+        )
 
         # 级联批量 DLQ 失败 → _commit_failed_crash → _CommitCrashSignal
         with pytest.raises(_CommitCrashSignal, match="commit_bulk_failure"):

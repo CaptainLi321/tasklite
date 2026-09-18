@@ -20,6 +20,7 @@ from tasklite.taxonomy import ERR_COMMIT_FAILURE_DLQ, ERR_JOB_DEPENDENCY
 from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
+from tests.machines import CommitFailureBackend
 
 
 class TestStateStoreSuccess:
@@ -110,17 +111,12 @@ class TestStateStoreFailureAndCascade:
 class TestStateStoreCommitCrashContract:
     """测试 commit 失败阈值与 DLQ 熔断契约。"""
 
-    class FailingBackend(InMemoryStateBackend):
-        def commit_job_success(self, uid, wall_meta, *, spawned_jobs=None, cursor_updates=None):
-            return False
-
-        def commit_job_failure(self, uid, failed_meta):
-            if failed_meta.get("error", "").startswith(ERR_COMMIT_FAILURE_DLQ):
-                return True  # DLQ 熔断写入成功
-            return False
-
     def test_commit_failure_threshold_retry_then_dlq(self):
-        backend = self.FailingBackend()
+        backend = CommitFailureBackend(
+            InMemoryStateBackend(),
+            failing=("commit_job_success", "commit_job_failure"),
+            dlq_pass_through=True,
+        )
         state = PipelineState({}, {}, {}, [])
         store = StateStore(backend, state, commit_failure_dlq_threshold=3)
 
