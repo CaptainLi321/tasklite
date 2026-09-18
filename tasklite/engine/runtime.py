@@ -345,14 +345,13 @@ class EngineRuntime:
         return self._completion.settle_reaped(completed)
 
     def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
-        """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。"""
-        if self.store.state is None:
-            self._session.run_id = self._session.run_id or uuid.uuid4().hex
-            # 绕过 run() 直达 step 的路径在此补齐认证身份（与 run_id 同生命周期）
-            if self._session.result_token is None:
-                self._session.result_token = secrets.token_hex(32)
-            self.channel.result_token = self._session.result_token
-            self.store.set_state(PipelineState({}, {}, {}, []))
+        """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。
+
+        run 身份（run_id/result_token/空态装载）唯一负责者是
+        prepare_run_state（execute() 启动屏障）——store.state 恒非 None
+        （构造与 set_state 双点归一化），经 run() 外直达 step 的路径由
+        测试显式 set_state 装载，无需惰性引导。
+        """
         store = self.store
 
         # 0. 停机门：ABORTING 强杀在途、DRAINING 排空完毕、空闲完成三早退
