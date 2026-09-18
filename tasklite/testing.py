@@ -7,13 +7,34 @@ cursors 的内部容器结构会随框架演进碎裂——本模块是唯一承
 from __future__ import annotations
 
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
 from .models.context import TaskContext
 from .models.job import Job
 
-__all__ = ["fake_ctx"]
+__all__ = ["fake_ctx", "running"]
+
+
+@contextmanager
+def running(target: Any) -> Iterator[Any]:
+    """把 TaskLite / EngineRuntime 置于「run 期间」状态（测试专用句柄）。
+
+    管理 API 的 run 期守卫读 ``_runtime._is_running``——测试直接翻转该
+    私有标志需自备 try/finally 复位，漏复位会污染同测试会话的后续用例。
+    本句柄保证复位；只翻一个布尔，不触碰 RunSession 生命周期
+    （begin()/钩子语义属 execute()，守卫测试只要旗子）。
+
+    Yields:
+        被置位的对象本身（EngineRuntime 或其包装的 TaskLite）。
+    """
+    rt = getattr(target, "_runtime", target)
+    rt._is_running = True
+    try:
+        yield rt
+    finally:
+        rt._is_running = False
 
 
 def fake_ctx(

@@ -8,6 +8,7 @@ list_dlq / clear_dlq / clear_history / seed_wall / seed_cursor 静默读写
 import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
+from tasklite.testing import running
 from tests.helpers import make_pipeline
 
 
@@ -88,12 +89,9 @@ class TestBackendSwapRunGuard:
 
     def test_backend_setter_during_run_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p._runtime._is_running = True
-        try:
+        with running(p):
             with pytest.raises(RuntimeError, match="backend"):
                 p.backend = InMemoryStateBackend()
-        finally:
-            p._runtime._is_running = False
 
 
 class TestBackendSwapTypeGuard:

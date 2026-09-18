@@ -7,6 +7,7 @@
 import pytest
 
 from tasklite.models.job import Job
+from tasklite.testing import running
 from tests.helpers import make_pipeline
 
 
@@ -41,12 +42,9 @@ class TestUncompletedFilter:
 
     def test_run_guard_rejects_during_run(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p._runtime._is_running = True
-        try:
+        with running(p):
             with pytest.raises(RuntimeError, match="uncompleted"):
                 p.uncompleted([])
-        finally:
-            p._runtime._is_running = False
 
 
 class TestUncompletedEnqueueComposition:

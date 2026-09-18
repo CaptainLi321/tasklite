@@ -16,6 +16,7 @@ from tasklite.models.job import Job
 from tasklite.pipeline import TaskLite
 from tasklite.utils.lockfile import release_lock, try_acquire_lock
 from tasklite.wrappers.discovery import register_discovery
+from tasklite.testing import running
 from tests.helpers import make_pipeline
 
 # ─── TaskLite 构造：backend 非法对象类型 ─────────────────────
@@ -176,27 +177,27 @@ class TestRunStateGuards:
     def test_enqueue_during_run_rejected(self, tmp_path):
         from tasklite.models.job import Job
         p = make_pipeline(tmp_path)
-        p._runtime._is_running = True
-        with pytest.raises(RuntimeError, match="enqueue"):
-            p.enqueue(Job("t", "j1"))
+        with running(p):
+            with pytest.raises(RuntimeError, match="enqueue"):
+                p.enqueue(Job("t", "j1"))
     def test_management_apis_during_run_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p._runtime._is_running = True
-        for api, call in [
-            ("list_dlq", lambda: p.list_dlq()),
-            ("clear_dlq", lambda: p.clear_dlq()),
-            ("clear_history", lambda: p.clear_history("t::")),
-            ("seed_wall", lambda: p.seed_wall(["t::a"])),
-            ("seed_cursor", lambda: p.seed_cursor("k", "v")),
-        ]:
-            with pytest.raises(RuntimeError, match=api):
-                call()
+        with running(p):
+            for api, call in [
+                ("list_dlq", lambda: p.list_dlq()),
+                ("clear_dlq", lambda: p.clear_dlq()),
+                ("clear_history", lambda: p.clear_history("t::")),
+                ("seed_wall", lambda: p.seed_wall(["t::a"])),
+                ("seed_cursor", lambda: p.seed_cursor("k", "v")),
+            ]:
+                with pytest.raises(RuntimeError, match=api):
+                    call()
     def test_guard_clears_after_run(self, tmp_path):
         from tasklite.models.job import Job
         p = make_pipeline(tmp_path)
-        # 模拟 run 完成：守卫标志被 finally 清除
-        p._runtime._is_running = True
-        p._runtime._is_running = False
+        # run 结束（with 退出）后守卫标志被清除
+        with running(p):
+            pass
         p.enqueue(Job("t", "j1"))  # 不应抛
 
 class TestRunLockGuard:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from tasklite.testing import running
 from tests.helpers import make_runtime
 
 from tasklite.engine.runtime import (
@@ -314,8 +315,7 @@ class TestTaskLiteRuntimeFacadeIntegration:
         p.register_handler("dummy", dummy_runtime_handler)
 
         # 模拟运行中状态
-        p._runtime._is_running = True
-        try:
+        with running(p):
             with pytest.raises(RuntimeError, match="outside run"):
                 p.enqueue([Job("dummy", "1")])
             with pytest.raises(RuntimeError, match="outside run"):
@@ -328,5 +328,3 @@ class TestTaskLiteRuntimeFacadeIntegration:
                 p.seed_wall(["dummy::1"])
             with pytest.raises(RuntimeError, match="outside run"):
                 p.seed_cursor("k", "v")
-        finally:
-            p._runtime._is_running = False

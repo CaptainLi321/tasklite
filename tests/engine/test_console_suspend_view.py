@@ -11,6 +11,7 @@ import pytest
 
 from tasklite.engine.resource import META_RESOURCE_SUSPENDS
 from tasklite.utils.jsonutil import dumps
+from tasklite.testing import running
 from tests.helpers import make_pipeline
 
 
@@ -52,12 +53,9 @@ class TestListSuspendsView:
 
     def test_run_outer_guard_rejects_during_run(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p._runtime._is_running = True
-        try:
+        with running(p):
             with pytest.raises(RuntimeError, match="list_suspends"):
                 p.list_suspends()
-        finally:
-            p._runtime._is_running = False
 
 
 class TestListSuspendsDegrade:
