@@ -125,7 +125,7 @@ def test_scheduler_has_potential_spawners():
         cursors={},
         queue=[Job("t", "a", depends_on=["t::missing"]).to_dict()],
     )
-    result = sched.pop_next_runnable(mock_store, set())
+    result = sched.pop_next_runnable(mock_store.state, set())
     assert result.runnable_idx is None
     assert result.has_potential_spawners is False
 
@@ -139,7 +139,7 @@ def test_scheduler_has_potential_spawners():
             Job("t", "spawner", resources={"gpu": 1.0}).to_dict(),
         ],
     )
-    result = sched.pop_next_runnable(mock_store, set())
+    result = sched.pop_next_runnable(mock_store.state, set())
     assert result.runnable_idx is None
     assert result.has_potential_spawners is True
 

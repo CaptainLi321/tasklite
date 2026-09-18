@@ -118,7 +118,7 @@ class DispatchMachine:
             )
 
         in_flight_uids = store.in_flight_uids
-        sched = self._scheduler.pop_next_runnable(store, in_flight_uids)
+        sched = self._scheduler.pop_next_runnable(store.state, in_flight_uids)
         if sched.runnable_idx is None:
             return DispatchOutcome(
                 entry=None,

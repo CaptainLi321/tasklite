@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 from .resource import Resource, ResourceManager, ResourceEvaluation
 from ..models.job import Job, JobRuntimeState
-from ..models.state import uid_from_job_dict
+from ..models.state import PipelineState, uid_from_job_dict
 
 logger = logging.getLogger("tasklite")
 
@@ -245,7 +245,7 @@ class JobScheduler:
 
     def pop_next_runnable(
         self,
-        state: Any,
+        state: PipelineState,
         in_flight_uids: FrozenSet[str] = frozenset(),
     ) -> ScheduleResult:
         """Scan queue read-only. Returns index and wait info. Does NOT acquire resources.
@@ -257,11 +257,10 @@ class JobScheduler:
         集合。在 missing dependency 判定时，依赖正在运行的 job 不算 missing
         （待其完成 commit 到 wall 后自然解锁），避免并发模型下误判死锁。
         """
-        effective_state = getattr(state, "state", state)
-        q_data = effective_state.queue
-        wall_data = effective_state.wall
-        failed_data = effective_state.failed
-        queue_uids = effective_state.queue_uids
+        q_data = state.queue
+        wall_data = state.wall
+        failed_data = state.failed
+        queue_uids = state.queue_uids
         pending_or_running = queue_uids | set(in_flight_uids)
 
         runnable_idx = None

@@ -280,10 +280,6 @@ class StateStore:
         """重入队作业（崩溃恢复/重试）并同步 UID 索引。"""
         self._state.requeue_jobs(job_dicts, front=front)
 
-    def replace_queue(self, job_dicts: List[Dict[str, Any]]) -> None:
-        """整体替换队列并重建 UID 索引。"""
-        self._state.replace_queue(job_dicts)
-
     def is_known(self, uid: str) -> bool:
         """检查作业是否已在系统任一集合（wall/failed/queue/in_flight）中。"""
         return self._state.is_known(uid)
@@ -300,10 +296,6 @@ class StateStore:
     def is_empty(self) -> bool:
         """队列是否为空。"""
         return self._state.is_empty
-
-    def find_dependency_cycles(self) -> List[str]:
-        """找出当前队列依赖图中的环成员。"""
-        return self._state.find_dependency_cycles()
 
     def clear_in_flight(self) -> None:
         """清空在途集合并维护重跑豁免集合。"""
