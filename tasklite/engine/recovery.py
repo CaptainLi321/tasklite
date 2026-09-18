@@ -139,8 +139,16 @@ class RecoveryOrchestrator:
                 merged_rows.append(jd)
 
         for jd in merged_rows:
-            # 1. 退避换算（委托强类型 JobRuntimeState 对齐双时钟）
+            # 1. 退避换算（委托强类型 JobRuntimeState 对齐双时钟）。
+            # 旧顶层 `_commit_failures` 裸键在此单点迁移进 runtime 命名
+            # 空间并从行上移除——计数唯一表示，下次落盘自然消失。
             rt_state = JobRuntimeState.from_dict(jd.get("runtime"))
+            if "_commit_failures" in jd and not rt_state.commit_failures:
+                try:
+                    rt_state.commit_failures = int(jd["_commit_failures"])
+                except (ValueError, TypeError):
+                    pass
+                jd.pop("_commit_failures", None)
             rt_state.align_wall_clock(now, wall_now)
             jd["runtime"] = rt_state.to_dict()
 

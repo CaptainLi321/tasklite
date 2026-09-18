@@ -611,21 +611,15 @@ class StateStore:
     # ── 2. 3-Strike 崩溃契约内部实现 ─────────────────────────────────────
 
     def _register_commit_failure(self, job_dict: Dict[str, Any]) -> int:
-        """3-strike 计数登记骨架（计数递增与旧键回填的单一事实源）。
+        """3-strike 计数登记骨架（计数递增的单一事实源）。
 
-        旧落盘行仅有顶层 ``_commit_failures`` 键时回填进 runtime 命名
-        空间再递增；写侧 runtime/顶层双表示为过渡兼容，读侧一律以
-        JobRuntimeState 为权威。
+        计数唯一表示是 runtime 命名空间的 ``_commit_failures``（经
+        JobRuntimeState 强类型往返）；旧落盘行的顶层裸键兼容读取收敛在
+        repair_queue_on_load 单点，本方法不再维护双写。
         """
         rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
-        if "_commit_failures" in job_dict and not rt_state.commit_failures:
-            try:
-                rt_state.commit_failures = int(job_dict["_commit_failures"])
-            except (ValueError, TypeError):
-                pass
         failures = rt_state.record_commit_failure()
         job_dict["runtime"] = rt_state.to_dict()
-        job_dict["_commit_failures"] = failures
         return failures
 
     def _handle_commit_failure(
