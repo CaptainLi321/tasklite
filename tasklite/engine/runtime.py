@@ -97,7 +97,6 @@ class EngineRuntime:
             commit_failure_dlq_threshold=config.commit_failure_dlq_threshold,
             taxonomy=config.taxonomy,
             on_job_completed=self._session.fire_job_completed,
-            governor=config.governor,
             stats=self._session.stats,
             policy=config.policy,
         )

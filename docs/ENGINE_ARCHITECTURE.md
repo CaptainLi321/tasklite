@@ -199,7 +199,7 @@ HandlerEntry(NamedTuple)   # func / default_resources / payload_schema
 class RunConfig:
     name: str; ipc_dir: str
     backend: AbstractStateBackend
-    governor: DeadlockGovernor     # 构造期即建（StateStore 结算依赖 + 主循环仲裁共用）
+    governor: DeadlockGovernor     # 构造期即建（主循环仲裁专用；StateStore 不持 governor）
     policy: ExecutionPolicy        # 构造期即建（内部持有 discovery_rerun 共享引用）
     resources: ResourceManager
     handlers: Mapping[str, HandlerEntry]
@@ -334,7 +334,7 @@ class RecoveryMachine:
 
 ```python
 class StateStore:
-    def __init__(self, backend, *, commit_failure_dlq_threshold, taxonomy, governor,
+    def __init__(self, backend, *, commit_failure_dlq_threshold, taxonomy,
                  policy, stats, on_job_completed) -> None   # 显式依赖，禁止 getattr 回查
     def enqueue_jobs(self, jobs, *, front=False) -> List[str]   # 返回插入的 UID；规范化 + wall 去重
     @property state / is_empty

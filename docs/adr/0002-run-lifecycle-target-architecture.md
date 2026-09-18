@@ -194,3 +194,10 @@ v1.1.0 之后 4 天内落了 91 个深模块化提交（日均 23 个），对 g
   删除不可达的 `store is None` 早退，三组同形终态早退统一 `_terminal_outcome()`，
   填池派发 / 死锁仲裁 / drain 回收结算抽取为私有方法，行为零变更
   （1397 测试 + fencing/shutdown 时序测试全绿，未改任何断言）。
+- **修订 6（2026-09-17，维护者裁定）**：StateStore 依赖清单去 `governor`
+  ——逐方法核对确认全文件零使用（runtime 经 `config.governor` 自持，
+  测试访问的 `governor` 属性是 EngineRuntime 自有属性），构造注入与
+  property 为空挂件且是 store↔governor 运行时 import 环的成因。D1
+  原则「依赖清单以逐方法核对真实使用为准」的直接兑现；对照修订 4 的
+  setter 保留先例（彼处有 4 处测试真实依赖，此处为零）。连带：手册
+  §4.2.2/§4.2.7 的 governor 归属描述同步更正。

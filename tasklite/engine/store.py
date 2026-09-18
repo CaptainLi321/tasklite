@@ -12,7 +12,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
-from .governor import DeadlockGovernor
 from .policy import ExecutionPolicy
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
@@ -113,7 +112,6 @@ class StateStore:
         commit_failure_dlq_threshold: int = 3,
         taxonomy: Optional[ErrorTaxonomy] = None,
         on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None,
-        governor: Optional[DeadlockGovernor] = None,
         stats: Optional[Any] = None,
         policy: Optional[ExecutionPolicy] = None,
     ) -> None:
@@ -122,7 +120,6 @@ class StateStore:
         self._threshold = commit_failure_dlq_threshold
         self._taxonomy = taxonomy or _DEFAULT_TAXONOMY
         self._on_job_completed = on_job_completed
-        self._governor = governor if governor is not None else DeadlockGovernor()
         self._stats = stats
         self._policy = policy if policy is not None else ExecutionPolicy()
 
@@ -662,11 +659,4 @@ class StateStore:
             f"_commit_failures={failures}/{self._threshold}. "
             f"On-disk queue preserved; crashing to avoid unbounded retry loop."
         )
-
-    # ── 3. 死锁治理深模块引用 ──────────────────────────────────────────
-
-    @property
-    def governor(self) -> DeadlockGovernor:
-        """关联的死锁治理状态机深模块。"""
-        return self._governor
 
