@@ -487,6 +487,66 @@ class ExecutionChannel:
             return None
         return res
 
+    def _token_ok(self, res: Optional[dict], uid: str) -> Optional[dict]:
+        """claim 读取侧的令牌强校验（与 _read_authenticated_result 同一信任锚）。"""
+        token = getattr(self, "result_token", None)
+        if res is not None and token is not None and res.get("auth") != token:
+            logger.error(
+                f"Stale result auth token mismatch for {uid}; "
+                f"discarding untrusted result"
+            )
+            return None
+        return res
+
+    def _read_if_exists(self, path: Path) -> Optional[dict]:
+        """结果文件存在才认证读取（收割快路径/死亡复读共用的原语）。"""
+        return self._read_authenticated_result(path) if path.exists() else None
+
+    def _salvage_signals(self, uid: str, decoded: Optional[ExecutionResult]) -> List[Tuple[str, str, float]]:
+        """排空 uid 的挂起信号：decoded 非 None 时并入其挂起列表，否则原样返回。
+
+        不变式：结果文件已原子落盘 ⇒ 本执行体的信号追加全部早于落盘
+        （record_signal 只发生在 handler 执行期内），此刻排空无并发写者、
+        无损；非 success payload 不携带挂起字段，缺此步时 done 对经完成
+        机器的收尾清理会把「先排空阶段之后写入」的信号文件未读删除。
+        """
+        try:
+            pending = self.journal.drain_signals(uid)
+        except Exception as e:
+            logger.warning(f"Failed to salvage signals for {uid}: {e}")
+            return []
+        if decoded is not None and pending:
+            decoded.resource_suspensions = (
+                list(decoded.resource_suspensions) + list(pending)
+            )
+        return pending
+
+    def _consume_result_if_present(self, handle: JobHandle) -> Optional[ExecutionResult]:
+        """认证读取 → 守卫过滤 → 解码 → 信号并入的单一读取原语。
+
+        守卫契约：结果须为带 status 键的 dict 且非 interrupted 报告——
+        worker 报告被中断的结果按「未完成」处理（重入队），不作为终态。
+        abort 双阶段（杀进程前初查 / 杀死后重探测闭环）共用本原语。
+        """
+        incarnation = getattr(handle, "incarnation", None)
+        res_p = self.journal.result_path(handle.uid, incarnation)
+        if not res_p.exists():
+            return None
+        raw_res = self._read_authenticated_result(res_p)
+        if not (
+            raw_res is not None
+            and isinstance(raw_res, dict)
+            and "status" in raw_res
+            and raw_res.get("status") != "interrupted"
+        ):
+            return None
+        decoded = _decode_ipc_result(
+            raw_res, None, handle.job, self.ipc_dir,
+            output_roots=getattr(self, "output_roots", None),
+        )
+        self._salvage_signals(handle.uid, decoded)
+        return decoded
+
     def reap_completed(
         self, handles: Sequence[JobHandle]
     ) -> List[Tuple[JobHandle, ExecutionResult]]:
@@ -498,19 +558,13 @@ class ExecutionChannel:
             p = handle.process
             res_path = self.journal.result_path(handle.uid, handle.incarnation)
 
-            res = (
-                self._read_authenticated_result(res_path)
-                if res_path.exists() else None
-            )
+            res = self._read_if_exists(res_path)
             if res is not None:
                 completed.append((handle, self._collect_outcome(handle, res)))
                 continue
 
             if not p.is_alive():
-                res = (
-                    self._read_authenticated_result(res_path)
-                    if res_path.exists() else None
-                )
+                res = self._read_if_exists(res_path)
                 completed.append((handle, self._collect_outcome(handle, res)))
                 continue
 
@@ -528,10 +582,7 @@ class ExecutionChannel:
                     # deadline 前同因事件同果，不折入 TIMEOUT；仅 kill 后
                     # 仍存活/被击杀的执行体才归 TIMEOUT。
                     is_timeout = False
-                res = (
-                    self._read_authenticated_result(res_path)
-                    if res_path.exists() else None
-                )
+                res = self._read_if_exists(res_path)
                 completed.append(
                     (handle, self._collect_outcome(handle, res, is_timeout=is_timeout))
                 )
@@ -554,19 +605,12 @@ class ExecutionChannel:
                 result = self._build_terminal_failure(p, handle, is_timeout=is_timeout)
         finally:
             self._finalize_process(p)
-            try:
-                pending_signals = self.journal.drain_signals(handle.uid)
-                if pending_signals:
-                    if result is not None:
-                        result.resource_suspensions = (
-                            list(result.resource_suspensions) + list(pending_signals)
-                        )
-                        logger.info(
-                            f"Salvaged {len(pending_signals)} suspend signal(s) "
-                            f"from {handle.uid} before IPC cleanup"
-                        )
-            except Exception as e:
-                logger.warning(f"Failed to salvage signals for {handle.uid}: {e}")
+            pending_signals = self._salvage_signals(handle.uid, result)
+            if pending_signals:
+                logger.info(
+                    f"Salvaged {len(pending_signals)} suspend signal(s) "
+                    f"from {handle.uid} before IPC cleanup"
+                )
             self.journal.cleanup_ipc_files(handle.uid, handle.incarnation)
         return result
 
@@ -576,14 +620,7 @@ class ExecutionChannel:
         残留结果必须携带本 run 的认证令牌——跨 run 残留与伪造残留一律
         丢弃（崩溃恢复退化为重跑，保守正确；伪造残留的注入链不可达）。
         """
-        res = self.journal.claim_stale_result(uid)
-        token = getattr(self, "result_token", None)
-        if res is not None and token is not None and res.get("auth") != token:
-            logger.error(
-                f"Stale result auth token mismatch for {uid}; "
-                f"discarding untrusted result"
-            )
-            return None
+        res = self._token_ok(self.journal.claim_stale_result(uid), uid)
         if res is None:
             return None
         return _decode_ipc_result(
@@ -639,34 +676,10 @@ class ExecutionChannel:
         pending_handles: List[JobHandle] = []
 
         for h in handles:
-            incarnation = getattr(h, "incarnation", None)
-            res_p = self.journal.result_path(h.uid, incarnation)
-            if res_p.exists():
-                raw_res = self._read_authenticated_result(res_p)
-                if (
-                    raw_res is not None
-                    and isinstance(raw_res, dict)
-                    and "status" in raw_res
-                    and raw_res.get("status") != "interrupted"
-                ):
-                    decoded = _decode_ipc_result(
-                        raw_res, None, h.job, self.ipc_dir,
-                        output_roots=getattr(self, "output_roots", None),
-                    )
-                    # 不变式：结果文件已原子落盘 ⇒ 本执行体的信号追加全部
-                    # 早于落盘（record_signal 只发生在 handler 执行期内），
-                    # 此刻排空无并发写者、无损；非 success payload 不携带
-                    # 挂起字段，缺此步时 done 对经完成机器的收尾清理会把
-                    # 「先排空阶段之后写入」的信号文件未读删除。
-                    try:
-                        decoded.resource_suspensions = (
-                            list(decoded.resource_suspensions)
-                            + self.journal.drain_signals(h.uid)
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to salvage signals for {h.uid}: {e}")
-                    done_pairs.append((h, decoded))
-                    continue
+            decoded = self._consume_result_if_present(h)
+            if decoded is not None:
+                done_pairs.append((h, decoded))
+                continue
             pending_handles.append(h)
 
         if pending_handles:
@@ -679,34 +692,15 @@ class ExecutionChannel:
         salvaged: List[Tuple[str, str, float]] = []
         truly_cancelled: List[JobHandle] = []
         for h in pending_handles:
-            incarnation = getattr(h, "incarnation", None)
-            res_p = self.journal.result_path(h.uid, incarnation)
-            if res_p.exists():
-                raw_res = self._read_authenticated_result(res_p)
-                if (
-                    raw_res is not None
-                    and isinstance(raw_res, dict)
-                    and "status" in raw_res
-                    and raw_res.get("status") != "interrupted"
-                ):
-                    decoded = _decode_ipc_result(
-                        raw_res, None, h.job, self.ipc_dir,
-                        output_roots=getattr(self, "output_roots", None),
-                    )
-                    try:
-                        decoded.resource_suspensions = (
-                            list(decoded.resource_suspensions)
-                            + self.journal.drain_signals(h.uid)
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to salvage signals for {h.uid}: {e}")
-                    done_pairs.append((h, decoded))
-                    continue
-            try:
-                for r_name, secs in self.journal.drain_signals(h.uid):
-                    salvaged.append((h.uid, r_name, secs))
-            except Exception as e:
-                logger.warning(f"Failed to salvage signals for {h.uid}: {e}")
+            decoded = self._consume_result_if_present(h)
+            if decoded is not None:
+                done_pairs.append((h, decoded))
+                continue
+            # 杀进程后仍无结果：半成品清理前最后捞回信号（无并发写者）
+            salvaged.extend(
+                (h.uid, r_name, secs)
+                for r_name, secs in self._salvage_signals(h.uid, None)
+            )
             self.cleanup_artifacts(h.uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
             truly_cancelled.append(h)
 
