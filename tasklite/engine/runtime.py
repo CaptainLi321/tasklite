@@ -29,11 +29,6 @@ from .types import (  # noqa: E402
     TaskStats,
 )
 
-# 资源与运行时常量（提前定义避免模块环形导入）
-RT_BACKOFF_UNTIL = "_backoff_until"
-RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
-RT_COMMIT_FAILURES = "_commit_failures"
-
 from .config import RunConfig  # noqa: E402
 from .pacing import LoopFacts, decide_wait  # noqa: E402
 from .governor import (  # noqa: E402
@@ -58,7 +53,14 @@ from .dispatch import DispatchMachine, DispatchOutcome  # noqa: E402
 from .session import RunSession  # noqa: E402
 from ..backend.base import AbstractStateBackend  # noqa: E402
 from ..exceptions import _CommitCrashSignal, _JobTerminated  # noqa: E402
-from ..models.job import Job, JobRuntimeState, WORKER_RESOURCE, inject_worker_resource  # noqa: E402,F401
+from ..models.job import (  # noqa: E402
+    RT_BACKOFF_UNTIL,
+    RT_BACKOFF_WALL_DEADLINE,
+    Job,
+    JobRuntimeState,
+    WORKER_RESOURCE,
+    inject_worker_resource,
+)
 from ..models.state import PipelineState  # noqa: E402
 from ..taxonomy import ErrorTaxonomy  # noqa: E402
 from ..utils.lockfile import release_lock, try_acquire_lock  # noqa: E402

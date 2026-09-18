@@ -227,10 +227,15 @@ class JobRuntimeState:
 # （读取等于哨兵时视同缺省、pop 清空回哨兵、to_dict 导出时省略）；
 # 写入侧的规范化（deadline 校验 / 计数与取串）语义各异，保留在各
 # 写入方法内显式表达。
+# runtime 规范键名常量（键名字符串的单一引用点；引擎写入侧与测试经此引用）
+RT_BACKOFF_UNTIL = "_backoff_until"
+RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
+RT_COMMIT_FAILURES = "_commit_failures"
+
 _RUNTIME_FIELDS: Dict[str, Tuple[str, Any]] = {
-    "_backoff_until": ("backoff_until", None),
-    "_backoff_wall_deadline": ("backoff_wall_deadline", None),
-    "_commit_failures": ("commit_failures", 0),
+    RT_BACKOFF_UNTIL: ("backoff_until", None),
+    RT_BACKOFF_WALL_DEADLINE: ("backoff_wall_deadline", None),
+    RT_COMMIT_FAILURES: ("commit_failures", 0),
     "_dispatch_failures": ("dispatch_failures", 0),
     "_last_retry_error": ("last_retry_error", ""),
 }

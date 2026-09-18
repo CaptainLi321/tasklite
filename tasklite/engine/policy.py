@@ -18,7 +18,7 @@ import random
 import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
-from ..models.job import Job, JobRuntimeState
+from ..models.job import Job, JobRuntimeState, RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE
 from ..models.state import uid_from_job_dict
 from ..taxonomy import ERR_MAX_RETRIES as _ERR_MAX_RETRIES
 
@@ -88,8 +88,8 @@ class BackoffSchedule:
             runtime_obj.backoff_until = self.backoff_until
             runtime_obj.backoff_wall_deadline = self.wall_deadline
         elif isinstance(runtime_obj, dict):
-            runtime_obj["_backoff_until"] = self.backoff_until
-            runtime_obj["_backoff_wall_deadline"] = self.wall_deadline
+            runtime_obj[RT_BACKOFF_UNTIL] = self.backoff_until
+            runtime_obj[RT_BACKOFF_WALL_DEADLINE] = self.wall_deadline
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,7 @@ from tasklite.engine.resource import (
     RateLimitResource,
     ResourceManager,
 )
-from tasklite.engine.runtime import (
+from tasklite.models.job import (
     RT_BACKOFF_UNTIL,
     RT_BACKOFF_WALL_DEADLINE,
 )
