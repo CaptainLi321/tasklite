@@ -502,15 +502,7 @@ class StateStore:
         for uid, meta in sanitized_metas:
             matching = [j for j in queue if uid_from_job_dict(j) == uid]
             jd = matching[0] if matching else {"task_type": uid.split("::")[0], "job_id": uid.split("::")[1]}
-            rt_state = JobRuntimeState.from_dict(jd.get("runtime"))
-            if "_commit_failures" in jd and not rt_state.commit_failures:
-                try:
-                    rt_state.commit_failures = int(jd["_commit_failures"])
-                except (ValueError, TypeError):
-                    pass
-            failures = rt_state.record_commit_failure()
-            jd["runtime"] = rt_state.to_dict()
-            jd["_commit_failures"] = failures
+            failures = self._register_commit_failure(jd)
             if failures >= self._threshold:
                 single_committed = self._backend.commit_job_failure(
                     uid, {"error": ERR_COMMIT_FAILURE_DLQ, "commit_failures": failures, "fatal": True}
@@ -589,12 +581,7 @@ class StateStore:
             if uid not in affected:
                 remaining.append(jd)
                 continue
-            rt = jd.setdefault("runtime", {})
-            if not isinstance(rt, dict):
-                rt = {}
-                jd["runtime"] = rt
-            failures = rt.get("_commit_failures", 0) + 1
-            rt["_commit_failures"] = failures
+            failures = self._register_commit_failure(jd)
             if failures >= self._threshold:
                 dlq_meta = meta_by_uid[uid]
                 single_committed = self._backend.commit_job_failure(uid, dlq_meta)
@@ -623,6 +610,24 @@ class StateStore:
 
     # ── 2. 3-Strike 崩溃契约内部实现 ─────────────────────────────────────
 
+    def _register_commit_failure(self, job_dict: Dict[str, Any]) -> int:
+        """3-strike 计数登记骨架（计数递增与旧键回填的单一事实源）。
+
+        旧落盘行仅有顶层 ``_commit_failures`` 键时回填进 runtime 命名
+        空间再递增；写侧 runtime/顶层双表示为过渡兼容，读侧一律以
+        JobRuntimeState 为权威。
+        """
+        rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+        if "_commit_failures" in job_dict and not rt_state.commit_failures:
+            try:
+                rt_state.commit_failures = int(job_dict["_commit_failures"])
+            except (ValueError, TypeError):
+                pass
+        failures = rt_state.record_commit_failure()
+        job_dict["runtime"] = rt_state.to_dict()
+        job_dict["_commit_failures"] = failures
+        return failures
+
     def _handle_commit_failure(
         self,
         uid: str,
@@ -633,15 +638,7 @@ class StateStore:
         if job_dict is None:
             job_dict = {"task_type": uid.split("::")[0], "job_id": uid.split("::")[1]}
 
-        rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
-        if "_commit_failures" in job_dict and not rt_state.commit_failures:
-            try:
-                rt_state.commit_failures = int(job_dict["_commit_failures"])
-            except (ValueError, TypeError):
-                pass
-        failures = rt_state.record_commit_failure()
-        job_dict["runtime"] = rt_state.to_dict()
-        job_dict["_commit_failures"] = failures
+        failures = self._register_commit_failure(job_dict)
 
         if failures >= self._threshold:
             logger.critical(
