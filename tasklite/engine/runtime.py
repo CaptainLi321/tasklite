@@ -464,32 +464,13 @@ class EngineRuntime:
         try:
             self.run_loop_impl()
             exit_reason = self._session.exit_reason().value
-        except _JobTerminated as e:
-            logger.critical(f"Job terminated outside expected handlers: {e}")
-            exit_reason = self._session.exit_reason(e).value
-            self._recovery.abort_in_flight()
-            self._recovery.save_queue_crash_safe()
-            raise
-        except KeyboardInterrupt as e:
-            logger.warning("Pipeline interrupted by user.")
-            exit_reason = self._session.exit_reason(e).value
-            self._recovery.abort_in_flight()
-            self._recovery.save_queue_crash_safe()
-            raise
-        except _CommitCrashSignal as e:
-            logger.critical(f"Backend commit failure; aborting in-flight jobs: {e}")
-            exit_reason = self._session.exit_reason(e).value
-            self._recovery.abort_in_flight()
-            self._recovery.save_queue_crash_safe()
-            raise
-        except Exception as e:
-            logger.critical(f"Pipeline scheduler crashed with unhandled exception: {e}\n{traceback.format_exc()}")
-            exit_reason = self._session.exit_reason(e).value
-            self._recovery.abort_in_flight()
-            self._recovery.save_queue_crash_safe()
-            raise
         except BaseException as e:
-            logger.critical(f"Pipeline terminated by {type(e).__name__}: {e}")
+            # 单点崩溃网：所有异常同构处理（exit_reason + 在途清扫 + 崩溃保队
+            # + 原样上抛）；五类历史分支仅日志文案/级别不同——KI 与
+            # 非 Exception（_JobTerminated/_CommitCrashSignal/SystemExit）
+            # 不附 traceback，其余附。_CommitCrashSignal 防误吞不变式在
+            # 类继承（BaseException）与 dispatch 的早置 raise，不在此处。
+            self._crash_log(e)
             exit_reason = self._session.exit_reason(e).value
             self._recovery.abort_in_flight()
             self._recovery.save_queue_crash_safe()
@@ -500,6 +481,20 @@ class EngineRuntime:
             except Exception as e:
                 logger.warning(f"Failed to persist resource suspends: {e}")
             self._session.fire_run_end(exit_reason)
+
+    @staticmethod
+    def _crash_log(e: BaseException) -> None:
+        """承重网的逐类型日志分派（级别与文案对齐历史行为）。"""
+        if isinstance(e, KeyboardInterrupt):
+            logger.warning("Pipeline interrupted by user.")
+        elif isinstance(e, _JobTerminated):
+            logger.critical(f"Job terminated outside expected handlers: {e}")
+        elif isinstance(e, _CommitCrashSignal):
+            logger.critical(f"Backend commit failure; aborting in-flight jobs: {e}")
+        elif isinstance(e, Exception):
+            logger.critical(f"Pipeline scheduler crashed with unhandled exception: {e}\n{traceback.format_exc()}")
+        else:
+            logger.critical(f"Pipeline terminated by {type(e).__name__}: {e}")
 
     def _run_body(self) -> None:
         """主执行体。"""
