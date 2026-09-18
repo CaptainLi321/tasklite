@@ -21,7 +21,7 @@ def _jd(task: str, jid: str, **extra) -> dict:
 
 
 def _active(state: PipelineState) -> set:
-    return set(state._rerun_active_uids)
+    return set(state.rerun_active_uids)
 
 
 RERUN_POLICIES = ["every_run", "on_failure", "on_input_change"]

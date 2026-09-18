@@ -316,6 +316,11 @@ class PipelineState:
         return self._failed_uids
 
     @property
+    def rerun_active_uids(self) -> FrozenSet[str]:
+        """重跑豁免 uid 活索引的只读视图（六集合互斥豁免判定的事实源缓存）。"""
+        return frozenset(self._rerun_active_uids)
+
+    @property
     def in_flight_uids(self) -> FrozenSet[str]:
         """in-flight 作业 uid 集合。"""
         return frozenset(self._in_flight_uids)

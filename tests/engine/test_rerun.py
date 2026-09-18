@@ -233,7 +233,7 @@ class TestRerunEveryRun:
         # 模拟 abort：requeue（已含）+ clear_in_flight
         p._runtime.state.clear_in_flight()
         # 断言通过即无 DEBUG 崩溃；豁免集合保留 queue 中的 rerun 任务
-        assert "t::scan" in p._runtime.state._rerun_active_uids
+        assert "t::scan" in p._runtime.state.rerun_active_uids
 
     def test_clear_in_flight_removes_plain_tasks(self, tmp_path):
         """非 rerun 任务不被豁免集合保留。"""
@@ -246,7 +246,7 @@ class TestRerunEveryRun:
             p.backend.load_cursors(), queue,
         ))
         p._runtime.state.clear_in_flight()
-        assert "t::plain" not in p._runtime.state._rerun_active_uids
+        assert "t::plain" not in p._runtime.state.rerun_active_uids
 
     def test_direct_commit_failure_does_not_leak_rerun_exemption(self, tmp_path):
         """ 回归：rerun 任务经 no-handler 直接 commit 失败 → 从豁免集合移除。
@@ -269,7 +269,7 @@ class TestRerunEveryRun:
         ))
         # 模拟 dispatch 的 pop：rerun 任务加入豁免集合
         p._runtime.state.pop_job(0)
-        assert "nohandler::x" in p._runtime.state._rerun_active_uids
+        assert "nohandler::x" in p._runtime.state.rerun_active_uids
         # 直接 commit 路径（no-handler）内部会调 _mark_failed + unregister——
         # 这里手动模拟该路径的终止动作，验证豁免被移除
         from tasklite.pipeline import TaskLite
@@ -277,7 +277,7 @@ class TestRerunEveryRun:
         p.backend.commit_job_failure("nohandler::x", {"error": ERR_NO_HANDLER})
         p._runtime.store.mark_failed("nohandler::x", {"error": ERR_NO_HANDLER})
         p._runtime.state.unregister_in_flight("nohandler::x")
-        assert "nohandler::x" not in p._runtime.state._rerun_active_uids, \
+        assert "nohandler::x" not in p._runtime.state.rerun_active_uids, \
             "直接 commit 失败后豁免集合必须移除该 uid"
 
 
@@ -419,7 +419,7 @@ class TestDiscoveryDynamicFallbackRerun:
         t.join()
 
         assert "t::x" not in p.backend.load_wall(), "被 abort 的重跑不得误提交 wall"
-        assert "t::x" in p._runtime.state._rerun_active_uids, \
+        assert "t::x" in p._runtime.state.rerun_active_uids, \
             "abort 收尾后重入队的动态重跑必须保留豁免登记"
         remaining = [j for j in p.backend.load_queue() if j.get("job_id") == "x"]
         assert remaining, "被 abort 的重跑作业必须保留在磁盘队列（at-least-once）"

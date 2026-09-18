@@ -90,7 +90,7 @@ class TestInFlightSettleConditionalForwarding:
         state.unregister_in_flight("t::x")
         state.requeue_jobs([Job("t", "x", rerun="every_run").to_dict()], front=True)
         tracker.settle("t::x", state=state)
-        assert "t::x" in state._rerun_active_uids, "豁免不得被结算二次注销误删"
+        assert "t::x" in state.rerun_active_uids, "豁免不得被结算二次注销误删"
 
 
 class TestStateAssertionFactSource:
