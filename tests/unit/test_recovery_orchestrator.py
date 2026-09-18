@@ -22,25 +22,15 @@ from tasklite.models.job import (
 from tasklite.engine.store import StateStore
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
+from tests.machines import make_recovery_orchestrator
 
 
-def make_orchestrator(backend, state=None, resource_mgr=None):
-    """显式装配 RecoveryOrchestrator 的窄依赖集合。"""
-    state = state or PipelineState({}, {}, {}, [])
-    return RecoveryOrchestrator(
-        store=StateStore(backend, state=state),
-        channel=MagicMock(),
-        resources=resource_mgr or ResourceManager(),
-        in_flight=MagicMock(),
-        policy=PreflightPolicy(),
-        completion=MagicMock(),
-    )
 
 
 class TestRecoveryOrchestratorQueueRepair:
     def test_repair_queue_backoff_conversion(self):
         backend = InMemoryStateBackend()
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
 
         now_wall = time.time()
         # 1. 过去已过期截止时间 -> 应当被清除
@@ -62,7 +52,7 @@ class TestRecoveryOrchestratorQueueRepair:
 
     def test_repair_queue_filters_wall_and_failed_unless_rerun(self):
         backend = InMemoryStateBackend()
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
 
         # 在 wall 中且 rerun="never" -> 过滤
         job_wall = {"task_type": "t", "job_id": "w1", "rerun": "never"}
@@ -110,7 +100,7 @@ class TestRecoveryOrchestratorRepairDeltaPersist:
 
         backend.save_queue = _poison_full_rewrite
 
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(
             q_data, wall={"t::r1": {}}, failed={}
         )
@@ -141,7 +131,7 @@ class TestRecoveryOrchestratorRepairDeltaPersist:
 
         backend.delete_queue_uids = _recording_delete
 
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(
             q_data, wall={"t::r1": {}}, failed={"t::r2": {}}
         )
@@ -160,7 +150,7 @@ class TestRecoveryOrchestratorRepairDeltaPersist:
         q_data = backend.load_queue()
         backend.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
 
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(
             q_data, wall={"t::r1": {}}, failed={}
         )
@@ -189,7 +179,7 @@ class TestRecoveryOrchestratorRepairDuplicateWarning:
         # 窗口期并发入队：磁盘重读比快照多一行（合并预期内的新增，非重复）
         backend.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
 
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         with caplog.at_level(logging.WARNING, logger="tasklite"):
             repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
 
@@ -201,7 +191,7 @@ class TestRecoveryOrchestratorRepairDuplicateWarning:
 
     def test_snapshot_internal_duplicate_still_warns(self, caplog):
         backend = InMemoryStateBackend()
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         q_data = [
             {"task_type": "t", "job_id": "j1"},
             {"task_type": "t", "job_id": "j1"},
@@ -233,7 +223,7 @@ class TestRecoveryOrchestratorTerminalOverlapConvergence:
         backend.append_failed("t::x", {"error": "boom"})
         wall = backend.load_wall()
         failed = backend.load_failed()
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
 
         orchestrator.converge_terminal_overlap(wall, failed)
 
@@ -248,7 +238,7 @@ class TestRecoveryOrchestratorTerminalOverlapConvergence:
 
     def test_convergence_emits_warning_listing_conflict_uids(self, caplog):
         backend = InMemoryStateBackend()
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         wall = {"t::x": {}, "t::y": {}}
         failed = {"t::x": {}}
 
@@ -264,7 +254,7 @@ class TestRecoveryOrchestratorTerminalOverlapConvergence:
 
     def test_disjoint_terminal_sets_untouched_and_silent(self, caplog):
         backend = InMemoryStateBackend()
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         wall = {"t::w": {}}
         failed = {"t::f": {}}
 
@@ -278,7 +268,7 @@ class TestRecoveryOrchestratorTerminalOverlapConvergence:
     def test_backend_delete_failure_degrades_without_losing_convergence(self, caplog):
         backend = MagicMock()
         backend.delete_wall.side_effect = RuntimeError("disk gone")
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         wall = {"t::x": {}}
         failed = {"t::x": {}}
 
@@ -307,7 +297,7 @@ class TestRecoveryOrchestratorRepairFrontPriority:
         # 窗口期他进程 front 入队：磁盘真相中位于队首
         backend.enqueue_jobs([{"task_type": "t", "job_id": "front_job"}], front=True)
 
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
         assert [j["job_id"] for j in repaired] == ["front_job", "k1"]
 
@@ -319,7 +309,7 @@ class TestRecoveryOrchestratorRepairFrontPriority:
             backend.load_cursors(),
             repaired,
         )
-        orchestrator = make_orchestrator(backend, state=state)
+        orchestrator = make_recovery_orchestrator(backend, state=state)
         orchestrator.save_queue_crash_safe()
         assert [j["job_id"] for j in backend.load_queue()] == ["front_job", "k1"]
 
@@ -329,7 +319,7 @@ class TestRecoveryOrchestratorRepairFrontPriority:
         q_data = backend.load_queue()
         backend.enqueue_jobs([{"task_type": "t", "job_id": "tail_job"}])
 
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
         assert [j["job_id"] for j in repaired] == ["k1", "tail_job"]
 
@@ -345,7 +335,7 @@ class TestRecoveryOrchestratorRepairFrontPriority:
         backend.delete_queue_uids(["t::k1"])
         backend.enqueue_jobs([{"task_type": "t", "job_id": "front_job"}], front=True)
 
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
         assert [j["job_id"] for j in repaired] == ["front_job", "k2", "k1"]
 
@@ -355,7 +345,7 @@ class TestRecoveryOrchestratorRepairFrontPriority:
         q_data = backend.load_queue()
         backend.enqueue_jobs([{"task_type": "t", "job_id": "front_job"}], front=True)
 
-        orchestrator = make_orchestrator(backend)
+        orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
         assert [j["job_id"] for j in repaired] == ["front_job", "k1"]
 
@@ -371,7 +361,7 @@ class TestRecoveryOrchestratorCrashSafeSave:
 
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "j2"}])
 
-        orchestrator = make_orchestrator(backend, state=state)
+        orchestrator = make_recovery_orchestrator(backend, state=state)
 
         orchestrator.save_queue_crash_safe()
 
@@ -397,7 +387,7 @@ class TestRecoveryOrchestratorCrashSafeSave:
         state = PipelineState(
             {}, {}, {}, [{"task_type": "t", "job_id": "k1", "payload": {"v": 2}}]
         )
-        orchestrator = make_orchestrator(backend, state=state)
+        orchestrator = make_recovery_orchestrator(backend, state=state)
 
         legacy_calls = []
         monkeypatch.setattr(backend, "load_queue", lambda: legacy_calls.append("load"))
@@ -418,7 +408,7 @@ class TestRecoveryOrchestratorCrashSafeSave:
         backend.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
 
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "k1"}])
-        orchestrator = make_orchestrator(backend, state=state)
+        orchestrator = make_recovery_orchestrator(backend, state=state)
 
         orchestrator.save_queue_crash_safe()
 
@@ -436,7 +426,7 @@ class TestRecoveryOrchestratorCrashSafeSave:
         backend.replace_queue_atomic = _boom
 
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "in_mem"}])
-        orchestrator = make_orchestrator(backend, state=state)
+        orchestrator = make_recovery_orchestrator(backend, state=state)
 
         # 不应抛出异常，也不应覆盖磁盘（内存独有作业由 at-least-once 吸收）
         orchestrator.save_queue_crash_safe()
