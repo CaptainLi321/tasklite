@@ -8,6 +8,15 @@
 
 ### 变更（重构）
 
+- **架构深化收敛（八项候选，27 个原子提交）**：本窗口按架构评审完成八组深化重构——
+  ① 卫生批次：rerun 策略值单一真相（9 处字面量 → `RERUN_VALUES`/`RERUN_EXEMPT_VALUES`）、断头转发与死代码群清算（`all_known_uids`/`attempted_uids` 死链、channel 死常量与零消费别名、backend 19 个死导入等）；
+  ② 死亡归因：`taxonomy.attribute_process_death` 决策表成为收割侧唯一裁决点（同一 exitcode 双路径同 meta 形状），死亡串族落 DLQ 不再 unknown，`_classify_exitcode` 语义相反死实现删除；
+  ③ 瞬态信号具名化（见下条）；
+  ④ 死锁仲裁收形：`StandstillFacts` 停摆投影值对象成为 governor 唯一入参形状，`DispatchOutcome` 删 `sched` 内嵌与 `attribution` 死别名，13 处防御 getattr 清零；
+  ⑤ runtime 收敛：五连 except 塌缩单点崩溃网、step() 不可达惰性引导删除、RT 键名常量收敛注册表旁、启动装载修复序列下沉 `RecoveryMachine.load_and_repair`（ADR 依赖矩阵零变更）；
+  ⑥ channel 读取原语化：`_consume_result_if_present` 等四原语收敛五处手抄读取序列，abort 双段逐字重复消除；
+  ⑦ 3-strike 收敛：`_register_commit_failure` 单点、提交失败计数唯一表示（runtime 命名空间），旧顶层裸键 repair 单点迁移，governor 空挂件退场（ADR-0002 修订 6）；
+  ⑧ 测试可构造性立法：`fake_ctx` 扩参收编 29 处手搓 `TaskContext`、`running()` 句柄收编 12 处 `_is_running` 私有翻转、`tests/machines.py` 共享装配库（`MachineEnv` NamedTuple + `CommitFailureBackend` 注入工厂 + `FakeChannel` 具名替身）、`rerun_active_uids` 只读视图，附 hygiene AST 守卫锁定测试面纪律。
 - **瞬态信号具名化（`transient_kind`）**：worker 结果文件 `retry` 通道的 `lock_conflict` / `rate_limited` 两个旁挂布尔键合并为单一结构化字段 `transient_kind`（`"lock_conflict"` / `"rate_limited"`；`interrupted` 维持独立 status 通道，解码侧归一为 kind）；`ExecutionResult` / `RetryPlan` / `RetryOutcome` 三份平行布尔字段收敛为 `transient_kind: Optional[str]` 单字段，`plan_retry` 关键字参数同步收敛（鸭子类型反射提取删除）；登记表 `engine.types.TRANSIENT_KIND_STAT_KEYS`（kind → 统计键）为新增瞬态信号的唯一登记点，`apply_retry` 统计映射改查表；降级写盘按 kind 单键保真。统计键名不变（公开 API 兼容）；父子进程同版本部署且跨 run 残留结果经令牌轮换丢弃，wire 变更无兼容矩阵。
 
 缺陷修复版本：收敛 HTTP 传输异常分类与快照写入谓词、错误分类法构造契约、单射转义与内容指纹、状态机六集合互斥以及依赖宽限与挂起信号排空等多项缺陷。
