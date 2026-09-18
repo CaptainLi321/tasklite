@@ -13,16 +13,13 @@ from pathlib import Path
 
 import pytest
 from tasklite import TaskLite, Job
+from tasklite.testing import fake_ctx
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job as J
 
 
 def _ctx(output_root, job_id="j1"):
-    return TaskContext(
-        J("test", job_id, payload={}),
-        set(), set(), {},
-        output_root=output_root,
-    )
+    return fake_ctx(J("test", job_id, payload={}), output_root=output_root)
 
 
 # ══════════════════════════════════════════════════════════════════════

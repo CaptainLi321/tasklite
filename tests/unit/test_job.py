@@ -1,6 +1,7 @@
 """Unit tests for the Job class serialization and deserialization."""
 
 import pytest
+from tasklite.testing import fake_ctx
 from tasklite.models.job import Job, JobRuntimeState
 
 
@@ -734,6 +735,6 @@ class TestOversizedIntNumberValidation:
         st = JobRuntimeState.from_dict({"_backoff_until": huge, "_backoff_wall_deadline": huge})
         assert st.backoff_until is None
         assert st.backoff_wall_deadline is None
-        ctx = TaskContext(Job("t", "j"), set(), set(), {})
+        ctx = fake_ctx(Job("t", "j"))
         with pytest.raises(ValueError):
             ctx.suspend_resource("api", huge)

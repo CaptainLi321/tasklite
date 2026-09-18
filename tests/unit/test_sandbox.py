@@ -1,6 +1,7 @@
 """Tests for TaskContext.declare_output() output path sandbox (REQ-10)."""
 from pathlib import Path
 import pytest
+from tasklite.testing import fake_ctx
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
 from tasklite.utils.ipc import ArtifactJournal
@@ -13,14 +14,7 @@ class TestOutputSandbox:
     @staticmethod
     def _ctx(output_root, job_id="j1", ipc_dir=None):
         job = Job("test", job_id, payload={})
-        return TaskContext(
-            job,
-            set(),
-            set(),
-            {},
-            output_root=output_root,
-            ipc_dir=ipc_dir,
-        )
+        return fake_ctx(job, output_root=output_root, ipc_dir=ipc_dir)
 
     # Tests
 
@@ -107,13 +101,13 @@ class TestPathSandbox:
     def test_output_root_rejects_traversal_in_sandbox(self, tmp_path):
         """Path traversal outside output_root → ValueError."""
         job = Job("test", "j1")
-        ctx = TaskContext(job, set(), set(), {}, output_root=tmp_path)
+        ctx = fake_ctx(job, output_root=tmp_path)
         with pytest.raises(ValueError, match="outside output_root"):
             ctx.declare_output("../../etc/passwd")
     def test_no_output_root_allows_any(self, tmp_path):
         """output_root=None → no path restriction."""
         job = Job("test", "j2")
-        ctx = TaskContext(job, set(), set(), {}, output_root=None)
+        ctx = fake_ctx(job)
         # Should not raise
         ctx.declare_output(str(tmp_path / "anything.txt"))
 
@@ -124,12 +118,7 @@ class TestSandboxAdversarialInputs:
     @staticmethod
     def _ctx(output_root, job_id="j1"):
         job = Job("test", job_id, payload={})
-        return TaskContext(
-            job,
-            set(),
-            set(),
-            {},
-            output_root=output_root,
+        return fake_ctx(job, output_root=output_root,
         )
     def test_path_with_null_bytes_rejected(self, tmp_path):
         """Paths with embedded null bytes raise ValueError (Python filesystem safety)."""

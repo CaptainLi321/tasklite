@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tasklite.testing import fake_ctx
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
@@ -334,29 +335,29 @@ class TestTaskContextMethods:
     def _make_ctx(**overrides) -> TaskContext:
         job = Job("t", "j1")
         defaults = {
-            "wall_keys": set(),
-            "failed_keys": set(),
+            "wall": set(),
+            "failed": set(),
             "cursors": {},
         }
         defaults.update(overrides)
-        return TaskContext(job, **defaults)
+        return fake_ctx(job, **defaults)
 
     def test_is_completed_true_for_wall_member(self):
         """is_completed returns True if uid in wall_keys, False otherwise."""
-        ctx = self._make_ctx(wall_keys={"t::j1", "t::x"})
+        ctx = self._make_ctx(wall={"t::j1", "t::x"})
         assert ctx.is_completed("t::j1") is True
         assert ctx.is_completed("t::j2") is False
 
     def test_is_failed_true_for_failed_member(self):
         """is_failed returns True if uid in failed_keys, False otherwise."""
-        ctx = self._make_ctx(failed_keys={"t::j1", "t::x"})
+        ctx = self._make_ctx(failed={"t::j1", "t::x"})
         assert ctx.is_failed("t::j1") is True
         assert ctx.is_failed("t::j2") is False
 
     def test_is_completed_and_is_failed_independent(self):
         """is_completed and is_failed are independent — same uid can't be in both, but different uids can."""
         ctx = self._make_ctx(
-            wall_keys={"t::a", "t::done"}, failed_keys={"t::b", "t::fail"}
+            wall={"t::a", "t::done"}, failed={"t::b", "t::fail"}
         )
         assert ctx.is_completed("t::a") and not ctx.is_failed("t::a")
         assert ctx.is_failed("t::b") and not ctx.is_completed("t::b")

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tasklite.testing import fake_ctx
 from tasklite.pipeline import TaskLite
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
@@ -384,6 +385,6 @@ class TestSignalsFileDrainSemantics:
         with pytest.raises(RuntimeError, match="incarnation"):
             _mp_worker_wrapper(WorkerLaunchSpec(
                 handler=lambda j, c: (True, {}), job=Job("t", "x"),
-                task_ctx=TaskContext(Job("t", "x"), set(), set(), {}),
+                task_ctx=fake_ctx(Job("t", "x")),
                 incarnation=None, ipc_dir=str(tmp_path), timeout=60.0,
             ))

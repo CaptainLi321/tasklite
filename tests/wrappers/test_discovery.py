@@ -19,6 +19,7 @@ import re
 import tempfile
 
 import pytest
+from tasklite.testing import fake_ctx
 from tasklite.pipeline import TaskLite
 from tasklite.models.job import Job
 from tasklite.models.context import TaskContext
@@ -155,10 +156,7 @@ def _make_pipeline(name="test_disc"):
 def _make_ctx(job=None, wall=None, failed=None):
     if job is None:
         job = Job("discover", "seed", payload={})
-    return TaskContext(
-        job, set(wall or ()), set(failed or ()), {},
-        output_root=None,
-    )
+    return fake_ctx(job, wall=wall or (), failed=failed or ())
 
 
 def _register(pipeline, **kwargs):

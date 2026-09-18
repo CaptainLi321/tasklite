@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from tasklite.testing import fake_ctx
 from tasklite.engine.channel import (
     ExecutionChannel,
     WorkerLaunchSpec,
@@ -343,7 +344,7 @@ class TestSubmitStartFailureCleanup:
         spec = WorkerLaunchSpec(
             handler=lambda j, c: True,
             job=Job("t", "j1", payload={}),
-            task_ctx=TaskContext(Job("t", "j1", payload={}), set(), set(), {}),
+            task_ctx=fake_ctx(Job("t", "j1", payload={})),
             incarnation="run.1",
             ipc_dir=str(tmp_path),
             timeout=60,
@@ -357,7 +358,7 @@ class TestSubmitStartFailureCleanup:
         spec = WorkerLaunchSpec(
             handler=lambda j, c: True,
             job=Job("t", "j1", payload={}),
-            task_ctx=TaskContext(Job("t", "j1", payload={}), set(), set(), {}),
+            task_ctx=fake_ctx(Job("t", "j1", payload={})),
             incarnation="run.1",
             ipc_dir=None,
             timeout=60,

@@ -10,6 +10,7 @@
 import pytest
 from pathlib import Path
 from tasklite import TaskLite, Job
+from tasklite.testing import fake_ctx
 from tasklite.models.job import Job as J
 from tasklite.models.state import PipelineState
 from tasklite.wrappers.discovery import register_discovery
@@ -656,20 +657,18 @@ class TestSeenUidsAPI:
 
     def test_attempted_uids_union_of_wall_and_failed(self):
         from tasklite.models.context import TaskContext
-        ctx = TaskContext(
-            J("t", "j1"), {"w1": {}, "w2": {}}, {"f1": {}}, {},
-        )
+        ctx = fake_ctx(J("t", "j1"), wall={"w1": {}, "w2": {}}, failed={"f1": {}})
         assert ctx.attempted_uids() == frozenset({"w1", "w2", "f1"})
 
     def test_attempted_uids_empty_when_no_keys(self):
         from tasklite.models.context import TaskContext
-        ctx = TaskContext(J("t", "j1"), set(), set(), {})
+        ctx = fake_ctx(J("t", "j1"))
         assert ctx.attempted_uids() == frozenset()
 
     def test_attempted_uids_returns_snapshot_not_live_view(self):
         from tasklite.models.context import TaskContext
         wall = {"w1": {}}
-        ctx = TaskContext(J("t", "j1"), wall, {"f1": {}}, {})
+        ctx = fake_ctx(J("t", "j1"), wall=wall, failed={"f1": {}})
         snapshot = ctx.attempted_uids()
         wall["w2"] = {}  # 外部 mutate 源集合
         assert "w2" not in snapshot, "attempted_uids 必须返回快照而非活引用"

@@ -13,17 +13,14 @@ import time
 from pathlib import Path
 
 from tasklite import TaskLite, Job
+from tasklite.testing import fake_ctx
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job as J
 from tasklite.utils.ipc import ArtifactJournal
 
 
 def _ctx(job_id="j1"):
-    return TaskContext(
-        J("test", job_id, payload={}),
-        set(), set(), {},
-        output_root=None,
-    )
+    return fake_ctx(J("test", job_id, payload={}))
 
 
 def _pipeline(tmp_path, name="r4"):

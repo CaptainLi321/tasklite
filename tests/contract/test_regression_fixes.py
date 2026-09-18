@@ -14,6 +14,7 @@ from typing import Literal, Optional, TypedDict
 
 import pytest
 
+from tasklite.testing import fake_ctx
 from tasklite.engine.resource import CapacityResource
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.models.context import TaskContext
@@ -156,14 +157,14 @@ def test_release_acquired_continues_after_single_failure(pipeline_sqlite):
 
 
 def test_spawn_rejects_non_json_payload():
-    ctx = TaskContext(Job("t", "a", payload={}), set(), set(), {})
+    ctx = fake_ctx(Job("t", "a", payload={}))
     with pytest.raises(ValueError, match="not JSON-serializable"):
         ctx.spawn(Job("t", "child", payload={"bad": object()}))
     assert ctx.new_jobs == []  # 坏作业不进入 new_jobs
 
 
 def test_spawn_accepts_json_payload():
-    ctx = TaskContext(Job("t", "a", payload={}), set(), set(), {})
+    ctx = fake_ctx(Job("t", "a", payload={}))
     child = Job("t", "child", payload={"ok": [1, 2, 3]})
     ctx.spawn(child)
     assert ctx.new_jobs == [child]
@@ -171,7 +172,7 @@ def test_spawn_accepts_json_payload():
 
 def test_spawn_rejects_inf_payload():
     """payload 含 float('inf')/nan 时触发预检拒绝（防止产出非标准 JSON）。"""
-    ctx = TaskContext(Job("t", "a", payload={}), set(), set(), {})
+    ctx = fake_ctx(Job("t", "a", payload={}))
     with pytest.raises(ValueError, match="not JSON-serializable"):
         ctx.spawn(Job("t", "child", payload={"bad": float("inf")}))
     with pytest.raises(ValueError, match="not JSON-serializable"):
@@ -235,7 +236,7 @@ def test_int_field_rejects_bool():
 @pytest.mark.parametrize("output_root", ["sandboxed", None])
 def test_declare_output_null_byte_rejected(tmp_path, output_root):
     root = tmp_path if output_root == "sandboxed" else None
-    ctx = TaskContext(Job("t", "a", payload={}), set(), set(), {}, output_root=root)
+    ctx = fake_ctx(Job("t", "a", payload={}), output_root=root)
     with pytest.raises(ValueError, match="null byte"):
         ctx.declare_output("bad\x00path.txt")
 

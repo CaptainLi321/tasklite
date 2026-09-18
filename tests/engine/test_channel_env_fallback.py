@@ -7,6 +7,7 @@ TASKLITE_IPC_DIR 环境变量顺序兜底解析执行目录。解析成功必须
 崩溃（实例属性与 handle 两套真相源）。
 """
 
+from tasklite.testing import fake_ctx
 from tasklite.engine.channel import ExecutionChannel, WorkerLaunchSpec
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
@@ -59,14 +60,14 @@ class TestEnvFallbackIpcDirCoherence:
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("TASKLITE_IPC_DIR", str(tmp_path))
-        fake_ctx = type("Ctx", (), {"Process": _ResultWritingProcess})()
-        channel = ExecutionChannel(mp_ctx=fake_ctx)
+        fake_mp_ctx = type("Ctx", (), {"Process": _ResultWritingProcess})()
+        channel = ExecutionChannel(mp_ctx=fake_mp_ctx)
 
         job = Job("t", "x")
         spec = WorkerLaunchSpec(
             handler=lambda j, c: (True, {}),
             job=job,
-            task_ctx=TaskContext(job, set(), set(), {}),
+            task_ctx=fake_ctx(job),
             incarnation=_INCARNATION,
             ipc_dir=None,
             timeout=60.0,

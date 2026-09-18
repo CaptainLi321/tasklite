@@ -9,6 +9,7 @@ wall 投毒、子任务注入与游标投毒。防御：每 run 随机令牌经 
 
 import json
 
+from tasklite.testing import fake_ctx
 from tasklite.engine.channel import (
     ExecutionChannel,
     JobHandle,
@@ -56,7 +57,7 @@ class TestResultAuthTokenWorkerSide:
         job = Job("t", "x")
         _mp_worker_wrapper(WorkerLaunchSpec(
             handler=lambda j, c: (True, {"ok": 1}), job=job,
-            task_ctx=TaskContext(job, set(), set(), {}),
+            task_ctx=fake_ctx(job),
             incarnation=_INC, ipc_dir=str(tmp_path), timeout=60.0,
             result_token=_TOKEN,
         ))
@@ -74,7 +75,7 @@ class TestResultAuthTokenWorkerSide:
             job = Job("t", f"y{want_status}")
             _mp_worker_wrapper(WorkerLaunchSpec(
                 handler=handler, job=job,
-                task_ctx=TaskContext(job, set(), set(), {}),
+                task_ctx=fake_ctx(job),
                 incarnation=_INC, ipc_dir=str(tmp_path), timeout=60.0,
                 result_token=_TOKEN,
             ))

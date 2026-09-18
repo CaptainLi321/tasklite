@@ -87,7 +87,7 @@ def fake_ctx(
         set(wall) if wall is not None else set(),
         set(failed) if failed is not None else set(),
         dict(cursors) if cursors is not None else {},
-        output_root=Path(output_root) if output_root is not None else None,
+        output_root=Path(output_root) if isinstance(output_root, str) else output_root,
         ipc_dir=ipc_dir,
         transient_registry=transient_registry,
         fatal_exceptions=fatal_exceptions,

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from tasklite.testing import fake_ctx
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.engine.channel import (
     _decode_ipc_result,
@@ -353,7 +354,7 @@ class TestSerializationContract:
 
         ipc = str(tmp_path)
         job = Job("t", "a")
-        ctx = TaskContext(job, set(), set(), {}, output_root=None, ipc_dir=ipc)
+        ctx = fake_ctx(job, ipc_dir=ipc)
 
         # 父进程持锁 → worker try_acquire_lock(timeout=2.0) 失败
         fd = try_acquire_lock(ipc, "t::a")
@@ -393,7 +394,7 @@ class TestSerializationContract:
 
         ipc = str(tmp_path)
         job = Job("t", "rl")
-        ctx = TaskContext(job, set(), set(), {}, output_root=None, ipc_dir=ipc)
+        ctx = fake_ctx(job, ipc_dir=ipc)
 
         def rate_limited_handler(j, c):
             raise RateLimitHit("HTTP 429 RateLimit hit (resource=api, ttl=60.0s)")
@@ -421,7 +422,7 @@ class TestSerializationContract:
 
         ipc = str(tmp_path)
         job = Job("t", "re")
-        ctx = TaskContext(job, set(), set(), {}, output_root=None, ipc_dir=ipc)
+        ctx = fake_ctx(job, ipc_dir=ipc)
 
         def plain_retry_handler(j, c):
             raise RetryError("HTTP 503 Transient server error")
@@ -717,10 +718,7 @@ class TestDeclaredExceptionClassification:
 
         ipc = str(tmp_path)
         job = Job("t", "dt")
-        ctx = TaskContext(
-            job, set(), set(), {}, ipc_dir=ipc,
-            transient_exceptions=(_DeclaredTransientError,),
-        )
+        ctx = fake_ctx(job, ipc_dir=ipc, transient_exceptions=(_DeclaredTransientError,))
         _mp_worker_wrapper(WorkerLaunchSpec(
             handler=_raise_declared_transient, job=job, task_ctx=ctx,
             incarnation="declared.1", ipc_dir=ipc, timeout=60.0,
@@ -739,10 +737,7 @@ class TestDeclaredExceptionClassification:
 
         ipc = str(tmp_path)
         job = Job("t", "df")
-        ctx = TaskContext(
-            job, set(), set(), {}, ipc_dir=ipc,
-            fatal_exceptions=(_DeclaredFatalError,),
-        )
+        ctx = fake_ctx(job, ipc_dir=ipc, fatal_exceptions=(_DeclaredFatalError,))
         _mp_worker_wrapper(WorkerLaunchSpec(
             handler=_raise_declared_fatal, job=job, task_ctx=ctx,
             incarnation="declared.1", ipc_dir=ipc, timeout=60.0,
@@ -965,7 +960,7 @@ class TestUnresolvedItemsTwoRound:
         """declare_output 返回解析后绝对路径（相对路径按 output_root 重定位）。"""
         from tasklite.models.context import TaskContext
         root = tmp_path / "out"
-        ctx = TaskContext(Job("t", "a"), set(), set(), {}, output_root=root, ipc_dir=None)
+        ctx = fake_ctx(Job("t", "a"), output_root=root)
         r = ctx.declare_output("output/file.jpg")
         assert r.startswith(str(root.resolve()))
         assert Path(r).is_absolute()

@@ -18,6 +18,7 @@ IO 故障时 OSError 直接穿透 → worker 裸崩退出（无结果文件）�
 
 import pytest
 
+from tasklite.testing import fake_ctx
 from tasklite.engine import channel as channel_mod
 from tasklite.engine.channel import _mp_worker_wrapper
 from tasklite.models.context import TaskContext
@@ -40,7 +41,7 @@ def _is_full_payload(result_dict):
 def _make_spec(job, handler, ipc_dir, incarnation=_INCARNATION):
     from tasklite.engine.channel import WorkerLaunchSpec
     return WorkerLaunchSpec(
-        handler=handler, job=job, task_ctx=TaskContext(job, set(), set(), {}),
+        handler=handler, job=job, task_ctx=fake_ctx(job),
         incarnation=incarnation, ipc_dir=ipc_dir, timeout=60.0,
     )
 
