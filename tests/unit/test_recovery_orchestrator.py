@@ -22,7 +22,7 @@ from tasklite.models.job import (
 from tasklite.engine.store import StateStore
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
-from tests.machines import make_recovery_orchestrator
+from tests.machines import FakeChannel, FakeInFlight, make_recovery_orchestrator
 
 
 
@@ -439,19 +439,11 @@ class TestRecoveryOrchestratorSuspendPersistence:
     def test_apply_pending_signals_persists_suspensions(self):
         backend = InMemoryStateBackend()
         rm = ResourceManager({"api": RateLimitResource("api", 1.0)})
-        in_flight = MagicMock()
-        in_flight.active_uids.return_value = ["t::j1"]
-        channel = MagicMock()
-        # channel.drain_active_signals 返回一条挂起信号
-        channel.drain_active_signals.return_value = [("t::j1", "api", 30.0)]
-
-        orchestrator = RecoveryOrchestrator(
-            store=StateStore(backend),
-            channel=channel,
-            resources=rm,
-            in_flight=in_flight,
-            policy=PreflightPolicy(),
-            completion=MagicMock(),
+        orchestrator = make_recovery_orchestrator(
+            backend,
+            resource_mgr=rm,
+            channel=FakeChannel(active_signals=[("t::j1", "api", 30.0)]),
+            in_flight=FakeInFlight(["t::j1"]),
         )
 
         orchestrator.apply_pending_signals()
@@ -467,15 +459,10 @@ class TestRecoveryOrchestratorResidueSalvage:
 
         backend = InMemoryStateBackend()
         rm = ResourceManager({"api": RateLimitResource("api", 1.0)})
-        channel = MagicMock()
-        channel.drain_all_signals.return_value = [("t::j1", "api", 30.0)]
-        orchestrator = RecoveryOrchestrator(
-            store=StateStore(backend),
-            channel=channel,
-            resources=rm,
-            in_flight=MagicMock(),
-            policy=PreflightPolicy(),
-            completion=MagicMock(),
+        orchestrator = make_recovery_orchestrator(
+            backend,
+            resource_mgr=rm,
+            channel=FakeChannel(all_signals=[("t::j1", "api", 30.0)]),
         )
 
         orchestrator.salvage_residue_signals()
@@ -487,15 +474,10 @@ class TestRecoveryOrchestratorResidueSalvage:
     def test_salvage_residue_signals_channel_failure_is_isolated(self):
         """清扫原语异常只降级告警，不得打断启动序列。"""
         backend = InMemoryStateBackend()
-        channel = MagicMock()
-        channel.drain_all_signals.side_effect = OSError("ipc dir unavailable")
-        orchestrator = RecoveryOrchestrator(
-            store=StateStore(backend),
-            channel=channel,
-            resources=ResourceManager({"api": RateLimitResource("api", 1.0)}),
-            in_flight=MagicMock(),
-            policy=PreflightPolicy(),
-            completion=MagicMock(),
+        orchestrator = make_recovery_orchestrator(
+            backend,
+            resource_mgr=ResourceManager({"api": RateLimitResource("api", 1.0)}),
+            channel=FakeChannel(drain_all_error=OSError("ipc dir unavailable")),
         )
 
         orchestrator.salvage_residue_signals()
@@ -503,16 +485,11 @@ class TestRecoveryOrchestratorResidueSalvage:
         assert backend.get_meta(META_RESOURCE_SUSPENDS) is None
 
     def test_salvage_residue_signals_skips_unregistered_resource(self):
-        channel = MagicMock()
-        channel.drain_all_signals.return_value = [("t::j1", "no_such", 9.0)]
         backend = InMemoryStateBackend()
-        orchestrator = RecoveryOrchestrator(
-            store=StateStore(backend),
-            channel=channel,
-            resources=ResourceManager({"api": RateLimitResource("api", 1.0)}),
-            in_flight=MagicMock(),
-            policy=PreflightPolicy(),
-            completion=MagicMock(),
+        orchestrator = make_recovery_orchestrator(
+            backend,
+            resource_mgr=ResourceManager({"api": RateLimitResource("api", 1.0)}),
+            channel=FakeChannel(all_signals=[("t::j1", "no_such", 9.0)]),
         )
 
         orchestrator.salvage_residue_signals()

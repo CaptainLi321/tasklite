@@ -28,7 +28,48 @@ from tasklite.models.job import WORKER_RESOURCE
 from tasklite.models.state import PipelineState
 from tasklite.taxonomy import ErrorTaxonomy
 
-__all__ = ["MachineEnv", "make_machines", "make_recovery_orchestrator"]
+__all__ = [
+    "MachineEnv",
+    "make_machines",
+    "make_recovery_orchestrator",
+    "FakeChannel",
+    "FakeInFlight",
+]
+
+
+class FakeChannel:
+    """RecoveryOrchestrator 消费面的具名替身——三个读口，字段即配置。
+
+    遵循「具名 spec 契约、禁按位置反解」：方法名即消费面契约，构造
+    参数即返回值配置，不靠 MagicMock 的运行时属性组装。
+    """
+
+    def __init__(self, *, active_signals=(), all_signals=(), drain_all_error=None):
+        self.active_signals = list(active_signals)
+        self.all_signals = list(all_signals)
+        self.drain_all_error = drain_all_error
+
+    def drain_active_signals(self, uids):
+        return list(self.active_signals)
+
+    def drain_all_signals(self):
+        if self.drain_all_error is not None:
+            raise self.drain_all_error
+        return list(self.all_signals)
+
+    def abort_in_flight(self, handles):
+        from tasklite.engine.channel import AbortOutcome
+        return AbortOutcome(completed=[], cancelled=[])
+
+
+class FakeInFlight:
+    """apply_pending_signals 消费面替身（只读 active_uids）。"""
+
+    def __init__(self, uids=()):
+        self._uids = list(uids)
+
+    def active_uids(self):
+        return list(self._uids)
 
 
 class MachineEnv(NamedTuple):
