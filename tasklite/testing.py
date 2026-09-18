@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from .models.context import TaskContext
 from .models.job import Job
@@ -24,6 +24,11 @@ def fake_ctx(
     cursors: Optional[Dict[str, str]] = None,
     resources: Optional[Iterable[str]] = None,
     tmp_root: Optional[Any] = None,
+    output_root: Optional[Any] = None,
+    ipc_dir: Optional[str] = None,
+    fatal_exceptions: Optional[Tuple[type, ...]] = None,
+    transient_exceptions: Optional[Tuple[type, ...]] = None,
+    transient_registry: Tuple[type, ...] = (),
 ) -> TaskContext:
     """构造 handler 单测用 TaskContext。
 
@@ -39,24 +44,32 @@ def fake_ctx(
             清单记录随之可用）。路径经 ``ctx.output_root`` / ``ctx.ipc_dir``
             读取；目录清理由调用方的 tmp_root 机制（如 pytest tmp_path
             的会话级回收）统一承担。
+        output_root: 直接指定产物根目录（与 tmp_root 互斥使用）。
+        ipc_dir: 直接指定 IPC 目录（caller 选定目录，非 tmp_root 子目录）。
+        fatal_exceptions / transient_exceptions: 异常分类声明元组
+            （worker 侧 classify 接缝直测用）。
+        transient_registry: 瞬态注册表元组（与上两者同属分类声明面）。
 
     Returns:
         TaskContext: 内部容器结构由本函数兜底装配的上下文实例。
     """
-    output_root: Optional[Path] = None
-    ipc_dir: Optional[str] = None
     if tmp_root is not None:
         base = Path(tempfile.mkdtemp(dir=str(tmp_root)))
         output_root = base
-        ipc_dir = str(base / "ipc")
+        if ipc_dir is None:
+            ipc_dir = str(base / "ipc")
+            Path(ipc_dir).mkdir(parents=True, exist_ok=True)
+    elif ipc_dir is not None:
         Path(ipc_dir).mkdir(parents=True, exist_ok=True)
     return TaskContext(
         job,
         set(wall) if wall is not None else set(),
         set(failed) if failed is not None else set(),
         dict(cursors) if cursors is not None else {},
-        output_root=output_root,
+        output_root=Path(output_root) if output_root is not None else None,
         ipc_dir=ipc_dir,
-        transient_registry=(),
+        transient_registry=transient_registry,
+        fatal_exceptions=fatal_exceptions,
+        transient_exceptions=transient_exceptions,
         resource_names=frozenset(resources) if resources is not None else None,
     )

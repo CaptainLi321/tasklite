@@ -85,3 +85,35 @@ class TestFakeCtxSuspendGuard:
         ctx = fake_ctx(_job())
         ctx.suspend_resource("anything", 60.0)
         assert ctx.resource_suspensions == [("anything", 60.0)]
+
+
+class TestFakeCtxExtendedParams:
+    """keyword-only 扩展参数：不改变既有调用形态（非破坏性扩展）。"""
+
+    def test_fatal_and_transient_exceptions_forwarded(self):
+        class Boom(Exception):
+            pass
+
+        ctx = fake_ctx(_job(), fatal_exceptions=(Boom,), transient_exceptions=(ValueError,))
+        assert ctx.fatal_exceptions == (Boom,)
+        assert ctx.transient_exceptions == (ValueError,)
+
+    def test_transient_registry_forwarded(self):
+        ctx = fake_ctx(_job(), transient_registry=(RuntimeError,))
+        assert ctx.transient_registry == (RuntimeError,)
+
+    def test_direct_ipc_dir_created(self, tmp_path):
+        ipc = str(tmp_path / "my_ipc")
+        ctx = fake_ctx(_job(), ipc_dir=ipc)
+        assert ctx.ipc_dir == ipc
+        assert Path(ipc).is_dir()
+
+    def test_direct_output_root_forwarded(self, tmp_path):
+        root = tmp_path / "root"
+        ctx = fake_ctx(_job(), output_root=str(root))
+        assert str(ctx.output_root) == str(root)
+
+    def test_tmp_root_with_explicit_ipc_dir_keeps_ipc(self, tmp_path):
+        ipc = str(tmp_path / "custom_ipc")
+        ctx = fake_ctx(_job(), tmp_root=tmp_path, ipc_dir=ipc)
+        assert ctx.ipc_dir == ipc
