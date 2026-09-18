@@ -429,12 +429,14 @@ class EngineRuntime:
         self._in_flight.clear()
 
     def prepare_run_state(self) -> PipelineState:
-        """加载持久化状态、初始化 run_id 屏障、执行恢复修复并构建内存 PipelineState。"""
+        """加载持久化状态、初始化 run_id 屏障、执行恢复修复并构建内存 PipelineState。
+
+        编排层只负责 run 生命周期操作：调度轮复位与 fencing 屏障（run
+        身份是 RunSession 属物，meta 持久化与 channel 同步是横切副作用，
+        不下沉机器以免 session 依赖回流）；装载与修复序列归
+        RecoveryMachine.load_and_repair。
+        """
         self.scheduler.begin_round()
-        wall = self.backend.load_wall()
-        failed = self.backend.load_failed()
-        cursors = self.backend.load_cursors()
-        q_data = self.backend.load_queue()
 
         # Fencing 屏障（结果认证令牌与 run_id 同生命周期：每 run 轮换并
         # 同步到执行通道，收割/认领/中止三条读取路径共用同一信任锚）
@@ -448,16 +450,7 @@ class EngineRuntime:
             logger.critical(f"Failed to persist run_id to meta table: {e}")
             raise
 
-        # 启动期队列整理与资源挂起加载（终态交集先收敛，后续 repair 与
-        # 六集合互斥断言都依赖 wall/failed 互斥前提）
-        self._recovery.converge_terminal_overlap(wall, failed)
-        q_data = self._recovery.repair_queue_on_load(q_data, wall, failed)
-        self._recovery.load_resource_suspends()
-        self._recovery.salvage_residue_signals()
-
-        state = PipelineState(wall, failed, cursors, q_data)
-        self.store.set_state(state)
-        return state
+        return self._recovery.load_and_repair()
 
     def _run_loop(self) -> None:
         """运行主事件循环与统一异常承重网。"""

@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
-from ..models.state import uid_from_job_dict
+from ..models.state import PipelineState, uid_from_job_dict
 from ..utils.jsonutil import loads
 from .inflight import InFlightJob, InFlightTracker
 from .resource import (
@@ -60,6 +60,30 @@ class RecoveryOrchestrator:
         self._in_flight = in_flight
         self._policy = policy
         self._completion = completion
+
+    def load_and_repair(self) -> PipelineState:
+        """启动期持久化状态装载与修复（prepare_run_state 的机器侧职责段）。
+
+        backend 四连加载 → 终态交集收敛 → 队列修复 → 资源挂起恢复 →
+        残留信号回收 → PipelineState 构造并落 store。全部依赖已在构造
+        清单内（backend 经 store 活引用），零新增依赖。
+        """
+        backend = self._store.backend
+        wall = backend.load_wall()
+        failed = backend.load_failed()
+        cursors = backend.load_cursors()
+        q_data = backend.load_queue()
+
+        # 启动期队列整理与资源挂起加载（终态交集先收敛，后续 repair 与
+        # 六集合互斥断言都依赖 wall/failed 互斥前提）
+        self.converge_terminal_overlap(wall, failed)
+        q_data = self.repair_queue_on_load(q_data, wall, failed)
+        self.load_resource_suspends()
+        self.salvage_residue_signals()
+
+        state = PipelineState(wall, failed, cursors, q_data)
+        self._store.set_state(state)
+        return state
 
     def repair_queue_on_load(
         self, q_data: list, wall: dict, failed: dict
