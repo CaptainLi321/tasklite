@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable
 
 from .types import ExitReason, StopMode, TaskStats
 
@@ -24,17 +24,17 @@ class RunSession:
     def __init__(
         self,
         *,
-        on_run_start: Optional[Callable[[], None]] = None,
-        on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None,
-        on_run_end: Optional[Callable[[str], None]] = None,
+        on_run_start: Callable[[], None] | None = None,
+        on_job_completed: Callable[[str, dict[str, Any], bool, bool], None] | None = None,
+        on_run_end: Callable[[str], None] | None = None,
     ) -> None:
         self.on_run_start = on_run_start
         self.on_job_completed = on_job_completed
         self.on_run_end = on_run_end
-        self.run_id: Optional[str] = None
+        self.run_id: str | None = None
         # 每 run 随机结果认证令牌：随 WorkerLaunchSpec 下发 worker、随结果
         # 落盘，主进程读取侧强校验（防 ipc_dir 写入者伪造结果文件投毒）
-        self.result_token: Optional[str] = None
+        self.result_token: str | None = None
         self.dispatch_seq: int = 0
         self.stop_mode: StopMode = StopMode.NONE
         self._stats = TaskStats()
@@ -44,7 +44,7 @@ class RunSession:
     def stats(self) -> TaskStats:
         return self._stats
 
-    def begin(self, run_id: Optional[str] = None) -> None:
+    def begin(self, run_id: str | None = None) -> None:
         """新 run 的复位入口：全部生命周期状态归零，run_id 待分配时置 None。"""
         self.run_id = run_id
         self.result_token = secrets.token_hex(32)
@@ -68,7 +68,7 @@ class RunSession:
             logger.info("停机状态设置为 DRAINING（等待在途任务完成）")
         return self.stop_mode
 
-    def exit_reason(self, exc: Optional[BaseException] = None) -> ExitReason:
+    def exit_reason(self, exc: BaseException | None = None) -> ExitReason:
         """终局原因唯一推导实现：异常类型优先（KeyboardInterrupt→INTERRUPTED、
         其余异常→ERROR——信号 handler 可能已改写 stop_mode 仍以异常为准），
         无异常按 stop_mode 三态。"""
@@ -94,7 +94,7 @@ class RunSession:
             self._stats["hook_errors"] += 1
 
     def fire_job_completed(
-        self, uid: str, meta: Dict[str, Any], success: bool, going_to_retry: bool,
+        self, uid: str, meta: dict[str, Any], success: bool, going_to_retry: bool,
     ) -> None:
         if self.on_job_completed is None:
             return

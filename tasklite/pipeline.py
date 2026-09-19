@@ -4,7 +4,7 @@ import logging
 import multiprocessing as mp
 import time  # 模块内零调用：tests 以 tasklite.pipeline.time 为锚点 monkeypatch sleep/monotonic，保留为补丁接缝
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Sequence
 
 from .backend.base import AbstractStateBackend
 from .backend.memory import InMemoryStateBackend
@@ -46,19 +46,19 @@ class TaskLite:
     def __init__(
         self,
         name: str,
-        state_dir: Union[str, Path],
-        backend: Union[str, AbstractStateBackend] = "sqlite",
-        output_root: Union[str, Path, Sequence[Union[str, Path]], None] = None,
+        state_dir: str | Path,
+        backend: str | AbstractStateBackend = "sqlite",
+        output_root: str | Path | Sequence[str | Path] | None = None,
         max_workers: int = _DEFAULT_MAX_WORKERS,
-        on_run_start: Optional[Callable[[], None]] = None,
-        on_run_end: Optional[Callable[[str], None]] = None,
-        on_job_completed: Optional[Callable[[str, dict, bool, bool], None]] = None,
+        on_run_start: Callable[[], None] | None = None,
+        on_run_end: Callable[[str], None] | None = None,
+        on_job_completed: Callable[[str, dict, bool, bool], None] | None = None,
         strict_picklable: bool = False,
-        fatal_exceptions: Optional[tuple] = None,
-        transient_exceptions: Optional[tuple] = None,
-        dep_grace_seconds: Optional[float] = None,
-        commit_failure_dlq_threshold: Optional[int] = None,
-        deadlock_gap_max_rounds: Optional[int] = None,
+        fatal_exceptions: tuple | None = None,
+        transient_exceptions: tuple | None = None,
+        dep_grace_seconds: float | None = None,
+        commit_failure_dlq_threshold: int | None = None,
+        deadlock_gap_max_rounds: int | None = None,
     ):
         """Initialize the pipeline.
 
@@ -155,17 +155,17 @@ class TaskLite:
             )
 
         # handler -> (func, default_resources, payload_schema)
-        self.handlers: Dict[str, HandlerEntry] = {}
+        self.handlers: dict[str, HandlerEntry] = {}
         # discovery task_type -> 默认 rerun 策略——enqueue/spawn
         # 时经 apply_discovery_rerun 注入（见 enqueue docstring），使「固定
         # uid 每会话重扫」成为默认。
-        self._discovery_rerun: Dict[str, str] = {}
+        self._discovery_rerun: dict[str, str] = {}
         # 错误分类与瞬态注册是 **per-pipeline 实例态**——不跨 pipeline/run
         # 累积；子进程只消费 ctx 携带的不可变快照（见
         # register_transient_exception / _dispatch_job）。
-        self._fatal_exceptions: Optional[tuple] = (
+        self._fatal_exceptions: tuple | None = (
             tuple(fatal_exceptions) if fatal_exceptions is not None else None)
-        self._transient_exceptions: Optional[tuple] = (
+        self._transient_exceptions: tuple | None = (
             tuple(transient_exceptions) if transient_exceptions is not None else None)
         # 声明元组随 ctx pickle 下发子进程——非 Exception / 不可 pickle 类
         # 与注册表路径同规在构造期 fail-loud，不滞后到 spawn 派发才失败。
@@ -339,8 +339,8 @@ class TaskLite:
         self,
         task_type: str,
         handler_func: Callable[[Job, TaskContext], Any],
-        default_resources: Optional[Dict[str, float]] = None,
-        payload_schema: Optional[type] = None,
+        default_resources: dict[str, float] | None = None,
+        payload_schema: type | None = None,
     ) -> None:
         """
         Register a handler for a task type.
@@ -349,12 +349,12 @@ class TaskLite:
         - None (Implies success)
         - True / False
         - dict (Metadata for success)
-        - Tuple[bool, dict]
+        - tuple[bool, dict]
         Raise RetryError to push back to queue.
         Raise FatalError for non-retryable bugs (direct DLQ, no retries).
         Raise Exception to fail and push to DLQ.
 
-        payload_schema: Optional TypedDict class for runtime payload validation.
+        payload_schema: optional TypedDict class for runtime payload validation.
         Validated BEFORE forking the subprocess. Validation failures go directly to DLQ.
         """
         self._ensure_not_running("register_handler")
@@ -440,7 +440,7 @@ class TaskLite:
         self.register_transient_exceptions(classes)
 
 
-    def uncompleted(self, jobs: Sequence[Job]) -> List[Job]:
+    def uncompleted(self, jobs: Sequence[Job]) -> list[Job]:
         """过滤出尚未成功完成的 job（uid 不在 wall 的子集，保留输入顺序）。
 
         回溯/增量场景的入队前过滤辅助——调用方自行查 wall 过滤时，漏掉
@@ -459,7 +459,7 @@ class TaskLite:
         wall = self._backend.load_wall()
         return [j for j in jobs if j.uid not in wall]
 
-    def enqueue(self, jobs: Union[Job, Sequence[Job]], front: bool = False) -> None:
+    def enqueue(self, jobs: Job | Sequence[Job], front: bool = False) -> None:
         """Add jobs to the queue.
 
         Args:
@@ -505,24 +505,24 @@ class TaskLite:
         elif inserted:
             logger.info(f"Enqueued {len(inserted)} job(s).")
 
-    def list_suspends(self) -> List[SuspendEntry]:
+    def list_suspends(self) -> list[SuspendEntry]:
         """只读查询当前仍生效的资源挂起。委托 OpsConsole。
 
         Returns:
-            List[SuspendEntry]: 每条含 ``resource`` / ``resume_at``（epoch
+            list[SuspendEntry]: 每条含 ``resource`` / ``resume_at``（epoch
             秒）/ ``remaining_seconds``（查询时刻快照），按解封时刻升序。
         """
         self._ensure_not_running("list_suspends")
         return self._console.list_suspends()
 
-    def list_dlq(self) -> List[DLQEntry]:
+    def list_dlq(self) -> list[DLQEntry]:
         """只读查询 DLQ，返回结构化条目。委托 OpsConsole。"""
         self._ensure_not_running("list_dlq")
         return self._console.list_dlq()
 
     def clear_dlq(
         self,
-        task_types: Optional[Sequence[str]] = None,
+        task_types: Sequence[str] | None = None,
         *,
         keep_fatal: bool = True,
     ) -> int:
@@ -532,7 +532,7 @@ class TaskLite:
 
     def clear_history(
         self,
-        targets: Union[str, Sequence[str]],
+        targets: str | Sequence[str],
         *,
         where: Sequence[str] = ("wall", "failed"),
     ) -> int:

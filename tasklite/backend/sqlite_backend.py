@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable
 
 from .base import (
     AbstractStateBackend,
@@ -28,7 +28,7 @@ class SQLiteStateBackend(AbstractStateBackend):
     """Atomic SQLite state backend for tasklite.
     Combines queue, wall_log, and failed_log into a single ACID-compliant database."""
 
-    def __init__(self, filepath: Union[str, Path]):
+    def __init__(self, filepath: str | Path):
         self.path = Path(filepath)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -126,7 +126,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             if user_ver < _SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
-    def get_meta(self, key: str) -> Optional[str]:
+    def get_meta(self, key: str) -> str | None:
         if not self.path.exists():
             return None
         try:
@@ -173,7 +173,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             "removed. Recreate the state database or migrate manually."
         )
 
-    def _seq_range(self, conn, count: int, front: bool) -> List[int]:
+    def _seq_range(self, conn, count: int, front: bool) -> list[int]:
         """分配 count 个保序 seq：front 取 min_seq - count..min_seq-1，back 取 max_seq+1..。
 
         调用方必须已通过 ``BEGIN IMMEDIATE`` 持写事务：MIN/MAX 的读
@@ -192,7 +192,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         base = max_seq + 1
         return list(range(base, base + count))
 
-    def load_wall(self) -> Dict[str, Dict[str, Any]]:
+    def load_wall(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
             return {}
         try:
@@ -204,7 +204,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Corrupted wall payload in {self.path.name}: {e}") from e
 
-    def append_failed(self, uid: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    def append_failed(self, uid: str, payload: dict[str, Any] | None = None) -> None:
         try:
             with self._get_conn() as conn:
                 # _attempt 读-递增-写必须持写事务串行化，否则并发 append
@@ -217,7 +217,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.error(f"Failed to append to DLQ in {self.path.name}: {e}")
             raise
 
-    def load_failed(self) -> Dict[str, Dict[str, Any]]:
+    def load_failed(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
             return {}
         try:
@@ -229,7 +229,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Corrupted failed DLQ payload in {self.path.name}: {e}") from e
 
-    def load_queue(self) -> List[Dict[str, Any]]:
+    def load_queue(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         try:
@@ -241,7 +241,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Corrupted queue payload in {self.path.name}: {e}") from e
 
-    def _rewrite_queue_rows(self, conn, jobs: List[Dict[str, Any]]) -> None:
+    def _rewrite_queue_rows(self, conn, jobs: list[dict[str, Any]]) -> None:
         """queue 表整表重写的单一出口（save_queue 与 replace_queue_atomic 共用）。
 
         写变前先经 ``validate_queue_replacement`` 校验替换集（None/非法形状
@@ -271,7 +271,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                 rows,
             )
 
-    def save_queue(self, jobs: List[Dict[str, Any]]) -> None:
+    def save_queue(self, jobs: list[dict[str, Any]]) -> None:
         """全量重写队列（测试装配 / replace_queue_atomic 事务内步骤，罕见 O(N)）。
 
         红线：无读基准的整表覆盖——崩溃恢复路径的「合并保存」严禁直接
@@ -287,7 +287,7 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     def replace_queue_atomic(
         self,
-        compute: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]],
+        compute: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
     ) -> None:
         try:
             with self._get_conn() as conn:
@@ -306,7 +306,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to replace queue atomically in {self.path.name}: {e}")
             raise
 
-    def enqueue_jobs(self, jobs: List[Dict[str, Any]], *, front: bool = False) -> List[str]:
+    def enqueue_jobs(self, jobs: list[dict[str, Any]], *, front: bool = False) -> list[str]:
         """批量增量入队：单事务原子插入，跳过重复 uid。
 
         与 save_queue 的区别：不做 DELETE 全表重写——与 run() 的 delta
@@ -324,7 +324,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                 existing = {
                     row[0] for row in conn.execute('SELECT uid FROM queue')
                 }
-                fresh: List[Dict[str, Any]] = []
+                fresh: list[dict[str, Any]] = []
                 batch_seen: set = set()
                 for j in jobs:
                     u = uid_from_job_dict(j)
@@ -347,7 +347,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to enqueue jobs to {self.path.name}: {e}")
             raise
 
-    def load_cursors(self) -> Dict[str, str]:
+    def load_cursors(self) -> dict[str, str]:
         if not self.path.exists():
             return {}
         try:
@@ -357,7 +357,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(f"Failed to load cursors from {self.path.name}: {e}") from e
 
-    def commit_job_success(self, uid: str, result_meta: dict, *, spawned_jobs=(), cursor_updates: Optional[Dict[str, str]] = None) -> bool:
+    def commit_job_success(self, uid: str, result_meta: dict, *, spawned_jobs=(), cursor_updates: dict[str, str] | None = None) -> bool:
         """原子 delta：写 wall + 删除 popped uid + 队头插入 spawned_jobs + 更新 cursors。
 
         失败时事务回滚，on-disk 队列不变（popped uid 仍在磁盘）。
@@ -498,7 +498,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             return False
         return True
 
-    def delete_queue_uids(self, uids: List[str]) -> int:
+    def delete_queue_uids(self, uids: list[str]) -> int:
         """按 uid 定向批量删除队列行（repair 差量落盘），不触碰其余行。"""
         if not uids:
             return 0
@@ -512,7 +512,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to delete queue uids in {self.path.name}: {e}")
             raise
 
-    def commit_retry(self, popped_uid: str, requeued_job: Dict[str, Any], *, front: bool = False) -> bool:
+    def commit_retry(self, popped_uid: str, requeued_job: dict[str, Any], *, front: bool = False) -> bool:
         """原子 delta：删除 popped_uid + 按 front 插入 requeued_job。不写 wall/DLQ。
 
         popped_uid 已先删除，故同 uid 重插安全（用 INSERT 而非 REPLACE）。
@@ -536,7 +536,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             return False
         return True
 
-    def commit_bulk_failure(self, uids_metas: List[Tuple[str, dict]]) -> bool:
+    def commit_bulk_failure(self, uids_metas: list[tuple[str, dict]]) -> bool:
         """原子 delta：批量写 DLQ + 批量删除这些 uid + 批量清理 wall 旧记录。失败时 on-disk 队列不变。
 
         删除是按 uid 精准删除，剩余条目保持原 seq 顺序。
@@ -562,7 +562,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             return False
         return True
 
-    def delete_failed(self, uids: List[str]) -> int:
+    def delete_failed(self, uids: list[str]) -> int:
         """从 DLQ 批量删除指定 uid（clear_dlq/clear_history 的后端）。"""
         if not uids:
             return 0
@@ -576,7 +576,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to delete failed entries in {self.path.name}: {e}")
             raise
 
-    def delete_wall(self, uids: List[str]) -> int:
+    def delete_wall(self, uids: list[str]) -> int:
         """从 wall 批量删除指定 uid（clear_history 的后端）。"""
         if not uids:
             return 0
@@ -590,7 +590,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to delete wall entries in {self.path.name}: {e}")
             raise
 
-    def seed_wall(self, uids: List[str]) -> int:
+    def seed_wall(self, uids: list[str]) -> int:
         """把 uid 批量写入 wall（meta 空 dict）——存档迁移标记「已处理」。
 
         幂等：已存在的 uid 被覆盖（meta 重置为空）。

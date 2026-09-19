@@ -9,7 +9,7 @@ from __future__ import annotations
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator
 
 from .models.context import TaskContext
 from .models.job import Job
@@ -40,16 +40,16 @@ def running(target: Any) -> Iterator[Any]:
 def fake_ctx(
     job: Job,
     *,
-    wall: Optional[Iterable[str]] = None,
-    failed: Optional[Iterable[str]] = None,
-    cursors: Optional[Dict[str, str]] = None,
-    resources: Optional[Iterable[str]] = None,
-    tmp_root: Optional[Any] = None,
-    output_root: Optional[Any] = None,
-    ipc_dir: Optional[str] = None,
-    fatal_exceptions: Optional[Tuple[type, ...]] = None,
-    transient_exceptions: Optional[Tuple[type, ...]] = None,
-    transient_registry: Tuple[type, ...] = (),
+    wall: Iterable[str] | None = None,
+    failed: Iterable[str] | None = None,
+    cursors: dict[str, str] | None = None,
+    resources: Iterable[str] | None = None,
+    tmp_root: Any | None = None,
+    output_root: Any | None = None,
+    ipc_dir: str | None = None,
+    fatal_exceptions: tuple[type, ...] | None = None,
+    transient_exceptions: tuple[type, ...] | None = None,
+    transient_registry: tuple[type, ...] = (),
 ) -> TaskContext:
     """构造 handler 单测用 TaskContext。
 

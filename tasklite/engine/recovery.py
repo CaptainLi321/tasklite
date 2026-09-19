@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Any, List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .channel import ExecutionChannel

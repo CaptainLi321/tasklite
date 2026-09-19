@@ -12,7 +12,7 @@ import random
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, List, Mapping, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Mapping, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .channel import ExecutionChannel
@@ -51,7 +51,7 @@ class DispatchOutcome:
     形状），构造期一次性投影——pacing 与 governor 从同一份事实读取，
     不存在扁平字段与内嵌 sched 的两份真相。
     """
-    entry: Optional[InFlightJob] = None
+    entry: InFlightJob | None = None
     has_runnable: bool = False
     should_continue: bool = True
     worker_wait: float = 0.0
@@ -297,7 +297,7 @@ class DispatchMachine:
         )
 
 
-    def dispatch_job(self, sched: ScheduleResult) -> Optional[InFlightJob]:
+    def dispatch_job(self, sched: ScheduleResult) -> InFlightJob | None:
         """统一派发单个作业：出队 -> 五关预检 -> 两阶段资源租约 -> 子进程启动 -> in-flight 原子登记。
 
         返回 InFlightJob 条目；若被预检五关拦截（去重/依赖失败/无handler/孤儿延迟/残留恢复）或校验失败，返回 None。
@@ -329,7 +329,7 @@ class DispatchMachine:
             return None
 
         # Acquire resources via two-phase lease
-        handle: Optional[JobHandle] = None
+        handle: JobHandle | None = None
         try:
             lease = self._resources.reserve(
                 job.task_type, job.resources, uid=uid

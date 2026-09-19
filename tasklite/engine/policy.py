@@ -16,7 +16,7 @@ import math
 import os
 import random
 import time
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Mapping
 
 from ..models.job import Job, JobRuntimeState, RT_BACKOFF_UNTIL, RT_BACKOFF_WALL_DEADLINE
 from ..models.state import uid_from_job_dict
@@ -51,7 +51,7 @@ class PreflightDecision:
     action: PreflightAction
     reason: DecisionReason
     effective_rerun: str
-    input_changed: Optional[bool] = None
+    input_changed: bool | None = None
 
     @property
     def should_skip(self) -> bool:
@@ -82,7 +82,7 @@ class BackoffSchedule:
             wall_deadline=now_wall + delay,
         )
 
-    def populate_runtime(self, runtime_obj: Union[dict, JobRuntimeState]) -> None:
+    def populate_runtime(self, runtime_obj: dict | JobRuntimeState) -> None:
         """将双时钟截止时间原子写入 Job 的 runtime（支持 dict 或 JobRuntimeState）。"""
         if isinstance(runtime_obj, JobRuntimeState):
             runtime_obj.backoff_until = self.backoff_until
@@ -98,10 +98,10 @@ class RetryPlan:
 
     going_to_retry: bool
     delay: float = 0.0
-    retry_dict: Optional[Dict[str, Any]] = None
-    fail_meta: Optional[Dict[str, Any]] = None
-    transient_kind: Optional[str] = None
-    schedule: Optional[BackoffSchedule] = None
+    retry_dict: dict[str, Any] | None = None
+    fail_meta: dict[str, Any] | None = None
+    transient_kind: str | None = None
+    schedule: BackoffSchedule | None = None
 
 
 class AdmissionPolicy:
@@ -109,7 +109,7 @@ class AdmissionPolicy:
 
     def __init__(
         self,
-        discovery_rerun: Optional[Mapping[str, str]] = None,
+        discovery_rerun: Mapping[str, str] | None = None,
         *,
         enable_stat_cache: bool = False,
     ) -> None:
@@ -117,7 +117,7 @@ class AdmissionPolicy:
             discovery_rerun if discovery_rerun is not None else {}
         )
         self.enable_stat_cache: bool = enable_stat_cache
-        self._stat_cache: Dict[str, Optional[os.stat_result]] = {}
+        self._stat_cache: dict[str, os.stat_result | None] = {}
 
     def clear_stat_cache(self) -> None:
         """清空实例级文件 stat 缓存。"""
@@ -135,7 +135,7 @@ class AdmissionPolicy:
             return True
         return False
 
-    def check_input_changed(self, wall_meta: Optional[dict]) -> bool:
+    def check_input_changed(self, wall_meta: dict | None) -> bool:
         """比对 Wall 历史输入指纹与当前磁盘文件状态（带 StatCache 与脏数据容灾）。
 
         任一文件输入 size/mtime_ns 变化（或文件消失、或 wall 无历史指纹）
@@ -176,10 +176,10 @@ class AdmissionPolicy:
 
     def evaluate(
         self,
-        job_dict_or_rerun: Union[dict, Optional[str]],
+        job_dict_or_rerun: dict | str | None,
         *,
-        task_type: Optional[str] = None,
-        wall_meta: Optional[dict] = None,
+        task_type: str | None = None,
+        wall_meta: dict | None = None,
         is_wall: bool = False,
         is_failed: bool = False,
     ) -> PreflightDecision:
@@ -318,8 +318,8 @@ class BackoffGovernor:
         backoff_base: float = 2.0,
         backoff_max: float = 300.0,
         *,
-        now_mono: Optional[float] = None,
-        now_wall: Optional[float] = None,
+        now_mono: float | None = None,
+        now_wall: float | None = None,
     ) -> BackoffSchedule:
         """计算指数退避抖动时延，并生成对齐的双时钟截止时间。"""
         delay = self.compute_backoff(retries, backoff_base, backoff_max)
@@ -334,8 +334,8 @@ class BackoffGovernor:
     def compute_orphan_schedule(
         self,
         *,
-        now_mono: Optional[float] = None,
-        now_wall: Optional[float] = None,
+        now_mono: float | None = None,
+        now_wall: float | None = None,
     ) -> BackoffSchedule:
         """计算孤儿锁冲突时的短退避时间表（[0.75, 1.0]s 抖动）。"""
         delay = random.uniform(0.75, 1.0)
@@ -360,8 +360,8 @@ class BackoffGovernor:
         job: Job,
         job_dict: dict,
         *,
-        retry_error: Optional[str] = None,
-        transient_kind: Optional[str] = None,
+        retry_error: str | None = None,
+        transient_kind: str | None = None,
     ) -> RetryPlan:
         """规划重试决策与退避状态机（单一出口：计算预算、退避时延与双时钟状态）。
 
@@ -382,7 +382,7 @@ class BackoffGovernor:
         transient = transient_kind is not None
 
         if job.retries >= job.max_retries and not transient:
-            fail_meta: Dict[str, Any] = {"error": _ERR_MAX_RETRIES}
+            fail_meta: dict[str, Any] = {"error": _ERR_MAX_RETRIES}
             rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
             if rt_state.last_retry_error:
                 fail_meta["last_retry_error"] = rt_state.last_retry_error
@@ -429,7 +429,7 @@ class ExecutionPolicy(AdmissionPolicy, BackoffGovernor):
 
     def __init__(
         self,
-        discovery_rerun: Optional[Mapping[str, str]] = None,
+        discovery_rerun: Mapping[str, str] | None = None,
         *,
         enable_stat_cache: bool = False,
     ) -> None:

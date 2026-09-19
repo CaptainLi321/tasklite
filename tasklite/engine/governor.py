@@ -11,9 +11,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import (
-    Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union, TYPE_CHECKING
-)
+from typing import Any, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .store import StateStore
@@ -45,15 +43,15 @@ class DeadlockDecision:
     - action: "resolved" (已归因并移入 DLQ) | "grace_waiting" (正在依赖宽限期中) | "gap_retrying" (分类缺口重试中) | "none" (未检测到死锁)
     - should_terminate: bool (是否应终止主循环，如全队列 DLQ 完毕且队列清空)
     - wait_time: float (建议外层事件泵等待的时延秒数，如宽限或重试时为 0.5s，否则为 0.0s)
-    - failed_uids: List[str] (本轮判定失败的 UID 列表)
-    - cascaded_uids: List[str] (本轮级联失败的 UID 列表)
+    - failed_uids: list[str] (本轮判定失败的 UID 列表)
+    - cascaded_uids: list[str] (本轮级联失败的 UID 列表)
     """
 
     action: str
     should_terminate: bool
     wait_time: float = 0.0
-    failed_uids: List[str] = field(default_factory=list)
-    cascaded_uids: List[str] = field(default_factory=list)
+    failed_uids: list[str] = field(default_factory=list)
+    cascaded_uids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -62,8 +60,8 @@ class DeadlockGovernor:
 
     dep_grace_seconds: float = DEP_GRACE_SECONDS
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
-    dep_grace_deadline: Optional[float] = None
-    dep_grace_missing: Optional[FrozenSet[str]] = None
+    dep_grace_deadline: float | None = None
+    dep_grace_missing: frozenset[str] | None = None
     deadlock_gap_rounds: int = 0
 
     def reset(self) -> None:
@@ -98,19 +96,19 @@ class DeadlockGovernor:
     def check_dependency_grace(
         self,
         state: PipelineState,
-        missing_identifiers: Union[Sequence[Union[int, str]], Set[str], Sequence[str]],
+        missing_identifiers: Sequence[int | str] | set[str] | Sequence[str],
         *,
-        has_potential_spawners: Optional[bool] = None,
-        scheduler: Optional[Any] = None,
-        now: Optional[float] = None,
-        grace_seconds: Optional[float] = None,
+        has_potential_spawners: bool | None = None,
+        scheduler: Any | None = None,
+        now: float | None = None,
+        grace_seconds: float | None = None,
     ) -> bool:
         """评估缺失依赖的作业是否应授予宽限期（等待潜在 spawner 产出而非立即 DLQ）。
 
         返回 True 表示正在宽限中（主循环应继续等待）；False 表示无候选或宽限已超时。
         （纯逻辑计算，不产生 sleep 副作用）。
         """
-        missing_uids: Set[str] = set()
+        missing_uids: set[str] = set()
         for item in missing_identifiers:
             if isinstance(item, str):
                 missing_uids.add(item)
@@ -204,7 +202,7 @@ class DeadlockGovernor:
         self,
         log_prefix: str,
         *,
-        max_rounds: Optional[int] = None,
+        max_rounds: int | None = None,
     ) -> bool:
         """死锁分类缺口的连续轮次升级逻辑。
 
@@ -229,13 +227,13 @@ class DeadlockGovernor:
 
     @staticmethod
     def _split_deadlock_by_uids(
-        queue: List[Dict[str, Any]],
-        target_uids: Set[str],
+        queue: list[dict[str, Any]],
+        target_uids: set[str],
         error: str,
-    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Dict[str, Any]]]:
+    ) -> tuple[list[tuple[str, dict[str, Any]]], list[dict[str, Any]]]:
         """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」。"""
-        uids_metas: List[Tuple[str, Dict[str, Any]]] = []
-        remaining_queue: List[Dict[str, Any]] = []
+        uids_metas: list[tuple[str, dict[str, Any]]] = []
+        remaining_queue: list[dict[str, Any]] = []
         for jd in queue:
             uid = uid_from_job_dict(jd)
             if uid in target_uids:
@@ -246,7 +244,7 @@ class DeadlockGovernor:
 
     def arbitrate(
         self,
-        facts: Optional[StandstillFacts],
+        facts: StandstillFacts | None,
         store: "StateStore",
     ) -> DeadlockDecision:
         """自闭环死锁仲裁单一入口。
@@ -283,7 +281,7 @@ class DeadlockGovernor:
         facts: StandstillFacts,
         store: "StateStore",
         *,
-        scheduler: Optional[Any] = None,
+        scheduler: Any | None = None,
     ) -> DeadlockDecision:
         """处理死锁：细粒度归因 + bulk_failure + cascade（纯计算求值，无阻塞副作用）。"""
         effective_state = store.state

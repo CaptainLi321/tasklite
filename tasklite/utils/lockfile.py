@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Optional
+
 
 from .injective import safe_uid_filename
 
@@ -26,7 +26,7 @@ def _lock_path(ipc_dir: str, uid: str) -> Path:
     return Path(ipc_dir) / f"{safe_uid_filename(uid)}.lock"
 
 
-def try_acquire_lock(ipc_dir: str, uid: str, *, timeout: float = 0.0) -> Optional[int]:
+def try_acquire_lock(ipc_dir: str, uid: str, *, timeout: float = 0.0) -> int | None:
     """尝试获取 ``{uid}.lock`` 排他锁（非阻塞或带超时）。
 
     Returns:

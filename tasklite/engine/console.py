@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Sequence
 
 from .store import DLQEntry, StateStore
 from .resource import META_RESOURCE_SUSPENDS
@@ -59,7 +59,7 @@ class OpsConsole:
 
     # ── 只读查询 ──────────────────────────────────────────────────────
 
-    def list_suspends(self) -> List[SuspendEntry]:
+    def list_suspends(self) -> list[SuspendEntry]:
         """只读查询当前仍生效的资源挂起（跨重启持久化的限流/离线等待）。
 
         真相源是 meta 表（``resource_suspends``）而非内存 ResourceManager——
@@ -68,7 +68,7 @@ class OpsConsole:
         告警 + 跳过，与启动期恢复路径的 fail-soft 语义一致。
 
         Returns:
-            List[SuspendEntry]: 按 ``resume_at`` 升序（最先解封在前）。
+            list[SuspendEntry]: 按 ``resume_at`` 升序（最先解封在前）。
         """
         try:
             raw = self._backend.get_meta(META_RESOURCE_SUSPENDS)
@@ -87,7 +87,7 @@ class OpsConsole:
             return []
 
         now_wall = time.time()
-        entries: List[SuspendEntry] = []
+        entries: list[SuspendEntry] = []
         for name, deadline in deadlines.items():
             # loads 契约保证键恒为 str、数值恒有限——仅需防字符串/布尔
             # 等合法 JSON 但语义非法的值（bool 是 int 子类，须先判）。
@@ -105,10 +105,10 @@ class OpsConsole:
         entries.sort(key=lambda e: e.resume_at)
         return entries
 
-    def list_dlq(self) -> List[DLQEntry]:
+    def list_dlq(self) -> list[DLQEntry]:
         """只读查询 DLQ，返回结构化条目（uid / error_type / error / attempts / failed_at / meta）。"""
         failed = self._backend.load_failed()
-        entries: List[DLQEntry] = []
+        entries: list[DLQEntry] = []
         for uid, meta in sorted(failed.items()):
             if not isinstance(meta, dict):
                 entries.append(
@@ -141,7 +141,7 @@ class OpsConsole:
 
     def clear_dlq(
         self,
-        task_types: Optional[Sequence[str]] = None,
+        task_types: Sequence[str] | None = None,
         *,
         keep_fatal: bool = True,
     ) -> int:
@@ -174,7 +174,7 @@ class OpsConsole:
 
     def clear_history(
         self,
-        targets: Union[str, Sequence[str]],
+        targets: str | Sequence[str],
         *,
         where: Sequence[str] = ("wall", "failed"),
     ) -> int:

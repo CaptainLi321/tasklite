@@ -126,7 +126,7 @@ import hashlib
 import logging
 import pickle
 import re
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from ..models.job import RERUN_VALUES
 
@@ -146,7 +146,7 @@ logger = logging.getLogger("tasklite")
 class DiscoveryJob(Protocol):
     """扫描任务的最小接口（框架无关）：payload 提供命名空间 key 的输入。"""
 
-    payload: Dict[str, Any]
+    payload: dict[str, Any]
 
 
 class DiscoveryContext(Protocol):
@@ -175,8 +175,8 @@ class DiscoveryHost(Protocol):
         self,
         task_type: str,
         handler_func: Callable[..., Any],
-        default_resources: Optional[Dict[str, float]] = None,
-        payload_schema: Optional[type] = None,
+        default_resources: dict[str, float] | None = None,
+        payload_schema: type | None = None,
     ) -> None: ...
 
     def set_discovery_rerun(self, task_type: str, rerun: str) -> None: ...
@@ -225,14 +225,14 @@ class DiscoveryHandler:
 
     def __init__(
         self,
-        fetch_func: Callable[[DiscoveryJob, DiscoveryContext, int], List[Any]],
+        fetch_func: Callable[[DiscoveryJob, DiscoveryContext, int], list[Any]],
         id_func: Callable[[Any], str],
         process_item_func: Callable[[DiscoveryJob, DiscoveryContext, Any, str], None],
         process_task_type: str,
-        cursor_key_func: Optional[Callable[[Dict[str, Any]], str]] = None,
+        cursor_key_func: Callable[[dict[str, Any]], str] | None = None,
         max_pages: int = 1000,
         scan_mode: str = "incremental",
-        on_missing: Optional[Callable[[DiscoveryJob, DiscoveryContext, List[str]], None]] = None,
+        on_missing: Callable[[DiscoveryJob, DiscoveryContext, list[str]], None] | None = None,
     ):
         self.fetch_func = fetch_func
         self.id_func = id_func
@@ -451,17 +451,17 @@ class DiscoveryHandler:
 def register_discovery(
     host: DiscoveryHost,
     task_type: str,
-    fetch_func: Callable[[DiscoveryJob, DiscoveryContext, int], List[Any]],
+    fetch_func: Callable[[DiscoveryJob, DiscoveryContext, int], list[Any]],
     id_func: Callable[[Any], str],
     process_item_func: Callable[[DiscoveryJob, DiscoveryContext, Any, str], None],
     process_task_type: str,
-    cursor_key_func: Optional[Callable[[Dict[str, Any]], str]] = None,
-    default_resources: Optional[Dict[str, float]] = None,
-    payload_schema: Optional[type] = None,
+    cursor_key_func: Callable[[dict[str, Any]], str] | None = None,
+    default_resources: dict[str, float] | None = None,
+    payload_schema: type | None = None,
     max_pages: int = 1000,
     rerun: str = "every_run",
     scan_mode: str = "incremental",
-    on_missing: Optional[Callable[[DiscoveryJob, DiscoveryContext, List[str]], None]] = None,
+    on_missing: Callable[[DiscoveryJob, DiscoveryContext, list[str]], None] | None = None,
 ) -> None:
     """注册纯任务模型增量发现 handler（per REQUIREMENTS CONTRACT）。
 

@@ -12,7 +12,7 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
+from typing import Any, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .channel import ExecutionChannel
@@ -120,7 +120,7 @@ class CompletionMachine:
         job: Job,
         job_dict: dict,
         result: ExecutionResult,
-        job_start: Optional[float] = None,
+        job_start: float | None = None,
         expect_in_flight: bool = True,
     ) -> None:
         """事务性提交一个执行结果到后端并同步内存。
@@ -187,7 +187,7 @@ class CompletionMachine:
 
     def _apply_success(
         self, uid: str, job_dict: dict, result: ExecutionResult,
-        job_start: Optional[float] = None
+        job_start: float | None = None
     ) -> None:
         """处理成功分支：子任务去重、wall 记录与 cursor 推进。"""
         store = self._store
@@ -195,7 +195,7 @@ class CompletionMachine:
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
         # 动态子任务去重与规范化
-        spawned_dicts: List[Dict[str, Any]] = []
+        spawned_dicts: list[dict[str, Any]] = []
         new_jobs = result.new_jobs
         if new_jobs:
             seen_in_batch = set()
@@ -267,7 +267,7 @@ class CompletionMachine:
 
     def _apply_failure(
         self, uid: str, job_dict: dict, result: ExecutionResult,
-        job_start: Optional[float] = None
+        job_start: float | None = None
     ) -> None:
         """处理永久失败分支：写入 DLQ 与级联阻断下游。"""
         duration = (time.monotonic() - job_start) if job_start is not None else 0.0
@@ -280,7 +280,7 @@ class CompletionMachine:
 
 
     def settle_reaped(
-        self, reaped: Sequence[Tuple[JobHandle, ExecutionResult]]
+        self, reaped: Sequence[tuple[JobHandle, ExecutionResult]]
     ) -> int:
         """统一结算从执行通道收割的已完成作业列表。
 
@@ -306,7 +306,7 @@ class CompletionMachine:
     def settle_aborted(
         self,
         cancelled_entries: Sequence[InFlightJob],
-        done_entries: Sequence[Tuple[InFlightJob, ExecutionResult]],
+        done_entries: Sequence[tuple[InFlightJob, ExecutionResult]],
     ) -> None:
         """统一结算异常或停机时分类的在途作业。
 
@@ -323,7 +323,7 @@ class CompletionMachine:
             store.requeue_jobs(job_dicts, front=True)
 
         # 2. 已完成任务提交
-        commit_crash: Optional[BaseException] = None
+        commit_crash: BaseException | None = None
         for entry, result in done_entries:
             try:
                 self.complete_job(entry, result)
@@ -369,8 +369,8 @@ class CompletionMachine:
 
     def release_acquired(
         self,
-        acquired_or_entry: Union[InFlightJob, List[Tuple[str, float]], Any],
-        uid: Optional[str] = None,
+        acquired_or_entry: InFlightJob | list[tuple[str, float]] | Any,
+        uid: str | None = None,
     ) -> None:
         """释放已 acquire 的资源（支持 InFlightJob 或元组列表）。"""
         if isinstance(acquired_or_entry, InFlightJob):

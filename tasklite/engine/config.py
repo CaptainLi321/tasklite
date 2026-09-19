@@ -1,6 +1,6 @@
 """EngineRuntime 的静态装配配置。
 
-RunConfig 是调优参数默认值的唯一解析点：调用方一律透传 Optional 原始值，
+RunConfig 是调优参数默认值的唯一解析点：调用方一律透传可空（X | None）原始值，
 经 ``RunConfig.resolve()`` / ``resolve_tuning()`` 规范化为最终类型
 （None → 常量默认），此后任何模块不得再做二次默认值判断。
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union, TYPE_CHECKING
+from typing import Callable, Dict, Mapping, Sequence, TYPE_CHECKING
 
 from .governor import DEADLOCK_GAP_MAX_ROUNDS, DEP_GRACE_SECONDS, DeadlockGovernor
 from .policy import ExecutionPolicy
@@ -32,7 +32,7 @@ class Tuning:
     deadlock_gap_max_rounds: int
 
 
-def _positive_int_rounds(value: Optional[int], default: int, name: str) -> int:
+def _positive_int_rounds(value: int | None, default: int, name: str) -> int:
     """轮次阈值规范化：仅真 int（bool/浮点/数字字符串 TypeError）且 >= 1。
 
     浮点截断（如 1.9 → 1）会静默落入「零恢复窗口」致命域，字符串强转
@@ -51,9 +51,9 @@ def _positive_int_rounds(value: Optional[int], default: int, name: str) -> int:
 
 def resolve_tuning(
     *,
-    dep_grace_seconds: Optional[float] = None,
-    commit_failure_dlq_threshold: Optional[int] = None,
-    deadlock_gap_max_rounds: Optional[int] = None,
+    dep_grace_seconds: float | None = None,
+    commit_failure_dlq_threshold: int | None = None,
+    deadlock_gap_max_rounds: int | None = None,
 ) -> Tuning:
     """调优标量规范化（与 RunConfig.resolve 共用同一真相源）。
 
@@ -117,16 +117,16 @@ class RunConfig:
     governor: DeadlockGovernor
     policy: ExecutionPolicy
     # ── 调优标量（默认值唯一落点）──
-    output_root: Optional[Union[Path, Sequence[Path]]] = None
+    output_root: Path | Sequence[Path] | None = None
     strict_picklable: bool = False
     dep_grace_seconds: float = DEP_GRACE_SECONDS
     commit_failure_dlq_threshold: int = COMMIT_FAILURE_DLQ_THRESHOLD
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
-    fatal_exceptions: Optional[Tuple[type, ...]] = None
-    transient_exceptions: Optional[Tuple[type, ...]] = None
-    on_run_start: Optional[Callable[[], None]] = None
-    on_run_end: Optional[Callable[[str], None]] = None
-    on_job_completed: Optional[Callable[[str, Dict, bool, bool], None]] = None
+    fatal_exceptions: tuple[type, ...] | None = None
+    transient_exceptions: tuple[type, ...] | None = None
+    on_run_start: Callable[[], None] | None = None
+    on_run_end: Callable[[str], None] | None = None
+    on_job_completed: Callable[[str, Dict, bool, bool], None] | None = None
 
     @classmethod
     def resolve(
@@ -142,18 +142,18 @@ class RunConfig:
         discovery_rerun: Mapping[str, str],
         governor: DeadlockGovernor,
         policy: ExecutionPolicy,
-        output_root: Optional[Union[Path, Sequence[Path]]] = None,
+        output_root: Path | Sequence[Path] | None = None,
         strict_picklable: bool = False,
-        dep_grace_seconds: Optional[float] = None,
-        commit_failure_dlq_threshold: Optional[int] = None,
-        deadlock_gap_max_rounds: Optional[int] = None,
-        fatal_exceptions: Optional[Tuple[type, ...]] = None,
-        transient_exceptions: Optional[Tuple[type, ...]] = None,
-        on_run_start: Optional[Callable[[], None]] = None,
-        on_run_end: Optional[Callable[[str], None]] = None,
-        on_job_completed: Optional[Callable[[str, Dict, bool, bool], None]] = None,
+        dep_grace_seconds: float | None = None,
+        commit_failure_dlq_threshold: int | None = None,
+        deadlock_gap_max_rounds: int | None = None,
+        fatal_exceptions: tuple[type, ...] | None = None,
+        transient_exceptions: tuple[type, ...] | None = None,
+        on_run_start: Callable[[], None] | None = None,
+        on_run_end: Callable[[str], None] | None = None,
+        on_job_completed: Callable[[str, Dict, bool, bool], None] | None = None,
     ) -> "RunConfig":
-        """唯一规范化入口：Optional 原始值 → 常量默认 + 最终类型。"""
+        """唯一规范化入口：可空原始值 → 常量默认 + 最终类型。"""
         tuning = resolve_tuning(
             dep_grace_seconds=dep_grace_seconds,
             commit_failure_dlq_threshold=commit_failure_dlq_threshold,

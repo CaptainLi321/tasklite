@@ -6,10 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
-from typing import (
-    Any, Dict, Iterable, Iterator, List, Mapping, Optional,
-    Tuple, Union
-)
+from typing import Any, Iterable, Iterator, Mapping
 
 logger = logging.getLogger("tasklite")
 
@@ -45,7 +42,7 @@ def persist_resource_suspensions(backend: Any, resource_mgr: "ResourceManager") 
 
 
 def apply_suspend_signals(
-    signals: Iterable[Tuple[str, str, float]],
+    signals: Iterable[tuple[str, str, float]],
     backend: Any,
     resource_mgr: "ResourceManager",
     origin: str = "",
@@ -76,7 +73,7 @@ class Resource(ABC):
         self.name = name
 
     @abstractmethod
-    def can_acquire(self, amount: float) -> Tuple[bool, float]:
+    def can_acquire(self, amount: float) -> tuple[bool, float]:
         """Returns (is_available, seconds_to_wait_if_not)"""
         pass
 
@@ -105,7 +102,7 @@ class Resource(ABC):
         """
         pass
 
-    def suspended_until(self) -> Optional[float]:
+    def suspended_until(self) -> float | None:
         """挂起截止的协议访问器——monotonic 时钟
         时刻，无挂起/无限速等待返回 None。
 
@@ -182,7 +179,7 @@ class RateLimitResource(Resource):
         self.interval = interval_seconds
         self.next_available = time.monotonic()
 
-    def can_acquire(self, amount: float) -> Tuple[bool, float]:
+    def can_acquire(self, amount: float) -> tuple[bool, float]:
         now = time.monotonic()
         if now >= self.next_available:
             return True, 0.0
@@ -203,7 +200,7 @@ class RateLimitResource(Resource):
         seconds = self._sanitize_suspend(seconds)
         self.next_available = max(self.next_available, now + seconds)
 
-    def suspended_until(self) -> Optional[float]:
+    def suspended_until(self) -> float | None:
         # 限速的挂起语义 = 下次可用时刻（next_available 为 monotonic）。
         # 仅当存在真实等待/挂起（未来时刻）时返回；否则返回 None，与
         # CapacityResource 的“无挂起返回 None”语义对齐。
@@ -242,7 +239,7 @@ class CapacityResource(Resource):
         # 用计数器提升可观测性（双重释放是资源泄漏的早期信号）。
         self.release_overruns = 0
 
-    def can_acquire(self, amount: float) -> Tuple[bool, float]:
+    def can_acquire(self, amount: float) -> tuple[bool, float]:
         if amount > self.capacity:
             # Deadlock safeguard: impossible request
             return False, float('inf')
@@ -292,7 +289,7 @@ class CapacityResource(Resource):
         seconds = self._sanitize_suspend(seconds)
         self.suspend_until = max(self.suspend_until, now + seconds)
 
-    def suspended_until(self) -> Optional[float]:
+    def suspended_until(self) -> float | None:
         # 仅在存在有效挂起（未来截止时刻）时返回；过期或无挂起返回 None
         return self.suspend_until if self.suspend_until > time.monotonic() else None
 
@@ -318,8 +315,8 @@ class ResourceEvaluation:
     wait_time: float
     is_unknown: bool = False
     is_impossible: bool = False
-    unknown_name: Optional[str] = None
-    impossible_name: Optional[str] = None
+    unknown_name: str | None = None
+    impossible_name: str | None = None
 
 
 @dataclass
@@ -332,8 +329,8 @@ class ResourceLease:
 
     manager: "ResourceManager"
     job_uid: str
-    acquired: List[Tuple[str, float]]
-    rate_limits: List[Tuple[str, float]]
+    acquired: list[tuple[str, float]]
+    rate_limits: list[tuple[str, float]]
     status: LeaseStatus = LeaseStatus.RESERVED
 
     def claim(self) -> None:
@@ -377,8 +374,8 @@ class NullResourceLease(ResourceLease):
 
     manager: Any = None
     job_uid: str = ""
-    acquired: List[Tuple[str, float]] = field(default_factory=list)
-    rate_limits: List[Tuple[str, float]] = field(default_factory=list)
+    acquired: list[tuple[str, float]] = field(default_factory=list)
+    rate_limits: list[tuple[str, float]] = field(default_factory=list)
     status: LeaseStatus = LeaseStatus.RELEASED
 
     def claim(self) -> None:
@@ -404,10 +401,10 @@ class ResourceManager(MutableMapping[str, Resource]):
 
     def __init__(
         self,
-        resources: Optional[Mapping[str, Resource]] = None,
-        handlers: Optional[Mapping[str, Any]] = None,
+        resources: Mapping[str, Resource] | None = None,
+        handlers: Mapping[str, Any] | None = None,
     ) -> None:
-        self._resources: Dict[str, Resource] = dict(resources) if resources is not None else {}
+        self._resources: dict[str, Resource] = dict(resources) if resources is not None else {}
         self.handlers: Mapping[str, Any] = handlers if handlers is not None else {}
 
     def __getitem__(self, key: str) -> Resource:
@@ -431,11 +428,11 @@ class ResourceManager(MutableMapping[str, Resource]):
     def effective_resources(
         self,
         task_type: str,
-        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
-    ) -> Dict[str, float]:
+        declared_resources: Mapping[str, float] | Iterable[tuple[str, float]] | None = None,
+    ) -> dict[str, float]:
         """合并 Handler 默认资源与 Job 声明资源。"""
         if declared_resources is None:
-            base: Dict[str, float] = {}
+            base: dict[str, float] = {}
         elif isinstance(declared_resources, Mapping):
             base = dict(declared_resources)
         else:
@@ -449,7 +446,7 @@ class ResourceManager(MutableMapping[str, Resource]):
     def evaluate(
         self,
         task_type: str,
-        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
+        declared_resources: Mapping[str, float] | Iterable[tuple[str, float]] | None = None,
     ) -> ResourceEvaluation:
         """评估作业所需资源的可用性与合法性。"""
         eff = self.effective_resources(task_type, declared_resources)
@@ -487,14 +484,14 @@ class ResourceManager(MutableMapping[str, Resource]):
     def reserve(
         self,
         task_type: str,
-        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
+        declared_resources: Mapping[str, float] | Iterable[tuple[str, float]] | None = None,
         *,
-        uid: Optional[str] = None,
+        uid: str | None = None,
     ) -> ResourceLease:
         """两阶段原子预约：立即占用 CapacityResource，预检 RateLimitResource。"""
         eff = self.effective_resources(task_type, declared_resources)
-        acquired: List[Tuple[str, float]] = []
-        rate_limits: List[Tuple[str, float]] = []
+        acquired: list[tuple[str, float]] = []
+        rate_limits: list[tuple[str, float]] = []
         try:
             for res_name, amount in eff.items():
                 res = self._resources.get(res_name)
@@ -524,10 +521,10 @@ class ResourceManager(MutableMapping[str, Resource]):
     def try_reserve(
         self,
         task_type: str,
-        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
+        declared_resources: Mapping[str, float] | Iterable[tuple[str, float]] | None = None,
         *,
-        uid: Optional[str] = None,
-    ) -> Optional[ResourceLease]:
+        uid: str | None = None,
+    ) -> ResourceLease | None:
         """试探性预约资源。不可用时返回 None（不抛异常、不产生副作用）。"""
         eval_res = self.evaluate(task_type, declared_resources)
         if not eval_res.is_available:
@@ -540,11 +537,11 @@ class ResourceManager(MutableMapping[str, Resource]):
     def acquire_effective(
         self,
         task_type: str,
-        declared_resources: Optional[Union[Mapping[str, float], Iterable[Tuple[str, float]]]] = None,
-    ) -> List[Tuple[str, float]]:
+        declared_resources: Mapping[str, float] | Iterable[tuple[str, float]] | None = None,
+    ) -> list[tuple[str, float]]:
         """事务性 acquire 所有合并后的资源（异常时自动释放已获取的部分）。"""
         eff = self.effective_resources(task_type, declared_resources)
-        acquired: List[Tuple[str, float]] = []
+        acquired: list[tuple[str, float]] = []
         try:
             for res_name, amount in eff.items():
                 res = self._resources.get(res_name)
@@ -559,9 +556,9 @@ class ResourceManager(MutableMapping[str, Resource]):
 
     def release_all(
         self,
-        acquired: Iterable[Tuple[str, float]],
+        acquired: Iterable[tuple[str, float]],
         *,
-        uid: Optional[str] = None,
+        uid: str | None = None,
     ) -> None:
         """释放已获取的资源集合（异常安全）。"""
         for item in acquired:
@@ -588,7 +585,7 @@ class ResourceManager(MutableMapping[str, Resource]):
         res.suspend(seconds)
         return True
 
-    def can_acquire_worker(self, amount: float = 1.0) -> Tuple[bool, float]:
+    def can_acquire_worker(self, amount: float = 1.0) -> tuple[bool, float]:
         """检查工作者槽位可用性。"""
         worker_res = self._resources.get(WORKER_RESOURCE)
         if worker_res is None:
@@ -597,15 +594,15 @@ class ResourceManager(MutableMapping[str, Resource]):
 
     def collect_suspensions(
         self,
-        now_mono: Optional[float] = None,
-        now_wall: Optional[float] = None,
-    ) -> Dict[str, float]:
+        now_mono: float | None = None,
+        now_wall: float | None = None,
+    ) -> dict[str, float]:
         """收集当前所有资源的挂起截止（挂钟时间戳，用于跨崩溃持久化）。"""
         if now_mono is None:
             now_mono = time.monotonic()
         if now_wall is None:
             now_wall = time.time()
-        suspensions: Dict[str, float] = {}
+        suspensions: dict[str, float] = {}
         for res_name, res in self._resources.items():
             deadline = res.suspended_until()
             if deadline is not None and deadline > now_mono:
@@ -616,7 +613,7 @@ class ResourceManager(MutableMapping[str, Resource]):
     def restore_suspensions(
         self,
         suspensions: Mapping[str, float],
-        now_wall: Optional[float] = None,
+        now_wall: float | None = None,
     ) -> None:
         """从挂钟时间戳恢复资源挂起状态。"""
         if now_wall is None:

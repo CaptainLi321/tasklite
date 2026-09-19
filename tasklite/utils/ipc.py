@@ -18,7 +18,7 @@ from pathlib import Path
 import re
 import shutil
 import time
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Sequence
 from urllib.parse import unquote
 
 from .injective import safe_uid_filename
@@ -72,12 +72,12 @@ class ArtifactJournal:
 
     def __init__(
         self,
-        ipc_dir: Optional[Union[str, Path]] = None,
-        output_roots: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
+        ipc_dir: str | Path | None = None,
+        output_roots: str | Path | Sequence[str | Path] | None = None,
     ) -> None:
-        self.ipc_dir: Optional[str] = str(ipc_dir) if ipc_dir is not None else None
+        self.ipc_dir: str | None = str(ipc_dir) if ipc_dir is not None else None
         if output_roots is None:
-            self.output_roots: Optional[List[Path]] = None
+            self.output_roots: list[Path] | None = None
         elif isinstance(output_roots, (str, Path)):
             self.output_roots = [Path(output_roots).resolve()]
         else:
@@ -103,27 +103,27 @@ class ArtifactJournal:
             raise ValueError("ipc_dir is required to build inputs_path")
         return Path(self.ipc_dir) / f"{safe_uid_filename(uid)}{_INPUTS_SUFFIX}"
 
-    def result_path(self, uid: str, incarnation: Optional[str] = None) -> Path:
+    def result_path(self, uid: str, incarnation: str | None = None) -> Path:
         """某个 job 的最终结果文件路径。"""
         if self.ipc_dir is None:
             raise ValueError("ipc_dir is required to build result_path")
         suffix = f".{incarnation}{_RESULT_SUFFIX}" if incarnation else _RESULT_SUFFIX
         return Path(self.ipc_dir) / f"{safe_uid_filename(uid)}{suffix}"
 
-    def result_tmp_path(self, uid: str, incarnation: Optional[str] = None) -> Path:
+    def result_tmp_path(self, uid: str, incarnation: str | None = None) -> Path:
         """某个 job 的结果临时文件路径。"""
         if self.ipc_dir is None:
             raise ValueError("ipc_dir is required to build result_tmp_path")
         suffix = f".{incarnation}{_RESULT_TMP_SUFFIX}" if incarnation else _RESULT_TMP_SUFFIX
         return Path(self.ipc_dir) / f"{safe_uid_filename(uid)}{suffix}"
 
-    def iter_stale_result_paths(self, uid: str) -> List[Path]:
+    def iter_stale_result_paths(self, uid: str) -> list[Path]:
         """枚举某个 uid 的全部残留结果文件路径。"""
         if self.ipc_dir is None:
             return []
         d = Path(self.ipc_dir)
         base = f"{safe_uid_filename(uid)}"
-        found: List[Path] = []
+        found: list[Path] = []
         try:
             for pat in (f"{base}.*{_RESULT_SUFFIX}", f"{base}.*{_RESULT_TMP_SUFFIX}"):
                 for p in d.glob(pat):
@@ -137,8 +137,8 @@ class ArtifactJournal:
 
     @staticmethod
     def resolve_and_validate_path(
-        raw_path: Union[str, Path],
-        output_roots: Optional[Union[Path, Sequence[Path]]] = None,
+        raw_path: str | Path,
+        output_roots: Path | Sequence[Path] | None = None,
         sandbox: bool = True,
     ) -> str:
         """解析声明路径为规范绝对路径（沙盒校验 + 相对重定位共用逻辑）。"""
@@ -223,7 +223,7 @@ class ArtifactJournal:
         return entry
 
     def record_input_uri(
-        self, uid: str, url: str, uri_fingerprint: Optional[str] = None
+        self, uid: str, url: str, uri_fingerprint: str | None = None
     ) -> dict:
         """记录 URI 输入声明。"""
         entry: dict = {"path": url, "kind": "uri"}
@@ -248,7 +248,7 @@ class ArtifactJournal:
     # ── 结果写入与降级 ──────────────────────────────────────────
 
     def write_result_atomic(
-        self, uid: str, result_dict: dict, incarnation: Optional[str] = None
+        self, uid: str, result_dict: dict, incarnation: str | None = None
     ) -> None:
         """原子写结果：先写 .tmp 再 os.replace。失败时清理 .tmp。"""
         tmp = self.result_tmp_path(uid, incarnation)
@@ -276,7 +276,7 @@ class ArtifactJournal:
             raise
 
     def write_result_with_degradation(
-        self, uid: str, payload: Dict[str, Any], incarnation: Optional[str] = None
+        self, uid: str, payload: dict[str, Any], incarnation: str | None = None
     ) -> None:
         """worker 结果落盘的唯一出口：完整写失败时两级降级，绝不裸抛 OSError。"""
         try:
@@ -297,7 +297,7 @@ class ArtifactJournal:
             )
         orig_status = payload.get("status")
         degraded_status = "retry" if orig_status in (None, "success") else orig_status
-        degraded: Dict[str, Any] = {
+        degraded: dict[str, Any] = {
             "status": degraded_status,
             "error": f"IPC_RESULT_WRITE_DEGRADED: {write_err}",
         }
@@ -316,12 +316,12 @@ class ArtifactJournal:
 
     # ── 读取与解析（父进程 Engine 侧）─────────────────────────────
 
-    def read_inputs(self, uid: str) -> List[dict]:
+    def read_inputs(self, uid: str) -> list[dict]:
         """读取一个 job 的全部输入声明。"""
         if self.ipc_dir is None:
             return []
         path = self.inputs_path(uid)
-        entries: List[dict] = []
+        entries: list[dict] = []
         try:
             if path.exists():
                 with open(path, encoding="utf-8") as f:
@@ -339,12 +339,12 @@ class ArtifactJournal:
             pass
         return entries
 
-    def read_outputs(self, uid: str) -> List[Tuple[str, bool, str]]:
+    def read_outputs(self, uid: str) -> list[tuple[str, bool, str]]:
         """读取一个 job 的全部已声明输出 (path, cleanup, kind)。"""
         if self.ipc_dir is None:
             return []
         path = self.outputs_path(uid)
-        outputs: List[Tuple[str, bool, str]] = []
+        outputs: list[tuple[str, bool, str]] = []
         try:
             if path.exists():
                 with open(path, encoding="utf-8") as f:
@@ -369,7 +369,7 @@ class ArtifactJournal:
             pass
         return outputs
 
-    def drain_signals(self, uid: str) -> List[Tuple[str, float]]:
+    def drain_signals(self, uid: str) -> list[tuple[str, float]]:
         """读取并删除一个 job 的 suspend 信号文件（排空语义）。
 
         不变式：先以原子 rename 把信号文件摘出命名空间，再读摘除后的稳定
@@ -401,7 +401,7 @@ class ArtifactJournal:
             pass
         return signals
 
-    def drain_all_signals(self) -> List[Tuple[str, str, float]]:
+    def drain_all_signals(self) -> list[tuple[str, str, float]]:
         """清扫 ipc_dir 全部 suspend 信号残留并排空（含 .draining 孤儿）。
 
         不变式：任何清理动作前先读取并按语义分发内容——本方法只负责
@@ -422,8 +422,8 @@ class ArtifactJournal:
             ]
         except OSError:
             return []
-        out: List[Tuple[str, str, float]] = []
-        seen: Set[str] = set()
+        out: list[tuple[str, str, float]] = []
+        seen: set[str] = set()
         for name in candidates:
             uid = self._uid_from_signals_filename(name)
             if uid is None or uid in seen:
@@ -434,7 +434,7 @@ class ArtifactJournal:
         return out
 
     @staticmethod
-    def _uid_from_signals_filename(name: str) -> Optional[str]:
+    def _uid_from_signals_filename(name: str) -> str | None:
         """信号文件名（含 .draining 摘除名）→ uid；非协议域形态返回 None。
 
         摘除名形状为 {base}.signals.jsonl.{pid}.{ns}.draining，与
@@ -457,9 +457,9 @@ class ArtifactJournal:
         return uid
 
     @staticmethod
-    def _read_suspend_lines(path: Path) -> List[Tuple[str, float]]:
+    def _read_suspend_lines(path: Path) -> list[tuple[str, float]]:
         """读取单个信号文件中的全部 suspend 记录（坏行容灾跳过）。"""
-        signals: List[Tuple[str, float]] = []
+        signals: list[tuple[str, float]] = []
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -477,7 +477,7 @@ class ArtifactJournal:
             pass
         return signals
 
-    def _salvage_draining_files(self, uid: str) -> List[Tuple[str, float]]:
+    def _salvage_draining_files(self, uid: str) -> list[tuple[str, float]]:
         """回收 uid 名下排空中途读者死亡遗留的 .draining 孤儿（先读后删）。
 
         孤儿名形状为 {base}.signals.jsonl.{pid}.{monotonic_ns}.draining，
@@ -488,7 +488,7 @@ class ArtifactJournal:
             return []
         base = safe_uid_filename(uid)
         anchor = len(base) + len(_SIGNALS_SUFFIX)
-        signals: List[Tuple[str, float]] = []
+        signals: list[tuple[str, float]] = []
         try:
             orphans = [
                 p
@@ -506,8 +506,8 @@ class ArtifactJournal:
         return signals
 
     def read_result(
-        self, path_or_uid: Union[str, Path], incarnation: Optional[str] = None
-    ) -> Optional[dict]:
+        self, path_or_uid: str | Path, incarnation: str | None = None
+    ) -> dict | None:
         """读取结果文件；损坏/不存在返回 None。"""
         if isinstance(path_or_uid, Path):
             path = path_or_uid
@@ -529,14 +529,14 @@ class ArtifactJournal:
             logger.warning(f"Corrupt result file {path}: {e}, ignoring")
             return None
 
-    def claim_stale_result(self, uid: str) -> Optional[dict]:
+    def claim_stale_result(self, uid: str) -> dict | None:
         """认领并读取遗留的已落盘残留结果，清理其余过期结果。"""
         res_paths = self.iter_stale_result_paths(uid)
         res_paths = [p for p in res_paths if p.name.endswith(_RESULT_SUFFIX)]
         if not res_paths:
             return None
 
-        def _freshness_key(p: Path) -> Tuple[int, int]:
+        def _freshness_key(p: Path) -> tuple[int, int]:
             try:
                 mtime_ns = p.stat().st_mtime_ns
             except OSError:
@@ -572,7 +572,7 @@ class ArtifactJournal:
         根为 output_roots 与 ipc_dir 的并集；无任何信任根或解析越界一律
         拒绝清理（fail-safe 方向：漏删可人工补救，误删不可逆）。
         """
-        candidates: List[Path] = list(self.output_roots or [])
+        candidates: list[Path] = list(self.output_roots or [])
         if self.ipc_dir:
             candidates.append(Path(self.ipc_dir).resolve())
         if not candidates:
@@ -592,7 +592,7 @@ class ArtifactJournal:
         )
         return False
 
-    def verify_outputs(self, uid: str) -> Tuple[bool, Optional[str]]:
+    def verify_outputs(self, uid: str) -> tuple[bool, str | None]:
         """校验 job 的产物是否存在（忽略临时 cache）。
 
         Returns:
@@ -605,7 +605,7 @@ class ArtifactJournal:
                 return False, f"Missing output {out_path}"
         return True, None
 
-    def cleanup_ipc_files(self, uid: str, incarnation: Optional[str] = None) -> None:
+    def cleanup_ipc_files(self, uid: str, incarnation: str | None = None) -> None:
         """删除某个 job 的结果/信号/临时文件（不含 outputs.jsonl）。"""
         if self.ipc_dir is None:
             return
@@ -622,7 +622,7 @@ class ArtifactJournal:
             except (FileNotFoundError, OSError):
                 pass
 
-    def cleanup(self, uid: str, mode: Union[str, ArtifactCleanupMode]) -> None:
+    def cleanup(self, uid: str, mode: str | ArtifactCleanupMode) -> None:
         """根据清理模式对产物文件与声明文件进行生命周期清理。"""
         if self.ipc_dir is None:
             return

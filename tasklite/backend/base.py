@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable
 
 from ..taxonomy import classify_error_type
 
@@ -39,19 +39,19 @@ class AbstractStateBackend(ABC):
     """
 
     @abstractmethod
-    def load_wall(self) -> Dict[str, Dict[str, Any]]: ...
+    def load_wall(self) -> dict[str, dict[str, Any]]: ...
 
     @abstractmethod
-    def load_failed(self) -> Dict[str, Dict[str, Any]]: ...
+    def load_failed(self) -> dict[str, dict[str, Any]]: ...
 
     @abstractmethod
-    def load_cursors(self) -> Dict[str, str]: ...
+    def load_cursors(self) -> dict[str, str]: ...
 
     @abstractmethod
-    def load_queue(self) -> List[Dict[str, Any]]: ...
+    def load_queue(self) -> list[dict[str, Any]]: ...
 
     @abstractmethod
-    def save_queue(self, jobs: List[Dict[str, Any]]) -> None:
+    def save_queue(self, jobs: list[dict[str, Any]]) -> None:
         """整表重写队列（测试装配 / replace_queue_atomic 的事务内步骤）。
 
         红线：这是「无读基准的整表覆盖」——跨进程并发的 enqueue/commit
@@ -67,7 +67,7 @@ class AbstractStateBackend(ABC):
     @abstractmethod
     def replace_queue_atomic(
         self,
-        compute: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]],
+        compute: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
     ) -> None:
         """读-改-写收敛的整表替换：磁盘真相读取与写回在单个写事务内完成。
 
@@ -90,8 +90,8 @@ class AbstractStateBackend(ABC):
         uid: str,
         result_meta: dict,
         *,
-        spawned_jobs: List[Dict[str, Any]] = (),
-        cursor_updates: Optional[Dict[str, str]] = None,
+        spawned_jobs: list[dict[str, Any]] = (),
+        cursor_updates: dict[str, str] | None = None,
     ) -> bool:
         """Persist a successful job as a delta, atomically.
 
@@ -128,7 +128,7 @@ class AbstractStateBackend(ABC):
     def commit_retry(
         self,
         popped_uid: str,
-        requeued_job: Dict[str, Any],
+        requeued_job: dict[str, Any],
         *,
         front: bool = False,
     ) -> bool:
@@ -142,7 +142,7 @@ class AbstractStateBackend(ABC):
     @abstractmethod
     def commit_bulk_failure(
         self,
-        uids_metas: List[Tuple[str, dict]],
+        uids_metas: list[tuple[str, dict]],
     ) -> bool:
         """Best-effort bulk mark-failed (deadlock case), as a delta.
 
@@ -154,7 +154,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def append_failed(self, uid: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    def append_failed(self, uid: str, payload: dict[str, Any] | None = None) -> None:
         """Append a record to the DLQ (failed log) without touching the queue.
 
         Used for out-of-band DLQ appends (e.g. user-driven inspection).
@@ -172,7 +172,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def delete_queue_uids(self, uids: List[str]) -> int:
+    def delete_queue_uids(self, uids: list[str]) -> int:
         """按 uid 定向批量删除队列行（加载期 repair 的差量落盘唯一出口）。
 
         与 save_queue 的全表重写相对：只 DELETE 指定 uid 的行，其余行原样
@@ -183,7 +183,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def get_meta(self, key: str) -> Optional[str]:
+    def get_meta(self, key: str) -> str | None:
         """读取一条框架级元数据（如 fencing 的 last_run_id）。无则返回 None。"""
 
     @abstractmethod
@@ -191,7 +191,7 @@ class AbstractStateBackend(ABC):
         """写入一条框架级元数据（UPSERT 语义）。失败抛异常（不吞）。"""
 
     @abstractmethod
-    def enqueue_jobs(self, jobs: List[Dict[str, Any]], *, front: bool = False) -> List[str]:
+    def enqueue_jobs(self, jobs: list[dict[str, Any]], *, front: bool = False) -> list[str]:
         """批量增量入队（enqueue 与 run 并发时不做全量覆盖）。
 
         Effects: 按 front 在队列头/尾插入 jobs（保序），**单事务原子**。
@@ -205,7 +205,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def delete_failed(self, uids: List[str]) -> int:
+    def delete_failed(self, uids: list[str]) -> int:
         """从 DLQ 批量删除指定 uid（clear_dlq/clear_history 的后端实现）。
 
         返回实际删除行数。不触碰 queue/wall。仅限 run() 之外调用
@@ -213,7 +213,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def delete_wall(self, uids: List[str]) -> int:
+    def delete_wall(self, uids: list[str]) -> int:
         """从 wall 批量删除指定 uid（clear_history 的后端实现 + commit 路径事务内清理）。返回实际删除行数。
 
         两种调用上下文：
@@ -227,7 +227,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def seed_wall(self, uids: List[str]) -> int:
+    def seed_wall(self, uids: list[str]) -> int:
         """把 uid 批量写入 wall（meta 为空 dict）——存档迁移标记「已处理」。
 
         用途：媒体/数据资产项目的存档迁移（硬链接 + wall 种子），

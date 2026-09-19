@@ -9,7 +9,7 @@ import copy
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable
 
 from .base import (
     AbstractStateBackend,
@@ -26,29 +26,29 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._wall: Dict[str, Dict[str, Any]] = {}
-        self._failed: Dict[str, Dict[str, Any]] = {}
-        self._cursors: Dict[str, str] = {}
-        self._queue: List[Dict[str, Any]] = []
-        self._meta: Dict[str, str] = {}
+        self._wall: dict[str, dict[str, Any]] = {}
+        self._failed: dict[str, dict[str, Any]] = {}
+        self._cursors: dict[str, str] = {}
+        self._queue: list[dict[str, Any]] = []
+        self._meta: dict[str, str] = {}
 
-    def load_wall(self) -> Dict[str, Dict[str, Any]]:
+    def load_wall(self) -> dict[str, dict[str, Any]]:
         with self._lock:
             return copy.deepcopy(self._wall)
 
-    def load_failed(self) -> Dict[str, Dict[str, Any]]:
+    def load_failed(self) -> dict[str, dict[str, Any]]:
         with self._lock:
             return copy.deepcopy(self._failed)
 
-    def load_cursors(self) -> Dict[str, str]:
+    def load_cursors(self) -> dict[str, str]:
         with self._lock:
             return dict(self._cursors)
 
-    def load_queue(self) -> List[Dict[str, Any]]:
+    def load_queue(self) -> list[dict[str, Any]]:
         with self._lock:
             return copy.deepcopy(self._queue)
 
-    def _dedup_copy(self, jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _dedup_copy(self, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """整表替换行的单一出口（save_queue 与 replace_queue_atomic 共用）。
 
         替换集先经 ``validate_queue_replacement`` 校验（与 SQLite 腿同一出口、
@@ -69,20 +69,20 @@ class InMemoryStateBackend(AbstractStateBackend):
             clean.append(copy.deepcopy(j))
         return clean
 
-    def save_queue(self, jobs: List[Dict[str, Any]]) -> None:
+    def save_queue(self, jobs: list[dict[str, Any]]) -> None:
         with self._lock:
             self._queue = self._dedup_copy(jobs)
 
     def replace_queue_atomic(
         self,
-        compute: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]],
+        compute: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
     ) -> None:
         with self._lock:
             # 锁内读真相 → 纯计算 → 替换：compute 抛异常时 _queue 赋值
             # 未发生，队列保持调用前状态（对齐 SQLite 腿事务回滚）。
             self._queue = self._dedup_copy(compute(copy.deepcopy(self._queue)))
 
-    def _build_dlq_meta(self, meta: Optional[dict], prev: Any) -> Dict[str, Any]:
+    def _build_dlq_meta(self, meta: dict | None, prev: Any) -> dict[str, Any]:
         """计算 DLQ 行终值（纯函数，不变更任何状态）：_attempt 计数 + error_type + failed_at。
 
         不变式：``_attempt`` 是写入事件计数而非逻辑失败次数；既有计数损坏
@@ -106,7 +106,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             merged["_attempt"] = 1
         return merged
 
-    def _write_dlq_entry(self, uid: str, meta: Optional[dict]) -> None:
+    def _write_dlq_entry(self, uid: str, meta: dict | None) -> None:
         """DLQ 写入单一出口：终值经 _build_dlq_meta 计算后落变。"""
         self._failed[uid] = self._build_dlq_meta(meta, self._failed.get(uid))
 
@@ -115,8 +115,8 @@ class InMemoryStateBackend(AbstractStateBackend):
         uid: str,
         result_meta: dict,
         *,
-        spawned_jobs: List[Dict[str, Any]] = (),
-        cursor_updates: Optional[Dict[str, str]] = None,
+        spawned_jobs: list[dict[str, Any]] = (),
+        cursor_updates: dict[str, str] | None = None,
     ) -> bool:
         with self._lock:
             try:
@@ -143,7 +143,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                             )
                             return False
                         seen.add(suid)
-                cursor_sets: Dict[str, str] = {}
+                cursor_sets: dict[str, str] = {}
                 cursor_dels: set = set()
                 if cursor_updates:
                     for k, v in cursor_updates.items():
@@ -185,7 +185,7 @@ class InMemoryStateBackend(AbstractStateBackend):
     def commit_retry(
         self,
         popped_uid: str,
-        requeued_job: Dict[str, Any],
+        requeued_job: dict[str, Any],
         *,
         front: bool = False,
     ) -> bool:
@@ -212,14 +212,14 @@ class InMemoryStateBackend(AbstractStateBackend):
                 logger.critical(f"Failed to commit retry for {popped_uid}: {e}")
                 return False
 
-    def commit_bulk_failure(self, uids_metas: List[Tuple[str, dict]]) -> bool:
+    def commit_bulk_failure(self, uids_metas: list[tuple[str, dict]]) -> bool:
         with self._lock:
             try:
                 # 校验先行：全部 DLQ 行计算在任何变更前完成——任一行失败则
                 # queue/wall/failed 整体不变（对齐 SQLite 事务回滚，杜绝
                 # 「队列已整体删除、DLQ 未落」的半成品失败态）。
-                new_entries: List[Tuple[str, Dict[str, Any]]] = []
-                overlay: Dict[str, Any] = {}
+                new_entries: list[tuple[str, dict[str, Any]]] = []
+                overlay: dict[str, Any] = {}
                 for uid, meta in uids_metas:
                     # 批内同 uid 多次出现时模拟 SQLite 同事务顺序写：
                     # 后一行读取前一行结果，_attempt 连续递增。
@@ -240,7 +240,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 logger.critical(f"Failed to commit bulk failure: {e}")
                 return False
 
-    def append_failed(self, uid: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    def append_failed(self, uid: str, payload: dict[str, Any] | None = None) -> None:
         with self._lock:
             self._write_dlq_entry(uid, payload or {})
 
@@ -249,7 +249,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             self._queue = [j for j in self._queue if uid_from_job_dict(j) != uid]
             return True
 
-    def delete_queue_uids(self, uids: List[str]) -> int:
+    def delete_queue_uids(self, uids: list[str]) -> int:
         """按 uid 定向批量删除队列条目，与 SQLite 腿同语义：不触碰其余条目。"""
         if not uids:
             return 0
@@ -260,7 +260,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             self._queue = kept
             return removed
 
-    def get_meta(self, key: str) -> Optional[str]:
+    def get_meta(self, key: str) -> str | None:
         with self._lock:
             return self._meta.get(key)
 
@@ -268,12 +268,12 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             self._meta[key] = str(value)
 
-    def enqueue_jobs(self, jobs: List[Dict[str, Any]], *, front: bool = False) -> List[str]:
+    def enqueue_jobs(self, jobs: list[dict[str, Any]], *, front: bool = False) -> list[str]:
         if not jobs:
             return []
         with self._lock:
             existing = {uid_from_job_dict(j) for j in self._queue}
-            fresh: List[Dict[str, Any]] = []
+            fresh: list[dict[str, Any]] = []
             batch_seen = set()
             for j in jobs:
                 u = uid_from_job_dict(j)
@@ -289,7 +289,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 self._queue.extend(fresh)
             return [uid_from_job_dict(j) for j in fresh]
 
-    def delete_failed(self, uids: List[str]) -> int:
+    def delete_failed(self, uids: list[str]) -> int:
         with self._lock:
             del_set = set(uids)
             count = 0
@@ -299,7 +299,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                     count += 1
             return count
 
-    def delete_wall(self, uids: List[str]) -> int:
+    def delete_wall(self, uids: list[str]) -> int:
         with self._lock:
             del_set = set(uids)
             count = 0
@@ -309,7 +309,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                     count += 1
             return count
 
-    def seed_wall(self, uids: List[str]) -> int:
+    def seed_wall(self, uids: list[str]) -> int:
         """把 uid 批量写入 wall（meta 空 dict）。
 
         不变式：wall/failed 全局互斥——已在 failed 的 uid 拒绝种子；

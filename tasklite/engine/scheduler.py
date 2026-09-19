@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .types import HandlerEntry
@@ -32,8 +32,8 @@ class JobFacts:
 
     uid: str
     task_type: str
-    resources: Tuple[Tuple[str, float], ...]
-    depends_on: Tuple[str, ...]
+    resources: tuple[tuple[str, float], ...]
+    depends_on: tuple[str, ...]
 
     @classmethod
     def from_job_dict(cls, job_dict: dict) -> "JobFacts":
@@ -46,7 +46,7 @@ class JobFacts:
             depends_on=tuple(job.depends_on),
         )
 
-    def resource_map(self) -> Dict[str, float]:
+    def resource_map(self) -> dict[str, float]:
         """解冻 resources 供 can_acquire/merge 使用（只读消费）。"""
         return dict(self.resources)
 
@@ -54,10 +54,10 @@ class JobFacts:
 @dataclass(frozen=True)
 class DeadlockAttribution:
     """不可变死锁归因值对象，记录导致死锁的作业 UID 分类（解耦队列整型下标）。"""
-    unknown_resource_uids: Tuple[str, ...] = ()
-    missing_dependency_uids: Tuple[str, ...] = ()
-    malformed_uids: Tuple[str, ...] = ()
-    impossible_resource_uids: Tuple[str, ...] = ()
+    unknown_resource_uids: tuple[str, ...] = ()
+    missing_dependency_uids: tuple[str, ...] = ()
+    malformed_uids: tuple[str, ...] = ()
+    impossible_resource_uids: tuple[str, ...] = ()
 
     @property
     def has_deadlock_causes(self) -> bool:
@@ -98,8 +98,8 @@ class ScheduleResult:
       （pending_dep_failure 携带失败依赖，_dispatch_job 走依赖失败分支）；
     - ``kind == "none"``：无可运行 job（本轮无 job 可派发）。
     """
-    runnable_idx: Optional[int] = None
-    pending_dep_failure: Optional[str] = None
+    runnable_idx: int | None = None
+    pending_dep_failure: str | None = None
     min_wait: float = float('inf')
     waiting_for_dependency: bool = False
     has_potential_spawners: bool = False
@@ -107,7 +107,7 @@ class ScheduleResult:
     kind: str = "none"
     # 死锁归因值对象（UID 集合）
     attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
-    candidate_uid: Optional[str] = None
+    candidate_uid: str | None = None
 
     @property
     def is_runnable(self) -> bool:
@@ -125,19 +125,19 @@ class ScheduleResult:
         return self.runnable_idx is not None
 
     @property
-    def unknown_resource_uids(self) -> Tuple[str, ...]:
+    def unknown_resource_uids(self) -> tuple[str, ...]:
         return self.attribution.unknown_resource_uids
 
     @property
-    def missing_dependency_uids(self) -> Tuple[str, ...]:
+    def missing_dependency_uids(self) -> tuple[str, ...]:
         return self.attribution.missing_dependency_uids
 
     @property
-    def malformed_uids(self) -> Tuple[str, ...]:
+    def malformed_uids(self) -> tuple[str, ...]:
         return self.attribution.malformed_uids
 
     @property
-    def impossible_resource_uids(self) -> Tuple[str, ...]:
+    def impossible_resource_uids(self) -> tuple[str, ...]:
         return self.attribution.impossible_resource_uids
 
     def standstill_facts(self) -> StandstillFacts:
@@ -155,8 +155,8 @@ class JobScheduler:
 
     def __init__(
         self,
-        resources: Union[Dict[str, "Resource"], ResourceManager],
-        handlers: Optional[Dict[str, "HandlerEntry"]] = None,
+        resources: dict[str, "Resource"] | ResourceManager,
+        handlers: dict[str, "HandlerEntry"] | None = None,
     ):
         if isinstance(resources, ResourceManager):
             self.resource_mgr = resources
@@ -165,7 +165,7 @@ class JobScheduler:
             self.resources = resources
             self.resource_mgr = ResourceManager(resources, handlers=handlers)
         self.handlers = handlers if handlers is not None else getattr(self.resource_mgr, "handlers", {})
-        self._job_cache: Dict[Tuple[str, str], JobFacts] = {}
+        self._job_cache: dict[tuple[str, str], JobFacts] = {}
         self._JOB_CACHE_MAX = 100_000
 
     def begin_round(self) -> None:
@@ -235,7 +235,7 @@ class JobScheduler:
         cached_res = dict(job.resources) if not isinstance(job.resources, dict) else job.resources
         return list(job.depends_on) == job_dep and cached_res == job_res
 
-    def _effective_resources(self, job) -> Dict[str, float]:
+    def _effective_resources(self, job) -> dict[str, float]:
         """job 实际会 acquire 的资源集（委托给 ResourceManager 单点真相源）。"""
         if isinstance(job, JobFacts):
             job_resources = job.resource_map()
@@ -246,7 +246,7 @@ class JobScheduler:
     def pop_next_runnable(
         self,
         state: PipelineState,
-        in_flight_uids: FrozenSet[str] = frozenset(),
+        in_flight_uids: frozenset[str] = frozenset(),
     ) -> ScheduleResult:
         """Scan queue read-only. Returns index and wait info. Does NOT acquire resources.
 
@@ -267,12 +267,12 @@ class JobScheduler:
         min_wait = float('inf')
         waiting_for_dependency = False
         has_potential_spawners = False
-        pending_dep_failure: Optional[str] = None
+        pending_dep_failure: str | None = None
         dep_failed_idx: int = -1  # 首个 dep-failed job 的索引（兜底）
-        unknown_resource_uids: List[str] = []
-        missing_dependency_uids: List[str] = []
-        malformed_uids: List[str] = []
-        impossible_resource_uids: List[str] = []
+        unknown_resource_uids: list[str] = []
+        missing_dependency_uids: list[str] = []
+        malformed_uids: list[str] = []
+        impossible_resource_uids: list[str] = []
 
         now = time.monotonic()
 
@@ -384,7 +384,7 @@ class JobScheduler:
         else:
             kind = "none"
 
-        candidate_uid: Optional[str] = None
+        candidate_uid: str | None = None
         if runnable_idx is not None and runnable_idx < len(q_data):
             candidate_uid = uid_from_job_dict(q_data[runnable_idx])
 

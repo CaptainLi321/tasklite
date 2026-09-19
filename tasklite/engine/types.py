@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, NamedTuple, Optional
+from typing import Callable, NamedTuple
 
 EMPTY_STATS = {
     "completed": 0,
@@ -109,7 +109,7 @@ class StepOutcome:
     deadlock_detected: bool
     stop_mode: StopMode
     should_terminate: bool = False
-    exit_reason: Optional[str] = None
+    exit_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,11 +125,11 @@ class RunSummary:
     stats: "TaskStats"
     run_id: str
     duration_seconds: float
-    unhandled_exception: Optional[BaseException] = None
+    unhandled_exception: BaseException | None = None
 
 
 class HandlerEntry(NamedTuple):
     """注册 handler 的结构化条目——调度器与派发路径按字段名访问。"""
     func: Callable
-    default_resources: Dict[str, float]
-    payload_schema: Optional[type]
+    default_resources: dict[str, float]
+    payload_schema: type | None

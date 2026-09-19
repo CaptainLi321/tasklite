@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from ..utils.injective import safe_uid_filename
 from ..taxonomy import validate_resource_amounts
@@ -53,12 +53,12 @@ class JobRuntimeState:
     往返对 extra 命名空间无损，框架读写永不劫持或丢弃 extra 键。
     """
 
-    backoff_until: Optional[float] = None
-    backoff_wall_deadline: Optional[float] = None
+    backoff_until: float | None = None
+    backoff_wall_deadline: float | None = None
     commit_failures: int = 0
     dispatch_failures: int = 0
     last_retry_error: str = ""
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def is_backed_off(self, now: float) -> bool:
         """判断是否处于退避期。"""
@@ -113,7 +113,7 @@ class JobRuntimeState:
             self.backoff_until = None
             self.backoff_wall_deadline = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """导出持久化字典（完全保留 _ 开头与任意 extra 字段）。"""
         d = dict(self.extra)
         for key, (attr, empty) in _RUNTIME_FIELDS.items():
@@ -125,7 +125,7 @@ class JobRuntimeState:
         return d
 
     @classmethod
-    def from_dict(cls, data: Optional[Union[Dict[str, Any], "JobRuntimeState"]]) -> "JobRuntimeState":
+    def from_dict(cls, data: dict[str, Any] | JobRuntimeState | None) -> "JobRuntimeState":
         if isinstance(data, JobRuntimeState):
             return cls(
                 backoff_until=data.backoff_until,
@@ -232,7 +232,7 @@ RT_BACKOFF_UNTIL = "_backoff_until"
 RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
 RT_COMMIT_FAILURES = "_commit_failures"
 
-_RUNTIME_FIELDS: Dict[str, Tuple[str, Any]] = {
+_RUNTIME_FIELDS: dict[str, tuple[str, Any]] = {
     RT_BACKOFF_UNTIL: ("backoff_until", None),
     RT_BACKOFF_WALL_DEADLINE: ("backoff_wall_deadline", None),
     RT_COMMIT_FAILURES: ("commit_failures", 0),
@@ -241,7 +241,7 @@ _RUNTIME_FIELDS: Dict[str, Tuple[str, Any]] = {
 }
 
 
-def _coerce_deadline(value: Any) -> Optional[float]:
+def _coerce_deadline(value: Any) -> float | None:
     """deadline 型规范值在写入校验与容灾解析间共用的规范化：仅有限实数放行。"""
     if isinstance(value, (int, float)) and not isinstance(value, bool) and _is_finite(value):
         return float(value)
@@ -255,17 +255,17 @@ class Job:
         self,
         task_type: str,
         job_id: str,
-        payload: Optional[Dict[str, Any]] = None,
-        resources: Optional[Dict[str, float]] = None,
+        payload: dict[str, Any] | None = None,
+        resources: dict[str, float] | None = None,
         retries: int = 0,
         max_retries: int = 3,
-        depends_on: Optional[List[str]] = None,
+        depends_on: list[str] | None = None,
         timeout: int = 3600,
         backoff_base: float = 2.0,
         backoff_max: float = 300.0,
         timeout_is_transient: bool = False,
-        rerun: Optional[str] = None,
-        runtime: Optional[Dict[str, Any]] = None,
+        rerun: str | None = None,
+        runtime: dict[str, Any] | None = None,
     ):
         """Initialize a Job.
 
@@ -446,7 +446,7 @@ class Job:
         return self._runtime
 
     @runtime.setter
-    def runtime(self, value: Union[Dict[str, Any], JobRuntimeState, None]) -> None:
+    def runtime(self, value: dict[str, Any] | JobRuntimeState | None) -> None:
         if isinstance(value, JobRuntimeState):
             self._runtime = value
         else:

@@ -3,9 +3,7 @@ from __future__ import annotations
 
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
-from typing import (
-    Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Tuple, Union, TYPE_CHECKING
-)
+from typing import Any, Iterator, Mapping, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..models.job import Job
@@ -32,10 +30,10 @@ class InFlightJob:
     uid: str
     job_dict: dict
     job: Job
-    acquired: List[Tuple[str, float]] = field(default_factory=list)
-    handle: Optional[JobHandle] = None
-    job_start: Optional[float] = None
-    lease: Optional["ResourceLease"] = None
+    acquired: list[tuple[str, float]] = field(default_factory=list)
+    handle: JobHandle | None = None
+    job_start: float | None = None
+    lease: ResourceLease | None = None
 
     def __post_init__(self) -> None:
         if self.lease is None:
@@ -49,7 +47,7 @@ class InFlightJob:
         """是否为伪条目（崩溃恢复或 abort 消费路径）。"""
         return self.handle is None
 
-    def release_resources(self, resource_mgr: Optional["ResourceManager"] = None) -> None:
+    def release_resources(self, resource_mgr: ResourceManager | None = None) -> None:
         """释放关联的资源租约或 acquired 列表（幂等归还）。"""
         if self.lease is not None:
             self.lease.release()
@@ -70,8 +68,8 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
     4. 字典语义 MutableMapping 兼容。
     """
 
-    def __init__(self, entries: Optional[Mapping[str, InFlightJob]] = None) -> None:
-        self._entries: Dict[str, InFlightJob] = dict(entries) if entries is not None else {}
+    def __init__(self, entries: Mapping[str, InFlightJob] | None = None) -> None:
+        self._entries: dict[str, InFlightJob] = dict(entries) if entries is not None else {}
 
     def __getitem__(self, uid: str) -> InFlightJob:
         return self._entries[uid]
@@ -91,14 +89,14 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
     def __contains__(self, uid: object) -> bool:
         return uid in self._entries
 
-    def get(self, uid: str, default: Optional[InFlightJob] = None) -> Optional[InFlightJob]:
+    def get(self, uid: str, default: InFlightJob | None = None) -> InFlightJob | None:
         return self._entries.get(uid, default)
 
-    def pop(self, uid: str, default: Optional[InFlightJob] = None) -> Optional[InFlightJob]:
+    def pop(self, uid: str, default: InFlightJob | None = None) -> InFlightJob | None:
         return self._entries.pop(uid, default)
 
     @property
-    def uids(self) -> FrozenSet[str]:
+    def uids(self) -> frozenset[str]:
         """当前在途作业 UID 集合的不可变快照（单一真相源）。"""
         return frozenset(self._entries.keys())
 
@@ -109,7 +107,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         self,
         entry: InFlightJob,
         *,
-        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
+        state: PipelineState | StateStore | Any | None = None,
     ) -> InFlightJob:
         """登记在途作业条目（单一真相源入口）。"""
         self._entries[entry.uid] = entry
@@ -121,8 +119,8 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         self,
         uid: str,
         *,
-        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
-    ) -> Optional[InFlightJob]:
+        state: PipelineState | StateStore | Any | None = None,
+    ) -> InFlightJob | None:
         """语义化结算接缝：注销在途任务并同步内存状态（单一真相源出口）。"""
         entry = self._entries.pop(uid, None)
         if state is not None and hasattr(state, "unregister_in_flight"):
@@ -133,23 +131,23 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
                 state.unregister_in_flight(uid)
         return entry
 
-    def active_handles(self) -> List[JobHandle]:
+    def active_handles(self) -> list[JobHandle]:
         """收集所有活动的真实子进程句柄（排除 handle=None 的伪条目）。"""
         return [
             entry.handle for entry in self._entries.values()
             if entry.handle is not None
         ]
 
-    def active_uids(self) -> List[str]:
+    def active_uids(self) -> list[str]:
         """收集所有在途任务的 uid 列表。"""
         return list(self._entries.keys())
 
     def classify_aborted(
         self, completed_map: Mapping[str, Any]
-    ) -> Tuple[List[InFlightJob], List[Tuple[InFlightJob, Any]]]:
+    ) -> tuple[list[InFlightJob], list[tuple[InFlightJob, Any]]]:
         """将当前在途任务分类为（已取消待重入队列表, 已完成待提交列表）。"""
-        cancelled_entries: List[InFlightJob] = []
-        done_entries: List[Tuple[InFlightJob, Any]] = []
+        cancelled_entries: list[InFlightJob] = []
+        done_entries: list[tuple[InFlightJob, Any]] = []
         for entry in self._entries.values():
             if entry.uid in completed_map:
                 done_entries.append((entry, completed_map[entry.uid]))
@@ -159,7 +157,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
 
     def release_all_resources(
         self,
-        resource_mgr: Optional["ResourceManager"] = None,
+        resource_mgr: ResourceManager | None = None,
     ) -> None:
         """释放所有在途任务已占用的资源（防泄漏并清空 acquired 列表以防二次释放）。"""
         for entry in self._entries.values():

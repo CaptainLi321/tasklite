@@ -14,7 +14,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Iterable, Sequence
 
 from ..exceptions import (
     FatalError,
@@ -39,7 +39,7 @@ _KEY_TRACEBACK = "traceback"
 _RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
 
 
-def _normalize_handler_result(result: Any) -> Tuple[bool, Dict[str, Any]]:
+def _normalize_handler_result(result: Any) -> tuple[bool, dict[str, Any]]:
     """Normalize handler return value to (success, metadata) tuple."""
     if result is None:
         return True, {}
@@ -83,19 +83,19 @@ def _decode_ipc_result(
     res: dict,
     p: Any,
     job: Job,
-    ipc_dir: Optional[str] = None,
+    ipc_dir: str | None = None,
     *,
-    output_roots: Optional[Sequence[Union[str, Path]]] = None,
+    output_roots: Sequence[str | Path] | None = None,
 ) -> "ExecutionResult":
     """解析子进程通过结果文件回传的结果字典。"""
     success = False
-    result_meta: Dict[str, Any] = {}
+    result_meta: dict[str, Any] = {}
     retry_requested = False
-    retry_error: Optional[str] = None
-    new_jobs: List[Job] = []
-    cursor_updates: Dict[str, str] = {}
-    resource_suspensions: List[Tuple[str, float]] = []
-    transient_kind: Optional[str] = None
+    retry_error: str | None = None
+    new_jobs: list[Job] = []
+    cursor_updates: dict[str, str] = {}
+    resource_suspensions: list[tuple[str, float]] = []
+    transient_kind: str | None = None
 
     if isinstance(res, dict) and "status" in res:
         if res["status"] == "success":
@@ -240,7 +240,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
     journal = ArtifactJournal(ipc_dir)
     result_token = spec.result_token
 
-    def _write_result(payload: Dict[str, Any]) -> None:
+    def _write_result(payload: dict[str, Any]) -> None:
         # 结果认证令牌随全部状态通道落盘，主进程读取侧强校验
         payload["auth"] = result_token
         journal.write_result_with_degradation(uid, payload, incarnation=incarnation)
@@ -279,7 +279,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         # 限流瞬态判定必须在子进程编码侧完成：RateLimitHit 是 RetryError
         # 子类、与本类共享 status="retry" 通道，父进程侧已无异常类型可辨；
         # 预算豁免依赖该结构化字段（与 lock_conflict 同构）。
-        retry_payload: Dict[str, Any] = {"status": "retry", "error": str(e)}
+        retry_payload: dict[str, Any] = {"status": "retry", "error": str(e)}
         if isinstance(e, RateLimitHit):
             retry_payload["transient_kind"] = "rate_limited"
         _write_result(retry_payload)
@@ -333,14 +333,14 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
 class ExecutionResult:
     """Outcome of a single multiprocessing job execution."""
     success: bool = False
-    result_meta: Dict[str, Any] = field(default_factory=dict)
+    result_meta: dict[str, Any] = field(default_factory=dict)
     retry_requested: bool = False
-    retry_error: Optional[str] = None
-    new_jobs: List[Job] = field(default_factory=list)
-    cursor_updates: Dict[str, str] = field(default_factory=dict)
-    resource_suspensions: List[Tuple[str, float]] = field(default_factory=list)
-    transient_kind: Optional[str] = None
-    going_to_retry: Optional[bool] = None
+    retry_error: str | None = None
+    new_jobs: list[Job] = field(default_factory=list)
+    cursor_updates: dict[str, str] = field(default_factory=dict)
+    resource_suspensions: list[tuple[str, float]] = field(default_factory=list)
+    transient_kind: str | None = None
+    going_to_retry: bool | None = None
 
 
 @dataclass
@@ -352,7 +352,7 @@ class JobHandle:
     timeout: float
     job: Job
     ipc_dir: str
-    incarnation: Optional[str] = None
+    incarnation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -369,7 +369,7 @@ class WorkerLaunchSpec:
     incarnation: str
     ipc_dir: str
     timeout: float
-    result_token: Optional[str] = None
+    result_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -380,9 +380,9 @@ class AbortOutcome:
     cancelled 任务的信号文件已随半成品清理删除，其 suspend 信号只能经
     本列表带回上层应用（suspend 的 max 语义保证重复应用幂等）。
     """
-    completed: List[Tuple[JobHandle, ExecutionResult]]
-    cancelled: List[JobHandle]
-    salvaged_signals: List[Tuple[str, str, float]] = field(default_factory=list)
+    completed: list[tuple[JobHandle, ExecutionResult]]
+    cancelled: list[JobHandle]
+    salvaged_signals: list[tuple[str, str, float]] = field(default_factory=list)
 
 
 class ExecutionChannel:
@@ -392,17 +392,17 @@ class ExecutionChannel:
 
     def __init__(
         self,
-        ipc_dir: Optional[Union[str, Path]] = None,
+        ipc_dir: str | Path | None = None,
         *,
-        mp_ctx: Optional[Any] = None,
-        output_roots: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
+        mp_ctx: Any | None = None,
+        output_roots: str | Path | Sequence[str | Path] | None = None,
     ) -> None:
         self._mp_ctx = mp_ctx or mp.get_context("spawn")
         self.ipc_dir = str(ipc_dir) if ipc_dir is not None else None
         # 输出沙盒信任根随 channel 注入 journal——清理消费侧的删除复检依赖
         self.output_roots = output_roots
         # 每 run 随机结果认证令牌（run 启动屏障由 runtime 同步）；None 表示未启用
-        self.result_token: Optional[str] = None
+        self.result_token: str | None = None
         if self.ipc_dir:
             try:
                 Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
@@ -471,7 +471,7 @@ class ExecutionChannel:
             incarnation=spec.incarnation,
         )
 
-    def _read_authenticated_result(self, path: Path) -> Optional[dict]:
+    def _read_authenticated_result(self, path: Path) -> dict | None:
         """读取侧强校验结果认证令牌，不匹配按无结果丢弃（瞬态、零预算）。
 
         威胁模型：ipc_dir 写入者可伪造结果文件驱动 wall 投毒、new_jobs
@@ -486,7 +486,7 @@ class ExecutionChannel:
             return None
         return res
 
-    def _token_ok(self, res: Optional[dict], uid: str) -> Optional[dict]:
+    def _token_ok(self, res: dict | None, uid: str) -> dict | None:
         """claim 读取侧的令牌强校验（与 _read_authenticated_result 同一信任锚）。"""
         token = getattr(self, "result_token", None)
         if res is not None and token is not None and res.get("auth") != token:
@@ -497,11 +497,11 @@ class ExecutionChannel:
             return None
         return res
 
-    def _read_if_exists(self, path: Path) -> Optional[dict]:
+    def _read_if_exists(self, path: Path) -> dict | None:
         """结果文件存在才认证读取（收割快路径/死亡复读共用的原语）。"""
         return self._read_authenticated_result(path) if path.exists() else None
 
-    def _salvage_signals(self, uid: str, decoded: Optional[ExecutionResult]) -> List[Tuple[str, str, float]]:
+    def _salvage_signals(self, uid: str, decoded: ExecutionResult | None) -> list[tuple[str, str, float]]:
         """排空 uid 的挂起信号：decoded 非 None 时并入其挂起列表，否则原样返回。
 
         不变式：结果文件已原子落盘 ⇒ 本执行体的信号追加全部早于落盘
@@ -520,7 +520,7 @@ class ExecutionChannel:
             )
         return pending
 
-    def _consume_result_if_present(self, handle: JobHandle) -> Optional[ExecutionResult]:
+    def _consume_result_if_present(self, handle: JobHandle) -> ExecutionResult | None:
         """认证读取 → 守卫过滤 → 解码 → 信号并入的单一读取原语。
 
         守卫契约：结果须为带 status 键的 dict 且非 interrupted 报告——
@@ -548,9 +548,9 @@ class ExecutionChannel:
 
     def reap_completed(
         self, handles: Sequence[JobHandle]
-    ) -> List[Tuple[JobHandle, ExecutionResult]]:
+    ) -> list[tuple[JobHandle, ExecutionResult]]:
         """非阻塞扫描所有 in-flight handle，返回本次已完成的 (handle, result)。"""
-        completed: List[Tuple[JobHandle, ExecutionResult]] = []
+        completed: list[tuple[JobHandle, ExecutionResult]] = []
 
         for handle in handles:
             now = time.monotonic()
@@ -589,11 +589,11 @@ class ExecutionChannel:
         return completed
 
     def _collect_outcome(
-        self, handle: JobHandle, res: Optional[dict], *, is_timeout: bool = False
+        self, handle: JobHandle, res: dict | None, *, is_timeout: bool = False
     ) -> ExecutionResult:
         """收敛 drain 三段同构尾部：解析结果 -> 收割进程 -> 清理 IPC 文件。"""
         p = handle.process
-        result: Optional[ExecutionResult] = None
+        result: ExecutionResult | None = None
         try:
             if res is not None:
                 result = _decode_ipc_result(
@@ -613,7 +613,7 @@ class ExecutionChannel:
             self.journal.cleanup_ipc_files(handle.uid, handle.incarnation)
         return result
 
-    def claim_stale_result(self, uid: str, job: Job) -> Optional[ExecutionResult]:
+    def claim_stale_result(self, uid: str, job: Job) -> ExecutionResult | None:
         """启动/派发前崩溃恢复：认领并消费上次 run 遗留的已落盘残留结果。
 
         残留结果必须携带本 run 的认证令牌——跨 run 残留与伪造残留一律
@@ -654,15 +654,15 @@ class ExecutionChannel:
         """非阻塞探测执行锁。True 表示无孤儿持锁可安全执行；False 表示孤儿活跃需 defer。"""
         return lockfile.probe_lock(self.ipc_dir, uid)
 
-    def drain_active_signals(self, uids: Iterable[str]) -> List[Tuple[str, str, float]]:
+    def drain_active_signals(self, uids: Iterable[str]) -> list[tuple[str, str, float]]:
         """原子排空所有在途任务追加的 suspend 信号。"""
-        signals: List[Tuple[str, str, float]] = []
+        signals: list[tuple[str, str, float]] = []
         for uid in uids:
             for r_name, secs in self.journal.drain_signals(uid):
                 signals.append((uid, r_name, secs))
         return signals
 
-    def drain_all_signals(self) -> List[Tuple[str, str, float]]:
+    def drain_all_signals(self) -> list[tuple[str, str, float]]:
         """启动期清扫 ipc_dir 全部残留 suspend 信号（含 .draining 孤儿回收）。"""
         return self.journal.drain_all_signals()
 
@@ -671,8 +671,8 @@ class ExecutionChannel:
         if not handles:
             return AbortOutcome(completed=[], cancelled=[])
 
-        done_pairs: List[Tuple[JobHandle, ExecutionResult]] = []
-        pending_handles: List[JobHandle] = []
+        done_pairs: list[tuple[JobHandle, ExecutionResult]] = []
+        pending_handles: list[JobHandle] = []
 
         for h in handles:
             decoded = self._consume_result_if_present(h)
@@ -688,8 +688,8 @@ class ExecutionChannel:
         # 「先排空后杀」窗口内 worker 终生前写入的 suspend 信号，唯一可靠
         # 捞回点是进程死亡后的最终排空（无并发写者，排空无损）；缺此步时
         # cancelled 分支的半成品清理会把信号文件连同信号一起删除。
-        salvaged: List[Tuple[str, str, float]] = []
-        truly_cancelled: List[JobHandle] = []
+        salvaged: list[tuple[str, str, float]] = []
+        truly_cancelled: list[JobHandle] = []
         for h in pending_handles:
             decoded = self._consume_result_if_present(h)
             if decoded is not None:
@@ -731,7 +731,7 @@ class ExecutionChannel:
         """统一收敛产物与 IPC 临时文件的生命周期清理。"""
         self.journal.cleanup(uid, mode=mode)
 
-    def read_declared_inputs(self, uid: str) -> List[dict]:
+    def read_declared_inputs(self, uid: str) -> list[dict]:
         """读取任务声明的输入清单。"""
         try:
             return self.journal.read_inputs(uid)

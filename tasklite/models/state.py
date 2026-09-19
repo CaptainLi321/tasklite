@@ -13,7 +13,7 @@ All mutations are in-place; queue changes go through the three methods
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, FrozenSet, List, Mapping
+from typing import Any, Mapping
 
 from .job import Job, RERUN_EXEMPT_VALUES
 
@@ -47,15 +47,15 @@ class PipelineState:
 
     def __init__(
         self,
-        wall: Mapping[str, Dict[str, Any]],
-        failed: Mapping[str, Dict[str, Any]],
+        wall: Mapping[str, dict[str, Any]],
+        failed: Mapping[str, dict[str, Any]],
         cursors: Mapping[str, str],
-        queue: List[Dict[str, Any]],
+        queue: list[dict[str, Any]],
     ):
-        self._wall: Dict[str, Dict[str, Any]] = dict(wall)
-        self._failed: Dict[str, Dict[str, Any]] = dict(failed)
-        self._cursors: Dict[str, str] = dict(cursors)
-        self._queue: List[dict] = list(queue)
+        self._wall: dict[str, dict[str, Any]] = dict(wall)
+        self._failed: dict[str, dict[str, Any]] = dict(failed)
+        self._cursors: dict[str, str] = dict(cursors)
+        self._queue: list[dict] = list(queue)
         self._wall_uids: set = set(self._wall)
         self._failed_uids: set = set(self._failed)
         self._queue_uids: set = {uid_from_job_dict(j) for j in self._queue}
@@ -66,23 +66,23 @@ class PipelineState:
                 self._rerun_active_uids.add(uid_from_job_dict(j))
 
     @property
-    def wall(self) -> Dict[str, Dict[str, Any]]:
+    def wall(self) -> dict[str, dict[str, Any]]:
         return self._wall
 
     @property
-    def failed(self) -> Dict[str, Dict[str, Any]]:
+    def failed(self) -> dict[str, dict[str, Any]]:
         return self._failed
 
     @property
-    def cursors(self) -> Dict[str, str]:
+    def cursors(self) -> dict[str, str]:
         return self._cursors
 
     @property
-    def queue(self) -> List[dict]:
+    def queue(self) -> list[dict]:
         return self._queue
 
     @queue.setter
-    def queue(self, value: List[dict]) -> None:
+    def queue(self, value: list[dict]) -> None:
         self.replace_queue(value)
 
     # 队列变更（唯一修改 _queue + _queue_uids 的路径）----------------
@@ -98,7 +98,7 @@ class PipelineState:
             self._assert_uids_consistent()
         return job_dict
 
-    def spawn_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None:
+    def spawn_jobs(self, job_dicts: list[dict[str, Any]], front: bool = True) -> None:
         """批量入队（spawn 默认队首，preserving order），逐条同步 uid。"""
         if front:
             self._queue[0:0] = list(job_dicts)
@@ -111,7 +111,7 @@ class PipelineState:
         if __debug__:
             self._assert_uids_consistent()
 
-    def requeue_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None:
+    def requeue_jobs(self, job_dicts: list[dict[str, Any]], front: bool = True) -> None:
         """重入队（崩溃恢复/重试），语义同 spawn_jobs 队首插入。"""
         self.spawn_jobs(job_dicts, front=front)
 
@@ -150,7 +150,7 @@ class PipelineState:
         if __debug__:
             self._assert_state_consistent()
 
-    def replace_queue(self, job_dicts: List[Dict[str, Any]]) -> None:
+    def replace_queue(self, job_dicts: list[dict[str, Any]]) -> None:
         """整体替换队列（死锁批量移除肇事者场景），重建 uid 索引。"""
         self._queue = list(job_dicts)
         self._queue_uids = {uid_from_job_dict(j) for j in self._queue}
@@ -163,9 +163,9 @@ class PipelineState:
 
     # 级联失败（按需计算反向依赖）-------------------------------
 
-    def _build_dependents(self) -> Dict[str, set]:
+    def _build_dependents(self) -> dict[str, set]:
         """按需从当前 _queue 构建反向依赖索引 dependents[dep_uid] -> {job_uid...}。"""
-        dependents: Dict[str, set] = {}
+        dependents: dict[str, set] = {}
         for jd in self._queue:
             try:
                 job = Job.from_dict(jd)
@@ -176,10 +176,10 @@ class PipelineState:
                 dependents.setdefault(dep_uid, set()).add(job_uid)
         return dependents
 
-    def fail_cascade(self, failed_uid: str) -> List[str]:
+    def fail_cascade(self, failed_uid: str) -> list[str]:
         """沿反向依赖递归标记下游为级联失败。"""
         dependents = self._build_dependents()
-        cascade: List[str] = []
+        cascade: list[str] = []
         stack = [failed_uid]
         seen = {failed_uid}
         while stack:
@@ -192,7 +192,7 @@ class PipelineState:
                     stack.append(downstream)
         return cascade
 
-    def find_dependency_cycles(self) -> List[str]:
+    def find_dependency_cycles(self) -> list[str]:
         """在当前 _queue 的依赖图中找出所有依赖环成员。
 
         不变式：返回值为每次回边命中时「DFS 当前路径自闭点起的切片 + 闭点重复」
@@ -201,7 +201,7 @@ class PipelineState:
         遍历序与递归形式逐一致且深度不受解释器递归上限约束——深链队列
         （深度超递归限制）不得因环检测本身崩溃。
         """
-        edges: Dict[str, set] = {}
+        edges: dict[str, set] = {}
         for jd in self._queue:
             try:
                 job = Job.from_dict(jd)
@@ -209,10 +209,10 @@ class PipelineState:
                 continue
             edges[job.uid] = set(job.depends_on)
 
-        color: Dict[str, int] = {}
-        cycle_members: List[str] = []
-        path_stack: List[str] = []
-        frame_deps: List[Any] = []
+        color: dict[str, int] = {}
+        cycle_members: list[str] = []
+        path_stack: list[str] = []
+        frame_deps: list[Any] = []
 
         for root in list(edges):
             if color.get(root, 0) != 0:
@@ -245,7 +245,7 @@ class PipelineState:
 
     # 完成/失败记录 ------------------------------------------------
 
-    def mark_success(self, uid: str, meta: Dict[str, Any]) -> None:
+    def mark_success(self, uid: str, meta: dict[str, Any]) -> None:
         """终态转移：uid → wall（成功）。单一入口维护 wall/failed 索引。"""
         self._failed.pop(uid, None)
         self._failed_uids.discard(uid)
@@ -254,7 +254,7 @@ class PipelineState:
         if __debug__:
             self._assert_terminal_uids_consistent()
 
-    def mark_failed(self, uid: str, meta: Dict[str, Any]) -> None:
+    def mark_failed(self, uid: str, meta: dict[str, Any]) -> None:
         """终态转移：uid → failed（DLQ）。单一入口维护 wall/failed 索引。"""
         self._wall.pop(uid, None)
         self._wall_uids.discard(uid)
@@ -287,7 +287,7 @@ class PipelineState:
         if __debug__:
             self._assert_terminal_uids_consistent()
 
-    def add_wall(self, uid: str, meta: Dict[str, Any]) -> None:
+    def add_wall(self, uid: str, meta: dict[str, Any]) -> None:
         """向 wall 集合添加 uid（运维接缝，seed_wall 场景）。"""
         self._wall[uid] = meta
         self._wall_uids.add(uid)
@@ -316,12 +316,12 @@ class PipelineState:
         return self._failed_uids
 
     @property
-    def rerun_active_uids(self) -> FrozenSet[str]:
+    def rerun_active_uids(self) -> frozenset[str]:
         """重跑豁免 uid 活索引的只读视图（六集合互斥豁免判定的事实源缓存）。"""
         return frozenset(self._rerun_active_uids)
 
     @property
-    def in_flight_uids(self) -> FrozenSet[str]:
+    def in_flight_uids(self) -> frozenset[str]:
         """in-flight 作业 uid 集合。"""
         return frozenset(self._in_flight_uids)
 

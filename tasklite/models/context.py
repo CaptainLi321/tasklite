@@ -5,7 +5,7 @@ import logging
 import math
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Tuple
 
 from .job import Job
 from ..utils.ipc import ArtifactJournal
@@ -22,24 +22,24 @@ class TaskContext:
         job: Job,
         wall_keys: set,
         failed_keys: set,
-        cursors: Dict[str, str],
-        output_root: Optional[Path] = None,
-        ipc_dir: Optional[str] = None,
+        cursors: dict[str, str],
+        output_root: Path | None = None,
+        ipc_dir: str | None = None,
         transient_registry: Tuple = (),
-        fatal_exceptions: Optional[Tuple] = None,
-        transient_exceptions: Optional[Tuple] = None,
-        resource_names: Optional[Union[frozenset, set]] = None,
+        fatal_exceptions: Tuple | None = None,
+        transient_exceptions: Tuple | None = None,
+        resource_names: frozenset | set | None = None,
     ):
         self.job = job
-        self.new_jobs: List[Job] = []
-        self.resource_suspensions: List[Tuple[str, float]] = []
+        self.new_jobs: list[Job] = []
+        self.resource_suspensions: list[tuple[str, float]] = []
         self._wall_keys = wall_keys
         self._failed_keys = failed_keys
         self._cursors = cursors
-        self.cursor_updates: Dict[str, str] = {}
+        self.cursor_updates: dict[str, str] = {}
         # 已注册资源名快照——suspend_resource 据此 fail-loud。
         # None（直接构造 ctx 的旧测试路径）表示不校验；生产派发路径必传。
-        self._resource_names: Optional[frozenset] = (
+        self._resource_names: frozenset | None = (
             frozenset(resource_names) if resource_names is not None else None
         )
         # output_root 支持多根（跨盘输出场景）——list 时
@@ -66,11 +66,11 @@ class TaskContext:
         # 归 WorkerLaunchSpec（进程 seam 具名契约），worker 据它构造带
         # incarnation 的结果文件名，孤儿进程的旧 incarnation 文件不被
         # 新 run 看见。
-        self._journal_instance: Optional[ArtifactJournal] = None
-        self._journal_instance_dir: Optional[str] = None
+        self._journal_instance: ArtifactJournal | None = None
+        self._journal_instance_dir: str | None = None
 
     @property
-    def _journal(self) -> Optional[ArtifactJournal]:
+    def _journal(self) -> ArtifactJournal | None:
         """当前 ipc_dir 对应的产物清单深模块实例（按目录缓存单例）。"""
         if self.ipc_dir is None:
             return None
@@ -96,7 +96,7 @@ class TaskContext:
             ) from e
         self.new_jobs.append(job)
 
-    def declare_output(self, path: Union[str, Path], cleanup_on_fail: bool = True, *, sandbox: bool = True) -> str:
+    def declare_output(self, path: str | Path, cleanup_on_fail: bool = True, *, sandbox: bool = True) -> str:
         """Declare an output file. Validates path sandbox if output_root is set.
 
         Automatically creates parent directories. On job failure (or retry),
@@ -115,7 +115,7 @@ class TaskContext:
         """
         return self._declare(path, cleanup_on_fail, sandbox, "output")
 
-    def declare_cache(self, path: Union[str, Path], *, sandbox: bool = True) -> str:
+    def declare_cache(self, path: str | Path, *, sandbox: bool = True) -> str:
         """Declare a **temporary/cache** file.
 
         语义：任务结束时（无论成败）该文件**不应存在**。
@@ -135,7 +135,7 @@ class TaskContext:
         """
         return self._declare(path, True, sandbox, "cache")
 
-    def _declare(self, path: Union[str, Path], cleanup_on_fail: bool, sandbox: bool, kind: str) -> str:
+    def _declare(self, path: str | Path, cleanup_on_fail: bool, sandbox: bool, kind: str) -> str:
         """declare_output/declare_cache 的共享实现（消除重复）。"""
         raw = str(path)
         resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_root, sandbox=sandbox)
@@ -145,7 +145,7 @@ class TaskContext:
             self._journal.record_output(self.job.uid, resolved, cleanup_on_fail, kind=kind)
         return resolved
 
-    def declare_input(self, path: Union[str, Path]) -> str:
+    def declare_input(self, path: str | Path) -> str:
         """声明一个**输入文件**——记录 + 采集指纹，返回规范绝对路径。
 
         注意：本方法**没有** ``sandbox`` 参数，这是有意设计——输入声明只记录
@@ -172,7 +172,7 @@ class TaskContext:
             self._journal.record_input_file(self.job.uid, resolved)
         return resolved
 
-    def declare_input_uri(self, url: Union[str, Path], uri_fingerprint: Optional[str] = None) -> str:
+    def declare_input_uri(self, url: str | Path, uri_fingerprint: str | None = None) -> str:
         """声明一个**输入 URI**——仅记录（可追溯），返回 url 字符串。
 
         ``uri_fingerprint`` 可选：业务侧提供的指纹字符串（如 ETag/Last-
@@ -221,11 +221,11 @@ class TaskContext:
         """
         return frozenset(self._wall_keys) | frozenset(self._failed_keys)
 
-    def get_cursor(self, key: str) -> Optional[str]:
+    def get_cursor(self, key: str) -> str | None:
         """Retrieve the value of a high-watermark cursor."""
         return self._cursors.get(key)
 
-    def set_cursor(self, key: str, value: Optional[str]) -> None:
+    def set_cursor(self, key: str, value: str | None) -> None:
         """Update a cursor. It will be committed atomically when the job succeeds.
 
         Both key and value must be strings. Pass ``None`` as value to **delete**

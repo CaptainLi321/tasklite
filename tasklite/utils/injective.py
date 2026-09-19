@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, Iterable, Sequence, Union
+from typing import Any, Iterable, Sequence
 
 _PERCENT_ESCAPE = "%"
 _PERCENT_ESCAPED = "%25"
@@ -44,7 +44,7 @@ _TRUNC_MARKER = "%_"
 _TRUNC_FIXED_LEN = len(_TRUNC_MARKER) + _TRUNC_DIGEST_HEX
 
 # 文件系统危险字符映射（POSIX /、Windows \、NUL、glob *?[]、冒号 :）
-FS_ESCAPE_CHARS: Dict[str, str] = {
+FS_ESCAPE_CHARS: dict[str, str] = {
     "/": "%2F",
     "\\": "%5C",
     "\x00": "%00",
@@ -58,9 +58,9 @@ FS_ESCAPE_CHARS: Dict[str, str] = {
 
 def escape_injective(
     text: str,
-    forbidden: Union[str, Sequence[str], None] = DEFAULT_FORBIDDEN,
+    forbidden: str | Sequence[str] | None = DEFAULT_FORBIDDEN,
     *,
-    allowed: Union[str, Sequence[str], None] = None,
+    allowed: str | Sequence[str] | None = None,
 ) -> str:
     """可逆单射转义：
     - 若指定 allowed：仅 allowed 中的字符原样保留，其余字符转为 UTF-8 %XX；
@@ -99,8 +99,8 @@ def sanitize_identifier(
     value: Any,
     *,
     max_len: int = 120,
-    forbidden: Union[str, Sequence[str], None] = DEFAULT_FORBIDDEN,
-    allowed: Union[str, Sequence[str], None] = None,
+    forbidden: str | Sequence[str] | None = DEFAULT_FORBIDDEN,
+    allowed: str | Sequence[str] | None = None,
     fallback: str = EMPTY_SENTINEL,
 ) -> str:
     """净化任意值为确定性、单射安全的标识符（如 job_id 或 content_id）。单射契约分级：
@@ -158,7 +158,7 @@ def sanitize_job_component(value: Any, *, max_len: int = 120) -> str:
     return sanitize_identifier(value, max_len=max_len)
 
 
-def sanitize_content_id(content_id: Union[str, None], *, max_len: int = 120) -> str:
+def sanitize_content_id(content_id: str | None, *, max_len: int = 120) -> str:
     """按严密 allowlist 净化 content_id（如用于 discovery 子任务派发）。
 
     None/空值返回像集外哨兵（固定形态，不随 max_len 收缩）；单射契约分级
@@ -209,7 +209,7 @@ def _fingerprint_token(value: Any) -> str:
 
 
 def content_fingerprint(
-    parts: Iterable[Union[str, int, float]],
+    parts: Iterable[str | int | float],
     *,
     version: str = "",
 ) -> str:

@@ -10,7 +10,7 @@ import datetime
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 from .policy import ExecutionPolicy
 from ..backend.base import AbstractStateBackend
@@ -46,8 +46,8 @@ class DLQEntry(NamedTuple):
     error_type: str
     error: str
     attempts: int
-    failed_at: Optional[str]
-    meta: Dict[str, Any]
+    failed_at: str | None
+    meta: dict[str, Any]
 
 
 __all__ = [
@@ -67,24 +67,24 @@ __all__ = [
 class SuccessOutcome:
     """apply_success 原子转移结果。"""
     uid: str
-    wall_meta: Dict[str, Any]
-    spawned_uids: List[str] = field(default_factory=list)
+    wall_meta: dict[str, Any]
+    spawned_uids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class FailureOutcome:
     """apply_failure 原子转移结果。"""
     uid: str
-    error_meta: Dict[str, Any]
-    cascaded_uids: List[str] = field(default_factory=list)
+    error_meta: dict[str, Any]
+    cascaded_uids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class RetryOutcome:
     """apply_retry 原子转移结果。"""
     uid: str
-    retry_dict: Dict[str, Any]
-    transient_kind: Optional[str] = None
+    retry_dict: dict[str, Any]
+    transient_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,8 +97,8 @@ class SkipOutcome:
 @dataclass(frozen=True)
 class BulkFailureOutcome:
     """apply_bulk_failure 原子转移结果。"""
-    failed_uids: List[str]
-    cascaded_uids: List[str] = field(default_factory=list)
+    failed_uids: list[str]
+    cascaded_uids: list[str] = field(default_factory=list)
     remaining_queue_count: int = 0
 
 
@@ -108,12 +108,12 @@ class StateStore:
     def __init__(
         self,
         backend: AbstractStateBackend,
-        state: Optional[PipelineState] = None,
+        state: PipelineState | None = None,
         commit_failure_dlq_threshold: int = 3,
-        taxonomy: Optional[ErrorTaxonomy] = None,
-        on_job_completed: Optional[Callable[[str, Dict[str, Any], bool, bool], None]] = None,
-        stats: Optional[Any] = None,
-        policy: Optional[ExecutionPolicy] = None,
+        taxonomy: ErrorTaxonomy | None = None,
+        on_job_completed: Callable[[str, dict[str, Any], bool, bool], None] | None = None,
+        stats: Any | None = None,
+        policy: ExecutionPolicy | None = None,
     ) -> None:
         self._backend = backend
         self._state = state or PipelineState({}, {}, {}, [])
@@ -139,7 +139,7 @@ class StateStore:
     def set_stats(self, stats: Any) -> None:
         self._stats = stats
 
-    def normalize_and_validate_job(self, job: Union[Job, Dict[str, Any]]) -> Dict[str, Any]:
+    def normalize_and_validate_job(self, job: Job | dict[str, Any]) -> dict[str, Any]:
         """规范化并校验单个作业（JSON 可序列化预检、discovery 策略规范化、工人资源注入）。"""
         if isinstance(job, Job):
             try:
@@ -174,10 +174,10 @@ class StateStore:
 
     def enqueue_jobs(
         self,
-        jobs: Union[Job, Sequence[Job], Dict[str, Any], Sequence[Dict[str, Any]]],
+        jobs: Job | Sequence[Job] | dict[str, Any] | Sequence[dict[str, Any]],
         *,
         front: bool = False,
-    ) -> List[str]:
+    ) -> list[str]:
         """统一作业入队摄入管道（类型校验、序列化预检、策略规范化、资源注入、单事务原子插入）。
 
         返回实际插入后端的作业 UID 列表（自动去重）。
@@ -195,7 +195,7 @@ class StateStore:
         if not jobs_list:
             return []
 
-        jobs_dicts: List[Dict[str, Any]] = []
+        jobs_dicts: list[dict[str, Any]] = []
         for j in jobs_list:
             jd = self.normalize_and_validate_job(j)
             jobs_dicts.append(jd)
@@ -206,7 +206,7 @@ class StateStore:
         inserted = self._backend.enqueue_jobs(jobs_dicts, front=front)
         return inserted
 
-    def mark_failed(self, uid: str, meta: Dict[str, Any]) -> None:
+    def mark_failed(self, uid: str, meta: dict[str, Any]) -> None:
         """统一失败登记：清 wall 旧记录 + mark_failed。"""
         sanitized = self._taxonomy.normalize_dlq_meta(meta)
         self._state.mark_failed(uid, sanitized)
@@ -222,32 +222,32 @@ class StateStore:
         return self._backend
 
     @property
-    def queue(self) -> List[Dict[str, Any]]:
+    def queue(self) -> list[dict[str, Any]]:
         """内存作业队列视图。"""
         return self._state.queue
 
     @property
-    def wall(self) -> Dict[str, Dict[str, Any]]:
+    def wall(self) -> dict[str, dict[str, Any]]:
         """成功历史集合视图。"""
         return self._state.wall
 
     @property
-    def failed(self) -> Dict[str, Dict[str, Any]]:
+    def failed(self) -> dict[str, dict[str, Any]]:
         """死信队列集合视图。"""
         return self._state.failed
 
     @property
-    def cursors(self) -> Dict[str, str]:
+    def cursors(self) -> dict[str, str]:
         """游标字典视图。"""
         return self._state.cursors
 
     @property
-    def in_flight_uids(self) -> FrozenSet[str]:
+    def in_flight_uids(self) -> frozenset[str]:
         """当前在途作业 UID 集合快照。"""
         return self._state.in_flight_uids
 
     @property
-    def wall_uids(self) -> FrozenSet[str]:
+    def wall_uids(self) -> frozenset[str]:
         """已成功作业 UID 集合快照。
 
         不变式：对外只交不可变快照——PipelineState 内部活索引绝不被
@@ -256,12 +256,12 @@ class StateStore:
         return frozenset(self._state.wall_uids)
 
     @property
-    def failed_uids(self) -> FrozenSet[str]:
+    def failed_uids(self) -> frozenset[str]:
         """已失败作业 UID 集合快照（不可变契约同 wall_uids）。"""
         return frozenset(self._state.failed_uids)
 
     @property
-    def queue_uids(self) -> FrozenSet[str]:
+    def queue_uids(self) -> frozenset[str]:
         """排队作业 UID 集合快照（不可变契约同 wall_uids）。"""
         return frozenset(self._state.queue_uids)
 
@@ -269,11 +269,11 @@ class StateStore:
         """弹出指定位置作业并同步 UID 索引。"""
         return self._state.pop_job(idx)
 
-    def spawn_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None:
+    def spawn_jobs(self, job_dicts: list[dict[str, Any]], front: bool = True) -> None:
         """批量入队作业并同步 UID 索引。"""
         self._state.spawn_jobs(job_dicts, front=front)
 
-    def requeue_jobs(self, job_dicts: List[Dict[str, Any]], front: bool = True) -> None:
+    def requeue_jobs(self, job_dicts: list[dict[str, Any]], front: bool = True) -> None:
         """重入队作业（崩溃恢复/重试）并同步 UID 索引。"""
         self._state.requeue_jobs(job_dicts, front=front)
 
@@ -310,7 +310,7 @@ class StateStore:
         """注销在途 UID。"""
         self._state.unregister_in_flight(uid)
 
-    def set_state(self, state: Optional[PipelineState]) -> None:
+    def set_state(self, state: PipelineState | None) -> None:
         """重新设置内存状态（run 启动加载期使用）。"""
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
 
@@ -319,7 +319,7 @@ class StateStore:
         self._backend = backend
 
     def set_on_job_completed(
-        self, cb: Optional[Callable[[str, Dict[str, Any], bool, bool], None]]
+        self, cb: Callable[[str, dict[str, Any], bool, bool], None] | None
     ) -> None:
         """设置终态完成事件回调。"""
         self._on_job_completed = cb
@@ -329,13 +329,13 @@ class StateStore:
     def apply_success(
         self,
         uid: str,
-        result_meta: Dict[str, Any],
+        result_meta: dict[str, Any],
         *,
-        spawned_jobs: Sequence[Dict[str, Any]] = (),
-        cursor_updates: Optional[Mapping[str, Optional[str]]] = None,
-        declared_inputs: Sequence[Dict[str, Any]] = (),
-        run_id: Optional[str] = None,
-        job_dict: Optional[Dict[str, Any]] = None,
+        spawned_jobs: Sequence[dict[str, Any]] = (),
+        cursor_updates: Mapping[str, str | None] | None = None,
+        declared_inputs: Sequence[dict[str, Any]] = (),
+        run_id: str | None = None,
+        job_dict: dict[str, Any] | None = None,
     ) -> SuccessOutcome:
         """原子终态转移：成功。"""
         wall_meta = copy.deepcopy(result_meta) if result_meta else {}
@@ -383,8 +383,8 @@ class StateStore:
     def apply_failure(
         self,
         uid: str,
-        error_meta: Dict[str, Any],
-        job_dict: Optional[Dict[str, Any]] = None,
+        error_meta: dict[str, Any],
+        job_dict: dict[str, Any] | None = None,
         *,
         count_as: str = "failed",
         cascade: bool = True,
@@ -397,7 +397,7 @@ class StateStore:
             self._state.mark_failed(uid, sanitized_meta)
             self._state.unregister_in_flight(uid)
             self._record_stat(count_as, 1)
-            cascaded_uids: List[str] = []
+            cascaded_uids: list[str] = []
             if cascade:
                 cascaded_uids = self.cascade_fail(uid)
             return FailureOutcome(uid=uid, error_meta=sanitized_meta, cascaded_uids=cascaded_uids)
@@ -408,11 +408,11 @@ class StateStore:
     def apply_retry(
         self,
         uid: str,
-        job_dict: Dict[str, Any],
-        retry_dict: Dict[str, Any],
+        job_dict: dict[str, Any],
+        retry_dict: dict[str, Any],
         *,
         front: bool = False,
-        transient_kind: Optional[str] = None,
+        transient_kind: str | None = None,
     ) -> RetryOutcome:
         """原子状态转移：重试重入队。"""
         committed = self._backend.commit_retry(uid, retry_dict, front=front)
@@ -428,7 +428,7 @@ class StateStore:
         self.commit_failed_crash(uid, "commit_retry", job_dict)
         return RetryOutcome(uid=uid, retry_dict=retry_dict, transient_kind=transient_kind)
 
-    def _requeue_and_crash(self, uid: str, job_dict: Optional[Dict[str, Any]], reason: str) -> None:
+    def _requeue_and_crash(self, uid: str, job_dict: dict[str, Any] | None, reason: str) -> None:
         """单一出口：所有「commit 失败 → requeue 内存 + 崩溃」路径的收敛点。"""
         self._state.unregister_in_flight(uid)
         if job_dict is not None:
@@ -438,14 +438,14 @@ class StateStore:
             f"On-disk queue preserved; crashing to avoid unbounded retry loop."
         )
 
-    def commit_skip_crash(self, uid: str, job_dict: Optional[Dict[str, Any]] = None) -> None:
+    def commit_skip_crash(self, uid: str, job_dict: dict[str, Any] | None = None) -> None:
         """commit_skip 失败时的终态：只 requeue + 崩溃，绝不写 DLQ。"""
         self._requeue_and_crash(uid, job_dict, "commit_skip")
 
     def apply_skip(
         self,
         uid: str,
-        job_dict: Optional[Dict[str, Any]] = None,
+        job_dict: dict[str, Any] | None = None,
     ) -> SkipOutcome:
         """原子状态转移：去重跳过。"""
         committed = self._backend.commit_skip(uid)
@@ -462,9 +462,9 @@ class StateStore:
 
     def apply_bulk_failure(
         self,
-        uids_metas: Sequence[Tuple[str, Dict[str, Any]]],
+        uids_metas: Sequence[tuple[str, dict[str, Any]]],
         *,
-        remaining_queue: Optional[Sequence[Dict[str, Any]]] = None,
+        remaining_queue: Sequence[dict[str, Any]] | None = None,
         reason: str = "deadlock",
     ) -> BulkFailureOutcome:
         """原子批量失败（死锁归因或批量熔断）。"""
@@ -526,7 +526,7 @@ class StateStore:
             remaining_queue_count=len(self._state.queue),
         )
 
-    def cascade_fail(self, failed_uid: str) -> List[str]:
+    def cascade_fail(self, failed_uid: str) -> list[str]:
         """父 job 失败后 O(1) 级联标记全部下游为依赖失败。"""
         cascade_uids = self._state.fail_cascade(failed_uid)
         if not cascade_uids:
@@ -561,17 +561,17 @@ class StateStore:
             )
         return cascade_uids
 
-    def commit_failed_crash(self, uid: str, reason: str, job_dict: Optional[Dict[str, Any]] = None) -> None:
+    def commit_failed_crash(self, uid: str, reason: str, job_dict: dict[str, Any] | None = None) -> None:
         """对外暴露的 3-strike commit 失败收敛处理。"""
         self._handle_commit_failure(uid, reason, job_dict)
 
     def commit_bulk_failed_crash(
-        self, reason: str, uids_metas: List[Tuple[str, Dict[str, Any]]], queue_job_dicts: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], bool]:
+        self, reason: str, uids_metas: list[tuple[str, dict[str, Any]]], queue_job_dicts: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], bool]:
         """bulk commit 失败的 3-strike 处理。"""
         affected = {uid for uid, _ in uids_metas}
         meta_by_uid = dict(uids_metas)
-        remaining: List[Dict[str, Any]] = []
+        remaining: list[dict[str, Any]] = []
         has_kept_affected = False
         for jd in queue_job_dicts:
             uid = uid_from_job_dict(jd)
@@ -597,7 +597,7 @@ class StateStore:
         return remaining, has_kept_affected
 
     def apply_failed(
-        self, uid: str, meta: Dict[str, Any], *, unregister: bool = True
+        self, uid: str, meta: dict[str, Any], *, unregister: bool = True
     ) -> None:
         """失败登记的内存尾段。"""
         sanitized = self._taxonomy.normalize_dlq_meta(meta)
@@ -607,7 +607,7 @@ class StateStore:
 
     # ── 2. 3-Strike 崩溃契约内部实现 ─────────────────────────────────────
 
-    def _register_commit_failure(self, job_dict: Dict[str, Any]) -> int:
+    def _register_commit_failure(self, job_dict: dict[str, Any]) -> int:
         """3-strike 计数登记骨架（计数递增的单一事实源）。
 
         计数唯一表示是 runtime 命名空间的 ``_commit_failures``（经
@@ -623,7 +623,7 @@ class StateStore:
         self,
         uid: str,
         reason: str,
-        job_dict: Optional[Dict[str, Any]],
+        job_dict: dict[str, Any] | None,
     ) -> None:
         """3-strike commit 失败收敛处理。"""
         if job_dict is None:

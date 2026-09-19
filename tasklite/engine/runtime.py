@@ -13,7 +13,7 @@ import signal
 import time
 import traceback
 import uuid
-from typing import Any, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger("tasklite")
 
@@ -112,7 +112,7 @@ class EngineRuntime:
             completion=self._completion,
         )
 
-        self._run_lock_fd: Optional[int] = None
+        self._run_lock_fd: int | None = None
         self._is_running: bool = False
 
     @property
@@ -136,7 +136,7 @@ class EngineRuntime:
         return self._is_running
 
     @property
-    def state(self) -> Optional[PipelineState]:
+    def state(self) -> PipelineState | None:
         return self.store.state
 
     @property
@@ -147,7 +147,7 @@ class EngineRuntime:
         """停机请求接口（单调状态转移，委托 RunSession）。"""
         return self._session.request_stop(force=force)
 
-    def execute(self, options: Optional[ExecutionOptions] = None) -> RunSummary:
+    def execute(self, options: ExecutionOptions | None = None) -> RunSummary:
         """完整执行管线生命周期。"""
         opts = options or ExecutionOptions()
         start_time = time.monotonic()
@@ -262,7 +262,7 @@ class EngineRuntime:
 
     def _fill_dispatch_pool(
         self, limit: int, draining: bool
-    ) -> Tuple[Optional[DispatchOutcome], float, int]:
+    ) -> tuple[DispatchOutcome | None, float, int]:
         """填池派发（仅非 DRAINING 且未超单步上限）：逐个 dispatch_next，
         有候选则计数继续，断流/无候选即停；worker_wait 聚合取 min
         （多次资源挂起恢复取最早者）。
@@ -270,7 +270,7 @@ class EngineRuntime:
         Returns:
             (最后一次派发结果或 None, worker_wait 最小值或 0, 派发计数)
         """
-        last_outcome: Optional[DispatchOutcome] = None
+        last_outcome: DispatchOutcome | None = None
         worker_wait = 0.0
         dispatched = 0
         if not draining:
@@ -287,8 +287,8 @@ class EngineRuntime:
         return last_outcome, worker_wait, dispatched
 
     def _arbitrate_deadlock(
-        self, last_outcome: Optional[DispatchOutcome], store: StateStore
-    ) -> Tuple[bool, bool, float]:
+        self, last_outcome: DispatchOutcome | None, store: StateStore
+    ) -> tuple[bool, bool, float]:
         """无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。
 
         Returns:
@@ -320,7 +320,7 @@ class EngineRuntime:
         completed = self.channel.reap_completed(handles)
         return self._completion.settle_reaped(completed)
 
-    def step(self, max_dispatch: Optional[int] = None) -> StepOutcome:
+    def step(self, max_dispatch: int | None = None) -> StepOutcome:
         """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。
 
         run 身份（run_id/result_token/空态装载）唯一负责者是

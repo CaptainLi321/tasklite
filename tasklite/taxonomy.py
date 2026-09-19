@@ -13,7 +13,7 @@ import types
 import typing
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Sequence
 
 from .exceptions import FatalError, RateLimitHit, RetryError
 
@@ -51,7 +51,7 @@ ERROR_TYPE_DISPATCH = "dispatch"
 ERROR_TYPE_UNKNOWN = "unknown"
 
 # ── 默认内置启发式异常元组 ────────────────────────────────────────────────
-FATAL_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
+FATAL_EXCEPTIONS: tuple[type[BaseException], ...] = (
     TypeError,
     KeyError,
     AttributeError,
@@ -63,7 +63,7 @@ FATAL_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
     RecursionError,
 )
 
-TRANSIENT_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
+TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
     ConnectionError,
     TimeoutError,
     ConnectionRefusedError,
@@ -101,13 +101,13 @@ class ValidationErrorItem:
 class ValidationResult:
     """载荷/资源输入校验结果的不可变值对象。"""
     is_valid: bool
-    errors: Tuple[ValidationErrorItem, ...] = field(default_factory=tuple)
+    errors: tuple[ValidationErrorItem, ...] = field(default_factory=tuple)
 
-    def as_error_strings(self) -> List[str]:
+    def as_error_strings(self) -> list[str]:
         """向后兼容：导出 list[str] 错误字符串格式。"""
         return [e.message for e in self.errors]
 
-    def to_diagnostic_meta(self) -> Dict[str, Any]:
+    def to_diagnostic_meta(self) -> dict[str, Any]:
         """导出结构化 DLQ 诊断字典。"""
         return {
             "error_count": len(self.errors),
@@ -136,14 +136,14 @@ class ErrorClassification:
     is_retry: bool
     is_interrupted: bool = False
     lock_conflict: bool = False
-    retry_error: Optional[str] = None
-    traceback_str: Optional[str] = None
+    retry_error: str | None = None
+    traceback_str: str | None = None
     raw_error: str = ""
-    diagnostic_details: Optional[Dict[str, Any]] = None
+    diagnostic_details: dict[str, Any] | None = None
 
-    def to_dlq_meta(self, *, attempt: Optional[int] = None) -> Dict[str, Any]:
+    def to_dlq_meta(self, *, attempt: int | None = None) -> dict[str, Any]:
         """构建落入 failed_dlq 表的标准元数据字典。"""
-        meta: Dict[str, Any] = {
+        meta: dict[str, Any] = {
             "error": self.error_code or self.raw_error or "UNKNOWN_ERROR",
             "error_type": self.dlq_error_type,
             "fatal": self.is_fatal,
@@ -168,8 +168,8 @@ class DeathAttribution:
     """
 
     retry_requested: bool
-    result_meta: Dict[str, Any]
-    retry_error: Optional[str]
+    result_meta: dict[str, Any]
+    retry_error: str | None
     dlq_error_type: str
 
 
@@ -225,7 +225,7 @@ def _validate_transient_class(exception_cls: type) -> None:
 
 
 def validate_declared_exception_classes(
-    classes: Optional[Sequence[type]], param_name: str
+    classes: Sequence[type] | None, param_name: str
 ) -> None:
     """构造器声明的 fatal/transient 异常元组入口校验（fail-loud）。
 
@@ -242,9 +242,9 @@ class ErrorTaxonomy:
     def __init__(
         self,
         *,
-        fatal_exceptions: Optional[Sequence[Type[BaseException]]] = None,
-        transient_exceptions: Optional[Sequence[Type[BaseException]]] = None,
-        transient_registry: Optional[Sequence[Type[BaseException]]] = None,
+        fatal_exceptions: Sequence[type[BaseException]] | None = None,
+        transient_exceptions: Sequence[type[BaseException]] | None = None,
+        transient_registry: Sequence[type[BaseException]] | None = None,
     ) -> None:
         # 构造期 fail-loud（Never-Raise 契约前置）：与注册路径同规——
         # 专用分支异常类（RetryError/FatalError 子类，注册表命中先于
@@ -263,13 +263,13 @@ class ErrorTaxonomy:
         validate_declared_exception_classes(fatal_seq, "fatal_exceptions")
         validate_declared_exception_classes(transient_seq, "transient_exceptions")
         validate_declared_exception_classes(registry_seq, "transient_registry")
-        self._fatal_exceptions: Tuple[Type[BaseException], ...] = (
+        self._fatal_exceptions: tuple[type[BaseException], ...] = (
             fatal_seq if fatal_seq is not None else FATAL_EXCEPTIONS
         )
-        self._transient_exceptions: Tuple[Type[BaseException], ...] = (
+        self._transient_exceptions: tuple[type[BaseException], ...] = (
             transient_seq if transient_seq is not None else TRANSIENT_EXCEPTIONS
         )
-        self._registry: List[Type[BaseException]] = (
+        self._registry: list[type[BaseException]] = (
             registry_seq if registry_seq is not None else []
         )
 
@@ -277,7 +277,7 @@ class ErrorTaxonomy:
 
     def classify(
         self,
-        target: Union[BaseException, ValidationResult, Dict[str, Any], str, None],
+        target: BaseException | ValidationResult | dict[str, Any] | str | None,
     ) -> ErrorClassification:
         """错误分类单一入口（Never-Raise 契约保证）。
 
@@ -389,7 +389,7 @@ class ErrorTaxonomy:
 
     def attribute_process_death(
         self,
-        exitcode: Optional[int],
+        exitcode: int | None,
         *,
         timed_out: bool,
         timeout_seconds: float = 0.0,
@@ -449,7 +449,7 @@ class ErrorTaxonomy:
             dlq_error_type=ERROR_TYPE_TRANSIENT_EXHAUSTED,
         )
 
-    def _classify_dict(self, meta: Dict[str, Any]) -> ErrorClassification:
+    def _classify_dict(self, meta: dict[str, Any]) -> ErrorClassification:
         # IPC 状态字典
         status = meta.get("status")
         if status == "retry":
@@ -520,7 +520,7 @@ class ErrorTaxonomy:
         return cl
 
     def _classify_string(self, error: str) -> ErrorClassification:
-        mapping: Tuple[Tuple[str, ErrorCategory, str, bool, bool], ...] = (
+        mapping: tuple[tuple[str, ErrorCategory, str, bool, bool], ...] = (
             (ERR_DEPENDENCY_DEADLOCK, ErrorCategory.DEADLOCK, ERROR_TYPE_DEADLOCK, False, False),
             (ERR_RESOURCE_DEADLOCK, ErrorCategory.DEADLOCK, ERROR_TYPE_DEADLOCK, False, False),
             (ERR_MALFORMED_JOB, ErrorCategory.DEADLOCK, ERROR_TYPE_DEADLOCK, False, False),
@@ -620,7 +620,7 @@ class ErrorTaxonomy:
             )
             return ValidationResult(is_valid=False, errors=(item,))
 
-        errors: List[ValidationErrorItem] = []
+        errors: list[ValidationErrorItem] = []
         required_keys = getattr(schema, "__required_keys__", None)
 
         for key, expected_type in hints.items():
@@ -755,7 +755,7 @@ class ErrorTaxonomy:
             )
             return ValidationResult(is_valid=False, errors=(item,))
 
-        errors: List[ValidationErrorItem] = []
+        errors: list[ValidationErrorItem] = []
         for res_name, amount in resources.items():
             # 资源名必须为非空 str——非 str 键在调度侧判为未知资源（永不可跑）
             # 且经 JSON 落盘后键强转为 str，同一作业跨重启从死锁翻转为可跑，
@@ -841,9 +841,9 @@ class ErrorTaxonomy:
         self,
         meta: Any,
         *,
-        attempt: Optional[int] = None,
+        attempt: int | None = None,
         default_error: str = "UNKNOWN_ERROR",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """DLQ 元数据清洗与规范化的唯一出口。"""
         if not isinstance(meta, dict):
             raw_err = _safe_str(meta) if meta is not None else default_error
@@ -881,7 +881,7 @@ class ErrorTaxonomy:
         """register_transient 的快捷别名方法。"""
         self.register_transient(exception_cls)
 
-    def snapshot(self) -> Tuple[Type[BaseException], ...]:
+    def snapshot(self) -> tuple[type[BaseException], ...]:
         """生成不可变 tuple 快照。"""
         return tuple(self._registry)
 
@@ -890,12 +890,12 @@ class ErrorTaxonomy:
         return any(isinstance(exc, cls) for cls in self._registry)
 
     @property
-    def fatal_exceptions(self) -> Tuple[Type[BaseException], ...]:
+    def fatal_exceptions(self) -> tuple[type[BaseException], ...]:
         """已解析 fatal 启发式元组（构造器声明或内置默认）——派发侧下发子进程的唯一读口。"""
         return self._fatal_exceptions
 
     @property
-    def transient_exceptions(self) -> Tuple[Type[BaseException], ...]:
+    def transient_exceptions(self) -> tuple[type[BaseException], ...]:
         """已解析 transient 启发式元组（构造器声明或内置默认）——派发侧下发子进程的唯一读口。"""
         return self._transient_exceptions
 
@@ -920,10 +920,10 @@ def classify_error_type(meta: dict) -> str:
 
 def classify_exception(
     exc: BaseException,
-    registry: Union[ErrorTaxonomy, Sequence[type]] = (),
+    registry: ErrorTaxonomy | Sequence[type] = (),
     *,
-    fatal_exceptions: Optional[Tuple[type, ...]] = None,
-    transient_exceptions: Optional[Tuple[type, ...]] = None,
+    fatal_exceptions: tuple[type, ...] | None = None,
+    transient_exceptions: tuple[type, ...] | None = None,
 ) -> str:
     """异常三分类的生产语义，返回 retry/fatal/error。"""
     if isinstance(registry, ErrorTaxonomy):
@@ -954,7 +954,7 @@ def classify_exception(
 
 def is_transient_exception(
     exc: BaseException,
-    registry: Union[ErrorTaxonomy, Sequence[type]] = (),
+    registry: ErrorTaxonomy | Sequence[type] = (),
 ) -> bool:
     """判断异常是否属于瞬态（应自动重试）。"""
     return classify_exception(exc, registry) == "retry"
