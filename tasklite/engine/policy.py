@@ -359,7 +359,6 @@ class BackoffGovernor:
         self,
         job: Job,
         job_dict: dict,
-        retry_error_or_result: Any = None,
         *,
         retry_error: Optional[str] = None,
         transient_kind: Optional[str] = None,
@@ -380,16 +379,6 @@ class BackoffGovernor:
            - 记录 retry_error 到 last_retry_error。
         3. 组装待入队的 retry_dict 并对齐双时钟截止时间。
         """
-        # 支持直接传入 ExecutionResult 结构体
-        if retry_error_or_result is not None:
-            if hasattr(retry_error_or_result, "retry_error"):
-                retry_error = getattr(retry_error_or_result, "retry_error", retry_error)
-            elif isinstance(retry_error_or_result, str):
-                retry_error = retry_error_or_result
-            kind = getattr(retry_error_or_result, "transient_kind", None)
-            if kind:
-                transient_kind = kind
-
         transient = transient_kind is not None
 
         if job.retries >= job.max_retries and not transient:

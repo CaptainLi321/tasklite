@@ -29,7 +29,9 @@ class TestTransientSignalViaResultObject:
         policy = ExecutionPolicy()
         job = _job(max_retries=3, retries=1)
         res = ExecutionResult(retry_error="signal hit", transient_kind="interrupted")
-        plan = policy.plan_retry(job, job.to_dict(), res)
+        plan = policy.plan_retry(job, job.to_dict(),
+                              retry_error=res.retry_error,
+                              transient_kind=res.transient_kind)
         assert plan.going_to_retry is True, "瞬态信号必须豁免 DLQ 继续重试"
         assert plan.transient_kind == "interrupted"
         assert job.retries == 1, "瞬态重试不得消耗重试预算"
@@ -43,7 +45,9 @@ class TestTransientSignalViaResultObject:
         policy = ExecutionPolicy()
         job = _job(max_retries=3, retries=2)
         res = ExecutionResult(transient_kind="lock_conflict")
-        plan = policy.plan_retry(job, job.to_dict(), res)
+        plan = policy.plan_retry(job, job.to_dict(),
+                              retry_error=res.retry_error,
+                              transient_kind=res.transient_kind)
         assert plan.going_to_retry is True
         assert plan.transient_kind == "lock_conflict"
         assert job.retries == 2, "锁冲突重试不得消耗重试预算"
@@ -54,7 +58,9 @@ class TestTransientSignalViaResultObject:
         policy = ExecutionPolicy()
         job = _job(max_retries=3, retries=2)
         res = ExecutionResult(retry_error="HTTP 429 RateLimit hit", transient_kind="rate_limited")
-        plan = policy.plan_retry(job, job.to_dict(), res)
+        plan = policy.plan_retry(job, job.to_dict(),
+                              retry_error=res.retry_error,
+                              transient_kind=res.transient_kind)
         assert plan.going_to_retry is True, "限流瞬态信号必须豁免 DLQ 继续重试"
         assert plan.transient_kind == "rate_limited"
         assert job.retries == 2, "限流重试不得消耗重试预算"
@@ -68,7 +74,9 @@ class TestTransientSignalViaResultObject:
         policy = ExecutionPolicy()
         job = _job(max_retries=3, retries=3)
         res = ExecutionResult(retry_error="HTTP 429 RateLimit hit", transient_kind="rate_limited")
-        plan = policy.plan_retry(job, job.to_dict(), res)
+        plan = policy.plan_retry(job, job.to_dict(),
+                              retry_error=res.retry_error,
+                              transient_kind=res.transient_kind)
         assert plan.going_to_retry is True, "限流达预算上限也必须豁免 DLQ（持续 429 应挂起等待）"
         assert plan.fail_meta is None
 
@@ -89,7 +97,9 @@ class TestTransientSignalViaResultObject:
         policy = ExecutionPolicy()
         job = _job(max_retries=3, retries=3)
         res = ExecutionResult(transient_kind="interrupted")
-        plan = policy.plan_retry(job, job.to_dict(), res)
+        plan = policy.plan_retry(job, job.to_dict(),
+                              retry_error=res.retry_error,
+                              transient_kind=res.transient_kind)
         assert plan.going_to_retry is True, "瞬态信号达上限也必须豁免 DLQ"
         assert plan.fail_meta is None
 
@@ -98,7 +108,9 @@ class TestTransientSignalViaResultObject:
         policy = ExecutionPolicy()
         job = _job(max_retries=3, retries=1)
         res = ExecutionResult(retry_error="real failure")
-        plan = policy.plan_retry(job, job.to_dict(), res)
+        plan = policy.plan_retry(job, job.to_dict(),
+                              retry_error=res.retry_error,
+                              transient_kind=res.transient_kind)
         assert plan.going_to_retry is True
         assert plan.transient_kind is None
         assert job.retries == 2, "普通失败重试必须消耗重试预算"
@@ -113,7 +125,9 @@ class TestTransientKindRegistry:
         policy = ExecutionPolicy()
         job = _job(max_retries=2, retries=2)
         res = ExecutionResult(retry_error="transient hit", transient_kind=kind)
-        plan = policy.plan_retry(job, job.to_dict(), res)
+        plan = policy.plan_retry(job, job.to_dict(),
+                              retry_error=res.retry_error,
+                              transient_kind=res.transient_kind)
         assert plan.going_to_retry is True, f"{kind} 必须豁免 DLQ"
         assert plan.transient_kind == kind
         assert job.retries == 2, f"{kind} 不得烧预算"

@@ -162,7 +162,10 @@ class CompletionMachine:
         self, uid: str, job: Job, job_dict: dict, result: ExecutionResult
     ) -> None:
         """处理重试分支：委托策略深模块规划重试并同步存储与统计。"""
-        plan = self._policy.plan_retry(job, job_dict, result)
+        plan = self._policy.plan_retry(
+            job, job_dict,
+            retry_error=result.retry_error, transient_kind=result.transient_kind,
+        )
         if not plan.going_to_retry:
             logger.error(f"FAIL: {uid} exceeded max retries ({job.max_retries}). Sent to DLQ.")
             self._store.apply_failure(
