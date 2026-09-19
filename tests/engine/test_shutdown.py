@@ -248,7 +248,7 @@ class TestForceAbort:
 
     def test_stop_mode_semantics(self, tmp_path):
         """stop 置 DRAINING；stop(force=True) 置 ABORTING（单枚举状态机）。"""
-        from tasklite.engine.runtime import StopMode
+        from tasklite.engine.types import StopMode
         pipeline = TaskLite(name="t", state_dir=tmp_path / "state", backend="sqlite")
         assert pipeline._runtime.stop_mode is StopMode.NONE
         pipeline.stop()

@@ -258,7 +258,7 @@ class TestInFlightStateConsistency:
         spawn 去重路径，断言 C 不被重复入队。
         """
         from tasklite.engine.channel import ExecutionResult
-        from tasklite.engine.runtime import inject_worker_resource
+        from tasklite.models.job import inject_worker_resource
 
         pipeline = make_pipeline(tmp_path)
         pipeline.register_handler("parent", lambda j, c: True)

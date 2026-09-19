@@ -388,7 +388,7 @@ class TestSpawnDeduplication:
         pipeline._runtime.store.set_state(state)
 
         # parent::p1 成功并 spawn 同 uid X
-        from tasklite.engine.runtime import inject_worker_resource
+        from tasklite.models.job import inject_worker_resource
         job = Job("parent", "p1", payload={})
         job_dict = job.to_dict()
         inject_worker_resource(job_dict)
@@ -573,6 +573,6 @@ class TestCascadeFailedIndependentCounter:
         assert {job_a.uid, job_b.uid, job_c.uid} <= set(failed_table)
 
     def test_empty_stats_carries_cascade_failed_key(self):
-        from tasklite.engine.runtime import EMPTY_STATS
+        from tasklite.engine.types import EMPTY_STATS
         assert "cascade_failed" in EMPTY_STATS
         assert EMPTY_STATS["cascade_failed"] == 0

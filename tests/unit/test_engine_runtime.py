@@ -7,8 +7,8 @@ import pytest
 from tasklite.testing import running
 from tests.helpers import make_runtime
 
-from tasklite.engine.runtime import (
-    EngineRuntime,
+from tasklite.engine.runtime import EngineRuntime
+from tasklite.engine.types import (
     ExecutionOptions,
     ExitReason,
     RunSummary,

@@ -7,7 +7,7 @@ import time
 from unittest import mock
 
 import pytest
-from tasklite.engine.runtime import StopMode
+from tasklite.engine.types import StopMode
 from tasklite.pipeline import TaskLite
 from tasklite.models.job import Job
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
