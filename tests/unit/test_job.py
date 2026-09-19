@@ -469,7 +469,7 @@ class TestFatalExceptionTypes:
 
     def test_fatal_exceptions_tuple(self):
         """FATAL_EXCEPTIONS 含确定性 bug 类，不含 ValueError。"""
-        from tasklite.exceptions import FATAL_EXCEPTIONS
+        from tasklite.taxonomy import FATAL_EXCEPTIONS
         assert TypeError in FATAL_EXCEPTIONS
         assert KeyError in FATAL_EXCEPTIONS
         assert AttributeError in FATAL_EXCEPTIONS
@@ -478,7 +478,7 @@ class TestFatalExceptionTypes:
 
     def test_transient_exceptions_tuple(self):
         """TRANSIENT_EXCEPTIONS 含连接/超时类瞬态异常。"""
-        from tasklite.exceptions import TRANSIENT_EXCEPTIONS
+        from tasklite.taxonomy import TRANSIENT_EXCEPTIONS
         assert ConnectionError in TRANSIENT_EXCEPTIONS
         assert TimeoutError in TRANSIENT_EXCEPTIONS
         assert ConnectionResetError in TRANSIENT_EXCEPTIONS

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 
 class PipelineError(Exception):
     """Base class for all tasklite framework exceptions."""
@@ -53,18 +51,4 @@ __all__ = [
     "_CommitCrashSignal",
     "_JobTerminated",
 ]
-
-
-def __getattr__(name: str) -> Any:
-    """PEP 562 动态转发：兼容历史从 tasklite.exceptions 导入 taxonomy 符号的调用方。
-
-    以 taxonomy 声明公共面（``tasklite.taxonomy.__all__``）为白名单——
-    taxonomy 模块命名空间含其顶层导入的 typing/enum 等私有符号，
-    按白名单收敛避免误导入静默得到无关对象。
-    """
-    import tasklite.taxonomy as _tax
-
-    if name in _tax.__all__:
-        return getattr(_tax, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

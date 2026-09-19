@@ -6,7 +6,7 @@ import typing
 from typing_extensions import TypedDict
 import pytest
 
-from tasklite.exceptions import FatalError, RateLimitHit, RetryError, TransientRegistry
+from tasklite.exceptions import FatalError, RateLimitHit, RetryError
 from tasklite.taxonomy import (
     ERR_COMMIT_FAILURE_DLQ,
     ERR_DEPENDENCY_DEADLOCK,
@@ -28,6 +28,7 @@ from tasklite.taxonomy import (
     ErrorCategory,
     ErrorClassification,
     ErrorTaxonomy,
+    TransientRegistry,
     ValidationResult,
     classify_exception,
 )

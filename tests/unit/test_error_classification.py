@@ -8,13 +8,13 @@
 
 import pytest
 
-from tasklite.exceptions import (
-    TRANSIENT_EXCEPTIONS, FATAL_EXCEPTIONS,
-    TransientRegistry, is_transient_exception,
-    RetryError,
-)
+from tasklite.exceptions import RetryError
 from tasklite.models.job import Job
 from tasklite.pipeline import TaskLite
+from tasklite.taxonomy import (
+    TRANSIENT_EXCEPTIONS, FATAL_EXCEPTIONS,
+    TransientRegistry, is_transient_exception,
+)
 from tests.helpers import make_fake_process_class, patch_multiprocessing_for_fakes
 
 
