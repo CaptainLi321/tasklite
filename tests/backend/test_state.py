@@ -402,7 +402,7 @@ class TestTaskContextMethods:
             ctx.set_cursor("key", 123)
 
     def test_suspend_resource_appends_to_list(self):
-        ctx = self._make_ctx()
+        ctx = self._make_ctx(resources={"api"})
         ctx.suspend_resource("api", 10.0)
         assert ctx.resource_suspensions == [("api", 10.0)]
 

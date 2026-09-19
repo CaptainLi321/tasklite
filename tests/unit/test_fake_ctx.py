@@ -69,7 +69,7 @@ class TestFakeCtxTmpRoot:
 
 
 class TestFakeCtxSuspendGuard:
-    """resources 名单启用 suspend_resource 的 fail-loud 校验。"""
+    """suspend_resource 恒按已注册名单 fail-loud 校验（空名单即全拒绝）。"""
 
     def test_unknown_resource_rejected(self):
         ctx = fake_ctx(_job(), resources=["api_known"])
@@ -81,10 +81,10 @@ class TestFakeCtxSuspendGuard:
         ctx.suspend_resource("api_known", 60.0)
         assert ctx.resource_suspensions == [("api_known", 60.0)]
 
-    def test_no_resources_disables_guard(self):
+    def test_no_resources_rejects_all(self):
         ctx = fake_ctx(_job())
-        ctx.suspend_resource("anything", 60.0)
-        assert ctx.resource_suspensions == [("anything", 60.0)]
+        with pytest.raises(ValueError, match="Unknown resource"):
+            ctx.suspend_resource("anything", 60.0)
 
 
 class TestFakeCtxExtendedParams:

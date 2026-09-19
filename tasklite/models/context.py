@@ -38,10 +38,9 @@ class TaskContext:
         self._cursors = cursors
         self.cursor_updates: dict[str, str] = {}
         # 已注册资源名快照——suspend_resource 据此 fail-loud。
-        # None（直接构造 ctx 的旧测试路径）表示不校验；生产派发路径必传。
-        self._resource_names: frozenset | None = (
-            frozenset(resource_names) if resource_names is not None else None
-        )
+        # 不变式：恒为冻结集合；空集意味着无已注册资源，任何资源名的
+        # suspend 请求一律入口拒绝——未注册名永不静默放行。
+        self._resource_names: frozenset = frozenset(resource_names or ())
         # output_root 支持多根（跨盘输出场景）——list 时
         # 路径属于**任一**根即通过沙盒校验。
         self.output_root = output_root
@@ -259,7 +258,7 @@ class TaskContext:
         # "api"）会静默追加，消费端 apply_result/apply_pending_signals
         # 按 `in resources` 静默跳过 → 用户以为限流已生效、管线继续猛打
         # 目标 API。生产派发路径携带注册集快照，入口即拒绝。
-        if self._resource_names is not None and resource_name not in self._resource_names:
+        if resource_name not in self._resource_names:
             raise ValueError(
                 f"Unknown resource {resource_name!r} (registered: "
                 f"{sorted(self._resource_names)}); suspend request ignored"

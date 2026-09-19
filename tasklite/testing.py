@@ -58,8 +58,9 @@ def fake_ctx(
         wall: 已成功完成的 uid 集合（任意可迭代，``ctx.is_completed`` 命中源）。
         failed: 已进 DLQ 的 uid 集合（任意可迭代，``ctx.is_failed`` 命中源）。
         cursors: 游标初值映射（``ctx.get_cursor`` 命中源）。
-        resources: 已注册资源名集合——提供时 ``ctx.suspend_resource`` 按
-            名单 fail-loud 校验（与生产派发路径同语义）；缺省不校验。
+        resources: 已注册资源名集合——``ctx.suspend_resource`` 按名单
+            fail-loud 校验（与生产派发路径同语义）；缺省为空集，suspend
+            一律拒绝（测试挂起语义必须显式传名单）。
         tmp_root: 提供时在其下创建一次性临时目录作为 ``output_root``，
             并建 ``ipc`` 子目录（declare_output/declare_cache 的产物
             清单记录随之可用）。路径经 ``ctx.output_root`` / ``ctx.ipc_dir``
@@ -92,5 +93,5 @@ def fake_ctx(
         transient_registry=transient_registry,
         fatal_exceptions=fatal_exceptions,
         transient_exceptions=transient_exceptions,
-        resource_names=frozenset(resources) if resources is not None else None,
+        resource_names=frozenset(resources or ()),
     )
