@@ -328,14 +328,14 @@ class DispatchMachine:
         if self.dispatch_stale_restore(uid, job, job_dict):
             return None
 
-        # Acquire resources via two-phase lease
+        # 两阶段租约获取资源
         handle: JobHandle | None = None
         try:
             lease = self._resources.reserve(
                 job.task_type, job.resources, uid=uid
             )
             with lease:
-                # Payload validation
+                # 载荷校验
                 _handler_entry = self._handlers[job.task_type]
                 _payload_schema = _handler_entry.payload_schema
                 if _payload_schema is not None:
@@ -347,7 +347,7 @@ class DispatchMachine:
                         fail_meta: dict[str, Any] = {"error": _ERR_PAYLOAD_VALIDATION, "details": _errors}
                         self._reject_and_commit(uid, job_dict, fail_meta)
                         return None
-                # Build context + spawn (non-blocking)
+                # 构造上下文并 spawn（非阻塞）
                 wall_keys = store.wall_uids
                 failed_keys = store.failed_uids
                 # 输出声明走落盘 outputs.jsonl——handler 子进程内声明的

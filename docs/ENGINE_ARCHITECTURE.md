@@ -484,6 +484,16 @@ class ExecutionChannel:
 
 ---
 
+### 命名消歧：`state` / `status` 一词三义
+
+三处同名概念语义互不相干，阅读代码与命名新符号时勿混用、勿互相替代：
+
+| 名称 | 所在模块 | 语义 |
+|---|---|---|
+| `JobRuntimeState` | `models/job.py` | Job 的**运行期边带状态容器**（退避 deadline / commit·dispatch strike 计数 / 上次重试错误），序列化进 job 行 `runtime` 命名空间（`_` 前缀为框架字段） |
+| IPC payload `"status"` 键 | `engine/channel.py`（结果文件 JSON） | 子进程回传结果的**终态判别字符串**（`success` / `retry` / `fatal` / `interrupted`），由 `_decode_ipc_result` 消费；`interrupted` 按「未完成」处理 |
+| `LeaseStatus.status` | `engine/resource.py` | **资源租约生命周期态**枚举（`reserved` / `claimed` / `released`），两阶段租约的状态机字段 |
+
 ## 六、现状偏差与迁移基线
 
 > 本章是终态与当前工作树的**受控偏差登记表**；每完成一步即在表中勾销并原子提交。

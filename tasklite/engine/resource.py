@@ -241,7 +241,7 @@ class CapacityResource(Resource):
 
     def can_acquire(self, amount: float) -> tuple[bool, float]:
         if amount > self.capacity:
-            # Deadlock safeguard: impossible request
+            # 死锁防御：不可能满足的资源请求
             return False, float('inf')
 
         now = time.monotonic()
@@ -251,7 +251,7 @@ class CapacityResource(Resource):
         if self.used + amount <= self.capacity:
             return True, 0.0
 
-        # Wait a small poll interval until other tasks release it
+        # 轮询等待其他任务释放资源
         return False, self._CAPACITY_POLL_INTERVAL
 
     def acquire(self, amount: float) -> None:

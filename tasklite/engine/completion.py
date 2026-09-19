@@ -94,7 +94,7 @@ class CompletionMachine:
             # Release resources (无论成功/失败/重试/崩溃，由 entry 自归还)
             entry.release_resources(self._resources)
 
-            # Cleanup outputs and IPC artifacts via channel deep module
+            # 经 channel 深模块清理产物与 IPC 工件
             cleanup_mode = (
                 ArtifactCleanupMode.SUCCESS if result.success
                 else ArtifactCleanupMode.FAILURE_OR_RETRY

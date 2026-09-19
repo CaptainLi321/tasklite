@@ -326,7 +326,7 @@ class JobScheduler:
             if eval_res.is_unknown:
                 logger.error(f"Job {job.uid} references unknown resource '{eval_res.unknown_name}'.")
                 unknown_resource_uids.append(job.uid)
-                min_wait = float('inf')  # Deadlock: Unknown resource
+                min_wait = float('inf')  # 死锁：未知资源
                 can_run = False
             elif eval_res.is_impossible:
                 impossible_resource_uids.append(job.uid)

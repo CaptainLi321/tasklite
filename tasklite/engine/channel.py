@@ -424,22 +424,22 @@ class ExecutionChannel:
 
     @staticmethod
     def _finalize_process(p: Any) -> None:
-        """清理单个子进程：kill + join + close。"""
+        """清理单个子进程：kill + join + close（各步失败降级但留痕，不阻断收割）。"""
         try:
             if p.is_alive():
                 p.kill()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Process kill failed during finalize: {e}")
         try:
             p.join(timeout=ExecutionChannel._JOIN_REAP_TIMEOUT)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Process join failed during finalize: {e}")
         try:
             _p_close = getattr(p, "close", None)
             if _p_close is not None:
                 _p_close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Process close failed during finalize: {e}")
 
     def spawn(self, spec: WorkerLaunchSpec) -> JobHandle:
         """启动隔离子进程执行 handler，建立 incarnation fencing，立即返回句柄。"""
