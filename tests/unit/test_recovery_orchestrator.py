@@ -8,7 +8,7 @@ import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
-from tasklite.engine.policy import PreflightPolicy
+from tasklite.engine.policy import ExecutionPolicy
 from tasklite.engine.recovery import RecoveryOrchestrator, RecoveryMachine
 from tasklite.engine.resource import (
     META_RESOURCE_SUSPENDS,

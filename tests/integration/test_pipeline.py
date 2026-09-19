@@ -479,7 +479,7 @@ class TestMiscellaneous:
         def fake_backoff(*args, **kwargs):
             backoff_calls.append(args)
             return 0.0
-        monkeypatch.setattr("tasklite.engine.policy.PreflightPolicy.compute_backoff", fake_backoff)
+        monkeypatch.setattr("tasklite.engine.policy.ExecutionPolicy.compute_backoff", fake_backoff)
 
         BusinessPrefixProcess = make_ipc_process_class(results=[
             {"status": "retry", "error": "LOCK_CONFLICT: my business quota exceeded"},

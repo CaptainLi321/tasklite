@@ -11,9 +11,9 @@ Formula verified:
 import time
 from unittest.mock import patch
 
-from tasklite.engine.policy import PreflightPolicy
+from tasklite.engine.policy import ExecutionPolicy
 
-_DEFAULT_POLICY = PreflightPolicy()
+_DEFAULT_POLICY = ExecutionPolicy()
 compute_backoff = _DEFAULT_POLICY.compute_backoff
 
 # ── compute_backoff monkeypatch target ─────────────────────────────────
@@ -162,9 +162,9 @@ class TestProductionPipelineBehavior:
     """Verify compute_backoff() is the function used in production code paths."""
 
     def test_compute_backoff_in_policy_namespace(self) -> None:
-        """compute_backoff is available on PreflightPolicy."""
-        from tasklite.engine.policy import PreflightPolicy
-        policy = PreflightPolicy()
+        """compute_backoff is available on ExecutionPolicy."""
+        from tasklite.engine.policy import ExecutionPolicy
+        policy = ExecutionPolicy()
         assert callable(policy.compute_backoff)
         assert callable(policy.compute_backoff_schedule)
 

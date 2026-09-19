@@ -443,7 +443,7 @@ class TestRetryThenSuccess:
         ])
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=RetryThenSuccessProcess)
         # Backoff delay = 0 so the job is immediately runnable after retry.
-        monkeypatch.setattr("tasklite.engine.policy.PreflightPolicy.compute_backoff", lambda *a, **k: 0.0)
+        monkeypatch.setattr("tasklite.engine.policy.ExecutionPolicy.compute_backoff", lambda *a, **k: 0.0)
         # Don't actually sleep.
         monkeypatch.setattr("tasklite.pipeline.time.sleep", lambda s: None)
 

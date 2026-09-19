@@ -16,7 +16,7 @@ from tasklite import (
     job_ref, progress_hook, slice_list, content_fingerprint,
     sanitize_job_component, sanitize_identifier, sanitize_content_id, safe_uid_filename
 )
-from tasklite.engine.policy import PreflightPolicy, BackoffSchedule, PreflightDecision, PreflightAction, DecisionReason
+from tasklite.engine.policy import ExecutionPolicy, BackoffSchedule, PreflightDecision, PreflightAction, DecisionReason
 from tasklite.engine.resource import ResourceManager, ResourceEvaluation
 from tasklite.engine.inflight import InFlightTracker, InFlightJob
 from tasklite.models.state import PipelineState

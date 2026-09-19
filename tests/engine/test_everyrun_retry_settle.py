@@ -36,7 +36,7 @@ class TestEveryRunRetryWithWallHistory:
         ])
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FlakyProcess)
         monkeypatch.setattr(
-            "tasklite.engine.policy.PreflightPolicy.compute_backoff", lambda *a, **k: 0.0)
+            "tasklite.engine.policy.ExecutionPolicy.compute_backoff", lambda *a, **k: 0.0)
         monkeypatch.setattr("tasklite.pipeline.time.sleep", lambda s: None)
 
         p.run()

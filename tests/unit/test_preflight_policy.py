@@ -1,4 +1,4 @@
-"""PreflightPolicy 策略深模块单元测试套件。"""
+"""ExecutionPolicy 策略深模块单元测试套件。"""
 
 import math
 import os
@@ -10,13 +10,13 @@ from tasklite.engine.policy import (
     DecisionReason,
     PreflightAction,
     PreflightDecision,
-    PreflightPolicy,
+    ExecutionPolicy,
 )
 
 
 class TestPreflightEvaluationMatrix:
     def test_fresh_job_always_runs(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         dec = policy.evaluate({"task_type": "t", "rerun": "never"}, is_wall=False, is_failed=False)
         assert dec.should_run
         assert not dec.should_skip
@@ -24,7 +24,7 @@ class TestPreflightEvaluationMatrix:
         assert dec.action == PreflightAction.RUN
 
     def test_never_strategy_blocks_wall_and_failed(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         dec_wall = policy.evaluate({"task_type": "t", "rerun": "never"}, is_wall=True, is_failed=False)
         assert dec_wall.should_skip
         assert dec_wall.reason == DecisionReason.WALL_BLOCKED
@@ -34,7 +34,7 @@ class TestPreflightEvaluationMatrix:
         assert dec_failed.reason == DecisionReason.FAILED_BLOCKED
 
     def test_every_run_strategy_allows_both(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         dec_wall = policy.evaluate({"task_type": "t", "rerun": "every_run"}, is_wall=True, is_failed=False)
         assert dec_wall.should_run
         assert dec_wall.reason == DecisionReason.EVERY_RUN
@@ -44,7 +44,7 @@ class TestPreflightEvaluationMatrix:
         assert dec_failed.reason == DecisionReason.EVERY_RUN
 
     def test_on_failure_strategy_allows_failed_blocks_wall(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         dec_failed = policy.evaluate({"task_type": "t", "rerun": "on_failure"}, is_wall=False, is_failed=True)
         assert dec_failed.should_run
         assert dec_failed.reason == DecisionReason.ON_FAILURE_MATCH
@@ -86,7 +86,7 @@ class TestInputChangeAndStatCache:
         f.write_text("hello")
         st = f.stat()
 
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         wall_meta = {"inputs": [{"path": str(f), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
         assert not policy.check_input_changed(wall_meta)
 
@@ -100,7 +100,7 @@ class TestInputChangeAndStatCache:
         f.write_text("hello")
         st = f.stat()
 
-        policy = PreflightPolicy(enable_stat_cache=True)
+        policy = ExecutionPolicy(enable_stat_cache=True)
         wall_meta = {"inputs": [{"path": str(f), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
         assert not policy.check_input_changed(wall_meta)
 
@@ -113,7 +113,7 @@ class TestInputChangeAndStatCache:
         assert policy.check_input_changed(wall_meta)
 
     def test_input_changed_corrupt_data_fail_safe(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         # 非 dict、非 list、损坏元素均安全判定为 True（放行重跑）
         assert policy.check_input_changed(None)
         assert policy.check_input_changed({})
@@ -124,7 +124,7 @@ class TestInputChangeAndStatCache:
 
 class TestDiscoveryPolicyNormalization:
     def test_normalize_injects_default_only_when_none(self):
-        policy = PreflightPolicy({"scan": "every_run"})
+        policy = ExecutionPolicy({"scan": "every_run"})
 
         j1 = {"task_type": "scan", "rerun": None}
         assert policy.normalize_job_dict(j1, "scan")
@@ -141,7 +141,7 @@ class TestDiscoveryPolicyNormalization:
 
 class TestBackoffScheduleInvariants:
     def test_compute_backoff_basic_exponential(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         assert policy.compute_backoff(-1) == 0.0
         assert policy.compute_backoff(0) == 0.0
 
@@ -150,20 +150,20 @@ class TestBackoffScheduleInvariants:
             assert d >= 0.0
 
     def test_compute_backoff_overflow_capping(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         # retries >= 1025 不会 OverflowError
         d = policy.compute_backoff(2000, backoff_base=2.0, backoff_max=300.0)
         assert 0.0 <= d <= 375.0
 
     def test_compute_backoff_nan_inf_sanitizer(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         d1 = policy.compute_backoff(1, backoff_base=float("nan"))
         assert 0.0 <= d1 <= 5.0
         d2 = policy.compute_backoff(1, backoff_max=float("inf"))
         assert 0.0 <= d2 <= 5.0
 
     def test_compute_backoff_schedule_dual_clock_alignment(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         now_mono = 100.0
         now_wall = 1700000000.0
         sched = policy.compute_backoff_schedule(
@@ -178,7 +178,7 @@ class TestBackoffScheduleInvariants:
         assert rt["_backoff_wall_deadline"] == sched.wall_deadline
 
     def test_compute_orphan_schedule(self):
-        policy = PreflightPolicy()
+        policy = ExecutionPolicy()
         now_mono = 200.0
         now_wall = 1700000500.0
         sched = policy.compute_orphan_schedule(now_mono=now_mono, now_wall=now_wall)

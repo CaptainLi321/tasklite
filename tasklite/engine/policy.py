@@ -447,9 +447,6 @@ class ExecutionPolicy(AdmissionPolicy, BackoffGovernor):
         super().__init__(discovery_rerun=discovery_rerun, enable_stat_cache=enable_stat_cache)
 
 
-# 向后兼容别名
-PreflightPolicy = ExecutionPolicy
-
 __all__ = [
     "AdmissionPolicy",
     "BackoffGovernor",
@@ -458,6 +455,5 @@ __all__ = [
     "ExecutionPolicy",
     "PreflightAction",
     "PreflightDecision",
-    "PreflightPolicy",
     "RetryPlan",
 ]
