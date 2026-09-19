@@ -162,19 +162,18 @@ def test_deadlock_governor_spawner_fast_path():
 
 
 def test_deadlock_decision_structure():
-    """DeadlockDecision 纯值对象属性与布尔兼容性验证。"""
+    """DeadlockDecision 纯值对象属性验证。"""
     from tasklite.engine.governor import DeadlockDecision
 
     d1 = DeadlockDecision(action="grace_waiting", should_terminate=False, wait_time=0.5)
-    assert not d1
     assert d1.action == "grace_waiting"
+    assert d1.should_terminate is False
     assert d1.wait_time == 0.5
     assert d1.failed_uids == []
 
     d2 = DeadlockDecision(
         action="resolved", should_terminate=True, wait_time=0.0, failed_uids=["t::a"]
     )
-    assert d2
     assert d2.action == "resolved"
     assert d2.should_terminate is True
     assert d2.failed_uids == ["t::a"]

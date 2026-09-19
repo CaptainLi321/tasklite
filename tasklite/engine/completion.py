@@ -364,10 +364,6 @@ class CompletionMachine:
             pass
         return True
 
-    def cleanup_outputs(self, uid: str) -> None:
-        """清理失败/中断 job 的半成品输出（向后兼容委托给 channel）。"""
-        self._channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
-
     def release_acquired(
         self,
         acquired_or_entry: Union[InFlightJob, List[Tuple[str, float]], Any],

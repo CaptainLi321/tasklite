@@ -55,10 +55,6 @@ class DeadlockDecision:
     failed_uids: List[str] = field(default_factory=list)
     cascaded_uids: List[str] = field(default_factory=list)
 
-    def __bool__(self) -> bool:
-        """保持向后兼容布尔求值 (bool(decision) == should_terminate)。"""
-        return self.should_terminate
-
 
 @dataclass
 class DeadlockGovernor:

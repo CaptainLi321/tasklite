@@ -854,7 +854,6 @@ class TestDeadlockFallbackConservative:
         pipeline._runtime.state.find_dependency_cycles = lambda: []
         sched = self._sched(waiting_for_dependency=True)
         decision = pipeline._runtime.governor.resolve_deadlock(sched, store=pipeline._runtime.store)
-        assert not decision
         assert decision.should_terminate is False
         assert decision.wait_time == 0.5
         assert len(pipeline._runtime.state.queue) == 2
@@ -865,7 +864,6 @@ class TestDeadlockFallbackConservative:
         pipeline = self._queue_two_jobs(tmp_path)
         sched = self._sched()
         decision = pipeline._runtime.governor.resolve_deadlock(sched, store=pipeline._runtime.store)
-        assert not decision
         assert decision.should_terminate is False
         assert decision.wait_time == 0.5
         assert len(pipeline._runtime.state.queue) == 2
@@ -929,7 +927,6 @@ class TestDeadlockGapEscalation:
         from tasklite.engine.scheduler import StandstillFacts
         sched = StandstillFacts(waiting_for_dependency=True)
         decision = pipeline._runtime.governor.resolve_deadlock(sched, store=pipeline._runtime.store)
-        assert not decision
         assert decision.should_terminate is False
         assert decision.wait_time == 0.5
         assert len(pipeline._runtime.state.queue) == 2
