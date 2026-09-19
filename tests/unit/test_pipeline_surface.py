@@ -9,10 +9,7 @@ import tasklite.pipeline
 
 class TestPipelineModuleSurface:
     def test_no_dead_imports(self):
-        """pickle/classify_error_type 在模块内零使用且无补丁锚点，不得再绑入命名空间。"""
+        """零使用且无补丁锚点的符号不得绑入命名空间。"""
         assert not hasattr(tasklite.pipeline, "pickle")
         assert not hasattr(tasklite.pipeline, "classify_error_type")
-
-    def test_time_seam_preserved(self):
-        """time 是既有测试的 monkeypatch 锚点（tasklite.pipeline.time.sleep），必须保留。"""
-        assert hasattr(tasklite.pipeline, "time")
+        assert not hasattr(tasklite.pipeline, "time")

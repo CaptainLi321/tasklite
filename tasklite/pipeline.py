@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
-import time  # 模块内零调用：tests 以 tasklite.pipeline.time 为锚点 monkeypatch sleep/monotonic，保留为补丁接缝
 from pathlib import Path
 from typing import Any, Callable, Sequence
 

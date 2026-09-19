@@ -409,7 +409,7 @@ class TestKeyboardInterruptDuringSleep:
             if sleep_count[0] == 1:
                 raise KeyboardInterrupt()
 
-        monkeypatch.setattr("tasklite.pipeline.time.sleep", fake_sleep)
+        monkeypatch.setattr("tasklite.engine.runtime.time.sleep", fake_sleep)
 
         # run saves the queue then re-raises KeyboardInterrupt.
         with pytest.raises(KeyboardInterrupt):
@@ -445,7 +445,7 @@ class TestRetryThenSuccess:
         # Backoff delay = 0 so the job is immediately runnable after retry.
         monkeypatch.setattr("tasklite.engine.policy.ExecutionPolicy.compute_backoff", lambda *a, **k: 0.0)
         # Don't actually sleep.
-        monkeypatch.setattr("tasklite.pipeline.time.sleep", lambda s: None)
+        monkeypatch.setattr("tasklite.engine.runtime.time.sleep", lambda s: None)
 
         pipeline.run()
 
@@ -465,13 +465,14 @@ class TestRetryThenSuccess:
         # Controllable monotonic clock: start at t=1000, backoff until t=1100
         clock = [1000.0]
         monkeypatch.setattr("tasklite.engine.scheduler.time.monotonic", lambda: clock[0])
-        monkeypatch.setattr("tasklite.pipeline.time.monotonic", lambda: clock[0])
-        monkeypatch.setattr("tasklite.pipeline.time.time", lambda: wall_clock[0])
+        # 加载期 wall_deadline → monotonic 换算点（recovery.load_and_repair）
+        monkeypatch.setattr("tasklite.engine.recovery.time.monotonic", lambda: clock[0])
+        monkeypatch.setattr("tasklite.engine.recovery.time.time", lambda: wall_clock[0])
         # When the pipeline sleeps, advance the clock so the job becomes runnable.
         def fake_sleep(seconds):
             clock[0] += seconds
             wall_clock[0] += seconds
-        monkeypatch.setattr("tasklite.pipeline.time.sleep", fake_sleep)
+        monkeypatch.setattr("tasklite.engine.runtime.time.sleep", fake_sleep)
 
         job = Job("delayed", "j1", payload={}, retries=0, max_retries=3)
         job_dict = job.to_dict()

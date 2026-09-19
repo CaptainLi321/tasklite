@@ -83,7 +83,7 @@ class TestBackoffPersistence:
         # sleep so the loop exits while preserving the backoff job in the queue.
         def _stop_on_sleep(_s):
             pipeline.stop()
-        monkeypatch.setattr("tasklite.pipeline.time.sleep", _stop_on_sleep)
+        monkeypatch.setattr("tasklite.engine.runtime.time.sleep", _stop_on_sleep)
 
         pipeline.run()
 
@@ -130,7 +130,7 @@ class TestBackoffStaleUntilCleanup:
         # 若残留 _backoff_until 未被清除，调度器会 sleep ~1M s；stop 短路验证
         def _stop_on_sleep(_s):
             pipeline.stop()
-        monkeypatch.setattr("tasklite.pipeline.time.sleep", _stop_on_sleep)
+        monkeypatch.setattr("tasklite.engine.runtime.time.sleep", _stop_on_sleep)
 
         pipeline.run()
 
