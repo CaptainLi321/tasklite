@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-19
+
+文档匿名化修订版：ADR-0001 上下文章节移除下游生态仓库实名清单，改以泛化表述指代。仅文档变更，无代码与公开 API 变化。
+
+### 文档
+
+- **ADR-0001 匿名化**：上下文与业务痛点章节不再点名下游仓库，以「下游众多批处理与采集生态仓库」泛化指代——设计动机与架构裁决内容不变。
+
 ## [1.3.0] - 2026-09-19
 
 功能演进与安全加固版本：新增运维挂起视图、入队前 wall 过滤辅助与官方测试构造器三项公开 API；完成八组架构深化收敛与瞬态信号具名化；修复 IPC 结果文件认证与产物清理沙盒复检两项安全缺陷，以及 HTTP 传输异常分类与快照写入谓词、错误分类法构造契约、单射转义与内容指纹、状态机六集合互斥、依赖宽限与挂起信号排空等多项缺陷。
@@ -248,7 +256,8 @@
 - 运维 API：`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`。
 - 优雅停机状态机：首次信号 DRAINING 停止派发并排空在途任务，二次信号 ABORTING 分类回收在途任务。
 
-[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/CaptainLi321/tasklite/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/CaptainLi321/tasklite/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/CaptainLi321/tasklite/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/CaptainLi321/tasklite/compare/v1.2.0...v1.2.1
