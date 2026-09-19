@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from .base import (
     AbstractStateBackend,
@@ -256,7 +256,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         conn.execute('DELETE FROM queue')
         if jobs:
             seen: set = set()
-            rows = []
+            rows: list[tuple[str, int, str]] = []
             for i, j in enumerate(jobs):
                 u = uid_from_job_dict(j)
                 if u in seen:
@@ -357,7 +357,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(f"Failed to load cursors from {self.path.name}: {e}") from e
 
-    def commit_job_success(self, uid: str, result_meta: dict, *, spawned_jobs=(), cursor_updates: dict[str, str] | None = None) -> bool:
+    def commit_job_success(self, uid: str, result_meta: dict, *, spawned_jobs=(), cursor_updates: Mapping[str, str | None] | None = None) -> bool:
         """原子 delta：写 wall + 删除 popped uid + 队头插入 spawned_jobs + 更新 cursors。
 
         失败时事务回滚，on-disk 队列不变（popped uid 仍在磁盘）。

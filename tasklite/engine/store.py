@@ -420,9 +420,10 @@ class StateStore:
             self._state.unregister_in_flight(uid)
             self._state.requeue_jobs([retry_dict], front=front)
             self._record_stat("retried", 1)
-            stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
-            if stat_key:
-                self._record_stat(stat_key, 1)
+            if transient_kind is not None:
+                stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
+                if stat_key:
+                    self._record_stat(stat_key, 1)
             return RetryOutcome(uid=uid, retry_dict=retry_dict, transient_kind=transient_kind)
 
         self.commit_failed_crash(uid, "commit_retry", job_dict)

@@ -64,7 +64,7 @@ def _try_lock_fd(fd: int) -> bool:
     if os.name == "nt":
         import msvcrt
         try:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # 锁 offset 0 的 1 字节
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]  # 锁 offset 0 的 1 字节
             return True
         except OSError:
             return False
@@ -84,7 +84,7 @@ def release_lock(fd: int) -> None:
         if os.name == "nt":
             import msvcrt
             os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
         else:
             import fcntl
             fcntl.flock(fd, fcntl.LOCK_UN)

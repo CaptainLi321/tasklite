@@ -263,7 +263,7 @@ class PipelineState:
         if __debug__:
             self._assert_terminal_uids_consistent()
 
-    def update_cursors(self, updates: Mapping[str, str]) -> None:
+    def update_cursors(self, updates: Mapping[str, str | None]) -> None:
         """合并游标更新（覆盖语义）。"""
         for k, v in updates.items():
             if v is None:

@@ -20,8 +20,8 @@ class TaskContext:
     def __init__(
         self,
         job: Job,
-        wall_keys: set,
-        failed_keys: set,
+        wall_keys: set | frozenset,
+        failed_keys: set | frozenset,
         cursors: dict[str, str],
         output_root: Path | None = None,
         ipc_dir: str | None = None,
@@ -36,7 +36,7 @@ class TaskContext:
         self._wall_keys = wall_keys
         self._failed_keys = failed_keys
         self._cursors = cursors
-        self.cursor_updates: dict[str, str] = {}
+        self.cursor_updates: dict[str, str | None] = {}
         # 已注册资源名快照——suspend_resource 据此 fail-loud。
         # 不变式：恒为冻结集合；空集意味着无已注册资源，任何资源名的
         # suspend 请求一律入口拒绝——未注册名永不静默放行。

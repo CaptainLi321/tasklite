@@ -89,10 +89,10 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
     def __contains__(self, uid: object) -> bool:
         return uid in self._entries
 
-    def get(self, uid: str, default: InFlightJob | None = None) -> InFlightJob | None:
+    def get(self, uid: str, default: InFlightJob | None = None) -> InFlightJob | None:  # type: ignore[override]
         return self._entries.get(uid, default)
 
-    def pop(self, uid: str, default: InFlightJob | None = None) -> InFlightJob | None:
+    def pop(self, uid: str, default: InFlightJob | None = None) -> InFlightJob | None:  # type: ignore[override]
         return self._entries.pop(uid, default)
 
     @property

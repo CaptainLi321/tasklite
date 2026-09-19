@@ -205,7 +205,7 @@ class DispatchMachine:
         """
         if pending_dep_failure is not None:
             logger.warning(f"SKIP: {uid} (Dependency {pending_dep_failure} failed)")
-            fail_meta = {"error": _ERR_JOB_DEPENDENCY,
+            fail_meta: dict[str, Any] = {"error": _ERR_JOB_DEPENDENCY,
                          "failed_dependency": pending_dep_failure}
             # 依赖父失败的级联下游计入 cascade_failed 而非 failed，
             # 保证「真实业务失败率」统计不被级联稀释。
@@ -344,7 +344,7 @@ class DispatchMachine:
                         logger.error(f"Payload validation failed for {uid}: {_errors}")
                         # 校验失败不走子进程，release 租约后直接 commit
                         lease.release()
-                        fail_meta = {"error": _ERR_PAYLOAD_VALIDATION, "details": _errors}
+                        fail_meta: dict[str, Any] = {"error": _ERR_PAYLOAD_VALIDATION, "details": _errors}
                         self._reject_and_commit(uid, job_dict, fail_meta)
                         return None
                 # Build context + spawn (non-blocking)

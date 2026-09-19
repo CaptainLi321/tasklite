@@ -70,9 +70,10 @@ class JobRuntimeState:
 
     def remaining_backoff(self, now: float) -> float:
         """返回剩余退避时长（秒），非退避中返回 0.0。"""
-        if not self.is_backed_off(now):
+        until = self.backoff_until
+        if not isinstance(until, (int, float)) or until <= now:
             return 0.0
-        return max(0.0, float(self.backoff_until) - now)
+        return max(0.0, float(until) - now)
 
     def record_retry(
         self,
@@ -438,7 +439,7 @@ class Job:
         # 运行时边带状态（退避截止/3-strike 计数/最近重试错误）收敛到
         # `runtime` 单一命名空间，随 job_dict 落盘持久化——序列化只此
         # 一处，新增状态不会因散装下划线键漏写 to_dict 而丢失。
-        self.runtime = runtime  # type: ignore
+        self.runtime = runtime
 
     @property
     def runtime(self) -> JobRuntimeState:

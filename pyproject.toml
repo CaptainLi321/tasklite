@@ -52,6 +52,18 @@ addopts = "--strict-markers"
 timeout = 60
 norecursedirs = ["mutants", ".git", ".hypothesis", "__pycache__"]
 
+[tool.mypy]
+python_version = "3.10"
+files = ["tasklite"]
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "requests"
+ignore_missing_imports = true
+
 [tool.coverage.run]
 source = ["tasklite"]
 omit = ["*/tests/*"]

@@ -119,7 +119,7 @@ class RecoveryOrchestrator:
             disk_q = []
 
         seen_uid: set = set()
-        clean_q = []
+        clean_q: list[dict] = []
         dropped_uids: list = []
 
         # 合并以磁盘真相序为权威序（与 save_queue_crash_safe 的「磁盘独有行

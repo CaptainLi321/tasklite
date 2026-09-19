@@ -93,7 +93,7 @@ def _decode_ipc_result(
     retry_requested = False
     retry_error: str | None = None
     new_jobs: list[Job] = []
-    cursor_updates: dict[str, str] = {}
+    cursor_updates: dict[str, str | None] = {}
     resource_suspensions: list[tuple[str, float]] = []
     transient_kind: str | None = None
 
@@ -337,7 +337,7 @@ class ExecutionResult:
     retry_requested: bool = False
     retry_error: str | None = None
     new_jobs: list[Job] = field(default_factory=list)
-    cursor_updates: dict[str, str] = field(default_factory=dict)
+    cursor_updates: dict[str, str | None] = field(default_factory=dict)
     resource_suspensions: list[tuple[str, float]] = field(default_factory=list)
     transient_kind: str | None = None
     going_to_retry: bool | None = None
@@ -501,7 +501,7 @@ class ExecutionChannel:
         """结果文件存在才认证读取（收割快路径/死亡复读共用的原语）。"""
         return self._read_authenticated_result(path) if path.exists() else None
 
-    def _salvage_signals(self, uid: str, decoded: ExecutionResult | None) -> list[tuple[str, str, float]]:
+    def _salvage_signals(self, uid: str, decoded: ExecutionResult | None) -> list[tuple[str, float]]:
         """排空 uid 的挂起信号：decoded 非 None 时并入其挂起列表，否则原样返回。
 
         不变式：结果文件已原子落盘 ⇒ 本执行体的信号追加全部早于落盘
@@ -652,6 +652,8 @@ class ExecutionChannel:
 
     def probe_orphan_lock(self, uid: str) -> bool:
         """非阻塞探测执行锁。True 表示无孤儿持锁可安全执行；False 表示孤儿活跃需 defer。"""
+        if self.ipc_dir is None:
+            return True
         return lockfile.probe_lock(self.ipc_dir, uid)
 
     def drain_active_signals(self, uids: Iterable[str]) -> list[tuple[str, str, float]]:

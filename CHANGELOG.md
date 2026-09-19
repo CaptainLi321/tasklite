@@ -17,6 +17,7 @@
 
 ### 变更（重构）
 
+- **mypy 基础档零错误收敛**：新增 `[tool.mypy]` 配置（`python_version=3.10`、`check_untyped_defs`、`warn_unused_ignores` 等），修复全包 47 处类型违例——含 `_salvage_signals` 返回元数注解错误、`List` 旧式注解残漏、`__exit__` 恒 False 注解、`cursor_updates`/`handlers` 等签名对 None 删除语义与 Mapping 形态的放宽、僵尸 `type: ignore` 清理；`requests` 软依赖以 per-module 豁免。
 - **注解书写现代化**：包内 28 文件 749 处 `Optional` / `Union` / `typing.Dict` 等旧式泛型迁移至 PEP 585/604 内置泛型与 `X | Y` 联合语法（`from __future__ import annotations` 全部保留；`engine/config` 的 `if False:` 伪静态导入块转正为标准 `TYPE_CHECKING`）。
 - **strict_picklable 默认 True**：run() 前 handler pickle 预检默认开启（fail-loud，spawn 上下文契约），单测 lambda handler 迁移为模块级函数或显式关闭。
 - **TaskContext 资源名校验恒生效**：`resource_names=None` 不再跳过 `suspend_resource` 的注册名校验（一律归一空冻结集合，空集即全拒绝）；`tasklite.testing.fake_ctx` 的 resources 缺省语义同步。

@@ -42,6 +42,9 @@ _DEFAULT_MAX_WORKERS = 4
 class TaskLite:
     """Main pipeline orchestrator for task execution."""
 
+    _backend: AbstractStateBackend
+    output_root: Path | list[Path] | None = None
+
     def __init__(
         self,
         name: str,
@@ -115,9 +118,14 @@ class TaskLite:
                 self.output_root = [Path(r).resolve() for r in output_root]
                 for r in self.output_root:
                     r.mkdir(parents=True, exist_ok=True)
-            else:
+            elif isinstance(output_root, (str, Path)):
                 self.output_root = Path(output_root).resolve()
                 self.output_root.mkdir(parents=True, exist_ok=True)
+            else:
+                raise TypeError(
+                    f"output_root must be str/Path or a sequence thereof, "
+                    f"got {type(output_root).__name__}"
+                )
         else:
             self.output_root = None
 

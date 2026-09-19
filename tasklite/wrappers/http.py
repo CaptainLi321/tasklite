@@ -467,9 +467,9 @@ class http_guard:
         elif cls is RetryError:
             raise RetryError(f"HTTP {status_code} Transient server error")
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if exc_val is None:
-            return False
+            return
 
         cls = _resolve_category(self.policy.classify_exception(exc_val))
         if cls is RateLimitHit or isinstance(exc_val, RateLimitHit):
@@ -516,7 +516,7 @@ class http_guard:
             raise RetryError(f"Transient request error: {exc_val}") from exc_val
 
         # 未被策略识别的代码异常原样抛出
-        return False
+        return
 
 
 def guard_request(
@@ -596,7 +596,7 @@ class SnapshotStore:
         parsed = urllib.parse.urlparse(clean_url)
 
         # 归一化 query 参数
-        query_items: List[Tuple[str, str]] = []
+        query_items: list[tuple[str, str]] = []
         if parsed.query:
             query_items.extend(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
         if params:
@@ -620,7 +620,7 @@ class SnapshotStore:
             elif isinstance(body, str):
                 raw_bytes = body.encode("utf-8")
             else:
-                raw_bytes = bytes(body)
+                raw_bytes = bytes(body)  # type: ignore[arg-type]
             body_hash = f"_{hashlib.sha256(raw_bytes).hexdigest()[:16]}"
 
         url_component = sanitize_job_component(norm_url)
@@ -790,6 +790,7 @@ class SnapshotStore:
             res = fetch_fn(url, *args, **kwargs)
 
             # 提取响应字段
+            status_code: int | None
             if isinstance(res, HttpResponse):
                 status_code = res.status_code
                 headers = res.headers
@@ -913,7 +914,7 @@ class SQLiteSnapshotStore(SnapshotStore):
         elif isinstance(body, str):
             body_bytes = body.encode("utf-8")
         else:
-            body_bytes = bytes(body)
+            body_bytes = bytes(body)  # type: ignore[arg-type]
 
         headers_dict = {str(k): str(v) for k, v in headers.items()}
         headers_json = _json_dumps(headers_dict)
@@ -963,7 +964,7 @@ class MemorySnapshotStore(SnapshotStore):
         elif isinstance(body, str):
             body_bytes = body.encode("utf-8")
         else:
-            body_bytes = bytes(body)
+            body_bytes = bytes(body)  # type: ignore[arg-type]
         self._data[key] = HttpResponse(
             status_code=status_code,
             headers={str(k): str(v) for k, v in headers.items()},
@@ -1126,7 +1127,7 @@ def fetch_urllib(
         elif isinstance(data, str):
             req_body = data.encode("utf-8")
         else:
-            req_body = bytes(data)
+            req_body = bytes(data)  # type: ignore[arg-type]
 
     req = urllib.request.Request(
         url=final_url,

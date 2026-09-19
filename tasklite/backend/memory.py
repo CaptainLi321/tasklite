@@ -9,7 +9,7 @@ import copy
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from .base import (
     AbstractStateBackend,
@@ -114,8 +114,8 @@ class InMemoryStateBackend(AbstractStateBackend):
         uid: str,
         result_meta: dict,
         *,
-        spawned_jobs: list[dict[str, Any]] = (),
-        cursor_updates: dict[str, str] | None = None,
+        spawned_jobs: Sequence[dict[str, Any]] = (),
+        cursor_updates: Mapping[str, str | None] | None = None,
     ) -> bool:
         with self._lock:
             try:

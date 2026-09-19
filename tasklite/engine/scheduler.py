@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 if TYPE_CHECKING:
     from .types import HandlerEntry
@@ -153,10 +153,13 @@ class ScheduleResult:
 class JobScheduler:
     """Read-only scanner that locates the next runnable job in the queue."""
 
+    resources: dict[str, Resource] | ResourceManager
+    handlers: Mapping[str, HandlerEntry] | dict[str, HandlerEntry]
+
     def __init__(
         self,
         resources: dict[str, "Resource"] | ResourceManager,
-        handlers: dict[str, "HandlerEntry"] | None = None,
+        handlers: Mapping[str, HandlerEntry] | None = None,
     ):
         if isinstance(resources, ResourceManager):
             self.resource_mgr = resources
@@ -187,10 +190,12 @@ class JobScheduler:
         公开方法：失败机器的依赖宽限路径跨模块复用同一缓存（免二次
         全量反序列化），调度扫描本身也是唯一内部消费方。
         """
-        key = (job_dict.get("task_type"), job_dict.get("job_id"))
-        if key[0] is None or key[1] is None:
+        task_type = job_dict.get("task_type")
+        job_id = job_dict.get("job_id")
+        if task_type is None or job_id is None:
             # 畸形 dict（缺 task_type/job_id）无法用内容键——直接解析不缓存
             return JobFacts.from_job_dict(job_dict)
+        key = (task_type, job_id)
         facts = self._job_cache.get(key)
         # 缓存一致性校验：缓存命中时校验「调度只读字段」一致——rerun="every_run"
         # 的 job 在 wall 命中时被 spawn 去重豁免（文档化「每会话重扫」语义），

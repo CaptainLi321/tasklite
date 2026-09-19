@@ -148,11 +148,10 @@ class ArtifactJournal:
 
         if output_roots is not None and sandbox:
             p = Path(raw)
-            roots = (
-                output_roots
-                if isinstance(output_roots, (list, tuple))
-                else [output_roots]
-            )
+            if isinstance(output_roots, (list, tuple)):
+                roots = [Path(r) for r in output_roots]
+            else:
+                roots = [Path(str(output_roots))]
             if not p.is_absolute():
                 # 相对路径按第一个根重定位
                 p = roots[0] / p

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from ..taxonomy import classify_error_type
 
@@ -90,8 +90,8 @@ class AbstractStateBackend(ABC):
         uid: str,
         result_meta: dict,
         *,
-        spawned_jobs: list[dict[str, Any]] = (),
-        cursor_updates: dict[str, str] | None = None,
+        spawned_jobs: Sequence[dict[str, Any]] = (),
+        cursor_updates: Mapping[str, str | None] | None = None,
     ) -> bool:
         """Persist a successful job as a delta, atomically.
 

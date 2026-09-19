@@ -540,21 +540,22 @@ def register_discovery(
         )
     # 代码级强制：discovery 回调必须模块级可 pickle，否则 spawn
     # 子进程必然失败——把文档约定变成注册期 fail-loud。
-    for name, fn in (
+    picklable_checks: tuple[tuple[str, Callable[..., Any] | None], ...] = (
         ("fetch_func", fetch_func),
         ("id_func", id_func),
         ("process_item_func", process_item_func),
         ("cursor_key_func", cursor_key_func),
         ("on_missing", on_missing),
-    ):
-        if fn is None:
+    )
+    for check_name, check_fn in picklable_checks:
+        if check_fn is None:
             continue
         try:
-            pickle.dumps(fn)
+            pickle.dumps(check_fn)
         except Exception as e:
             raise TypeError(
-                f"{name} must be a module-level picklable function for "
-                f"spawn subprocess propagation, got {fn!r}: {e}"
+                f"{check_name} must be a module-level picklable function for "
+                f"spawn subprocess propagation, got {check_fn!r}: {e}"
             ) from e
     if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
         raise ValueError(f"max_pages must be a positive int, got {max_pages!r}")
