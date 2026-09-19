@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
 from .governor import DEADLOCK_GAP_MAX_ROUNDS, DEP_GRACE_SECONDS, DeadlockGovernor
 from .policy import ExecutionPolicy
@@ -20,7 +20,7 @@ from ..backend.base import AbstractStateBackend
 from ..taxonomy import ErrorTaxonomy
 from .types import HandlerEntry
 
-if False:  # TYPE_CHECKING 等价（避免运行时环形导入）
+if TYPE_CHECKING:  # 仅静态分析导入，避免运行时环形导入
     from .channel import ExecutionChannel
 
 
