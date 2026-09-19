@@ -6,7 +6,7 @@ import pytest
 
 tomllib = pytest.importorskip("tomllib")
 
-SUPPORTED_PYTHONS = ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+SUPPORTED_PYTHONS = ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 

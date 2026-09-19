@@ -21,8 +21,8 @@ test-fast:  ## 跳过 hypothesis，跑快速测试（约 8s）
 test-hypothesis:  ## 仅跑 hypothesis 属性测试
 	$(PYTEST) tests/ -q -p no:cacheprovider -m "hypothesis" --timeout=120
 
-test-matrix:  ## 多解释器矩阵冒烟（遍历本地 3.9/3.10/3.11/3.12/3.13/3.14 执行快速测试与类型提示求值冒烟）
-	@for py in python3.9 python3.10 python3.11 python3.12 python3.13 python3.14; do \
+test-matrix:  ## 多解释器矩阵冒烟（遍历本地 3.10/3.11/3.12/3.13/3.14 执行快速测试与类型提示求值冒烟）
+	@for py in python3.10 python3.11 python3.12 python3.13 python3.14; do \
 		if command -v $$py >/dev/null 2>&1; then \
 			echo "=== Testing import, typing & multi-process E2E with $$py ==="; \
 			PYTHONPATH=. $$py scripts/verify_matrix.py || exit 1; \

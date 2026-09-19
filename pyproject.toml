@@ -7,7 +7,7 @@ name = "tasklite-engine"
 dynamic = ["version"]
 
 description = "A lightweight task orchestration engine with zero external dependencies, process isolation, and ACID persistence"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 readme = "README.md"
 
@@ -17,7 +17,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
