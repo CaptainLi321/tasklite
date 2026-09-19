@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-19
+
+功能演进与安全加固版本：新增运维挂起视图、入队前 wall 过滤辅助与官方测试构造器三项公开 API；完成八组架构深化收敛与瞬态信号具名化；修复 IPC 结果文件认证与产物清理沙盒复检两项安全缺陷，以及 HTTP 传输异常分类与快照写入谓词、错误分类法构造契约、单射转义与内容指纹、状态机六集合互斥、依赖宽限与挂起信号排空等多项缺陷。
+
 ### 变更（重构）
 
 - **架构深化收敛（八项候选，27 个原子提交）**：本窗口按架构评审完成八组深化重构——
@@ -18,8 +22,6 @@
   ⑦ 3-strike 收敛：`_register_commit_failure` 单点、提交失败计数唯一表示（runtime 命名空间），旧顶层裸键 repair 单点迁移，governor 空挂件退场（ADR-0002 修订 6）；
   ⑧ 测试可构造性立法：`fake_ctx` 扩参收编 29 处手搓 `TaskContext`、`running()` 句柄收编 12 处 `_is_running` 私有翻转、`tests/machines.py` 共享装配库（`MachineEnv` NamedTuple + `CommitFailureBackend` 注入工厂 + `FakeChannel` 具名替身）、`rerun_active_uids` 只读视图，附 hygiene AST 守卫锁定测试面纪律。
 - **瞬态信号具名化（`transient_kind`）**：worker 结果文件 `retry` 通道的 `lock_conflict` / `rate_limited` 两个旁挂布尔键合并为单一结构化字段 `transient_kind`（`"lock_conflict"` / `"rate_limited"`；`interrupted` 维持独立 status 通道，解码侧归一为 kind）；`ExecutionResult` / `RetryPlan` / `RetryOutcome` 三份平行布尔字段收敛为 `transient_kind: Optional[str]` 单字段，`plan_retry` 关键字参数同步收敛（鸭子类型反射提取删除）；登记表 `engine.types.TRANSIENT_KIND_STAT_KEYS`（kind → 统计键）为新增瞬态信号的唯一登记点，`apply_retry` 统计映射改查表；降级写盘按 kind 单键保真。统计键名不变（公开 API 兼容）；父子进程同版本部署且跨 run 残留结果经令牌轮换丢弃，wire 变更无兼容矩阵。
-
-缺陷修复版本：收敛 HTTP 传输异常分类与快照写入谓词、错误分类法构造契约、单射转义与内容指纹、状态机六集合互斥以及依赖宽限与挂起信号排空等多项缺陷。
 
 ### 新增
 
@@ -246,7 +248,8 @@
 - 运维 API：`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`。
 - 优雅停机状态机：首次信号 DRAINING 停止派发并排空在途任务，二次信号 ABORTING 分类回收在途任务。
 
-[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/CaptainLi321/tasklite/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/CaptainLi321/tasklite/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/CaptainLi321/tasklite/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/CaptainLi321/tasklite/compare/v1.1.0...v1.2.0
