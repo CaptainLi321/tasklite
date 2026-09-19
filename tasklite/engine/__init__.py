@@ -9,7 +9,7 @@
 - ``store``: 统一状态事务、3-strike 崩溃与死锁归因深模块 (StateStore)；
 - ``dispatch``: 派发预检关与子进程派发编排 (DispatchMachine)；
 - ``completion``: 结果提交、清理、释放与恢复收尾 (CompletionMachine)；
-- ``recovery``: 崩溃恢复、TOCTOU 闭环 abort 与信号排空 (RecoveryMachine)；
+- ``recovery``: 崩溃恢复、TOCTOU 闭环 abort 与信号排空 (RecoveryOrchestrator)；
 - ``channel``: 子进程生命周期、阶梯看门狗、IPC 通道与产物清理 (ExecutionChannel)；
 - ``scheduler``: 队列只读扫描与不可变投影缓存 (JobScheduler)；
 - ``resource``: 限速与容量资源抽象与挂起语义 (ResourceManager / Resource)；

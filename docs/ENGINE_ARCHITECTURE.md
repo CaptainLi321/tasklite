@@ -63,7 +63,7 @@ Dispatch ──► Completion ◄── Recovery        （completion 不反向�
                    └──────────────────┬───────────────────┘
                                       ▼
                         ┌───────────────────────────┐
-                        │ RecoveryMachine 启动修复   │ (孤儿锁清理 / 残留挂起恢复)
+                        │ RecoveryOrchestrator 启动修复   │ (孤儿锁清理 / 残留挂起恢复)
                         └─────────────┬─────────────┘
                                       ▼
              ┌─────────────────────────────────────────────┐
@@ -315,7 +315,7 @@ class CompletionMachine:
     def settle_reaped(self, completed) -> int
     def settle_aborted(self, handles) -> None
 
-class RecoveryMachine:
+class RecoveryOrchestrator:
     def __init__(self, *, store, channel, resources, in_flight, policy,
                  completion) -> None
     def repair_queue_on_load(...) / load_resource_suspends() / persist_resource_suspends()

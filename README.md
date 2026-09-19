@@ -327,7 +327,7 @@ tasklite/
 │   ├── console.py       # OpsConsole：run() 外纯运维接缝（管理 API 委托目标）
 │   ├── dispatch.py      # 任务派发状态机 (DispatchMachine)
 │   ├── completion.py    # 任务完成与提交 (CompletionMachine)
-│   ├── recovery.py      # 崩溃检测与恢复 (RecoveryMachine)
+│   ├── recovery.py      # 崩溃检测与恢复 (RecoveryOrchestrator)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel / WorkerLaunchSpec)
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler)
 │   ├── policy.py        # 准入预检、重试退避与 rerun 决策 (ExecutionPolicy)

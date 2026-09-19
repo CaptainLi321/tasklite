@@ -52,8 +52,8 @@ _Avoid_: Collector, ResultHandler, Finalizer
 Specialized deep module unifying memory state machines, transactional backend persistence, 3-strike crash contracts, cascade downstream failures, and deadlock attribution policies.
 _Avoid_: ErrorManager, DeadlockResolver, StateRepository
 
-**RecoveryMachine**:
-Specialized machine responsible for startup repairs, TOCTOU-safe aborting, and crash-safe queue persistence (alias `RecoveryOrchestrator`).
+**RecoveryOrchestrator**:
+Specialized machine responsible for startup repairs, TOCTOU-safe aborting, and crash-safe queue persistence.
 _Avoid_: RepairService, AbortHandler, Rescuer
 
 **InFlightJob**:

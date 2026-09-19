@@ -382,10 +382,6 @@ class RecoveryOrchestrator:
         self._completion.settle_aborted(cancelled_entries, done_entries)
 
 
-# 向下兼容别名
-RecoveryMachine = RecoveryOrchestrator
-
 __all__ = [
     "RecoveryOrchestrator",
-    "RecoveryMachine",
 ]

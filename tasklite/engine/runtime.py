@@ -49,7 +49,7 @@ class EngineRuntime:
 
     def __init__(self, config: RunConfig) -> None:
         from .completion import CompletionMachine
-        from .recovery import RecoveryMachine
+        from .recovery import RecoveryOrchestrator
 
         self.config = config
         self.backend = config.backend
@@ -103,7 +103,7 @@ class EngineRuntime:
             ipc_dir=config.ipc_dir,
             commit_failure_dlq_threshold=config.commit_failure_dlq_threshold,
         )
-        self._recovery = RecoveryMachine(
+        self._recovery = RecoveryOrchestrator(
             store=self.store,
             channel=self.channel,
             resources=config.resources,
@@ -408,7 +408,7 @@ class EngineRuntime:
         编排层只负责 run 生命周期操作：调度轮复位与 fencing 屏障（run
         身份是 RunSession 属物，meta 持久化与 channel 同步是横切副作用，
         不下沉机器以免 session 依赖回流）；装载与修复序列归
-        RecoveryMachine.load_and_repair。
+        RecoveryOrchestrator.load_and_repair。
         """
         self.scheduler.begin_round()
 

@@ -9,7 +9,7 @@ import pytest
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.engine.policy import ExecutionPolicy
-from tasklite.engine.recovery import RecoveryOrchestrator, RecoveryMachine
+from tasklite.engine.recovery import RecoveryOrchestrator
 from tasklite.engine.resource import (
     META_RESOURCE_SUSPENDS,
     RateLimitResource,
@@ -495,8 +495,3 @@ class TestRecoveryOrchestratorResidueSalvage:
         orchestrator.salvage_residue_signals()
 
         assert backend.get_meta(META_RESOURCE_SUSPENDS) is None
-
-
-class TestRecoveryOrchestratorCompatibility:
-    def test_alias_equivalence(self):
-        assert RecoveryMachine is RecoveryOrchestrator
