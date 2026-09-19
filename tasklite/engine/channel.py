@@ -204,7 +204,6 @@ def _decode_ipc_result(
         result_meta = att.result_meta
         retry_error = att.retry_error
         retry_requested = att.retry_requested
-        retry_requested = True
 
     if success and ipc_dir is not None:
         ok, err = ArtifactJournal(ipc_dir, output_roots=output_roots).verify_outputs(job.uid)
