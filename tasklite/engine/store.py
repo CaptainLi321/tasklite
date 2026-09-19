@@ -611,8 +611,7 @@ class StateStore:
         """3-strike 计数登记骨架（计数递增的单一事实源）。
 
         计数唯一表示是 runtime 命名空间的 ``_commit_failures``（经
-        JobRuntimeState 强类型往返）；旧落盘行的顶层裸键兼容读取收敛在
-        repair_queue_on_load 单点，本方法不再维护双写。
+        JobRuntimeState 强类型往返）。
         """
         rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
         failures = rt_state.record_commit_failure()

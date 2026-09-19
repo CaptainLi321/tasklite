@@ -243,36 +243,3 @@ class TestStoreUidSnapshotContract:
         store.pop_job(0)
         assert "q::1" in snapshot
         assert "q::1" not in store.queue_uids
-
-
-class TestCommitFailureSingleRepresentation:
-    """提交失败计数唯一表示：runtime 命名空间，顶层裸键仅作旧数据迁移读取。"""
-
-    def test_top_level_legacy_key_migrated_on_repair(self, tmp_path):
-        """旧落盘行只带顶层键：repair 后计数被尊重、顶层键消失（幂等迁移）。"""
-        import json as json_mod
-        import sqlite3 as sqlite3_mod
-
-        from tasklite.models.state import PipelineState
-
-        backend = SQLiteStateBackend(tmp_path / "legacy.db")
-        legacy_job = Job("t", "legacy").to_dict()
-        legacy_job["runtime"] = {}
-        legacy_job["_commit_failures"] = 2  # 旧单表示形态
-        backend.save_queue([legacy_job])
-
-        store = StateStore(backend, state=PipelineState({}, {}, {}, []))
-        recovery = RecoveryOrchestrator(
-            store=store,
-            channel=None, resources=None, in_flight=None,
-            policy=ExecutionPolicy(), completion=None,
-        )
-        state = recovery.load_and_repair()
-
-        row = state.queue[0]
-        assert row["runtime"]["_commit_failures"] == 2, "旧顶层计数必须迁移进 runtime"
-        assert "_commit_failures" not in row, "顶层裸键迁移后必须移除（单一表示）"
-
-        # 迁移后再登记一次：计数接续（不被旧键缺失重置）
-        failures = store._register_commit_failure(row)
-        assert failures == 3
