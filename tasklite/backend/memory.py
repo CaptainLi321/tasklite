@@ -85,11 +85,10 @@ class InMemoryStateBackend(AbstractStateBackend):
     def _build_dlq_meta(self, meta: dict | None, prev: Any) -> dict[str, Any]:
         """计算 DLQ 行终值（纯函数，不变更任何状态）：_attempt 计数 + error_type + failed_at。
 
-        不变式：``_attempt`` 是写入事件计数而非逻辑失败次数；既有计数损坏
-        （非 dict 记录或非 int 计数）时静默重置为 1 并照常提交，绝不因脏计数
-        抛 TypeError——与 SQLite 后端「损坏行重置计数、写入成功」行为对齐。
-        ``merged`` 已显式携带 ``_attempt`` 时保留调用方值（计数由最先 DLQ
-        该 uid 的路径权威给定）。
+        不变式：``_attempt`` 是写入事件计数而非逻辑失败次数；既有计数
+        无效（非 dict 记录或非 int 计数）时静默重置为 1 并照常提交，绝不
+        因脏计数抛 TypeError——与 SQLite 后端「损坏行重置计数、写入成功」
+        行为对齐。
         """
         merged = copy.deepcopy(meta or {})
         if "error_type" not in merged:
@@ -102,8 +101,8 @@ class InMemoryStateBackend(AbstractStateBackend):
         prev_attempt = prev.get("_attempt")
         if isinstance(prev_attempt, int):
             merged["_attempt"] = prev_attempt + 1
-        elif "_attempt" not in merged:
-            merged["_attempt"] = 1
+        else:
+            merged["_attempt"] = 1  # 既有记录无有效计数：从 1 重新计数
         return merged
 
     def _write_dlq_entry(self, uid: str, meta: dict | None) -> None:

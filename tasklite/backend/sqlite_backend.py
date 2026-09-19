@@ -449,9 +449,8 @@ class SQLiteStateBackend(AbstractStateBackend):
                 prev = loads(row[0])
                 if isinstance(prev, dict) and isinstance(prev.get("_attempt"), int):
                     merged["_attempt"] = prev["_attempt"] + 1
-                elif isinstance(prev, dict) and "_attempt" not in merged:
-                    # 既有记录无 _attempt（旧路径写入）→ 初始化为 1
-                    merged["_attempt"] = 1
+                else:
+                    merged["_attempt"] = 1  # 既有记录无有效计数：从 1 重新计数
             except (json.JSONDecodeError, TypeError, ValueError):
                 merged["_attempt"] = 1  # 既有记录损坏：从 1 重新计数
         else:

@@ -346,14 +346,15 @@ class TestBackendCommitAtomicity:
         # 既有计数权威：incoming 显式 _attempt 被既有计数 +1 覆盖
         assert b.load_failed()["t::1"]["_attempt"] == 2
 
-    def test_incoming_attempt_preserved_when_existing_row_lacks_count(self, dual_backend):
+    def test_incoming_attempt_reset_when_existing_row_lacks_count(self, dual_backend):
         b = dual_backend
         _seed_failed_raw(b, "t::1", {"error": "legacy"})
 
         ok = b.commit_job_failure("t::1", {"error": "again", "_attempt": 7})
 
         assert ok is True
-        assert b.load_failed()["t::1"]["_attempt"] == 7
+        # 既有行无有效计数：incoming 显式 _attempt 一并不被信任，从 1 重计
+        assert b.load_failed()["t::1"]["_attempt"] == 1
 
 
 class TestReplaceQueueAtomic:
