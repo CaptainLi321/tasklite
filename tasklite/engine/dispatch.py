@@ -398,7 +398,7 @@ class DispatchMachine:
                     lease=lease,
                 )
                 # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
-                self._in_flight.dispatch(entry, state=store)
+                self._in_flight.track(entry, state=store)
                 return entry
 
         except _CommitCrashSignal:

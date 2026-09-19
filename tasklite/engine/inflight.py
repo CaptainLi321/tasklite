@@ -117,24 +117,6 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
             state.register_in_flight(entry.uid)
         return entry
 
-    def register(
-        self,
-        entry: InFlightJob,
-        *,
-        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
-    ) -> None:
-        """原子登记在途任务到内存与 PipelineState 索引（别名委托 track）。"""
-        self.track(entry, state=state)
-
-    def dispatch(
-        self,
-        entry: InFlightJob,
-        *,
-        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
-    ) -> InFlightJob:
-        """语义化派发接缝：原子登记在途任务并同步内存状态（别名委托 track）。"""
-        return self.track(entry, state=state)
-
     def settle(
         self,
         uid: str,
@@ -150,15 +132,6 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
             if uid in state.in_flight_uids:
                 state.unregister_in_flight(uid)
         return entry
-
-    def unregister(
-        self,
-        uid: str,
-        *,
-        state: Optional[Union["PipelineState", "StateStore", Any]] = None,
-    ) -> Optional[InFlightJob]:
-        """注销在途任务（别名委托 settle）。"""
-        return self.settle(uid, state=state)
 
     def active_handles(self) -> List[JobHandle]:
         """收集所有活动的真实子进程句柄（排除 handle=None 的伪条目）。"""
@@ -191,13 +164,6 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         """释放所有在途任务已占用的资源（防泄漏并清空 acquired 列表以防二次释放）。"""
         for entry in self._entries.values():
             entry.release_resources(resource_mgr)
-
-    def release_all_acquired(
-        self,
-        resource_mgr: "ResourceManager",
-    ) -> None:
-        """向后兼容别名：释放所有在途任务已占用的资源。"""
-        self.release_all_resources(resource_mgr)
 
     @staticmethod
     def create_pseudo_entry(

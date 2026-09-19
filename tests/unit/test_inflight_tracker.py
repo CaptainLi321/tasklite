@@ -33,31 +33,31 @@ class TestInFlightTrackerBasicMapping:
 
 
 class TestInFlightTrackerLifecycleAndStateSync:
-    def test_register_and_unregister_syncs_with_pipeline_state(self):
+    def test_track_and_settle_syncs_with_pipeline_state(self):
         tracker = InFlightTracker()
         state = PipelineState(wall={}, failed={}, cursors={}, queue=[])
 
         job = Job("t", "j1", {})
         entry = InFlightJob("t::j1", job.to_dict(), job, [("gpu", 1.0)], None, 100.0)
 
-        tracker.register(entry, state=state)
+        tracker.track(entry, state=state)
         assert "t::j1" in tracker
         assert "t::j1" in state.in_flight_uids
 
-        unregistered = tracker.unregister("t::j1", state=state)
-        assert unregistered is entry
+        settled = tracker.settle("t::j1", state=state)
+        assert settled is entry
         assert "t::j1" not in tracker
         assert "t::j1" not in state.in_flight_uids
 
-    def test_dispatch_and_settle_semantic_seams(self):
+    def test_track_settle_semantic_seams(self):
         tracker = InFlightTracker()
         state = PipelineState(wall={}, failed={}, cursors={}, queue=[])
 
         job = Job("t", "j1", {})
         entry = InFlightJob("t::j1", job.to_dict(), job, [("gpu", 1.0)], None, 100.0)
 
-        dispatched = tracker.dispatch(entry, state=state)
-        assert dispatched is entry
+        tracked = tracker.track(entry, state=state)
+        assert tracked is entry
         assert "t::j1" in tracker
         assert "t::j1" in tracker.uids
         assert "t::j1" in state.in_flight_uids
@@ -102,8 +102,8 @@ class TestInFlightTrackerHandlesAndPseudo:
         j2 = Job("t", "j2", {})
         e2 = InFlightTracker.create_pseudo_entry("t::j2", j2.to_dict(), j2)
 
-        tracker.register(e1)
-        tracker.register(e2)
+        tracker.track(e1)
+        tracker.track(e2)
 
         assert not e1.is_pseudo
         assert e2.is_pseudo
@@ -111,7 +111,7 @@ class TestInFlightTrackerHandlesAndPseudo:
 
 
 class TestInFlightTrackerResourceRelease:
-    def test_release_all_acquired_clears_resources(self):
+    def test_release_all_resources_clears_used(self):
         gpu = CapacityResource("gpu", 10.0)
         gpu.acquire(4.0)
         rm = ResourceManager({"gpu": gpu})
@@ -122,11 +122,11 @@ class TestInFlightTrackerResourceRelease:
         j2 = Job("t", "j2", {})
         e2 = InFlightJob("t::j2", j2.to_dict(), j2, [("gpu", 2.0)], None, None)
 
-        tracker.register(e1)
-        tracker.register(e2)
+        tracker.track(e1)
+        tracker.track(e2)
 
         assert gpu.used == 4.0
-        tracker.release_all_acquired(rm)
+        tracker.release_all_resources(rm)
         assert gpu.used == 0.0
 
     def test_entry_self_release_with_lease(self):
@@ -162,8 +162,8 @@ class TestInFlightTrackerResourceRelease:
         j2 = Job("t", "j2", {})
         e2 = InFlightJob("t::j2", j2.to_dict(), j2, [], None, None)
 
-        tracker.register(e1)
-        tracker.register(e2)
+        tracker.track(e1)
+        tracker.track(e2)
 
         assert set(tracker.active_uids()) == {"t::j1", "t::j2"}
 
