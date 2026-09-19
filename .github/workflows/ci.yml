@@ -1,0 +1,45 @@
+# 持续集成：push/PR 跑五解释器快速测试 + mypy 静态类型检查
+# （发版流水线见 release.yml，仅负责构建与 PyPI 受信发布）
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: 测试 (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装包与测试依赖
+        run: python -m pip install -e ".[dev]"
+
+      - name: 快速测试（跳过 hypothesis 属性测试）
+        run: python -m pytest tests/ -q -p no:cacheprovider -m "not hypothesis" --timeout=60
+
+  mypy:
+    name: 静态类型检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装 mypy
+        run: python -m pip install mypy
+
+      - name: mypy（配置见 pyproject [tool.mypy]）
+        run: python -m mypy
