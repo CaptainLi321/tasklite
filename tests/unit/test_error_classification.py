@@ -13,7 +13,7 @@ from tasklite.models.job import Job
 from tasklite.pipeline import TaskLite
 from tasklite.taxonomy import (
     TRANSIENT_EXCEPTIONS, FATAL_EXCEPTIONS,
-    TransientRegistry, is_transient_exception,
+    ErrorTaxonomy, is_transient_exception,
 )
 from tests.helpers import make_fake_process_class, patch_multiprocessing_for_fakes
 
@@ -38,14 +38,14 @@ class TestTransientClassification:
 
     def test_register_custom_transient(self):
         """per-pipeline 注册表：模块级业务异常注册为瞬态。"""
-        registry = TransientRegistry()
-        registry.register(_ModuleLevelNetworkError)
+        registry = ErrorTaxonomy()
+        registry.register_transient(_ModuleLevelNetworkError)
         assert is_transient_exception(_ModuleLevelNetworkError("down"), registry.snapshot())
         # 注册后立即生效，且幂等
-        registry.register(_ModuleLevelNetworkError)
+        registry.register_transient(_ModuleLevelNetworkError)
         assert is_transient_exception(_ModuleLevelNetworkError("down"), registry.snapshot())
         # 隔离语义（架构根治）：未注册的 registry 不受影响
-        other = TransientRegistry()
+        other = ErrorTaxonomy()
         assert not is_transient_exception(_ModuleLevelNetworkError("down"), other.snapshot())
 
     def test_register_rejects_function_scope_class(self):
@@ -54,12 +54,12 @@ class TestTransientClassification:
             pass
 
         with pytest.raises(TypeError, match="module-level"):
-            TransientRegistry().register(LocalError)
+            ErrorTaxonomy().register_transient(LocalError)
 
     def test_register_rejects_non_exception(self):
         """register_transient_exception 拒绝非 Exception 类。"""
         with pytest.raises(TypeError):
-            TransientRegistry().register(int)  # type: ignore
+            ErrorTaxonomy().register_transient(int)  # type: ignore
 
 
 class TestTransientAutoRetry:

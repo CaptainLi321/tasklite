@@ -1022,15 +1022,15 @@ class TestUnresolvedItemsTwoRound:
     def test_register_transient_rejects_retry_error_subclass(self):
         """注册 RetryError/FatalError 子类入口拒绝（专用分支优先，静默无效）。"""
         from tasklite.exceptions import RetryError, FatalError
-        from tasklite.taxonomy import TransientRegistry
+        from tasklite.taxonomy import ErrorTaxonomy
         class MyRetry(RetryError):
             pass
         class MyFatal(FatalError):
             pass
         with pytest.raises(TypeError, match="RetryError"):
-            TransientRegistry().register(MyRetry)
+            ErrorTaxonomy().register_transient(MyRetry)
         with pytest.raises(TypeError, match="FatalError"):
-            TransientRegistry().register(MyFatal)
+            ErrorTaxonomy().register_transient(MyFatal)
 
 
 

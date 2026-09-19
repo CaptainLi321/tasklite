@@ -28,7 +28,6 @@ from tasklite.taxonomy import (
     ErrorCategory,
     ErrorClassification,
     ErrorTaxonomy,
-    TransientRegistry,
     ValidationResult,
     classify_exception,
 )
@@ -339,10 +338,6 @@ class TestConstructorPolicyValidation:
         with pytest.raises(TypeError, match="transient_exceptions"):
             ErrorTaxonomy(transient_exceptions=[int])
 
-    def test_transient_registry_facade_validates_classes(self):
-        with pytest.raises(TypeError, match="transient_registry"):
-            TransientRegistry(classes=[42])
-
     def test_valid_sequences_still_accepted(self):
         taxonomy = ErrorTaxonomy(
             fatal_exceptions=(KeyError,),
@@ -369,7 +364,7 @@ class TestConstructorPolicyValidation:
         assert taxonomy.classify(TimeoutError("t")).is_transient is True
 
     def test_transient_registry_accepts_one_shot_iterator(self):
-        registry = TransientRegistry(classes=iter([ConnectionError]))
+        registry = ErrorTaxonomy(transient_registry=iter([ConnectionError]))
         assert registry.snapshot() == (ConnectionError,)
         assert registry.matches(ConnectionError("c")) is True
 
@@ -395,14 +390,14 @@ class TestConstructorRejectsDedicatedAndUnpicklableClasses:
         class MyRetry(RetryError):
             pass
 
-        with pytest.raises(TypeError, match="RetryError"):
+        with pytest.raises(TypeError, match="transient_registry.*RetryError"):
             ErrorTaxonomy(transient_registry=[MyRetry])
 
     def test_transient_registry_rejects_fatal_error_subclass(self):
         class MyFatal(FatalError):
             pass
 
-        with pytest.raises(TypeError, match="FatalError"):
+        with pytest.raises(TypeError, match="transient_registry.*FatalError"):
             ErrorTaxonomy(transient_registry=[MyFatal])
 
     def test_fatal_exceptions_rejects_retry_error_subclass(self):
@@ -418,13 +413,6 @@ class TestConstructorRejectsDedicatedAndUnpicklableClasses:
 
         with pytest.raises(TypeError, match="transient_exceptions.*FatalError"):
             ErrorTaxonomy(transient_exceptions=(MyFatal,))
-
-    def test_facade_constructor_rejects_dedicated_subclass(self):
-        class MyFatal(FatalError):
-            pass
-
-        with pytest.raises(TypeError, match="transient_registry.*FatalError"):
-            TransientRegistry(classes=[MyFatal])
 
     def test_transient_registry_rejects_unpicklable_class(self):
         class LocalError(Exception):

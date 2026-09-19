@@ -177,7 +177,6 @@ class TaskLite:
             fatal_exceptions=self._fatal_exceptions,
             transient_exceptions=self._transient_exceptions,
         )
-        self.transient_registry = self.taxonomy
         self.resources: ResourceManager = ResourceManager(handlers=self.handlers)
         # 内部 worker 资源：控制并发度。每个 job 默认占用 1 个 worker 槽位，
         # CapacityResource.used 实时反映 in-flight 占用，scheduler 的

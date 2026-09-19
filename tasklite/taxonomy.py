@@ -900,25 +900,6 @@ class ErrorTaxonomy:
         return self._transient_exceptions
 
 
-class TransientRegistry:
-    """瞬态异常注册表向后兼容门面（底层统一委托 ErrorTaxonomy）。"""
-
-    def __init__(self, classes: Optional[Sequence[type]] = None) -> None:
-        self._taxonomy = ErrorTaxonomy(transient_registry=classes)
-
-    def register(self, exception_cls: type) -> None:
-        """把业务自有异常类注册为瞬态（自动重试），幂等。"""
-        self._taxonomy.register_transient(exception_cls)
-
-    def snapshot(self) -> Tuple[Type[BaseException], ...]:
-        """返回不可变注册表快照（随 ctx 显式下发子进程）。"""
-        return self._taxonomy.snapshot()
-
-    def matches(self, exc: BaseException) -> bool:
-        """exc 是否命中本注册表。"""
-        return self._taxonomy.matches(exc)
-
-
 _DEFAULT_TAXONOMY = ErrorTaxonomy()
 
 
@@ -939,7 +920,7 @@ def classify_error_type(meta: dict) -> str:
 
 def classify_exception(
     exc: BaseException,
-    registry: Union[ErrorTaxonomy, TransientRegistry, Tuple[type, ...], Sequence[type], Any] = (),
+    registry: Union[ErrorTaxonomy, Sequence[type]] = (),
     *,
     fatal_exceptions: Optional[Tuple[type, ...]] = None,
     transient_exceptions: Optional[Tuple[type, ...]] = None,
@@ -958,11 +939,10 @@ def classify_exception(
     elif fatal_exceptions is None and transient_exceptions is None and not registry:
         cl = _DEFAULT_TAXONOMY.classify(exc)
     else:
-        classes = registry.snapshot() if hasattr(registry, "snapshot") else tuple(registry or ())
         taxonomy = ErrorTaxonomy(
             fatal_exceptions=fatal_exceptions,
             transient_exceptions=transient_exceptions,
-            transient_registry=classes,
+            transient_registry=tuple(registry or ()),
         )
         cl = taxonomy.classify(exc)
     if cl.is_retry or cl.is_transient:
@@ -974,7 +954,7 @@ def classify_exception(
 
 def is_transient_exception(
     exc: BaseException,
-    registry: Union[ErrorTaxonomy, TransientRegistry, Tuple[type, ...], Sequence[type], Any] = (),
+    registry: Union[ErrorTaxonomy, Sequence[type]] = (),
 ) -> bool:
     """判断异常是否属于瞬态（应自动重试）。"""
     return classify_exception(exc, registry) == "retry"
@@ -1011,7 +991,6 @@ __all__ = [
     "ValidationResult",
     "ErrorClassification",
     "ErrorTaxonomy",
-    "TransientRegistry",
     "_DEFAULT_TAXONOMY",
     # 模块级工具函数
     "_validate_transient_class",
