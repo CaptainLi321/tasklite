@@ -13,14 +13,27 @@
 """
 
 import time
+from functools import partial
 
 from tasklite import Job
 from tasklite.engine.scheduler import JobScheduler
+from tasklite.exceptions import RateLimitHit
 from tasklite.models.state import PipelineState, uid_from_job_dict
 
 from tests.helpers import (
-    make_ipc_process_class, make_pipeline, patch_multiprocessing_for_fakes,
+    make_ipc_process_class,
+    make_pipeline,
+    patch_multiprocessing_for_fakes,
+    true_handler,
 )
+
+def _rate_limit_then_success(attempts, job, ctx):
+    """前两次撞限流（挂起 + RateLimitHit），第三次成功（partial 绑定计数 list）。"""
+    attempts.append(1)
+    if len(attempts) <= 2:
+        ctx.suspend_resource("api", 60.0)
+        raise RateLimitHit("HTTP 429 RateLimit hit (resource=api, ttl=60.0s)")
+    return True
 
 
 class TestLockConflictBudgetExemption:
@@ -42,7 +55,7 @@ class TestLockConflictBudgetExemption:
         import sqlite3 as sqlite3_mod
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
 
         # retries 预算已由此前业务失败耗尽
         jd = Job("t", "j1", payload={}).to_dict()
@@ -114,15 +127,7 @@ class TestRateLimitBudgetExemption:
         pipeline.add_resource(CapacityResource("api", 1.0))
 
         attempts = []
-
-        def rate_limit_then_success(job, ctx):
-            attempts.append(1)
-            if len(attempts) <= 2:
-                ctx.suspend_resource("api", 60.0)
-                raise RateLimitHit("HTTP 429 RateLimit hit (resource=api, ttl=60.0s)")
-            return True
-
-        pipeline.register_handler("t", rate_limit_then_success)
+        pipeline.register_handler("t", partial(_rate_limit_then_success, attempts))
 
         # retries 预算已由此前业务失败耗尽
         jd = Job("t", "j1", payload={}).to_dict()
@@ -231,7 +236,7 @@ class TestMalformedNotMaskedByBackoff:
             lambda uid, meta, success, going_to_retry:
                 calls.append((uid, bool(success)))
         ))
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
 
         malformed = {"task_type": "t"}  # 缺 job_id → 无法反序列化
         backing_off = Job("t", "c", payload={}).to_dict()

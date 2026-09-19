@@ -37,6 +37,21 @@ def _spec_incarnation(args):
 FIXED_AUTH_TOKEN = "c" * 64
 
 
+def ok_handler(job, ctx):
+    """占位 handler：成功 + 空 meta（模块级可 pickle，满足 strict 预检）。"""
+    return (True, {})
+
+
+def true_handler(job, ctx):
+    """占位 handler：返回 True（模块级可 pickle，满足 strict 预检）。"""
+    return True
+
+
+def none_handler(job, ctx):
+    """占位 handler：返回 None（隐含成功；模块级可 pickle）。"""
+    return None
+
+
 def pin_result_token(monkeypatch, token=FIXED_AUTH_TOKEN):
     """固定本 run 的结果认证令牌。
 

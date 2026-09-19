@@ -44,7 +44,7 @@ from tasklite import (
 
 | 步骤 | 调用 | 必须遵守 |
 |------|------|----------|
-| ① 初始化 | `TaskLite(name, state_dir, output_root=..., max_workers=..., strict_picklable=False)` | `state_dir` 单实例独占；`output_root` 提供路径沙盒（多根）；`max_workers` 默认 4；`strict_picklable=True` 时 `run()` 前对所有 handler 做 pickle 预检（fail-loud） |
+| ① 初始化 | `TaskLite(name, state_dir, output_root=..., max_workers=..., strict_picklable=True)` | `state_dir` 单实例独占；`output_root` 提供路径沙盒（多根）；`max_workers` 默认 4；`strict_picklable` 默认 True——`run()` 前对所有 handler 做 pickle 预检（fail-loud，spawn 上下文要求 handler 必须 pickle 安全） |
 | ② 资源 | `add_resource(RateLimitResource / CapacityResource)` | amount 有限非负；同名覆盖会告警 |
 | ③a handler | `register_handler(task_type, fn, default_resources=..., payload_schema=...)` | 签名 `(job, ctx)`；返回 None/True/False/dict/(bool, dict) |
 | ③b discovery | `register_discovery(host, task_type, fetch_func, id_func, process_item_func, process_task_type, ...)` | `host` 实现 `DiscoveryHost` 协议（TaskLite 为默认）；回调必须模块级可 pickle——**注册期即做 pickle 预检**（fail-loud） |

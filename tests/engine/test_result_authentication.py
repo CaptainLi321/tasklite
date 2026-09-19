@@ -23,9 +23,9 @@ from tasklite.utils.injective import safe_uid_filename
 from tests.helpers import (
     make_fake_process_class,
     make_pipeline,
+    ok_handler,
     patch_multiprocessing_for_fakes,
 )
-
 _TOKEN = "b" * 64
 _INC = "a" * 32 + ".1"
 
@@ -191,7 +191,7 @@ class TestResultAuthTokenAssembly:
     def test_run_assembly_rotates_and_propagates_token(self, tmp_path, monkeypatch):
         """生产装配契约：run 启动生成新随机令牌并同步到执行通道。"""
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
         patch_multiprocessing_for_fakes(
             monkeypatch, fake_process_class=make_fake_process_class("success")
         )
@@ -206,7 +206,7 @@ class TestResultAuthTokenAssembly:
 
         # 新 run 令牌轮换
         p2 = make_pipeline(tmp_path, name="rotate_pipeline")
-        p2.register_handler("h", lambda job, ctx: (True, {}))
+        p2.register_handler("h", ok_handler)
         patch_multiprocessing_for_fakes(
             monkeypatch, fake_process_class=make_fake_process_class("success")
         )
@@ -217,7 +217,7 @@ class TestResultAuthTokenAssembly:
     def test_end_to_end_result_committed_under_auth(self, tmp_path, monkeypatch):
         """端到端：令牌随 spec 下发 worker、随结果落盘、读取侧校验通过。"""
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {"done": 1}))
+        p.register_handler("h", ok_handler)
         patch_multiprocessing_for_fakes(
             monkeypatch, fake_process_class=make_fake_process_class("success")
         )

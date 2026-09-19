@@ -52,7 +52,7 @@ class TaskLite:
         on_run_start: Callable[[], None] | None = None,
         on_run_end: Callable[[str], None] | None = None,
         on_job_completed: Callable[[str, dict, bool, bool], None] | None = None,
-        strict_picklable: bool = False,
+        strict_picklable: bool = True,
         fatal_exceptions: tuple | None = None,
         transient_exceptions: tuple | None = None,
         dep_grace_seconds: float | None = None,
@@ -82,9 +82,11 @@ class TaskLite:
                 success, going_to_retry)；``going_to_retry=True`` 表示将退避重试、
                 ``False`` 才是终局（成功/DLQ）。在 stats 更新之后、下一 job
                 派发之前调用；钩子内读 stats 保证一致。
-            strict_picklable: 代码级预检——True 时 run() 前对全部
-                handler 做 pickle 预检（fail-loud），False 为默认（保留单测
-                lambda 兼容）。
+            strict_picklable: 代码级预检——默认 True：run() 前对全部
+                handler 做 pickle 预检（fail-loud）。spawn 上下文要求
+                handler 必须 pickle 安全（模块级函数/类），预检把派发期
+                才爆发的序列化失败提前到 run() 入口；显式传 False 仅限
+                非严格路径（如 fork 语义宿主）自担风险。
 
             钩子契约（与防御层同原则）：同步、主线程执行、必须轻量
             非阻塞（重活业务方自丢线程池）；抛异常 → catch + warning +

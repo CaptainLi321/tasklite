@@ -20,6 +20,7 @@ from tasklite.engine.resource import CapacityResource
 from tasklite.models.job import Job
 from tasklite.pipeline import TaskLite
 from tasklite.taxonomy import validate_payload
+from tests.helpers import true_handler
 
 SRC_DIR = Path(__file__).resolve().parent.parent.parent / "tasklite"
 
@@ -847,7 +848,7 @@ class TestDispatchInterruptResources:
         from tasklite.pipeline import TaskLite
         p = TaskLite(name="t", state_dir=str(tmp_path), backend="sqlite", max_workers=1)
         p.add_resource(CapacityResource("slot", 2.0))
-        p.register_handler("t", lambda j, c: True, default_resources={"slot": 1.0})
+        p.register_handler("t", true_handler, default_resources={"slot": 1.0})
         p.enqueue([Job("t", "a")])
 
         raised = {}

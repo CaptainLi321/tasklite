@@ -18,10 +18,12 @@ from tests.helpers import (
     make_fake_process_class,
     make_ipc_process_class,
     make_pipeline,
+    none_handler,
+    ok_handler,
     patch_multiprocessing_for_fakes,
     patch_pipeline_manager,
+    true_handler,
 )
-
 
 class TestErrorHandling:
     """Tests for error handling: timeout, fatal, retry (REQ-4, REQ-11)."""
@@ -29,7 +31,7 @@ class TestErrorHandling:
     def test_timeout_kills_process(self, tmp_path, monkeypatch):
         """Handler hangs (process stays alive) → kill() called → DLQ with TIMEOUT."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("hang", lambda j, c: (True, {}))
+        pipeline.register_handler("hang", ok_handler)
         pipeline.enqueue([Job("hang", "j1", payload={}, timeout=1)])
 
         TimeoutFakeProcess = make_ipc_process_class(stay_alive=True)
@@ -44,7 +46,7 @@ class TestErrorHandling:
     def test_fatal_error_direct_dlq(self, tmp_path, monkeypatch):
         """FatalError → direct DLQ without retry."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("fatal_test", lambda j, c: (True, {}))
+        pipeline.register_handler("fatal_test", ok_handler)
 
         job = Job("fatal_test", "j1", payload={}, max_retries=5, retries=0)
         pipeline.enqueue([job])
@@ -62,7 +64,7 @@ class TestErrorHandling:
     def test_fatal_exception_detected(self, tmp_path, monkeypatch):
         """TypeError/KeyError/AttributeError/ValueError → direct DLQ with fatal."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("typeerr", lambda j, c: (True, {}))
+        pipeline.register_handler("typeerr", ok_handler)
         pipeline.enqueue([Job("typeerr", "j1", payload={})])
 
         FakeP = make_fake_process_class("fatal_exception")
@@ -77,7 +79,7 @@ class TestErrorHandling:
     def test_retry_max_exceeded_dlq(self, tmp_path, monkeypatch):
         """RetryError after max_retries → DLQ with MAX_RETRIES_EXCEEDED."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("retry_max", lambda j, c: (True, {}))
+        pipeline.register_handler("retry_max", ok_handler)
         pipeline.enqueue([Job("retry_max", "j1", payload={}, retries=3, max_retries=3)])
 
         FakeP = make_fake_process_class("retry")
@@ -127,7 +129,7 @@ class TestOutputVerification:
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=MissingOutputProcess)
 
-        pipeline.register_handler("output_test", lambda j, c: None)
+        pipeline.register_handler("output_test", none_handler)
         pipeline.enqueue([Job("output_test", "j1", payload={})])
         pipeline.run()
 
@@ -164,7 +166,7 @@ class TestOutputVerification:
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FailWithCleanup)
 
-        pipeline.register_handler("cleanup_test", lambda j, c: None)
+        pipeline.register_handler("cleanup_test", none_handler)
         pipeline.enqueue([Job("cleanup_test", "j1", payload={})])
         pipeline.run()
 
@@ -183,7 +185,7 @@ class TestPayloadValidation:
             age: int
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("validated", lambda j, c: (True, {}), payload_schema=MySchema)
+        pipeline.register_handler("validated", ok_handler, payload_schema=MySchema)
 
         # Payload missing 'age' field
         pipeline.enqueue([Job("validated", "j1", payload={"name": "test"})])
@@ -210,7 +212,7 @@ class TestProcessErrorPaths:
         记录崩溃退出码，而非无重试直判。
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("crash", lambda j, c: (True, {}))
+        pipeline.register_handler("crash", ok_handler)
         pipeline.enqueue([Job("crash", "j1", payload={}, max_retries=0)])
 
         CrashProcess = make_ipc_process_class(exitcode=1)  # non-zero, not killed
@@ -232,7 +234,7 @@ class TestProcessErrorPaths:
         应为 MAX_RETRIES_EXCEEDED + retry_error 记录结果文件缺失。
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("noresult", lambda j, c: (True, {}))
+        pipeline.register_handler("noresult", ok_handler)
         pipeline.enqueue([Job("noresult", "j1", payload={}, max_retries=0)])
 
         NoResultProcess = make_ipc_process_class()  # clean exit, no IPC put
@@ -250,7 +252,7 @@ class TestProcessErrorPaths:
         """Job requests > max_capacity → pipeline detects deadlock, job to DLQ."""
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("gpu", max_capacity=5.0))
-        pipeline.register_handler("heavy", lambda j, c: (True, {}))
+        pipeline.register_handler("heavy", ok_handler)
 
         job = Job("heavy", "j1", payload={}, resources={"gpu": 10.0})
         pipeline.enqueue([job])
@@ -272,7 +274,7 @@ class TestProcessErrorPaths:
         pipeline = make_pipeline(tmp_path)
         res = CapacityResource("slot", max_capacity=1.0)
         pipeline.add_resource(res)
-        pipeline.register_handler("test", lambda j, c: (True, {}),
+        pipeline.register_handler("test", ok_handler,
                                   default_resources={"slot": 1.0})
 
         # Inject broken release
@@ -296,7 +298,7 @@ class TestProcessErrorPaths:
     def test_output_cleanup_failure_not_fatal(self, tmp_path, monkeypatch):
         """File unlink during cleanup raises → caught, pipeline continues, job in DLQ."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("cleanup", lambda j, c: (True, {}))
+        pipeline.register_handler("cleanup", ok_handler)
 
         # FakeManager imported from tests.helpers
         monkeypatch.setattr("multiprocessing.Manager", lambda: FakeManager())
@@ -342,7 +344,7 @@ class TestKeyboardInterrupt:
     def test_keyboard_interrupt_saves_queue_sqlite(self, tmp_path, monkeypatch):
         """KeyboardInterrupt during job start → queue saved with all jobs, run() re-raises."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([Job("test", "j1", payload={}), Job("test", "j2", payload={})])
 
         class InterruptProcess:
@@ -392,7 +394,7 @@ class TestKeyboardInterruptDuringSleep:
     def test_no_duplicate_on_interrupt_during_sleep(self, tmp_path, monkeypatch):
         """Interrupt during scheduler sleep → job not duplicated in queue."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         # Place the job in a retry backoff window so the scheduler sleeps
         # waiting for the backoff to expire. (Unknown resources now trigger an
         # immediate RESOURCE_DEADLOCK instead of sleeping.)
@@ -433,7 +435,7 @@ class TestRetryThenSuccess:
     def test_retry_then_success(self, tmp_path, monkeypatch):
         """Handler raises RetryError first, returns True second → job in wall, retries=1."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("flaky", lambda j, c: (True, {}))
+        pipeline.register_handler("flaky", ok_handler)
         pipeline.enqueue([Job("flaky", "j1", payload={}, retries=0, max_retries=3)])
 
         RetryThenSuccessProcess = make_ipc_process_class(results=[
@@ -458,7 +460,7 @@ class TestRetryThenSuccess:
     def test_backoff_until_in_future_skips_then_runs(self, tmp_path, monkeypatch):
         """Job with future wall_deadline is skipped; after clock advances, runs."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("delayed", lambda j, c: (True, {}))
+        pipeline.register_handler("delayed", ok_handler)
 
         # Controllable wall clock: backoff wall_deadline at 100s after now
         wall_clock = [time.time()]
@@ -494,7 +496,7 @@ class TestRetryThenSuccess:
     def test_retry_error_empty_message(self, tmp_path, monkeypatch):
         """RetryError with empty string message → retry status, no crash."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("empty_retry", lambda j, c: (True, {}))
+        pipeline.register_handler("empty_retry", ok_handler)
         pipeline.enqueue([Job("empty_retry", "j1", payload={}, retries=3, max_retries=3)])
 
         EmptyMessageRetryProcess = make_ipc_process_class(results=[
@@ -516,7 +518,7 @@ class TestExceptionSubclassesAndEmpty:
     def test_fatal_error_empty_message(self, tmp_path, monkeypatch):
         """FatalError with empty message → DLQ with fatal=True."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("empty_fatal", lambda j, c: (True, {}))
+        pipeline.register_handler("empty_fatal", ok_handler)
         pipeline.enqueue([Job("empty_fatal", "j1", payload={})])
 
         EmptyFatalProcess = make_ipc_process_class(results=[
@@ -538,7 +540,7 @@ class TestExceptionSubclassesAndEmpty:
             pass
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("sub_retry", lambda j, c: (True, {}))
+        pipeline.register_handler("sub_retry", ok_handler)
         pipeline.enqueue([Job("sub_retry", "j1", payload={}, retries=3, max_retries=3)])
 
         SubclassRetryProcess = make_ipc_process_class(results=[
@@ -560,7 +562,7 @@ class TestExceptionSubclassesAndEmpty:
             pass
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("sub_fatal", lambda j, c: (True, {}))
+        pipeline.register_handler("sub_fatal", ok_handler)
         pipeline.enqueue([Job("sub_fatal", "j1", payload={})])
 
         SubclassFatalProcess = make_ipc_process_class(results=[
@@ -584,7 +586,7 @@ class TestExceptionSubclassesAndEmpty:
         Unknown 判死。
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("killed", lambda j, c: (True, {}))
+        pipeline.register_handler("killed", ok_handler)
  # max_retries=0：信号死亡消耗一次预算即耗尽 → 验证重试耗尽终态
         pipeline.enqueue([Job("killed", "j1", payload={}, max_retries=0)])
 
@@ -634,7 +636,7 @@ class TestExceptionSubclassesAndEmpty:
     def test_systemexit_in_subprocess_crash(self, tmp_path, monkeypatch):
         """SystemExit (BaseException, not Exception) → subprocess dies, crash exitcode."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("sysexit", lambda j, c: (True, {}))
+        pipeline.register_handler("sysexit", ok_handler)
         pipeline.enqueue([Job("sysexit", "j1", payload={}, max_retries=0)])
 
         SystemExitProcess = make_ipc_process_class(exitcode=1)  # no IPC result
@@ -686,7 +688,7 @@ class TestOutputCleanupVariants:
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FailWithCleanupFalse)
 
-        pipeline.register_handler("keep_test", lambda j, c: None)
+        pipeline.register_handler("keep_test", none_handler)
         pipeline.enqueue([Job("keep_test", "j1", payload={})])
         pipeline.run()
 
@@ -721,7 +723,7 @@ class TestOutputCleanupVariants:
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FailWithDirOutput)
 
-        pipeline.register_handler("dir_test", lambda j, c: None)
+        pipeline.register_handler("dir_test", none_handler)
         pipeline.enqueue([Job("dir_test", "j1", payload={})])
         pipeline.run()
 
@@ -761,7 +763,7 @@ class TestOutputCleanupVariants:
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=MultiOutputProcess)
 
-        pipeline.register_handler("multi_out", lambda j, c: None)
+        pipeline.register_handler("multi_out", none_handler)
         pipeline.enqueue([Job("multi_out", "j1", payload={})])
         pipeline.run()
 
@@ -804,7 +806,7 @@ class TestOutputCleanupVariants:
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=AllPresentProcess)
 
-        pipeline.register_handler("all_present", lambda j, c: None)
+        pipeline.register_handler("all_present", none_handler)
         pipeline.enqueue([Job("all_present", "j1", payload={})])
         pipeline.run()
 
@@ -838,7 +840,7 @@ class TestDeadlockFallbackConservative:
     def _queue_two_jobs(self, tmp_path):
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("slot", max_capacity=1.0))
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         pipeline.enqueue([Job("t", "a"), Job("t", "b")])
         state = PipelineState(
             pipeline.backend.load_wall(),
@@ -888,7 +890,7 @@ class TestDeadlockGapEscalation:
 
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("slot", max_capacity=2.0))
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         pipeline.enqueue([
             Job("t", "a", payload={}, depends_on=["t::b"]),
             Job("t", "b", payload={}, depends_on=["t::a"]),
@@ -915,7 +917,7 @@ class TestDeadlockGapEscalation:
 
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("slot", max_capacity=2.0))
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         pipeline.enqueue([Job("t", "a", payload={}, depends_on=["t::b"]),
                           Job("t", "b", payload={}, depends_on=["t::a"])])
         # 手动加载 state（_run_body 的加载逻辑）

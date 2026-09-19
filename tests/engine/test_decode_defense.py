@@ -21,6 +21,7 @@ from tasklite.engine.channel import (
 )
 from tasklite.models.job import Job
 from tasklite.utils.ipc import ArtifactJournal
+from tests.helpers import ok_handler
 
 # 合法的成功结果基线（其余字段全部正常，只变异目标字段）
 _BASE_OK = {
@@ -423,7 +424,7 @@ class TestMainLoopContinuesAfterDirectHandle:
         pipeline = TaskLite(
             name="t", state_dir=str(tmp_path / "state"), max_workers=1,
         )
-        pipeline.register_handler("good", lambda j, c: (True, {}))
+        pipeline.register_handler("good", ok_handler)
         pipeline.enqueue([
             Job("no_handler", "j1"),
             Job("good", "j2"),

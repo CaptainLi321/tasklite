@@ -8,6 +8,7 @@
 
 import os
 import time
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from tasklite.models.job import Job
 from tests.helpers import (
     make_fake_process_class,
     make_pipeline,
+    ok_handler,
     patch_multiprocessing_for_fakes,
     pin_result_token,
 )
@@ -38,6 +40,12 @@ def _hang_handler(job, ctx):
 
 def _quick_handler(job, ctx):
     return True
+
+
+def _record_uid(sink, job, ctx):
+    """记录派发执行的 uid（partial 绑定调用方 list；模块级函数保证可 pickle）。"""
+    sink.append(job.uid)
+    return (True, {})
 
 
 def _suspend_then_hang_handler(job, ctx):
@@ -155,7 +163,7 @@ class TestStaleResultRestore:
         """残留 success 结果 → job 直接进 wall，不启动子进程、不执行 handler。"""
         handler_calls = []
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: handler_calls.append(job.uid) or (True, {}))
+        p.register_handler("h", partial(_record_uid, handler_calls))
 
         p.enqueue([Job("h", "a")])
         # 模拟上次崩溃：残留 success 结果文件（job 已执行完成但未 commit）
@@ -180,7 +188,7 @@ class TestStaleResultRestore:
     def test_stale_retry_increments_retries(self, tmp_path, monkeypatch):
         """残留 retry 结果 → job 重试计数 +1 重入队，退避后重新执行成功。"""
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
 
         p.enqueue([Job("h", "a")])
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
@@ -206,7 +214,7 @@ class TestStaleResultRestore:
         """残留 fatal 结果 → job 直接进 DLQ，不启动子进程。"""
         handler_calls = []
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: handler_calls.append(job.uid) or (True, {}))
+        p.register_handler("h", partial(_record_uid, handler_calls))
 
         p.enqueue([Job("h", "a")])
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
@@ -229,7 +237,7 @@ class TestStaleResultRestore:
     def test_stale_error_goes_to_dlq(self, tmp_path, monkeypatch):
         """残留 error 结果 → job 直接进 DLQ。"""
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
 
         p.enqueue([Job("h", "a")])
         inc = "deadbeefdeadbeefdeadbeefdeadbeef.1"
@@ -251,7 +259,7 @@ class TestStaleResultRestore:
     def test_stale_corrupt_file_discarded_and_rerun(self, tmp_path, monkeypatch):
         """损坏/非结果格式残留 → 丢弃并正常派发执行（宁可重跑，不可误判）。"""
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
 
         p.enqueue([Job("h", "a")])
         # 非标准结果文件：有内容但缺 status 键
@@ -274,7 +282,7 @@ class TestStaleResultRestore:
         schema 防御：记为失败进 DLQ，不崩。
         """
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
 
         p.enqueue([Job("h", "a")])
         # status=success 但缺 raw_result（模拟损坏/旧版本残留）

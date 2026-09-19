@@ -12,6 +12,7 @@ Tests extracted from the original monolithic test file into:
 
 import json
 import time
+from functools import partial
 import queue
 import multiprocessing
 
@@ -20,18 +21,32 @@ import pytest
 from tasklite.pipeline import TaskLite
 from tasklite.models.job import Job
 from tasklite.engine.resource import RateLimitResource, CapacityResource
-from tests.helpers import _write_fake_result, make_fake_process_class, make_ipc_process_class, make_pipeline, patch_multiprocessing_for_fakes
+from tests.helpers import (
+    _write_fake_result,
+    make_fake_process_class,
+    make_ipc_process_class,
+    make_pipeline,
+    none_handler,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+    true_handler,
+)
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
+def _simple_handler(job, ctx, succeed=True, meta=None):
+    """成功/失败可配置的占位 handler（partial 绑定参数保证可 pickle）。"""
+    if not succeed:
+        raise Exception("failure")
+    return True, meta or {}
+
+
 def _register_simple_handler(pipeline, task_type="test", succeed=True, meta=None):
     """Register a handler that returns success/failure."""
-    def handler(job, ctx):
-        if not succeed:
-            raise Exception("failure")
-        return True, meta or {}
-    pipeline.register_handler(task_type, handler)
+    pipeline.register_handler(
+        task_type, partial(_simple_handler, succeed=succeed, meta=meta)
+    )
 
 
 # ─── Tests ──────────────────────────────────────────────────────────────────
@@ -53,7 +68,7 @@ class TestEmptyQueue:
     def test_enqueue_empty_list_noop(self, tmp_path):
         """enqueue([]) does not mutate queue or raise."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([])
         assert pipeline.backend.load_queue() == []
 
@@ -65,7 +80,7 @@ class TestEmptyQueue:
         with warnings_mod.catch_warnings(record=True) as caught:
             warnings_mod.simplefilter("always")
             pipeline = make_pipeline(tmp_path)
-            pipeline.register_handler("test", lambda j, c: (True, {}))
+            pipeline.register_handler("test", ok_handler)
             pipeline.enqueue([Job("test", "j1", payload={})])
 
         deprecations = [w for w in caught
@@ -84,7 +99,7 @@ class TestEmptyQueue:
         第二次 run 必须不创建任何执行体。
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
 
         FakeP = make_fake_process_class("success")
         created = []
@@ -128,7 +143,7 @@ class TestEmptyQueue:
     def test_wall_dedup_skips_completed(self, tmp_path):
         """Already-completed job UID in wall → removed from queue at run() start."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("dedup_test", lambda j, c: (True, {}))
+        pipeline.register_handler("dedup_test", ok_handler)
 
         # Inject a wall entry into the DB
         pipeline.backend.commit_job_success("dedup_test::j1", {"ok": True}, cursor_updates={})
@@ -154,7 +169,7 @@ class TestResources:
     def test_unknown_resource_deadlock_detected(self, tmp_path):
         """Job requires unknown resource → deadlock detected, job to DLQ, queue cleared."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         job = Job("test", "j1", payload={}, resources={"nonexistent": 1.0})
         pipeline.enqueue([job])
 
@@ -173,8 +188,8 @@ class TestResources:
         队列含 1 个 unknown-resource job + 1 个 normal job，
         只 fail 前者，后者正常完成。"""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
-        pipeline.register_handler("bad", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
+        pipeline.register_handler("bad", ok_handler)
         pipeline.enqueue([
             Job("bad", "b1", payload={}, resources={"ghost": 1.0}),
             Job("test", "j1", payload={}),
@@ -200,7 +215,7 @@ class TestResources:
         """缺失依赖的肇事者被 fail 为 DEPENDENCY_DEADLOCK，
         依赖它的下游任务走 cascade 标记为 JOB_DEPENDENCY。"""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         # j_missing 依赖不存在的 missing::dep
         # j_downstream 依赖 j_missing（j_missing 失败后走 cascade）
         pipeline.enqueue([
@@ -222,7 +237,7 @@ class TestResources:
         pipeline.add_resource(CapacityResource("slots", max_capacity=1.0))
         pipeline.register_handler(
             "test",
-            lambda j, c: (True, {}),
+            ok_handler,
             default_resources={"slots": 1.0},
         )
         pipeline.enqueue([Job("test", "j1", payload={})])
@@ -243,7 +258,7 @@ class TestResources:
         （请求 50，容量 100）。前者进 DLQ，后者正常完成。
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.add_resource(CapacityResource("mem", max_capacity=100.0))
 
         # Job A: 不可达（请求 200，容量 100）
@@ -273,7 +288,7 @@ class TestDependencies:
     def test_dependency_waits_for_parent(self, tmp_path, monkeypatch):
         """Job B depends_on=[A.uid] → B waits until A succeeds."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("dep_test", lambda j, c: (True, {}))
+        pipeline.register_handler("dep_test", ok_handler)
 
         job_a = Job("dep_test", "a", payload={})
         job_b = Job("dep_test", "b", payload={}, depends_on=[job_a.uid])
@@ -292,7 +307,7 @@ class TestDependencies:
     def test_cascading_failure_job_dependency(self, tmp_path, monkeypatch):
         """Parent A fails → child B marked JOB_DEPENDENCY without execution."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("fail_test", lambda j, c: (True, {}))
+        pipeline.register_handler("fail_test", ok_handler)
 
         job_b = Job("fail_test", "b", payload={}, depends_on=["fail_test::a"])
 
@@ -313,7 +328,7 @@ class TestDependencies:
     def test_dependency_deadlock_cycle(self, tmp_path, monkeypatch):
         """Circular dependency → deadlock detected → all to DLQ."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("cycle_test", lambda j, c: (True, {}))
+        pipeline.register_handler("cycle_test", ok_handler)
 
         job_a = Job("cycle_test", "a", payload={}, depends_on=["cycle_test::b"])
         job_b = Job("cycle_test", "b", payload={}, depends_on=["cycle_test::a"])
@@ -337,7 +352,7 @@ class TestMiscellaneous:
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("slots", max_capacity=10.0))
         pipeline.register_handler(
-            "with_defaults", lambda j, c: (True, {}),
+            "with_defaults", ok_handler,
             default_resources={"slots": 2.0},
         )
         job = Job("with_defaults", "j1", payload={})
@@ -358,7 +373,7 @@ class TestMiscellaneous:
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("slots", max_capacity=10.0))
         pipeline.register_handler(
-            "with_defaults", lambda j, c: (True, {}),
+            "with_defaults", ok_handler,
             default_resources={"slots": 2.0},
         )
         pipeline.enqueue([Job("with_defaults", "j1", payload={})])
@@ -372,7 +387,7 @@ class TestMiscellaneous:
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("slots", max_capacity=10.0))
         pipeline.register_handler(
-            "with_defaults", lambda j, c: (True, {}),
+            "with_defaults", ok_handler,
             default_resources={"slots": 2.0},
         )
         job = Job("with_defaults", "j1", payload={}, resources={"slots": 5.0})
@@ -391,7 +406,7 @@ class TestMiscellaneous:
         恢复 pop 时的原始 resources，避免 handler 默认资源变更后被旧值覆盖。"""
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("mem", max_capacity=10.0))
-        pipeline.register_handler("flaky", lambda j, c: True, default_resources={"mem": 1.0})
+        pipeline.register_handler("flaky", true_handler, default_resources={"mem": 1.0})
         pipeline.enqueue([Job("flaky", "j1", payload={}, max_retries=1)])
 
         captured = {}
@@ -418,7 +433,7 @@ class TestMiscellaneous:
         消耗 max_retries 预算——与 _dispatch_job 的 probe defer 语义对齐。
         修复前：锁冲突与业务瞬态失败混计数 → 孤儿持锁期间烧光预算 → 虚假 DLQ。"""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
         pipeline.enqueue([Job("t", "j1", payload={}, max_retries=1)])
 
         captured = {}
@@ -461,7 +476,7 @@ class TestMiscellaneous:
         修复后：判定端只读结构化 transient_kind 字段（本测试的结果 dict 故意
         **不带**该字段）→ 业务撞前缀不再误判。"""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
         pipeline.enqueue([Job("t", "j1", payload={}, max_retries=1)])
 
         captured = {}
@@ -507,7 +522,7 @@ class TestMiscellaneous:
     def test_cursor_update_on_success(self, tmp_path, monkeypatch):
         """Worker sends cursor_updates via IPC → persisted in backend."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("cursor_test", lambda j, c: (True, {}))
+        pipeline.register_handler("cursor_test", ok_handler)
 
         CursorUpdateProcess = make_ipc_process_class(results=[{
             "status": "success", "raw_result": True,
@@ -528,7 +543,7 @@ class TestMiscellaneous:
     def test_enqueue_front(self, tmp_path):
         """enqueue with front=True → job at front of queue."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
 
         pipeline.enqueue([Job("test", "j1", payload={}), Job("test", "j2", payload={})])
         pipeline.enqueue([Job("test", "j0", payload={})], front=True)
@@ -540,7 +555,7 @@ class TestMiscellaneous:
     def test_enqueue_front_deduplicates_existing_jobs(self, tmp_path):
         """enqueue with front=True 时也应跳过已存在的重复作业。"""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
 
         pipeline.enqueue([Job("test", "j1", payload={})])
         pipeline.enqueue([Job("test", "j1", payload={})], front=True)
@@ -552,7 +567,7 @@ class TestMiscellaneous:
     def test_multiple_jobs_process(self, tmp_path, monkeypatch):
         """Multiple enqueued jobs all get processed."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("multi", lambda j, c: (True, {"id": j.payload["id"]}))
+        pipeline.register_handler("multi", ok_handler)
         jobs = [Job("multi", f"j{i}", payload={"id": i}) for i in range(5)]
         pipeline.enqueue(jobs)
 
@@ -632,7 +647,7 @@ class TestPipelineWeirdCases:
     def test_enqueue_empty_list_is_noop(self, tmp_path):
         """enqueue([]) returns immediately without touching the queue."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
         pipeline.enqueue([Job("t", "j1", payload={})])
         before = len(pipeline.backend.load_queue())
 
@@ -644,7 +659,7 @@ class TestPipelineWeirdCases:
     def test_enqueue_duplicate_uids_same_call(self, tmp_path):
         """Two jobs with same uid enqueued in one call — first stored, second skipped (dedup at enqueue)."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
         pipeline.enqueue([Job("t", "dup", payload={}), Job("t", "dup", payload={})])
 
         queue = pipeline.backend.load_queue()
@@ -662,7 +677,7 @@ class TestPipelineWeirdCases:
         }])
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=NoneResultProcess)
 
-        pipeline.register_handler("none_handler", lambda j, c: None)
+        pipeline.register_handler("none_handler", none_handler)
         pipeline.enqueue([Job("none_handler", "j1", payload={})])
         pipeline.run()
 
@@ -675,7 +690,7 @@ class TestPipelineWeirdCases:
         pipeline.add_resource(CapacityResource("gpu", max_capacity=4.0))
         pipeline.add_resource(RateLimitResource("api", interval_seconds=1.0))
         pipeline.register_handler(
-            "multi_res", lambda j, c: (True, {}),
+            "multi_res", ok_handler,
             default_resources={"gpu": 2.0, "api": 1.0},
         )
         pipeline.enqueue([Job("multi_res", "j1", payload={})])
@@ -693,8 +708,8 @@ class TestPipelineWeirdCases:
     def test_spawned_child_jobs_prepend_to_queue(self, tmp_path, monkeypatch):
         """ctx.spawn() children are prepended → run before pre-existing queue items."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("parent", lambda j, c: (True, {}))
-        pipeline.register_handler("child", lambda j, c: (True, {}))
+        pipeline.register_handler("parent", ok_handler)
+        pipeline.register_handler("child", ok_handler)
 
         # Pre-load the queue with a "later" job
         pipeline.enqueue([Job("child", "later", payload={})])
@@ -724,7 +739,7 @@ class TestPipelineWeirdCases:
     def test_enqueue_front_multiple_calls(self, tmp_path):
         """Two front-enqueues: second call's job ends up at index 0."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
 
         pipeline.enqueue([Job("t", "base", payload={})])
         pipeline.enqueue([Job("t", "first_front", payload={})], front=True)
@@ -800,8 +815,8 @@ class TestPipelineWeirdCases:
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=HybridProcess)
 
-        pipeline.register_handler("setter", lambda j, c: (True, {}))
-        pipeline.register_handler("reader", lambda j, c: (True, {}))
+        pipeline.register_handler("setter", ok_handler)
+        pipeline.register_handler("reader", ok_handler)
         # reader 显式依赖 setter：并发模型下无依赖的 job 不保证执行顺序，
         # 加 depends_on 确保 B 在 A commit cursor 后才 dispatch。
         pipeline.enqueue([
@@ -824,7 +839,6 @@ class TestRegisterHandlerResourceGuard:
         from tasklite.models.job import Job
 
         p = TaskLite(name="g6_guard", state_dir=tmp_path / "state")
-        ok_handler = lambda j, c: True
 
         with pytest.raises(TypeError, match="must be a number"):
             p.register_handler("t1", ok_handler, default_resources={"api": True})
@@ -847,6 +861,6 @@ class TestRegisterHandlerResourceGuard:
         from tasklite import TaskLite
 
         p = TaskLite(name="g6_none", state_dir=tmp_path / "state")
-        p.register_handler("t1", lambda j, c: True, default_resources=None)
-        p.register_handler("t2", lambda j, c: True, default_resources={})
+        p.register_handler("t1", true_handler, default_resources=None)
+        p.register_handler("t2", true_handler, default_resources={})
         assert "t1" in p.handlers and "t2" in p.handlers

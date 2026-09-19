@@ -11,6 +11,7 @@
 
 import pytest
 from tasklite import TaskLite, Job
+from tests.helpers import true_handler
 from tasklite.wrappers.discovery import register_discovery
 
 def _ok_handler(job, ctx):
@@ -172,11 +173,8 @@ class TestRerunEveryRun:
         class _Schema(TypedDict):
             required_key: int
 
-        def _h(job, ctx):
-            return True
-
         p = _pipeline(tmp_path)
-        p.register_handler("t", _h, payload_schema=_Schema)
+        p.register_handler("t", true_handler, payload_schema=_Schema)
         p.seed_wall(["t::bad"])  # 上次成功（wall 有记录）
         # payload 缺 required_key → 走 payload-validation 直接 commit 路径
         p.enqueue([Job("t", "bad", payload={"wrong": 1}, rerun="every_run")])

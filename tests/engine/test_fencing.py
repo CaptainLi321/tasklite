@@ -11,16 +11,26 @@ drain 只查当前 incarnation 路径——孤儿（旧 run_id）写的文件不
 
 import threading
 import time
+from functools import partial
 
 from tasklite.pipeline import TaskLite
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
 
 from tests.helpers import (
-    make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes,
     _write_fake_result,
+    make_fake_process_class,
+    make_pipeline,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
 )
 from tasklite.utils.ipc import ArtifactJournal
+
+
+def _record_uid(sink, job, ctx):
+    """记录派发执行的 uid（partial 绑定调用方 list；模块级函数保证可 pickle）。"""
+    sink.append(job.uid)
+    return (True, {})
 
 
 class TestIncarnationFencing:
@@ -38,7 +48,7 @@ class TestIncarnationFencing:
         """
         p = make_pipeline(tmp_path)
         handler_calls = []
-        p.register_handler("h", lambda job, ctx: handler_calls.append(job.uid) or (True, {}))
+        p.register_handler("h", partial(_record_uid, handler_calls))
         p.enqueue([Job("h", "a")])
 
         # 预先写入一条「旧 run_id」的残留结果（模拟上次 run 孤儿将写的文件，
@@ -69,7 +79,7 @@ class TestIncarnationFencing:
         读到该文件，会 commit 孤儿上下文并 kill 新子进程（造成错误提交与误杀危害）。
         """
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
 
  # 手工触发一次派发（不消费残留）——通过让 claim_stale_result 找不到文件：
         # 先跑完一个正常 run，确认其结果文件使用**当前 run 的 incarnation**。
@@ -123,7 +133,7 @@ class TestIncarnationFencing:
             def kill(self): self._alive = False
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=CaptureProcess)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
         p.enqueue([Job("h", "a")])
         p.run()
 
@@ -144,7 +154,7 @@ class TestIncarnationFencing:
         p = make_pipeline(tmp_path)
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
         p.enqueue([Job("h", "a")])
         p.run()
         saved = p.backend.get_meta("last_run_id")
@@ -176,7 +186,7 @@ class TestIncarnationFencing:
             def kill(self): self._alive = False
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=SeqCaptureProcess)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
         p.enqueue([Job("h", "a", max_retries=1, backoff_base=0.01, backoff_max=0.01)])
         p.run()
 
@@ -283,7 +293,7 @@ class TestStaleDeclarationCleanup:
         读 outputs.jsonl 校验旧输出存在性失败 → "Missing output" 假 DLQ。
         """
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
         p.enqueue([Job("h", "a")])
 
         # 预置崩溃残留：上一次执行声明了 /tmp/nonexistent_old_output.txt
@@ -335,7 +345,7 @@ class TestStaleDeclarationCleanup:
         输入声明同样在 submit 前清理（否则成功提交时 _apply_result 读
         read_inputs 把旧指纹并入 wall meta，on_input_change 比对读到陈旧指纹）。"""
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
         p.enqueue([Job("h", "a")])
 
         journal = ArtifactJournal(p.ipc_dir)
@@ -399,7 +409,7 @@ class TestDispatchOrderFencing:
         patch_multiprocessing_for_fakes(
             monkeypatch, fake_process_class=make_fake_process_class("success"))
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
         p.enqueue([Job("h", "a")])
 
         # 模拟孤儿 worker：持有 {uid}.lock + 正在实时 append 的声明文件
@@ -454,7 +464,7 @@ class TestDispatchOrderFencing:
         残留结果提交进 wall、成功产出的物理文件保留（无双跑、无重跑）。
         """
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
         p.enqueue([Job("h", "a")])
         # 直接驱动派发需要内存状态（enqueue 只写磁盘）——从后端装载
         state = PipelineState({}, {}, {}, p.backend.load_queue())

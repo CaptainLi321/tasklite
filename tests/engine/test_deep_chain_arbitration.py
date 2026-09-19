@@ -15,8 +15,12 @@ from tasklite.engine.governor import DeadlockGovernor
 from tasklite.engine.store import StateStore
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
-from tests.helpers import make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    make_fake_process_class,
+    make_pipeline,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+)
 # 超出解释器默认递归限制（1000），保证场景真实落在递归深度敏感区
 CHAIN_N = 1500
 
@@ -86,7 +90,7 @@ class TestRunLoopDeepChainNoCrash:
         整链进 DLQ → 队列清空正常退出，全程不得因环检测崩溃。"""
         calls = _spy_cycle_detection(monkeypatch)
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
 
         # 链尾依赖退避中的 c：仲裁期 min_wait 有限且 waiting_for_dependency
         queue = _chain_queue(CHAIN_N, tail_deps=["t::c"])

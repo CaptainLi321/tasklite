@@ -15,8 +15,11 @@ from tasklite.taxonomy import (
     TRANSIENT_EXCEPTIONS, FATAL_EXCEPTIONS,
     ErrorTaxonomy, is_transient_exception,
 )
-from tests.helpers import make_fake_process_class, patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    make_fake_process_class,
+    patch_multiprocessing_for_fakes,
+    true_handler,
+)
 
 class _ModuleLevelNetworkError(Exception):
     """模块级异常类（spawn 子进程可 pickle 的要求）。"""
@@ -82,7 +85,7 @@ class TestTransientAutoRetry:
         pipeline = TaskLite(
             name="test_transient", state_dir=tmp_path / "state", backend="sqlite", max_workers=1,
         )
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         pipeline.enqueue([Job("t", "j1", payload={}, backoff_base=0.01)])
         pipeline.run()
 

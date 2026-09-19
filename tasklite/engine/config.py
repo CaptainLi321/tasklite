@@ -118,7 +118,7 @@ class RunConfig:
     policy: ExecutionPolicy
     # ── 调优标量（默认值唯一落点）──
     output_root: Path | Sequence[Path] | None = None
-    strict_picklable: bool = False
+    strict_picklable: bool = True
     dep_grace_seconds: float = DEP_GRACE_SECONDS
     commit_failure_dlq_threshold: int = COMMIT_FAILURE_DLQ_THRESHOLD
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
@@ -143,7 +143,7 @@ class RunConfig:
         governor: DeadlockGovernor,
         policy: ExecutionPolicy,
         output_root: Path | Sequence[Path] | None = None,
-        strict_picklable: bool = False,
+        strict_picklable: bool = True,
         dep_grace_seconds: float | None = None,
         commit_failure_dlq_threshold: int | None = None,
         deadlock_gap_max_rounds: int | None = None,

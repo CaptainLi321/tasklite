@@ -21,8 +21,12 @@ from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState, uid_from_job_dict
 from tasklite.taxonomy import validate_payload
-from tests.helpers import make_fake_process_class, patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    make_fake_process_class,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+    true_handler,
+)
 
 # ── 崩溃路径保存以磁盘为基准，不丢作业 ────────────────────────────
 
@@ -108,7 +112,7 @@ def test_crash_safe_save_backend_failure_preserves_disk(pipeline_sqlite, monkeyp
 def test_scheduler_unknown_resource_from_handler_defaults():
     """handler 默认资源引用未注册资源 → 合并后检测为 unknown。"""
     from tasklite.pipeline import HandlerEntry
-    handlers = {"fetch": HandlerEntry(lambda j, c: True, {"api": 1.0}, None)}
+    handlers = {"fetch": HandlerEntry(true_handler, {"api": 1.0}, None)}
     sched = JobScheduler({}, handlers)  # 空资源表
     job_dict = Job("fetch", "x", payload={}).to_dict()
     result = sched.pop_next_runnable(PipelineState({}, {}, {}, [job_dict]))
@@ -121,7 +125,7 @@ def test_scheduler_capacity_check_uses_merged_resources():
     cap = CapacityResource("api", 1.0)
     cap.acquire(1.0)  # 容量已满
     try:
-        handlers = {"fetch": HandlerEntry(lambda j, c: True, {"api": 1.0}, None)}
+        handlers = {"fetch": HandlerEntry(true_handler, {"api": 1.0}, None)}
         sched = JobScheduler({"api": cap}, handlers)
         job_dict = Job("fetch", "x", payload={}).to_dict()
         result = sched.pop_next_runnable(PipelineState({}, {}, {}, [job_dict]))
@@ -257,7 +261,7 @@ def test_backoff_dirty_string_does_not_crash():
 def test_backoff_dirty_string_until_does_not_crash_at_load(pipeline_sqlite, monkeypatch):
     """_backoff_until 为字符串脏数据 → 加载期不崩溃，job 照常执行成功。"""
     p = pipeline_sqlite
-    p.register_handler("t", lambda j, c: (True, {}))
+    p.register_handler("t", ok_handler)
     job = Job("t", "x", payload={})
     p.enqueue([job])
     q = p.backend.load_queue()
@@ -275,7 +279,7 @@ def test_backoff_dirty_string_until_does_not_crash_at_load(pipeline_sqlite, monk
 def test_backoff_wall_deadline_dirty_string_does_not_crash(pipeline_sqlite, monkeypatch):
     """退避时间 _backoff_wall_deadline 为字符串脏数据时在启动期清除，不崩溃，job 照常执行成功。"""
     p = pipeline_sqlite
-    p.register_handler("t", lambda j, c: (True, {}))
+    p.register_handler("t", ok_handler)
     job = Job("t", "x", payload={})
     p.enqueue([job])
     q = p.backend.load_queue()

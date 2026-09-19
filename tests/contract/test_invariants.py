@@ -11,8 +11,12 @@ from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.engine.channel import _normalize_handler_result
 from tasklite.models.job import Job
 from tasklite.pipeline import TaskLite
-from tests.helpers import make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    make_fake_process_class,
+    make_pipeline,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+)
 class TestInvariants:
     """Pipeline + backend invariants that must always hold."""
     # ── handler result normalization ───────────────────────────
@@ -52,7 +56,7 @@ class TestInvariants:
         snapshot and the durable backend state.
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([
             Job("test", "j1", payload={}),
             Job("test", "j2", payload={}),
@@ -81,7 +85,7 @@ class TestInvariants:
         (job persisted that shouldn't have been, e.g. from a retry leak).
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([
             Job("test", "j1", payload={}),
             Job("test", "j2", payload={}),

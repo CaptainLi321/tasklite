@@ -24,8 +24,10 @@ from tasklite.engine.channel import _mp_worker_wrapper
 from tasklite.models.context import TaskContext
 from tasklite.models.job import Job
 from tasklite.utils.ipc import ArtifactJournal
-from tests.helpers import patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+)
 # fencing 执行代标识（32-hex run_id + 序号）
 _INCARNATION = "deadbeefdeadbeefdeadbeefdeadbeef.1"
 
@@ -239,7 +241,7 @@ class TestDegradedRetryRequeuesNotDlq:
             name="degraded_ipc", state_dir=tmp_path / "state",
             backend="sqlite", max_workers=1,
         )
-        pipeline.register_handler("h", lambda j, c: (True, {}))
+        pipeline.register_handler("h", ok_handler)
         pipeline.enqueue([Job("h", "a")])
         pipeline.run()
 

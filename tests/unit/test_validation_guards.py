@@ -17,7 +17,7 @@ from tasklite.pipeline import TaskLite
 from tasklite.utils.lockfile import release_lock, try_acquire_lock
 from tasklite.wrappers.discovery import register_discovery
 from tasklite.testing import running
-from tests.helpers import make_pipeline
+from tests.helpers import make_pipeline, ok_handler, true_handler
 
 # ─── TaskLite 构造：backend 非法对象类型 ─────────────────────
 
@@ -112,7 +112,7 @@ class TestEnqueueSingleJobGuard:
 
 def _make_discovery_pipeline(tmp_path):
     p = make_pipeline(tmp_path)
-    p.register_handler("process_t", lambda j, c: (True, {}))
+    p.register_handler("process_t", ok_handler)
     return p
 
 # 模块级 dummy 回调（pickle 预检要求可 pickle）
@@ -216,7 +216,7 @@ class TestPayloadSchemaTypeGuard:
     def test_rejects_non_type_payload_schema(self, tmp_path):
         p = make_pipeline(tmp_path)
         with pytest.raises(TypeError, match="payload_schema must be a type"):
-            p.register_handler("t", lambda j, c: True, payload_schema={})  # type: ignore
+            p.register_handler("t", true_handler, payload_schema={})  # type: ignore
 
 class TestStrictPicklableGuard:
     def test_strict_picklable_rejects_lambda_handler(self, tmp_path):
@@ -225,11 +225,13 @@ class TestStrictPicklableGuard:
         p.register_handler("t", lambda j, c: True)
         with pytest.raises(TypeError, match="strict_picklable"):
             p.run()
-    def test_default_off_keeps_lambda_compat(self, tmp_path):
+    def test_default_on_rejects_lambda_handler(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_handler("t", lambda j, c: True)
-        # 默认不预检（单测 lambda 兼容）；这里只验证构造不报错
-        assert p.strict_picklable is False
+        # 默认 fail-loud：spawn 上下文要求 handler pickle 安全，预检在 run() 入口拒绝
+        assert p.strict_picklable is True
+        with pytest.raises(TypeError, match="not picklable"):
+            p.run()
 
 # ─── 新增入口校验防御（API ）─────────────────────
 
@@ -237,11 +239,11 @@ class TestRegisterHandlerTaskTypeGuard:
     def test_rejects_empty_task_type(self, tmp_path):
         p = make_pipeline(tmp_path)
         with pytest.raises(TypeError, match="task_type must be a non-empty str"):
-            p.register_handler("", lambda j, c: True)
+            p.register_handler("", true_handler)
     def test_rejects_task_type_with_separator(self, tmp_path):
         p = make_pipeline(tmp_path)
         with pytest.raises(ValueError, match="must not contain '::'"):
-            p.register_handler("a::b", lambda j, c: True)
+            p.register_handler("a::b", true_handler)
 
 class TestAddResourceGuard:
     def test_rejects_non_resource(self, tmp_path):

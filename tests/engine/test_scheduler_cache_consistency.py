@@ -25,14 +25,18 @@ from tasklite.engine.resource import CapacityResource
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.models.state import PipelineState
 
-from tests.helpers import make_pipeline, make_ipc_process_class, patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    make_ipc_process_class,
+    make_pipeline,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+)
 
 def testcached_job_stale_resources_no_crash_unknown_dlq(tmp_path, monkeypatch):
     pipeline = make_pipeline(tmp_path)
     pipeline.add_resource(CapacityResource("good", max_capacity=10.0))
-    pipeline.register_handler("parent", lambda j, c: (True, {}))
-    pipeline.register_handler("child", lambda j, c: (True, {}))
+    pipeline.register_handler("parent", ok_handler)
+    pipeline.register_handler("child", ok_handler)
 
     X1 = Job("child", "X", rerun="every_run", resources={"good": 1.0}).to_dict()
     X2 = Job("child", "X", rerun="every_run", resources={"nosuch": 1.0}).to_dict()

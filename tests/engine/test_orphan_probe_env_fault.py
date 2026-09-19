@@ -15,8 +15,10 @@ from tasklite.utils.injective import safe_uid_filename
 from tasklite.utils.ipc import ArtifactJournal
 from tasklite.models.job import Job
 
-from tests.helpers import make_pipeline
-
+from tests.helpers import (
+    make_pipeline,
+    true_handler,
+)
 
 def _poison_lock_dir(ipc_dir: Path, uid: str) -> Path:
     """把 uid 的锁文件路径预置为目录，使 os.open 抛 IsADirectoryError。"""
@@ -31,7 +33,7 @@ class TestOrphanProbeEnvFault:
     def test_poisoned_lock_path_defers_without_crashing_run(self, tmp_path):
         """锁文件被目录占位 → run 正常终结、作业瞬态 defer、零 DLQ 污染。"""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         pipeline.enqueue([Job("t", "j1", payload={})])
         _poison_lock_dir(pipeline.ipc_dir, "t::j1")
 

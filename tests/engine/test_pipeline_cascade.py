@@ -9,8 +9,13 @@ from tasklite.pipeline import TaskLite
 from tasklite.models.job import Job
 from tasklite.engine.resource import RateLimitResource, CapacityResource
 from tasklite.engine.scheduler import JobScheduler
-from tests.helpers import make_fake_process_class, make_ipc_process_class, make_pipeline, patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    make_fake_process_class,
+    make_ipc_process_class,
+    make_pipeline,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+)
 
 class TestIndirectCascade:
     """REQ-7.2: Indirect (grandchild) cascading dependency."""
@@ -18,7 +23,7 @@ class TestIndirectCascade:
     def test_indirect_cascade_grandchild(self, tmp_path, monkeypatch):
         """A→DLQ → B→JOB_DEPENDENCY → C→JOB_DEPENDENCY (B depends on A, C depends on B)."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("cascade", lambda j, c: (True, {}))
+        pipeline.register_handler("cascade", ok_handler)
 
         job_a = Job("cascade", "a", payload={})
         job_b = Job("cascade", "b", payload={}, depends_on=[job_a.uid])
@@ -45,8 +50,8 @@ class TestChildFailureIsolation:
     def test_child_failure_does_not_block_parent(self, tmp_path, monkeypatch):
         """Parent spawns child via ctx.spawn(); child fails; parent still succeeds."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("parent", lambda j, c: (True, {}))
-        pipeline.register_handler("child", lambda j, c: (True, {}))
+        pipeline.register_handler("parent", ok_handler)
+        pipeline.register_handler("child", ok_handler)
 
         StatefulFakeProcess = make_ipc_process_class(results=[
             {"status": "success", "raw_result": True,
@@ -72,7 +77,7 @@ class TestSuspendResource:
         """Handler suspends resource → resource state reflects suspension."""
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(RateLimitResource("api", interval_seconds=5.0))
-        pipeline.register_handler("blocker", lambda j, c: (True, {}),
+        pipeline.register_handler("blocker", ok_handler,
                                   default_resources={"api": 1.0})
 
         pipeline.enqueue([Job("blocker", "j1", payload={}, resources={"api": 1.0})])
@@ -137,7 +142,7 @@ class TestDAGWeirdTopologies:
     def _setup(self, tmp_path, monkeypatch):
         """Shared setup: pipeline + success FakeProcess mocks."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("dag", lambda j, c: (True, {}))
+        pipeline.register_handler("dag", ok_handler)
 
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
@@ -344,8 +349,8 @@ class TestSpawnDeduplication:
     def test_spawn_duplicate_job_is_skipped(self, tmp_path, monkeypatch):
         """Handler spawn 已存在的作业时，不应重复加入队列。"""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("parent", lambda j, c: (True, {}))
-        pipeline.register_handler("child", lambda j, c: (True, {}))
+        pipeline.register_handler("parent", ok_handler)
+        pipeline.register_handler("child", ok_handler)
 
         SpawnDuplicateProcess = make_ipc_process_class(results=[{
             "status": "success", "raw_result": True,
@@ -375,8 +380,8 @@ class TestSpawnDeduplication:
         from tasklite.models.state import PipelineState
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("parent", lambda j, c: (True, {}))
-        pipeline.register_handler("child", lambda j, c: (True, {}))
+        pipeline.register_handler("parent", ok_handler)
+        pipeline.register_handler("child", ok_handler)
         # X 历史成功（wall）
         pipeline.backend.commit_job_success("child::x", {"run_count": 1}, cursor_updates={})
         # X 重跑中（queue，every_run 放行重跑）
@@ -443,7 +448,7 @@ class TestOnJobCompletedBatchPaths:
         （c 经 _cascade_fail 批量路径；b 经 pending_dep_failure 直接 commit 路径）。
         dedup skip（a 本就在 failed）不算终结，不触发钩子。"""
         pipeline, calls = self._recording_pipeline(tmp_path)
-        pipeline.register_handler("cascade", lambda j, c: (True, {}))
+        pipeline.register_handler("cascade", ok_handler)
         pipeline.backend.commit_job_failure("cascade::a", {"error": "injected"})
         pipeline.enqueue([
             Job("cascade", "a", payload={}),
@@ -465,7 +470,7 @@ class TestOnJobCompletedBatchPaths:
         死锁批量路径此前缺 stats 递增，违反「钩子在 stats 更新后调用」契约）。"""
         pipeline, calls = self._recording_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("gpu", max_capacity=5.0))
-        pipeline.register_handler("heavy", lambda j, c: (True, {}))
+        pipeline.register_handler("heavy", ok_handler)
         pipeline.enqueue([Job("heavy", "j1", payload={}, resources={"gpu": 10.0})])
         pipeline.run()
 
@@ -484,7 +489,7 @@ class TestOnJobCompletedBatchPaths:
 
         pipeline = make_pipeline(tmp_path, on_job_completed=_boom)
         pipeline.add_resource(CapacityResource("gpu", max_capacity=5.0))
-        pipeline.register_handler("heavy", lambda j, c: (True, {}))
+        pipeline.register_handler("heavy", ok_handler)
         pipeline.enqueue([Job("heavy", "j1", payload={}, resources={"gpu": 10.0})])
         pipeline.run()
 
@@ -503,7 +508,7 @@ class TestOnJobCompletedBatchPaths:
         pipeline = make_pipeline(tmp_path, on_job_completed=(
             lambda uid, meta, success, going_to_retry: calls.append((uid, meta, success, going_to_retry))
         ))
-        pipeline.register_handler("t", lambda j, c: (True, {"size": 1}))
+        pipeline.register_handler("t", ok_handler)
 
         # 注入 _commit_failures=2：本次 commit_job_success 失败即达 3-strike
         jd = Job("t", "j1", payload={}).to_dict()
@@ -548,7 +553,7 @@ class TestCascadeFailedIndependentCounter:
 
     def test_cascade_counts_separate_from_failed(self, tmp_path, monkeypatch):
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("cascade", lambda j, c: (True, {}))
+        pipeline.register_handler("cascade", ok_handler)
 
         job_a = Job("cascade", "a", payload={})
         job_b = Job("cascade", "b", payload={}, depends_on=[job_a.uid])

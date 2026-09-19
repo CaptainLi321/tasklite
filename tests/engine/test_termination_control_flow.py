@@ -14,8 +14,13 @@ from tasklite.pipeline import TaskLite
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
 
-from tests.helpers import make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    make_fake_process_class,
+    make_pipeline,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+    true_handler,
+)
 
 class TestJobTerminatedNoFallThrough:
     def test_no_handler_commit_failure_dlq_no_fallthrough(self, tmp_path, monkeypatch):
@@ -108,7 +113,7 @@ class TestJobTerminatedNoFallThrough:
             url: str
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("h", lambda j, c: True, payload_schema=Schema)
+        pipeline.register_handler("h", true_handler, payload_schema=Schema)
 
         # payload 不含 url → 校验失败
         jd = Job("h", "j1", payload={"nope": 1}).to_dict()
@@ -143,7 +148,7 @@ class TestJobTerminatedNoFallThrough:
     def test_apply_result_commit_failure_dlq_continues_loop(self, tmp_path, monkeypatch):
         """_apply_result 路径 DLQ 阈值命中 → 主循环继续处理队列中其余 job。"""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("h", lambda j, c: (True, {}))
+        pipeline.register_handler("h", ok_handler)
 
         jd = Job("h", "j1", payload={}).to_dict()
         jd["runtime"] = {"_commit_failures": 2}
@@ -219,7 +224,7 @@ class TestFencingMetaFailLoud:
     def test_run_id_meta_failure_fails_loud(self, tmp_path, monkeypatch):
         """set_meta 失败 → run() 抛异常，而非静默降级为无 fence 运行。"""
         p = make_pipeline(tmp_path)
-        p.register_handler("h", lambda job, ctx: (True, {}))
+        p.register_handler("h", ok_handler)
 
         def boom(*a, **k):
             raise RuntimeError("meta table is broken")
@@ -243,7 +248,7 @@ class TestCommitSkipCrashTerminalPreservation:
         from tasklite.models.state import PipelineState
         from types import SimpleNamespace
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("h", lambda j, c: (True, {}))
+        pipeline.register_handler("h", ok_handler)
         jd = Job("h", "j1", payload={}).to_dict()
         if terminal_in_wall:
             wall = {"h::j1": {"run_count": 7, "last_run_at": "2020-01-01T00:00:00+00:00"}}
@@ -354,7 +359,7 @@ class TestCommitFailedCrashContractBreach:
             url: str
 
         pipeline, jd = self._pipeline_with_state(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True, payload_schema=Schema)
+        pipeline.register_handler("t", true_handler, payload_schema=Schema)
         jd["payload"] = {"nope": 1}
         monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta: False)
         monkeypatch.setattr(

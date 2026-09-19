@@ -12,9 +12,9 @@ from tasklite import Job
 from tests.helpers import (
     make_ipc_process_class,
     make_pipeline,
+    ok_handler,
     patch_multiprocessing_for_fakes,
 )
-
 
 class TestEveryRunRetryWithWallHistory:
     def test_transient_retry_then_success_does_not_crash(self, tmp_path, monkeypatch):
@@ -25,7 +25,7 @@ class TestEveryRunRetryWithWallHistory:
         （uid in wall/failed and queue）。
         """
         p = make_pipeline(tmp_path)
-        p.register_handler("t", lambda j, c: (True, {}))
+        p.register_handler("t", ok_handler)
         p.seed_wall(["t::scan"])
         p.enqueue([Job("t", "scan", rerun="every_run")])
 

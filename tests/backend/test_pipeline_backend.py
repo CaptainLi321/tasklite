@@ -11,8 +11,13 @@ from tasklite.engine.types import StopMode
 from tasklite.pipeline import TaskLite
 from tasklite.models.job import Job
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
-from tests.helpers import _write_fake_result, make_fake_process_class, make_ipc_process_class, patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    _write_fake_result,
+    make_fake_process_class,
+    make_ipc_process_class,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+)
 
 class CursorSetterFakeProcess:
     """Simulates a subprocess that calls ``ctx.set_cursor("high_water", "999")``
@@ -73,7 +78,7 @@ class TestBackoffPersistence:
         pipeline = TaskLite(
             name="test_backoff_persist", state_dir=state_dir, backend="sqlite"
         )
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
 
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
@@ -122,7 +127,7 @@ class TestBackoffStaleUntilCleanup:
         pipeline = TaskLite(
             name="test_backoff_stale", state_dir=state_dir, backend="sqlite"
         )
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
 
         FakeP = make_fake_process_class("success")
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=FakeP)
@@ -150,7 +155,7 @@ class TestBackendIntegrationWeirdCases:
         """SQLite's commit_job_success is atomic — verify calling it (no
         rollback_job_dict param) doesn't crash and returns True."""
         pipeline = TaskLite(name="test_sqlite_rollback", state_dir=tmp_state_dir, backend="sqlite")
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
 
         # Direct backend call: should not raise.
         result = pipeline.backend.commit_job_success(
@@ -190,7 +195,7 @@ class TestBackendIntegrationWeirdCases:
     def test_sqlite_backend_multiple_jobs_success(self, tmp_state_dir, monkeypatch):
         """SQLite backend: 3 jobs succeed → all in wall, queue empty."""
         pipeline = TaskLite(name="test_sql_multi", state_dir=tmp_state_dir, backend="sqlite")
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([
             Job("test", "s1", payload={}),
             Job("test", "s2", payload={}),
@@ -236,7 +241,7 @@ class TestBackendIntegrationWeirdCases:
         path through the real ``pipeline.run()`` loop.
         """
         pipeline = TaskLite(name="test_e2e_cur_sql", state_dir=tmp_state_dir, backend="sqlite")
-        pipeline.register_handler("cursor_setter", lambda j, c: (True, {}))
+        pipeline.register_handler("cursor_setter", ok_handler)
         pipeline.enqueue([Job("cursor_setter", "j1", payload={})])
 
         patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=CursorSetterFakeProcess)
@@ -378,7 +383,7 @@ class TestPipelineCommitFailureRequeue:
         """When backend.commit_job_failure returns False, pipeline crashes (crash-only)
         and on-disk queue preserves the job at front."""
         pipeline = TaskLite(name="test_fail_requeue", state_dir=tmp_state_dir, backend="sqlite")
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([Job("test", "j1", payload={})])
 
         FakeP = make_fake_process_class("error")

@@ -148,7 +148,7 @@ Dispatch ──► Completion ◄── Recovery        （completion 不反向�
 class TaskLite:
     def __init__(name, state_dir, backend="sqlite", output_root=None, max_workers=4,
                  on_run_start=None, on_run_end=None, on_job_completed=None,
-                 strict_picklable=False, fatal_exceptions=None, transient_exceptions=None,
+                 strict_picklable=True, fatal_exceptions=None, transient_exceptions=None,
                  dep_grace_seconds=None, commit_failure_dlq_threshold=None,
                  deadlock_gap_max_rounds=None)   # Optional 一律透传，不做默认值解析
     def add_resource(self, resource: Resource) -> None            # run 期守卫

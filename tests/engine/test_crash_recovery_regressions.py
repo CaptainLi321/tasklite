@@ -35,9 +35,10 @@ from tests.helpers import (
     make_fake_process_class,
     make_ipc_process_class,
     make_pipeline,
+    ok_handler,
     patch_multiprocessing_for_fakes,
+    true_handler,
 )
-
 
 # ─── Job 资源值校验 ──────────────────────────────────────
 
@@ -106,7 +107,7 @@ class TestPartialAcquireRelease:
         cap = CapacityResource("slot", max_capacity=4.0)
         pipeline.add_resource(cap)
         pipeline.add_resource(ExplodingResource("bad"))
-        pipeline.register_handler("t", lambda j, c: (True, {}),
+        pipeline.register_handler("t", ok_handler,
                                   default_resources={"slot": 1.0})
         pipeline.enqueue([Job("t", "j1", payload={}, resources={"bad": 1.0})])
 
@@ -131,7 +132,7 @@ class TestCommitCrashSignalCleanup:
 
     def test_commit_crash_signal_triggers_abort_and_save(self, tmp_path, monkeypatch):
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
         pipeline.enqueue([Job("t", "j1", payload={})])
 
         aborted = []
@@ -207,7 +208,7 @@ class TestCommitCrashSignalCleanup:
 
         # 用 payload_schema 注册 handler，job payload 非法（缺 count）→ 校验失败
         pipeline.register_handler(
-            "t", lambda j, c: (True, {}),
+            "t", ok_handler,
             default_resources={"slot": 1.0},
             payload_schema=PayloadSchema,
         )
@@ -417,7 +418,7 @@ class TestDeadlockBulkFailureCrashes:
         from tasklite.backend.sqlite_backend import SQLiteStateBackend
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         # 自依赖 → 确定性死锁 → _handle_deadlock → commit_bulk_failure
         pipeline.enqueue([Job("t", "j1", depends_on=["t::j1"])])
 
@@ -503,7 +504,7 @@ class TestDispatchFailureThreeStrike:
         import json as json_mod
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         # 注入 _dispatch_failures=2 → 本次 dispatch 失败即达 3-strike（独立计数）
         jd = Job("t", "j1", payload={}).to_dict()
         jd["runtime"] = {"_dispatch_failures": 2}
@@ -532,7 +533,7 @@ class TestDispatchFailureThreeStrike:
         import pickle as pickle_mod
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         pipeline.enqueue([Job("t", "j1", payload={})])
 
         def boom_submit(*a, **kw):
@@ -555,7 +556,7 @@ class TestCommitFailuresPreservation:
         import json as json_mod
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         # 注入 _commit_failures=2（模拟此前 dispatch/commit 已失败 2 次）。
         # backoff_base=0.01：加速测试——否则真实退避等待 2+4+8=14s
         # （time.sleep mock 无效：退避用 monotonic 判定，mock sleep 只去掉
@@ -608,7 +609,7 @@ class TestCommitFailuresPreservation:
         pipeline = make_pipeline(tmp_path, on_job_completed=(
             lambda uid, meta, success, going_to_retry: calls.append((uid, meta, success, going_to_retry))
         ))
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         jd = Job("t", "j1", payload={}).to_dict()
         jd["runtime"] = {"_dispatch_failures": 2}
         conn = sqlite3_mod.connect(tmp_path / "state" / "test_pipeline_state.db")
@@ -640,7 +641,7 @@ class TestLastRetryErrorPreservation:
         import sqlite3 as sqlite3_mod
         import json as json_mod
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         # 注入旧业务错误（模拟此前业务 retry 已持久化）
         jd = Job("t", "j1", payload={}).to_dict()
         jd["runtime"] = {"_last_retry_error": "old business error", "_commit_failures": 2}
@@ -713,7 +714,7 @@ class TestLockConflictBudgetExhaustedSelfRecovers:
         import sqlite3 as sqlite3_mod
         import json as json_mod
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         # retries 预算已由此前业务失败耗尽（retries == max_retries == 3）
         jd = Job("t", "j1", payload={}).to_dict()
         jd["retries"] = 3
@@ -775,7 +776,7 @@ class TestDispatchExceptionEntryRegistered:
         import pytest as pytest_mod
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         pipeline.enqueue([Job("t", "j1", payload={})])
 
         # 模拟注册后的派发期异常：self._in_flight[uid]=entry 已执行、
@@ -816,7 +817,7 @@ class TestDispatchExceptionEntryRegistered:
         import json as json_mod
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         # 注入 _dispatch_failures=2 → 本次 dispatch 失败即达 3-strike → DLQ 分支
         # （参考 TestDispatchFailureThreeStrike 的注入手法：直接写 job_dict 进磁盘队列）
         jd = Job("t", "j1", payload={}).to_dict()
@@ -867,7 +868,7 @@ class TestDispatchCommitCountersIndependent:
         from tasklite.exceptions import _CommitCrashSignal
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         jd = Job("t", "j1", payload={}).to_dict()
         # dispatch 已失败 2 次（独立计数），commit 失败 1 次（独立计数）
         jd["runtime"] = {"_dispatch_failures": 2, "_commit_failures": 1}
@@ -897,7 +898,7 @@ class TestDispatchCommitCountersIndependent:
         import json as json_mod
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         jd = Job("t", "j1", payload={}).to_dict()
         jd["runtime"] = {"_commit_failures": 2, "_dispatch_failures": 0}
         conn = sqlite3_mod.connect(tmp_path / "state" / "test_pipeline_state.db")
@@ -931,7 +932,7 @@ class TestDispatchCommitCountersIndependent:
         import json as json_mod
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
         jd = Job("t", "j1", payload={}).to_dict()
         # dispatch 已失败 1 次（此前 dispatch 3-strike 未达阈值 requeue）
         jd["runtime"] = {"_dispatch_failures": 1}
@@ -981,7 +982,7 @@ class TestRunLoopJobTerminatedNet:
 
     def test_job_terminated_net_binds_exception_and_runs_cleanup(self, tmp_path, monkeypatch):
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
         pipeline.enqueue([Job("t", "j1", payload={})])
 
         aborted = []
@@ -1030,7 +1031,7 @@ class TestCascadeBulkFailureCrash:
         from tasklite.backend.sqlite_backend import SQLiteStateBackend
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("t", lambda j, c: True)
+        pipeline.register_handler("t", true_handler)
 
         # a 已失败（预置 failed）→ b 依赖 a（pending_dep_failure 直接 commit
         # 失败）；b 处理时 `_cascade_fail(b)` 批量级联到其下游 c——
@@ -1178,7 +1179,7 @@ class TestResidueSignalRecovery:
         """残留「信号文件 + retry 结果」：retry payload 不携带挂起，信号不得丢。"""
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("api", max_capacity=1.0))
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
         journal = ArtifactJournal(pipeline.ipc_dir)
         journal.record_signal("t::j1", "api", 60.0)
         journal.write_result_atomic(
@@ -1206,7 +1207,7 @@ class TestResidueSignalRecovery:
         """无残留结果时信号文件曾被 PRE_SUBMIT 未读删除——排空须先于清理。"""
         pipeline = make_pipeline(tmp_path)
         pipeline.add_resource(CapacityResource("api", max_capacity=1.0))
-        pipeline.register_handler("t", lambda j, c: (True, {}))
+        pipeline.register_handler("t", ok_handler)
         ArtifactJournal(pipeline.ipc_dir).record_signal("t::j1", "api", 60.0)
         pipeline.enqueue([Job("t", "j1", payload={}, max_retries=0)])
 

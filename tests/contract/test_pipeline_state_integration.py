@@ -13,8 +13,15 @@ import pytest
 from tasklite.exceptions import _CommitCrashSignal
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
-from tests.helpers import _write_fake_result, FakeManager, make_fake_process_class, make_pipeline, patch_multiprocessing_for_fakes
-
+from tests.helpers import (
+    _write_fake_result,
+    FakeManager,
+    make_fake_process_class,
+    make_pipeline,
+    ok_handler,
+    patch_multiprocessing_for_fakes,
+    true_handler,
+)
 
 def _patch_mp(monkeypatch, process_class=None):
     """Patch multiprocessing Process/Queue/Manager for in-process tests."""
@@ -33,7 +40,7 @@ class TestPipelineStateCommitContract:
         from the handler must also be rolled back (post_pop_state used).
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {"ok": True}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([Job("test", "j1", payload={})])
 
         class SpawningFakeProcess:
@@ -100,7 +107,7 @@ class TestPipelineStateCommitContract:
         """commit_job_failure returns False -> pipeline crashes (crash-only),
         job re-queued at front, not in DLQ."""
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([Job("test", "j1", payload={})])
 
         _patch_mp(monkeypatch, make_fake_process_class("error"))
@@ -128,7 +135,7 @@ class TestPipelineStateCommitContract:
         re-insert the job and propagate the exception.
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([Job("test", "j1", payload={})])
 
         _patch_mp(monkeypatch)  # FakeManager so manager.list() doesn't fork
@@ -163,7 +170,7 @@ class TestPipelineStateCommitContract:
         and the queue must be persisted to disk.
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([
             Job("test", "j1", payload={}),
             Job("test", "j2", payload={}),
@@ -202,7 +209,7 @@ class TestPipelineStateCommitContract:
         RESOURCE_DEADLOCK (not silently dropped or left in the queue forever).
         """
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("test", lambda j, c: (True, {}))
+        pipeline.register_handler("test", ok_handler)
         pipeline.enqueue([Job("test", "j1", payload={}, resources={"nonexistent": 1.0})])
 
         # No FakeProcess needed — handler is never called (deadlock detected first).
@@ -261,8 +268,8 @@ class TestInFlightStateConsistency:
         from tasklite.models.job import inject_worker_resource
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("parent", lambda j, c: True)
-        pipeline.register_handler("child", lambda j, c: True)
+        pipeline.register_handler("parent", true_handler)
+        pipeline.register_handler("child", true_handler)
         pipeline.enqueue([Job("child", "c", payload={})])
         state = PipelineState(
             pipeline.backend.load_wall(), pipeline.backend.load_failed(),

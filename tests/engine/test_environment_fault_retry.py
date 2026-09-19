@@ -11,6 +11,7 @@ import pytest
 
 from tasklite.engine.channel import ExecutionChannel, ExecutionResult, JobHandle, _decode_ipc_result
 from tasklite.models.job import Job
+from tests.helpers import ok_handler
 
 
 class _Job:
@@ -81,7 +82,7 @@ class TestEnvFaultEndToEnd:
         from tests.helpers import make_ipc_process_class, make_pipeline, patch_multiprocessing_for_fakes
 
         pipeline = make_pipeline(tmp_path)
-        pipeline.register_handler("crash", lambda j, c: (True, {}))
+        pipeline.register_handler("crash", ok_handler)
         # max_retries=0：首次正退出码崩溃即耗尽预算 → 验证重试耗尽终态
         pipeline.enqueue([Job("crash", "j1", payload={}, max_retries=0)])
 

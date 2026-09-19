@@ -14,6 +14,7 @@ from tasklite.testing import fake_ctx
 from tasklite.models.job import Job as J
 from tasklite.models.state import PipelineState
 from tasklite.wrappers.discovery import register_discovery
+from tests.helpers import true_handler
 
 PAGESIZE = 2
 
@@ -473,7 +474,7 @@ class TestDependencyGrace:
     def test_grace_granted_when_runnable_candidate_exists(self, tmp_path):
         """有可运行候选（依赖在 wall）→ 宽限（等它 spawn 出依赖）。"""
         p = _pipeline(tmp_path)
-        p.register_handler("t", lambda j, c: True)
+        p.register_handler("t", true_handler)
         p.seed_wall(["driver::spawner"])  # 候选的依赖已满足
         queue = [
             J("t", "consumer", depends_on=["child::c1"]).to_dict(),  # 缺失依赖
@@ -487,7 +488,7 @@ class TestDependencyGrace:
     def test_grace_denied_when_all_waiting(self, tmp_path):
         """其余 job 都是等待者（依赖链尾）→ 不宽限，立即判死锁。"""
         p = _pipeline(tmp_path)
-        p.register_handler("t", lambda j, c: True)
+        p.register_handler("t", true_handler)
         queue = [
             J("t", "j_missing", depends_on=["missing::dep"]).to_dict(),
             J("t", "j_downstream", depends_on=["t::j_missing"]).to_dict(),
@@ -502,7 +503,7 @@ class TestDependencyGrace:
         """宽限超时 → 不再宽限（防依赖永不出现 → 无限等待）。"""
         import time as _t
         p = _pipeline(tmp_path)
-        p.register_handler("t", lambda j, c: True)
+        p.register_handler("t", true_handler)
         p.seed_wall(["driver::spawner"])
         queue = [
             J("t", "consumer", depends_on=["child::c1"]).to_dict(),
@@ -518,7 +519,7 @@ class TestDependencyGrace:
         job 恰好占据 A 组解决后的同位置（索引相同但身份不同）时，
         按 UID 重置截止，避免复用 A 组已过期 deadline。"""
         p = _pipeline(tmp_path)
-        p.register_handler("t", lambda j, c: True)
+        p.register_handler("t", true_handler)
         p.seed_wall(["driver::spawner"])
         # 第一个 episode：consumerA 缺 child::a1（索引 0），同位置有可运行候选
         queue = [
@@ -548,7 +549,7 @@ class TestDependencyGrace:
         独立缺失场景）时重新授权，不被前一个已解决 episode 的截止吞掉。
         缺失依赖宽限期独立计时机制。"""
         p = _pipeline(tmp_path)
-        p.register_handler("t", lambda j, c: True)
+        p.register_handler("t", true_handler)
         p.seed_wall(["driver::spawner"])  # 候选依赖已满足
         queue = [
             J("t", "consumerA", depends_on=["child::a1"]).to_dict(),
@@ -580,7 +581,7 @@ class TestDependencyGrace:
         """同一缺失集合（持续未解决）→ 截止保持（不无限顺延），超时判死锁。"""
         import time as _t3
         p = _pipeline(tmp_path)
-        p.register_handler("t", lambda j, c: True)
+        p.register_handler("t", true_handler)
         p.seed_wall(["driver::spawner"])
         queue = [
             J("t", "consumer", depends_on=["child::c1"]).to_dict(),
