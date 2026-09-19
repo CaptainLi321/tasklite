@@ -6,6 +6,20 @@
 
 ## [Unreleased]
 
+兼容面清算与支持基线收缩窗口：移除为不存在下游保留的 API 垫片群与测试便利接缝，Python 支持基线升至 3.10。
+
+### 移除（向后不兼容）
+
+- **API 兼容垫片清算（八组）**：删除 `tasklite.exceptions` 的 PEP 562 动态转发（taxonomy 符号改由 `tasklite.taxonomy` 直接导入）、`engine/runtime` 历史 re-export 块、`PreflightPolicy = ExecutionPolicy` 与 `RecoveryMachine = RecoveryOrchestrator` 别名、`InFlightTracker` 的 register/dispatch/unregister/release_all_acquired 别名族、`CompletionMachine.cleanup_outputs` 死别名、`DeadlockDecision.__bool__` 布尔求值、`TransientRegistry` 兼容门面（注册表统一 `ErrorTaxonomy`）、`ExecutionPolicy.plan_retry` 位置参数双形态（收敛为仅关键字 `retry_error=` / `transient_kind=`）。
+- **Python 3.9 支持移除**：`requires-python` 升至 `>=3.10`，classifiers 与 test-matrix 同步收敛为 3.10–3.14 五解释器。
+
+### 变更（重构）
+
+- **注解书写现代化**：包内 28 文件 749 处 `Optional` / `Union` / `typing.Dict` 等旧式泛型迁移至 PEP 585/604 内置泛型与 `X | Y` 联合语法（`from __future__ import annotations` 全部保留；`engine/config` 的 `if False:` 伪静态导入块转正为标准 `TYPE_CHECKING`）。
+- **strict_picklable 默认 True**：run() 前 handler pickle 预检默认开启（fail-loud，spawn 上下文契约），单测 lambda handler 迁移为模块级函数或显式关闭。
+- **TaskContext 资源名校验恒生效**：`resource_names=None` 不再跳过 `suspend_resource` 的注册名校验（一律归一空冻结集合，空集即全拒绝）；`tasklite.testing.fake_ctx` 的 resources 缺省语义同步。
+- **测试补丁接缝拆除**：`tasklite.pipeline` 的零调用 `import time` monkeypatch 锚点删除，测试补丁迁移至真实时钟消费模块。
+
 ## [1.3.1] - 2026-09-19
 
 文档匿名化修订版：ADR-0001 上下文章节移除下游生态仓库实名清单，改以泛化表述指代。仅文档变更，无代码与公开 API 变化。
