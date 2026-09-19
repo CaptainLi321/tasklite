@@ -424,8 +424,12 @@ class TaskLite:
             )
         self._discovery_rerun[task_type] = rerun
 
-    def register_transient_exception(self, exception_cls: type) -> None:
+    def register_transient_exception(self, exception_cls: "type | Sequence[type]") -> None:
         """把业务自有异常类注册为瞬态（自动重试），**per-pipeline 语义**。
+
+        接受单个异常类或类序列（序列即批量注册，等价于逐个调用）；
+        文件系统环境异常的常用组合（``PermissionError`` /
+        ``BlockingIOError`` / ``ConnectionResetError``）直接以序列传入。
 
         注册表是本 pipeline 实例态——不同 pipeline 的注册互不可见、
         跨 run 不累积。分类决策发生在子进程，因此类必须为模块级
@@ -433,20 +437,9 @@ class TaskLite:
         显式下发子进程。
         """
         self._ensure_not_running("register_transient_exception")
-        self.taxonomy.register_transient(exception_cls)
-
-    def register_transient_exceptions(self, classes: Sequence[type]) -> None:
-        """批量注册瞬态异常类。"""
-        self._ensure_not_running("register_transient_exceptions")
+        classes = (exception_cls,) if isinstance(exception_cls, type) else tuple(exception_cls)
         for cls in classes:
-            self.register_transient_exception(cls)
-
-    def register_file_transients(
-        self,
-        classes: Sequence[type] = (PermissionError, BlockingIOError, ConnectionResetError),
-    ) -> None:
-        """把常见文件系统环境异常批量注册为瞬态（可重试）。"""
-        self.register_transient_exceptions(classes)
+            self.taxonomy.register_transient(cls)
 
 
     def uncompleted(self, jobs: Sequence[Job]) -> list[Job]:

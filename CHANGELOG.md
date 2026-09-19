@@ -14,6 +14,7 @@
 
 ### 移除（向后不兼容）
 
+- **瞬态注册入口合一**：`register_transient_exception` 收敛为唯一入口并接受单类或类序列双形态；批量垫片 `register_transient_exceptions` 与默认参数便捷入口 `register_file_transients` 移除（全部下游零调用）。
 - **落盘格式兼容垫片清算（DLQ 旧格式行）**：既有 DLQ 行缺失 `_attempt` 计数时不再按旧格式初始化、亦不再保留 incoming 显式计数——一律与损坏行同语义从 1 重计（全部下游 DLQ 已核实全带计数）。
 - **落盘格式兼容垫片清算（裸键迁移）**：加载期对旧落盘行顶层 `_commit_failures` 裸键的单点迁移删除——计数唯一表示收敛为 runtime 命名空间（全部下游落盘数据已核实无旧格式残留）。
 - **API 兼容垫片清算（八组）**：删除 `tasklite.exceptions` 的 PEP 562 动态转发（taxonomy 符号改由 `tasklite.taxonomy` 直接导入）、`engine/runtime` 历史 re-export 块、`PreflightPolicy = ExecutionPolicy` 与 `RecoveryMachine = RecoveryOrchestrator` 别名、`InFlightTracker` 的 register/dispatch/unregister/release_all_acquired 别名族、`CompletionMachine.cleanup_outputs` 死别名、`DeadlockDecision.__bool__` 布尔求值、`TransientRegistry` 兼容门面（注册表统一 `ErrorTaxonomy`）、`ExecutionPolicy.plan_retry` 位置参数双形态（收敛为仅关键字 `retry_error=` / `transient_kind=`）。

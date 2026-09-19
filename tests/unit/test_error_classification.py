@@ -25,6 +25,14 @@ class _ModuleLevelNetworkError(Exception):
     """模块级异常类（spawn 子进程可 pickle 的要求）。"""
 
 
+class _SeqFormA(Exception):
+    """注册形态测试用模块级异常（pickle 预检要求模块级）。"""
+
+
+class _SeqFormB(Exception):
+    """注册形态测试用模块级异常（pickle 预检要求模块级）。"""
+
+
 class TestTransientClassification:
     def test_connection_errors_are_transient(self):
         """连接类异常被自动归类为瞬态（无需包 RetryError）。"""
@@ -63,6 +71,16 @@ class TestTransientClassification:
         """register_transient_exception 拒绝非 Exception 类。"""
         with pytest.raises(TypeError):
             ErrorTaxonomy().register_transient(int)  # type: ignore
+
+    def test_pipeline_entry_accepts_single_and_sequence(self, tmp_path):
+        """TaskLite 入口单/批双形态：单类与类序列注册结果一致。"""
+        from tasklite import TaskLite
+
+        p = TaskLite("t-reg", state_dir=tmp_path)
+        p.register_transient_exception(_SeqFormA)
+        p.register_transient_exception((_SeqFormA, _SeqFormB))
+        snap = p.taxonomy.snapshot()
+        assert _SeqFormA in snap and _SeqFormB in snap
 
 
 class TestTransientAutoRetry:

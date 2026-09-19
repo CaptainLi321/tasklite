@@ -283,8 +283,7 @@ from tasklite import (
 
 > **主机生命周期与瞬态注册（直接由 `TaskLite` 原生提供）**：
 > - `pipeline.run_graceful()`：统一 run + 优雅停机包装（Ctrl+C 转 DRAINING，自然等在途完成后安全退出）；
-> - `pipeline.register_transient_exceptions([cls1, cls2])`：批量注册业务瞬态异常；
-> - `pipeline.register_file_transients()`：把常见文件系统异常批量注册为瞬态（`PermissionError/BlockingIOError/ConnectionResetError`）。
+> - `pipeline.register_transient_exception(exc_or_seq)`：注册业务瞬态异常——接受单个异常类或类序列（序列即批量注册）；文件系统环境异常常用组合（`PermissionError/BlockingIOError/ConnectionResetError`）直接以序列传入。
 
 
 ---
