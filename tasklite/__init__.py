@@ -4,7 +4,7 @@ A lightweight, battle-hardened task orchestration engine with zero external
 dependencies, process isolation, and ACID persistence.
 """
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 
 # Public API - Core

@@ -4,9 +4,9 @@
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [1.4.0] - 2026-09-20
 
-兼容面清算与支持基线收缩窗口：移除为不存在下游保留的 API 垫片群与测试便利接缝，Python 支持基线升至 3.10。
+兼容面清算与支持基线收缩版本：移除为不存在下游保留的 API 垫片群、落盘格式兼容垫片与测试便利接缝，Python 支持基线升至 3.10；新增 CI 流水线并完成 mypy 基础档零错误收敛。
 
 ### 新增
 
