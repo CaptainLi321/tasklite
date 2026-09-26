@@ -4,6 +4,12 @@
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 新增
+
+- **公开导出 `HandlerEntry` 与 `jsonutil`（`dumps` / `loads`）**：生态扩展包与下游此前只能经内部路径（`tasklite.pipeline` / `tasklite.utils.jsonutil`）引用，现提升为顶层公开 API——后续内部模块布局调整不再威胁生态消费方。
+
 ## [1.4.0] - 2026-09-20
 
 兼容面清算与支持基线收缩版本：移除为不存在下游保留的 API 垫片群、落盘格式兼容垫片与测试便利接缝，Python 支持基线升至 3.10；新增 CI 流水线并完成 mypy 基础档零错误收敛。

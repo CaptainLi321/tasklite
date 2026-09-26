@@ -65,6 +65,11 @@ from . import contrib
 # Public API - Resources
 from .engine.resource import CapacityResource, RateLimitResource, Resource
 
+# Public API - Handler 注册表与 JSON 序列化
+from .engine.types import HandlerEntry
+from .utils import jsonutil
+from .utils.jsonutil import dumps, loads
+
 __all__ = [
     # Core
     "TaskLite",
@@ -119,6 +124,11 @@ __all__ = [
     "sanitize_job_component",
     "sanitize_content_id",
     "safe_uid_filename",
+    # Handler 注册表与 JSON 序列化
+    "HandlerEntry",
+    "jsonutil",
+    "dumps",
+    "loads",
     # Contrib
     "contrib",
     # Resources
