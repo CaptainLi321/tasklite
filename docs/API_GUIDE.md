@@ -296,18 +296,20 @@ from tasklite import (
 ### 7.1 DLQ 查询与清除
 
 ```python
-entries = pipeline.list_dlq()            # 只读查询：[(uid, error_type, error, attempts, failed_at, meta)]
+entries = pipeline.list_dlq()            # 只读查询：DLQEntry 列表（含原始业务 payload 快照 job_payload）
 suspends = pipeline.list_suspends()      # 只读查询：当前仍生效的资源挂起（SuspendEntry 列表）
 n = pipeline.clear_dlq()        # 清除：删 DLQ 条目（默认保留 fatal=true），随后由调用方 enqueue 同名任务重跑
 n = pipeline.clear_dlq(task_types=["download"], keep_fatal=False)
 n = pipeline.clear_history("download::")   # 删除 wall/DLQ 条目（强制重下/垃圾清理）；"download::" 前缀匹配
 n = pipeline.clear_history("t::a", where=("wall",))   # 精确 uid；where 可选 "wall"/"failed"
+n = pipeline.clear_history("t::", predicate=lambda uid: not uid.endswith("::ok"))
+# 谓词清理：仅删 targets 命中且 predicate(uid) 为真的条目（官方批删通道，无需直连数据库）
 ```
 
-- **`list_dlq()`**：只读查询，返回结构化条目 `DLQEntry(uid, error_type, error, attempts, failed_at, meta)`。损坏行（非 dict meta / 非 int `_attempt`）被兜底为 unknown 分类展示，不炸查询。
+- **`list_dlq()`**：只读查询，返回结构化条目 `DLQEntry(uid, error_type, error, attempts, failed_at, meta, job_payload=None)`。损坏行（非 dict meta / 非 int `_attempt`）被兜底为 unknown 分类展示，不炸查询。`job_payload` 是失败任务原始业务 payload 的 JSON 快照（补跑自足，无需外部反查）；该任务未随失败落盘快照时为 `None`。
 - **`list_suspends()`**：只读查询当前仍生效的资源挂起（如 IEEE 配额挂起到次日午夜的「现在挂了谁、何时解封」）。返回 `SuspendEntry(resource, resume_at, remaining_seconds)` 列表，按解封时刻升序；已解封条目不返回。真相源是 meta 表（挂起只在 `run()` 启动期恢复进内存，run 外查内存恒为空）；坏数据降级告警跳过，不炸查询。
 - **`clear_dlq`**：清除 = 删 DLQ（**不自动 enqueue**，由调用方随后 `enqueue` 同名任务重跑）。默认保留 `fatal=true` 的确定性失败（`FatalError`），`keep_fatal=False` 一并删除；`task_types` 按 task_type 前缀过滤。
-- **`clear_history`**：完整 uid 精确删除；**以 `::` 结尾**的字符串按前缀匹配（防 `"download"` 误匹配 `"downloads::"`）。用于「手动误删文件强制重下」（wall 清掉该 uid）与历史垃圾清理。
+- **`clear_history`**：完整 uid 精确删除；**以 `::` 结尾**的字符串按前缀匹配（防 `"download"` 误匹配 `"downloads::"`）。可选 `predicate: Callable[[str], bool]`：对 targets 命中的 uid 逐条判定，返回 False 则保留——「按条件删历史」走官方通道，判定在 Python 侧、删除仍经后端事务接口。用于「手动误删文件强制重下」（wall 清掉该 uid）与历史垃圾清理。
 - **DLQ 结构化字段**：每条 DLQ 记录统一带 `error_type`（`fatal` / `dependency` / `deadlock` / `transient_exhausted` / `no_handler` / `validation` / `commit_failure` / `dispatch` / `unknown`）与 `failed_at`（UTC ISO 时间戳）——排障不用再翻整份日志。错误码登记于 `tasklite/taxonomy.py`。
 
 ### 7.2 种子化 API（存档迁移官方通道）
@@ -363,7 +365,7 @@ Job("sync", "artist_5", rerun="on_failure")       # 网络误失败自愈
 
 ## 9. 存储后端
 
-仅支持 **SQLite**（默认，WAL 模式 + `synchronous=FULL`；`backend` 参数也可传 `AbstractStateBackend` 实例，SQLite 是唯一内置实现）。断电不损坏数据库，已应答的事务保证落盘（确保断电不丢失已应答任务）。执行中事务回滚仍由 at-least-once 语义吸收（对应 job 重跑，不数据损坏）。
+仅支持 **SQLite**（默认，WAL 模式 + `synchronous=FULL`；`backend` 参数也可传 `AbstractStateBackend` 实例，内置 SQLite 与纯内存（测试专用）两种实现）。自定义后端须实现 `AbstractStateBackend` 全部抽象方法（含 DLQ 原始 payload 快照读取 `load_failed_payloads`，与 `commit_job_failure` 的可选 `job_payload` 参数）。断电不损坏数据库，已应答的事务保证落盘（确保断电不丢失已应答任务）。执行中事务回滚仍由 at-least-once 语义吸收（对应 job 重跑，不数据损坏）。
 
 **三条状态契约**（内存↔磁盘一致性，详见 `README.md「架构概览」`）：
 1. 内存 queue = 磁盘 queue − in-flight（commit 成功才从磁盘删除）；

@@ -359,7 +359,7 @@ class OpsConsole:
     def __init__(self, backend, store, taxonomy) -> None   # list_dlq 分类依赖 taxonomy
     def list_dlq(self) -> List[DLQEntry]
     def clear_dlq(self, task_types=None, *, keep_fatal=True) -> int
-    def clear_history(self, targets, *, where=("wall", "failed")) -> int
+    def clear_history(self, targets, *, where=("wall", "failed"), predicate=None) -> int
     def seed_wall(self, uids) -> int
     def seed_cursor(self, key, value) -> None
 ```
