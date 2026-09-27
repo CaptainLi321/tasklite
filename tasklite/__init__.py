@@ -68,7 +68,6 @@ from .engine.resource import CapacityResource, RateLimitResource, Resource
 # Public API - Handler 注册表与 JSON 序列化
 from .engine.types import HandlerEntry
 from .utils import jsonutil
-from .utils.jsonutil import dumps, loads
 
 __all__ = [
     # Core
@@ -127,8 +126,6 @@ __all__ = [
     # Handler 注册表与 JSON 序列化
     "HandlerEntry",
     "jsonutil",
-    "dumps",
-    "loads",
     # Contrib
     "contrib",
     # Resources

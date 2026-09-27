@@ -456,6 +456,15 @@ class TestPackageExports:
             f"  In __all__ but not imported/assigned: {exported - defined_names}"
         )
 
+    def test_json_serialization_namespaced_not_bare(self):
+        """JSON 序列化只经 jsonutil 命名空间导出——通用裸名不污染顶层命名空间。"""
+        import tasklite
+
+        assert not hasattr(tasklite, "dumps")
+        assert not hasattr(tasklite, "loads")
+        assert hasattr(tasklite, "jsonutil")
+        assert tasklite.jsonutil.dumps is not None
+
 
 # ── FATAL_EXCEPTIONS + Job defaults (from test_pipeline.py) ─────────────
 
