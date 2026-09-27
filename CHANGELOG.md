@@ -4,6 +4,14 @@
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.4.2] - 2026-09-27
+
+文档修订版：mark_seen 契约论证收敛为 ADR-0003。仅文档变更，无代码与公开 API 变化。
+
+### 文档
+
+- **ADR-0003（Discovery 已见语义维持现状）**：「记见不 spawn」原语的论证裁决归档为 ADR（`docs/adr/0003-discovery-seen-no-op-placeholder.md`），替代原独立论证长文——裁决不重开 S3/S4/T2 契约，「已见不处理」以占位任务表达，并记录 fetch 过滤前置判据与重开条件（实现方向、标记生命周期管理、on_missing 差集口径）。
+
 ## [1.4.1] - 2026-09-27
 
 运维补强版本：DLQ 条目携带原始业务 payload 快照（补跑自足）、历史清理支持谓词过滤（免裸 SQL 穿透）、收回顶层通用裸名导出；落盘格式 v1→v2 自动迁移。
@@ -299,7 +307,8 @@
 - 运维 API：`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`。
 - 优雅停机状态机：首次信号 DRAINING 停止派发并排空在途任务，二次信号 ABORTING 分类回收在途任务。
 
-[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.4.2...HEAD
+[1.4.2]: https://github.com/CaptainLi321/tasklite/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/CaptainLi321/tasklite/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/CaptainLi321/tasklite/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/CaptainLi321/tasklite/compare/v1.3.0...v1.3.1
