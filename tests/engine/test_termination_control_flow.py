@@ -327,7 +327,7 @@ class TestCommitFailedCrashContractBreach:
         """dep-failed 路径：commit 失败 + commit_failed_crash 正常返回
         → _reject_and_commit 正常返回，dispatch_dep_failed 返回 True。"""
         pipeline, jd = self._pipeline_with_state(tmp_path)
-        monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta: False)
+        monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta, job_payload=None: False)
         monkeypatch.setattr(
             pipeline._runtime.store, "commit_failed_crash",
             lambda uid, reason, job_dict: None,
@@ -340,7 +340,7 @@ class TestCommitFailedCrashContractBreach:
         """no-handler 路径：commit 失败 + commit_failed_crash 正常返回
         → 正常返回 True。"""
         pipeline, jd = self._pipeline_with_state(tmp_path)
-        monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta: False)
+        monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta, job_payload=None: False)
         monkeypatch.setattr(
             pipeline._runtime.store, "commit_failed_crash",
             lambda uid, reason, job_dict: None,
@@ -361,7 +361,7 @@ class TestCommitFailedCrashContractBreach:
         pipeline, jd = self._pipeline_with_state(tmp_path)
         pipeline.register_handler("t", true_handler, payload_schema=Schema)
         jd["payload"] = {"nope": 1}
-        monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta: False)
+        monkeypatch.setattr(pipeline.backend, "commit_job_failure", lambda uid, meta, job_payload=None: False)
         monkeypatch.setattr(
             pipeline._runtime.store, "commit_failed_crash",
             lambda uid, reason, job_dict: None,

@@ -21,7 +21,7 @@ logger = logging.getLogger("tasklite")
 
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class SQLiteStateBackend(AbstractStateBackend):
@@ -106,9 +106,11 @@ class SQLiteStateBackend(AbstractStateBackend):
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS failed_dlq (
                     uid TEXT PRIMARY KEY,
-                    payload TEXT
+                    payload TEXT,
+                    job_payload TEXT
                 )
             ''')
+            self._ensure_dlq_schema(conn)
             self._ensure_queue_schema(conn)
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS cursors (
@@ -146,6 +148,16 @@ class SQLiteStateBackend(AbstractStateBackend):
         except Exception as e:
             logger.critical(f"Failed to write meta '{key}' in {self.path.name}: {e}")
             raise
+
+    def _ensure_dlq_schema(self, conn) -> None:
+        """确保 failed_dlq 具备 job_payload 快照列（v1 → v2 的加列迁移）。
+
+        加列是纯增量变更，旧读方（只 SELECT uid/payload）不受影响；
+        旧行该列为 NULL，属合法状态。
+        """
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(failed_dlq)").fetchall()}
+        if "job_payload" not in cols:
+            conn.execute("ALTER TABLE failed_dlq ADD COLUMN job_payload TEXT")
 
     def _ensure_queue_schema(self, conn) -> None:
         """确保 queue 表使用当前 schema（uid PK + seq 保序列）。
@@ -228,6 +240,22 @@ class SQLiteStateBackend(AbstractStateBackend):
             raise RuntimeError(f"Failed to load failed DLQ from {self.path.name}: {e}") from e
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Corrupted failed DLQ payload in {self.path.name}: {e}") from e
+
+    def load_failed_payloads(self) -> dict[str, dict[str, Any]]:
+        """读取 DLQ 各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
+        if not self.path.exists():
+            return {}
+        try:
+            with self._get_conn() as conn:
+                cursor = conn.execute(
+                    'SELECT uid, job_payload FROM failed_dlq '
+                    'WHERE job_payload IS NOT NULL'
+                )
+                return {row[0]: loads(row[1]) for row in cursor}
+        except (sqlite3.Error, OSError) as e:
+            raise RuntimeError(f"Failed to load DLQ payloads from {self.path.name}: {e}") from e
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Corrupted DLQ job_payload in {self.path.name}: {e}") from e
 
     def load_queue(self) -> list[dict[str, Any]]:
         if not self.path.exists():
@@ -414,7 +442,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             return False
         return True
 
-    def _write_dlq_row(self, conn, uid: str, meta: dict) -> None:
+    def _write_dlq_row(self, conn, uid: str, meta: dict, job_payload: dict | None = None) -> None:
         """DLQ 行写入的单一出口。
 
         读既有 ``_attempt`` 计数 → 递增或初始化 → INSERT OR REPLACE。
@@ -432,12 +460,16 @@ class SQLiteStateBackend(AbstractStateBackend):
         推导）与 ``failed_at``（UTC ISO 时间戳）。所有 DLQ 写入路径（含死锁/级联/
         重试耗尽）都带分类与时间，list_dlq() 查询可直接按类型过滤。
 
+        ``job_payload`` 是原始业务 payload 的 JSON 快照（补跑用）；传 None
+        时保留既有快照不覆盖——无 payload 的写入路径（bulk 级联/append）
+        不得抹掉此前快照。
+
         调用方必须已通过 ``BEGIN IMMEDIATE`` 持写事务：SELECT 旧计数 →
         递增 → REPLACE 的序列在 autocommit 下会丢并发计数（两个连接
         各基于同一旧值 +1 落盘，只留一次）。
         """
         row = conn.execute(
-            'SELECT payload FROM failed_dlq WHERE uid = ?', (uid,)
+            'SELECT payload, job_payload FROM failed_dlq WHERE uid = ?', (uid,)
         ).fetchone()
         merged = dict(meta or {})
         if "error_type" not in merged:
@@ -455,16 +487,26 @@ class SQLiteStateBackend(AbstractStateBackend):
                 merged["_attempt"] = 1  # 既有记录损坏：从 1 重新计数
         else:
             merged["_attempt"] = 1
-        conn.execute('INSERT OR REPLACE INTO failed_dlq (uid, payload) VALUES (?, ?)',
-                     (uid, dumps(merged)))
+        effective_payload = job_payload if job_payload is not None else (
+            loads(row[1]) if row is not None and row[1] is not None else None
+        )
+        conn.execute(
+            'INSERT OR REPLACE INTO failed_dlq (uid, payload, job_payload) VALUES (?, ?, ?)',
+            (uid, dumps(merged), dumps(effective_payload) if effective_payload is not None else None),
+        )
 
-    def commit_job_failure(self, uid: str, result_meta: dict) -> bool:
+    def commit_job_failure(
+        self, uid: str, result_meta: dict, job_payload: dict | None = None
+    ) -> bool:
         """原子 delta：写 DLQ + 删除 popped uid + 清理 wall 旧记录。失败时 on-disk 队列不变。
 
         同 uid 多次失败时保留失败历史——DLQ 是 INSERT OR REPLACE
         （PK 覆盖），直接覆盖会丢失「这是第几次失败」。读取既有记录的
         ``_attempt`` 计数并递增后合并写入，让同一 uid 的失败历史可观测。
         写盘经 ``_write_dlq_row`` 单一出口（_attempt 计数路径收敛）。
+
+        ``job_payload`` 为原始业务 payload 快照，随 DLQ 行一并落盘（补跑
+        无需外部反查）；None 表示本次路径无 payload 可存（保留既有快照）。
 
         同一事务内 ``DELETE FROM wall``——rerun 任务重跑
         失败时 wall 里的旧成功记录必须作废（最终状态唯一）；否则磁盘
@@ -475,7 +517,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             with self._get_conn() as conn:
                 # _attempt 读-递增-写必须持写事务串行化（详见 _get_conn）。
                 conn.execute('BEGIN IMMEDIATE')
-                self._write_dlq_row(conn, uid, result_meta)
+                self._write_dlq_row(conn, uid, result_meta, job_payload)
                 conn.execute('DELETE FROM queue WHERE uid = ?', (uid,))
                 conn.execute('DELETE FROM wall WHERE uid = ?', (uid,))
         except Exception as e:

@@ -153,6 +153,99 @@ class TestDlqQuery:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# DLQ 业务 payload 快照（补跑自足，无需外部反查）
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _boom_handler(job, ctx):
+    raise RuntimeError("boom")
+
+
+class TestDlqJobPayload:
+    def test_failure_path_persists_payload(self, tmp_path):
+        """真实失败路径：DLQ 条目携带原始业务 payload 快照（list_dlq 可读）。"""
+        p = _pipeline(tmp_path)
+        p.register_handler("t", _boom_handler)
+        p.enqueue([Job("t", "x", payload={"artist": "a", "sec_uid": "s"}, max_retries=0)])
+        p.run()
+        entries = {e.uid: e for e in p.list_dlq()}
+        assert entries["t::x"].job_payload == {"artist": "a", "sec_uid": "s"}
+
+    def test_backend_commit_and_load_roundtrip(self, tmp_path):
+        """后端直写：commit_job_failure 存快照，load_failed_payloads 读回。"""
+        p = _pipeline(tmp_path)
+        assert p.backend.commit_job_failure("t::x", {"error": "boom"}, job_payload={"k": "v"})
+        assert p.backend.load_failed_payloads() == {"t::x": {"k": "v"}}
+        entry = {e.uid: e for e in p.list_dlq()}["t::x"]
+        assert entry.job_payload == {"k": "v"}
+        assert entry.job_payload is not entry.meta, "快照与失败元数据必须分列"
+
+    def test_none_payload_keeps_previous_snapshot(self, tmp_path):
+        """无 payload 的写入路径（append/覆盖写）不得抹掉既有快照。"""
+        p = _pipeline(tmp_path)
+        p.backend.commit_job_failure("t::x", {"error": "first"}, job_payload={"k": 1})
+        p.backend.append_failed("t::x", {"error": "second"})
+        assert p.backend.load_failed_payloads()["t::x"] == {"k": 1}
+
+    def test_latest_payload_wins_on_repeat_failure(self, tmp_path):
+        p = _pipeline(tmp_path)
+        p.backend.commit_job_failure("t::x", {"error": "a"}, job_payload={"v": 1})
+        p.backend.commit_job_failure("t::x", {"error": "b"}, job_payload={"v": 2})
+        assert p.backend.load_failed_payloads()["t::x"] == {"v": 2}
+
+    def test_no_snapshot_entry_absent_from_payload_view(self, tmp_path):
+        p = _pipeline(tmp_path)
+        p.backend.append_failed("t::y", {"error": "x"})
+        assert p.backend.load_failed_payloads() == {}
+        assert {e.uid: e for e in p.list_dlq()}["t::y"].job_payload is None
+
+    def test_memory_backend_parity(self):
+        """内存后端同语义：快照存取/保留/清理与 SQLite 后端一致。"""
+        from tasklite.backend.memory import InMemoryStateBackend
+        b = InMemoryStateBackend()
+        assert b.commit_job_failure("t::x", {"error": "a"}, job_payload={"k": 1})
+        assert b.load_failed_payloads() == {"t::x": {"k": 1}}
+        assert b.commit_job_failure("t::x", {"error": "b"})
+        assert b.load_failed_payloads()["t::x"] == {"k": 1}, "None 不得抹掉既有快照"
+        assert b.delete_failed(["t::x"]) == 1
+        assert b.load_failed_payloads() == {}
+
+    def test_unserializable_payload_degrades_without_breaking_commit(self, tmp_path):
+        """payload 不可序列化时降级为 None：正常失败提交不得误触 3-strike。"""
+        p = _pipeline(tmp_path)
+        jd = Job("t", "x", payload={"ok": 1}).to_dict()
+        jd["payload"] = {"bad": object()}
+        assert p._runtime.store._extract_job_payload(jd) is None
+        # 端到端：降级后 commit 仍成功，DLQ 正常记账
+        sanitized = {"error": "boom"}
+        assert p.backend.commit_job_failure(
+            "t::x", sanitized, job_payload=p._runtime.store._extract_job_payload(jd)
+        )
+        assert "t::x" in p.backend.load_failed()
+        assert p.backend.load_failed_payloads() == {}
+
+    def test_v1_schema_migrated_additively(self, tmp_path):
+        """v1 旧库打开：加列迁移不丢数据、版本号推进、旧行照常可读。"""
+        import sqlite3
+        db_path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE failed_dlq (uid TEXT PRIMARY KEY, payload TEXT)")
+        conn.execute('INSERT INTO failed_dlq VALUES (\'t::old\', \'{"error": "boom"}\')')
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+        conn.close()
+
+        b = SQLiteStateBackend(db_path)
+        cols = {
+            c[1] for c in sqlite3.connect(db_path).execute("PRAGMA table_info(failed_dlq)")
+        }
+        assert "job_payload" in cols
+        assert sqlite3.connect(db_path).execute("PRAGMA user_version").fetchone()[0] == 2
+        assert b.load_failed()["t::old"]["error"] == "boom"
+        assert b.load_failed_payloads() == {}
+
+
+# ══════════════════════════════════════════════════════════════════════
 # clear_dlq（清除 = 删 DLQ + 重新 enqueue）
 # ══════════════════════════════════════════════════════════════════════
 
@@ -387,7 +480,7 @@ class TestBulkFailureThreeStrike:
         self._init_state(p)
         jd = Job("t", "a").to_dict()
         jd["runtime"] = {"_commit_failures": 3}  # 已连续失败 3 次
-        monkeypatch.setattr(p.backend, "commit_job_failure", lambda uid, meta: False)
+        monkeypatch.setattr(p.backend, "commit_job_failure", lambda uid, meta, job_payload=None: False)
 
         queue, kept = p._runtime.store.commit_bulk_failed_crash(
             "test", [("t::a", {"error": "x"})], [jd]
@@ -413,7 +506,7 @@ class TestBulkFailureThreeStrike:
         # 非 run 真实路径）——下方 enqueue 仅用于确保磁盘队列有该 uid
         # 基线状态，断言目标是内存 `_state` 队列。
         p.enqueue([Job("t", "a", payload={})])
-        monkeypatch.setattr(p.backend, "commit_job_failure", lambda uid, meta: False)
+        monkeypatch.setattr(p.backend, "commit_job_failure", lambda uid, meta, job_payload=None: False)
 
         # _commit_failures=2 → failures=3 达阈值 → DLQ 也失败 → 回 crash
         with pytest.raises(_CommitCrashSignal):

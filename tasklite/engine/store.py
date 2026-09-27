@@ -40,6 +40,7 @@ class DLQEntry(NamedTuple):
     - ``attempts``: 累计写入 DLQ 的次数 (_attempt 计数)
     - ``failed_at``: 最近一次失败时间 (UTC ISO 8601 字符串或 None)
     - ``meta``: 完整 DLQ payload 字典视图
+    - ``job_payload``: 原始业务 payload 快照 (未随失败落盘快照时为 None)
     """
 
     uid: str
@@ -48,6 +49,7 @@ class DLQEntry(NamedTuple):
     attempts: int
     failed_at: str | None
     meta: dict[str, Any]
+    job_payload: dict[str, Any] | None = None
 
 
 __all__ = [
@@ -391,7 +393,8 @@ class StateStore:
     ) -> FailureOutcome:
         """原子终态转移：永久失败（进入 DLQ）。"""
         sanitized_meta = self._taxonomy.normalize_dlq_meta(error_meta)
-        committed = self._backend.commit_job_failure(uid, sanitized_meta)
+        job_payload = self._extract_job_payload(job_dict)
+        committed = self._backend.commit_job_failure(uid, sanitized_meta, job_payload)
 
         if committed:
             self._state.mark_failed(uid, sanitized_meta)
@@ -404,6 +407,28 @@ class StateStore:
 
         self.commit_failed_crash(uid, sanitized_meta.get("error", "commit_job_failure"), job_dict)
         return FailureOutcome(uid=uid, error_meta=sanitized_meta)
+
+    @staticmethod
+    def _extract_job_payload(job_dict: dict[str, Any] | None) -> dict[str, Any] | None:
+        """提取可 JSON 序列化的业务 payload 快照（DLQ 落盘用）。
+
+        不可序列化时降级为 None 并告警，绝不让快照失败把正常失败提交
+        打成 commit failure（那会误触 3-strike 崩溃契约）。
+        """
+        if not isinstance(job_dict, dict):
+            return None
+        payload = job_dict.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        try:
+            dumps(payload)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Job payload for {job_dict.get('job_id', '?')} is not "
+                f"JSON-serializable; DLQ payload snapshot skipped."
+            )
+            return None
+        return payload
 
     def apply_retry(
         self,
@@ -503,7 +528,8 @@ class StateStore:
             failures = self._register_commit_failure(jd)
             if failures >= self._threshold:
                 single_committed = self._backend.commit_job_failure(
-                    uid, {"error": ERR_COMMIT_FAILURE_DLQ, "commit_failures": failures, "fatal": True}
+                    uid, {"error": ERR_COMMIT_FAILURE_DLQ, "commit_failures": failures, "fatal": True},
+                    job_payload=self._extract_job_payload(jd),
                 )
                 if single_committed:
                     queue = [j for j in queue if uid_from_job_dict(j) != uid]
@@ -582,7 +608,9 @@ class StateStore:
             failures = self._register_commit_failure(jd)
             if failures >= self._threshold:
                 dlq_meta = meta_by_uid[uid]
-                single_committed = self._backend.commit_job_failure(uid, dlq_meta)
+                single_committed = self._backend.commit_job_failure(
+                    uid, dlq_meta, job_payload=self._extract_job_payload(jd)
+                )
                 if single_committed:
                     self.apply_failed(uid, dlq_meta, unregister=False)
                     self._record_stat("failed", 1)
@@ -641,7 +669,9 @@ class StateStore:
                 "fatal": True,
                 "commit_failures": failures,
             }
-            dlq_committed = self._backend.commit_job_failure(uid, dlq_meta)
+            dlq_committed = self._backend.commit_job_failure(
+                uid, dlq_meta, job_payload=self._extract_job_payload(job_dict)
+            )
             if dlq_committed:
                 self.apply_failed(uid, dlq_meta)
                 self._record_stat("failed", 1)

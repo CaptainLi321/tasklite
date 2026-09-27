@@ -28,6 +28,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         self._lock = threading.RLock()
         self._wall: dict[str, dict[str, Any]] = {}
         self._failed: dict[str, dict[str, Any]] = {}
+        self._failed_payloads: dict[str, dict[str, Any]] = {}
         self._cursors: dict[str, str] = {}
         self._queue: list[dict[str, Any]] = []
         self._meta: dict[str, str] = {}
@@ -39,6 +40,11 @@ class InMemoryStateBackend(AbstractStateBackend):
     def load_failed(self) -> dict[str, dict[str, Any]]:
         with self._lock:
             return copy.deepcopy(self._failed)
+
+    def load_failed_payloads(self) -> dict[str, dict[str, Any]]:
+        """读取 DLQ 各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
+        with self._lock:
+            return copy.deepcopy(self._failed_payloads)
 
     def load_cursors(self) -> dict[str, str]:
         with self._lock:
@@ -156,6 +162,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 # 成功 commit 清理 failed 同名残行：与「job 最终状态唯一」
                 # 语义一致，防 wall∩failed 并存污染 _attempt 计数。
                 self._failed.pop(uid, None)
+                self._failed_payloads.pop(uid, None)
                 self._cursors.update(cursor_sets)
                 for k in cursor_dels:
                     self._cursors.pop(k, None)
@@ -164,7 +171,9 @@ class InMemoryStateBackend(AbstractStateBackend):
                 logger.critical(f"Failed to commit job success for {uid}: {e}")
                 return False
 
-    def commit_job_failure(self, uid: str, result_meta: dict) -> bool:
+    def commit_job_failure(
+        self, uid: str, result_meta: dict, job_payload: dict[str, Any] | None = None
+    ) -> bool:
         with self._lock:
             try:
                 # 校验先行：DLQ 终值计算与队列 uid 提取全部在变更前完成，
@@ -172,6 +181,10 @@ class InMemoryStateBackend(AbstractStateBackend):
                 new_meta = self._build_dlq_meta(result_meta, self._failed.get(uid))
                 remaining = [j for j in self._queue if uid_from_job_dict(j) != uid]
                 self._failed[uid] = new_meta
+                # payload 快照 latest-wins；None 表示本路径无 payload，保留既有
+                # 快照（与 SQLite 后端 _write_dlq_row 的保留语义对齐）。
+                if job_payload is not None:
+                    self._failed_payloads[uid] = copy.deepcopy(job_payload)
                 self._queue = remaining
                 # 同一事务语义内清理 wall 旧记录：rerun 任务重跑失败时旧成功
                 # 记录作废（最终状态唯一），防 wall∩failed 并存。
@@ -295,6 +308,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             for u in del_set:
                 if u in self._failed:
                     del self._failed[u]
+                    self._failed_payloads.pop(u, None)
                     count += 1
             return count
 

@@ -108,6 +108,7 @@ class OpsConsole:
     def list_dlq(self) -> list[DLQEntry]:
         """只读查询 DLQ，返回结构化条目（uid / error_type / error / attempts / failed_at / meta）。"""
         failed = self._backend.load_failed()
+        payloads = self._backend.load_failed_payloads()
         entries: list[DLQEntry] = []
         for uid, meta in sorted(failed.items()):
             if not isinstance(meta, dict):
@@ -119,6 +120,7 @@ class OpsConsole:
                         attempts=0,
                         failed_at=None,
                         meta={},
+                        job_payload=payloads.get(uid),
                     )
                 )
                 continue
@@ -133,6 +135,7 @@ class OpsConsole:
                     attempts=attempts,
                     failed_at=meta.get("failed_at"),
                     meta=dict(meta),
+                    job_payload=payloads.get(uid),
                 )
             )
         return entries

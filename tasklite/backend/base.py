@@ -45,6 +45,10 @@ class AbstractStateBackend(ABC):
     def load_failed(self) -> dict[str, dict[str, Any]]: ...
 
     @abstractmethod
+    def load_failed_payloads(self) -> dict[str, dict[str, Any]]:
+        """读取 DLQ 各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
+
+    @abstractmethod
     def load_cursors(self) -> dict[str, str]: ...
 
     @abstractmethod
@@ -113,10 +117,14 @@ class AbstractStateBackend(ABC):
         self,
         uid: str,
         result_meta: dict,
+        job_payload: dict[str, Any] | None = None,
     ) -> bool:
         """Persist a failed job to the DLQ as a delta, atomically.
 
         Effects: failed_dlq INSERT/REPLACE uid -> result_meta; queue DELETE uid.
+        ``job_payload`` is the original business payload snapshot stored
+        alongside the failure meta (for retry tooling); None keeps any
+        previously stored snapshot intact.
         Returns True on success. Returns False if persistence failed — on
         failure the backend MUST leave the on-disk queue unchanged (the popped
         uid remains on disk); the caller is responsible for deciding whether to
