@@ -4,11 +4,26 @@
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [1.4.1] - 2026-09-27
+
+运维补强版本：DLQ 条目携带原始业务 payload 快照（补跑自足）、历史清理支持谓词过滤（免裸 SQL 穿透）、收回顶层通用裸名导出；落盘格式 v1→v2 自动迁移。
 
 ### 新增
 
-- **公开导出 `HandlerEntry` 与 `jsonutil`（`dumps` / `loads`）**：生态扩展包与下游此前只能经内部路径（`tasklite.pipeline` / `tasklite.utils.jsonutil`）引用，现提升为顶层公开 API——后续内部模块布局调整不再威胁生态消费方。
+- **公开导出 `HandlerEntry` 与 `jsonutil` 命名空间**：生态扩展包与下游此前只能经内部路径（`tasklite.pipeline` / `tasklite.utils.jsonutil`）引用，现提升为顶层公开 API——后续内部模块布局调整不再威胁生态消费方（不含顶层 `dumps` / `loads` 裸名，见「变更」）。
+- **DLQ 业务 payload 快照**：`failed_dlq` 表新增 `job_payload` 快照列（schema v1→v2 纯加列迁移，旧库打开时自动升级，旧行 NULL 合法）；失败提交路径自动把原始业务 payload 随失败元数据落盘（3-strike 崩溃兜底路径同步携带；不可序列化 payload 降级为 None 并告警，不误触崩溃契约；无 payload 的写入路径保留既有快照）。新增后端契约 `load_failed_payloads()`（SQLite / 内存双后端对齐），`list_dlq()` 条目新增 `job_payload` 字段透出——补跑失败任务不再需要外部反查参数。
+- **谓词式历史清理（`clear_history` 的 `predicate` 参数）**：对 targets 命中的 uid 逐条判定，返回 False 则保留；判定在 Python 侧、删除仍经后端批量删除接口（WAL 校验与写事务纪律之内）——「按条件删历史」不再需要直连数据库穿透。
+
+### 变更（向后不兼容）
+
+- **收回顶层 `dumps` / `loads` 裸名导出**：JSON 序列化仅经 `tasklite.jsonutil` 命名空间公开（顶层裸名通用性过强，易与使用方命名空间混淆）；下游请改用 `from tasklite import jsonutil` 或 `from tasklite.jsonutil import dumps`。
+- **`DLQEntry` 新增第 7 字段 `job_payload`（默认 None）**：关键字访问与构造向后兼容；按位置解包全部字段的消费方需改为属性访问。
+- **`AbstractStateBackend` 新增抽象方法 `load_failed_payloads`**：自定义后端子类须同步实现（内置 SQLite / 内存双后端已对齐）；`commit_job_failure` 新增可选参数 `job_payload`（有默认值，向后兼容）。
+
+### 文档
+
+- API_GUIDE 运维章节与架构文档同步上述新公开 API 面。
+- 新增 discovery「记见不 spawn」原语契约论证文档（`docs/DISCOVERY-SEEN-CONTRACT.md`）——论证结论为维持现状（以占位任务表达「已见不处理」），原语暂不实现。
 
 ## [1.4.0] - 2026-09-20
 
@@ -284,7 +299,9 @@
 - 运维 API：`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`。
 - 优雅停机状态机：首次信号 DRAINING 停止派发并排空在途任务，二次信号 ABORTING 分类回收在途任务。
 
-[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/CaptainLi321/tasklite/compare/v1.4.0...v1.4.1
+[1.4.0]: https://github.com/CaptainLi321/tasklite/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/CaptainLi321/tasklite/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/CaptainLi321/tasklite/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/CaptainLi321/tasklite/compare/v1.2.1...v1.2.2
