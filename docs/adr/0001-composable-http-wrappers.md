@@ -5,7 +5,7 @@
 1. **429 速率限制退避逻辑碎片化**：不同下游各自手写 `time.sleep`、`Retry-After` 解析与异常抛出，容易误烧重试预算或造成子进程占死 worker 槽位；
 2. **Netscape `cookies.txt` 解析重复造轮子**：多个项目重复手写基于 `MozillaCookieJar` 或文本行分割的 cookie 解析与覆盖逻辑；
 3. **缺少统一的请求幂等快照（Raw HTTP Snapshots）**：爬虫调试或增量重跑时，重复向源站发送相同的静态 GET 请求，增加风控封禁风险；
-4. **底层库选型差异巨大**：部分平台依赖 `urllib`，部分重度依赖 `requests.Session` 并挂载复杂签名与受保护头（如抖音 `a_bogus`/`uifid`），另有部分依赖 `httpx` 或 GraphQL 客户端。
+4. **底层库选型差异巨大**：部分平台依赖 `urllib`，部分重度依赖 `requests.Session` 并挂载复杂签名与自研防爬头（动态签名参数、设备指纹等），另有部分依赖 `httpx` 或 GraphQL 客户端。
 
 ---
 

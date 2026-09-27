@@ -434,7 +434,7 @@ class http_guard:
 
         Args:
             ctx: 当前任务的 TaskContext（用于调用 `ctx.suspend_resource`）。
-            resource: 关联的限速资源名称（如 'api_pixiv'）。
+            resource: 关联的限速资源名称（如 'api_main'）。
             policy: 状态码与异常分类规则器（默认使用标准 HttpPolicy）。
             default_suspend_ttl: 遭遇 429 且未提供 Retry-After 时的默认挂起秒数。
         """
