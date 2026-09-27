@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .store import DLQEntry, StateStore
 from .resource import META_RESOURCE_SUSPENDS
@@ -180,8 +180,15 @@ class OpsConsole:
         targets: str | Sequence[str],
         *,
         where: Sequence[str] = ("wall", "failed"),
+        predicate: Callable[[str], bool] | None = None,
     ) -> int:
-        """从 wall 和/或 DLQ 删除条目。"""
+        """从 wall 和/或 DLQ 删除条目。
+
+        ``predicate`` 提供官方的「Python 侧判定 + 定向批删」通道：对
+        targets 命中的 uid 逐条调用，返回 False 则保留。判定在本进程
+        完成、删除仍走后端批量删除接口，业务无需再裸连数据库绕过
+        WAL 校验与写事务纪律。
+        """
         if isinstance(targets, str):
             patterns = [targets]
         elif isinstance(targets, (list, tuple)):
@@ -189,13 +196,18 @@ class OpsConsole:
         else:
             raise TypeError(
                 f"targets must be a str or a list/tuple of str, "
-                f"got {type(targets).__name__}"
+                f"got {type(targets).__name__} ({targets!r})"
             )
         for p in patterns:
             if not isinstance(p, str):
                 raise TypeError(
                     f"targets must contain only str, got {type(p).__name__} ({p!r})"
                 )
+        if predicate is not None and not callable(predicate):
+            raise TypeError(
+                f"predicate must be callable or None, "
+                f"got {type(predicate).__name__}"
+            )
         if not isinstance(where, (list, tuple)):
             raise TypeError(
                 f"where must be a sequence of 'wall'/'failed', got {type(where).__name__}"
@@ -209,10 +221,11 @@ class OpsConsole:
             )
 
         def _matches(uid: str) -> bool:
-            return any(
+            hit = any(
                 uid == p or (p.endswith("::") and uid.startswith(p))
                 for p in patterns
             )
+            return hit and (predicate is None or predicate(uid))
 
         state = self._store.state
         total = 0

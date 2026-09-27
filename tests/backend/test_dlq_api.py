@@ -340,6 +340,42 @@ class TestForget:
         assert set(p.backend.load_wall()) == {"t::b"}
 
 
+class TestPredicateClearHistory:
+    def test_predicate_filters_within_target_prefix(self, tmp_path):
+        """谓词只在 targets 命中集内收敛删除面：前缀外 uid 不进判定。"""
+        p = _pipeline(tmp_path)
+        p.seed_wall(["t::a", "t::b", "other::c"])
+        assert p.clear_history("t::", predicate=lambda u: u == "t::a") == 1
+        assert set(p.backend.load_wall()) == {"t::b", "other::c"}
+
+    def test_predicate_applies_to_wall_and_failed(self, tmp_path):
+        p = _pipeline(tmp_path)
+        p.seed_wall(["t::keep", "t::drop"])
+        p.backend.append_failed("t::keep", {"error": "x"})
+        p.backend.append_failed("t::drop", {"error": "x"})
+        assert p.clear_history("t::", predicate=lambda u: "drop" in u) == 2
+        assert set(p.backend.load_wall()) == {"t::keep"}
+        assert set(p.backend.load_failed()) == {"t::keep"}
+
+    def test_predicate_receives_matched_uids(self, tmp_path):
+        p = _pipeline(tmp_path)
+        p.seed_wall(["t::a", "t::b"])
+        seen: list[str] = []
+        p.clear_history("t::", predicate=seen.append)
+        assert sorted(seen) == ["t::a", "t::b"]
+
+    def test_predicate_none_keeps_default_semantics(self, tmp_path):
+        p = _pipeline(tmp_path)
+        p.seed_wall(["t::a", "t::b"])
+        assert p.clear_history("t::", predicate=None) == 2
+        assert p.backend.load_wall() == {}
+
+    def test_predicate_rejects_non_callable(self, tmp_path):
+        p = _pipeline(tmp_path)
+        with pytest.raises(TypeError, match="predicate"):
+            p.clear_history("t::", predicate="t::a")  # type: ignore[arg-type]
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 种子化 API + sanitize 公开
 # ══════════════════════════════════════════════════════════════════════

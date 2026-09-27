@@ -537,10 +537,15 @@ class TaskLite:
         targets: str | Sequence[str],
         *,
         where: Sequence[str] = ("wall", "failed"),
+        predicate: Callable[[str], bool] | None = None,
     ) -> int:
-        """从 wall 和/或 DLQ 删除条目。委托 OpsConsole。"""
+        """从 wall 和/或 DLQ 删除条目。委托 OpsConsole。
+
+        ``predicate`` 可选：对 targets 命中的 uid 逐条判定，返回 False
+        则保留（官方的 Python 侧判定 + 定向批删通道，替代裸 SQL 穿透）。
+        """
         self._ensure_not_running("clear_history")
-        return self._console.clear_history(targets, where=where)
+        return self._console.clear_history(targets, where=where, predicate=predicate)
 
     def seed_wall(self, uids: Sequence[str]) -> int:
         """把 uid 批量写入 wall。委托 OpsConsole。"""
