@@ -1,11 +1,9 @@
-"""TaskLite v2 子包：Task/Job/Attempt 三层模型的并行重建（ADR-0004）。
+"""TaskLite v2 子包：Task/Job/Attempt 三层模型（ADR-0004）。
 
-v2 在 ``tasklite/v2/`` 下从零重写：架构照搬 v1 的机器分工与系统级不变式，
-命名与模型按 ADR-0004 重塑——Task 为进程内注册的静态规格模板，Job 为
-一次有界激活的逻辑实例（uid = task_type::job_id 身份不变），Attempt 为
-append-only 的执行轨迹；``sanitize_*`` 家族更名为 ``encode_*`` 单射编码族；
-「DLQ / 死信」术语更换为「失败档案 failed」；backoff 机制砍除，重试节奏
-由 RequeuePolicy seam 接管。
+模型：Task 为进程内注册的静态规格模板；Job 为一次有界激活的逻辑实例
+（uid = task_type::job_id）；Attempt 为 append-only 的执行轨迹。编码族
+统一 ``encode_*`` 可逆单射转义；失败终态集合称「失败档案 failed」；
+重试节奏由 RequeuePolicy seam 收敛，核心不含退避与排序计算。
 
 隔离红线：v2 严禁 import v1——``tasklite.v2`` 不依赖旧树任何模块，保证
 独立演进与最终整体替换；v1 处于冻结期，仅允许缺陷修复。
