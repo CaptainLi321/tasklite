@@ -59,9 +59,20 @@
 
 ---
 
-## 三、文档与权威索引
+## 三、v2 双包期红线（重建期，详见 [`docs/adr/0004-v2-parallel-rebuild.md`](docs/adr/0004-v2-parallel-rebuild.md)）
+
+1. **v2 位置与隔离**：v2 位于 `tasklite/v2/`，从零重写——架构照搬 v1，命名与 Task/Job/Attempt 三层模型按 ADR-0004 重塑；**v2 严禁 import v1**；v1 冻结（仅允许缺陷修复，禁止新特性）。
+2. **v2 分层红线镜像**：`v2/models/` 严禁 import `v2/engine/`（IPC 声明读写下沉 `v2/utils/ipc.py`）；`v2/utils/` 严禁 import `v2/wrappers/`；v2 核心层严禁依赖 `v2/contrib/`。
+3. **v2 术语红线**：禁用 `sanitize` / `taxonomy` / `DLQ` 旧词——编码族统一 `encode_*`，错误分类统一 `ErrorClassifier`（`errorclass.py`），失败集合统一「失败档案 failed」（`FailureEntry` / `list_failures`）。
+4. **v2 无调度逻辑**：核心内禁止排序计算与退避计算（backoff 全族已砍除）；重试节奏与候选排序一律经 OrderingPolicy / RequeuePolicy seam 以 wrapper/util 形态扩展；Job 模型不携带 priority / deadline / period 字段。
+5. **迁移原则**：代码与注释迁移原则（不变式必迁、历史叙事必删、时序防护转测试、书写新标准）见 ADR-0004；v2 测试置于 `tests/v2/`，每单元原子提交且全量测试全绿（沿用红线 1）。
+
+---
+
+## 四、文档与权威索引
 
 - **引擎架构总览与概念词典**：[`docs/ENGINE_ARCHITECTURE.md`](docs/ENGINE_ARCHITECTURE.md)
+- **架构决策记录（ADR）**：[`docs/adr/`](docs/adr/)（v2 重建总纲：ADR-0004）
 - **文档唯一总纲**：[`README.md`](README.md)
 - **完整 API 参考与运维手册**：[`docs/API_GUIDE.md`](docs/API_GUIDE.md)
 - **Discovery 需求契约**：[`tasklite/wrappers/discovery.py`](tasklite/wrappers/discovery.py)
