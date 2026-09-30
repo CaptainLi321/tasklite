@@ -5,6 +5,7 @@
 """
 from .attempt import ATTEMPT_OUTCOMES, AttemptRecord
 from .job import Job, JobRuntimeState
+from .state import PipelineState, uid_from_job_dict
 from .task import Task, TaskRegistry
 
 __all__ = [
@@ -12,6 +13,8 @@ __all__ = [
     "AttemptRecord",
     "Job",
     "JobRuntimeState",
+    "PipelineState",
     "Task",
     "TaskRegistry",
+    "uid_from_job_dict",
 ]
