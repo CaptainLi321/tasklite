@@ -8,9 +8,10 @@ resources、payload_schema 与默认重试/超时策略。代码即规格，不�
 规格位字段在构造时可覆盖这些默认；实例位字段（attempt_no /
 activation_no / first_enqueued_at）只属于单次激活，不出现在 Task。
 
-本模块同时承载模型层共享的数值校验单点（``validate_resource_amounts``
-与 ``_is_finite``）：Task 的 default_resources 与 Job 的 resources /
-timeout 共用同一套拒绝规则，单点维护防止两侧语义漂移。
+本模块同时承载模型层共享的校验单点（``validate_task_type`` /
+``validate_retry_budget`` / ``validate_timeout`` / ``validate_timeout_flag``
+/ ``validate_resource_amounts``）：Task 的规格字段与 Job 的同名字段共用
+同一套拒绝规则与报错文案，单点维护防止两侧语义漂移。
 """
 from __future__ import annotations
 
@@ -70,8 +71,11 @@ def validate_resource_amounts(resources: Any, where: str = "resources") -> None:
             )
 
 
-def _validate_task_type(task_type: Any) -> None:
-    """task_type 入口校验：非空 str 且不含 '::'（uid 分隔符）。"""
+def validate_task_type(task_type: Any) -> None:
+    """task_type 入口校验：非空 str 且不含 '::'（uid 分隔符）。
+
+    Task 规格与 Job 实例共用（同名同规则），报错文案为两侧单一真相。
+    """
     if not isinstance(task_type, str):
         raise TypeError(
             f"task_type must be a str, got {type(task_type).__name__} ({task_type!r})"
@@ -103,8 +107,8 @@ def _validate_payload_schema(payload_schema: Any) -> None:
         )
 
 
-def _validate_retry_budget(max_retries: Any) -> None:
-    """max_retries 入口校验：非 bool 的 int 且 >= 0。
+def validate_retry_budget(max_retries: Any) -> None:
+    """max_retries 入口校验：非 bool 的 int 且 >= 0（Task/Job 共用）。
 
     isinstance 检查必须在 < 0 之前——字符串脏数据会先触发比较处的原始
     TypeError，友好报错失效。
@@ -118,8 +122,8 @@ def _validate_retry_budget(max_retries: Any) -> None:
         raise ValueError(f"max_retries must be >= 0, got {max_retries}")
 
 
-def _validate_timeout(timeout: Any) -> None:
-    """timeout 入口校验：有限正数。
+def validate_timeout(timeout: Any) -> None:
+    """timeout 入口校验：有限正数（Task/Job 共用）。
 
     NaN 使 ``timeout <= 0`` 校验恒 False 而漏过（NaN <= 0 为 False），
     deadline = monotonic + NaN = NaN，``now > NaN`` 恒 False → 看门狗
@@ -134,8 +138,8 @@ def _validate_timeout(timeout: Any) -> None:
         raise ValueError(f"timeout must be finite and > 0, got {timeout}")
 
 
-def _validate_timeout_flag(timeout_is_transient: Any) -> None:
-    """timeout_is_transient 入口校验：必须为 bool。
+def validate_timeout_flag(timeout_is_transient: Any) -> None:
+    """timeout_is_transient 入口校验：必须为 bool（Task/Job 共用）。
 
     非 bool 值（如字符串）在执行侧的 ``job.timeout_is_transient`` 判断时
     被当作真值，静默改变超时归类语义，入口拒绝。
@@ -180,12 +184,12 @@ class Task:
     timeout_is_transient: bool = False
 
     def __post_init__(self) -> None:
-        _validate_task_type(self.task_type)
+        validate_task_type(self.task_type)
         _validate_handler(self.handler)
         _validate_payload_schema(self.payload_schema)
-        _validate_retry_budget(self.max_retries)
-        _validate_timeout(self.timeout)
-        _validate_timeout_flag(self.timeout_is_transient)
+        validate_retry_budget(self.max_retries)
+        validate_timeout(self.timeout)
+        validate_timeout_flag(self.timeout_is_transient)
         resources_raw = self.default_resources if self.default_resources is not None else {}
         # 容器类型与 amount 校验须先于拷贝——str/序列等可迭代类型会在
         # dict() 拷贝处抛不可读的原始 ValueError
@@ -247,4 +251,8 @@ __all__ = [
     "Task",
     "TaskRegistry",
     "validate_resource_amounts",
+    "validate_retry_budget",
+    "validate_task_type",
+    "validate_timeout",
+    "validate_timeout_flag",
 ]
