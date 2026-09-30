@@ -3,7 +3,15 @@
 分层红线：本包严禁 import ``v2/engine/``（IPC 声明读写一律下沉
 ``v2/utils/ipc.py``），亦不得依赖 v1 旧树任何模块。
 """
+from .attempt import ATTEMPT_OUTCOMES, AttemptRecord
 from .job import Job, JobRuntimeState
 from .task import Task, TaskRegistry
 
-__all__ = ["Job", "JobRuntimeState", "Task", "TaskRegistry"]
+__all__ = [
+    "ATTEMPT_OUTCOMES",
+    "AttemptRecord",
+    "Job",
+    "JobRuntimeState",
+    "Task",
+    "TaskRegistry",
+]
