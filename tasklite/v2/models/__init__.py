@@ -4,6 +4,7 @@
 ``v2/utils/ipc.py``），亦不得依赖 v1 旧树任何模块。
 """
 from .attempt import ATTEMPT_OUTCOMES, AttemptRecord
+from .context import JobContext
 from .job import Job, JobRuntimeState
 from .state import PipelineState, uid_from_job_dict
 from .task import Task, TaskRegistry
@@ -12,6 +13,7 @@ __all__ = [
     "ATTEMPT_OUTCOMES",
     "AttemptRecord",
     "Job",
+    "JobContext",
     "JobRuntimeState",
     "PipelineState",
     "Task",
