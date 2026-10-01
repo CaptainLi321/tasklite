@@ -32,6 +32,7 @@ from .governor import (
     DeadlockGovernor,
 )
 from .in_flight import InFlightJob, InFlightTracker
+from .recovery import RecoveryOrchestrator
 from .scheduler import (
     DeadlockAttribution,
     FifoOrderingPolicy,
@@ -85,6 +86,7 @@ __all__ = [
     "decide_wait",
     "InFlightJob",
     "InFlightTracker",
+    "RecoveryOrchestrator",
     "JobHandle",
     "DeadlockAttribution",
     "FifoOrderingPolicy",
