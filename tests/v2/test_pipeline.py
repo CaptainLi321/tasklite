@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tasklite.v2.backend.base import AbstractStateBackend
 from tasklite.v2.backend.memory import InMemoryStateBackend
 from tasklite.v2.engine.admission import (
     ImmediateRequeuePolicy,
@@ -53,6 +54,89 @@ class TailRequeuePolicy(RequeuePolicy):
 
     def plan_requeue(self, job_dict, *, transient_kind=None) -> RequeuePlan:
         return RequeuePlan(front=False, delay_seconds=0.0)
+
+
+class DelegatingFakeBackend(AbstractStateBackend):
+    """显式契约子类假后端：全部契约方法逐一转发内部真实后端。
+
+    伪造后端的标准形态——契约缺口在类构造期即暴露（ABC 强制对齐），
+    不依赖任何鸭子接受分支。
+    """
+
+    def __init__(self) -> None:
+        self.inner = InMemoryStateBackend()
+
+    def load_wall(self, *args, **kwargs):
+        return self.inner.load_wall(*args, **kwargs)
+
+    def load_failed(self, *args, **kwargs):
+        return self.inner.load_failed(*args, **kwargs)
+
+    def load_failed_payloads(self, *args, **kwargs):
+        return self.inner.load_failed_payloads(*args, **kwargs)
+
+    def load_cursors(self, *args, **kwargs):
+        return self.inner.load_cursors(*args, **kwargs)
+
+    def load_queue(self, *args, **kwargs):
+        return self.inner.load_queue(*args, **kwargs)
+
+    def save_queue(self, *args, **kwargs):
+        return self.inner.save_queue(*args, **kwargs)
+
+    def replace_queue_atomic(self, *args, **kwargs):
+        return self.inner.replace_queue_atomic(*args, **kwargs)
+
+    def commit_job_success(self, *args, **kwargs):
+        return self.inner.commit_job_success(*args, **kwargs)
+
+    def commit_job_failure(self, *args, **kwargs):
+        return self.inner.commit_job_failure(*args, **kwargs)
+
+    def commit_retry(self, *args, **kwargs):
+        return self.inner.commit_retry(*args, **kwargs)
+
+    def commit_bulk_failure(self, *args, **kwargs):
+        return self.inner.commit_bulk_failure(*args, **kwargs)
+
+    def commit_skip(self, *args, **kwargs):
+        return self.inner.commit_skip(*args, **kwargs)
+
+    def append_failed(self, *args, **kwargs):
+        return self.inner.append_failed(*args, **kwargs)
+
+    def enqueue_jobs(self, *args, **kwargs):
+        return self.inner.enqueue_jobs(*args, **kwargs)
+
+    def delete_queue_uids(self, *args, **kwargs):
+        return self.inner.delete_queue_uids(*args, **kwargs)
+
+    def delete_failed(self, *args, **kwargs):
+        return self.inner.delete_failed(*args, **kwargs)
+
+    def delete_wall(self, *args, **kwargs):
+        return self.inner.delete_wall(*args, **kwargs)
+
+    def seed_wall(self, *args, **kwargs):
+        return self.inner.seed_wall(*args, **kwargs)
+
+    def seed_cursor(self, *args, **kwargs):
+        return self.inner.seed_cursor(*args, **kwargs)
+
+    def append_attempt(self, *args, **kwargs):
+        return self.inner.append_attempt(*args, **kwargs)
+
+    def update_attempt(self, *args, **kwargs):
+        return self.inner.update_attempt(*args, **kwargs)
+
+    def load_attempts(self, *args, **kwargs):
+        return self.inner.load_attempts(*args, **kwargs)
+
+    def get_meta(self, *args, **kwargs):
+        return self.inner.get_meta(*args, **kwargs)
+
+    def set_meta(self, *args, **kwargs):
+        return self.inner.set_meta(*args, **kwargs)
 
 
 # ── fake 进程（写 IPC 结果文件，与真实 worker 同路径）──────────────────
@@ -785,7 +869,8 @@ class TestBackendSwap:
             with pytest.raises(RuntimeError, match="backend"):
                 p.backend = InMemoryStateBackend()
 
-    def test_duck_typed_backend_accepted(self, tmp_path):
+    def test_backend_setter_rejects_duck_typed_object(self, tmp_path):
+        """只带读写核心方法的鸭子对象显式 TypeError 拒绝（契约面单一）。"""
         p = make_pipeline(tmp_path)
 
         class PartialBackend:
@@ -795,6 +880,15 @@ class TestBackendSwap:
             def commit_job_success(self, uid, meta, **kw):
                 return True
 
-        duck = PartialBackend()
-        p.backend = duck
-        assert p.backend is duck
+        with pytest.raises(TypeError, match="AbstractStateBackend"):
+            p.backend = PartialBackend()
+
+    def test_explicit_subclass_backend_accepted(self, tmp_path):
+        """显式 AbstractStateBackend 子类假后端：接受注入并重绑持库组件。"""
+        p = make_pipeline(tmp_path)
+        fake = DelegatingFakeBackend()
+        fake.append_failed("fetch::x", {"error": "subclass"})
+        p.backend = fake
+        assert p.backend is fake
+        assert p._runtime.store.backend is fake
+        assert any(e.uid == "fetch::x" for e in p.list_failures())

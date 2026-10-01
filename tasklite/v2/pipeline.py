@@ -347,17 +347,11 @@ class TaskLite:
 
     @backend.setter
     def backend(self, value: AbstractStateBackend) -> None:
-        # 入口即校验：非后端对象（后端名字符串、None 等）fail-loud，失败
-        # 不延迟到管理 API 调用才以 AttributeError 爆发。除
-        # AbstractStateBackend 实例外接受提供读写核心方法的鸭子类型对象
-        # （崩溃注入测试的伪造后端 seam）。
-        if not (
-            isinstance(value, AbstractStateBackend)
-            or (
-                callable(getattr(value, "load_queue", None))
-                and callable(getattr(value, "commit_job_success", None))
-            )
-        ):
+        # 入口即校验：仅接受 AbstractStateBackend 实例，非后端对象（后端
+        # 名字符串、None、只带个别方法的鸭子对象）一律 fail-loud。鸭子
+        # 接受会让契约缺口的伪造后端延迟到运行期才以 AttributeError
+        # 半路爆发——契约面必须单一（显式子类化，缺方法在类构造期暴露）。
+        if not isinstance(value, AbstractStateBackend):
             raise TypeError(
                 f"backend must be an AbstractStateBackend instance "
                 f"(use the `backend` constructor argument for "
