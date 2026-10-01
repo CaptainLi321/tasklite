@@ -71,13 +71,15 @@ def resolve_tuning(
                 f"dep_grace_seconds must be a real number, got "
                 f"{type(dep_grace_seconds).__name__} ({dep_grace_seconds!r})"
             )
-        grace = float(dep_grace_seconds)
-    # 超大 int 转 float 溢出抛 OverflowError（ArithmeticError 子类），
-    # 收敛为 ValueError 与其余非法值同路 fail-loud
-    try:
-        finite_grace = math.isfinite(grace)
-    except OverflowError:
-        finite_grace = False
+        # 超大 int 转 float 溢出抛 OverflowError（ArithmeticError 子类），
+        # 收敛为 ValueError 与其余非法值同路 fail-loud
+        try:
+            grace = float(dep_grace_seconds)
+        except OverflowError:
+            raise ValueError(
+                f"dep_grace_seconds must be a finite number > 0, got {dep_grace_seconds!r}"
+            ) from None
+    finite_grace = math.isfinite(grace)
     if not finite_grace or grace <= 0:
         raise ValueError(
             f"dep_grace_seconds must be a finite number > 0, got {dep_grace_seconds!r}"

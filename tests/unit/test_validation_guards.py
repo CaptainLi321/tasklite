@@ -376,6 +376,17 @@ class TestTuningScalarGuard:
         with pytest.raises(TypeError, match="dep_grace_seconds"):
             resolve_tuning(dep_grace_seconds=bad)
 
+    def test_huge_int_dep_grace_converges_to_value_error(self):
+        """超大 int（超 float 范围）必须收敛为 ValueError，不得裸抛 OverflowError。
+
+        类型收敛契约：int → float 的溢出与 NaN/inf 同属「非有限值」非法域，
+        统一 ValueError 出口（此前 OverflowError 从 float() 转换点裸抛，
+        与文档「同路 fail-loud 收敛」不符）。
+        """
+        from tasklite.engine.config import resolve_tuning
+        with pytest.raises(ValueError, match="dep_grace_seconds"):
+            resolve_tuning(dep_grace_seconds=10 ** 400)
+
     def test_dep_grace_accepts_integral_seconds(self):
         from tasklite.engine.config import resolve_tuning
         assert resolve_tuning(dep_grace_seconds=5).dep_grace_seconds == 5.0
