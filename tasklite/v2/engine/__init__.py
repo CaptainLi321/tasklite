@@ -31,6 +31,7 @@ from .types import (
     StopMode,
     TaskStats,
 )
+from .wait import LoopFacts, WaitDecision, decide_wait
 
 __all__ = [
     "ErrorClassifier",
@@ -50,4 +51,7 @@ __all__ = [
     "RequeuePlan",
     "RequeuePolicy",
     "RerunPolicy",
+    "LoopFacts",
+    "WaitDecision",
+    "decide_wait",
 ]
