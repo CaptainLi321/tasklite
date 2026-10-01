@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import copy
-import datetime
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
@@ -32,6 +31,7 @@ from ..models.attempt import (
 )
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, uid_from_job_dict
+from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import dumps
 from .admission import ImmediateRequeuePolicy, RequeuePolicy, RerunPolicy
 from .errorclass import ERR_COMMIT_FAILURE, ERR_JOB_DEPENDENCY, ErrorClassifier
@@ -42,11 +42,6 @@ logger = logging.getLogger("tasklite.v2")
 # commit 连续失败达阈值后按确定性坏输入收敛进失败档案（此前为无限崩溃
 # 重启循环）；默认 3 次。
 COMMIT_FAILURE_THRESHOLD = 3
-
-
-def _utc_now_iso() -> str:
-    """当前时刻的 UTC ISO 8601 串（first_enqueued_at / 轨迹收尾共用）。"""
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 @dataclass(frozen=True)
@@ -183,7 +178,7 @@ class StateStore:
             self._backend.update_attempt(
                 attempt_id,
                 outcome=outcome,
-                finished_at=_utc_now_iso(),
+                finished_at=utc_now_iso(),
                 error=error,
             )
         except Exception as e:
@@ -262,7 +257,7 @@ class StateStore:
         self._rerun_policy.normalize_job_dict(job_dict, task_type)
         inject_worker_resource(job_dict)
         if not job_dict.get("first_enqueued_at"):
-            job_dict["first_enqueued_at"] = _utc_now_iso()
+            job_dict["first_enqueued_at"] = utc_now_iso()
 
     def enqueue_jobs(
         self,
@@ -463,7 +458,7 @@ class StateStore:
     ) -> SuccessOutcome:
         """原子终态转移：成功（wall 落盘 + 清失败档案残行 + 子任务/cursor）。"""
         wall_meta = copy.deepcopy(result_meta) if result_meta else {}
-        wall_meta.setdefault("last_run_at", _utc_now_iso())
+        wall_meta.setdefault("last_run_at", utc_now_iso())
         if run_id is not None:
             wall_meta.setdefault("last_run_id", run_id)
         if declared_inputs:

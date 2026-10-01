@@ -16,7 +16,6 @@ orphan-probe → stale-restore。依赖以显式窄清单注入（无共享袋�
 
 from __future__ import annotations
 
-import datetime
 import enum
 import logging
 import time
@@ -74,13 +73,9 @@ from .in_flight import InFlightJob
 from .resource import RateLimitUnavailable, apply_suspend_signals
 from .scheduler import ScheduleResult, StandstillFacts
 from .types import AttemptFinish
+from ..utils.clock import utc_now_iso
 
 logger = logging.getLogger("tasklite.v2")
-
-
-def _utc_now_iso() -> str:
-    """当前时刻的 UTC ISO 8601 串（轨迹行 started_at）。"""
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 class DispatchKind(enum.Enum):
@@ -409,7 +404,7 @@ class DispatchMachine:
             attempt_no=job.attempt_no,
             incarnation=incarnation,
             run_id=self._session.run_id,
-            started_at=_utc_now_iso(),
+            started_at=utc_now_iso(),
             outcome=ATTEMPT_RUNNING,
         )
         try:

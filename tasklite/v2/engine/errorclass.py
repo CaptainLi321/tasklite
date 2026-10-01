@@ -7,7 +7,6 @@
 """
 from __future__ import annotations
 
-import datetime
 import pickle
 import signal
 import types
@@ -17,6 +16,7 @@ from enum import Enum
 from typing import Any, Sequence
 
 from ..exceptions import FatalError, RateLimitHit, RetryError
+from ..utils.clock import utc_now_iso
 
 _UnionType = getattr(types, "UnionType", None)
 
@@ -636,7 +636,7 @@ class ErrorClassifier:
             return {
                 "error": raw_err,
                 "error_type": ErrorCategory.UNKNOWN.value,
-                "failed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "failed_at": utc_now_iso(),
                 "_attempt": attempt if attempt is not None else 0,
             }
 
@@ -646,9 +646,7 @@ class ErrorClassifier:
             normalized["error_type"] = cl.failed_error_type
 
         if "failed_at" not in normalized:
-            normalized["failed_at"] = datetime.datetime.now(
-                datetime.timezone.utc
-            ).isoformat()
+            normalized["failed_at"] = utc_now_iso()
 
         if attempt is not None:
             normalized["_attempt"] = attempt
