@@ -18,6 +18,15 @@ from .admission import (
 )
 from .errorclass import ErrorClassifier
 from .in_flight import InFlightJob, InFlightTracker
+from .scheduler import (
+    DeadlockAttribution,
+    FifoOrderingPolicy,
+    JobFacts,
+    JobScheduler,
+    OrderingPolicy,
+    ScheduleResult,
+    StandstillFacts,
+)
 from .resource import (
     CapacityResource,
     RateLimitResource,
@@ -59,4 +68,11 @@ __all__ = [
     "InFlightJob",
     "InFlightTracker",
     "JobHandle",
+    "DeadlockAttribution",
+    "FifoOrderingPolicy",
+    "JobFacts",
+    "JobScheduler",
+    "OrderingPolicy",
+    "ScheduleResult",
+    "StandstillFacts",
 ]
