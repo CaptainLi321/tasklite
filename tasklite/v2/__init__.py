@@ -29,7 +29,7 @@ from .pipeline import TaskLite
 from .models.attempt import AttemptRecord
 from .models.context import JobContext
 from .models.job import Job, JobRuntimeState
-from .models.task import Task, TaskRegistry
+from .models.task import Task, TaskRegistry, validate_resource_amounts
 
 # ── 异常族 ───────────────────────────────────────────────────────────
 from .exceptions import (
@@ -59,6 +59,8 @@ from .engine.errorclass import (
     ERR_PROCESS_SIGNAL_DEATH,
     ERR_RESOURCE_DEADLOCK,
     ERR_TIMEOUT_PREFIX,
+    FATAL_EXCEPTIONS,
+    TRANSIENT_EXCEPTIONS,
     ErrorCategory,
     ErrorClassification,
     ErrorClassifier,
@@ -83,6 +85,7 @@ from .engine.store import FailureEntry
 # ── 策略 seam：准入（rerun）与重入队（节奏）─────────────────────────
 from .engine.admission import (
     ImmediateRequeuePolicy,
+    RequeuePlan,
     RequeuePolicy,
     RerunPolicy,
 )
@@ -125,6 +128,7 @@ __all__ = [
     "JobRuntimeState",
     "Task",
     "TaskRegistry",
+    "validate_resource_amounts",
     # 异常族
     "FatalError",
     "PipelineError",
@@ -159,6 +163,9 @@ __all__ = [
     "ERR_NO_IPC_RESULT",
     "ERR_PROCESS_SIGNAL_DEATH",
     "ERR_IPC_WRITE_DEGRADED_PREFIX",
+    # 错误分类：默认异常启发式元组
+    "FATAL_EXCEPTIONS",
+    "TRANSIENT_EXCEPTIONS",
     # 资源体系
     "CapacityResource",
     "RateLimitResource",
@@ -167,6 +174,7 @@ __all__ = [
     "FailureEntry",
     # 策略 seam
     "ImmediateRequeuePolicy",
+    "RequeuePlan",
     "RequeuePolicy",
     "RerunPolicy",
     "FifoOrderingPolicy",

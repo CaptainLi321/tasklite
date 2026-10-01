@@ -1,18 +1,21 @@
-"""v2 包面静态契约测试：wrappers/contrib 导出面与分层隔离红线。
+"""v2 包面静态契约测试：主公开面导出、指南导入承诺与分层隔离红线。
 
-锁定三条结构性契约（重构静默破坏即红）：
+锁定四条结构性契约（重构静默破坏即红）：
 1. ``tasklite.v2`` 主公开面不吞并 wrappers/contrib——import 主包不触发
    二者加载（wrappers 经子包路径导入，ADR-0004 裁决）；
 2. v2 核心层源码（models/utils/backend/engine + 顶层模块）严禁 import
    ``v2/wrappers`` 与 ``v2/contrib``（分层单向依赖红线）；
 3. wrappers/contrib 严禁 import v1（tasklite 非 v2 子树任何模块）——
-   v2 独立演进的隔离前提。
+   v2 独立演进的隔离前提；
+4. V2_GUIDE 代码块中的 tasklite 导入语句逐条可导入——文档承诺的
+   导入路径（如 ``from tasklite.v2 import RequeuePlan``）不得漂移。
 """
 from __future__ import annotations
 
 import ast
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -119,6 +122,60 @@ class TestLayeringRedLine:
             if banned:
                 offenders[path.name] = sorted(banned)
         assert not offenders, f"适配层出现 v1 依赖: {offenders}"
+
+
+class TestMainSurfaceMigrationExports:
+    """主公开面迁移期补齐的四个导出（__all__ 同步且可导入）。"""
+
+    _MIGRATION_EXPORTS = frozenset(
+        {"FATAL_EXCEPTIONS", "TRANSIENT_EXCEPTIONS", "RequeuePlan", "validate_resource_amounts"}
+    )
+
+    def test_migration_export_names_in_all(self):
+        import tasklite.v2 as v2_pkg
+
+        missing = self._MIGRATION_EXPORTS - set(v2_pkg.__all__)
+        assert not missing, f"主公开面 __all__ 缺少迁移期补齐导出: {sorted(missing)}"
+
+    def test_migration_export_names_importable(self):
+        from tasklite.v2 import (
+            FATAL_EXCEPTIONS,
+            TRANSIENT_EXCEPTIONS,
+            RequeuePlan,
+            validate_resource_amounts,
+        )
+
+        assert isinstance(FATAL_EXCEPTIONS, tuple) and isinstance(FATAL_EXCEPTIONS[0], type)
+        assert isinstance(TRANSIENT_EXCEPTIONS, tuple) and isinstance(
+            TRANSIENT_EXCEPTIONS[0], type
+        )
+        assert isinstance(RequeuePlan, type)
+        assert callable(validate_resource_amounts)
+
+
+class TestGuideImportContract:
+    """V2_GUIDE 代码块中的 tasklite 导入语句逐条可导入（文档承诺不漂移）。"""
+
+    def test_guide_tasklite_imports_resolve(self):
+        doc = (PROJECT_ROOT / "docs" / "V2_GUIDE.md").read_text(encoding="utf-8")
+        blocks = re.findall(r"```python\n(.+?)```", doc, flags=re.DOTALL)
+        assert blocks, "V2_GUIDE 未捕获 python 代码块，围栏标记已漂移"
+        stmts: list[str] = []
+        for block in blocks:
+            for node in ast.walk(ast.parse(block)):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.level == 0
+                    and (node.module or "").startswith("tasklite")
+                ):
+                    seg = ast.get_source_segment(block, node)
+                    assert seg is not None
+                    stmts.append(seg)
+        assert stmts, "V2_GUIDE 代码块未捕获任何 tasklite 导入语句"
+        joined = "\n".join(stmts)
+        assert "RequeuePlan" in joined, "V2_GUIDE §5 的 RequeuePlan 导入承诺已漂移"
+        for stmt in stmts:
+            exec(compile(stmt, "<V2_GUIDE.md>", "exec"), {})
 
 
 class TestMainSurfaceIsolation:
