@@ -1,10 +1,10 @@
 """文档文件引用存在性门禁（纯文件系统检查，毫秒级完成）。
 
-扫描 README.md 与 docs/API_GUIDE.md 全文，提取形如 tests/xxx.py、
-tasklite/xxx.py、scripts/xxx 的文件路径引用（反引号包裹或裸文本
-均可——路径字符集在反引号 / 中英文标点 / 空格处自然截断，无需对反引号
-做特殊处理），断言每个引用的路径相对仓库根真实存在（文件与目录引用
-均合法）——防止文档漂移留下死链接。
+扫描 README.md、docs/API_GUIDE.md 与 docs/V2_GUIDE.md 全文，提取形如
+tests/xxx.py、tasklite/xxx.py、scripts/xxx 的文件路径引用（反引号包裹
+或裸文本均可——路径字符集在反引号 / 中英文标点 / 空格处自然截断，
+无需对反引号做特殊处理），断言每个引用的路径相对仓库根真实存在
+（文件与目录引用均合法）——防止文档漂移留下死链接。
 
 示例性伪路径（如 ./state、./out、./downloads/）与 docs/ 前缀不在扫描
 范围内：本门禁只认 tests/、tasklite/、scripts/ 三种前缀。
@@ -21,6 +21,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 SCANNED_DOCS = (
     ROOT / "README.md",
     ROOT / "docs" / "API_GUIDE.md",
+    ROOT / "docs" / "V2_GUIDE.md",
 )
 
 # 路径引用提取模式：三种前缀之一开头，后接常规路径字符。
