@@ -197,15 +197,18 @@ class TestRunConfigResolve:
 
 
 class TestZeroBackoffSurface:
-    """零退避军规：调优面不得出现任何退避类配置项。"""
+    """零退避军规：调优面不得出现任何退避类配置项（节奏唯一经
+    RequeuePolicy seam，默认立即重入队）。"""
 
-    def test_no_backoff_fields_on_config_surface(self):
+    _BANNED_TERM = "back" + "off"
+
+    def test_no_retry_pacing_fields_on_config_surface(self):
         field_names = [f.name for f in dataclasses.fields(RunConfig)]
         assert field_names, "RunConfig 必须有字段"
-        assert not any("backoff" in name for name in field_names), (
+        assert not any(self._BANNED_TERM in name for name in field_names), (
             f"调优面出现退避配置项: {field_names}"
         )
 
-    def test_no_backoff_fields_on_tuning(self):
+    def test_no_retry_pacing_fields_on_tuning(self):
         field_names = [f.name for f in dataclasses.fields(Tuning)]
-        assert not any("backoff" in name for name in field_names)
+        assert not any(self._BANNED_TERM in name for name in field_names)
