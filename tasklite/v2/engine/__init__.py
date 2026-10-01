@@ -17,6 +17,7 @@ from .admission import (
     RerunPolicy,
 )
 from .errorclass import ErrorClassifier
+from .in_flight import InFlightJob, InFlightTracker
 from .resource import (
     CapacityResource,
     RateLimitResource,
@@ -28,6 +29,7 @@ from .types import (
     EMPTY_STATS,
     TRANSIENT_KIND_STAT_KEYS,
     ExitReason,
+    JobHandle,
     StopMode,
     TaskStats,
 )
@@ -54,4 +56,7 @@ __all__ = [
     "LoopFacts",
     "WaitDecision",
     "decide_wait",
+    "InFlightJob",
+    "InFlightTracker",
+    "JobHandle",
 ]
