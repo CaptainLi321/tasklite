@@ -672,31 +672,18 @@ class TestResourceManagerEvaluation:
         assert eval_res.impossible_name is None
 
 
-class TestTransactionalAcquire:
-    """事务性获取与幂等释放。"""
+class TestReleaseAllSafety:
+    """批量释放幂等与异常安全。"""
 
-    def test_acquire_effective_success_and_release(self):
+    def test_release_all_rollback_after_reserve_acquire(self):
+        """reserve 预扣的容量可经 release_all 全量归还（事务性回滚通道）。"""
         gpu = CapacityResource("gpu", 10.0)
         mgr = ResourceManager({"gpu": gpu})
-        acquired = mgr.acquire_effective("task", {"gpu": 4.0})
-        assert acquired == [("gpu", 4.0)]
+        lease = mgr.reserve("task", {"gpu": 4.0})
         assert gpu.used == 4.0
 
-        mgr.release_all(acquired)
+        mgr.release_all(lease.acquired)
         assert gpu.used == 0.0
-
-    def test_acquire_effective_rollback_on_failure(self):
-        gpu = CapacityResource("gpu", 4.0)
-        cpu = CapacityResource("cpu", 2.0)
-        mgr = ResourceManager({"gpu": gpu, "cpu": cpu})
-
-        # cpu 仅 2.0，申请 5.0 在第二项抛异常
-        with pytest.raises(ValueError):
-            mgr.acquire_effective("task", {"gpu": 2.0, "cpu": 5.0})
-
-        # 已获取的 gpu 必须被自动回滚释放
-        assert gpu.used == 0.0
-        assert cpu.used == 0.0
 
     def test_release_all_skips_malformed_items(self):
         """畸形条目（非二元组）跳过不打断批释放（异常安全）。"""
@@ -749,22 +736,6 @@ class TestResourceLease:
         mgr = ResourceManager({"gpu": gpu})
         with pytest.raises(KeyError, match="not registered"):
             mgr.reserve("task", {"gpu": 2.0, "nope": 1.0})
-        assert gpu.used == 0.0
-
-    def test_try_reserve_returns_none_when_unavailable(self):
-        gpu = CapacityResource("gpu", 2.0)
-        mgr = ResourceManager({"gpu": gpu})
-
-        lease = mgr.try_reserve("task", {"gpu": 2.0})
-        assert lease is not None
-        assert gpu.used == 2.0
-
-        # 容量耗尽：try_reserve 返回 None，不抛异常、无副作用
-        lease_none = mgr.try_reserve("task", {"gpu": 1.0})
-        assert lease_none is None
-        assert gpu.used == 2.0
-
-        lease.release()
         assert gpu.used == 0.0
 
     def test_lease_context_manager_auto_rollback_on_exception(self):

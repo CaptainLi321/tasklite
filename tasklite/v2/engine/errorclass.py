@@ -135,7 +135,6 @@ class ErrorClassification:
     is_fatal: bool
     is_retry: bool
     is_interrupted: bool = False
-    lock_conflict: bool = False
     retry_error: str | None = None
     traceback_str: str | None = None
     raw_error: str = ""
@@ -460,7 +459,6 @@ class ErrorClassifier:
                 is_transient=True,
                 is_fatal=False,
                 is_retry=True,
-                lock_conflict=bool(meta.get("lock_conflict")),
                 raw_error=_safe_str(meta.get("error", "")),
                 traceback_str=meta.get("traceback"),
             )

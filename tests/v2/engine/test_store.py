@@ -462,7 +462,6 @@ class TestApplyBulkFailure:
                 ("cycle::1", {"error": "DEPENDENCY_DEADLOCK"}),
                 ("cycle::2", {"error": "DEPENDENCY_DEADLOCK"}),
             ],
-            remaining_queue=[{"task_type": "safe", "job_id": "1"}],
         )
 
         assert isinstance(outcome, BulkFailureOutcome)

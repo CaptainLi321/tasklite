@@ -124,22 +124,6 @@ class ScheduleResult:
         """是否存在选中的候选作业下标。"""
         return self.runnable_idx is not None
 
-    @property
-    def unknown_resource_uids(self) -> tuple[str, ...]:
-        return self.attribution.unknown_resource_uids
-
-    @property
-    def missing_dependency_uids(self) -> tuple[str, ...]:
-        return self.attribution.missing_dependency_uids
-
-    @property
-    def malformed_uids(self) -> tuple[str, ...]:
-        return self.attribution.malformed_uids
-
-    @property
-    def impossible_resource_uids(self) -> tuple[str, ...]:
-        return self.attribution.impossible_resource_uids
-
     def standstill_facts(self) -> StandstillFacts:
         """投影为 governor 仲裁输入的停摆事实（剔除派发侧字段）。"""
         return StandstillFacts(

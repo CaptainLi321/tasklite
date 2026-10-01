@@ -11,7 +11,6 @@ from tasklite.v2.engine.scheduler import (
     JobFacts,
     JobScheduler,
     OrderingPolicy,
-    ScheduleResult,
     StandstillFacts,
 )
 from tasklite.v2.models.job import Job
@@ -184,7 +183,7 @@ class TestScanAttribution:
         scheduler = JobScheduler(resources={})
         state = _state([Job("t", "x", resources={"ghost": 1.0}).to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset())
-        assert result.unknown_resource_uids == ("t::x",)
+        assert result.attribution.unknown_resource_uids == ("t::x",)
         assert result.min_wait == INF
 
     def test_impossible_resource_attribution(self):
@@ -192,15 +191,15 @@ class TestScanAttribution:
         scheduler = JobScheduler({"r": cap})
         state = _state([Job("t", "x", resources={"r": 99.0}).to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset())
-        assert result.impossible_resource_uids == ("t::x",)
+        assert result.attribution.impossible_resource_uids == ("t::x",)
         assert result.min_wait == INF
 
     def test_malformed_job_captured_without_crash(self):
         scheduler = JobScheduler(resources={})
         state = _state([{"task_type": "t"}])
         result = scheduler.scan_next_runnable(state, frozenset())
-        assert len(result.malformed_uids) == 1
-        assert result.malformed_uids[0].startswith("_unknown::")
+        assert len(result.attribution.malformed_uids) == 1
+        assert result.attribution.malformed_uids[0].startswith("_unknown::")
         assert result.min_wait == INF
 
     def test_malformed_forces_inf_over_finite_resource_wait(self):
@@ -215,7 +214,7 @@ class TestScanAttribution:
             ]
         )
         result = scheduler.scan_next_runnable(state, frozenset())
-        assert result.malformed_uids and result.malformed_uids[0].startswith("_unknown::")
+        assert result.attribution.malformed_uids and result.attribution.malformed_uids[0].startswith("_unknown::")
         assert result.min_wait == INF, "有限资源等待不得遮蔽畸形死锁归因"
 
     def test_finite_resource_wait_reported(self):
@@ -231,7 +230,7 @@ class TestScanAttribution:
         scheduler = JobScheduler(resources={})
         state = _state([Job("t", "a", depends_on=["t::missing"]).to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset())
-        assert result.missing_dependency_uids == ("t::a",)
+        assert result.attribution.missing_dependency_uids == ("t::a",)
         assert result.waiting_for_dependency is True
         assert result.has_potential_spawners is False
 
@@ -240,7 +239,7 @@ class TestScanAttribution:
         scheduler = JobScheduler(resources={})
         state = _state([Job("t", "a", depends_on=["t::running"]).to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset({"t::running"}))
-        assert result.missing_dependency_uids == ()
+        assert result.attribution.missing_dependency_uids == ()
         assert result.waiting_for_dependency is True
 
     def test_has_potential_spawners_with_resource_blocked_job(self):
@@ -269,7 +268,7 @@ class TestScanAttribution:
         result = scheduler.scan_next_runnable(state, frozenset())
         assert result.is_runnable is True
         assert result.candidate_uid == "t::first"
-        assert result.unknown_resource_uids == ()
+        assert result.attribution.unknown_resource_uids == ()
 
 
 class TestOrderingPolicySeam:
@@ -334,9 +333,3 @@ class TestDeadlockAttributionValue:
         assert DeadlockAttribution(missing_dependency_uids=("t::x",)).has_deadlock_causes is True
         assert DeadlockAttribution(unknown_resource_uids=("t::x",)).has_deadlock_causes is True
         assert DeadlockAttribution(impossible_resource_uids=("t::x",)).has_deadlock_causes is True
-
-    def test_schedule_result_delegates_attribution(self):
-        result = ScheduleResult(
-            attribution=DeadlockAttribution(unknown_resource_uids=("t::u",))
-        )
-        assert result.unknown_resource_uids == ("t::u",)

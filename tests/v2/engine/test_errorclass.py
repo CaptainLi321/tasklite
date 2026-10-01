@@ -143,10 +143,9 @@ class TestClassifierMetaDictionaries:
 
         # IPC retry 字典
         cl_retry = classifier.classify(
-            {"status": "retry", "error": "retry me", "lock_conflict": True}
+            {"status": "retry", "error": "retry me"}
         )
         assert cl_retry.is_retry is True
-        assert cl_retry.lock_conflict is True
         assert cl_retry.failed_error_type == ErrorCategory.TRANSIENT_EXHAUSTED.value
 
         # IPC fatal 字典

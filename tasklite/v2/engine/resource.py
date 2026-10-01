@@ -409,7 +409,7 @@ class ResourceManager(MutableMapping[str, Resource]):
     1. 资源注册表与生命周期管理（Dict-like 访问）；
     2. Task 默认资源的动态单点合并（消除调度与派发双重维护）；
     3. 细粒度资源合法性与可用性评估（unknown、impossible、wait_time）；
-    4. 事务性原子获取（acquire_effective）与安全幂等释放（release_all）；
+    4. 两阶段租约（reserve 预扣 + claim 兑现）与安全幂等释放（release_all）；
     5. 统一挂起与跨崩溃状态持久化/恢复。
     """
 
@@ -541,46 +541,6 @@ class ResourceManager(MutableMapping[str, Resource]):
             )
         except BaseException:
             self.release_all(acquired, uid=uid)
-            raise
-
-    def try_reserve(
-        self,
-        task_type: str,
-        declared_resources: Mapping[str, float]
-        | Iterable[tuple[str, float]]
-        | None = None,
-        *,
-        uid: str | None = None,
-    ) -> ResourceLease | None:
-        """试探性预约资源。不可用时返回 None（不抛异常、不产生副作用）。"""
-        eval_res = self.evaluate(task_type, declared_resources)
-        if not eval_res.is_available:
-            return None
-        try:
-            return self.reserve(task_type, declared_resources, uid=uid)
-        except Exception:
-            return None
-
-    def acquire_effective(
-        self,
-        task_type: str,
-        declared_resources: Mapping[str, float]
-        | Iterable[tuple[str, float]]
-        | None = None,
-    ) -> list[tuple[str, float]]:
-        """事务性 acquire 所有合并后的资源（异常时自动释放已获取的部分）。"""
-        eff = self.effective_resources(task_type, declared_resources)
-        acquired: list[tuple[str, float]] = []
-        try:
-            for res_name, amount in eff.items():
-                res = self._resources.get(res_name)
-                if res is None:
-                    raise KeyError(f"Resource '{res_name}' not registered")
-                res.acquire(amount)
-                acquired.append((res_name, amount))
-            return acquired
-        except BaseException:
-            self.release_all(acquired)
             raise
 
     def release_all(

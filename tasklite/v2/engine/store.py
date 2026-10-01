@@ -133,10 +133,6 @@ class StateStore:
         if self._stats is not None:
             self._stats[key] = self._stats.get(key, 0) + amount
 
-    def record_stat(self, key: str, amount: int = 1) -> None:
-        """公开统计指标记录接缝（供孤儿延迟等特殊派发事件使用）。"""
-        self._record_stat(key, amount)
-
     @property
     def stats(self) -> Any:
         """统计字典引用（可能为 None）。"""
@@ -614,10 +610,9 @@ class StateStore:
         self,
         uids_metas: Sequence[tuple[str, dict[str, Any]]],
         *,
-        remaining_queue: Sequence[dict[str, Any]] | None = None,
         reason: str = "deadlock",
     ) -> BulkFailureOutcome:
-        """原子批量失败（死锁归因或批量熔断）。"""
+        """原子批量失败（死锁归因或批量熔断）；剩余队列由失败集单点派生。"""
         normalized_metas = [
             (uid, self._classifier.normalize_failed_meta(meta))
             for uid, meta in uids_metas
@@ -625,12 +620,11 @@ class StateStore:
         committed = self._backend.commit_bulk_failure(normalized_metas)
 
         if committed:
-            if remaining_queue is None:
-                failed_set = {u for u, _ in normalized_metas}
-                remaining_queue = [
-                    jd for jd in self._state.queue
-                    if uid_from_job_dict(jd) not in failed_set
-                ]
+            failed_set = {u for u, _ in normalized_metas}
+            remaining_queue = [
+                jd for jd in self._state.queue
+                if uid_from_job_dict(jd) not in failed_set
+            ]
             self._state.replace_queue(list(remaining_queue))
             self._record_stat("failed", len(normalized_metas))
             for uid, meta in normalized_metas:
