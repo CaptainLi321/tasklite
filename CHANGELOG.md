@@ -4,6 +4,21 @@
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+v2 并行重建子包落地版（总纲 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，使用指南 [docs/V2_GUIDE.md](docs/V2_GUIDE.md)）：`tasklite/v2/` 从零重写完成（42 模块、47 测试文件，全量 4058 测试五解释器矩阵通过）。v1 同步进入**冻结期**——仅允许缺陷修复，不再接受新特性；v2 严禁 import v1，最终上位与 v1 退役另行裁决。v1 公开 API 本版零变化。
+
+### 新增
+
+- **v2 子包 `tasklite.v2`（Task/Job/Attempt 三层模型）**：架构照搬 v1（进程隔离、SQLite WAL 状态机、六步调用契约、瞬态信号军规、rerun 四策略、wall/cursors 全保留），模型重塑三层——Task 为进程内注册的静态规格模板（`register_task` + `TaskRegistry`）、Job 为 `uid = task_type::job_id` 身份不变的一次有界激活（实例位收敛 `attempt_no` / `activation_no` / `first_enqueued_at`，v1 的 `retries` 构造参数废除）、Attempt 为 append-only 执行轨迹表（`incarnation` / `outcome` 全生命周期落盘，端到端追溯链打通；旁路观测面，不参与六集合互斥）。
+- **v2 公开面与命名体系**：`from tasklite.v2 import ...` 集中导出（门面、模型层、异常族、错误分类、资源体系、策略 seam、后端、编码族等 61 项）；命名族重塑——`register_handler`→`register_task`、`add_resource`→`register_resource`、`TaskContext`→`JobContext`、`sanitize_*`→`encode_*`（可逆单射编码语义正名）、`ErrorTaxonomy`→`ErrorClassifier`、`list_dlq`/`clear_dlq`→`list_failures`/`clear_failures`（「DLQ/死信」术语统一「失败档案 failed」，条目类 `FailureEntry`，档案补跑 `retry_failure` 按轨迹最大激活代 +1 推进不撞号）、`on_job_completed`→`on_attempt_finished(uid, *, outcome: AttemptFinish)`（布尔语义经值对象正交承载）。完整映射见 ADR-0004。
+- **v2 调度扩展 seam（核心零调度逻辑）**：`OrderingPolicy`（默认 `FifoOrderingPolicy`，`scan_next_runnable` 唯一选择点）与 `RequeuePolicy`（默认 `ImmediateRequeuePolicy`，重试节奏唯一出口）双接缝立约——软 EDF / 优先级 / aging / 退避回归未来一律以 wrapper/util 形态插入；backoff 全族（`BackoffGovernor` / `backoff_*`）砍除，重试为立即重入队，瞬态信号军规（不烧预算 + 降级写盘 + 零污染）自然成立；Job 模型不携带 priority / deadline / period。
+- **v2 数据库零兼容 schema**：`attempts` 轨迹表、`failed` 失败档案术语全新落盘（不认旧 user_version、无迁移路径）；SQLite / Memory 双后端契约参数化对齐；`tests/v2/` 47 文件测试面与 v1 测试并存（断言语义而非实现细节）。
+
+### 修复
+
+- **`resolve_tuning` 超大整数溢出收敛 ValueError（v1 冻结期双落修复）**：`dep_grace_seconds` 传入超出 float 范围的 int（如 `10**400`）时，int→float 转换在 isfinite 守卫之前裸抛 `OverflowError`，与「非法值统一 ValueError fail-loud」的类型收敛契约不符——转换纳入溢出捕获后统一从 ValueError 出口拒绝（`tasklite/engine/config.py` 与 `tasklite/v2/engine/config.py` 双落，回归测试锁定于 `tests/unit/test_validation_guards.py`）。
+
 ## [1.4.2] - 2026-09-27
 
 文档修订版：mark_seen 契约论证收敛为 ADR-0003。仅文档变更，无代码与公开 API 变化。
