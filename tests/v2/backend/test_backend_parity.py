@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from tasklite.v2.backend import InMemoryStateBackend, SQLiteStateBackend
-from tasklite.v2.models.attempt import AttemptRecord
+from tasklite.v2.models.attempt import ATTEMPT_RUNNING, AttemptRecord
 from tasklite.v2.models.job import Job
 from tasklite.v2.models.state import uid_from_job_dict
 
@@ -135,7 +135,7 @@ class TestCoreContractProperties:
         assert [r.attempt_no for r in records] == [1, 2]
         assert records[0].outcome == "failed"
         assert records[0].incarnation == "run_seed.1"
-        assert records[1].is_running
+        assert records[1].outcome == ATTEMPT_RUNNING
 
         # 已收尾行不可二次收尾；未知 id 返回 False（双腿同构）
         with pytest.raises(ValueError, match="already finalized"):

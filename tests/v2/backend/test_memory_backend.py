@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from tasklite.v2.backend import InMemoryStateBackend
-from tasklite.v2.models.attempt import AttemptRecord
+from tasklite.v2.models.attempt import ATTEMPT_RUNNING, AttemptRecord
 from tasklite.v2.models.job import Job
 from tasklite.v2.models.state import uid_from_job_dict
 
@@ -227,7 +227,7 @@ class TestMemoryAttemptTrajectory:
             b.update_attempt(attempt_id, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00", error="")
         # 门卫失败后轨迹行仍是 running
         (rec,) = b.load_attempts("t::one")
-        assert rec.is_running
+        assert rec.outcome == ATTEMPT_RUNNING
 
     def test_load_attempts_filters_by_uid_in_id_order(self):
         b = InMemoryStateBackend()

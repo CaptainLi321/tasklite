@@ -1,8 +1,8 @@
-"""v2 AttemptRecord 轨迹契约测试：词汇表、字段校验与序列化往返。"""
+"""v2 AttemptRecord 轨迹契约测试：词汇表、字段校验与持久化重建往返。"""
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
 
 import pytest
 
@@ -24,6 +24,11 @@ def _running_record(**overrides) -> AttemptRecord:
     return AttemptRecord(**defaults)
 
 
+def _persisted_dict(rec: AttemptRecord) -> dict:
+    """导出持久化字典（attempts 表列名，与 dataclass 字段一一对应）。"""
+    return asdict(rec)
+
+
 class TestAttemptRecordCreation:
     """构造与词汇表。"""
 
@@ -42,7 +47,6 @@ class TestAttemptRecordCreation:
         assert rec.outcome == "running"
         assert rec.finished_at is None
         assert rec.error is None
-        assert rec.is_running
 
     def test_all_outcomes_accepted(self):
         for outcome in ATTEMPT_OUTCOMES:
@@ -50,7 +54,6 @@ class TestAttemptRecordCreation:
                 outcome=outcome, finished_at="2026-05-01T00:00:05+00:00"
             )
             assert rec.outcome == outcome
-            assert rec.is_running == (outcome == "running")
 
     def test_failed_outcome_carries_error(self):
         rec = _running_record(
@@ -111,11 +114,11 @@ class TestAttemptRecordValidation:
 
 
 class TestAttemptRecordSerialization:
-    """to_dict/from_dict 往返与缺键语义。"""
+    """from_dict 重建往返与缺键语义（持久化列名 = dataclass 字段名）。"""
 
     def test_roundtrip_running(self):
         rec = _running_record()
-        assert AttemptRecord.from_dict(rec.to_dict()) == rec
+        assert AttemptRecord.from_dict(_persisted_dict(rec)) == rec
 
     def test_roundtrip_terminal_with_error(self):
         rec = _running_record(
@@ -125,17 +128,17 @@ class TestAttemptRecordSerialization:
             finished_at="2026-05-01T00:00:05+00:00",
             error="RateLimitHit: 429",
         )
-        assert AttemptRecord.from_dict(rec.to_dict()) == rec
+        assert AttemptRecord.from_dict(_persisted_dict(rec)) == rec
 
-    def test_to_dict_key_set(self):
-        keys = set(_running_record().to_dict())
+    def test_persisted_key_set(self):
+        keys = set(_persisted_dict(_running_record()))
         assert keys == {
             "job_uid", "activation_no", "attempt_no", "incarnation",
             "run_id", "started_at", "outcome", "finished_at", "error",
         }
 
     def test_from_dict_missing_optional_keys_default_none(self):
-        data = _running_record().to_dict()
+        data = _persisted_dict(_running_record())
         data.pop("finished_at")
         data.pop("error")
         rec = AttemptRecord.from_dict(data)
@@ -143,7 +146,7 @@ class TestAttemptRecordSerialization:
         assert rec.error is None
 
     def test_from_dict_missing_required_key_raises(self):
-        data = _running_record().to_dict()
+        data = _persisted_dict(_running_record())
         for required in ("job_uid", "activation_no", "attempt_no",
                          "incarnation", "run_id", "started_at", "outcome"):
             broken = dict(data)
@@ -153,7 +156,7 @@ class TestAttemptRecordSerialization:
 
     def test_from_dict_revalidates(self):
         """重建走同一校验链：脏数据按同一规则拒绝。"""
-        data = _running_record().to_dict()
+        data = _persisted_dict(_running_record())
         data["outcome"] = "vanished"
         with pytest.raises(ValueError, match="outcome must be one of"):
             AttemptRecord.from_dict(data)

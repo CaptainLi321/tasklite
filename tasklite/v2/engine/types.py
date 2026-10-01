@@ -55,46 +55,10 @@ class ExitReason(str, enum.Enum):
 
 
 class TaskStats(dict):
-    """运行统计字典。"""
+    """运行统计字典（键集即公开监控面，读写一律下标风格）。"""
 
     def __init__(self) -> None:
         super().__init__(EMPTY_STATS)
-
-    @property
-    def completed(self) -> int:
-        return self["completed"]
-
-    @property
-    def failed(self) -> int:
-        return self["failed"]
-
-    @property
-    def retried(self) -> int:
-        return self["retried"]
-
-    @property
-    def skipped(self) -> int:
-        return self["skipped"]
-
-    @property
-    def hook_errors(self) -> int:
-        return self["hook_errors"]
-
-    @property
-    def deferred_orphan(self) -> int:
-        return self["deferred_orphan"]
-
-    @property
-    def interrupted_reruns(self) -> int:
-        return self["interrupted_reruns"]
-
-    @property
-    def rate_limited_reruns(self) -> int:
-        return self["rate_limited_reruns"]
-
-    @property
-    def cascade_failed(self) -> int:
-        return self["cascade_failed"]
 
 
 @dataclass(frozen=True)

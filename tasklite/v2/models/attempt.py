@@ -111,25 +111,6 @@ class AttemptRecord:
         _validate_optional_str("finished_at", self.finished_at)
         _validate_optional_str("error", self.error)
 
-    @property
-    def is_running(self) -> bool:
-        """本次执行是否尚未收尾（唯一非终态 outcome 为 running）。"""
-        return self.outcome == "running"
-
-    def to_dict(self) -> dict[str, Any]:
-        """导出持久化字典（对应 attempts 表列名；None 字段原样保留）。"""
-        return {
-            "job_uid": self.job_uid,
-            "activation_no": self.activation_no,
-            "attempt_no": self.attempt_no,
-            "incarnation": self.incarnation,
-            "run_id": self.run_id,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "outcome": self.outcome,
-            "error": self.error,
-        }
-
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AttemptRecord:
         """从持久化字典重建（必填键缺失显式 KeyError，可空键缺省 None）。"""

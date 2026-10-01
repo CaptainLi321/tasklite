@@ -56,24 +56,6 @@ class TestEmptyStats:
         assert TaskStats()["completed"] == 0
 
 
-class TestTaskStatsProperties:
-    """只读属性与字典读写同源。"""
-
-    def test_properties_read_through(self):
-        stats = TaskStats()
-        for key in _EXPECTED_STAT_KEYS:
-            assert getattr(stats, key) == 0
-
-    def test_dict_mutation_visible_via_properties(self):
-        stats = TaskStats()
-        stats["completed"] = 3
-        stats["cascade_failed"] = 5
-        stats["rate_limited_reruns"] = 2
-        assert stats.completed == 3
-        assert stats.cascade_failed == 5
-        assert stats.rate_limited_reruns == 2
-
-
 class TestTransientKindRegistry:
     """瞬态信号登记表完备性（v1 同源断言按 v2 词汇移植）。
 

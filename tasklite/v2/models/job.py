@@ -133,55 +133,10 @@ class JobRuntimeState:
             extra=extra,
         )
 
-    def __getitem__(self, key: str) -> Any:
-        spec = _RUNTIME_FIELDS.get(key)
-        if spec is not None:
-            val = getattr(self, spec[0])
-            if val is not None:
-                return val
-            raise KeyError(key)
-        return self.extra[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key == RT_COMMIT_FAILURES:
-            self.commit_failures = int(value or 0)
-        elif key == RT_DISPATCH_FAILURES:
-            self.dispatch_failures = int(value or 0)
-        elif key == RT_LAST_RETRY_ERROR:
-            self.last_retry_error = str(value or "")
-        else:
-            self.extra[key] = value
-
-    def __contains__(self, key: str) -> bool:
-        spec = _RUNTIME_FIELDS.get(key)
-        if spec is not None:
-            return getattr(self, spec[0]) != spec[1]
-        return key in self.extra
-
-    def get(self, key: str, default: Any = None) -> Any:
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def setdefault(self, key: str, default: Any = None) -> Any:
-        if key not in self:
-            self[key] = default
-        return self[key]
-
-    def pop(self, key: str, default: Any = None) -> Any:
-        spec = _RUNTIME_FIELDS.get(key)
-        if spec is not None:
-            attr, empty = spec
-            val = getattr(self, attr)
-            setattr(self, attr, empty)
-            return val if val != empty else default
-        return self.extra.pop(key, default)
-
 
 # runtime 规范键注册表：框架字段的单一事实源。empty 为「未设置」哨兵
-# （读取等于哨兵时视同缺省、pop 清空回哨兵、to_dict 导出时省略）；
-# 写入侧的规范化（计数与取串）语义保留在各写入方法内显式表达。
+# （等于哨兵时 to_dict 导出省略）；写入侧的规范化（计数与取串）语义
+# 保留在各写入方法内显式表达。
 # runtime 规范键名常量（键名字符串的单一引用点；引擎写入侧与测试经此引用）
 RT_COMMIT_FAILURES = "_commit_failures"
 RT_DISPATCH_FAILURES = "_dispatch_failures"

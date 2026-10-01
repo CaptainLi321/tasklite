@@ -491,11 +491,7 @@ class TestJobRuntimeState:
         st_two = JobRuntimeState.from_dict({"dispatch_failures": 7})
         assert st_two.dispatch_failures == 0
         assert st_two.extra == {"dispatch_failures": 7}
-        # 映射协议读取同名键直达 extra，不被字段别名遮蔽
-        assert st_two["dispatch_failures"] == 7
-        st_two["dispatch_failures"] = 1
-        assert st_two.dispatch_failures == 0
-        assert st_two.extra["dispatch_failures"] == 1
+        assert st_two.to_dict() == {"dispatch_failures": 7}
 
     def test_stale_loose_same_name_key_cannot_revive_field(self):
         # 同时含规范键与无下划线同名键：字段只认规范键；规范键清空后，
@@ -509,25 +505,6 @@ class TestJobRuntimeState:
         assert back == {"commit_failures": 99}
         st_two = JobRuntimeState.from_dict(back)
         assert st_two.commit_failures == 0
-
-    def test_mapping_protocol_set_get_contains_pop(self):
-        st = JobRuntimeState()
-        st["_commit_failures"] = 3
-        st["_last_retry_error"] = "err"
-        st["user_key"] = {"any": "payload"}
-        assert st["_commit_failures"] == 3
-        assert st["_last_retry_error"] == "err"
-        assert "_commit_failures" in st
-        assert "user_key" in st
-        assert "absent" not in st
-        assert st.get("absent", "fallback") == "fallback"
-        assert st.setdefault("fresh", "v") == "v"
-        assert st.pop("user_key") == {"any": "payload"}
-        assert "user_key" not in st
-        # pop 框架字段：清空回哨兵并返回原值
-        assert st.pop("_commit_failures", None) == 3
-        assert st.commit_failures == 0
-        assert st.pop("_commit_failures", "gone") == "gone"
 
     def test_from_dict_tolerates_dirty_counters(self):
         """持久化容灾：脏计数（非数值/None）降级为 0，不抛异常。"""
