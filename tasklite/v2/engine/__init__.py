@@ -3,7 +3,8 @@
 本包承载引擎机器群与共享值对象（当前已立模块：错误分类 errorclass、
 引擎值对象 types、资源体系 resource、准入与重入队策略 admission、
 等待决策 wait、在飞追踪 in_flight、只读扫描调度器 scheduler、
-死锁治理 governor、执行通道 channel、恢复编排 recovery）。调度逻辑仅留
+死锁治理 governor、执行通道 channel、恢复编排 recovery、状态仓库
+store）。调度逻辑仅留
 seam：选择点收敛在 scheduler 的 scan_next_runnable（访问序经
 OrderingPolicy），重试节奏收敛在 RequeuePolicy（默认立即重入队）。
 
@@ -42,6 +43,16 @@ from .scheduler import (
     ScheduleResult,
     StandstillFacts,
 )
+from .store import (
+    BulkFailureOutcome,
+    COMMIT_FAILURE_THRESHOLD,
+    FailureEntry,
+    FailureOutcome,
+    RetryOutcome,
+    SkipOutcome,
+    StateStore,
+    SuccessOutcome,
+)
 from .resource import (
     CapacityResource,
     RateLimitResource,
@@ -52,6 +63,7 @@ from .resource import (
 from .types import (
     EMPTY_STATS,
     TRANSIENT_KIND_STAT_KEYS,
+    AttemptFinish,
     ExitReason,
     JobHandle,
     StopMode,
@@ -63,6 +75,7 @@ __all__ = [
     "ErrorClassifier",
     "EMPTY_STATS",
     "TRANSIENT_KIND_STAT_KEYS",
+    "AttemptFinish",
     "ExitReason",
     "StopMode",
     "TaskStats",
@@ -99,4 +112,12 @@ __all__ = [
     "DEP_GRACE_SECONDS",
     "DeadlockDecision",
     "DeadlockGovernor",
+    "BulkFailureOutcome",
+    "COMMIT_FAILURE_THRESHOLD",
+    "FailureEntry",
+    "FailureOutcome",
+    "RetryOutcome",
+    "SkipOutcome",
+    "StateStore",
+    "SuccessOutcome",
 ]

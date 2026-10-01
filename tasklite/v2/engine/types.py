@@ -97,6 +97,21 @@ class TaskStats(dict):
         return self["cascade_failed"]
 
 
+@dataclass(frozen=True)
+class AttemptFinish:
+    """一次 attempt 收尾事件的不可变载荷（on_attempt_finished 钩子唯一形状）。
+
+    布尔语义经值对象承载、不裸传：``success`` 与 ``going_to_retry``
+    正交——成功 True/False；失败将重试 False/True；失败耗尽进失败档案
+    False/False。``meta`` 是终态元数据字典视图（成功 wall meta / 失败
+    档案 meta）。
+    """
+
+    success: bool
+    going_to_retry: bool
+    meta: dict[str, Any]
+
+
 @dataclass
 class JobHandle:
     """一个在途子进程的句柄（在飞追踪与收割看门狗共用的值对象）。
@@ -159,6 +174,7 @@ class RunSummary:
 __all__ = [
     "EMPTY_STATS",
     "TRANSIENT_KIND_STAT_KEYS",
+    "AttemptFinish",
     "StopMode",
     "ExitReason",
     "TaskStats",
