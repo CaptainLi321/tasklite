@@ -1,0 +1,783 @@
+"""v2 执行通道：子进程 spawn、阶梯看门狗、IPC 收割、fencing 与 TOCTOU 中止。
+
+ExecutionChannel 统一内敛子进程派发、看门狗阶梯终止、两级降级落盘收割、
+结果认证、跨平台排他文件锁探测与 TOCTOU 闭环清理的底层复杂性。
+
+spawn 上下文显式取 ``mp.get_context("spawn")``：fork 会把父进程的锁
+状态/线程/连接池半成品复制进子进程（引擎侧任何锁的持有状态都会在
+子进程镜像里失真），spawn 注册表经 WorkerLaunchSpec 显式下发、不经
+继承，进程 seam 的全部载荷具名可审计。
+"""
+
+from __future__ import annotations
+
+import logging
+import multiprocessing as mp
+import os
+import time
+import traceback
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from ..exceptions import FatalError, RateLimitHit, RetryError
+from ..models.context import JobContext
+from ..models.job import Job
+from ..utils import lockfile
+from ..utils.ipc import (
+    ArtifactCleanupMode,
+    ArtifactJournal,
+    decode_raw_result as _decode_raw_result,
+    encode_raw_result as _encode_raw_result,
+)
+from ..utils.jsonutil import dumps
+from .errorclass import _DEFAULT_CLASSIFIER, classify_exception
+from .types import JobHandle
+
+logger = logging.getLogger("tasklite.v2")
+
+_KEY_TRACEBACK = "traceback"
+_RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
+
+
+def _normalize_handler_result(result: Any) -> tuple[bool, dict[str, Any]]:
+    """把 handler 返回值归一为 (success, metadata)，坏形态收敛为任务级失败。
+
+    dict/tuple(dict) 元数据必须 JSON 可序列化——含 bytes/datetime/NaN 的
+    元数据会让持久层 commit 失败进而触发崩溃契约，预检后坏 dict 直接
+    进失败档案（宁可单任务失败，不可无限崩溃重启循环）。
+    """
+    if result is None:
+        return True, {}
+    if isinstance(result, bool):
+        return result, {}
+    if isinstance(result, dict):
+        try:
+            dumps(result)
+        except (TypeError, ValueError) as e:
+            logger.error(
+                f"Handler returned dict with non-JSON-serializable metadata: {e}. "
+                f"Job will be marked as failed."
+            )
+            return False, {"error": f"invalid result metadata: not JSON-serializable: {e}"}
+        return True, result
+    if isinstance(result, tuple) and len(result) == 2:
+        if not isinstance(result[0], bool) or not isinstance(result[1], dict):
+            logger.error(
+                f"Handler returned invalid tuple: expected (bool, dict), got "
+                f"({type(result[0]).__name__}, {type(result[1]).__name__}). "
+                f"Job will be marked as failed."
+            )
+            return False, {"error": "invalid handler return tuple: expected (bool, dict)"}
+        try:
+            dumps(result[1])
+        except (TypeError, ValueError) as e:
+            logger.error(
+                f"Handler returned tuple with non-JSON-serializable metadata: {e}. "
+                f"Job will be marked as failed."
+            )
+            return False, {"error": f"invalid result metadata: not JSON-serializable: {e}"}
+        return result[0], result[1]
+    logger.error(
+        f"Handler returned unrecognized type: {type(result).__name__}. "
+        f"Expected None, bool, dict, or tuple(bool, dict). "
+        f"Job will be marked as failed."
+    )
+    return False, {"error": f"invalid handler return type: {type(result).__name__}"}
+
+
+def _parse_spawned_jobs(raw_new_jobs: Any) -> tuple[list[Job], str | None]:
+    """解析结果文件的 new_jobs 字段；坏形态收敛为错误串，绝不抛 TypeError。
+
+    不变式：结果文件任何异常形态都收敛为任务级失败记账，不得以
+    TypeError 穿透收割/认领链使单任务损坏放大为整管崩溃。
+    """
+    if not isinstance(raw_new_jobs, list):
+        return [], f"invalid new_jobs type: {type(raw_new_jobs).__name__}"
+    new_jobs: list[Job] = []
+    for job_dict in raw_new_jobs:
+        try:
+            new_jobs.append(Job.from_dict(job_dict))
+        except (KeyError, TypeError, ValueError) as e:
+            return [], f"invalid spawned job dict: {e}"
+    return new_jobs, None
+
+
+def _parse_cursor_updates(raw_cursors: Any) -> tuple[dict[str, str | None], str | None]:
+    """解析 cursor_updates 字段：键 str、值 str/None，其余收敛为错误串。"""
+    if not isinstance(raw_cursors, dict):
+        return {}, f"invalid cursor_updates type: {type(raw_cursors).__name__}"
+    for key, value in raw_cursors.items():
+        if not (isinstance(key, str) and (value is None or isinstance(value, str))):
+            return {}, f"invalid cursor_updates value: {key!r}={value!r}"
+    return dict(raw_cursors), None
+
+
+def _parse_resource_suspensions(
+    raw_suspensions: Any,
+) -> tuple[list[tuple[str, float]], str | None]:
+    """解析 resource_suspensions 字段：元素 (str, 数字) 二元组，其余报错。"""
+    if not isinstance(raw_suspensions, list):
+        return [], f"invalid resource_suspensions type: {type(raw_suspensions).__name__}"
+    valid: list[tuple[str, float]] = []
+    for item in raw_suspensions:
+        if (
+            isinstance(item, (list, tuple))
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and isinstance(item[1], (int, float))
+            and not isinstance(item[1], bool)
+        ):
+            valid.append((item[0], float(item[1])))
+        else:
+            return [], f"invalid resource_suspension entry: {item!r}"
+    return valid, None
+
+
+def _decode_success_branch(res: dict, job: Job) -> tuple[bool, dict[str, Any], list[Job], dict[str, str | None], list[tuple[str, float]]]:
+    """success 状态解码：raw_result 还原归一 + 三个子字段防御解析。
+
+    返回 (success, result_meta, new_jobs, cursor_updates, resource_suspensions)；
+    任一子段损坏即 success=False 且 result_meta 携带错误串（不抛异常）。
+    """
+    if "raw_result" not in res:
+        logger.error(f"Corrupt result file for {job.uid}: missing 'raw_result' key")
+        return False, {"error": "CORRUPT_RESULT_FILE: missing raw_result"}, [], {}, []
+    try:
+        raw_result = _decode_raw_result(res["raw_result"])
+        success, result_meta = _normalize_handler_result(raw_result)
+    except Exception as e:
+        logger.error(f"Result decode failed for {job.uid}: {e}")
+        return False, {
+            "error": f"CORRUPT_RESULT_FILE: decode failed: {e}",
+            _KEY_TRACEBACK: traceback.format_exc(),
+        }, [], {}, []
+
+    new_jobs, jobs_error = _parse_spawned_jobs(res.get("new_jobs", []))
+    if jobs_error is not None:
+        logger.error(f"Malformed spawned jobs in {job.uid}: {jobs_error}")
+        return False, {"error": jobs_error}, [], {}, []
+
+    if not success:
+        return False, result_meta, [], {}, []
+
+    cursor_updates, cursor_error = _parse_cursor_updates(res.get("cursor_updates", {}))
+    if cursor_error is not None:
+        logger.error(f"Invalid cursor_updates in {job.uid}: {cursor_error}")
+        return False, {"error": cursor_error}, [], {}, []
+    suspensions, suspension_error = _parse_resource_suspensions(
+        res.get("resource_suspensions", [])
+    )
+    if suspension_error is not None:
+        logger.error(f"Invalid resource_suspensions in {job.uid}: {suspension_error}")
+        return False, {"error": suspension_error}, [], {}, []
+    return True, result_meta, new_jobs, cursor_updates, suspensions
+
+
+def _decode_ipc_result(
+    res: dict,
+    p: Any,
+    job: Job,
+    ipc_dir: str | None = None,
+    *,
+    output_roots: Sequence[str | Path] | None = None,
+) -> "ExecutionResult":
+    """解析子进程通过结果文件回传的结果字典（防御解析的单一入口）。
+
+    损坏/注入形态一律收敛为任务级失败或瞬态重试记账，任何输入都不
+    穿透异常；无 status 键的形态死亡归因全权交 classify_process_death
+    决策表（信号死亡与正码崩溃同表同形）。
+    """
+    success = False
+    result_meta: dict[str, Any] = {}
+    retry_requested = False
+    retry_error: str | None = None
+    new_jobs: list[Job] = []
+    cursor_updates: dict[str, str | None] = {}
+    resource_suspensions: list[tuple[str, float]] = []
+    transient_kind: str | None = None
+
+    status = res.get("status") if isinstance(res, dict) else None
+    if status == "success":
+        (
+            success,
+            result_meta,
+            new_jobs,
+            cursor_updates,
+            resource_suspensions,
+        ) = _decode_success_branch(res, job)
+    elif status == "retry":
+        retry_requested = True
+        retry_error = res.get("error")
+        kind = res.get("transient_kind")
+        transient_kind = kind if isinstance(kind, str) else None
+    elif status == "interrupted":
+        retry_requested = True
+        retry_error = res.get("error")
+        transient_kind = "interrupted"
+    elif status == "fatal":
+        result_meta = {
+            "error": res.get("error", "FATAL (no message)"),
+            _KEY_TRACEBACK: res.get(_KEY_TRACEBACK),
+            "fatal": True,
+        }
+        logger.error(f"Fatal error in {job.uid}:\n{res.get(_KEY_TRACEBACK, '')}")
+    elif status is not None:
+        result_meta = {
+            "error": res.get("error", f"unknown status {status!r}"),
+            _KEY_TRACEBACK: res.get(_KEY_TRACEBACK),
+        }
+        logger.error(f"Worker crashed for {job.uid}:\n{res.get(_KEY_TRACEBACK, '')}")
+    else:
+        # 无有效结果文件 → 死亡归因全权交决策表（信号死亡与正码崩溃同表同形）
+        att = _DEFAULT_CLASSIFIER.classify_process_death(
+            getattr(p, "exitcode", None), timed_out=False
+        )
+        result_meta = att.result_meta
+        retry_error = att.retry_error
+        retry_requested = att.retry_requested
+
+    if success and ipc_dir is not None:
+        ok, err = ArtifactJournal(ipc_dir, output_roots=output_roots).verify_outputs(job.uid)
+        if not ok:
+            logger.error(f"Verification failed for {job.uid}: {err}")
+            success = False
+            result_meta = {"error": err}
+
+    return ExecutionResult(
+        success=success,
+        result_meta=result_meta,
+        retry_requested=retry_requested,
+        retry_error=retry_error,
+        new_jobs=new_jobs,
+        cursor_updates=cursor_updates,
+        resource_suspensions=resource_suspensions,
+        transient_kind=transient_kind,
+    )
+
+
+def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
+    """spawn 子进程执行体入口：持锁执行 handler 并把结果原子落盘。
+
+    不变式：锁生命周期严格等于本执行体生命周期（try 前获取、finally
+    释放）——锁先于 handler 获取保证同 uid 执行体全局互斥，finally 释放
+    保证执行体任何出口（含未分类异常）都交还锁。
+    """
+    handler_func = spec.handler
+    job = spec.job
+    ctx = spec.task_ctx
+    ipc_dir = spec.ipc_dir
+    uid = job.uid
+    incarnation = spec.incarnation
+    if not incarnation:
+        raise RuntimeError(
+            f"worker started without incarnation for {uid}: "
+            f"fencing requires WorkerLaunchSpec.incarnation"
+        )
+    journal = ArtifactJournal(ipc_dir)
+    result_token = spec.result_token
+
+    def _write_result(payload: dict[str, Any]) -> None:
+        # 结果认证令牌随全部状态通道落盘，主进程读取侧强校验
+        payload["auth"] = result_token
+        journal.write_result_with_degradation(uid, payload, incarnation=incarnation)
+
+    transient_registry = getattr(ctx, "transient_registry", ()) or ()
+    try:
+        _lock_fd = lockfile.try_acquire_lock(ipc_dir, uid, timeout=2.0)
+    except OSError as e:
+        # 锁文件环境故障（权限/目录占位）写降级重试结果：与「锁被占」
+        # 同走瞬态信号通道（零预算、降级写盘、零污染），不让单作业环境
+        # 故障炸穿执行体；errno 归因保留供运维区分两种语义。
+        _write_result({
+            "status": "retry",
+            "transient_kind": "lock_conflict",
+            "error": f"LOCK_ENV_FAULT: cannot open lock file for {uid} "
+                     f"(errno={getattr(e, 'errno', None)}): {e}",
+        })
+        return
+    if _lock_fd is None:
+        _write_result({
+            "status": "retry",
+            "transient_kind": "lock_conflict",
+            "error": f"LOCK_CONFLICT: another execution body holds {uid} lock",
+        })
+        return
+    try:
+        raw_result = handler_func(job, ctx)
+        _write_result({
+            "status": "success",
+            "raw_result": _encode_raw_result(raw_result),
+            "new_jobs": [j.to_dict() for j in ctx.new_jobs],
+            "resource_suspensions": ctx.resource_suspensions,
+            "cursor_updates": ctx.cursor_updates,
+        })
+    except RetryError as e:
+        # 限流瞬态判定必须在子进程编码侧完成：RateLimitHit 是 RetryError
+        # 子类、与本类共享 status="retry" 通道，父进程侧已无异常类型可辨；
+        # 预算豁免依赖该结构化字段（与 lock_conflict 同构）。
+        retry_payload: dict[str, Any] = {"status": "retry", "error": str(e)}
+        if isinstance(e, RateLimitHit):
+            retry_payload["transient_kind"] = "rate_limited"
+        _write_result(retry_payload)
+    except FatalError as e:
+        _write_result({
+            "status": "fatal",
+            "error": str(e),
+            _KEY_TRACEBACK: traceback.format_exc(),
+        })
+    except Exception as e:
+        kind = classify_exception(
+            e,
+            transient_registry,
+            fatal_exceptions=getattr(ctx, "fatal_exceptions", None),
+            transient_exceptions=getattr(ctx, "transient_exceptions", None),
+        )
+        if kind == "retry":
+            _write_result({
+                "status": "retry",
+                "error": f"{type(e).__name__}: {e}",
+            })
+        elif kind == "fatal":
+            _write_result({
+                "status": "fatal",
+                "error": f"{type(e).__name__}: {e}",
+                _KEY_TRACEBACK: traceback.format_exc(),
+            })
+        else:
+            _write_result({
+                "status": "error",
+                "error": f"{type(e).__name__}: {e}",
+                _KEY_TRACEBACK: traceback.format_exc(),
+            })
+    except KeyboardInterrupt as e:
+        _write_result({
+            "status": "interrupted",
+            "error": f"WORKER_INTERRUPTED: {type(e).__name__}",
+            _KEY_TRACEBACK: traceback.format_exc(),
+        })
+    except SystemExit as e:
+        _write_result({
+            "status": "error",
+            "error": f"WORKER_INTERRUPTED: {type(e).__name__}",
+            _KEY_TRACEBACK: traceback.format_exc(),
+        })
+    finally:
+        lockfile.release_lock(_lock_fd)
+
+
+@dataclass
+class ExecutionResult:
+    """单次子进程执行的收割产物（收割/认领/中止三路径共形）。"""
+
+    success: bool = False
+    result_meta: dict[str, Any] = field(default_factory=dict)
+    retry_requested: bool = False
+    retry_error: str | None = None
+    new_jobs: list[Job] = field(default_factory=list)
+    cursor_updates: dict[str, str | None] = field(default_factory=dict)
+    resource_suspensions: list[tuple[str, float]] = field(default_factory=list)
+    transient_kind: str | None = None
+    going_to_retry: bool | None = None
+
+
+@dataclass(frozen=True)
+class WorkerLaunchSpec:
+    """进程 seam 具名契约——spawn 下发子进程执行体的全部载荷。
+
+    incarnation（``{run_id}.{dispatch_seq}`` 执行身份）与结果认证令牌归
+    本 spec，不借道 JobContext 属性穿透进程边界。
+    """
+
+    handler: Callable[[Job, JobContext], Any]
+    job: Job
+    task_ctx: JobContext
+    incarnation: str
+    ipc_dir: str
+    timeout: float
+    result_token: str | None = None
+
+
+@dataclass(frozen=True)
+class AbortOutcome:
+    """强制终止/异常停机时的收尾结果。
+
+    salvaged_signals：杀进程后补排空捞回的 (uid, resource, seconds)——
+    cancelled 任务的信号文件已随半成品清理删除，其 suspend 信号只能经
+    本列表带回上层应用（suspend 的 max 语义保证重复应用幂等）。
+    """
+
+    completed: list[tuple[JobHandle, ExecutionResult]]
+    cancelled: list[JobHandle]
+    salvaged_signals: list[tuple[str, str, float]] = field(default_factory=list)
+
+
+class ExecutionChannel:
+    """标准子进程执行通道深模块实现。"""
+
+    _JOIN_REAP_TIMEOUT: float = 5.0
+
+    def __init__(
+        self,
+        ipc_dir: str | Path | None = None,
+        *,
+        mp_ctx: Any | None = None,
+        output_roots: str | Path | Sequence[str | Path] | None = None,
+    ) -> None:
+        self._mp_ctx = mp_ctx or mp.get_context("spawn")
+        self.ipc_dir = str(ipc_dir) if ipc_dir is not None else None
+        # 输出沙盒信任根随 channel 注入 journal——清理消费侧的删除复检依赖
+        self.output_roots = output_roots
+        # 每 run 随机结果认证令牌（run 启动屏障由 runtime 同步）；None 表示未启用
+        self.result_token: str | None = None
+        if self.ipc_dir:
+            try:
+                Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+
+    @property
+    def journal(self) -> ArtifactJournal:
+        ipc = getattr(self, "ipc_dir", None)
+        cached = getattr(self, "_journal", None)
+        if cached is None or cached.ipc_dir != ipc:
+            cached = ArtifactJournal(ipc, output_roots=getattr(self, "output_roots", None))
+            self._journal = cached
+        return cached
+
+    @journal.setter
+    def journal(self, value: ArtifactJournal) -> None:
+        self._journal = value
+
+    @staticmethod
+    def _finalize_process(p: Any) -> None:
+        """清理单个子进程：kill + join + close（各步失败降级但留痕，不阻断收割）。"""
+        try:
+            if p.is_alive():
+                p.kill()
+        except Exception as e:
+            logger.warning(f"Process kill failed during finalize: {e}")
+        try:
+            p.join(timeout=ExecutionChannel._JOIN_REAP_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"Process join failed during finalize: {e}")
+        try:
+            process_close = getattr(p, "close", None)
+            if process_close is not None:
+                process_close()
+        except Exception as e:
+            logger.warning(f"Process close failed during finalize: {e}")
+
+    def spawn(self, spec: WorkerLaunchSpec) -> JobHandle:
+        """启动隔离子进程执行 handler，建立 incarnation fencing，立即返回句柄。"""
+        effective_ipc_dir = spec.ipc_dir or self.ipc_dir or os.environ.get(_RESULT_DIR_ENV)
+        if not effective_ipc_dir:
+            raise ValueError("ipc_dir is required for ExecutionChannel.spawn()")
+        Path(effective_ipc_dir).mkdir(parents=True, exist_ok=True)
+        # 不变式：收割路径（journal/probe/drain）以实例属性为事实源，实例
+        # 属性为空而经兜底解析成功时必须回写，保证与 handle 派发路径同源
+        if self.ipc_dir is None:
+            self.ipc_dir = str(effective_ipc_dir)
+        spec.task_ctx.ipc_dir = effective_ipc_dir
+        p = None
+        try:
+            p = self._mp_ctx.Process(target=_mp_worker_wrapper, args=(spec,))
+            p.start()
+        except Exception:
+            if p is not None:
+                self._finalize_process(p)
+            raise
+        deadline = time.monotonic() + spec.timeout
+        return JobHandle(
+            uid=spec.job.uid,
+            process=p,
+            deadline=deadline,
+            timeout=spec.timeout,
+            job=spec.job,
+            ipc_dir=effective_ipc_dir,
+            incarnation=spec.incarnation,
+        )
+
+    def _read_authenticated_result(self, path: Path) -> dict | None:
+        """读取侧强校验结果认证令牌，不匹配按无结果丢弃（瞬态、零预算）。
+
+        威胁模型：ipc_dir 写入者可伪造结果文件驱动 wall 投毒、new_jobs
+        子任务注入与 cursor 投毒；令牌不匹配的结果绝不进入解码管线。
+        """
+        res = self.journal.read_result(path)
+        token = getattr(self, "result_token", None)
+        if res is not None and token is not None and res.get("auth") != token:
+            logger.error(
+                f"Result auth token mismatch, discarding untrusted result: {path.name}"
+            )
+            return None
+        return res
+
+    def _token_ok(self, res: dict | None, uid: str) -> dict | None:
+        """认领读取侧的令牌强校验（与 _read_authenticated_result 同一信任锚）。"""
+        token = getattr(self, "result_token", None)
+        if res is not None and token is not None and res.get("auth") != token:
+            logger.error(
+                f"Stale result auth token mismatch for {uid}; "
+                f"discarding untrusted result"
+            )
+            return None
+        return res
+
+    def _read_if_exists(self, path: Path) -> dict | None:
+        """结果文件存在才认证读取（收割快路径/死亡复读共用的原语）。"""
+        return self._read_authenticated_result(path) if path.exists() else None
+
+    def _salvage_signals(self, uid: str, decoded: ExecutionResult | None) -> list[tuple[str, float]]:
+        """排空 uid 的挂起信号：decoded 非 None 时并入其挂起列表，否则原样返回。
+
+        不变式：结果文件已原子落盘 ⇒ 本执行体的信号追加全部早于落盘
+        （record_signal 只发生在 handler 执行期内），此刻排空无并发写者、
+        无损；非 success payload 不携带挂起字段，缺此步时完成机器的收尾
+        清理会把「先排空阶段之后写入」的信号文件未读删除。
+        """
+        try:
+            pending = self.journal.drain_signals(uid)
+        except Exception as e:
+            logger.warning(f"Failed to salvage signals for {uid}: {e}")
+            return []
+        if decoded is not None and pending:
+            decoded.resource_suspensions = (
+                list(decoded.resource_suspensions) + list(pending)
+            )
+        return pending
+
+    def _consume_result_if_present(self, handle: JobHandle) -> ExecutionResult | None:
+        """认证读取 → 守卫过滤 → 解码 → 信号并入的单一读取原语。
+
+        守卫契约：结果须为带 status 键的 dict 且非 interrupted 报告——
+        worker 报告被中断的结果按「未完成」处理（重入队），不作为终态。
+        abort 双阶段（杀进程前初查 / 杀死后重探测闭环）共用本原语。
+        """
+        incarnation = getattr(handle, "incarnation", None)
+        res_path = self.journal.result_path(handle.uid, incarnation)
+        if not res_path.exists():
+            return None
+        raw_res = self._read_authenticated_result(res_path)
+        if not (
+            raw_res is not None
+            and isinstance(raw_res, dict)
+            and "status" in raw_res
+            and raw_res.get("status") != "interrupted"
+        ):
+            return None
+        decoded = _decode_ipc_result(
+            raw_res, None, handle.job, self.ipc_dir,
+            output_roots=getattr(self, "output_roots", None),
+        )
+        self._salvage_signals(handle.uid, decoded)
+        return decoded
+
+    def reap_completed(
+        self, handles: Sequence[JobHandle]
+    ) -> list[tuple[JobHandle, ExecutionResult]]:
+        """非阻塞扫描所有 in-flight handle，返回本次已完成的 (handle, result)。"""
+        completed: list[tuple[JobHandle, ExecutionResult]] = []
+
+        for handle in handles:
+            now = time.monotonic()
+            p = handle.process
+            res_path = self.journal.result_path(handle.uid, handle.incarnation)
+
+            res = self._read_if_exists(res_path)
+            if res is not None:
+                completed.append((handle, self._collect_outcome(handle, res)))
+                continue
+
+            if not p.is_alive():
+                res = self._read_if_exists(res_path)
+                completed.append((handle, self._collect_outcome(handle, res)))
+                continue
+
+            if now > handle.deadline:
+                p.join(timeout=0.5)
+                if p.is_alive():
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    is_timeout = True
+                else:
+                    # join 窗口内已自然退出：死亡归因全权交 exitcode 分簇
+                    # （0 → NO_IPC_RESULT 瞬态、<0 信号、>0 正码崩溃），与
+                    # deadline 前同因事件同果，不折入 TIMEOUT；仅 kill 后
+                    # 仍存活/被击杀的执行体才归 TIMEOUT。
+                    is_timeout = False
+                res = self._read_if_exists(res_path)
+                completed.append(
+                    (handle, self._collect_outcome(handle, res, is_timeout=is_timeout))
+                )
+
+        return completed
+
+    def _collect_outcome(
+        self, handle: JobHandle, res: dict | None, *, is_timeout: bool = False
+    ) -> ExecutionResult:
+        """收敛收割三段同构尾部：解析结果 → 收割进程 → 清理 IPC 文件。"""
+        p = handle.process
+        result: ExecutionResult | None = None
+        try:
+            if res is not None:
+                result = _decode_ipc_result(
+                    res, p, handle.job, handle.ipc_dir,
+                    output_roots=getattr(self, "output_roots", None),
+                )
+            else:
+                result = self._build_terminal_failure(p, handle, is_timeout=is_timeout)
+        finally:
+            self._finalize_process(p)
+            pending_signals = self._salvage_signals(handle.uid, result)
+            if pending_signals:
+                logger.info(
+                    f"Salvaged {len(pending_signals)} suspend signal(s) "
+                    f"from {handle.uid} before IPC cleanup"
+                )
+            self.journal.cleanup_ipc_files(handle.uid, handle.incarnation)
+        return result
+
+    def claim_stale_result(self, uid: str, job: Job) -> ExecutionResult | None:
+        """启动/派发前崩溃恢复：认领并消费上次 run 遗留的已落盘残留结果。
+
+        残留结果必须携带本 run 的认证令牌——跨 run 残留与伪造残留一律
+        丢弃（崩溃恢复退化为重跑，保守正确；伪造残留的注入链不可达）。
+        """
+        res = self._token_ok(self.journal.claim_stale_result_payload(uid), uid)
+        if res is None:
+            return None
+        return _decode_ipc_result(
+            res, None, job, self.ipc_dir,
+            output_roots=getattr(self, "output_roots", None),
+        )
+
+    @staticmethod
+    def _build_terminal_failure(
+        p: Any, handle: JobHandle, *, is_timeout: bool
+    ) -> ExecutionResult:
+        """构造进程终止（崩溃/超时）但无结果文件时的 ExecutionResult。"""
+        att = _DEFAULT_CLASSIFIER.classify_process_death(
+            p.exitcode,
+            timed_out=is_timeout,
+            timeout_seconds=handle.timeout,
+            timeout_is_transient=getattr(handle.job, "timeout_is_transient", False),
+        )
+        if att.retry_requested and "signal" in att.result_meta:
+            logger.warning(
+                f"Worker for {handle.uid} died by {att.result_meta['signal']}; "
+                f"will retry (requeue pacing is owned by RequeuePolicy)"
+            )
+        return ExecutionResult(
+            success=False,
+            result_meta=att.result_meta,
+            retry_requested=att.retry_requested,
+            retry_error=att.retry_error,
+        )
+
+    def probe_orphan_lock(self, uid: str) -> bool:
+        """非阻塞探测执行锁。True 表示无孤儿持锁可安全执行；False 表示孤儿活跃需 defer。"""
+        if self.ipc_dir is None:
+            return True
+        return lockfile.probe_lock(self.ipc_dir, uid)
+
+    def drain_active_signals(self, uids: Iterable[str]) -> list[tuple[str, str, float]]:
+        """原子排空所有在途任务追加的 suspend 信号。"""
+        signals: list[tuple[str, str, float]] = []
+        for uid in uids:
+            for r_name, secs in self.journal.drain_signals(uid):
+                signals.append((uid, r_name, secs))
+        return signals
+
+    def drain_all_signals(self) -> list[tuple[str, str, float]]:
+        """启动期清扫 ipc_dir 全部残留 suspend 信号（含 .draining 孤儿回收）。"""
+        return self.journal.drain_all_signals()
+
+    def abort_in_flight(self, handles: Sequence[JobHandle]) -> AbortOutcome:
+        """TOCTOU 闭环中止：排空信号 → 初查分类 → 进程终止 → 重探测闭环 → 残留清理。"""
+        if not handles:
+            return AbortOutcome(completed=[], cancelled=[])
+
+        done_pairs: list[tuple[JobHandle, ExecutionResult]] = []
+        pending_handles: list[JobHandle] = []
+
+        for handle in handles:
+            decoded = self._consume_result_if_present(handle)
+            if decoded is not None:
+                done_pairs.append((handle, decoded))
+                continue
+            pending_handles.append(handle)
+
+        if pending_handles:
+            self.finalize_processes(pending_handles)
+
+        # 杀进程后补排空（不变式：收尾排空必须晚于进程终止）。abort 序列
+        # 「先排空后杀」窗口内 worker 终生前写入的 suspend 信号，唯一可靠
+        # 捞回点是进程死亡后的最终排空（无并发写者，排空无损）；缺此步时
+        # cancelled 分支的半成品清理会把信号文件连同信号一起删除。
+        salvaged: list[tuple[str, str, float]] = []
+        truly_cancelled: list[JobHandle] = []
+        for handle in pending_handles:
+            decoded = self._consume_result_if_present(handle)
+            if decoded is not None:
+                done_pairs.append((handle, decoded))
+                continue
+            # 杀进程后仍无结果：半成品清理前最后捞回信号（无并发写者）
+            salvaged.extend(
+                (handle.uid, r_name, secs)
+                for r_name, secs in self._salvage_signals(handle.uid, None)
+            )
+            self.cleanup_artifacts(handle.uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
+            truly_cancelled.append(handle)
+
+        return AbortOutcome(
+            completed=done_pairs,
+            cancelled=truly_cancelled,
+            salvaged_signals=salvaged,
+        )
+
+    def cleanup_in_flight(self, handles: Sequence[JobHandle]) -> None:
+        """主循环异常退出时 kill + join 所有残留 in-flight 子进程并清理 IPC。"""
+        for handle in handles:
+            try:
+                self._finalize_process(handle.process)
+                self.journal.cleanup_ipc_files(handle.uid, handle.incarnation)
+            except Exception as e:
+                logger.error(f"Error cleaning up in-flight job {handle.uid}: {e}")
+
+    def finalize_processes(self, handles: Sequence[JobHandle]) -> None:
+        """只 kill + join 残留子进程，不删 IPC 文件。"""
+        for handle in handles:
+            try:
+                self._finalize_process(handle.process)
+            except Exception as e:
+                logger.error(f"Error finalizing in-flight job {handle.uid}: {e}")
+
+    def cleanup_artifacts(self, uid: str, *, mode: ArtifactCleanupMode) -> None:
+        """统一收敛产物与 IPC 临时文件的生命周期清理。"""
+        self.journal.cleanup(uid, mode=mode)
+
+    def read_declared_inputs(self, uid: str) -> list[dict]:
+        """读取任务声明的输入清单。"""
+        try:
+            return self.journal.read_inputs(uid)
+        except Exception:
+            return []
+
+
+__all__ = [
+    "AbortOutcome",
+    "ArtifactCleanupMode",
+    "ExecutionChannel",
+    "ExecutionResult",
+    "JobHandle",
+    "WorkerLaunchSpec",
+    "_decode_ipc_result",
+    "_decode_raw_result",
+    "_encode_raw_result",
+    "_mp_worker_wrapper",
+    "_normalize_handler_result",
+]

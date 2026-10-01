@@ -3,9 +3,9 @@
 本包承载引擎机器群与共享值对象（当前已立模块：错误分类 errorclass、
 引擎值对象 types、资源体系 resource、准入与重入队策略 admission、
 等待决策 wait、在飞追踪 in_flight、只读扫描调度器 scheduler、
-死锁治理 governor）。调度逻辑仅留 seam：选择点收敛在 scheduler 的
-scan_next_runnable（访问序经 OrderingPolicy），重试节奏收敛在
-RequeuePolicy（默认立即重入队）。
+死锁治理 governor、执行通道 channel、恢复编排 recovery）。调度逻辑仅留
+seam：选择点收敛在 scheduler 的 scan_next_runnable（访问序经
+OrderingPolicy），重试节奏收敛在 RequeuePolicy（默认立即重入队）。
 
 分层红线：本包属核心层，严禁 import ``v2/wrappers/`` 与 ``v2/contrib/``，
 亦不得依赖 v1 旧树任何模块；可依赖 ``v2/{models,utils,backend}``。
@@ -17,6 +17,12 @@ from .admission import (
     RequeuePlan,
     RequeuePolicy,
     RerunPolicy,
+)
+from .channel import (
+    AbortOutcome,
+    ExecutionChannel,
+    ExecutionResult,
+    WorkerLaunchSpec,
 )
 from .errorclass import ErrorClassifier
 from .governor import (
@@ -59,6 +65,10 @@ __all__ = [
     "ExitReason",
     "StopMode",
     "TaskStats",
+    "AbortOutcome",
+    "ExecutionChannel",
+    "ExecutionResult",
+    "WorkerLaunchSpec",
     "Resource",
     "RateLimitResource",
     "CapacityResource",
