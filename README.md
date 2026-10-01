@@ -172,6 +172,18 @@ pipeline.run()
 
 ---
 
+## 🧭 v2 子包（Task/Job/Attempt 三层重建）
+
+v1 之外，仓库内并行生长着 **v2 重建子包**（[`tasklite/v2/`](tasklite/v2/)，总纲 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)）：架构照搬 v1（进程隔离、SQLite WAL、六步契约不变），模型重塑为 **Task（规格）/ Job（逻辑实例）/ Attempt（执行轨迹）** 三层，命名体系全面翻新（`register_handler`→`register_task`、`add_resource`→`register_resource`、死信队列→**失败档案**、`sanitize_*`→`encode_*`），退避机制移除、调度策略收敛为 OrderingPolicy / RequeuePolicy 接缝。**v1 处于冻结期**（仅缺陷修复），v2 严禁反向依赖 v1。
+
+```python
+from tasklite.v2 import TaskLite, Job, Task, AttemptRecord
+```
+
+使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**，设计与命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)。本文其余章节描述 v1 公开面。
+
+---
+
 ## 🍳 实战 Recipes
 
 ### Recipe 1: 增量分页扫描器 (Discovery)

@@ -76,4 +76,5 @@
 - **架构决策记录（ADR）**：[`docs/adr/`](docs/adr/)（v2 重建总纲：ADR-0004）
 - **文档唯一总纲**：[`README.md`](README.md)
 - **完整 API 参考与运维手册**：[`docs/API_GUIDE.md`](docs/API_GUIDE.md)
+- **v2 权威使用指南**：[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)（Task/Job/Attempt 三层模型、六步契约、失败档案、调度 seam 与 v1→v2 命名映射）
 - **Discovery 需求契约**：[`tasklite/wrappers/discovery.py`](tasklite/wrappers/discovery.py)
