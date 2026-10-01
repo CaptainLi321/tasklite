@@ -1,0 +1,532 @@
+"""EngineRuntime：v2 核心运行期深模块（装配 + 薄事件泵）。
+
+统一聚合主循环事件泵（四相：填池派发 → 死锁仲裁 → 回收结算 → 等待
+决策）、五关预检派发、结果收敛事务、崩溃/停机恢复与在途追踪。装配
+快照见 RunConfig（engine/config.py）；一次 run 的生命周期状态与钩子
+单一出口见 RunSession（engine/session.py）。
+"""
+from __future__ import annotations
+
+import logging
+import pickle
+import secrets
+import signal
+import time
+import traceback
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+from .config import RunConfig
+from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
+from .channel import ExecutionChannel
+from .completion import CompletionMachine
+from .errorclass import ErrorClassifier
+from .in_flight import InFlightTracker
+from .recovery import RecoveryOrchestrator
+from .scheduler import JobScheduler
+from .session import RunSession
+from .store import StateStore
+from .types import (
+    ExecutionOptions,
+    ExitReason,
+    RunSummary,
+    StepOutcome,
+    StopMode,
+    TaskStats,
+)
+from .wait import LoopFacts, decide_wait
+from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..models.state import PipelineState
+from ..utils.lockfile import release_lock, try_acquire_lock
+
+logger = logging.getLogger("tasklite.v2")
+
+# step() 单步派发上限缺省（显式上限由调用方传入）
+_UNBOUNDED_DISPATCH_LIMIT = 1_000_000
+
+
+@dataclass(frozen=True)
+class DeadlockArbitration:
+    """无可运行候选时死锁仲裁的命名结果。
+
+    - ``deadlock_detected``: 本拍是否判定并已熔断死锁（进失败档案）；
+    - ``should_terminate``: governor 独立终止信号（全队列熔断且队列清空）；
+    - ``wait_seconds``: 宽限/缺口重试的建议等待秒数（否则 0）。
+    """
+
+    deadlock_detected: bool
+    should_terminate: bool
+    wait_seconds: float
+
+
+class EngineRuntime:
+    """v2 核心运行期深模块：装配机器群并驱动四相事件泵。"""
+
+    def __init__(self, config: RunConfig) -> None:
+        self.config = config
+        self.backend = config.backend
+        self.tasks = config.tasks
+        self.scheduler = JobScheduler(resources=config.resources)
+        self.governor = config.governor
+
+        # 持久会话：execute() 经 begin() 复位（语义等价于每次新建会话，
+        # 同时保证机器持有的 session 引用跨 run 稳定）。
+        self._session = RunSession(
+            on_run_start=config.on_run_start,
+            on_attempt_finished=config.on_attempt_finished,
+            on_run_end=config.on_run_end,
+        )
+
+        # 构造期即建 StateStore（enqueue/OpsConsole 在 run 前可用）；
+        # on_attempt_finished 绑定会话方法——钩子后置变更即时生效。
+        self.store: StateStore = StateStore(
+            self.backend,
+            commit_failure_threshold=config.commit_failure_threshold,
+            classifier=config.classifier,
+            on_attempt_finished=self._session.fire_attempt_finished,
+            stats=self._session.stats,
+            rerun_policy=config.rerun_policy,
+            requeue_policy=config.requeue_policy,
+        )
+
+        self.channel: ExecutionChannel = config.channel
+        self._in_flight: InFlightTracker = InFlightTracker()
+
+        # 构建机器依赖拓扑（recovery 依赖 completion；dispatch 依赖 recovery）
+        self._completion = CompletionMachine(
+            store=self.store,
+            rerun_policy=config.rerun_policy,
+            channel=self.channel,
+            resources=config.resources,
+            in_flight=self._in_flight,
+            session=self._session,
+        )
+        self._recovery = RecoveryOrchestrator(
+            store=self.store,
+            channel=self.channel,
+            resources=config.resources,
+            in_flight=self._in_flight,
+            policy=config.rerun_policy,
+            completion=self._completion,
+        )
+        self._dispatch = DispatchMachine(
+            store=self.store,
+            scheduler=self.scheduler,
+            rerun_policy=config.rerun_policy,
+            resources=config.resources,
+            channel=self.channel,
+            in_flight=self._in_flight,
+            session=self._session,
+            recovery=self._recovery,
+            tasks=config.tasks,
+            classifier=config.classifier,
+            output_root=config.output_root,
+            ipc_dir=config.ipc_dir,
+            commit_failure_threshold=config.commit_failure_threshold,
+        )
+
+        self._run_lock_fd: int | None = None
+        self._is_running: bool = False
+
+    @property
+    def session(self) -> RunSession:
+        return self._session
+
+    @property
+    def in_flight(self) -> InFlightTracker:
+        return self._in_flight
+
+    @property
+    def stats(self) -> TaskStats:
+        return self._session.stats
+
+    @property
+    def stop_mode(self) -> StopMode:
+        return self._session.stop_mode
+
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
+    @property
+    def state(self) -> PipelineState:
+        return self.store.state
+
+    @property
+    def classifier(self) -> ErrorClassifier:
+        return self.config.classifier
+
+    def request_stop(self, *, force: bool = False) -> StopMode:
+        """停机请求接口（单调状态转移，委托 RunSession）。"""
+        return self._session.request_stop(force=force)
+
+    def execute(self, options: ExecutionOptions | None = None) -> RunSummary:
+        """完整执行管线生命周期。"""
+        opts = options if options is not None else ExecutionOptions()
+        start_time = time.monotonic()
+        exit_reason = ExitReason.COMPLETED
+
+        # 不变式：run() 重入守卫——同一实例并发 execute 必须 fail-loud 拒绝
+        if self._is_running:
+            raise RuntimeError("Pipeline run() already in progress on this instance.")
+        self._is_running = True
+
+        old_sigterm = None
+        old_sigint = None
+        # 不变式：任何离开 execute() 的路径都必须复位 _is_running 并释放已
+        # 获取的锁 fd。初始化段（锁获取 + 信号陷阱）与 begin 前预检
+        # （strict_picklable）故障同样走该收尾，但不触发 fire_run_end——
+        # run 尚未 begin，on_run_end 只属于已开始的 run（与 on_run_start
+        # 起止对称）。
+        session_begun = False
+        try:
+            # 1. 单运行排他文件锁（try_acquire_lock 契约：仅「锁被占」返回
+            #    None，权限/磁盘满等环境故障抛 OSError，语义必须上抛不吞）。
+            #    fd 返回值立即注册（None 注册无害）：注册前的 KI 窗口是解释器
+            #    字节码级、纯 Python 无法消除，此处收敛到最小。
+            if opts.acquire_run_lock:
+                self._run_lock_fd = try_acquire_lock(
+                    self.config.ipc_dir, "__pipeline_run__", timeout=0
+                )
+                if self._run_lock_fd is None:
+                    raise RuntimeError(
+                        f"Another run() is in progress for state_dir "
+                        f"{self.config.ipc_dir}; concurrent runs on the same "
+                        f"state are forbidden."
+                    )
+
+            # 2. 信号陷阱
+            if opts.install_signals:
+                try:
+                    old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
+                except (ValueError, OSError):
+                    pass
+                try:
+                    old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
+                except (ValueError, OSError):
+                    pass
+        except BaseException:
+            if old_sigterm is not None:
+                signal.signal(signal.SIGTERM, old_sigterm)
+            if old_sigint is not None:
+                signal.signal(signal.SIGINT, old_sigint)
+            if self._run_lock_fd is not None:
+                release_lock(self._run_lock_fd)
+                self._run_lock_fd = None
+            self._is_running = False
+            raise
+
+        try:
+            self._preflight_picklable_handlers()
+            # 新 run 复位：统计/序号/停机态/幂等标志归零；store 记账换新 stats。
+            self._session.begin()
+            session_begun = True
+            self.store.set_stats(self._session.stats)
+            self.governor.reset()
+
+            # on_run_start 钩子（单一出口在 RunSession）
+            self._session.fire_run_start()
+
+            self._run_body()
+
+            exit_reason = self._session.exit_reason()
+
+        except KeyboardInterrupt as e:
+            exit_reason = self._session.exit_reason(e)
+            raise
+        except BaseException as e:
+            exit_reason = self._session.exit_reason(e)
+            raise
+        finally:
+            # on_run_end 仅在对应 on_run_start 已可能触发的 run（已 begin）
+            # 上触发：begin 前失败不发 end，杜绝起止不对称。
+            if session_begun:
+                self._session.fire_run_end(exit_reason.value)
+            if self._run_lock_fd is not None:
+                release_lock(self._run_lock_fd)
+                self._run_lock_fd = None
+            self._is_running = False
+
+            if old_sigterm is not None:
+                signal.signal(signal.SIGTERM, old_sigterm)
+            if old_sigint is not None:
+                signal.signal(signal.SIGINT, old_sigint)
+
+        duration = time.monotonic() - start_time
+        return RunSummary(
+            exit_reason=exit_reason,
+            stats=self._session.stats,
+            run_id=self._session.run_id or "",
+            duration_seconds=duration,
+        )
+
+    # ── 四相事件泵 ────────────────────────────────────────────────────
+
+    def _terminal_outcome(self) -> StepOutcome:
+        """三个终态早退（ABORTING / 排空完毕 / 空闲完成）的统一形状：
+        全零计数 + should_terminate=True + 当前停机态与退出原因透传。"""
+        return StepOutcome(
+            dispatched_count=0,
+            completed_count=0,
+            is_idle=True,
+            should_wait=False,
+            wait_time=0.0,
+            deadlock_detected=False,
+            stop_mode=self._session.stop_mode,
+            should_terminate=True,
+            exit_reason=self._session.exit_reason().value,
+        )
+
+    def _fill_dispatch_pool(
+        self, limit: int, draining: bool
+    ) -> tuple[DispatchOutcome | None, float, int]:
+        """相一·填池派发（仅非 DRAINING 且未超单步上限）：逐个 dispatch_next，
+        SPAWNED / HANDLED_NO_SUBPROCESS 继续填池，WORKER_SATURATED /
+        NO_CANDIDATE 断流即停；worker_wait 聚合取 min（多次资源挂起恢复
+        取最早者）。
+
+        Returns:
+            (最后一次派发结果或 None, worker_wait 最小值或 0, 实派发计数)
+        """
+        last_outcome: DispatchOutcome | None = None
+        worker_wait = 0.0
+        dispatched = 0
+        if not draining:
+            while dispatched < limit:
+                outcome = self._dispatch.dispatch_next()
+                last_outcome = outcome
+                if outcome.worker_wait > 0:
+                    worker_wait = (
+                        outcome.worker_wait
+                        if worker_wait <= 0
+                        else min(worker_wait, outcome.worker_wait)
+                    )
+                if outcome.kind is DispatchKind.SPAWNED:
+                    dispatched += 1
+                    continue
+                if outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS:
+                    continue
+                break
+        return last_outcome, worker_wait, dispatched
+
+    def _arbitrate_deadlock(
+        self, last_outcome: DispatchOutcome | None, store: StateStore
+    ) -> DeadlockArbitration:
+        """相二·无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。"""
+        deadlock_detected = False
+        should_terminate = False
+        wait_seconds = 0.0
+        if last_outcome is not None and last_outcome.kind is DispatchKind.NO_CANDIDATE:
+            if store.is_empty and not self._in_flight:
+                should_terminate = True
+            elif not self._in_flight:
+                decision = self.governor.arbitrate(
+                    last_outcome.standstill, store=self.store
+                )
+                if decision.action == "resolved":
+                    deadlock_detected = True
+                    if decision.should_terminate:
+                        should_terminate = True
+                elif decision.action in ("grace_waiting", "gap_retrying"):
+                    if decision.wait_time > 0:
+                        wait_seconds = decision.wait_time
+        return DeadlockArbitration(
+            deadlock_detected=deadlock_detected,
+            should_terminate=should_terminate,
+            wait_seconds=wait_seconds,
+        )
+
+    def _drain_and_settle(self) -> int:
+        """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
+        if not self._in_flight:
+            return 0
+        self._recovery.apply_pending_signals()
+        handles = self._in_flight.active_handles()
+        completed = self.channel.reap_completed(handles)
+        return self._completion.settle_reaped(completed)
+
+    def step(self, max_dispatch: int | None = None) -> StepOutcome:
+        """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。
+
+        run 身份（run_id/result_token/空态装载）唯一负责者是
+        prepare_run_state（execute() 启动屏障）——store.state 恒非 None
+        （构造与 set_state 双点归一化），经 run() 外直达 step 的路径由
+        测试显式 set_state 装载，无需惰性引导。
+        """
+        store = self.store
+
+        # 0. 停机门：ABORTING 强杀在途、DRAINING 排空完毕、空闲完成三早退
+        draining = False
+        if self._session.stop_mode is not StopMode.NONE:
+            if self._session.stop_mode is StopMode.ABORTING:
+                logger.warning("Force abort requested. Killing in-flight jobs.")
+                self._recovery.abort_in_flight()
+                self._recovery.save_queue_crash_safe()
+                return self._terminal_outcome()
+            if self._in_flight:
+                draining = True
+            else:
+                logger.info("Pipeline drained. Saving queue and exiting.")
+                self._recovery.save_queue_crash_safe()
+                return self._terminal_outcome()
+        if store.is_empty and not self._in_flight:
+            return self._terminal_outcome()
+
+        # 1. 填池派发（仅非 DRAINING 状态且未超过单步限制）
+        limit = max_dispatch if max_dispatch is not None else _UNBOUNDED_DISPATCH_LIMIT
+        last_outcome, worker_wait, dispatched = self._fill_dispatch_pool(limit, draining)
+
+        # 前进信号终结宽限 episode（须先于死锁仲裁）：任何成功派发都证明
+        # 等待者已消解，同缺失集合复发按新 episode 重新授予完整宽限
+        if dispatched > 0:
+            self.governor.record_dispatch_progress()
+
+        # 2. 处理无可运行 job 与死锁判定
+        arbitration = self._arbitrate_deadlock(last_outcome, store)
+
+        # 3. Drain 回收在途结果并统一结算
+        completed_count = self._drain_and_settle()
+
+        # 4. 等待/空闲决策（唯一实现见 wait.decide_wait）
+        is_idle = store.is_empty and not self._in_flight
+        decision = decide_wait(LoopFacts(
+            stop_mode=self._session.stop_mode, has_in_flight=bool(self._in_flight),
+            store_empty=store.is_empty, dispatched=dispatched, completed=completed_count,
+            has_runnable=(last_outcome.kind is not DispatchKind.NO_CANDIDATE
+                          if last_outcome is not None else True),
+            min_wait=(last_outcome.standstill.min_wait
+                      if last_outcome is not None else float("inf")),
+            worker_wait=worker_wait, deadlock_wait=arbitration.wait_seconds,
+            should_terminate=arbitration.should_terminate,
+        ))
+
+        exit_reason = (
+            self._session.exit_reason().value if (is_idle or arbitration.should_terminate)
+            else None
+        )
+
+        return StepOutcome(
+            dispatched_count=dispatched, completed_count=completed_count,
+            is_idle=is_idle, should_wait=decision.should_wait,
+            wait_time=decision.wait_time,
+            deadlock_detected=arbitration.deadlock_detected,
+            stop_mode=self._session.stop_mode,
+            should_terminate=arbitration.should_terminate or is_idle,
+            exit_reason=exit_reason,
+        )
+
+    # ── 主循环与承重网 ────────────────────────────────────────────────
+
+    def run_loop(self) -> None:
+        """事件驱动主循环：以 step() 统一驱动填池、回收与等待（裸循环）。"""
+        store = self.store
+        self._in_flight.clear()
+        while not store.is_empty or self._in_flight:
+            outcome = self.step()
+            if outcome.should_terminate:
+                break
+            if outcome.should_wait and outcome.wait_time > 0:
+                time.sleep(outcome.wait_time)
+
+        logger.info(f"Pipeline {self.config.name} finished.")
+        self._in_flight.clear()
+
+    def prepare_run_state(self) -> PipelineState:
+        """加载持久化状态、初始化 run_id 屏障、执行恢复修复并构建内存
+        PipelineState。
+
+        编排层只负责 run 生命周期操作：调度轮复位与 fencing 屏障（run
+        身份是 RunSession 属物，meta 持久化与 channel 同步是横切副作用，
+        不下沉机器以免 session 依赖回流）；装载与修复序列归
+        RecoveryOrchestrator.load_and_repair。
+        """
+        self.scheduler.begin_round()
+
+        # Fencing 屏障（结果认证令牌与 run_id 同生命周期：每 run 轮换并
+        # 同步到执行通道，收割/认领/中止三条读取路径共用同一信任锚）
+        self._session.run_id = uuid.uuid4().hex
+        self._session.result_token = secrets.token_hex(32)
+        self.channel.result_token = self._session.result_token
+        self._session.dispatch_seq = 0
+        try:
+            self.backend.set_meta("last_run_id", self._session.run_id)
+        except Exception as e:
+            logger.critical(f"Failed to persist run_id to meta table: {e}")
+            raise
+
+        return self._recovery.load_and_repair()
+
+    def _run_with_crash_net(self) -> None:
+        """运行主事件循环与统一异常承重网。"""
+        exit_reason = self._session.exit_reason().value
+        try:
+            self.run_loop()
+            exit_reason = self._session.exit_reason().value
+        except BaseException as e:
+            # 单点崩溃网：所有异常同构处理（exit_reason + 在途清扫 + 崩溃
+            # 保队 + 原样上抛）；KI 与非 Exception（_JobTerminated /
+            # _CommitCrashSignal / SystemExit）不附 traceback，其余附。
+            # _CommitCrashSignal 防误吞不变式在类继承（BaseException）与
+            # dispatch 的早置 raise，不在此处。
+            self._crash_log(e)
+            exit_reason = self._session.exit_reason(e).value
+            self._recovery.abort_in_flight()
+            self._recovery.save_queue_crash_safe()
+            raise
+        finally:
+            try:
+                self._recovery.persist_resource_suspensions()
+            except Exception as e:
+                logger.warning(f"Failed to persist resource suspensions: {e}")
+            self._session.fire_run_end(exit_reason)
+
+    @staticmethod
+    def _crash_log(e: BaseException) -> None:
+        """承重网的逐类型日志分派（KI 与非 Exception 不附 traceback）。"""
+        if isinstance(e, KeyboardInterrupt):
+            logger.warning("Pipeline interrupted by user.")
+        elif isinstance(e, _JobTerminated):
+            logger.critical(f"Job terminated outside expected handlers: {e}")
+        elif isinstance(e, _CommitCrashSignal):
+            logger.critical(f"Backend commit failure; aborting in-flight jobs: {e}")
+        elif isinstance(e, Exception):
+            logger.critical(
+                f"Pipeline scheduler crashed with unhandled exception: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+        else:
+            logger.critical(f"Pipeline terminated by {type(e).__name__}: {e}")
+
+    def _run_body(self) -> None:
+        """主执行体：启动屏障（装载 + fencing）→ 带承重网的主循环。"""
+        self.prepare_run_state()
+        self._run_with_crash_net()
+
+    def _handle_signal(self, signum: int, frame: Any) -> None:
+        logger.info(f"收到信号 {signum}，更新停机状态机……")
+        self.request_stop()
+
+    def _preflight_picklable_handlers(self) -> None:
+        """strict 预检：全部已注册 Task 的 handler 必须可 pickle。
+
+        spawn 进程模型下不可 pickle 的 handler 会在每次派发时崩溃——
+        构造期入口拒绝（fail-loud），而非运行期逐作业失败。
+        """
+        if not self.config.strict_picklable:
+            return
+        for task_type in self.tasks.task_types():
+            task = self.tasks.lookup(task_type)
+            try:
+                pickle.dumps(task.handler)
+            except Exception as e:
+                raise TypeError(
+                    f"Handler for task_type '{task_type}' is not picklable: "
+                    f"{task.handler!r} ({e}). Functions must be module-level."
+                ) from e
+
+
+__all__ = [
+    "DeadlockArbitration",
+    "EngineRuntime",
+]

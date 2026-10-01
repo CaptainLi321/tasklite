@@ -4,9 +4,10 @@
 引擎值对象 types、资源体系 resource、准入与重入队策略 admission、
 等待决策 wait、在飞追踪 in_flight、只读扫描调度器 scheduler、
 死锁治理 governor、执行通道 channel、恢复编排 recovery、状态仓库
-store、派发机器 dispatch、完成机器 completion）。调度逻辑仅留
-seam：选择点收敛在 scheduler 的 scan_next_runnable（访问序经
-OrderingPolicy），重试节奏收敛在 RequeuePolicy（默认立即重入队）。
+store、派发机器 dispatch、完成机器 completion、装配配置 config、
+运行会话 session、运行时 runtime）。调度逻辑仅留 seam：选择点收敛在
+scheduler 的 scan_next_runnable（访问序经 OrderingPolicy），重试节奏
+收敛在 RequeuePolicy（默认立即重入队）。
 
 分层红线：本包属核心层，严禁 import ``v2/wrappers/`` 与 ``v2/contrib/``，
 亦不得依赖 v1 旧树任何模块；可依赖 ``v2/{models,utils,backend}``。
@@ -26,6 +27,7 @@ from .channel import (
     WorkerLaunchSpec,
 )
 from .completion import CompletionMachine
+from .config import RunConfig, Tuning, resolve_tuning
 from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
 from .errorclass import ErrorClassifier
 from .governor import (
@@ -36,6 +38,7 @@ from .governor import (
 )
 from .in_flight import InFlightJob, InFlightTracker
 from .recovery import RecoveryOrchestrator
+from .runtime import DeadlockArbitration, EngineRuntime
 from .scheduler import (
     DeadlockAttribution,
     FifoOrderingPolicy,
@@ -45,6 +48,7 @@ from .scheduler import (
     ScheduleResult,
     StandstillFacts,
 )
+from .session import RunSession
 from .store import (
     BulkFailureOutcome,
     COMMIT_FAILURE_THRESHOLD,
@@ -66,8 +70,11 @@ from .types import (
     EMPTY_STATS,
     TRANSIENT_KIND_STAT_KEYS,
     AttemptFinish,
+    ExecutionOptions,
     ExitReason,
     JobHandle,
+    RunSummary,
+    StepOutcome,
     StopMode,
     TaskStats,
 )
@@ -78,7 +85,10 @@ __all__ = [
     "EMPTY_STATS",
     "TRANSIENT_KIND_STAT_KEYS",
     "AttemptFinish",
+    "ExecutionOptions",
     "ExitReason",
+    "RunSummary",
+    "StepOutcome",
     "StopMode",
     "TaskStats",
     "AbortOutcome",
@@ -89,6 +99,12 @@ __all__ = [
     "DispatchMachine",
     "DispatchOutcome",
     "CompletionMachine",
+    "DeadlockArbitration",
+    "EngineRuntime",
+    "RunConfig",
+    "RunSession",
+    "Tuning",
+    "resolve_tuning",
     "Resource",
     "RateLimitResource",
     "CapacityResource",
