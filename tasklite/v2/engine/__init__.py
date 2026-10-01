@@ -8,6 +8,14 @@ scheduler 的 scan_next_runnable，重试节奏收敛在 RequeuePolicy（默认
 分层红线：本包属核心层，严禁 import ``v2/wrappers/`` 与 ``v2/contrib/``，
 亦不得依赖 v1 旧树任何模块；可依赖 ``v2/{models,utils,backend}``。
 """
+from .admission import (
+    ImmediateRequeuePolicy,
+    PreflightAction,
+    PreflightDecision,
+    RequeuePlan,
+    RequeuePolicy,
+    RerunPolicy,
+)
 from .errorclass import ErrorClassifier
 from .resource import (
     CapacityResource,
@@ -36,4 +44,10 @@ __all__ = [
     "CapacityResource",
     "ResourceEvaluation",
     "ResourceManager",
+    "ImmediateRequeuePolicy",
+    "PreflightAction",
+    "PreflightDecision",
+    "RequeuePlan",
+    "RequeuePolicy",
+    "RerunPolicy",
 ]
