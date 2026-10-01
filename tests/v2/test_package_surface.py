@@ -57,7 +57,12 @@ def _imported_module_names(path: pathlib.Path) -> set[str]:
 
 
 class TestWrappersExportFace:
-    """wrappers 子包导出面：__all__ 与实际属性一一对应。"""
+    """wrappers 子包导出面：仅子模块聚合，__all__ 与实际属性一一对应。"""
+
+    def test_all_is_submodule_aggregation_only(self):
+        """不设符号级再导出——__all__ 收敛为子模块名单（平行承诺面删除，
+        符号一律经 ``tasklite.v2.wrappers.<模块>`` 全路径导入）。"""
+        assert wrappers_pkg.__all__ == ["discovery", "http"]
 
     def test_all_names_importable_and_equal(self):
         for name in wrappers_pkg.__all__:
@@ -140,7 +145,12 @@ class TestMainSurfaceIsolation:
         )
 
     def test_wrappers_subpackage_importable_standalone(self):
-        code = "import tasklite.v2.wrappers as w; assert 'register_discovery' in w.__all__"
+        code = (
+            "import tasklite.v2.wrappers as w; "
+            "assert w.__all__ == ['discovery', 'http']; "
+            "from tasklite.v2.wrappers.discovery import register_discovery; "
+            "assert callable(register_discovery)"
+        )
         env = dict(os.environ)
         env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         result = subprocess.run(
