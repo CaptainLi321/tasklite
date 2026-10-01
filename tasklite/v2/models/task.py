@@ -239,6 +239,14 @@ class TaskRegistry:
                 f"enqueuing its jobs)"
             ) from None
 
+    def get(self, task_type: str) -> Task | None:
+        """按 task_type 查询规格；未注册返回 None（dict-like 读口）。
+
+        供 ResourceManager 等按 Mapping 语义消费默认资源的装配组件
+        使用；缺省回退语义（None → 无默认）由调用方表达。
+        """
+        return self._tasks.get(task_type)
+
     def __contains__(self, task_type: object) -> bool:
         return isinstance(task_type, str) and task_type in self._tasks
 
