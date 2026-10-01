@@ -30,7 +30,7 @@ from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import EngineRuntime
 from .engine.scheduler import OrderingPolicy
 from .engine.store import FailureEntry
-from .engine.types import RunSummary, TaskStats
+from .engine.types import ExecutionOptions, RunSummary, TaskStats
 from .models.job import Job, RERUN_VALUES, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry, validate_task_type
 
@@ -648,8 +648,19 @@ class TaskLite:
         """
         self._runtime.request_stop(force=force)
 
-    def run(self) -> RunSummary:
+    def run(
+        self,
+        *,
+        install_signals: bool = True,
+        acquire_run_lock: bool = True,
+    ) -> RunSummary:
         """运行管线直到队列排空（或收到排空/强停请求），返回运行摘要。
+
+        install_signals / acquire_run_lock 逐参透传引擎 ExecutionOptions
+        （缺省与引擎一致、默认行为不变）：install_signals=False 不安装
+        SIGTERM/SIGINT 停机信号陷阱（宿主进程自管信号时使用）；
+        acquire_run_lock=False 跳过 state_dir 级单运行排他文件锁
+        （同库多实例的互斥协调移交宿主）。
 
         未处理异常一律经 raise 通道原样上抛（摘要仅无异常终结时语义
         完整）。
@@ -658,7 +669,12 @@ class TaskLite:
             f"=== Starting Pipeline: {self.name} "
             f"(Backend: {self.backend_type}) ==="
         )
-        return self._runtime.execute()
+        return self._runtime.execute(
+            ExecutionOptions(
+                install_signals=install_signals,
+                acquire_run_lock=acquire_run_lock,
+            )
+        )
 
     def run_graceful(self) -> None:
         """统一 run + 优雅停机包装：捕获 KeyboardInterrupt 转 DRAINING。

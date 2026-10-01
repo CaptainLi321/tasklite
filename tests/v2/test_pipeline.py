@@ -653,7 +653,7 @@ class TestSixStepContract:
     def test_run_graceful_swallows_keyboard_interrupt(self, tmp_path, monkeypatch):
         p = make_pipeline(tmp_path)
 
-        def raise_interrupt():
+        def raise_interrupt(options=None):
             raise KeyboardInterrupt()
 
         monkeypatch.setattr(p._runtime, "execute", raise_interrupt)
@@ -844,6 +844,67 @@ class TestManageApis:
             with running(p):
                 with pytest.raises(RuntimeError, match=api_name):
                     call(p)
+
+
+class TestRunExecutionOptions:
+    """run() 运行参数透传：引擎可配的 ExecutionOptions 在公开面可达，
+    缺省与引擎默认一致（默认行为不变）。"""
+
+    def test_default_run_acquires_reentry_lock(self, tmp_path):
+        """默认等价断言：run() 照常获取 state_dir 级单运行排他锁。"""
+        from tasklite.v2.utils.lockfile import release_lock, try_acquire_lock
+
+        p = make_pipeline(tmp_path)
+        lock_fd = try_acquire_lock(p.ipc_dir, "__pipeline_run__", timeout=0)
+        assert lock_fd is not None
+        try:
+            with pytest.raises(RuntimeError, match="Another run.*in progress"):
+                p.run()
+        finally:
+            release_lock(lock_fd)
+
+    def test_acquire_run_lock_false_bypasses_reentry_lock(self, tmp_path):
+        """acquire_run_lock=False：锁被占时并发 run 不被重入锁拒绝。"""
+        from tasklite.v2.utils.lockfile import release_lock, try_acquire_lock
+
+        p = make_pipeline(tmp_path)
+        lock_fd = try_acquire_lock(p.ipc_dir, "__pipeline_run__", timeout=0)
+        assert lock_fd is not None
+        try:
+            summary = p.run(acquire_run_lock=False)
+            assert summary.exit_reason is ExitReason.COMPLETED
+        finally:
+            release_lock(lock_fd)
+
+    def test_install_signals_wiring(self, tmp_path, monkeypatch):
+        """install_signals 接线：False 不安装信号陷阱，默认安装
+        SIGTERM/SIGINT（记录器断言，不硬造信号场景）。"""
+        import signal as signal_module
+
+        import tasklite.v2.engine.runtime as runtime_module
+
+        installed: list[int] = []
+
+        class _SignalRecorder:
+            """signal 模块替身：只记录安装请求，不装真实 handler。"""
+
+            SIGTERM = signal_module.SIGTERM
+            SIGINT = signal_module.SIGINT
+
+            @staticmethod
+            def signal(signum, handler):
+                installed.append(signum)
+                return None
+
+        monkeypatch.setattr(runtime_module, "signal", _SignalRecorder)
+        p = make_pipeline(tmp_path)
+
+        p.run(install_signals=False)
+        assert installed == []
+
+        summary = p.run()
+        assert summary.exit_reason is ExitReason.COMPLETED
+        assert installed == [signal_module.SIGTERM, signal_module.SIGINT]
 
 
 class TestBackendSwap:
