@@ -38,6 +38,25 @@ class TestArtifactJournalPathAndSandbox:
             == tmp_path / "t%3A%3Ajob_1.abc.1.result.json.tmp"
         )
 
+    def test_none_ipc_dir_path_builders_fail_loud(self):
+        """ipc_dir 缺省时全部路径构造入口 fail-loud。
+
+        若任一路径构造改为隐式 str(None) 兜底，写入侧会向进程 CWD 的
+        字面 ``None/`` 目录落盘测试碎屑（跨 cwd 漂移、永不清理）——
+        本测试锁定 ValueError 契约，杜绝该退化形态。
+        """
+        journal = ArtifactJournal(None)
+        assert journal.ipc_dir is None
+        for build in (
+            lambda: journal.signals_path("t::x"),
+            lambda: journal.outputs_path("t::x"),
+            lambda: journal.inputs_path("t::x"),
+            lambda: journal.result_path("t::x", _INCARNATION_FIRST),
+            lambda: journal.result_tmp_path("t::x", _INCARNATION_FIRST),
+        ):
+            with pytest.raises(ValueError, match="ipc_dir"):
+                build()
+
     def test_null_byte_rejection(self, tmp_path):
         with pytest.raises(ValueError, match="null byte"):
             ArtifactJournal.resolve_and_validate_path("bad\x00path.txt", tmp_path)
