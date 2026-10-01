@@ -1,12 +1,13 @@
-"""v2 SQLiteStateBackend 测试（移植 v1 五个后端测试文件并按 v2 语义改写）。
+"""v2 SQLiteStateBackend 契约测试。
 
-移植来源对照：
-- v1 test_state.py → schema/init/空加载/delta 提交/损坏行/保存重写矩阵；
-- v1 test_sqlite_pragma.py → WAL fail-loud 与 per-connection synchronous=FULL；
-- v1 test_dlq_api.py → 失败档案 payload 快照面（管线级 API 属 engine 阶段）；
-- v1 test_seed_cursor_validation.py → seed/cursor 入口校验与双腿对齐；
-- v1 test_concurrency_regression.py → 并发混合写与交错队头入队的 seq 唯一性
-  （失败写入事件计数已由 attempts 旁路轨迹承接，断言改为档案行唯一）。
+覆盖面：
+- schema 初始化 / 空加载 / delta 提交 / 损坏行容灾 / 整表重写矩阵；
+- WAL fail-loud 与 per-connection synchronous=FULL 的持久化不变式；
+- 零旧库兼容（版本号与异代表形状 fail-loud 拒绝）；
+- 失败档案 API（payload 快照面与 append 幂等语义）；
+- seed/cursor 入口校验；
+- 并发混合写与交错队头入队的 seq 唯一性（失败写入事件计数由 attempts
+  旁路轨迹承接，断言以档案行唯一为准）。
 """
 
 from __future__ import annotations
@@ -96,7 +97,7 @@ class TestSchemaInit:
 
 
 class TestWALAndPragmas:
-    """WAL fail-loud 与 per-connection synchronous=FULL（移植 test_sqlite_pragma）。"""
+    """WAL fail-loud 与 per-connection synchronous=FULL。"""
 
     def test_wal_mode_persists_at_database_level(self, tmp_path):
         SQLiteStateBackend(tmp_path / "wal_state.db")
@@ -170,6 +171,7 @@ class TestLegacyDatabaseRejected:
             "CREATE TABLE queue (idx INTEGER PRIMARY KEY AUTOINCREMENT, job_data TEXT)"
         )
         conn.execute(
+            # 异形旧库 fixture：表名与列形均不符合 v2 schema，形状校验须拒识
             "CREATE TABLE failed_dlq (uid TEXT PRIMARY KEY, payload TEXT)"
         )
         conn.execute(f"PRAGMA user_version = {user_version}")
@@ -563,7 +565,7 @@ class TestReplaceQueueAtomic:
 
 
 class TestSqliteFailureArchive:
-    """失败档案 API（移植 test_dlq_api 后端级部分 + append 语义）。"""
+    """失败档案 API：append 幂等与 payload 快照面。"""
 
     def test_append_failed_overwrites_same_uid(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
@@ -739,7 +741,7 @@ class TestSqliteAttemptTrajectory:
 
 
 class TestSeedWallAndCursor:
-    """种子化：wall/failed 互斥 + cursor 入口校验（移植 test_seed_cursor_validation）。"""
+    """种子化：wall/failed 互斥 + cursor 入口校验。"""
 
     def test_seed_wall_writes_empty_meta_idempotently(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")

@@ -1,4 +1,4 @@
-"""v2 InMemoryStateBackend 契约测试（移植 v1 对应测试并按 v2 语义改写）。
+"""v2 InMemoryStateBackend 契约测试。
 
 覆盖：基础 CRUD 与幂等入队、delta 提交（成功/失败/重试/批量/跳过）、
 失败档案 API（带外登记 / payload 快照 / 定向清除）、attempts 轨迹

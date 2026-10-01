@@ -7,7 +7,7 @@
 - 终态互斥（成功删 failed 同名行、失败删 wall 行，最终状态唯一）；
 - attempts append-only（历史行只增不改，每行仅允许一次收尾）。
 
-另移植 v1 双腿契约面：commit 失败/冲突不变式（False ⇒ 后端与调用前
+另覆盖双腿契约面：commit 失败/冲突不变式（False ⇒ 后端与调用前
 完全一致）、replace_queue_atomic、替换集形状校验、seed_wall 互斥、
 seed_cursor 入口校验。
 """
