@@ -799,11 +799,11 @@ class TestWatchdogReap:
             pass
 
     class _DyingDuringJoinProcess:
-        """join 窗口内自然退出的进程桩（exitcode 0，无结果文件）。"""
+        """join 窗口内自然退出的进程桩（无结果文件，exitcode 可注入）。"""
 
-        def __init__(self):
+        def __init__(self, exitcode: int = 0):
             self._alive = True
-            self.exitcode = 0
+            self.exitcode = exitcode
 
         def is_alive(self):
             return self._alive
@@ -860,6 +860,33 @@ class TestWatchdogReap:
             "join 窗口内自然退出且无结果 → NO_IPC_RESULT 瞬态，非 TIMEOUT"
         )
         assert result.retry_requested is True
+
+    @pytest.mark.parametrize("exitcode", [-9, 1])
+    def test_join_window_death_cluster_attributed_symmetrically(
+        self, tmp_path, exitcode
+    ):
+        """对称性基准：join 窗口内信号死亡（-9）/正码崩溃（1）按 exitcode
+        分簇归因并维持可重试。
+
+        不变式：deadline 后 join 窗口内已自然退出的执行体，死亡归因全权
+        交 exitcode 分簇，与 deadline 前同因事件同果——环境故障不得仅因
+        跨过 deadline 就从「可重试」分裂为「零重试直落失败档案」；仅
+        kill 后仍存活的执行体才归 TIMEOUT。
+        """
+        job = Job("t", "cluster_death")
+        handle = JobHandle(
+            uid=job.uid, process=self._DyingDuringJoinProcess(exitcode),
+            deadline=time.monotonic() - 1, timeout=2.0,
+            job=job, ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+        )
+        completed = ExecutionChannel(tmp_path).reap_completed([handle])
+        result = completed[0][1]
+        assert result.success is False
+        assert f"PROCESS_CRASH_EXITCODE_{exitcode}" in result.result_meta["error"], (
+            "join 窗口内死亡必须按 exitcode 分簇归因，而非折入 TIMEOUT"
+        )
+        assert result.retry_requested is True, "同窗口死亡维持瞬态可重试（对称性）"
+        assert result.retry_error
 
     def test_completed_result_reaped_before_deadline(self, tmp_path):
         """结果文件已落盘且进程仍活 → 直接按结果收割（不等 deadline）。"""
