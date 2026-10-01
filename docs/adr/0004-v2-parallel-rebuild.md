@@ -85,6 +85,12 @@
 | `validate_payload`（模块级、返回 list） | `validate_payload_errors` |
 | `claim_stale_result`（utils/ipc 同名异构） | `claim_stale_result_payload` |
 | `fetch_urllib` / `fetch_requests` | `urllib_fetch` / `requests_fetch` |
+| `commit_failure_dlq_threshold` | `commit_failure_threshold` |
+| `ERR_COMMIT_FAILURE_DLQ` | `ERR_COMMIT_FAILURE`（**值串同步变更** `"COMMIT_FAILURE_DLQ"` → `"COMMIT_FAILURE"`——下游按错误码串匹配的迁移必须改串，非仅改常量名） |
+| `guarded_fetch` | `guarded`（wrappers/http 装饰器工厂） |
+| http guard 参数 `backoff` | `retry_delay_base` |
+| `HandlerEntry` | `Task` + `TaskRegistry`（结构性取代：handler 注册条目升级为规格模板与注册表两层） |
+| 实例属性 `pipeline.taxonomy` / `pipeline.handlers` | `pipeline.classifier` / `pipeline.tasks` |
 
 **保留不动**：`wall`、`seed_wall`、`seed_cursor`、`safe_uid_filename`、`content_fingerprint`、`incarnation`、`DeadlockGovernor.arbitrate`、`RunConfig` / `RunSession` / `EngineRuntime` / `PipelineState` / `DispatchMachine` / `CompletionMachine` / `StateStore` / `RecoveryOrchestrator` / `InFlightJob` / `WorkerLaunchSpec` / `OpsConsole`、`job_ref` / `progress_hook` / `slice_list`、`ERR_*` 错误码常量、`EMPTY_SENTINEL`。
 
