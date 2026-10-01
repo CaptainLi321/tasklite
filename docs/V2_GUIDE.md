@@ -184,7 +184,7 @@ print(summary.exit_reason, summary.stats["completed"], summary.run_id)
 pipeline.stop()
 ```
 
-**handler 契约**：签名 `handler(job, ctx)`；返回值语义——`None`/`True` 成功，`False` 失败，`dict` 成功元数据，`tuple[bool, dict]` 组合；抛 `RetryError` 推回队列重试，抛 `FatalError` 直接进失败档案（不消耗重试预算），`RateLimitHit`（`RetryError` 子类）裸抛即按瞬态重试并遵守瞬态信号军规，其余异常失败进失败档案。
+**handler 契约**：签名 `handler(job, ctx)`；返回值语义——`None`/`True` 成功，`False` 失败，`dict` 成功元数据，`tuple[bool, dict]` 组合；抛 `RetryError` 推回队列重试，抛 `FatalError` 直接进失败档案（不消耗重试预算），`RateLimitHit`（`RetryError` 子类）裸抛即按瞬态重试并遵守瞬态信号军规，其余异常失败进失败档案。`SystemExit` 同走错误通道计入重试预算（handler 内 `sys.exit()` 属主动退出/代码缺陷语义，不享受瞬态零预算；`KeyboardInterrupt` 才是唯一的瞬态中断信号——分野裁决见 ADR-0004「后果与重开条件」）。
 
 **JobContext 常用 API**（handler 内执行上下文，属于一次 job 执行）：
 

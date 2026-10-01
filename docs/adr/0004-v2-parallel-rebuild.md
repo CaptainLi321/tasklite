@@ -127,4 +127,5 @@
 - v2 上位判据：对 v1 全部保留特性功能对等、测试覆盖对等、文档同步；届时新 ADR 裁决 v1 退役与 `tasklite.v2` 提升为主包路径。
 - 调度接线的门面构造参数（`TaskLite(ordering=...)` / `TaskLite(requeue_policy=...)`）已按库主裁决提前落地：仅做接线——策略实例经 RunConfig 装配透传至 `JobScheduler(ordering=...)` 与重试节奏出口，默认不传行为不变（FIFO / 立即重入队，解析收敛在 `RunConfig.resolve` 唯一解析点），不实现任何策略。
 - 调度 wrapper ADR（软 EDF / aging / 错峰 / 准入、延迟类重试策略）引入时的裁决范围收窄为：OrderingPolicy / RequeuePolicy 的**策略实现**与 **Job 调度属性（priority / deadline / period）的存放位置**；接缝本身与门面接线形态已由本 ADR 定案，不再是该 ADR 的事项。
-- v1 冻结期发现的设计缺陷：v1 修复（保持行为）与 v2 修正**双落**，禁止只在 v2 修。
+- **库主裁决（2026-10-02）：v1 绝对冻结停止修补，缺陷仅在 v2 修正**（此前「v1 修复与 v2 修正双落」规则废止；v1 的结构问题不得带入 v2，v2 侧发现的缺陷一律在 v2 修正后由上位判据整体替换 v1）。
+- SystemExit 通道分野为 v2 有意契约（非移植漂移）：worker 内 handler 抛出的 `SystemExit` 一律走错误通道——计入重试预算、终态进失败档案；仅 `KeyboardInterrupt` 是瞬态中断（零预算重入队）。理由：若把 `SystemExit` 当瞬态零预算重入队，`sys.exit` 类异常路径会零预算无限重跑、run 永不返回。该语义与 v1 自初版起的裁决一致（v1 worker 同走错误通道），v2 以双测试显式锁定（`tests/v2/engine/test_channel.py` 的 worker 通道单测 + `tests/v2/integration/test_end_to_end.py` 的真实子进程归因测试）；按上文冻结裁决，本条不再回流 v1。
