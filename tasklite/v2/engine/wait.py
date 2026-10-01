@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
 
 from .types import StopMode
 
-# 在途但本拍无新完成时的轮询间隔
-_IN_FLIGHT_POLL_SECONDS = 0.05
+# 事件泵最小轮询节拍：在途但本拍无新完成的等待拍长，兼作 worker
+# 饱和建议等待的下限（dispatch 复用同一节拍，两处不各写字面量）
+IN_FLIGHT_POLL_SECONDS = 0.05
 # 各类受控等待的单拍上限
 _WAIT_CAP_SECONDS = 1.0
 
@@ -55,7 +56,7 @@ def decide_wait(facts: LoopFacts) -> WaitDecision:
         return WaitDecision(should_wait=False, wait_time=0.0)
     if facts.has_in_flight:
         if facts.completed == 0:
-            return WaitDecision(should_wait=True, wait_time=_IN_FLIGHT_POLL_SECONDS)
+            return WaitDecision(should_wait=True, wait_time=IN_FLIGHT_POLL_SECONDS)
         return WaitDecision(should_wait=False, wait_time=0.0)
     if facts.deadlock_wait > 0:
         return WaitDecision(should_wait=True, wait_time=min(facts.deadlock_wait, _WAIT_CAP_SECONDS))

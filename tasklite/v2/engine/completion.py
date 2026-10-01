@@ -119,7 +119,7 @@ class CompletionMachine:
                 uid,
                 outcome=AttemptFinish(
                     success=bool(result.success),
-                    going_to_retry=bool(result.going_to_retry),
+                    going_to_retry=result.going_to_retry,
                     meta=dict(result.result_meta),
                 ),
             )

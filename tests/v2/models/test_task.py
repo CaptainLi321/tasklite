@@ -54,6 +54,11 @@ class TestTaskCreation:
         assert task.timeout == 7200
         assert task.timeout_is_transient is True
 
+    def test_timeout_is_transient_is_keyword_only(self):
+        """timeout_is_transient 为 kw-only：尾部布尔的位置传参显式拒绝。"""
+        with pytest.raises(TypeError):
+            Task("t", _handler, None, None, 3, 3600, True)
+
     def test_frozen_fields_reject_assignment(self):
         """Task 为 frozen 规格：字段赋值显式拒绝。"""
         task = Task(task_type="t", handler=_handler)

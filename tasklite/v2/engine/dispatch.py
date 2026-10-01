@@ -73,6 +73,7 @@ from .in_flight import InFlightJob
 from .resource import RateLimitUnavailable, apply_suspend_signals
 from .scheduler import ScheduleResult, StandstillFacts
 from .types import AttemptFinish
+from .wait import IN_FLIGHT_POLL_SECONDS
 from ..utils.clock import utc_now_iso
 
 logger = logging.getLogger("tasklite.v2")
@@ -155,7 +156,7 @@ class DispatchMachine:
         ok, worker_wait = self._resources.can_acquire_worker(1.0)
         if not ok:
             if worker_wait <= 0:
-                worker_wait = 0.05
+                worker_wait = IN_FLIGHT_POLL_SECONDS
             return DispatchOutcome(
                 kind=DispatchKind.WORKER_SATURATED,
                 worker_wait=worker_wait,
@@ -555,6 +556,7 @@ class DispatchMachine:
         # 不在此保存队列：内存此刻缺其他 in-flight 作业，交给运行循环的
         # 崩溃安全保存合并磁盘真相后统一保存。
         raise KeyboardInterrupt
+
     def _handle_rate_limit_defer(
         self,
         uid: str,

@@ -262,18 +262,19 @@ class DeadlockGovernor:
     @staticmethod
     def _split_deadlock_by_uids(
         queue: list[dict[str, Any]],
-        target_uids: set[str],
+        target_uids: set[str] | None,
         error: str,
     ) -> list[tuple[str, dict[str, Any]]]:
         """从队列拆出「进失败档案的肇事者」（uid → 错误元数据）。
 
-        队列剩余行的去留由 store 的批量失败出口按 uid 精准删除收敛，
-        本方法只负责归因装配。
+        ``target_uids=None`` 表示缺口升级的全队列兜底熔断（全部行标记
+        root_cause）。队列剩余行的去留由 store 的批量失败出口按 uid
+        精准删除收敛，本方法只负责归因装配。
         """
         return [
             (uid_from_job_dict(jd), {"error": error, "root_cause": True})
             for jd in queue
-            if uid_from_job_dict(jd) in target_uids
+            if target_uids is None or uid_from_job_dict(jd) in target_uids
         ]
 
     def arbitrate(
@@ -376,11 +377,9 @@ class DeadlockGovernor:
                         should_terminate=False,
                         wait_time=0.5,
                     )
-                uids_metas = [
-                    (uid_from_job_dict(jd),
-                     {"error": ERR_DEADLOCK_GAP, "root_cause": True})
-                    for jd in effective_state.queue
-                ]
+                uids_metas = self._split_deadlock_by_uids(
+                    list(effective_state.queue), None, ERR_DEADLOCK_GAP
+                )
             else:
                 logger.error(
                     f"Deadlock detected: dependency cycle among {len(cycle_uids)} job(s): "
@@ -400,11 +399,9 @@ class DeadlockGovernor:
                     should_terminate=False,
                     wait_time=0.5,
                 )
-            uids_metas = [
-                (uid_from_job_dict(jd),
-                 {"error": ERR_DEADLOCK_GAP, "root_cause": True})
-                for jd in effective_state.queue
-            ]
+            uids_metas = self._split_deadlock_by_uids(
+                list(effective_state.queue), None, ERR_DEADLOCK_GAP
+            )
 
         # 提交批量死锁失败（失败档案单一出口）
         outcome = store.apply_bulk_failure(uids_metas)

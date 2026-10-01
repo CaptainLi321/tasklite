@@ -379,7 +379,7 @@ class ExecutionResult:
     cursor_updates: dict[str, str | None] = field(default_factory=dict)
     resource_suspensions: list[tuple[str, float]] = field(default_factory=list)
     transient_kind: str | None = None
-    going_to_retry: bool | None = None
+    going_to_retry: bool = False
 
 
 @dataclass(frozen=True)

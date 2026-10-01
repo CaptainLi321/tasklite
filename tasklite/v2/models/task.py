@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -181,7 +181,9 @@ class Task:
     payload_schema: type | None = None
     max_retries: int = 3
     timeout: int | float = 3600
-    timeout_is_transient: bool = False
+    # kw-only：规格位尾部布尔以显式关键字表达，位置传参在构造点静默
+    # 漂移（如误占 timeout 位）由签名直接拒绝
+    timeout_is_transient: bool = field(kw_only=True, default=False)
 
     def __post_init__(self) -> None:
         validate_task_type(self.task_type)
