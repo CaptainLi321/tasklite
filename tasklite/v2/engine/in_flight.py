@@ -39,6 +39,9 @@ class InFlightJob:
     handle: JobHandle | None = None
     job_start: float | None = None
     lease: ResourceLease | None = None
+    # 已派发轨迹行 id（attempts 旁路观测面）：派发机器开行时落位，完成
+    # 机器收尾时经 store 落终态；伪条目（崩溃恢复/拒绝路径）为 None。
+    attempt_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.lease is None:

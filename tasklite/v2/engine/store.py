@@ -285,19 +285,38 @@ class StateStore:
         jobs_dicts = [self.normalize_and_validate_job(j) for j in jobs_list]
         return self._backend.enqueue_jobs(jobs_dicts, front=front)
 
-    def requeue_transient(self, job_dict: dict[str, Any], *, transient_kind: str) -> None:
+    def requeue_transient(
+        self,
+        job_dict: dict[str, Any],
+        *,
+        transient_kind: str,
+        attempt_id: int | None = None,
+        error: str | None = None,
+    ) -> None:
         """瞬态信号降级回队的单一出口（军规：零预算 + 立即重入队 + 零污染）。
 
         节奏唯一经 RequeuePolicy 规划（默认立即、队首插队——同轮内优先
         重扫，瞬态作业不被新入队作业排挤到队尾）；统计键走
         TRANSIENT_KIND_STAT_KEYS 登记表；不触碰 runtime——不烧 commit /
-        dispatch 失败预算、不写 last_retry_error。
+        dispatch 失败预算、不写 last_retry_error。``attempt_id`` 非 None 时
+        同步把已派发轨迹行收尾为 requeued（旁路观测面单一出口内闭环）。
         """
         plan = self._requeue_policy.plan_requeue(job_dict, transient_kind=transient_kind)
         self._state.requeue_jobs([job_dict], front=plan.front)
         stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
         if stat_key:
             self._record_stat(stat_key, 1)
+        self._finish_attempt(attempt_id, outcome="requeued", error=error)
+
+    def finish_attempt(
+        self, attempt_id: int | None, *, outcome: str, error: str | None = None
+    ) -> None:
+        """attempts 旁路轨迹行收尾的公开接缝（不经 apply_* 事务的路径使用）。
+
+        典型消费方：派发机器的异常分支 requeue（未走 apply_retry 事务但
+        本次执行已终结为重入队）。收尾失败降级告警，不阻断主流程。
+        """
+        self._finish_attempt(attempt_id, outcome=outcome, error=error)
 
     # ── 内存状态受控接缝（视图与转发）────────────────────────────────
 

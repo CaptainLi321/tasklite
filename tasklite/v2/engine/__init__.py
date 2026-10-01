@@ -25,6 +25,7 @@ from .channel import (
     ExecutionResult,
     WorkerLaunchSpec,
 )
+from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
 from .errorclass import ErrorClassifier
 from .governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
@@ -83,6 +84,9 @@ __all__ = [
     "ExecutionChannel",
     "ExecutionResult",
     "WorkerLaunchSpec",
+    "DispatchKind",
+    "DispatchMachine",
+    "DispatchOutcome",
     "Resource",
     "RateLimitResource",
     "CapacityResource",

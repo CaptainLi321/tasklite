@@ -325,14 +325,22 @@ class RecoveryOrchestrator:
             signals, self._store.backend, self._resources, origin="from "
         )
 
-    def restore_stale_result(self, uid: str, job: Job, job_dict: dict) -> bool:
+    def restore_stale_result(
+        self,
+        uid: str,
+        job: Job,
+        job_dict: dict,
+        *,
+        attempt_id: int | None = None,
+    ) -> bool:
         """崩溃恢复：派发子进程前消费该 uid 的残留结果文件。
 
-        上次 run 主进程 SIGKILL/OOM/断电崩溃时，子进程可能已写好结果文件
-        但未及 commit。本方法在派发机器的 acquire/spawn 之前调用：若有
-        残留结果，直接构造伪 entry 交完成机器按同一收尾契约提交（不启动
-        子进程），避免「新子进程已启动、却被旧结果文件误判完成而 kill」
-        的双重执行窗口。
+        上次 run 主进程 SIGKILL/OOM/断电崩溃时，子进程可能已写好结果
+        文件但未及 commit。本方法在派发机器的 acquire/spawn 之前调用：
+        若有残留结果，直接构造伪 entry 交完成机器按同一收尾契约提交
+        （不启动子进程），避免「新子进程已启动、却被旧结果文件误判完成
+        而 kill」的双重执行窗口。``attempt_id`` 是本次派发已开的轨迹行，
+        随伪 entry 透传给完成机器按认领结果收尾（残留行不悬空为 running）。
 
         Returns:
             True 表示已消费残留（job 已提交/重入队，调用方不再派发子进程）；
@@ -346,6 +354,7 @@ class RecoveryOrchestrator:
         # （acquired=[] 无资源、handle=None 无进程），复用完整的收尾契约：
         # 失败输出清理、IPC 文件清理、身份注销。
         entry = self._in_flight.create_pseudo_entry(uid, job_dict, job)
+        entry.attempt_id = attempt_id
         try:
             self._completion.complete_job(entry, result)
         except _JobTerminated:
