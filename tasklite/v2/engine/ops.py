@@ -191,8 +191,12 @@ class OpsConsole:
     def retry_failure(self, uid: str) -> bool:
         """把失败档案中的单个作业移出档案并重新入队（人工补跑通道）。
 
-        以档案携带的原始业务 payload 快照重建作业（实例位归零：新激活
-        的首次尝试），经 store.enqueue_jobs 规范化（策略注入 + 资源注入 +
+        激活代按拦截点放行语义推进：档案补跑本质是 failed 拦截点放行
+        重跑，重建作业的 ``activation_no`` 取该 uid 在 attempts 轨迹中的
+        最大激活代 +1、``attempt_no`` 归 1——否则补跑执行与首激活在
+        attempts 表共享同一 ``(activation_no, attempt_no)`` 逻辑键，
+        追溯面撞号；无轨迹行（带外登记）回退初激活 1。业务 payload 取
+        档案快照，经 store.enqueue_jobs 规范化（策略注入 + 资源注入 +
         首入队时间）队首入队，再删档案行。先入队后删除的次序保证崩溃
         窗口至多留下「queue∩failed 并存」——由加载期修复按 rerun 策略
         收敛，绝不丢作业。已在队列驻留的 uid 不重复入队（enqueue 去重），
@@ -210,9 +214,18 @@ class OpsConsole:
             raise KeyError(f"uid {uid!r} not in failure archive")
         task_type, _, job_id = uid.partition("::")
         payloads = self._backend.load_failed_payloads()
-        # 实例位经 Job 模型归零（attempt_no/activation_no=1：从档案放行
-        # 重跑即新激活），payload 取档案快照（无快照回退空 dict）
-        job = Job(task_type=task_type, job_id=job_id, payload=payloads.get(uid) or {})
+        # 激活代取轨迹最大值 +1（failed 拦截点放行 = 新激活代），attempt_no
+        # 经 Job 模型默认归 1；payload 取档案快照（无快照回退空 dict）。
+        prior_activation = max(
+            (record.activation_no for record in self._backend.load_attempts(uid)),
+            default=0,
+        )
+        job = Job(
+            task_type=task_type,
+            job_id=job_id,
+            payload=payloads.get(uid) or {},
+            activation_no=prior_activation + 1,
+        )
         self._store.enqueue_jobs([job], front=True)
         self._backend.delete_failed([uid])
         state = self._store.state

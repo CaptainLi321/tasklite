@@ -22,6 +22,7 @@ from tasklite.v2.engine.errorclass import (
 from tasklite.v2.engine.ops import OpsConsole, SuspendEntry
 from tasklite.v2.engine.resource import META_RESOURCE_SUSPENSIONS
 from tasklite.v2.engine.store import StateStore
+from tasklite.v2.models.attempt import AttemptRecord
 from tasklite.v2.models.job import Job
 from tasklite.v2.utils.jsonutil import dumps
 
@@ -166,12 +167,41 @@ class TestRetryFailure:
         jd = queue[0]
         assert (jd["task_type"], jd["job_id"]) == ("t", "x")
         assert jd["payload"] == {"artist": "a"}
-        # 实例位归零：新激活的首次尝试
+        # 无轨迹行（带外登记）→ 初激活 1；attempt_no 归 1（新激活首次尝试）
         assert jd["attempt_no"] == 1
         assert jd["activation_no"] == 1
         assert jd["first_enqueued_at"], "enqueue 必须填充首入队时间"
         assert "__workers__" in jd["resources"], "enqueue 必须注入工人资源"
         assert "t::x" not in store.state.failed
+
+    def test_retry_advances_activation_from_attempt_trace(self):
+        """轨迹有更高激活代时补跑必须 +1 推进——补跑执行与既有激活在
+
+        attempts 表的 (activation_no, attempt_no) 逻辑键撞号会击穿
+        「一行 = 一次物理执行」的追溯链。
+        """
+        backend, _, console = _make_console()
+        backend.commit_job_failure("t::x", {"error": "boom"}, job_payload={"k": 1})
+        # 轨迹行按真实派发协议落表：先插 running 行，再收尾为 failed
+        attempt_id = backend.append_attempt(AttemptRecord(
+            job_uid="t::x",
+            activation_no=2,
+            attempt_no=1,
+            incarnation="run_a.1",
+            run_id="run_a",
+            started_at="2026-09-01T00:00:00+00:00",
+            outcome="running",
+        ))
+        backend.update_attempt(
+            attempt_id,
+            outcome="failed",
+            finished_at="2026-09-01T00:00:05+00:00",
+            error="boom",
+        )
+        assert console.retry_failure("t::x") is True
+        jd = backend.load_queue()[0]
+        assert jd["activation_no"] == 3, "补跑 = failed 拦截点放行，激活代按轨迹 +1"
+        assert jd["attempt_no"] == 1
 
     def test_retry_missing_uid_raises(self):
         _, _, console = _make_console()

@@ -7,8 +7,9 @@
 （spawn 子进程经 pickle 接收）。
 
 激活代双通道对照：拦截点豁免放行（every_run）推进 activation_no+1
-并重置 attempt_no=1；失败档案人工补跑（retry_failure）实例位整体归零
-（新激活的首次尝试）。两通道语义不同，各自锁定。
+并重置 attempt_no=1；失败档案人工补跑（retry_failure）同为 failed
+拦截点放行——按 attempts 轨迹最大激活代 +1 重建、attempt_no=1。两
+通道均不得与既有激活在 (activation_no, attempt_no) 逻辑键上撞号。
 """
 from __future__ import annotations
 
@@ -198,12 +199,15 @@ class TestEndToEnd:
         assert meta["recovered"] is True
         assert meta["run_count"] == 1
 
-        # 档案补跑通道：实例位整体归零（新激活的首次尝试），与拦截点
-        # 豁免放行的 +1 推进是两条不同语义通道
+        # 档案补跑通道：failed 拦截点放行语义——激活代按轨迹最大值 +1
+        # 推进、attempt_no 归 1，与 every_run 豁免放行同构
         attempts = p.backend.load_attempts("work::item_eps")
         assert [a.outcome for a in attempts] == ["failed", "succeeded"]
         assert [a.attempt_no for a in attempts] == [1, 1]
-        assert [a.activation_no for a in attempts] == [1, 1]
+        assert [a.activation_no for a in attempts] == [1, 2]
+        # 撞号防回归：补跑放行不得复用首激活的 (activation_no, attempt_no)
+        logical_keys = [(a.activation_no, a.attempt_no) for a in attempts]
+        assert len(logical_keys) == len(set(logical_keys))
 
     def test_every_run_rerun_advances_activation_and_run_count(
         self, tmp_path
