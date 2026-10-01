@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    from ..models.state import PipelineState
     from ..models.task import Task
     from .admission import RerunPolicy
     from .channel import ExecutionChannel
@@ -163,7 +164,7 @@ class DispatchMachine:
                 standstill=StandstillFacts(min_wait=0.0),
             )
 
-        sched = self._scheduler.scan_next_runnable(store.state, store.in_flight_uids)
+        sched = self._scheduler.scan_next_runnable(store.state, store.state.in_flight_uids)
         if sched.runnable_idx is None:
             return DispatchOutcome(
                 kind=DispatchKind.NO_CANDIDATE,
@@ -188,7 +189,7 @@ class DispatchMachine:
         pending_dep_failure = (
             sched.pending_dep_failure if sched.kind == "dep_failed" else None
         )
-        job_dict = store.pop_job(sched.runnable_idx)
+        job_dict = store.state.pop_job(sched.runnable_idx)
         job = Job.from_dict(job_dict)
         uid = job.uid
 
@@ -241,18 +242,18 @@ class DispatchMachine:
         的 wall/failed 命中重跑。
         """
         store = self._store
-        if not store.is_known(uid):
+        if not store.state.is_known(uid):
             return False
-        decision = self._rerun_policy.admit(job_dict, store)
+        decision = self._rerun_policy.admit(job_dict, store.state)
         if decision.should_skip:
             attempt_id, _ = self._open_attempt(job)
             store.apply_skip(uid, job_dict=job_dict, attempt_id=attempt_id)
             return True
-        if decision.should_run and (uid in store.wall_uids or uid in store.failed_uids):
+        if decision.should_run and (uid in store.state.wall_uids or uid in store.state.failed_uids):
             # 豁免登记与准入判定同源：pop_job 只按字面 rerun 键登记豁免，
             # 队列行无键而由动态兜底放行的重跑必须在此补登记，否则
             # in-flight 登记的全量互斥断言会击落本关放行的作业。
-            store.mark_rerun_active(uid)
+            store.state.mark_rerun_active(uid)
             # 不变式：准入层放行的重跑，其有效策略必须落为行内字面键——
             # 豁免事实随行持久，abort/retry/崩溃回滚的按字面键豁免重建
             # （requeue/clear_in_flight/replace_queue）才不丢失动态放行事实。
@@ -453,7 +454,7 @@ class DispatchMachine:
                         )
                         return None
 
-                ctx = self._build_context(job, store)
+                ctx = self._build_context(job, store.state)
                 logger.info(f"RUN: {uid}")
                 job_start = time.monotonic()
                 handle = self._channel.spawn(WorkerLaunchSpec(
@@ -477,7 +478,7 @@ class DispatchMachine:
                     attempt_id=attempt_id,
                 )
                 # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
-                self._in_flight.track(entry, state=store)
+                self._in_flight.track(entry, state=store.state)
                 return entry
         except (_CommitCrashSignal, AssertionError):
             raise
@@ -486,7 +487,7 @@ class DispatchMachine:
                 self._channel.cleanup_in_flight([handle])
             raise
 
-    def _build_context(self, job: Job, store: "StateStore") -> JobContext:
+    def _build_context(self, job: Job, state: "PipelineState") -> JobContext:
         """组装执行上下文（快照契约：注册表/启发式/资源名随 ctx 下发子进程）。"""
         # 注册表快照契约：per-pipeline 瞬态异常注册表快照随 ctx pickle
         # 下发——分类决策在子进程，注册表必须显式传递（不可依赖父进程
@@ -496,11 +497,13 @@ class DispatchMachine:
         # 注册表同源于本 classifier 实例，父子两侧分类语义一致。
         # 资源名注册集快照随 ctx 下发——suspend_resource 对未注册名
         # fail-loud（typo 不静默失效）。
+        # 不变式：wall/failed 活索引在快照边界冻结为 frozenset——
+        # JobContext 持有的必须是派发时刻快照，绝不引用活集合。
         return JobContext(
             job,
-            store.wall_uids,
-            store.failed_uids,
-            dict(store.cursors),
+            frozenset(state.wall_uids),
+            frozenset(state.failed_uids),
+            dict(state.cursors),
             output_root=self._output_root,
             ipc_dir=self._ipc_dir,
             transient_registry=self._classifier.snapshot(),
@@ -552,7 +555,7 @@ class DispatchMachine:
             # 全部交给运行循环的中止收尾统一处理，避免对同一 entry 二次
             # 释放资源、二次 requeue 同一作业。
             raise KeyboardInterrupt
-        self._store.requeue_jobs([job_dict], front=True)
+        self._store.state.requeue_jobs([job_dict], front=True)
         # 不在此保存队列：内存此刻缺其他 in-flight 作业，交给运行循环的
         # 崩溃安全保存合并磁盘真相后统一保存。
         raise KeyboardInterrupt
@@ -605,11 +608,11 @@ class DispatchMachine:
                 "failures": failures,
                 "detail": str(exc)[:200],
             }
-            self._in_flight.settle(uid, state=store)
+            self._in_flight.settle(uid, state=store.state)
             self._reject_and_commit(uid, job_dict, fail_meta, attempt_id=attempt_id)
             return None
-        self._in_flight.settle(uid, state=store)
-        store.requeue_jobs([job_dict], front=True)
+        self._in_flight.settle(uid, state=store.state)
+        store.state.requeue_jobs([job_dict], front=True)
         store.finish_attempt(
             attempt_id, outcome=ATTEMPT_REQUEUED, error=f"dispatch failure: {exc}"
         )

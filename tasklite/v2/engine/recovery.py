@@ -317,7 +317,7 @@ class RecoveryOrchestrator:
         """
 
         def _merge(disk_q: list) -> list:
-            mem_q = self._store.queue
+            mem_q = self._store.state.queue
             mem_uids = {uid_from_job_dict(jd) for jd in mem_q}
             # 磁盘有而内存没有的作业（commit/pop 窗口内丢失的）补回队首
             extra = [jd for jd in disk_q if uid_from_job_dict(jd) not in mem_uids]

@@ -319,7 +319,7 @@ class OpsConsole:
                     f"seed_wall uid must have non-empty task_type and job_id, got {u!r}"
                 )
         failed = self._store.backend.load_failed()
-        queue_uids = set(self._store.queue_uids)
+        queue_uids = set(self._store.state.queue_uids)
         queue_uids.update(uid_from_job_dict(jd) for jd in self._store.backend.load_queue())
         conflict_failed = sorted({u for u in uids if u in failed})
         conflict_queue = sorted({u for u in uids if u in queue_uids})

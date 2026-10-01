@@ -331,7 +331,7 @@ class EngineRuntime:
         should_terminate = False
         wait_seconds = 0.0
         if last_outcome is not None and last_outcome.kind is DispatchKind.NO_CANDIDATE:
-            if store.is_empty and not self._in_flight:
+            if store.state.is_empty and not self._in_flight:
                 should_terminate = True
             elif not self._in_flight:
                 decision = self.governor.arbitrate(
@@ -383,7 +383,7 @@ class EngineRuntime:
                 logger.info("Pipeline drained. Saving queue and exiting.")
                 self._recovery.save_queue_crash_safe()
                 return self._terminal_outcome()
-        if store.is_empty and not self._in_flight:
+        if store.state.is_empty and not self._in_flight:
             return self._terminal_outcome()
 
         # 1. 填池派发（仅非 DRAINING 状态且未超过单步限制）
@@ -402,10 +402,10 @@ class EngineRuntime:
         completed_count = self._drain_and_settle()
 
         # 4. 等待/空闲决策（唯一实现见 wait.decide_wait）
-        is_idle = store.is_empty and not self._in_flight
+        is_idle = store.state.is_empty and not self._in_flight
         decision = decide_wait(LoopFacts(
             stop_mode=self._session.stop_mode, has_in_flight=bool(self._in_flight),
-            store_empty=store.is_empty, dispatched=dispatched, completed=completed_count,
+            store_empty=store.state.is_empty, dispatched=dispatched, completed=completed_count,
             has_runnable=(last_outcome.kind is not DispatchKind.NO_CANDIDATE
                           if last_outcome is not None else True),
             min_wait=(last_outcome.standstill.min_wait
@@ -435,7 +435,7 @@ class EngineRuntime:
         """事件驱动主循环：以 step() 统一驱动填池、回收与等待（裸循环）。"""
         store = self.store
         self._in_flight.clear()
-        while not store.is_empty or self._in_flight:
+        while not store.state.is_empty or self._in_flight:
             outcome = self.step()
             if outcome.should_terminate:
                 break

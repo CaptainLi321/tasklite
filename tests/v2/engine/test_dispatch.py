@@ -169,7 +169,7 @@ class TestDispatchOutcomeKind:
     def test_spawned_entry_carries_attempt_row(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
 
         spawned_specs: list[WorkerLaunchSpec] = []
         monkeypatch.setattr(
@@ -187,7 +187,7 @@ class TestDispatchOutcomeKind:
         assert entry.uid == "t::j1"
         assert entry.attempt_id is not None
         assert "t::j1" in env.in_flight
-        assert "t::j1" in env.store.in_flight_uids
+        assert "t::j1" in env.store.state.in_flight_uids
 
         # 派发即插 running 轨迹行 + incarnation 生成于派发点
         records = env.backend.load_attempts("t::j1")
@@ -207,16 +207,16 @@ class TestDedupGate:
     def test_wall_hit_without_rerun_skips(self, tmp_path):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
-        env.store.pop_job(0)
-        env.store.register_in_flight("t::j1")
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.pop_job(0)
+        env.store.state.register_in_flight("t::j1")
         env.store.apply_success("t::j1", {})
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert env.stats["skipped"] == 1
-        assert "t::j1" not in env.store.queue_uids
+        assert "t::j1" not in env.store.state.queue_uids
         # 跳过同样落轨迹行（skipped 结局）
         records = env.backend.load_attempts("t::j1")
         assert records[-1].outcome == "skipped"
@@ -225,9 +225,9 @@ class TestDedupGate:
         """every_run 放行：activation_no+1、attempt_no 重置 1、字面 rerun 键落行。"""
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.register_in_flight("t::j1")
+        env.store.state.register_in_flight("t::j1")
         env.store.apply_success("t::j1", {})
-        env.store.spawn_jobs([Job("t", "j1", rerun="every_run").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1", rerun="every_run").to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
             lambda spec: env.spawn_handle(spec.job.uid, spec.incarnation),
@@ -247,15 +247,15 @@ class TestDedupGate:
         assert records[-1].activation_no == 2
         assert records[-1].attempt_no == 1
         # 豁免已登记（in-flight 互斥不击落 wall 命中的重跑）
-        assert "t::j1" in env.store.in_flight_uids
+        assert "t::j1" in env.store.state.in_flight_uids
 
     def test_failed_hit_with_on_failure_reruns(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.mark_rerun_active("t::j1")
-        env.store.register_in_flight("t::j1")
+        env.store.state.mark_rerun_active("t::j1")
+        env.store.state.register_in_flight("t::j1")
         env.store.apply_failure("t::j1", {"error": "boom"})
-        env.store.spawn_jobs([Job("t", "j1", rerun="on_failure").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1", rerun="on_failure").to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
             lambda spec: env.spawn_handle(spec.job.uid, spec.incarnation),
@@ -271,16 +271,16 @@ class TestRejectGates:
 
     def test_no_handler_gate_fails_with_hook(self, tmp_path):
         env = DispatchEnv(tmp_path)
-        env.store.spawn_jobs([Job("ghost", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("ghost", "j1").to_dict()])
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert env.stats["failed"] == 1
-        assert "ghost::j1" in env.store.failed
-        assert env.store.failed["ghost::j1"]["error"] == ERR_NO_HANDLER
+        assert "ghost::j1" in env.store.state.failed
+        assert env.store.state.failed["ghost::j1"]["error"] == ERR_NO_HANDLER
         assert env.hooks == [
             ("ghost::j1", AttemptFinish(success=False, going_to_retry=False,
-                                        meta=env.store.failed["ghost::j1"]))
+                                        meta=env.store.state.failed["ghost::j1"]))
         ]
         records = env.backend.load_attempts("ghost::j1")
         assert records[-1].outcome == "failed"
@@ -288,7 +288,7 @@ class TestRejectGates:
     def test_dep_failed_gate_cascades_downstream(self, tmp_path):
         env = DispatchEnv(tmp_path)
         env.register("child")
-        env.store.spawn_jobs([
+        env.store.state.spawn_jobs([
             Job("child", "b", depends_on=["parent::a"]).to_dict(),
             Job("child", "c", depends_on=["child::b"]).to_dict(),
         ])
@@ -300,9 +300,9 @@ class TestRejectGates:
         outcome = env.dispatch.dispatch_job(sched)
         assert outcome is None
         assert env.stats["cascade_failed"] == 2
-        assert env.store.failed["child::b"]["error"] == ERR_JOB_DEPENDENCY
-        assert env.store.failed["child::b"]["failed_dependency"] == "parent::a"
-        assert env.store.failed["child::c"]["error"] == ERR_JOB_DEPENDENCY
+        assert env.store.state.failed["child::b"]["error"] == ERR_JOB_DEPENDENCY
+        assert env.store.state.failed["child::b"]["failed_dependency"] == "parent::a"
+        assert env.store.state.failed["child::c"]["error"] == ERR_JOB_DEPENDENCY
 
     def test_payload_validation_failure_rejects_without_subprocess(self, tmp_path):
         from typing import TypedDict
@@ -312,12 +312,12 @@ class TestRejectGates:
 
         env = DispatchEnv(tmp_path)
         env.register("t", payload_schema=Schema)
-        env.store.spawn_jobs([Job("t", "j1", payload={"name": 1}).to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1", payload={"name": 1}).to_dict()])
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert env.store.failed["t::j1"]["error"] == ERR_PAYLOAD_VALIDATION
-        assert env.store.failed["t::j1"]["details"]
+        assert env.store.state.failed["t::j1"]["error"] == ERR_PAYLOAD_VALIDATION
+        assert env.store.state.failed["t::j1"]["details"]
         # 载荷校验失败释放租约：工人槽位归还
         assert env.resources["__workers__"].used == 0.0
         records = env.backend.load_attempts("t::j1")
@@ -331,7 +331,7 @@ class TestRejectGates:
 
         env = DispatchEnv(tmp_path)
         env.register("t", payload_schema=Schema)
-        env.store.spawn_jobs([Job("t", "j1", payload={"name": "x"}).to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1", payload={"name": "x"}).to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
             lambda spec: env.spawn_handle(spec.job.uid, spec.incarnation),
@@ -346,7 +346,7 @@ class TestOrphanProbeGate:
     def _defer(self, tmp_path, probe_result, stats_key="deferred_orphan"):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         if isinstance(probe_result, Exception):
             def probe(uid):
                 raise probe_result
@@ -359,10 +359,10 @@ class TestOrphanProbeGate:
     def test_lock_held_defers_transiently(self, tmp_path):
         env, outcome = self._defer(tmp_path, False)
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert "t::j1" in env.store.queue_uids
-        assert env.store.queue[0]["job_id"] == "j1"
+        assert "t::j1" in env.store.state.queue_uids
+        assert env.store.state.queue[0]["job_id"] == "j1"
         assert env.stats["deferred_orphan"] == 1
-        rt = JobRuntimeState.from_dict(env.store.queue[0].get("runtime"))
+        rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
         assert rt.dispatch_failures == 0
         assert rt.last_retry_error == ""
         records = env.backend.load_attempts("t::j1")
@@ -376,7 +376,7 @@ class TestOrphanProbeGate:
         )
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert env.stats["deferred_orphan"] == 1
-        assert "t::j1" in env.store.queue_uids
+        assert "t::j1" in env.store.state.queue_uids
 
 
 class TestStaleRestoreGate:
@@ -387,7 +387,7 @@ class TestStaleRestoreGate:
 
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         stale = ExecutionResult(success=True, result_meta={"restored": True})
         monkeypatch.setattr(env.channel, "claim_stale_result", lambda uid, job: stale)
         cleaned: list[str] = []
@@ -405,7 +405,7 @@ class TestStaleRestoreGate:
     def test_no_stale_result_cleans_pre_submit(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         monkeypatch.setattr(env.channel, "claim_stale_result", lambda uid, job: None)
         cleaned: list[str] = []
         monkeypatch.setattr(
@@ -426,7 +426,7 @@ class TestStaleRestoreGate:
     ):
         env = DispatchEnv(tmp_path, extra_resources={"api": RateLimitResource("api", 0.01)})
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         monkeypatch.setattr(
             env.channel, "drain_active_signals",
             lambda uids: [("t::j1", "api", 30.0)],
@@ -450,7 +450,7 @@ class TestRateLimitDefer:
         env = DispatchEnv(tmp_path, extra_resources={"api": rate_limit})
         env.register("t")
         job = Job("t", "j1", resources={"api": 1.0})
-        env.store.spawn_jobs([job.to_dict()])
+        env.store.state.spawn_jobs([job.to_dict()])
         assert env.resources.evaluate("t", {"api": 1.0}).is_available
 
         # 关 5 残留信号排空恰落在调度评估之后、reserve 预约之前
@@ -462,8 +462,8 @@ class TestRateLimitDefer:
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert "t::j1" in env.store.queue_uids
-        rt = JobRuntimeState.from_dict(env.store.queue[0].get("runtime"))
+        assert "t::j1" in env.store.state.queue_uids
+        rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
         assert rt.dispatch_failures == 0, "限速二次检查不得计入派发失败 3-strike"
         assert rt.last_retry_error == "", "瞬态信号不得污染 last_retry_error"
         assert env.stats["rate_limited_reruns"] == 1
@@ -483,13 +483,13 @@ class TestDispatchFailureStrike:
     def test_below_threshold_requeues_and_raises(self, tmp_path):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         self._spawn_raises(env, RuntimeError("boom"))
 
         with pytest.raises(RuntimeError, match="boom"):
             env.dispatch.dispatch_next()
-        assert "t::j1" in env.store.queue_uids
-        rt = JobRuntimeState.from_dict(env.store.queue[0].get("runtime"))
+        assert "t::j1" in env.store.state.queue_uids
+        rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
         assert rt.dispatch_failures == 1
         records = env.backend.load_attempts("t::j1")
         assert records[-1].outcome == "requeued"
@@ -499,14 +499,14 @@ class TestDispatchFailureStrike:
         env.register("t")
         jd = Job("t", "j1").to_dict()
         jd["runtime"] = {RT_DISPATCH_FAILURES: 2}
-        env.store.spawn_jobs([jd])
+        env.store.state.spawn_jobs([jd])
         self._spawn_raises(env, RuntimeError("deterministic badness"))
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert "t::j1" in env.store.failed
-        assert env.store.failed["t::j1"]["error"] == ERR_DISPATCH_FAILURE
-        assert env.store.failed["t::j1"]["failures"] == 3
+        assert "t::j1" in env.store.state.failed
+        assert env.store.state.failed["t::j1"]["error"] == ERR_DISPATCH_FAILURE
+        assert env.store.state.failed["t::j1"]["failures"] == 3
         records = env.backend.load_attempts("t::j1")
         assert records[-1].outcome == "failed"
         assert [uid for uid, _ in env.hooks] == ["t::j1"]
@@ -514,19 +514,19 @@ class TestDispatchFailureStrike:
     def test_interrupt_requeues_and_reraises(self, tmp_path):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         self._spawn_raises(env, KeyboardInterrupt())
 
         with pytest.raises(KeyboardInterrupt):
             env.dispatch.dispatch_next()
-        assert "t::j1" in env.store.queue_uids
+        assert "t::j1" in env.store.state.queue_uids
 
     def test_commit_crash_signal_passes_through_untouched(self, tmp_path):
         from tasklite.v2.exceptions import _CommitCrashSignal
 
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
 
         def boom(spec):
             raise _CommitCrashSignal("backend down")
@@ -536,7 +536,7 @@ class TestDispatchFailureStrike:
             env.dispatch.dispatch_next()
         # 崩溃信号穿透：不计派发失败预算、不写失败档案（交运行循环崩溃网
         # 按磁盘真相统一收尾）
-        assert "t::j1" not in env.store.failed
+        assert "t::j1" not in env.store.state.failed
         assert env.stats["failed"] == 0
         records = env.backend.load_attempts("t::j1")
         assert records[-1].outcome == "running"
@@ -544,7 +544,7 @@ class TestDispatchFailureStrike:
     def test_assertion_error_passes_through(self, tmp_path):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
 
         def boom(spec):
             raise AssertionError("invariant broken")
@@ -552,7 +552,7 @@ class TestDispatchFailureStrike:
         env.channel.spawn = boom
         with pytest.raises(AssertionError):
             env.dispatch.dispatch_next()
-        assert "t::j1" not in env.store.failed
+        assert "t::j1" not in env.store.state.failed
         records = env.backend.load_attempts("t::j1")
         assert records[-1].outcome == "running"
 
@@ -566,11 +566,11 @@ class TestGateOrderContract:
         env.register("t")
         env.backend.commit_job_failure("dead::parent", {"error": "dead"})
         env.store.state.mark_failed("dead::parent", {"error": "dead"})
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
-        env.store.pop_job(0)
-        env.store.register_in_flight("t::j1")
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.pop_job(0)
+        env.store.state.register_in_flight("t::j1")
         env.store.apply_success("t::j1", {})
-        env.store.spawn_jobs([
+        env.store.state.spawn_jobs([
             Job("t", "j1", depends_on=["dead::parent"]).to_dict()
         ])
 
@@ -578,7 +578,7 @@ class TestGateOrderContract:
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert env.stats["skipped"] == 1
         assert env.stats["cascade_failed"] == 0
-        assert "t::j1" not in env.store.failed
+        assert "t::j1" not in env.store.state.failed
 
 
 class TestTraceAppendDegradation:
@@ -587,7 +587,7 @@ class TestTraceAppendDegradation:
     def test_append_failure_still_dispatches(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.spawn_jobs([Job("t", "j1").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         monkeypatch.setattr(
             env.backend,
             "append_attempt",

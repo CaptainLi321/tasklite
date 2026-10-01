@@ -100,12 +100,12 @@ class TestApplySuccess:
 
         assert isinstance(outcome, SuccessOutcome)
         assert outcome.uid == "process::1"
-        assert store.wall["process::1"]["score"] == 100
-        assert store.wall["process::1"]["last_run_id"] == "run_abc"
-        assert store.wall["process::1"]["run_count"] == 1
-        assert "last_run_at" in store.wall["process::1"]
-        assert store.wall["process::1"]["inputs"][0]["path"] == "/tmp/a.txt"
-        assert "process::1" not in store.in_flight_uids
+        assert store.state.wall["process::1"]["score"] == 100
+        assert store.state.wall["process::1"]["last_run_id"] == "run_abc"
+        assert store.state.wall["process::1"]["run_count"] == 1
+        assert "last_run_at" in store.state.wall["process::1"]
+        assert store.state.wall["process::1"]["inputs"][0]["path"] == "/tmp/a.txt"
+        assert "process::1" not in store.state.in_flight_uids
 
     def test_run_count_continues_from_opposite_terminal(self):
         """重跑成功从失败档案对侧终态续数（run_count 跨终态递增）。"""
@@ -113,15 +113,15 @@ class TestApplySuccess:
         state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error": "boom", "run_count": 4})
         # 终态 uid 重入 in-flight 须经重跑豁免登记（六集合互斥协议）
-        store.mark_rerun_active("t::1")
+        store.state.mark_rerun_active("t::1")
         state.register_in_flight("t::1")
         store.apply_success("t::1", {})
-        assert store.wall["t::1"]["run_count"] == 5
-        assert "t::1" not in store.failed
+        assert store.state.wall["t::1"]["run_count"] == 5
+        assert "t::1" not in store.state.failed
 
     def test_spawn_and_cursor_updates(self):
         store, _, _ = _make_store()
-        store.register_in_flight("root::1")
+        store.state.register_in_flight("root::1")
         spawned = [
             {"task_type": "child", "job_id": "c1"},
             {"task_type": "child", "job_id": "c2"},
@@ -135,9 +135,9 @@ class TestApplySuccess:
         )
 
         assert outcome.spawned_uids == ["child::c1", "child::c2"]
-        assert store.cursors["batch_pos"] == "100"
-        assert "old_cursor" not in store.cursors
-        assert [jd["job_id"] for jd in store.queue] == ["c1", "c2"]
+        assert store.state.cursors["batch_pos"] == "100"
+        assert "old_cursor" not in store.state.cursors
+        assert [jd["job_id"] for jd in store.state.queue] == ["c1", "c2"]
         assert store.stats is None  # 未注入统计不炸
 
     def test_declared_inputs_deduped_by_path(self):
@@ -152,7 +152,7 @@ class TestApplySuccess:
                 "junk",
             ],
         )
-        inputs = store.wall["t::1"]["inputs"]
+        inputs = store.state.wall["t::1"]["inputs"]
         assert len(inputs) == 1
         assert inputs[0]["size"] == 2
 
@@ -179,11 +179,11 @@ class TestApplyFailureAndCascade:
         assert isinstance(outcome, FailureOutcome)
         assert set(outcome.cascaded_uids) == {"child::1", "grandchild::1"}
         for uid in ("parent::1", "child::1", "grandchild::1"):
-            assert uid in store.failed
+            assert uid in store.state.failed
             assert uid in store.backend.load_failed()
-        assert store.failed["child::1"]["error"] == ERR_JOB_DEPENDENCY
-        assert store.failed["child::1"]["failed_dependency"] == "parent::1"
-        assert "parent::1" not in store.in_flight_uids
+        assert store.state.failed["child::1"]["error"] == ERR_JOB_DEPENDENCY
+        assert store.state.failed["child::1"]["failed_dependency"] == "parent::1"
+        assert "parent::1" not in store.state.in_flight_uids
 
     def test_failure_payload_snapshot_skipped_when_unserializable(self, caplog):
         """payload 快照不可序列化时降级 None——快照失败不得误触 3-strike。"""
@@ -194,20 +194,20 @@ class TestApplyFailureAndCascade:
             "payload": {"bad": object()},
         }
         store.apply_failure("t::1", {"error": "x"}, job_dict=job_dict)
-        assert "t::1" in store.failed
+        assert "t::1" in store.state.failed
         assert "t::1" not in backend.load_failed_payloads()
 
     def test_failure_clears_wall_on_both_sides(self):
         """失败终态与成功终态互删对侧（内存与后端镜像同步）。"""
         store, _, backend = _make_store()
-        store.register_in_flight("t::1")
+        store.state.register_in_flight("t::1")
         store.apply_success("t::1", {})
-        store.mark_rerun_active("t::1")
-        store.register_in_flight("t::1")
+        store.state.mark_rerun_active("t::1")
+        store.state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error": "again"})
 
-        assert "t::1" not in store.wall
-        assert "t::1" in store.failed
+        assert "t::1" not in store.state.wall
+        assert "t::1" in store.state.failed
         assert "t::1" not in backend.load_wall()
         assert "t::1" in backend.load_failed()
 
@@ -222,7 +222,7 @@ class TestApplyRetry:
         stats = TaskStats()
         store, state, _ = _make_store(stats=stats)
         state.replace_queue([])
-        store.register_in_flight("t::1")
+        store.state.register_in_flight("t::1")
 
         outcome = store.apply_retry(
             "t::1",
@@ -234,8 +234,8 @@ class TestApplyRetry:
 
         assert isinstance(outcome, RetryOutcome)
         assert outcome.transient_kind == "interrupted"
-        assert store.queue[0]["job_id"] == "1"
-        assert "t::1" not in store.in_flight_uids
+        assert store.state.queue[0]["job_id"] == "1"
+        assert "t::1" not in store.state.in_flight_uids
         assert stats["retried"] == 1
         assert stats["interrupted_reruns"] == 1
 
@@ -247,7 +247,7 @@ class TestApplyRetry:
 
         with pytest.raises(_CommitCrashSignal, match="commit_retry"):
             store.apply_retry("t::1", {"task_type": "t", "job_id": "1"}, self._retry_dict())
-        assert "t::1" in store.queue_uids
+        assert "t::1" in store.state.queue_uids
 
 
 class TestApplySkip:
@@ -266,7 +266,7 @@ class TestApplySkip:
         assert isinstance(outcome, SkipOutcome)
         assert outcome.was_known is True
         assert stats["skipped"] == 1
-        assert store.is_empty
+        assert store.state.is_empty
         assert backend.load_queue() == []
 
     def test_skip_commit_failure_crashes_without_archive(self):
@@ -279,8 +279,8 @@ class TestApplySkip:
 
         with pytest.raises(_CommitCrashSignal, match="commit_skip"):
             store.apply_skip("t::1", job_dict={"task_type": "t", "job_id": "1"})
-        assert "t::1" in store.queue_uids
-        assert "t::1" not in store.failed
+        assert "t::1" in store.state.queue_uids
+        assert "t::1" not in store.state.failed
 
 
 class TestMarkFailedMemoryContract:
@@ -330,36 +330,36 @@ class TestCommitFailureStrike:
         store = self._strike_store([])
         job_dict = {"task_type": "task", "job_id": "1"}
 
-        store.register_in_flight("task::1")
+        store.state.register_in_flight("task::1")
         with pytest.raises(_CommitCrashSignal):
             store.apply_success("task::1", {}, job_dict=job_dict)
         assert job_dict["runtime"]["_commit_failures"] == 1
-        assert "task::1" in store.queue_uids
+        assert "task::1" in store.state.queue_uids
 
-        store.pop_job(0)
-        store.register_in_flight("task::1")
+        store.state.pop_job(0)
+        store.state.register_in_flight("task::1")
         with pytest.raises(_CommitCrashSignal):
             store.apply_success("task::1", {}, job_dict=job_dict)
         assert job_dict["runtime"]["_commit_failures"] == 2
 
-        store.pop_job(0)
-        store.register_in_flight("task::1")
+        store.state.pop_job(0)
+        store.state.register_in_flight("task::1")
         with pytest.raises(_JobTerminated, match="permanently failed"):
             store.apply_success("task::1", {}, job_dict=job_dict)
-        assert "task::1" in store.failed
-        assert store.failed["task::1"]["fatal"] is True
-        assert store.failed["task::1"]["error"] == ERR_COMMIT_FAILURE
+        assert "task::1" in store.state.failed
+        assert store.state.failed["task::1"]["fatal"] is True
+        assert store.state.failed["task::1"]["error"] == ERR_COMMIT_FAILURE
 
     def test_strike_archive_fires_hook_exactly_once(self):
         hooks: list[tuple[str, AttemptFinish]] = []
         store = self._strike_store(hooks)
         job_dict = {"task_type": "task", "job_id": "1"}
         for _ in range(2):
-            store.register_in_flight("task::1")
+            store.state.register_in_flight("task::1")
             with pytest.raises(_CommitCrashSignal):
                 store.apply_success("task::1", {}, job_dict=job_dict)
-            store.pop_job(0)
-        store.register_in_flight("task::1")
+            store.state.pop_job(0)
+        store.state.register_in_flight("task::1")
         with pytest.raises(_JobTerminated):
             store.apply_success("task::1", {}, job_dict=job_dict)
 
@@ -467,8 +467,8 @@ class TestApplyBulkFailure:
         assert isinstance(outcome, BulkFailureOutcome)
         assert outcome.failed_uids == ["cycle::1", "cycle::2"]
         assert outcome.remaining_queue_count == 1
-        assert "cycle::1" in store.failed
-        assert "safe::1" in store.queue_uids
+        assert "cycle::1" in store.state.failed
+        assert "safe::1" in store.state.queue_uids
 
     def test_bulk_failure_keeps_wall_deleted_on_backend(self):
         """批量失败与单条失败对称：wall 同名行随事务删除。"""
@@ -488,8 +488,8 @@ class TestApplyBulkFailure:
 
         with pytest.raises(_CommitCrashSignal):
             store.apply_bulk_failure([("cycle::1", {"error": "DEPENDENCY_DEADLOCK"})])
-        assert store.queue[0]["runtime"]["_commit_failures"] == 1
-        assert "cycle::1" not in store.failed
+        assert store.state.queue[0]["runtime"]["_commit_failures"] == 1
+        assert "cycle::1" not in store.state.failed
 
 
 class TestBulkStrikeConvergence:
@@ -523,7 +523,7 @@ class TestBulkStrikeConvergence:
             [("cycle::1", {"error": "DEPENDENCY_DEADLOCK"})]
         )
         assert outcome.failed_uids == ["cycle::1"]
-        deadlock_meta = store_deadlock.failed["cycle::1"]
+        deadlock_meta = store_deadlock.state.failed["cycle::1"]
 
         hooks_cascade: list[tuple[str, AttemptFinish]] = []
         store_cascade = self._strike_bulk_store(
@@ -538,10 +538,10 @@ class TestBulkStrikeConvergence:
                 },
             ],
         )
-        store_cascade.pop_job(0)
+        store_cascade.state.pop_job(0)
         cascade_outcome = store_cascade.apply_failure("parent::1", {"error": "boom"})
         assert cascade_outcome.cascaded_uids == ["child::1"]
-        cascade_meta = store_cascade.failed["child::1"]
+        cascade_meta = store_cascade.state.failed["child::1"]
 
         for meta in (deadlock_meta, cascade_meta):
             assert meta["error"] == ERR_COMMIT_FAILURE
@@ -571,9 +571,9 @@ class TestBulkStrikeConvergence:
 
         assert outcome.failed_uids == ["cycle::1", "ghost::9"]
         assert outcome.remaining_queue_count == 0
-        assert store.failed["cycle::1"]["error"] == ERR_COMMIT_FAILURE
-        assert store.failed["ghost::9"]["error"] == ERR_COMMIT_FAILURE
-        assert "ghost::9" not in store.queue_uids
+        assert store.state.failed["cycle::1"]["error"] == ERR_COMMIT_FAILURE
+        assert store.state.failed["ghost::9"]["error"] == ERR_COMMIT_FAILURE
+        assert "ghost::9" not in store.state.queue_uids
         assert sorted(uid for uid, _ in hooks) == ["cycle::1", "ghost::9"]
         assert store.stats["failed"] == 2
 
@@ -740,12 +740,12 @@ class TestAttemptTraceFinalization:
         aid = self._open_running(backend, "t::1")
 
         store.apply_success("t::1", {}, attempt_id=aid)
-        assert "t::1" in store.wall
+        assert "t::1" in store.state.wall
 
     def test_attempt_id_none_is_noop(self):
         store, _, _ = _make_store()
         store.apply_success("t::1", {}, attempt_id=None)
-        assert "t::1" in store.wall
+        assert "t::1" in store.state.wall
 
 
 class TestSnapshotAndMembership:
@@ -760,28 +760,32 @@ class TestSnapshotAndMembership:
         )
         return StateStore(InMemoryStateBackend(), state)
 
-    def test_membership_delegation(self):
+    def test_membership_predicates(self):
+        """成员判定经 store.state 单一访问路径（六集合统一谓词）。"""
         store = self._probe_store()
-        assert store.is_completed("w::1")
-        assert store.is_failed("f::1")
-        assert store.is_known("w::1")
-        assert store.is_known("q::1")
-        assert not store.is_known("unknown::1")
-        assert store.cursors == {"c": "v"}
+        assert "w::1" in store.state.wall
+        assert "f::1" in store.state.failed
+        assert store.state.is_known("w::1")
+        assert store.state.is_known("q::1")
+        assert not store.state.is_known("unknown::1")
+        assert store.state.cursors == {"c": "v"}
 
-    @pytest.mark.parametrize(
-        "prop", ["wall_uids", "failed_uids", "queue_uids", "in_flight_uids"]
-    )
-    def test_uid_properties_return_frozenset(self, prop):
+    def test_uid_index_liveness_contract(self):
+        """uid 索引形态契约：in_flight 恒 frozenset，wall/failed/queue 为
+        活索引（调用方需要快照时在边界显式 frozenset 冻结）。"""
         store = self._probe_store()
-        assert isinstance(getattr(store, prop), frozenset)
+        assert isinstance(store.state.in_flight_uids, frozenset)
+        assert isinstance(store.state.wall_uids, set)
+        assert isinstance(store.state.failed_uids, set)
+        assert isinstance(store.state.queue_uids, set)
 
     def test_snapshot_isolation(self):
+        """显式冻结的快照与活索引隔离（快照边界在调用方）。"""
         store = self._probe_store()
-        snapshot = store.queue_uids
-        store.pop_job(0)
+        snapshot = frozenset(store.state.queue_uids)
+        store.state.pop_job(0)
         assert "q::1" in snapshot
-        assert "q::1" not in store.queue_uids
+        assert "q::1" not in store.state.queue_uids
 
     def test_set_state_and_backend_reset(self):
         store, _, _ = _make_store()
@@ -789,7 +793,7 @@ class TestSnapshotAndMembership:
         store.set_state(fresh)
         assert store.state is fresh
         store.set_state(None)
-        assert store.is_empty
+        assert store.state.is_empty
         new_backend = InMemoryStateBackend()
         store.set_backend(new_backend)
         assert store.backend is new_backend
@@ -849,17 +853,17 @@ class _MutexProbe:
         self.store = StateStore(self.backend, self.state)
 
     def _pop_from_memory_queue(self, uid: str) -> None:
-        for idx, jd in enumerate(self.store.queue):
+        for idx, jd in enumerate(self.store.state.queue):
             if f"{jd.get('task_type')}::{jd.get('job_id')}" == uid:
-                self.store.pop_job(idx)
+                self.store.state.pop_job(idx)
                 return
 
     def apply(self, action: str, i: int) -> None:
         uid = _UID_POOL[i]
         if action == "enqueue":
-            if self.store.is_known(uid) or uid in self.store.queue_uids:
+            if self.store.state.is_known(uid) or uid in self.store.state.queue_uids:
                 return
-            self.store.spawn_jobs([_job_dict(uid)], front=False)
+            self.store.state.spawn_jobs([_job_dict(uid)], front=False)
         elif action == "success":
             self._pop_from_memory_queue(uid)
             self.store.apply_success(uid, {"score": i})
@@ -872,7 +876,7 @@ class _MutexProbe:
             if self.backend.commit_job_failure(uid, {"error": "tail"}):
                 self.store.mark_failed_memory(uid, {"error": "tail"})
         elif action == "retry":
-            if self.store.is_completed(uid) or self.store.is_failed(uid):
+            if uid in self.store.state.wall or uid in self.store.state.failed:
                 return
             self._pop_from_memory_queue(uid)
             self.store.apply_retry(uid, _job_dict(uid), _job_dict(uid))
@@ -886,8 +890,8 @@ class _MutexProbe:
 
     def assert_mutex(self) -> None:
         """核心不变式：wall ∩ failed = ∅（内存与后端镜像一致），终态不留在队列。"""
-        mem_wall = set(self.store.wall_uids)
-        mem_failed = set(self.store.failed_uids)
+        mem_wall = set(self.store.state.wall_uids)
+        mem_failed = set(self.store.state.failed_uids)
         assert mem_wall & mem_failed == set(), f"内存互斥破坏: {mem_wall & mem_failed}"
         disk_wall = set(self.backend.load_wall())
         disk_failed = set(self.backend.load_failed())
@@ -896,7 +900,7 @@ class _MutexProbe:
         assert mem_failed == disk_failed, f"failed 镜像漂移: {mem_failed} vs {disk_failed}"
         assert mem_wall | mem_failed <= set(_UID_POOL)
         for uid in mem_wall | mem_failed:
-            assert uid not in self.store.queue_uids, f"终态 {uid} 残留在队列"
+            assert uid not in self.store.state.queue_uids, f"终态 {uid} 残留在队列"
 
 
 @pytest.mark.hypothesis
@@ -924,14 +928,14 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     probe._pop_from_memory_queue(uid)
 
     probe.store.apply_failure(uid, {"error": "boom"}, job_dict=_job_dict(uid))
-    assert probe.store.is_failed(uid)
-    assert not probe.store.is_completed(uid)
+    assert uid in probe.store.state.failed
+    assert uid not in probe.store.state.wall
 
     probe.store.apply_success(uid, {"score": 1})
-    assert probe.store.is_completed(uid)
-    assert not probe.store.is_failed(uid)
+    assert uid in probe.store.state.wall
+    assert uid not in probe.store.state.failed
 
     probe.store.apply_failure(uid, {"error": "again"}, job_dict=_job_dict(uid))
-    assert probe.store.is_failed(uid)
-    assert not probe.store.is_completed(uid)
+    assert uid in probe.store.state.failed
+    assert uid not in probe.store.state.wall
     probe.assert_mutex()

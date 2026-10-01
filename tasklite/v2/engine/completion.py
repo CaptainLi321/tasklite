@@ -145,7 +145,7 @@ class CompletionMachine:
         """
         store = self._store
         if expect_in_flight:
-            assert uid in store.in_flight_uids, (
+            assert uid in store.state.in_flight_uids, (
                 f"identity vacuity violation: {uid} not in-flight "
                 f"at apply_result entry"
             )
@@ -311,10 +311,10 @@ class CompletionMachine:
             if nj_uid in seen_in_batch:
                 logger.debug(f"Skipping duplicate spawn for {nj_uid}.")
                 continue
-            if store.is_known(nj_uid):
-                if nj_uid in store.queue_uids or nj_uid in store.in_flight_uids:
+            if store.state.is_known(nj_uid):
+                if nj_uid in store.state.queue_uids or nj_uid in store.state.in_flight_uids:
                     continue
-                decision = self._rerun_policy.admit(nj.to_dict(), store)
+                decision = self._rerun_policy.admit(nj.to_dict(), store.state)
                 if decision.should_skip:
                     continue
             seen_in_batch.add(nj_uid)
@@ -395,7 +395,7 @@ class CompletionMachine:
                 self.complete_job(entry, result)
                 completed_count += 1
             finally:
-                self._in_flight.settle(handle.uid, state=store)
+                self._in_flight.settle(handle.uid, state=store.state)
         return completed_count
 
     def settle_aborted(
@@ -412,10 +412,10 @@ class CompletionMachine:
         store = self._store
         # 1. 未完成任务注销并重入队
         for pending_entry in cancelled_entries:
-            self._in_flight.settle(pending_entry.uid, state=store)
+            self._in_flight.settle(pending_entry.uid, state=store.state)
         job_dicts = [entry.job_dict for entry in cancelled_entries]
         if job_dicts:
-            store.requeue_jobs(job_dicts, front=True)
+            store.state.requeue_jobs(job_dicts, front=True)
 
         # 2. 已完成任务提交
         commit_crash: BaseException | None = None
@@ -427,10 +427,10 @@ class CompletionMachine:
             except _CommitCrashSignal as e:
                 commit_crash = e
             finally:
-                self._in_flight.settle(entry.uid, state=store)
+                self._in_flight.settle(entry.uid, state=store.state)
 
         self._in_flight.clear()
-        store.clear_in_flight()
+        store.state.clear_in_flight()
         if commit_crash is not None:
             raise commit_crash
 

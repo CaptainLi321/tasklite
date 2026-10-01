@@ -20,7 +20,7 @@ from ..models.state import uid_from_job_dict
 
 
 class TerminalHistory(Protocol):
-    """准入判定消费的终态历史契约（StateStore/PipelineState 满足）。"""
+    """准入判定消费的终态历史契约（PipelineState 满足）。"""
 
     @property
     def wall(self) -> Mapping[str, dict]: ...
@@ -242,7 +242,7 @@ class RerunPolicy:
         """统一极窄准入判定入口：从终态历史契约提取上下文并执行评估。
 
         ``history`` 为 ``TerminalHistory`` 契约（wall/failed 视图，
-        StateStore 与 PipelineState 均满足）。
+        PipelineState 满足；调用方传 ``store.state``）。
         """
         uid = uid_from_job_dict(job_dict)
         wall_hit = uid in history.wall

@@ -315,7 +315,7 @@ class StateStore:
         """
         self._finish_attempt(attempt_id, outcome=outcome, error=error)
 
-    # ── 内存状态受控接缝（视图与转发）────────────────────────────────
+    # ── 内存状态受控接缝 ─────────────────────────────────────────────
 
     def mark_failed_memory(
         self, uid: str, meta: dict[str, Any], *, unregister: bool = True
@@ -333,102 +333,14 @@ class StateStore:
 
     @property
     def state(self) -> PipelineState:
-        """底层 PipelineState 引用（供调度器/恢复编排层直读）。"""
+        """底层 PipelineState 引用（内存状态唯一访问路径，供调度器/
+        恢复编排层/机器群直读）。"""
         return self._state
 
     @property
     def backend(self) -> AbstractStateBackend:
         """底层持久化后端引用（所有权唯一锚点，换库经 set_backend 单点）。"""
         return self._backend
-
-    @property
-    def queue(self) -> list[dict[str, Any]]:
-        """内存作业队列视图。"""
-        return self._state.queue
-
-    @property
-    def wall(self) -> dict[str, dict[str, Any]]:
-        """成功历史集合视图。"""
-        return self._state.wall
-
-    @property
-    def failed(self) -> dict[str, dict[str, Any]]:
-        """失败档案集合视图。"""
-        return self._state.failed
-
-    @property
-    def cursors(self) -> dict[str, str]:
-        """游标字典视图。"""
-        return self._state.cursors
-
-    @property
-    def in_flight_uids(self) -> frozenset[str]:
-        """当前在途作业 UID 集合快照。"""
-        return self._state.in_flight_uids
-
-    @property
-    def wall_uids(self) -> frozenset[str]:
-        """已成功作业 UID 集合快照。
-
-        不变式：对外只交不可变快照——PipelineState 内部活索引绝不被
-        调用方持有引用（误改会静默破坏 wall 去重一致性）。
-        """
-        return frozenset(self._state.wall_uids)
-
-    @property
-    def failed_uids(self) -> frozenset[str]:
-        """已失败作业 UID 集合快照（不可变契约同 wall_uids）。"""
-        return frozenset(self._state.failed_uids)
-
-    @property
-    def queue_uids(self) -> frozenset[str]:
-        """排队作业 UID 集合快照（不可变契约同 wall_uids）。"""
-        return frozenset(self._state.queue_uids)
-
-    def pop_job(self, idx: int) -> dict[str, Any]:
-        """弹出指定位置作业并同步 UID 索引。"""
-        return self._state.pop_job(idx)
-
-    def spawn_jobs(self, job_dicts: list[dict[str, Any]], *, front: bool = True) -> None:
-        """批量入队作业并同步 UID 索引。"""
-        self._state.spawn_jobs(job_dicts, front=front)
-
-    def requeue_jobs(self, job_dicts: list[dict[str, Any]], *, front: bool = True) -> None:
-        """重入队作业（崩溃恢复/重试）并同步 UID 索引。"""
-        self._state.requeue_jobs(job_dicts, front=front)
-
-    def is_known(self, uid: str) -> bool:
-        """检查作业是否已在系统任一集合（wall/failed/queue/in_flight）中。"""
-        return self._state.is_known(uid)
-
-    def is_completed(self, uid: str) -> bool:
-        """检查作业是否已在 wall 成功集合中。"""
-        return uid in self._state.wall
-
-    def is_failed(self, uid: str) -> bool:
-        """检查作业是否已在失败档案中。"""
-        return uid in self._state.failed
-
-    @property
-    def is_empty(self) -> bool:
-        """队列是否为空。"""
-        return self._state.is_empty
-
-    def clear_in_flight(self) -> None:
-        """清空在途集合并维护重跑豁免集合。"""
-        self._state.clear_in_flight()
-
-    def register_in_flight(self, uid: str) -> None:
-        """登记在途 UID。"""
-        self._state.register_in_flight(uid)
-
-    def mark_rerun_active(self, uid: str) -> None:
-        """登记重跑豁免 UID（派发期准入放行的 wall/failed 命中重跑）。"""
-        self._state.mark_rerun_active(uid)
-
-    def unregister_in_flight(self, uid: str) -> None:
-        """注销在途 UID。"""
-        self._state.unregister_in_flight(uid)
 
     def set_state(self, state: PipelineState | None) -> None:
         """重新设置内存状态（run 启动加载期使用）。"""

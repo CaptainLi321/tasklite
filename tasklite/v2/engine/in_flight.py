@@ -19,8 +19,8 @@ if TYPE_CHECKING:
     class InFlightStateIndex(Protocol):
         """在途登记/注销同步的内存状态索引契约。
 
-        StateStore（装配转发）与 PipelineState（直持索引）均满足；注册
-        与注销是六集合互斥不变式的单一维护点。
+        PipelineState（直持索引）满足；注册与注销是六集合互斥不变式的
+        单一维护点（调用方传 ``store.state``）。
         """
 
         @property
@@ -127,8 +127,8 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         """登记在途作业条目（单一真相源入口）。
 
         ``state`` 为内存状态索引（``InFlightStateIndex`` 契约，
-        StateStore/PipelineState 满足），非 None 时同步内存 in-flight
-        索引。
+        PipelineState 满足，调用方传 ``store.state``），非 None 时同步
+        内存 in-flight 索引。
         """
         self._entries[entry.uid] = entry
         if state is not None:

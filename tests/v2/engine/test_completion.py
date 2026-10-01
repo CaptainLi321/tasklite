@@ -94,7 +94,7 @@ class CompletionEnv:
             lease=lease,
             attempt_id=attempt_id,
         )
-        self.in_flight.track(entry, state=self.store)
+        self.in_flight.track(entry, state=self.store.state)
         return entry
 
     def open_attempt(self, job: Job, *, attempt_no=1, activation_no=1) -> int:
@@ -147,11 +147,11 @@ class TestCompleteJobSuccess:
         env.completion.complete_job(entry, result)
 
         assert env.resources["gpu"].used == 0.0
-        assert env.store.wall["t::j1"]["score"] == 100
-        assert env.store.wall["t::j1"]["last_run_id"] == env.session.run_id
-        assert env.store.wall["t::j1"]["inputs"][0]["path"] == "/data/in.csv"
+        assert env.store.state.wall["t::j1"]["score"] == 100
+        assert env.store.state.wall["t::j1"]["last_run_id"] == env.session.run_id
+        assert env.store.state.wall["t::j1"]["inputs"][0]["path"] == "/data/in.csv"
         assert env.stats["completed"] == 1
-        assert "t::j1" not in env.store.in_flight_uids
+        assert "t::j1" not in env.store.state.in_flight_uids
         assert cleaned == [("t::j1", ArtifactCleanupMode.SUCCESS)]
         # 收尾钩子恰好一次（成功语义）
         assert env.hooks == [
@@ -173,7 +173,7 @@ class TestCompleteJobSuccess:
                 cursor_updates={"pos": "42"},
             ),
         )
-        assert env.store.cursors["pos"] == "42"
+        assert env.store.state.cursors["pos"] == "42"
 
 
 class TestCompleteJobFailure:
@@ -197,8 +197,8 @@ class TestCompleteJobFailure:
             entry, ExecutionResult(success=False, result_meta={"error": "boom"})
         )
 
-        assert env.store.failed["t::j1"]["error"] == "boom"
-        assert env.store.failed["child::c1"]["error"] == "JOB_DEPENDENCY"
+        assert env.store.state.failed["t::j1"]["error"] == "boom"
+        assert env.store.state.failed["child::c1"]["error"] == "JOB_DEPENDENCY"
         assert env.stats["failed"] == 1
         assert env.stats["cascade_failed"] == 1
         assert cleaned[-1] == ("t::j1", ArtifactCleanupMode.FAILURE_OR_RETRY)
@@ -224,9 +224,9 @@ class TestRetryBudget:
 
         assert result.going_to_retry is True
         assert env.stats["retried"] == 1
-        assert env.store.queue[0]["attempt_no"] == 2
-        assert env.store.queue[0]["first_enqueued_at"] == job.first_enqueued_at
-        rt = JobRuntimeState.from_dict(env.store.queue[0].get("runtime"))
+        assert env.store.state.queue[0]["attempt_no"] == 2
+        assert env.store.state.queue[0]["first_enqueued_at"] == job.first_enqueued_at
+        rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
         assert rt.last_retry_error == "connection blip"
         assert env.backend.load_attempts("t::j1")[-1].outcome == "requeued"
         assert env.hooks[-1] == (
@@ -246,8 +246,8 @@ class TestRetryBudget:
             "t::j1", job, job_dict,
             ExecutionResult(retry_requested=True, retry_error="x"),
         )
-        assert env.store.queue[0]["custom_note"] == "keep-me"
-        assert env.store.queue[0]["resources"] == {"__workers__": 1.0}
+        assert env.store.state.queue[0]["custom_note"] == "keep-me"
+        assert env.store.state.queue[0]["resources"] == {"__workers__": 1.0}
 
     def test_budget_exhaustion_archives(self, tmp_path):
         env = CompletionEnv(tmp_path)
@@ -262,10 +262,10 @@ class TestRetryBudget:
         env.completion.complete_job(entry, result)
 
         assert result.going_to_retry is False
-        assert "t::j1" in env.store.failed
-        assert env.store.failed["t::j1"]["error"] == ERR_MAX_RETRIES
-        assert env.store.failed["t::j1"]["last_retry_error"] == "first failure"
-        assert env.store.failed["t::j1"]["retry_error"] == "second"
+        assert "t::j1" in env.store.state.failed
+        assert env.store.state.failed["t::j1"]["error"] == ERR_MAX_RETRIES
+        assert env.store.state.failed["t::j1"]["last_retry_error"] == "first failure"
+        assert env.store.state.failed["t::j1"]["retry_error"] == "second"
         assert env.stats["failed"] == 1
         assert env.backend.load_attempts("t::j1")[-1].outcome == "failed"
 
@@ -284,9 +284,9 @@ class TestRetryBudget:
         env.completion.complete_job(entry, result)
 
         assert result.going_to_retry is True
-        assert "t::j1" not in env.store.failed
-        assert env.store.queue[0]["attempt_no"] == 5
-        rt = JobRuntimeState.from_dict(env.store.queue[0].get("runtime"))
+        assert "t::j1" not in env.store.state.failed
+        assert env.store.state.queue[0]["attempt_no"] == 5
+        rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
         assert rt.last_retry_error == ""
         assert env.stats["interrupted_reruns"] == 1
 
@@ -337,8 +337,8 @@ class TestThreeStrikeTermination:
         env.completion.complete_job(entry, result)  # 不上抛 _JobTerminated
 
         assert result.going_to_retry is False
-        assert "t::j1" in env.store.failed
-        assert env.store.failed["t::j1"]["error"] == "COMMIT_FAILURE"
+        assert "t::j1" in env.store.state.failed
+        assert env.store.state.failed["t::j1"]["error"] == "COMMIT_FAILURE"
         # 钩子恰好一次：3-strike 分支已触发，尾部跳过
         assert len(env.hooks) == 1
         assert env.hooks[0][1].success is False
@@ -351,10 +351,10 @@ class TestSpawnedJobs:
     def test_spawn_dedup_queue_hit_blocks_rerun(self, tmp_path):
         """queue/in-flight 命中无条件拦截，优先于 every_run 豁免。"""
         env = CompletionEnv(tmp_path)
-        env.store.register_in_flight("child::x")
+        env.store.state.register_in_flight("child::x")
         env.store.apply_success("child::x", {})
         # X 重跑中（queue，every_run 放行重跑）
-        env.store.spawn_jobs([Job("child", "x", rerun="every_run").to_dict()])
+        env.store.state.spawn_jobs([Job("child", "x", rerun="every_run").to_dict()])
 
         parent = Job("parent", "p1")
         entry = env.track_entry(parent)
@@ -365,13 +365,13 @@ class TestSpawnedJobs:
                 new_jobs=[Job("child", "x", rerun="every_run")],
             ),
         )
-        assert "parent::p1" in env.store.wall
-        x_rows = [jd for jd in env.store.queue if jd["job_id"] == "x"]
+        assert "parent::p1" in env.store.state.wall
+        x_rows = [jd for jd in env.store.state.queue if jd["job_id"] == "x"]
         assert len(x_rows) == 1, "spawn 必须被 queue 命中拦截"
 
     def test_spawn_wall_hit_every_run_admitted(self, tmp_path):
         env = CompletionEnv(tmp_path)
-        env.store.register_in_flight("child::y")
+        env.store.state.register_in_flight("child::y")
         env.store.apply_success("child::y", {})
         # wall 命中 + every_run：spawn 放行（唯一终态历史行被替换语义）
 
@@ -384,8 +384,8 @@ class TestSpawnedJobs:
                 new_jobs=[Job("child", "y", rerun="every_run")],
             ),
         )
-        assert "parent::p1" in env.store.wall
-        assert "child::y" in env.store.queue_uids
+        assert "parent::p1" in env.store.state.wall
+        assert "child::y" in env.store.state.queue_uids
 
     def test_spawn_dedup_within_batch(self, tmp_path):
         env = CompletionEnv(tmp_path)
@@ -398,7 +398,7 @@ class TestSpawnedJobs:
                 new_jobs=[Job("child", "a"), Job("child", "a")],
             ),
         )
-        rows = [jd for jd in env.store.queue if jd["job_id"] == "a"]
+        rows = [jd for jd in env.store.state.queue if jd["job_id"] == "a"]
         assert len(rows) == 1
 
     def test_unserializable_spawned_job_rejected_not_parent(self, tmp_path):
@@ -418,9 +418,9 @@ class TestSpawnedJobs:
                 new_jobs=[Job("child", "bad", payload={"x": Unserializable()})],
             ),
         )
-        assert "parent::p1" in env.store.wall
-        assert "child::bad" in env.store.failed
-        assert "INVALID_SPAWNED_JOB" in env.store.failed["child::bad"]["error"]
+        assert "parent::p1" in env.store.state.wall
+        assert "child::bad" in env.store.state.failed
+        assert "INVALID_SPAWNED_JOB" in env.store.state.failed["child::bad"]["error"]
         # 伪 entry 无轨迹行：拒绝路径不落 attempt
         assert env.backend.load_attempts("child::bad") == []
 
@@ -460,7 +460,7 @@ class TestSuspensionApplication:
                 success=True, result_meta={}, resource_suspensions=[("ghost", 5.0)],
             ),
         )
-        assert "t::j1" in env.store.wall
+        assert "t::j1" in env.store.state.wall
 
 
 class TestIdentityVacuity:
@@ -484,7 +484,7 @@ class TestIdentityVacuity:
             ExecutionResult(success=True),
             expect_in_flight=False,
         )
-        assert "t::j1" in env.store.wall
+        assert "t::j1" in env.store.state.wall
 
 
 class TestSettleReaped:
@@ -504,10 +504,10 @@ class TestSettleReaped:
             (e2.handle, ExecutionResult(success=False, result_meta={"error": "x"})),
         ])
         assert count == 2
-        assert "t::j1" in env.store.wall
-        assert "t::j2" in env.store.failed
+        assert "t::j1" in env.store.state.wall
+        assert "t::j2" in env.store.state.failed
         assert len(env.in_flight) == 0
-        assert env.store.in_flight_uids == frozenset()
+        assert env.store.state.in_flight_uids == frozenset()
         assert env.backend.load_attempts("t::j1")[-1].outcome == "succeeded"
 
     def test_settle_reaped_skips_unknown_handle(self, tmp_path):
@@ -532,10 +532,10 @@ class TestSettleAborted:
             cancelled_entries=[e1],
             done_entries=[(e2, ExecutionResult(success=True, result_meta={}))],
         )
-        assert [jd["job_id"] for jd in env.store.queue] == ["j1"]
-        assert "t::j2" in env.store.wall
+        assert [jd["job_id"] for jd in env.store.state.queue] == ["j1"]
+        assert "t::j2" in env.store.state.wall
         assert len(env.in_flight) == 0
-        assert env.store.in_flight_uids == frozenset()
+        assert env.store.state.in_flight_uids == frozenset()
 
     def test_commit_crash_signal_last_one_propagates(self, tmp_path):
         class FailingBackend(InMemoryStateBackend):
@@ -555,7 +555,7 @@ class TestSettleAborted:
                 done_entries=[(e1, ExecutionResult(success=True))],
             )
         assert len(env.in_flight) == 0
-        assert env.store.in_flight_uids == frozenset()
+        assert env.store.state.in_flight_uids == frozenset()
 
 
 class TestHookFireDiscipline:
@@ -581,4 +581,4 @@ class TestHookFireDiscipline:
         entry = env.track_entry(job)
         env.completion.complete_job(entry, ExecutionResult(success=True))
         assert env.stats["hook_errors"] == 1
-        assert "t::j1" in env.store.wall
+        assert "t::j1" in env.store.state.wall
