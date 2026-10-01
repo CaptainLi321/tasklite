@@ -24,6 +24,12 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..models.attempt import (
+    ATTEMPT_FAILED,
+    ATTEMPT_REQUEUED,
+    ATTEMPT_SKIPPED,
+    ATTEMPT_SUCCEEDED,
+)
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, uid_from_job_dict
 from ..utils.jsonutil import dumps
@@ -306,7 +312,7 @@ class StateStore:
         stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
         if stat_key:
             self._record_stat(stat_key, 1)
-        self._finish_attempt(attempt_id, outcome="requeued", error=error)
+        self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error=error)
 
     def finish_attempt(
         self, attempt_id: int | None, *, outcome: str, error: str | None = None
@@ -495,7 +501,7 @@ class StateStore:
             self._state.mark_success(uid, wall_meta)
             self._state.unregister_in_flight(uid)
             self._record_stat("completed", 1)
-            self._finish_attempt(attempt_id, outcome="succeeded")
+            self._finish_attempt(attempt_id, outcome=ATTEMPT_SUCCEEDED)
             spawned_uids = [uid_from_job_dict(j) for j in spawned_list]
             return SuccessOutcome(uid=uid, wall_meta=wall_meta, spawned_uids=spawned_uids)
 
@@ -523,7 +529,7 @@ class StateStore:
             self._record_stat(count_as, 1)
             self._finish_attempt(
                 attempt_id,
-                outcome="failed",
+                outcome=ATTEMPT_FAILED,
                 error=self._attempt_error(normalized_meta),
             )
             cascaded_uids: list[str] = []
@@ -582,7 +588,7 @@ class StateStore:
                 stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
                 if stat_key:
                     self._record_stat(stat_key, 1)
-            self._finish_attempt(attempt_id, outcome="requeued", error=error)
+            self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error=error)
             return RetryOutcome(uid=uid, retry_dict=retry_dict, transient_kind=transient_kind)
 
         self.handle_commit_failure_strike(uid, "commit_retry", job_dict, attempt_id=attempt_id)
@@ -600,7 +606,7 @@ class StateStore:
         if committed:
             self._state.unregister_in_flight(uid)
             self._record_stat("skipped", 1)
-            self._finish_attempt(attempt_id, outcome="skipped")
+            self._finish_attempt(attempt_id, outcome=ATTEMPT_SKIPPED)
             return SkipOutcome(uid=uid, was_known=True)
 
         self.handle_skip_commit_strike(uid, job_dict, attempt_id=attempt_id)
@@ -753,7 +759,7 @@ class StateStore:
                 self.mark_failed_memory(uid, strike_meta)
                 self._record_stat("failed", 1)
                 self._finish_attempt(
-                    attempt_id, outcome="failed", error=ERR_COMMIT_FAILURE
+                    attempt_id, outcome=ATTEMPT_FAILED, error=ERR_COMMIT_FAILURE
                 )
                 self.fire_attempt_finished(
                     uid,
@@ -855,7 +861,7 @@ class StateStore:
         self._state.unregister_in_flight(uid)
         if job_dict is not None:
             self._state.requeue_jobs([job_dict], front=True)
-        self._finish_attempt(attempt_id, outcome="requeued", error=reason)
+        self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error=reason)
         raise _CommitCrashSignal(
             f"Backend commit returned False for {uid} ({reason}). "
             f"On-disk queue preserved; crashing to avoid unbounded retry loop."

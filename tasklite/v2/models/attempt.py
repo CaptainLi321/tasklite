@@ -20,6 +20,15 @@ from typing import Any
 # - requeued：本次执行以重入队收尾（瞬态失败/瞬态信号，job 继续重试）；
 # - skipped：激活被终态拦截点放行重跑前跳过（如 wall 命中跳过）。
 ATTEMPT_OUTCOMES = ("running", "succeeded", "failed", "requeued", "skipped")
+# 写侧派生常量（值解包自词汇表单一真相）：派发开行与终态/重入队收尾
+# 的全部写点统一引用，拼写漂移由 _validate_outcome 入口拒绝。
+(
+    ATTEMPT_RUNNING,
+    ATTEMPT_SUCCEEDED,
+    ATTEMPT_FAILED,
+    ATTEMPT_REQUEUED,
+    ATTEMPT_SKIPPED,
+) = ATTEMPT_OUTCOMES
 
 
 def _validate_non_empty_str(field_name: str, value: Any) -> None:
@@ -138,6 +147,11 @@ class AttemptRecord:
 
 
 __all__ = [
+    "ATTEMPT_FAILED",
     "ATTEMPT_OUTCOMES",
+    "ATTEMPT_REQUEUED",
+    "ATTEMPT_RUNNING",
+    "ATTEMPT_SKIPPED",
+    "ATTEMPT_SUCCEEDED",
     "AttemptRecord",
 ]

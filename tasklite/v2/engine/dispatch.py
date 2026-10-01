@@ -59,7 +59,7 @@ if TYPE_CHECKING:
         def __contains__(self, task_type: object) -> bool: ...
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
-from ..models.attempt import AttemptRecord
+from ..models.attempt import ATTEMPT_REQUEUED, ATTEMPT_RUNNING, AttemptRecord
 from ..models.context import JobContext
 from ..models.job import Job, JobRuntimeState
 from .channel import ArtifactCleanupMode, WorkerLaunchSpec
@@ -410,7 +410,7 @@ class DispatchMachine:
             incarnation=incarnation,
             run_id=self._session.run_id,
             started_at=_utc_now_iso(),
-            outcome="running",
+            outcome=ATTEMPT_RUNNING,
         )
         try:
             attempt_id = self._store.backend.append_attempt(record)
@@ -614,7 +614,7 @@ class DispatchMachine:
         self._in_flight.settle(uid, state=store)
         store.requeue_jobs([job_dict], front=True)
         store.finish_attempt(
-            attempt_id, outcome="requeued", error=f"dispatch failure: {exc}"
+            attempt_id, outcome=ATTEMPT_REQUEUED, error=f"dispatch failure: {exc}"
         )
         # 不在此保存队列：内存此刻缺其他 in-flight 作业，交给运行循环的
         # 崩溃安全保存合并磁盘真相后统一保存。
