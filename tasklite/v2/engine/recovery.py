@@ -14,11 +14,11 @@ RecoveryOrchestrator 统一内敛：
 6. 陈旧结果恢复（restore_stale_result：派发前消费上次 run 遗留的
    已落盘结果，避免双重执行窗口）。
 
-依赖以显式窄清单注入（无共享袋）；``store`` 与 ``completion`` 两个协作
-机器在后续引擎单元落地，本模块按结构契约消费——store 须提供
-``backend`` 活引用 / ``queue`` 内存队列 / ``set_state``；completion 须
-提供 ``complete_job(entry, result)`` 与 ``settle_aborted(cancelled,
-done)``（Job 终结唯一经由完成机器收尾）。
+依赖以显式窄清单注入（无共享袋）；``store``（StateStore）与
+``completion``（CompletionMachine）两个协作机器按结构契约消费——store
+须提供 ``backend`` 活引用 / ``queue`` 内存队列 / ``set_state``；
+completion 须提供 ``complete_job(entry, result)`` 与
+``settle_aborted(cancelled, done)``（Job 终结唯一经由完成机器收尾）。
 """
 
 from __future__ import annotations

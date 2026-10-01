@@ -4,7 +4,7 @@
 引擎值对象 types、资源体系 resource、准入与重入队策略 admission、
 等待决策 wait、在飞追踪 in_flight、只读扫描调度器 scheduler、
 死锁治理 governor、执行通道 channel、恢复编排 recovery、状态仓库
-store）。调度逻辑仅留
+store、派发机器 dispatch、完成机器 completion）。调度逻辑仅留
 seam：选择点收敛在 scheduler 的 scan_next_runnable（访问序经
 OrderingPolicy），重试节奏收敛在 RequeuePolicy（默认立即重入队）。
 
@@ -25,6 +25,7 @@ from .channel import (
     ExecutionResult,
     WorkerLaunchSpec,
 )
+from .completion import CompletionMachine
 from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
 from .errorclass import ErrorClassifier
 from .governor import (
@@ -87,6 +88,7 @@ __all__ = [
     "DispatchKind",
     "DispatchMachine",
     "DispatchOutcome",
+    "CompletionMachine",
     "Resource",
     "RateLimitResource",
     "CapacityResource",
