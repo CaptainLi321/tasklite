@@ -609,8 +609,6 @@ class StateStore:
     def apply_bulk_failure(
         self,
         uids_metas: Sequence[tuple[str, dict[str, Any]]],
-        *,
-        reason: str = "deadlock",
     ) -> BulkFailureOutcome:
         """原子批量失败（死锁归因或批量熔断）；剩余队列由失败集单点派生。"""
         normalized_metas = [
