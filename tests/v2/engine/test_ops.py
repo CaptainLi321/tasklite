@@ -30,7 +30,7 @@ from tasklite.v2.utils.jsonutil import dumps
 def _make_console(backend: InMemoryStateBackend | None = None):
     backend = backend if backend is not None else InMemoryStateBackend()
     store = StateStore(backend)
-    return backend, store, OpsConsole(backend, store, ErrorClassifier())
+    return backend, store, OpsConsole(store, ErrorClassifier())
 
 
 def _ok_handler(job, ctx):
@@ -458,17 +458,19 @@ class TestUncompleted:
 
 
 class TestBackendSwapRebind:
-    """换库后管理面目标库一致性（set_backend 重绑定）。"""
+    """换库后管理面目标库一致性（锚点唯一收敛在 StateStore）。"""
 
     def test_management_apis_target_rebound_backend(self):
-        old_backend, _, console = _make_console()
+        old_backend, store, console = _make_console()
         old_backend.seed_wall(["w::old"])
         old_backend.append_failed("a::old", {"error": "old"})
         old_backend.seed_cursor("ck", "old")
 
         new_backend = InMemoryStateBackend()
         new_backend.append_failed("a::new", {"error": "new"})
-        console.set_backend(new_backend)
+        # 换库唯一动作：换 StateStore 锚点；OpsConsole 不独立持库，
+        # 管理面经 store.backend 派生自然跟随新库。
+        store.set_backend(new_backend)
 
         # 只读面读新库
         assert [e.uid for e in console.list_failures()] == ["a::new"]

@@ -36,6 +36,7 @@ from .types import (
     TaskStats,
 )
 from .wait import LoopFacts, decide_wait
+from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.state import PipelineState
 from ..utils.lockfile import release_lock, try_acquire_lock
@@ -65,7 +66,6 @@ class EngineRuntime:
 
     def __init__(self, config: RunConfig) -> None:
         self.config = config
-        self.backend = config.backend
         self.tasks = config.tasks
         self.scheduler = JobScheduler(
             resources=config.resources, ordering=config.ordering
@@ -82,8 +82,10 @@ class EngineRuntime:
 
         # 构造期即建 StateStore（enqueue/OpsConsole 在 run 前可用）；
         # on_attempt_finished 绑定会话方法——钩子后置变更即时生效。
+        # backend 所有权唯一锚定 StateStore（RunConfig.backend 仅为构造
+        # 期装配快照的搬运通道），运行期一切读写经 store.backend 派生。
         self.store: StateStore = StateStore(
-            self.backend,
+            config.backend,
             commit_failure_threshold=config.commit_failure_threshold,
             classifier=config.classifier,
             on_attempt_finished=self._session.fire_attempt_finished,
@@ -134,6 +136,15 @@ class EngineRuntime:
     @property
     def session(self) -> RunSession:
         return self._session
+
+    @property
+    def backend(self) -> AbstractStateBackend:
+        """持久化后端只读派生引用（所有权唯一锚定 StateStore）。
+
+        换库唯一经 ``store.set_backend`` 单点，本属性每次读取实时派生，
+        不持有独立可变引用——新增需要后端的机器一律经本接缝取用。
+        """
+        return self.store.backend
 
     @property
     def in_flight(self) -> InFlightTracker:

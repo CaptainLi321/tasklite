@@ -338,7 +338,7 @@ class StateStore:
 
     @property
     def backend(self) -> AbstractStateBackend:
-        """底层持久化后端引用。"""
+        """底层持久化后端引用（所有权唯一锚点，换库经 set_backend 单点）。"""
         return self._backend
 
     @property
@@ -435,7 +435,12 @@ class StateStore:
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
 
     def set_backend(self, backend: AbstractStateBackend) -> None:
-        """重新设置持久化后端。"""
+        """换库唯一锚点：backend 所有权归 StateStore 单持。
+
+        不变式：本方法是全引擎唯一的后端重绑定点——其余组件（runtime /
+        OpsConsole / 门面）一律经 ``store.backend`` 只读派生，换库一处
+        动作、全部持有者必然同步。
+        """
         self._backend = backend
 
     # ── 事务性原子终态转移（apply_* 出口族）──────────────────────────

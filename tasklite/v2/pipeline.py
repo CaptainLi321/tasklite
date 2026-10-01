@@ -102,7 +102,6 @@ class TaskLite:
     监听器列表。
     """
 
-    _backend: AbstractStateBackend
     output_root: Path | list[Path] | None = None
 
     def __init__(
@@ -128,7 +127,9 @@ class TaskLite:
         self.name = _validate_pipeline_name(name)
         self.state_dir = self._prepare_state_dir(state_dir)
         self.output_root = self._resolve_output_root(output_root)
-        self._backend, self.backend_type = self._build_backend(backend)
+        # 构造期局部搬运：backend 实例只向 RunConfig（装配快照）与
+        # StateStore（运行期所有权锚点）各交接一次，门面自身不独立持库。
+        backend_instance, self.backend_type = self._build_backend(backend)
 
         # Task 规格注册表与任务级默认 rerun 注入面——RerunPolicy 冻结
         # dict 引用（而非拷贝），装配期注册经 set_discovery_rerun 即时
@@ -140,6 +141,7 @@ class TaskLite:
         self.ipc_dir, self._mp_ctx = self._prepare_ipc_dir()
         self.strict_picklable = strict_picklable
         self.runtime_config = self._build_run_config(
+            backend_instance,
             on_run_start=on_run_start,
             on_run_end=on_run_end,
             on_attempt_finished=on_attempt_finished,
@@ -154,9 +156,9 @@ class TaskLite:
         # 门面使用 enqueue/管理面）
         self._runtime = EngineRuntime(config=self.runtime_config)
 
-        # 管理段运维接缝（run() 外管理 API 委托目标）
+        # 管理段运维接缝（run() 外管理 API 委托目标；backend 经
+        # store.backend 派生，不独立持库）
         self._console = OpsConsole(
-            backend=self._backend,
             store=self._runtime.store,
             classifier=self.classifier,
         )
@@ -282,6 +284,7 @@ class TaskLite:
 
     def _build_run_config(
         self,
+        backend: AbstractStateBackend,
         *,
         on_run_start: Callable[[], None] | None,
         on_run_end: Callable[[str], None] | None,
@@ -297,7 +300,8 @@ class TaskLite:
         装配件按引用共享（冻结引用而非拷贝）；调优标量一律可空透传，
         默认值唯一解析点在 resolve_tuning；调度策略（ordering /
         requeue_policy）同为可空透传，None → FIFO / 立即重入队的默认
-        收敛在 RunConfig.resolve。
+        收敛在 RunConfig.resolve。backend 在此仅为构造期搬运——运行期
+        所有权唯一锚定 StateStore（EngineRuntime 构造 store 时交接）。
         """
         tuning = resolve_tuning(
             dep_grace_seconds=dep_grace_seconds,
@@ -312,7 +316,7 @@ class TaskLite:
         return RunConfig.resolve(
             name=self.name,
             ipc_dir=self.ipc_dir,
-            backend=self._backend,
+            backend=backend,
             resources=self.resources,
             tasks=self.tasks,
             channel=channel,
@@ -343,7 +347,8 @@ class TaskLite:
 
     @property
     def backend(self) -> AbstractStateBackend:
-        return self._backend
+        """当前持久化后端（只读派生自 StateStore 锚点）。"""
+        return self._runtime.store.backend
 
     @backend.setter
     def backend(self, value: AbstractStateBackend) -> None:
@@ -357,19 +362,12 @@ class TaskLite:
                 f"(use the `backend` constructor argument for "
                 f"'sqlite'/'memory'), got {type(value).__name__}"
             )
-        if hasattr(self, "_runtime"):
-            # 换库属管理段操作，仅限 run() 外调用（对齐 register_task /
-            # register_resource 守卫惯例）：运行期换库会撕裂主循环已
-            # 装配的后端引用。
-            self._ensure_not_running("backend")
-            self._runtime.backend = value
-            self._runtime.store.set_backend(value)
-        self._backend = value
-        if hasattr(self, "_console"):
-            # 不变式：凡持有后端引用的组件必须随换库同步重绑定，漏绑会使
-            # 管理 API（list_failures/clear_failures/clear_history/
-            # seed_wall/seed_cursor）静默读写旧库。
-            self._console.set_backend(value)
+        # 换库属管理段操作，仅限 run() 外调用（对齐 register_task /
+        # register_resource 守卫惯例）：运行期换库会撕裂主循环已装配的
+        # 后端引用。换库唯一动作 = 换 StateStore 锚点——runtime / 门面 /
+        # OpsConsole 等一切持有者经 store.backend 派生，必然同步。
+        self._ensure_not_running("backend")
+        self._runtime.store.set_backend(value)
 
     @property
     def stats(self) -> TaskStats:

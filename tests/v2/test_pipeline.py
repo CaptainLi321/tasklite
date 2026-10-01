@@ -847,16 +847,31 @@ class TestManageApis:
 
 
 class TestBackendSwap:
-    """backend property/setter：换库重绑定全部持库组件。"""
+    """backend property/setter：换库唯一动作 = 换 StateStore 锚点。"""
 
     def test_backend_setter_rebinds_runtime_store_console(self, tmp_path):
+        """换库后全部持有者看到同一新实例（锚点收敛回归锁）。
+
+        不变式：backend 所有权唯一锚定 StateStore——pipeline setter 只做
+        「换 store 锚点」一个动作，其余持有者（门面 property / runtime /
+        OpsConsole 管理面 / enqueue 摄入面）一律经 store.backend 只读
+        派生。新增持 backend 的机器必须加入本断言——把「漏绑」从静默
+        读写旧库变成测试红灯。
+        """
         p = make_pipeline(tmp_path)
         new_backend = InMemoryStateBackend()
         new_backend.append_failed("fetch::x", {"error": "moved"})
         p.backend = new_backend
+        # 持有者逐一刻画：门面 property、runtime 派生引用、store 锚点
         assert p.backend is new_backend
+        assert p._runtime.backend is new_backend
         assert p._runtime.store.backend is new_backend
+        # 管理面（OpsConsole 经 store 派生）：读面命中新库数据
         assert any(e.uid == "fetch::x" for e in p.list_failures())
+        # 摄入面（enqueue 经 store 派生）：写面命中新库
+        p.register_task("fetch", ok_handler)
+        p.enqueue(Job("fetch", "swapped"))
+        assert [jd["job_id"] for jd in new_backend.load_queue()] == ["swapped"]
 
     def test_backend_setter_rejects_non_backend(self, tmp_path):
         p = make_pipeline(tmp_path)

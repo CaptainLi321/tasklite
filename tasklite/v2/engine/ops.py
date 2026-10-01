@@ -15,7 +15,6 @@ from typing import Callable, Sequence
 from .errorclass import ErrorClassifier
 from .resource import META_RESOURCE_SUSPENSIONS
 from .store import FailureEntry, StateStore
-from ..backend.base import AbstractStateBackend
 from ..models.job import Job
 from ..models.state import uid_from_job_dict
 from ..utils.jsonutil import loads
@@ -39,27 +38,18 @@ class SuspendEntry:
 class OpsConsole:
     """run() 外的纯运维接缝——管理段操作委托目标。
 
-    构造依赖 (backend, store, classifier)：list_failures 的 error_type
-    归档视图依赖 classifier.classify。
+    构造依赖 (store, classifier)：持久化后端经 ``store.backend`` 只读
+    派生（所有权唯一锚定 StateStore，换库随锚点自然跟随，本类不独立
+    持库）；list_failures 的 error_type 归档视图依赖 classifier.classify。
     """
 
     def __init__(
         self,
-        backend: AbstractStateBackend,
         store: StateStore,
         classifier: ErrorClassifier,
     ) -> None:
-        self._backend = backend
         self._store = store
         self._classifier = classifier
-
-    def set_backend(self, backend: AbstractStateBackend) -> None:
-        """重新绑定持久化后端（与 StateStore.set_backend 同步调用）。
-
-        不变式：凡持有后端引用的组件必须随换库同步重绑定，否则管理 API
-        静默读写旧库。
-        """
-        self._backend = backend
 
     # ── 只读查询 ──────────────────────────────────────────────────────
 
@@ -76,7 +66,7 @@ class OpsConsole:
             list[SuspendEntry]: 按 ``resume_at`` 升序（最先解封在前）。
         """
         try:
-            raw = self._backend.get_meta(META_RESOURCE_SUSPENSIONS)
+            raw = self._store.backend.get_meta(META_RESOURCE_SUSPENSIONS)
         except Exception as e:
             logger.warning(f"Failed to load resource suspensions from meta: {e}")
             return []
@@ -120,8 +110,8 @@ class OpsConsole:
         （unknown 兜底）；损坏行（非 dict）归空视图，绝不让单条脏数据
         打断整条查询。
         """
-        failed = self._backend.load_failed()
-        payloads = self._backend.load_failed_payloads()
+        failed = self._store.backend.load_failed()
+        payloads = self._store.backend.load_failed_payloads()
         entries: list[FailureEntry] = []
         for uid, meta in sorted(failed.items()):
             if not isinstance(meta, dict):
@@ -149,7 +139,7 @@ class OpsConsole:
           会吞掉重跑策略的豁免语义；
         - 已驻留队列的重复 uid 不排除——队列去重是 enqueue 自身的职责。
         """
-        wall = self._backend.load_wall()
+        wall = self._store.backend.load_wall()
         return [j for j in jobs if j.uid not in wall]
 
     # ── 变更操作 ──────────────────────────────────────────────────────
@@ -174,7 +164,7 @@ class OpsConsole:
                         f"task_types must contain only non-empty str, got {t!r}"
                     )
             task_types = list(task_types)
-        failed = self._backend.load_failed()
+        failed = self._store.backend.load_failed()
         to_delete = [
             uid for uid, meta in failed.items()
             if (task_types is None or any(uid.startswith(t + "::") for t in task_types))
@@ -182,7 +172,7 @@ class OpsConsole:
         ]
         if not to_delete:
             return 0
-        deleted_count = self._backend.delete_failed(to_delete)
+        deleted_count = self._store.backend.delete_failed(to_delete)
         state = self._store.state
         for uid in to_delete:
             state.discard_failed(uid)
@@ -209,15 +199,15 @@ class OpsConsole:
             KeyError: uid 不在失败档案（typo fail-loud，静默 no-op 会
                 掩盖补跑拼写错误）。
         """
-        failed = self._backend.load_failed()
+        failed = self._store.backend.load_failed()
         if uid not in failed:
             raise KeyError(f"uid {uid!r} not in failure archive")
         task_type, _, job_id = uid.partition("::")
-        payloads = self._backend.load_failed_payloads()
+        payloads = self._store.backend.load_failed_payloads()
         # 激活代取轨迹最大值 +1（failed 拦截点放行 = 新激活代），attempt_no
         # 经 Job 模型默认归 1；payload 取档案快照（无快照回退空 dict）。
         prior_activation = max(
-            (record.activation_no for record in self._backend.load_attempts(uid)),
+            (record.activation_no for record in self._store.backend.load_attempts(uid)),
             default=0,
         )
         job = Job(
@@ -227,7 +217,7 @@ class OpsConsole:
             activation_no=prior_activation + 1,
         )
         self._store.enqueue_jobs([job], front=True)
-        self._backend.delete_failed([uid])
+        self._store.backend.delete_failed([uid])
         state = self._store.state
         state.discard_failed(uid)
         return True
@@ -287,17 +277,17 @@ class OpsConsole:
         state = self._store.state
         total = 0
         if "wall" in where:
-            wall = self._backend.load_wall()
+            wall = self._store.backend.load_wall()
             matched = [u for u in wall if _matches(u)]
             if matched:
-                total += self._backend.delete_wall(matched)
+                total += self._store.backend.delete_wall(matched)
                 for u in matched:
                     state.discard_wall(u)
         if "failed" in where:
-            failed = self._backend.load_failed()
+            failed = self._store.backend.load_failed()
             matched = [u for u in failed if _matches(u)]
             if matched:
-                total += self._backend.delete_failed(matched)
+                total += self._store.backend.delete_failed(matched)
                 for u in matched:
                     state.discard_failed(u)
         return total
@@ -328,9 +318,9 @@ class OpsConsole:
                 raise ValueError(
                     f"seed_wall uid must have non-empty task_type and job_id, got {u!r}"
                 )
-        failed = self._backend.load_failed()
+        failed = self._store.backend.load_failed()
         queue_uids = set(self._store.queue_uids)
-        queue_uids.update(uid_from_job_dict(jd) for jd in self._backend.load_queue())
+        queue_uids.update(uid_from_job_dict(jd) for jd in self._store.backend.load_queue())
         conflict_failed = sorted({u for u in uids if u in failed})
         conflict_queue = sorted({u for u in uids if u in queue_uids})
         if conflict_failed:
@@ -346,7 +336,7 @@ class OpsConsole:
                 f"{conflict_queue}; wall/queue must stay disjoint. Drain or "
                 f"clear the queue entries first if archiving is intended."
             )
-        written = self._backend.seed_wall(list(uids))
+        written = self._store.backend.seed_wall(list(uids))
         state = self._store.state
         for u in uids:
             state.add_wall(u, {})
@@ -363,7 +353,7 @@ class OpsConsole:
             raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
         if not isinstance(value, str):
             raise TypeError(f"cursor value must be str, got {type(value).__name__}")
-        self._backend.seed_cursor(key, value)
+        self._store.backend.seed_cursor(key, value)
         self._store.state.set_cursor(key, value)
 
 
