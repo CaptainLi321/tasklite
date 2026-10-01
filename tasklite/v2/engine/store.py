@@ -644,40 +644,10 @@ class StateStore:
                 remaining_queue_count=len(self._state.queue),
             )
 
-        # 批量 commit 失败：3-strike 逐条收敛
-        queue = list(self._state.queue)
-        kept_any = False
-        for uid, meta in normalized_metas:
-            matching = [j for j in queue if uid_from_job_dict(j) == uid]
-            jd = matching[0] if matching else {
-                "task_type": uid.split("::")[0],
-                "job_id": uid.split("::")[1],
-            }
-            failures = self._register_commit_failure(jd)
-            if failures >= self._threshold:
-                strike_meta = {
-                    "error": ERR_COMMIT_FAILURE,
-                    "commit_failures": failures,
-                    "fatal": True,
-                }
-                single_committed = self._backend.commit_job_failure(
-                    uid, strike_meta, job_payload=self._extract_job_payload(jd)
-                )
-                if single_committed:
-                    queue = [j for j in queue if uid_from_job_dict(j) != uid]
-                    self.mark_failed_memory(uid, strike_meta)
-                    self._record_stat("failed", 1)
-                    self.fire_attempt_finished(
-                        uid,
-                        outcome=AttemptFinish(
-                            success=False, going_to_retry=False, meta=strike_meta
-                        ),
-                    )
-                else:
-                    kept_any = True
-            else:
-                kept_any = True
-
+        # 批量 commit 失败：3-strike 逐条收敛（与级联路径共用单一实现）
+        queue, kept_any = self.handle_bulk_failure_strike(
+            "commit_bulk_failure", normalized_metas, list(self._state.queue)
+        )
         self._state.replace_queue(queue)
         if kept_any:
             raise _CommitCrashSignal(
@@ -814,44 +784,64 @@ class StateStore:
         uids_metas: list[tuple[str, dict[str, Any]]],
         queue_job_dicts: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], bool]:
-        """批量 commit 失败的 3-strike 逐条收敛处理。
+        """批量 commit 失败的 3-strike 逐条收敛（批量崩溃契约唯一实现）。
 
-        返回（存留队列, 是否有作业仍留队）：留队者带递增的 commit 失败
-        计数，达阈值的作业逐条尝试单写失败档案（成功即出队），单写也
-        失败则留队待下次启动。
+        遍历归因全集而非仅队列内行——队列外 uid 以合成最小 dict 同规
+        计账与熔断，绝不静默丢失记账。返回（存留队列, 是否有归因作业
+        仍留队）：留队者带递增的 commit 失败计数，达阈值者经
+        ``_bulk_strike_finalize`` 熔断出队，单写也失败则留队待下次启动。
         """
-        affected = {uid for uid, _ in uids_metas}
-        meta_by_uid = dict(uids_metas)
-        remaining: list[dict[str, Any]] = []
-        has_kept_affected = False
-        for jd in queue_job_dicts:
-            uid = uid_from_job_dict(jd)
-            if uid not in affected:
-                remaining.append(jd)
-                continue
+        queue = list(queue_job_dicts)
+        kept_any = False
+        for uid, _ in uids_metas:
+            matching = [j for j in queue if uid_from_job_dict(j) == uid]
+            jd = matching[0] if matching else {
+                "task_type": uid.split("::")[0],
+                "job_id": uid.split("::")[1],
+            }
             failures = self._register_commit_failure(jd)
             if failures >= self._threshold:
-                archive_meta = meta_by_uid[uid]
-                single_committed = self._backend.commit_job_failure(
-                    uid, archive_meta, job_payload=self._extract_job_payload(jd)
-                )
-                if single_committed:
-                    self.mark_failed_memory(uid, archive_meta, unregister=False)
-                    self._record_stat("failed", 1)
-                    self.fire_attempt_finished(
-                        uid,
-                        outcome=AttemptFinish(
-                            success=False, going_to_retry=False, meta=archive_meta
-                        ),
-                    )
+                if self._bulk_strike_finalize(uid, jd, failures=failures):
+                    queue = [j for j in queue if uid_from_job_dict(j) != uid]
                     continue
                 logger.critical(
                     f"Bulk 3-strike: failure archive write also failed for "
                     f"{uid} ({reason}); keeping in queue for next boot."
                 )
-            has_kept_affected = True
-            remaining.append(jd)
-        return remaining, has_kept_affected
+            kept_any = True
+        return queue, kept_any
+
+    def _bulk_strike_finalize(
+        self,
+        uid: str,
+        job_dict: dict[str, Any],
+        *,
+        failures: int,
+    ) -> bool:
+        """批量 3-strike 熔断收尾单点（死锁批量与级联批量两路共用）。
+
+        统一语义：熔断 meta 与单条 handle_commit_failure_strike 同规——
+        归因收敛为 ERR_COMMIT_FAILURE strike_meta（原始归因让位于计数控
+        迹）；``unregister=False``——批量契约路径的失败登记与在途注销
+        分离，在途集合交由调用方统一处置。返回单写失败档案是否落盘。
+        """
+        strike_meta = {
+            "error": ERR_COMMIT_FAILURE,
+            "fatal": True,
+            "commit_failures": failures,
+        }
+        single_committed = self._backend.commit_job_failure(
+            uid, strike_meta, job_payload=self._extract_job_payload(job_dict)
+        )
+        if not single_committed:
+            return False
+        self.mark_failed_memory(uid, strike_meta, unregister=False)
+        self._record_stat("failed", 1)
+        self.fire_attempt_finished(
+            uid,
+            outcome=AttemptFinish(success=False, going_to_retry=False, meta=strike_meta),
+        )
+        return True
 
     def _requeue_and_crash(
         self,

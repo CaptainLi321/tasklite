@@ -493,6 +493,92 @@ class TestApplyBulkFailure:
         assert "cycle::1" not in store.failed
 
 
+class TestBulkStrikeConvergence:
+    """批量 3-strike 两路（死锁批量 / 级联批量）收敛语义分叉锁定。"""
+
+    def _strike_bulk_store(
+        self, hooks: list, queue_rows: list, *, threshold: int = 3
+    ) -> StateStore:
+        backend = CommitFailureBackend(
+            InMemoryStateBackend(),
+            failing=("commit_bulk_failure",),
+            archive_pass_through=True,
+        )
+        state = PipelineState({}, {}, {}, queue_rows)
+        return StateStore(
+            backend,
+            state,
+            commit_failure_threshold=threshold,
+            stats=TaskStats(),
+            on_attempt_finished=lambda uid, *, outcome: hooks.append((uid, outcome)),
+        )
+
+    def test_deadlock_and_cascade_strike_meta_converged(self):
+        """死锁批量与级联批量的熔断 meta 同规（归因统一 ERR_COMMIT_FAILURE）。"""
+        hooks_deadlock: list[tuple[str, AttemptFinish]] = []
+        store_deadlock = self._strike_bulk_store(
+            hooks_deadlock,
+            [{"task_type": "cycle", "job_id": "1", "runtime": {"_commit_failures": 2}}],
+        )
+        outcome = store_deadlock.apply_bulk_failure(
+            [("cycle::1", {"error": "DEPENDENCY_DEADLOCK"})]
+        )
+        assert outcome.failed_uids == ["cycle::1"]
+        deadlock_meta = store_deadlock.failed["cycle::1"]
+
+        hooks_cascade: list[tuple[str, AttemptFinish]] = []
+        store_cascade = self._strike_bulk_store(
+            hooks_cascade,
+            [
+                {"task_type": "parent", "job_id": "1"},
+                {
+                    "task_type": "child",
+                    "job_id": "1",
+                    "depends_on": ["parent::1"],
+                    "runtime": {"_commit_failures": 2},
+                },
+            ],
+        )
+        store_cascade.pop_job(0)
+        cascade_outcome = store_cascade.apply_failure("parent::1", {"error": "boom"})
+        assert cascade_outcome.cascaded_uids == ["child::1"]
+        cascade_meta = store_cascade.failed["child::1"]
+
+        for meta in (deadlock_meta, cascade_meta):
+            assert meta["error"] == ERR_COMMIT_FAILURE
+            assert meta["fatal"] is True
+            assert meta["commit_failures"] == 3
+        assert [uid for uid, _ in hooks_deadlock] == ["cycle::1"]
+        assert [uid for uid, _ in hooks_cascade] == ["child::1"]
+        for _, fin in hooks_deadlock + hooks_cascade:
+            assert fin.success is False and fin.going_to_retry is False
+            assert fin.meta["error"] == ERR_COMMIT_FAILURE
+
+    def test_out_of_queue_uid_still_finalized_and_accounted(self):
+        """归因中的队列外 uid 同规计数与熔断（记账绝不静默丢失）。"""
+        hooks: list[tuple[str, AttemptFinish]] = []
+        store = self._strike_bulk_store(
+            hooks,
+            [{"task_type": "cycle", "job_id": "1"}],
+            threshold=1,
+        )
+
+        outcome = store.apply_bulk_failure(
+            [
+                ("cycle::1", {"error": "DEPENDENCY_DEADLOCK"}),
+                ("ghost::9", {"error": "DEPENDENCY_DEADLOCK"}),
+            ]
+        )
+
+        assert outcome.failed_uids == ["cycle::1", "ghost::9"]
+        assert outcome.remaining_queue_count == 0
+        assert store.failed["cycle::1"]["error"] == ERR_COMMIT_FAILURE
+        assert store.failed["ghost::9"]["error"] == ERR_COMMIT_FAILURE
+        assert "ghost::9" not in store.queue_uids
+        assert sorted(uid for uid, _ in hooks) == ["cycle::1", "ghost::9"]
+        assert store.stats["failed"] == 2
+
+
 class TestIntakePipeline:
     """enqueue 摄入管道三步 + 首入队时间。"""
 
