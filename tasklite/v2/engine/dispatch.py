@@ -4,11 +4,10 @@
 orphan-probe → stale-restore。依赖以显式窄清单注入（无共享袋），经
 ``store``/``recovery`` 复用状态仓库与恢复编排深模块，不反向引用门面。
 
-``session`` 与 ``tasks`` 按结构契约消费：session 提供
-``run_id`` / ``next_dispatch_seq()`` / ``result_token``（运行会话机器的
-装配契约）；tasks 提供 ``task_type in tasks`` 与
-``tasks.lookup(task_type) -> Task``（TaskRegistry 的装配契约，Task 持
-``handler`` 与 ``payload_schema``）。
+``session`` 与 ``tasks`` 按具名 Protocol 消费（装配契约见本模块的
+``DispatchSession`` 与 ``TaskSource``：RunSession / TaskRegistry 真实
+类型自动满足）；``output_root`` 与 config 声明同型
+（``Path | Sequence[Path] | None``，多根输出场景）。
 
 派发即插 attempts 轨迹行（outcome=running）：incarnation
 （``run_id.dispatch_seq``）在本模块生成并随行落表——seq 每次派发递增，
@@ -23,9 +22,13 @@ import logging
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import Any, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from pathlib import Path
+
+    from ..models.task import Task
     from .admission import RerunPolicy
     from .channel import ExecutionChannel
     from .errorclass import ErrorClassifier
@@ -34,6 +37,26 @@ if TYPE_CHECKING:
     from .resource import ResourceManager
     from .scheduler import JobScheduler
     from .store import StateStore
+
+    class DispatchSession(Protocol):
+        """派发/完成机器消费的运行会话装配契约（RunSession 自动满足）。
+
+        ``run_id`` 是 incarnation 与 wall meta 的 run 身份事实源；
+        ``result_token`` 随 WorkerLaunchSpec 下发做结果认证；
+        ``next_dispatch_seq`` 为 incarnation fencing 提供单调递增序号。
+        """
+
+        run_id: str | None
+        result_token: str | None
+
+        def next_dispatch_seq(self) -> int: ...
+
+    class TaskSource(Protocol):
+        """派发机器消费的任务规格来源契约（TaskRegistry 自动满足）。"""
+
+        def lookup(self, task_type: str) -> "Task": ...
+
+        def __contains__(self, task_type: object) -> bool: ...
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.attempt import AttemptRecord
@@ -96,11 +119,11 @@ class DispatchMachine:
         resources: "ResourceManager",
         channel: "ExecutionChannel",
         in_flight: "InFlightTracker",
-        session: Any,
+        session: "DispatchSession",
         recovery: "RecoveryOrchestrator",
-        tasks: Any,
+        tasks: "TaskSource",
         classifier: "ErrorClassifier",
-        output_root: Any,
+        output_root: "Path | Sequence[Path] | None",
         ipc_dir: str,
         commit_failure_threshold: int,
     ) -> None:

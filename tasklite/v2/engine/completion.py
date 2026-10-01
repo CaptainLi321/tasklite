@@ -12,8 +12,8 @@ max_retries + 1``，业务失败重试推进 ``attempt_no + 1``；瞬态信号
 last_retry_error 不污染、预算耗尽也豁免失败档案。重试节奏唯一经
 StateStore.apply_retry 内的 RequeuePolicy（默认立即队首重入）。
 
-``session`` 按运行会话结构契约消费（``run_id``，wall meta 的
-last_run_id 事实源）。
+``session`` 按具名 Protocol ``DispatchSession`` 消费（``run_id`` 是
+wall meta 的 last_run_id 事实源；契约定义见 dispatch 模块）。
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from typing import Any, Sequence, TYPE_CHECKING
 if TYPE_CHECKING:
     from .admission import RerunPolicy
     from .channel import ExecutionChannel
+    from .dispatch import DispatchSession
     from .in_flight import InFlightTracker
     from .resource import ResourceManager
     from .store import StateStore
@@ -51,7 +52,7 @@ class CompletionMachine:
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
-        session: Any,
+        session: "DispatchSession",
     ) -> None:
         self._store = store
         self._rerun_policy = rerun_policy

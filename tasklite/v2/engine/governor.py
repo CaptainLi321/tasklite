@@ -25,12 +25,22 @@ from .errorclass import (
     ERR_MALFORMED_JOB,
     ERR_RESOURCE_DEADLOCK,
 )
-from .scheduler import StandstillFacts
+from .scheduler import JobFacts, StandstillFacts
 
 logger = logging.getLogger("tasklite.v2")
 
 DEP_GRACE_SECONDS = 60.0
 DEADLOCK_GAP_MAX_ROUNDS = 5
+
+
+class ScanCache(Protocol):
+    """依赖宽限回退路径复用的调度投影缓存契约（JobScheduler 自动满足）。
+
+    单趟扫描已反序列化的 Job 投影按内容键缓存复用——宽限判定逐行
+    读 ``depends_on`` 时免二次全量反序列化。
+    """
+
+    def cached_job(self, job_dict: dict) -> JobFacts: ...
 
 
 class BulkFailureOutcome(Protocol):
@@ -156,7 +166,7 @@ class DeadlockGovernor:
         missing_identifiers: Sequence[int | str] | set[str],
         *,
         has_potential_spawners: bool | None = None,
-        scheduler: Any | None = None,
+        scheduler: ScanCache | None = None,
         now: float | None = None,
         grace_seconds: float | None = None,
     ) -> bool:
@@ -212,7 +222,7 @@ class DeadlockGovernor:
             if uid in missing_uids:
                 continue
             try:
-                if scheduler is not None and hasattr(scheduler, "cached_job"):
+                if scheduler is not None:
                     job = scheduler.cached_job(jd)
                 else:
                     job = Job.from_dict(jd)
@@ -305,7 +315,7 @@ class DeadlockGovernor:
         facts: StandstillFacts,
         store: ArbitrationStore,
         *,
-        scheduler: Any | None = None,
+        scheduler: ScanCache | None = None,
     ) -> DeadlockDecision:
         """处理死锁：细粒度归因 + 批量失败档案提交 + 级联（纯计算求值，无阻塞副作用）。"""
         effective_state = store.state
@@ -416,4 +426,5 @@ __all__ = [
     "DEP_GRACE_SECONDS",
     "DeadlockDecision",
     "DeadlockGovernor",
+    "ScanCache",
 ]

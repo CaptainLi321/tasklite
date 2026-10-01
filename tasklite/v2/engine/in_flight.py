@@ -10,11 +10,25 @@ from __future__ import annotations
 
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping, TYPE_CHECKING
+from typing import Any, Iterator, Mapping, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..models.state import PipelineState
     from .resource import ResourceManager
+
+    class InFlightStateIndex(Protocol):
+        """在途登记/注销同步的内存状态索引契约。
+
+        StateStore（装配转发）与 PipelineState（直持索引）均满足；注册
+        与注销是六集合互斥不变式的单一维护点。
+        """
+
+        @property
+        def in_flight_uids(self) -> frozenset[str]: ...
+
+        def register_in_flight(self, uid: str) -> None: ...
+
+        def unregister_in_flight(self, uid: str) -> None: ...
 
 from ..models.job import Job
 from .resource import NullResourceLease, ResourceLease
@@ -108,15 +122,16 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         self,
         entry: InFlightJob,
         *,
-        state: Any | None = None,
+        state: "InFlightStateIndex | None" = None,
     ) -> InFlightJob:
         """登记在途作业条目（单一真相源入口）。
 
-        ``state`` 为提供 ``register_in_flight`` 的 PipelineState（或
-        StateStore 装配），非 None 时同步内存 in-flight 索引。
+        ``state`` 为内存状态索引（``InFlightStateIndex`` 契约，
+        StateStore/PipelineState 满足），非 None 时同步内存 in-flight
+        索引。
         """
         self._entries[entry.uid] = entry
-        if state is not None and hasattr(state, "register_in_flight"):
+        if state is not None:
             state.register_in_flight(entry.uid)
         return entry
 
@@ -124,11 +139,11 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         self,
         uid: str,
         *,
-        state: Any | None = None,
+        state: "InFlightStateIndex | None" = None,
     ) -> InFlightJob | None:
         """语义化结算接缝：注销在途任务并同步内存状态（单一真相源出口）。"""
         entry = self._entries.pop(uid, None)
-        if state is not None and hasattr(state, "unregister_in_flight"):
+        if state is not None:
             # 收尾机器的提交路径内部已注销 in-flight（重试分支注销后立即
             # 重入队并重建 rerun 豁免）；此处仅在 uid 仍在途索引时才兜底
             # 转发注销，防止二次注销误删刚重建的豁免（安全网语义不变）。

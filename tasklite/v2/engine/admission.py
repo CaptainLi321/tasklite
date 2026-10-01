@@ -14,9 +14,19 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import Mapping, Protocol
 
 from ..models.state import uid_from_job_dict
+
+
+class TerminalHistory(Protocol):
+    """准入判定消费的终态历史契约（StateStore/PipelineState 满足）。"""
+
+    @property
+    def wall(self) -> Mapping[str, dict]: ...
+
+    @property
+    def failed(self) -> Mapping[str, dict]: ...
 
 
 class PreflightAction(str, Enum):
@@ -227,15 +237,17 @@ class RerunPolicy:
     def admit(
         self,
         job_dict: dict,
-        store_or_state: Any,
+        history: TerminalHistory,
     ) -> PreflightDecision:
-        """统一极窄准入判定入口：自动从 store/state 提取历史上下文并执行评估。"""
+        """统一极窄准入判定入口：从终态历史契约提取上下文并执行评估。
+
+        ``history`` 为 ``TerminalHistory`` 契约（wall/failed 视图，
+        StateStore 与 PipelineState 均满足）。
+        """
         uid = uid_from_job_dict(job_dict)
-        wall = getattr(store_or_state, "wall", {})
-        failed = getattr(store_or_state, "failed", {})
-        wall_hit = uid in wall
-        failed_hit = uid in failed
-        wall_meta = wall.get(uid) if wall_hit else None
+        wall_hit = uid in history.wall
+        failed_hit = uid in history.failed
+        wall_meta = history.wall.get(uid) if wall_hit else None
         return self.evaluate(
             job_dict,
             wall_meta=wall_meta,
@@ -307,4 +319,5 @@ __all__ = [
     "RequeuePlan",
     "RequeuePolicy",
     "RerunPolicy",
+    "TerminalHistory",
 ]

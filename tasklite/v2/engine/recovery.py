@@ -14,23 +14,60 @@ RecoveryOrchestrator 统一内敛：
 6. 陈旧结果恢复（restore_stale_result：派发前消费上次 run 遗留的
    已落盘结果，避免双重执行窗口）。
 
-依赖以显式窄清单注入（无共享袋）；``store``（StateStore）与
-``completion``（CompletionMachine）两个协作机器按结构契约消费——store
-须提供 ``backend`` 活引用 / ``queue`` 内存队列 / ``set_state``；
-completion 须提供 ``complete_job(entry, result)`` 与
-``settle_aborted(cancelled, done)``（Job 终结唯一经由完成机器收尾）。
+依赖以显式窄清单注入（无共享袋）；``store`` 与 ``completion`` 两个
+协作机器按具名 Protocol 消费——``RecoveryStore``（backend 活引用 /
+queue 内存队列视图 / set_state 落位口，StateStore 自动满足）与
+``RecoveryCompletion``（complete_job(entry, result) 与
+settle_aborted(cancelled, done)，Job 终结唯一经由完成机器收尾，
+CompletionMachine 自动满足）。
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ..backend.base import AbstractStateBackend
     from .admission import RerunPolicy
-    from .channel import ExecutionChannel
-    from .in_flight import InFlightTracker
+    from .channel import ExecutionChannel, ExecutionResult
+    from .in_flight import InFlightJob, InFlightTracker
     from .resource import ResourceManager
+
+    class RecoveryStore(Protocol):
+        """恢复编排消费的状态仓库契约（StateStore 自动满足）。
+
+        ``backend`` 是持久化后端活引用（加载/修复/差量落盘不经 facade
+        中转）；``queue`` 为内存队列视图（崩溃安全保存的合并侧）；
+        ``set_state`` 为装载修复结果的落位口。
+        """
+
+        @property
+        def backend(self) -> AbstractStateBackend: ...
+
+        @property
+        def queue(self) -> list[dict[str, Any]]: ...
+
+        def set_state(self, state: PipelineState | None) -> None: ...
+
+    class RecoveryCompletion(Protocol):
+        """恢复编排消费的完成机器契约（CompletionMachine 自动满足）。
+
+        Job 终结唯一经由完成机器收尾：残留认领走 ``complete_job`` 同一
+        出口，中止分类结算走 ``settle_aborted``。
+        """
+
+        def complete_job(
+            self, entry: InFlightJob, result: ExecutionResult
+        ) -> None: ...
+
+        def settle_aborted(
+            self,
+            cancelled_entries: Sequence[InFlightJob],
+            done_entries: Sequence[tuple[InFlightJob, ExecutionResult]],
+        ) -> None: ...
 
 from ..exceptions import _JobTerminated
 from ..models.job import Job
@@ -51,12 +88,12 @@ class RecoveryOrchestrator:
     def __init__(
         self,
         *,
-        store: Any,
+        store: "RecoveryStore",
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
         policy: "RerunPolicy",
-        completion: Any,
+        completion: "RecoveryCompletion",
     ) -> None:
         self._store = store
         self._channel = channel
