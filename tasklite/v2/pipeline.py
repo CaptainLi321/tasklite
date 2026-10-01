@@ -20,7 +20,7 @@ from typing import Any, Callable, Sequence
 from .backend.base import AbstractStateBackend
 from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
-from .engine.admission import ImmediateRequeuePolicy, RequeuePolicy, RerunPolicy
+from .engine.admission import RequeuePolicy, RerunPolicy
 from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig, resolve_tuning
 from .engine.errorclass import ErrorClassifier, validate_declared_exception_classes
@@ -28,6 +28,7 @@ from .engine.governor import DeadlockGovernor
 from .engine.ops import OpsConsole, SuspendEntry
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import EngineRuntime
+from .engine.scheduler import OrderingPolicy
 from .engine.store import FailureEntry
 from .engine.types import RunSummary, TaskStats
 from .models.job import Job, RERUN_VALUES, WORKER_RESOURCE
@@ -85,6 +86,13 @@ class TaskLite:
             可 pickle，预检把派发期才爆发的序列化失败提前到入口。
         fatal_exceptions / transient_exceptions: 异常分类声明元组
             （构造期 fail-loud 校验，随执行上下文快照下发子进程）。
+        ordering: 队列访问序策略（默认 None → FIFO，唯一解析点在
+            RunConfig.resolve）；核心不含排序计算，自定义策略经
+            OrderingPolicy 接缝插入，``scan_next_runnable`` 唯一
+            选择点结构不变。
+        requeue_policy: 重试节奏策略（默认 None → 立即重入队，唯一
+            解析点在 RunConfig.resolve）；重入队位置与节奏唯一经
+            RequeuePolicy 出口规划。
         dep_grace_seconds / commit_failure_threshold / deadlock_gap_max_rounds:
             调优标量（可空透传，默认值唯一解析点在 resolve_tuning）。
 
@@ -111,6 +119,8 @@ class TaskLite:
         strict_picklable: bool = True,
         fatal_exceptions: tuple | None = None,
         transient_exceptions: tuple | None = None,
+        ordering: OrderingPolicy | None = None,
+        requeue_policy: RequeuePolicy | None = None,
         dep_grace_seconds: float | None = None,
         commit_failure_threshold: int | None = None,
         deadlock_gap_max_rounds: int | None = None,
@@ -133,6 +143,8 @@ class TaskLite:
             on_run_start=on_run_start,
             on_run_end=on_run_end,
             on_attempt_finished=on_attempt_finished,
+            ordering=ordering,
+            requeue_policy=requeue_policy,
             dep_grace_seconds=dep_grace_seconds,
             commit_failure_threshold=commit_failure_threshold,
             deadlock_gap_max_rounds=deadlock_gap_max_rounds,
@@ -274,6 +286,8 @@ class TaskLite:
         on_run_start: Callable[[], None] | None,
         on_run_end: Callable[[str], None] | None,
         on_attempt_finished: Callable[..., None] | None,
+        ordering: OrderingPolicy | None,
+        requeue_policy: RequeuePolicy | None,
         dep_grace_seconds: float | None,
         commit_failure_threshold: int | None,
         deadlock_gap_max_rounds: int | None,
@@ -281,7 +295,9 @@ class TaskLite:
         """RunConfig 静态装配快照：调优唯一解析点 + 机器群前置件。
 
         装配件按引用共享（冻结引用而非拷贝）；调优标量一律可空透传，
-        默认值唯一解析点在 resolve_tuning。
+        默认值唯一解析点在 resolve_tuning；调度策略（ordering /
+        requeue_policy）同为可空透传，None → FIFO / 立即重入队的默认
+        收敛在 RunConfig.resolve。
         """
         tuning = resolve_tuning(
             dep_grace_seconds=dep_grace_seconds,
@@ -306,7 +322,8 @@ class TaskLite:
                 deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
             ),
             rerun_policy=RerunPolicy(self._discovery_rerun),
-            requeue_policy=ImmediateRequeuePolicy(),
+            requeue_policy=requeue_policy,
+            ordering=ordering,
             output_root=self.output_root,
             strict_picklable=self.strict_picklable,
             dep_grace_seconds=tuning.dep_grace_seconds,

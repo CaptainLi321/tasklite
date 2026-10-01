@@ -13,7 +13,13 @@ from pathlib import Path
 import pytest
 
 from tasklite.v2.backend.memory import InMemoryStateBackend
+from tasklite.v2.engine.admission import (
+    ImmediateRequeuePolicy,
+    RequeuePlan,
+    RequeuePolicy,
+)
 from tasklite.v2.engine.resource import CapacityResource, RateLimitResource
+from tasklite.v2.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
 from tasklite.v2.engine.types import AttemptFinish, ExitReason, StopMode
 from tasklite.v2.models.job import Job
 from tasklite.v2.models.task import Task
@@ -35,11 +41,29 @@ class OtherBizError(Exception):
     """第二类业务瞬态异常样本（批量注册用，同为模块级可 pickle）。"""
 
 
+class NewestFirstPolicy(OrderingPolicy):
+    """队尾优先访问序（门面注入用样本：反转 FIFO 出队顺序）。"""
+
+    def visit_order(self, queue):
+        return range(len(queue) - 1, -1, -1)
+
+
+class TailRequeuePolicy(RequeuePolicy):
+    """恒队尾重入队策略（门面注入用样本：front 恒 False、零延迟）。"""
+
+    def plan_requeue(self, job_dict, *, transient_kind=None) -> RequeuePlan:
+        return RequeuePlan(front=False, delay_seconds=0.0)
+
+
 # ── fake 进程（写 IPC 结果文件，与真实 worker 同路径）──────────────────
 
 
-def make_instant_process_class():
-    """FakeProcess：start() 即写成功结果并退出。"""
+def make_instant_process_class(retry_uid: str | None = None):
+    """FakeProcess：start() 即写结果并退出。
+
+    ``retry_uid`` 命中的 job 写 retry 结果（走失败重试收尾路径），其余
+    写成功结果——重入队位置类用例经此驱动。
+    """
 
     class InstantProcess:
         def __init__(self, target=None, args=(), kwargs=None, **_kw):
@@ -50,16 +74,19 @@ def make_instant_process_class():
         def start(self):
             if self.args:
                 spec = self.args[0]
+                result = {
+                    "new_jobs": [],
+                    "resource_suspensions": [],
+                    "cursor_updates": {},
+                    "auth": spec.result_token,
+                }
+                if retry_uid is not None and spec.job.uid == retry_uid:
+                    result.update({"status": "retry", "error": "stub failure"})
+                else:
+                    result.update({"status": "success", "raw_result": True})
                 ArtifactJournal(spec.ipc_dir).write_result_atomic(
                     spec.job.uid,
-                    {
-                        "status": "success",
-                        "raw_result": True,
-                        "new_jobs": [],
-                        "resource_suspensions": [],
-                        "cursor_updates": {},
-                        "auth": spec.result_token,
-                    },
+                    result,
                     incarnation=spec.incarnation,
                 )
             self._alive = False
@@ -567,6 +594,101 @@ class TestSixStepContract:
         p.run()
         assert observed == [True]
         assert p.is_running is False
+
+
+# ── 调度接缝构造参数（ordering / requeue_policy）─────────────────────
+
+
+class TestSchedulingSeamWiring:
+    """调度策略门面构造参数：注入生效、默认不传行为等价。"""
+
+    def test_ordering_constructor_arg_reverses_visit_order(self, tmp_path, monkeypatch):
+        order: list[str] = []
+
+        def on_attempt_finished(uid, *, outcome):
+            order.append(uid)
+
+        p = make_pipeline(
+            tmp_path,
+            ordering=NewestFirstPolicy(),
+            on_attempt_finished=on_attempt_finished,
+        )
+        p.register_task("fetch", ok_handler)
+        p.enqueue([Job("fetch", "a"), Job("fetch", "b"), Job("fetch", "c")])
+        monkeypatch.setattr(mp, "Process", make_instant_process_class())
+        p.run()
+
+        assert order == ["fetch::c", "fetch::b", "fetch::a"]
+
+    def test_ordering_default_wiring_and_fifo_equivalence(self, tmp_path, monkeypatch):
+        order: list[str] = []
+
+        def on_attempt_finished(uid, *, outcome):
+            order.append(uid)
+
+        p = make_pipeline(tmp_path, on_attempt_finished=on_attempt_finished)
+        p.register_task("fetch", ok_handler)
+        p.enqueue([Job("fetch", "a"), Job("fetch", "b"), Job("fetch", "c")])
+        monkeypatch.setattr(mp, "Process", make_instant_process_class())
+        p.run()
+
+        assert order == ["fetch::a", "fetch::b", "fetch::c"]
+        # 默认解析收敛在 RunConfig.resolve：门面不传 → FIFO 装配件直达调度器
+        assert isinstance(p.runtime_config.ordering, FifoOrderingPolicy)
+        assert p._runtime.scheduler.ordering is p.runtime_config.ordering
+
+    def test_requeue_policy_constructor_arg_controls_requeue_position(
+        self, tmp_path, monkeypatch
+    ):
+        """队尾重入队注入：flaky 首试失败后排在 later 之后（默认应在之前）。"""
+        order: list[tuple[str, bool]] = []
+
+        def on_attempt_finished(uid, *, outcome):
+            order.append((uid, outcome.going_to_retry))
+
+        p = make_pipeline(
+            tmp_path,
+            max_workers=1,
+            requeue_policy=TailRequeuePolicy(),
+            on_attempt_finished=on_attempt_finished,
+        )
+        p.register_task("fetch", ok_handler)
+        p.enqueue([Job("fetch", "flaky", max_retries=1), Job("fetch", "later")])
+        monkeypatch.setattr(
+            mp, "Process", make_instant_process_class(retry_uid="fetch::flaky")
+        )
+        p.run()
+
+        assert [uid for uid, _ in order] == [
+            "fetch::flaky", "fetch::later", "fetch::flaky",
+        ]
+        assert order[0][1] is True
+        assert order[2][1] is False
+        assert "fetch::later" in p.backend.load_wall()
+        assert "fetch::flaky" in p.backend.load_failed()
+
+    def test_requeue_default_wiring_and_front_equivalence(self, tmp_path, monkeypatch):
+        """默认立即重入队（front=True）：flaky 重试先于 later 结算。"""
+        order: list[str] = []
+
+        def on_attempt_finished(uid, *, outcome):
+            order.append(uid)
+
+        p = make_pipeline(
+            tmp_path,
+            max_workers=1,
+            on_attempt_finished=on_attempt_finished,
+        )
+        p.register_task("fetch", ok_handler)
+        p.enqueue([Job("fetch", "flaky", max_retries=1), Job("fetch", "later")])
+        monkeypatch.setattr(
+            mp, "Process", make_instant_process_class(retry_uid="fetch::flaky")
+        )
+        p.run()
+
+        assert order == ["fetch::flaky", "fetch::flaky", "fetch::later"]
+        assert isinstance(p.runtime_config.requeue_policy, ImmediateRequeuePolicy)
+        assert p._runtime.store._requeue_policy is p.runtime_config.requeue_policy
 
 
 # ── 管理面委托（run() 外）────────────────────────────────────────────

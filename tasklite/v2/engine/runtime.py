@@ -67,7 +67,9 @@ class EngineRuntime:
         self.config = config
         self.backend = config.backend
         self.tasks = config.tasks
-        self.scheduler = JobScheduler(resources=config.resources)
+        self.scheduler = JobScheduler(
+            resources=config.resources, ordering=config.ordering
+        )
         self.governor = config.governor
 
         # 持久会话：execute() 经 begin() 复位（语义等价于每次新建会话，

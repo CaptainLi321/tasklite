@@ -16,7 +16,11 @@ from pathlib import Path
 import pytest
 
 from tasklite.v2.backend.memory import InMemoryStateBackend
-from tasklite.v2.engine.admission import ImmediateRequeuePolicy, RerunPolicy
+from tasklite.v2.engine.admission import (
+    ImmediateRequeuePolicy,
+    RequeuePolicy,
+    RerunPolicy,
+)
 from tasklite.v2.engine.channel import ExecutionChannel
 from tasklite.v2.engine.config import RunConfig, Tuning, resolve_tuning
 from tasklite.v2.engine.errorclass import ErrorClassifier
@@ -26,8 +30,16 @@ from tasklite.v2.engine.governor import (
     DeadlockGovernor,
 )
 from tasklite.v2.engine.resource import ResourceManager
+from tasklite.v2.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
 from tasklite.v2.engine.store import COMMIT_FAILURE_THRESHOLD
 from tasklite.v2.models.task import TaskRegistry
+
+
+class NewestFirstOrdering(OrderingPolicy):
+    """队尾优先访问序样本（引用共享断言用）。"""
+
+    def visit_order(self, queue):
+        return range(len(queue) - 1, -1, -1)
 
 
 class ConfigEnv:
@@ -194,6 +206,20 @@ class TestRunConfigResolve:
         config = ConfigEnv(tmp_path).resolve()
         with pytest.raises(dataclasses.FrozenInstanceError):
             config.name = "mutated"  # type: ignore[misc]
+
+    def test_seam_policies_none_resolved_to_defaults(self, tmp_path):
+        """调度策略可空透传：None → FIFO / 立即重入队（唯一解析点）。"""
+        config = ConfigEnv(tmp_path).resolve(requeue_policy=None, ordering=None)
+        assert isinstance(config.ordering, FifoOrderingPolicy)
+        assert isinstance(config.requeue_policy, ImmediateRequeuePolicy)
+
+    def test_seam_policies_passthrough_by_reference(self, tmp_path):
+        """显式注入的策略按引用共享（冻结引用而非拷贝）。"""
+        env = ConfigEnv(tmp_path)
+        custom_ordering = NewestFirstOrdering()
+        config = env.resolve(ordering=custom_ordering)
+        assert config.ordering is custom_ordering
+        assert config.requeue_policy is env.requeue_policy
 
 
 class TestZeroBackoffSurface:

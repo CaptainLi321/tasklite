@@ -233,12 +233,12 @@ v2 核心**不含任何调度策略计算**：候选排序与重试节奏各留�
 
 ### OrderingPolicy：队列访问序
 
-`scan_next_runnable`（`v2/engine/scheduler.py`）是**唯一选择点**：调度器按 OrderingPolicy 给出的下标序逐条评估队列、首个可运行者处停止（首中即停）。默认实现 `FifoOrderingPolicy`（按 seq 升序）。最小自定义示例：
+`scan_next_runnable`（`v2/engine/scheduler.py`）是**唯一选择点**：调度器按 OrderingPolicy 给出的下标序逐条评估队列、首个可运行者处停止（首中即停）。默认实现 `FifoOrderingPolicy`（按 seq 升序）。自定义策略经门面构造参数 `ordering` 注入（None → FIFO，默认解析收敛在 `RunConfig.resolve` 唯一解析点）：
 
 ```python
 from collections.abc import Iterable, Sequence
 
-from tasklite.v2 import OrderingPolicy
+from tasklite.v2 import OrderingPolicy, TaskLite
 
 
 class NewestFirstPolicy(OrderingPolicy):
@@ -246,19 +246,17 @@ class NewestFirstPolicy(OrderingPolicy):
 
     def visit_order(self, queue: Sequence[dict]) -> Iterable[int]:
         return range(len(queue) - 1, -1, -1)
+
+
+pipeline = TaskLite(name="media", state_dir="./state", ordering=NewestFirstPolicy())
 ```
-
-接线现状：
-
-- **引擎层**：`JobScheduler(resources=..., ordering=NewestFirstPolicy())` 构造期注入；
-- **门面层**：`TaskLite` 默认装配 FIFO；自定义策略在门面下的正式接线形态（连同 Job 调度属性的存放）由未来的调度 wrapper ADR 裁决（ADR-0004「后果与重开条件」）。当前试用通道是 run() 前替换引擎运行件上调度器实例的 `ordering` 属性（管理段操作；注意只能替换属性、不能整对象替换——派发机器在装配期已按引用绑定调度器实例）。
 
 ### RequeuePolicy：重试节奏唯一出口
 
-核心引擎把一个失败/瞬态作业放回队列时，一律经 `plan_requeue` 取得节奏规划，自身不做任何计算：
+核心引擎把一个失败/瞬态作业放回队列时，一律经 `plan_requeue` 取得节奏规划，自身不做任何计算。自定义策略同样经门面构造参数 `requeue_policy` 注入（None → 立即重入队）：
 
 ```python
-from tasklite.v2 import ImmediateRequeuePolicy, RequeuePolicy, RequeuePlan
+from tasklite.v2 import RequeuePlan, RequeuePolicy, TaskLite
 
 
 class FixedDelayRequeuePolicy(RequeuePolicy):
@@ -266,12 +264,16 @@ class FixedDelayRequeuePolicy(RequeuePolicy):
 
     def plan_requeue(self, job_dict, *, transient_kind=None) -> RequeuePlan:
         return RequeuePlan(front=False, delay_seconds=30.0)
+
+
+pipeline = TaskLite(name="media", state_dir="./state",
+                    requeue_policy=FixedDelayRequeuePolicy())
 ```
 
 - 默认实现 `ImmediateRequeuePolicy`：`RequeuePlan(front=True, delay_seconds=0.0)`——零延迟、插队首（重试不被新入队作业排挤到饥饿尾部）；
 - `RequeuePlan.delay_seconds` 当前核心无延迟消费方（立即重入队语义下无人读它）——它是为未来节奏策略预留的表达位，届时经 seam 填充即可生效，无需改动调用方；
 - `transient_kind` 非 None 表示瞬态信号（`interrupted` / `lock_conflict` / `rate_limited`）——预算豁免语境下策略不得因预算耗尽拒绝重入队。瞬态信号军规（不烧重试预算 + 降级写盘 + 零污染）在「立即重入队」默认策略下自然成立；
-- 自定义 RequeuePolicy 当前同样无门面接线（门面构造期固定装配 `ImmediateRequeuePolicy`），接线与语义随调度 wrapper ADR 立法。
+- 两个构造参数只做接线：不引入任何策略实现、不给 Job 增调度字段；`scan_next_runnable` 唯一选择点与 `plan_requeue` 唯一出口的结构不变。
 
 ### 核心禁改红线
 
@@ -312,7 +314,7 @@ class FixedDelayRequeuePolicy(RequeuePolicy):
 v2 **砍除了整个退避机制**：`BackoffGovernor` 与 `backoff_base` / `backoff_max` / `backoff_until` / `backoff_wall_deadline` 全族不再存在。v2 的重试语义是**立即重入队**：
 
 - 失败（未耗尽预算）→ `ImmediateRequeuePolicy` 规划 `RequeuePlan(front=True, delay_seconds=0.0)` → 队首重入队 → 下一轮扫描即可再次派发；
-- 重试间隔不再由框架注入——若业务需要节奏（固定退避、指数退避、限速窗），经 `RequeuePolicy` seam 以 wrapper/util 形态实现（见第 5 节示例骨架），核心零改动；
+- 重试间隔不再由框架注入——若业务需要节奏（固定退避、指数退避、限速窗），经门面构造参数 `requeue_policy` 注入自定义 `RequeuePolicy`（见第 5 节示例骨架），核心零改动；
 - 瞬态信号（孤儿锁冲突 / 外部中断 / 限速）天然受益：零等待重入队 + 不烧重试预算 + 零污染，实际等待由资源挂起 TTL（`ctx.suspend_resource` 的跨重启持久化挂起）承担，而非框架级退避计时器。
 
 这一取舍的裁决依据与重开条件（退避类策略经 seam 回归须新立 ADR）见 ADR-0004「调度 seam」与「后果与重开条件」章节。

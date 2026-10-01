@@ -15,10 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence, TYPE_CHECKING
 
-from .admission import RequeuePolicy, RerunPolicy
+from .admission import ImmediateRequeuePolicy, RequeuePolicy, RerunPolicy
 from .errorclass import ErrorClassifier
 from .governor import DEADLOCK_GAP_MAX_ROUNDS, DEP_GRACE_SECONDS, DeadlockGovernor
 from .resource import ResourceManager
+from .scheduler import FifoOrderingPolicy, OrderingPolicy
 from .store import COMMIT_FAILURE_THRESHOLD
 from ..backend.base import AbstractStateBackend
 from ..models.task import TaskRegistry
@@ -124,6 +125,7 @@ class RunConfig:
     governor: DeadlockGovernor
     rerun_policy: RerunPolicy
     requeue_policy: RequeuePolicy
+    ordering: OrderingPolicy
     # ── 调优标量（默认值唯一落点）──
     output_root: Path | Sequence[Path] | None = None
     strict_picklable: bool = True
@@ -147,7 +149,8 @@ class RunConfig:
         classifier: ErrorClassifier,
         governor: DeadlockGovernor,
         rerun_policy: RerunPolicy,
-        requeue_policy: RequeuePolicy,
+        requeue_policy: RequeuePolicy | None = None,
+        ordering: OrderingPolicy | None = None,
         output_root: Path | Sequence[Path] | None = None,
         strict_picklable: bool = True,
         dep_grace_seconds: float | None = None,
@@ -173,7 +176,10 @@ class RunConfig:
             classifier=classifier,
             governor=governor,
             rerun_policy=rerun_policy,
-            requeue_policy=requeue_policy,
+            requeue_policy=(
+                requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
+            ),
+            ordering=ordering if ordering is not None else FifoOrderingPolicy(),
             output_root=output_root,
             strict_picklable=strict_picklable,
             dep_grace_seconds=tuning.dep_grace_seconds,
