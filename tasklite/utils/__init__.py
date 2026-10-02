@@ -1,7 +1,4 @@
-"""Utility functions for tasklite."""
-from ..taxonomy import validate_payload
+"""工具层：单射编码族与 JSON 序列化统一出口。
 
-__all__ = [
-    "validate_payload",
-]
-
+分层红线：``tasklite/utils/`` 严禁 import ``tasklite/wrappers/``。
+"""

@@ -1,515 +1,383 @@
-"""InMemoryStateBackend 契约与功能测试。"""
+"""v2 InMemoryStateBackend 契约测试。
 
-import json
-import sqlite3
+覆盖：基础 CRUD 与幂等入队、delta 提交（成功/失败/重试/批量/跳过）、
+失败档案 API（带外登记 / payload 快照 / 定向清除）、attempts 轨迹
+插入-收尾-查询、种子化入口校验、快照隔离。
+"""
+
+from __future__ import annotations
 
 import pytest
-from tasklite.backend.memory import InMemoryStateBackend
-from tasklite.backend.sqlite_backend import SQLiteStateBackend
+
+from tasklite.backend import InMemoryStateBackend
+from tasklite.models.attempt import ATTEMPT_RUNNING, AttemptRecord
 from tasklite.models.job import Job
 from tasklite.models.state import uid_from_job_dict
-from tasklite.pipeline import TaskLite
 
 
-def _calc_worker(job, ctx):
-    return {"doubled": job.payload["x"] * 2}
+def _job_dict(job_id: str, **overrides) -> dict:
+    """标准 job dict 构造（backend 存储行形态）。"""
+    data = Job("t", job_id).to_dict()
+    data.update(overrides)
+    return data
 
 
-class TestInMemoryStateBackendContract:
-    def test_basic_crud_and_isolation(self):
+def _running_attempt(job_uid: str, attempt_no: int = 1) -> AttemptRecord:
+    """派发即插行标准形态。"""
+    return AttemptRecord(
+        job_uid=job_uid,
+        activation_no=1,
+        attempt_no=attempt_no,
+        incarnation=f"run_seed.{attempt_no}",
+        run_id="run_seed",
+        started_at="2026-05-01T00:00:00+00:00",
+        outcome="running",
+    )
+
+
+class TestInMemoryBackendContract:
+    """基础 CRUD、幂等入队与 meta 持久化。"""
+
+    def test_initial_state_empty(self):
         b = InMemoryStateBackend()
-        # 初始状态为空
         assert b.load_wall() == {}
         assert b.load_failed() == {}
+        assert b.load_failed_payloads() == {}
         assert b.load_cursors() == {}
         assert b.load_queue() == []
+        assert b.load_attempts("t::missing") == []
+        assert b.get_meta("any") is None
 
-        # enqueue_jobs
-        j1 = {"task_type": "t", "job_id": "1", "payload": {"a": 1}}
-        j2 = {"task_type": "t", "job_id": "2", "payload": {"a": 2}}
-        inserted = b.enqueue_jobs([j1, j2])
-        assert inserted == ["t::1", "t::2"]
+    def test_enqueue_dedup_within_and_across_batches(self):
+        b = InMemoryStateBackend()
+        first = _job_dict("one")
+        second = _job_dict("two")
+        assert b.enqueue_jobs([first, second]) == ["t::one", "t::two"]
         assert len(b.load_queue()) == 2
 
-        # 幂等去重入队
-        inserted2 = b.enqueue_jobs([j1, {"task_type": "t", "job_id": "3"}])
-        assert inserted2 == ["t::3"]
-        assert len(b.load_queue()) == 3
+        # 队列已有 uid 与批次内重复都跳过，只插入新条目
+        inserted = b.enqueue_jobs([first, _job_dict("one"), _job_dict("three")])
+        assert inserted == ["t::three"]
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == [
+            "t::one", "t::two", "t::three",
+        ]
 
-    def test_commit_job_success_with_spawn_and_cursor(self):
+    def test_enqueue_front_and_back_ordering(self):
         b = InMemoryStateBackend()
-        j1 = {"task_type": "t", "job_id": "1"}
-        b.enqueue_jobs([j1])
-
-        spawn = {"task_type": "t", "job_id": "child"}
-        ok = b.commit_job_success(
-            "t::1",
-            {"status": "ok"},
-            spawned_jobs=[spawn],
-            cursor_updates={"page": "2"},
-        )
-        assert ok is True
-        wall = b.load_wall()
-        assert "t::1" in wall
-        assert wall["t::1"]["status"] == "ok"
-        assert b.load_cursors() == {"page": "2"}
-        q = b.load_queue()
-        assert len(q) == 1
-        assert q[0]["job_id"] == "child"
-
-    def test_commit_job_failure_and_dlq_metadata(self):
-        b = InMemoryStateBackend()
-        j1 = {"task_type": "t", "job_id": "fail1"}
-        b.enqueue_jobs([j1])
-
-        ok = b.commit_job_failure("t::fail1", {"error": "NETWORK_TIMEOUT"})
-        assert ok is True
-        failed = b.load_failed()
-        assert "t::fail1" in failed
-        entry = failed["t::fail1"]
-        assert entry["error"] == "NETWORK_TIMEOUT"
-        assert entry["_attempt"] == 1
-        assert "failed_at" in entry
-        assert entry["error_type"] == "unknown"
-        assert b.load_queue() == []
-
-        # 结构化错误与 fatal 分类测试
-        b.commit_job_failure("t::fatal", {"error": "Boom", "fatal": True})
-        b.commit_job_failure("t::deadlock", {"error": "DEADLOCK_CLASSIFICATION_GAP"})
-        b.commit_job_failure("t::dep", {"error": "JOB_DEPENDENCY"})
-        b.commit_job_failure("t::retries", {"error": "MAX_RETRIES_EXCEEDED"})
-
-        res = b.load_failed()
-        assert res["t::fatal"]["error_type"] == "fatal"
-        assert res["t::deadlock"]["error_type"] == "deadlock"
-        assert res["t::dep"]["error_type"] == "dependency"
-        assert res["t::retries"]["error_type"] == "transient_exhausted"
-
-    def test_commit_retry(self):
-        b = InMemoryStateBackend()
-        j1 = {"task_type": "t", "job_id": "retry1"}
-        b.enqueue_jobs([j1])
-
-        retry_job = {"task_type": "t", "job_id": "retry1", "retries": 1}
-        ok = b.commit_retry("t::retry1", retry_job, front=True)
-        assert ok is True
-        q = b.load_queue()
-        assert len(q) == 1
-        assert q[0]["retries"] == 1
-        assert b.load_wall() == {}
+        b.enqueue_jobs([_job_dict("base")])
+        b.enqueue_jobs([_job_dict("front")], front=True)
+        b.enqueue_jobs([_job_dict("back")], front=False)
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == [
+            "t::front", "t::base", "t::back",
+        ]
 
     def test_meta_persistence(self):
         b = InMemoryStateBackend()
-        assert b.get_meta("key1") is None
-        b.set_meta("key1", "val1")
-        assert b.get_meta("key1") == "val1"
+        assert b.get_meta("key_one") is None
+        b.set_meta("key_one", "val_one")
+        assert b.get_meta("key_one") == "val_one"
+        b.set_meta("key_one", "val_two")
+        assert b.get_meta("key_one") == "val_two"
 
-
-class TestTaskLiteWithMemoryBackend:
-    def test_tasklite_runs_with_memory_backend(self, tmp_path):
-        p = TaskLite("mem_test", state_dir=tmp_path, backend="memory")
-        assert p.backend_type == "memory"
-
-        p.register_handler("calc", _calc_worker)
-        p.enqueue(Job("calc", "1", payload={"x": 10}))
-        p.enqueue(Job("calc", "2", payload={"x": 20}))
-
-        p.run()
-        assert p.stats.completed == 2
-        wall = p.backend.load_wall()
-        assert "calc::1" in wall
-        assert wall["calc::1"]["doubled"] == 20
-        assert "calc::2" in wall
-        assert wall["calc::2"]["doubled"] == 40
-
-
-class _UncommittableMeta:
-    """令 DLQ 行计算必然失败的 meta 载荷：memory 侧 deepcopy 拒绝，SQLite 侧 JSON 序列化拒绝。"""
-
-    def __deepcopy__(self, memo):
-        raise ValueError("uncommittable meta")
-
-
-def _atomic_snapshot(backend):
-    """与实现无关的后端状态快照（剔除 failed_at 等非确定字段），用于原子性比对。"""
-    return {
-        "queue": [uid_from_job_dict(j) for j in backend.load_queue()],
-        "wall": set(backend.load_wall()),
-        "failed_attempts": {u: m.get("_attempt") for u, m in backend.load_failed().items()},
-        "cursors": backend.load_cursors(),
-    }
-
-
-def _seed_failed_raw(backend, uid: str, payload: dict) -> None:
-    """绕过 DLQ 归一化直接种入原始记录（模拟外部脏数据），两后端等效。"""
-    if isinstance(backend, InMemoryStateBackend):
-        backend._failed[uid] = dict(payload)
-        return
-    conn = sqlite3.connect(backend.path)
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO failed_dlq (uid, payload) VALUES (?, ?)",
-            (uid, json.dumps(payload)),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-@pytest.fixture(params=["memory", "sqlite"])
-def dual_backend(request, tmp_path):
-    """同一断言集作用于 memory 与 sqlite 两后端，即构成行为对齐断言。"""
-    if request.param == "memory":
-        return InMemoryStateBackend()
-    return SQLiteStateBackend(tmp_path / "atomic_state.db")
-
-
-class TestBackendCommitAtomicity:
-    """commit_* 失败/冲突不变式：返回 False ⇒ 后端状态与调用前完全一致。
-
-    3-strike 崩溃契约以「commit 返回 False ⇒ 后端未变」为前提做重启重建，
-    后端任何先部分落盘再报失败的路径都会让 job 及其 spawned 任务静默消失。
-    """
-
-    def test_spawn_conflict_returns_false_keeping_backend_unchanged(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([
-            {"task_type": "t", "job_id": "1"},
-            {"task_type": "t", "job_id": "child"},
-        ])
-        b.append_failed("t::1", {"error": "stale"})
-        before = _atomic_snapshot(b)
+    def test_commit_job_success_with_spawn_and_cursor(self):
+        b = InMemoryStateBackend()
+        b.enqueue_jobs([_job_dict("one")])
 
         ok = b.commit_job_success(
-            "t::1",
+            "t::one",
             {"status": "ok"},
-            spawned_jobs=[{"task_type": "t", "job_id": "child"}],
-            cursor_updates={"cur": "9"},
-        )
-
-        assert ok is False
-        # popped uid 仍在队列、wall/failed/cursors 均未被触碰
-        assert _atomic_snapshot(b) == before
-        assert "t::1" in [uid_from_job_dict(j) for j in b.load_queue()]
-
-        # 冲突被拒后后端仍可正常提交同一 job（spawned 改为不冲突的新 uid）
-        ok = b.commit_job_success(
-            "t::1",
-            {"status": "ok"},
-            spawned_jobs=[{"task_type": "t", "job_id": "fresh"}],
+            spawned_jobs=[_job_dict("child")],
+            cursor_updates={"page": "two"},
         )
         assert ok is True
-        # spawned 队首插入，预置的 t::child 条目保持原位
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::fresh", "t::child"]
-        assert "t::1" in b.load_wall()
+        assert b.load_wall()["t::one"] == {"status": "ok"}
+        assert b.load_cursors() == {"page": "two"}
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::child"]
 
-    def test_spawn_batch_duplicate_uid_rejected_without_dup_entries(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([{"task_type": "t", "job_id": "1"}])
-        before = _atomic_snapshot(b)
+    def test_commit_job_success_stores_exact_meta_without_injection(self):
+        """失败/成功 meta 原样落库：backend 不解释 meta、不注入派生字段。"""
+        b = InMemoryStateBackend()
+        assert b.commit_job_success("t::one", {"v": 1}) is True
+        assert b.load_wall() == {"t::one": {"v": 1}}
 
-        ok = b.commit_job_success(
-            "t::1",
-            {},
-            spawned_jobs=[
-                {"task_type": "t", "job_id": "x"},
-                {"task_type": "t", "job_id": "x"},
-            ],
-        )
+    def test_commit_job_failure_records_archive_and_clears_queue(self):
+        b = InMemoryStateBackend()
+        b.enqueue_jobs([_job_dict("doomed")])
 
-        assert ok is False
-        after = _atomic_snapshot(b)
-        assert after == before
-        # 绝不产出重复队列条目却报成功
-        uids = [uid_from_job_dict(j) for j in b.load_queue()]
-        assert len(uids) == len(set(uids))
-
-    def test_success_commit_with_spawn_and_cursor_still_applies(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([{"task_type": "t", "job_id": "1"}])
-        b.append_failed("t::1", {"error": "stale"})
-
-        ok = b.commit_job_success(
-            "t::1",
-            {"status": "ok"},
-            spawned_jobs=[
-                {"task_type": "t", "job_id": "c1"},
-                {"task_type": "t", "job_id": "c2"},
-            ],
-            cursor_updates={"page": "2"},
-        )
-
+        ok = b.commit_job_failure("t::doomed", {"error": "NETWORK_TIMEOUT"})
         assert ok is True
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::c1", "t::c2"]
-        wall = b.load_wall()
-        assert wall["t::1"]["status"] == "ok"
-        # 成功 commit 清理 failed 同名残行
-        assert "t::1" not in b.load_failed()
-        assert b.load_cursors() == {"page": "2"}
-
-    def test_retry_uid_conflict_returns_false_keeping_queue_intact(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([
-            {"task_type": "t", "job_id": "A"},
-            {"task_type": "t", "job_id": "B"},
-        ])
-        before = _atomic_snapshot(b)
-
-        ok = b.commit_retry(
-            "t::A",
-            {"task_type": "t", "job_id": "B", "retries": 1},
-            front=True,
-        )
-
-        assert ok is False
-        assert _atomic_snapshot(b) == before
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::A", "t::B"]
-
-    def test_retry_same_uid_requeue_still_succeeds(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([
-            {"task_type": "t", "job_id": "A"},
-            {"task_type": "t", "job_id": "B"},
-        ])
-
-        assert b.commit_retry("t::A", {"task_type": "t", "job_id": "A", "retries": 1}, front=True) is True
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::A", "t::B"]
-        assert b.commit_retry("t::A", {"task_type": "t", "job_id": "A", "retries": 2}, front=False) is True
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::B", "t::A"]
-
-    def test_bulk_failure_write_error_leaves_backend_unchanged(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([
-            {"task_type": "t", "job_id": "1"},
-            {"task_type": "t", "job_id": "2"},
-        ])
-        b.seed_wall(["t::9"])
-        before = _atomic_snapshot(b)
-
-        ok = b.commit_bulk_failure([
-            ("t::1", {"error": "d1"}),
-            ("t::2", {"payload": _UncommittableMeta()}),
-        ])
-
-        assert ok is False
-        # 队列绝不被整体删除、wall 绝不被清理
-        assert _atomic_snapshot(b) == before
-
-    def test_job_failure_write_error_leaves_backend_unchanged(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([{"task_type": "t", "job_id": "1"}])
-        before = _atomic_snapshot(b)
-
-        ok = b.commit_job_failure("t::1", {"payload": _UncommittableMeta()})
-
-        assert ok is False
-        assert _atomic_snapshot(b) == before
-        assert "t::1" in [uid_from_job_dict(j) for j in b.load_queue()]
-
-    def test_bulk_failure_with_dirty_attempt_resets_count_and_succeeds(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([
-            {"task_type": "t", "job_id": "1"},
-            {"task_type": "t", "job_id": "2"},
-        ])
-        _seed_failed_raw(b, "t::2", {"_attempt": "dirty", "error": "legacy"})
-
-        ok = b.commit_bulk_failure([
-            ("t::1", {"error": "d1"}),
-            ("t::2", {"error": "d2"}),
-        ])
-
-        # 脏计数静默重置并照常提交，绝不报失败留下半成品状态
-        assert ok is True
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == []
-        assert b.load_failed()["t::2"]["_attempt"] == 1
-        assert "t::2" in b.load_failed()
-
-    def test_job_failure_with_dirty_attempt_resets_count_and_succeeds(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([{"task_type": "t", "job_id": "1"}])
-        _seed_failed_raw(b, "t::1", {"_attempt": "dirty", "error": "legacy"})
-
-        ok = b.commit_job_failure("t::1", {"error": "boom"})
-
-        assert ok is True
-        assert b.load_failed()["t::1"]["_attempt"] == 1
+        # v2 语义：失败 meta 精确等于调用方传入（历史与时间线由 attempts 承接）
+        assert b.load_failed() == {"t::doomed": {"error": "NETWORK_TIMEOUT"}}
         assert b.load_queue() == []
+        assert b.load_wall() == {}
 
-    def test_existing_int_attempt_overrides_incoming_meta_attempt(self, dual_backend):
-        b = dual_backend
-        b.append_failed("t::1", {"error": "first"})
+    def test_commit_job_failure_preserves_remaining_queue(self):
+        b = InMemoryStateBackend()
+        b.enqueue_jobs([_job_dict("discard"), _job_dict("next")])
+        assert b.commit_job_failure("t::discard", {}) is True
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::next"]
 
-        ok = b.commit_job_failure("t::1", {"error": "second", "_attempt": 99})
+    def test_commit_retry_same_uid_requeue(self):
+        """同 uid 重试 = DELETE+INSERT：实例位随 job_data 自然往返。"""
+        b = InMemoryStateBackend()
+        b.enqueue_jobs([_job_dict("retry_one")])
 
-        assert ok is True
-        # 既有计数权威：incoming 显式 _attempt 被既有计数 +1 覆盖
-        assert b.load_failed()["t::1"]["_attempt"] == 2
+        requeued = _job_dict("retry_one", attempt_no=2)
+        assert b.commit_retry("t::retry_one", requeued, front=True) is True
+        queue = b.load_queue()
+        assert len(queue) == 1
+        assert queue[0]["attempt_no"] == 2
+        assert b.load_wall() == {} and b.load_failed() == {}
 
-    def test_incoming_attempt_reset_when_existing_row_lacks_count(self, dual_backend):
-        b = dual_backend
-        _seed_failed_raw(b, "t::1", {"error": "legacy"})
+    def test_commit_retry_conflicting_uid_returns_false(self):
+        b = InMemoryStateBackend()
+        job_a = _job_dict("alpha")
+        job_b = _job_dict("beta")
+        b.enqueue_jobs([job_a, job_b])
 
-        ok = b.commit_job_failure("t::1", {"error": "again", "_attempt": 7})
+        assert b.commit_retry("t::ghost", job_a) is False
+        # 冲突后 on-disk 队列原样（绝不产出重复条目却报成功）
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::alpha", "t::beta"]
 
-        assert ok is True
-        # 既有行无有效计数：incoming 显式 _attempt 一并不被信任，从 1 重计
-        assert b.load_failed()["t::1"]["_attempt"] == 1
+    def test_commit_bulk_failure_preserves_remaining_order(self):
+        b = InMemoryStateBackend()
+        b.enqueue_jobs([_job_dict(j) for j in ("first", "second", "third")])
+        assert b.commit_bulk_failure([("t::first", {"err": "x"}), ("t::second", {"err": "y"})]) is True
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::third"]
+        assert set(b.load_failed()) == {"t::first", "t::second"}
 
+    def test_commit_bulk_failure_empty_is_noop(self):
+        b = InMemoryStateBackend()
+        assert b.commit_bulk_failure([]) is True
+        assert b.load_failed() == {}
 
-class TestReplaceQueueAtomic:
-    """读-改-写收敛的整表替换原语契约（双腿对齐）。
+    def test_commit_skip_removes_stale_uid_only(self):
+        b = InMemoryStateBackend()
+        b.enqueue_jobs([_job_dict("stale"), _job_dict("live")])
+        assert b.commit_skip("t::stale") is True
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::live"]
+        assert b.load_wall() == {} and b.load_failed() == {}
 
-    不变式：compute 在写锁内接收磁盘真相快照；compute 抛异常 ⇒ 队列与
-    调用前完全一致（对齐 SQLite 事务回滚）；替换以 compute 返回值为准。
-    """
-
-    def test_replace_result_wins_and_absent_rows_are_removed(self, dual_backend):
-        b = dual_backend
-        b.save_queue([
-            {"task_type": "t", "job_id": "k1"},
-            {"task_type": "t", "job_id": "gone"},
-        ])
-
-        def compute(disk_q):
-            assert [uid_from_job_dict(j) for j in disk_q] == ["t::k1", "t::gone"]
-            updated = dict(disk_q[0], payload={"v": 2})
-            fresh = {"task_type": "t", "job_id": "n1"}
-            return [updated, fresh]
-
-        b.replace_queue_atomic(compute)
-
-        q = b.load_queue()
-        assert [uid_from_job_dict(j) for j in q] == ["t::k1", "t::n1"]
-        assert q[0]["payload"] == {"v": 2}
-
-    def test_compute_receives_rows_enqueued_before_replace(self, dual_backend):
-        """替换前已提交（已应答成功）的入队必须进入磁盘真相快照，
-        不得被内存态或陈旧快照替代——这是窗口期入队存活的前提。"""
-        b = dual_backend
-        b.save_queue([{"task_type": "t", "job_id": "k1"}])
-        b.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
-
-        seen = {}
-
-        def compute(disk_q):
-            seen["uids"] = [uid_from_job_dict(j) for j in disk_q]
-            return disk_q
-
-        b.replace_queue_atomic(compute)
-
-        assert seen["uids"] == ["t::k1", "t::late"]
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1", "t::late"]
-
-    def test_replace_rolls_back_when_compute_raises(self, dual_backend):
-        b = dual_backend
-        b.save_queue([
-            {"task_type": "t", "job_id": "k1"},
-            {"task_type": "t", "job_id": "k2"},
-        ])
-
-        def boom(disk_q):
-            raise RuntimeError("merge failed")
-
-        with pytest.raises(RuntimeError):
-            b.replace_queue_atomic(boom)
-
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1", "t::k2"]
+    def test_delete_queue_uids_targeted(self):
+        b = InMemoryStateBackend()
+        b.enqueue_jobs([_job_dict(j) for j in ("a", "b", "c")])
+        assert b.delete_queue_uids(["t::a", "t::c", "t::ghost"]) == 2
+        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::b"]
 
 
-class TestQueueReplacementShapeValidation:
-    """整表替换集形状契约（双腿一致）。
+class TestMemoryAttemptTrajectory:
+    """attempts 轨迹：插入（派发即插行）→ 收尾（一次）→ 查询。"""
 
-    不变式：替换集非法（None / 非序列 / 元素非 dict）必须在任何写变之前
-    fail-loud 抛 TypeError——SQLite 腿若在 DELETE 后才察觉，会静默清空
-    整条队列且事务正常提交；Memory 腿对同一输入必须行为一致。
-    """
+    def test_append_assigns_increasing_ids(self):
+        b = InMemoryStateBackend()
+        first = b.append_attempt(_running_attempt("t::one"))
+        second = b.append_attempt(_running_attempt("t::one", attempt_no=2))
+        third = b.append_attempt(_running_attempt("t::other"))
+        assert first < second < third
 
-    def test_replace_with_none_compute_result_fails_loud(self, dual_backend):
-        """compute 漏写 return（返回 None）→ TypeError，队列原状。"""
-        b = dual_backend
-        b.save_queue([
-            {"task_type": "t", "job_id": "k1"},
-            {"task_type": "t", "job_id": "k2"},
-        ])
-
-        with pytest.raises(TypeError):
-            b.replace_queue_atomic(lambda disk_q: None)
-
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1", "t::k2"]
-
-    def test_replace_with_non_sequence_fails_loud(self, dual_backend):
-        """替换集为非序列（int / 单个 dict）→ TypeError，队列原状。"""
-        b = dual_backend
-        b.save_queue([{"task_type": "t", "job_id": "k1"}])
-
-        with pytest.raises(TypeError):
-            b.replace_queue_atomic(lambda disk_q: 42)
-        with pytest.raises(TypeError):
-            b.replace_queue_atomic(lambda disk_q: {"task_type": "t", "job_id": "x"})
-
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1"]
-
-    def test_replace_with_non_dict_item_fails_loud(self, dual_backend):
-        """替换集元素非 job dict → TypeError，队列原状。"""
-        b = dual_backend
-        b.save_queue([{"task_type": "t", "job_id": "k1"}])
-
-        with pytest.raises(TypeError):
-            b.replace_queue_atomic(
-                lambda disk_q: [{"task_type": "t", "job_id": "ok"}, "not-a-dict"]
+    def test_append_rejects_non_dispatch_shape(self):
+        b = InMemoryStateBackend()
+        with pytest.raises(ValueError, match="fresh running row"):
+            b.append_attempt(
+                AttemptRecord(
+                    job_uid="t::one", activation_no=1, attempt_no=1,
+                    incarnation="run_seed.1", run_id="run_seed",
+                    started_at="2026-05-01T00:00:00+00:00",
+                    outcome="succeeded",
+                    finished_at="2026-05-01T00:00:05+00:00",
+                )
             )
+        assert b.load_attempts("t::one") == []
 
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1"]
+    def test_update_finalizes_running_row(self):
+        b = InMemoryStateBackend()
+        attempt_id = b.append_attempt(_running_attempt("t::one"))
+        ok = b.update_attempt(
+            attempt_id, outcome="requeued",
+            finished_at="2026-05-01T00:00:05+00:00", error="RateLimitHit",
+        )
+        assert ok is True
+        (rec,) = b.load_attempts("t::one")
+        assert rec.outcome == "requeued"
+        assert rec.finished_at == "2026-05-01T00:00:05+00:00"
+        assert rec.error == "RateLimitHit"
+        # 身份字段保持插入原值（append-only：只写收尾三列）
+        assert rec.incarnation == "run_seed.1"
+        assert rec.started_at == "2026-05-01T00:00:00+00:00"
 
-    def test_save_queue_none_fails_loud(self, dual_backend):
-        """save_queue(None) → TypeError，队列原状（空列表仍合法清空）。"""
-        b = dual_backend
-        b.save_queue([{"task_type": "t", "job_id": "k1"}])
+    def test_update_unknown_id_returns_false(self):
+        b = InMemoryStateBackend()
+        assert b.update_attempt(99, outcome="skipped", finished_at="2026-05-01T00:00:05+00:00") is False
 
-        with pytest.raises(TypeError):
-            b.save_queue(None)
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::k1"]
+    def test_double_finalization_raises(self):
+        b = InMemoryStateBackend()
+        attempt_id = b.append_attempt(_running_attempt("t::one"))
+        assert b.update_attempt(attempt_id, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
+        with pytest.raises(ValueError, match="already finalized"):
+            b.update_attempt(attempt_id, outcome="failed", finished_at="2026-05-01T00:00:09+00:00")
 
-        b.save_queue([])
-        assert b.load_queue() == []
+    def test_update_rejects_running_and_bad_shapes(self):
+        b = InMemoryStateBackend()
+        attempt_id = b.append_attempt(_running_attempt("t::one"))
+        with pytest.raises(ValueError, match="outcome must be one of"):
+            b.update_attempt(attempt_id, outcome="running", finished_at="2026-05-01T00:00:05+00:00")
+        with pytest.raises(TypeError, match="finished_at must be a str"):
+            b.update_attempt(attempt_id, outcome="succeeded", finished_at=None)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="error must be a non-empty str or None"):
+            b.update_attempt(attempt_id, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00", error="")
+        # 门卫失败后轨迹行仍是 running
+        (rec,) = b.load_attempts("t::one")
+        assert rec.outcome == ATTEMPT_RUNNING
+
+    def test_load_attempts_filters_by_uid_in_id_order(self):
+        b = InMemoryStateBackend()
+        b.append_attempt(_running_attempt("t::one"))
+        b.append_attempt(_running_attempt("t::other"))
+        b.append_attempt(_running_attempt("t::one", attempt_no=2))
+        records = b.load_attempts("t::one")
+        assert [r.attempt_no for r in records] == [1, 2]
+
+    def test_attempts_untouched_by_terminal_commits(self):
+        """旁路观测面：终态提交不触碰 attempts 行。"""
+        b = InMemoryStateBackend()
+        b.enqueue_jobs([_job_dict("one")])
+        attempt_id = b.append_attempt(_running_attempt("t::one"))
+        b.update_attempt(attempt_id, outcome="failed", finished_at="2026-05-01T00:00:05+00:00", error="boom")
+        b.commit_job_failure("t::one", {"error": "boom"}, job_payload={"k": 1})
+
+        (rec,) = b.load_attempts("t::one")
+        assert rec.outcome == "failed"
+        assert rec.error == "boom"
 
 
-class TestSeedWallFailedMutualExclusion:
-    """seed_wall 拒绝已存在 failed 的 uid（wall/failed 全局互斥，两后端同契约）。
+class TestMemoryFailureArchive:
+    """失败档案 API：带外登记、payload 快照、定向清除、互删语义。"""
 
-    seed 链路若静默覆盖会留下 wall∩failed 重叠：下一次派发时状态一致性
-    断言崩溃、配合崩溃恢复形成重启循环。语义定为整体拒绝（零写入）——
-    DLQ 记录须先经 delete_failed/clear_dlq 显式清除，静默清除会丢失败历史。
-    """
+    def test_append_failed_overwrites_same_uid(self):
+        b = InMemoryStateBackend()
+        b.append_failed("t::dup", {"first": 1})
+        b.append_failed("t::dup", {"second": 2})
+        assert b.load_failed() == {"t::dup": {"second": 2}}
 
-    def test_seed_wall_rejects_uid_already_in_failed(self, dual_backend):
-        b = dual_backend
-        b.append_failed("t::x", {"error": "boom"})
+    def test_append_failed_none_payload_stores_empty(self):
+        b = InMemoryStateBackend()
+        b.append_failed("t::nil", None)
+        assert b.load_failed() == {"t::nil": {}}
 
-        with pytest.raises(ValueError, match="already in failed"):
-            b.seed_wall(["t::x"])
+    def test_payload_snapshot_roundtrip_and_latest_wins(self):
+        b = InMemoryStateBackend()
+        assert b.commit_job_failure("t::one", {"error": "first"}, job_payload={"v": 1}) is True
+        assert b.load_failed_payloads() == {"t::one": {"v": 1}}
+        assert b.commit_job_failure("t::one", {"error": "second"}, job_payload={"v": 2}) is True
+        assert b.load_failed_payloads() == {"t::one": {"v": 2}}
 
-        # 零写入：拒绝后 wall 不含该 uid，failed 记录原样保留
-        assert "t::x" not in b.load_wall()
-        assert "t::x" in b.load_failed()
+    def test_none_payload_keeps_previous_snapshot(self):
+        """无 payload 的写入路径（带外登记/覆盖写）不得抹掉既有快照。"""
+        b = InMemoryStateBackend()
+        assert b.commit_job_failure("t::one", {"error": "first"}, job_payload={"k": 1}) is True
+        b.append_failed("t::one", {"error": "second"})
+        assert b.load_failed_payloads() == {"t::one": {"k": 1}}
 
-    def test_seed_wall_conflict_is_atomic_no_partial_write(self, dual_backend):
-        """冲突批次整体拒绝：batch 内非冲突 uid 亦不得部分写入。"""
-        b = dual_backend
+    def test_no_snapshot_entry_absent_from_payload_view(self):
+        b = InMemoryStateBackend()
+        b.append_failed("t::other", {"error": "x"})
+        assert b.load_failed_payloads() == {}
+
+    def test_delete_failed_clears_meta_and_snapshot(self):
+        b = InMemoryStateBackend()
+        b.commit_job_failure("t::one", {"error": "x"}, job_payload={"k": 1})
+        b.append_failed("t::two", {"error": "y"})
+        assert b.delete_failed(["t::one", "t::ghost"]) == 1
+        assert b.load_failed() == {"t::two": {"error": "y"}}
+        assert b.load_failed_payloads() == {}
+
+    def test_delete_wall_targeted(self):
+        b = InMemoryStateBackend()
+        b.commit_job_success("t::one", {"ok": True})
+        b.commit_job_success("t::two", {"ok": True})
+        assert b.delete_wall(["t::one", "t::ghost"]) == 1
+        assert set(b.load_wall()) == {"t::two"}
+
+    def test_success_commit_deletes_failed_same_uid(self):
+        """最终状态唯一：成功 commit 删失败档案同名行（含快照）。"""
+        b = InMemoryStateBackend()
+        b.commit_job_failure("t::one", {"error": "stale"}, job_payload={"k": 1})
+        assert b.commit_job_success("t::one", {"ok": True}) is True
+        assert b.load_failed() == {}
+        assert b.load_failed_payloads() == {}
+
+    def test_failure_commit_deletes_wall_same_uid(self):
+        """最终状态唯一：失败 commit 删 wall 同名行。"""
+        b = InMemoryStateBackend()
+        b.commit_job_success("t::one", {"ok": True})
+        assert b.commit_job_failure("t::one", {"error": "boom"}) is True
+        assert b.load_wall() == {}
+        assert set(b.load_failed()) == {"t::one"}
+
+
+class TestMemorySeedAndCursor:
+    """种子化：wall/failed 互斥拒绝 + cursor 入口校验。"""
+
+    def test_seed_wall_writes_empty_meta_idempotently(self):
+        b = InMemoryStateBackend()
+        assert b.seed_wall(["t::fresh_one", "t::fresh_two"]) == 2
+        assert b.load_wall() == {"t::fresh_one": {}, "t::fresh_two": {}}
+        assert b.seed_wall(["t::fresh_one"]) == 1
+        assert b.load_wall()["t::fresh_one"] == {}
+
+    def test_seed_wall_rejects_uid_already_in_failed_atomically(self):
+        b = InMemoryStateBackend()
         b.append_failed("t::bad", {"error": "boom"})
-
         with pytest.raises(ValueError, match="already in failed"):
-            b.seed_wall(["t::ok1", "t::bad", "t::ok2"])
+            b.seed_wall(["t::ok_entry", "t::bad", "t::ok_next"])
+        # 冲突整体拒绝：零写入，失败档案记录原样保留
+        assert b.load_wall() == {}
+        assert set(b.load_failed()) == {"t::bad"}
 
-        assert set(b.load_wall()) == set()
-        assert "t::bad" in b.load_failed()
+    def test_seed_wall_after_delete_failed_succeeds(self):
+        b = InMemoryStateBackend()
+        b.append_failed("t::one", {"error": "boom"})
+        assert b.delete_failed(["t::one"]) == 1
+        assert b.seed_wall(["t::one"]) == 1
+        assert b.load_wall() == {"t::one": {}}
 
-    def test_seed_wall_fresh_uid_unaffected(self, dual_backend):
-        """正常 seed（无 failed 冲突）行为不变：幂等覆盖写入。"""
-        b = dual_backend
-        assert b.seed_wall(["t::fresh1", "t::fresh2"]) == 2
-        assert set(b.load_wall()) == {"t::fresh1", "t::fresh2"}
-        # 幂等：重复 seed 仍成功（meta 重置为空）
-        assert b.seed_wall(["t::fresh1"]) == 1
-        assert b.load_wall()["t::fresh1"] == {}
+    @pytest.mark.parametrize("key,value", [(None, "v"), ("k", 123), ("", "v")])
+    def test_seed_cursor_rejects_bad_types(self, key, value):
+        b = InMemoryStateBackend()
+        with pytest.raises(TypeError):
+            b.seed_cursor(key, value)
+        assert b.load_cursors() == {}
+
+    def test_seed_cursor_valid_roundtrip_upsert(self):
+        b = InMemoryStateBackend()
+        b.seed_cursor("k", "v_one")
+        b.seed_cursor("k", "v_two")
+        assert b.load_cursors() == {"k": "v_two"}
+
+
+class TestMemorySnapshotIsolation:
+    """快照隔离：load 返回深拷贝，写路径入参深拷贝。"""
+
+    def test_load_queue_result_mutation_is_invisible(self):
+        b = InMemoryStateBackend()
+        b.enqueue_jobs([_job_dict("one", payload={"x": 1})])
+        snapshot = b.load_queue()
+        snapshot[0]["payload"]["x"] = 999
+        snapshot.pop()
+        assert b.load_queue()[0]["payload"] == {"x": 1}
+
+    def test_load_wall_and_failed_results_mutation_is_invisible(self):
+        b = InMemoryStateBackend()
+        b.commit_job_success("t::one", {"meta": {"v": 1}})
+        b.append_failed("t::two", {"meta": {"v": 2}})
+        b.load_wall()["t::one"]["meta"]["v"] = 999
+        b.load_failed()["t::two"]["meta"]["v"] = 999
+        assert b.load_wall()["t::one"]["meta"] == {"v": 1}
+        assert b.load_failed()["t::two"]["meta"] == {"v": 2}
+
+    def test_enqueue_input_mutation_is_invisible(self):
+        b = InMemoryStateBackend()
+        job = _job_dict("one", payload={"x": 1})
+        b.enqueue_jobs([job])
+        job["payload"]["x"] = 999
+        assert b.load_queue()[0]["payload"] == {"x": 1}

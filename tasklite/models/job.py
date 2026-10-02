@@ -1,39 +1,50 @@
-"""Job data model for tasklite."""
+"""v2 Job 模型：一次有界激活的逻辑实例（ADR-0004 三层模型的实例位）。
+
+字段归位原则：本类只承载「这一次激活」的语义——
+
+- 规格位（可覆盖 Task 默认）：task_type / job_id / payload / resources /
+  depends_on / timeout / max_retries / timeout_is_transient / rerun；
+- 实例位（框架运行期管理）：attempt_no（本次激活内尝试序号，1 起始含
+  首次执行；预算判定：允许执行条件 ``attempt_no <= max_retries + 1``）、
+  activation_no（激活代，每次从 wall/failed 拦截点放行重跑时 +1）、
+  first_enqueued_at（UTC ISO，首次入队时间，重试不刷新，由 enqueue 填充）；
+- 运行期边带状态收敛到 ``runtime`` 单一命名空间（JobRuntimeState），随
+  job_dict 落盘持久化——序列化只此一处，新增状态不会因散装下划线键
+  漏写 to_dict 而丢失。
+
+身份不变式：``uid = task_type::job_id``，queue/wall/failed 三表主键与
+六集合互斥均以 uid 为身份；``__eq__``/``__hash__`` 仅按 uid。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
 from typing import Any
 
-from ..utils.injective import safe_uid_filename
-from ..taxonomy import validate_resource_amounts
+from ..utils.encoding import safe_uid_filename
+from .task import (
+    validate_resource_amounts,
+    validate_retry_budget,
+    validate_task_type,
+    validate_timeout,
+    validate_timeout_flag,
+)
 
 # uid 派生的 IPC 文件名（锁 / result / signals / outputs）
 # 无截断——job_id/task_type 超长时文件名超 255 字节（EXT4 单文件名字节
-# 上限）→ os.open ENAMETOOLONG → 派发侧异常未分类 → requeue + 退避/崩溃
-# 重启 → livelock（job 永远无法执行且不进 DLQ）。入口按 safe_uid_filename
+# 上限）→ os.open ENAMETOOLONG → 派发侧异常未分类 → 重入队 + 崩溃重启
+# → livelock（job 永远无法执行且不进失败档案）。入口按 safe_uid_filename
 # 实际字节数（含转义膨胀）拒绝，fail-fast。
 # 255 - 56 = 199：56 为最坏结果文件后缀 ``.{32-hex run_id}.{seq}.result.json``。
 _MAX_SAFE_UID_BYTES = 199
 
 WORKER_RESOURCE = "__workers__"
 
-# rerun 策略合法值（校验点：Job 构造 / set_discovery_rerun / register_discovery）
-# 与「豁免重跑」子集（判定点：PipelineState 六集合互斥豁免）的单一真相；
-# 豁免集 = 合法集 − {"never"}，新增策略值漏改任一消费点即静默丢豁免。
+# rerun 策略合法值（校验点：Job 构造 / 任务级默认策略注册）与「豁免重跑」
+# 子集（判定点：PipelineState 六集合互斥豁免）的单一真相；豁免集 =
+# 合法集 − {"never"}，新增策略值漏改任一消费点即静默丢豁免。
 RERUN_VALUES = ("never", "on_failure", "every_run", "on_input_change")
 RERUN_EXEMPT_VALUES = ("every_run", "on_failure", "on_input_change")
 assert set(RERUN_EXEMPT_VALUES) == set(RERUN_VALUES) - {"never"}
-
-
-def _is_finite(value: Any) -> bool:
-    """math.isfinite 的溢出安全版：超出 float 范围的超大 int（如 10**400）
-    转换溢出抛 OverflowError（ArithmeticError 子类，会命中 FATAL 启发式），
-    此处按「非有限」收敛，交由调用方既有 ValueError/TypeError 通道明确报错。"""
-    try:
-        return math.isfinite(value)
-    except OverflowError:
-        return False
 
 
 def inject_worker_resource(job_dict: dict) -> None:
@@ -46,45 +57,20 @@ def inject_worker_resource(job_dict: dict) -> None:
 
 @dataclass
 class JobRuntimeState:
-    """Job 运行期内部边带状态（强类型结构化存储，替代散装字典）。
+    """Job 运行期内部边带状态（强类型结构化存储）。
 
     不变式：runtime 命名空间内仅 `_` 前缀名为框架字段，其余任意键（含与
     字段同名的无下划线形态）一律是用户的 extra 数据——to_dict/from_dict
     往返对 extra 命名空间无损，框架读写永不劫持或丢弃 extra 键。
     """
 
-    backoff_until: float | None = None
-    backoff_wall_deadline: float | None = None
     commit_failures: int = 0
     dispatch_failures: int = 0
     last_retry_error: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
-    def is_backed_off(self, now: float) -> bool:
-        """判断是否处于退避期。"""
-        if self.backoff_until is None:
-            return False
-        if not isinstance(self.backoff_until, (int, float)):
-            return False
-        return self.backoff_until > now
-
-    def remaining_backoff(self, now: float) -> float:
-        """返回剩余退避时长（秒），非退避中返回 0.0。"""
-        until = self.backoff_until
-        if not isinstance(until, (int, float)) or until <= now:
-            return 0.0
-        return max(0.0, float(until) - now)
-
-    def record_retry(
-        self,
-        monotonic_now: float,
-        wall_now: float,
-        delay: float,
-        error: str = "",
-    ) -> None:
-        """记录重试退避状态。"""
-        self.backoff_until = monotonic_now + delay
-        self.backoff_wall_deadline = wall_now + delay
+    def record_retry_error(self, error: object) -> None:
+        """记录最近一次重试的错误串（空值收敛为空串）。"""
         self.last_retry_error = str(error or "")
 
     def record_commit_failure(self) -> int:
@@ -97,25 +83,8 @@ class JobRuntimeState:
         self.dispatch_failures += 1
         return self.dispatch_failures
 
-    def align_wall_clock(self, monotonic_now: float, wall_now: float) -> None:
-        """从持久化的 wall_deadline 换算为内存 monotonic 退避时间。"""
-        if (
-            self.backoff_wall_deadline is not None
-            and isinstance(self.backoff_wall_deadline, (int, float))
-            and not isinstance(self.backoff_wall_deadline, bool)
-            and _is_finite(self.backoff_wall_deadline)
-        ):
-            if self.backoff_wall_deadline > wall_now:
-                self.backoff_until = monotonic_now + (self.backoff_wall_deadline - wall_now)
-            else:
-                self.backoff_until = None
-                self.backoff_wall_deadline = None
-        else:
-            self.backoff_until = None
-            self.backoff_wall_deadline = None
-
     def to_dict(self) -> dict[str, Any]:
-        """导出持久化字典（完全保留 _ 开头与任意 extra 字段）。"""
+        """导出持久化字典（完全保留 `_` 开头与任意 extra 字段）。"""
         d = dict(self.extra)
         for key, (attr, empty) in _RUNTIME_FIELDS.items():
             val = getattr(self, attr)
@@ -126,11 +95,9 @@ class JobRuntimeState:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | JobRuntimeState | None) -> "JobRuntimeState":
+    def from_dict(cls, data: dict[str, Any] | JobRuntimeState | None) -> JobRuntimeState:
         if isinstance(data, JobRuntimeState):
             return cls(
-                backoff_until=data.backoff_until,
-                backoff_wall_deadline=data.backoff_wall_deadline,
                 commit_failures=data.commit_failures,
                 dispatch_failures=data.dispatch_failures,
                 last_retry_error=data.last_retry_error,
@@ -144,113 +111,207 @@ class JobRuntimeState:
         def _pop_val(key: str) -> Any:
             return extra.pop(key, None)
 
-        raw_bu = _pop_val("_backoff_until")
-        backoff_until = _coerce_deadline(raw_bu)
-
-        raw_wd = _pop_val("_backoff_wall_deadline")
-        backoff_wall_deadline = _coerce_deadline(raw_wd)
-
-        raw_cf = _pop_val("_commit_failures")
+        raw_cf = _pop_val(RT_COMMIT_FAILURES)
         try:
             commit_failures = int(raw_cf) if raw_cf is not None else 0
         except (ValueError, TypeError):
             commit_failures = 0
 
-        raw_df = _pop_val("_dispatch_failures")
+        raw_df = _pop_val(RT_DISPATCH_FAILURES)
         try:
             dispatch_failures = int(raw_df) if raw_df is not None else 0
         except (ValueError, TypeError):
             dispatch_failures = 0
 
-        raw_re = _pop_val("_last_retry_error")
+        raw_re = _pop_val(RT_LAST_RETRY_ERROR)
         last_retry_error = str(raw_re or "")
 
         return cls(
-            backoff_until=backoff_until,
-            backoff_wall_deadline=backoff_wall_deadline,
             commit_failures=commit_failures,
             dispatch_failures=dispatch_failures,
             last_retry_error=last_retry_error,
             extra=extra,
         )
 
-    def __getitem__(self, key: str) -> Any:
-        spec = _RUNTIME_FIELDS.get(key)
-        if spec is not None:
-            val = getattr(self, spec[0])
-            if val is not None:
-                return val
-            raise KeyError(key)
-        return self.extra[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key == "_backoff_until":
-            self.backoff_until = _coerce_deadline(value)
-        elif key == "_backoff_wall_deadline":
-            self.backoff_wall_deadline = _coerce_deadline(value)
-        elif key == "_commit_failures":
-            self.commit_failures = int(value or 0)
-        elif key == "_dispatch_failures":
-            self.dispatch_failures = int(value or 0)
-        elif key == "_last_retry_error":
-            self.last_retry_error = str(value or "")
-        else:
-            self.extra[key] = value
-
-    def __contains__(self, key: str) -> bool:
-        spec = _RUNTIME_FIELDS.get(key)
-        if spec is not None:
-            return getattr(self, spec[0]) != spec[1]
-        return key in self.extra
-
-    def get(self, key: str, default: Any = None) -> Any:
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def setdefault(self, key: str, default: Any = None) -> Any:
-        if key not in self:
-            self[key] = default
-        return self[key]
-
-    def pop(self, key: str, default: Any = None) -> Any:
-        spec = _RUNTIME_FIELDS.get(key)
-        if spec is not None:
-            attr, empty = spec
-            val = getattr(self, attr)
-            setattr(self, attr, empty)
-            return val if val != empty else default
-        return self.extra.pop(key, default)
-
 
 # runtime 规范键注册表：框架字段的单一事实源。empty 为「未设置」哨兵
-# （读取等于哨兵时视同缺省、pop 清空回哨兵、to_dict 导出时省略）；
-# 写入侧的规范化（deadline 校验 / 计数与取串）语义各异，保留在各
-# 写入方法内显式表达。
+# （等于哨兵时 to_dict 导出省略）；写入侧的规范化（计数与取串）语义
+# 保留在各写入方法内显式表达。
 # runtime 规范键名常量（键名字符串的单一引用点；引擎写入侧与测试经此引用）
-RT_BACKOFF_UNTIL = "_backoff_until"
-RT_BACKOFF_WALL_DEADLINE = "_backoff_wall_deadline"
 RT_COMMIT_FAILURES = "_commit_failures"
+RT_DISPATCH_FAILURES = "_dispatch_failures"
+RT_LAST_RETRY_ERROR = "_last_retry_error"
 
 _RUNTIME_FIELDS: dict[str, tuple[str, Any]] = {
-    RT_BACKOFF_UNTIL: ("backoff_until", None),
-    RT_BACKOFF_WALL_DEADLINE: ("backoff_wall_deadline", None),
     RT_COMMIT_FAILURES: ("commit_failures", 0),
-    "_dispatch_failures": ("dispatch_failures", 0),
-    "_last_retry_error": ("last_retry_error", ""),
+    RT_DISPATCH_FAILURES: ("dispatch_failures", 0),
+    RT_LAST_RETRY_ERROR: ("last_retry_error", ""),
 }
 
 
-def _coerce_deadline(value: Any) -> float | None:
-    """deadline 型规范值在写入校验与容灾解析间共用的规范化：仅有限实数放行。"""
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and _is_finite(value):
-        return float(value)
-    return None
+def _validate_job_id(job_id: Any) -> None:
+    """job_id 入口校验：非空 str 且不含 '::'。
+
+    拒绝非 str——str 强转会使数值与字符串字面量静默碰撞
+    （Job("t", 1.0).uid == Job("t", "1.0").uid == "t::1.0"），混合
+    数值/字符串 job_id 的管线静默合并不同任务（wall 去重吞掉后者），
+    与 task_type 的 str 校验对称。
+    """
+    if not isinstance(job_id, str):
+        raise TypeError(
+            f"job_id must be a str, got {type(job_id).__name__} ({job_id!r})"
+        )
+    if not job_id:
+        raise ValueError(f"job_id must be a non-empty str, got {job_id!r}")
+    if "::" in job_id:
+        raise ValueError(f"job_id must not contain '::', got {job_id!r}")
+
+
+def _validate_uid_ipc_filename(task_type: str, job_id: str) -> None:
+    """uid 派生 IPC 文件名超 255 字节 → ENAMETOOLONG livelock，入口拒绝。"""
+    if len(safe_uid_filename(f"{task_type}::{job_id}").encode("utf-8")) > _MAX_SAFE_UID_BYTES:
+        raise ValueError(
+            f"task_type+job_id too long: uid-derived IPC filename would exceed "
+            f"filesystem name limit ({_MAX_SAFE_UID_BYTES} bytes max); got "
+            f"{task_type!r}::{job_id!r} — shorten to avoid ENAMETOOLONG livelock"
+        )
+
+
+def _normalize_payload(payload: Any) -> dict[str, Any]:
+    """payload 入口校验与规范化：仅接受 dict 或 None。
+
+    非 dict payload 若放行，会潜伏到子进程序列化处才崩，入口拒绝。
+    """
+    if payload is not None and not isinstance(payload, dict):
+        raise TypeError(
+            f"payload must be a dict or None, got {type(payload).__name__} ({payload!r})"
+        )
+    return dict(payload) if payload else {}
+
+
+def _normalize_resources(resources: Any) -> dict[str, float]:
+    """resources 入口校验与规范化。
+
+    非 dict 类型（str 等可迭代）会在迭代处抛原始 AttributeError
+    （不可读），入口显式拒绝；数值规则委托模型层共享校验单点。
+    """
+    if resources is not None and not isinstance(resources, dict):
+        raise TypeError(
+            f"resources must be a dict or None, got {type(resources).__name__} ({resources!r})"
+        )
+    normalized = dict(resources) if resources else {}
+    validate_resource_amounts(normalized, "resources")
+    return normalized
+
+
+def _normalize_depends_on(depends_on: Any) -> list[str]:
+    """depends_on 入口校验与规范化：list/tuple 且元素全为 str。
+
+    先校验外层类型再迭代——str 可迭代出 str，若直接 all(isinstance)
+    检查会把 "parent::id" 静默肢解为字符列表，作业以依赖死锁死亡。
+    """
+    if depends_on is not None and not isinstance(depends_on, (list, tuple)):
+        raise TypeError(
+            f"depends_on must be a list of strings, got {type(depends_on).__name__}"
+        )
+    normalized = list(depends_on) if depends_on is not None else []
+    if not all(isinstance(d, str) for d in normalized):
+        raise TypeError(
+            f"depends_on must contain only strings, got {normalized!r}"
+        )
+    return normalized
+
+
+def _validate_rerun(rerun: Any) -> None:
+    """rerun 策略入口校验（fail-loud）——非法值会被静默当 "never" 处理。
+
+    None 是「未指定」哨兵（可被任务级默认策略注入），显式字符串一律
+    尊重；仅拒绝未知字符串值。
+    """
+    if rerun is not None and rerun not in RERUN_VALUES:
+        raise ValueError(
+            f"rerun must be None (unspecified) or one of "
+            f"{'/'.join(repr(v) for v in RERUN_VALUES)}, got {rerun!r}"
+        )
+
+
+def _validate_attempt_no(attempt_no: Any) -> None:
+    """attempt_no 入口校验：非 bool 的 int 且 >= 1（1 起始含首次执行）。"""
+    if not isinstance(attempt_no, int) or isinstance(attempt_no, bool):
+        raise TypeError(
+            f"attempt_no must be an int, got {type(attempt_no).__name__} "
+            f"({attempt_no!r})"
+        )
+    if attempt_no < 1:
+        raise ValueError(f"attempt_no must be >= 1, got {attempt_no}")
+
+
+def _validate_activation_no(activation_no: Any) -> None:
+    """activation_no 入口校验：非 bool 的 int 且 >= 1（初激活为 1）。"""
+    if not isinstance(activation_no, int) or isinstance(activation_no, bool):
+        raise TypeError(
+            f"activation_no must be an int, got {type(activation_no).__name__} "
+            f"({activation_no!r})"
+        )
+    if activation_no < 1:
+        raise ValueError(f"activation_no must be >= 1, got {activation_no}")
+
+
+def _validate_first_enqueued_at(first_enqueued_at: Any) -> None:
+    """first_enqueued_at 入口校验：str（UTC ISO）或 None（尚未入队）。
+
+    非-str 非-None 值会以随机类型潜伏到落盘序列化处才崩，入口拒绝；
+    时间戳本身由 enqueue 单点填充，本处只做类型门卫。
+    """
+    if first_enqueued_at is not None and not isinstance(first_enqueued_at, str):
+        raise TypeError(
+            f"first_enqueued_at must be a str or None, got "
+            f"{type(first_enqueued_at).__name__} ({first_enqueued_at!r})"
+        )
+    if first_enqueued_at == "":
+        raise ValueError("first_enqueued_at must be a non-empty str or None")
 
 
 class Job:
-    """Represents a discrete unit of work in the pipeline."""
+    """一次有界激活的逻辑实例（uid = task_type::job_id 身份不变）。
+
+    Args:
+        task_type: 任务类型名（须匹配已注册 Task 的 task_type）。非空 str
+            且不含 ``::``（uid 分隔符）。
+        job_id: 任务类型内的唯一标识。非空 str 且不含 ``::``。
+        payload: 传给 handler 的业务数据 dict（须可 JSON 序列化，完整
+            序列化预检在 enqueue/spawn 侧执行，构造期先做 dict 类型门卫）。
+        resources: 要获取的资源占用映射（覆盖 Task 默认资源）。
+        max_retries: 重试预算上限（覆盖 Task 默认 3）。允许执行条件为
+            ``attempt_no <= max_retries + 1``；0 表示任何失败直接进
+            失败档案。
+        depends_on: 上游 job uid 列表（``task_type::job_id``）。失败的
+            上游会级联阻断本 job。
+        timeout: 执行超时秒数（覆盖 Task 默认 3600），有限正数。
+        timeout_is_transient: 超时是否视为瞬态失败（keyword-only）。
+            True 时看门狗超时按重试处理，而非直接进失败档案。
+        rerun: 跨会话重跑策略——「成功进 wall 是否算数」由它决定
+            （**不改变 uid 派生**，身份仍是 uid）：
+            - None（默认，未指定哨兵）：未指定——任务级默认策略可注入；
+              无默认策略的任务按 "never" 处理。与显式 "never" 的区别：
+              显式值一律尊重，不再被任务级默认覆盖（保持 enqueue 与
+              spawn 行为一致）；
+            - "never"：wall/failed 命中即跳过；
+            - "on_failure"：wall 命中跳过，failed 命中重跑（网络误失败
+              可自愈；成功即自动清失败档案残行）；
+            - "every_run"：wall/failed 命中都重跑（成功 REPLACE wall 行、
+              run_count+1）——扫描类/orchestrator 任务；
+            - "on_input_change"：wall 命中比对输入指纹，failed 命中重跑。
+            策略只作用于「wall/failed 拦截点」；queue/in-flight 永远算数
+            （同一轮内不重复派发/并发双跑）。随 job_dict 持久化。
+        runtime: 运行期边带状态（dict 或 JobRuntimeState，由框架管理）。
+        attempt_no: 本次激活内尝试序号（实例位，框架管理，1 起始含首次
+            执行）。
+        activation_no: 激活代（实例位，框架管理，每次从 wall/failed
+            拦截点放行重跑时 +1，初激活为 1）。
+        first_enqueued_at: 首次入队时间（实例位，UTC ISO，由 enqueue
+            填充，重试不刷新；None 表示尚未入队）。
+    """
 
     def __init__(
         self,
@@ -258,187 +319,43 @@ class Job:
         job_id: str,
         payload: dict[str, Any] | None = None,
         resources: dict[str, float] | None = None,
-        retries: int = 0,
         max_retries: int = 3,
         depends_on: list[str] | None = None,
-        timeout: int = 3600,
-        backoff_base: float = 2.0,
-        backoff_max: float = 300.0,
+        timeout: int | float = 3600,
+        *,
         timeout_is_transient: bool = False,
         rerun: str | None = None,
         runtime: dict[str, Any] | None = None,
+        attempt_no: int = 1,
+        activation_no: int = 1,
+        first_enqueued_at: str | None = None,
     ):
-        """Initialize a Job.
-
-        Args:
-            task_type: Task type name (must match a registered handler). Must not
-                contain ``::`` (used as uid separator).
-            job_id: Unique job identifier within the task type. Must not contain ``::``.
-            payload: Business data dict passed to handler. Must be JSON-serializable.
-            resources: Resource amounts to acquire (overrides handler defaults).
-            retries: Current retry count (internal, managed by framework).
-            max_retries: Max retry attempts before DLQ. Must be >= 0.
-            depends_on: List of upstream job UIDs (``task_type::job_id``). Failed
-                parents cascade-block this job.
-            timeout: Execution timeout in seconds. Must be > 0.
-            backoff_base: Exponential backoff base in seconds. Must be finite and >= 0.
-            backoff_max: Backoff cap in seconds. Must be finite and >= 0.
-            timeout_is_transient: 超时是否视为瞬态失败（默认 False 保持
-                保守语义）。True 时看门狗 TIMEOUT 按 retry 处理（指数退避重试，
-                达 max_retries 才 DLQ），而非直接 Unknown → DLQ。适用于设计上
-                可能长跑的 job 类型（如 discovery 的整页扫描）——「超时」的
-                语义是「没跑完」，不等于「确定性失败」。
-            rerun: 跨会话重跑策略——「成功进 wall 是否算
-                数」由它决定（**不改变 job_id 派生**，身份仍是 uid）：
-                - None（默认，未指定哨兵）：**未指定**——discovery
-                  任务注入 ``set_discovery_rerun`` 登记的默认策略；普通任务
-                  按 "never" 处理。与显式 "never" 的区别：显式值一律尊重，
-                  不再被 discovery 默认覆盖（保持 enqueue 与 spawn 行为一致）。
-                - "never"：wall/failed 命中即跳过（现状语义）；
-                - "on_failure"：wall 命中跳过，failed 命中**重跑**
-                  （网络误失败可自愈；成功即自动清 DLQ 残行）；
-                - "every_run"：wall/failed 命中都**重跑**（成功 REPLACE
-                  wall 行、run_count+1）——discovery 扫描/orchestrator；
-                - "on_input_change"：wall 命中比对输入指纹，failed 命中重跑。
-                策略只作用于「wall/failed 拦截点」；queue/in-flight 永远
-                算数（同一轮内不重复派发/并发双跑）。随 job_dict 持久化。
-        """
+        # 身份校验链：类型 → 空值 → '::' 分隔符 → IPC 文件名长度上限
+        validate_task_type(task_type)
         self.task_type = task_type
-        # 非 str task_type：下方 "::" in task_type 会抛原始 TypeError，且与 job_id 的
-        # str 归一化不对称，入口显式拒绝。
-        if not isinstance(task_type, str):
-            raise TypeError(
-                f"task_type must be a str, got {type(task_type).__name__} ({task_type!r})"
-            )
-        # job_id 拒绝非 str——str 强转会使数值与字符串
-        # 字面量静默碰撞（Job("t",1.0).uid == Job("t","1.0").uid == "t::1.0"），
-        # 混合数值/字符串 job_id 的管线静默合并不同任务（wall 去重吞掉后者）。
-        # 入口显式拒绝，与 task_type 对称。
-        if not isinstance(job_id, str):
-            raise TypeError(
-                f"job_id must be a str, got {type(job_id).__name__} ({job_id!r})"
-            )
+        _validate_job_id(job_id)
         self.job_id = job_id
-        # 校验 task_type/job_id 非空且不含 '::'，避免 uid 的 'task::id' 分隔符碰撞
-        if not task_type:
-            raise ValueError(f"task_type must be a non-empty str, got {task_type!r}")
-        if not self.job_id:
-            raise ValueError(f"job_id must be a non-empty str, got {job_id!r}")
-        if "::" in task_type:
-            raise ValueError(f"task_type must not contain '::', got {task_type!r}")
-        if "::" in self.job_id:
-            raise ValueError(f"job_id must not contain '::', got {job_id!r}")
-        # uid 派生 IPC 文件名超 255 字节 → ENAMETOOLONG livelock，入口拒绝。
-        if len(safe_uid_filename(f"{task_type}::{job_id}").encode("utf-8")) > _MAX_SAFE_UID_BYTES:
-            raise ValueError(
-                f"task_type+job_id too long: uid-derived IPC filename would exceed "
-                f"filesystem name limit ({_MAX_SAFE_UID_BYTES} bytes max); got "
-                f"{task_type!r}::{job_id!r} — shorten to avoid ENAMETOOLONG livelock"
-            )
-        # 非 dict payload：to_dict/enqueue 预检均放行、直到子进程才崩，入口拒绝。
-        if payload is not None and not isinstance(payload, dict):
-            raise TypeError(
-                f"payload must be a dict or None, got {type(payload).__name__} ({payload!r})"
-            )
-        self.payload = dict(payload) if payload else {}
-        # resources 必须为 dict——str 等可迭代类型在下方
-        # ``for res_name, amount in self.resources.items`` 抛原始
-        # AttributeError（不可读），None 被 or {} 兜底但其他类型漏过。
-        # 与 payload 的 dict 校验对称，入口显式拒绝。
-        if resources is not None and not isinstance(resources, dict):
-            raise TypeError(
-                f"resources must be a dict or None, got {type(resources).__name__} ({resources!r})"
-            )
-        self.resources = dict(resources) if resources else {}
-        # 数值校验单点化（与 pipeline.register_handler 的默认资源
-        # 校验共用 taxonomy.validate_resource_amounts）——负值/NaN/Inf
-        # 会在调度器 acquire 时抛 ValueError（若抛在 try 之外，部分资源
-        # 永久泄漏），且 NaN 会毒化 CapacityResource 的 used 账目导致 livelock。
-        # 构造时即拒绝（bool 是 int 子类，isinstance(True,(int,float)) 为
-        # True 会放行，故显式拒绝 bool）。
-        validate_resource_amounts(self.resources, "resources")
-        self.retries = retries
-        # retries 必须为 int——字符串等脏数据会在 _complete_job 的
-        # `job.retries >= job.max_retries` 比较处抛 TypeError，导致无限
-        # 崩溃重启循环（job 从磁盘恢复 → 再跑再崩，且无 DLQ 兜底）。
-        if not isinstance(retries, int) or isinstance(retries, bool):
-            raise TypeError(f"retries must be an int, got {type(retries).__name__} ({retries!r})")
-        # retries 下界校验：防止负数导致退避比较异常与无延迟重试，入口即拒绝。
-        if retries < 0:
-            raise ValueError(f"retries must be >= 0, got {retries}")
-        # max_retries 的 isinstance 检查必须在 < 0 之前——字符串脏数据
-        # 会先触发 "abc" < 0 的原始 TypeError，友好报错失效。
-        if not isinstance(max_retries, int) or isinstance(max_retries, bool):
-            raise TypeError(
-                f"max_retries must be an int, got {type(max_retries).__name__} ({max_retries!r})"
-            )
-        if max_retries < 0:
-            raise ValueError(f"max_retries must be >= 0, got {max_retries}")
+        _validate_uid_ipc_filename(task_type, job_id)
+
+        self.payload = _normalize_payload(payload)
+        self.resources = _normalize_resources(resources)
+        validate_retry_budget(max_retries)
         self.max_retries = max_retries
-        # 先校验外层类型再迭代——str 可迭代出 str，若直接 all(isinstance) 检查
-        # 会把 "parent::id" 静默肢解为字符列表，作业以 DEPENDENCY_DEADLOCK 死亡。
-        if depends_on is not None and not isinstance(depends_on, (list, tuple)):
-            raise TypeError(
-                f"depends_on must be a list of strings, got {type(depends_on).__name__}"
-            )
-        self.depends_on = list(depends_on) if depends_on is not None else []
-        if not all(isinstance(d, str) for d in self.depends_on):
-            raise TypeError(
-                f"depends_on must contain only strings, got {self.depends_on!r}"
-            )
+        self.depends_on = _normalize_depends_on(depends_on)
+        validate_timeout(timeout)
         self.timeout = timeout
-        # timeout 必须为有限正数——NaN 使 timeout <= 0 校验恒
-        # False 而漏过（NaN <= 0 为 False），deadline = monotonic + NaN = NaN，
-        # now > NaN 恒 False → 看门狗永不触发，挂死 job 永不 kill。
-        # bool 是 int 子类，同样拒绝（timeout=True 被接受为 1 秒）。
-        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
-            raise TypeError(
-                f"timeout must be a number, got {type(timeout).__name__} ({timeout!r})"
-            )
-        if not _is_finite(timeout) or timeout <= 0:
-            raise ValueError(f"timeout must be finite and > 0, got {timeout}")
-        # backoff_base/backoff_max 与 timeout 的校验对称——
-        # 仅 math.isfinite + < 0 不够：字符串 "2.0" 抛原始 TypeError
-        # （math.isfinite 不接收 str），True 被接受为 1.0（bool 是 int 子类）。
-        if not isinstance(backoff_base, (int, float)) or isinstance(backoff_base, bool):
-            raise TypeError(
-                f"backoff_base must be a number, got {type(backoff_base).__name__} ({backoff_base!r})"
-            )
-        if not _is_finite(backoff_base) or backoff_base < 0:
-            raise ValueError(
-                f"backoff_base must be finite and non-negative, got {backoff_base}"
-            )
-        if not isinstance(backoff_max, (int, float)) or isinstance(backoff_max, bool):
-            raise TypeError(
-                f"backoff_max must be a number, got {type(backoff_max).__name__} ({backoff_max!r})"
-            )
-        if not _is_finite(backoff_max) or backoff_max < 0:
-            raise ValueError(
-                f"backoff_max must be finite and non-negative, got {backoff_max}"
-            )
-        self.backoff_base = backoff_base
-        self.backoff_max = backoff_max
-        # 超时归类可配置。bool 类型校验——非 bool 值（如字符串）在
-        # executor 的 ``handle.job.timeout_is_transient`` 判断时被当作真值，
-        # 静默改变归类语义，入口拒绝。
-        if not isinstance(timeout_is_transient, bool):
-            raise TypeError(
-                f"timeout_is_transient must be a bool, got "
-                f"{type(timeout_is_transient).__name__} ({timeout_is_transient!r})"
-            )
+        validate_timeout_flag(timeout_is_transient)
         self.timeout_is_transient = timeout_is_transient
-        # rerun 策略入口校验（fail-loud）——非法值会被静默当 "never" 处理。
-        # None 是「未指定」哨兵（可被 discovery 默认注入），
-        # 显式字符串一律尊重；仅拒绝未知字符串值。
-        if rerun is not None and rerun not in RERUN_VALUES:
-            raise ValueError(
-                f"rerun must be None (unspecified) or one of "
-                f"{'/'.join(repr(v) for v in RERUN_VALUES)}, got {rerun!r}"
-            )
+        _validate_rerun(rerun)
         self.rerun = rerun
-        # 运行时边带状态（退避截止/3-strike 计数/最近重试错误）收敛到
-        # `runtime` 单一命名空间，随 job_dict 落盘持久化——序列化只此
-        # 一处，新增状态不会因散装下划线键漏写 to_dict 而丢失。
+
+        # 实例位：框架运行期管理的激活/尝试账目与首次入队时间
+        _validate_attempt_no(attempt_no)
+        self.attempt_no = attempt_no
+        _validate_activation_no(activation_no)
+        self.activation_no = activation_no
+        _validate_first_enqueued_at(first_enqueued_at)
+        self.first_enqueued_at = first_enqueued_at
         self.runtime = runtime
 
     @property
@@ -454,51 +371,48 @@ class Job:
             self._runtime = JobRuntimeState.from_dict(value)
 
     def to_dict(self) -> dict:
-        """Serialize job to dictionary.
-
-        Returns shallow copies of payload/resources/depends_on to prevent
-        external mutation of internal state. ``runtime`` 子 dict 显式保留
-        ——边带状态集中序列化，不散装丢失。
-        """
+        """序列化 job 为字典（payload/resources/depends_on 浅拷贝，防外部
+        就地变异内部状态）；``runtime`` 子 dict 显式保留——边带状态集中
+        序列化，不散装丢失。"""
         return {
             "task_type": self.task_type,
             "job_id": self.job_id,
             "payload": dict(self.payload),
             "resources": dict(self.resources),
-            "retries": self.retries,
             "max_retries": self.max_retries,
             "depends_on": list(self.depends_on),
             "timeout": self.timeout,
-            "backoff_base": self.backoff_base,
-            "backoff_max": self.backoff_max,
             "timeout_is_transient": self.timeout_is_transient,
             "rerun": self.rerun,
             "runtime": self.runtime.to_dict(),
+            "attempt_no": self.attempt_no,
+            "activation_no": self.activation_no,
+            "first_enqueued_at": self.first_enqueued_at,
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Job":
-        """Deserialize job from dictionary."""
+    def from_dict(cls, data: dict) -> Job:
+        """反序列化 job（缺键回默认值；rerun 缺键/None = 未指定哨兵）。"""
         return cls(
             data["task_type"],
             data["job_id"],
             data.get("payload", {}),
             data.get("resources", {}),
-            data.get("retries", 0),
             data.get("max_retries", 3),
             data.get("depends_on", []),
             data.get("timeout", 3600),
-            data.get("backoff_base", 2.0),
-            data.get("backoff_max", 300.0),
-            data.get("timeout_is_transient", False),
-            data.get("rerun"), # 缺键/None = 未指定哨兵
-            # runtime 子 dict 显式保留——边带状态只存这一处。
-            data.get("runtime", {}),
+            timeout_is_transient=data.get("timeout_is_transient", False),
+            rerun=data.get("rerun"),
+            # runtime 子 dict 显式保留——边带状态只存这一处
+            runtime=data.get("runtime", {}),
+            attempt_no=data.get("attempt_no", 1),
+            activation_no=data.get("activation_no", 1),
+            first_enqueued_at=data.get("first_enqueued_at"),
         )
 
     @property
     def uid(self) -> str:
-        """Return unique identifier for this job."""
+        """唯一标识：task_type::job_id。"""
         return f"{self.task_type}::{self.job_id}"
 
     def __eq__(self, other: object) -> bool:
@@ -508,3 +422,16 @@ class Job:
 
     def __hash__(self) -> int:
         return hash(self.uid)
+
+
+__all__ = [
+    "Job",
+    "JobRuntimeState",
+    "RERUN_EXEMPT_VALUES",
+    "RERUN_VALUES",
+    "RT_COMMIT_FAILURES",
+    "RT_DISPATCH_FAILURES",
+    "RT_LAST_RETRY_ERROR",
+    "WORKER_RESOURCE",
+    "inject_worker_resource",
+]

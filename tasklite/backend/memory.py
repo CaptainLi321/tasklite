@@ -1,28 +1,37 @@
-"""纯内存状态后端适配器（InMemoryStateBackend）。
+"""v2 纯内存状态后端（InMemoryStateBackend）。
 
-实现 AbstractStateBackend 完整契约，提供零文件系统 IO 的纯内存状态存储。
-适用于瞬态管线、单元测试、沙盒执行与 CI 矩阵测试。
+实现 AbstractStateBackend 完整契约，提供零文件系统 IO 的纯内存状态
+存储：瞬态管线、单元测试、沙盒执行。快照隔离的 delta 事务语义与
+SQLite 腿对齐——「校验先行、统一落变」模拟事务回滚：返回 False 或
+抛异常时全部集合与调用前完全一致。
 """
 from __future__ import annotations
 
 import copy
 import logging
 import threading
-from datetime import datetime, timezone
+from dataclasses import replace
 from typing import Any, Callable, Mapping, Sequence
 
 from .base import (
     AbstractStateBackend,
-    classify_error_type,
+    validate_attempt_dispatch,
+    validate_attempt_finish,
     validate_queue_replacement,
 )
+from ..models.attempt import AttemptRecord
 from ..models.state import uid_from_job_dict
 
 logger = logging.getLogger("tasklite")
 
 
 class InMemoryStateBackend(AbstractStateBackend):
-    """纯内存状态后端。提供快照隔离的 delta 事务语义，与 SQLite 后端行为完全对齐。"""
+    """纯内存状态后端：单锁串行化 + 深拷贝隔离的快照语义。
+
+    所有 load_* 返回深拷贝、所有写路径对入参深拷贝——外部可变别名
+    不得穿透快照隔离。attempts 以 dict 模拟自增主键（id 严格递增，
+    插入序即 id 序）。
+    """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -32,6 +41,10 @@ class InMemoryStateBackend(AbstractStateBackend):
         self._cursors: dict[str, str] = {}
         self._queue: list[dict[str, Any]] = []
         self._meta: dict[str, str] = {}
+        self._attempts: dict[int, AttemptRecord] = {}
+        self._attempt_seq = 1
+
+    # 全量加载 -------------------------------------------------------
 
     def load_wall(self) -> dict[str, dict[str, Any]]:
         with self._lock:
@@ -42,7 +55,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             return copy.deepcopy(self._failed)
 
     def load_failed_payloads(self) -> dict[str, dict[str, Any]]:
-        """读取 DLQ 各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
+        """读取失败档案各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
         with self._lock:
             return copy.deepcopy(self._failed_payloads)
 
@@ -54,18 +67,20 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             return copy.deepcopy(self._queue)
 
+    # 整表重写 -------------------------------------------------------
+
     def _dedup_copy(self, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """整表替换行的单一出口（save_queue 与 replace_queue_atomic 共用）。
 
-        替换集先经 ``validate_queue_replacement`` 校验（与 SQLite 腿同一出口、
-        同一时机——赋值之前 fail-loud，`_queue` 保持调用前状态）。
+        替换集先经 ``validate_queue_replacement`` 校验（与 SQLite 腿同一
+        出口、同一时机——赋值之前 fail-loud，``_queue`` 保持调用前状态）。
         保存兜底去重：重复 uid 保留首条 + 告警，与 SQLite 腿
-        _rewrite_queue_rows 同语义；条目一律 deepcopy，杜绝外部可变别名
-        穿透快照隔离。
+        ``_rewrite_queue_rows`` 同语义；条目一律 deepcopy，杜绝外部可变
+        别名穿透快照隔离。
         """
         validate_queue_replacement(jobs)
-        seen = set()
-        clean = []
+        seen: set[str] = set()
+        clean: list[dict[str, Any]] = []
         for j in jobs:
             u = uid_from_job_dict(j)
             if u in seen:
@@ -88,32 +103,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             # 未发生，队列保持调用前状态（对齐 SQLite 腿事务回滚）。
             self._queue = self._dedup_copy(compute(copy.deepcopy(self._queue)))
 
-    def _build_dlq_meta(self, meta: dict | None, prev: Any) -> dict[str, Any]:
-        """计算 DLQ 行终值（纯函数，不变更任何状态）：_attempt 计数 + error_type + failed_at。
-
-        不变式：``_attempt`` 是写入事件计数而非逻辑失败次数；既有计数
-        无效（非 dict 记录或非 int 计数）时静默重置为 1 并照常提交，绝不
-        因脏计数抛 TypeError——与 SQLite 后端「损坏行重置计数、写入成功」
-        行为对齐。
-        """
-        merged = copy.deepcopy(meta or {})
-        if "error_type" not in merged:
-            merged["error_type"] = classify_error_type(merged)
-        if "failed_at" not in merged:
-            merged["failed_at"] = datetime.now(timezone.utc).isoformat()
-        if not isinstance(prev, dict):
-            merged["_attempt"] = 1
-            return merged
-        prev_attempt = prev.get("_attempt")
-        if isinstance(prev_attempt, int):
-            merged["_attempt"] = prev_attempt + 1
-        else:
-            merged["_attempt"] = 1  # 既有记录无有效计数：从 1 重新计数
-        return merged
-
-    def _write_dlq_entry(self, uid: str, meta: dict | None) -> None:
-        """DLQ 写入单一出口：终值经 _build_dlq_meta 计算后落变。"""
-        self._failed[uid] = self._build_dlq_meta(meta, self._failed.get(uid))
+    # delta 提交 -----------------------------------------------------
 
     def commit_job_success(
         self,
@@ -127,14 +117,14 @@ class InMemoryStateBackend(AbstractStateBackend):
             try:
                 # 校验先行：全部 deepcopy 与冲突判定在任何变更前完成。
                 # 不变式：返回 False / 抛异常 ⇒ wall/queue/failed/cursors 与
-                # 调用前完全一致（对齐 SQLite 事务回滚；store 的 3-strike
+                # 调用前完全一致（对齐 SQLite 事务回滚；store 的连续失败
                 # 崩溃契约以「后端未变」为前提做重启重建）。
                 wall_meta = copy.deepcopy(result_meta or {})
                 spawned_copy = [copy.deepcopy(j) for j in spawned_jobs]
                 remaining = [j for j in self._queue if uid_from_job_dict(j) != uid]
                 if spawned_copy:
                     remaining_uids = {uid_from_job_dict(j) for j in remaining}
-                    seen: set = set()
+                    seen: set[str] = set()
                     for sj in spawned_copy:
                         suid = uid_from_job_dict(sj)
                         # spawned uid 撞上删除 popped 后的队列既有条目，或
@@ -149,7 +139,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                             return False
                         seen.add(suid)
                 cursor_sets: dict[str, str] = {}
-                cursor_dels: set = set()
+                cursor_dels: set[str] = set()
                 if cursor_updates:
                     for k, v in cursor_updates.items():
                         if v is None:
@@ -160,7 +150,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 self._wall[uid] = wall_meta
                 self._queue = spawned_copy + remaining  # 队首插入 spawned 并保序
                 # 成功 commit 清理 failed 同名残行：与「job 最终状态唯一」
-                # 语义一致，防 wall∩failed 并存污染 _attempt 计数。
+                # 语义一致，防 wall∩failed 并存。
                 self._failed.pop(uid, None)
                 self._failed_payloads.pop(uid, None)
                 self._cursors.update(cursor_sets)
@@ -176,17 +166,20 @@ class InMemoryStateBackend(AbstractStateBackend):
     ) -> bool:
         with self._lock:
             try:
-                # 校验先行：DLQ 终值计算与队列 uid 提取全部在变更前完成，
+                # 校验先行：失败 meta 与 payload 快照的拷贝在变更前完成，
                 # 任一步失败 ⇒ failed/queue/wall 整体不变（对齐 SQLite 回滚）。
-                new_meta = self._build_dlq_meta(result_meta, self._failed.get(uid))
+                meta_copy = copy.deepcopy(result_meta or {})
+                payload_copy = (
+                    copy.deepcopy(job_payload) if job_payload is not None else None
+                )
                 remaining = [j for j in self._queue if uid_from_job_dict(j) != uid]
-                self._failed[uid] = new_meta
-                # payload 快照 latest-wins；None 表示本路径无 payload，保留既有
-                # 快照（与 SQLite 后端 _write_dlq_row 的保留语义对齐）。
-                if job_payload is not None:
-                    self._failed_payloads[uid] = copy.deepcopy(job_payload)
+                self._failed[uid] = meta_copy
+                # payload 快照 latest-wins；None 表示本路径无 payload，保留
+                # 既有快照（与 SQLite 腿 _write_failed_row 的保留语义对齐）。
+                if payload_copy is not None:
+                    self._failed_payloads[uid] = payload_copy
                 self._queue = remaining
-                # 同一事务语义内清理 wall 旧记录：rerun 任务重跑失败时旧成功
+                # 同一事务语义内清理 wall 旧记录：重跑任务失败时旧成功
                 # 记录作废（最终状态唯一），防 wall∩failed 并存。
                 self._wall.pop(uid, None)
                 return True
@@ -208,7 +201,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 remaining = [j for j in self._queue if uid_from_job_dict(j) != popped_uid]
                 # 对齐 SQLite 普通 INSERT 冲突回滚：requeued uid 撞上删除
                 # popped 后的既有条目 → False 走崩溃契约，绝不产出重复条目；
-                # uid == popped_uid 属同 job 重插，安全放行。
+                # uid == popped_uid 属同 job 重插（DELETE+INSERT），安全放行。
                 if ruid != popped_uid and any(uid_from_job_dict(j) == ruid for j in remaining):
                     logger.critical(
                         f"commit_retry for {popped_uid}: requeued uid {ruid} "
@@ -227,24 +220,16 @@ class InMemoryStateBackend(AbstractStateBackend):
     def commit_bulk_failure(self, uids_metas: list[tuple[str, dict]]) -> bool:
         with self._lock:
             try:
-                # 校验先行：全部 DLQ 行计算在任何变更前完成——任一行失败则
+                # 校验先行：全部失败行拷贝在任何变更前完成——任一行失败则
                 # queue/wall/failed 整体不变（对齐 SQLite 事务回滚，杜绝
-                # 「队列已整体删除、DLQ 未落」的半成品失败态）。
-                new_entries: list[tuple[str, dict[str, Any]]] = []
-                overlay: dict[str, Any] = {}
-                for uid, meta in uids_metas:
-                    # 批内同 uid 多次出现时模拟 SQLite 同事务顺序写：
-                    # 后一行读取前一行结果，_attempt 连续递增。
-                    prev = overlay.get(uid, self._failed.get(uid))
-                    entry = self._build_dlq_meta(meta, prev)
-                    overlay[uid] = entry
-                    new_entries.append((uid, entry))
+                # 「队列已整体删除、档案未落」的半成品失败态）。
+                entries = [(uid, copy.deepcopy(meta or {})) for uid, meta in uids_metas]
                 fail_uids = {u for u, _ in uids_metas}
                 remaining = [j for j in self._queue if uid_from_job_dict(j) not in fail_uids]
-                for uid, entry in new_entries:
-                    self._failed[uid] = entry
-                    # rerun 任务被级联/死锁批量 DLQ 时 wall 旧成功记录作废
-                    # （最终状态唯一），与 commit_job_failure 对称。
+                for uid, meta in entries:
+                    self._failed[uid] = meta
+                    # 级联/死锁批量失败时 wall 旧成功记录作废（最终状态
+                    # 唯一），与 commit_job_failure 对称。
                     self._wall.pop(uid, None)
                 self._queue = remaining
                 return True
@@ -252,33 +237,16 @@ class InMemoryStateBackend(AbstractStateBackend):
                 logger.critical(f"Failed to commit bulk failure: {e}")
                 return False
 
-    def append_failed(self, uid: str, payload: dict[str, Any] | None = None) -> None:
-        with self._lock:
-            self._write_dlq_entry(uid, payload or {})
-
     def commit_skip(self, uid: str) -> bool:
         with self._lock:
             self._queue = [j for j in self._queue if uid_from_job_dict(j) != uid]
             return True
 
-    def delete_queue_uids(self, uids: list[str]) -> int:
-        """按 uid 定向批量删除队列条目，与 SQLite 腿同语义：不触碰其余条目。"""
-        if not uids:
-            return 0
+    def append_failed(self, uid: str, payload: dict[str, Any] | None = None) -> None:
         with self._lock:
-            del_set = set(uids)
-            kept = [j for j in self._queue if uid_from_job_dict(j) not in del_set]
-            removed = len(self._queue) - len(kept)
-            self._queue = kept
-            return removed
+            self._failed[uid] = copy.deepcopy(payload or {})
 
-    def get_meta(self, key: str) -> str | None:
-        with self._lock:
-            return self._meta.get(key)
-
-    def set_meta(self, key: str, value: str) -> None:
-        with self._lock:
-            self._meta[key] = str(value)
+    # 增量入队 -------------------------------------------------------
 
     def enqueue_jobs(self, jobs: list[dict[str, Any]], *, front: bool = False) -> list[str]:
         if not jobs:
@@ -286,9 +254,11 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             existing = {uid_from_job_dict(j) for j in self._queue}
             fresh: list[dict[str, Any]] = []
-            batch_seen = set()
+            batch_seen: set[str] = set()
             for j in jobs:
                 u = uid_from_job_dict(j)
+                # 批次内重复（同一调用传相同 uid 两次）与队列中已有的
+                # uid 都跳过（首个存储，后续跳过）。
                 if u in existing or u in batch_seen:
                     continue
                 batch_seen.add(u)
@@ -300,6 +270,19 @@ class InMemoryStateBackend(AbstractStateBackend):
             else:
                 self._queue.extend(fresh)
             return [uid_from_job_dict(j) for j in fresh]
+
+    # 定向删除与种子 --------------------------------------------------
+
+    def delete_queue_uids(self, uids: list[str]) -> int:
+        """按 uid 定向批量删除队列条目，与 SQLite 腿同语义：不触碰其余条目。"""
+        if not uids:
+            return 0
+        with self._lock:
+            del_set = set(uids)
+            kept = [j for j in self._queue if uid_from_job_dict(j) not in del_set]
+            removed = len(self._queue) - len(kept)
+            self._queue = kept
+            return removed
 
     def delete_failed(self, uids: list[str]) -> int:
         with self._lock:
@@ -326,7 +309,8 @@ class InMemoryStateBackend(AbstractStateBackend):
         """把 uid 批量写入 wall（meta 空 dict）。
 
         不变式：wall/failed 全局互斥——已在 failed 的 uid 拒绝种子；
-        先查后写（同锁内），冲突整体拒绝、零写入，不静默清除 DLQ 记录。
+        先查后写（同锁内），冲突整体拒绝、零写入，不静默清除失败档案
+        记录（失败历史须先经 delete_failed 显式清除）。
         """
         with self._lock:
             conflict = sorted({u for u in uids if u in self._failed})
@@ -345,7 +329,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         """预填一个 cursor（UPSERT，幂等）。
 
         与 SQLiteStateBackend.seed_cursor 同契约 fail-loud：key 非空 str、
-        value 必须 str——静默 str() 强转会让同一非法入参在本腿写 '123'、
+        value 必须 str——静默 str() 强转会让同一非法入参在本腿写数字串、
         sqlite 腿抛异常（跨后端行为分歧），且与内存镜像值型漂移。
         """
         if not isinstance(key, str) or not key:
@@ -354,3 +338,60 @@ class InMemoryStateBackend(AbstractStateBackend):
             raise TypeError(f"cursor value must be str, got {type(value).__name__}")
         with self._lock:
             self._cursors[key] = value
+
+    # 尝试轨迹（append-only 旁路观测面）--------------------------------
+
+    def append_attempt(self, record: AttemptRecord) -> int:
+        """派发即插行：分配自增轨迹 id 并落内存表（单语句语义，无读-改-写窗口）。"""
+        validate_attempt_dispatch(record)
+        with self._lock:
+            attempt_id = self._attempt_seq
+            self._attempt_seq += 1
+            self._attempts[attempt_id] = record
+            return attempt_id
+
+    def update_attempt(
+        self,
+        attempt_id: int,
+        *,
+        outcome: str,
+        finished_at: str,
+        error: str | None = None,
+    ) -> bool:
+        """收尾轨迹行：仅允许把 running 行收敛为终态一次。
+
+        读-判-写在锁内串行完成；目标 id 不存在返回 False，对已收尾行
+        再次收尾抛 ValueError（双重终结是调用方协议缺陷，fail-loud）。
+        """
+        validate_attempt_finish(outcome, finished_at, error)
+        with self._lock:
+            current = self._attempts.get(attempt_id)
+            if current is None:
+                return False
+            if current.outcome != "running":
+                raise ValueError(
+                    f"attempt {attempt_id} already finalized with outcome "
+                    f"{current.outcome!r}; double finalization is a protocol violation"
+                )
+            self._attempts[attempt_id] = replace(
+                current, outcome=outcome, finished_at=finished_at, error=error
+            )
+            return True
+
+    def load_attempts(self, job_uid: str) -> list[AttemptRecord]:
+        """按 job_uid 读取轨迹（dict 插入序 = 自增 id 序）。"""
+        with self._lock:
+            return [rec for rec in self._attempts.values() if rec.job_uid == job_uid]
+
+    # 元数据 ---------------------------------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        with self._lock:
+            return self._meta.get(key)
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._meta[key] = str(value)
+
+
+__all__ = ["InMemoryStateBackend"]

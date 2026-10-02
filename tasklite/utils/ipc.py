@@ -1,11 +1,21 @@
-"""文件级 IPC 与产物清单管理：输入/输出/信号/结果声明、沙盒校验、指纹采集与生命周期清理。
+"""v2 文件级 IPC 与产物清单：声明读写、结果落盘降级、信号排空与生命周期清理。
 
 统一内敛文件级 IPC 与产物清单的完整生命周期管理：
-- 路径与沙盒校验：跨盘多根沙盒匹配、空字节防御、相对路径规范重定位；
-- 声明追加落盘：输入（文件 stat 指纹 / URI 声明）、输出（产物 / 临时 cache 声明）、挂起信号；
-- 结果落盘与降级：原子写 (fsync + replace)、两级降级、坏行/损坏容灾解析；
-- 校验与排空读取：产物存在性校验（忽略 cache）、信号原子排空（truncate + unlink）、残留结果认领；
-- 产物与 IPC 生命周期清理：按 PRE_SUBMIT / SUCCESS / FAILURE_OR_RETRY 模式清理临时文件与声明。
+
+- 路径与沙盒校验：空字节防御、跨盘多根沙盒匹配、相对路径规范重定位；
+- 声明追加落盘：输入（文件 stat 指纹 / URI 声明）、输出（产物 / 临时
+  cache 声明）、挂起信号；
+- 结果落盘与降级：原子写（fsync + replace）、两级降级、坏行/损坏容灾
+  解析；瞬态信号（interrupted / lock_conflict / rate_limited）的降级
+  保真——``transient_kind`` 结构化字段随降级继承，瞬态军规全链不失效；
+- 校验与排空读取：产物存在性校验（忽略 cache）、信号原子排空（rename
+  摘除 + 孤儿回收）、残留结果认领（``claim_stale_result_payload``，
+  与 channel 层认领入口同名异构消歧）；
+- 产物与 IPC 生命周期清理：按 PRE_SUBMIT / SUCCESS / FAILURE_OR_RETRY
+  模式清理临时文件与声明，删除前消费侧沙盒归属复检。
+
+分层红线：本模块是模型层（JobContext）的 IPC 声明读写下沉点；瞬态信号
+落盘即回队——本层严禁出现任何重试节奏语义（节奏归 RequeuePolicy）。
 """
 
 from __future__ import annotations
@@ -14,19 +24,19 @@ import enum
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import shutil
 import time
+from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import unquote
 
-from .injective import safe_uid_filename
+from .encoding import safe_uid_filename
 from .jsonutil import dump, dumps, load, loads
 
 logger = logging.getLogger("tasklite")
 
-# 声明/信号/结果文件的扩展名与模式
+# 声明/信号/结果文件的扩展名与锚定模式
 _SIGNALS_SUFFIX = ".signals.jsonl"
 _OUTPUTS_SUFFIX = ".outputs.jsonl"
 _INPUTS_SUFFIX = ".inputs.jsonl"
@@ -38,14 +48,19 @@ _RAW_TUPLE_SENTINEL = "__tl_tuple_v1"
 
 
 def encode_raw_result(raw_result: Any) -> Any:
-    """编码 handler 返回值以便 JSON 落盘。"""
+    """编码 handler 返回值以便 JSON 落盘（tuple 经哨兵标记还原）。"""
     if isinstance(raw_result, tuple):
         return [_RAW_TUPLE_SENTINEL, list(raw_result)]
     return raw_result
 
 
 def decode_raw_result(encoded: Any) -> Any:
-    """读取结果文件后还原 handler 返回值。"""
+    """读取结果文件后还原 handler 返回值。
+
+    哨兵碰撞防御：用户返回值恰好形如 ``[哨兵, x]`` 且还原段非 list/tuple
+    时原样返回——强行 ``tuple(x)`` 会在非序列还原段上抛 TypeError 穿透
+    收割链（单任务损坏放大为整管崩溃）。
+    """
     if (
         isinstance(encoded, list)
         and len(encoded) == 2
@@ -58,16 +73,17 @@ def decode_raw_result(encoded: Any) -> Any:
 
 class ArtifactCleanupMode(str, enum.Enum):
     """产物生命周期清理模式。"""
+
     PRE_SUBMIT = "pre_submit"
     SUCCESS = "success"
     FAILURE_OR_RETRY = "failure_retry"
 
 
 class ArtifactJournal:
-    """产物清单与文件级 IPC 深模块。
+    """产物清单与文件级 IPC 声明深模块。
 
-    对外提供极简高层操作，封装沙盒越界防御、stat 指纹采集、坏行容灾解析、
-    原子清空、结果原子落盘/降级与多模式文件生命周期清理逻辑。
+    对外提供极简高层操作，封装沙盒越界防御、stat 指纹采集、坏行容灾
+    解析、原子清空、结果原子落盘/降级与多模式文件生命周期清理逻辑。
     """
 
     def __init__(
@@ -118,7 +134,12 @@ class ArtifactJournal:
         return Path(self.ipc_dir) / f"{safe_uid_filename(uid)}{suffix}"
 
     def iter_stale_result_paths(self, uid: str) -> list[Path]:
-        """枚举某个 uid 的全部残留结果文件路径。"""
+        """枚举某个 uid 的全部残留结果文件路径（锚定 incarnation 形态）。
+
+        不变式：job_id 可含点，glob ``{uid}.*`` 会命中点后缀兄弟 uid
+        （如 ``h::a`` 与 ``h::a.b``）的文件——必须以 incarnation 正则
+        在 base 之后锚定匹配，防误认/误删兄弟 uid 的结果。
+        """
         if self.ipc_dir is None:
             return []
         d = Path(self.ipc_dir)
@@ -139,6 +160,7 @@ class ArtifactJournal:
     def resolve_and_validate_path(
         raw_path: str | Path,
         output_roots: Path | Sequence[Path] | None = None,
+        *,
         sandbox: bool = True,
     ) -> str:
         """解析声明路径为规范绝对路径（沙盒校验 + 相对重定位共用逻辑）。"""
@@ -174,10 +196,10 @@ class ArtifactJournal:
         except (OSError, RuntimeError):
             return os.path.abspath(str(p))
 
-    # ── 声明追加写入（子进程 Worker 侧）───────────────────────────
+    # ── 声明追加写入（Worker 侧）─────────────────────────────────
 
     def record_output(
-        self, uid: str, out_path: str, cleanup: bool = True, kind: str = "output"
+        self, uid: str, out_path: str, *, cleanup: bool = True, kind: str = "output"
     ) -> None:
         """追加一条输出声明到落盘文件（失败静默，尽力而为）。"""
         if self.ipc_dir is None:
@@ -232,7 +254,11 @@ class ArtifactJournal:
         return entry
 
     def record_signal(self, uid: str, r_name: str, secs: float) -> None:
-        """追加一条 suspend 信号到 signals 文件。"""
+        """追加一条 suspend 信号到 signals 文件。
+
+        信号立即落盘 flush——即使 handler 随后崩溃/超时，限流信息也不
+        丢失（进程被 kill 后文件仍在，信号不丢）。
+        """
         if self.ipc_dir is None:
             return
         path = self.signals_path(uid)
@@ -277,7 +303,12 @@ class ArtifactJournal:
     def write_result_with_degradation(
         self, uid: str, payload: dict[str, Any], incarnation: str | None = None
     ) -> None:
-        """worker 结果落盘的唯一出口：完整写失败时两级降级，绝不裸抛 OSError。"""
+        """worker 结果落盘的唯一出口：完整写失败时两级降级，绝不裸抛 OSError。
+
+        降级语义：完整写 → 短暂停顿后重试完整写 → 降级写最小结果
+        （success 改写 retry 让 job 重跑，其他 status 保持原语义）→
+        仍失败记 error 后放弃（worker 无结果退出，收割按崩溃语义处理）。
+        """
         try:
             self.write_result_atomic(uid, payload, incarnation=incarnation)
             return
@@ -300,8 +331,8 @@ class ArtifactJournal:
             "status": degraded_status,
             "error": f"IPC_RESULT_WRITE_DEGRADED: {write_err}",
         }
-        # 认证令牌随降级继承：读取侧强校验下丢令牌的降级结果会被误拒，
-        # transient_kind 的瞬态保真语义随之失效
+        # 认证令牌与瞬态种类随降级继承：读取侧强校验下丢令牌的降级结果
+        # 会被误拒，transient_kind 的瞬态保真语义（不烧预算）随之失效
         if "auth" in payload:
             degraded["auth"] = payload["auth"]
         if payload.get("transient_kind"):
@@ -316,7 +347,7 @@ class ArtifactJournal:
     # ── 读取与解析（父进程 Engine 侧）─────────────────────────────
 
     def read_inputs(self, uid: str) -> list[dict]:
-        """读取一个 job 的全部输入声明。"""
+        """读取一个 job 的全部输入声明（坏行容灾跳过）。"""
         if self.ipc_dir is None:
             return []
         path = self.inputs_path(uid)
@@ -507,7 +538,7 @@ class ArtifactJournal:
     def read_result(
         self, path_or_uid: str | Path, incarnation: str | None = None
     ) -> dict | None:
-        """读取结果文件；损坏/不存在返回 None。"""
+        """读取结果文件；损坏/不存在返回 None（宁可重跑，不可崩）。"""
         if isinstance(path_or_uid, Path):
             path = path_or_uid
         elif "/" in str(path_or_uid) or "\\" in str(path_or_uid):
@@ -528,25 +559,21 @@ class ArtifactJournal:
             logger.warning(f"Corrupt result file {path}: {e}, ignoring")
             return None
 
-    def claim_stale_result(self, uid: str) -> dict | None:
-        """认领并读取遗留的已落盘残留结果，清理其余过期结果。"""
+    def claim_stale_result_payload(self, uid: str) -> dict | None:
+        """认领并读取遗留的已落盘残留结果，清理其余过期结果。
+
+        只消费 final 结果文件——.tmp 残留可能是孤儿 worker 正在写的
+        半成品，读部分 JSON 返回 None 后 unlink 正在写的文件会让孤儿
+        的 os.replace 抛 FileNotFoundError。残留取舍以
+        (mtime_ns, incarnation_seq) 决胜：秒级 mtime 同刻不稳定，最新
+        执行代的 seq 是第二决胜键。
+        """
         res_paths = self.iter_stale_result_paths(uid)
         res_paths = [p for p in res_paths if p.name.endswith(_RESULT_SUFFIX)]
         if not res_paths:
             return None
 
-        def _freshness_key(p: Path) -> tuple[int, int]:
-            try:
-                mtime_ns = p.stat().st_mtime_ns
-            except OSError:
-                mtime_ns = -1
-            try:
-                seq = int(p.name.removesuffix(_RESULT_SUFFIX).rsplit(".", 1)[-1])
-            except (ValueError, IndexError):
-                seq = -1
-            return (mtime_ns, seq)
-
-        res_path = max(res_paths, key=_freshness_key)
+        res_path = max(res_paths, key=self._freshness_key)
         res = self.read_result(res_path)
         for p in res_paths:
             try:
@@ -560,6 +587,22 @@ class ArtifactJournal:
             )
             return None
         return res
+
+    @staticmethod
+    def _freshness_key(p: Path) -> tuple[int, int]:
+        """残留结果新鲜度键 (mtime_ns, incarnation_seq)。"""
+
+        def _seq_of(path: Path) -> int:
+            try:
+                return int(path.name.removesuffix(_RESULT_SUFFIX).rsplit(".", 1)[-1])
+            except (ValueError, IndexError):
+                return -1
+
+        try:
+            mtime_ns = p.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = -1
+        return (mtime_ns, _seq_of(p))
 
     # ── 产物校验与生命周期清理 ────────────────────────────────────
 
@@ -698,4 +741,3 @@ __all__ = [
     "encode_raw_result",
     "decode_raw_result",
 ]
-

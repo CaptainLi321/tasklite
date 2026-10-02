@@ -1,15 +1,20 @@
-"""跨平台文件锁 + uid→文件名安全映射（flock 孤儿探测）。
+"""v2 跨平台单文件锁：uid→锁文件映射与孤儿探测（flock 互斥）。
 
 设计约束：
-- **worker 持锁、主进程仅探测**——锁的生命周期 = 执行体生命周期。主进程
-  持锁会在其崩溃时释放（fd 关闭 → 内核释放 flock），孤儿 worker 仍活着
-  锁却空闲 → 新 run 探测通过 → 双跑（正是要防的场景）。
-- 锁文件 `{uid}.lock` 永不删除（unlink 后新进程 create 同名文件拿到的是
+- **worker 持锁、主进程仅探测**——不变式：锁生命周期严格等于子进程执行体
+  生命周期。主进程持锁会在其崩溃时释放（fd 关闭 → 内核释放 flock），孤儿
+  worker 仍活着锁却空闲 → 新 run 探测通过 → 双跑（正是要防的场景）。
+- 锁文件 ``{uid}.lock`` 永不删除（unlink 后新进程 create 同名文件拿到的是
   新 inode 的锁，与旧持锁者不互斥——经典 unlink-recreate 竞争）。空文件
   累积可接受，pipeline 停止时可整目录离线清理。
-- uid 含 ``::``（Windows 文件名禁 ``:``）→ 统一转义为安全字符，供锁文件
-  与 executor 的 result/signals/outputs 文件名共享（不得另造一套映射；
-  同时保证 fence 结果文件名的 Windows 兼容）。
+- uid 派生锁文件名复用 ``encoding.safe_uid_filename`` 单射编码（不得另造
+  一套映射）。单射性证明关键点：**先转义 ``%`` 为 ``%25``、后转义 ``::``
+  为 ``%3A%3A``**——若先转义 ``::``，输入 ``t::x::y`` 与字面
+  ``t%3A%3Ax%3A%3Ay`` 会在第二步碰撞同像，多对一映射使锁文件互串；
+  转义符优先转义保证输出中 ``%`` 唯一引导一个 %XX 序列，解码可逆。
+- 锁冲突（``lock_conflict``）是瞬态信号：不烧重试预算、降级写盘回队、
+  零污染；锁路径环境故障（OSError）与「锁被占」语义不同——环境故障
+  fail-soft 上抛供调用方按同构瞬态信号降级，不得混入 None 静默重试。
 """
 from __future__ import annotations
 
@@ -17,12 +22,11 @@ import os
 import time
 from pathlib import Path
 
-
-from .injective import safe_uid_filename
-
+from .encoding import safe_uid_filename
 
 
 def _lock_path(ipc_dir: str, uid: str) -> Path:
+    """uid → 锁文件路径（与 result/signals/outputs 共享单射文件名映射）。"""
     return Path(ipc_dir) / f"{safe_uid_filename(uid)}.lock"
 
 
@@ -99,11 +103,19 @@ def release_lock(fd: int) -> None:
 def probe_lock(ipc_dir: str, uid: str) -> bool:
     """主进程探测：非阻塞试锁，成功即释放，返回「无其他执行体持锁」。
 
-    仅用于判断孤儿 worker 是否存活——探测成功释放锁，
-    不持有。探测失败（孤儿持锁）→ 调用方 requeue + 短退避。
+    仅用于判断孤儿 worker 是否存活——探测成功释放锁，不持有。探测失败
+    （孤儿持锁）→ 调用方按 ``lock_conflict`` 瞬态信号 defer（不烧预算、
+    降级写盘、零污染），节奏归 RequeuePolicy。
     """
     fd = try_acquire_lock(ipc_dir, uid)
     if fd is None:
         return False
     release_lock(fd)
     return True
+
+
+__all__ = [
+    "probe_lock",
+    "release_lock",
+    "try_acquire_lock",
+]

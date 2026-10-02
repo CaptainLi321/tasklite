@@ -1,19 +1,19 @@
-"""Mutable pipeline state container.
+"""v2 可变管线状态容器（wall / failed / cursors / queue / in-flight）。
 
-Single-threaded event loop; immutability is unnecessary. Three contracts
-govern consistency:
-  1. In-memory queue = on-disk queue minus in-flight jobs.
-  2. wall/failed/cursors advance only after backend commit returns True.
-  3. ``_run_body`` repairs residual drift by filtering queue against
-     wall/failed on load (at-least-once backstop).
+单线程事件循环，无需不可变化。三条一致性契约：
+  1. 内存队列 = 落盘队列 − in-flight 作业。
+  2. wall/failed/cursors 只在后端 commit 返回 True 之后推进。
+  3. 加载期由恢复编排层过滤 queue 对 wall/failed 的残留漂移
+     （at-least-once 兜底）。
 
-All mutations are in-place; queue changes go through the three methods
-(``pop_job``/``spawn_jobs``/``requeue_jobs``) so ``_queue_uids`` never drifts.
+所有变更原地进行；队列变更只经三个受控方法（``pop_job`` /
+``spawn_jobs`` / ``requeue_jobs``），``_queue_uids`` 永不漂移。
 """
 from __future__ import annotations
 
 import copy
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from .job import Job, RERUN_EXEMPT_VALUES
 
@@ -39,9 +39,9 @@ def uid_from_job_dict(job_dict: dict) -> str:
 
 
 class PipelineState:
-    """Mutable pipeline state: wall/failed/cursors dicts + queue list.
+    """可变管线状态：wall/failed/cursors 三个 dict + queue 列表。
 
-    All operations are in-place, O(1)/O(k)。维护 ``_queue_uids``/``_wall_uids``/
+    所有操作原地进行，O(1)/O(k)。维护 ``_queue_uids``/``_wall_uids``/
     ``_failed_uids`` 增量 uid 索引。所有状态转移必须经由受控方法。
     """
 
@@ -56,11 +56,11 @@ class PipelineState:
         self._failed: dict[str, dict[str, Any]] = dict(failed)
         self._cursors: dict[str, str] = dict(cursors)
         self._queue: list[dict] = list(queue)
-        self._wall_uids: set = set(self._wall)
-        self._failed_uids: set = set(self._failed)
-        self._queue_uids: set = {uid_from_job_dict(j) for j in self._queue}
-        self._in_flight_uids: set = set()
-        self._rerun_active_uids: set = set()
+        self._wall_uids: set[str] = set(self._wall)
+        self._failed_uids: set[str] = set(self._failed)
+        self._queue_uids: set[str] = {uid_from_job_dict(j) for j in self._queue}
+        self._in_flight_uids: set[str] = set()
+        self._rerun_active_uids: set[str] = set()
         for j in self._queue:
             if _is_rerun_exempt(j):
                 self._rerun_active_uids.add(uid_from_job_dict(j))
@@ -99,7 +99,7 @@ class PipelineState:
         return job_dict
 
     def spawn_jobs(self, job_dicts: list[dict[str, Any]], front: bool = True) -> None:
-        """批量入队（spawn 默认队首，preserving order），逐条同步 uid。"""
+        """批量入队（spawn 默认队首插队，保序），逐条同步 uid。"""
         if front:
             self._queue[0:0] = list(job_dicts)
         else:
@@ -119,7 +119,7 @@ class PipelineState:
         """登记派发期准入放行的重跑豁免 uid。
 
         不变式：豁免集合与准入判定同源——字面 rerun 键由 pop_job/
-        spawn_jobs 登记，准入层按含 discovery 默认策略的有效策略放行的
+        spawn_jobs 登记，准入层按含任务级默认策略的有效策略放行的
         重跑由此登记；缺任一登记，in-flight 登记的全量互斥断言都会把
         合法重跑误判为 wall/failed ∩ in-flight 违例。
         """
@@ -141,7 +141,7 @@ class PipelineState:
             self._assert_state_consistent()
 
     def clear_in_flight(self) -> None:
-        """清空 in-flight 集合（_abort_in_flight 使用）。"""
+        """清空 in-flight 集合（中止回收路径使用）。"""
         self._in_flight_uids.clear()
         self._rerun_active_uids = {
             uid_from_job_dict(j) for j in self._queue
@@ -163,9 +163,9 @@ class PipelineState:
 
     # 级联失败（按需计算反向依赖）-------------------------------
 
-    def _build_dependents(self) -> dict[str, set]:
+    def _build_dependents(self) -> dict[str, set[str]]:
         """按需从当前 _queue 构建反向依赖索引 dependents[dep_uid] -> {job_uid...}。"""
-        dependents: dict[str, set] = {}
+        dependents: dict[str, set[str]] = {}
         for jd in self._queue:
             try:
                 job = Job.from_dict(jd)
@@ -176,7 +176,7 @@ class PipelineState:
                 dependents.setdefault(dep_uid, set()).add(job_uid)
         return dependents
 
-    def fail_cascade(self, failed_uid: str) -> list[str]:
+    def cascade_fail(self, failed_uid: str) -> list[str]:
         """沿反向依赖递归标记下游为级联失败。"""
         dependents = self._build_dependents()
         cascade: list[str] = []
@@ -196,12 +196,12 @@ class PipelineState:
         """在当前 _queue 的依赖图中找出所有依赖环成员。
 
         不变式：返回值为每次回边命中时「DFS 当前路径自闭点起的切片 + 闭点重复」
-        按遍历序的拼接，governor 死锁归因依赖该精确口径（成员、顺序、重复闭点）。
+        按遍历序的拼接，死锁治理器的归因依赖该精确口径（成员、顺序、重复闭点）。
         实现为显式栈仿真调用栈：栈帧持有节点的依赖迭代器，弹帧即回溯置黑，
         遍历序与递归形式逐一致且深度不受解释器递归上限约束——深链队列
         （深度超递归限制）不得因环检测本身崩溃。
         """
-        edges: dict[str, set] = {}
+        edges: dict[str, set[str]] = {}
         for jd in self._queue:
             try:
                 job = Job.from_dict(jd)
@@ -255,7 +255,7 @@ class PipelineState:
             self._assert_terminal_uids_consistent()
 
     def mark_failed(self, uid: str, meta: dict[str, Any]) -> None:
-        """终态转移：uid → failed（DLQ）。单一入口维护 wall/failed 索引。"""
+        """终态转移：uid → failed（失败档案）。单一入口维护 wall/failed 索引。"""
         self._wall.pop(uid, None)
         self._wall_uids.discard(uid)
         self._failed[uid] = copy.deepcopy(meta)
@@ -301,17 +301,17 @@ class PipelineState:
     # 只读访问 ----------------------------------------------------
 
     @property
-    def queue_uids(self) -> set:
+    def queue_uids(self) -> set[str]:
         """队列 uid 的活索引。"""
         return self._queue_uids
 
     @property
-    def wall_uids(self) -> set:
+    def wall_uids(self) -> set[str]:
         """wall 终态 uid 的活索引。"""
         return self._wall_uids
 
     @property
-    def failed_uids(self) -> set:
+    def failed_uids(self) -> set[str]:
         """failed 终态 uid 的活索引。"""
         return self._failed_uids
 
@@ -341,7 +341,7 @@ class PipelineState:
 
     # 内部 ---------------------------------------------------------
 
-    def _rerun_exempt_uids_from_queue(self) -> set:
+    def _rerun_exempt_uids_from_queue(self) -> set[str]:
         """从 queue 事实源直接取重跑豁免集合，不依赖派生缓存
         ``_rerun_active_uids``（缓存被瞬态路径误删时断言不得误报）。"""
         return {
@@ -387,3 +387,9 @@ class PipelineState:
         )
         self._assert_uids_consistent()
         self._assert_terminal_uids_consistent()
+
+
+__all__ = [
+    "PipelineState",
+    "uid_from_job_dict",
+]

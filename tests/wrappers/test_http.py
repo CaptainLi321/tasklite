@@ -1,17 +1,21 @@
+"""v2 HTTP 包装器测试：Cookie 工具 / 分类守卫 / 快照存储 / 执行器 / 内置 fetch。
+
+移植 v1 同源测试并按 v2 命名面改写：fetch_urllib → urllib_fetch、
+fetch_requests → requests_fetch、guarded_fetch → guarded；本地重试
+等待基数参数按 v2 词汇表命名（retry_delay_base）。
+"""
 from __future__ import annotations
 
 import email.utils
 import io
-import json
 import math
 import socket
 import threading
 import time
 import urllib.error
-import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,13 +28,13 @@ from tasklite.wrappers.http import (
     MemorySnapshotStore,
     SQLiteSnapshotStore,
     SnapshotStore,
-    fetch_requests,
-    fetch_urllib,
     format_cookie_header,
     guard_request,
-    guarded_fetch,
+    guarded,
     http_guard,
     parse_netscape_cookies,
+    requests_fetch,
+    urllib_fetch,
 )
 
 
@@ -135,7 +139,7 @@ def test_http_policy_retry_after_parsing() -> None:
 def test_extract_retry_after_non_positive_returns_none() -> None:
     """0/负数/非有限数/过期 HTTP-Date 均为「无有效时长」，返回 None 而非 clamp 0.0。
 
-    不变式：仅正值具备挂起语义。TaskContext.suspend_resource 对 seconds<=0
+    不变式：仅正值具备挂起语义。JobContext.suspend_resource 对 seconds<=0
     fail-loud，clamp 放行的 0.0 会在守卫 __exit__ 内以 ValueError 替换限流信号。
     """
     policy = HttpPolicy()
@@ -153,7 +157,7 @@ def test_extract_retry_after_non_positive_returns_none() -> None:
 
 
 class _StrictSuspendCtx:
-    """与引擎 TaskContext.suspend_resource 入口校验同构的最小上下文。"""
+    """与引擎 JobContext.suspend_resource 入口校验同构的最小上下文。"""
 
     def __init__(self) -> None:
         self.calls: list = []
@@ -165,12 +169,12 @@ class _StrictSuspendCtx:
 
 
 @pytest.mark.parametrize("hdrs", [{"Retry-After": "0"}, {"Retry-After": "-3"}])
-def test_http_guard_invalid_retry_after_falls_back_to_default_ttl(hdrs: dict) -> None:
+def test_http_guard_invalid_retry_after_falls_to_default_ttl(hdrs: dict) -> None:
     """429 携带非法 Retry-After 时必须回落 default_suspend_ttl 并保持限流信号原样抛出。
 
     挂起信号必须以正时长落盘：若 0.0 直达 suspend_resource，入口 ValueError
     会替换 RateLimitHit，worker 兜底改写 error 终态——限流信号零落盘且任务
-    以 UNKNOWN 终态误入 DLQ 不再重试。
+    以 UNKNOWN 终态误入失败档案不再重试。
     """
     ctx = _StrictSuspendCtx()
     with pytest.raises(RateLimitHit):
@@ -211,8 +215,8 @@ def test_http_guard_rate_limit_and_suspend() -> None:
 def test_http_guard_nested_inner_without_ctx_defers_suspension_to_outer() -> None:
     """内层守卫无 ctx/resource 时不得置位 _suspended，挂起信号须由外层守卫落盘。
 
-    API_GUIDE 场景 4 官方组合（外层带 ctx 守卫 + store.cached(fetch_urllib)）：
-    fetch_urllib 的内层守卫 ctx=None，若其无条件置位 _suspended，外层会误判
+    官方组合（外层带 ctx 守卫 + store.cached(urllib_fetch)）：
+    urllib_fetch 的内层守卫 ctx=None，若其无条件置位 _suspended，外层会误判
     「已挂起」而跳过 suspend_resource——限流闭环静默失效，管线全速猛打被限流 API。
     """
     ctx = _StrictSuspendCtx()
@@ -397,7 +401,7 @@ def test_check_response_accepts_classifier_subclasses() -> None:
 
     status_classifier 返回自定义 FatalError 子类属签名的自然用法；若以
     `cls is FatalError` 分派则三分类全不命中，401 错误响应被静默作为
-    成功返回，错误既不上抛也不进死信队列。
+    成功返回，错误既不上抛也不进失败档案。
     """
     fatal_policy = HttpPolicy(
         status_classifier=lambda code, resp: _CustomFatal if code == 401 else None
@@ -477,21 +481,21 @@ def test_guard_request_retry_loop() -> None:
             raise ConnectionResetError("Connection reset by peer")
         return HttpResponse(status_code=200, headers={}, body=b"success")
 
-    # 配置 max_retries=2, backoff=0.01 快速就地重试成功
-    resp = guard_request(flaky_request, max_retries=2, backoff=0.01)
+    # 配置 max_retries=2, retry_delay_base=0.01 快速就地重试成功
+    resp = guard_request(flaky_request, max_retries=2, retry_delay_base=0.01)
     assert resp.status_code == 200
     assert attempts == 3
 
     # 重试耗尽时抛出 RetryError
     attempts = 0
     with pytest.raises(RetryError):
-        guard_request(flaky_request, max_retries=1, backoff=0.01)
+        guard_request(flaky_request, max_retries=1, retry_delay_base=0.01)
 
 
-def test_guarded_fetch_decorator() -> None:
+def test_guarded_decorator() -> None:
     mock_ctx = MagicMock()
 
-    @guarded_fetch(ctx=mock_ctx, resource="api_danbooru", default_suspend_ttl=45.0)
+    @guarded(ctx=mock_ctx, resource="api_danbooru", default_suspend_ttl=45.0)
     def fetch_something() -> HttpResponse:
         return HttpResponse(status_code=429, headers={}, body=b"rate limited")
 
@@ -633,7 +637,7 @@ def test_snapshot_store_cached_decorator(tmp_path: Path) -> None:
 def test_snapshot_cached_distinguishes_json_data_posts() -> None:
     """同 URL 不同 json_data 的 POST 必须各发一次真实网络请求（Body 单射哈希契约）。
 
-    json_data 是 fetch_requests 的 JSON 请求体参数名，若未纳入快照 key，
+    json_data 是 requests_fetch 的 JSON 请求体参数名，若未纳入快照 key，
     不同 JSON 体将共享同一 key 并静默命中首个请求的响应。
     """
     request_count = {"n": 0}
@@ -657,7 +661,7 @@ def test_snapshot_cached_distinguishes_json_data_posts() -> None:
     try:
         base_url = f"http://127.0.0.1:{server.server_port}"
         store = MemorySnapshotStore()
-        cached_fetch = store.cached(fetch_requests)
+        cached_fetch = store.cached(requests_fetch)
 
         r1 = cached_fetch(f"{base_url}/api", method="POST", json_data={"action": "a"})
         r2 = cached_fetch(f"{base_url}/api", method="POST", json_data={"action": "another-with-longer-body"})
@@ -706,8 +710,8 @@ def test_snapshot_cached_body_params_fingerprint() -> None:
 def test_snapshot_cached_distinguishes_positional_args() -> None:
     """以位置实参传参的请求必须各自真实发起，禁止静默命中同一快照。
 
-    默认 key 纳入 bind 后的全部位置实参（与关键字参数同权重）：
-    遗漏位置实参时 page-2 会零网络零告警地命中 page-1 的快照。
+    默认 key 纳入全部位置实参（与关键字参数同权重）：遗漏位置实参时
+    page-2 会零网络零告警地命中 page-1 的快照。
     """
     call_count = 0
 
@@ -774,17 +778,17 @@ def test_snapshot_cached_distinguishes_identity_headers() -> None:
     assert call_count == 3
 
 
-def test_snapshot_cached_wrapped_fetch_urllib_429_suspension_reaches_outer_guard(
+def test_snapshot_cached_wrapped_urllib_fetch_429_suspension_reaches_outer_guard(
     local_http_server: str,
 ) -> None:
-    """store.cached(fetch_urllib) 嵌套外层带 ctx 守卫时，429 挂起信号必须穿透内层落盘。
+    """store.cached(urllib_fetch) 嵌套外层带 ctx 守卫时，429 挂起信号必须穿透内层落盘。
 
-    fetch_urllib 自带 ctx=None 内层守卫，该组合是 API_GUIDE 场景 4 的官方
-    推荐用法；挂起时长取自真实 Retry-After 响应头。
+    urllib_fetch 自带 ctx=None 内层守卫，该组合是官方推荐用法；
+    挂起时长取自真实 Retry-After 响应头。
     """
     store = MemorySnapshotStore()
     ctx = _StrictSuspendCtx()
-    cached_fetch = store.cached(fetch_urllib)
+    cached_fetch = store.cached(urllib_fetch)
 
     with pytest.raises(RateLimitHit):
         with http_guard(ctx=ctx, resource="api_feed", default_suspend_ttl=60.0):
@@ -916,7 +920,7 @@ def test_snapshot_cached_urllib_native_response_status_passthrough() -> None:
 
 
 # ==============================================================================
-# 6. 内置 fetch_urllib 与 本地 HTTP 服务测试
+# 6. 内置 urllib_fetch 与 本地 HTTP 服务测试
 # ==============================================================================
 
 class _TestHttpHandler(BaseHTTPRequestHandler):
@@ -965,15 +969,15 @@ def local_http_server():
     server.shutdown()
 
 
-def test_fetch_urllib_success(local_http_server: str) -> None:
-    resp = fetch_urllib(f"{local_http_server}/json")
+def test_urllib_fetch_success(local_http_server: str) -> None:
+    resp = urllib_fetch(f"{local_http_server}/json")
     assert resp.status_code == 200
     assert resp.ok is True
     assert resp.json() == {"status": "ok", "msg": "hello"}
 
 
-def test_fetch_urllib_post(local_http_server: str) -> None:
-    resp = fetch_urllib(
+def test_urllib_fetch_post(local_http_server: str) -> None:
+    resp = urllib_fetch(
         f"{local_http_server}/submit",
         method="POST",
         data={"user": "alice", "age": 25},
@@ -982,40 +986,40 @@ def test_fetch_urllib_post(local_http_server: str) -> None:
     assert resp.json()["received_bytes"] > 0
 
 
-def test_fetch_urllib_429_suspension(local_http_server: str) -> None:
+def test_urllib_fetch_429_suspension(local_http_server: str) -> None:
     mock_ctx = MagicMock()
     with pytest.raises(RateLimitHit):
-        fetch_urllib(f"{local_http_server}/429", ctx=mock_ctx, resource="api_local")
+        urllib_fetch(f"{local_http_server}/429", ctx=mock_ctx, resource="api_local")
     mock_ctx.suspend_resource.assert_called_once_with("api_local", 15.0)
 
 
-def test_fetch_urllib_500_retry(local_http_server: str) -> None:
+def test_urllib_fetch_500_retry(local_http_server: str) -> None:
     with pytest.raises(RetryError):
-        fetch_urllib(f"{local_http_server}/500")
+        urllib_fetch(f"{local_http_server}/500")
 
 
-def test_fetch_urllib_404_fatal(local_http_server: str) -> None:
+def test_urllib_fetch_404_fatal(local_http_server: str) -> None:
     with pytest.raises(FatalError):
-        fetch_urllib(f"{local_http_server}/non_existent")
+        urllib_fetch(f"{local_http_server}/non_existent")
 
 
-def test_fetch_urllib_drops_none_params_like_requests(local_http_server: str) -> None:
+def test_urllib_fetch_drops_none_params_like_requests(local_http_server: str) -> None:
     """params None 值与 requests 语义对齐丢弃：不上链，快照 key 与省略等价。
 
-    requests 对 params={"k": None} 直接丢弃该参数；若 fetch_urllib 以
+    requests 对 params={"k": None} 直接丢弃该参数；若 urllib_fetch 以
     str(v) 拼接上链，同一 params 映射在两后端线上请求不同而快照 key 相同，
     共用同一 SnapshotStore 的混用脚本会静默串快照。
     """
-    resp = fetch_urllib(f"{local_http_server}/echo", params={"k": None, "a": "1"})
+    resp = urllib_fetch(f"{local_http_server}/echo", params={"k": None, "a": "1"})
     assert resp.text == "/echo?a=1"
 
 
-def test_fetch_urllib_bad_status_line_raises_retry_error() -> None:
+def test_urllib_fetch_bad_status_line_raises_retry_error() -> None:
     """残缺状态行（源站/代理提前断连）必须转换为 RetryError 退避重试。
 
     urllib 的 do_open 只把 OSError 包装为 URLError，残缺状态行在
     getresponse 阶段以裸 BadStatusLine 抛出——守卫必须将其归为瞬态，
-    不得放行裸异常（零重试直送死信队列）。
+    不得放行裸异常（零重试直送失败档案）。
     """
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
@@ -1042,27 +1046,27 @@ def test_fetch_urllib_bad_status_line_raises_retry_error() -> None:
     assert started.wait(timeout=5)
     try:
         with pytest.raises(RetryError):
-            fetch_urllib(f"http://127.0.0.1:{port}/x", timeout=5.0)
+            urllib_fetch(f"http://127.0.0.1:{port}/x", timeout=5.0)
     finally:
         t.join(timeout=5)
 
 
-def test_fetch_requests_success(local_http_server: str) -> None:
-    resp = fetch_requests(f"{local_http_server}/json")
+def test_requests_fetch_success(local_http_server: str) -> None:
+    resp = requests_fetch(f"{local_http_server}/json")
     assert resp.status_code == 200
     assert resp.ok is True
     assert resp.json() == {"status": "ok", "msg": "hello"}
 
 
-def test_fetch_requests_429_suspension(local_http_server: str) -> None:
+def test_requests_fetch_429_suspension(local_http_server: str) -> None:
     mock_ctx = MagicMock()
     with pytest.raises(RateLimitHit):
-        fetch_requests(f"{local_http_server}/429", ctx=mock_ctx, resource="api_req")
+        requests_fetch(f"{local_http_server}/429", ctx=mock_ctx, resource="api_req")
     mock_ctx.suspend_resource.assert_called_once_with("api_req", 15.0)
 
 
 # ==============================================================================
-# 5. HttpExecutor 深模块测试
+# 7. HttpExecutor 深模块测试
 # ==============================================================================
 
 class TestHttpExecutor:
@@ -1124,11 +1128,11 @@ class TestHttpExecutor:
         """429 必须命中 RateLimitHit 专用分支直接上抛，禁止落入本地重试循环。
 
         不变式：RateLimitHit 是 RetryError 子类，except 顺序颠倒会把限流吞进
-        本地线性微退避——无视 Retry-After 猛打限流端点，且挂起信号逐 attempt
-        重复落盘。限流等待唯一交由引擎挂起收敛。
+        本地线性微等待重试——无视 Retry-After 猛打限流端点，且挂起信号逐
+        attempt 重复落盘。限流等待唯一交由引擎挂起收敛。
         """
         mock_ctx = MagicMock()
-        executor = HttpExecutor(ctx=mock_ctx, resource="api_x", max_retries=5, backoff=0.0)
+        executor = HttpExecutor(ctx=mock_ctx, resource="api_x", max_retries=5, retry_delay_base=0.0)
         call_count = 0
 
         def rate_limited_fetch(url: str):
@@ -1143,14 +1147,12 @@ class TestHttpExecutor:
         mock_ctx.suspend_resource.assert_called_once_with("api_x", 30.0)
 
 
-
-
 def test_http_guard_suspend_failure_preserves_rate_limit_signal() -> None:
-    """suspend_resource 抛 ValueError 时守卫__exit__ 不得以其覆盖限流信号。
+    """suspend_resource 抛 ValueError 时守卫 __exit__ 不得以其覆盖限流信号。
 
     资源名 typo（未注册名 fail-loud 的 ValueError）等挂起入口故障必须与
     限流信号本身解耦：ValueError 从 __exit__ 直接穿透会把瞬态 RateLimitHit
-    替换为普通异常（烧重试预算进 DLQ），且挂起信号丢失。挂起失败降级为
+    替换为普通异常（烧重试预算进失败档案），且挂起信号丢失。挂起失败降级为
     日志告警，_suspended 不置位，RateLimitHit 原样抛出。
     """
 
@@ -1189,14 +1191,14 @@ def test_http_guard_suspend_type_error_preserves_rate_limit_signal() -> None:
     assert exc_info.value is hit
 
 
-class TestHttpExecutorBackoffShape:
-    """HttpExecutor 本地重试退避形态（与引擎指数退避策略同形）。
+class TestHttpExecutorRetryWaitShape:
+    """HttpExecutor 本地重试等待形态（指数递增封顶 + 抖动）。
 
-    线性无上限退避（backoff*attempt）在大 max_retries 下累计睡眠巨大且
-    与引擎 backoff_base*2^n（封顶+抖动）策略不一致。
+    线性无上限等待（base×attempt）在大 max_retries 下累计睡眠巨大；
+    正确形状为 base×2^(n-1)（封顶 + ±25% 抖动）。
     """
 
-    def _run_with_capture(self, monkeypatch, max_retries, backoff):
+    def _run_with_capture(self, monkeypatch, max_retries, retry_delay_base):
         import tasklite.wrappers.http as http_mod
 
         sleeps: list = []
@@ -1214,29 +1216,28 @@ class TestHttpExecutorBackoffShape:
             calls["n"] += 1
             raise RetryError(f"transient #{calls['n']}")
 
-        executor = http_mod.HttpExecutor(max_retries=max_retries, backoff=backoff)
+        executor = http_mod.HttpExecutor(max_retries=max_retries, retry_delay_base=retry_delay_base)
         with pytest.raises(RetryError):
             executor.execute(_flaky)
         return sleeps
 
-    def test_retry_delays_follow_exponential_shape(self, monkeypatch):
-        """第 n 次重试等待 backoff*2^(n-1)（指数），而非线性 backoff*n。"""
-        sleeps = self._run_with_capture(monkeypatch, max_retries=4, backoff=1.0)
+    def test_retry_waits_follow_exponential_shape(self, monkeypatch):
+        """第 n 次重试等待 base×2^(n-1)（指数），而非线性 base×n。"""
+        sleeps = self._run_with_capture(monkeypatch, max_retries=4, retry_delay_base=1.0)
         assert sleeps == [1.0, 2.0, 4.0, 8.0]
 
-    def test_retry_delay_capped(self, monkeypatch):
-        """单次等待封顶，大 backoff/大 max_retries 不再产生巨量睡眠。"""
-        sleeps = self._run_with_capture(monkeypatch, max_retries=30, backoff=1000.0)
+    def test_retry_wait_capped(self, monkeypatch):
+        """单次等待封顶，大 base/大 max_retries 不再产生巨量睡眠。"""
+        sleeps = self._run_with_capture(monkeypatch, max_retries=30, retry_delay_base=1000.0)
         assert sleeps
         assert all(s <= 300.0 for s in sleeps)
         assert len(sleeps) == 30
 
-    def test_retry_delay_jittered(self, monkeypatch):
-        """抖动以 ±25% 延迟幅度作用于每次等待（与引擎抖动幅度一致）。"""
+    def test_retry_wait_jittered(self, monkeypatch):
+        """抖动以 ±25% 延迟幅度作用于每次等待。"""
         import tasklite.wrappers.http as http_mod
 
         jitter_calls: list = []
-        captured = {"delay": 0.0}
 
         def _fake_uniform(a, b):
             jitter_calls.append((a, b))
@@ -1248,11 +1249,11 @@ class TestHttpExecutorBackoffShape:
         def _flaky(*args, **kwargs):
             raise RetryError("transient")
 
-        executor = http_mod.HttpExecutor(max_retries=2, backoff=4.0)
+        executor = http_mod.HttpExecutor(max_retries=2, retry_delay_base=4.0)
         with pytest.raises(RetryError):
             executor.execute(_flaky)
 
-        # 与引擎 compute_backoff 同写法：uniform(-0.25, 0.25) 后乘延迟 d=4, 8
+        # 与等待计算同写法：uniform(-0.25, 0.25) 后乘延迟（base=4 → 4, 8）
         assert len(jitter_calls) == 2
         assert jitter_calls[0] == (-0.25, 0.25)
         assert jitter_calls[1] == (-0.25, 0.25)

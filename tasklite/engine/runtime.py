@@ -1,7 +1,8 @@
-"""EngineRuntime：TaskLite 核心运行期深模块（装配 + 薄事件泵）。
+"""EngineRuntime：v2 核心运行期深模块（装配 + 薄事件泵）。
 
-统一聚合主循环事件泵、五关预检派发、结果收敛事务、崩溃/停机恢复与在途追踪。
-装配快照见 RunConfig（engine/config.py）；一次 run 的生命周期状态与钩子
+统一聚合主循环事件泵（四相：填池派发 → 死锁仲裁 → 回收结算 → 等待
+决策）、五关预检派发、结果收敛事务、崩溃/停机恢复与在途追踪。装配
+快照见 RunConfig（engine/config.py）；一次 run 的生命周期状态与钩子
 单一出口见 RunSession（engine/session.py）。
 """
 from __future__ import annotations
@@ -13,11 +14,20 @@ import signal
 import time
 import traceback
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
-logger = logging.getLogger("tasklite")
-
-from .types import (  # noqa: E402
+from .config import RunConfig
+from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
+from .channel import ExecutionChannel
+from .completion import CompletionMachine
+from .errorclass import ErrorClassifier
+from .in_flight import InFlightTracker
+from .recovery import RecoveryOrchestrator
+from .scheduler import JobScheduler
+from .session import RunSession
+from .store import StateStore
+from .types import (
     ExecutionOptions,
     ExitReason,
     RunSummary,
@@ -25,91 +35,99 @@ from .types import (  # noqa: E402
     StopMode,
     TaskStats,
 )
+from .wait import LoopFacts, decide_wait
+from ..backend.base import AbstractStateBackend
+from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..models.state import PipelineState
+from ..utils.lockfile import release_lock, try_acquire_lock
 
-from .config import RunConfig  # noqa: E402
-from .pacing import LoopFacts, decide_wait  # noqa: E402
-from .store import StateStore  # noqa: E402
-from .channel import ExecutionChannel  # noqa: E402
-from .inflight import InFlightTracker  # noqa: E402
-from .scheduler import JobScheduler  # noqa: E402
-from .dispatch import DispatchMachine, DispatchOutcome  # noqa: E402
-from .session import RunSession  # noqa: E402
-from ..exceptions import _CommitCrashSignal, _JobTerminated  # noqa: E402
-from ..models.job import Job  # noqa: E402
-from ..models.state import PipelineState  # noqa: E402
-from ..taxonomy import ErrorTaxonomy  # noqa: E402
-from ..utils.lockfile import release_lock, try_acquire_lock  # noqa: E402
+logger = logging.getLogger("tasklite")
+
+# step() 单步派发上限缺省（显式上限由调用方传入）
+_UNBOUNDED_DISPATCH_LIMIT = 1_000_000
+
+
+@dataclass(frozen=True)
+class DeadlockArbitration:
+    """无可运行候选时死锁仲裁的命名结果。
+
+    - ``deadlock_detected``: 本拍是否判定并已熔断死锁（进失败档案）；
+    - ``should_terminate``: governor 独立终止信号（全队列熔断且队列清空）；
+    - ``wait_seconds``: 宽限/缺口重试的建议等待秒数（否则 0）。
+    """
+
+    deadlock_detected: bool
+    should_terminate: bool
+    wait_seconds: float
 
 
 class EngineRuntime:
-    """TaskLite 核心运行期深模块。
-
-    统一聚合主循环事件泵、五关预检派发、结果收敛事务、崩溃/停机恢复与在途追踪。
-    """
+    """v2 核心运行期深模块：装配机器群并驱动四相事件泵。"""
 
     def __init__(self, config: RunConfig) -> None:
-        from .completion import CompletionMachine
-        from .recovery import RecoveryOrchestrator
-
         self.config = config
-        self.backend = config.backend
-        self.handlers = config.handlers
-        self.scheduler = JobScheduler(resources=config.resources, handlers=config.handlers)
+        self.tasks = config.tasks
+        self.scheduler = JobScheduler(
+            resources=config.resources, ordering=config.ordering
+        )
         self.governor = config.governor
 
         # 持久会话：execute() 经 begin() 复位（语义等价于每次新建会话，
         # 同时保证机器持有的 session 引用跨 run 稳定）。
         self._session = RunSession(
             on_run_start=config.on_run_start,
-            on_job_completed=config.on_job_completed,
+            on_attempt_finished=config.on_attempt_finished,
             on_run_end=config.on_run_end,
         )
 
         # 构造期即建 StateStore（enqueue/OpsConsole 在 run 前可用）；
-        # on_job_completed 绑定会话方法——钩子后置变更即时生效。
+        # on_attempt_finished 绑定会话方法——钩子后置变更即时生效。
+        # backend 所有权唯一锚定 StateStore（RunConfig.backend 仅为构造
+        # 期装配快照的搬运通道），运行期一切读写经 store.backend 派生。
         self.store: StateStore = StateStore(
-            self.backend,
-            commit_failure_dlq_threshold=config.commit_failure_dlq_threshold,
-            taxonomy=config.taxonomy,
-            on_job_completed=self._session.fire_job_completed,
+            config.backend,
+            commit_failure_threshold=config.commit_failure_threshold,
+            classifier=config.classifier,
+            on_attempt_finished=self._session.fire_attempt_finished,
             stats=self._session.stats,
-            policy=config.policy,
+            rerun_policy=config.rerun_policy,
+            requeue_policy=config.requeue_policy,
         )
 
         self.channel: ExecutionChannel = config.channel
         self._in_flight: InFlightTracker = InFlightTracker()
 
-        # 构建机器依赖拓扑
+        # 构建机器依赖拓扑（recovery 依赖 completion；dispatch 依赖 recovery）
         self._completion = CompletionMachine(
             store=self.store,
-            policy=config.policy,
+            rerun_policy=config.rerun_policy,
             channel=self.channel,
             resources=config.resources,
             in_flight=self._in_flight,
             session=self._session,
-        )
-        self._dispatch = DispatchMachine(
-            store=self.store,
-            scheduler=self.scheduler,
-            policy=config.policy,
-            resources=config.resources,
-            channel=self.channel,
-            in_flight=self._in_flight,
-            session=self._session,
-            completion=self._completion,
-            handlers=config.handlers,
-            taxonomy=config.taxonomy,
-            output_root=config.output_root,
-            ipc_dir=config.ipc_dir,
-            commit_failure_dlq_threshold=config.commit_failure_dlq_threshold,
         )
         self._recovery = RecoveryOrchestrator(
             store=self.store,
             channel=self.channel,
             resources=config.resources,
             in_flight=self._in_flight,
-            policy=config.policy,
+            policy=config.rerun_policy,
             completion=self._completion,
+        )
+        self._dispatch = DispatchMachine(
+            store=self.store,
+            scheduler=self.scheduler,
+            rerun_policy=config.rerun_policy,
+            resources=config.resources,
+            channel=self.channel,
+            in_flight=self._in_flight,
+            session=self._session,
+            recovery=self._recovery,
+            tasks=config.tasks,
+            classifier=config.classifier,
+            output_root=config.output_root,
+            ipc_dir=config.ipc_dir,
+            commit_failure_threshold=config.commit_failure_threshold,
         )
 
         self._run_lock_fd: int | None = None
@@ -118,6 +136,15 @@ class EngineRuntime:
     @property
     def session(self) -> RunSession:
         return self._session
+
+    @property
+    def backend(self) -> AbstractStateBackend:
+        """持久化后端只读派生引用（所有权唯一锚定 StateStore）。
+
+        换库唯一经 ``store.set_backend`` 单点，本属性每次读取实时派生，
+        不持有独立可变引用——新增需要后端的机器一律经本接缝取用。
+        """
+        return self.store.backend
 
     @property
     def in_flight(self) -> InFlightTracker:
@@ -136,23 +163,24 @@ class EngineRuntime:
         return self._is_running
 
     @property
-    def state(self) -> PipelineState | None:
+    def state(self) -> PipelineState:
         return self.store.state
 
     @property
-    def taxonomy(self) -> ErrorTaxonomy:
-        return self.config.taxonomy
+    def classifier(self) -> ErrorClassifier:
+        return self.config.classifier
 
-    def request_stop(self, force: bool = False) -> StopMode:
+    def request_stop(self, *, force: bool = False) -> StopMode:
         """停机请求接口（单调状态转移，委托 RunSession）。"""
         return self._session.request_stop(force=force)
 
     def execute(self, options: ExecutionOptions | None = None) -> RunSummary:
         """完整执行管线生命周期。"""
-        opts = options or ExecutionOptions()
+        opts = options if options is not None else ExecutionOptions()
         start_time = time.monotonic()
         exit_reason = ExitReason.COMPLETED
 
+        # 不变式：run() 重入守卫——同一实例并发 execute 必须 fail-loud 拒绝
         if self._is_running:
             raise RuntimeError("Pipeline run() already in progress on this instance.")
         self._is_running = True
@@ -176,8 +204,9 @@ class EngineRuntime:
                 )
                 if self._run_lock_fd is None:
                     raise RuntimeError(
-                        f"Another run() is in progress for state_dir {self.config.ipc_dir}; "
-                        f"concurrent runs on the same state are forbidden."
+                        f"Another run() is in progress for state_dir "
+                        f"{self.config.ipc_dir}; concurrent runs on the same "
+                        f"state are forbidden."
                     )
 
             # 2. 信号陷阱
@@ -202,7 +231,7 @@ class EngineRuntime:
             raise
 
         try:
-            self._preflight_picklable_callbacks()
+            self._preflight_picklable_handlers()
             # 新 run 复位：统计/序号/停机态/幂等标志归零；store 记账换新 stats。
             self._session.begin()
             session_begun = True
@@ -245,6 +274,8 @@ class EngineRuntime:
             duration_seconds=duration,
         )
 
+    # ── 四相事件泵 ────────────────────────────────────────────────────
+
     def _terminal_outcome(self) -> StepOutcome:
         """三个终态早退（ABORTING / 排空完毕 / 空闲完成）的统一形状：
         全零计数 + should_terminate=True + 当前停机态与退出原因透传。"""
@@ -263,12 +294,13 @@ class EngineRuntime:
     def _fill_dispatch_pool(
         self, limit: int, draining: bool
     ) -> tuple[DispatchOutcome | None, float, int]:
-        """填池派发（仅非 DRAINING 且未超单步上限）：逐个 dispatch_next，
-        有候选则计数继续，断流/无候选即停；worker_wait 聚合取 min
-        （多次资源挂起恢复取最早者）。
+        """相一·填池派发（仅非 DRAINING 且未超单步上限）：逐个 dispatch_next，
+        SPAWNED / HANDLED_NO_SUBPROCESS 继续填池，WORKER_SATURATED /
+        NO_CANDIDATE 断流即停；worker_wait 聚合取 min（多次资源挂起恢复
+        取最早者）。
 
         Returns:
-            (最后一次派发结果或 None, worker_wait 最小值或 0, 派发计数)
+            (最后一次派发结果或 None, worker_wait 最小值或 0, 实派发计数)
         """
         last_outcome: DispatchOutcome | None = None
         worker_wait = 0.0
@@ -278,41 +310,48 @@ class EngineRuntime:
                 outcome = self._dispatch.dispatch_next()
                 last_outcome = outcome
                 if outcome.worker_wait > 0:
-                    worker_wait = outcome.worker_wait if worker_wait <= 0 else min(worker_wait, outcome.worker_wait)
-                if outcome.entry is not None:
+                    worker_wait = (
+                        outcome.worker_wait
+                        if worker_wait <= 0
+                        else min(worker_wait, outcome.worker_wait)
+                    )
+                if outcome.kind is DispatchKind.SPAWNED:
                     dispatched += 1
                     continue
-                if not outcome.should_continue:
-                    break
+                if outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS:
+                    continue
+                break
         return last_outcome, worker_wait, dispatched
 
     def _arbitrate_deadlock(
         self, last_outcome: DispatchOutcome | None, store: StateStore
-    ) -> tuple[bool, bool, float]:
-        """无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。
-
-        Returns:
-            (是否判定死锁, 是否应终止, 宽限/间隙重试等待秒数)
-        """
+    ) -> DeadlockArbitration:
+        """相二·无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。"""
         deadlock_detected = False
         should_terminate = False
-        deadlock_wait = 0.0
-        if last_outcome is not None and not last_outcome.has_runnable:
-            if store.is_empty and not self._in_flight:
+        wait_seconds = 0.0
+        if last_outcome is not None and last_outcome.kind is DispatchKind.NO_CANDIDATE:
+            if store.state.is_empty and not self._in_flight:
                 should_terminate = True
             elif not self._in_flight:
-                decision = self.governor.arbitrate(last_outcome.standstill, store=self.store)
+                decision = self.governor.arbitrate(
+                    last_outcome.standstill, store=self.store
+                )
                 if decision.action == "resolved":
                     deadlock_detected = True
                     if decision.should_terminate:
                         should_terminate = True
                 elif decision.action in ("grace_waiting", "gap_retrying"):
                     if decision.wait_time > 0:
-                        deadlock_wait = decision.wait_time
-        return deadlock_detected, should_terminate, deadlock_wait
+                        wait_seconds = decision.wait_time
+        return DeadlockArbitration(
+            deadlock_detected=deadlock_detected,
+            should_terminate=should_terminate,
+            wait_seconds=wait_seconds,
+        )
 
     def _drain_and_settle(self) -> int:
-        """Drain 回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
+        """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
         if not self._in_flight:
             return 0
         self._recovery.apply_pending_signals()
@@ -344,55 +383,59 @@ class EngineRuntime:
                 logger.info("Pipeline drained. Saving queue and exiting.")
                 self._recovery.save_queue_crash_safe()
                 return self._terminal_outcome()
-        if store.is_empty and not self._in_flight:
+        if store.state.is_empty and not self._in_flight:
             return self._terminal_outcome()
 
         # 1. 填池派发（仅非 DRAINING 状态且未超过单步限制）
-        limit = max_dispatch if max_dispatch is not None else 1000000
+        limit = max_dispatch if max_dispatch is not None else _UNBOUNDED_DISPATCH_LIMIT
         last_outcome, worker_wait, dispatched = self._fill_dispatch_pool(limit, draining)
 
         # 前进信号终结宽限 episode（须先于死锁仲裁）：任何成功派发都证明
         # 等待者已消解，同缺失集合复发按新 episode 重新授予完整宽限
         if dispatched > 0:
-            self.governor.note_dispatch_progress()
+            self.governor.record_dispatch_progress()
 
         # 2. 处理无可运行 job 与死锁判定
-        deadlock_detected, should_terminate, deadlock_wait = (
-            self._arbitrate_deadlock(last_outcome, store)
-        )
+        arbitration = self._arbitrate_deadlock(last_outcome, store)
 
         # 3. Drain 回收在途结果并统一结算
         completed_count = self._drain_and_settle()
 
-        # 4. 等待/空闲决策（唯一实现见 pacing.decide_wait）
-        is_idle = store.is_empty and not self._in_flight
+        # 4. 等待/空闲决策（唯一实现见 wait.decide_wait）
+        is_idle = store.state.is_empty and not self._in_flight
         decision = decide_wait(LoopFacts(
             stop_mode=self._session.stop_mode, has_in_flight=bool(self._in_flight),
-            store_empty=store.is_empty, dispatched=dispatched, completed=completed_count,
-            has_runnable=last_outcome.has_runnable if last_outcome is not None else True,
+            store_empty=store.state.is_empty, dispatched=dispatched, completed=completed_count,
+            has_runnable=(last_outcome.kind is not DispatchKind.NO_CANDIDATE
+                          if last_outcome is not None else True),
             min_wait=(last_outcome.standstill.min_wait
                       if last_outcome is not None else float("inf")),
-            worker_wait=worker_wait, deadlock_wait=deadlock_wait,
-            should_terminate=should_terminate,
+            worker_wait=worker_wait, deadlock_wait=arbitration.wait_seconds,
+            should_terminate=arbitration.should_terminate,
         ))
 
         exit_reason = (
-            self._session.exit_reason().value if (is_idle or should_terminate) else None
+            self._session.exit_reason().value if (is_idle or arbitration.should_terminate)
+            else None
         )
 
         return StepOutcome(
             dispatched_count=dispatched, completed_count=completed_count,
             is_idle=is_idle, should_wait=decision.should_wait,
-            wait_time=decision.wait_time, deadlock_detected=deadlock_detected,
+            wait_time=decision.wait_time,
+            deadlock_detected=arbitration.deadlock_detected,
             stop_mode=self._session.stop_mode,
-            should_terminate=should_terminate or is_idle, exit_reason=exit_reason,
+            should_terminate=arbitration.should_terminate or is_idle,
+            exit_reason=exit_reason,
         )
 
-    def run_loop_impl(self) -> None:
-        """事件驱动主循环：以 step() 统一驱动填池、回收与等待。"""
+    # ── 主循环与承重网 ────────────────────────────────────────────────
+
+    def run_loop(self) -> None:
+        """事件驱动主循环：以 step() 统一驱动填池、回收与等待（裸循环）。"""
         store = self.store
         self._in_flight.clear()
-        while not store.is_empty or self._in_flight:
+        while not store.state.is_empty or self._in_flight:
             outcome = self.step()
             if outcome.should_terminate:
                 break
@@ -403,7 +446,8 @@ class EngineRuntime:
         self._in_flight.clear()
 
     def prepare_run_state(self) -> PipelineState:
-        """加载持久化状态、初始化 run_id 屏障、执行恢复修复并构建内存 PipelineState。
+        """加载持久化状态、初始化 run_id 屏障、执行恢复修复并构建内存
+        PipelineState。
 
         编排层只负责 run 生命周期操作：调度轮复位与 fencing 屏障（run
         身份是 RunSession 属物，meta 持久化与 channel 同步是横切副作用，
@@ -426,18 +470,18 @@ class EngineRuntime:
 
         return self._recovery.load_and_repair()
 
-    def _run_loop(self) -> None:
+    def _run_with_crash_net(self) -> None:
         """运行主事件循环与统一异常承重网。"""
         exit_reason = self._session.exit_reason().value
         try:
-            self.run_loop_impl()
+            self.run_loop()
             exit_reason = self._session.exit_reason().value
         except BaseException as e:
-            # 单点崩溃网：所有异常同构处理（exit_reason + 在途清扫 + 崩溃保队
-            # + 原样上抛）；五类历史分支仅日志文案/级别不同——KI 与
-            # 非 Exception（_JobTerminated/_CommitCrashSignal/SystemExit）
-            # 不附 traceback，其余附。_CommitCrashSignal 防误吞不变式在
-            # 类继承（BaseException）与 dispatch 的早置 raise，不在此处。
+            # 单点崩溃网：所有异常同构处理（exit_reason + 在途清扫 + 崩溃
+            # 保队 + 原样上抛）；KI 与非 Exception（_JobTerminated /
+            # _CommitCrashSignal / SystemExit）不附 traceback，其余附。
+            # _CommitCrashSignal 防误吞不变式在类继承（BaseException）与
+            # dispatch 的早置 raise，不在此处。
             self._crash_log(e)
             exit_reason = self._session.exit_reason(e).value
             self._recovery.abort_in_flight()
@@ -445,14 +489,14 @@ class EngineRuntime:
             raise
         finally:
             try:
-                self._recovery.persist_resource_suspends()
+                self._recovery.persist_resource_suspensions()
             except Exception as e:
-                logger.warning(f"Failed to persist resource suspends: {e}")
+                logger.warning(f"Failed to persist resource suspensions: {e}")
             self._session.fire_run_end(exit_reason)
 
     @staticmethod
     def _crash_log(e: BaseException) -> None:
-        """承重网的逐类型日志分派（级别与文案对齐历史行为）。"""
+        """承重网的逐类型日志分派（KI 与非 Exception 不附 traceback）。"""
         if isinstance(e, KeyboardInterrupt):
             logger.warning("Pipeline interrupted by user.")
         elif isinstance(e, _JobTerminated):
@@ -460,27 +504,42 @@ class EngineRuntime:
         elif isinstance(e, _CommitCrashSignal):
             logger.critical(f"Backend commit failure; aborting in-flight jobs: {e}")
         elif isinstance(e, Exception):
-            logger.critical(f"Pipeline scheduler crashed with unhandled exception: {e}\n{traceback.format_exc()}")
+            logger.critical(
+                f"Pipeline scheduler crashed with unhandled exception: {e}\n"
+                f"{traceback.format_exc()}"
+            )
         else:
             logger.critical(f"Pipeline terminated by {type(e).__name__}: {e}")
 
     def _run_body(self) -> None:
-        """主执行体。"""
+        """主执行体：启动屏障（装载 + fencing）→ 带承重网的主循环。"""
         self.prepare_run_state()
-        self._run_loop()
+        self._run_with_crash_net()
 
     def _handle_signal(self, signum: int, frame: Any) -> None:
         logger.info(f"收到信号 {signum}，更新停机状态机……")
         self.request_stop()
 
-    def _preflight_picklable_callbacks(self) -> None:
+    def _preflight_picklable_handlers(self) -> None:
+        """strict 预检：全部已注册 Task 的 handler 必须可 pickle。
+
+        spawn 进程模型下不可 pickle 的 handler 会在每次派发时崩溃——
+        构造期入口拒绝（fail-loud），而非运行期逐作业失败。
+        """
         if not self.config.strict_picklable:
             return
-        for task_type, entry in self.handlers.items():
+        for task_type in self.tasks.task_types():
+            task = self.tasks.lookup(task_type)
             try:
-                pickle.dumps(entry.func)
+                pickle.dumps(task.handler)
             except Exception as e:
                 raise TypeError(
-                    f"Handler for task_type '{task_type}' is not picklable: {entry.func!r} ({e}). "
-                    f"Functions must be module-level."
+                    f"Handler for task_type '{task_type}' is not picklable: "
+                    f"{task.handler!r} ({e}). Functions must be module-level."
                 ) from e
+
+
+__all__ = [
+    "DeadlockArbitration",
+    "EngineRuntime",
+]

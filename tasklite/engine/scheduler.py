@@ -1,32 +1,31 @@
-"""Job scheduler for tasklite.
+"""v2 只读扫描调度器与选择序接缝。
 
-The scheduler performs a read-only scan over the queue to find the next
-runnable job. It does NOT acquire resources (only ``can_acquire``); the
-actual acquisition happens in the pipeline after the job is popped.
+调度器对队列做只读扫描定位下一个可运行 job：不获取资源（只经
+``ResourceManager.evaluate`` 评估），实际获取由派发机器在弹出后执行。
+``scan_next_runnable`` 是唯一选择点；访问序一律经 OrderingPolicy 接缝
+取得，核心不出现任何排序计算——软 EDF / 优先级 / aging 等排序策略
+未来以新 OrderingPolicy 实现插入，核心不动。
 """
 from __future__ import annotations
 
 import logging
-import time
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Mapping
 
-if TYPE_CHECKING:
-    from .types import HandlerEntry
-
-from .resource import Resource, ResourceManager, ResourceEvaluation
-from ..models.job import Job, JobRuntimeState
+from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
+from .resource import Resource, ResourceManager
 
 logger = logging.getLogger("tasklite")
 
 
 @dataclass(frozen=True)
 class JobFacts:
-    """不可变调度投影（scheduler 缓存唯一持有的 Job 视图）。
+    """不可变调度投影（调度缓存唯一持有的 Job 视图）。
 
     调度扫描只读四个事实：uid / task_type / resources / depends_on。
-    frozen dataclass + tuple/tuple 让 `_job_cache` 命中返回的对象无法被
+    frozen dataclass + tuple/tuple 让 ``_job_cache`` 命中返回的对象无法被
     任何调用点原地改写——「缓存不透出可变对象」由类型直接保证。
     """
 
@@ -36,7 +35,7 @@ class JobFacts:
     depends_on: tuple[str, ...]
 
     @classmethod
-    def from_job_dict(cls, job_dict: dict) -> "JobFacts":
+    def from_job_dict(cls, job_dict: dict) -> JobFacts:
         """完整走 Job.from_dict 校验，然后冻结调度所需字段。"""
         job = Job.from_dict(job_dict)
         return cls(
@@ -47,13 +46,14 @@ class JobFacts:
         )
 
     def resource_map(self) -> dict[str, float]:
-        """解冻 resources 供 can_acquire/merge 使用（只读消费）。"""
+        """解冻 resources 供资源评估使用（只读消费）。"""
         return dict(self.resources)
 
 
 @dataclass(frozen=True)
 class DeadlockAttribution:
     """不可变死锁归因值对象，记录导致死锁的作业 UID 分类（解耦队列整型下标）。"""
+
     unknown_resource_uids: tuple[str, ...] = ()
     missing_dependency_uids: tuple[str, ...] = ()
     malformed_uids: tuple[str, ...] = ()
@@ -75,8 +75,8 @@ class StandstillFacts:
     """停摆投影值对象——死锁仲裁输入的唯一形状（LoopFacts 模式）。
 
     只携带仲裁评估所需事实（min_wait / 依赖等待 / 潜在派生者 / 归因），
-    不含派发侧字段；DispatchOutcome 构造期从 ScheduleResult 一次性投影，
-    governor 不再鸭子解包多态入参形状。等待决策仍归 pacing.decide_wait，
+    不含派发侧字段；派发产物构造期从 ScheduleResult 一次性投影，
+    governor 不再鸭子解包多态入参形状。等待决策仍归 wait.decide_wait，
     本对象只承载事实不产出决策。
     """
 
@@ -88,14 +88,14 @@ class StandstillFacts:
 
 @dataclass
 class ScheduleResult:
-    """Outcome of a read-only scan over the queue.
+    """一次只读队列扫描的结果。
 
     ``kind`` 显式表达 runnable_idx + pending_dep_failure + dep_failed_idx
     的兜底关系：
 
     - ``kind == "runnable"``：runnable_idx 指向真正可运行的 job；
     - ``kind == "dep_failed"``：runnable_idx 指向 dep-failed 兜底位置
-      （pending_dep_failure 携带失败依赖，_dispatch_job 走依赖失败分支）；
+      （pending_dep_failure 携带失败依赖，派发机器走依赖失败分支）；
     - ``kind == "none"``：无可运行 job（本轮无 job 可派发）。
     """
     runnable_idx: int | None = None
@@ -124,22 +124,6 @@ class ScheduleResult:
         """是否存在选中的候选作业下标。"""
         return self.runnable_idx is not None
 
-    @property
-    def unknown_resource_uids(self) -> tuple[str, ...]:
-        return self.attribution.unknown_resource_uids
-
-    @property
-    def missing_dependency_uids(self) -> tuple[str, ...]:
-        return self.attribution.missing_dependency_uids
-
-    @property
-    def malformed_uids(self) -> tuple[str, ...]:
-        return self.attribution.malformed_uids
-
-    @property
-    def impossible_resource_uids(self) -> tuple[str, ...]:
-        return self.attribution.impossible_resource_uids
-
     def standstill_facts(self) -> StandstillFacts:
         """投影为 governor 仲裁输入的停摆事实（剔除派发侧字段）。"""
         return StandstillFacts(
@@ -150,37 +134,59 @@ class ScheduleResult:
         )
 
 
+class OrderingPolicy(ABC):
+    """队列访问序接缝契约（扫描选择点唯一）。
+
+    ``visit_order`` 给出一次扫描应访问的队列下标序列：调度器按该序
+    逐条评估并在首个可运行者处停止（首中即停）。默认实现 FIFO
+    （按 seq 升序）；软 EDF / 优先级 / aging 等策略未来以新实现插入。
+    Job 调度属性（priority / deadline / period）不落在 Job 模型——
+    其存放与语义由未来的调度策略 ADR 裁决。
+    """
+
+    @abstractmethod
+    def visit_order(self, queue: Sequence[dict]) -> Iterable[int]:
+        """返回本次扫描访问队列下标的迭代序。"""
+
+
+class FifoOrderingPolicy(OrderingPolicy):
+    """FIFO 访问序（默认）：按队列 seq 升序、首中即停。"""
+
+    def visit_order(self, queue: Sequence[dict]) -> Iterable[int]:
+        return range(len(queue))
+
+
 class JobScheduler:
-    """Read-only scanner that locates the next runnable job in the queue."""
+    """只读扫描器：按 OrderingPolicy 访问序定位队列中下一个可运行 job。"""
 
     resources: dict[str, Resource] | ResourceManager
-    handlers: Mapping[str, HandlerEntry] | dict[str, HandlerEntry]
 
     def __init__(
         self,
-        resources: dict[str, "Resource"] | ResourceManager,
-        handlers: Mapping[str, HandlerEntry] | None = None,
+        resources: dict[str, Resource] | ResourceManager,
+        tasks: Mapping[str, object] | None = None,
+        *,
+        ordering: OrderingPolicy | None = None,
     ):
         if isinstance(resources, ResourceManager):
             self.resource_mgr = resources
             self.resources = resources
         else:
             self.resources = resources
-            self.resource_mgr = ResourceManager(resources, handlers=handlers)
-        self.handlers = handlers if handlers is not None else getattr(self.resource_mgr, "handlers", {})
+            self.resource_mgr = ResourceManager(resources, tasks=tasks)
+        self.ordering: OrderingPolicy = ordering if ordering is not None else FifoOrderingPolicy()
         self._job_cache: dict[tuple[str, str], JobFacts] = {}
         self._JOB_CACHE_MAX = 100_000
 
     def begin_round(self) -> None:
-        """清空调度缓存（**run 生命周期**，由 ``_run_body`` 加载期调用）。
+        """清空调度缓存（**run 生命周期**，由运行主循环加载期调用）。
 
-        内容键 + 只读字段（depends_on/task_type/resources/uid）
-        使缓存跨轮安全：retries/runtime/backoff 从 live job_dict 读取，
-        retry 路径用 retry_dict["resources"] 恢复原始资源与缓存一致，
-        spawn 去重防同 uid 冲突——阻塞/退避/慢 job 阶段主循环 ~20Hz 轮询
-        时避免每轮全量反序列化队列（N=10 万 ≈ 240ms/轮 CPU 空烧）。
-        跨 run 陈旧（clear_history + 重新 enqueue 同 uid 不同内容）由
-        加载期清空覆盖。
+        内容键 + 只读字段（depends_on/resources）使缓存跨轮安全：
+        实例位字段（attempt_no/activation_no/runtime）从 live job_dict
+        读取，重入队路径用原 resources 恢复与缓存一致，spawn 去重防同
+        uid 冲突——阻塞/慢 job 阶段主循环高频轮询时避免每轮全量反序列化
+        队列（大队列每轮数百毫秒 CPU 空烧）。跨 run 陈旧（清历史后重新
+        入队同 uid 不同内容）由加载期清空覆盖。
         """
         self._job_cache.clear()
 
@@ -203,7 +209,7 @@ class JobScheduler:
         # 若直接返回陈旧缓存，调度器（缓存投影）与派发器（Job.from_dict 重新
         # 解析的 fresh Job）看到不同字段 → 未知资源/依赖判定背离，以裸 KeyError
         # 击穿整条 run。字段不一致视为 miss 重新解析；同 uid 同内容
-        # （retry/常规重跑/requeue）仍命中缓存，保留缓存复用的性能收益。
+        # （重试/常规重跑/重入队）仍命中缓存，保留缓存复用的性能收益。
         if facts is not None and self._sched_fields_match(facts, job_dict):
             return facts
         facts = JobFacts.from_job_dict(job_dict)
@@ -222,11 +228,11 @@ class JobScheduler:
 
         内容键 (task_type, job_id) 假设同 uid 内容不变；every_run 重 spawn 打破
         该假设。仅 depends_on/resources 影响调度判定（unknown/missing/依赖/
-        can_acquire），比对二者即可判定能否安全复用缓存。
+        可运行评估），比对二者即可判定能否安全复用缓存。
 
         null 语义与 ``Job.from_dict`` 对齐：``resources=None``→``{}``、
         ``depends_on=None``→``[]``（否则 ``dict(None)``/``list(None)`` 抛
-        TypeError，把**本可正常解析执行**的合法 job 误判为畸形进 DLQ——
+        TypeError，把**本可正常解析执行**的合法 job 误判为畸形进失败档案——
         避免将合法任务误判为畸形）。非 dict/非 list 的畸形值视为不一致，
         返回 False（重新解析，``Job.from_dict`` 会对畸形正确抛错归位）。
         """
@@ -248,19 +254,20 @@ class JobScheduler:
             job_resources = dict(job.resources)
         return self.resource_mgr.effective_resources(job.task_type, job_resources)
 
-    def pop_next_runnable(
+    def scan_next_runnable(
         self,
         state: PipelineState,
         in_flight_uids: frozenset[str] = frozenset(),
     ) -> ScheduleResult:
-        """Scan queue read-only. Returns index and wait info. Does NOT acquire resources.
+        """只读扫描队列：返回候选下标与等待事实，不获取资源。
 
         ``state`` 提供队列只读事实（queue/wall/failed/queue_uids——
         ``queue_uids`` 返回活索引引用，提供 O(1) 索引，无 O(N) 拷贝）。
 
-        ``in_flight_uids`` 是当前正在子进程中执行（已 pop 但未 commit）的 job uid
-        集合。在 missing dependency 判定时，依赖正在运行的 job 不算 missing
-        （待其完成 commit 到 wall 后自然解锁），避免并发模型下误判死锁。
+        ``in_flight_uids`` 是当前正在子进程中执行（已扫描选中但未 commit）的
+        job uid 集合。在 missing dependency 判定时，依赖正在运行的 job 不算
+        missing（待其完成 commit 到 wall 后自然解锁），避免并发模型下误判
+        死锁。
         """
         q_data = state.queue
         wall_data = state.wall
@@ -279,9 +286,8 @@ class JobScheduler:
         malformed_uids: list[str] = []
         impossible_resource_uids: list[str] = []
 
-        now = time.monotonic()
-
-        for i, job_dict in enumerate(q_data):
+        for i in self.ordering.visit_order(q_data):
+            job_dict = q_data[i]
             # 捕获畸形 job dict（缺 task_type/job_id 等），记录 UID 避免整个扫描崩溃
             try:
                 job = self.cached_job(job_dict)
@@ -338,23 +344,11 @@ class JobScheduler:
             if not can_run:
                 continue
 
-            # 4. Backoff — 复用循环顶部的 now 值，避免双重 time.monotonic 调用
-            raw_rt = job_dict.get("runtime")
-            rt_state = (
-                raw_rt
-                if isinstance(raw_rt, JobRuntimeState)
-                else (JobRuntimeState.from_dict(raw_rt) if isinstance(raw_rt, dict) else None)
-            )
-            if rt_state is not None and rt_state.is_backed_off(now):
-                min_wait = min(min_wait, rt_state.remaining_backoff(now))
-                continue
-
-            if can_run:
-                runnable_idx = i
-                break
+            runnable_idx = i
+            break
 
         # 兜底：整轮没有可运行 job 但存在 dep-failed job →
-        # runnable_idx 落回首个 dep-failed 位置（_dispatch_job 会处理它）。
+        # runnable_idx 落回首个 dep-failed 位置（派发机器会处理它）。
         if runnable_idx is None and pending_dep_failure is not None:
             runnable_idx = dep_failed_idx
 
@@ -374,9 +368,9 @@ class JobScheduler:
         # 死锁归因类集合（impossible/unknown/missing/malformed）任一非空时
         # 强制 min_wait=inf：这些类别的判定不依赖任何等待——impossible/
         # unknown 是永久性死锁，missing 由宽限逻辑单独裁决，malformed 无法
-        # 反序列化、永远不可能变为可运行。若被队列中另一 job 的有限退避/
-        # 资源等待覆盖 min_wait，死锁判定被逐轮推迟到该等待终结（退避逐轮
-        # 放大时可拖数十分钟，管线表现为卡死无日志）。
+        # 反序列化、永远不可能变为可运行。若被队列中另一 job 的有限资源
+        # 等待覆盖 min_wait，死锁判定被逐轮推迟到该等待终结（资源挂起
+        # TTL 可达数十分钟，管线表现为卡死无日志）。
         if attribution.has_deadlock_causes and min_wait != float('inf'):
             min_wait = float('inf')
 
@@ -403,3 +397,14 @@ class JobScheduler:
             attribution=attribution,
             candidate_uid=candidate_uid,
         )
+
+
+__all__ = [
+    "DeadlockAttribution",
+    "FifoOrderingPolicy",
+    "JobFacts",
+    "JobScheduler",
+    "OrderingPolicy",
+    "ScheduleResult",
+    "StandstillFacts",
+]

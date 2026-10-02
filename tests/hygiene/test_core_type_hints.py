@@ -55,7 +55,12 @@ def _source_defined_names(module) -> "dict[str, set]":
 
 
 def _type_checking_only_names(module) -> set:
-    """收集仅静态检查分支导入、运行时不可用的名字。"""
+    """收集仅静态检查分支导入或定义、运行时不可用的名字。
+
+    覆盖两种形态：分支内 import 的名字，以及分支内 class 定义（如规避
+    运行时环导入而收进静态分支的 Protocol 契约类）——二者运行时同样
+    不存在于模块命名空间。
+    """
     try:
         source = inspect.getsource(module)
     except (OSError, TypeError):
@@ -68,16 +73,38 @@ def _type_checking_only_names(module) -> set:
                     names.update(a.asname or a.name for a in inner.names)
                 elif isinstance(inner, ast.Import):
                     names.update((a.asname or a.name).split(".")[0] for a in inner.names)
+                elif isinstance(inner, ast.ClassDef):
+                    names.add(inner.name)
     return {n for n in names if not hasattr(module, n)}
 
 
+def _fallback_namespace(names: set) -> dict:
+    """静态专用名字的兜底命名空间。
+
+    标准库（collections.abc / typing / builtins）真对象优先——被注解
+    下标使用（如 ``Sequence[Path]``）的名字以 Any 替代会抛
+    ``TypeError: type 'Any' is not subscriptable``；其余名字用 Any。
+    """
+    import builtins
+    import collections.abc
+
+    ns: dict = {}
+    for name in names:
+        for source in (collections.abc, typing, builtins):
+            if hasattr(source, name):
+                ns[name] = getattr(source, name)
+                break
+        else:
+            ns[name] = typing.Any
+    return ns
+
+
 def _resolve_hints(func, module):
-    """解析注解；仅对静态专用导入的名字以 Any 兜底重试。"""
+    """解析注解；仅对静态专用名字以兜底命名空间重试。"""
     try:
         return typing.get_type_hints(func)
     except NameError:
-        localns = {n: typing.Any for n in _type_checking_only_names(module)}
-        return typing.get_type_hints(func, localns=localns)
+        return typing.get_type_hints(func, localns=_fallback_namespace(_type_checking_only_names(module)))
 
 
 def _iter_core_modules():

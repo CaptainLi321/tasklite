@@ -10,8 +10,8 @@
   回写时才炸或比较语义失真）；``parse_int`` 把超长整数字面量解析限制的
   裸 ``ValueError`` 包装为 ``json.JSONDecodeError``——且所有拒绝均抛
   ``json.JSONDecodeError``（非裸 ``ValueError``）——调用方既有的
-  ``except json.JSONDecodeError`` 分支（sqlite_backend.load_* 等）才能
-  真正捕获；裸 ValueError 会逃逸既有 except 分支。
+  ``except json.JSONDecodeError`` 分支（backend 的 load_* 容灾路径等）才
+  能真正捕获；裸 ValueError 会逃逸既有 except 分支。
 
 静态契约：tests 扫描源码断言本模块之外无裸 ``json.dumps``/``json.loads``
 （豁免：``models/state.py`` 的 hash 计算——非落盘/传输用途）。
@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import json
 import math
+from typing import Any
 
 
-def _reject_constant(name: str):
+def _reject_constant(name: str) -> None:
     """parse_constant 回调：拒绝 NaN/Infinity，抛 JSONDecodeError。
 
     JSONDecodeError 是 ValueError 子类——调用方按「损坏数据」处理的分支
@@ -53,7 +54,7 @@ def _bounded_int(s: str) -> int:
 
     Python 3.11+ 对超过 int↔str 转换位数上限（默认 4300 位）的整数字面量，
     ``int(s)`` 抛裸 ``ValueError``——逃逸调用方既有的 ``except
-    json.JSONDecodeError`` 损坏数据分支（sqlite_backend.load_* 等）。
+    json.JSONDecodeError`` 损坏数据分支（backend 的 load_* 容灾路径等）。
     统一按损坏数据拒绝，doc 参数携带字面量供定位。
     """
     try:
@@ -64,25 +65,33 @@ def _bounded_int(s: str) -> int:
         ) from exc
 
 
-def dumps(obj) -> str:
+def dumps(obj: Any) -> str:
     """序列化（ensure_ascii=False 保中文可读 + allow_nan=False 拒 NaN）。"""
     return json.dumps(obj, ensure_ascii=False, allow_nan=False)
 
 
-def dump(obj, fp):
+def dump(obj: Any, fp: Any) -> None:
     """序列化到文件对象（与 dumps 同契约）。"""
     json.dump(obj, fp, ensure_ascii=False, allow_nan=False)
 
 
-def loads(s: str):
+def loads(s: str) -> Any:
     """反序列化（拒绝 NaN/Infinity/溢出浮点/超限整数，抛 JSONDecodeError）。"""
     return json.loads(
         s, parse_constant=_reject_constant, parse_float=_finite_float, parse_int=_bounded_int
     )
 
 
-def load(fp):
+def load(fp: Any) -> Any:
     """从文件对象反序列化（同 loads 的拒绝语义）。"""
     return json.load(
         fp, parse_constant=_reject_constant, parse_float=_finite_float, parse_int=_bounded_int
     )
+
+
+__all__ = [
+    "dump",
+    "dumps",
+    "load",
+    "loads",
+]

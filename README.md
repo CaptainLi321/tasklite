@@ -172,15 +172,15 @@ pipeline.run()
 
 ---
 
-## 🧭 v2 子包（Task/Job/Attempt 三层重建）
+## 🧭 v2 三层模型（Task/Job/Attempt）
 
-v1 之外，仓库内并行生长着 **v2 重建子包**（[`tasklite/v2/`](tasklite/v2/)，总纲 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)）：架构照搬 v1（进程隔离、SQLite WAL、六步契约不变），模型重塑为 **Task（规格）/ Job（逻辑实例）/ Attempt（执行轨迹）** 三层，命名体系全面翻新（`register_handler`→`register_task`、`add_resource`→`register_resource`、死信队列→**失败档案**、`sanitize_*`→`encode_*`），退避机制移除、调度策略收敛为 OrderingPolicy / RequeuePolicy 接缝。**v1 处于冻结期**（仅缺陷修复），v2 严禁反向依赖 v1。
+本包为 **v2 重建版**（设计总纲 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，上位裁决 [ADR-0005](docs/adr/0005-v2-promotion.md)）：架构保留进程隔离、SQLite WAL、六步调用契约，模型重塑为 **Task（规格）/ Job（逻辑实例）/ Attempt（执行轨迹）** 三层，命名体系全面翻新（`register_handler`→`register_task`、`add_resource`→`register_resource`、死信队列→**失败档案**、`sanitize_*`→`encode_*`），退避机制移除、调度策略收敛为 OrderingPolicy / RequeuePolicy 接缝。**v1 已退役**（git 历史与 `v1-final` 标签留档）。
 
 ```python
-from tasklite.v2 import TaskLite, Job, Task, AttemptRecord
+from tasklite import TaskLite, Job, Task, AttemptRecord
 ```
 
-使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**，设计与命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)。本文其余章节描述 v1 公开面。
+使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**，v1 → v2 命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)。
 
 ---
 
@@ -333,25 +333,26 @@ tasklite/
 │   ├── runtime.py       # 核心运行期深模块、主循环事件泵 (EngineRuntime)
 │   ├── config.py        # RunConfig 静态装配快照、默认值唯一解析点
 │   ├── session.py       # RunSession 单次 run 生命周期状态与钩子单一出口
-│   ├── pacing.py        # 事件泵等待/空闲决策纯函数（decide_wait）
+│   ├── wait.py          # 事件泵等待/空闲决策纯函数
 │   ├── types.py         # 引擎公共值对象单一真相源
 │   ├── store.py         # 状态事务、3-strike 崩溃与死锁归因 (StateStore)
-│   ├── console.py       # OpsConsole：run() 外纯运维接缝（管理 API 委托目标）
+│   ├── ops.py           # OpsConsole：run() 外纯运维接缝（管理 API 委托目标）
 │   ├── dispatch.py      # 任务派发状态机 (DispatchMachine)
 │   ├── completion.py    # 任务完成与提交 (CompletionMachine)
 │   ├── recovery.py      # 崩溃检测与恢复 (RecoveryOrchestrator)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel / WorkerLaunchSpec)
-│   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler)
-│   ├── policy.py        # 准入预检、重试退避与 rerun 决策 (ExecutionPolicy)
+│   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler / OrderingPolicy seam)
+│   ├── admission.py     # rerun 准入 (RerunPolicy) 与重入队节奏 (RequeuePolicy)
 │   ├── governor.py      # 死锁归因仲裁与依赖宽限 (DeadlockGovernor)
-│   ├── inflight.py      # 在途作业租约追踪 (InFlightTracker)
+│   ├── in_flight.py     # 在途作业租约追踪 (InFlightTracker)
+│   ├── errorclass.py    # 错误分类与校验分类深模块 (ErrorClassifier)
 │   └── resource.py      # 令牌桶限速与并发容量资源
 ├── backend/             # SQLite WAL 强一致事务持久化后端
-├── models/              # Job / TaskContext / PipelineState 数据模型
-├── taxonomy.py          # 错误分类法与校验分类深模块 (ErrorTaxonomy)
-├── testing.py          # fake_ctx：handler 单测的官方 TaskContext 构造器
+├── models/              # Task / Job / Attempt / PipelineState / JobContext 数据模型
+├── testing.py           # fake_ctx：handler 单测的官方 JobContext 构造器
 ├── wrappers/            # discovery.py（增量扫描）/ http.py（网络守卫与快照）
-└── utils/               # injective（单射 %XX 转义）/ ipc（IPC 信号与降级落盘）/ jsonutil（禁NaN）/ lockfile
+├── contrib/             # 生态扩展套件与参考实现（核心不依赖）
+└── utils/               # encoding（单射 %XX 转义）/ ipc（IPC 信号与降级落盘）/ clock / jsonutil（禁NaN）/ lockfile
 ```
 
 ---

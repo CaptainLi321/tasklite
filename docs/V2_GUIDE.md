@@ -6,10 +6,10 @@
 
 ## 1. 定位与导入
 
-v2 落位于 `tasklite/v2/` 子包，与 v1 同处一个发行版。**唯一承诺稳定的导入面**是 `tasklite/v2/__init__.py` 的集中导出：
+v2 即 `tasklite` 主包（上位裁决 [ADR-0005](adr/0005-v2-promotion.md)）。**唯一承诺稳定的导入面**是 `tasklite/__init__.py` 的集中导出：
 
 ```python
-from tasklite.v2 import (
+from tasklite import (
     TaskLite,                    # 门面（六步调用契约唯一入口）
     Job, Task, AttemptRecord,    # 三层模型：实例 / 规格 / 轨迹
     JobContext,                  # handler 执行上下文
@@ -22,11 +22,11 @@ from tasklite.v2 import (
 )
 ```
 
-子包路径补充：`from tasklite.v2.wrappers.discovery import register_discovery`（增量扫描适配）、`from tasklite.v2.wrappers.http import http_guard, urllib_fetch, SQLiteSnapshotStore`（网络守卫与快照）、`from tasklite.v2.testing import fake_ctx`（handler 单测构造器）。wrappers 不进主 `__all__`，经 `tasklite.v2.wrappers.*` 导入。
+子包路径补充：`from tasklite.wrappers.discovery import register_discovery`（增量扫描适配）、`from tasklite.wrappers.http import http_guard, urllib_fetch, SQLiteSnapshotStore`（网络守卫与快照）、`from tasklite.testing import fake_ctx`（handler 单测构造器）。wrappers 不进主 `__all__`，经 `tasklite.wrappers.*` 导入。
 
 **隔离与冻结（ADR-0004 裁决）**：
 
-- **v2 严禁 import v1**——`tasklite.v2` 不依赖旧树任何模块，保证独立演进与最终整体替换；
+- **v2 严禁 import v1**——`tasklite` 不依赖旧树任何模块，保证独立演进与最终整体替换；
 - **v1 处于冻结期**——仅允许缺陷修复，不接受新特性；冻结期缺陷须 v1/v2 双落修复；
 - v2 分层红线镜像：`v2/models/` 严禁 import `v2/engine/`，`v2/utils/` 严禁 import `v2/wrappers/`，v2 核心层严禁依赖 `v2/contrib/`；
 - v2 无独立版本号，随主包 `tasklite.__version__` 单一事实源；
@@ -49,7 +49,7 @@ v2 把 v1 混于一个 `Job` 的概念拆成三层——规格、逻辑实例、
 `Task` 是 frozen dataclass，一般经门面简式注册（首参传 task_type 字符串）：
 
 ```python
-from tasklite.v2 import Task
+from tasklite import Task
 
 task = Task(
     "download",                                   # task_type（非空 str，不含 "::"）
@@ -77,7 +77,7 @@ Job 的字段按「规格位 / 实例位」归位：
   - `first_enqueued_at`——首次入队时间（UTC ISO），重试不刷新，由 enqueue 摄入管道填充（重试/spawn 回流的作业保留原值）。
 
 ```python
-from tasklite.v2 import Job
+from tasklite import Job
 
 job = Job(
     "download", "img_001",
@@ -140,9 +140,9 @@ Task 规格（进程内 TaskRegistry：handler / 默认资源 / payload_schema /
 import logging
 from pathlib import Path
 
-from tasklite.v2 import Job, RateLimitResource, RetryError, TaskLite
+from tasklite import Job, RateLimitResource, RetryError, TaskLite
 
-logging.getLogger("tasklite.v2").setLevel(logging.INFO)
+logging.getLogger("tasklite").setLevel(logging.INFO)
 
 
 def download_handler(job, ctx):
@@ -199,7 +199,7 @@ pipeline.stop()
 
 **run/stop 细节**：`run()` 返回 `RunSummary(exit_reason, stats, run_id, duration_seconds)`；`stop()` 请求 DRAINING（不再派发、在途自然完成），`stop(force=True)` 请求 ABORTING（分类消费在途任务）；`run_graceful()` 是统一包装（捕获 KeyboardInterrupt 转 DRAINING）。构造期钩子三件：`on_run_start` / `on_attempt_finished(uid, *, outcome: AttemptFinish)` / `on_run_end(exit_reason)`——同步、主线程、必须轻量非阻塞（抛异常只计数进 `stats["hook_errors"]`）。
 
-handler 单测用官方构造器：`from tasklite.v2.testing import fake_ctx`——`fake_ctx(job, wall=..., failed=..., cursors=..., resources=..., tmp_root=...)`，不硬编码 JobContext 内部容器结构。
+handler 单测用官方构造器：`from tasklite.testing import fake_ctx`——`fake_ctx(job, wall=..., failed=..., cursors=..., resources=..., tmp_root=...)`，不硬编码 JobContext 内部容器结构。
 
 ---
 
@@ -238,7 +238,7 @@ v2 核心**不含任何调度策略计算**：候选排序与重试节奏各留�
 ```python
 from collections.abc import Iterable, Sequence
 
-from tasklite.v2 import OrderingPolicy, TaskLite
+from tasklite import OrderingPolicy, TaskLite
 
 
 class NewestFirstPolicy(OrderingPolicy):
@@ -256,7 +256,7 @@ pipeline = TaskLite(name="media", state_dir="./state", ordering=NewestFirstPolic
 核心引擎把一个失败/瞬态作业放回队列时，一律经 `plan_requeue` 取得节奏规划，自身不做任何计算。自定义策略同样经门面构造参数 `requeue_policy` 注入（None → 立即重入队）：
 
 ```python
-from tasklite.v2 import RequeuePlan, RequeuePolicy, TaskLite
+from tasklite import RequeuePlan, RequeuePolicy, TaskLite
 
 
 class FixedDelayRequeuePolicy(RequeuePolicy):

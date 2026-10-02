@@ -1,6 +1,6 @@
-"""官方测试工具（冻结 TaskContext 内部构造结构对下游测试的影响面）。
+"""v2 官方测试工具（冻结 JobContext 内部构造结构对下游测试的影响面）。
 
-handler 单测需要构造 TaskContext，直接以位置参数硬编码 wall/failed/
+handler 单测需要构造 JobContext，直接以位置参数硬编码 wall/failed/
 cursors 的内部容器结构会随框架演进碎裂——本模块是唯一承诺稳定的测试
 构造入口（参数形态变更视为破坏性变更，与公开 API 同等对待）。
 """
@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .models.context import TaskContext
+from .models.context import JobContext
 from .models.job import Job
 
 __all__ = ["fake_ctx", "running"]
@@ -50,13 +50,13 @@ def fake_ctx(
     fatal_exceptions: tuple[type, ...] | None = None,
     transient_exceptions: tuple[type, ...] | None = None,
     transient_registry: tuple[type, ...] = (),
-) -> TaskContext:
-    """构造 handler 单测用 TaskContext。
+) -> JobContext:
+    """构造 handler 单测用 JobContext。
 
     Args:
         job: 测试目标 job。
         wall: 已成功完成的 uid 集合（任意可迭代，``ctx.is_completed`` 命中源）。
-        failed: 已进 DLQ 的 uid 集合（任意可迭代，``ctx.is_failed`` 命中源）。
+        failed: 已进失败档案的 uid 集合（任意可迭代，``ctx.is_failed`` 命中源）。
         cursors: 游标初值映射（``ctx.get_cursor`` 命中源）。
         resources: 已注册资源名集合——``ctx.suspend_resource`` 按名单
             fail-loud 校验（与生产派发路径同语义）；缺省为空集，suspend
@@ -73,7 +73,7 @@ def fake_ctx(
         transient_registry: 瞬态注册表元组（与上两者同属分类声明面）。
 
     Returns:
-        TaskContext: 内部容器结构由本函数兜底装配的上下文实例。
+        JobContext: 内部容器结构由本函数兜底装配的上下文实例。
     """
     if tmp_root is not None:
         base = Path(tempfile.mkdtemp(dir=str(tmp_root)))
@@ -83,7 +83,7 @@ def fake_ctx(
             Path(ipc_dir).mkdir(parents=True, exist_ok=True)
     elif ipc_dir is not None:
         Path(ipc_dir).mkdir(parents=True, exist_ok=True)
-    return TaskContext(
+    return JobContext(
         job,
         set(wall) if wall is not None else set(),
         set(failed) if failed is not None else set(),

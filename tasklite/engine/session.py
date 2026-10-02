@@ -4,32 +4,41 @@
 - stop_mode 单调转移（NONE→DRAINING→ABORTING，唯一入口 request_stop）；
 - fire_run_end 幂等（一个 run 至多发一次）；
 - stats 无 public setter（结算记账经 StateStore）；
-- begin() 是新 run 的复位入口（run_id/dispatch_seq/stats/stop_mode/幂等标志归零）。
+- begin() 是新 run 的复位入口（run_id/dispatch_seq/stats/stop_mode/幂等
+  标志归零）。
 """
 
 from __future__ import annotations
 
 import logging
 import secrets
-from typing import Any, Callable
+from typing import Callable, TYPE_CHECKING
 
 from .types import ExitReason, StopMode, TaskStats
+
+if TYPE_CHECKING:
+    from .types import AttemptFinish
 
 logger = logging.getLogger("tasklite")
 
 
 class RunSession:
-    """一次 run() 的可变生命周期状态 + fire_* 钩子单一出口（红线 6）。"""
+    """一次 run() 的可变生命周期状态 + fire_* 钩子单一出口。
+
+    attempt 收尾钩子的载荷形态是 AttemptFinish 值对象（布尔语义经值
+    对象承载、不裸传）；异常隔离与 hook_errors 计数在各 fire_* 出口内
+    完成——用户回调缺陷不得击穿事件泵。
+    """
 
     def __init__(
         self,
         *,
         on_run_start: Callable[[], None] | None = None,
-        on_job_completed: Callable[[str, dict[str, Any], bool, bool], None] | None = None,
+        on_attempt_finished: Callable[..., None] | None = None,
         on_run_end: Callable[[str], None] | None = None,
     ) -> None:
         self.on_run_start = on_run_start
-        self.on_job_completed = on_job_completed
+        self.on_attempt_finished = on_attempt_finished
         self.on_run_end = on_run_end
         self.run_id: str | None = None
         # 每 run 随机结果认证令牌：随 WorkerLaunchSpec 下发 worker、随结果
@@ -58,7 +67,7 @@ class RunSession:
         self.dispatch_seq += 1
         return self.dispatch_seq
 
-    def request_stop(self, force: bool = False) -> StopMode:
+    def request_stop(self, *, force: bool = False) -> StopMode:
         """停机状态机唯一入口（单调：NONE→DRAINING→ABORTING）。"""
         if force or self.stop_mode == StopMode.DRAINING:
             self.stop_mode = StopMode.ABORTING
@@ -93,15 +102,13 @@ class RunSession:
             logger.warning(f"on_run_start hook raised: {e}")
             self._stats["hook_errors"] += 1
 
-    def fire_job_completed(
-        self, uid: str, meta: dict[str, Any], success: bool, going_to_retry: bool,
-    ) -> None:
-        if self.on_job_completed is None:
+    def fire_attempt_finished(self, uid: str, *, outcome: "AttemptFinish") -> None:
+        if self.on_attempt_finished is None:
             return
         try:
-            self.on_job_completed(uid, meta, success, going_to_retry)
+            self.on_attempt_finished(uid, outcome=outcome)
         except Exception as e:
-            logger.warning(f"on_job_completed hook raised for {uid}: {e}")
+            logger.warning(f"on_attempt_finished hook raised for {uid}: {e}")
             self._stats["hook_errors"] += 1
 
     def fire_run_end(self, reason: str) -> None:
@@ -115,3 +122,8 @@ class RunSession:
         except Exception as e:
             logger.warning(f"on_run_end hook raised: {e}")
             self._stats["hook_errors"] += 1
+
+
+__all__ = [
+    "RunSession",
+]

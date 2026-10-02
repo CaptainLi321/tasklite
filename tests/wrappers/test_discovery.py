@@ -1,32 +1,37 @@
-"""Tests for register_discovery() — REQUIREMENTS CONTRACT (see utils/discovery.py).
+"""v2 register_discovery 契约测试（REQUIREMENTS CONTRACT，见 v2 wrappers discovery 模块）。
 
-纯任务模型增量发现：已见集合 = wall/failed 快照（ctx.is_completed / ctx.is_failed），
-无 cursor、无 seen 持久化、无 poison 表、无互斥注入。
+纯任务模型增量发现：已见集合 = wall/failed 快照（ctx.is_completed /
+ctx.is_failed），无 cursor、无 seen 持久化、无 poison 表、无互斥注入。
+移植 v1 同源测试并按 v2 公开面改写（encode_content_id / register_task）。
 
-V1 要求的契约验证场景（与 test_discovery.py 对偶）：
+契约验证场景：
 - 首次全量扫描（空 wall → 逐页 → 空页终止）
 - 中间翻页运行（部分命中页继续翻，整页命中终止）
 - 重新发现含新内容（新 id 被处理，旧 id 被 wall 快照跳过）
 - 源端删除场景（删中间/删最旧/删最新 → 不重不漏）
 - 崩溃重跑（异常传播 → 重扫 → wall 去重吸收）
-- 确定性 job_id（净化后的 content_id 直接可用作 Job.job_id）
+- 确定性 job_id（编码后的 content_id 直接可用作 Job.job_id）
 - 真实子进程（spawn 上下文，模块级回调可 pickle）
-- 防御测试（D-1：id_func 异常、fetch 非 list、process_item_func 异常、
-  cursor_key 非法、process_task_type 非法——每处防御分支配触发测试）
+- 防御测试：id_func 异常、fetch 非 list、process_item_func 异常、
+  cursor_key 非法、process_task_type 非法——每处防御分支配触发测试
 """
+from __future__ import annotations
 
 import re
+import sys
 import tempfile
+from pathlib import Path
 
 import pytest
+
+from tasklite import Job, TaskLite
 from tasklite.testing import fake_ctx
-from tasklite.pipeline import TaskLite
-from tasklite.models.job import Job
-from tasklite.models.context import TaskContext
 from tasklite.wrappers.discovery import (
-    sanitize_content_id,
+    encode_content_id,
     register_discovery,
 )
+
+PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
 
 # ══════════════════════════════════════════════════════════════════════
 # 直调测试的数据源：模块级可变状态（handler 直调，同进程共享）
@@ -35,13 +40,13 @@ from tasklite.wrappers.discovery import (
 PAGESIZE = 3
 PTYPE = "download"  # process 子任务 task_type
 
-_posts: list = []          # 当前内容源（按 id 倒序）
+_posts: list = []              # 当前内容源（按 id 倒序）
 _seen_by_handler: set = set()  # process_item_func 实际处理过的 content_id
 
 # 防御/崩溃测试的可变观测：模块级回调（可 pickle）与模块级状态配对
-_processed_guard: list = []   # 防御测试里 process 回调记录的内容
-_poison_attempts = {"n": 0}   # poison item 被尝试的次数
-_crash_calls = {"n": 0}       # 崩溃 fetch 的调用计数
+_processed_guard: list = []    # 防御测试里 process 回调记录的内容
+_poison_attempts = {"n": 0}    # poison item 被尝试的次数
+_crash_calls = {"n": 0}        # 崩溃 fetch 的调用计数
 
 
 def _reset_source(items: list):
@@ -86,11 +91,14 @@ def cursor_key_func(payload):
 
 
 def _seen_orig(seen):
-    """从净化 content_id 还原原始 id：反转义 %XX + 兼容旧指纹后缀剥离。"""
+    """从编码 content_id 还原原始 id：反转义 %XX + 剥离截断域指纹后缀。
+
+    截断形态 = 前缀 + "%_" + 16 位 sha256 指纹（像集外标记，见
+    v2 utils/encoding），还原时整体剥掉。
+    """
     out = set()
     for cid in seen:
-        m = re.match(r"^(.*)_[0-9a-f]{8}$", cid)
-        base = m.group(1) if m else cid
+        base = re.sub(r"%_[0-9a-f]{16}$", "", cid)
         out.add(re.sub(r"%([0-9A-Fa-f]{2})", lambda mm: chr(int(mm.group(1), 16)), base))
     return out
 
@@ -100,7 +108,7 @@ def process_item_func(job, ctx, item, content_id):
     _seen_by_handler.add(content_id)
 
 
-# ── 防御/崩溃测试用的模块级回调（pickle preflight 要求模块级）──────────
+# ── 防御/崩溃测试用的模块级回调（spawn 序列化预检要求模块级）──────────
 
 
 def bad_key(payload):
@@ -145,7 +153,7 @@ def poison_process(job, ctx, item, content_id):
 
 
 def _make_pipeline(name="test_disc"):
-    """构造 pipeline（直调测试从不 run()，仅用其承载 handler 注册）。
+    """构造 pipeline（直调测试从不 run()，仅用其承载 Task 注册）。
 
     使用进程唯一临时目录（tempfile.mkdtemp），避免跨测试污染。
     """
@@ -160,7 +168,7 @@ def _make_ctx(job=None, wall=None, failed=None):
 
 
 def _register(pipeline, **kwargs):
-    """注册纯 discovery（无命名空间——prefix 为空，净化 = 单层指纹）。
+    """注册纯 discovery（无命名空间——prefix 为空，编码 = 单层转义）。
 
     cursor_key_func 命名空间的语义由 test_cursor_key_namespace_prevents_id_collision
     单独覆盖；主路径测试用无前缀形态使 wall 快照构造简单且与 handler 一致。
@@ -182,8 +190,8 @@ def _wall_from_seen():
 
 
 def _handler(pipeline):
-    # HandlerEntry 命名访问（替代三元组 [0] 下标）
-    return pipeline.handlers["discover"].func
+    # TaskRegistry 命名访问（Task 规格的 handler 字段）
+    return pipeline.tasks.get("discover").handler
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -213,7 +221,7 @@ class TestTermination:
         job = Job("discover", "seed", payload={"artist_id": "123"})
         # wall 预置 {9,8}（page1=[9,8,7] 部分命中）
         seen = {"9", "8"}
-        wall = {f"{PTYPE}::{sanitize_content_id(c)}" for c in seen}
+        wall = {f"{PTYPE}::{encode_content_id(c)}" for c in seen}
         ctx = _make_ctx(job, wall=wall)
         assert _handler(pipeline)(job, ctx) is True
         # 部分命中必须继续翻页：7 和后续页全部处理
@@ -227,7 +235,7 @@ class TestTermination:
         pipeline = _make_pipeline()
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
-        wall = {f"{PTYPE}::{sanitize_content_id(str(i))}" for i in range(7)}
+        wall = {f"{PTYPE}::{encode_content_id(str(i))}" for i in range(7)}
         ctx = _make_ctx(job, wall=wall)
         assert _handler(pipeline)(job, ctx) is True
         assert _seen_by_handler == set(), "整页命中后不应处理任何 item"
@@ -328,10 +336,10 @@ class TestRediscoveryAndDeletion:
 
 class TestCrashRerun:
     def test_mid_scan_crash_propagates(self):
-        """扫描中途 fetch 抛异常 → 异常传播（由错误分类决定重试/DLQ）。
+        """扫描中途 fetch 抛异常 → 异常传播（由错误分类决定重试/失败档案）。
 
-        本模型无游标可推进，崩溃即整轮重扫——已 spawn 的子任务
-        由确定性 job_id 的 wall 去重吸收，不重不漏。
+        本模型无游标可推进，崩溃即整轮重扫——已 spawn 的子任务由确定性
+        job_id 的 wall 去重吸收，不重不漏。
         """
         _reset_source([{"id": i} for i in range(7)])
         _crash_calls["n"] = 0
@@ -372,8 +380,8 @@ class TestCrashRerun:
 
 
 class TestInteractionMatrix:
-    def test_failed_child_is_completed_via_dlq(self):
-        """process 子任务进 DLQ（FatalError）→ is_failed 判定为已见。
+    def test_failed_child_is_seen_via_failed_archive(self):
+        """process 子任务进失败档案（FatalError）→ is_failed 判定为已见。
 
         poison 机制的替代：坏内容不再重新 spawn（等价旧版 dead-letter），
         且含坏 item 的页可正常整页命中（旧版含毒页永不命中，需 max_pages
@@ -383,8 +391,8 @@ class TestInteractionMatrix:
         pipeline = _make_pipeline()
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
-        # failed 快照含内容 "2"（上次 DLQ）
-        failed = {f"{PTYPE}::{sanitize_content_id('2')}"}
+        # failed 快照含内容 "2"（上次进失败档案）
+        failed = {f"{PTYPE}::{encode_content_id('2')}"}
         ctx = _make_ctx(job, failed=failed)
         assert _handler(pipeline)(job, ctx) is True
         # 坏内容 2 不再 spawn；3、1 正常处理
@@ -393,9 +401,8 @@ class TestInteractionMatrix:
     def test_wall_empty_rerun_rescans_all_dedup_by_framework(self):
         """wall 快照缺失（游标级状态丢失的等价物）→ 完整重扫。
 
-        与旧版「游标丢失 → 从空游标重扫」对偶：handler 层必然重跑，
-        去重由确定性 job_id 在框架 wall 层吸收（本测试只验证
-        「重扫不丢内容」）。
+        handler 层必然重跑，去重由确定性 job_id 在框架 wall 层吸收
+        （本测试只验证「重扫不丢内容」）。
         """
         _reset_source([{"id": i} for i in range(6)])
         pipeline = _make_pipeline()
@@ -420,7 +427,7 @@ class TestInteractionMatrix:
         job = Job("discover", "seed", payload={"artist_id": "A"})
         ctx = _make_ctx(job)
         assert _handler(pipeline)(job, ctx) is True
-        # 净化后的 content_id 必须以分组前缀开头（命名空间生效）。
+        # 编码后的 content_id 必须以分组前缀开头（命名空间生效）。
         # prefix = f"{len(key)}:{key}"，`:` 单射转义为 %3A
         processed = list(_seen_by_handler)
         assert len(processed) == 1
@@ -428,7 +435,7 @@ class TestInteractionMatrix:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 防御测试（D-1：每处防御分支必须配触发测试）
+# 防御测试（每处防御分支必须配触发测试）
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -508,7 +515,10 @@ class TestDefense:
         assert _seen_orig(set(_processed_guard)) == {"3", "1"}
         assert _poison_attempts["n"] == 1
         _processed_guard.clear()
-        wall = {f"{PTYPE}::{sanitize_content_id('3')}", f"{PTYPE}::{sanitize_content_id('1')}"}
+        wall = {
+            f"{PTYPE}::{encode_content_id('3')}",
+            f"{PTYPE}::{encode_content_id('1')}",
+        }
         ctx2 = _make_ctx(job, wall=wall)
         assert _handler(pipeline)(job, ctx2) is True
         assert _processed_guard == [], "好 item 已见不得重复处理"
@@ -582,12 +592,10 @@ def _rt_posts_with_new(old_count, new_ids):
 
 
 def _rt_setup(tmp_path, monkeypatch, name="rt_disc"):
-    import sys
-    from pathlib import Path
-    project_root = str(Path(__file__).resolve().parent.parent.parent)
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-    monkeypatch.setenv("PYTHONPATH", project_root)
+    """子进程按限定名 import 本模块（handler 反序列化）所需的路径环境。"""
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+    monkeypatch.setenv("PYTHONPATH", PROJECT_ROOT)
     return TaskLite(name=name, state_dir=tmp_path / "state", backend="sqlite", max_workers=3)
 
 
@@ -598,7 +606,7 @@ def test_real_subprocess_discovery(tmp_path, monkeypatch):
         pipeline, "rt_disc", _rt_fetch, _rt_id, _rt_process, "rt_child",
         cursor_key_func=_rt_cursor_key,
     )
-    pipeline.register_handler("rt_child", _rt_child_handler)
+    pipeline.register_task("rt_child", _rt_child_handler)
     pipeline.enqueue([Job("rt_disc", "seed", payload={
         "artist_id": "1", "posts": _rt_posts_upto(5),
     })])
@@ -609,7 +617,7 @@ def test_real_subprocess_discovery(tmp_path, monkeypatch):
     assert len(child_uids) == 5, f"expected 5 child jobs, got {child_uids}"
     # 命名空间前缀生效：job_id 以 5%3Art_1 开头（length-prefix，`:`→%3A）
     assert all(u.startswith("rt_child::4%3Art_1") for u in child_uids), child_uids
-    # 纯任务模型不产生任何 cursor（区别于旧 discovery）
+    # 纯任务模型不产生任何 cursor（区别于游标式 discovery）
     cursors = pipeline.backend.load_cursors()
     assert cursors == {}, f"discovery must not write cursors: {cursors}"
 
@@ -621,7 +629,7 @@ def test_real_subprocess_rediscovery(tmp_path, monkeypatch):
         pipeline, "rt_disc2", _rt_fetch, _rt_id, _rt_process, "rt_child",
         cursor_key_func=_rt_cursor_key,
     )
-    pipeline.register_handler("rt_child", _rt_child_handler)
+    pipeline.register_task("rt_child", _rt_child_handler)
 
     # 第一次发现：0..3
     pipeline.enqueue([Job("rt_disc2", "seed", payload={
@@ -646,23 +654,23 @@ def test_real_subprocess_rediscovery(tmp_path, monkeypatch):
 
 
 def test_real_subprocess_max_pages(tmp_path, monkeypatch):
-    """持续更新源无法整页命中 → max_pages 停止扫描（不超时、不 DLQ）。"""
+    """持续更新源无法整页命中 → max_pages 停止扫描（不超时、不进失败档案）。"""
     pipeline = _rt_setup(tmp_path, monkeypatch, name="rt_disc3")
     posts = sorted([{"id": str(i)} for i in range(100)], key=lambda p: p["id"], reverse=True)
     register_discovery(
         pipeline, "rt_disc3", _rt_fetch, _rt_id, _rt_process, "rt_child",
         max_pages=2,
     )
-    pipeline.register_handler("rt_child", _rt_child_handler)
+    pipeline.register_task("rt_child", _rt_child_handler)
     pipeline.enqueue([Job("rt_disc3", "seed", payload={"artist_id": "3", "posts": posts})])
-    pipeline.run()  # 不应超时/DLQ
+    pipeline.run()  # 不应超时/失败
 
     wall = pipeline.backend.load_wall()
     child_uids = [k for k in wall if k.startswith("rt_child::")]
-    # 只处理前 2 页 × 每页 2 条 = 4 个；不产生 partial cursor（旧版有）
+    # 只处理前 2 页 × 每页 2 条 = 4 个；不产生 partial cursor
     assert len(child_uids) == PAGESIZE_RT * 2, f"expected 4 children, got {child_uids}"
     failed = pipeline.backend.load_failed()
-    assert not failed, f"max_pages 截断不应进 DLQ: {failed}"
+    assert not failed, f"max_pages 截断不应进失败档案: {failed}"
 
 
 def test_real_subprocess_full_mode_with_max_pages(tmp_path, monkeypatch):
@@ -674,7 +682,7 @@ def test_real_subprocess_full_mode_with_max_pages(tmp_path, monkeypatch):
         scan_mode="full",
         max_pages=3,
     )
-    pipeline.register_handler("rt_child", _rt_child_handler)
+    pipeline.register_task("rt_child", _rt_child_handler)
 
     # 预先在 wall 中塞入前两页（100, 99, 98, 97）
     # 模拟历史深处有洞（第 3 页 96, 95 未下载）
@@ -709,7 +717,7 @@ def test_payload_dynamic_override_scan_mode_and_max_pages(tmp_path, monkeypatch)
         scan_mode="incremental",
         max_pages=1000,
     )
-    pipeline.register_handler("rt_child", _rt_child_handler)
+    pipeline.register_task("rt_child", _rt_child_handler)
 
     # 预置第 1 页（50, 49）到 wall
     pipeline.seed_wall([
@@ -758,4 +766,3 @@ def test_invalid_payload_scan_mode_and_max_pages_rejected(tmp_path):
         job_bad_max = Job("discover", "j2", payload={"max_pages": bad_max})
         with pytest.raises(ValueError, match="max_pages"):
             h(job_bad_max, _make_ctx(job_bad_max))
-

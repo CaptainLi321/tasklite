@@ -1,11 +1,21 @@
 """面向业务方的展示与切片工具。
 
-提供 job_ref / progress_hook / slice_list 三个便利工具，
-经 tasklite/__init__.py 统一导出。
+提供 job_ref / progress_hook / slice_list 三个便利工具，经
+``tasklite/__init__.py`` 统一导出。progress_hook 按
+``on_attempt_finished(uid, *, outcome)`` 钩子契约适配——布尔语义经
+AttemptFinish 值对象承载，不裸传四个散装参数。
 """
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any
+
+from .engine.types import AttemptFinish
+
+__all__ = [
+    "job_ref",
+    "progress_hook",
+    "slice_list",
+]
 
 
 def job_ref(meta: Any) -> str:
@@ -20,26 +30,36 @@ def job_ref(meta: Any) -> str:
     return ""
 
 
-def progress_hook(uid: str, meta: Any, success: bool, going_to_retry: bool) -> None:
-    """控制台每 job 终结回调：一行进度输出（标准钩子适配器）。"""
+def progress_hook(uid: str, *, outcome: AttemptFinish) -> None:
+    """控制台每 attempt 终结回调：一行进度输出（on_attempt_finished 标准适配器）。
+
+    重试文案为「重入队」而非任何延迟字眼——v2 重试节奏唯一经
+    RequeuePolicy seam 表达，默认立即重入队，标准适配器不预设延迟语义。
+    """
     task_type = uid.split("::", 1)[0]
-    ref = job_ref(meta)
+    ref = job_ref(outcome.meta)
     label = f"{task_type} {ref}" if ref else task_type
-    if going_to_retry:
-        print(f"  ⟳ {label} 失败，退避重试", flush=True)
-    elif success:
+    if outcome.going_to_retry:
+        print(f"  ⟳ {label} 失败，重入队重试", flush=True)
+    elif outcome.success:
         print(f"  ✓ {label}", flush=True)
     else:
-        print(f"  ✗ {label} → DLQ", flush=True)
+        print(f"  ✗ {label} → 失败档案", flush=True)
 
 
 def slice_list(
-    items: List[Any],
-    start: Optional[int],
-    count: Optional[int],
-    limit: Optional[int],
-) -> List[Any]:
-    """分批切片：先 limit，再 [start:start+count]。"""
+    items: list[Any],
+    *,
+    start: int | None = None,
+    count: int | None = None,
+    limit: int | None = None,
+) -> list[Any]:
+    """分批切片：先 limit 总量截断，再取 [start : start+count] 窗口。
+
+    参数纪律：start / count / limit 一律 keyword-only——三者语义易混
+    （``start+count`` 是窗口定位、``limit`` 是总量截断，先 limit 后窗口），
+    裸位置调用会把 limit 错传成 start 而静默得到错误切片。
+    """
     if limit is not None:
         items = items[:limit]
     if start is not None or count is not None:

@@ -1,1 +1,1 @@
-"""HTTP wrapper tests package."""
+"""wrappers 测试树（discovery / http）。"""

@@ -1,34 +1,31 @@
-"""DeadlockGovernor: 死锁归因、依赖宽限与缺口升级治理深模块。
+"""v2 死锁治理深模块：归因、依赖宽限与缺口升级。
 
 统一内敛：
-1. 依赖缺失宽限期管理（Dependency Grace Deadline & Missing Sets）；
-2. 死锁分类缺口连续轮次升级治理（Deadlock Gap Escalation Rounds）；
-3. 细粒度死锁归因分析与批量事务熔断（Cycle Detection, Missing Dep, Unknown/Impossible Resource）。
-"""
+1. 依赖缺失宽限期管理（宽限截止时刻与缺失集快照）；
+2. 死锁分类缺口连续轮次升级治理；
+3. 细粒度死锁归因分析与批量事务熔断（环检测、缺失依赖、
+   未知/超容资源、畸形条目）。
 
+术语口径：死锁熔断的终态落点是失败档案（failed）——按 uid 唯一
+终态、与 wall 全局互斥，由 store 的批量失败出口收敛。
+"""
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .store import StateStore
-    from ..backend.base import AbstractStateBackend
+from typing import Any, Protocol
 
 from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
-from .scheduler import StandstillFacts
-from ..taxonomy import (
+from .errorclass import (
     ERR_DEADLOCK_GAP,
     ERR_DEPENDENCY_DEADLOCK,
-    ERR_JOB_DEPENDENCY,
     ERR_MALFORMED_JOB,
     ERR_RESOURCE_DEADLOCK,
-    ErrorTaxonomy,
-    _DEFAULT_TAXONOMY,
 )
+from .scheduler import JobFacts, StandstillFacts
 
 logger = logging.getLogger("tasklite")
 
@@ -36,15 +33,49 @@ DEP_GRACE_SECONDS = 60.0
 DEADLOCK_GAP_MAX_ROUNDS = 5
 
 
+class ScanCache(Protocol):
+    """依赖宽限回退路径复用的调度投影缓存契约（JobScheduler 自动满足）。
+
+    单趟扫描已反序列化的 Job 投影按内容键缓存复用——宽限判定逐行
+    读 ``depends_on`` 时免二次全量反序列化。
+    """
+
+    def cached_job(self, job_dict: dict) -> JobFacts: ...
+
+
+class BulkFailureOutcome(Protocol):
+    """批量失败转移结果的鸭子形状（失败与级联 UID 列表）。"""
+
+    failed_uids: list[str]
+    cascaded_uids: list[str]
+
+
+class ArbitrationStore(Protocol):
+    """死锁仲裁所需的 store 契约。
+
+    ``state`` 提供只读事实（queue / wall / 环检测）；
+    ``apply_bulk_failure`` 是批量失败档案写入的单一出口（原子提交
+    失败档案行、按 uid 删除队列行并级联下游，返回转移结果）。
+    """
+
+    @property
+    def state(self) -> PipelineState: ...
+
+    def apply_bulk_failure(
+        self, uids_metas: Sequence[tuple[str, dict[str, Any]]]
+    ) -> BulkFailureOutcome: ...
+
+
 @dataclass(frozen=True)
 class DeadlockDecision:
     """死锁治理裁决结果（纯值对象，无阻塞副作用）。
 
-    - action: "resolved" (已归因并移入 DLQ) | "grace_waiting" (正在依赖宽限期中) | "gap_retrying" (分类缺口重试中) | "none" (未检测到死锁)
-    - should_terminate: bool (是否应终止主循环，如全队列 DLQ 完毕且队列清空)
-    - wait_time: float (建议外层事件泵等待的时延秒数，如宽限或重试时为 0.5s，否则为 0.0s)
-    - failed_uids: list[str] (本轮判定失败的 UID 列表)
-    - cascaded_uids: list[str] (本轮级联失败的 UID 列表)
+    - action: "resolved" (已归因并移入失败档案) | "grace_waiting" (正在依赖宽限期中)
+      | "gap_retrying" (分类缺口重试中) | "none" (未检测到死锁)
+    - should_terminate: 是否应终止主循环（如全队列熔断完毕且队列清空）
+    - wait_time: 建议外层事件泵等待的时延秒数（宽限或重试时为 0.5s，否则 0.0s）
+    - failed_uids: 本轮判定失败的 UID 列表
+    - cascaded_uids: 本轮级联失败的 UID 列表
     """
 
     action: str
@@ -56,7 +87,13 @@ class DeadlockDecision:
 
 @dataclass
 class DeadlockGovernor:
-    """统一死锁归因、依赖宽限与缺口升级治理深模块。"""
+    """统一死锁归因、依赖宽限与缺口升级治理深模块。
+
+    不变式（宽限窗语义）：宽限 episode 以缺失集快照为身份；episode 的
+    终结点有且仅有四个——超时裁决、无 spawner 裁决、派发前进信号、
+    超过一个宽限窗的残留检测。任何残留 deadline 泄漏进后续 episode
+    都会把同缺失集的新等待者零宽限误判死锁。
+    """
 
     dep_grace_seconds: float = DEP_GRACE_SECONDS
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
@@ -71,16 +108,16 @@ class DeadlockGovernor:
         self.deadlock_gap_rounds = 0
 
     def _end_grace_episode(self) -> None:
-        """终结当前宽限 episode（deadline 与缺失集快照一并清除）。
+        """终结当前宽限 episode（截止时刻与缺失集快照一并清除）。
 
         不变式：过期/残留 deadline 严禁泄漏进后续 episode——否则同缺失依赖
-        （同 uid 集合，如 retry 原样 requeue）的新等待者继承过期 deadline
-        被零宽限立即误判死锁 DLQ，即使面对全新 spawner 也无等待机会。
+        （同 uid 集合，如重试原样重入队）的新等待者继承过期 deadline
+        被零宽限立即误判死锁进失败档案，即使面对全新 spawner 也无等待机会。
         """
         self.dep_grace_deadline = None
         self.dep_grace_missing = None
 
-    def note_dispatch_progress(self) -> None:
+    def record_dispatch_progress(self) -> None:
         """派发前进信号终结当前宽限 episode（消解侧唯一终结点）。
 
         不变式：任何成功派发都证明此前的等待者已消解，残留 deadline 严禁
@@ -93,17 +130,47 @@ class DeadlockGovernor:
             self._end_grace_episode()
         self.deadlock_gap_rounds = 0
 
+    def _grant_or_expire(
+        self,
+        missing_uids: set[str],
+        now_mono: float,
+        effective_grace: float,
+    ) -> bool:
+        """授予新宽限或裁决当前宽限已过期（授予/过期的唯一裁决点）。
+
+        返回 True 表示宽限中（主循环应继续等待）；False 表示宽限已超时
+        并已终结 episode。
+        """
+        deadline = self.dep_grace_deadline
+        if deadline is None:
+            deadline = now_mono + effective_grace
+            self.dep_grace_deadline = deadline
+            logger.warning(
+                f"DEPENDENCY GRACE: {len(missing_uids)} job(s) waiting "
+                f"on missing deps; granting {effective_grace}s "
+                f"grace (runnable job(s) may spawn them)."
+            )
+        if now_mono < deadline:
+            return True
+        self._end_grace_episode()
+        logger.error(
+            f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
+            f"still waiting on missing deps after "
+            f"{effective_grace}s; treating as deadlock (failure archive)."
+        )
+        return False
+
     def check_dependency_grace(
         self,
         state: PipelineState,
-        missing_identifiers: Sequence[int | str] | set[str] | Sequence[str],
+        missing_identifiers: Sequence[int | str] | set[str],
         *,
         has_potential_spawners: bool | None = None,
-        scheduler: Any | None = None,
+        scheduler: ScanCache | None = None,
         now: float | None = None,
         grace_seconds: float | None = None,
     ) -> bool:
-        """评估缺失依赖的作业是否应授予宽限期（等待潜在 spawner 产出而非立即 DLQ）。
+        """评估缺失依赖的作业是否应授予宽限期（等待潜在 spawner 产出而非立即进失败档案）。
 
         返回 True 表示正在宽限中（主循环应继续等待）；False 表示无候选或宽限已超时。
         （纯逻辑计算，不产生 sleep 副作用）。
@@ -141,61 +208,28 @@ class DeadlockGovernor:
         ):
             self._end_grace_episode()
 
-        # 若调度器已单趟给出潜在 spawner 裁决，直接复用事实（避免二次扫描队列及重复反序列化）
+        # 若调度器已单趟给出潜在 spawner 裁决，直接复用事实
+        # （避免二次扫描队列及重复反序列化）
         if has_potential_spawners is not None:
             if not has_potential_spawners:
                 self._end_grace_episode()
                 return False
-            deadline = self.dep_grace_deadline
-            if deadline is None:
-                deadline = now_mono + effective_grace
-                self.dep_grace_deadline = deadline
-                logger.warning(
-                    f"DEPENDENCY GRACE: {len(missing_uids)} job(s) waiting "
-                    f"on missing deps; granting {effective_grace}s "
-                    f"grace (runnable job(s) may spawn them)."
-                )
-            if now_mono < deadline:
-                return True
-            self._end_grace_episode()
-            logger.error(
-                f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
-                f"still waiting on missing deps after "
-                f"{effective_grace}s; treating as deadlock (DLQ)."
-            )
-            return False
+            return self._grant_or_expire(missing_uids, now_mono, effective_grace)
 
-        # 兼容回退：检查队列中是否存在「全部已知依赖已在 wall 中」的潜在可运行作业
+        # 回退路径：检查队列中是否存在「全部已知依赖已在 wall 中」的潜在可运行作业
         for jd in state.queue:
             uid = uid_from_job_dict(jd)
             if uid in missing_uids:
                 continue
             try:
-                if scheduler is not None and hasattr(scheduler, "cached_job"):
+                if scheduler is not None:
                     job = scheduler.cached_job(jd)
                 else:
                     job = Job.from_dict(jd)
             except (KeyError, TypeError, ValueError):
                 continue
             if all(dep in state.wall for dep in job.depends_on):
-                deadline = self.dep_grace_deadline
-                if deadline is None:
-                    deadline = now_mono + effective_grace
-                    self.dep_grace_deadline = deadline
-                    logger.warning(
-                        f"DEPENDENCY GRACE: {len(missing_uids)} job(s) waiting "
-                        f"on missing deps; granting {effective_grace}s "
-                        f"grace (runnable job(s) may spawn them)."
-                    )
-                if now_mono < deadline:
-                    return True
-                self._end_grace_episode()
-                logger.error(
-                    f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
-                    f"still waiting on missing deps after "
-                    f"{effective_grace}s; treating as deadlock (DLQ)."
-                )
-                return False
+                return self._grant_or_expire(missing_uids, now_mono, effective_grace)
         return False
 
     def check_gap_or_escalate(
@@ -206,7 +240,7 @@ class DeadlockGovernor:
     ) -> bool:
         """死锁分类缺口的连续轮次升级逻辑。
 
-        返回 True 表示已达上限需升级为全队列 DLQ；False 表示未达上限，等待下一轮重试。
+        返回 True 表示已达上限需升级为全队列熔断；False 表示未达上限，等待下一轮重试。
         （纯计数逻辑，不产生 sleep 副作用）。
         """
         effective_max = (
@@ -221,38 +255,39 @@ class DeadlockGovernor:
             return False
         logger.critical(
             f"{log_prefix} persisted for {effective_max} rounds; "
-            f"escalating to whole-queue DLQ ({ERR_DEADLOCK_GAP})."
+            f"escalating to whole-queue failure archive ({ERR_DEADLOCK_GAP})."
         )
         return True
 
     @staticmethod
     def _split_deadlock_by_uids(
         queue: list[dict[str, Any]],
-        target_uids: set[str],
+        target_uids: set[str] | None,
         error: str,
-    ) -> tuple[list[tuple[str, dict[str, Any]]], list[dict[str, Any]]]:
-        """把队列拆分为「进 DLQ 的肇事者」与「保留的剩余队列」。"""
-        uids_metas: list[tuple[str, dict[str, Any]]] = []
-        remaining_queue: list[dict[str, Any]] = []
-        for jd in queue:
-            uid = uid_from_job_dict(jd)
-            if uid in target_uids:
-                uids_metas.append((uid, {"error": error, "root_cause": True}))
-            else:
-                remaining_queue.append(jd)
-        return uids_metas, remaining_queue
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """从队列拆出「进失败档案的肇事者」（uid → 错误元数据）。
+
+        ``target_uids=None`` 表示缺口升级的全队列兜底熔断（全部行标记
+        root_cause）。队列剩余行的去留由 store 的批量失败出口按 uid
+        精准删除收敛，本方法只负责归因装配。
+        """
+        return [
+            (uid_from_job_dict(jd), {"error": error, "root_cause": True})
+            for jd in queue
+            if target_uids is None or uid_from_job_dict(jd) in target_uids
+        ]
 
     def arbitrate(
         self,
         facts: StandstillFacts | None,
-        store: "StateStore",
+        store: ArbitrationStore,
     ) -> DeadlockDecision:
         """自闭环死锁仲裁单一入口。
 
         评估停摆事实：
         1. 若 min_wait == inf，直接触发 resolve_deadlock 进行细粒度归因与批量熔断；
-        2. 若 min_wait 为有限值，但处于 waiting_for_dependency 且存在拓扑成环（find_dependency_cycles），
-           自动识别隐式死锁并触发 resolve_deadlock；
+        2. 若 min_wait 为有限值，但处于 waiting_for_dependency 且存在拓扑成环
+           （find_dependency_cycles），自动识别隐式死锁并触发 resolve_deadlock；
         3. 否则认定为正常等待或背压，返回 action="none"。
         """
         if facts is None:
@@ -266,7 +301,7 @@ class DeadlockGovernor:
             cycle_uids = store.state.find_dependency_cycles()
             if cycle_uids:
                 logger.error(
-                    f"Deadlock detected during backoff/wait: dependency cycle "
+                    f"Deadlock detected during wait: dependency cycle "
                     f"{sorted(set(cycle_uids))} masked by finite min_wait."
                 )
                 return self.resolve_deadlock(facts, store=store)
@@ -279,11 +314,11 @@ class DeadlockGovernor:
     def resolve_deadlock(
         self,
         facts: StandstillFacts,
-        store: "StateStore",
+        store: ArbitrationStore,
         *,
-        scheduler: Any | None = None,
+        scheduler: ScanCache | None = None,
     ) -> DeadlockDecision:
-        """处理死锁：细粒度归因 + bulk_failure + cascade（纯计算求值，无阻塞副作用）。"""
+        """处理死锁：细粒度归因 + 批量失败档案提交 + 级联（纯计算求值，无阻塞副作用）。"""
         effective_state = store.state
         effective_grace = self.dep_grace_seconds
         effective_gap_max = self.deadlock_gap_max_rounds
@@ -296,12 +331,12 @@ class DeadlockGovernor:
 
         if malformed_uids:
             logger.error(f"Deadlock: {len(malformed_uids)} job(s) have malformed dict (unparseable).")
-            uids_metas, remaining_queue = self._split_deadlock_by_uids(
+            uids_metas = self._split_deadlock_by_uids(
                 list(effective_state.queue), malformed_uids, ERR_MALFORMED_JOB
             )
         elif unknown_uids:
             logger.error(f"Deadlock: {len(unknown_uids)} job(s) reference unknown resource(s).")
-            uids_metas, remaining_queue = self._split_deadlock_by_uids(
+            uids_metas = self._split_deadlock_by_uids(
                 list(effective_state.queue), unknown_uids, ERR_RESOURCE_DEADLOCK
             )
         elif missing_uids:
@@ -321,12 +356,12 @@ class DeadlockGovernor:
                     wait_time=0.5,
                 )
             logger.error(f"Deadlock: {len(missing_uids)} job(s) have unresolvable (missing) dependencies.")
-            uids_metas, remaining_queue = self._split_deadlock_by_uids(
+            uids_metas = self._split_deadlock_by_uids(
                 list(effective_state.queue), missing_uids, ERR_DEPENDENCY_DEADLOCK
             )
         elif impossible_uids:
             logger.error(f"Deadlock: {len(impossible_uids)} job(s) request impossible resource amounts (exceeds capacity).")
-            uids_metas, remaining_queue = self._split_deadlock_by_uids(
+            uids_metas = self._split_deadlock_by_uids(
                 list(effective_state.queue), impossible_uids, ERR_RESOURCE_DEADLOCK
             )
         elif facts.waiting_for_dependency:
@@ -342,18 +377,15 @@ class DeadlockGovernor:
                         should_terminate=False,
                         wait_time=0.5,
                     )
-                uids_metas = [
-                    (uid_from_job_dict(jd),
-                     {"error": ERR_DEADLOCK_GAP, "root_cause": True})
-                    for jd in effective_state.queue
-                ]
-                remaining_queue = []
+                uids_metas = self._split_deadlock_by_uids(
+                    list(effective_state.queue), None, ERR_DEADLOCK_GAP
+                )
             else:
                 logger.error(
                     f"Deadlock detected: dependency cycle among {len(cycle_uids)} job(s): "
                     f"{sorted(cycle_uids)}"
                 )
-                uids_metas, remaining_queue = self._split_deadlock_by_uids(
+                uids_metas = self._split_deadlock_by_uids(
                     list(effective_state.queue), cycle_uids, ERR_DEPENDENCY_DEADLOCK
                 )
         else:
@@ -367,15 +399,12 @@ class DeadlockGovernor:
                     should_terminate=False,
                     wait_time=0.5,
                 )
-            uids_metas = [
-                (uid_from_job_dict(jd),
-                 {"error": ERR_DEADLOCK_GAP, "root_cause": True})
-                for jd in effective_state.queue
-            ]
-            remaining_queue = []
+            uids_metas = self._split_deadlock_by_uids(
+                list(effective_state.queue), None, ERR_DEADLOCK_GAP
+            )
 
-        # 提交批量死锁失败
-        outcome = store.apply_bulk_failure(uids_metas, remaining_queue=remaining_queue)
+        # 提交批量死锁失败（失败档案单一出口）
+        outcome = store.apply_bulk_failure(uids_metas)
         self.deadlock_gap_rounds = 0
         should_terminate = len(outcome.failed_uids) > 0 and len(effective_state.queue) == 0
         return DeadlockDecision(
@@ -386,9 +415,13 @@ class DeadlockGovernor:
             cascaded_uids=outcome.cascaded_uids,
         )
 
+
 __all__ = [
+    "ArbitrationStore",
+    "BulkFailureOutcome",
+    "DEADLOCK_GAP_MAX_ROUNDS",
+    "DEP_GRACE_SECONDS",
     "DeadlockDecision",
     "DeadlockGovernor",
-    "DEP_GRACE_SECONDS",
-    "DEADLOCK_GAP_MAX_ROUNDS",
+    "ScanCache",
 ]
