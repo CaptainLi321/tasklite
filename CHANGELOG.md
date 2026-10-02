@@ -10,7 +10,7 @@
 
 ## [2.0.0] - 2026-10-02
 
-v2 上位为主包的破坏性大版本（上位总纲 [ADR-0005](docs/adr/0005-v2-promotion.md)，重建设计 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，使用指南 [docs/V2_GUIDE.md](docs/V2_GUIDE.md)）：v2 子包物理提升为 `tasklite` 主包（单原子提交世界切换，生产代码零逻辑改写），v1 树整体退役（git 历史与 `v1-final` 标签留档），`tasklite.v2` 导入路径消亡且**不留路径别名**。本版同时收录 v2 并行重建期的全部特性（Task/Job/Attempt 三层模型，全量 2204 测试）。
+v2 上位为主包的破坏性大版本（上位总纲 [ADR-0005](docs/adr/0005-v2-promotion.md)，重建设计 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，使用指南 [docs/V2_GUIDE.md](docs/V2_GUIDE.md)）：v2 子包物理提升为 `tasklite` 主包（单原子提交世界切换，生产代码零逻辑改写），v1 树整体退役（git 历史与 `v1-final` 标签留档），v2 子包导入路径消亡且**不留路径别名**。本版同时收录 v2 并行重建期的全部特性（Task/Job/Attempt 三层模型，全量 2204 测试）。
 
 ### 移除（向后不兼容）
 
