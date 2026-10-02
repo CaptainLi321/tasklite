@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20external-brightgreen.svg)]()
 [![ACID Persistence](https://img.shields.io/badge/persistence-SQLite%20WAL%20(ACID)-orange.svg)]()
-[![Tests](https://img.shields.io/badge/tests-2000%2B%20passed-success.svg)]()
+[![Tests](https://img.shields.io/badge/tests-2200%2B%20passed-success.svg)]()
 
 ---
 
@@ -22,7 +22,7 @@
 - **标准库进程池 (`multiprocessing.Pool` / `ProcessPoolExecutor`)**：
   - ❌ 缺乏内置状态持久化，程序中断后已完成进度丢失；
   - ❌ 子任务发生 C 扩展段错误 (SIGSEGV) 或内存泄露 (OOM) 时，容易导致主进程一同崩溃；
-  - ❌ 缺少全局速率限制与服务熔断机制，缺乏 DAG 拓扑依赖与死信隔离。
+  - ❌ 缺少全局速率限制与服务熔断机制，缺乏 DAG 拓扑依赖与失败隔离。
 - **重型分布式任务队列 (`Celery` / `Airflow` / `Temporal`)**：
   - ❌ 强依赖 Redis、RabbitMQ、PostgreSQL 等外部服务，本地单机运行或轻量嵌入脚本时运维成本过高；
   - ❌ 架构较重，不适合作为随用随走的轻量批处理脚手架。
@@ -30,7 +30,7 @@
 **TaskLite 的设计定位**：  
 **零依赖的单机批处理脚手架**——只需 `pip install tasklite-engine`。
 1. **多 Worker 并发加速**：多进程并行执行，充分利用多核算力，彻底解决单线程耗时长的问题；
-2. **断点续跑防重跑**：以 SQLite WAL 事务表记录状态，已完成的任务自动跳过，失败任务进入死信队列或退避重试，杜绝因个别失败导致全量重跑；
+2. **断点续跑防重跑**：以 SQLite WAL 事务表记录状态，已完成的任务自动跳过，失败任务立即重入队重试、预算耗尽进失败档案，杜绝因个别失败导致全量重跑；
 3. **物理隔离与容灾**：主进程只负责调度，业务逻辑在独立子进程中运行并设超时强杀，即使子任务崩溃、死锁或系统断电，状态依然完整可恢复。
 
 ---
@@ -90,7 +90,7 @@ flowchart TD
 
 ### 2. ⚡ SQLite WAL 状态持久化 (ACID)
 - 基于 SQLite WAL + `synchronous=FULL` 模式；
-- 四集合状态机（Wall 已完成 / Queue 待办 / In-Flight 在途 / Failed 死信）在单次事务中原子转移；
+- 状态机（Wall 成功档案 / Queue 待办 / In-Flight 在途 / Failed 失败档案）在单次事务中原子转移；
 - 遭遇中断或异常关机时，重启后支持 At-Least-Once 接续执行。
 
 ### 3. 🔍 函数式增量探索 (Functional Discovery)
@@ -103,7 +103,7 @@ flowchart TD
 
 ### 5. 🔗 DAG 拓扑依赖与级联熔断
 - 任务通过 `depends_on` 声明依赖；
-- 父任务失败进入死信队列时，所有下游依赖自动标记跳过 (`JOB_DEPENDENCY`)，避免无效计算。
+- 父任务失败进入失败档案时，所有下游依赖自动标记跳过 (`ERR_JOB_DEPENDENCY`)，避免无效计算。
 
 ### 6. 📦 产物沙盒与自动清理
 - `ctx.declare_output()` 声明产出文件，内置路径遍历防御 (`../` 拒绝)；
@@ -111,7 +111,7 @@ flowchart TD
 
 ### 7. 🌐 组合式 HTTP 网络工具与快照守卫 (HTTP Wrappers)
 - 开放 Callable 设计，支持原生 `urllib`、`requests`、`httpx` 或平台自定义签名 SDK；
-- `http_guard` 自动捕获 429、解析 `Retry-After` 并触发 `ctx.suspend_resource` 全管线退避，收敛异常三分类；
+- `http_guard` 自动捕获 429、解析 `Retry-After` 并触发 `ctx.suspend_resource` 全管线挂起，收敛异常三分类；
 - `SQLiteSnapshotStore` 提供单射键原始响应快照持久化，支持全离线幂等重放；
 - 内置标准 Netscape `cookies.txt` 解析工具。
 
@@ -138,31 +138,31 @@ from tasklite import TaskLite, Job, RetryError, RateLimitResource
 
 logging.getLogger("tasklite").setLevel(logging.INFO)
 
-# 1. 定义任务处理器（在独立子进程中执行）
+# 1. 定义任务处理器（在独立子进程中执行，必须模块级定义）
 def download_handler(job: Job, ctx):
     # 声明产出文件（失败时自动清理半残文件）
     out = ctx.declare_output(f"./downloads/{job.job_id}.jpg", cleanup_on_fail=True)
-    
+
     # 模拟业务下载
     success = do_download(job.payload["url"], out)
     if not success:
-        raise RetryError("网络抖动，触发指数退避重试")
-    
+        raise RetryError("网络抖动，立即重入队重试")
+
     return True, {"size": 1024, "path": str(out)}
 
-# 2. 初始化引擎与配置资源
+# 2. 初始化引擎（六步调用契约：初始化 → register_resource → register_task → enqueue → run → stop）
 pipeline = TaskLite(
     name="media_downloader",
     state_dir="./state",        # 状态持久化目录（SQLite WAL）
     output_root="./downloads",  # 产物沙盒根目录
-    max_workers=4,              # 并发子进程数
+    max_workers=4,              # 并发子进程数（内部 __workers__ 容量资源，可覆盖）
 )
 
-# 3. 注册全局限速（每秒最多 2 次请求）与处理器
-pipeline.add_resource(RateLimitResource("api", interval_seconds=0.5))
-pipeline.register_handler("download", download_handler, default_resources={"api": 1.0})
+# 3. 注册全局限速（每秒最多 2 次请求）与 Task 规格
+pipeline.register_resource(RateLimitResource("api", interval_seconds=0.5))
+pipeline.register_task("download", download_handler, default_resources={"api": 1.0})
 
-# 4. 入队并启动（阻塞直到队列全部完成）
+# 4. 入队并启动（阻塞直到队列全部完成，返回 RunSummary）
 pipeline.enqueue([
     Job("download", "img_001", payload={"url": "https://example.com/1.jpg"}),
     Job("download", "img_002", payload={"url": "https://example.com/2.jpg"}),
@@ -172,15 +172,21 @@ pipeline.run()
 
 ---
 
-## 🧭 v2 三层模型（Task/Job/Attempt）
+## 🧭 三层模型（Task / Job / Attempt）
 
-本包为 **v2 重建版**（设计总纲 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，上位裁决 [ADR-0005](docs/adr/0005-v2-promotion.md)）：架构保留进程隔离、SQLite WAL、六步调用契约，模型重塑为 **Task（规格）/ Job（逻辑实例）/ Attempt（执行轨迹）** 三层，命名体系全面翻新（`register_handler`→`register_task`、`add_resource`→`register_resource`、死信队列→**失败档案**、`sanitize_*`→`encode_*`），退避机制移除、调度策略收敛为 OrderingPolicy / RequeuePolicy 接缝。**v1 已退役**（git 历史与 `v1-final` 标签留档）。
+本引擎按实时系统理论建模为三层（设计总纲 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，上位裁决 [ADR-0005](docs/adr/0005-v2-promotion.md)）：
+
+| 层 | 定义 | 持久化 |
+|---|---|---|
+| **Task（规格）** | 进程内注册的静态模板：task_type 名、handler、默认资源、payload_schema、默认 max_retries / timeout | 代码即规格，不落盘；注册于 `register_task` |
+| **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变 | queue 行 job_data JSON（uid 为主键） |
+| **Attempt（执行轨迹）** | 一次物理执行的记录：attempt 序号、incarnation、起止时间、结局 | append-only 新表 `attempts` |
+
+任一 attempts 行可回溯「哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——端到端追溯链完整。完整使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**（权威）；v1 → v2 命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)。**v1 已退役**（git 历史与 `v1-final` 标签留档）。
 
 ```python
 from tasklite import TaskLite, Job, Task, AttemptRecord
 ```
-
-使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**，v1 → v2 命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)。
 
 ---
 
@@ -201,7 +207,7 @@ def item_id(post) -> str:
     return str(post["id"])  # 唯一内容 ID
 
 def process_item(job, ctx, post, content_id: str):
-    # 发现新内容时派生子任务（content_id 已做单射净化）
+    # 发现新内容时派生子任务（content_id 已做单射编码）
     ctx.spawn(Job("download", content_id, payload={"url": post["url"]}))
 
 # 注册增量探索
@@ -242,7 +248,7 @@ from tasklite import RateLimitHit
 def fetch_handler(job, ctx):
     resp = requests.get(job.payload["url"])
     if resp.status_code == 429:
-        # 全管线挂起 api 资源 1 小时，状态持久化到磁盘，随后抛出退避重试
+        # 全管线挂起 api 资源 1 小时，状态持久化到磁盘，随后抛出瞬态重试
         ctx.suspend_resource("api", seconds=3600)
         raise RateLimitHit("Triggered 429, suspending API for 1h")
     return True, resp.json()
@@ -269,8 +275,8 @@ def agent_worker(job: Job, ctx):
     return True, {"tokens": result.get("usage", 0)}
 
 pipeline = TaskLite(name="agent_batch", state_dir="./agent_state", max_workers=8)
-pipeline.add_resource(RateLimitResource("llm_rpm", interval_seconds=0.1))
-pipeline.register_handler("analyze", agent_worker, default_resources={"llm_rpm": 1.0})
+pipeline.register_resource(RateLimitResource("llm_rpm", interval_seconds=0.1))
+pipeline.register_task("analyze", agent_worker, default_resources={"llm_rpm": 1.0})
 
 # 入队海量任务，中途即使断网或意外中断，重启后自动跳过已完成任务接续执行
 pipeline.enqueue([
@@ -284,40 +290,43 @@ pipeline.run()
 
 ```python
 from tasklite import TaskLite, RateLimitResource
-from tasklite.wrappers.http import SQLiteSnapshotStore, http_guard, fetch_urllib
+from tasklite.wrappers.http import SQLiteSnapshotStore, http_guard, urllib_fetch
 
 pipeline = TaskLite("crawler", state_dir="./states")
-pipeline.add_resource(RateLimitResource("api", interval_seconds=1.0))
+pipeline.register_resource(RateLimitResource("api", interval_seconds=1.0))
 
 # 原始 HTTP 响应持久化快照（独立 snapshots.db，支持全离线重放与反爬保护）
 snapshot_store = SQLiteSnapshotStore("./snapshots.db")
-cached_fetch = snapshot_store.cached(fetch_urllib)
+cached_fetch = snapshot_store.cached(urllib_fetch)
 
 def crawler_handler(job, ctx):
-    # 429 时自动挂起 api 资源、5xx 瞬态重试、4xx 直接 DLQ
+    # 429 时自动挂起 api 资源、5xx 瞬态重试、4xx 直接进失败档案
     with http_guard(ctx=ctx, resource="api", default_suspend_ttl=60.0):
         resp = cached_fetch(job.payload["url"])
         return resp.json()
 
-pipeline.register_handler("fetch", crawler_handler, default_resources={"api": 1.0})
+pipeline.register_task("fetch", crawler_handler, default_resources={"api": 1.0})
 ```
 
 ---
 
 
-## 🛠️ 死信队列与运维 (DLQ & Ops)
+## 🛠️ 失败档案与运维 (Failed & Ops)
 
-当任务重试超限或发生致命错误时，任务进入持久化死信队列 (DLQ)。可以通过标准 API 检查与清理：
+当任务重试预算耗尽或发生致命错误时，任务进入持久化**失败档案**（failed 表，与 wall 按 uid 互斥且唯一终态）。运维 API 仅限 `run()` 外调用：
 
 ```python
-# 1. 检查死信详情
-for entry in pipeline.list_dlq():
-    print(f"UID: {entry.uid}, 错误类型: {entry.error_type}, 原因: {entry.error}")
+# 1. 检查失败详情（条目携带原始业务 payload 快照，补跑自足）
+for entry in pipeline.list_failures():
+    print(f"UID: {entry.uid}, 原因: {entry.error}, 元数据: {entry.meta}")
 
-# 2. 清理指定类型的 DLQ（默认保留 fatal 错误，可入队同名任务重跑）
-pipeline.clear_dlq(task_types=["download"], keep_fatal=False)
+# 2. 清理指定类型的失败档案（默认保留 fatal 错误，可入队同名任务重跑）
+pipeline.clear_failures(task_types=["download"], keep_fatal=False)
 
-# 3. 精确或前缀清理历史（wall / failed）
+# 3. 单条人工补跑：移出档案、按档案 payload 快照队首重入队
+pipeline.retry_failure("download::img_001")
+
+# 4. 精确或前缀清理历史（wall / failed）
 pipeline.clear_history("download::")
 ```
 

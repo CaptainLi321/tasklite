@@ -1,6 +1,6 @@
-# TaskLite v2 使用指南
+# TaskLite 使用指南（v2）
 
-> v2 是 [`docs/adr/0004-v2-parallel-rebuild.md`](adr/0004-v2-parallel-rebuild.md) 裁决的**并行重建子包**：架构照搬 v1（进程隔离、SQLite WAL 状态机、六步调用契约、瞬态信号军规全部保留），命名与模型按 ADR-0004 重塑。本指南是 v2 的权威使用文档；架构总览与概念词典见 [`ENGINE_ARCHITECTURE.md`](ENGINE_ARCHITECTURE.md)（v1 视角），设计与迁移军规见 ADR-0004。
+> 本包为 [`docs/adr/0004-v2-parallel-rebuild.md`](adr/0004-v2-parallel-rebuild.md) 重建、经 [ADR-0005](adr/0005-v2-promotion.md) 上位为主包的引擎：进程隔离、SQLite WAL 状态机、六步调用契约、瞬态信号军规全部保留，模型与命名按 ADR-0004 重塑。本指南是现行**权威**使用文档；v1 时代架构文档 [`ENGINE_ARCHITECTURE.md`](ENGINE_ARCHITECTURE.md) 已归档留档。
 
 ---
 
@@ -24,19 +24,18 @@ from tasklite import (
 
 子包路径补充：`from tasklite.wrappers.discovery import register_discovery`（增量扫描适配）、`from tasklite.wrappers.http import http_guard, urllib_fetch, SQLiteSnapshotStore`（网络守卫与快照）、`from tasklite.testing import fake_ctx`（handler 单测构造器）。wrappers 不进主 `__all__`，经 `tasklite.wrappers.*` 导入。
 
-**隔离与冻结（ADR-0004 裁决）**：
+**架构红线与边界**：
 
-- **v2 严禁 import v1**——`tasklite` 不依赖旧树任何模块，保证独立演进与最终整体替换；
-- **v1 处于冻结期**——仅允许缺陷修复，不接受新特性；冻结期缺陷须 v1/v2 双落修复；
-- v2 分层红线镜像：`v2/models/` 严禁 import `v2/engine/`，`v2/utils/` 严禁 import `v2/wrappers/`，v2 核心层严禁依赖 `v2/contrib/`；
-- v2 无独立版本号，随主包 `tasklite.__version__` 单一事实源；
-- **数据库零兼容**：v2 schema 全新（含 attempts 表），不认 v1 旧库。
+- 分层单向依赖：`tasklite/models/` 严禁 import `tasklite/engine/`（IPC 声明读写一律下沉 `tasklite/utils/ipc.py`），`tasklite/utils/` 严禁 import `tasklite/wrappers/`，核心层（engine/backend/models/utils）严禁依赖 `tasklite/contrib/`；
+- 版本单一事实源：`tasklite.__version__`（pyproject 动态读取点）；
+- **数据库零兼容**：schema 全新（含 attempts 表），旧库 fail-loud 拒识（`user_version=3`）；
+- v1 已退役：git 历史与 `v1-final` 标签留档，迁移映射见第 6 节与 ADR-0004。
 
 ---
 
 ## 2. Task / Job / Attempt 三层模型
 
-v2 把 v1 混于一个 `Job` 的概念拆成三层——规格、逻辑实例、执行轨迹各有其身：
+本引擎把规格与执行实例拆成三层——规格、逻辑实例、执行轨迹各有其身：
 
 | 层 | 定义 | 持久化 |
 |---|---|---|
@@ -124,7 +123,7 @@ Job uid = task_type::job_id ──当前终态──▶ wall（成功档案） /
 Task 规格（进程内 TaskRegistry：handler / 默认资源 / payload_schema / 默认重试与超时）
 ```
 
-任一 attempt 行出发都能回答「这是哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——v1 时代一次执行没有独立持久身份、重试即 DELETE+INSERT 的追溯断层由此补齐。
+任一 attempt 行出发都能回答「这是哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——一次执行没有独立持久身份、重试即 DELETE+INSERT 的追溯断层由此补齐。
 
 ---
 
@@ -229,11 +228,11 @@ pipeline.retry_failure("download::img_001")
 
 ## 5. 调度扩展 seam（OrderingPolicy / RequeuePolicy）
 
-v2 核心**不含任何调度策略计算**：候选排序与重试节奏各留一个接缝，扩展一律以 wrapper/util 形态插入，核心不动。
+核心**不含任何调度策略计算**：候选排序与重试节奏各留一个接缝，扩展一律以 wrapper/util 形态插入，核心不动。
 
 ### OrderingPolicy：队列访问序
 
-`scan_next_runnable`（`v2/engine/scheduler.py`）是**唯一选择点**：调度器按 OrderingPolicy 给出的下标序逐条评估队列、首个可运行者处停止（首中即停）。默认实现 `FifoOrderingPolicy`（按 seq 升序）。自定义策略经门面构造参数 `ordering` 注入（None → FIFO，默认解析收敛在 `RunConfig.resolve` 唯一解析点）：
+`scan_next_runnable`（`tasklite/engine/scheduler.py`）是**唯一选择点**：调度器按 OrderingPolicy 给出的下标序逐条评估队列、首个可运行者处停止（首中即停）。默认实现 `FifoOrderingPolicy`（按 seq 升序）。自定义策略经门面构造参数 `ordering` 注入（None → FIFO，默认解析收敛在 `RunConfig.resolve` 唯一解析点）：
 
 ```python
 from collections.abc import Iterable, Sequence
@@ -277,7 +276,7 @@ pipeline = TaskLite(name="media", state_dir="./state",
 
 ### 核心禁改红线
 
-- v2 核心（models/backend/engine/utils）**禁止出现任何排序计算与退避计算**；
+- 核心（models/backend/engine/utils）**禁止出现任何排序计算与退避计算**；
 - **Job 模型不携带** `priority` / `deadline` / `period` 字段——其存放与语义由未来调度策略 ADR 裁决；
 - 软 EDF / 优先级 / aging / 错峰 / 准入控制等策略引入时**须新立 ADR**，以 wrapper/util 形态实现上述接缝，核心不动。
 
@@ -311,7 +310,7 @@ pipeline = TaskLite(name="media", state_dir="./state",
 
 ## 7. backoff 移除说明
 
-v2 **砍除了整个退避机制**：`BackoffGovernor` 与 `backoff_base` / `backoff_max` / `backoff_until` / `backoff_wall_deadline` 全族不再存在。v2 的重试语义是**立即重入队**：
+本引擎**砍除整个退避机制**：`BackoffGovernor` 与 `backoff_base` / `backoff_max` / `backoff_until` / `backoff_wall_deadline` 全族（v1 遗产）不再存在。重试语义是**立即重入队**：
 
 - 失败（未耗尽预算）→ `ImmediateRequeuePolicy` 规划 `RequeuePlan(front=True, delay_seconds=0.0)` → 队首重入队 → 下一轮扫描即可再次派发；
 - 重试间隔不再由框架注入——若业务需要节奏（固定退避、指数退避、限速窗），经门面构造参数 `requeue_policy` 注入自定义 `RequeuePolicy`（见第 5 节示例骨架），核心零改动；

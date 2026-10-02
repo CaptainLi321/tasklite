@@ -1,8 +1,7 @@
 # AGENTS.md（自动加载指针与开发红线）
 
-> 完整架构设计、状态机模型与概念词典见 **[`docs/ENGINE_ARCHITECTURE.md`](docs/ENGINE_ARCHITECTURE.md)**。
+> 权威使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**（Task/Job/Attempt 三层模型与全部公开契约）。
 > 文档唯一总纲见 **[`README.md`](README.md)**（以及「设计契约」章节）。
-> 完整 API 与运维参考见 **[`docs/API_GUIDE.md`](docs/API_GUIDE.md)**。
 > 本文件定义 Agent 在本仓库开发、重构、修复时**必须绝对遵守的硬性红线与工作流纪律**。
 
 ---
@@ -10,10 +9,10 @@
 ## 一、核心红线与开发纪律（必须遵守）
 
 1. **测试全绿才允许提交**：
-   - 提交前必须执行全量测试：`python -m pytest tests/ -q -p no:cacheprovider`（必须 100% 绿灯，测试数量随 v2 双轨期增长，以 `pytest --collect-only` 实测为准）。
+   - 提交前必须执行全量测试：`python -m pytest tests/ -q -p no:cacheprovider`（必须 100% 绿灯，约 2200 个测试，以 `pytest --collect-only` 实测为准）。
    - 涉及类型注解、API 签名或模块导入修改时，必须运行多解释器矩阵：`make test-matrix`（验证 Python 3.10/3.11/3.12/3.13/3.14 兼容性与类型求值）。
    - **测试命令必须真实 exit code 判定**：不得修改 `scripts/pre-push` 让测试恒 exit 0。
-   - **高负载时序豁免（TLE 容忍）**：宿主机后台重负载（如视频转码满载）期间，壁钟/耗时断言类用例（当前已知：`tests/engine/test_concurrency.py` 与 `tests/v2/engine/test_concurrency.py` 全部用例）允许抖动失败。放行条件：失败**仅限**时序敏感用例且其余测试全绿；放行时须在提交信息或交付报告注明「负载抖动放行」，负载恢复后补跑确认；本豁免严禁扩大化为忽略任何非时序失败或让测试恒过。
+   - **高负载时序豁免（TLE 容忍）**：宿主机后台重负载（如视频转码满载）期间，壁钟/耗时断言类用例（当前已知：`tests/engine/test_concurrency.py` 全部用例）允许抖动失败。放行条件：失败**仅限**时序敏感用例且其余测试全绿；放行时须在提交信息或交付报告注明「负载抖动放行」，负载恢复后补跑确认；本豁免严禁扩大化为忽略任何非时序失败或让测试恒过。
 2. **始终使用中文**：中文回答、中文代码注释与规范中文 Commit 提交信息。
 3. **严禁混合提交（独立原子化提交）**：
    - 多个独立的问题修复、特性演进或重构，**严禁揉杂在同一个 Commit 中**；
@@ -21,23 +20,23 @@
    - 保证每个 Commit 独立自洽，在 `git bisect` 或 `cherry-pick` 时具备独立可验证性与可回滚性；
    - 单元改完并跑通对应测试后**当场 `git commit`**，不得长期堆积滞留工作区后一次性大包提交；遇 `index.lock` 冲突 `sleep 2` 重试最多 5 次。
 4. **分层单向依赖红线**：
-   - `models/` 严禁反向 import `engine/`（IPC 声明读写一律下沉 `utils/ipc.py`）；
-   - `utils/` 严禁反向 import `wrappers/`（无历史垫片）；
-   - 核心层（`engine/`, `backend/`, `models/`, `utils/`）严禁反向依赖 `contrib/`。
+   - `tasklite/models/` 严禁反向 import `tasklite/engine/`（IPC 声明读写一律下沉 `tasklite/utils/ipc.py`）；
+   - `tasklite/utils/` 严禁反向 import `tasklite/wrappers/`（无反向垫片）；
+   - 核心层（`tasklite/engine/`, `tasklite/backend/`, `tasklite/models/`, `tasklite/utils/`）严禁反向依赖 `tasklite/contrib/` 与 `tasklite/wrappers/`。
 5. **单射性编码红线**：
-   - 所有业务标识派生复合 UID 或文件系统路径（如 `safe_uid_filename`、`sanitize_content_id`、`sanitize_job_component`），**必须使用可逆 `%XX` 百分号单射转义**；
+   - 所有业务标识派生复合 UID 或文件系统路径（如 `safe_uid_filename`、`encode_content_id`、`encode_job_component`），**必须使用可逆 `%XX` 百分号单射转义**；
    - 严禁丢弃式非单射净化（非单射净化会导致多对一碰撞，在 wall 去重时静默吞任务）。
 6. **单一出口原则**：
    - Job 终结（成功/失败/重试）必须唯一经由 `CompletionMachine.complete_job` 收尾；
-   - 失败终态登记必须唯一经由 `StateStore.apply_failed` / `StateStore.apply_failure` 收敛（保证 wall/failed 互斥）；
-   - 运行态事件钩子必须唯一经由 `RunContext.fire_*` 单一出口触发。
+   - 失败终态登记必须唯一经由 `StateStore.apply_failure` 收敛（内存尾段经 `mark_failed_memory`，保证 wall/failed 互斥）；
+   - 运行态事件钩子必须唯一经由 `RunSession.fire_*` 单一出口触发。
 7. **持久化与并发事务纪律**：
    - SQLite `journal_mode=WAL` 必须在启动时验证生效（fail-loud，拒绝在断电可损坏模式下启动）；
    - `sqlite_backend.py` 中的序号分配与读-改-写操作必须在显式 `BEGIN IMMEDIATE` 写事务保护下执行。
 8. **瞬态信号军规**：
    - 孤儿锁冲突（`lock_conflict`）、外部中断（`interrupted`）、限速（`RateLimitHit`）等瞬态信号，必须做到**「不烧重试预算 + 降级写盘 + 零污染」**。
 9. **六步标准调用顺序**：
-   - 初始化 → `add_resource` → `register_handler` / `register_discovery` / `register_transient_exception` → `enqueue` → `run` → `stop`；管理 API 仅限 `run()` 外调用。
+   - 初始化 → `register_resource` → `register_task` / `register_discovery` / `register_transient_exception` → `enqueue` → `run` → `stop`；管理 API 仅限 `run()` 外调用。
 
 ---
 
@@ -56,25 +55,23 @@
 - ✅ **单射性数学证明关键点**：如 `lockfile.py` 中「先 `%25` 后 `::` 转义以防 `t::x::y` 碰撞」。
 
 ### 3. 时序防护转移为自动化测试（三转移）
-- 凡是复杂并发时序、TOCTOU 闭环或极端防御逻辑，**必须优先编写确定性回归测试 / 变异测试锁定**（参考 `tests/engine/test_shutdown.py`），代码中只保留一行意图说明，严禁用大段注释替代测试。
+- 凡是复杂并发时序、TOCTOU 闭环或极端防御逻辑，**必须优先编写确定性回归测试 / 变异测试锁定**（参考 `tests/engine/test_concurrency.py`），代码中只保留一行意图说明，严禁用大段注释替代测试。
 
 ---
 
-## 三、v2 双包期红线（重建期，详见 [`docs/adr/0004-v2-parallel-rebuild.md`](docs/adr/0004-v2-parallel-rebuild.md)）
+## 三、v2 模型与术语红线（转正，详见 [`docs/adr/0004-v2-parallel-rebuild.md`](docs/adr/0004-v2-parallel-rebuild.md) 与 [`docs/adr/0005-v2-promotion.md`](docs/adr/0005-v2-promotion.md)）
 
-1. **v2 位置与隔离**：v2 位于 `tasklite/v2/`，从零重写——架构照搬 v1，命名与 Task/Job/Attempt 三层模型按 ADR-0004 重塑；**v2 严禁 import v1**；v1 冻结（仅允许缺陷修复，禁止新特性）。
-2. **v2 分层红线镜像**：`v2/models/` 严禁 import `v2/engine/`（IPC 声明读写下沉 `v2/utils/ipc.py`）；`v2/utils/` 严禁 import `v2/wrappers/`；v2 核心层严禁依赖 `v2/contrib/`。
-3. **v2 术语红线**：禁用 `sanitize` / `taxonomy` / `DLQ` 旧词——编码族统一 `encode_*`，错误分类统一 `ErrorClassifier`（`errorclass.py`），失败集合统一「失败档案 failed」（`FailureEntry` / `list_failures`）。
-4. **v2 无调度逻辑**：核心内禁止排序计算与退避计算（backoff 全族已砍除）；重试节奏与候选排序一律经 OrderingPolicy / RequeuePolicy seam 以 wrapper/util 形态扩展；Job 模型不携带 priority / deadline / period 字段。
-5. **迁移原则**：代码与注释迁移原则（不变式必迁、历史叙事必删、时序防护转测试、书写新标准）见 ADR-0004；v2 测试置于 `tests/v2/`，每单元原子提交且全量测试全绿（沿用红线 1）。
+1. **术语红线**：禁用 `sanitize` / `taxonomy` / `DLQ` 旧词——编码族统一 `encode_*`，错误分类统一 `ErrorClassifier`（`engine/errorclass.py`，`ErrorCategory` 唯一表示），失败集合统一「失败档案 failed」（`FailureEntry` / `list_failures` / `clear_failures` / `retry_failure`）。
+2. **核心禁调度计算**：核心层（engine/backend/models/utils）内禁止任何排序计算与退避计算（backoff 全族已砍除）；重试节奏与候选排序一律经 OrderingPolicy / RequeuePolicy seam 以 wrapper/util 形态扩展，**seam 扩展须另立 ADR**；Job 模型不携带 priority / deadline / period 字段。
+3. **三层模型语义**：Task（规格，注册于 `TaskRegistry`）/ Job（逻辑实例，`uid = task_type::job_id` 身份不变）/ Attempt（append-only 执行轨迹，旁路观测面，不参与六集合互斥）；`retries` 构造参数已废除，预算位收敛 `max_retries`。
 
 ---
 
 ## 四、文档与权威索引
 
-- **引擎架构总览与概念词典**：[`docs/ENGINE_ARCHITECTURE.md`](docs/ENGINE_ARCHITECTURE.md)
-- **架构决策记录（ADR）**：[`docs/adr/`](docs/adr/)（v2 重建总纲：ADR-0004）
+- **权威使用指南**：[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)（Task/Job/Attempt 三层模型、六步契约、失败档案、调度 seam 与 v1→v2 命名映射）
 - **文档唯一总纲**：[`README.md`](README.md)
-- **完整 API 参考与运维手册**：[`docs/API_GUIDE.md`](docs/API_GUIDE.md)
-- **v2 权威使用指南**：[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)（Task/Job/Attempt 三层模型、六步契约、失败档案、调度 seam 与 v1→v2 命名映射）
+- **架构决策记录（ADR）**：[`docs/adr/`](docs/adr/)（v2 重建总纲：ADR-0004；上位与 v1 退役：ADR-0005）
+- **领域概念词典**：[`CONTEXT.md`](CONTEXT.md)
 - **Discovery 需求契约**：[`tasklite/wrappers/discovery.py`](tasklite/wrappers/discovery.py)
+- **v1 历史归档**（描述已退役的 v1 公开面，以 git 历史为真相）：[`docs/API_GUIDE.md`](docs/API_GUIDE.md)、[`docs/ENGINE_ARCHITECTURE.md`](docs/ENGINE_ARCHITECTURE.md)
