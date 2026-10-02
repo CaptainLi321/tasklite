@@ -182,7 +182,7 @@ pipeline.run()
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变 | queue 行 job_data JSON（uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：attempt 序号、incarnation、起止时间、结局 | append-only 新表 `attempts` |
 
-任一 attempts 行可回溯「哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——端到端追溯链完整。完整使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**（权威）；v1 → v2 命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)。**v1 已退役**（git 历史与 `v1-final` 标签留档）。
+任一 attempts 行可回溯「哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——端到端追溯链完整。完整使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**（权威）；v1 → v2 命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)；未来演进方向（CLI 直达、make 式级联更新、调度策略族）见 [ROADMAP](docs/ROADMAP.md)。**v1 已退役**（git 历史与 `v1-final` 标签留档）。
 
 ```python
 from tasklite import TaskLite, Job, Task, AttemptRecord
