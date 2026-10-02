@@ -74,15 +74,15 @@ show_missing = true
 skip_covered = false
 
 [tool.mutmut]
-# v1 冻结：变异测试目标仅为 v2 子包
+# 变异测试目标：核心层与门面（contrib 不参与）
 source_paths = [
-    "tasklite/v2/backend/",
-    "tasklite/v2/engine/",
-    "tasklite/v2/models/",
-    "tasklite/v2/utils/",
-    "tasklite/v2/wrappers/",
-    "tasklite/v2/exceptions.py",
-    "tasklite/v2/pipeline.py",
+    "tasklite/backend/",
+    "tasklite/engine/",
+    "tasklite/models/",
+    "tasklite/utils/",
+    "tasklite/wrappers/",
+    "tasklite/exceptions.py",
+    "tasklite/pipeline.py",
 ]
 also_copy = ["tasklite/"]
 pytest_add_cli_args = ["--import-mode=importlib"]
