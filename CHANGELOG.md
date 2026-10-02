@@ -6,9 +6,31 @@
 
 ## [Unreleased]
 
-v2 并行重建子包落地版（总纲 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，使用指南 [docs/V2_GUIDE.md](docs/V2_GUIDE.md)）：`tasklite/v2/` 从零重写完成（42 模块、47 测试文件，全量 4058 测试五解释器矩阵通过）。v1 同步进入**冻结期**——仅允许缺陷修复，不再接受新特性；v2 严禁 import v1，最终上位与 v1 退役另行裁决。v1 公开 API 本版零变化。
+暂无未发布变更。
 
-### 新增
+## [2.0.0] - 2026-10-02
+
+v2 上位为主包的破坏性大版本（上位总纲 [ADR-0005](docs/adr/0005-v2-promotion.md)，重建设计 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，使用指南 [docs/V2_GUIDE.md](docs/V2_GUIDE.md)）：v2 子包物理提升为 `tasklite` 主包（单原子提交世界切换，生产代码零逻辑改写），v1 树整体退役（git 历史与 `v1-final` 标签留档），`tasklite.v2` 导入路径消亡且**不留路径别名**。本版同时收录 v2 并行重建期的全部特性（Task/Job/Attempt 三层模型，全量 2204 测试）。
+
+### 移除（向后不兼容）
+
+- **v1 公开面整体移除**：`TaskContext` / `DLQEntry` / `sanitize_*` / `ErrorTaxonomy` / `ERROR_TYPE_*` 常量 / `ExecutionPolicy` / `BackoffGovernor` 等 v1 符号不复存在；`register_handler`→`register_task`、`add_resource`→`register_resource`、`list_dlq`/`clear_dlq`→`list_failures`/`clear_failures`、`TaskContext`→`JobContext`、`sanitize_*`→`encode_*`——完整映射见 [ADR-0004 命名映射表](docs/adr/0004-v2-parallel-rebuild.md)。
+- **旧状态库 fail-loud 拒识**：SQLite schema 全新（`user_version=3`，含 append-only `attempts` 轨迹表与 `failed` 失败档案术语），旧库打开即拒绝启动、不写迁移路径——请换用新 `state_dir` 冷启动，或按 `v1-final` 标签运行旧版。
+- **backoff 全族砍除**：`BackoffGovernor` 与 `backoff_base` / `backoff_max` / `backoff_until` / `backoff_wall_deadline` 不再存在；重试默认**立即重入队**，节奏需求经 `RequeuePolicy` 接缝注入（ADR-0004 调度 seam）。
+
+### 变更（向后不兼容）
+
+- **布尔参数一律 keyword-only**（v2 书写军规）：门面与运维 API 的布尔参数不再接受位置传参（如 `TaskLite(..., *, strict_picklable=True)`、`clear_failures(task_types, *, keep_fatal=True)`）。
+- **错误码值串变更**：`ERR_COMMIT_FAILURE_DLQ` → `ERR_COMMIT_FAILURE`，落盘值串 `"COMMIT_FAILURE_DLQ"` → `"COMMIT_FAILURE"`——按错误码串匹配的下游必须改串，非仅改常量名。
+- **`Job` 构造参数 `retries` 废除**：预算位收敛 `max_retries`（允许执行条件 `attempt_no <= max_retries + 1`）；实例位新增 `attempt_no` / `activation_no` / `first_enqueued_at`（框架管理）。
+- **生命周期钩子签名值对象化**：`on_job_completed(uid, meta, success, going_to_retry)` → `on_attempt_finished(uid, *, outcome: AttemptFinish)`（布尔语义经值对象正交承载）。
+- **`SystemExit` 错误通道契约显式化**：worker 内 handler 抛出的 `SystemExit` 一律走错误通道（计入重试预算、终态进失败档案）；仅 `KeyboardInterrupt` 是瞬态中断（零预算重入队）。语义与 v1 自初版一致，本版以双测试显式锁定。
+
+### 迁移指引
+
+未适配的 v1 消费方（本机 `import tasklite` 经仓库路径实时解析，下一次运行前须适配）：适配前以 `git checkout v1-final` 标签运行旧版；迁移按 [ADR-0004 映射表](docs/adr/0004-v2-parallel-rebuild.md#命名映射表v1--v2)（主要触点：`register_handler`→`register_task`、`add_resource`→`register_resource`、`list_dlq`/`clear_dlq`→`list_failures`/`clear_failures`、`sanitize_*`→`encode_*`、`TaskContext`→`JobContext`、钩子签名值对象化、`retries`→`max_retries`）；旧状态库不迁移，换新 `state_dir` 冷启动。
+
+### 新增（v2 重建期特性）
 
 - **v2 重建（Task/Job/Attempt 三层模型）**：架构照搬 v1（进程隔离、SQLite WAL 状态机、六步调用契约、瞬态信号军规、rerun 四策略、wall/cursors 全保留），模型重塑三层——Task 为进程内注册的静态规格模板（`register_task` + `TaskRegistry`）、Job 为 `uid = task_type::job_id` 身份不变的一次有界激活（实例位收敛 `attempt_no` / `activation_no` / `first_enqueued_at`，v1 的 `retries` 构造参数废除）、Attempt 为 append-only 执行轨迹表（`incarnation` / `outcome` 全生命周期落盘，端到端追溯链打通；旁路观测面，不参与六集合互斥）。
 - **v2 公开面与命名体系**：主 `__init__` 集中导出（门面、模型层、异常族、错误分类、资源体系、策略 seam、后端、编码族等 61 项）；命名族重塑——`register_handler`→`register_task`、`add_resource`→`register_resource`、`TaskContext`→`JobContext`、`sanitize_*`→`encode_*`（可逆单射编码语义正名）、`ErrorTaxonomy`→`ErrorClassifier`、`list_dlq`/`clear_dlq`→`list_failures`/`clear_failures`（「DLQ/死信」术语统一「失败档案 failed」，条目类 `FailureEntry`，档案补跑 `retry_failure` 按轨迹最大激活代 +1 推进不撞号）、`on_job_completed`→`on_attempt_finished(uid, *, outcome: AttemptFinish)`（布尔语义经值对象正交承载）。完整映射见 ADR-0004。
@@ -322,7 +344,8 @@ v2 并行重建子包落地版（总纲 [ADR-0004](docs/adr/0004-v2-parallel-reb
 - 运维 API：`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`。
 - 优雅停机状态机：首次信号 DRAINING 停止派发并排空在途任务，二次信号 ABORTING 分类回收在途任务。
 
-[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v1.4.2...HEAD
+[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/CaptainLi321/tasklite/compare/v1.4.2...v2.0.0
 [1.4.2]: https://github.com/CaptainLi321/tasklite/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/CaptainLi321/tasklite/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/CaptainLi321/tasklite/compare/v1.3.1...v1.4.0
