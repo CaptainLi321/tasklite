@@ -319,9 +319,12 @@ class TestDeclareInput:
     def test_declare_input_uri_without_fingerprint(self, tmp_path):
         ipc = str(tmp_path / "ipc")
         ctx = _make_ctx(ipc_dir=ipc)
-        ctx.declare_input_uri(Path("/feeds/daily.xml"))
+        uri_path = Path("/feeds/daily.xml")
+        ctx.declare_input_uri(uri_path)
         entries = ArtifactJournal(ipc).read_inputs("fetch::j1")
-        assert entries == [{"path": "/feeds/daily.xml", "kind": "uri"}]
+        # Path 入参按 str() 原样记录（URI 不做文件系统解析，路径分隔符
+        # 随平台保留——断言构造结果而非 POSIX 字面量）
+        assert entries == [{"path": str(uri_path), "kind": "uri"}]
 
     def test_declare_input_uri_fingerprint_type_guard(self):
         ctx = _make_ctx()

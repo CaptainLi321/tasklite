@@ -20,6 +20,13 @@ from ..utils.clock import utc_now_iso
 
 _UnionType = getattr(types, "UnionType", None)
 
+# SIGKILL 仅 POSIX 提供，Windows 无该常量。oom_hint 是「进程被 OOM killer
+# 击杀」的启发式标记：无 SIGKILL 的平台恒为 False（负 exitcode 仍按信号
+# 死亡归因）。平台差异而非降级——强杀路径在 Windows 由 proc.kill() 经
+# TerminateProcess 等价完成（看门狗/中止路径共用），本条只影响 OOM 归因位，
+# 绝不因平台缺常量而抛 AttributeError。
+_SIGKILL: int | None = getattr(signal, "SIGKILL", None)
+
 # ── 框架错误码常量（持久化协议：失败档案与重试账目按这些串归因，
 #    串值属跨进程数据契约，不做词汇改写） ──────────────────────────────
 ERR_DEPENDENCY_DEADLOCK = "DEPENDENCY_DEADLOCK"
@@ -429,7 +436,7 @@ class ErrorClassifier:
                 result_meta={
                     "error": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}",
                     "signal": sig_name,
-                    "oom_hint": -exitcode == int(signal.SIGKILL),
+                    "oom_hint": _SIGKILL is not None and -exitcode == _SIGKILL,
                 },
                 retry_error=f"{ERR_PROCESS_SIGNAL_DEATH}: killed by {sig_name} ({exitcode})",
                 failed_error_type=ErrorCategory.TRANSIENT_EXHAUSTED.value,

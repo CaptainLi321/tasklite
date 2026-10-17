@@ -6,6 +6,7 @@ normalize_failed_meta；资源数额校验单点在 models/task.py，此处不�
 注意：本文件不启用 ``from __future__ import annotations``——字符串化注解
 会让 get_type_hints 丢失嵌套局部 TypedDict 的定义域。
 """
+import signal
 import typing
 from typing import Literal, TypedDict
 
@@ -894,7 +895,11 @@ class TestDeathAttributionTable:
         assert att.retry_requested is True
         assert att.result_meta["error"] == f"{ERR_PROCESS_CRASH_PREFIX}{code}"
         assert "signal" in att.result_meta
-        assert att.result_meta["oom_hint"] is (code == -9)
+        # oom_hint 只在平台提供 SIGKILL 时可能为真（Windows 无该常量，
+        # 强杀经 proc.kill()/TerminateProcess 完成，不命中 OOM 启发式）
+        assert att.result_meta["oom_hint"] is (
+            code == -9 and hasattr(signal, "SIGKILL")
+        )
         assert att.retry_error.startswith(ERR_PROCESS_SIGNAL_DEATH)
         assert att.failed_error_type == ErrorCategory.TRANSIENT_EXHAUSTED.value
 
@@ -902,7 +907,9 @@ class TestDeathAttributionTable:
         att = classifier.classify_process_death(
             -9, timed_out=False, timeout_is_transient=False
         )
-        assert att.result_meta["signal"] == "SIGKILL"
+        # POSIX 解析为 SIGKILL；Windows 无 9 号信号，按 SIGNO9 回退
+        expected = "SIGKILL" if hasattr(signal, "SIGKILL") else "SIGNO9"
+        assert att.result_meta["signal"] == expected
 
     def test_unknown_signal_number_falls_back_to_signo(self, classifier):
         att = classifier.classify_process_death(
