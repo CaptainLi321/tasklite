@@ -376,12 +376,6 @@ class StateStore:
             )
             return None
 
-    def record_attempt_finish(
-        self, attempt_id: int | None, *, outcome: str, error: str | None = None
-    ) -> None:
-        """attempts 旁路轨迹行收尾；失败降级告警，绝不阻断主事务。"""
-        self._finish_attempt(attempt_id, outcome=outcome, error=error)
-
     def record_attempt_skip(
         self,
         job: Job,
