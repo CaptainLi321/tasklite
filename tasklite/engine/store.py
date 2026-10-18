@@ -163,12 +163,15 @@ class StateStore:
     def _selection_excluded_uids(self) -> frozenset[str]:
         """当前队列中被执行选择拦截（Exclude/Skip）的**合法作业** uid 集合。
 
-        畸形行无可信身份（缺 task_type/job_id 等），不属于「指定 task_type 的
-        合法作业」——跳过并继续走既有 MALFORMED_JOB 归因，不能因带个 task_type
-        字段就被选择豁免。空规则集返回空集。
+        优先复用 SelectionMachine 的缓存投影；畸形行无可信身份，不属于
+        合法作业——跳过并走既有 MALFORMED_JOB 归因。
         """
         selection = self._selection
-        if selection is None or not selection.is_active:
+        if selection is None:
+            return frozenset()
+        if hasattr(selection, "excluded_uids"):
+            return selection.excluded_uids()
+        if not selection.is_active:
             return frozenset()
         excluded: set[str] = set()
         for job_dict in self._state.queue:

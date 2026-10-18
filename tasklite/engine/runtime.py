@@ -23,12 +23,10 @@ from .channel import ExecutionChannel
 from .completion import CompletionMachine
 from .errorclass import (
     ERR_DEPENDENCY_EXCLUDED,
-    ERR_DEPENDENCY_SKIPPED,
     ERR_DEADLOCK_GAP,
-    ERR_SKIPPED,
     ErrorClassifier,
 )
-from .governor import SelectionStandstill
+from .selection import SelectionMachine, SelectionStandstill
 from .in_flight import InFlightTracker
 from .recovery import RecoveryOrchestrator
 from .scheduler import DeadlockAttribution, JobScheduler
@@ -145,10 +143,9 @@ class EngineRuntime:
         # 注入后同步到调度器与 StateStore（终态写入出口），execute() 启动期
         # 再固化一次即 per-run 快照。
         self._selection: Selection | None = None
-        # Skip 终态跳过的 run 级状态：脏标记驱动跳过阶段（run 启动 + 派生
-        # 作业落队后）；_skipped_uids 用于捕获派生作业对已跳过上游的级联。
+        self.selection_machine: SelectionMachine | None = None
+        # Skip 终态跳过的 run 级状态：脏标记驱动跳过阶段（run 启动 + 派生作业落队后）
         self._skip_dirty: bool = False
-        self._skipped_uids: set[str] = set()
 
     def set_selection(self, selection: Selection | None) -> None:
         """注入执行选择（仅 run() 外；门面已守卫，此处提供运行期双保险）。"""
@@ -157,8 +154,12 @@ class EngineRuntime:
                 "selection() is only allowed outside run(); current run is in progress."
             )
         self._selection = selection
+        if selection is not None and selection.is_active:
+            self.selection_machine = SelectionMachine(selection, self.store)
+        else:
+            self.selection_machine = None
         self.scheduler.selection = selection
-        self.store._set_selection(selection)
+        self.store._set_selection(self.selection_machine or selection)
 
     @property
     def session(self) -> RunSession:
@@ -211,11 +212,10 @@ class EngineRuntime:
         if self._is_running:
             raise RuntimeError("Pipeline run() already in progress on this instance.")
         self._is_running = True
-        # per-run 快照：run 期门面守卫禁止替换规则，此处仍显式固化进调度器
-        # 与 StateStore（终态写入出口），保证规则与本次 run 一一对应。
+        if self.selection_machine is not None:
+            self.selection_machine.reset_run()
         self.scheduler.selection = self._selection
-        self.store._set_selection(self._selection)
-        self._skipped_uids.clear()
+        self.store._set_selection(self.selection_machine or self._selection)
         self._skip_dirty = False
 
         old_sigterm = None
@@ -402,14 +402,11 @@ class EngineRuntime:
         self, attribution: DeadlockAttribution
     ) -> SelectionStandstill | None:
         """执行选择停摆拓扑判定；未激活或存在其他归因原因时不介入。"""
-        selection = self._selection
-        if selection is None or not selection.is_active:
+        if self.selection_machine is None or not self.selection_machine.is_active:
             return None
         if attribution.has_deadlock_causes:
             return None
-        return self.governor.analyze_selection_standstill(
-            self.store.state, selection, scheduler=self.scheduler
-        )
+        return self.selection_machine.partition_standstill()
 
     def _report_selection_blocked(self, standstill: SelectionStandstill) -> None:
         """记录「允许执行但仅因 Exclude 而本次无法完成」的下游（留队待下次）。"""
@@ -459,94 +456,12 @@ class EngineRuntime:
         return True
 
     def _apply_selection_skips(self) -> None:
-        """终态跳过：Skip 命中行移出 queue，下游整链级联跳过并留审计轨迹。
-
-        Skip 是永久语义（不进入 wall/失败档案，下次不再重试），审计落
-        attempts（outcome=skipped）与 ``stats["skipped"]``。删除序为下游优先：
-        崩溃中断后 Skip 根仍在队列，下次 run 可重新得到同一闭包（幂等）。
-        """
-        selection = self._selection
-        if selection is None or not selection.has_skip_rules:
-            return
-        store = self.store
-        queue = store.state.queue
-        if not queue:
-            return
-        rows: dict[str, dict] = {}
-        facts: dict[str, tuple[str, tuple[str, ...]]] = {}
-        for job_dict in queue:
-            try:
-                sched_job = self.scheduler.cached_job(job_dict)
-            except (KeyError, TypeError, ValueError):
-                continue  # 畸形行走既有 MALFORMED_JOB 归因
-            rows[sched_job.uid] = job_dict
-            facts[sched_job.uid] = (sched_job.task_type, tuple(sched_job.depends_on))
-        if not facts:
-            return
-        dependents: dict[str, list[str]] = {}
-        for uid, (_task_type, depends_on) in facts.items():
-            for dep in depends_on:
-                dependents.setdefault(dep, []).append(uid)
-        seeds = {
-            uid
-            for uid, (task_type, depends_on) in facts.items()
-            if selection.is_skipped(task_type)
-            or any(dep in self._skipped_uids for dep in depends_on)
-        }
-        if not seeds:
-            return
-        closure = set(seeds)
-        depth: dict[str, int] = {uid: 0 for uid in seeds}
-        root_of: dict[str, str] = {uid: uid for uid in seeds}
-        stack = list(seeds)
-        while stack:
-            cur = stack.pop()
-            for child in dependents.get(cur, ()):
-                if child in closure:
-                    continue
-                closure.add(child)
-                depth[child] = depth[cur] + 1
-                root_of[child] = root_of.get(cur, cur)
-                stack.append(child)
-        skipped = 0
-        for uid in sorted(closure, key=lambda item: (-depth.get(item, 0), item)):
-            queued_row = rows.get(uid)
-            if queued_row is None:
-                continue
-            try:
-                job = Job.from_dict(queued_row)
-            except (KeyError, TypeError, ValueError):
-                continue
-            if uid in seeds and selection.is_skipped(job.task_type):
-                error = ERR_SKIPPED
-            else:
-                error = (
-                    f"{ERR_DEPENDENCY_SKIPPED} "
-                    f"(upstream: {root_of.get(uid, '?')})"
-                )
-            store.apply_skip(uid, job_dict=queued_row)
-            self._skipped_uids.add(uid)
-            self._record_skip_attempt(job, error)
-            skipped += 1
-            logger.info(f"SELECTION: job {uid} skipped terminal ({error}).")
-        if skipped:
-            removed = set(closure)
-            store.state.replace_queue(
-                [
-                    job_dict
-                    for job_dict in queue
-                    if uid_from_job_dict(job_dict) not in removed
-                ]
+        """终态跳过：委托 SelectionMachine 收敛 Skip 闭包与审计轨迹。"""
+        if self.selection_machine is not None and self.selection_machine.has_skip_rules:
+            self.selection_machine.apply_skips(
+                run_id=self._session.run_id,
+                seq_supplier=self._session.next_dispatch_seq,
             )
-
-    def _record_skip_attempt(self, job: Job, error: str) -> None:
-        """Skip 终态审计（旁路 attempts 轨迹；委托 StateStore 单一接缝）。"""
-        self.store.record_attempt_skip(
-            job,
-            error,
-            run_id=self._session.run_id,
-            seq=self._session.next_dispatch_seq(),
-        )
 
     def _drain_and_settle(self) -> int:
         """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""

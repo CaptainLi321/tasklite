@@ -744,3 +744,58 @@ def test_run_signatures_unchanged():
         "acquire_run_lock: 'bool' = True) -> 'RunSummary'"
     )
     assert str(inspect.signature(TaskLite.run_graceful)) == "(self) -> 'None'"
+
+
+def test_selection_machine_isolated_unit():
+    """SelectionMachine 深模块隔离单元测试：闭包驱逐、拓扑消减与排除投影。"""
+    from tasklite.backend.memory import InMemoryStateBackend
+    from tasklite.engine.selection import SelectionMachine, SelectionStandstill
+    from tasklite.engine.store import StateStore
+    from tasklite.models.job import Job
+
+    backend = InMemoryStateBackend()
+    store = StateStore(backend)
+    selection = Selection([Skip("to_skip"), Exclude("to_exclude")])
+    machine = SelectionMachine(selection, store)
+
+    assert machine.is_active is True
+    assert machine.has_skip_rules is True
+    assert machine.is_skipped("to_skip") is True
+    assert machine.is_excluded("to_exclude") is True
+    assert machine.allows_type("normal") is True
+
+    # 1. 排除投影与缓存
+    store.state.replace_queue([
+        Job("to_exclude", "e1").to_dict(),
+        Job("normal", "n1", depends_on=["to_exclude::e1"]).to_dict(),
+    ])
+    assert machine.excluded_uids() == frozenset({"to_exclude::e1"})
+    # 缓存测试：队列不变时返回相同对象
+    assert machine.excluded_uids() is machine.excluded_uids()
+
+    # 2. 停摆拓扑消减
+    standstill = machine.partition_standstill()
+    assert isinstance(standstill, SelectionStandstill)
+    assert standstill.excluded_uids == ("to_exclude::e1",)
+    assert standstill.blocked_uids == ("normal::n1",)
+    assert standstill.only_blocked_by_exclusion is True
+
+    # 3. Skip 驱逐与审计
+    store.state.replace_queue([
+        Job("to_skip", "s1").to_dict(),
+        Job("normal", "n2", depends_on=["to_skip::s1"]).to_dict(),
+    ])
+    seq = 0
+    def next_seq():
+        nonlocal seq
+        seq += 1
+        return seq
+
+    evicted = machine.apply_skips(run_id="run_test", seq_supplier=next_seq)
+    assert evicted == 2
+    assert store.state.is_empty is True
+    attempts = backend.load_attempts("to_skip::s1")
+    assert len(attempts) == 1 and attempts[0].outcome == "skipped"
+    attempts_child = backend.load_attempts("normal::n2")
+    assert len(attempts_child) == 1 and attempts_child[0].outcome == "skipped"
+
