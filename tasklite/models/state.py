@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Mapping, Set as AbstractSet
 from typing import Any
 
 from .job import Job, RERUN_EXEMPT_VALUES
@@ -203,8 +203,12 @@ class PipelineState:
                     stack.append(downstream)
         return cascade
 
-    def find_dependency_cycles(self) -> list[str]:
+    def find_dependency_cycles(
+        self, *, node_uids: AbstractSet[str] | None = None
+    ) -> list[str]:
         """在当前 _queue 的依赖图中找出所有依赖环成员。
+
+        ``node_uids`` 限定参与构图的队列节点；节点范围外的依赖边不参与环检测。
 
         不变式：返回值为每次回边命中时「DFS 当前路径自闭点起的切片 + 闭点重复」
         按遍历序的拼接，死锁治理器的归因依赖该精确口径（成员、顺序、重复闭点）。
@@ -217,6 +221,8 @@ class PipelineState:
             try:
                 job = Job.from_dict(jd)
             except (KeyError, TypeError, ValueError):
+                continue
+            if node_uids is not None and job.uid not in node_uids:
                 continue
             edges[job.uid] = set(job.depends_on)
 

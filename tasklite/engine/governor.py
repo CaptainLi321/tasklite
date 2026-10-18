@@ -19,7 +19,6 @@ from typing import Any, Protocol
 
 from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
-from ..selection import Selection
 from .errorclass import (
     ERR_DEADLOCK_GAP,
     ERR_DEPENDENCY_DEADLOCK,
@@ -27,6 +26,7 @@ from .errorclass import (
     ERR_RESOURCE_DEADLOCK,
 )
 from .scheduler import JobFacts, StandstillFacts
+from .selection import SelectionStandstill
 
 logger = logging.getLogger("tasklite")
 
@@ -95,10 +95,6 @@ class DeadlockDecision:
     failed_uids: list[str] = field(default_factory=list)
     cascaded_uids: list[str] = field(default_factory=list)
     standstill: SelectionStandstill | None = None
-
-
-
-from .selection import SelectionStandstill
 
 
 @dataclass
@@ -275,23 +271,6 @@ class DeadlockGovernor:
         )
         return True
 
-    def analyze_selection_standstill(
-        self,
-        state: PipelineState,
-        selection: Selection,
-        *,
-        scheduler: ScanCache | None = None,
-    ) -> SelectionStandstill | None:
-        """以 Kahn 入度消减剥离选择停摆（委托 SelectionMachine 完成纯计算）。"""
-        from .selection import SelectionMachine
-
-        class _ShimStore:
-            def __init__(self, s: PipelineState) -> None:
-                self.state = s
-
-        sm = SelectionMachine(selection, _ShimStore(state))  # type: ignore[arg-type]
-        return sm.partition_standstill()
-
     @staticmethod
     def _split_deadlock_by_uids(
         queue: list[dict[str, Any]],
@@ -331,36 +310,60 @@ class DeadlockGovernor:
             self.deadlock_gap_rounds = 0
             return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
 
+        selection_active = selection_machine is not None and selection_machine.is_active
+        selection_standstill = (
+            selection_machine.partition_standstill()
+            if selection_active and selection_machine is not None
+            else None
+        )
+
         # 0. 执行选择先验判定：无明确死锁成因时先检查是否仅因 Exclude 阻塞
         if (
-            selection_machine is not None
-            and selection_machine.is_active
+            selection_active
+            and selection_machine is not None
             and not facts.attribution.has_deadlock_causes
         ):
-            standstill = selection_machine.partition_standstill()
-            if standstill is not None and standstill.only_blocked_by_exclusion:
+            if (
+                selection_standstill is not None
+                and selection_standstill.only_blocked_by_exclusion
+            ):
                 self.deadlock_gap_rounds = 0
                 return DeadlockDecision(
                     action="selection_blocked",
                     should_terminate=True,
                     wait_time=0.0,
-                    standstill=standstill,
+                    standstill=selection_standstill,
                 )
 
         if facts.min_wait == float("inf"):
-            return self.resolve_deadlock(
-                facts, store=store, selection_machine=selection_machine
+            return self._resolve_deadlock(
+                facts,
+                store=store,
+                selection_machine=selection_machine,
+                selection_standstill=selection_standstill,
+                scheduler=None,
             )
 
         if facts.waiting_for_dependency and store.state is not None:
-            cycle_uids = store.state.find_dependency_cycles()
+            if selection_active:
+                cycle_uids = (
+                    selection_standstill.cycle_uids
+                    if selection_standstill is not None
+                    else ()
+                )
+            else:
+                cycle_uids = store.state.find_dependency_cycles()
             if cycle_uids:
                 logger.error(
                     f"Deadlock detected during wait: dependency cycle "
                     f"{sorted(set(cycle_uids))} masked by finite min_wait."
                 )
-                return self.resolve_deadlock(
-                    facts, store=store, selection_machine=selection_machine
+                return self._resolve_deadlock(
+                    facts,
+                    store=store,
+                    selection_machine=selection_machine,
+                    selection_standstill=selection_standstill,
+                    scheduler=None,
                 )
 
         # 正常等待/背压结论（有限等待且无环）证明上一缺口 episode 已消解——
@@ -376,10 +379,34 @@ class DeadlockGovernor:
         scheduler: ScanCache | None = None,
         selection_machine: SelectionStandstillSource | None = None,
     ) -> DeadlockDecision:
-        """处理死锁：细粒度归因 + 批量失败档案提交 + 级联（纯计算求值，无阻塞副作用）。"""
+        """直接执行死锁归因，并在入口读取当前选择停摆事实。"""
+        selection_standstill = (
+            selection_machine.partition_standstill()
+            if selection_machine is not None and selection_machine.is_active
+            else None
+        )
+        return self._resolve_deadlock(
+            facts,
+            store=store,
+            scheduler=scheduler,
+            selection_machine=selection_machine,
+            selection_standstill=selection_standstill,
+        )
+
+    def _resolve_deadlock(
+        self,
+        facts: StandstillFacts,
+        store: ArbitrationStore,
+        *,
+        scheduler: ScanCache | None,
+        selection_machine: SelectionStandstillSource | None,
+        selection_standstill: SelectionStandstill | None,
+    ) -> DeadlockDecision:
+        """以同一停摆快照完成归因与状态提交。"""
         effective_state = store.state
         effective_grace = self.dep_grace_seconds
         effective_gap_max = self.deadlock_gap_max_rounds
+        selection_active = selection_machine is not None and selection_machine.is_active
 
         attr = facts.attribution
         malformed_uids = set(attr.malformed_uids)
@@ -423,7 +450,14 @@ class DeadlockGovernor:
                 list(effective_state.queue), impossible_uids, ERR_RESOURCE_DEADLOCK
             )
         elif facts.waiting_for_dependency:
-            cycle_uids = set(effective_state.find_dependency_cycles())
+            if selection_active:
+                cycle_uids = set(
+                    selection_standstill.cycle_uids
+                    if selection_standstill is not None
+                    else ()
+                )
+            else:
+                cycle_uids = set(effective_state.find_dependency_cycles())
             if not cycle_uids:
                 escalated = self.check_gap_or_escalate(
                     "Deadlock classification gap (waiting_for_dependency without cycle)",
@@ -471,6 +505,7 @@ class DeadlockGovernor:
             and selection_machine is not None
             and selection_machine.is_active
         ):
+            # 批量写入可能改变队列；归档为零时再基于当前队列收敛。
             standstill = selection_machine.partition_standstill()
             if standstill is not None and standstill.only_blocked_by_exclusion:
                 return DeadlockDecision(

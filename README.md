@@ -352,7 +352,7 @@ tasklite/
 │   ├── session.py       # RunSession 单次 run 生命周期状态与钩子单一出口
 │   ├── wait.py          # 事件泵等待/空闲决策纯函数
 │   ├── types.py         # 引擎公共值对象单一真相源
-│   ├── store.py         # 状态事务、3-strike 崩溃与死锁归因 (StateStore)
+│   ├── store.py         # 状态事务、3-strike 崩溃与失败写入隔离 (StateStore)
 │   ├── ops.py           # OpsConsole：run() 外纯运维接缝（管理 API 委托目标）
 │   ├── dispatch.py      # 任务派发状态机 (DispatchMachine)
 │   ├── completion.py    # 任务完成与提交 (CompletionMachine)
@@ -360,7 +360,8 @@ tasklite/
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel / WorkerLaunchSpec)
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler / OrderingPolicy 排序 seam / Selection 候选准入 seam)
 │   ├── admission.py     # rerun 准入 (RerunPolicy) 与重入队节奏 (RequeuePolicy seam)
-│   ├── governor.py      # 死锁归因仲裁与依赖宽限 (DeadlockGovernor)
+│   ├── governor.py      # 死锁归因仲裁与依赖宽限，消费选择停摆事实 (DeadlockGovernor)
+│   ├── selection.py     # Skip 闭包与选择停摆图事实 (SelectionMachine)
 │   ├── in_flight.py     # 在途作业租约追踪 (InFlightTracker)
 │   ├── errorclass.py    # 错误分类与校验分类深模块 (ErrorClassifier)
 │   └── resource.py      # 令牌桶限速与并发容量资源

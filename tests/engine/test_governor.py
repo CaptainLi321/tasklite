@@ -71,9 +71,9 @@ def _spy_cycle_detection(monkeypatch):
     calls = {"count": 0}
     original = PipelineState.find_dependency_cycles
 
-    def spy(self):
+    def spy(self, **kwargs):
         calls["count"] += 1
-        return original(self)
+        return original(self, **kwargs)
 
     monkeypatch.setattr(PipelineState, "find_dependency_cycles", spy)
     return calls
@@ -604,4 +604,100 @@ class TestSelectionClosedLoopArbitration:
         assert decision.should_terminate is True
         assert decision.standstill is not None
         assert decision.standstill.blocked_uids == ("normal::2",)
+
+    def test_excluded_self_loop_and_cross_exclude_cycle_leave_allowed_work_runnable(self):
+        from tasklite.engine.resource import CapacityResource
+        from tasklite.engine.scheduler import JobScheduler
+        from tasklite.engine.selection import SelectionMachine
+        from tasklite.engine.store import StateStore
+        from tasklite.selection import Exclude, Selection
+
+        store = StateStore(InMemoryStateBackend())
+        store.state.replace_queue([
+            Job("excluded", "e", depends_on=["excluded::e", "allowed::a"]).to_dict(),
+            Job("allowed", "a", depends_on=["excluded::e"]).to_dict(),
+            Job("allowed", "downstream", depends_on=["excluded::e"]).to_dict(),
+            Job("resource", "waiter", resources={"api": 1}).to_dict(),
+        ])
+        selection = Selection([Exclude("excluded")])
+        machine = SelectionMachine(selection, store)
+        store._set_selection(selection)
+        resource = CapacityResource("api", 1)
+        resource.suspend(30)
+        scheduler = JobScheduler({"api": resource})
+        scheduler.selection = selection
+        facts = scheduler.scan_next_runnable(store.state, set()).standstill_facts()
+        assert 0 < facts.min_wait <= 30
+        assert facts.waiting_for_dependency
+        assert not facts.attribution.has_deadlock_causes
+
+        standstill = machine.partition_standstill()
+        assert standstill is not None
+        assert standstill.cycle_uids == ()
+        assert set(standstill.blocked_uids) == {"allowed::a", "allowed::downstream"}
+        assert standstill.unblocked_uids == ("resource::waiter",)
+
+        decision = DeadlockGovernor().arbitrate(
+            facts,
+            store=store,
+            selection_machine=machine,
+        )
+        assert decision.action == "none"
+        assert not decision.should_terminate
+        assert len(store.state.queue) == 4
+        assert not store.state.failed
+
+    def test_missing_dependency_is_attributed_before_remaining_allowed_cycle(self):
+        from tasklite.engine.scheduler import JobScheduler
+        from tasklite.engine.selection import SelectionMachine
+        from tasklite.engine.store import StateStore
+        from tasklite.selection import Exclude, Selection
+
+        store = StateStore(InMemoryStateBackend())
+        store.state.replace_queue([
+            Job("t", "a", depends_on=["t::b"]).to_dict(),
+            Job("t", "b", depends_on=["t::a"]).to_dict(),
+            Job("t", "gap", depends_on=["t::missing"]).to_dict(),
+            Job("t", "downstream", depends_on=["t::gap"]).to_dict(),
+        ])
+        selection = Selection([Exclude("other")])
+        machine = SelectionMachine(selection, store)
+        store._set_selection(selection)
+        scheduler = JobScheduler({})
+        scheduler.selection = selection
+        governor = DeadlockGovernor()
+        standstill = machine.partition_standstill()
+        assert standstill is not None
+        assert set(standstill.cycle_uids) == {"t::a", "t::b"}
+
+        facts = scheduler.scan_next_runnable(store.state, set()).standstill_facts()
+        assert facts.attribution.missing_dependency_uids == ("t::gap",)
+        decision = governor.arbitrate(
+            facts,
+            store=store,
+            selection_machine=machine,
+        )
+        assert decision.action == "resolved"
+        assert set(store.state.failed) == {"t::gap"}
+        assert {uid_from_job_dict(row) for row in store.state.queue} == {
+            "t::a", "t::b", "t::downstream"
+        }
+
+        candidate = scheduler.scan_next_runnable(store.state, set())
+        assert candidate.kind == "dep_failed"
+        assert candidate.runnable_idx is not None
+        downstream = store.state.pop_job(candidate.runnable_idx)
+        assert uid_from_job_dict(downstream) == "t::downstream"
+        store.apply_failure(
+            "t::downstream",
+            {"error": "JOB_DEPENDENCY", "failed_dependency": "t::gap"},
+            job_dict=downstream,
+        )
+
+        facts = scheduler.scan_next_runnable(store.state, set()).standstill_facts()
+        assert not facts.attribution.has_deadlock_causes
+        decision = governor.arbitrate(facts, store=store, selection_machine=machine)
+        assert decision.action == "resolved"
+        assert set(decision.failed_uids) == {"t::a", "t::b"}
+        assert store.state.is_empty
 

@@ -253,6 +253,19 @@ class TestFindDependencyCycles:
         ])
         assert st.find_dependency_cycles() == []
 
+    def test_node_scope_limits_detection_to_induced_queue_subgraph(self):
+        st = PipelineState({}, {}, {}, [
+            _jid("a", ["t::b"]),
+            _jid("b", ["t::a"]),
+            _jid("c", ["t::d"]),
+            _jid("d", ["t::c"]),
+            _jid("outside", ["t::a"]),
+        ])
+
+        assert st.find_dependency_cycles(
+            node_uids={"t::a", "t::b", "t::outside"}
+        ) == ["t::a", "t::b", "t::a"]
+
 
 class TestDeepGraphCycleDetection:
     """深图环检测：线性迭代实现不受解释器递归上限约束（governor 每轮

@@ -1,7 +1,7 @@
 """v2 执行选择机器（SelectionMachine）：统筹 Skip 闭包驱逐与 Exclude 停摆剥离。
 
-深模块契约：顶层 tasklite/selection.py 仅保留声明式规则与协议，运行态图算法、
-Kahn 拓扑入度消减与下游优先驱逐结算在本模块内闭环。
+深模块契约：顶层 tasklite/selection.py 仅保留声明式规则与协议；本模块负责
+Skip 闭包与 Kahn 选择停摆投影，依赖环检测复用 PipelineState 的统一实现。
 
 单向依赖约束：本模块仅依赖 Selection（规则集）与 StateStore（状态仓），
 避免反向耦合 JobScheduler。
@@ -30,8 +30,10 @@ class SelectionStandstill:
     以 ``wall_uids | deferred_uids``（Exclude 命中行 + 防御性的 Skip 残留行）
     为初始波前，对剩余「允许执行」作业做入度消减：
 
-    - ``stuck_uids``：入度无法消减为 0 的允许作业——存在依赖环或依赖回边
-      之外的缺口，属真死锁候选，交既有 governor 归因熔断；
+    - ``stuck_uids``：入度无法消减为 0 的允许作业，可能包含环成员、缺口
+      及其下游；
+    - ``cycle_uids``：仅从 stuck 子图中由 PipelineState 的依赖环检测器识别
+      的真实环成员，供 governor 沿用既有环归因；
     - ``blocked_uids``：入度可消减、且传递依赖最终落在 deferred 波前上的
       允许作业——本次仅因上游被排除/跳过而无法完成，必须留队等待下次 run；
     - ``unblocked_uids``：入度可消减但仍有余量（如资源等待）的允许作业，
@@ -45,6 +47,7 @@ class SelectionStandstill:
     blocked_uids: tuple[str, ...] = ()
     unblocked_uids: tuple[str, ...] = ()
     stuck_uids: tuple[str, ...] = ()
+    cycle_uids: tuple[str, ...] = ()
     blocked_by: tuple[tuple[str, str], ...] = ()
 
     @property
@@ -215,6 +218,9 @@ class SelectionMachine:
                 if indegree[child] == 0:
                     ready.append(child)
         stuck = allowed - reduced
+        cycle_uids = (
+            state.find_dependency_cycles(node_uids=stuck) if stuck else []
+        )
 
         # 仅因排除受阻：从 deferred 沿依赖边反向闭包，再与可消减集求交。
         children: dict[str, list[str]] = {}
@@ -238,6 +244,7 @@ class SelectionMachine:
             blocked_uids=tuple(sorted(blocked)),
             unblocked_uids=tuple(sorted(reduced - blocked)),
             stuck_uids=tuple(sorted(stuck)),
+            cycle_uids=tuple(cycle_uids),
             blocked_by=tuple(
                 sorted((uid, root_of.get(uid, "")) for uid in blocked)
             ),

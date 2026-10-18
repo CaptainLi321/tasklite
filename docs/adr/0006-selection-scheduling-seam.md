@@ -27,12 +27,15 @@ v2 需要「本 run 只消费队列的一个子集」的单机能力：同一持
      在依赖/资源评估之前按 `task_type` 跳过命中作业——不贡献 missing / unknown /
      impossible / min_wait / has_potential_spawners 任何停摆事实；
    - **Skip 跳过阶段**：`EngineRuntime._apply_selection_skips`
-     （`tasklite/engine/runtime.py`）在 run 启动与派生作业落队后，把 Skip 命中行及其
-     下游闭包收敛为终态跳过（移出 queue + attempts 审计），删除序为下游优先；
-   - **停摆拓扑剥离**：`DeadlockGovernor.analyze_selection_standstill`
-     （`tasklite/engine/governor.py`）以 `wall_uids | deferred_uids` 为初始波前做
-     Kahn 入度消减，区分「真死锁（stuck，交既有归因）」与「仅被 Exclude 阻塞
-     （blocked，留队并终止本 run）」；运行期不再有固定等待兜底；
+     （`tasklite/engine/runtime.py`）在 run 启动与派生作业落队后触发
+     `SelectionMachine.apply_skips`（`tasklite/engine/selection.py`），由该 machine
+     将 Skip 命中行及其下游闭包收敛为终态跳过（移出 queue + attempts 审计），删除序为下游优先；
+   - **停摆拓扑剥离**：`SelectionMachine.partition_standstill`
+     （`tasklite/engine/selection.py`）以 `wall_uids | deferred_uids` 为初始波前做
+     Kahn 入度消减，并在 stuck 子图上复用 `PipelineState.find_dependency_cycles`
+     （`tasklite/models/state.py`）区分真实环成员与缺口/下游；`DeadlockGovernor`
+     （`tasklite/engine/governor.py`）消费同拍停摆事实并执行既有归因，只有「仅被
+     Exclude 阻塞（blocked）」时才留队并终止本 run；运行期不再有固定等待兜底；
    - **终态写入隔离**：`StateStore.cascade_fail` 与 `StateStore.apply_bulk_failure`
      （`tasklite/engine/store.py`）在写入失败档案前过滤被排除/跳过 uid，级联路径经
      `PipelineState.cascade_fail(..., *, excluded_uids=...)`

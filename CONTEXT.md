@@ -81,7 +81,7 @@ Specialized machine handling subprocess result collection, output cleanup, resou
 _Avoid_: Collector, ResultHandler, Finalizer
 
 **StateStore**:
-Specialized deep module unifying memory state machines, transactional backend persistence, 3-strike crash contracts, cascade downstream failures, and deadlock attribution policies.
+Specialized deep module unifying memory state transitions, transactional backend persistence, 3-strike crash handling, downstream failure propagation, and the failure-write guard for excluded or skipped jobs.
 _Avoid_: ErrorManager, DeadlockResolver, StateRepository
 
 **RecoveryOrchestrator**:
