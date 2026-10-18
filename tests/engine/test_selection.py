@@ -16,7 +16,7 @@ from tasklite.engine.resource import Resource
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.types import EMPTY_STATS
 from tasklite.models.state import PipelineState
-from tasklite.Selection import Selection
+from tasklite.selection import Selection
 from tasklite.testing import running
 from tasklite.utils.ipc import ArtifactJournal
 
@@ -303,9 +303,9 @@ def test_public_surface_exports_only_exclude():
     assert "Exclude" in tasklite.__all__
     assert "Selection" not in tasklite.__all__
     assert "Rule" not in tasklite.__all__
-    # 子模块名不被同名类覆盖：from tasklite.Selection import Exclude 保持可用。
-    assert tasklite.Selection.__name__ == "tasklite.Selection"
-    assert tasklite.Selection.Exclude is Exclude
+    # 子模块名不被同名类覆盖：from tasklite.selection import Exclude 保持可用。
+    assert tasklite.selection.__name__ == "tasklite.selection"
+    assert tasklite.selection.Exclude is Exclude
 
 
 def test_failed_parent_cascade_keeps_excluded_downstream(monkeypatch, tmp_path):

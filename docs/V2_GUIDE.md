@@ -349,7 +349,7 @@ pipeline.selection()                            # 重置：恢复全执行
 pipeline.run()                                  # 下次 run 消费留队作业
 ```
 
-规则是职责单一的值对象：当前唯一规则 `Exclude(type=...)` 按 `job.task_type` 精确排除；`Rule` 协议只要求 `matches_type(task_type)`（引擎的调度热路径与终态写入出口都按 task_type 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层只导出 `Exclude`，`from tasklite.Selection import Selection` 仍可用于高级集成。规则只做 task_type 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨设备复用。
+规则是职责单一的值对象：当前唯一规则 `Exclude(type=...)` 按 `job.task_type` 精确排除；`Rule` 协议只要求 `matches_type(task_type)`（引擎的调度热路径与终态写入出口都按 task_type 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层只导出 `Exclude`，`from tasklite.selection import Selection` 仍可用于高级集成。规则只做 task_type 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨设备复用。
 
 语义（跨设备队列交接的前提）：
 

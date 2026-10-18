@@ -31,7 +31,7 @@ from ..models.attempt import (
 )
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, uid_from_job_dict
-from ..Selection import Selection
+from ..selection import Selection
 from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import dumps
 from .admission import ImmediateRequeuePolicy, RequeuePolicy, RerunPolicy

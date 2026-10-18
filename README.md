@@ -342,7 +342,7 @@ pipeline.clear_history("download::")
 ```
 tasklite/
 ├── pipeline.py          # TaskLite 核心门面与配置
-├── Selection.py         # 执行选择规则值对象（候选准入 seam，ADR-0006）
+├── selection.py         # 执行选择规则值对象（候选准入 seam，ADR-0006）
 ├── hooks.py             # 用户工具函数（job_ref / progress_hook / slice_list）
 ├── engine/              # 核心执行机器群
 │   ├── runtime.py       # 核心运行期深模块、主循环事件泵 (EngineRuntime)

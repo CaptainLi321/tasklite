@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
-from ..Selection import Selection
+from ..selection import Selection
 from .resource import Resource, ResourceManager
 
 logger = logging.getLogger("tasklite")

@@ -28,7 +28,7 @@ __version__ = "2.1.0"
 from .pipeline import TaskLite
 
 # ── 执行选择（pipeline 级规则值对象）─────────────────────────────────
-from .Selection import Exclude
+from .selection import Exclude
 
 # ── 模型层：规格 / 实例 / 轨迹 / 上下文 ──────────────────────────────
 from .models.attempt import AttemptRecord

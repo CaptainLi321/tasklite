@@ -33,7 +33,7 @@ from .engine.store import FailureEntry
 from .engine.types import ExecutionOptions, RunSummary, TaskStats
 from .models.job import Job, RERUN_VALUES, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry, validate_task_type
-from .Selection import Rule, Selection
+from .selection import Rule, Selection
 
 logger = logging.getLogger("tasklite")
 

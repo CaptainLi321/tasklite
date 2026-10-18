@@ -44,7 +44,7 @@ RequeuePolicy / OrderingPolicy / Selection seam 以**各自 seam 形态**扩展�
    轴、优先级/期限类或改动语义须重开 ADR。
 
 2. **API 形态**：
-   - 单模块 `tasklite/Selection.py`（不拆 models/wrappers/engine 多文件）；
+   - 单模块 `tasklite/selection.py`（不拆 models/wrappers/engine 多文件）；
    - `Rule` 协议只要求 `matches_type(task_type) -> bool`；当前唯一规则
      `Exclude(type=...)`（冻结 dataclass，按 `job.task_type` 精确匹配）；`Selection`
      是引擎内部规则集（`allows_type` / `is_active`），`Selection.__init__` 对缺少
@@ -56,7 +56,7 @@ RequeuePolicy / OrderingPolicy / Selection seam 以**各自 seam 形态**扩展�
      `ExecutionOptions` / `RunConfig` 零新增字段；per-run 快照经内部注入面
      （`EngineRuntime.set_selection` → `JobScheduler.selection` 与
      `StateStore._set_selection`，`execute()` 启动期固化）承载，不进公开选项；
-   - 顶层包只导出 `Exclude`（`Rule` / `Selection` 经 `tasklite.Selection` 子模块导入，
+   - 顶层包只导出 `Exclude`（`Rule` / `Selection` 经 `tasklite.selection` 子模块导入，
      避免同名类覆盖子模块属性）。
 
 3. **语义契约**（关键语义由 `tests/engine/test_selection.py` 覆盖；规则 `matches_type`

@@ -15,7 +15,7 @@
 ### 新增
 
 - **执行选择（Selection）**：`TaskLite.selection(*rules)` 是 pipeline 属性、不是 `run()` 参数——每次调用整体替换规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变。
-  - 新模块 `tasklite/Selection.py`：`Rule` 协议（`matches_type(task_type)`，缺少该入口的规则注册期 fail-loud）、`Exclude(type=...)` 值对象（按 `job.task_type` 精确排除，冻结 dataclass）、`Selection` 规则集（`allows_type` / `is_active`）；顶层 `tasklite` 只导出 `Exclude`，高级集成可经 `tasklite.Selection` 子模块导入。
+  - 新模块 `tasklite/selection.py`：`Rule` 协议（`matches_type(task_type)`，缺少该入口的规则注册期 fail-loud）、`Exclude(type=...)` 值对象（按 `job.task_type` 精确排除，冻结 dataclass）、`Selection` 规则集（`allows_type` / `is_active`）；顶层 `tasklite` 只导出 `Exclude`，高级集成可经 `tasklite.selection` 子模块导入。
   - 语义：未选中作业不派发、不写 attempt 轨迹、不进入 wall/失败档案、不消耗资源与重试预算，队列行原样保留；其下游依赖保持 PENDING_DEPENDENCY 留队；当剩余队列只剩「未选中 + 被其传递阻塞」的作业且无在途任务时，`run()` 正常以 `ExitReason.COMPLETED` 收敛（不判死锁、不空转、不写失败档案）。
   - 终态写入隔离：级联失败（父任务失败）与死锁批量熔断的写入出口同样过滤被排除 uid——被排除作业绝不进入失败档案，也不会被级联删出队列。畸形队列行（缺 `job_id` 等）无可信身份，不参与选择豁免，仍按既有 `MALFORMED_JOB` 语义进失败档案。
   - 规则只做 task_type 格式校验，不校验注册表存在性（规则可先于 `register_task` 配置，也可跨设备复用）。
