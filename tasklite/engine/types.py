@@ -23,6 +23,7 @@ EMPTY_STATS = {
     "interrupted_reruns": 0,
     "rate_limited_reruns": 0,
     "cascade_failed": 0,
+    "excluded_blocked": 0,
 }
 
 # 瞬态信号种类登记表：kind → 统计键。瞬态军规（不烧重试预算 + 豁免失败

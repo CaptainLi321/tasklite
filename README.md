@@ -115,10 +115,12 @@ flowchart TD
 - `SQLiteSnapshotStore` 提供单射键原始响应快照持久化，支持全离线幂等重放；
 - 内置标准 Netscape `cookies.txt` 解析工具。
 
-### 8. 🎛️ 执行选择 (Selection)：默认全执行 + 指定类型留队
-- **第三类调度扩展 seam（候选准入/选择，与 OrderingPolicy / RequeuePolicy 并列，决策见 [ADR-0006](docs/adr/0006-selection-scheduling-seam.md)）**：`pipeline.selection(Exclude(type="pdf_to_md"))` 以方法调用配置 pipeline 级规则——未选中作业不派发、不消耗资源与重试预算，队列行原样留在持久化 queue，父失败级联与死锁熔断也不会将其归档；
-- 仅剩「未选中 + 被其阻塞」作业时 `run()` 正常以 COMPLETED 收敛（此时队列可能非空，完成度按 queue 判定），队列保留给下一次 run 或下一台设备消费（跨设备队列交接）；
-- 默认空规则与扩展前完全等价；`Rule` 协议要求 `matches_type(task_type)`（缺少则注册期 fail-loud），当前只实现 `Exclude`。
+### 8. 🎛️ 执行选择 (Selection)：Exclude 延迟留队 + Skip 终态跳过
+- **第三类调度扩展 seam（候选准入/选择，与 OrderingPolicy / RequeuePolicy 并列，决策见 [ADR-0006](docs/adr/0006-selection-scheduling-seam.md)）**：`pipeline.selection(Exclude(type="pdf_to_md"), Skip(type="ocr"))` 以方法调用配置 pipeline 级规则，两类语义严格区分：
+  - `Exclude`（延迟）：命中作业不派发、不消耗资源与重试预算，队列行原样保留；下游允许作业本次报 `ERR_DEPENDENCY_EXCLUDED` 并计入 `stats["excluded_blocked"]`，下一次 run 自动恢复执行；
+  - `Skip`（终态）：命中作业移出队列（不进 wall / 失败档案），下游整链级联跳过（attempt 记 `DEPENDENCY_SKIPPED`），下次运行不再重试；同一 task_type 同时命中时 Skip 优先。
+- 停摆仲裁用 **Kahn 入度消减**（波前 = wall ∪ excluded）严格区分「真死锁」（依赖环/缺口 → 既有归因熔断）与「仅被 Exclude 阻塞」（留队 + COMPLETED 收敛）；不存在固定等待兜底与忙旋，混合真实死锁不会被选择规则掩盖；
+- 默认空规则与扩展前完全等价；`Rule` 协议要求 `matches_type(task_type)`（缺少则注册期 fail-loud），顶层导出 `Exclude` / `Selection` / `Skip`。
 
 ---
 
@@ -342,7 +344,7 @@ pipeline.clear_history("download::")
 ```
 tasklite/
 ├── pipeline.py          # TaskLite 核心门面与配置
-├── selection.py         # 执行选择规则值对象（候选准入 seam，ADR-0006）
+├── selection.py         # 执行选择规则值对象 Exclude/Skip（候选准入 seam，ADR-0006）
 ├── hooks.py             # 用户工具函数（job_ref / progress_hook / slice_list）
 ├── engine/              # 核心执行机器群
 │   ├── runtime.py       # 核心运行期深模块、主循环事件泵 (EngineRuntime)

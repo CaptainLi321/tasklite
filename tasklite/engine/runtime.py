@@ -21,7 +21,14 @@ from .config import RunConfig
 from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
 from .channel import ExecutionChannel
 from .completion import CompletionMachine
-from .errorclass import ErrorClassifier
+from .errorclass import (
+    ERR_DEPENDENCY_EXCLUDED,
+    ERR_DEPENDENCY_SKIPPED,
+    ERR_DEADLOCK_GAP,
+    ERR_SKIPPED,
+    ErrorClassifier,
+)
+from .governor import SelectionStandstill
 from .in_flight import InFlightTracker
 from .recovery import RecoveryOrchestrator
 from .scheduler import DeadlockAttribution, JobScheduler
@@ -38,8 +45,11 @@ from .types import (
 from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
-from ..models.state import PipelineState
+from ..models.attempt import ATTEMPT_RUNNING, ATTEMPT_SKIPPED, AttemptRecord
+from ..models.job import Job
+from ..models.state import PipelineState, uid_from_job_dict
 from ..selection import Selection
+from ..utils.clock import utc_now_iso
 from ..utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
@@ -137,6 +147,10 @@ class EngineRuntime:
         # 注入后同步到调度器与 StateStore（终态写入出口），execute() 启动期
         # 再固化一次即 per-run 快照。
         self._selection: Selection | None = None
+        # Skip 终态跳过的 run 级状态：脏标记驱动跳过阶段（run 启动 + 派生
+        # 作业落队后）；_skipped_uids 用于捕获派生作业对已跳过上游的级联。
+        self._skip_dirty: bool = False
+        self._skipped_uids: set[str] = set()
 
     def set_selection(self, selection: Selection | None) -> None:
         """注入执行选择（仅 run() 外；门面已守卫，此处提供运行期双保险）。"""
@@ -203,6 +217,8 @@ class EngineRuntime:
         # 与 StateStore（终态写入出口），保证规则与本次 run 一一对应。
         self.scheduler.selection = self._selection
         self.store._set_selection(self._selection)
+        self._skipped_uids.clear()
+        self._skip_dirty = False
 
         old_sigterm = None
         old_sigint = None
@@ -347,9 +363,10 @@ class EngineRuntime:
     ) -> DeadlockArbitration:
         """相二·无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。
 
-        执行选择激活时，若剩余队列全部是「未选中作业 + 被其传递阻塞的下游」，
-        本 run 已无可派发目标——在 governor 之前判为正常完成：不进入死锁
-        归因、不写失败档案，退出原因为 COMPLETED。
+        执行选择激活时先做 Kahn 拓扑剥离：只有「排除/跳过 + 仅被其阻塞」
+        才干净收尾；允许作业存在依赖环/缺口时一律交既有 governor 归因熔断，
+        绝不因 Exclude 命中而掩盖真死锁。resolved 却零归档时按选择事实重新
+        收敛（强制削减或终止），严禁固定等待掩盖零归档。
         """
         deadlock_detected = False
         should_terminate = False
@@ -358,13 +375,11 @@ class EngineRuntime:
             if store.state.is_empty and not self._in_flight:
                 should_terminate = True
             elif not self._in_flight:
-                if self._remaining_only_selection_blocked(
+                standstill = self._selection_standstill(
                     last_outcome.standstill.attribution
-                ):
-                    logger.info(
-                        "Remaining queued jobs are excluded by selection; "
-                        "finishing run as completed."
-                    )
+                )
+                if standstill is not None and standstill.only_blocked_by_exclusion:
+                    self._report_selection_blocked(standstill)
                     should_terminate = True
                 else:
                     decision = self.governor.arbitrate(
@@ -375,13 +390,7 @@ class EngineRuntime:
                         if decision.should_terminate:
                             should_terminate = True
                         elif not decision.failed_uids:
-                            # 不变式：resolved 却零归档 = 归因/过滤口径不一致。
-                            # 给非零等待避免零等待忙旋（不改变既有仲裁语义）。
-                            logger.warning(
-                                "Deadlock arbitration reported 'resolved' without "
-                                "failing any job; backing off to avoid a busy spin."
-                            )
-                            wait_seconds = 0.5
+                            should_terminate = self._settle_zero_failure_resolution()
                     elif decision.action in ("grace_waiting", "gap_retrying"):
                         if decision.wait_time > 0:
                             wait_seconds = decision.wait_time
@@ -391,56 +400,180 @@ class EngineRuntime:
             wait_seconds=wait_seconds,
         )
 
-    def _remaining_only_selection_blocked(self, attribution: DeadlockAttribution) -> bool:
-        """剩余队列是否只有「未选中作业 + 被其传递阻塞的下游」。
-
-        判决本身无状态变更（读取队列事实时复用调度缓存，``cached_job`` 写
-        缓存属良性副作用）；无规则、任务畸形或存在任何可归因停摆（未知/
-        超容资源、缺失依赖、畸形条目）一律返回 False，交既有死锁归因。
-        闭包 O(n+e)：以被排除的队列行为根沿 depends_on 反向扩展被阻塞下游，
-        再校验每个下游的全部未满足依赖都落在闭包内（纯被选择阻塞才收尾）。
-        """
+    def _selection_standstill(
+        self, attribution: DeadlockAttribution
+    ) -> SelectionStandstill | None:
+        """执行选择停摆拓扑判定；未激活或存在其他归因原因时不介入。"""
         selection = self._selection
         if selection is None or not selection.is_active:
-            return False
+            return None
         if attribution.has_deadlock_causes:
-            return False
-        queue = self.store.state.queue
+            return None
+        return self.governor.analyze_selection_standstill(
+            self.store.state, selection, scheduler=self.scheduler
+        )
+
+    def _report_selection_blocked(self, standstill: SelectionStandstill) -> None:
+        """记录「允许执行但仅因 Exclude 而本次无法完成」的下游（留队待下次）。"""
+        upstream = dict(standstill.blocked_by)
+        for uid in standstill.blocked_uids:
+            logger.warning(
+                f"SELECTION: allowed job {uid} blocked by excluded upstream "
+                f"{upstream.get(uid, '?')} ({ERR_DEPENDENCY_EXCLUDED}); kept in "
+                f"queue for a later run."
+            )
+        if standstill.blocked_uids:
+            self.stats["excluded_blocked"] += len(standstill.blocked_uids)
+        logger.info(
+            "Remaining queued jobs are deferred by selection; finishing run as "
+            "completed with the queue preserved."
+        )
+
+    def _settle_zero_failure_resolution(self) -> bool:
+        """resolved 但零归档的收敛：终止或强制削减队列，保证每拍有进展。
+
+        返回 should_terminate。旧实现以 0.5s 固定等待兜底，无法保证队列
+        削减，会在「归档全被选择过滤」时无限忙旋；此处在选择语义下重新求值，
+        残余 stuck 允许作业按既有缺口错误码强制熔断。
+        """
+        standstill = self._selection_standstill(DeadlockAttribution())
+        if standstill is not None and standstill.only_blocked_by_exclusion:
+            self._report_selection_blocked(standstill)
+            return True
+        if standstill is not None and standstill.stuck_uids:
+            logger.error(
+                "Deadlock arbitration resolved without archiving while allowed "
+                f"jobs remain stuck ({list(standstill.stuck_uids)}); attributing "
+                f"them to {ERR_DEADLOCK_GAP} to guarantee queue reduction."
+            )
+            outcome = self.store.apply_bulk_failure(
+                [
+                    (uid, {"error": ERR_DEADLOCK_GAP, "root_cause": True})
+                    for uid in standstill.stuck_uids
+                ]
+            )
+            if outcome.failed_uids:
+                return False
+        logger.critical(
+            "Deadlock arbitration reported 'resolved' without failing any job; "
+            "terminating the run instead of spinning (queue preserved on disk)."
+        )
+        return True
+
+    def _apply_selection_skips(self) -> None:
+        """终态跳过：Skip 命中行移出 queue，下游整链级联跳过并留审计轨迹。
+
+        Skip 是永久语义（不进入 wall/失败档案，下次不再重试），审计落
+        attempts（outcome=skipped）与 ``stats["skipped"]``。删除序为下游优先：
+        崩溃中断后 Skip 根仍在队列，下次 run 可重新得到同一闭包（幂等）。
+        """
+        selection = self._selection
+        if selection is None or not selection.has_skip_rules:
+            return
+        store = self.store
+        queue = store.state.queue
         if not queue:
-            return False
-        job_map: dict[str, tuple[str, tuple[str, ...]]] = {}
+            return
+        rows: dict[str, dict] = {}
+        facts: dict[str, tuple[str, tuple[str, ...]]] = {}
         for job_dict in queue:
             try:
-                facts = self.scheduler.cached_job(job_dict)
+                sched_job = self.scheduler.cached_job(job_dict)
             except (KeyError, TypeError, ValueError):
-                return False
-            job_map[facts.uid] = (facts.task_type, facts.depends_on)
+                continue  # 畸形行走既有 MALFORMED_JOB 归因
+            rows[sched_job.uid] = job_dict
+            facts[sched_job.uid] = (sched_job.task_type, tuple(sched_job.depends_on))
+        if not facts:
+            return
         dependents: dict[str, list[str]] = {}
-        omitted: set[str] = set()
-        for uid, (task_type, depends_on) in job_map.items():
-            if not selection.allows_type(task_type):
-                omitted.add(uid)
-                continue
-            for dependency in depends_on:
-                dependents.setdefault(dependency, []).append(uid)
-        if not omitted:
-            return False
-        blocked: set[str] = set()
-        stack = list(omitted)
+        for uid, (_task_type, depends_on) in facts.items():
+            for dep in depends_on:
+                dependents.setdefault(dep, []).append(uid)
+        seeds = {
+            uid
+            for uid, (task_type, depends_on) in facts.items()
+            if selection.is_skipped(task_type)
+            or any(dep in self._skipped_uids for dep in depends_on)
+        }
+        if not seeds:
+            return
+        closure = set(seeds)
+        depth: dict[str, int] = {uid: 0 for uid in seeds}
+        root_of: dict[str, str] = {uid: uid for uid in seeds}
+        stack = list(seeds)
         while stack:
-            uid = stack.pop()
-            for child in dependents.get(uid, ()):
-                if child not in blocked and child not in omitted:
-                    blocked.add(child)
-                    stack.append(child)
-        if omitted | blocked != set(job_map):
-            return False
-        wall = self.store.state.wall_uids
-        for uid in blocked:
-            unmet = [dep for dep in job_map[uid][1] if dep not in wall]
-            if not unmet or not all(dep in omitted or dep in blocked for dep in unmet):
-                return False
-        return True
+            cur = stack.pop()
+            for child in dependents.get(cur, ()):
+                if child in closure:
+                    continue
+                closure.add(child)
+                depth[child] = depth[cur] + 1
+                root_of[child] = root_of.get(cur, cur)
+                stack.append(child)
+        skipped = 0
+        for uid in sorted(closure, key=lambda item: (-depth.get(item, 0), item)):
+            queued_row = rows.get(uid)
+            if queued_row is None:
+                continue
+            try:
+                job = Job.from_dict(queued_row)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if uid in seeds and selection.is_skipped(job.task_type):
+                error = ERR_SKIPPED
+            else:
+                error = (
+                    f"{ERR_DEPENDENCY_SKIPPED} "
+                    f"(upstream: {root_of.get(uid, '?')})"
+                )
+            store.apply_skip(uid, job_dict=queued_row)
+            self._skipped_uids.add(uid)
+            self._record_skip_attempt(job, error)
+            skipped += 1
+            logger.info(f"SELECTION: job {uid} skipped terminal ({error}).")
+        if skipped:
+            removed = set(closure)
+            store.state.replace_queue(
+                [
+                    job_dict
+                    for job_dict in queue
+                    if uid_from_job_dict(job_dict) not in removed
+                ]
+            )
+
+    def _record_skip_attempt(self, job: Job, error: str) -> None:
+        """Skip 终态审计（旁路 attempts 轨迹；写失败降级告警，不阻断主流程）。
+
+        轨迹行遵循 append-only 契约：先插 running 开行、再一次收尾为
+        skipped——与派发侧同一写侧形状，不绕过 ``append_attempt`` 门卫。
+        """
+        run_id = self._session.run_id
+        if not run_id:  # pragma: no cover - 跳过阶段只在 run 内执行
+            return
+        try:
+            now = utc_now_iso()
+            incarnation = f"{run_id}.skip.{self._session.next_dispatch_seq()}"
+            attempt_id = self.store.backend.append_attempt(
+                AttemptRecord(
+                    job_uid=job.uid,
+                    activation_no=job.activation_no,
+                    attempt_no=job.attempt_no,
+                    incarnation=incarnation,
+                    run_id=run_id,
+                    started_at=now,
+                    outcome=ATTEMPT_RUNNING,
+                )
+            )
+            self.store.backend.update_attempt(
+                attempt_id,
+                outcome=ATTEMPT_SKIPPED,
+                finished_at=now,
+                error=error,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Attempt trace append degraded for skipped {job.uid}: {e}"
+            )
 
     def _drain_and_settle(self) -> int:
         """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
@@ -475,6 +608,11 @@ class EngineRuntime:
                 logger.info("Pipeline drained. Saving queue and exiting.")
                 self._recovery.save_queue_crash_safe()
                 return self._terminal_outcome()
+
+        # 0.5 执行选择·Skip：run 启动与派生作业落队后把终态跳过收敛掉
+        if self._skip_dirty:
+            self._skip_dirty = False
+            self._apply_selection_skips()
         if store.state.is_empty and not self._in_flight:
             return self._terminal_outcome()
 
@@ -492,6 +630,9 @@ class EngineRuntime:
 
         # 3. Drain 回收在途结果并统一结算
         completed_count = self._drain_and_settle()
+        if completed_count:
+            # 派生作业可能带 Skip 命中或依赖已跳过上游，下一拍先收敛跳过闭包
+            self._skip_dirty = True
 
         # 4. 等待/空闲决策（唯一实现见 wait.decide_wait）
         is_idle = store.state.is_empty and not self._in_flight
@@ -606,6 +747,7 @@ class EngineRuntime:
     def _run_body(self) -> None:
         """主执行体：启动屏障（装载 + fencing）→ 带承重网的主循环。"""
         self.prepare_run_state()
+        self._skip_dirty = True
         self._run_with_crash_net()
 
     def _handle_signal(self, signum: int, frame: Any) -> None:

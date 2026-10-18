@@ -39,6 +39,11 @@ ERR_MALFORMED_JOB = "MALFORMED_JOB"
 ERR_COMMIT_FAILURE = "COMMIT_FAILURE"
 ERR_DISPATCH_FAILURE = "DISPATCH_FAILURE"
 ERR_DEADLOCK_GAP = "DEADLOCK_CLASSIFICATION_GAP"
+# 执行选择（Selection）归因：旁路观测/运行日志口径，不进入失败档案
+# （Skip 为终态跳过，Exclude 下游为延迟留队，均非失败）。
+ERR_SKIPPED = "SKIPPED"
+ERR_DEPENDENCY_SKIPPED = "DEPENDENCY_SKIPPED"
+ERR_DEPENDENCY_EXCLUDED = "DEPENDENCY_EXCLUDED"
 
 # ── 子进程死亡归因错误串前缀（classify_process_death 决策表产出，
 #    与 _classify_string 映射同源；失败档案落盘串按前缀匹配分类） ──────
@@ -938,6 +943,9 @@ __all__ = [
     "ERR_COMMIT_FAILURE",
     "ERR_DISPATCH_FAILURE",
     "ERR_DEADLOCK_GAP",
+    "ERR_SKIPPED",
+    "ERR_DEPENDENCY_SKIPPED",
+    "ERR_DEPENDENCY_EXCLUDED",
     # 死亡归因错误串前缀
     "ERR_TIMEOUT_PREFIX",
     "ERR_PROCESS_CRASH_PREFIX",

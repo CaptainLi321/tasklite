@@ -27,8 +27,8 @@ __version__ = "2.1.0"
 # ── 门面（六步调用契约的唯一入口）────────────────────────────────────
 from .pipeline import TaskLite
 
-# ── 执行选择（pipeline 级规则值对象）─────────────────────────────────
-from .selection import Exclude
+# ── 执行选择（pipeline 级规则值对象与规则集）─────────────────────────
+from .selection import Exclude, Selection, Skip
 
 # ── 模型层：规格 / 实例 / 轨迹 / 上下文 ──────────────────────────────
 from .models.attempt import AttemptRecord
@@ -52,6 +52,8 @@ from .engine.errorclass import (
     ERR_COMMIT_FAILURE,
     ERR_DEADLOCK_GAP,
     ERR_DEPENDENCY_DEADLOCK,
+    ERR_DEPENDENCY_EXCLUDED,
+    ERR_DEPENDENCY_SKIPPED,
     ERR_DISPATCH_FAILURE,
     ERR_IPC_WRITE_DEGRADED_PREFIX,
     ERR_JOB_DEPENDENCY,
@@ -63,6 +65,7 @@ from .engine.errorclass import (
     ERR_PROCESS_CRASH_PREFIX,
     ERR_PROCESS_SIGNAL_DEATH,
     ERR_RESOURCE_DEADLOCK,
+    ERR_SKIPPED,
     ERR_TIMEOUT_PREFIX,
     FATAL_EXCEPTIONS,
     TRANSIENT_EXCEPTIONS,
@@ -128,6 +131,8 @@ __all__ = [
     "TaskLite",
     # 执行选择
     "Exclude",
+    "Selection",
+    "Skip",
     # 模型层
     "AttemptRecord",
     "Job",
@@ -165,6 +170,9 @@ __all__ = [
     "ERR_COMMIT_FAILURE",
     "ERR_DISPATCH_FAILURE",
     "ERR_DEADLOCK_GAP",
+    "ERR_DEPENDENCY_EXCLUDED",
+    "ERR_DEPENDENCY_SKIPPED",
+    "ERR_SKIPPED",
     "ERR_TIMEOUT_PREFIX",
     "ERR_PROCESS_CRASH_PREFIX",
     "ERR_NO_IPC_RESULT",

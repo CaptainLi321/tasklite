@@ -10,17 +10,18 @@
 
 ## [2.1.0] - 2026-10-18
 
-执行选择版本：`pipeline.selection(...)` 以方法调用配置「默认全执行 + 指定 task_type 不执行」，未选中作业原样留队，服务跨设备/跨 run 的队列交接。
+执行选择版本：`pipeline.selection(...)` 以方法调用配置 pipeline 级规则，严格区分 **Exclude（本次不执行、原样留队、下次自动恢复）** 与 **Skip（终态跳过、下游级联、下次不再重试）** 两个单机语义。
 
 ### 新增
 
 - **执行选择（Selection）**：`TaskLite.selection(*rules)` 是 pipeline 属性、不是 `run()` 参数——每次调用整体替换规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变。
-  - 新模块 `tasklite/selection.py`：`Rule` 协议（`matches_type(task_type)`，缺少该入口的规则注册期 fail-loud）、`Exclude(type=...)` 值对象（按 `job.task_type` 精确排除，冻结 dataclass）、`Selection` 规则集（`allows_type` / `is_active`）；顶层 `tasklite` 只导出 `Exclude`，高级集成可经 `tasklite.selection` 子模块导入。
-  - 语义：未选中作业不派发、不写 attempt 轨迹、不进入 wall/失败档案、不消耗资源与重试预算，队列行原样保留；其下游依赖保持 PENDING_DEPENDENCY 留队；当剩余队列只剩「未选中 + 被其传递阻塞」的作业且无在途任务时，`run()` 正常以 `ExitReason.COMPLETED` 收敛（不判死锁、不空转、不写失败档案）。
-  - 终态写入隔离：级联失败（父任务失败）与死锁批量熔断的写入出口同样过滤被排除 uid——被排除作业绝不进入失败档案，也不会被级联删出队列。畸形队列行（缺 `job_id` 等）无可信身份，不参与选择豁免，仍按既有 `MALFORMED_JOB` 语义进失败档案。
-  - 规则只做 task_type 格式校验，不校验注册表存在性（规则可先于 `register_task` 配置，也可跨设备复用）。
-  - 引擎接线：`scan_next_runnable` 在依赖/资源评估前按 task_type 跳过未选中作业；`_arbitrate_deadlock` 在 governor 之前以无状态谓词判定「仅剩选择留队」为正常完成。不改 `RunSummary` / `EMPTY_STATS` / `ExecutionOptions` / `RunConfig`，混合真实死锁场景仍走既有归因语义。
-  - **集成方注意**：selection 激活时 `run()` 可能以 `COMPLETED` 退出而持久化队列非空（未选中作业留队），完成度请按 queue 判定，不能只看退出原因。
+  - 新模块 `tasklite/selection.py`（全小写，Linux 大小写敏感环境 `from tasklite.selection import ...` 可用）：`Rule` 协议（`matches_type(task_type)`，缺少该入口的规则注册期 fail-loud）、`Exclude(type=...)` / `Skip(type=...)` 冻结值对象、`Selection` 规则集（`is_skipped` / `is_excluded` / `allows_type` / `is_active` / `has_skip_rules`）；顶层 `tasklite` 导出 `Exclude` / `Selection` / `Skip`。
+  - **Exclude（延迟语义）**：命中作业不派发、不写 attempt 轨迹、不进入 wall/失败档案、不消耗资源与重试预算，队列行原样保留；下游允许作业本次报 `ERR_DEPENDENCY_EXCLUDED` 并计入新增公开计数 `stats["excluded_blocked"]`，下一次 run（去掉 Exclude / 换 run 配置）自动恢复执行。
+  - **Skip（终态语义）**：命中作业移出 queue，不进入 wall / 失败档案，`stats["skipped"]` 计数，审计落 append-only attempts（`outcome="skipped"`，错误码 `SKIPPED`）；直接或间接依赖它的下游整链级联跳过（attempt 错误码 `DEPENDENCY_SKIPPED`），下次运行不再重试；Skip 优先于 Exclude。
+  - **停摆仲裁改为 Kahn 拓扑入度消减**：以 `wall_uids | excluded_uids` 为初始波前，区分真死锁（依赖环/自环/缺口 → 既有 `ERR_DEPENDENCY_DEADLOCK` / `ERR_DEADLOCK_GAP` / `ERR_RESOURCE_DEADLOCK` / `ERR_MALFORMED_JOB` 归因熔断）与「仅因 Exclude 而受阻」（留队 + `COMPLETED` 收敛）；修复「允许作业依赖环被掩盖为正常完成」与「resolved 零归档 0.5s 忙旋」两个缺陷，零归档路径保证队列削减或干净终止。
+  - 终态写入隔离：级联失败（父任务失败）与死锁批量熔断的写入出口过滤被排除/跳过 uid。畸形队列行（缺 `job_id` 等）无可信身份，不参与选择豁免，仍按既有 `MALFORMED_JOB` 语义进失败档案。
+  - 规则只做 task_type 格式校验，不校验注册表存在性（规则可先于 `register_task` 配置，也可跨运行窗口复用）。
+  - **集成方注意**：Exclude 激活时 `run()` 可能以 `COMPLETED` 退出而持久化队列非空（留队待下次），完成度请按 queue 判定；Skip 是永久删除语义。
 - **文档**：[ADR-0006](docs/adr/0006-selection-scheduling-seam.md) 将执行选择登记为第三类调度扩展 seam（候选准入/选择），V2_GUIDE §5/§8、README 架构树与特性 8、ROADMAP §3、AGENTS seam 注册句同步分类。
 - **版本**：`tasklite/__init__.py` `__version__` 2.0.0 → 2.1.0（ZeroCite v2 依赖 `tasklite-engine>=2.1.0`）。
 

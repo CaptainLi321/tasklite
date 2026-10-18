@@ -19,6 +19,7 @@ from typing import Any, Protocol
 
 from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
+from ..selection import Selection
 from .errorclass import (
     ERR_DEADLOCK_GAP,
     ERR_DEPENDENCY_DEADLOCK,
@@ -83,6 +84,36 @@ class DeadlockDecision:
     wait_time: float = 0.0
     failed_uids: list[str] = field(default_factory=list)
     cascaded_uids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SelectionStandstill:
+    """执行选择下的停摆拓扑判定（Kahn 入度消减结果）。
+
+    以 ``wall_uids | deferred_uids``（Exclude 命中行 + 防御性的 Skip 残留行）
+    为初始波前，对剩余「允许执行」作业做入度消减：
+
+    - ``stuck_uids``：入度无法消减为 0 的允许作业——存在依赖环或依赖回边
+      之外的缺口，属真死锁候选，交既有 governor 归因熔断；
+    - ``blocked_uids``：入度可消减、且传递依赖最终落在 deferred 波前上的
+      允许作业——本次仅因上游被排除/跳过而无法完成，必须留队等待下次 run；
+    - ``unblocked_uids``：入度可消减但仍有余量（如资源等待）的允许作业，
+      存在本 run 继续推进的可能，不得据此终止运行。
+
+    结论 ``only_blocked_by_exclusion`` 为真当且仅当没有任何允许作业可能
+    在本 run 完成（无 stuck、无 unblocked）：此时本 run 干净终止，队列保留。
+    """
+
+    excluded_uids: tuple[str, ...] = ()
+    blocked_uids: tuple[str, ...] = ()
+    unblocked_uids: tuple[str, ...] = ()
+    stuck_uids: tuple[str, ...] = ()
+    blocked_by: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def only_blocked_by_exclusion(self) -> bool:
+        """剩余队列是否全部为「排除/跳过 + 仅被其阻塞」的作业。"""
+        return not self.stuck_uids and not self.unblocked_uids
 
 
 @dataclass
@@ -259,6 +290,97 @@ class DeadlockGovernor:
         )
         return True
 
+    def analyze_selection_standstill(
+        self,
+        state: PipelineState,
+        selection: Selection,
+        *,
+        scheduler: ScanCache | None = None,
+    ) -> SelectionStandstill | None:
+        """以 Kahn 入度消减剥离选择停摆：区分真死锁与「仅被排除阻塞」。
+
+        返回 None 表示队列存在畸形行（无可信拓扑事实），交既有
+        ``MALFORMED_JOB`` 归因。纯计算、无状态变更。
+        """
+        queue = state.queue
+        if not queue:
+            return SelectionStandstill()
+        facts: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for job_dict in queue:
+            try:
+                if scheduler is not None:
+                    job = scheduler.cached_job(job_dict)
+                    uid, task_type, depends_on = job.uid, job.task_type, job.depends_on
+                else:
+                    parsed = Job.from_dict(job_dict)
+                    uid, task_type, depends_on = (
+                        parsed.uid,
+                        parsed.task_type,
+                        tuple(parsed.depends_on),
+                    )
+            except (KeyError, TypeError, ValueError):
+                return None
+            facts[uid] = (task_type, tuple(depends_on))
+
+        deferred = {
+            uid for uid, (task_type, _deps) in facts.items()
+            if not selection.allows_type(task_type)
+        }
+        excluded = {
+            uid for uid, (task_type, _deps) in facts.items()
+            if selection.is_excluded(task_type)
+        }
+        allowed = set(facts) - deferred
+
+        # Kahn：只有允许作业参与消减；deferred 与 wall 同为已满足波前。
+        indegree: dict[str, int] = {}
+        dependents: dict[str, list[str]] = {}
+        for uid in allowed:
+            count = 0
+            for dep in facts[uid][1]:
+                if dep in deferred or dep in state.wall_uids:
+                    continue
+                count += 1
+                dependents.setdefault(dep, []).append(uid)
+            indegree[uid] = count
+        ready = [uid for uid, count in indegree.items() if count == 0]
+        reduced: set[str] = set()
+        while ready:
+            uid = ready.pop()
+            reduced.add(uid)
+            for child in dependents.get(uid, ()):
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    ready.append(child)
+        stuck = allowed - reduced
+
+        # 仅因排除受阻：从 deferred 沿依赖边反向闭包，再与可消减集求交。
+        children: dict[str, list[str]] = {}
+        for uid in allowed:
+            for dep in facts[uid][1]:
+                children.setdefault(dep, []).append(uid)
+        root_of: dict[str, str] = {}
+        blocked: set[str] = set()
+        stack: list[str] = list(deferred)
+        while stack:
+            cur = stack.pop()
+            for child in children.get(cur, ()):
+                if child in deferred or child in blocked:
+                    continue
+                blocked.add(child)
+                root_of.setdefault(child, root_of.get(cur, cur))
+                stack.append(child)
+        blocked &= reduced
+        return SelectionStandstill(
+            excluded_uids=tuple(sorted(excluded)),
+            blocked_uids=tuple(sorted(blocked)),
+            unblocked_uids=tuple(sorted(reduced - blocked)),
+            stuck_uids=tuple(sorted(stuck)),
+            blocked_by=tuple(
+                sorted((uid, root_of.get(uid, "")) for uid in blocked)
+            ),
+        )
+
     @staticmethod
     def _split_deadlock_by_uids(
         queue: list[dict[str, Any]],
@@ -424,4 +546,5 @@ __all__ = [
     "DeadlockDecision",
     "DeadlockGovernor",
     "ScanCache",
+    "SelectionStandstill",
 ]

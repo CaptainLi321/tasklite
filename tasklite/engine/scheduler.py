@@ -302,10 +302,10 @@ class JobScheduler:
             can_run = True
             failed_dependency = None
 
-            # 执行选择：未选中作业在依赖/资源评估之前整体跳过——不贡献
-            # missing/unknown/impossible/min_wait/has_potential_spawners 任何
-            # 停摆事实；运行期收敛仲裁把「仅剩未选中」判为正常完成。
-            # None / 空规则集短路，行为与扩展前等价。
+            # 执行选择：命中 Skip/Exclude 的作业在依赖/资源评估之前整体
+            # 跳过——不贡献 missing/unknown/impossible/min_wait/
+            # has_potential_spawners 任何停摆事实；Skip 由运行期跳过阶段收敛
+            # 为终态，Exclude 由停摆仲裁判为留队延迟。None / 空规则集短路。
             selection = self.selection
             if (
                 selection is not None

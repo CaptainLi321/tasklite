@@ -56,8 +56,9 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 ## 3. 调度策略族 —— `已搁置（库主 2026-10-02 裁决），解禁后逐策略小 ADR`
 
 > **状态更新（2026-10-18，ADR-0006）**：候选准入/选择（`task_type` 维度）已按库主直接
-> 指示于 2.1.0 立项实现为**第三类调度扩展 seam**（`pipeline.selection(...)` + `Exclude`，
-> 见 [ADR-0006](adr/0006-selection-scheduling-seam.md)）。本节冻结的排序/退避策略族
+> 指示于 2.1.0 立项实现为**第三类调度扩展 seam**（`pipeline.selection(...)` +
+> `Exclude` / `Skip` 两类单机语义，见 [ADR-0006](adr/0006-selection-scheduling-seam.md)）。
+> 本节冻结的排序/退避策略族
 > （软 EDF、退避回归、aging、jitter、超期准入等依赖 Job 调度字段的方向）**状态不变**，
 > 上述实现不构成解禁；第 5 项「超期准入控制」依赖 Job `deadline`、仍随本节冻结，与
 > Selection 的 `task_type` 准入不同轴。

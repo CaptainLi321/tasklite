@@ -234,7 +234,7 @@ pipeline.retry_failure("download::img_001")
 |---|---|---|---|
 | `OrderingPolicy` | 候选排序（队列访问序） | `JobScheduler.scan_next_runnable` 按 `visit_order` 首中即停 | ADR-0004 |
 | `RequeuePolicy` | 重入队节奏 | `RequeuePolicy.plan_requeue`（`StateStore.requeue_transient` / `apply_retry` 唯一消费） | ADR-0004 |
-| `Selection` | 候选准入/选择（`task_type` 维度） | `scan_next_runnable` 候选过滤 + 终态写入出口（`cascade_fail` / `apply_bulk_failure`）隔离 + `_remaining_only_selection_blocked` 收敛前置 | [ADR-0006](adr/0006-selection-scheduling-seam.md)、本指南第 8 节 |
+| `Selection` | 候选准入/选择（`task_type` 维度：Exclude 延迟 / Skip 终态） | `scan_next_runnable` 候选过滤 + Skip 跳过阶段（终态收敛） + 停摆仲裁 Kahn 拓扑剥离 + 终态写入出口（`cascade_fail` / `apply_bulk_failure`）隔离 | [ADR-0006](adr/0006-selection-scheduling-seam.md)、本指南第 8 节 |
 
 ### OrderingPolicy：队列访问序
 
@@ -282,7 +282,7 @@ pipeline = TaskLite(name="media", state_dir="./state",
 
 ### Selection：候选准入/选择（第三类 seam）
 
-Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」，既不是候选排序也不是重入队节奏：`pipeline.selection(Exclude(type="pdf_to_md"))` 配置规则集，未选中作业原样留队（跨设备/跨 run 交接）。API 与语义契约见**第 8 节**；分类裁决、终态写入隔离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。
+Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」，既不是候选排序也不是重入队节奏：`pipeline.selection(Exclude(type="pdf_to_md"), Skip(type="ocr"))` 配置规则集——Exclude 延迟留队（下次 run 自动恢复），Skip 终态跳过并级联下游。API 与语义契约见**第 8 节**；分类裁决、停摆拓扑剥离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。
 
 ### 核心禁改红线
 
@@ -331,31 +331,43 @@ Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」�
 
 ---
 
-## 8. 执行选择（Selection）：默认全执行 + 指定 task_type 留队
+## 8. 执行选择（Selection）：Exclude 延迟留队 + Skip 终态跳过
 
-Selection 属**第 5 节调度扩展 seam 的第三类——候选准入/选择**（与 OrderingPolicy、RequeuePolicy 并列），分类裁决、终态写入隔离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。本节给出使用面与语义契约。
+Selection 属**第 5 节调度扩展 seam 的第三类——候选准入/选择**（与 OrderingPolicy、RequeuePolicy 并列），分类裁决、停摆拓扑剥离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。本节给出使用面与语义契约。
 
-`pipeline.selection(*rules)` 是 **pipeline 属性**（不是 `run()` 的参数）：每次调用**整体替换**规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变，`RunSummary` / `EMPTY_STATS` / `ExecutionOptions` 均无新增字段。
+`pipeline.selection(*rules)` 是 **pipeline 属性**（不是 `run()` 的参数）：每次调用**整体替换**规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变，`RunSummary` / `ExecutionOptions` 无新增字段，`EMPTY_STATS` 新增 `excluded_blocked` 计数（本次 run 中「允许执行但仅因 Exclude 上游而无法完成」的留队作业数）。
 
 ```python
-from tasklite import Exclude, Job, TaskLite
+from tasklite import Exclude, Job, Skip, TaskLite
 
 pipeline = TaskLite(name="research", state_dir="./state")
-pipeline.selection(Exclude(type="pdf_to_md"))   # 本次配置：pdf_to_md 不执行、留队
+pipeline.selection(Exclude(type="pdf_to_md"))   # 本次不执行、留队（下次自动恢复）
 pipeline.enqueue([Job("fetch", "a"), Job("pdf_to_md", "p")])
 pipeline.run()                                  # 只执行 fetch，pdf_to_md 留在持久化队列
 
+pipeline.selection(Skip(type="ocr"))            # 终态跳过：命中作业与下游永不执行
+pipeline.selection(Exclude("a"), Skip("b"))     # 每次整体替换；同一 task_type Skip 优先
 pipeline.selection()                            # 重置：恢复全执行
-pipeline.run()                                  # 下次 run 消费留队作业
 ```
 
-规则是职责单一的值对象：当前唯一规则 `Exclude(type=...)` 按 `job.task_type` 精确排除；`Rule` 协议只要求 `matches_type(task_type)`（引擎的调度热路径与终态写入出口都按 task_type 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层只导出 `Exclude`，`from tasklite.selection import Selection` 仍可用于高级集成。规则只做 task_type 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨设备复用。
+规则是职责单一的值对象：`Exclude(type=...)`（延迟）与 `Skip(type=...)`（终态）均按 `job.task_type` 精确匹配；`Rule` 协议只要求 `matches_type(task_type)`（引擎的调度热路径与终态写入出口都按 task_type 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层 `tasklite` 导出 `Exclude` / `Selection` / `Skip`，`from tasklite.selection import ...` 子模块路径同样可用（模块名全小写）。规则只做 task_type 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨运行窗口复用。
 
-语义（跨设备队列交接的前提）：
+### 8.1 Exclude（延迟语义：留队、下次自动重试）
 
-- 未选中作业**不派发、不写 attempt 轨迹、不进入 wall/失败档案、不消耗 worker/资源与重试预算**，队列行原样留在持久化 queue（终态写入出口同样隔离：父失败级联与死锁批量熔断都不会归档被排除 uid）；
-- 其下游作业依赖仍挂在 queue 中 → 保持 PENDING_DEPENDENCY 安静留队；
-- 只剩「未选中 + 被其传递阻塞」的作业且无在途任务时，`run()` 正常以 `ExitReason.COMPLETED` 收敛（不判死锁、不空转、不写失败档案）；
+- 命中作业不派发、不写 attempt 轨迹、不进入 wall/失败档案、不消耗 worker/资源与重试预算，队列行原样保留；
+- 其下游允许作业同样留队，本次 run 报 `ERR_DEPENDENCY_EXCLUDED` 并计入 `stats["excluded_blocked"]`，下一次 run（去掉 Exclude / 换 run 配置）自动恢复执行；
+- 停摆仲裁用 **Kahn 入度消减**（初始波前 = `wall_uids | excluded_uids`）严格区分：允许作业存在依赖环/缺口时按既有 governor 归因熔断（`ERR_DEPENDENCY_DEADLOCK` / `ERR_DEADLOCK_GAP` / `ERR_RESOURCE_DEADLOCK` / `ERR_MALFORMED_JOB`），绝不因 Exclude 命中而掩盖；仅当剩余允许作业全部可消减且仅被 Exclude 阻塞时，`run()` 以 `ExitReason.COMPLETED` 收敛并保留队列（无固定等待、无忙旋）；
+- 终态写入出口隔离：被排除 uid 不进入失败档案（父失败级联不传播、批量熔断被过滤）。
+
+### 8.2 Skip（终态语义：跳过、下游级联、不再重试）
+
+- 命中作业从 queue 移除，不进入 wall、不进入失败档案（既不成功也不失败），`stats["skipped"]` 计数，审计落 append-only attempts（`outcome="skipped"`，错误码 `SKIPPED`）；
+- 直接或间接依赖 Skip 作业的下游永远无法完成，整链级联跳过（attempt 错误码 `DEPENDENCY_SKIPPED`，含上游 uid），一并从 queue 移除，下次运行不再重试；
+- Skip 与 Exclude 同时命中时 **Skip 优先**（终态意图强于延迟意图）；Skip 级联同样优先于 Exclude——被 Skip 上游永久堵死的 Exclude 作业也一并终态跳过；
+- 运行期派生（`ctx.spawn`）出的 Skip 命中作业在下一拍被跳过阶段收敛，不会派发。
+
+### 8.3 集成方注意
+
+- selection 激活时 `run()` 可能以 `COMPLETED` 退出而持久化队列非空（Exclude 留队），完成度请按 queue 判定，不能只看退出原因；`stats["excluded_blocked"]` 给出本次被延迟的下游数量；
 - 混合场景（队列同时存在真实死锁成因的允许作业）仍按既有死锁归因/失败档案语义处理——选择规则不等于死锁豁免；
-- **集成方注意**：selection 激活时 `run()` 可能以 `COMPLETED` 退出而持久化队列非空（未选中作业留队），完成度请按 queue 判定，不能只看退出原因；
 - `selection(...)` 仅允许 `run()` 外调用；run 期调用抛 `RuntimeError`。

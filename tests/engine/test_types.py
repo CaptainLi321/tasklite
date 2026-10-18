@@ -31,13 +31,14 @@ _EXPECTED_STAT_KEYS = {
     "interrupted_reruns",
     "rate_limited_reruns",
     "cascade_failed",
+    "excluded_blocked",
 }
 
 
 class TestEmptyStats:
-    """EMPTY_STATS 基准形状：九键全零，TaskStats 以其为初始快照而非别名。"""
+    """EMPTY_STATS 基准形状：十键全零，TaskStats 以其为初始快照而非别名。"""
 
-    def test_nine_keys_all_zero(self):
+    def test_ten_keys_all_zero(self):
         assert set(EMPTY_STATS) == _EXPECTED_STAT_KEYS
         assert all(value == 0 for value in EMPTY_STATS.values())
 
@@ -66,7 +67,7 @@ class TestTransientKindRegistry:
 
     @pytest.mark.parametrize("stat_key", sorted(TRANSIENT_KIND_STAT_KEYS.values()))
     def test_stat_keys_are_public_api(self, stat_key):
-        """kind→统计键映射不得指向公开 EMPTY_STATS 九键之外的键
+        """kind→统计键映射不得指向公开 EMPTY_STATS 十键之外的键
         （统计键逐键文档化，改键名即破坏监控面）。"""
         assert stat_key in EMPTY_STATS
 

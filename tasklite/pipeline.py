@@ -499,10 +499,16 @@ class TaskLite:
         """设置执行选择规则集（pipeline 属性，不是 run() 参数）。
 
         每次调用**整体替换**规则集，0 参数 = 重置为默认全执行；返回 self
-        支持链式。未选中作业不派发、不写 attempt 轨迹、不进入 wall/失败
-        档案、不消耗资源与重试预算，原样留在持久化 queue；其下游保持
-        PENDING_DEPENDENCY 留队。仅剩「未选中 + 被其阻塞」作业且无在途
-        任务时，`run()` 正常以 COMPLETED 收敛，队列保留给下一次 run。
+        支持链式。两类规则语义严格区分：
+
+        - ``Exclude(type=...)``：本次不执行、原样留队（不写 attempt、不进
+          wall/失败档案、不消耗资源与预算），下游同样留队，下一次 run 自动
+          恢复执行；仅因排除而停摆时 `run()` 以 COMPLETED 收敛并保留队列。
+        - ``Skip(type=...)``：终态跳过（移出 queue、不进 wall/失败档案），
+          下游整链级联跳过（attempt 记 ``DEPENDENCY_SKIPPED``），下次不再
+          执行。
+
+        同一 task_type 同时命中时 Skip 优先。
         """
         self._ensure_not_running("selection")
         self._runtime.set_selection(Selection(rules))

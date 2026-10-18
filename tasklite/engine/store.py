@@ -159,11 +159,11 @@ class StateStore:
         self._selection = selection
 
     def _selection_excluded_uids(self) -> frozenset[str]:
-        """当前队列中被执行选择排除的**合法作业** uid 集合（空规则时为空集）。
+        """当前队列中被执行选择拦截（Exclude/Skip）的**合法作业** uid 集合。
 
         畸形行无可信身份（缺 task_type/job_id 等），不属于「指定 task_type 的
         合法作业」——跳过并继续走既有 MALFORMED_JOB 归因，不能因带个 task_type
-        字段就被选择豁免。
+        字段就被选择豁免。空规则集返回空集。
         """
         selection = self._selection
         if selection is None or not selection.is_active:
@@ -561,8 +561,8 @@ class StateStore:
     ) -> BulkFailureOutcome:
         """原子批量失败（死锁归因或批量熔断）；剩余队列由失败集单点派生。
 
-        执行选择激活时按队列行 task_type 过滤被排除 uid：它们绝不进入失败
-        档案（过滤后为空则直接返回空结果，由运行期收敛谓词正常收尾）。
+        执行选择激活时按队列行 task_type 过滤被排除/跳过 uid：它们绝不进入
+        失败档案（过滤后为空则直接返回空结果，由运行期选择仲裁收敛）。
         """
         excluded_uids = self._selection_excluded_uids()
         if excluded_uids:
