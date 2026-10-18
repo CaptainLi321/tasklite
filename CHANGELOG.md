@@ -25,6 +25,10 @@
 - **文档**：[ADR-0006](docs/adr/0006-selection-scheduling-seam.md) 将执行选择登记为第三类调度扩展 seam（候选准入/选择），V2_GUIDE §5/§8、README 架构树与特性 8、ROADMAP §3、AGENTS seam 注册句同步分类。
 - **版本**：`tasklite/__init__.py` `__version__` 2.0.0 → 2.1.0（ZeroCite v2 依赖 `tasklite-engine>=2.1.0`）。
 
+### 修复
+
+- **挂起恢复端到端用例的时序竞态**：`tests/integration/test_end_to_end.py::test_real_subprocess_suspend_resource_recovers` 中 waiter 改为显式依赖 holder，消除 Windows 高负载下子进程启动超过限速窗口时 waiter 抢在 holder 结算前派发、导致「waiter 派发晚于 holder 终态」断言倒挂的误报（时序断言下界不变）。
+
 ## [2.0.0] - 2026-10-02
 
 v2 上位为主包的破坏性大版本（上位总纲 [ADR-0005](docs/adr/0005-v2-promotion.md)，重建设计 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，使用指南 [docs/V2_GUIDE.md](docs/V2_GUIDE.md)）：v2 子包物理提升为 `tasklite` 主包（单原子提交世界切换，生产代码零逻辑改写），v1 树整体退役（git 历史与 `v1-final` 标签留档），v2 子包导入路径消亡且**不留路径别名**。本版同时收录 v2 并行重建期的全部特性（Task/Job/Attempt 三层模型，全量 2204 测试）。

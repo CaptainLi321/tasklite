@@ -465,7 +465,16 @@ class TestRealSubprocessFaultScenarios:
         p.register_task(
             "gated_plain", plain_gated_handler, default_resources={"api": 1.0}
         )
-        p.enqueue([Job("gated", "holder"), Job("gated_plain", "waiter")])
+        # waiter 显式依赖 holder：排除「限速窗口先于 holder 子进程启动到期、
+        # waiter 抢在 holder 结算前派发」的调度竞态（Windows 高负载下子进程
+        # 启动可超过 interval）。依赖使 waiter 只能在 holder 终态后参与调度，
+        # 挂起恢复窗口的断言才具备确定性下界。
+        p.enqueue(
+            [
+                Job("gated", "holder"),
+                Job("gated_plain", "waiter", depends_on=["gated::holder"]),
+            ]
+        )
         summary = p.run()
         p.stop()
 
@@ -475,7 +484,8 @@ class TestRealSubprocessFaultScenarios:
         assert "gated_plain::waiter" in wall
 
         # 挂起语义下界：waiter 的派发必须晚于 holder 终态 + 挂起窗口的
-        # 宽松下界（挂起 2s，下界取 1s——满载只会更长，不会更短）
+        # 宽松下界（挂起 2s，主循环等待单拍上限 1s，下界取 1s——满载只会
+        # 更长，不会更短）
         holder = p.backend.load_attempts("gated::holder")[0]
         waiter = p.backend.load_attempts("gated_plain::waiter")[0]
         gap = (
