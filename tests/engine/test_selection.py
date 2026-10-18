@@ -505,6 +505,43 @@ def test_skip_root_and_downstream_are_terminal_skipped(fake_process, tmp_path):
     assert dict(second.stats) == dict(EMPTY_STATS)
 
 
+def test_skip_cascade_wins_over_deadlock_cycle(fake_process, tmp_path):
+    """Skip 子树内的依赖环按级联跳过归因：Skip 永久语义优先于拓扑死锁。
+
+    判定优先级：Skip 级联阶段先于停摆仲裁执行。b 与 c 即便成环，也因 Skip
+    上游永久不可执行而整链终态跳过；环只在「允许作业」残图中才由 governor
+    归因（对照 test_exclude_downstream_cycle_is_failed_not_masked）。
+    """
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task("skip_t", ok_handler)
+    pipeline.register_task("rank", ok_handler)
+    pipeline.enqueue(
+        [
+            Job("skip_t", "s"),
+            Job("rank", "b", depends_on=["skip_t::s", "rank::c"]),
+            Job("rank", "c", depends_on=["rank::b"]),
+        ]
+    )
+    pipeline.selection(Skip(type="skip_t"))
+
+    summary = pipeline.run()
+
+    assert summary.exit_reason is ExitReason.COMPLETED
+    assert summary.stats["skipped"] == 3
+    assert summary.stats["failed"] == 0
+    assert _queued(pipeline) == []
+    assert pipeline.backend.load_failed() == {}
+    assert _attempt_errors(pipeline, "skip_t::s")[-1] == ERR_SKIPPED
+    cycle_errors = (
+        _attempt_errors(pipeline, "rank::b")[-1]
+        + _attempt_errors(pipeline, "rank::c")[-1]
+    )
+    assert cycle_errors.count(ERR_DEPENDENCY_SKIPPED) == 2
+    assert ERR_DEPENDENCY_DEADLOCK not in cycle_errors
+    # 再次 run 无残留、无重试。
+    assert dict(pipeline.run().stats) == dict(EMPTY_STATS)
+
+
 def test_skip_wins_over_exclude_for_upstream_type(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("skip_t", ok_handler)

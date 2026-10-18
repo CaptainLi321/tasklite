@@ -364,6 +364,7 @@ pipeline.selection()                            # 重置：恢复全执行
 - 命中作业从 queue 移除，不进入 wall、不进入失败档案（既不成功也不失败），`stats["skipped"]` 计数，审计落 append-only attempts（`outcome="skipped"`，错误码 `SKIPPED`）；
 - 直接或间接依赖 Skip 作业的下游永远无法完成，整链级联跳过（attempt 错误码 `DEPENDENCY_SKIPPED`，含上游 uid），一并从 queue 移除，下次运行不再重试；
 - Skip 与 Exclude 同时命中时 **Skip 优先**（终态意图强于延迟意图）；Skip 级联同样优先于 Exclude——被 Skip 上游永久堵死的 Exclude 作业也一并终态跳过；
+- **判定优先级**：Skip 级联阶段在停摆仲裁之前执行——Skip 子树内即便存在依赖环/缺口，也一律按 `DEPENDENCY_SKIPPED` 归因（Skip 上游是永久死因，环是否可解已无调度意义）；Exclude 则相反，允许作业残图中的环/缺口优先按死锁归因熔断（§8.1）；
 - 运行期派生（`ctx.spawn`）出的 Skip 命中作业在下一拍被跳过阶段收敛，不会派发。
 
 ### 8.3 集成方注意

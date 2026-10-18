@@ -71,7 +71,11 @@ v2 需要「本 run 只消费队列的一个子集」的单机能力：同一持
      错误码 `SKIPPED`）；直接或间接依赖它的下游整链终态跳过（attempt 错误码
      `DEPENDENCY_SKIPPED`，含上游 uid），下次运行不再重试；
    - **优先级**：同一 task_type 同时命中 Skip / Exclude 时 Skip 优先；Skip 级联同样
-     优先于 Exclude（被 Skip 上游永久堵死的 Exclude 作业一并终态跳过）；
+     优先于 Exclude（被 Skip 上游永久堵死的 Exclude 作业一并终态跳过）。
+     **Skip 级联先于停摆仲裁执行**——Skip 子树内的依赖环/缺口一律按
+     `DEPENDENCY_SKIPPED` 归因（Skip 上游是永久死因，环是否可解已无调度意义）；
+     与之对照，Exclude 残图内的环/缺口优先走死锁归因（`ERR_DEPENDENCY_DEADLOCK`
+     等），因为 Exclude 只是延迟、下一次 run 仍会面对同一拓扑；
    - **停摆仲裁**：仅当无 in-flight、无可派发候选且无既有归因原因（missing / unknown /
      impossible / malformed）时进行拓扑剥离。`stuck`（入度无法消减：依赖环、自环、
      缺口）交既有 governor 归因熔断（`ERR_DEPENDENCY_DEADLOCK` / `ERR_DEADLOCK_GAP` 等）；
