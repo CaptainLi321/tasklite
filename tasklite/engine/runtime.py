@@ -45,11 +45,9 @@ from .types import (
 from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
-from ..models.attempt import ATTEMPT_RUNNING, ATTEMPT_SKIPPED, AttemptRecord
 from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
 from ..selection import Selection
-from ..utils.clock import utc_now_iso
 from ..utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
@@ -542,38 +540,13 @@ class EngineRuntime:
             )
 
     def _record_skip_attempt(self, job: Job, error: str) -> None:
-        """Skip 终态审计（旁路 attempts 轨迹；写失败降级告警，不阻断主流程）。
-
-        轨迹行遵循 append-only 契约：先插 running 开行、再一次收尾为
-        skipped——与派发侧同一写侧形状，不绕过 ``append_attempt`` 门卫。
-        """
-        run_id = self._session.run_id
-        if not run_id:  # pragma: no cover - 跳过阶段只在 run 内执行
-            return
-        try:
-            now = utc_now_iso()
-            incarnation = f"{run_id}.skip.{self._session.next_dispatch_seq()}"
-            attempt_id = self.store.backend.append_attempt(
-                AttemptRecord(
-                    job_uid=job.uid,
-                    activation_no=job.activation_no,
-                    attempt_no=job.attempt_no,
-                    incarnation=incarnation,
-                    run_id=run_id,
-                    started_at=now,
-                    outcome=ATTEMPT_RUNNING,
-                )
-            )
-            self.store.backend.update_attempt(
-                attempt_id,
-                outcome=ATTEMPT_SKIPPED,
-                finished_at=now,
-                error=error,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Attempt trace append degraded for skipped {job.uid}: {e}"
-            )
+        """Skip 终态审计（旁路 attempts 轨迹；委托 StateStore 单一接缝）。"""
+        self.store.record_attempt_skip(
+            job,
+            error,
+            run_id=self._session.run_id,
+            seq=self._session.next_dispatch_seq(),
+        )
 
     def _drain_and_settle(self) -> int:
         """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""

@@ -59,7 +59,7 @@ if TYPE_CHECKING:
         def __contains__(self, task_type: object) -> bool: ...
 
 from ..exceptions import _CommitCrashSignal, _JobTerminated
-from ..models.attempt import ATTEMPT_REQUEUED, ATTEMPT_RUNNING, AttemptRecord
+from ..models.attempt import ATTEMPT_REQUEUED
 from ..models.context import JobContext
 from ..models.job import Job, JobRuntimeState
 from .channel import ArtifactCleanupMode, WorkerLaunchSpec
@@ -75,7 +75,6 @@ from .resource import RateLimitUnavailable, apply_suspend_signals
 from .scheduler import ScheduleResult, StandstillFacts
 from .types import AttemptFinish
 from .wait import IN_FLIGHT_POLL_SECONDS
-from ..utils.clock import utc_now_iso
 
 logger = logging.getLogger("tasklite")
 
@@ -400,23 +399,11 @@ class DispatchMachine:
         attempts 是旁路观测面，观测缺口不得击落可正常执行的派发。
         """
         incarnation = f"{self._session.run_id}.{self._session.next_dispatch_seq()}"
-        record = AttemptRecord(
-            job_uid=job.uid,
-            activation_no=job.activation_no,
-            attempt_no=job.attempt_no,
+        attempt_id = self._store.record_attempt_dispatch(
+            job,
             incarnation=incarnation,
             run_id=self._session.run_id,
-            started_at=utc_now_iso(),
-            outcome=ATTEMPT_RUNNING,
         )
-        try:
-            attempt_id = self._store.backend.append_attempt(record)
-        except Exception as e:
-            logger.warning(
-                f"Attempt trace append degraded for {job.uid}: {e}; "
-                f"dispatching without trace row"
-            )
-            return None, incarnation
         return attempt_id, incarnation
 
     def _spawn_entry(

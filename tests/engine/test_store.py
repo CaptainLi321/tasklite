@@ -939,3 +939,43 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     assert uid in probe.store.state.failed
     assert uid not in probe.store.state.wall
     probe.assert_mutex()
+
+
+class TestRecordAttemptSeam:
+    """StateStore 对 attempt 轨迹写入的统一持久化接缝测试。"""
+
+    def test_record_attempt_dispatch_success_and_degraded(self):
+        backend = InMemoryStateBackend()
+        store = StateStore(backend)
+        job = Job("fetch", "1")
+
+        # 正常记录 dispatch
+        attempt_id = store.record_attempt_dispatch(
+            job, incarnation="run1.1", run_id="run1"
+        )
+        assert attempt_id is not None
+        records = backend.load_attempts("fetch::1")
+        assert len(records) == 1
+        assert records[0].outcome == "running"
+        assert records[0].incarnation == "run1.1"
+
+        # run_id 为空时不写轨迹
+        assert store.record_attempt_dispatch(job, incarnation="x", run_id=None) is None
+
+    def test_record_attempt_skip_success_and_degraded(self):
+        backend = InMemoryStateBackend()
+        store = StateStore(backend)
+        job = Job("skip_type", "2")
+
+        # 正常记录 skip
+        store.record_attempt_skip(job, "SKIPPED", run_id="run1", seq=2)
+        records = backend.load_attempts("skip_type::2")
+        assert len(records) == 1
+        assert records[0].outcome == "skipped"
+        assert records[0].error == "SKIPPED"
+        assert records[0].incarnation == "run1.skip.2"
+
+        # run_id 为空时不写轨迹
+        store.record_attempt_skip(job, "SKIPPED", run_id=None, seq=3)
+        assert len(backend.load_attempts("skip_type::2")) == 1
+

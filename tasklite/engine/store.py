@@ -26,8 +26,10 @@ from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.attempt import (
     ATTEMPT_FAILED,
     ATTEMPT_REQUEUED,
+    ATTEMPT_RUNNING,
     ATTEMPT_SKIPPED,
     ATTEMPT_SUCCEEDED,
+    AttemptRecord,
 )
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, uid_from_job_dict
@@ -346,6 +348,77 @@ class StateStore:
         本次执行已终结为重入队）。收尾失败降级告警，不阻断主流程。
         """
         self._finish_attempt(attempt_id, outcome=outcome, error=error)
+
+    def record_attempt_dispatch(
+        self,
+        job: Job,
+        *,
+        incarnation: str,
+        run_id: str | None,
+    ) -> int | None:
+        """记录作业派发尝试（旁路 attempts 轨迹；写失败降级告警，不阻断主流程）。"""
+        if not run_id:
+            return None
+        record = AttemptRecord(
+            job_uid=job.uid,
+            activation_no=job.activation_no,
+            attempt_no=job.attempt_no,
+            incarnation=incarnation,
+            run_id=run_id,
+            started_at=utc_now_iso(),
+            outcome=ATTEMPT_RUNNING,
+        )
+        try:
+            return self._backend.append_attempt(record)
+        except Exception as e:
+            logger.warning(
+                f"Attempt trace append degraded for {job.uid}: {e}; "
+                f"dispatching without trace row"
+            )
+            return None
+
+    def record_attempt_finish(
+        self, attempt_id: int | None, *, outcome: str, error: str | None = None
+    ) -> None:
+        """attempts 旁路轨迹行收尾；失败降级告警，绝不阻断主事务。"""
+        self._finish_attempt(attempt_id, outcome=outcome, error=error)
+
+    def record_attempt_skip(
+        self,
+        job: Job,
+        error: str,
+        *,
+        run_id: str | None,
+        seq: int,
+    ) -> None:
+        """Skip 终态审计（旁路 attempts 轨迹：先插 running 开行，再收尾为 skipped）。"""
+        if not run_id:
+            return
+        try:
+            now = utc_now_iso()
+            incarnation = f"{run_id}.skip.{seq}"
+            attempt_id = self._backend.append_attempt(
+                AttemptRecord(
+                    job_uid=job.uid,
+                    activation_no=job.activation_no,
+                    attempt_no=job.attempt_no,
+                    incarnation=incarnation,
+                    run_id=run_id,
+                    started_at=now,
+                    outcome=ATTEMPT_RUNNING,
+                )
+            )
+            self._backend.update_attempt(
+                attempt_id,
+                outcome=ATTEMPT_SKIPPED,
+                finished_at=now,
+                error=error,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Attempt trace append degraded for skipped {job.uid}: {e}"
+            )
+
 
     # ── 内存状态受控接缝 ─────────────────────────────────────────────
 
