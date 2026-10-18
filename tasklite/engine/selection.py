@@ -1,7 +1,7 @@
-"""v2 执行选择机器（SelectionMachine）：统筹 Skip 闭包驱逐、Exclude 停摆剥离与排除投影。
+"""v2 执行选择机器（SelectionMachine）：统筹 Skip 闭包驱逐与 Exclude 停摆剥离。
 
 深模块契约：顶层 tasklite/selection.py 仅保留声明式规则与协议，运行态图算法、
-Kahn 拓扑入度消减、下游优先驱逐结算与队列投影下沉在本模块内闭环。
+Kahn 拓扑入度消减与下游优先驱逐结算在本模块内闭环。
 
 单向依赖约束：本模块仅依赖 Selection（规则集）与 StateStore（状态仓），
 避免反向耦合 JobScheduler。
@@ -54,17 +54,12 @@ class SelectionStandstill:
 
 
 class SelectionMachine:
-    """执行选择深模块：统筹 Skip 闭包驱逐、Exclude 停摆剥离与排除投影。"""
+    """执行选择深模块：统筹 Skip 闭包驱逐与 Exclude 停摆剥离。"""
 
     def __init__(self, selection: Selection, store: StateStore):
         self._selection = selection
         self._store = store
         self._skipped_uids: set[str] = set()
-        self._cached_excluded: tuple[int, int, frozenset[str]] | None = None
-
-    @property
-    def selection(self) -> Selection:
-        return self._selection
 
     @property
     def is_active(self) -> bool:
@@ -74,51 +69,9 @@ class SelectionMachine:
     def has_skip_rules(self) -> bool:
         return self._selection.has_skip_rules
 
-    def allows_type(self, task_type: str | None) -> bool:
-        if task_type is None:
-            return False
-        return self._selection.allows_type(task_type)
-
-    def is_skipped(self, task_type: str | None) -> bool:
-        if task_type is None:
-            return False
-        return self._selection.is_skipped(task_type)
-
-    def is_excluded(self, task_type: str | None) -> bool:
-        if task_type is None:
-            return False
-        return self._selection.is_excluded(task_type)
-
     def reset_run(self) -> None:
         """每 run 开始时复位运行期状态。"""
         self._skipped_uids.clear()
-        self._cached_excluded = None
-
-    def excluded_uids(self) -> frozenset[str]:
-        """当前队列中被执行选择拦截（Exclude/Skip）的合法作业 uid 集合（带缓存）。"""
-        if not self._selection.is_active:
-            return frozenset()
-        queue = self._store.state.queue
-        cache_key = (len(queue), id(queue))
-        if (
-            self._cached_excluded is not None
-            and self._cached_excluded[0] == cache_key[0]
-            and self._cached_excluded[1] == cache_key[1]
-        ):
-            return self._cached_excluded[2]
-
-        excluded: set[str] = set()
-        for job_dict in queue:
-            task_type = job_dict.get("task_type")
-            if task_type is not None and self._selection.allows_type(task_type):
-                continue
-            try:
-                excluded.add(Job.from_dict(job_dict).uid)
-            except (KeyError, TypeError, ValueError):
-                continue
-        res = frozenset(excluded)
-        self._cached_excluded = (cache_key[0], cache_key[1], res)
-        return res
 
     def apply_skips(self, *, run_id: str | None, seq_supplier: Callable[[], int]) -> int:
         """终态跳过：Skip 命中行移出 queue，下游整链级联跳过并留审计轨迹。
@@ -196,7 +149,6 @@ class SelectionMachine:
             skipped += 1
             logger.info(f"SELECTION: job {uid} skipped terminal ({error}).")
         if skipped:
-            self._cached_excluded = None
             removed = set(closure)
             store.state.replace_queue(
                 [

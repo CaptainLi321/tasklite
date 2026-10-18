@@ -163,24 +163,20 @@ class StateStore:
     def _selection_excluded_uids(self) -> frozenset[str]:
         """当前队列中被执行选择拦截（Exclude/Skip）的**合法作业** uid 集合。
 
-        优先复用 SelectionMachine 的缓存投影；畸形行无可信身份，不属于
-        合法作业——跳过并走既有 MALFORMED_JOB 归因。
+        投影随当前队列计算；畸形行无可信身份，不属于合法作业——跳过并走
+        既有 MALFORMED_JOB 归因。
         """
         selection = self._selection
-        if selection is None:
-            return frozenset()
-        if hasattr(selection, "excluded_uids"):
-            return selection.excluded_uids()
-        if not selection.is_active:
+        if selection is None or not selection.is_active:
             return frozenset()
         excluded: set[str] = set()
         for job_dict in self._state.queue:
-            if selection.allows_type(job_dict.get("task_type")):
-                continue
             try:
-                excluded.add(Job.from_dict(job_dict).uid)
+                job = Job.from_dict(job_dict)
             except (KeyError, TypeError, ValueError):
                 continue
+            if not selection.allows_type(job.task_type):
+                excluded.add(job.uid)
         return frozenset(excluded)
 
     def fire_attempt_finished(self, uid: str, *, outcome: AttemptFinish) -> None:

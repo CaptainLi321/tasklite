@@ -279,7 +279,7 @@ def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
     assert _queued(pipeline) == ["heavy::h"]
 
 
-# ── Exclude 停摆的拓扑剥离（缺陷 1、2 回归）───────────────────────────
+# ── Exclude 停摆的拓扑剥离 ─────────────────────────────────────────
 
 
 def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
@@ -747,7 +747,7 @@ def test_run_signatures_unchanged():
 
 
 def test_selection_machine_isolated_unit():
-    """SelectionMachine 深模块隔离单元测试：闭包驱逐、拓扑消减与排除投影。"""
+    """SelectionMachine 深模块隔离单元测试：闭包驱逐与拓扑消减。"""
     from tasklite.backend.memory import InMemoryStateBackend
     from tasklite.engine.selection import SelectionMachine, SelectionStandstill
     from tasklite.engine.store import StateStore
@@ -760,27 +760,16 @@ def test_selection_machine_isolated_unit():
 
     assert machine.is_active is True
     assert machine.has_skip_rules is True
-    assert machine.is_skipped("to_skip") is True
-    assert machine.is_excluded("to_exclude") is True
-    assert machine.allows_type("normal") is True
-
-    # 1. 排除投影与缓存
     store.state.replace_queue([
         Job("to_exclude", "e1").to_dict(),
         Job("normal", "n1", depends_on=["to_exclude::e1"]).to_dict(),
     ])
-    assert machine.excluded_uids() == frozenset({"to_exclude::e1"})
-    # 缓存测试：队列不变时返回相同对象
-    assert machine.excluded_uids() is machine.excluded_uids()
-
-    # 2. 停摆拓扑消减
     standstill = machine.partition_standstill()
     assert isinstance(standstill, SelectionStandstill)
     assert standstill.excluded_uids == ("to_exclude::e1",)
     assert standstill.blocked_uids == ("normal::n1",)
     assert standstill.only_blocked_by_exclusion is True
 
-    # 3. Skip 驱逐与审计
     store.state.replace_queue([
         Job("to_skip", "s1").to_dict(),
         Job("normal", "n2", depends_on=["to_skip::s1"]).to_dict(),
@@ -798,4 +787,46 @@ def test_selection_machine_isolated_unit():
     assert len(attempts) == 1 and attempts[0].outcome == "skipped"
     attempts_child = backend.load_attempts("normal::n2")
     assert len(attempts_child) == 1 and attempts_child[0].outcome == "skipped"
+
+
+@pytest.mark.parametrize("rule_type", [Exclude, Skip])
+@pytest.mark.parametrize("failure_path", ["cascade", "bulk"])
+def test_selection_failure_isolation_after_equal_length_spawn(
+    tmp_path, rule_type, failure_path
+):
+    """派发与派生保持队列长度时，终态隔离仍以当前选择投影为准。"""
+    pipeline = _pipeline(tmp_path)
+    pipeline.selection(rule_type("excluded"))
+    store = pipeline._runtime.store
+    pending = Job("allowed", "pending").to_dict()
+    downstream = Job(
+        "allowed", "downstream", depends_on=["excluded::child"]
+    ).to_dict()
+    rows = [pending, downstream]
+    store.state.replace_queue(rows)
+    pipeline.backend.save_queue(rows)
+    store.apply_failure("parent::first", {"error": "fatal"})
+
+    dispatched = store.state.pop_job(0)
+    child = Job(
+        "excluded", "child", depends_on=["parent::failing"]
+    ).to_dict()
+    store.apply_success(
+        "allowed::pending", {}, job_dict=dispatched, spawned_jobs=[child]
+    )
+    assert len(store.state.queue) == len(rows)
+
+    if failure_path == "cascade":
+        outcome = store.apply_failure("parent::failing", {"error": "fatal"})
+        assert outcome.cascaded_uids == []
+    else:
+        outcome = store.apply_bulk_failure(
+            [("excluded::child", {"error": "fatal"})]
+        )
+        assert outcome.failed_uids == []
+
+    assert _queued(pipeline) == ["excluded::child", "allowed::downstream"]
+    assert _uids(store.state.queue) == _queued(pipeline)
+    assert "excluded::child" not in pipeline.backend.load_failed()
+    assert "allowed::downstream" not in pipeline.backend.load_failed()
 

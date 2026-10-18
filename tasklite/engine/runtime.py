@@ -158,7 +158,7 @@ class EngineRuntime:
         else:
             self.selection_machine = None
         self.scheduler.selection = selection
-        self.store._set_selection(self.selection_machine or selection)
+        self.store._set_selection(selection)
 
     @property
     def session(self) -> RunSession:
@@ -214,7 +214,7 @@ class EngineRuntime:
         if self.selection_machine is not None:
             self.selection_machine.reset_run()
         self.scheduler.selection = self._selection
-        self.store._set_selection(self.selection_machine or self._selection)
+        self.store._set_selection(self._selection)
         self._skip_dirty = False
 
         old_sigterm = None
