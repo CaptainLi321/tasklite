@@ -1,6 +1,6 @@
 # TaskLite 使用指南（v2）
 
-> 本包为 [`docs/adr/0004-v2-parallel-rebuild.md`](adr/0004-v2-parallel-rebuild.md) 重建、经 [ADR-0005](adr/0005-v2-promotion.md) 上位为主包的引擎：进程隔离、SQLite WAL 状态机、六步调用契约、瞬态信号军规全部保留，模型与命名按 ADR-0004 重塑。本指南是现行**权威**使用文档；v1 时代架构文档 [`ENGINE_ARCHITECTURE.md`](ENGINE_ARCHITECTURE.md) 已归档留档。
+> 本包为 [`docs/adr/0004-v2-parallel-rebuild.md`](adr/0004-v2-parallel-rebuild.md) 重建、经 [ADR-0005](adr/0005-v2-promotion.md) 上位为主包的引擎：进程隔离、SQLite WAL 状态机、六步调用契约、瞬态信号军规全部保留，模型与命名按 ADR-0004 重塑。本指南是现行**权威**使用文档；v1 历史正文已移出工作树，以 Git 历史与 `v1-final` 标签为追溯来源。
 
 ---
 

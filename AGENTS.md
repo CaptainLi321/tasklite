@@ -75,4 +75,3 @@
 - **演进路线图**：[`docs/ROADMAP.md`](docs/ROADMAP.md)（已分析未实施方向：单任务直达 CLI、make 式级联更新、调度策略族；实施前须立项 ADR）
 - **领域概念词典**：[`CONTEXT.md`](CONTEXT.md)
 - **Discovery 需求契约**：[`tasklite/wrappers/discovery.py`](tasklite/wrappers/discovery.py)
-- **v1 历史归档**（描述已退役的 v1 公开面，以 git 历史为真相）：[`docs/API_GUIDE.md`](docs/API_GUIDE.md)、[`docs/ENGINE_ARCHITECTURE.md`](docs/ENGINE_ARCHITECTURE.md)
