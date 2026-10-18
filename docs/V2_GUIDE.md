@@ -226,9 +226,15 @@ pipeline.retry_failure("download::img_001")
 
 ---
 
-## 5. 调度扩展 seam（OrderingPolicy / RequeuePolicy）
+## 5. 调度扩展 seam（三类注册表：OrderingPolicy / RequeuePolicy / Selection）
 
-核心**不含任何调度策略计算**：候选排序与重试节奏各留一个接缝，扩展一律以 wrapper/util 形态插入，核心不动。
+核心**不含任何调度策略计算**：候选排序、重入队节奏与候选准入各留一个接缝，扩展一律以**各自 seam 形态**插入（策略 wrapper/util 或选择规则值对象），核心不动；**seam 扩展须另立 ADR**。
+
+| seam | 类型 | 唯一出口 | 决策 |
+|---|---|---|---|
+| `OrderingPolicy` | 候选排序（队列访问序） | `JobScheduler.scan_next_runnable` 按 `visit_order` 首中即停 | ADR-0004 |
+| `RequeuePolicy` | 重入队节奏 | `RequeuePolicy.plan_requeue`（`StateStore.requeue_transient` / `apply_retry` 唯一消费） | ADR-0004 |
+| `Selection` | 候选准入/选择（`task_type` 维度） | `scan_next_runnable` 候选过滤 + 终态写入出口（`cascade_fail` / `apply_bulk_failure`）隔离 + `_remaining_only_selection_blocked` 收敛前置 | [ADR-0006](adr/0006-selection-scheduling-seam.md)、本指南第 8 节 |
 
 ### OrderingPolicy：队列访问序
 
@@ -274,11 +280,16 @@ pipeline = TaskLite(name="media", state_dir="./state",
 - `transient_kind` 非 None 表示瞬态信号（`interrupted` / `lock_conflict` / `rate_limited`）——预算豁免语境下策略不得因预算耗尽拒绝重入队。瞬态信号军规（不烧重试预算 + 降级写盘 + 零污染）在「立即重入队」默认策略下自然成立；
 - 两个构造参数只做接线：不引入任何策略实现、不给 Job 增调度字段；`scan_next_runnable` 唯一选择点与 `plan_requeue` 唯一出口的结构不变。
 
+### Selection：候选准入/选择（第三类 seam）
+
+Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」，既不是候选排序也不是重入队节奏：`pipeline.selection(Exclude(type="pdf_to_md"))` 配置规则集，未选中作业原样留队（跨设备/跨 run 交接）。API 与语义契约见**第 8 节**；分类裁决、终态写入隔离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。
+
 ### 核心禁改红线
 
 - 核心（models/backend/engine/utils）**禁止出现任何排序计算与退避计算**；
 - **Job 模型不携带** `priority` / `deadline` / `period` 字段——其存放与语义由未来调度策略 ADR 裁决；
-- 软 EDF / 优先级 / aging / 错峰 / 准入控制等策略引入时**须新立 ADR**，以 wrapper/util 形态实现上述接缝，核心不动。
+- 软 EDF / 优先级 / aging / 错峰 / 超期准入（依赖 Job deadline 等调度字段）等策略引入时**须新立 ADR**，以 wrapper/util 形态实现上述接缝，核心不动；
+- `Selection` 的 `task_type` 准入轴已由 [ADR-0006](adr/0006-selection-scheduling-seam.md) 定案；新增规则轴、优先级/期限类策略或修改其语义须重开 ADR。
 
 ---
 
@@ -321,6 +332,8 @@ pipeline = TaskLite(name="media", state_dir="./state",
 ---
 
 ## 8. 执行选择（Selection）：默认全执行 + 指定 task_type 留队
+
+Selection 属**第 5 节调度扩展 seam 的第三类——候选准入/选择**（与 OrderingPolicy、RequeuePolicy 并列），分类裁决、终态写入隔离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。本节给出使用面与语义契约。
 
 `pipeline.selection(*rules)` 是 **pipeline 属性**（不是 `run()` 的参数）：每次调用**整体替换**规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变，`RunSummary` / `EMPTY_STATS` / `ExecutionOptions` 均无新增字段。
 

@@ -8,10 +8,14 @@ build/
 
 # Testing
 .pytest_cache/
+.pytest_temp/
 .hypothesis/
 .coverage
 htmlcov/
 mutants/
+
+# 运行残留（本地 ipc / 测试临时目录不跟踪；不删除现场文件）
+/ipc/
 
 # IDE
 .vscode/

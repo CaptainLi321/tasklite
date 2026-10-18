@@ -116,7 +116,7 @@ flowchart TD
 - 内置标准 Netscape `cookies.txt` 解析工具。
 
 ### 8. 🎛️ 执行选择 (Selection)：默认全执行 + 指定类型留队
-- `pipeline.selection(Exclude(type="pdf_to_md"))` 以方法调用配置 pipeline 级规则：未选中作业不派发、不消耗资源与重试预算，队列行原样留在持久化 queue，父失败级联与死锁熔断也不会将其归档；
+- **第三类调度扩展 seam（候选准入/选择，与 OrderingPolicy / RequeuePolicy 并列，决策见 [ADR-0006](docs/adr/0006-selection-scheduling-seam.md)）**：`pipeline.selection(Exclude(type="pdf_to_md"))` 以方法调用配置 pipeline 级规则——未选中作业不派发、不消耗资源与重试预算，队列行原样留在持久化 queue，父失败级联与死锁熔断也不会将其归档；
 - 仅剩「未选中 + 被其阻塞」作业时 `run()` 正常以 COMPLETED 收敛（此时队列可能非空，完成度按 queue 判定），队列保留给下一次 run 或下一台设备消费（跨设备队列交接）；
 - 默认空规则与扩展前完全等价；`Rule` 协议要求 `matches_type(task_type)`（缺少则注册期 fail-loud），当前只实现 `Exclude`。
 
@@ -342,6 +342,7 @@ pipeline.clear_history("download::")
 ```
 tasklite/
 ├── pipeline.py          # TaskLite 核心门面与配置
+├── Selection.py         # 执行选择规则值对象（候选准入 seam，ADR-0006）
 ├── hooks.py             # 用户工具函数（job_ref / progress_hook / slice_list）
 ├── engine/              # 核心执行机器群
 │   ├── runtime.py       # 核心运行期深模块、主循环事件泵 (EngineRuntime)
@@ -355,8 +356,8 @@ tasklite/
 │   ├── completion.py    # 任务完成与提交 (CompletionMachine)
 │   ├── recovery.py      # 崩溃检测与恢复 (RecoveryOrchestrator)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel / WorkerLaunchSpec)
-│   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler / OrderingPolicy seam)
-│   ├── admission.py     # rerun 准入 (RerunPolicy) 与重入队节奏 (RequeuePolicy)
+│   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler / OrderingPolicy 排序 seam / Selection 候选准入 seam)
+│   ├── admission.py     # rerun 准入 (RerunPolicy) 与重入队节奏 (RequeuePolicy seam)
 │   ├── governor.py      # 死锁归因仲裁与依赖宽限 (DeadlockGovernor)
 │   ├── in_flight.py     # 在途作业租约追踪 (InFlightTracker)
 │   ├── errorclass.py    # 错误分类与校验分类深模块 (ErrorClassifier)

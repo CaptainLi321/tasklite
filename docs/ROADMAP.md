@@ -51,12 +51,20 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 
 **风险面**：路径规范化（相对/绝对/symlink，复用 `encode_*` 单射族）；join 成本（wall meta
 扩展或 products 倒排表，schema 变更升 user_version）；自产自销/环防护（文件系统天然无环，
-仍需显式断言）。与调度域正交，不触碰 OrderingPolicy/RequeuePolicy 红线。
+仍需显式断言）。与调度域正交，不触碰 OrderingPolicy / RequeuePolicy / Selection 三类调度 seam 红线。
 
 ## 3. 调度策略族 —— `已搁置（库主 2026-10-02 裁决），解禁后逐策略小 ADR`
 
+> **状态更新（2026-10-18，ADR-0006）**：候选准入/选择（`task_type` 维度）已按库主直接
+> 指示于 2.1.0 立项实现为**第三类调度扩展 seam**（`pipeline.selection(...)` + `Exclude`，
+> 见 [ADR-0006](adr/0006-selection-scheduling-seam.md)）。本节冻结的排序/退避策略族
+> （软 EDF、退避回归、aging、jitter、超期准入等依赖 Job 调度字段的方向）**状态不变**，
+> 上述实现不构成解禁；第 5 项「超期准入控制」依赖 Job `deadline`、仍随本节冻结，与
+> Selection 的 `task_type` 准入不同轴。
+
 接线已全部就绪（`TaskLite(*, ordering=..., requeue_policy=...)` 门面构造参数 + 引擎层两个
-唯一出口），核心禁排序/退避计算红线不变。候选按收益排序：
+唯一出口——本节冻结族对应的排序/节奏两个出口；候选准入见 ADR-0006），核心禁排序/退避
+计算红线不变。候选按收益排序：
 
 1. **软 EDF**：Job 增 deadline 字段 + `DeadlineOrderingPolicy`（消除队头阻塞，10 分钟大任务
    压住毫秒级告警的场景）；与 `first_enqueued_at` 协同可延伸 aging；

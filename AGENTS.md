@@ -62,7 +62,7 @@
 ## 三、v2 模型与术语红线（转正，详见 [`docs/adr/0004-v2-parallel-rebuild.md`](docs/adr/0004-v2-parallel-rebuild.md) 与 [`docs/adr/0005-v2-promotion.md`](docs/adr/0005-v2-promotion.md)）
 
 1. **术语红线**：禁用 `sanitize` / `taxonomy` / `DLQ` 旧词——编码族统一 `encode_*`，错误分类统一 `ErrorClassifier`（`engine/errorclass.py`，`ErrorCategory` 唯一表示），失败集合统一「失败档案 failed」（`FailureEntry` / `list_failures` / `clear_failures` / `retry_failure`）。
-2. **核心禁调度计算**：核心层（engine/backend/models/utils）内禁止任何排序计算与退避计算（backoff 全族已砍除）；重试节奏与候选排序一律经 OrderingPolicy / RequeuePolicy seam 以 wrapper/util 形态扩展，**seam 扩展须另立 ADR**；Job 模型不携带 priority / deadline / period 字段。
+2. **核心禁调度计算**：核心层（engine/backend/models/utils）内禁止任何排序计算与退避计算（backoff 全族已砍除）；重试节奏、候选排序与候选准入一律经 OrderingPolicy / RequeuePolicy / Selection seam 以**各自 seam 形态**扩展（策略 wrapper/util 或选择规则值对象），**seam 扩展须另立 ADR**；Job 模型不携带 priority / deadline / period 字段。
 3. **三层模型语义**：Task（规格，注册于 `TaskRegistry`）/ Job（逻辑实例，`uid = task_type::job_id` 身份不变）/ Attempt（append-only 执行轨迹，旁路观测面，不参与六集合互斥）；`retries` 构造参数已废除，预算位收敛 `max_retries`。
 
 ---
