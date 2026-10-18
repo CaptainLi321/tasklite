@@ -67,16 +67,26 @@ class ArbitrationStore(Protocol):
     ) -> BulkFailureOutcome: ...
 
 
+class SelectionStandstillSource(Protocol):
+    """死锁仲裁消费的执行选择停摆事实源契约（SelectionMachine 自动满足）。"""
+
+    @property
+    def is_active(self) -> bool: ...
+
+    def partition_standstill(self) -> SelectionStandstill | None: ...
+
+
 @dataclass(frozen=True)
 class DeadlockDecision:
     """死锁治理裁决结果（纯值对象，无阻塞副作用）。
 
-    - action: "resolved" (已归因并移入失败档案) | "grace_waiting" (正在依赖宽限期中)
-      | "gap_retrying" (分类缺口重试中) | "none" (未检测到死锁)
-    - should_terminate: 是否应终止主循环（如全队列熔断完毕且队列清空）
+    - action: "resolved" (已归因并移入失败档案) | "selection_blocked" (队列仅因执行选择排除而延迟)
+      | "grace_waiting" (正在依赖宽限期中) | "gap_retrying" (分类缺口重试中) | "none" (未检测到死锁)
+    - should_terminate: 是否应终止主循环（如全队列熔断完毕且队列清空，或选择排除干净收敛）
     - wait_time: 建议外层事件泵等待的时延秒数（宽限或重试时为 0.5s，否则 0.0s）
     - failed_uids: 本轮判定失败的 UID 列表
     - cascaded_uids: 本轮级联失败的 UID 列表
+    - standstill: 选择停摆事实快照（仅在 action="selection_blocked" 时附带）
     """
 
     action: str
@@ -84,6 +94,8 @@ class DeadlockDecision:
     wait_time: float = 0.0
     failed_uids: list[str] = field(default_factory=list)
     cascaded_uids: list[str] = field(default_factory=list)
+    standstill: SelectionStandstill | None = None
+
 
 
 from .selection import SelectionStandstill
@@ -302,10 +314,14 @@ class DeadlockGovernor:
         self,
         facts: StandstillFacts | None,
         store: ArbitrationStore,
+        *,
+        selection_machine: SelectionStandstillSource | None = None,
     ) -> DeadlockDecision:
         """自闭环死锁仲裁单一入口。
 
         评估停摆事实：
+        0. 若传入 selection_machine 且激活，且无已知死锁成因，先做 Kahn 拓扑消减；
+           若判定为「仅因 Exclude 阻塞」，闭环返回 action="selection_blocked"；
         1. 若 min_wait == inf，直接触发 resolve_deadlock 进行细粒度归因与批量熔断；
         2. 若 min_wait 为有限值，但处于 waiting_for_dependency 且存在拓扑成环
            （find_dependency_cycles），自动识别隐式死锁并触发 resolve_deadlock；
@@ -315,8 +331,26 @@ class DeadlockGovernor:
             self.deadlock_gap_rounds = 0
             return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
 
+        # 0. 执行选择先验判定：无明确死锁成因时先检查是否仅因 Exclude 阻塞
+        if (
+            selection_machine is not None
+            and selection_machine.is_active
+            and not facts.attribution.has_deadlock_causes
+        ):
+            standstill = selection_machine.partition_standstill()
+            if standstill is not None and standstill.only_blocked_by_exclusion:
+                self.deadlock_gap_rounds = 0
+                return DeadlockDecision(
+                    action="selection_blocked",
+                    should_terminate=True,
+                    wait_time=0.0,
+                    standstill=standstill,
+                )
+
         if facts.min_wait == float("inf"):
-            return self.resolve_deadlock(facts, store=store)
+            return self.resolve_deadlock(
+                facts, store=store, selection_machine=selection_machine
+            )
 
         if facts.waiting_for_dependency and store.state is not None:
             cycle_uids = store.state.find_dependency_cycles()
@@ -325,7 +359,9 @@ class DeadlockGovernor:
                     f"Deadlock detected during wait: dependency cycle "
                     f"{sorted(set(cycle_uids))} masked by finite min_wait."
                 )
-                return self.resolve_deadlock(facts, store=store)
+                return self.resolve_deadlock(
+                    facts, store=store, selection_machine=selection_machine
+                )
 
         # 正常等待/背压结论（有限等待且无环）证明上一缺口 episode 已消解——
         # 缺口升级只统计连续轮次，非连续缺口从零计数
@@ -338,6 +374,7 @@ class DeadlockGovernor:
         store: ArbitrationStore,
         *,
         scheduler: ScanCache | None = None,
+        selection_machine: SelectionStandstillSource | None = None,
     ) -> DeadlockDecision:
         """处理死锁：细粒度归因 + 批量失败档案提交 + 级联（纯计算求值，无阻塞副作用）。"""
         effective_state = store.state
@@ -427,6 +464,51 @@ class DeadlockGovernor:
         # 提交批量死锁失败（失败档案单一出口）
         outcome = store.apply_bulk_failure(uids_metas)
         self.deadlock_gap_rounds = 0
+
+        # resolved 但零归档时的选择收敛闭环（如归档全部被选择过滤）
+        if (
+            not outcome.failed_uids
+            and selection_machine is not None
+            and selection_machine.is_active
+        ):
+            standstill = selection_machine.partition_standstill()
+            if standstill is not None and standstill.only_blocked_by_exclusion:
+                return DeadlockDecision(
+                    action="selection_blocked",
+                    should_terminate=True,
+                    wait_time=0.0,
+                    standstill=standstill,
+                )
+            if standstill is not None and standstill.stuck_uids:
+                logger.error(
+                    "Deadlock arbitration resolved without archiving while allowed "
+                    f"jobs remain stuck ({list(standstill.stuck_uids)}); attributing "
+                    f"them to {ERR_DEADLOCK_GAP} to guarantee queue reduction."
+                )
+                fallback_outcome = store.apply_bulk_failure(
+                    [
+                        (uid, {"error": ERR_DEADLOCK_GAP, "root_cause": True})
+                        for uid in standstill.stuck_uids
+                    ]
+                )
+                if fallback_outcome.failed_uids:
+                    return DeadlockDecision(
+                        action="resolved",
+                        should_terminate=len(effective_state.queue) == 0,
+                        wait_time=0.0,
+                        failed_uids=fallback_outcome.failed_uids,
+                        cascaded_uids=fallback_outcome.cascaded_uids,
+                    )
+            logger.critical(
+                "Deadlock arbitration reported 'resolved' without failing any job; "
+                "terminating the run instead of spinning (queue preserved on disk)."
+            )
+            return DeadlockDecision(
+                action="resolved",
+                should_terminate=True,
+                wait_time=0.0,
+            )
+
         should_terminate = len(outcome.failed_uids) > 0 and len(effective_state.queue) == 0
         return DeadlockDecision(
             action="resolved",

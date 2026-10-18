@@ -578,3 +578,30 @@ class TestGraceRelapseAfterProgress:
         assert decision.action == "grace_waiting"
         assert decision.wait_time > 0
         assert store.bulk_calls == []
+
+
+class TestSelectionClosedLoopArbitration:
+    """DeadlockGovernor.arbitrate 闭环处理执行选择停摆与零归档测试。"""
+
+    def test_arbitrate_returns_selection_blocked_when_only_exclusion_deferred(self):
+        from tasklite.backend.memory import InMemoryStateBackend
+        from tasklite.engine.selection import SelectionMachine
+        from tasklite.engine.store import StateStore
+        from tasklite.selection import Exclude, Selection
+
+        gov = DeadlockGovernor()
+        backend = InMemoryStateBackend()
+        store = StateStore(backend)
+        store.state.replace_queue([
+            Job("ex_type", "1").to_dict(),
+            Job("normal", "2", depends_on=["ex_type::1"]).to_dict(),
+        ])
+        sm = SelectionMachine(Selection([Exclude("ex_type")]), store)
+        sched = StandstillFacts(min_wait=INF, attribution=DeadlockAttribution())
+
+        decision = gov.arbitrate(sched, store=store, selection_machine=sm)
+        assert decision.action == "selection_blocked"
+        assert decision.should_terminate is True
+        assert decision.standstill is not None
+        assert decision.standstill.blocked_uids == ("normal::2",)
+

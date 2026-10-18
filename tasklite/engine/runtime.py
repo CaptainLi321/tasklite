@@ -23,7 +23,6 @@ from .channel import ExecutionChannel
 from .completion import CompletionMachine
 from .errorclass import (
     ERR_DEPENDENCY_EXCLUDED,
-    ERR_DEADLOCK_GAP,
     ErrorClassifier,
 )
 from .selection import SelectionMachine, SelectionStandstill
@@ -359,13 +358,7 @@ class EngineRuntime:
     def _arbitrate_deadlock(
         self, last_outcome: DispatchOutcome | None, store: StateStore
     ) -> DeadlockArbitration:
-        """相二·无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。
-
-        执行选择激活时先做 Kahn 拓扑剥离：只有「排除/跳过 + 仅被其阻塞」
-        才干净收尾；允许作业存在依赖环/缺口时一律交既有 governor 归因熔断，
-        绝不因 Exclude 命中而掩盖真死锁。resolved 却零归档时按选择事实重新
-        收敛（强制削减或终止），严禁固定等待掩盖零归档。
-        """
+        """相二·无可运行候选时的死锁归因（委托 DeadlockGovernor 自闭环仲裁）。"""
         deadlock_detected = False
         should_terminate = False
         wait_seconds = 0.0
@@ -373,40 +366,33 @@ class EngineRuntime:
             if store.state.is_empty and not self._in_flight:
                 should_terminate = True
             elif not self._in_flight:
-                standstill = self._selection_standstill(
-                    last_outcome.standstill.attribution
-                )
-                if standstill is not None and standstill.only_blocked_by_exclusion:
-                    self._report_selection_blocked(standstill)
-                    should_terminate = True
+                if self.selection_machine is not None:
+                    decision = self.governor.arbitrate(
+                        last_outcome.standstill,
+                        store=self.store,
+                        selection_machine=self.selection_machine,
+                    )
                 else:
                     decision = self.governor.arbitrate(
-                        last_outcome.standstill, store=self.store
+                        last_outcome.standstill,
+                        store=self.store,
                     )
-                    if decision.action == "resolved":
+                if decision.action in ("resolved", "selection_blocked"):
+                    if decision.action == "selection_blocked":
+                        if decision.standstill is not None:
+                            self._report_selection_blocked(decision.standstill)
+                    else:
                         deadlock_detected = True
-                        if decision.should_terminate:
-                            should_terminate = True
-                        elif not decision.failed_uids:
-                            should_terminate = self._settle_zero_failure_resolution()
-                    elif decision.action in ("grace_waiting", "gap_retrying"):
-                        if decision.wait_time > 0:
-                            wait_seconds = decision.wait_time
+                    if decision.should_terminate:
+                        should_terminate = True
+                elif decision.action in ("grace_waiting", "gap_retrying"):
+                    if decision.wait_time > 0:
+                        wait_seconds = decision.wait_time
         return DeadlockArbitration(
             deadlock_detected=deadlock_detected,
             should_terminate=should_terminate,
             wait_seconds=wait_seconds,
         )
-
-    def _selection_standstill(
-        self, attribution: DeadlockAttribution
-    ) -> SelectionStandstill | None:
-        """执行选择停摆拓扑判定；未激活或存在其他归因原因时不介入。"""
-        if self.selection_machine is None or not self.selection_machine.is_active:
-            return None
-        if attribution.has_deadlock_causes:
-            return None
-        return self.selection_machine.partition_standstill()
 
     def _report_selection_blocked(self, standstill: SelectionStandstill) -> None:
         """记录「允许执行但仅因 Exclude 而本次无法完成」的下游（留队待下次）。"""
@@ -423,37 +409,6 @@ class EngineRuntime:
             "Remaining queued jobs are deferred by selection; finishing run as "
             "completed with the queue preserved."
         )
-
-    def _settle_zero_failure_resolution(self) -> bool:
-        """resolved 但零归档的收敛：终止或强制削减队列，保证每拍有进展。
-
-        返回 should_terminate。旧实现以 0.5s 固定等待兜底，无法保证队列
-        削减，会在「归档全被选择过滤」时无限忙旋；此处在选择语义下重新求值，
-        残余 stuck 允许作业按既有缺口错误码强制熔断。
-        """
-        standstill = self._selection_standstill(DeadlockAttribution())
-        if standstill is not None and standstill.only_blocked_by_exclusion:
-            self._report_selection_blocked(standstill)
-            return True
-        if standstill is not None and standstill.stuck_uids:
-            logger.error(
-                "Deadlock arbitration resolved without archiving while allowed "
-                f"jobs remain stuck ({list(standstill.stuck_uids)}); attributing "
-                f"them to {ERR_DEADLOCK_GAP} to guarantee queue reduction."
-            )
-            outcome = self.store.apply_bulk_failure(
-                [
-                    (uid, {"error": ERR_DEADLOCK_GAP, "root_cause": True})
-                    for uid in standstill.stuck_uids
-                ]
-            )
-            if outcome.failed_uids:
-                return False
-        logger.critical(
-            "Deadlock arbitration reported 'resolved' without failing any job; "
-            "terminating the run instead of spinning (queue preserved on disk)."
-        )
-        return True
 
     def _apply_selection_skips(self) -> None:
         """终态跳过：委托 SelectionMachine 收敛 Skip 闭包与审计轨迹。"""
