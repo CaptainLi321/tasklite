@@ -317,3 +317,32 @@ pipeline = TaskLite(name="media", state_dir="./state",
 - 瞬态信号（孤儿锁冲突 / 外部中断 / 限速）天然受益：零等待重入队 + 不烧重试预算 + 零污染，实际等待由资源挂起 TTL（`ctx.suspend_resource` 的跨重启持久化挂起）承担，而非框架级退避计时器。
 
 这一取舍的裁决依据与重开条件（退避类策略经 seam 回归须新立 ADR）见 ADR-0004「调度 seam」与「后果与重开条件」章节。
+
+---
+
+## 8. 执行选择（Selection）：默认全执行 + 指定 task_type 留队
+
+`pipeline.selection(*rules)` 是 **pipeline 属性**（不是 `run()` 的参数）：每次调用**整体替换**规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变，`RunSummary` / `EMPTY_STATS` / `ExecutionOptions` 均无新增字段。
+
+```python
+from tasklite import Exclude, Job, TaskLite
+
+pipeline = TaskLite(name="research", state_dir="./state")
+pipeline.selection(Exclude(type="pdf_to_md"))   # 本次配置：pdf_to_md 不执行、留队
+pipeline.enqueue([Job("fetch", "a"), Job("pdf_to_md", "p")])
+pipeline.run()                                  # 只执行 fetch，pdf_to_md 留在持久化队列
+
+pipeline.selection()                            # 重置：恢复全执行
+pipeline.run()                                  # 下次 run 消费留队作业
+```
+
+规则是职责单一的值对象：当前唯一规则 `Exclude(type=...)` 按 `job.task_type` 精确排除；`Rule` 协议只要求 `matches_type(task_type)`（引擎的调度热路径与终态写入出口都按 task_type 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层只导出 `Exclude`，`from tasklite.Selection import Selection` 仍可用于高级集成。规则只做 task_type 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨设备复用。
+
+语义（跨设备队列交接的前提）：
+
+- 未选中作业**不派发、不写 attempt 轨迹、不进入 wall/失败档案、不消耗 worker/资源与重试预算**，队列行原样留在持久化 queue（终态写入出口同样隔离：父失败级联与死锁批量熔断都不会归档被排除 uid）；
+- 其下游作业依赖仍挂在 queue 中 → 保持 PENDING_DEPENDENCY 安静留队；
+- 只剩「未选中 + 被其传递阻塞」的作业且无在途任务时，`run()` 正常以 `ExitReason.COMPLETED` 收敛（不判死锁、不空转、不写失败档案）；
+- 混合场景（队列同时存在真实死锁成因的允许作业）仍按既有死锁归因/失败档案语义处理——选择规则不等于死锁豁免；
+- **集成方注意**：selection 激活时 `run()` 可能以 `COMPLETED` 退出而持久化队列非空（未选中作业留队），完成度请按 queue 判定，不能只看退出原因；
+- `selection(...)` 仅允许 `run()` 外调用；run 期调用抛 `RuntimeError`。

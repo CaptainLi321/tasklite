@@ -31,6 +31,7 @@ from ..models.attempt import (
 )
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, uid_from_job_dict
+from ..Selection import Selection
 from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import dumps
 from .admission import ImmediateRequeuePolicy, RequeuePolicy, RerunPolicy
@@ -125,6 +126,9 @@ class StateStore:
         self._requeue_policy = (
             requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
         )
+        # 执行选择（终态写入出口的排除闸门）：None = 不过滤；
+        # 由 EngineRuntime 在 run 启动期单点注入，与调度器同一事实源。
+        self._selection: Selection | None = None
 
     # ── 统计与事件钩子 ────────────────────────────────────────────────
 
@@ -145,6 +149,34 @@ class StateStore:
     def set_on_attempt_finished(self, cb: Callable[..., None] | None) -> None:
         """设置 attempt 收尾事件回调。"""
         self._on_attempt_finished = cb
+
+    def _set_selection(self, selection: Selection | None) -> None:
+        """内部注入面：执行选择（终态写入出口的排除闸门；None = 不过滤）。
+
+        仅 EngineRuntime 在 run 启动期调用，外部不得直接使用（避免与调度器
+        的选择事实源不一致）。
+        """
+        self._selection = selection
+
+    def _selection_excluded_uids(self) -> frozenset[str]:
+        """当前队列中被执行选择排除的**合法作业** uid 集合（空规则时为空集）。
+
+        畸形行无可信身份（缺 task_type/job_id 等），不属于「指定 task_type 的
+        合法作业」——跳过并继续走既有 MALFORMED_JOB 归因，不能因带个 task_type
+        字段就被选择豁免。
+        """
+        selection = self._selection
+        if selection is None or not selection.is_active:
+            return frozenset()
+        excluded: set[str] = set()
+        for job_dict in self._state.queue:
+            if selection.allows_type(job_dict.get("task_type")):
+                continue
+            try:
+                excluded.add(Job.from_dict(job_dict).uid)
+            except (KeyError, TypeError, ValueError):
+                continue
+        return frozenset(excluded)
 
     def fire_attempt_finished(self, uid: str, *, outcome: AttemptFinish) -> None:
         """attempt 收尾事件钩子的单一出口（异常隔离 + hook_errors 计数）。
@@ -527,7 +559,20 @@ class StateStore:
         self,
         uids_metas: Sequence[tuple[str, dict[str, Any]]],
     ) -> BulkFailureOutcome:
-        """原子批量失败（死锁归因或批量熔断）；剩余队列由失败集单点派生。"""
+        """原子批量失败（死锁归因或批量熔断）；剩余队列由失败集单点派生。
+
+        执行选择激活时按队列行 task_type 过滤被排除 uid：它们绝不进入失败
+        档案（过滤后为空则直接返回空结果，由运行期收敛谓词正常收尾）。
+        """
+        excluded_uids = self._selection_excluded_uids()
+        if excluded_uids:
+            uids_metas = [
+                (uid, meta) for uid, meta in uids_metas if uid not in excluded_uids
+            ]
+            if not uids_metas:
+                return BulkFailureOutcome(
+                    failed_uids=[], remaining_queue_count=len(self._state.queue)
+                )
         normalized_metas = [
             (uid, self._classifier.normalize_failed_meta(meta))
             for uid, meta in uids_metas
@@ -571,8 +616,18 @@ class StateStore:
         )
 
     def cascade_fail(self, failed_uid: str) -> list[str]:
-        """父作业失败后 O(1) 级联标记全部下游为依赖失败。"""
-        cascade_uids = self._state.cascade_fail(failed_uid)
+        """父作业失败后 O(1) 级联标记全部下游为依赖失败。
+
+        执行选择激活时，被排除作业是传播终止点：不进入级联失败集合，也不
+        向其下游继续传播（下游保持待依赖留队，由后续 run 消费）。
+        """
+        excluded_uids = self._selection_excluded_uids()
+        cascade_uids = self._state.cascade_fail(
+            failed_uid, excluded_uids=excluded_uids
+        )
+        if excluded_uids:
+            # 兜底过滤：终态写入出口绝不接受被排除 uid（与 DFS 终止点双保险）。
+            cascade_uids = [uid for uid in cascade_uids if uid not in excluded_uids]
         if not cascade_uids:
             return []
         cascade_metas = [

@@ -115,6 +115,11 @@ flowchart TD
 - `SQLiteSnapshotStore` 提供单射键原始响应快照持久化，支持全离线幂等重放；
 - 内置标准 Netscape `cookies.txt` 解析工具。
 
+### 8. 🎛️ 执行选择 (Selection)：默认全执行 + 指定类型留队
+- `pipeline.selection(Exclude(type="pdf_to_md"))` 以方法调用配置 pipeline 级规则：未选中作业不派发、不消耗资源与重试预算，队列行原样留在持久化 queue，父失败级联与死锁熔断也不会将其归档；
+- 仅剩「未选中 + 被其阻塞」作业时 `run()` 正常以 COMPLETED 收敛（此时队列可能非空，完成度按 queue 判定），队列保留给下一次 run 或下一台设备消费（跨设备队列交接）；
+- 默认空规则与扩展前完全等价；`Rule` 协议要求 `matches_type(task_type)`（缺少则注册期 fail-loud），当前只实现 `Exclude`。
+
 ---
 
 

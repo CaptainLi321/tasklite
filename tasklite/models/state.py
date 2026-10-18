@@ -176,8 +176,17 @@ class PipelineState:
                 dependents.setdefault(dep_uid, set()).add(job_uid)
         return dependents
 
-    def cascade_fail(self, failed_uid: str) -> list[str]:
-        """沿反向依赖递归标记下游为级联失败。"""
+    def cascade_fail(
+        self,
+        failed_uid: str,
+        *,
+        excluded_uids: frozenset[str] = frozenset(),
+    ) -> list[str]:
+        """沿反向依赖递归标记下游为级联失败。
+
+        ``excluded_uids`` 是传播终止点（执行选择排除的作业）：既不加入级联
+        集合，也不向其下游继续传播——这些作业原样留队，由后续 run 消费。
+        """
         dependents = self._build_dependents()
         cascade: list[str] = []
         stack = [failed_uid]
@@ -185,6 +194,8 @@ class PipelineState:
         while stack:
             cur = stack.pop()
             for downstream in dependents.get(cur, ()):
+                if downstream in excluded_uids:
+                    continue
                 if downstream not in seen and downstream not in self._wall \
                         and downstream not in self._failed:
                     seen.add(downstream)

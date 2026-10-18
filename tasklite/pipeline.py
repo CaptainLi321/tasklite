@@ -33,6 +33,7 @@ from .engine.store import FailureEntry
 from .engine.types import ExecutionOptions, RunSummary, TaskStats
 from .models.job import Job, RERUN_VALUES, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry, validate_task_type
+from .Selection import Rule, Selection
 
 logger = logging.getLogger("tasklite")
 
@@ -493,6 +494,19 @@ class TaskLite:
                 "arguments alongside a Task instance are rejected (they "
                 "would be silently ignored). Pass overrides inside the Task."
             )
+
+    def selection(self, *rules: Rule) -> "TaskLite":
+        """设置执行选择规则集（pipeline 属性，不是 run() 参数）。
+
+        每次调用**整体替换**规则集，0 参数 = 重置为默认全执行；返回 self
+        支持链式。未选中作业不派发、不写 attempt 轨迹、不进入 wall/失败
+        档案、不消耗资源与重试预算，原样留在持久化 queue；其下游保持
+        PENDING_DEPENDENCY 留队。仅剩「未选中 + 被其阻塞」作业且无在途
+        任务时，`run()` 正常以 COMPLETED 收敛，队列保留给下一次 run。
+        """
+        self._ensure_not_running("selection")
+        self._runtime.set_selection(Selection(rules))
+        return self
 
     def set_discovery_rerun(self, task_type: str, rerun: str) -> None:
         """登记 discovery task_type 的默认 rerun 策略（宿主接缝）。

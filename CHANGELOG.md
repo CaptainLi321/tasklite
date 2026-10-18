@@ -8,6 +8,21 @@
 
 暂无未发布变更。
 
+## [2.1.0] - 2026-10-18
+
+执行选择版本：`pipeline.selection(...)` 以方法调用配置「默认全执行 + 指定 task_type 不执行」，未选中作业原样留队，服务跨设备/跨 run 的队列交接。
+
+### 新增
+
+- **执行选择（Selection）**：`TaskLite.selection(*rules)` 是 pipeline 属性、不是 `run()` 参数——每次调用整体替换规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变。
+  - 新模块 `tasklite/Selection.py`：`Rule` 协议（`matches_type(task_type)`，缺少该入口的规则注册期 fail-loud）、`Exclude(type=...)` 值对象（按 `job.task_type` 精确排除，冻结 dataclass）、`Selection` 规则集（`allows_type` / `is_active`）；顶层 `tasklite` 只导出 `Exclude`，高级集成可经 `tasklite.Selection` 子模块导入。
+  - 语义：未选中作业不派发、不写 attempt 轨迹、不进入 wall/失败档案、不消耗资源与重试预算，队列行原样保留；其下游依赖保持 PENDING_DEPENDENCY 留队；当剩余队列只剩「未选中 + 被其传递阻塞」的作业且无在途任务时，`run()` 正常以 `ExitReason.COMPLETED` 收敛（不判死锁、不空转、不写失败档案）。
+  - 终态写入隔离：级联失败（父任务失败）与死锁批量熔断的写入出口同样过滤被排除 uid——被排除作业绝不进入失败档案，也不会被级联删出队列。畸形队列行（缺 `job_id` 等）无可信身份，不参与选择豁免，仍按既有 `MALFORMED_JOB` 语义进失败档案。
+  - 规则只做 task_type 格式校验，不校验注册表存在性（规则可先于 `register_task` 配置，也可跨设备复用）。
+  - 引擎接线：`scan_next_runnable` 在依赖/资源评估前按 task_type 跳过未选中作业；`_arbitrate_deadlock` 在 governor 之前以无状态谓词判定「仅剩选择留队」为正常完成。不改 `RunSummary` / `EMPTY_STATS` / `ExecutionOptions` / `RunConfig`，混合真实死锁场景仍走既有归因语义。
+  - **集成方注意**：selection 激活时 `run()` 可能以 `COMPLETED` 退出而持久化队列非空（未选中作业留队），完成度请按 queue 判定，不能只看退出原因。
+- **版本**：`tasklite/__init__.py` `__version__` 2.0.0 → 2.1.0（ZeroCite v2 依赖 `tasklite-engine>=2.1.0`）。
+
 ## [2.0.0] - 2026-10-02
 
 v2 上位为主包的破坏性大版本（上位总纲 [ADR-0005](docs/adr/0005-v2-promotion.md)，重建设计 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，使用指南 [docs/V2_GUIDE.md](docs/V2_GUIDE.md)）：v2 子包物理提升为 `tasklite` 主包（单原子提交世界切换，生产代码零逻辑改写），v1 树整体退役（git 历史与 `v1-final` 标签留档），v2 子包导入路径消亡且**不留路径别名**。本版同时收录 v2 并行重建期的全部特性（Task/Job/Attempt 三层模型，全量 2204 测试）。
@@ -344,7 +359,8 @@ v2 上位为主包的破坏性大版本（上位总纲 [ADR-0005](docs/adr/0005-
 - 运维 API：`list_dlq` / `clear_dlq` / `clear_history` / `seed_wall` / `seed_cursor`。
 - 优雅停机状态机：首次信号 DRAINING 停止派发并排空在途任务，二次信号 ABORTING 分类回收在途任务。
 
-[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/CaptainLi321/tasklite/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/CaptainLi321/tasklite/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/CaptainLi321/tasklite/compare/v1.4.2...v2.0.0
 [1.4.2]: https://github.com/CaptainLi321/tasklite/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/CaptainLi321/tasklite/compare/v1.4.0...v1.4.1

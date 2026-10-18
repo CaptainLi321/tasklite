@@ -24,7 +24,7 @@ from .completion import CompletionMachine
 from .errorclass import ErrorClassifier
 from .in_flight import InFlightTracker
 from .recovery import RecoveryOrchestrator
-from .scheduler import JobScheduler
+from .scheduler import DeadlockAttribution, JobScheduler
 from .session import RunSession
 from .store import StateStore
 from .types import (
@@ -39,6 +39,7 @@ from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.state import PipelineState
+from ..Selection import Selection
 from ..utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
@@ -132,6 +133,20 @@ class EngineRuntime:
 
         self._run_lock_fd: int | None = None
         self._is_running: bool = False
+        # 执行选择（pipeline 属性）：None = 默认全执行；门面经 set_selection
+        # 注入后同步到调度器与 StateStore（终态写入出口），execute() 启动期
+        # 再固化一次即 per-run 快照。
+        self._selection: Selection | None = None
+
+    def set_selection(self, selection: Selection | None) -> None:
+        """注入执行选择（仅 run() 外；门面已守卫，此处提供运行期双保险）。"""
+        if self._is_running:
+            raise RuntimeError(
+                "selection() is only allowed outside run(); current run is in progress."
+            )
+        self._selection = selection
+        self.scheduler.selection = selection
+        self.store._set_selection(selection)
 
     @property
     def session(self) -> RunSession:
@@ -184,6 +199,10 @@ class EngineRuntime:
         if self._is_running:
             raise RuntimeError("Pipeline run() already in progress on this instance.")
         self._is_running = True
+        # per-run 快照：run 期门面守卫禁止替换规则，此处仍显式固化进调度器
+        # 与 StateStore（终态写入出口），保证规则与本次 run 一一对应。
+        self.scheduler.selection = self._selection
+        self.store._set_selection(self._selection)
 
         old_sigterm = None
         old_sigint = None
@@ -326,7 +345,12 @@ class EngineRuntime:
     def _arbitrate_deadlock(
         self, last_outcome: DispatchOutcome | None, store: StateStore
     ) -> DeadlockArbitration:
-        """相二·无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。"""
+        """相二·无可运行候选时的死锁归因（仅无 in-flight 时仲裁生效）。
+
+        执行选择激活时，若剩余队列全部是「未选中作业 + 被其传递阻塞的下游」，
+        本 run 已无可派发目标——在 governor 之前判为正常完成：不进入死锁
+        归因、不写失败档案，退出原因为 COMPLETED。
+        """
         deadlock_detected = False
         should_terminate = False
         wait_seconds = 0.0
@@ -334,21 +358,89 @@ class EngineRuntime:
             if store.state.is_empty and not self._in_flight:
                 should_terminate = True
             elif not self._in_flight:
-                decision = self.governor.arbitrate(
-                    last_outcome.standstill, store=self.store
-                )
-                if decision.action == "resolved":
-                    deadlock_detected = True
-                    if decision.should_terminate:
-                        should_terminate = True
-                elif decision.action in ("grace_waiting", "gap_retrying"):
-                    if decision.wait_time > 0:
-                        wait_seconds = decision.wait_time
+                if self._remaining_only_selection_blocked(
+                    last_outcome.standstill.attribution
+                ):
+                    logger.info(
+                        "Remaining queued jobs are excluded by selection; "
+                        "finishing run as completed."
+                    )
+                    should_terminate = True
+                else:
+                    decision = self.governor.arbitrate(
+                        last_outcome.standstill, store=self.store
+                    )
+                    if decision.action == "resolved":
+                        deadlock_detected = True
+                        if decision.should_terminate:
+                            should_terminate = True
+                        elif not decision.failed_uids:
+                            # 不变式：resolved 却零归档 = 归因/过滤口径不一致。
+                            # 给非零等待避免零等待忙旋（不改变既有仲裁语义）。
+                            logger.warning(
+                                "Deadlock arbitration reported 'resolved' without "
+                                "failing any job; backing off to avoid a busy spin."
+                            )
+                            wait_seconds = 0.5
+                    elif decision.action in ("grace_waiting", "gap_retrying"):
+                        if decision.wait_time > 0:
+                            wait_seconds = decision.wait_time
         return DeadlockArbitration(
             deadlock_detected=deadlock_detected,
             should_terminate=should_terminate,
             wait_seconds=wait_seconds,
         )
+
+    def _remaining_only_selection_blocked(self, attribution: DeadlockAttribution) -> bool:
+        """剩余队列是否只有「未选中作业 + 被其传递阻塞的下游」。
+
+        判决本身无状态变更（读取队列事实时复用调度缓存，``cached_job`` 写
+        缓存属良性副作用）；无规则、任务畸形或存在任何可归因停摆（未知/
+        超容资源、缺失依赖、畸形条目）一律返回 False，交既有死锁归因。
+        闭包 O(n+e)：以被排除的队列行为根沿 depends_on 反向扩展被阻塞下游，
+        再校验每个下游的全部未满足依赖都落在闭包内（纯被选择阻塞才收尾）。
+        """
+        selection = self._selection
+        if selection is None or not selection.is_active:
+            return False
+        if attribution.has_deadlock_causes:
+            return False
+        queue = self.store.state.queue
+        if not queue:
+            return False
+        job_map: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for job_dict in queue:
+            try:
+                facts = self.scheduler.cached_job(job_dict)
+            except (KeyError, TypeError, ValueError):
+                return False
+            job_map[facts.uid] = (facts.task_type, facts.depends_on)
+        dependents: dict[str, list[str]] = {}
+        omitted: set[str] = set()
+        for uid, (task_type, depends_on) in job_map.items():
+            if not selection.allows_type(task_type):
+                omitted.add(uid)
+                continue
+            for dependency in depends_on:
+                dependents.setdefault(dependency, []).append(uid)
+        if not omitted:
+            return False
+        blocked: set[str] = set()
+        stack = list(omitted)
+        while stack:
+            uid = stack.pop()
+            for child in dependents.get(uid, ()):
+                if child not in blocked and child not in omitted:
+                    blocked.add(child)
+                    stack.append(child)
+        if omitted | blocked != set(job_map):
+            return False
+        wall = self.store.state.wall_uids
+        for uid in blocked:
+            unmet = [dep for dep in job_map[uid][1] if dep not in wall]
+            if not unmet or not all(dep in omitted or dep in blocked for dep in unmet):
+                return False
+        return True
 
     def _drain_and_settle(self) -> int:
         """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""

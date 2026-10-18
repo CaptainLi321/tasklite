@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from ..models.job import Job
 from ..models.state import PipelineState, uid_from_job_dict
+from ..Selection import Selection
 from .resource import Resource, ResourceManager
 
 logger = logging.getLogger("tasklite")
@@ -175,6 +176,9 @@ class JobScheduler:
             self.resources = resources
             self.resource_mgr = ResourceManager(resources, tasks=tasks)
         self.ordering: OrderingPolicy = ordering if ordering is not None else FifoOrderingPolicy()
+        # 执行选择由 EngineRuntime 单点注入（None = 默认全执行）；本属性是
+        # 内部注入面，外部不得直接赋值（须与 StateStore 的选择事实源一致）。
+        self.selection: Selection | None = None
         self._job_cache: dict[tuple[str, str], JobFacts] = {}
         self._JOB_CACHE_MAX = 100_000
 
@@ -297,6 +301,18 @@ class JobScheduler:
                 continue
             can_run = True
             failed_dependency = None
+
+            # 执行选择：未选中作业在依赖/资源评估之前整体跳过——不贡献
+            # missing/unknown/impossible/min_wait/has_potential_spawners 任何
+            # 停摆事实；运行期收敛仲裁把「仅剩未选中」判为正常完成。
+            # None / 空规则集短路，行为与扩展前等价。
+            selection = self.selection
+            if (
+                selection is not None
+                and selection.is_active
+                and not selection.allows_type(job.task_type)
+            ):
+                continue
 
             # 1. Failed dependency: job is runnable (will be marked as dependency failure)
             if job.depends_on:

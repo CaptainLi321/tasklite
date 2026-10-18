@@ -7,10 +7,10 @@
 
 公开面：TaskLite 门面（六步调用契约）、模型层、异常族、错误分类
 （ErrorClassifier 与 ERR_* 错误码）、单射编码族、资源体系、失败档案
-条目、用户钩子三件套、准入与重入队策略 seam、排序策略 seam、持久化
-后端与运行摘要值对象，均经本文件集中导出（``from tasklite import
-...`` 是唯一承诺稳定的导入面）。``__version__`` 为版本单一事实源
-（pyproject 动态读取点）。
+条目、用户钩子三件套、准入与重入队策略 seam、排序策略 seam、执行选择
+规则值对象、持久化后端与运行摘要值对象，均经本文件集中导出
+（``from tasklite import ...`` 是唯一承诺稳定的导入面）。``__version__``
+为版本单一事实源（pyproject 动态读取点）。
 
 分层单向依赖红线：``tasklite/models/`` 严禁 import
 ``tasklite/engine/``（IPC 声明读写一律下沉 ``tasklite/utils/ipc.py``），
@@ -22,10 +22,13 @@
 """
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # ── 门面（六步调用契约的唯一入口）────────────────────────────────────
 from .pipeline import TaskLite
+
+# ── 执行选择（pipeline 级规则值对象）─────────────────────────────────
+from .Selection import Exclude
 
 # ── 模型层：规格 / 实例 / 轨迹 / 上下文 ──────────────────────────────
 from .models.attempt import AttemptRecord
@@ -123,6 +126,8 @@ from .utils import jsonutil
 __all__ = [
     # 门面
     "TaskLite",
+    # 执行选择
+    "Exclude",
     # 模型层
     "AttemptRecord",
     "Job",
