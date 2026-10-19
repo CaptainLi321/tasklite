@@ -6,8 +6,7 @@
   3. 加载期由恢复编排层过滤 queue 对 wall/failed 的残留漂移
      （at-least-once 兜底）。
 
-所有变更原地进行；队列变更只经三个受控方法（``pop_job`` /
-``spawn_jobs`` / ``requeue_jobs``），``_queue_uids`` 永不漂移。
+所有变更原地进行；队列变更只经受控方法，``_queue_uids`` 永不漂移。
 """
 from __future__ import annotations
 
@@ -108,6 +107,17 @@ class PipelineState:
         for j in job_dicts:
             if _is_rerun_exempt(j):
                 self._rerun_active_uids.add(uid_from_job_dict(j))
+        if __debug__:
+            self._assert_uids_consistent()
+
+    def remove_queued_uid(self, uid: str) -> None:
+        """按 uid 清除队列行，保留其他作业的在途重跑豁免。"""
+        if uid not in self._queue_uids:
+            return
+        self._queue[:] = [jd for jd in self._queue if uid_from_job_dict(jd) != uid]
+        self._queue_uids.discard(uid)
+        if uid not in self._in_flight_uids:
+            self._rerun_active_uids.discard(uid)
         if __debug__:
             self._assert_uids_consistent()
 

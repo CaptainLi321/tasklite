@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from ..models.job import Job
-from ..models.state import uid_from_job_dict
 from ..selection import Selection
 from .errorclass import ERR_DEPENDENCY_SKIPPED, ERR_SKIPPED
 
@@ -151,15 +150,6 @@ class SelectionMachine:
             )
             skipped += 1
             logger.info(f"SELECTION: job {uid} skipped terminal ({error}).")
-        if skipped:
-            removed = set(closure)
-            store.state.replace_queue(
-                [
-                    job_dict
-                    for job_dict in queue
-                    if uid_from_job_dict(job_dict) not in removed
-                ]
-            )
         return skipped
 
     def partition_standstill(self) -> SelectionStandstill | None:

@@ -607,9 +607,10 @@ class StateStore:
         job_dict: dict[str, Any] | None = None,
         attempt_id: int | None = None,
     ) -> SkipOutcome:
-        """原子状态转移：去重跳过（只清队列残行，不写 wall/failed）。"""
+        """原子状态转移：终态跳过（清除磁盘与内存队列，不写 wall/failed）。"""
         committed = self._backend.commit_skip(uid)
         if committed:
+            self._state.remove_queued_uid(uid)
             self._state.unregister_in_flight(uid)
             self._record_stat("skipped", 1)
             self._finish_attempt(attempt_id, outcome=ATTEMPT_SKIPPED)

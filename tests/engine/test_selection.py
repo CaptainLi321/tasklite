@@ -789,6 +789,65 @@ def test_selection_machine_isolated_unit():
     assert len(attempts_child) == 1 and attempts_child[0].outcome == "skipped"
 
 
+@pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
+def test_partial_skip_commit_stays_removed_after_crash_save_and_reload(
+    tmp_path, monkeypatch, backend_kind
+):
+    """跳过闭包部分提交后崩溃，已提交的下游不得被保存或重启复活。"""
+    from tasklite.engine.selection import SelectionMachine
+    from tasklite.exceptions import _CommitCrashSignal
+
+    pipeline = TaskLite(name="skip_crash", state_dir=tmp_path, backend=backend_kind)
+    store = pipeline._runtime.store
+    backend = pipeline.backend
+    root = Job("skip_root", "root").to_dict()
+    child = Job("allowed", "child", depends_on=["skip_root::root"]).to_dict()
+    unrelated = Job("allowed", "unrelated").to_dict()
+    rows = [root, child, unrelated]
+    store.state.replace_queue(rows)
+    backend.save_queue(rows)
+    commit_skip = backend.commit_skip
+    calls = []
+
+    def fail_root(uid):
+        calls.append(uid)
+        return False if uid == "skip_root::root" else commit_skip(uid)
+
+    monkeypatch.setattr(backend, "commit_skip", fail_root)
+    selection = Selection([Skip("skip_root")])
+    machine = SelectionMachine(selection, store)
+    with pytest.raises(_CommitCrashSignal, match="commit_skip"):
+        machine.apply_skips(run_id="first_run", seq_supplier=lambda: 1)
+
+    assert calls == ["allowed::child", "skip_root::root"]
+    assert _uids(backend.load_queue()) == ["skip_root::root", "allowed::unrelated"]
+    assert store.state.queue_uids == {"skip_root::root", "allowed::unrelated"}
+    assert [record.outcome for record in backend.load_attempts("allowed::child")] == [
+        "skipped"
+    ]
+    assert backend.load_attempts("skip_root::root") == []
+
+    pipeline._runtime._recovery.save_queue_crash_safe()
+    assert _uids(backend.load_queue()) == ["skip_root::root", "allowed::unrelated"]
+    monkeypatch.setattr(backend, "commit_skip", commit_skip)
+    restarted = TaskLite(
+        name="skip_crash", state_dir=tmp_path,
+        backend="sqlite" if backend_kind == "sqlite" else backend,
+    )
+    restarted._runtime._recovery.load_and_repair()
+    assert _uids(restarted._runtime.store.state.queue) == [
+        "skip_root::root", "allowed::unrelated"
+    ]
+    assert SelectionMachine(selection, restarted._runtime.store).apply_skips(
+        run_id="second_run", seq_supplier=lambda: 1
+    ) == 1
+    assert _uids(restarted.backend.load_queue()) == ["allowed::unrelated"]
+    assert _uids(restarted._runtime.store.state.queue) == ["allowed::unrelated"]
+    assert len(restarted.backend.load_attempts("allowed::child")) == 1
+    assert restarted.backend.load_wall() == {}
+    assert restarted.backend.load_failed() == {}
+
+
 @pytest.mark.parametrize("rule_type", [Exclude, Skip])
 @pytest.mark.parametrize("failure_path", ["cascade", "bulk"])
 def test_selection_failure_isolation_after_equal_length_spawn(

@@ -253,13 +253,15 @@ class TestApplyRetry:
 class TestApplySkip:
     """apply_skip 去重跳过。"""
 
-    def test_skip_records_stat_and_clears_queue(self):
+    @pytest.mark.parametrize("dispatched", [False, True])
+    def test_skip_records_stat_and_clears_queue(self, dispatched):
         stats = TaskStats()
         backend = InMemoryStateBackend()
         backend.save_queue([{"task_type": "t", "job_id": "1"}])
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
         store = StateStore(backend, state, stats=stats)
-        state.pop_job(0)
+        if dispatched:
+            state.pop_job(0)
 
         outcome = store.apply_skip("t::1", job_dict={"task_type": "t", "job_id": "1"})
 
@@ -268,6 +270,21 @@ class TestApplySkip:
         assert stats["skipped"] == 1
         assert store.state.is_empty
         assert backend.load_queue() == []
+
+    def test_skip_preserves_other_in_flight_rerun_exemption(self):
+        store, state, backend = _make_store()
+        store.apply_success("t::running", {})
+        state.mark_rerun_active("t::running")
+        state.register_in_flight("t::running")
+        pending = Job("t", "skip").to_dict()
+        state.spawn_jobs([pending])
+        backend.save_queue([pending])
+
+        store.apply_skip("t::skip", job_dict=pending)
+
+        assert state.is_empty
+        assert state.in_flight_uids == {"t::running"}
+        state._assert_state_consistent()
 
     def test_skip_commit_failure_crashes_without_archive(self):
         """commit_skip 失败：只 requeue + 崩溃，绝不写失败档案。"""
