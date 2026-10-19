@@ -351,6 +351,9 @@ class EngineRuntime:
                     dispatched += 1
                     continue
                 if outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS:
+                    # 残留结果认领可派生作业，必须在后续派发与仲裁前收敛 Skip。
+                    if self._session.stop_mode is StopMode.NONE:
+                        self._apply_selection_skips()
                     continue
                 break
         return last_outcome, worker_wait, dispatched

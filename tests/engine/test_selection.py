@@ -630,6 +630,94 @@ def test_spawned_skip_child_is_terminal_skipped(monkeypatch, tmp_path):
     assert _attempt_errors(pipeline, "skip_t::child")[-1] == ERR_SKIPPED
 
 
+@pytest.mark.parametrize("cyclic", [False, True])
+@pytest.mark.parametrize("following", [False, True])
+def test_stale_result_spawn_skips_before_dispatch_or_arbitration(
+    monkeypatch, tmp_path, cyclic, following
+):
+    """残留结果派生的 Skip 闭包在下一次派发及停摆仲裁前收敛。"""
+    from tasklite.engine.channel import ExecutionResult
+
+    monkeypatch.setattr(mp, "Process", _fake_process_class())
+    seen = []
+    pipeline = _pipeline(
+        tmp_path,
+        on_attempt_finished=lambda uid, *, outcome: seen.append(
+            (uid, set(_queued(pipeline)))
+        ),
+    )
+    for task_type in ("parent", "skip_t", "normal"):
+        pipeline.register_task(task_type, ok_handler)
+    spawned = [Job("skip_t", "root")]
+    if cyclic:
+        spawned.extend([
+            Job("normal", "a", depends_on=["skip_t::root", "normal::b"]),
+            Job("normal", "b", depends_on=["normal::a"]),
+        ])
+    queued = [Job("parent", "restore")]
+    if following:
+        queued.append(Job("normal", "following", depends_on=["parent::restore"]))
+    pipeline.enqueue(queued)
+    pipeline.selection(Skip("skip_t"))
+    monkeypatch.setattr(
+        pipeline._runtime.channel,
+        "claim_stale_result",
+        lambda uid, job: ExecutionResult(success=True, new_jobs=spawned)
+        if uid == "parent::restore" else None,
+    )
+    dispatch_job = pipeline._runtime._dispatch.dispatch_job
+
+    def dispatch_after_skip(sched):
+        row = pipeline._runtime.state.queue[sched.runnable_idx]
+        if row["job_id"] == "following":
+            assert _queued(pipeline) == ["normal::following"]
+        return dispatch_job(sched)
+
+    monkeypatch.setattr(pipeline._runtime._dispatch, "dispatch_job", dispatch_after_skip)
+    summary = pipeline.run()
+
+    assert summary.stats["completed"] == 1 + following
+    assert summary.stats["skipped"] == len(spawned)
+    assert _queued(pipeline) == []
+    assert pipeline.backend.load_failed() == {}
+    assert _attempt_errors(pipeline, "skip_t::root") == [ERR_SKIPPED]
+    for job in spawned[1:]:
+        assert _attempt_errors(pipeline, job.uid)[-1].startswith(ERR_DEPENDENCY_SKIPPED)
+    parent_queue = {job.uid for job in spawned}
+    if following:
+        parent_queue.add("normal::following")
+    assert seen[0] == ("parent::restore", parent_queue)
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_stale_result_spawn_skip_respects_stop_hook(monkeypatch, tmp_path, force):
+    """父收尾钩子请求停机后，派生 Skip 作业留队交下一次 run 收敛。"""
+    from tasklite.engine.channel import ExecutionResult
+
+    def stop_after_parent(uid, *, outcome):
+        pipeline.stop(force=force)
+
+    pipeline = _pipeline(tmp_path, on_attempt_finished=stop_after_parent)
+    pipeline.register_task("parent", ok_handler)
+    pipeline.register_task("skip_t", ok_handler)
+    pipeline.enqueue(Job("parent", "restore"))
+    pipeline.selection(Skip("skip_t"))
+    monkeypatch.setattr(
+        pipeline._runtime.channel,
+        "claim_stale_result",
+        lambda uid, job: ExecutionResult(success=True, new_jobs=[Job("skip_t", "child")]),
+    )
+
+    summary = pipeline.run()
+
+    assert summary.stats["completed"] == 1
+    assert summary.stats["skipped"] == 0
+    assert _queued(pipeline) == ["skip_t::child"]
+    assert pipeline.backend.load_attempts("skip_t::child") == []
+    assert pipeline.run().stats["skipped"] == 1
+    assert _queued(pipeline) == []
+
+
 def test_failed_parent_cascade_keeps_excluded_downstream(monkeypatch, tmp_path):
     monkeypatch.setattr(mp, "Process", _fake_process_class(fail_uid="fetch::parent"))
     pipeline = _pipeline(tmp_path)
