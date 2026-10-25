@@ -23,7 +23,7 @@
   - 规则只做 task_type 格式校验，不校验注册表存在性（规则可先于 `register_task` 配置，也可跨运行窗口复用）。
   - **集成方注意**：Exclude 激活时 `run()` 可能以 `COMPLETED` 退出而持久化队列非空（留队待下次），完成度请按 queue 判定；Skip 是永久删除语义。
 - **文档**：[ADR-0006](docs/adr/0006-selection-scheduling-seam.md) 将执行选择登记为第三类调度扩展 seam（候选准入/选择），V2_GUIDE §5/§8、README 架构树与特性 8、ROADMAP §3、AGENTS seam 注册句同步分类。
-- **版本**：`tasklite/__init__.py` `__version__` 2.0.0 → 2.1.0（ZeroCite v2 依赖 `tasklite-engine>=2.1.0`）。
+- **版本**：`tasklite/__init__.py` `__version__` 2.0.0 → 2.1.0（文献处理项目（项目A）的新版本依赖 `tasklite-engine>=2.1.0`）。
 
 ### 修复
 
