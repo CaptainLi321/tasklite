@@ -107,7 +107,7 @@ from .engine.types import (
     ExitReason,
     RunSummary,
     StopMode,
-    TaskStats,
+    RunStats,
 )
 
 # ── 持久化后端 ───────────────────────────────────────────────────────
@@ -199,7 +199,7 @@ __all__ = [
     "ExitReason",
     "RunSummary",
     "StopMode",
-    "TaskStats",
+    "RunStats",
     # 持久化后端
     "InMemoryStateBackend",
     "SQLiteStateBackend",

@@ -27,7 +27,7 @@ class JobContext:
         wall_keys: set | frozenset,
         failed_keys: set | frozenset,
         cursors: dict[str, str],
-        output_root: Path | None = None,
+        output_roots: Path | None = None,
         ipc_dir: str | None = None,
         transient_registry: tuple[type[BaseException], ...] = (),
         fatal_exceptions: tuple[type[BaseException], ...] | None = None,
@@ -45,9 +45,9 @@ class JobContext:
         # 不变式：恒为冻结集合；空集意味着无已注册资源，任何资源名的
         # suspend 请求一律入口拒绝——未注册名永不静默放行。
         self._resource_names: frozenset = frozenset(resource_names or ())
-        # output_root 支持多根（跨盘输出场景）——解析时
+        # output_roots 支持多根（跨盘输出场景）——解析时
         # 路径属于**任一**根即通过沙盒校验。
-        self.output_root = output_root
+        self.output_roots = output_roots
         # 注册表快照契约：瞬态异常注册表快照随 ctx pickle 下发子进程——
         # spawn 子进程不继承父进程函数作用域的注册，分类决策在子进程
         # 发生，快照在此携带、worker 入口重放。
@@ -108,13 +108,13 @@ class JobContext:
         已声明输出会被删除，防止半写文件残留。
 
         ``sandbox=False`` 显式豁免路径沙盒（跨盘输出等无法归入任何
-        output_root 的场景）——放弃越界保护，与 ``output_root=None``
+        output_roots 的场景）——放弃越界保护，与 ``output_roots=None``
         同语义，但逐路径声明而非全局关闭。
 
         Returns:
             框架将校验/清理的**解析后规范绝对路径**——handler 应用返回值
             写文件（而非原始参数），保证写入位置与校验/清理位置一致
-            （相对路径按 output_root 重定位，原始相对字符串按 CWD 写会
+            （相对路径按 output_roots 重定位，原始相对字符串按 CWD 写会
             与校验脱节 → 误判产物缺失）。
         """
         return self._declare(path, cleanup_on_fail=cleanup_on_fail, sandbox=sandbox, kind="output")
@@ -133,7 +133,7 @@ class JobContext:
         ``ctx.declare_output("./v.mp4")`` 声明（成功校验存在 + 失败清理）。
 
         路径沙盒与 ``declare_output`` 相同：``sandbox=False`` 显式豁免
-        （跨盘缓存等无法归入任何 output_root 的场景）——放弃越界保护，
+        （跨盘缓存等无法归入任何 output_roots 的场景）——放弃越界保护，
         逐路径声明而非全局关闭。返回解析后的规范绝对路径。
         """
         return self._declare(path, cleanup_on_fail=True, sandbox=sandbox, kind="cache")
@@ -143,7 +143,7 @@ class JobContext:
     ) -> str:
         """declare_output/declare_cache 的共享实现（消除重复）。"""
         raw = str(path)
-        resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_root, sandbox=sandbox)
+        resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_roots, sandbox=sandbox)
         parent = Path(resolved).parent
         parent.mkdir(parents=True, exist_ok=True)
         if self._journal is not None:
@@ -172,7 +172,7 @@ class JobContext:
         时视为变化 → 重跑，避免误跳过）。
         """
         raw = str(path)
-        resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_root, sandbox=False)
+        resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_roots, sandbox=False)
         if self._journal is not None:
             self._journal.record_input_file(self.job.uid, resolved)
         return resolved

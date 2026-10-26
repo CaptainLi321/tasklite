@@ -267,7 +267,7 @@ def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     gpu = CountingResource()
     pipeline.register_resource(gpu)
-    pipeline.register_task("heavy", ok_handler, default_resources={"gpu": 1.0})
+    pipeline.register_task("heavy", ok_handler, resources={"gpu": 1.0})
     pipeline.register_task("light", ok_handler)
     pipeline.enqueue([Job("heavy", "h"), Job("light", "l")])
     pipeline.selection(Exclude(task_type="heavy"))

@@ -47,7 +47,7 @@ def main():
         pipeline.register_resource(CapacityResource("gpu", 2.0))
         pipeline.register_resource(RateLimitResource("api", 0.05))
 
-        pipeline.register_task("task_a", handler_a, default_resources={"gpu": 1.0})
+        pipeline.register_task("task_a", handler_a, resources={"gpu": 1.0})
         pipeline.register_task("task_retry", handler_retry)
 
         j1 = Job("task_a", "job_1", {"val": 42}, resources={"api": 1.0})

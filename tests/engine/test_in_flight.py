@@ -120,8 +120,8 @@ class TestInFlightTrackerHandlesAndPseudo:
         handle = JobHandle(
             job_uid="t::j1",
             process=FakeProcess(101),
-            deadline=100.0,
-            timeout=10.0,
+            timeout_at_monotonic=100.0,
+            timeout_seconds=10.0,
             job=job_real,
             ipc_dir="/tmp/ipc",
             execution_id="run1.1",
@@ -139,20 +139,20 @@ class TestInFlightTrackerHandlesAndPseudo:
         assert tracker.active_handles() == [handle]
 
     def test_watchdog_fields_carried_on_handle(self):
-        """看门狗字段（deadline/timeout/job_start）随条目透传，timeout 语义原样。"""
+        """看门狗字段（timeout_at_monotonic/timeout/started_monotonic）随条目透传，timeout 语义原样。"""
         job = Job("t", "jw")
         handle = JobHandle(
             job_uid="t::jw",
             process=FakeProcess(7),
-            deadline=500.0,
-            timeout=30.0,
+            timeout_at_monotonic=500.0,
+            timeout_seconds=30.0,
             job=job,
             ipc_dir="/tmp/ipc",
             execution_id="run9.42",
         )
         entry = InFlightJob("t::jw", job.to_dict(), job, [], handle, 470.0)
         assert entry.handle is handle
-        assert entry.handle.deadline - entry.job_start == 30.0
+        assert entry.handle.timeout_at_monotonic - entry.started_monotonic == 30.0
 
 
 class TestInFlightTrackerResourceRelease:

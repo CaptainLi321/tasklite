@@ -107,7 +107,7 @@ class DeadlockGovernor:
     都会把同缺失集的新等待者零宽限误判死锁。
     """
 
-    dep_grace_seconds: float = DEP_GRACE_SECONDS
+    dependency_grace_seconds: float = DEP_GRACE_SECONDS
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
     dep_grace_deadline: float | None = None
     dep_grace_missing: frozenset[str] | None = None
@@ -201,7 +201,7 @@ class DeadlockGovernor:
             return False
 
         effective_grace = (
-            float(grace_seconds) if grace_seconds is not None else self.dep_grace_seconds
+            float(grace_seconds) if grace_seconds is not None else self.dependency_grace_seconds
         )
 
         # 若缺失 UID 集合发生变化，重置宽限截止时间（新 episode）
@@ -404,7 +404,7 @@ class DeadlockGovernor:
     ) -> DeadlockDecision:
         """以同一停摆快照完成归因与状态提交。"""
         effective_state = store.state
-        effective_grace = self.dep_grace_seconds
+        effective_grace = self.dependency_grace_seconds
         effective_gap_max = self.deadlock_gap_max_rounds
         selection_active = selection_machine is not None and selection_machine.is_active
 

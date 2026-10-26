@@ -6,7 +6,7 @@ orphan-probe → stale-restore。依赖以显式窄清单注入（无共享袋�
 
 ``session`` 与 ``tasks`` 按具名 Protocol 消费（装配契约见本模块的
 ``DispatchSession`` 与 ``TaskSource``：RunSession / TaskRegistry 真实
-类型自动满足）；``output_root`` 与 config 声明同型
+类型自动满足）；``output_roots`` 与 config 声明同型
 （``Path | Sequence[Path] | None``，多根输出场景）。
 
 派发即插 attempts 轨迹行（outcome=running）：execution_id
@@ -119,7 +119,7 @@ class DispatchMachine:
         recovery: "RecoveryOrchestrator",
         tasks: "TaskSource",
         classifier: "ErrorClassifier",
-        output_root: "Path | Sequence[Path] | None",
+        output_roots: "Path | Sequence[Path] | None",
         ipc_dir: str,
         commit_failure_threshold: int,
     ) -> None:
@@ -133,7 +133,7 @@ class DispatchMachine:
         self._recovery = recovery
         self._tasks = tasks
         self._classifier = classifier
-        self._output_root = output_root
+        self._output_roots = output_roots
         self._ipc_dir = ipc_dir
         self._commit_failure_threshold = commit_failure_threshold
 
@@ -443,14 +443,14 @@ class DispatchMachine:
 
                 ctx = self._build_context(job, store.state)
                 logger.info(f"RUN: {job_uid}")
-                job_start = time.monotonic()
+                started_monotonic = time.monotonic()
                 handle = self._channel.spawn(WorkerLaunchSpec(
                     handler=task.handler,
                     job=job,
                     job_context=ctx,
                     execution_id=execution_id,
                     ipc_dir=self._ipc_dir,
-                    timeout=job.timeout,
+                    timeout_seconds=job.timeout_seconds,
                     result_token=self._session.result_token,
                 ))
                 lease.claim()
@@ -460,7 +460,7 @@ class DispatchMachine:
                     job_snapshot=job_snapshot,
                     job=job,
                     handle=handle,
-                    job_start=job_start,
+                    started_monotonic=started_monotonic,
                     lease=lease,
                     attempt_id=attempt_id,
                 )
@@ -491,7 +491,7 @@ class DispatchMachine:
             frozenset(state.wall_uids),
             frozenset(state.failed_uids),
             dict(state.cursors),
-            output_root=self._output_root,
+            output_roots=self._output_roots,
             ipc_dir=self._ipc_dir,
             transient_registry=self._classifier.snapshot(),
             fatal_exceptions=self._classifier.fatal_exceptions,

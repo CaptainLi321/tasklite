@@ -32,7 +32,7 @@ from tasklite.engine.types import (
     RunSummary,
     StepOutcome,
     StopMode,
-    TaskStats,
+    RunStats,
 )
 from tasklite.models.job import Job, WORKER_RESOURCE
 from tasklite.models.task import Task, TaskRegistry
@@ -196,7 +196,7 @@ class RuntimeEnv:
                 governor=DeadlockGovernor(),
                 rerun_policy=RerunPolicy(),
                 requeue_policy=ImmediateRequeuePolicy(),
-                output_root=tmp_path,
+                output_roots=tmp_path,
                 strict_picklable=strict_picklable,
                 on_run_start=on_run_start,
                 on_run_end=on_run_end,
@@ -225,7 +225,7 @@ class TestEngineRuntimeConfiguration:
         assert runtime.config.name == "test_runtime"
         assert runtime.stop_mode == StopMode.NONE
         assert not runtime.is_running
-        assert isinstance(runtime.stats, TaskStats)
+        assert isinstance(runtime.stats, RunStats)
         assert isinstance(runtime.session, RunSession)
         assert isinstance(runtime.store, StateStore)
         assert runtime.channel is runtime.config.channel

@@ -81,7 +81,7 @@ def _spy_cycle_detection(monkeypatch):
 
 class TestGovernorBasics:
     def test_reset_clears_all_round_state(self):
-        gov = DeadlockGovernor(dep_grace_seconds=10.0, deadlock_gap_max_rounds=3)
+        gov = DeadlockGovernor(dependency_grace_seconds=10.0, deadlock_gap_max_rounds=3)
         gov.dep_grace_deadline = 100.0
         gov.dep_grace_missing = frozenset(["t::j1"])
         gov.deadlock_gap_rounds = 2
@@ -153,7 +153,7 @@ class TestGapEscalation:
 
     def test_gap_rounds_reset_on_grace_waiting_conclusion(self):
         """缺口轮次间的依赖宽限裁决（非缺口结论）同样终结 gap episode。"""
-        gov = DeadlockGovernor(dep_grace_seconds=60.0, deadlock_gap_max_rounds=5)
+        gov = DeadlockGovernor(dependency_grace_seconds=60.0, deadlock_gap_max_rounds=5)
         state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
         store = FakeArbitrationStore(state)
         sched_gap = StandstillFacts(min_wait=INF)
@@ -177,7 +177,7 @@ class TestGapEscalation:
 
 class TestDependencyGrace:
     def test_grace_period_fallback_path(self):
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state(
             [
                 Job("t", "a", depends_on=["t::b"]).to_dict(),
@@ -197,7 +197,7 @@ class TestDependencyGrace:
 
     def test_spawner_fast_path(self):
         """提供 has_potential_spawners 时直接依据单趟事实裁决，零扫描 state.queue。"""
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state([])
 
         assert gov.check_dependency_grace(
@@ -220,7 +220,7 @@ class TestDependencyGrace:
 
     def test_grace_episode_ends_on_expiry(self):
         """宽限超时即终结 episode：过期 deadline 不泄漏进同缺失集的新等待者。"""
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state(
             [
                 Job("t", "b", depends_on=["t::x"]).to_dict(),
@@ -246,7 +246,7 @@ class TestDependencyGrace:
         复发（如 every_run 同 uid 重入队等待新缺失依赖）且全新 spawner 在场时
         必须重新授予完整宽限，而非继承残留 deadline 被零宽限批量误判。
         """
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
 
         assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
@@ -263,7 +263,7 @@ class TestDependencyGrace:
 
     def test_grace_episode_ends_on_no_spawner(self):
         """无潜在 spawner 的立即裁决同样终结 episode，重启后重新授予完整宽限。"""
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
 
         assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
@@ -276,7 +276,7 @@ class TestDependencyGrace:
 
     def test_grace_expiry_clears_deadline_fallback_path(self):
         """回退路径（无 spawner 快道事实）的超时裁决同样终结 episode。"""
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state(
             [
                 Job("t", "b", depends_on=["t::x"]).to_dict(),
@@ -300,7 +300,7 @@ class TestDependencyGrace:
         时间启发式无法区分「刚过期的残留」与「活跃 episode」。任何成功派发
         都证明等待者已消解，episode 应当终结，复发自然是新 episode。
         """
-        gov = DeadlockGovernor(dep_grace_seconds=60.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=60.0)
         state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
 
         # episode：授予宽限（deadline=160），随后等待者消解并被派发
@@ -319,7 +319,7 @@ class TestDependencyGrace:
 
     def test_missing_set_change_starts_new_episode(self):
         """缺失集变化即新 episode：deadline 重置、不继承旧窗口。"""
-        gov = DeadlockGovernor(dep_grace_seconds=10.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=10.0)
         state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
 
         assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
@@ -341,7 +341,7 @@ class TestDependencyGrace:
 
 class TestArbitrateFacade:
     def test_none_facts_returns_none(self):
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         store = FakeArbitrationStore(_state([]))
         decision = gov.arbitrate(None, store)
         assert decision.action == "none"
@@ -349,7 +349,7 @@ class TestArbitrateFacade:
         assert decision.wait_time == 0.0
 
     def test_finite_wait_without_cycle_returns_none(self):
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state([Job("t", "a", depends_on=["t::b"]).to_dict()])
         store = FakeArbitrationStore(state)
         sched = StandstillFacts(min_wait=2.0, waiting_for_dependency=False)
@@ -360,7 +360,7 @@ class TestArbitrateFacade:
 
     def test_finite_wait_with_cycle_resolves(self):
         """有限等待但拓扑成环（掩盖死锁）→ 触发 resolve_deadlock 熔断环成员。"""
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state(
             [
                 Job("t", "a", depends_on=["t::b"]).to_dict(),
@@ -426,7 +426,7 @@ class TestResolveDeadlockAttribution:
         assert state.failed["t::x"]["error"] == ERR_RESOURCE_DEADLOCK
 
     def test_missing_dependency_without_spawner_fails_after_grace(self):
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state([Job("t", "a", depends_on=["t::ghost"]).to_dict()])
         store = FakeArbitrationStore(state)
         facts = StandstillFacts(
@@ -439,7 +439,7 @@ class TestResolveDeadlockAttribution:
         assert state.failed["t::a"]["error"] == ERR_DEPENDENCY_DEADLOCK
 
     def test_missing_dependency_with_spawner_graces(self):
-        gov = DeadlockGovernor(dep_grace_seconds=5.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
         state = _state([Job("t", "a", depends_on=["t::ghost"]).to_dict()])
         store = FakeArbitrationStore(state)
         facts = StandstillFacts(
@@ -557,7 +557,7 @@ class TestGovernorArbitrateDeepChain:
 class TestGraceRelapseAfterProgress:
     def test_resolve_relapse_after_progress_gets_full_grace(self):
         """死锁仲裁路径同样受益于前进终结点：盲区复发裁决为宽限而非批量熔断。"""
-        gov = DeadlockGovernor(dep_grace_seconds=60.0)
+        gov = DeadlockGovernor(dependency_grace_seconds=60.0)
         state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
         store = FakeArbitrationStore(state)
         sched = StandstillFacts(

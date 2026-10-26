@@ -3,7 +3,7 @@
 字段归位原则：本类只承载「这一次激活」的语义——
 
 - 规格位（可覆盖 Task 默认）：task_type / job_id / payload / resources /
-  depends_on / timeout / max_retries / timeout_is_transient / rerun；
+  depends_on / timeout_seconds / max_retries / timeout_is_transient / rerun；
 - 实例位（框架运行期管理）：attempt_no（本次激活内尝试序号，1 起始含
   首次执行；预算判定：允许执行条件 ``attempt_no <= max_retries + 1``）、
   activation_no（激活代，每次从 wall/failed 拦截点放行重跑时 +1）、
@@ -25,7 +25,7 @@ from .task import (
     validate_resource_amounts,
     validate_retry_budget,
     validate_task_type,
-    validate_timeout,
+    validate_timeout_seconds,
     validate_timeout_flag,
 )
 
@@ -287,7 +287,7 @@ class Job:
             失败档案。
         depends_on: 上游 job uid 列表（``task_type::job_id``）。失败的
             上游会级联阻断本 job。
-        timeout: 执行超时秒数（覆盖 Task 默认 3600），有限正数。
+        timeout_seconds: 执行超时秒数（覆盖 Task 默认 3600），有限正数。
         timeout_is_transient: 超时是否视为瞬态失败（keyword-only）。
             True 时看门狗超时按重试处理，而非直接进失败档案。
         rerun: 跨会话重跑策略——「成功进 wall 是否算数」由它决定
@@ -321,7 +321,7 @@ class Job:
         resources: dict[str, float] | None = None,
         max_retries: int = 3,
         depends_on: list[str] | None = None,
-        timeout: int | float = 3600,
+        timeout_seconds: int | float = 3600,
         *,
         timeout_is_transient: bool = False,
         rerun: str | None = None,
@@ -342,8 +342,8 @@ class Job:
         validate_retry_budget(max_retries)
         self.max_retries = max_retries
         self.depends_on = _normalize_depends_on(depends_on)
-        validate_timeout(timeout)
-        self.timeout = timeout
+        validate_timeout_seconds(timeout_seconds)
+        self.timeout_seconds = timeout_seconds
         validate_timeout_flag(timeout_is_transient)
         self.timeout_is_transient = timeout_is_transient
         _validate_rerun(rerun)
@@ -381,7 +381,7 @@ class Job:
             "resources": dict(self.resources),
             "max_retries": self.max_retries,
             "depends_on": list(self.depends_on),
-            "timeout": self.timeout,
+            "timeout": self.timeout_seconds,
             "timeout_is_transient": self.timeout_is_transient,
             "rerun": self.rerun,
             "runtime": self.runtime.to_dict(),

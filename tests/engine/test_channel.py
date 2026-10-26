@@ -49,7 +49,7 @@ def make_spec(
         job_context=make_ctx(job),
         execution_id=execution_id,
         ipc_dir=str(ipc_dir) if ipc_dir is not None else None,
-        timeout=60.0,
+        timeout_seconds=60.0,
         result_token=result_token,
     )
 
@@ -266,7 +266,7 @@ class TestWorkerWrapper:
         spec = WorkerLaunchSpec(
             handler=lambda j, c: (_ for _ in ()).throw(ConnectionAbortedError("reset")),
             job=job, job_context=ctx, execution_id=_EXECUTION_ID,
-            ipc_dir=str(tmp_path), timeout=60.0,
+            ipc_dir=str(tmp_path), timeout_seconds=60.0,
         )
         _mp_worker_wrapper(spec)
         res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
@@ -696,7 +696,7 @@ class TestDecodeConvergencePaths:
             job.uid, dict(self._SCALAR_CORRUPT), execution_id=_EXECUTION_ID,
         )
         handle = JobHandle(
-            job_uid=job.uid, process=self._DeadProcess(), deadline=1.0, timeout=5.0,
+            job_uid=job.uid, process=self._DeadProcess(), timeout_at_monotonic=1.0, timeout_seconds=5.0,
             job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
@@ -735,8 +735,8 @@ class TestBuildTerminalFailureDefense:
         return JobHandle(
             job_uid="t::a",
             process=SimpleNamespace(exitcode=None),
-            deadline=1.0,
-            timeout=5.0,
+            timeout_at_monotonic=1.0,
+            timeout_seconds=5.0,
             job=TestBuildTerminalFailureDefense._JobStub(timeout_is_transient),
             ipc_dir="/tmp",
         )
@@ -776,7 +776,7 @@ class TestBuildTerminalFailureDefense:
 
 
 class TestWatchdogReap:
-    """看门狗：deadline 驱动 kill；join 窗口自然退出按 exitcode 归因。"""
+    """看门狗：timeout_at_monotonic 驱动 kill；join 窗口自然退出按 exitcode 归因。"""
 
     class _HungProcess:
         """kill 前恒活的进程桩（模拟死锁/卡死）。"""
@@ -821,7 +821,7 @@ class TestWatchdogReap:
         job = Job("t", "hang")
         handle = JobHandle(
             job_uid=job.uid, process=self._HungProcess(),
-            deadline=time.monotonic() - 1, timeout=2.0,
+            timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
             job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
@@ -837,7 +837,7 @@ class TestWatchdogReap:
         job = Job("t", "hang_transient", timeout_is_transient=True)
         handle = JobHandle(
             job_uid=job.uid, process=self._HungProcess(),
-            deadline=time.monotonic() - 1, timeout=2.0,
+            timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
             job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
@@ -847,11 +847,11 @@ class TestWatchdogReap:
         )
 
     def test_join_window_exit_attributed_by_exitcode(self, tmp_path):
-        """deadline 触发 join 后自然退出 → 按 exitcode 归因（NO_IPC_RESULT），不折入 TIMEOUT。"""
+        """timeout_at_monotonic 触发 join 后自然退出 → 按 exitcode 归因（NO_IPC_RESULT），不折入 TIMEOUT。"""
         job = Job("t", "natural_exit")
         handle = JobHandle(
             job_uid=job.uid, process=self._DyingDuringJoinProcess(),
-            deadline=time.monotonic() - 1, timeout=2.0,
+            timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
             job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
@@ -868,15 +868,15 @@ class TestWatchdogReap:
         """对称性基准：join 窗口内信号死亡（-9）/正码崩溃（1）按 exitcode
         分簇归因并维持可重试。
 
-        不变式：deadline 后 join 窗口内已自然退出的执行体，死亡归因全权
-        交 exitcode 分簇，与 deadline 前同因事件同果——环境故障不得仅因
-        跨过 deadline 就从「可重试」分裂为「零重试直落失败档案」；仅
+        不变式：timeout_at_monotonic 后 join 窗口内已自然退出的执行体，死亡归因全权
+        交 exitcode 分簇，与 timeout_at_monotonic 前同因事件同果——环境故障不得仅因
+        跨过 timeout_at_monotonic 就从「可重试」分裂为「零重试直落失败档案」；仅
         kill 后仍存活的执行体才归 TIMEOUT。
         """
         job = Job("t", "cluster_death")
         handle = JobHandle(
             job_uid=job.uid, process=self._DyingDuringJoinProcess(exitcode),
-            deadline=time.monotonic() - 1, timeout=2.0,
+            timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
             job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
@@ -889,7 +889,7 @@ class TestWatchdogReap:
         assert result.retry_error
 
     def test_completed_result_reaped_before_deadline(self, tmp_path):
-        """结果文件已落盘且进程仍活 → 直接按结果收割（不等 deadline）。"""
+        """结果文件已落盘且进程仍活 → 直接按结果收割（不等 timeout_at_monotonic）。"""
         job = Job("t", "fast")
         ArtifactJournal(tmp_path).write_result_atomic(
             job.uid,
@@ -904,7 +904,7 @@ class TestWatchdogReap:
         )
         handle = JobHandle(
             job_uid=job.uid, process=self._HungProcess(),
-            deadline=time.monotonic() + 60, timeout=60.0,
+            timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0,
             job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
@@ -1064,7 +1064,7 @@ class TestResultAuthTokenReaderSide:
         job = Job("t", "x")
         self._write_result_file(channel, job, self._poison_payload())
         handle = JobHandle(
-            job_uid=job.uid, process=self._DeadProcess(), deadline=1e18, timeout=10.0,
+            job_uid=job.uid, process=self._DeadProcess(), timeout_at_monotonic=1e18, timeout_seconds=10.0,
             job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
 
@@ -1083,7 +1083,7 @@ class TestResultAuthTokenReaderSide:
         job = Job("t", "x")
         self._write_result_file(channel, job, self._poison_payload())
         handle = JobHandle(
-            job_uid=job.uid, process=self._DeadProcess(), deadline=1e18, timeout=10.0,
+            job_uid=job.uid, process=self._DeadProcess(), timeout_at_monotonic=1e18, timeout_seconds=10.0,
             job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
 
@@ -1122,12 +1122,12 @@ class TestAbortInFlight:
 
         h_done = JobHandle(
             job_uid=job_done.uid, process=self.MockProcess(),
-            deadline=time.monotonic() + 10, timeout=10, job=job_done,
+            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job_done,
             ipc_dir=str(tmp_path), execution_id="inc_done",
         )
         h_pending = JobHandle(
             job_uid=job_pending.uid, process=self.MockProcess(),
-            deadline=time.monotonic() + 10, timeout=10, job=job_pending,
+            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job_pending,
             ipc_dir=str(tmp_path), execution_id="inc_pending",
         )
 
@@ -1172,7 +1172,7 @@ class TestAbortInFlight:
 
         h = JobHandle(
             job_uid=job.uid, process=KillWritingProcess(),
-            deadline=time.monotonic() + 10, timeout=10, job=job,
+            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
             ipc_dir=str(tmp_path), execution_id="inc_salvage",
         )
 
@@ -1220,7 +1220,7 @@ class TestAbortInFlight:
 
         h = JobHandle(
             job_uid=job.uid, process=FinishOnKillProcess(),
-            deadline=time.monotonic() + 10, timeout=10, job=job,
+            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
             ipc_dir=str(tmp_path), execution_id="inc_reprobe",
         )
 
@@ -1242,7 +1242,7 @@ class TestAbortInFlight:
         )
         h = JobHandle(
             job_uid=job.uid, process=self.MockProcess(),
-            deadline=time.monotonic() + 10, timeout=10, job=job,
+            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
             ipc_dir=str(tmp_path), execution_id="inc_interrupted",
         )
 
@@ -1269,7 +1269,7 @@ class TestCleanupInFlight:
         channel.journal.record_signal(job.uid, "api", 1.0)
         handle = JobHandle(
             job_uid=job.uid, process=TestAbortInFlight.MockProcess(),
-            deadline=time.monotonic() + 10, timeout=10, job=job,
+            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
             ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
 

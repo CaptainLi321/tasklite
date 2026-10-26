@@ -274,7 +274,7 @@ class TestScanAttribution:
 class TestOrderingPolicySeam:
     def test_fifo_default_selects_first_runnable_in_seq_order(self):
         scheduler = JobScheduler(resources={})
-        assert isinstance(scheduler.ordering, FifoOrderingPolicy)
+        assert isinstance(scheduler.ordering_policy, FifoOrderingPolicy)
         state = _state([Job("t", "a").to_dict(), Job("t", "b").to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset())
         assert result.candidate_uid == "t::a"
@@ -291,7 +291,7 @@ class TestOrderingPolicySeam:
             def visit_order(self, queue):
                 return reversed(range(len(queue)))
 
-        scheduler = JobScheduler(resources={}, ordering=ReverseOrderingPolicy())
+        scheduler = JobScheduler(resources={}, ordering_policy=ReverseOrderingPolicy())
         state = _state([Job("t", "a").to_dict(), Job("t", "b").to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset())
         assert result.candidate_uid == "t::b"
@@ -303,7 +303,7 @@ class TestOrderingPolicySeam:
             def visit_order(self, queue):
                 return reversed(range(len(queue)))
 
-        scheduler = JobScheduler(resources={}, ordering=ReverseOrderingPolicy())
+        scheduler = JobScheduler(resources={}, ordering_policy=ReverseOrderingPolicy())
         state = _state(
             [
                 Job("t", "head", depends_on=["t::failed_parent"]).to_dict(),

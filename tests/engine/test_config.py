@@ -69,7 +69,7 @@ class ConfigEnv:
             governor=self.governor,
             rerun_policy=self.rerun_policy,
             requeue_policy=self.requeue_policy,
-            output_root=None,
+            output_roots=None,
         )
         base.update(overrides)
         return RunConfig.resolve(**base)
@@ -81,17 +81,17 @@ class TestResolveTuning:
     def test_defaults_match_engine_constants(self):
         tuning = resolve_tuning()
         assert tuning == Tuning(
-            dep_grace_seconds=DEP_GRACE_SECONDS,
+            dependency_grace_seconds=DEP_GRACE_SECONDS,
             commit_failure_threshold=COMMIT_FAILURE_THRESHOLD,
             deadlock_gap_max_rounds=DEADLOCK_GAP_MAX_ROUNDS,
         )
-        assert isinstance(tuning.dep_grace_seconds, float)
+        assert isinstance(tuning.dependency_grace_seconds, float)
         assert isinstance(tuning.commit_failure_threshold, int)
         assert isinstance(tuning.deadlock_gap_max_rounds, int)
 
     def test_int_grace_normalized_to_float(self):
-        assert resolve_tuning(dep_grace_seconds=5).dep_grace_seconds == 5.0
-        assert isinstance(resolve_tuning(dep_grace_seconds=5).dep_grace_seconds, float)
+        assert resolve_tuning(dependency_grace_seconds=5).dependency_grace_seconds == 5.0
+        assert isinstance(resolve_tuning(dependency_grace_seconds=5).dependency_grace_seconds, float)
 
     def test_explicit_rounds_passthrough(self):
         tuning = resolve_tuning(
@@ -102,13 +102,13 @@ class TestResolveTuning:
 
     @pytest.mark.parametrize("bad", [0, -1.5, float("inf"), float("nan"), -0.001])
     def test_rejects_invalid_dep_grace_seconds(self, bad):
-        with pytest.raises(ValueError, match="dep_grace_seconds"):
-            resolve_tuning(dep_grace_seconds=bad)
+        with pytest.raises(ValueError, match="dependency_grace_seconds"):
+            resolve_tuning(dependency_grace_seconds=bad)
 
     @pytest.mark.parametrize("bad", ["60", True, [60], {"s": 1}, object()])
     def test_rejects_non_numeric_dep_grace_seconds(self, bad):
-        with pytest.raises(TypeError, match="dep_grace_seconds"):
-            resolve_tuning(dep_grace_seconds=bad)
+        with pytest.raises(TypeError, match="dependency_grace_seconds"):
+            resolve_tuning(dependency_grace_seconds=bad)
 
     @pytest.mark.parametrize("bad", [True, 1.9, 2.0, "3"])
     def test_rejects_non_int_threshold(self, bad):
@@ -135,8 +135,8 @@ class TestResolveTuning:
 
     def test_huge_int_grace_converges_to_value_error(self):
         """超大 int 转 float 溢出收敛为 ValueError（与 NaN/inf 同路 fail-loud）。"""
-        with pytest.raises(ValueError, match="dep_grace_seconds"):
-            resolve_tuning(dep_grace_seconds=10 ** 400)
+        with pytest.raises(ValueError, match="dependency_grace_seconds"):
+            resolve_tuning(dependency_grace_seconds=10 ** 400)
 
 
 class TestRunConfigResolve:
@@ -158,33 +158,33 @@ class TestRunConfigResolve:
 
     def test_none_scalars_resolved_to_constant_defaults(self, tmp_path):
         config = ConfigEnv(tmp_path).resolve()
-        assert config.dep_grace_seconds == DEP_GRACE_SECONDS
+        assert config.dependency_grace_seconds == DEP_GRACE_SECONDS
         assert config.commit_failure_threshold == COMMIT_FAILURE_THRESHOLD
         assert config.deadlock_gap_max_rounds == DEADLOCK_GAP_MAX_ROUNDS
         assert config.strict_picklable is True
-        assert config.output_root is None
+        assert config.output_roots is None
         assert config.on_run_start is None
         assert config.on_run_end is None
         assert config.on_attempt_finished is None
 
     def test_explicit_scalars_passthrough_without_second_default(self, tmp_path):
         config = ConfigEnv(tmp_path).resolve(
-            dep_grace_seconds=1.5,
+            dependency_grace_seconds=1.5,
             commit_failure_threshold=5,
             deadlock_gap_max_rounds=2,
             strict_picklable=False,
-            output_root=Path("/tmp/out"),
+            output_roots=Path("/tmp/out"),
         )
-        assert config.dep_grace_seconds == 1.5
+        assert config.dependency_grace_seconds == 1.5
         assert config.commit_failure_threshold == 5
         assert config.deadlock_gap_max_rounds == 2
         assert config.strict_picklable is False
-        assert config.output_root == Path("/tmp/out")
+        assert config.output_roots == Path("/tmp/out")
 
     def test_invalid_tuning_fails_loud_at_resolve(self, tmp_path):
         env = ConfigEnv(tmp_path)
-        with pytest.raises(ValueError, match="dep_grace_seconds"):
-            env.resolve(dep_grace_seconds=0.0)
+        with pytest.raises(ValueError, match="dependency_grace_seconds"):
+            env.resolve(dependency_grace_seconds=0.0)
 
     def test_hooks_passthrough(self, tmp_path):
         fired_start = []
@@ -209,16 +209,16 @@ class TestRunConfigResolve:
 
     def test_seam_policies_none_resolved_to_defaults(self, tmp_path):
         """调度策略可空透传：None → FIFO / 立即重入队（唯一解析点）。"""
-        config = ConfigEnv(tmp_path).resolve(requeue_policy=None, ordering=None)
-        assert isinstance(config.ordering, FifoOrderingPolicy)
+        config = ConfigEnv(tmp_path).resolve(requeue_policy=None, ordering_policy=None)
+        assert isinstance(config.ordering_policy, FifoOrderingPolicy)
         assert isinstance(config.requeue_policy, ImmediateRequeuePolicy)
 
     def test_seam_policies_passthrough_by_reference(self, tmp_path):
         """显式注入的策略按引用共享（冻结引用而非拷贝）。"""
         env = ConfigEnv(tmp_path)
         custom_ordering = NewestFirstOrdering()
-        config = env.resolve(ordering=custom_ordering)
-        assert config.ordering is custom_ordering
+        config = env.resolve(ordering_policy=custom_ordering)
+        assert config.ordering_policy is custom_ordering
         assert config.requeue_policy is env.requeue_policy
 
 

@@ -30,7 +30,7 @@ from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import EngineRuntime
 from .engine.scheduler import OrderingPolicy
 from .engine.store import FailureEntry
-from .engine.types import ExecutionOptions, RunSummary, TaskStats
+from .engine.types import ExecutionOptions, RunSummary, RunStats
 from .models.job import Job, RERUN_VALUES, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry, validate_task_type
 from .selection import Rule, Selection
@@ -70,7 +70,7 @@ class TaskLite:
         state_dir: 持久化状态目录（不存在则创建）。
         backend: ``"sqlite"``（默认，ACID 保证）/"memory" 或
             AbstractStateBackend 实例。
-        output_root: 产物根目录（单根或多根序列）；设置后
+        output_roots: 产物根目录（单根或多根序列）；设置后
             declare_output 声明路径被沙盒约束在根内。
         max_workers: 最大并发子进程数——内部 ``__workers__`` 容量资源
             实现，可经 ``register_resource`` 覆盖。
@@ -87,14 +87,14 @@ class TaskLite:
             可 pickle，预检把派发期才爆发的序列化失败提前到入口。
         fatal_exceptions / transient_exceptions: 异常分类声明元组
             （构造期 fail-loud 校验，随执行上下文快照下发子进程）。
-        ordering: 队列访问序策略（默认 None → FIFO，唯一解析点在
+        ordering_policy: 队列访问序策略（默认 None → FIFO，唯一解析点在
             RunConfig.resolve）；核心不含排序计算，自定义策略经
             OrderingPolicy 接缝插入，``scan_next_runnable`` 唯一
             选择点结构不变。
         requeue_policy: 重试节奏策略（默认 None → 立即重入队，唯一
             解析点在 RunConfig.resolve）；重入队位置与节奏唯一经
             RequeuePolicy 出口规划。
-        dep_grace_seconds / commit_failure_threshold / deadlock_gap_max_rounds:
+        dependency_grace_seconds / commit_failure_threshold / deadlock_gap_max_rounds:
             调优标量（可空透传，默认值唯一解析点在 resolve_tuning）。
 
     钩子契约：同步、主线程执行、必须轻量非阻塞（重活业务方自丢线程
@@ -103,14 +103,14 @@ class TaskLite:
     监听器列表。
     """
 
-    output_root: Path | list[Path] | None = None
+    output_roots: Path | list[Path] | None = None
 
     def __init__(
         self,
         name: str,
         state_dir: str | Path,
         backend: str | AbstractStateBackend = "sqlite",
-        output_root: str | Path | Sequence[str | Path] | None = None,
+        output_roots: str | Path | Sequence[str | Path] | None = None,
         max_workers: int = _DEFAULT_MAX_WORKERS,
         *,
         on_run_start: Callable[[], None] | None = None,
@@ -119,15 +119,15 @@ class TaskLite:
         strict_picklable: bool = True,
         fatal_exceptions: tuple | None = None,
         transient_exceptions: tuple | None = None,
-        ordering: OrderingPolicy | None = None,
+        ordering_policy: OrderingPolicy | None = None,
         requeue_policy: RequeuePolicy | None = None,
-        dep_grace_seconds: float | None = None,
+        dependency_grace_seconds: float | None = None,
         commit_failure_threshold: int | None = None,
         deadlock_gap_max_rounds: int | None = None,
     ) -> None:
         self.name = _validate_pipeline_name(name)
         self.state_dir = self._prepare_state_dir(state_dir)
-        self.output_root = self._resolve_output_root(output_root)
+        self.output_roots = self._resolve_output_roots(output_roots)
         # 构造期局部搬运：backend 实例只向 RunConfig（装配快照）与
         # StateStore（运行期所有权锚点）各交接一次，门面自身不独立持库。
         backend_instance, self.backend_type = self._build_backend(backend)
@@ -146,9 +146,9 @@ class TaskLite:
             on_run_start=on_run_start,
             on_run_end=on_run_end,
             on_attempt_finished=on_attempt_finished,
-            ordering=ordering,
+            ordering_policy=ordering_policy,
             requeue_policy=requeue_policy,
-            dep_grace_seconds=dep_grace_seconds,
+            dependency_grace_seconds=dependency_grace_seconds,
             commit_failure_threshold=commit_failure_threshold,
             deadlock_gap_max_rounds=deadlock_gap_max_rounds,
         )
@@ -174,24 +174,24 @@ class TaskLite:
         return path
 
     @staticmethod
-    def _resolve_output_root(
-        output_root: str | Path | Sequence[str | Path] | None,
+    def _resolve_output_roots(
+        output_roots: str | Path | Sequence[str | Path] | None,
     ) -> Path | list[Path] | None:
         """产物根装配：单根/多根（多根时声明路径属任一根即过沙盒）。"""
-        if output_root is None:
+        if output_roots is None:
             return None
-        if isinstance(output_root, (list, tuple)):
-            roots = [Path(r).resolve() for r in output_root]
+        if isinstance(output_roots, (list, tuple)):
+            roots = [Path(r).resolve() for r in output_roots]
             for r in roots:
                 r.mkdir(parents=True, exist_ok=True)
             return roots
-        if isinstance(output_root, (str, Path)):
-            root = Path(output_root).resolve()
+        if isinstance(output_roots, (str, Path)):
+            root = Path(output_roots).resolve()
             root.mkdir(parents=True, exist_ok=True)
             return root
         raise TypeError(
-            f"output_root must be str/Path or a sequence thereof, "
-            f"got {type(output_root).__name__}"
+            f"output_roots must be str/Path or a sequence thereof, "
+            f"got {type(output_roots).__name__}"
         )
 
     def _build_backend(
@@ -290,29 +290,29 @@ class TaskLite:
         on_run_start: Callable[[], None] | None,
         on_run_end: Callable[[str], None] | None,
         on_attempt_finished: Callable[..., None] | None,
-        ordering: OrderingPolicy | None,
+        ordering_policy: OrderingPolicy | None,
         requeue_policy: RequeuePolicy | None,
-        dep_grace_seconds: float | None,
+        dependency_grace_seconds: float | None,
         commit_failure_threshold: int | None,
         deadlock_gap_max_rounds: int | None,
     ) -> RunConfig:
         """RunConfig 静态装配快照：调优唯一解析点 + 机器群前置件。
 
         装配件按引用共享（冻结引用而非拷贝）；调优标量一律可空透传，
-        默认值唯一解析点在 resolve_tuning；调度策略（ordering /
+        默认值唯一解析点在 resolve_tuning；调度策略（ordering_policy /
         requeue_policy）同为可空透传，None → FIFO / 立即重入队的默认
         收敛在 RunConfig.resolve。backend 在此仅为构造期搬运——运行期
         所有权唯一锚定 StateStore（EngineRuntime 构造 store 时交接）。
         """
         tuning = resolve_tuning(
-            dep_grace_seconds=dep_grace_seconds,
+            dependency_grace_seconds=dependency_grace_seconds,
             commit_failure_threshold=commit_failure_threshold,
             deadlock_gap_max_rounds=deadlock_gap_max_rounds,
         )
         channel = ExecutionChannel(
             self.ipc_dir,
             process_context=self._process_context,
-            output_roots=self.output_root,
+            output_roots=self.output_roots,
         )
         return RunConfig.resolve(
             name=self.name,
@@ -323,15 +323,15 @@ class TaskLite:
             channel=channel,
             classifier=self.classifier,
             governor=DeadlockGovernor(
-                dep_grace_seconds=tuning.dep_grace_seconds,
+                dependency_grace_seconds=tuning.dependency_grace_seconds,
                 deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
             ),
             rerun_policy=RerunPolicy(self._discovery_rerun),
             requeue_policy=requeue_policy,
-            ordering=ordering,
-            output_root=self.output_root,
+            ordering_policy=ordering_policy,
+            output_roots=self.output_roots,
             strict_picklable=self.strict_picklable,
-            dep_grace_seconds=tuning.dep_grace_seconds,
+            dependency_grace_seconds=tuning.dependency_grace_seconds,
             commit_failure_threshold=tuning.commit_failure_threshold,
             deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
             on_run_start=on_run_start,
@@ -371,7 +371,7 @@ class TaskLite:
         self._runtime.store.set_backend(value)
 
     @property
-    def stats(self) -> TaskStats:
+    def stats(self) -> RunStats:
         return self._runtime.stats
 
     # 钩子只读直达 RunSession（钩子仅在构造期参数传入）。
@@ -417,10 +417,10 @@ class TaskLite:
         self,
         task_or_type: "Task | str",
         handler: Callable[[Job, Any], Any] | None = None,
-        default_resources: dict[str, float] | None = None,
+        resources: dict[str, float] | None = None,
         payload_schema: type | None = None,
         max_retries: int = 3,
-        timeout: int | float = 3600,
+        timeout_seconds: int | float = 3600,
         *,
         timeout_is_transient: bool = False,
     ) -> None:
@@ -430,8 +430,8 @@ class TaskLite:
         以 Task 实例为准，旁置参数静默忽略会让调用方误以为覆盖生效，
         入口 fail-loud 拒绝。
 
-        简式：首参传 task_type str，handler 必填；default_resources /
-        payload_schema / max_retries / timeout / timeout_is_transient 经
+        简式：首参传 task_type str，handler 必填；resources /
+        payload_schema / max_retries / timeout_seconds / timeout_is_transient 经
         Task 构造面校验（模型层校验单点，门面不重复实现）。
 
         handler 返回值语义：None/True 成功；False 失败；dict 成功元数据；
@@ -445,10 +445,10 @@ class TaskLite:
         if isinstance(task_or_type, Task):
             self._reject_spec_overrides(
                 handler=handler,
-                default_resources=default_resources,
+                resources=resources,
                 payload_schema=payload_schema,
                 max_retries=max_retries,
-                timeout=timeout,
+                timeout_seconds=timeout_seconds,
                 timeout_is_transient=timeout_is_transient,
             )
             task = task_or_type
@@ -462,10 +462,10 @@ class TaskLite:
             task = Task(
                 task_type,
                 handler,
-                default_resources=default_resources,
+                resources=resources,
                 payload_schema=payload_schema,
                 max_retries=max_retries,
-                timeout=timeout,
+                timeout_seconds=timeout_seconds,
                 timeout_is_transient=timeout_is_transient,
             )
         self.tasks.register(task)
@@ -474,20 +474,20 @@ class TaskLite:
     def _reject_spec_overrides(
         *,
         handler: Callable[[Job, Any], Any] | None,
-        default_resources: dict[str, float] | None,
+        resources: dict[str, float] | None,
         payload_schema: type | None,
         max_retries: int,
-        timeout: int | float,
+        timeout_seconds: int | float,
         timeout_is_transient: bool,
 ) -> None:
         """规格式注册的旁置参数门卫（非默认形态一律 ValueError）。"""
         if (
             handler is not None
-            or default_resources is not None
+            or resources is not None
             or payload_schema is not None
             or timeout_is_transient is not False
             or max_retries != Task.max_retries
-            or timeout != Task.timeout
+            or timeout_seconds != Task.timeout_seconds
         ):
             raise ValueError(
                 "register_task(Task, ...) takes the spec as-is; extra spec "

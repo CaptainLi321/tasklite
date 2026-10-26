@@ -18,7 +18,7 @@ from tasklite.engine.types import (
     RunSummary,
     StopMode,
     StepOutcome,
-    TaskStats,
+    RunStats,
 )
 
 _EXPECTED_STAT_KEYS = {
@@ -36,25 +36,25 @@ _EXPECTED_STAT_KEYS = {
 
 
 class TestEmptyStats:
-    """EMPTY_STATS 基准形状：十键全零，TaskStats 以其为初始快照而非别名。"""
+    """EMPTY_STATS 基准形状：十键全零，RunStats 以其为初始快照而非别名。"""
 
     def test_ten_keys_all_zero(self):
         assert set(EMPTY_STATS) == _EXPECTED_STAT_KEYS
         assert all(value == 0 for value in EMPTY_STATS.values())
 
     def test_task_stats_initial_snapshot(self):
-        stats = TaskStats()
+        stats = RunStats()
         assert dict(stats) == EMPTY_STATS
 
     def test_task_stats_mutation_does_not_alias_template(self):
-        """不变式：TaskStats 是 EMPTY_STATS 的拷贝初始化——实例计数不得
+        """不变式：RunStats 是 EMPTY_STATS 的拷贝初始化——实例计数不得
         写穿模板，否则并发 run 之间统计互污。"""
-        stats = TaskStats()
+        stats = RunStats()
         stats["completed"] += 1
         stats["failed"] = 7
         assert EMPTY_STATS["completed"] == 0
         assert EMPTY_STATS["failed"] == 0
-        assert TaskStats()["completed"] == 0
+        assert RunStats()["completed"] == 0
 
 
 class TestTransientKindRegistry:
@@ -165,7 +165,7 @@ class TestRunSummary:
     def _summary() -> RunSummary:
         return RunSummary(
             exit_reason=ExitReason.COMPLETED,
-            stats=TaskStats(),
+            stats=RunStats(),
             run_id="run_seed.1",
             duration_seconds=1.25,
         )
@@ -185,7 +185,7 @@ class TestRunSummary:
         exc = RuntimeError("wrapper observed crash")
         summary = RunSummary(
             exit_reason=ExitReason.ERROR,
-            stats=TaskStats(),
+            stats=RunStats(),
             run_id="run_seed.2",
             duration_seconds=0.0,
             unhandled_exception=exc,

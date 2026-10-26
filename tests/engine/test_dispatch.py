@@ -38,7 +38,7 @@ from tasklite.engine.resource import (
 )
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.store import StateStore
-from tasklite.engine.types import AttemptFinish, TaskStats
+from tasklite.engine.types import AttemptFinish, RunStats
 from tasklite.models.job import Job, JobRuntimeState, RT_DISPATCH_FAILURES
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
@@ -81,7 +81,7 @@ class DispatchEnv:
     def __init__(self, tmp_path, *, capacity: float = 2.0, extra_resources=None):
         self.ipc_dir = str(tmp_path / "ipc")
         Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
-        self.output_root = str(tmp_path / "out")
+        self.output_roots = str(tmp_path / "out")
 
         resources_map = {
             "__workers__": CapacityResource("__workers__", capacity),
@@ -90,7 +90,7 @@ class DispatchEnv:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
-        self.stats = TaskStats()
+        self.stats = RunStats()
         self.hooks: list[tuple[str, AttemptFinish]] = []
         self.store = StateStore(
             self.backend,
@@ -122,7 +122,7 @@ class DispatchEnv:
             recovery=self.recovery,
             tasks=self.tasks,
             classifier=ErrorClassifier(),
-            output_root=self.output_root,
+            output_roots=self.output_roots,
             ipc_dir=self.ipc_dir,
             commit_failure_threshold=3,
         )
@@ -140,8 +140,8 @@ class DispatchEnv:
         return JobHandle(
             job_uid=uid,
             process=FakeProcess(),
-            deadline=1e18,
-            timeout=60.0,
+            timeout_at_monotonic=1e18,
+            timeout_seconds=60.0,
             job=Job(*uid.split("::", 1)),
             ipc_dir=self.ipc_dir,
             execution_id=execution_id,

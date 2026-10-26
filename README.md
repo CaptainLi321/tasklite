@@ -161,13 +161,13 @@ def download_handler(job: Job, ctx):
 pipeline = TaskLite(
     name="media_downloader",
     state_dir="./state",        # 状态持久化目录（SQLite WAL）
-    output_root="./downloads",  # 产物沙盒根目录
+    output_roots="./downloads",  # 产物沙盒根目录
     max_workers=4,              # 并发子进程数（内部 __workers__ 容量资源，可覆盖）
 )
 
 # 3. 注册全局限速（每秒最多 2 次请求）与 Task 规格
 pipeline.register_resource(RateLimitResource("api", interval_seconds=0.5))
-pipeline.register_task("download", download_handler, default_resources={"api": 1.0})
+pipeline.register_task("download", download_handler, resources={"api": 1.0})
 
 # 4. 入队并启动（阻塞直到队列全部完成，返回 RunSummary）
 pipeline.enqueue([
@@ -185,7 +185,7 @@ pipeline.run()
 
 | 层 | 定义 | 持久化 |
 |---|---|---|
-| **Task（规格）** | 进程内注册的静态模板：task_type 名、handler、默认资源、payload_schema、默认 max_retries / timeout | 代码即规格，不落盘；注册于 `register_task` |
+| **Task（规格）** | 进程内注册的静态模板：task_type 名、handler、默认资源、payload_schema、默认 max_retries / timeout_seconds | 代码即规格，不落盘；注册于 `register_task` |
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变 | queue 行 job_data JSON（uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：attempt 序号、execution_id、起止时间、结局 | append-only 新表 `attempts` |
 
@@ -225,7 +225,7 @@ register_discovery(
     id_func=item_id,
     process_item_func=process_item,
     process_task_type="download",
-    default_resources={"api": 1.0},
+    resources={"api": 1.0},
 )
 ```
 
@@ -283,7 +283,7 @@ def agent_worker(job: Job, ctx):
 
 pipeline = TaskLite(name="agent_batch", state_dir="./agent_state", max_workers=8)
 pipeline.register_resource(RateLimitResource("llm_rpm", interval_seconds=0.1))
-pipeline.register_task("analyze", agent_worker, default_resources={"llm_rpm": 1.0})
+pipeline.register_task("analyze", agent_worker, resources={"llm_rpm": 1.0})
 
 # 入队海量任务，中途即使断网或意外中断，重启后自动跳过已完成任务接续执行
 pipeline.enqueue([
@@ -316,7 +316,7 @@ def crawler_handler(job, ctx):
         resp = cached_fetch(job.payload["url"])
         return resp.json()
 
-pipeline.register_task("fetch", crawler_handler, default_resources={"api": 1.0})
+pipeline.register_task("fetch", crawler_handler, resources={"api": 1.0})
 ```
 
 ---

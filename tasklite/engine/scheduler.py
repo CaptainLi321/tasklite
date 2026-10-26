@@ -167,7 +167,7 @@ class JobScheduler:
         resources: dict[str, Resource] | ResourceManager,
         tasks: Mapping[str, object] | None = None,
         *,
-        ordering: OrderingPolicy | None = None,
+        ordering_policy: OrderingPolicy | None = None,
     ):
         if isinstance(resources, ResourceManager):
             self.resource_mgr = resources
@@ -175,7 +175,7 @@ class JobScheduler:
         else:
             self.resources = resources
             self.resource_mgr = ResourceManager(resources, tasks=tasks)
-        self.ordering: OrderingPolicy = ordering if ordering is not None else FifoOrderingPolicy()
+        self.ordering_policy: OrderingPolicy = ordering_policy if ordering_policy is not None else FifoOrderingPolicy()
         # 执行选择由 EngineRuntime 单点注入（None = 默认全执行）；本属性是
         # 内部注入面，外部不得直接赋值（须与 StateStore 的选择事实源一致）。
         self.selection: Selection | None = None
@@ -290,7 +290,7 @@ class JobScheduler:
         malformed_uids: list[str] = []
         impossible_resource_uids: list[str] = []
 
-        for i in self.ordering.visit_order(q_data):
+        for i in self.ordering_policy.visit_order(q_data):
             job_snapshot = q_data[i]
             # 捕获畸形 job dict（缺 task_type/job_id 等），记录 UID 避免整个扫描崩溃
             try:

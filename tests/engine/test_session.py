@@ -14,7 +14,7 @@ import pytest
 from hypothesis import example, given, settings, strategies as st
 
 from tasklite.engine.session import RunSession
-from tasklite.engine.types import AttemptFinish, ExitReason, StopMode, TaskStats
+from tasklite.engine.types import AttemptFinish, ExitReason, StopMode, RunStats
 
 # 抛异常钩子可用的异常类型（均为 Exception 子类，模拟不可信钩子代码）
 _HOSTILE_EXCEPTIONS = [ValueError, RuntimeError, KeyError, TypeError, IndexError]
@@ -73,7 +73,7 @@ class TestSessionLifecycle:
         assert session.run_id == "run-2"
         assert session.dispatch_no == 0
         assert session.stop_mode == StopMode.NONE
-        assert isinstance(session.stats, TaskStats)
+        assert isinstance(session.stats, RunStats)
         assert session.stats["completed"] == 0
         # begin 后 fire_run_end 重新可发（幂等标志已复位）
         fired = []

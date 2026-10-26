@@ -231,19 +231,19 @@ class TestConstruction:
 
     def test_output_root_single_created_and_resolved(self, tmp_path):
         root = tmp_path / "out"
-        p = make_pipeline(tmp_path, output_root=root)
-        assert p.output_root == root.resolve()
-        assert p.output_root.is_dir()
+        p = make_pipeline(tmp_path, output_roots=root)
+        assert p.output_roots == root.resolve()
+        assert p.output_roots.is_dir()
 
     def test_output_root_multi_root_all_created(self, tmp_path):
         roots = [tmp_path / "o1", tmp_path / "o2"]
-        p = make_pipeline(tmp_path, output_root=roots)
-        assert p.output_root == [r.resolve() for r in roots]
-        assert all(r.is_dir() for r in p.output_root)
+        p = make_pipeline(tmp_path, output_roots=roots)
+        assert p.output_roots == [r.resolve() for r in roots]
+        assert all(r.is_dir() for r in p.output_roots)
 
     def test_output_root_bad_type_rejected(self, tmp_path):
-        with pytest.raises(TypeError, match="output_root"):
-            make_pipeline(tmp_path, output_root=42)
+        with pytest.raises(TypeError, match="output_roots"):
+            make_pipeline(tmp_path, output_roots=42)
 
     def test_backend_sqlite_default_type_name(self, tmp_path):
         p = TaskLite("sp", tmp_path / "state")
@@ -308,7 +308,7 @@ class TestRegisterTask:
 
     def test_register_task_spec_instance(self, tmp_path):
         p = make_pipeline(tmp_path)
-        spec = Task("fetch", ok_handler, default_resources={"api": 1.0})
+        spec = Task("fetch", ok_handler, resources={"api": 1.0})
         p.register_task(spec)
         assert p.tasks.lookup("fetch") is spec
 
@@ -317,16 +317,16 @@ class TestRegisterTask:
         p.register_task(
             "fetch",
             ok_handler,
-            default_resources={"api": 1.0},
+            resources={"api": 1.0},
             max_retries=1,
-            timeout=30,
+            timeout_seconds=30,
             timeout_is_transient=True,
         )
         spec = p.tasks.lookup("fetch")
         assert spec.handler is ok_handler
-        assert spec.default_resources == {"api": 1.0}
+        assert spec.resources == {"api": 1.0}
         assert spec.max_retries == 1
-        assert spec.timeout == 30
+        assert spec.timeout_seconds == 30
         assert spec.timeout_is_transient is True
 
     def test_simple_form_requires_handler(self, tmp_path):
@@ -344,13 +344,13 @@ class TestRegisterTask:
         with pytest.raises(ValueError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), handler=ok_handler)
         with pytest.raises(ValueError, match="extra spec"):
-            p.register_task(Task("fetch", ok_handler), default_resources={"a": 1})
+            p.register_task(Task("fetch", ok_handler), resources={"a": 1})
         with pytest.raises(ValueError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), payload_schema=dict)
         with pytest.raises(ValueError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), max_retries=0)
         with pytest.raises(ValueError, match="extra spec"):
-            p.register_task(Task("fetch", ok_handler), timeout=60)
+            p.register_task(Task("fetch", ok_handler), timeout_seconds=60)
         with pytest.raises(ValueError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), timeout_is_transient=True)
 
@@ -524,10 +524,15 @@ class TestEnqueue:
 
     def test_intake_pipeline_injections(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.enqueue(Job("fetch", "a"))
+        p.enqueue(Job("fetch", "a", timeout_seconds=17, payload={"timeout": "业务时限"}))
         (row,) = p.backend.load_queue()
         assert row["resources"]["__workers__"] == 1.0
         assert row["first_enqueued_at"]
+        assert row["timeout"] == 17
+        assert "timeout_seconds" not in row
+        restored = Job.from_dict(row)
+        assert restored.timeout_seconds == 17
+        assert restored.payload == {"timeout": "业务时限"}
 
     def test_front_is_keyword_only(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -609,7 +614,7 @@ class TestSixStepContract:
         )
 
         p.register_resource(CapacityResource("gpu", 2.0))
-        p.register_task("fetch", ok_handler, default_resources={"gpu": 1.0})
+        p.register_task("fetch", ok_handler, resources={"gpu": 1.0})
         p.register_transient_exception(BizError)
         p.enqueue([Job("fetch", "a"), Job("fetch", "b")])
 
@@ -680,7 +685,7 @@ class TestSixStepContract:
         assert p.is_running is False
 
 
-# ── 调度接缝构造参数（ordering / requeue_policy）─────────────────────
+# ── 调度接缝构造参数（ordering_policy / requeue_policy）─────────────────────
 
 
 class TestSchedulingSeamWiring:
@@ -694,7 +699,7 @@ class TestSchedulingSeamWiring:
 
         p = make_pipeline(
             tmp_path,
-            ordering=NewestFirstPolicy(),
+            ordering_policy=NewestFirstPolicy(),
             on_attempt_finished=on_attempt_finished,
         )
         p.register_task("fetch", ok_handler)
@@ -718,8 +723,8 @@ class TestSchedulingSeamWiring:
 
         assert order == ["fetch::a", "fetch::b", "fetch::c"]
         # 默认解析收敛在 RunConfig.resolve：门面不传 → FIFO 装配件直达调度器
-        assert isinstance(p.runtime_config.ordering, FifoOrderingPolicy)
-        assert p._runtime.scheduler.ordering is p.runtime_config.ordering
+        assert isinstance(p.runtime_config.ordering_policy, FifoOrderingPolicy)
+        assert p._runtime.scheduler.ordering_policy is p.runtime_config.ordering_policy
 
     def test_requeue_policy_constructor_arg_controls_requeue_position(
         self, tmp_path, monkeypatch

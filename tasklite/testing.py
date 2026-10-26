@@ -45,7 +45,7 @@ def fake_ctx(
     cursors: dict[str, str] | None = None,
     resources: Iterable[str] | None = None,
     tmp_root: Any | None = None,
-    output_root: Any | None = None,
+    output_roots: Any | None = None,
     ipc_dir: str | None = None,
     fatal_exceptions: tuple[type, ...] | None = None,
     transient_exceptions: tuple[type, ...] | None = None,
@@ -61,12 +61,12 @@ def fake_ctx(
         resources: 已注册资源名集合——``ctx.suspend_resource`` 按名单
             fail-loud 校验（与生产派发路径同语义）；缺省为空集，suspend
             一律拒绝（测试挂起语义必须显式传名单）。
-        tmp_root: 提供时在其下创建一次性临时目录作为 ``output_root``，
+        tmp_root: 提供时在其下创建一次性临时目录作为 ``output_roots``，
             并建 ``ipc`` 子目录（declare_output/declare_cache 的产物
-            清单记录随之可用）。路径经 ``ctx.output_root`` / ``ctx.ipc_dir``
+            清单记录随之可用）。路径经 ``ctx.output_roots`` / ``ctx.ipc_dir``
             读取；目录清理由调用方的 tmp_root 机制（如 pytest tmp_path
             的会话级回收）统一承担。
-        output_root: 直接指定产物根目录（与 tmp_root 互斥使用）。
+        output_roots: 直接指定产物根目录（与 tmp_root 互斥使用）。
         ipc_dir: 直接指定 IPC 目录（caller 选定目录，非 tmp_root 子目录）。
         fatal_exceptions / transient_exceptions: 异常分类声明元组
             （worker 侧 classify 接缝直测用）。
@@ -77,7 +77,7 @@ def fake_ctx(
     """
     if tmp_root is not None:
         base = Path(tempfile.mkdtemp(dir=str(tmp_root)))
-        output_root = base
+        output_roots = base
         if ipc_dir is None:
             ipc_dir = str(base / "ipc")
             Path(ipc_dir).mkdir(parents=True, exist_ok=True)
@@ -88,7 +88,7 @@ def fake_ctx(
         set(wall) if wall is not None else set(),
         set(failed) if failed is not None else set(),
         dict(cursors) if cursors is not None else {},
-        output_root=Path(output_root) if isinstance(output_root, str) else output_root,
+        output_roots=Path(output_roots) if isinstance(output_roots, str) else output_roots,
         ipc_dir=ipc_dir,
         transient_registry=transient_registry,
         fatal_exceptions=fatal_exceptions,

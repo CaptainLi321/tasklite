@@ -239,7 +239,7 @@ def make_pipeline(tmp_path, name="test_pipeline",
     """
     return TaskLite(
         name=name, state_dir=tmp_path / "state", backend="sqlite",
-        output_root=tmp_path / "output",
+        output_roots=tmp_path / "output",
         on_run_start=on_run_start, on_run_end=on_run_end,
         on_attempt_finished=on_attempt_finished,
     )

@@ -421,7 +421,7 @@ class ResourceManager(MutableMapping[str, Resource]):
         self._resources: dict[str, Resource] = (
             dict(resources) if resources is not None else {}
         )
-        # task_type → Task 规格映射（duck-typing 读 default_resources；
+        # task_type → Task 规格映射（duck-typing 读 resources；
         # 规格校验单点在 models/task.py 的 Task 构造期）
         self.tasks: Mapping[str, Any] = tasks if tasks is not None else {}
 
@@ -457,7 +457,7 @@ class ResourceManager(MutableMapping[str, Resource]):
             base = dict(declared_resources)
         task = self.tasks.get(task_type)
         defaults = (
-            getattr(task, "default_resources", None) if task is not None else None
+            getattr(task, "resources", None) if task is not None else None
         )
         if not defaults:
             return base

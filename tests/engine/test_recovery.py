@@ -895,7 +895,7 @@ class TestAbortInFlight:
         process = _DoneProcess()
         handle = JobHandle(
             job_uid=job.uid, process=process,
-            deadline=time.monotonic() + 60, timeout=60.0, job=job,
+            timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
             ipc_dir=str(tmp_path), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
@@ -916,7 +916,7 @@ class TestAbortInFlight:
         process = _FinishOnKillProcess(channel, job.uid, _INCARNATION)
         handle = JobHandle(
             job_uid=job.uid, process=process,
-            deadline=time.monotonic() + 60, timeout=60.0, job=job,
+            timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
             ipc_dir=str(tmp_path), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
@@ -941,7 +941,7 @@ class TestAbortInFlight:
         process = _DoneProcess()
         handle = JobHandle(
             job_uid=job.uid, process=process,
-            deadline=time.monotonic() + 60, timeout=60.0, job=job,
+            timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
             ipc_dir=str(tmp_path), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
@@ -990,7 +990,7 @@ class TestAbortInFlight:
         process = _DoneProcess()
         handle = JobHandle(
             job_uid=job.uid, process=process,
-            deadline=time.monotonic() + 60, timeout=60.0, job=job,
+            timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
             ipc_dir=str(tmp_path), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight

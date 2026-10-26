@@ -1,7 +1,7 @@
 """v2 测试辅助工具回归（fake_ctx / running）。
 
 契约：wall/failed/cursors 的内部容器结构由构造器兜底装配（调用方传
-任意可迭代/映射即可）；tmp_root 模式提供沙盒 output_root 与可记录的
+任意可迭代/映射即可）；tmp_root 模式提供沙盒 output_roots 与可记录的
 ipc 目录；resources 名单启用 suspend_resource 的 fail-loud 校验；
 running 句柄保证 run 期旗子复位（漏复位污染同会话后续用例）。
 """
@@ -52,7 +52,7 @@ def _make_runtime(tmp_path) -> EngineRuntime:
             governor=DeadlockGovernor(),
             rerun_policy=RerunPolicy(),
             requeue_policy=ImmediateRequeuePolicy(),
-            output_root=tmp_path,
+            output_roots=tmp_path,
         )
     )
 
@@ -89,24 +89,24 @@ class TestFakeCtxBasics:
 
 
 class TestFakeCtxTmpRoot:
-    """tmp_root 模式：沙盒 output_root + 可记录 ipc 目录。"""
+    """tmp_root 模式：沙盒 output_roots + 可记录 ipc 目录。"""
 
     def test_output_root_and_ipc_under_tmp_root(self, tmp_path):
         ctx = fake_ctx(_job(), tmp_root=tmp_path)
-        assert Path(ctx.output_root).parent == tmp_path
-        assert Path(ctx.ipc_dir).parent == Path(ctx.output_root)
+        assert Path(ctx.output_roots).parent == tmp_path
+        assert Path(ctx.ipc_dir).parent == Path(ctx.output_roots)
         assert Path(ctx.ipc_dir).is_dir()
 
     def test_declare_output_resolved_inside_sandbox(self, tmp_path):
         ctx = fake_ctx(_job(), tmp_root=tmp_path)
         final = ctx.declare_output("out.json")
         assert str(tmp_path) in str(final)
-        assert final.startswith(str(ctx.output_root))
+        assert final.startswith(str(ctx.output_roots))
 
     def test_two_ctxs_get_isolated_dirs(self, tmp_path):
         ctx1 = fake_ctx(_job(), tmp_root=tmp_path)
         ctx2 = fake_ctx(_job(), tmp_root=tmp_path)
-        assert Path(ctx1.output_root) != Path(ctx2.output_root)
+        assert Path(ctx1.output_roots) != Path(ctx2.output_roots)
 
 
 class TestFakeCtxSuspendGuard:
@@ -151,8 +151,8 @@ class TestFakeCtxExtendedParams:
 
     def test_direct_output_root_forwarded(self, tmp_path):
         root = tmp_path / "root"
-        ctx = fake_ctx(_job(), output_root=str(root))
-        assert str(ctx.output_root) == str(root)
+        ctx = fake_ctx(_job(), output_roots=str(root))
+        assert str(ctx.output_roots) == str(root)
 
     def test_tmp_root_with_explicit_ipc_dir_keeps_ipc(self, tmp_path):
         ipc = str(tmp_path / "custom_ipc")

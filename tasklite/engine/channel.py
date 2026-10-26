@@ -395,7 +395,7 @@ class WorkerLaunchSpec:
     job_context: JobContext
     execution_id: str
     ipc_dir: str
-    timeout: float
+    timeout_seconds: float
     result_token: str | None = None
 
 
@@ -488,12 +488,12 @@ class ExecutionChannel:
             if p is not None:
                 self._finalize_process(p)
             raise
-        deadline = time.monotonic() + spec.timeout
+        timeout_at_monotonic = time.monotonic() + spec.timeout_seconds
         return JobHandle(
             job_uid=spec.job.uid,
             process=p,
-            deadline=deadline,
-            timeout=spec.timeout,
+            timeout_at_monotonic=timeout_at_monotonic,
+            timeout_seconds=spec.timeout_seconds,
             job=spec.job,
             ipc_dir=effective_ipc_dir,
             execution_id=spec.execution_id,
@@ -595,7 +595,7 @@ class ExecutionChannel:
                 completed.append((handle, self._collect_outcome(handle, res)))
                 continue
 
-            if now > handle.deadline:
+            if now > handle.timeout_at_monotonic:
                 p.join(timeout=0.5)
                 if p.is_alive():
                     try:
@@ -606,7 +606,7 @@ class ExecutionChannel:
                 else:
                     # join 窗口内已自然退出：死亡归因全权交 exitcode 分簇
                     # （0 → NO_IPC_RESULT 瞬态、<0 信号、>0 正码崩溃），与
-                    # deadline 前同因事件同果，不折入 TIMEOUT；仅 kill 后
+                    # timeout_at_monotonic 前同因事件同果，不折入 TIMEOUT；仅 kill 后
                     # 仍存活/被击杀的执行体才归 TIMEOUT。
                     is_timeout = False
                 res = self._read_if_exists(res_path)
@@ -663,7 +663,7 @@ class ExecutionChannel:
         att = _DEFAULT_CLASSIFIER.classify_process_death(
             p.exitcode,
             timed_out=is_timeout,
-            timeout_seconds=handle.timeout,
+            timeout_seconds=handle.timeout_seconds,
             timeout_is_transient=getattr(handle.job, "timeout_is_transient", False),
         )
         if att.retry_requested and "signal" in att.result_meta:

@@ -613,7 +613,7 @@ class TestEffectiveResources:
             "train": Task(
                 task_type="train",
                 handler=_ok_handler,
-                default_resources={"gpu": 1.0, "ram": 4.0},
+                resources={"gpu": 1.0, "ram": 4.0},
             )
         }
         mgr = ResourceManager(tasks=tasks)

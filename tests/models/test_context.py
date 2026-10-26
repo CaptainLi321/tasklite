@@ -25,7 +25,7 @@ def _make_ctx(
     failed: set[str] | None = None,
     cursors: dict[str, str] | None = None,
     resources: frozenset | None = None,
-    output_root: Path | None = None,
+    output_roots: Path | None = None,
     ipc_dir: str | None = None,
 ) -> JobContext:
     """构造测试用 JobContext（内部容器由本工厂兜底装配）。"""
@@ -34,7 +34,7 @@ def _make_ctx(
         wall if wall is not None else set(),
         failed if failed is not None else set(),
         cursors if cursors is not None else {},
-        output_root=output_root,
+        output_roots=output_roots,
         ipc_dir=ipc_dir,
         resource_names=resources,
     )
@@ -124,7 +124,7 @@ class TestDeclareOutputSandbox:
     def test_resolves_within_root_and_creates_parents(self, tmp_path):
         root = tmp_path / "out"
         root.mkdir()
-        ctx = _make_ctx(output_root=root, ipc_dir=str(tmp_path / "ipc"))
+        ctx = _make_ctx(output_roots=root, ipc_dir=str(tmp_path / "ipc"))
         final = ctx.declare_output("sub/dir/out.json")
         assert final.startswith(str(root))
         assert Path(final).parent.is_dir()  # 父目录自动创建
@@ -135,7 +135,7 @@ class TestDeclareOutputSandbox:
         root = tmp_path / "out"
         root.mkdir()
         ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_root=root, ipc_dir=ipc)
+        ctx = _make_ctx(output_roots=root, ipc_dir=ipc)
         keep = ctx.declare_output("keep.bin", cleanup_on_fail=False)
         drop = ctx.declare_output("drop.bin")
         recorded = {p: (c, k) for p, c, k in ArtifactJournal(ipc).read_outputs("fetch::j1")}
@@ -145,24 +145,24 @@ class TestDeclareOutputSandbox:
     def test_cleanup_flag_is_keyword_only(self, tmp_path):
         root = tmp_path / "out"
         root.mkdir()
-        ctx = _make_ctx(output_root=root)
+        ctx = _make_ctx(output_roots=root)
         with pytest.raises(TypeError, match="positional argument"):
             ctx.declare_output("a.bin", False)  # type: ignore[misc]
 
     def test_path_traversal_rejected(self, tmp_path):
         root = tmp_path / "out"
         root.mkdir()
-        ctx = _make_ctx(output_root=root)
+        ctx = _make_ctx(output_roots=root)
         (tmp_path / "secret.txt").write_text("secret")
-        with pytest.raises(ValueError, match="resolves outside output_root"):
+        with pytest.raises(ValueError, match="resolves outside output_roots"):
             ctx.declare_output("../secret.txt")
-        with pytest.raises(ValueError, match="resolves outside output_root"):
+        with pytest.raises(ValueError, match="resolves outside output_roots"):
             ctx.declare_output(str(tmp_path / "elsewhere" / "f.bin"))
 
     def test_absolute_within_root_accepted(self, tmp_path):
         root = tmp_path / "out"
         root.mkdir()
-        ctx = _make_ctx(output_root=root)
+        ctx = _make_ctx(output_roots=root)
         final = ctx.declare_output(str(root / "abs.json"))
         assert final == str((root / "abs.json").resolve())
 
@@ -172,10 +172,10 @@ class TestDeclareOutputSandbox:
         root.mkdir()
         elsewhere = tmp_path / "other_root"
         elsewhere.mkdir()
-        ctx = _make_ctx(output_root=root)
+        ctx = _make_ctx(output_roots=root)
         final = ctx.declare_output(str(elsewhere / "cross.bin"), sandbox=False)
         assert final.startswith(str(elsewhere))
-        with pytest.raises(ValueError, match="resolves outside output_root"):
+        with pytest.raises(ValueError, match="resolves outside output_roots"):
             ctx.declare_output(str(elsewhere / "cross2.bin"))
 
     def test_no_output_root_allows_any(self, tmp_path):
@@ -186,19 +186,19 @@ class TestDeclareOutputSandbox:
     def test_null_byte_rejected(self, tmp_path):
         root = tmp_path / "out"
         root.mkdir()
-        ctx = _make_ctx(output_root=root)
+        ctx = _make_ctx(output_roots=root)
         with pytest.raises(ValueError, match="null byte"):
             ctx.declare_output("bad\x00name")
 
     def test_relative_path_relocated_to_root_not_cwd(self, tmp_path, monkeypatch):
-        """相对路径按 output_root 重定位（而非进程 CWD），写入与校验位置
+        """相对路径按 output_roots 重定位（而非进程 CWD），写入与校验位置
         一致。"""
         root = tmp_path / "out"
         root.mkdir()
         other_cwd = tmp_path / "cwd"
         other_cwd.mkdir()
         monkeypatch.chdir(other_cwd)
-        ctx = _make_ctx(output_root=root)
+        ctx = _make_ctx(output_roots=root)
         final = ctx.declare_output("rel.json")
         assert final.startswith(str(root))
         assert not (other_cwd / "rel.json").exists()
@@ -222,7 +222,7 @@ class TestMultiRootSandbox:
         outside = tmp_path / "outside"
         root_a.mkdir()
         outside.mkdir()
-        with pytest.raises(ValueError, match="resolves outside output_root"):
+        with pytest.raises(ValueError, match="resolves outside output_roots"):
             ArtifactJournal.resolve_and_validate_path(
                 str(outside / "f.bin"), [root_a], sandbox=True
             )
@@ -244,13 +244,13 @@ class TestDeclareCache:
     def test_cache_resolves_within_root(self, tmp_path):
         root = tmp_path / "out"
         root.mkdir()
-        ctx = _make_ctx(output_root=root, ipc_dir=str(tmp_path / "ipc"))
+        ctx = _make_ctx(output_roots=root, ipc_dir=str(tmp_path / "ipc"))
         final = ctx.declare_cache("./v.mp4.part")
         assert final.startswith(str(root))
 
     def test_cache_kind_persisted_with_cleanup_true(self, tmp_path):
         ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_root=tmp_path, ipc_dir=ipc)
+        ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
         final = ctx.declare_cache("part.bin")
         assert ArtifactJournal(ipc).read_outputs("fetch::j1") == [(final, True, "cache")]
 
@@ -259,8 +259,8 @@ class TestDeclareCache:
         elsewhere = tmp_path / "other"
         root.mkdir()
         elsewhere.mkdir()
-        ctx = _make_ctx(output_root=root)
-        with pytest.raises(ValueError, match="resolves outside output_root"):
+        ctx = _make_ctx(output_roots=root)
+        with pytest.raises(ValueError, match="resolves outside output_roots"):
             ctx.declare_cache(str(elsewhere / "c.part"))
 
     def test_cache_sandbox_false_exempts(self, tmp_path):
@@ -268,7 +268,7 @@ class TestDeclareCache:
         elsewhere = tmp_path / "other"
         root.mkdir()
         elsewhere.mkdir()
-        ctx = _make_ctx(output_root=root)
+        ctx = _make_ctx(output_roots=root)
         final = ctx.declare_cache(str(elsewhere / "c.part"), sandbox=False)
         assert final.startswith(str(elsewhere))
 
@@ -281,7 +281,7 @@ class TestDeclareInput:
         src.write_bytes(b"payload")
         st = src.stat()
         ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_root=tmp_path, ipc_dir=ipc)
+        ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
         resolved = ctx.declare_input(src)
         assert resolved == str(src.resolve())
         entries = ArtifactJournal(ipc).read_inputs("fetch::j1")
@@ -296,7 +296,7 @@ class TestDeclareInput:
         (tmp_path / "rel.txt").write_text("x")
         monkeypatch.chdir(tmp_path)
         ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_root=tmp_path / "out", ipc_dir=ipc)
+        ctx = _make_ctx(output_roots=tmp_path / "out", ipc_dir=ipc)
         resolved = ctx.declare_input("rel.txt")
         assert resolved == str((tmp_path / "rel.txt").resolve())
 
@@ -304,7 +304,7 @@ class TestDeclareInput:
         """stat 失败记录 path 但不带指纹（on_input_change 比对时视为变化
         → 重跑，避免误跳过）。"""
         ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_root=tmp_path, ipc_dir=ipc)
+        ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
         resolved = ctx.declare_input(tmp_path / "ghost.bin")
         entries = ArtifactJournal(ipc).read_inputs("fetch::j1")
         assert entries == [{"path": resolved, "kind": "file"}]
@@ -337,7 +337,7 @@ class TestDeclareInput:
 
     def test_no_ipc_dir_declarations_are_noops(self):
         """ipc_dir=None：声明调用不落盘也不报错（无清单场景）。"""
-        ctx = _make_ctx(output_root=None, ipc_dir=None)
+        ctx = _make_ctx(output_roots=None, ipc_dir=None)
         ctx.declare_output("a.bin")
         ctx.declare_cache("b.part")
         ctx.declare_input("c.txt")

@@ -9,7 +9,7 @@ resources、payload_schema 与默认重试/超时策略。代码即规格，不�
 activation_no / first_enqueued_at）只属于单次激活，不出现在 Task。
 
 本模块同时承载模型层共享的校验单点（``validate_task_type`` /
-``validate_retry_budget`` / ``validate_timeout`` / ``validate_timeout_flag``
+``validate_retry_budget`` / ``validate_timeout_seconds`` / ``validate_timeout_flag``
 / ``validate_resource_amounts``）：Task 的规格字段与 Job 的同名字段共用
 同一套拒绝规则与报错文案，单点维护防止两侧语义漂移。
 """
@@ -122,20 +122,20 @@ def validate_retry_budget(max_retries: Any) -> None:
         raise ValueError(f"max_retries must be >= 0, got {max_retries}")
 
 
-def validate_timeout(timeout: Any) -> None:
-    """timeout 入口校验：有限正数（Task/Job 共用）。
+def validate_timeout_seconds(timeout_seconds: Any) -> None:
+    """timeout_seconds 入口校验：有限正数（Task/Job 共用）。
 
-    NaN 使 ``timeout <= 0`` 校验恒 False 而漏过（NaN <= 0 为 False），
+    NaN 使 ``timeout_seconds <= 0`` 校验恒 False 而漏过（NaN <= 0 为 False），
     deadline = monotonic + NaN = NaN，``now > NaN`` 恒 False → 看门狗
     永不触发，挂死 job 永不 kill——NaN/Inf 一律拒绝。bool 是 int 子类，
-    同样拒绝（timeout=True 被接受为 1 秒）。
+    同样拒绝（timeout_seconds=True 被接受为 1 秒）。
     """
-    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+    if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool):
         raise TypeError(
-            f"timeout must be a number, got {type(timeout).__name__} ({timeout!r})"
+            f"timeout_seconds must be a number, got {type(timeout_seconds).__name__} ({timeout_seconds!r})"
         )
-    if not _is_finite(timeout) or timeout <= 0:
-        raise ValueError(f"timeout must be finite and > 0, got {timeout}")
+    if not _is_finite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError(f"timeout_seconds must be finite and > 0, got {timeout_seconds}")
 
 
 def validate_timeout_flag(timeout_is_transient: Any) -> None:
@@ -162,13 +162,13 @@ class Task:
             None/True 表示成功，False 表示失败，dict 作为成功元数据，
             tuple[bool, dict] 组合形式；抛 RetryError 推回队列重试，抛
             FatalError 直接进失败档案（不消耗重试预算）。
-        default_resources: 该类任务的默认资源占用映射；Job 构造时可用
+        resources: 该类任务的默认资源占用映射；Job 构造时可用
             ``resources`` 覆盖。构造后浅拷贝隔离外部就地变异。
         payload_schema: 可选 TypedDict 类，派发前对 payload 做运行时
             校验，校验失败直接进失败档案。
         max_retries: 默认重试预算上限（对齐 v2 Job 默认 3）；允许执行
             条件为 ``attempt_no <= max_retries + 1``。
-        timeout: 默认执行超时秒数（对齐 v2 Job 默认 3600），有限正数。
+        timeout_seconds: 默认执行超时秒数（对齐 v2 Job 默认 3600），有限正数。
         timeout_is_transient: 超时是否视为瞬态失败（默认 False 保持保守
             语义）。True 时看门狗超时按重试处理而非直接进失败档案，
             适用于设计上可能长跑的任务——「超时」的语义是「没跑完」，
@@ -177,12 +177,12 @@ class Task:
 
     task_type: str
     handler: Callable[..., Any]
-    default_resources: dict[str, float] | None = None
+    resources: dict[str, float] | None = None
     payload_schema: type | None = None
     max_retries: int = 3
-    timeout: int | float = 3600
+    timeout_seconds: int | float = 3600
     # kw-only：规格位尾部布尔以显式关键字表达，位置传参在构造点静默
-    # 漂移（如误占 timeout 位）由签名直接拒绝
+    # 漂移（如误占 timeout_seconds 位）由签名直接拒绝
     timeout_is_transient: bool = field(kw_only=True, default=False)
 
     def __post_init__(self) -> None:
@@ -190,16 +190,16 @@ class Task:
         _validate_handler(self.handler)
         _validate_payload_schema(self.payload_schema)
         validate_retry_budget(self.max_retries)
-        validate_timeout(self.timeout)
+        validate_timeout_seconds(self.timeout_seconds)
         validate_timeout_flag(self.timeout_is_transient)
-        resources_raw = self.default_resources if self.default_resources is not None else {}
+        resources_raw = self.resources if self.resources is not None else {}
         # 容器类型与 amount 校验须先于拷贝——str/序列等可迭代类型会在
         # dict() 拷贝处抛不可读的原始 ValueError
-        validate_resource_amounts(resources_raw, "default_resources")
+        validate_resource_amounts(resources_raw, "resources")
         resources = dict(resources_raw) if resources_raw else {}
         # frozen 实例的字段规范化须经 object.__setattr__；浅拷贝隔离外部
         # 就地变异（规格不可变，默认资源账目不得被注册方漂移）
-        object.__setattr__(self, "default_resources", resources)
+        object.__setattr__(self, "resources", resources)
 
 
 class TaskRegistry:
@@ -263,6 +263,6 @@ __all__ = [
     "validate_resource_amounts",
     "validate_retry_budget",
     "validate_task_type",
-    "validate_timeout",
+    "validate_timeout_seconds",
     "validate_timeout_flag",
 ]

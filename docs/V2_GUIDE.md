@@ -39,7 +39,7 @@ from tasklite import (
 
 | 层 | 定义 | 持久化 |
 |---|---|---|
-| **Task（规格）** | 进程内注册的静态模板：`task_type` 名、handler、`default_resources`、`payload_schema`、默认 `max_retries` / `timeout` / `timeout_is_transient` | 代码即规格，不落盘；注册于 `register_task`（落点 `TaskRegistry`） |
+| **Task（规格）** | 进程内注册的静态模板：`task_type` 名、handler、`resources`、`payload_schema`、默认 `max_retries` / `timeout_seconds` / `timeout_is_transient` | 代码即规格，不落盘；注册于 `register_task`（落点 `TaskRegistry`） |
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变（queue/wall/failed 三表 PK 与六集合互斥均以 uid 为身份） | queue 行 job_data JSON（uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：序号、`execution_id`、起止时间、`outcome` | **append-only** 新表 `attempts` |
 
@@ -55,14 +55,14 @@ from tasklite import Task
 task = Task(
     "download",                                   # task_type（非空 str，不含 "::"）
     download_handler,                             # handler，签名 handler(job, ctx)
-    default_resources={"api": 1.0},               # 该类任务默认资源占用
+    resources={"api": 1.0},                       # 该类任务默认资源占用
     payload_schema=DownloadPayload,               # 可选 TypedDict，派发前运行时校验
     max_retries=3,                                # 默认重试预算
-    timeout=3600,                                 # 默认执行超时秒
+    timeout_seconds=3600,                         # 默认执行超时秒
     timeout_is_transient=False,                   # 超时是否按瞬态失败重试
 )
 pipeline.register_task(task)        # 规格式：Task 实例原样注册，旁置参数一律拒绝
-pipeline.register_task("download", download_handler, default_resources={"api": 1.0})  # 简式
+pipeline.register_task("download", download_handler, resources={"api": 1.0})  # 简式
 ```
 
 `TaskRegistry` 契约：task_type 一对一；重复注册显式 `ValueError`（静默覆盖会让已入队 Job 挂到新 handler 上），未注册 lookup 显式 `KeyError`。
@@ -71,7 +71,7 @@ pipeline.register_task("download", download_handler, default_resources={"api": 1
 
 Job 的字段按「规格位 / 实例位」归位：
 
-- **规格位**（可覆盖 Task 默认）：`task_type` / `job_id` / `payload` / `resources` / `depends_on` / `max_retries` / `timeout` / `timeout_is_transient` / `rerun`；
+- **规格位**（可覆盖 Task 默认）：`task_type` / `job_id` / `payload` / `resources` / `depends_on` / `max_retries` / `timeout_seconds` / `timeout_is_transient` / `rerun`；
 - **实例位**（框架运行期管理）：
   - `attempt_no`——本次激活内尝试序号，**1 起始含首次执行**；预算判定：允许执行条件 `attempt_no <= max_retries + 1`；
   - `activation_no`——激活代，每次从 wall/failed 拦截点放行重跑时 +1（初激活为 1）；
@@ -160,7 +160,7 @@ def download_handler(job, ctx):
 pipeline = TaskLite(
     name="media",
     state_dir="./state",           # 持久化目录（SQLite WAL）
-    output_root="./downloads",     # 产物沙盒根（单根或多根序列）
+    output_roots="./downloads",     # 产物沙盒根（单根或多根序列）
     max_workers=4,                 # 并发子进程数（内部 __workers__ 容量资源，可覆盖）
 )
 
@@ -168,7 +168,7 @@ pipeline = TaskLite(
 pipeline.register_resource(RateLimitResource("api", interval_seconds=0.5))
 
 # 3. 注册 Task 规格与瞬态异常
-pipeline.register_task("download", download_handler, default_resources={"api": 1.0})
+pipeline.register_task("download", download_handler, resources={"api": 1.0})
 pipeline.register_transient_exception(MyTransientNetError)   # 可选：业务自有瞬态异常自动重试
 
 # 4. 入队（重复 uid 静默跳过；first_enqueued_at 在此填充）
@@ -242,7 +242,7 @@ pipeline.retry_failure("download::img_001")
 
 ### OrderingPolicy：队列访问序
 
-`scan_next_runnable`（`tasklite/engine/scheduler.py`）是**唯一选择点**：调度器按 OrderingPolicy 给出的下标序逐条评估队列、首个可运行者处停止（首中即停）。默认实现 `FifoOrderingPolicy`（按 seq 升序）。自定义策略经门面构造参数 `ordering` 注入（None → FIFO，默认解析收敛在 `RunConfig.resolve` 唯一解析点）：
+`scan_next_runnable`（`tasklite/engine/scheduler.py`）是**唯一选择点**：调度器按 OrderingPolicy 给出的下标序逐条评估队列、首个可运行者处停止（首中即停）。默认实现 `FifoOrderingPolicy`（按 seq 升序）。自定义策略经门面构造参数 `ordering_policy` 注入（None → FIFO，默认解析收敛在 `RunConfig.resolve` 唯一解析点）：
 
 ```python
 from collections.abc import Iterable, Sequence
@@ -257,7 +257,7 @@ class NewestFirstPolicy(OrderingPolicy):
         return range(len(queue) - 1, -1, -1)
 
 
-pipeline = TaskLite(name="media", state_dir="./state", ordering=NewestFirstPolicy())
+pipeline = TaskLite(name="media", state_dir="./state", ordering_policy=NewestFirstPolicy())
 ```
 
 ### RequeuePolicy：重试节奏唯一出口

@@ -82,7 +82,7 @@ class TestArtifactJournalPathAndSandbox:
         root = tmp_path / "outputs"
         root.mkdir()
         outside = tmp_path / "outside.txt"
-        with pytest.raises(ValueError, match="outside output_root"):
+        with pytest.raises(ValueError, match="outside output_roots"):
             ArtifactJournal.resolve_and_validate_path(str(outside), root, sandbox=True)
 
     def test_sandbox_bypass(self, tmp_path):

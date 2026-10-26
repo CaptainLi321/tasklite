@@ -7,11 +7,11 @@ A robust, embedded Python task orchestration engine featuring subprocess isolati
 ### Core Domain
 
 **Task**:
-The static specification template registered in-process: `task_type` name, handler, `default_resources`, `payload_schema`, default `max_retries` / `timeout` / `timeout_is_transient`. Code-is-spec, never persisted; registered via `register_task` into a `TaskRegistry`.
+The static specification template registered in-process: `task_type` name, handler, `resources`, `payload_schema`, default `max_retries` / `timeout_seconds` / `timeout_is_transient`. Code-is-spec, never persisted; registered via `register_task` into a `TaskRegistry`.
 _Avoid_: Handler, JobTemplate, WorkType, Step
 
 **Job**:
-The logical instance of one bounded activation, uniquely identified by `uid = f"{task_type}::{job_id}"` with associated payload, dependencies, and resource requirements. Specification slots (payload/resources/depends_on/max_retries/timeout/rerun) override Task defaults; instance slots are framework-managed: `attempt_no` (1-based try number within the activation; execution allowed while `attempt_no <= max_retries + 1`), `activation_no` (generation counter, +1 on each rerun released from a wall/failed interception), `first_enqueued_at` (UTC ISO of first enqueue, never refreshed on retry).
+The logical instance of one bounded activation, uniquely identified by `uid = f"{task_type}::{job_id}"` with associated payload, dependencies, and resource requirements. Specification slots (payload/resources/depends_on/max_retries/timeout_seconds/rerun) override Task defaults; instance slots are framework-managed: `attempt_no` (1-based try number within the activation; execution allowed while `attempt_no <= max_retries + 1`), `activation_no` (generation counter, +1 on each rerun released from a wall/failed interception), `first_enqueued_at` (UTC ISO of first enqueue, never refreshed on retry).
 _Avoid_: Message, Item, Record, Execution
 
 **Attempt**:
@@ -63,7 +63,7 @@ The reversible `%XX` percent-encoding family (`encode_identifier` / `encode_job_
 _Avoid_: Sanitizer, Slugger, Escaper, sanitize_*
 
 **OrderingPolicy**:
-The queue visit-order seam: `scan_next_runnable` is the single selection point; default `FifoOrderingPolicy` (by seq). Custom policies inject via the `ordering` facade parameter — the core contains no scheduling arithmetic.
+The queue visit-order seam: `scan_next_runnable` is the single selection point; default `FifoOrderingPolicy` (by seq). Custom policies inject via the `ordering_policy` facade parameter — the core contains no scheduling arithmetic.
 _Avoid_: SortStrategy, PriorityScheme
 
 **RequeuePolicy**:
@@ -96,7 +96,7 @@ Runtime tracked context for a job dispatched to an active subprocess before comp
 _Avoid_: RunningTask, ActiveProcess, WorkerHandle
 
 **WorkerLaunchSpec**:
-The frozen named contract crossing the process seam, carrying the full spawn payload (handler, job, execution context, execution_id, ipc_dir, timeout) for worker subprocess launch; execution_id belongs to the spec, not to JobContext.
+The frozen named contract crossing the process seam, carrying the full spawn payload (handler, job, execution context, execution_id, ipc_dir, timeout_seconds) for worker subprocess launch; execution_id belongs to the spec, not to JobContext.
 _Avoid_: SpawnArgs, ProcessPayload
 
 **JobContext**:

@@ -55,7 +55,7 @@ class ExitReason(str, enum.Enum):
     ERROR = "error"
 
 
-class TaskStats(dict):
+class RunStats(dict):
     """运行统计字典（键集即公开监控面，读写一律下标风格）。"""
 
     def __init__(self) -> None:
@@ -81,7 +81,7 @@ class AttemptFinish:
 class JobHandle:
     """一个在途子进程的句柄（在飞追踪与收割看门狗共用的值对象）。
 
-    ``deadline``（monotonic 时刻）与 ``timeout`` 驱动看门狗超时判定；
+    ``timeout_at_monotonic``（monotonic 时刻）与 ``timeout_seconds`` 驱动看门狗超时判定；
     ``execution_id``（``run_id.dispatch_no``）是本次执行体的身份串，
     结果认证与锁归属都锚定它。进程对象本身以 ``Any`` 承载——进程 seam
     的具体形态由执行通道装配，本值对象不绑定。
@@ -89,8 +89,8 @@ class JobHandle:
 
     job_uid: str
     process: Any
-    deadline: float
-    timeout: float
+    timeout_at_monotonic: float
+    timeout_seconds: float
     job: Job
     ipc_dir: str
     execution_id: str | None = None
@@ -130,7 +130,7 @@ class RunSummary:
     """
 
     exit_reason: ExitReason
-    stats: TaskStats
+    stats: RunStats
     run_id: str
     duration_seconds: float
     unhandled_exception: BaseException | None = None
@@ -142,7 +142,7 @@ __all__ = [
     "AttemptFinish",
     "StopMode",
     "ExitReason",
-    "TaskStats",
+    "RunStats",
     "ExecutionOptions",
     "JobHandle",
     "StepOutcome",

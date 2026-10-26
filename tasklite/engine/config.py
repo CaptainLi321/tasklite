@@ -31,7 +31,7 @@ if TYPE_CHECKING:  # 仅静态分析导入，避免运行时环形导入
 @dataclass(frozen=True)
 class Tuning:
     """三参数调优标量的已解析形态（governor 构造等前置场景使用）。"""
-    dep_grace_seconds: float
+    dependency_grace_seconds: float
     commit_failure_threshold: int
     deadlock_gap_max_rounds: int
 
@@ -55,41 +55,41 @@ def _positive_int_rounds(value: int | None, default: int, name: str) -> int:
 
 def resolve_tuning(
     *,
-    dep_grace_seconds: float | None = None,
+    dependency_grace_seconds: float | None = None,
     commit_failure_threshold: int | None = None,
     deadlock_gap_max_rounds: int | None = None,
 ) -> Tuning:
     """调优标量规范化（与 RunConfig.resolve 共用同一真相源）。
 
-    合法性域：dep_grace_seconds 有限正实数（仅 int/float，bool/str 等
+    合法性域：dependency_grace_seconds 有限正实数（仅 int/float，bool/str 等
     非数值类型 TypeError；0/负 → 依赖宽限立即判死；NaN 比较恒 False /
     inf → 宽限永不裁决活锁）；两个轮次阈值为正整数（仅真 int——bool、
     浮点与数字字符串一律 TypeError：浮点截断（如 1.9 → 1）会静默落入
     「零恢复窗口」致命域，字符串强转则让类型漂移无告警穿透）。
     """
-    if dep_grace_seconds is None:
+    if dependency_grace_seconds is None:
         grace = DEP_GRACE_SECONDS
     else:
-        if isinstance(dep_grace_seconds, bool) or not isinstance(
-            dep_grace_seconds, (int, float)
+        if isinstance(dependency_grace_seconds, bool) or not isinstance(
+            dependency_grace_seconds, (int, float)
         ):
             raise TypeError(
-                f"dep_grace_seconds must be a real number, got "
-                f"{type(dep_grace_seconds).__name__} ({dep_grace_seconds!r})"
+                f"dependency_grace_seconds must be a real number, got "
+                f"{type(dependency_grace_seconds).__name__} ({dependency_grace_seconds!r})"
             )
         # 超大 int 转 float 溢出抛 OverflowError（ArithmeticError 子类），
         # 收敛为 ValueError 与其余非法值同路 fail-loud
         try:
-            grace = float(dep_grace_seconds)
+            grace = float(dependency_grace_seconds)
         except OverflowError:
             raise ValueError(
-                f"dep_grace_seconds must be a finite number > 0, "
-                f"got {dep_grace_seconds!r}"
+                f"dependency_grace_seconds must be a finite number > 0, "
+                f"got {dependency_grace_seconds!r}"
             ) from None
     finite_grace = math.isfinite(grace)
     if not finite_grace or grace <= 0:
         raise ValueError(
-            f"dep_grace_seconds must be a finite number > 0, got {dep_grace_seconds!r}"
+            f"dependency_grace_seconds must be a finite number > 0, got {dependency_grace_seconds!r}"
         )
     threshold = _positive_int_rounds(
         commit_failure_threshold, COMMIT_FAILURE_THRESHOLD,
@@ -100,7 +100,7 @@ def resolve_tuning(
         "deadlock_gap_max_rounds",
     )
     return Tuning(
-        dep_grace_seconds=grace,
+        dependency_grace_seconds=grace,
         commit_failure_threshold=threshold,
         deadlock_gap_max_rounds=gap_rounds,
     )
@@ -125,11 +125,11 @@ class RunConfig:
     governor: DeadlockGovernor
     rerun_policy: RerunPolicy
     requeue_policy: RequeuePolicy
-    ordering: OrderingPolicy
+    ordering_policy: OrderingPolicy
     # ── 调优标量（默认值唯一落点）──
-    output_root: Path | Sequence[Path] | None = None
+    output_roots: Path | Sequence[Path] | None = None
     strict_picklable: bool = True
-    dep_grace_seconds: float = DEP_GRACE_SECONDS
+    dependency_grace_seconds: float = DEP_GRACE_SECONDS
     commit_failure_threshold: int = COMMIT_FAILURE_THRESHOLD
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
     on_run_start: Callable[[], None] | None = None
@@ -150,10 +150,10 @@ class RunConfig:
         governor: DeadlockGovernor,
         rerun_policy: RerunPolicy,
         requeue_policy: RequeuePolicy | None = None,
-        ordering: OrderingPolicy | None = None,
-        output_root: Path | Sequence[Path] | None = None,
+        ordering_policy: OrderingPolicy | None = None,
+        output_roots: Path | Sequence[Path] | None = None,
         strict_picklable: bool = True,
-        dep_grace_seconds: float | None = None,
+        dependency_grace_seconds: float | None = None,
         commit_failure_threshold: int | None = None,
         deadlock_gap_max_rounds: int | None = None,
         on_run_start: Callable[[], None] | None = None,
@@ -162,7 +162,7 @@ class RunConfig:
     ) -> "RunConfig":
         """唯一规范化入口：可空原始值 → 常量默认 + 最终类型。"""
         tuning = resolve_tuning(
-            dep_grace_seconds=dep_grace_seconds,
+            dependency_grace_seconds=dependency_grace_seconds,
             commit_failure_threshold=commit_failure_threshold,
             deadlock_gap_max_rounds=deadlock_gap_max_rounds,
         )
@@ -179,10 +179,10 @@ class RunConfig:
             requeue_policy=(
                 requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
             ),
-            ordering=ordering if ordering is not None else FifoOrderingPolicy(),
-            output_root=output_root,
+            ordering_policy=ordering_policy if ordering_policy is not None else FifoOrderingPolicy(),
+            output_roots=output_roots,
             strict_picklable=strict_picklable,
-            dep_grace_seconds=tuning.dep_grace_seconds,
+            dependency_grace_seconds=tuning.dependency_grace_seconds,
             commit_failure_threshold=tuning.commit_failure_threshold,
             deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
             on_run_start=on_run_start,

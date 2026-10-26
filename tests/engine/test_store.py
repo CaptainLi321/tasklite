@@ -28,7 +28,7 @@ from tasklite.engine.store import (
     StateStore,
     SuccessOutcome,
 )
-from tasklite.engine.types import AttemptFinish, TaskStats
+from tasklite.engine.types import AttemptFinish, RunStats
 from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.job import Job, WORKER_RESOURCE
 from tasklite.models.state import PipelineState
@@ -219,7 +219,7 @@ class TestApplyRetry:
         return Job("t", "1", attempt_no=2).to_dict()
 
     def test_commit_path_requeues_front_and_records_stats(self):
-        stats = TaskStats()
+        stats = RunStats()
         store, state, _ = _make_store(stats=stats)
         state.replace_queue([])
         store.state.register_in_flight("t::1")
@@ -243,7 +243,7 @@ class TestApplyRetry:
         backend = InMemoryStateBackend()
         failing = CommitFailureBackend(backend, failing=("commit_retry",))
         state = PipelineState({}, {}, {}, [])
-        store = StateStore(failing, state, stats=TaskStats())
+        store = StateStore(failing, state, stats=RunStats())
 
         with pytest.raises(_CommitCrashSignal, match="commit_retry"):
             store.apply_retry("t::1", {"task_type": "t", "job_id": "1"}, self._retry_job_snapshot())
@@ -255,7 +255,7 @@ class TestApplySkip:
 
     @pytest.mark.parametrize("dispatched", [False, True])
     def test_skip_records_stat_and_clears_queue(self, dispatched):
-        stats = TaskStats()
+        stats = RunStats()
         backend = InMemoryStateBackend()
         backend.save_queue([{"task_type": "t", "job_id": "1"}])
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
@@ -291,7 +291,7 @@ class TestApplySkip:
         backend = InMemoryStateBackend()
         failing = CommitFailureBackend(backend, failing=("commit_skip",))
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
-        store = StateStore(failing, state, stats=TaskStats())
+        store = StateStore(failing, state, stats=RunStats())
         state.pop_job(0)
 
         with pytest.raises(_CommitCrashSignal, match="commit_skip"):
@@ -339,7 +339,7 @@ class TestCommitFailureStrike:
             backend,
             PipelineState({}, {}, {}, []),
             commit_failure_threshold=3,
-            stats=TaskStats(),
+            stats=RunStats(),
             on_attempt_finished=lambda uid, *, outcome: hooks.append((uid, outcome)),
         )
 
@@ -396,7 +396,7 @@ class TestHookSingleExit:
     """fire_attempt_finished 单一出口与异常隔离。"""
 
     def test_hook_exception_isolated_and_counted(self):
-        stats = TaskStats()
+        stats = RunStats()
         store, _, _ = _make_store(stats=stats)
 
         def boom(uid, *, outcome):
@@ -424,7 +424,7 @@ class TestHookSingleExit:
         assert captured == ["t::1"]
 
     def test_bulk_failure_fires_hook_per_uid(self):
-        stats = TaskStats()
+        stats = RunStats()
         hooks: list[tuple[str, AttemptFinish]] = []
         backend = InMemoryStateBackend()
         store = StateStore(
@@ -525,7 +525,7 @@ class TestBulkStrikeConvergence:
             backend,
             state,
             commit_failure_threshold=threshold,
-            stats=TaskStats(),
+            stats=RunStats(),
             on_attempt_finished=lambda uid, *, outcome: hooks.append((uid, outcome)),
         )
 
@@ -674,7 +674,7 @@ class TestRequeueTransient:
         ],
     )
     def test_requeue_transient_records_stat_and_fronts(self, kind, stat_key):
-        stats = TaskStats()
+        stats = RunStats()
         store, state, _ = _make_store(stats=stats)
         jd = Job("t", "1").to_dict()
 
@@ -685,7 +685,7 @@ class TestRequeueTransient:
 
     def test_requeue_transient_leaves_runtime_untouched(self):
         """零污染：不烧 commit/dispatch 失败预算、不写 last_retry_error。"""
-        stats = TaskStats()
+        stats = RunStats()
         store, _, _ = _make_store(stats=stats)
         jd = Job("t", "1").to_dict()
 

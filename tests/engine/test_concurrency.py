@@ -38,7 +38,7 @@ def slow_window_handler(job, ctx):
     start = time.time()
     time.sleep(0.5)
     end = time.time()
-    window_file = ctx.output_root / f"window_{job.job_id}.txt"
+    window_file = ctx.output_roots / f"window_{job.job_id}.txt"
     window_file.write_text(f"{start} {end}", encoding="utf-8")
     return True, {}
 
@@ -48,10 +48,10 @@ def fast_handler(job, ctx):
     return True, {"processed": job.job_id}
 
 
-def _load_windows(output_root: Path) -> list[tuple[float, float]]:
+def _load_windows(output_roots: Path) -> list[tuple[float, float]]:
     """读取全部执行时间窗文件，返回 (start, end) 列表。"""
     windows = []
-    for path in sorted(output_root.glob("window_*.txt")):
+    for path in sorted(output_roots.glob("window_*.txt")):
         start_str, end_str = path.read_text(encoding="utf-8").split()
         windows.append((float(start_str), float(end_str)))
     return windows
@@ -83,7 +83,7 @@ def test_scheduler_shares_task_registry_reference(tmp_state_dir):
         name="test_sched_ref", state_dir=tmp_state_dir, backend="sqlite",
     )
     pipeline.register_resource(CapacityResource("mem", max_capacity=2.0))
-    pipeline.register_task("fast_task", fast_handler, default_resources={"mem": 1.0})
+    pipeline.register_task("fast_task", fast_handler, resources={"mem": 1.0})
 
     resource_mgr = pipeline._runtime.scheduler.resource_mgr
     assert resource_mgr is pipeline.resources
@@ -106,11 +106,11 @@ def test_three_jobs_run_concurrently(tmp_state_dir):
         name="test_concurrency",
         state_dir=tmp_state_dir,
         backend="sqlite",
-        output_root=tmp_state_dir / "output",
+        output_roots=tmp_state_dir / "output",
         max_workers=3,
     )
     pipeline.register_resource(CapacityResource("cpu", max_capacity=3.0))
-    pipeline.register_task("slow", slow_window_handler, default_resources={"cpu": 1.0})
+    pipeline.register_task("slow", slow_window_handler, resources={"cpu": 1.0})
     pipeline.enqueue([Job("slow", f"j{i}") for i in range(3)])
 
     start = time.perf_counter()
@@ -137,7 +137,7 @@ def test_workers_resource_limits_concurrency(tmp_state_dir):
         name="test_workers_limit",
         state_dir=tmp_state_dir,
         backend="sqlite",
-        output_root=tmp_state_dir / "output",
+        output_roots=tmp_state_dir / "output",
         max_workers=2,
     )
     pipeline.register_task("slow", slow_window_handler)
@@ -205,11 +205,11 @@ def test_resource_capacity_respected_under_concurrency(tmp_state_dir):
         name="test_cap_respected",
         state_dir=tmp_state_dir,
         backend="sqlite",
-        output_root=tmp_state_dir / "output",
+        output_roots=tmp_state_dir / "output",
         max_workers=3,
     )
     pipeline.register_resource(CapacityResource("mem", max_capacity=2.0))
-    pipeline.register_task("slow", slow_window_handler, default_resources={"mem": 1.0})
+    pipeline.register_task("slow", slow_window_handler, resources={"mem": 1.0})
     pipeline.enqueue([Job("slow", f"j{i}") for i in range(3)])
 
     start = time.perf_counter()

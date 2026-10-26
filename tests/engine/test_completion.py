@@ -29,7 +29,7 @@ from tasklite.engine.resource import (
     ResourceManager,
 )
 from tasklite.engine.store import StateStore
-from tasklite.engine.types import AttemptFinish, JobHandle, TaskStats
+from tasklite.engine.types import AttemptFinish, JobHandle, RunStats
 from tasklite.models.job import Job, JobRuntimeState
 from tasklite.models.state import PipelineState
 
@@ -64,7 +64,7 @@ class CompletionEnv:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
-        self.stats = TaskStats()
+        self.stats = RunStats()
         self.hooks: list[tuple[str, AttemptFinish]] = []
         self.store = StateStore(
             self.backend,
@@ -115,8 +115,8 @@ class CompletionEnv:
         return JobHandle(
             job_uid=uid,
             process=FakeProcess(),
-            deadline=1e18,
-            timeout=60.0,
+            timeout_at_monotonic=1e18,
+            timeout_seconds=60.0,
             job=Job(*uid.split("::", 1)),
             ipc_dir=self.ipc_dir,
             execution_id=f"{self.session.run_id}.1",
@@ -237,7 +237,8 @@ class TestRetryBudget:
     def test_retry_job_snapshot_preserves_custom_fields(self, tmp_path):
         """重试 = 原作业原样重入队：顶层自定义字段与已注入资源随重试往返保留。"""
         env = CompletionEnv(tmp_path)
-        job = Job("t", "j1", resources={"__workers__": 1.0})
+        job = Job("t", "j1", resources={"__workers__": 1.0},
+                  timeout_seconds=23, payload={"timeout": "业务时限"})
         entry = env.track_entry(job)
         job_snapshot = dict(entry.job_snapshot)
         job_snapshot["custom_note"] = "keep-me"
@@ -248,6 +249,9 @@ class TestRetryBudget:
         )
         assert env.store.state.queue[0]["custom_note"] == "keep-me"
         assert env.store.state.queue[0]["resources"] == {"__workers__": 1.0}
+        restored = Job.from_dict(env.store.state.queue[0])
+        assert restored.timeout_seconds == 23
+        assert restored.payload == {"timeout": "业务时限"}
 
     def test_budget_exhaustion_archives(self, tmp_path):
         env = CompletionEnv(tmp_path)
@@ -381,11 +385,15 @@ class TestSpawnedJobs:
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
-                new_jobs=[Job("child", "y", rerun="every_run")],
+                new_jobs=[Job("child", "y", rerun="every_run",
+                              timeout_seconds=29, payload={"timeout": "业务时限"})],
             ),
         )
         assert "parent::p1" in env.store.state.wall
         assert "child::y" in env.store.state.queue_uids
+        restored = Job.from_dict(env.store.state.queue[0])
+        assert restored.timeout_seconds == 29
+        assert restored.payload == {"timeout": "业务时限"}
 
     def test_spawn_dedup_within_batch(self, tmp_path):
         env = CompletionEnv(tmp_path)

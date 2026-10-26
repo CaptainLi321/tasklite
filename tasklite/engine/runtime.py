@@ -37,7 +37,7 @@ from .types import (
     RunSummary,
     StepOutcome,
     StopMode,
-    TaskStats,
+    RunStats,
 )
 from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
@@ -74,7 +74,7 @@ class EngineRuntime:
         self.config = config
         self.tasks = config.tasks
         self.scheduler = JobScheduler(
-            resources=config.resources, ordering=config.ordering
+            resources=config.resources, ordering_policy=config.ordering_policy
         )
         self.governor = config.governor
 
@@ -131,7 +131,7 @@ class EngineRuntime:
             recovery=self._recovery,
             tasks=config.tasks,
             classifier=config.classifier,
-            output_root=config.output_root,
+            output_roots=config.output_roots,
             ipc_dir=config.ipc_dir,
             commit_failure_threshold=config.commit_failure_threshold,
         )
@@ -178,7 +178,7 @@ class EngineRuntime:
         return self._in_flight
 
     @property
-    def stats(self) -> TaskStats:
+    def stats(self) -> RunStats:
         return self._session.stats
 
     @property

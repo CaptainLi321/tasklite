@@ -63,7 +63,7 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 > 上述实现不构成解禁；第 5 项「超期准入控制」依赖 Job `deadline`、仍随本节冻结，与
 > Selection 的 `task_type` 准入不同轴。
 
-接线已全部就绪（`TaskLite(*, ordering=..., requeue_policy=...)` 门面构造参数 + 引擎层两个
+接线已全部就绪（`TaskLite(*, ordering_policy=..., requeue_policy=...)` 门面构造参数 + 引擎层两个
 唯一出口——本节冻结族对应的排序/节奏两个出口；候选准入见 ADR-0006），核心禁排序/退避
 计算红线不变。候选按收益排序：
 

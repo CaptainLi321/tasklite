@@ -88,7 +88,7 @@ class CompletionMachine:
                 entry.job,
                 entry.job_snapshot,
                 result,
-                job_start=entry.job_start,
+                started_monotonic=entry.started_monotonic,
                 expect_in_flight=(entry.handle is not None),
                 attempt_id=entry.attempt_id,
             )
@@ -131,7 +131,7 @@ class CompletionMachine:
         job_snapshot: dict[str, Any],
         result: ExecutionResult,
         *,
-        job_start: float | None = None,
+        started_monotonic: float | None = None,
         expect_in_flight: bool = True,
         attempt_id: int | None = None,
     ) -> None:
@@ -168,11 +168,11 @@ class CompletionMachine:
             self._apply_retry(uid, job, job_snapshot, result, attempt_id=attempt_id)
         elif result.success:
             self._apply_success(
-                uid, job_snapshot, result, job_start=job_start, attempt_id=attempt_id
+                uid, job_snapshot, result, started_monotonic=started_monotonic, attempt_id=attempt_id
             )
         else:
             self._apply_failure(
-                uid, job_snapshot, result, job_start=job_start, attempt_id=attempt_id
+                uid, job_snapshot, result, started_monotonic=started_monotonic, attempt_id=attempt_id
             )
 
     # ── 三态分支 ──────────────────────────────────────────────────────
@@ -264,11 +264,11 @@ class CompletionMachine:
         job_snapshot: dict[str, Any],
         result: ExecutionResult,
         *,
-        job_start: float | None = None,
+        started_monotonic: float | None = None,
         attempt_id: int | None = None,
     ) -> None:
         """成功分支：子任务去重规范化、wall 记录与 cursor 推进。"""
-        duration = (time.monotonic() - job_start) if job_start is not None else 0.0
+        duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
         spawned_job_snapshots = self._collect_spawned_job_snapshots(uid, result.new_jobs)
@@ -357,11 +357,11 @@ class CompletionMachine:
         job_snapshot: dict[str, Any],
         result: ExecutionResult,
         *,
-        job_start: float | None = None,
+        started_monotonic: float | None = None,
         attempt_id: int | None = None,
     ) -> None:
         """永久失败分支：写入失败档案与级联阻断下游。"""
-        duration = (time.monotonic() - job_start) if job_start is not None else 0.0
+        duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.error(
             f"FAIL: {uid} (duration {duration:.2f}s, sent to failure archive). "
             f"Meta: {result.result_meta}"

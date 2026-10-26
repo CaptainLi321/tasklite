@@ -54,7 +54,7 @@ def _make_pipeline(tmp_path, **overrides) -> TaskLite:
         name="e2e_pipeline",
         state_dir=tmp_path / "state",
         backend="sqlite",
-        output_root=tmp_path / "output",
+        output_roots=tmp_path / "output",
     )
     defaults.update(overrides)
     return TaskLite(**defaults)
@@ -69,7 +69,7 @@ class TransientSampleError(Exception):
 
 def ok_with_input_handler(job, ctx):
     """成功 + 声明输入文件 + 业务元数据（供 wall meta 审计键断言）。"""
-    source = ctx.output_root / f"source_{job.job_id}.txt"
+    source = ctx.output_roots / f"source_{job.job_id}.txt"
     source.write_text("seed data", encoding="utf-8")
     ctx.declare_input(source)
     return True, {"touched": job.job_id}
@@ -82,7 +82,7 @@ def explode_handler(job, ctx):
 
 def flaky_first_attempt_handler(job, ctx):
     """首次执行抛瞬态异常，重试执行成功（磁盘标记跨子进程传递状态）。"""
-    marker = ctx.output_root / f"flaky_marker_{job.job_id}"
+    marker = ctx.output_roots / f"flaky_marker_{job.job_id}"
     if marker.exists():
         return True, {"recovered": True}
     marker.write_text(job.job_id, encoding="utf-8")
@@ -96,7 +96,7 @@ def always_transient_handler(job, ctx):
 
 def fail_once_then_ok_handler(job, ctx):
     """首激活失败并写标记；档案补跑激活读到标记即成功。"""
-    marker = ctx.output_root / f"fail_once_marker_{job.job_id}"
+    marker = ctx.output_roots / f"fail_once_marker_{job.job_id}"
     if marker.exists():
         return True, {"recovered": True}
     marker.write_text(job.job_id, encoding="utf-8")
@@ -122,7 +122,7 @@ def plain_gated_handler(job, ctx):
 
 def interrupted_first_handler(job, ctx):
     """首次执行抛 KeyboardInterrupt；重跑（零预算瞬态）读到标记即成功。"""
-    marker = ctx.output_root / f"interrupted_marker_{job.job_id}"
+    marker = ctx.output_roots / f"interrupted_marker_{job.job_id}"
     if marker.exists():
         return True, {"recovered": True}
     marker.write_text(job.job_id, encoding="utf-8")
@@ -140,9 +140,9 @@ def partial_output_hang_handler(job, ctx):
     ready 标记先于挂起落盘——测试侧轮询标记出现再请求强停，避免在
     handler 尚未声明输出前击杀（竞态会让清理断言假绿）。
     """
-    partial = ctx.declare_output(ctx.output_root / f"partial_{job.job_id}.txt")
+    partial = ctx.declare_output(ctx.output_roots / f"partial_{job.job_id}.txt")
     Path(partial).write_text("half-written", encoding="utf-8")
-    ready = ctx.output_root / f"ready_{job.job_id}"
+    ready = ctx.output_roots / f"ready_{job.job_id}"
     ready.write_text(job.job_id, encoding="utf-8")
     time.sleep(60.0)
     return True, {}
@@ -404,9 +404,9 @@ class TestForceAbortCleanup:
         p.register_task("abortable", partial_output_hang_handler)
         p.enqueue(Job("abortable", "item_abort"))
 
-        output_root = tmp_path / "output"
-        partial = output_root / "partial_item_abort.txt"
-        ready = output_root / "ready_item_abort"
+        output_roots = tmp_path / "output"
+        partial = output_roots / "partial_item_abort.txt"
+        ready = output_roots / "ready_item_abort"
 
         def request_force_abort_when_declared() -> None:
             # 轮询 handler 已落盘半成品声明（上限放宽至 15s 容忍满载
@@ -440,7 +440,7 @@ class TestRealSubprocessFaultScenarios:
         """短 timeout + 挂起 handler → 看门狗击杀 → 超时归因进失败档案。"""
         p = _make_pipeline(tmp_path)
         p.register_task("hung", hung_handler)
-        p.enqueue(Job("hung", "item_watchdog", timeout=0.2, max_retries=0))
+        p.enqueue(Job("hung", "item_watchdog", timeout_seconds=0.2, max_retries=0))
         p.run()
         p.stop()
 
@@ -460,10 +460,10 @@ class TestRealSubprocessFaultScenarios:
         api = RateLimitResource("api", interval_seconds=1.0)
         p.register_resource(api)
         p.register_task(
-            "gated", suspend_and_complete_handler, default_resources={"api": 1.0}
+            "gated", suspend_and_complete_handler, resources={"api": 1.0}
         )
         p.register_task(
-            "gated_plain", plain_gated_handler, default_resources={"api": 1.0}
+            "gated_plain", plain_gated_handler, resources={"api": 1.0}
         )
         # waiter 显式依赖 holder：排除「限速窗口先于 holder 子进程启动到期、
         # waiter 抢在 holder 结算前派发」的调度竞态（Windows 高负载下子进程

@@ -178,7 +178,7 @@ class DiscoveryHost(Protocol):
         self,
         task_type: str,
         handler: Callable[..., Any],
-        default_resources: dict[str, float] | None = None,
+        resources: dict[str, float] | None = None,
         payload_schema: type | None = None,
     ) -> None: ...
 
@@ -521,7 +521,7 @@ def register_discovery(
     process_item_func: Callable[[DiscoveryJob, DiscoveryContext, Any, str], None],
     process_task_type: str,
     cursor_key_func: Callable[[dict[str, Any]], str] | None = None,
-    default_resources: dict[str, float] | None = None,
+    resources: dict[str, float] | None = None,
     payload_schema: type | None = None,
     max_pages: int = 1000,
     rerun: str = "every_run",
@@ -552,7 +552,7 @@ def register_discovery(
             与用户 spawn 时必须一致。
         cursor_key_func: 可选。``(payload) -> str``，仅作 job_id 命名空间
             前缀（防跨分组内容 id 碰撞），无任何游标/互斥语义。
-        default_resources: 发现任务自身的默认资源需求。
+        resources: 发现任务自身的默认资源需求。
         payload_schema: 发现任务 payload 的运行时校验 schema。
         max_pages: 单次扫描页数硬上限（活性保障条款，默认 1000）。
         rerun: discovery job 的默认跨会话重跑策略（默认 ``"every_run"``）
@@ -644,7 +644,7 @@ def register_discovery(
     host.register_task(
         task_type,
         handler,
-        default_resources=default_resources,
+        resources=resources,
         payload_schema=payload_schema,
     )
     # 记录 discovery 默认 rerun 供 enqueue 注入

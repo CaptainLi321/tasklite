@@ -117,8 +117,8 @@ class FakeHost:
         self.registered = []
 
     def register_task(self, task_type, handler,
-                      default_resources=None, payload_schema=None):
-        self.registered.append((task_type, handler, default_resources, payload_schema))
+                      resources=None, payload_schema=None):
+        self.registered.append((task_type, handler, resources, payload_schema))
 
     def set_discovery_rerun(self, task_type, rerun):
         self.registered.append(("rerun", task_type, rerun))

@@ -29,7 +29,7 @@ class TestJobCreation:
         assert job.resources == {}
         assert job.max_retries == 3
         assert job.depends_on == []
-        assert job.timeout == 3600
+        assert job.timeout_seconds == 3600
         assert job.timeout_is_transient is False
         assert job.rerun is None
         # 实例位初值：首次激活、首次尝试、尚未入队
@@ -46,7 +46,7 @@ class TestJobCreation:
             resources={"api": 1.0, "disk": 2.5},
             max_retries=5,
             depends_on=["parent_job"],
-            timeout=7200,
+            timeout_seconds=7200,
             timeout_is_transient=True,
             rerun="on_failure",
             attempt_no=2,
@@ -57,7 +57,7 @@ class TestJobCreation:
         assert job.resources == {"api": 1.0, "disk": 2.5}
         assert job.max_retries == 5
         assert job.depends_on == ["parent_job"]
-        assert job.timeout == 7200
+        assert job.timeout_seconds == 7200
         assert job.timeout_is_transient is True
         assert job.rerun == "on_failure"
         assert job.attempt_no == 2
@@ -87,9 +87,9 @@ class TestJobCreation:
             Job("t", "id", {}, {}, 3, [], 3600, True)  # type: ignore[misc]
 
     def test_float_timeout_accepted(self):
-        job = Job("t", "id", timeout=1.5)
-        assert job.timeout == 1.5
-        assert isinstance(job.timeout, float)
+        job = Job("t", "id", timeout_seconds=1.5)
+        assert job.timeout_seconds == 1.5
+        assert isinstance(job.timeout_seconds, float)
 
 
 class TestJobIdentityValidation:
@@ -187,7 +187,7 @@ class TestJobPayloadAndResources:
 
 
 class TestJobSpecFieldValidation:
-    """max_retries / timeout / depends_on / rerun 校验。"""
+    """max_retries / timeout_seconds / depends_on / rerun 校验。"""
 
     def test_negative_max_retries(self):
         with pytest.raises(ValueError, match="max_retries must be >= 0"):
@@ -206,14 +206,14 @@ class TestJobSpecFieldValidation:
         assert job.max_retries == 0
 
     def test_timeout_matrix_rejected(self):
-        """timeout 拒绝零/负/NaN/Inf/超大 int/bool/非数值。"""
-        with pytest.raises(TypeError, match="timeout must be a number"):
-            Job("t", "id", timeout="60")
-        with pytest.raises(TypeError, match="timeout must be a number"):
-            Job("t", "id", timeout=True)
+        """timeout_seconds 拒绝零/负/NaN/Inf/超大 int/bool/非数值。"""
+        with pytest.raises(TypeError, match="timeout_seconds must be a number"):
+            Job("t", "id", timeout_seconds="60")
+        with pytest.raises(TypeError, match="timeout_seconds must be a number"):
+            Job("t", "id", timeout_seconds=True)
         for bad in (0, -1, float("nan"), float("inf"), 10**400):
-            with pytest.raises(ValueError, match="timeout must be finite and > 0"):
-                Job("t", "id", timeout=bad)
+            with pytest.raises(ValueError, match="timeout_seconds must be finite and > 0"):
+                Job("t", "id", timeout_seconds=bad)
 
     def test_non_bool_timeout_is_transient_rejected(self):
         """非 bool 真值会静默改变超时归类语义，入口拒绝。"""
@@ -305,7 +305,7 @@ class TestJobUid:
     def test_equality_and_hash_by_uid_only(self):
         """__eq__/__hash__ 仅按 uid：规格位不同的同 uid Job 仍等价。"""
         a = Job("t", "j", payload={"x": 1})
-        b = Job("t", "j", payload={"x": 2}, timeout=99)
+        b = Job("t", "j", payload={"x": 2}, timeout_seconds=99)
         assert a == b
         assert hash(a) == hash(b)
         assert a != Job("t", "other")
@@ -333,7 +333,7 @@ class TestJobToDictFromDict:
             resources={"cpu": 0.5},
             max_retries=4,
             depends_on=["a", "b"],
-            timeout=100,
+            timeout_seconds=100,
             rerun="every_run",
             attempt_no=2,
             activation_no=1,
@@ -358,7 +358,7 @@ class TestJobToDictFromDict:
         assert job.resources == {}
         assert job.max_retries == 3
         assert job.depends_on == []
-        assert job.timeout == 3600
+        assert job.timeout_seconds == 3600
         assert job.timeout_is_transient is False
         assert job.rerun is None
         assert job.attempt_no == 1
@@ -380,7 +380,7 @@ class TestJobToDictFromDict:
             resources={"api": 1.0, "disk": 2.5},
             max_retries=5,
             depends_on=["parent_job"],
-            timeout=7200,
+            timeout_seconds=7200,
             timeout_is_transient=True,
             rerun="on_input_change",
             attempt_no=3,
@@ -394,7 +394,7 @@ class TestJobToDictFromDict:
         assert recreated.resources == original.resources
         assert recreated.max_retries == original.max_retries
         assert recreated.depends_on == original.depends_on
-        assert recreated.timeout == original.timeout
+        assert recreated.timeout_seconds == original.timeout_seconds
         assert recreated.timeout_is_transient == original.timeout_is_transient
         assert recreated.rerun == original.rerun
         assert recreated.attempt_no == original.attempt_no

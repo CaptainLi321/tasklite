@@ -184,7 +184,7 @@ class ArtifactJournal:
                 logger.debug(f"Could not resolve output path '{raw}', using abspath fallback.")
             if not any(resolved_path.is_relative_to(r) for r in roots):
                 raise ValueError(
-                    f"Output path '{raw}' resolves outside output_root {roots!r}"
+                    f"Output path '{raw}' resolves outside output_roots {roots!r}"
                 )
             return str(resolved_path)
 

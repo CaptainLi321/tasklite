@@ -14,7 +14,7 @@ import logging
 import secrets
 from typing import Callable, TYPE_CHECKING
 
-from .types import ExitReason, StopMode, TaskStats
+from .types import ExitReason, StopMode, RunStats
 
 if TYPE_CHECKING:
     from .types import AttemptFinish
@@ -46,11 +46,11 @@ class RunSession:
         self.result_token: str | None = None
         self.dispatch_no: int = 0
         self.stop_mode: StopMode = StopMode.NONE
-        self._stats = TaskStats()
+        self._stats = RunStats()
         self._run_end_fired = False
 
     @property
-    def stats(self) -> TaskStats:
+    def stats(self) -> RunStats:
         return self._stats
 
     def begin(self, run_id: str | None = None) -> None:
@@ -59,7 +59,7 @@ class RunSession:
         self.result_token = secrets.token_hex(32)
         self.dispatch_no = 0
         self.stop_mode = StopMode.NONE
-        self._stats = TaskStats()
+        self._stats = RunStats()
         self._run_end_fired = False
 
     def next_dispatch_no(self) -> int:

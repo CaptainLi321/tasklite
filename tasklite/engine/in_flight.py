@@ -42,8 +42,8 @@ class InFlightJob:
     由派发机器创建，传给收尾机器处理结果。内敛持有 ResourceLease 或
     acquired 列表，提供自归还的 release_resources 接缝。
     ``handle is None`` 表示伪 entry（崩溃恢复/abort 消费路径），此时
-    ``acquired=[]``；``job_start`` 与 ``handle.deadline`` 共同驱动看门狗
-    超时判定（timeout 语义）。
+    ``acquired=[]``；``started_monotonic`` 与 ``handle.timeout_at_monotonic`` 共同驱动看门狗
+    超时判定（timeout_seconds 语义）。
     """
 
     job_uid: str
@@ -51,7 +51,7 @@ class InFlightJob:
     job: Job
     acquired: list[tuple[str, float]] = field(default_factory=list)
     handle: JobHandle | None = None
-    job_start: float | None = None
+    started_monotonic: float | None = None
     lease: ResourceLease | None = None
     # 已派发轨迹行 id（attempts 旁路观测面）：派发机器开行时落位，完成
     # 机器收尾时经 store 落终态；伪条目（崩溃恢复/拒绝路径）为 None。
@@ -196,7 +196,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
             job=job,
             acquired=[],
             handle=None,
-            job_start=None,
+            started_monotonic=None,
             lease=NullResourceLease(job_uid=job_uid),
         )
 
