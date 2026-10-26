@@ -70,6 +70,9 @@ _Avoid_: SortStrategy, PriorityScheme
 The single outlet for retry pacing: default `ImmediateRequeuePolicy` (`RequeuePlan(front=True, delay_seconds=0.0)`); delay-style strategies re-enter through this seam via a future ADR.
 _Avoid_: BackoffGovernor, RetryTimer, BackoffSchedule
 
+**Selection**:
+流水线级候选准入规则集：`Exclude(task_type=...)` 延迟留队，`Skip(task_type=...)` 终态跳过并级联下游，同一任务类型由 Skip 优先。规则对象以 `task_type` 保存匹配目标，`Rule.matches_task_type(task_type)` 为匹配入口，`Selection.allows_task_type(task_type)` 判断本次运行是否允许派发；自定义非 Skip 规则采用 Exclude 语义。
+
 ### Engine Machines
 
 **DispatchMachine**:

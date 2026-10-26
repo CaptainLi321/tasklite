@@ -179,7 +179,7 @@ class SelectionMachine:
 
         deferred = {
             uid for uid, (task_type, _deps) in facts.items()
-            if not self._selection.allows_type(task_type)
+            if not self._selection.allows_task_type(task_type)
         }
         excluded = {
             uid for uid, (task_type, _deps) in facts.items()

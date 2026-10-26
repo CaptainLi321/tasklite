@@ -282,7 +282,7 @@ pipeline = TaskLite(name="media", state_dir="./state",
 
 ### Selection：候选准入/选择（第三类 seam）
 
-Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」，既不是候选排序也不是重入队节奏：`pipeline.selection(Exclude(type="pdf_to_md"), Skip(type="ocr"))` 配置规则集——Exclude 延迟留队（下次 run 自动恢复），Skip 终态跳过并级联下游。API 与语义契约见**第 8 节**；分类裁决、停摆拓扑剥离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。
+Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」，既不是候选排序也不是重入队节奏：`pipeline.selection(Exclude(task_type="pdf_to_md"), Skip(task_type="ocr"))` 配置规则集——Exclude 延迟留队（下次 run 自动恢复），Skip 终态跳过并级联下游。API 与语义契约见**第 8 节**；分类裁决、停摆拓扑剥离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。
 
 ### 核心禁改红线
 
@@ -341,16 +341,16 @@ Selection 属**第 5 节调度扩展 seam 的第三类——候选准入/选择*
 from tasklite import Exclude, Job, Skip, TaskLite
 
 pipeline = TaskLite(name="research", state_dir="./state")
-pipeline.selection(Exclude(type="pdf_to_md"))   # 本次不执行、留队（下次自动恢复）
+pipeline.selection(Exclude(task_type="pdf_to_md"))   # 本次不执行、留队（下次自动恢复）
 pipeline.enqueue([Job("fetch", "a"), Job("pdf_to_md", "p")])
 pipeline.run()                                  # 只执行 fetch，pdf_to_md 留在持久化队列
 
-pipeline.selection(Skip(type="ocr"))            # 终态跳过：命中作业与下游永不执行
+pipeline.selection(Skip(task_type="ocr"))            # 终态跳过：命中作业与下游永不执行
 pipeline.selection(Exclude("a"), Skip("b"))     # 每次整体替换；同一 task_type Skip 优先
 pipeline.selection()                            # 重置：恢复全执行
 ```
 
-规则是职责单一的值对象：`Exclude(type=...)`（延迟）与 `Skip(type=...)`（终态）均按 `job.task_type` 精确匹配；`Rule` 协议只要求 `matches_type(task_type)`（引擎的调度热路径与终态写入出口都按 task_type 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层 `tasklite` 导出 `Exclude` / `Selection` / `Skip`，`from tasklite.selection import ...` 子模块路径同样可用（模块名全小写）。规则只做 task_type 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨运行窗口复用。
+规则是职责单一的值对象：`Exclude(task_type=...)`（延迟）与 `Skip(task_type=...)`（终态）均按 `job.task_type` 精确匹配；`Rule` 协议只要求 `matches_task_type(task_type)`（引擎的调度热路径与终态写入出口都按 task_type 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_task_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层 `tasklite` 导出 `Exclude` / `Selection` / `Skip`，`from tasklite.selection import ...` 子模块路径同样可用（模块名全小写）。规则只做 task_type 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨运行窗口复用。
 
 ### 8.1 Exclude（延迟语义：留队、下次自动重试）
 

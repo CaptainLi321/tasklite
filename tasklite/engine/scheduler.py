@@ -310,7 +310,7 @@ class JobScheduler:
             if (
                 selection is not None
                 and selection.is_active
-                and not selection.allows_type(job.task_type)
+                and not selection.allows_task_type(job.task_type)
             ):
                 continue
 

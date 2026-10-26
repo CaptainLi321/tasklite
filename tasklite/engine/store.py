@@ -175,7 +175,7 @@ class StateStore:
                 job = Job.from_dict(job_dict)
             except (KeyError, TypeError, ValueError):
                 continue
-            if not selection.allows_type(job.task_type):
+            if not selection.allows_task_type(job.task_type):
                 excluded.add(job.uid)
         return frozenset(excluded)
 

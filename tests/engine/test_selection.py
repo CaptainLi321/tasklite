@@ -161,7 +161,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
         ]
     )
     before = {uid: row for uid, row in zip(_queued(pipeline), pipeline.backend.load_queue())}
-    pipeline.selection(Exclude(type="convert"))
+    pipeline.selection(Exclude(task_type="convert"))
 
     summary = pipeline.run()
 
@@ -196,7 +196,7 @@ def test_only_excluded_jobs_finish_completed_without_failures(fake_process, tmp_
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("convert", ok_handler)
     pipeline.enqueue([Job("convert", "a"), Job("convert", "b"), Job("convert", "c")])
-    pipeline.selection(Exclude(type="convert"))
+    pipeline.selection(Exclude(task_type="convert"))
 
     summary = pipeline.run()
 
@@ -216,8 +216,8 @@ def test_selection_chains_replaces_and_persists_across_runs(fake_process, tmp_pa
     pipeline.register_task("convert", ok_handler)
     pipeline.enqueue([Job("fetch", "a"), Job("convert", "b")])
     # 链式调用 + 每次整体替换：最终只剩 convert 规则，fetch 恢复可执行。
-    assert pipeline.selection(Exclude(type="fetch")) is pipeline
-    assert pipeline.selection(Exclude(type="convert")) is pipeline
+    assert pipeline.selection(Exclude(task_type="fetch")) is pipeline
+    assert pipeline.selection(Exclude(task_type="convert")) is pipeline
 
     assert pipeline.run().stats["completed"] == 1
     second = pipeline.run()  # 规则是 pipeline 属性：下一次 run 仍生效
@@ -236,28 +236,28 @@ def test_selection_call_during_run_raises(tmp_path):
     pipeline = _pipeline(tmp_path)
     with running(pipeline):
         with pytest.raises(RuntimeError, match="selection"):
-            pipeline.selection(Exclude(type="fetch"))
+            pipeline.selection(Exclude(task_type="fetch"))
         with pytest.raises(RuntimeError, match="selection"):  # 引擎注入点双保险
             pipeline._runtime.set_selection(None)
 
 
 def test_exclude_validation_and_unknown_task_type(fake_process, tmp_path):
     with pytest.raises(TypeError):
-        Exclude(type=123)  # type: ignore[arg-type]
+        Exclude(task_type=123)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
-        Exclude(type="")
+        Exclude(task_type="")
     with pytest.raises(ValueError):
-        Exclude(type="a::b")
+        Exclude(task_type="a::b")
     with pytest.raises(TypeError):
-        Skip(type=123)  # type: ignore[arg-type]
+        Skip(task_type=123)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
-        Skip(type="a::b")
+        Skip(task_type="a::b")
     with pytest.raises(TypeError):
         Selection([object()])
 
     # 格式合法但未注册的 task_type：不报错、无效果（规则可先于注册表配置）。
     pipeline = _pipeline(tmp_path)
-    pipeline.selection(Exclude(type="never_registered"))
+    pipeline.selection(Exclude(task_type="never_registered"))
     pipeline.register_task("fetch", ok_handler)
     pipeline.enqueue(Job("fetch", "a"))
     assert pipeline.run().stats["completed"] == 1
@@ -270,7 +270,7 @@ def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
     pipeline.register_task("heavy", ok_handler, default_resources={"gpu": 1.0})
     pipeline.register_task("light", ok_handler)
     pipeline.enqueue([Job("heavy", "h"), Job("light", "l")])
-    pipeline.selection(Exclude(type="heavy"))
+    pipeline.selection(Exclude(task_type="heavy"))
 
     summary = pipeline.run()
 
@@ -294,7 +294,7 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
             Job("rank", "c", depends_on=["rank::b"]),
         ]
     )
-    pipeline.selection(Exclude(type="excluded_t"))
+    pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
 
@@ -324,7 +324,7 @@ def test_exclude_downstream_self_loop_is_failed(fake_process, tmp_path):
             Job("rank", "b", depends_on=["excluded_t::a", "rank::b"]),
         ]
     )
-    pipeline.selection(Exclude(type="excluded_t"))
+    pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
 
@@ -345,7 +345,7 @@ def test_exclude_downstream_ghost_dependency_is_failed(fake_process, tmp_path):
             Job("rank", "b", depends_on=["excluded_t::a", "ghost::x"]),
         ]
     )
-    pipeline.selection(Exclude(type="excluded_t"))
+    pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
 
@@ -368,7 +368,7 @@ def test_exclude_downstream_blocks_completes_without_busy_spin(fake_process, tmp
             Job("rank", "c", depends_on=["rank::b"]),
         ]
     )
-    pipeline.selection(Exclude(type="excluded_t"))
+    pipeline.selection(Exclude(task_type="excluded_t"))
     outcome: dict = {}
 
     def run_pipeline():
@@ -397,7 +397,7 @@ def test_governor_cycles_do_not_archive_excluded_jobs(fake_process, tmp_path):
             Job("rank", "d", depends_on=["rank::c"]),
         ]
     )
-    pipeline.selection(Exclude(type="excluded_t"))
+    pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
 
@@ -411,7 +411,7 @@ def test_governor_cycles_do_not_archive_excluded_jobs(fake_process, tmp_path):
     only = _pipeline(tmp_path / "only")
     only.register_task("excluded_t", ok_handler)
     only.enqueue([Job("excluded_t", "a", depends_on=["excluded_t::a"])])
-    only.selection(Exclude(type="excluded_t"))
+    only.selection(Exclude(task_type="excluded_t"))
     only_summary = only.run()
     assert only_summary.exit_reason is ExitReason.COMPLETED
     assert dict(only_summary.stats) == dict(EMPTY_STATS)
@@ -427,7 +427,7 @@ def test_mixed_deadlock_keeps_excluded_and_fails_allowed(fake_process, tmp_path)
             Job("rank", "unknown", resources={"ghost": 1.0}),
         ]
     )
-    pipeline.selection(Exclude(type="excluded_t"))
+    pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
 
@@ -443,7 +443,7 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
 ):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("rank", ok_handler)
-    pipeline.selection(Exclude(type="excluded_t"))
+    pipeline.selection(Exclude(task_type="excluded_t"))
     # 畸形行（缺 job_id）带被排除 task_type：不得被选择豁免，仍走 MALFORMED_JOB。
     pipeline.backend.save_queue(
         [{"task_type": "excluded_t"}, Job("rank", "ok").to_dict()]
@@ -485,7 +485,7 @@ def test_skip_root_and_downstream_are_terminal_skipped(fake_process, tmp_path):
             Job("fetch", "f"),
         ]
     )
-    pipeline.selection(Skip(type="skip_t"))
+    pipeline.selection(Skip(task_type="skip_t"))
 
     summary = pipeline.run()
 
@@ -522,7 +522,7 @@ def test_skip_cascade_wins_over_deadlock_cycle(fake_process, tmp_path):
             Job("rank", "c", depends_on=["rank::b"]),
         ]
     )
-    pipeline.selection(Skip(type="skip_t"))
+    pipeline.selection(Skip(task_type="skip_t"))
 
     summary = pipeline.run()
 
@@ -554,7 +554,7 @@ def test_skip_wins_over_exclude_for_upstream_type(fake_process, tmp_path):
             Job("rank", "c", depends_on=["excluded_t::b"]),
         ]
     )
-    pipeline.selection(Skip(type="skip_t"), Exclude(type="excluded_t"))
+    pipeline.selection(Skip(task_type="skip_t"), Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
 
@@ -569,7 +569,7 @@ def test_skip_and_exclude_same_type_skip_wins(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("t", ok_handler)
     pipeline.enqueue([Job("t", "a")])
-    pipeline.selection(Skip(type="t"), Exclude(type="t"))
+    pipeline.selection(Skip(task_type="t"), Exclude(task_type="t"))
 
     summary = pipeline.run()
 
@@ -582,7 +582,7 @@ def test_skip_only_queue_completes_without_execution(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("skip_t", ok_handler)
     pipeline.enqueue([Job("skip_t", "a"), Job("skip_t", "b")])
-    pipeline.selection(Skip(type="skip_t"))
+    pipeline.selection(Skip(task_type="skip_t"))
 
     summary = pipeline.run()
 
@@ -600,7 +600,7 @@ def test_spawned_excluded_child_stays_queued(monkeypatch, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("fetch", ok_handler)
     pipeline.enqueue(Job("fetch", "parent"))
-    pipeline.selection(Exclude(type="excluded_t"))
+    pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
 
@@ -618,7 +618,7 @@ def test_spawned_skip_child_is_terminal_skipped(monkeypatch, tmp_path):
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("skip_t", ok_handler)
     pipeline.enqueue(Job("fetch", "parent"))
-    pipeline.selection(Skip(type="skip_t"))
+    pipeline.selection(Skip(task_type="skip_t"))
 
     summary = pipeline.run()
 
@@ -731,7 +731,7 @@ def test_failed_parent_cascade_keeps_excluded_downstream(monkeypatch, tmp_path):
             Job("downstream", "grand", depends_on=["excluded_t::child"]),
         ]
     )
-    pipeline.selection(Exclude(type="excluded_t"))
+    pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
 
@@ -781,7 +781,7 @@ def test_selection_rules_contract_and_precedence():
         def __init__(self, task_type):
             self.task_type = task_type
 
-        def matches_type(self, task_type):
+        def matches_task_type(self, task_type):
             return task_type == self.task_type
 
     selection = Selection([ByType("pdf_to_md")])
@@ -789,25 +789,25 @@ def test_selection_rules_contract_and_precedence():
     # 非 Skip 形状的自定义规则归入 Exclude 语义。
     assert selection.is_excluded("pdf_to_md") is True
     assert selection.is_skipped("pdf_to_md") is False
-    assert selection.allows_type("pdf_to_md") is False
-    assert selection.allows_type("rank") is True
+    assert selection.allows_task_type("pdf_to_md") is False
+    assert selection.allows_task_type("rank") is True
     assert Selection().is_active is False
-    assert Selection().allows_type("anything") is True
+    assert Selection().allows_task_type("anything") is True
 
-    precedence = Selection([Skip("t"), Exclude("t")])
+    precedence = Selection([Skip(task_type="t"), Exclude(task_type="t")])
     assert precedence.is_skipped("t") is True and precedence.is_excluded("t") is False
-    assert precedence.allows_type("t") is False
+    assert precedence.allows_task_type("t") is False
     assert precedence.has_skip_rules is True
 
-    with pytest.raises(TypeError, match="matches_type"):
+    with pytest.raises(TypeError, match="matches_task_type"):
         Selection([object()])
 
-    class LegacyMatchesOnly:  # 旧形态规则必须 fail-loud，不允许静默漏判
-        def matches(self, job):
+    class RuleWithoutTaskTypeMatcher:
+        def matches_type(self, task_type):
             return True
 
-    with pytest.raises(TypeError, match="matches_type"):
-        Selection([LegacyMatchesOnly()])
+    with pytest.raises(TypeError, match="matches_task_type"):
+        Selection([RuleWithoutTaskTypeMatcher()])
 
 
 def test_public_surface_exports_selection_rule_types():
