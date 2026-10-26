@@ -29,20 +29,20 @@ class FakeJob:
 
 
 class FakeCtx:
-    """自制最小 ctx：只实现 is_completed/is_failed/attempted_uids（DiscoveryContext 协议）。"""
+    """自制最小 ctx：只实现 has_succeeded/has_failed/succeeded_or_failed_job_uids（DiscoveryContext 协议）。"""
 
     def __init__(self, done=(), failed=(), seen=()):
         self._done = set(done)
         self._failed = set(failed)
         self._seen = set(seen)
 
-    def is_completed(self, uid):
-        return uid in self._done
+    def has_succeeded(self, job_uid):
+        return job_uid in self._done
 
-    def is_failed(self, uid):
-        return uid in self._failed
+    def has_failed(self, job_uid):
+        return job_uid in self._failed
 
-    def attempted_uids(self):
+    def succeeded_or_failed_job_uids(self):
         return frozenset(self._seen)
 
 
@@ -91,8 +91,8 @@ class TestDiscoveryHandlerFrameworkIndependent:
         # 契约 T2：第二页未整页命中（old-c 是新的）→ 继续到空页
         # 通过 processed 包含 old-c 已隐式验证。
 
-    def test_full_mode_uses_attempted_uids_protocol_only(self):
-        """full + on_missing 的差集计算只依赖 ctx.attempted_uids()。"""
+    def test_full_mode_uses_succeeded_or_failed_job_uids_protocol_only(self):
+        """full + on_missing 的差集计算只依赖 ctx.succeeded_or_failed_job_uids()。"""
         processed.clear()
         missing_reported.clear()
         # child::vanished 已见但数据源里已不存在（源端删除）

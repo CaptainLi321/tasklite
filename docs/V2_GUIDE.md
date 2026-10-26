@@ -196,7 +196,9 @@ pipeline.stop()
 | `ctx.declare_input(path)` / `ctx.declare_input_uri(url)` | 声明输入（采集 stat 指纹，联动 `rerun="on_input_change"`） |
 | `ctx.get_cursor(key)` / `ctx.set_cursor(key, value)` | 高水位游标读写（成功时原子提交；`value=None` 删除） |
 | `ctx.suspend_resource(name, seconds)` | 全局挂起资源（429/配额熔断，跨进程跨重启持久化） |
-| `ctx.is_completed(uid)` / `ctx.is_failed(uid)` / `ctx.attempted_uids()` | wall/failed 快照查询（派发时刻快照语义） |
+| `ctx.has_succeeded(job_uid)` / `ctx.has_failed(job_uid)` / `ctx.succeeded_or_failed_job_uids()` | 成功/失败档案快照查询；并集不含 skipped、队列成员或 Attempt 历史（派发时刻快照，不实时刷新） |
+
+入队前可在 `run()` 外使用 `pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))`：仅排除成功档案命中的 Job，保留输入顺序；失败档案或队列中已有的 Job 仍可返回，重跑与队列去重分别由派发和入队处理。
 
 **run/stop 细节**：`run()` 返回 `RunSummary(exit_reason, stats, run_id, duration_seconds)`；`stop()` 请求 DRAINING（不再派发、在途自然完成），`stop(force=True)` 请求 ABORTING（分类消费在途任务）；`run_graceful()` 是统一包装（捕获 KeyboardInterrupt 转 DRAINING）。构造期钩子三件：`on_run_start` / `on_attempt_finished(uid, *, outcome: AttemptFinish)` / `on_run_end(exit_reason)`——同步、主线程、必须轻量非阻塞（抛异常只计数进 `stats["hook_errors"]`）。
 

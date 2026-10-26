@@ -195,23 +195,16 @@ class JobContext:
             self._journal.record_input_uri(self.job.uid, url_str, uri_fingerprint)
         return url_str
 
-    def is_completed(self, uid: str) -> bool:
-        """job 是否已在 wall 快照中（已成功完成过的内容）。"""
-        return uid in self._wall_keys
+    def has_succeeded(self, job_uid: str) -> bool:
+        """查询 job_uid 是否命中派发时的成功档案快照。"""
+        return job_uid in self._wall_keys
 
-    def is_failed(self, uid: str) -> bool:
-        """job 是否已在失败档案快照中（永久失败）。"""
-        return uid in self._failed_keys
+    def has_failed(self, job_uid: str) -> bool:
+        """查询 job_uid 是否命中派发时的失败档案快照。"""
+        return job_uid in self._failed_keys
 
-    def attempted_uids(self) -> frozenset:
-        """返回 wall∪failed 已见 uid 的只读快照。
-
-        扫描类包装器的 on_missing 需要「可迭代的已见集合」——本方法是
-        唯一公开入口，不暴露 ``_wall_keys`` 等私有字段（跨模块私有耦合，
-        字段名变更会静默失效）。返回**快照**（frozenset）而非活引用：
-        调用方改动返回值不影响框架内部集合（身份判定基础不被业务
-        mutate）。快照语义同 ``is_completed``/``is_failed``。
-        """
+    def succeeded_or_failed_job_uids(self) -> frozenset:
+        """返回派发时成功与失败档案 UID 的只读并集，不包含 skipped 或执行轨迹。"""
         return frozenset(self._wall_keys) | frozenset(self._failed_keys)
 
     def get_cursor(self, key: str) -> str | None:

@@ -55,8 +55,8 @@ def fake_ctx(
 
     Args:
         job: 测试目标 job。
-        wall: 已成功完成的 uid 集合（任意可迭代，``ctx.is_completed`` 命中源）。
-        failed: 已进失败档案的 uid 集合（任意可迭代，``ctx.is_failed`` 命中源）。
+        wall: 已成功完成的 uid 集合（任意可迭代，``ctx.has_succeeded`` 命中源）。
+        failed: 已进失败档案的 uid 集合（任意可迭代，``ctx.has_failed`` 命中源）。
         cursors: 游标初值映射（``ctx.get_cursor`` 命中源）。
         resources: 已注册资源名集合——``ctx.suspend_resource`` 按名单
             fail-loud 校验（与生产派发路径同语义）；缺省为空集，suspend

@@ -541,7 +541,7 @@ class TestEnqueue:
                 p.enqueue(Job("fetch", "a"))
 
 
-class TestUncompleted:
+class TestFilterJobsWithoutSuccess:
     """wall 过滤语义与顺序保持（委托 OpsConsole）。"""
 
     def test_wall_hits_filtered_order_preserved(self, tmp_path):
@@ -553,33 +553,33 @@ class TestUncompleted:
             Job("fetch", "new2"),
             Job("fetch", "done2"),
         ]
-        result = p.uncompleted(jobs)
+        result = p.filter_jobs_without_success(jobs)
         assert [j.uid for j in result] == ["fetch::new", "fetch::new2"]
 
     def test_empty_input_returns_empty(self, tmp_path):
-        assert make_pipeline(tmp_path).uncompleted([]) == []
+        assert make_pipeline(tmp_path).filter_jobs_without_success([]) == []
 
     def test_failed_entries_not_excluded(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.backend.append_failed("fetch::broken", {"error": "x"})
         jobs = [Job("fetch", "broken"), Job("fetch", "fresh")]
-        assert [j.uid for j in p.uncompleted(jobs)] == [
+        assert [j.uid for j in p.filter_jobs_without_success(jobs)] == [
             "fetch::broken",
             "fetch::fresh",
         ]
 
-    def test_enqueue_composition_only_enqueues_uncompleted(self, tmp_path):
+    def test_enqueue_composition_only_enqueues_jobs_without_success(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.seed_wall(["fetch::done"])
-        p.enqueue(p.uncompleted([Job("fetch", "done"), Job("fetch", "new")]))
+        p.enqueue(p.filter_jobs_without_success([Job("fetch", "done"), Job("fetch", "new")]))
         queued = {f"{r['task_type']}::{r['job_id']}" for r in p.backend.load_queue()}
         assert queued == {"fetch::new"}
 
     def test_run_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
         with running(p):
-            with pytest.raises(RuntimeError, match="uncompleted"):
-                p.uncompleted([])
+            with pytest.raises(RuntimeError, match="filter_jobs_without_success"):
+                p.filter_jobs_without_success([])
 
 
 # ── 六步契约与运行门面 ────────────────────────────────────────────────

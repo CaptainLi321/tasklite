@@ -7,7 +7,7 @@
 - cursor_key 前缀单射性（length-prefix 防跨组碰撞）
 
 依赖宽限（governor）语义的用例不在本文件——v2 已收敛至
-tests/v2/engine/test_governor.py；attempted_uids 上下文 API 契约由
+tests/v2/engine/test_governor.py；succeeded_or_failed_job_uids 上下文 API 契约由
 tests/v2/models/test_context.py 锁定，此处仅保留 discovery 端到端回归。
 """
 from __future__ import annotations
@@ -469,7 +469,7 @@ class TestMissingDetection:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# cursor_key 前缀单射与 attempted_uids 端到端回归
+# cursor_key 前缀单射与 succeeded_or_failed_job_uids 端到端回归
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -520,14 +520,14 @@ class TestCursorKeyPrefixInjective:
         assert missing == {"3%3Ag_A0", "3%3Ag_A1"}, f"本组已删应报全、跨组不得误报: {missing}"
 
 
-class TestAttemptedUidsUsage:
-    """on_missing 差集计算经 ctx.attempted_uids 公开快照 API 的端到端回归。
+class TestSucceededOrFailedJobUidsUsage:
+    """on_missing 差集计算经 ctx.succeeded_or_failed_job_uids 公开快照 API 的端到端回归。
 
-    attempted_uids 的上下文契约（wall∪failed 并集、快照语义）由
+    succeeded_or_failed_job_uids 的上下文契约（wall∪failed 并集、快照语义）由
     tests/v2/models/test_context.py 锁定，此处只验证 discovery 消费路径。"""
 
-    def test_discovery_on_missing_uses_attempted_uids(self, tmp_path):
-        """端到端回归：on_missing 差集计算经 attempted_uids 仍正确。"""
+    def test_discovery_on_missing_uses_succeeded_or_failed_job_uids(self, tmp_path):
+        """端到端回归：on_missing 差集计算经 succeeded_or_failed_job_uids 仍正确。"""
         p = _pipeline(tmp_path)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing2.txt"

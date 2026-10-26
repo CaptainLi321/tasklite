@@ -293,6 +293,10 @@ pipeline.enqueue([
 pipeline.run()
 ```
 
+handler 可用 `ctx.has_succeeded(job_uid)`、`ctx.has_failed(job_uid)` 查询派发时的成功/失败档案快照；`ctx.succeeded_or_failed_job_uids()` 返回两者的只读并集，不含 skipped、队列成员或 Attempt 历史，不实时刷新。
+
+入队前可在 `run()` 外调用 `pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))`：仅排除成功档案命中者，保留输入顺序；失败档案和队列中已有的 Job 仍可返回。
+
 ### Recipe 5: 官方 HTTP 守卫与原始响应快照重放 (HTTP Wrappers)
 
 ```python

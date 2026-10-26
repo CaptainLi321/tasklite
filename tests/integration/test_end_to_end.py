@@ -324,7 +324,7 @@ class TestEndToEnd:
             "work::step_one",
             "work::step_two",
         ]
-        assert p.uncompleted([Job("work", "step_one"), Job("work", "next")]) == [
+        assert p.filter_jobs_without_success([Job("work", "step_one"), Job("work", "next")]) == [
             Job("work", "next")
         ]
 

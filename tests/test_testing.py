@@ -64,16 +64,16 @@ class TestFakeCtxBasics:
         job = _job()
         ctx = fake_ctx(job)
         assert ctx.job is job
-        assert not ctx.is_completed("fetch::j1")
-        assert not ctx.is_failed("fetch::j1")
+        assert not ctx.has_succeeded("fetch::j1")
+        assert not ctx.has_failed("fetch::j1")
         assert ctx.get_cursor("any") is None
 
     def test_wall_failed_accept_any_iterable(self):
         ctx = fake_ctx(_job(), wall=["a::1", "a::2"], failed=("b::1",))
-        assert ctx.is_completed("a::1")
-        assert ctx.is_completed("a::2")
-        assert ctx.is_failed("b::1")
-        assert ctx.attempted_uids() == frozenset({"a::1", "a::2", "b::1"})
+        assert ctx.has_succeeded("a::1")
+        assert ctx.has_succeeded("a::2")
+        assert ctx.has_failed("b::1")
+        assert ctx.succeeded_or_failed_job_uids() == frozenset({"a::1", "a::2", "b::1"})
 
     def test_cursors_mapping_visible(self):
         ctx = fake_ctx(_job(), cursors={"high_water": "2026-01-01"})

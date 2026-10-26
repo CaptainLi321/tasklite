@@ -2,7 +2,7 @@
 
 从 StateStore 剥离管理段逻辑（list_failures / clear_failures / retry_
 failure / clear_history / seed_wall / seed_cursor / list_suspensions /
-uncompleted），供门面管理 API 委托。不变式：管理 API 仅限 run() 外
+filter_jobs_without_success），供门面管理 API 委托。不变式：管理 API 仅限 run() 外
 调用（改变 is_known 判定基础，与 enqueue 同纪律）。
 """
 from __future__ import annotations
@@ -129,7 +129,7 @@ class OpsConsole:
             ))
         return entries
 
-    def uncompleted(self, jobs: Sequence[Job]) -> list[Job]:
+    def filter_jobs_without_success(self, jobs: Sequence[Job]) -> list[Job]:
         """过滤出尚未成功完成的 job（uid 不在 wall 的子集，保留输入顺序）。
 
         回溯/增量场景的入队前过滤辅助。边界语义：

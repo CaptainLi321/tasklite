@@ -556,14 +556,14 @@ class TaskLite:
 
     # ── 入队与过滤（六步之四前置）──────────────────────────────────
 
-    def uncompleted(self, jobs: Sequence[Job]) -> list[Job]:
+    def filter_jobs_without_success(self, jobs: Sequence[Job]) -> list[Job]:
         """过滤出尚未成功完成的 job（uid 不在 wall 的子集，保留输入顺序）。
 
         委托 OpsConsole；边界语义（failed 不排除、队列驻留不排除）见其
-        docstring。标准姿势：``pipeline.enqueue(pipeline.uncompleted(jobs))``。
+        docstring。标准姿势：``pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))``。
         """
-        self._ensure_not_running("uncompleted")
-        return self._console.uncompleted(jobs)
+        self._ensure_not_running("filter_jobs_without_success")
+        return self._console.filter_jobs_without_success(jobs)
 
     def enqueue(self, jobs: Job | Sequence[Job], *, front: bool = False) -> None:
         """入队作业（重复 uid 静默跳过，front=True 插队首）。

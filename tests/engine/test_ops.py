@@ -3,7 +3,7 @@
 覆盖：list_failures / clear_failures / retry_failure（失败档案运维面，
 含损坏行防御与 payload 快照）、clear_history（wall/failed 删除通道与
 谓词）、seed_wall / seed_cursor（含六集合互斥零写入拒绝）、
-list_suspensions（meta 真相源视图）、uncompleted（wall 过滤辅助）与
+list_suspensions（meta 真相源视图）、filter_jobs_without_success（wall 过滤辅助）与
 换库重绑定一致性。规则：全部管理 API 仅限 run() 外调用。
 """
 
@@ -34,7 +34,7 @@ def _make_console(backend: InMemoryStateBackend | None = None):
 
 
 def _ok_handler(job, ctx):
-    """占位 handler（模块级，仅作 uncompleted 过滤面参考）。"""
+    """占位 handler（模块级，仅作 filter_jobs_without_success 过滤面参考）。"""
     return True
 
 
@@ -438,23 +438,24 @@ class TestListSuspensions:
         assert console.list_suspensions() == []
 
 
-class TestUncompleted:
+class TestFilterJobsWithoutSuccess:
     """入队前 wall 过滤辅助。"""
 
     def test_filters_by_wall_only(self):
         backend, _, console = _make_console()
         backend.seed_wall(["t::done", "t::failed_then_done"])
         backend.append_failed("t::failed", {"error": "x"})
+        backend.enqueue_jobs([Job("t", "queued").to_dict()])
         jobs = [
-            Job("t", "done"), Job("t", "failed"), Job("t", "fresh"),
+            Job("t", "done"), Job("t", "failed"), Job("t", "queued"), Job("t", "fresh"),
         ]
-        remaining = console.uncompleted(jobs)
-        assert [j.uid for j in remaining] == ["t::failed", "t::fresh"]
+        remaining = console.filter_jobs_without_success(jobs)
+        assert [j.uid for j in remaining] == ["t::failed", "t::queued", "t::fresh"]
 
     def test_empty_wall_returns_all_in_order(self):
         _, _, console = _make_console()
         jobs = [Job("t", "b"), Job("t", "a")]
-        assert console.uncompleted(jobs) == jobs
+        assert console.filter_jobs_without_success(jobs) == jobs
 
 
 class TestBackendSwapRebind:

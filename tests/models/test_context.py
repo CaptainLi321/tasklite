@@ -45,17 +45,21 @@ class TestSnapshotSemantics:
 
     def test_default_state_empty(self):
         ctx = _make_ctx()
-        assert not ctx.is_completed("fetch::j1")
-        assert not ctx.is_failed("fetch::j1")
+        assert not ctx.has_succeeded("fetch::j1")
+        assert not ctx.has_failed("fetch::j1")
         assert ctx.get_cursor("any") is None
-        assert ctx.attempted_uids() == frozenset()
+        assert ctx.succeeded_or_failed_job_uids() == frozenset()
 
     def test_wall_failed_snapshot_visible(self):
         ctx = _make_ctx(wall={"a::one", "a::two"}, failed={"b::one"})
-        assert ctx.is_completed("a::one")
-        assert ctx.is_completed("a::two")
-        assert ctx.is_failed("b::one")
-        assert ctx.attempted_uids() == frozenset({"a::one", "a::two", "b::one"})
+        assert ctx.has_succeeded(job_uid="a::one")
+        assert ctx.has_succeeded("a::two")
+        assert ctx.has_failed(job_uid="b::one")
+        job_uids = ctx.succeeded_or_failed_job_uids()
+        assert isinstance(job_uids, frozenset)
+        assert job_uids == frozenset({"a::one", "a::two", "b::one"})
+        assert not ctx.has_succeeded(job_uid="b::one")
+        assert not ctx.has_failed(job_uid="a::one")
 
     def test_cursors_visible_and_updatable(self):
         ctx = _make_ctx(cursors={"high_water": "2026-01-01"})

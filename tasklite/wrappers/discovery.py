@@ -7,7 +7,7 @@
 任何实现该协议的宿主/测试桩均可直接复用。
 
 「已见集合」的实现载体：框架的 wall/failed 集合
-（``ctx.is_completed`` / ``ctx.is_failed`` 的 run 派发时刻快照）——
+（``ctx.has_succeeded`` / ``ctx.has_failed`` 的 run 派发时刻快照）——
 **无 cursor、无 seen 持久化、无互斥注入、无 poison 表**。
 
 为什么成立：discovery 的 seen 集合与框架 wall/failed 集合是同一份数据
@@ -22,7 +22,7 @@
 - ``cursor_key_func``（可选）：仅作 job_id 命名空间前缀（防止跨分组内容 id
   碰撞导致 wall 去重误吞），无游标语义。
 - 坏 item 由 process 子任务的任务层重试/失败档案吸收——子任务进失败档案
-  即 ``is_failed`` = 已见，不再重新 spawn；失败档案内容在 failed 快照中算
+  即 ``has_failed`` = 已见，不再重新 spawn；失败档案内容在 failed 快照中算
   「已见」，含坏 item 的页可正常整页命中。
 - wall/failed 快照在 discovery job 派发时固定：同一内容本次 run 内跨页重复
   出现时会重复 spawn（框架 wall 去重吸收，仅浪费一次 spawn 调用）。
@@ -72,7 +72,7 @@ S1. 已见集合是「自首次运行以来见过的所有内容 id 的并集」
 S2. **禁止**把已见集合截断为「最旧 N 个」「最近 N 个」或任何滑动窗口：
     截断后窗口外的已见 id 下次被误判为「新内容」→ 重复处理，且破坏
     T2 的整页命中判定。
-S3. 已见集合 = 框架 wall/failed 快照（``ctx.is_completed`` / ``ctx.is_failed``），
+S3. 已见集合 = 框架 wall/failed 快照（``ctx.has_succeeded`` / ``ctx.has_failed``），
     完整与持久由后端 ACID 事务保证。**无独立 seen 持久化、无 compact 编码**
     ——「百万级 seen」由 wall 表承载（wall 本就是完整历史），语义无损。
 S4. 成员判定 ``f"{process_task_type}::{content_id}" in wall∪failed`` 必须
@@ -156,14 +156,14 @@ class DiscoveryContext(Protocol):
     """扫描循环需要的最小上下文接口（框架无关）。
 
     语义契约（由宿主保证）：
-    - ``is_completed`` / ``is_failed``：派发时刻 wall/failed 快照成员判定；
-    - ``attempted_uids``：wall∪failed 的只读快照（full 模式 on_missing 差集用）。
+    - ``has_succeeded`` / ``has_failed``：派发时刻 wall/failed 快照成员判定；
+    - ``succeeded_or_failed_job_uids``：wall∪failed 的只读快照（full 模式 on_missing 差集用）。
     本模块不要求也不探测任何其他 ctx 字段/方法。
     """
 
-    def is_completed(self, uid: str) -> bool: ...
-    def is_failed(self, uid: str) -> bool: ...
-    def attempted_uids(self) -> Iterable[str]: ...
+    def has_succeeded(self, job_uid: str) -> bool: ...
+    def has_failed(self, job_uid: str) -> bool: ...
+    def succeeded_or_failed_job_uids(self) -> Iterable[str]: ...
 
 
 class DiscoveryHost(Protocol):
@@ -204,14 +204,14 @@ class DiscoveryHandler:
     """按 REQUIREMENTS CONTRACT 实现的增量发现 handler（纯任务模型）。
 
     **框架无关**：本类及其扫描循环只依赖 ``DiscoveryJob`` / ``DiscoveryContext``
-    两个最小协议（payload + is_completed/is_failed/attempted_uids），运行时
+    两个最小协议（payload + has_succeeded/has_failed/succeeded_or_failed_job_uids），运行时
     **不 import 任何框架模块**，可被任何实现这两个协议的宿主直接复用；
     TaskLite 只是框架默认宿主。
 
     框架负责契约规定的全部语义：
       - 从第 1 页起逐页扫描，page 由框架传入，用户 fetch_func 只拉一页；
-      - 「已见」判定 = wall/failed 快照成员判定（``ctx.is_completed`` /
-        ``ctx.is_failed``），完整集合由框架保证；
+      - 「已见」判定 = wall/failed 快照成员判定（``ctx.has_succeeded`` /
+        ``ctx.has_failed``），完整集合由框架保证；
       - 整页命中或空页才终止；仅完整扫描结束才返回成功（本模型无游标，
         崩溃即整轮重扫，重不漏由确定性 job_id + wall 去重吸收）；
       - 每个新 item 以编码后的 content_id 交给 ``process_item_func``，
@@ -426,7 +426,7 @@ class DiscoveryHandler:
             # break——一路扫到空页或 max_pages（全量成本只在 fetch，已见
             # 内容仍逐条跳过）。
             page_all_seen = all(
-                ctx.is_completed(uid) or ctx.is_failed(uid)
+                ctx.has_succeeded(uid) or ctx.has_failed(uid)
                 for _, _, uid in page_entries
             )
             if page_all_seen and scan_mode != "full":
@@ -447,10 +447,10 @@ class DiscoveryHandler:
         整轮扫描；跳过不入任何集合，下次 run 重试。达失败档案阈值由 process
         子任务的任务层重试/失败档案吸收，本层不计数）。整页已见时复用
         page_all_seen 短路——循环内判定与 all 判定语义一致（均为
-        is_completed or is_failed），无需对同批 entry 重复查询快照。
+        has_succeeded or has_failed），无需对同批 entry 重复查询快照。
         """
         for item, content_id, uid in page_entries:
-            if page_all_seen or ctx.is_completed(uid) or ctx.is_failed(uid):
+            if page_all_seen or ctx.has_succeeded(uid) or ctx.has_failed(uid):
                 continue
             try:
                 self.process_item_func(job, ctx, item, content_id)
@@ -484,7 +484,7 @@ class DiscoveryHandler:
             group_prefix = (
                 percent_encode(prefix, allowed=CONTENT_ID_ALLOWED) if prefix else ""
             )
-            for uid in ctx.attempted_uids():
+            for uid in ctx.succeeded_or_failed_job_uids():
                 if uid.startswith(ptype_prefix):
                     content_part = uid[len(ptype_prefix):]
                     if not group_prefix or _in_cursor_group(content_part, group_prefix):

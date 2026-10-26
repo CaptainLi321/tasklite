@@ -101,10 +101,11 @@ _Avoid_: SpawnArgs, ProcessPayload
 
 **JobContext**:
 The execution context handed to a handler, belonging to one job execution (`spawn` / `declare_output` / `declare_input` / cursors / `suspend_resource` / wall-failed snapshot queries).
+`has_succeeded(job_uid)` / `has_failed(job_uid)` 查询派发时的成功/失败档案快照；`succeeded_or_failed_job_uids()` 返回只读并集，不含 skipped、队列成员或 Attempt 历史，不实时刷新。
 _Avoid_: TaskContext, ExecContext, HandlerEnv
 
 **OpsConsole**:
-The pure operations seam for management APIs used outside `run()` (list_failures / clear_failures / clear_history / seed_wall / seed_cursor), constructed with explicit `(backend, store, classifier)` dependencies and delegated to by the TaskLite facade.
+The pure operations seam for management APIs used outside `run()` (list_failures / clear_failures / clear_history / seed_wall / seed_cursor), constructed with explicit `(backend, store, classifier)` dependencies and delegated to by the TaskLite facade. `filter_jobs_without_success(jobs)` 仅过滤成功档案命中者，保留输入顺序，failed 与 queued Job 仍可返回。
 _Avoid_: AdminAPI, MaintenanceService
 
 **wait / decide_wait**:

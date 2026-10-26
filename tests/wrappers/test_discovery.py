@@ -1,7 +1,7 @@
 """v2 register_discovery 契约测试（REQUIREMENTS CONTRACT，见 v2 wrappers discovery 模块）。
 
-纯任务模型增量发现：已见集合 = wall/failed 快照（ctx.is_completed /
-ctx.is_failed），无 cursor、无 seen 持久化、无 poison 表、无互斥注入。
+纯任务模型增量发现：已见集合 = wall/failed 快照（ctx.has_succeeded /
+ctx.has_failed），无 cursor、无 seen 持久化、无 poison 表、无互斥注入。
 移植 v1 同源测试并按 v2 公开面改写（encode_content_id / register_task）。
 
 契约验证场景：
@@ -381,7 +381,7 @@ class TestCrashRerun:
 
 class TestInteractionMatrix:
     def test_failed_child_is_seen_via_failed_archive(self):
-        """process 子任务进失败档案（FatalError）→ is_failed 判定为已见。
+        """process 子任务进失败档案（FatalError）→ has_failed 判定为已见。
 
         poison 机制的替代：坏内容不再重新 spawn（等价旧版 dead-letter），
         且含坏 item 的页可正常整页命中（旧版含毒页永不命中，需 max_pages
