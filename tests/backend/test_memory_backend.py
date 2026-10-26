@@ -12,10 +12,10 @@ import pytest
 from tasklite.backend import InMemoryStateBackend
 from tasklite.models.attempt import ATTEMPT_RUNNING, AttemptRecord
 from tasklite.models.job import Job
-from tasklite.models.state import uid_from_job_dict
+from tasklite.models.state import job_uid_from_snapshot
 
 
-def _job_dict(job_id: str, **overrides) -> dict:
+def _job_snapshot(job_id: str, **overrides) -> dict:
     """标准 job dict 构造（backend 存储行形态）。"""
     data = Job("t", job_id).to_dict()
     data.update(overrides)
@@ -46,53 +46,53 @@ class TestInMemoryBackendContract:
         assert b.load_cursors() == {}
         assert b.load_queue() == []
         assert b.load_attempts("t::missing") == []
-        assert b.get_meta("any") is None
+        assert b.get_engine_metadata("any") is None
 
     def test_enqueue_dedup_within_and_across_batches(self):
         b = InMemoryStateBackend()
-        first = _job_dict("one")
-        second = _job_dict("two")
+        first = _job_snapshot("one")
+        second = _job_snapshot("two")
         assert b.enqueue_jobs([first, second]) == ["t::one", "t::two"]
         assert len(b.load_queue()) == 2
 
         # 队列已有 uid 与批次内重复都跳过，只插入新条目
-        inserted = b.enqueue_jobs([first, _job_dict("one"), _job_dict("three")])
+        inserted = b.enqueue_jobs([first, _job_snapshot("one"), _job_snapshot("three")])
         assert inserted == ["t::three"]
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == [
+        assert [job_uid_from_snapshot(j) for j in b.load_queue()] == [
             "t::one", "t::two", "t::three",
         ]
 
     def test_enqueue_front_and_back_ordering(self):
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict("base")])
-        b.enqueue_jobs([_job_dict("front")], front=True)
-        b.enqueue_jobs([_job_dict("back")], front=False)
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == [
+        b.enqueue_jobs([_job_snapshot("base")])
+        b.enqueue_jobs([_job_snapshot("front")], front=True)
+        b.enqueue_jobs([_job_snapshot("back")], front=False)
+        assert [job_uid_from_snapshot(j) for j in b.load_queue()] == [
             "t::front", "t::base", "t::back",
         ]
 
     def test_meta_persistence(self):
         b = InMemoryStateBackend()
-        assert b.get_meta("key_one") is None
-        b.set_meta("key_one", "val_one")
-        assert b.get_meta("key_one") == "val_one"
-        b.set_meta("key_one", "val_two")
-        assert b.get_meta("key_one") == "val_two"
+        assert b.get_engine_metadata("key_one") is None
+        b.set_engine_metadata("key_one", "val_one")
+        assert b.get_engine_metadata("key_one") == "val_one"
+        b.set_engine_metadata("key_one", "val_two")
+        assert b.get_engine_metadata("key_one") == "val_two"
 
     def test_commit_job_success_with_spawn_and_cursor(self):
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict("one")])
+        b.enqueue_jobs([_job_snapshot("one")])
 
         ok = b.commit_job_success(
             "t::one",
             {"status": "ok"},
-            spawned_jobs=[_job_dict("child")],
+            spawned_job_snapshots=[_job_snapshot("child")],
             cursor_updates={"page": "two"},
         )
         assert ok is True
         assert b.load_wall()["t::one"] == {"status": "ok"}
         assert b.load_cursors() == {"page": "two"}
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::child"]
+        assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::child"]
 
     def test_commit_job_success_stores_exact_meta_without_injection(self):
         """失败/成功 meta 原样落库：backend 不解释 meta、不注入派生字段。"""
@@ -102,7 +102,7 @@ class TestInMemoryBackendContract:
 
     def test_commit_job_failure_records_archive_and_clears_queue(self):
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict("doomed")])
+        b.enqueue_jobs([_job_snapshot("doomed")])
 
         ok = b.commit_job_failure("t::doomed", {"error": "NETWORK_TIMEOUT"})
         assert ok is True
@@ -113,16 +113,16 @@ class TestInMemoryBackendContract:
 
     def test_commit_job_failure_preserves_remaining_queue(self):
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict("discard"), _job_dict("next")])
+        b.enqueue_jobs([_job_snapshot("discard"), _job_snapshot("next")])
         assert b.commit_job_failure("t::discard", {}) is True
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::next"]
+        assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::next"]
 
     def test_commit_retry_same_uid_requeue(self):
-        """同 uid 重试 = DELETE+INSERT：实例位随 job_data 自然往返。"""
+        """同 uid 重试 = DELETE+INSERT：实例位随 job_snapshot 自然往返。"""
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict("retry_one")])
+        b.enqueue_jobs([_job_snapshot("retry_one")])
 
-        requeued = _job_dict("retry_one", attempt_no=2)
+        requeued = _job_snapshot("retry_one", attempt_no=2)
         assert b.commit_retry("t::retry_one", requeued, front=True) is True
         queue = b.load_queue()
         assert len(queue) == 1
@@ -131,19 +131,19 @@ class TestInMemoryBackendContract:
 
     def test_commit_retry_conflicting_uid_returns_false(self):
         b = InMemoryStateBackend()
-        job_a = _job_dict("alpha")
-        job_b = _job_dict("beta")
+        job_a = _job_snapshot("alpha")
+        job_b = _job_snapshot("beta")
         b.enqueue_jobs([job_a, job_b])
 
         assert b.commit_retry("t::ghost", job_a) is False
         # 冲突后 on-disk 队列原样（绝不产出重复条目却报成功）
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::alpha", "t::beta"]
+        assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::alpha", "t::beta"]
 
     def test_commit_bulk_failure_preserves_remaining_order(self):
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict(j) for j in ("first", "second", "third")])
+        b.enqueue_jobs([_job_snapshot(j) for j in ("first", "second", "third")])
         assert b.commit_bulk_failure([("t::first", {"err": "x"}), ("t::second", {"err": "y"})]) is True
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::third"]
+        assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::third"]
         assert set(b.load_failed()) == {"t::first", "t::second"}
 
     def test_commit_bulk_failure_empty_is_noop(self):
@@ -153,16 +153,16 @@ class TestInMemoryBackendContract:
 
     def test_commit_skip_removes_stale_uid_only(self):
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict("stale"), _job_dict("live")])
+        b.enqueue_jobs([_job_snapshot("stale"), _job_snapshot("live")])
         assert b.commit_skip("t::stale") is True
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::live"]
+        assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::live"]
         assert b.load_wall() == {} and b.load_failed() == {}
 
     def test_delete_queue_uids_targeted(self):
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict(j) for j in ("a", "b", "c")])
+        b.enqueue_jobs([_job_snapshot(j) for j in ("a", "b", "c")])
         assert b.delete_queue_uids(["t::a", "t::c", "t::ghost"]) == 2
-        assert [uid_from_job_dict(j) for j in b.load_queue()] == ["t::b"]
+        assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::b"]
 
 
 class TestMemoryAttemptTrajectory:
@@ -240,7 +240,7 @@ class TestMemoryAttemptTrajectory:
     def test_attempts_untouched_by_terminal_commits(self):
         """旁路观测面：终态提交不触碰 attempts 行。"""
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict("one")])
+        b.enqueue_jobs([_job_snapshot("one")])
         attempt_id = b.append_attempt(_running_attempt("t::one"))
         b.update_attempt(attempt_id, outcome="failed", finished_at="2026-05-01T00:00:05+00:00", error="boom")
         b.commit_job_failure("t::one", {"error": "boom"}, job_payload={"k": 1})
@@ -360,7 +360,7 @@ class TestMemorySnapshotIsolation:
 
     def test_load_queue_result_mutation_is_invisible(self):
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_dict("one", payload={"x": 1})])
+        b.enqueue_jobs([_job_snapshot("one", payload={"x": 1})])
         snapshot = b.load_queue()
         snapshot[0]["payload"]["x"] = 999
         snapshot.pop()
@@ -377,7 +377,7 @@ class TestMemorySnapshotIsolation:
 
     def test_enqueue_input_mutation_is_invisible(self):
         b = InMemoryStateBackend()
-        job = _job_dict("one", payload={"x": 1})
+        job = _job_snapshot("one", payload={"x": 1})
         b.enqueue_jobs([job])
         job["payload"]["x"] = 999
         assert b.load_queue()[0]["payload"] == {"x": 1}

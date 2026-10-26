@@ -19,7 +19,7 @@ from typing import Any, Callable, Mapping, Sequence
 from ..models.attempt import ATTEMPT_OUTCOMES, AttemptRecord
 
 
-def validate_queue_replacement(jobs: Any) -> None:
+def validate_queue_replacement(job_snapshots: Any) -> None:
     """整表替换集统一形状校验（save_queue / replace_queue_atomic 共用）。
 
     契约：替换集必须是 job dict 的 list/tuple（与 load_queue 行形态一致）；
@@ -29,16 +29,16 @@ def validate_queue_replacement(jobs: Any) -> None:
     混过校验，SQLite 腿「DELETE 全表成功 + INSERT 全跳过」会静默清空整条
     队列且事务正常提交，与 Memory 腿抛 TypeError 且队列原状形成行为分叉。
     """
-    if not isinstance(jobs, (list, tuple)):
+    if not isinstance(job_snapshots, (list, tuple)):
         raise TypeError(
             f"queue replacement must be a list of job dicts, "
-            f"got {type(jobs).__name__}"
+            f"got {type(job_snapshots).__name__}"
         )
-    for i, job in enumerate(jobs):
-        if not isinstance(job, dict):
+    for i, job_snapshot in enumerate(job_snapshots):
+        if not isinstance(job_snapshot, dict):
             raise TypeError(
                 f"queue replacement item #{i} must be a job dict, "
-                f"got {type(job).__name__}"
+                f"got {type(job_snapshot).__name__}"
             )
 
 
@@ -110,7 +110,7 @@ class AbstractStateBackend(ABC):
       seed_wall / seed_cursor）：加载期 repair 差量落盘与运维接缝；
     - 尝试轨迹（append_attempt / update_attempt / load_attempts）：
       append-only 旁路观测面；
-    - 元数据（get_meta / set_meta）：框架级键值（fencing 的 last_run_id 等）。
+    - 元数据（get_engine_metadata / set_engine_metadata）：框架级键值（fencing 的 last_run_id 等）。
     """
 
     # 全量加载 -------------------------------------------------------
@@ -138,7 +138,7 @@ class AbstractStateBackend(ABC):
     # 整表重写 -------------------------------------------------------
 
     @abstractmethod
-    def save_queue(self, jobs: list[dict[str, Any]]) -> None:
+    def save_queue(self, job_snapshots: list[dict[str, Any]]) -> None:
         """整表重写队列（测试装配 / replace_queue_atomic 的事务内步骤）。
 
         红线：这是「无读基准的整表覆盖」——跨进程并发的 enqueue/commit
@@ -176,10 +176,10 @@ class AbstractStateBackend(ABC):
     @abstractmethod
     def commit_job_success(
         self,
-        uid: str,
+        job_uid: str,
         result_meta: dict,
         *,
-        spawned_jobs: Sequence[dict[str, Any]] = (),
+        spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
     ) -> bool:
         """原子持久化一个成功 job 的 delta。
@@ -187,7 +187,7 @@ class AbstractStateBackend(ABC):
         单事务效果：
         - wall：INSERT/REPLACE uid → result_meta；
         - queue：DELETE 被弹出的 uid；
-        - queue：spawned_jobs 队头插入（保序）；
+        - queue：spawned_job_snapshots 队头插入（保序）；
         - failed：DELETE 同名残行（成功终态唯一，防 wall∩failed 并存）；
         - cursors：合并 cursor_updates（None 值表示删除游标）。
 
@@ -199,7 +199,7 @@ class AbstractStateBackend(ABC):
     @abstractmethod
     def commit_job_failure(
         self,
-        uid: str,
+        job_uid: str,
         result_meta: dict,
         job_payload: dict[str, Any] | None = None,
     ) -> bool:
@@ -216,12 +216,12 @@ class AbstractStateBackend(ABC):
     @abstractmethod
     def commit_retry(
         self,
-        popped_uid: str,
-        requeued_job: dict[str, Any],
+        popped_job_uid: str,
+        requeued_job_snapshot: dict[str, Any],
         *,
         front: bool = False,
     ) -> bool:
-        """原子持久化一次重入队 delta：DELETE popped_uid + 按 front 插入 requeued_job。
+        """原子持久化一次重入队 delta：DELETE popped_job_uid + 按 front 插入 requeued_job_snapshot。
 
         不写 wall/failed。同 uid 重试是 DELETE+INSERT（一次执行没有独立
         持久身份，身份仍是 uid）。重插不得静默丢弃：requeued uid 撞上删除
@@ -230,7 +230,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def commit_bulk_failure(self, uids_metas: list[tuple[str, dict]]) -> bool:
+    def commit_bulk_failure(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
         """原子批量写失败档案（死锁/级联场景）的 delta。
 
         单事务效果：failed INSERT/REPLACE 每个 uid → meta；
@@ -241,7 +241,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def commit_skip(self, uid: str) -> bool:
+    def commit_skip(self, job_uid: str) -> bool:
         """delta 删除队列中已终态（重复）的 uid。
 
         去重命中（uid 已在 wall/failed）时调用——磁盘队列中该 uid 是残留
@@ -251,7 +251,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def append_failed(self, uid: str, payload: dict[str, Any] | None = None) -> None:
+    def append_failed(self, job_uid: str, payload: dict[str, Any] | None = None) -> None:
         """绕过队列直接写一条失败档案记录（带外登记面）。
 
         按 uid REPLACE（幂等）；不触碰 queue/wall/cursors。持久化失败
@@ -261,8 +261,8 @@ class AbstractStateBackend(ABC):
     # 增量入队 -------------------------------------------------------
 
     @abstractmethod
-    def enqueue_jobs(self, jobs: list[dict[str, Any]], *, front: bool = False) -> list[str]:
-        """批量增量入队：按 front 在队列头/尾插入 jobs（保序），单事务原子。
+    def enqueue_jobs(self, job_snapshots: list[dict[str, Any]], *, front: bool = False) -> list[str]:
+        """批量增量入队：按 front 在队列头/尾插入 job_snapshots（保序），单事务原子。
 
         跳过与现有队列重复的 uid（含批次内重复，首个存储），返回实际插入
         的 uid 列表。与 commit_* 的 delta 语义对齐：不做全表重写——运行中
@@ -274,7 +274,7 @@ class AbstractStateBackend(ABC):
     # 定向删除与种子 --------------------------------------------------
 
     @abstractmethod
-    def delete_queue_uids(self, uids: list[str]) -> int:
+    def delete_queue_uids(self, job_uids: list[str]) -> int:
         """按 uid 定向批量删除队列行（加载期 repair 的差量落盘唯一出口）。
 
         与 save_queue 的全表重写相对：只 DELETE 指定 uid 的行，其余行原样
@@ -285,7 +285,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def delete_failed(self, uids: list[str]) -> int:
+    def delete_failed(self, job_uids: list[str]) -> int:
         """从失败档案批量删除指定 uid（clear_failures 的后端实现）。
 
         返回实际删除行数（连带清除 payload 快照）。不触碰 queue/wall。
@@ -293,7 +293,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def delete_wall(self, uids: list[str]) -> int:
+    def delete_wall(self, job_uids: list[str]) -> int:
         """从 wall 批量删除指定 uid（clear_history 的后端实现 + commit 路径事务内清理）。
 
         两种调用上下文：
@@ -307,7 +307,7 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def seed_wall(self, uids: list[str]) -> int:
+    def seed_wall(self, job_uids: list[str]) -> int:
         """把 uid 批量写入 wall（meta 为空 dict）——存档迁移标记「已处理」。
 
         幂等：已存在的 uid 被覆盖（meta 重置为空）。返回实际写入行数。
@@ -365,11 +365,11 @@ class AbstractStateBackend(ABC):
     # 元数据 ---------------------------------------------------------
 
     @abstractmethod
-    def get_meta(self, key: str) -> str | None:
+    def get_engine_metadata(self, key: str) -> str | None:
         """读取一条框架级元数据（如 fencing 的 last_run_id）。无则返回 None。"""
 
     @abstractmethod
-    def set_meta(self, key: str, value: str) -> None:
+    def set_engine_metadata(self, key: str, value: str) -> None:
         """写入一条框架级元数据（UPSERT 语义）。失败抛异常（不吞）。"""
 
 

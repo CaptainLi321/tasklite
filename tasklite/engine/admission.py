@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Protocol
 
-from ..models.state import uid_from_job_dict
+from ..models.state import job_uid_from_snapshot
 
 
 class TerminalHistory(Protocol):
@@ -91,15 +91,15 @@ class RerunPolicy:
         """清空实例级文件 stat 缓存。"""
         self._stat_cache.clear()
 
-    def normalize_job_dict(self, job_dict: dict, task_type: str) -> bool:
+    def normalize_job_snapshot(self, job_snapshot: dict, task_type: str) -> bool:
         """入队与 Spawn 时的 Job 字典规范化（注入任务级默认策略）。
 
-        仅在 job_dict['rerun'] is None 时注入默认策略；显式指定的 'never'
+        仅在 job_snapshot['rerun'] is None 时注入默认策略；显式指定的 'never'
         或其它策略一律尊重。
         """
         disc_rerun = self.discovery_rerun.get(task_type)
-        if disc_rerun and job_dict.get("rerun") is None:
-            job_dict["rerun"] = disc_rerun
+        if disc_rerun and job_snapshot.get("rerun") is None:
+            job_snapshot["rerun"] = disc_rerun
             return True
         return False
 
@@ -144,7 +144,7 @@ class RerunPolicy:
 
     def evaluate(
         self,
-        job_dict_or_rerun: dict | str | None,
+        job_snapshot_or_rerun: dict | str | None,
         *,
         task_type: str | None = None,
         wall_meta: dict | None = None,
@@ -152,11 +152,11 @@ class RerunPolicy:
         is_failed: bool = False,
     ) -> PreflightDecision:
         """评估作业是否应当被拦截或放行重跑。"""
-        if isinstance(job_dict_or_rerun, dict):
-            rerun_raw = job_dict_or_rerun.get("rerun")
-            actual_task_type = task_type or job_dict_or_rerun.get("task_type")
+        if isinstance(job_snapshot_or_rerun, dict):
+            rerun_raw = job_snapshot_or_rerun.get("rerun")
+            actual_task_type = task_type or job_snapshot_or_rerun.get("task_type")
         else:
-            rerun_raw = job_dict_or_rerun
+            rerun_raw = job_snapshot_or_rerun
             actual_task_type = task_type
 
         # 任务级默认策略兜底（未显式指定时）
@@ -236,7 +236,7 @@ class RerunPolicy:
 
     def admit(
         self,
-        job_dict: dict,
+        job_snapshot: dict,
         history: TerminalHistory,
     ) -> PreflightDecision:
         """统一极窄准入判定入口：从终态历史契约提取上下文并执行评估。
@@ -244,12 +244,12 @@ class RerunPolicy:
         ``history`` 为 ``TerminalHistory`` 契约（wall/failed 视图，
         PipelineState 满足；调用方传 ``store.state``）。
         """
-        uid = uid_from_job_dict(job_dict)
+        uid = job_uid_from_snapshot(job_snapshot)
         wall_hit = uid in history.wall
         failed_hit = uid in history.failed
         wall_meta = history.wall.get(uid) if wall_hit else None
         return self.evaluate(
-            job_dict,
+            job_snapshot,
             wall_meta=wall_meta,
             is_wall=wall_hit,
             is_failed=failed_hit,
@@ -282,7 +282,7 @@ class RequeuePolicy(ABC):
     @abstractmethod
     def plan_requeue(
         self,
-        job_dict: dict,
+        job_snapshot: dict,
         *,
         transient_kind: str | None = None,
     ) -> RequeuePlan:
@@ -304,7 +304,7 @@ class ImmediateRequeuePolicy(RequeuePolicy):
 
     def plan_requeue(
         self,
-        job_dict: dict,
+        job_snapshot: dict,
         *,
         transient_kind: str | None = None,
     ) -> RequeuePlan:

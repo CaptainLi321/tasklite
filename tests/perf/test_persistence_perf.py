@@ -35,7 +35,7 @@ def _bench_commit_job_success(backend: SQLiteStateBackend, *, samples: int) -> f
         result = backend.commit_job_success(
             "test::latency_probe",
             result_meta={"ok": True},
-            spawned_jobs=[],
+            spawned_job_snapshots=[],
             cursor_updates={},
         )
         elapsed = time.perf_counter() - start
@@ -88,8 +88,8 @@ def test_enqueue_jobs_latency_constant_with_queue_size(tmp_path):
             Job("test", f"{tag}_{i}", payload={}).to_dict() for i in range(50)
         ]
         start = time.perf_counter()
-        for job_dict in batch:
-            backend.enqueue_jobs([job_dict])
+        for job_snapshot in batch:
+            backend.enqueue_jobs([job_snapshot])
         return (time.perf_counter() - start) / len(batch)
 
     baseline = _bench_sequential_enqueues(baseline_backend, "probe")

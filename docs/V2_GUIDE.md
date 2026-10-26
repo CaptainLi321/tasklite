@@ -43,6 +43,8 @@ from tasklite import (
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变（queue/wall/failed 三表 PK 与六集合互斥均以 uid 为身份） | queue 行 job_data JSON（uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：序号、`execution_id`、起止时间、`outcome` | **append-only** 新表 `attempts` |
 
+持久层 Python 接口以 `job_snapshot` / `job_snapshots` 表示完整 Job 字典，以 `job_uid` 表示跨对象作业身份；业务输入仍称 `payload`。引擎级键值读写使用 `backend.get_engine_metadata(key)` / `backend.set_engine_metadata(key, value)`，其中 `last_run_id` 仍表示最近一次运行。当前落盘格式仍为 schema 3，SQL 表列与 JSON 键保持现行契约。
+
 ### Task：规格层
 
 `Task` 是 frozen dataclass，一般经门面简式注册（首参传 task_type 字符串）：
@@ -267,7 +269,7 @@ from tasklite import RequeuePlan, RequeuePolicy, TaskLite
 class FixedDelayRequeuePolicy(RequeuePolicy):
     """固定延迟节奏（示例骨架：delay_seconds 是延迟类策略的表达位）。"""
 
-    def plan_requeue(self, job_dict, *, transient_kind=None) -> RequeuePlan:
+    def plan_requeue(self, job_snapshot, *, transient_kind=None) -> RequeuePlan:
         return RequeuePlan(front=False, delay_seconds=30.0)
 
 

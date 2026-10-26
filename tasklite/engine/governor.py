@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ..models.job import Job
-from ..models.state import PipelineState, uid_from_job_dict
+from ..models.state import PipelineState, job_uid_from_snapshot
 from .errorclass import (
     ERR_DEADLOCK_GAP,
     ERR_DEPENDENCY_DEADLOCK,
@@ -41,7 +41,7 @@ class ScanCache(Protocol):
     读 ``depends_on`` 时免二次全量反序列化。
     """
 
-    def cached_job(self, job_dict: dict) -> JobFacts: ...
+    def cached_job(self, job_snapshot: dict) -> JobFacts: ...
 
 
 class BulkFailureOutcome(Protocol):
@@ -193,7 +193,7 @@ class DeadlockGovernor:
                 missing_uids.add(item)
             elif isinstance(item, int) and 0 <= item < len(state.queue):
                 try:
-                    missing_uids.add(uid_from_job_dict(state.queue[item]))
+                    missing_uids.add(job_uid_from_snapshot(state.queue[item]))
                 except (KeyError, TypeError, ValueError):
                     pass
 
@@ -230,7 +230,7 @@ class DeadlockGovernor:
 
         # 回退路径：检查队列中是否存在「全部已知依赖已在 wall 中」的潜在可运行作业
         for jd in state.queue:
-            uid = uid_from_job_dict(jd)
+            uid = job_uid_from_snapshot(jd)
             if uid in missing_uids:
                 continue
             try:
@@ -284,9 +284,9 @@ class DeadlockGovernor:
         精准删除收敛，本方法只负责归因装配。
         """
         return [
-            (uid_from_job_dict(jd), {"error": error, "root_cause": True})
+            (job_uid_from_snapshot(jd), {"error": error, "root_cause": True})
             for jd in queue
-            if target_uids is None or uid_from_job_dict(jd) in target_uids
+            if target_uids is None or job_uid_from_snapshot(jd) in target_uids
         ]
 
     def arbitrate(

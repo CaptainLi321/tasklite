@@ -16,7 +16,7 @@ from .errorclass import ErrorClassifier
 from .resource import META_RESOURCE_SUSPENSIONS
 from .store import FailureEntry, StateStore
 from ..models.job import Job
-from ..models.state import uid_from_job_dict
+from ..models.state import job_uid_from_snapshot
 from ..utils.jsonutil import loads
 
 logger = logging.getLogger("tasklite")
@@ -66,7 +66,7 @@ class OpsConsole:
             list[SuspendEntry]: 按 ``resume_at`` 升序（最先解封在前）。
         """
         try:
-            raw = self._store.backend.get_meta(META_RESOURCE_SUSPENSIONS)
+            raw = self._store.backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)
         except Exception as e:
             logger.warning(f"Failed to load resource suspensions from meta: {e}")
             return []
@@ -320,7 +320,7 @@ class OpsConsole:
                 )
         failed = self._store.backend.load_failed()
         queue_uids = set(self._store.state.queue_uids)
-        queue_uids.update(uid_from_job_dict(jd) for jd in self._store.backend.load_queue())
+        queue_uids.update(job_uid_from_snapshot(jd) for jd in self._store.backend.load_queue())
         conflict_failed = sorted({u for u in uids if u in failed})
         conflict_queue = sorted({u for u in uids if u in queue_uids})
         if conflict_failed:

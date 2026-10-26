@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from tasklite.models.job import Job
-from tasklite.models.state import PipelineState, uid_from_job_dict
+from tasklite.models.state import PipelineState, job_uid_from_snapshot
 
 
 def _jid(job_id: str, depends_on: list[str] | None = None, rerun: str | None = None) -> dict:
@@ -32,13 +32,13 @@ class TestQueueOrdering:
         """spawn 默认队首插队且保序（子任务优先于存量队列）。"""
         st = PipelineState({}, {}, {}, [_jid("old")])
         st.spawn_jobs([_jid("a"), _jid("b")])
-        uids = [uid_from_job_dict(j) for j in st.queue]
+        uids = [job_uid_from_snapshot(j) for j in st.queue]
         assert uids == ["t::a", "t::b", "t::old"]
 
     def test_spawn_back_appends(self):
         st = PipelineState({}, {}, {}, [_jid("old")])
         st.spawn_jobs([_jid("a")], front=False)
-        uids = [uid_from_job_dict(j) for j in st.queue]
+        uids = [job_uid_from_snapshot(j) for j in st.queue]
         assert uids == ["t::old", "t::a"]
 
     def test_requeue_front_is_spawn_front_semantics(self):
@@ -46,7 +46,7 @@ class TestQueueOrdering:
         st = PipelineState({}, {}, {}, [_jid("next"), _jid("other")])
         popped = st.pop_job(0)  # 派发等价物：出队
         st.requeue_jobs([popped])  # 崩溃恢复等价物：队首重入队
-        uids = [uid_from_job_dict(j) for j in st.queue]
+        uids = [job_uid_from_snapshot(j) for j in st.queue]
         assert uids == ["t::next", "t::other"]
 
     def test_pop_job_syncs_queue_uids(self):
@@ -153,26 +153,26 @@ class TestSixSetMutex:
         assert st.wall_uids == set()
 
 
-class TestUidFromJobDict:
+class TestJobUidFromSnapshot:
     """uid 提取与损坏容灾。"""
 
     def test_direct_extraction(self):
-        assert uid_from_job_dict(_jid("j")) == "t::j"
+        assert job_uid_from_snapshot(_jid("j")) == "t::j"
 
     def test_partial_dict_reconstructs_via_job(self):
         d = {"task_type": "t", "job_id": "j", "payload": {"k": 1}}
-        assert uid_from_job_dict(d) == "t::j"
+        assert job_uid_from_snapshot(d) == "t::j"
 
-    def test_full_job_dict_compatible(self):
+    def test_full_job_snapshot_compatible(self):
         """v2 Job.to_dict 产物（含实例位字段）同样直接提取。"""
-        assert uid_from_job_dict(Job("t", "j", attempt_no=2).to_dict()) == "t::j"
+        assert job_uid_from_snapshot(Job("t", "j", attempt_no=2).to_dict()) == "t::j"
 
     def test_corrupt_dict_falls_back_to_content_hash(self):
         """task_type/job_id 均缺失且无法重建：按内容哈希兜底（恒定、可去重）。"""
-        uid_a = uid_from_job_dict({"payload": {"k": 1}})
+        uid_a = job_uid_from_snapshot({"payload": {"k": 1}})
         assert uid_a.startswith("_unknown::")
-        assert uid_a == uid_from_job_dict({"payload": {"k": 1}})
-        assert uid_a != uid_from_job_dict({"payload": {"k": 2}})
+        assert uid_a == job_uid_from_snapshot({"payload": {"k": 1}})
+        assert uid_a != job_uid_from_snapshot({"payload": {"k": 2}})
 
 
 class TestTerminalRecords:

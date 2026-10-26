@@ -26,9 +26,9 @@ def _state(queue, wall=None, failed=None):
 
 
 class TestJobFactsProjection:
-    def test_from_job_dict_freezes_sched_fields(self):
+    def test_from_job_snapshot_freezes_sched_fields(self):
         job = Job("t", "j", resources={"b": 2.0, "a": 1.0}, depends_on=["t::x"])
-        facts = JobFacts.from_job_dict(job.to_dict())
+        facts = JobFacts.from_job_snapshot(job.to_dict())
         assert facts.uid == "t::j"
         assert facts.task_type == "t"
         assert facts.resources == (("a", 1.0), ("b", 2.0))
@@ -36,7 +36,7 @@ class TestJobFactsProjection:
         assert facts.resource_map() == {"a": 1.0, "b": 2.0}
 
     def test_frozen_projection_is_immutable(self):
-        facts = JobFacts.from_job_dict(Job("t", "j").to_dict())
+        facts = JobFacts.from_job_snapshot(Job("t", "j").to_dict())
         with pytest.raises(Exception):
             facts.uid = "other::uid"  # type: ignore[misc]
 

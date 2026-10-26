@@ -89,7 +89,7 @@ class CompletionEnv:
             lease = self.resources.reserve(job.task_type, job.resources, uid=job.uid)
         entry = InFlightJob(
             job_uid=job.uid,
-            job_dict=job.to_dict(),
+            job_snapshot=job.to_dict(),
             job=job,
             lease=lease,
             attempt_id=attempt_id,
@@ -234,16 +234,16 @@ class TestRetryBudget:
             AttemptFinish(success=False, going_to_retry=True, meta={}),
         )
 
-    def test_retry_dict_preserves_custom_fields(self, tmp_path):
+    def test_retry_job_snapshot_preserves_custom_fields(self, tmp_path):
         """重试 = 原作业原样重入队：顶层自定义字段与已注入资源随重试往返保留。"""
         env = CompletionEnv(tmp_path)
         job = Job("t", "j1", resources={"__workers__": 1.0})
         entry = env.track_entry(job)
-        job_dict = dict(entry.job_dict)
-        job_dict["custom_note"] = "keep-me"
+        job_snapshot = dict(entry.job_snapshot)
+        job_snapshot["custom_note"] = "keep-me"
 
         env.completion.apply_result(
-            "t::j1", job, job_dict,
+            "t::j1", job, job_snapshot,
             ExecutionResult(retry_requested=True, retry_error="x"),
         )
         assert env.store.state.queue[0]["custom_note"] == "keep-me"
@@ -256,7 +256,7 @@ class TestRetryBudget:
         job.runtime.record_retry_error("first failure")
         attempt_id = env.open_attempt(job, attempt_no=2)
         entry = env.track_entry(job, attempt_id=attempt_id)
-        entry.job_dict["runtime"] = job.runtime.to_dict()
+        entry.job_snapshot["runtime"] = job.runtime.to_dict()
 
         result = ExecutionResult(retry_requested=True, retry_error="second")
         env.completion.complete_job(entry, result)
@@ -331,7 +331,7 @@ class TestThreeStrikeTermination:
         entry = env.track_entry(job)
         # 预埋 2 次 commit 失败：本次 commit_job_success 失败即达 3-strike
         job.runtime.commit_failures = 2
-        entry.job_dict["runtime"] = job.runtime.to_dict()
+        entry.job_snapshot["runtime"] = job.runtime.to_dict()
 
         result = ExecutionResult(success=True, result_meta={"score": 1})
         env.completion.complete_job(entry, result)  # 不上抛 _JobTerminated
@@ -359,7 +359,7 @@ class TestSpawnedJobs:
         parent = Job("parent", "p1")
         entry = env.track_entry(parent)
         env.completion.apply_result(
-            "parent::p1", parent, entry.job_dict,
+            "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
                 new_jobs=[Job("child", "x", rerun="every_run")],
@@ -378,7 +378,7 @@ class TestSpawnedJobs:
         parent = Job("parent", "p1")
         entry = env.track_entry(parent)
         env.completion.apply_result(
-            "parent::p1", parent, entry.job_dict,
+            "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
                 new_jobs=[Job("child", "y", rerun="every_run")],
@@ -392,7 +392,7 @@ class TestSpawnedJobs:
         parent = Job("parent", "p1")
         entry = env.track_entry(parent)
         env.completion.apply_result(
-            "parent::p1", parent, entry.job_dict,
+            "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
                 new_jobs=[Job("child", "a"), Job("child", "a")],
@@ -411,7 +411,7 @@ class TestSpawnedJobs:
         parent = Job("parent", "p1")
         entry = env.track_entry(parent)
         env.completion.apply_result(
-            "parent::p1", parent, entry.job_dict,
+            "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
                 result_meta={"ok": 1},
@@ -446,7 +446,7 @@ class TestSuspensionApplication:
             ),
         )
         assert env.resources["api"].suspended_until() is not None
-        raw = env.backend.get_meta("resource_suspensions")
+        raw = env.backend.get_engine_metadata("resource_suspensions")
         assert raw is not None and "api" in loads(raw)
 
     def test_unknown_resource_suspension_skipped(self, tmp_path, caplog):

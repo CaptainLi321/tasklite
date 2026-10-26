@@ -9,7 +9,7 @@
   activation_no（激活代，每次从 wall/failed 拦截点放行重跑时 +1）、
   first_enqueued_at（UTC ISO，首次入队时间，重试不刷新，由 enqueue 填充）；
 - 运行期边带状态收敛到 ``runtime`` 单一命名空间（JobRuntimeState），随
-  job_dict 落盘持久化——序列化只此一处，新增状态不会因散装下划线键
+  job_snapshot 落盘持久化——序列化只此一处，新增状态不会因散装下划线键
   漏写 to_dict 而丢失。
 
 身份不变式：``uid = task_type::job_id``，queue/wall/failed 三表主键与
@@ -47,12 +47,12 @@ RERUN_EXEMPT_VALUES = ("every_run", "on_failure", "on_input_change")
 assert set(RERUN_EXEMPT_VALUES) == set(RERUN_VALUES) - {"never"}
 
 
-def inject_worker_resource(job_dict: dict) -> None:
-    """给 job_dict 的 resources 注入默认 worker 槽位。"""
-    resources = dict(job_dict.get("resources", {}))
+def inject_worker_resource(job_snapshot: dict) -> None:
+    """给 job_snapshot 的 resources 注入默认 worker 槽位。"""
+    resources = dict(job_snapshot.get("resources", {}))
     if WORKER_RESOURCE not in resources:
         resources[WORKER_RESOURCE] = 1.0
-    job_dict["resources"] = resources
+    job_snapshot["resources"] = resources
 
 
 @dataclass
@@ -303,7 +303,7 @@ class Job:
               run_count+1）——扫描类/orchestrator 任务；
             - "on_input_change"：wall 命中比对输入指纹，failed 命中重跑。
             策略只作用于「wall/failed 拦截点」；queue/in-flight 永远算数
-            （同一轮内不重复派发/并发双跑）。随 job_dict 持久化。
+            （同一轮内不重复派发/并发双跑）。随 job_snapshot 持久化。
         runtime: 运行期边带状态（dict 或 JobRuntimeState，由框架管理）。
         attempt_no: 本次激活内尝试序号（实例位，框架管理，1 起始含首次
             执行）。

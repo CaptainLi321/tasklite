@@ -959,7 +959,7 @@ def test_selection_failure_isolation_after_equal_length_spawn(
         "excluded", "child", depends_on=["parent::failing"]
     ).to_dict()
     store.apply_success(
-        "allowed::pending", {}, job_dict=dispatched, spawned_jobs=[child]
+        "allowed::pending", {}, job_snapshot=dispatched, spawned_job_snapshots=[child]
     )
     assert len(store.state.queue) == len(rows)
 

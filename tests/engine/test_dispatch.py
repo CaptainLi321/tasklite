@@ -239,9 +239,9 @@ class TestDedupGate:
         assert entry is not None
         assert entry.job.activation_no == 2
         assert entry.job.attempt_no == 1
-        assert entry.job_dict["rerun"] == "every_run"
-        assert entry.job_dict["activation_no"] == 2
-        assert entry.job_dict["attempt_no"] == 1
+        assert entry.job_snapshot["rerun"] == "every_run"
+        assert entry.job_snapshot["activation_no"] == 2
+        assert entry.job_snapshot["attempt_no"] == 1
         # 轨迹行按新激活代号落表
         records = env.backend.load_attempts("t::j1")
         assert records[-1].activation_no == 2

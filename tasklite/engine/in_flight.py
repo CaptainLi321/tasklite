@@ -47,7 +47,7 @@ class InFlightJob:
     """
 
     job_uid: str
-    job_dict: dict
+    job_snapshot: dict
     job: Job
     acquired: list[tuple[str, float]] = field(default_factory=list)
     handle: JobHandle | None = None
@@ -186,13 +186,13 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
     @staticmethod
     def create_pseudo_entry(
         job_uid: str,
-        job_dict: dict,
+        job_snapshot: dict,
         job: Job,
     ) -> InFlightJob:
         """合成安全伪条目（用于崩溃恢复或 abort 结果提交）。"""
         return InFlightJob(
             job_uid=job_uid,
-            job_dict=job_dict,
+            job_snapshot=job_snapshot,
             job=job,
             acquired=[],
             handle=None,

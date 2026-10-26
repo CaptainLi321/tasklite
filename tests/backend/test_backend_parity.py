@@ -19,10 +19,10 @@ import pytest
 from tasklite.backend import InMemoryStateBackend, SQLiteStateBackend
 from tasklite.models.attempt import ATTEMPT_RUNNING, AttemptRecord
 from tasklite.models.job import Job
-from tasklite.models.state import uid_from_job_dict
+from tasklite.models.state import job_uid_from_snapshot
 
 
-def _job_dict(job_id: str, **overrides) -> dict:
+def _job_snapshot(job_id: str, **overrides) -> dict:
     data = Job("t", job_id).to_dict()
     data.update(overrides)
     return data
@@ -41,7 +41,7 @@ def _running_attempt(job_uid: str, attempt_no: int = 1) -> AttemptRecord:
 
 
 def _queue_uids(backend) -> list[str]:
-    return [uid_from_job_dict(j) for j in backend.load_queue()]
+    return [job_uid_from_snapshot(j) for j in backend.load_queue()]
 
 
 def _snapshot(backend) -> dict:
@@ -68,25 +68,25 @@ class TestCoreContractProperties:
 
     def test_enqueue_visible_idempotent_and_ordered(self, dual_backend):
         b = dual_backend
-        assert b.enqueue_jobs([_job_dict("one"), _job_dict("two")]) == ["t::one", "t::two"]
+        assert b.enqueue_jobs(job_snapshots=[_job_snapshot("one"), _job_snapshot("two")]) == ["t::one", "t::two"]
         # enqueue 后可见：保序落盘
         assert _queue_uids(b) == ["t::one", "t::two"]
         # 幂等去重：队列已有与批次内重复都跳过
-        assert b.enqueue_jobs([_job_dict("one"), _job_dict("three"), _job_dict("three")]) == ["t::three"]
+        assert b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("three"), _job_snapshot("three")]) == ["t::three"]
         assert _queue_uids(b) == ["t::one", "t::two", "t::three"]
         # front 入队插队首、保序
-        assert b.enqueue_jobs([_job_dict("frontal")], front=True) == ["t::frontal"]
+        assert b.enqueue_jobs([_job_snapshot("frontal")], front=True) == ["t::frontal"]
         assert _queue_uids(b) == ["t::frontal", "t::one", "t::two", "t::three"]
 
     def test_popped_uid_invisible_after_terminal_commit(self, dual_backend):
         """终态 delta 提交后 uid 从队列消失（成功/失败/批量/跳过四路径）。"""
         b = dual_backend
-        b.enqueue_jobs([_job_dict(j) for j in ("success_one", "fail_one", "bulk_one", "skip_one")])
+        b.enqueue_jobs([_job_snapshot(j) for j in ("success_one", "fail_one", "bulk_one", "skip_one")])
 
-        assert b.commit_job_success("t::success_one", {"ok": True}) is True
-        assert b.commit_job_failure("t::fail_one", {"error": "x"}) is True
-        assert b.commit_bulk_failure([("t::bulk_one", {"error": "y"})]) is True
-        assert b.commit_skip("t::skip_one") is True
+        assert b.commit_job_success(job_uid="t::success_one", result_meta={"ok": True}) is True
+        assert b.commit_job_failure(job_uid="t::fail_one", result_meta={"error": "x"}) is True
+        assert b.commit_bulk_failure(job_uids_metas=[("t::bulk_one", {"error": "y"})]) is True
+        assert b.commit_skip(job_uid="t::skip_one") is True
 
         assert _queue_uids(b) == []
         assert set(b.load_wall()) == {"t::success_one"}
@@ -95,9 +95,9 @@ class TestCoreContractProperties:
     def test_popped_uid_requeued_visible_via_commit_retry(self, dual_backend):
         """重试 delta 是同 uid DELETE+INSERT：重入队后以新行可见。"""
         b = dual_backend
-        b.enqueue_jobs([_job_dict("one")])
-        requeued = _job_dict("one", attempt_no=2)
-        assert b.commit_retry("t::one", requeued) is True
+        b.enqueue_jobs([_job_snapshot("one")])
+        requeued = _job_snapshot("one", attempt_no=2)
+        assert b.commit_retry(popped_job_uid="t::one", requeued_job_snapshot=requeued) is True
         queue = b.load_queue()
         assert _queue_uids(b) == ["t::one"]
         assert queue[0]["attempt_no"] == 2
@@ -148,10 +148,10 @@ class TestCoreContractProperties:
 
     def test_meta_roundtrip_upsert(self, dual_backend):
         b = dual_backend
-        assert b.get_meta("fencing") is None
-        b.set_meta("fencing", "run_seed")
-        b.set_meta("fencing", "run_next")
-        assert b.get_meta("fencing") == "run_next"
+        assert b.get_engine_metadata("fencing") is None
+        b.set_engine_metadata("fencing", "run_seed")
+        b.set_engine_metadata("fencing", "run_next")
+        assert b.get_engine_metadata("fencing") == "run_next"
 
 
 class _UncommittableMeta:
@@ -172,14 +172,14 @@ class TestBackendCommitAtomicity:
 
     def test_spawn_conflict_returns_false_keeping_backend_unchanged(self, dual_backend):
         b = dual_backend
-        b.enqueue_jobs([_job_dict("one"), _job_dict("child")])
-        b.append_failed("t::one", {"error": "stale"})
+        b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("child")])
+        b.append_failed(job_uid="t::one", payload={"error": "stale"})
         before = _snapshot(b)
 
         ok = b.commit_job_success(
             "t::one",
             {"status": "ok"},
-            spawned_jobs=[_job_dict("child")],
+            spawned_job_snapshots=[_job_snapshot("child")],
             cursor_updates={"cur": "nine"},
         )
 
@@ -190,7 +190,7 @@ class TestBackendCommitAtomicity:
 
         # 冲突被拒后后端仍可正常提交同一 job（spawned 改为不冲突的新 uid）
         ok = b.commit_job_success(
-            "t::one", {"status": "ok"}, spawned_jobs=[_job_dict("fresh")]
+            "t::one", {"status": "ok"}, spawned_job_snapshots=[_job_snapshot("fresh")]
         )
         assert ok is True
         # spawned 队首插入，预置的 t::child 条目保持原位
@@ -199,13 +199,13 @@ class TestBackendCommitAtomicity:
 
     def test_spawn_batch_duplicate_uid_rejected_without_dup_entries(self, dual_backend):
         b = dual_backend
-        b.enqueue_jobs([_job_dict("one")])
+        b.enqueue_jobs([_job_snapshot("one")])
         before = _snapshot(b)
 
         ok = b.commit_job_success(
             "t::one",
             {},
-            spawned_jobs=[_job_dict("x_marks"), _job_dict("x_marks")],
+            spawned_job_snapshots=[_job_snapshot("x_marks"), _job_snapshot("x_marks")],
         )
 
         assert ok is False
@@ -216,10 +216,10 @@ class TestBackendCommitAtomicity:
 
     def test_retry_uid_conflict_returns_false_keeping_queue_intact(self, dual_backend):
         b = dual_backend
-        b.enqueue_jobs([_job_dict("alpha"), _job_dict("beta")])
+        b.enqueue_jobs([_job_snapshot("alpha"), _job_snapshot("beta")])
         before = _snapshot(b)
 
-        ok = b.commit_retry("t::alpha", _job_dict("beta", attempt_no=2), front=True)
+        ok = b.commit_retry("t::alpha", _job_snapshot("beta", attempt_no=2), front=True)
 
         assert ok is False
         assert _snapshot(b) == before
@@ -227,16 +227,16 @@ class TestBackendCommitAtomicity:
 
     def test_retry_same_uid_requeue_still_succeeds(self, dual_backend):
         b = dual_backend
-        b.enqueue_jobs([_job_dict("alpha"), _job_dict("beta")])
+        b.enqueue_jobs([_job_snapshot("alpha"), _job_snapshot("beta")])
 
-        assert b.commit_retry("t::alpha", _job_dict("alpha", attempt_no=2), front=True) is True
+        assert b.commit_retry("t::alpha", _job_snapshot("alpha", attempt_no=2), front=True) is True
         assert _queue_uids(b) == ["t::alpha", "t::beta"]
-        assert b.commit_retry("t::alpha", _job_dict("alpha", attempt_no=3), front=False) is True
+        assert b.commit_retry("t::alpha", _job_snapshot("alpha", attempt_no=3), front=False) is True
         assert _queue_uids(b) == ["t::beta", "t::alpha"]
 
     def test_bulk_failure_write_error_leaves_backend_unchanged(self, dual_backend):
         b = dual_backend
-        b.enqueue_jobs([_job_dict("one"), _job_dict("two")])
+        b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("two")])
         b.seed_wall(["t::nine"])
         before = _snapshot(b)
 
@@ -251,7 +251,7 @@ class TestBackendCommitAtomicity:
 
     def test_job_failure_write_error_leaves_backend_unchanged(self, dual_backend):
         b = dual_backend
-        b.enqueue_jobs([_job_dict("one")])
+        b.enqueue_jobs([_job_snapshot("one")])
         before = _snapshot(b)
 
         ok = b.commit_job_failure("t::one", {"payload": _UncommittableMeta()})
@@ -262,13 +262,13 @@ class TestBackendCommitAtomicity:
 
     def test_success_commit_with_spawn_and_cursor_still_applies(self, dual_backend):
         b = dual_backend
-        b.enqueue_jobs([_job_dict("one")])
+        b.enqueue_jobs([_job_snapshot("one")])
         b.append_failed("t::one", {"error": "stale"})
 
         ok = b.commit_job_success(
             "t::one",
             {"status": "ok"},
-            spawned_jobs=[_job_dict("child_one"), _job_dict("child_two")],
+            spawned_job_snapshots=[_job_snapshot("child_one"), _job_snapshot("child_two")],
             cursor_updates={"page": "two"},
         )
 
@@ -289,31 +289,31 @@ class TestReplaceQueueAtomic:
 
     def test_replace_result_wins_and_absent_rows_are_removed(self, dual_backend):
         b = dual_backend
-        b.save_queue([_job_dict("keep"), _job_dict("gone")])
+        b.save_queue(job_snapshots=[_job_snapshot("keep"), _job_snapshot("gone")])
 
         def compute(disk_q):
-            assert [uid_from_job_dict(j) for j in disk_q] == ["t::keep", "t::gone"]
+            assert [job_uid_from_snapshot(j) for j in disk_q] == ["t::keep", "t::gone"]
             updated = dict(disk_q[0], payload={"v": "two"})
-            fresh = _job_dict("new_one")
+            fresh = _job_snapshot("new_one")
             return [updated, fresh]
 
         b.replace_queue_atomic(compute)
 
         q = b.load_queue()
-        assert [uid_from_job_dict(j) for j in q] == ["t::keep", "t::new_one"]
+        assert [job_uid_from_snapshot(j) for j in q] == ["t::keep", "t::new_one"]
         assert q[0]["payload"] == {"v": "two"}
 
     def test_compute_receives_rows_enqueued_before_replace(self, dual_backend):
         """替换前已提交（已应答成功）的入队必须进入磁盘真相快照，
         不得被内存态或陈旧快照替代——这是窗口期入队存活的前提。"""
         b = dual_backend
-        b.save_queue([_job_dict("keep")])
-        b.enqueue_jobs([_job_dict("late")])
+        b.save_queue([_job_snapshot("keep")])
+        b.enqueue_jobs([_job_snapshot("late")])
 
         seen: dict[str, list[str]] = {}
 
         def compute(disk_q):
-            seen["uids"] = [uid_from_job_dict(j) for j in disk_q]
+            seen["uids"] = [job_uid_from_snapshot(j) for j in disk_q]
             return disk_q
 
         b.replace_queue_atomic(compute)
@@ -323,7 +323,7 @@ class TestReplaceQueueAtomic:
 
     def test_replace_rolls_back_when_compute_raises(self, dual_backend):
         b = dual_backend
-        b.save_queue([_job_dict("keep"), _job_dict("keep_two")])
+        b.save_queue([_job_snapshot("keep"), _job_snapshot("keep_two")])
 
         def boom(disk_q):
             raise RuntimeError("merge failed")
@@ -345,7 +345,7 @@ class TestQueueReplacementShapeValidation:
     def test_replace_with_none_compute_result_fails_loud(self, dual_backend):
         """compute 漏写 return（返回 None）→ TypeError，队列原状。"""
         b = dual_backend
-        b.save_queue([_job_dict("keep"), _job_dict("keep_two")])
+        b.save_queue([_job_snapshot("keep"), _job_snapshot("keep_two")])
 
         with pytest.raises(TypeError):
             b.replace_queue_atomic(lambda disk_q: None)
@@ -354,7 +354,7 @@ class TestQueueReplacementShapeValidation:
 
     def test_replace_with_non_sequence_fails_loud(self, dual_backend):
         b = dual_backend
-        b.save_queue([_job_dict("keep")])
+        b.save_queue([_job_snapshot("keep")])
 
         with pytest.raises(TypeError):
             b.replace_queue_atomic(lambda disk_q: 42)
@@ -365,11 +365,11 @@ class TestQueueReplacementShapeValidation:
 
     def test_replace_with_non_dict_item_fails_loud(self, dual_backend):
         b = dual_backend
-        b.save_queue([_job_dict("keep")])
+        b.save_queue([_job_snapshot("keep")])
 
         with pytest.raises(TypeError):
             b.replace_queue_atomic(
-                lambda disk_q: [_job_dict("ok_entry"), "not-a-dict"]
+                lambda disk_q: [_job_snapshot("ok_entry"), "not-a-dict"]
             )
 
         assert _queue_uids(b) == ["t::keep"]
@@ -377,7 +377,7 @@ class TestQueueReplacementShapeValidation:
     def test_save_queue_none_fails_loud(self, dual_backend):
         """save_queue(None) → TypeError，队列原状（空列表仍合法清空）。"""
         b = dual_backend
-        b.save_queue([_job_dict("keep")])
+        b.save_queue([_job_snapshot("keep")])
 
         with pytest.raises(TypeError):
             b.save_queue(None)

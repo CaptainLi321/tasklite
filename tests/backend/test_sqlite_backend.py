@@ -22,13 +22,13 @@ import pytest
 from tasklite.backend import SQLiteStateBackend
 from tasklite.models.attempt import ATTEMPT_RUNNING, AttemptRecord
 from tasklite.models.job import Job
-from tasklite.models.state import uid_from_job_dict
+from tasklite.models.state import job_uid_from_snapshot
 
 N_THREADS = 6
 N_ROUNDS = 12
 
 
-def _job_dict(job_id: str, **overrides) -> dict:
+def _job_snapshot(job_id: str, **overrides) -> dict:
     data = Job("t", job_id).to_dict()
     data.update(overrides)
     return data
@@ -47,7 +47,7 @@ def _running_attempt(job_uid: str, attempt_no: int = 1, run_id: str = "run_seed"
 
 
 def _queue_uids(backend: SQLiteStateBackend) -> list[str]:
-    return [uid_from_job_dict(j) for j in backend.load_queue()]
+    return [job_uid_from_snapshot(j) for j in backend.load_queue()]
 
 
 def _get_tables(conn: sqlite3.Connection) -> set[str]:
@@ -73,7 +73,7 @@ class TestSchemaInit:
         db_path = tmp_path / "state.db"
         b_first = SQLiteStateBackend(db_path)
         b_first.commit_job_success("t::one", {"ok": True}, cursor_updates={"c": "v"})
-        b_first.enqueue_jobs([_job_dict("queued")])
+        b_first.enqueue_jobs([_job_snapshot("queued")])
 
         b_second = SQLiteStateBackend(db_path)
         assert b_second.load_wall() == {"t::one": {"ok": True}}
@@ -211,7 +211,7 @@ class TestCommitJobSuccess:
         assert backend.commit_job_success(
             "t::source",
             {"status": "done", "bytes": 1024},
-            spawned_jobs=[_job_dict("child")],
+            spawned_job_snapshots=[_job_snapshot("child")],
             cursor_updates={"cursor_artist": "page_late"},
         ) is True
 
@@ -221,7 +221,7 @@ class TestCommitJobSuccess:
 
     def test_removes_popped_uid_without_spawn(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict("target"), _job_dict("next")])
+        backend.save_queue([_job_snapshot("target"), _job_snapshot("next")])
 
         assert backend.commit_job_success("t::target", {"ok": True}) is True
         assert backend.load_wall() == {"t::target": {"ok": True}}
@@ -257,11 +257,11 @@ class TestCommitJobSuccess:
     def test_spawn_conflict_returns_false_and_preserves_disk(self, tmp_path):
         """spawned uid 撞磁盘既有行（漂移窗口）→ False + 全量回滚。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        job_a = _job_dict("alpha")
-        job_b = _job_dict("beta")
+        job_a = _job_snapshot("alpha")
+        job_b = _job_snapshot("beta")
         backend.save_queue([job_a, job_b])
 
-        assert backend.commit_job_success("t::alpha", {"ok": True}, spawned_jobs=[job_b]) is False
+        assert backend.commit_job_success("t::alpha", {"ok": True}, spawned_job_snapshots=[job_b]) is False
         # 回滚：wall 未写、popped 未删、队列原样
         assert backend.load_wall() == {}
         assert _queue_uids(backend) == ["t::alpha", "t::beta"]
@@ -269,7 +269,7 @@ class TestCommitJobSuccess:
     def test_transaction_failure_returns_false_and_preserves_queue(self, tmp_path):
         """SQLite 事务抛异常（如 disk full）→ False + on-disk 队列不变。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict("alpha"), _job_dict("beta")])
+        backend.save_queue([_job_snapshot("alpha"), _job_snapshot("beta")])
 
         real_connect = sqlite3.connect
         call_count = {"n": 0}
@@ -296,7 +296,7 @@ class TestCommitJobFailure:
 
     def test_records_archive_and_clears_queue(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict("doomed")])
+        backend.save_queue([_job_snapshot("doomed")])
 
         assert backend.commit_job_failure("t::doomed", {"error": "timeout"}) is True
         # v2 语义：失败 meta 精确等于传入（历史由 attempts 轨迹承接）
@@ -305,7 +305,7 @@ class TestCommitJobFailure:
 
     def test_preserves_remaining_queue_order(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict(j) for j in ("first", "second", "third")])
+        backend.save_queue([_job_snapshot(j) for j in ("first", "second", "third")])
         backend.commit_job_failure("t::second", {"error": "boom"})
         assert _queue_uids(backend) == ["t::first", "t::third"]
 
@@ -321,7 +321,7 @@ class TestCommitJobFailure:
 
     def test_transaction_failure_returns_false_and_preserves_queue(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict("alpha"), _job_dict("beta")])
+        backend.save_queue([_job_snapshot("alpha"), _job_snapshot("beta")])
 
         real_connect = sqlite3.connect
         call_count = {"n": 0}
@@ -349,7 +349,7 @@ class TestCommitBulkFailure:
 
     def test_records_multiple_and_clears_queue(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict("a"), _job_dict("b")])
+        backend.save_queue([_job_snapshot("a"), _job_snapshot("b")])
 
         assert backend.commit_bulk_failure(
             [("t::a", {"err": "x"}), ("t::b", {"err": "y"})]
@@ -359,7 +359,7 @@ class TestCommitBulkFailure:
 
     def test_preserves_remaining_queue_order(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict(j) for j in ("dead_one", "dead_two", "keep_one", "keep_two")])
+        backend.save_queue([_job_snapshot(j) for j in ("dead_one", "dead_two", "keep_one", "keep_two")])
         backend.commit_bulk_failure([("t::dead_one", {"error": "x"}), ("t::dead_two", {"error": "y"})])
         assert _queue_uids(backend) == ["t::keep_one", "t::keep_two"]
 
@@ -381,9 +381,9 @@ class TestCommitRetry:
 
     def test_same_uid_reinsert_with_updated_fields(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict("retry_one")])
+        backend.save_queue([_job_snapshot("retry_one")])
 
-        requeued = _job_dict("retry_one", attempt_no=2)
+        requeued = _job_snapshot("retry_one", attempt_no=2)
         assert backend.commit_retry("t::retry_one", requeued) is True
         queue = backend.load_queue()
         assert len(queue) == 1
@@ -392,8 +392,8 @@ class TestCommitRetry:
     def test_conflicting_uid_returns_false_and_preserves_disk(self, tmp_path):
         """requeued uid 撞队列既有行 → 普通 INSERT 冲突 → False，磁盘原样。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        job_a = _job_dict("alpha")
-        job_b = _job_dict("beta")
+        job_a = _job_snapshot("alpha")
+        job_b = _job_snapshot("beta")
         backend.save_queue([job_a, job_b])
 
         assert backend.commit_retry("t::ghost", job_a) is False
@@ -401,11 +401,11 @@ class TestCommitRetry:
 
     def test_front_and_back_placement(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.enqueue_jobs([_job_dict("alpha"), _job_dict("beta")])
+        backend.enqueue_jobs([_job_snapshot("alpha"), _job_snapshot("beta")])
 
-        assert backend.commit_retry("t::alpha", _job_dict("alpha", attempt_no=2), front=True) is True
+        assert backend.commit_retry("t::alpha", _job_snapshot("alpha", attempt_no=2), front=True) is True
         assert _queue_uids(backend) == ["t::alpha", "t::beta"]
-        assert backend.commit_retry("t::alpha", _job_dict("alpha", attempt_no=3), front=False) is True
+        assert backend.commit_retry("t::alpha", _job_snapshot("alpha", attempt_no=3), front=False) is True
         assert _queue_uids(backend) == ["t::beta", "t::alpha"]
 
 
@@ -414,15 +414,15 @@ class TestSaveAndEnqueueQueue:
 
     def test_save_queue_overwrites_and_clears(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict("one"), _job_dict("two")])
-        backend.save_queue([_job_dict("three")])
+        backend.save_queue([_job_snapshot("one"), _job_snapshot("two")])
+        backend.save_queue([_job_snapshot("three")])
         assert _queue_uids(backend) == ["t::three"]
         backend.save_queue([])
         assert backend.load_queue() == []
 
     def test_save_queue_preserves_order_large(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        jobs = [_job_dict(f"item_{i}") for i in range(500)]
+        jobs = [_job_snapshot(f"item_{i}") for i in range(500)]
         backend.save_queue(jobs)
         loaded = backend.load_queue()
         assert [j["job_id"] for j in loaded] == [f"item_{i}" for i in range(500)]
@@ -435,26 +435,26 @@ class TestSaveAndEnqueueQueue:
 
         monkeypatch.setattr(sqlite3, "connect", _boom)
         with pytest.raises(sqlite3.OperationalError, match="disk full"):
-            backend.save_queue([_job_dict("one")])
+            backend.save_queue([_job_snapshot("one")])
 
     def test_enqueue_front_back_and_dedup(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        assert backend.enqueue_jobs([_job_dict("base")]) == ["t::base"]
-        assert backend.enqueue_jobs([_job_dict("front")], front=True) == ["t::front"]
-        assert backend.enqueue_jobs([_job_dict("back")]) == ["t::back"]
+        assert backend.enqueue_jobs([_job_snapshot("base")]) == ["t::base"]
+        assert backend.enqueue_jobs([_job_snapshot("front")], front=True) == ["t::front"]
+        assert backend.enqueue_jobs([_job_snapshot("back")]) == ["t::back"]
         # 队列已有与批次内重复都跳过
-        assert backend.enqueue_jobs([_job_dict("base"), _job_dict("fresh"), _job_dict("fresh")]) == ["t::fresh"]
+        assert backend.enqueue_jobs([_job_snapshot("base"), _job_snapshot("fresh"), _job_snapshot("fresh")]) == ["t::fresh"]
         assert _queue_uids(backend) == ["t::front", "t::base", "t::back", "t::fresh"]
 
     def test_delete_queue_uids_targeted(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.enqueue_jobs([_job_dict(j) for j in ("a", "b", "c")])
+        backend.enqueue_jobs([_job_snapshot(j) for j in ("a", "b", "c")])
         assert backend.delete_queue_uids(["t::a", "t::c", "t::ghost"]) == 2
         assert _queue_uids(backend) == ["t::b"]
 
     def test_commit_skip_removes_uid_only(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.enqueue_jobs([_job_dict("stale"), _job_dict("live")])
+        backend.enqueue_jobs([_job_snapshot("stale"), _job_snapshot("live")])
         assert backend.commit_skip("t::stale") is True
         assert _queue_uids(backend) == ["t::live"]
         assert backend.load_wall() == {} and backend.load_failed() == {}
@@ -523,7 +523,7 @@ class TestReplaceQueueAtomic:
         已被写事务消除。确定性判定，不依赖真实多进程竞速。
         """
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict("keep")])
+        backend.save_queue([_job_snapshot("keep")])
         observed: dict[str, bool] = {}
 
         def compute(disk_q):
@@ -547,7 +547,7 @@ class TestReplaceQueueAtomic:
     def test_replace_raises_and_preserves_disk_on_corrupted_payload(self, tmp_path):
         """读阶段失败（队列行损坏）→ 异常传播 + 整体回滚，compute 不获执行机会。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_dict("keep")])
+        backend.save_queue([_job_snapshot("keep")])
         with sqlite3.connect(backend.path) as conn:
             conn.execute("UPDATE queue SET job_data = 'not-json'")
             conn.commit()
@@ -703,7 +703,7 @@ class TestSqliteAttemptTrajectory:
     def test_attempts_untouched_by_terminal_commits(self, tmp_path):
         """旁路观测面：终态提交（含同 uid 失败）不触碰 attempts 行。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.enqueue_jobs([_job_dict("one")])
+        backend.enqueue_jobs([_job_snapshot("one")])
         attempt_id = backend.append_attempt(_running_attempt("t::one"))
         backend.update_attempt(
             attempt_id, outcome="failed",
@@ -807,7 +807,7 @@ class TestConcurrentMixedWrites:
                 if not backend.commit_job_success(
                     f"c::{tid}-{k}",
                     {"ok": True},
-                    spawned_jobs=[{"task_type": "s", "job_id": f"s{tid}-{k}"}],
+                    spawned_job_snapshots=[{"task_type": "s", "job_id": f"s{tid}-{k}"}],
                     cursor_updates={f"cur_{tid}": str(k)},
                 ):
                     errors.append(f"commit_job_success returned False (t{tid} k{k})")

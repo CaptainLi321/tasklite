@@ -19,7 +19,7 @@ from tasklite.engine.governor import (
 )
 from tasklite.engine.scheduler import DeadlockAttribution, StandstillFacts
 from tasklite.models.job import Job
-from tasklite.models.state import PipelineState, uid_from_job_dict
+from tasklite.models.state import PipelineState, job_uid_from_snapshot
 
 INF = float("inf")
 # 超出解释器默认递归限制（1000），保证场景真实落在递归深度敏感区
@@ -46,7 +46,7 @@ class FakeArbitrationStore:
         for uid, meta in uids_metas:
             self.state.mark_failed(uid, dict(meta))
         fail_set = {uid for uid, _ in uids_metas}
-        remaining = [jd for jd in self.state.queue if uid_from_job_dict(jd) not in fail_set]
+        remaining = [jd for jd in self.state.queue if job_uid_from_snapshot(jd) not in fail_set]
         self.state.replace_queue(remaining)
         return SimpleNamespace(failed_uids=[uid for uid, _ in uids_metas], cascaded_uids=[])
 
@@ -393,11 +393,11 @@ class TestResolveDeadlockAttribution:
         store = FakeArbitrationStore(state)
         facts = StandstillFacts(
             min_wait=INF,
-            attribution=DeadlockAttribution(malformed_uids=(uid_from_job_dict({"task_type": "t"}),)),
+            attribution=DeadlockAttribution(malformed_uids=(job_uid_from_snapshot({"task_type": "t"}),)),
         )
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
-        malformed_uid = uid_from_job_dict({"task_type": "t"})
+        malformed_uid = job_uid_from_snapshot({"task_type": "t"})
         assert state.failed[malformed_uid]["error"] == ERR_MALFORMED_JOB
         assert state.failed[malformed_uid]["root_cause"] is True
 
@@ -468,7 +468,7 @@ class TestResolveDeadlockAttribution:
         assert decision.action == "resolved"
         assert set(state.failed) == {"t::a", "t::b"}
         assert state.failed["t::a"]["error"] == ERR_DEPENDENCY_DEADLOCK
-        assert [uid_from_job_dict(jd) for jd in state.queue] == ["t::c"]
+        assert [job_uid_from_snapshot(jd) for jd in state.queue] == ["t::c"]
 
     def test_unclassifiable_gap_escalates_whole_queue(self):
         """缺口升级到阈值 → 全队列进失败档案且队列清空 → should_terminate。"""
@@ -510,7 +510,7 @@ class TestResolveDeadlockAttribution:
         assert decision.action == "resolved"
         assert decision.should_terminate is False
         assert set(state.failed) == {"t::a"}
-        assert [uid_from_job_dict(jd) for jd in state.queue] == ["t::c"]
+        assert [job_uid_from_snapshot(jd) for jd in state.queue] == ["t::c"]
 
 
 class TestGovernorArbitrateDeepChain:
@@ -679,7 +679,7 @@ class TestSelectionClosedLoopArbitration:
         )
         assert decision.action == "resolved"
         assert set(store.state.failed) == {"t::gap"}
-        assert {uid_from_job_dict(row) for row in store.state.queue} == {
+        assert {job_uid_from_snapshot(row) for row in store.state.queue} == {
             "t::a", "t::b", "t::downstream"
         }
 
@@ -687,11 +687,11 @@ class TestSelectionClosedLoopArbitration:
         assert candidate.kind == "dep_failed"
         assert candidate.runnable_idx is not None
         downstream = store.state.pop_job(candidate.runnable_idx)
-        assert uid_from_job_dict(downstream) == "t::downstream"
+        assert job_uid_from_snapshot(downstream) == "t::downstream"
         store.apply_failure(
             "t::downstream",
             {"error": "JOB_DEPENDENCY", "failed_dependency": "t::gap"},
-            job_dict=downstream,
+            job_snapshot=downstream,
         )
 
         facts = scheduler.scan_next_runnable(store.state, set()).standstill_facts()

@@ -188,31 +188,31 @@ class DispatchMachine:
         pending_dep_failure = (
             sched.pending_dep_failure if sched.kind == "dep_failed" else None
         )
-        job_dict = store.state.pop_job(sched.runnable_idx)
-        job = Job.from_dict(job_dict)
+        job_snapshot = store.state.pop_job(sched.runnable_idx)
+        job = Job.from_dict(job_snapshot)
         job_uid = job.uid
 
         # 预检五关以调用顺序表达时序契约，每关返回 True=已处理。
-        if self.dispatch_dedup(job_uid, job, job_dict):
+        if self.dispatch_dedup(job_uid, job, job_snapshot):
             return None
         attempt_id, execution_id = self._open_attempt(job)
         if pending_dep_failure is not None:
             if self.dispatch_dep_failed(
-                job_uid, job_dict, pending_dep_failure, attempt_id=attempt_id
+                job_uid, job_snapshot, pending_dep_failure, attempt_id=attempt_id
             ):
                 return None
         if job.task_type not in self._tasks:
             if self.dispatch_no_handler(
-                job_uid, job_dict, job.task_type, attempt_id=attempt_id
+                job_uid, job_snapshot, job.task_type, attempt_id=attempt_id
             ):
                 return None
-        if self.dispatch_orphan_probe(job_uid, job_dict, attempt_id=attempt_id):
+        if self.dispatch_orphan_probe(job_uid, job_snapshot, attempt_id=attempt_id):
             return None
-        if self.dispatch_stale_restore(job_uid, job, job_dict, attempt_id=attempt_id):
+        if self.dispatch_stale_restore(job_uid, job, job_snapshot, attempt_id=attempt_id):
             return None
 
         try:
-            return self._spawn_entry(job_uid, job, job_dict, attempt_id, execution_id)
+            return self._spawn_entry(job_uid, job, job_snapshot, attempt_id, execution_id)
         except _CommitCrashSignal:
             # _CommitCrashSignal 继承 BaseException——「commit 失败需崩溃」
             # 的信号不会被 except Exception 兜底误吞。re-raise 让它穿透到
@@ -224,15 +224,15 @@ class DispatchMachine:
             # 原样穿透交运行循环崩溃网统一收尾。
             raise
         except KeyboardInterrupt:
-            return self._handle_interrupt(job_uid, job_dict)
+            return self._handle_interrupt(job_uid, job_snapshot)
         except RateLimitUnavailable as e:
-            return self._handle_rate_limit_defer(job_uid, job_dict, attempt_id, e)
+            return self._handle_rate_limit_defer(job_uid, job_snapshot, attempt_id, e)
         except Exception as e:
-            return self._handle_dispatch_failure(job_uid, job_dict, attempt_id, e)
+            return self._handle_dispatch_failure(job_uid, job_snapshot, attempt_id, e)
 
     # ── 预检五关（顺序即时序契约）────────────────────────────────────
 
-    def dispatch_dedup(self, job_uid: str, job: Job, job_dict: dict) -> bool:
+    def dispatch_dedup(self, job_uid: str, job: Job, job_snapshot: dict) -> bool:
         """派发预检关 1——去重（is_known 命中 → rerun 策略 → 跳过/放行）。
 
         返回 True = 已处理（job 被跳过，跳过同样落轨迹行 skipped）；
@@ -243,10 +243,10 @@ class DispatchMachine:
         store = self._store
         if not store.state.is_known(job_uid):
             return False
-        decision = self._rerun_policy.admit(job_dict, store.state)
+        decision = self._rerun_policy.admit(job_snapshot, store.state)
         if decision.should_skip:
             attempt_id, _ = self._open_attempt(job)
-            store.apply_skip(job_uid, job_dict=job_dict, attempt_id=attempt_id)
+            store.apply_skip(job_uid, job_snapshot=job_snapshot, attempt_id=attempt_id)
             return True
         if decision.should_run and (job_uid in store.state.wall_uids or job_uid in store.state.failed_uids):
             # 豁免登记与准入判定同源：pop_job 只按字面 rerun 键登记豁免，
@@ -256,20 +256,20 @@ class DispatchMachine:
             # 不变式：准入层放行的重跑，其有效策略必须落为行内字面键——
             # 豁免事实随行持久，abort/retry/崩溃回滚的按字面键豁免重建
             # （requeue/clear_in_flight/replace_queue）才不丢失动态放行事实。
-            job_dict["rerun"] = decision.effective_rerun
+            job_snapshot["rerun"] = decision.effective_rerun
             # 激活推进：从 wall/failed 拦截点放行重跑 = 新激活代——
             # activation_no + 1、attempt_no 重置 1（本次执行是新激活的
             # 首次尝试，轨迹行按新代号落表）。
             job.activation_no = job.activation_no + 1
             job.attempt_no = 1
-            job_dict["activation_no"] = job.activation_no
-            job_dict["attempt_no"] = 1
+            job_snapshot["activation_no"] = job.activation_no
+            job_snapshot["attempt_no"] = 1
         return False
 
     def dispatch_dep_failed(
         self,
         job_uid: str,
-        job_dict: dict,
+        job_snapshot: dict,
         pending_dep_failure: str,
         *,
         attempt_id: int | None = None,
@@ -290,14 +290,14 @@ class DispatchMachine:
         # 依赖父失败的级联下游计入 cascade_failed 而非 failed——
         # 「真实业务失败率」统计不被级联稀释。
         self._reject_and_commit(
-            job_uid, job_dict, fail_meta, count_as="cascade_failed", attempt_id=attempt_id
+            job_uid, job_snapshot, fail_meta, count_as="cascade_failed", attempt_id=attempt_id
         )
         return True
 
     def dispatch_no_handler(
         self,
         job_uid: str,
-        job_dict: dict,
+        job_snapshot: dict,
         task_type: str,
         *,
         attempt_id: int | None = None,
@@ -309,13 +309,13 @@ class DispatchMachine:
         """
         logger.error(f"SKIP: {job_uid} (No handler for task_type '{task_type}')")
         fail_meta = {"error": ERR_NO_HANDLER, "fatal": True}
-        self._reject_and_commit(job_uid, job_dict, fail_meta, attempt_id=attempt_id)
+        self._reject_and_commit(job_uid, job_snapshot, fail_meta, attempt_id=attempt_id)
         return True
 
     def dispatch_orphan_probe(
         self,
         job_uid: str,
-        job_dict: dict,
+        job_snapshot: dict,
         *,
         attempt_id: int | None = None,
     ) -> bool:
@@ -344,7 +344,7 @@ class DispatchMachine:
                 f"Deferring {job_uid}: orphan execution body still holds lock."
             )
             self._store.requeue_transient(
-                job_dict,
+                job_snapshot,
                 transient_kind="lock_conflict",
                 attempt_id=attempt_id,
                 error="orphan lock conflict",
@@ -356,7 +356,7 @@ class DispatchMachine:
         self,
         job_uid: str,
         job: Job,
-        job_dict: dict,
+        job_snapshot: dict,
         *,
         attempt_id: int | None = None,
     ) -> bool:
@@ -373,7 +373,7 @@ class DispatchMachine:
         已开的轨迹行随认领结果在完成机器侧收尾（attempt_id 透传）。
         """
         self._salvage_residue_signals(job_uid)
-        if self._recovery.restore_stale_result(job_uid, job, job_dict, attempt_id=attempt_id):
+        if self._recovery.restore_stale_result(job_uid, job, job_snapshot, attempt_id=attempt_id):
             return True
         self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
         return False
@@ -410,7 +410,7 @@ class DispatchMachine:
         self,
         job_uid: str,
         job: Job,
-        job_dict: dict,
+        job_snapshot: dict,
         attempt_id: int | None,
         execution_id: str,
     ) -> InFlightJob | None:
@@ -437,7 +437,7 @@ class DispatchMachine:
                             "details": errors,
                         }
                         self._reject_and_commit(
-                            job_uid, job_dict, fail_meta, attempt_id=attempt_id
+                            job_uid, job_snapshot, fail_meta, attempt_id=attempt_id
                         )
                         return None
 
@@ -457,7 +457,7 @@ class DispatchMachine:
 
                 entry = InFlightJob(
                     job_uid=job_uid,
-                    job_dict=job_dict,
+                    job_snapshot=job_snapshot,
                     job=job,
                     handle=handle,
                     job_start=job_start,
@@ -504,7 +504,7 @@ class DispatchMachine:
     def _reject_and_commit(
         self,
         job_uid: str,
-        job_dict: dict,
+        job_snapshot: dict,
         meta: dict,
         *,
         count_as: str = "failed",
@@ -520,7 +520,7 @@ class DispatchMachine:
         """
         try:
             outcome = self._store.apply_failure(
-                job_uid, meta, job_dict=job_dict, count_as=count_as,
+                job_uid, meta, job_snapshot=job_snapshot, count_as=count_as,
                 cascade=True, attempt_id=attempt_id,
             )
             self._store.fire_attempt_finished(
@@ -534,7 +534,7 @@ class DispatchMachine:
             # 指标并触发钩子）
             return
 
-    def _handle_interrupt(self, job_uid: str, job_dict: dict) -> None:
+    def _handle_interrupt(self, job_uid: str, job_snapshot: dict) -> None:
         """派发中断分支：entry 已登记交运行循环统一 abort，否则回队后上抛。"""
         logger.warning(f"Pipeline interrupted while dispatching {job_uid}.")
         if job_uid in self._in_flight:
@@ -542,7 +542,7 @@ class DispatchMachine:
             # 全部交给运行循环的中止收尾统一处理，避免对同一 entry 二次
             # 释放资源、二次 requeue 同一作业。
             raise KeyboardInterrupt
-        self._store.state.requeue_jobs([job_dict], front=True)
+        self._store.state.requeue_jobs([job_snapshot], front=True)
         # 不在此保存队列：内存此刻缺其他 in-flight 作业，交给运行循环的
         # 崩溃安全保存合并磁盘真相后统一保存。
         raise KeyboardInterrupt
@@ -550,7 +550,7 @@ class DispatchMachine:
     def _handle_rate_limit_defer(
         self,
         job_uid: str,
-        job_dict: dict,
+        job_snapshot: dict,
         attempt_id: int | None,
         exc: RateLimitUnavailable,
     ) -> None:
@@ -564,7 +564,7 @@ class DispatchMachine:
             f"Deferring {job_uid}: rate limit re-check failed at reserve ({exc})."
         )
         self._store.requeue_transient(
-            job_dict,
+            job_snapshot,
             transient_kind="rate_limited",
             attempt_id=attempt_id,
             error=str(exc),
@@ -574,16 +574,16 @@ class DispatchMachine:
     def _handle_dispatch_failure(
         self,
         job_uid: str,
-        job_dict: dict,
+        job_snapshot: dict,
         attempt_id: int | None,
         exc: Exception,
     ) -> None:
         """派发异常分支：3-strike 派发失败预算收敛，未达阈值回队后上抛。"""
         store = self._store
         logger.error(f"Error dispatching job {job_uid}: {exc}\n{traceback.format_exc()}")
-        rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+        rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
         failures = rt_state.record_dispatch_failure()
-        job_dict["runtime"] = rt_state.to_dict()
+        job_snapshot["runtime"] = rt_state.to_dict()
         if failures >= self._commit_failure_threshold:
             logger.critical(
                 f"Dispatch failed {failures} times for {job_uid} ({exc}); "
@@ -596,10 +596,10 @@ class DispatchMachine:
                 "detail": str(exc)[:200],
             }
             self._in_flight.settle(job_uid, state=store.state)
-            self._reject_and_commit(job_uid, job_dict, fail_meta, attempt_id=attempt_id)
+            self._reject_and_commit(job_uid, job_snapshot, fail_meta, attempt_id=attempt_id)
             return None
         self._in_flight.settle(job_uid, state=store.state)
-        store.state.requeue_jobs([job_dict], front=True)
+        store.state.requeue_jobs([job_snapshot], front=True)
         store.finish_attempt(
             attempt_id, outcome=ATTEMPT_REQUEUED, error=f"dispatch failure: {exc}"
         )

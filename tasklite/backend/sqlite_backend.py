@@ -19,7 +19,7 @@ from .base import (
     validate_queue_replacement,
 )
 from ..models.attempt import AttemptRecord
-from ..models.state import uid_from_job_dict
+from ..models.state import job_uid_from_snapshot
 from ..utils.jsonutil import dumps, loads
 
 logger = logging.getLogger("tasklite")
@@ -203,8 +203,8 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     # 序号分配 ---------------------------------------------------------
 
-    def _seq_range(self, conn: sqlite3.Connection, count: int, front: bool) -> list[int]:
-        """分配 count 个保序 seq：front 取 min_seq - count..min_seq-1，back 取 max_seq+1..。
+    def _queue_position_range(self, conn: sqlite3.Connection, count: int, front: bool) -> list[int]:
+        """分配 count 个保序 seq：front 取 min_queue_position - count..min_queue_position-1，back 取 max_queue_position+1..。
 
         调用方必须已通过 ``BEGIN IMMEDIATE`` 持写事务：MIN/MAX 的读
         与调用方随后的 INSERT 必须原子——否则两个连接读到同一 min/max
@@ -213,13 +213,13 @@ class SQLiteStateBackend(AbstractStateBackend):
         """
         if count <= 0:
             return []
-        min_seq, max_seq = conn.execute('SELECT MIN(seq), MAX(seq) FROM queue').fetchone()
-        if min_seq is None:  # 空表
-            min_seq, max_seq = 0, -1
+        min_queue_position, max_queue_position = conn.execute('SELECT MIN(seq), MAX(seq) FROM queue').fetchone()
+        if min_queue_position is None:  # 空表
+            min_queue_position, max_queue_position = 0, -1
         if front:
-            base = min_seq - count
-            return list(range(base, min_seq))  # 首条最小，保序
-        base = max_seq + 1
+            base = min_queue_position - count
+            return list(range(base, min_queue_position))  # 首条最小，保序
+        base = max_queue_position + 1
         return list(range(base, base + count))
 
     # 全量加载 ---------------------------------------------------------
@@ -287,7 +287,7 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     # 整表重写 ---------------------------------------------------------
 
-    def _rewrite_queue_rows(self, conn: sqlite3.Connection, jobs: list[dict[str, Any]]) -> None:
+    def _rewrite_queue_rows(self, conn: sqlite3.Connection, job_snapshots: list[dict[str, Any]]) -> None:
         """queue 表整表重写的单一出口（save_queue 与 replace_queue_atomic 共用）。
 
         写变前先经 ``validate_queue_replacement`` 校验替换集（None/非法形状
@@ -297,13 +297,13 @@ class SQLiteStateBackend(AbstractStateBackend):
         覆盖为最后一条）——与加载期去重策略一致，杜绝队列 uid 索引与
         queue list 的漂移。调用方必须已持写事务（显式或隐式）。
         """
-        validate_queue_replacement(jobs)
+        validate_queue_replacement(job_snapshots)
         conn.execute('DELETE FROM queue')
-        if jobs:
+        if job_snapshots:
             seen: set[str] = set()
             rows: list[tuple[str, int, str]] = []
-            for j in jobs:
-                u = uid_from_job_dict(j)
+            for j in job_snapshots:
+                u = job_uid_from_snapshot(j)
                 if u in seen:
                     logger.warning(
                         f"save_queue: duplicate uid {u} dropped (kept first)."
@@ -316,7 +316,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                 rows,
             )
 
-    def save_queue(self, jobs: list[dict[str, Any]]) -> None:
+    def save_queue(self, job_snapshots: list[dict[str, Any]]) -> None:
         """全量重写队列（测试装配 / replace_queue_atomic 事务内步骤，罕见 O(N)）。
 
         红线：无读基准的整表覆盖——崩溃恢复路径的「合并保存」严禁直接
@@ -325,7 +325,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         """
         try:
             with self._get_conn() as conn:
-                self._rewrite_queue_rows(conn, jobs)
+                self._rewrite_queue_rows(conn, job_snapshots)
         except Exception as e:
             logger.critical(f"Failed to save queue to {self.path.name}: {e}")
             raise
@@ -355,10 +355,10 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     def commit_job_success(
         self,
-        uid: str,
+        job_uid: str,
         result_meta: dict,
         *,
-        spawned_jobs: Sequence[dict[str, Any]] = (),
+        spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
     ) -> bool:
         """原子 delta：写 wall + 删 popped uid + 删 failed 残行 + 队头插 spawned + 更新 cursors。
@@ -368,23 +368,23 @@ class SQLiteStateBackend(AbstractStateBackend):
         try:
             with self._get_conn() as conn:
                 # spawned 队头插入的 seq 分配是读-改-写：先取写锁再读，
-                # 与并发的 front 入队互斥，否则两方读到同一 min_seq。
+                # 与并发的 front 入队互斥，否则两方读到同一 min_queue_position。
                 conn.execute('BEGIN IMMEDIATE')
                 conn.execute(
                     'INSERT OR REPLACE INTO wall (uid, payload) VALUES (?, ?)',
-                    (uid, dumps(result_meta or {})),
+                    (job_uid, dumps(result_meta or {})),
                 )
-                conn.execute('DELETE FROM queue WHERE uid = ?', (uid,))
+                conn.execute('DELETE FROM queue WHERE uid = ?', (job_uid,))
                 # 成功 commit 时清理 failed 同名残行——否则同一 uid 永久
                 # 「既成功又失败」（失败档案与 wall 矛盾）。幂等，与
                 # 「job 最终状态唯一」语义一致。
-                conn.execute('DELETE FROM failed WHERE uid = ?', (uid,))
-                if spawned_jobs:
-                    seqs = self._seq_range(conn, len(spawned_jobs), front=True)
+                conn.execute('DELETE FROM failed WHERE uid = ?', (job_uid,))
+                if spawned_job_snapshots:
+                    queue_positions = self._queue_position_range(conn, len(spawned_job_snapshots), front=True)
                     cur = conn.executemany(
                         'INSERT OR IGNORE INTO queue (uid, seq, job_data) VALUES (?, ?, ?)',
-                        [(uid_from_job_dict(j), s, dumps(j))
-                         for j, s in zip(spawned_jobs, seqs)],
+                        [(job_uid_from_snapshot(j), s, dumps(j))
+                         for j, s in zip(spawned_job_snapshots, queue_positions)],
                     )
                     # 防止 INSERT OR IGNORE 静默丢弃 spawn：若某个 spawned
                     # uid 与磁盘队列冲突（内存 is_known 预筛后的漂移窗口），
@@ -393,16 +393,16 @@ class SQLiteStateBackend(AbstractStateBackend):
                     # 返回实际插入行数，rowcount < len 即检测到漂移 → 抛
                     # 异常回滚返回 False 走崩溃契约（重启后 at-least-once
                     # 重扫），而非静默掩盖。
-                    if cur.rowcount is not None and cur.rowcount < len(spawned_jobs):
+                    if cur.rowcount is not None and cur.rowcount < len(spawned_job_snapshots):
                         logger.critical(
-                            f"commit_job_success for {uid}: "
-                            f"{len(spawned_jobs) - cur.rowcount} spawned job(s) "
+                            f"commit_job_success for {job_uid}: "
+                            f"{len(spawned_job_snapshots) - cur.rowcount} spawned job(s) "
                             f"silently dropped by INSERT OR IGNORE (disk/memory "
                             f"drift). Returning False to trigger crash contract."
                         )
                         raise RuntimeError(
-                            f"spawned job uid conflict on disk for {uid}: "
-                            f"inserted {cur.rowcount}/{len(spawned_jobs)}"
+                            f"spawned job uid conflict on disk for {job_uid}: "
+                            f"inserted {cur.rowcount}/{len(spawned_job_snapshots)}"
                         )
                 if cursor_updates:
                     # None 值表示删除游标；非 None 值为 str（set_cursor 校验保证）
@@ -415,14 +415,14 @@ class SQLiteStateBackend(AbstractStateBackend):
                                 (k, v),
                             )
         except Exception as e:
-            logger.critical(f"Failed to commit job success for {uid} in {self.path.name}: {e}")
+            logger.critical(f"Failed to commit job success for {job_uid} in {self.path.name}: {e}")
             return False
         return True
 
     def _write_failed_row(
         self,
         conn: sqlite3.Connection,
-        uid: str,
+        job_uid: str,
         meta: dict,
         job_payload: dict[str, Any] | None = None,
     ) -> None:
@@ -441,7 +441,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         基于同一旧行决定保留/覆盖，交错落盘后快照来源不确定）。
         """
         row = conn.execute(
-            'SELECT job_payload FROM failed WHERE uid = ?', (uid,)
+            'SELECT job_payload FROM failed WHERE uid = ?', (job_uid,)
         ).fetchone()
         merged = dict(meta or {})
         effective_payload = (
@@ -451,12 +451,12 @@ class SQLiteStateBackend(AbstractStateBackend):
         )
         conn.execute(
             'INSERT OR REPLACE INTO failed (uid, payload, job_payload) VALUES (?, ?, ?)',
-            (uid, dumps(merged),
+            (job_uid, dumps(merged),
              dumps(effective_payload) if effective_payload is not None else None),
         )
 
     def commit_job_failure(
-        self, uid: str, result_meta: dict, job_payload: dict[str, Any] | None = None
+        self, job_uid: str, result_meta: dict, job_payload: dict[str, Any] | None = None
     ) -> bool:
         """原子 delta：写失败档案 + 删 popped uid + 删 wall 同名行。
 
@@ -469,30 +469,30 @@ class SQLiteStateBackend(AbstractStateBackend):
             with self._get_conn() as conn:
                 # 快照保留的读-改-写必须持写事务串行化（详见 _get_conn）。
                 conn.execute('BEGIN IMMEDIATE')
-                self._write_failed_row(conn, uid, result_meta, job_payload)
-                conn.execute('DELETE FROM queue WHERE uid = ?', (uid,))
-                conn.execute('DELETE FROM wall WHERE uid = ?', (uid,))
+                self._write_failed_row(conn, job_uid, result_meta, job_payload)
+                conn.execute('DELETE FROM queue WHERE uid = ?', (job_uid,))
+                conn.execute('DELETE FROM wall WHERE uid = ?', (job_uid,))
         except Exception as e:
-            logger.critical(f"Failed to commit job failure for {uid} in {self.path.name}: {e}")
+            logger.critical(f"Failed to commit job failure for {job_uid} in {self.path.name}: {e}")
             return False
         return True
 
-    def commit_skip(self, uid: str) -> bool:
+    def commit_skip(self, job_uid: str) -> bool:
         """delta 删除队列中已终态（重复）的 uid；不写 wall/failed。"""
         try:
             with self._get_conn() as conn:
-                conn.execute('DELETE FROM queue WHERE uid = ?', (uid,))
+                conn.execute('DELETE FROM queue WHERE uid = ?', (job_uid,))
         except Exception as e:
-            logger.critical(f"Failed to commit skip for {uid} in {self.path.name}: {e}")
+            logger.critical(f"Failed to commit skip for {job_uid} in {self.path.name}: {e}")
             return False
         return True
 
     def commit_retry(
-        self, popped_uid: str, requeued_job: dict[str, Any], *, front: bool = False
+        self, popped_job_uid: str, requeued_job_snapshot: dict[str, Any], *, front: bool = False
     ) -> bool:
-        """原子 delta：DELETE popped_uid + 按 front 插入 requeued_job（同 uid DELETE+INSERT）。
+        """原子 delta：DELETE popped_job_uid + 按 front 插入 requeued_job_snapshot（同 uid DELETE+INSERT）。
 
-        不写 wall/failed。popped_uid 已先删除，故同 uid 重插安全（用
+        不写 wall/failed。popped_job_uid 已先删除，故同 uid 重插安全（用
         INSERT 而非 REPLACE）。不用 INSERT OR IGNORE——若 requeued uid 与
         队列既有行冲突（本不该发生），静默丢弃会让 job 无声消失却返回
         True；普通 INSERT 让真实冲突抛异常 → 返回 False → 走崩溃契约。
@@ -503,18 +503,18 @@ class SQLiteStateBackend(AbstractStateBackend):
                 # seq 分配的读与随后的 INSERT 之间不能让并发方插入提交：
                 # 先取写锁再读（事务纪律详见 _get_conn docstring）。
                 conn.execute('BEGIN IMMEDIATE')
-                conn.execute('DELETE FROM queue WHERE uid = ?', (popped_uid,))
-                seqs = self._seq_range(conn, 1, front=front)
+                conn.execute('DELETE FROM queue WHERE uid = ?', (popped_job_uid,))
+                queue_positions = self._queue_position_range(conn, 1, front=front)
                 conn.execute(
                     'INSERT INTO queue (uid, seq, job_data) VALUES (?, ?, ?)',
-                    (uid_from_job_dict(requeued_job), seqs[0], dumps(requeued_job)),
+                    (job_uid_from_snapshot(requeued_job_snapshot), queue_positions[0], dumps(requeued_job_snapshot)),
                 )
         except Exception as e:
-            logger.critical(f"Failed to commit retry for {popped_uid} in {self.path.name}: {e}")
+            logger.critical(f"Failed to commit retry for {popped_job_uid} in {self.path.name}: {e}")
             return False
         return True
 
-    def commit_bulk_failure(self, uids_metas: list[tuple[str, dict]]) -> bool:
+    def commit_bulk_failure(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
         """原子 delta：批量写失败档案 + 按 uid 精准删除队列行 + 批量清 wall 旧记录。
 
         与 commit_job_failure 对称，同一事务内批量 ``DELETE FROM wall``
@@ -525,43 +525,43 @@ class SQLiteStateBackend(AbstractStateBackend):
             with self._get_conn() as conn:
                 # 快照保留的读-改-写必须持写事务串行化（详见 _get_conn）。
                 conn.execute('BEGIN IMMEDIATE')
-                for uid, meta in uids_metas:
-                    self._write_failed_row(conn, uid, meta)
+                for job_uid, meta in job_uids_metas:
+                    self._write_failed_row(conn, job_uid, meta)
                 conn.executemany(
                     'DELETE FROM queue WHERE uid = ?',
-                    [(uid,) for uid, _ in uids_metas],
+                    [(job_uid,) for job_uid, _ in job_uids_metas],
                 )
                 conn.executemany(
                     'DELETE FROM wall WHERE uid = ?',
-                    [(uid,) for uid, _ in uids_metas],
+                    [(job_uid,) for job_uid, _ in job_uids_metas],
                 )
         except Exception as e:
             logger.critical(f"Failed to commit bulk failure in {self.path.name}: {e}")
             return False
         return True
 
-    def append_failed(self, uid: str, payload: dict[str, Any] | None = None) -> None:
+    def append_failed(self, job_uid: str, payload: dict[str, Any] | None = None) -> None:
         try:
             with self._get_conn() as conn:
                 # 快照保留的读-改-写必须持写事务串行化，否则并发 append
                 # 基于同一旧快照各写各的（详见 _get_conn）。经
                 # _write_failed_row 单一出口写入。
                 conn.execute('BEGIN IMMEDIATE')
-                self._write_failed_row(conn, uid, payload or {})
+                self._write_failed_row(conn, job_uid, payload or {})
         except Exception as e:
             logger.error(f"Failed to append to failed archive in {self.path.name}: {e}")
             raise
 
     # 增量入队 -----------------------------------------------------------
 
-    def enqueue_jobs(self, jobs: list[dict[str, Any]], *, front: bool = False) -> list[str]:
+    def enqueue_jobs(self, job_snapshots: list[dict[str, Any]], *, front: bool = False) -> list[str]:
         """批量增量入队：单事务原子插入，跳过重复 uid。
 
         与 save_queue 的区别：不做 DELETE 全表重写——与运行中 run() 的
         delta commit 并发时不覆盖其已提交变更（写入侧不覆盖，读-改-写
         窗口仍由 replace_queue_atomic 收敛）。失败抛异常（不吞）。
         """
-        if not jobs:
+        if not job_snapshots:
             return []
         try:
             with self._get_conn() as conn:
@@ -574,8 +574,8 @@ class SQLiteStateBackend(AbstractStateBackend):
                 }
                 fresh: list[dict[str, Any]] = []
                 batch_seen: set[str] = set()
-                for j in jobs:
-                    u = uid_from_job_dict(j)
+                for j in job_snapshots:
+                    u = job_uid_from_snapshot(j)
                     # 批次内重复（同一 enqueue 调用传相同 uid 两次）与
                     # 队列中已有的 uid 都跳过（首个存储，后续跳过）。
                     if u in existing or u in batch_seen:
@@ -584,62 +584,62 @@ class SQLiteStateBackend(AbstractStateBackend):
                     fresh.append(j)
                 if not fresh:
                     return []
-                seqs = self._seq_range(conn, len(fresh), front=front)
+                queue_positions = self._queue_position_range(conn, len(fresh), front=front)
                 conn.executemany(
                     'INSERT INTO queue (uid, seq, job_data) VALUES (?, ?, ?)',
-                    [(uid_from_job_dict(j), s, dumps(j))
-                     for j, s in zip(fresh, seqs)],
+                    [(job_uid_from_snapshot(j), s, dumps(j))
+                     for j, s in zip(fresh, queue_positions)],
                 )
-                return [uid_from_job_dict(j) for j in fresh]
+                return [job_uid_from_snapshot(j) for j in fresh]
         except Exception as e:
-            logger.critical(f"Failed to enqueue jobs to {self.path.name}: {e}")
+            logger.critical(f"Failed to enqueue job_snapshots to {self.path.name}: {e}")
             raise
 
     # 定向删除与种子 -------------------------------------------------------
 
-    def delete_queue_uids(self, uids: list[str]) -> int:
+    def delete_queue_uids(self, job_uids: list[str]) -> int:
         """按 uid 定向批量删除队列行（加载期 repair 差量落盘），不触碰其余行。"""
-        if not uids:
+        if not job_uids:
             return 0
         try:
             with self._get_conn() as conn:
                 cur = conn.executemany(
-                    'DELETE FROM queue WHERE uid = ?', [(u,) for u in uids]
+                    'DELETE FROM queue WHERE uid = ?', [(u,) for u in job_uids]
                 )
                 return cur.rowcount if cur.rowcount is not None else 0
         except Exception as e:
             logger.critical(f"Failed to delete queue uids in {self.path.name}: {e}")
             raise
 
-    def delete_failed(self, uids: list[str]) -> int:
+    def delete_failed(self, job_uids: list[str]) -> int:
         """从失败档案批量删除指定 uid（clear_failures 的后端实现）。"""
-        if not uids:
+        if not job_uids:
             return 0
         try:
             with self._get_conn() as conn:
                 cur = conn.executemany(
-                    'DELETE FROM failed WHERE uid = ?', [(u,) for u in uids]
+                    'DELETE FROM failed WHERE uid = ?', [(u,) for u in job_uids]
                 )
                 return cur.rowcount if cur.rowcount is not None else 0
         except Exception as e:
             logger.critical(f"Failed to delete failed entries in {self.path.name}: {e}")
             raise
 
-    def delete_wall(self, uids: list[str]) -> int:
+    def delete_wall(self, job_uids: list[str]) -> int:
         """从 wall 批量删除指定 uid（clear_history 的后端实现）。"""
-        if not uids:
+        if not job_uids:
             return 0
         try:
             with self._get_conn() as conn:
                 cur = conn.executemany(
-                    'DELETE FROM wall WHERE uid = ?', [(u,) for u in uids]
+                    'DELETE FROM wall WHERE uid = ?', [(u,) for u in job_uids]
                 )
                 return cur.rowcount if cur.rowcount is not None else 0
         except Exception as e:
             logger.critical(f"Failed to delete wall entries in {self.path.name}: {e}")
             raise
 
-    def seed_wall(self, uids: list[str]) -> int:
+    def seed_wall(self, job_uids: list[str]) -> int:
         """把 uid 批量写入 wall（meta 空 dict）——存档迁移标记「已处理」。
 
         幂等：已存在的 uid 被覆盖（meta 重置为空）。
@@ -648,9 +648,9 @@ class SQLiteStateBackend(AbstractStateBackend):
         再读，详见 _get_conn），冲突时零写入（整体拒绝），不静默清除
         失败档案记录（失败历史须先经 delete_failed 显式清除）。
         """
-        if not uids:
+        if not job_uids:
             return 0
-        unique_uids = list(dict.fromkeys(uids))
+        unique_uids = list(dict.fromkeys(job_uids))
         try:
             with self._get_conn() as conn:
                 conn.execute('BEGIN IMMEDIATE')
@@ -668,7 +668,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                     )
                 cur = conn.executemany(
                     'INSERT OR REPLACE INTO wall (uid, payload) VALUES (?, ?)',
-                    [(u, dumps({})) for u in uids],
+                    [(u, dumps({})) for u in job_uids],
                 )
                 return cur.rowcount if cur.rowcount is not None else 0
         except Exception as e:
@@ -779,7 +779,7 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     # 元数据 ---------------------------------------------------------------
 
-    def get_meta(self, key: str) -> str | None:
+    def get_engine_metadata(self, key: str) -> str | None:
         if not self.path.exists():
             return None
         try:
@@ -789,7 +789,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(f"Failed to read meta '{key}' from {self.path.name}: {e}") from e
 
-    def set_meta(self, key: str, value: str) -> None:
+    def set_engine_metadata(self, key: str, value: str) -> None:
         try:
             with self._get_conn() as conn:
                 conn.execute(

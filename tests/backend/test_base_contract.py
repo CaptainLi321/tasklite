@@ -52,8 +52,8 @@ EXPECTED_ABSTRACT_METHODS = {
     "update_attempt",
     "load_attempts",
     # 元数据
-    "get_meta",
-    "set_meta",
+    "get_engine_metadata",
+    "set_engine_metadata",
 }
 
 

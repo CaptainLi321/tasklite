@@ -378,7 +378,7 @@ class TestListSuspensions:
     """资源挂起只读视图（meta 表为唯一真相源）。"""
 
     def _seed_suspensions(self, backend, deadlines):
-        backend.set_meta(META_RESOURCE_SUSPENSIONS, dumps(deadlines))
+        backend.set_engine_metadata(META_RESOURCE_SUSPENSIONS, dumps(deadlines))
 
     def test_empty_meta_returns_empty(self):
         _, _, console = _make_console()
@@ -414,9 +414,9 @@ class TestListSuspensions:
 
     def test_corrupt_meta_degrades_to_empty(self):
         backend, _, console = _make_console()
-        backend.set_meta(META_RESOURCE_SUSPENSIONS, "not-json{")
+        backend.set_engine_metadata(META_RESOURCE_SUSPENSIONS, "not-json{")
         assert console.list_suspensions() == []
-        backend.set_meta(META_RESOURCE_SUSPENSIONS, dumps(["list", "not", "dict"]))
+        backend.set_engine_metadata(META_RESOURCE_SUSPENSIONS, dumps(["list", "not", "dict"]))
         assert console.list_suspensions() == []
 
     def test_non_numeric_deadline_skipped(self):
@@ -434,7 +434,7 @@ class TestListSuspensions:
         def _boom(_key):
             raise OSError(5, "disk gone")
 
-        backend.get_meta = _boom  # type: ignore[method-assign]
+        backend.get_engine_metadata = _boom  # type: ignore[method-assign]
         assert console.list_suspensions() == []
 
 

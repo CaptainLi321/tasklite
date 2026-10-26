@@ -826,12 +826,12 @@ class TestApplySuspendSignals:
     """``apply_suspend_signals`` 共享助手：应用成功才持久化，坏信号降级跳过。"""
 
     class _MetaRecorder:
-        """记录 set_meta 调用的假后端（只实现助手依赖的最小面）。"""
+        """记录 set_engine_metadata 调用的假后端（只实现助手依赖的最小面）。"""
 
         def __init__(self):
             self.calls: list[tuple[str, str]] = []
 
-        def set_meta(self, key: str, value: str) -> None:
+        def set_engine_metadata(self, key: str, value: str) -> None:
             self.calls.append((key, value))
 
     @staticmethod
@@ -889,7 +889,7 @@ class TestSuspensionPersistenceAcrossCrash:
 
         persist_resource_suspensions(backend, mgr)
 
-        raw = backend.get_meta(META_RESOURCE_SUSPENSIONS)
+        raw = backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)
         assert raw is not None
         deadlines = json.loads(raw)
         assert "api" in deadlines
@@ -900,7 +900,7 @@ class TestSuspensionPersistenceAcrossCrash:
         """后端落盘失败降级告警，不向挂起应用方抛异常。"""
 
         class _FailingBackend:
-            def set_meta(self, key: str, value: str) -> None:
+            def set_engine_metadata(self, key: str, value: str) -> None:
                 raise RuntimeError("disk gone")
 
         mgr = ResourceManager(
@@ -922,7 +922,7 @@ class TestSuspensionPersistenceAcrossCrash:
         fresh = ResourceManager(
             resources={"api": RateLimitResource("api", interval_seconds=1.0)}
         )
-        fresh.restore_suspensions(json.loads(backend.get_meta(META_RESOURCE_SUSPENSIONS)))
+        fresh.restore_suspensions(json.loads(backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)))
         remaining = fresh["api"].next_available - time.monotonic()
         assert abs(remaining - 300.0) <= 1.0
 
@@ -932,4 +932,4 @@ class TestSuspensionPersistenceAcrossCrash:
             resources={"api": RateLimitResource("api", interval_seconds=1.0)}
         )
         persist_resource_suspensions(backend, mgr)
-        assert json.loads(backend.get_meta(META_RESOURCE_SUSPENSIONS)) == {}
+        assert json.loads(backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)) == {}

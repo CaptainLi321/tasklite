@@ -178,15 +178,15 @@ class TestDiscoveryPolicyNormalization:
         policy = RerunPolicy({"scan": "every_run"})
 
         job_unspecified = {"task_type": "scan", "rerun": None}
-        assert policy.normalize_job_dict(job_unspecified, "scan")
+        assert policy.normalize_job_snapshot(job_unspecified, "scan")
         assert job_unspecified["rerun"] == "every_run"
 
         job_never = {"task_type": "scan", "rerun": "never"}
-        assert not policy.normalize_job_dict(job_never, "scan")
+        assert not policy.normalize_job_snapshot(job_never, "scan")
         assert job_never["rerun"] == "never"
 
         job_on_failure = {"task_type": "scan", "rerun": "on_failure"}
-        assert not policy.normalize_job_dict(job_on_failure, "scan")
+        assert not policy.normalize_job_snapshot(job_on_failure, "scan")
         assert job_on_failure["rerun"] == "on_failure"
 
     def test_evaluate_uses_discovery_default_when_rerun_missing(self):
@@ -208,9 +208,9 @@ class TestImmediateRequeuePolicy:
     def test_transient_kind_keeps_immediate_zero_budget_rhythm(self):
         """瞬态信号军规在立即策略下自然成立：零延迟、不因预算耗尽拒收。"""
         policy = ImmediateRequeuePolicy()
-        job_dict = {"task_type": "t", "job_id": "j", "max_retries": 0, "attempt_no": 1}
+        job_snapshot = {"task_type": "t", "job_id": "j", "max_retries": 0, "attempt_no": 1}
         for kind in ("interrupted", "lock_conflict", "rate_limited"):
-            plan = policy.plan_requeue(job_dict, transient_kind=kind)
+            plan = policy.plan_requeue(job_snapshot, transient_kind=kind)
             assert plan.front is True
             assert plan.delay_seconds == 0.0
 
@@ -220,7 +220,7 @@ class TestImmediateRequeuePolicy:
         class TailingRequeuePolicy(RequeuePolicy):
             """尾插节奏桩：验证接缝只约定形状、不绑定默认实现。"""
 
-            def plan_requeue(self, job_dict, *, transient_kind=None) -> RequeuePlan:
+            def plan_requeue(self, job_snapshot, *, transient_kind=None) -> RequeuePlan:
                 return RequeuePlan(front=False, delay_seconds=2.5)
 
         policy: RequeuePolicy = TailingRequeuePolicy()

@@ -51,12 +51,12 @@ class CommitFailureBackend:
             return False
         return self._real.commit_job_success(*a, **k)
 
-    def commit_job_failure(self, uid, meta, *a, **k):
+    def commit_job_failure(self, job_uid, meta, *a, **k):
         if "commit_job_failure" in self._failing:
             if self._archive_pass_through and meta.get("error") == ERR_COMMIT_FAILURE:
-                return self._real.commit_job_failure(uid, meta, *a, **k)
+                return self._real.commit_job_failure(job_uid, meta, *a, **k)
             return False
-        return self._real.commit_job_failure(uid, meta, *a, **k)
+        return self._real.commit_job_failure(job_uid, meta, *a, **k)
 
     def commit_retry(self, *a, **k):
         if "commit_retry" in self._failing:
@@ -130,7 +130,7 @@ class TestApplySuccess:
         outcome = store.apply_success(
             "root::1",
             {},
-            spawned_jobs=spawned,
+            spawned_job_snapshots=spawned,
             cursor_updates={"batch_pos": "100", "old_cursor": None},
         )
 
@@ -173,7 +173,7 @@ class TestApplyFailureAndCascade:
         outcome = store.apply_failure(
             "parent::1",
             {"error": "crash"},
-            job_dict={"task_type": "parent", "job_id": "1"},
+            job_snapshot={"task_type": "parent", "job_id": "1"},
         )
 
         assert isinstance(outcome, FailureOutcome)
@@ -188,12 +188,12 @@ class TestApplyFailureAndCascade:
     def test_failure_payload_snapshot_skipped_when_unserializable(self, caplog):
         """payload 快照不可序列化时降级 None——快照失败不得误触 3-strike。"""
         store, _, backend = _make_store()
-        job_dict = {
+        job_snapshot = {
             "task_type": "t",
             "job_id": "1",
             "payload": {"bad": object()},
         }
-        store.apply_failure("t::1", {"error": "x"}, job_dict=job_dict)
+        store.apply_failure("t::1", {"error": "x"}, job_snapshot=job_snapshot)
         assert "t::1" in store.state.failed
         assert "t::1" not in backend.load_failed_payloads()
 
@@ -215,7 +215,7 @@ class TestApplyFailureAndCascade:
 class TestApplyRetry:
     """apply_retry 重试重入队。"""
 
-    def _retry_dict(self) -> dict:
+    def _retry_job_snapshot(self) -> dict:
         return Job("t", "1", attempt_no=2).to_dict()
 
     def test_commit_path_requeues_front_and_records_stats(self):
@@ -227,7 +227,7 @@ class TestApplyRetry:
         outcome = store.apply_retry(
             "t::1",
             {"task_type": "t", "job_id": "1"},
-            self._retry_dict(),
+            self._retry_job_snapshot(),
             transient_kind="interrupted",
             error="transient blip",
         )
@@ -246,7 +246,7 @@ class TestApplyRetry:
         store = StateStore(failing, state, stats=TaskStats())
 
         with pytest.raises(_CommitCrashSignal, match="commit_retry"):
-            store.apply_retry("t::1", {"task_type": "t", "job_id": "1"}, self._retry_dict())
+            store.apply_retry("t::1", {"task_type": "t", "job_id": "1"}, self._retry_job_snapshot())
         assert "t::1" in store.state.queue_uids
 
 
@@ -263,7 +263,7 @@ class TestApplySkip:
         if dispatched:
             state.pop_job(0)
 
-        outcome = store.apply_skip("t::1", job_dict={"task_type": "t", "job_id": "1"})
+        outcome = store.apply_skip("t::1", job_snapshot={"task_type": "t", "job_id": "1"})
 
         assert isinstance(outcome, SkipOutcome)
         assert outcome.was_known is True
@@ -280,7 +280,7 @@ class TestApplySkip:
         state.spawn_jobs([pending])
         backend.save_queue([pending])
 
-        store.apply_skip("t::skip", job_dict=pending)
+        store.apply_skip("t::skip", job_snapshot=pending)
 
         assert state.is_empty
         assert state.in_flight_uids == {"t::running"}
@@ -295,7 +295,7 @@ class TestApplySkip:
         state.pop_job(0)
 
         with pytest.raises(_CommitCrashSignal, match="commit_skip"):
-            store.apply_skip("t::1", job_dict={"task_type": "t", "job_id": "1"})
+            store.apply_skip("t::1", job_snapshot={"task_type": "t", "job_id": "1"})
         assert "t::1" in store.state.queue_uids
         assert "t::1" not in store.state.failed
 
@@ -345,24 +345,24 @@ class TestCommitFailureStrike:
 
     def test_threshold_retry_then_archive(self):
         store = self._strike_store([])
-        job_dict = {"task_type": "task", "job_id": "1"}
+        job_snapshot = {"task_type": "task", "job_id": "1"}
 
         store.state.register_in_flight("task::1")
         with pytest.raises(_CommitCrashSignal):
-            store.apply_success("task::1", {}, job_dict=job_dict)
-        assert job_dict["runtime"]["_commit_failures"] == 1
+            store.apply_success("task::1", {}, job_snapshot=job_snapshot)
+        assert job_snapshot["runtime"]["_commit_failures"] == 1
         assert "task::1" in store.state.queue_uids
 
         store.state.pop_job(0)
         store.state.register_in_flight("task::1")
         with pytest.raises(_CommitCrashSignal):
-            store.apply_success("task::1", {}, job_dict=job_dict)
-        assert job_dict["runtime"]["_commit_failures"] == 2
+            store.apply_success("task::1", {}, job_snapshot=job_snapshot)
+        assert job_snapshot["runtime"]["_commit_failures"] == 2
 
         store.state.pop_job(0)
         store.state.register_in_flight("task::1")
         with pytest.raises(_JobTerminated, match="permanently failed"):
-            store.apply_success("task::1", {}, job_dict=job_dict)
+            store.apply_success("task::1", {}, job_snapshot=job_snapshot)
         assert "task::1" in store.state.failed
         assert store.state.failed["task::1"]["fatal"] is True
         assert store.state.failed["task::1"]["error"] == ERR_COMMIT_FAILURE
@@ -370,15 +370,15 @@ class TestCommitFailureStrike:
     def test_strike_archive_fires_hook_exactly_once(self):
         hooks: list[tuple[str, AttemptFinish]] = []
         store = self._strike_store(hooks)
-        job_dict = {"task_type": "task", "job_id": "1"}
+        job_snapshot = {"task_type": "task", "job_id": "1"}
         for _ in range(2):
             store.state.register_in_flight("task::1")
             with pytest.raises(_CommitCrashSignal):
-                store.apply_success("task::1", {}, job_dict=job_dict)
+                store.apply_success("task::1", {}, job_snapshot=job_snapshot)
             store.state.pop_job(0)
         store.state.register_in_flight("task::1")
         with pytest.raises(_JobTerminated):
-            store.apply_success("task::1", {}, job_dict=job_dict)
+            store.apply_success("task::1", {}, job_snapshot=job_snapshot)
 
         assert len(hooks) == 1
         uid, fin = hooks[0]
@@ -845,7 +845,7 @@ _UID_POOL = [
 ]
 
 
-def _job_dict(uid: str) -> dict:
+def _job_snapshot(uid: str) -> dict:
     task_type, job_id = uid.split("::", 1)
     return {"task_type": task_type, "job_id": job_id}
 
@@ -880,13 +880,13 @@ class _MutexProbe:
         if action == "enqueue":
             if self.store.state.is_known(uid) or uid in self.store.state.queue_uids:
                 return
-            self.store.state.spawn_jobs([_job_dict(uid)], front=False)
+            self.store.state.spawn_jobs([_job_snapshot(uid)], front=False)
         elif action == "success":
             self._pop_from_memory_queue(uid)
             self.store.apply_success(uid, {"score": i})
         elif action == "failure":
             self._pop_from_memory_queue(uid)
-            self.store.apply_failure(uid, {"error": "boom"}, job_dict=_job_dict(uid))
+            self.store.apply_failure(uid, {"error": "boom"}, job_snapshot=_job_snapshot(uid))
         elif action == "mark_failed":
             # mark_failed_memory 是失败登记的内存尾段：先完成后端提交再登记
             self._pop_from_memory_queue(uid)
@@ -896,7 +896,7 @@ class _MutexProbe:
             if uid in self.store.state.wall or uid in self.store.state.failed:
                 return
             self._pop_from_memory_queue(uid)
-            self.store.apply_retry(uid, _job_dict(uid), _job_dict(uid))
+            self.store.apply_retry(uid, _job_snapshot(uid), _job_snapshot(uid))
         elif action == "skip":
             self._pop_from_memory_queue(uid)
             self.store.apply_skip(uid)
@@ -944,7 +944,7 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     probe = _MutexProbe()
     probe._pop_from_memory_queue(uid)
 
-    probe.store.apply_failure(uid, {"error": "boom"}, job_dict=_job_dict(uid))
+    probe.store.apply_failure(uid, {"error": "boom"}, job_snapshot=_job_snapshot(uid))
     assert uid in probe.store.state.failed
     assert uid not in probe.store.state.wall
 
@@ -952,7 +952,7 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     assert uid in probe.store.state.wall
     assert uid not in probe.store.state.failed
 
-    probe.store.apply_failure(uid, {"error": "again"}, job_dict=_job_dict(uid))
+    probe.store.apply_failure(uid, {"error": "again"}, job_snapshot=_job_snapshot(uid))
     assert uid in probe.store.state.failed
     assert uid not in probe.store.state.wall
     probe.assert_mutex()

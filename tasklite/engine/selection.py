@@ -90,12 +90,12 @@ class SelectionMachine:
             return 0
         rows: dict[str, dict] = {}
         facts: dict[str, tuple[str, tuple[str, ...]]] = {}
-        for job_dict in queue:
+        for job_snapshot in queue:
             try:
-                parsed = Job.from_dict(job_dict)
+                parsed = Job.from_dict(job_snapshot)
             except (KeyError, TypeError, ValueError):
                 continue  # 畸形行走既有 MALFORMED_JOB 归因
-            rows[parsed.uid] = job_dict
+            rows[parsed.uid] = job_snapshot
             facts[parsed.uid] = (parsed.task_type, tuple(parsed.depends_on))
         if not facts:
             return 0
@@ -140,7 +140,7 @@ class SelectionMachine:
                     f"{ERR_DEPENDENCY_SKIPPED} "
                     f"(upstream: {root_of.get(uid, '?')})"
                 )
-            store.apply_skip(uid, job_dict=queued_row)
+            store.apply_skip(uid, job_snapshot=queued_row)
             self._skipped_uids.add(uid)
             store.record_attempt_skip(
                 job,
@@ -165,9 +165,9 @@ class SelectionMachine:
         if not queue:
             return SelectionStandstill()
         facts: dict[str, tuple[str, tuple[str, ...]]] = {}
-        for job_dict in queue:
+        for job_snapshot in queue:
             try:
-                parsed = Job.from_dict(job_dict)
+                parsed = Job.from_dict(job_snapshot)
                 uid, task_type, depends_on = (
                     parsed.uid,
                     parsed.task_type,

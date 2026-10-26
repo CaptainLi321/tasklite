@@ -623,14 +623,14 @@ class TestCrashNet:
         assert fired == ["completed"]
 
     def test_run_id_meta_failure_fails_loud(self, tmp_path, monkeypatch):
-        """set_meta 失败 → execute() 抛异常，而非静默降级为无 fence 运行。"""
+        """set_engine_metadata 失败 → execute() 抛异常，而非静默降级为无 fence 运行。"""
         env = RuntimeEnv(tmp_path)
         env.register("t")
 
         def boom(*_a, **_kw):
             raise RuntimeError("meta table is broken")
 
-        monkeypatch.setattr(env.backend, "set_meta", boom)
+        monkeypatch.setattr(env.backend, "set_engine_metadata", boom)
         with pytest.raises(RuntimeError, match="meta table is broken"):
             env.runtime.execute()
 
@@ -647,7 +647,7 @@ class TestPrepareRunState:
         state = runtime.prepare_run_state()
 
         assert runtime.session.run_id and runtime.session.run_id != "stale"
-        assert env.backend.get_meta("last_run_id") == runtime.session.run_id
+        assert env.backend.get_engine_metadata("last_run_id") == runtime.session.run_id
         # 认证令牌与 run_id 同生命周期轮换并同步执行通道
         assert runtime.channel.result_token == runtime.session.result_token
         assert runtime.session.dispatch_no == 0

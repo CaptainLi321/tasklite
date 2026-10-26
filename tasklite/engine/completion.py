@@ -86,7 +86,7 @@ class CompletionMachine:
             self.apply_result(
                 uid,
                 entry.job,
-                entry.job_dict,
+                entry.job_snapshot,
                 result,
                 job_start=entry.job_start,
                 expect_in_flight=(entry.handle is not None),
@@ -128,7 +128,7 @@ class CompletionMachine:
         self,
         uid: str,
         job: Job,
-        job_dict: dict[str, Any],
+        job_snapshot: dict[str, Any],
         result: ExecutionResult,
         *,
         job_start: float | None = None,
@@ -165,14 +165,14 @@ class CompletionMachine:
 
         # 2. 状态分发
         if result.retry_requested:
-            self._apply_retry(uid, job, job_dict, result, attempt_id=attempt_id)
+            self._apply_retry(uid, job, job_snapshot, result, attempt_id=attempt_id)
         elif result.success:
             self._apply_success(
-                uid, job_dict, result, job_start=job_start, attempt_id=attempt_id
+                uid, job_snapshot, result, job_start=job_start, attempt_id=attempt_id
             )
         else:
             self._apply_failure(
-                uid, job_dict, result, job_start=job_start, attempt_id=attempt_id
+                uid, job_snapshot, result, job_start=job_start, attempt_id=attempt_id
             )
 
     # ── 三态分支 ──────────────────────────────────────────────────────
@@ -181,12 +181,12 @@ class CompletionMachine:
         self,
         uid: str,
         job: Job,
-        job_dict: dict[str, Any],
+        job_snapshot: dict[str, Any],
         result: ExecutionResult,
         *,
         attempt_id: int | None = None,
     ) -> None:
-        """重试分支：预算判定 → retry_dict 组装 → store.apply_retry。
+        """重试分支：预算判定 → retry_job_snapshot 组装 → store.apply_retry。
 
         瞬态信号（TRANSIENT_KIND_STAT_KEYS 登记的三类）零预算：即使
         attempt_no 已超预算也豁免失败档案、attempt_no 不推进、
@@ -204,27 +204,27 @@ class CompletionMachine:
                 f"Sent to failure archive."
             )
             fail_meta: dict[str, Any] = {"error": ERR_MAX_RETRIES}
-            rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+            rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
             if rt_state.last_retry_error:
                 fail_meta["last_retry_error"] = rt_state.last_retry_error
             if retry_error:
                 fail_meta["retry_error"] = retry_error
             self._store.apply_failure(
-                uid, fail_meta, job_dict=job_dict, cascade=True,
+                uid, fail_meta, job_snapshot=job_snapshot, cascade=True,
                 attempt_id=attempt_id,
             )
             result.going_to_retry = False
             return
 
-        retry_dict = self._build_retry_dict(
-            job, job_dict, retry_error=retry_error, is_transient=is_transient
+        retry_job_snapshot = self._build_retry_job_snapshot(
+            job, job_snapshot, retry_error=retry_error, is_transient=is_transient
         )
         next_attempt = job.attempt_no if is_transient else job.attempt_no + 1
         logger.info(f"RETRY: {uid} (attempt {next_attempt}/{job.max_retries + 1})")
         self._store.apply_retry(
             uid,
-            job_dict,
-            retry_dict,
+            job_snapshot,
+            retry_job_snapshot,
             transient_kind=transient_kind,
             attempt_id=attempt_id,
             error=retry_error,
@@ -232,9 +232,9 @@ class CompletionMachine:
         result.going_to_retry = True
 
     @staticmethod
-    def _build_retry_dict(
+    def _build_retry_job_snapshot(
         job: Job,
-        job_dict: dict[str, Any],
+        job_snapshot: dict[str, Any],
         *,
         retry_error: str | None,
         is_transient: bool,
@@ -243,25 +243,25 @@ class CompletionMachine:
 
         不变式（与 Job 实例位语义对齐）：瞬态信号零预算——attempt_no
         不推进、last_retry_error 不写；业务失败重试 attempt_no+1 并记录
-        最近重试错误。job_dict 顶层自定义字段随重试往返保留；resources
-        以原 job_dict 为准（保留已注入的 ``__workers__`` 槽位）；
+        最近重试错误。job_snapshot 顶层自定义字段随重试往返保留；resources
+        以原 job_snapshot 为准（保留已注入的 ``__workers__`` 槽位）；
         first_enqueued_at 原样保留（重试不刷新首次入队时间）。
         """
-        retry_dict = dict(job_dict)
+        retry_job_snapshot = dict(job_snapshot)
         if not is_transient:
             job.attempt_no = job.attempt_no + 1
-        retry_dict.update(job.to_dict())
-        retry_dict["resources"] = dict(job_dict.get("resources", {}))
-        retry_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+        retry_job_snapshot.update(job.to_dict())
+        retry_job_snapshot["resources"] = dict(job_snapshot.get("resources", {}))
+        retry_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
         if retry_error and not is_transient:
             retry_state.record_retry_error(retry_error)
-        retry_dict["runtime"] = retry_state.to_dict()
-        return retry_dict
+        retry_job_snapshot["runtime"] = retry_state.to_dict()
+        return retry_job_snapshot
 
     def _apply_success(
         self,
         uid: str,
-        job_dict: dict[str, Any],
+        job_snapshot: dict[str, Any],
         result: ExecutionResult,
         *,
         job_start: float | None = None,
@@ -271,23 +271,23 @@ class CompletionMachine:
         duration = (time.monotonic() - job_start) if job_start is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
-        spawned_dicts = self._collect_spawned_dicts(uid, result.new_jobs)
+        spawned_job_snapshots = self._collect_spawned_job_snapshots(uid, result.new_jobs)
         wall_meta = dict(result.result_meta or {})
         declared_inputs = self._channel.read_declared_inputs(uid)
 
         self._store.apply_success(
             uid,
             wall_meta,
-            spawned_jobs=spawned_dicts,
+            spawned_job_snapshots=spawned_job_snapshots,
             cursor_updates=result.cursor_updates,
             declared_inputs=declared_inputs,
             run_id=self._session.run_id,
-            job_dict=job_dict,
+            job_snapshot=job_snapshot,
             attempt_id=attempt_id,
         )
         result.going_to_retry = False
 
-    def _collect_spawned_dicts(
+    def _collect_spawned_job_snapshots(
         self, parent_uid: str, new_jobs: Sequence[Job]
     ) -> list[dict[str, Any]]:
         """动态子任务去重与规范化。
@@ -300,9 +300,9 @@ class CompletionMachine:
         不触发 commit 崩溃契约。
         """
         store = self._store
-        spawned_dicts: list[dict[str, Any]] = []
+        spawned_job_snapshots: list[dict[str, Any]] = []
         if not new_jobs:
-            return spawned_dicts
+            return spawned_job_snapshots
 
         seen_in_batch: set[str] = set()
         unique_new_jobs: list[Job] = []
@@ -322,11 +322,11 @@ class CompletionMachine:
 
         for nj in unique_new_jobs:
             try:
-                spawned_dicts.append(store.normalize_spawned_job(nj))
+                spawned_job_snapshots.append(store.normalize_spawned_job(nj))
             except ValueError as err:
                 self._reject_spawned_job(nj, err)
-        logger.debug(f"Spawned {len(spawned_dicts)} jobs for {parent_uid}.")
-        return spawned_dicts
+        logger.debug(f"Spawned {len(spawned_job_snapshots)} jobs for {parent_uid}.")
+        return spawned_job_snapshots
 
     def _reject_spawned_job(self, job: Job, err: Exception) -> None:
         """坏子作业（不可 JSON 序列化）经 ``complete_job`` 单一出口终结。
@@ -354,7 +354,7 @@ class CompletionMachine:
     def _apply_failure(
         self,
         uid: str,
-        job_dict: dict[str, Any],
+        job_snapshot: dict[str, Any],
         result: ExecutionResult,
         *,
         job_start: float | None = None,
@@ -367,7 +367,7 @@ class CompletionMachine:
             f"Meta: {result.result_meta}"
         )
         self._store.apply_failure(
-            uid, result.result_meta, job_dict=job_dict, cascade=True,
+            uid, result.result_meta, job_snapshot=job_snapshot, cascade=True,
             attempt_id=attempt_id,
         )
         result.going_to_retry = False
@@ -413,9 +413,9 @@ class CompletionMachine:
         # 1. 未完成任务注销并重入队
         for pending_entry in cancelled_entries:
             self._in_flight.settle(pending_entry.job_uid, state=store.state)
-        job_dicts = [entry.job_dict for entry in cancelled_entries]
-        if job_dicts:
-            store.state.requeue_jobs(job_dicts, front=True)
+        job_snapshots = [entry.job_snapshot for entry in cancelled_entries]
+        if job_snapshots:
+            store.state.requeue_jobs(job_snapshots, front=True)
 
         # 2. 已完成任务提交
         commit_crash: BaseException | None = None

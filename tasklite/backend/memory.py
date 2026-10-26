@@ -20,7 +20,7 @@ from .base import (
     validate_queue_replacement,
 )
 from ..models.attempt import AttemptRecord
-from ..models.state import uid_from_job_dict
+from ..models.state import job_uid_from_snapshot
 
 logger = logging.getLogger("tasklite")
 
@@ -40,7 +40,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         self._failed_payloads: dict[str, dict[str, Any]] = {}
         self._cursors: dict[str, str] = {}
         self._queue: list[dict[str, Any]] = []
-        self._meta: dict[str, str] = {}
+        self._engine_metadata: dict[str, str] = {}
         self._attempts: dict[int, AttemptRecord] = {}
         self._attempt_seq = 1
 
@@ -69,7 +69,7 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     # 整表重写 -------------------------------------------------------
 
-    def _dedup_copy(self, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _dedup_copy(self, job_snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """整表替换行的单一出口（save_queue 与 replace_queue_atomic 共用）。
 
         替换集先经 ``validate_queue_replacement`` 校验（与 SQLite 腿同一
@@ -78,11 +78,11 @@ class InMemoryStateBackend(AbstractStateBackend):
         ``_rewrite_queue_rows`` 同语义；条目一律 deepcopy，杜绝外部可变
         别名穿透快照隔离。
         """
-        validate_queue_replacement(jobs)
+        validate_queue_replacement(job_snapshots)
         seen: set[str] = set()
         clean: list[dict[str, Any]] = []
-        for j in jobs:
-            u = uid_from_job_dict(j)
+        for j in job_snapshots:
+            u = job_uid_from_snapshot(j)
             if u in seen:
                 logger.warning(f"save_queue: duplicate uid {u} dropped (kept first).")
                 continue
@@ -90,9 +90,9 @@ class InMemoryStateBackend(AbstractStateBackend):
             clean.append(copy.deepcopy(j))
         return clean
 
-    def save_queue(self, jobs: list[dict[str, Any]]) -> None:
+    def save_queue(self, job_snapshots: list[dict[str, Any]]) -> None:
         with self._lock:
-            self._queue = self._dedup_copy(jobs)
+            self._queue = self._dedup_copy(job_snapshots)
 
     def replace_queue_atomic(
         self,
@@ -107,10 +107,10 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     def commit_job_success(
         self,
-        uid: str,
+        job_uid: str,
         result_meta: dict,
         *,
-        spawned_jobs: Sequence[dict[str, Any]] = (),
+        spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
     ) -> bool:
         with self._lock:
@@ -120,20 +120,20 @@ class InMemoryStateBackend(AbstractStateBackend):
                 # 调用前完全一致（对齐 SQLite 事务回滚；store 的连续失败
                 # 崩溃契约以「后端未变」为前提做重启重建）。
                 wall_meta = copy.deepcopy(result_meta or {})
-                spawned_copy = [copy.deepcopy(j) for j in spawned_jobs]
-                remaining = [j for j in self._queue if uid_from_job_dict(j) != uid]
+                spawned_copy = [copy.deepcopy(j) for j in spawned_job_snapshots]
+                remaining = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
                 if spawned_copy:
-                    remaining_uids = {uid_from_job_dict(j) for j in remaining}
+                    remaining_uids = {job_uid_from_snapshot(j) for j in remaining}
                     seen: set[str] = set()
                     for sj in spawned_copy:
-                        suid = uid_from_job_dict(sj)
+                        suid = job_uid_from_snapshot(sj)
                         # spawned uid 撞上删除 popped 后的队列既有条目，或
                         # 批内自相重复，均判定内存/磁盘漂移 → False 走崩溃
                         # 契约，绝不产出重复队列条目（对齐 SQLite
                         # INSERT OR IGNORE + rowcount 漂移检测）。
                         if suid in remaining_uids or suid in seen:
                             logger.critical(
-                                f"commit_job_success for {uid}: spawned job {suid} "
+                                f"commit_job_success for {job_uid}: spawned job {suid} "
                                 f"conflicts with queue (drift). Returning False."
                             )
                             return False
@@ -147,22 +147,22 @@ class InMemoryStateBackend(AbstractStateBackend):
                         else:
                             cursor_sets[k] = str(v)
                 # 校验全部通过，统一落变（落变段不再调用任何可失败操作）
-                self._wall[uid] = wall_meta
+                self._wall[job_uid] = wall_meta
                 self._queue = spawned_copy + remaining  # 队首插入 spawned 并保序
                 # 成功 commit 清理 failed 同名残行：与「job 最终状态唯一」
                 # 语义一致，防 wall∩failed 并存。
-                self._failed.pop(uid, None)
-                self._failed_payloads.pop(uid, None)
+                self._failed.pop(job_uid, None)
+                self._failed_payloads.pop(job_uid, None)
                 self._cursors.update(cursor_sets)
                 for k in cursor_dels:
                     self._cursors.pop(k, None)
                 return True
             except Exception as e:
-                logger.critical(f"Failed to commit job success for {uid}: {e}")
+                logger.critical(f"Failed to commit job success for {job_uid}: {e}")
                 return False
 
     def commit_job_failure(
-        self, uid: str, result_meta: dict, job_payload: dict[str, Any] | None = None
+        self, job_uid: str, result_meta: dict, job_payload: dict[str, Any] | None = None
     ) -> bool:
         with self._lock:
             try:
@@ -172,39 +172,39 @@ class InMemoryStateBackend(AbstractStateBackend):
                 payload_copy = (
                     copy.deepcopy(job_payload) if job_payload is not None else None
                 )
-                remaining = [j for j in self._queue if uid_from_job_dict(j) != uid]
-                self._failed[uid] = meta_copy
+                remaining = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
+                self._failed[job_uid] = meta_copy
                 # payload 快照 latest-wins；None 表示本路径无 payload，保留
                 # 既有快照（与 SQLite 腿 _write_failed_row 的保留语义对齐）。
                 if payload_copy is not None:
-                    self._failed_payloads[uid] = payload_copy
+                    self._failed_payloads[job_uid] = payload_copy
                 self._queue = remaining
                 # 同一事务语义内清理 wall 旧记录：重跑任务失败时旧成功
                 # 记录作废（最终状态唯一），防 wall∩failed 并存。
-                self._wall.pop(uid, None)
+                self._wall.pop(job_uid, None)
                 return True
             except Exception as e:
-                logger.critical(f"Failed to commit job failure for {uid}: {e}")
+                logger.critical(f"Failed to commit job failure for {job_uid}: {e}")
                 return False
 
     def commit_retry(
         self,
-        popped_uid: str,
-        requeued_job: dict[str, Any],
+        popped_job_uid: str,
+        requeued_job_snapshot: dict[str, Any],
         *,
         front: bool = False,
     ) -> bool:
         with self._lock:
             try:
-                requeued_copy = copy.deepcopy(requeued_job)
-                ruid = uid_from_job_dict(requeued_copy)
-                remaining = [j for j in self._queue if uid_from_job_dict(j) != popped_uid]
+                requeued_copy = copy.deepcopy(requeued_job_snapshot)
+                ruid = job_uid_from_snapshot(requeued_copy)
+                remaining = [j for j in self._queue if job_uid_from_snapshot(j) != popped_job_uid]
                 # 对齐 SQLite 普通 INSERT 冲突回滚：requeued uid 撞上删除
                 # popped 后的既有条目 → False 走崩溃契约，绝不产出重复条目；
-                # uid == popped_uid 属同 job 重插（DELETE+INSERT），安全放行。
-                if ruid != popped_uid and any(uid_from_job_dict(j) == ruid for j in remaining):
+                # uid == popped_job_uid 属同 job 重插（DELETE+INSERT），安全放行。
+                if ruid != popped_job_uid and any(job_uid_from_snapshot(j) == ruid for j in remaining):
                     logger.critical(
-                        f"commit_retry for {popped_uid}: requeued uid {ruid} "
+                        f"commit_retry for {popped_job_uid}: requeued uid {ruid} "
                         f"conflicts with existing queue entry. Returning False."
                     )
                     return False
@@ -214,49 +214,49 @@ class InMemoryStateBackend(AbstractStateBackend):
                     self._queue = remaining + [requeued_copy]
                 return True
             except Exception as e:
-                logger.critical(f"Failed to commit retry for {popped_uid}: {e}")
+                logger.critical(f"Failed to commit retry for {popped_job_uid}: {e}")
                 return False
 
-    def commit_bulk_failure(self, uids_metas: list[tuple[str, dict]]) -> bool:
+    def commit_bulk_failure(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
         with self._lock:
             try:
                 # 校验先行：全部失败行拷贝在任何变更前完成——任一行失败则
                 # queue/wall/failed 整体不变（对齐 SQLite 事务回滚，杜绝
                 # 「队列已整体删除、档案未落」的半成品失败态）。
-                entries = [(uid, copy.deepcopy(meta or {})) for uid, meta in uids_metas]
-                fail_uids = {u for u, _ in uids_metas}
-                remaining = [j for j in self._queue if uid_from_job_dict(j) not in fail_uids]
-                for uid, meta in entries:
-                    self._failed[uid] = meta
+                entries = [(job_uid, copy.deepcopy(meta or {})) for job_uid, meta in job_uids_metas]
+                fail_uids = {u for u, _ in job_uids_metas}
+                remaining = [j for j in self._queue if job_uid_from_snapshot(j) not in fail_uids]
+                for job_uid, meta in entries:
+                    self._failed[job_uid] = meta
                     # 级联/死锁批量失败时 wall 旧成功记录作废（最终状态
                     # 唯一），与 commit_job_failure 对称。
-                    self._wall.pop(uid, None)
+                    self._wall.pop(job_uid, None)
                 self._queue = remaining
                 return True
             except Exception as e:
                 logger.critical(f"Failed to commit bulk failure: {e}")
                 return False
 
-    def commit_skip(self, uid: str) -> bool:
+    def commit_skip(self, job_uid: str) -> bool:
         with self._lock:
-            self._queue = [j for j in self._queue if uid_from_job_dict(j) != uid]
+            self._queue = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
             return True
 
-    def append_failed(self, uid: str, payload: dict[str, Any] | None = None) -> None:
+    def append_failed(self, job_uid: str, payload: dict[str, Any] | None = None) -> None:
         with self._lock:
-            self._failed[uid] = copy.deepcopy(payload or {})
+            self._failed[job_uid] = copy.deepcopy(payload or {})
 
     # 增量入队 -------------------------------------------------------
 
-    def enqueue_jobs(self, jobs: list[dict[str, Any]], *, front: bool = False) -> list[str]:
-        if not jobs:
+    def enqueue_jobs(self, job_snapshots: list[dict[str, Any]], *, front: bool = False) -> list[str]:
+        if not job_snapshots:
             return []
         with self._lock:
-            existing = {uid_from_job_dict(j) for j in self._queue}
+            existing = {job_uid_from_snapshot(j) for j in self._queue}
             fresh: list[dict[str, Any]] = []
             batch_seen: set[str] = set()
-            for j in jobs:
-                u = uid_from_job_dict(j)
+            for j in job_snapshots:
+                u = job_uid_from_snapshot(j)
                 # 批次内重复（同一调用传相同 uid 两次）与队列中已有的
                 # uid 都跳过（首个存储，后续跳过）。
                 if u in existing or u in batch_seen:
@@ -269,24 +269,24 @@ class InMemoryStateBackend(AbstractStateBackend):
                 self._queue[0:0] = fresh
             else:
                 self._queue.extend(fresh)
-            return [uid_from_job_dict(j) for j in fresh]
+            return [job_uid_from_snapshot(j) for j in fresh]
 
     # 定向删除与种子 --------------------------------------------------
 
-    def delete_queue_uids(self, uids: list[str]) -> int:
+    def delete_queue_uids(self, job_uids: list[str]) -> int:
         """按 uid 定向批量删除队列条目，与 SQLite 腿同语义：不触碰其余条目。"""
-        if not uids:
+        if not job_uids:
             return 0
         with self._lock:
-            del_set = set(uids)
-            kept = [j for j in self._queue if uid_from_job_dict(j) not in del_set]
+            del_set = set(job_uids)
+            kept = [j for j in self._queue if job_uid_from_snapshot(j) not in del_set]
             removed = len(self._queue) - len(kept)
             self._queue = kept
             return removed
 
-    def delete_failed(self, uids: list[str]) -> int:
+    def delete_failed(self, job_uids: list[str]) -> int:
         with self._lock:
-            del_set = set(uids)
+            del_set = set(job_uids)
             count = 0
             for u in del_set:
                 if u in self._failed:
@@ -295,9 +295,9 @@ class InMemoryStateBackend(AbstractStateBackend):
                     count += 1
             return count
 
-    def delete_wall(self, uids: list[str]) -> int:
+    def delete_wall(self, job_uids: list[str]) -> int:
         with self._lock:
-            del_set = set(uids)
+            del_set = set(job_uids)
             count = 0
             for u in del_set:
                 if u in self._wall:
@@ -305,7 +305,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                     count += 1
             return count
 
-    def seed_wall(self, uids: list[str]) -> int:
+    def seed_wall(self, job_uids: list[str]) -> int:
         """把 uid 批量写入 wall（meta 空 dict）。
 
         不变式：wall/failed 全局互斥——已在 failed 的 uid 拒绝种子；
@@ -313,14 +313,14 @@ class InMemoryStateBackend(AbstractStateBackend):
         记录（失败历史须先经 delete_failed 显式清除）。
         """
         with self._lock:
-            conflict = sorted({u for u in uids if u in self._failed})
+            conflict = sorted({u for u in job_uids if u in self._failed})
             if conflict:
                 raise ValueError(
                     f"seed_wall refuses uid(s) already in failed: {conflict}; "
                     f"wall/failed must stay disjoint"
                 )
             count = 0
-            for u in uids:
+            for u in job_uids:
                 self._wall[u] = {}
                 count += 1
             return count
@@ -385,13 +385,13 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     # 元数据 ---------------------------------------------------------
 
-    def get_meta(self, key: str) -> str | None:
+    def get_engine_metadata(self, key: str) -> str | None:
         with self._lock:
-            return self._meta.get(key)
+            return self._engine_metadata.get(key)
 
-    def set_meta(self, key: str, value: str) -> None:
+    def set_engine_metadata(self, key: str, value: str) -> None:
         with self._lock:
-            self._meta[key] = str(value)
+            self._engine_metadata[key] = str(value)
 
 
 __all__ = ["InMemoryStateBackend"]

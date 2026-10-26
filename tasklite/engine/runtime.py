@@ -43,7 +43,7 @@ from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job
-from ..models.state import PipelineState, uid_from_job_dict
+from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Selection
 from ..utils.lockfile import release_lock, try_acquire_lock
 
@@ -542,7 +542,7 @@ class EngineRuntime:
         self.channel.result_token = self._session.result_token
         self._session.dispatch_no = 0
         try:
-            self.backend.set_meta("last_run_id", self._session.run_id)
+            self.backend.set_engine_metadata("last_run_id", self._session.run_id)
         except Exception as e:
             logger.critical(f"Failed to persist run_id to meta table: {e}")
             raise

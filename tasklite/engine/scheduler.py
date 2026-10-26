@@ -14,7 +14,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from ..models.job import Job
-from ..models.state import PipelineState, uid_from_job_dict
+from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Selection
 from .resource import Resource, ResourceManager
 
@@ -36,9 +36,9 @@ class JobFacts:
     depends_on: tuple[str, ...]
 
     @classmethod
-    def from_job_dict(cls, job_dict: dict) -> JobFacts:
+    def from_job_snapshot(cls, job_snapshot: dict) -> JobFacts:
         """完整走 Job.from_dict 校验，然后冻结调度所需字段。"""
-        job = Job.from_dict(job_dict)
+        job = Job.from_dict(job_snapshot)
         return cls(
             uid=job.uid,
             task_type=job.task_type,
@@ -186,7 +186,7 @@ class JobScheduler:
         """清空调度缓存（**run 生命周期**，由运行主循环加载期调用）。
 
         内容键 + 只读字段（depends_on/resources）使缓存跨轮安全：
-        实例位字段（attempt_no/activation_no/runtime）从 live job_dict
+        实例位字段（attempt_no/activation_no/runtime）从 live job_snapshot
         读取，重入队路径用原 resources 恢复与缓存一致，spawn 去重防同
         uid 冲突——阻塞/慢 job 阶段主循环高频轮询时避免每轮全量反序列化
         队列（大队列每轮数百毫秒 CPU 空烧）。跨 run 陈旧（清历史后重新
@@ -194,17 +194,17 @@ class JobScheduler:
         """
         self._job_cache.clear()
 
-    def cached_job(self, job_dict: dict) -> JobFacts:
-        """返回 job_dict 的不可变调度投影（内容键缓存复用）。
+    def cached_job(self, job_snapshot: dict) -> JobFacts:
+        """返回 job_snapshot 的不可变调度投影（内容键缓存复用）。
 
         公开方法：失败机器的依赖宽限路径跨模块复用同一缓存（免二次
         全量反序列化），调度扫描本身也是唯一内部消费方。
         """
-        task_type = job_dict.get("task_type")
-        job_id = job_dict.get("job_id")
+        task_type = job_snapshot.get("task_type")
+        job_id = job_snapshot.get("job_id")
         if task_type is None or job_id is None:
             # 畸形 dict（缺 task_type/job_id）无法用内容键——直接解析不缓存
-            return JobFacts.from_job_dict(job_dict)
+            return JobFacts.from_job_snapshot(job_snapshot)
         key = (task_type, job_id)
         facts = self._job_cache.get(key)
         # 缓存一致性校验：缓存命中时校验「调度只读字段」一致——rerun="every_run"
@@ -214,17 +214,17 @@ class JobScheduler:
         # 解析的 fresh Job）看到不同字段 → 未知资源/依赖判定背离，以裸 KeyError
         # 击穿整条 run。字段不一致视为 miss 重新解析；同 uid 同内容
         # （重试/常规重跑/重入队）仍命中缓存，保留缓存复用的性能收益。
-        if facts is not None and self._sched_fields_match(facts, job_dict):
+        if facts is not None and self._sched_fields_match(facts, job_snapshot):
             return facts
-        facts = JobFacts.from_job_dict(job_dict)
+        facts = JobFacts.from_job_snapshot(job_snapshot)
         if len(self._job_cache) >= self._JOB_CACHE_MAX:
             self._job_cache.clear()
         self._job_cache[key] = facts
         return facts
 
     @staticmethod
-    def _sched_fields_match(job, job_dict: dict) -> bool:
-        """校验缓存投影（或 Job）与 job_dict 的调度只读字段一致。
+    def _sched_fields_match(job, job_snapshot: dict) -> bool:
+        """校验缓存投影（或 Job）与 job_snapshot 的调度只读字段一致。
 
         ``job`` 接受 ``JobFacts``（生产缓存路径）或 ``Job``（测试直调）——
         两者都只读 depends_on/resources；``dict(...)`` 归一化让
@@ -240,8 +240,8 @@ class JobScheduler:
         避免将合法任务误判为畸形）。非 dict/非 list 的畸形值视为不一致，
         返回 False（重新解析，``Job.from_dict`` 会对畸形正确抛错归位）。
         """
-        raw_res = job_dict.get("resources")
-        raw_dep = job_dict.get("depends_on")
+        raw_res = job_snapshot.get("resources")
+        raw_dep = job_snapshot.get("depends_on")
         try:
             job_res = dict(raw_res) if raw_res is not None else {}
             job_dep = list(raw_dep) if raw_dep is not None else []
@@ -291,13 +291,13 @@ class JobScheduler:
         impossible_resource_uids: list[str] = []
 
         for i in self.ordering.visit_order(q_data):
-            job_dict = q_data[i]
+            job_snapshot = q_data[i]
             # 捕获畸形 job dict（缺 task_type/job_id 等），记录 UID 避免整个扫描崩溃
             try:
-                job = self.cached_job(job_dict)
+                job = self.cached_job(job_snapshot)
             except (KeyError, TypeError, ValueError) as e:
                 logger.error(f"Malformed job dict at index {i}: {e}")
-                malformed_uids.append(uid_from_job_dict(job_dict))
+                malformed_uids.append(job_uid_from_snapshot(job_snapshot))
                 continue
             can_run = True
             failed_dependency = None
@@ -401,7 +401,7 @@ class JobScheduler:
 
         candidate_uid: str | None = None
         if runnable_idx is not None and runnable_idx < len(q_data):
-            candidate_uid = uid_from_job_dict(q_data[runnable_idx])
+            candidate_uid = job_uid_from_snapshot(q_data[runnable_idx])
 
         return ScheduleResult(
             runnable_idx=runnable_idx,

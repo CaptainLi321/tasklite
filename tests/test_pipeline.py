@@ -52,7 +52,7 @@ class NewestFirstPolicy(OrderingPolicy):
 class TailRequeuePolicy(RequeuePolicy):
     """恒队尾重入队策略（门面注入用样本：front 恒 False、零延迟）。"""
 
-    def plan_requeue(self, job_dict, *, transient_kind=None) -> RequeuePlan:
+    def plan_requeue(self, job_snapshot, *, transient_kind=None) -> RequeuePlan:
         return RequeuePlan(front=False, delay_seconds=0.0)
 
 
@@ -132,11 +132,11 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def load_attempts(self, *args, **kwargs):
         return self.inner.load_attempts(*args, **kwargs)
 
-    def get_meta(self, *args, **kwargs):
-        return self.inner.get_meta(*args, **kwargs)
+    def get_engine_metadata(self, *args, **kwargs):
+        return self.inner.get_engine_metadata(*args, **kwargs)
 
-    def set_meta(self, *args, **kwargs):
-        return self.inner.set_meta(*args, **kwargs)
+    def set_engine_metadata(self, *args, **kwargs):
+        return self.inner.set_engine_metadata(*args, **kwargs)
 
 
 # ── fake 进程（写 IPC 结果文件，与真实 worker 同路径）──────────────────
@@ -953,7 +953,7 @@ class TestBackendSwap:
             def load_queue(self):
                 return []
 
-            def commit_job_success(self, uid, meta, **kw):
+            def commit_job_success(self, job_uid, meta, **kw):
                 return True
 
         with pytest.raises(TypeError, match="AbstractStateBackend"):

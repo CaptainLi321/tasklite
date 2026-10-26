@@ -426,14 +426,14 @@ class TestJobWorkerResource:
     """worker 槽位注入（resources 缺省补 1.0，显式值不覆盖）。"""
 
     def test_inject_defaults_when_missing(self):
-        job_dict = Job("t", "id").to_dict()
-        inject_worker_resource(job_dict)
-        assert job_dict["resources"]["__workers__"] == 1.0
+        job_snapshot = Job("t", "id").to_dict()
+        inject_worker_resource(job_snapshot)
+        assert job_snapshot["resources"]["__workers__"] == 1.0
 
     def test_inject_keeps_explicit_amount(self):
-        job_dict = Job("t", "id", resources={"__workers__": 2.0}).to_dict()
-        inject_worker_resource(job_dict)
-        assert job_dict["resources"]["__workers__"] == 2.0
+        job_snapshot = Job("t", "id", resources={"__workers__": 2.0}).to_dict()
+        inject_worker_resource(job_snapshot)
+        assert job_snapshot["resources"]["__workers__"] == 2.0
 
     def test_inject_does_not_mutate_source_job(self):
         job = Job("t", "id")

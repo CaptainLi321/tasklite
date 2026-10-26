@@ -96,9 +96,9 @@ def _parse_spawned_jobs(raw_new_jobs: Any) -> tuple[list[Job], str | None]:
     if not isinstance(raw_new_jobs, list):
         return [], f"invalid new_jobs type: {type(raw_new_jobs).__name__}"
     new_jobs: list[Job] = []
-    for job_dict in raw_new_jobs:
+    for job_snapshot in raw_new_jobs:
         try:
-            new_jobs.append(Job.from_dict(job_dict))
+            new_jobs.append(Job.from_dict(job_snapshot))
         except (KeyError, TypeError, ValueError) as e:
             return [], f"invalid spawned job dict: {e}"
     return new_jobs, None

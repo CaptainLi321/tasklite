@@ -17,23 +17,23 @@ from typing import Any
 from .job import Job, RERUN_EXEMPT_VALUES
 
 
-def _is_rerun_exempt(job_dict: dict) -> bool:
+def _is_rerun_exempt(job_snapshot: dict) -> bool:
     """rerun 策略允许越过终态重跑的作业可合法落在 wall/failed ∩ 队列
     交集——六集合互斥断言对此类作业豁免。"""
-    return job_dict.get("rerun") in RERUN_EXEMPT_VALUES
+    return job_snapshot.get("rerun") in RERUN_EXEMPT_VALUES
 
 
-def uid_from_job_dict(job_dict: dict) -> str:
+def job_uid_from_snapshot(job_snapshot: dict) -> str:
     """从 job dict 中直接提取 uid，避免完整的 Job.from_dict 反序列化开销。"""
-    task_type = job_dict.get("task_type")
-    job_id = job_dict.get("job_id")
+    task_type = job_snapshot.get("task_type")
+    job_id = job_snapshot.get("job_id")
     if task_type is not None and job_id is not None:
         return f"{task_type}::{job_id}"
     try:
-        return Job.from_dict(job_dict).uid
+        return Job.from_dict(job_snapshot).uid
     except (KeyError, TypeError, ValueError):
         import hashlib, json
-        h = hashlib.sha256(json.dumps(job_dict, sort_keys=True, default=str).encode()).hexdigest()
+        h = hashlib.sha256(json.dumps(job_snapshot, sort_keys=True, default=str).encode()).hexdigest()
         return f"_unknown::{h}"
 
 
@@ -57,12 +57,12 @@ class PipelineState:
         self._queue: list[dict] = list(queue)
         self._wall_uids: set[str] = set(self._wall)
         self._failed_uids: set[str] = set(self._failed)
-        self._queue_uids: set[str] = {uid_from_job_dict(j) for j in self._queue}
+        self._queue_uids: set[str] = {job_uid_from_snapshot(j) for j in self._queue}
         self._in_flight_uids: set[str] = set()
         self._rerun_active_uids: set[str] = set()
         for j in self._queue:
             if _is_rerun_exempt(j):
-                self._rerun_active_uids.add(uid_from_job_dict(j))
+                self._rerun_active_uids.add(job_uid_from_snapshot(j))
 
     @property
     def wall(self) -> dict[str, dict[str, Any]]:
@@ -88,25 +88,25 @@ class PipelineState:
 
     def pop_job(self, idx: int) -> dict:
         """弹出并返回 job dict，同步从 _queue_uids 移除其 uid。"""
-        job_dict = self._queue.pop(idx)
-        uid = uid_from_job_dict(job_dict)
-        if _is_rerun_exempt(job_dict):
+        job_snapshot = self._queue.pop(idx)
+        uid = job_uid_from_snapshot(job_snapshot)
+        if _is_rerun_exempt(job_snapshot):
             self._rerun_active_uids.add(uid)
         self._queue_uids.discard(uid)
         if __debug__:
             self._assert_uids_consistent()
-        return job_dict
+        return job_snapshot
 
-    def spawn_jobs(self, job_dicts: list[dict[str, Any]], front: bool = True) -> None:
+    def spawn_jobs(self, job_snapshots: list[dict[str, Any]], front: bool = True) -> None:
         """批量入队（spawn 默认队首插队，保序），逐条同步 uid。"""
         if front:
-            self._queue[0:0] = list(job_dicts)
+            self._queue[0:0] = list(job_snapshots)
         else:
-            self._queue.extend(job_dicts)
-        self._queue_uids.update(uid_from_job_dict(j) for j in job_dicts)
-        for j in job_dicts:
+            self._queue.extend(job_snapshots)
+        self._queue_uids.update(job_uid_from_snapshot(j) for j in job_snapshots)
+        for j in job_snapshots:
             if _is_rerun_exempt(j):
-                self._rerun_active_uids.add(uid_from_job_dict(j))
+                self._rerun_active_uids.add(job_uid_from_snapshot(j))
         if __debug__:
             self._assert_uids_consistent()
 
@@ -114,16 +114,16 @@ class PipelineState:
         """按 uid 清除队列行，保留其他作业的在途重跑豁免。"""
         if uid not in self._queue_uids:
             return
-        self._queue[:] = [jd for jd in self._queue if uid_from_job_dict(jd) != uid]
+        self._queue[:] = [jd for jd in self._queue if job_uid_from_snapshot(jd) != uid]
         self._queue_uids.discard(uid)
         if uid not in self._in_flight_uids:
             self._rerun_active_uids.discard(uid)
         if __debug__:
             self._assert_uids_consistent()
 
-    def requeue_jobs(self, job_dicts: list[dict[str, Any]], front: bool = True) -> None:
+    def requeue_jobs(self, job_snapshots: list[dict[str, Any]], front: bool = True) -> None:
         """重入队（崩溃恢复/重试），语义同 spawn_jobs 队首插入。"""
-        self.spawn_jobs(job_dicts, front=front)
+        self.spawn_jobs(job_snapshots, front=front)
 
     def mark_rerun_active(self, uid: str) -> None:
         """登记派发期准入放行的重跑豁免 uid。
@@ -154,18 +154,18 @@ class PipelineState:
         """清空 in-flight 集合（中止回收路径使用）。"""
         self._in_flight_uids.clear()
         self._rerun_active_uids = {
-            uid_from_job_dict(j) for j in self._queue
+            job_uid_from_snapshot(j) for j in self._queue
             if _is_rerun_exempt(j)
         }
         if __debug__:
             self._assert_state_consistent()
 
-    def replace_queue(self, job_dicts: list[dict[str, Any]]) -> None:
+    def replace_queue(self, job_snapshots: list[dict[str, Any]]) -> None:
         """整体替换队列（死锁批量移除肇事者场景），重建 uid 索引。"""
-        self._queue = list(job_dicts)
-        self._queue_uids = {uid_from_job_dict(j) for j in self._queue}
+        self._queue = list(job_snapshots)
+        self._queue_uids = {job_uid_from_snapshot(j) for j in self._queue}
         self._rerun_active_uids = {
-            uid_from_job_dict(j) for j in self._queue
+            job_uid_from_snapshot(j) for j in self._queue
             if _is_rerun_exempt(j)
         }
         if __debug__:
@@ -372,13 +372,13 @@ class PipelineState:
         """从 queue 事实源直接取重跑豁免集合，不依赖派生缓存
         ``_rerun_active_uids``（缓存被瞬态路径误删时断言不得误报）。"""
         return {
-            uid_from_job_dict(j) for j in self._queue
+            job_uid_from_snapshot(j) for j in self._queue
             if _is_rerun_exempt(j)
         }
 
     def _assert_uids_consistent(self) -> None:
         """DEBUG 不变式：_queue_uids 与 _queue 完全一致。"""
-        recomputed = {uid_from_job_dict(j) for j in self._queue}
+        recomputed = {job_uid_from_snapshot(j) for j in self._queue}
         assert self._queue_uids == recomputed, (
             f"_queue_uids drift: cached={self._queue_uids!r} actual={recomputed!r}"
         )
@@ -418,5 +418,5 @@ class PipelineState:
 
 __all__ = [
     "PipelineState",
-    "uid_from_job_dict",
+    "job_uid_from_snapshot",
 ]

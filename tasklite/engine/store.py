@@ -32,7 +32,7 @@ from ..models.attempt import (
     AttemptRecord,
 )
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
-from ..models.state import PipelineState, uid_from_job_dict
+from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Selection
 from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import dumps
@@ -83,7 +83,7 @@ class FailureOutcome:
 class RetryOutcome:
     """apply_retry 原子转移结果。"""
     uid: str
-    retry_dict: dict[str, Any]
+    retry_job_snapshot: dict[str, Any]
     transient_kind: str | None = None
 
 
@@ -170,9 +170,9 @@ class StateStore:
         if selection is None or not selection.is_active:
             return frozenset()
         excluded: set[str] = set()
-        for job_dict in self._state.queue:
+        for job_snapshot in self._state.queue:
             try:
-                job = Job.from_dict(job_dict)
+                job = Job.from_dict(job_snapshot)
             except (KeyError, TypeError, ValueError):
                 continue
             if not selection.allows_task_type(job.task_type):
@@ -238,25 +238,25 @@ class StateStore:
                 raise ValueError(
                     f"Payload for job {job.uid} is not JSON-serializable: {e}"
                 ) from e
-            job_dict = job.to_dict()
+            job_snapshot = job.to_dict()
         elif isinstance(job, dict):
             if "task_type" not in job or "job_id" not in job:
                 raise ValueError("Job dict must contain 'task_type' and 'job_id'")
             try:
                 dumps(job.get("payload", {}))
             except (TypeError, ValueError) as e:
-                uid = uid_from_job_dict(job)
+                uid = job_uid_from_snapshot(job)
                 raise ValueError(
                     f"Payload for job {uid} is not JSON-serializable: {e}"
                 ) from e
-            job_dict = copy.deepcopy(job)
+            job_snapshot = copy.deepcopy(job)
         else:
             raise TypeError(
                 f"Expected Job or dict, got {type(job).__name__}"
             )
 
-        self._finalize_intake_dict(job_dict, str(job_dict["task_type"]))
-        return job_dict
+        self._finalize_intake_snapshot(job_snapshot, str(job_snapshot["task_type"]))
+        return job_snapshot
 
     def normalize_spawned_job(self, job: Job) -> dict[str, Any]:
         """动态子作业的摄入规范化（成功提交路径的 spawn 侧单点）。
@@ -265,17 +265,17 @@ class StateStore:
         ValueError——调用方按「拒绝该子作业、不连坐父作业成功提交、
         不触发 commit 崩溃契约」的语义处置。
         """
-        job_dict = job.to_dict()
-        self._finalize_intake_dict(job_dict, job.task_type)
+        job_snapshot = job.to_dict()
+        self._finalize_intake_snapshot(job_snapshot, job.task_type)
         try:
-            dumps(job_dict)
+            dumps(job_snapshot)
         except (TypeError, ValueError) as e:
             raise ValueError(
                 f"Spawned job {job.uid} is not JSON-serializable: {e}"
             ) from e
-        return job_dict
+        return job_snapshot
 
-    def _finalize_intake_dict(self, job_dict: dict[str, Any], task_type: str) -> None:
+    def _finalize_intake_snapshot(self, job_snapshot: dict[str, Any], task_type: str) -> None:
         """摄入三步收尾：RerunPolicy 策略注入 → ``__workers__`` 资源注入 →
         first_enqueued_at 填充。
 
@@ -283,10 +283,10 @@ class StateStore:
         dict 已携带首次入队时间，绝不刷新——「首次入队时间」是端到端
         追溯链的锚点。
         """
-        self._rerun_policy.normalize_job_dict(job_dict, task_type)
-        inject_worker_resource(job_dict)
-        if not job_dict.get("first_enqueued_at"):
-            job_dict["first_enqueued_at"] = utc_now_iso()
+        self._rerun_policy.normalize_job_snapshot(job_snapshot, task_type)
+        inject_worker_resource(job_snapshot)
+        if not job_snapshot.get("first_enqueued_at"):
+            job_snapshot["first_enqueued_at"] = utc_now_iso()
 
     def enqueue_jobs(
         self,
@@ -312,12 +312,12 @@ class StateStore:
         if not jobs_list:
             return []
 
-        jobs_dicts = [self.normalize_and_validate_job(j) for j in jobs_list]
-        return self._backend.enqueue_jobs(jobs_dicts, front=front)
+        job_snapshots = [self.normalize_and_validate_job(j) for j in jobs_list]
+        return self._backend.enqueue_jobs(job_snapshots, front=front)
 
     def requeue_transient(
         self,
-        job_dict: dict[str, Any],
+        job_snapshot: dict[str, Any],
         *,
         transient_kind: str,
         attempt_id: int | None = None,
@@ -331,8 +331,8 @@ class StateStore:
         dispatch 失败预算、不写 last_retry_error。``attempt_id`` 非 None 时
         同步把已派发轨迹行收尾为 requeued（旁路观测面单一出口内闭环）。
         """
-        plan = self._requeue_policy.plan_requeue(job_dict, transient_kind=transient_kind)
-        self._state.requeue_jobs([job_dict], front=plan.front)
+        plan = self._requeue_policy.plan_requeue(job_snapshot, transient_kind=transient_kind)
+        self._state.requeue_jobs([job_snapshot], front=plan.front)
         stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
         if stat_key:
             self._record_stat(stat_key, 1)
@@ -460,11 +460,11 @@ class StateStore:
         uid: str,
         result_meta: dict[str, Any],
         *,
-        spawned_jobs: Sequence[dict[str, Any]] = (),
+        spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
         declared_inputs: Sequence[dict[str, Any]] = (),
         run_id: str | None = None,
-        job_dict: dict[str, Any] | None = None,
+        job_snapshot: dict[str, Any] | None = None,
         attempt_id: int | None = None,
     ) -> SuccessOutcome:
         """原子终态转移：成功（wall 落盘 + 清失败档案残行 + 子任务/cursor）。"""
@@ -491,28 +491,28 @@ class StateStore:
                 prev_count = 0
         wall_meta["run_count"] = prev_count + 1
 
-        spawned_list = list(spawned_jobs)
+        spawned_snapshots = list(spawned_job_snapshots)
         committed = self._backend.commit_job_success(
             uid,
             wall_meta,
-            spawned_jobs=spawned_list,
+            spawned_job_snapshots=spawned_snapshots,
             cursor_updates=cursor_updates,
         )
 
         if committed:
-            if spawned_list:
-                self._state.spawn_jobs(spawned_list, front=True)
+            if spawned_snapshots:
+                self._state.spawn_jobs(spawned_snapshots, front=True)
             if cursor_updates:
                 self._state.update_cursors(cursor_updates)
             self._state.mark_success(uid, wall_meta)
             self._state.unregister_in_flight(uid)
             self._record_stat("completed", 1)
             self._finish_attempt(attempt_id, outcome=ATTEMPT_SUCCEEDED)
-            spawned_uids = [uid_from_job_dict(j) for j in spawned_list]
+            spawned_uids = [job_uid_from_snapshot(j) for j in spawned_snapshots]
             return SuccessOutcome(uid=uid, wall_meta=wall_meta, spawned_uids=spawned_uids)
 
         # commit 失败走 3-strike 收敛契约
-        self.handle_commit_failure_strike(uid, "commit_job_success", job_dict, attempt_id=attempt_id)
+        self.handle_commit_failure_strike(uid, "commit_job_success", job_snapshot, attempt_id=attempt_id)
         return SuccessOutcome(uid=uid, wall_meta=wall_meta)
 
     def apply_failure(
@@ -520,14 +520,14 @@ class StateStore:
         uid: str,
         error_meta: dict[str, Any],
         *,
-        job_dict: dict[str, Any] | None = None,
+        job_snapshot: dict[str, Any] | None = None,
         count_as: str = "failed",
         cascade: bool = True,
         attempt_id: int | None = None,
     ) -> FailureOutcome:
         """原子终态转移：永久失败（进入失败档案 + wall 互删 + 级联下游）。"""
         normalized_meta = self._classifier.normalize_failed_meta(error_meta)
-        job_payload = self._extract_job_payload(job_dict)
+        job_payload = self._extract_job_payload(job_snapshot)
         committed = self._backend.commit_job_failure(uid, normalized_meta, job_payload)
 
         if committed:
@@ -546,28 +546,28 @@ class StateStore:
         self.handle_commit_failure_strike(
             uid,
             self._attempt_error(normalized_meta) or "commit_job_failure",
-            job_dict,
+            job_snapshot,
             attempt_id=attempt_id,
         )
         return FailureOutcome(uid=uid, error_meta=normalized_meta)
 
     @staticmethod
-    def _extract_job_payload(job_dict: dict[str, Any] | None) -> dict[str, Any] | None:
+    def _extract_job_payload(job_snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
         """提取可 JSON 序列化的业务 payload 快照（失败档案落盘用）。
 
         不可序列化时降级为 None 并告警，绝不让快照失败把正常失败提交
         打成 commit 失败（那会误触 3-strike 崩溃契约）。
         """
-        if not isinstance(job_dict, dict):
+        if not isinstance(job_snapshot, dict):
             return None
-        payload = job_dict.get("payload")
+        payload = job_snapshot.get("payload")
         if not isinstance(payload, dict):
             return None
         try:
             dumps(payload)
         except (TypeError, ValueError):
             logger.warning(
-                f"Job payload for {job_dict.get('job_id', '?')} is not "
+                f"Job payload for {job_snapshot.get('job_id', '?')} is not "
                 f"JSON-serializable; failure archive payload snapshot skipped."
             )
             return None
@@ -576,35 +576,35 @@ class StateStore:
     def apply_retry(
         self,
         uid: str,
-        job_dict: dict[str, Any],
-        retry_dict: dict[str, Any],
+        job_snapshot: dict[str, Any],
+        retry_job_snapshot: dict[str, Any],
         *,
         transient_kind: str | None = None,
         attempt_id: int | None = None,
         error: str | None = None,
     ) -> RetryOutcome:
         """原子状态转移：重试重入队（节奏经 RequeuePolicy 唯一出口）。"""
-        plan = self._requeue_policy.plan_requeue(retry_dict, transient_kind=transient_kind)
-        committed = self._backend.commit_retry(uid, retry_dict, front=plan.front)
+        plan = self._requeue_policy.plan_requeue(retry_job_snapshot, transient_kind=transient_kind)
+        committed = self._backend.commit_retry(uid, retry_job_snapshot, front=plan.front)
         if committed:
             self._state.unregister_in_flight(uid)
-            self._state.requeue_jobs([retry_dict], front=plan.front)
+            self._state.requeue_jobs([retry_job_snapshot], front=plan.front)
             self._record_stat("retried", 1)
             if transient_kind is not None:
                 stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
                 if stat_key:
                     self._record_stat(stat_key, 1)
             self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error=error)
-            return RetryOutcome(uid=uid, retry_dict=retry_dict, transient_kind=transient_kind)
+            return RetryOutcome(uid=uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
 
-        self.handle_commit_failure_strike(uid, "commit_retry", job_dict, attempt_id=attempt_id)
-        return RetryOutcome(uid=uid, retry_dict=retry_dict, transient_kind=transient_kind)
+        self.handle_commit_failure_strike(uid, "commit_retry", job_snapshot, attempt_id=attempt_id)
+        return RetryOutcome(uid=uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
 
     def apply_skip(
         self,
         uid: str,
         *,
-        job_dict: dict[str, Any] | None = None,
+        job_snapshot: dict[str, Any] | None = None,
         attempt_id: int | None = None,
     ) -> SkipOutcome:
         """原子状态转移：终态跳过（清除磁盘与内存队列，不写 wall/failed）。"""
@@ -616,7 +616,7 @@ class StateStore:
             self._finish_attempt(attempt_id, outcome=ATTEMPT_SKIPPED)
             return SkipOutcome(uid=uid, was_known=True)
 
-        self.handle_skip_commit_strike(uid, job_dict, attempt_id=attempt_id)
+        self.handle_skip_commit_strike(uid, job_snapshot, attempt_id=attempt_id)
         raise AssertionError(  # pragma: no cover - 契约防御
             f"skip commit strike for {uid} unexpectedly returned normally; "
             f"contract requires raising _CommitCrashSignal."
@@ -650,7 +650,7 @@ class StateStore:
             failed_set = {u for u, _ in normalized_metas}
             remaining_queue = [
                 jd for jd in self._state.queue
-                if uid_from_job_dict(jd) not in failed_set
+                if job_uid_from_snapshot(jd) not in failed_set
             ]
             self._state.replace_queue(list(remaining_queue))
             self._record_stat("failed", len(normalized_metas))
@@ -706,7 +706,7 @@ class StateStore:
             cascade_set = set(cascade_uids)
             remaining = [
                 jd for jd in self._state.queue
-                if uid_from_job_dict(jd) not in cascade_set
+                if job_uid_from_snapshot(jd) not in cascade_set
             ]
             self._state.replace_queue(remaining)
             self._record_stat("cascade_failed", len(cascade_uids))
@@ -733,22 +733,22 @@ class StateStore:
 
     # ── commit 失败 3-strike 收敛契约 ─────────────────────────────────
 
-    def _register_commit_failure(self, job_dict: dict[str, Any]) -> int:
+    def _register_commit_failure(self, job_snapshot: dict[str, Any]) -> int:
         """3-strike 计数登记（计数递增的单一事实源）。
 
         计数唯一表示是 runtime 命名空间的 ``_commit_failures``（经
         JobRuntimeState 强类型往返）。
         """
-        rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
+        rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
         failures = rt_state.record_commit_failure()
-        job_dict["runtime"] = rt_state.to_dict()
+        job_snapshot["runtime"] = rt_state.to_dict()
         return failures
 
     def handle_commit_failure_strike(
         self,
         uid: str,
         reason: str,
-        job_dict: dict[str, Any] | None = None,
+        job_snapshot: dict[str, Any] | None = None,
         *,
         attempt_id: int | None = None,
     ) -> None:
@@ -759,13 +759,13 @@ class StateStore:
         收敛进失败档案（触发钩子）并抛 _JobTerminated；阈值熔断写入也
         失败时同样 requeue + 崩溃。
         """
-        if job_dict is None:
-            job_dict = {
+        if job_snapshot is None:
+            job_snapshot = {
                 "task_type": uid.split("::")[0],
                 "job_id": uid.split("::")[1],
             }
 
-        failures = self._register_commit_failure(job_dict)
+        failures = self._register_commit_failure(job_snapshot)
 
         if failures >= self._threshold:
             logger.critical(
@@ -779,7 +779,7 @@ class StateStore:
                 "commit_failures": failures,
             }
             strike_committed = self._backend.commit_job_failure(
-                uid, strike_meta, job_payload=self._extract_job_payload(job_dict)
+                uid, strike_meta, job_payload=self._extract_job_payload(job_snapshot)
             )
             if strike_committed:
                 self.mark_failed_memory(uid, strike_meta)
@@ -798,23 +798,23 @@ class StateStore:
                 )
 
         # 未达阈值或熔断写入仍失败：requeue 并上抛崩溃信号
-        self._requeue_and_crash(uid, job_dict, reason, attempt_id=attempt_id)
+        self._requeue_and_crash(uid, job_snapshot, reason, attempt_id=attempt_id)
 
     def handle_skip_commit_strike(
         self,
         uid: str,
-        job_dict: dict[str, Any] | None = None,
+        job_snapshot: dict[str, Any] | None = None,
         *,
         attempt_id: int | None = None,
     ) -> None:
         """commit_skip 失败时的收敛处理：只 requeue + 崩溃，绝不写失败档案。"""
-        self._requeue_and_crash(uid, job_dict, "commit_skip", attempt_id=attempt_id)
+        self._requeue_and_crash(uid, job_snapshot, "commit_skip", attempt_id=attempt_id)
 
     def handle_bulk_failure_strike(
         self,
         reason: str,
         uids_metas: list[tuple[str, dict[str, Any]]],
-        queue_job_dicts: list[dict[str, Any]],
+        queue_job_snapshots: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], bool]:
         """批量 commit 失败的 3-strike 逐条收敛（批量崩溃契约唯一实现）。
 
@@ -823,10 +823,10 @@ class StateStore:
         仍留队）：留队者带递增的 commit 失败计数，达阈值者经
         ``_bulk_strike_finalize`` 熔断出队，单写也失败则留队待下次启动。
         """
-        queue = list(queue_job_dicts)
+        queue = list(queue_job_snapshots)
         kept_any = False
         for uid, _ in uids_metas:
-            matching = [j for j in queue if uid_from_job_dict(j) == uid]
+            matching = [j for j in queue if job_uid_from_snapshot(j) == uid]
             jd = matching[0] if matching else {
                 "task_type": uid.split("::")[0],
                 "job_id": uid.split("::")[1],
@@ -834,7 +834,7 @@ class StateStore:
             failures = self._register_commit_failure(jd)
             if failures >= self._threshold:
                 if self._bulk_strike_finalize(uid, jd, failures=failures):
-                    queue = [j for j in queue if uid_from_job_dict(j) != uid]
+                    queue = [j for j in queue if job_uid_from_snapshot(j) != uid]
                     continue
                 logger.critical(
                     f"Bulk 3-strike: failure archive write also failed for "
@@ -846,7 +846,7 @@ class StateStore:
     def _bulk_strike_finalize(
         self,
         uid: str,
-        job_dict: dict[str, Any],
+        job_snapshot: dict[str, Any],
         *,
         failures: int,
     ) -> bool:
@@ -863,7 +863,7 @@ class StateStore:
             "commit_failures": failures,
         }
         single_committed = self._backend.commit_job_failure(
-            uid, strike_meta, job_payload=self._extract_job_payload(job_dict)
+            uid, strike_meta, job_payload=self._extract_job_payload(job_snapshot)
         )
         if not single_committed:
             return False
@@ -878,15 +878,15 @@ class StateStore:
     def _requeue_and_crash(
         self,
         uid: str,
-        job_dict: dict[str, Any] | None,
+        job_snapshot: dict[str, Any] | None,
         reason: str,
         *,
         attempt_id: int | None = None,
     ) -> None:
         """单一出口：所有「commit 失败 → requeue 内存 + 崩溃」路径的收敛点。"""
         self._state.unregister_in_flight(uid)
-        if job_dict is not None:
-            self._state.requeue_jobs([job_dict], front=True)
+        if job_snapshot is not None:
+            self._state.requeue_jobs([job_snapshot], front=True)
         self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error=reason)
         raise _CommitCrashSignal(
             f"Backend commit returned False for {uid} ({reason}). "

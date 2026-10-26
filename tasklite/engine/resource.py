@@ -43,7 +43,7 @@ def persist_resource_suspensions(backend: Any, resource_mgr: ResourceManager) ->
     """
     deadlines = resource_mgr.collect_suspensions()
     try:
-        backend.set_meta(META_RESOURCE_SUSPENSIONS, dumps(deadlines))
+        backend.set_engine_metadata(META_RESOURCE_SUSPENSIONS, dumps(deadlines))
     except Exception as e:
         logger.error(f"Failed to persist resource suspensions to meta: {e}")
 

@@ -71,7 +71,7 @@ if TYPE_CHECKING:
 
 from ..exceptions import _JobTerminated
 from ..models.job import Job
-from ..models.state import PipelineState, uid_from_job_dict
+from ..models.state import PipelineState, job_uid_from_snapshot
 from ..utils.jsonutil import loads
 from .resource import (
     META_RESOURCE_SUSPENSIONS,
@@ -165,12 +165,12 @@ class RecoveryOrchestrator:
         disk_uids: set = set()
         merged_rows: list = []
         for jd in disk_q:
-            u = uid_from_job_dict(jd)
+            u = job_uid_from_snapshot(jd)
             if u not in disk_uids:  # uid 主键下磁盘重复不可达，防御性收敛
                 disk_uids.add(u)
                 merged_rows.append(jd)
         for jd in q_data:
-            if uid_from_job_dict(jd) not in disk_uids:
+            if job_uid_from_snapshot(jd) not in disk_uids:
                 merged_rows.append(jd)
 
         seen_uid: set = set()
@@ -178,7 +178,7 @@ class RecoveryOrchestrator:
         dropped_uids: list = []
 
         for jd in merged_rows:
-            u = uid_from_job_dict(jd)
+            u = job_uid_from_snapshot(jd)
             wall_hit = u in wall
             failed_hit = u in failed
             if wall_hit or failed_hit:
@@ -251,7 +251,7 @@ class RecoveryOrchestrator:
     def load_resource_suspensions(self) -> None:
         """从 meta 表恢复资源挂起状态（挂钟截止换算回挂起秒数注入 ResourceManager）。"""
         try:
-            raw = self._store.backend.get_meta(META_RESOURCE_SUSPENSIONS)
+            raw = self._store.backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)
         except Exception as e:
             logger.warning(f"Failed to load resource suspensions from meta: {e}")
             return
@@ -318,9 +318,9 @@ class RecoveryOrchestrator:
 
         def _merge(disk_q: list) -> list:
             mem_q = self._store.state.queue
-            mem_uids = {uid_from_job_dict(jd) for jd in mem_q}
+            mem_uids = {job_uid_from_snapshot(jd) for jd in mem_q}
             # 磁盘有而内存没有的作业（commit/pop 窗口内丢失的）补回队首
-            extra = [jd for jd in disk_q if uid_from_job_dict(jd) not in mem_uids]
+            extra = [jd for jd in disk_q if job_uid_from_snapshot(jd) not in mem_uids]
             if extra:
                 logger.warning(
                     f"Crash-safe save: recovered {len(extra)} job(s) from disk "
@@ -330,7 +330,7 @@ class RecoveryOrchestrator:
             seen: set = set()
             dedup_mem = []
             for jd in mem_q:
-                u = uid_from_job_dict(jd)
+                u = job_uid_from_snapshot(jd)
                 if u in seen:
                     continue
                 seen.add(u)
@@ -366,7 +366,7 @@ class RecoveryOrchestrator:
         self,
         uid: str,
         job: Job,
-        job_dict: dict,
+        job_snapshot: dict,
         *,
         attempt_id: int | None = None,
     ) -> bool:
@@ -390,7 +390,7 @@ class RecoveryOrchestrator:
         # （单一出口）：构造安全伪 entry 走完成机器同一条路径
         # （acquired=[] 无资源、handle=None 无进程），复用完整的收尾契约：
         # 失败输出清理、IPC 文件清理、身份注销。
-        entry = self._in_flight.create_pseudo_entry(uid, job_dict, job)
+        entry = self._in_flight.create_pseudo_entry(uid, job_snapshot, job)
         entry.attempt_id = attempt_id
         try:
             self._completion.complete_job(entry, result)
