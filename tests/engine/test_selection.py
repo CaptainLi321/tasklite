@@ -77,7 +77,7 @@ def _fake_process_class(*, fail_uid=None, spawn_jobs=()):
                 }
             result["auth"] = spec.result_token
             ArtifactJournal(spec.ipc_dir).write_result_atomic(
-                spec.job.uid, result, incarnation=spec.incarnation
+                spec.job.uid, result, execution_id=spec.execution_id
             )
 
         def is_alive(self):

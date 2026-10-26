@@ -41,7 +41,7 @@ from tasklite import (
 |---|---|---|
 | **Task（规格）** | 进程内注册的静态模板：`task_type` 名、handler、`default_resources`、`payload_schema`、默认 `max_retries` / `timeout` / `timeout_is_transient` | 代码即规格，不落盘；注册于 `register_task`（落点 `TaskRegistry`） |
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变（queue/wall/failed 三表 PK 与六集合互斥均以 uid 为身份） | queue 行 job_data JSON（uid 为主键） |
-| **Attempt（执行轨迹）** | 一次物理执行的记录：序号、`incarnation`、起止时间、`outcome` | **append-only** 新表 `attempts` |
+| **Attempt（执行轨迹）** | 一次物理执行的记录：序号、`execution_id`、起止时间、`outcome` | **append-only** 新表 `attempts` |
 
 ### Task：规格层
 
@@ -92,7 +92,7 @@ job.uid          # "download::img_001"——身份不变式
 
 ### Attempt：执行轨迹（append-only 旁路面）
 
-`attempts` 表一行 = 一次物理执行：`(id 自增, job_uid, activation_no, attempt_no, incarnation, run_id, started_at, finished_at, outcome, error)`。**派发即插行**（outcome=running），终态或重入队时更新该行。`incarnation`（`run_id.dispatch_seq` 执行代标识）随 attempt 落表。
+`AttemptRecord` 表达一次物理执行：`(job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error)`；`attempts` 表另有自增 `id`，schema 3 的执行身份列仍为 `incarnation`，由后端显式映射。**派发即插行**（outcome=running），终态或重入队时更新该行。`execution_id`（`run_id.dispatch_no` 执行代标识）随 attempt 落表。
 
 `outcome` 词汇表（单一真相 `ATTEMPT_OUTCOMES`）：
 
@@ -108,13 +108,13 @@ job.uid          # "download::img_001"——身份不变式
 
 ```python
 for rec in pipeline.backend.load_attempts("download::img_001"):
-    print(rec.activation_no, rec.attempt_no, rec.incarnation, rec.outcome, rec.error)
+    print(rec.activation_no, rec.attempt_no, rec.execution_id, rec.outcome, rec.error)
 ```
 
 ### 追溯链
 
 ```
-attempts 行（job_uid, activation_no, attempt_no, incarnation, outcome, ...）
+attempts 行（job_uid, activation_no, attempt_no, execution_id, outcome, ...）
     │ job_uid
     ▼
 Job uid = task_type::job_id ──当前终态──▶ wall（成功档案） / failed（失败档案）
@@ -315,7 +315,7 @@ Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」�
 | `AdmissionPolicy`（policy.py） | `RerunPolicy`（admission.py） |
 | `BackoffGovernor` / `plan_retry` 退避计算 | 删除——`RequeuePolicy` seam 接管（默认 `ImmediateRequeuePolicy`） |
 
-其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`wall` / `seed_wall` / `seed_cursor` / `safe_uid_filename` / `content_fingerprint` / `incarnation` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。
+其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`wall` / `seed_wall` / `seed_cursor` / `content_fingerprint` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。执行身份与文件名编码现使用 `execution_id` 和 `encode_job_uid_filename`；schema 3 的 SQL 列与 IPC 文件名字节保持不变。
 
 ---
 

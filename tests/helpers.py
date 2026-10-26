@@ -12,24 +12,24 @@ from pathlib import Path
 from tasklite.pipeline import TaskLite
 
 
-def _write_fake_result(ipc_dir, uid, result_dict, incarnation=None, auth_token=None):
+def _write_fake_result(ipc_dir, uid, result_dict, execution_id=None, auth_token=None):
     """FakeProcess 用：把 IPC 结果原子写入结果文件（与真实子进程同路径）。
 
-    incarnation 与结果认证令牌均由 WorkerLaunchSpec 携带——fake 与真实
+    execution_id 与结果认证令牌均由 WorkerLaunchSpec 携带——fake 与真实
     子进程共享同一路径构造逻辑与令牌落盘行为，保证 drain 能读到 fake
     写的结果且通过读取侧强校验。
     """
     from tasklite.utils.ipc import ArtifactJournal
     if auth_token is not None:
         result_dict["auth"] = auth_token
-    ArtifactJournal(ipc_dir).write_result_atomic(uid, result_dict, incarnation=incarnation)
+    ArtifactJournal(ipc_dir).write_result_atomic(uid, result_dict, execution_id=execution_id)
 
 
-def _spec_incarnation(args):
-    """从 FakeProcess args=(WorkerLaunchSpec,) 提取 incarnation。"""
+def _spec_execution_id(args):
+    """从 FakeProcess args=(WorkerLaunchSpec,) 提取 execution_id。"""
     if not args:
         return None
-    return args[0].incarnation
+    return args[0].execution_id
 
 
 FIXED_AUTH_TOKEN = "c" * 64
@@ -86,7 +86,7 @@ def make_fake_process_class(outcome="success"):
                 spec = self.args[0]
                 job = spec.job
                 ipc_dir = spec.ipc_dir
-                incarnation = spec.incarnation
+                execution_id = spec.execution_id
                 auth_token = getattr(spec, "result_token", None)
                 if outcome == "success":
                     _write_fake_result(ipc_dir, job.uid, {
@@ -95,27 +95,27 @@ def make_fake_process_class(outcome="success"):
                         "new_jobs": [],
                         "resource_suspensions": [],
                         "cursor_updates": {},
-                    }, incarnation=incarnation, auth_token=auth_token)
+                    }, execution_id=execution_id, auth_token=auth_token)
                 elif outcome == "retry":
-                    _write_fake_result(ipc_dir, job.uid, {"status": "retry", "error": "transient"}, incarnation=incarnation, auth_token=auth_token)
+                    _write_fake_result(ipc_dir, job.uid, {"status": "retry", "error": "transient"}, execution_id=execution_id, auth_token=auth_token)
                 elif outcome == "fatal":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "fatal",
                         "error": "FatalError: bug",
                         "traceback": "traceback",
-                    }, incarnation=incarnation, auth_token=auth_token)
+                    }, execution_id=execution_id, auth_token=auth_token)
                 elif outcome == "fatal_exception":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "fatal",
                         "error": "TypeError: bad type",
                         "traceback": "traceback",
-                    }, incarnation=incarnation, auth_token=auth_token)
+                    }, execution_id=execution_id, auth_token=auth_token)
                 elif outcome == "error":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "error",
                         "error": "something broke",
                         "traceback": "traceback",
-                    }, incarnation=incarnation, auth_token=auth_token)
+                    }, execution_id=execution_id, auth_token=auth_token)
 
         def join(self, timeout=None):
             self._alive = False
@@ -169,7 +169,7 @@ def make_ipc_process_class(results=(), exitcode=0, stay_alive=False):
                 spec = self.args[0]
                 _write_fake_result(
                     spec.ipc_dir, spec.job.uid, payload,
-                    incarnation=spec.incarnation,
+                    execution_id=spec.execution_id,
                     auth_token=getattr(spec, "result_token", None),
                 )
 
@@ -228,7 +228,7 @@ def patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=None):
 
 def patch_pipeline_manager(pipeline, monkeypatch):
     """Replace the spawn-context Manager on a pipeline instance with FakeManager."""
-    monkeypatch.setattr(pipeline._mp_ctx, "Manager", lambda: FakeManager())
+    monkeypatch.setattr(pipeline._process_context, "Manager", lambda: FakeManager())
 
 
 def make_pipeline(tmp_path, name="test_pipeline",

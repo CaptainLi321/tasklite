@@ -26,9 +26,9 @@ if TYPE_CHECKING:
         @property
         def in_flight_uids(self) -> frozenset[str]: ...
 
-        def register_in_flight(self, uid: str) -> None: ...
+        def register_in_flight(self, job_uid: str) -> None: ...
 
-        def unregister_in_flight(self, uid: str) -> None: ...
+        def unregister_in_flight(self, job_uid: str) -> None: ...
 
 from ..models.job import Job
 from .resource import NullResourceLease, ResourceLease
@@ -46,7 +46,7 @@ class InFlightJob:
     超时判定（timeout 语义）。
     """
 
-    uid: str
+    job_uid: str
     job_dict: dict
     job: Job
     acquired: list[tuple[str, float]] = field(default_factory=list)
@@ -60,7 +60,7 @@ class InFlightJob:
     def __post_init__(self) -> None:
         if self.lease is None:
             if not self.acquired:
-                self.lease = NullResourceLease(job_uid=self.uid)
+                self.lease = NullResourceLease(job_uid=self.job_uid)
         elif not self.acquired:
             self.acquired = list(self.lease.acquired)
 
@@ -76,7 +76,7 @@ class InFlightJob:
             self.acquired = []
         elif self.acquired:
             if resource_mgr is not None:
-                resource_mgr.release_all(self.acquired, uid=self.uid)
+                resource_mgr.release_all(self.acquired, uid=self.job_uid)
             self.acquired = []
 
 
@@ -86,14 +86,14 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
     def __init__(self, entries: Mapping[str, InFlightJob] | None = None) -> None:
         self._entries: dict[str, InFlightJob] = dict(entries) if entries is not None else {}
 
-    def __getitem__(self, uid: str) -> InFlightJob:
-        return self._entries[uid]
+    def __getitem__(self, job_uid: str) -> InFlightJob:
+        return self._entries[job_uid]
 
-    def __setitem__(self, uid: str, entry: InFlightJob) -> None:
-        self._entries[uid] = entry
+    def __setitem__(self, job_uid: str, entry: InFlightJob) -> None:
+        self._entries[job_uid] = entry
 
-    def __delitem__(self, uid: str) -> None:
-        del self._entries[uid]
+    def __delitem__(self, job_uid: str) -> None:
+        del self._entries[job_uid]
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._entries)
@@ -101,14 +101,14 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
     def __len__(self) -> int:
         return len(self._entries)
 
-    def __contains__(self, uid: object) -> bool:
-        return uid in self._entries
+    def __contains__(self, job_uid: object) -> bool:
+        return job_uid in self._entries
 
-    def get(self, uid: str, default: InFlightJob | None = None) -> InFlightJob | None:  # type: ignore[override]
-        return self._entries.get(uid, default)
+    def get(self, job_uid: str, default: InFlightJob | None = None) -> InFlightJob | None:  # type: ignore[override]
+        return self._entries.get(job_uid, default)
 
-    def pop(self, uid: str, default: InFlightJob | None = None) -> InFlightJob | None:  # type: ignore[override]
-        return self._entries.pop(uid, default)
+    def pop(self, job_uid: str, default: InFlightJob | None = None) -> InFlightJob | None:  # type: ignore[override]
+        return self._entries.pop(job_uid, default)
 
     @property
     def uids(self) -> frozenset[str]:
@@ -130,25 +130,25 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         PipelineState 满足，调用方传 ``store.state``），非 None 时同步
         内存 in-flight 索引。
         """
-        self._entries[entry.uid] = entry
+        self._entries[entry.job_uid] = entry
         if state is not None:
-            state.register_in_flight(entry.uid)
+            state.register_in_flight(entry.job_uid)
         return entry
 
     def settle(
         self,
-        uid: str,
+        job_uid: str,
         *,
         state: "InFlightStateIndex | None" = None,
     ) -> InFlightJob | None:
         """语义化结算接缝：注销在途任务并同步内存状态（单一真相源出口）。"""
-        entry = self._entries.pop(uid, None)
+        entry = self._entries.pop(job_uid, None)
         if state is not None:
             # 收尾机器的提交路径内部已注销 in-flight（重试分支注销后立即
             # 重入队并重建 rerun 豁免）；此处仅在 uid 仍在途索引时才兜底
             # 转发注销，防止二次注销误删刚重建的豁免（安全网语义不变）。
-            if uid in state.in_flight_uids:
-                state.unregister_in_flight(uid)
+            if job_uid in state.in_flight_uids:
+                state.unregister_in_flight(job_uid)
         return entry
 
     def active_handles(self) -> list[JobHandle]:
@@ -169,8 +169,8 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         cancelled_entries: list[InFlightJob] = []
         done_entries: list[tuple[InFlightJob, Any]] = []
         for entry in self._entries.values():
-            if entry.uid in completed_map:
-                done_entries.append((entry, completed_map[entry.uid]))
+            if entry.job_uid in completed_map:
+                done_entries.append((entry, completed_map[entry.job_uid]))
             else:
                 cancelled_entries.append(entry)
         return cancelled_entries, done_entries
@@ -185,19 +185,19 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
 
     @staticmethod
     def create_pseudo_entry(
-        uid: str,
+        job_uid: str,
         job_dict: dict,
         job: Job,
     ) -> InFlightJob:
         """合成安全伪条目（用于崩溃恢复或 abort 结果提交）。"""
         return InFlightJob(
-            uid=uid,
+            job_uid=job_uid,
             job_dict=job_dict,
             job=job,
             acquired=[],
             handle=None,
             job_start=None,
-            lease=NullResourceLease(job_uid=uid),
+            lease=NullResourceLease(job_uid=job_uid),
         )
 
 

@@ -187,7 +187,7 @@ class TestRetryFailure:
             job_uid="t::x",
             activation_no=2,
             attempt_no=1,
-            incarnation="run_a.1",
+            execution_id="run_a.1",
             run_id="run_a",
             started_at="2026-09-01T00:00:00+00:00",
             outcome="running",

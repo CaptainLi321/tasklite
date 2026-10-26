@@ -9,9 +9,9 @@ orphan-probe → stale-restore。依赖以显式窄清单注入（无共享袋�
 类型自动满足）；``output_root`` 与 config 声明同型
 （``Path | Sequence[Path] | None``，多根输出场景）。
 
-派发即插 attempts 轨迹行（outcome=running）：incarnation
-（``run_id.dispatch_seq``）在本模块生成并随行落表——seq 每次派发递增，
-同 uid 重试再派发也获得新 incarnation，与上次尝试的结果文件隔离。
+派发即插 attempts 轨迹行（outcome=running）：execution_id
+（``run_id.dispatch_no``）在本模块生成并随行落表——seq 每次派发递增，
+同 uid 重试再派发也获得新 execution_id，与上次尝试的结果文件隔离。
 """
 
 from __future__ import annotations
@@ -41,15 +41,15 @@ if TYPE_CHECKING:
     class DispatchSession(Protocol):
         """派发/完成机器消费的运行会话装配契约（RunSession 自动满足）。
 
-        ``run_id`` 是 incarnation 与 wall meta 的 run 身份事实源；
+        ``run_id`` 是 execution_id 与 wall meta 的 run 身份事实源；
         ``result_token`` 随 WorkerLaunchSpec 下发做结果认证；
-        ``next_dispatch_seq`` 为 incarnation fencing 提供单调递增序号。
+        ``next_dispatch_no`` 为 execution_id fencing 提供单调递增序号。
         """
 
         run_id: str | None
         result_token: str | None
 
-        def next_dispatch_seq(self) -> int: ...
+        def next_dispatch_no(self) -> int: ...
 
     class TaskSource(Protocol):
         """派发机器消费的任务规格来源契约（TaskRegistry 自动满足）。"""
@@ -190,29 +190,29 @@ class DispatchMachine:
         )
         job_dict = store.state.pop_job(sched.runnable_idx)
         job = Job.from_dict(job_dict)
-        uid = job.uid
+        job_uid = job.uid
 
         # 预检五关以调用顺序表达时序契约，每关返回 True=已处理。
-        if self.dispatch_dedup(uid, job, job_dict):
+        if self.dispatch_dedup(job_uid, job, job_dict):
             return None
-        attempt_id, incarnation = self._open_attempt(job)
+        attempt_id, execution_id = self._open_attempt(job)
         if pending_dep_failure is not None:
             if self.dispatch_dep_failed(
-                uid, job_dict, pending_dep_failure, attempt_id=attempt_id
+                job_uid, job_dict, pending_dep_failure, attempt_id=attempt_id
             ):
                 return None
         if job.task_type not in self._tasks:
             if self.dispatch_no_handler(
-                uid, job_dict, job.task_type, attempt_id=attempt_id
+                job_uid, job_dict, job.task_type, attempt_id=attempt_id
             ):
                 return None
-        if self.dispatch_orphan_probe(uid, job_dict, attempt_id=attempt_id):
+        if self.dispatch_orphan_probe(job_uid, job_dict, attempt_id=attempt_id):
             return None
-        if self.dispatch_stale_restore(uid, job, job_dict, attempt_id=attempt_id):
+        if self.dispatch_stale_restore(job_uid, job, job_dict, attempt_id=attempt_id):
             return None
 
         try:
-            return self._spawn_entry(uid, job, job_dict, attempt_id, incarnation)
+            return self._spawn_entry(job_uid, job, job_dict, attempt_id, execution_id)
         except _CommitCrashSignal:
             # _CommitCrashSignal 继承 BaseException——「commit 失败需崩溃」
             # 的信号不会被 except Exception 兜底误吞。re-raise 让它穿透到
@@ -224,15 +224,15 @@ class DispatchMachine:
             # 原样穿透交运行循环崩溃网统一收尾。
             raise
         except KeyboardInterrupt:
-            return self._handle_interrupt(uid, job_dict)
+            return self._handle_interrupt(job_uid, job_dict)
         except RateLimitUnavailable as e:
-            return self._handle_rate_limit_defer(uid, job_dict, attempt_id, e)
+            return self._handle_rate_limit_defer(job_uid, job_dict, attempt_id, e)
         except Exception as e:
-            return self._handle_dispatch_failure(uid, job_dict, attempt_id, e)
+            return self._handle_dispatch_failure(job_uid, job_dict, attempt_id, e)
 
     # ── 预检五关（顺序即时序契约）────────────────────────────────────
 
-    def dispatch_dedup(self, uid: str, job: Job, job_dict: dict) -> bool:
+    def dispatch_dedup(self, job_uid: str, job: Job, job_dict: dict) -> bool:
         """派发预检关 1——去重（is_known 命中 → rerun 策略 → 跳过/放行）。
 
         返回 True = 已处理（job 被跳过，跳过同样落轨迹行 skipped）；
@@ -241,18 +241,18 @@ class DispatchMachine:
         的 wall/failed 命中重跑。
         """
         store = self._store
-        if not store.state.is_known(uid):
+        if not store.state.is_known(job_uid):
             return False
         decision = self._rerun_policy.admit(job_dict, store.state)
         if decision.should_skip:
             attempt_id, _ = self._open_attempt(job)
-            store.apply_skip(uid, job_dict=job_dict, attempt_id=attempt_id)
+            store.apply_skip(job_uid, job_dict=job_dict, attempt_id=attempt_id)
             return True
-        if decision.should_run and (uid in store.state.wall_uids or uid in store.state.failed_uids):
+        if decision.should_run and (job_uid in store.state.wall_uids or job_uid in store.state.failed_uids):
             # 豁免登记与准入判定同源：pop_job 只按字面 rerun 键登记豁免，
             # 队列行无键而由动态兜底放行的重跑必须在此补登记，否则
             # in-flight 登记的全量互斥断言会击落本关放行的作业。
-            store.state.mark_rerun_active(uid)
+            store.state.mark_rerun_active(job_uid)
             # 不变式：准入层放行的重跑，其有效策略必须落为行内字面键——
             # 豁免事实随行持久，abort/retry/崩溃回滚的按字面键豁免重建
             # （requeue/clear_in_flight/replace_queue）才不丢失动态放行事实。
@@ -268,7 +268,7 @@ class DispatchMachine:
 
     def dispatch_dep_failed(
         self,
-        uid: str,
+        job_uid: str,
         job_dict: dict,
         pending_dep_failure: str,
         *,
@@ -282,7 +282,7 @@ class DispatchMachine:
         """
         if pending_dep_failure is None:
             return False
-        logger.warning(f"SKIP: {uid} (Dependency {pending_dep_failure} failed)")
+        logger.warning(f"SKIP: {job_uid} (Dependency {pending_dep_failure} failed)")
         fail_meta: dict[str, Any] = {
             "error": ERR_JOB_DEPENDENCY,
             "failed_dependency": pending_dep_failure,
@@ -290,13 +290,13 @@ class DispatchMachine:
         # 依赖父失败的级联下游计入 cascade_failed 而非 failed——
         # 「真实业务失败率」统计不被级联稀释。
         self._reject_and_commit(
-            uid, job_dict, fail_meta, count_as="cascade_failed", attempt_id=attempt_id
+            job_uid, job_dict, fail_meta, count_as="cascade_failed", attempt_id=attempt_id
         )
         return True
 
     def dispatch_no_handler(
         self,
-        uid: str,
+        job_uid: str,
         job_dict: dict,
         task_type: str,
         *,
@@ -307,14 +307,14 @@ class DispatchMachine:
         返回 True = 已处理（直接 commit 到失败档案并级联下游）；仅当
         task_type not in tasks 时调用。commit 失败走 3-strike / 崩溃路径。
         """
-        logger.error(f"SKIP: {uid} (No handler for task_type '{task_type}')")
+        logger.error(f"SKIP: {job_uid} (No handler for task_type '{task_type}')")
         fail_meta = {"error": ERR_NO_HANDLER, "fatal": True}
-        self._reject_and_commit(uid, job_dict, fail_meta, attempt_id=attempt_id)
+        self._reject_and_commit(job_uid, job_dict, fail_meta, attempt_id=attempt_id)
         return True
 
     def dispatch_orphan_probe(
         self,
-        uid: str,
+        job_uid: str,
         job_dict: dict,
         *,
         attempt_id: int | None = None,
@@ -329,19 +329,19 @@ class DispatchMachine:
         return，绝不删孤儿实时声明。返回 True = 已处理（孤儿存活 defer）。
         """
         try:
-            probe_ok = self._channel.probe_orphan_lock(uid)
+            probe_ok = self._channel.probe_orphan_lock(job_uid)
         except OSError as e:
             # 锁文件环境故障（权限/目录占位/路径超长）与「锁被占」语义
             # 不同，但同属非作业自身故障：按孤儿锁冲突瞬态信号同构 defer
             # （零预算、降级写盘回队、零污染），绝不放大为整 run 崩溃。
             logger.warning(
-                f"Lock probe environment fault for {uid} "
+                f"Lock probe environment fault for {job_uid} "
                 f"(errno={getattr(e, 'errno', None)}): {e}; deferring."
             )
             probe_ok = False
         if not probe_ok:
             logger.warning(
-                f"Deferring {uid}: orphan execution body still holds lock."
+                f"Deferring {job_uid}: orphan execution body still holds lock."
             )
             self._store.requeue_transient(
                 job_dict,
@@ -354,7 +354,7 @@ class DispatchMachine:
 
     def dispatch_stale_restore(
         self,
-        uid: str,
+        job_uid: str,
         job: Job,
         job_dict: dict,
         *,
@@ -372,18 +372,18 @@ class DispatchMachine:
         关 4 探测已通过（锁空闲 ⇒ 无活跃追加写者），排空无损。本次派发
         已开的轨迹行随认领结果在完成机器侧收尾（attempt_id 透传）。
         """
-        self._salvage_residue_signals(uid)
-        if self._recovery.restore_stale_result(uid, job, job_dict, attempt_id=attempt_id):
+        self._salvage_residue_signals(job_uid)
+        if self._recovery.restore_stale_result(job_uid, job, job_dict, attempt_id=attempt_id):
             return True
-        self._channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
+        self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
         return False
 
-    def _salvage_residue_signals(self, uid: str) -> None:
+    def _salvage_residue_signals(self, job_uid: str) -> None:
         """排空并应用单个 uid 跨 run 崩溃残留的 suspend 信号（先读后删）。"""
         try:
-            signals = self._channel.drain_active_signals([uid])
+            signals = self._channel.drain_active_signals([job_uid])
         except Exception as e:
-            logger.warning(f"Failed to salvage residue signals for {uid}: {e}")
+            logger.warning(f"Failed to salvage residue signals for {job_uid}: {e}")
             return
         apply_suspend_signals(
             signals, self._store.backend, self._resources, origin="residue of "
@@ -392,27 +392,27 @@ class DispatchMachine:
     # ── 轨迹开行与 spawn ──────────────────────────────────────────────
 
     def _open_attempt(self, job: Job) -> tuple[int | None, str]:
-        """派发即插 running 轨迹行，返回 (轨迹行 id, incarnation)。
+        """派发即插 running 轨迹行，返回 (轨迹行 id, execution_id)。
 
-        incarnation fencing 归属派发点：``{run_id}.{dispatch_seq}`` 生成
-        于此并随轨迹落表。轨迹插入失败降级为 (None, incarnation)——
+        execution_id fencing 归属派发点：``{run_id}.{dispatch_no}`` 生成
+        于此并随轨迹落表。轨迹插入失败降级为 (None, execution_id)——
         attempts 是旁路观测面，观测缺口不得击落可正常执行的派发。
         """
-        incarnation = f"{self._session.run_id}.{self._session.next_dispatch_seq()}"
+        execution_id = f"{self._session.run_id}.{self._session.next_dispatch_no()}"
         attempt_id = self._store.record_attempt_dispatch(
             job,
-            incarnation=incarnation,
+            execution_id=execution_id,
             run_id=self._session.run_id,
         )
-        return attempt_id, incarnation
+        return attempt_id, execution_id
 
     def _spawn_entry(
         self,
-        uid: str,
+        job_uid: str,
         job: Job,
         job_dict: dict,
         attempt_id: int | None,
-        incarnation: str,
+        execution_id: str,
     ) -> InFlightJob | None:
         """两阶段资源租约 → 载荷校验 → 执行上下文组装 → spawn → 在飞登记。
 
@@ -423,32 +423,32 @@ class DispatchMachine:
         """
         store = self._store
         handle = None
-        lease = self._resources.reserve(job.task_type, job.resources, uid=uid)
+        lease = self._resources.reserve(job.task_type, job.resources, uid=job_uid)
         try:
             with lease:
                 task = self._tasks.lookup(job.task_type)
                 if task.payload_schema is not None:
                     errors = validate_payload_errors(job.payload, task.payload_schema)
                     if errors:
-                        logger.error(f"Payload validation failed for {uid}: {errors}")
+                        logger.error(f"Payload validation failed for {job_uid}: {errors}")
                         lease.release()
                         fail_meta: dict[str, Any] = {
                             "error": ERR_PAYLOAD_VALIDATION,
                             "details": errors,
                         }
                         self._reject_and_commit(
-                            uid, job_dict, fail_meta, attempt_id=attempt_id
+                            job_uid, job_dict, fail_meta, attempt_id=attempt_id
                         )
                         return None
 
                 ctx = self._build_context(job, store.state)
-                logger.info(f"RUN: {uid}")
+                logger.info(f"RUN: {job_uid}")
                 job_start = time.monotonic()
                 handle = self._channel.spawn(WorkerLaunchSpec(
                     handler=task.handler,
                     job=job,
-                    task_ctx=ctx,
-                    incarnation=incarnation,
+                    job_context=ctx,
+                    execution_id=execution_id,
                     ipc_dir=self._ipc_dir,
                     timeout=job.timeout,
                     result_token=self._session.result_token,
@@ -456,7 +456,7 @@ class DispatchMachine:
                 lease.claim()
 
                 entry = InFlightJob(
-                    uid=uid,
+                    job_uid=job_uid,
                     job_dict=job_dict,
                     job=job,
                     handle=handle,
@@ -503,7 +503,7 @@ class DispatchMachine:
 
     def _reject_and_commit(
         self,
-        uid: str,
+        job_uid: str,
         job_dict: dict,
         meta: dict,
         *,
@@ -520,11 +520,11 @@ class DispatchMachine:
         """
         try:
             outcome = self._store.apply_failure(
-                uid, meta, job_dict=job_dict, count_as=count_as,
+                job_uid, meta, job_dict=job_dict, count_as=count_as,
                 cascade=True, attempt_id=attempt_id,
             )
             self._store.fire_attempt_finished(
-                uid,
+                job_uid,
                 outcome=AttemptFinish(
                     success=False, going_to_retry=False, meta=dict(outcome.error_meta)
                 ),
@@ -534,10 +534,10 @@ class DispatchMachine:
             # 指标并触发钩子）
             return
 
-    def _handle_interrupt(self, uid: str, job_dict: dict) -> None:
+    def _handle_interrupt(self, job_uid: str, job_dict: dict) -> None:
         """派发中断分支：entry 已登记交运行循环统一 abort，否则回队后上抛。"""
-        logger.warning(f"Pipeline interrupted while dispatching {uid}.")
-        if uid in self._in_flight:
+        logger.warning(f"Pipeline interrupted while dispatching {job_uid}.")
+        if job_uid in self._in_flight:
             # entry 已注册到 in_flight：此处不清理/不 requeue/不 release，
             # 全部交给运行循环的中止收尾统一处理，避免对同一 entry 二次
             # 释放资源、二次 requeue 同一作业。
@@ -549,7 +549,7 @@ class DispatchMachine:
 
     def _handle_rate_limit_defer(
         self,
-        uid: str,
+        job_uid: str,
         job_dict: dict,
         attempt_id: int | None,
         exc: RateLimitUnavailable,
@@ -561,7 +561,7 @@ class DispatchMachine:
         等待由资源挂起 TTL 承担，绝不计入 3-strike 崩溃计数。
         """
         logger.warning(
-            f"Deferring {uid}: rate limit re-check failed at reserve ({exc})."
+            f"Deferring {job_uid}: rate limit re-check failed at reserve ({exc})."
         )
         self._store.requeue_transient(
             job_dict,
@@ -573,20 +573,20 @@ class DispatchMachine:
 
     def _handle_dispatch_failure(
         self,
-        uid: str,
+        job_uid: str,
         job_dict: dict,
         attempt_id: int | None,
         exc: Exception,
     ) -> None:
         """派发异常分支：3-strike 派发失败预算收敛，未达阈值回队后上抛。"""
         store = self._store
-        logger.error(f"Error dispatching job {uid}: {exc}\n{traceback.format_exc()}")
+        logger.error(f"Error dispatching job {job_uid}: {exc}\n{traceback.format_exc()}")
         rt_state = JobRuntimeState.from_dict(job_dict.get("runtime"))
         failures = rt_state.record_dispatch_failure()
         job_dict["runtime"] = rt_state.to_dict()
         if failures >= self._commit_failure_threshold:
             logger.critical(
-                f"Dispatch failed {failures} times for {uid} ({exc}); "
+                f"Dispatch failed {failures} times for {job_uid} ({exc}); "
                 f"treating as deterministic bad input (e.g. unpickleable "
                 f"handler), sending to failure archive."
             )
@@ -595,10 +595,10 @@ class DispatchMachine:
                 "failures": failures,
                 "detail": str(exc)[:200],
             }
-            self._in_flight.settle(uid, state=store.state)
-            self._reject_and_commit(uid, job_dict, fail_meta, attempt_id=attempt_id)
+            self._in_flight.settle(job_uid, state=store.state)
+            self._reject_and_commit(job_uid, job_dict, fail_meta, attempt_id=attempt_id)
             return None
-        self._in_flight.settle(uid, state=store.state)
+        self._in_flight.settle(job_uid, state=store.state)
         store.state.requeue_jobs([job_dict], front=True)
         store.finish_attempt(
             attempt_id, outcome=ATTEMPT_REQUEUED, error=f"dispatch failure: {exc}"

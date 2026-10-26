@@ -1,7 +1,7 @@
 """v2 单射编码族契约测试（确定性用例 + hypothesis 属性测试）。
 
 被测契约范围（严格按各函数 docstring 声称）：
-- ``percent_encode`` / ``safe_uid_filename``：全域单射（任意 x != y ⟹
+- ``percent_encode`` / ``encode_job_uid_filename``：全域单射（任意 x != y ⟹
   f(x) != f(y)）；
 - ``encode_identifier`` / ``encode_content_id``：编码后 ≤ max_len 的非空
   输入全域单射；空值哨兵处于像集外（零碰撞）；超长截断输出带像集外标记
@@ -25,7 +25,7 @@ from tasklite.utils.encoding import (
     encode_identifier,
     encode_job_component,
     percent_encode,
-    safe_uid_filename,
+    encode_job_uid_filename,
 )
 
 # 折磨字母表：转义符、路径分隔符、glob 元字符、控制字符、多字节与高低码位字符
@@ -455,7 +455,7 @@ def test_empty_sentinel_outside_image_never_collides(text):
     assert encode_content_id(text) != sentinel_cid
 
 
-# ── safe_uid_filename：单射性与文件系统危险字符逃逸 ────────────────────
+# ── encode_job_uid_filename：单射性与文件系统危险字符逃逸 ────────────────────
 
 
 @pytest.mark.hypothesis
@@ -463,23 +463,23 @@ def test_empty_sentinel_outside_image_never_collides(text):
 @example(("t::1", "t::2"))
 @example(("t::x::y", "t::x%3A%3Ay"))
 @given(pair=distinct_pair)
-def test_safe_uid_filename_is_injective(pair):
+def test_encode_job_uid_filename_is_injective(pair):
     """任意 uid_a != uid_b：安全文件名映射必不同（含 '::' 复合 uid 场景）。"""
     uid_a, uid_b = pair
-    assert safe_uid_filename(uid_a) != safe_uid_filename(uid_b)
+    assert encode_job_uid_filename(uid_a) != encode_job_uid_filename(uid_b)
 
 
-def test_safe_uid_filename_escapes_filesystem_hazards():
+def test_encode_job_uid_filename_escapes_filesystem_hazards():
     # 路径穿越
-    assert "/" not in safe_uid_filename("t::a/../../../etc/passwd")
-    assert "\\" not in safe_uid_filename("t::a\\..\\..\\b")
+    assert "/" not in encode_job_uid_filename("t::a/../../../etc/passwd")
+    assert "\\" not in encode_job_uid_filename("t::a\\..\\..\\b")
     # Windows 冒号
-    assert ":" not in safe_uid_filename("t::a:b")
+    assert ":" not in encode_job_uid_filename("t::a:b")
     # NUL
-    assert "\x00" not in safe_uid_filename("t::a\x00b")
+    assert "\x00" not in encode_job_uid_filename("t::a\x00b")
     # Glob 元字符
     for ch in "*?[]":
-        assert ch not in safe_uid_filename(f"t::a{ch}b")
+        assert ch not in encode_job_uid_filename(f"t::a{ch}b")
 
 
 @pytest.mark.hypothesis
@@ -487,9 +487,9 @@ def test_safe_uid_filename_escapes_filesystem_hazards():
 @example("t::a/../../../etc/passwd")
 @example("t::a\x00b*?[")
 @given(uid=any_text)
-def test_safe_uid_filename_free_of_bare_percent(uid):
+def test_encode_job_uid_filename_free_of_bare_percent(uid):
     """安全文件名不含裸 %（% 只以 %XX 成对出现，'::' 复合 uid 亦然）。"""
-    name = safe_uid_filename(uid)
+    name = encode_job_uid_filename(uid)
     assert _percent_only_as_escapes(name)
 
 

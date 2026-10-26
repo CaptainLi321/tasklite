@@ -237,12 +237,12 @@ def content_fingerprint(
     return h.hexdigest()[:16]
 
 
-def safe_uid_filename(uid: str) -> str:
+def encode_job_uid_filename(job_uid: str) -> str:
     """把 job uid 映射为对任意文件系统安全（无 : 等保留字符）的文件名。
 
     与执行器的 result/signals/outputs/lock 路径函数共享单射性。
     """
-    escaped = uid.replace(_PERCENT_ESCAPE, _PERCENT_ESCAPED)
+    escaped = job_uid.replace(_PERCENT_ESCAPE, _PERCENT_ESCAPED)
     for ch, enc in FS_ESCAPE_CHARS.items():
         escaped = escaped.replace(ch, enc)
     return escaped
@@ -258,5 +258,5 @@ __all__ = [
     "encode_identifier",
     "encode_job_component",
     "percent_encode",
-    "safe_uid_filename",
+    "encode_job_uid_filename",
 ]

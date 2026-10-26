@@ -41,8 +41,8 @@ class StubSession:
         self.run_id = run_id
         self.result_token = "t" * 64
 
-    def next_dispatch_seq(self) -> int:
-        raise AssertionError("completion 不消费 dispatch_seq")
+    def next_dispatch_no(self) -> int:
+        raise AssertionError("completion 不消费 dispatch_no")
 
 
 class FakeProcess:
@@ -88,7 +88,7 @@ class CompletionEnv:
         if lease is None:
             lease = self.resources.reserve(job.task_type, job.resources, uid=job.uid)
         entry = InFlightJob(
-            uid=job.uid,
+            job_uid=job.uid,
             job_dict=job.to_dict(),
             job=job,
             lease=lease,
@@ -104,7 +104,7 @@ class CompletionEnv:
             job_uid=job.uid,
             activation_no=activation_no,
             attempt_no=attempt_no,
-            incarnation=f"{self.session.run_id}.1",
+            execution_id=f"{self.session.run_id}.1",
             run_id=self.session.run_id,
             started_at="2026-01-01T00:00:00+00:00",
             outcome="running",
@@ -113,13 +113,13 @@ class CompletionEnv:
 
     def make_handle(self, uid: str) -> JobHandle:
         return JobHandle(
-            uid=uid,
+            job_uid=uid,
             process=FakeProcess(),
             deadline=1e18,
             timeout=60.0,
             job=Job(*uid.split("::", 1)),
             ipc_dir=self.ipc_dir,
-            incarnation=f"{self.session.run_id}.1",
+            execution_id=f"{self.session.run_id}.1",
         )
 
 

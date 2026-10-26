@@ -118,13 +118,13 @@ class TestInFlightTrackerHandlesAndPseudo:
         tracker = InFlightTracker()
         job_real = Job("t", "j1")
         handle = JobHandle(
-            uid="t::j1",
+            job_uid="t::j1",
             process=FakeProcess(101),
             deadline=100.0,
             timeout=10.0,
             job=job_real,
             ipc_dir="/tmp/ipc",
-            incarnation="run1.1",
+            execution_id="run1.1",
         )
         entry_real = InFlightJob("t::j1", job_real.to_dict(), job_real, [], handle, None)
 
@@ -142,13 +142,13 @@ class TestInFlightTrackerHandlesAndPseudo:
         """看门狗字段（deadline/timeout/job_start）随条目透传，timeout 语义原样。"""
         job = Job("t", "jw")
         handle = JobHandle(
-            uid="t::jw",
+            job_uid="t::jw",
             process=FakeProcess(7),
             deadline=500.0,
             timeout=30.0,
             job=job,
             ipc_dir="/tmp/ipc",
-            incarnation="run9.42",
+            execution_id="run9.42",
         )
         entry = InFlightJob("t::jw", job.to_dict(), job, [], handle, 470.0)
         assert entry.handle is handle
@@ -181,7 +181,7 @@ class TestInFlightTrackerResourceRelease:
         assert gpu.used == 3.0
 
         job = Job("t", "j1", {"gpu": 3.0})
-        entry = InFlightJob(uid="t::j1", job_dict=job.to_dict(), job=job, lease=lease)
+        entry = InFlightJob(job_uid="t::j1", job_dict=job.to_dict(), job=job, lease=lease)
         assert entry.acquired == [("gpu", 3.0)]
 
         entry.release_resources(rm)
@@ -225,7 +225,7 @@ class TestInFlightTrackerResourceRelease:
 
         cancelled, done = tracker.classify_aborted({"t::ja": {"status": "ok"}})
         assert len(cancelled) == 1
-        assert cancelled[0].uid == "t::jb"
+        assert cancelled[0].job_uid == "t::jb"
         assert len(done) == 1
-        assert done[0][0].uid == "t::ja"
+        assert done[0][0].job_uid == "t::ja"
         assert done[0][1] == {"status": "ok"}

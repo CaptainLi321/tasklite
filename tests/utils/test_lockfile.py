@@ -60,13 +60,13 @@ class TestFlockMutex:
 
     def test_lock_file_never_unlinked_after_release(self, tmp_path):
         """锁文件创建后永不删除：释放后同名文件仍在（unlink-recreate 竞争防御）。"""
-        from tasklite.utils.encoding import safe_uid_filename
+        from tasklite.utils.encoding import encode_job_uid_filename
 
         uid = "keep::file"
         fd = try_acquire_lock(str(tmp_path), uid)
         assert fd is not None
         release_lock(fd)
-        assert (tmp_path / f"{safe_uid_filename(uid)}.lock").exists(), (
+        assert (tmp_path / f"{encode_job_uid_filename(uid)}.lock").exists(), (
             "锁文件必须保留在磁盘（unlink 后新 inode 锁与旧持锁者不互斥）"
         )
 
@@ -78,9 +78,9 @@ class TestFlockMutex:
         """
         import pytest
 
-        from tasklite.utils.encoding import safe_uid_filename
+        from tasklite.utils.encoding import encode_job_uid_filename
 
-        lock_name = f"{safe_uid_filename('keep::file')}.lock"
+        lock_name = f"{encode_job_uid_filename('keep::file')}.lock"
         (tmp_path / lock_name).mkdir()
         with pytest.raises(OSError):
             try_acquire_lock(str(tmp_path), "keep::file")

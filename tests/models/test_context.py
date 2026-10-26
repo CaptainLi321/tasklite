@@ -14,7 +14,7 @@ import pytest
 
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
-from tasklite.utils.encoding import safe_uid_filename
+from tasklite.utils.encoding import encode_job_uid_filename
 from tasklite.utils.ipc import ArtifactJournal
 
 
@@ -353,7 +353,7 @@ class TestSuspendResource:
         ctx.suspend_resource("api_known", 60.0)
         assert ctx.resource_suspensions == [("api_known", 60.0)]
         # 信号立即落盘：进程被 kill 后文件仍在，信号不丢
-        signals_file = Path(ipc) / f"{safe_uid_filename('fetch::j1')}.signals.jsonl"
+        signals_file = Path(ipc) / f"{encode_job_uid_filename('fetch::j1')}.signals.jsonl"
         assert signals_file.exists()
         lines = [json.loads(line) for line in signals_file.read_text().splitlines()]
         assert lines == [{"suspend": ["api_known", 60.0]}]

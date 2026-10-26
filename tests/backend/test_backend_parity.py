@@ -33,7 +33,7 @@ def _running_attempt(job_uid: str, attempt_no: int = 1) -> AttemptRecord:
         job_uid=job_uid,
         activation_no=1,
         attempt_no=attempt_no,
-        incarnation=f"run_seed.{attempt_no}",
+        execution_id=f"run_seed.{attempt_no}",
         run_id="run_seed",
         started_at="2026-05-01T00:00:00+00:00",
         outcome="running",
@@ -134,7 +134,7 @@ class TestCoreContractProperties:
         records = b.load_attempts("t::one")
         assert [r.attempt_no for r in records] == [1, 2]
         assert records[0].outcome == "failed"
-        assert records[0].incarnation == "run_seed.1"
+        assert records[0].execution_id == "run_seed.1"
         assert records[1].outcome == ATTEMPT_RUNNING
 
         # 已收尾行不可二次收尾；未知 id 返回 False（双腿同构）

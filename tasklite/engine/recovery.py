@@ -431,7 +431,7 @@ class RecoveryOrchestrator:
             origin="salvaged from aborted ",
         )
 
-        completed_map = {h.uid: res for h, res in outcome.completed}
+        completed_map = {h.job_uid: res for h, res in outcome.completed}
         cancelled_entries, done_entries = self._in_flight.classify_aborted(completed_map)
 
         # 4. 委托完成机器统一结算已取消与已完成条目

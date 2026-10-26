@@ -266,14 +266,14 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
     """
     handler_func = spec.handler
     job = spec.job
-    ctx = spec.task_ctx
+    ctx = spec.job_context
     ipc_dir = spec.ipc_dir
-    uid = job.uid
-    incarnation = spec.incarnation
-    if not incarnation:
+    job_uid = job.uid
+    execution_id = spec.execution_id
+    if not execution_id:
         raise RuntimeError(
-            f"worker started without incarnation for {uid}: "
-            f"fencing requires WorkerLaunchSpec.incarnation"
+            f"worker started without execution_id for {job_uid}: "
+            f"fencing requires WorkerLaunchSpec.execution_id"
         )
     journal = ArtifactJournal(ipc_dir)
     result_token = spec.result_token
@@ -281,11 +281,11 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
     def _write_result(payload: dict[str, Any]) -> None:
         # 结果认证令牌随全部状态通道落盘，主进程读取侧强校验
         payload["auth"] = result_token
-        journal.write_result_with_degradation(uid, payload, incarnation=incarnation)
+        journal.write_result_with_degradation(job_uid, payload, execution_id=execution_id)
 
     transient_registry = getattr(ctx, "transient_registry", ()) or ()
     try:
-        _lock_fd = lockfile.try_acquire_lock(ipc_dir, uid, timeout=2.0)
+        _lock_fd = lockfile.try_acquire_lock(ipc_dir, job_uid, timeout=2.0)
     except OSError as e:
         # 锁文件环境故障（权限/目录占位）写降级重试结果：与「锁被占」
         # 同走瞬态信号通道（零预算、降级写盘、零污染），不让单作业环境
@@ -293,7 +293,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         _write_result({
             "status": "retry",
             "transient_kind": "lock_conflict",
-            "error": f"LOCK_ENV_FAULT: cannot open lock file for {uid} "
+            "error": f"LOCK_ENV_FAULT: cannot open lock file for {job_uid} "
                      f"(errno={getattr(e, 'errno', None)}): {e}",
         })
         return
@@ -301,7 +301,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         _write_result({
             "status": "retry",
             "transient_kind": "lock_conflict",
-            "error": f"LOCK_CONFLICT: another execution body holds {uid} lock",
+            "error": f"LOCK_CONFLICT: another execution body holds {job_uid} lock",
         })
         return
     try:
@@ -386,14 +386,14 @@ class ExecutionResult:
 class WorkerLaunchSpec:
     """进程 seam 具名契约——spawn 下发子进程执行体的全部载荷。
 
-    incarnation（``{run_id}.{dispatch_seq}`` 执行身份）与结果认证令牌归
+    execution_id（``{run_id}.{dispatch_no}`` 执行身份）与结果认证令牌归
     本 spec，不借道 JobContext 属性穿透进程边界。
     """
 
     handler: Callable[[Job, JobContext], Any]
     job: Job
-    task_ctx: JobContext
-    incarnation: str
+    job_context: JobContext
+    execution_id: str
     ipc_dir: str
     timeout: float
     result_token: str | None = None
@@ -422,10 +422,10 @@ class ExecutionChannel:
         self,
         ipc_dir: str | Path | None = None,
         *,
-        mp_ctx: Any | None = None,
+        process_context: Any | None = None,
         output_roots: str | Path | Sequence[str | Path] | None = None,
     ) -> None:
-        self._mp_ctx = mp_ctx or mp.get_context("spawn")
+        self._process_context = process_context or mp.get_context("spawn")
         self.ipc_dir = str(ipc_dir) if ipc_dir is not None else None
         # 输出沙盒信任根随 channel 注入 journal——清理消费侧的删除复检依赖
         self.output_roots = output_roots
@@ -470,7 +470,7 @@ class ExecutionChannel:
             logger.warning(f"Process close failed during finalize: {e}")
 
     def spawn(self, spec: WorkerLaunchSpec) -> JobHandle:
-        """启动隔离子进程执行 handler，建立 incarnation fencing，立即返回句柄。"""
+        """启动隔离子进程执行 handler，建立 execution_id fencing，立即返回句柄。"""
         effective_ipc_dir = spec.ipc_dir or self.ipc_dir or os.environ.get(_RESULT_DIR_ENV)
         if not effective_ipc_dir:
             raise ValueError("ipc_dir is required for ExecutionChannel.spawn()")
@@ -479,10 +479,10 @@ class ExecutionChannel:
         # 属性为空而经兜底解析成功时必须回写，保证与 handle 派发路径同源
         if self.ipc_dir is None:
             self.ipc_dir = str(effective_ipc_dir)
-        spec.task_ctx.ipc_dir = effective_ipc_dir
+        spec.job_context.ipc_dir = effective_ipc_dir
         p = None
         try:
-            p = self._mp_ctx.Process(target=_mp_worker_wrapper, args=(spec,))
+            p = self._process_context.Process(target=_mp_worker_wrapper, args=(spec,))
             p.start()
         except Exception:
             if p is not None:
@@ -490,13 +490,13 @@ class ExecutionChannel:
             raise
         deadline = time.monotonic() + spec.timeout
         return JobHandle(
-            uid=spec.job.uid,
+            job_uid=spec.job.uid,
             process=p,
             deadline=deadline,
             timeout=spec.timeout,
             job=spec.job,
             ipc_dir=effective_ipc_dir,
-            incarnation=spec.incarnation,
+            execution_id=spec.execution_id,
         )
 
     def _read_authenticated_result(self, path: Path) -> dict | None:
@@ -514,12 +514,12 @@ class ExecutionChannel:
             return None
         return res
 
-    def _token_ok(self, res: dict | None, uid: str) -> dict | None:
+    def _token_ok(self, res: dict | None, job_uid: str) -> dict | None:
         """认领读取侧的令牌强校验（与 _read_authenticated_result 同一信任锚）。"""
         token = getattr(self, "result_token", None)
         if res is not None and token is not None and res.get("auth") != token:
             logger.error(
-                f"Stale result auth token mismatch for {uid}; "
+                f"Stale result auth token mismatch for {job_uid}; "
                 f"discarding untrusted result"
             )
             return None
@@ -529,7 +529,7 @@ class ExecutionChannel:
         """结果文件存在才认证读取（收割快路径/死亡复读共用的原语）。"""
         return self._read_authenticated_result(path) if path.exists() else None
 
-    def _salvage_signals(self, uid: str, decoded: ExecutionResult | None) -> list[tuple[str, float]]:
+    def _salvage_signals(self, job_uid: str, decoded: ExecutionResult | None) -> list[tuple[str, float]]:
         """排空 uid 的挂起信号：decoded 非 None 时并入其挂起列表，否则原样返回。
 
         不变式：结果文件已原子落盘 ⇒ 本执行体的信号追加全部早于落盘
@@ -538,9 +538,9 @@ class ExecutionChannel:
         清理会把「先排空阶段之后写入」的信号文件未读删除。
         """
         try:
-            pending = self.journal.drain_signals(uid)
+            pending = self.journal.drain_signals(job_uid)
         except Exception as e:
-            logger.warning(f"Failed to salvage signals for {uid}: {e}")
+            logger.warning(f"Failed to salvage signals for {job_uid}: {e}")
             return []
         if decoded is not None and pending:
             decoded.resource_suspensions = (
@@ -555,8 +555,8 @@ class ExecutionChannel:
         worker 报告被中断的结果按「未完成」处理（重入队），不作为终态。
         abort 双阶段（杀进程前初查 / 杀死后重探测闭环）共用本原语。
         """
-        incarnation = getattr(handle, "incarnation", None)
-        res_path = self.journal.result_path(handle.uid, incarnation)
+        execution_id = getattr(handle, "execution_id", None)
+        res_path = self.journal.result_path(handle.job_uid, execution_id)
         if not res_path.exists():
             return None
         raw_res = self._read_authenticated_result(res_path)
@@ -571,7 +571,7 @@ class ExecutionChannel:
             raw_res, None, handle.job, self.ipc_dir,
             output_roots=getattr(self, "output_roots", None),
         )
-        self._salvage_signals(handle.uid, decoded)
+        self._salvage_signals(handle.job_uid, decoded)
         return decoded
 
     def reap_completed(
@@ -583,7 +583,7 @@ class ExecutionChannel:
         for handle in handles:
             now = time.monotonic()
             p = handle.process
-            res_path = self.journal.result_path(handle.uid, handle.incarnation)
+            res_path = self.journal.result_path(handle.job_uid, handle.execution_id)
 
             res = self._read_if_exists(res_path)
             if res is not None:
@@ -632,22 +632,22 @@ class ExecutionChannel:
                 result = self._build_terminal_failure(p, handle, is_timeout=is_timeout)
         finally:
             self._finalize_process(p)
-            pending_signals = self._salvage_signals(handle.uid, result)
+            pending_signals = self._salvage_signals(handle.job_uid, result)
             if pending_signals:
                 logger.info(
                     f"Salvaged {len(pending_signals)} suspend signal(s) "
-                    f"from {handle.uid} before IPC cleanup"
+                    f"from {handle.job_uid} before IPC cleanup"
                 )
-            self.journal.cleanup_ipc_files(handle.uid, handle.incarnation)
+            self.journal.cleanup_ipc_files(handle.job_uid, handle.execution_id)
         return result
 
-    def claim_stale_result(self, uid: str, job: Job) -> ExecutionResult | None:
+    def claim_stale_result(self, job_uid: str, job: Job) -> ExecutionResult | None:
         """启动/派发前崩溃恢复：认领并消费上次 run 遗留的已落盘残留结果。
 
         残留结果必须携带本 run 的认证令牌——跨 run 残留与伪造残留一律
         丢弃（崩溃恢复退化为重跑，保守正确；伪造残留的注入链不可达）。
         """
-        res = self._token_ok(self.journal.claim_stale_result_payload(uid), uid)
+        res = self._token_ok(self.journal.claim_stale_result_payload(job_uid), job_uid)
         if res is None:
             return None
         return _decode_ipc_result(
@@ -668,7 +668,7 @@ class ExecutionChannel:
         )
         if att.retry_requested and "signal" in att.result_meta:
             logger.warning(
-                f"Worker for {handle.uid} died by {att.result_meta['signal']}; "
+                f"Worker for {handle.job_uid} died by {att.result_meta['signal']}; "
                 f"will retry (requeue pacing is owned by RequeuePolicy)"
             )
         return ExecutionResult(
@@ -678,18 +678,18 @@ class ExecutionChannel:
             retry_error=att.retry_error,
         )
 
-    def probe_orphan_lock(self, uid: str) -> bool:
+    def probe_orphan_lock(self, job_uid: str) -> bool:
         """非阻塞探测执行锁。True 表示无孤儿持锁可安全执行；False 表示孤儿活跃需 defer。"""
         if self.ipc_dir is None:
             return True
-        return lockfile.probe_lock(self.ipc_dir, uid)
+        return lockfile.probe_lock(self.ipc_dir, job_uid)
 
     def drain_active_signals(self, uids: Iterable[str]) -> list[tuple[str, str, float]]:
         """原子排空所有在途任务追加的 suspend 信号。"""
         signals: list[tuple[str, str, float]] = []
-        for uid in uids:
-            for r_name, secs in self.journal.drain_signals(uid):
-                signals.append((uid, r_name, secs))
+        for job_uid in uids:
+            for r_name, secs in self.journal.drain_signals(job_uid):
+                signals.append((job_uid, r_name, secs))
         return signals
 
     def drain_all_signals(self) -> list[tuple[str, str, float]]:
@@ -727,10 +727,10 @@ class ExecutionChannel:
                 continue
             # 杀进程后仍无结果：半成品清理前最后捞回信号（无并发写者）
             salvaged.extend(
-                (handle.uid, r_name, secs)
-                for r_name, secs in self._salvage_signals(handle.uid, None)
+                (handle.job_uid, r_name, secs)
+                for r_name, secs in self._salvage_signals(handle.job_uid, None)
             )
-            self.cleanup_artifacts(handle.uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
+            self.cleanup_artifacts(handle.job_uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
             truly_cancelled.append(handle)
 
         return AbortOutcome(
@@ -744,9 +744,9 @@ class ExecutionChannel:
         for handle in handles:
             try:
                 self._finalize_process(handle.process)
-                self.journal.cleanup_ipc_files(handle.uid, handle.incarnation)
+                self.journal.cleanup_ipc_files(handle.job_uid, handle.execution_id)
             except Exception as e:
-                logger.error(f"Error cleaning up in-flight job {handle.uid}: {e}")
+                logger.error(f"Error cleaning up in-flight job {handle.job_uid}: {e}")
 
     def finalize_processes(self, handles: Sequence[JobHandle]) -> None:
         """只 kill + join 残留子进程，不删 IPC 文件。"""
@@ -754,16 +754,16 @@ class ExecutionChannel:
             try:
                 self._finalize_process(handle.process)
             except Exception as e:
-                logger.error(f"Error finalizing in-flight job {handle.uid}: {e}")
+                logger.error(f"Error finalizing in-flight job {handle.job_uid}: {e}")
 
-    def cleanup_artifacts(self, uid: str, *, mode: ArtifactCleanupMode) -> None:
+    def cleanup_artifacts(self, job_uid: str, *, mode: ArtifactCleanupMode) -> None:
         """统一收敛产物与 IPC 临时文件的生命周期清理。"""
-        self.journal.cleanup(uid, mode=mode)
+        self.journal.cleanup(job_uid, mode=mode)
 
-    def read_declared_inputs(self, uid: str) -> list[dict]:
+    def read_declared_inputs(self, job_uid: str) -> list[dict]:
         """读取任务声明的输入清单。"""
         try:
-            return self.journal.read_inputs(uid)
+            return self.journal.read_inputs(job_uid)
         except Exception:
             return []
 

@@ -7,7 +7,7 @@
 - 锁文件 ``{uid}.lock`` 永不删除（unlink 后新进程 create 同名文件拿到的是
   新 inode 的锁，与旧持锁者不互斥——经典 unlink-recreate 竞争）。空文件
   累积可接受，pipeline 停止时可整目录离线清理。
-- uid 派生锁文件名复用 ``encoding.safe_uid_filename`` 单射编码（不得另造
+- uid 派生锁文件名复用 ``encoding.encode_job_uid_filename`` 单射编码（不得另造
   一套映射）。单射性证明关键点：**先转义 ``%`` 为 ``%25``、后转义 ``::``
   为 ``%3A%3A``**——若先转义 ``::``，输入 ``t::x::y`` 与字面
   ``t%3A%3Ax%3A%3Ay`` 会在第二步碰撞同像，多对一映射使锁文件互串；
@@ -22,15 +22,15 @@ import os
 import time
 from pathlib import Path
 
-from .encoding import safe_uid_filename
+from .encoding import encode_job_uid_filename
 
 
-def _lock_path(ipc_dir: str, uid: str) -> Path:
+def _lock_path(ipc_dir: str, job_uid: str) -> Path:
     """uid → 锁文件路径（与 result/signals/outputs 共享单射文件名映射）。"""
-    return Path(ipc_dir) / f"{safe_uid_filename(uid)}.lock"
+    return Path(ipc_dir) / f"{encode_job_uid_filename(job_uid)}.lock"
 
 
-def try_acquire_lock(ipc_dir: str, uid: str, *, timeout: float = 0.0) -> int | None:
+def try_acquire_lock(ipc_dir: str, job_uid: str, *, timeout: float = 0.0) -> int | None:
     """尝试获取 ``{uid}.lock`` 排他锁（非阻塞或带超时）。
 
     Returns:
@@ -46,7 +46,7 @@ def try_acquire_lock(ipc_dir: str, uid: str, *, timeout: float = 0.0) -> int | N
     （``LK_NBLCK``，锁 offset 0 的 1 字节）。``timeout > 0`` 时以短间隔
     轮询（worker 入口持锁允许 ≤2s 短等待）。
     """
-    path = _lock_path(ipc_dir, uid)
+    path = _lock_path(ipc_dir, job_uid)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
     deadline = None if timeout <= 0 else time.monotonic() + timeout
@@ -100,14 +100,14 @@ def release_lock(fd: int) -> None:
         pass
 
 
-def probe_lock(ipc_dir: str, uid: str) -> bool:
+def probe_lock(ipc_dir: str, job_uid: str) -> bool:
     """主进程探测：非阻塞试锁，成功即释放，返回「无其他执行体持锁」。
 
     仅用于判断孤儿 worker 是否存活——探测成功释放锁，不持有。探测失败
     （孤儿持锁）→ 调用方按 ``lock_conflict`` 瞬态信号 defer（不烧预算、
     降级写盘、零污染），节奏归 RequeuePolicy。
     """
-    fd = try_acquire_lock(ipc_dir, uid)
+    fd = try_acquire_lock(ipc_dir, job_uid)
     if fd is None:
         return False
     release_lock(fd)

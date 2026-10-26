@@ -4,7 +4,7 @@
 - stop_mode 单调转移（NONE→DRAINING→ABORTING，唯一入口 request_stop）；
 - fire_run_end 幂等（一个 run 至多发一次）；
 - stats 无 public setter（结算记账经 StateStore）；
-- begin() 是新 run 的复位入口（run_id/dispatch_seq/stats/stop_mode/幂等
+- begin() 是新 run 的复位入口（run_id/dispatch_no/stats/stop_mode/幂等
   标志归零）。
 """
 
@@ -44,7 +44,7 @@ class RunSession:
         # 每 run 随机结果认证令牌：随 WorkerLaunchSpec 下发 worker、随结果
         # 落盘，主进程读取侧强校验（防 ipc_dir 写入者伪造结果文件投毒）
         self.result_token: str | None = None
-        self.dispatch_seq: int = 0
+        self.dispatch_no: int = 0
         self.stop_mode: StopMode = StopMode.NONE
         self._stats = TaskStats()
         self._run_end_fired = False
@@ -57,15 +57,15 @@ class RunSession:
         """新 run 的复位入口：全部生命周期状态归零，run_id 待分配时置 None。"""
         self.run_id = run_id
         self.result_token = secrets.token_hex(32)
-        self.dispatch_seq = 0
+        self.dispatch_no = 0
         self.stop_mode = StopMode.NONE
         self._stats = TaskStats()
         self._run_end_fired = False
 
-    def next_dispatch_seq(self) -> int:
-        """fence 序号单调递增（incarnation 身份隔离的序号来源）。"""
-        self.dispatch_seq += 1
-        return self.dispatch_seq
+    def next_dispatch_no(self) -> int:
+        """fence 序号单调递增（execution_id 身份隔离的序号来源）。"""
+        self.dispatch_no += 1
+        return self.dispatch_no
 
     def request_stop(self, *, force: bool = False) -> StopMode:
         """停机状态机唯一入口（单调：NONE→DRAINING→ABORTING）。"""

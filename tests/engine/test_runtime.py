@@ -59,7 +59,7 @@ def _write_success_result(spec) -> None:
             "cursor_updates": {},
             "auth": spec.result_token,
         },
-        incarnation=spec.incarnation,
+        execution_id=spec.execution_id,
     )
 
 
@@ -307,7 +307,7 @@ class TestEngineRuntimeExecutionLifecycle:
         env.register("t")
         env.runtime.store.enqueue_jobs([Job("t", "j1", payload={})])
         monkeypatch.setattr(
-            env.runtime.channel, "_mp_ctx",
+            env.runtime.channel, "_process_context",
             SimpleNamespace(Process=make_instant_process_class()),
         )
 
@@ -405,7 +405,7 @@ class TestEngineRuntimeExecutionLifecycle:
         local_fn = lambda j, c: True  # noqa: E731
         env.tasks.register(Task(task_type="local", handler=local_fn))
         monkeypatch.setattr(
-            env.runtime.channel, "_mp_ctx",
+            env.runtime.channel, "_process_context",
             SimpleNamespace(Process=make_instant_process_class()),
         )
         env.runtime.store.enqueue_jobs([Job("local", "j1", payload={})])
@@ -521,7 +521,7 @@ class TestRunReentryGuard:
         env.register("t")
         env.runtime.store.enqueue_jobs([Job("t", "j1", payload={})])
         monkeypatch.setattr(
-            env.runtime.channel, "_mp_ctx",
+            env.runtime.channel, "_process_context",
             SimpleNamespace(Process=make_gate_process_class(enter, release)),
         )
         runtime = env.runtime
@@ -642,7 +642,7 @@ class TestPrepareRunState:
         env = RuntimeEnv(tmp_path)
         runtime = env.runtime
         runtime.session.run_id = "stale"
-        runtime.session.dispatch_seq = 9
+        runtime.session.dispatch_no = 9
 
         state = runtime.prepare_run_state()
 
@@ -650,7 +650,7 @@ class TestPrepareRunState:
         assert env.backend.get_meta("last_run_id") == runtime.session.run_id
         # 认证令牌与 run_id 同生命周期轮换并同步执行通道
         assert runtime.channel.result_token == runtime.session.result_token
-        assert runtime.session.dispatch_seq == 0
+        assert runtime.session.dispatch_no == 0
         assert runtime.store.state is state
 
     def test_prepare_clears_scheduler_cache_each_round(self, tmp_path):
@@ -689,7 +689,7 @@ class TestGracefulDraining:
             [Job("t", "j1", payload={}), Job("t", "j2", payload={})]
         )
         monkeypatch.setattr(
-            env.runtime.channel, "_mp_ctx",
+            env.runtime.channel, "_process_context",
             SimpleNamespace(Process=make_gate_process_class(enter, release)),
         )
         runtime = env.runtime
@@ -733,7 +733,7 @@ class TestForceAbort:
         env.register("t")
         env.runtime.store.enqueue_jobs([Job("t", "j1", payload={})])
         monkeypatch.setattr(
-            env.runtime.channel, "_mp_ctx",
+            env.runtime.channel, "_process_context",
             SimpleNamespace(Process=make_stay_alive_process_class(enter)),
         )
         runtime = env.runtime

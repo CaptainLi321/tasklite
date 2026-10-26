@@ -67,7 +67,7 @@ class JobContext:
         self.ipc_dir = ipc_dir
         # fencing 的执行代标识（{run_id}.{seq}）不经 JobContext 携带——
         # 归 WorkerLaunchSpec（进程 seam 具名契约），worker 据它构造带
-        # incarnation 的结果文件名，孤儿进程的旧 incarnation 文件不被
+        # execution_id 的结果文件名，孤儿进程的旧 execution_id 文件不被
         # 新 run 看见。
         self._journal_instance: ArtifactJournal | None = None
         self._journal_instance_dir: str | None = None

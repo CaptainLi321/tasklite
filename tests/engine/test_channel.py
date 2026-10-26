@@ -23,10 +23,10 @@ from tasklite.engine.types import JobHandle
 from tasklite.exceptions import RateLimitHit
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
-from tasklite.utils.encoding import safe_uid_filename
+from tasklite.utils.encoding import encode_job_uid_filename
 from tasklite.utils.ipc import ArtifactJournal, encode_raw_result
 
-_INCARNATION = "deadbeefdeadbeefdeadbeefdeadbeef.1"
+_EXECUTION_ID = "deadbeefdeadbeefdeadbeefdeadbeef.1"
 _TOKEN = "b" * 64
 
 
@@ -39,15 +39,15 @@ def make_spec(
     job: Job,
     handler,
     ipc_dir,
-    incarnation: str = _INCARNATION,
+    execution_id: str = _EXECUTION_ID,
     *,
     result_token: str | None = None,
 ) -> WorkerLaunchSpec:
     return WorkerLaunchSpec(
         handler=handler,
         job=job,
-        task_ctx=make_ctx(job),
-        incarnation=incarnation,
+        job_context=make_ctx(job),
+        execution_id=execution_id,
         ipc_dir=str(ipc_dir) if ipc_dir is not None else None,
         timeout=60.0,
         result_token=result_token,
@@ -150,8 +150,8 @@ class TestExecutionChannelArtifactCleanup:
 class TestWorkerWrapper:
     """worker 执行体入口：认证令牌、锁冲突/环境故障降级、瞬态三 kind 落盘。"""
 
-    def _result_file(self, tmp_path, job, incarnation=_INCARNATION) -> Path:
-        return tmp_path / f"{safe_uid_filename(job.uid)}.{incarnation}.result.json"
+    def _result_file(self, tmp_path, job, execution_id=_EXECUTION_ID) -> Path:
+        return tmp_path / f"{encode_job_uid_filename(job.uid)}.{execution_id}.result.json"
 
     def test_worker_writes_success_with_auth_token(self, tmp_path):
         job = Job("t", "x")
@@ -183,11 +183,11 @@ class TestWorkerWrapper:
             assert data["status"] == want_status
             assert data["auth"] == _TOKEN
 
-    def test_worker_rejects_missing_incarnation(self, tmp_path):
-        """incarnation 缺失 fail-loud（fencing 契约破坏不得静默产出无名结果）。"""
+    def test_worker_rejects_missing_execution_id(self, tmp_path):
+        """execution_id 缺失 fail-loud（fencing 契约破坏不得静默产出无名结果）。"""
         job = Job("t", "x")
-        with pytest.raises(RuntimeError, match="incarnation"):
-            _mp_worker_wrapper(make_spec(job, lambda j, c: True, tmp_path, incarnation=None))
+        with pytest.raises(RuntimeError, match="execution_id"):
+            _mp_worker_wrapper(make_spec(job, lambda j, c: True, tmp_path, execution_id=None))
 
     def test_lock_conflict_writes_transient_retry(self, tmp_path, monkeypatch):
         """锁被占 → retry + transient_kind=lock_conflict（瞬态军规 wire）。"""
@@ -197,7 +197,7 @@ class TestWorkerWrapper:
         job = Job("h", "a")
         _mp_worker_wrapper(make_spec(job, lambda j, c: (True, {}), tmp_path))
 
-        res = ArtifactJournal(tmp_path).read_result("h::a", incarnation=_INCARNATION)
+        res = ArtifactJournal(tmp_path).read_result("h::a", execution_id=_EXECUTION_ID)
         assert res is not None
         assert res["status"] == "retry"
         assert res["transient_kind"] == "lock_conflict"
@@ -211,12 +211,12 @@ class TestWorkerWrapper:
         """
         ipc_dir = str(tmp_path / "ipc")
         uid = "t::j1"
-        lock_name = f"{safe_uid_filename(uid)}.lock"
+        lock_name = f"{encode_job_uid_filename(uid)}.lock"
         (Path(ipc_dir) / lock_name).mkdir(parents=True)
 
         job = Job("t", "j1")
         _mp_worker_wrapper(make_spec(
-            job, lambda j, c: True, ipc_dir, incarnation="r.1",
+            job, lambda j, c: True, ipc_dir, execution_id="r.1",
         ))
 
         journal = ArtifactJournal(ipc_dir)
@@ -242,7 +242,7 @@ class TestWorkerWrapper:
         ):
             job = Job("h", job_id)
             _mp_worker_wrapper(make_spec(job, handler, tmp_path))
-            res = ArtifactJournal(tmp_path).read_result(job.uid, incarnation=_INCARNATION)
+            res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
             assert res["status"] == "retry"
             assert res.get("transient_kind") == want_kind
 
@@ -252,7 +252,7 @@ class TestWorkerWrapper:
 
         job = Job("h", "ki")
         _mp_worker_wrapper(make_spec(job, interrupted, tmp_path))
-        res = ArtifactJournal(tmp_path).read_result(job.uid, incarnation=_INCARNATION)
+        res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
         assert res["status"] == "interrupted"
         assert res["error"].startswith("WORKER_INTERRUPTED:")
 
@@ -265,11 +265,11 @@ class TestWorkerWrapper:
         )
         spec = WorkerLaunchSpec(
             handler=lambda j, c: (_ for _ in ()).throw(ConnectionAbortedError("reset")),
-            job=job, task_ctx=ctx, incarnation=_INCARNATION,
+            job=job, job_context=ctx, execution_id=_EXECUTION_ID,
             ipc_dir=str(tmp_path), timeout=60.0,
         )
         _mp_worker_wrapper(spec)
-        res = ArtifactJournal(tmp_path).read_result(job.uid, incarnation=_INCARNATION)
+        res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
         assert res["status"] == "retry"
 
     def test_fatal_heuristic_writes_fatal(self, tmp_path):
@@ -278,7 +278,7 @@ class TestWorkerWrapper:
         _mp_worker_wrapper(make_spec(
             job, lambda j, c: (_ for _ in ()).throw(TypeError("bug")), tmp_path,
         ))
-        res = ArtifactJournal(tmp_path).read_result(job.uid, incarnation=_INCARNATION)
+        res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
         assert res["status"] == "fatal"
         assert "TypeError" in res["error"]
 
@@ -287,7 +287,7 @@ class TestWorkerWrapper:
         _mp_worker_wrapper(make_spec(
             job, lambda j, c: (_ for _ in ()).throw(ValueError("plain")), tmp_path,
         ))
-        res = ArtifactJournal(tmp_path).read_result(job.uid, incarnation=_INCARNATION)
+        res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
         assert res["status"] == "error"
         assert "ValueError" in res["error"]
 
@@ -307,18 +307,18 @@ class TestWorkerResultWriteDegraded:
         real_write = ArtifactJournal.write_result_atomic
         calls: list[dict] = []
 
-        def flaky_write(journal_self, uid, result_dict, incarnation=None):
+        def flaky_write(journal_self, uid, result_dict, execution_id=None):
             calls.append(result_dict)
             if self._is_full_payload(result_dict):
                 raise OSError(28, "No space left on device")
-            return real_write(journal_self, uid, result_dict, incarnation=incarnation)
+            return real_write(journal_self, uid, result_dict, execution_id=execution_id)
 
         monkeypatch.setattr(ArtifactJournal, "write_result_atomic", flaky_write)
 
         job = Job("h", "a")
         _mp_worker_wrapper(make_spec(job, lambda j, c: (True, {"v": 1}), tmp_path))
 
-        res = ArtifactJournal(tmp_path).read_result("h::a", incarnation=_INCARNATION)
+        res = ArtifactJournal(tmp_path).read_result("h::a", execution_id=_EXECUTION_ID)
         assert res is not None, "降级写必须成功落盘（小 payload 可写）"
         assert res["status"] == "retry"
         assert "IPC_RESULT_WRITE_DEGRADED" in res["error"]
@@ -334,10 +334,10 @@ class TestWorkerResultWriteDegraded:
         """
         real_write = ArtifactJournal.write_result_atomic
 
-        def flaky_write(journal_self, uid, result_dict, incarnation=None):
+        def flaky_write(journal_self, uid, result_dict, execution_id=None):
             if self._is_full_payload(result_dict):
                 raise OSError(28, "No space left on device")
-            return real_write(journal_self, uid, result_dict, incarnation=incarnation)
+            return real_write(journal_self, uid, result_dict, execution_id=execution_id)
 
         monkeypatch.setattr(ArtifactJournal, "write_result_atomic", flaky_write)
         monkeypatch.setattr(
@@ -347,7 +347,7 @@ class TestWorkerResultWriteDegraded:
         job = Job("h", "a")
         _mp_worker_wrapper(make_spec(job, lambda j, c: (True, {}), tmp_path))
 
-        res = ArtifactJournal(tmp_path).read_result("h::a", incarnation=_INCARNATION)
+        res = ArtifactJournal(tmp_path).read_result("h::a", execution_id=_EXECUTION_ID)
         assert res is not None
         assert res["status"] == "retry"
         assert res.get("transient_kind") == "lock_conflict"
@@ -357,10 +357,10 @@ class TestWorkerResultWriteDegraded:
         """限流完整写失败 → 降级结果保留 rate_limited（预算豁免依据）。"""
         real_write = ArtifactJournal.write_result_atomic
 
-        def flaky_write(journal_self, uid, result_dict, incarnation=None):
+        def flaky_write(journal_self, uid, result_dict, execution_id=None):
             if "IPC_RESULT_WRITE_DEGRADED" not in str(result_dict.get("error", "")):
                 raise OSError(28, "No space left on device")
-            return real_write(journal_self, uid, result_dict, incarnation=incarnation)
+            return real_write(journal_self, uid, result_dict, execution_id=execution_id)
 
         monkeypatch.setattr(ArtifactJournal, "write_result_atomic", flaky_write)
 
@@ -371,7 +371,7 @@ class TestWorkerResultWriteDegraded:
 
         _mp_worker_wrapper(make_spec(job, rate_limited_handler, tmp_path))
 
-        res = ArtifactJournal(tmp_path).read_result("h::rl", incarnation=_INCARNATION)
+        res = ArtifactJournal(tmp_path).read_result("h::rl", execution_id=_EXECUTION_ID)
         assert res is not None
         assert res["status"] == "retry"
         assert res.get("transient_kind") == "rate_limited"
@@ -379,7 +379,7 @@ class TestWorkerResultWriteDegraded:
     def test_all_writes_fail_worker_exits_without_crash(self, tmp_path, monkeypatch):
         """两级挽救均失效 → worker 不抛 OSError、无结果文件（按崩溃收割）。"""
 
-        def refusing_write(journal_self, uid, result_dict, incarnation=None):
+        def refusing_write(journal_self, uid, result_dict, execution_id=None):
             raise OSError(28, "No space left on device")
 
         monkeypatch.setattr(ArtifactJournal, "write_result_atomic", refusing_write)
@@ -388,7 +388,7 @@ class TestWorkerResultWriteDegraded:
         _mp_worker_wrapper(make_spec(job, lambda j, c: (True, {}), tmp_path))
 
         journal = ArtifactJournal(tmp_path)
-        assert not journal.result_path("h::a", _INCARNATION).exists(), (
+        assert not journal.result_path("h::a", _EXECUTION_ID).exists(), (
             "全部写失败时不应存在结果文件"
         )
 
@@ -400,7 +400,7 @@ class TestEnvFallbackIpcDirCoherence:
         monkeypatch.setenv("TASKLITE_IPC_DIR", str(tmp_path))
 
         class ResultWritingProcess:
-            """start() 时经 spec.task_ctx.ipc_dir 写 success 结果的进程桩。"""
+            """start() 时经 spec.job_context.ipc_dir 写 success 结果的进程桩。"""
 
             def __init__(self, target=None, args=(), kwargs=None, **_kw):
                 self.args = args
@@ -410,7 +410,7 @@ class TestEnvFallbackIpcDirCoherence:
             def start(self):
                 spec = self.args[0]
                 self._alive = True
-                ArtifactJournal(spec.task_ctx.ipc_dir).write_result_atomic(
+                ArtifactJournal(spec.job_context.ipc_dir).write_result_atomic(
                     spec.job.uid,
                     {
                         "status": "success",
@@ -419,7 +419,7 @@ class TestEnvFallbackIpcDirCoherence:
                         "resource_suspensions": [],
                         "cursor_updates": {},
                     },
-                    incarnation=spec.incarnation,
+                    execution_id=spec.execution_id,
                 )
 
             def join(self, timeout=None):
@@ -431,8 +431,8 @@ class TestEnvFallbackIpcDirCoherence:
             def kill(self):
                 self._alive = False
 
-        fake_mp_ctx = type("Ctx", (), {"Process": ResultWritingProcess})()
-        channel = ExecutionChannel(mp_ctx=fake_mp_ctx)
+        fake_process_context = type("Ctx", (), {"Process": ResultWritingProcess})()
+        channel = ExecutionChannel(process_context=fake_process_context)
 
         job = Job("t", "x")
         handle = channel.spawn(make_spec(job, lambda j, c: (True, {}), None))
@@ -445,7 +445,7 @@ class TestEnvFallbackIpcDirCoherence:
         assert channel.journal.ipc_dir == str(tmp_path)
 
         completed = channel.reap_completed([handle])
-        assert [(h.uid, r.success) for h, r in completed] == [("t::x", True)]
+        assert [(h.job_uid, r.success) for h, r in completed] == [("t::x", True)]
         assert channel.probe_orphan_lock("t::x") is True
         assert channel.drain_all_signals() == []
 
@@ -456,7 +456,7 @@ class TestSpawnFailureCleanup:
             def Process(self, *args, **kwargs):
                 raise RuntimeError("process start failed")
 
-        channel = ExecutionChannel(mp_ctx=ExplodingCtx(), ipc_dir=str(tmp_path))
+        channel = ExecutionChannel(process_context=ExplodingCtx(), ipc_dir=str(tmp_path))
         job = Job("t", "j1")
         with pytest.raises(RuntimeError, match="process start failed"):
             channel.spawn(make_spec(job, lambda j, c: True, tmp_path))
@@ -464,7 +464,7 @@ class TestSpawnFailureCleanup:
     def test_submit_requires_ipc_dir(self, monkeypatch):
         monkeypatch.delenv("TASKLITE_IPC_DIR", raising=False)
         channel = ExecutionChannel(
-            mp_ctx=type("Ctx", (), {"Process": lambda *a, **k: None})()
+            process_context=type("Ctx", (), {"Process": lambda *a, **k: None})()
         )
         job = Job("t", "j1")
         with pytest.raises(ValueError, match="ipc_dir"):
@@ -693,32 +693,32 @@ class TestDecodeConvergencePaths:
     def test_reap_completed_contains_scalar_new_jobs_corruption(self, tmp_path):
         job = Job("t", "a")
         ArtifactJournal(tmp_path).write_result_atomic(
-            job.uid, dict(self._SCALAR_CORRUPT), incarnation=_INCARNATION,
+            job.uid, dict(self._SCALAR_CORRUPT), execution_id=_EXECUTION_ID,
         )
         handle = JobHandle(
-            uid=job.uid, process=self._DeadProcess(), deadline=1.0, timeout=5.0,
-            job=job, ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            job_uid=job.uid, process=self._DeadProcess(), deadline=1.0, timeout=5.0,
+            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         assert len(completed) == 1, "损坏任务必须被收割而非打断收割循环"
         result = completed[0][1]
         assert result.success is False
         assert "invalid new_jobs type" in result.result_meta["error"]
-        assert not ArtifactJournal(tmp_path).result_path(job.uid, _INCARNATION).exists(), (
+        assert not ArtifactJournal(tmp_path).result_path(job.uid, _EXECUTION_ID).exists(), (
             "收割后 IPC 结果文件必须照常清理"
         )
 
     def test_claim_stale_result_contains_scalar_new_jobs_corruption(self, tmp_path):
         job = Job("t", "a")
-        incarnation = "deadbeefdeadbeefdeadbeefdeadbeef.2"
+        execution_id = "deadbeefdeadbeefdeadbeefdeadbeef.2"
         ArtifactJournal(tmp_path).write_result_atomic(
-            job.uid, dict(self._SCALAR_CORRUPT), incarnation=incarnation,
+            job.uid, dict(self._SCALAR_CORRUPT), execution_id=execution_id,
         )
         result = ExecutionChannel(tmp_path).claim_stale_result(job.uid, job)
         assert result is not None, "含 status 键的残留结果必须被认领"
         assert result.success is False
         assert "invalid new_jobs type" in result.result_meta["error"]
-        assert not ArtifactJournal(tmp_path).result_path(job.uid, incarnation).exists(), (
+        assert not ArtifactJournal(tmp_path).result_path(job.uid, execution_id).exists(), (
             "认领后残留文件必须照常消费清理"
         )
 
@@ -733,7 +733,7 @@ class TestBuildTerminalFailureDefense:
     @staticmethod
     def _handle(timeout_is_transient):
         return JobHandle(
-            uid="t::a",
+            job_uid="t::a",
             process=SimpleNamespace(exitcode=None),
             deadline=1.0,
             timeout=5.0,
@@ -820,9 +820,9 @@ class TestWatchdogReap:
     def test_deadline_kill_attributed_to_timeout(self, tmp_path):
         job = Job("t", "hang")
         handle = JobHandle(
-            uid=job.uid, process=self._HungProcess(),
+            job_uid=job.uid, process=self._HungProcess(),
             deadline=time.monotonic() - 1, timeout=2.0,
-            job=job, ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         assert len(completed) == 1
@@ -836,9 +836,9 @@ class TestWatchdogReap:
     def test_timeout_transient_job_requests_retry(self, tmp_path):
         job = Job("t", "hang_transient", timeout_is_transient=True)
         handle = JobHandle(
-            uid=job.uid, process=self._HungProcess(),
+            job_uid=job.uid, process=self._HungProcess(),
             deadline=time.monotonic() - 1, timeout=2.0,
-            job=job, ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         result = completed[0][1]
@@ -850,9 +850,9 @@ class TestWatchdogReap:
         """deadline 触发 join 后自然退出 → 按 exitcode 归因（NO_IPC_RESULT），不折入 TIMEOUT。"""
         job = Job("t", "natural_exit")
         handle = JobHandle(
-            uid=job.uid, process=self._DyingDuringJoinProcess(),
+            job_uid=job.uid, process=self._DyingDuringJoinProcess(),
             deadline=time.monotonic() - 1, timeout=2.0,
-            job=job, ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         result = completed[0][1]
@@ -875,9 +875,9 @@ class TestWatchdogReap:
         """
         job = Job("t", "cluster_death")
         handle = JobHandle(
-            uid=job.uid, process=self._DyingDuringJoinProcess(exitcode),
+            job_uid=job.uid, process=self._DyingDuringJoinProcess(exitcode),
             deadline=time.monotonic() - 1, timeout=2.0,
-            job=job, ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         result = completed[0][1]
@@ -900,15 +900,15 @@ class TestWatchdogReap:
                 "resource_suspensions": [],
                 "cursor_updates": {},
             },
-            incarnation=_INCARNATION,
+            execution_id=_EXECUTION_ID,
         )
         handle = JobHandle(
-            uid=job.uid, process=self._HungProcess(),
+            job_uid=job.uid, process=self._HungProcess(),
             deadline=time.monotonic() + 60, timeout=60.0,
-            job=job, ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
-        assert [(h.uid, r.success) for h, r in completed] == [("t::fast", True)]
+        assert [(h.job_uid, r.success) for h, r in completed] == [("t::fast", True)]
 
 
 class TestFinalizeProcessKillRace:
@@ -951,7 +951,7 @@ class TestStaleResultClaimChannel:
                 "resource_suspensions": [],
                 "cursor_updates": {},
             },
-            incarnation=f"{'a' * 32}.1",
+            execution_id=f"{'a' * 32}.1",
         )
 
         result = channel.claim_stale_result(job.uid, job)
@@ -963,15 +963,15 @@ class TestStaleResultClaimChannel:
         """认领必须忽略 .tmp 残留（孤儿 worker 正在写，unlink 会炸其 replace）。"""
         channel = ExecutionChannel(tmp_path)
         job = Job("h", "a")
-        base = safe_uid_filename(job.uid)
+        base = encode_job_uid_filename(job.uid)
         tmp_file = tmp_path / f"{base}.result.json.tmp"
         tmp_file.write_text('{"status": "suc')
 
         assert channel.claim_stale_result(job.uid, job) is None
         assert tmp_file.exists(), "认领不得 unlink 正在写的 .tmp 文件"
 
-    def test_claim_stale_prefers_latest_incarnation_same_instant(self, tmp_path):
-        """同刻多执行代残留按 (mtime_ns, incarnation_seq) 决胜取最新。"""
+    def test_claim_stale_prefers_latest_execution_id_same_instant(self, tmp_path):
+        """同刻多执行代残留按 (mtime_ns, execution_id_seq) 决胜取最新。"""
         import os
 
         run_id = "a" * 32
@@ -979,12 +979,12 @@ class TestStaleResultClaimChannel:
         journal.write_result_atomic(
             "t::x",
             {"status": "success", "raw_result": encode_raw_result((True, {"v": 1}))},
-            incarnation=f"{run_id}.1",
+            execution_id=f"{run_id}.1",
         )
         journal.write_result_atomic(
             "t::x",
             {"status": "success", "raw_result": encode_raw_result((True, {"v": 2}))},
-            incarnation=f"{run_id}.2",
+            execution_id=f"{run_id}.2",
         )
         for p in tmp_path.glob("*.result.json"):
             os.utime(p, ns=(1234567890, 1234567890))
@@ -1008,8 +1008,8 @@ class TestResultAuthTokenReaderSide:
         }
 
     @staticmethod
-    def _write_result_file(channel, job, payload, incarnation=_INCARNATION):
-        p = channel.journal.result_path(job.uid, incarnation)
+    def _write_result_file(channel, job, payload, execution_id=_EXECUTION_ID):
+        p = channel.journal.result_path(job.uid, execution_id)
         p.write_text(json.dumps(payload), encoding="utf-8")
         return p
 
@@ -1064,8 +1064,8 @@ class TestResultAuthTokenReaderSide:
         job = Job("t", "x")
         self._write_result_file(channel, job, self._poison_payload())
         handle = JobHandle(
-            uid=job.uid, process=self._DeadProcess(), deadline=1e18, timeout=10.0,
-            job=job, ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            job_uid=job.uid, process=self._DeadProcess(), deadline=1e18, timeout=10.0,
+            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
 
         completed = channel.reap_completed([handle])
@@ -1083,8 +1083,8 @@ class TestResultAuthTokenReaderSide:
         job = Job("t", "x")
         self._write_result_file(channel, job, self._poison_payload())
         handle = JobHandle(
-            uid=job.uid, process=self._DeadProcess(), deadline=1e18, timeout=10.0,
-            job=job, ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            job_uid=job.uid, process=self._DeadProcess(), deadline=1e18, timeout=10.0,
+            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
 
         outcome = channel.abort_in_flight([handle])
@@ -1121,24 +1121,24 @@ class TestAbortInFlight:
         )
 
         h_done = JobHandle(
-            uid=job_done.uid, process=self.MockProcess(),
+            job_uid=job_done.uid, process=self.MockProcess(),
             deadline=time.monotonic() + 10, timeout=10, job=job_done,
-            ipc_dir=str(tmp_path), incarnation="inc_done",
+            ipc_dir=str(tmp_path), execution_id="inc_done",
         )
         h_pending = JobHandle(
-            uid=job_pending.uid, process=self.MockProcess(),
+            job_uid=job_pending.uid, process=self.MockProcess(),
             deadline=time.monotonic() + 10, timeout=10, job=job_pending,
-            ipc_dir=str(tmp_path), incarnation="inc_pending",
+            ipc_dir=str(tmp_path), execution_id="inc_pending",
         )
 
         outcome = channel.abort_in_flight([h_done, h_pending])
         assert len(outcome.completed) == 1
-        assert outcome.completed[0][0].uid == job_done.uid
+        assert outcome.completed[0][0].job_uid == job_done.uid
         assert outcome.completed[0][1].success is True
         assert outcome.completed[0][1].result_meta == {"done": 1}
 
         assert len(outcome.cancelled) == 1
-        assert outcome.cancelled[0].uid == job_pending.uid
+        assert outcome.cancelled[0].job_uid == job_pending.uid
 
     def test_abort_salvages_signal_written_before_kill(self, tmp_path):
         """杀进程后补排空：「先排空后杀」窗口内终前写入的 suspend 信号捞回。
@@ -1171,14 +1171,14 @@ class TestAbortInFlight:
                 pass
 
         h = JobHandle(
-            uid=job.uid, process=KillWritingProcess(),
+            job_uid=job.uid, process=KillWritingProcess(),
             deadline=time.monotonic() + 10, timeout=10, job=job,
-            ipc_dir=str(tmp_path), incarnation="inc_salvage",
+            ipc_dir=str(tmp_path), execution_id="inc_salvage",
         )
 
         outcome = channel.abort_in_flight([h])
 
-        assert [handle.uid for handle in outcome.cancelled] == [job.uid]
+        assert [handle.job_uid for handle in outcome.cancelled] == [job.uid]
         assert outcome.salvaged_signals == [(job.uid, "gpu", 30.0)]
         # 信号已被消费带走，半成品清理照常执行（不留残留文件）
         assert not channel.journal.signals_path(job.uid).exists()
@@ -1208,7 +1208,7 @@ class TestAbortInFlight:
                 channel.journal.write_result_atomic(
                     job.uid,
                     {"status": "success", "raw_result": {"done": 1}},
-                    incarnation="inc_reprobe",
+                    execution_id="inc_reprobe",
                 )
                 channel.journal.record_signal(job.uid, "api", 5.0)
 
@@ -1219,14 +1219,14 @@ class TestAbortInFlight:
                 pass
 
         h = JobHandle(
-            uid=job.uid, process=FinishOnKillProcess(),
+            job_uid=job.uid, process=FinishOnKillProcess(),
             deadline=time.monotonic() + 10, timeout=10, job=job,
-            ipc_dir=str(tmp_path), incarnation="inc_reprobe",
+            ipc_dir=str(tmp_path), execution_id="inc_reprobe",
         )
 
         outcome = channel.abort_in_flight([h])
 
-        assert [handle.uid for handle, _ in outcome.completed] == [job.uid]
+        assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
         assert outcome.completed[0][1].success is True
         assert outcome.completed[0][1].resource_suspensions == [("api", 5.0)]
         assert outcome.salvaged_signals == []
@@ -1238,18 +1238,18 @@ class TestAbortInFlight:
         channel.journal.write_result_atomic(
             job.uid,
             {"status": "interrupted", "error": "WORKER_INTERRUPTED: KeyboardInterrupt"},
-            incarnation="inc_interrupted",
+            execution_id="inc_interrupted",
         )
         h = JobHandle(
-            uid=job.uid, process=self.MockProcess(),
+            job_uid=job.uid, process=self.MockProcess(),
             deadline=time.monotonic() + 10, timeout=10, job=job,
-            ipc_dir=str(tmp_path), incarnation="inc_interrupted",
+            ipc_dir=str(tmp_path), execution_id="inc_interrupted",
         )
 
         outcome = channel.abort_in_flight([h])
 
         assert outcome.completed == [], "被中断报告不得作为终态提交"
-        assert [handle.uid for handle in outcome.cancelled] == [job.uid]
+        assert [handle.job_uid for handle in outcome.cancelled] == [job.uid]
 
     def test_abort_empty_handles_returns_empty_outcome(self, tmp_path):
         channel = ExecutionChannel(tmp_path)
@@ -1264,16 +1264,16 @@ class TestCleanupInFlight:
         channel = ExecutionChannel(tmp_path)
         job = Job("task", "residual")
         channel.journal.write_result_atomic(
-            job.uid, {"status": "success"}, incarnation=_INCARNATION
+            job.uid, {"status": "success"}, execution_id=_EXECUTION_ID
         )
         channel.journal.record_signal(job.uid, "api", 1.0)
         handle = JobHandle(
-            uid=job.uid, process=TestAbortInFlight.MockProcess(),
+            job_uid=job.uid, process=TestAbortInFlight.MockProcess(),
             deadline=time.monotonic() + 10, timeout=10, job=job,
-            ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
         )
 
         channel.cleanup_in_flight([handle])
 
-        assert not channel.journal.result_path(job.uid, _INCARNATION).exists()
+        assert not channel.journal.result_path(job.uid, _EXECUTION_ID).exists()
         assert not channel.journal.signals_path(job.uid).exists()

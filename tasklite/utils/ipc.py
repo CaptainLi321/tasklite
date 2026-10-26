@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import unquote
 
-from .encoding import safe_uid_filename
+from .encoding import encode_job_uid_filename
 from .jsonutil import dump, dumps, load, loads
 
 logger = logging.getLogger("tasklite")
@@ -101,49 +101,49 @@ class ArtifactJournal:
 
     # ── 路径构造 ──────────────────────────────────────────────────
 
-    def signals_path(self, uid: str) -> Path:
+    def signals_path(self, job_uid: str) -> Path:
         """某个 job 的 suspend 信号文件路径。"""
         if self.ipc_dir is None:
             raise ValueError("ipc_dir is required to build signals_path")
-        return Path(self.ipc_dir) / f"{safe_uid_filename(uid)}{_SIGNALS_SUFFIX}"
+        return Path(self.ipc_dir) / f"{encode_job_uid_filename(job_uid)}{_SIGNALS_SUFFIX}"
 
-    def outputs_path(self, uid: str) -> Path:
+    def outputs_path(self, job_uid: str) -> Path:
         """某个 job 的已声明输出文件路径。"""
         if self.ipc_dir is None:
             raise ValueError("ipc_dir is required to build outputs_path")
-        return Path(self.ipc_dir) / f"{safe_uid_filename(uid)}{_OUTPUTS_SUFFIX}"
+        return Path(self.ipc_dir) / f"{encode_job_uid_filename(job_uid)}{_OUTPUTS_SUFFIX}"
 
-    def inputs_path(self, uid: str) -> Path:
+    def inputs_path(self, job_uid: str) -> Path:
         """输入声明的落盘路径。"""
         if self.ipc_dir is None:
             raise ValueError("ipc_dir is required to build inputs_path")
-        return Path(self.ipc_dir) / f"{safe_uid_filename(uid)}{_INPUTS_SUFFIX}"
+        return Path(self.ipc_dir) / f"{encode_job_uid_filename(job_uid)}{_INPUTS_SUFFIX}"
 
-    def result_path(self, uid: str, incarnation: str | None = None) -> Path:
+    def result_path(self, job_uid: str, execution_id: str | None = None) -> Path:
         """某个 job 的最终结果文件路径。"""
         if self.ipc_dir is None:
             raise ValueError("ipc_dir is required to build result_path")
-        suffix = f".{incarnation}{_RESULT_SUFFIX}" if incarnation else _RESULT_SUFFIX
-        return Path(self.ipc_dir) / f"{safe_uid_filename(uid)}{suffix}"
+        suffix = f".{execution_id}{_RESULT_SUFFIX}" if execution_id else _RESULT_SUFFIX
+        return Path(self.ipc_dir) / f"{encode_job_uid_filename(job_uid)}{suffix}"
 
-    def result_tmp_path(self, uid: str, incarnation: str | None = None) -> Path:
+    def result_tmp_path(self, job_uid: str, execution_id: str | None = None) -> Path:
         """某个 job 的结果临时文件路径。"""
         if self.ipc_dir is None:
             raise ValueError("ipc_dir is required to build result_tmp_path")
-        suffix = f".{incarnation}{_RESULT_TMP_SUFFIX}" if incarnation else _RESULT_TMP_SUFFIX
-        return Path(self.ipc_dir) / f"{safe_uid_filename(uid)}{suffix}"
+        suffix = f".{execution_id}{_RESULT_TMP_SUFFIX}" if execution_id else _RESULT_TMP_SUFFIX
+        return Path(self.ipc_dir) / f"{encode_job_uid_filename(job_uid)}{suffix}"
 
-    def iter_stale_result_paths(self, uid: str) -> list[Path]:
-        """枚举某个 uid 的全部残留结果文件路径（锚定 incarnation 形态）。
+    def iter_stale_result_paths(self, job_uid: str) -> list[Path]:
+        """枚举某个 uid 的全部残留结果文件路径（锚定 execution_id 形态）。
 
         不变式：job_id 可含点，glob ``{uid}.*`` 会命中点后缀兄弟 uid
-        （如 ``h::a`` 与 ``h::a.b``）的文件——必须以 incarnation 正则
+        （如 ``h::a`` 与 ``h::a.b``）的文件——必须以 execution_id 正则
         在 base 之后锚定匹配，防误认/误删兄弟 uid 的结果。
         """
         if self.ipc_dir is None:
             return []
         d = Path(self.ipc_dir)
-        base = f"{safe_uid_filename(uid)}"
+        base = f"{encode_job_uid_filename(job_uid)}"
         found: list[Path] = []
         try:
             for pat in (f"{base}.*{_RESULT_SUFFIX}", f"{base}.*{_RESULT_TMP_SUFFIX}"):
@@ -199,12 +199,12 @@ class ArtifactJournal:
     # ── 声明追加写入（Worker 侧）─────────────────────────────────
 
     def record_output(
-        self, uid: str, out_path: str, *, cleanup: bool = True, kind: str = "output"
+        self, job_uid: str, out_path: str, *, cleanup: bool = True, kind: str = "output"
     ) -> None:
         """追加一条输出声明到落盘文件（失败静默，尽力而为）。"""
         if self.ipc_dir is None:
             return
-        path = self.outputs_path(uid)
+        path = self.outputs_path(job_uid)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
@@ -218,11 +218,11 @@ class ArtifactJournal:
         except OSError:
             pass
 
-    def record_input_entry(self, uid: str, entry: dict) -> None:
+    def record_input_entry(self, job_uid: str, entry: dict) -> None:
         """追加一条输入声明条目到落盘文件。"""
         if self.ipc_dir is None:
             return
-        path = self.inputs_path(uid)
+        path = self.inputs_path(job_uid)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
@@ -231,7 +231,7 @@ class ArtifactJournal:
         except OSError:
             pass
 
-    def record_input_file(self, uid: str, resolved_path: str) -> dict:
+    def record_input_file(self, job_uid: str, resolved_path: str) -> dict:
         """采集文件 stat 指纹并追加输入声明。"""
         entry: dict = {"path": resolved_path, "kind": "file"}
         try:
@@ -240,20 +240,20 @@ class ArtifactJournal:
             entry["mtime_ns"] = st.st_mtime_ns
         except OSError:
             pass
-        self.record_input_entry(uid, entry)
+        self.record_input_entry(job_uid, entry)
         return entry
 
     def record_input_uri(
-        self, uid: str, url: str, uri_fingerprint: str | None = None
+        self, job_uid: str, url: str, uri_fingerprint: str | None = None
     ) -> dict:
         """记录 URI 输入声明。"""
         entry: dict = {"path": url, "kind": "uri"}
         if uri_fingerprint is not None:
             entry["uri_fingerprint"] = uri_fingerprint
-        self.record_input_entry(uid, entry)
+        self.record_input_entry(job_uid, entry)
         return entry
 
-    def record_signal(self, uid: str, r_name: str, secs: float) -> None:
+    def record_signal(self, job_uid: str, r_name: str, secs: float) -> None:
         """追加一条 suspend 信号到 signals 文件。
 
         信号立即落盘 flush——即使 handler 随后崩溃/超时，限流信息也不
@@ -261,7 +261,7 @@ class ArtifactJournal:
         """
         if self.ipc_dir is None:
             return
-        path = self.signals_path(uid)
+        path = self.signals_path(job_uid)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
@@ -273,11 +273,11 @@ class ArtifactJournal:
     # ── 结果写入与降级 ──────────────────────────────────────────
 
     def write_result_atomic(
-        self, uid: str, result_dict: dict, incarnation: str | None = None
+        self, job_uid: str, result_dict: dict, execution_id: str | None = None
     ) -> None:
         """原子写结果：先写 .tmp 再 os.replace。失败时清理 .tmp。"""
-        tmp = self.result_tmp_path(uid, incarnation)
-        final = self.result_path(uid, incarnation)
+        tmp = self.result_tmp_path(job_uid, execution_id)
+        final = self.result_path(job_uid, execution_id)
         tmp.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -301,7 +301,7 @@ class ArtifactJournal:
             raise
 
     def write_result_with_degradation(
-        self, uid: str, payload: dict[str, Any], incarnation: str | None = None
+        self, job_uid: str, payload: dict[str, Any], execution_id: str | None = None
     ) -> None:
         """worker 结果落盘的唯一出口：完整写失败时两级降级，绝不裸抛 OSError。
 
@@ -310,20 +310,20 @@ class ArtifactJournal:
         仍失败记 error 后放弃（worker 无结果退出，收割按崩溃语义处理）。
         """
         try:
-            self.write_result_atomic(uid, payload, incarnation=incarnation)
+            self.write_result_atomic(job_uid, payload, execution_id=execution_id)
             return
         except OSError as e:
             logger.warning(
-                f"result write failed for {uid}: {e}; retrying full payload once after brief pause"
+                f"result write failed for {job_uid}: {e}; retrying full payload once after brief pause"
             )
         time.sleep(0.05)
         try:
-            self.write_result_atomic(uid, payload, incarnation=incarnation)
+            self.write_result_atomic(job_uid, payload, execution_id=execution_id)
             return
         except OSError as e:
             write_err = str(e)
             logger.warning(
-                f"full result write retry also failed for {uid}: {e}; falling back to degraded result"
+                f"full result write retry also failed for {job_uid}: {e}; falling back to degraded result"
             )
         orig_status = payload.get("status")
         degraded_status = "retry" if orig_status in (None, "success") else orig_status
@@ -338,19 +338,19 @@ class ArtifactJournal:
         if payload.get("transient_kind"):
             degraded["transient_kind"] = payload["transient_kind"]
         try:
-            self.write_result_atomic(uid, degraded, incarnation=incarnation)
+            self.write_result_atomic(job_uid, degraded, execution_id=execution_id)
         except OSError as e2:
             logger.error(
-                f"degraded result write also failed for {uid}: {e2}; worker exiting without IPC result"
+                f"degraded result write also failed for {job_uid}: {e2}; worker exiting without IPC result"
             )
 
     # ── 读取与解析（父进程 Engine 侧）─────────────────────────────
 
-    def read_inputs(self, uid: str) -> list[dict]:
+    def read_inputs(self, job_uid: str) -> list[dict]:
         """读取一个 job 的全部输入声明（坏行容灾跳过）。"""
         if self.ipc_dir is None:
             return []
-        path = self.inputs_path(uid)
+        path = self.inputs_path(job_uid)
         entries: list[dict] = []
         try:
             if path.exists():
@@ -369,11 +369,11 @@ class ArtifactJournal:
             pass
         return entries
 
-    def read_outputs(self, uid: str) -> list[tuple[str, bool, str]]:
+    def read_outputs(self, job_uid: str) -> list[tuple[str, bool, str]]:
         """读取一个 job 的全部已声明输出 (path, cleanup, kind)。"""
         if self.ipc_dir is None:
             return []
-        path = self.outputs_path(uid)
+        path = self.outputs_path(job_uid)
         outputs: list[tuple[str, bool, str]] = []
         try:
             if path.exists():
@@ -399,7 +399,7 @@ class ArtifactJournal:
             pass
         return outputs
 
-    def drain_signals(self, uid: str) -> list[tuple[str, float]]:
+    def drain_signals(self, job_uid: str) -> list[tuple[str, float]]:
         """读取并删除一个 job 的 suspend 信号文件（排空语义）。
 
         不变式：先以原子 rename 把信号文件摘出命名空间，再读摘除后的稳定
@@ -414,8 +414,8 @@ class ArtifactJournal:
         """
         if self.ipc_dir is None:
             return []
-        signals = self._salvage_draining_files(uid)
-        path = self.signals_path(uid)
+        signals = self._salvage_draining_files(job_uid)
+        path = self.signals_path(job_uid)
         # 摘除名须与原文件同目录（同文件系统是 rename 原子性的前提）
         draining = path.with_name(
             f"{path.name}.{os.getpid()}.{time.monotonic_ns()}.draining"
@@ -439,7 +439,7 @@ class ArtifactJournal:
         信号却无任何再消费路径」的残留：后续派发预检清理与完成收尾清理
         都会未读删除信号文件，启动期全量清扫是该不变式的兜底回收点。
         每个文件名还原 uid 后复用 ``drain_signals`` 的摘除式排空与孤儿
-        回收协议；文件名 → uid 取 ``safe_uid_filename`` 的百分号解码逆
+        回收协议；文件名 → uid 取 ``encode_job_uid_filename`` 的百分号解码逆
         映射，往返校验失败（像集外形态）不触碰。
         """
         if self.ipc_dir is None:
@@ -455,12 +455,12 @@ class ArtifactJournal:
         out: list[tuple[str, str, float]] = []
         seen: set[str] = set()
         for name in candidates:
-            uid = self._uid_from_signals_filename(name)
-            if uid is None or uid in seen:
+            job_uid = self._uid_from_signals_filename(name)
+            if job_uid is None or job_uid in seen:
                 continue
-            seen.add(uid)
-            for r_name, secs in self.drain_signals(uid):
-                out.append((uid, r_name, secs))
+            seen.add(job_uid)
+            for r_name, secs in self.drain_signals(job_uid):
+                out.append((job_uid, r_name, secs))
         return out
 
     @staticmethod
@@ -481,10 +481,10 @@ class ArtifactJournal:
             base = parts[0][: -len(_SIGNALS_SUFFIX)]
         else:
             return None
-        uid = unquote(base)
-        if safe_uid_filename(uid) != base:
+        job_uid = unquote(base)
+        if encode_job_uid_filename(job_uid) != base:
             return None
-        return uid
+        return job_uid
 
     @staticmethod
     def _read_suspend_lines(path: Path) -> list[tuple[str, float]]:
@@ -507,7 +507,7 @@ class ArtifactJournal:
             pass
         return signals
 
-    def _salvage_draining_files(self, uid: str) -> list[tuple[str, float]]:
+    def _salvage_draining_files(self, job_uid: str) -> list[tuple[str, float]]:
         """回收 uid 名下排空中途读者死亡遗留的 .draining 孤儿（先读后删）。
 
         孤儿名形状为 {base}.signals.jsonl.{pid}.{monotonic_ns}.draining，
@@ -516,7 +516,7 @@ class ArtifactJournal:
         """
         if self.ipc_dir is None:
             return []
-        base = safe_uid_filename(uid)
+        base = encode_job_uid_filename(job_uid)
         anchor = len(base) + len(_SIGNALS_SUFFIX)
         signals: list[tuple[str, float]] = []
         try:
@@ -536,7 +536,7 @@ class ArtifactJournal:
         return signals
 
     def read_result(
-        self, path_or_uid: str | Path, incarnation: str | None = None
+        self, path_or_uid: str | Path, execution_id: str | None = None
     ) -> dict | None:
         """读取结果文件；损坏/不存在返回 None（宁可重跑，不可崩）。"""
         if isinstance(path_or_uid, Path):
@@ -544,7 +544,7 @@ class ArtifactJournal:
         elif "/" in str(path_or_uid) or "\\" in str(path_or_uid):
             path = Path(path_or_uid)
         else:
-            path = self.result_path(str(path_or_uid), incarnation=incarnation)
+            path = self.result_path(str(path_or_uid), execution_id=execution_id)
 
         try:
             with open(path, encoding="utf-8") as f:
@@ -559,16 +559,16 @@ class ArtifactJournal:
             logger.warning(f"Corrupt result file {path}: {e}, ignoring")
             return None
 
-    def claim_stale_result_payload(self, uid: str) -> dict | None:
+    def claim_stale_result_payload(self, job_uid: str) -> dict | None:
         """认领并读取遗留的已落盘残留结果，清理其余过期结果。
 
         只消费 final 结果文件——.tmp 残留可能是孤儿 worker 正在写的
         半成品，读部分 JSON 返回 None 后 unlink 正在写的文件会让孤儿
         的 os.replace 抛 FileNotFoundError。残留取舍以
-        (mtime_ns, incarnation_seq) 决胜：秒级 mtime 同刻不稳定，最新
-        执行代的 seq 是第二决胜键。
+        (mtime_ns, dispatch_no) 决胜：秒级 mtime 同刻不稳定，最新
+        执行代的派发号 是第二决胜键。
         """
-        res_paths = self.iter_stale_result_paths(uid)
+        res_paths = self.iter_stale_result_paths(job_uid)
         res_paths = [p for p in res_paths if p.name.endswith(_RESULT_SUFFIX)]
         if not res_paths:
             return None
@@ -583,14 +583,14 @@ class ArtifactJournal:
 
         if not isinstance(res, dict) or "status" not in res:
             logger.warning(
-                f"Discarding stale result file for {uid}: not a valid result dict: {res!r}"
+                f"Discarding stale result file for {job_uid}: not a valid result dict: {res!r}"
             )
             return None
         return res
 
     @staticmethod
     def _freshness_key(p: Path) -> tuple[int, int]:
-        """残留结果新鲜度键 (mtime_ns, incarnation_seq)。"""
+        """残留结果新鲜度键 (mtime_ns, dispatch_no)。"""
 
         def _seq_of(path: Path) -> int:
             try:
@@ -625,46 +625,46 @@ class ArtifactJournal:
             return False
         return True
 
-    def _cleanup_sandbox_guard(self, uid: str, raw_path: str) -> bool:
+    def _cleanup_sandbox_guard(self, job_uid: str, raw_path: str) -> bool:
         """清理卫兵：归属复检失败时告警一次并示意调用方跳过该路径。"""
         if self._in_cleanup_sandbox(raw_path):
             return True
         logger.error(
-            f"Refusing to clean declared path outside sandbox for {uid}: {raw_path}"
+            f"Refusing to clean declared path outside sandbox for {job_uid}: {raw_path}"
         )
         return False
 
-    def verify_outputs(self, uid: str) -> tuple[bool, str | None]:
+    def verify_outputs(self, job_uid: str) -> tuple[bool, str | None]:
         """校验 job 的产物是否存在（忽略临时 cache）。
 
         Returns:
             (True, None) 表示校验通过；(False, error_msg) 表示产物缺失。
         """
-        for out_path, _, kind in self.read_outputs(uid):
+        for out_path, _, kind in self.read_outputs(job_uid):
             if kind == "cache":
                 continue
             if not Path(out_path).exists():
                 return False, f"Missing output {out_path}"
         return True, None
 
-    def cleanup_ipc_files(self, uid: str, incarnation: str | None = None) -> None:
+    def cleanup_ipc_files(self, job_uid: str, execution_id: str | None = None) -> None:
         """删除某个 job 的结果/信号/临时文件（不含 outputs.jsonl）。"""
         if self.ipc_dir is None:
             return
-        targets = [self.signals_path(uid)]
-        if incarnation is not None:
+        targets = [self.signals_path(job_uid)]
+        if execution_id is not None:
             targets += [
-                self.result_path(uid, incarnation),
-                self.result_tmp_path(uid, incarnation),
+                self.result_path(job_uid, execution_id),
+                self.result_tmp_path(job_uid, execution_id),
             ]
-        targets += self.iter_stale_result_paths(uid)
+        targets += self.iter_stale_result_paths(job_uid)
         for p in targets:
             try:
                 p.unlink()
             except (FileNotFoundError, OSError):
                 pass
 
-    def cleanup(self, uid: str, mode: str | ArtifactCleanupMode) -> None:
+    def cleanup(self, job_uid: str, mode: str | ArtifactCleanupMode) -> None:
         """根据清理模式对产物文件与声明文件进行生命周期清理。"""
         if self.ipc_dir is None:
             return
@@ -672,13 +672,13 @@ class ArtifactJournal:
         mode_val = mode.value if hasattr(mode, "value") else str(mode)
 
         if mode_val == ArtifactCleanupMode.PRE_SUBMIT.value:
-            for p in (self.inputs_path(uid), self.outputs_path(uid), self.signals_path(uid)):
+            for p in (self.inputs_path(job_uid), self.outputs_path(job_uid), self.signals_path(job_uid)):
                 try:
                     if p.exists():
                         p.unlink()
                 except OSError:
                     pass
-            for sp in self.iter_stale_result_paths(uid):
+            for sp in self.iter_stale_result_paths(job_uid):
                 try:
                     if sp.exists():
                         sp.unlink()
@@ -688,30 +688,30 @@ class ArtifactJournal:
 
         if mode_val == ArtifactCleanupMode.SUCCESS.value:
             try:
-                for out_path, _, kind in self.read_outputs(uid):
+                for out_path, _, kind in self.read_outputs(job_uid):
                     if kind == "cache":
-                        if not self._cleanup_sandbox_guard(uid, out_path):
+                        if not self._cleanup_sandbox_guard(job_uid, out_path):
                             continue
                         out_obj = Path(out_path)
                         if out_obj.exists():
                             out_obj.unlink()
                             logger.info(f"Cleaned cache file: {out_obj}")
-                op = self.outputs_path(uid)
+                op = self.outputs_path(job_uid)
                 if op.exists():
                     op.unlink()
-                ip = self.inputs_path(uid)
+                ip = self.inputs_path(job_uid)
                 if ip.exists():
                     ip.unlink()
             except OSError:
                 pass
-            self.cleanup_ipc_files(uid)
+            self.cleanup_ipc_files(job_uid)
             return
 
         if mode_val == ArtifactCleanupMode.FAILURE_OR_RETRY.value:
             try:
-                for out_path, cleanup, kind in self.read_outputs(uid):
+                for out_path, cleanup, kind in self.read_outputs(job_uid):
                     if kind == "cache" or cleanup:
-                        if not self._cleanup_sandbox_guard(uid, out_path):
+                        if not self._cleanup_sandbox_guard(job_uid, out_path):
                             continue
                         out_path_obj = Path(out_path)
                         if out_path_obj.exists():
@@ -721,18 +721,18 @@ class ArtifactJournal:
                                 out_path_obj.unlink()
                             logger.info(f"Cleaned broken output: {out_path_obj}")
             except Exception as e:
-                logger.error(f"Could not remove outputs for {uid}: {e}")
+                logger.error(f"Could not remove outputs for {job_uid}: {e}")
             finally:
                 try:
-                    p = self.outputs_path(uid)
+                    p = self.outputs_path(job_uid)
                     if p.exists():
                         p.unlink()
-                    ip = self.inputs_path(uid)
+                    ip = self.inputs_path(job_uid)
                     if ip.exists():
                         ip.unlink()
                 except OSError:
                     pass
-                self.cleanup_ipc_files(uid)
+                self.cleanup_ipc_files(job_uid)
 
 
 __all__ = [

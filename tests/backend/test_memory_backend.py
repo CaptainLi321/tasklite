@@ -28,7 +28,7 @@ def _running_attempt(job_uid: str, attempt_no: int = 1) -> AttemptRecord:
         job_uid=job_uid,
         activation_no=1,
         attempt_no=attempt_no,
-        incarnation=f"run_seed.{attempt_no}",
+        execution_id=f"run_seed.{attempt_no}",
         run_id="run_seed",
         started_at="2026-05-01T00:00:00+00:00",
         outcome="running",
@@ -181,7 +181,7 @@ class TestMemoryAttemptTrajectory:
             b.append_attempt(
                 AttemptRecord(
                     job_uid="t::one", activation_no=1, attempt_no=1,
-                    incarnation="run_seed.1", run_id="run_seed",
+                    execution_id="run_seed.1", run_id="run_seed",
                     started_at="2026-05-01T00:00:00+00:00",
                     outcome="succeeded",
                     finished_at="2026-05-01T00:00:05+00:00",
@@ -202,7 +202,7 @@ class TestMemoryAttemptTrajectory:
         assert rec.finished_at == "2026-05-01T00:00:05+00:00"
         assert rec.error == "RateLimitHit"
         # 身份字段保持插入原值（append-only：只写收尾三列）
-        assert rec.incarnation == "run_seed.1"
+        assert rec.execution_id == "run_seed.1"
         assert rec.started_at == "2026-05-01T00:00:00+00:00"
 
     def test_update_unknown_id_returns_false(self):

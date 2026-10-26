@@ -63,15 +63,15 @@ class TestSessionLifecycle:
     def test_begin_resets_everything(self):
         session = RunSession()
         session.begin("run-1")
-        session.next_dispatch_seq()
-        session.next_dispatch_seq()
+        session.next_dispatch_no()
+        session.next_dispatch_no()
         session.stats["completed"] = 3
         session.request_stop(force=True)
         session.fire_run_end("error")  # 置幂等标志
 
         session.begin("run-2")
         assert session.run_id == "run-2"
-        assert session.dispatch_seq == 0
+        assert session.dispatch_no == 0
         assert session.stop_mode == StopMode.NONE
         assert isinstance(session.stats, TaskStats)
         assert session.stats["completed"] == 0
@@ -96,11 +96,11 @@ class TestSessionLifecycle:
         assert session.request_stop(force=False) == StopMode.ABORTING
         assert session.request_stop(force=False) == StopMode.ABORTING
 
-    def test_dispatch_seq_monotonic(self):
+    def test_dispatch_no_monotonic(self):
         session = RunSession()
-        assert session.next_dispatch_seq() == 1
-        assert session.next_dispatch_seq() == 2
-        assert session.dispatch_seq == 2
+        assert session.next_dispatch_no() == 1
+        assert session.next_dispatch_no() == 2
+        assert session.dispatch_no == 2
 
     def test_fire_run_end_idempotent(self):
         fired = []

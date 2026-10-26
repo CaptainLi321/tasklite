@@ -80,7 +80,7 @@ class CompletionMachine:
         单一出口：IPC 文件生命周期集中在本方法 finally——正常路径（收割
         已删 result/signals）与恢复路径（伪 entry）统一走清理模式分派。
         """
-        uid = entry.uid
+        uid = entry.job_uid
         terminated = False
         try:
             self.apply_result(
@@ -388,14 +388,14 @@ class CompletionMachine:
         store = self._store
         completed_count = 0
         for handle, result in reaped:
-            entry = self._in_flight.get(handle.uid)
+            entry = self._in_flight.get(handle.job_uid)
             if entry is None:
                 continue
             try:
                 self.complete_job(entry, result)
                 completed_count += 1
             finally:
-                self._in_flight.settle(handle.uid, state=store.state)
+                self._in_flight.settle(handle.job_uid, state=store.state)
         return completed_count
 
     def settle_aborted(
@@ -412,7 +412,7 @@ class CompletionMachine:
         store = self._store
         # 1. 未完成任务注销并重入队
         for pending_entry in cancelled_entries:
-            self._in_flight.settle(pending_entry.uid, state=store.state)
+            self._in_flight.settle(pending_entry.job_uid, state=store.state)
         job_dicts = [entry.job_dict for entry in cancelled_entries]
         if job_dicts:
             store.state.requeue_jobs(job_dicts, front=True)
@@ -427,7 +427,7 @@ class CompletionMachine:
             except _CommitCrashSignal as e:
                 commit_crash = e
             finally:
-                self._in_flight.settle(entry.uid, state=store.state)
+                self._in_flight.settle(entry.job_uid, state=store.state)
 
         self._in_flight.clear()
         store.state.clear_in_flight()

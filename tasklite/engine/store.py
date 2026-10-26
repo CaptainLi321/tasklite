@@ -352,7 +352,7 @@ class StateStore:
         self,
         job: Job,
         *,
-        incarnation: str,
+        execution_id: str,
         run_id: str | None,
     ) -> int | None:
         """记录作业派发尝试（旁路 attempts 轨迹；写失败降级告警，不阻断主流程）。"""
@@ -362,7 +362,7 @@ class StateStore:
             job_uid=job.uid,
             activation_no=job.activation_no,
             attempt_no=job.attempt_no,
-            incarnation=incarnation,
+            execution_id=execution_id,
             run_id=run_id,
             started_at=utc_now_iso(),
             outcome=ATTEMPT_RUNNING,
@@ -389,13 +389,13 @@ class StateStore:
             return
         try:
             now = utc_now_iso()
-            incarnation = f"{run_id}.skip.{seq}"
+            execution_id = f"{run_id}.skip.{seq}"
             attempt_id = self._backend.append_attempt(
                 AttemptRecord(
                     job_uid=job.uid,
                     activation_no=job.activation_no,
                     attempt_no=job.attempt_no,
-                    incarnation=incarnation,
+                    execution_id=execution_id,
                     run_id=run_id,
                     started_at=now,
                     outcome=ATTEMPT_RUNNING,

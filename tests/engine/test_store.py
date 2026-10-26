@@ -705,7 +705,7 @@ class TestAttemptTraceFinalization:
             job_uid=uid,
             activation_no=1,
             attempt_no=1,
-            incarnation="r" * 32 + ".1",
+            execution_id="r" * 32 + ".1",
             run_id="r" * 32,
             started_at="2026-01-01T00:00:00+00:00",
             outcome="running",
@@ -968,16 +968,16 @@ class TestRecordAttemptSeam:
 
         # 正常记录 dispatch
         attempt_id = store.record_attempt_dispatch(
-            job, incarnation="run1.1", run_id="run1"
+            job, execution_id="run1.1", run_id="run1"
         )
         assert attempt_id is not None
         records = backend.load_attempts("fetch::1")
         assert len(records) == 1
         assert records[0].outcome == "running"
-        assert records[0].incarnation == "run1.1"
+        assert records[0].execution_id == "run1.1"
 
         # run_id 为空时不写轨迹
-        assert store.record_attempt_dispatch(job, incarnation="x", run_id=None) is None
+        assert store.record_attempt_dispatch(job, execution_id="x", run_id=None) is None
 
     def test_record_attempt_skip_success_and_degraded(self):
         backend = InMemoryStateBackend()
@@ -990,7 +990,7 @@ class TestRecordAttemptSeam:
         assert len(records) == 1
         assert records[0].outcome == "skipped"
         assert records[0].error == "SKIPPED"
-        assert records[0].incarnation == "run1.skip.2"
+        assert records[0].execution_id == "run1.skip.2"
 
         # run_id 为空时不写轨迹
         store.record_attempt_skip(job, "SKIPPED", run_id=None, seq=3)

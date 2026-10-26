@@ -53,7 +53,7 @@ def _patch_mp_context(monkeypatch):
     The pipeline uses mp.get_context("spawn") to avoid mutating global state
     In tests, we want monkeypatching mp.Process / mp.Queue to still work.
     By making get_context return the global mp module, the executor's
-    self._mp_ctx.Process resolves to the (patched) mp.Process.
+    self._process_context.Process resolves to the (patched) mp.Process.
     """
     monkeypatch.setattr(mp, "get_context", lambda method: mp)
 

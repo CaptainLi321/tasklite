@@ -15,7 +15,7 @@ The logical instance of one bounded activation, uniquely identified by `uid = f"
 _Avoid_: Message, Item, Record, Execution
 
 **Attempt**:
-The append-only trace record of one physical execution: `(job_uid, activation_no, attempt_no, incarnation, run_id, started_at, finished_at, outcome, error)`. Row inserted at dispatch (`outcome=running`), updated at settlement; a bypass observation surface that never participates in the six-set mutual exclusion — "final state is unique" (wall/failed by uid) and "history is traceable" (attempts never deleted) are thereby decoupled.
+The append-only trace record of one physical execution: `(job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error)`. Row inserted at dispatch (`outcome=running`), updated at settlement; a bypass observation surface that never participates in the six-set mutual exclusion — "final state is unique" (wall/failed by uid) and "history is traceable" (attempts never deleted) are thereby decoupled.
 _Avoid_: Trial, ExecutionLog, RunRecord
 
 **TaskRegistry**:
@@ -59,7 +59,7 @@ The single source of truth for error tri-classification, transient-exception reg
 _Avoid_: Taxonomy, ErrorTaxonomy, ClassifierService
 
 **encode_* family**:
-The reversible `%XX` percent-encoding family (`encode_identifier` / `encode_job_component` / `encode_content_id` / `percent_encode`) plus `safe_uid_filename` / `content_fingerprint`, guaranteeing injectivity (zero collisions) across file paths, job IDs, and discovery namespaces.
+The reversible `%XX` percent-encoding family (`encode_identifier` / `encode_job_component` / `encode_content_id` / `percent_encode`) plus `encode_job_uid_filename` / `content_fingerprint`, guaranteeing injectivity (zero collisions) across file paths, job IDs, and discovery namespaces.
 _Avoid_: Sanitizer, Slugger, Escaper, sanitize_*
 
 **OrderingPolicy**:
@@ -93,7 +93,7 @@ Runtime tracked context for a job dispatched to an active subprocess before comp
 _Avoid_: RunningTask, ActiveProcess, WorkerHandle
 
 **WorkerLaunchSpec**:
-The frozen named contract crossing the process seam, carrying the full spawn payload (handler, job, execution context, incarnation, ipc_dir, timeout) for worker subprocess launch; incarnation belongs to the spec, not to JobContext.
+The frozen named contract crossing the process seam, carrying the full spawn payload (handler, job, execution context, execution_id, ipc_dir, timeout) for worker subprocess launch; execution_id belongs to the spec, not to JobContext.
 _Avoid_: SpawnArgs, ProcessPayload
 
 **JobContext**:

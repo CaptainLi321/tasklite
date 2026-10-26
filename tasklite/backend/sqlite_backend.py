@@ -42,8 +42,11 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "meta": ("k", "v"),
 }
 
-# attempts 查询列（SELECT 列序 → AttemptRecord.from_dict 键序）
-_ATTEMPT_COLUMNS: tuple[str, ...] = _TABLE_COLUMNS["attempts"][1:]
+# 模型键序与 schema3 SQL 列序显式分离，执行身份仍落入 incarnation 列。
+_ATTEMPT_MODEL_KEYS: tuple[str, ...] = (
+    "job_uid", "activation_no", "attempt_no", "execution_id", "run_id",
+    "started_at", "finished_at", "outcome", "error",
+)
 
 
 class SQLiteStateBackend(AbstractStateBackend):
@@ -701,7 +704,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                     'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     (
                         record.job_uid, record.activation_no, record.attempt_no,
-                        record.incarnation, record.run_id, record.started_at,
+                        record.execution_id, record.run_id, record.started_at,
                         record.finished_at, record.outcome, record.error,
                     ),
                 )
@@ -766,7 +769,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                     (job_uid,),
                 ).fetchall()
                 return [
-                    AttemptRecord.from_dict(dict(zip(_ATTEMPT_COLUMNS, row)))
+                    AttemptRecord.from_dict(dict(zip(_ATTEMPT_MODEL_KEYS, row)))
                     for row in rows
                 ]
         except (sqlite3.Error, OSError) as e:

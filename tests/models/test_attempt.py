@@ -15,7 +15,7 @@ def _running_record(**overrides) -> AttemptRecord:
         "job_uid": "encode::vid_001",
         "activation_no": 1,
         "attempt_no": 1,
-        "incarnation": "run_ab12cd34.7",
+        "execution_id": "run_ab12cd34.7",
         "run_id": "run_ab12cd34",
         "started_at": "2026-05-01T00:00:00+00:00",
         "outcome": "running",
@@ -25,7 +25,7 @@ def _running_record(**overrides) -> AttemptRecord:
 
 
 def _persisted_dict(rec: AttemptRecord) -> dict:
-    """导出持久化字典（attempts 表列名，与 dataclass 字段一一对应）。"""
+    """导出模型字典，SQL 列映射由后端负责。"""
     return asdict(rec)
 
 
@@ -42,7 +42,7 @@ class TestAttemptRecordCreation:
         assert rec.job_uid == "encode::vid_001"
         assert rec.activation_no == 1
         assert rec.attempt_no == 1
-        assert rec.incarnation == "run_ab12cd34.7"
+        assert rec.execution_id == "run_ab12cd34.7"
         assert rec.run_id == "run_ab12cd34"
         assert rec.outcome == "running"
         assert rec.finished_at is None
@@ -93,7 +93,7 @@ class TestAttemptRecordValidation:
                 _running_record(**{field: 0})
 
     def test_identity_strings_matrix(self):
-        for field in ("incarnation", "run_id", "started_at"):
+        for field in ("execution_id", "run_id", "started_at"):
             with pytest.raises(TypeError, match=f"{field} must be a str"):
                 _running_record(**{field: 42})
             with pytest.raises(ValueError, match=f"{field} must be a non-empty str"):
@@ -114,7 +114,7 @@ class TestAttemptRecordValidation:
 
 
 class TestAttemptRecordSerialization:
-    """from_dict 重建往返与缺键语义（持久化列名 = dataclass 字段名）。"""
+    """from_dict 重建往返与缺键语义（模型字段字典）。"""
 
     def test_roundtrip_running(self):
         rec = _running_record()
@@ -133,7 +133,7 @@ class TestAttemptRecordSerialization:
     def test_persisted_key_set(self):
         keys = set(_persisted_dict(_running_record()))
         assert keys == {
-            "job_uid", "activation_no", "attempt_no", "incarnation",
+            "job_uid", "activation_no", "attempt_no", "execution_id",
             "run_id", "started_at", "outcome", "finished_at", "error",
         }
 
@@ -148,7 +148,7 @@ class TestAttemptRecordSerialization:
     def test_from_dict_missing_required_key_raises(self):
         data = _persisted_dict(_running_record())
         for required in ("job_uid", "activation_no", "attempt_no",
-                         "incarnation", "run_id", "started_at", "outcome"):
+                         "execution_id", "run_id", "started_at", "outcome"):
             broken = dict(data)
             broken.pop(required)
             with pytest.raises(KeyError):

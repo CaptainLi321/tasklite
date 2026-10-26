@@ -334,7 +334,7 @@ class AbstractStateBackend(ABC):
 
         协议：仅在派发点调用，record 必须是 outcome="running"、无收尾
         时刻/错误的派发即插行（``validate_attempt_dispatch`` 门卫），随行
-        落盘 started_at / incarnation / run_id。attempts 不参与 wall/failed
+        落盘 started_at / execution_id / run_id。attempts 不参与 wall/failed
         的互斥与 REPLACE 语义，本方法不触碰 queue/wall/failed/cursors；
         持久化失败抛异常（fail-loud，不吞）。
         """

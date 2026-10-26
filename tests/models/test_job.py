@@ -14,7 +14,7 @@ from tasklite.models.job import (
     RERUN_VALUES,
     inject_worker_resource,
 )
-from tasklite.utils.encoding import safe_uid_filename
+from tasklite.utils.encoding import encode_job_uid_filename
 
 
 class TestJobCreation:
@@ -128,15 +128,15 @@ class TestJobIdentityValidation:
         """uid 派生 IPC 文件名（锁/结果）超上限 → ENAMETOOLONG → 派发
         livelock（永远重入队且不进失败档案），入口按转义后字节数拒绝。"""
         long_id = "x" * 400
-        assert len(safe_uid_filename(f"t::{long_id}")) > 199
+        assert len(encode_job_uid_filename(f"t::{long_id}")) > 199
         with pytest.raises(ValueError, match="too long"):
             Job("t", long_id)
 
     def test_uid_filename_boundary_accepted(self):
         """转义后 ≤199 字节的 uid 仍可构造（边界不误杀）。"""
-        # 干净 job_id：safe_uid_filename 只把 :: 转义为 %3A%3A（+4 字节）
+        # 干净 job_id：encode_job_uid_filename 只把 :: 转义为 %3A%3A（+4 字节）
         ok_id = "k" * 190
-        assert len(safe_uid_filename(f"t::{ok_id}")) <= 199
+        assert len(encode_job_uid_filename(f"t::{ok_id}")) <= 199
         Job("t", ok_id)  # 不抛
 
 

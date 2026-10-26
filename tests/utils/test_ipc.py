@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from tasklite.utils.encoding import safe_uid_filename
+from tasklite.utils.encoding import encode_job_uid_filename
 from tasklite.utils.ipc import (
     ArtifactCleanupMode,
     ArtifactJournal,
@@ -288,9 +288,9 @@ class TestArtifactJournalResidueSweep:
         assert journal.drain_all_signals() == []
 
     def test_drain_all_signals_skips_names_outside_injective_image(self, tmp_path):
-        """文件名还原不出合法 uid（safe_uid_filename 像集外）时不触碰。
+        """文件名还原不出合法 uid（encode_job_uid_filename 像集外）时不触碰。
 
-        裸冒号不可能由 safe_uid_filename 产生（必被转义），该形态不在
+        裸冒号不可能由 encode_job_uid_filename 产生（必被转义），该形态不在
         协议域内，清扫不得误删。
         """
         journal = ArtifactJournal(tmp_path)
@@ -306,7 +306,7 @@ class TestResultWriteAndRead:
         """结果原子写 → 可读回（无部分消息问题）。"""
         journal = ArtifactJournal(tmp_path)
         journal.write_result_atomic(
-            "t::j1", {"status": "success", "x": 1}, incarnation=_INCARNATION_FIRST
+            "t::j1", {"status": "success", "x": 1}, execution_id=_INCARNATION_FIRST
         )
         assert journal.result_path("t::j1", _INCARNATION_FIRST).exists()
         data = journal.read_result(journal.result_path("t::j1", _INCARNATION_FIRST))
@@ -316,7 +316,7 @@ class TestResultWriteAndRead:
         """原子写后 .tmp 文件被 rename 掉，不留残留。"""
         journal = ArtifactJournal(tmp_path)
         journal.write_result_atomic(
-            "t::j1", {"status": "success"}, incarnation=_INCARNATION_FIRST
+            "t::j1", {"status": "success"}, execution_id=_INCARNATION_FIRST
         )
         assert not journal.result_tmp_path("t::j1", _INCARNATION_FIRST).exists()
 
@@ -340,7 +340,7 @@ class TestResultWriteAndRead:
             journal.write_result_atomic(
                 "t::j1",
                 {"status": "success", "raw_result": {"v": float("nan")}},
-                incarnation=_INCARNATION_FIRST,
+                execution_id=_INCARNATION_FIRST,
             )
         # 原子写失败 → 无残留文件（tmp 被清理）
         assert not journal.result_path("t::j1", _INCARNATION_FIRST).exists()
@@ -349,7 +349,7 @@ class TestResultWriteAndRead:
         """cleanup 删除结果 + 信号 + 临时文件。"""
         journal = ArtifactJournal(tmp_path)
         journal.write_result_atomic(
-            "t::j1", {"status": "success"}, incarnation=_INCARNATION_FIRST
+            "t::j1", {"status": "success"}, execution_id=_INCARNATION_FIRST
         )
         journal.record_signal("t::j1", "api", 1.0)
         journal.cleanup_ipc_files("t::j1")
@@ -364,21 +364,21 @@ class TestResultWriteDegradation:
         real_write = ArtifactJournal.write_result_atomic
         calls: list[dict] = []
 
-        def flaky_write(journal_self, uid, result_dict, incarnation=None):
+        def flaky_write(journal_self, uid, result_dict, execution_id=None):
             calls.append(result_dict)
             # 完整 payload 模拟磁盘满（大文件写不下）；降级 payload 写成功
             if "raw_result" in result_dict:
                 raise OSError(28, "No space left on device")
-            return real_write(journal_self, uid, result_dict, incarnation=incarnation)
+            return real_write(journal_self, uid, result_dict, execution_id=execution_id)
 
         monkeypatch.setattr(ArtifactJournal, "write_result_atomic", flaky_write)
         journal = ArtifactJournal(tmp_path)
 
         journal.write_result_with_degradation(
-            "h::a", {"status": "success", "raw_result": True}, incarnation=_INCARNATION_FIRST
+            "h::a", {"status": "success", "raw_result": True}, execution_id=_INCARNATION_FIRST
         )
 
-        res = journal.read_result("h::a", incarnation=_INCARNATION_FIRST)
+        res = journal.read_result("h::a", execution_id=_INCARNATION_FIRST)
         assert res is not None, "降级写必须成功落盘（小 payload 可写）"
         assert res["status"] == "retry", (
             f"success 降级必须改写 retry（重跑而非丢失）: {res}"
@@ -393,11 +393,11 @@ class TestResultWriteDegradation:
         real_write = ArtifactJournal.write_result_atomic
         token = "b" * 64
 
-        def flaky_write(journal_self, uid, result_dict, incarnation=None):
+        def flaky_write(journal_self, uid, result_dict, execution_id=None):
             # 以降级标记区分：降级 payload（error 带 DEGRADED 标记）放行
             if "IPC_RESULT_WRITE_DEGRADED" not in str(result_dict.get("error", "")):
                 raise OSError(28, "No space left on device")
-            return real_write(journal_self, uid, result_dict, incarnation=incarnation)
+            return real_write(journal_self, uid, result_dict, execution_id=execution_id)
 
         monkeypatch.setattr(ArtifactJournal, "write_result_atomic", flaky_write)
         journal = ArtifactJournal(tmp_path)
@@ -405,10 +405,10 @@ class TestResultWriteDegradation:
         journal.write_result_with_degradation(
             "h::a",
             {"status": "retry", "transient_kind": "lock_conflict", "auth": token},
-            incarnation=_INCARNATION_FIRST,
+            execution_id=_INCARNATION_FIRST,
         )
 
-        res = journal.read_result("h::a", incarnation=_INCARNATION_FIRST)
+        res = journal.read_result("h::a", execution_id=_INCARNATION_FIRST)
         assert res is not None
         assert res["status"] == "retry"
         assert res.get("transient_kind") == "lock_conflict", (
@@ -419,14 +419,14 @@ class TestResultWriteDegradation:
     def test_all_writes_fail_silently_gives_up(self, tmp_path, monkeypatch):
         """完整写 + 降级写全部失败 → 不抛 OSError、无结果文件。"""
 
-        def refusing_write(journal_self, uid, result_dict, incarnation=None):
+        def refusing_write(journal_self, uid, result_dict, execution_id=None):
             raise OSError(28, "No space left on device")
 
         monkeypatch.setattr(ArtifactJournal, "write_result_atomic", refusing_write)
         journal = ArtifactJournal(tmp_path)
 
         journal.write_result_with_degradation(
-            "h::a", {"status": "success", "raw_result": True}, incarnation=_INCARNATION_FIRST
+            "h::a", {"status": "success", "raw_result": True}, execution_id=_INCARNATION_FIRST
         )
         assert not journal.result_path("h::a", _INCARNATION_FIRST).exists()
 
@@ -434,8 +434,8 @@ class TestResultWriteDegradation:
 class TestStaleResultClaim:
     """残留结果认领：freshness 决胜、.tmp 忽略、坏形状丢弃、兄弟 uid 锚定。"""
 
-    def test_claim_prefers_latest_incarnation_same_instant(self, tmp_path):
-        """同刻多执行代残留按 (mtime_ns, incarnation_seq) 决胜。
+    def test_claim_prefers_latest_execution_id_same_instant(self, tmp_path):
+        """同刻多执行代残留按 (mtime_ns, execution_id_seq) 决胜。
 
         秒级 mtime 键在同秒内排序不稳定，可能消费较旧执行代的结果。
         把所有文件的 mtime 钉到同一纳秒，只有 seq 能区分。
@@ -445,12 +445,12 @@ class TestStaleResultClaim:
         journal.write_result_atomic(
             "t::x",
             {"status": "success", "raw_result": encode_raw_result((True, {"v": 1}))},
-            incarnation=f"{run_id}.1",
+            execution_id=f"{run_id}.1",
         )
         journal.write_result_atomic(
             "t::x",
             {"status": "success", "raw_result": encode_raw_result((True, {"v": 2}))},
-            incarnation=f"{run_id}.2",
+            execution_id=f"{run_id}.2",
         )
         for p in tmp_path.glob("*.result.json"):
             os.utime(p, ns=(1234567890, 1234567890))
@@ -464,7 +464,7 @@ class TestStaleResultClaim:
     def test_claim_ignores_tmp_leftover(self, tmp_path):
         """认领必须忽略 .tmp 残留（孤儿 worker 正在写，读半成品无意义且危险）。"""
         journal = ArtifactJournal(tmp_path)
-        base = safe_uid_filename("h::a")
+        base = encode_job_uid_filename("h::a")
         tmp_file = tmp_path / f"{base}.result.json.tmp"
         tmp_file.write_text('{"status": "suc')  # 部分 JSON
 
@@ -475,22 +475,22 @@ class TestStaleResultClaim:
         """无 status 键 / 非 dict 的残留 → 丢弃返回 None（宁可重跑）。"""
         journal = ArtifactJournal(tmp_path)
         journal.write_result_atomic(
-            "h::a", {"not": "a result"}, incarnation=_INCARNATION_FIRST
+            "h::a", {"not": "a result"}, execution_id=_INCARNATION_FIRST
         )
         assert journal.claim_stale_result_payload("h::a") is None
         assert not journal.result_path("h::a", _INCARNATION_FIRST).exists(), (
             "丢弃的残留文件必须被清理（防重启后重复判定）"
         )
 
-    def test_claim_consumes_and_cleans_all_incarnations(self, tmp_path):
+    def test_claim_consumes_and_cleans_all_execution_ids(self, tmp_path):
         """认领消费最新残留后，其余执行代残留一并清理。"""
         run_id = "c" * 32
         journal = ArtifactJournal(tmp_path)
         journal.write_result_atomic(
-            "h::a", {"status": "retry", "error": "old"}, incarnation=f"{run_id}.1"
+            "h::a", {"status": "retry", "error": "old"}, execution_id=f"{run_id}.1"
         )
         journal.write_result_atomic(
-            "h::a", {"status": "retry", "error": "new"}, incarnation=f"{run_id}.2"
+            "h::a", {"status": "retry", "error": "new"}, execution_id=f"{run_id}.2"
         )
 
         payload = journal.claim_stale_result_payload("h::a")
@@ -503,7 +503,7 @@ class TestStaleResultClaim:
         journal.write_result_atomic(
             "h::page.1",
             {"status": "success", "raw_result": True},
-            incarnation=_INCARNATION_FIRST,
+            execution_id=_INCARNATION_FIRST,
         )
         assert journal.iter_stale_result_paths("h::page") == [], (
             "点后缀兄弟 uid 的结果文件不得被误判为本 uid 的残留"
@@ -514,32 +514,32 @@ class TestStaleResultClaim:
         journal.write_result_atomic(
             "h::a.b.c",
             {"status": "success", "raw_result": True},
-            incarnation="deadbeefdeadbeefdeadbeefdeadbeef.7",
+            execution_id="deadbeefdeadbeefdeadbeefdeadbeef.7",
         )
         assert journal.iter_stale_result_paths("h::a") == []
 
-    def test_same_uid_incarnation_still_matched(self, tmp_path):
-        """本 uid 自己的 incarnation 残留仍须被枚举（锚定修复不误伤正常路径）。"""
+    def test_same_uid_execution_id_still_matched(self, tmp_path):
+        """本 uid 自己的 execution_id 残留仍须被枚举（锚定修复不误伤正常路径）。"""
         journal = ArtifactJournal(tmp_path)
         journal.write_result_atomic(
             "h::a",
             {"status": "success", "raw_result": True},
-            incarnation="deadbeefdeadbeefdeadbeefdeadbeef.3",
+            execution_id="deadbeefdeadbeefdeadbeefdeadbeef.3",
         )
         found = journal.iter_stale_result_paths("h::a")
         assert len(found) == 1, f"本 uid 残留应被枚举: {found}"
 
     def test_cleanup_does_not_delete_sibling_result(self, tmp_path):
         """cleanup_ipc_files 不得删除点后缀兄弟 uid 的结果文件（全链路）。"""
-        incarnation = "deadbeefdeadbeefdeadbeefdeadbeef.5"
+        execution_id = "deadbeefdeadbeefdeadbeefdeadbeef.5"
         journal = ArtifactJournal(tmp_path)
         journal.write_result_atomic(
             "h::page.1",
             {"status": "success", "raw_result": True},
-            incarnation=incarnation,
+            execution_id=execution_id,
         )
-        journal.cleanup_ipc_files("h::page", incarnation)
-        assert journal.result_path("h::page.1", incarnation).exists(), (
+        journal.cleanup_ipc_files("h::page", execution_id)
+        assert journal.result_path("h::page.1", execution_id).exists(), (
             "cleanup 不得删除兄弟 uid 的结果文件"
         )
 

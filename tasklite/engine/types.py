@@ -82,18 +82,18 @@ class JobHandle:
     """一个在途子进程的句柄（在飞追踪与收割看门狗共用的值对象）。
 
     ``deadline``（monotonic 时刻）与 ``timeout`` 驱动看门狗超时判定；
-    ``incarnation``（``run_id.dispatch_seq``）是本次执行体的身份串，
+    ``execution_id``（``run_id.dispatch_no``）是本次执行体的身份串，
     结果认证与锁归属都锚定它。进程对象本身以 ``Any`` 承载——进程 seam
     的具体形态由执行通道装配，本值对象不绑定。
     """
 
-    uid: str
+    job_uid: str
     process: Any
     deadline: float
     timeout: float
     job: Job
     ipc_dir: str
-    incarnation: str | None = None
+    execution_id: str | None = None
 
 
 @dataclass(frozen=True)

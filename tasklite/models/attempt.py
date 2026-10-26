@@ -5,8 +5,8 @@ Attempt = 一次物理执行的轨迹行：派发即插行（outcome=running）�
 （wall/failed）→ task_type → 进程内 Task 注册规格。
 
 旁路观测面定位：attempts 不参与六集合互斥——wall/failed 仍按 uid 唯一
-终态，「最终状态唯一」与「历史可追溯」由此解耦；``incarnation``
-（``run_id.dispatch_seq``）随 attempt 落表，不再只存在于 IPC 文件名。
+终态，「最终状态唯一」与「历史可追溯」由此解耦；``execution_id``
+（``run_id.dispatch_no``）随 attempt 落表，不再只存在于 IPC 文件名。
 """
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ class AttemptRecord:
         job_uid: 归属 job 的 uid（``task_type::job_id``）。
         activation_no: 激活代（job 从 wall/failed 拦截点放行重跑时 +1）。
         attempt_no: 本次激活内尝试序号（1 起始含首次执行）。
-        incarnation: 执行代标识 ``run_id.dispatch_seq``（fencing 依据）。
+        execution_id: 执行代标识 ``run_id.dispatch_no``（fencing 依据）。
         run_id: 归属 run 的标识。
         started_at: 派发时刻（UTC ISO）。
         finished_at: 收尾时刻（UTC ISO）；None 表示仍在执行。
@@ -93,7 +93,7 @@ class AttemptRecord:
     job_uid: str
     activation_no: int
     attempt_no: int
-    incarnation: str
+    execution_id: str
     run_id: str
     started_at: str
     outcome: str
@@ -104,7 +104,7 @@ class AttemptRecord:
         _validate_non_empty_str("job_uid", self.job_uid)
         _validate_counter("activation_no", self.activation_no)
         _validate_counter("attempt_no", self.attempt_no)
-        _validate_non_empty_str("incarnation", self.incarnation)
+        _validate_non_empty_str("execution_id", self.execution_id)
         _validate_non_empty_str("run_id", self.run_id)
         _validate_non_empty_str("started_at", self.started_at)
         _validate_outcome(self.outcome)
@@ -118,7 +118,7 @@ class AttemptRecord:
             job_uid=data["job_uid"],
             activation_no=data["activation_no"],
             attempt_no=data["attempt_no"],
-            incarnation=data["incarnation"],
+            execution_id=data["execution_id"],
             run_id=data["run_id"],
             started_at=data["started_at"],
             outcome=data["outcome"],

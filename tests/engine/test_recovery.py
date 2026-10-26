@@ -762,14 +762,14 @@ class TestRestoreStaleResult:
                 "resource_suspensions": [],
                 "cursor_updates": {},
             },
-            incarnation=_INCARNATION,
+            execution_id=_INCARNATION,
         )
 
         assert orchestrator.restore_stale_result(job.uid, job, job.to_dict()) is True
         assert len(completion.completed_jobs) == 1
         entry, result = completion.completed_jobs[0]
         assert entry.is_pseudo, "残留消费必须走安全伪 entry（无资源、无进程）"
-        assert entry.uid == job.uid
+        assert entry.job_uid == job.uid
         assert result.success is True
 
     def test_forged_residue_rejected_by_token(self, tmp_path):
@@ -787,7 +787,7 @@ class TestRestoreStaleResult:
                 "resource_suspensions": [],
                 "cursor_updates": {},
             },
-            incarnation=_INCARNATION,
+            execution_id=_INCARNATION,
         )
 
         assert orchestrator.restore_stale_result(job.uid, job, job.to_dict()) is False
@@ -802,7 +802,7 @@ class TestRestoreStaleResult:
         job = Job("t", "threshold")
         ArtifactJournal(tmp_path).write_result_atomic(
             job.uid, {"status": "fatal", "error": "boom", "traceback": "tb"},
-            incarnation=_INCARNATION,
+            execution_id=_INCARNATION,
         )
 
         assert orchestrator.restore_stale_result(job.uid, job, job.to_dict()) is True
@@ -833,13 +833,13 @@ class _DoneProcess:
 class _FinishOnKillProcess:
     """kill() 时写最终结果 + suspend 信号的进程桩（TOCTOU 窗口复现）。"""
 
-    def __init__(self, channel, uid, incarnation):
+    def __init__(self, channel, uid, execution_id):
         self._alive = True
         self.exitcode = 0
         self.killed = False
         self._channel = channel
         self._uid = uid
-        self._incarnation = incarnation
+        self._execution_id = execution_id
 
     def is_alive(self):
         return self._alive
@@ -853,7 +853,7 @@ class _FinishOnKillProcess:
         self._channel.journal.write_result_atomic(
             self._uid,
             {"status": "success", "raw_result": {"done": 1}},
-            incarnation=self._incarnation,
+            execution_id=self._execution_id,
         )
         self._channel.journal.record_signal(self._uid, "api", 5.0)
 
@@ -890,13 +890,13 @@ class TestAbortInFlight:
                 "status": "success", "raw_result": True,
                 "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
             },
-            incarnation=_INCARNATION,
+            execution_id=_INCARNATION,
         )
         process = _DoneProcess()
         handle = JobHandle(
-            uid=job.uid, process=process,
+            job_uid=job.uid, process=process,
             deadline=time.monotonic() + 60, timeout=60.0, job=job,
-            ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            ipc_dir=str(tmp_path), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
         tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], handle, None))
@@ -905,7 +905,7 @@ class TestAbortInFlight:
 
         assert process.killed is False, "已完成 entry 不得被 kill"
         cancelled, done = completion.settled[0]
-        assert [e.uid for e, _ in done] == [job.uid], "已完成结果必须交完成机器提交"
+        assert [e.job_uid for e, _ in done] == [job.uid], "已完成结果必须交完成机器提交"
         assert cancelled == []
         assert out_file.exists(), "成功产出的物理输出必须保留"
 
@@ -915,9 +915,9 @@ class TestAbortInFlight:
         job = Job("fast", "toctou")
         process = _FinishOnKillProcess(channel, job.uid, _INCARNATION)
         handle = JobHandle(
-            uid=job.uid, process=process,
+            job_uid=job.uid, process=process,
             deadline=time.monotonic() + 60, timeout=60.0, job=job,
-            ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            ipc_dir=str(tmp_path), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
         tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], handle, None))
@@ -925,7 +925,7 @@ class TestAbortInFlight:
         orchestrator.abort_in_flight()
 
         cancelled, done = completion.settled[0]
-        assert [e.uid for e, _ in done] == [job.uid], (
+        assert [e.job_uid for e, _ in done] == [job.uid], (
             "kill 窗口内落盘的结果必须被重探测消费（不删结果、不取消）"
         )
         assert cancelled == []
@@ -940,9 +940,9 @@ class TestAbortInFlight:
         channel.journal.record_signal(job.uid, "api", 60.0)
         process = _DoneProcess()
         handle = JobHandle(
-            uid=job.uid, process=process,
+            job_uid=job.uid, process=process,
             deadline=time.monotonic() + 60, timeout=60.0, job=job,
-            ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            ipc_dir=str(tmp_path), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
         tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], handle, None))
@@ -989,9 +989,9 @@ class TestAbortInFlight:
         capacity.acquire(1.0)
         process = _DoneProcess()
         handle = JobHandle(
-            uid=job.uid, process=process,
+            job_uid=job.uid, process=process,
             deadline=time.monotonic() + 60, timeout=60.0, job=job,
-            ipc_dir=str(tmp_path), incarnation=_INCARNATION,
+            ipc_dir=str(tmp_path), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
         tracker.track(InFlightJob(

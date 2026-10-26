@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..utils.encoding import safe_uid_filename
+from ..utils.encoding import encode_job_uid_filename
 from .task import (
     validate_resource_amounts,
     validate_retry_budget,
@@ -32,7 +32,7 @@ from .task import (
 # uid 派生的 IPC 文件名（锁 / result / signals / outputs）
 # 无截断——job_id/task_type 超长时文件名超 255 字节（EXT4 单文件名字节
 # 上限）→ os.open ENAMETOOLONG → 派发侧异常未分类 → 重入队 + 崩溃重启
-# → livelock（job 永远无法执行且不进失败档案）。入口按 safe_uid_filename
+# → livelock（job 永远无法执行且不进失败档案）。入口按 encode_job_uid_filename
 # 实际字节数（含转义膨胀）拒绝，fail-fast。
 # 255 - 56 = 199：56 为最坏结果文件后缀 ``.{32-hex run_id}.{seq}.result.json``。
 _MAX_SAFE_UID_BYTES = 199
@@ -169,7 +169,7 @@ def _validate_job_id(job_id: Any) -> None:
 
 def _validate_uid_ipc_filename(task_type: str, job_id: str) -> None:
     """uid 派生 IPC 文件名超 255 字节 → ENAMETOOLONG livelock，入口拒绝。"""
-    if len(safe_uid_filename(f"{task_type}::{job_id}").encode("utf-8")) > _MAX_SAFE_UID_BYTES:
+    if len(encode_job_uid_filename(f"{task_type}::{job_id}").encode("utf-8")) > _MAX_SAFE_UID_BYTES:
         raise ValueError(
             f"task_type+job_id too long: uid-derived IPC filename would exceed "
             f"filesystem name limit ({_MAX_SAFE_UID_BYTES} bytes max); got "

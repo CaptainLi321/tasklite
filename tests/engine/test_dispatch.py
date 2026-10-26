@@ -3,7 +3,7 @@
 覆盖：DispatchOutcome 单一 kind 枚举判据、五关时序契约（dedup →
 dep-failed → no-handler → orphan-probe → stale-restore）、rerun 放行的
 激活推进（activation_no+1 / attempt_no 重置）、派发即插 attempts 轨迹行
-与 incarnation 生成、瞬态信号（lock_conflict / rate_limited）零预算降级
+与 execution_id 生成、瞬态信号（lock_conflict / rate_limited）零预算降级
 回队、派发失败 3-strike 收敛。
 """
 
@@ -45,16 +45,16 @@ from tasklite.models.task import Task, TaskRegistry
 
 
 class StubSession:
-    """运行会话结构契约桩：run_id / dispatch_seq / result_token。"""
+    """运行会话结构契约桩：run_id / dispatch_no / result_token。"""
 
     def __init__(self, run_id: str = "a" * 32) -> None:
         self.run_id = run_id
         self.result_token = "t" * 64
-        self._dispatch_seq = 0
+        self._dispatch_no = 0
 
-    def next_dispatch_seq(self) -> int:
-        self._dispatch_seq += 1
-        return self._dispatch_seq
+    def next_dispatch_no(self) -> int:
+        self._dispatch_no += 1
+        return self._dispatch_no
 
 
 class RecordingCompletion:
@@ -64,7 +64,7 @@ class RecordingCompletion:
         self.calls: list[tuple[str, Any]] = []
 
     def complete_job(self, entry, result) -> None:
-        self.calls.append((entry.uid, result))
+        self.calls.append((entry.job_uid, result))
 
     def settle_aborted(self, cancelled, done) -> None:
         pass
@@ -134,17 +134,17 @@ class DispatchEnv:
             payload_schema=payload_schema,
         ))
 
-    def spawn_handle(self, uid: str, incarnation: str):
+    def spawn_handle(self, uid: str, execution_id: str):
         from tasklite.engine.types import JobHandle
 
         return JobHandle(
-            uid=uid,
+            job_uid=uid,
             process=FakeProcess(),
             deadline=1e18,
             timeout=60.0,
             job=Job(*uid.split("::", 1)),
             ipc_dir=self.ipc_dir,
-            incarnation=incarnation,
+            execution_id=execution_id,
         )
 
 
@@ -176,7 +176,7 @@ class TestDispatchOutcomeKind:
             env.channel,
             "spawn",
             lambda spec: spawned_specs.append(spec) or env.spawn_handle(
-                spec.job.uid, spec.incarnation
+                spec.job.uid, spec.execution_id
             ),
         )
 
@@ -184,20 +184,20 @@ class TestDispatchOutcomeKind:
         assert outcome.kind is DispatchKind.SPAWNED
         entry = outcome.entry
         assert entry is not None
-        assert entry.uid == "t::j1"
+        assert entry.job_uid == "t::j1"
         assert entry.attempt_id is not None
         assert "t::j1" in env.in_flight
         assert "t::j1" in env.store.state.in_flight_uids
 
-        # 派发即插 running 轨迹行 + incarnation 生成于派发点
+        # 派发即插 running 轨迹行 + execution_id 生成于派发点
         records = env.backend.load_attempts("t::j1")
         assert len(records) == 1
         assert records[0].outcome == "running"
-        assert records[0].incarnation == f"{env.session.run_id}.1"
+        assert records[0].execution_id == f"{env.session.run_id}.1"
         assert records[0].run_id == env.session.run_id
         assert records[0].activation_no == 1
         assert records[0].attempt_no == 1
-        assert spawned_specs[0].incarnation == records[0].incarnation
+        assert spawned_specs[0].execution_id == records[0].execution_id
         assert spawned_specs[0].result_token == env.session.result_token
 
 
@@ -230,7 +230,7 @@ class TestDedupGate:
         env.store.state.spawn_jobs([Job("t", "j1", rerun="every_run").to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.incarnation),
+            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
         outcome = env.dispatch.dispatch_next()
@@ -258,7 +258,7 @@ class TestDedupGate:
         env.store.state.spawn_jobs([Job("t", "j1", rerun="on_failure").to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.incarnation),
+            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
         outcome = env.dispatch.dispatch_next()
@@ -334,7 +334,7 @@ class TestRejectGates:
         env.store.state.spawn_jobs([Job("t", "j1", payload={"name": "x"}).to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.incarnation),
+            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
         )
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.SPAWNED
@@ -414,7 +414,7 @@ class TestStaleRestoreGate:
         )
         monkeypatch.setattr(
             env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.incarnation),
+            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
         outcome = env.dispatch.dispatch_next()
@@ -434,7 +434,7 @@ class TestStaleRestoreGate:
         monkeypatch.setattr(env.channel, "claim_stale_result", lambda uid, job: None)
         monkeypatch.setattr(
             env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.incarnation),
+            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
         outcome = env.dispatch.dispatch_next()
@@ -595,7 +595,7 @@ class TestTraceAppendDegradation:
         )
         monkeypatch.setattr(
             env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.incarnation),
+            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
         outcome = env.dispatch.dispatch_next()

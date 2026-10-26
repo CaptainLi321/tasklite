@@ -418,7 +418,7 @@ class EngineRuntime:
         if self.selection_machine is not None and self.selection_machine.has_skip_rules:
             self.selection_machine.apply_skips(
                 run_id=self._session.run_id,
-                seq_supplier=self._session.next_dispatch_seq,
+                seq_supplier=self._session.next_dispatch_no,
             )
 
     def _drain_and_settle(self) -> int:
@@ -540,7 +540,7 @@ class EngineRuntime:
         self._session.run_id = uuid.uuid4().hex
         self._session.result_token = secrets.token_hex(32)
         self.channel.result_token = self._session.result_token
-        self._session.dispatch_seq = 0
+        self._session.dispatch_no = 0
         try:
             self.backend.set_meta("last_run_id", self._session.run_id)
         except Exception as e:

@@ -63,7 +63,7 @@ def _running_record(**overrides) -> AttemptRecord:
         "job_uid": "encode::vid_001",
         "activation_no": 1,
         "attempt_no": 1,
-        "incarnation": "run_ab12cd34.7",
+        "execution_id": "run_ab12cd34.7",
         "run_id": "run_ab12cd34",
         "started_at": "2026-05-01T00:00:00+00:00",
         "outcome": "running",

@@ -139,7 +139,7 @@ class TaskLite:
         self._discovery_rerun: dict[str, str] = {}
         self.classifier = self._build_classifier(fatal_exceptions, transient_exceptions)
         self.resources = self._build_resources(self.tasks, max_workers)
-        self.ipc_dir, self._mp_ctx = self._prepare_ipc_dir()
+        self.ipc_dir, self._process_context = self._prepare_ipc_dir()
         self.strict_picklable = strict_picklable
         self.runtime_config = self._build_run_config(
             backend_instance,
@@ -311,7 +311,7 @@ class TaskLite:
         )
         channel = ExecutionChannel(
             self.ipc_dir,
-            mp_ctx=self._mp_ctx,
+            process_context=self._process_context,
             output_roots=self.output_root,
         )
         return RunConfig.resolve(

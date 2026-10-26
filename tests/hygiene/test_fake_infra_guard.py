@@ -4,15 +4,15 @@ fake 测试体系由三层耦合构成，任一层被生产侧或测试侧重构
 让全部 fake 测试失效或假绿。本文件用 AST 断言契约点仍然存在：
 
 1. tests/conftest.py 的 autouse fixture 把 ``mp.get_context`` 重定向为返回
-   全局 ``mp`` 模块——executor 持有的 ``self._mp_ctx``（get_context 返回值）
+   全局 ``mp`` 模块——executor 持有的 ``self._process_context``（get_context 返回值）
    才会解析到被 monkeypatch 的全局 ``mp.Process``；
 2. tests/helpers.py 的 ``patch_multiprocessing_for_fakes`` 必须同时 patch
    全局 ``multiprocessing.Process`` 与 ``tasklite.pipeline.mp.Process``
    双路径（Manager 同理）——漏任一路径即真实子进程逃逸 fake 替换；
-3. helpers 的 ``_spec_incarnation`` 按 FakeProcess args 元组布局
-   ``(WorkerLaunchSpec,)`` 从 ``args[0]`` 取 spec.incarnation，
+3. helpers 的 ``_spec_execution_id`` 按 FakeProcess args 元组布局
+   ``(WorkerLaunchSpec,)`` 从 ``args[0]`` 取 spec.execution_id，
    FakeProcess ``start()`` 从 ``args[0]`` 取 spec.job/spec.ipc_dir/
-   spec.incarnation 写 fake 结果——进程 seam 契约字段增删会静默错位。
+   spec.execution_id 写 fake 结果——进程 seam 契约字段增删会静默错位。
 """
 
 import ast
@@ -115,7 +115,7 @@ def test_conftest_autouse_fixture_redirects_get_context_to_global_mp():
     assert redirects, (
         "autouse fixture 必须含 monkeypatch.setattr(mp, 'get_context', "
         "lambda method: mp)——get_context 若返回真实 spawn context，"
-        "executor 的 self._mp_ctx.Process 将绕过全局 mp.Process patch，"
+        "executor 的 self._process_context.Process 将绕过全局 mp.Process patch，"
         "fake 测试全部静默失效"
     )
 
@@ -161,17 +161,17 @@ def test_helpers_patch_covers_global_and_pipeline_mp_paths():
         )
 
 
-def test_spec_incarnation_parses_fake_args_layout():
-    """契约 3：_spec_incarnation 按 (WorkerLaunchSpec,) 布局取 args[0].incarnation。"""
+def test_spec_execution_id_parses_fake_args_layout():
+    """契约 3：_spec_execution_id 按 (WorkerLaunchSpec,) 布局取 args[0].execution_id。"""
     tree = _parse(HELPERS)
-    funcs = _functions(tree, "_spec_incarnation")
-    assert funcs, "helpers._spec_incarnation 必须存在（fake 进程 incarnation 提取）"
+    funcs = _functions(tree, "_spec_execution_id")
+    assert funcs, "helpers._spec_execution_id 必须存在（fake 进程 execution_id 提取）"
     inc = funcs[0]
 
     assert _accesses_arg_index(inc, 0), (
-        "_spec_incarnation 必须从 args[0] 取 spec——FakeProcess args 布局 "
+        "_spec_execution_id 必须从 args[0] 取 spec——FakeProcess args 布局 "
         "(WorkerLaunchSpec,) 的第 1 位；进程 seam 契约字段增删"
-        "会静默取错 incarnation，fencing 全部失效"
+        "会静默取错 execution_id，fencing 全部失效"
     )
 
     has_length_guard = any(
@@ -179,16 +179,16 @@ def test_spec_incarnation_parses_fake_args_layout():
         for node in ast.walk(inc)
     )
     assert has_length_guard, (
-        "_spec_incarnation 必须带空元组防御（args 为空返回 None 而非 IndexError）"
+        "_spec_execution_id 必须带空元组防御（args 为空返回 None 而非 IndexError）"
     )
 
-    reads_incarnation = any(
+    reads_execution_id = any(
         isinstance(node, ast.Attribute)
-        and node.attr == "incarnation"
+        and node.attr == "execution_id"
         for node in ast.walk(inc)
     )
-    assert reads_incarnation, (
-        "_spec_incarnation 必须读取 spec.incarnation（fencing 契约的核心字段）"
+    assert reads_execution_id, (
+        "_spec_execution_id 必须读取 spec.execution_id（fencing 契约的核心字段）"
     )
 
 
@@ -206,7 +206,7 @@ def test_fake_process_classes_read_spec_fields_from_args_layout():
             f"{factory_name} 的 FakeProcess 必须从 self.args[0] 取 spec——"
             "args 布局 (WorkerLaunchSpec,) 第 1 位"
         )
-        for field in ("job", "ipc_dir", "incarnation"):
+        for field in ("job", "ipc_dir", "execution_id"):
             reads_field = any(
                 isinstance(node, ast.Attribute) and node.attr == field
                 for node in ast.walk(factory)

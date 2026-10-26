@@ -120,7 +120,7 @@ from .utils.encoding import (
     encode_identifier,
     encode_job_component,
     percent_encode,
-    safe_uid_filename,
+    encode_job_uid_filename,
 )
 
 # ── JSON 序列化统一出口 ──────────────────────────────────────────────
@@ -209,7 +209,7 @@ __all__ = [
     "encode_identifier",
     "encode_job_component",
     "percent_encode",
-    "safe_uid_filename",
+    "encode_job_uid_filename",
     # 序列化
     "jsonutil",
 ]

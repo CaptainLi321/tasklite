@@ -39,7 +39,7 @@ def _running_attempt(job_uid: str, attempt_no: int = 1, run_id: str = "run_seed"
         job_uid=job_uid,
         activation_no=1,
         attempt_no=attempt_no,
-        incarnation=f"{run_id}.{attempt_no}",
+        execution_id=f"{run_id}.{attempt_no}",
         run_id=run_id,
         started_at="2026-05-01T00:00:00+00:00",
         outcome="running",
@@ -635,7 +635,7 @@ class TestSqliteAttemptTrajectory:
             backend.append_attempt(
                 AttemptRecord(
                     job_uid="t::one", activation_no=1, attempt_no=1,
-                    incarnation="run_seed.1", run_id="run_seed",
+                    execution_id="run_seed.1", run_id="run_seed",
                     started_at="2026-05-01T00:00:00+00:00",
                     outcome="skipped",
                 )
@@ -654,7 +654,7 @@ class TestSqliteAttemptTrajectory:
         assert rec.outcome == "failed"
         assert rec.error == "boom"
         # append-only：身份列保持插入原值，仅收尾三列被写
-        assert rec.incarnation == "run_seed.1"
+        assert rec.execution_id == "run_seed.1"
         assert rec.started_at == "2026-05-01T00:00:00+00:00"
 
         with pytest.raises(ValueError, match="already finalized"):

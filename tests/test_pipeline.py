@@ -171,7 +171,7 @@ def make_instant_process_class(retry_uid: str | None = None):
                 ArtifactJournal(spec.ipc_dir).write_result_atomic(
                     spec.job.uid,
                     result,
-                    incarnation=spec.incarnation,
+                    execution_id=spec.execution_id,
                 )
             self._alive = False
 

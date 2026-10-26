@@ -2,7 +2,7 @@
 
 覆盖六步契约的运行段全链路：spawn 子进程执行 → IPC 结果落盘 → wall
 终态（业务 meta + run_count/inputs 审计键）→ attempts 轨迹（append-only
-追溯链：activation/attempt 序号、incarnation、outcome 流转）→ 失败
+追溯链：activation/attempt 序号、execution_id、outcome 流转）→ 失败
 档案 → retry_failure 人工补跑 → run/stop 门面收尾。handler 全部模块级
 （spawn 子进程经 pickle 接收）。
 
@@ -178,7 +178,7 @@ class TestEndToEnd:
         assert rec.outcome == "succeeded"
         assert rec.attempt_no == 1
         assert rec.activation_no == 1
-        assert rec.incarnation.startswith(rec.run_id)
+        assert rec.execution_id.startswith(rec.run_id)
         assert rec.finished_at is not None
         assert rec.error is None
 
