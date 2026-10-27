@@ -76,7 +76,7 @@ class InFlightJob:
             self.acquired = []
         elif self.acquired:
             if resource_mgr is not None:
-                resource_mgr.release_all(self.acquired, uid=self.job_uid)
+                resource_mgr.release_all(self.acquired, job_uid=self.job_uid)
             self.acquired = []
 
 

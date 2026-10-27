@@ -79,7 +79,7 @@ class TaskLite:
             全部退出路径），参数为 exit_reason（completed /
             stopped_draining / stopped_aborting / interrupted / error）。
         on_attempt_finished: 每 attempt 收尾时同步调用（同一 job 跨
-            重试触发多次），签名 ``(uid, *, outcome: AttemptOutcome)``；
+            重试触发多次），签名 ``(job_uid, *, outcome: AttemptOutcome)``；
             在 stats 更新之后、下一 job 派发之前调用。布尔语义经
             AttemptOutcome 值对象承载（success 与 will_retry 正交）。
         strict_picklable: run() 前对全部已注册 Task 的 handler 做
@@ -696,16 +696,17 @@ class TaskLite:
             )
         )
 
-    def run_graceful(self) -> None:
+    def run_graceful(self) -> RunSummary | None:
         """统一 run + 优雅停机包装：捕获 KeyboardInterrupt 转 DRAINING。
 
-        库函数不改变退出码（无 sys.exit）。收到 KeyboardInterrupt 时
-        请求 stop() 转为优雅停机，等待在途任务完成并收尾。
+        库函数不改变退出码（无 sys.exit）。正常完成返回 RunSummary；
+        收到 KeyboardInterrupt 时请求 stop() 转为优雅停机并返回 None。
         """
         try:
-            self.run()
+            return self.run()
         except KeyboardInterrupt:
             logger.info("收到 KeyboardInterrupt，请求优雅停机（DRAINING）……")
+            return None
         finally:
             try:
                 self.stop()

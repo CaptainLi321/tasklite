@@ -119,7 +119,7 @@ class OpsConsole:
             meta_view = dict(meta)
             if not meta_view.get("error_category"):
                 meta_view["error_category"] = (
-                    self._classifier.classify(meta).failed_error_category
+                    self._classifier.classify(meta).error_category
                 )
             entries.append(FailureEntry(
                 job_uid=uid,

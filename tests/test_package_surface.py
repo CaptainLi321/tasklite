@@ -137,10 +137,16 @@ class TestLayeringRedLine:
 
 
 class TestMainSurfaceExports:
-    """主公开面的四个导出（__all__ 同步且可导入）。"""
+    """主公开面的核心导出（__all__ 同步且可导入）。"""
 
     _EXPORTS = frozenset(
-        {"FATAL_EXCEPTIONS", "TRANSIENT_EXCEPTIONS", "RequeuePlan", "validate_resource_amounts"}
+        {
+            "FATAL_EXCEPTIONS",
+            "TRANSIENT_EXCEPTIONS",
+            "RequeuePlan",
+            "SuspendEntry",
+            "validate_resource_amounts",
+        }
     )
 
     def test_export_names_in_all(self):
@@ -154,6 +160,7 @@ class TestMainSurfaceExports:
             FATAL_EXCEPTIONS,
             TRANSIENT_EXCEPTIONS,
             RequeuePlan,
+            SuspendEntry,
             validate_resource_amounts,
         )
 
@@ -162,6 +169,7 @@ class TestMainSurfaceExports:
             TRANSIENT_EXCEPTIONS[0], type
         )
         assert isinstance(RequeuePlan, type)
+        assert isinstance(SuspendEntry, type)
         assert callable(validate_resource_amounts)
 
 

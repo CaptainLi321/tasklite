@@ -62,14 +62,14 @@ def apply_suspend_signals(
     aborted "``），仅用于日志归因。
     """
     applied = False
-    for uid, r_name, secs in signals:
-        if resource_mgr.suspend_resource(r_name, secs):
-            logger.info(f"Applied suspend signal {origin}{uid}: {r_name} for {secs}s")
+    for job_uid, resource_name, seconds in signals:
+        if resource_mgr.suspend_resource(resource_name, seconds):
+            logger.info(f"Applied suspend signal {origin}{job_uid}: {resource_name} for {seconds}s")
             applied = True
         else:
             logger.warning(
                 f"Skipping suspend signal for unregistered resource "
-                f"{r_name!r} ({origin}{uid})"
+                f"{resource_name!r} ({origin}{job_uid})"
             )
     if applied:
         persist_resource_suspensions(backend, resource_mgr)
@@ -190,7 +190,7 @@ class RateLimitResource(Resource):
             raise ValueError(
                 f"interval_seconds must be finite and > 0, got {interval_seconds!r}"
             )
-        self.interval = interval_seconds
+        self.interval_seconds = interval_seconds
         self.next_available = time.monotonic()
 
     def can_acquire(self, amount: float) -> tuple[bool, float]:
@@ -204,7 +204,7 @@ class RateLimitResource(Resource):
             raise ValueError(f"amount must be non-negative, got {amount}")
         now = time.monotonic()
         base_time = max(now, self.next_available)
-        self.next_available = base_time + (self.interval * amount)
+        self.next_available = base_time + (self.interval_seconds * amount)
 
     def release(self, amount: float) -> None:
         """时间片消费不可撤销——no-op（基类契约允许）。"""
@@ -223,7 +223,7 @@ class RateLimitResource(Resource):
         return None
 
     def __repr__(self) -> str:
-        return f"RateLimitResource(name={self.name!r}, interval={self.interval})"
+        return f"RateLimitResource(name={self.name!r}, interval_seconds={self.interval_seconds})"
 
 
 class CapacityResource(Resource):
@@ -238,7 +238,7 @@ class CapacityResource(Resource):
         # NaN 让 can_acquire 的 ``amount > NaN`` 恒 False、``used + amount
         # <= NaN`` 恒 False → 永远返回 (False, 0.5) → 主循环无限 sleep
         # （livelock，死锁检测只认 inf 不认 NaN）；负值让 acquire 永远
-        # 抛 ValueError（amount > capacity 恒 True）→ 全灭。入口即拒。
+        # 抛 ValueError（amount > max_capacity 恒 True）→ 全灭。入口即拒。
         if not isinstance(max_capacity, (int, float)) or isinstance(max_capacity, bool):
             raise TypeError(
                 f"max_capacity must be a number, got {type(max_capacity).__name__} "
@@ -246,23 +246,23 @@ class CapacityResource(Resource):
             )
         if not math.isfinite(max_capacity) or max_capacity < 0:
             raise ValueError(f"max_capacity must be finite and >= 0, got {max_capacity!r}")
-        self.capacity = max_capacity
+        self.max_capacity = max_capacity
         self.used = 0.0
-        self.suspend_until = 0.0
+        self._suspended_until = 0.0
         # 可观测性：release 超量（双重释放/记错账）计数——保持 clamp 行为
         # 不变，用计数器提升可观测性（双重释放是资源泄漏的早期信号）。
         self.release_overruns = 0
 
     def can_acquire(self, amount: float) -> tuple[bool, float]:
-        if amount > self.capacity:
+        if amount > self.max_capacity:
             # 死锁防御：不可能满足的资源请求
             return False, float("inf")
 
         now = time.monotonic()
-        if now < self.suspend_until:
-            return False, self.suspend_until - now
+        if now < self._suspended_until:
+            return False, self._suspended_until - now
 
-        if self.used + amount <= self.capacity:
+        if self.used + amount <= self.max_capacity:
             return True, 0.0
 
         # 轮询等待其他任务释放资源
@@ -271,14 +271,14 @@ class CapacityResource(Resource):
     def acquire(self, amount: float) -> None:
         """占用 ``amount`` 单位容量。
 
-        ``amount=0`` 合法：不占容量，仅校验 ``capacity >= 0``。用于声明
+        ``amount=0`` 合法：不占容量，仅校验 ``max_capacity >= 0``。用于声明
         了资源但不消费槽位的 job。
         """
         if amount < 0:
             raise ValueError(f"amount must be non-negative, got {amount}")
-        if amount > self.capacity:
+        if amount > self.max_capacity:
             raise ValueError(
-                f"amount {amount} exceeds resource capacity {self.capacity}"
+                f"amount {amount} exceeds resource capacity {self.max_capacity}"
             )
         self.used += amount
 
@@ -300,16 +300,16 @@ class CapacityResource(Resource):
     def suspend(self, seconds: float) -> None:
         now = time.monotonic()
         seconds = self._clamp_suspend(seconds)
-        self.suspend_until = max(self.suspend_until, now + seconds)
+        self._suspended_until = max(self._suspended_until, now + seconds)
 
     def suspended_until(self) -> float | None:
         # 仅在存在有效挂起（未来截止时刻）时返回；过期或无挂起返回 None
-        return self.suspend_until if self.suspend_until > time.monotonic() else None
+        return self._suspended_until if self._suspended_until > time.monotonic() else None
 
     def __repr__(self) -> str:
         return (
             f"CapacityResource(name={self.name!r}, used={self.used}, "
-            f"capacity={self.capacity})"
+            f"max_capacity={self.max_capacity})"
         )
 
 
@@ -367,7 +367,7 @@ class ResourceLease:
         """
         if self.status == LeaseStatus.RELEASED:
             return
-        self.manager.release_all(self.acquired, uid=self.job_uid)
+        self.manager.release_all(self.acquired, job_uid=self.job_uid)
         self.status = LeaseStatus.RELEASED
 
     def cancel(self) -> None:
@@ -510,7 +510,7 @@ class ResourceManager(MutableMapping[str, Resource]):
         | Iterable[tuple[str, float]]
         | None = None,
         *,
-        uid: str | None = None,
+        job_uid: str | None = None,
     ) -> ResourceLease:
         """两阶段原子预约：立即占用 CapacityResource，预检 RateLimitResource。"""
         eff = self.effective_resources(task_type, declared_resources)
@@ -534,20 +534,20 @@ class ResourceManager(MutableMapping[str, Resource]):
                     acquired.append((res_name, amount))
             return ResourceLease(
                 manager=self,
-                job_uid=uid or "",
+                job_uid=job_uid or "",
                 acquired=acquired,
                 rate_limits=rate_limits,
                 status=LeaseStatus.RESERVED,
             )
         except BaseException:
-            self.release_all(acquired, uid=uid)
+            self.release_all(acquired, job_uid=job_uid)
             raise
 
     def release_all(
         self,
         acquired: Iterable[tuple[str, float]],
         *,
-        uid: str | None = None,
+        job_uid: str | None = None,
     ) -> None:
         """释放已获取的资源集合（异常安全）。"""
         for item in acquired:
@@ -562,7 +562,7 @@ class ResourceManager(MutableMapping[str, Resource]):
                 res.release(amount)
             except Exception as e:
                 logger.warning(
-                    f"Error releasing resource '{res_name}' for {uid or 'unknown'}: {e}"
+                    f"Error releasing resource '{res_name}' for {job_uid or 'unknown'}: {e}"
                 )
 
     def suspend_resource(self, name: str, seconds: float) -> bool:

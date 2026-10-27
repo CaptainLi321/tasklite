@@ -253,7 +253,9 @@ class ArtifactJournal:
         self.record_input_entry(job_uid, entry)
         return entry
 
-    def record_signal(self, job_uid: str, r_name: str, secs: float) -> None:
+    def record_signal(
+        self, job_uid: str, resource_name: str, seconds: float
+    ) -> None:
         """追加一条 suspend 信号到 signals 文件。
 
         信号立即落盘 flush——即使 handler 随后崩溃/超时，限流信息也不
@@ -265,7 +267,7 @@ class ArtifactJournal:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
-                f.write(dumps({"suspend": [r_name, secs]}) + "\n")
+                f.write(dumps({"suspend": [resource_name, seconds]}) + "\n")
                 f.flush()
         except OSError:
             pass

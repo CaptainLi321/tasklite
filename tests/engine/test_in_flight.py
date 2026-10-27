@@ -177,7 +177,7 @@ class TestInFlightTrackerResourceRelease:
     def test_entry_self_release_with_lease(self):
         gpu = CapacityResource("gpu", 10.0)
         rm = ResourceManager({"gpu": gpu})
-        lease = rm.reserve("t", {"gpu": 3.0}, uid="t::j1")
+        lease = rm.reserve("t", {"gpu": 3.0}, job_uid="t::j1")
         assert gpu.used == 3.0
 
         job = Job("t", "j1", {"gpu": 3.0})

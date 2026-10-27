@@ -77,7 +77,7 @@ class TestClassifierStandardExceptionShapes:
         assert cl.is_transient is True
         assert cl.is_fatal is False
         assert cl.category == ErrorCategory.TRANSIENT_EXHAUSTED
-        assert cl.failed_error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
+        assert cl.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
 
         # RateLimitHit（RetryError 子类）
         cl_rate = classifier.classify(RateLimitHit("429"))
@@ -89,7 +89,7 @@ class TestClassifierStandardExceptionShapes:
         assert cl_fatal.is_fatal is True
         assert cl_fatal.is_transient is False
         assert cl_fatal.category == ErrorCategory.FATAL
-        assert cl_fatal.failed_error_category == ErrorCategory.FATAL.value
+        assert cl_fatal.error_category == ErrorCategory.FATAL.value
 
         # 内置启发式 Fatal（TypeError, KeyError 等）
         cl_type = classifier.classify(TypeError("bad type"))
@@ -147,41 +147,41 @@ class TestClassifierMetaDictionaries:
             {"status": "retry", "error_message": "retry me"}
         )
         assert cl_retry.is_retry is True
-        assert cl_retry.failed_error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
+        assert cl_retry.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
 
         # IPC fatal 字典
         cl_fatal = classifier.classify(
             {"status": "fatal", "error_message": "fatal crash", "traceback": "..."}
         )
         assert cl_fatal.is_fatal is True
-        assert cl_fatal.failed_error_category == ErrorCategory.FATAL.value
+        assert cl_fatal.error_category == ErrorCategory.FATAL.value
 
         # IPC interrupted 字典：档案视图按 unknown 归档（中断不落档案）
         cl_intr = classifier.classify({"status": "interrupted", "error_message": "ctrl-c"})
         assert cl_intr.is_interrupted is True
         assert cl_intr.category == ErrorCategory.INTERRUPTED
-        assert cl_intr.failed_error_category == ErrorCategory.UNKNOWN.value
+        assert cl_intr.error_category == ErrorCategory.UNKNOWN.value
 
     def test_failed_meta_dictionaries(self):
         classifier = ErrorClassifier()
 
         cl_deadlock = classifier.classify({"error_message": ERR_DEPENDENCY_DEADLOCK})
         assert cl_deadlock.category == ErrorCategory.DEADLOCK
-        assert cl_deadlock.failed_error_category == ErrorCategory.DEADLOCK.value
+        assert cl_deadlock.error_category == ErrorCategory.DEADLOCK.value
 
         cl_no_handler = classifier.classify({"error_message": ERR_NO_HANDLER})
         assert cl_no_handler.category == ErrorCategory.NO_HANDLER
-        assert cl_no_handler.failed_error_category == ErrorCategory.NO_HANDLER.value
+        assert cl_no_handler.error_category == ErrorCategory.NO_HANDLER.value
 
         cl_fatal_flag = classifier.classify({"error_message": "boom", "is_fatal": True})
         assert cl_fatal_flag.is_fatal is True
-        assert cl_fatal_flag.failed_error_category == ErrorCategory.FATAL.value
+        assert cl_fatal_flag.error_category == ErrorCategory.FATAL.value
 
         # meta 的 error_type 为 unknown 视同未设置：回退错误串映射结论
         cl_typed = classifier.classify(
             {"error_message": ERR_JOB_DEPENDENCY, "error_category": ErrorCategory.UNKNOWN.value}
         )
-        assert cl_typed.failed_error_category == ErrorCategory.DEPENDENCY.value
+        assert cl_typed.error_category == ErrorCategory.DEPENDENCY.value
 
     def test_classification_roundtrip_via_failed_meta(self):
         """不变式：异常 → 分类 → 失败档案 meta → 分类，结论恒等。"""
@@ -193,8 +193,8 @@ class TestClassifierMetaDictionaries:
         cl_second = classifier.classify(meta)
 
         assert (
-            cl_first.failed_error_category
-            == cl_second.failed_error_category
+            cl_first.error_category
+            == cl_second.error_category
             == ErrorCategory.TRANSIENT_EXHAUSTED.value
         )
         assert cl_second.is_fatal is False
@@ -204,7 +204,7 @@ class TestClassifierMetaDictionaries:
         cl = ErrorClassification(
             category=ErrorCategory.FATAL,
             error_code="",
-            failed_error_category=ErrorCategory.FATAL.value,
+            error_category=ErrorCategory.FATAL.value,
             is_transient=False,
             is_fatal=True,
             is_retry=False,
@@ -223,7 +223,7 @@ class TestClassifierMetaDictionaries:
         empty = ErrorClassification(
             category=ErrorCategory.UNKNOWN,
             error_code="",
-            failed_error_category=ErrorCategory.UNKNOWN.value,
+            error_category=ErrorCategory.UNKNOWN.value,
             is_transient=False,
             is_fatal=False,
             is_retry=False,
@@ -843,7 +843,7 @@ class TestErrorCodeStringMapping:
         classifier = ErrorClassifier()
         cl = classifier.classify(code)
         assert cl.category == category
-        assert cl.failed_error_category == category.value
+        assert cl.error_category == category.value
 
     def test_prefixed_error_codes_match(self):
         """带上下文后缀的错误串按前缀归因（失败档案落盘串回读场景）。"""
@@ -863,7 +863,7 @@ class TestDeathAttributionTable:
 
     锁定不变式：
     1. exitcode × timed_out × timeout_is_transient 全组合的 meta 形状 /
-       错误串 / 瞬态语义 / failed_error_category；
+       错误串 / 瞬态语义 / error_category；
     2. 决策表产出的错误串族必须被 _classify_string 映射消费（死亡串不落
        unknown）；
     3. 瞬态军规：环境死亡烧预算（retry_requested=True）、非瞬态超时终局。
@@ -876,7 +876,7 @@ class TestDeathAttributionTable:
         assert att.retry_requested is True
         assert att.result_metadata == {}
         assert att.retry_error == f"{ERR_TIMEOUT_PREFIX}5.0s)"
-        assert att.failed_error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
+        assert att.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
 
     def test_non_transient_timeout_is_terminal_fatal(self, classifier):
         att = classifier.classify_process_death(
@@ -885,7 +885,7 @@ class TestDeathAttributionTable:
         assert att.retry_requested is False
         assert att.result_metadata == {"error_message": f"{ERR_TIMEOUT_PREFIX}3.0s)"}
         assert att.retry_error is None
-        assert att.failed_error_category == ErrorCategory.FATAL.value
+        assert att.error_category == ErrorCategory.FATAL.value
 
     @pytest.mark.parametrize("code", [-9, -11, -15])
     def test_negative_exitcode_is_signal_death(self, classifier, code):
@@ -901,7 +901,7 @@ class TestDeathAttributionTable:
             code == -9 and hasattr(signal, "SIGKILL")
         )
         assert att.retry_error.startswith(ERR_PROCESS_SIGNAL_DEATH)
-        assert att.failed_error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
+        assert att.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
 
     def test_signal_name_resolved_for_known_signal(self, classifier):
         att = classifier.classify_process_death(
@@ -927,7 +927,7 @@ class TestDeathAttributionTable:
         assert "signal" not in att.result_metadata
         assert "oom_hint" not in att.result_metadata
         assert att.retry_error == f"PROCESS_CRASH_EXIT: worker exited with code {code}"
-        assert att.failed_error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
+        assert att.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
 
     @pytest.mark.parametrize("code", [None, 0])
     def test_zero_or_missing_exitcode_is_no_ipc_result(self, classifier, code):
@@ -939,7 +939,7 @@ class TestDeathAttributionTable:
         assert att.retry_error == (
             f"{ERR_NO_IPC_RESULT}: worker exited without writing a result file"
         )
-        assert att.failed_error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
+        assert att.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
 
     def test_timed_out_takes_priority_over_exitcode(self, classifier):
         """timed_out 优先裁决：超时窗口内被看门狗 kill（exitcode=-9）仍按
@@ -971,7 +971,7 @@ class TestDeathStringClassification:
     )
     def test_death_strings_classified(self, classifier, error_str, expected_type):
         cl = classifier.classify({"error_message": error_str})
-        assert cl.failed_error_category == expected_type
+        assert cl.error_category == expected_type
         assert classify_error_category({"error_message": error_str}) == expected_type
 
     def test_arbitrary_business_string_still_unknown(self, classifier):
@@ -983,7 +983,7 @@ class TestDeathStringClassification:
         assert cl.category == ErrorCategory.FATAL
 
     def test_decision_table_rows_carry_consistent_failed_types(self, classifier):
-        """决策表每行的 failed_error_category 与其错误串的分类结论一致——两表同源。"""
+        """决策表每行的 error_category 与其错误串的分类结论一致——两表同源。"""
         rows = [
             classifier.classify_process_death(
                 None, timed_out=True, timeout_seconds=1.0, timeout_is_transient=True
@@ -999,4 +999,4 @@ class TestDeathStringClassification:
             assert isinstance(att, DeathAttribution)
             error = att.result_metadata.get("error_message")
             if error:
-                assert classify_error_category({"error_message": error}) == att.failed_error_category
+                assert classify_error_category({"error_message": error}) == att.error_category

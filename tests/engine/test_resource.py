@@ -703,7 +703,7 @@ class TestResourceLease:
 
         # 预约阶段：gpu 立即扣减，api 暂不推进 next_available
         before = api.next_available
-        lease = mgr.reserve("task", {"gpu": 2.0, "api": 1.0}, uid="t::j1")
+        lease = mgr.reserve("task", {"gpu": 2.0, "api": 1.0}, job_uid="t::j1")
         assert lease.status.value == "reserved"
         assert gpu.used == 2.0
         assert api.next_available == before
@@ -728,7 +728,7 @@ class TestResourceLease:
         api.acquire(1.0)  # 制造限速等待窗
 
         with pytest.raises(RateLimitUnavailable, match="api"):
-            mgr.reserve("task", {"gpu": 2.0, "api": 1.0}, uid="t::j2")
+            mgr.reserve("task", {"gpu": 2.0, "api": 1.0}, job_uid="t::j2")
         assert gpu.used == 0.0, "预约失败必须回滚已占容量"
 
     def test_reserve_unknown_resource_rolls_back(self):
@@ -743,7 +743,7 @@ class TestResourceLease:
         mgr = ResourceManager({"gpu": gpu})
 
         with pytest.raises(RuntimeError):
-            with mgr.reserve("task", {"gpu": 3.0}, uid="t::err") as lease:
+            with mgr.reserve("task", {"gpu": 3.0}, job_uid="t::err") as lease:
                 assert gpu.used == 3.0
                 assert lease.status.value == "reserved"
                 raise RuntimeError("dispatch failed")
@@ -785,7 +785,7 @@ class TestSuspensionCollectAndRestore:
 
         now_mono = time.monotonic()
         now_wall = time.time()
-        gpu.suspend_until = now_mono + 20.0
+        gpu._suspended_until = now_mono + 20.0
         suspensions = mgr.collect_suspensions(now_mono=now_mono, now_wall=now_wall)
         assert "gpu" in suspensions
         assert math.isclose(suspensions["gpu"], now_wall + 20.0, abs_tol=1e-1)
@@ -794,7 +794,7 @@ class TestSuspensionCollectAndRestore:
         gpu_fresh = CapacityResource("gpu", 10.0)
         mgr_fresh = ResourceManager({"gpu": gpu_fresh})
         mgr_fresh.restore_suspensions(suspensions, now_wall=now_wall)
-        assert gpu_fresh.suspend_until > time.monotonic()
+        assert gpu_fresh._suspended_until > time.monotonic()
 
     def test_restore_expired_deadline_ignored(self):
         """挂钟截止已过 → 恢复后资源不暂停。"""

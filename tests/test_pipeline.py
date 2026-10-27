@@ -21,7 +21,7 @@ from tasklite.engine.admission import (
 )
 from tasklite.engine.resource import CapacityResource, RateLimitResource
 from tasklite.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
-from tasklite.engine.types import AttemptOutcome, ExitReason, StopMode
+from tasklite.engine.types import AttemptOutcome, ExitReason, RunSummary, StopMode
 from tasklite.models.job import Job
 from tasklite.models.task import Task
 from tasklite.pipeline import TaskLite
@@ -285,7 +285,7 @@ class TestConstruction:
     def test_worker_resource_registered_with_capacity(self, tmp_path):
         p = make_pipeline(tmp_path, max_workers=7)
         assert "__workers__" in p.resources
-        assert p.resources["__workers__"].capacity == 7.0
+        assert p.resources["__workers__"].max_capacity == 7.0
 
     def test_declared_exceptions_validated_at_construction(self, tmp_path):
         with pytest.raises((TypeError, ValueError)):
@@ -385,13 +385,13 @@ class TestRegisterResource:
         p.register_resource(CapacityResource("gpu", 1.0))
         with caplog.at_level("WARNING"):
             p.register_resource(CapacityResource("gpu", 2.0))
-        assert p.resources["gpu"].capacity == 2.0
+        assert p.resources["gpu"].max_capacity == 2.0
         assert any("Overwriting existing resource 'gpu'" in r.message for r in caplog.records)
 
     def test_override_workers_changes_concurrency(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_resource(CapacityResource("__workers__", 9.0))
-        assert p.resources["__workers__"].capacity == 9.0
+        assert p.resources["__workers__"].max_capacity == 9.0
 
     def test_run_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -662,8 +662,14 @@ class TestSixStepContract:
             raise KeyboardInterrupt()
 
         monkeypatch.setattr(p._runtime, "execute", raise_interrupt)
-        p.run_graceful()
+        assert p.run_graceful() is None
         assert p._runtime.stop_mode is StopMode.DRAINING
+
+    def test_run_graceful_returns_summary_on_normal_completion(self, tmp_path):
+        p = make_pipeline(tmp_path)
+        summary = p.run_graceful()
+        assert isinstance(summary, RunSummary)
+        assert summary.exit_reason is ExitReason.COMPLETED
 
     def test_is_running_flag_lifecycle(self, tmp_path, monkeypatch):
         p = make_pipeline(tmp_path)

@@ -423,7 +423,7 @@ class DispatchMachine:
         """
         store = self._store
         handle = None
-        lease = self._resources.reserve(job.task_type, job.resources, uid=job_uid)
+        lease = self._resources.reserve(job.task_type, job.resources, job_uid=job_uid)
         try:
             with lease:
                 task = self._tasks.lookup(job.task_type)

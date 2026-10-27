@@ -831,7 +831,7 @@ def test_run_signatures_unchanged():
         "(self, *, install_signals: 'bool' = True, "
         "acquire_run_lock: 'bool' = True) -> 'RunSummary'"
     )
-    assert str(inspect.signature(TaskLite.run_graceful)) == "(self) -> 'None'"
+    assert str(inspect.signature(TaskLite.run_graceful)) == "(self) -> 'RunSummary | None'"
 
 
 def test_selection_machine_isolated_unit():

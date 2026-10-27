@@ -135,14 +135,14 @@ class ValidationResult:
 class ErrorClassification:
     """错误多维分类决策的不可变值对象（单一真相源）。
 
-    failed_error_category 是失败档案 meta ``error_category`` 键的取值（与
+    error_category 是失败档案 meta ``error_category`` 键的取值（与
     ErrorCategory 成员值同源）；中断分类按 unknown 归档——中断是瞬态
     信号不落失败档案，档案值域不为其单列成员。
     """
 
     category: ErrorCategory
     error_code: str
-    failed_error_category: str
+    error_category: str
     is_transient: bool
     is_fatal: bool
     is_retry: bool
@@ -156,7 +156,7 @@ class ErrorClassification:
         """构建落入 failed 表的标准元数据字典。"""
         meta: dict[str, Any] = {
             "error_message": self.error_code or self.raw_error or "UNKNOWN_ERROR",
-            "error_category": self.failed_error_category,
+            "error_category": self.error_category,
             "is_fatal": self.is_fatal,
         }
         if self.diagnostic_details:
@@ -173,7 +173,7 @@ class DeathAttribution:
     """子进程死亡归因决策表的行值（不可变）。
 
     classify_process_death 是「exitcode × 超时 × timeout_is_transient →
-    瞬态/终局、result_metadata、retry_error、failed_error_category」的单一裁决点；
+    瞬态/终局、result_metadata、retry_error、error_category」的单一裁决点；
     收割路径（有结果文件解码、无结果文件终局构造、stale 认领）对同一
     根因必须经本表得到相同形状。
     """
@@ -181,7 +181,7 @@ class DeathAttribution:
     retry_requested: bool
     result_metadata: dict[str, Any]
     retry_error: str | None
-    failed_error_category: str
+    error_category: str
 
 
 def _safe_str(obj: Any) -> str:
@@ -299,7 +299,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.VALIDATION,
                 error_code=ERR_PAYLOAD_VALIDATION,
-                failed_error_category=ErrorCategory.VALIDATION.value,
+                error_category=ErrorCategory.VALIDATION.value,
                 is_transient=False,
                 is_fatal=False,
                 is_retry=False,
@@ -323,7 +323,7 @@ class ErrorClassifier:
         return ErrorClassification(
             category=ErrorCategory.UNKNOWN,
             error_code="",
-            failed_error_category=ErrorCategory.UNKNOWN.value,
+            error_category=ErrorCategory.UNKNOWN.value,
             is_transient=False,
             is_fatal=False,
             is_retry=False,
@@ -347,7 +347,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.INTERRUPTED,
                 error_code="INTERRUPTED",
-                failed_error_category=ErrorCategory.UNKNOWN.value,
+                error_category=ErrorCategory.UNKNOWN.value,
                 is_transient=False,
                 is_fatal=False,
                 is_retry=False,
@@ -359,7 +359,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.TRANSIENT_EXHAUSTED,
                 error_code=ERR_MAX_RETRIES,
-                failed_error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
+                error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
                 is_transient=True,
                 is_fatal=False,
                 is_retry=True,
@@ -370,7 +370,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.FATAL,
                 error_code="",
-                failed_error_category=ErrorCategory.FATAL.value,
+                error_category=ErrorCategory.FATAL.value,
                 is_transient=False,
                 is_fatal=True,
                 is_retry=False,
@@ -381,7 +381,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.TRANSIENT_EXHAUSTED,
                 error_code=ERR_MAX_RETRIES,
-                failed_error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
+                error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
                 is_transient=True,
                 is_fatal=False,
                 is_retry=False,
@@ -391,7 +391,7 @@ class ErrorClassifier:
         return ErrorClassification(
             category=ErrorCategory.UNKNOWN,
             error_code="",
-            failed_error_category=ErrorCategory.UNKNOWN.value,
+            error_category=ErrorCategory.UNKNOWN.value,
             is_transient=False,
             is_fatal=False,
             is_retry=False,
@@ -423,13 +423,13 @@ class ErrorClassifier:
                     retry_requested=True,
                     result_metadata={},
                     retry_error=f"{ERR_TIMEOUT_PREFIX}{timeout_seconds}s)",
-                    failed_error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
+                    error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
                 )
             return DeathAttribution(
                 retry_requested=False,
                 result_metadata={"error_message": f"{ERR_TIMEOUT_PREFIX}{timeout_seconds}s)"},
                 retry_error=None,
-                failed_error_category=ErrorCategory.FATAL.value,
+                error_category=ErrorCategory.FATAL.value,
             )
         if exitcode is not None and exitcode < 0:
             try:
@@ -444,20 +444,20 @@ class ErrorClassifier:
                     "oom_hint": _SIGKILL is not None and -exitcode == _SIGKILL,
                 },
                 retry_error=f"{ERR_PROCESS_SIGNAL_DEATH}: killed by {sig_name} ({exitcode})",
-                failed_error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
+                error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
             )
         if exitcode:
             return DeathAttribution(
                 retry_requested=True,
                 result_metadata={"error_message": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}"},
                 retry_error=f"PROCESS_CRASH_EXIT: worker exited with code {exitcode}",
-                failed_error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
+                error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
             )
         return DeathAttribution(
             retry_requested=True,
             result_metadata={"error_message": ERR_NO_IPC_RESULT},
             retry_error=f"{ERR_NO_IPC_RESULT}: worker exited without writing a result file",
-            failed_error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
+            error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
         )
 
     def _classify_dict(self, meta: dict[str, Any]) -> ErrorClassification:
@@ -467,7 +467,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.TRANSIENT_EXHAUSTED,
                 error_code=ERR_MAX_RETRIES,
-                failed_error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
+                error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
                 is_transient=True,
                 is_fatal=False,
                 is_retry=True,
@@ -478,7 +478,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.FATAL,
                 error_code="",
-                failed_error_category=ErrorCategory.FATAL.value,
+                error_category=ErrorCategory.FATAL.value,
                 is_transient=False,
                 is_fatal=True,
                 is_retry=False,
@@ -489,7 +489,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.INTERRUPTED,
                 error_code="INTERRUPTED",
-                failed_error_category=ErrorCategory.UNKNOWN.value,
+                error_category=ErrorCategory.UNKNOWN.value,
                 is_transient=False,
                 is_fatal=False,
                 is_retry=False,
@@ -506,7 +506,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.FATAL,
                 error_code=error_str,
-                failed_error_category=ErrorCategory.FATAL.value,
+                error_category=ErrorCategory.FATAL.value,
                 is_transient=False,
                 is_fatal=True,
                 is_retry=False,
@@ -520,7 +520,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=cl.category,
                 error_code=error_str,
-                failed_error_category=raw_category,
+                error_category=raw_category,
                 is_transient=cl.is_transient,
                 is_fatal=cl.is_fatal,
                 is_retry=cl.is_retry,
@@ -553,7 +553,7 @@ class ErrorClassifier:
                 return ErrorClassification(
                     category=cat,
                     error_code=code,
-                    failed_error_category=cat.value,
+                    error_category=cat.value,
                     is_transient=trans,
                     is_fatal=fatal,
                     is_retry=False,
@@ -564,7 +564,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.COMMIT_FAILURE,
                 error_code=ERR_COMMIT_FAILURE,
-                failed_error_category=ErrorCategory.COMMIT_FAILURE.value,
+                error_category=ErrorCategory.COMMIT_FAILURE.value,
                 is_transient=False,
                 is_fatal=False,
                 is_retry=False,
@@ -575,7 +575,7 @@ class ErrorClassifier:
             return ErrorClassification(
                 category=ErrorCategory.DISPATCH,
                 error_code=ERR_DISPATCH_FAILURE,
-                failed_error_category=ErrorCategory.DISPATCH.value,
+                error_category=ErrorCategory.DISPATCH.value,
                 is_transient=False,
                 is_fatal=False,
                 is_retry=False,
@@ -585,7 +585,7 @@ class ErrorClassifier:
         return ErrorClassification(
             category=ErrorCategory.UNKNOWN,
             error_code="",
-            failed_error_category=ErrorCategory.UNKNOWN.value,
+            error_category=ErrorCategory.UNKNOWN.value,
             is_transient=False,
             is_fatal=False,
             is_retry=False,
@@ -653,7 +653,7 @@ class ErrorClassifier:
         normalized = dict(meta)
         if not normalized.get("error_category"):
             cl = self.classify(normalized)
-            normalized["error_category"] = cl.failed_error_category
+            normalized["error_category"] = cl.error_category
 
         if "failed_at" not in normalized:
             normalized["failed_at"] = utc_now_iso()
@@ -886,7 +886,7 @@ def validate_payload_errors(payload: dict, schema: Any) -> list:
 
 def classify_error_category(meta: dict) -> str:
     """从失败档案 meta 推导结构化 error_category（list_failures 查询与落库共用）。"""
-    return _DEFAULT_CLASSIFIER.classify(meta).failed_error_category
+    return _DEFAULT_CLASSIFIER.classify(meta).error_category
 
 
 def classify_exception(

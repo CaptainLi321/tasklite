@@ -87,7 +87,8 @@ from .engine.resource import (
     Resource,
 )
 
-# ── 失败档案条目 ─────────────────────────────────────────────────────
+# ── 失败档案条目与挂起条目 ───────────────────────────────────────────
+from .engine.ops import SuspendEntry
 from .engine.store import FailureEntry
 
 # ── 策略 seam：准入（rerun）与重入队（节奏）─────────────────────────
@@ -185,8 +186,9 @@ __all__ = [
     "CapacityResource",
     "RateLimitResource",
     "Resource",
-    # 失败档案
+    # 失败档案与挂起
     "FailureEntry",
+    "SuspendEntry",
     # 策略 seam
     "ImmediateRequeuePolicy",
     "RequeuePlan",

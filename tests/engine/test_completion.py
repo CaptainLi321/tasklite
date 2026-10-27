@@ -86,7 +86,7 @@ class CompletionEnv:
 
     def track_entry(self, job: Job, *, lease=None, attempt_id=None) -> InFlightJob:
         if lease is None:
-            lease = self.resources.reserve(job.task_type, job.resources, uid=job.uid)
+            lease = self.resources.reserve(job.task_type, job.resources, job_uid=job.uid)
         entry = InFlightJob(
             job_uid=job.uid,
             job_snapshot=job.to_dict(),
