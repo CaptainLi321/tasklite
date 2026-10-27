@@ -132,6 +132,9 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def load_attempts(self, *args, **kwargs):
         return self.inner.load_attempts(*args, **kwargs)
 
+    def load_latest_succeeded_finished_at(self, *args, **kwargs):
+        return self.inner.load_latest_succeeded_finished_at(*args, **kwargs)
+
     def get_engine_metadata(self, *args, **kwargs):
         return self.inner.get_engine_metadata(*args, **kwargs)
 

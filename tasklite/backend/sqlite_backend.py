@@ -214,6 +214,11 @@ class SQLiteStateBackend(AbstractStateBackend):
         在缺列上建索引时抛出费解的 no such column）。"""
         conn.execute('CREATE INDEX IF NOT EXISTS idx_queue_position ON queue(queue_position)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_job_uid ON attempts(job_uid)')
+        # 可信基线窄查询（job_uid + outcome 定位，rowid 即 attempt_id 隐式随索引有序）
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_attempts_job_uid_outcome '
+            'ON attempts(job_uid, outcome)'
+        )
 
     # 序号分配 ---------------------------------------------------------
 
@@ -829,6 +834,25 @@ class SQLiteStateBackend(AbstractStateBackend):
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(
                 f"Failed to load attempts for {job_uid!r} from {self.path.name}: {e}"
+            ) from e
+
+    def load_latest_succeeded_finished_at(self, job_uid: str) -> str | None:
+        if not self.path.exists():
+            return None
+        try:
+            with self._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT finished_at FROM attempts "
+                    "WHERE job_uid = ? AND outcome = 'succeeded' "
+                    "ORDER BY attempt_id DESC LIMIT 1",
+                    (job_uid,),
+                ).fetchone()
+                if row is None or not isinstance(row[0], str) or not row[0]:
+                    return None
+                return row[0]
+        except (sqlite3.Error, OSError) as e:
+            raise RuntimeError(
+                f"Failed to load latest succeeded finished_at for {job_uid!r} from {self.path.name}: {e}"
             ) from e
 
     # 元数据 ---------------------------------------------------------------

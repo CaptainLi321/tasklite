@@ -114,27 +114,19 @@ class TestArtifactJournalDeclarations:
         assert ok is True
         assert err is None
 
-    def test_record_and_read_input_file_and_uri(self, tmp_path):
+    def test_record_and_read_input_paths(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
         uid = "job_in"
         data_file = tmp_path / "input.txt"
         data_file.write_text("hello input")
 
-        entry_file = journal.record_input_file(uid, str(data_file))
-        assert entry_file["kind"] == "file"
-        assert entry_file["size"] == len("hello input")
-        assert "mtime_ns" in entry_file
+        assert journal.record_input_file(uid, str(data_file)) == str(data_file)
+        journal.record_input_file(uid, "/other/path")
 
-        entry_uri = journal.record_input_uri(
-            uid, "https://example.com/data", uri_fingerprint="etag123"
-        )
-        assert entry_uri["kind"] == "uri"
-        assert entry_uri["uri_fingerprint"] == "etag123"
-
-        inputs = journal.read_inputs(uid)
-        assert len(inputs) == 2
-        assert inputs[0]["path"] == str(data_file)
-        assert inputs[1]["path"] == "https://example.com/data"
+        assert journal.read_inputs(uid) == [str(data_file), "/other/path"]
+        # 落盘行仅含规范路径，不携带 size/mtime 快照
+        raw = journal.inputs_path(uid).read_text(encoding="utf-8").splitlines()
+        assert json.loads(raw[0]) == {"path": str(data_file)}
 
     def test_signal_record_and_drain(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
@@ -605,8 +597,7 @@ class TestResultParseContainment:
 
         entries = journal.read_inputs(uid)
 
-        assert len(entries) == 1, "深嵌套行按坏行跳过"
-        assert entries[0]["path"] == "/tmp/a"
+        assert entries == ["/tmp/a"], "深嵌套行按坏行跳过"
 
     def test_read_suspend_lines_deep_nesting_line_skipped(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
@@ -661,8 +652,7 @@ class TestResultParseContainment:
             encoding="utf-8",
         )
         entries = journal.read_inputs(uid)
-        assert len(entries) == 2, "坏行应被跳过而非终止读取"
-        assert entries[0]["path"] == "/in_first" and entries[1]["path"] == "/in_second"
+        assert entries == ["/in_first", "/in_second"], "坏行应被跳过而非终止读取"
 
 
 class TestCleanupSandboxRecheck:

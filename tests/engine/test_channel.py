@@ -81,9 +81,7 @@ class TestExecutionChannelBasics:
             "job_inputs", {"kind": "file", "path": "/tmp/a.txt", "size": 100, "mtime_ns": 1000}
         )
         inputs = channel.read_declared_inputs("job_inputs")
-        assert len(inputs) == 1
-        assert inputs[0]["path"] == "/tmp/a.txt"
-        assert inputs[0]["size"] == 100
+        assert inputs == ["/tmp/a.txt"]
 
     def test_journal_property_rebuilds_on_ipc_dir_change(self, tmp_path):
         channel = ExecutionChannel()

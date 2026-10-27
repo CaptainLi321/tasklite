@@ -428,6 +428,16 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             return [rec for rec in self._attempts.values() if rec.job_uid == job_uid]
 
+    def load_latest_succeeded_finished_at(self, job_uid: str) -> str | None:
+        """按 attempt_id 倒序查找指定 job_uid 最新一条 succeeded 轨迹行的 finished_at。"""
+        with self._lock:
+            for rec in reversed(self._attempts.values()):
+                if rec.job_uid == job_uid and rec.outcome == "succeeded":
+                    if isinstance(rec.finished_at, str) and rec.finished_at:
+                        return rec.finished_at
+                    return None
+            return None
+
     # 元数据 ---------------------------------------------------------
 
     def get_engine_metadata(self, key: str) -> str | None:

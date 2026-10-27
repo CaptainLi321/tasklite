@@ -198,7 +198,7 @@ pipeline.stop()
 |---|---|
 | `ctx.spawn(Job(...))` | 入队子 job（运行期派生唯一合法通道） |
 | `ctx.declare_output(path)` / `ctx.declare_cache(path)` | 声明产物 / 临时半成品（返回解析后规范绝对路径，应使用返回值写文件） |
-| `ctx.declare_input(path)` / `ctx.declare_input_uri(url)` | 声明输入（采集 stat 指纹，联动 `rerun="on_input_change"`） |
+| `ctx.declare_input(path)` | 声明输入（校验存在性并记录规范绝对路径，联动 trigger / `rerun="on_input_change"`） |
 | `ctx.get_cursor(key)` / `ctx.set_cursor(key, value)` | 高水位游标读写（成功时原子提交；`value=None` 删除） |
 | `ctx.suspend_resource(name, seconds)` | 全局挂起资源（429/配额熔断，跨进程跨重启持久化） |
 | `ctx.has_succeeded(job_uid)` / `ctx.has_failed(job_uid)` / `ctx.succeeded_or_failed_job_uids()` | 成功/失败档案快照查询；并集不含 skipped、队列成员或 Attempt 历史（派发时刻快照，不实时刷新） |

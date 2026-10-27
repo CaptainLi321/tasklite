@@ -10,8 +10,8 @@
   单点维护）；
 - attempt 收尾事件钩子唯一经由 ``fire_attempt_finished`` 触发（异常隔离
   + hook_errors 计数）；
-- attempts 轨迹为旁路 append-only 观测面：apply_* 终态时同步收尾轨迹行，
-  更新失败降级告警、绝不阻断主事务。
+- attempts 轨迹为 append-only 观测面：成功收尾与 successes 同事务提交（可信
+  基线来源）；失败/重试/跳过收尾更新失败降级告警、绝不阻断主事务。
 """
 
 from __future__ import annotations
@@ -34,9 +34,15 @@ from ..models.attempt import (
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Selection
-from ..utils.clock import utc_now_iso
+from ..utils.clock import parse_utc_iso_to_us, utc_now_iso
 from ..utils.jsonutil import dumps
-from .admission import ImmediateRequeuePolicy, RequeuePolicy, RerunPolicy
+from .admission import (
+    ImmediateRequeuePolicy,
+    RequeuePolicy,
+    RerunPolicy,
+    extract_trusted_metadata_timestamp_us,
+    is_trusted_success_metadata,
+)
 from .errorclass import ERR_COMMIT_FAILURE, ERR_JOB_DEPENDENCY, ErrorClassifier
 from .types import TRANSIENT_KIND_STAT_KEYS, AttemptOutcome
 
@@ -406,6 +412,32 @@ class StateStore:
             )
 
 
+    def trusted_last_succeeded_at_us(
+        self, job_uid: str, *, success_metadata: Mapping[str, Any] | None = None
+    ) -> int | None:
+        """可信成功基线（整数微秒）：无可信档案则返回 None（调用方保守执行）。
+
+        不变式：基线只取自同事务提交的 attempts succeeded 行；先以 successes
+        档案框架元数据（seed 的空字典、缺键或坏值一律不可信）为闸门，且校验
+        successes 框架时间戳与 attempts 实际完成时间戳严格一致，防止
+        clear_history 后残留的旧 attempts 成功行被拼接成伪基线。
+        """
+        if success_metadata is None:
+            success_metadata = self._state.successes.get(job_uid)
+        meta_ts = extract_trusted_metadata_timestamp_us(success_metadata)
+        if meta_ts is None:
+            return None
+        finished_at = self._backend.load_latest_succeeded_finished_at(job_uid)
+        if finished_at is None:
+            return None
+        try:
+            attempt_ts = parse_utc_iso_to_us(finished_at)
+        except (TypeError, ValueError):
+            return None
+        if meta_ts != attempt_ts:
+            return None
+        return attempt_ts
+
     # ── 内存状态受控接缝 ─────────────────────────────────────────────
 
     def mark_failed_memory(
@@ -455,7 +487,7 @@ class StateStore:
         *,
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
-        declared_inputs: Sequence[dict[str, Any]] = (),
+        declared_inputs: Sequence[str] = (),
         run_id: str | None = None,
         job_snapshot: dict[str, Any] | None = None,
         attempt_id: int | None = None,
@@ -470,14 +502,13 @@ class StateStore:
             success_metadata["last_success_run_id"] = run_id
         else:
             success_metadata.pop("last_success_run_id", None)
+        success_metadata.pop("inputs", None)
         if declared_inputs:
-            deduped = {
-                entry.get("path"): entry
-                for entry in declared_inputs
-                if isinstance(entry, dict) and entry.get("path")
-            }
-            if deduped:
-                success_metadata["inputs"] = list(deduped.values())
+            input_paths = list(dict.fromkeys(
+                path for path in declared_inputs if isinstance(path, str) and path
+            ))
+            if input_paths:
+                success_metadata["inputs"] = input_paths
 
         # 增量记录 success_count（防御非 int 脏数据；重跑成功从对侧终态续数）
         prev_meta = self._state.successes.get(job_uid) or self._state.failed.get(job_uid)

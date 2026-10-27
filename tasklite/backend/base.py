@@ -368,6 +368,10 @@ class AbstractStateBackend(ABC):
     def load_attempts(self, job_uid: str) -> list[AttemptRecord]:
         """按 job_uid 读取全部尝试轨迹（按轨迹 id 升序）；无轨迹返回空列表。"""
 
+    @abstractmethod
+    def load_latest_succeeded_finished_at(self, job_uid: str) -> str | None:
+        """窄查询指定 job_uid 最新一条 outcome == 'succeeded' 轨迹行的 finished_at；无则返回 None。"""
+
     # 元数据 ---------------------------------------------------------
 
     @abstractmethod

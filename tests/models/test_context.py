@@ -274,21 +274,23 @@ class TestDeclareCache:
 
 
 class TestDeclareInput:
-    """declare_input：stat 指纹采集与 URI 声明。"""
+    """declare_input：声明点校验存在性，仅记录规范路径。"""
 
-    def test_fingerprint_collected(self, tmp_path):
+    def test_path_recorded_without_fingerprint(self, tmp_path):
         src = tmp_path / "src.bin"
         src.write_bytes(b"payload")
-        st = src.stat()
         ipc = str(tmp_path / "ipc")
         ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
         resolved = ctx.declare_input(src)
         assert resolved == str(src.resolve())
-        entries = ArtifactJournal(ipc).read_inputs("fetch::j1")
-        assert entries == [{
-            "path": resolved, "kind": "file",
-            "size": st.st_size, "mtime_ns": st.st_mtime_ns,
-        }]
+        assert ArtifactJournal(ipc).read_inputs("fetch::j1") == [resolved]
+
+    def test_directory_input_accepted(self, tmp_path):
+        folder = tmp_path / "in_dir"
+        folder.mkdir()
+        ipc = str(tmp_path / "ipc")
+        ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
+        assert ctx.declare_input(folder) == str(folder.resolve())
 
     def test_relative_input_resolves_against_cwd_not_sandbox(self, tmp_path, monkeypatch):
         """declare_input 无沙盒语义（有意设计：框架不写输入文件）——相对
@@ -300,47 +302,24 @@ class TestDeclareInput:
         resolved = ctx.declare_input("rel.txt")
         assert resolved == str((tmp_path / "rel.txt").resolve())
 
-    def test_missing_file_records_path_only(self, tmp_path):
-        """stat 失败记录 path 但不带指纹（on_input_change 比对时视为变化
-        → 重跑，避免误跳过）。"""
+    def test_missing_input_fails_loud_without_recording(self, tmp_path):
         ipc = str(tmp_path / "ipc")
         ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
-        resolved = ctx.declare_input(tmp_path / "ghost.bin")
-        entries = ArtifactJournal(ipc).read_inputs("fetch::j1")
-        assert entries == [{"path": resolved, "kind": "file"}]
+        with pytest.raises(FileNotFoundError):
+            ctx.declare_input(tmp_path / "ghost.bin")
+        assert ArtifactJournal(ipc).read_inputs("fetch::j1") == []
 
-    def test_declare_input_uri_recorded(self, tmp_path):
-        ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(ipc_dir=ipc)
-        url = ctx.declare_input_uri("https://example.com/feed", uri_fingerprint="etag-abc")
-        assert url == "https://example.com/feed"
-        entries = ArtifactJournal(ipc).read_inputs("fetch::j1")
-        assert entries == [{
-            "path": "https://example.com/feed", "kind": "uri",
-            "uri_fingerprint": "etag-abc",
-        }]
+    def test_uri_declaration_removed(self):
+        assert not hasattr(_make_ctx(), "declare_input_uri")
 
-    def test_declare_input_uri_without_fingerprint(self, tmp_path):
-        ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(ipc_dir=ipc)
-        uri_path = Path("/feeds/daily.xml")
-        ctx.declare_input_uri(uri_path)
-        entries = ArtifactJournal(ipc).read_inputs("fetch::j1")
-        # Path 入参按 str() 原样记录（URI 不做文件系统解析，路径分隔符
-        # 随平台保留——断言构造结果而非 POSIX 字面量）
-        assert entries == [{"path": str(uri_path), "kind": "uri"}]
-
-    def test_declare_input_uri_fingerprint_type_guard(self):
-        ctx = _make_ctx()
-        with pytest.raises(TypeError, match="uri_fingerprint must be a str or None"):
-            ctx.declare_input_uri("https://example.com", uri_fingerprint=123)
-
-    def test_no_ipc_dir_declarations_are_noops(self):
+    def test_no_ipc_dir_declarations_are_noops(self, tmp_path):
         """ipc_dir=None：声明调用不落盘也不报错（无清单场景）。"""
+        existing = tmp_path / "c.txt"
+        existing.write_text("x")
         ctx = _make_ctx(output_roots=None, ipc_dir=None)
         ctx.declare_output("a.bin")
         ctx.declare_cache("b.part")
-        ctx.declare_input("c.txt")
+        ctx.declare_input(existing)
 
 
 class TestSuspendResource:

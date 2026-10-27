@@ -161,7 +161,7 @@ class TriggerContext:
 - `TaskLite.register_trigger(name: str, fn: Callable[[TriggerContext], bool]) -> None`：在 `run()` 外注册自定义触发器。
 - `Task` / `TaskLite.register_task(..., resources=None, payload_schema=None, max_retries=3, timeout_seconds=3600, *, timeout_is_transient=False, trigger="once")`：定义任务模板默认规格。
 - `Job(task_type, job_id, payload=None, resources=None, max_retries=None, depends_on=None, timeout_seconds=None, *, timeout_is_transient=None, trigger=None, ...)`：未指定项（`None`）在执行与准入时自动继承所属 `Task` 模板规格。
-- `JobContext.declare_input(path: str | Path) -> Path`：声明本地文件或目录输入（立即校验存在性，成功时僅将规范路径字符串存入 `successes.metadata["inputs"]`）。
+- `JobContext.declare_input(path: str | Path) -> str`：声明本地文件或目录输入（立即校验存在性，成功时仅将规范路径字符串存入 `successes.metadata["inputs"]`，返回规范绝对路径字符串）。
 
 ### 5.2 现有场景与新接口映射表
 

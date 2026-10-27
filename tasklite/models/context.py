@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from pathlib import Path
 
 from ..utils.ipc import ArtifactJournal
@@ -151,49 +152,18 @@ class JobContext:
         return resolved
 
     def declare_input(self, path: str | Path) -> str:
-        """声明一个**输入文件**——记录 + 采集指纹，返回规范绝对路径。
+        """声明一个本地输入文件或目录：校验路径存在、记录规范绝对路径并返回该路径字符串。
 
-        注意：本方法**没有** ``sandbox`` 参数，这是有意设计——输入声明只
-        记录路径与 stat 指纹，框架不写该文件，因此不存在输出沙盒/清理
-        语义；与 ``declare_output/declare_cache`` 的路径沙盒无关。
-
-        指纹 ``{path, size, mtime_ns}``（stat 调用，微秒级，不用内容
-        hash 避免大文件读盘）。任务成功时框架把输入清单写入 successes meta
-        （``meta["inputs"]``）——排障/审计/种子化脚本都能回答「这个任务
-        当时基于什么输入跑出来的」。
-
-        与 ``rerun="on_input_change"`` 联动：下次 enqueue 时框架对 successes
-        中的旧指纹重新 stat 比对，任一文件 size/mtime_ns 变化 → 重跑；
-        不变 → 跳过（on_input_change 的变更检测只针对文件输入；URI
-        默认不检测，见 ``declare_input_uri``）。
-
-        指纹在**声明时**采集（handler 要读的输入此刻应已存在）；stat
-        失败（文件不存在等）记录 path 但不带指纹（on_input_change 比对
-        时视为变化 → 重跑，避免误跳过）。
+        本方法无 ``sandbox`` 参数——框架不写或清理输入文件，相对路径按当前工作目录解析。
+        在声明点立即执行 ``os.stat(resolved)`` 校验路径存在（缺失或断链立即抛 ``FileNotFoundError`` / ``OSError``）；
+        成功提交时框架把去重保序的规范路径字符串列表 ``list[str]`` 写入 ``successes.metadata["inputs"]``。
         """
         raw = str(path)
         resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_roots, sandbox=False)
+        os.stat(resolved)
         if self._journal is not None:
             self._journal.record_input_file(self.job.uid, resolved)
         return resolved
-
-    def declare_input_uri(self, url: str | Path, uri_fingerprint: str | None = None) -> str:
-        """声明一个**输入 URI**——仅记录（可追溯），返回 url 字符串。
-
-        ``uri_fingerprint`` 可选：业务侧提供的指纹字符串（如 ETag/
-        Last-Modified），落盘供审计。**不参与 on_input_change 比对**——
-        URI 的内容是否变化需网络请求，框架不在派发前免费检查（URI
-        变更检测留给业务，可把指纹拼进 job_id 或由业务自建 checker）。
-        """
-        if uri_fingerprint is not None and not isinstance(uri_fingerprint, str):
-            raise TypeError(
-                f"uri_fingerprint must be a str or None, "
-                f"got {type(uri_fingerprint).__name__}"
-            )
-        url_str = str(url)
-        if self._journal is not None:
-            self._journal.record_input_uri(self.job.uid, url_str, uri_fingerprint)
-        return url_str
 
     def has_succeeded(self, job_uid: str) -> bool:
         """查询 job_uid 是否命中派发时的成功档案快照。"""

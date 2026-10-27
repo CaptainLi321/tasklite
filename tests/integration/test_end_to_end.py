@@ -161,16 +161,13 @@ class TestEndToEnd:
         assert summary.exit_reason is ExitReason.COMPLETED
         assert summary.stats["succeeded"] == 1
         meta = p.backend.load_successes()["work::item_alpha"]
-        # successes 审计键：业务 meta 原样落盘 + 框架审计键（run_count /
-        # inputs 指纹清单 / 归属 run）
+        # successes 审计键：业务 meta 原样落盘 + 框架审计键（success_count /
+        # inputs 规范路径清单 / 归属 run）
         assert meta["touched"] == "item_alpha"
         assert meta["success_count"] == 1
         assert meta["last_success_run_id"] == summary.run_id
         assert len(meta["inputs"]) == 1
-        entry = meta["inputs"][0]
-        assert entry["path"].endswith("source_item_alpha.txt")
-        assert entry["size"] == len("seed data")
-        assert "mtime_ns" in entry
+        assert meta["inputs"][0].endswith("source_item_alpha.txt")
 
         attempts = p.backend.load_attempts("work::item_alpha")
         assert len(attempts) == 1

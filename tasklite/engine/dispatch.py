@@ -260,7 +260,9 @@ class DispatchMachine:
         store = self._store
         if not store.state.is_known(job_uid):
             return False
-        decision = self._rerun_policy.admit(job_snapshot, store.state)
+        decision = self._rerun_policy.admit(
+            job_snapshot, store.state, baseline_lookup=store.trusted_last_succeeded_at_us
+        )
         if decision.should_skip:
             try:
                 attempt_id, _ = self._open_attempt(job)

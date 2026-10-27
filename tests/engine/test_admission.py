@@ -1,7 +1,8 @@
-"""v2 准入与重入队策略深模块测试：rerun 矩阵、输入指纹与节奏接缝。"""
+"""v2 准入与重入队策略深模块测试：rerun 矩阵、输入 mtime 与可信基线判据、节奏接缝。"""
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 from tasklite.engine.admission import (
@@ -11,7 +12,23 @@ from tasklite.engine.admission import (
     RequeuePlan,
     RequeuePolicy,
     RerunPolicy,
+    extract_trusted_metadata_timestamp_us,
+    is_trusted_success_metadata,
 )
+
+
+def _trusted_meta(
+    inputs: list[str],
+    *,
+    success_count: object = 1,
+    last_succeeded_at: str = "2026-05-01T00:00:00+00:00",
+) -> dict:
+    return {
+        "success_count": success_count,
+        "last_succeeded_at": last_succeeded_at,
+        "last_success_run_id": "run_seed",
+        "inputs": inputs,
+    }
 
 
 class TestRerunEvaluationMatrix:
@@ -67,40 +84,53 @@ class TestRerunEvaluationMatrix:
     def test_on_input_change_matrix(self, tmp_path):
         target = tmp_path / "data.bin"
         target.write_bytes(b"v1")
-        st = target.stat()
+        mtime_us = target.stat().st_mtime_ns // 1_000
         policy = RerunPolicy()
-        meta = {"inputs": [{"path": str(target), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
+        meta = _trusted_meta([str(target)])
 
-        # successes 命中且指纹一致 → 拦截
+        # successes 命中且输入 mtime 不晚于可信基线 → 拦截
         dec_unchanged = policy.evaluate(
             {"task_type": "t", "rerun": "on_input_change"},
             success_metadata=meta, is_success=True, is_failed=False,
+            baseline_lookup=lambda: mtime_us,
         )
         assert dec_unchanged.should_skip
         assert dec_unchanged.reason == DecisionReason.INPUT_UNCHANGED
         assert dec_unchanged.input_changed is False
 
-        # successes 命中且指纹变化 → 放行重跑
-        target.write_bytes(b"v2-content-longer")
-        policy.clear_stat_cache()
+        # 输入 mtime 严格晚于基线 → 放行重跑
         dec_changed = policy.evaluate(
             {"task_type": "t", "rerun": "on_input_change"},
             success_metadata=meta, is_success=True, is_failed=False,
+            baseline_lookup=lambda: mtime_us - 1,
         )
         assert dec_changed.should_run
         assert dec_changed.reason == DecisionReason.INPUT_CHANGED
         assert dec_changed.input_changed is True
 
-        # 失败档案命中 → 放行重跑（不比对指纹）
+        # 无可信基线 → 保守放行
+        dec_no_baseline = policy.evaluate(
+            {"task_type": "t", "rerun": "on_input_change"},
+            success_metadata=meta, is_success=True, is_failed=False,
+            baseline_lookup=lambda: None,
+        )
+        assert dec_no_baseline.should_run
+
+        # 失败档案命中 → 放行重跑（不查询基线）
+        def _must_not_call():
+            raise AssertionError("baseline lookup must be lazy")
+
         dec_failed = policy.evaluate(
-            {"task_type": "t", "rerun": "on_input_change"}, is_success=False, is_failed=True
+            {"task_type": "t", "rerun": "on_input_change"}, is_success=False, is_failed=True,
+            baseline_lookup=_must_not_call,
         )
         assert dec_failed.should_run
         assert dec_failed.reason == DecisionReason.ON_FAILURE_MATCH
 
         # 无历史命中 → 全新运行
         dec_fresh = policy.evaluate(
-            {"task_type": "t", "rerun": "on_input_change"}, is_success=False, is_failed=False
+            {"task_type": "t", "rerun": "on_input_change"}, is_success=False, is_failed=False,
+            baseline_lookup=_must_not_call,
         )
         assert dec_fresh.should_run
         assert dec_fresh.reason == DecisionReason.FRESH
@@ -130,49 +160,99 @@ class TestAdmitNarrowInterface:
 
 
 class TestInputChangeAndStatCache:
-    def test_input_changed_detects_mtime_and_size(self, tmp_path):
+    def test_equal_microsecond_does_not_trigger_strictly_later_does(self, tmp_path):
         data_file = tmp_path / "data.txt"
         data_file.write_text("hello")
-        st = data_file.stat()
-
+        base_ns = 1_700_000_000_123_456_000
+        os.utime(data_file, ns=(base_ns, base_ns + 999))
+        baseline_us = base_ns // 1_000
         policy = RerunPolicy()
-        success_metadata = {"inputs": [{"path": str(data_file), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
-        assert not policy.check_input_changed(success_metadata)
+        meta = _trusted_meta([str(data_file)])
+        # 同一微秒内的亚微秒差（999ns）截断后相等 → 不触发
+        assert not policy.check_input_changed(meta, last_succeeded_at_us=baseline_us)
+        os.utime(data_file, ns=(base_ns, base_ns + 1_000))
+        assert policy.check_input_changed(meta, last_succeeded_at_us=baseline_us)
 
-        data_file.write_text("hello world")
-        policy.clear_stat_cache()
-        assert policy.check_input_changed(success_metadata)
+    def test_size_only_change_with_same_mtime_does_not_trigger(self, tmp_path):
+        data_file = tmp_path / "data.txt"
+        data_file.write_text("hello")
+        base_ns = 1_700_000_000_000_000_000
+        os.utime(data_file, ns=(base_ns, base_ns))
+        policy = RerunPolicy()
+        meta = _trusted_meta([str(data_file)])
+        data_file.write_text("hello world, longer")
+        os.utime(data_file, ns=(base_ns, base_ns))
+        assert not policy.check_input_changed(meta, last_succeeded_at_us=base_ns // 1_000)
+
+    def test_directory_input_stats_directory_itself_only(self, tmp_path):
+        folder = tmp_path / "dir"
+        folder.mkdir()
+        base_ns = 1_700_000_000_000_000_000
+        os.utime(folder, ns=(base_ns, base_ns))
+        policy = RerunPolicy()
+        meta = _trusted_meta([str(folder)])
+        nested = tmp_path / "dir_sub"
+        nested.mkdir()
+        assert not policy.check_input_changed(meta, last_succeeded_at_us=base_ns // 1_000)
+        (folder / "new.txt").write_text("x")
+        os.utime(folder, ns=(base_ns + 5_000, base_ns + 5_000))
+        assert policy.check_input_changed(meta, last_succeeded_at_us=base_ns // 1_000)
+
+    def test_default_baseline_extracted_from_trusted_metadata(self, tmp_path):
+        data_file = tmp_path / "data.txt"
+        data_file.write_text("hello")
+        base_ns = 1_700_000_000_000_000_000
+        os.utime(data_file, ns=(base_ns, base_ns))
+        policy = RerunPolicy()
+        meta = _trusted_meta([str(data_file)], last_succeeded_at="2023-11-14T22:13:20+00:00")
+        assert not policy.check_input_changed(meta)
+        assert policy.check_input_changed({"inputs": [str(data_file)]})
 
     def test_input_changed_stat_cache_avoids_repeated_syscalls(self, tmp_path):
         data_file = tmp_path / "data.txt"
         data_file.write_text("hello")
-        st = data_file.stat()
+        baseline_us = data_file.stat().st_mtime_ns // 1_000
 
         policy = RerunPolicy(enable_stat_cache=True)
-        success_metadata = {"inputs": [{"path": str(data_file), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
-        assert not policy.check_input_changed(success_metadata)
+        meta = _trusted_meta([str(data_file)])
+        assert not policy.check_input_changed(meta, last_succeeded_at_us=baseline_us)
 
         # 文件被删但缓存命中：沿用缓存事实判定未变化
         data_file.unlink()
-        assert not policy.check_input_changed(success_metadata)
+        assert not policy.check_input_changed(meta, last_succeeded_at_us=baseline_us)
 
         # 清除缓存后感知到文件缺失
         policy.clear_stat_cache()
-        assert policy.check_input_changed(success_metadata)
+        assert policy.check_input_changed(meta, last_succeeded_at_us=baseline_us)
 
     def test_input_changed_corrupt_data_fail_safe(self):
         policy = RerunPolicy()
-        # 非 dict、非 list、损坏元素均安全判定为 True（放行重跑）
+        # 缺基线、非 list、空 list、非 str 元素均安全判定为 True（放行重跑）
         assert policy.check_input_changed(None)
         assert policy.check_input_changed({})
-        assert policy.check_input_changed({"inputs": "corrupt_string"})
-        assert policy.check_input_changed({"inputs": [42, "bar"]})
-        assert policy.check_input_changed({"inputs": [{"path": 12345}]})
+        assert policy.check_input_changed({"inputs": "corrupt"}, last_succeeded_at_us=1)
+        assert policy.check_input_changed({"inputs": []}, last_succeeded_at_us=1)
+        assert policy.check_input_changed({"inputs": [42]}, last_succeeded_at_us=1)
+        assert policy.check_input_changed({"inputs": [{"path": "/x"}]}, last_succeeded_at_us=1)
+        assert policy.check_input_changed({"inputs": ["/x"]}, last_succeeded_at_us=True)
 
-    def test_input_changed_skips_uri_entries(self):
-        policy = RerunPolicy()
-        meta = {"inputs": [{"kind": "uri", "path": "http://example.com/a", "size": None, "mtime_ns": None}]}
-        assert policy.check_input_changed(meta) is False
+
+class TestTrustedMetadataFilter:
+    def test_seed_empty_and_incomplete_metadata_untrusted(self):
+        assert extract_trusted_metadata_timestamp_us(None) is None
+        assert extract_trusted_metadata_timestamp_us({}) is None
+        assert not is_trusted_success_metadata({"last_succeeded_at": "2026-05-01T00:00:00+00:00"})
+        assert not is_trusted_success_metadata(_trusted_meta([], success_count=0))
+        assert not is_trusted_success_metadata(_trusted_meta([], success_count=True))
+        assert not is_trusted_success_metadata(_trusted_meta([], last_succeeded_at="garbage"))
+        assert not is_trusted_success_metadata(_trusted_meta([], last_succeeded_at="2026-05-01T00:00:00"))
+        bad_run = _trusted_meta([])
+        bad_run["last_success_run_id"] = ""
+        assert not is_trusted_success_metadata(bad_run)
+
+    def test_complete_framework_metadata_trusted_in_microseconds(self):
+        meta = _trusted_meta([], last_succeeded_at="1970-01-01T00:00:01.000002+00:00")
+        assert extract_trusted_metadata_timestamp_us(meta) == 1_000_002
 
 
 class TestDiscoveryPolicyNormalization:

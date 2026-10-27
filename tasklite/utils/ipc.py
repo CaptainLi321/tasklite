@@ -3,7 +3,7 @@
 统一内敛文件级 IPC 与产物清单的完整生命周期管理：
 
 - 路径与沙盒校验：空字节防御、跨盘多根沙盒匹配、相对路径规范重定位；
-- 声明追加落盘：输入（文件 stat 指纹 / URI 声明）、输出（产物 / 临时
+- 声明追加落盘：输入（规范路径）、输出（产物 / 临时
   cache 声明）、挂起信号；
 - 结果落盘与降级：原子写（fsync + replace）、两级降级、坏行/损坏容灾
   解析；瞬态信号（interrupted / lock_conflict / rate_limited）的降级
@@ -82,7 +82,7 @@ class ArtifactCleanupMode(str, enum.Enum):
 class ArtifactJournal:
     """产物清单与文件级 IPC 声明深模块。
 
-    对外提供极简高层操作，封装沙盒越界防御、stat 指纹采集、坏行容灾
+    对外提供极简高层操作，封装沙盒越界防御、输入路径记录、坏行容灾
     解析、原子清空、结果原子落盘/降级与多模式文件生命周期清理逻辑。
     """
 
@@ -231,27 +231,10 @@ class ArtifactJournal:
         except OSError:
             pass
 
-    def record_input_file(self, job_uid: str, resolved_path: str) -> dict:
-        """采集文件 stat 指纹并追加输入声明。"""
-        entry: dict = {"path": resolved_path, "kind": "file"}
-        try:
-            st = os.stat(resolved_path)
-            entry["size"] = st.st_size
-            entry["mtime_ns"] = st.st_mtime_ns
-        except OSError:
-            pass
-        self.record_input_entry(job_uid, entry)
-        return entry
-
-    def record_input_uri(
-        self, job_uid: str, url: str, uri_fingerprint: str | None = None
-    ) -> dict:
-        """记录 URI 输入声明。"""
-        entry: dict = {"path": url, "kind": "uri"}
-        if uri_fingerprint is not None:
-            entry["uri_fingerprint"] = uri_fingerprint
-        self.record_input_entry(job_uid, entry)
-        return entry
+    def record_input_file(self, job_uid: str, resolved_path: str) -> str:
+        """追加一条规范输入路径声明并返回该路径字符串。"""
+        self.record_input_entry(job_uid, {"path": resolved_path})
+        return resolved_path
 
     def record_signal(
         self, job_uid: str, resource_name: str, seconds: float
@@ -348,12 +331,12 @@ class ArtifactJournal:
 
     # ── 读取与解析（父进程 Engine 侧）─────────────────────────────
 
-    def read_inputs(self, job_uid: str) -> list[dict]:
-        """读取一个 job 的全部输入声明（坏行容灾跳过）。"""
+    def read_inputs(self, job_uid: str) -> list[str]:
+        """读取一个 job 的全部已声明输入路径字符串列表（坏行容灾跳过）。"""
         if self.ipc_dir is None:
             return []
         path = self.inputs_path(job_uid)
-        entries: list[dict] = []
+        paths: list[str] = []
         try:
             if path.exists():
                 with open(path, encoding="utf-8") as f:
@@ -363,13 +346,13 @@ class ArtifactJournal:
                             continue
                         try:
                             data = loads(line)
-                            if isinstance(data, dict) and isinstance(data.get("path"), str):
-                                entries.append(data)
+                            if isinstance(data, dict) and isinstance(data.get("path"), str) and data["path"]:
+                                paths.append(data["path"])
                         except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
                             continue
         except OSError:
             pass
-        return entries
+        return paths
 
     def read_outputs(self, job_uid: str) -> list[tuple[str, bool, str]]:
         """读取一个 job 的全部已声明输出 (path, cleanup, kind)。"""

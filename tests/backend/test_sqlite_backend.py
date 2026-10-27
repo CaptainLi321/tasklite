@@ -101,7 +101,7 @@ class TestSchemaInit:
             for table, columns in expected.items():
                 assert {row[1] for row in conn.execute(f"PRAGMA table_xinfo({table})")} == columns
             indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-        assert {"idx_queue_position", "idx_attempts_job_uid"} <= indexes
+        assert {"idx_queue_position", "idx_attempts_job_uid", "idx_attempts_job_uid_outcome"} <= indexes
         assert "idx_queue_seq" not in indexes
 
     def test_init_is_idempotent_and_preserves_data(self, tmp_path):
@@ -875,6 +875,24 @@ class TestSqliteAttemptTrajectory:
         )
         assert rows[1][:2] == (second_id, "t::other")
         assert rows[1][3] == "running" and rows[1][4] is None
+
+    def test_load_latest_succeeded_finished_at(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        backend = SQLiteStateBackend(db_path)
+        assert backend.load_latest_succeeded_finished_at("t::one") is None
+
+        a1 = backend.append_attempt(_running_attempt("t::one", attempt_no=1))
+        backend.update_attempt(a1, outcome="succeeded", finished_at="2026-05-01T00:00:01+00:00")
+        assert backend.load_latest_succeeded_finished_at("t::one") == "2026-05-01T00:00:01+00:00"
+
+        a2 = backend.append_attempt(_running_attempt("t::one", attempt_no=2))
+        backend.update_attempt(a2, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
+        assert backend.load_latest_succeeded_finished_at("t::one") == "2026-05-01T00:00:05+00:00"
+
+        # 后续 failed 不覆盖最新成功时间
+        a3 = backend.append_attempt(_running_attempt("t::one", attempt_no=3))
+        backend.update_attempt(a3, outcome="failed", finished_at="2026-05-01T00:00:09+00:00", error_message="err")
+        assert backend.load_latest_succeeded_finished_at("t::one") == "2026-05-01T00:00:05+00:00"
 
 
 class TestSeedWallAndCursor:

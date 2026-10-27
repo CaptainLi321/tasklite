@@ -187,6 +187,9 @@ class RecoveryOrchestrator:
                     success_metadata=successes.get(u),
                     is_success=success_hit,
                     is_failed=failed_hit,
+                    baseline_lookup=lambda uid=u: self._store.trusted_last_succeeded_at_us(
+                        uid, success_metadata=successes.get(uid)
+                    ),
                 )
                 if decision.should_skip:
                     dropped_uids.append(u)

@@ -172,6 +172,32 @@ class TestCoreContractProperties:
             999999, outcome="skipped", finished_at="2026-05-01T00:00:09+00:00"
         ) is False
 
+    def test_load_latest_succeeded_finished_at_narrow_query(self, dual_backend):
+        """按 attempt_id 倒序精确定位最新一次成功完成时间戳，不受前后非成功行干扰。"""
+        b = dual_backend
+        assert b.load_latest_succeeded_finished_at("t::none") is None
+
+        # 仅有 running / failed 轨迹时无成功基线
+        a1 = b.append_attempt(_running_attempt("t::job", attempt_no=1))
+        b.update_attempt(a1, outcome="failed", finished_at="2026-05-01T00:00:01+00:00", error_message="boom")
+        assert b.load_latest_succeeded_finished_at("t::job") is None
+
+        # 写入第一次成功
+        a2 = b.append_attempt(_running_attempt("t::job", attempt_no=2))
+        b.update_attempt(a2, outcome="succeeded", finished_at="2026-05-01T00:00:02+00:00")
+        assert b.load_latest_succeeded_finished_at("t::job") == "2026-05-01T00:00:02+00:00"
+
+        # 写入第二次成功（时间更新）
+        a3 = b.append_attempt(_running_attempt("t::job", attempt_no=3))
+        b.update_attempt(a3, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
+        assert b.load_latest_succeeded_finished_at("t::job") == "2026-05-01T00:00:05+00:00"
+
+        # 随后发生失败重跑或在途执行，最新成功时间戳不受干扰
+        a4 = b.append_attempt(_running_attempt("t::job", attempt_no=4))
+        b.update_attempt(a4, outcome="failed", finished_at="2026-05-01T00:00:06+00:00", error_message="err")
+        b.append_attempt(_running_attempt("t::job", attempt_no=5))
+        assert b.load_latest_succeeded_finished_at("t::job") == "2026-05-01T00:00:05+00:00"
+
     def test_meta_roundtrip_upsert(self, dual_backend):
         b = dual_backend
         assert b.get_engine_metadata("fencing") is None

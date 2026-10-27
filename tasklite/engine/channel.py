@@ -765,8 +765,8 @@ class ExecutionChannel:
         """统一收敛产物与 IPC 临时文件的生命周期清理。"""
         self.journal.cleanup(job_uid, mode=mode)
 
-    def read_declared_inputs(self, job_uid: str) -> list[dict]:
-        """读取任务声明的输入清单。"""
+    def read_declared_inputs(self, job_uid: str) -> list[str]:
+        """读取任务声明的输入路径清单。"""
         try:
             return self.journal.read_inputs(job_uid)
         except Exception:

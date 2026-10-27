@@ -140,7 +140,7 @@ class TestCompleteJobSuccess:
         )
         monkeypatch.setattr(
             env.channel, "read_declared_inputs",
-            lambda uid: [{"path": "/data/in.csv", "kind": "file", "size": 3}],
+            lambda uid: ["/data/in.csv"],
         )
 
         result = ExecutionResult(success=True, result_metadata={"score": 100})
@@ -149,7 +149,7 @@ class TestCompleteJobSuccess:
         assert env.resources["gpu"].used == 0.0
         assert env.store.state.successes["t::j1"]["score"] == 100
         assert env.store.state.successes["t::j1"]["last_success_run_id"] == env.session.run_id
-        assert env.store.state.successes["t::j1"]["inputs"][0]["path"] == "/data/in.csv"
+        assert env.store.state.successes["t::j1"]["inputs"] == ["/data/in.csv"]
         assert env.stats["succeeded"] == 1
         assert "t::j1" not in env.store.state.in_flight_uids
         assert cleaned == [("t::j1", ArtifactCleanupMode.SUCCESS)]

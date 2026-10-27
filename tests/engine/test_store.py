@@ -112,7 +112,7 @@ class TestApplySuccess:
             "process::1",
             {"score": 100},
             run_id="run_abc",
-            declared_inputs=[{"path": "/tmp/a.txt", "kind": "file"}],
+            declared_inputs=["/tmp/a.txt"],
             attempt_id=aid,
             execution_id="run_abc.1",
         )
@@ -123,7 +123,7 @@ class TestApplySuccess:
         assert store.state.successes["process::1"]["last_success_run_id"] == "run_abc"
         assert store.state.successes["process::1"]["success_count"] == 1
         assert "last_succeeded_at" in store.state.successes["process::1"]
-        assert store.state.successes["process::1"]["inputs"][0]["path"] == "/tmp/a.txt"
+        assert store.state.successes["process::1"]["inputs"] == ["/tmp/a.txt"]
         assert "process::1" not in store.state.in_flight_uids
         (rec,) = backend.load_attempts("process::1")
         assert rec.outcome == "succeeded"
@@ -165,23 +165,103 @@ class TestApplySuccess:
         assert [jd["job_id"] for jd in store.state.queue] == ["c1", "c2"]
         assert store.stats is None  # 未注入统计不炸
 
-    def test_declared_inputs_deduped_by_path(self):
+    def test_declared_inputs_deduped_preserving_order(self):
+        store, _, backend = _make_store()
+        aid = _open_running_attempt(backend, "t::1")
+        store.apply_success(
+            "t::1",
+            {"inputs": ["/user/spoofed"]},
+            declared_inputs=["/b", "/a", "/b", "", 42, {"path": "/c"}],
+            attempt_id=aid,
+        )
+        assert store.state.successes["t::1"]["inputs"] == ["/b", "/a"]
+
+    def test_user_inputs_key_dropped_without_declarations(self):
+        store, _, backend = _make_store()
+        aid = _open_running_attempt(backend, "t::1")
+        store.apply_success("t::1", {"inputs": ["/user/spoofed"]}, attempt_id=aid)
+        assert "inputs" not in store.state.successes["t::1"]
+
+
+class TestTrustedLastSucceededAtUs:
+    """可信成功基线查询（trusted_last_succeeded_at_us）判定矩阵。"""
+
+    def test_missing_successes_returns_none_even_with_attempts_row(self):
+        store, _, backend = _make_store()
+        aid = _open_running_attempt(backend, "t::1")
+        backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
+        assert store.trusted_last_succeeded_at_us("t::1") is None
+
+    def test_seed_successes_empty_metadata_returns_none(self):
+        store, state, backend = _make_store()
+        aid = _open_running_attempt(backend, "t::1")
+        backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
+        state.add_success("t::1", {})
+        assert store.trusted_last_succeeded_at_us("t::1") is None
+
+    def test_clear_history_then_seed_rejects_old_attempts_row(self):
+        store, state, backend = _make_store()
+        aid = _open_running_attempt(backend, "t::1")
+        store.apply_success("t::1", {}, attempt_id=aid, finished_at="2026-05-01T00:00:05+00:00")
+        assert store.trusted_last_succeeded_at_us("t::1") is not None
+
+        # 模拟清空 successes 历史后人工种子
+        state.discard_success("t::1")
+        assert store.trusted_last_succeeded_at_us("t::1") is None
+        state.add_success("t::1", {})
+        assert store.trusted_last_succeeded_at_us("t::1") is None
+
+    def test_incomplete_or_corrupt_metadata_returns_none(self):
+        store, state, backend = _make_store()
+        aid = _open_running_attempt(backend, "t::1")
+        backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
+
+        # 缺 success_count / 非整数
+        state.add_success("t::1", {"last_succeeded_at": "2026-05-01T00:00:05+00:00"})
+        assert store.trusted_last_succeeded_at_us("t::1") is None
+        state.add_success("t::1", {"last_succeeded_at": "2026-05-01T00:00:05+00:00", "success_count": 0})
+        assert store.trusted_last_succeeded_at_us("t::1") is None
+        state.add_success("t::1", {"last_succeeded_at": "2026-05-01T00:00:05+00:00", "success_count": True})
+        assert store.trusted_last_succeeded_at_us("t::1") is None
+
+        # 坏时间戳
+        state.add_success("t::1", {"last_succeeded_at": "corrupt", "success_count": 1})
+        assert store.trusted_last_succeeded_at_us("t::1") is None
+
+        # 空 last_success_run_id
+        state.add_success(
+            "t::1",
+            {"last_succeeded_at": "2026-05-01T00:00:05+00:00", "success_count": 1, "last_success_run_id": ""},
+        )
+        assert store.trusted_last_succeeded_at_us("t::1") is None
+
+    def test_valid_success_returns_exact_integer_microseconds(self):
         store, _, backend = _make_store()
         aid = _open_running_attempt(backend, "t::1")
         store.apply_success(
             "t::1",
             {},
-            declared_inputs=[
-                {"path": "/a", "size": 1},
-                {"path": "/a", "size": 2},
-                {"not_path": True},
-                "junk",
-            ],
+            run_id="run_valid",
             attempt_id=aid,
+            finished_at="1970-01-01T00:00:01.123456+00:00",
         )
-        inputs = store.state.successes["t::1"]["inputs"]
-        assert len(inputs) == 1
-        assert inputs[0]["size"] == 2
+        assert store.trusted_last_succeeded_at_us("t::1") == 1_123_456
+
+    def test_mismatched_finished_at_between_successes_and_attempts_returns_none(self):
+        """successes 的 last_succeeded_at 与 attempts 最新 succeeded 行时间不一致时不采信。"""
+        store, state, backend = _make_store()
+        aid = _open_running_attempt(backend, "t::1")
+        backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:01+00:00")
+        state.add_success(
+            "t::1",
+            {
+                "success_count": 1,
+                "last_succeeded_at": "2026-05-01T00:00:09+00:00",
+                "last_success_run_id": "run_1",
+            },
+        )
+        # 即使两者各自合法，只要不相等就不采信为基线
+        assert store.trusted_last_succeeded_at_us("t::1") is None
 
 
 class TestApplyFailureAndCascade:

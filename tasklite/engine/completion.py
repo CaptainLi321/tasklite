@@ -325,7 +325,10 @@ class CompletionMachine:
             if store.state.is_known(spawned_uid):
                 if spawned_uid in store.state.queue_uids or spawned_uid in store.state.in_flight_uids:
                     continue
-                decision = self._rerun_policy.admit(spawned_job.to_dict(), store.state)
+                decision = self._rerun_policy.admit(
+                    spawned_job.to_dict(), store.state,
+                    baseline_lookup=store.trusted_last_succeeded_at_us,
+                )
                 if decision.should_skip:
                     continue
             seen_in_batch.add(spawned_uid)

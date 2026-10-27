@@ -51,6 +51,7 @@ EXPECTED_ABSTRACT_METHODS = {
     "append_attempt",
     "update_attempt",
     "load_attempts",
+    "load_latest_succeeded_finished_at",
     # 元数据
     "get_engine_metadata",
     "set_engine_metadata",

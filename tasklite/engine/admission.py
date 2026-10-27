@@ -3,7 +3,7 @@
 统一内敛：
 1. rerun 四策略矩阵评估（never / on_failure / every_run / on_input_change）
    ——策略只作用于 successes/failed 拦截点，queue/in-flight 永远算数；
-2. 磁盘文件输入指纹（stat）比对与实例级 stat 缓存；
+2. 输入路径 mtime（整数微秒）严格晚于可信成功基线的比对与实例级 stat 缓存；
 3. 任务级默认策略（discovery 注入面）的入队规范化；
 4. 重入队节奏接缝（RequeuePolicy）：重试节奏的唯一出口，默认实现为
    立即重入队——核心不出现任何节奏计算，未来延迟类策略经此插入。
@@ -14,9 +14,47 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from ..models.state import job_uid_from_snapshot
+from ..utils.clock import mtime_ns_to_us, parse_utc_iso_to_us
+
+_UNSET = object()
+
+
+def extract_trusted_metadata_timestamp_us(
+    metadata: Mapping[str, Any] | None,
+) -> int | None:
+    """从 successes 档案 metadata 中提取并校验框架写入的可信完成时间戳（整数微秒）。
+
+    过滤人工 seed_successes 的空字典 ``{}``、缺失或非正整数的 ``success_count``、
+    非法 ``last_success_run_id`` 以及缺失或无法解析的 ``last_succeeded_at``。
+    """
+    if not isinstance(metadata, Mapping) or not metadata:
+        return None
+    success_count = metadata.get("success_count")
+    if (
+        not isinstance(success_count, int)
+        or isinstance(success_count, bool)
+        or success_count < 1
+    ):
+        return None
+    if "last_success_run_id" in metadata:
+        run_id = metadata.get("last_success_run_id")
+        if not isinstance(run_id, str) or not run_id:
+            return None
+    last_succeeded_at = metadata.get("last_succeeded_at")
+    if not isinstance(last_succeeded_at, str) or not last_succeeded_at:
+        return None
+    try:
+        return parse_utc_iso_to_us(last_succeeded_at)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_trusted_success_metadata(metadata: Mapping[str, Any] | None) -> bool:
+    """判断 successes 档案 metadata 是否具备完整的框架成功运行元数据。"""
+    return extract_trusted_metadata_timestamp_us(metadata) is not None
 
 
 class TerminalHistory(Protocol):
@@ -103,26 +141,39 @@ class RerunPolicy:
             return True
         return False
 
-    def check_input_changed(self, success_metadata: dict | None) -> bool:
-        """比对 successes 历史输入指纹与当前磁盘文件状态（带 stat 缓存与脏数据容灾）。
+    def check_input_changed(
+        self,
+        success_metadata: Mapping[str, Any] | None,
+        *,
+        last_succeeded_at_us: Any = _UNSET,
+    ) -> bool:
+        """比对可信成功基线微秒时间（last_succeeded_at_us）与输入路径当前磁盘 mtime_us。
 
-        任一文件输入 size/mtime_ns 变化（或文件消失、或 successes 无历史指纹）
-        → 视为变化（True）→ 重跑。URI 声明不参与比对。
+        任一输入路径的 mtime_us 严格晚于基线时间（或缺乏可信基线、无有效输入列表、
+        文件缺失）→ 视为变化（True）→ 放行重跑；全部 mtime_us <= baseline_us → False。
         """
-        prev_inputs = success_metadata.get("inputs") if isinstance(success_metadata, dict) else None
-        if not isinstance(prev_inputs, list):
+        if last_succeeded_at_us is _UNSET:
+            baseline_us = extract_trusted_metadata_timestamp_us(success_metadata)
+        elif (
+            isinstance(last_succeeded_at_us, int)
+            and not isinstance(last_succeeded_at_us, bool)
+        ):
+            baseline_us = last_succeeded_at_us
+        else:
+            baseline_us = None
+
+        if baseline_us is None:
             return True
-        for entry in prev_inputs:
-            if not isinstance(entry, dict):
-                return True
-            if entry.get("kind") == "uri":
-                continue
-            path = entry.get("path")
-            if not path or not isinstance(path, str):
-                return True
-            size = entry.get("size")
-            mtime_ns = entry.get("mtime_ns")
-            if size is None or mtime_ns is None:
+
+        prev_inputs = (
+            success_metadata.get("inputs")
+            if isinstance(success_metadata, Mapping)
+            else None
+        )
+        if not isinstance(prev_inputs, list) or not prev_inputs:
+            return True
+        for path in prev_inputs:
+            if not isinstance(path, str) or not path:
                 return True
             try:
                 if self.enable_stat_cache:
@@ -138,7 +189,7 @@ class RerunPolicy:
                     st = os.stat(path)
             except OSError:
                 return True
-            if st.st_size != size or st.st_mtime_ns != mtime_ns:
+            if mtime_ns_to_us(st.st_mtime_ns) > baseline_us:
                 return True
         return False
 
@@ -150,8 +201,13 @@ class RerunPolicy:
         success_metadata: dict | None = None,
         is_success: bool = False,
         is_failed: bool = False,
+        baseline_lookup: Callable[[], int | None] | None = None,
     ) -> PreflightDecision:
-        """评估作业是否应当被拦截或放行重跑。"""
+        """评估作业是否应当被拦截或放行重跑。
+
+        ``baseline_lookup`` 惰性返回可信成功基线（整数微秒），仅在
+        on_input_change 命中 successes 时调用；缺省时从 metadata 提取。
+        """
         if isinstance(job_snapshot_or_rerun, dict):
             rerun_raw = job_snapshot_or_rerun.get("rerun")
             actual_task_type = task_type or job_snapshot_or_rerun.get("task_type")
@@ -201,7 +257,11 @@ class RerunPolicy:
                     effective_rerun=rerun,
                 )
             if is_success:
-                changed = self.check_input_changed(success_metadata)
+                baseline = baseline_lookup() if baseline_lookup is not None else _UNSET
+                changed = self.check_input_changed(
+                    success_metadata,
+                    last_succeeded_at_us=baseline,
+                )
                 if changed:
                     return PreflightDecision(
                         action=PreflightAction.RUN,
@@ -238,6 +298,8 @@ class RerunPolicy:
         self,
         job_snapshot: dict,
         history: TerminalHistory,
+        *,
+        baseline_lookup: Callable[[str], int | None] | None = None,
     ) -> PreflightDecision:
         """统一极窄准入判定入口：从终态历史契约提取上下文并执行评估。
 
@@ -253,6 +315,9 @@ class RerunPolicy:
             success_metadata=success_metadata,
             is_success=success_hit,
             is_failed=failed_hit,
+            baseline_lookup=(
+                (lambda: baseline_lookup(uid)) if baseline_lookup is not None else None
+            ),
         )
 
 
@@ -320,4 +385,6 @@ __all__ = [
     "RequeuePolicy",
     "RerunPolicy",
     "TerminalHistory",
+    "extract_trusted_metadata_timestamp_us",
+    "is_trusted_success_metadata",
 ]
