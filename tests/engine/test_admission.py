@@ -173,6 +173,18 @@ class TestInputChangeAndStatCache:
         os.utime(data_file, ns=(base_ns, base_ns + 1_000))
         assert policy.check_input_changed(meta, last_succeeded_at_us=baseline_us)
 
+    def test_strictly_earlier_microsecond_does_not_trigger(self, tmp_path):
+        data_file = tmp_path / "data.txt"
+        data_file.write_text("hello")
+        base_ns = 1_700_000_000_123_456_000
+        baseline_us = base_ns // 1_000
+        # 输入文件 mtime_us 严格小于基线时间（例如 T - 1000μs）
+        earlier_ns = base_ns - 1_000_000
+        os.utime(data_file, ns=(earlier_ns, earlier_ns))
+        policy = RerunPolicy()
+        meta = _trusted_meta([str(data_file)])
+        assert not policy.check_input_changed(meta, last_succeeded_at_us=baseline_us)
+
     def test_size_only_change_with_same_mtime_does_not_trigger(self, tmp_path):
         data_file = tmp_path / "data.txt"
         data_file.write_text("hello")

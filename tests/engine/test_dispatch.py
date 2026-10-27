@@ -644,6 +644,8 @@ class TestAdmissionEvaluationTiming:
         """attempt_no > 1 沿用激活内重试，不重调策略准入。"""
         env = DispatchEnv(tmp_path)
         env.register("t")
+        # 记录历史成功；若错误执行了准入评估（rerun 默认 never），将被判定为跳过
+        env.store.state.mark_success("t::j1", {})
         retry_job = Job("t", "j1", attempt_no=2, activation_no=1)
         env.store.state.spawn_jobs([retry_job.to_dict()])
         monkeypatch.setattr(

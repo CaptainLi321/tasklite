@@ -58,7 +58,7 @@ class TestParseUtcIsoToUs:
             parse_utc_iso_to_us(12345)  # type: ignore[arg-type]
         with pytest.raises(ValueError):
             parse_utc_iso_to_us("")
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             parse_utc_iso_to_us("not-a-timestamp")
 
 
