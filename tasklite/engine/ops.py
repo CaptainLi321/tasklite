@@ -1,7 +1,7 @@
 """OpsConsole：run() 外纯运维接缝。
 
 从 StateStore 剥离管理段逻辑（list_failures / clear_failures / retry_
-failure / clear_history / seed_wall / seed_cursor / list_suspensions /
+failure / clear_history / seed_successes / seed_cursor / list_suspensions /
 filter_jobs_without_success），供门面管理 API 委托。不变式：管理 API 仅限 run() 外
 调用（改变 is_known 判定基础，与 enqueue 同纪律）。
 """
@@ -103,15 +103,15 @@ class OpsConsole:
         return entries
 
     def list_failures(self) -> list[FailureEntry]:
-        """只读查询失败档案，返回结构化条目（uid / error / meta /
-        job_payload）。
+        """只读查询失败档案，返回结构化条目（job_uid / error_message / metadata /
+        payload）。
 
         meta 视图缺 error_type（带外登记的裸行）时经 classifier 就地归档
         （unknown 兜底）；损坏行（非 dict）归空视图，绝不让单条脏数据
         打断整条查询。
         """
         failed = self._store.backend.load_failed()
-        payloads = self._store.backend.load_failed_payloads()
+        payloads = self._store.backend.load_failure_payloads()
         entries: list[FailureEntry] = []
         for uid, meta in sorted(failed.items()):
             if not isinstance(meta, dict):
@@ -119,28 +119,28 @@ class OpsConsole:
             meta_view = dict(meta)
             if not meta_view.get("error_type"):
                 meta_view["error_type"] = (
-                    self._classifier.classify(meta).failed_error_type
+                    self._classifier.classify(meta).failed_error_category
                 )
             entries.append(FailureEntry(
-                uid=uid,
-                error=str(meta_view.get("error", "")),
-                meta=meta_view,
-                job_payload=payloads.get(uid),
+                job_uid=uid,
+                error_message=str(meta_view.get("error", "")),
+                metadata=meta_view,
+                payload=payloads.get(uid),
             ))
         return entries
 
     def filter_jobs_without_success(self, jobs: Sequence[Job]) -> list[Job]:
-        """过滤出尚未成功完成的 job（uid 不在 wall 的子集，保留输入顺序）。
+        """过滤出尚未成功完成的 job（uid 不在 successes 的子集，保留输入顺序）。
 
         回溯/增量场景的入队前过滤辅助。边界语义：
-        - 只按 wall（成功历史）过滤；失败档案（failed）中的 job **不**
+        - 只按 successes（成功历史）过滤；失败档案（failed）中的 job **不**
           排除——重新入队后是否重跑由 ``Job(rerun=...)`` 在派发层裁决
           （默认 ``never`` 静默跳过，``on_failure`` 重跑），此处抢先过滤
           会吞掉重跑策略的豁免语义；
         - 已驻留队列的重复 uid 不排除——队列去重是 enqueue 自身的职责。
         """
-        wall = self._store.backend.load_wall()
-        return [j for j in jobs if j.uid not in wall]
+        successes = self._store.backend.load_successes()
+        return [j for j in jobs if j.uid not in successes]
 
     # ── 变更操作 ──────────────────────────────────────────────────────
 
@@ -203,7 +203,7 @@ class OpsConsole:
         if uid not in failed:
             raise KeyError(f"uid {uid!r} not in failure archive")
         task_type, _, job_id = uid.partition("::")
-        payloads = self._store.backend.load_failed_payloads()
+        payloads = self._store.backend.load_failure_payloads()
         # 激活代取轨迹最大值 +1（failed 拦截点放行 = 新激活代），attempt_no
         # 经 Job 模型默认归 1；payload 取档案快照（无快照回退空 dict）。
         prior_activation = max(
@@ -226,10 +226,10 @@ class OpsConsole:
         self,
         targets: str | Sequence[str],
         *,
-        where: Sequence[str] = ("wall", "failed"),
+        where: Sequence[str] = ("successes", "failed"),
         predicate: Callable[[str], bool] | None = None,
     ) -> int:
-        """从 wall 和/或失败档案删除条目。
+        """从 successes 和/或失败档案删除条目。
 
         ``predicate`` 提供官方的「Python 侧判定 + 定向批删」通道：对
         targets 命中的 uid 逐条调用，返回 False 则保留。判定在本进程
@@ -256,15 +256,15 @@ class OpsConsole:
             )
         if not isinstance(where, (list, tuple)):
             raise TypeError(
-                f"where must be a sequence of 'wall'/'failed', "
+                f"where must be a sequence of 'successes'/'failed', "
                 f"got {type(where).__name__}"
             )
         where_set = set(where)
-        unknown = where_set - {"wall", "failed"}
+        unknown = where_set - {"successes", "failed"}
         if unknown:
             raise ValueError(
                 f"where contains unknown target(s): {sorted(unknown)!r}; "
-                f"allowed: 'wall', 'failed'"
+                f"allowed: 'successes', 'failed'"
             )
 
         def _matches(uid: str) -> bool:
@@ -276,13 +276,13 @@ class OpsConsole:
 
         state = self._store.state
         total = 0
-        if "wall" in where:
-            wall = self._store.backend.load_wall()
-            matched = [u for u in wall if _matches(u)]
+        if "successes" in where:
+            successes = self._store.backend.load_successes()
+            matched = [u for u in successes if _matches(u)]
             if matched:
-                total += self._store.backend.delete_wall(matched)
+                total += self._store.backend.delete_successes(matched)
                 for u in matched:
-                    state.discard_wall(u)
+                    state.discard_success(u)
         if "failed" in where:
             failed = self._store.backend.load_failed()
             matched = [u for u in failed if _matches(u)]
@@ -292,14 +292,14 @@ class OpsConsole:
                     state.discard_failed(u)
         return total
 
-    def seed_wall(self, uids: Sequence[str]) -> int:
-        """把 uid 批量写入 wall（存档迁移标记「已处理」），返回实际写入数。
+    def seed_successes(self, uids: Sequence[str]) -> int:
+        """把 uid 批量写入 successes（存档迁移标记「已处理」），返回实际写入数。
 
         不变式（六集合互斥）：已在失败档案或驻留队列的 uid 拒绝种子。
         failed 与 queue 两腿均以后端持久层为真相（run 前内存 state 是
         空占位，仅查内存腿会漏掉落盘队列驻留）。预检先于任何写入
         （backend 持久层与内存 state 双腿零写入），冲突整体拒绝——静默
-        写入会留下 wall∩failed / wall∩queue 非豁免重叠，令下一次状态
+        写入会留下 successes∩failed / successes∩queue 非豁免重叠，令下一次状态
         变更的一致性断言崩溃；失败档案记录须先经 clear_failures /
         clear_history 显式清除，队列驻留须待 run 排空或显式清理后再种子。
         """
@@ -310,13 +310,13 @@ class OpsConsole:
         for u in uids:
             if not isinstance(u, str) or u.count("::") != 1:
                 raise ValueError(
-                    f"seed_wall uid must be 'task_type::job_id' str with exactly "
+                    f"seed_successes job_uid must be 'task_type::job_id' str with exactly "
                     f"one '::' separator, got {u!r}"
                 )
             task_type, job_id = u.split("::", 1)
             if not task_type or not job_id:
                 raise ValueError(
-                    f"seed_wall uid must have non-empty task_type and job_id, got {u!r}"
+                    f"seed_successes job_uid must have non-empty task_type and job_id, got {u!r}"
                 )
         failed = self._store.backend.load_failed()
         queue_uids = set(self._store.state.queue_uids)
@@ -325,21 +325,21 @@ class OpsConsole:
         conflict_queue = sorted({u for u in uids if u in queue_uids})
         if conflict_failed:
             raise ValueError(
-                f"seed_wall refuses uid(s) already in the failure archive: "
-                f"{conflict_failed}; wall/failed must stay disjoint. Clear the "
+                f"seed_successes refuses uid(s) already in the failure archive: "
+                f"{conflict_failed}; successes/failed must stay disjoint. Clear the "
                 f"failure entries first (clear_failures/clear_history) if "
                 f"archiving is intended."
             )
         if conflict_queue:
             raise ValueError(
-                f"seed_wall refuses uid(s) still resident in the queue: "
-                f"{conflict_queue}; wall/queue must stay disjoint. Drain or "
+                f"seed_successes refuses uid(s) still resident in the queue: "
+                f"{conflict_queue}; successes/queue must stay disjoint. Drain or "
                 f"clear the queue entries first if archiving is intended."
             )
-        written = self._store.backend.seed_wall(list(uids))
+        written = self._store.backend.seed_successes(list(uids))
         state = self._store.state
         for u in uids:
-            state.add_wall(u, {})
+            state.add_success(u, {})
         return written
 
     def seed_cursor(self, key: str, value: str) -> None:

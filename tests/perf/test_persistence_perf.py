@@ -34,7 +34,7 @@ def _bench_commit_job_success(backend: SQLiteStateBackend, *, samples: int) -> f
         start = time.perf_counter()
         result = backend.commit_job_success(
             "test::latency_probe",
-            result_meta={"ok": True},
+            result_metadata={"ok": True},
             spawned_job_snapshots=[],
             cursor_updates={},
         )
@@ -48,7 +48,7 @@ def test_commit_job_success_scales_constant_with_queue_size(tmp_path):
     """10k 队列下 commit_job_success 延迟保持在空库基线的常数倍内。
 
     delta 语义：删 popped uid（此处不在队列，no-op）+ 插空 spawned +
-    写 wall——工作量与队列规模无关。若实现退化为整表重写，10k 队列侧
+    写 successes——工作量与队列规模无关。若实现退化为整表重写，10k 队列侧
     每次提交要重写全部行，延迟远超空库侧常数倍。
     """
     baseline_backend = SQLiteStateBackend(tmp_path / "baseline.db")
@@ -68,7 +68,7 @@ def test_commit_job_success_scales_constant_with_queue_size(tmp_path):
     )
     # 队列不受影响：probe uid 不在队列、无 spawned 插入
     assert len(busy_backend.load_queue()) == _QUEUE_DEPTH
-    assert "test::latency_probe" in busy_backend.load_wall()
+    assert "test::latency_probe" in busy_backend.load_successes()
 
 
 def test_enqueue_jobs_latency_constant_with_queue_size(tmp_path):

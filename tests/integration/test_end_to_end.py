@@ -1,6 +1,6 @@
 """v2 端到端集成测试：真实子进程跑通全链路（无任何 fake）。
 
-覆盖六步契约的运行段全链路：spawn 子进程执行 → IPC 结果落盘 → wall
+覆盖六步契约的运行段全链路：spawn 子进程执行 → IPC 结果落盘 → successes
 终态（业务 meta + run_count/inputs 审计键）→ attempts 轨迹（append-only
 追溯链：activation/attempt 序号、execution_id、outcome 流转）→ 失败
 档案 → retry_failure 人工补跑 → run/stop 门面收尾。handler 全部模块级
@@ -68,7 +68,7 @@ class TransientSampleError(Exception):
 
 
 def ok_with_input_handler(job, ctx):
-    """成功 + 声明输入文件 + 业务元数据（供 wall meta 审计键断言）。"""
+    """成功 + 声明输入文件 + 业务元数据（供 successes meta 审计键断言）。"""
     source = ctx.output_roots / f"source_{job.job_id}.txt"
     source.write_text("seed data", encoding="utf-8")
     ctx.declare_input(source)
@@ -160,8 +160,8 @@ class TestEndToEnd:
 
         assert summary.exit_reason is ExitReason.COMPLETED
         assert summary.stats["completed"] == 1
-        meta = p.backend.load_wall()["work::item_alpha"]
-        # wall 审计键：业务 meta 原样落盘 + 框架审计键（run_count /
+        meta = p.backend.load_successes()["work::item_alpha"]
+        # successes 审计键：业务 meta 原样落盘 + 框架审计键（run_count /
         # inputs 指纹清单 / 归属 run）
         assert meta["touched"] == "item_alpha"
         assert meta["run_count"] == 1
@@ -180,7 +180,7 @@ class TestEndToEnd:
         assert rec.activation_no == 1
         assert rec.execution_id.startswith(rec.run_id)
         assert rec.finished_at is not None
-        assert rec.error is None
+        assert rec.error_message is None
 
     def test_failure_lands_in_archive_with_attempt_trace(self, tmp_path):
         p = _make_pipeline(tmp_path)
@@ -192,13 +192,13 @@ class TestEndToEnd:
         failed = p.backend.load_failed()
         assert "work::item_beta" in failed
         assert "end-to-end explosion" in failed["work::item_beta"]["error"]
-        # wall/failed 互斥：失败终态不得残留 wall 行
-        assert "work::item_beta" not in p.backend.load_wall()
+        # successes/failed 互斥：失败终态不得残留 successes 行
+        assert "work::item_beta" not in p.backend.load_successes()
 
         attempts = p.backend.load_attempts("work::item_beta")
         assert len(attempts) == 1
         assert attempts[0].outcome == "failed"
-        assert attempts[0].error is not None
+        assert attempts[0].error_message is not None
 
     def test_transient_retry_exhaustion_trace(self, tmp_path):
         p = _make_pipeline(tmp_path)
@@ -224,7 +224,7 @@ class TestEndToEnd:
         summary = p.run()
         p.stop()
 
-        assert "work::item_delta" in p.backend.load_wall()
+        assert "work::item_delta" in p.backend.load_successes()
         attempts = p.backend.load_attempts("work::item_delta")
         # 同一激活内重试推进：attempt_no 1→2，activation_no 不变
         assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
@@ -242,8 +242,8 @@ class TestEndToEnd:
 
         # 档案结构化查询：uid/错误/payload 快照自洽（补跑无需外部反查）
         entries = p.list_failures()
-        assert [e.uid for e in entries] == ["work::item_eps"]
-        assert entries[0].job_payload == {"k": "v"}
+        assert [e.job_uid for e in entries] == ["work::item_eps"]
+        assert entries[0].payload == {"k": "v"}
 
         assert p.retry_failure("work::item_eps") is True
         assert p.list_failures() == []
@@ -251,7 +251,7 @@ class TestEndToEnd:
         summary = p.run()
         p.stop()
         assert summary.stats["completed"] == 1
-        meta = p.backend.load_wall()["work::item_eps"]
+        meta = p.backend.load_successes()["work::item_eps"]
         assert meta["recovered"] is True
         assert meta["run_count"] == 1
 
@@ -273,16 +273,16 @@ class TestEndToEnd:
         p.enqueue(Job("work", "item_eta", rerun="every_run"))
         first = p.run()
         assert first.stats["completed"] == 1
-        assert p.backend.load_wall()["work::item_eta"]["run_count"] == 1
+        assert p.backend.load_successes()["work::item_eta"]["run_count"] == 1
 
-        # 第二会话重扫：wall 命中但 every_run 豁免放行 → 新激活重跑，
-        # 成功 REPLACE wall 行且 run_count 从对侧终态续数
+        # 第二会话重扫：successes 命中但 every_run 豁免放行 → 新激活重跑，
+        # 成功 REPLACE successes 行且 run_count 从对侧终态续数
         p.enqueue(Job("work", "item_eta", rerun="every_run"))
         second = p.run()
         p.stop()
 
         assert second.stats["completed"] == 1
-        assert p.backend.load_wall()["work::item_eta"]["run_count"] == 2
+        assert p.backend.load_successes()["work::item_eta"]["run_count"] == 2
 
         attempts = p.backend.load_attempts("work::item_eta")
         assert [a.outcome for a in attempts] == ["succeeded", "succeeded"]
@@ -293,7 +293,7 @@ class TestEndToEnd:
         events: list = []
 
         def on_attempt_finished(uid, *, outcome):
-            events.append((uid, outcome.success, outcome.going_to_retry))
+            events.append((uid, outcome.success, outcome.will_retry))
 
         p = _make_pipeline(
             tmp_path,
@@ -320,7 +320,7 @@ class TestEndToEnd:
             ("work::step_two", True, False),
         ]
         assert summary.stats["completed"] == 2
-        assert sorted(p.backend.load_wall()) == [
+        assert sorted(p.backend.load_successes()) == [
             "work::step_one",
             "work::step_two",
         ]
@@ -388,7 +388,7 @@ class TestEnvFaultExhaustion:
         attempts = p.backend.load_attempts("crash::item_env_crash")
         assert [a.attempt_no for a in attempts] == [1, 2]
         assert [a.outcome for a in attempts] == ["requeued", "failed"]
-        assert "crash::item_env_crash" not in p.backend.load_wall()
+        assert "crash::item_env_crash" not in p.backend.load_successes()
 
 
 class TestForceAbortCleanup:
@@ -425,8 +425,8 @@ class TestForceAbortCleanup:
         assert summary.exit_reason is ExitReason.STOPPED_ABORTING
         # ABORTING：半成品输出被清理
         assert not partial.exists(), "强杀作业的半成品输出必须被清理"
-        # 作业未 commit（未进 wall），留在磁盘队列可重跑
-        assert "abortable::item_abort" not in p.backend.load_wall()
+        # 作业未 commit（未进 successes），留在磁盘队列可重跑
+        assert "abortable::item_abort" not in p.backend.load_successes()
         remaining = p.backend.load_queue()
         assert any(
             j.get("job_id") == "item_abort" for j in remaining
@@ -448,11 +448,11 @@ class TestRealSubprocessFaultScenarios:
         assert "hung::item_watchdog" in failed
         error = failed["hung::item_watchdog"]["error"]
         assert error.startswith("TIMEOUT"), f"应归因超时，got: {error}"
-        assert "hung::item_watchdog" not in p.backend.load_wall()
+        assert "hung::item_watchdog" not in p.backend.load_successes()
 
         attempts = p.backend.load_attempts("hung::item_watchdog")
         assert [a.outcome for a in attempts] == ["failed"]
-        assert attempts[0].error is not None and "TIMEOUT" in attempts[0].error
+        assert attempts[0].error_message is not None and "TIMEOUT" in attempts[0].error_message
 
     def test_real_subprocess_suspend_resource_recovers(self, tmp_path):
         """RateLimitResource 挂起：首作业挂起资源，后续作业等恢复后完成。"""
@@ -478,10 +478,10 @@ class TestRealSubprocessFaultScenarios:
         summary = p.run()
         p.stop()
 
-        wall = p.backend.load_wall()
+        successes = p.backend.load_successes()
         assert summary.stats["completed"] == 2
-        assert "gated::holder" in wall
-        assert "gated_plain::waiter" in wall
+        assert "gated::holder" in successes
+        assert "gated_plain::waiter" in successes
 
         # 挂起语义下界：waiter 的派发必须晚于 holder 终态 + 挂起窗口的
         # 宽松下界（挂起 2s，主循环等待单拍上限 1s，下界取 1s——满载只会
@@ -507,7 +507,7 @@ class TestRealSubprocessFaultScenarios:
         summary = p.run()
         p.stop()
 
-        assert "interrupted::item_interrupted" in p.backend.load_wall()
+        assert "interrupted::item_interrupted" in p.backend.load_successes()
         assert "interrupted::item_interrupted" not in p.backend.load_failed()
         attempts = p.backend.load_attempts("interrupted::item_interrupted")
         assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
@@ -528,4 +528,4 @@ class TestRealSubprocessFaultScenarios:
         assert "sysexit::item_sysexit" in failed
         error = failed["sysexit::item_sysexit"]["error"]
         assert "WORKER_INTERRUPTED" in error, f"应含中断族归因串，got: {error}"
-        assert "sysexit::item_sysexit" not in p.backend.load_wall()
+        assert "sysexit::item_sysexit" not in p.backend.load_successes()

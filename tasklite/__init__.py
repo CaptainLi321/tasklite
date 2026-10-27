@@ -74,7 +74,7 @@ from .engine.errorclass import (
     ErrorClassifier,
     ValidationErrorItem,
     ValidationResult,
-    classify_error_type,
+    classify_error_category,
     classify_exception,
     is_transient_exception,
     validate_payload_errors,
@@ -103,7 +103,7 @@ from .engine.scheduler import FifoOrderingPolicy, OrderingPolicy
 
 # ── 运行值对象：run()/stop() 调用边界直接遭遇的形状 ──────────────────
 from .engine.types import (
-    AttemptFinish,
+    AttemptOutcome,
     ExitReason,
     RunSummary,
     StopMode,
@@ -156,7 +156,7 @@ __all__ = [
     "ErrorClassifier",
     "ValidationErrorItem",
     "ValidationResult",
-    "classify_error_type",
+    "classify_error_category",
     "classify_exception",
     "is_transient_exception",
     "validate_payload_errors",
@@ -195,7 +195,7 @@ __all__ = [
     "FifoOrderingPolicy",
     "OrderingPolicy",
     # 运行值对象
-    "AttemptFinish",
+    "AttemptOutcome",
     "ExitReason",
     "RunSummary",
     "StopMode",

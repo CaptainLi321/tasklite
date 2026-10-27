@@ -6,13 +6,13 @@
   depends_on / timeout_seconds / max_retries / timeout_is_transient / rerun；
 - 实例位（框架运行期管理）：attempt_no（本次激活内尝试序号，1 起始含
   首次执行；预算判定：允许执行条件 ``attempt_no <= max_retries + 1``）、
-  activation_no（激活代，每次从 wall/failed 拦截点放行重跑时 +1）、
+  activation_no（激活代，每次从 successes/failed 拦截点放行重跑时 +1）、
   first_enqueued_at（UTC ISO，首次入队时间，重试不刷新，由 enqueue 填充）；
 - 运行期边带状态收敛到 ``runtime`` 单一命名空间（JobRuntimeState），随
   job_snapshot 落盘持久化——序列化只此一处，新增状态不会因散装下划线键
   漏写 to_dict 而丢失。
 
-身份不变式：``uid = task_type::job_id``，queue/wall/failed 三表主键与
+身份不变式：``uid = task_type::job_id``，queue/successes/failed 三表主键与
 六集合互斥均以 uid 为身份；``__eq__``/``__hash__`` 仅按 uid。
 """
 from __future__ import annotations
@@ -154,7 +154,7 @@ def _validate_job_id(job_id: Any) -> None:
 
     拒绝非 str——str 强转会使数值与字符串字面量静默碰撞
     （Job("t", 1.0).uid == Job("t", "1.0").uid == "t::1.0"），混合
-    数值/字符串 job_id 的管线静默合并不同任务（wall 去重吞掉后者），
+    数值/字符串 job_id 的管线静默合并不同任务（successes 去重吞掉后者），
     与 task_type 的 str 校验对称。
     """
     if not isinstance(job_id, str):
@@ -290,24 +290,24 @@ class Job:
         timeout_seconds: 执行超时秒数（覆盖 Task 默认 3600），有限正数。
         timeout_is_transient: 超时是否视为瞬态失败（keyword-only）。
             True 时看门狗超时按重试处理，而非直接进失败档案。
-        rerun: 跨会话重跑策略——「成功进 wall 是否算数」由它决定
+        rerun: 跨会话重跑策略——「成功进 successes 是否算数」由它决定
             （**不改变 uid 派生**，身份仍是 uid）：
             - None（默认，未指定哨兵）：未指定——任务级默认策略可注入；
               无默认策略的任务按 "never" 处理。与显式 "never" 的区别：
               显式值一律尊重，不再被任务级默认覆盖（保持 enqueue 与
               spawn 行为一致）；
-            - "never"：wall/failed 命中即跳过；
-            - "on_failure"：wall 命中跳过，failed 命中重跑（网络误失败
+            - "never"：successes/failed 命中即跳过；
+            - "on_failure"：successes 命中跳过，failed 命中重跑（网络误失败
               可自愈；成功即自动清失败档案残行）；
-            - "every_run"：wall/failed 命中都重跑（成功 REPLACE wall 行、
+            - "every_run"：successes/failed 命中都重跑（成功 REPLACE successes 行、
               run_count+1）——扫描类/orchestrator 任务；
-            - "on_input_change"：wall 命中比对输入指纹，failed 命中重跑。
-            策略只作用于「wall/failed 拦截点」；queue/in-flight 永远算数
+            - "on_input_change"：successes 命中比对输入指纹，failed 命中重跑。
+            策略只作用于「successes/failed 拦截点」；queue/in-flight 永远算数
             （同一轮内不重复派发/并发双跑）。随 job_snapshot 持久化。
         runtime: 运行期边带状态（dict 或 JobRuntimeState，由框架管理）。
         attempt_no: 本次激活内尝试序号（实例位，框架管理，1 起始含首次
             执行）。
-        activation_no: 激活代（实例位，框架管理，每次从 wall/failed
+        activation_no: 激活代（实例位，框架管理，每次从 successes/failed
             拦截点放行重跑时 +1，初激活为 1）。
         first_enqueued_at: 首次入队时间（实例位，UTC ISO，由 enqueue
             填充，重试不刷新；None 表示尚未入队）。

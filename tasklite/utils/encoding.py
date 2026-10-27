@@ -3,7 +3,7 @@
 设计原则：
 1. 单射性（Injective / Bijection）：对于任意 a != b，encode(a) != encode(b)。
    任何非单射净化（如丢弃字符、简单多对一替换）在拼装 UID 或文件路径时
-   会导致碰撞，进而导致 wall 去重静默吞任务或锁竞争错乱。
+   会导致碰撞，进而导致 successes 去重静默吞任务或锁竞争错乱。
 2. 转义符优先转义：% 必须首先转义为 %25，因此输出中的 % 唯一且确定地
    引导一个 %XX 序列。推论：含孤立 %（% 后不跟两位大写 hex）的串不在
    像集中——哨兵与截断标记均利用此性质选取「任何输入都映射不出」的形态。
@@ -126,7 +126,7 @@ def encode_identifier(
       压入上限，fail-loud）；直通输入对任意 max_len 均可用。
 
     非 str 非 None 输入显式 TypeError 拒绝（与 percent_encode 拒绝原则
-    同源）：隐式 str() 强转会让 int 123 与 str "123" 同像碰撞，wall 去重
+    同源）：隐式 str() 强转会让 int 123 与 str "123" 同像碰撞，successes 去重
     依赖本函数族的单射性，跨型同像即静默吞任务。
     """
     if value is None:
@@ -224,7 +224,7 @@ def content_fingerprint(
 ) -> str:
     """内容指纹 → 确定性 job_id 片段（sha1，截 16 位，可读）。
 
-    任何输入变化（含 bump version 盐）→ 指纹变化 → wall 不命中 → 重跑。
+    任何输入变化（含 bump version 盐）→ 指纹变化 → successes 不命中 → 重跑。
     与「job_id 确定性、禁止随机后缀」红线一致：给定输入恒同指纹。
     """
     h = hashlib.sha1()

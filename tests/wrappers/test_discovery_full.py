@@ -107,8 +107,8 @@ class TestFullMode:
         # 5 条 → 3 页（2/2/1）+ 空页；首次扫描无已见 → 全量 spawn
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
         p.run()
-        wall = p.backend.load_wall()
-        children = [k for k in wall if k.startswith("child::")]
+        successes = p.backend.load_successes()
+        children = [k for k in successes if k.startswith("child::")]
         assert len(children) == 5, f"full 模式首次扫描应 spawn 全部 5 个: {children}"
         assert self._log_count(log_path) == 4, \
             f"full 模式应 fetch 4 次（3 页+空页），实际: {self._log_count(log_path)}"
@@ -123,16 +123,16 @@ class TestFullMode:
         p.register_task("child", _child_ok)
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
         p.run()
-        wall = p.backend.load_wall()
-        assert len([k for k in wall if k.startswith("child::")]) == 5
+        successes = p.backend.load_successes()
+        assert len([k for k in successes if k.startswith("child::")]) == 5
         first_run_fetches = self._log_count(log_path)
         assert first_run_fetches == 4
 
         # 重跑（every_run 注入）→ full 扫完 3 页 + 空页，已见不重复 spawn
         p.enqueue([Job("disc", "seed2", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
         p.run()
-        wall = p.backend.load_wall()
-        assert len([k for k in wall if k.startswith("child::")]) == 5, \
+        successes = p.backend.load_successes()
+        assert len([k for k in successes if k.startswith("child::")]) == 5, \
             "full 重跑不得重复 spawn 已见内容"
         second_run_fetches = self._log_count(log_path) - first_run_fetches
         assert second_run_fetches == 4, \
@@ -153,8 +153,8 @@ class TestFullMode:
         # 重跑：page1=[4,3] 全已见 → 整页命中即停（不翻后续页）
         p.enqueue([Job("disc", "seed2", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
         p.run()
-        wall = p.backend.load_wall()
-        assert len([k for k in wall if k.startswith("child::")]) == 5
+        successes = p.backend.load_successes()
+        assert len([k for k in successes if k.startswith("child::")]) == 5
         second_run_fetches = self._log_count(log_path) - first_run_fetches
         assert second_run_fetches == 1, \
             f"incremental 重跑应 fetch 1 次（整页命中即停），实际增量: {second_run_fetches}"
@@ -222,7 +222,7 @@ class TestMissingDetection:
         report = tmp_path / "missing.txt"
 
         # 预置已见内容 0..4（known 非空，差集才有误报素材）
-        p.seed_wall([f"child::{i}" for i in range(5)])
+        p.seed_successes([f"child::{i}" for i in range(5)])
 
         # payload 覆盖为 full：本次完整扫到全部已见内容 → 无删除
         p.enqueue([Job("disc", "seed", payload={
@@ -258,9 +258,9 @@ class TestMissingDetection:
     def test_max_pages_truncation_no_missing_report(self, tmp_path):
         """回归：full 模式 max_pages 截断不触发 on_missing。
 
-        原测试只跑一次（首次 run wall 空 → known 空 → on_missing
+        原测试只跑一次（首次 run successes 空 → known 空 → on_missing
         不调用，修复前也通过）——不杀变异。正确场景：先完整扫描建立
-        wall（known 非空），再截断 run——修复前会把更深页内容误报为
+        successes（known 非空），再截断 run——修复前会把更深页内容误报为
         「已删除」，修复后因 completed_full=False 不触发。
 
         v2 TaskRegistry 拒绝重复注册：Run 2 用同库新实例重挂覆盖配置
@@ -270,7 +270,7 @@ class TestMissingDetection:
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
 
-        # Run 1：完整扫描（max_pages 默认大）→ 6 条进入 wall（known 非空）
+        # Run 1：完整扫描（max_pages 默认大）→ 6 条进入 successes（known 非空）
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", rerun="never", on_missing=_on_missing)
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
@@ -296,7 +296,7 @@ class TestMissingDetection:
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
 
-        # Run 1：正常 id_func 完整扫描 → 6 条进入 wall
+        # Run 1：正常 id_func 完整扫描 → 6 条进入 successes
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", rerun="never", on_missing=_on_missing)
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
@@ -321,7 +321,7 @@ class TestMissingDetection:
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
 
-        # Run 1：正常完整扫描 → 6 条进入 wall（known 非空）
+        # Run 1：正常完整扫描 → 6 条进入 successes（known 非空）
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", rerun="never", on_missing=_on_missing)
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
@@ -371,12 +371,12 @@ class TestMissingDetection:
                            cursor_key_func=_group_key,
                            scan_mode="full", rerun="never", on_missing=_on_missing)
 
-        # 组 A：完整扫描 4 条 → wall
+        # 组 A：完整扫描 4 条 → successes
         p.enqueue([Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
                                                  "group": "A", "missing_report": str(report)})])
         p.run()
         assert not report.exists()
-        # 组 B：完整扫描 2 条 → wall（与 A 共享 process_task_type="child"）
+        # 组 B：完整扫描 2 条 → successes（与 A 共享 process_task_type="child"）
         p.enqueue([Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
                                                  "group": "B", "missing_report": str(report)})])
         p.run()
@@ -410,12 +410,12 @@ class TestMissingDetection:
         prefix_a = f"{len('g_' + long_a)}:g_{long_a}"
         prefix_b = f"{len('g_' + long_b)}:g_{long_b}"
 
-        # 组 A（超长 key）：完整扫描 4 条 → wall
+        # 组 A（超长 key）：完整扫描 4 条 → successes
         p.enqueue([Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
                                                  "group": long_a, "missing_report": str(report)})])
         p.run()
         assert not report.exists()
-        # 组 B（另一超长 key，共享 process_task_type）：完整扫描 2 条 → wall
+        # 组 B（另一超长 key，共享 process_task_type）：完整扫描 2 条 → successes
         p.enqueue([Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
                                                  "group": long_b, "missing_report": str(report)})])
         p.run()
@@ -443,15 +443,15 @@ class TestMissingDetection:
         # 首次：5 条全扫 → 无 missing（on_missing 不调用，无异常）
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(5)})])
         p.run()
-        wall = p.backend.load_wall()
-        assert "disc::seed" in wall
+        successes = p.backend.load_successes()
+        assert "disc::seed" in successes
 
         # 删 2 条 → 重跑：有 missing 差集 → on_missing 抛异常 → 必须被吞
         posts = [{"id": 2}, {"id": 1}, {"id": 0}]
         p.enqueue([Job("disc", "seed2", payload={"posts": posts})])
         p.run()
-        wall = p.backend.load_wall()
-        assert "disc::seed2" in wall, \
+        successes = p.backend.load_successes()
+        assert "disc::seed2" in successes, \
             "on_missing 抛异常不得让 discovery job 崩溃/进失败档案"
 
     def test_unicode_escape_injective(self):
@@ -478,7 +478,7 @@ class TestCursorKeyPrefixInjective:
 
     键名前缀转义必须保证单射性：
     `(key="ab", cid="c_d")` 与 `(key="ab_c", cid="d")` 派生相同 job_id
-    → 跨组碰撞 → wall 去重静默吞内容。length-prefix（{len}:{key}）修复。"""
+    → 跨组碰撞 → successes 去重静默吞内容。length-prefix（{len}:{key}）修复。"""
 
     def test_prefix_collision_pair_now_distinct(self):
         # 验证 length-prefix 前缀隔离：2:ab vs 4:ab_c → 边界可复原，派生不同
@@ -523,7 +523,7 @@ class TestCursorKeyPrefixInjective:
 class TestSucceededOrFailedJobUidsUsage:
     """on_missing 差集计算经 ctx.succeeded_or_failed_job_uids 公开快照 API 的端到端回归。
 
-    succeeded_or_failed_job_uids 的上下文契约（wall∪failed 并集、快照语义）由
+    succeeded_or_failed_job_uids 的上下文契约（successes∪failed 并集、快照语义）由
     tests/v2/models/test_context.py 锁定，此处只验证 discovery 消费路径。"""
 
     def test_discovery_on_missing_uses_succeeded_or_failed_job_uids(self, tmp_path):

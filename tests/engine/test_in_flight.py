@@ -48,7 +48,7 @@ class TestInFlightTrackerBasicMapping:
 class TestInFlightTrackerLifecycleAndStateSync:
     def test_track_and_settle_syncs_with_pipeline_state(self):
         tracker = InFlightTracker()
-        state = PipelineState(wall={}, failed={}, cursors={}, queue=[])
+        state = PipelineState(successes={}, failed={}, cursors={}, queue=[])
 
         job = Job("t", "j1")
         entry = InFlightJob("t::j1", job.to_dict(), job, [("gpu", 1.0)], None, 100.0)
@@ -64,7 +64,7 @@ class TestInFlightTrackerLifecycleAndStateSync:
 
     def test_track_settle_semantic_seams(self):
         tracker = InFlightTracker()
-        state = PipelineState(wall={}, failed={}, cursors={}, queue=[])
+        state = PipelineState(successes={}, failed={}, cursors={}, queue=[])
 
         job = Job("t", "j1")
         entry = InFlightJob("t::j1", job.to_dict(), job, [("gpu", 1.0)], None, 100.0)
@@ -98,7 +98,7 @@ class TestInFlightTrackerLifecycleAndStateSync:
 
     def test_settle_unknown_uid_is_noop(self):
         tracker = InFlightTracker()
-        state = PipelineState(wall={}, failed={}, cursors={}, queue=[])
+        state = PipelineState(successes={}, failed={}, cursors={}, queue=[])
         assert tracker.settle("t::ghost", state=state) is None
         assert state.in_flight_uids == frozenset()
 

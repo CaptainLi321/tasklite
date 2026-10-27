@@ -161,7 +161,7 @@ def test_workers_resource_limits_concurrency(tmp_state_dir):
 def test_dependency_chain_under_concurrency(tmp_state_dir):
     """依赖链 A → B → C 在 max_workers=3 下仍按序执行。
 
-    依赖强制串行：B 等 A commit 到 wall，C 等 B。即使有 3 个 worker
+    依赖强制串行：B 等 A commit 到 successes，C 等 B。即使有 3 个 worker
     槽位，三者也不能并行——以 attempts 轨迹的时序边界锁定（下游
     started_at 不得早于上游 finished_at）。
     """
@@ -177,10 +177,10 @@ def test_dependency_chain_under_concurrency(tmp_state_dir):
     ])
     pipeline.run()
 
-    wall = pipeline.backend.load_wall()
-    assert "fast::A" in wall
-    assert "fast::B" in wall
-    assert "fast::C" in wall
+    successes = pipeline.backend.load_successes()
+    assert "fast::A" in successes
+    assert "fast::B" in successes
+    assert "fast::C" in successes
 
     traces = {
         uid: pipeline.backend.load_attempts(uid)[0]

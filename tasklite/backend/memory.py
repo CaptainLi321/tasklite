@@ -35,7 +35,7 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._wall: dict[str, dict[str, Any]] = {}
+        self._successes: dict[str, dict[str, Any]] = {}
         self._failed: dict[str, dict[str, Any]] = {}
         self._failed_payloads: dict[str, dict[str, Any]] = {}
         self._cursors: dict[str, str] = {}
@@ -46,15 +46,15 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     # 全量加载 -------------------------------------------------------
 
-    def load_wall(self) -> dict[str, dict[str, Any]]:
+    def load_successes(self) -> dict[str, dict[str, Any]]:
         with self._lock:
-            return copy.deepcopy(self._wall)
+            return copy.deepcopy(self._successes)
 
     def load_failed(self) -> dict[str, dict[str, Any]]:
         with self._lock:
             return copy.deepcopy(self._failed)
 
-    def load_failed_payloads(self) -> dict[str, dict[str, Any]]:
+    def load_failure_payloads(self) -> dict[str, dict[str, Any]]:
         """读取失败档案各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
         with self._lock:
             return copy.deepcopy(self._failed_payloads)
@@ -108,7 +108,7 @@ class InMemoryStateBackend(AbstractStateBackend):
     def commit_job_success(
         self,
         job_uid: str,
-        result_meta: dict,
+        result_metadata: dict,
         *,
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
@@ -116,10 +116,10 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             try:
                 # 校验先行：全部 deepcopy 与冲突判定在任何变更前完成。
-                # 不变式：返回 False / 抛异常 ⇒ wall/queue/failed/cursors 与
+                # 不变式：返回 False / 抛异常 ⇒ successes/queue/failed/cursors 与
                 # 调用前完全一致（对齐 SQLite 事务回滚；store 的连续失败
                 # 崩溃契约以「后端未变」为前提做重启重建）。
-                wall_meta = copy.deepcopy(result_meta or {})
+                success_metadata = copy.deepcopy(result_metadata or {})
                 spawned_copy = [copy.deepcopy(j) for j in spawned_job_snapshots]
                 remaining = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
                 if spawned_copy:
@@ -147,10 +147,10 @@ class InMemoryStateBackend(AbstractStateBackend):
                         else:
                             cursor_sets[k] = str(v)
                 # 校验全部通过，统一落变（落变段不再调用任何可失败操作）
-                self._wall[job_uid] = wall_meta
+                self._successes[job_uid] = success_metadata
                 self._queue = spawned_copy + remaining  # 队首插入 spawned 并保序
                 # 成功 commit 清理 failed 同名残行：与「job 最终状态唯一」
-                # 语义一致，防 wall∩failed 并存。
+                # 语义一致，防 successes∩failed 并存。
                 self._failed.pop(job_uid, None)
                 self._failed_payloads.pop(job_uid, None)
                 self._cursors.update(cursor_sets)
@@ -162,15 +162,15 @@ class InMemoryStateBackend(AbstractStateBackend):
                 return False
 
     def commit_job_failure(
-        self, job_uid: str, result_meta: dict, job_payload: dict[str, Any] | None = None
+        self, job_uid: str, result_metadata: dict, payload: dict[str, Any] | None = None
     ) -> bool:
         with self._lock:
             try:
                 # 校验先行：失败 meta 与 payload 快照的拷贝在变更前完成，
-                # 任一步失败 ⇒ failed/queue/wall 整体不变（对齐 SQLite 回滚）。
-                meta_copy = copy.deepcopy(result_meta or {})
+                # 任一步失败 ⇒ failed/queue/successes 整体不变（对齐 SQLite 回滚）。
+                meta_copy = copy.deepcopy(result_metadata or {})
                 payload_copy = (
-                    copy.deepcopy(job_payload) if job_payload is not None else None
+                    copy.deepcopy(payload) if payload is not None else None
                 )
                 remaining = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
                 self._failed[job_uid] = meta_copy
@@ -179,9 +179,9 @@ class InMemoryStateBackend(AbstractStateBackend):
                 if payload_copy is not None:
                     self._failed_payloads[job_uid] = payload_copy
                 self._queue = remaining
-                # 同一事务语义内清理 wall 旧记录：重跑任务失败时旧成功
-                # 记录作废（最终状态唯一），防 wall∩failed 并存。
-                self._wall.pop(job_uid, None)
+                # 同一事务语义内清理 successes 旧记录：重跑任务失败时旧成功
+                # 记录作废（最终状态唯一），防 successes∩failed 并存。
+                self._successes.pop(job_uid, None)
                 return True
             except Exception as e:
                 logger.critical(f"Failed to commit job failure for {job_uid}: {e}")
@@ -217,20 +217,20 @@ class InMemoryStateBackend(AbstractStateBackend):
                 logger.critical(f"Failed to commit retry for {popped_job_uid}: {e}")
                 return False
 
-    def commit_bulk_failure(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
+    def commit_job_failures(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
         with self._lock:
             try:
                 # 校验先行：全部失败行拷贝在任何变更前完成——任一行失败则
-                # queue/wall/failed 整体不变（对齐 SQLite 事务回滚，杜绝
+                # queue/successes/failed 整体不变（对齐 SQLite 事务回滚，杜绝
                 # 「队列已整体删除、档案未落」的半成品失败态）。
                 entries = [(job_uid, copy.deepcopy(meta or {})) for job_uid, meta in job_uids_metas]
                 fail_uids = {u for u, _ in job_uids_metas}
                 remaining = [j for j in self._queue if job_uid_from_snapshot(j) not in fail_uids]
                 for job_uid, meta in entries:
                     self._failed[job_uid] = meta
-                    # 级联/死锁批量失败时 wall 旧成功记录作废（最终状态
+                    # 级联/死锁批量失败时 successes 旧成功记录作废（最终状态
                     # 唯一），与 commit_job_failure 对称。
-                    self._wall.pop(job_uid, None)
+                    self._successes.pop(job_uid, None)
                 self._queue = remaining
                 return True
             except Exception as e:
@@ -242,9 +242,9 @@ class InMemoryStateBackend(AbstractStateBackend):
             self._queue = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
             return True
 
-    def append_failed(self, job_uid: str, payload: dict[str, Any] | None = None) -> None:
+    def append_failed(self, job_uid: str, metadata: dict[str, Any] | None = None) -> None:
         with self._lock:
-            self._failed[job_uid] = copy.deepcopy(payload or {})
+            self._failed[job_uid] = copy.deepcopy(metadata or {})
 
     # 增量入队 -------------------------------------------------------
 
@@ -295,20 +295,20 @@ class InMemoryStateBackend(AbstractStateBackend):
                     count += 1
             return count
 
-    def delete_wall(self, job_uids: list[str]) -> int:
+    def delete_successes(self, job_uids: list[str]) -> int:
         with self._lock:
             del_set = set(job_uids)
             count = 0
             for u in del_set:
-                if u in self._wall:
-                    del self._wall[u]
+                if u in self._successes:
+                    del self._successes[u]
                     count += 1
             return count
 
-    def seed_wall(self, job_uids: list[str]) -> int:
-        """把 uid 批量写入 wall（meta 空 dict）。
+    def seed_successes(self, job_uids: list[str]) -> int:
+        """把 uid 批量写入 successes（meta 空 dict）。
 
-        不变式：wall/failed 全局互斥——已在 failed 的 uid 拒绝种子；
+        不变式：successes/failed 全局互斥——已在 failed 的 uid 拒绝种子；
         先查后写（同锁内），冲突整体拒绝、零写入，不静默清除失败档案
         记录（失败历史须先经 delete_failed 显式清除）。
         """
@@ -316,12 +316,12 @@ class InMemoryStateBackend(AbstractStateBackend):
             conflict = sorted({u for u in job_uids if u in self._failed})
             if conflict:
                 raise ValueError(
-                    f"seed_wall refuses uid(s) already in failed: {conflict}; "
-                    f"wall/failed must stay disjoint"
+                    f"seed_successes refuses uid(s) already in failed: {conflict}; "
+                    f"successes/failed must stay disjoint"
                 )
             count = 0
             for u in job_uids:
-                self._wall[u] = {}
+                self._successes[u] = {}
                 count += 1
             return count
 
@@ -356,14 +356,14 @@ class InMemoryStateBackend(AbstractStateBackend):
         *,
         outcome: str,
         finished_at: str,
-        error: str | None = None,
+        error_message: str | None = None,
     ) -> bool:
         """收尾轨迹行：仅允许把 running 行收敛为终态一次。
 
         读-判-写在锁内串行完成；目标 id 不存在返回 False，对已收尾行
         再次收尾抛 ValueError（双重终结是调用方协议缺陷，fail-loud）。
         """
-        validate_attempt_finish(outcome, finished_at, error)
+        validate_attempt_finish(outcome, finished_at, error_message)
         with self._lock:
             current = self._attempts.get(attempt_id)
             if current is None:
@@ -374,7 +374,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                     f"{current.outcome!r}; double finalization is a protocol violation"
                 )
             self._attempts[attempt_id] = replace(
-                current, outcome=outcome, finished_at=finished_at, error=error
+                current, outcome=outcome, finished_at=finished_at, error_message=error_message
             )
             return True
 

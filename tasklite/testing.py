@@ -1,6 +1,6 @@
 """v2 官方测试工具（冻结 JobContext 内部构造结构对下游测试的影响面）。
 
-handler 单测需要构造 JobContext，直接以位置参数硬编码 wall/failed/
+handler 单测需要构造 JobContext，直接以位置参数硬编码 successes/failed/
 cursors 的内部容器结构会随框架演进碎裂——本模块是唯一承诺稳定的测试
 构造入口（参数形态变更视为破坏性变更，与公开 API 同等对待）。
 """
@@ -40,7 +40,7 @@ def running(target: Any) -> Iterator[Any]:
 def fake_ctx(
     job: Job,
     *,
-    wall: Iterable[str] | None = None,
+    successes: Iterable[str] | None = None,
     failed: Iterable[str] | None = None,
     cursors: dict[str, str] | None = None,
     resources: Iterable[str] | None = None,
@@ -55,7 +55,7 @@ def fake_ctx(
 
     Args:
         job: 测试目标 job。
-        wall: 已成功完成的 uid 集合（任意可迭代，``ctx.has_succeeded`` 命中源）。
+        successes: 已成功完成的 uid 集合（任意可迭代，``ctx.has_succeeded`` 命中源）。
         failed: 已进失败档案的 uid 集合（任意可迭代，``ctx.has_failed`` 命中源）。
         cursors: 游标初值映射（``ctx.get_cursor`` 命中源）。
         resources: 已注册资源名集合——``ctx.suspend_resource`` 按名单
@@ -85,7 +85,7 @@ def fake_ctx(
         Path(ipc_dir).mkdir(parents=True, exist_ok=True)
     return JobContext(
         job,
-        set(wall) if wall is not None else set(),
+        set(successes) if successes is not None else set(),
         set(failed) if failed is not None else set(),
         dict(cursors) if cursors is not None else {},
         output_roots=Path(output_roots) if isinstance(output_roots, str) else output_roots,

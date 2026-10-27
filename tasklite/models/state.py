@@ -1,9 +1,9 @@
-"""v2 可变管线状态容器（wall / failed / cursors / queue / in-flight）。
+"""v2 可变管线状态容器（successes / failed / cursors / queue / in-flight）。
 
 单线程事件循环，无需不可变化。三条一致性契约：
   1. 内存队列 = 落盘队列 − in-flight 作业。
-  2. wall/failed/cursors 只在后端 commit 返回 True 之后推进。
-  3. 加载期由恢复编排层过滤 queue 对 wall/failed 的残留漂移
+  2. successes/failed/cursors 只在后端 commit 返回 True 之后推进。
+  3. 加载期由恢复编排层过滤 queue 对 successes/failed 的残留漂移
      （at-least-once 兜底）。
 
 所有变更原地进行；队列变更只经受控方法，``_queue_uids`` 永不漂移。
@@ -18,7 +18,7 @@ from .job import Job, RERUN_EXEMPT_VALUES
 
 
 def _is_rerun_exempt(job_snapshot: dict) -> bool:
-    """rerun 策略允许越过终态重跑的作业可合法落在 wall/failed ∩ 队列
+    """rerun 策略允许越过终态重跑的作业可合法落在 successes/failed ∩ 队列
     交集——六集合互斥断言对此类作业豁免。"""
     return job_snapshot.get("rerun") in RERUN_EXEMPT_VALUES
 
@@ -38,24 +38,24 @@ def job_uid_from_snapshot(job_snapshot: dict) -> str:
 
 
 class PipelineState:
-    """可变管线状态：wall/failed/cursors 三个 dict + queue 列表。
+    """可变管线状态：successes/failed/cursors 三个 dict + queue 列表。
 
-    所有操作原地进行，O(1)/O(k)。维护 ``_queue_uids``/``_wall_uids``/
+    所有操作原地进行，O(1)/O(k)。维护 ``_queue_uids``/``_success_job_uids``/
     ``_failed_uids`` 增量 uid 索引。所有状态转移必须经由受控方法。
     """
 
     def __init__(
         self,
-        wall: Mapping[str, dict[str, Any]],
+        successes: Mapping[str, dict[str, Any]],
         failed: Mapping[str, dict[str, Any]],
         cursors: Mapping[str, str],
         queue: list[dict[str, Any]],
     ):
-        self._wall: dict[str, dict[str, Any]] = dict(wall)
+        self._successes: dict[str, dict[str, Any]] = dict(successes)
         self._failed: dict[str, dict[str, Any]] = dict(failed)
         self._cursors: dict[str, str] = dict(cursors)
         self._queue: list[dict] = list(queue)
-        self._wall_uids: set[str] = set(self._wall)
+        self._success_job_uids: set[str] = set(self._successes)
         self._failed_uids: set[str] = set(self._failed)
         self._queue_uids: set[str] = {job_uid_from_snapshot(j) for j in self._queue}
         self._in_flight_uids: set[str] = set()
@@ -65,8 +65,8 @@ class PipelineState:
                 self._rerun_active_uids.add(job_uid_from_snapshot(j))
 
     @property
-    def wall(self) -> dict[str, dict[str, Any]]:
-        return self._wall
+    def successes(self) -> dict[str, dict[str, Any]]:
+        return self._successes
 
     @property
     def failed(self) -> dict[str, dict[str, Any]]:
@@ -89,10 +89,10 @@ class PipelineState:
     def pop_job(self, idx: int) -> dict:
         """弹出并返回 job dict，同步从 _queue_uids 移除其 uid。"""
         job_snapshot = self._queue.pop(idx)
-        uid = job_uid_from_snapshot(job_snapshot)
+        job_uid = job_uid_from_snapshot(job_snapshot)
         if _is_rerun_exempt(job_snapshot):
-            self._rerun_active_uids.add(uid)
-        self._queue_uids.discard(uid)
+            self._rerun_active_uids.add(job_uid)
+        self._queue_uids.discard(job_uid)
         if __debug__:
             self._assert_uids_consistent()
         return job_snapshot
@@ -110,14 +110,14 @@ class PipelineState:
         if __debug__:
             self._assert_uids_consistent()
 
-    def remove_queued_uid(self, uid: str) -> None:
+    def remove_queued_uid(self, job_uid: str) -> None:
         """按 uid 清除队列行，保留其他作业的在途重跑豁免。"""
-        if uid not in self._queue_uids:
+        if job_uid not in self._queue_uids:
             return
-        self._queue[:] = [jd for jd in self._queue if job_uid_from_snapshot(jd) != uid]
-        self._queue_uids.discard(uid)
-        if uid not in self._in_flight_uids:
-            self._rerun_active_uids.discard(uid)
+        self._queue[:] = [jd for jd in self._queue if job_uid_from_snapshot(jd) != job_uid]
+        self._queue_uids.discard(job_uid)
+        if job_uid not in self._in_flight_uids:
+            self._rerun_active_uids.discard(job_uid)
         if __debug__:
             self._assert_uids_consistent()
 
@@ -125,28 +125,28 @@ class PipelineState:
         """重入队（崩溃恢复/重试），语义同 spawn_jobs 队首插入。"""
         self.spawn_jobs(job_snapshots, front=front)
 
-    def mark_rerun_active(self, uid: str) -> None:
+    def mark_rerun_active(self, job_uid: str) -> None:
         """登记派发期准入放行的重跑豁免 uid。
 
         不变式：豁免集合与准入判定同源——字面 rerun 键由 pop_job/
         spawn_jobs 登记，准入层按含任务级默认策略的有效策略放行的
         重跑由此登记；缺任一登记，in-flight 登记的全量互斥断言都会把
-        合法重跑误判为 wall/failed ∩ in-flight 违例。
+        合法重跑误判为 successes/failed ∩ in-flight 违例。
         """
-        self._rerun_active_uids.add(uid)
+        self._rerun_active_uids.add(job_uid)
 
     # in-flight 集合（唯一修改 _in_flight_uids 的路径）-------------
 
-    def register_in_flight(self, uid: str) -> None:
+    def register_in_flight(self, job_uid: str) -> None:
         """登记一个已派发到子进程、尚未 commit 的作业 uid。"""
-        self._in_flight_uids.add(uid)
+        self._in_flight_uids.add(job_uid)
         if __debug__:
             self._assert_state_consistent()
 
-    def unregister_in_flight(self, uid: str) -> None:
+    def unregister_in_flight(self, job_uid: str) -> None:
         """注销一个已完成/失败/崩溃回收的 in-flight 作业 uid。"""
-        self._in_flight_uids.discard(uid)
-        self._rerun_active_uids.discard(uid)
+        self._in_flight_uids.discard(job_uid)
+        self._rerun_active_uids.discard(job_uid)
         if __debug__:
             self._assert_state_consistent()
 
@@ -206,7 +206,7 @@ class PipelineState:
             for downstream in dependents.get(cur, ()):
                 if downstream in excluded_uids:
                     continue
-                if downstream not in seen and downstream not in self._wall \
+                if downstream not in seen and downstream not in self._successes \
                         and downstream not in self._failed:
                     seen.add(downstream)
                     cascade.append(downstream)
@@ -272,21 +272,21 @@ class PipelineState:
 
     # 完成/失败记录 ------------------------------------------------
 
-    def mark_success(self, uid: str, meta: dict[str, Any]) -> None:
-        """终态转移：uid → wall（成功）。单一入口维护 wall/failed 索引。"""
-        self._failed.pop(uid, None)
-        self._failed_uids.discard(uid)
-        self._wall[uid] = copy.deepcopy(meta)
-        self._wall_uids.add(uid)
+    def mark_success(self, job_uid: str, metadata: dict[str, Any]) -> None:
+        """终态转移：uid → successes（成功）。单一入口维护 successes/failed 索引。"""
+        self._failed.pop(job_uid, None)
+        self._failed_uids.discard(job_uid)
+        self._successes[job_uid] = copy.deepcopy(metadata)
+        self._success_job_uids.add(job_uid)
         if __debug__:
             self._assert_terminal_uids_consistent()
 
-    def mark_failed(self, uid: str, meta: dict[str, Any]) -> None:
-        """终态转移：uid → failed（失败档案）。单一入口维护 wall/failed 索引。"""
-        self._wall.pop(uid, None)
-        self._wall_uids.discard(uid)
-        self._failed[uid] = copy.deepcopy(meta)
-        self._failed_uids.add(uid)
+    def mark_failed(self, job_uid: str, metadata: dict[str, Any]) -> None:
+        """终态转移：uid → failed（失败档案）。单一入口维护 successes/failed 索引。"""
+        self._successes.pop(job_uid, None)
+        self._success_job_uids.discard(job_uid)
+        self._failed[job_uid] = copy.deepcopy(metadata)
+        self._failed_uids.add(job_uid)
         if __debug__:
             self._assert_terminal_uids_consistent()
 
@@ -300,24 +300,24 @@ class PipelineState:
 
     # 运维管理受控变更（OpsConsole 公共接缝）--------------------------
 
-    def discard_wall(self, uid: str) -> None:
-        """从 wall 集合移除指定 uid（运维接缝，幂等）。"""
-        self._wall.pop(uid, None)
-        self._wall_uids.discard(uid)
+    def discard_success(self, job_uid: str) -> None:
+        """从 successes 集合移除指定 uid（运维接缝，幂等）。"""
+        self._successes.pop(job_uid, None)
+        self._success_job_uids.discard(job_uid)
         if __debug__:
             self._assert_terminal_uids_consistent()
 
-    def discard_failed(self, uid: str) -> None:
+    def discard_failed(self, job_uid: str) -> None:
         """从 failed 集合移除指定 uid（运维接缝，幂等）。"""
-        self._failed.pop(uid, None)
-        self._failed_uids.discard(uid)
+        self._failed.pop(job_uid, None)
+        self._failed_uids.discard(job_uid)
         if __debug__:
             self._assert_terminal_uids_consistent()
 
-    def add_wall(self, uid: str, meta: dict[str, Any]) -> None:
-        """向 wall 集合添加 uid（运维接缝，seed_wall 场景）。"""
-        self._wall[uid] = meta
-        self._wall_uids.add(uid)
+    def add_success(self, job_uid: str, metadata: dict[str, Any]) -> None:
+        """向 successes 集合添加 uid（运维接缝，seed_successes 场景）。"""
+        self._successes[job_uid] = metadata
+        self._success_job_uids.add(job_uid)
         if __debug__:
             self._assert_terminal_uids_consistent()
 
@@ -333,9 +333,9 @@ class PipelineState:
         return self._queue_uids
 
     @property
-    def wall_uids(self) -> set[str]:
-        """wall 终态 uid 的活索引。"""
-        return self._wall_uids
+    def success_job_uids(self) -> set[str]:
+        """successes 终态 uid 的活索引。"""
+        return self._success_job_uids
 
     @property
     def failed_uids(self) -> set[str]:
@@ -357,13 +357,13 @@ class PipelineState:
         """队列是否为空。"""
         return not self._queue
 
-    def is_known(self, uid: str) -> bool:
+    def is_known(self, job_uid: str) -> bool:
         """作业是否在系统中的统一谓词。"""
         return (
-            uid in self._wall
-            or uid in self._failed
-            or uid in self._queue_uids
-            or uid in self._in_flight_uids
+            job_uid in self._successes
+            or job_uid in self._failed
+            or job_uid in self._queue_uids
+            or job_uid in self._in_flight_uids
         )
 
     # 内部 ---------------------------------------------------------
@@ -384,9 +384,9 @@ class PipelineState:
         )
 
     def _assert_terminal_uids_consistent(self) -> None:
-        """DEBUG 不变式：wall/failed 增量索引与 dict 完全一致。"""
-        assert self._wall_uids == set(self._wall), (
-            f"_wall_uids drift: cached={self._wall_uids!r} actual={set(self._wall)!r}"
+        """DEBUG 不变式：successes/failed 增量索引与 dict 完全一致。"""
+        assert self._success_job_uids == set(self._successes), (
+            f"_success_job_uids drift: cached={self._success_job_uids!r} actual={set(self._successes)!r}"
         )
         assert self._failed_uids == set(self._failed), (
             f"_failed_uids drift: cached={self._failed_uids!r} actual={set(self._failed)!r}"
@@ -400,17 +400,17 @@ class PipelineState:
             f"(queue={self._queue_uids!r} in_flight={self._in_flight_uids!r})"
         )
         exempt = self._rerun_active_uids | self._rerun_exempt_uids_from_queue()
-        done_overlap = (set(self._wall) | set(self._failed)) & self._in_flight_uids
+        done_overlap = (set(self._successes) | set(self._failed)) & self._in_flight_uids
         assert not (done_overlap - exempt), (
-            f"uid in wall/failed and in_flight: {done_overlap - exempt!r}"
+            f"uid in successes/failed and in_flight: {done_overlap - exempt!r}"
         )
-        wall_failed = set(self._wall) & set(self._failed)
-        assert not wall_failed, (
-            f"uid in both wall and failed: {wall_failed!r}"
+        success_failed = set(self._successes) & set(self._failed)
+        assert not success_failed, (
+            f"uid in both successes and failed: {success_failed!r}"
         )
-        done_queue = (set(self._wall) | set(self._failed)) & self._queue_uids
+        done_queue = (set(self._successes) | set(self._failed)) & self._queue_uids
         assert not (done_queue - exempt), (
-            f"uid in wall/failed and queue: {done_queue - exempt!r}"
+            f"uid in successes/failed and queue: {done_queue - exempt!r}"
         )
         self._assert_uids_consistent()
         self._assert_terminal_uids_consistent()

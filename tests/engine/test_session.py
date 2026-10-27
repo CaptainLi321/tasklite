@@ -4,7 +4,7 @@
 - stop_mode 单调转移（NONE→DRAINING→ABORTING，唯一入口 request_stop）；
 - fire_run_end 幂等：任意多次调用，钩子至多触发一次且取首次 reason；
 - 钩子异常不外溢、仅计数（hook_errors）；
-- fire_attempt_finished 以 AttemptFinish 值对象原样路由到钩子；
+- fire_attempt_finished 以 AttemptOutcome 值对象原样路由到钩子；
 - begin() 复位全部生命周期状态（幂等标志、统计、停机模式、序号）。
 """
 
@@ -14,7 +14,7 @@ import pytest
 from hypothesis import example, given, settings, strategies as st
 
 from tasklite.engine.session import RunSession
-from tasklite.engine.types import AttemptFinish, ExitReason, StopMode, RunStats
+from tasklite.engine.types import AttemptOutcome, ExitReason, StopMode, RunStats
 
 # 抛异常钩子可用的异常类型（均为 Exception 子类，模拟不可信钩子代码）
 _HOSTILE_EXCEPTIONS = [ValueError, RuntimeError, KeyError, TypeError, IndexError]
@@ -115,7 +115,7 @@ class TestSessionLifecycle:
 
         session = RunSession(on_attempt_finished=boom)
         session.fire_attempt_finished(
-            "t::1", outcome=AttemptFinish(success=True, going_to_retry=False, meta={}),
+            "t::1", outcome=AttemptOutcome(success=True, will_retry=False, metadata={}),
         )
         assert session.stats["hook_errors"] == 1
 
@@ -185,7 +185,7 @@ def test_hook_exception_swallowed_and_counted(exc_cls, n, which):
         else:
             session.fire_attempt_finished(
                 f"t::{i}",
-                outcome=AttemptFinish(success=False, going_to_retry=False, meta={}),
+                outcome=AttemptOutcome(success=False, will_retry=False, metadata={}),
             )
     assert len(calls) == n
     assert session.stats["hook_errors"] == n
@@ -195,16 +195,16 @@ def test_hook_exception_swallowed_and_counted(exc_cls, n, which):
 @settings(max_examples=50, deadline=None)
 @given(uid=st.text(min_size=1, max_size=30), success=st.booleans(), retry=st.booleans())
 def test_attempt_finished_hook_receives_value_object(uid, success, retry):
-    """fire_attempt_finished 把 (uid, outcome=AttemptFinish) 原样路由给钩子。"""
+    """fire_attempt_finished 把 (uid, outcome=AttemptOutcome) 原样路由给钩子。"""
     captured = []
     session = RunSession(
         on_attempt_finished=lambda u, *, outcome: captured.append((u, outcome))
     )
-    outcome = AttemptFinish(success=success, going_to_retry=retry, meta={"k": 1})
+    outcome = AttemptOutcome(success=success, will_retry=retry, metadata={"k": 1})
     session.fire_attempt_finished(uid, outcome=outcome)
     assert captured == [(uid, outcome)]
     assert captured[0][1].success is success
-    assert captured[0][1].going_to_retry is retry
+    assert captured[0][1].will_retry is retry
     assert session.stats["hook_errors"] == 0
 
 
@@ -294,11 +294,11 @@ def test_lifecycle_invariants_hold_for_arbitrary_action_sequences(actions):
             run_end_fired = True
         elif action in ("attempt_ok", "attempt_fail", "attempt_retry"):
             success = action == "attempt_ok"
-            going_to_retry = action == "attempt_retry"
+            will_retry = action == "attempt_retry"
             session.fire_attempt_finished(
                 "t::1",
-                outcome=AttemptFinish(
-                    success=success, going_to_retry=going_to_retry, meta={},
+                outcome=AttemptOutcome(
+                    success=success, will_retry=will_retry, metadata={},
                 ),
             )
             attempt_hook_calls += 1

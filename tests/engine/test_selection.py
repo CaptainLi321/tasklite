@@ -113,7 +113,7 @@ def _queued(pipeline: TaskLite) -> list[str]:
 
 
 def _attempt_errors(pipeline: TaskLite, uid: str) -> list[str]:
-    return [attempt.error or "" for attempt in pipeline.backend.load_attempts(uid)]
+    return [attempt.error_message or "" for attempt in pipeline.backend.load_attempts(uid)]
 
 
 # ── 默认全执行 / Exclude 延迟语义 ─────────────────────────────────────
@@ -131,7 +131,7 @@ def test_default_and_empty_rule_selection_execute_everything(fake_process, tmp_p
         return (
             summary.exit_reason,
             dict(summary.stats),
-            sorted(pipeline.backend.load_wall()),
+            sorted(pipeline.backend.load_successes()),
             _queued(pipeline),
         )
 
@@ -169,7 +169,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     assert summary.stats["completed"] == 1
     assert summary.stats["failed"] == 0 and summary.stats["skipped"] == 0
     assert summary.stats["excluded_blocked"] == 1  # rank::r（下游阻塞）
-    assert sorted(pipeline.backend.load_wall()) == ["fetch::a"]
+    assert sorted(pipeline.backend.load_successes()) == ["fetch::a"]
     assert pipeline.backend.load_failed() == {} and pipeline.list_failures() == []
     assert _queued(pipeline) == ["convert::b", "rank::r"]
     # 留队行原样保留：不写 attempts、不动实例位/预算位。
@@ -184,7 +184,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     second = pipeline.run()
     assert second.exit_reason is ExitReason.COMPLETED
     assert second.stats["completed"] == 2
-    assert sorted(pipeline.backend.load_wall()) == [
+    assert sorted(pipeline.backend.load_successes()) == [
         "convert::b",
         "fetch::a",
         "rank::r",
@@ -202,7 +202,7 @@ def test_only_excluded_jobs_finish_completed_without_failures(fake_process, tmp_
 
     assert summary.exit_reason is ExitReason.COMPLETED
     assert dict(summary.stats) == dict(EMPTY_STATS)
-    assert pipeline.backend.load_wall() == {}
+    assert pipeline.backend.load_successes() == {}
     assert pipeline.backend.load_failed() == {}
     assert sorted(_queued(pipeline)) == ["convert::a", "convert::b", "convert::c"]
     # 再次 run 仍为正常完成（不空转、不判死锁、不写失败档案）。
@@ -228,7 +228,7 @@ def test_selection_chains_replaces_and_persists_across_runs(fake_process, tmp_pa
     pipeline.selection()  # 重置后下一次 run 消费留队作业
     third = pipeline.run()
     assert third.stats["completed"] == 1
-    assert sorted(pipeline.backend.load_wall()) == ["convert::b", "fetch::a"]
+    assert sorted(pipeline.backend.load_successes()) == ["convert::b", "fetch::a"]
     assert _queued(pipeline) == []
 
 
@@ -310,7 +310,7 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
     pipeline.selection()
     second = pipeline.run()
     assert second.stats["completed"] == 1
-    assert "excluded_t::a" in pipeline.backend.load_wall()
+    assert "excluded_t::a" in pipeline.backend.load_successes()
     assert sorted(pipeline.backend.load_failed()) == ["rank::b", "rank::c"]
 
 
@@ -460,11 +460,11 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
 
     summary = outcome["summary"]
     assert summary.exit_reason is ExitReason.COMPLETED
-    assert sorted(pipeline.backend.load_wall()) == ["rank::ok"]
+    assert sorted(pipeline.backend.load_successes()) == ["rank::ok"]
     failures = pipeline.list_failures()
     assert len(failures) == 1
-    assert failures[0].uid.startswith("_unknown::")
-    assert failures[0].meta["error"] == ERR_MALFORMED_JOB
+    assert failures[0].job_uid.startswith("_unknown::")
+    assert failures[0].metadata["error"] == ERR_MALFORMED_JOB
     assert pipeline.backend.load_queue() == []
 
 
@@ -493,8 +493,8 @@ def test_skip_root_and_downstream_are_terminal_skipped(fake_process, tmp_path):
     assert summary.stats["completed"] == 1
     assert summary.stats["skipped"] == 3
     assert summary.stats["failed"] == 0 and summary.stats["cascade_failed"] == 0
-    # 跳过是终态：不进 wall、不进失败档案、也不留在 queue。
-    assert sorted(pipeline.backend.load_wall()) == ["fetch::f"]
+    # 跳过是终态：不进 successes、不进失败档案、也不留在 queue。
+    assert sorted(pipeline.backend.load_successes()) == ["fetch::f"]
     assert pipeline.backend.load_failed() == {}
     assert _queued(pipeline) == []
     assert _attempt_errors(pipeline, "skip_t::a")[-1] == ERR_SKIPPED
@@ -575,7 +575,7 @@ def test_skip_and_exclude_same_type_skip_wins(fake_process, tmp_path):
 
     assert summary.stats["skipped"] == 1
     assert _queued(pipeline) == []
-    assert pipeline.backend.load_wall() == {}
+    assert pipeline.backend.load_successes() == {}
 
 
 def test_skip_only_queue_completes_without_execution(fake_process, tmp_path):
@@ -590,7 +590,7 @@ def test_skip_only_queue_completes_without_execution(fake_process, tmp_path):
     assert summary.stats["skipped"] == 2
     assert summary.stats["completed"] == 0
     assert _queued(pipeline) == []
-    assert pipeline.backend.load_wall() == {} and pipeline.backend.load_failed() == {}
+    assert pipeline.backend.load_successes() == {} and pipeline.backend.load_failed() == {}
     assert pipeline.run().stats["skipped"] == 0
 
 
@@ -605,7 +605,7 @@ def test_spawned_excluded_child_stays_queued(monkeypatch, tmp_path):
     summary = pipeline.run()
 
     assert summary.exit_reason is ExitReason.COMPLETED
-    assert sorted(pipeline.backend.load_wall()) == ["fetch::parent"]
+    assert sorted(pipeline.backend.load_successes()) == ["fetch::parent"]
     assert pipeline.backend.load_failed() == {}
     assert _queued(pipeline) == ["excluded_t::child"]
     assert pipeline.backend.load_attempts("excluded_t::child") == []
@@ -625,7 +625,7 @@ def test_spawned_skip_child_is_terminal_skipped(monkeypatch, tmp_path):
     assert summary.exit_reason is ExitReason.COMPLETED
     assert summary.stats["completed"] == 1
     assert summary.stats["skipped"] == 1
-    assert sorted(pipeline.backend.load_wall()) == ["fetch::parent"]
+    assert sorted(pipeline.backend.load_successes()) == ["fetch::parent"]
     assert _queued(pipeline) == []
     assert _attempt_errors(pipeline, "skip_t::child")[-1] == ERR_SKIPPED
 
@@ -662,7 +662,7 @@ def test_stale_result_spawn_skips_before_dispatch_or_arbitration(
     monkeypatch.setattr(
         pipeline._runtime.channel,
         "claim_stale_result",
-        lambda uid, job: ExecutionResult(success=True, new_jobs=spawned)
+        lambda uid, job: ExecutionResult(success=True, spawned_jobs=spawned)
         if uid == "parent::restore" else None,
     )
     dispatch_job = pipeline._runtime._dispatch.dispatch_job
@@ -705,7 +705,7 @@ def test_stale_result_spawn_skip_respects_stop_hook(monkeypatch, tmp_path, force
     monkeypatch.setattr(
         pipeline._runtime.channel,
         "claim_stale_result",
-        lambda uid, job: ExecutionResult(success=True, new_jobs=[Job("skip_t", "child")]),
+        lambda uid, job: ExecutionResult(success=True, spawned_jobs=[Job("skip_t", "child")]),
     )
 
     summary = pipeline.run()
@@ -750,14 +750,14 @@ def test_scheduler_skips_selected_before_stall_facts():
     allowed = Job("rank", "r").to_dict()
     excluded = Job("pdf_to_md", "p").to_dict()
     blocked = Job("push", "x", depends_on=["pdf_to_md::p"]).to_dict()
-    state = PipelineState(wall={}, failed={}, cursors={}, queue=[excluded, blocked, allowed])
+    state = PipelineState(successes={}, failed={}, cursors={}, queue=[excluded, blocked, allowed])
 
     scheduler = JobScheduler(resources={})
     scheduler.selection = Selection([Exclude("pdf_to_md")])
     result = scheduler.scan_next_runnable(state, frozenset())
     assert result.is_runnable is True and result.runnable_idx == 2
 
-    only_stalled = PipelineState(wall={}, failed={}, cursors={}, queue=[excluded, blocked])
+    only_stalled = PipelineState(successes={}, failed={}, cursors={}, queue=[excluded, blocked])
     stalled = scheduler.scan_next_runnable(only_stalled, frozenset())
     assert stalled.kind == "none"
     assert stalled.attribution.has_deadlock_causes is False
@@ -768,7 +768,7 @@ def test_scheduler_skips_selected_before_stall_facts():
     skipped = Job("skip_t", "s").to_dict()
     scheduler.selection = Selection([Skip("skip_t")])
     result = scheduler.scan_next_runnable(
-        PipelineState(wall={}, failed={}, cursors={}, queue=[skipped, allowed]),
+        PipelineState(successes={}, failed={}, cursors={}, queue=[skipped, allowed]),
         frozenset(),
     )
     assert result.runnable_idx == 1
@@ -932,7 +932,7 @@ def test_partial_skip_commit_stays_removed_after_crash_save_and_reload(
     assert _uids(restarted.backend.load_queue()) == ["allowed::unrelated"]
     assert _uids(restarted._runtime.store.state.queue) == ["allowed::unrelated"]
     assert len(restarted.backend.load_attempts("allowed::child")) == 1
-    assert restarted.backend.load_wall() == {}
+    assert restarted.backend.load_successes() == {}
     assert restarted.backend.load_failed() == {}
 
 

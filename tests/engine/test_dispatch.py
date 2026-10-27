@@ -38,7 +38,7 @@ from tasklite.engine.resource import (
 )
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.store import StateStore
-from tasklite.engine.types import AttemptFinish, RunStats
+from tasklite.engine.types import AttemptOutcome, RunStats
 from tasklite.models.job import Job, JobRuntimeState, RT_DISPATCH_FAILURES
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
@@ -91,7 +91,7 @@ class DispatchEnv:
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
         self.stats = RunStats()
-        self.hooks: list[tuple[str, AttemptFinish]] = []
+        self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.store = StateStore(
             self.backend,
             PipelineState({}, {}, {}, []),
@@ -246,7 +246,7 @@ class TestDedupGate:
         records = env.backend.load_attempts("t::j1")
         assert records[-1].activation_no == 2
         assert records[-1].attempt_no == 1
-        # 豁免已登记（in-flight 互斥不击落 wall 命中的重跑）
+        # 豁免已登记（in-flight 互斥不击落 successes 命中的重跑）
         assert "t::j1" in env.store.state.in_flight_uids
 
     def test_failed_hit_with_on_failure_reruns(self, tmp_path, monkeypatch):
@@ -279,8 +279,8 @@ class TestRejectGates:
         assert "ghost::j1" in env.store.state.failed
         assert env.store.state.failed["ghost::j1"]["error"] == ERR_NO_HANDLER
         assert env.hooks == [
-            ("ghost::j1", AttemptFinish(success=False, going_to_retry=False,
-                                        meta=env.store.state.failed["ghost::j1"]))
+            ("ghost::j1", AttemptOutcome(success=False, will_retry=False,
+                                        metadata=env.store.state.failed["ghost::j1"]))
         ]
         records = env.backend.load_attempts("ghost::j1")
         assert records[-1].outcome == "failed"
@@ -388,7 +388,7 @@ class TestStaleRestoreGate:
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-        stale = ExecutionResult(success=True, result_meta={"restored": True})
+        stale = ExecutionResult(success=True, result_metadata={"restored": True})
         monkeypatch.setattr(env.channel, "claim_stale_result", lambda uid, job: stale)
         cleaned: list[str] = []
         monkeypatch.setattr(
@@ -561,7 +561,7 @@ class TestGateOrderContract:
     """五关顺序即契约：dedup 先于 dep-failed。"""
 
     def test_dedup_takes_precedence_over_dep_failed(self, tmp_path):
-        """wall 命中且无豁免的作业带失败依赖：按跳过处理，不进级联。"""
+        """successes 命中且无豁免的作业带失败依赖：按跳过处理，不进级联。"""
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.backend.commit_job_failure("dead::parent", {"error": "dead"})

@@ -208,7 +208,7 @@ class JobScheduler:
         key = (task_type, job_id)
         facts = self._job_cache.get(key)
         # 缓存一致性校验：缓存命中时校验「调度只读字段」一致——rerun="every_run"
-        # 的 job 在 wall 命中时被 spawn 去重豁免（文档化「每会话重扫」语义），
+        # 的 job 在 successes 命中时被 spawn 去重豁免（文档化「每会话重扫」语义），
         # 可在**同一 run 内**让同 uid 以不同 resources/depends_on 二次入队。
         # 若直接返回陈旧缓存，调度器（缓存投影）与派发器（Job.from_dict 重新
         # 解析的 fresh Job）看到不同字段 → 未知资源/依赖判定背离，以裸 KeyError
@@ -265,16 +265,16 @@ class JobScheduler:
     ) -> ScheduleResult:
         """只读扫描队列：返回候选下标与等待事实，不获取资源。
 
-        ``state`` 提供队列只读事实（queue/wall/failed/queue_uids——
+        ``state`` 提供队列只读事实（queue/successes/failed/queue_uids——
         ``queue_uids`` 返回活索引引用，提供 O(1) 索引，无 O(N) 拷贝）。
 
         ``in_flight_uids`` 是当前正在子进程中执行（已扫描选中但未 commit）的
         job uid 集合。在 missing dependency 判定时，依赖正在运行的 job 不算
-        missing（待其完成 commit 到 wall 后自然解锁），避免并发模型下误判
+        missing（待其完成 commit 到 successes 后自然解锁），避免并发模型下误判
         死锁。
         """
         q_data = state.queue
-        wall_data = state.wall
+        success_metadata = state.successes
         failed_data = state.failed
         queue_uids = state.queue_uids
         pending_or_running = queue_uids | set(in_flight_uids)
@@ -333,7 +333,7 @@ class JobScheduler:
             has_missing_dep = False
             if job.depends_on:
                 for dep_uid in job.depends_on:
-                    if dep_uid not in wall_data:
+                    if dep_uid not in success_metadata:
                         can_run = False
                         waiting_for_dependency = True
                         has_missing_dep = True

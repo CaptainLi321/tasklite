@@ -224,7 +224,7 @@ def test_encode_family_rejects_non_str_non_none():
     """非 str 非 None 入参显式 TypeError 拒绝，与 percent_encode 拒绝原则对齐。
 
     隐式 str() 强转会让 int 123 与 str "123" 同像碰撞（多对一，破坏单射
-    契约）——三个派生编码函数是公共导出 API 的 job_id 派生防线，wall 去
+    契约）——三个派生编码函数是公共导出 API 的 job_id 派生防线，successes 去
     重依赖其单射性，跨型同像会静默吞任务。
     """
     for fn in (encode_identifier, encode_job_component, encode_content_id):
@@ -517,7 +517,7 @@ def test_content_fingerprint_rejects_type_and_delimiter_collisions():
 
 def test_content_fingerprint_nested_containers_order_insensitive():
     # 嵌套结构全 token 化：任意层级 dict（含 dict 作 value）插入序无关，
-    # 逻辑相等必同指纹（否则确定性 job_id 分叉 → wall 不命中 → 重复执行）
+    # 逻辑相等必同指纹（否则确定性 job_id 分叉 → successes 不命中 → 重复执行）
     assert content_fingerprint([{"k": {"a": 1, "b": 2}}]) == content_fingerprint(
         [{"k": {"b": 2, "a": 1}}]
     )

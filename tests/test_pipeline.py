@@ -21,7 +21,7 @@ from tasklite.engine.admission import (
 )
 from tasklite.engine.resource import CapacityResource, RateLimitResource
 from tasklite.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
-from tasklite.engine.types import AttemptFinish, ExitReason, StopMode
+from tasklite.engine.types import AttemptOutcome, ExitReason, StopMode
 from tasklite.models.job import Job
 from tasklite.models.task import Task
 from tasklite.pipeline import TaskLite
@@ -66,14 +66,14 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def __init__(self) -> None:
         self.inner = InMemoryStateBackend()
 
-    def load_wall(self, *args, **kwargs):
-        return self.inner.load_wall(*args, **kwargs)
+    def load_successes(self, *args, **kwargs):
+        return self.inner.load_successes(*args, **kwargs)
 
     def load_failed(self, *args, **kwargs):
         return self.inner.load_failed(*args, **kwargs)
 
-    def load_failed_payloads(self, *args, **kwargs):
-        return self.inner.load_failed_payloads(*args, **kwargs)
+    def load_failure_payloads(self, *args, **kwargs):
+        return self.inner.load_failure_payloads(*args, **kwargs)
 
     def load_cursors(self, *args, **kwargs):
         return self.inner.load_cursors(*args, **kwargs)
@@ -96,8 +96,8 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def commit_retry(self, *args, **kwargs):
         return self.inner.commit_retry(*args, **kwargs)
 
-    def commit_bulk_failure(self, *args, **kwargs):
-        return self.inner.commit_bulk_failure(*args, **kwargs)
+    def commit_job_failures(self, *args, **kwargs):
+        return self.inner.commit_job_failures(*args, **kwargs)
 
     def commit_skip(self, *args, **kwargs):
         return self.inner.commit_skip(*args, **kwargs)
@@ -114,11 +114,11 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def delete_failed(self, *args, **kwargs):
         return self.inner.delete_failed(*args, **kwargs)
 
-    def delete_wall(self, *args, **kwargs):
-        return self.inner.delete_wall(*args, **kwargs)
+    def delete_successes(self, *args, **kwargs):
+        return self.inner.delete_successes(*args, **kwargs)
 
-    def seed_wall(self, *args, **kwargs):
-        return self.inner.seed_wall(*args, **kwargs)
+    def seed_successes(self, *args, **kwargs):
+        return self.inner.seed_successes(*args, **kwargs)
 
     def seed_cursor(self, *args, **kwargs):
         return self.inner.seed_cursor(*args, **kwargs)
@@ -476,7 +476,7 @@ class TestRegisterTransientException:
 
 
 class TestEnqueue:
-    """enqueue 摄入：front 语义、wall 不拦、注入管道。"""
+    """enqueue 摄入：front 语义、successes 不拦、注入管道。"""
 
     def test_single_job_wrapped(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -518,7 +518,7 @@ class TestEnqueue:
 
     def test_wall_hit_not_blocked_at_enqueue(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.seed_wall(["fetch::done"])
+        p.seed_successes(["fetch::done"])
         p.enqueue(Job("fetch", "done"))
         assert len(p.backend.load_queue()) == 1
 
@@ -547,11 +547,11 @@ class TestEnqueue:
 
 
 class TestFilterJobsWithoutSuccess:
-    """wall 过滤语义与顺序保持（委托 OpsConsole）。"""
+    """successes 过滤语义与顺序保持（委托 OpsConsole）。"""
 
     def test_wall_hits_filtered_order_preserved(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.seed_wall(["fetch::done1", "fetch::done2"])
+        p.seed_successes(["fetch::done1", "fetch::done2"])
         jobs = [
             Job("fetch", "new"),
             Job("fetch", "done1"),
@@ -575,7 +575,7 @@ class TestFilterJobsWithoutSuccess:
 
     def test_enqueue_composition_only_enqueues_jobs_without_success(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.seed_wall(["fetch::done"])
+        p.seed_successes(["fetch::done"])
         p.enqueue(p.filter_jobs_without_success([Job("fetch", "done"), Job("fetch", "new")]))
         queued = {f"{r['task_type']}::{r['job_id']}" for r in p.backend.load_queue()}
         assert queued == {"fetch::new"}
@@ -624,7 +624,7 @@ class TestSixStepContract:
 
         assert summary.exit_reason is ExitReason.COMPLETED
         assert summary.stats["completed"] == 2
-        assert sorted(p.backend.load_wall()) == ["fetch::a", "fetch::b"]
+        assert sorted(p.backend.load_successes()) == ["fetch::a", "fetch::b"]
         assert events[0] == "run_start"
         assert events[-1] == "run_end:completed"
         assert events[1:3] == ["attempt:fetch::a:True", "attempt:fetch::b:True"]
@@ -733,7 +733,7 @@ class TestSchedulingSeamWiring:
         order: list[tuple[str, bool]] = []
 
         def on_attempt_finished(uid, *, outcome):
-            order.append((uid, outcome.going_to_retry))
+            order.append((uid, outcome.will_retry))
 
         p = make_pipeline(
             tmp_path,
@@ -753,7 +753,7 @@ class TestSchedulingSeamWiring:
         ]
         assert order[0][1] is True
         assert order[2][1] is False
-        assert "fetch::later" in p.backend.load_wall()
+        assert "fetch::later" in p.backend.load_successes()
         assert "fetch::flaky" in p.backend.load_failed()
 
     def test_requeue_default_wiring_and_front_equivalence(self, tmp_path, monkeypatch):
@@ -791,8 +791,8 @@ class TestManageApis:
         p.backend.append_failed("fetch::bad", {"error": "boom", "fatal": False})
         entries = p.list_failures()
         assert len(entries) == 1
-        assert entries[0].uid == "fetch::bad"
-        assert entries[0].error == "boom"
+        assert entries[0].job_uid == "fetch::bad"
+        assert entries[0].error_message == "boom"
 
     def test_clear_failures_removes_non_fatal(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -821,18 +821,18 @@ class TestManageApis:
 
     def test_seed_wall_and_seed_cursor(self, tmp_path):
         p = make_pipeline(tmp_path)
-        assert p.seed_wall(["fetch::done"]) == 1
-        assert "fetch::done" in p.backend.load_wall()
+        assert p.seed_successes(["fetch::done"]) == 1
+        assert "fetch::done" in p.backend.load_successes()
         p.seed_cursor("page", "7")
         assert p.backend.load_cursors()["page"] == "7"
 
     def test_clear_history_removes_from_both(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.seed_wall(["fetch::ok"])
+        p.seed_successes(["fetch::ok"])
         p.backend.append_failed("fetch::bad", {"error": "x", "fatal": False})
         removed = p.clear_history(["fetch::"])
         assert removed == 2
-        assert p.backend.load_wall() == {}
+        assert p.backend.load_successes() == {}
         assert p.backend.load_failed() == {}
 
     def test_run_guards_across_manage_apis(self, tmp_path):
@@ -841,7 +841,7 @@ class TestManageApis:
             ("list_failures", lambda p: p.list_failures()),
             ("clear_failures", lambda p: p.clear_failures()),
             ("clear_history", lambda p: p.clear_history("fetch::")),
-            ("seed_wall", lambda p: p.seed_wall(["fetch::a"])),
+            ("seed_successes", lambda p: p.seed_successes(["fetch::a"])),
             ("seed_cursor", lambda p: p.seed_cursor("k", "v")),
         ]
         for api_name, call in guarded:
@@ -933,7 +933,7 @@ class TestBackendSwap:
         assert p._runtime.backend is new_backend
         assert p._runtime.store.backend is new_backend
         # 管理面（OpsConsole 经 store 派生）：读面命中新库数据
-        assert any(e.uid == "fetch::x" for e in p.list_failures())
+        assert any(e.job_uid == "fetch::x" for e in p.list_failures())
         # 摄入面（enqueue 经 store 派生）：写面命中新库
         p.register_task("fetch", ok_handler)
         p.enqueue(Job("fetch", "swapped"))
@@ -972,4 +972,4 @@ class TestBackendSwap:
         p.backend = fake
         assert p.backend is fake
         assert p._runtime.store.backend is fake
-        assert any(e.uid == "fetch::x" for e in p.list_failures())
+        assert any(e.job_uid == "fetch::x" for e in p.list_failures())

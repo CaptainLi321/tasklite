@@ -1,6 +1,6 @@
 """v2 测试辅助工具回归（fake_ctx / running）。
 
-契约：wall/failed/cursors 的内部容器结构由构造器兜底装配（调用方传
+契约：successes/failed/cursors 的内部容器结构由构造器兜底装配（调用方传
 任意可迭代/映射即可）；tmp_root 模式提供沙盒 output_roots 与可记录的
 ipc 目录；resources 名单启用 suspend_resource 的 fail-loud 校验；
 running 句柄保证 run 期旗子复位（漏复位污染同会话后续用例）。
@@ -69,7 +69,7 @@ class TestFakeCtxBasics:
         assert ctx.get_cursor("any") is None
 
     def test_wall_failed_accept_any_iterable(self):
-        ctx = fake_ctx(_job(), wall=["a::1", "a::2"], failed=("b::1",))
+        ctx = fake_ctx(_job(), successes=["a::1", "a::2"], failed=("b::1",))
         assert ctx.has_succeeded("a::1")
         assert ctx.has_succeeded("a::2")
         assert ctx.has_failed("b::1")
@@ -85,7 +85,7 @@ class TestFakeCtxBasics:
         ctx = fake_ctx(_job())
         child = _job("fetch", "child")
         ctx.spawn(child)
-        assert ctx.new_jobs == [child]
+        assert ctx.spawned_jobs == [child]
 
 
 class TestFakeCtxTmpRoot:

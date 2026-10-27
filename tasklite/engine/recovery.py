@@ -110,24 +110,24 @@ class RecoveryOrchestrator:
         清单内（backend 经 store 活引用），零新增依赖。
         """
         backend = self._store.backend
-        wall = backend.load_wall()
+        successes = backend.load_successes()
         failed = backend.load_failed()
         cursors = backend.load_cursors()
         q_data = backend.load_queue()
 
         # 启动期队列整理与资源挂起加载（终态交集先收敛，后续修复与
-        # 六集合互斥断言都依赖 wall/failed 互斥前提）
-        self.converge_terminal_overlap(wall, failed)
-        q_data = self.repair_queue_on_load(q_data, wall, failed)
+        # 六集合互斥断言都依赖 successes/failed 互斥前提）
+        self.converge_terminal_overlap(successes, failed)
+        q_data = self.repair_queue_on_load(q_data, successes, failed)
         self.load_resource_suspensions()
         self.salvage_residue_signals()
 
-        state = PipelineState(wall, failed, cursors, q_data)
+        state = PipelineState(successes, failed, cursors, q_data)
         self._store.set_state(state)
         return state
 
     def repair_queue_on_load(
-        self, q_data: list, wall: dict, failed: dict
+        self, q_data: list, successes: dict, failed: dict
     ) -> list:
         """加载期队列整理：磁盘合并重读 + 残留过滤 + UID 去重，差量定向清理。
 
@@ -135,7 +135,7 @@ class RecoveryOrchestrator:
            的作业，补进本次 run 的内存队列；合并以磁盘真相序为权威序（窗口期
            front 入队作业保持其磁盘队首位置，快照独有行让位队尾）。重读失败
            仅放弃合并并告警，清理正确性不受影响；不基于重读结果做任何写盘。
-        2. 残留过滤：过滤已在 wall/failed 中且不符合 rerun 策略的残留；
+        2. 残留过滤：过滤已在 successes/failed 中且不符合 rerun 策略的残留；
            放行保留的重跑行落字面 rerun 键（有效策略口径，豁免登记以行内
            键为事实源）。
         3. UID 去重：同一 UID 重复条目保留首条；磁盘重读与快照的同 uid
@@ -179,13 +179,13 @@ class RecoveryOrchestrator:
 
         for jd in merged_rows:
             u = job_uid_from_snapshot(jd)
-            wall_hit = u in wall
+            success_hit = u in successes
             failed_hit = u in failed
-            if wall_hit or failed_hit:
+            if success_hit or failed_hit:
                 decision = self._policy.evaluate(
                     jd,
-                    wall_meta=wall.get(u),
-                    is_wall=wall_hit,
+                    success_metadata=successes.get(u),
+                    is_success=success_hit,
                     is_failed=failed_hit,
                 )
                 if decision.should_skip:
@@ -220,28 +220,28 @@ class RecoveryOrchestrator:
                 )
         return clean_q
 
-    def converge_terminal_overlap(self, wall: dict, failed: dict) -> None:
-        """加载期收敛存量 wall∩failed 终态交集（failed 优先，内存 + 磁盘同步）。
+    def converge_terminal_overlap(self, successes: dict, failed: dict) -> None:
+        """加载期收敛存量 successes∩failed 终态交集（failed 优先，内存 + 磁盘同步）。
 
-        不变式：wall/failed 全局互斥；交集属终态违例数据，不收敛则首次
+        不变式：successes/failed 全局互斥；交集属终态违例数据，不收敛则首次
         派发的六集合互斥断言对任意作业全局触发。收敛语义与失败档案写入
-        侧清 wall 一致（failed 保留失败证据，可人工核查重跑，优于静默
-        视为成功）。落盘为按 uid 定向 ``delete_wall`` 差量删除（磁盘其余
+        侧清 successes 一致（failed 保留失败证据，可人工核查重跑，优于静默
+        视为成功）。落盘为按 uid 定向 ``delete_successes`` 差量删除（磁盘其余
         行原样保留），失败仅降级告警——内存态已收敛，本次 run 不受影响，
         磁盘保持原状、下次加载重判（幂等）。
         """
-        overlap = sorted(set(wall) & set(failed))
+        overlap = sorted(set(successes) & set(failed))
         if not overlap:
             return
         for uid in overlap:
-            del wall[uid]
+            del successes[uid]
         logger.warning(
-            f"Loaded {len(overlap)} uid(s) present in both wall and failed "
+            f"Loaded {len(overlap)} uid(s) present in both successes and failed "
             f"(terminal-state violation); converged to failed and removed "
-            f"from wall: {overlap}"
+            f"from successes: {overlap}"
         )
         try:
-            self._store.backend.delete_wall(overlap)
+            self._store.backend.delete_successes(overlap)
         except Exception as e:
             logger.warning(
                 f"Failed to persist terminal-overlap convergence to backend; "

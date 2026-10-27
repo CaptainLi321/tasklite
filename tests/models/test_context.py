@@ -21,7 +21,7 @@ from tasklite.utils.ipc import ArtifactJournal
 def _make_ctx(
     job: Job | None = None,
     *,
-    wall: set[str] | None = None,
+    successes: set[str] | None = None,
     failed: set[str] | None = None,
     cursors: dict[str, str] | None = None,
     resources: frozenset | None = None,
@@ -31,7 +31,7 @@ def _make_ctx(
     """构造测试用 JobContext（内部容器由本工厂兜底装配）。"""
     return JobContext(
         job if job is not None else Job("fetch", "j1"),
-        wall if wall is not None else set(),
+        successes if successes is not None else set(),
         failed if failed is not None else set(),
         cursors if cursors is not None else {},
         output_roots=output_roots,
@@ -41,7 +41,7 @@ def _make_ctx(
 
 
 class TestSnapshotSemantics:
-    """wall/failed 快照与游标读写。"""
+    """successes/failed 快照与游标读写。"""
 
     def test_default_state_empty(self):
         ctx = _make_ctx()
@@ -51,7 +51,7 @@ class TestSnapshotSemantics:
         assert ctx.succeeded_or_failed_job_uids() == frozenset()
 
     def test_wall_failed_snapshot_visible(self):
-        ctx = _make_ctx(wall={"a::one", "a::two"}, failed={"b::one"})
+        ctx = _make_ctx(successes={"a::one", "a::two"}, failed={"b::one"})
         assert ctx.has_succeeded(job_uid="a::one")
         assert ctx.has_succeeded("a::two")
         assert ctx.has_failed(job_uid="b::one")
@@ -91,7 +91,7 @@ class TestSpawn:
         ctx = _make_ctx()
         child = Job("fetch", "child")
         ctx.spawn(child)
-        assert ctx.new_jobs == [child]
+        assert ctx.spawned_jobs == [child]
 
     def test_spawn_rejects_non_serializable_payload(self):
         """坏 payload 在子进程内立即预检拒绝（父作业进失败档案，而非
@@ -104,7 +104,7 @@ class TestSpawn:
         with pytest.raises(ValueError, match="not JSON-serializable") as exc_info:
             ctx.spawn(Job("fetch", "bad", payload={"fn": my_func}))
         assert "fetch::bad" in str(exc_info.value)
-        assert ctx.new_jobs == []
+        assert ctx.spawned_jobs == []
 
     def test_spawn_rejects_nan_payload(self):
         """allow_nan=False：float('inf') 不得通过预检产出非标准 JSON。"""
@@ -115,7 +115,7 @@ class TestSpawn:
     def test_spawn_accepts_normal_payload(self):
         ctx = _make_ctx()
         ctx.spawn(Job("fetch", "ok", payload={"url": "https://example.com/a"}))
-        assert len(ctx.new_jobs) == 1
+        assert len(ctx.spawned_jobs) == 1
 
 
 class TestDeclareOutputSandbox:

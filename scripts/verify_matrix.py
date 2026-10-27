@@ -63,10 +63,10 @@ def main():
         assert stats["retried"] == 1, f"Expected 1 retried, got {stats['retried']}"
         assert stats["skipped"] == 0
 
-        wall = pipeline.backend.load_wall()
-        assert "task_a::job_1" in wall
-        assert "task_retry::job_2" in wall
-        assert wall["task_a::job_1"]["result"] == "processed_42"
+        successes = pipeline.backend.load_successes()
+        assert "task_a::job_1" in successes
+        assert "task_retry::job_2" in successes
+        assert successes["task_a::job_1"]["result"] == "processed_42"
         assert len(pipeline.list_failures()) == 0
 
     print("✓ End-to-end multi-process execution passed.")

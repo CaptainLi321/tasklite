@@ -4,11 +4,11 @@
 - enqueue 后可见（幂等去重、front/back 保序）；
 - pop 后不可见（delta 终态提交后 uid 从磁盘队列消失，队列行从不单独
   「裸弹出」——弹出的 uid 只在 commit 事务内删除）；
-- 终态互斥（成功删 failed 同名行、失败删 wall 行，最终状态唯一）；
+- 终态互斥（成功删 failed 同名行、失败删 successes 行，最终状态唯一）；
 - attempts append-only（历史行只增不改，每行仅允许一次收尾）。
 
 另覆盖双腿契约面：commit 失败/冲突不变式（False ⇒ 后端与调用前
-完全一致）、replace_queue_atomic、替换集形状校验、seed_wall 互斥、
+完全一致）、replace_queue_atomic、替换集形状校验、seed_successes 互斥、
 seed_cursor 入口校验。
 """
 
@@ -48,9 +48,9 @@ def _snapshot(backend) -> dict:
     """与实现无关的后端状态快照，用于原子性比对（False ⇒ 全集不变）。"""
     return {
         "queue": _queue_uids(backend),
-        "wall": backend.load_wall(),
+        "wall": backend.load_successes(),
         "failed": backend.load_failed(),
-        "failure_payloads": backend.load_failed_payloads(),
+        "failure_payloads": backend.load_failure_payloads(),
         "cursors": backend.load_cursors(),
     }
 
@@ -83,13 +83,13 @@ class TestCoreContractProperties:
         b = dual_backend
         b.enqueue_jobs([_job_snapshot(j) for j in ("success_one", "fail_one", "bulk_one", "skip_one")])
 
-        assert b.commit_job_success(job_uid="t::success_one", result_meta={"ok": True}) is True
-        assert b.commit_job_failure(job_uid="t::fail_one", result_meta={"error": "x"}) is True
-        assert b.commit_bulk_failure(job_uids_metas=[("t::bulk_one", {"error": "y"})]) is True
+        assert b.commit_job_success(job_uid="t::success_one", result_metadata={"ok": True}) is True
+        assert b.commit_job_failure(job_uid="t::fail_one", result_metadata={"error": "x"}) is True
+        assert b.commit_job_failures(job_uids_metas=[("t::bulk_one", {"error": "y"})]) is True
         assert b.commit_skip(job_uid="t::skip_one") is True
 
         assert _queue_uids(b) == []
-        assert set(b.load_wall()) == {"t::success_one"}
+        assert set(b.load_successes()) == {"t::success_one"}
         assert set(b.load_failed()) == {"t::fail_one", "t::bulk_one"}
 
     def test_popped_uid_requeued_visible_via_commit_retry(self, dual_backend):
@@ -103,18 +103,24 @@ class TestCoreContractProperties:
         assert queue[0]["attempt_no"] == 2
 
     def test_success_failure_mutually_delete_opposite_side(self, dual_backend):
-        """终态互斥：成功删 failed 同名行、失败删 wall 行（最终状态唯一）。"""
+        """终态互斥：成功删 failed 同名行、失败删 successes 行（最终状态唯一）。"""
         b = dual_backend
-        b.commit_job_failure("t::one", {"error": "stale"}, job_payload={"k": 1})
+        metadata = {"error": "stale", "payload": "档案元数据", "nested": {"new_jobs": [1]}}
+        payload = {"error": "业务输入", "metadata": "业务值", "nested": {"timeout": 9}}
+        assert b.commit_job_failure(
+            job_uid="t::one", result_metadata=metadata, payload=payload
+        ) is True
+        assert b.load_failed()["t::one"] == metadata
+        assert b.load_failure_payloads()["t::one"] == payload
         b.commit_job_success("t::other", {"ok": True})
 
         assert b.commit_job_success("t::one", {"ok": True}) is True
         assert b.load_failed() == {}
-        assert b.load_failed_payloads() == {}
+        assert b.load_failure_payloads() == {}
 
         assert b.commit_job_failure("t::other", {"error": "boom"}) is True
-        assert b.load_wall() == {"t::one": {"ok": True}}
-        assert not (set(b.load_wall()) & set(b.load_failed()))
+        assert b.load_successes() == {"t::one": {"ok": True}}
+        assert not (set(b.load_successes()) & set(b.load_failed()))
 
     def test_attempts_append_only_never_rewrites_history(self, dual_backend):
         """attempts 只增不改：历史行字段稳定、每行仅一次收尾。"""
@@ -125,7 +131,7 @@ class TestCoreContractProperties:
 
         assert b.update_attempt(
             first, outcome="failed",
-            finished_at="2026-05-01T00:00:05+00:00", error="boom",
+            finished_at="2026-05-01T00:00:05+00:00", error_message="boom",
         ) is True
 
         third = b.append_attempt(_running_attempt("t::other"))
@@ -173,7 +179,7 @@ class TestBackendCommitAtomicity:
     def test_spawn_conflict_returns_false_keeping_backend_unchanged(self, dual_backend):
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("child")])
-        b.append_failed(job_uid="t::one", payload={"error": "stale"})
+        b.append_failed(job_uid="t::one", metadata={"error": "stale"})
         before = _snapshot(b)
 
         ok = b.commit_job_success(
@@ -184,7 +190,7 @@ class TestBackendCommitAtomicity:
         )
 
         assert ok is False
-        # popped uid 仍在队列、wall/failed/cursors 均未被触碰
+        # popped uid 仍在队列、successes/failed/cursors 均未被触碰
         assert _snapshot(b) == before
         assert "t::one" in _queue_uids(b)
 
@@ -195,7 +201,7 @@ class TestBackendCommitAtomicity:
         assert ok is True
         # spawned 队首插入，预置的 t::child 条目保持原位
         assert _queue_uids(b) == ["t::fresh", "t::child"]
-        assert "t::one" in b.load_wall()
+        assert "t::one" in b.load_successes()
 
     def test_spawn_batch_duplicate_uid_rejected_without_dup_entries(self, dual_backend):
         b = dual_backend
@@ -237,16 +243,16 @@ class TestBackendCommitAtomicity:
     def test_bulk_failure_write_error_leaves_backend_unchanged(self, dual_backend):
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("two")])
-        b.seed_wall(["t::nine"])
+        b.seed_successes(["t::nine"])
         before = _snapshot(b)
 
-        ok = b.commit_bulk_failure([
+        ok = b.commit_job_failures([
             ("t::one", {"error": "d_one"}),
             ("t::two", {"payload": _UncommittableMeta()}),
         ])
 
         assert ok is False
-        # 队列绝不被整体删除、wall 绝不被清理
+        # 队列绝不被整体删除、successes 绝不被清理
         assert _snapshot(b) == before
 
     def test_job_failure_write_error_leaves_backend_unchanged(self, dual_backend):
@@ -274,7 +280,7 @@ class TestBackendCommitAtomicity:
 
         assert ok is True
         assert _queue_uids(b) == ["t::child_one", "t::child_two"]
-        assert b.load_wall()["t::one"]["status"] == "ok"
+        assert b.load_successes()["t::one"]["status"] == "ok"
         # 成功 commit 清理 failed 同名残行
         assert "t::one" not in b.load_failed()
         assert b.load_cursors() == {"page": "two"}
@@ -388,9 +394,9 @@ class TestQueueReplacementShapeValidation:
 
 
 class TestSeedWallMutualExclusion:
-    """seed_wall 拒绝已存在 failed 的 uid（wall/failed 全局互斥，双腿同契约）。
+    """seed_successes 拒绝已存在 failed 的 uid（successes/failed 全局互斥，双腿同契约）。
 
-    seed 链路若静默覆盖会留下 wall∩failed 重叠：下一次派发时状态一致性
+    seed 链路若静默覆盖会留下 successes∩failed 重叠：下一次派发时状态一致性
     断言崩溃、配合崩溃恢复形成重启循环。语义定为整体拒绝（零写入）——
     失败档案记录须先经 delete_failed 显式清除，静默清除会丢失败历史。
     """
@@ -400,10 +406,10 @@ class TestSeedWallMutualExclusion:
         b.append_failed("t::x_marks", {"error": "boom"})
 
         with pytest.raises(ValueError, match="already in failed"):
-            b.seed_wall(["t::x_marks"])
+            b.seed_successes(["t::x_marks"])
 
-        # 零写入：拒绝后 wall 不含该 uid，失败档案记录原样保留
-        assert "t::x_marks" not in b.load_wall()
+        # 零写入：拒绝后 successes 不含该 uid，失败档案记录原样保留
+        assert "t::x_marks" not in b.load_successes()
         assert "t::x_marks" in b.load_failed()
 
     def test_seed_wall_conflict_is_atomic_no_partial_write(self, dual_backend):
@@ -412,19 +418,19 @@ class TestSeedWallMutualExclusion:
         b.append_failed("t::bad_entry", {"error": "boom"})
 
         with pytest.raises(ValueError, match="already in failed"):
-            b.seed_wall(["t::ok_entry", "t::bad_entry", "t::ok_next"])
+            b.seed_successes(["t::ok_entry", "t::bad_entry", "t::ok_next"])
 
-        assert set(b.load_wall()) == set()
+        assert set(b.load_successes()) == set()
         assert "t::bad_entry" in b.load_failed()
 
     def test_seed_wall_fresh_uid_idempotent(self, dual_backend):
         """正常 seed（无 failed 冲突）行为不变：幂等覆盖写入。"""
         b = dual_backend
-        assert b.seed_wall(["t::fresh_one", "t::fresh_two"]) == 2
-        assert set(b.load_wall()) == {"t::fresh_one", "t::fresh_two"}
+        assert b.seed_successes(["t::fresh_one", "t::fresh_two"]) == 2
+        assert set(b.load_successes()) == {"t::fresh_one", "t::fresh_two"}
         # 幂等：重复 seed 仍成功（meta 重置为空）
-        assert b.seed_wall(["t::fresh_one"]) == 1
-        assert b.load_wall()["t::fresh_one"] == {}
+        assert b.seed_successes(["t::fresh_one"]) == 1
+        assert b.load_successes()["t::fresh_one"] == {}
 
 
 class TestSeedCursorParity:

@@ -79,9 +79,9 @@ class TaskLite:
             全部退出路径），参数为 exit_reason（completed /
             stopped_draining / stopped_aborting / interrupted / error）。
         on_attempt_finished: 每 attempt 收尾时同步调用（同一 job 跨
-            重试触发多次），签名 ``(uid, *, outcome: AttemptFinish)``；
+            重试触发多次），签名 ``(uid, *, outcome: AttemptOutcome)``；
             在 stats 更新之后、下一 job 派发之前调用。布尔语义经
-            AttemptFinish 值对象承载（success 与 going_to_retry 正交）。
+            AttemptOutcome 值对象承载（success 与 will_retry 正交）。
         strict_picklable: run() 前对全部已注册 Task 的 handler 做
             pickle 预检（fail-loud）——spawn 上下文要求 handler 模块级
             可 pickle，预检把派发期才爆发的序列化失败提前到入口。
@@ -502,9 +502,9 @@ class TaskLite:
         支持链式。两类规则语义严格区分：
 
         - ``Exclude(task_type=...)``：本次不执行、原样留队（不写 attempt、不进
-          wall/失败档案、不消耗资源与预算），下游同样留队，下一次 run 自动
+          successes/失败档案、不消耗资源与预算），下游同样留队，下一次 run 自动
           恢复执行；仅因排除而停摆时 `run()` 以 COMPLETED 收敛并保留队列。
-        - ``Skip(task_type=...)``：终态跳过（移出 queue、不进 wall/失败档案），
+        - ``Skip(task_type=...)``：终态跳过（移出 queue、不进 successes/失败档案），
           下游整链级联跳过（attempt 记 ``DEPENDENCY_SKIPPED``），下次不再
           执行。
 
@@ -557,7 +557,7 @@ class TaskLite:
     # ── 入队与过滤（六步之四前置）──────────────────────────────────
 
     def filter_jobs_without_success(self, jobs: Sequence[Job]) -> list[Job]:
-        """过滤出尚未成功完成的 job（uid 不在 wall 的子集，保留输入顺序）。
+        """过滤出尚未成功完成的 job（uid 不在 successes 的子集，保留输入顺序）。
 
         委托 OpsConsole；边界语义（failed 不排除、队列驻留不排除）见其
         docstring。标准姿势：``pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))``。
@@ -568,7 +568,7 @@ class TaskLite:
     def enqueue(self, jobs: Job | Sequence[Job], *, front: bool = False) -> None:
         """入队作业（重复 uid 静默跳过，front=True 插队首）。
 
-        wall 命中不在 enqueue 拦截——rerun 策略裁决属派发层（拦截点在
+        successes 命中不在 enqueue 拦截——rerun 策略裁决属派发层（拦截点在
         五关预检），此处抢先过滤会吞掉 every_run/on_failure 的豁免
         语义。写入走后端增量 API（单事务原子插入，不做全表重写），与
         run() 的增量 commit 并发时互不覆盖；序列化预检、任务级默认
@@ -637,17 +637,17 @@ class TaskLite:
         self,
         targets: str | Sequence[str],
         *,
-        where: Sequence[str] = ("wall", "failed"),
+        where: Sequence[str] = ("successes", "failed"),
         predicate: Callable[[str], bool] | None = None,
     ) -> int:
-        """从 wall 和/或失败档案删除条目。委托 OpsConsole。"""
+        """从 successes 和/或失败档案删除条目。委托 OpsConsole。"""
         self._ensure_not_running("clear_history")
         return self._console.clear_history(targets, where=where, predicate=predicate)
 
-    def seed_wall(self, uids: Sequence[str]) -> int:
-        """把 uid 批量写入 wall（存档迁移标记「已处理」）。委托 OpsConsole。"""
-        self._ensure_not_running("seed_wall")
-        return self._console.seed_wall(uids)
+    def seed_successes(self, job_uids: Sequence[str]) -> int:
+        """把 uid 批量写入 successes（存档迁移标记「已处理」）。委托 OpsConsole。"""
+        self._ensure_not_running("seed_successes")
+        return self._console.seed_successes(job_uids)
 
     def seed_cursor(self, key: str, value: str) -> None:
         """预填一个 cursor（幂等）。委托 OpsConsole。"""
@@ -663,7 +663,7 @@ class TaskLite:
           自然完成后再退出（优雅停机）。
         - ``stop(force=True)``（ABORTING）：分类消费在途任务——已完成
           （结果文件已落盘、只差 drain 回收）的 job 走完成机器提交（进
-          wall/failed，不 kill、不删产出、不 requeue），仅对进行中的
+          successes/failed，不 kill、不删产出、不 requeue），仅对进行中的
           job 执行 kill + 清半成品 + requeue 后退出。
         """
         self._runtime.request_stop(force=force)

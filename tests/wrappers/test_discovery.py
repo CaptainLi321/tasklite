@@ -1,15 +1,15 @@
 """v2 register_discovery 契约测试（REQUIREMENTS CONTRACT，见 v2 wrappers discovery 模块）。
 
-纯任务模型增量发现：已见集合 = wall/failed 快照（ctx.has_succeeded /
+纯任务模型增量发现：已见集合 = successes/failed 快照（ctx.has_succeeded /
 ctx.has_failed），无 cursor、无 seen 持久化、无 poison 表、无互斥注入。
 移植 v1 同源测试并按 v2 公开面改写（encode_content_id / register_task）。
 
 契约验证场景：
-- 首次全量扫描（空 wall → 逐页 → 空页终止）
+- 首次全量扫描（空 successes → 逐页 → 空页终止）
 - 中间翻页运行（部分命中页继续翻，整页命中终止）
-- 重新发现含新内容（新 id 被处理，旧 id 被 wall 快照跳过）
+- 重新发现含新内容（新 id 被处理，旧 id 被 successes 快照跳过）
 - 源端删除场景（删中间/删最旧/删最新 → 不重不漏）
-- 崩溃重跑（异常传播 → 重扫 → wall 去重吸收）
+- 崩溃重跑（异常传播 → 重扫 → successes 去重吸收）
 - 确定性 job_id（编码后的 content_id 直接可用作 Job.job_id）
 - 真实子进程（spawn 上下文，模块级回调可 pickle）
 - 防御测试：id_func 异常、fetch 非 list、process_item_func 异常、
@@ -161,17 +161,17 @@ def _make_pipeline(name="test_disc"):
     return TaskLite(name=name, state_dir=state_dir, backend="sqlite")
 
 
-def _make_ctx(job=None, wall=None, failed=None):
+def _make_ctx(job=None, successes=None, failed=None):
     if job is None:
         job = Job("discover", "seed", payload={})
-    return fake_ctx(job, wall=wall or (), failed=failed or ())
+    return fake_ctx(job, successes=successes or (), failed=failed or ())
 
 
 def _register(pipeline, **kwargs):
     """注册纯 discovery（无命名空间——prefix 为空，编码 = 单层转义）。
 
     cursor_key_func 命名空间的语义由 test_cursor_key_namespace_prevents_id_collision
-    单独覆盖；主路径测试用无前缀形态使 wall 快照构造简单且与 handler 一致。
+    单独覆盖；主路径测试用无前缀形态使 successes 快照构造简单且与 handler 一致。
     """
     register_discovery(
         pipeline,
@@ -185,7 +185,7 @@ def _register(pipeline, **kwargs):
 
 
 def _wall_from_seen():
-    """把已处理的 content_id 转成 wall 快照（等价「子任务已完成」）。"""
+    """把已处理的 content_id 转成 successes 快照（等价「子任务已完成」）。"""
     return {f"{PTYPE}::{cid}" for cid in _seen_by_handler}
 
 
@@ -201,7 +201,7 @@ def _handler(pipeline):
 
 class TestTermination:
     def test_first_scan_full_pagination_until_empty(self):
-        """首次全量扫描：空 wall → 逐页拉取直到空页终止。"""
+        """首次全量扫描：空 successes → 逐页拉取直到空页终止。"""
         _reset_source([{"id": i} for i in range(7)])  # 7 条 → 3 页 + 1 空页
         pipeline = _make_pipeline()
         _register(pipeline)
@@ -219,10 +219,10 @@ class TestTermination:
         pipeline = _make_pipeline()
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
-        # wall 预置 {9,8}（page1=[9,8,7] 部分命中）
+        # successes 预置 {9,8}（page1=[9,8,7] 部分命中）
         seen = {"9", "8"}
-        wall = {f"{PTYPE}::{encode_content_id(c)}" for c in seen}
-        ctx = _make_ctx(job, wall=wall)
+        successes = {f"{PTYPE}::{encode_content_id(c)}" for c in seen}
+        ctx = _make_ctx(job, successes=successes)
         assert _handler(pipeline)(job, ctx) is True
         # 部分命中必须继续翻页：7 和后续页全部处理
         assert _seen_orig(_seen_by_handler) == {
@@ -235,8 +235,8 @@ class TestTermination:
         pipeline = _make_pipeline()
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
-        wall = {f"{PTYPE}::{encode_content_id(str(i))}" for i in range(7)}
-        ctx = _make_ctx(job, wall=wall)
+        successes = {f"{PTYPE}::{encode_content_id(str(i))}" for i in range(7)}
+        ctx = _make_ctx(job, successes=successes)
         assert _handler(pipeline)(job, ctx) is True
         assert _seen_by_handler == set(), "整页命中后不应处理任何 item"
 
@@ -248,7 +248,7 @@ class TestTermination:
 
 class TestRediscoveryAndDeletion:
     def test_rediscovery_only_new_content(self):
-        """重新发现：只处理新增内容，旧内容被 wall 快照跳过。"""
+        """重新发现：只处理新增内容，旧内容被 successes 快照跳过。"""
         _reset_source([{"id": i} for i in range(6)])  # 首次 6 条
         pipeline = _make_pipeline()
         _register(pipeline)
@@ -261,13 +261,13 @@ class TestRediscoveryAndDeletion:
         _add_posts([{"id": 10}, {"id": 11}])
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
-        ctx2 = _make_ctx(job, wall=wall2)
+        ctx2 = _make_ctx(job, successes=wall2)
         assert _handler(pipeline)(job, ctx2) is True
         # 只处理新的 2 个，旧的 0-5 全部跳过
         assert _seen_orig(_seen_by_handler) == {"10", "11"}
 
     def test_deletion_middle_no_rescan_no_loss(self):
-        """删中间：不触发全量重扫，前移内容仍被 wall 判定为已见。"""
+        """删中间：不触发全量重扫，前移内容仍被 successes 判定为已见。"""
         _reset_source([{"id": i} for i in range(9)])
         pipeline = _make_pipeline()
         _register(pipeline)
@@ -281,7 +281,7 @@ class TestRediscoveryAndDeletion:
         _add_posts([{"id": 12}])
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
-        ctx2 = _make_ctx(job, wall=wall2)
+        ctx2 = _make_ctx(job, successes=wall2)
         assert _handler(pipeline)(job, ctx2) is True
         # 只处理新的 12；前移的旧内容（如 page1 的 8,7）全部跳过
         assert _seen_orig(_seen_by_handler) == {"12"}
@@ -299,7 +299,7 @@ class TestRediscoveryAndDeletion:
         _add_posts([{"id": 20}])
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
-        ctx2 = _make_ctx(job, wall=wall2)
+        ctx2 = _make_ctx(job, successes=wall2)
         assert _handler(pipeline)(job, ctx2) is True
         assert _seen_orig(_seen_by_handler) == {"20"}
 
@@ -316,21 +316,21 @@ class TestRediscoveryAndDeletion:
         _add_posts([{"id": 10}])
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
-        ctx2 = _make_ctx(job, wall=wall2)
+        ctx2 = _make_ctx(job, successes=wall2)
         assert _handler(pipeline)(job, ctx2) is True
         assert _seen_orig(_seen_by_handler) == {"10"}
 
-        # 新作品 10 被删 → 重跑：wall 快照仍含 10（历史），不重复处理
+        # 新作品 10 被删 → 重跑：successes 快照仍含 10（历史），不重复处理
         _delete_posts([10])
         wall3 = wall2 | _wall_from_seen()  # 历史 0-3 ∪ 新增 10
         _seen_by_handler.clear()
-        ctx3 = _make_ctx(job, wall=wall3)
+        ctx3 = _make_ctx(job, successes=wall3)
         assert _handler(pipeline)(job, ctx3) is True
         assert _seen_orig(_seen_by_handler) == set()
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 崩溃重跑（无游标 → 异常传播 → 重扫 → wall 去重吸收）
+# 崩溃重跑（无游标 → 异常传播 → 重扫 → successes 去重吸收）
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -339,7 +339,7 @@ class TestCrashRerun:
         """扫描中途 fetch 抛异常 → 异常传播（由错误分类决定重试/失败档案）。
 
         本模型无游标可推进，崩溃即整轮重扫——已 spawn 的子任务由确定性
-        job_id 的 wall 去重吸收，不重不漏。
+        job_id 的 successes 去重吸收，不重不漏。
         """
         _reset_source([{"id": i} for i in range(7)])
         _crash_calls["n"] = 0
@@ -355,7 +355,7 @@ class TestCrashRerun:
             _handler(pipeline)(job, ctx)
 
     def test_rerun_after_crash_rescans_and_dedups(self):
-        """崩溃后重跑：完整重扫；已 spawn 的 item 被 wall 快照吸收。"""
+        """崩溃后重跑：完整重扫；已 spawn 的 item 被 successes 快照吸收。"""
         _reset_source([{"id": i} for i in range(6)])
         pipeline = _make_pipeline()
         _register(pipeline)
@@ -366,10 +366,10 @@ class TestCrashRerun:
         _handler(pipeline)(job, ctx)
         assert _seen_orig(_seen_by_handler) == {str(i) for i in range(6)}
 
-        # 重跑：wall 快照含全部已处理 uid → 整页命中终止，不重复处理
+        # 重跑：successes 快照含全部已处理 uid → 整页命中终止，不重复处理
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
-        ctx2 = _make_ctx(job, wall=wall2)
+        ctx2 = _make_ctx(job, successes=wall2)
         assert _handler(pipeline)(job, ctx2) is True
         assert _seen_orig(_seen_by_handler) == set(), "重跑不得重复处理"
 
@@ -399,9 +399,9 @@ class TestInteractionMatrix:
         assert _seen_orig(_seen_by_handler) == {"3", "1"}
 
     def test_wall_empty_rerun_rescans_all_dedup_by_framework(self):
-        """wall 快照缺失（游标级状态丢失的等价物）→ 完整重扫。
+        """successes 快照缺失（游标级状态丢失的等价物）→ 完整重扫。
 
-        handler 层必然重跑，去重由确定性 job_id 在框架 wall 层吸收
+        handler 层必然重跑，去重由确定性 job_id 在框架 successes 层吸收
         （本测试只验证「重扫不丢内容」）。
         """
         _reset_source([{"id": i} for i in range(6)])
@@ -410,7 +410,7 @@ class TestInteractionMatrix:
         job = Job("discover", "seed", payload={"artist_id": "123"})
         ctx = _make_ctx(job)
         assert _handler(pipeline)(job, ctx) is True
-        # 模拟 wall 快照丢失 → 空 wall 重扫
+        # 模拟 successes 快照丢失 → 空 successes 重扫
         _seen_by_handler.clear()
         ctx2 = _make_ctx(job)
         assert _handler(pipeline)(job, ctx2) is True
@@ -515,11 +515,11 @@ class TestDefense:
         assert _seen_orig(set(_processed_guard)) == {"3", "1"}
         assert _poison_attempts["n"] == 1
         _processed_guard.clear()
-        wall = {
+        successes = {
             f"{PTYPE}::{encode_content_id('3')}",
             f"{PTYPE}::{encode_content_id('1')}",
         }
-        ctx2 = _make_ctx(job, wall=wall)
+        ctx2 = _make_ctx(job, successes=successes)
         assert _handler(pipeline)(job, ctx2) is True
         assert _processed_guard == [], "好 item 已见不得重复处理"
         assert _poison_attempts["n"] == 2, "坏 item 无 poison 表 → 每 run 重试一次"
@@ -612,8 +612,8 @@ def test_real_subprocess_discovery(tmp_path, monkeypatch):
     })])
     pipeline.run()
 
-    wall = pipeline.backend.load_wall()
-    child_uids = sorted(k for k in wall if k.startswith("rt_child::"))
+    successes = pipeline.backend.load_successes()
+    child_uids = sorted(k for k in successes if k.startswith("rt_child::"))
     assert len(child_uids) == 5, f"expected 5 child jobs, got {child_uids}"
     # 命名空间前缀生效：job_id 以 5%3Art_1 开头（length-prefix，`:`→%3A）
     assert all(u.startswith("rt_child::4%3Art_1") for u in child_uids), child_uids
@@ -636,7 +636,7 @@ def test_real_subprocess_rediscovery(tmp_path, monkeypatch):
         "artist_id": "2", "posts": _rt_posts_upto(4),
     })])
     pipeline.run()
-    wall1 = pipeline.backend.load_wall()
+    wall1 = pipeline.backend.load_successes()
     assert len([k for k in wall1 if k.startswith("rt_child::")]) == 4
 
     # 第二次发现：旧 0..3 + 新 10、11（新内容排最前）
@@ -645,8 +645,8 @@ def test_real_subprocess_rediscovery(tmp_path, monkeypatch):
     })])
     pipeline.run()
 
-    wall = pipeline.backend.load_wall()
-    child_uids = sorted(k for k in wall if k.startswith("rt_child::"))
+    successes = pipeline.backend.load_successes()
+    child_uids = sorted(k for k in successes if k.startswith("rt_child::"))
     assert len(child_uids) == 6, f"expected 6 total child jobs, got {len(child_uids)}"
     # 新增项：4%3Art_210 / 4%3Art_211（length-prefix，key="rt_2" len=4）
     assert any(u.startswith("rt_child::4%3Art_210") for u in child_uids), child_uids
@@ -665,8 +665,8 @@ def test_real_subprocess_max_pages(tmp_path, monkeypatch):
     pipeline.enqueue([Job("rt_disc3", "seed", payload={"artist_id": "3", "posts": posts})])
     pipeline.run()  # 不应超时/失败
 
-    wall = pipeline.backend.load_wall()
-    child_uids = [k for k in wall if k.startswith("rt_child::")]
+    successes = pipeline.backend.load_successes()
+    child_uids = [k for k in successes if k.startswith("rt_child::")]
     # 只处理前 2 页 × 每页 2 条 = 4 个；不产生 partial cursor
     assert len(child_uids) == PAGESIZE_RT * 2, f"expected 4 children, got {child_uids}"
     failed = pipeline.backend.load_failed()
@@ -684,9 +684,9 @@ def test_real_subprocess_full_mode_with_max_pages(tmp_path, monkeypatch):
     )
     pipeline.register_task("rt_child", _rt_child_handler)
 
-    # 预先在 wall 中塞入前两页（100, 99, 98, 97）
+    # 预先在 successes 中塞入前两页（100, 99, 98, 97）
     # 模拟历史深处有洞（第 3 页 96, 95 未下载）
-    pipeline.seed_wall([
+    pipeline.seed_successes([
         "rt_child::100",
         "rt_child::99",
         "rt_child::98",
@@ -697,14 +697,14 @@ def test_real_subprocess_full_mode_with_max_pages(tmp_path, monkeypatch):
     pipeline.enqueue([Job("rt_disc_full", "seed", payload={"artist_id": "full1", "posts": posts})])
     pipeline.run()
 
-    wall = pipeline.backend.load_wall()
-    child_uids = [k for k in wall if k.startswith("rt_child::")]
+    successes = pipeline.backend.load_successes()
+    child_uids = [k for k in successes if k.startswith("rt_child::")]
     # 包含预置 4 个 + 第 3 页新处理的 2 个（96, 95）= 共 6 个
     assert len(child_uids) == 6
-    assert "rt_child::96" in wall
-    assert "rt_child::95" in wall
+    assert "rt_child::96" in successes
+    assert "rt_child::95" in successes
     # 第 4 页（94, 93）不应被扫描到
-    assert "rt_child::94" not in wall
+    assert "rt_child::94" not in successes
 
 
 def test_payload_dynamic_override_scan_mode_and_max_pages(tmp_path, monkeypatch):
@@ -719,8 +719,8 @@ def test_payload_dynamic_override_scan_mode_and_max_pages(tmp_path, monkeypatch)
     )
     pipeline.register_task("rt_child", _rt_child_handler)
 
-    # 预置第 1 页（50, 49）到 wall
-    pipeline.seed_wall([
+    # 预置第 1 页（50, 49）到 successes
+    pipeline.seed_successes([
         "rt_child::50",
         "rt_child::49",
     ])
@@ -740,12 +740,12 @@ def test_payload_dynamic_override_scan_mode_and_max_pages(tmp_path, monkeypatch)
     ])
     pipeline.run()
 
-    wall = pipeline.backend.load_wall()
+    successes = pipeline.backend.load_successes()
     # 预置 2 个 + 第 2 页新处理 2 个（48, 47）= 4 个
-    assert "rt_child::48" in wall
-    assert "rt_child::47" in wall
+    assert "rt_child::48" in successes
+    assert "rt_child::47" in successes
     # 第 3 页（46, 45）未被扫描
-    assert "rt_child::46" not in wall
+    assert "rt_child::46" not in successes
 
 
 def test_invalid_payload_scan_mode_and_max_pages_rejected(tmp_path):

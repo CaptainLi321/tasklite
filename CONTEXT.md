@@ -11,11 +11,11 @@ The static specification template registered in-process: `task_type` name, handl
 _Avoid_: Handler, JobTemplate, WorkType, Step
 
 **Job**:
-The logical instance of one bounded activation, uniquely identified by `uid = f"{task_type}::{job_id}"` with associated payload, dependencies, and resource requirements. Specification slots (payload/resources/depends_on/max_retries/timeout_seconds/rerun) override Task defaults; instance slots are framework-managed: `attempt_no` (1-based try number within the activation; execution allowed while `attempt_no <= max_retries + 1`), `activation_no` (generation counter, +1 on each rerun released from a wall/failed interception), `first_enqueued_at` (UTC ISO of first enqueue, never refreshed on retry).
+The logical instance of one bounded activation, uniquely identified by `uid = f"{task_type}::{job_id}"` with associated payload, dependencies, and resource requirements. Specification slots (payload/resources/depends_on/max_retries/timeout_seconds/rerun) override Task defaults; instance slots are framework-managed: `attempt_no` (1-based try number within the activation; execution allowed while `attempt_no <= max_retries + 1`), `activation_no` (generation counter, +1 on each rerun released from a successes/failed interception), `first_enqueued_at` (UTC ISO of first enqueue, never refreshed on retry).
 _Avoid_: Message, Item, Record, Execution
 
 **Attempt**:
-The append-only trace record of one physical execution: `(job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error)`. Row inserted at dispatch (`outcome=running`), updated at settlement; a bypass observation surface that never participates in the six-set mutual exclusion — "final state is unique" (wall/failed by uid) and "history is traceable" (attempts never deleted) are thereby decoupled.
+The append-only trace record of one physical execution: `(job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`. Row inserted at dispatch (`outcome=running`), updated at settlement; a bypass observation surface that never participates in the six-set mutual exclusion — "final state is unique" (successes/failed by uid) and "history is traceable" (attempts never deleted) are thereby decoupled.
 _Avoid_: Trial, ExecutionLog, RunRecord
 
 **TaskRegistry**:
@@ -39,19 +39,19 @@ The deep execution engine unifying the event pump, step advances, dispatch prefl
 _Avoid_: RunnerHelper, LoopExecutor, ExecutionService
 
 **PipelineState**:
-In-memory fast lookup container holding active collections (`_queue`, `_wall`, `_failed`, `_cursors`, and `_in_flight`) with invariant consistency checks and encapsulated mutation interfaces.
+In-memory fast lookup container holding active collections (`_queue`, `_successes`, `_failed`, `_cursors`, and `_in_flight`) with invariant consistency checks and encapsulated mutation interfaces.
 _Avoid_: StateHolder, Store, MemoryState
 
-**Wall**:
+**Successes（成功档案）**:
 The immutable historical set of successfully executed jobs and their metadata.
 _Avoid_: SuccessTable, CompletedSet, HistoryStore
 
 **Failed (失败档案)**:
-The persistent failure archive of jobs that failed permanently or exhausted their retry budget (`failed` table); mutually exclusive with wall by uid (one final state per uid). APIs: `list_failures` / `clear_failures` / `retry_failure`.
+The persistent failure archive of jobs that failed permanently or exhausted their retry budget (`failed` table); mutually exclusive with successes by uid (one final state per uid). APIs: `list_failures` / `clear_failures` / `retry_failure`.
 _Avoid_: FailureLog, ErrorQueue, Trash, DLQ, DeadLetter
 
 **FailureEntry**:
-The structured archive entry: `uid`, `error`, `meta` (full archive metadata view incl. `error_type`), `job_payload` (raw business payload snapshot — manual re-run needs no external lookup).
+The structured archive entry: `job_uid`, `error_message`, `metadata` (full archive metadata view incl. `error_type`), `payload` (raw business payload snapshot — manual re-run needs no external lookup).
 _Avoid_: DLQEntry, ErrorRecord
 
 **ErrorClassifier**:
@@ -100,12 +100,12 @@ The frozen named contract crossing the process seam, carrying the full spawn pay
 _Avoid_: SpawnArgs, ProcessPayload
 
 **JobContext**:
-The execution context handed to a handler, belonging to one job execution (`spawn` / `declare_output` / `declare_input` / cursors / `suspend_resource` / wall-failed snapshot queries).
+The execution context handed to a handler, belonging to one job execution (`spawn` / `declare_output` / `declare_input` / cursors / `suspend_resource` / successes-failed snapshot queries).
 `has_succeeded(job_uid)` / `has_failed(job_uid)` 查询派发时的成功/失败档案快照；`succeeded_or_failed_job_uids()` 返回只读并集，不含 skipped、队列成员或 Attempt 历史，不实时刷新。
 _Avoid_: TaskContext, ExecContext, HandlerEnv
 
 **OpsConsole**:
-The pure operations seam for management APIs used outside `run()` (list_failures / clear_failures / clear_history / seed_wall / seed_cursor), constructed with explicit `(backend, store, classifier)` dependencies and delegated to by the TaskLite facade. `filter_jobs_without_success(jobs)` 仅过滤成功档案命中者，保留输入顺序，failed 与 queued Job 仍可返回。
+The pure operations seam for management APIs used outside `run()` (list_failures / clear_failures / clear_history / seed_successes / seed_cursor), constructed with explicit `(backend, store, classifier)` dependencies and delegated to by the TaskLite facade. `filter_jobs_without_success(jobs)` 仅过滤成功档案命中者，保留输入顺序，failed 与 queued Job 仍可返回。
 _Avoid_: AdminAPI, MaintenanceService
 
 **wait / decide_wait**:

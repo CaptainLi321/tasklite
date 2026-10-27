@@ -17,7 +17,7 @@ from tasklite.engine.admission import (
 class TestRerunEvaluationMatrix:
     def test_fresh_job_always_runs(self):
         policy = RerunPolicy()
-        dec = policy.evaluate({"task_type": "t", "rerun": "never"}, is_wall=False, is_failed=False)
+        dec = policy.evaluate({"task_type": "t", "rerun": "never"}, is_success=False, is_failed=False)
         assert dec.should_run
         assert not dec.should_skip
         assert dec.reason == DecisionReason.FRESH
@@ -25,41 +25,41 @@ class TestRerunEvaluationMatrix:
 
     def test_never_strategy_blocks_wall_and_failed(self):
         policy = RerunPolicy()
-        dec_wall = policy.evaluate({"task_type": "t", "rerun": "never"}, is_wall=True, is_failed=False)
+        dec_wall = policy.evaluate({"task_type": "t", "rerun": "never"}, is_success=True, is_failed=False)
         assert dec_wall.should_skip
-        assert dec_wall.reason == DecisionReason.WALL_BLOCKED
+        assert dec_wall.reason == DecisionReason.SUCCESS_BLOCKED
 
-        dec_failed = policy.evaluate({"task_type": "t", "rerun": "never"}, is_wall=False, is_failed=True)
+        dec_failed = policy.evaluate({"task_type": "t", "rerun": "never"}, is_success=False, is_failed=True)
         assert dec_failed.should_skip
         assert dec_failed.reason == DecisionReason.FAILED_BLOCKED
 
     def test_every_run_strategy_allows_both(self):
         policy = RerunPolicy()
-        dec_wall = policy.evaluate({"task_type": "t", "rerun": "every_run"}, is_wall=True, is_failed=False)
+        dec_wall = policy.evaluate({"task_type": "t", "rerun": "every_run"}, is_success=True, is_failed=False)
         assert dec_wall.should_run
         assert dec_wall.reason == DecisionReason.EVERY_RUN
 
-        dec_failed = policy.evaluate({"task_type": "t", "rerun": "every_run"}, is_wall=False, is_failed=True)
+        dec_failed = policy.evaluate({"task_type": "t", "rerun": "every_run"}, is_success=False, is_failed=True)
         assert dec_failed.should_run
         assert dec_failed.reason == DecisionReason.EVERY_RUN
 
     def test_on_failure_strategy_allows_failed_blocks_wall(self):
         policy = RerunPolicy()
         dec_failed = policy.evaluate(
-            {"task_type": "t", "rerun": "on_failure"}, is_wall=False, is_failed=True
+            {"task_type": "t", "rerun": "on_failure"}, is_success=False, is_failed=True
         )
         assert dec_failed.should_run
         assert dec_failed.reason == DecisionReason.ON_FAILURE_MATCH
 
-        dec_wall = policy.evaluate({"task_type": "t", "rerun": "on_failure"}, is_wall=True, is_failed=False)
+        dec_wall = policy.evaluate({"task_type": "t", "rerun": "on_failure"}, is_success=True, is_failed=False)
         assert dec_wall.should_skip
-        assert dec_wall.reason == DecisionReason.WALL_BLOCKED
+        assert dec_wall.reason == DecisionReason.SUCCESS_BLOCKED
 
     def test_unspecified_rerun_defaults_to_never(self):
         policy = RerunPolicy()
-        dec = policy.evaluate({"task_type": "t", "rerun": None}, is_wall=True, is_failed=False)
+        dec = policy.evaluate({"task_type": "t", "rerun": None}, is_success=True, is_failed=False)
         assert dec.should_skip
-        assert dec.reason == DecisionReason.WALL_BLOCKED
+        assert dec.reason == DecisionReason.SUCCESS_BLOCKED
         assert dec.effective_rerun == "never"
 
     def test_on_input_change_matrix(self, tmp_path):
@@ -69,21 +69,21 @@ class TestRerunEvaluationMatrix:
         policy = RerunPolicy()
         meta = {"inputs": [{"path": str(target), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
 
-        # wall 命中且指纹一致 → 拦截
+        # successes 命中且指纹一致 → 拦截
         dec_unchanged = policy.evaluate(
             {"task_type": "t", "rerun": "on_input_change"},
-            wall_meta=meta, is_wall=True, is_failed=False,
+            success_metadata=meta, is_success=True, is_failed=False,
         )
         assert dec_unchanged.should_skip
         assert dec_unchanged.reason == DecisionReason.INPUT_UNCHANGED
         assert dec_unchanged.input_changed is False
 
-        # wall 命中且指纹变化 → 放行重跑
+        # successes 命中且指纹变化 → 放行重跑
         target.write_bytes(b"v2-content-longer")
         policy.clear_stat_cache()
         dec_changed = policy.evaluate(
             {"task_type": "t", "rerun": "on_input_change"},
-            wall_meta=meta, is_wall=True, is_failed=False,
+            success_metadata=meta, is_success=True, is_failed=False,
         )
         assert dec_changed.should_run
         assert dec_changed.reason == DecisionReason.INPUT_CHANGED
@@ -91,14 +91,14 @@ class TestRerunEvaluationMatrix:
 
         # 失败档案命中 → 放行重跑（不比对指纹）
         dec_failed = policy.evaluate(
-            {"task_type": "t", "rerun": "on_input_change"}, is_wall=False, is_failed=True
+            {"task_type": "t", "rerun": "on_input_change"}, is_success=False, is_failed=True
         )
         assert dec_failed.should_run
         assert dec_failed.reason == DecisionReason.ON_FAILURE_MATCH
 
         # 无历史命中 → 全新运行
         dec_fresh = policy.evaluate(
-            {"task_type": "t", "rerun": "on_input_change"}, is_wall=False, is_failed=False
+            {"task_type": "t", "rerun": "on_input_change"}, is_success=False, is_failed=False
         )
         assert dec_fresh.should_run
         assert dec_fresh.reason == DecisionReason.FRESH
@@ -108,7 +108,7 @@ class TestAdmitNarrowInterface:
     def test_admit_extracts_history_from_store(self):
         policy = RerunPolicy()
         store_mock = SimpleNamespace(
-            wall={"t::wall_job": {}},
+            successes={"t::wall_job": {}},
             failed={"t::failed_job": {}},
         )
 
@@ -118,7 +118,7 @@ class TestAdmitNarrowInterface:
 
         d_wall = policy.admit({"task_type": "t", "job_id": "wall_job", "rerun": "never"}, store_mock)
         assert d_wall.should_skip
-        assert d_wall.reason == DecisionReason.WALL_BLOCKED
+        assert d_wall.reason == DecisionReason.SUCCESS_BLOCKED
 
         d_failed = policy.admit(
             {"task_type": "t", "job_id": "failed_job", "rerun": "on_failure"}, store_mock
@@ -134,12 +134,12 @@ class TestInputChangeAndStatCache:
         st = data_file.stat()
 
         policy = RerunPolicy()
-        wall_meta = {"inputs": [{"path": str(data_file), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
-        assert not policy.check_input_changed(wall_meta)
+        success_metadata = {"inputs": [{"path": str(data_file), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
+        assert not policy.check_input_changed(success_metadata)
 
         data_file.write_text("hello world")
         policy.clear_stat_cache()
-        assert policy.check_input_changed(wall_meta)
+        assert policy.check_input_changed(success_metadata)
 
     def test_input_changed_stat_cache_avoids_repeated_syscalls(self, tmp_path):
         data_file = tmp_path / "data.txt"
@@ -147,16 +147,16 @@ class TestInputChangeAndStatCache:
         st = data_file.stat()
 
         policy = RerunPolicy(enable_stat_cache=True)
-        wall_meta = {"inputs": [{"path": str(data_file), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
-        assert not policy.check_input_changed(wall_meta)
+        success_metadata = {"inputs": [{"path": str(data_file), "size": st.st_size, "mtime_ns": st.st_mtime_ns}]}
+        assert not policy.check_input_changed(success_metadata)
 
         # 文件被删但缓存命中：沿用缓存事实判定未变化
         data_file.unlink()
-        assert not policy.check_input_changed(wall_meta)
+        assert not policy.check_input_changed(success_metadata)
 
         # 清除缓存后感知到文件缺失
         policy.clear_stat_cache()
-        assert policy.check_input_changed(wall_meta)
+        assert policy.check_input_changed(success_metadata)
 
     def test_input_changed_corrupt_data_fail_safe(self):
         policy = RerunPolicy()
@@ -191,7 +191,7 @@ class TestDiscoveryPolicyNormalization:
 
     def test_evaluate_uses_discovery_default_when_rerun_missing(self):
         policy = RerunPolicy({"scan": "every_run"})
-        dec = policy.evaluate({"task_type": "scan"}, is_wall=True, is_failed=False)
+        dec = policy.evaluate({"task_type": "scan"}, is_success=True, is_failed=False)
         assert dec.should_run
         assert dec.reason == DecisionReason.EVERY_RUN
         assert dec.effective_rerun == "every_run"

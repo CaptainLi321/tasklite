@@ -40,9 +40,9 @@ class TestInMemoryBackendContract:
 
     def test_initial_state_empty(self):
         b = InMemoryStateBackend()
-        assert b.load_wall() == {}
+        assert b.load_successes() == {}
         assert b.load_failed() == {}
-        assert b.load_failed_payloads() == {}
+        assert b.load_failure_payloads() == {}
         assert b.load_cursors() == {}
         assert b.load_queue() == []
         assert b.load_attempts("t::missing") == []
@@ -90,7 +90,7 @@ class TestInMemoryBackendContract:
             cursor_updates={"page": "two"},
         )
         assert ok is True
-        assert b.load_wall()["t::one"] == {"status": "ok"}
+        assert b.load_successes()["t::one"] == {"status": "ok"}
         assert b.load_cursors() == {"page": "two"}
         assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::child"]
 
@@ -98,7 +98,7 @@ class TestInMemoryBackendContract:
         """失败/成功 meta 原样落库：backend 不解释 meta、不注入派生字段。"""
         b = InMemoryStateBackend()
         assert b.commit_job_success("t::one", {"v": 1}) is True
-        assert b.load_wall() == {"t::one": {"v": 1}}
+        assert b.load_successes() == {"t::one": {"v": 1}}
 
     def test_commit_job_failure_records_archive_and_clears_queue(self):
         b = InMemoryStateBackend()
@@ -109,7 +109,7 @@ class TestInMemoryBackendContract:
         # v2 语义：失败 meta 精确等于调用方传入（历史与时间线由 attempts 承接）
         assert b.load_failed() == {"t::doomed": {"error": "NETWORK_TIMEOUT"}}
         assert b.load_queue() == []
-        assert b.load_wall() == {}
+        assert b.load_successes() == {}
 
     def test_commit_job_failure_preserves_remaining_queue(self):
         b = InMemoryStateBackend()
@@ -127,7 +127,7 @@ class TestInMemoryBackendContract:
         queue = b.load_queue()
         assert len(queue) == 1
         assert queue[0]["attempt_no"] == 2
-        assert b.load_wall() == {} and b.load_failed() == {}
+        assert b.load_successes() == {} and b.load_failed() == {}
 
     def test_commit_retry_conflicting_uid_returns_false(self):
         b = InMemoryStateBackend()
@@ -139,16 +139,16 @@ class TestInMemoryBackendContract:
         # 冲突后 on-disk 队列原样（绝不产出重复条目却报成功）
         assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::alpha", "t::beta"]
 
-    def test_commit_bulk_failure_preserves_remaining_order(self):
+    def test_commit_job_failures_preserves_remaining_order(self):
         b = InMemoryStateBackend()
         b.enqueue_jobs([_job_snapshot(j) for j in ("first", "second", "third")])
-        assert b.commit_bulk_failure([("t::first", {"err": "x"}), ("t::second", {"err": "y"})]) is True
+        assert b.commit_job_failures([("t::first", {"err": "x"}), ("t::second", {"err": "y"})]) is True
         assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::third"]
         assert set(b.load_failed()) == {"t::first", "t::second"}
 
-    def test_commit_bulk_failure_empty_is_noop(self):
+    def test_commit_job_failures_empty_is_noop(self):
         b = InMemoryStateBackend()
-        assert b.commit_bulk_failure([]) is True
+        assert b.commit_job_failures([]) is True
         assert b.load_failed() == {}
 
     def test_commit_skip_removes_stale_uid_only(self):
@@ -156,7 +156,7 @@ class TestInMemoryBackendContract:
         b.enqueue_jobs([_job_snapshot("stale"), _job_snapshot("live")])
         assert b.commit_skip("t::stale") is True
         assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::live"]
-        assert b.load_wall() == {} and b.load_failed() == {}
+        assert b.load_successes() == {} and b.load_failed() == {}
 
     def test_delete_queue_uids_targeted(self):
         b = InMemoryStateBackend()
@@ -194,13 +194,13 @@ class TestMemoryAttemptTrajectory:
         attempt_id = b.append_attempt(_running_attempt("t::one"))
         ok = b.update_attempt(
             attempt_id, outcome="requeued",
-            finished_at="2026-05-01T00:00:05+00:00", error="RateLimitHit",
+            finished_at="2026-05-01T00:00:05+00:00", error_message="RateLimitHit",
         )
         assert ok is True
         (rec,) = b.load_attempts("t::one")
         assert rec.outcome == "requeued"
         assert rec.finished_at == "2026-05-01T00:00:05+00:00"
-        assert rec.error == "RateLimitHit"
+        assert rec.error_message == "RateLimitHit"
         # 身份字段保持插入原值（append-only：只写收尾三列）
         assert rec.execution_id == "run_seed.1"
         assert rec.started_at == "2026-05-01T00:00:00+00:00"
@@ -224,7 +224,7 @@ class TestMemoryAttemptTrajectory:
         with pytest.raises(TypeError, match="finished_at must be a str"):
             b.update_attempt(attempt_id, outcome="succeeded", finished_at=None)  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="error must be a non-empty str or None"):
-            b.update_attempt(attempt_id, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00", error="")
+            b.update_attempt(attempt_id, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00", error_message="")
         # 门卫失败后轨迹行仍是 running
         (rec,) = b.load_attempts("t::one")
         assert rec.outcome == ATTEMPT_RUNNING
@@ -242,12 +242,12 @@ class TestMemoryAttemptTrajectory:
         b = InMemoryStateBackend()
         b.enqueue_jobs([_job_snapshot("one")])
         attempt_id = b.append_attempt(_running_attempt("t::one"))
-        b.update_attempt(attempt_id, outcome="failed", finished_at="2026-05-01T00:00:05+00:00", error="boom")
-        b.commit_job_failure("t::one", {"error": "boom"}, job_payload={"k": 1})
+        b.update_attempt(attempt_id, outcome="failed", finished_at="2026-05-01T00:00:05+00:00", error_message="boom")
+        b.commit_job_failure("t::one", {"error": "boom"}, payload={"k": 1})
 
         (rec,) = b.load_attempts("t::one")
         assert rec.outcome == "failed"
-        assert rec.error == "boom"
+        assert rec.error_message == "boom"
 
 
 class TestMemoryFailureArchive:
@@ -266,80 +266,80 @@ class TestMemoryFailureArchive:
 
     def test_payload_snapshot_roundtrip_and_latest_wins(self):
         b = InMemoryStateBackend()
-        assert b.commit_job_failure("t::one", {"error": "first"}, job_payload={"v": 1}) is True
-        assert b.load_failed_payloads() == {"t::one": {"v": 1}}
-        assert b.commit_job_failure("t::one", {"error": "second"}, job_payload={"v": 2}) is True
-        assert b.load_failed_payloads() == {"t::one": {"v": 2}}
+        assert b.commit_job_failure("t::one", {"error": "first"}, payload={"v": 1}) is True
+        assert b.load_failure_payloads() == {"t::one": {"v": 1}}
+        assert b.commit_job_failure("t::one", {"error": "second"}, payload={"v": 2}) is True
+        assert b.load_failure_payloads() == {"t::one": {"v": 2}}
 
     def test_none_payload_keeps_previous_snapshot(self):
         """无 payload 的写入路径（带外登记/覆盖写）不得抹掉既有快照。"""
         b = InMemoryStateBackend()
-        assert b.commit_job_failure("t::one", {"error": "first"}, job_payload={"k": 1}) is True
+        assert b.commit_job_failure("t::one", {"error": "first"}, payload={"k": 1}) is True
         b.append_failed("t::one", {"error": "second"})
-        assert b.load_failed_payloads() == {"t::one": {"k": 1}}
+        assert b.load_failure_payloads() == {"t::one": {"k": 1}}
 
     def test_no_snapshot_entry_absent_from_payload_view(self):
         b = InMemoryStateBackend()
         b.append_failed("t::other", {"error": "x"})
-        assert b.load_failed_payloads() == {}
+        assert b.load_failure_payloads() == {}
 
     def test_delete_failed_clears_meta_and_snapshot(self):
         b = InMemoryStateBackend()
-        b.commit_job_failure("t::one", {"error": "x"}, job_payload={"k": 1})
+        b.commit_job_failure("t::one", {"error": "x"}, payload={"k": 1})
         b.append_failed("t::two", {"error": "y"})
         assert b.delete_failed(["t::one", "t::ghost"]) == 1
         assert b.load_failed() == {"t::two": {"error": "y"}}
-        assert b.load_failed_payloads() == {}
+        assert b.load_failure_payloads() == {}
 
     def test_delete_wall_targeted(self):
         b = InMemoryStateBackend()
         b.commit_job_success("t::one", {"ok": True})
         b.commit_job_success("t::two", {"ok": True})
-        assert b.delete_wall(["t::one", "t::ghost"]) == 1
-        assert set(b.load_wall()) == {"t::two"}
+        assert b.delete_successes(["t::one", "t::ghost"]) == 1
+        assert set(b.load_successes()) == {"t::two"}
 
     def test_success_commit_deletes_failed_same_uid(self):
         """最终状态唯一：成功 commit 删失败档案同名行（含快照）。"""
         b = InMemoryStateBackend()
-        b.commit_job_failure("t::one", {"error": "stale"}, job_payload={"k": 1})
+        b.commit_job_failure("t::one", {"error": "stale"}, payload={"k": 1})
         assert b.commit_job_success("t::one", {"ok": True}) is True
         assert b.load_failed() == {}
-        assert b.load_failed_payloads() == {}
+        assert b.load_failure_payloads() == {}
 
     def test_failure_commit_deletes_wall_same_uid(self):
-        """最终状态唯一：失败 commit 删 wall 同名行。"""
+        """最终状态唯一：失败 commit 删 successes 同名行。"""
         b = InMemoryStateBackend()
         b.commit_job_success("t::one", {"ok": True})
         assert b.commit_job_failure("t::one", {"error": "boom"}) is True
-        assert b.load_wall() == {}
+        assert b.load_successes() == {}
         assert set(b.load_failed()) == {"t::one"}
 
 
 class TestMemorySeedAndCursor:
-    """种子化：wall/failed 互斥拒绝 + cursor 入口校验。"""
+    """种子化：successes/failed 互斥拒绝 + cursor 入口校验。"""
 
     def test_seed_wall_writes_empty_meta_idempotently(self):
         b = InMemoryStateBackend()
-        assert b.seed_wall(["t::fresh_one", "t::fresh_two"]) == 2
-        assert b.load_wall() == {"t::fresh_one": {}, "t::fresh_two": {}}
-        assert b.seed_wall(["t::fresh_one"]) == 1
-        assert b.load_wall()["t::fresh_one"] == {}
+        assert b.seed_successes(["t::fresh_one", "t::fresh_two"]) == 2
+        assert b.load_successes() == {"t::fresh_one": {}, "t::fresh_two": {}}
+        assert b.seed_successes(["t::fresh_one"]) == 1
+        assert b.load_successes()["t::fresh_one"] == {}
 
     def test_seed_wall_rejects_uid_already_in_failed_atomically(self):
         b = InMemoryStateBackend()
         b.append_failed("t::bad", {"error": "boom"})
         with pytest.raises(ValueError, match="already in failed"):
-            b.seed_wall(["t::ok_entry", "t::bad", "t::ok_next"])
+            b.seed_successes(["t::ok_entry", "t::bad", "t::ok_next"])
         # 冲突整体拒绝：零写入，失败档案记录原样保留
-        assert b.load_wall() == {}
+        assert b.load_successes() == {}
         assert set(b.load_failed()) == {"t::bad"}
 
     def test_seed_wall_after_delete_failed_succeeds(self):
         b = InMemoryStateBackend()
         b.append_failed("t::one", {"error": "boom"})
         assert b.delete_failed(["t::one"]) == 1
-        assert b.seed_wall(["t::one"]) == 1
-        assert b.load_wall() == {"t::one": {}}
+        assert b.seed_successes(["t::one"]) == 1
+        assert b.load_successes() == {"t::one": {}}
 
     @pytest.mark.parametrize("key,value", [(None, "v"), ("k", 123), ("", "v")])
     def test_seed_cursor_rejects_bad_types(self, key, value):
@@ -370,9 +370,9 @@ class TestMemorySnapshotIsolation:
         b = InMemoryStateBackend()
         b.commit_job_success("t::one", {"meta": {"v": 1}})
         b.append_failed("t::two", {"meta": {"v": 2}})
-        b.load_wall()["t::one"]["meta"]["v"] = 999
+        b.load_successes()["t::one"]["meta"]["v"] = 999
         b.load_failed()["t::two"]["meta"]["v"] = 999
-        assert b.load_wall()["t::one"]["meta"] == {"v": 1}
+        assert b.load_successes()["t::one"]["meta"] == {"v": 1}
         assert b.load_failed()["t::two"]["meta"] == {"v": 2}
 
     def test_enqueue_input_mutation_is_invisible(self):

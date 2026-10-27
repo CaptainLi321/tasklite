@@ -55,7 +55,7 @@
 ```mermaid
 flowchart TD
     subgraph Host ["主调度进程 (Master Scheduler) - 永不运行业务 Handler"]
-        State[("SQLite WAL 状态机\n(Wall / Queue / Failed / In-Flight)")]
+        State[("SQLite WAL 状态机\n(Successes / Queue / Failed / In-Flight)")]
         Scheduler["JobScheduler (资源调度 / 拓扑依赖)"]
         Watchdog["进程看门狗 (超时 SIGKILL / 孤儿锁探测)"]
     end
@@ -90,12 +90,12 @@ flowchart TD
 
 ### 2. ⚡ SQLite WAL 状态持久化 (ACID)
 - 基于 SQLite WAL + `synchronous=FULL` 模式；
-- 状态机（Wall 成功档案 / Queue 待办 / In-Flight 在途 / Failed 失败档案）在单次事务中原子转移；
+- 状态机（Successes 成功档案 / Queue 待办 / In-Flight 在途 / Failed 失败档案）在单次事务中原子转移；
 - 遭遇中断或异常关机时，重启后支持 At-Least-Once 接续执行。
 
 ### 3. 🔍 函数式增量探索 (Functional Discovery)
 - 针对数据同步、采集与拉取场景的无游标 (Cursor-less) 增量扫描；
-- 直接复用已完成集合 (Wall) 即时判定已见内容，整页命中自动刹车，天然免疫上游记录删除、插入导致的游标漂移。
+- 直接复用成功档案 (Successes) 即时判定已见内容，整页命中自动刹车，天然免疫上游记录删除、插入导致的游标漂移。
 
 ### 4. ⏸️ 全局限流与配额熔断持久化休眠
 - 内置 `RateLimitResource`（速率限制）与 `CapacityResource`（并发限制）；
@@ -118,8 +118,8 @@ flowchart TD
 ### 8. 🎛️ 执行选择 (Selection)：Exclude 延迟留队 + Skip 终态跳过
 - **第三类调度扩展 seam（候选准入/选择，与 OrderingPolicy / RequeuePolicy 并列，决策见 [ADR-0006](docs/adr/0006-selection-scheduling-seam.md)）**：`pipeline.selection(Exclude(task_type="pdf_to_md"), Skip(task_type="ocr"))` 以方法调用配置 pipeline 级规则，两类语义严格区分：
   - `Exclude`（延迟）：命中作业不派发、不消耗资源与重试预算，队列行原样保留；下游允许作业本次报 `ERR_DEPENDENCY_EXCLUDED` 并计入 `stats["excluded_blocked"]`，下一次 run 自动恢复执行；
-  - `Skip`（终态）：命中作业移出队列（不进 wall / 失败档案），下游整链级联跳过（attempt 记 `DEPENDENCY_SKIPPED`），下次运行不再重试；同一 task_type 同时命中时 Skip 优先。
-- 停摆仲裁用 **Kahn 入度消减**（波前 = wall ∪ excluded）严格区分「真死锁」（依赖环/缺口 → 既有归因熔断）与「仅被 Exclude 阻塞」（留队 + COMPLETED 收敛）；不存在固定等待兜底与忙旋，混合真实死锁不会被选择规则掩盖；
+  - `Skip`（终态）：命中作业移出队列（不进 successes / 失败档案），下游整链级联跳过（attempt 记 `DEPENDENCY_SKIPPED`），下次运行不再重试；同一 task_type 同时命中时 Skip 优先。
+- 停摆仲裁用 **Kahn 入度消减**（波前 = successes ∪ excluded）严格区分「真死锁」（依赖环/缺口 → 既有归因熔断）与「仅被 Exclude 阻塞」（留队 + COMPLETED 收敛）；不存在固定等待兜底与忙旋，混合真实死锁不会被选择规则掩盖；
 - 默认空规则与扩展前完全等价；`Rule` 协议要求 `matches_task_type(task_type)`（缺少则注册期 fail-loud），顶层导出 `Exclude` / `Selection` / `Skip`。
 
 ---
@@ -324,12 +324,12 @@ pipeline.register_task("fetch", crawler_handler, resources={"api": 1.0})
 
 ## 🛠️ 失败档案与运维 (Failed & Ops)
 
-当任务重试预算耗尽或发生致命错误时，任务进入持久化**失败档案**（failed 表，与 wall 按 uid 互斥且唯一终态）。运维 API 仅限 `run()` 外调用：
+当任务重试预算耗尽或发生致命错误时，任务进入持久化**失败档案**（failed 表，与 successes 按 uid 互斥且唯一终态）。运维 API 仅限 `run()` 外调用：
 
 ```python
 # 1. 检查失败详情（条目携带原始业务 payload 快照，补跑自足）
 for entry in pipeline.list_failures():
-    print(f"UID: {entry.uid}, 原因: {entry.error}, 元数据: {entry.meta}")
+    print(f"UID: {entry.job_uid}, 原因: {entry.error_message}, 元数据: {entry.metadata}")
 
 # 2. 清理指定类型的失败档案（默认保留 fatal 错误，可入队同名任务重跑）
 pipeline.clear_failures(task_types=["download"], keep_fatal=False)
@@ -337,7 +337,7 @@ pipeline.clear_failures(task_types=["download"], keep_fatal=False)
 # 3. 单条人工补跑：移出档案、按档案 payload 快照队首重入队
 pipeline.retry_failure("download::img_001")
 
-# 4. 精确或前缀清理历史（wall / failed）
+# 4. 精确或前缀清理历史（successes / failed）
 pipeline.clear_history("download::")
 ```
 

@@ -1,7 +1,7 @@
 """v2 JobContext：handler 执行上下文（属于一次 job 执行）。
 
 提供 spawn、产物/输入声明、游标与资源挂起 API。快照语义：每个 job
-派发时构造一次，wall/failed 键集合为该时刻快照——同一 run 内后派发
+派发时构造一次，successes/failed 键集合为该时刻快照——同一 run 内后派发
 的 job 能看到先前完成的任务，不反映构造之后其他并发 in-flight job
 的完成/失败。
 """
@@ -24,7 +24,7 @@ class JobContext:
     def __init__(
         self,
         job: Job,
-        wall_keys: set | frozenset,
+        success_job_uids: set | frozenset,
         failed_keys: set | frozenset,
         cursors: dict[str, str],
         output_roots: Path | None = None,
@@ -35,9 +35,9 @@ class JobContext:
         resource_names: frozenset | set | None = None,
     ):
         self.job = job
-        self.new_jobs: list[Job] = []
+        self.spawned_jobs: list[Job] = []
         self.resource_suspensions: list[tuple[str, float]] = []
-        self._wall_keys = wall_keys
+        self._success_job_uids = success_job_uids
         self._failed_keys = failed_keys
         self._cursors = cursors
         self.cursor_updates: dict[str, str | None] = {}
@@ -97,7 +97,7 @@ class JobContext:
             raise ValueError(
                 f"Payload for spawned job {job.uid} is not JSON-serializable: {e}"
             ) from e
-        self.new_jobs.append(job)
+        self.spawned_jobs.append(job)
 
     def declare_output(
         self, path: str | Path, *, cleanup_on_fail: bool = True, sandbox: bool = True
@@ -158,11 +158,11 @@ class JobContext:
         语义；与 ``declare_output/declare_cache`` 的路径沙盒无关。
 
         指纹 ``{path, size, mtime_ns}``（stat 调用，微秒级，不用内容
-        hash 避免大文件读盘）。任务成功时框架把输入清单写入 wall meta
+        hash 避免大文件读盘）。任务成功时框架把输入清单写入 successes meta
         （``meta["inputs"]``）——排障/审计/种子化脚本都能回答「这个任务
         当时基于什么输入跑出来的」。
 
-        与 ``rerun="on_input_change"`` 联动：下次 enqueue 时框架对 wall
+        与 ``rerun="on_input_change"`` 联动：下次 enqueue 时框架对 successes
         中的旧指纹重新 stat 比对，任一文件 size/mtime_ns 变化 → 重跑；
         不变 → 跳过（on_input_change 的变更检测只针对文件输入；URI
         默认不检测，见 ``declare_input_uri``）。
@@ -197,7 +197,7 @@ class JobContext:
 
     def has_succeeded(self, job_uid: str) -> bool:
         """查询 job_uid 是否命中派发时的成功档案快照。"""
-        return job_uid in self._wall_keys
+        return job_uid in self._success_job_uids
 
     def has_failed(self, job_uid: str) -> bool:
         """查询 job_uid 是否命中派发时的失败档案快照。"""
@@ -205,7 +205,7 @@ class JobContext:
 
     def succeeded_or_failed_job_uids(self) -> frozenset:
         """返回派发时成功与失败档案 UID 的只读并集，不包含 skipped 或执行轨迹。"""
-        return frozenset(self._wall_keys) | frozenset(self._failed_keys)
+        return frozenset(self._success_job_uids) | frozenset(self._failed_keys)
 
     def get_cursor(self, key: str) -> str | None:
         """读取高水位游标的当前值。"""

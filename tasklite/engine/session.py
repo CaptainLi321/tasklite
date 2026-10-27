@@ -17,7 +17,7 @@ from typing import Callable, TYPE_CHECKING
 from .types import ExitReason, StopMode, RunStats
 
 if TYPE_CHECKING:
-    from .types import AttemptFinish
+    from .types import AttemptOutcome
 
 logger = logging.getLogger("tasklite")
 
@@ -25,7 +25,7 @@ logger = logging.getLogger("tasklite")
 class RunSession:
     """一次 run() 的可变生命周期状态 + fire_* 钩子单一出口。
 
-    attempt 收尾钩子的载荷形态是 AttemptFinish 值对象（布尔语义经值
+    attempt 收尾钩子的载荷形态是 AttemptOutcome 值对象（布尔语义经值
     对象承载、不裸传）；异常隔离与 hook_errors 计数在各 fire_* 出口内
     完成——用户回调缺陷不得击穿事件泵。
     """
@@ -102,13 +102,13 @@ class RunSession:
             logger.warning(f"on_run_start hook raised: {e}")
             self._stats["hook_errors"] += 1
 
-    def fire_attempt_finished(self, uid: str, *, outcome: "AttemptFinish") -> None:
+    def fire_attempt_finished(self, job_uid: str, *, outcome: "AttemptOutcome") -> None:
         if self.on_attempt_finished is None:
             return
         try:
-            self.on_attempt_finished(uid, outcome=outcome)
+            self.on_attempt_finished(job_uid, outcome=outcome)
         except Exception as e:
-            logger.warning(f"on_attempt_finished hook raised for {uid}: {e}")
+            logger.warning(f"on_attempt_finished hook raised for {job_uid}: {e}")
             self._stats["hook_errors"] += 1
 
     def fire_run_end(self, reason: str) -> None:

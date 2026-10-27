@@ -1,6 +1,6 @@
 """v2 StateStore 状态仓库测试：六出口事务、失败档案、3-strike 与摄入管道。
 
-覆盖：apply_* 原子终态转移（内存/后端镜像一致）、wall/failed 互斥性质
+覆盖：apply_* 原子终态转移（内存/后端镜像一致）、successes/failed 互斥性质
 （hypothesis 任意操作序列）、mark_failed_memory 联动契约、commit 失败
 3-strike 收敛、enqueue 摄入三步（策略注入 / 工人资源注入 / 首入队时间
 填充）、瞬态降级回队与 attempts 旁路轨迹收尾。
@@ -28,7 +28,7 @@ from tasklite.engine.store import (
     StateStore,
     SuccessOutcome,
 )
-from tasklite.engine.types import AttemptFinish, RunStats
+from tasklite.engine.types import AttemptOutcome, RunStats
 from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.job import Job, WORKER_RESOURCE
 from tasklite.models.state import PipelineState
@@ -63,10 +63,10 @@ class CommitFailureBackend:
             return False
         return self._real.commit_retry(*a, **k)
 
-    def commit_bulk_failure(self, *a, **k):
-        if "commit_bulk_failure" in self._failing:
+    def commit_job_failures(self, *a, **k):
+        if "commit_job_failures" in self._failing:
             return False
-        return self._real.commit_bulk_failure(*a, **k)
+        return self._real.commit_job_failures(*a, **k)
 
     def commit_skip(self, *a, **k):
         if "commit_skip" in self._failing:
@@ -99,12 +99,12 @@ class TestApplySuccess:
         )
 
         assert isinstance(outcome, SuccessOutcome)
-        assert outcome.uid == "process::1"
-        assert store.state.wall["process::1"]["score"] == 100
-        assert store.state.wall["process::1"]["last_run_id"] == "run_abc"
-        assert store.state.wall["process::1"]["run_count"] == 1
-        assert "last_run_at" in store.state.wall["process::1"]
-        assert store.state.wall["process::1"]["inputs"][0]["path"] == "/tmp/a.txt"
+        assert outcome.job_uid == "process::1"
+        assert store.state.successes["process::1"]["score"] == 100
+        assert store.state.successes["process::1"]["last_run_id"] == "run_abc"
+        assert store.state.successes["process::1"]["run_count"] == 1
+        assert "last_run_at" in store.state.successes["process::1"]
+        assert store.state.successes["process::1"]["inputs"][0]["path"] == "/tmp/a.txt"
         assert "process::1" not in store.state.in_flight_uids
 
     def test_run_count_continues_from_opposite_terminal(self):
@@ -116,7 +116,7 @@ class TestApplySuccess:
         store.state.mark_rerun_active("t::1")
         state.register_in_flight("t::1")
         store.apply_success("t::1", {})
-        assert store.state.wall["t::1"]["run_count"] == 5
+        assert store.state.successes["t::1"]["run_count"] == 5
         assert "t::1" not in store.state.failed
 
     def test_spawn_and_cursor_updates(self):
@@ -152,7 +152,7 @@ class TestApplySuccess:
                 "junk",
             ],
         )
-        inputs = store.state.wall["t::1"]["inputs"]
+        inputs = store.state.successes["t::1"]["inputs"]
         assert len(inputs) == 1
         assert inputs[0]["size"] == 2
 
@@ -195,7 +195,7 @@ class TestApplyFailureAndCascade:
         }
         store.apply_failure("t::1", {"error": "x"}, job_snapshot=job_snapshot)
         assert "t::1" in store.state.failed
-        assert "t::1" not in backend.load_failed_payloads()
+        assert "t::1" not in backend.load_failure_payloads()
 
     def test_failure_clears_wall_on_both_sides(self):
         """失败终态与成功终态互删对侧（内存与后端镜像同步）。"""
@@ -206,9 +206,9 @@ class TestApplyFailureAndCascade:
         store.state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error": "again"})
 
-        assert "t::1" not in store.state.wall
+        assert "t::1" not in store.state.successes
         assert "t::1" in store.state.failed
-        assert "t::1" not in backend.load_wall()
+        assert "t::1" not in backend.load_successes()
         assert "t::1" in backend.load_failed()
 
 
@@ -229,7 +229,7 @@ class TestApplyRetry:
             {"task_type": "t", "job_id": "1"},
             self._retry_job_snapshot(),
             transient_kind="interrupted",
-            error="transient blip",
+            error_message="transient blip",
         )
 
         assert isinstance(outcome, RetryOutcome)
@@ -320,16 +320,16 @@ class TestMarkFailedMemoryContract:
 
     def test_failed_takes_over_from_wall(self):
         store, state, _ = _make_store()
-        state.add_wall("encode::a", {"prev": "ok"})
+        state.add_success("encode::a", {"prev": "ok"})
         store.mark_failed_memory("encode::a", {"error": "boom"})
         assert "encode::a" in state.failed_uids
-        assert "encode::a" not in state.wall_uids
+        assert "encode::a" not in state.success_job_uids
 
 
 class TestCommitFailureStrike:
     """commit 失败 3-strike 收敛契约。"""
 
-    def _strike_store(self, hooks: list[tuple[str, AttemptFinish]]) -> StateStore:
+    def _strike_store(self, hooks: list[tuple[str, AttemptOutcome]]) -> StateStore:
         backend = CommitFailureBackend(
             InMemoryStateBackend(),
             failing=("commit_job_success", "commit_job_failure"),
@@ -368,7 +368,7 @@ class TestCommitFailureStrike:
         assert store.state.failed["task::1"]["error"] == ERR_COMMIT_FAILURE
 
     def test_strike_archive_fires_hook_exactly_once(self):
-        hooks: list[tuple[str, AttemptFinish]] = []
+        hooks: list[tuple[str, AttemptOutcome]] = []
         store = self._strike_store(hooks)
         job_snapshot = {"task_type": "task", "job_id": "1"}
         for _ in range(2):
@@ -384,8 +384,8 @@ class TestCommitFailureStrike:
         uid, fin = hooks[0]
         assert uid == "task::1"
         assert fin.success is False
-        assert fin.going_to_retry is False
-        assert fin.meta["error"] == ERR_COMMIT_FAILURE
+        assert fin.will_retry is False
+        assert fin.metadata["error"] == ERR_COMMIT_FAILURE
         assert store.stats["failed"] == 1
 
     def test_default_threshold_constant(self):
@@ -404,14 +404,14 @@ class TestHookSingleExit:
 
         store.set_on_attempt_finished(boom)
         store.fire_attempt_finished(
-            "t::1", outcome=AttemptFinish(success=True, going_to_retry=False, meta={})
+            "t::1", outcome=AttemptOutcome(success=True, will_retry=False, metadata={})
         )
         assert stats["hook_errors"] == 1
 
     def test_no_callback_is_noop(self):
         store, _, _ = _make_store()
         store.fire_attempt_finished(
-            "t::1", outcome=AttemptFinish(success=True, going_to_retry=False, meta={})
+            "t::1", outcome=AttemptOutcome(success=True, will_retry=False, metadata={})
         )
 
     def test_set_on_attempt_finished_rebinds(self):
@@ -419,13 +419,13 @@ class TestHookSingleExit:
         store, _, _ = _make_store()
         store.set_on_attempt_finished(lambda uid, *, outcome: captured.append(uid))
         store.fire_attempt_finished(
-            "t::1", outcome=AttemptFinish(success=False, going_to_retry=True, meta={})
+            "t::1", outcome=AttemptOutcome(success=False, will_retry=True, metadata={})
         )
         assert captured == ["t::1"]
 
     def test_bulk_failure_fires_hook_per_uid(self):
         stats = RunStats()
-        hooks: list[tuple[str, AttemptFinish]] = []
+        hooks: list[tuple[str, AttemptOutcome]] = []
         backend = InMemoryStateBackend()
         store = StateStore(
             backend,
@@ -439,11 +439,11 @@ class TestHookSingleExit:
              ("cycle::2", {"error": "DEPENDENCY_DEADLOCK"})]
         )
         assert {uid for uid, _ in hooks} == {"cycle::1", "cycle::2"}
-        assert all(fin.success is False and fin.going_to_retry is False for _, fin in hooks)
+        assert all(fin.success is False and fin.will_retry is False for _, fin in hooks)
         assert stats["failed"] == 2
 
     def test_cascade_fires_hook_per_downstream(self):
-        hooks: list[tuple[str, AttemptFinish]] = []
+        hooks: list[tuple[str, AttemptOutcome]] = []
         backend = InMemoryStateBackend()
         state = PipelineState(
             {}, {}, {},
@@ -488,17 +488,17 @@ class TestApplyBulkFailure:
         assert "safe::1" in store.state.queue_uids
 
     def test_bulk_failure_keeps_wall_deleted_on_backend(self):
-        """批量失败与单条失败对称：wall 同名行随事务删除。"""
+        """批量失败与单条失败对称：successes 同名行随事务删除。"""
         store, _, backend = _make_store()
-        backend.seed_wall(["cycle::1"])
+        backend.seed_successes(["cycle::1"])
         store.apply_bulk_failure([("cycle::1", {"error": "DEPENDENCY_DEADLOCK"})])
-        assert "cycle::1" not in backend.load_wall()
+        assert "cycle::1" not in backend.load_successes()
 
     def test_bulk_commit_failure_below_threshold_crashes(self):
         backend = InMemoryStateBackend()
         failing = CommitFailureBackend(
             backend,
-            failing=("commit_bulk_failure", "commit_job_failure"),
+            failing=("commit_job_failures", "commit_job_failure"),
         )
         state = PipelineState({}, {}, {}, [{"task_type": "cycle", "job_id": "1"}])
         store = StateStore(failing, state, commit_failure_threshold=3)
@@ -517,7 +517,7 @@ class TestBulkStrikeConvergence:
     ) -> StateStore:
         backend = CommitFailureBackend(
             InMemoryStateBackend(),
-            failing=("commit_bulk_failure",),
+            failing=("commit_job_failures",),
             archive_pass_through=True,
         )
         state = PipelineState({}, {}, {}, queue_rows)
@@ -531,7 +531,7 @@ class TestBulkStrikeConvergence:
 
     def test_deadlock_and_cascade_strike_meta_converged(self):
         """死锁批量与级联批量的熔断 meta 同规（归因统一 ERR_COMMIT_FAILURE）。"""
-        hooks_deadlock: list[tuple[str, AttemptFinish]] = []
+        hooks_deadlock: list[tuple[str, AttemptOutcome]] = []
         store_deadlock = self._strike_bulk_store(
             hooks_deadlock,
             [{"task_type": "cycle", "job_id": "1", "runtime": {"_commit_failures": 2}}],
@@ -542,7 +542,7 @@ class TestBulkStrikeConvergence:
         assert outcome.failed_uids == ["cycle::1"]
         deadlock_meta = store_deadlock.state.failed["cycle::1"]
 
-        hooks_cascade: list[tuple[str, AttemptFinish]] = []
+        hooks_cascade: list[tuple[str, AttemptOutcome]] = []
         store_cascade = self._strike_bulk_store(
             hooks_cascade,
             [
@@ -567,12 +567,12 @@ class TestBulkStrikeConvergence:
         assert [uid for uid, _ in hooks_deadlock] == ["cycle::1"]
         assert [uid for uid, _ in hooks_cascade] == ["child::1"]
         for _, fin in hooks_deadlock + hooks_cascade:
-            assert fin.success is False and fin.going_to_retry is False
-            assert fin.meta["error"] == ERR_COMMIT_FAILURE
+            assert fin.success is False and fin.will_retry is False
+            assert fin.metadata["error"] == ERR_COMMIT_FAILURE
 
     def test_out_of_queue_uid_still_finalized_and_accounted(self):
         """归因中的队列外 uid 同规计数与熔断（记账绝不静默丢失）。"""
-        hooks: list[tuple[str, AttemptFinish]] = []
+        hooks: list[tuple[str, AttemptOutcome]] = []
         store = self._strike_bulk_store(
             hooks,
             [{"task_type": "cycle", "job_id": "1"}],
@@ -726,7 +726,7 @@ class TestAttemptTraceFinalization:
         store.apply_failure("t::fail", {"error": "boom"}, attempt_id=aid_fail)
         rec = backend.load_attempts("t::fail")[0]
         assert rec.outcome == "failed"
-        assert rec.error == "boom"
+        assert rec.error_message == "boom"
 
         aid_retry = self._open_running(backend, "t::retry")
         store.apply_retry(
@@ -734,11 +734,11 @@ class TestAttemptTraceFinalization:
             {"task_type": "t", "job_id": "retry"},
             Job("t", "retry").to_dict(),
             attempt_id=aid_retry,
-            error="transient",
+            error_message="transient",
         )
         rec = backend.load_attempts("t::retry")[0]
         assert rec.outcome == "requeued"
-        assert rec.error == "transient"
+        assert rec.error_message == "transient"
 
         aid_skip = self._open_running(backend, "t::skip")
         store.apply_skip("t::skip", attempt_id=aid_skip)
@@ -757,12 +757,12 @@ class TestAttemptTraceFinalization:
         aid = self._open_running(backend, "t::1")
 
         store.apply_success("t::1", {}, attempt_id=aid)
-        assert "t::1" in store.state.wall
+        assert "t::1" in store.state.successes
 
     def test_attempt_id_none_is_noop(self):
         store, _, _ = _make_store()
         store.apply_success("t::1", {}, attempt_id=None)
-        assert "t::1" in store.state.wall
+        assert "t::1" in store.state.successes
 
 
 class TestSnapshotAndMembership:
@@ -780,7 +780,7 @@ class TestSnapshotAndMembership:
     def test_membership_predicates(self):
         """成员判定经 store.state 单一访问路径（六集合统一谓词）。"""
         store = self._probe_store()
-        assert "w::1" in store.state.wall
+        assert "w::1" in store.state.successes
         assert "f::1" in store.state.failed
         assert store.state.is_known("w::1")
         assert store.state.is_known("q::1")
@@ -788,11 +788,11 @@ class TestSnapshotAndMembership:
         assert store.state.cursors == {"c": "v"}
 
     def test_uid_index_liveness_contract(self):
-        """uid 索引形态契约：in_flight 恒 frozenset，wall/failed/queue 为
+        """uid 索引形态契约：in_flight 恒 frozenset，successes/failed/queue 为
         活索引（调用方需要快照时在边界显式 frozenset 冻结）。"""
         store = self._probe_store()
         assert isinstance(store.state.in_flight_uids, frozenset)
-        assert isinstance(store.state.wall_uids, set)
+        assert isinstance(store.state.success_job_uids, set)
         assert isinstance(store.state.failed_uids, set)
         assert isinstance(store.state.queue_uids, set)
 
@@ -821,21 +821,21 @@ class TestFailureEntryShape:
 
     def test_frozen_shape(self):
         entry = FailureEntry(
-            uid="t::1", error="boom", meta={"error": "boom"}, job_payload={"k": 1}
+            job_uid="t::1", error_message="boom", metadata={"error": "boom"}, payload={"k": 1}
         )
-        assert entry.uid == "t::1"
-        assert entry.error == "boom"
-        assert entry.meta == {"error": "boom"}
-        assert entry.job_payload == {"k": 1}
+        assert entry.job_uid == "t::1"
+        assert entry.error_message == "boom"
+        assert entry.metadata == {"error": "boom"}
+        assert entry.payload == {"k": 1}
         with pytest.raises(Exception):
-            entry.uid = "t::2"  # type: ignore[misc]
+            entry.job_uid = "t::2"  # type: ignore[misc]
 
     def test_payload_defaults_none(self):
-        entry = FailureEntry(uid="t::1", error="x", meta={})
-        assert entry.job_payload is None
+        entry = FailureEntry(job_uid="t::1", error_message="x", metadata={})
+        assert entry.payload is None
 
 
-# ── wall/failed 互斥性质（hypothesis 任意操作序列）─────────────────────
+# ── successes/failed 互斥性质（hypothesis 任意操作序列）─────────────────────
 
 _UID_POOL = [
     "encode::1",
@@ -893,7 +893,7 @@ class _MutexProbe:
             if self.backend.commit_job_failure(uid, {"error": "tail"}):
                 self.store.mark_failed_memory(uid, {"error": "tail"})
         elif action == "retry":
-            if uid in self.store.state.wall or uid in self.store.state.failed:
+            if uid in self.store.state.successes or uid in self.store.state.failed:
                 return
             self._pop_from_memory_queue(uid)
             self.store.apply_retry(uid, _job_snapshot(uid), _job_snapshot(uid))
@@ -906,11 +906,11 @@ class _MutexProbe:
         self.assert_mutex()
 
     def assert_mutex(self) -> None:
-        """核心不变式：wall ∩ failed = ∅（内存与后端镜像一致），终态不留在队列。"""
-        mem_wall = set(self.store.state.wall_uids)
+        """核心不变式：successes ∩ failed = ∅（内存与后端镜像一致），终态不留在队列。"""
+        mem_wall = set(self.store.state.success_job_uids)
         mem_failed = set(self.store.state.failed_uids)
         assert mem_wall & mem_failed == set(), f"内存互斥破坏: {mem_wall & mem_failed}"
-        disk_wall = set(self.backend.load_wall())
+        disk_wall = set(self.backend.load_successes())
         disk_failed = set(self.backend.load_failed())
         assert disk_wall & disk_failed == set(), f"后端互斥破坏: {disk_wall & disk_failed}"
         assert mem_wall == disk_wall, f"wall 镜像漂移: {mem_wall} vs {disk_wall}"
@@ -927,7 +927,7 @@ class _MutexProbe:
 @example(ops=[("failure", 1), ("enqueue", 1), ("retry", 1)])
 @given(ops=op_strategy)
 def test_wall_failed_mutex_holds_for_arbitrary_operation_sequences(ops):
-    """任意操作序列后（及每一步后），wall/failed 全局互斥且镜像一致。"""
+    """任意操作序列后（及每一步后），successes/failed 全局互斥且镜像一致。"""
     probe = _MutexProbe()
     probe.assert_mutex()
     for action, i in ops:
@@ -946,15 +946,15 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
 
     probe.store.apply_failure(uid, {"error": "boom"}, job_snapshot=_job_snapshot(uid))
     assert uid in probe.store.state.failed
-    assert uid not in probe.store.state.wall
+    assert uid not in probe.store.state.successes
 
     probe.store.apply_success(uid, {"score": 1})
-    assert uid in probe.store.state.wall
+    assert uid in probe.store.state.successes
     assert uid not in probe.store.state.failed
 
     probe.store.apply_failure(uid, {"error": "again"}, job_snapshot=_job_snapshot(uid))
     assert uid in probe.store.state.failed
-    assert uid not in probe.store.state.wall
+    assert uid not in probe.store.state.successes
     probe.assert_mutex()
 
 
@@ -989,7 +989,7 @@ class TestRecordAttemptSeam:
         records = backend.load_attempts("skip_type::2")
         assert len(records) == 1
         assert records[0].outcome == "skipped"
-        assert records[0].error == "SKIPPED"
+        assert records[0].error_message == "SKIPPED"
         assert records[0].execution_id == "run1.skip.2"
 
         # run_id 为空时不写轨迹

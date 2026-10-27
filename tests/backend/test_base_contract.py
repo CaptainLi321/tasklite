@@ -24,9 +24,9 @@ BACKEND_PACKAGE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent / "t
 
 EXPECTED_ABSTRACT_METHODS = {
     # 全量加载
-    "load_wall",
+    "load_successes",
     "load_failed",
-    "load_failed_payloads",
+    "load_failure_payloads",
     "load_cursors",
     "load_queue",
     # 整表重写
@@ -36,7 +36,7 @@ EXPECTED_ABSTRACT_METHODS = {
     "commit_job_success",
     "commit_job_failure",
     "commit_retry",
-    "commit_bulk_failure",
+    "commit_job_failures",
     "commit_skip",
     "append_failed",
     # 增量入队
@@ -44,8 +44,8 @@ EXPECTED_ABSTRACT_METHODS = {
     # 定向删除与种子
     "delete_queue_uids",
     "delete_failed",
-    "delete_wall",
-    "seed_wall",
+    "delete_successes",
+    "seed_successes",
     "seed_cursor",
     # 尝试轨迹（append-only 旁路观测面）
     "append_attempt",
@@ -84,7 +84,7 @@ class TestAbstractContractLock:
 
     def test_partial_implementation_stays_abstract(self):
         class HalfBackend(AbstractStateBackend):
-            def load_wall(self):
+            def load_successes(self):
                 return {}
 
         with pytest.raises(TypeError):
@@ -136,7 +136,7 @@ class TestValidateAttemptDispatch:
 
     def test_precarried_error_rejected(self):
         with pytest.raises(ValueError, match="fresh running row"):
-            validate_attempt_dispatch(_running_record(error="boom"))
+            validate_attempt_dispatch(_running_record(error_message="boom"))
 
 
 class TestValidateAttemptFinish:

@@ -27,7 +27,7 @@ from tasklite.engine.runtime import EngineRuntime
 from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import (
-    AttemptFinish,
+    AttemptOutcome,
     ExitReason,
     RunSummary,
     StepOutcome,
@@ -183,7 +183,7 @@ class RuntimeEnv:
             {WORKER_RESOURCE: CapacityResource(WORKER_RESOURCE, capacity)}
         )
         self.tasks = TaskRegistry()
-        self.hooks: list[tuple[str, AttemptFinish]] = []
+        self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.runtime = EngineRuntime(
             config=RunConfig.resolve(
                 name=name,
@@ -302,7 +302,7 @@ class TestEngineRuntimeExecutionLifecycle:
         assert events == ["start", "end:completed"]
 
     def test_execute_completes_job_end_to_end(self, tmp_path, monkeypatch):
-        """四相泵 E2E：派发 → 回收 → 结算进 wall，attempts 轨迹收尾成功。"""
+        """四相泵 E2E：派发 → 回收 → 结算进 successes，attempts 轨迹收尾成功。"""
         env = RuntimeEnv(tmp_path)
         env.register("t")
         env.runtime.store.enqueue_jobs([Job("t", "j1", payload={})])
@@ -315,10 +315,10 @@ class TestEngineRuntimeExecutionLifecycle:
 
         assert summary.exit_reason is ExitReason.COMPLETED
         assert env.runtime.stats["completed"] == 1
-        assert "t::j1" in env.backend.load_wall()
+        assert "t::j1" in env.backend.load_successes()
         assert env.backend.load_queue() == []
         # attempt 收尾钩子经单一出口触发（成功形态值对象）
-        assert [(uid, out.success, out.going_to_retry) for uid, out in env.hooks] == [
+        assert [(uid, out.success, out.will_retry) for uid, out in env.hooks] == [
             ("t::j1", True, False)
         ]
         records = env.backend.load_attempts("t::j1")
@@ -411,7 +411,7 @@ class TestEngineRuntimeExecutionLifecycle:
         env.runtime.store.enqueue_jobs([Job("local", "j1", payload={})])
         summary = env.runtime.execute()
         assert summary.exit_reason is ExitReason.COMPLETED
-        assert "local::j1" in env.backend.load_wall()
+        assert "local::j1" in env.backend.load_successes()
 
     def test_concurrent_run_lock_rejection(self, tmp_path):
         from tasklite.utils.lockfile import release_lock, try_acquire_lock
@@ -552,7 +552,7 @@ class TestRunReentryGuard:
 
         # 结束后恢复正常：同实例可再次 run() 并完成队列
         runtime.execute()
-        assert "t::j1" in env.backend.load_wall(), "复跑必须正常完成作业"
+        assert "t::j1" in env.backend.load_successes(), "复跑必须正常完成作业"
 
 
 # ── 崩溃承重网与 fencing 屏障 ────────────────────────────────────────
@@ -718,9 +718,9 @@ class TestGracefulDraining:
         assert observed["alive_during_draining"] is True, \
             "DRAINING 不得 kill in-flight 进程"
         assert summary.exit_reason is ExitReason.STOPPED_DRAINING
-        # DRAINING：in-flight job 完成并进 wall；j2 留磁盘队列
-        assert "t::j1" in env.backend.load_wall()
-        assert "t::j2" not in env.backend.load_wall()
+        # DRAINING：in-flight job 完成并进 successes；j2 留磁盘队列
+        assert "t::j1" in env.backend.load_successes()
+        assert "t::j2" not in env.backend.load_successes()
         assert any(jd.get("job_id") == "j2" for jd in env.backend.load_queue())
 
 
@@ -753,8 +753,8 @@ class TestForceAbort:
         proc = observed["proc"]
         assert proc.is_alive() is False, "ABORTING 必须 kill in-flight 子进程"
         assert proc.exitcode == -9
-        # 作业未 commit（未进 wall），保留在磁盘队列
-        assert "t::j1" not in env.backend.load_wall()
+        # 作业未 commit（未进 successes），保留在磁盘队列
+        assert "t::j1" not in env.backend.load_successes()
         assert any(jd.get("job_id") == "j1" for jd in env.backend.load_queue())
 
     def test_deadlock_detected_flag_propagates_to_step_outcome(

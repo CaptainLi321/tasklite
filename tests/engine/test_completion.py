@@ -29,7 +29,7 @@ from tasklite.engine.resource import (
     ResourceManager,
 )
 from tasklite.engine.store import StateStore
-from tasklite.engine.types import AttemptFinish, JobHandle, RunStats
+from tasklite.engine.types import AttemptOutcome, JobHandle, RunStats
 from tasklite.models.job import Job, JobRuntimeState
 from tasklite.models.state import PipelineState
 
@@ -65,7 +65,7 @@ class CompletionEnv:
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
         self.stats = RunStats()
-        self.hooks: list[tuple[str, AttemptFinish]] = []
+        self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.store = StateStore(
             self.backend,
             PipelineState({}, {}, {}, []),
@@ -143,20 +143,20 @@ class TestCompleteJobSuccess:
             lambda uid: [{"path": "/data/in.csv", "kind": "file", "size": 3}],
         )
 
-        result = ExecutionResult(success=True, result_meta={"score": 100})
+        result = ExecutionResult(success=True, result_metadata={"score": 100})
         env.completion.complete_job(entry, result)
 
         assert env.resources["gpu"].used == 0.0
-        assert env.store.state.wall["t::j1"]["score"] == 100
-        assert env.store.state.wall["t::j1"]["last_run_id"] == env.session.run_id
-        assert env.store.state.wall["t::j1"]["inputs"][0]["path"] == "/data/in.csv"
+        assert env.store.state.successes["t::j1"]["score"] == 100
+        assert env.store.state.successes["t::j1"]["last_run_id"] == env.session.run_id
+        assert env.store.state.successes["t::j1"]["inputs"][0]["path"] == "/data/in.csv"
         assert env.stats["completed"] == 1
         assert "t::j1" not in env.store.state.in_flight_uids
         assert cleaned == [("t::j1", ArtifactCleanupMode.SUCCESS)]
         # 收尾钩子恰好一次（成功语义）
         assert env.hooks == [
-            ("t::j1", AttemptFinish(success=True, going_to_retry=False,
-                                    meta={"score": 100}))
+            ("t::j1", AttemptOutcome(success=True, will_retry=False,
+                                    metadata={"score": 100}))
         ]
         assert env.backend.load_attempts("t::j1")[-1].outcome == "succeeded"
 
@@ -169,7 +169,7 @@ class TestCompleteJobSuccess:
             entry,
             ExecutionResult(
                 success=True,
-                result_meta={},
+                result_metadata={},
                 cursor_updates={"pos": "42"},
             ),
         )
@@ -194,7 +194,7 @@ class TestCompleteJobFailure:
         )
 
         env.completion.complete_job(
-            entry, ExecutionResult(success=False, result_meta={"error": "boom"})
+            entry, ExecutionResult(success=False, result_metadata={"error": "boom"})
         )
 
         assert env.store.state.failed["t::j1"]["error"] == "boom"
@@ -205,7 +205,7 @@ class TestCompleteJobFailure:
         assert env.backend.load_attempts("t::j1")[-1].outcome == "failed"
         finish_by_uid = {uid: fin for uid, fin in env.hooks}
         assert finish_by_uid["t::j1"].success is False
-        assert finish_by_uid["t::j1"].going_to_retry is False
+        assert finish_by_uid["t::j1"].will_retry is False
 
 
 class TestRetryBudget:
@@ -222,7 +222,7 @@ class TestRetryBudget:
         )
         env.completion.complete_job(entry, result)
 
-        assert result.going_to_retry is True
+        assert result.will_retry is True
         assert env.stats["retried"] == 1
         assert env.store.state.queue[0]["attempt_no"] == 2
         assert env.store.state.queue[0]["first_enqueued_at"] == job.first_enqueued_at
@@ -231,7 +231,7 @@ class TestRetryBudget:
         assert env.backend.load_attempts("t::j1")[-1].outcome == "requeued"
         assert env.hooks[-1] == (
             "t::j1",
-            AttemptFinish(success=False, going_to_retry=True, meta={}),
+            AttemptOutcome(success=False, will_retry=True, metadata={}),
         )
 
     def test_retry_job_snapshot_preserves_custom_fields(self, tmp_path):
@@ -265,7 +265,7 @@ class TestRetryBudget:
         result = ExecutionResult(retry_requested=True, retry_error="second")
         env.completion.complete_job(entry, result)
 
-        assert result.going_to_retry is False
+        assert result.will_retry is False
         assert "t::j1" in env.store.state.failed
         assert env.store.state.failed["t::j1"]["error"] == ERR_MAX_RETRIES
         assert env.store.state.failed["t::j1"]["last_retry_error"] == "first failure"
@@ -287,7 +287,7 @@ class TestRetryBudget:
         )
         env.completion.complete_job(entry, result)
 
-        assert result.going_to_retry is True
+        assert result.will_retry is True
         assert "t::j1" not in env.store.state.failed
         assert env.store.state.queue[0]["attempt_no"] == 5
         rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
@@ -337,16 +337,16 @@ class TestThreeStrikeTermination:
         job.runtime.commit_failures = 2
         entry.job_snapshot["runtime"] = job.runtime.to_dict()
 
-        result = ExecutionResult(success=True, result_meta={"score": 1})
+        result = ExecutionResult(success=True, result_metadata={"score": 1})
         env.completion.complete_job(entry, result)  # 不上抛 _JobTerminated
 
-        assert result.going_to_retry is False
+        assert result.will_retry is False
         assert "t::j1" in env.store.state.failed
         assert env.store.state.failed["t::j1"]["error"] == "COMMIT_FAILURE"
         # 钩子恰好一次：3-strike 分支已触发，尾部跳过
         assert len(env.hooks) == 1
         assert env.hooks[0][1].success is False
-        assert env.hooks[0][1].meta["error"] == "COMMIT_FAILURE"
+        assert env.hooks[0][1].metadata["error"] == "COMMIT_FAILURE"
 
 
 class TestSpawnedJobs:
@@ -366,10 +366,10 @@ class TestSpawnedJobs:
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
-                new_jobs=[Job("child", "x", rerun="every_run")],
+                spawned_jobs=[Job("child", "x", rerun="every_run")],
             ),
         )
-        assert "parent::p1" in env.store.state.wall
+        assert "parent::p1" in env.store.state.successes
         x_rows = [jd for jd in env.store.state.queue if jd["job_id"] == "x"]
         assert len(x_rows) == 1, "spawn 必须被 queue 命中拦截"
 
@@ -377,7 +377,7 @@ class TestSpawnedJobs:
         env = CompletionEnv(tmp_path)
         env.store.state.register_in_flight("child::y")
         env.store.apply_success("child::y", {})
-        # wall 命中 + every_run：spawn 放行（唯一终态历史行被替换语义）
+        # successes 命中 + every_run：spawn 放行（唯一终态历史行被替换语义）
 
         parent = Job("parent", "p1")
         entry = env.track_entry(parent)
@@ -385,11 +385,11 @@ class TestSpawnedJobs:
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
-                new_jobs=[Job("child", "y", rerun="every_run",
+                spawned_jobs=[Job("child", "y", rerun="every_run",
                               timeout_seconds=29, payload={"timeout": "业务时限"})],
             ),
         )
-        assert "parent::p1" in env.store.state.wall
+        assert "parent::p1" in env.store.state.successes
         assert "child::y" in env.store.state.queue_uids
         restored = Job.from_dict(env.store.state.queue[0])
         assert restored.timeout_seconds == 29
@@ -403,7 +403,7 @@ class TestSpawnedJobs:
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
-                new_jobs=[Job("child", "a"), Job("child", "a")],
+                spawned_jobs=[Job("child", "a"), Job("child", "a")],
             ),
         )
         rows = [jd for jd in env.store.state.queue if jd["job_id"] == "a"]
@@ -422,11 +422,11 @@ class TestSpawnedJobs:
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
-                result_meta={"ok": 1},
-                new_jobs=[Job("child", "bad", payload={"x": Unserializable()})],
+                result_metadata={"ok": 1},
+                spawned_jobs=[Job("child", "bad", payload={"x": Unserializable()})],
             ),
         )
-        assert "parent::p1" in env.store.state.wall
+        assert "parent::p1" in env.store.state.successes
         assert "child::bad" in env.store.state.failed
         assert "INVALID_SPAWNED_JOB" in env.store.state.failed["child::bad"]["error"]
         # 伪 entry 无轨迹行：拒绝路径不落 attempt
@@ -449,7 +449,7 @@ class TestSuspensionApplication:
             entry,
             ExecutionResult(
                 success=True,
-                result_meta={},
+                result_metadata={},
                 resource_suspensions=[("api", 30.0)],
             ),
         )
@@ -465,10 +465,10 @@ class TestSuspensionApplication:
         env.completion.complete_job(
             entry,
             ExecutionResult(
-                success=True, result_meta={}, resource_suspensions=[("ghost", 5.0)],
+                success=True, result_metadata={}, resource_suspensions=[("ghost", 5.0)],
             ),
         )
-        assert "t::j1" in env.store.state.wall
+        assert "t::j1" in env.store.state.successes
 
 
 class TestIdentityVacuity:
@@ -492,7 +492,7 @@ class TestIdentityVacuity:
             ExecutionResult(success=True),
             expect_in_flight=False,
         )
-        assert "t::j1" in env.store.state.wall
+        assert "t::j1" in env.store.state.successes
 
 
 class TestSettleReaped:
@@ -508,11 +508,11 @@ class TestSettleReaped:
         e2.handle = env.make_handle("t::j2")
 
         count = env.completion.settle_reaped([
-            (e1.handle, ExecutionResult(success=True, result_meta={})),
-            (e2.handle, ExecutionResult(success=False, result_meta={"error": "x"})),
+            (e1.handle, ExecutionResult(success=True, result_metadata={})),
+            (e2.handle, ExecutionResult(success=False, result_metadata={"error": "x"})),
         ])
         assert count == 2
-        assert "t::j1" in env.store.state.wall
+        assert "t::j1" in env.store.state.successes
         assert "t::j2" in env.store.state.failed
         assert len(env.in_flight) == 0
         assert env.store.state.in_flight_uids == frozenset()
@@ -538,10 +538,10 @@ class TestSettleAborted:
 
         env.completion.settle_aborted(
             cancelled_entries=[e1],
-            done_entries=[(e2, ExecutionResult(success=True, result_meta={}))],
+            done_entries=[(e2, ExecutionResult(success=True, result_metadata={}))],
         )
         assert [jd["job_id"] for jd in env.store.state.queue] == ["j1"]
-        assert "t::j2" in env.store.state.wall
+        assert "t::j2" in env.store.state.successes
         assert len(env.in_flight) == 0
         assert env.store.state.in_flight_uids == frozenset()
 
@@ -577,7 +577,7 @@ class TestHookFireDiscipline:
             entry, ExecutionResult(retry_requested=True, retry_error="flaky")
         )
         assert env.hooks == [
-            ("t::j1", AttemptFinish(success=False, going_to_retry=True, meta={}))
+            ("t::j1", AttemptOutcome(success=False, will_retry=True, metadata={}))
         ]
 
     def test_hook_error_isolated(self, tmp_path):
@@ -589,4 +589,4 @@ class TestHookFireDiscipline:
         entry = env.track_entry(job)
         env.completion.complete_job(entry, ExecutionResult(success=True))
         assert env.stats["hook_errors"] == 1
-        assert "t::j1" in env.store.state.wall
+        assert "t::j1" in env.store.state.successes

@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     class DispatchSession(Protocol):
         """派发/完成机器消费的运行会话装配契约（RunSession 自动满足）。
 
-        ``run_id`` 是 execution_id 与 wall meta 的 run 身份事实源；
+        ``run_id`` 是 execution_id 与 successes meta 的 run 身份事实源；
         ``result_token`` 随 WorkerLaunchSpec 下发做结果认证；
         ``next_dispatch_no`` 为 execution_id fencing 提供单调递增序号。
         """
@@ -73,7 +73,7 @@ from .errorclass import (
 from .in_flight import InFlightJob
 from .resource import RateLimitUnavailable, apply_suspend_signals
 from .scheduler import ScheduleResult, StandstillFacts
-from .types import AttemptFinish
+from .types import AttemptOutcome
 from .wait import IN_FLIGHT_POLL_SECONDS
 
 logger = logging.getLogger("tasklite")
@@ -238,7 +238,7 @@ class DispatchMachine:
         返回 True = 已处理（job 被跳过，跳过同样落轨迹行 skipped）；
         返回 False = 未命中或准入放行（调用方继续后续预检关）。统一
         is_known 谓词；rerun 策略豁免 every_run/on_failure/on_input_change
-        的 wall/failed 命中重跑。
+        的 successes/failed 命中重跑。
         """
         store = self._store
         if not store.state.is_known(job_uid):
@@ -248,7 +248,7 @@ class DispatchMachine:
             attempt_id, _ = self._open_attempt(job)
             store.apply_skip(job_uid, job_snapshot=job_snapshot, attempt_id=attempt_id)
             return True
-        if decision.should_run and (job_uid in store.state.wall_uids or job_uid in store.state.failed_uids):
+        if decision.should_run and (job_uid in store.state.success_job_uids or job_uid in store.state.failed_uids):
             # 豁免登记与准入判定同源：pop_job 只按字面 rerun 键登记豁免，
             # 队列行无键而由动态兜底放行的重跑必须在此补登记，否则
             # in-flight 登记的全量互斥断言会击落本关放行的作业。
@@ -257,7 +257,7 @@ class DispatchMachine:
             # 豁免事实随行持久，abort/retry/崩溃回滚的按字面键豁免重建
             # （requeue/clear_in_flight/replace_queue）才不丢失动态放行事实。
             job_snapshot["rerun"] = decision.effective_rerun
-            # 激活推进：从 wall/failed 拦截点放行重跑 = 新激活代——
+            # 激活推进：从 successes/failed 拦截点放行重跑 = 新激活代——
             # activation_no + 1、attempt_no 重置 1（本次执行是新激活的
             # 首次尝试，轨迹行按新代号落表）。
             job.activation_no = job.activation_no + 1
@@ -283,14 +283,14 @@ class DispatchMachine:
         if pending_dep_failure is None:
             return False
         logger.warning(f"SKIP: {job_uid} (Dependency {pending_dep_failure} failed)")
-        fail_meta: dict[str, Any] = {
+        failure_metadata: dict[str, Any] = {
             "error": ERR_JOB_DEPENDENCY,
             "failed_dependency": pending_dep_failure,
         }
         # 依赖父失败的级联下游计入 cascade_failed 而非 failed——
         # 「真实业务失败率」统计不被级联稀释。
         self._reject_and_commit(
-            job_uid, job_snapshot, fail_meta, count_as="cascade_failed", attempt_id=attempt_id
+            job_uid, job_snapshot, failure_metadata, count_as="cascade_failed", attempt_id=attempt_id
         )
         return True
 
@@ -308,8 +308,8 @@ class DispatchMachine:
         task_type not in tasks 时调用。commit 失败走 3-strike / 崩溃路径。
         """
         logger.error(f"SKIP: {job_uid} (No handler for task_type '{task_type}')")
-        fail_meta = {"error": ERR_NO_HANDLER, "fatal": True}
-        self._reject_and_commit(job_uid, job_snapshot, fail_meta, attempt_id=attempt_id)
+        failure_metadata = {"error": ERR_NO_HANDLER, "fatal": True}
+        self._reject_and_commit(job_uid, job_snapshot, failure_metadata, attempt_id=attempt_id)
         return True
 
     def dispatch_orphan_probe(
@@ -347,7 +347,7 @@ class DispatchMachine:
                 job_snapshot,
                 transient_kind="lock_conflict",
                 attempt_id=attempt_id,
-                error="orphan lock conflict",
+                error_message="orphan lock conflict",
             )
             return True
         return False
@@ -432,12 +432,12 @@ class DispatchMachine:
                     if errors:
                         logger.error(f"Payload validation failed for {job_uid}: {errors}")
                         lease.release()
-                        fail_meta: dict[str, Any] = {
+                        failure_metadata: dict[str, Any] = {
                             "error": ERR_PAYLOAD_VALIDATION,
                             "details": errors,
                         }
                         self._reject_and_commit(
-                            job_uid, job_snapshot, fail_meta, attempt_id=attempt_id
+                            job_uid, job_snapshot, failure_metadata, attempt_id=attempt_id
                         )
                         return None
 
@@ -484,11 +484,11 @@ class DispatchMachine:
         # 注册表同源于本 classifier 实例，父子两侧分类语义一致。
         # 资源名注册集快照随 ctx 下发——suspend_resource 对未注册名
         # fail-loud（typo 不静默失效）。
-        # 不变式：wall/failed 活索引在快照边界冻结为 frozenset——
+        # 不变式：successes/failed 活索引在快照边界冻结为 frozenset——
         # JobContext 持有的必须是派发时刻快照，绝不引用活集合。
         return JobContext(
             job,
-            frozenset(state.wall_uids),
+            frozenset(state.success_job_uids),
             frozenset(state.failed_uids),
             dict(state.cursors),
             output_roots=self._output_roots,
@@ -525,8 +525,8 @@ class DispatchMachine:
             )
             self._store.fire_attempt_finished(
                 job_uid,
-                outcome=AttemptFinish(
-                    success=False, going_to_retry=False, meta=dict(outcome.error_meta)
+                outcome=AttemptOutcome(
+                    success=False, will_retry=False, metadata=dict(outcome.failure_metadata)
                 ),
             )
         except _JobTerminated:
@@ -567,7 +567,7 @@ class DispatchMachine:
             job_snapshot,
             transient_kind="rate_limited",
             attempt_id=attempt_id,
-            error=str(exc),
+            error_message=str(exc),
         )
         return None
 
@@ -590,18 +590,18 @@ class DispatchMachine:
                 f"treating as deterministic bad input (e.g. unpickleable "
                 f"handler), sending to failure archive."
             )
-            fail_meta = {
+            failure_metadata = {
                 "error": ERR_DISPATCH_FAILURE,
                 "failures": failures,
                 "detail": str(exc)[:200],
             }
             self._in_flight.settle(job_uid, state=store.state)
-            self._reject_and_commit(job_uid, job_snapshot, fail_meta, attempt_id=attempt_id)
+            self._reject_and_commit(job_uid, job_snapshot, failure_metadata, attempt_id=attempt_id)
             return None
         self._in_flight.settle(job_uid, state=store.state)
         store.state.requeue_jobs([job_snapshot], front=True)
         store.finish_attempt(
-            attempt_id, outcome=ATTEMPT_REQUEUED, error=f"dispatch failure: {exc}"
+            attempt_id, outcome=ATTEMPT_REQUEUED, error_message=f"dispatch failure: {exc}"
         )
         # 不在此保存队列：内存此刻缺其他 in-flight 作业，交给运行循环的
         # 崩溃安全保存合并磁盘真相后统一保存。

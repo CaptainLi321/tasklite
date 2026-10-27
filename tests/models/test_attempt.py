@@ -46,7 +46,7 @@ class TestAttemptRecordCreation:
         assert rec.run_id == "run_ab12cd34"
         assert rec.outcome == "running"
         assert rec.finished_at is None
-        assert rec.error is None
+        assert rec.error_message is None
 
     def test_all_outcomes_accepted(self):
         for outcome in ATTEMPT_OUTCOMES:
@@ -59,9 +59,9 @@ class TestAttemptRecordCreation:
         rec = _running_record(
             outcome="failed",
             finished_at="2026-05-01T00:00:05+00:00",
-            error="MAX_RETRIES_EXCEEDED",
+            error_message="MAX_RETRIES_EXCEEDED",
         )
-        assert rec.error == "MAX_RETRIES_EXCEEDED"
+        assert rec.error_message == "MAX_RETRIES_EXCEEDED"
 
     def test_frozen_rejects_mutation(self):
         rec = _running_record()
@@ -100,7 +100,7 @@ class TestAttemptRecordValidation:
                 _running_record(**{field: ""})
 
     def test_optional_strings_matrix(self):
-        for field in ("finished_at", "error"):
+        for field in ("finished_at", "error_message"):
             with pytest.raises(TypeError, match=f"{field} must be a str"):
                 _running_record(**{field: 99})
             with pytest.raises(ValueError, match=f"{field} must be a non-empty str"):
@@ -126,7 +126,7 @@ class TestAttemptRecordSerialization:
             attempt_no=3,
             outcome="requeued",
             finished_at="2026-05-01T00:00:05+00:00",
-            error="RateLimitHit: 429",
+            error_message="RateLimitHit: 429",
         )
         assert AttemptRecord.from_dict(_persisted_dict(rec)) == rec
 
@@ -134,16 +134,16 @@ class TestAttemptRecordSerialization:
         keys = set(_persisted_dict(_running_record()))
         assert keys == {
             "job_uid", "activation_no", "attempt_no", "execution_id",
-            "run_id", "started_at", "outcome", "finished_at", "error",
+            "run_id", "started_at", "outcome", "finished_at", "error_message",
         }
 
     def test_from_dict_missing_optional_keys_default_none(self):
         data = _persisted_dict(_running_record())
         data.pop("finished_at")
-        data.pop("error")
+        data.pop("error_message")
         rec = AttemptRecord.from_dict(data)
         assert rec.finished_at is None
-        assert rec.error is None
+        assert rec.error_message is None
 
     def test_from_dict_missing_required_key_raises(self):
         data = _persisted_dict(_running_record())

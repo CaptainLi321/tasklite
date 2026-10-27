@@ -5,10 +5,10 @@ delta 语义组织：队列行的「弹出」从不单独落盘——被弹出�
 磁盘队列中，直到 commit_job_success / commit_job_failure /
 commit_retry / commit_skip 的事务内才删除（at-least-once 崩溃契约）。
 
-失败档案（failed）术语：按 uid 唯一终态，wall/failed 全局互斥——
-成功 commit 删 failed 同名行、失败 commit 删 wall 行，「最终状态唯一」
+失败档案（failed）术语：按 uid 唯一终态，successes/failed 全局互斥——
+成功 commit 删 failed 同名行、失败 commit 删 successes 行，「最终状态唯一」
 由此保证；失败历史与执行时间线由 attempts 旁路轨迹承接，本表不注入
-计数字段。attempts 为 append-only 旁路观测面：不参与 wall/failed 的
+计数字段。attempts 为 append-only 旁路观测面：不参与 successes/failed 的
 互斥与 REPLACE 语义。
 """
 from __future__ import annotations
@@ -55,16 +55,16 @@ def validate_attempt_dispatch(record: Any) -> None:
             f"attempt record must be an AttemptRecord, "
             f"got {type(record).__name__} ({record!r})"
         )
-    if record.outcome != "running" or record.finished_at is not None or record.error is not None:
+    if record.outcome != "running" or record.finished_at is not None or record.error_message is not None:
         raise ValueError(
             "dispatch append must be a fresh running row "
             "(outcome='running', finished_at=None, error=None), got "
             f"outcome={record.outcome!r} finished_at={record.finished_at!r} "
-            f"error={record.error!r}"
+            f"error={record.error_message!r}"
         )
 
 
-def validate_attempt_finish(outcome: Any, finished_at: Any, error: Any) -> None:
+def validate_attempt_finish(outcome: Any, finished_at: Any, error_message: Any) -> None:
     """尝试轨迹收尾门卫：outcome 属终态词汇、收尾时刻与错误形态合法。
 
     running 是插入侧专属形态——收尾接口把 running 写回会把已派发行
@@ -84,11 +84,11 @@ def validate_attempt_finish(outcome: Any, finished_at: Any, error: Any) -> None:
         )
     if not finished_at:
         raise ValueError("finished_at must be a non-empty str")
-    if error is not None and not isinstance(error, str):
+    if error_message is not None and not isinstance(error_message, str):
         raise TypeError(
-            f"error must be a str or None, got {type(error).__name__} ({error!r})"
+            f"error must be a str or None, got {type(error_message).__name__} ({error_message!r})"
         )
-    if error == "":
+    if error_message == "":
         raise ValueError("error must be a non-empty str or None")
 
 
@@ -96,18 +96,18 @@ class AbstractStateBackend(ABC):
     """管线状态持久化抽象契约（SQLite / Memory 双腿共同口径）。
 
     语义分组：
-    - 全量加载（load_wall / load_failed / load_failed_payloads /
+    - 全量加载（load_successes / load_failed / load_failure_payloads /
       load_cursors / load_queue）：仅启动装配与测试装配使用；
     - 整表重写（save_queue / replace_queue_atomic）：读-改-写必须经
       ``replace_queue_atomic`` 收敛进单个写事务；
     - delta 提交（commit_job_success / commit_job_failure /
-      commit_retry / commit_bulk_failure / commit_skip）：逐 job 单事务
+      commit_retry / commit_job_failures / commit_skip）：逐 job 单事务
       碎片化，禁止多 job 混合长事务；返回 False 表示持久化失败且后端
       保持调用前状态，调用方不得推进内存镜像并走崩溃契约；
     - 增量入队（enqueue_jobs）：不做全量覆盖，与运行中 delta 提交并发
       安全（写入侧不覆盖）；
-    - 定向删除与种子（delete_queue_uids / delete_failed / delete_wall /
-      seed_wall / seed_cursor）：加载期 repair 差量落盘与运维接缝；
+    - 定向删除与种子（delete_queue_uids / delete_failed / delete_successes /
+      seed_successes / seed_cursor）：加载期 repair 差量落盘与运维接缝；
     - 尝试轨迹（append_attempt / update_attempt / load_attempts）：
       append-only 旁路观测面；
     - 元数据（get_engine_metadata / set_engine_metadata）：框架级键值（fencing 的 last_run_id 等）。
@@ -116,7 +116,7 @@ class AbstractStateBackend(ABC):
     # 全量加载 -------------------------------------------------------
 
     @abstractmethod
-    def load_wall(self) -> dict[str, dict[str, Any]]:
+    def load_successes(self) -> dict[str, dict[str, Any]]:
         """加载全部成功终态（uid → meta）。"""
 
     @abstractmethod
@@ -124,7 +124,7 @@ class AbstractStateBackend(ABC):
         """加载全部失败档案终态（uid → 失败 meta）。"""
 
     @abstractmethod
-    def load_failed_payloads(self) -> dict[str, dict[str, Any]]:
+    def load_failure_payloads(self) -> dict[str, dict[str, Any]]:
         """读取失败档案各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
 
     @abstractmethod
@@ -177,7 +177,7 @@ class AbstractStateBackend(ABC):
     def commit_job_success(
         self,
         job_uid: str,
-        result_meta: dict,
+        result_metadata: dict,
         *,
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
@@ -185,14 +185,14 @@ class AbstractStateBackend(ABC):
         """原子持久化一个成功 job 的 delta。
 
         单事务效果：
-        - wall：INSERT/REPLACE uid → result_meta；
+        - successes：INSERT/REPLACE uid → result_metadata；
         - queue：DELETE 被弹出的 uid；
         - queue：spawned_job_snapshots 队头插入（保序）；
-        - failed：DELETE 同名残行（成功终态唯一，防 wall∩failed 并存）；
+        - failed：DELETE 同名残行（成功终态唯一，防 successes∩failed 并存）；
         - cursors：合并 cursor_updates（None 值表示删除游标）。
 
         返回 True 成功；返回 False 表示任一步持久化失败且后端保持调用前
-        状态（被弹出的 uid 仍在磁盘队列），调用方不得更新内存 wall/cursor
+        状态（被弹出的 uid 仍在磁盘队列），调用方不得更新内存 successes/cursor
         状态，并自行决定是否重入队（崩溃契约）。
         """
 
@@ -200,15 +200,15 @@ class AbstractStateBackend(ABC):
     def commit_job_failure(
         self,
         job_uid: str,
-        result_meta: dict,
-        job_payload: dict[str, Any] | None = None,
+        result_metadata: dict,
+        payload: dict[str, Any] | None = None,
     ) -> bool:
         """原子持久化一个失败 job 的 delta（写入失败档案）。
 
-        单事务效果：failed INSERT/REPLACE uid → result_meta；
-        queue DELETE uid；wall DELETE 同名行——重跑任务重试耗尽时旧成功
-        记录作废（最终状态唯一），否则磁盘 wall∩failed 并存破坏互斥。
-        ``job_payload`` 是原始业务 payload 快照（补跑自足，无需外部反查）；
+        单事务效果：failed INSERT/REPLACE uid → result_metadata；
+        queue DELETE uid；successes DELETE 同名行——重跑任务重试耗尽时旧成功
+        记录作废（最终状态唯一），否则磁盘 successes∩failed 并存破坏互斥。
+        ``payload`` 是原始业务输入快照（补跑自足，无需外部反查）；
         None 表示本路径无可存快照，保留既有快照不覆盖。
         返回语义与 ``commit_job_success`` 一致：False ⇒ 后端未变、崩溃契约。
         """
@@ -223,19 +223,19 @@ class AbstractStateBackend(ABC):
     ) -> bool:
         """原子持久化一次重入队 delta：DELETE popped_job_uid + 按 front 插入 requeued_job_snapshot。
 
-        不写 wall/failed。同 uid 重试是 DELETE+INSERT（一次执行没有独立
+        不写 successes/failed。同 uid 重试是 DELETE+INSERT（一次执行没有独立
         持久身份，身份仍是 uid）。重插不得静默丢弃：requeued uid 撞上删除
         popped 后的既有行冲突时返回 False 走崩溃契约，绝不产出重复队列
         条目却报成功。
         """
 
     @abstractmethod
-    def commit_bulk_failure(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
+    def commit_job_failures(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
         """原子批量写失败档案（死锁/级联场景）的 delta。
 
         单事务效果：failed INSERT/REPLACE 每个 uid → meta；
         queue 按 uid 精准 DELETE（剩余条目保持原顺序）；
-        wall 批量 DELETE 同名行（与 commit_job_failure 对称的最终状态唯一）。
+        successes 批量 DELETE 同名行（与 commit_job_failure 对称的最终状态唯一）。
         任一行失败 ⇒ 整体回滚、返回 False，绝不留下「队列已删、档案未落」
         的半成品失败态。
         """
@@ -244,17 +244,17 @@ class AbstractStateBackend(ABC):
     def commit_skip(self, job_uid: str) -> bool:
         """delta 删除队列中已终态（重复）的 uid。
 
-        去重命中（uid 已在 wall/failed）时调用——磁盘队列中该 uid 是残留
+        去重命中（uid 已在 successes/failed）时调用——磁盘队列中该 uid 是残留
         条目，直接删除以同步内存/磁盘（内存 = 磁盘 − in-flight）。
-        不写 wall/failed（重复条目不改变任何状态，只是清理）。
+        不写 successes/failed（重复条目不改变任何状态，只是清理）。
         返回 True 成功；False 时 on-disk 队列不变，调用方走崩溃契约。
         """
 
     @abstractmethod
-    def append_failed(self, job_uid: str, payload: dict[str, Any] | None = None) -> None:
+    def append_failed(self, job_uid: str, metadata: dict[str, Any] | None = None) -> None:
         """绕过队列直接写一条失败档案记录（带外登记面）。
 
-        按 uid REPLACE（幂等）；不触碰 queue/wall/cursors。持久化失败
+        按 uid REPLACE（幂等）；不触碰 queue/successes/cursors。持久化失败
         抛异常（不吞）。
         """
 
@@ -288,18 +288,18 @@ class AbstractStateBackend(ABC):
     def delete_failed(self, job_uids: list[str]) -> int:
         """从失败档案批量删除指定 uid（clear_failures 的后端实现）。
 
-        返回实际删除行数（连带清除 payload 快照）。不触碰 queue/wall。
+        返回实际删除行数（连带清除 payload 快照）。不触碰 queue/successes。
         仅限 run() 之外调用（改变 is_known 判定基础，与 enqueue 同纪律）。
         """
 
     @abstractmethod
-    def delete_wall(self, job_uids: list[str]) -> int:
-        """从 wall 批量删除指定 uid（clear_history 的后端实现 + commit 路径事务内清理）。
+    def delete_successes(self, job_uids: list[str]) -> int:
+        """从 successes 批量删除指定 uid（clear_history 的后端实现 + commit 路径事务内清理）。
 
         两种调用上下文：
         - 运行外管理 API 的批量删除；
-        - commit_job_failure / commit_bulk_failure 的同一事务内逐 uid 删除
-          （重跑任务重跑失败时 wall 旧记录作废，最终状态唯一）。
+        - commit_job_failure / commit_job_failures 的同一事务内逐 uid 删除
+          （重跑任务重跑失败时 successes 旧记录作废，最终状态唯一）。
 
         运行中的调用仅限 commit 事务内部（随失败档案写入原子提交，不改变
         进行中的派发判定）；独立调用仅限 run 之外（改变 is_known 判定
@@ -307,13 +307,13 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def seed_wall(self, job_uids: list[str]) -> int:
-        """把 uid 批量写入 wall（meta 为空 dict）——存档迁移标记「已处理」。
+    def seed_successes(self, job_uids: list[str]) -> int:
+        """把 uid 批量写入 successes（meta 为空 dict）——存档迁移标记「已处理」。
 
         幂等：已存在的 uid 被覆盖（meta 重置为空）。返回实际写入行数。
-        不变式（wall/failed 全局互斥）：已在 failed 的 uid 拒绝种子——
+        不变式（successes/failed 全局互斥）：已在 failed 的 uid 拒绝种子——
         冲突整体拒绝（零写入、抛 ValueError），不静默清除失败档案记录；
-        持久层与管理 API（OpsConsole.seed_wall）两层同契约。
+        持久层与管理 API（OpsConsole.seed_successes）两层同契约。
         """
 
     @abstractmethod
@@ -322,8 +322,8 @@ class AbstractStateBackend(ABC):
 
         入口校验 fail-loud：key 非空 str、value 必须 str——静默 str() 强转
         会让同一非法入参在 sqlite 腿抛异常、memory 腿写数字串（跨后端行为
-        分歧），且与内存镜像值型漂移。discovery 的已见判定走 wall/failed，
-        「已见预填」请用 ``seed_wall``；本方法服务通用业务 cursor。
+        分歧），且与内存镜像值型漂移。discovery 的已见判定走 successes/failed，
+        「已见预填」请用 ``seed_successes``；本方法服务通用业务 cursor。
         """
 
     # 尝试轨迹（append-only 旁路观测面）--------------------------------
@@ -334,8 +334,8 @@ class AbstractStateBackend(ABC):
 
         协议：仅在派发点调用，record 必须是 outcome="running"、无收尾
         时刻/错误的派发即插行（``validate_attempt_dispatch`` 门卫），随行
-        落盘 started_at / execution_id / run_id。attempts 不参与 wall/failed
-        的互斥与 REPLACE 语义，本方法不触碰 queue/wall/failed/cursors；
+        落盘 started_at / execution_id / run_id。attempts 不参与 successes/failed
+        的互斥与 REPLACE 语义，本方法不触碰 queue/successes/failed/cursors；
         持久化失败抛异常（fail-loud，不吞）。
         """
 
@@ -346,7 +346,7 @@ class AbstractStateBackend(ABC):
         *,
         outcome: str,
         finished_at: str,
-        error: str | None = None,
+        error_message: str | None = None,
     ) -> bool:
         """终态/重试时收尾轨迹行：写 finished_at / outcome / error。
 

@@ -68,10 +68,10 @@ class TestQueueOrdering:
 
 
 class TestSixSetMutex:
-    """六集合互斥：queue / in-flight / wall / failed 与豁免集。"""
+    """六集合互斥：queue / in-flight / successes / failed 与豁免集。"""
 
     def test_is_known_covers_all_four_sources(self):
-        """is_known 涵盖 wall/failed/queue/in-flight 四者（统一事实源）。"""
+        """is_known 涵盖 successes/failed/queue/in-flight 四者（统一事实源）。"""
         st = PipelineState({"w1": {}}, {"f1": {}}, {}, [_jid("q1")])
         st.register_in_flight("i1")
         assert st.is_known("w1")
@@ -95,14 +95,14 @@ class TestSixSetMutex:
             st.register_in_flight("t::x")
 
     def test_terminal_uid_in_flight_triggers_assertion(self):
-        """非豁免 uid 同时落 wall 与 in-flight：断言 fail-loud。"""
+        """非豁免 uid 同时落 successes 与 in-flight：断言 fail-loud。"""
         st = PipelineState({}, {}, {}, [])
         st.mark_success("t::x", {"score": 1})
-        with pytest.raises(AssertionError, match="wall/failed and in_flight"):
+        with pytest.raises(AssertionError, match="successes/failed and in_flight"):
             st.register_in_flight("t::x")
 
     def test_rerun_exempt_uid_bypasses_terminal_mutex(self):
-        """豁免策略作业可合法落在 wall/failed ∩ in-flight 交集（不触发断言）。"""
+        """豁免策略作业可合法落在 successes/failed ∩ in-flight 交集（不触发断言）。"""
         st = PipelineState({}, {}, {}, [_jid("x", rerun="every_run")])
         st.mark_success("t::x", {"score": 1})
         st.pop_job(0)  # pop_job 登记字面豁免
@@ -144,13 +144,13 @@ class TestSixSetMutex:
         st = PipelineState({}, {}, {}, [])
         st.mark_failed("t::x", {"error": "boom"})
         assert st.failed_uids == {"t::x"}
-        assert st.wall_uids == set()
+        assert st.success_job_uids == set()
         st.mark_success("t::x", {"score": 1})
-        assert st.wall_uids == {"t::x"}
+        assert st.success_job_uids == {"t::x"}
         assert st.failed_uids == set()
         st.mark_failed("t::x", {"error": "again"})
         assert st.failed_uids == {"t::x"}
-        assert st.wall_uids == set()
+        assert st.success_job_uids == set()
 
 
 class TestJobUidFromSnapshot:
@@ -183,7 +183,7 @@ class TestTerminalRecords:
         meta = {"nested": {"count": 1}}
         st.mark_success("t::x", meta)
         meta["nested"]["count"] = 99
-        assert st.wall["t::x"]["nested"]["count"] == 1
+        assert st.successes["t::x"]["nested"]["count"] == 1
 
     def test_update_cursors_merge_and_delete(self):
         st = PipelineState({}, {}, {"a": "1"}, [])
@@ -194,12 +194,12 @@ class TestTerminalRecords:
 
     def test_ops_seams_idempotent(self):
         st = PipelineState({}, {}, {}, [])
-        st.add_wall("t::w", {})
-        st.add_wall("t::w", {"again": True})
-        assert st.wall["t::w"] == {"again": True}
-        st.discard_wall("t::w")
-        st.discard_wall("t::w")  # 幂等
-        assert "t::w" not in st.wall_uids
+        st.add_success("t::w", {})
+        st.add_success("t::w", {"again": True})
+        assert st.successes["t::w"] == {"again": True}
+        st.discard_success("t::w")
+        st.discard_success("t::w")  # 幂等
+        assert "t::w" not in st.success_job_uids
         st.mark_failed("t::f", {})
         st.discard_failed("t::f")
         st.discard_failed("t::f")  # 幂等

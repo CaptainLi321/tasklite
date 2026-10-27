@@ -7,7 +7,7 @@
    未知/超容资源、畸形条目）。
 
 术语口径：死锁熔断的终态落点是失败档案（failed）——按 uid 唯一
-终态、与 wall 全局互斥，由 store 的批量失败出口收敛。
+终态、与 successes 全局互斥，由 store 的批量失败出口收敛。
 """
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ class BulkFailureOutcome(Protocol):
 class ArbitrationStore(Protocol):
     """死锁仲裁所需的 store 契约。
 
-    ``state`` 提供只读事实（queue / wall / 环检测）；
+    ``state`` 提供只读事实（queue / successes / 环检测）；
     ``apply_bulk_failure`` 是批量失败档案写入的单一出口（原子提交
     失败档案行、按 uid 删除队列行并级联下游，返回转移结果）。
     """
@@ -228,7 +228,7 @@ class DeadlockGovernor:
                 return False
             return self._grant_or_expire(missing_uids, now_mono, effective_grace)
 
-        # 回退路径：检查队列中是否存在「全部已知依赖已在 wall 中」的潜在可运行作业
+        # 回退路径：检查队列中是否存在「全部已知依赖已在 successes 中」的潜在可运行作业
         for jd in state.queue:
             uid = job_uid_from_snapshot(jd)
             if uid in missing_uids:
@@ -240,7 +240,7 @@ class DeadlockGovernor:
                     job = Job.from_dict(jd)
             except (KeyError, TypeError, ValueError):
                 continue
-            if all(dep in state.wall for dep in job.depends_on):
+            if all(dep in state.successes for dep in job.depends_on):
                 return self._grant_or_expire(missing_uids, now_mono, effective_grace)
         return False
 

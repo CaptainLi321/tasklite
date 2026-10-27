@@ -26,7 +26,7 @@ logger = logging.getLogger("tasklite")
 class SelectionStandstill:
     """执行选择下的停摆拓扑判定（Kahn 入度消减结果）。
 
-    以 ``wall_uids | deferred_uids``（Exclude 命中行 + 防御性的 Skip 残留行）
+    以 ``success_job_uids | deferred_uids``（Exclude 命中行 + 防御性的 Skip 残留行）
     为初始波前，对剩余「允许执行」作业做入度消减：
 
     - ``stuck_uids``：入度无法消减为 0 的允许作业，可能包含环成员、缺口
@@ -78,7 +78,7 @@ class SelectionMachine:
     def apply_skips(self, *, run_id: str | None, seq_supplier: Callable[[], int]) -> int:
         """终态跳过：Skip 命中行移出 queue，下游整链级联跳过并留审计轨迹。
 
-        Skip 是永久语义（不进入 wall/失败档案，下次不再重试），审计落
+        Skip 是永久语义（不进入 successes/失败档案，下次不再重试），审计落
         attempts（outcome=skipped）。删除序为下游优先：崩溃中断后 Skip 根
         仍在队列，下次 run 可重新得到同一闭包（幂等）。
         """
@@ -187,13 +187,13 @@ class SelectionMachine:
         }
         allowed = set(facts) - deferred
 
-        # Kahn：只有允许作业参与消减；deferred 与 wall 同为已满足波前。
+        # Kahn：只有允许作业参与消减；deferred 与 successes 同为已满足波前。
         indegree: dict[str, int] = {}
         dependents: dict[str, list[str]] = {}
         for uid in allowed:
             count = 0
             for dep in facts[uid][1]:
-                if dep in deferred or dep in state.wall_uids:
+                if dep in deferred or dep in state.success_job_uids:
                     continue
                 count += 1
                 dependents.setdefault(dep, []).append(uid)

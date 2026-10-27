@@ -1,9 +1,9 @@
 """v2 OpsConsole 运维控制台测试：失败档案管理面与种子化/挂起视图。
 
 覆盖：list_failures / clear_failures / retry_failure（失败档案运维面，
-含损坏行防御与 payload 快照）、clear_history（wall/failed 删除通道与
-谓词）、seed_wall / seed_cursor（含六集合互斥零写入拒绝）、
-list_suspensions（meta 真相源视图）、filter_jobs_without_success（wall 过滤辅助）与
+含损坏行防御与 payload 快照）、clear_history（successes/failed 删除通道与
+谓词）、seed_successes / seed_cursor（含六集合互斥零写入拒绝）、
+list_suspensions（meta 真相源视图）、filter_jobs_without_success（successes 过滤辅助）与
 换库重绑定一致性。规则：全部管理 API 仅限 run() 外调用。
 """
 
@@ -44,20 +44,20 @@ class TestListFailures:
     def test_structured_entries_with_payload_snapshot(self):
         backend, _, console = _make_console()
         backend.commit_job_failure(
-            "t::a", {"error": ERR_DEPENDENCY_DEADLOCK}, job_payload={"k": 1}
+            "t::a", {"error": ERR_DEPENDENCY_DEADLOCK}, payload={"k": 1}
         )
         backend.commit_job_failure(
-            "t::b", {"error": "boom", "fatal": True}, job_payload={"k": 2}
+            "t::b", {"error": "boom", "fatal": True}, payload={"k": 2}
         )
 
         entries = console.list_failures()
-        by_uid = {e.uid: e for e in entries}
+        by_uid = {e.job_uid: e for e in entries}
         assert set(by_uid) == {"t::a", "t::b"}
-        assert by_uid["t::a"].error == ERR_DEPENDENCY_DEADLOCK
-        assert by_uid["t::a"].meta["error_type"]
-        assert by_uid["t::a"].job_payload == {"k": 1}
-        assert by_uid["t::b"].meta["fatal"] is True
-        assert by_uid["t::b"].job_payload == {"k": 2}
+        assert by_uid["t::a"].error_message == ERR_DEPENDENCY_DEADLOCK
+        assert by_uid["t::a"].metadata["error_type"]
+        assert by_uid["t::a"].payload == {"k": 1}
+        assert by_uid["t::b"].metadata["fatal"] is True
+        assert by_uid["t::b"].payload == {"k": 2}
 
     def test_empty_archive_returns_empty(self):
         _, _, console = _make_console()
@@ -67,7 +67,7 @@ class TestListFailures:
         backend, _, console = _make_console()
         backend.append_failed("t::z", {"error": "x"})
         backend.append_failed("t::a", {"error": "x"})
-        assert [e.uid for e in console.list_failures()] == ["t::a", "t::z"]
+        assert [e.job_uid for e in console.list_failures()] == ["t::a", "t::z"]
 
     def test_bare_row_gains_classifier_error_type(self):
         """带外登记的裸行（无 error_type）在查询视图经 classifier 归档，
@@ -78,7 +78,7 @@ class TestListFailures:
 
         entry = console.list_failures()[0]
 
-        assert entry.meta["error_type"], "查询视图必须补齐归档 error_type"
+        assert entry.metadata["error_type"], "查询视图必须补齐归档 error_type"
         assert "error_type" not in backend.load_failed()["t::bare"]
 
     def test_corrupt_meta_row_does_not_crash_query(self):
@@ -86,15 +86,15 @@ class TestListFailures:
         backend, _, console = _make_console()
         backend.append_failed("t::ok", {"error": "x"})
         backend._failed["t::corrupt"] = "boom"  # 直接注入损坏行
-        entries = {e.uid: e for e in console.list_failures()}
+        entries = {e.job_uid: e for e in console.list_failures()}
         assert set(entries) == {"t::ok", "t::corrupt"}
-        assert entries["t::corrupt"].meta["error_type"] == "unknown"
-        assert entries["t::corrupt"].error == ""
+        assert entries["t::corrupt"].metadata["error_type"] == "unknown"
+        assert entries["t::corrupt"].error_message == ""
 
     def test_no_snapshot_entry_payload_none(self):
         backend, _, console = _make_console()
         backend.append_failed("t::y", {"error": "x"})
-        assert console.list_failures()[0].job_payload is None
+        assert console.list_failures()[0].payload is None
 
 
 class TestClearFailures:
@@ -157,7 +157,7 @@ class TestRetryFailure:
     def test_retry_reenqueues_from_payload_snapshot(self):
         backend, store, console = _make_console()
         backend.commit_job_failure(
-            "t::x", {"error": "boom"}, job_payload={"artist": "a"}
+            "t::x", {"error": "boom"}, payload={"artist": "a"}
         )
         assert console.retry_failure("t::x") is True
 
@@ -181,7 +181,7 @@ class TestRetryFailure:
         「一行 = 一次物理执行」的追溯链。
         """
         backend, _, console = _make_console()
-        backend.commit_job_failure("t::x", {"error": "boom"}, job_payload={"k": 1})
+        backend.commit_job_failure("t::x", {"error": "boom"}, payload={"k": 1})
         # 轨迹行按真实派发协议落表：先插 running 行，再收尾为 failed
         attempt_id = backend.append_attempt(AttemptRecord(
             job_uid="t::x",
@@ -196,7 +196,7 @@ class TestRetryFailure:
             attempt_id,
             outcome="failed",
             finished_at="2026-09-01T00:00:05+00:00",
-            error="boom",
+            error_message="boom",
         )
         assert console.retry_failure("t::x") is True
         jd = backend.load_queue()[0]
@@ -217,7 +217,7 @@ class TestRetryFailure:
     def test_retry_idempotent_against_queue_residence(self):
         """uid 已驻留队列：不重复入队，档案行照删。"""
         backend, store, console = _make_console()
-        backend.commit_job_failure("t::z", {"error": "x"}, job_payload={"k": 1})
+        backend.commit_job_failure("t::z", {"error": "x"}, payload={"k": 1})
         store.enqueue_jobs([Job("t", "z", payload={"k": 1})])
         assert console.retry_failure("t::z") is True
         assert len(backend.load_queue()) == 1
@@ -225,51 +225,51 @@ class TestRetryFailure:
 
 
 class TestClearHistory:
-    """wall / failed 删除通道。"""
+    """successes / failed 删除通道。"""
 
     def test_forget_both_wall_and_failed(self):
         backend, _, console = _make_console()
-        backend.seed_wall(["t::a", "t::b", "other::c"])
+        backend.seed_successes(["t::a", "t::b", "other::c"])
         backend.append_failed("t::b", {"error": "x"})
         backend.append_failed("t::d", {"error": "x"})
 
-        assert console.clear_history("t::") == 4  # wall 2 + failed 2
-        assert backend.load_wall() == {"other::c": {}}
+        assert console.clear_history("t::") == 4  # successes 2 + failed 2
+        assert backend.load_successes() == {"other::c": {}}
         assert backend.load_failed() == {}
 
     def test_forget_exact_uid(self):
         backend, _, console = _make_console()
-        backend.seed_wall(["t::a", "t::b"])
+        backend.seed_successes(["t::a", "t::b"])
         assert console.clear_history("t::a") == 1
-        assert set(backend.load_wall()) == {"t::b"}
+        assert set(backend.load_successes()) == {"t::b"}
 
     def test_forget_only_wall(self):
         backend, _, console = _make_console()
-        backend.seed_wall(["t::a"])
+        backend.seed_successes(["t::a"])
         backend.append_failed("t::a", {"error": "x"})
-        assert console.clear_history("t::a", where=("wall",)) == 1
-        assert backend.load_wall() == {}
+        assert console.clear_history("t::a", where=("successes",)) == 1
+        assert backend.load_successes() == {}
         assert set(backend.load_failed()) == {"t::a"}
 
     def test_prefix_requires_double_colon(self):
         """防前缀误匹配：无 :: 结尾的 pattern 只精确匹配完整 uid。"""
         backend, _, console = _make_console()
-        backend.seed_wall(["download::x", "downloads::y"])
+        backend.seed_successes(["download::x", "downloads::y"])
         assert console.clear_history("download") == 0
-        assert set(backend.load_wall()) == {"download::x", "downloads::y"}
+        assert set(backend.load_successes()) == {"download::x", "downloads::y"}
         assert console.clear_history("download::") == 1
-        assert set(backend.load_wall()) == {"downloads::y"}
+        assert set(backend.load_successes()) == {"downloads::y"}
 
     def test_forget_uid_list(self):
         backend, _, console = _make_console()
-        backend.seed_wall(["t::a", "t::b", "t::c"])
+        backend.seed_successes(["t::a", "t::b", "t::c"])
         assert console.clear_history(["t::a", "t::c"]) == 2
-        assert set(backend.load_wall()) == {"t::b"}
+        assert set(backend.load_successes()) == {"t::b"}
 
     def test_unknown_where_rejected(self):
         _, _, console = _make_console()
         with pytest.raises(ValueError, match="where"):
-            console.clear_history("t::", where=("wall", "queue"))  # type: ignore[arg-type]
+            console.clear_history("t::", where=("successes", "queue"))  # type: ignore[arg-type]
 
     def test_invalid_targets_rejected(self):
         _, _, console = _make_console()
@@ -284,22 +284,22 @@ class TestPredicateClearHistory:
 
     def test_predicate_filters_within_target_prefix(self):
         backend, _, console = _make_console()
-        backend.seed_wall(["t::a", "t::b", "other::c"])
+        backend.seed_successes(["t::a", "t::b", "other::c"])
         assert console.clear_history("t::", predicate=lambda u: u == "t::a") == 1
-        assert set(backend.load_wall()) == {"t::b", "other::c"}
+        assert set(backend.load_successes()) == {"t::b", "other::c"}
 
     def test_predicate_applies_to_wall_and_failed(self):
         backend, _, console = _make_console()
-        backend.seed_wall(["t::keep", "t::drop"])
+        backend.seed_successes(["t::keep", "t::drop"])
         backend.append_failed("t::keep", {"error": "x"})
         backend.append_failed("t::drop", {"error": "x"})
         assert console.clear_history("t::", predicate=lambda u: "drop" in u) == 2
-        assert set(backend.load_wall()) == {"t::keep"}
+        assert set(backend.load_successes()) == {"t::keep"}
         assert set(backend.load_failed()) == {"t::keep"}
 
     def test_predicate_receives_matched_uids(self):
         backend, _, console = _make_console()
-        backend.seed_wall(["t::a", "t::b"])
+        backend.seed_successes(["t::a", "t::b"])
         seen: list[str] = []
         console.clear_history("t::", predicate=seen.append)
         assert sorted(seen) == ["t::a", "t::b"]
@@ -315,49 +315,49 @@ class TestSeeding:
 
     def test_seed_wall_makes_known(self):
         backend, _, console = _make_console()
-        assert console.seed_wall(["t::archived_1", "t::archived_2"]) == 2
-        assert backend.load_wall() == {
+        assert console.seed_successes(["t::archived_1", "t::archived_2"]) == 2
+        assert backend.load_successes() == {
             "t::archived_1": {}, "t::archived_2": {},
         }
 
     def test_seed_wall_rejects_bad_uid(self):
         _, _, console = _make_console()
         with pytest.raises(ValueError, match="task_type::job_id"):
-            console.seed_wall(["no-colon"])
+            console.seed_successes(["no-colon"])
 
     def test_seed_wall_rejects_uid_already_in_failed(self):
-        """seed 已 failed 的 uid 被整体拒绝（wall/failed 全局互斥契约）。
+        """seed 已 failed 的 uid 被整体拒绝（successes/failed 全局互斥契约）。
 
         seed 链路（console 预检 → backend 持久层 → 内存 state）双腿零写入：
-        静默覆盖会留下 wall∩failed 重叠，令后续派发的状态一致性断言崩溃；
+        静默覆盖会留下 successes∩failed 重叠，令后续派发的状态一致性断言崩溃；
         失败档案记录须先显式清除，不静默吞失败历史。
         """
         backend, store, console = _make_console()
         backend.append_failed("t::archived_1", {"error": "boom"})
 
         with pytest.raises(ValueError, match="already in the failure archive"):
-            console.seed_wall(["t::archived_1", "t::fresh"])
+            console.seed_successes(["t::archived_1", "t::fresh"])
 
         # 双腿零写入：持久层与内存 state 均不含种子，failed 记录原样保留
-        assert backend.load_wall() == {}
+        assert backend.load_successes() == {}
         assert set(backend.load_failed()) == {"t::archived_1"}
-        assert "t::archived_1" not in store.state.wall
-        assert "t::fresh" not in store.state.wall
+        assert "t::archived_1" not in store.state.successes
+        assert "t::fresh" not in store.state.successes
 
     def test_seed_wall_rejects_uid_resident_in_queue(self):
         """队列驻留（磁盘真相）同样拒绝种子——仅查内存腿会漏掉。"""
         backend, store, console = _make_console()
         store.enqueue_jobs([Job("t", "queued", payload={})])
         with pytest.raises(ValueError, match="still resident in the queue"):
-            console.seed_wall(["t::queued"])
+            console.seed_successes(["t::queued"])
 
     def test_seed_wall_after_clear_failures_succeeds(self):
         """先显式清除失败档案再种子：合法存档迁移路径不受拒绝语义波及。"""
         backend, _, console = _make_console()
         backend.append_failed("t::archived_1", {"error": "boom"})
         assert console.clear_failures() == 1
-        assert console.seed_wall(["t::archived_1"]) == 1
-        assert backend.load_wall()["t::archived_1"] == {}
+        assert console.seed_successes(["t::archived_1"]) == 1
+        assert backend.load_successes()["t::archived_1"] == {}
         assert set(backend.load_failed()) == set()
 
     def test_seed_cursor_readable_via_backend(self):
@@ -439,11 +439,11 @@ class TestListSuspensions:
 
 
 class TestFilterJobsWithoutSuccess:
-    """入队前 wall 过滤辅助。"""
+    """入队前 successes 过滤辅助。"""
 
     def test_filters_by_wall_only(self):
         backend, _, console = _make_console()
-        backend.seed_wall(["t::done", "t::failed_then_done"])
+        backend.seed_successes(["t::done", "t::failed_then_done"])
         backend.append_failed("t::failed", {"error": "x"})
         backend.enqueue_jobs([Job("t", "queued").to_dict()])
         jobs = [
@@ -463,7 +463,7 @@ class TestBackendSwapRebind:
 
     def test_management_apis_target_rebound_backend(self):
         old_backend, store, console = _make_console()
-        old_backend.seed_wall(["w::old"])
+        old_backend.seed_successes(["w::old"])
         old_backend.append_failed("a::old", {"error": "old"})
         old_backend.seed_cursor("ck", "old")
 
@@ -474,14 +474,14 @@ class TestBackendSwapRebind:
         store.set_backend(new_backend)
 
         # 只读面读新库
-        assert [e.uid for e in console.list_failures()] == ["a::new"]
+        assert [e.job_uid for e in console.list_failures()] == ["a::new"]
         # 变更面写新库、旧库不受波及
         assert console.clear_failures() == 1
         assert new_backend.load_failed() == {}
         assert "a::old" in old_backend.load_failed()
-        assert console.seed_wall(["t::new"]) == 1
-        assert "t::new" in new_backend.load_wall()
-        assert "t::new" not in old_backend.load_wall()
+        assert console.seed_successes(["t::new"]) == 1
+        assert "t::new" in new_backend.load_successes()
+        assert "t::new" not in old_backend.load_successes()
         console.seed_cursor("k", "new")
         assert new_backend.load_cursors()["k"] == "new"
         assert old_backend.load_cursors()["ck"] == "old"

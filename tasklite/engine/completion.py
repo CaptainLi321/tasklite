@@ -13,7 +13,7 @@ last_retry_error 不污染、预算耗尽也豁免失败档案。重试节奏唯
 StateStore.apply_retry 内的 RequeuePolicy（默认立即队首重入）。
 
 ``session`` 按具名 Protocol ``DispatchSession`` 消费（``run_id`` 是
-wall meta 的 last_run_id 事实源；契约定义见 dispatch 模块）。
+successes meta 的 last_run_id 事实源；契约定义见 dispatch 模块）。
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from .channel import ArtifactCleanupMode, ExecutionResult, JobHandle
 from .errorclass import ERR_MAX_RETRIES
 from .in_flight import InFlightJob, InFlightTracker
 from .resource import persist_resource_suspensions
-from .types import AttemptFinish
+from .types import AttemptOutcome
 
 logger = logging.getLogger("tasklite")
 
@@ -71,7 +71,7 @@ class CompletionMachine:
         钩子恰好一次。
 
         身份非真空：在飞注销**不在本方法开头**统一执行——那会造成
-        「四集合真空」窗口（uid 不在 wall/failed/queue/in-flight 任一
+        「四集合真空」窗口（uid 不在 successes/failed/queue/in-flight 任一
         集合），使 handler 自 spawn 同 uid 子任务时被 ``is_known`` 漏判。
         注销时机下推到 ``apply_result`` 内部分支（retry 在重入队前、
         success 在 mark_success 后、failure 在 mark_failed 后），保证
@@ -98,7 +98,7 @@ class CompletionMachine:
             # 标记终结并跳过尾部触发——否则同一 job 触发两次钩子（第二次
             # success 标志还与实际终态矛盾）。「每个 attempt 收尾钩子恰好
             # 调用一次」是收尾出口的明文承诺。
-            result.going_to_retry = False
+            result.will_retry = False
             terminated = True
         finally:
             # 资源释放（无论成功/失败/重试/崩溃，由 entry 自归还）
@@ -117,10 +117,10 @@ class CompletionMachine:
         if not terminated:
             self._store.fire_attempt_finished(
                 uid,
-                outcome=AttemptFinish(
+                outcome=AttemptOutcome(
                     success=bool(result.success),
-                    going_to_retry=result.going_to_retry,
-                    meta=dict(result.result_meta),
+                    will_retry=result.will_retry,
+                    metadata=dict(result.result_metadata),
                 ),
             )
 
@@ -203,17 +203,17 @@ class CompletionMachine:
                 f"FAIL: {uid} exceeded max retries ({job.max_retries}). "
                 f"Sent to failure archive."
             )
-            fail_meta: dict[str, Any] = {"error": ERR_MAX_RETRIES}
+            failure_metadata: dict[str, Any] = {"error": ERR_MAX_RETRIES}
             rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
             if rt_state.last_retry_error:
-                fail_meta["last_retry_error"] = rt_state.last_retry_error
+                failure_metadata["last_retry_error"] = rt_state.last_retry_error
             if retry_error:
-                fail_meta["retry_error"] = retry_error
+                failure_metadata["retry_error"] = retry_error
             self._store.apply_failure(
-                uid, fail_meta, job_snapshot=job_snapshot, cascade=True,
+                uid, failure_metadata, job_snapshot=job_snapshot, cascade=True,
                 attempt_id=attempt_id,
             )
-            result.going_to_retry = False
+            result.will_retry = False
             return
 
         retry_job_snapshot = self._build_retry_job_snapshot(
@@ -227,9 +227,9 @@ class CompletionMachine:
             retry_job_snapshot,
             transient_kind=transient_kind,
             attempt_id=attempt_id,
-            error=retry_error,
+            error_message=retry_error,
         )
-        result.going_to_retry = True
+        result.will_retry = True
 
     @staticmethod
     def _build_retry_job_snapshot(
@@ -267,17 +267,17 @@ class CompletionMachine:
         started_monotonic: float | None = None,
         attempt_id: int | None = None,
     ) -> None:
-        """成功分支：子任务去重规范化、wall 记录与 cursor 推进。"""
+        """成功分支：子任务去重规范化、successes 记录与 cursor 推进。"""
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
-        spawned_job_snapshots = self._collect_spawned_job_snapshots(uid, result.new_jobs)
-        wall_meta = dict(result.result_meta or {})
+        spawned_job_snapshots = self._collect_spawned_job_snapshots(uid, result.spawned_jobs)
+        success_metadata = dict(result.result_metadata or {})
         declared_inputs = self._channel.read_declared_inputs(uid)
 
         self._store.apply_success(
             uid,
-            wall_meta,
+            success_metadata,
             spawned_job_snapshots=spawned_job_snapshots,
             cursor_updates=result.cursor_updates,
             declared_inputs=declared_inputs,
@@ -285,15 +285,15 @@ class CompletionMachine:
             job_snapshot=job_snapshot,
             attempt_id=attempt_id,
         )
-        result.going_to_retry = False
+        result.will_retry = False
 
     def _collect_spawned_job_snapshots(
-        self, parent_uid: str, new_jobs: Sequence[Job]
+        self, parent_uid: str, spawned_jobs: Sequence[Job]
     ) -> list[dict[str, Any]]:
         """动态子任务去重与规范化。
 
         去重规则：批内同 uid 只留首个；queue/in-flight 命中无条件拦截
-        （同轮不重复派发/并发双跑，优先于 rerun 豁免）；wall/failed 命中
+        （同轮不重复派发/并发双跑，优先于 rerun 豁免）；successes/failed 命中
         经 RerunPolicy 准入判定。规范化经 store.normalize_spawned_job
         （策略注入 + 资源注入 + 首入队时间 + 序列化预检）；不可序列化的
         坏子作业独立登记失败终态（拒绝语义），不连坐父作业的成功提交、
@@ -301,12 +301,12 @@ class CompletionMachine:
         """
         store = self._store
         spawned_job_snapshots: list[dict[str, Any]] = []
-        if not new_jobs:
+        if not spawned_jobs:
             return spawned_job_snapshots
 
         seen_in_batch: set[str] = set()
-        unique_new_jobs: list[Job] = []
-        for nj in new_jobs:
+        unique_spawned_jobs: list[Job] = []
+        for nj in spawned_jobs:
             nj_uid = nj.uid
             if nj_uid in seen_in_batch:
                 logger.debug(f"Skipping duplicate spawn for {nj_uid}.")
@@ -318,9 +318,9 @@ class CompletionMachine:
                 if decision.should_skip:
                     continue
             seen_in_batch.add(nj_uid)
-            unique_new_jobs.append(nj)
+            unique_spawned_jobs.append(nj)
 
-        for nj in unique_new_jobs:
+        for nj in unique_spawned_jobs:
             try:
                 spawned_job_snapshots.append(store.normalize_spawned_job(nj))
             except ValueError as err:
@@ -344,7 +344,7 @@ class CompletionMachine:
             entry,
             ExecutionResult(
                 success=False,
-                result_meta={
+                result_metadata={
                     "error": f"INVALID_SPAWNED_JOB: job dict is not "
                     f"JSON-serializable: {err}"
                 },
@@ -364,13 +364,13 @@ class CompletionMachine:
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.error(
             f"FAIL: {uid} (duration {duration:.2f}s, sent to failure archive). "
-            f"Meta: {result.result_meta}"
+            f"Meta: {result.result_metadata}"
         )
         self._store.apply_failure(
-            uid, result.result_meta, job_snapshot=job_snapshot, cascade=True,
+            uid, result.result_metadata, job_snapshot=job_snapshot, cascade=True,
             attempt_id=attempt_id,
         )
-        result.going_to_retry = False
+        result.will_retry = False
 
     # ── 批量结算 ──────────────────────────────────────────────────────
 

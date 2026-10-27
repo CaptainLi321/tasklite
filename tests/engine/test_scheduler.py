@@ -19,9 +19,9 @@ from tasklite.models.state import PipelineState
 INF = float("inf")
 
 
-def _state(queue, wall=None, failed=None):
+def _state(queue, successes=None, failed=None):
     return PipelineState(
-        wall=wall or {}, failed=failed or {}, cursors={}, queue=list(queue)
+        successes=successes or {}, failed=failed or {}, cursors={}, queue=list(queue)
     )
 
 
@@ -235,7 +235,7 @@ class TestScanAttribution:
         assert result.has_potential_spawners is False
 
     def test_in_flight_dependency_not_counted_missing(self):
-        """依赖正在执行的 job 不算 missing（待 commit 到 wall 自然解锁）。"""
+        """依赖正在执行的 job 不算 missing（待 commit 到 successes 自然解锁）。"""
         scheduler = JobScheduler(resources={})
         state = _state([Job("t", "a", depends_on=["t::running"]).to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset({"t::running"}))

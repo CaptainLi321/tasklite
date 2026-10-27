@@ -129,11 +129,11 @@ class TestRepairQueueOnLoad:
         job_failed_rerun = {"task_type": "t", "job_id": "f_rerun", "rerun": "on_failure"}
         job_fresh = {"task_type": "t", "job_id": "fresh"}
 
-        wall = {"t::w_blocked": {}, "t::w_rerun": {}}
+        successes = {"t::w_blocked": {}, "t::w_rerun": {}}
         failed = {"t::f_rerun": {}}
         repaired = orchestrator.repair_queue_on_load(
             [job_wall, job_every_run, job_failed_rerun, job_fresh],
-            wall=wall, failed=failed,
+            successes=successes, failed=failed,
         )
 
         assert _uids(repaired) == ["t::w_rerun", "t::f_rerun", "t::fresh"]
@@ -149,7 +149,7 @@ class TestRepairQueueOnLoad:
                    "_last_retry_error": "old", "user_extra": {"k": "v"}}
         job = {"task_type": "t", "job_id": "rt", "runtime": dict(runtime)}
 
-        repaired = orchestrator.repair_queue_on_load([job], wall={}, failed={})
+        repaired = orchestrator.repair_queue_on_load([job], successes={}, failed={})
 
         assert repaired[0]["runtime"] == runtime, "修复不得改写 runtime 边带状态"
 
@@ -163,7 +163,7 @@ class TestRepairQueueOnLoad:
         job = {"task_type": "t", "job_id": "dflt", "rerun": None}
 
         repaired = orchestrator.repair_queue_on_load(
-            [job], wall={"t::dflt": {}}, failed={},
+            [job], successes={"t::dflt": {}}, failed={},
         )
 
         assert _uids(repaired) == ["t::dflt"]
@@ -183,7 +183,7 @@ class TestRepairDeltaPersist:
     def test_repair_preserves_job_enqueued_during_repair_window(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([
-            {"task_type": "t", "job_id": "residue_row", "rerun": "never"},  # wall 残留，应清理
+            {"task_type": "t", "job_id": "residue_row", "rerun": "never"},  # successes 残留，应清理
             {"task_type": "t", "job_id": "keep_row"},
         ])
         q_data = backend.load_queue()
@@ -198,7 +198,7 @@ class TestRepairDeltaPersist:
 
         orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(
-            q_data, wall={"t::residue_row": {}}, failed={}
+            q_data, successes={"t::residue_row": {}}, failed={}
         )
 
         disk_uids = set(_uids(backend.load_queue()))
@@ -229,7 +229,7 @@ class TestRepairDeltaPersist:
 
         orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(
-            q_data, wall={"t::residue_row": {}}, failed={"t::failed_residue": {}}
+            q_data, successes={"t::residue_row": {}}, failed={"t::failed_residue": {}}
         )
 
         # 只定向删除残留行，保留行保持原序
@@ -248,7 +248,7 @@ class TestRepairDeltaPersist:
 
         orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(
-            q_data, wall={"t::residue_row": {}}, failed={}
+            q_data, successes={"t::residue_row": {}}, failed={}
         )
 
         assert set(_uids(backend.load_queue())) == {"t::keep_row", "t::late"}
@@ -308,7 +308,7 @@ class TestRepairDuplicateWarning:
 
         orchestrator = make_recovery_orchestrator(backend)
         with caplog.at_level(logging.WARNING, logger="tasklite"):
-            repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+            repaired = orchestrator.repair_queue_on_load(q_data, successes={}, failed={})
 
         dup_msgs = [
             r.getMessage() for r in caplog.records if "duplicate uid" in r.getMessage()
@@ -325,7 +325,7 @@ class TestRepairDuplicateWarning:
         ]
 
         with caplog.at_level(logging.WARNING, logger="tasklite"):
-            repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+            repaired = orchestrator.repair_queue_on_load(q_data, successes={}, failed={})
 
         dup_msgs = [
             r.getMessage() for r in caplog.records if "duplicate uid" in r.getMessage()
@@ -346,16 +346,16 @@ class TestRepairDuplicateWarning:
         backend.load_queue = broken_load
         orchestrator = make_recovery_orchestrator(backend)
         with caplog.at_level(logging.WARNING, logger="tasklite"):
-            repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+            repaired = orchestrator.repair_queue_on_load(q_data, successes={}, failed={})
 
         assert _uids(repaired) == ["t::keep_row"], "重读失败以加载快照为准，不丢行"
         assert any("repair merge" in r.getMessage() for r in caplog.records)
 
 
 class TestTerminalOverlapConvergence:
-    """加载期终态交集收敛：wall∩failed 违例数据在构建运行态前确定性收敛。
+    """加载期终态交集收敛：successes∩failed 违例数据在构建运行态前确定性收敛。
 
-    不变式：wall/failed 全局互斥；违例交集若流入运行态，首个作业派发的
+    不变式：successes/failed 全局互斥；违例交集若流入运行态，首个作业派发的
     in-flight 登记触发的全量互斥断言即崩溃循环。收敛必须 failed 优先
     （失败档案保留失败证据供人工核查重跑）、按 uid 差量定向删除（磁盘
     其余行原样保留），并留 WARNING 诊断证据。
@@ -363,35 +363,35 @@ class TestTerminalOverlapConvergence:
 
     def test_overlap_converged_to_failed_in_memory_and_disk(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.seed_wall(["t::x", "t::clean"])
+        backend.seed_successes(["t::x", "t::clean"])
         backend.append_failed("t::x", {"error": "boom"})
-        wall = backend.load_wall()
+        successes = backend.load_successes()
         failed = backend.load_failed()
         orchestrator = make_recovery_orchestrator(backend)
 
-        orchestrator.converge_terminal_overlap(wall, failed)
+        orchestrator.converge_terminal_overlap(successes, failed)
 
-        # failed 优先：交集 uid 从内存 wall 剔除，失败档案证据保留
-        assert "t::x" not in wall
-        assert "t::clean" in wall
+        # failed 优先：交集 uid 从内存 successes 剔除，失败档案证据保留
+        assert "t::x" not in successes
+        assert "t::clean" in successes
         assert "t::x" in failed
         # 磁盘差量收敛：仅违例行剔除，其余行原样保留
-        assert "t::x" not in backend.load_wall()
-        assert "t::clean" in backend.load_wall()
+        assert "t::x" not in backend.load_successes()
+        assert "t::clean" in backend.load_successes()
         assert "t::x" in backend.load_failed()
 
     def test_convergence_emits_warning_listing_conflict_uids(self, caplog):
         backend = InMemoryStateBackend()
         orchestrator = make_recovery_orchestrator(backend)
-        wall = {"t::x": {}, "t::y": {}}
+        successes = {"t::x": {}, "t::y": {}}
         failed = {"t::x": {}}
 
         with caplog.at_level(logging.WARNING, logger="tasklite"):
-            orchestrator.converge_terminal_overlap(wall, failed)
+            orchestrator.converge_terminal_overlap(successes, failed)
 
         warns = [
             r.getMessage() for r in caplog.records
-            if "both wall and failed" in r.getMessage()
+            if "both successes and failed" in r.getMessage()
         ]
         assert len(warns) == 1, f"交集收敛必须留恰好一条 WARNING 证据: {warns}"
         assert "t::x" in warns[0]
@@ -399,28 +399,28 @@ class TestTerminalOverlapConvergence:
     def test_disjoint_terminal_sets_untouched_and_silent(self, caplog):
         backend = InMemoryStateBackend()
         orchestrator = make_recovery_orchestrator(backend)
-        wall = {"t::w": {}}
+        successes = {"t::w": {}}
         failed = {"t::f": {}}
 
         with caplog.at_level(logging.WARNING, logger="tasklite"):
-            orchestrator.converge_terminal_overlap(wall, failed)
+            orchestrator.converge_terminal_overlap(successes, failed)
 
-        assert wall == {"t::w": {}}
+        assert successes == {"t::w": {}}
         assert failed == {"t::f": {}}
         assert caplog.records == []
 
     def test_backend_delete_failure_degrades_without_losing_convergence(self, caplog):
         backend = MagicMock()
-        backend.delete_wall.side_effect = RuntimeError("disk gone")
+        backend.delete_successes.side_effect = RuntimeError("disk gone")
         orchestrator = make_recovery_orchestrator(backend)
-        wall = {"t::x": {}}
+        successes = {"t::x": {}}
         failed = {"t::x": {}}
 
         with caplog.at_level(logging.WARNING, logger="tasklite"):
-            orchestrator.converge_terminal_overlap(wall, failed)
+            orchestrator.converge_terminal_overlap(successes, failed)
 
         # 落盘失败不回退内存收敛（本次 run 不受影响），磁盘下次加载重判
-        assert "t::x" not in wall
+        assert "t::x" not in successes
         assert any(
             "re-converge on next load" in r.getMessage() for r in caplog.records
         )
@@ -442,13 +442,13 @@ class TestRepairFrontPriority:
         backend.enqueue_jobs([{"task_type": "t", "job_id": "front_job"}], front=True)
 
         orchestrator = make_recovery_orchestrator(backend)
-        repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+        repaired = orchestrator.repair_queue_on_load(q_data, successes={}, failed={})
         assert [j["job_id"] for j in repaired] == ["front_job", "keep_row"]
 
         # 停机落盘固化验证：合并序写入 store 后经 crash-safe 落盘，磁盘序
         # 不得被内存中的错误队尾 append 翻转
         state = PipelineState(
-            backend.load_wall(),
+            backend.load_successes(),
             backend.load_failed(),
             backend.load_cursors(),
             repaired,
@@ -464,7 +464,7 @@ class TestRepairFrontPriority:
         backend.enqueue_jobs([{"task_type": "t", "job_id": "tail_job"}])
 
         orchestrator = make_recovery_orchestrator(backend)
-        repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+        repaired = orchestrator.repair_queue_on_load(q_data, successes={}, failed={})
         assert [j["job_id"] for j in repaired] == ["keep_row", "tail_job"]
 
     def test_snapshot_rows_missing_on_disk_are_kept_at_tail(self, tmp_path):
@@ -480,7 +480,7 @@ class TestRepairFrontPriority:
         backend.enqueue_jobs([{"task_type": "t", "job_id": "front_job"}], front=True)
 
         orchestrator = make_recovery_orchestrator(backend)
-        repaired = orchestrator.repair_queue_on_load(q_data, wall={}, failed={})
+        repaired = orchestrator.repair_queue_on_load(q_data, successes={}, failed={})
         assert [j["job_id"] for j in repaired] == ["front_job", "keep_second", "keep_first"]
 
 
@@ -703,10 +703,10 @@ class TestLoadAndRepair:
     def test_load_and_repair_full_flow(self, tmp_path):
         """四连加载 → 交集收敛 → 队列修复 → 挂起恢复 → 残留回收 → 落 store。"""
         backend = InMemoryStateBackend()
-        backend.seed_wall(["t::overlap", "t::done"])
+        backend.seed_successes(["t::overlap", "t::done"])
         backend.append_failed("t::overlap", {"error": "legacy"})
         backend.enqueue_jobs([
-            {"task_type": "t", "job_id": "done", "rerun": "never"},  # wall 残留
+            {"task_type": "t", "job_id": "done", "rerun": "never"},  # successes 残留
             {"task_type": "t", "job_id": "fresh"},
         ])
         backend.set_engine_metadata(
@@ -725,7 +725,7 @@ class TestLoadAndRepair:
         state = orchestrator.load_and_repair()
 
         assert store.state is state
-        assert "t::overlap" not in state.wall and "t::overlap" in state.failed
+        assert "t::overlap" not in state.successes and "t::overlap" in state.failed
         assert [f"{j['task_type']}::{j['job_id']}" for j in state.queue] == ["t::fresh"]
         assert resource_mgr.collect_suspensions() != {}, "挂起与残留信号都必须注入"
         assert list(tmp_path.glob("*.signals.jsonl")) == []

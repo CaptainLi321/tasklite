@@ -4,10 +4,10 @@ Selection 是 TaskLite 的属性（``pipeline.selection(...)`` 配置），不�
 ``run()`` 的参数。两类规则语义严格区分：
 
 - ``Exclude(task_type=...)``：**本次不执行、原样留队**。命中作业不派发、不写
-  attempt 轨迹、不进入 wall/失败档案、不消耗资源与重试预算；其下游因依赖
+  attempt 轨迹、不进入 successes/失败档案、不消耗资源与重试预算；其下游因依赖
   未完成而停摆，但同样留队，下一次 run（上游不再被排除/换运行配置/换策略）自动
   恢复执行。留队是「延迟」而非「失败」。
-- ``Skip(task_type=...)``：**终态跳过**。命中作业从 queue 移除，不进入 wall /
+- ``Skip(task_type=...)``：**终态跳过**。命中作业从 queue 移除，不进入 successes /
   失败档案（既不成功也不失败）；直接或间接依赖它的下游永远无法完成，
   级联判定为跳过（``ERR_DEPENDENCY_SKIPPED``），一并移出 queue，下次运行
   不再重试。Skip 的终态记录落 append-only attempt 轨迹（outcome=skipped）

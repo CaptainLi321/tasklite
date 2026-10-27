@@ -2,7 +2,7 @@
 
 统一内敛：
 1. rerun 四策略矩阵评估（never / on_failure / every_run / on_input_change）
-   ——策略只作用于 wall/failed 拦截点，queue/in-flight 永远算数；
+   ——策略只作用于 successes/failed 拦截点，queue/in-flight 永远算数；
 2. 磁盘文件输入指纹（stat）比对与实例级 stat 缓存；
 3. 任务级默认策略（discovery 注入面）的入队规范化；
 4. 重入队节奏接缝（RequeuePolicy）：重试节奏的唯一出口，默认实现为
@@ -23,7 +23,7 @@ class TerminalHistory(Protocol):
     """准入判定消费的终态历史契约（PipelineState 满足）。"""
 
     @property
-    def wall(self) -> Mapping[str, dict]: ...
+    def successes(self) -> Mapping[str, dict]: ...
 
     @property
     def failed(self) -> Mapping[str, dict]: ...
@@ -39,12 +39,12 @@ class PreflightAction(str, Enum):
 class DecisionReason(str, Enum):
     """预检判定决策归因。"""
 
-    FRESH = "fresh"                        # 全新作业（未命中 wall 亦未命中失败档案）
+    FRESH = "fresh"                        # 全新作业（未命中 successes 亦未命中失败档案）
     EVERY_RUN = "every_run"                # 显式/默认 every_run 策略豁免重跑
     ON_FAILURE_MATCH = "on_failure_match"  # 命中失败档案且策略为 on_failure 放行重跑
-    INPUT_CHANGED = "input_changed"        # 命中 wall 但输入文件指纹发生变化，放行重跑
-    INPUT_UNCHANGED = "input_unchanged"    # 命中 wall 且输入文件指纹无变化，拦截跳过
-    WALL_BLOCKED = "wall_blocked"          # 命中 wall 且策略为 never/on_failure，拦截跳过
+    INPUT_CHANGED = "input_changed"        # 命中 successes 但输入文件指纹发生变化，放行重跑
+    INPUT_UNCHANGED = "input_unchanged"    # 命中 successes 且输入文件指纹无变化，拦截跳过
+    SUCCESS_BLOCKED = "wall_blocked"          # 命中 successes 且策略为 never/on_failure，拦截跳过
     FAILED_BLOCKED = "failed_blocked"      # 命中失败档案且策略为 never，拦截跳过
 
 
@@ -71,7 +71,7 @@ class PreflightDecision:
 class RerunPolicy:
     """rerun 策略矩阵深模块（评估、输入指纹比对与任务级默认策略注入）。
 
-    策略只作用于 wall/failed 拦截点：命中历史终态的作业按矩阵判定拦截
+    策略只作用于 successes/failed 拦截点：命中历史终态的作业按矩阵判定拦截
     或豁免重跑；queue/in-flight 身份永远算数（同一轮内不重复派发）。
     """
 
@@ -103,13 +103,13 @@ class RerunPolicy:
             return True
         return False
 
-    def check_input_changed(self, wall_meta: dict | None) -> bool:
-        """比对 wall 历史输入指纹与当前磁盘文件状态（带 stat 缓存与脏数据容灾）。
+    def check_input_changed(self, success_metadata: dict | None) -> bool:
+        """比对 successes 历史输入指纹与当前磁盘文件状态（带 stat 缓存与脏数据容灾）。
 
-        任一文件输入 size/mtime_ns 变化（或文件消失、或 wall 无历史指纹）
+        任一文件输入 size/mtime_ns 变化（或文件消失、或 successes 无历史指纹）
         → 视为变化（True）→ 重跑。URI 声明不参与比对。
         """
-        prev_inputs = wall_meta.get("inputs") if isinstance(wall_meta, dict) else None
+        prev_inputs = success_metadata.get("inputs") if isinstance(success_metadata, dict) else None
         if not isinstance(prev_inputs, list):
             return True
         for entry in prev_inputs:
@@ -147,8 +147,8 @@ class RerunPolicy:
         job_snapshot_or_rerun: dict | str | None,
         *,
         task_type: str | None = None,
-        wall_meta: dict | None = None,
-        is_wall: bool = False,
+        success_metadata: dict | None = None,
+        is_success: bool = False,
         is_failed: bool = False,
     ) -> PreflightDecision:
         """评估作业是否应当被拦截或放行重跑。"""
@@ -166,7 +166,7 @@ class RerunPolicy:
             rerun = rerun_raw or "never"
 
         # 未命中历史集合
-        if not is_wall and not is_failed:
+        if not is_success and not is_failed:
             return PreflightDecision(
                 action=PreflightAction.RUN,
                 reason=DecisionReason.FRESH,
@@ -189,7 +189,7 @@ class RerunPolicy:
                 )
             return PreflightDecision(
                 action=PreflightAction.SKIP,
-                reason=DecisionReason.WALL_BLOCKED,
+                reason=DecisionReason.SUCCESS_BLOCKED,
                 effective_rerun=rerun,
             )
 
@@ -200,8 +200,8 @@ class RerunPolicy:
                     reason=DecisionReason.ON_FAILURE_MATCH,
                     effective_rerun=rerun,
                 )
-            if is_wall:
-                changed = self.check_input_changed(wall_meta)
+            if is_success:
+                changed = self.check_input_changed(success_metadata)
                 if changed:
                     return PreflightDecision(
                         action=PreflightAction.RUN,
@@ -222,10 +222,10 @@ class RerunPolicy:
             )
 
         # 默认 "never"
-        if is_wall:
+        if is_success:
             return PreflightDecision(
                 action=PreflightAction.SKIP,
-                reason=DecisionReason.WALL_BLOCKED,
+                reason=DecisionReason.SUCCESS_BLOCKED,
                 effective_rerun=rerun,
             )
         return PreflightDecision(
@@ -241,17 +241,17 @@ class RerunPolicy:
     ) -> PreflightDecision:
         """统一极窄准入判定入口：从终态历史契约提取上下文并执行评估。
 
-        ``history`` 为 ``TerminalHistory`` 契约（wall/failed 视图，
+        ``history`` 为 ``TerminalHistory`` 契约（successes/failed 视图，
         PipelineState 满足；调用方传 ``store.state``）。
         """
         uid = job_uid_from_snapshot(job_snapshot)
-        wall_hit = uid in history.wall
+        success_hit = uid in history.successes
         failed_hit = uid in history.failed
-        wall_meta = history.wall.get(uid) if wall_hit else None
+        success_metadata = history.successes.get(uid) if success_hit else None
         return self.evaluate(
             job_snapshot,
-            wall_meta=wall_meta,
-            is_wall=wall_hit,
+            success_metadata=success_metadata,
+            is_success=success_hit,
             is_failed=failed_hit,
         )
 

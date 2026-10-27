@@ -6,26 +6,26 @@
 ``DiscoveryHost`` 公开协议把扫描器挂到宿主上（TaskLite 是其默认实现）。
 任何实现该协议的宿主/测试桩均可直接复用。
 
-「已见集合」的实现载体：框架的 wall/failed 集合
+「已见集合」的实现载体：框架的 successes/failed 集合
 （``ctx.has_succeeded`` / ``ctx.has_failed`` 的 run 派发时刻快照）——
 **无 cursor、无 seen 持久化、无互斥注入、无 poison 表**。
 
-为什么成立：discovery 的 seen 集合与框架 wall/failed 集合是同一份数据
+为什么成立：discovery 的 seen 集合与框架 successes/failed 集合是同一份数据
 （「这个内容处理过了」）——后者由后端 ACID 事务保证完整与持久。
 并发同 cursor_key 扫描无需互斥（「共享可变 seen 集合可被并发 REPLACE
-覆盖」的前提在本模型下不存在）：wall 由后端事务写入，最坏代价
+覆盖」的前提在本模型下不存在）：successes 由后端事务写入，最坏代价
 是重复 fetch，正确性不受影响。
 
 参数与行为要点：
 - ``process_task_type``（必填）：process 子任务的 task_type——整页命中判定
-  按 ``f"{process_task_type}::{content_id}"`` 查询 wall/failed 快照。
+  按 ``f"{process_task_type}::{content_id}"`` 查询 successes/failed 快照。
 - ``cursor_key_func``（可选）：仅作 job_id 命名空间前缀（防止跨分组内容 id
-  碰撞导致 wall 去重误吞），无游标语义。
+  碰撞导致 successes 去重误吞），无游标语义。
 - 坏 item 由 process 子任务的任务层重试/失败档案吸收——子任务进失败档案
   即 ``has_failed`` = 已见，不再重新 spawn；失败档案内容在 failed 快照中算
   「已见」，含坏 item 的页可正常整页命中。
-- wall/failed 快照在 discovery job 派发时固定：同一内容本次 run 内跨页重复
-  出现时会重复 spawn（框架 wall 去重吸收，仅浪费一次 spawn 调用）。
+- successes/failed 快照在 discovery job 派发时固定：同一内容本次 run 内跨页重复
+  出现时会重复 spawn（框架 successes 去重吸收，仅浪费一次 spawn 调用）。
 - 达 ``max_pages`` 截断仅记日志、不落任何游标：下次 run 仍从第 1 页完整重扫。
 
 回调必须为模块级可 pickle 函数（spawn 进程隔离约束，与普通 handler 一致）。
@@ -54,9 +54,9 @@ T2. 当且仅当整页命中时，才说明「本页及以后全是旧内容」�
         后续页仍可能有新内容）。
 T3. 仅「完整扫描」结束（整页命中或空页）才返回成功。中途停止（job 失败/
     重启、id_func 异常中断）**不得**视为完整——本模型无游标可推进，未完成
-    的扫描必须在下一次运行完整重扫（重不漏由确定性 job_id + wall 去重吸收）。
+    的扫描必须在下一次运行完整重扫（重不漏由确定性 job_id + successes 去重吸收）。
     **退化路径例外**：max_pages 截断与 id_func 全失败早停两处实现返回
-    **成功**（进 wall）并打醒目日志——语义上「未完整」由 discovery 默认
+    **成功**（进 successes）并打醒目日志——语义上「未完整」由 discovery 默认
     rerun="every_run" 保证下一会话重扫；若用户将 rerun 覆盖为 never，截断后
     增量链静默死亡（漏内容且无失败信号），需自行权衡。
 T4. **liveness 例外（max_pages 硬上限，默认 1000）**：持续更新源无法整页
@@ -72,17 +72,17 @@ S1. 已见集合是「自首次运行以来见过的所有内容 id 的并集」
 S2. **禁止**把已见集合截断为「最旧 N 个」「最近 N 个」或任何滑动窗口：
     截断后窗口外的已见 id 下次被误判为「新内容」→ 重复处理，且破坏
     T2 的整页命中判定。
-S3. 已见集合 = 框架 wall/failed 快照（``ctx.has_succeeded`` / ``ctx.has_failed``），
+S3. 已见集合 = 框架 successes/failed 快照（``ctx.has_succeeded`` / ``ctx.has_failed``），
     完整与持久由后端 ACID 事务保证。**无独立 seen 持久化、无 compact 编码**
-    ——「百万级 seen」由 wall 表承载（wall 本就是完整历史），语义无损。
-S4. 成员判定 ``f"{process_task_type}::{content_id}" in wall∪failed`` 必须
+    ——「百万级 seen」由 successes 表承载（successes 本就是完整历史），语义无损。
+S4. 成员判定 ``f"{process_task_type}::{content_id}" in successes∪failed`` 必须
     覆盖全部已见 id。
 
 ------------------------------------------------------------------------------
 去重与 job_id —— 必须确定性派生
 ------------------------------------------------------------------------------
 - 同一内容项（同 cursor_key 组 + 内容 id）在**任何运行/重启**中必须生成
-  **相同**的 job_id，使框架的 wall/queue 去重能吸收重复 spawn（崩溃重跑、
+  **相同**的 job_id，使框架的 successes/queue 去重能吸收重复 spawn（崩溃重跑、
   并发重复扫描）。
 - **禁止**用随机后缀（uuid/时间戳）派生 job_id——随机 id 使去重失效，
   同一内容被重复执行。
@@ -115,7 +115,7 @@ S4. 成员判定 ``f"{process_task_type}::{content_id}" in wall∪failed`` 必�
 V1. 契约正确性必须由回归测试固定，至少覆盖：首次全量扫描（空集合 → 逐页
     → 空页终止）；中间翻页运行（部分命中页继续翻，整页命中终止）；重新发现
     含新内容（新 id 被处理，旧 id 被跳过）；源端删除场景（删中间/删最旧/删最新
-    → 不重不漏）；崩溃重跑（wall 快照未推进 → 完整重扫 → 去重吸收）；
+    → 不重不漏）；崩溃重跑（successes 快照未推进 → 完整重扫 → 去重吸收）；
     max_pages 截断不触发 on_missing；id_func 全失败早停不触发
     on_missing；多 cursor_key 组共享 process_task_type 时 on_missing
     只报本组。
@@ -156,8 +156,8 @@ class DiscoveryContext(Protocol):
     """扫描循环需要的最小上下文接口（框架无关）。
 
     语义契约（由宿主保证）：
-    - ``has_succeeded`` / ``has_failed``：派发时刻 wall/failed 快照成员判定；
-    - ``succeeded_or_failed_job_uids``：wall∪failed 的只读快照（full 模式 on_missing 差集用）。
+    - ``has_succeeded`` / ``has_failed``：派发时刻 successes/failed 快照成员判定；
+    - ``succeeded_or_failed_job_uids``：successes∪failed 的只读快照（full 模式 on_missing 差集用）。
     本模块不要求也不探测任何其他 ctx 字段/方法。
     """
 
@@ -210,13 +210,13 @@ class DiscoveryHandler:
 
     框架负责契约规定的全部语义：
       - 从第 1 页起逐页扫描，page 由框架传入，用户 fetch_func 只拉一页；
-      - 「已见」判定 = wall/failed 快照成员判定（``ctx.has_succeeded`` /
+      - 「已见」判定 = successes/failed 快照成员判定（``ctx.has_succeeded`` /
         ``ctx.has_failed``），完整集合由框架保证；
       - 整页命中或空页才终止；仅完整扫描结束才返回成功（本模型无游标，
-        崩溃即整轮重扫，重不漏由确定性 job_id + wall 去重吸收）；
+        崩溃即整轮重扫，重不漏由确定性 job_id + successes 去重吸收）；
       - 每个新 item 以编码后的 content_id 交给 ``process_item_func``，
         用户在其中 spawn 子任务，job_id 直接用框架传入的 content_id；
-      - 防源端删除与记录漂移由「完整 wall/failed 集合 + 整页命中」天然保证。
+      - 防源端删除与记录漂移由「完整 successes/failed 集合 + 整页命中」天然保证。
 
     可 pickle 性：本类是模块级类；回调由用户提供，必须为模块级可 pickle
     函数（与普通 handler 的 spawn 约束一致）。
@@ -237,7 +237,7 @@ class DiscoveryHandler:
         self.id_func = id_func
         self.process_item_func = process_item_func
         # process 子任务的 task_type——整页命中判定用 f"{ptype}::{content_id}"
-        # 查询 wall/failed，必须与用户 spawn 时一致（见 register_discovery
+        # 查询 successes/failed，必须与用户 spawn 时一致（见 register_discovery
         # 的校验：非空 str 且不含 "::"）。
         self.process_task_type = process_task_type
         self.cursor_key_func = cursor_key_func
@@ -273,7 +273,7 @@ class DiscoveryHandler:
 
         prefix 不能是 `key + "_"` 的裸拼接——`_` 属于干净字符集，
         `(key="ab", cid="c_d")` 与 `(key="ab_c", cid="d")` 派生相同 job_id
-        → 跨组碰撞 → wall 去重静默吞内容（数据丢失）。采用 length-prefix
+        → 跨组碰撞 → successes 去重静默吞内容（数据丢失）。采用 length-prefix
         （`{len(key)}:{key}`）：`:` 会被单射转义为 %3A，`%3A` 前的数字给出
         key 长度 → 拼接边界可复原 → 不同 (key, cid) 对永不派生相同字符串
         （单射保持）。
@@ -392,7 +392,7 @@ class DiscoveryHandler:
         while True:
             if page > effective_max_pages:
                 # 页数硬上限。无法整页命中的持续更新源或 full 模式指定页数
-                # 在此停止——已 spawn 的子任务由 wall 吸收；下次 run 从
+                # 在此停止——已 spawn 的子任务由 successes 吸收；下次 run 从
                 # 第 1 页重扫。
                 completed_full = False
                 logger.warning(
@@ -411,7 +411,7 @@ class DiscoveryHandler:
                 completed_full = False
 
             # 整页 id_func 全失败 = 源结构异常：终止本轮扫描避免死循环
-            # （每页都失败、wall 零增长 → max_pages 前先止损），下轮重试。
+            # （每页都失败、successes 零增长 → max_pages 前先止损），下轮重试。
             # 此早停也是不完整扫描——该页 item 及更深页内容仍在源上（只是
             # id_func 解析失败），差集会把这些内容误报为「已删除」。
             if not page_entries:
@@ -422,7 +422,7 @@ class DiscoveryHandler:
                 break
 
             # 单页「部分命中」不算终止——整页命中才说明本页及以后全是旧内容。
-            # 判定依据完整 wall/failed 快照。scan_mode="full" 跳过整页命中
+            # 判定依据完整 successes/failed 快照。scan_mode="full" 跳过整页命中
             # break——一路扫到空页或 max_pages（全量成本只在 fetch，已见
             # 内容仍逐条跳过）。
             page_all_seen = all(
@@ -470,7 +470,7 @@ class DiscoveryHandler:
     ) -> None:
         """full 模式差集报告：「已见但本次未扫到」= 源站删除检测。
 
-        已见集合从 wall/failed 快照筛 process_task_type 前缀；只取本组
+        已见集合从 successes/failed 快照筛 process_task_type 前缀；只取本组
         （cursor_key 命名空间）的已见内容——多组共享 process_task_type 时，
         他组内容在本组 seen_this_run 之外，不过滤会被误报为「已删除」。
 
@@ -509,7 +509,7 @@ class DiscoveryHandler:
             self._report_missing(job, ctx, prefix, seen_this_run, self.on_missing)
         # 本模型无游标可推进——崩溃（fetch 抛异常 → 异常传播，由用户按错误
         # 分类决定重试/失败档案）即整轮重扫；已 spawn 的子任务由确定性
-        # job_id 的 wall 去重吸收，不重不漏。
+        # job_id 的 successes 去重吸收，不重不漏。
         return True
 
 
@@ -531,7 +531,7 @@ def register_discovery(
     """注册纯任务模型增量发现 handler（per REQUIREMENTS CONTRACT）。
 
     按 REQUIREMENTS CONTRACT（T/S/D/M/R 条款）实现，「已见集合」直接
-    使用框架 wall/failed 集合——无 cursor、无 seen 持久化、无 poison 表、
+    使用框架 successes/failed 集合——无 cursor、无 seen 持久化、无 poison 表、
     无同 cursor_key 互斥注入。
 
     Args:
@@ -548,7 +548,7 @@ def register_discovery(
             单射转义编码（不含 "::"、长度受限），可直接用作 ``Job.job_id``；
             spawn 的 task_type 必须是 ``process_task_type``。
         process_task_type: process 子任务的 task_type——整页命中判定按
-            ``f"{process_task_type}::{content_id}"`` 查询 wall/failed，
+            ``f"{process_task_type}::{content_id}"`` 查询 successes/failed，
             与用户 spawn 时必须一致。
         cursor_key_func: 可选。``(payload) -> str``，仅作 job_id 命名空间
             前缀（防跨分组内容 id 碰撞），无任何游标/互斥语义。
@@ -640,7 +640,7 @@ def register_discovery(
         on_missing=on_missing,
     )
     # 框架无关适配：只调用宿主公开协议的两个方法，不触碰任何私有字段/
-    # 内部注册表——并发安全由 wall ACID + 去重保证。
+    # 内部注册表——并发安全由 successes ACID + 去重保证。
     host.register_task(
         task_type,
         handler,

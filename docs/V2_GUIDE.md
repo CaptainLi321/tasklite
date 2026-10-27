@@ -74,7 +74,7 @@ Job 的字段按「规格位 / 实例位」归位：
 - **规格位**（可覆盖 Task 默认）：`task_type` / `job_id` / `payload` / `resources` / `depends_on` / `max_retries` / `timeout_seconds` / `timeout_is_transient` / `rerun`；
 - **实例位**（框架运行期管理）：
   - `attempt_no`——本次激活内尝试序号，**1 起始含首次执行**；预算判定：允许执行条件 `attempt_no <= max_retries + 1`；
-  - `activation_no`——激活代，每次从 wall/failed 拦截点放行重跑时 +1（初激活为 1）；
+  - `activation_no`——激活代，每次从 successes/failed 拦截点放行重跑时 +1（初激活为 1）；
   - `first_enqueued_at`——首次入队时间（UTC ISO），重试不刷新，由 enqueue 摄入管道填充（重试/spawn 回流的作业保留原值）。
 
 ```python
@@ -90,7 +90,7 @@ job = Job(
 job.uid          # "download::img_001"——身份不变式
 ```
 
-`rerun` 四策略：`"never"`（wall/failed 命中即跳过，默认）/ `"on_failure"`（failed 命中重跑）/ `"every_run"`（命中都重跑，成功 REPLACE wall 行且 run_count+1）/ `"on_input_change"`（wall 命中比对输入指纹）。`None` 哨兵可被任务级默认策略（`set_discovery_rerun` 注入面）覆盖，显式值一律尊重。
+`rerun` 四策略：`"never"`（successes/failed 命中即跳过，默认）/ `"on_failure"`（failed 命中重跑）/ `"every_run"`（命中都重跑，成功 REPLACE successes 行且 run_count+1）/ `"on_input_change"`（successes 命中比对输入指纹）。`None` 哨兵可被任务级默认策略（`set_discovery_rerun` 注入面）覆盖，显式值一律尊重。
 
 ### Attempt：执行轨迹（append-only 旁路面）
 
@@ -104,9 +104,9 @@ job.uid          # "download::img_001"——身份不变式
 | `succeeded` | 本次执行成功 |
 | `failed` | 本次执行失败且耗尽预算（job 进失败档案） |
 | `requeued` | 本次执行以重入队收尾（瞬态失败/瞬态信号，job 继续重试） |
-| `skipped` | 激活被终态拦截点跳过（如 wall 命中且策略为 never） |
+| `skipped` | 激活被终态拦截点跳过（如 successes 命中且策略为 never） |
 
-**旁路观测面定位**：attempts 不参与六集合互斥——wall/failed 仍按 uid 唯一终态，「最终状态唯一」与「历史可追溯」由此解耦。查询经后端只读口：
+**旁路观测面定位**：attempts 不参与六集合互斥——successes/failed 仍按 uid 唯一终态，「最终状态唯一」与「历史可追溯」由此解耦。查询经后端只读口：
 
 ```python
 for rec in pipeline.backend.load_attempts("download::img_001"):
@@ -119,7 +119,7 @@ for rec in pipeline.backend.load_attempts("download::img_001"):
 attempts 行（job_uid, activation_no, attempt_no, execution_id, outcome, ...）
     │ job_uid
     ▼
-Job uid = task_type::job_id ──当前终态──▶ wall（成功档案） / failed（失败档案）
+Job uid = task_type::job_id ──当前终态──▶ successes（成功档案） / failed（失败档案）
     │ task_type
     ▼
 Task 规格（进程内 TaskRegistry：handler / 默认资源 / payload_schema / 默认重试与超时）
@@ -200,20 +200,20 @@ pipeline.stop()
 
 入队前可在 `run()` 外使用 `pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))`：仅排除成功档案命中的 Job，保留输入顺序；失败档案或队列中已有的 Job 仍可返回，重跑与队列去重分别由派发和入队处理。
 
-**run/stop 细节**：`run()` 返回 `RunSummary(exit_reason, stats, run_id, duration_seconds)`；`stop()` 请求 DRAINING（不再派发、在途自然完成），`stop(force=True)` 请求 ABORTING（分类消费在途任务）；`run_graceful()` 是统一包装（捕获 KeyboardInterrupt 转 DRAINING）。构造期钩子三件：`on_run_start` / `on_attempt_finished(uid, *, outcome: AttemptFinish)` / `on_run_end(exit_reason)`——同步、主线程、必须轻量非阻塞（抛异常只计数进 `stats["hook_errors"]`）。
+**run/stop 细节**：`run()` 返回 `RunSummary(exit_reason, stats, run_id, duration_seconds)`；`stop()` 请求 DRAINING（不再派发、在途自然完成），`stop(force=True)` 请求 ABORTING（分类消费在途任务）；`run_graceful()` 是统一包装（捕获 KeyboardInterrupt 转 DRAINING）。构造期钩子三件：`on_run_start` / `on_attempt_finished(uid, *, outcome: AttemptOutcome)` / `on_run_end(exit_reason)`——同步、主线程、必须轻量非阻塞（抛异常只计数进 `stats["hook_errors"]`）。
 
-handler 单测用官方构造器：`from tasklite.testing import fake_ctx`——`fake_ctx(job, wall=..., failed=..., cursors=..., resources=..., tmp_root=...)`，不硬编码 JobContext 内部容器结构。
+handler 单测用官方构造器：`from tasklite.testing import fake_ctx`——`fake_ctx(job, successes=..., failed=..., cursors=..., resources=..., tmp_root=...)`，不硬编码 JobContext 内部容器结构。
 
 ---
 
 ## 4. 失败档案（failed）
 
-重试预算耗尽、致命错误、依赖级联等**永久失败**的唯一归宿是失败档案（failed 表；wall/failed 按 uid 互斥且唯一终态）。运维面三 API 均限 `run()` 外调用：
+重试预算耗尽、致命错误、依赖级联等**永久失败**的唯一归宿是失败档案（failed 表；successes/failed 按 uid 互斥且唯一终态）。运维面三 API 均限 `run()` 外调用：
 
 ```python
-# 只读查询：结构化条目（uid / error / meta / job_payload）
+# 只读查询：结构化条目（job_uid / error_message / metadata / payload）
 for entry in pipeline.list_failures():
-    print(entry.uid, entry.error, entry.meta.get("error_type"), entry.job_payload)
+    print(entry.job_uid, entry.error_message, entry.metadata.get("error_type"), entry.payload)
 
 # 批量清理（默认保留 fatal=true 的确定性失败；返回删除数）
 n = pipeline.clear_failures(task_types=["download"], keep_fatal=True)
@@ -222,11 +222,11 @@ n = pipeline.clear_failures(task_types=["download"], keep_fatal=True)
 pipeline.retry_failure("download::img_001")
 ```
 
-- **`FailureEntry`**：`uid`、`error`（原始错误消息/错误码）、`meta`（完整档案元数据视图，含 `error_type` 分类码）、`job_payload`（原始业务 payload 快照——补跑无需外部反查参数；无可存快照时为 None）。
+- **`FailureEntry`**：`job_uid`、`error_message`（原始错误消息/错误码）、`metadata`（完整档案元数据视图，含 `error_type` 分类码）、`payload`（原始业务 payload 快照——补跑无需外部反查参数；无可存快照时为 None）。
 - **`clear_failures(task_types=None, *, keep_fatal=True)`**：按 task_type 前缀匹配删除；`keep_fatal=False` 连确定性失败一并清理。
 - **`retry_failure(uid)`**：失败档案的人工补跑通道。激活代按拦截点放行语义推进——重建作业的 `activation_no` 取该 uid 在 attempts 轨迹中的最大激活代 +1、`attempt_no` 归 1（与 every_run 豁免放行同构，保证 attempts 表 `(activation_no, attempt_no)` 逻辑键不撞号）；payload 取档案快照，先入队后删行（崩溃窗口至多留下 queue∩failed 并存，由加载期修复收敛，不丢作业）。
 
-**与 attempts 轨迹的关系**：failed 表回答「当前终态是什么」（每 uid 至多一行，成功即被 wall 侧取代），attempts 表回答「历史上每次执行发生了什么」（append-only，永不删行）。`retry_failure` 补跑后，attempts 中旧的 `outcome="failed"` 行保留为轨迹证据，新激活以新 `(activation_no, attempt_no)` 追加——「最终状态唯一」与「历史可追溯」经两张面解耦。
+**与 attempts 轨迹的关系**：failed 表回答「当前终态是什么」（每 uid 至多一行，成功即被 successes 侧取代），attempts 表回答「历史上每次执行发生了什么」（append-only，永不删行）。`retry_failure` 补跑后，attempts 中旧的 `outcome="failed"` 行保留为轨迹证据，新激活以新 `(activation_no, attempt_no)` 追加——「最终状态唯一」与「历史可追溯」经两张面解耦。
 
 ---
 
@@ -309,7 +309,7 @@ Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」�
 | `TaskLite.clear_dlq` | `TaskLite.clear_failures` |
 | `DLQEntry` | `FailureEntry` |
 | `TaskContext` | `JobContext` |
-| `on_job_completed(uid, meta, success, going_to_retry)` | `on_attempt_finished(uid, *, outcome: AttemptFinish)` |
+| `on_job_completed(uid, meta, success, going_to_retry)` | `on_attempt_finished(uid, *, outcome: AttemptOutcome)` |
 | `Job(..., retries=...)` 构造参数 | 废除——预算位收敛 `max_retries`（允许执行条件 `attempt_no <= max_retries + 1`） |
 | `sanitize_identifier` / `sanitize_job_component` / `sanitize_content_id` | `encode_identifier` / `encode_job_component` / `encode_content_id` |
 | `escape_injective` | `percent_encode` |
@@ -319,7 +319,7 @@ Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」�
 | `AdmissionPolicy`（policy.py） | `RerunPolicy`（admission.py） |
 | `BackoffGovernor` / `plan_retry` 退避计算 | 删除——`RequeuePolicy` seam 接管（默认 `ImmediateRequeuePolicy`） |
 
-其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`wall` / `seed_wall` / `seed_cursor` / `content_fingerprint` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。执行身份与文件名编码现使用 `execution_id` 和 `encode_job_uid_filename`；schema 3 的 SQL 列与 IPC 文件名字节保持不变。
+其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`seed_cursor` / `content_fingerprint` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。成功档案 Python API 现使用 `successes` / `load_successes` / `delete_successes` / `seed_successes`；`AttemptOutcome` 使用 `success`、`will_retry`、`metadata`，`ExecutionResult` 与 `JobContext` 的 Job 对象列表使用 `spawned_jobs`。当前仍按 schema 3 读写唯一旧 SQL 表 `wall`、attempts 列 `error` 和 worker 消息键 `new_jobs`，不提供旧 Python 别名。执行身份与文件名编码现使用 `execution_id` 和 `encode_job_uid_filename`；schema 3 的 SQL 列与 IPC 文件名字节保持不变。
 
 ---
 
@@ -358,14 +358,14 @@ pipeline.selection()                            # 重置：恢复全执行
 
 ### 8.1 Exclude（延迟语义：留队、下次自动重试）
 
-- 命中作业不派发、不写 attempt 轨迹、不进入 wall/失败档案、不消耗 worker/资源与重试预算，队列行原样保留；
+- 命中作业不派发、不写 attempt 轨迹、不进入 successes/失败档案、不消耗 worker/资源与重试预算，队列行原样保留；
 - 其下游允许作业同样留队，本次 run 报 `ERR_DEPENDENCY_EXCLUDED` 并计入 `stats["excluded_blocked"]`，下一次 run（去掉 Exclude / 换 run 配置）自动恢复执行；
-- 停摆仲裁用 **Kahn 入度消减**（初始波前 = `wall_uids | excluded_uids`）严格区分：允许作业存在依赖环/缺口时按既有 governor 归因熔断（`ERR_DEPENDENCY_DEADLOCK` / `ERR_DEADLOCK_GAP` / `ERR_RESOURCE_DEADLOCK` / `ERR_MALFORMED_JOB`），绝不因 Exclude 命中而掩盖；仅当剩余允许作业全部可消减且仅被 Exclude 阻塞时，`run()` 以 `ExitReason.COMPLETED` 收敛并保留队列（无固定等待、无忙旋）；
+- 停摆仲裁用 **Kahn 入度消减**（初始波前 = `success_job_uids | excluded_uids`）严格区分：允许作业存在依赖环/缺口时按既有 governor 归因熔断（`ERR_DEPENDENCY_DEADLOCK` / `ERR_DEADLOCK_GAP` / `ERR_RESOURCE_DEADLOCK` / `ERR_MALFORMED_JOB`），绝不因 Exclude 命中而掩盖；仅当剩余允许作业全部可消减且仅被 Exclude 阻塞时，`run()` 以 `ExitReason.COMPLETED` 收敛并保留队列（无固定等待、无忙旋）；
 - 终态写入出口隔离：被排除 uid 不进入失败档案（父失败级联不传播、批量熔断被过滤）。
 
 ### 8.2 Skip（终态语义：跳过、下游级联、不再重试）
 
-- 命中作业从 queue 移除，不进入 wall、不进入失败档案（既不成功也不失败），`stats["skipped"]` 计数，审计落 append-only attempts（`outcome="skipped"`，错误码 `SKIPPED`）；
+- 命中作业从 queue 移除，不进入 successes、不进入失败档案（既不成功也不失败），`stats["skipped"]` 计数，审计落 append-only attempts（`outcome="skipped"`，错误码 `SKIPPED`）；
 - 直接或间接依赖 Skip 作业的下游永远无法完成，整链级联跳过（attempt 错误码 `DEPENDENCY_SKIPPED`，含上游 uid），一并从 queue 移除，下次运行不再重试；
 - Skip 与 Exclude 同时命中时 **Skip 优先**（终态意图强于延迟意图）；Skip 级联同样优先于 Exclude——被 Skip 上游永久堵死的 Exclude 作业也一并终态跳过；
 - **判定优先级**：Skip 级联阶段在停摆仲裁之前执行——Skip 子树内即便存在依赖环/缺口，也一律按 `DEPENDENCY_SKIPPED` 归因（Skip 上游是永久死因，环是否可解已无调度意义）；Exclude 则相反，允许作业残图中的环/缺口优先按死锁归因熔断（§8.1）；

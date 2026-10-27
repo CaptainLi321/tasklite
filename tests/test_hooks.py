@@ -1,7 +1,7 @@
 """v2 用户钩子三件套回归（job_ref / progress_hook / slice_list）。
 
 契约：progress_hook 适配 v2 的 on_attempt_finished(uid, *, outcome)
-钩子形状（AttemptFinish 值对象承载布尔语义）；slice_list 的三个数值
+钩子形状（AttemptOutcome 值对象承载布尔语义）；slice_list 的三个数值
 参数 keyword-only（语义易混，裸位置传参会被类型检查静默放行）。
 """
 from __future__ import annotations
@@ -11,12 +11,12 @@ from contextlib import redirect_stdout
 
 import pytest
 
-from tasklite.engine.types import AttemptFinish
+from tasklite.engine.types import AttemptOutcome
 from tasklite.hooks import job_ref, progress_hook, slice_list
 
 
 class TestJobRef:
-    """result_meta 引用提取优先级：post_id > artist > id。"""
+    """result_metadata 引用提取优先级：post_id > artist > id。"""
 
     def test_post_id_first(self):
         assert job_ref({"post_id": 123}) == "#123"
@@ -47,8 +47,8 @@ class TestProgressHook:
         with redirect_stdout(buf):
             progress_hook(
                 "fetch::p1",
-                outcome=AttemptFinish(
-                    success=True, going_to_retry=False, meta={"post_id": 10}
+                outcome=AttemptOutcome(
+                    success=True, will_retry=False, metadata={"post_id": 10}
                 ),
             )
         assert "✓ fetch #10" in buf.getvalue()
@@ -58,8 +58,8 @@ class TestProgressHook:
         with redirect_stdout(buf):
             progress_hook(
                 "fetch::p2",
-                outcome=AttemptFinish(
-                    success=False, going_to_retry=True, meta={"artist": "bob"}
+                outcome=AttemptOutcome(
+                    success=False, will_retry=True, metadata={"artist": "bob"}
                 ),
             )
         assert "⟳ fetch bob 失败，重入队重试" in buf.getvalue()
@@ -69,7 +69,7 @@ class TestProgressHook:
         with redirect_stdout(buf):
             progress_hook(
                 "fetch::p3",
-                outcome=AttemptFinish(success=False, going_to_retry=False, meta={}),
+                outcome=AttemptOutcome(success=False, will_retry=False, metadata={}),
             )
         assert "✗ fetch → 失败档案" in buf.getvalue()
 
@@ -78,7 +78,7 @@ class TestProgressHook:
         with redirect_stdout(buf):
             progress_hook(
                 "fetch::p4",
-                outcome=AttemptFinish(success=True, going_to_retry=False, meta={}),
+                outcome=AttemptOutcome(success=True, will_retry=False, metadata={}),
             )
         assert "✓ fetch" in buf.getvalue()
         assert "✓ fetch " not in buf.getvalue()

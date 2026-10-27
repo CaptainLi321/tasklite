@@ -87,21 +87,21 @@ def _normalize_handler_result(result: Any) -> tuple[bool, dict[str, Any]]:
     return False, {"error": f"invalid handler return type: {type(result).__name__}"}
 
 
-def _parse_spawned_jobs(raw_new_jobs: Any) -> tuple[list[Job], str | None]:
+def _parse_spawned_jobs(raw_spawned_jobs: Any) -> tuple[list[Job], str | None]:
     """解析结果文件的 new_jobs 字段；坏形态收敛为错误串，绝不抛 TypeError。
 
     不变式：结果文件任何异常形态都收敛为任务级失败记账，不得以
     TypeError 穿透收割/认领链使单任务损坏放大为整管崩溃。
     """
-    if not isinstance(raw_new_jobs, list):
-        return [], f"invalid new_jobs type: {type(raw_new_jobs).__name__}"
-    new_jobs: list[Job] = []
-    for job_snapshot in raw_new_jobs:
+    if not isinstance(raw_spawned_jobs, list):
+        return [], f"invalid new_jobs type: {type(raw_spawned_jobs).__name__}"
+    spawned_jobs: list[Job] = []
+    for job_snapshot in raw_spawned_jobs:
         try:
-            new_jobs.append(Job.from_dict(job_snapshot))
+            spawned_jobs.append(Job.from_dict(job_snapshot))
         except (KeyError, TypeError, ValueError) as e:
             return [], f"invalid spawned job dict: {e}"
-    return new_jobs, None
+    return spawned_jobs, None
 
 
 def _parse_cursor_updates(raw_cursors: Any) -> tuple[dict[str, str | None], str | None]:
@@ -138,15 +138,15 @@ def _parse_resource_suspensions(
 def _decode_success_branch(res: dict, job: Job) -> tuple[bool, dict[str, Any], list[Job], dict[str, str | None], list[tuple[str, float]]]:
     """success 状态解码：raw_result 还原归一 + 三个子字段防御解析。
 
-    返回 (success, result_meta, new_jobs, cursor_updates, resource_suspensions)；
-    任一子段损坏即 success=False 且 result_meta 携带错误串（不抛异常）。
+    返回 (success, result_metadata, spawned_jobs, cursor_updates, resource_suspensions)；
+    任一子段损坏即 success=False 且 result_metadata 携带错误串（不抛异常）。
     """
     if "raw_result" not in res:
         logger.error(f"Corrupt result file for {job.uid}: missing 'raw_result' key")
         return False, {"error": "CORRUPT_RESULT_FILE: missing raw_result"}, [], {}, []
     try:
         raw_result = _decode_raw_result(res["raw_result"])
-        success, result_meta = _normalize_handler_result(raw_result)
+        success, result_metadata = _normalize_handler_result(raw_result)
     except Exception as e:
         logger.error(f"Result decode failed for {job.uid}: {e}")
         return False, {
@@ -154,13 +154,13 @@ def _decode_success_branch(res: dict, job: Job) -> tuple[bool, dict[str, Any], l
             _KEY_TRACEBACK: traceback.format_exc(),
         }, [], {}, []
 
-    new_jobs, jobs_error = _parse_spawned_jobs(res.get("new_jobs", []))
+    spawned_jobs, jobs_error = _parse_spawned_jobs(res.get("new_jobs", []))
     if jobs_error is not None:
         logger.error(f"Malformed spawned jobs in {job.uid}: {jobs_error}")
         return False, {"error": jobs_error}, [], {}, []
 
     if not success:
-        return False, result_meta, [], {}, []
+        return False, result_metadata, [], {}, []
 
     cursor_updates, cursor_error = _parse_cursor_updates(res.get("cursor_updates", {}))
     if cursor_error is not None:
@@ -172,7 +172,7 @@ def _decode_success_branch(res: dict, job: Job) -> tuple[bool, dict[str, Any], l
     if suspension_error is not None:
         logger.error(f"Invalid resource_suspensions in {job.uid}: {suspension_error}")
         return False, {"error": suspension_error}, [], {}, []
-    return True, result_meta, new_jobs, cursor_updates, suspensions
+    return True, result_metadata, spawned_jobs, cursor_updates, suspensions
 
 
 def _decode_ipc_result(
@@ -190,10 +190,10 @@ def _decode_ipc_result(
     决策表（信号死亡与正码崩溃同表同形）。
     """
     success = False
-    result_meta: dict[str, Any] = {}
+    result_metadata: dict[str, Any] = {}
     retry_requested = False
     retry_error: str | None = None
-    new_jobs: list[Job] = []
+    spawned_jobs: list[Job] = []
     cursor_updates: dict[str, str | None] = {}
     resource_suspensions: list[tuple[str, float]] = []
     transient_kind: str | None = None
@@ -202,8 +202,8 @@ def _decode_ipc_result(
     if status == "success":
         (
             success,
-            result_meta,
-            new_jobs,
+            result_metadata,
+            spawned_jobs,
             cursor_updates,
             resource_suspensions,
         ) = _decode_success_branch(res, job)
@@ -217,14 +217,14 @@ def _decode_ipc_result(
         retry_error = res.get("error")
         transient_kind = "interrupted"
     elif status == "fatal":
-        result_meta = {
+        result_metadata = {
             "error": res.get("error", "FATAL (no message)"),
             _KEY_TRACEBACK: res.get(_KEY_TRACEBACK),
             "fatal": True,
         }
         logger.error(f"Fatal error in {job.uid}:\n{res.get(_KEY_TRACEBACK, '')}")
     elif status is not None:
-        result_meta = {
+        result_metadata = {
             "error": res.get("error", f"unknown status {status!r}"),
             _KEY_TRACEBACK: res.get(_KEY_TRACEBACK),
         }
@@ -234,7 +234,7 @@ def _decode_ipc_result(
         att = _DEFAULT_CLASSIFIER.classify_process_death(
             getattr(p, "exitcode", None), timed_out=False
         )
-        result_meta = att.result_meta
+        result_metadata = att.result_metadata
         retry_error = att.retry_error
         retry_requested = att.retry_requested
 
@@ -243,14 +243,14 @@ def _decode_ipc_result(
         if not ok:
             logger.error(f"Verification failed for {job.uid}: {err}")
             success = False
-            result_meta = {"error": err}
+            result_metadata = {"error": err}
 
     return ExecutionResult(
         success=success,
-        result_meta=result_meta,
+        result_metadata=result_metadata,
         retry_requested=retry_requested,
         retry_error=retry_error,
-        new_jobs=new_jobs,
+        spawned_jobs=spawned_jobs,
         cursor_updates=cursor_updates,
         resource_suspensions=resource_suspensions,
         transient_kind=transient_kind,
@@ -309,7 +309,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         _write_result({
             "status": "success",
             "raw_result": _encode_raw_result(raw_result),
-            "new_jobs": [j.to_dict() for j in ctx.new_jobs],
+            "new_jobs": [j.to_dict() for j in ctx.spawned_jobs],
             "resource_suspensions": ctx.resource_suspensions,
             "cursor_updates": ctx.cursor_updates,
         })
@@ -372,14 +372,14 @@ class ExecutionResult:
     """单次子进程执行的收割产物（收割/认领/中止三路径共形）。"""
 
     success: bool = False
-    result_meta: dict[str, Any] = field(default_factory=dict)
+    result_metadata: dict[str, Any] = field(default_factory=dict)
     retry_requested: bool = False
     retry_error: str | None = None
-    new_jobs: list[Job] = field(default_factory=list)
+    spawned_jobs: list[Job] = field(default_factory=list)
     cursor_updates: dict[str, str | None] = field(default_factory=dict)
     resource_suspensions: list[tuple[str, float]] = field(default_factory=list)
     transient_kind: str | None = None
-    going_to_retry: bool = False
+    will_retry: bool = False
 
 
 @dataclass(frozen=True)
@@ -502,7 +502,7 @@ class ExecutionChannel:
     def _read_authenticated_result(self, path: Path) -> dict | None:
         """读取侧强校验结果认证令牌，不匹配按无结果丢弃（瞬态、零预算）。
 
-        威胁模型：ipc_dir 写入者可伪造结果文件驱动 wall 投毒、new_jobs
+        威胁模型：ipc_dir 写入者可伪造结果文件驱动 successes 投毒、new_jobs
         子任务注入与 cursor 投毒；令牌不匹配的结果绝不进入解码管线。
         """
         res = self.journal.read_result(path)
@@ -666,14 +666,14 @@ class ExecutionChannel:
             timeout_seconds=handle.timeout_seconds,
             timeout_is_transient=getattr(handle.job, "timeout_is_transient", False),
         )
-        if att.retry_requested and "signal" in att.result_meta:
+        if att.retry_requested and "signal" in att.result_metadata:
             logger.warning(
-                f"Worker for {handle.job_uid} died by {att.result_meta['signal']}; "
+                f"Worker for {handle.job_uid} died by {att.result_metadata['signal']}; "
                 f"will retry (requeue pacing is owned by RequeuePolicy)"
             )
         return ExecutionResult(
             success=False,
-            result_meta=att.result_meta,
+            result_metadata=att.result_metadata,
             retry_requested=att.retry_requested,
             retry_error=att.retry_error,
         )

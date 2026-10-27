@@ -6,7 +6,7 @@
 - Job 终结事务唯一经由本模块的 apply_* 出口族收敛（成功 / 失败 / 重试 /
   跳过 / 批量失败 / 级联）——backend commit + 内存镜像 + 统计 + 级联
   在同一出口内对齐，内存永不领先磁盘；
-- 失败终态内存登记唯一经由 ``mark_failed_memory``（wall/failed 互斥的
+- 失败终态内存登记唯一经由 ``mark_failed_memory``（successes/failed 互斥的
   单点维护）；
 - attempt 收尾事件钩子唯一经由 ``fire_attempt_finished`` 触发（异常隔离
   + hook_errors 计数）；
@@ -38,7 +38,7 @@ from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import dumps
 from .admission import ImmediateRequeuePolicy, RequeuePolicy, RerunPolicy
 from .errorclass import ERR_COMMIT_FAILURE, ERR_JOB_DEPENDENCY, ErrorClassifier
-from .types import TRANSIENT_KIND_STAT_KEYS, AttemptFinish
+from .types import TRANSIENT_KIND_STAT_KEYS, AttemptOutcome
 
 logger = logging.getLogger("tasklite")
 
@@ -51,38 +51,38 @@ COMMIT_FAILURE_THRESHOLD = 3
 class FailureEntry:
     """失败档案只读查询的结构化不可变条目（运维查询面的载荷形状）。
 
-    - ``uid``: 作业唯一标识 (task_type::job_id)
-    - ``error``: 原始错误消息/错误码
-    - ``meta``: 完整失败档案 meta 字典视图
-    - ``job_payload``: 原始业务 payload 快照（失败落盘无可存快照时为 None）
+    - ``job_uid``: 作业唯一标识 (task_type::job_id)
+    - ``error_message``: 原始错误消息/错误码
+    - ``metadata``: 完整失败档案 meta 字典视图
+    - ``payload``: 原始业务 payload 快照（失败落盘无可存快照时为 None）
     """
 
-    uid: str
-    error: str
-    meta: dict[str, Any]
-    job_payload: dict[str, Any] | None = None
+    job_uid: str
+    error_message: str
+    metadata: dict[str, Any]
+    payload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class SuccessOutcome:
     """apply_success 原子转移结果。"""
-    uid: str
-    wall_meta: dict[str, Any]
+    job_uid: str
+    success_metadata: dict[str, Any]
     spawned_uids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class FailureOutcome:
     """apply_failure 原子转移结果。"""
-    uid: str
-    error_meta: dict[str, Any]
+    job_uid: str
+    failure_metadata: dict[str, Any]
     cascaded_uids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class RetryOutcome:
     """apply_retry 原子转移结果。"""
-    uid: str
+    job_uid: str
     retry_job_snapshot: dict[str, Any]
     transient_kind: str | None = None
 
@@ -90,7 +90,7 @@ class RetryOutcome:
 @dataclass(frozen=True)
 class SkipOutcome:
     """apply_skip 原子转移结果。"""
-    uid: str
+    job_uid: str
     was_known: bool
 
 
@@ -179,7 +179,7 @@ class StateStore:
                 excluded.add(job.uid)
         return frozenset(excluded)
 
-    def fire_attempt_finished(self, uid: str, *, outcome: AttemptFinish) -> None:
+    def fire_attempt_finished(self, job_uid: str, *, outcome: AttemptOutcome) -> None:
         """attempt 收尾事件钩子的单一出口（异常隔离 + hook_errors 计数）。
 
         钩子在统计更新之后触发（调用方保证），钩子内读统计一致；钩子
@@ -188,13 +188,13 @@ class StateStore:
         if self._on_attempt_finished is None:
             return
         try:
-            self._on_attempt_finished(uid, outcome=outcome)
+            self._on_attempt_finished(job_uid, outcome=outcome)
         except Exception as e:
-            logger.warning(f"on_attempt_finished hook raised for {uid}: {e}")
+            logger.warning(f"on_attempt_finished hook raised for {job_uid}: {e}")
             self._record_stat("hook_errors", 1)
 
     def _finish_attempt(
-        self, attempt_id: int | None, *, outcome: str, error: str | None = None
+        self, attempt_id: int | None, *, outcome: str, error_message: str | None = None
     ) -> None:
         """attempts 旁路轨迹行收尾；失败降级告警，绝不阻断主事务。
 
@@ -208,7 +208,7 @@ class StateStore:
                 attempt_id,
                 outcome=outcome,
                 finished_at=utc_now_iso(),
-                error=error,
+                error_message=error_message,
             )
         except Exception as e:
             logger.warning(
@@ -217,10 +217,10 @@ class StateStore:
             )
 
     @staticmethod
-    def _attempt_error(meta: Mapping[str, Any]) -> str | None:
+    def _attempt_error(metadata: Mapping[str, Any]) -> str | None:
         """从失败 meta 提取轨迹行错误串（空串收敛为 None）。"""
-        error = str(meta.get("error") or "")
-        return error or None
+        error_message = str(metadata.get("error") or "")
+        return error_message or None
 
     # ── 摄入管道（enqueue / spawn）──────────────────────────────────
 
@@ -245,9 +245,9 @@ class StateStore:
             try:
                 dumps(job.get("payload", {}))
             except (TypeError, ValueError) as e:
-                uid = job_uid_from_snapshot(job)
+                job_uid = job_uid_from_snapshot(job)
                 raise ValueError(
-                    f"Payload for job {uid} is not JSON-serializable: {e}"
+                    f"Payload for job {job_uid} is not JSON-serializable: {e}"
                 ) from e
             job_snapshot = copy.deepcopy(job)
         else:
@@ -321,7 +321,7 @@ class StateStore:
         *,
         transient_kind: str,
         attempt_id: int | None = None,
-        error: str | None = None,
+        error_message: str | None = None,
     ) -> None:
         """瞬态信号降级回队的单一出口（军规：零预算 + 立即重入队 + 零污染）。
 
@@ -336,17 +336,17 @@ class StateStore:
         stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
         if stat_key:
             self._record_stat(stat_key, 1)
-        self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error=error)
+        self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error_message=error_message)
 
     def finish_attempt(
-        self, attempt_id: int | None, *, outcome: str, error: str | None = None
+        self, attempt_id: int | None, *, outcome: str, error_message: str | None = None
     ) -> None:
         """attempts 旁路轨迹行收尾的公开接缝（不经 apply_* 事务的路径使用）。
 
         典型消费方：派发机器的异常分支 requeue（未走 apply_retry 事务但
         本次执行已终结为重入队）。收尾失败降级告警，不阻断主流程。
         """
-        self._finish_attempt(attempt_id, outcome=outcome, error=error)
+        self._finish_attempt(attempt_id, outcome=outcome, error_message=error_message)
 
     def record_attempt_dispatch(
         self,
@@ -379,7 +379,7 @@ class StateStore:
     def record_attempt_skip(
         self,
         job: Job,
-        error: str,
+        error_message: str,
         *,
         run_id: str | None,
         seq: int,
@@ -405,7 +405,7 @@ class StateStore:
                 attempt_id,
                 outcome=ATTEMPT_SKIPPED,
                 finished_at=now,
-                error=error,
+                error_message=error_message,
             )
         except Exception as e:
             logger.warning(
@@ -416,18 +416,18 @@ class StateStore:
     # ── 内存状态受控接缝 ─────────────────────────────────────────────
 
     def mark_failed_memory(
-        self, uid: str, meta: dict[str, Any], *, unregister: bool = True
+        self, job_uid: str, metadata: dict[str, Any], *, unregister: bool = True
     ) -> None:
-        """失败终态内存登记的唯一尾段（wall/failed 互斥单点维护）。
+        """失败终态内存登记的唯一尾段（successes/failed 互斥单点维护）。
 
         先经失败档案元数据规范化，再落 failed 集合——state.mark_failed
-        同步摘除 wall 同名行（成功/失败互删语义）；``unregister=False``
+        同步摘除 successes 同名行（成功/失败互删语义）；``unregister=False``
         供批量崩溃契约路径先登记、由调用方统一处置在途集合。
         """
-        normalized = self._classifier.normalize_failed_meta(meta)
-        self._state.mark_failed(uid, normalized)
+        normalized = self._classifier.normalize_failure_metadata(metadata)
+        self._state.mark_failed(job_uid, normalized)
         if unregister:
-            self._state.unregister_in_flight(uid)
+            self._state.unregister_in_flight(job_uid)
 
     @property
     def state(self) -> PipelineState:
@@ -457,8 +457,8 @@ class StateStore:
 
     def apply_success(
         self,
-        uid: str,
-        result_meta: dict[str, Any],
+        job_uid: str,
+        result_metadata: dict[str, Any],
         *,
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
@@ -467,11 +467,11 @@ class StateStore:
         job_snapshot: dict[str, Any] | None = None,
         attempt_id: int | None = None,
     ) -> SuccessOutcome:
-        """原子终态转移：成功（wall 落盘 + 清失败档案残行 + 子任务/cursor）。"""
-        wall_meta = copy.deepcopy(result_meta) if result_meta else {}
-        wall_meta.setdefault("last_run_at", utc_now_iso())
+        """原子终态转移：成功（successes 落盘 + 清失败档案残行 + 子任务/cursor）。"""
+        success_metadata = copy.deepcopy(result_metadata) if result_metadata else {}
+        success_metadata.setdefault("last_run_at", utc_now_iso())
         if run_id is not None:
-            wall_meta.setdefault("last_run_id", run_id)
+            success_metadata.setdefault("last_run_id", run_id)
         if declared_inputs:
             deduped = {
                 entry.get("path"): entry
@@ -479,22 +479,22 @@ class StateStore:
                 if isinstance(entry, dict) and entry.get("path")
             }
             if deduped:
-                wall_meta["inputs"] = list(deduped.values())
+                success_metadata["inputs"] = list(deduped.values())
 
         # 增量记录 run_count（防御非 int 脏数据；重跑成功从对侧终态续数）
-        prev_meta = self._state.wall.get(uid) or self._state.failed.get(uid)
+        prev_meta = self._state.successes.get(job_uid) or self._state.failed.get(job_uid)
         prev_count = 0
         if isinstance(prev_meta, dict):
             try:
                 prev_count = int(prev_meta.get("run_count", 0))
             except (TypeError, ValueError):
                 prev_count = 0
-        wall_meta["run_count"] = prev_count + 1
+        success_metadata["run_count"] = prev_count + 1
 
         spawned_snapshots = list(spawned_job_snapshots)
         committed = self._backend.commit_job_success(
-            uid,
-            wall_meta,
+            job_uid,
+            success_metadata,
             spawned_job_snapshots=spawned_snapshots,
             cursor_updates=cursor_updates,
         )
@@ -504,52 +504,52 @@ class StateStore:
                 self._state.spawn_jobs(spawned_snapshots, front=True)
             if cursor_updates:
                 self._state.update_cursors(cursor_updates)
-            self._state.mark_success(uid, wall_meta)
-            self._state.unregister_in_flight(uid)
+            self._state.mark_success(job_uid, success_metadata)
+            self._state.unregister_in_flight(job_uid)
             self._record_stat("completed", 1)
             self._finish_attempt(attempt_id, outcome=ATTEMPT_SUCCEEDED)
             spawned_uids = [job_uid_from_snapshot(j) for j in spawned_snapshots]
-            return SuccessOutcome(uid=uid, wall_meta=wall_meta, spawned_uids=spawned_uids)
+            return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata, spawned_uids=spawned_uids)
 
         # commit 失败走 3-strike 收敛契约
-        self.handle_commit_failure_strike(uid, "commit_job_success", job_snapshot, attempt_id=attempt_id)
-        return SuccessOutcome(uid=uid, wall_meta=wall_meta)
+        self.handle_commit_failure_strike(job_uid, "commit_job_success", job_snapshot, attempt_id=attempt_id)
+        return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata)
 
     def apply_failure(
         self,
-        uid: str,
-        error_meta: dict[str, Any],
+        job_uid: str,
+        failure_metadata: dict[str, Any],
         *,
         job_snapshot: dict[str, Any] | None = None,
         count_as: str = "failed",
         cascade: bool = True,
         attempt_id: int | None = None,
     ) -> FailureOutcome:
-        """原子终态转移：永久失败（进入失败档案 + wall 互删 + 级联下游）。"""
-        normalized_meta = self._classifier.normalize_failed_meta(error_meta)
-        job_payload = self._extract_job_payload(job_snapshot)
-        committed = self._backend.commit_job_failure(uid, normalized_meta, job_payload)
+        """原子终态转移：永久失败（进入失败档案 + successes 互删 + 级联下游）。"""
+        normalized_meta = self._classifier.normalize_failure_metadata(failure_metadata)
+        payload = self._extract_job_payload(job_snapshot)
+        committed = self._backend.commit_job_failure(job_uid, normalized_meta, payload)
 
         if committed:
-            self.mark_failed_memory(uid, normalized_meta)
+            self.mark_failed_memory(job_uid, normalized_meta)
             self._record_stat(count_as, 1)
             self._finish_attempt(
                 attempt_id,
                 outcome=ATTEMPT_FAILED,
-                error=self._attempt_error(normalized_meta),
+                error_message=self._attempt_error(normalized_meta),
             )
             cascaded_uids: list[str] = []
             if cascade:
-                cascaded_uids = self.cascade_fail(uid)
-            return FailureOutcome(uid=uid, error_meta=normalized_meta, cascaded_uids=cascaded_uids)
+                cascaded_uids = self.cascade_fail(job_uid)
+            return FailureOutcome(job_uid=job_uid, failure_metadata=normalized_meta, cascaded_uids=cascaded_uids)
 
         self.handle_commit_failure_strike(
-            uid,
+            job_uid,
             self._attempt_error(normalized_meta) or "commit_job_failure",
             job_snapshot,
             attempt_id=attempt_id,
         )
-        return FailureOutcome(uid=uid, error_meta=normalized_meta)
+        return FailureOutcome(job_uid=job_uid, failure_metadata=normalized_meta)
 
     @staticmethod
     def _extract_job_payload(job_snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -575,50 +575,50 @@ class StateStore:
 
     def apply_retry(
         self,
-        uid: str,
+        job_uid: str,
         job_snapshot: dict[str, Any],
         retry_job_snapshot: dict[str, Any],
         *,
         transient_kind: str | None = None,
         attempt_id: int | None = None,
-        error: str | None = None,
+        error_message: str | None = None,
     ) -> RetryOutcome:
         """原子状态转移：重试重入队（节奏经 RequeuePolicy 唯一出口）。"""
         plan = self._requeue_policy.plan_requeue(retry_job_snapshot, transient_kind=transient_kind)
-        committed = self._backend.commit_retry(uid, retry_job_snapshot, front=plan.front)
+        committed = self._backend.commit_retry(job_uid, retry_job_snapshot, front=plan.front)
         if committed:
-            self._state.unregister_in_flight(uid)
+            self._state.unregister_in_flight(job_uid)
             self._state.requeue_jobs([retry_job_snapshot], front=plan.front)
             self._record_stat("retried", 1)
             if transient_kind is not None:
                 stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
                 if stat_key:
                     self._record_stat(stat_key, 1)
-            self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error=error)
-            return RetryOutcome(uid=uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
+            self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error_message=error_message)
+            return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
 
-        self.handle_commit_failure_strike(uid, "commit_retry", job_snapshot, attempt_id=attempt_id)
-        return RetryOutcome(uid=uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
+        self.handle_commit_failure_strike(job_uid, "commit_retry", job_snapshot, attempt_id=attempt_id)
+        return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
 
     def apply_skip(
         self,
-        uid: str,
+        job_uid: str,
         *,
         job_snapshot: dict[str, Any] | None = None,
         attempt_id: int | None = None,
     ) -> SkipOutcome:
-        """原子状态转移：终态跳过（清除磁盘与内存队列，不写 wall/failed）。"""
-        committed = self._backend.commit_skip(uid)
+        """原子状态转移：终态跳过（清除磁盘与内存队列，不写 successes/failed）。"""
+        committed = self._backend.commit_skip(job_uid)
         if committed:
-            self._state.remove_queued_uid(uid)
-            self._state.unregister_in_flight(uid)
+            self._state.remove_queued_uid(job_uid)
+            self._state.unregister_in_flight(job_uid)
             self._record_stat("skipped", 1)
             self._finish_attempt(attempt_id, outcome=ATTEMPT_SKIPPED)
-            return SkipOutcome(uid=uid, was_known=True)
+            return SkipOutcome(job_uid=job_uid, was_known=True)
 
-        self.handle_skip_commit_strike(uid, job_snapshot, attempt_id=attempt_id)
+        self.handle_skip_commit_strike(job_uid, job_snapshot, attempt_id=attempt_id)
         raise AssertionError(  # pragma: no cover - 契约防御
-            f"skip commit strike for {uid} unexpectedly returned normally; "
+            f"skip commit strike for {job_uid} unexpectedly returned normally; "
             f"contract requires raising _CommitCrashSignal."
         )
 
@@ -634,17 +634,17 @@ class StateStore:
         excluded_uids = self._selection_excluded_uids()
         if excluded_uids:
             uids_metas = [
-                (uid, meta) for uid, meta in uids_metas if uid not in excluded_uids
+                (job_uid, metadata) for job_uid, metadata in uids_metas if job_uid not in excluded_uids
             ]
             if not uids_metas:
                 return BulkFailureOutcome(
                     failed_uids=[], remaining_queue_count=len(self._state.queue)
                 )
         normalized_metas = [
-            (uid, self._classifier.normalize_failed_meta(meta))
-            for uid, meta in uids_metas
+            (job_uid, self._classifier.normalize_failure_metadata(metadata))
+            for job_uid, metadata in uids_metas
         ]
-        committed = self._backend.commit_bulk_failure(normalized_metas)
+        committed = self._backend.commit_job_failures(normalized_metas)
 
         if committed:
             failed_set = {u for u, _ in normalized_metas}
@@ -654,12 +654,12 @@ class StateStore:
             ]
             self._state.replace_queue(list(remaining_queue))
             self._record_stat("failed", len(normalized_metas))
-            for uid, meta in normalized_metas:
-                self._state.mark_failed(uid, meta)
-                self._state.unregister_in_flight(uid)
+            for job_uid, metadata in normalized_metas:
+                self._state.mark_failed(job_uid, metadata)
+                self._state.unregister_in_flight(job_uid)
                 self.fire_attempt_finished(
-                    uid,
-                    outcome=AttemptFinish(success=False, going_to_retry=False, meta=meta),
+                    job_uid,
+                    outcome=AttemptOutcome(success=False, will_retry=False, metadata=metadata),
                 )
             return BulkFailureOutcome(
                 failed_uids=[u for u, _ in normalized_metas],
@@ -668,12 +668,12 @@ class StateStore:
 
         # 批量 commit 失败：3-strike 逐条收敛（与级联路径共用单一实现）
         queue, kept_any = self.handle_bulk_failure_strike(
-            "commit_bulk_failure", normalized_metas, list(self._state.queue)
+            "commit_job_failures", normalized_metas, list(self._state.queue)
         )
         self._state.replace_queue(queue)
         if kept_any:
             raise _CommitCrashSignal(
-                f"Backend commit_bulk_failure returned False for "
+                f"Backend commit_job_failures returned False for "
                 f"{len(normalized_metas)} jobs. {len(queue)} kept in queue with "
                 f"incremented commit failure count. Crashing to retry."
             )
@@ -694,14 +694,14 @@ class StateStore:
         )
         if excluded_uids:
             # 兜底过滤：终态写入出口绝不接受被排除 uid（与 DFS 终止点双保险）。
-            cascade_uids = [uid for uid in cascade_uids if uid not in excluded_uids]
+            cascade_uids = [job_uid for job_uid in cascade_uids if job_uid not in excluded_uids]
         if not cascade_uids:
             return []
         cascade_metas = [
-            (uid, {"error": ERR_JOB_DEPENDENCY, "failed_dependency": failed_uid})
-            for uid in cascade_uids
+            (job_uid, {"error": ERR_JOB_DEPENDENCY, "failed_dependency": failed_uid})
+            for job_uid in cascade_uids
         ]
-        committed = self._backend.commit_bulk_failure(cascade_metas)
+        committed = self._backend.commit_job_failures(cascade_metas)
         if committed:
             cascade_set = set(cascade_uids)
             remaining = [
@@ -710,22 +710,22 @@ class StateStore:
             ]
             self._state.replace_queue(remaining)
             self._record_stat("cascade_failed", len(cascade_uids))
-            for uid, meta in cascade_metas:
-                self.mark_failed_memory(uid, meta)
+            for job_uid, metadata in cascade_metas:
+                self.mark_failed_memory(job_uid, metadata)
                 self.fire_attempt_finished(
-                    uid,
-                    outcome=AttemptFinish(success=False, going_to_retry=False, meta=meta),
+                    job_uid,
+                    outcome=AttemptOutcome(success=False, will_retry=False, metadata=metadata),
                 )
             return cascade_uids
 
         # 批量 commit 失败：3-strike 逐条收敛后仍存留则崩溃
         remaining, kept = self.handle_bulk_failure_strike(
-            "commit_bulk_failure", cascade_metas, list(self._state.queue)
+            "commit_job_failures", cascade_metas, list(self._state.queue)
         )
         self._state.replace_queue(remaining)
         if kept:
             raise _CommitCrashSignal(
-                f"Backend commit_bulk_failure returned False for "
+                f"Backend commit_job_failures returned False for "
                 f"{len(cascade_metas)} cascade job(s); {len(remaining)} kept in "
                 f"queue. Crashing to retry; on-disk queue preserved."
             )
@@ -746,7 +746,7 @@ class StateStore:
 
     def handle_commit_failure_strike(
         self,
-        uid: str,
+        job_uid: str,
         reason: str,
         job_snapshot: dict[str, Any] | None = None,
         *,
@@ -761,15 +761,15 @@ class StateStore:
         """
         if job_snapshot is None:
             job_snapshot = {
-                "task_type": uid.split("::")[0],
-                "job_id": uid.split("::")[1],
+                "task_type": job_uid.split("::")[0],
+                "job_id": job_uid.split("::")[1],
             }
 
         failures = self._register_commit_failure(job_snapshot)
 
         if failures >= self._threshold:
             logger.critical(
-                f"Backend commit failed {failures} times for {uid} ({reason}); "
+                f"Backend commit failed {failures} times for {job_uid} ({reason}); "
                 f"treating as deterministic bad input, sending to failure "
                 f"archive instead of crashing."
             )
@@ -779,36 +779,36 @@ class StateStore:
                 "commit_failures": failures,
             }
             strike_committed = self._backend.commit_job_failure(
-                uid, strike_meta, job_payload=self._extract_job_payload(job_snapshot)
+                job_uid, strike_meta, payload=self._extract_job_payload(job_snapshot)
             )
             if strike_committed:
-                self.mark_failed_memory(uid, strike_meta)
+                self.mark_failed_memory(job_uid, strike_meta)
                 self._record_stat("failed", 1)
                 self._finish_attempt(
-                    attempt_id, outcome=ATTEMPT_FAILED, error=ERR_COMMIT_FAILURE
+                    attempt_id, outcome=ATTEMPT_FAILED, error_message=ERR_COMMIT_FAILURE
                 )
                 self.fire_attempt_finished(
-                    uid,
-                    outcome=AttemptFinish(
-                        success=False, going_to_retry=False, meta=strike_meta
+                    job_uid,
+                    outcome=AttemptOutcome(
+                        success=False, will_retry=False, metadata=strike_meta
                     ),
                 )
                 raise _JobTerminated(
-                    f"Job {uid} permanently failed after {failures} commit attempts."
+                    f"Job {job_uid} permanently failed after {failures} commit attempts."
                 )
 
         # 未达阈值或熔断写入仍失败：requeue 并上抛崩溃信号
-        self._requeue_and_crash(uid, job_snapshot, reason, attempt_id=attempt_id)
+        self._requeue_and_crash(job_uid, job_snapshot, reason, attempt_id=attempt_id)
 
     def handle_skip_commit_strike(
         self,
-        uid: str,
+        job_uid: str,
         job_snapshot: dict[str, Any] | None = None,
         *,
         attempt_id: int | None = None,
     ) -> None:
         """commit_skip 失败时的收敛处理：只 requeue + 崩溃，绝不写失败档案。"""
-        self._requeue_and_crash(uid, job_snapshot, "commit_skip", attempt_id=attempt_id)
+        self._requeue_and_crash(job_uid, job_snapshot, "commit_skip", attempt_id=attempt_id)
 
     def handle_bulk_failure_strike(
         self,
@@ -825,27 +825,27 @@ class StateStore:
         """
         queue = list(queue_job_snapshots)
         kept_any = False
-        for uid, _ in uids_metas:
-            matching = [j for j in queue if job_uid_from_snapshot(j) == uid]
+        for job_uid, _ in uids_metas:
+            matching = [j for j in queue if job_uid_from_snapshot(j) == job_uid]
             jd = matching[0] if matching else {
-                "task_type": uid.split("::")[0],
-                "job_id": uid.split("::")[1],
+                "task_type": job_uid.split("::")[0],
+                "job_id": job_uid.split("::")[1],
             }
             failures = self._register_commit_failure(jd)
             if failures >= self._threshold:
-                if self._bulk_strike_finalize(uid, jd, failures=failures):
-                    queue = [j for j in queue if job_uid_from_snapshot(j) != uid]
+                if self._bulk_strike_finalize(job_uid, jd, failures=failures):
+                    queue = [j for j in queue if job_uid_from_snapshot(j) != job_uid]
                     continue
                 logger.critical(
                     f"Bulk 3-strike: failure archive write also failed for "
-                    f"{uid} ({reason}); keeping in queue for next boot."
+                    f"{job_uid} ({reason}); keeping in queue for next boot."
                 )
             kept_any = True
         return queue, kept_any
 
     def _bulk_strike_finalize(
         self,
-        uid: str,
+        job_uid: str,
         job_snapshot: dict[str, Any],
         *,
         failures: int,
@@ -863,33 +863,33 @@ class StateStore:
             "commit_failures": failures,
         }
         single_committed = self._backend.commit_job_failure(
-            uid, strike_meta, job_payload=self._extract_job_payload(job_snapshot)
+            job_uid, strike_meta, payload=self._extract_job_payload(job_snapshot)
         )
         if not single_committed:
             return False
-        self.mark_failed_memory(uid, strike_meta, unregister=False)
+        self.mark_failed_memory(job_uid, strike_meta, unregister=False)
         self._record_stat("failed", 1)
         self.fire_attempt_finished(
-            uid,
-            outcome=AttemptFinish(success=False, going_to_retry=False, meta=strike_meta),
+            job_uid,
+            outcome=AttemptOutcome(success=False, will_retry=False, metadata=strike_meta),
         )
         return True
 
     def _requeue_and_crash(
         self,
-        uid: str,
+        job_uid: str,
         job_snapshot: dict[str, Any] | None,
         reason: str,
         *,
         attempt_id: int | None = None,
     ) -> None:
         """单一出口：所有「commit 失败 → requeue 内存 + 崩溃」路径的收敛点。"""
-        self._state.unregister_in_flight(uid)
+        self._state.unregister_in_flight(job_uid)
         if job_snapshot is not None:
             self._state.requeue_jobs([job_snapshot], front=True)
-        self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error=reason)
+        self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error_message=reason)
         raise _CommitCrashSignal(
-            f"Backend commit returned False for {uid} ({reason}). "
+            f"Backend commit returned False for {job_uid} ({reason}). "
             f"On-disk queue preserved; crashing to avoid unbounded retry loop."
         )
 
