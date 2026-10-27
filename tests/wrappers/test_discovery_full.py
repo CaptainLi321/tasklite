@@ -68,7 +68,7 @@ def _process(job, ctx, item, content_id):
 
 
 def _group_key(payload):
-    return f"g_{payload['group']}"  # 模块级（cursor_key_func 必须可 pickle）
+    return f"g_{payload['group']}"  # 模块级（group_key_func 必须可 pickle）
 
 
 def _child_ok(job, ctx):
@@ -368,7 +368,7 @@ class TestMissingDetection:
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           cursor_key_func=_group_key,
+                           group_key_func=_group_key,
                            scan_mode="full", rerun="never", on_missing=_on_missing)
 
         # 组 A：完整扫描 4 条 → successes
@@ -383,13 +383,11 @@ class TestMissingDetection:
         assert not report.exists()
 
         # 组 A 再次 full 扫描（只 A 的内容 0..3）→ missing 只应含 A 的已删内容
-        # 修复前：known 含 A+B 全部 → B 的 id 8、9 被误报
         p.enqueue([Job("disc", "seedA2", payload={"posts": [{"id": 3}, {"id": 2}],
                                                   "group": "A", "missing_report": str(report)})])
         p.run()
         missing = set(report.read_text().splitlines()) if report.exists() else set()
-        # 本组 missing 恰好 = A 的已删内容（length-prefix：3%3Ag_A）；
-        # 修复前：known 含 A+B → B 的 3%3Ag_B_8/9 误报混入
+        # 本组 missing 恰好 = A 的已删内容（length-prefix：3%3Ag_A）
         assert missing == {"3%3Ag_A0", "3%3Ag_A1"}, f"本组已删应报全、跨组不得误报: {missing}"
 
     def test_on_missing_long_cursor_key_truncated_domain(self, tmp_path):
@@ -402,7 +400,7 @@ class TestMissingDetection:
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           cursor_key_func=_group_key,
+                           group_key_func=_group_key,
                            scan_mode="full", rerun="never", on_missing=_on_missing)
 
         long_a = "a" * 200
@@ -500,7 +498,7 @@ class TestCursorKeyPrefixInjective:
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           cursor_key_func=_group_key,
+                           group_key_func=_group_key,
                            scan_mode="full", rerun="never", on_missing=_on_missing)
         # 组 A：4 条
         p.enqueue([Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],

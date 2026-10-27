@@ -19,7 +19,7 @@
 参数与行为要点：
 - ``process_task_type``（必填）：process 子任务的 task_type——整页命中判定
   按 ``f"{process_task_type}::{content_id}"`` 查询 successes/failed 快照。
-- ``cursor_key_func``（可选）：仅作 job_id 命名空间前缀（防止跨分组内容 id
+- ``group_key_func``（可选）：仅作 job_id 命名空间前缀（防止跨分组内容 id
   碰撞导致 successes 去重误吞），无游标语义。
 - 坏 item 由 process 子任务的任务层重试/失败档案吸收——子任务进失败档案
   即 ``has_failed`` = 已见，不再重新 spawn；失败档案内容在 failed 快照中算
@@ -89,7 +89,7 @@ S4. 成员判定 ``f"{process_task_type}::{content_id}" in successes∪failed`` 
 - job_id 派生 = ``encode_content_id(prefix + content_id)``：content_id
   是框架编码后的单射转义形式（干净 id 原样、脏 id UTF-8 字节百分号转义、
   超长截断 + sha256 指纹，不含 ``::``），**直接**用作子任务 job_id。
-  ``cursor_key_func`` 返回值仅作命名空间前缀（防跨组 id 碰撞），无游标
+  ``group_key_func`` 返回值仅作命名空间前缀（防跨组 id 碰撞），无游标
   语义。派生必须与 ``process_task_type`` 的已见判定一致（同一 content_id）。
 
 ------------------------------------------------------------------------------
@@ -185,7 +185,7 @@ class DiscoveryHost(Protocol):
     def set_discovery_rerun(self, task_type: str, rerun: str) -> None: ...
 
 
-def _in_cursor_group(content_part: str, group_prefix: str) -> bool:
+def _in_discovery_group(content_part: str, group_prefix: str) -> bool:
     """判定编码后的 content 片段是否派生自本 cursor_key 组的未截断转义前缀。
 
     直通域成员恰为 ``group_prefix + percent_encode(cid)``，前缀比较精确；
@@ -228,7 +228,7 @@ class DiscoveryHandler:
         id_func: Callable[[Any], str],
         process_item_func: Callable[[DiscoveryJob, DiscoveryContext, Any, str], None],
         process_task_type: str,
-        cursor_key_func: Callable[[dict[str, Any]], str] | None = None,
+        group_key_func: Callable[[dict[str, Any]], str] | None = None,
         max_pages: int = 1000,
         scan_mode: str = "incremental",
         on_missing: Callable[[DiscoveryJob, DiscoveryContext, list[str]], None] | None = None,
@@ -240,7 +240,7 @@ class DiscoveryHandler:
         # 查询 successes/failed，必须与用户 spawn 时一致（见 register_discovery
         # 的校验：非空 str 且不含 "::"）。
         self.process_task_type = process_task_type
-        self.cursor_key_func = cursor_key_func
+        self.group_key_func = group_key_func
         # 单次扫描的页数硬上限。持续更新的内容源可能永远无法整页命中
         # （新内容不断把旧内容顶到后面）——无上限时扫描无限翻页，直到超时
         # 被 TIMEOUT kill → Unknown → 失败档案不重试 → 发现链死亡。
@@ -269,7 +269,7 @@ class DiscoveryHandler:
         return f"{self.process_task_type}::{content_id}"
 
     def _resolve_prefix(self, job: DiscoveryJob) -> str:
-        """可选命名空间前缀（cursor_key_func 仅作 job_id 分组，无游标语义）。
+        """可选命名空间前缀（group_key_func 仅作 job_id 分组，无游标语义）。
 
         prefix 不能是 `key + "_"` 的裸拼接——`_` 属于干净字符集，
         `(key="ab", cid="c_d")` 与 `(key="ab_c", cid="d")` 派生相同 job_id
@@ -278,12 +278,12 @@ class DiscoveryHandler:
         key 长度 → 拼接边界可复原 → 不同 (key, cid) 对永不派生相同字符串
         （单射保持）。
         """
-        if self.cursor_key_func is None:
+        if self.group_key_func is None:
             return ""
-        key = self.cursor_key_func(job.payload)
+        key = self.group_key_func(job.payload)
         if not isinstance(key, str) or not key:
             raise ValueError(
-                f"cursor_key_func must return a non-empty str, got {key!r}"
+                f"group_key_func must return a non-empty str, got {key!r}"
             )
         return f"{len(key)}:{key}"
 
@@ -476,7 +476,7 @@ class DiscoveryHandler:
 
         组前缀必须用未截断的单射转义形态：编码输出的截断形态尾部带全文
         指纹，两个独立编码值之间不存在前缀关系，组过滤只能依托未截断前缀
-        + 截断头部互补匹配保持精确（_in_cursor_group）。
+        + 截断头部互补匹配保持精确（_in_discovery_group）。
         """
         try:
             known: set[str] = set()
@@ -487,7 +487,7 @@ class DiscoveryHandler:
             for uid in ctx.succeeded_or_failed_job_uids():
                 if uid.startswith(ptype_prefix):
                     content_part = uid[len(ptype_prefix):]
-                    if not group_prefix or _in_cursor_group(content_part, group_prefix):
+                    if not group_prefix or _in_discovery_group(content_part, group_prefix):
                         known.add(content_part)
             missing = sorted(known - seen_this_run)
             if missing:
@@ -520,7 +520,7 @@ def register_discovery(
     id_func: Callable[[Any], str],
     process_item_func: Callable[[DiscoveryJob, DiscoveryContext, Any, str], None],
     process_task_type: str,
-    cursor_key_func: Callable[[dict[str, Any]], str] | None = None,
+    group_key_func: Callable[[dict[str, Any]], str] | None = None,
     resources: dict[str, float] | None = None,
     payload_schema: type | None = None,
     max_pages: int = 1000,
@@ -550,7 +550,7 @@ def register_discovery(
         process_task_type: process 子任务的 task_type——整页命中判定按
             ``f"{process_task_type}::{content_id}"`` 查询 successes/failed，
             与用户 spawn 时必须一致。
-        cursor_key_func: 可选。``(payload) -> str``，仅作 job_id 命名空间
+        group_key_func: 可选。``(payload) -> str``，仅作 job_id 命名空间
             前缀（防跨分组内容 id 碰撞），无任何游标/互斥语义。
         resources: 发现任务自身的默认资源需求。
         payload_schema: 发现任务 payload 的运行时校验 schema。
@@ -597,10 +597,10 @@ def register_discovery(
     ):
         if not callable(fn):
             raise TypeError(f"{name} must be callable, got {type(fn).__name__}")
-    if cursor_key_func is not None and not callable(cursor_key_func):
+    if group_key_func is not None and not callable(group_key_func):
         raise TypeError(
-            f"cursor_key_func must be callable or None, "
-            f"got {type(cursor_key_func).__name__}"
+            f"group_key_func must be callable or None, "
+            f"got {type(group_key_func).__name__}"
         )
     # 代码级强制：discovery 回调必须模块级可 pickle，否则 spawn 子进程
     # 必然失败——把文档约定变成注册期 fail-loud。
@@ -608,7 +608,7 @@ def register_discovery(
         ("fetch_func", fetch_func),
         ("id_func", id_func),
         ("process_item_func", process_item_func),
-        ("cursor_key_func", cursor_key_func),
+        ("group_key_func", group_key_func),
         ("on_missing", on_missing),
     )
     for check_name, check_fn in picklable_checks:
@@ -634,7 +634,7 @@ def register_discovery(
         id_func,
         process_item_func,
         process_task_type,
-        cursor_key_func=cursor_key_func,
+        group_key_func=group_key_func,
         max_pages=max_pages,
         scan_mode=scan_mode,
         on_missing=on_missing,

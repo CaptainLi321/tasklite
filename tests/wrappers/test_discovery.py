@@ -86,7 +86,7 @@ def id_func(item):
     return str(item["id"])
 
 
-def cursor_key_func(payload):
+def group_key_func(payload):
     return f"cursor_{payload['artist_id']}"
 
 
@@ -170,7 +170,7 @@ def _make_ctx(job=None, successes=None, failed=None):
 def _register(pipeline, **kwargs):
     """注册纯 discovery（无命名空间——prefix 为空，编码 = 单层转义）。
 
-    cursor_key_func 命名空间的语义由 test_cursor_key_namespace_prevents_id_collision
+    group_key_func 命名空间的语义由 test_cursor_key_namespace_prevents_id_collision
     单独覆盖；主路径测试用无前缀形态使 successes 快照构造简单且与 handler 一致。
     """
     register_discovery(
@@ -347,7 +347,7 @@ class TestCrashRerun:
         pipeline = _make_pipeline()
         register_discovery(
             pipeline, "discover", crash_fetch, id_func,
-            process_item_func, PTYPE, cursor_key_func=cursor_key_func,
+            process_item_func, PTYPE, group_key_func=group_key_func,
         )
         job = Job("discover", "seed", payload={"artist_id": "123"})
         ctx = _make_ctx(job)
@@ -422,7 +422,7 @@ class TestInteractionMatrix:
         pipeline = _make_pipeline()
         register_discovery(
             pipeline, "discover", fetch_func, id_func, process_item_func,
-            PTYPE, cursor_key_func=cursor_key_func,
+            PTYPE, group_key_func=group_key_func,
         )
         job = Job("discover", "seed", payload={"artist_id": "A"})
         ctx = _make_ctx(job)
@@ -441,16 +441,16 @@ class TestInteractionMatrix:
 
 class TestDefense:
     def test_cursor_key_invalid_rejected(self):
-        """防御：cursor_key_func 返回空串 → fail-loud ValueError。"""
+        """防御：group_key_func 返回空串 → fail-loud ValueError。"""
         _reset_source([{"id": 1}])
         pipeline = _make_pipeline()
 
         register_discovery(
             pipeline, "discover", fetch_func, id_func, process_item_func,
-            PTYPE, cursor_key_func=bad_key,
+            PTYPE, group_key_func=bad_key,
         )
         job = Job("discover", "seed", payload={})
-        with pytest.raises(ValueError, match="cursor_key_func"):
+        with pytest.raises(ValueError, match="group_key_func"):
             _handler(pipeline)(job, _make_ctx(job))
 
     def test_fetch_non_list_rejected(self):
@@ -604,7 +604,7 @@ def test_real_subprocess_discovery(tmp_path, monkeypatch):
     pipeline = _rt_setup(tmp_path, monkeypatch)
     register_discovery(
         pipeline, "rt_disc", _rt_fetch, _rt_id, _rt_process, "rt_child",
-        cursor_key_func=_rt_cursor_key,
+        group_key_func=_rt_cursor_key,
     )
     pipeline.register_task("rt_child", _rt_child_handler)
     pipeline.enqueue([Job("rt_disc", "seed", payload={
@@ -627,7 +627,7 @@ def test_real_subprocess_rediscovery(tmp_path, monkeypatch):
     pipeline = _rt_setup(tmp_path, monkeypatch, name="rt_disc2")
     register_discovery(
         pipeline, "rt_disc2", _rt_fetch, _rt_id, _rt_process, "rt_child",
-        cursor_key_func=_rt_cursor_key,
+        group_key_func=_rt_cursor_key,
     )
     pipeline.register_task("rt_child", _rt_child_handler)
 
