@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from .errorclass import ErrorClassifier
-from .resource import META_RESOURCE_SUSPENSIONS
+from .resource import ENGINE_METADATA_RESOURCE_SUSPENSIONS
 from .store import FailureEntry, StateStore
 from ..models.job import Job
 from ..models.state import job_uid_from_snapshot
@@ -66,7 +66,7 @@ class OpsConsole:
             list[SuspendEntry]: 按 ``resume_at`` 升序（最先解封在前）。
         """
         try:
-            raw = self._store.backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)
+            raw = self._store.backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS)
         except Exception as e:
             logger.warning(f"Failed to load resource suspensions from engine_metadata: {e}")
             return []

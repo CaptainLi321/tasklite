@@ -23,8 +23,8 @@ logger = logging.getLogger("tasklite")
 # 单次挂起的上限（秒）：防止子进程传入 1e12 等超大值永久停摆管线
 _MAX_SUSPEND_SECONDS = 86400.0  # 24h
 
-# 资源挂起截止时刻在 meta 表的持久化键
-META_RESOURCE_SUSPENSIONS = "resource_suspensions"
+# 资源挂起截止时刻在 engine_metadata 表的持久化键
+ENGINE_METADATA_RESOURCE_SUSPENSIONS = "resource_suspensions"
 
 
 class RateLimitUnavailable(RuntimeError):
@@ -37,15 +37,15 @@ class RateLimitUnavailable(RuntimeError):
 
 
 def persist_resource_suspensions(backend: Any, resource_mgr: ResourceManager) -> None:
-    """把资源挂起截止时刻原子落盘到 meta 表（completion/recovery 共享助手）。
+    """把资源挂起截止时刻原子落盘到 engine_metadata 表（completion/recovery 共享助手）。
 
     挂起的应用点即时持久化，消除 kill -9/OOM 时挂起丢失窗口。
     """
     deadlines = resource_mgr.collect_suspensions()
     try:
-        backend.set_engine_metadata(META_RESOURCE_SUSPENSIONS, dumps(deadlines))
+        backend.set_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS, dumps(deadlines))
     except Exception as e:
-        logger.error(f"Failed to persist resource suspensions to meta: {e}")
+        logger.error(f"Failed to persist resource suspensions to engine_metadata: {e}")
 
 
 def apply_suspend_signals(
@@ -638,7 +638,7 @@ class ResourceManager(MutableMapping[str, Resource]):
 
 
 __all__ = [
-    "META_RESOURCE_SUSPENSIONS",
+    "ENGINE_METADATA_RESOURCE_SUSPENSIONS",
     "RateLimitUnavailable",
     "Resource",
     "RateLimitResource",

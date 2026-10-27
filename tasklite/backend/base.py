@@ -46,7 +46,7 @@ def validate_attempt_dispatch(record: Any) -> None:
     """尝试轨迹插入门卫：只接受「派发即插行」形态。
 
     契约（attempts append-only 协议的插入侧）：AttemptRecord 且
-    outcome="running"、finished_at 与 error 均为 None——收尾字段由
+    outcome="running"、finished_at 与 error_message 均为 None——收尾字段由
     ``update_attempt`` 唯一写入；插入侧出现收尾字段说明调用方绕过了
     派发点协议（终态行伪装成派发行，时间线出现空洞），fail-loud 拒绝。
     """
@@ -58,9 +58,9 @@ def validate_attempt_dispatch(record: Any) -> None:
     if record.outcome != "running" or record.finished_at is not None or record.error_message is not None:
         raise ValueError(
             "dispatch append must be a fresh running row "
-            "(outcome='running', finished_at=None, error=None), got "
+            "(outcome='running', finished_at=None, error_message=None), got "
             f"outcome={record.outcome!r} finished_at={record.finished_at!r} "
-            f"error={record.error_message!r}"
+            f"error_message={record.error_message!r}"
         )
 
 
@@ -86,10 +86,10 @@ def validate_attempt_finish(outcome: Any, finished_at: Any, error_message: Any) 
         raise ValueError("finished_at must be a non-empty str")
     if error_message is not None and not isinstance(error_message, str):
         raise TypeError(
-            f"error must be a str or None, got {type(error_message).__name__} ({error_message!r})"
+            f"error_message must be a str or None, got {type(error_message).__name__} ({error_message!r})"
         )
     if error_message == "":
-        raise ValueError("error must be a non-empty str or None")
+        raise ValueError("error_message must be a non-empty str or None")
 
 
 class AbstractStateBackend(ABC):
@@ -133,7 +133,7 @@ class AbstractStateBackend(ABC):
 
     @abstractmethod
     def load_queue(self) -> list[dict[str, Any]]:
-        """按 seq 升序加载磁盘队列真相。"""
+        """按 queue_position 升序加载磁盘队列真相。"""
 
     # 整表重写 -------------------------------------------------------
 
@@ -200,12 +200,12 @@ class AbstractStateBackend(ABC):
     def commit_job_failure(
         self,
         job_uid: str,
-        result_metadata: dict,
+        failure_metadata: dict,
         payload: dict[str, Any] | None = None,
     ) -> bool:
         """原子持久化一个失败 job 的 delta（写入失败档案）。
 
-        单事务效果：failed INSERT/REPLACE uid → result_metadata；
+        单事务效果：failed INSERT/REPLACE uid → failure_metadata；
         queue DELETE uid；successes DELETE 同名行——重跑任务重试耗尽时旧成功
         记录作废（最终状态唯一），否则磁盘 successes∩failed 并存破坏互斥。
         ``payload`` 是原始业务输入快照（补跑自足，无需外部反查）；
@@ -230,10 +230,10 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def commit_job_failures(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
+    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> bool:
         """原子批量写失败档案（死锁/级联场景）的 delta。
 
-        单事务效果：failed INSERT/REPLACE 每个 uid → meta；
+        单事务效果：failed INSERT/REPLACE 每个 uid → metadata；
         queue 按 uid 精准 DELETE（剩余条目保持原顺序）；
         successes 批量 DELETE 同名行（与 commit_job_failure 对称的最终状态唯一）。
         任一行失败 ⇒ 整体回滚、返回 False，绝不留下「队列已删、档案未落」
@@ -348,7 +348,7 @@ class AbstractStateBackend(ABC):
         finished_at: str,
         error_message: str | None = None,
     ) -> bool:
-        """终态/重试时收尾轨迹行：写 finished_at / outcome / error。
+        """终态/重试时收尾轨迹行：写 finished_at / outcome / error_message。
 
         收尾词汇与 ``AttemptRecord`` 一致（succeeded / failed / requeued /
         skipped），running 是插入侧专属形态（``validate_attempt_finish``

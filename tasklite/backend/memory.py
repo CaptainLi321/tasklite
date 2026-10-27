@@ -37,7 +37,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         self._lock = threading.RLock()
         self._successes: dict[str, dict[str, Any]] = {}
         self._failed: dict[str, dict[str, Any]] = {}
-        self._failed_payloads: dict[str, dict[str, Any]] = {}
+        self._failure_payloads: dict[str, dict[str, Any]] = {}
         self._cursors: dict[str, str] = {}
         self._queue: list[dict[str, Any]] = []
         self._engine_metadata: dict[str, str] = {}
@@ -57,7 +57,7 @@ class InMemoryStateBackend(AbstractStateBackend):
     def load_failure_payloads(self) -> dict[str, dict[str, Any]]:
         """读取失败档案各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
         with self._lock:
-            return copy.deepcopy(self._failed_payloads)
+            return copy.deepcopy(self._failure_payloads)
 
     def load_cursors(self) -> dict[str, str]:
         with self._lock:
@@ -152,7 +152,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 # 成功 commit 清理 failed 同名残行：与「job 最终状态唯一」
                 # 语义一致，防 successes∩failed 并存。
                 self._failed.pop(job_uid, None)
-                self._failed_payloads.pop(job_uid, None)
+                self._failure_payloads.pop(job_uid, None)
                 self._cursors.update(cursor_sets)
                 for k in cursor_dels:
                     self._cursors.pop(k, None)
@@ -162,13 +162,13 @@ class InMemoryStateBackend(AbstractStateBackend):
                 return False
 
     def commit_job_failure(
-        self, job_uid: str, result_metadata: dict, payload: dict[str, Any] | None = None
+        self, job_uid: str, failure_metadata: dict, payload: dict[str, Any] | None = None
     ) -> bool:
         with self._lock:
             try:
                 # 校验先行：失败 meta 与 payload 快照的拷贝在变更前完成，
                 # 任一步失败 ⇒ failed/queue/successes 整体不变（对齐 SQLite 回滚）。
-                meta_copy = copy.deepcopy(result_metadata or {})
+                meta_copy = copy.deepcopy(failure_metadata or {})
                 payload_copy = (
                     copy.deepcopy(payload) if payload is not None else None
                 )
@@ -177,7 +177,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 # payload 快照 latest-wins；None 表示本路径无 payload，保留
                 # 既有快照（与 SQLite 腿 _write_failed_row 的保留语义对齐）。
                 if payload_copy is not None:
-                    self._failed_payloads[job_uid] = payload_copy
+                    self._failure_payloads[job_uid] = payload_copy
                 self._queue = remaining
                 # 同一事务语义内清理 successes 旧记录：重跑任务失败时旧成功
                 # 记录作废（最终状态唯一），防 successes∩failed 并存。
@@ -217,14 +217,14 @@ class InMemoryStateBackend(AbstractStateBackend):
                 logger.critical(f"Failed to commit retry for {popped_job_uid}: {e}")
                 return False
 
-    def commit_job_failures(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
+    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> bool:
         with self._lock:
             try:
                 # 校验先行：全部失败行拷贝在任何变更前完成——任一行失败则
                 # queue/successes/failed 整体不变（对齐 SQLite 事务回滚，杜绝
                 # 「队列已整体删除、档案未落」的半成品失败态）。
-                entries = [(job_uid, copy.deepcopy(meta or {})) for job_uid, meta in job_uids_metas]
-                fail_uids = {u for u, _ in job_uids_metas}
+                entries = [(job_uid, copy.deepcopy(meta or {})) for job_uid, meta in job_uids_metadata]
+                fail_uids = {u for u, _ in job_uids_metadata}
                 remaining = [j for j in self._queue if job_uid_from_snapshot(j) not in fail_uids]
                 for job_uid, meta in entries:
                     self._failed[job_uid] = meta
@@ -291,7 +291,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             for u in del_set:
                 if u in self._failed:
                     del self._failed[u]
-                    self._failed_payloads.pop(u, None)
+                    self._failure_payloads.pop(u, None)
                     count += 1
             return count
 

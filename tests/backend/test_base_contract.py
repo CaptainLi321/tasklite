@@ -164,9 +164,9 @@ class TestValidateAttemptFinish:
             validate_attempt_finish("succeeded", "", None)
 
     def test_error_optional_but_typed(self):
-        with pytest.raises(TypeError, match="error must be a str or None"):
+        with pytest.raises(TypeError, match="error_message must be a str or None"):
             validate_attempt_finish("failed", "2026-05-01T00:00:05+00:00", 99)
-        with pytest.raises(ValueError, match="error must be a non-empty str or None"):
+        with pytest.raises(ValueError, match="error_message must be a non-empty str or None"):
             validate_attempt_finish("failed", "2026-05-01T00:00:05+00:00", "")
 
 

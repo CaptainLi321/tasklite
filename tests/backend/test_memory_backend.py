@@ -223,7 +223,7 @@ class TestMemoryAttemptTrajectory:
             b.update_attempt(attempt_id, outcome="running", finished_at="2026-05-01T00:00:05+00:00")
         with pytest.raises(TypeError, match="finished_at must be a str"):
             b.update_attempt(attempt_id, outcome="succeeded", finished_at=None)  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="error must be a non-empty str or None"):
+        with pytest.raises(ValueError, match="error_message must be a non-empty str or None"):
             b.update_attempt(attempt_id, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00", error_message="")
         # 门卫失败后轨迹行仍是 running
         (rec,) = b.load_attempts("t::one")

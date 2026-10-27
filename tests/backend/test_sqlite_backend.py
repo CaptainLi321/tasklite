@@ -478,34 +478,34 @@ class TestSaveAndEnqueueQueue:
 class TestCorruptionAndLocks:
     """损坏行与锁错误 fail-loud（不吞、不静默空返回）。"""
 
-    def test_load_wall_corrupt_payload_raises(self, tmp_path):
+    def test_load_successes_corrupt_metadata_raises(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         with sqlite3.connect(tmp_path / "state.db") as conn:
             conn.execute(
                 "INSERT INTO successes (job_uid, metadata) VALUES (?, ?)",
                 ("bad_uid", "not valid json{{{"),
             )
-        with pytest.raises(RuntimeError, match="Corrupted successes payload"):
+        with pytest.raises(RuntimeError, match="Corrupted successes metadata"):
             backend.load_successes()
 
-    def test_load_queue_corrupt_payload_raises(self, tmp_path):
+    def test_load_queue_corrupt_job_snapshot_raises(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         with sqlite3.connect(tmp_path / "state.db") as conn:
             conn.execute(
                 "INSERT INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)",
                 ("bad", 0, "not valid json{{{"),
             )
-        with pytest.raises(RuntimeError, match="Corrupted queue payload"):
+        with pytest.raises(RuntimeError, match="Corrupted queue job_snapshot"):
             backend.load_queue()
 
-    def test_load_failed_corrupt_payload_raises(self, tmp_path):
+    def test_load_failed_corrupt_metadata_raises(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         with sqlite3.connect(tmp_path / "state.db") as conn:
             conn.execute(
                 "INSERT INTO failed (job_uid, metadata) VALUES (?, ?)",
                 ("bad_uid", "not valid json{{{"),
             )
-        with pytest.raises(RuntimeError, match="Corrupted failed payload"):
+        with pytest.raises(RuntimeError, match="Corrupted failed metadata"):
             backend.load_failed()
 
     def test_load_queue_locked_db_raises(self, tmp_path, monkeypatch):

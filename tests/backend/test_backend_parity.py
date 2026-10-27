@@ -84,8 +84,8 @@ class TestCoreContractProperties:
         b.enqueue_jobs([_job_snapshot(j) for j in ("success_one", "fail_one", "bulk_one", "skip_one")])
 
         assert b.commit_job_success(job_uid="t::success_one", result_metadata={"ok": True}) is True
-        assert b.commit_job_failure(job_uid="t::fail_one", result_metadata={"error_message": "x"}) is True
-        assert b.commit_job_failures(job_uids_metas=[("t::bulk_one", {"error_message": "y"})]) is True
+        assert b.commit_job_failure(job_uid="t::fail_one", failure_metadata={"error_message": "x"}) is True
+        assert b.commit_job_failures(job_uids_metadata=[("t::bulk_one", {"error_message": "y"})]) is True
         assert b.commit_skip(job_uid="t::skip_one") is True
 
         assert _queue_uids(b) == []
@@ -108,7 +108,7 @@ class TestCoreContractProperties:
         metadata = {"error_message": "stale", "payload": "档案元数据", "nested": {"new_jobs": [1]}}
         payload = {"error": "业务输入", "metadata": "业务值", "nested": {"timeout": 9}}
         assert b.commit_job_failure(
-            job_uid="t::one", result_metadata=metadata, payload=payload
+            job_uid="t::one", failure_metadata=metadata, payload=payload
         ) is True
         assert b.load_failed()["t::one"] == metadata
         assert b.load_failure_payloads()["t::one"] == payload

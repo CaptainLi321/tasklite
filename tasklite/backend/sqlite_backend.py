@@ -248,7 +248,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(f"Failed to load successes from {self.path.name}: {e}") from e
         except ValueError as e:
-            raise RuntimeError(f"Corrupted successes payload in {self.path.name}: {e}") from e
+            raise RuntimeError(f"Corrupted successes metadata in {self.path.name}: {e}") from e
 
     def load_failed(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -260,7 +260,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(f"Failed to load failed archive from {self.path.name}: {e}") from e
         except ValueError as e:
-            raise RuntimeError(f"Corrupted failed payload in {self.path.name}: {e}") from e
+            raise RuntimeError(f"Corrupted failed metadata in {self.path.name}: {e}") from e
 
     def load_failure_payloads(self) -> dict[str, dict[str, Any]]:
         """读取失败档案各 job_uid 的原始业务 payload 快照（无快照的 job_uid 不出现）。"""
@@ -297,7 +297,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(f"Failed to load queue from {self.path.name}: {e}") from e
         except ValueError as e:
-            raise RuntimeError(f"Corrupted queue payload in {self.path.name}: {e}") from e
+            raise RuntimeError(f"Corrupted queue job_snapshot in {self.path.name}: {e}") from e
 
     # 整表重写 ---------------------------------------------------------
 
@@ -397,8 +397,8 @@ class SQLiteStateBackend(AbstractStateBackend):
                     queue_positions = self._queue_position_range(conn, len(spawned_job_snapshots), front=True)
                     cur = conn.executemany(
                         'INSERT OR IGNORE INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)',
-                        [(job_uid_from_snapshot(j), s, dumps(j))
-                         for j, s in zip(spawned_job_snapshots, queue_positions)],
+                        [(job_uid_from_snapshot(j), pos, dumps(j))
+                         for j, pos in zip(spawned_job_snapshots, queue_positions)],
                     )
                     # 防止 INSERT OR IGNORE 静默丢弃 spawn：若某个 spawned
                     # job_uid 与磁盘队列冲突（内存 is_known 预筛后的漂移窗口），
@@ -470,7 +470,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         )
 
     def commit_job_failure(
-        self, job_uid: str, result_metadata: dict, payload: dict[str, Any] | None = None
+        self, job_uid: str, failure_metadata: dict, payload: dict[str, Any] | None = None
     ) -> bool:
         """原子 delta：写失败档案 + 删 popped job_uid + 删 successes 同名行。
 
@@ -483,7 +483,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             with self._get_conn() as conn:
                 # 快照保留的读-改-写必须持写事务串行化（详见 _get_conn）。
                 conn.execute('BEGIN IMMEDIATE')
-                self._write_failed_row(conn, job_uid, result_metadata, payload)
+                self._write_failed_row(conn, job_uid, failure_metadata, payload)
                 conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
                 conn.execute('DELETE FROM successes WHERE job_uid = ?', (job_uid,))
         except Exception as e:
@@ -528,7 +528,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             return False
         return True
 
-    def commit_job_failures(self, job_uids_metas: list[tuple[str, dict]]) -> bool:
+    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> bool:
         """原子 delta：批量写失败档案 + 按 job_uid 精准删除队列行 + 批量清 successes 旧记录。
 
         与 commit_job_failure 对称，同一事务内批量 ``DELETE FROM successes``
@@ -539,15 +539,15 @@ class SQLiteStateBackend(AbstractStateBackend):
             with self._get_conn() as conn:
                 # 快照保留的读-改-写必须持写事务串行化（详见 _get_conn）。
                 conn.execute('BEGIN IMMEDIATE')
-                for job_uid, meta in job_uids_metas:
+                for job_uid, meta in job_uids_metadata:
                     self._write_failed_row(conn, job_uid, meta)
                 conn.executemany(
                     'DELETE FROM queue WHERE job_uid = ?',
-                    [(job_uid,) for job_uid, _ in job_uids_metas],
+                    [(job_uid,) for job_uid, _ in job_uids_metadata],
                 )
                 conn.executemany(
                     'DELETE FROM successes WHERE job_uid = ?',
-                    [(job_uid,) for job_uid, _ in job_uids_metas],
+                    [(job_uid,) for job_uid, _ in job_uids_metadata],
                 )
         except Exception as e:
             logger.critical(f"Failed to commit bulk failure in {self.path.name}: {e}")
@@ -601,8 +601,8 @@ class SQLiteStateBackend(AbstractStateBackend):
                 queue_positions = self._queue_position_range(conn, len(fresh), front=front)
                 conn.executemany(
                     'INSERT INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)',
-                    [(job_uid_from_snapshot(j), s, dumps(j))
-                     for j, s in zip(fresh, queue_positions)],
+                    [(job_uid_from_snapshot(j), pos, dumps(j))
+                     for j, pos in zip(fresh, queue_positions)],
                 )
                 return [job_uid_from_snapshot(j) for j in fresh]
         except Exception as e:
@@ -801,7 +801,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                 row = conn.execute('SELECT value FROM engine_metadata WHERE key = ?', (key,)).fetchone()
                 return row[0] if row else None
         except (sqlite3.Error, OSError) as e:
-            raise RuntimeError(f"Failed to read meta '{key}' from {self.path.name}: {e}") from e
+            raise RuntimeError(f"Failed to read engine_metadata '{key}' from {self.path.name}: {e}") from e
 
     def set_engine_metadata(self, key: str, value: str) -> None:
         try:
@@ -811,7 +811,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                     (key, value),
                 )
         except Exception as e:
-            logger.critical(f"Failed to write meta '{key}' in {self.path.name}: {e}")
+            logger.critical(f"Failed to write engine_metadata '{key}' in {self.path.name}: {e}")
             raise
 
 

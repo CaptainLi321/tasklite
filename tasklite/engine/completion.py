@@ -306,25 +306,25 @@ class CompletionMachine:
 
         seen_in_batch: set[str] = set()
         unique_spawned_jobs: list[Job] = []
-        for nj in spawned_jobs:
-            nj_uid = nj.uid
-            if nj_uid in seen_in_batch:
-                logger.debug(f"Skipping duplicate spawn for {nj_uid}.")
+        for spawned_job in spawned_jobs:
+            spawned_uid = spawned_job.uid
+            if spawned_uid in seen_in_batch:
+                logger.debug(f"Skipping duplicate spawn for {spawned_uid}.")
                 continue
-            if store.state.is_known(nj_uid):
-                if nj_uid in store.state.queue_uids or nj_uid in store.state.in_flight_uids:
+            if store.state.is_known(spawned_uid):
+                if spawned_uid in store.state.queue_uids or spawned_uid in store.state.in_flight_uids:
                     continue
-                decision = self._rerun_policy.admit(nj.to_dict(), store.state)
+                decision = self._rerun_policy.admit(spawned_job.to_dict(), store.state)
                 if decision.should_skip:
                     continue
-            seen_in_batch.add(nj_uid)
-            unique_spawned_jobs.append(nj)
+            seen_in_batch.add(spawned_uid)
+            unique_spawned_jobs.append(spawned_job)
 
-        for nj in unique_spawned_jobs:
+        for spawned_job in unique_spawned_jobs:
             try:
-                spawned_job_snapshots.append(store.normalize_spawned_job(nj))
+                spawned_job_snapshots.append(store.normalize_spawned_job(spawned_job))
             except ValueError as err:
-                self._reject_spawned_job(nj, err)
+                self._reject_spawned_job(spawned_job, err)
         logger.debug(f"Spawned {len(spawned_job_snapshots)} jobs for {parent_uid}.")
         return spawned_job_snapshots
 

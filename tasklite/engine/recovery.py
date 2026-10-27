@@ -74,7 +74,7 @@ from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..utils.jsonutil import loads
 from .resource import (
-    META_RESOURCE_SUSPENSIONS,
+    ENGINE_METADATA_RESOURCE_SUSPENSIONS,
     apply_suspend_signals,
     persist_resource_suspensions,
 )
@@ -249,26 +249,26 @@ class RecoveryOrchestrator:
             )
 
     def load_resource_suspensions(self) -> None:
-        """从 meta 表恢复资源挂起状态（挂钟截止换算回挂起秒数注入 ResourceManager）。"""
+        """从 engine_metadata 表恢复资源挂起状态（挂钟截止换算回挂起秒数注入 ResourceManager）。"""
         try:
-            raw = self._store.backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)
+            raw = self._store.backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS)
         except Exception as e:
-            logger.warning(f"Failed to load resource suspensions from meta: {e}")
+            logger.warning(f"Failed to load resource suspensions from engine_metadata: {e}")
             return
         if raw is None:
             return
         try:
             deadlines = loads(raw)
         except (ValueError, TypeError) as e:
-            logger.warning(f"Corrupted resource_suspensions meta, ignoring: {e}")
+            logger.warning(f"Corrupted resource_suspensions engine_metadata, ignoring: {e}")
             return
         if not isinstance(deadlines, dict):
-            logger.warning("resource_suspensions meta is not a dict, ignoring")
+            logger.warning("resource_suspensions engine_metadata is not a dict, ignoring")
             return
         self._resources.restore_suspensions(deadlines)
 
     def persist_resource_suspensions(self) -> None:
-        """run 结束时把资源挂起截止持久化到 meta 表。
+        """run 结束时把资源挂起截止持久化到 engine_metadata 表。
 
         挂起的应用点即时持久化（消除 kill -9/OOM 时挂起丢失窗口）
         经 resource.persist_resource_suspensions 共享助手落盘。
@@ -282,7 +282,7 @@ class RecoveryOrchestrator:
         崩溃时，信号文件存活但同 run 再无排空触点；后续派发预检清理与
         完成收尾清理都会未读删除信号文件。启动期全量清扫（先读分发后
         删除）是该不变式的兜底回收点；``suspend()`` 的 max 语义保证与
-        meta 恢复的挂起幂等合并。清扫原语异常只降级告警，不打断启动。
+        engine_metadata 恢复的挂起幂等合并。清扫原语异常只降级告警，不打断启动。
         """
         try:
             signals = self._channel.drain_all_signals()

@@ -500,7 +500,7 @@ class ErrorClassifier:
         # 失败档案 meta 字典
         is_fatal = bool(meta.get("is_fatal"))
         error_str = _safe_str(meta.get("error_message", ""))
-        failed_type = meta.get("error_category")
+        raw_category = meta.get("error_category")
 
         if is_fatal:
             return ErrorClassification(
@@ -516,11 +516,11 @@ class ErrorClassifier:
 
         # 映射错误码
         cl = self._classify_string(error_str)
-        if failed_type and failed_type != ErrorCategory.UNKNOWN.value:
+        if raw_category and raw_category != ErrorCategory.UNKNOWN.value:
             return ErrorClassification(
                 category=cl.category,
                 error_code=error_str,
-                failed_error_category=failed_type,
+                failed_error_category=raw_category,
                 is_transient=cl.is_transient,
                 is_fatal=cl.is_fatal,
                 is_retry=cl.is_retry,

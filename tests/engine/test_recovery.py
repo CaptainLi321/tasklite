@@ -19,7 +19,7 @@ from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
 from tasklite.engine.recovery import RecoveryOrchestrator
 from tasklite.engine.resource import (
-    META_RESOURCE_SUSPENSIONS,
+    ENGINE_METADATA_RESOURCE_SUSPENSIONS,
     CapacityResource,
     RateLimitResource,
     ResourceManager,
@@ -591,13 +591,13 @@ class TestSuspendPersistenceAndRestore:
 
         orchestrator.apply_pending_signals()
 
-        assert backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS) is not None
+        assert backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS) is not None
 
     def test_load_resource_suspensions_restores_into_manager(self):
         backend = InMemoryStateBackend()
         resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
         backend.set_engine_metadata(
-            META_RESOURCE_SUSPENSIONS, dumps({"api": time.time() + 30.0})
+            ENGINE_METADATA_RESOURCE_SUSPENSIONS, dumps({"api": time.time() + 30.0})
         )
         orchestrator = make_recovery_orchestrator(backend, resource_mgr=resource_mgr)
 
@@ -608,7 +608,7 @@ class TestSuspendPersistenceAndRestore:
     def test_load_resource_suspensions_ignores_corrupted_meta(self, caplog):
         backend = InMemoryStateBackend()
         resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
-        backend.set_engine_metadata(META_RESOURCE_SUSPENSIONS, "not-json{{")
+        backend.set_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS, "not-json{{")
         orchestrator = make_recovery_orchestrator(backend, resource_mgr=resource_mgr)
 
         with caplog.at_level(logging.WARNING, logger="tasklite"):
@@ -620,7 +620,7 @@ class TestSuspendPersistenceAndRestore:
     def test_load_resource_suspensions_ignores_non_dict_meta(self, caplog):
         backend = InMemoryStateBackend()
         resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
-        backend.set_engine_metadata(META_RESOURCE_SUSPENSIONS, dumps([1, 2]))
+        backend.set_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS, dumps([1, 2]))
         orchestrator = make_recovery_orchestrator(backend, resource_mgr=resource_mgr)
 
         with caplog.at_level(logging.WARNING, logger="tasklite"):
@@ -637,7 +637,7 @@ class TestSuspendPersistenceAndRestore:
 
         orchestrator.persist_resource_suspensions()
 
-        assert "api" in loads(backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS))
+        assert "api" in loads(backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS))
 
 
 class TestResidueSalvage:
@@ -655,7 +655,7 @@ class TestResidueSalvage:
         orchestrator.salvage_residue_signals()
 
         assert "api" in resource_mgr.collect_suspensions()
-        persisted = loads(backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS))
+        persisted = loads(backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS))
         assert "api" in persisted
 
     def test_salvage_residue_signals_channel_failure_is_isolated(self):
@@ -669,7 +669,7 @@ class TestResidueSalvage:
 
         orchestrator.salvage_residue_signals()
 
-        assert backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS) is None
+        assert backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS) is None
 
     def test_salvage_residue_signals_skips_unregistered_resource(self):
         backend = InMemoryStateBackend()
@@ -681,7 +681,7 @@ class TestResidueSalvage:
 
         orchestrator.salvage_residue_signals()
 
-        assert backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS) is None
+        assert backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS) is None
 
     def test_residue_signals_from_real_channel_journal(self, tmp_path):
         """真实 channel 落盘的跨 run 残留信号经启动清扫回收并应用。"""
@@ -710,7 +710,7 @@ class TestLoadAndRepair:
             {"task_type": "t", "job_id": "fresh"},
         ])
         backend.set_engine_metadata(
-            META_RESOURCE_SUSPENSIONS, dumps({"api": time.time() + 30.0})
+            ENGINE_METADATA_RESOURCE_SUSPENSIONS, dumps({"api": time.time() + 30.0})
         )
         channel = ExecutionChannel(tmp_path)
         channel.journal.record_signal("t::fresh", "api", 20.0)
@@ -979,7 +979,7 @@ class TestAbortInFlight:
         orchestrator.abort_in_flight()
 
         assert resource_mgr.collect_suspensions() != {}, "捞回信号必须被应用"
-        assert backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS) is not None
+        assert backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS) is not None
 
     def test_abort_releases_resources_before_settlement(self, tmp_path):
         """已占用资源在结算前统一释放（防泄漏）。"""

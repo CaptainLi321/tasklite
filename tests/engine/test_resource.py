@@ -15,7 +15,7 @@ import pytest
 
 from tasklite.backend import InMemoryStateBackend
 from tasklite.engine.resource import (
-    META_RESOURCE_SUSPENSIONS,
+    ENGINE_METADATA_RESOURCE_SUSPENSIONS,
     CapacityResource,
     RateLimitResource,
     RateLimitUnavailable,
@@ -846,7 +846,7 @@ class TestApplySuspendSignals:
         apply_suspend_signals([("t::j1", "api", 300.0)], backend, mgr, origin="from ")
         assert len(backend.calls) == 1
         key, raw = backend.calls[0]
-        assert key == META_RESOURCE_SUSPENSIONS
+        assert key == ENGINE_METADATA_RESOURCE_SUSPENSIONS
         assert "api" in json.loads(raw)
         assert mgr["api"].suspended_until() is not None
 
@@ -873,7 +873,7 @@ class TestApplySuspendSignals:
 
 
 class TestSuspensionPersistenceAcrossCrash:
-    """挂起截止跨崩溃持久化（新 meta 键 ``resource_suspensions``）。
+    """挂起截止跨崩溃持久化（engine_metadata 键 ``resource_suspensions``）。
 
     handler 对 "api" 挂起 300 秒（限流）后进程崩溃——若不落盘，挂起随
     进程消失，重启即放行。管线级「run 尾部落盘 + 启动加载」编排由后续
@@ -889,7 +889,7 @@ class TestSuspensionPersistenceAcrossCrash:
 
         persist_resource_suspensions(backend, mgr)
 
-        raw = backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)
+        raw = backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS)
         assert raw is not None
         deadlines = json.loads(raw)
         assert "api" in deadlines
@@ -922,7 +922,7 @@ class TestSuspensionPersistenceAcrossCrash:
         fresh = ResourceManager(
             resources={"api": RateLimitResource("api", interval_seconds=1.0)}
         )
-        fresh.restore_suspensions(json.loads(backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)))
+        fresh.restore_suspensions(json.loads(backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS)))
         remaining = fresh["api"].next_available - time.monotonic()
         assert abs(remaining - 300.0) <= 1.0
 
@@ -932,4 +932,4 @@ class TestSuspensionPersistenceAcrossCrash:
             resources={"api": RateLimitResource("api", interval_seconds=1.0)}
         )
         persist_resource_suspensions(backend, mgr)
-        assert json.loads(backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)) == {}
+        assert json.loads(backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS)) == {}
