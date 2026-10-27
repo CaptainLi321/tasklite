@@ -35,6 +35,26 @@ def _running_attempt(job_uid: str, attempt_no: int = 1) -> AttemptRecord:
     )
 
 
+def _open_and_commit_success(
+    b: InMemoryStateBackend,
+    job_uid: str,
+    result_metadata: dict,
+    *,
+    attempt_no: int = 1,
+    finished_at: str = "2026-05-01T00:00:05+00:00",
+    **kwargs,
+) -> bool:
+    attempt_id = b.append_attempt(_running_attempt(job_uid, attempt_no=attempt_no))
+    return b.commit_job_success(
+        job_uid,
+        result_metadata,
+        attempt_id=attempt_id,
+        execution_id=f"run_seed.{attempt_no}",
+        finished_at=finished_at,
+        **kwargs,
+    )
+
+
 class TestInMemoryBackendContract:
     """基础 CRUD、幂等入队与 meta 持久化。"""
 
@@ -83,7 +103,8 @@ class TestInMemoryBackendContract:
         b = InMemoryStateBackend()
         b.enqueue_jobs([_job_snapshot("one")])
 
-        ok = b.commit_job_success(
+        ok = _open_and_commit_success(
+            b,
             "t::one",
             {"status": "ok"},
             spawned_job_snapshots=[_job_snapshot("child")],
@@ -93,11 +114,14 @@ class TestInMemoryBackendContract:
         assert b.load_successes()["t::one"] == {"status": "ok"}
         assert b.load_cursors() == {"page": "two"}
         assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::child"]
+        (rec,) = b.load_attempts("t::one")
+        assert rec.outcome == "succeeded"
+        assert rec.finished_at == "2026-05-01T00:00:05+00:00"
 
     def test_commit_job_success_stores_exact_meta_without_injection(self):
         """失败/成功 meta 原样落库：backend 不解释 meta、不注入派生字段。"""
         b = InMemoryStateBackend()
-        assert b.commit_job_success("t::one", {"v": 1}) is True
+        assert _open_and_commit_success(b, "t::one", {"v": 1}) is True
         assert b.load_successes() == {"t::one": {"v": 1}}
 
     def test_commit_job_failure_records_archive_and_clears_queue(self):
@@ -238,16 +262,33 @@ class TestMemoryAttemptTrajectory:
         assert [r.attempt_no for r in records] == [1, 2]
 
     def test_attempts_untouched_by_terminal_commits(self):
-        """旁路观测面：终态提交不触碰 attempts 行。"""
+        """失败/跳过终态提交不触碰 attempts；成功提交仅收尾指定 running 行而不改历史行。"""
         b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_snapshot("one")])
-        attempt_id = b.append_attempt(_running_attempt("t::one"))
-        b.update_attempt(attempt_id, outcome="failed", finished_at="2026-05-01T00:00:05+00:00", error_message="boom")
+        b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("two")])
+        hist_id = b.append_attempt(_running_attempt("t::one", attempt_no=1))
+        b.update_attempt(hist_id, outcome="failed", finished_at="2026-05-01T00:00:05+00:00", error_message="boom")
         b.commit_job_failure("t::one", {"error_message": "boom"}, payload={"k": 1})
+        b.commit_skip("t::two")
 
         (rec,) = b.load_attempts("t::one")
         assert rec.outcome == "failed"
         assert rec.error_message == "boom"
+
+        active_id = b.append_attempt(_running_attempt("t::one", attempt_no=2))
+        assert b.commit_job_success(
+            "t::one",
+            {"ok": True},
+            attempt_id=active_id,
+            execution_id="run_seed.2",
+            finished_at="2026-05-01T00:00:09+00:00",
+        ) is True
+        hist_rec, active_rec = b.load_attempts("t::one")
+        assert hist_rec.outcome == "failed"
+        assert hist_rec.finished_at == "2026-05-01T00:00:05+00:00"
+        assert hist_rec.error_message == "boom"
+        assert active_rec.outcome == "succeeded"
+        assert active_rec.finished_at == "2026-05-01T00:00:09+00:00"
+        assert active_rec.error_message is None
 
 
 class TestMemoryFailureArchive:
@@ -293,8 +334,8 @@ class TestMemoryFailureArchive:
 
     def test_delete_wall_targeted(self):
         b = InMemoryStateBackend()
-        b.commit_job_success("t::one", {"ok": True})
-        b.commit_job_success("t::two", {"ok": True})
+        _open_and_commit_success(b, "t::one", {"ok": True})
+        _open_and_commit_success(b, "t::two", {"ok": True})
         assert b.delete_successes(["t::one", "t::ghost"]) == 1
         assert set(b.load_successes()) == {"t::two"}
 
@@ -302,14 +343,14 @@ class TestMemoryFailureArchive:
         """最终状态唯一：成功 commit 删失败档案同名行（含快照）。"""
         b = InMemoryStateBackend()
         b.commit_job_failure("t::one", {"error_message": "stale"}, payload={"k": 1})
-        assert b.commit_job_success("t::one", {"ok": True}) is True
+        assert _open_and_commit_success(b, "t::one", {"ok": True}) is True
         assert b.load_failed() == {}
         assert b.load_failure_payloads() == {}
 
     def test_failure_commit_deletes_wall_same_uid(self):
         """最终状态唯一：失败 commit 删 successes 同名行。"""
         b = InMemoryStateBackend()
-        b.commit_job_success("t::one", {"ok": True})
+        _open_and_commit_success(b, "t::one", {"ok": True})
         assert b.commit_job_failure("t::one", {"error_message": "boom"}) is True
         assert b.load_successes() == {}
         assert set(b.load_failed()) == {"t::one"}
@@ -368,7 +409,7 @@ class TestMemorySnapshotIsolation:
 
     def test_load_wall_and_failed_results_mutation_is_invisible(self):
         b = InMemoryStateBackend()
-        b.commit_job_success("t::one", {"meta": {"v": 1}})
+        _open_and_commit_success(b, "t::one", {"meta": {"v": 1}})
         b.append_failed("t::two", {"meta": {"v": 2}})
         b.load_successes()["t::one"]["meta"]["v"] = 999
         b.load_failed()["t::two"]["meta"]["v"] = 999

@@ -13,7 +13,7 @@ def snapshot(path):
                 list(conn.iterdump()))
 
 
-@pytest.mark.parametrize("version", [0, 1, 2, 3, 5, 99])
+@pytest.mark.parametrize("version", [0, 1, 2, 3, 4, 99])
 def test_nonempty_incompatible_database_is_preserved(tmp_path, version):
     path = tmp_path / "original.db"
     with sqlite3.connect(path) as conn:
@@ -25,7 +25,7 @@ def test_nonempty_incompatible_database_is_preserved(tmp_path, version):
         SQLiteStateBackend(path)
     assert snapshot(path) == before
     assert str(path) in str(caught.value)
-    assert "4" in str(caught.value)
+    assert "5" in str(caught.value)
     assert "保留原库" in str(caught.value)
 
 
@@ -48,6 +48,7 @@ def test_version_zero_with_any_application_object_is_rejected(tmp_path, setup):
 @pytest.mark.parametrize("change", [
     "PRAGMA user_version=0",
     "PRAGMA user_version=3",
+    "PRAGMA user_version=4",
     "DROP TABLE queue",
     "ALTER TABLE failed ADD COLUMN unexpected TEXT",
     "ALTER TABLE attempts RENAME COLUMN error_message TO error",
@@ -87,7 +88,7 @@ def test_fresh_database_and_special_characters(tmp_path, empty_file):
     backend.seed_cursor("error", "new_jobs")
     assert SQLiteStateBackend(path).load_cursors() == {"error": "new_jobs"}
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (4,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (5,)
         assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
 
 

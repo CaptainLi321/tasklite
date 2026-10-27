@@ -210,7 +210,10 @@ class TestDedupGate:
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         env.store.state.pop_job(0)
         env.store.state.register_in_flight("t::j1")
-        env.store.apply_success("t::j1", {})
+        aid = env.store.record_attempt_dispatch(
+            Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
+        )
+        env.store.apply_success("t::j1", {}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
 
         outcome = env.dispatch.dispatch_next()
@@ -226,7 +229,10 @@ class TestDedupGate:
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.register_in_flight("t::j1")
-        env.store.apply_success("t::j1", {})
+        aid = env.store.record_attempt_dispatch(
+            Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
+        )
+        env.store.apply_success("t::j1", {}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
         env.store.state.spawn_jobs([Job("t", "j1", rerun="every_run").to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
@@ -569,7 +575,10 @@ class TestGateOrderContract:
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         env.store.state.pop_job(0)
         env.store.state.register_in_flight("t::j1")
-        env.store.apply_success("t::j1", {})
+        aid = env.store.record_attempt_dispatch(
+            Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
+        )
+        env.store.apply_success("t::j1", {}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
         env.store.state.spawn_jobs([
             Job("t", "j1", depends_on=["dead::parent"]).to_dict()
         ])
@@ -581,10 +590,12 @@ class TestGateOrderContract:
         assert "t::j1" not in env.store.state.failed
 
 
-class TestTraceAppendDegradation:
-    """轨迹开行的旁路降级：观测缺口不击落派发。"""
+class TestTraceAppendReliability:
+    """轨迹开行可靠保障：派发开行失败保队且不启动 handler。"""
 
-    def test_append_failure_still_dispatches(self, tmp_path, monkeypatch):
+    def test_append_failure_preserves_queue_without_starting_handler(self, tmp_path, monkeypatch):
+        from tasklite.exceptions import _CommitCrashSignal
+
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
@@ -593,11 +604,16 @@ class TestTraceAppendDegradation:
             "append_attempt",
             lambda record: (_ for _ in ()).throw(RuntimeError("trace down")),
         )
+        spawned: list[Any] = []
         monkeypatch.setattr(
             env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
+            lambda spec: spawned.append(spec) or env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
-        outcome = env.dispatch.dispatch_next()
-        assert outcome.kind is DispatchKind.SPAWNED
-        assert outcome.entry.attempt_id is None
+        with pytest.raises(_CommitCrashSignal, match="Failed to append attempt row"):
+            env.dispatch.dispatch_next()
+        assert spawned == []
+        assert "t::j1" in env.store.state.queue_uids
+        assert "t::j1" not in env.in_flight
+        assert "t::j1" not in env.store.state.in_flight_uids
+        assert env.backend.load_attempts("t::j1") == []

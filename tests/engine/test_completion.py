@@ -163,7 +163,7 @@ class TestCompleteJobSuccess:
     def test_cursor_updates_applied(self, tmp_path):
         env = CompletionEnv(tmp_path)
         job = Job("t", "j1")
-        entry = env.track_entry(job)
+        entry = env.track_entry(job, attempt_id=env.open_attempt(job))
 
         env.completion.complete_job(
             entry,
@@ -356,18 +356,19 @@ class TestSpawnedJobs:
         """queue/in-flight 命中无条件拦截，优先于 every_run 豁免。"""
         env = CompletionEnv(tmp_path)
         env.store.state.register_in_flight("child::x")
-        env.store.apply_success("child::x", {})
+        env.store.apply_success("child::x", {}, attempt_id=env.open_attempt(Job("child", "x")))
         # X 重跑中（queue，every_run 放行重跑）
         env.store.state.spawn_jobs([Job("child", "x", rerun="every_run").to_dict()])
 
         parent = Job("parent", "p1")
-        entry = env.track_entry(parent)
+        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
         env.completion.apply_result(
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
                 spawned_jobs=[Job("child", "x", rerun="every_run")],
             ),
+            attempt_id=entry.attempt_id,
         )
         assert "parent::p1" in env.store.state.successes
         x_rows = [jd for jd in env.store.state.queue if jd["job_id"] == "x"]
@@ -376,11 +377,11 @@ class TestSpawnedJobs:
     def test_spawn_wall_hit_every_run_admitted(self, tmp_path):
         env = CompletionEnv(tmp_path)
         env.store.state.register_in_flight("child::y")
-        env.store.apply_success("child::y", {})
+        env.store.apply_success("child::y", {}, attempt_id=env.open_attempt(Job("child", "y")))
         # successes 命中 + every_run：spawn 放行（唯一终态历史行被替换语义）
 
         parent = Job("parent", "p1")
-        entry = env.track_entry(parent)
+        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
         env.completion.apply_result(
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
@@ -388,6 +389,7 @@ class TestSpawnedJobs:
                 spawned_jobs=[Job("child", "y", rerun="every_run",
                               timeout_seconds=29, payload={"timeout_seconds": "业务时限"})],
             ),
+            attempt_id=entry.attempt_id,
         )
         assert "parent::p1" in env.store.state.successes
         assert "child::y" in env.store.state.queue_uids
@@ -398,13 +400,14 @@ class TestSpawnedJobs:
     def test_spawn_dedup_within_batch(self, tmp_path):
         env = CompletionEnv(tmp_path)
         parent = Job("parent", "p1")
-        entry = env.track_entry(parent)
+        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
         env.completion.apply_result(
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
                 spawned_jobs=[Job("child", "a"), Job("child", "a")],
             ),
+            attempt_id=entry.attempt_id,
         )
         rows = [jd for jd in env.store.state.queue if jd["job_id"] == "a"]
         assert len(rows) == 1
@@ -417,7 +420,7 @@ class TestSpawnedJobs:
             pass
 
         parent = Job("parent", "p1")
-        entry = env.track_entry(parent)
+        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
         env.completion.apply_result(
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
@@ -425,6 +428,7 @@ class TestSpawnedJobs:
                 result_metadata={"ok": 1},
                 spawned_jobs=[Job("child", "bad", payload={"x": Unserializable()})],
             ),
+            attempt_id=entry.attempt_id,
         )
         assert "parent::p1" in env.store.state.successes
         assert "child::bad" in env.store.state.failed
@@ -443,7 +447,7 @@ class TestSuspensionApplication:
             tmp_path, extra_resources={"api": RateLimitResource("api", 0.01)}
         )
         job = Job("t", "j1")
-        entry = env.track_entry(job)
+        entry = env.track_entry(job, attempt_id=env.open_attempt(job))
 
         env.completion.complete_job(
             entry,
@@ -460,7 +464,7 @@ class TestSuspensionApplication:
     def test_unknown_resource_suspension_skipped(self, tmp_path, caplog):
         env = CompletionEnv(tmp_path)
         job = Job("t", "j1")
-        entry = env.track_entry(job)
+        entry = env.track_entry(job, attempt_id=env.open_attempt(job))
 
         env.completion.complete_job(
             entry,
@@ -487,10 +491,12 @@ class TestIdentityVacuity:
     def test_pseudo_entry_skips_assertion(self, tmp_path):
         env = CompletionEnv(tmp_path)
         job = Job("t", "j1")
+        aid = env.open_attempt(job)
         env.completion.apply_result(
             "t::j1", job, job.to_dict(),
             ExecutionResult(success=True),
             expect_in_flight=False,
+            attempt_id=aid,
         )
         assert "t::j1" in env.store.state.successes
 
@@ -532,9 +538,9 @@ class TestSettleAborted:
     def test_cancelled_requeued_done_committed(self, tmp_path):
         env = CompletionEnv(tmp_path)
         j1 = Job("t", "j1")
-        e1 = env.track_entry(j1)
+        e1 = env.track_entry(j1, attempt_id=env.open_attempt(j1))
         j2 = Job("t", "j2")
-        e2 = env.track_entry(j2)
+        e2 = env.track_entry(j2, attempt_id=env.open_attempt(j2))
 
         env.completion.settle_aborted(
             cancelled_entries=[e1],
@@ -586,7 +592,7 @@ class TestHookFireDiscipline:
             lambda uid, *, outcome: (_ for _ in ()).throw(RuntimeError("boom"))
         )
         job = Job("t", "j1")
-        entry = env.track_entry(job)
+        entry = env.track_entry(job, attempt_id=env.open_attempt(job))
         env.completion.complete_job(entry, ExecutionResult(success=True))
         assert env.stats["hook_errors"] == 1
         assert "t::j1" in env.store.state.successes

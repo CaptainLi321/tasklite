@@ -195,7 +195,22 @@ class DispatchMachine:
         # 预检五关以调用顺序表达时序契约，每关返回 True=已处理。
         if self.dispatch_dedup(job_uid, job, job_snapshot):
             return None
-        attempt_id, execution_id = self._open_attempt(job)
+        attempt_id: int | None = None
+        try:
+            attempt_id, execution_id = self._open_attempt(job)
+        except Exception as e:
+            logger.critical(
+                f"Failed to open attempt row for {job_uid}: {e}; "
+                f"requeueing and aborting dispatch without starting handler."
+            )
+            store.state.requeue_jobs([job_snapshot], front=True)
+            raise _CommitCrashSignal(
+                f"Failed to append attempt row for {job_uid} ({e}). "
+                f"Job preserved in queue without starting handler."
+            ) from e
+        except BaseException:
+            store.state.requeue_jobs([job_snapshot], front=True)
+            raise
         if pending_dep_failure is not None:
             if self.dispatch_dep_failed(
                 job_uid, job_snapshot, pending_dep_failure, attempt_id=attempt_id
@@ -208,7 +223,9 @@ class DispatchMachine:
                 return None
         if self.dispatch_orphan_probe(job_uid, job_snapshot, attempt_id=attempt_id):
             return None
-        if self.dispatch_stale_restore(job_uid, job, job_snapshot, attempt_id=attempt_id):
+        if self.dispatch_stale_restore(
+            job_uid, job, job_snapshot, attempt_id=attempt_id, execution_id=execution_id
+        ):
             return None
 
         try:
@@ -245,7 +262,13 @@ class DispatchMachine:
             return False
         decision = self._rerun_policy.admit(job_snapshot, store.state)
         if decision.should_skip:
-            attempt_id, _ = self._open_attempt(job)
+            try:
+                attempt_id, _ = self._open_attempt(job)
+            except Exception as e:
+                logger.warning(
+                    f"Attempt trace append degraded for skipped {job_uid}: {e}"
+                )
+                attempt_id = None
             store.apply_skip(job_uid, job_snapshot=job_snapshot, attempt_id=attempt_id)
             return True
         if decision.should_run and (job_uid in store.state.success_uids or job_uid in store.state.failed_uids):
@@ -359,6 +382,7 @@ class DispatchMachine:
         job_snapshot: dict,
         *,
         attempt_id: int | None = None,
+        execution_id: str | None = None,
     ) -> bool:
         """派发预检关 5——陈旧结果认领与派发前残留清理（stale-restore）。
 
@@ -373,7 +397,9 @@ class DispatchMachine:
         已开的轨迹行随认领结果在完成机器侧收尾（attempt_id 透传）。
         """
         self._salvage_residue_signals(job_uid)
-        if self._recovery.restore_stale_result(job_uid, job, job_snapshot, attempt_id=attempt_id):
+        if self._recovery.restore_stale_result(
+            job_uid, job, job_snapshot, attempt_id=attempt_id, execution_id=execution_id
+        ):
             return True
         self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
         return False
@@ -395,8 +421,7 @@ class DispatchMachine:
         """派发即插 running 轨迹行，返回 (轨迹行 id, execution_id)。
 
         execution_id fencing 归属派发点：``{run_id}.{dispatch_no}`` 生成
-        于此并随轨迹落表。轨迹插入失败降级为 (None, execution_id)——
-        attempts 是旁路观测面，观测缺口不得击落可正常执行的派发。
+        于此并随轨迹落表；开行失败由调用方捕获以保队并中止派发。
         """
         execution_id = f"{self._session.run_id}.{self._session.next_dispatch_no()}"
         attempt_id = self._store.record_attempt_dispatch(
@@ -463,6 +488,7 @@ class DispatchMachine:
                     started_monotonic=started_monotonic,
                     lease=lease,
                     attempt_id=attempt_id,
+                    execution_id=execution_id,
                 )
                 # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
                 self._in_flight.track(entry, state=store.state)

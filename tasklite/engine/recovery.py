@@ -372,6 +372,7 @@ class RecoveryOrchestrator:
         job_snapshot: dict,
         *,
         attempt_id: int | None = None,
+        execution_id: str | None = None,
     ) -> bool:
         """崩溃恢复：派发子进程前消费该 uid 的残留结果文件。
 
@@ -395,6 +396,7 @@ class RecoveryOrchestrator:
         # 失败输出清理、IPC 文件清理、身份注销。
         entry = self._in_flight.create_pseudo_entry(uid, job_snapshot, job)
         entry.attempt_id = attempt_id
+        entry.execution_id = execution_id
         try:
             self._completion.complete_job(entry, result)
         except _JobTerminated:

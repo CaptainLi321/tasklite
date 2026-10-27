@@ -179,21 +179,27 @@ class AbstractStateBackend(ABC):
         job_uid: str,
         result_metadata: dict,
         *,
+        attempt_id: int | None = None,
+        execution_id: str | None = None,
+        finished_at: str | None = None,
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
     ) -> bool:
-        """原子持久化一个成功 job 的 delta。
+        """原子持久化一个成功 job 的 delta，并在同一事务中校验与终结对应 attempts 行。
 
         单事务效果：
+        - attempts：校验 attempt_id / finished_at 非空，对应行存在、job_uid 一致、
+          execution_id 一致（传入非空时）、且 outcome == 'running'，将其更新为
+          outcome='succeeded', finished_at=finished_at, error_message=None；
         - successes：INSERT/REPLACE uid → result_metadata；
         - queue：DELETE 被弹出的 uid；
         - queue：spawned_job_snapshots 队头插入（保序）；
         - failed：DELETE 同名残行（成功终态唯一，防 successes∩failed 并存）；
         - cursors：合并 cursor_updates（None 值表示删除游标）。
 
-        返回 True 成功；返回 False 表示任一步持久化失败且后端保持调用前
-        状态（被弹出的 uid 仍在磁盘队列），调用方不得更新内存 successes/cursor
-        状态，并自行决定是否重入队（崩溃契约）。
+        返回 True 成功；返回 False 表示 attempts 校验失败或任一步持久化失败且
+        后端保持调用前状态（被弹出的 uid 仍在磁盘队列，attempts 仍保持原状），
+        调用方不得更新内存 successes/cursor 状态，并自行决定是否重入队（崩溃契约）。
         """
 
     @abstractmethod

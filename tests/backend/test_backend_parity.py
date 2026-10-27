@@ -40,6 +40,26 @@ def _running_attempt(job_uid: str, attempt_no: int = 1) -> AttemptRecord:
     )
 
 
+def _open_and_commit_success(
+    backend,
+    job_uid: str,
+    result_metadata: dict,
+    *,
+    attempt_no: int = 1,
+    finished_at: str = "2026-05-01T00:00:05+00:00",
+    **kwargs,
+) -> bool:
+    attempt_id = backend.append_attempt(_running_attempt(job_uid, attempt_no=attempt_no))
+    return backend.commit_job_success(
+        job_uid=job_uid,
+        result_metadata=result_metadata,
+        attempt_id=attempt_id,
+        execution_id=f"run_seed.{attempt_no}",
+        finished_at=finished_at,
+        **kwargs,
+    )
+
+
 def _queue_uids(backend) -> list[str]:
     return [job_uid_from_snapshot(j) for j in backend.load_queue()]
 
@@ -83,7 +103,7 @@ class TestCoreContractProperties:
         b = dual_backend
         b.enqueue_jobs([_job_snapshot(j) for j in ("success_one", "fail_one", "bulk_one", "skip_one")])
 
-        assert b.commit_job_success(job_uid="t::success_one", result_metadata={"ok": True}) is True
+        assert _open_and_commit_success(b, job_uid="t::success_one", result_metadata={"ok": True}) is True
         assert b.commit_job_failure(job_uid="t::fail_one", failure_metadata={"error_message": "x"}) is True
         assert b.commit_job_failures(job_uids_metadata=[("t::bulk_one", {"error_message": "y"})]) is True
         assert b.commit_skip(job_uid="t::skip_one") is True
@@ -112,9 +132,9 @@ class TestCoreContractProperties:
         ) is True
         assert b.load_failed()["t::one"] == metadata
         assert b.load_failure_payloads()["t::one"] == payload
-        b.commit_job_success("t::other", {"ok": True})
+        _open_and_commit_success(b, "t::other", {"ok": True})
 
-        assert b.commit_job_success("t::one", {"ok": True}) is True
+        assert _open_and_commit_success(b, "t::one", {"ok": True}) is True
         assert b.load_failed() == {}
         assert b.load_failure_payloads() == {}
 
@@ -180,42 +200,58 @@ class TestBackendCommitAtomicity:
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("child")])
         b.append_failed(job_uid="t::one", metadata={"error_message": "stale"})
+        attempt_id = b.append_attempt(_running_attempt("t::one"))
         before = _snapshot(b)
 
         ok = b.commit_job_success(
             "t::one",
             {"status": "ok"},
+            attempt_id=attempt_id,
+            execution_id="run_seed.1",
+            finished_at="2026-05-01T00:00:05+00:00",
             spawned_job_snapshots=[_job_snapshot("child")],
             cursor_updates={"cur": "nine"},
         )
 
         assert ok is False
-        # popped uid 仍在队列、successes/failed/cursors 均未被触碰
+        # popped uid 仍在队列、attempts/successes/failed/cursors 均未被触碰
         assert _snapshot(b) == before
+        assert b.load_attempts("t::one")[0].outcome == "running"
         assert "t::one" in _queue_uids(b)
 
         # 冲突被拒后后端仍可正常提交同一 job（spawned 改为不冲突的新 uid）
         ok = b.commit_job_success(
-            "t::one", {"status": "ok"}, spawned_job_snapshots=[_job_snapshot("fresh")]
+            "t::one",
+            {"status": "ok"},
+            attempt_id=attempt_id,
+            execution_id="run_seed.1",
+            finished_at="2026-05-01T00:00:05+00:00",
+            spawned_job_snapshots=[_job_snapshot("fresh")],
         )
         assert ok is True
         # spawned 队首插入，预置的 t::child 条目保持原位
         assert _queue_uids(b) == ["t::fresh", "t::child"]
         assert "t::one" in b.load_successes()
+        assert b.load_attempts("t::one")[0].outcome == "succeeded"
 
     def test_spawn_batch_duplicate_uid_rejected_without_dup_entries(self, dual_backend):
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one")])
+        attempt_id = b.append_attempt(_running_attempt("t::one"))
         before = _snapshot(b)
 
         ok = b.commit_job_success(
             "t::one",
             {},
+            attempt_id=attempt_id,
+            execution_id="run_seed.1",
+            finished_at="2026-05-01T00:00:05+00:00",
             spawned_job_snapshots=[_job_snapshot("x_marks"), _job_snapshot("x_marks")],
         )
 
         assert ok is False
         assert _snapshot(b) == before
+        assert b.load_attempts("t::one")[0].outcome == "running"
         # 绝不产出重复队列条目却报成功
         uids = _queue_uids(b)
         assert len(uids) == len(set(uids))
@@ -271,7 +307,8 @@ class TestBackendCommitAtomicity:
         b.enqueue_jobs([_job_snapshot("one")])
         b.append_failed("t::one", {"error_message": "stale"})
 
-        ok = b.commit_job_success(
+        ok = _open_and_commit_success(
+            b,
             "t::one",
             {"status": "ok"},
             spawned_job_snapshots=[_job_snapshot("child_one"), _job_snapshot("child_two")],
@@ -284,6 +321,69 @@ class TestBackendCommitAtomicity:
         # 成功 commit 清理 failed 同名残行
         assert "t::one" not in b.load_failed()
         assert b.load_cursors() == {"page": "two"}
+
+    def test_success_commit_rejects_invalid_attempt_row_keeping_all_tables_unchanged(self, dual_backend):
+        """成功提交校验 attempts 行（缺行、uid/执行代不符、已收尾），失败时全表与历史行零改动。"""
+        b = dual_backend
+        b.enqueue_jobs([_job_snapshot("one")])
+        b.append_failed("t::one", {"error_message": "stale"},)
+        b.seed_cursor("cur", "initial")
+
+        # 历史已收尾行（不可被后续成功提交触碰）
+        hist_id = b.append_attempt(_running_attempt("t::one", attempt_no=1))
+        assert b.update_attempt(
+            hist_id, outcome="failed", finished_at="2026-05-01T00:00:01+00:00", error_message="boom"
+        ) is True
+        other_id = b.append_attempt(_running_attempt("t::other", attempt_no=1))
+        active_id = b.append_attempt(_running_attempt("t::one", attempt_no=2))
+        before = _snapshot(b)
+        before_attempts_one = b.load_attempts("t::one")
+        before_attempts_other = b.load_attempts("t::other")
+
+        invalid_cases = [
+            # 1. attempt_id 为 None
+            dict(attempt_id=None, execution_id="run_seed.2", finished_at="2026-05-01T00:00:05+00:00"),
+            # 2. attempt_id 不存在
+            dict(attempt_id=999999, execution_id="run_seed.2", finished_at="2026-05-01T00:00:05+00:00"),
+            # 3. attempt_id 对应其他 job_uid
+            dict(attempt_id=other_id, execution_id="run_seed.1", finished_at="2026-05-01T00:00:05+00:00"),
+            # 4. execution_id 不匹配
+            dict(attempt_id=active_id, execution_id="wrong_exec.2", finished_at="2026-05-01T00:00:05+00:00"),
+            # 5. 目标 attempt_id 已经非 running（已收尾）
+            dict(attempt_id=hist_id, execution_id="run_seed.1", finished_at="2026-05-01T00:00:05+00:00"),
+            # 6. finished_at 缺失或为空
+            dict(attempt_id=active_id, execution_id="run_seed.2", finished_at=None),
+            dict(attempt_id=active_id, execution_id="run_seed.2", finished_at=""),
+        ]
+        for case in invalid_cases:
+            ok = b.commit_job_success(
+                "t::one",
+                {"status": "ok"},
+                spawned_job_snapshots=[_job_snapshot("child")],
+                cursor_updates={"cur": "updated"},
+                **case,
+            )
+            assert ok is False, f"expected False for {case}"
+            assert _snapshot(b) == before
+            assert b.load_attempts("t::one") == before_attempts_one
+            assert b.load_attempts("t::other") == before_attempts_other
+
+        # 随后传入合法参数时正常原子提交，历史行仍不改
+        ok = b.commit_job_success(
+            "t::one",
+            {"status": "ok"},
+            attempt_id=active_id,
+            execution_id="run_seed.2",
+            finished_at="2026-05-01T00:00:05+00:00",
+            spawned_job_snapshots=[_job_snapshot("child")],
+            cursor_updates={"cur": "updated"},
+        )
+        assert ok is True
+        attempts_after = b.load_attempts("t::one")
+        assert attempts_after[0] == before_attempts_one[0]
+        assert attempts_after[1].outcome == "succeeded"
+        assert attempts_after[1].finished_at == "2026-05-01T00:00:05+00:00"
+        assert b.load_attempts("t::other") == before_attempts_other
 
 
 class TestReplaceQueueAtomic:

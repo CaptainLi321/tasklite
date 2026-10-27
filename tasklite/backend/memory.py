@@ -110,15 +110,59 @@ class InMemoryStateBackend(AbstractStateBackend):
         job_uid: str,
         result_metadata: dict,
         *,
+        attempt_id: int | None = None,
+        execution_id: str | None = None,
+        finished_at: str | None = None,
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
     ) -> bool:
         with self._lock:
             try:
-                # 校验先行：全部 deepcopy 与冲突判定在任何变更前完成。
-                # 不变式：返回 False / 抛异常 ⇒ successes/queue/failed/cursors 与
+                # 校验先行：全部 deepcopy、attempts 行校验与冲突判定在任何变更前完成。
+                # 不变式：返回 False / 抛异常 ⇒ successes/attempts/queue/failed/cursors 与
                 # 调用前完全一致（对齐 SQLite 事务回滚；store 的连续失败
                 # 崩溃契约以「后端未变」为前提做重启重建）。
+                if not isinstance(attempt_id, int) or isinstance(attempt_id, bool):
+                    logger.critical(
+                        f"commit_job_success for {job_uid}: attempt_id must be an int, got {attempt_id!r}"
+                    )
+                    return False
+                if execution_id is not None and (not isinstance(execution_id, str) or not execution_id):
+                    logger.critical(
+                        f"commit_job_success for {job_uid}: execution_id must be a non-empty str or None, got {execution_id!r}"
+                    )
+                    return False
+                validate_attempt_finish("succeeded", finished_at, None)
+                current_attempt = self._attempts.get(attempt_id)
+                if current_attempt is None:
+                    logger.critical(
+                        f"commit_job_success for {job_uid}: attempt {attempt_id} does not exist"
+                    )
+                    return False
+                if current_attempt.job_uid != job_uid:
+                    logger.critical(
+                        f"commit_job_success for {job_uid}: attempt {attempt_id} job_uid mismatch "
+                        f"(expected {job_uid!r}, got {current_attempt.job_uid!r})"
+                    )
+                    return False
+                if execution_id is not None and current_attempt.execution_id != execution_id:
+                    logger.critical(
+                        f"commit_job_success for {job_uid}: attempt {attempt_id} execution_id mismatch "
+                        f"(expected {execution_id!r}, got {current_attempt.execution_id!r})"
+                    )
+                    return False
+                if current_attempt.outcome != "running":
+                    logger.critical(
+                        f"commit_job_success for {job_uid}: attempt {attempt_id} already finalized "
+                        f"with outcome {current_attempt.outcome!r}"
+                    )
+                    return False
+                updated_attempt = replace(
+                    current_attempt,
+                    outcome="succeeded",
+                    finished_at=finished_at,
+                    error_message=None,
+                )
                 success_metadata = copy.deepcopy(result_metadata or {})
                 spawned_copy = [copy.deepcopy(j) for j in spawned_job_snapshots]
                 remaining = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
@@ -147,6 +191,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                         else:
                             cursor_sets[k] = str(v)
                 # 校验全部通过，统一落变（落变段不再调用任何可失败操作）
+                self._attempts[attempt_id] = updated_attempt
                 self._successes[job_uid] = success_metadata
                 self._queue = spawned_copy + remaining  # 队首插入 spawned 并保序
                 # 成功 commit 清理 failed 同名残行：与「job 最终状态唯一」

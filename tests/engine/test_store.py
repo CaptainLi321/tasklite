@@ -84,18 +84,37 @@ def _make_store(**kwargs) -> tuple[StateStore, PipelineState, InMemoryStateBacke
     return store, state, backend
 
 
+def _open_running_attempt(backend: InMemoryStateBackend, uid: str = "t::1", execution_id: str = "run_abc.1", run_id: str = "run_abc") -> int:
+    from tasklite.models.attempt import AttemptRecord
+
+    return backend.append_attempt(
+        AttemptRecord(
+            job_uid=uid,
+            activation_no=1,
+            attempt_no=1,
+            execution_id=execution_id,
+            run_id=run_id,
+            started_at="2026-01-01T00:00:00+00:00",
+            outcome="running",
+        )
+    )
+
+
 class TestApplySuccess:
     """apply_success 原子终态转移。"""
 
     def test_basic_wall_meta(self):
-        store, state, _ = _make_store()
+        store, state, backend = _make_store()
         state.register_in_flight("process::1")
+        aid = _open_running_attempt(backend, "process::1")
 
         outcome = store.apply_success(
             "process::1",
             {"score": 100},
             run_id="run_abc",
             declared_inputs=[{"path": "/tmp/a.txt", "kind": "file"}],
+            attempt_id=aid,
+            execution_id="run_abc.1",
         )
 
         assert isinstance(outcome, SuccessOutcome)
@@ -106,22 +125,27 @@ class TestApplySuccess:
         assert "last_succeeded_at" in store.state.successes["process::1"]
         assert store.state.successes["process::1"]["inputs"][0]["path"] == "/tmp/a.txt"
         assert "process::1" not in store.state.in_flight_uids
+        (rec,) = backend.load_attempts("process::1")
+        assert rec.outcome == "succeeded"
+        assert rec.finished_at == store.state.successes["process::1"]["last_succeeded_at"]
 
     def test_run_count_continues_from_opposite_terminal(self):
         """重跑成功从失败档案对侧终态续数（run_count 跨终态递增）。"""
-        store, state, _ = _make_store()
+        store, state, backend = _make_store()
         state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error_message": "boom", "success_count": 4})
         # 终态 uid 重入 in-flight 须经重跑豁免登记（六集合互斥协议）
         store.state.mark_rerun_active("t::1")
         state.register_in_flight("t::1")
-        store.apply_success("t::1", {})
+        aid = _open_running_attempt(backend, "t::1")
+        store.apply_success("t::1", {}, attempt_id=aid)
         assert store.state.successes["t::1"]["success_count"] == 5
         assert "t::1" not in store.state.failed
 
     def test_spawn_and_cursor_updates(self):
-        store, _, _ = _make_store()
+        store, _, backend = _make_store()
         store.state.register_in_flight("root::1")
+        aid = _open_running_attempt(backend, "root::1")
         spawned = [
             {"task_type": "child", "job_id": "c1"},
             {"task_type": "child", "job_id": "c2"},
@@ -132,6 +156,7 @@ class TestApplySuccess:
             {},
             spawned_job_snapshots=spawned,
             cursor_updates={"batch_pos": "100", "old_cursor": None},
+            attempt_id=aid,
         )
 
         assert outcome.spawned_uids == ["child::c1", "child::c2"]
@@ -141,7 +166,8 @@ class TestApplySuccess:
         assert store.stats is None  # 未注入统计不炸
 
     def test_declared_inputs_deduped_by_path(self):
-        store, _, _ = _make_store()
+        store, _, backend = _make_store()
+        aid = _open_running_attempt(backend, "t::1")
         store.apply_success(
             "t::1",
             {},
@@ -151,6 +177,7 @@ class TestApplySuccess:
                 {"not_path": True},
                 "junk",
             ],
+            attempt_id=aid,
         )
         inputs = store.state.successes["t::1"]["inputs"]
         assert len(inputs) == 1
@@ -201,7 +228,8 @@ class TestApplyFailureAndCascade:
         """失败终态与成功终态互删对侧（内存与后端镜像同步）。"""
         store, _, backend = _make_store()
         store.state.register_in_flight("t::1")
-        store.apply_success("t::1", {})
+        aid = _open_running_attempt(backend, "t::1")
+        store.apply_success("t::1", {}, attempt_id=aid)
         store.state.mark_rerun_active("t::1")
         store.state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error_message": "again"})
@@ -273,7 +301,8 @@ class TestApplySkip:
 
     def test_skip_preserves_other_in_flight_rerun_exemption(self):
         store, state, backend = _make_store()
-        store.apply_success("t::running", {})
+        aid = _open_running_attempt(backend, "t::running")
+        store.apply_success("t::running", {}, attempt_id=aid)
         state.mark_rerun_active("t::running")
         state.register_in_flight("t::running")
         pending = Job("t", "skip").to_dict()
@@ -745,7 +774,7 @@ class TestAttemptTraceFinalization:
         assert backend.load_attempts("t::skip")[0].outcome == "skipped"
 
     def test_trace_update_failure_degrades_without_blocking(self):
-        """轨迹收尾失败（旁路观测面）降级告警，不阻断主事务。"""
+        """旁路轨迹收尾失败（失败/重试/跳过路径）降级告警，不阻断主事务。"""
         backend = InMemoryStateBackend()
         state = PipelineState({}, {}, {}, [])
 
@@ -756,13 +785,28 @@ class TestAttemptTraceFinalization:
         store = StateStore(TraceBreakingBackend(backend), state)
         aid = self._open_running(backend, "t::1")
 
-        store.apply_success("t::1", {}, attempt_id=aid)
-        assert "t::1" in store.state.successes
+        store.apply_failure("t::1", {"error_message": "boom"}, attempt_id=aid)
+        assert "t::1" in store.state.failed
 
-    def test_attempt_id_none_is_noop(self):
-        store, _, _ = _make_store()
-        store.apply_success("t::1", {}, attempt_id=None)
-        assert "t::1" in store.state.successes
+    def test_success_missing_or_invalid_attempt_rolls_back_and_keeps_state_clean(self):
+        """成功提交缺少有效 running attempt 行时整体失败回滚，内存状态/统计/钩子不提前变化。"""
+        stats = RunStats()
+        hooks: list[tuple[str, AttemptOutcome]] = []
+        store, state, backend = _make_store(
+            stats=stats,
+            on_attempt_finished=lambda uid, *, outcome: hooks.append((uid, outcome)),
+        )
+        job_snapshot = {"task_type": "t", "job_id": "1"}
+        state.register_in_flight("t::1")
+
+        with pytest.raises(_CommitCrashSignal, match="commit_job_success"):
+            store.apply_success("t::1", {"score": 1}, job_snapshot=job_snapshot, attempt_id=None)
+
+        assert "t::1" not in store.state.successes
+        assert "t::1" not in backend.load_successes()
+        assert "t::1" in store.state.queue_uids
+        assert stats["succeeded"] == 0
+        assert hooks == []
 
 
 class TestSnapshotAndMembership:
@@ -883,7 +927,8 @@ class _MutexProbe:
             self.store.state.spawn_jobs([_job_snapshot(uid)], front=False)
         elif action == "success":
             self._pop_from_memory_queue(uid)
-            self.store.apply_success(uid, {"score": i})
+            aid = _open_running_attempt(self.backend, uid)
+            self.store.apply_success(uid, {"score": i}, attempt_id=aid)
         elif action == "failure":
             self._pop_from_memory_queue(uid)
             self.store.apply_failure(uid, {"error_message": "boom"}, job_snapshot=_job_snapshot(uid))
@@ -948,7 +993,8 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     assert uid in probe.store.state.failed
     assert uid not in probe.store.state.successes
 
-    probe.store.apply_success(uid, {"score": 1})
+    aid = _open_running_attempt(probe.backend, uid)
+    probe.store.apply_success(uid, {"score": 1}, attempt_id=aid)
     assert uid in probe.store.state.successes
     assert uid not in probe.store.state.failed
 
@@ -961,7 +1007,7 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
 class TestRecordAttemptSeam:
     """StateStore 对 attempt 轨迹写入的统一持久化接缝测试。"""
 
-    def test_record_attempt_dispatch_success_and_degraded(self):
+    def test_record_attempt_dispatch_success_and_propagates_failure(self):
         backend = InMemoryStateBackend()
         store = StateStore(backend)
         job = Job("fetch", "1")
@@ -978,6 +1024,14 @@ class TestRecordAttemptSeam:
 
         # run_id 为空时不写轨迹
         assert store.record_attempt_dispatch(job, execution_id="x", run_id=None) is None
+
+        # 开行写入失败时向上传播异常（不静默返回 None）
+        def fail_append(_record):
+            raise RuntimeError("append_attempt failed")
+
+        backend.append_attempt = fail_append  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="append_attempt failed"):
+            store.record_attempt_dispatch(job, execution_id="run1.2", run_id="run1")
 
     def test_record_attempt_skip_success_and_degraded(self):
         backend = InMemoryStateBackend()
@@ -997,16 +1051,31 @@ class TestRecordAttemptSeam:
         assert len(backend.load_attempts("skip_type::2")) == 1
 
 
-
-def test_success_metadata_preserves_user_keys_and_setdefault_precedence():
+def test_success_metadata_preserves_user_keys_and_overwrites_framework_keys():
     store, state, backend = _make_store()
     metadata = {"run_count": 73, "last_run_at": "业务时间", "last_run_id": "业务身份",
                 "success_count": 99, "last_succeeded_at": "自定义时间",
                 "last_success_run_id": "自定义身份", "nested": {"error": "业务"}}
     state.register_in_flight("t::j")
-    store.apply_success("t::j", metadata, run_id="actual")
+    aid = _open_running_attempt(backend, "t::j", execution_id="actual.1", run_id="actual")
+    store.apply_success(
+        "t::j",
+        metadata,
+        run_id="actual",
+        attempt_id=aid,
+        execution_id="actual.1",
+        finished_at="2026-05-01T00:00:09+00:00",
+    )
     stored = backend.load_successes()["t::j"]
-    assert stored == {**metadata, "success_count": 1}
+    assert stored == {
+        **metadata,
+        "success_count": 1,
+        "last_succeeded_at": "2026-05-01T00:00:09+00:00",
+        "last_success_run_id": "actual",
+    }
+    (rec,) = backend.load_attempts("t::j")
+    assert rec.outcome == "succeeded"
+    assert rec.finished_at == "2026-05-01T00:00:09+00:00"
     metadata["nested"]["error"] = "changed"
     assert backend.load_successes()["t::j"]["nested"] == {"error": "业务"}
 

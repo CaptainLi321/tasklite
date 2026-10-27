@@ -91,6 +91,9 @@ class CompletionMachine:
                 started_monotonic=entry.started_monotonic,
                 expect_in_flight=(entry.handle is not None),
                 attempt_id=entry.attempt_id,
+                execution_id=entry.execution_id if entry.execution_id is not None else (
+                    entry.handle.execution_id if entry.handle is not None else None
+                ),
             )
         except _JobTerminated:
             # commit 连续失败达阈值 → job 已失败档案终结（正常终态）。
@@ -134,6 +137,7 @@ class CompletionMachine:
         started_monotonic: float | None = None,
         expect_in_flight: bool = True,
         attempt_id: int | None = None,
+        execution_id: str | None = None,
     ) -> None:
         """事务性提交一个执行结果到后端并同步内存。
 
@@ -168,7 +172,12 @@ class CompletionMachine:
             self._apply_retry(uid, job, job_snapshot, result, attempt_id=attempt_id)
         elif result.success:
             self._apply_success(
-                uid, job_snapshot, result, started_monotonic=started_monotonic, attempt_id=attempt_id
+                uid,
+                job_snapshot,
+                result,
+                started_monotonic=started_monotonic,
+                attempt_id=attempt_id,
+                execution_id=execution_id,
             )
         else:
             self._apply_failure(
@@ -266,6 +275,7 @@ class CompletionMachine:
         *,
         started_monotonic: float | None = None,
         attempt_id: int | None = None,
+        execution_id: str | None = None,
     ) -> None:
         """成功分支：子任务去重规范化、successes 记录与 cursor 推进。"""
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
@@ -284,6 +294,7 @@ class CompletionMachine:
             run_id=self._session.run_id,
             job_snapshot=job_snapshot,
             attempt_id=attempt_id,
+            execution_id=execution_id,
         )
         result.will_retry = False
 

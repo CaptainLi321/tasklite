@@ -28,7 +28,7 @@ from tasklite import (
 
 - 分层单向依赖：`tasklite/models/` 严禁 import `tasklite/engine/`（IPC 声明读写一律下沉 `tasklite/utils/ipc.py`），`tasklite/utils/` 严禁 import `tasklite/wrappers/`，核心层（engine/backend/models/utils）严禁依赖 `tasklite/contrib/`；
 - 版本单一事实源：`tasklite.__version__`（pyproject 动态读取点）；
-- **数据库零兼容**：schema 全新（含 attempts 表），旧库 fail-loud 拒识（`user_version=4`）；
+- **数据库零兼容**：schema 全新（含 attempts 表），旧库 fail-loud 拒识（`user_version=5`）；
 - v1 已退役：git 历史与 `v1-final` 标签留档，迁移映射见第 6 节与 ADR-0004。
 
 ---
@@ -43,11 +43,11 @@ from tasklite import (
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变（queue/successes/failed 三表 PK 与六集合互斥均以 uid 为身份） | queue 行 job_snapshot JSON（job_uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：序号、`execution_id`、起止时间、`outcome` | **append-only** 新表 `attempts` |
 
-持久层 Python 接口以 `job_snapshot` / `job_snapshots` 表示完整 Job 字典，以 `job_uid` 表示跨对象作业身份；业务输入仍称 `payload`。引擎级键值读写使用 `backend.get_engine_metadata(key)` / `backend.set_engine_metadata(key, value)`，其中 `last_run_id` 仍表示最近一次运行。当前开发落盘格式为 schema 4（包版本已切换为 2.2.0，尚未发布）。仅接纳真正空库或完整且列集合匹配的 schema 4 库；版本 0 的非空库、schema 3、混入 wall/meta 的库或半建库均明确拒绝，不自动迁移或补齐。拒绝前使用只读连接检查，保留原库；使用匹配版本读取历史，或显式选择新的状态库路径。
+持久层 Python 接口以 `job_snapshot` / `job_snapshots` 表示完整 Job 字典，以 `job_uid` 表示跨对象作业身份；业务输入仍称 `payload`。引擎级键值读写使用 `backend.get_engine_metadata(key)` / `backend.set_engine_metadata(key, value)`，其中 `last_run_id` 仍表示最近一次运行。当前开发落盘格式为 schema 5（`user_version=5`，包版本已切换为 2.2.0，尚未发布）。仅接纳真正空库或完整且列集合匹配的 schema 5 库；版本 0 的非空库、`user_version <= 4` 旧库、混入 wall/meta 的库或半建库均明确拒绝，不自动迁移或补齐。拒绝前使用只读连接检查，保留原库；使用匹配版本读取历史，或显式选择新的状态库路径。
 
-schema 4 六张核心表为 `queue(job_uid, queue_position, job_snapshot)`、`successes(job_uid, metadata)`、`failed(job_uid, metadata, payload)`、`attempts(attempt_id, job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`、`cursors(key, value)` 与 `engine_metadata(key, value)`。失败档案 `metadata` 与业务 `payload` 各自原样存取；HTTP 缓存 `http_snapshots` 是独立库，不随本 schema 切换。
+schema 5 六张核心表为 `queue(job_uid, queue_position, job_snapshot)`、`successes(job_uid, metadata)`、`failed(job_uid, metadata, payload)`、`attempts(attempt_id, job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`、`cursors(key, value)` 与 `engine_metadata(key, value)`。失败档案 `metadata` 与业务 `payload` 各自原样存取；HTTP 缓存 `http_snapshots` 是独立库，不随本 schema 切换。
 
-失败 metadata 的框架键为 `error_message/error_category/is_fatal/attempt_no`（未知尝试号仍为 0）。成功 metadata 使用 `success_count/last_succeeded_at/last_success_run_id`；计数由框架写入，两个最近成功字段仍按 `setdefault` 保留调用方值，不构成可信成功证据。业务 payload、runtime extra 及嵌套 metadata 的同拼写键均不翻译。
+失败 metadata 的框架键为 `error_message/error_category/is_fatal/attempt_no`（未知尝试号仍为 0）。成功 metadata 使用 `success_count/last_succeeded_at/last_success_run_id`；三者均由框架在同事务内强制写入（覆盖用户同名键），并与对应 running `attempts` 行收尾（`outcome='succeeded'`, `finished_at`）在同一 `BEGIN IMMEDIATE` 写事务内原子提交。业务 payload、runtime extra 及嵌套 metadata 的同拼写键均不翻译。
 
 
 ### Task：规格层

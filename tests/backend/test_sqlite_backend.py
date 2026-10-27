@@ -46,6 +46,26 @@ def _running_attempt(job_uid: str, attempt_no: int = 1, run_id: str = "run_seed"
     )
 
 
+def _open_and_commit_success(
+    backend: SQLiteStateBackend,
+    job_uid: str,
+    result_metadata: dict,
+    *,
+    attempt_no: int = 1,
+    finished_at: str = "2026-05-01T00:00:05+00:00",
+    **kwargs,
+) -> bool:
+    attempt_id = backend.append_attempt(_running_attempt(job_uid, attempt_no=attempt_no))
+    return backend.commit_job_success(
+        job_uid,
+        result_metadata,
+        attempt_id=attempt_id,
+        execution_id=f"run_seed.{attempt_no}",
+        finished_at=finished_at,
+        **kwargs,
+    )
+
+
 def _queue_uids(backend: SQLiteStateBackend) -> list[str]:
     return [job_uid_from_snapshot(j) for j in backend.load_queue()]
 
@@ -67,7 +87,7 @@ class TestSchemaInit:
             tables = _get_tables(conn)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
         assert {"queue", "successes", "failed", "attempts", "cursors", "engine_metadata"} <= tables
-        assert version == 4
+        assert version == 5
         expected = {
             "queue": {"job_uid", "queue_position", "job_snapshot"},
             "successes": {"job_uid", "metadata"},
@@ -87,7 +107,7 @@ class TestSchemaInit:
     def test_init_is_idempotent_and_preserves_data(self, tmp_path):
         db_path = tmp_path / "state.db"
         b_first = SQLiteStateBackend(db_path)
-        b_first.commit_job_success("t::one", {"ok": True}, cursor_updates={"c": "v"})
+        _open_and_commit_success(b_first, "t::one", {"ok": True}, cursor_updates={"c": "v"})
         b_first.enqueue_jobs([_job_snapshot("queued")])
 
         b_second = SQLiteStateBackend(db_path)
@@ -219,11 +239,12 @@ class TestLegacyDatabaseRejected:
 
 
 class TestCommitJobSuccess:
-    """成功 delta：successes REPLACE + popped 删除 + failed 残行清理 + spawn 队头 + cursors。"""
+    """成功 delta：同事务终结对应 attempts 行 + successes REPLACE + popped 删除 + failed 残行清理 + spawn 队头 + cursors。"""
 
     def test_atomic_writes_all_tables(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        assert backend.commit_job_success(
+        assert _open_and_commit_success(
+            backend,
             "t::source",
             {"status": "done", "bytes": 1024},
             spawned_job_snapshots=[_job_snapshot("child")],
@@ -233,31 +254,34 @@ class TestCommitJobSuccess:
         assert backend.load_successes() == {"t::source": {"status": "done", "bytes": 1024}}
         assert _queue_uids(backend) == ["t::child"]
         assert backend.load_cursors() == {"cursor_artist": "page_late"}
+        (rec,) = backend.load_attempts("t::source")
+        assert rec.outcome == "succeeded"
+        assert rec.finished_at == "2026-05-01T00:00:05+00:00"
 
     def test_removes_popped_uid_without_spawn(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([_job_snapshot("target"), _job_snapshot("next")])
 
-        assert backend.commit_job_success("t::target", {"ok": True}) is True
+        assert _open_and_commit_success(backend, "t::target", {"ok": True}) is True
         assert backend.load_successes() == {"t::target": {"ok": True}}
         assert _queue_uids(backend) == ["t::next"]
         assert backend.load_cursors() == {}
 
     def test_multiple_cursor_updates(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_success("t::one", {}, cursor_updates={"a": "one", "b": "two", "c": "three"})
+        _open_and_commit_success(backend, "t::one", {}, cursor_updates={"a": "one", "b": "two", "c": "three"})
         assert backend.load_cursors() == {"a": "one", "b": "two", "c": "three"}
 
     def test_cursor_none_value_deletes(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_success("t::one", {}, cursor_updates={"k": "v"})
-        backend.commit_job_success("t::two", {}, cursor_updates={"k": None})
+        _open_and_commit_success(backend, "t::one", {}, cursor_updates={"k": "v"})
+        _open_and_commit_success(backend, "t::two", {}, cursor_updates={"k": None})
         assert backend.load_cursors() == {}
 
     def test_same_uid_overwrites_wall(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_success("t::one", {"v": "first"})
-        backend.commit_job_success("t::one", {"v": "second"})
+        _open_and_commit_success(backend, "t::one", {"v": "first"}, attempt_no=1)
+        _open_and_commit_success(backend, "t::one", {"v": "second"}, attempt_no=2)
         assert backend.load_successes() == {"t::one": {"v": "second"}}
 
     def test_deletes_failed_same_uid_row(self, tmp_path):
@@ -265,26 +289,38 @@ class TestCommitJobSuccess:
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.commit_job_failure("t::one", {"error_message": "stale"}, payload={"k": 1})
 
-        assert backend.commit_job_success("t::one", {"ok": True}) is True
+        assert _open_and_commit_success(backend, "t::one", {"ok": True}) is True
         assert backend.load_failed() == {}
         assert backend.load_failure_payloads() == {}
 
     def test_spawn_conflict_returns_false_and_preserves_disk(self, tmp_path):
-        """spawned uid 撞磁盘既有行（漂移窗口）→ False + 全量回滚。"""
+        """spawned uid 撞磁盘既有行（漂移窗口）→ False + 全量回滚（含 attempts）。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
         job_a = _job_snapshot("alpha")
         job_b = _job_snapshot("beta")
         backend.save_queue([job_a, job_b])
+        attempt_id = backend.append_attempt(_running_attempt("t::alpha"))
 
-        assert backend.commit_job_success("t::alpha", {"ok": True}, spawned_job_snapshots=[job_b]) is False
-        # 回滚：successes 未写、popped 未删、队列原样
+        assert backend.commit_job_success(
+            "t::alpha",
+            {"ok": True},
+            attempt_id=attempt_id,
+            execution_id="run_seed.1",
+            finished_at="2026-05-01T00:00:05+00:00",
+            spawned_job_snapshots=[job_b],
+        ) is False
+        # 回滚：successes 未写、attempts 仍为 running、popped 未删、队列原样
         assert backend.load_successes() == {}
         assert _queue_uids(backend) == ["t::alpha", "t::beta"]
+        (rec,) = backend.load_attempts("t::alpha")
+        assert rec.outcome == "running"
+        assert rec.finished_at is None
 
     def test_transaction_failure_returns_false_and_preserves_queue(self, tmp_path):
         """SQLite 事务抛异常（如 disk full）→ False + on-disk 队列不变。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([_job_snapshot("alpha"), _job_snapshot("beta")])
+        attempt_id = backend.append_attempt(_running_attempt("t::alpha"))
 
         real_connect = sqlite3.connect
         call_count = {"n": 0}
@@ -300,10 +336,79 @@ class TestCommitJobSuccess:
             return real_connect(path, *args, **kwargs)
 
         with mock.patch("sqlite3.connect", side_effect=fake_connect):
-            result = backend.commit_job_success("t::alpha", {"ok": True})
+            result = backend.commit_job_success(
+                "t::alpha",
+                {"ok": True},
+                attempt_id=attempt_id,
+                execution_id="run_seed.1",
+                finished_at="2026-05-01T00:00:05+00:00",
+            )
 
         assert result is False
         assert _queue_uids(backend) == ["t::alpha", "t::beta"]
+
+    def test_each_write_point_failure_rolls_back_all_tables(self, tmp_path, monkeypatch):
+        """事务内各写点失败：successes/attempts/queue/failed/spawn/cursor 全回滚，历史 attempts 不改。"""
+        for fail_sql_fragment in (
+            "UPDATE attempts SET outcome",
+            "INSERT OR REPLACE INTO successes",
+            "DELETE FROM queue",
+            "DELETE FROM failed",
+            "INSERT OR IGNORE INTO queue",
+            "INSERT OR REPLACE INTO cursors",
+        ):
+            db_path = tmp_path / f"rollback_{fail_sql_fragment.split()[0]}_{len(fail_sql_fragment)}.db"
+            backend = SQLiteStateBackend(db_path)
+            backend.save_queue([_job_snapshot("alpha"), _job_snapshot("keep")])
+            backend.commit_job_failure("t::alpha", {"error_message": "prior"}, payload={"k": 1})
+            backend.save_queue([_job_snapshot("alpha"), _job_snapshot("keep")])
+            backend.seed_cursor("cur", "old")
+            hist_id = backend.append_attempt(_running_attempt("t::alpha", attempt_no=1))
+            backend.update_attempt(
+                hist_id, outcome="failed", finished_at="2026-05-01T00:00:01+00:00", error_message="prior"
+            )
+            active_id = backend.append_attempt(_running_attempt("t::alpha", attempt_no=2))
+
+            real_connect = sqlite3.connect
+
+            class FailingConnection(sqlite3.Connection):
+                def execute(self, sql, *args, **kwargs):
+                    if fail_sql_fragment in sql:
+                        raise sqlite3.OperationalError(f"injected failure on {fail_sql_fragment}")
+                    return super().execute(sql, *args, **kwargs)
+
+                def executemany(self, sql, *args, **kwargs):
+                    if fail_sql_fragment in sql:
+                        raise sqlite3.OperationalError(f"injected failure on {fail_sql_fragment}")
+                    return super().executemany(sql, *args, **kwargs)
+
+            def connect(database, *args, **kwargs):
+                kwargs["factory"] = FailingConnection
+                return real_connect(database, *args, **kwargs)
+
+            with monkeypatch.context() as mp_ctx:
+                mp_ctx.setattr(sqlite3, "connect", connect)
+                ok = backend.commit_job_success(
+                    "t::alpha",
+                    {"ok": True},
+                    attempt_id=active_id,
+                    execution_id="run_seed.2",
+                    finished_at="2026-05-01T00:00:05+00:00",
+                    spawned_job_snapshots=[_job_snapshot("child")],
+                    cursor_updates={"cur": "new"},
+                )
+            assert ok is False
+            assert backend.load_successes() == {}
+            assert _queue_uids(backend) == ["t::alpha", "t::keep"]
+            assert backend.load_failed() == {"t::alpha": {"error_message": "prior"}}
+            assert backend.load_failure_payloads() == {"t::alpha": {"k": 1}}
+            assert backend.load_cursors() == {"cur": "old"}
+            attempts = backend.load_attempts("t::alpha")
+            assert len(attempts) == 2
+            assert attempts[0].outcome == "failed"
+            assert attempts[0].finished_at == "2026-05-01T00:00:01+00:00"
+            assert attempts[1].outcome == "running"
+            assert attempts[1].finished_at is None
 
 
 class TestCommitJobFailure:
@@ -327,7 +432,7 @@ class TestCommitJobFailure:
     def test_deletes_wall_same_uid_in_same_transaction(self, tmp_path):
         """重跑任务失败时 successes 旧成功记录作废（最终状态唯一、互删语义）。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_success("t::one", {"ok": True})
+        _open_and_commit_success(backend, "t::one", {"ok": True})
 
         assert backend.commit_job_failure("t::one", {"error_message": "boom"}) is True
         assert backend.load_successes() == {}
@@ -380,8 +485,8 @@ class TestCommitBulkFailure:
 
     def test_deletes_wall_rows_same_transaction(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_success("t::one", {"ok": True})
-        backend.commit_job_success("t::two", {"ok": True})
+        _open_and_commit_success(backend, "t::one", {"ok": True})
+        _open_and_commit_success(backend, "t::two", {"ok": True})
         assert backend.commit_job_failures([("t::one", {"error_message": "x"}), ("t::two", {"error_message": "y"})]) is True
         assert backend.load_successes() == {}
 
@@ -628,8 +733,8 @@ class TestSqliteFailureArchive:
 
     def test_delete_wall_targeted(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_success("t::one", {"ok": True})
-        backend.commit_job_success("t::two", {"ok": True})
+        _open_and_commit_success(backend, "t::one", {"ok": True})
+        _open_and_commit_success(backend, "t::two", {"ok": True})
         assert backend.delete_successes(["t::one", "t::ghost"]) == 1
         assert set(backend.load_successes()) == {"t::two"}
 
@@ -716,19 +821,36 @@ class TestSqliteAttemptTrajectory:
         assert rec.outcome == "succeeded"
 
     def test_attempts_untouched_by_terminal_commits(self, tmp_path):
-        """旁路观测面：终态提交（含同 uid 失败）不触碰 attempts 行。"""
+        """失败/跳过终态提交不触碰 attempts；成功提交仅收尾指定 running 行而不改历史行。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.enqueue_jobs([_job_snapshot("one")])
-        attempt_id = backend.append_attempt(_running_attempt("t::one"))
+        backend.enqueue_jobs([_job_snapshot("one"), _job_snapshot("two")])
+        hist_id = backend.append_attempt(_running_attempt("t::one", attempt_no=1))
         backend.update_attempt(
-            attempt_id, outcome="failed",
+            hist_id, outcome="failed",
             finished_at="2026-05-01T00:00:05+00:00", error_message="boom",
         )
 
         backend.commit_job_failure("t::one", {"error_message": "boom"}, payload={"k": 1})
+        backend.commit_skip("t::two")
         (rec,) = backend.load_attempts("t::one")
         assert rec.outcome == "failed"
         assert rec.error_message == "boom"
+
+        active_id = backend.append_attempt(_running_attempt("t::one", attempt_no=2))
+        assert backend.commit_job_success(
+            "t::one",
+            {"ok": True},
+            attempt_id=active_id,
+            execution_id="run_seed.2",
+            finished_at="2026-05-01T00:00:09+00:00",
+        ) is True
+        hist_rec, active_rec = backend.load_attempts("t::one")
+        assert hist_rec.outcome == "failed"
+        assert hist_rec.finished_at == "2026-05-01T00:00:05+00:00"
+        assert hist_rec.error_message == "boom"
+        assert active_rec.outcome == "succeeded"
+        assert active_rec.finished_at == "2026-05-01T00:00:09+00:00"
+        assert active_rec.error_message is None
 
     def test_raw_rows_only_grow_never_rewrite_history(self, tmp_path):
         """append-only 硬断言：直查表行，历史行的身份列与已收尾列不再变化。"""
@@ -818,8 +940,9 @@ class TestConcurrentMixedWrites:
                     [{"task_type": "q", "job_id": f"e{tid}-{k}"}],
                     front=(k % 2 == 0),
                 )
-                # 路径二：成功 commit（successes 写 + popped 删除 + spawned 队头插入 + cursor）
-                if not backend.commit_job_success(
+                # 路径二：成功 commit（同事务终结 attempts + successes 写 + popped 删除 + spawned 队头插入 + cursor）
+                if not _open_and_commit_success(
+                    backend,
                     f"c::{tid}-{k}",
                     {"ok": True},
                     spawned_job_snapshots=[{"task_type": "s", "job_id": f"s{tid}-{k}"}],

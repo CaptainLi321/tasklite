@@ -25,7 +25,7 @@ from ..utils.jsonutil import dumps, loads
 logger = logging.getLogger("tasklite")
 
 # 只接纳本代完整形状或真正空库，不提供自动迁移。
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 # 核心表的精确列集合；不扩大为 SQL 类型与约束审计。
 _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -372,18 +372,58 @@ class SQLiteStateBackend(AbstractStateBackend):
         job_uid: str,
         result_metadata: dict,
         *,
+        attempt_id: int | None = None,
+        execution_id: str | None = None,
+        finished_at: str | None = None,
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
     ) -> bool:
-        """原子 delta：写 successes + 删 popped job_uid + 删 failed 残行 + 队头插 spawned + 更新 cursors。
+        """原子 delta：同事务校验并终结对应 attempts 行 + 写 successes + 删 popped job_uid + 删 failed 残行 + 队头插 spawned + 更新 cursors。
 
-        失败时事务回滚，on-disk 队列不变（popped job_uid 仍在磁盘）。
+        失败或 attempts 行校验不通过时事务整体回滚，on-disk 队列、attempts 及全表保持不变。
         """
+        if not isinstance(attempt_id, int) or isinstance(attempt_id, bool):
+            logger.critical(
+                f"Failed to commit job success for {job_uid} in {self.path.name}: "
+                f"attempt_id must be an int, got {attempt_id!r}"
+            )
+            return False
+        if execution_id is not None and (not isinstance(execution_id, str) or not execution_id):
+            logger.critical(
+                f"Failed to commit job success for {job_uid} in {self.path.name}: "
+                f"execution_id must be a non-empty str or None, got {execution_id!r}"
+            )
+            return False
         try:
+            validate_attempt_finish("succeeded", finished_at, None)
             with self._get_conn() as conn:
-                # spawned 队头插入的 queue_position 分配是读-改-写：先取写锁再读，
-                # 与并发的 front 入队互斥，否则两方读到同一 min_queue_position。
+                # 读 attempts 运行态 + spawned 队头插入的 queue_position 分配是读-改-写：
+                # 先取写锁再读，与并发写入互斥。
                 conn.execute('BEGIN IMMEDIATE')
+                attempt_row = conn.execute(
+                    'SELECT job_uid, execution_id, outcome FROM attempts WHERE attempt_id = ?',
+                    (attempt_id,),
+                ).fetchone()
+                if attempt_row is None:
+                    raise RuntimeError(f"attempt {attempt_id} does not exist")
+                row_uid, row_exec_id, row_outcome = attempt_row
+                if row_uid != job_uid:
+                    raise RuntimeError(
+                        f"attempt {attempt_id} job_uid mismatch: expected {job_uid!r}, got {row_uid!r}"
+                    )
+                if execution_id is not None and row_exec_id != execution_id:
+                    raise RuntimeError(
+                        f"attempt {attempt_id} execution_id mismatch: expected {execution_id!r}, got {row_exec_id!r}"
+                    )
+                if row_outcome != "running":
+                    raise RuntimeError(
+                        f"attempt {attempt_id} already finalized with outcome {row_outcome!r}"
+                    )
+                conn.execute(
+                    'UPDATE attempts SET outcome = ?, finished_at = ?, error_message = NULL '
+                    'WHERE attempt_id = ?',
+                    ("succeeded", finished_at, attempt_id),
+                )
                 conn.execute(
                     'INSERT OR REPLACE INTO successes (job_uid, metadata) VALUES (?, ?)',
                     (job_uid, dumps(result_metadata or {})),

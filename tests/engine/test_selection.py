@@ -955,11 +955,19 @@ def test_selection_failure_isolation_after_equal_length_spawn(
     store.apply_failure("parent::first", {"error_message": "fatal"})
 
     dispatched = store.state.pop_job(0)
+    aid = store.record_attempt_dispatch(
+        Job("allowed", "pending"), execution_id="sel_run.1", run_id="sel_run"
+    )
     child = Job(
         "excluded", "child", depends_on=["parent::failing"]
     ).to_dict()
     store.apply_success(
-        "allowed::pending", {}, job_snapshot=dispatched, spawned_job_snapshots=[child]
+        "allowed::pending",
+        {},
+        job_snapshot=dispatched,
+        spawned_job_snapshots=[child],
+        attempt_id=aid,
+        execution_id="sel_run.1",
     )
     assert len(store.state.queue) == len(rows)
 

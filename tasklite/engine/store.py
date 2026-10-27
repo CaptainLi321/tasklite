@@ -355,7 +355,7 @@ class StateStore:
         execution_id: str,
         run_id: str | None,
     ) -> int | None:
-        """记录作业派发尝试（旁路 attempts 轨迹；写失败降级告警，不阻断主流程）。"""
+        """记录作业派发尝试（写入 running 轨迹行；开行异常向外传播以阻止无行派发）。"""
         if not run_id:
             return None
         record = AttemptRecord(
@@ -367,14 +367,7 @@ class StateStore:
             started_at=utc_now_iso(),
             outcome=ATTEMPT_RUNNING,
         )
-        try:
-            return self._backend.append_attempt(record)
-        except Exception as e:
-            logger.warning(
-                f"Attempt trace append degraded for {job.uid}: {e}; "
-                f"dispatching without trace row"
-            )
-            return None
+        return self._backend.append_attempt(record)
 
     def record_attempt_skip(
         self,
@@ -466,12 +459,17 @@ class StateStore:
         run_id: str | None = None,
         job_snapshot: dict[str, Any] | None = None,
         attempt_id: int | None = None,
+        execution_id: str | None = None,
+        finished_at: str | None = None,
     ) -> SuccessOutcome:
-        """原子终态转移：成功（successes 落盘 + 清失败档案残行 + 子任务/cursor）。"""
+        """原子终态转移：成功（同事务终结对应 attempts 行 + successes 落盘 + 清失败档案残行 + 子任务/cursor）。"""
+        effective_finished_at = finished_at if finished_at is not None else utc_now_iso()
         success_metadata = copy.deepcopy(result_metadata) if result_metadata else {}
-        success_metadata.setdefault("last_succeeded_at", utc_now_iso())
+        success_metadata["last_succeeded_at"] = effective_finished_at
         if run_id is not None:
-            success_metadata.setdefault("last_success_run_id", run_id)
+            success_metadata["last_success_run_id"] = run_id
+        else:
+            success_metadata.pop("last_success_run_id", None)
         if declared_inputs:
             deduped = {
                 entry.get("path"): entry
@@ -495,6 +493,9 @@ class StateStore:
         committed = self._backend.commit_job_success(
             job_uid,
             success_metadata,
+            attempt_id=attempt_id,
+            execution_id=execution_id,
+            finished_at=effective_finished_at,
             spawned_job_snapshots=spawned_snapshots,
             cursor_updates=cursor_updates,
         )
@@ -507,7 +508,6 @@ class StateStore:
             self._state.mark_success(job_uid, success_metadata)
             self._state.unregister_in_flight(job_uid)
             self._record_stat("succeeded", 1)
-            self._finish_attempt(attempt_id, outcome=ATTEMPT_SUCCEEDED)
             spawned_uids = [job_uid_from_snapshot(j) for j in spawned_snapshots]
             return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata, spawned_uids=spawned_uids)
 

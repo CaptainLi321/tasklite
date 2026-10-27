@@ -16,6 +16,7 @@ from __future__ import annotations
 import time
 
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
+from tasklite.models.attempt import AttemptRecord
 from tasklite.models.job import Job
 
 # 相对断言的判别倍数：O(1) 两侧比值 ≈1；全表重写回归下 10k 行重插与
@@ -29,12 +30,29 @@ _QUEUE_DEPTH = 10_000
 
 def _bench_commit_job_success(backend: SQLiteStateBackend, *, samples: int) -> float:
     """多次采样 commit_job_success 单事务延迟，返回最小值。"""
+    attempt_ids = [
+        backend.append_attempt(
+            AttemptRecord(
+                job_uid="test::latency_probe",
+                activation_no=i + 1,
+                attempt_no=1,
+                execution_id=f"bench_run.{i + 1}",
+                run_id="bench_run",
+                started_at="2026-05-01T00:00:00+00:00",
+                outcome="running",
+            )
+        )
+        for i in range(samples)
+    ]
     best = float("inf")
-    for _ in range(samples):
+    for i, attempt_id in enumerate(attempt_ids):
         start = time.perf_counter()
         result = backend.commit_job_success(
             "test::latency_probe",
             result_metadata={"ok": True},
+            attempt_id=attempt_id,
+            execution_id=f"bench_run.{i + 1}",
+            finished_at="2026-05-01T00:00:05+00:00",
             spawned_job_snapshots=[],
             cursor_updates={},
         )
