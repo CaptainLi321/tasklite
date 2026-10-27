@@ -258,7 +258,6 @@ class TestDedupGate:
     def test_failed_hit_with_on_failure_reruns(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.state.mark_rerun_active("t::j1")
         env.store.state.register_in_flight("t::j1")
         env.store.apply_failure("t::j1", {"error_message": "boom"})
         env.store.state.spawn_jobs([Job("t", "j1", rerun="on_failure").to_dict()])
@@ -564,10 +563,10 @@ class TestDispatchFailureStrike:
 
 
 class TestGateOrderContract:
-    """五关顺序即契约：dedup 先于 dep-failed。"""
+    """顺序契约：dep-failed 先于 dedup。"""
 
-    def test_dedup_takes_precedence_over_dep_failed(self, tmp_path):
-        """successes 命中且无豁免的作业带失败依赖：按跳过处理，不进级联。"""
+    def test_dep_failed_takes_precedence_over_dedup(self, tmp_path):
+        """带失败依赖的作业优先判定为依赖失败，不得借旧成功跳过。"""
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.backend.commit_job_failure("dead::parent", {"error_message": "dead"})
@@ -585,9 +584,9 @@ class TestGateOrderContract:
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert env.stats["skipped"] == 1
-        assert env.stats["cascade_failed"] == 0
-        assert "t::j1" not in env.store.state.failed
+        assert env.stats["skipped"] == 0
+        assert env.stats["cascade_failed"] == 1
+        assert "t::j1" in env.store.state.failed
 
 
 class TestTraceAppendReliability:
@@ -617,3 +616,42 @@ class TestTraceAppendReliability:
         assert "t::j1" not in env.in_flight
         assert "t::j1" not in env.store.state.in_flight_uids
         assert env.backend.load_attempts("t::j1") == []
+
+
+class TestAdmissionEvaluationTiming:
+    """求值时序契约：求值前不 pop 丢队，重试沿用激活。"""
+
+    def test_evaluation_exception_preserves_candidate_in_queue(self, tmp_path, monkeypatch):
+        """准入求值异常时候选原位保留在队列中，不 pop 丢队。"""
+        env = DispatchEnv(tmp_path)
+        env.register("t")
+        job = Job("t", "j1")
+        env.store.state.spawn_jobs([job.to_dict()])
+
+        def broken_admit(*args, **kwargs):
+            raise ValueError("bad trigger evaluation")
+
+        monkeypatch.setattr(env.dispatch._rerun_policy, "admit", broken_admit)
+
+        with pytest.raises(ValueError, match="bad trigger evaluation"):
+            env.dispatch.dispatch_next()
+
+        assert "t::j1" in env.store.state.queue_uids
+        assert env.store.state.queue[0]["job_id"] == "j1"
+        assert "t::j1" not in env.store.state.in_flight_uids
+
+    def test_in_activation_retry_bypasses_rerun_policy_and_keeps_attempt_no(self, tmp_path, monkeypatch):
+        """attempt_no > 1 沿用激活内重试，不重调策略准入。"""
+        env = DispatchEnv(tmp_path)
+        env.register("t")
+        retry_job = Job("t", "j1", attempt_no=2, activation_no=1)
+        env.store.state.spawn_jobs([retry_job.to_dict()])
+        monkeypatch.setattr(
+            env.channel, "spawn",
+            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
+        )
+
+        outcome = env.dispatch.dispatch_next()
+        assert outcome.kind is DispatchKind.SPAWNED
+        assert outcome.entry.job.attempt_no == 2
+        assert outcome.entry.job.activation_no == 1

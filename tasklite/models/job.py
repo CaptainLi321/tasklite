@@ -39,12 +39,8 @@ _MAX_SAFE_UID_BYTES = 199
 
 WORKER_RESOURCE = "__workers__"
 
-# rerun 策略合法值（校验点：Job 构造 / 任务级默认策略注册）与「豁免重跑」
-# 子集（判定点：PipelineState 六集合互斥豁免）的单一真相；豁免集 =
-# 合法集 − {"never"}，新增策略值漏改任一消费点即静默丢豁免。
+# rerun 策略合法值（校验点：Job 构造 / 任务级默认策略注册）
 RERUN_VALUES = ("never", "on_failure", "every_run", "on_input_change")
-RERUN_EXEMPT_VALUES = ("every_run", "on_failure", "on_input_change")
-assert set(RERUN_EXEMPT_VALUES) == set(RERUN_VALUES) - {"never"}
 
 
 def inject_worker_resource(job_snapshot: dict) -> None:
@@ -429,7 +425,6 @@ class Job:
 __all__ = [
     "Job",
     "JobRuntimeState",
-    "RERUN_EXEMPT_VALUES",
     "RERUN_VALUES",
     "RT_COMMIT_FAILURES",
     "RT_DISPATCH_FAILURES",

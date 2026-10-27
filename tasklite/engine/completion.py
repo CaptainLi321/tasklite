@@ -48,7 +48,7 @@ class CompletionMachine:
         self,
         *,
         store: "StateStore",
-        rerun_policy: "RerunPolicy",
+        rerun_policy: "RerunPolicy | None" = None,
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
@@ -322,15 +322,10 @@ class CompletionMachine:
             if spawned_uid in seen_in_batch:
                 logger.debug(f"Skipping duplicate spawn for {spawned_uid}.")
                 continue
-            if store.state.is_known(spawned_uid):
-                if spawned_uid in store.state.queue_uids or spawned_uid in store.state.in_flight_uids:
-                    continue
-                decision = self._rerun_policy.admit(
-                    spawned_job.to_dict(), store.state,
-                    baseline_lookup=store.trusted_last_succeeded_at_us,
-                )
-                if decision.should_skip:
-                    continue
+            # 忙时去重：排队中或在途作业不重复入队；候选统一入队保留，由依赖就绪后求值
+            if spawned_uid in store.state.queue_uids or spawned_uid in store.state.in_flight_uids:
+                logger.debug(f"Skipping spawn for busy {spawned_uid}.")
+                continue
             seen_in_batch.add(spawned_uid)
             unique_spawned_jobs.append(spawned_job)
 

@@ -134,8 +134,6 @@ class TestApplySuccess:
         store, state, backend = _make_store()
         state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error_message": "boom", "success_count": 4})
-        # 终态 uid 重入 in-flight 须经重跑豁免登记（六集合互斥协议）
-        store.state.mark_rerun_active("t::1")
         state.register_in_flight("t::1")
         aid = _open_running_attempt(backend, "t::1")
         store.apply_success("t::1", {}, attempt_id=aid)
@@ -310,7 +308,6 @@ class TestApplyFailureAndCascade:
         store.state.register_in_flight("t::1")
         aid = _open_running_attempt(backend, "t::1")
         store.apply_success("t::1", {}, attempt_id=aid)
-        store.state.mark_rerun_active("t::1")
         store.state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error_message": "again"})
 
@@ -383,7 +380,6 @@ class TestApplySkip:
         store, state, backend = _make_store()
         aid = _open_running_attempt(backend, "t::running")
         store.apply_success("t::running", {}, attempt_id=aid)
-        state.mark_rerun_active("t::running")
         state.register_in_flight("t::running")
         pending = Job("t", "skip").to_dict()
         state.spawn_jobs([pending])

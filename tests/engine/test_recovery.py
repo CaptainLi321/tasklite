@@ -120,7 +120,8 @@ def _uids(jobs):
 
 
 class TestRepairQueueOnLoad:
-    def test_repair_filters_wall_and_failed_unless_rerun(self):
+    def test_repair_preserves_all_candidates_without_early_drop(self):
+        """加载期保候选契约：所有候选原样保留进内存队列，不在加载期提前删行。"""
         backend = InMemoryStateBackend()
         orchestrator = make_recovery_orchestrator(backend)
 
@@ -136,10 +137,7 @@ class TestRepairQueueOnLoad:
             successes=successes, failed=failed,
         )
 
-        assert _uids(repaired) == ["t::w_rerun", "t::f_rerun", "t::fresh"]
-        # 放行保留的重跑行落字面 rerun 键（豁免登记以行内键为事实源）
-        assert repaired[0]["rerun"] == "every_run"
-        assert repaired[1]["rerun"] == "on_failure"
+        assert _uids(repaired) == ["t::w_blocked", "t::w_rerun", "t::f_rerun", "t::fresh"]
 
     def test_repair_runtime_passes_through_untouched(self):
         """无重试节奏字段的运行时状态原样穿透（重试节奏归 RequeuePolicy）。"""
@@ -153,44 +151,20 @@ class TestRepairQueueOnLoad:
 
         assert repaired[0]["runtime"] == runtime, "修复不得改写 runtime 边带状态"
 
-    def test_repair_keeps_rerun_none_row_when_exempt_by_task_default(self):
-        """rerun=None 的行按有效策略（任务级默认）判定，落字面 effective 键。"""
-        backend = InMemoryStateBackend()
-        policy = RerunPolicy(discovery_rerun={"t": "every_run"})
-        orchestrator = make_recovery_orchestrator(
-            backend, policy=policy,
-        )
-        job = {"task_type": "t", "job_id": "dflt", "rerun": None}
-
-        repaired = orchestrator.repair_queue_on_load(
-            [job], successes={"t::dflt": {}}, failed={},
-        )
-
-        assert _uids(repaired) == ["t::dflt"]
-        assert repaired[0]["rerun"] == "every_run", (
-            "放行行必须落有效策略的字面键，豁免登记不得在加载态丢失"
-        )
-
 
 class TestRepairDeltaPersist:
-    """repair 落盘必须是差量定向删除：陈旧加载快照不得全表覆盖磁盘真相。
-
-    并发语义以受控注入模拟：在 load 之后、repair 落盘之前注入一次
-    enqueue_jobs（等价于他进程已应答成功的一次单事务入队），不依赖真实
-    多进程竞速。
-    """
+    """repair 合并必须保留磁盘真相：陈旧加载快照不得全表覆盖磁盘真相。"""
 
     def test_repair_preserves_job_enqueued_during_repair_window(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([
-            {"task_type": "t", "job_id": "residue_row", "rerun": "never"},  # successes 残留，应清理
+            {"task_type": "t", "job_id": "residue_row", "rerun": "never"},
             {"task_type": "t", "job_id": "keep_row"},
         ])
         q_data = backend.load_queue()
         # 注入「load 之后、repair 落盘之前」他进程已应答成功的入队
         backend.enqueue_jobs([{"task_type": "t", "job_id": "late"}])
 
-        # 全表重写即回归本缺陷：一旦回退为 save_queue(clean_q) 此处立即失败
         def _poison_full_rewrite(jobs):
             raise AssertionError("repair 不得以陈旧快照全表重写队列")
 
@@ -204,11 +178,11 @@ class TestRepairDeltaPersist:
         disk_uids = set(_uids(backend.load_queue()))
         assert "t::late" in disk_uids
         assert "t::keep_row" in disk_uids
-        assert "t::residue_row" not in disk_uids
+        assert "t::residue_row" in disk_uids
         # 窗口期入队的作业同时并入本次 run 的内存队列
-        assert set(_uids(repaired)) == {"t::keep_row", "t::late"}
+        assert set(_uids(repaired)) == {"t::residue_row", "t::keep_row", "t::late"}
 
-    def test_repair_deletes_only_residual_rows_from_disk(self, tmp_path):
+    def test_repair_preserves_candidate_rows_on_disk(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([
             {"task_type": "t", "job_id": "residue_row", "rerun": "never"},
@@ -218,24 +192,17 @@ class TestRepairDeltaPersist:
         ])
         q_data = backend.load_queue()
 
-        deleted_calls = []
-        orig_delete = backend.delete_queue_uids
-
-        def _recording_delete(uids):
-            deleted_calls.append(list(uids))
-            return orig_delete(uids)
-
-        backend.delete_queue_uids = _recording_delete
-
         orchestrator = make_recovery_orchestrator(backend)
         repaired = orchestrator.repair_queue_on_load(
             q_data, successes={"t::residue_row": {}}, failed={"t::failed_residue": {}}
         )
 
-        # 只定向删除残留行，保留行保持原序
-        assert _uids(backend.load_queue()) == ["t::keep_row", "t::keep_second"]
-        assert _uids(repaired) == ["t::keep_row", "t::keep_second"]
-        assert set(deleted_calls[0]) == {"t::residue_row", "t::failed_residue"}
+        assert _uids(backend.load_queue()) == [
+            "t::residue_row", "t::keep_row", "t::failed_residue", "t::keep_second"
+        ]
+        assert _uids(repaired) == [
+            "t::residue_row", "t::keep_row", "t::failed_residue", "t::keep_second"
+        ]
 
     def test_repair_delta_persist_aligned_on_memory_backend(self):
         backend = InMemoryStateBackend()
@@ -251,40 +218,8 @@ class TestRepairDeltaPersist:
             q_data, successes={"t::residue_row": {}}, failed={}
         )
 
-        assert set(_uids(backend.load_queue())) == {"t::keep_row", "t::late"}
-        assert set(_uids(repaired)) == {"t::keep_row", "t::late"}
-
-    @pytest.mark.parametrize(
-        "backend_factory",
-        [
-            lambda tmp_path: InMemoryStateBackend(),
-            lambda tmp_path: SQLiteStateBackend(tmp_path / "state.db"),
-        ],
-        ids=["memory", "sqlite"],
-    )
-    def test_delete_queue_uids_failure_degrades_instead_of_raising(
-        self, tmp_path, monkeypatch, backend_factory
-    ):
-        """差量删除失败必须降级告警：内存态照常收敛，磁盘下次加载重判。"""
-        backend = backend_factory(tmp_path)
-        recovery = make_recovery_orchestrator(backend)
-
-        def failing_delete(uids):
-            raise OSError("database is locked")
-
-        monkeypatch.setattr(backend, "delete_queue_uids", failing_delete)
-
-        snapshot = [
-            {"task_type": "t", "job_id": "residue", "rerun": "never"},
-            {"task_type": "t", "job_id": "live"},
-        ]
-        clean_q = recovery.repair_queue_on_load(
-            snapshot, {"t::residue": {"error_message": "stale"}}, {}
-        )
-
-        assert [jd["job_id"] for jd in clean_q] == ["live"], (
-            "内存态照常收敛：本次 run 不受落盘降级影响"
-        )
+        assert set(_uids(backend.load_queue())) == {"t::residue_row", "t::keep_row", "t::late"}
+        assert set(_uids(repaired)) == {"t::residue_row", "t::keep_row", "t::late"}
 
 
 class TestRepairDuplicateWarning:
@@ -726,7 +661,7 @@ class TestLoadAndRepair:
 
         assert store.state is state
         assert "t::overlap" not in state.successes and "t::overlap" in state.failed
-        assert [f"{j['task_type']}::{j['job_id']}" for j in state.queue] == ["t::fresh"]
+        assert [f"{j['task_type']}::{j['job_id']}" for j in state.queue] == ["t::done", "t::fresh"]
         assert resource_mgr.collect_suspensions() != {}, "挂起与残留信号都必须注入"
         assert list(tmp_path.glob("*.signals.jsonl")) == []
 

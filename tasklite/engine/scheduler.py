@@ -277,7 +277,17 @@ class JobScheduler:
         successes_map = state.successes
         failed_map = state.failed
         queue_uids = state.queue_uids
-        pending_or_running = queue_uids | set(in_flight_uids)
+        in_flight_set = set(in_flight_uids)
+        pending_or_running = queue_uids | in_flight_set
+
+        # 本批活跃集合：活跃态遮蔽历史终态（排除被 Exclude 延迟阻断者）
+        excluded_uids: set[str] = set()
+        if self.selection is not None and self.selection.is_active:
+            for job_snapshot in queue_snapshots:
+                tt = job_snapshot.get("task_type")
+                if tt and not self.selection.allows_task_type(tt):
+                    excluded_uids.add(job_uid_from_snapshot(job_snapshot))
+        active_uids = pending_or_running - excluded_uids
 
         runnable_idx = None
         min_wait = float('inf')
@@ -299,8 +309,6 @@ class JobScheduler:
                 logger.error(f"Malformed job dict at index {i}: {e}")
                 malformed_uids.append(job_uid_from_snapshot(job_snapshot))
                 continue
-            can_run = True
-            failed_dependency = None
 
             # 执行选择：命中 Skip/Exclude 的作业在依赖/资源评估之前整体
             # 跳过——不贡献 missing/unknown/impossible/min_wait/
@@ -314,36 +322,53 @@ class JobScheduler:
             ):
                 continue
 
-            # 1. Failed dependency: job is runnable (will be marked as dependency failure)
+            # 依赖屏障与就绪判定：活跃遮蔽历史，失败优先于去重
+            can_run = True
+            failed_dependency = None
+            has_missing_dep = False
+            waiting_for_dep = False
+
             if job.depends_on:
                 for dep_uid in job.depends_on:
-                    if dep_uid in failed_map:
+                    if dep_uid in active_uids:
+                        # 1. 依赖作业在本批活跃（队列待跑或在途执行）：必须等待其完成
+                        waiting_for_dep = True
+                        can_run = False
+                    elif dep_uid in failed_map:
+                        # 2. 依赖作业不在活跃集且处于失败档案：依赖失败，优先于 trigger 去重
                         failed_dependency = dep_uid
                         can_run = False
                         break
+                    elif dep_uid in successes_map:
+                        # 3. 依赖作业不在活跃集且处于成功档案：依赖就绪
+                        continue
+                    elif dep_uid in pending_or_running:
+                        # 4. 依赖作业在队列中（如被 Exclude 延迟阻断）：等待其就绪，非缺失依赖
+                        waiting_for_dep = True
+                        can_run = False
+                    else:
+                        # 5. 依赖作业既不在活跃集/队列，也无任何终态：真正缺失依赖
+                        has_missing_dep = True
+                        can_run = False
 
             if failed_dependency:
-                # 记录首个 pending_dep_failure，继续扫描优先挑出可运行 job
                 if pending_dep_failure is None:
                     pending_dep_failure = failed_dependency
                     dep_failed_idx = i
                 continue
 
-            # 2. Missing dependency: not runnable
-            has_missing_dep = False
-            if job.depends_on:
-                for dep_uid in job.depends_on:
-                    if dep_uid not in successes_map:
-                        can_run = False
-                        waiting_for_dependency = True
-                        has_missing_dep = True
-                        if dep_uid not in pending_or_running:
-                            missing_dependency_uids.append(job.uid)
+            if has_missing_dep:
+                waiting_for_dependency = True
+                missing_dependency_uids.append(job.uid)
+                continue
 
-            if not has_missing_dep:
-                has_potential_spawners = True
+            if waiting_for_dep:
+                waiting_for_dependency = True
+                continue
 
-            # 3. 资源评估（unknown / impossible / wait_time 由 ResourceManager 深模块统一裁决）
+            has_potential_spawners = True
+
+            # 资源评估（unknown / impossible / wait_time 由 ResourceManager 深模块统一裁决）
             eval_res = self.resource_mgr.evaluate(job.task_type, job.resources)
             if eval_res.is_unknown:
                 logger.error(f"Job {job.uid} references unknown resource '{eval_res.unknown_name}'.")

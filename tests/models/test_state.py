@@ -94,30 +94,32 @@ class TestSixSetMutex:
         with pytest.raises(AssertionError, match="queue and in_flight"):
             st.register_in_flight("t::x")
 
-    def test_terminal_uid_in_flight_triggers_assertion(self):
-        """非豁免 uid 同时落 successes 与 in-flight：断言 fail-loud。"""
+    def test_terminal_uid_in_flight_allowed_during_rerun(self):
+        """重跑场景下终态 uid 可合法处于 in-flight 集合（核心两互斥不变式保持）。"""
         st = PipelineState({}, {}, {}, [])
         st.mark_success("t::x", {"score": 1})
-        with pytest.raises(AssertionError, match="successes/failed and in_flight"):
-            st.register_in_flight("t::x")
+        st.register_in_flight("t::x")
+        assert "t::x" in st.in_flight_uids
+        assert "t::x" in st.success_uids
+        st._assert_state_consistent()
 
-    def test_rerun_exempt_uid_bypasses_terminal_mutex(self):
-        """豁免策略作业可合法落在 successes/failed ∩ in-flight 交集（不触发断言）。"""
-        st = PipelineState({}, {}, {}, [_jid("x", rerun="every_run")])
-        st.mark_success("t::x", {"score": 1})
-        st.pop_job(0)  # pop_job 登记字面豁免
-        st.register_in_flight("t::x")  # 不抛
-        assert "t::x" in st.rerun_active_uids
-        st.unregister_in_flight("t::x")
-        assert "t::x" not in st.rerun_active_uids
-
-    def test_mark_rerun_active_registers_admission_granted_uids(self):
-        """准入层放行的重跑（字面 rerun 为 None、默认策略生效）由此登记。"""
+    def test_terminal_uid_in_queue_allowed_during_rerun(self):
+        """重跑场景下终态 uid 可合法处于 queue 候选队列（依赖就绪前不提前删行）。"""
         st = PipelineState({}, {}, {}, [_jid("x")])
-        st.mark_success("t::x", {})
-        st.pop_job(0)  # 字面 None：不落字面豁免集
-        st.mark_rerun_active("t::x")  # 准入登记补齐豁免
-        st.register_in_flight("t::x")  # 不抛
+        st.mark_success("t::x", {"score": 1})
+        assert "t::x" in st.queue_uids
+        assert "t::x" in st.success_uids
+        st._assert_state_consistent()
+
+    def test_successes_failed_overlap_triggers_assertion(self):
+        """successes 与 failed 互斥违例：断言 fail-loud。"""
+        st = PipelineState({}, {}, {}, [])
+        st._successes["t::x"] = {}
+        st._failed["t::x"] = {}
+        st._success_uids.add("t::x")
+        st._failed_uids.add("t::x")
+        with pytest.raises(AssertionError, match="both successes and failed"):
+            st._assert_state_consistent()
 
     def test_unregister_and_clear_in_flight(self):
         st = PipelineState({}, {}, {}, [])
@@ -128,16 +130,6 @@ class TestSixSetMutex:
         assert st.in_flight_uids == frozenset({"b"})
         st.clear_in_flight()
         assert st.in_flight_uids == frozenset()
-
-    def test_clear_in_flight_rebuilds_rerun_actives_from_queue(self):
-        """清空后按 queue 事实源重建字面豁免集。"""
-        st = PipelineState({}, {}, {}, [_jid("r", rerun="on_failure")])
-        st.pop_job(0)
-        st.mark_rerun_active("t::r")
-        st.register_in_flight("t::r")
-        st.clear_in_flight()
-        # t::r 已不在 queue：重建后豁免集为空
-        assert "t::r" not in st.rerun_active_uids
 
     def test_wall_failed_mutex_through_inverse_transitions(self):
         """成功/失败互逆转移：任一终态写入都把 uid 从对侧集合精确移出。"""

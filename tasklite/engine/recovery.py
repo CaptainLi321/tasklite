@@ -92,7 +92,7 @@ class RecoveryOrchestrator:
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
-        rerun_policy: "RerunPolicy",
+        rerun_policy: "RerunPolicy | None" = None,
         completion: "RecoveryCompletion",
     ) -> None:
         self._store = store
@@ -175,30 +175,9 @@ class RecoveryOrchestrator:
 
         seen_uid: set = set()
         clean_queue: list[dict] = []
-        dropped_uids: list = []
 
         for job_snapshot in merged_rows:
             u = job_uid_from_snapshot(job_snapshot)
-            success_hit = u in successes
-            failed_hit = u in failed
-            if success_hit or failed_hit:
-                decision = self._rerun_policy.evaluate(
-                    job_snapshot,
-                    success_metadata=successes.get(u),
-                    is_success=success_hit,
-                    is_failed=failed_hit,
-                    baseline_lookup=lambda uid=u: self._store.trusted_last_succeeded_at_us(
-                        uid, success_metadata=successes.get(uid)
-                    ),
-                )
-                if decision.should_skip:
-                    dropped_uids.append(u)
-                    continue
-                # 不变式：放行保留的重跑行必须落字面 rerun 键——PipelineState
-                # 构造期豁免登记以行内键为事实源，动态兜底放行不得在加载态
-                # 丢失豁免（否则任意其他作业的 in-flight 登记即触发互斥断言）。
-                job_snapshot["rerun"] = decision.effective_rerun
-
             # 去重（保留首条）。集合合并已收敛镜像行，此分支仅剩快照内部
             # 的真实重复告警。去重命中项不参与磁盘删除：uid 主键约束下
             # 磁盘不存在重复行，按 uid 删除会连同保留首条一并误删。
@@ -210,17 +189,6 @@ class RecoveryOrchestrator:
             seen_uid.add(u)
             clean_queue.append(job_snapshot)
 
-        # 差量落盘：只删除需要移除的残留行，其余行原样保留。
-        # 落盘失败仅降级告警——内存态已收敛，本次 run 不受影响，磁盘保持
-        # 原状、下次加载重判（幂等），与 converge_terminal_overlap 同策略。
-        if dropped_uids:
-            try:
-                self._store.backend.delete_queue_uids(dropped_uids)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to persist queue repair deletions to backend; "
-                    f"in-memory state is converged, disk will re-converge on next load: {e}"
-                )
         return clean_queue
 
     def converge_terminal_overlap(self, successes: dict, failed: dict) -> None:

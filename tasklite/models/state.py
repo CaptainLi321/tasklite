@@ -14,13 +14,7 @@ import copy
 from collections.abc import Mapping, Set as AbstractSet
 from typing import Any
 
-from .job import Job, RERUN_EXEMPT_VALUES
-
-
-def _is_rerun_exempt(job_snapshot: dict) -> bool:
-    """rerun 策略允许越过终态重跑的作业可合法落在 successes/failed ∩ 队列
-    交集——六集合互斥断言对此类作业豁免。"""
-    return job_snapshot.get("rerun") in RERUN_EXEMPT_VALUES
+from .job import Job
 
 
 def job_uid_from_snapshot(job_snapshot: dict) -> str:
@@ -59,10 +53,6 @@ class PipelineState:
         self._failed_uids: set[str] = set(self._failed)
         self._queue_uids: set[str] = {job_uid_from_snapshot(j) for j in self._queue}
         self._in_flight_uids: set[str] = set()
-        self._rerun_active_uids: set[str] = set()
-        for j in self._queue:
-            if _is_rerun_exempt(j):
-                self._rerun_active_uids.add(job_uid_from_snapshot(j))
 
     @property
     def successes(self) -> dict[str, dict[str, Any]]:
@@ -90,8 +80,6 @@ class PipelineState:
         """弹出并返回 job dict，同步从 _queue_uids 移除其 uid。"""
         job_snapshot = self._queue.pop(idx)
         job_uid = job_uid_from_snapshot(job_snapshot)
-        if _is_rerun_exempt(job_snapshot):
-            self._rerun_active_uids.add(job_uid)
         self._queue_uids.discard(job_uid)
         if __debug__:
             self._assert_uids_consistent()
@@ -104,14 +92,11 @@ class PipelineState:
         else:
             self._queue.extend(job_snapshots)
         self._queue_uids.update(job_uid_from_snapshot(j) for j in job_snapshots)
-        for j in job_snapshots:
-            if _is_rerun_exempt(j):
-                self._rerun_active_uids.add(job_uid_from_snapshot(j))
         if __debug__:
             self._assert_uids_consistent()
 
     def remove_queued_uid(self, job_uid: str) -> None:
-        """按 uid 清除队列行，保留其他作业的在途重跑豁免。"""
+        """按 uid 清除队列行。"""
         if job_uid not in self._queue_uids:
             return
         self._queue[:] = [
@@ -119,24 +104,12 @@ class PipelineState:
             if job_uid_from_snapshot(job_snapshot) != job_uid
         ]
         self._queue_uids.discard(job_uid)
-        if job_uid not in self._in_flight_uids:
-            self._rerun_active_uids.discard(job_uid)
         if __debug__:
             self._assert_uids_consistent()
 
     def requeue_jobs(self, job_snapshots: list[dict[str, Any]], front: bool = True) -> None:
         """重入队（崩溃恢复/重试），语义同 spawn_jobs 队首插入。"""
         self.spawn_jobs(job_snapshots, front=front)
-
-    def mark_rerun_active(self, job_uid: str) -> None:
-        """登记派发期准入放行的重跑豁免 uid。
-
-        不变式：豁免集合与准入判定同源——字面 rerun 键由 pop_job/
-        spawn_jobs 登记，准入层按含任务级默认策略的有效策略放行的
-        重跑由此登记；缺任一登记，in-flight 登记的全量互斥断言都会把
-        合法重跑误判为 successes/failed ∩ in-flight 违例。
-        """
-        self._rerun_active_uids.add(job_uid)
 
     # in-flight 集合（唯一修改 _in_flight_uids 的路径）-------------
 
@@ -149,17 +122,12 @@ class PipelineState:
     def unregister_in_flight(self, job_uid: str) -> None:
         """注销一个已完成/失败/崩溃回收的 in-flight 作业 uid。"""
         self._in_flight_uids.discard(job_uid)
-        self._rerun_active_uids.discard(job_uid)
         if __debug__:
             self._assert_state_consistent()
 
     def clear_in_flight(self) -> None:
         """清空 in-flight 集合（中止回收路径使用）。"""
         self._in_flight_uids.clear()
-        self._rerun_active_uids = {
-            job_uid_from_snapshot(j) for j in self._queue
-            if _is_rerun_exempt(j)
-        }
         if __debug__:
             self._assert_state_consistent()
 
@@ -167,10 +135,6 @@ class PipelineState:
         """整体替换队列（死锁批量移除肇事者场景），重建 uid 索引。"""
         self._queue = list(job_snapshots)
         self._queue_uids = {job_uid_from_snapshot(j) for j in self._queue}
-        self._rerun_active_uids = {
-            job_uid_from_snapshot(j) for j in self._queue
-            if _is_rerun_exempt(j)
-        }
         if __debug__:
             self._assert_uids_consistent()
 
@@ -346,11 +310,6 @@ class PipelineState:
         return self._failed_uids
 
     @property
-    def rerun_active_uids(self) -> frozenset[str]:
-        """重跑豁免 uid 活索引的只读视图（六集合互斥豁免判定的事实源缓存）。"""
-        return frozenset(self._rerun_active_uids)
-
-    @property
     def in_flight_uids(self) -> frozenset[str]:
         """in-flight 作业 uid 集合。"""
         return frozenset(self._in_flight_uids)
@@ -371,14 +330,6 @@ class PipelineState:
 
     # 内部 ---------------------------------------------------------
 
-    def _rerun_exempt_uids_from_queue(self) -> set[str]:
-        """从 queue 事实源直接取重跑豁免集合，不依赖派生缓存
-        ``_rerun_active_uids``（缓存被瞬态路径误删时断言不得误报）。"""
-        return {
-            job_uid_from_snapshot(j) for j in self._queue
-            if _is_rerun_exempt(j)
-        }
-
     def _assert_uids_consistent(self) -> None:
         """DEBUG 不变式：_queue_uids 与 _queue 完全一致。"""
         recomputed = {job_uid_from_snapshot(j) for j in self._queue}
@@ -396,24 +347,18 @@ class PipelineState:
         )
 
     def _assert_state_consistent(self) -> None:
-        """DEBUG 不变式：作业身份六集合互斥。"""
+        """DEBUG 不变式：核心互斥不变式。
+        1. queue ∩ in_flight == ∅
+        2. successes ∩ failed == ∅
+        """
         overlap = self._queue_uids & self._in_flight_uids
         assert not overlap, (
             f"uid in both queue and in_flight: {overlap!r} "
             f"(queue={self._queue_uids!r} in_flight={self._in_flight_uids!r})"
         )
-        exempt = self._rerun_active_uids | self._rerun_exempt_uids_from_queue()
-        done_overlap = (set(self._successes) | set(self._failed)) & self._in_flight_uids
-        assert not (done_overlap - exempt), (
-            f"uid in successes/failed and in_flight: {done_overlap - exempt!r}"
-        )
-        success_failed = set(self._successes) & set(self._failed)
+        success_failed = self._success_uids & self._failed_uids
         assert not success_failed, (
             f"uid in both successes and failed: {success_failed!r}"
-        )
-        done_queue = (set(self._successes) | set(self._failed)) & self._queue_uids
-        assert not (done_queue - exempt), (
-            f"uid in successes/failed and queue: {done_queue - exempt!r}"
         )
         self._assert_uids_consistent()
         self._assert_terminal_uids_consistent()

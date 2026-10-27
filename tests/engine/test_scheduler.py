@@ -333,3 +333,78 @@ class TestDeadlockAttributionValue:
         assert DeadlockAttribution(missing_dependency_uids=("t::x",)).has_deadlock_causes is True
         assert DeadlockAttribution(unknown_resource_uids=("t::x",)).has_deadlock_causes is True
         assert DeadlockAttribution(impossible_resource_uids=("t::x",)).has_deadlock_causes is True
+
+
+class TestInBatchDependencyBarrier:
+    """本批依赖屏障：活跃态遮蔽历史终态，失败优先于去重。"""
+
+    def test_in_batch_active_upstream_blocks_downstream_even_if_historically_succeeded(self):
+        """上游在本批队列待执行（即使有旧成功）：下游必须等待上游本批完成。"""
+        scheduler = JobScheduler(resources={})
+        up = Job("t", "up").to_dict()
+        down = Job("t", "down", depends_on=["t::up"]).to_dict()
+        # [down, up] 逆序入队，且 t::up 历史已有成功
+        state = _state([down, up], successes={"t::up": {"last_succeeded_at": "2026-01-01T00:00:00Z"}})
+        result = scheduler.scan_next_runnable(state, frozenset())
+        assert result.is_runnable is True
+        assert result.candidate_uid == "t::up"
+        assert result.runnable_idx == 1
+
+    def test_in_batch_active_upstream_masks_historical_failure(self):
+        """上游重入队重跑（即使历史失败）：下游等待本批执行，不提前判定依赖失败。"""
+        scheduler = JobScheduler(resources={})
+        up = Job("t", "up").to_dict()
+        down = Job("t", "down", depends_on=["t::up"]).to_dict()
+        state = _state([down, up], failed={"t::up": {"error_message": "old_failure"}})
+        result = scheduler.scan_next_runnable(state, frozenset())
+        assert result.is_runnable is True
+        assert result.candidate_uid == "t::up"
+        assert result.runnable_idx == 1
+
+    def test_in_flight_upstream_blocks_downstream(self):
+        """上游在途执行中：下游等待。"""
+        scheduler = JobScheduler(resources={})
+        down = Job("t", "down", depends_on=["t::up"]).to_dict()
+        state = _state([down], successes={"t::up": {}})
+        result = scheduler.scan_next_runnable(state, in_flight_uids=frozenset({"t::up"}))
+        assert result.is_runnable is False
+        assert result.waiting_for_dependency is True
+
+    def test_terminal_failed_upstream_triggers_dep_failed(self):
+        """上游已处于失败终态且不在活跃集：直接判定依赖失败。"""
+        scheduler = JobScheduler(resources={})
+        down = Job("t", "down", depends_on=["t::up"]).to_dict()
+        state = _state([down], failed={"t::up": {"error_message": "dead"}})
+        result = scheduler.scan_next_runnable(state, frozenset())
+        assert result.is_dep_failed is True
+        assert result.pending_dep_failure == "t::up"
+        assert result.candidate_uid == "t::down"
+
+    def test_multi_layer_dag_ordering_and_cascading(self):
+        """多层 DAG [C, B, A]：逐级解锁或级联阻断。"""
+        scheduler = JobScheduler(resources={})
+        a = Job("t", "a").to_dict()
+        b = Job("t", "b", depends_on=["t::a"]).to_dict()
+        c = Job("t", "c", depends_on=["t::b"]).to_dict()
+
+        # 初始：[c, b, a]
+        state = _state([c, b, a])
+        r1 = scheduler.scan_next_runnable(state, frozenset())
+        assert r1.candidate_uid == "t::a"
+
+        # A 成功后：[c, b]
+        state_after_a = _state([c, b], successes={"t::a": {}})
+        r2 = scheduler.scan_next_runnable(state_after_a, frozenset())
+        assert r2.candidate_uid == "t::b"
+
+        # B 成功后：[c]
+        state_after_b = _state([c], successes={"t::a": {}, "t::b": {}})
+        r3 = scheduler.scan_next_runnable(state_after_b, frozenset())
+        assert r3.candidate_uid == "t::c"
+
+        # 若 B 失败后：[c]
+        state_b_failed = _state([c], successes={"t::a": {}}, failed={"t::b": {"error_message": "dead"}})
+        r_fail = scheduler.scan_next_runnable(state_b_failed, frozenset())
+        assert r_fail.is_dep_failed is True
+        assert r_fail.pending_dep_failure == "t::b"
+        assert r_fail.candidate_uid == "t::c"

@@ -176,25 +176,67 @@ class DispatchMachine:
         return DispatchOutcome(kind=DispatchKind.SPAWNED, entry=entry)
 
     def dispatch_job(self, sched: ScheduleResult) -> InFlightJob | None:
-        """统一派发单个作业：出队 → 五关预检 → 轨迹开行 → 两阶段资源
-        租约 → 子进程启动 → 在飞原子登记。
+        """统一派发单个作业：依赖失败处理 / 统一准入求值 → 出队 → 轨迹开行 →
+        两阶段资源租约 → 子进程启动 → 在飞原子登记。
 
-        返回 InFlightJob 条目；被五关预检或载荷校验拦截（已终结/已回队）
-        时返回 None。
+        返回 InFlightJob 条目；被预检拦截（已终结/跳过/已回队）时返回 None。
         """
         store = self._store
         if sched.runnable_idx is None:
             return None
-        pending_dep_failure = (
-            sched.pending_dep_failure if sched.kind == "dep_failed" else None
-        )
-        job_snapshot = store.state.pop_job(sched.runnable_idx)
-        job = Job.from_dict(job_snapshot)
+
+        # 1. 依赖已失败分支：优先于去重/准入求值（上游失败阻断下游，不得借旧成功跳过）
+        if sched.kind == "dep_failed":
+            pending_dep_failure = sched.pending_dep_failure
+            job_snapshot = store.state.pop_job(sched.runnable_idx)
+            job = Job.from_dict(job_snapshot)
+            job_uid = job.uid
+            attempt_id: int | None = None
+            try:
+                attempt_id, _ = self._open_attempt(job)
+            except Exception as e:
+                logger.warning(
+                    f"Attempt trace append degraded for dependency failed {job_uid}: {e}"
+                )
+                attempt_id = None
+            self.dispatch_dep_failed(
+                job_uid, job_snapshot, pending_dep_failure, attempt_id=attempt_id
+            )
+            return None
+
+        # 2. 候选就绪：求值前不 pop 丢队，异常原位留队
+        peek_snapshot = store.state.queue[sched.runnable_idx]
+        job = Job.from_dict(peek_snapshot)
         job_uid = job.uid
 
-        # 预检五关以调用顺序表达时序契约，每关返回 True=已处理。
-        if self.dispatch_dedup(job_uid, job, job_snapshot):
-            return None
+        # 首次激活准入 (attempt_no <= 1) vs 激活内故障重试 (attempt_no > 1)
+        if job.attempt_no <= 1:
+            decision = self._rerun_policy.admit(
+                peek_snapshot, store.state, baseline_lookup=store.trusted_last_succeeded_at_us
+            )
+            if decision.should_skip:
+                job_snapshot = store.state.pop_job(sched.runnable_idx)
+                attempt_id: int | None = None
+                try:
+                    attempt_id, _ = self._open_attempt(job)
+                except Exception as e:
+                    logger.warning(
+                        f"Attempt trace append degraded for skipped {job_uid}: {e}"
+                    )
+                    attempt_id = None
+                store.apply_skip(job_uid, job_snapshot=job_snapshot, attempt_id=attempt_id)
+                return None
+
+            job_snapshot = store.state.pop_job(sched.runnable_idx)
+            if job_uid in store.state.success_uids or job_uid in store.state.failed_uids:
+                job.activation_no = job.activation_no + 1
+                job.attempt_no = 1
+                job_snapshot["activation_no"] = job.activation_no
+                job_snapshot["attempt_no"] = 1
+                job_snapshot["rerun"] = decision.effective_rerun
+        else:
+            job_snapshot = store.state.pop_job(sched.runnable_idx)
+
         attempt_id: int | None = None
         try:
             attempt_id, execution_id = self._open_attempt(job)
@@ -211,11 +253,7 @@ class DispatchMachine:
         except BaseException:
             store.state.requeue_jobs([job_snapshot], front=True)
             raise
-        if pending_dep_failure is not None:
-            if self.dispatch_dep_failed(
-                job_uid, job_snapshot, pending_dep_failure, attempt_id=attempt_id
-            ):
-                return None
+
         if job.task_type not in self._tasks:
             if self.dispatch_no_handler(
                 job_uid, job_snapshot, job.task_type, attempt_id=attempt_id
@@ -247,49 +285,7 @@ class DispatchMachine:
         except Exception as e:
             return self._handle_dispatch_failure(job_uid, job_snapshot, attempt_id, e)
 
-    # ── 预检五关（顺序即时序契约）────────────────────────────────────
-
-    def dispatch_dedup(self, job_uid: str, job: Job, job_snapshot: dict) -> bool:
-        """派发预检关 1——去重（is_known 命中 → rerun 策略 → 跳过/放行）。
-
-        返回 True = 已处理（job 被跳过，跳过同样落轨迹行 skipped）；
-        返回 False = 未命中或准入放行（调用方继续后续预检关）。统一
-        is_known 谓词；rerun 策略豁免 every_run/on_failure/on_input_change
-        的 successes/failed 命中重跑。
-        """
-        store = self._store
-        if not store.state.is_known(job_uid):
-            return False
-        decision = self._rerun_policy.admit(
-            job_snapshot, store.state, baseline_lookup=store.trusted_last_succeeded_at_us
-        )
-        if decision.should_skip:
-            try:
-                attempt_id, _ = self._open_attempt(job)
-            except Exception as e:
-                logger.warning(
-                    f"Attempt trace append degraded for skipped {job_uid}: {e}"
-                )
-                attempt_id = None
-            store.apply_skip(job_uid, job_snapshot=job_snapshot, attempt_id=attempt_id)
-            return True
-        if decision.should_run and (job_uid in store.state.success_uids or job_uid in store.state.failed_uids):
-            # 豁免登记与准入判定同源：pop_job 只按字面 rerun 键登记豁免，
-            # 队列行无键而由动态兜底放行的重跑必须在此补登记，否则
-            # in-flight 登记的全量互斥断言会击落本关放行的作业。
-            store.state.mark_rerun_active(job_uid)
-            # 不变式：准入层放行的重跑，其有效策略必须落为行内字面键——
-            # 豁免事实随行持久，abort/retry/崩溃回滚的按字面键豁免重建
-            # （requeue/clear_in_flight/replace_queue）才不丢失动态放行事实。
-            job_snapshot["rerun"] = decision.effective_rerun
-            # 激活推进：从 successes/failed 拦截点放行重跑 = 新激活代——
-            # activation_no + 1、attempt_no 重置 1（本次执行是新激活的
-            # 首次尝试，轨迹行按新代号落表）。
-            job.activation_no = job.activation_no + 1
-            job.attempt_no = 1
-            job_snapshot["activation_no"] = job.activation_no
-            job_snapshot["attempt_no"] = 1
-        return False
+    # ── 预检关卡 ──────────────────────────────────────────────────────
 
     def dispatch_dep_failed(
         self,
