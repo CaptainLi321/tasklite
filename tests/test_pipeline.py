@@ -806,7 +806,7 @@ class TestManageApis:
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
         p.backend.append_failed("fetch::bad", {"error_message": "boom"})
-        assert p.retry_failure("fetch::bad") is True
+        assert p.retry_failure(job_uid="fetch::bad") is True
         assert "fetch::bad" not in p.backend.load_failed()
         (row,) = p.backend.load_queue()
         assert row["job_id"] == "bad"

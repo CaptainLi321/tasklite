@@ -189,7 +189,7 @@ class TestClassifierMetaDictionaries:
         exc = ConnectionResetError("network peer dropped")
         cl_first = classifier.classify(exc)
 
-        meta = cl_first.to_failure_metadata(attempt=2)
+        meta = cl_first.to_failure_metadata(attempt_no=2)
         cl_second = classifier.classify(meta)
 
         assert (
@@ -211,7 +211,7 @@ class TestClassifierMetaDictionaries:
             raw_error="ValueError: boom",
             traceback_str="tb-frame",
         )
-        meta = cl.to_failure_metadata(attempt=3)
+        meta = cl.to_failure_metadata(attempt_no=3)
         assert meta == {
             "error_message": "ValueError: boom",
             "error_category": "fatal",
@@ -267,10 +267,10 @@ class TestNeverRaiseContract:
         assert norm["failed_at"]
         assert norm["attempt_no"] == 0
 
-        # 显式 attempt 覆盖；既有 error_type / _attempt 保留
+        # 显式 attempt_no 覆盖；既有 error_category / attempt_no 保留
         norm_two = classifier.normalize_failure_metadata(
             {"error_message": "x", "error_category": ErrorCategory.DISPATCH.value, "attempt_no": 5},
-            attempt=9,
+            attempt_no=9,
         )
         assert norm_two["error_category"] == ErrorCategory.DISPATCH.value
         assert norm_two["attempt_no"] == 9

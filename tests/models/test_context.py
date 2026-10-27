@@ -31,9 +31,9 @@ def _make_ctx(
     """构造测试用 JobContext（内部容器由本工厂兜底装配）。"""
     return JobContext(
         job if job is not None else Job("fetch", "j1"),
-        successes if successes is not None else set(),
-        failed if failed is not None else set(),
-        cursors if cursors is not None else {},
+        success_job_uids=successes if successes is not None else set(),
+        failed_job_uids=failed if failed is not None else set(),
+        cursors=cursors if cursors is not None else {},
         output_roots=output_roots,
         ipc_dir=ipc_dir,
         resource_names=resources,

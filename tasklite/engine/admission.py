@@ -44,7 +44,7 @@ class DecisionReason(str, Enum):
     ON_FAILURE_MATCH = "on_failure_match"  # 命中失败档案且策略为 on_failure 放行重跑
     INPUT_CHANGED = "input_changed"        # 命中 successes 但输入文件指纹发生变化，放行重跑
     INPUT_UNCHANGED = "input_unchanged"    # 命中 successes 且输入文件指纹无变化，拦截跳过
-    SUCCESS_BLOCKED = "wall_blocked"          # 命中 successes 且策略为 never/on_failure，拦截跳过
+    SUCCESS_BLOCKED = "success_blocked"    # 命中 successes 且策略为 never/on_failure，拦截跳过
     FAILED_BLOCKED = "failed_blocked"      # 命中失败档案且策略为 never，拦截跳过
 
 

@@ -25,7 +25,7 @@ class JobContext:
         self,
         job: Job,
         success_job_uids: set | frozenset,
-        failed_keys: set | frozenset,
+        failed_job_uids: set | frozenset,
         cursors: dict[str, str],
         output_roots: Path | None = None,
         ipc_dir: str | None = None,
@@ -38,7 +38,7 @@ class JobContext:
         self.spawned_jobs: list[Job] = []
         self.resource_suspensions: list[tuple[str, float]] = []
         self._success_job_uids = success_job_uids
-        self._failed_keys = failed_keys
+        self._failed_job_uids = failed_job_uids
         self._cursors = cursors
         self.cursor_updates: dict[str, str | None] = {}
         # 已注册资源名快照——suspend_resource 据此 fail-loud。
@@ -201,11 +201,11 @@ class JobContext:
 
     def has_failed(self, job_uid: str) -> bool:
         """查询 job_uid 是否命中派发时的失败档案快照。"""
-        return job_uid in self._failed_keys
+        return job_uid in self._failed_job_uids
 
     def succeeded_or_failed_job_uids(self) -> frozenset:
         """返回派发时成功与失败档案 UID 的只读并集，不包含 skipped 或执行轨迹。"""
-        return frozenset(self._success_job_uids) | frozenset(self._failed_keys)
+        return frozenset(self._success_job_uids) | frozenset(self._failed_job_uids)
 
     def get_cursor(self, key: str) -> str | None:
         """读取高水位游标的当前值。"""

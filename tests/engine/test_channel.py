@@ -32,7 +32,7 @@ _TOKEN = "b" * 64
 
 def make_ctx(job: Job) -> JobContext:
     """最小 JobContext 装配（声明/挂起默认空，ipc_dir 由 spawn 回填）。"""
-    return JobContext(job, success_job_uids=set(), failed_keys=set(), cursors={})
+    return JobContext(job, success_job_uids=set(), failed_job_uids=set(), cursors={})
 
 
 def make_spec(
@@ -260,7 +260,7 @@ class TestWorkerWrapper:
         """per-pipeline 瞬态注册表随 ctx 下发，命中注册表按 retry 分类。"""
         job = Job("h", "reg")
         ctx = JobContext(
-            job, success_job_uids=set(), failed_keys=set(), cursors={},
+            job, success_job_uids=set(), failed_job_uids=set(), cursors={},
             transient_registry=(ConnectionAbortedError,),
         )
         spec = WorkerLaunchSpec(

@@ -56,7 +56,7 @@ class OpsConsole:
     def list_suspensions(self) -> list[SuspendEntry]:
         """只读查询当前仍生效的资源挂起（跨重启持久化的限流/离线等待）。
 
-        真相源是 meta 表（``resource_suspensions``）而非内存
+        真相源是 engine_metadata 表（``resource_suspensions``）而非内存
         ResourceManager——挂起仅在 ``run()`` 启动时恢复进内存，run() 外
         查询内存态恒为空。已过期（解封时刻早于查询时刻）的条目过滤不
         返回；坏数据降级为告警 + 跳过，与启动期恢复路径的 fail-soft
@@ -68,17 +68,17 @@ class OpsConsole:
         try:
             raw = self._store.backend.get_engine_metadata(META_RESOURCE_SUSPENSIONS)
         except Exception as e:
-            logger.warning(f"Failed to load resource suspensions from meta: {e}")
+            logger.warning(f"Failed to load resource suspensions from engine_metadata: {e}")
             return []
         if raw is None:
             return []
         try:
             deadlines = loads(raw)
         except (ValueError, TypeError) as e:
-            logger.warning(f"Corrupted resource_suspensions meta, ignoring: {e}")
+            logger.warning(f"Corrupted resource_suspensions engine_metadata, ignoring: {e}")
             return []
         if not isinstance(deadlines, dict):
-            logger.warning("resource_suspensions meta is not a dict, ignoring")
+            logger.warning("resource_suspensions engine_metadata is not a dict, ignoring")
             return []
 
         now_wall = time.time()
@@ -150,7 +150,7 @@ class OpsConsole:
         *,
         keep_fatal: bool = True,
     ) -> int:
-        """从失败档案删除匹配条目（默认保留 fatal=true 的确定性失败），
+        """从失败档案删除匹配条目（默认保留 is_fatal=true 的确定性失败），
         返回删除数。"""
         if task_types is not None:
             if not isinstance(task_types, (list, tuple)):
@@ -178,48 +178,48 @@ class OpsConsole:
             state.discard_failed(uid)
         return deleted_count
 
-    def retry_failure(self, uid: str) -> bool:
+    def retry_failure(self, job_uid: str) -> bool:
         """把失败档案中的单个作业移出档案并重新入队（人工补跑通道）。
 
         激活代按拦截点放行语义推进：档案补跑本质是 failed 拦截点放行
-        重跑，重建作业的 ``activation_no`` 取该 uid 在 attempts 轨迹中的
+        重跑，重建作业的 ``activation_no`` 取该 job_uid 在 attempts 轨迹中的
         最大激活代 +1、``attempt_no`` 归 1——否则补跑执行与首激活在
         attempts 表共享同一 ``(activation_no, attempt_no)`` 逻辑键，
         追溯面撞号；无轨迹行（带外登记）回退初激活 1。业务 payload 取
         档案快照，经 store.enqueue_jobs 规范化（策略注入 + 资源注入 +
         首入队时间）队首入队，再删档案行。先入队后删除的次序保证崩溃
         窗口至多留下「queue∩failed 并存」——由加载期修复按 rerun 策略
-        收敛，绝不丢作业。已在队列驻留的 uid 不重复入队（enqueue 去重），
+        收敛，绝不丢作业。已在队列驻留的 job_uid 不重复入队（enqueue 去重），
         档案行照删（下次 run 从队列执行）。
 
         Returns:
             bool: 条目已从档案移除（入队完成或已驻留队列）。
 
         Raises:
-            KeyError: uid 不在失败档案（typo fail-loud，静默 no-op 会
+            KeyError: job_uid 不在失败档案（typo fail-loud，静默 no-op 会
                 掩盖补跑拼写错误）。
         """
         failed = self._store.backend.load_failed()
-        if uid not in failed:
-            raise KeyError(f"uid {uid!r} not in failure archive")
-        task_type, _, job_id = uid.partition("::")
+        if job_uid not in failed:
+            raise KeyError(f"job_uid {job_uid!r} not in failure archive")
+        task_type, _, job_id = job_uid.partition("::")
         payloads = self._store.backend.load_failure_payloads()
         # 激活代取轨迹最大值 +1（failed 拦截点放行 = 新激活代），attempt_no
         # 经 Job 模型默认归 1；payload 取档案快照（无快照回退空 dict）。
         prior_activation = max(
-            (record.activation_no for record in self._store.backend.load_attempts(uid)),
+            (record.activation_no for record in self._store.backend.load_attempts(job_uid)),
             default=0,
         )
         job = Job(
             task_type=task_type,
             job_id=job_id,
-            payload=payloads.get(uid) or {},
+            payload=payloads.get(job_uid) or {},
             activation_no=prior_activation + 1,
         )
         self._store.enqueue_jobs([job], front=True)
-        self._store.backend.delete_failed([uid])
+        self._store.backend.delete_failed([job_uid])
         state = self._store.state
-        state.discard_failed(uid)
+        state.discard_failed(job_uid)
         return True
 
     def clear_history(
@@ -292,10 +292,10 @@ class OpsConsole:
                     state.discard_failed(u)
         return total
 
-    def seed_successes(self, uids: Sequence[str]) -> int:
-        """把 uid 批量写入 successes（存档迁移标记「已处理」），返回实际写入数。
+    def seed_successes(self, job_uids: Sequence[str]) -> int:
+        """把 job_uid 批量写入 successes（存档迁移标记「已处理」），返回实际写入数。
 
-        不变式（六集合互斥）：已在失败档案或驻留队列的 uid 拒绝种子。
+        不变式（六集合互斥）：已在失败档案或驻留队列的 job_uid 拒绝种子。
         failed 与 queue 两腿均以后端持久层为真相（run 前内存 state 是
         空占位，仅查内存腿会漏掉落盘队列驻留）。预检先于任何写入
         （backend 持久层与内存 state 双腿零写入），冲突整体拒绝——静默
@@ -303,11 +303,11 @@ class OpsConsole:
         变更的一致性断言崩溃；失败档案记录须先经 clear_failures /
         clear_history 显式清除，队列驻留须待 run 排空或显式清理后再种子。
         """
-        if not isinstance(uids, (list, tuple)):
+        if not isinstance(job_uids, (list, tuple)):
             raise TypeError(
-                f"uids must be a list/tuple of str, got {type(uids).__name__}"
+                f"job_uids must be a list/tuple of str, got {type(job_uids).__name__}"
             )
-        for u in uids:
+        for u in job_uids:
             if not isinstance(u, str) or u.count("::") != 1:
                 raise ValueError(
                     f"seed_successes job_uid must be 'task_type::job_id' str with exactly "
@@ -321,8 +321,8 @@ class OpsConsole:
         failed = self._store.backend.load_failed()
         queue_uids = set(self._store.state.queue_uids)
         queue_uids.update(job_uid_from_snapshot(jd) for jd in self._store.backend.load_queue())
-        conflict_failed = sorted({u for u in uids if u in failed})
-        conflict_queue = sorted({u for u in uids if u in queue_uids})
+        conflict_failed = sorted({u for u in job_uids if u in failed})
+        conflict_queue = sorted({u for u in job_uids if u in queue_uids})
         if conflict_failed:
             raise ValueError(
                 f"seed_successes refuses uid(s) already in the failure archive: "
@@ -336,9 +336,9 @@ class OpsConsole:
                 f"{conflict_queue}; successes/queue must stay disjoint. Drain or "
                 f"clear the queue entries first if archiving is intended."
             )
-        written = self._store.backend.seed_successes(list(uids))
+        written = self._store.backend.seed_successes(list(job_uids))
         state = self._store.state
-        for u in uids:
+        for u in job_uids:
             state.add_success(u, {})
         return written
 

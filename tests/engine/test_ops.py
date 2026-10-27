@@ -159,7 +159,7 @@ class TestRetryFailure:
         backend.commit_job_failure(
             "t::x", {"error_message": "boom"}, payload={"artist": "a"}
         )
-        assert console.retry_failure("t::x") is True
+        assert console.retry_failure(job_uid="t::x") is True
 
         assert backend.load_failed() == {}, "补跑必须移出失败档案"
         queue = backend.load_queue()
@@ -315,7 +315,7 @@ class TestSeeding:
 
     def test_seed_wall_makes_known(self):
         backend, _, console = _make_console()
-        assert console.seed_successes(["t::archived_1", "t::archived_2"]) == 2
+        assert console.seed_successes(job_uids=["t::archived_1", "t::archived_2"]) == 2
         assert backend.load_successes() == {
             "t::archived_1": {}, "t::archived_2": {},
         }

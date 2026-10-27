@@ -628,10 +628,10 @@ class TaskLite:
         self._ensure_not_running("clear_failures")
         return self._console.clear_failures(task_types, keep_fatal=keep_fatal)
 
-    def retry_failure(self, uid: str) -> bool:
+    def retry_failure(self, job_uid: str) -> bool:
         """把失败档案中的单个作业移出档案并重新入队（人工补跑）。"""
         self._ensure_not_running("retry_failure")
-        return self._console.retry_failure(uid)
+        return self._console.retry_failure(job_uid)
 
     def clear_history(
         self,

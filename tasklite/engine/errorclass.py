@@ -152,7 +152,7 @@ class ErrorClassification:
     raw_error: str = ""
     diagnostic_details: dict[str, Any] | None = None
 
-    def to_failure_metadata(self, *, attempt: int | None = None) -> dict[str, Any]:
+    def to_failure_metadata(self, *, attempt_no: int | None = None) -> dict[str, Any]:
         """构建落入 failed 表的标准元数据字典。"""
         meta: dict[str, Any] = {
             "error_message": self.error_code or self.raw_error or "UNKNOWN_ERROR",
@@ -163,8 +163,8 @@ class ErrorClassification:
             meta.update(self.diagnostic_details)
         if self.traceback_str:
             meta["traceback"] = self.traceback_str
-        if attempt is not None:
-            meta["attempt_no"] = attempt
+        if attempt_no is not None:
+            meta["attempt_no"] = attempt_no
         return meta
 
 
@@ -637,7 +637,7 @@ class ErrorClassifier:
         self,
         meta: Any,
         *,
-        attempt: int | None = None,
+        attempt_no: int | None = None,
         default_error: str = "UNKNOWN_ERROR",
     ) -> dict[str, Any]:
         """失败档案元数据规范化的唯一出口。"""
@@ -647,7 +647,7 @@ class ErrorClassifier:
                 "error_message": raw_err,
                 "error_category": ErrorCategory.UNKNOWN.value,
                 "failed_at": utc_now_iso(),
-                "attempt_no": attempt if attempt is not None else 0,
+                "attempt_no": attempt_no if attempt_no is not None else 0,
             }
 
         normalized = dict(meta)
@@ -658,8 +658,8 @@ class ErrorClassifier:
         if "failed_at" not in normalized:
             normalized["failed_at"] = utc_now_iso()
 
-        if attempt is not None:
-            normalized["attempt_no"] = attempt
+        if attempt_no is not None:
+            normalized["attempt_no"] = attempt_no
         else:
             normalized.setdefault("attempt_no", 0)
 

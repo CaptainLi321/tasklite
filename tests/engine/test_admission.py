@@ -28,10 +28,12 @@ class TestRerunEvaluationMatrix:
         dec_wall = policy.evaluate({"task_type": "t", "rerun": "never"}, is_success=True, is_failed=False)
         assert dec_wall.should_skip
         assert dec_wall.reason == DecisionReason.SUCCESS_BLOCKED
+        assert dec_wall.reason.value == "success_blocked"
 
         dec_failed = policy.evaluate({"task_type": "t", "rerun": "never"}, is_success=False, is_failed=True)
         assert dec_failed.should_skip
         assert dec_failed.reason == DecisionReason.FAILED_BLOCKED
+        assert dec_failed.reason.value == "failed_blocked"
 
     def test_every_run_strategy_allows_both(self):
         policy = RerunPolicy()
