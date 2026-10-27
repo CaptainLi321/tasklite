@@ -1,7 +1,7 @@
 """v2 错误分类深模块：统一错误分类、进程死亡归因、载荷校验与失败档案元数据规范化。
 
 本模块是 v2 框架对于「错误与异常」的单一真相源（Single Source of Truth）：
-异常继承体系判定、失败档案 error_type 推导、子进程死亡归因与载荷结构化
+异常继承体系判定、失败档案 error_category 推导、子进程死亡归因与载荷结构化
 校验中的规则收敛为高局部性、高杠杆的深模块。资源数额校验不在此处——
 单点位于 ``models/task.py`` 的 ``validate_resource_amounts``。
 """
@@ -77,7 +77,7 @@ TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
 
 
 class ErrorCategory(str, Enum):
-    """错误大类（权威单一事实来源；档案 error_type 取成员值）。"""
+    """错误大类（权威单一事实来源；档案 error_category 取成员值）。"""
 
     FATAL = "fatal"
     TRANSIENT_EXHAUSTED = "transient_exhausted"
@@ -135,7 +135,7 @@ class ValidationResult:
 class ErrorClassification:
     """错误多维分类决策的不可变值对象（单一真相源）。
 
-    failed_error_category 是失败档案 meta ``error_type`` 键的取值（与
+    failed_error_category 是失败档案 meta ``error_category`` 键的取值（与
     ErrorCategory 成员值同源）；中断分类按 unknown 归档——中断是瞬态
     信号不落失败档案，档案值域不为其单列成员。
     """
@@ -155,16 +155,16 @@ class ErrorClassification:
     def to_failure_metadata(self, *, attempt: int | None = None) -> dict[str, Any]:
         """构建落入 failed 表的标准元数据字典。"""
         meta: dict[str, Any] = {
-            "error": self.error_code or self.raw_error or "UNKNOWN_ERROR",
-            "error_type": self.failed_error_category,
-            "fatal": self.is_fatal,
+            "error_message": self.error_code or self.raw_error or "UNKNOWN_ERROR",
+            "error_category": self.failed_error_category,
+            "is_fatal": self.is_fatal,
         }
         if self.diagnostic_details:
             meta.update(self.diagnostic_details)
         if self.traceback_str:
             meta["traceback"] = self.traceback_str
         if attempt is not None:
-            meta["_attempt"] = attempt
+            meta["attempt_no"] = attempt
         return meta
 
 
@@ -427,7 +427,7 @@ class ErrorClassifier:
                 )
             return DeathAttribution(
                 retry_requested=False,
-                result_metadata={"error": f"{ERR_TIMEOUT_PREFIX}{timeout_seconds}s)"},
+                result_metadata={"error_message": f"{ERR_TIMEOUT_PREFIX}{timeout_seconds}s)"},
                 retry_error=None,
                 failed_error_category=ErrorCategory.FATAL.value,
             )
@@ -439,7 +439,7 @@ class ErrorClassifier:
             return DeathAttribution(
                 retry_requested=True,
                 result_metadata={
-                    "error": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}",
+                    "error_message": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}",
                     "signal": sig_name,
                     "oom_hint": _SIGKILL is not None and -exitcode == _SIGKILL,
                 },
@@ -449,13 +449,13 @@ class ErrorClassifier:
         if exitcode:
             return DeathAttribution(
                 retry_requested=True,
-                result_metadata={"error": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}"},
+                result_metadata={"error_message": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}"},
                 retry_error=f"PROCESS_CRASH_EXIT: worker exited with code {exitcode}",
                 failed_error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
             )
         return DeathAttribution(
             retry_requested=True,
-            result_metadata={"error": ERR_NO_IPC_RESULT},
+            result_metadata={"error_message": ERR_NO_IPC_RESULT},
             retry_error=f"{ERR_NO_IPC_RESULT}: worker exited without writing a result file",
             failed_error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
         )
@@ -471,7 +471,7 @@ class ErrorClassifier:
                 is_transient=True,
                 is_fatal=False,
                 is_retry=True,
-                raw_error=_safe_str(meta.get("error", "")),
+                raw_error=_safe_str(meta.get("error_message", "")),
                 traceback_str=meta.get("traceback"),
             )
         if status == "fatal":
@@ -482,7 +482,7 @@ class ErrorClassifier:
                 is_transient=False,
                 is_fatal=True,
                 is_retry=False,
-                raw_error=_safe_str(meta.get("error", "")),
+                raw_error=_safe_str(meta.get("error_message", "")),
                 traceback_str=meta.get("traceback"),
             )
         if status == "interrupted":
@@ -494,13 +494,13 @@ class ErrorClassifier:
                 is_fatal=False,
                 is_retry=False,
                 is_interrupted=True,
-                raw_error=_safe_str(meta.get("error", "")),
+                raw_error=_safe_str(meta.get("error_message", "")),
             )
 
         # 失败档案 meta 字典
-        is_fatal = bool(meta.get("fatal"))
-        error_str = _safe_str(meta.get("error", ""))
-        failed_type = meta.get("error_type")
+        is_fatal = bool(meta.get("is_fatal"))
+        error_str = _safe_str(meta.get("error_message", ""))
+        failed_type = meta.get("error_category")
 
         if is_fatal:
             return ErrorClassification(
@@ -530,7 +530,7 @@ class ErrorClassifier:
         return cl
 
     def _classify_string(self, error: str) -> ErrorClassification:
-        # (错误码/前缀, 大类, 瞬态, 致命)；档案 error_type 取大类成员值
+        # (错误码/前缀, 大类, 瞬态, 致命)；档案 error_category 取大类成员值
         mapping: tuple[tuple[str, ErrorCategory, bool, bool], ...] = (
             (ERR_DEPENDENCY_DEADLOCK, ErrorCategory.DEADLOCK, False, False),
             (ERR_RESOURCE_DEADLOCK, ErrorCategory.DEADLOCK, False, False),
@@ -644,24 +644,24 @@ class ErrorClassifier:
         if not isinstance(meta, dict):
             raw_err = _safe_str(meta) if meta is not None else default_error
             return {
-                "error": raw_err,
-                "error_type": ErrorCategory.UNKNOWN.value,
+                "error_message": raw_err,
+                "error_category": ErrorCategory.UNKNOWN.value,
                 "failed_at": utc_now_iso(),
-                "_attempt": attempt if attempt is not None else 0,
+                "attempt_no": attempt if attempt is not None else 0,
             }
 
         normalized = dict(meta)
-        if not normalized.get("error_type"):
+        if not normalized.get("error_category"):
             cl = self.classify(normalized)
-            normalized["error_type"] = cl.failed_error_category
+            normalized["error_category"] = cl.failed_error_category
 
         if "failed_at" not in normalized:
             normalized["failed_at"] = utc_now_iso()
 
         if attempt is not None:
-            normalized["_attempt"] = attempt
+            normalized["attempt_no"] = attempt
         else:
-            normalized.setdefault("_attempt", 0)
+            normalized.setdefault("attempt_no", 0)
 
         return normalized
 
@@ -885,7 +885,7 @@ def validate_payload_errors(payload: dict, schema: Any) -> list:
 
 
 def classify_error_category(meta: dict) -> str:
-    """从失败档案 meta 推导结构化 error_type（list_failures 查询与落库共用）。"""
+    """从失败档案 meta 推导结构化 error_category（list_failures 查询与落库共用）。"""
     return _DEFAULT_CLASSIFIER.classify(meta).failed_error_category
 
 

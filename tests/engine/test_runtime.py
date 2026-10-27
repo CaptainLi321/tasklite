@@ -54,7 +54,7 @@ def _write_success_result(spec) -> None:
         {
             "status": "success",
             "raw_result": True,
-            "new_jobs": [],
+            "spawned_jobs": [],
             "resource_suspensions": [],
             "cursor_updates": {},
             "auth": spec.result_token,

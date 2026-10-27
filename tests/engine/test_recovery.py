@@ -279,7 +279,7 @@ class TestRepairDeltaPersist:
             {"task_type": "t", "job_id": "live"},
         ]
         clean_q = recovery.repair_queue_on_load(
-            snapshot, {"t::residue": {"error": "stale"}}, {}
+            snapshot, {"t::residue": {"error_message": "stale"}}, {}
         )
 
         assert [jd["job_id"] for jd in clean_q] == ["live"], (
@@ -364,7 +364,7 @@ class TestTerminalOverlapConvergence:
     def test_overlap_converged_to_failed_in_memory_and_disk(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.seed_successes(["t::x", "t::clean"])
-        backend.append_failed("t::x", {"error": "boom"})
+        backend.append_failed("t::x", {"error_message": "boom"})
         successes = backend.load_successes()
         failed = backend.load_failed()
         orchestrator = make_recovery_orchestrator(backend)
@@ -704,7 +704,7 @@ class TestLoadAndRepair:
         """四连加载 → 交集收敛 → 队列修复 → 挂起恢复 → 残留回收 → 落 store。"""
         backend = InMemoryStateBackend()
         backend.seed_successes(["t::overlap", "t::done"])
-        backend.append_failed("t::overlap", {"error": "legacy"})
+        backend.append_failed("t::overlap", {"error_message": "legacy"})
         backend.enqueue_jobs([
             {"task_type": "t", "job_id": "done", "rerun": "never"},  # successes 残留
             {"task_type": "t", "job_id": "fresh"},
@@ -758,7 +758,7 @@ class TestRestoreStaleResult:
             {
                 "status": "success",
                 "raw_result": True,
-                "new_jobs": [],
+                "spawned_jobs": [],
                 "resource_suspensions": [],
                 "cursor_updates": {},
             },
@@ -783,7 +783,7 @@ class TestRestoreStaleResult:
             {
                 "status": "success",
                 "raw_result": {"poisoned": True},
-                "new_jobs": [],
+                "spawned_jobs": [],
                 "resource_suspensions": [],
                 "cursor_updates": {},
             },
@@ -801,7 +801,7 @@ class TestRestoreStaleResult:
         orchestrator, _ = self._make(tmp_path, completion=completion)
         job = Job("t", "threshold")
         ArtifactJournal(tmp_path).write_result_atomic(
-            job.uid, {"status": "fatal", "error": "boom", "traceback": "tb"},
+            job.uid, {"status": "fatal", "error_message": "boom", "traceback": "tb"},
             execution_id=_INCARNATION,
         )
 
@@ -888,7 +888,7 @@ class TestAbortInFlight:
             job.uid,
             {
                 "status": "success", "raw_result": True,
-                "new_jobs": [], "resource_suspensions": [], "cursor_updates": {},
+                "spawned_jobs": [], "resource_suspensions": [], "cursor_updates": {},
             },
             execution_id=_INCARNATION,
         )

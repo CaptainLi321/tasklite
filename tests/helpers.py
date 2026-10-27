@@ -92,28 +92,28 @@ def make_fake_process_class(outcome="success"):
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "success",
                         "raw_result": True,
-                        "new_jobs": [],
+                        "spawned_jobs": [],
                         "resource_suspensions": [],
                         "cursor_updates": {},
                     }, execution_id=execution_id, auth_token=auth_token)
                 elif outcome == "retry":
-                    _write_fake_result(ipc_dir, job.uid, {"status": "retry", "error": "transient"}, execution_id=execution_id, auth_token=auth_token)
+                    _write_fake_result(ipc_dir, job.uid, {"status": "retry", "error_message": "transient"}, execution_id=execution_id, auth_token=auth_token)
                 elif outcome == "fatal":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "fatal",
-                        "error": "FatalError: bug",
+                        "error_message": "FatalError: bug",
                         "traceback": "traceback",
                     }, execution_id=execution_id, auth_token=auth_token)
                 elif outcome == "fatal_exception":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "fatal",
-                        "error": "TypeError: bad type",
+                        "error_message": "TypeError: bad type",
                         "traceback": "traceback",
                     }, execution_id=execution_id, auth_token=auth_token)
                 elif outcome == "error":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "error",
-                        "error": "something broke",
+                        "error_message": "something broke",
                         "traceback": "traceback",
                     }, execution_id=execution_id, auth_token=auth_token)
 

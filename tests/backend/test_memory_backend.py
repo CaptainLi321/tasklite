@@ -104,10 +104,10 @@ class TestInMemoryBackendContract:
         b = InMemoryStateBackend()
         b.enqueue_jobs([_job_snapshot("doomed")])
 
-        ok = b.commit_job_failure("t::doomed", {"error": "NETWORK_TIMEOUT"})
+        ok = b.commit_job_failure("t::doomed", {"error_message": "NETWORK_TIMEOUT"})
         assert ok is True
         # v2 语义：失败 meta 精确等于调用方传入（历史与时间线由 attempts 承接）
-        assert b.load_failed() == {"t::doomed": {"error": "NETWORK_TIMEOUT"}}
+        assert b.load_failed() == {"t::doomed": {"error_message": "NETWORK_TIMEOUT"}}
         assert b.load_queue() == []
         assert b.load_successes() == {}
 
@@ -243,7 +243,7 @@ class TestMemoryAttemptTrajectory:
         b.enqueue_jobs([_job_snapshot("one")])
         attempt_id = b.append_attempt(_running_attempt("t::one"))
         b.update_attempt(attempt_id, outcome="failed", finished_at="2026-05-01T00:00:05+00:00", error_message="boom")
-        b.commit_job_failure("t::one", {"error": "boom"}, payload={"k": 1})
+        b.commit_job_failure("t::one", {"error_message": "boom"}, payload={"k": 1})
 
         (rec,) = b.load_attempts("t::one")
         assert rec.outcome == "failed"
@@ -266,29 +266,29 @@ class TestMemoryFailureArchive:
 
     def test_payload_snapshot_roundtrip_and_latest_wins(self):
         b = InMemoryStateBackend()
-        assert b.commit_job_failure("t::one", {"error": "first"}, payload={"v": 1}) is True
+        assert b.commit_job_failure("t::one", {"error_message": "first"}, payload={"v": 1}) is True
         assert b.load_failure_payloads() == {"t::one": {"v": 1}}
-        assert b.commit_job_failure("t::one", {"error": "second"}, payload={"v": 2}) is True
+        assert b.commit_job_failure("t::one", {"error_message": "second"}, payload={"v": 2}) is True
         assert b.load_failure_payloads() == {"t::one": {"v": 2}}
 
     def test_none_payload_keeps_previous_snapshot(self):
         """无 payload 的写入路径（带外登记/覆盖写）不得抹掉既有快照。"""
         b = InMemoryStateBackend()
-        assert b.commit_job_failure("t::one", {"error": "first"}, payload={"k": 1}) is True
-        b.append_failed("t::one", {"error": "second"})
+        assert b.commit_job_failure("t::one", {"error_message": "first"}, payload={"k": 1}) is True
+        b.append_failed("t::one", {"error_message": "second"})
         assert b.load_failure_payloads() == {"t::one": {"k": 1}}
 
     def test_no_snapshot_entry_absent_from_payload_view(self):
         b = InMemoryStateBackend()
-        b.append_failed("t::other", {"error": "x"})
+        b.append_failed("t::other", {"error_message": "x"})
         assert b.load_failure_payloads() == {}
 
     def test_delete_failed_clears_meta_and_snapshot(self):
         b = InMemoryStateBackend()
-        b.commit_job_failure("t::one", {"error": "x"}, payload={"k": 1})
-        b.append_failed("t::two", {"error": "y"})
+        b.commit_job_failure("t::one", {"error_message": "x"}, payload={"k": 1})
+        b.append_failed("t::two", {"error_message": "y"})
         assert b.delete_failed(["t::one", "t::ghost"]) == 1
-        assert b.load_failed() == {"t::two": {"error": "y"}}
+        assert b.load_failed() == {"t::two": {"error_message": "y"}}
         assert b.load_failure_payloads() == {}
 
     def test_delete_wall_targeted(self):
@@ -301,7 +301,7 @@ class TestMemoryFailureArchive:
     def test_success_commit_deletes_failed_same_uid(self):
         """最终状态唯一：成功 commit 删失败档案同名行（含快照）。"""
         b = InMemoryStateBackend()
-        b.commit_job_failure("t::one", {"error": "stale"}, payload={"k": 1})
+        b.commit_job_failure("t::one", {"error_message": "stale"}, payload={"k": 1})
         assert b.commit_job_success("t::one", {"ok": True}) is True
         assert b.load_failed() == {}
         assert b.load_failure_payloads() == {}
@@ -310,7 +310,7 @@ class TestMemoryFailureArchive:
         """最终状态唯一：失败 commit 删 successes 同名行。"""
         b = InMemoryStateBackend()
         b.commit_job_success("t::one", {"ok": True})
-        assert b.commit_job_failure("t::one", {"error": "boom"}) is True
+        assert b.commit_job_failure("t::one", {"error_message": "boom"}) is True
         assert b.load_successes() == {}
         assert set(b.load_failed()) == {"t::one"}
 
@@ -327,7 +327,7 @@ class TestMemorySeedAndCursor:
 
     def test_seed_wall_rejects_uid_already_in_failed_atomically(self):
         b = InMemoryStateBackend()
-        b.append_failed("t::bad", {"error": "boom"})
+        b.append_failed("t::bad", {"error_message": "boom"})
         with pytest.raises(ValueError, match="already in failed"):
             b.seed_successes(["t::ok_entry", "t::bad", "t::ok_next"])
         # 冲突整体拒绝：零写入，失败档案记录原样保留
@@ -336,7 +336,7 @@ class TestMemorySeedAndCursor:
 
     def test_seed_wall_after_delete_failed_succeeds(self):
         b = InMemoryStateBackend()
-        b.append_failed("t::one", {"error": "boom"})
+        b.append_failed("t::one", {"error_message": "boom"})
         assert b.delete_failed(["t::one"]) == 1
         assert b.seed_successes(["t::one"]) == 1
         assert b.load_successes() == {"t::one": {}}

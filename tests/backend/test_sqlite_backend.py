@@ -66,8 +66,23 @@ class TestSchemaInit:
         with sqlite3.connect(db_path) as conn:
             tables = _get_tables(conn)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert {"queue", "wall", "failed", "attempts", "cursors", "meta"} <= tables
-        assert version == 3
+        assert {"queue", "successes", "failed", "attempts", "cursors", "engine_metadata"} <= tables
+        assert version == 4
+        expected = {
+            "queue": {"job_uid", "queue_position", "job_snapshot"},
+            "successes": {"job_uid", "metadata"},
+            "failed": {"job_uid", "metadata", "payload"},
+            "attempts": {"attempt_id", "job_uid", "activation_no", "attempt_no", "execution_id",
+                         "run_id", "started_at", "finished_at", "outcome", "error_message"},
+            "cursors": {"key", "value"},
+            "engine_metadata": {"key", "value"},
+        }
+        with sqlite3.connect(db_path) as conn:
+            for table, columns in expected.items():
+                assert {row[1] for row in conn.execute(f"PRAGMA table_xinfo({table})")} == columns
+            indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        assert {"idx_queue_position", "idx_attempts_job_uid"} <= indexes
+        assert "idx_queue_seq" not in indexes
 
     def test_init_is_idempotent_and_preserves_data(self, tmp_path):
         db_path = tmp_path / "state.db"
@@ -199,7 +214,7 @@ class TestLegacyDatabaseRejected:
         conn.execute("CREATE TABLE cursors (key TEXT PRIMARY KEY, value TEXT)")
         conn.commit()
         conn.close()
-        with pytest.raises(RuntimeError, match="Unsupported table shape for 'cursors'"):
+        with pytest.raises(RuntimeError, match="Unsupported table shape"):
             SQLiteStateBackend(db_path)
 
 
@@ -248,7 +263,7 @@ class TestCommitJobSuccess:
     def test_deletes_failed_same_uid_row(self, tmp_path):
         """最终状态唯一：成功 commit 删失败档案同名残行（含快照）。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_failure("t::one", {"error": "stale"}, payload={"k": 1})
+        backend.commit_job_failure("t::one", {"error_message": "stale"}, payload={"k": 1})
 
         assert backend.commit_job_success("t::one", {"ok": True}) is True
         assert backend.load_failed() == {}
@@ -298,15 +313,15 @@ class TestCommitJobFailure:
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([_job_snapshot("doomed")])
 
-        assert backend.commit_job_failure("t::doomed", {"error": "timeout"}) is True
+        assert backend.commit_job_failure("t::doomed", {"error_message": "timeout"}) is True
         # v2 语义：失败 meta 精确等于传入（历史由 attempts 轨迹承接）
-        assert backend.load_failed() == {"t::doomed": {"error": "timeout"}}
+        assert backend.load_failed() == {"t::doomed": {"error_message": "timeout"}}
         assert backend.load_queue() == []
 
     def test_preserves_remaining_queue_order(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([_job_snapshot(j) for j in ("first", "second", "third")])
-        backend.commit_job_failure("t::second", {"error": "boom"})
+        backend.commit_job_failure("t::second", {"error_message": "boom"})
         assert _queue_uids(backend) == ["t::first", "t::third"]
 
     def test_deletes_wall_same_uid_in_same_transaction(self, tmp_path):
@@ -314,7 +329,7 @@ class TestCommitJobFailure:
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.commit_job_success("t::one", {"ok": True})
 
-        assert backend.commit_job_failure("t::one", {"error": "boom"}) is True
+        assert backend.commit_job_failure("t::one", {"error_message": "boom"}) is True
         assert backend.load_successes() == {}
         assert set(backend.load_failed()) == {"t::one"}
         assert not (set(backend.load_successes()) & set(backend.load_failed()))
@@ -337,7 +352,7 @@ class TestCommitJobFailure:
             return real_connect(path, *args, **kwargs)
 
         with mock.patch("sqlite3.connect", side_effect=fake_connect):
-            result = backend.commit_job_failure("t::alpha", {"error": "boom"})
+            result = backend.commit_job_failure("t::alpha", {"error_message": "boom"})
 
         assert result is False
         assert _queue_uids(backend) == ["t::alpha", "t::beta"]
@@ -360,14 +375,14 @@ class TestCommitBulkFailure:
     def test_preserves_remaining_queue_order(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([_job_snapshot(j) for j in ("dead_one", "dead_two", "keep_one", "keep_two")])
-        backend.commit_job_failures([("t::dead_one", {"error": "x"}), ("t::dead_two", {"error": "y"})])
+        backend.commit_job_failures([("t::dead_one", {"error_message": "x"}), ("t::dead_two", {"error_message": "y"})])
         assert _queue_uids(backend) == ["t::keep_one", "t::keep_two"]
 
     def test_deletes_wall_rows_same_transaction(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.commit_job_success("t::one", {"ok": True})
         backend.commit_job_success("t::two", {"ok": True})
-        assert backend.commit_job_failures([("t::one", {"error": "x"}), ("t::two", {"error": "y"})]) is True
+        assert backend.commit_job_failures([("t::one", {"error_message": "x"}), ("t::two", {"error_message": "y"})]) is True
         assert backend.load_successes() == {}
 
     def test_empty_list_is_noop(self, tmp_path):
@@ -390,7 +405,7 @@ class TestCommitRetry:
         assert queue[0]["attempt_no"] == 2
 
     def test_conflicting_uid_returns_false_and_preserves_disk(self, tmp_path):
-        """requeued uid 撞队列既有行 → 普通 INSERT 冲突 → False，磁盘原样。"""
+        """requeued job_uid 撞队列既有行 → 普通 INSERT 冲突 → False，磁盘原样。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
         job_a = _job_snapshot("alpha")
         job_b = _job_snapshot("beta")
@@ -467,17 +482,17 @@ class TestCorruptionAndLocks:
         backend = SQLiteStateBackend(tmp_path / "state.db")
         with sqlite3.connect(tmp_path / "state.db") as conn:
             conn.execute(
-                "INSERT INTO wall (uid, payload) VALUES (?, ?)",
+                "INSERT INTO successes (job_uid, metadata) VALUES (?, ?)",
                 ("bad_uid", "not valid json{{{"),
             )
-        with pytest.raises(RuntimeError, match="Corrupted wall payload"):
+        with pytest.raises(RuntimeError, match="Corrupted successes payload"):
             backend.load_successes()
 
     def test_load_queue_corrupt_payload_raises(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         with sqlite3.connect(tmp_path / "state.db") as conn:
             conn.execute(
-                "INSERT INTO queue (uid, seq, job_data) VALUES (?, ?, ?)",
+                "INSERT INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)",
                 ("bad", 0, "not valid json{{{"),
             )
         with pytest.raises(RuntimeError, match="Corrupted queue payload"):
@@ -487,7 +502,7 @@ class TestCorruptionAndLocks:
         backend = SQLiteStateBackend(tmp_path / "state.db")
         with sqlite3.connect(tmp_path / "state.db") as conn:
             conn.execute(
-                "INSERT INTO failed (uid, payload) VALUES (?, ?)",
+                "INSERT INTO failed (job_uid, metadata) VALUES (?, ?)",
                 ("bad_uid", "not valid json{{{"),
             )
         with pytest.raises(RuntimeError, match="Corrupted failed payload"):
@@ -503,13 +518,13 @@ class TestCorruptionAndLocks:
         with pytest.raises(RuntimeError, match="Failed to load queue"):
             backend.load_queue()
 
-    def test_dropped_table_recreated_on_reopen(self, tmp_path):
-        db_path = tmp_path / "state.db"
-        SQLiteStateBackend(db_path)
-        with sqlite3.connect(db_path) as conn:
+    def test_dropped_table_rejected_on_reopen(self, tmp_path):
+        path = tmp_path / "state.db"
+        SQLiteStateBackend(path)
+        with sqlite3.connect(path) as conn:
             conn.execute("DROP TABLE queue")
-        backend_reopened = SQLiteStateBackend(db_path)
-        assert backend_reopened.load_queue() == []
+        with pytest.raises(RuntimeError, match="Unsupported table shape for 'queue'"):
+            SQLiteStateBackend(path)
 
 
 class TestReplaceQueueAtomic:
@@ -549,7 +564,7 @@ class TestReplaceQueueAtomic:
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([_job_snapshot("keep")])
         with sqlite3.connect(backend.path) as conn:
-            conn.execute("UPDATE queue SET job_data = 'not-json'")
+            conn.execute("UPDATE queue SET job_snapshot = 'not-json'")
             conn.commit()
 
         compute_called: list[Any] = []
@@ -560,7 +575,7 @@ class TestReplaceQueueAtomic:
 
         assert compute_called == []
         with sqlite3.connect(backend.path) as conn:
-            rows = conn.execute("SELECT job_data FROM queue").fetchall()
+            rows = conn.execute("SELECT job_snapshot FROM queue").fetchall()
         assert rows == [("not-json",)], "读失败必须回滚，磁盘行原样保留"
 
 
@@ -580,35 +595,35 @@ class TestSqliteFailureArchive:
 
     def test_payload_snapshot_roundtrip_latest_wins(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        assert backend.commit_job_failure("t::one", {"error": "first"}, payload={"v": 1}) is True
+        assert backend.commit_job_failure("t::one", {"error_message": "first"}, payload={"v": 1}) is True
         assert backend.load_failure_payloads() == {"t::one": {"v": 1}}
-        assert backend.commit_job_failure("t::one", {"error": "second"}, payload={"v": 2}) is True
+        assert backend.commit_job_failure("t::one", {"error_message": "second"}, payload={"v": 2}) is True
         assert backend.load_failure_payloads() == {"t::one": {"v": 2}}
 
     def test_none_payload_keeps_previous_snapshot(self, tmp_path):
         """无 payload 的写入路径（append/覆盖写）不得抹掉既有快照。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_failure("t::one", {"error": "first"}, payload={"k": 1})
-        backend.append_failed("t::one", {"error": "second"})
+        backend.commit_job_failure("t::one", {"error_message": "first"}, payload={"k": 1})
+        backend.append_failed("t::one", {"error_message": "second"})
         assert backend.load_failure_payloads() == {"t::one": {"k": 1}}
 
     def test_no_snapshot_entry_absent_from_payload_view(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.append_failed("t::other", {"error": "x"})
+        backend.append_failed("t::other", {"error_message": "x"})
         assert backend.load_failure_payloads() == {}
 
     def test_unserializable_payload_returns_false(self, tmp_path):
         """payload 不可序列化 → 序列化异常回滚 → False（不落半行）。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        assert backend.commit_job_failure("t::one", {"error": "x"}, payload={"bad": object()}) is False
+        assert backend.commit_job_failure("t::one", {"error_message": "x"}, payload={"bad": object()}) is False
         assert backend.load_failed() == {}
 
     def test_delete_failed_clears_meta_and_snapshot(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_failure("t::one", {"error": "x"}, payload={"k": 1})
-        backend.append_failed("t::two", {"error": "y"})
+        backend.commit_job_failure("t::one", {"error_message": "x"}, payload={"k": 1})
+        backend.append_failed("t::two", {"error_message": "y"})
         assert backend.delete_failed(["t::one", "t::ghost"]) == 1
-        assert backend.load_failed() == {"t::two": {"error": "y"}}
+        assert backend.load_failed() == {"t::two": {"error_message": "y"}}
         assert backend.load_failure_payloads() == {}
 
     def test_delete_wall_targeted(self, tmp_path):
@@ -710,7 +725,7 @@ class TestSqliteAttemptTrajectory:
             finished_at="2026-05-01T00:00:05+00:00", error_message="boom",
         )
 
-        backend.commit_job_failure("t::one", {"error": "boom"}, payload={"k": 1})
+        backend.commit_job_failure("t::one", {"error_message": "boom"}, payload={"k": 1})
         (rec,) = backend.load_attempts("t::one")
         assert rec.outcome == "failed"
         assert rec.error_message == "boom"
@@ -728,8 +743,8 @@ class TestSqliteAttemptTrajectory:
 
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
-                "SELECT id, job_uid, started_at, outcome, finished_at, error "
-                "FROM attempts ORDER BY id ASC"
+                "SELECT attempt_id, job_uid, started_at, outcome, finished_at, error_message "
+                "FROM attempts ORDER BY attempt_id ASC"
             ).fetchall()
         assert len(rows) == 2
         assert rows[0] == (
@@ -752,7 +767,7 @@ class TestSeedWallAndCursor:
 
     def test_seed_wall_rejects_uid_already_in_failed_atomically(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.append_failed("t::bad", {"error": "boom"})
+        backend.append_failed("t::bad", {"error_message": "boom"})
 
         with pytest.raises(ValueError, match="already in failed"):
             backend.seed_successes(["t::ok_entry", "t::bad", "t::ok_next"])
@@ -763,7 +778,7 @@ class TestSeedWallAndCursor:
 
     def test_seed_wall_after_delete_failed_succeeds(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.append_failed("t::one", {"error": "boom"})
+        backend.append_failed("t::one", {"error_message": "boom"})
         assert backend.delete_failed(["t::one"]) == 1
         assert backend.seed_successes(["t::one"]) == 1
         assert backend.load_successes() == {"t::one": {}}
@@ -812,9 +827,9 @@ class TestConcurrentMixedWrites:
                 ):
                     errors.append(f"commit_job_success returned False (t{tid} k{k})")
                 # 路径三：共享 uid 的失败档案并发写（按 uid REPLACE、快照保留）
-                backend.append_failed("shared::uid", {"error": "boom"})
+                backend.append_failed("shared::uid", {"error_message": "boom"})
                 # 路径四：失败 commit（失败档案写入的另一个并发入口）
-                if not backend.commit_job_failure(f"f::{tid}-{k}", {"error": "x"}):
+                if not backend.commit_job_failure(f"f::{tid}-{k}", {"error_message": "x"}):
                     errors.append(f"commit_job_failure returned False (t{tid} k{k})")
         except Exception as e:
             errors.append(f"thread {tid} failed: {e!r}")
@@ -846,7 +861,7 @@ class TestConcurrentMixedWrites:
 
         with sqlite3.connect(db_path) as conn:
             total, distinct = conn.execute(
-                "SELECT COUNT(*), COUNT(DISTINCT seq) FROM queue"
+                "SELECT COUNT(*), COUNT(DISTINCT queue_position) FROM queue"
             ).fetchone()
         # seq 全局唯一：重复 seq 直接破坏队头保序契约
         assert total == distinct, (
@@ -858,7 +873,7 @@ class TestConcurrentMixedWrites:
 
         # 失败档案：共享 uid 按唯一终态收敛为一行，meta 为最后一次写入
         failed = backends[0].load_failed()
-        assert failed["shared::uid"] == {"error": "boom"}
+        assert failed["shared::uid"] == {"error_message": "boom"}
         assert len(failed) == N_THREADS * N_ROUNDS + 1
 
         # successes 全部落盘（每个 c:: uid 一次成功 commit）
@@ -887,10 +902,10 @@ class TestInterleavedTwoConnections:
 
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
-                "SELECT uid FROM queue ORDER BY seq ASC"
+                "SELECT job_uid FROM queue ORDER BY queue_position ASC"
             ).fetchall()
             total, distinct = conn.execute(
-                "SELECT COUNT(*), COUNT(DISTINCT seq) FROM queue"
+                "SELECT COUNT(*), COUNT(DISTINCT queue_position) FROM queue"
             ).fetchone()
         # 队头保序契约：后插入的 seq 更小，seq 升序 = 插入逆序
         assert [r[0] for r in rows] == list(reversed(insert_order))

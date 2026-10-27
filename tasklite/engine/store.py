@@ -219,7 +219,7 @@ class StateStore:
     @staticmethod
     def _attempt_error(metadata: Mapping[str, Any]) -> str | None:
         """从失败 meta 提取轨迹行错误串（空串收敛为 None）。"""
-        error_message = str(metadata.get("error") or "")
+        error_message = str(metadata.get("error_message") or "")
         return error_message or None
 
     # ── 摄入管道（enqueue / spawn）──────────────────────────────────
@@ -469,9 +469,9 @@ class StateStore:
     ) -> SuccessOutcome:
         """原子终态转移：成功（successes 落盘 + 清失败档案残行 + 子任务/cursor）。"""
         success_metadata = copy.deepcopy(result_metadata) if result_metadata else {}
-        success_metadata.setdefault("last_run_at", utc_now_iso())
+        success_metadata.setdefault("last_succeeded_at", utc_now_iso())
         if run_id is not None:
-            success_metadata.setdefault("last_run_id", run_id)
+            success_metadata.setdefault("last_success_run_id", run_id)
         if declared_inputs:
             deduped = {
                 entry.get("path"): entry
@@ -481,15 +481,15 @@ class StateStore:
             if deduped:
                 success_metadata["inputs"] = list(deduped.values())
 
-        # 增量记录 run_count（防御非 int 脏数据；重跑成功从对侧终态续数）
+        # 增量记录 success_count（防御非 int 脏数据；重跑成功从对侧终态续数）
         prev_meta = self._state.successes.get(job_uid) or self._state.failed.get(job_uid)
         prev_count = 0
         if isinstance(prev_meta, dict):
             try:
-                prev_count = int(prev_meta.get("run_count", 0))
+                prev_count = int(prev_meta.get("success_count", 0))
             except (TypeError, ValueError):
                 prev_count = 0
-        success_metadata["run_count"] = prev_count + 1
+        success_metadata["success_count"] = prev_count + 1
 
         spawned_snapshots = list(spawned_job_snapshots)
         committed = self._backend.commit_job_success(
@@ -698,7 +698,7 @@ class StateStore:
         if not cascade_uids:
             return []
         cascade_metas = [
-            (job_uid, {"error": ERR_JOB_DEPENDENCY, "failed_dependency": failed_uid})
+            (job_uid, {"error_message": ERR_JOB_DEPENDENCY, "failed_dependency": failed_uid})
             for job_uid in cascade_uids
         ]
         committed = self._backend.commit_job_failures(cascade_metas)
@@ -774,8 +774,8 @@ class StateStore:
                 f"archive instead of crashing."
             )
             strike_meta = {
-                "error": ERR_COMMIT_FAILURE,
-                "fatal": True,
+                "error_message": ERR_COMMIT_FAILURE,
+                "is_fatal": True,
                 "commit_failures": failures,
             }
             strike_committed = self._backend.commit_job_failure(
@@ -858,8 +858,8 @@ class StateStore:
         分离，在途集合交由调用方统一处置。返回单写失败档案是否落盘。
         """
         strike_meta = {
-            "error": ERR_COMMIT_FAILURE,
-            "fatal": True,
+            "error_message": ERR_COMMIT_FAILURE,
+            "is_fatal": True,
             "commit_failures": failures,
         }
         single_committed = self._backend.commit_job_failure(

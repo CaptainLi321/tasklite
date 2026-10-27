@@ -284,7 +284,7 @@ class DeadlockGovernor:
         精准删除收敛，本方法只负责归因装配。
         """
         return [
-            (job_uid_from_snapshot(jd), {"error": error, "root_cause": True})
+            (job_uid_from_snapshot(jd), {"error_message": error, "root_cause": True})
             for jd in queue
             if target_uids is None or job_uid_from_snapshot(jd) in target_uids
         ]
@@ -522,7 +522,7 @@ class DeadlockGovernor:
                 )
                 fallback_outcome = store.apply_bulk_failure(
                     [
-                        (uid, {"error": ERR_DEADLOCK_GAP, "root_cause": True})
+                        (uid, {"error_message": ERR_DEADLOCK_GAP, "root_cause": True})
                         for uid in standstill.stuck_uids
                     ]
                 )

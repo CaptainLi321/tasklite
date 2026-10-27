@@ -148,7 +148,7 @@ class TestCompleteJobSuccess:
 
         assert env.resources["gpu"].used == 0.0
         assert env.store.state.successes["t::j1"]["score"] == 100
-        assert env.store.state.successes["t::j1"]["last_run_id"] == env.session.run_id
+        assert env.store.state.successes["t::j1"]["last_success_run_id"] == env.session.run_id
         assert env.store.state.successes["t::j1"]["inputs"][0]["path"] == "/data/in.csv"
         assert env.stats["completed"] == 1
         assert "t::j1" not in env.store.state.in_flight_uids
@@ -194,11 +194,11 @@ class TestCompleteJobFailure:
         )
 
         env.completion.complete_job(
-            entry, ExecutionResult(success=False, result_metadata={"error": "boom"})
+            entry, ExecutionResult(success=False, result_metadata={"error_message": "boom"})
         )
 
-        assert env.store.state.failed["t::j1"]["error"] == "boom"
-        assert env.store.state.failed["child::c1"]["error"] == "JOB_DEPENDENCY"
+        assert env.store.state.failed["t::j1"]["error_message"] == "boom"
+        assert env.store.state.failed["child::c1"]["error_message"] == "JOB_DEPENDENCY"
         assert env.stats["failed"] == 1
         assert env.stats["cascade_failed"] == 1
         assert cleaned[-1] == ("t::j1", ArtifactCleanupMode.FAILURE_OR_RETRY)
@@ -238,7 +238,7 @@ class TestRetryBudget:
         """重试 = 原作业原样重入队：顶层自定义字段与已注入资源随重试往返保留。"""
         env = CompletionEnv(tmp_path)
         job = Job("t", "j1", resources={"__workers__": 1.0},
-                  timeout_seconds=23, payload={"timeout": "业务时限"})
+                  timeout_seconds=23, payload={"timeout_seconds": "业务时限"})
         entry = env.track_entry(job)
         job_snapshot = dict(entry.job_snapshot)
         job_snapshot["custom_note"] = "keep-me"
@@ -251,7 +251,7 @@ class TestRetryBudget:
         assert env.store.state.queue[0]["resources"] == {"__workers__": 1.0}
         restored = Job.from_dict(env.store.state.queue[0])
         assert restored.timeout_seconds == 23
-        assert restored.payload == {"timeout": "业务时限"}
+        assert restored.payload == {"timeout_seconds": "业务时限"}
 
     def test_budget_exhaustion_archives(self, tmp_path):
         env = CompletionEnv(tmp_path)
@@ -267,7 +267,7 @@ class TestRetryBudget:
 
         assert result.will_retry is False
         assert "t::j1" in env.store.state.failed
-        assert env.store.state.failed["t::j1"]["error"] == ERR_MAX_RETRIES
+        assert env.store.state.failed["t::j1"]["error_message"] == ERR_MAX_RETRIES
         assert env.store.state.failed["t::j1"]["last_retry_error"] == "first failure"
         assert env.store.state.failed["t::j1"]["retry_error"] == "second"
         assert env.stats["failed"] == 1
@@ -342,11 +342,11 @@ class TestThreeStrikeTermination:
 
         assert result.will_retry is False
         assert "t::j1" in env.store.state.failed
-        assert env.store.state.failed["t::j1"]["error"] == "COMMIT_FAILURE"
+        assert env.store.state.failed["t::j1"]["error_message"] == "COMMIT_FAILURE"
         # 钩子恰好一次：3-strike 分支已触发，尾部跳过
         assert len(env.hooks) == 1
         assert env.hooks[0][1].success is False
-        assert env.hooks[0][1].metadata["error"] == "COMMIT_FAILURE"
+        assert env.hooks[0][1].metadata["error_message"] == "COMMIT_FAILURE"
 
 
 class TestSpawnedJobs:
@@ -386,14 +386,14 @@ class TestSpawnedJobs:
             ExecutionResult(
                 success=True,
                 spawned_jobs=[Job("child", "y", rerun="every_run",
-                              timeout_seconds=29, payload={"timeout": "业务时限"})],
+                              timeout_seconds=29, payload={"timeout_seconds": "业务时限"})],
             ),
         )
         assert "parent::p1" in env.store.state.successes
         assert "child::y" in env.store.state.queue_uids
         restored = Job.from_dict(env.store.state.queue[0])
         assert restored.timeout_seconds == 29
-        assert restored.payload == {"timeout": "业务时限"}
+        assert restored.payload == {"timeout_seconds": "业务时限"}
 
     def test_spawn_dedup_within_batch(self, tmp_path):
         env = CompletionEnv(tmp_path)
@@ -428,7 +428,7 @@ class TestSpawnedJobs:
         )
         assert "parent::p1" in env.store.state.successes
         assert "child::bad" in env.store.state.failed
-        assert "INVALID_SPAWNED_JOB" in env.store.state.failed["child::bad"]["error"]
+        assert "INVALID_SPAWNED_JOB" in env.store.state.failed["child::bad"]["error_message"]
         # 伪 entry 无轨迹行：拒绝路径不落 attempt
         assert env.backend.load_attempts("child::bad") == []
 
@@ -509,7 +509,7 @@ class TestSettleReaped:
 
         count = env.completion.settle_reaped([
             (e1.handle, ExecutionResult(success=True, result_metadata={})),
-            (e2.handle, ExecutionResult(success=False, result_metadata={"error": "x"})),
+            (e2.handle, ExecutionResult(success=False, result_metadata={"error_message": "x"})),
         ])
         assert count == 2
         assert "t::j1" in env.store.state.successes

@@ -1,12 +1,12 @@
 # 0007 命名统一与持久 schema 的破坏边界
 
-状态：已接受；文档契约已完成，代码尚未实施。
+状态：已接受；命名及 schema 4 已在开发分支实施。可信成功、trigger、产物和新 IPC 行为另行交付。
 
 框架在身份、完整 Job 快照、业务 payload、结果 metadata 与成功/失败档案之间存在同名异义及缩写。决定采用[命名计划](../NAMING_PLAN_2026-10.md)的精确映射，以无歧义的统一名称替换旧接口，放弃兼容别名、弃用过渡和双写；保留 Task / Job / Attempt 模型、稳定 UID 与现有行为。这一选择接受调用方一次性修改的成本，避免长期维护两套字段及误读业务数据。
 
 ## 版本与交付顺序
 
-- 目标发布版本为 **3.0.0**，目标命名 schema 为 **4**；当前代码仍为 2.1.0/schema 3。本 ADR 不修改运行时版本、不发布。运行时包版本在最终交付票统一调整，schema 4 在 SQL 切换票实现。
+- 目标发布版本为 **3.0.0**，目标命名 schema 为 **4**；当前开发代码为 2.1.0/schema 4，尚未发布 3.0.0。本 ADR 不修改运行时版本、不发布。运行时包版本在最终交付票统一调整，schema 4 在 SQL 切换票实现。
 - N1 交付本决策、命名所有权和本地任务图。N2 先按 Python 身份、轨迹、元数据与快照的生产消费闭环拆原子票，第一代码票只改 `dispatch_seq/next_dispatch_seq→dispatch_no/next_dispatch_no`，物理身份字符串格式 `run_id.N` 不变。
 - 全部 SQL 表列在单独一票中一次切换为命名计划第 2 节的完整目标形状，并将 schema 3 升级边界固定为 schema 4；不因拆 Python 票连续产生中间 schema。Python 字段与 SQL 列之间允许有显式映射，但不增加旧公开 API 兼容别名、不双写、不在同一已交付接口上接受两套字段。
 - N2 完成后执行 N3A/N3B，不与重跑成功事务、trigger、产物授权或新 IPC 行为混合提交。相关权威指南随实际代码交付更新；本次不把尚未实现的目标 API 写成可用契约，不修改历史 ADR。
@@ -26,6 +26,21 @@
 ## schema 接纳与旧库保护
 
 SQL 切换票必须明确接受「真正的新空库」或「schema 4 且目标表形状正确的库」。schema 3 及其他旧版本明确拒绝；`user_version=0` 但已有业务表的库不能自动当作新库升级，也不能通过建目标表掩盖旧表。版本检查与表形状检查必须同时覆盖手改版本号和半建库。
+
+本票接纳判定如下，作为上述边界的精确化：
+
+| 实际库状态 | 判定 |
+| --- | --- |
+| 指定路径不存在；或合法 `user_version=0` 且无应用表、视图、触发器、索引等对象的真正空库（含只读确认的零字节文件） | 接纳，在指定路径创建六表、索引及版本 4 |
+| `user_version=0` 但含任意应用对象，包括部分或完整目标表、无关表、仅 HTTP 表 | 拒绝，不补齐、不升级 |
+| schema 3 或其他非 0/4 版本 | 拒绝 |
+| schema 4，完整六核心表均为 table，列集合精确匹配命名计划 | 接纳；允许额外用户表，但拒绝混入异代 `wall` / `meta` 表 |
+| schema 4 缺表、错列、额外核心列或同名视图 | 拒绝，不自动重建 |
+| 损坏、读不出或权限错误 | 直接报错，不当空库，不改用可写连接兜底 |
+
+现有字段类型与约束设计保留；形状检查不扩大为完整 SQL 约束审计。只读预检使用普通 `mode=ro` URI（路径经 `Path.as_uri` 编码），不得用 `immutable` 忽略 WAL。接受后在写连接设置 WAL 前复核，并在 `BEGIN IMMEDIATE` 内再次复核；空库 DDL、索引及版本写入在同一事务完成。拒绝保护指应用数据、结构、版本与 journal 模式不被初始化写 SQL 修改；不承诺 SQLite 侧文件的所有字节或 mtime 恒定，不清理 sidecar。不增加 inode fence 或跨进程迁移协议，升级前须先停止外部写入。
+
+框架 JSON 在本票一次切换：Job 外层 `timeout_seconds`，worker 信封 `spawned_jobs/error_message`，失败 metadata 本层 `error_message/error_category/is_fatal/attempt_no`，成功 metadata 本层 `success_count/last_succeeded_at/last_success_run_id`。专属 `Job.from_dict`、`AttemptRecord.from_dict` 和消息入口明确拒绝各自旧字段，不做 alias、fallback 或双写；新字段缺省仍用既有默认值。业务 payload、runtime extra、自定义或嵌套 metadata 不扫描翻译。引擎 KV 的 `last_run_id`、状态 `error/fatal`、ErrorCategory 字符串值及 HTTP 独立 `http_snapshots` 七列和 version 0 机制保持。
 
 已有库首先通过只读连接进行版本和形状预检；拒绝应发生在设置 `journal_mode=WAL`、建表、建索引、写版本号等持久操作之前。预检失败或不能确认版本时直接报错，不改以可写连接重试。进入接受路径后仍须复核接纳条件，防止检查与写入之间状态变化；不能把预检当作替代事务校验的依据。若外部进程同时修改或替换状态库，使用者应先停写并确认 worker 与锁归属，再升级；本 ADR 不引入跨进程库升级协议。
 

@@ -60,7 +60,7 @@ def _normalize_handler_result(result: Any) -> tuple[bool, dict[str, Any]]:
                 f"Handler returned dict with non-JSON-serializable metadata: {e}. "
                 f"Job will be marked as failed."
             )
-            return False, {"error": f"invalid result metadata: not JSON-serializable: {e}"}
+            return False, {"error_message": f"invalid result metadata: not JSON-serializable: {e}"}
         return True, result
     if isinstance(result, tuple) and len(result) == 2:
         if not isinstance(result[0], bool) or not isinstance(result[1], dict):
@@ -69,7 +69,7 @@ def _normalize_handler_result(result: Any) -> tuple[bool, dict[str, Any]]:
                 f"({type(result[0]).__name__}, {type(result[1]).__name__}). "
                 f"Job will be marked as failed."
             )
-            return False, {"error": "invalid handler return tuple: expected (bool, dict)"}
+            return False, {"error_message": "invalid handler return tuple: expected (bool, dict)"}
         try:
             dumps(result[1])
         except (TypeError, ValueError) as e:
@@ -77,24 +77,24 @@ def _normalize_handler_result(result: Any) -> tuple[bool, dict[str, Any]]:
                 f"Handler returned tuple with non-JSON-serializable metadata: {e}. "
                 f"Job will be marked as failed."
             )
-            return False, {"error": f"invalid result metadata: not JSON-serializable: {e}"}
+            return False, {"error_message": f"invalid result metadata: not JSON-serializable: {e}"}
         return result[0], result[1]
     logger.error(
         f"Handler returned unrecognized type: {type(result).__name__}. "
         f"Expected None, bool, dict, or tuple(bool, dict). "
         f"Job will be marked as failed."
     )
-    return False, {"error": f"invalid handler return type: {type(result).__name__}"}
+    return False, {"error_message": f"invalid handler return type: {type(result).__name__}"}
 
 
 def _parse_spawned_jobs(raw_spawned_jobs: Any) -> tuple[list[Job], str | None]:
-    """解析结果文件的 new_jobs 字段；坏形态收敛为错误串，绝不抛 TypeError。
+    """解析结果文件的 spawned_jobs 字段；坏形态收敛为错误串，绝不抛 TypeError。
 
     不变式：结果文件任何异常形态都收敛为任务级失败记账，不得以
     TypeError 穿透收割/认领链使单任务损坏放大为整管崩溃。
     """
     if not isinstance(raw_spawned_jobs, list):
-        return [], f"invalid new_jobs type: {type(raw_spawned_jobs).__name__}"
+        return [], f"invalid spawned_jobs type: {type(raw_spawned_jobs).__name__}"
     spawned_jobs: list[Job] = []
     for job_snapshot in raw_spawned_jobs:
         try:
@@ -143,21 +143,21 @@ def _decode_success_branch(res: dict, job: Job) -> tuple[bool, dict[str, Any], l
     """
     if "raw_result" not in res:
         logger.error(f"Corrupt result file for {job.uid}: missing 'raw_result' key")
-        return False, {"error": "CORRUPT_RESULT_FILE: missing raw_result"}, [], {}, []
+        return False, {"error_message": "CORRUPT_RESULT_FILE: missing raw_result"}, [], {}, []
     try:
         raw_result = _decode_raw_result(res["raw_result"])
         success, result_metadata = _normalize_handler_result(raw_result)
     except Exception as e:
         logger.error(f"Result decode failed for {job.uid}: {e}")
         return False, {
-            "error": f"CORRUPT_RESULT_FILE: decode failed: {e}",
+            "error_message": f"CORRUPT_RESULT_FILE: decode failed: {e}",
             _KEY_TRACEBACK: traceback.format_exc(),
         }, [], {}, []
 
-    spawned_jobs, jobs_error = _parse_spawned_jobs(res.get("new_jobs", []))
+    spawned_jobs, jobs_error = _parse_spawned_jobs(res.get("spawned_jobs", []))
     if jobs_error is not None:
         logger.error(f"Malformed spawned jobs in {job.uid}: {jobs_error}")
-        return False, {"error": jobs_error}, [], {}, []
+        return False, {"error_message": jobs_error}, [], {}, []
 
     if not success:
         return False, result_metadata, [], {}, []
@@ -165,13 +165,13 @@ def _decode_success_branch(res: dict, job: Job) -> tuple[bool, dict[str, Any], l
     cursor_updates, cursor_error = _parse_cursor_updates(res.get("cursor_updates", {}))
     if cursor_error is not None:
         logger.error(f"Invalid cursor_updates in {job.uid}: {cursor_error}")
-        return False, {"error": cursor_error}, [], {}, []
+        return False, {"error_message": cursor_error}, [], {}, []
     suspensions, suspension_error = _parse_resource_suspensions(
         res.get("resource_suspensions", [])
     )
     if suspension_error is not None:
         logger.error(f"Invalid resource_suspensions in {job.uid}: {suspension_error}")
-        return False, {"error": suspension_error}, [], {}, []
+        return False, {"error_message": suspension_error}, [], {}, []
     return True, result_metadata, spawned_jobs, cursor_updates, suspensions
 
 
@@ -199,7 +199,12 @@ def _decode_ipc_result(
     transient_kind: str | None = None
 
     status = res.get("status") if isinstance(res, dict) else None
-    if status == "success":
+    legacy_keys = {"new_jobs", "error"} & res.keys() if isinstance(res, dict) else set()
+    if legacy_keys:
+        result_metadata = {
+            "error_message": f"CORRUPT_RESULT_FILE: unsupported fields {sorted(legacy_keys)}"
+        }
+    elif status == "success":
         (
             success,
             result_metadata,
@@ -209,23 +214,23 @@ def _decode_ipc_result(
         ) = _decode_success_branch(res, job)
     elif status == "retry":
         retry_requested = True
-        retry_error = res.get("error")
+        retry_error = res.get("error_message")
         kind = res.get("transient_kind")
         transient_kind = kind if isinstance(kind, str) else None
     elif status == "interrupted":
         retry_requested = True
-        retry_error = res.get("error")
+        retry_error = res.get("error_message")
         transient_kind = "interrupted"
     elif status == "fatal":
         result_metadata = {
-            "error": res.get("error", "FATAL (no message)"),
+            "error_message": res.get("error_message", "FATAL (no message)"),
             _KEY_TRACEBACK: res.get(_KEY_TRACEBACK),
-            "fatal": True,
+            "is_fatal": True,
         }
         logger.error(f"Fatal error in {job.uid}:\n{res.get(_KEY_TRACEBACK, '')}")
     elif status is not None:
         result_metadata = {
-            "error": res.get("error", f"unknown status {status!r}"),
+            "error_message": res.get("error_message", f"unknown status {status!r}"),
             _KEY_TRACEBACK: res.get(_KEY_TRACEBACK),
         }
         logger.error(f"Worker crashed for {job.uid}:\n{res.get(_KEY_TRACEBACK, '')}")
@@ -243,7 +248,7 @@ def _decode_ipc_result(
         if not ok:
             logger.error(f"Verification failed for {job.uid}: {err}")
             success = False
-            result_metadata = {"error": err}
+            result_metadata = {"error_message": err}
 
     return ExecutionResult(
         success=success,
@@ -293,7 +298,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         _write_result({
             "status": "retry",
             "transient_kind": "lock_conflict",
-            "error": f"LOCK_ENV_FAULT: cannot open lock file for {job_uid} "
+            "error_message": f"LOCK_ENV_FAULT: cannot open lock file for {job_uid} "
                      f"(errno={getattr(e, 'errno', None)}): {e}",
         })
         return
@@ -301,7 +306,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         _write_result({
             "status": "retry",
             "transient_kind": "lock_conflict",
-            "error": f"LOCK_CONFLICT: another execution body holds {job_uid} lock",
+            "error_message": f"LOCK_CONFLICT: another execution body holds {job_uid} lock",
         })
         return
     try:
@@ -309,7 +314,7 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         _write_result({
             "status": "success",
             "raw_result": _encode_raw_result(raw_result),
-            "new_jobs": [j.to_dict() for j in ctx.spawned_jobs],
+            "spawned_jobs": [j.to_dict() for j in ctx.spawned_jobs],
             "resource_suspensions": ctx.resource_suspensions,
             "cursor_updates": ctx.cursor_updates,
         })
@@ -317,14 +322,14 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         # 限流瞬态判定必须在子进程编码侧完成：RateLimitHit 是 RetryError
         # 子类、与本类共享 status="retry" 通道，父进程侧已无异常类型可辨；
         # 预算豁免依赖该结构化字段（与 lock_conflict 同构）。
-        retry_payload: dict[str, Any] = {"status": "retry", "error": str(e)}
+        retry_payload: dict[str, Any] = {"status": "retry", "error_message": str(e)}
         if isinstance(e, RateLimitHit):
             retry_payload["transient_kind"] = "rate_limited"
         _write_result(retry_payload)
     except FatalError as e:
         _write_result({
             "status": "fatal",
-            "error": str(e),
+            "error_message": str(e),
             _KEY_TRACEBACK: traceback.format_exc(),
         })
     except Exception as e:
@@ -337,30 +342,30 @@ def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
         if kind == "retry":
             _write_result({
                 "status": "retry",
-                "error": f"{type(e).__name__}: {e}",
+                "error_message": f"{type(e).__name__}: {e}",
             })
         elif kind == "fatal":
             _write_result({
                 "status": "fatal",
-                "error": f"{type(e).__name__}: {e}",
+                "error_message": f"{type(e).__name__}: {e}",
                 _KEY_TRACEBACK: traceback.format_exc(),
             })
         else:
             _write_result({
                 "status": "error",
-                "error": f"{type(e).__name__}: {e}",
+                "error_message": f"{type(e).__name__}: {e}",
                 _KEY_TRACEBACK: traceback.format_exc(),
             })
     except KeyboardInterrupt as e:
         _write_result({
             "status": "interrupted",
-            "error": f"WORKER_INTERRUPTED: {type(e).__name__}",
+            "error_message": f"WORKER_INTERRUPTED: {type(e).__name__}",
             _KEY_TRACEBACK: traceback.format_exc(),
         })
     except SystemExit as e:
         _write_result({
             "status": "error",
-            "error": f"WORKER_INTERRUPTED: {type(e).__name__}",
+            "error_message": f"WORKER_INTERRUPTED: {type(e).__name__}",
             _KEY_TRACEBACK: traceback.format_exc(),
         })
     finally:
@@ -502,7 +507,7 @@ class ExecutionChannel:
     def _read_authenticated_result(self, path: Path) -> dict | None:
         """读取侧强校验结果认证令牌，不匹配按无结果丢弃（瞬态、零预算）。
 
-        威胁模型：ipc_dir 写入者可伪造结果文件驱动 successes 投毒、new_jobs
+        威胁模型：ipc_dir 写入者可伪造结果文件驱动 successes 投毒、spawned_jobs
         子任务注入与 cursor 投毒；令牌不匹配的结果绝不进入解码管线。
         """
         res = self.journal.read_result(path)

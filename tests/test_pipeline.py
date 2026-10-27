@@ -159,13 +159,13 @@ def make_instant_process_class(retry_uid: str | None = None):
             if self.args:
                 spec = self.args[0]
                 result = {
-                    "new_jobs": [],
+                    "spawned_jobs": [],
                     "resource_suspensions": [],
                     "cursor_updates": {},
                     "auth": spec.result_token,
                 }
                 if retry_uid is not None and spec.job.uid == retry_uid:
-                    result.update({"status": "retry", "error": "stub failure"})
+                    result.update({"status": "retry", "error_message": "stub failure"})
                 else:
                     result.update({"status": "success", "raw_result": True})
                 ArtifactJournal(spec.ipc_dir).write_result_atomic(
@@ -528,8 +528,8 @@ class TestEnqueue:
         (row,) = p.backend.load_queue()
         assert row["resources"]["__workers__"] == 1.0
         assert row["first_enqueued_at"]
-        assert row["timeout"] == 17
-        assert "timeout_seconds" not in row
+        assert row["timeout_seconds"] == 17
+        assert "timeout" not in row
         restored = Job.from_dict(row)
         assert restored.timeout_seconds == 17
         assert restored.payload == {"timeout": "业务时限"}
@@ -566,7 +566,7 @@ class TestFilterJobsWithoutSuccess:
 
     def test_failed_entries_not_excluded(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.backend.append_failed("fetch::broken", {"error": "x"})
+        p.backend.append_failed("fetch::broken", {"error_message": "x"})
         jobs = [Job("fetch", "broken"), Job("fetch", "fresh")]
         assert [j.uid for j in p.filter_jobs_without_success(jobs)] == [
             "fetch::broken",
@@ -788,7 +788,7 @@ class TestManageApis:
 
     def test_list_failures_returns_structured_entries(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.backend.append_failed("fetch::bad", {"error": "boom", "fatal": False})
+        p.backend.append_failed("fetch::bad", {"error_message": "boom", "is_fatal": False})
         entries = p.list_failures()
         assert len(entries) == 1
         assert entries[0].job_uid == "fetch::bad"
@@ -796,8 +796,8 @@ class TestManageApis:
 
     def test_clear_failures_removes_non_fatal(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.backend.append_failed("fetch::bad", {"error": "boom"})
-        p.backend.append_failed("fetch::bug", {"error": "x", "fatal": True})
+        p.backend.append_failed("fetch::bad", {"error_message": "boom"})
+        p.backend.append_failed("fetch::bug", {"error_message": "x", "is_fatal": True})
         removed = p.clear_failures()
         assert removed == 1
         assert sorted(p.backend.load_failed()) == ["fetch::bug"]
@@ -805,7 +805,7 @@ class TestManageApis:
     def test_retry_failure_requeues_job(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
-        p.backend.append_failed("fetch::bad", {"error": "boom"})
+        p.backend.append_failed("fetch::bad", {"error_message": "boom"})
         assert p.retry_failure("fetch::bad") is True
         assert "fetch::bad" not in p.backend.load_failed()
         (row,) = p.backend.load_queue()
@@ -829,7 +829,7 @@ class TestManageApis:
     def test_clear_history_removes_from_both(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.seed_successes(["fetch::ok"])
-        p.backend.append_failed("fetch::bad", {"error": "x", "fatal": False})
+        p.backend.append_failed("fetch::bad", {"error_message": "x", "is_fatal": False})
         removed = p.clear_history(["fetch::"])
         assert removed == 2
         assert p.backend.load_successes() == {}
@@ -926,7 +926,7 @@ class TestBackendSwap:
         """
         p = make_pipeline(tmp_path)
         new_backend = InMemoryStateBackend()
-        new_backend.append_failed("fetch::x", {"error": "moved"})
+        new_backend.append_failed("fetch::x", {"error_message": "moved"})
         p.backend = new_backend
         # 持有者逐一刻画：门面 property、runtime 派生引用、store 锚点
         assert p.backend is new_backend
@@ -968,7 +968,7 @@ class TestBackendSwap:
         """显式 AbstractStateBackend 子类假后端：接受注入并重绑持库组件。"""
         p = make_pipeline(tmp_path)
         fake = DelegatingFakeBackend()
-        fake.append_failed("fetch::x", {"error": "subclass"})
+        fake.append_failed("fetch::x", {"error_message": "subclass"})
         p.backend = fake
         assert p.backend is fake
         assert p._runtime.store.backend is fake

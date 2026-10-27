@@ -28,7 +28,7 @@ from tasklite import (
 
 - 分层单向依赖：`tasklite/models/` 严禁 import `tasklite/engine/`（IPC 声明读写一律下沉 `tasklite/utils/ipc.py`），`tasklite/utils/` 严禁 import `tasklite/wrappers/`，核心层（engine/backend/models/utils）严禁依赖 `tasklite/contrib/`；
 - 版本单一事实源：`tasklite.__version__`（pyproject 动态读取点）；
-- **数据库零兼容**：schema 全新（含 attempts 表），旧库 fail-loud 拒识（`user_version=3`）；
+- **数据库零兼容**：schema 全新（含 attempts 表），旧库 fail-loud 拒识（`user_version=4`）；
 - v1 已退役：git 历史与 `v1-final` 标签留档，迁移映射见第 6 节与 ADR-0004。
 
 ---
@@ -40,10 +40,15 @@ from tasklite import (
 | 层 | 定义 | 持久化 |
 |---|---|---|
 | **Task（规格）** | 进程内注册的静态模板：`task_type` 名、handler、`resources`、`payload_schema`、默认 `max_retries` / `timeout_seconds` / `timeout_is_transient` | 代码即规格，不落盘；注册于 `register_task`（落点 `TaskRegistry`） |
-| **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变（queue/wall/failed 三表 PK 与六集合互斥均以 uid 为身份） | queue 行 job_data JSON（uid 为主键） |
+| **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变（queue/successes/failed 三表 PK 与六集合互斥均以 uid 为身份） | queue 行 job_snapshot JSON（job_uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：序号、`execution_id`、起止时间、`outcome` | **append-only** 新表 `attempts` |
 
-持久层 Python 接口以 `job_snapshot` / `job_snapshots` 表示完整 Job 字典，以 `job_uid` 表示跨对象作业身份；业务输入仍称 `payload`。引擎级键值读写使用 `backend.get_engine_metadata(key)` / `backend.set_engine_metadata(key, value)`，其中 `last_run_id` 仍表示最近一次运行。当前落盘格式仍为 schema 3，SQL 表列与 JSON 键保持现行契约。
+持久层 Python 接口以 `job_snapshot` / `job_snapshots` 表示完整 Job 字典，以 `job_uid` 表示跨对象作业身份；业务输入仍称 `payload`。引擎级键值读写使用 `backend.get_engine_metadata(key)` / `backend.set_engine_metadata(key, value)`，其中 `last_run_id` 仍表示最近一次运行。当前开发落盘格式为 schema 4（包版本暂为 2.1.0，尚未发布目标 3.0.0）。仅接纳真正空库或完整且列集合匹配的 schema 4 库；版本 0 的非空库、schema 3、混入 wall/meta 的库或半建库均明确拒绝，不自动迁移或补齐。拒绝前使用只读连接检查，保留原库；使用匹配版本读取历史，或显式选择新的状态库路径。
+
+schema 4 六张核心表为 `queue(job_uid, queue_position, job_snapshot)`、`successes(job_uid, metadata)`、`failed(job_uid, metadata, payload)`、`attempts(attempt_id, job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`、`cursors(key, value)` 与 `engine_metadata(key, value)`。失败档案 `metadata` 与业务 `payload` 各自原样存取；HTTP 缓存 `http_snapshots` 是独立库，不随本 schema 切换。
+
+失败 metadata 的框架键为 `error_message/error_category/is_fatal/attempt_no`（未知尝试号仍为 0）。成功 metadata 使用 `success_count/last_succeeded_at/last_success_run_id`；计数由框架写入，两个最近成功字段仍按 `setdefault` 保留调用方值，不构成可信成功证据。业务 payload、runtime extra 及嵌套 metadata 的同拼写键均不翻译。
+
 
 ### Task：规格层
 
@@ -90,11 +95,11 @@ job = Job(
 job.uid          # "download::img_001"——身份不变式
 ```
 
-`rerun` 四策略：`"never"`（successes/failed 命中即跳过，默认）/ `"on_failure"`（failed 命中重跑）/ `"every_run"`（命中都重跑，成功 REPLACE successes 行且 run_count+1）/ `"on_input_change"`（successes 命中比对输入指纹）。`None` 哨兵可被任务级默认策略（`set_discovery_rerun` 注入面）覆盖，显式值一律尊重。
+`rerun` 四策略：`"never"`（successes/failed 命中即跳过，默认）/ `"on_failure"`（failed 命中重跑）/ `"every_run"`（命中都重跑，成功 REPLACE successes 行且 success_count+1）/ `"on_input_change"`（successes 命中比对输入指纹）。`None` 哨兵可被任务级默认策略（`set_discovery_rerun` 注入面）覆盖，显式值一律尊重。
 
 ### Attempt：执行轨迹（append-only 旁路面）
 
-`AttemptRecord` 表达一次物理执行：`(job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error)`；`attempts` 表另有自增 `id`，schema 3 的执行身份列仍为 `incarnation`，由后端显式映射。**派发即插行**（outcome=running），终态或重入队时更新该行。`execution_id`（`run_id.dispatch_no` 执行代标识）随 attempt 落表。
+`AttemptRecord` 表达一次物理执行：`(job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`；`attempts` 表另有自增 `attempt_id`，执行身份列为 `execution_id`。**派发即插行**（outcome=running），终态或重入队时更新该行。`execution_id`（`run_id.dispatch_no` 执行代标识）随 attempt 落表。
 
 `outcome` 词汇表（单一真相 `ATTEMPT_OUTCOMES`）：
 
@@ -213,7 +218,7 @@ handler 单测用官方构造器：`from tasklite.testing import fake_ctx`——
 ```python
 # 只读查询：结构化条目（job_uid / error_message / metadata / payload）
 for entry in pipeline.list_failures():
-    print(entry.job_uid, entry.error_message, entry.metadata.get("error_type"), entry.payload)
+    print(entry.job_uid, entry.error_message, entry.metadata.get("error_category"), entry.payload)
 
 # 批量清理（默认保留 fatal=true 的确定性失败；返回删除数）
 n = pipeline.clear_failures(task_types=["download"], keep_fatal=True)
@@ -222,7 +227,7 @@ n = pipeline.clear_failures(task_types=["download"], keep_fatal=True)
 pipeline.retry_failure("download::img_001")
 ```
 
-- **`FailureEntry`**：`job_uid`、`error_message`（原始错误消息/错误码）、`metadata`（完整档案元数据视图，含 `error_type` 分类码）、`payload`（原始业务 payload 快照——补跑无需外部反查参数；无可存快照时为 None）。
+- **`FailureEntry`**：`job_uid`、`error_message`（原始错误消息/错误码）、`metadata`（完整档案元数据视图，含 `error_category` 分类码）、`payload`（原始业务 payload 快照——补跑无需外部反查参数；无可存快照时为 None）。
 - **`clear_failures(task_types=None, *, keep_fatal=True)`**：按 task_type 前缀匹配删除；`keep_fatal=False` 连确定性失败一并清理。
 - **`retry_failure(uid)`**：失败档案的人工补跑通道。激活代按拦截点放行语义推进——重建作业的 `activation_no` 取该 uid 在 attempts 轨迹中的最大激活代 +1、`attempt_no` 归 1（与 every_run 豁免放行同构，保证 attempts 表 `(activation_no, attempt_no)` 逻辑键不撞号）；payload 取档案快照，先入队后删行（崩溃窗口至多留下 queue∩failed 并存，由加载期修复收敛，不丢作业）。
 
@@ -242,7 +247,7 @@ pipeline.retry_failure("download::img_001")
 
 ### OrderingPolicy：队列访问序
 
-`scan_next_runnable`（`tasklite/engine/scheduler.py`）是**唯一选择点**：调度器按 OrderingPolicy 给出的下标序逐条评估队列、首个可运行者处停止（首中即停）。默认实现 `FifoOrderingPolicy`（按 seq 升序）。自定义策略经门面构造参数 `ordering_policy` 注入（None → FIFO，默认解析收敛在 `RunConfig.resolve` 唯一解析点）：
+`scan_next_runnable`（`tasklite/engine/scheduler.py`）是**唯一选择点**：调度器按 OrderingPolicy 给出的下标序逐条评估队列、首个可运行者处停止（首中即停）。默认实现 `FifoOrderingPolicy`（按 queue_position 升序）。自定义策略经门面构造参数 `ordering_policy` 注入（None → FIFO，默认解析收敛在 `RunConfig.resolve` 唯一解析点）：
 
 ```python
 from collections.abc import Iterable, Sequence
@@ -319,7 +324,7 @@ Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」�
 | `AdmissionPolicy`（policy.py） | `RerunPolicy`（admission.py） |
 | `BackoffGovernor` / `plan_retry` 退避计算 | 删除——`RequeuePolicy` seam 接管（默认 `ImmediateRequeuePolicy`） |
 
-其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`seed_cursor` / `content_fingerprint` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。成功档案 Python API 现使用 `successes` / `load_successes` / `delete_successes` / `seed_successes`；`AttemptOutcome` 使用 `success`、`will_retry`、`metadata`，`ExecutionResult` 与 `JobContext` 的 Job 对象列表使用 `spawned_jobs`。当前仍按 schema 3 读写唯一旧 SQL 表 `wall`、attempts 列 `error` 和 worker 消息键 `new_jobs`，不提供旧 Python 别名。执行身份与文件名编码现使用 `execution_id` 和 `encode_job_uid_filename`；schema 3 的 SQL 列与 IPC 文件名字节保持不变。
+其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`seed_cursor` / `content_fingerprint` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。成功档案 Python API 现使用 `successes` / `load_successes` / `delete_successes` / `seed_successes`；`AttemptOutcome` 使用 `success`、`will_retry`、`metadata`，`ExecutionResult` 与 `JobContext` 的 Job 对象列表使用 `spawned_jobs`。SQL 使用 `successes`、`attempts.error_message`，worker 信封使用 `spawned_jobs/error_message`；Job 快照外层使用 `timeout_seconds`，专属入口拒绝旧字段。执行身份与文件名编码使用 `execution_id` 和 `encode_job_uid_filename`，IPC 文件名字节保持不变。
 
 ---
 

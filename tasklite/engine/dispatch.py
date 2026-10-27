@@ -284,7 +284,7 @@ class DispatchMachine:
             return False
         logger.warning(f"SKIP: {job_uid} (Dependency {pending_dep_failure} failed)")
         failure_metadata: dict[str, Any] = {
-            "error": ERR_JOB_DEPENDENCY,
+            "error_message": ERR_JOB_DEPENDENCY,
             "failed_dependency": pending_dep_failure,
         }
         # 依赖父失败的级联下游计入 cascade_failed 而非 failed——
@@ -308,7 +308,7 @@ class DispatchMachine:
         task_type not in tasks 时调用。commit 失败走 3-strike / 崩溃路径。
         """
         logger.error(f"SKIP: {job_uid} (No handler for task_type '{task_type}')")
-        failure_metadata = {"error": ERR_NO_HANDLER, "fatal": True}
+        failure_metadata = {"error_message": ERR_NO_HANDLER, "is_fatal": True}
         self._reject_and_commit(job_uid, job_snapshot, failure_metadata, attempt_id=attempt_id)
         return True
 
@@ -433,7 +433,7 @@ class DispatchMachine:
                         logger.error(f"Payload validation failed for {job_uid}: {errors}")
                         lease.release()
                         failure_metadata: dict[str, Any] = {
-                            "error": ERR_PAYLOAD_VALIDATION,
+                            "error_message": ERR_PAYLOAD_VALIDATION,
                             "details": errors,
                         }
                         self._reject_and_commit(
@@ -591,7 +591,7 @@ class DispatchMachine:
                 f"handler), sending to failure archive."
             )
             failure_metadata = {
-                "error": ERR_DISPATCH_FAILURE,
+                "error_message": ERR_DISPATCH_FAILURE,
                 "failures": failures,
                 "detail": str(exc)[:200],
             }

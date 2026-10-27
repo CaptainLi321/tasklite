@@ -300,7 +300,7 @@ class Job:
             - "on_failure"：successes 命中跳过，failed 命中重跑（网络误失败
               可自愈；成功即自动清失败档案残行）；
             - "every_run"：successes/failed 命中都重跑（成功 REPLACE successes 行、
-              run_count+1）——扫描类/orchestrator 任务；
+              success_count+1）——扫描类/orchestrator 任务；
             - "on_input_change"：successes 命中比对输入指纹，failed 命中重跑。
             策略只作用于「successes/failed 拦截点」；queue/in-flight 永远算数
             （同一轮内不重复派发/并发双跑）。随 job_snapshot 持久化。
@@ -381,7 +381,7 @@ class Job:
             "resources": dict(self.resources),
             "max_retries": self.max_retries,
             "depends_on": list(self.depends_on),
-            "timeout": self.timeout_seconds,
+            "timeout_seconds": self.timeout_seconds,
             "timeout_is_transient": self.timeout_is_transient,
             "rerun": self.rerun,
             "runtime": self.runtime.to_dict(),
@@ -393,6 +393,8 @@ class Job:
     @classmethod
     def from_dict(cls, data: dict) -> Job:
         """反序列化 job（缺键回默认值；rerun 缺键/None = 未指定哨兵）。"""
+        if "timeout" in data:
+            raise ValueError("Job 快照不接受旧字段 timeout；请使用 timeout_seconds")
         return cls(
             data["task_type"],
             data["job_id"],
@@ -400,7 +402,7 @@ class Job:
             data.get("resources", {}),
             data.get("max_retries", 3),
             data.get("depends_on", []),
-            data.get("timeout", 3600),
+            data.get("timeout_seconds", 3600),
             timeout_is_transient=data.get("timeout_is_transient", False),
             rerun=data.get("rerun"),
             # runtime 子 dict 显式保留——边带状态只存这一处

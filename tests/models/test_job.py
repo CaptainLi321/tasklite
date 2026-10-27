@@ -319,7 +319,7 @@ class TestJobToDictFromDict:
         result = Job("scan", "s1").to_dict()
         expected_keys = {
             "task_type", "job_id", "payload", "resources",
-            "max_retries", "depends_on", "timeout", "timeout_is_transient",
+            "max_retries", "depends_on", "timeout_seconds", "timeout_is_transient",
             "rerun", "runtime", "attempt_no", "activation_no",
             "first_enqueued_at",
         }
@@ -346,7 +346,7 @@ class TestJobToDictFromDict:
         assert d["resources"] == {"cpu": 0.5}
         assert d["max_retries"] == 4
         assert d["depends_on"] == ["a", "b"]
-        assert d["timeout"] == 100
+        assert d["timeout_seconds"] == 100
         assert d["rerun"] == "every_run"
         assert d["attempt_no"] == 2
         assert d["activation_no"] == 1

@@ -53,7 +53,7 @@ class CommitFailureBackend:
 
     def commit_job_failure(self, job_uid, meta, *a, **k):
         if "commit_job_failure" in self._failing:
-            if self._archive_pass_through and meta.get("error") == ERR_COMMIT_FAILURE:
+            if self._archive_pass_through and meta.get("error_message") == ERR_COMMIT_FAILURE:
                 return self._real.commit_job_failure(job_uid, meta, *a, **k)
             return False
         return self._real.commit_job_failure(job_uid, meta, *a, **k)
@@ -101,9 +101,9 @@ class TestApplySuccess:
         assert isinstance(outcome, SuccessOutcome)
         assert outcome.job_uid == "process::1"
         assert store.state.successes["process::1"]["score"] == 100
-        assert store.state.successes["process::1"]["last_run_id"] == "run_abc"
-        assert store.state.successes["process::1"]["run_count"] == 1
-        assert "last_run_at" in store.state.successes["process::1"]
+        assert store.state.successes["process::1"]["last_success_run_id"] == "run_abc"
+        assert store.state.successes["process::1"]["success_count"] == 1
+        assert "last_succeeded_at" in store.state.successes["process::1"]
         assert store.state.successes["process::1"]["inputs"][0]["path"] == "/tmp/a.txt"
         assert "process::1" not in store.state.in_flight_uids
 
@@ -111,12 +111,12 @@ class TestApplySuccess:
         """重跑成功从失败档案对侧终态续数（run_count 跨终态递增）。"""
         store, state, _ = _make_store()
         state.register_in_flight("t::1")
-        store.apply_failure("t::1", {"error": "boom", "run_count": 4})
+        store.apply_failure("t::1", {"error_message": "boom", "success_count": 4})
         # 终态 uid 重入 in-flight 须经重跑豁免登记（六集合互斥协议）
         store.state.mark_rerun_active("t::1")
         state.register_in_flight("t::1")
         store.apply_success("t::1", {})
-        assert store.state.successes["t::1"]["run_count"] == 5
+        assert store.state.successes["t::1"]["success_count"] == 5
         assert "t::1" not in store.state.failed
 
     def test_spawn_and_cursor_updates(self):
@@ -172,7 +172,7 @@ class TestApplyFailureAndCascade:
 
         outcome = store.apply_failure(
             "parent::1",
-            {"error": "crash"},
+            {"error_message": "crash"},
             job_snapshot={"task_type": "parent", "job_id": "1"},
         )
 
@@ -181,7 +181,7 @@ class TestApplyFailureAndCascade:
         for uid in ("parent::1", "child::1", "grandchild::1"):
             assert uid in store.state.failed
             assert uid in store.backend.load_failed()
-        assert store.state.failed["child::1"]["error"] == ERR_JOB_DEPENDENCY
+        assert store.state.failed["child::1"]["error_message"] == ERR_JOB_DEPENDENCY
         assert store.state.failed["child::1"]["failed_dependency"] == "parent::1"
         assert "parent::1" not in store.state.in_flight_uids
 
@@ -193,7 +193,7 @@ class TestApplyFailureAndCascade:
             "job_id": "1",
             "payload": {"bad": object()},
         }
-        store.apply_failure("t::1", {"error": "x"}, job_snapshot=job_snapshot)
+        store.apply_failure("t::1", {"error_message": "x"}, job_snapshot=job_snapshot)
         assert "t::1" in store.state.failed
         assert "t::1" not in backend.load_failure_payloads()
 
@@ -204,7 +204,7 @@ class TestApplyFailureAndCascade:
         store.apply_success("t::1", {})
         store.state.mark_rerun_active("t::1")
         store.state.register_in_flight("t::1")
-        store.apply_failure("t::1", {"error": "again"})
+        store.apply_failure("t::1", {"error_message": "again"})
 
         assert "t::1" not in store.state.successes
         assert "t::1" in store.state.failed
@@ -306,22 +306,22 @@ class TestMarkFailedMemoryContract:
     def test_default_registers_failed_and_unregisters_in_flight(self):
         store, state, _ = _make_store()
         state.register_in_flight("encode::a")
-        store.mark_failed_memory("encode::a", {"error": "boom"})
+        store.mark_failed_memory("encode::a", {"error_message": "boom"})
         assert "encode::a" in state.failed_uids
         assert "encode::a" not in state.in_flight_uids
-        assert state.failed["encode::a"]["error"] == "boom"
+        assert state.failed["encode::a"]["error_message"] == "boom"
 
     def test_explicit_unregister_false_keeps_in_flight(self):
         store, state, _ = _make_store()
         state.register_in_flight("encode::a")
-        store.mark_failed_memory("encode::a", {"error": "boom"}, unregister=False)
+        store.mark_failed_memory("encode::a", {"error_message": "boom"}, unregister=False)
         assert "encode::a" in state.failed_uids
         assert "encode::a" in state.in_flight_uids
 
     def test_failed_takes_over_from_wall(self):
         store, state, _ = _make_store()
         state.add_success("encode::a", {"prev": "ok"})
-        store.mark_failed_memory("encode::a", {"error": "boom"})
+        store.mark_failed_memory("encode::a", {"error_message": "boom"})
         assert "encode::a" in state.failed_uids
         assert "encode::a" not in state.success_job_uids
 
@@ -364,8 +364,8 @@ class TestCommitFailureStrike:
         with pytest.raises(_JobTerminated, match="permanently failed"):
             store.apply_success("task::1", {}, job_snapshot=job_snapshot)
         assert "task::1" in store.state.failed
-        assert store.state.failed["task::1"]["fatal"] is True
-        assert store.state.failed["task::1"]["error"] == ERR_COMMIT_FAILURE
+        assert store.state.failed["task::1"]["is_fatal"] is True
+        assert store.state.failed["task::1"]["error_message"] == ERR_COMMIT_FAILURE
 
     def test_strike_archive_fires_hook_exactly_once(self):
         hooks: list[tuple[str, AttemptOutcome]] = []
@@ -385,7 +385,7 @@ class TestCommitFailureStrike:
         assert uid == "task::1"
         assert fin.success is False
         assert fin.will_retry is False
-        assert fin.metadata["error"] == ERR_COMMIT_FAILURE
+        assert fin.metadata["error_message"] == ERR_COMMIT_FAILURE
         assert store.stats["failed"] == 1
 
     def test_default_threshold_constant(self):
@@ -435,8 +435,8 @@ class TestHookSingleExit:
         )
 
         store.apply_bulk_failure(
-            [("cycle::1", {"error": "DEPENDENCY_DEADLOCK"}),
-             ("cycle::2", {"error": "DEPENDENCY_DEADLOCK"})]
+            [("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"}),
+             ("cycle::2", {"error_message": "DEPENDENCY_DEADLOCK"})]
         )
         assert {uid for uid, _ in hooks} == {"cycle::1", "cycle::2"}
         assert all(fin.success is False and fin.will_retry is False for _, fin in hooks)
@@ -458,7 +458,7 @@ class TestHookSingleExit:
         )
         state.pop_job(0)
 
-        outcome = store.apply_failure("parent::1", {"error": "crash"})
+        outcome = store.apply_failure("parent::1", {"error_message": "crash"})
         assert outcome.cascaded_uids == ["child::1"]
         assert [uid for uid, _ in hooks] == ["child::1"]
 
@@ -476,8 +476,8 @@ class TestApplyBulkFailure:
 
         outcome = store.apply_bulk_failure(
             [
-                ("cycle::1", {"error": "DEPENDENCY_DEADLOCK"}),
-                ("cycle::2", {"error": "DEPENDENCY_DEADLOCK"}),
+                ("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"}),
+                ("cycle::2", {"error_message": "DEPENDENCY_DEADLOCK"}),
             ],
         )
 
@@ -491,7 +491,7 @@ class TestApplyBulkFailure:
         """批量失败与单条失败对称：successes 同名行随事务删除。"""
         store, _, backend = _make_store()
         backend.seed_successes(["cycle::1"])
-        store.apply_bulk_failure([("cycle::1", {"error": "DEPENDENCY_DEADLOCK"})])
+        store.apply_bulk_failure([("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"})])
         assert "cycle::1" not in backend.load_successes()
 
     def test_bulk_commit_failure_below_threshold_crashes(self):
@@ -504,7 +504,7 @@ class TestApplyBulkFailure:
         store = StateStore(failing, state, commit_failure_threshold=3)
 
         with pytest.raises(_CommitCrashSignal):
-            store.apply_bulk_failure([("cycle::1", {"error": "DEPENDENCY_DEADLOCK"})])
+            store.apply_bulk_failure([("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"})])
         assert store.state.queue[0]["runtime"]["_commit_failures"] == 1
         assert "cycle::1" not in store.state.failed
 
@@ -537,7 +537,7 @@ class TestBulkStrikeConvergence:
             [{"task_type": "cycle", "job_id": "1", "runtime": {"_commit_failures": 2}}],
         )
         outcome = store_deadlock.apply_bulk_failure(
-            [("cycle::1", {"error": "DEPENDENCY_DEADLOCK"})]
+            [("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"})]
         )
         assert outcome.failed_uids == ["cycle::1"]
         deadlock_meta = store_deadlock.state.failed["cycle::1"]
@@ -556,19 +556,19 @@ class TestBulkStrikeConvergence:
             ],
         )
         store_cascade.state.pop_job(0)
-        cascade_outcome = store_cascade.apply_failure("parent::1", {"error": "boom"})
+        cascade_outcome = store_cascade.apply_failure("parent::1", {"error_message": "boom"})
         assert cascade_outcome.cascaded_uids == ["child::1"]
         cascade_meta = store_cascade.state.failed["child::1"]
 
         for meta in (deadlock_meta, cascade_meta):
-            assert meta["error"] == ERR_COMMIT_FAILURE
-            assert meta["fatal"] is True
+            assert meta["error_message"] == ERR_COMMIT_FAILURE
+            assert meta["is_fatal"] is True
             assert meta["commit_failures"] == 3
         assert [uid for uid, _ in hooks_deadlock] == ["cycle::1"]
         assert [uid for uid, _ in hooks_cascade] == ["child::1"]
         for _, fin in hooks_deadlock + hooks_cascade:
             assert fin.success is False and fin.will_retry is False
-            assert fin.metadata["error"] == ERR_COMMIT_FAILURE
+            assert fin.metadata["error_message"] == ERR_COMMIT_FAILURE
 
     def test_out_of_queue_uid_still_finalized_and_accounted(self):
         """归因中的队列外 uid 同规计数与熔断（记账绝不静默丢失）。"""
@@ -581,15 +581,15 @@ class TestBulkStrikeConvergence:
 
         outcome = store.apply_bulk_failure(
             [
-                ("cycle::1", {"error": "DEPENDENCY_DEADLOCK"}),
-                ("ghost::9", {"error": "DEPENDENCY_DEADLOCK"}),
+                ("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"}),
+                ("ghost::9", {"error_message": "DEPENDENCY_DEADLOCK"}),
             ]
         )
 
         assert outcome.failed_uids == ["cycle::1", "ghost::9"]
         assert outcome.remaining_queue_count == 0
-        assert store.state.failed["cycle::1"]["error"] == ERR_COMMIT_FAILURE
-        assert store.state.failed["ghost::9"]["error"] == ERR_COMMIT_FAILURE
+        assert store.state.failed["cycle::1"]["error_message"] == ERR_COMMIT_FAILURE
+        assert store.state.failed["ghost::9"]["error_message"] == ERR_COMMIT_FAILURE
         assert "ghost::9" not in store.state.queue_uids
         assert sorted(uid for uid, _ in hooks) == ["cycle::1", "ghost::9"]
         assert store.stats["failed"] == 2
@@ -723,7 +723,7 @@ class TestAttemptTraceFinalization:
         assert backend.load_attempts("t::ok")[0].finished_at
 
         aid_fail = self._open_running(backend, "t::fail")
-        store.apply_failure("t::fail", {"error": "boom"}, attempt_id=aid_fail)
+        store.apply_failure("t::fail", {"error_message": "boom"}, attempt_id=aid_fail)
         rec = backend.load_attempts("t::fail")[0]
         assert rec.outcome == "failed"
         assert rec.error_message == "boom"
@@ -821,11 +821,11 @@ class TestFailureEntryShape:
 
     def test_frozen_shape(self):
         entry = FailureEntry(
-            job_uid="t::1", error_message="boom", metadata={"error": "boom"}, payload={"k": 1}
+            job_uid="t::1", error_message="boom", metadata={"error_message": "boom"}, payload={"k": 1}
         )
         assert entry.job_uid == "t::1"
         assert entry.error_message == "boom"
-        assert entry.metadata == {"error": "boom"}
+        assert entry.metadata == {"error_message": "boom"}
         assert entry.payload == {"k": 1}
         with pytest.raises(Exception):
             entry.job_uid = "t::2"  # type: ignore[misc]
@@ -886,12 +886,12 @@ class _MutexProbe:
             self.store.apply_success(uid, {"score": i})
         elif action == "failure":
             self._pop_from_memory_queue(uid)
-            self.store.apply_failure(uid, {"error": "boom"}, job_snapshot=_job_snapshot(uid))
+            self.store.apply_failure(uid, {"error_message": "boom"}, job_snapshot=_job_snapshot(uid))
         elif action == "mark_failed":
             # mark_failed_memory 是失败登记的内存尾段：先完成后端提交再登记
             self._pop_from_memory_queue(uid)
-            if self.backend.commit_job_failure(uid, {"error": "tail"}):
-                self.store.mark_failed_memory(uid, {"error": "tail"})
+            if self.backend.commit_job_failure(uid, {"error_message": "tail"}):
+                self.store.mark_failed_memory(uid, {"error_message": "tail"})
         elif action == "retry":
             if uid in self.store.state.successes or uid in self.store.state.failed:
                 return
@@ -902,7 +902,7 @@ class _MutexProbe:
             self.store.apply_skip(uid)
         elif action == "bulk_failure":
             self._pop_from_memory_queue(uid)
-            self.store.apply_bulk_failure([(uid, {"error": "deadlock"})])
+            self.store.apply_bulk_failure([(uid, {"error_message": "deadlock"})])
         self.assert_mutex()
 
     def assert_mutex(self) -> None:
@@ -944,7 +944,7 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     probe = _MutexProbe()
     probe._pop_from_memory_queue(uid)
 
-    probe.store.apply_failure(uid, {"error": "boom"}, job_snapshot=_job_snapshot(uid))
+    probe.store.apply_failure(uid, {"error_message": "boom"}, job_snapshot=_job_snapshot(uid))
     assert uid in probe.store.state.failed
     assert uid not in probe.store.state.successes
 
@@ -952,7 +952,7 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     assert uid in probe.store.state.successes
     assert uid not in probe.store.state.failed
 
-    probe.store.apply_failure(uid, {"error": "again"}, job_snapshot=_job_snapshot(uid))
+    probe.store.apply_failure(uid, {"error_message": "again"}, job_snapshot=_job_snapshot(uid))
     assert uid in probe.store.state.failed
     assert uid not in probe.store.state.successes
     probe.assert_mutex()
@@ -996,3 +996,32 @@ class TestRecordAttemptSeam:
         store.record_attempt_skip(job, "SKIPPED", run_id=None, seq=3)
         assert len(backend.load_attempts("skip_type::2")) == 1
 
+
+
+def test_success_metadata_preserves_user_keys_and_setdefault_precedence():
+    store, state, backend = _make_store()
+    metadata = {"run_count": 73, "last_run_at": "业务时间", "last_run_id": "业务身份",
+                "success_count": 99, "last_succeeded_at": "自定义时间",
+                "last_success_run_id": "自定义身份", "nested": {"error": "业务"}}
+    state.register_in_flight("t::j")
+    store.apply_success("t::j", metadata, run_id="actual")
+    stored = backend.load_successes()["t::j"]
+    assert stored == {**metadata, "success_count": 1}
+    metadata["nested"]["error"] = "changed"
+    assert backend.load_successes()["t::j"]["nested"] == {"error": "业务"}
+
+
+def test_failure_normalization_keeps_user_keys_and_unknown_attempt_sentinel():
+    from tasklite.engine.errorclass import ErrorClassifier
+
+    metadata = {"error_message": ERR_JOB_DEPENDENCY, "error": "业务旧键", "fatal": "业务",
+                "_attempt": 7, "nested": {"error_type": "业务分类", "fatal": False}}
+    normalized = ErrorClassifier().normalize_failure_metadata(metadata)
+    assert normalized["error_category"] == "dependency"
+    assert normalized["attempt_no"] == 0
+    assert normalized["error"] == "业务旧键"
+    assert normalized["fatal"] == "业务"
+    assert normalized["_attempt"] == 7
+    assert normalized["nested"] == metadata["nested"]
+    assert "error_category" not in metadata
+    assert "attempt_no" not in metadata

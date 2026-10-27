@@ -144,20 +144,20 @@ class TestClassifierMetaDictionaries:
 
         # IPC retry 字典
         cl_retry = classifier.classify(
-            {"status": "retry", "error": "retry me"}
+            {"status": "retry", "error_message": "retry me"}
         )
         assert cl_retry.is_retry is True
         assert cl_retry.failed_error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
 
         # IPC fatal 字典
         cl_fatal = classifier.classify(
-            {"status": "fatal", "error": "fatal crash", "traceback": "..."}
+            {"status": "fatal", "error_message": "fatal crash", "traceback": "..."}
         )
         assert cl_fatal.is_fatal is True
         assert cl_fatal.failed_error_category == ErrorCategory.FATAL.value
 
         # IPC interrupted 字典：档案视图按 unknown 归档（中断不落档案）
-        cl_intr = classifier.classify({"status": "interrupted", "error": "ctrl-c"})
+        cl_intr = classifier.classify({"status": "interrupted", "error_message": "ctrl-c"})
         assert cl_intr.is_interrupted is True
         assert cl_intr.category == ErrorCategory.INTERRUPTED
         assert cl_intr.failed_error_category == ErrorCategory.UNKNOWN.value
@@ -165,21 +165,21 @@ class TestClassifierMetaDictionaries:
     def test_failed_meta_dictionaries(self):
         classifier = ErrorClassifier()
 
-        cl_deadlock = classifier.classify({"error": ERR_DEPENDENCY_DEADLOCK})
+        cl_deadlock = classifier.classify({"error_message": ERR_DEPENDENCY_DEADLOCK})
         assert cl_deadlock.category == ErrorCategory.DEADLOCK
         assert cl_deadlock.failed_error_category == ErrorCategory.DEADLOCK.value
 
-        cl_no_handler = classifier.classify({"error": ERR_NO_HANDLER})
+        cl_no_handler = classifier.classify({"error_message": ERR_NO_HANDLER})
         assert cl_no_handler.category == ErrorCategory.NO_HANDLER
         assert cl_no_handler.failed_error_category == ErrorCategory.NO_HANDLER.value
 
-        cl_fatal_flag = classifier.classify({"error": "boom", "fatal": True})
+        cl_fatal_flag = classifier.classify({"error_message": "boom", "is_fatal": True})
         assert cl_fatal_flag.is_fatal is True
         assert cl_fatal_flag.failed_error_category == ErrorCategory.FATAL.value
 
         # meta 的 error_type 为 unknown 视同未设置：回退错误串映射结论
         cl_typed = classifier.classify(
-            {"error": ERR_JOB_DEPENDENCY, "error_type": ErrorCategory.UNKNOWN.value}
+            {"error_message": ERR_JOB_DEPENDENCY, "error_category": ErrorCategory.UNKNOWN.value}
         )
         assert cl_typed.failed_error_category == ErrorCategory.DEPENDENCY.value
 
@@ -198,7 +198,7 @@ class TestClassifierMetaDictionaries:
             == ErrorCategory.TRANSIENT_EXHAUSTED.value
         )
         assert cl_second.is_fatal is False
-        assert meta["_attempt"] == 2
+        assert meta["attempt_no"] == 2
 
     def test_to_failed_meta_fields(self):
         cl = ErrorClassification(
@@ -213,11 +213,11 @@ class TestClassifierMetaDictionaries:
         )
         meta = cl.to_failure_metadata(attempt=3)
         assert meta == {
-            "error": "ValueError: boom",
-            "error_type": "fatal",
-            "fatal": True,
+            "error_message": "ValueError: boom",
+            "error_category": "fatal",
+            "is_fatal": True,
             "traceback": "tb-frame",
-            "_attempt": 3,
+            "attempt_no": 3,
         }
         # error_code 与 raw_error 双空 → UNKNOWN_ERROR 兜底
         empty = ErrorClassification(
@@ -228,8 +228,8 @@ class TestClassifierMetaDictionaries:
             is_fatal=False,
             is_retry=False,
         )
-        assert empty.to_failure_metadata()["error"] == "UNKNOWN_ERROR"
-        assert "_attempt" not in empty.to_failure_metadata()
+        assert empty.to_failure_metadata()["error_message"] == "UNKNOWN_ERROR"
+        assert "attempt_no" not in empty.to_failure_metadata()
 
 
 class TestNeverRaiseContract:
@@ -255,32 +255,32 @@ class TestNeverRaiseContract:
         for garbage in [None, 42, [1, 2], _BrokenStrObject()]:
             norm = classifier.normalize_failure_metadata(garbage)
             assert isinstance(norm, dict)
-            assert "error_type" in norm
+            assert "error_category" in norm
             assert "failed_at" in norm
-            assert "_attempt" in norm
+            assert "attempt_no" in norm
 
     def test_normalize_failed_meta_dict_paths(self):
         classifier = ErrorClassifier()
         # dict 缺 error_type → 由分类推导；缺 failed_at → 填 UTC 时间戳
-        norm = classifier.normalize_failure_metadata({"error": ERR_DEPENDENCY_DEADLOCK})
-        assert norm["error_type"] == ErrorCategory.DEADLOCK.value
+        norm = classifier.normalize_failure_metadata({"error_message": ERR_DEPENDENCY_DEADLOCK})
+        assert norm["error_category"] == ErrorCategory.DEADLOCK.value
         assert norm["failed_at"]
-        assert norm["_attempt"] == 0
+        assert norm["attempt_no"] == 0
 
         # 显式 attempt 覆盖；既有 error_type / _attempt 保留
         norm_two = classifier.normalize_failure_metadata(
-            {"error": "x", "error_type": ErrorCategory.DISPATCH.value, "_attempt": 5},
+            {"error_message": "x", "error_category": ErrorCategory.DISPATCH.value, "attempt_no": 5},
             attempt=9,
         )
-        assert norm_two["error_type"] == ErrorCategory.DISPATCH.value
-        assert norm_two["_attempt"] == 9
+        assert norm_two["error_category"] == ErrorCategory.DISPATCH.value
+        assert norm_two["attempt_no"] == 9
 
         # 非 dict meta 的 default_error 兜底
         norm_default = classifier.normalize_failure_metadata(
             None, default_error="FALLBACK_ERR"
         )
-        assert norm_default["error"] == "FALLBACK_ERR"
-        assert norm_default["error_type"] == ErrorCategory.UNKNOWN.value
+        assert norm_default["error_message"] == "FALLBACK_ERR"
+        assert norm_default["error_category"] == ErrorCategory.UNKNOWN.value
 
 
 class TestNeverRaiseAgainstBrokenStr:
@@ -305,11 +305,11 @@ class TestNeverRaiseAgainstBrokenStr:
         assert cl_obj.category == ErrorCategory.UNKNOWN
         # 字典路径（IPC/档案 meta 的 error 值不可信）
         cl_dict = classifier.classify(
-            {"status": "retry", "error": _BrokenStrObject()}
+            {"status": "retry", "error_message": _BrokenStrObject()}
         )
         assert isinstance(cl_dict, ErrorClassification)
         assert cl_dict.is_retry is True
-        cl_failed = classifier.classify({"error": _BrokenStrError("x"), "fatal": True})
+        cl_failed = classifier.classify({"error_message": _BrokenStrError("x"), "is_fatal": True})
         assert isinstance(cl_failed, ErrorClassification)
         assert cl_failed.is_fatal is True
 
@@ -324,8 +324,8 @@ class TestNeverRaiseAgainstBrokenStr:
         classifier = ErrorClassifier()
         norm = classifier.normalize_failure_metadata(_BrokenStrObject())
         assert isinstance(norm, dict)
-        assert norm["error"]
-        assert norm["error_type"] == ErrorCategory.UNKNOWN.value
+        assert norm["error_message"]
+        assert norm["error_category"] == ErrorCategory.UNKNOWN.value
 
 
 class TestPayloadValidation:
@@ -883,7 +883,7 @@ class TestDeathAttributionTable:
             None, timed_out=True, timeout_seconds=3.0, timeout_is_transient=False
         )
         assert att.retry_requested is False
-        assert att.result_metadata == {"error": f"{ERR_TIMEOUT_PREFIX}3.0s)"}
+        assert att.result_metadata == {"error_message": f"{ERR_TIMEOUT_PREFIX}3.0s)"}
         assert att.retry_error is None
         assert att.failed_error_category == ErrorCategory.FATAL.value
 
@@ -893,7 +893,7 @@ class TestDeathAttributionTable:
             code, timed_out=False, timeout_is_transient=False
         )
         assert att.retry_requested is True
-        assert att.result_metadata["error"] == f"{ERR_PROCESS_CRASH_PREFIX}{code}"
+        assert att.result_metadata["error_message"] == f"{ERR_PROCESS_CRASH_PREFIX}{code}"
         assert "signal" in att.result_metadata
         # oom_hint 只在平台提供 SIGKILL 时可能为真（Windows 无该常量，
         # 强杀经 proc.kill()/TerminateProcess 完成，不命中 OOM 启发式）
@@ -923,7 +923,7 @@ class TestDeathAttributionTable:
             code, timed_out=False, timeout_is_transient=False
         )
         assert att.retry_requested is True
-        assert att.result_metadata == {"error": f"{ERR_PROCESS_CRASH_PREFIX}{code}"}
+        assert att.result_metadata == {"error_message": f"{ERR_PROCESS_CRASH_PREFIX}{code}"}
         assert "signal" not in att.result_metadata
         assert "oom_hint" not in att.result_metadata
         assert att.retry_error == f"PROCESS_CRASH_EXIT: worker exited with code {code}"
@@ -935,7 +935,7 @@ class TestDeathAttributionTable:
             code, timed_out=False, timeout_is_transient=False
         )
         assert att.retry_requested is True
-        assert att.result_metadata == {"error": ERR_NO_IPC_RESULT}
+        assert att.result_metadata == {"error_message": ERR_NO_IPC_RESULT}
         assert att.retry_error == (
             f"{ERR_NO_IPC_RESULT}: worker exited without writing a result file"
         )
@@ -970,15 +970,15 @@ class TestDeathStringClassification:
         ],
     )
     def test_death_strings_classified(self, classifier, error_str, expected_type):
-        cl = classifier.classify({"error": error_str})
+        cl = classifier.classify({"error_message": error_str})
         assert cl.failed_error_category == expected_type
-        assert classify_error_category({"error": error_str}) == expected_type
+        assert classify_error_category({"error_message": error_str}) == expected_type
 
     def test_arbitrary_business_string_still_unknown(self, classifier):
-        assert classify_error_category({"error": "some handler message"}) == "unknown"
+        assert classify_error_category({"error_message": "some handler message"}) == "unknown"
 
     def test_timeout_string_marks_fatal(self, classifier):
-        cl = classifier.classify({"error": f"{ERR_TIMEOUT_PREFIX}5s)"})
+        cl = classifier.classify({"error_message": f"{ERR_TIMEOUT_PREFIX}5s)"})
         assert cl.is_fatal is True
         assert cl.category == ErrorCategory.FATAL
 
@@ -997,6 +997,6 @@ class TestDeathStringClassification:
         ]
         for att in rows:
             assert isinstance(att, DeathAttribution)
-            error = att.result_metadata.get("error")
+            error = att.result_metadata.get("error_message")
             if error:
-                assert classify_error_category({"error": error}) == att.failed_error_category
+                assert classify_error_category({"error_message": error}) == att.failed_error_category

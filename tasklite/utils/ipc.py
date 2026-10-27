@@ -329,7 +329,7 @@ class ArtifactJournal:
         degraded_status = "retry" if orig_status in (None, "success") else orig_status
         degraded: dict[str, Any] = {
             "status": degraded_status,
-            "error": f"IPC_RESULT_WRITE_DEGRADED: {write_err}",
+            "error_message": f"IPC_RESULT_WRITE_DEGRADED: {write_err}",
         }
         # 认证令牌与瞬态种类随降级继承：读取侧强校验下丢令牌的降级结果
         # 会被误拒，transient_kind 的瞬态保真语义（不烧预算）随之失效

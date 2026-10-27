@@ -203,7 +203,7 @@ class CompletionMachine:
                 f"FAIL: {uid} exceeded max retries ({job.max_retries}). "
                 f"Sent to failure archive."
             )
-            failure_metadata: dict[str, Any] = {"error": ERR_MAX_RETRIES}
+            failure_metadata: dict[str, Any] = {"error_message": ERR_MAX_RETRIES}
             rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
             if rt_state.last_retry_error:
                 failure_metadata["last_retry_error"] = rt_state.last_retry_error
@@ -345,7 +345,7 @@ class CompletionMachine:
             ExecutionResult(
                 success=False,
                 result_metadata={
-                    "error": f"INVALID_SPAWNED_JOB: job dict is not "
+                    "error_message": f"INVALID_SPAWNED_JOB: job dict is not "
                     f"JSON-serializable: {err}"
                 },
             ),

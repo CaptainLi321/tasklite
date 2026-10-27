@@ -44,19 +44,19 @@ class TestListFailures:
     def test_structured_entries_with_payload_snapshot(self):
         backend, _, console = _make_console()
         backend.commit_job_failure(
-            "t::a", {"error": ERR_DEPENDENCY_DEADLOCK}, payload={"k": 1}
+            "t::a", {"error_message": ERR_DEPENDENCY_DEADLOCK}, payload={"k": 1}
         )
         backend.commit_job_failure(
-            "t::b", {"error": "boom", "fatal": True}, payload={"k": 2}
+            "t::b", {"error_message": "boom", "is_fatal": True}, payload={"k": 2}
         )
 
         entries = console.list_failures()
         by_uid = {e.job_uid: e for e in entries}
         assert set(by_uid) == {"t::a", "t::b"}
         assert by_uid["t::a"].error_message == ERR_DEPENDENCY_DEADLOCK
-        assert by_uid["t::a"].metadata["error_type"]
+        assert by_uid["t::a"].metadata["error_category"]
         assert by_uid["t::a"].payload == {"k": 1}
-        assert by_uid["t::b"].metadata["fatal"] is True
+        assert by_uid["t::b"].metadata["is_fatal"] is True
         assert by_uid["t::b"].payload == {"k": 2}
 
     def test_empty_archive_returns_empty(self):
@@ -65,35 +65,35 @@ class TestListFailures:
 
     def test_entries_sorted_by_uid(self):
         backend, _, console = _make_console()
-        backend.append_failed("t::z", {"error": "x"})
-        backend.append_failed("t::a", {"error": "x"})
+        backend.append_failed("t::z", {"error_message": "x"})
+        backend.append_failed("t::a", {"error_message": "x"})
         assert [e.job_uid for e in console.list_failures()] == ["t::a", "t::z"]
 
     def test_bare_row_gains_classifier_error_type(self):
         """带外登记的裸行（无 error_type）在查询视图经 classifier 归档，
         且只读查询不回写持久层。"""
         backend, _, console = _make_console()
-        backend.append_failed("t::bare", {"error": ERR_DISPATCH_FAILURE})
-        assert "error_type" not in backend.load_failed()["t::bare"]
+        backend.append_failed("t::bare", {"error_message": ERR_DISPATCH_FAILURE})
+        assert "error_category" not in backend.load_failed()["t::bare"]
 
         entry = console.list_failures()[0]
 
-        assert entry.metadata["error_type"], "查询视图必须补齐归档 error_type"
-        assert "error_type" not in backend.load_failed()["t::bare"]
+        assert entry.metadata["error_category"], "查询视图必须补齐归档 error_type"
+        assert "error_category" not in backend.load_failed()["t::bare"]
 
     def test_corrupt_meta_row_does_not_crash_query(self):
         """非 dict 损坏行归空视图（unknown 归档），不打断整条查询。"""
         backend, _, console = _make_console()
-        backend.append_failed("t::ok", {"error": "x"})
+        backend.append_failed("t::ok", {"error_message": "x"})
         backend._failed["t::corrupt"] = "boom"  # 直接注入损坏行
         entries = {e.job_uid: e for e in console.list_failures()}
         assert set(entries) == {"t::ok", "t::corrupt"}
-        assert entries["t::corrupt"].metadata["error_type"] == "unknown"
+        assert entries["t::corrupt"].metadata["error_category"] == "unknown"
         assert entries["t::corrupt"].error_message == ""
 
     def test_no_snapshot_entry_payload_none(self):
         backend, _, console = _make_console()
-        backend.append_failed("t::y", {"error": "x"})
+        backend.append_failed("t::y", {"error_message": "x"})
         assert console.list_failures()[0].payload is None
 
 
@@ -101,15 +101,15 @@ class TestClearFailures:
     """失败档案删除面（默认保留 fatal）。"""
 
     def _seed(self, backend):
-        backend.append_failed("dl::a", {"error": "boom", "fatal": True})
-        backend.append_failed("dl::b", {"error": "net", "fatal": False})
-        backend.append_failed("other::c", {"error": "x"})
+        backend.append_failed("dl::a", {"error_message": "boom", "is_fatal": True})
+        backend.append_failed("dl::b", {"error_message": "net", "is_fatal": False})
+        backend.append_failed("other::c", {"error_message": "x"})
 
     def test_keeps_fatal_by_default(self):
         backend, store, console = _make_console()
         self._seed(backend)
         # 预置内存镜像（run 外查询前内存 failed 为空占位）
-        store.state.mark_failed("dl::b", {"error": "net"})
+        store.state.mark_failed("dl::b", {"error_message": "net"})
         assert console.clear_failures() == 2  # b、c 清除，fatal 的 a 保留
         assert set(backend.load_failed()) == {"dl::a"}
         assert "dl::b" not in store.state.failed
@@ -141,7 +141,7 @@ class TestClearFailures:
     def test_clear_then_enqueue_reruns(self):
         """清除语义：删档案后驻留/新入队作业不再被 failed 残留过滤。"""
         backend, store, console = _make_console()
-        backend.append_failed("t::x", {"error": "net"})
+        backend.append_failed("t::x", {"error_message": "net"})
         store.enqueue_jobs([Job("t", "x", payload={})])
         assert console.clear_failures() == 1
 
@@ -157,7 +157,7 @@ class TestRetryFailure:
     def test_retry_reenqueues_from_payload_snapshot(self):
         backend, store, console = _make_console()
         backend.commit_job_failure(
-            "t::x", {"error": "boom"}, payload={"artist": "a"}
+            "t::x", {"error_message": "boom"}, payload={"artist": "a"}
         )
         assert console.retry_failure("t::x") is True
 
@@ -181,7 +181,7 @@ class TestRetryFailure:
         「一行 = 一次物理执行」的追溯链。
         """
         backend, _, console = _make_console()
-        backend.commit_job_failure("t::x", {"error": "boom"}, payload={"k": 1})
+        backend.commit_job_failure("t::x", {"error_message": "boom"}, payload={"k": 1})
         # 轨迹行按真实派发协议落表：先插 running 行，再收尾为 failed
         attempt_id = backend.append_attempt(AttemptRecord(
             job_uid="t::x",
@@ -210,14 +210,14 @@ class TestRetryFailure:
 
     def test_retry_without_payload_uses_empty_payload(self):
         backend, _, console = _make_console()
-        backend.append_failed("t::y", {"error": "x"})  # 无快照
+        backend.append_failed("t::y", {"error_message": "x"})  # 无快照
         assert console.retry_failure("t::y") is True
         assert backend.load_queue()[0]["payload"] == {}
 
     def test_retry_idempotent_against_queue_residence(self):
         """uid 已驻留队列：不重复入队，档案行照删。"""
         backend, store, console = _make_console()
-        backend.commit_job_failure("t::z", {"error": "x"}, payload={"k": 1})
+        backend.commit_job_failure("t::z", {"error_message": "x"}, payload={"k": 1})
         store.enqueue_jobs([Job("t", "z", payload={"k": 1})])
         assert console.retry_failure("t::z") is True
         assert len(backend.load_queue()) == 1
@@ -230,8 +230,8 @@ class TestClearHistory:
     def test_forget_both_wall_and_failed(self):
         backend, _, console = _make_console()
         backend.seed_successes(["t::a", "t::b", "other::c"])
-        backend.append_failed("t::b", {"error": "x"})
-        backend.append_failed("t::d", {"error": "x"})
+        backend.append_failed("t::b", {"error_message": "x"})
+        backend.append_failed("t::d", {"error_message": "x"})
 
         assert console.clear_history("t::") == 4  # successes 2 + failed 2
         assert backend.load_successes() == {"other::c": {}}
@@ -246,7 +246,7 @@ class TestClearHistory:
     def test_forget_only_wall(self):
         backend, _, console = _make_console()
         backend.seed_successes(["t::a"])
-        backend.append_failed("t::a", {"error": "x"})
+        backend.append_failed("t::a", {"error_message": "x"})
         assert console.clear_history("t::a", where=("successes",)) == 1
         assert backend.load_successes() == {}
         assert set(backend.load_failed()) == {"t::a"}
@@ -291,8 +291,8 @@ class TestPredicateClearHistory:
     def test_predicate_applies_to_wall_and_failed(self):
         backend, _, console = _make_console()
         backend.seed_successes(["t::keep", "t::drop"])
-        backend.append_failed("t::keep", {"error": "x"})
-        backend.append_failed("t::drop", {"error": "x"})
+        backend.append_failed("t::keep", {"error_message": "x"})
+        backend.append_failed("t::drop", {"error_message": "x"})
         assert console.clear_history("t::", predicate=lambda u: "drop" in u) == 2
         assert set(backend.load_successes()) == {"t::keep"}
         assert set(backend.load_failed()) == {"t::keep"}
@@ -333,7 +333,7 @@ class TestSeeding:
         失败档案记录须先显式清除，不静默吞失败历史。
         """
         backend, store, console = _make_console()
-        backend.append_failed("t::archived_1", {"error": "boom"})
+        backend.append_failed("t::archived_1", {"error_message": "boom"})
 
         with pytest.raises(ValueError, match="already in the failure archive"):
             console.seed_successes(["t::archived_1", "t::fresh"])
@@ -354,7 +354,7 @@ class TestSeeding:
     def test_seed_wall_after_clear_failures_succeeds(self):
         """先显式清除失败档案再种子：合法存档迁移路径不受拒绝语义波及。"""
         backend, _, console = _make_console()
-        backend.append_failed("t::archived_1", {"error": "boom"})
+        backend.append_failed("t::archived_1", {"error_message": "boom"})
         assert console.clear_failures() == 1
         assert console.seed_successes(["t::archived_1"]) == 1
         assert backend.load_successes()["t::archived_1"] == {}
@@ -444,7 +444,7 @@ class TestFilterJobsWithoutSuccess:
     def test_filters_by_wall_only(self):
         backend, _, console = _make_console()
         backend.seed_successes(["t::done", "t::failed_then_done"])
-        backend.append_failed("t::failed", {"error": "x"})
+        backend.append_failed("t::failed", {"error_message": "x"})
         backend.enqueue_jobs([Job("t", "queued").to_dict()])
         jobs = [
             Job("t", "done"), Job("t", "failed"), Job("t", "queued"), Job("t", "fresh"),
@@ -464,11 +464,11 @@ class TestBackendSwapRebind:
     def test_management_apis_target_rebound_backend(self):
         old_backend, store, console = _make_console()
         old_backend.seed_successes(["w::old"])
-        old_backend.append_failed("a::old", {"error": "old"})
+        old_backend.append_failed("a::old", {"error_message": "old"})
         old_backend.seed_cursor("ck", "old")
 
         new_backend = InMemoryStateBackend()
-        new_backend.append_failed("a::new", {"error": "new"})
+        new_backend.append_failed("a::new", {"error_message": "new"})
         # 换库唯一动作：换 StateStore 锚点；OpsConsole 不独立持库，
         # 管理面经 store.backend 派生自然跟随新库。
         store.set_backend(new_backend)

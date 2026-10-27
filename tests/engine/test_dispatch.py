@@ -254,7 +254,7 @@ class TestDedupGate:
         env.register("t")
         env.store.state.mark_rerun_active("t::j1")
         env.store.state.register_in_flight("t::j1")
-        env.store.apply_failure("t::j1", {"error": "boom"})
+        env.store.apply_failure("t::j1", {"error_message": "boom"})
         env.store.state.spawn_jobs([Job("t", "j1", rerun="on_failure").to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
@@ -277,7 +277,7 @@ class TestRejectGates:
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert env.stats["failed"] == 1
         assert "ghost::j1" in env.store.state.failed
-        assert env.store.state.failed["ghost::j1"]["error"] == ERR_NO_HANDLER
+        assert env.store.state.failed["ghost::j1"]["error_message"] == ERR_NO_HANDLER
         assert env.hooks == [
             ("ghost::j1", AttemptOutcome(success=False, will_retry=False,
                                         metadata=env.store.state.failed["ghost::j1"]))
@@ -300,9 +300,9 @@ class TestRejectGates:
         outcome = env.dispatch.dispatch_job(sched)
         assert outcome is None
         assert env.stats["cascade_failed"] == 2
-        assert env.store.state.failed["child::b"]["error"] == ERR_JOB_DEPENDENCY
+        assert env.store.state.failed["child::b"]["error_message"] == ERR_JOB_DEPENDENCY
         assert env.store.state.failed["child::b"]["failed_dependency"] == "parent::a"
-        assert env.store.state.failed["child::c"]["error"] == ERR_JOB_DEPENDENCY
+        assert env.store.state.failed["child::c"]["error_message"] == ERR_JOB_DEPENDENCY
 
     def test_payload_validation_failure_rejects_without_subprocess(self, tmp_path):
         from typing import TypedDict
@@ -316,7 +316,7 @@ class TestRejectGates:
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert env.store.state.failed["t::j1"]["error"] == ERR_PAYLOAD_VALIDATION
+        assert env.store.state.failed["t::j1"]["error_message"] == ERR_PAYLOAD_VALIDATION
         assert env.store.state.failed["t::j1"]["details"]
         # 载荷校验失败释放租约：工人槽位归还
         assert env.resources["__workers__"].used == 0.0
@@ -505,7 +505,7 @@ class TestDispatchFailureStrike:
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert "t::j1" in env.store.state.failed
-        assert env.store.state.failed["t::j1"]["error"] == ERR_DISPATCH_FAILURE
+        assert env.store.state.failed["t::j1"]["error_message"] == ERR_DISPATCH_FAILURE
         assert env.store.state.failed["t::j1"]["failures"] == 3
         records = env.backend.load_attempts("t::j1")
         assert records[-1].outcome == "failed"
@@ -564,8 +564,8 @@ class TestGateOrderContract:
         """successes 命中且无豁免的作业带失败依赖：按跳过处理，不进级联。"""
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.backend.commit_job_failure("dead::parent", {"error": "dead"})
-        env.store.state.mark_failed("dead::parent", {"error": "dead"})
+        env.backend.commit_job_failure("dead::parent", {"error_message": "dead"})
+        env.store.state.mark_failed("dead::parent", {"error_message": "dead"})
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         env.store.state.pop_job(0)
         env.store.state.register_in_flight("t::j1")

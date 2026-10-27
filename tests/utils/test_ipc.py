@@ -383,7 +383,7 @@ class TestResultWriteDegradation:
         assert res["status"] == "retry", (
             f"success 降级必须改写 retry（重跑而非丢失）: {res}"
         )
-        assert "IPC_RESULT_WRITE_DEGRADED" in res["error"]
+        assert "IPC_RESULT_WRITE_DEGRADED" in res["error_message"]
         full_attempts = [c for c in calls if "raw_result" in c]
         assert len(full_attempts) == 2, "完整写应先试两次再降级"
         assert len(calls) == 3, "降级写只补一次（calls[2] 为最小 retry 结果）"
@@ -395,7 +395,7 @@ class TestResultWriteDegradation:
 
         def flaky_write(journal_self, uid, result_dict, execution_id=None):
             # 以降级标记区分：降级 payload（error 带 DEGRADED 标记）放行
-            if "IPC_RESULT_WRITE_DEGRADED" not in str(result_dict.get("error", "")):
+            if "IPC_RESULT_WRITE_DEGRADED" not in str(result_dict.get("error_message", "")):
                 raise OSError(28, "No space left on device")
             return real_write(journal_self, uid, result_dict, execution_id=execution_id)
 
@@ -487,14 +487,14 @@ class TestStaleResultClaim:
         run_id = "c" * 32
         journal = ArtifactJournal(tmp_path)
         journal.write_result_atomic(
-            "h::a", {"status": "retry", "error": "old"}, execution_id=f"{run_id}.1"
+            "h::a", {"status": "retry", "error_message": "old"}, execution_id=f"{run_id}.1"
         )
         journal.write_result_atomic(
-            "h::a", {"status": "retry", "error": "new"}, execution_id=f"{run_id}.2"
+            "h::a", {"status": "retry", "error_message": "new"}, execution_id=f"{run_id}.2"
         )
 
         payload = journal.claim_stale_result_payload("h::a")
-        assert payload is not None and payload["error"] == "new"
+        assert payload is not None and payload["error_message"] == "new"
         assert journal.iter_stale_result_paths("h::a") == []
 
     def test_sibling_uid_dot_suffix_not_matched(self, tmp_path):

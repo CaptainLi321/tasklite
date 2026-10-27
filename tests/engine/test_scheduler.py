@@ -134,7 +134,7 @@ class TestScanResultSemantics:
         scheduler = JobScheduler(resources={})
         state = _state(
             [Job("t", "j2", depends_on=["t::failed_parent"]).to_dict()],
-            failed={"t::failed_parent": {"error": "fatal"}},
+            failed={"t::failed_parent": {"error_message": "fatal"}},
         )
         result = scheduler.scan_next_runnable(state, frozenset())
         assert result.is_runnable is False
@@ -151,7 +151,7 @@ class TestScanResultSemantics:
                 Job("t", "bad", depends_on=["t::failed_parent"]).to_dict(),
                 Job("t", "good").to_dict(),
             ],
-            failed={"t::failed_parent": {"error": "fatal"}},
+            failed={"t::failed_parent": {"error_message": "fatal"}},
         )
         result = scheduler.scan_next_runnable(state, frozenset())
         assert result.is_runnable is True
@@ -309,7 +309,7 @@ class TestOrderingPolicySeam:
                 Job("t", "head", depends_on=["t::failed_parent"]).to_dict(),
                 Job("t", "tail", depends_on=["t::other_parent"]).to_dict(),
             ],
-            failed={"t::failed_parent": {"error": "x"}, "t::other_parent": {"error": "y"}},
+            failed={"t::failed_parent": {"error_message": "x"}, "t::other_parent": {"error_message": "y"}},
         )
         result = scheduler.scan_next_runnable(state, frozenset())
         assert result.is_dep_failed is True

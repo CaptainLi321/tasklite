@@ -201,7 +201,7 @@ class TestWorkerWrapper:
         assert res is not None
         assert res["status"] == "retry"
         assert res["transient_kind"] == "lock_conflict"
-        assert res["error"].startswith("LOCK_CONFLICT:")
+        assert res["error_message"].startswith("LOCK_CONFLICT:")
 
     def test_lock_env_fault_writes_degraded_retry(self, tmp_path):
         """锁文件打不开（IsADirectoryError）→ 落盘 retry+lock_conflict 结果。
@@ -224,7 +224,7 @@ class TestWorkerWrapper:
         assert res is not None
         assert res["status"] == "retry"
         assert res["transient_kind"] == "lock_conflict"
-        assert "LOCK_ENV_FAULT" in res["error"]
+        assert "LOCK_ENV_FAULT" in res["error_message"]
 
     def test_rate_limit_writes_transient_kind(self, tmp_path):
         """RateLimitHit 与业务 RetryError 共享 retry 通道，仅前者带 rate_limited。"""
@@ -254,7 +254,7 @@ class TestWorkerWrapper:
         _mp_worker_wrapper(make_spec(job, interrupted, tmp_path))
         res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
         assert res["status"] == "interrupted"
-        assert res["error"].startswith("WORKER_INTERRUPTED:")
+        assert res["error_message"].startswith("WORKER_INTERRUPTED:")
 
     def test_registered_transient_exception_writes_retry(self, tmp_path):
         """per-pipeline 瞬态注册表随 ctx 下发，命中注册表按 retry 分类。"""
@@ -280,7 +280,7 @@ class TestWorkerWrapper:
         ))
         res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
         assert res["status"] == "fatal"
-        assert "TypeError" in res["error"]
+        assert "TypeError" in res["error_message"]
 
     def test_plain_exception_writes_error(self, tmp_path):
         job = Job("h", "ve")
@@ -289,7 +289,7 @@ class TestWorkerWrapper:
         ))
         res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
         assert res["status"] == "error"
-        assert "ValueError" in res["error"]
+        assert "ValueError" in res["error_message"]
 
 
 class TestWorkerResultWriteDegraded:
@@ -300,7 +300,7 @@ class TestWorkerResultWriteDegraded:
         """区分完整 payload 与降级 payload（降级写的 error 带 DEGRADED 标记）。"""
         if "raw_result" in result_dict:
             return True
-        return str(result_dict.get("error", "")).startswith("LOCK_CONFLICT:")
+        return str(result_dict.get("error_message", "")).startswith("LOCK_CONFLICT:")
 
     def test_success_payload_write_failure_degrades_to_retry(self, tmp_path, monkeypatch):
         """完整结果写两连败 → 降级写 retry 结果（重跑而非静默丢失）。"""
@@ -321,7 +321,7 @@ class TestWorkerResultWriteDegraded:
         res = ArtifactJournal(tmp_path).read_result("h::a", execution_id=_EXECUTION_ID)
         assert res is not None, "降级写必须成功落盘（小 payload 可写）"
         assert res["status"] == "retry"
-        assert "IPC_RESULT_WRITE_DEGRADED" in res["error"]
+        assert "IPC_RESULT_WRITE_DEGRADED" in res["error_message"]
         full_attempts = [c for c in calls if self._is_full_payload(c)]
         assert len(full_attempts) == 2, "完整写应先试两次再降级"
         assert len(calls) == 3, "降级写只补一次"
@@ -351,14 +351,14 @@ class TestWorkerResultWriteDegraded:
         assert res is not None
         assert res["status"] == "retry"
         assert res.get("transient_kind") == "lock_conflict"
-        assert "IPC_RESULT_WRITE_DEGRADED" in res["error"]
+        assert "IPC_RESULT_WRITE_DEGRADED" in res["error_message"]
 
     def test_rate_limit_degraded_keeps_structured_field(self, tmp_path, monkeypatch):
         """限流完整写失败 → 降级结果保留 rate_limited（预算豁免依据）。"""
         real_write = ArtifactJournal.write_result_atomic
 
         def flaky_write(journal_self, uid, result_dict, execution_id=None):
-            if "IPC_RESULT_WRITE_DEGRADED" not in str(result_dict.get("error", "")):
+            if "IPC_RESULT_WRITE_DEGRADED" not in str(result_dict.get("error_message", "")):
                 raise OSError(28, "No space left on device")
             return real_write(journal_self, uid, result_dict, execution_id=execution_id)
 
@@ -415,7 +415,7 @@ class TestEnvFallbackIpcDirCoherence:
                     {
                         "status": "success",
                         "raw_result": True,
-                        "new_jobs": [],
+                        "spawned_jobs": [],
                         "resource_suspensions": [],
                         "cursor_updates": {},
                     },
@@ -477,12 +477,12 @@ class TestNormalizeResultJsonSerializable:
     def test_dict_with_bytes_metadata_rejected(self):
         success, meta = _normalize_handler_result({"data": b"raw"})
         assert success is False
-        assert "not JSON-serializable" in meta["error"]
+        assert "not JSON-serializable" in meta["error_message"]
 
     def test_tuple_with_datetime_metadata_rejected(self):
         success, meta = _normalize_handler_result((True, {"ts": datetime.now()}))
         assert success is False
-        assert "not JSON-serializable" in meta["error"]
+        assert "not JSON-serializable" in meta["error_message"]
 
     def test_plain_dict_still_accepted(self):
         success, meta = _normalize_handler_result({"a": 1, "b": "x"})
@@ -492,28 +492,28 @@ class TestNormalizeResultJsonSerializable:
     def test_failed_tuple_with_bad_meta_rejected(self):
         success, meta = _normalize_handler_result((False, {"blob": bytes(3)}))
         assert success is False
-        assert "not JSON-serializable" in meta["error"]
+        assert "not JSON-serializable" in meta["error_message"]
 
     def test_nan_result_meta_rejected(self):
         success, meta = _normalize_handler_result({"size": float("nan")})
         assert success is False, "NaN result_metadata 必须被拒绝"
-        assert "not JSON-serializable" in meta["error"]
+        assert "not JSON-serializable" in meta["error_message"]
 
     def test_invalid_tuple_shape_rejected(self):
         success, meta = _normalize_handler_result(("yes", {"a": 1}))
         assert success is False
-        assert "invalid handler return tuple" in meta["error"]
+        assert "invalid handler return tuple" in meta["error_message"]
 
     def test_unrecognized_type_rejected(self):
         success, meta = _normalize_handler_result(42)
         assert success is False
-        assert "invalid handler return type" in meta["error"]
+        assert "invalid handler return type" in meta["error_message"]
 
 
 _BASE_OK = {
     "status": "success",
     "raw_result": {"ok": True},
-    "new_jobs": [],
+    "spawned_jobs": [],
     "cursor_updates": {},
     "resource_suspensions": [],
 }
@@ -531,7 +531,7 @@ class TestDecodeIpcResultDefense:
         del res["raw_result"]
         result = _decode(res)
         assert result.success is False
-        assert "CORRUPT_RESULT_FILE" in result.result_metadata["error"]
+        assert "CORRUPT_RESULT_FILE" in result.result_metadata["error_message"]
 
     def test_success_decode_crash_converted_to_corrupt_result(self, monkeypatch):
         """解码异常兜底：success 分支解码/归一化段意外异常 → 转损坏结果。"""
@@ -541,23 +541,23 @@ class TestDecodeIpcResultDefense:
         )
         result = _decode(dict(_BASE_OK))
         assert result.success is False
-        assert result.result_metadata["error"].startswith("CORRUPT_RESULT_FILE: decode failed")
+        assert result.result_metadata["error_message"].startswith("CORRUPT_RESULT_FILE: decode failed")
         assert "traceback" in result.result_metadata
 
     def test_new_jobs_scalar_marks_failed_not_crash(self):
         for scalar in (7, 3.5, True):
-            result = _decode(dict(_BASE_OK, new_jobs=scalar))
+            result = _decode(dict(_BASE_OK, spawned_jobs=scalar))
             assert result.success is False
-            assert "invalid new_jobs type" in result.result_metadata["error"]
+            assert "invalid spawned_jobs type" in result.result_metadata["error_message"]
 
     def test_malformed_spawned_job_marks_failed(self):
-        res = dict(_BASE_OK, new_jobs=[{"task_type": "t"}])  # 缺 job_id
+        res = dict(_BASE_OK, spawned_jobs=[{"task_type": "t"}])  # 缺 job_id
         result = _decode(res)
         assert result.success is False
-        assert "invalid spawned job dict" in result.result_metadata["error"]
+        assert "invalid spawned job dict" in result.result_metadata["error_message"]
 
     def test_valid_spawned_jobs_parsed(self):
-        res = dict(_BASE_OK, new_jobs=[
+        res = dict(_BASE_OK, spawned_jobs=[
             {"task_type": "t", "job_id": "child", "payload": {"v": 1}},
         ])
         result = _decode(res)
@@ -568,52 +568,52 @@ class TestDecodeIpcResultDefense:
         res = dict(_BASE_OK, cursor_updates=["k", "v"])
         result = _decode(res)
         assert result.success is False
-        assert "invalid cursor_updates type" in result.result_metadata["error"]
+        assert "invalid cursor_updates type" in result.result_metadata["error_message"]
 
     def test_cursor_updates_value_not_str_marks_failed(self):
         res = dict(_BASE_OK, cursor_updates={"k": 123})
         result = _decode(res)
         assert result.success is False
-        assert "invalid cursor_updates value" in result.result_metadata["error"]
+        assert "invalid cursor_updates value" in result.result_metadata["error_message"]
 
     def test_resource_suspensions_bad_element_marks_failed(self):
         res = dict(_BASE_OK, resource_suspensions=[("api", "not-a-number")])
         result = _decode(res)
         assert result.success is False
-        assert "invalid resource_suspension entry" in result.result_metadata["error"]
+        assert "invalid resource_suspension entry" in result.result_metadata["error_message"]
 
     def test_resource_suspensions_not_list_marks_failed(self):
         res = dict(_BASE_OK, resource_suspensions={"api": 1.0})
         result = _decode(res)
         assert result.success is False
-        assert "invalid resource_suspensions type" in result.result_metadata["error"]
+        assert "invalid resource_suspensions type" in result.result_metadata["error_message"]
 
     def test_retry_status_extracts_transient_kind(self):
-        result = _decode({"status": "retry", "error": "x", "transient_kind": "rate_limited"})
+        result = _decode({"status": "retry", "error_message": "x", "transient_kind": "rate_limited"})
         assert result.retry_requested is True
         assert result.transient_kind == "rate_limited"
 
     def test_retry_status_non_string_kind_ignored(self):
-        result = _decode({"status": "retry", "error": "x", "transient_kind": 7})
+        result = _decode({"status": "retry", "error_message": "x", "transient_kind": 7})
         assert result.retry_requested is True
         assert result.transient_kind is None
 
     def test_interrupted_status_forces_transient_kind(self):
-        result = _decode({"status": "interrupted", "error": "sig"})
+        result = _decode({"status": "interrupted", "error_message": "sig"})
         assert result.retry_requested is True
         assert result.transient_kind == "interrupted"
 
     def test_fatal_status_marks_failed(self):
-        res = {"status": "fatal", "error": "boom", "traceback": "tb"}
+        res = {"status": "fatal", "error_message": "boom", "traceback": "tb"}
         result = _decode(res)
         assert result.success is False
-        assert result.result_metadata["fatal"] is True
-        assert result.result_metadata["error"] == "boom"
+        assert result.result_metadata["is_fatal"] is True
+        assert result.result_metadata["error_message"] == "boom"
 
     def test_unknown_status_marks_failed(self):
         result = _decode({"status": "weird"})
         assert result.success is False
-        assert "unknown status" in result.result_metadata["error"]
+        assert "unknown status" in result.result_metadata["error_message"]
 
     def test_crash_exitcode_marks_failed(self):
         class _P:
@@ -622,21 +622,21 @@ class TestDecodeIpcResultDefense:
         res = {"raw": "not-a-result-dict"}  # 无 status 键 → 走 exitcode 归因
         result = _decode(res, p=_P())
         assert result.success is False
-        assert "PROCESS_CRASH_EXITCODE_-9" in result.result_metadata["error"]
+        assert "PROCESS_CRASH_EXITCODE_-9" in result.result_metadata["error_message"]
 
     def test_missing_status_without_process_requests_retry(self):
         """认领路径（p=None）读到无 status 的残留文件 → NO_IPC_RESULT 可重试。"""
         result = _decode({}, None)
         assert result.success is False
         assert result.retry_requested is True
-        assert "NO_IPC_RESULT" in result.result_metadata["error"]
+        assert "NO_IPC_RESULT" in result.result_metadata["error_message"]
 
     def test_nonzero_exitcode_without_status_requests_retry(self):
         res = {"raw": "not-a-result-dict"}
         result = _decode(res, SimpleNamespace(exitcode=1))
         assert result.success is False
         assert result.retry_requested is True
-        assert "PROCESS_CRASH_EXITCODE_1" in result.result_metadata["error"]
+        assert "PROCESS_CRASH_EXITCODE_1" in result.result_metadata["error_message"]
         assert "PROCESS_CRASH_EXIT" in (result.retry_error or "")
 
     def test_missing_output_marks_failed(self, tmp_path):
@@ -644,7 +644,7 @@ class TestDecodeIpcResultDefense:
         journal.record_output("t::a", str(tmp_path / "missing.jpg"), cleanup=True)
         result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
         assert result.success is False
-        assert "Missing output" in result.result_metadata["error"]
+        assert "Missing output" in result.result_metadata["error_message"]
 
     def test_present_output_passes(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
@@ -670,7 +670,7 @@ class TestDecodeConvergencePaths:
     _SCALAR_CORRUPT = {
         "status": "success",
         "raw_result": None,
-        "new_jobs": 7,
+        "spawned_jobs": 7,
         "cursor_updates": {},
         "resource_suspensions": [],
     }
@@ -703,7 +703,7 @@ class TestDecodeConvergencePaths:
         assert len(completed) == 1, "损坏任务必须被收割而非打断收割循环"
         result = completed[0][1]
         assert result.success is False
-        assert "invalid new_jobs type" in result.result_metadata["error"]
+        assert "invalid spawned_jobs type" in result.result_metadata["error_message"]
         assert not ArtifactJournal(tmp_path).result_path(job.uid, _EXECUTION_ID).exists(), (
             "收割后 IPC 结果文件必须照常清理"
         )
@@ -717,7 +717,7 @@ class TestDecodeConvergencePaths:
         result = ExecutionChannel(tmp_path).claim_stale_result(job.uid, job)
         assert result is not None, "含 status 键的残留结果必须被认领"
         assert result.success is False
-        assert "invalid new_jobs type" in result.result_metadata["error"]
+        assert "invalid spawned_jobs type" in result.result_metadata["error_message"]
         assert not ArtifactJournal(tmp_path).result_path(job.uid, execution_id).exists(), (
             "认领后残留文件必须照常消费清理"
         )
@@ -755,7 +755,7 @@ class TestBuildTerminalFailureDefense:
         )
         assert result.success is False
         assert result.retry_requested is False
-        assert "TIMEOUT" in result.result_metadata["error"]
+        assert "TIMEOUT" in result.result_metadata["error_message"]
 
     def test_crash_exitcode_classified(self):
         result = ExecutionChannel._build_terminal_failure(
@@ -763,7 +763,7 @@ class TestBuildTerminalFailureDefense:
         )
         assert result.success is False
         assert result.retry_requested is True
-        assert "PROCESS_CRASH_EXITCODE_-11" in result.result_metadata["error"]
+        assert "PROCESS_CRASH_EXITCODE_-11" in result.result_metadata["error_message"]
 
     def test_clean_exit_without_result_classified(self):
         result = ExecutionChannel._build_terminal_failure(
@@ -771,7 +771,7 @@ class TestBuildTerminalFailureDefense:
         )
         assert result.success is False
         assert result.retry_requested is True
-        assert "NO_IPC_RESULT" in result.result_metadata["error"]
+        assert "NO_IPC_RESULT" in result.result_metadata["error_message"]
         assert result.retry_error
 
 
@@ -828,7 +828,7 @@ class TestWatchdogReap:
         assert len(completed) == 1
         result = completed[0][1]
         assert result.success is False
-        assert result.result_metadata["error"].startswith("TIMEOUT")
+        assert result.result_metadata["error_message"].startswith("TIMEOUT")
         assert result.retry_requested is False, (
             "timeout_is_transient=False 的超时是终局，不烧重试预算"
         )
@@ -856,7 +856,7 @@ class TestWatchdogReap:
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         result = completed[0][1]
-        assert "NO_IPC_RESULT" in result.result_metadata["error"], (
+        assert "NO_IPC_RESULT" in result.result_metadata["error_message"], (
             "join 窗口内自然退出且无结果 → NO_IPC_RESULT 瞬态，非 TIMEOUT"
         )
         assert result.retry_requested is True
@@ -882,7 +882,7 @@ class TestWatchdogReap:
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         result = completed[0][1]
         assert result.success is False
-        assert f"PROCESS_CRASH_EXITCODE_{exitcode}" in result.result_metadata["error"], (
+        assert f"PROCESS_CRASH_EXITCODE_{exitcode}" in result.result_metadata["error_message"], (
             "join 窗口内死亡必须按 exitcode 分簇归因，而非折入 TIMEOUT"
         )
         assert result.retry_requested is True, "同窗口死亡维持瞬态可重试（对称性）"
@@ -896,7 +896,7 @@ class TestWatchdogReap:
             {
                 "status": "success",
                 "raw_result": True,
-                "new_jobs": [],
+                "spawned_jobs": [],
                 "resource_suspensions": [],
                 "cursor_updates": {},
             },
@@ -947,7 +947,7 @@ class TestStaleResultClaimChannel:
             {
                 "status": "success",
                 "raw_result": {"status": "ok"},
-                "new_jobs": [],
+                "spawned_jobs": [],
                 "resource_suspensions": [],
                 "cursor_updates": {},
             },
@@ -1003,7 +1003,7 @@ class TestResultAuthTokenReaderSide:
         return {
             "status": "success",
             "raw_result": {"poisoned": True},
-            "new_jobs": [{"task_type": "evil", "job_id": "injected", "payload": {}}],
+            "spawned_jobs": [{"task_type": "evil", "job_id": "injected", "payload": {}}],
             "cursor_updates": {"cursor": "poisoned"},
         }
 
@@ -1237,7 +1237,7 @@ class TestAbortInFlight:
         job = Job("task", "interrupted")
         channel.journal.write_result_atomic(
             job.uid,
-            {"status": "interrupted", "error": "WORKER_INTERRUPTED: KeyboardInterrupt"},
+            {"status": "interrupted", "error_message": "WORKER_INTERRUPTED: KeyboardInterrupt"},
             execution_id="inc_interrupted",
         )
         h = JobHandle(

@@ -398,7 +398,7 @@ class TestResolveDeadlockAttribution:
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
         malformed_uid = job_uid_from_snapshot({"task_type": "t"})
-        assert state.failed[malformed_uid]["error"] == ERR_MALFORMED_JOB
+        assert state.failed[malformed_uid]["error_message"] == ERR_MALFORMED_JOB
         assert state.failed[malformed_uid]["root_cause"] is True
 
     def test_unknown_resource_attribution(self):
@@ -411,7 +411,7 @@ class TestResolveDeadlockAttribution:
         )
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
-        assert state.failed["t::x"]["error"] == ERR_RESOURCE_DEADLOCK
+        assert state.failed["t::x"]["error_message"] == ERR_RESOURCE_DEADLOCK
 
     def test_impossible_resource_attribution(self):
         gov = DeadlockGovernor()
@@ -423,7 +423,7 @@ class TestResolveDeadlockAttribution:
         )
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
-        assert state.failed["t::x"]["error"] == ERR_RESOURCE_DEADLOCK
+        assert state.failed["t::x"]["error_message"] == ERR_RESOURCE_DEADLOCK
 
     def test_missing_dependency_without_spawner_fails_after_grace(self):
         gov = DeadlockGovernor(dependency_grace_seconds=5.0)
@@ -436,7 +436,7 @@ class TestResolveDeadlockAttribution:
         )
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
-        assert state.failed["t::a"]["error"] == ERR_DEPENDENCY_DEADLOCK
+        assert state.failed["t::a"]["error_message"] == ERR_DEPENDENCY_DEADLOCK
 
     def test_missing_dependency_with_spawner_graces(self):
         gov = DeadlockGovernor(dependency_grace_seconds=5.0)
@@ -467,7 +467,7 @@ class TestResolveDeadlockAttribution:
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
         assert set(state.failed) == {"t::a", "t::b"}
-        assert state.failed["t::a"]["error"] == ERR_DEPENDENCY_DEADLOCK
+        assert state.failed["t::a"]["error_message"] == ERR_DEPENDENCY_DEADLOCK
         assert [job_uid_from_snapshot(jd) for jd in state.queue] == ["t::c"]
 
     def test_unclassifiable_gap_escalates_whole_queue(self):
@@ -481,7 +481,7 @@ class TestResolveDeadlockAttribution:
         assert decision.action == "resolved"
         assert decision.should_terminate is True
         assert set(state.failed) == {"t::a", "t::b"}
-        assert state.failed["t::a"]["error"] == ERR_DEADLOCK_GAP
+        assert state.failed["t::a"]["error_message"] == ERR_DEADLOCK_GAP
         assert state.queue == []
 
     def test_partial_failure_keeps_queue_not_terminating(self):
@@ -690,7 +690,7 @@ class TestSelectionClosedLoopArbitration:
         assert job_uid_from_snapshot(downstream) == "t::downstream"
         store.apply_failure(
             "t::downstream",
-            {"error": "JOB_DEPENDENCY", "failed_dependency": "t::gap"},
+            {"error_message": "JOB_DEPENDENCY", "failed_dependency": "t::gap"},
             job_snapshot=downstream,
         )
 

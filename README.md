@@ -74,7 +74,7 @@ flowchart TD
 ```
 
 ### 三层崩溃恢复防线
-1. **执行代标识 (Generation Tag)**：结果文件携带 `{uid}.{run_id}.{seq}`，前次崩溃的孤儿进程结果对新 Run 不可见；
+1. **执行代标识 (Generation Tag)**：结果文件携带 `{uid}.{run_id}.{dispatch_no}`，前次崩溃的孤儿进程结果对新 Run 不可见；
 2. **启动期残留消费**：启动时自动识别并提交崩溃前已落盘的有效结果，不重复执行；
 3. **孤儿文件锁探测 (Lockfile Fencing)**：严格保证同一 UID 在全局只有一个物理执行体。
 
@@ -186,7 +186,7 @@ pipeline.run()
 | 层 | 定义 | 持久化 |
 |---|---|---|
 | **Task（规格）** | 进程内注册的静态模板：task_type 名、handler、默认资源、payload_schema、默认 max_retries / timeout_seconds | 代码即规格，不落盘；注册于 `register_task` |
-| **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变 | queue 行 job_data JSON（uid 为主键） |
+| **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变 | queue 行 job_snapshot JSON（job_uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：attempt 序号、execution_id、起止时间、结局 | append-only 新表 `attempts` |
 
 任一 attempts 行可回溯「哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——端到端追溯链完整。完整使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**（权威）；v1 → v2 命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)；未来演进方向（CLI 直达、make 式级联更新、调度策略族）见 [ROADMAP](docs/ROADMAP.md)。**v1 已退役**（git 历史与 `v1-final` 标签留档）。
@@ -382,3 +382,5 @@ tasklite/
 ## 📄 开源许可证
 
 本项目基于 [MIT License](LICENSE) 开源。
+
+开发中的命名存储契约为 schema 4（包版本暂为 2.1.0，目标 3.0.0 尚未发布）。仅接纳真正空库或完整目标形状的 schema 4；旧库、版本 0 非空库与半建库在只读预检阶段明确拒绝，不自动迁移或修复。请保留原库，用匹配版本读取历史，或显式选择新状态库路径。字段与接纳边界见 [V2 使用指南](docs/V2_GUIDE.md) 和 [ADR-0007](docs/adr/0007-naming-schema-contract.md)。

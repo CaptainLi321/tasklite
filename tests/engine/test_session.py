@@ -126,7 +126,7 @@ class TestSessionLifecycle:
 @pytest.mark.hypothesis
 @settings(max_examples=50, deadline=None)
 @example(reasons=[])
-@example(reasons=["completed", "completed", "error"])
+@example(reasons=["completed", "completed", "error_message"])
 @given(reasons=st.lists(st.text(max_size=20), max_size=12))
 def test_fire_run_end_fires_exactly_once_with_first_reason(reasons):
     """任意 n 次调用：记录型钩子恰好在首次调用触发一次，reason 取首个。"""
@@ -140,7 +140,7 @@ def test_fire_run_end_fires_exactly_once_with_first_reason(reasons):
 
 @pytest.mark.hypothesis
 @settings(max_examples=50, deadline=None)
-@example(reasons=["completed", "error"])
+@example(reasons=["completed", "error_message"])
 @given(reasons=st.lists(st.text(min_size=1, max_size=20), min_size=1, max_size=12))
 def test_fire_run_end_idempotent_even_when_hook_raises(reasons):
     """幂等标志在钩子调用前置位：即使钩子每次都抛异常，也只进入钩子一次。"""

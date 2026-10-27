@@ -142,13 +142,13 @@ class TestSixSetMutex:
     def test_wall_failed_mutex_through_inverse_transitions(self):
         """成功/失败互逆转移：任一终态写入都把 uid 从对侧集合精确移出。"""
         st = PipelineState({}, {}, {}, [])
-        st.mark_failed("t::x", {"error": "boom"})
+        st.mark_failed("t::x", {"error_message": "boom"})
         assert st.failed_uids == {"t::x"}
         assert st.success_job_uids == set()
         st.mark_success("t::x", {"score": 1})
         assert st.success_job_uids == {"t::x"}
         assert st.failed_uids == set()
-        st.mark_failed("t::x", {"error": "again"})
+        st.mark_failed("t::x", {"error_message": "again"})
         assert st.failed_uids == {"t::x"}
         assert st.success_job_uids == set()
 

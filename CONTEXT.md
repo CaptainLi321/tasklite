@@ -51,7 +51,7 @@ The persistent failure archive of jobs that failed permanently or exhausted thei
 _Avoid_: FailureLog, ErrorQueue, Trash, DLQ, DeadLetter
 
 **FailureEntry**:
-The structured archive entry: `job_uid`, `error_message`, `metadata` (full archive metadata view incl. `error_type`), `payload` (raw business payload snapshot — manual re-run needs no external lookup).
+The structured archive entry: `job_uid`, `error_message`, `metadata` (full archive metadata view incl. `error_category`), `payload` (raw business payload snapshot — manual re-run needs no external lookup).
 _Avoid_: DLQEntry, ErrorRecord
 
 **ErrorClassifier**:
@@ -63,7 +63,7 @@ The reversible `%XX` percent-encoding family (`encode_identifier` / `encode_job_
 _Avoid_: Sanitizer, Slugger, Escaper, sanitize_*
 
 **OrderingPolicy**:
-The queue visit-order seam: `scan_next_runnable` is the single selection point; default `FifoOrderingPolicy` (by seq). Custom policies inject via the `ordering_policy` facade parameter — the core contains no scheduling arithmetic.
+The queue visit-order seam: `scan_next_runnable` is the single selection point; default `FifoOrderingPolicy` (by queue_position). Custom policies inject via the `ordering_policy` facade parameter — the core contains no scheduling arithmetic.
 _Avoid_: SortStrategy, PriorityScheme
 
 **RequeuePolicy**:
@@ -119,7 +119,7 @@ Abstract storage interface implementing atomic delta commits for job success, fa
 _Avoid_: Database, Repository, StorageDriver
 
 **SQLiteStateBackend**:
-Default ACID storage adapter using SQLite in WAL mode with immediate transactions; fresh schema (`user_version=3`, incl. the append-only `attempts` table), fail-loud rejection of any older library.
+Default ACID storage adapter using SQLite in WAL mode with immediate transactions; fresh schema (`user_version=4`, incl. the append-only `attempts` table), read-only preflight rejection of older versions, nonempty version 0 databases, and incomplete or mixed schema 4 databases. Package 2.1.0 remains the development version; target 3.0.0 is not released.
 _Avoid_: SQLiteDriver, DBBackend
 
 **InMemoryStateBackend**:

@@ -84,8 +84,8 @@ class TestCoreContractProperties:
         b.enqueue_jobs([_job_snapshot(j) for j in ("success_one", "fail_one", "bulk_one", "skip_one")])
 
         assert b.commit_job_success(job_uid="t::success_one", result_metadata={"ok": True}) is True
-        assert b.commit_job_failure(job_uid="t::fail_one", result_metadata={"error": "x"}) is True
-        assert b.commit_job_failures(job_uids_metas=[("t::bulk_one", {"error": "y"})]) is True
+        assert b.commit_job_failure(job_uid="t::fail_one", result_metadata={"error_message": "x"}) is True
+        assert b.commit_job_failures(job_uids_metas=[("t::bulk_one", {"error_message": "y"})]) is True
         assert b.commit_skip(job_uid="t::skip_one") is True
 
         assert _queue_uids(b) == []
@@ -105,7 +105,7 @@ class TestCoreContractProperties:
     def test_success_failure_mutually_delete_opposite_side(self, dual_backend):
         """终态互斥：成功删 failed 同名行、失败删 successes 行（最终状态唯一）。"""
         b = dual_backend
-        metadata = {"error": "stale", "payload": "档案元数据", "nested": {"new_jobs": [1]}}
+        metadata = {"error_message": "stale", "payload": "档案元数据", "nested": {"new_jobs": [1]}}
         payload = {"error": "业务输入", "metadata": "业务值", "nested": {"timeout": 9}}
         assert b.commit_job_failure(
             job_uid="t::one", result_metadata=metadata, payload=payload
@@ -118,7 +118,7 @@ class TestCoreContractProperties:
         assert b.load_failed() == {}
         assert b.load_failure_payloads() == {}
 
-        assert b.commit_job_failure("t::other", {"error": "boom"}) is True
+        assert b.commit_job_failure("t::other", {"error_message": "boom"}) is True
         assert b.load_successes() == {"t::one": {"ok": True}}
         assert not (set(b.load_successes()) & set(b.load_failed()))
 
@@ -179,7 +179,7 @@ class TestBackendCommitAtomicity:
     def test_spawn_conflict_returns_false_keeping_backend_unchanged(self, dual_backend):
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("child")])
-        b.append_failed(job_uid="t::one", metadata={"error": "stale"})
+        b.append_failed(job_uid="t::one", metadata={"error_message": "stale"})
         before = _snapshot(b)
 
         ok = b.commit_job_success(
@@ -247,7 +247,7 @@ class TestBackendCommitAtomicity:
         before = _snapshot(b)
 
         ok = b.commit_job_failures([
-            ("t::one", {"error": "d_one"}),
+            ("t::one", {"error_message": "d_one"}),
             ("t::two", {"payload": _UncommittableMeta()}),
         ])
 
@@ -269,7 +269,7 @@ class TestBackendCommitAtomicity:
     def test_success_commit_with_spawn_and_cursor_still_applies(self, dual_backend):
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one")])
-        b.append_failed("t::one", {"error": "stale"})
+        b.append_failed("t::one", {"error_message": "stale"})
 
         ok = b.commit_job_success(
             "t::one",
@@ -403,7 +403,7 @@ class TestSeedWallMutualExclusion:
 
     def test_seed_wall_rejects_uid_already_in_failed(self, dual_backend):
         b = dual_backend
-        b.append_failed("t::x_marks", {"error": "boom"})
+        b.append_failed("t::x_marks", {"error_message": "boom"})
 
         with pytest.raises(ValueError, match="already in failed"):
             b.seed_successes(["t::x_marks"])
@@ -415,7 +415,7 @@ class TestSeedWallMutualExclusion:
     def test_seed_wall_conflict_is_atomic_no_partial_write(self, dual_backend):
         """冲突批次整体拒绝：batch 内非冲突 uid 亦不得部分写入。"""
         b = dual_backend
-        b.append_failed("t::bad_entry", {"error": "boom"})
+        b.append_failed("t::bad_entry", {"error_message": "boom"})
 
         with pytest.raises(ValueError, match="already in failed"):
             b.seed_successes(["t::ok_entry", "t::bad_entry", "t::ok_next"])
@@ -448,3 +448,25 @@ class TestSeedCursorParity:
         b.seed_cursor("k", "v_one")
         b.seed_cursor("k", "v_two")
         assert b.load_cursors() == {"k": "v_two"}
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"error": "业务", "error_message": "新业务", "nested": {"new_jobs": [], "spawned_jobs": [1]}}])
+def test_archive_metadata_and_payload_are_independent_untranslated_copies(dual_backend, payload):
+    import copy
+
+    backend = dual_backend
+    metadata = {"error": "旧业务键", "error_message": "框架诊断", "fatal": "业务", "is_fatal": False,
+                "_attempt": 9, "attempt_no": 0, "nested": {"timeout": 17, "timeout_seconds": 18}}
+    expected_metadata = copy.deepcopy(metadata)
+    expected_payload = copy.deepcopy(payload)
+    assert backend.commit_job_failure("t::separate", metadata, payload=payload)
+    metadata["nested"]["timeout"] = 99
+    if payload:
+        payload["nested"]["new_jobs"].append(99)
+    assert backend.load_failed() == {"t::separate": expected_metadata}
+    expected_payloads = {} if payload is None else {"t::separate": expected_payload}
+    assert backend.load_failure_payloads() == expected_payloads
+    backend.load_failed()["t::separate"]["nested"]["timeout"] = 999
+    assert backend.load_failed() == {"t::separate": expected_metadata}
+    assert backend.commit_job_failure("t::separate", {"replacement": True}, payload=None)
+    assert backend.load_failure_payloads() == expected_payloads

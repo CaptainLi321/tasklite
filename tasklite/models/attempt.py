@@ -114,6 +114,9 @@ class AttemptRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AttemptRecord:
         """从持久化字典重建（必填键缺失显式 KeyError，可空键缺省 None）。"""
+        for key in ("incarnation", "error"):
+            if key in data:
+                raise ValueError(f"AttemptRecord 不接受旧字段 {key}")
         return cls(
             job_uid=data["job_uid"],
             activation_no=data["activation_no"],

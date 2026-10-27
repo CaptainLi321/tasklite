@@ -64,14 +64,14 @@ def _fake_process_class(*, fail_uid=None, spawn_jobs=()):
             if spec.job.uid == fail_uid:
                 result = {
                     "status": "fatal",
-                    "error": "FatalError: boom",
+                    "error_message": "FatalError: boom",
                     "traceback": "",
                 }
             else:
                 result = {
                     "status": "success",
                     "raw_result": True,
-                    "new_jobs": [dict(job) for job in spawn_jobs],
+                    "spawned_jobs": [dict(job) for job in spawn_jobs],
                     "resource_suspensions": [],
                     "cursor_updates": {},
                 }
@@ -301,7 +301,7 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
     assert summary.exit_reason is ExitReason.COMPLETED
     failed = pipeline.backend.load_failed()
     assert sorted(failed) == ["rank::b", "rank::c"]
-    assert all(ERR_DEPENDENCY_DEADLOCK in meta["error"] for meta in failed.values())
+    assert all(ERR_DEPENDENCY_DEADLOCK in meta["error_message"] for meta in failed.values())
     assert summary.stats["failed"] == 2
     # 被排除作业不被环归因波及，原样留队。
     assert _queued(pipeline) == ["excluded_t::a"]
@@ -331,7 +331,7 @@ def test_exclude_downstream_self_loop_is_failed(fake_process, tmp_path):
     assert summary.exit_reason is ExitReason.COMPLETED
     failed = pipeline.backend.load_failed()
     assert list(failed) == ["rank::b"]
-    assert ERR_DEPENDENCY_DEADLOCK in failed["rank::b"]["error"]
+    assert ERR_DEPENDENCY_DEADLOCK in failed["rank::b"]["error_message"]
     assert _queued(pipeline) == ["excluded_t::a"]
 
 
@@ -352,7 +352,7 @@ def test_exclude_downstream_ghost_dependency_is_failed(fake_process, tmp_path):
     assert summary.exit_reason is ExitReason.COMPLETED
     failed = pipeline.backend.load_failed()
     assert list(failed) == ["rank::b"]
-    assert "DEPENDENCY_DEADLOCK" in failed["rank::b"]["error"]
+    assert "DEPENDENCY_DEADLOCK" in failed["rank::b"]["error_message"]
     assert _queued(pipeline) == ["excluded_t::a"]
 
 
@@ -464,7 +464,7 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     failures = pipeline.list_failures()
     assert len(failures) == 1
     assert failures[0].job_uid.startswith("_unknown::")
-    assert failures[0].metadata["error"] == ERR_MALFORMED_JOB
+    assert failures[0].metadata["error_message"] == ERR_MALFORMED_JOB
     assert pipeline.backend.load_queue() == []
 
 
@@ -952,7 +952,7 @@ def test_selection_failure_isolation_after_equal_length_spawn(
     rows = [pending, downstream]
     store.state.replace_queue(rows)
     pipeline.backend.save_queue(rows)
-    store.apply_failure("parent::first", {"error": "fatal"})
+    store.apply_failure("parent::first", {"error_message": "fatal"})
 
     dispatched = store.state.pop_job(0)
     child = Job(
@@ -964,11 +964,11 @@ def test_selection_failure_isolation_after_equal_length_spawn(
     assert len(store.state.queue) == len(rows)
 
     if failure_path == "cascade":
-        outcome = store.apply_failure("parent::failing", {"error": "fatal"})
+        outcome = store.apply_failure("parent::failing", {"error_message": "fatal"})
         assert outcome.cascaded_uids == []
     else:
         outcome = store.apply_bulk_failure(
-            [("excluded::child", {"error": "fatal"})]
+            [("excluded::child", {"error_message": "fatal"})]
         )
         assert outcome.failed_uids == []
 

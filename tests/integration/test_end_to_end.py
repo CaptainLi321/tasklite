@@ -164,8 +164,8 @@ class TestEndToEnd:
         # successes 审计键：业务 meta 原样落盘 + 框架审计键（run_count /
         # inputs 指纹清单 / 归属 run）
         assert meta["touched"] == "item_alpha"
-        assert meta["run_count"] == 1
-        assert meta["last_run_id"] == summary.run_id
+        assert meta["success_count"] == 1
+        assert meta["last_success_run_id"] == summary.run_id
         assert len(meta["inputs"]) == 1
         entry = meta["inputs"][0]
         assert entry["path"].endswith("source_item_alpha.txt")
@@ -191,7 +191,7 @@ class TestEndToEnd:
 
         failed = p.backend.load_failed()
         assert "work::item_beta" in failed
-        assert "end-to-end explosion" in failed["work::item_beta"]["error"]
+        assert "end-to-end explosion" in failed["work::item_beta"]["error_message"]
         # successes/failed 互斥：失败终态不得残留 successes 行
         assert "work::item_beta" not in p.backend.load_successes()
 
@@ -209,7 +209,7 @@ class TestEndToEnd:
         p.stop()
 
         meta = p.backend.load_failed()["work::item_gamma"]
-        assert meta["error"] == ERR_MAX_RETRIES
+        assert meta["error_message"] == ERR_MAX_RETRIES
 
         attempts = p.backend.load_attempts("work::item_gamma")
         assert [a.attempt_no for a in attempts] == [1, 2, 3]
@@ -253,7 +253,7 @@ class TestEndToEnd:
         assert summary.stats["completed"] == 1
         meta = p.backend.load_successes()["work::item_eps"]
         assert meta["recovered"] is True
-        assert meta["run_count"] == 1
+        assert meta["success_count"] == 1
 
         # 档案补跑通道：failed 拦截点放行语义——激活代按轨迹最大值 +1
         # 推进、attempt_no 归 1，与 every_run 豁免放行同构
@@ -273,7 +273,7 @@ class TestEndToEnd:
         p.enqueue(Job("work", "item_eta", rerun="every_run"))
         first = p.run()
         assert first.stats["completed"] == 1
-        assert p.backend.load_successes()["work::item_eta"]["run_count"] == 1
+        assert p.backend.load_successes()["work::item_eta"]["success_count"] == 1
 
         # 第二会话重扫：successes 命中但 every_run 豁免放行 → 新激活重跑，
         # 成功 REPLACE successes 行且 run_count 从对侧终态续数
@@ -282,7 +282,7 @@ class TestEndToEnd:
         p.stop()
 
         assert second.stats["completed"] == 1
-        assert p.backend.load_successes()["work::item_eta"]["run_count"] == 2
+        assert p.backend.load_successes()["work::item_eta"]["success_count"] == 2
 
         attempts = p.backend.load_attempts("work::item_eta")
         assert [a.outcome for a in attempts] == ["succeeded", "succeeded"]
@@ -381,7 +381,7 @@ class TestEnvFaultExhaustion:
         failed = p.backend.load_failed()
         assert "crash::item_env_crash" in failed
         entry = failed["crash::item_env_crash"]
-        assert entry["error"] == ERR_MAX_RETRIES
+        assert entry["error_message"] == ERR_MAX_RETRIES
         assert "PROCESS_CRASH_EXIT" in entry.get("last_retry_error", "")
         assert "PROCESS_CRASH_EXIT" in entry.get("retry_error", "")
 
@@ -446,7 +446,7 @@ class TestRealSubprocessFaultScenarios:
 
         failed = p.backend.load_failed()
         assert "hung::item_watchdog" in failed
-        error = failed["hung::item_watchdog"]["error"]
+        error = failed["hung::item_watchdog"]["error_message"]
         assert error.startswith("TIMEOUT"), f"应归因超时，got: {error}"
         assert "hung::item_watchdog" not in p.backend.load_successes()
 
@@ -526,6 +526,6 @@ class TestRealSubprocessFaultScenarios:
 
         failed = p.backend.load_failed()
         assert "sysexit::item_sysexit" in failed
-        error = failed["sysexit::item_sysexit"]["error"]
+        error = failed["sysexit::item_sysexit"]["error_message"]
         assert "WORKER_INTERRUPTED" in error, f"应含中断族归因串，got: {error}"
         assert "sysexit::item_sysexit" not in p.backend.load_successes()

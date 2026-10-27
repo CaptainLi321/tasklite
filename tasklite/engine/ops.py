@@ -40,7 +40,7 @@ class OpsConsole:
 
     构造依赖 (store, classifier)：持久化后端经 ``store.backend`` 只读
     派生（所有权唯一锚定 StateStore，换库随锚点自然跟随，本类不独立
-    持库）；list_failures 的 error_type 归档视图依赖 classifier.classify。
+    持库）；list_failures 的 error_category 归档视图依赖 classifier.classify。
     """
 
     def __init__(
@@ -106,7 +106,7 @@ class OpsConsole:
         """只读查询失败档案，返回结构化条目（job_uid / error_message / metadata /
         payload）。
 
-        meta 视图缺 error_type（带外登记的裸行）时经 classifier 就地归档
+        meta 视图缺 error_category（带外登记的裸行）时经 classifier 就地归档
         （unknown 兜底）；损坏行（非 dict）归空视图，绝不让单条脏数据
         打断整条查询。
         """
@@ -117,13 +117,13 @@ class OpsConsole:
             if not isinstance(meta, dict):
                 meta = {}
             meta_view = dict(meta)
-            if not meta_view.get("error_type"):
-                meta_view["error_type"] = (
+            if not meta_view.get("error_category"):
+                meta_view["error_category"] = (
                     self._classifier.classify(meta).failed_error_category
                 )
             entries.append(FailureEntry(
                 job_uid=uid,
-                error_message=str(meta_view.get("error", "")),
+                error_message=str(meta_view.get("error_message", "")),
                 metadata=meta_view,
                 payload=payloads.get(uid),
             ))
@@ -168,7 +168,7 @@ class OpsConsole:
         to_delete = [
             uid for uid, meta in failed.items()
             if (task_types is None or any(uid.startswith(t + "::") for t in task_types))
-            and not (keep_fatal and isinstance(meta, dict) and meta.get("fatal"))
+            and not (keep_fatal and isinstance(meta, dict) and meta.get("is_fatal"))
         ]
         if not to_delete:
             return 0
