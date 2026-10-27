@@ -39,7 +39,7 @@ from tasklite import (
 
 | 层 | 定义 | 持久化 |
 |---|---|---|
-| **Task（规格）** | 进程内注册的静态模板：`task_type` 名、handler、`resources`、`payload_schema`、默认 `max_retries` / `timeout_seconds` / `timeout_is_transient` | 代码即规格，不落盘；注册于 `register_task`（落点 `TaskRegistry`） |
+| **Task（规格）** | 进程内注册的静态模板：`task_type` 名、handler、`resources`、`payload_schema`、默认 `max_retries` / `timeout_seconds` / `timeout_is_transient` / `trigger` | 代码即规格，不落盘；注册于 `register_task`（落点 `TaskRegistry`） |
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变（queue/successes/failed 三表 PK 与六集合互斥均以 uid 为身份） | queue 行 job_snapshot JSON（job_uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：序号、`execution_id`、起止时间、`outcome` | **append-only** 新表 `attempts` |
 
@@ -101,6 +101,29 @@ job.uid          # "download::img_001"——身份不变式
 
 运行前可用 `pipeline.register_trigger("name", fn)` 注册 `Callable[[TriggerContext], bool]`，Task 与 Job 仅保存名称。`TriggerContext` 提供隔离的 `job` 快照、`has_succeeded`、`has_failed`、只读 `success_metadata` 与 `last_succeeded_at_us`。禁止覆盖内置或重复名称，未注册名称、回调异常与非 `bool` 返回值使 `run()` 原样抛错、保留候选并回收在途任务，不消耗重试预算或写入失败档案。返回 `False` 正常跳过，本次 run 的下游继续流转；该就绪标记不跨 run 持久化。同次激活的故障重试（`attempt_no > 1`）不再求值。
 
+### 触发器迁移与恢复边界
+
+| 旧接口或场景 | 当前写法与行为 |
+|---|---|
+| `Job(..., rerun="never")` | `Job(..., trigger="once")`；命中成功或失败历史均跳过 |
+| `rerun="every_run"` | `trigger="always"`；每次显式入队都触发 |
+| `rerun="on_failure" / "on_input_change"` | 参数改为 `trigger`，名称保持；也可在 `register_task` 统一指定 |
+| `set_discovery_rerun` | 删除；`register_discovery(..., trigger="always")` 通过 Task 规格继承，Job 可显式覆盖 |
+| `declare_input_uri(url)` | 删除；远端版本条件可写自定义 trigger，业务审计字段可放成功返回 metadata |
+| 输入历史 `(size, mtime_ns)` 快照 | `declare_input(path)` 仅记录路径；目录只 stat 自身，不递归 |
+
+不提供旧参数、旧快照键或旧策略名别名。`Job.to_dict()` 保留尚未继承的 `None`；入队与派生摄入后，已解析规格随快照持久化。恢复不会用新的 Task 默认值覆盖快照中的显式预算或超时。自定义触发器的名称随快照保存，函数每次启动由应用重新注册，函数自身无需传给 worker。
+
+使用 `on_input_change` 时，时间比较统一截断到整数微秒：`mtime_ns // 1000 > finished_at_us`，同一微秒内的差异不触发。`seed_successes` 写入的空记录、清历史后再 seed、缺完整框架成功证据的档案均无可信基线，保守执行以建立新成功。可信基线下没有输入列表、空列表或路径缺失属于配置/文件错误，`run()` 上抛并保留候选；首次执行中动态发现的缺路径在 `declare_input` 调用点报错。
+
+对于本轮显式入队的 `A → B`，即使 `[B, A]` 逆序，也先处理 A，再判定 B。A 更新输入则 B 可重跑，A 成功但未改输入则 B 可跳过；A 本轮失败时，A、B 的旧成功均不能遮蔽依赖失败。未入本批的依赖可使用有效历史成功。框架不自动扫描文件、创建或重新入队未提交的下游。
+
+`attempt_no > 1` 是已准入激活的故障重试，跨 `run()` 或主进程崩溃恢复后继续沿用同一激活与剩余预算，不重新调用 trigger。首次尝试的瞬态中断、孤儿锁冲突或限速仍保持 `attempt_no == 1`，再次派发会重新求值；这些信号不消耗重试预算、不写失败档案、不污染最近故障信息。主进程异常会回收在途任务并保存未执行候选；进程被直接杀死时，已提交的队列是恢复依据。未提交副作用可能重做，不承诺 exactly-once。
+
+数据库边界仍是 schema 5：schema 4 及更早版本在只读预检时明确拒绝，不自动迁移、不删除原库。应保留原库，用匹配版本读取历史，或显式选择独立的新状态库路径；不应把旧队列快照键改名当作已完成数据迁移。
+
+可运行的稳定身份、逆序入队与三轮 mtime 重跑示例见 [examples/trigger_chain.py](../examples/trigger_chain.py)。
+
 ### Attempt：执行轨迹（append-only 旁路面）
 
 `AttemptRecord` 表达一次物理执行：`(job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`；`attempts` 表另有自增 `attempt_id`，执行身份列为 `execution_id`。**派发即插行**（outcome=running），终态或重入队时更新该行。`execution_id`（`run_id.dispatch_no` 执行代标识）随 attempt 落表。
@@ -131,7 +154,7 @@ attempts 行（job_uid, activation_no, attempt_no, execution_id, outcome, ...）
 Job uid = task_type::job_id ──当前终态──▶ successes（成功档案） / failed（失败档案）
     │ task_type
     ▼
-Task 规格（进程内 TaskRegistry：handler / 默认资源 / payload_schema / 默认重试与超时）
+Task 规格（进程内 TaskRegistry：handler / 默认资源 / payload_schema / 默认重试、超时与 trigger）
 ```
 
 任一 attempt 行出发都能回答「这是哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——一次执行没有独立持久身份、重试即 DELETE+INSERT 的追溯断层由此补齐。
@@ -142,7 +165,7 @@ Task 规格（进程内 TaskRegistry：handler / 默认资源 / payload_schema /
 
 六步契约（顺序本身是设计的一部分，管理 API 仅限 `run()` 外调用）：
 
-**初始化 → `register_resource` → `register_task` / `register_discovery` / `register_transient_exception` → `enqueue` → `run` → `stop`**
+**初始化 → `register_resource` → `register_task` / `register_discovery` / `register_trigger` / `register_transient_exception` → `enqueue` → `run` → `stop`**
 
 最小可运行示例：
 

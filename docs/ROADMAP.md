@@ -29,29 +29,20 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 
 **顺带收益**：运维子命令 `tasklite failures` / `retry <uid>` / `wall`（ops 面直映射）。
 
-## 2. make 式级联更新（on_input_change 扩展）—— `分析完备，待立项 ADR`
+## 2. make 式级联更新（内容指纹与自动发现下游）—— `分析完备，待立项 ADR`
 
-**动机**：上游重跑后下游躺在 wall 里永不失效；需要 make 的传递性 dirty propagation
-（数据流触发），且可用内容指纹做得**比 mtime 语义的 make 更准**。
+**已交付基线（ADR-0008）**：下游通过 `ctx.declare_input(path)` 声明路径、设置 `trigger="on_input_change"`，每轮显式入队需要处理的上下游。对于本批 `A → B`，先完成 A 的本批处理，再按 B 的可信成功时间与当前输入 mtime 判定；逆序入队同样生效。A 未改输入时 B 可跳过，A 本批失败时 B 不借旧成功放行。目录仅 stat 自身，不递归；保持 mtime 的内容替换可能漏判，输出缺失不自动触发。完整契约见 [V2 使用指南](V2_GUIDE.md#触发器迁移与恢复边界)。
 
-**第 0 档（零代码，即刻可用）**：下游 job 把上游产物路径声明进自己的 inputs +
-`rerun="on_input_change"`——周期性链路下一轮 run 在 wall 拦截点自动比对 mtime 触发下游
-重跑。限制：惰性（下轮 run 生效）、mtime 假阳性（touch 即触发）。
+**未来方向**：内容指纹比较、消费者倒排索引及自动发现/入队未提交的下游均未实施，须另立 ADR。本轮交付不授权这些扩展。
 
-**第 1 档（完整 make 语义，约 300–500 行 + 测试）**：
+**候选形态**：
 
-- wall meta 增加 declared outputs 记录（path → `content_fingerprint`；`declare_output`
-  采集点已存在）；
-- 级联判定 = 「上游 outputs ∩ 下游 inputs」路径 join + **内容指纹对比**——上游重跑但产物
-  未变时下游不空转（超越 make）；
-- 触发形态：lazy（下游重新入队时在 wall 拦截点比对）先行，零新事务面；eager push（上游
-  commit 时反查消费者重新入队）留二期；
-- 语义归位：级联失效走 `on_input_change` 通道（`activation_no+1`），**不新开 rerun 策略**，
-  四策略矩阵不动。
+- 在成功档案中表达产物路径与内容指纹，和下游声明输入建立可审查的关联；
+- 比较上游产物内容与下游成功基线，避免仅 touch 引发空转；
+- 先研究显式入队候选的惰性判定，再独立裁决是否支持成功提交时反查并创建下游候选；
+- 保持稳定 Job 身份，明确与现有 `on_input_change` 判据及激活代推进的关系，不从实现便利反推新契约。
 
-**风险面**：路径规范化（相对/绝对/symlink，复用 `encode_*` 单射族）；join 成本（wall meta
-扩展或 products 倒排表，schema 变更升 user_version）；自产自销/环防护（文件系统天然无环，
-仍需显式断言）。与调度域正交，不触碰 OrderingPolicy / RequeuePolicy / Selection 三类调度 seam 红线。
+**风险面**：路径规范化与单射编码、内容基线的可信性、索引成本、共享路径和依赖环、崩溃后的候选恢复。任何 schema 扩展须明确版本边界；不因该方向引入核心排序或退避计算。
 
 ## 3. 调度策略族 —— `已搁置（库主 2026-10-02 裁决），解禁后逐策略小 ADR`
 

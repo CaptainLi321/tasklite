@@ -185,7 +185,7 @@ pipeline.run()
 
 | 层 | 定义 | 持久化 |
 |---|---|---|
-| **Task（规格）** | 进程内注册的静态模板：task_type 名、handler、默认资源、payload_schema、默认 max_retries / timeout_seconds | 代码即规格，不落盘；注册于 `register_task` |
+| **Task（规格）** | 进程内注册的静态模板：task_type 名、handler、默认资源、payload_schema、默认 max_retries / timeout_seconds / timeout_is_transient / trigger | 代码即规格，不落盘；注册于 `register_task` |
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变 | queue 行 job_snapshot JSON（job_uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：attempt 序号、execution_id、起止时间、结局 | append-only 新表 `attempts` |
 
@@ -246,6 +246,22 @@ transcode_job = Job(
 pipeline.enqueue([download_job, transcode_job])
 pipeline.run()
 ```
+
+同批依赖会先等待上游本次处理完毕，历史成功不会提前解锁仍在排队或运行的上游。上游本次失败时，下游按依赖失败归档。
+
+### 按输入更新重跑（稳定 Job 身份）
+
+在 `register_task(..., trigger="on_input_change")` 声明默认触发条件，handler 中用 `ctx.declare_input(path)` 声明输入；每轮仍需显式入队所需上下游。框架在上游就绪后读取输入当前 mtime，严格晚于上次可信成功完成时间才执行，下游身份保持不变。上游运行但输入未变时，下游可跳过；输出缺失不会自动触发。
+
+从仓库根目录运行[完整示例](examples/trigger_chain.py)：
+
+```sh
+python -m examples.trigger_chain --root /tmp/tasklite-trigger-demo
+```
+
+示例以 `[下游, 上游]` 逆序入队，连续提交 `alpha / alpha / beta`；使用新目录时，三轮的「成功 / 跳过」分别为 `2 / 0`、`1 / 1`、`2 / 0`。示例按内容决定上游是否写文件，框架的输入判据仍仅为 mtime。目录只检查自身时间，保留 mtime 的内容替换可能漏判。
+
+Task 的 `resources / max_retries / timeout_seconds / timeout_is_transient / trigger` 是默认规格，Job 对应参数为 `None` 时继承；显式 `0`、`False` 均保留，资源按键合并。默认 `trigger="once"`，Discovery 默认 `"always"`；自定义触发条件通过 `register_trigger(name, fn)` 注册。完整语义及旧接口迁移见 [V2 使用指南](docs/V2_GUIDE.md#触发器迁移与恢复边界)。
 
 ### Recipe 3: 遭遇 429 限流与配额熔断全局休眠
 

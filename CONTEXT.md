@@ -7,12 +7,18 @@ A robust, embedded Python task orchestration engine featuring subprocess isolati
 ### Core Domain
 
 **Task**:
-The static specification template registered in-process: `task_type` name, handler, `resources`, `payload_schema`, default `max_retries` / `timeout_seconds` / `timeout_is_transient`. Code-is-spec, never persisted; registered via `register_task` into a `TaskRegistry`.
+进程内静态规格模板：`task_type`、handler、`resources`、`payload_schema` 及默认 `max_retries / timeout_seconds / timeout_is_transient / trigger`；代码即规格，不落盘，注册于 `TaskRegistry`。
 _Avoid_: Handler, JobTemplate, WorkType, Step
 
 **Job**:
-The logical instance of one bounded activation, uniquely identified by `uid = f"{task_type}::{job_id}"` with associated payload, dependencies, and resource requirements. Specification slots (payload/resources/depends_on/max_retries/timeout_seconds/rerun) override Task defaults; instance slots are framework-managed: `attempt_no` (1-based try number within the activation; execution allowed while `attempt_no <= max_retries + 1`), `activation_no` (generation counter, +1 on each rerun released from a successes/failed interception), `first_enqueued_at` (UTC ISO of first enqueue, never refreshed on retry).
+稳定身份为 `uid = f"{task_type}::{job_id}"` 的逻辑实例。五项规格 `resources / max_retries / timeout_seconds / timeout_is_transient / trigger` 为 `None` 时继承 Task，资源按键合并且显式同名键覆盖。实例位由框架管理：`attempt_no` 为同次激活内从 1 起始的尝试号，`activation_no` 为首次准入推进的激活代，`first_enqueued_at` 重试时不刷新。已持久化的显式规格恢复时不被新模板覆盖。
 _Avoid_: Message, Item, Record, Execution
+
+**TriggerContext / TriggerRegistry**:
+Trigger 在主进程依赖就绪后、出队与写 Attempt 前决定是否开始一次激活；内置 `once / on_failure / on_input_change / always`，默认 once，Discovery 默认 always。应用通过 `register_trigger(name, fn)` 注册名称，Job 仅保存字符串引用。只读判定上下文提供隔离 Job 快照、历史终态和可信成功微秒基线。False 是本次无需执行，允许下游流转；Selection Skip 是永久跳过并级联，两者分离。故障重试 `attempt_no > 1` 不重复求值；异常原样上抛并保队。
+
+**可信成功基线**:
+当前成功档案的框架元数据与同事务收尾的 succeeded Attempt 相互核验后得到的 `finished_at_us`。人工 seed 空档案与清历史后残留的旧 Attempt 不组成可信基线；缺证据保守执行。`on_input_change` 仅检查声明输入路径当前 `mtime_ns // 1000` 是否严格晚于该基线，不存历史大小/mtime，不递归目录，不因输出缺失自动触发。
 
 **Attempt**:
 The append-only trace record of one physical execution: `(job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`. Row inserted at dispatch (`outcome=running`), updated at settlement; a bypass observation surface that never participates in the six-set mutual exclusion — "final state is unique" (successes/failed by uid) and "history is traceable" (attempts never deleted) are thereby decoupled.
@@ -76,7 +82,7 @@ _Avoid_: BackoffGovernor, RetryTimer, BackoffSchedule
 ### Engine Machines
 
 **DispatchMachine**:
-Specialized machine enforcing the 5-stage preflight checks (dedup, dependency, task lookup, orphan probe, stale restore), acquiring resources, and submitting worker subprocesses.
+先等待本批依赖、处理依赖失败，再统一求值 trigger，随后处理任务查找、孤儿探测与残留认领，申请资源并派发 worker。活跃上游遮蔽历史终态；同批 trigger False 的就绪标记仅保留在当前运行内存中。
 _Avoid_: Submitter, Launcher, DispatcherService
 
 **CompletionMachine**:
