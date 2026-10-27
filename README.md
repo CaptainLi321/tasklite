@@ -331,7 +331,7 @@ pipeline.register_task("fetch", crawler_handler, resources={"api": 1.0})
 for entry in pipeline.list_failures():
     print(f"UID: {entry.job_uid}, 原因: {entry.error_message}, 元数据: {entry.metadata}")
 
-# 2. 清理指定类型的失败档案（默认保留 fatal 错误，可入队同名任务重跑）
+# 2. 清理指定类型的失败档案（默认保留 is_fatal=true 错误，可入队同名任务重跑）
 pipeline.clear_failures(task_types=["download"], keep_fatal=False)
 
 # 3. 单条人工补跑：移出档案、按档案 payload 快照队首重入队
@@ -383,4 +383,4 @@ tasklite/
 
 本项目基于 [MIT License](LICENSE) 开源。
 
-开发中的命名存储契约为 schema 4（包版本暂为 2.1.0，目标 3.0.0 尚未发布）。仅接纳真正空库或完整目标形状的 schema 4；旧库、版本 0 非空库与半建库在只读预检阶段明确拒绝，不自动迁移或修复。请保留原库，用匹配版本读取历史，或显式选择新状态库路径。字段与接纳边界见 [V2 使用指南](docs/V2_GUIDE.md) 和 [ADR-0007](docs/adr/0007-naming-schema-contract.md)。
+开发中的命名存储契约为 schema 4（包版本已切换为 3.0.0，尚未发布）。仅接纳真正空库或完整目标形状的 schema 4；旧库、版本 0 非空库与半建库在只读预检阶段明确拒绝，不自动迁移或修复。请保留原库，用匹配版本读取历史，或显式选择新状态库路径。字段与接纳边界见 [V2 使用指南](docs/V2_GUIDE.md) 和 [ADR-0007](docs/adr/0007-naming-schema-contract.md)。

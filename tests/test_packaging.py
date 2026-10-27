@@ -31,3 +31,12 @@ def test_license_expression_excludes_license_classifier():
     assert project["license"] == "MIT"
     license_classifiers = [c for c in project["classifiers"] if c.startswith("License ::")]
     assert license_classifiers == []
+
+
+def test_runtime_version_matches_naming_contract():
+    import tasklite
+
+    assert tasklite.__version__ == "3.0.0"
+    assert _load_pyproject()["tool"]["setuptools"]["dynamic"]["version"] == {
+        "attr": "tasklite.__version__"
+    }

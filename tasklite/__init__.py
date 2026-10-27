@@ -22,7 +22,7 @@
 """
 from __future__ import annotations
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 
 # ── 门面（六步调用契约的唯一入口）────────────────────────────────────
 from .pipeline import TaskLite

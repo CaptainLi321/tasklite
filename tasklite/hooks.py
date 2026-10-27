@@ -2,7 +2,7 @@
 
 提供 job_ref / progress_hook / slice_list 三个便利工具，经
 ``tasklite/__init__.py`` 统一导出。progress_hook 按
-``on_attempt_finished(uid, *, outcome)`` 钩子契约适配——布尔语义经
+``on_attempt_finished(job_uid, *, outcome)`` 钩子契约适配——布尔语义经
 AttemptOutcome 值对象承载，不裸传四个散装参数。
 """
 from __future__ import annotations

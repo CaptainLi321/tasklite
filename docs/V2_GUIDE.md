@@ -43,7 +43,7 @@ from tasklite import (
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变（queue/successes/failed 三表 PK 与六集合互斥均以 uid 为身份） | queue 行 job_snapshot JSON（job_uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：序号、`execution_id`、起止时间、`outcome` | **append-only** 新表 `attempts` |
 
-持久层 Python 接口以 `job_snapshot` / `job_snapshots` 表示完整 Job 字典，以 `job_uid` 表示跨对象作业身份；业务输入仍称 `payload`。引擎级键值读写使用 `backend.get_engine_metadata(key)` / `backend.set_engine_metadata(key, value)`，其中 `last_run_id` 仍表示最近一次运行。当前开发落盘格式为 schema 4（包版本暂为 2.1.0，尚未发布目标 3.0.0）。仅接纳真正空库或完整且列集合匹配的 schema 4 库；版本 0 的非空库、schema 3、混入 wall/meta 的库或半建库均明确拒绝，不自动迁移或补齐。拒绝前使用只读连接检查，保留原库；使用匹配版本读取历史，或显式选择新的状态库路径。
+持久层 Python 接口以 `job_snapshot` / `job_snapshots` 表示完整 Job 字典，以 `job_uid` 表示跨对象作业身份；业务输入仍称 `payload`。引擎级键值读写使用 `backend.get_engine_metadata(key)` / `backend.set_engine_metadata(key, value)`，其中 `last_run_id` 仍表示最近一次运行。当前开发落盘格式为 schema 4（包版本已切换为 3.0.0，尚未发布）。仅接纳真正空库或完整且列集合匹配的 schema 4 库；版本 0 的非空库、schema 3、混入 wall/meta 的库或半建库均明确拒绝，不自动迁移或补齐。拒绝前使用只读连接检查，保留原库；使用匹配版本读取历史，或显式选择新的状态库路径。
 
 schema 4 六张核心表为 `queue(job_uid, queue_position, job_snapshot)`、`successes(job_uid, metadata)`、`failed(job_uid, metadata, payload)`、`attempts(attempt_id, job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`、`cursors(key, value)` 与 `engine_metadata(key, value)`。失败档案 `metadata` 与业务 `payload` 各自原样存取；HTTP 缓存 `http_snapshots` 是独立库，不随本 schema 切换。
 
@@ -115,7 +115,7 @@ job.uid          # "download::img_001"——身份不变式
 
 ```python
 for rec in pipeline.backend.load_attempts("download::img_001"):
-    print(rec.activation_no, rec.attempt_no, rec.execution_id, rec.outcome, rec.error)
+    print(rec.activation_no, rec.attempt_no, rec.execution_id, rec.outcome, rec.error_message)
 ```
 
 ### 追溯链
@@ -205,7 +205,7 @@ pipeline.stop()
 
 入队前可在 `run()` 外使用 `pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))`：仅排除成功档案命中的 Job，保留输入顺序；失败档案或队列中已有的 Job 仍可返回，重跑与队列去重分别由派发和入队处理。
 
-**run/stop 细节**：`run()` 返回 `RunSummary(exit_reason, stats, run_id, duration_seconds)`；`stop()` 请求 DRAINING（不再派发、在途自然完成），`stop(force=True)` 请求 ABORTING（分类消费在途任务）；`run_graceful()` 是统一包装（捕获 KeyboardInterrupt 转 DRAINING）。构造期钩子三件：`on_run_start` / `on_attempt_finished(uid, *, outcome: AttemptOutcome)` / `on_run_end(exit_reason)`——同步、主线程、必须轻量非阻塞（抛异常只计数进 `stats["hook_errors"]`）。
+**run/stop 细节**：`run()` 返回 `RunSummary(exit_reason, stats, run_id, duration_seconds)`；`stop()` 请求 DRAINING（不再派发、在途自然完成），`stop(force=True)` 请求 ABORTING（分类消费在途任务）；`run_graceful()` 是统一包装（捕获 KeyboardInterrupt 转 DRAINING）。构造期钩子三件：`on_run_start` / `on_attempt_finished(job_uid, *, outcome: AttemptOutcome)` / `on_run_end(exit_reason)`——同步、主线程、必须轻量非阻塞（抛异常只计数进 `stats["hook_errors"]`）。
 
 handler 单测用官方构造器：`from tasklite.testing import fake_ctx`——`fake_ctx(job, successes=..., failed=..., cursors=..., resources=..., tmp_root=...)`，不硬编码 JobContext 内部容器结构。
 
@@ -220,16 +220,16 @@ handler 单测用官方构造器：`from tasklite.testing import fake_ctx`——
 for entry in pipeline.list_failures():
     print(entry.job_uid, entry.error_message, entry.metadata.get("error_category"), entry.payload)
 
-# 批量清理（默认保留 fatal=true 的确定性失败；返回删除数）
+# 批量清理（默认保留 is_fatal=true 的确定性失败；返回删除数）
 n = pipeline.clear_failures(task_types=["download"], keep_fatal=True)
 
-# 单条人工补跑：移出档案、按档案 payload 快照队首重入队；uid 不在档案显式 KeyError
+# 单条人工补跑：移出档案、按档案 payload 快照队首重入队；job_uid 不在档案显式 KeyError
 pipeline.retry_failure("download::img_001")
 ```
 
 - **`FailureEntry`**：`job_uid`、`error_message`（原始错误消息/错误码）、`metadata`（完整档案元数据视图，含 `error_category` 分类码）、`payload`（原始业务 payload 快照——补跑无需外部反查参数；无可存快照时为 None）。
 - **`clear_failures(task_types=None, *, keep_fatal=True)`**：按 task_type 前缀匹配删除；`keep_fatal=False` 连确定性失败一并清理。
-- **`retry_failure(uid)`**：失败档案的人工补跑通道。激活代按拦截点放行语义推进——重建作业的 `activation_no` 取该 uid 在 attempts 轨迹中的最大激活代 +1、`attempt_no` 归 1（与 every_run 豁免放行同构，保证 attempts 表 `(activation_no, attempt_no)` 逻辑键不撞号）；payload 取档案快照，先入队后删行（崩溃窗口至多留下 queue∩failed 并存，由加载期修复收敛，不丢作业）。
+- **`retry_failure(job_uid)`**：失败档案的人工补跑通道。激活代按拦截点放行语义推进——重建作业的 `activation_no` 取该 job_uid 在 attempts 轨迹中的最大激活代 +1、`attempt_no` 归 1（与 every_run 豁免放行同构，保证 attempts 表 `(activation_no, attempt_no)` 逻辑键不撞号）；payload 取档案快照，先入队后删行（崩溃窗口至多留下 queue∩failed 并存，由加载期修复收敛，不丢作业）。
 
 **与 attempts 轨迹的关系**：failed 表回答「当前终态是什么」（每 uid 至多一行，成功即被 successes 侧取代），attempts 表回答「历史上每次执行发生了什么」（append-only，永不删行）。`retry_failure` 补跑后，attempts 中旧的 `outcome="failed"` 行保留为轨迹证据，新激活以新 `(activation_no, attempt_no)` 追加——「最终状态唯一」与「历史可追溯」经两张面解耦。
 
@@ -314,7 +314,7 @@ Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」�
 | `TaskLite.clear_dlq` | `TaskLite.clear_failures` |
 | `DLQEntry` | `FailureEntry` |
 | `TaskContext` | `JobContext` |
-| `on_job_completed(uid, meta, success, going_to_retry)` | `on_attempt_finished(uid, *, outcome: AttemptOutcome)` |
+| `on_job_completed(uid, meta, success, going_to_retry)` | `on_attempt_finished(job_uid, *, outcome: AttemptOutcome)` |
 | `Job(..., retries=...)` 构造参数 | 废除——预算位收敛 `max_retries`（允许执行条件 `attempt_no <= max_retries + 1`） |
 | `sanitize_identifier` / `sanitize_job_component` / `sanitize_content_id` | `encode_identifier` / `encode_job_component` / `encode_content_id` |
 | `escape_injective` | `percent_encode` |

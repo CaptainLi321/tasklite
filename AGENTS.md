@@ -24,11 +24,11 @@
    - `tasklite/utils/` 严禁反向 import `tasklite/wrappers/`（无反向垫片）；
    - 核心层（`tasklite/engine/`, `tasklite/backend/`, `tasklite/models/`, `tasklite/utils/`）严禁反向依赖 `tasklite/contrib/` 与 `tasklite/wrappers/`。
 5. **单射性编码红线**：
-   - 所有业务标识派生复合 UID 或文件系统路径（如 `safe_uid_filename`、`encode_content_id`、`encode_job_component`），**必须使用可逆 `%XX` 百分号单射转义**；
-   - 严禁丢弃式非单射净化（非单射净化会导致多对一碰撞，在 wall 去重时静默吞任务）。
+   - 所有业务标识派生复合 UID 或文件系统路径（如 `encode_job_uid_filename`、`encode_content_id`、`encode_job_component`），**必须使用可逆 `%XX` 百分号单射转义**；
+   - 严禁丢弃式非单射净化（非单射净化会导致多对一碰撞，在 successes 去重时静默吞任务）。
 6. **单一出口原则**：
    - Job 终结（成功/失败/重试）必须唯一经由 `CompletionMachine.complete_job` 收尾；
-   - 失败终态登记必须唯一经由 `StateStore.apply_failure` 收敛（内存尾段经 `mark_failed_memory`，保证 wall/failed 互斥）；
+   - 失败终态登记必须唯一经由 `StateStore.apply_failure` 收敛（内存尾段经 `mark_failed_memory`，保证 successes/failed 互斥）；
    - 运行态事件钩子必须唯一经由 `RunSession.fire_*` 单一出口触发。
 7. **持久化与并发事务纪律**：
    - SQLite `journal_mode=WAL` 必须在启动时验证生效（fail-loud，拒绝在断电可损坏模式下启动）；
@@ -71,7 +71,7 @@
 
 - **权威使用指南**：[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)（Task/Job/Attempt 三层模型、六步契约、失败档案、调度 seam 与 v1→v2 命名映射）
 - **文档唯一总纲**：[`README.md`](README.md)
-- **架构决策记录（ADR）**：[`docs/adr/`](docs/adr/)（v2 重建总纲：ADR-0004；上位与 v1 退役：ADR-0005）
+- **架构决策记录（ADR）**：[`docs/adr/`](docs/adr/)（v2 重建总纲：ADR-0004；上位与 v1 退役：ADR-0005；命名与 schema 4 契约：ADR-0007）
 - **演进路线图**：[`docs/ROADMAP.md`](docs/ROADMAP.md)（已分析未实施方向：单任务直达 CLI、make 式级联更新、调度策略族；实施前须立项 ADR）
 - **领域概念词典**：[`CONTEXT.md`](CONTEXT.md)
 - **Discovery 需求契约**：[`tasklite/wrappers/discovery.py`](tasklite/wrappers/discovery.py)
