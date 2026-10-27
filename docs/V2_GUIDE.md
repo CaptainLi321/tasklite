@@ -184,7 +184,7 @@ pipeline.enqueue([
 
 # 5. 运行（阻塞直到队列排空，返回 RunSummary）
 summary = pipeline.run()
-print(summary.exit_reason, summary.stats["completed"], summary.run_id)
+print(summary.exit_reason, summary.stats["succeeded"], summary.run_id)
 
 # 6. 停机（run() 自然返回后收尾；stop() 也可在 run 期从其他线程请求优雅停机）
 pipeline.stop()
@@ -205,7 +205,7 @@ pipeline.stop()
 
 入队前可在 `run()` 外使用 `pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))`：仅排除成功档案命中的 Job，保留输入顺序；失败档案或队列中已有的 Job 仍可返回，重跑与队列去重分别由派发和入队处理。
 
-**run/stop 细节**：`run()` 返回 `RunSummary(exit_reason, stats, run_id, duration_seconds)`；`stop()` 请求 DRAINING（不再派发、在途自然完成），`stop(force=True)` 请求 ABORTING（分类消费在途任务）；`run_graceful()` 是统一包装（捕获 KeyboardInterrupt 转 DRAINING）。构造期钩子三件：`on_run_start` / `on_attempt_finished(job_uid, *, outcome: AttemptOutcome)` / `on_run_end(exit_reason)`——同步、主线程、必须轻量非阻塞（抛异常只计数进 `stats["hook_errors"]`）。
+**run/stop 细节**：`run()` 返回 `RunSummary(exit_reason, stats, run_id, duration_seconds)`；`stop()` 请求 DRAINING（不再派发、在途自然完成），`stop(force=True)` 请求 ABORTING（分类消费在途任务）；`run_graceful()` 是统一包装（正常完成返回 `RunSummary`，捕获 KeyboardInterrupt 转 DRAINING 并返回 `None`）。构造期钩子三件：`on_run_start` / `on_attempt_finished(job_uid, *, outcome: AttemptOutcome)` / `on_run_end(exit_reason)`——同步、主线程、必须轻量非阻塞（抛异常只计数进 `stats["hook_errors"]`）。
 
 handler 单测用官方构造器：`from tasklite.testing import fake_ctx`——`fake_ctx(job, successes=..., failed=..., cursors=..., resources=..., tmp_root=...)`，不硬编码 JobContext 内部容器结构。
 
@@ -324,7 +324,7 @@ Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」�
 | `AdmissionPolicy`（policy.py） | `RerunPolicy`（admission.py） |
 | `BackoffGovernor` / `plan_retry` 退避计算 | 删除——`RequeuePolicy` seam 接管（默认 `ImmediateRequeuePolicy`） |
 
-其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`seed_cursor` / `content_fingerprint` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。成功档案 Python API 现使用 `successes` / `load_successes` / `delete_successes` / `seed_successes`；`AttemptOutcome` 使用 `success`、`will_retry`、`metadata`，`ExecutionResult` 与 `JobContext` 的 Job 对象列表使用 `spawned_jobs`。SQL 使用 `successes`、`attempts.error_message`，worker 信封使用 `spawned_jobs/error_message`；Job 快照外层使用 `timeout_seconds`，专属入口拒绝旧字段。执行身份与文件名编码使用 `execution_id` 和 `encode_job_uid_filename`，IPC 文件名字节保持不变。
+其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`seed_cursor` / `content_fingerprint` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。成功档案 Python API 现使用 `successes` / `load_successes` / `delete_successes` / `seed_successes`（状态集合属性为 `PipelineState.success_uids`）；`AttemptOutcome` 使用 `success`、`will_retry`、`metadata`，`ExecutionResult` 与 `JobContext` 的 Job 对象列表使用 `spawned_jobs`。运行统计 `EMPTY_STATS` 使用 `succeeded` 与 `lock_conflict_reruns`；资源公开属性对齐为 `RateLimitResource.interval_seconds` 与 `CapacityResource.max_capacity`；`register_discovery` 分组键参数为 `group_key_func`；顶层包公开导出 `SuspendEntry`。SQL 使用 `successes`、`attempts.error_message`，worker 信封使用 `spawned_jobs/error_message`；Job 快照外层使用 `timeout_seconds`，专属入口拒绝旧字段。执行身份与文件名编码使用 `execution_id` 和 `encode_job_uid_filename`，IPC 文件名字节保持不变。
 
 ---
 
@@ -365,7 +365,7 @@ pipeline.selection()                            # 重置：恢复全执行
 
 - 命中作业不派发、不写 attempt 轨迹、不进入 successes/失败档案、不消耗 worker/资源与重试预算，队列行原样保留；
 - 其下游允许作业同样留队，本次 run 报 `ERR_DEPENDENCY_EXCLUDED` 并计入 `stats["excluded_blocked"]`，下一次 run（去掉 Exclude / 换 run 配置）自动恢复执行；
-- 停摆仲裁用 **Kahn 入度消减**（初始波前 = `success_job_uids | excluded_uids`）严格区分：允许作业存在依赖环/缺口时按既有 governor 归因熔断（`ERR_DEPENDENCY_DEADLOCK` / `ERR_DEADLOCK_GAP` / `ERR_RESOURCE_DEADLOCK` / `ERR_MALFORMED_JOB`），绝不因 Exclude 命中而掩盖；仅当剩余允许作业全部可消减且仅被 Exclude 阻塞时，`run()` 以 `ExitReason.COMPLETED` 收敛并保留队列（无固定等待、无忙旋）；
+- 停摆仲裁用 **Kahn 入度消减**（初始波前 = `success_uids | excluded_uids`）严格区分：允许作业存在依赖环/缺口时按既有 governor 归因熔断（`ERR_DEPENDENCY_DEADLOCK` / `ERR_DEADLOCK_GAP` / `ERR_RESOURCE_DEADLOCK` / `ERR_MALFORMED_JOB`），绝不因 Exclude 命中而掩盖；仅当剩余允许作业全部可消减且仅被 Exclude 阻塞时，`run()` 以 `ExitReason.COMPLETED` 收敛并保留队列（无固定等待、无忙旋）；
 - 终态写入出口隔离：被排除 uid 不进入失败档案（父失败级联不传播、批量熔断被过滤）。
 
 ### 8.2 Skip（终态语义：跳过、下游级联、不再重试）
