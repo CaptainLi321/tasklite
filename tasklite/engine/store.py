@@ -382,14 +382,14 @@ class StateStore:
         error_message: str,
         *,
         run_id: str | None,
-        seq: int,
+        dispatch_no: int,
     ) -> None:
         """Skip 终态审计（旁路 attempts 轨迹：先插 running 开行，再收尾为 skipped）。"""
         if not run_id:
             return
         try:
             now = utc_now_iso()
-            execution_id = f"{run_id}.skip.{seq}"
+            execution_id = f"{run_id}.skip.{dispatch_no}"
             attempt_id = self._backend.append_attempt(
                 AttemptRecord(
                     job_uid=job.uid,

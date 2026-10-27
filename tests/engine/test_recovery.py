@@ -110,7 +110,7 @@ def make_recovery_orchestrator(backend=None, *, state=None, resource_mgr=None,
         channel=channel if channel is not None else MagicMock(),
         resources=resource_mgr if resource_mgr is not None else ResourceManager(),
         in_flight=in_flight if in_flight is not None else MagicMock(),
-        policy=policy if policy is not None else RerunPolicy(),
+        rerun_policy=policy if policy is not None else RerunPolicy(),
         completion=completion if completion is not None else MagicMock(),
     )
 
@@ -718,7 +718,7 @@ class TestLoadAndRepair:
         store = StoreShim(backend)
         orchestrator = RecoveryOrchestrator(
             store=store, channel=channel, resources=resource_mgr,
-            in_flight=InFlightTracker(), policy=RerunPolicy(),
+            in_flight=InFlightTracker(), rerun_policy=RerunPolicy(),
             completion=MagicMock(),
         )
 
@@ -871,7 +871,7 @@ class TestAbortInFlight:
         completion = RecordingCompletion()
         orchestrator = RecoveryOrchestrator(
             store=StoreShim(backend), channel=channel, resources=resource_mgr,
-            in_flight=InFlightTracker(), policy=RerunPolicy(),
+            in_flight=InFlightTracker(), rerun_policy=RerunPolicy(),
             completion=completion,
         )
         return orchestrator, channel, completion, resource_mgr
@@ -970,7 +970,7 @@ class TestAbortInFlight:
         )
         orchestrator = RecoveryOrchestrator(
             store=StoreShim(backend), channel=fake_channel, resources=resource_mgr,
-            in_flight=InFlightTracker(), policy=RerunPolicy(),
+            in_flight=InFlightTracker(), rerun_policy=RerunPolicy(),
             completion=completion,
         )
         tracker = orchestrator._in_flight

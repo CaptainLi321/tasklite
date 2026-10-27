@@ -140,7 +140,7 @@ class OrderingPolicy(ABC):
 
     ``visit_order`` 给出一次扫描应访问的队列下标序列：调度器按该序
     逐条评估并在首个可运行者处停止（首中即停）。默认实现 FIFO
-    （按 seq 升序）；软 EDF / 优先级 / aging 等策略未来以新实现插入。
+    （按 queue_position 升序）；软 EDF / 优先级 / aging 等策略未来以新实现插入。
     Job 调度属性（priority / deadline / period）不落在 Job 模型——
     其存放与语义由未来的调度策略 ADR 裁决。
     """
@@ -151,7 +151,7 @@ class OrderingPolicy(ABC):
 
 
 class FifoOrderingPolicy(OrderingPolicy):
-    """FIFO 访问序（默认）：按队列 seq 升序、首中即停。"""
+    """FIFO 访问序（默认）：按队列 queue_position 升序、首中即停。"""
 
     def visit_order(self, queue: Sequence[dict]) -> Iterable[int]:
         return range(len(queue))
@@ -273,9 +273,9 @@ class JobScheduler:
         missing（待其完成 commit 到 successes 后自然解锁），避免并发模型下误判
         死锁。
         """
-        q_data = state.queue
-        success_metadata = state.successes
-        failed_data = state.failed
+        queue_snapshots = state.queue
+        successes_map = state.successes
+        failed_map = state.failed
         queue_uids = state.queue_uids
         pending_or_running = queue_uids | set(in_flight_uids)
 
@@ -290,8 +290,8 @@ class JobScheduler:
         malformed_uids: list[str] = []
         impossible_resource_uids: list[str] = []
 
-        for i in self.ordering_policy.visit_order(q_data):
-            job_snapshot = q_data[i]
+        for i in self.ordering_policy.visit_order(queue_snapshots):
+            job_snapshot = queue_snapshots[i]
             # 捕获畸形 job dict（缺 task_type/job_id 等），记录 UID 避免整个扫描崩溃
             try:
                 job = self.cached_job(job_snapshot)
@@ -317,7 +317,7 @@ class JobScheduler:
             # 1. Failed dependency: job is runnable (will be marked as dependency failure)
             if job.depends_on:
                 for dep_uid in job.depends_on:
-                    if dep_uid in failed_data:
+                    if dep_uid in failed_map:
                         failed_dependency = dep_uid
                         can_run = False
                         break
@@ -333,7 +333,7 @@ class JobScheduler:
             has_missing_dep = False
             if job.depends_on:
                 for dep_uid in job.depends_on:
-                    if dep_uid not in success_metadata:
+                    if dep_uid not in successes_map:
                         can_run = False
                         waiting_for_dependency = True
                         has_missing_dep = True
@@ -400,8 +400,8 @@ class JobScheduler:
             kind = "none"
 
         candidate_uid: str | None = None
-        if runnable_idx is not None and runnable_idx < len(q_data):
-            candidate_uid = job_uid_from_snapshot(q_data[runnable_idx])
+        if runnable_idx is not None and runnable_idx < len(queue_snapshots):
+            candidate_uid = job_uid_from_snapshot(queue_snapshots[runnable_idx])
 
         return ScheduleResult(
             runnable_idx=runnable_idx,

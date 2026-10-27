@@ -868,7 +868,7 @@ def test_selection_machine_isolated_unit():
         seq += 1
         return seq
 
-    evicted = machine.apply_skips(run_id="run_test", seq_supplier=next_seq)
+    evicted = machine.apply_skips(run_id="run_test", dispatch_no_supplier=next_seq)
     assert evicted == 2
     assert store.state.is_empty is True
     attempts = backend.load_attempts("to_skip::s1")
@@ -905,7 +905,7 @@ def test_partial_skip_commit_stays_removed_after_crash_save_and_reload(
     selection = Selection([Skip("skip_root")])
     machine = SelectionMachine(selection, store)
     with pytest.raises(_CommitCrashSignal, match="commit_skip"):
-        machine.apply_skips(run_id="first_run", seq_supplier=lambda: 1)
+        machine.apply_skips(run_id="first_run", dispatch_no_supplier=lambda: 1)
 
     assert calls == ["allowed::child", "skip_root::root"]
     assert _uids(backend.load_queue()) == ["skip_root::root", "allowed::unrelated"]
@@ -927,7 +927,7 @@ def test_partial_skip_commit_stays_removed_after_crash_save_and_reload(
         "skip_root::root", "allowed::unrelated"
     ]
     assert SelectionMachine(selection, restarted._runtime.store).apply_skips(
-        run_id="second_run", seq_supplier=lambda: 1
+        run_id="second_run", dispatch_no_supplier=lambda: 1
     ) == 1
     assert _uids(restarted.backend.load_queue()) == ["allowed::unrelated"]
     assert _uids(restarted._runtime.store.state.queue) == ["allowed::unrelated"]

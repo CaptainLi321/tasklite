@@ -42,7 +42,7 @@ _OUTPUTS_SUFFIX = ".outputs.jsonl"
 _INPUTS_SUFFIX = ".inputs.jsonl"
 _RESULT_TMP_SUFFIX = ".result.json.tmp"
 _RESULT_SUFFIX = ".result.json"
-_INCARNATION_RE = re.compile(r"\.([0-9a-f]{32})\.(\d+)\.result\.json$")
+_EXECUTION_ID_RESULT_RE = re.compile(r"\.([0-9a-f]{32})\.(\d+)\.result\.json$")
 _DRAINING_RE = re.compile(r"\.(\d+)\.(\d+)\.draining$")
 _RAW_TUPLE_SENTINEL = "__tl_tuple_v1"
 
@@ -76,7 +76,7 @@ class ArtifactCleanupMode(str, enum.Enum):
 
     PRE_SUBMIT = "pre_submit"
     SUCCESS = "success"
-    FAILURE_OR_RETRY = "failure_retry"
+    FAILURE_OR_RETRY = "failure_or_retry"
 
 
 class ArtifactJournal:
@@ -148,7 +148,7 @@ class ArtifactJournal:
         try:
             for pat in (f"{base}.*{_RESULT_SUFFIX}", f"{base}.*{_RESULT_TMP_SUFFIX}"):
                 for p in d.glob(pat):
-                    if _INCARNATION_RE.match(p.name, pos=len(base)):
+                    if _EXECUTION_ID_RESULT_RE.match(p.name, pos=len(base)):
                         found.append(p)
         except OSError:
             pass
@@ -592,7 +592,7 @@ class ArtifactJournal:
     def _freshness_key(p: Path) -> tuple[int, int]:
         """残留结果新鲜度键 (mtime_ns, dispatch_no)。"""
 
-        def _seq_of(path: Path) -> int:
+        def _dispatch_no_of(path: Path) -> int:
             try:
                 return int(path.name.removesuffix(_RESULT_SUFFIX).rsplit(".", 1)[-1])
             except (ValueError, IndexError):
@@ -602,7 +602,7 @@ class ArtifactJournal:
             mtime_ns = p.stat().st_mtime_ns
         except OSError:
             mtime_ns = -1
-        return (mtime_ns, _seq_of(p))
+        return (mtime_ns, _dispatch_no_of(p))
 
     # ── 产物校验与生命周期清理 ────────────────────────────────────
 

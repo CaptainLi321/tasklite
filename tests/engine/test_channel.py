@@ -16,7 +16,7 @@ from tasklite.engine.channel import (
     ExecutionChannel,
     WorkerLaunchSpec,
     _decode_ipc_result,
-    _mp_worker_wrapper,
+    _worker_process_entry,
     _normalize_handler_result,
 )
 from tasklite.engine.types import JobHandle
@@ -155,7 +155,7 @@ class TestWorkerWrapper:
 
     def test_worker_writes_success_with_auth_token(self, tmp_path):
         job = Job("t", "x")
-        _mp_worker_wrapper(make_spec(
+        _worker_process_entry(make_spec(
             job, lambda j, c: (True, {"ok": 1}), tmp_path, result_token=_TOKEN,
         ))
         data = json.loads(self._result_file(tmp_path, job).read_text(encoding="utf-8"))
@@ -176,7 +176,7 @@ class TestWorkerWrapper:
             (raise_system_exit, "error", "yexit"),
         ):
             job = Job("t", job_id)
-            _mp_worker_wrapper(make_spec(
+            _worker_process_entry(make_spec(
                 job, handler, tmp_path, result_token=_TOKEN,
             ))
             data = json.loads(self._result_file(tmp_path, job).read_text(encoding="utf-8"))
@@ -187,7 +187,7 @@ class TestWorkerWrapper:
         """execution_id 缺失 fail-loud（fencing 契约破坏不得静默产出无名结果）。"""
         job = Job("t", "x")
         with pytest.raises(RuntimeError, match="execution_id"):
-            _mp_worker_wrapper(make_spec(job, lambda j, c: True, tmp_path, execution_id=None))
+            _worker_process_entry(make_spec(job, lambda j, c: True, tmp_path, execution_id=None))
 
     def test_lock_conflict_writes_transient_retry(self, tmp_path, monkeypatch):
         """锁被占 → retry + transient_kind=lock_conflict（瞬态军规 wire）。"""
@@ -195,7 +195,7 @@ class TestWorkerWrapper:
             "tasklite.utils.lockfile.try_acquire_lock", lambda *a, **k: None
         )
         job = Job("h", "a")
-        _mp_worker_wrapper(make_spec(job, lambda j, c: (True, {}), tmp_path))
+        _worker_process_entry(make_spec(job, lambda j, c: (True, {}), tmp_path))
 
         res = ArtifactJournal(tmp_path).read_result("h::a", execution_id=_EXECUTION_ID)
         assert res is not None
@@ -215,7 +215,7 @@ class TestWorkerWrapper:
         (Path(ipc_dir) / lock_name).mkdir(parents=True)
 
         job = Job("t", "j1")
-        _mp_worker_wrapper(make_spec(
+        _worker_process_entry(make_spec(
             job, lambda j, c: True, ipc_dir, execution_id="r.1",
         ))
 
@@ -241,7 +241,7 @@ class TestWorkerWrapper:
             (business_retry, "biz", None),
         ):
             job = Job("h", job_id)
-            _mp_worker_wrapper(make_spec(job, handler, tmp_path))
+            _worker_process_entry(make_spec(job, handler, tmp_path))
             res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
             assert res["status"] == "retry"
             assert res.get("transient_kind") == want_kind
@@ -251,7 +251,7 @@ class TestWorkerWrapper:
             raise KeyboardInterrupt()
 
         job = Job("h", "ki")
-        _mp_worker_wrapper(make_spec(job, interrupted, tmp_path))
+        _worker_process_entry(make_spec(job, interrupted, tmp_path))
         res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
         assert res["status"] == "interrupted"
         assert res["error_message"].startswith("WORKER_INTERRUPTED:")
@@ -268,14 +268,14 @@ class TestWorkerWrapper:
             job=job, job_context=ctx, execution_id=_EXECUTION_ID,
             ipc_dir=str(tmp_path), timeout_seconds=60.0,
         )
-        _mp_worker_wrapper(spec)
+        _worker_process_entry(spec)
         res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
         assert res["status"] == "retry"
 
     def test_fatal_heuristic_writes_fatal(self, tmp_path):
         """未注册的 TypeError 命中 fatal 启发式 → fatal 通道。"""
         job = Job("h", "tb")
-        _mp_worker_wrapper(make_spec(
+        _worker_process_entry(make_spec(
             job, lambda j, c: (_ for _ in ()).throw(TypeError("bug")), tmp_path,
         ))
         res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
@@ -284,7 +284,7 @@ class TestWorkerWrapper:
 
     def test_plain_exception_writes_error(self, tmp_path):
         job = Job("h", "ve")
-        _mp_worker_wrapper(make_spec(
+        _worker_process_entry(make_spec(
             job, lambda j, c: (_ for _ in ()).throw(ValueError("plain")), tmp_path,
         ))
         res = ArtifactJournal(tmp_path).read_result(job.uid, execution_id=_EXECUTION_ID)
@@ -316,7 +316,7 @@ class TestWorkerResultWriteDegraded:
         monkeypatch.setattr(ArtifactJournal, "write_result_atomic", flaky_write)
 
         job = Job("h", "a")
-        _mp_worker_wrapper(make_spec(job, lambda j, c: (True, {"v": 1}), tmp_path))
+        _worker_process_entry(make_spec(job, lambda j, c: (True, {"v": 1}), tmp_path))
 
         res = ArtifactJournal(tmp_path).read_result("h::a", execution_id=_EXECUTION_ID)
         assert res is not None, "降级写必须成功落盘（小 payload 可写）"
@@ -345,7 +345,7 @@ class TestWorkerResultWriteDegraded:
         )
 
         job = Job("h", "a")
-        _mp_worker_wrapper(make_spec(job, lambda j, c: (True, {}), tmp_path))
+        _worker_process_entry(make_spec(job, lambda j, c: (True, {}), tmp_path))
 
         res = ArtifactJournal(tmp_path).read_result("h::a", execution_id=_EXECUTION_ID)
         assert res is not None
@@ -369,7 +369,7 @@ class TestWorkerResultWriteDegraded:
         def rate_limited_handler(job_arg, ctx):
             raise RateLimitHit("HTTP 429 RateLimit hit")
 
-        _mp_worker_wrapper(make_spec(job, rate_limited_handler, tmp_path))
+        _worker_process_entry(make_spec(job, rate_limited_handler, tmp_path))
 
         res = ArtifactJournal(tmp_path).read_result("h::rl", execution_id=_EXECUTION_ID)
         assert res is not None
@@ -385,7 +385,7 @@ class TestWorkerResultWriteDegraded:
         monkeypatch.setattr(ArtifactJournal, "write_result_atomic", refusing_write)
 
         job = Job("h", "a")
-        _mp_worker_wrapper(make_spec(job, lambda j, c: (True, {}), tmp_path))
+        _worker_process_entry(make_spec(job, lambda j, c: (True, {}), tmp_path))
 
         journal = ArtifactJournal(tmp_path)
         assert not journal.result_path("h::a", _EXECUTION_ID).exists(), (

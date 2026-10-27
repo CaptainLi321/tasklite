@@ -65,7 +65,7 @@ class JobContext:
         # suspend 信号走落盘文件（{ipc_dir}/{uid}.signals.jsonl）——
         # 进程被 kill 后文件仍在，信号不丢。
         self.ipc_dir = ipc_dir
-        # fencing 的执行代标识（{run_id}.{seq}）不经 JobContext 携带——
+        # fencing 的执行代标识（{run_id}.{dispatch_no}）不经 JobContext 携带——
         # 归 WorkerLaunchSpec（进程 seam 具名契约），worker 据它构造带
         # execution_id 的结果文件名，孤儿进程的旧 execution_id 文件不被
         # 新 run 看见。

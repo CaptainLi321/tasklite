@@ -144,13 +144,13 @@ class TestSixSetMutex:
         st = PipelineState({}, {}, {}, [])
         st.mark_failed("t::x", {"error_message": "boom"})
         assert st.failed_uids == {"t::x"}
-        assert st.success_job_uids == set()
+        assert st.success_uids == set()
         st.mark_success("t::x", {"score": 1})
-        assert st.success_job_uids == {"t::x"}
+        assert st.success_uids == {"t::x"}
         assert st.failed_uids == set()
         st.mark_failed("t::x", {"error_message": "again"})
         assert st.failed_uids == {"t::x"}
-        assert st.success_job_uids == set()
+        assert st.success_uids == set()
 
 
 class TestJobUidFromSnapshot:
@@ -199,7 +199,7 @@ class TestTerminalRecords:
         assert st.successes["t::w"] == {"again": True}
         st.discard_success("t::w")
         st.discard_success("t::w")  # 幂等
-        assert "t::w" not in st.success_job_uids
+        assert "t::w" not in st.success_uids
         st.mark_failed("t::f", {})
         st.discard_failed("t::f")
         st.discard_failed("t::f")  # 幂等

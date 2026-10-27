@@ -262,7 +262,7 @@ def _decode_ipc_result(
     )
 
 
-def _mp_worker_wrapper(spec: "WorkerLaunchSpec") -> None:
+def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
     """spawn 子进程执行体入口：持锁执行 handler 并把结果原子落盘。
 
     不变式：锁生命周期严格等于本执行体生命周期（try 前获取、finally
@@ -487,7 +487,7 @@ class ExecutionChannel:
         spec.job_context.ipc_dir = effective_ipc_dir
         p = None
         try:
-            p = self._process_context.Process(target=_mp_worker_wrapper, args=(spec,))
+            p = self._process_context.Process(target=_worker_process_entry, args=(spec,))
             p.start()
         except Exception:
             if p is not None:
@@ -783,6 +783,6 @@ __all__ = [
     "_decode_ipc_result",
     "_decode_raw_result",
     "_encode_raw_result",
-    "_mp_worker_wrapper",
+    "_worker_process_entry",
     "_normalize_handler_result",
 ]

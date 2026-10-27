@@ -92,14 +92,14 @@ class RecoveryOrchestrator:
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
-        policy: "RerunPolicy",
+        rerun_policy: "RerunPolicy",
         completion: "RecoveryCompletion",
     ) -> None:
         self._store = store
         self._channel = channel
         self._resources = resources
         self._in_flight = in_flight
-        self._policy = policy
+        self._rerun_policy = rerun_policy
         self._completion = completion
 
     def load_and_repair(self) -> PipelineState:
@@ -113,21 +113,21 @@ class RecoveryOrchestrator:
         successes = backend.load_successes()
         failed = backend.load_failed()
         cursors = backend.load_cursors()
-        q_data = backend.load_queue()
+        queue_snapshots = backend.load_queue()
 
         # 启动期队列整理与资源挂起加载（终态交集先收敛，后续修复与
         # 六集合互斥断言都依赖 successes/failed 互斥前提）
         self.converge_terminal_overlap(successes, failed)
-        q_data = self.repair_queue_on_load(q_data, successes, failed)
+        queue_snapshots = self.repair_queue_on_load(queue_snapshots, successes, failed)
         self.load_resource_suspensions()
         self.salvage_residue_signals()
 
-        state = PipelineState(successes, failed, cursors, q_data)
+        state = PipelineState(successes, failed, cursors, queue_snapshots)
         self._store.set_state(state)
         return state
 
     def repair_queue_on_load(
-        self, q_data: list, successes: dict, failed: dict
+        self, queue_snapshots: list, successes: dict, failed: dict
     ) -> list:
         """加载期队列整理：磁盘合并重读 + 残留过滤 + UID 去重，差量定向清理。
 
@@ -149,13 +149,13 @@ class RecoveryOrchestrator:
            （幂等）。
         """
         try:
-            disk_q = self._store.backend.load_queue()
+            disk_queue = self._store.backend.load_queue()
         except Exception as e:
             logger.warning(
                 f"Failed to reload queue for repair merge; "
                 f"proceeding with load-time snapshot only: {e}"
             )
-            disk_q = []
+            disk_queue = []
 
         # 合并以磁盘真相序为权威序（与 save_queue_crash_safe 的「磁盘独有行
         # 补回队首」语义对齐）：窗口期他进程 front 入队的行保持其磁盘队首
@@ -164,26 +164,26 @@ class RecoveryOrchestrator:
         # （窗口期被他进程消费的行）保底追加队尾维持 at-least-once，不丢行。
         disk_uids: set = set()
         merged_rows: list = []
-        for jd in disk_q:
-            u = job_uid_from_snapshot(jd)
+        for job_snapshot in disk_queue:
+            u = job_uid_from_snapshot(job_snapshot)
             if u not in disk_uids:  # uid 主键下磁盘重复不可达，防御性收敛
                 disk_uids.add(u)
-                merged_rows.append(jd)
-        for jd in q_data:
-            if job_uid_from_snapshot(jd) not in disk_uids:
-                merged_rows.append(jd)
+                merged_rows.append(job_snapshot)
+        for job_snapshot in queue_snapshots:
+            if job_uid_from_snapshot(job_snapshot) not in disk_uids:
+                merged_rows.append(job_snapshot)
 
         seen_uid: set = set()
-        clean_q: list[dict] = []
+        clean_queue: list[dict] = []
         dropped_uids: list = []
 
-        for jd in merged_rows:
-            u = job_uid_from_snapshot(jd)
+        for job_snapshot in merged_rows:
+            u = job_uid_from_snapshot(job_snapshot)
             success_hit = u in successes
             failed_hit = u in failed
             if success_hit or failed_hit:
-                decision = self._policy.evaluate(
-                    jd,
+                decision = self._rerun_policy.evaluate(
+                    job_snapshot,
                     success_metadata=successes.get(u),
                     is_success=success_hit,
                     is_failed=failed_hit,
@@ -194,7 +194,7 @@ class RecoveryOrchestrator:
                 # 不变式：放行保留的重跑行必须落字面 rerun 键——PipelineState
                 # 构造期豁免登记以行内键为事实源，动态兜底放行不得在加载态
                 # 丢失豁免（否则任意其他作业的 in-flight 登记即触发互斥断言）。
-                jd["rerun"] = decision.effective_rerun
+                job_snapshot["rerun"] = decision.effective_rerun
 
             # 去重（保留首条）。集合合并已收敛镜像行，此分支仅剩快照内部
             # 的真实重复告警。去重命中项不参与磁盘删除：uid 主键约束下
@@ -205,7 +205,7 @@ class RecoveryOrchestrator:
                 )
                 continue
             seen_uid.add(u)
-            clean_q.append(jd)
+            clean_queue.append(job_snapshot)
 
         # 差量落盘：只删除需要移除的残留行，其余行原样保留。
         # 落盘失败仅降级告警——内存态已收敛，本次 run 不受影响，磁盘保持
@@ -218,7 +218,7 @@ class RecoveryOrchestrator:
                     f"Failed to persist queue repair deletions to backend; "
                     f"in-memory state is converged, disk will re-converge on next load: {e}"
                 )
-        return clean_q
+        return clean_queue
 
     def converge_terminal_overlap(self, successes: dict, failed: dict) -> None:
         """加载期收敛存量 successes∩failed 终态交集（failed 优先，内存 + 磁盘同步）。
@@ -316,11 +316,14 @@ class RecoveryOrchestrator:
         at-least-once 重扫吸收。
         """
 
-        def _merge(disk_q: list) -> list:
-            mem_q = self._store.state.queue
-            mem_uids = {job_uid_from_snapshot(jd) for jd in mem_q}
+        def _merge(disk_queue: list) -> list:
+            mem_queue = self._store.state.queue
+            mem_uids = {job_uid_from_snapshot(job_snapshot) for job_snapshot in mem_queue}
             # 磁盘有而内存没有的作业（commit/pop 窗口内丢失的）补回队首
-            extra = [jd for jd in disk_q if job_uid_from_snapshot(jd) not in mem_uids]
+            extra = [
+                job_snapshot for job_snapshot in disk_queue
+                if job_uid_from_snapshot(job_snapshot) not in mem_uids
+            ]
             if extra:
                 logger.warning(
                     f"Crash-safe save: recovered {len(extra)} job(s) from disk "
@@ -329,12 +332,12 @@ class RecoveryOrchestrator:
             # 内存内按 uid 去重（异常路径可能重复 requeue 同一作业）
             seen: set = set()
             dedup_mem = []
-            for jd in mem_q:
-                u = job_uid_from_snapshot(jd)
+            for job_snapshot in mem_queue:
+                u = job_uid_from_snapshot(job_snapshot)
                 if u in seen:
                     continue
                 seen.add(u)
-                dedup_mem.append(jd)
+                dedup_mem.append(job_snapshot)
             return extra + dedup_mem
 
         try:

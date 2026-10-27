@@ -354,13 +354,13 @@ class SQLiteStateBackend(AbstractStateBackend):
                 # 同事务——并发 enqueue 要么先于本事务提交（进入磁盘真相、
                 # 参与合并），要么等本事务提交后再落盘，绝无中间态覆盖。
                 conn.execute('BEGIN IMMEDIATE')
-                disk_q = [
+                disk_queue = [
                     loads(row[0])
                     for row in conn.execute(
                         'SELECT job_snapshot FROM queue ORDER BY queue_position ASC'
                     )
                 ]
-                self._rewrite_queue_rows(conn, compute(disk_q))
+                self._rewrite_queue_rows(conn, compute(disk_queue))
         except Exception as e:
             logger.critical(f"Failed to replace queue atomically in {self.path.name}: {e}")
             raise

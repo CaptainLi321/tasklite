@@ -26,7 +26,7 @@ logger = logging.getLogger("tasklite")
 class SelectionStandstill:
     """执行选择下的停摆拓扑判定（Kahn 入度消减结果）。
 
-    以 ``success_job_uids | deferred_uids``（Exclude 命中行 + 防御性的 Skip 残留行）
+    以 ``success_uids | deferred_uids``（Exclude 命中行 + 防御性的 Skip 残留行）
     为初始波前，对剩余「允许执行」作业做入度消减：
 
     - ``stuck_uids``：入度无法消减为 0 的允许作业，可能包含环成员、缺口
@@ -75,7 +75,7 @@ class SelectionMachine:
         """每 run 开始时复位运行期状态。"""
         self._skipped_uids.clear()
 
-    def apply_skips(self, *, run_id: str | None, seq_supplier: Callable[[], int]) -> int:
+    def apply_skips(self, *, run_id: str | None, dispatch_no_supplier: Callable[[], int]) -> int:
         """终态跳过：Skip 命中行移出 queue，下游整链级联跳过并留审计轨迹。
 
         Skip 是永久语义（不进入 successes/失败档案，下次不再重试），审计落
@@ -146,7 +146,7 @@ class SelectionMachine:
                 job,
                 error,
                 run_id=run_id,
-                seq=seq_supplier(),
+                dispatch_no=dispatch_no_supplier(),
             )
             skipped += 1
             logger.info(f"SELECTION: job {uid} skipped terminal ({error}).")
@@ -193,7 +193,7 @@ class SelectionMachine:
         for uid in allowed:
             count = 0
             for dep in facts[uid][1]:
-                if dep in deferred or dep in state.success_job_uids:
+                if dep in deferred or dep in state.success_uids:
                     continue
                 count += 1
                 dependents.setdefault(dep, []).append(uid)

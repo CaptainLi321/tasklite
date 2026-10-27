@@ -40,7 +40,7 @@ def job_uid_from_snapshot(job_snapshot: dict) -> str:
 class PipelineState:
     """可变管线状态：successes/failed/cursors 三个 dict + queue 列表。
 
-    所有操作原地进行，O(1)/O(k)。维护 ``_queue_uids``/``_success_job_uids``/
+    所有操作原地进行，O(1)/O(k)。维护 ``_queue_uids``/``_success_uids``/
     ``_failed_uids`` 增量 uid 索引。所有状态转移必须经由受控方法。
     """
 
@@ -55,7 +55,7 @@ class PipelineState:
         self._failed: dict[str, dict[str, Any]] = dict(failed)
         self._cursors: dict[str, str] = dict(cursors)
         self._queue: list[dict] = list(queue)
-        self._success_job_uids: set[str] = set(self._successes)
+        self._success_uids: set[str] = set(self._successes)
         self._failed_uids: set[str] = set(self._failed)
         self._queue_uids: set[str] = {job_uid_from_snapshot(j) for j in self._queue}
         self._in_flight_uids: set[str] = set()
@@ -114,7 +114,10 @@ class PipelineState:
         """按 uid 清除队列行，保留其他作业的在途重跑豁免。"""
         if job_uid not in self._queue_uids:
             return
-        self._queue[:] = [jd for jd in self._queue if job_uid_from_snapshot(jd) != job_uid]
+        self._queue[:] = [
+            job_snapshot for job_snapshot in self._queue
+            if job_uid_from_snapshot(job_snapshot) != job_uid
+        ]
         self._queue_uids.discard(job_uid)
         if job_uid not in self._in_flight_uids:
             self._rerun_active_uids.discard(job_uid)
@@ -176,9 +179,9 @@ class PipelineState:
     def _build_dependents(self) -> dict[str, set[str]]:
         """按需从当前 _queue 构建反向依赖索引 dependents[dep_uid] -> {job_uid...}。"""
         dependents: dict[str, set[str]] = {}
-        for jd in self._queue:
+        for job_snapshot in self._queue:
             try:
-                job = Job.from_dict(jd)
+                job = Job.from_dict(job_snapshot)
             except (KeyError, TypeError, ValueError):
                 continue
             job_uid = job.uid
@@ -227,9 +230,9 @@ class PipelineState:
         （深度超递归限制）不得因环检测本身崩溃。
         """
         edges: dict[str, set[str]] = {}
-        for jd in self._queue:
+        for job_snapshot in self._queue:
             try:
-                job = Job.from_dict(jd)
+                job = Job.from_dict(job_snapshot)
             except (KeyError, TypeError, ValueError):
                 continue
             if node_uids is not None and job.uid not in node_uids:
@@ -277,14 +280,14 @@ class PipelineState:
         self._failed.pop(job_uid, None)
         self._failed_uids.discard(job_uid)
         self._successes[job_uid] = copy.deepcopy(metadata)
-        self._success_job_uids.add(job_uid)
+        self._success_uids.add(job_uid)
         if __debug__:
             self._assert_terminal_uids_consistent()
 
     def mark_failed(self, job_uid: str, metadata: dict[str, Any]) -> None:
         """终态转移：uid → failed（失败档案）。单一入口维护 successes/failed 索引。"""
         self._successes.pop(job_uid, None)
-        self._success_job_uids.discard(job_uid)
+        self._success_uids.discard(job_uid)
         self._failed[job_uid] = copy.deepcopy(metadata)
         self._failed_uids.add(job_uid)
         if __debug__:
@@ -303,7 +306,7 @@ class PipelineState:
     def discard_success(self, job_uid: str) -> None:
         """从 successes 集合移除指定 uid（运维接缝，幂等）。"""
         self._successes.pop(job_uid, None)
-        self._success_job_uids.discard(job_uid)
+        self._success_uids.discard(job_uid)
         if __debug__:
             self._assert_terminal_uids_consistent()
 
@@ -317,7 +320,7 @@ class PipelineState:
     def add_success(self, job_uid: str, metadata: dict[str, Any]) -> None:
         """向 successes 集合添加 uid（运维接缝，seed_successes 场景）。"""
         self._successes[job_uid] = metadata
-        self._success_job_uids.add(job_uid)
+        self._success_uids.add(job_uid)
         if __debug__:
             self._assert_terminal_uids_consistent()
 
@@ -333,9 +336,9 @@ class PipelineState:
         return self._queue_uids
 
     @property
-    def success_job_uids(self) -> set[str]:
+    def success_uids(self) -> set[str]:
         """successes 终态 uid 的活索引。"""
-        return self._success_job_uids
+        return self._success_uids
 
     @property
     def failed_uids(self) -> set[str]:
@@ -385,8 +388,8 @@ class PipelineState:
 
     def _assert_terminal_uids_consistent(self) -> None:
         """DEBUG 不变式：successes/failed 增量索引与 dict 完全一致。"""
-        assert self._success_job_uids == set(self._successes), (
-            f"_success_job_uids drift: cached={self._success_job_uids!r} actual={set(self._successes)!r}"
+        assert self._success_uids == set(self._successes), (
+            f"_success_uids drift: cached={self._success_uids!r} actual={set(self._successes)!r}"
         )
         assert self._failed_uids == set(self._failed), (
             f"_failed_uids drift: cached={self._failed_uids!r} actual={set(self._failed)!r}"

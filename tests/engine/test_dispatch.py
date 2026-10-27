@@ -107,7 +107,7 @@ class DispatchEnv:
             channel=self.channel,
             resources=self.resources,
             in_flight=self.in_flight,
-            policy=RerunPolicy(),
+            rerun_policy=RerunPolicy(),
             completion=self.completion,
         )
         self.tasks = TaskRegistry()

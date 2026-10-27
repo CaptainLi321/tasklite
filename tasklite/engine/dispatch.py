@@ -10,7 +10,7 @@ orphan-probe → stale-restore。依赖以显式窄清单注入（无共享袋�
 （``Path | Sequence[Path] | None``，多根输出场景）。
 
 派发即插 attempts 轨迹行（outcome=running）：execution_id
-（``run_id.dispatch_no``）在本模块生成并随行落表——seq 每次派发递增，
+（``run_id.dispatch_no``）在本模块生成并随行落表——dispatch_no 每次派发递增，
 同 uid 重试再派发也获得新 execution_id，与上次尝试的结果文件隔离。
 """
 
@@ -248,7 +248,7 @@ class DispatchMachine:
             attempt_id, _ = self._open_attempt(job)
             store.apply_skip(job_uid, job_snapshot=job_snapshot, attempt_id=attempt_id)
             return True
-        if decision.should_run and (job_uid in store.state.success_job_uids or job_uid in store.state.failed_uids):
+        if decision.should_run and (job_uid in store.state.success_uids or job_uid in store.state.failed_uids):
             # 豁免登记与准入判定同源：pop_job 只按字面 rerun 键登记豁免，
             # 队列行无键而由动态兜底放行的重跑必须在此补登记，否则
             # in-flight 登记的全量互斥断言会击落本关放行的作业。
@@ -488,7 +488,7 @@ class DispatchMachine:
         # JobContext 持有的必须是派发时刻快照，绝不引用活集合。
         return JobContext(
             job,
-            frozenset(state.success_job_uids),
+            frozenset(state.success_uids),
             frozenset(state.failed_uids),
             dict(state.cursors),
             output_roots=self._output_roots,

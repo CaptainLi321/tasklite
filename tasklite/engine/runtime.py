@@ -117,7 +117,7 @@ class EngineRuntime:
             channel=self.channel,
             resources=config.resources,
             in_flight=self._in_flight,
-            policy=config.rerun_policy,
+            rerun_policy=config.rerun_policy,
             completion=self._completion,
         )
         self._dispatch = DispatchMachine(
@@ -418,7 +418,7 @@ class EngineRuntime:
         if self.selection_machine is not None and self.selection_machine.has_skip_rules:
             self.selection_machine.apply_skips(
                 run_id=self._session.run_id,
-                seq_supplier=self._session.next_dispatch_no,
+                dispatch_no_supplier=self._session.next_dispatch_no,
             )
 
     def _drain_and_settle(self) -> int:

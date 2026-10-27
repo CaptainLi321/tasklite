@@ -323,7 +323,7 @@ class TestMarkFailedMemoryContract:
         state.add_success("encode::a", {"prev": "ok"})
         store.mark_failed_memory("encode::a", {"error_message": "boom"})
         assert "encode::a" in state.failed_uids
-        assert "encode::a" not in state.success_job_uids
+        assert "encode::a" not in state.success_uids
 
 
 class TestCommitFailureStrike:
@@ -792,7 +792,7 @@ class TestSnapshotAndMembership:
         活索引（调用方需要快照时在边界显式 frozenset 冻结）。"""
         store = self._probe_store()
         assert isinstance(store.state.in_flight_uids, frozenset)
-        assert isinstance(store.state.success_job_uids, set)
+        assert isinstance(store.state.success_uids, set)
         assert isinstance(store.state.failed_uids, set)
         assert isinstance(store.state.queue_uids, set)
 
@@ -907,7 +907,7 @@ class _MutexProbe:
 
     def assert_mutex(self) -> None:
         """核心不变式：successes ∩ failed = ∅（内存与后端镜像一致），终态不留在队列。"""
-        mem_wall = set(self.store.state.success_job_uids)
+        mem_wall = set(self.store.state.success_uids)
         mem_failed = set(self.store.state.failed_uids)
         assert mem_wall & mem_failed == set(), f"内存互斥破坏: {mem_wall & mem_failed}"
         disk_wall = set(self.backend.load_successes())
@@ -985,7 +985,7 @@ class TestRecordAttemptSeam:
         job = Job("skip_type", "2")
 
         # 正常记录 skip
-        store.record_attempt_skip(job, "SKIPPED", run_id="run1", seq=2)
+        store.record_attempt_skip(job, "SKIPPED", run_id="run1", dispatch_no=2)
         records = backend.load_attempts("skip_type::2")
         assert len(records) == 1
         assert records[0].outcome == "skipped"
@@ -993,7 +993,7 @@ class TestRecordAttemptSeam:
         assert records[0].execution_id == "run1.skip.2"
 
         # run_id 为空时不写轨迹
-        store.record_attempt_skip(job, "SKIPPED", run_id=None, seq=3)
+        store.record_attempt_skip(job, "SKIPPED", run_id=None, dispatch_no=3)
         assert len(backend.load_attempts("skip_type::2")) == 1
 
 
