@@ -193,7 +193,7 @@ class SelectionMachine:
         for uid in allowed:
             count = 0
             for dep in facts[uid][1]:
-                if dep in deferred or dep in state.success_uids:
+                if dep in deferred or state.dependency_ready(dep):
                     continue
                 count += 1
                 dependents.setdefault(dep, []).append(uid)

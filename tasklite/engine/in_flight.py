@@ -146,7 +146,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
         entry = self._entries.pop(job_uid, None)
         if state is not None:
             # 收尾机器的提交路径内部已注销 in-flight（重试分支注销后立即
-            # 重入队并重建 rerun 豁免）；此处仅在 uid 仍在途索引时才兜底
+            # 重入队并重建 trigger 豁免）；此处仅在 uid 仍在途索引时才兜底
             # 转发注销，防止二次注销误删刚重建的豁免（安全网语义不变）。
             if job_uid in state.in_flight_uids:
                 state.unregister_in_flight(job_uid)

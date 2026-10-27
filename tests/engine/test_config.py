@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+
 import dataclasses
 from pathlib import Path
 
@@ -19,7 +21,7 @@ from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import (
     ImmediateRequeuePolicy,
     RequeuePolicy,
-    RerunPolicy,
+    TriggerRegistry,
 )
 from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.config import RunConfig, Tuning, resolve_tuning
@@ -54,7 +56,7 @@ class ConfigEnv:
         self.channel = ExecutionChannel(self.ipc_dir)
         self.classifier = ErrorClassifier()
         self.governor = DeadlockGovernor()
-        self.rerun_policy = RerunPolicy()
+        self.trigger_registry = TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS)
         self.requeue_policy = ImmediateRequeuePolicy()
 
     def resolve(self, **overrides) -> RunConfig:
@@ -67,7 +69,7 @@ class ConfigEnv:
             channel=self.channel,
             classifier=self.classifier,
             governor=self.governor,
-            rerun_policy=self.rerun_policy,
+            trigger_registry=self.trigger_registry,
             requeue_policy=self.requeue_policy,
             output_roots=None,
         )
@@ -151,7 +153,7 @@ class TestRunConfigResolve:
         assert config.channel is env.channel
         assert config.classifier is env.classifier
         assert config.governor is env.governor
-        assert config.rerun_policy is env.rerun_policy
+        assert config.trigger_registry is env.trigger_registry
         assert config.requeue_policy is env.requeue_policy
         assert config.name == "test_config"
         assert config.ipc_dir == env.ipc_dir

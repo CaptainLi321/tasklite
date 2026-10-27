@@ -23,7 +23,7 @@ import time
 from typing import Any, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .admission import RerunPolicy
+    from .admission import TriggerRegistry
     from .channel import ExecutionChannel
     from .dispatch import DispatchSession
     from .in_flight import InFlightTracker
@@ -48,14 +48,14 @@ class CompletionMachine:
         self,
         *,
         store: "StateStore",
-        rerun_policy: "RerunPolicy | None" = None,
+        trigger_registry: "TriggerRegistry | None" = None,
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
         session: "DispatchSession",
     ) -> None:
         self._store = store
-        self._rerun_policy = rerun_policy
+        self._trigger_registry = trigger_registry
         self._channel = channel
         self._resources = resources
         self._in_flight = in_flight
@@ -304,8 +304,8 @@ class CompletionMachine:
         """动态子任务去重与规范化。
 
         去重规则：批内同 uid 只留首个；queue/in-flight 命中无条件拦截
-        （同轮不重复派发/并发双跑，优先于 rerun 豁免）；successes/failed 命中
-        经 RerunPolicy 准入判定。规范化经 store.normalize_spawned_job
+        （同轮不重复派发/并发双跑，优先于 trigger 豁免）；successes/failed 命中
+        经 TriggerRegistry 准入判定。规范化经 store.normalize_spawned_job
         （策略注入 + 资源注入 + 首入队时间 + 序列化预检）；不可序列化的
         坏子作业独立登记失败终态（拒绝语义），不连坐父作业的成功提交、
         不触发 commit 崩溃契约。

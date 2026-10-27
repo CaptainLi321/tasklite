@@ -3,7 +3,7 @@
 字段归位原则：本类只承载「这一次激活」的语义——
 
 - 规格位（可覆盖 Task 默认）：task_type / job_id / payload / resources /
-  depends_on / timeout_seconds / max_retries / timeout_is_transient / rerun；
+  depends_on / timeout_seconds / max_retries / timeout_is_transient / trigger；
 - 实例位（框架运行期管理）：attempt_no（本次激活内尝试序号，1 起始含
   首次执行；预算判定：允许执行条件 ``attempt_no <= max_retries + 1``）、
   activation_no（激活代，每次从 successes/failed 拦截点放行重跑时 +1）、
@@ -27,6 +27,7 @@ from .task import (
     validate_task_type,
     validate_timeout_seconds,
     validate_timeout_flag,
+    validate_trigger,
 )
 
 # uid 派生的 IPC 文件名（锁 / result / signals / outputs）
@@ -39,13 +40,13 @@ _MAX_SAFE_UID_BYTES = 199
 
 WORKER_RESOURCE = "__workers__"
 
-# rerun 策略合法值（校验点：Job 构造 / 任务级默认策略注册）
-RERUN_VALUES = ("never", "on_failure", "every_run", "on_input_change")
+# 内置触发器名称；自定义触发器同样仅以名称引用。
+BUILTIN_TRIGGERS = ("once", "on_failure", "always", "on_input_change")
 
 
 def inject_worker_resource(job_snapshot: dict) -> None:
     """给 job_snapshot 的 resources 注入默认 worker 槽位。"""
-    resources = dict(job_snapshot.get("resources", {}))
+    resources = dict(job_snapshot.get("resources") or {})
     if WORKER_RESOURCE not in resources:
         resources[WORKER_RESOURCE] = 1.0
     job_snapshot["resources"] = resources
@@ -218,19 +219,6 @@ def _normalize_depends_on(depends_on: Any) -> list[str]:
     return normalized
 
 
-def _validate_rerun(rerun: Any) -> None:
-    """rerun 策略入口校验（fail-loud）——非法值会被静默当 "never" 处理。
-
-    None 是「未指定」哨兵（可被任务级默认策略注入），显式字符串一律
-    尊重；仅拒绝未知字符串值。
-    """
-    if rerun is not None and rerun not in RERUN_VALUES:
-        raise ValueError(
-            f"rerun must be None (unspecified) or one of "
-            f"{'/'.join(repr(v) for v in RERUN_VALUES)}, got {rerun!r}"
-        )
-
-
 def _validate_attempt_no(attempt_no: Any) -> None:
     """attempt_no 入口校验：非 bool 的 int 且 >= 1（1 起始含首次执行）。"""
     if not isinstance(attempt_no, int) or isinstance(attempt_no, bool):
@@ -277,29 +265,18 @@ class Job:
         job_id: 任务类型内的唯一标识。非空 str 且不含 ``::``。
         payload: 传给 handler 的业务数据 dict（须可 JSON 序列化，完整
             序列化预检在 enqueue/spawn 侧执行，构造期先做 dict 类型门卫）。
-        resources: 要获取的资源占用映射（覆盖 Task 默认资源）。
-        max_retries: 重试预算上限（覆盖 Task 默认 3）。允许执行条件为
+        resources: None 继承 Task 默认资源；显式映射按键合并并覆盖同名资源。
+        max_retries: None 继承 Task 重试预算；显式值覆盖模板。允许执行条件为
             ``attempt_no <= max_retries + 1``；0 表示任何失败直接进
             失败档案。
         depends_on: 上游 job uid 列表（``task_type::job_id``）。失败的
             上游会级联阻断本 job。
-        timeout_seconds: 执行超时秒数（覆盖 Task 默认 3600），有限正数。
-        timeout_is_transient: 超时是否视为瞬态失败（keyword-only）。
+        timeout_seconds: None 继承 Task；显式秒数须为有限正数。
+        timeout_is_transient: None 继承 Task；显式控制超时是否为瞬态失败。
             True 时看门狗超时按重试处理，而非直接进失败档案。
-        rerun: 跨会话重跑策略——「成功进 successes 是否算数」由它决定
-            （**不改变 uid 派生**，身份仍是 uid）：
-            - None（默认，未指定哨兵）：未指定——任务级默认策略可注入；
-              无默认策略的任务按 "never" 处理。与显式 "never" 的区别：
-              显式值一律尊重，不再被任务级默认覆盖（保持 enqueue 与
-              spawn 行为一致）；
-            - "never"：successes/failed 命中即跳过；
-            - "on_failure"：successes 命中跳过，failed 命中重跑（网络误失败
-              可自愈；成功即自动清失败档案残行）；
-            - "every_run"：successes/failed 命中都重跑（成功 REPLACE successes 行、
-              success_count+1）——扫描类/orchestrator 任务；
-            - "on_input_change"：successes 命中比对输入指纹，failed 命中重跑。
-            策略只作用于「successes/failed 拦截点」；queue/in-flight 永远算数
-            （同一轮内不重复派发/并发双跑）。随 job_snapshot 持久化。
+        trigger: 首次尝试的触发器名称；None 继承 Task。内置 once /
+            on_failure / always / on_input_change，或 register_trigger 注册名。
+            新作业与历史作业统一求值；同次激活的故障重试不重复求值。
         runtime: 运行期边带状态（dict 或 JobRuntimeState，由框架管理）。
         attempt_no: 本次激活内尝试序号（实例位，框架管理，1 起始含首次
             执行）。
@@ -315,12 +292,12 @@ class Job:
         job_id: str,
         payload: dict[str, Any] | None = None,
         resources: dict[str, float] | None = None,
-        max_retries: int = 3,
+        max_retries: int | None = None,
         depends_on: list[str] | None = None,
-        timeout_seconds: int | float = 3600,
+        timeout_seconds: int | float | None = None,
         *,
-        timeout_is_transient: bool = False,
-        rerun: str | None = None,
+        timeout_is_transient: bool | None = None,
+        trigger: str | None = None,
         runtime: dict[str, Any] | None = None,
         attempt_no: int = 1,
         activation_no: int = 1,
@@ -334,16 +311,20 @@ class Job:
         _validate_uid_ipc_filename(task_type, job_id)
 
         self.payload = _normalize_payload(payload)
-        self.resources = _normalize_resources(resources)
-        validate_retry_budget(max_retries)
+        self.resources = None if resources is None else _normalize_resources(resources)
+        if max_retries is not None:
+            validate_retry_budget(max_retries)
         self.max_retries = max_retries
         self.depends_on = _normalize_depends_on(depends_on)
-        validate_timeout_seconds(timeout_seconds)
+        if timeout_seconds is not None:
+            validate_timeout_seconds(timeout_seconds)
         self.timeout_seconds = timeout_seconds
-        validate_timeout_flag(timeout_is_transient)
+        if timeout_is_transient is not None:
+            validate_timeout_flag(timeout_is_transient)
         self.timeout_is_transient = timeout_is_transient
-        _validate_rerun(rerun)
-        self.rerun = rerun
+        if trigger is not None:
+            validate_trigger(trigger)
+        self.trigger = trigger
 
         # 实例位：框架运行期管理的激活/尝试账目与首次入队时间
         _validate_attempt_no(attempt_no)
@@ -374,12 +355,12 @@ class Job:
             "task_type": self.task_type,
             "job_id": self.job_id,
             "payload": dict(self.payload),
-            "resources": dict(self.resources),
+            "resources": None if self.resources is None else dict(self.resources),
             "max_retries": self.max_retries,
             "depends_on": list(self.depends_on),
             "timeout_seconds": self.timeout_seconds,
             "timeout_is_transient": self.timeout_is_transient,
-            "rerun": self.rerun,
+            "trigger": self.trigger,
             "runtime": self.runtime.to_dict(),
             "attempt_no": self.attempt_no,
             "activation_no": self.activation_no,
@@ -388,19 +369,21 @@ class Job:
 
     @classmethod
     def from_dict(cls, data: dict) -> Job:
-        """反序列化 job（缺键回默认值；rerun 缺键/None = 未指定哨兵）。"""
+        """反序列化 job（缺键回默认值；trigger 缺键/None = 未指定哨兵）。"""
+        if "rerun" in data:
+            raise ValueError("Job 快照不接受旧字段 rerun；请使用 trigger")
         if "timeout" in data:
             raise ValueError("Job 快照不接受旧字段 timeout；请使用 timeout_seconds")
         return cls(
             data["task_type"],
             data["job_id"],
             data.get("payload", {}),
-            data.get("resources", {}),
-            data.get("max_retries", 3),
+            data.get("resources"),
+            data.get("max_retries"),
             data.get("depends_on", []),
-            data.get("timeout_seconds", 3600),
-            timeout_is_transient=data.get("timeout_is_transient", False),
-            rerun=data.get("rerun"),
+            data.get("timeout_seconds"),
+            timeout_is_transient=data.get("timeout_is_transient"),
+            trigger=data.get("trigger"),
             # runtime 子 dict 显式保留——边带状态只存这一处
             runtime=data.get("runtime", {}),
             attempt_no=data.get("attempt_no", 1),
@@ -425,7 +408,7 @@ class Job:
 __all__ = [
     "Job",
     "JobRuntimeState",
-    "RERUN_VALUES",
+    "BUILTIN_TRIGGERS",
     "RT_COMMIT_FAILURES",
     "RT_DISPATCH_FAILURES",
     "RT_LAST_RETRY_ERROR",

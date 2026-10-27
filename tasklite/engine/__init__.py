@@ -4,7 +4,7 @@
 子模块一律经 ``tasklite.engine.<模块>`` 全路径导入。装配结构：
 
 - 值对象与配置：types（引擎值对象/枚举）、config（RunConfig 装配快照）、
-  errorclass（错误分类）、admission（rerun 准入与 RequeuePolicy 重入队策略）；
+  errorclass（错误分类）、admission（trigger 准入与 RequeuePolicy 重入队策略）；
 - 调度与资源：scheduler（只读扫描选择点，OrderingPolicy seam）、
   resource（资源体系与两阶段租约）、wait（等待决策）；
 - 机器群：dispatch（五关预检派发）、channel（子进程执行通道）、

@@ -15,7 +15,7 @@ from tasklite import (
     job_ref, progress_hook, slice_list, content_fingerprint,
     encode_job_component, encode_identifier, encode_content_id, encode_job_uid_filename
 )
-from tasklite.engine.admission import RerunPolicy, RequeuePolicy, RequeuePlan
+from tasklite.engine.admission import TriggerRegistry, RequeuePolicy, RequeuePlan
 from tasklite.engine.resource import ResourceManager, ResourceEvaluation
 from tasklite.engine.in_flight import InFlightTracker, InFlightJob
 from tasklite.models.state import PipelineState

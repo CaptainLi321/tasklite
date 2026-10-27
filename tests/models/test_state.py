@@ -15,13 +15,13 @@ from tasklite.models.job import Job
 from tasklite.models.state import PipelineState, job_uid_from_snapshot
 
 
-def _jid(job_id: str, depends_on: list[str] | None = None, rerun: str | None = None) -> dict:
+def _jid(job_id: str, depends_on: list[str] | None = None, trigger: str | None = None) -> dict:
     """队列用 job dict（job_id 恒为确定性字面量）。"""
     d = {"task_type": "t", "job_id": job_id}
     if depends_on is not None:
         d["depends_on"] = depends_on
-    if rerun is not None:
-        d["rerun"] = rerun
+    if trigger is not None:
+        d["trigger"] = trigger
     return d
 
 

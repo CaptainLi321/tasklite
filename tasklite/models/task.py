@@ -21,6 +21,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def validate_trigger(trigger: Any) -> None:
+    """触发器引用仅允许非空名称，名称解析留在主进程派发点。"""
+    if not isinstance(trigger, str):
+        raise TypeError("trigger must be a non-empty str")
+    if not trigger:
+        raise ValueError("trigger must be a non-empty str")
+
+
 def _is_finite(value: Any) -> bool:
     """math.isfinite 的溢出安全版：超出 float 范围的超大 int（如 10**400）
     转换溢出抛 OverflowError（ArithmeticError 子类，会命中 fatal 启发式），
@@ -169,6 +177,7 @@ class Task:
         max_retries: 默认重试预算上限（对齐 v2 Job 默认 3）；允许执行
             条件为 ``attempt_no <= max_retries + 1``。
         timeout_seconds: 默认执行超时秒数（对齐 v2 Job 默认 3600），有限正数。
+        trigger: 首次尝试的触发器名称，默认 once；发现任务默认 always。
         timeout_is_transient: 超时是否视为瞬态失败（默认 False 保持保守
             语义）。True 时看门狗超时按重试处理而非直接进失败档案，
             适用于设计上可能长跑的任务——「超时」的语义是「没跑完」，
@@ -184,6 +193,7 @@ class Task:
     # kw-only：规格位尾部布尔以显式关键字表达，位置传参在构造点静默
     # 漂移（如误占 timeout_seconds 位）由签名直接拒绝
     timeout_is_transient: bool = field(kw_only=True, default=False)
+    trigger: str = field(kw_only=True, default="once")
 
     def __post_init__(self) -> None:
         validate_task_type(self.task_type)
@@ -192,6 +202,7 @@ class Task:
         validate_retry_budget(self.max_retries)
         validate_timeout_seconds(self.timeout_seconds)
         validate_timeout_flag(self.timeout_is_transient)
+        validate_trigger(self.trigger)
         resources_raw = self.resources if self.resources is not None else {}
         # 容器类型与 amount 校验须先于拷贝——str/序列等可迭代类型会在
         # dict() 拷贝处抛不可读的原始 ValueError

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence, TYPE_CHECKING
 
-from .admission import ImmediateRequeuePolicy, RequeuePolicy, RerunPolicy
+from .admission import ImmediateRequeuePolicy, RequeuePolicy, TriggerRegistry
 from .errorclass import ErrorClassifier
 from .governor import DEADLOCK_GAP_MAX_ROUNDS, DEP_GRACE_SECONDS, DeadlockGovernor
 from .resource import ResourceManager
@@ -110,7 +110,7 @@ def resolve_tuning(
 class RunConfig:
     """EngineRuntime 的静态装配配置规范（冻结引用而非拷贝）。
 
-    装配件在门面构造期即建并按引用共享（Task 注册表与 rerun 策略的
+    装配件在门面构造期即建并按引用共享（Task 注册表与 trigger 策略的
     装配期变更经 run 期守卫约束）；StateStore 由 EngineRuntime 构造期
     创建（其 on_attempt_finished 回调绑定 RunSession，随会话存活）。
     """
@@ -123,7 +123,7 @@ class RunConfig:
     channel: "ExecutionChannel"
     classifier: ErrorClassifier
     governor: DeadlockGovernor
-    rerun_policy: RerunPolicy
+    trigger_registry: TriggerRegistry
     requeue_policy: RequeuePolicy
     ordering_policy: OrderingPolicy
     # ── 调优标量（默认值唯一落点）──
@@ -148,7 +148,7 @@ class RunConfig:
         channel: "ExecutionChannel",
         classifier: ErrorClassifier,
         governor: DeadlockGovernor,
-        rerun_policy: RerunPolicy,
+        trigger_registry: TriggerRegistry,
         requeue_policy: RequeuePolicy | None = None,
         ordering_policy: OrderingPolicy | None = None,
         output_roots: Path | Sequence[Path] | None = None,
@@ -175,7 +175,7 @@ class RunConfig:
             channel=channel,
             classifier=classifier,
             governor=governor,
-            rerun_policy=rerun_policy,
+            trigger_registry=trigger_registry,
             requeue_policy=(
                 requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
             ),

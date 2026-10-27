@@ -13,7 +13,7 @@ from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from tasklite.backend.memory import InMemoryStateBackend
-from tasklite.engine.admission import RerunPolicy
+from tasklite.engine.admission import TriggerRegistry
 from tasklite.engine.errorclass import (
     ERR_COMMIT_FAILURE,
     ERR_JOB_DEPENDENCY,
@@ -32,6 +32,13 @@ from tasklite.engine.types import AttemptOutcome, RunStats
 from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.job import Job, WORKER_RESOURCE
 from tasklite.models.state import PipelineState
+
+
+def _task_specs(task_type, trigger):
+    from tasklite import Task, TaskRegistry
+    tasks = TaskRegistry()
+    tasks.register(Task(task_type, lambda job, ctx: True, trigger=trigger))
+    return tasks
 
 
 class CommitFailureBackend:
@@ -717,16 +724,16 @@ class TestIntakePipeline:
         jd = store.normalize_and_validate_job(job)
         assert jd["first_enqueued_at"] == "2026-01-01T00:00:00+00:00"
 
-    def test_enqueue_injects_discovery_rerun_for_unspecified(self):
+    def test_enqueue_injects_discovery_trigger_for_unspecified(self):
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            rerun_policy=RerunPolicy(discovery_rerun={"scan": "every_run"}),
+            trigger_registry=TriggerRegistry(tasks=_task_specs("scan", "always")),
         )
         jd = store.normalize_and_validate_job(Job("scan", "1"))
-        assert jd["rerun"] == "every_run"
-        jd_explicit = store.normalize_and_validate_job(Job("scan", "2", rerun="never"))
-        assert jd_explicit["rerun"] == "never"
+        assert jd["trigger"] == "always"
+        jd_explicit = store.normalize_and_validate_job(Job("scan", "2", trigger="once"))
+        assert jd_explicit["trigger"] == "once"
 
     def test_enqueue_rejects_unserializable_payload(self):
         store, _, _ = _make_store()
@@ -754,10 +761,10 @@ class TestIntakePipeline:
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            rerun_policy=RerunPolicy(discovery_rerun={"child": "on_failure"}),
+            trigger_registry=TriggerRegistry(tasks=_task_specs("child", "on_failure")),
         )
         jd = store.normalize_spawned_job(Job("child", "c1"))
-        assert jd["rerun"] == "on_failure"
+        assert jd["trigger"] == "on_failure"
         assert jd["resources"][WORKER_RESOURCE] == 1.0
         assert jd["first_enqueued_at"]
 

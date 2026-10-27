@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..backend.base import AbstractStateBackend
-    from .admission import RerunPolicy
+    from .admission import TriggerRegistry
     from .channel import ExecutionChannel, ExecutionResult
     from .in_flight import InFlightJob, InFlightTracker
     from .resource import ResourceManager
@@ -92,14 +92,14 @@ class RecoveryOrchestrator:
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
-        rerun_policy: "RerunPolicy | None" = None,
+        trigger_registry: "TriggerRegistry | None" = None,
         completion: "RecoveryCompletion",
     ) -> None:
         self._store = store
         self._channel = channel
         self._resources = resources
         self._in_flight = in_flight
-        self._rerun_policy = rerun_policy
+        self._trigger_registry = trigger_registry
         self._completion = completion
 
     def load_and_repair(self) -> PipelineState:
@@ -135,8 +135,8 @@ class RecoveryOrchestrator:
            的作业，补进本次 run 的内存队列；合并以磁盘真相序为权威序（窗口期
            front 入队作业保持其磁盘队首位置，快照独有行让位队尾）。重读失败
            仅放弃合并并告警，清理正确性不受影响；不基于重读结果做任何写盘。
-        2. 残留过滤：过滤已在 successes/failed 中且不符合 rerun 策略的残留；
-           放行保留的重跑行落字面 rerun 键（有效策略口径，豁免登记以行内
+        2. 残留过滤：过滤已在 successes/failed 中且不符合 trigger 策略的残留；
+           放行保留的重跑行落字面 trigger 键（有效策略口径，豁免登记以行内
            键为事实源）。
         3. UID 去重：同一 UID 重复条目保留首条；磁盘重读与快照的同 uid
            重逢属合并预期内的镜像行（静默收敛），仅快照内部的真实异常重复

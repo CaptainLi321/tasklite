@@ -100,7 +100,7 @@ def fail_once_then_ok_handler(job, ctx):
     if marker.exists():
         return True, {"recovered": True}
     marker.write_text(job.job_id, encoding="utf-8")
-    raise RuntimeError("fail once then await manual rerun")
+    raise RuntimeError("fail once then await manual trigger")
 
 
 def hung_handler(job, ctx):
@@ -267,14 +267,14 @@ class TestEndToEnd:
     ):
         p = _make_pipeline(tmp_path)
         p.register_task("work", ok_with_input_handler)
-        p.enqueue(Job("work", "item_eta", rerun="every_run"))
+        p.enqueue(Job("work", "item_eta", trigger="always"))
         first = p.run()
         assert first.stats["succeeded"] == 1
         assert p.backend.load_successes()["work::item_eta"]["success_count"] == 1
 
         # 第二会话重扫：successes 命中但 every_run 豁免放行 → 新激活重跑，
         # 成功 REPLACE successes 行且 run_count 从对侧终态续数
-        p.enqueue(Job("work", "item_eta", rerun="every_run"))
+        p.enqueue(Job("work", "item_eta", trigger="always"))
         second = p.run()
         p.stop()
 

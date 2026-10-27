@@ -1,7 +1,7 @@
 """v2 DispatchMachine 派发机器测试：五关预检、两阶段租约、轨迹开行与瞬态分支。
 
 覆盖：DispatchOutcome 单一 kind 枚举判据、五关时序契约（dedup →
-dep-failed → no-handler → orphan-probe → stale-restore）、rerun 放行的
+dep-failed → no-handler → orphan-probe → stale-restore）、trigger 放行的
 激活推进（activation_no+1 / attempt_no 重置）、派发即插 attempts 轨迹行
 与 execution_id 生成、瞬态信号（lock_conflict / rate_limited）零预算降级
 回队、派发失败 3-strike 收敛。
@@ -9,13 +9,15 @@ dep-failed → no-handler → orphan-probe → stale-restore）、rerun 放行�
 
 from __future__ import annotations
 
+from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
-from tasklite.engine.admission import RerunPolicy
+from tasklite.engine.admission import TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel, WorkerLaunchSpec
 from tasklite.engine.dispatch import (
     DispatchKind,
@@ -107,14 +109,14 @@ class DispatchEnv:
             channel=self.channel,
             resources=self.resources,
             in_flight=self.in_flight,
-            rerun_policy=RerunPolicy(),
+            trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             completion=self.completion,
         )
         self.tasks = TaskRegistry()
         self.dispatch = DispatchMachine(
             store=self.store,
             scheduler=JobScheduler(self.resources),
-            rerun_policy=RerunPolicy(),
+            trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             resources=self.resources,
             channel=self.channel,
             in_flight=self.in_flight,
@@ -202,7 +204,7 @@ class TestDispatchOutcomeKind:
 
 
 class TestDedupGate:
-    """预检关 1——去重与 rerun 放行。"""
+    """预检关 1——去重与 trigger 放行。"""
 
     def test_wall_hit_without_rerun_skips(self, tmp_path):
         env = DispatchEnv(tmp_path)
@@ -225,7 +227,7 @@ class TestDedupGate:
         assert records[-1].outcome == "skipped"
 
     def test_rerun_admission_advances_activation(self, tmp_path, monkeypatch):
-        """every_run 放行：activation_no+1、attempt_no 重置 1、字面 rerun 键落行。"""
+        """every_run 放行：activation_no+1、attempt_no 重置 1、字面 trigger 键落行。"""
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.register_in_flight("t::j1")
@@ -233,7 +235,7 @@ class TestDedupGate:
             Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
         )
         env.store.apply_success("t::j1", {}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
-        env.store.state.spawn_jobs([Job("t", "j1", rerun="every_run").to_dict()])
+        env.store.state.spawn_jobs([Job("t", "j1", trigger="always").to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
             lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
@@ -245,7 +247,7 @@ class TestDedupGate:
         assert entry is not None
         assert entry.job.activation_no == 2
         assert entry.job.attempt_no == 1
-        assert entry.job_snapshot["rerun"] == "every_run"
+        assert entry.job_snapshot["trigger"] == "always"
         assert entry.job_snapshot["activation_no"] == 2
         assert entry.job_snapshot["attempt_no"] == 1
         # 轨迹行按新激活代号落表
@@ -259,8 +261,11 @@ class TestDedupGate:
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.register_in_flight("t::j1")
-        env.store.apply_failure("t::j1", {"error_message": "boom"})
-        env.store.state.spawn_jobs([Job("t", "j1", rerun="on_failure").to_dict()])
+        aid = env.store.record_attempt_dispatch(
+            Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
+        )
+        env.store.apply_failure("t::j1", {"error_message": "boom"}, attempt_id=aid)
+        env.store.state.spawn_jobs([Job("t", "j1", trigger="on_failure").to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
             lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
@@ -631,7 +636,7 @@ class TestAdmissionEvaluationTiming:
         def broken_admit(*args, **kwargs):
             raise ValueError("bad trigger evaluation")
 
-        monkeypatch.setattr(env.dispatch._rerun_policy, "admit", broken_admit)
+        monkeypatch.setattr(env.dispatch._trigger_registry, "admit", broken_admit)
 
         with pytest.raises(ValueError, match="bad trigger evaluation"):
             env.dispatch.dispatch_next()
@@ -640,11 +645,11 @@ class TestAdmissionEvaluationTiming:
         assert env.store.state.queue[0]["job_id"] == "j1"
         assert "t::j1" not in env.store.state.in_flight_uids
 
-    def test_in_activation_retry_bypasses_rerun_policy_and_keeps_attempt_no(self, tmp_path, monkeypatch):
+    def test_in_activation_retry_bypasses_trigger_registry_and_keeps_attempt_no(self, tmp_path, monkeypatch):
         """attempt_no > 1 沿用激活内重试，不重调策略准入。"""
         env = DispatchEnv(tmp_path)
         env.register("t")
-        # 记录历史成功；若错误执行了准入评估（rerun 默认 never），将被判定为跳过
+        # 记录历史成功；若错误执行了准入评估（trigger 默认 never），将被判定为跳过
         env.store.state.mark_success("t::j1", {})
         retry_job = Job("t", "j1", attempt_no=2, activation_no=1)
         env.store.state.spawn_jobs([retry_job.to_dict()])

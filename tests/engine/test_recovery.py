@@ -12,9 +12,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+
+from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
-from tasklite.engine.admission import RerunPolicy
+from tasklite.engine.admission import TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
 from tasklite.engine.recovery import RecoveryOrchestrator
@@ -110,7 +112,7 @@ def make_recovery_orchestrator(backend=None, *, state=None, resource_mgr=None,
         channel=channel if channel is not None else MagicMock(),
         resources=resource_mgr if resource_mgr is not None else ResourceManager(),
         in_flight=in_flight if in_flight is not None else MagicMock(),
-        rerun_policy=policy if policy is not None else RerunPolicy(),
+        trigger_registry=policy if policy is not None else TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
         completion=completion if completion is not None else MagicMock(),
     )
 
@@ -125,9 +127,9 @@ class TestRepairQueueOnLoad:
         backend = InMemoryStateBackend()
         orchestrator = make_recovery_orchestrator(backend)
 
-        job_wall = {"task_type": "t", "job_id": "w_blocked", "rerun": "never"}
-        job_every_run = {"task_type": "t", "job_id": "w_rerun", "rerun": "every_run"}
-        job_failed_rerun = {"task_type": "t", "job_id": "f_rerun", "rerun": "on_failure"}
+        job_wall = {"task_type": "t", "job_id": "w_blocked", "trigger": "once"}
+        job_every_run = {"task_type": "t", "job_id": "w_rerun", "trigger": "always"}
+        job_failed_rerun = {"task_type": "t", "job_id": "f_rerun", "trigger": "on_failure"}
         job_fresh = {"task_type": "t", "job_id": "fresh"}
 
         successes = {"t::w_blocked": {}, "t::w_rerun": {}}
@@ -158,7 +160,7 @@ class TestRepairDeltaPersist:
     def test_repair_preserves_job_enqueued_during_repair_window(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([
-            {"task_type": "t", "job_id": "residue_row", "rerun": "never"},
+            {"task_type": "t", "job_id": "residue_row", "trigger": "once"},
             {"task_type": "t", "job_id": "keep_row"},
         ])
         q_data = backend.load_queue()
@@ -185,9 +187,9 @@ class TestRepairDeltaPersist:
     def test_repair_preserves_candidate_rows_on_disk(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([
-            {"task_type": "t", "job_id": "residue_row", "rerun": "never"},
+            {"task_type": "t", "job_id": "residue_row", "trigger": "once"},
             {"task_type": "t", "job_id": "keep_row"},
-            {"task_type": "t", "job_id": "failed_residue", "rerun": "never"},
+            {"task_type": "t", "job_id": "failed_residue", "trigger": "once"},
             {"task_type": "t", "job_id": "keep_second"},
         ])
         q_data = backend.load_queue()
@@ -207,7 +209,7 @@ class TestRepairDeltaPersist:
     def test_repair_delta_persist_aligned_on_memory_backend(self):
         backend = InMemoryStateBackend()
         backend.save_queue([
-            {"task_type": "t", "job_id": "residue_row", "rerun": "never"},
+            {"task_type": "t", "job_id": "residue_row", "trigger": "once"},
             {"task_type": "t", "job_id": "keep_row"},
         ])
         q_data = backend.load_queue()
@@ -641,7 +643,7 @@ class TestLoadAndRepair:
         backend.seed_successes(["t::overlap", "t::done"])
         backend.append_failed("t::overlap", {"error_message": "legacy"})
         backend.enqueue_jobs([
-            {"task_type": "t", "job_id": "done", "rerun": "never"},  # successes 残留
+            {"task_type": "t", "job_id": "done", "trigger": "once"},  # successes 残留
             {"task_type": "t", "job_id": "fresh"},
         ])
         backend.set_engine_metadata(
@@ -653,7 +655,7 @@ class TestLoadAndRepair:
         store = StoreShim(backend)
         orchestrator = RecoveryOrchestrator(
             store=store, channel=channel, resources=resource_mgr,
-            in_flight=InFlightTracker(), rerun_policy=RerunPolicy(),
+            in_flight=InFlightTracker(), trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             completion=MagicMock(),
         )
 
@@ -806,7 +808,7 @@ class TestAbortInFlight:
         completion = RecordingCompletion()
         orchestrator = RecoveryOrchestrator(
             store=StoreShim(backend), channel=channel, resources=resource_mgr,
-            in_flight=InFlightTracker(), rerun_policy=RerunPolicy(),
+            in_flight=InFlightTracker(), trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             completion=completion,
         )
         return orchestrator, channel, completion, resource_mgr
@@ -905,7 +907,7 @@ class TestAbortInFlight:
         )
         orchestrator = RecoveryOrchestrator(
             store=StoreShim(backend), channel=fake_channel, resources=resource_mgr,
-            in_flight=InFlightTracker(), rerun_policy=RerunPolicy(),
+            in_flight=InFlightTracker(), trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             completion=completion,
         )
         tracker = orchestrator._in_flight

@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
     from ..models.state import PipelineState
     from ..models.task import Task
-    from .admission import RerunPolicy
+    from .admission import TriggerRegistry
     from .channel import ExecutionChannel
     from .errorclass import ErrorClassifier
     from .in_flight import InFlightTracker
@@ -111,7 +111,7 @@ class DispatchMachine:
         *,
         store: "StateStore",
         scheduler: "JobScheduler",
-        rerun_policy: "RerunPolicy",
+        trigger_registry: "TriggerRegistry",
         resources: "ResourceManager",
         channel: "ExecutionChannel",
         in_flight: "InFlightTracker",
@@ -125,7 +125,7 @@ class DispatchMachine:
     ) -> None:
         self._store = store
         self._scheduler = scheduler
-        self._rerun_policy = rerun_policy
+        self._trigger_registry = trigger_registry
         self._resources = resources
         self._channel = channel
         self._in_flight = in_flight
@@ -206,15 +206,16 @@ class DispatchMachine:
 
         # 2. 候选就绪：求值前不 pop 丢队，异常原位留队
         peek_snapshot = store.state.queue[sched.runnable_idx]
+        self._trigger_registry.normalize_job_snapshot(peek_snapshot, peek_snapshot["task_type"])
         job = Job.from_dict(peek_snapshot)
         job_uid = job.uid
 
         # 首次激活准入 (attempt_no <= 1) vs 激活内故障重试 (attempt_no > 1)
         if job.attempt_no <= 1:
-            decision = self._rerun_policy.admit(
+            should_run = self._trigger_registry.admit(
                 peek_snapshot, store.state, baseline_lookup=store.trusted_last_succeeded_at_us
             )
-            if decision.should_skip:
+            if not should_run:
                 job_snapshot = store.state.pop_job(sched.runnable_idx)
                 attempt_id: int | None = None
                 try:
@@ -225,15 +226,16 @@ class DispatchMachine:
                     )
                     attempt_id = None
                 store.apply_skip(job_uid, job_snapshot=job_snapshot, attempt_id=attempt_id)
+                store.state.mark_trigger_skipped(job_uid)
                 return None
 
+            job.activation_no = max(
+                (record.activation_no for record in store.backend.load_attempts(job_uid)),
+                default=0,
+            ) + 1
             job_snapshot = store.state.pop_job(sched.runnable_idx)
-            if job_uid in store.state.success_uids or job_uid in store.state.failed_uids:
-                job.activation_no = job.activation_no + 1
-                job.attempt_no = 1
-                job_snapshot["activation_no"] = job.activation_no
-                job_snapshot["attempt_no"] = 1
-                job_snapshot["rerun"] = decision.effective_rerun
+            job_snapshot["activation_no"] = job.activation_no
+
         else:
             job_snapshot = store.state.pop_job(sched.runnable_idx)
 

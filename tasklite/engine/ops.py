@@ -134,8 +134,8 @@ class OpsConsole:
 
         回溯/增量场景的入队前过滤辅助。边界语义：
         - 只按 successes（成功历史）过滤；失败档案（failed）中的 job **不**
-          排除——重新入队后是否重跑由 ``Job(rerun=...)`` 在派发层裁决
-          （默认 ``never`` 静默跳过，``on_failure`` 重跑），此处抢先过滤
+          排除——重新入队后是否重跑由 ``Job(trigger=...)`` 在派发层裁决
+          （默认 ``once`` 静默跳过，``on_failure`` 重跑），此处抢先过滤
           会吞掉重跑策略的豁免语义；
         - 已驻留队列的重复 uid 不排除——队列去重是 enqueue 自身的职责。
         """
@@ -188,7 +188,7 @@ class OpsConsole:
         追溯面撞号；无轨迹行（带外登记）回退初激活 1。业务 payload 取
         档案快照，经 store.enqueue_jobs 规范化（策略注入 + 资源注入 +
         首入队时间）队首入队，再删档案行。先入队后删除的次序保证崩溃
-        窗口至多留下「queue∩failed 并存」——由加载期修复按 rerun 策略
+        窗口至多留下「queue∩failed 并存」——由加载期修复按 trigger 策略
         收敛，绝不丢作业。已在队列驻留的 job_uid 不重复入队（enqueue 去重），
         档案行照删（下次 run 从队列执行）。
 

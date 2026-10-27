@@ -57,7 +57,7 @@ T3. 仅「完整扫描」结束（整页命中或空页）才返回成功。中�
     的扫描必须在下一次运行完整重扫（重不漏由确定性 job_id + successes 去重吸收）。
     **退化路径例外**：max_pages 截断与 id_func 全失败早停两处实现返回
     **成功**（进 successes）并打醒目日志——语义上「未完整」由 discovery 默认
-    rerun="every_run" 保证下一会话重扫；若用户将 rerun 覆盖为 never，截断后
+    trigger="always" 保证下一会话重扫；若用户将 trigger 覆盖为 once，截断后
     增量链静默死亡（漏内容且无失败信号），需自行权衡。
 T4. **liveness 例外（max_pages 硬上限，默认 1000）**：持续更新源无法整页
     命中时按页数上限停止——这是对完整扫描的显式退化路径，**不算完整扫描**：
@@ -127,7 +127,7 @@ import pickle
 from collections.abc import Callable, Iterable
 from typing import Any, Protocol
 
-from ..models.job import RERUN_VALUES
+from ..models.task import validate_trigger
 from ..utils.encoding import (
     CONTENT_ID_ALLOWED,
     encode_content_id,
@@ -169,8 +169,8 @@ class DiscoveryContext(Protocol):
 class DiscoveryHost(Protocol):
     """``register_discovery`` 对宿主框架的全部要求（框架无关协议）。
 
-    宿主只需提供两个公开能力：注册一个普通 Task 规格、登记 discovery 默认
-    rerun。TaskLite 的实现是框架默认适配，但任何实现本协议的对象都可以
+    宿主只需提供 register_task，并接纳 trigger 默认规格。
+    TaskLite 的实现是框架默认适配，但任何实现本协议的对象都可以
     直接使用 ``register_discovery``。
     """
 
@@ -180,9 +180,9 @@ class DiscoveryHost(Protocol):
         handler: Callable[..., Any],
         resources: dict[str, float] | None = None,
         payload_schema: type | None = None,
+        *,
+        trigger: str = "always",
     ) -> None: ...
-
-    def set_discovery_rerun(self, task_type: str, rerun: str) -> None: ...
 
 
 def _in_discovery_group(content_part: str, group_prefix: str) -> bool:
@@ -524,7 +524,7 @@ def register_discovery(
     resources: dict[str, float] | None = None,
     payload_schema: type | None = None,
     max_pages: int = 1000,
-    rerun: str = "every_run",
+    trigger: str = "always",
     scan_mode: str = "incremental",
     on_missing: Callable[[DiscoveryJob, DiscoveryContext, list[str]], None] | None = None,
 ) -> None:
@@ -536,7 +536,7 @@ def register_discovery(
 
     Args:
         host: 实现 ``DiscoveryHost`` 协议的宿主（框架默认适配 = TaskLite；
-            任何只实现 register_task + set_discovery_rerun 两方法的对象
+            任何实现 register_task 并接纳 trigger 规格的对象
             亦可——本函数不依赖框架具体类型）。
         task_type: 发现任务的 task_type（handler 名）。
         fetch_func: ``(job, ctx, page) -> list[item]``。每次扫描从 page=1
@@ -555,7 +555,7 @@ def register_discovery(
         resources: 发现任务自身的默认资源需求。
         payload_schema: 发现任务 payload 的运行时校验 schema。
         max_pages: 单次扫描页数硬上限（活性保障条款，默认 1000）。
-        rerun: discovery job 的默认跨会话重跑策略（默认 ``"every_run"``）
+        trigger: discovery job 的默认跨会话重跑策略（默认 ``"always"``）
             ——enqueue 该 task_type 的 job 时自动注入（用户显式指定非默认
             策略则尊重）。发现任务用固定 uid（如 ``discover::favorites``）
             每会话重扫，无需时间戳后缀。
@@ -623,11 +623,7 @@ def register_discovery(
             ) from e
     if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
         raise ValueError(f"max_pages must be a positive int, got {max_pages!r}")
-    if rerun not in RERUN_VALUES:
-        raise ValueError(
-            f"rerun must be one of "
-            f"{'/'.join(repr(v) for v in RERUN_VALUES)}, got {rerun!r}"
-        )
+    validate_trigger(trigger)
 
     handler = DiscoveryHandler(
         fetch_func,
@@ -639,16 +635,15 @@ def register_discovery(
         scan_mode=scan_mode,
         on_missing=on_missing,
     )
-    # 框架无关适配：只调用宿主公开协议的两个方法，不触碰任何私有字段/
+    # 框架无关适配：只调用宿主公开协议，不触碰任何私有字段/
     # 内部注册表——并发安全由 successes ACID + 去重保证。
     host.register_task(
         task_type,
         handler,
         resources=resources,
         payload_schema=payload_schema,
+        trigger=trigger,
     )
-    # 记录 discovery 默认 rerun 供 enqueue 注入
-    host.set_discovery_rerun(task_type, rerun)
 
 
 __all__ = [

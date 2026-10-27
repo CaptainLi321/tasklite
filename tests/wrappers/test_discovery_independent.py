@@ -3,11 +3,11 @@
 架构要求：``v2/wrappers/discovery.py`` 的扫描核心（``DiscoveryHandler``）
 只依赖 ``DiscoveryJob``/``DiscoveryContext`` 两个最小协议，**不 import
 任何框架模块**；``register_discovery`` 是框架默认适配器，只依赖
-``DiscoveryHost`` 公开协议（register_task + set_discovery_rerun）。
+``DiscoveryHost`` 公开协议（register_task 接纳 trigger 默认规格）。
 本文件用完全自制的 FakeJob/FakeCtx/FakeHost 验证这两条边界，不经过
 TaskLite/Job/JobContext 任何一个真实框架类型。
 
-TaskLite 宿主侧的 set_discovery_rerun 校验与默认 rerun 注入已由
+TaskLite 宿主侧的默认 trigger 继承已由
 tests/v2/test_pipeline.py 的 TestSetDiscoveryRerun 锁定，此处不重复。
 """
 from __future__ import annotations
@@ -117,36 +117,33 @@ class FakeHost:
         self.registered = []
 
     def register_task(self, task_type, handler,
-                      resources=None, payload_schema=None):
-        self.registered.append((task_type, handler, resources, payload_schema))
+                      resources=None, payload_schema=None, *, trigger="once"):
+        self.registered.append((task_type, handler, resources, payload_schema, trigger))
 
-    def set_discovery_rerun(self, task_type, rerun):
-        self.registered.append(("rerun", task_type, rerun))
 
 
 class TestRegisterDiscoveryFrameworkIndependent:
     def test_register_discovery_only_needs_discovery_host_protocol(self):
-        """适配器只调用宿主两个公开方法，可用 FakeHost 完成注册。"""
+        """适配器只调用宿主 register_task，可用 FakeHost 完成注册。"""
         host = FakeHost()
         register_discovery(
             host, "discover", _fetch, _item_id, _process, "child",
-            rerun="every_run",
+            trigger="always",
         )
         task_entry = host.registered[0]
         assert task_entry[0] == "discover"
         assert isinstance(task_entry[1], DiscoveryHandler), (
             "register_discovery 必须注册框架无关的 DiscoveryHandler"
         )
-        # 不触碰任何私有字段：默认 rerun 经公开方法登记
-        assert host.registered[1] == ("rerun", "discover", "every_run")
+        # 默认 trigger 作为 Task 规格注册
+        assert task_entry[4] == "always"
 
     def test_register_discovery_rejects_bad_host_fail_loud(self):
         """防御测试：宿主缺协议方法时立即 AttributeError，而非静默。"""
 
         class BrokenHost:
-            def register_task(self, *args, **kwargs):
-                pass
-            # 缺 set_discovery_rerun
+            pass
+            # 缺 register_task
 
         with pytest.raises(AttributeError):
             register_discovery(

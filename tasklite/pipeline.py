@@ -1,8 +1,8 @@
 """v2 TaskLite 门面：用户唯一入口与六步标准调用顺序。
 
 六步契约（顺序本身是设计的一部分）：初始化 → ``register_resource`` →
-``register_task`` / ``register_discovery``（wrappers 适配器经宿主接缝
-``set_discovery_rerun`` 挂载）/ ``register_transient_exception`` →
+``register_task`` / ``register_discovery`` / ``register_trigger`` /
+``register_transient_exception`` →
 ``enqueue`` → ``run`` → ``stop``；管理 API 仅限 ``run()`` 外调用。
 
 装配分区：构造器只做参数编排，backend / 分类器 / 资源 / IPC 通道 /
@@ -20,7 +20,8 @@ from typing import Any, Callable, Sequence
 from .backend.base import AbstractStateBackend
 from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
-from .engine.admission import RequeuePolicy, RerunPolicy
+from .engine.admission import RequeuePolicy, TriggerRegistry
+from .models.trigger import TriggerContext
 from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig, resolve_tuning
 from .engine.errorclass import ErrorClassifier, validate_declared_exception_classes
@@ -31,8 +32,8 @@ from .engine.runtime import EngineRuntime
 from .engine.scheduler import OrderingPolicy
 from .engine.store import FailureEntry
 from .engine.types import ExecutionOptions, RunSummary, RunStats
-from .models.job import Job, RERUN_VALUES, WORKER_RESOURCE
-from .models.task import Task, TaskRegistry, validate_task_type
+from .models.job import Job, WORKER_RESOURCE
+from .models.task import Task, TaskRegistry
 from .selection import Rule, Selection
 
 logger = logging.getLogger("tasklite")
@@ -132,11 +133,10 @@ class TaskLite:
         # StateStore（运行期所有权锚点）各交接一次，门面自身不独立持库。
         backend_instance, self.backend_type = self._build_backend(backend)
 
-        # Task 规格注册表与任务级默认 rerun 注入面——RerunPolicy 冻结
-        # dict 引用（而非拷贝），装配期注册经 set_discovery_rerun 即时
-        # 可见；run 期守卫约束变更窗口。
+        # 注册表按引用共享；运行期守卫限制配置变更窗口。
         self.tasks = TaskRegistry()
-        self._discovery_rerun: dict[str, str] = {}
+        from .triggers import BUILTIN_TRIGGER_FUNCTIONS
+        self._triggers = TriggerRegistry(tasks=self.tasks, functions=BUILTIN_TRIGGER_FUNCTIONS)
         self.classifier = self._build_classifier(fatal_exceptions, transient_exceptions)
         self.resources = self._build_resources(self.tasks, max_workers)
         self.ipc_dir, self._process_context = self._prepare_ipc_dir()
@@ -326,7 +326,7 @@ class TaskLite:
                 dependency_grace_seconds=tuning.dependency_grace_seconds,
                 deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
             ),
-            rerun_policy=RerunPolicy(self._discovery_rerun),
+            trigger_registry=self._triggers,
             requeue_policy=requeue_policy,
             ordering_policy=ordering_policy,
             output_roots=self.output_roots,
@@ -423,6 +423,7 @@ class TaskLite:
         timeout_seconds: int | float = 3600,
         *,
         timeout_is_transient: bool = False,
+        trigger: str = "once",
     ) -> None:
         """注册一个 Task 规格（Task 实例）或按简式参数就地构造规格。
 
@@ -450,6 +451,7 @@ class TaskLite:
                 max_retries=max_retries,
                 timeout_seconds=timeout_seconds,
                 timeout_is_transient=timeout_is_transient,
+                trigger=trigger,
             )
             task = task_or_type
         else:
@@ -467,6 +469,7 @@ class TaskLite:
                 max_retries=max_retries,
                 timeout_seconds=timeout_seconds,
                 timeout_is_transient=timeout_is_transient,
+                trigger=trigger,
             )
         self.tasks.register(task)
 
@@ -479,6 +482,7 @@ class TaskLite:
         max_retries: int,
         timeout_seconds: int | float,
         timeout_is_transient: bool,
+        trigger: str,
 ) -> None:
         """规格式注册的旁置参数门卫（非默认形态一律 ValueError）。"""
         if (
@@ -486,6 +490,7 @@ class TaskLite:
             or resources is not None
             or payload_schema is not None
             or timeout_is_transient is not False
+            or trigger != Task.trigger
             or max_retries != Task.max_retries
             or timeout_seconds != Task.timeout_seconds
         ):
@@ -514,27 +519,10 @@ class TaskLite:
         self._runtime.set_selection(Selection(rules))
         return self
 
-    def set_discovery_rerun(self, task_type: str, rerun: str) -> None:
-        """登记 discovery task_type 的默认 rerun 策略（宿主接缝）。
-
-        discovery 适配器（v2 wrappers，经宿主协议挂载）经本公开方法写入
-        默认 rerun——宿主实现细节（``_discovery_rerun`` 私有字典）不暴露
-        给适配器。enqueue/spawn 时若 job 未指定 rerun（Job.rerun=None
-        哨兵）则经 RerunPolicy 注入该默认值，使固定 uid 的 discovery
-        job 每会话重扫；显式值（含 "never"）一律尊重。
-        """
-        self._ensure_not_running("set_discovery_rerun")
-        validate_task_type(task_type)
-        if rerun not in RERUN_VALUES:
-            raise ValueError(
-                f"rerun must be one of "
-                f"{'/'.join(repr(v) for v in RERUN_VALUES)}, got {rerun!r}"
-            )
-        if task_type in self._discovery_rerun:
-            logger.warning(
-                f"Overwriting discovery rerun for task_type '{task_type}'"
-            )
-        self._discovery_rerun[task_type] = rerun
+    def register_trigger(self, name: str, fn: Callable[["TriggerContext"], bool]) -> None:
+        """注册主进程触发条件；内置名称与重复名称不允许覆盖。"""
+        self._ensure_not_running("register_trigger")
+        self._triggers.register(name, fn)
 
     def register_transient_exception(
         self, exception_cls: "type | Sequence[type]"
@@ -568,11 +556,11 @@ class TaskLite:
     def enqueue(self, jobs: Job | Sequence[Job], *, front: bool = False) -> None:
         """入队作业（重复 uid 静默跳过，front=True 插队首）。
 
-        successes 命中不在 enqueue 拦截——rerun 策略裁决属派发层（拦截点在
-        五关预检），此处抢先过滤会吞掉 every_run/on_failure 的豁免
+        successes 命中不在 enqueue 拦截——trigger 策略裁决属派发层（拦截点在
+        五关预检），此处抢先过滤会吞掉 always/on_failure 的豁免
         语义。写入走后端增量 API（单事务原子插入，不做全表重写），与
         run() 的增量 commit 并发时互不覆盖；序列化预检、任务级默认
-        rerun 注入、``__workers__`` 资源注入与 first_enqueued_at 填充
+        trigger 注入、``__workers__`` 资源注入与 first_enqueued_at 填充
         统一在 StateStore.enqueue_jobs 摄入管道完成。
 
         非线程安全：不得与 ``run()`` 并发调用；运行期 handler 内生成

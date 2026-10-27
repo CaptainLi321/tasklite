@@ -11,7 +11,7 @@ import pytest
 from tasklite.models.job import (
     Job,
     JobRuntimeState,
-    RERUN_VALUES,
+    BUILTIN_TRIGGERS,
     inject_worker_resource,
 )
 from tasklite.utils.encoding import encode_job_uid_filename
@@ -26,12 +26,12 @@ class TestJobCreation:
         assert job.task_type == "scan"
         assert job.job_id == "scan_001"
         assert job.payload == {}
-        assert job.resources == {}
-        assert job.max_retries == 3
+        assert job.resources is None
+        assert job.max_retries is None
         assert job.depends_on == []
-        assert job.timeout_seconds == 3600
-        assert job.timeout_is_transient is False
-        assert job.rerun is None
+        assert job.timeout_seconds is None
+        assert job.timeout_is_transient is None
+        assert job.trigger is None
         # 实例位初值：首次激活、首次尝试、尚未入队
         assert job.attempt_no == 1
         assert job.activation_no == 1
@@ -48,7 +48,7 @@ class TestJobCreation:
             depends_on=["parent_job"],
             timeout_seconds=7200,
             timeout_is_transient=True,
-            rerun="on_failure",
+            trigger="on_failure",
             attempt_no=2,
             activation_no=3,
             first_enqueued_at="2026-01-01T00:00:00+00:00",
@@ -59,7 +59,7 @@ class TestJobCreation:
         assert job.depends_on == ["parent_job"]
         assert job.timeout_seconds == 7200
         assert job.timeout_is_transient is True
-        assert job.rerun == "on_failure"
+        assert job.trigger == "on_failure"
         assert job.attempt_no == 2
         assert job.activation_no == 3
         assert job.first_enqueued_at == "2026-01-01T00:00:00+00:00"
@@ -68,7 +68,7 @@ class TestJobCreation:
         assert Job("fetch", "j1", payload=None).payload == {}
 
     def test_resources_none_defaults_to_empty_dict(self):
-        assert Job("fetch", "j1", resources=None).resources == {}
+        assert Job("fetch", "j1", resources=None).resources is None
 
     def test_resources_shallow_copied(self):
         """Job.resources 初始化浅拷贝，防外部就地变异。"""
@@ -187,7 +187,7 @@ class TestJobPayloadAndResources:
 
 
 class TestJobSpecFieldValidation:
-    """max_retries / timeout_seconds / depends_on / rerun 校验。"""
+    """max_retries / timeout_seconds / depends_on / trigger 校验。"""
 
     def test_negative_max_retries(self):
         with pytest.raises(ValueError, match="max_retries must be >= 0"):
@@ -239,16 +239,17 @@ class TestJobSpecFieldValidation:
         job = Job("t", "j1", depends_on=["t::j1"])
         assert job.uid in job.depends_on
 
-    def test_rerun_legal_value_set(self):
-        """rerun 四策略 + None 哨兵语义：合法值全接受，非法值拒绝。"""
-        assert RERUN_VALUES == ("never", "on_failure", "every_run", "on_input_change")
-        for value in RERUN_VALUES:
-            assert Job("t", "id", rerun=value).rerun == value
-        assert Job("t", "id").rerun is None
-        with pytest.raises(ValueError, match="rerun must be None"):
-            Job("t", "id", rerun="always")
-        with pytest.raises(ValueError, match="rerun must be None"):
-            Job("t", "id", rerun="never ")
+    def test_trigger_names_and_unspecified_sentinel(self):
+        """trigger 四策略 + None 哨兵语义：合法值全接受，非法值拒绝。"""
+        assert BUILTIN_TRIGGERS == ("once", "on_failure", "always", "on_input_change")
+        for value in BUILTIN_TRIGGERS:
+            assert Job("t", "id", trigger=value).trigger == value
+        assert Job("t", "id").trigger is None
+        assert Job("t", "id", trigger="custom").trigger == "custom"
+        with pytest.raises(ValueError, match="trigger must be a non-empty str"):
+            Job("t", "id", trigger="")
+        with pytest.raises(TypeError, match="trigger must be a non-empty str"):
+            Job("t", "id", trigger=12)
 
 
 class TestJobInstanceFieldValidation:
@@ -320,7 +321,7 @@ class TestJobToDictFromDict:
         expected_keys = {
             "task_type", "job_id", "payload", "resources",
             "max_retries", "depends_on", "timeout_seconds", "timeout_is_transient",
-            "rerun", "runtime", "attempt_no", "activation_no",
+            "trigger", "runtime", "attempt_no", "activation_no",
             "first_enqueued_at",
         }
         assert set(result.keys()) == expected_keys
@@ -334,7 +335,7 @@ class TestJobToDictFromDict:
             max_retries=4,
             depends_on=["a", "b"],
             timeout_seconds=100,
-            rerun="every_run",
+            trigger="always",
             attempt_no=2,
             activation_no=1,
             first_enqueued_at="2026-02-02T00:00:00+00:00",
@@ -347,7 +348,7 @@ class TestJobToDictFromDict:
         assert d["max_retries"] == 4
         assert d["depends_on"] == ["a", "b"]
         assert d["timeout_seconds"] == 100
-        assert d["rerun"] == "every_run"
+        assert d["trigger"] == "always"
         assert d["attempt_no"] == 2
         assert d["activation_no"] == 1
         assert d["first_enqueued_at"] == "2026-02-02T00:00:00+00:00"
@@ -355,12 +356,12 @@ class TestJobToDictFromDict:
     def test_from_dict_missing_optional_keys_uses_defaults(self):
         job = Job.from_dict({"task_type": "t", "job_id": "j"})
         assert job.payload == {}
-        assert job.resources == {}
-        assert job.max_retries == 3
+        assert job.resources is None
+        assert job.max_retries is None
         assert job.depends_on == []
-        assert job.timeout_seconds == 3600
-        assert job.timeout_is_transient is False
-        assert job.rerun is None
+        assert job.timeout_seconds is None
+        assert job.timeout_is_transient is None
+        assert job.trigger is None
         assert job.attempt_no == 1
         assert job.activation_no == 1
         assert job.first_enqueued_at is None
@@ -382,7 +383,7 @@ class TestJobToDictFromDict:
             depends_on=["parent_job"],
             timeout_seconds=7200,
             timeout_is_transient=True,
-            rerun="on_input_change",
+            trigger="on_input_change",
             attempt_no=3,
             activation_no=2,
             first_enqueued_at="2026-03-03T00:00:00+00:00",
@@ -396,7 +397,7 @@ class TestJobToDictFromDict:
         assert recreated.depends_on == original.depends_on
         assert recreated.timeout_seconds == original.timeout_seconds
         assert recreated.timeout_is_transient == original.timeout_is_transient
-        assert recreated.rerun == original.rerun
+        assert recreated.trigger == original.trigger
         assert recreated.attempt_no == original.attempt_no
         assert recreated.activation_no == original.activation_no
         assert recreated.first_enqueued_at == original.first_enqueued_at
@@ -438,7 +439,7 @@ class TestJobWorkerResource:
     def test_inject_does_not_mutate_source_job(self):
         job = Job("t", "id")
         inject_worker_resource(job.to_dict())
-        assert "__workers__" not in job.resources
+        assert job.resources is None
 
 
 class TestJobRuntimeState:

@@ -102,7 +102,7 @@ class TestFullMode:
         log_path = tmp_path / "fetches.log"
         p = _pipeline(tmp_path)
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           scan_mode="full", rerun="never")
+                           scan_mode="full", trigger="once")
         p.register_task("child", _child_ok)
         # 5 条 → 3 页（2/2/1）+ 空页；首次扫描无已见 → 全量 spawn
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
@@ -189,7 +189,7 @@ class TestMissingDetection:
         """full 模式 + on_missing：已见但本次未扫到 = 源站删除。"""
         p = _pipeline(tmp_path)
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
 
@@ -217,7 +217,7 @@ class TestMissingDetection:
         p = _pipeline(tmp_path)
         # 不传 scan_mode → handler 默认 incremental；仅挂 on_missing
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           rerun="never", on_missing=_on_missing)
+                           trigger="once", on_missing=_on_missing)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
 
@@ -272,7 +272,7 @@ class TestMissingDetection:
 
         # Run 1：完整扫描（max_pages 默认大）→ 6 条进入 successes（known 非空）
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
         p.run()
         assert not report.exists(), "完整扫描无删除 → 无 missing"
@@ -283,7 +283,7 @@ class TestMissingDetection:
         p2 = _pipeline(tmp_path)
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing,
+                           scan_mode="full", trigger="once", on_missing=_on_missing,
                            max_pages=1)
         p2.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
         p2.run()
@@ -298,7 +298,7 @@ class TestMissingDetection:
 
         # Run 1：正常 id_func 完整扫描 → 6 条进入 successes
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
         p.run()
         assert not report.exists()
@@ -308,7 +308,7 @@ class TestMissingDetection:
         p2 = _pipeline(tmp_path)
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id_fail, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         p2.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
         p2.run()
         assert not report.exists(), "id_func 全失败早停不得误报 missing"
@@ -323,7 +323,7 @@ class TestMissingDetection:
 
         # Run 1：正常完整扫描 → 6 条进入 successes（known 非空）
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
         p.run()
         assert not report.exists()
@@ -334,7 +334,7 @@ class TestMissingDetection:
         p2 = _pipeline(tmp_path)
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id_partial_raise, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         p2.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
         p2.run()
         assert not report.exists(), "id_func 部分失败的不完整扫描不得误报 missing"
@@ -347,7 +347,7 @@ class TestMissingDetection:
         report = tmp_path / "missing.txt"
 
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
         p.run()
         assert not report.exists()
@@ -356,7 +356,7 @@ class TestMissingDetection:
         p2 = _pipeline(tmp_path)
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id_partial_invalid, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         p2.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
         p2.run()
         assert not report.exists(), "id_func 非法返回的不完整扫描不得误报 missing"
@@ -369,7 +369,7 @@ class TestMissingDetection:
         report = tmp_path / "missing.txt"
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            group_key_func=_group_key,
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
 
         # 组 A：完整扫描 4 条 → successes
         p.enqueue([Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
@@ -401,7 +401,7 @@ class TestMissingDetection:
         report = tmp_path / "missing.txt"
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            group_key_func=_group_key,
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
 
         long_a = "a" * 200
         long_b = "b" * 200
@@ -436,7 +436,7 @@ class TestMissingDetection:
         p = _pipeline(tmp_path)
         p.register_task("child", _child_ok)
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing_boom)
+                           scan_mode="full", trigger="once", on_missing=_on_missing_boom)
 
         # 首次：5 条全扫 → 无 missing（on_missing 不调用，无异常）
         p.enqueue([Job("disc", "seed", payload={"posts": _posts(5)})])
@@ -499,7 +499,7 @@ class TestCursorKeyPrefixInjective:
         report = tmp_path / "missing.txt"
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            group_key_func=_group_key,
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         # 组 A：4 条
         p.enqueue([Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
                                                  "group": "A", "missing_report": str(report)})])
@@ -530,7 +530,7 @@ class TestSucceededOrFailedJobUidsUsage:
         p.register_task("child", _child_ok)
         report = tmp_path / "missing2.txt"
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
-                           scan_mode="full", rerun="never", on_missing=_on_missing)
+                           scan_mode="full", trigger="once", on_missing=_on_missing)
         # 首次：spawn 2 条（无已见）
         p.enqueue([Job("disc", "seed1", payload={"posts": [{"id": 1}, {"id": 2}],
                                                  "missing_report": str(report)})])

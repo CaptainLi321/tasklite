@@ -33,6 +33,7 @@ from .selection import Exclude, Selection, Skip
 # ── 模型层：规格 / 实例 / 轨迹 / 上下文 ──────────────────────────────
 from .models.attempt import AttemptRecord
 from .models.context import JobContext
+from .models.trigger import TriggerContext
 from .models.job import Job, JobRuntimeState
 from .models.task import Task, TaskRegistry, validate_resource_amounts
 
@@ -91,12 +92,12 @@ from .engine.resource import (
 from .engine.ops import SuspendEntry
 from .engine.store import FailureEntry
 
-# ── 策略 seam：准入（rerun）与重入队（节奏）─────────────────────────
+# ── 策略 seam：准入（trigger）与重入队（节奏）─────────────────────────
 from .engine.admission import (
     ImmediateRequeuePolicy,
     RequeuePlan,
     RequeuePolicy,
-    RerunPolicy,
+    TriggerRegistry,
 )
 
 # ── 策略 seam：调度排序 ──────────────────────────────────────────────
@@ -138,6 +139,7 @@ __all__ = [
     "AttemptRecord",
     "Job",
     "JobContext",
+    "TriggerContext",
     "JobRuntimeState",
     "Task",
     "TaskRegistry",
@@ -193,7 +195,7 @@ __all__ = [
     "ImmediateRequeuePolicy",
     "RequeuePlan",
     "RequeuePolicy",
-    "RerunPolicy",
+    "TriggerRegistry",
     "FifoOrderingPolicy",
     "OrderingPolicy",
     # 运行值对象

@@ -7,6 +7,8 @@ running 句柄保证 run 期旗子复位（漏复位污染同会话后续用例�
 """
 from __future__ import annotations
 
+from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,7 +28,7 @@ def _make_runtime(tmp_path) -> EngineRuntime:
     """最小 EngineRuntime 装配（InMemory 后端零 IO）。"""
     from tasklite.engine.admission import (
         ImmediateRequeuePolicy,
-        RerunPolicy,
+        TriggerRegistry,
     )
     from tasklite.engine.channel import ExecutionChannel
     from tasklite.engine.config import RunConfig
@@ -50,7 +52,7 @@ def _make_runtime(tmp_path) -> EngineRuntime:
             channel=ExecutionChannel(ipc_dir),
             classifier=ErrorClassifier(),
             governor=DeadlockGovernor(),
-            rerun_policy=RerunPolicy(),
+            trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             requeue_policy=ImmediateRequeuePolicy(),
             output_roots=tmp_path,
         )

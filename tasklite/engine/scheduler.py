@@ -42,7 +42,7 @@ class JobFacts:
         return cls(
             uid=job.uid,
             task_type=job.task_type,
-            resources=tuple(sorted(job.resources.items())),
+            resources=tuple(sorted((job.resources or {}).items())),
             depends_on=tuple(job.depends_on),
         )
 
@@ -207,7 +207,7 @@ class JobScheduler:
             return JobFacts.from_job_snapshot(job_snapshot)
         key = (task_type, job_id)
         facts = self._job_cache.get(key)
-        # 缓存一致性校验：缓存命中时校验「调度只读字段」一致——rerun="every_run"
+        # 缓存一致性校验：缓存命中时校验「调度只读字段」一致——trigger="always"
         # 的 job 在 successes 命中时被 spawn 去重豁免（文档化「每会话重扫」语义），
         # 可在**同一 run 内**让同 uid 以不同 resources/depends_on 二次入队。
         # 若直接返回陈旧缓存，调度器（缓存投影）与派发器（Job.from_dict 重新
@@ -230,7 +230,7 @@ class JobScheduler:
         两者都只读 depends_on/resources；``dict(...)`` 归一化让
         ``tuple[(k,v),...]``（JobFacts）与 ``dict``（Job）在此等价。
 
-        内容键 (task_type, job_id) 假设同 uid 内容不变；every_run 重 spawn 打破
+        内容键 (task_type, job_id) 假设同 uid 内容不变；always 重 spawn 打破
         该假设。仅 depends_on/resources 影响调度判定（unknown/missing/依赖/
         可运行评估），比对二者即可判定能否安全复用缓存。
 
@@ -247,7 +247,7 @@ class JobScheduler:
             job_dep = list(raw_dep) if raw_dep is not None else []
         except (TypeError, ValueError):
             return False  # 畸形值 → 不一致，重新解析（Job.from_dict 会拒）
-        cached_res = dict(job.resources) if not isinstance(job.resources, dict) else job.resources
+        cached_res = dict(job.resources or {}) if not isinstance(job.resources, dict) else job.resources
         return list(job.depends_on) == job_dep and cached_res == job_res
 
     def _effective_resources(self, job) -> dict[str, float]:
@@ -334,6 +334,8 @@ class JobScheduler:
                         # 1. 依赖作业在本批活跃（队列待跑或在途执行）：必须等待其完成
                         waiting_for_dep = True
                         can_run = False
+                    elif dep_uid in state.trigger_skipped_uids:
+                        continue
                     elif dep_uid in failed_map:
                         # 2. 依赖作业不在活跃集且处于失败档案：依赖失败，优先于 trigger 去重
                         failed_dependency = dep_uid

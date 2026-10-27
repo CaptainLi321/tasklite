@@ -39,7 +39,7 @@ from ..utils.jsonutil import dumps
 from .admission import (
     ImmediateRequeuePolicy,
     RequeuePolicy,
-    RerunPolicy,
+    TriggerRegistry,
     extract_trusted_metadata_timestamp_us,
     is_trusted_success_metadata,
 )
@@ -120,7 +120,7 @@ class StateStore:
         classifier: ErrorClassifier | None = None,
         on_attempt_finished: Callable[..., None] | None = None,
         stats: Any | None = None,
-        rerun_policy: RerunPolicy | None = None,
+        trigger_registry: TriggerRegistry | None = None,
         requeue_policy: RequeuePolicy | None = None,
     ) -> None:
         self._backend = backend
@@ -129,7 +129,7 @@ class StateStore:
         self._classifier = classifier if classifier is not None else ErrorClassifier()
         self._on_attempt_finished = on_attempt_finished
         self._stats = stats
-        self._rerun_policy = rerun_policy if rerun_policy is not None else RerunPolicy()
+        self._trigger_registry = trigger_registry if trigger_registry is not None else TriggerRegistry()
         # 重试节奏唯一出口：核心不做任何节奏计算，默认立即重入队。
         self._requeue_policy = (
             requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
@@ -261,7 +261,7 @@ class StateStore:
                 f"Expected Job or dict, got {type(job).__name__}"
             )
 
-        self._finalize_intake_snapshot(job_snapshot, str(job_snapshot["task_type"]))
+        self.finalize_intake_snapshot(job_snapshot, str(job_snapshot["task_type"]))
         return job_snapshot
 
     def normalize_spawned_job(self, job: Job) -> dict[str, Any]:
@@ -272,7 +272,7 @@ class StateStore:
         不触发 commit 崩溃契约」的语义处置。
         """
         job_snapshot = job.to_dict()
-        self._finalize_intake_snapshot(job_snapshot, job.task_type)
+        self.finalize_intake_snapshot(job_snapshot, job.task_type)
         try:
             dumps(job_snapshot)
         except (TypeError, ValueError) as e:
@@ -281,15 +281,15 @@ class StateStore:
             ) from e
         return job_snapshot
 
-    def _finalize_intake_snapshot(self, job_snapshot: dict[str, Any], task_type: str) -> None:
-        """摄入三步收尾：RerunPolicy 策略注入 → ``__workers__`` 资源注入 →
+    def finalize_intake_snapshot(self, job_snapshot: dict[str, Any], task_type: str) -> None:
+        """摄入三步收尾：TriggerRegistry 策略注入 → ``__workers__`` 资源注入 →
         first_enqueued_at 填充。
 
         first_enqueued_at 仅在缺失时填充（UTC ISO）：重试/spawn 回流的
         dict 已携带首次入队时间，绝不刷新——「首次入队时间」是端到端
         追溯链的锚点。
         """
-        self._rerun_policy.normalize_job_snapshot(job_snapshot, task_type)
+        self._trigger_registry.normalize_job_snapshot(job_snapshot, task_type)
         inject_worker_resource(job_snapshot)
         if not job_snapshot.get("first_enqueued_at"):
             job_snapshot["first_enqueued_at"] = utc_now_iso()

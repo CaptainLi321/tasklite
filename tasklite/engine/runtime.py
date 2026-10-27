@@ -96,7 +96,7 @@ class EngineRuntime:
             classifier=config.classifier,
             on_attempt_finished=self._session.fire_attempt_finished,
             stats=self._session.stats,
-            rerun_policy=config.rerun_policy,
+            trigger_registry=config.trigger_registry,
             requeue_policy=config.requeue_policy,
         )
 
@@ -106,7 +106,7 @@ class EngineRuntime:
         # 构建机器依赖拓扑（recovery 依赖 completion；dispatch 依赖 recovery）
         self._completion = CompletionMachine(
             store=self.store,
-            rerun_policy=config.rerun_policy,
+            trigger_registry=config.trigger_registry,
             channel=self.channel,
             resources=config.resources,
             in_flight=self._in_flight,
@@ -117,13 +117,13 @@ class EngineRuntime:
             channel=self.channel,
             resources=config.resources,
             in_flight=self._in_flight,
-            rerun_policy=config.rerun_policy,
+            trigger_registry=config.trigger_registry,
             completion=self._completion,
         )
         self._dispatch = DispatchMachine(
             store=self.store,
             scheduler=self.scheduler,
-            rerun_policy=config.rerun_policy,
+            trigger_registry=config.trigger_registry,
             resources=config.resources,
             channel=self.channel,
             in_flight=self._in_flight,

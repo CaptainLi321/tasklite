@@ -1,25 +1,16 @@
-"""v2 准入与重入队策略深模块。
-
-统一内敛：
-1. rerun 四策略矩阵评估（never / on_failure / every_run / on_input_change）
-   ——策略只作用于 successes/failed 拦截点，queue/in-flight 永远算数；
-2. 输入路径 mtime（整数微秒）严格晚于可信成功基线的比对与实例级 stat 缓存；
-3. 任务级默认策略（discovery 注入面）的入队规范化；
-4. 重入队节奏接缝（RequeuePolicy）：重试节奏的唯一出口，默认实现为
-   立即重入队——核心不出现任何节奏计算，未来延迟类策略经此插入。
-"""
+"""触发器求值与重入队接缝：核心仅负责配置、继承与派发接线。"""
 from __future__ import annotations
 
-import os
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 
-from ..models.state import job_uid_from_snapshot
-from ..utils.clock import mtime_ns_to_us, parse_utc_iso_to_us
-
-_UNSET = object()
+from ..models.job import Job
+from ..models.task import TaskRegistry, validate_trigger
+from ..models.trigger import TriggerContext
+from ..utils.clock import parse_utc_iso_to_us
 
 
 def extract_trusted_metadata_timestamp_us(
@@ -67,232 +58,47 @@ class TerminalHistory(Protocol):
     def failed(self) -> Mapping[str, dict]: ...
 
 
-class PreflightAction(str, Enum):
-    """预检判定行动。"""
-
-    RUN = "run"    # 放行：新作业运行，或策略豁免重跑
-    SKIP = "skip"  # 拦截：命中历史终态且无豁免，跳过执行
-
-
-class DecisionReason(str, Enum):
-    """预检判定决策归因。"""
-
-    FRESH = "fresh"                        # 全新作业（未命中 successes 亦未命中失败档案）
-    EVERY_RUN = "every_run"                # 显式/默认 every_run 策略豁免重跑
-    ON_FAILURE_MATCH = "on_failure_match"  # 命中失败档案且策略为 on_failure 放行重跑
-    INPUT_CHANGED = "input_changed"        # 命中 successes 但输入文件指纹发生变化，放行重跑
-    INPUT_UNCHANGED = "input_unchanged"    # 命中 successes 且输入文件指纹无变化，拦截跳过
-    SUCCESS_BLOCKED = "success_blocked"    # 命中 successes 且策略为 never/on_failure，拦截跳过
-    FAILED_BLOCKED = "failed_blocked"      # 命中失败档案且策略为 never，拦截跳过
-
-
-@dataclass(frozen=True)
-class PreflightDecision:
-    """预检策略评估结果（不可变值对象）。"""
-
-    action: PreflightAction
-    reason: DecisionReason
-    effective_rerun: str
-    input_changed: bool | None = None
-
-    @property
-    def should_skip(self) -> bool:
-        """是否应当跳过（拦截）。"""
-        return self.action == PreflightAction.SKIP
-
-    @property
-    def should_run(self) -> bool:
-        """是否应当放行（运行或重跑）。"""
-        return self.action == PreflightAction.RUN
-
-
-class RerunPolicy:
-    """rerun 策略矩阵深模块（评估、输入指纹比对与任务级默认策略注入）。
-
-    策略只作用于 successes/failed 拦截点：命中历史终态的作业按矩阵判定拦截
-    或豁免重跑；queue/in-flight 身份永远算数（同一轮内不重复派发）。
-    """
+class TriggerRegistry:
+    """触发器名称注册与主进程求值的唯一出口。"""
 
     def __init__(
         self,
-        discovery_rerun: Mapping[str, str] | None = None,
         *,
-        enable_stat_cache: bool = False,
+        tasks: TaskRegistry | None = None,
+        functions: Mapping[str, Callable[[TriggerContext], bool]] | None = None,
     ) -> None:
-        self.discovery_rerun: Mapping[str, str] = (
-            discovery_rerun if discovery_rerun is not None else {}
-        )
-        self.enable_stat_cache: bool = enable_stat_cache
-        self._stat_cache: dict[str, os.stat_result | None] = {}
+        self.tasks = tasks
+        self.functions = dict(functions or {})
 
-    def clear_stat_cache(self) -> None:
-        """清空实例级文件 stat 缓存。"""
-        self._stat_cache.clear()
+    def register(self, name: str, fn: Callable[[TriggerContext], bool]) -> None:
+        validate_trigger(name)
+        if name in self.functions:
+            raise ValueError(f"trigger {name!r} already registered")
+        if not callable(fn):
+            raise TypeError("trigger function must be callable")
+        self.functions[name] = fn
 
     def normalize_job_snapshot(self, job_snapshot: dict, task_type: str) -> bool:
-        """入队与 Spawn 时的 Job 字典规范化（注入任务级默认策略）。
-
-        仅在 job_snapshot['rerun'] is None 时注入默认策略；显式指定的 'never'
-        或其它策略一律尊重。
-        """
-        disc_rerun = self.discovery_rerun.get(task_type)
-        if disc_rerun and job_snapshot.get("rerun") is None:
-            job_snapshot["rerun"] = disc_rerun
-            return True
-        return False
-
-    def check_input_changed(
-        self,
-        success_metadata: Mapping[str, Any] | None,
-        *,
-        last_succeeded_at_us: Any = _UNSET,
-    ) -> bool:
-        """比对可信成功基线微秒时间（last_succeeded_at_us）与输入路径当前磁盘 mtime_us。
-
-        任一输入路径的 mtime_us 严格晚于基线时间（或缺乏可信基线、无有效输入列表、
-        文件缺失）→ 视为变化（True）→ 放行重跑；全部 mtime_us <= baseline_us → False。
-        """
-        if last_succeeded_at_us is _UNSET:
-            baseline_us = extract_trusted_metadata_timestamp_us(success_metadata)
-        elif (
-            isinstance(last_succeeded_at_us, int)
-            and not isinstance(last_succeeded_at_us, bool)
-        ):
-            baseline_us = last_succeeded_at_us
-        else:
-            baseline_us = None
-
-        if baseline_us is None:
-            return True
-
-        prev_inputs = (
-            success_metadata.get("inputs")
-            if isinstance(success_metadata, Mapping)
-            else None
-        )
-        if not isinstance(prev_inputs, list) or not prev_inputs:
-            return True
-        for path in prev_inputs:
-            if not isinstance(path, str) or not path:
-                return True
-            try:
-                if self.enable_stat_cache:
-                    if path not in self._stat_cache:
-                        try:
-                            self._stat_cache[path] = os.stat(path)
-                        except OSError:
-                            self._stat_cache[path] = None
-                    st = self._stat_cache[path]
-                    if st is None:
-                        return True
-                else:
-                    st = os.stat(path)
-            except OSError:
-                return True
-            if mtime_ns_to_us(st.st_mtime_ns) > baseline_us:
-                return True
-        return False
-
-    def evaluate(
-        self,
-        job_snapshot_or_rerun: dict | str | None,
-        *,
-        task_type: str | None = None,
-        success_metadata: dict | None = None,
-        is_success: bool = False,
-        is_failed: bool = False,
-        baseline_lookup: Callable[[], int | None] | None = None,
-    ) -> PreflightDecision:
-        """评估作业是否应当被拦截或放行重跑。
-
-        ``baseline_lookup`` 惰性返回可信成功基线（整数微秒），仅在
-        on_input_change 命中 successes 时调用；缺省时从 metadata 提取。
-        """
-        if isinstance(job_snapshot_or_rerun, dict):
-            rerun_raw = job_snapshot_or_rerun.get("rerun")
-            actual_task_type = task_type or job_snapshot_or_rerun.get("task_type")
-        else:
-            rerun_raw = job_snapshot_or_rerun
-            actual_task_type = task_type
-
-        # 任务级默认策略兜底（未显式指定时）
-        if rerun_raw is None and actual_task_type and actual_task_type in self.discovery_rerun:
-            rerun = self.discovery_rerun[actual_task_type]
-        else:
-            rerun = rerun_raw or "never"
-
-        # 未命中历史集合
-        if not is_success and not is_failed:
-            return PreflightDecision(
-                action=PreflightAction.RUN,
-                reason=DecisionReason.FRESH,
-                effective_rerun=rerun,
-            )
-
-        if rerun == "every_run":
-            return PreflightDecision(
-                action=PreflightAction.RUN,
-                reason=DecisionReason.EVERY_RUN,
-                effective_rerun=rerun,
-            )
-
-        if rerun == "on_failure":
-            if is_failed:
-                return PreflightDecision(
-                    action=PreflightAction.RUN,
-                    reason=DecisionReason.ON_FAILURE_MATCH,
-                    effective_rerun=rerun,
-                )
-            return PreflightDecision(
-                action=PreflightAction.SKIP,
-                reason=DecisionReason.SUCCESS_BLOCKED,
-                effective_rerun=rerun,
-            )
-
-        if rerun == "on_input_change":
-            if is_failed:
-                return PreflightDecision(
-                    action=PreflightAction.RUN,
-                    reason=DecisionReason.ON_FAILURE_MATCH,
-                    effective_rerun=rerun,
-                )
-            if is_success:
-                baseline = baseline_lookup() if baseline_lookup is not None else _UNSET
-                changed = self.check_input_changed(
-                    success_metadata,
-                    last_succeeded_at_us=baseline,
-                )
-                if changed:
-                    return PreflightDecision(
-                        action=PreflightAction.RUN,
-                        reason=DecisionReason.INPUT_CHANGED,
-                        effective_rerun=rerun,
-                        input_changed=True,
-                    )
-                return PreflightDecision(
-                    action=PreflightAction.SKIP,
-                    reason=DecisionReason.INPUT_UNCHANGED,
-                    effective_rerun=rerun,
-                    input_changed=False,
-                )
-            return PreflightDecision(
-                action=PreflightAction.RUN,
-                reason=DecisionReason.FRESH,
-                effective_rerun=rerun,
-            )
-
-        # 默认 "never"
-        if is_success:
-            return PreflightDecision(
-                action=PreflightAction.SKIP,
-                reason=DecisionReason.SUCCESS_BLOCKED,
-                effective_rerun=rerun,
-            )
-        return PreflightDecision(
-            action=PreflightAction.SKIP,
-            reason=DecisionReason.FAILED_BLOCKED,
-            effective_rerun=rerun,
-        )
+        """摄入时落实 Task 五项规格，显式资源键覆盖模板默认。"""
+        task = self.tasks.get(task_type) if self.tasks is not None else None
+        defaults = {
+            "resources": dict(task.resources) if task else {},
+            "max_retries": task.max_retries if task else 3,
+            "timeout_seconds": task.timeout_seconds if task else 3600,
+            "timeout_is_transient": task.timeout_is_transient if task else False,
+            "trigger": task.trigger if task else "once",
+        }
+        changed = False
+        for key, value in defaults.items():
+            if key == "resources":
+                value.update(job_snapshot.get(key) or {})
+                if value != job_snapshot.get(key):
+                    changed = True
+                job_snapshot[key] = value
+            elif job_snapshot.get(key) is None:
+                job_snapshot[key] = value
+                changed = True
+        return changed
 
     def admit(
         self,
@@ -300,25 +106,32 @@ class RerunPolicy:
         history: TerminalHistory,
         *,
         baseline_lookup: Callable[[str], int | None] | None = None,
-    ) -> PreflightDecision:
-        """统一极窄准入判定入口：从终态历史契约提取上下文并执行评估。
-
-        ``history`` 为 ``TerminalHistory`` 契约（successes/failed 视图，
-        PipelineState 满足；调用方传 ``store.state``）。
-        """
-        uid = job_uid_from_snapshot(job_snapshot)
-        success_hit = uid in history.successes
-        failed_hit = uid in history.failed
-        success_metadata = history.successes.get(uid) if success_hit else None
-        return self.evaluate(
-            job_snapshot,
-            success_metadata=success_metadata,
-            is_success=success_hit,
-            is_failed=failed_hit,
-            baseline_lookup=(
-                (lambda: baseline_lookup(uid)) if baseline_lookup is not None else None
+    ) -> bool:
+        """依赖就绪后构造隔离快照；任何判定错误原样向外抛出。"""
+        job = Job.from_dict(copy.deepcopy(job_snapshot))
+        name = job.trigger or "once"
+        try:
+            fn = self.functions[name]
+        except KeyError:
+            raise ValueError(f"unregistered trigger {name!r}") from None
+        uid = job.uid
+        metadata = history.successes.get(uid)
+        ctx = TriggerContext(
+            job=job,
+            has_succeeded=uid in history.successes,
+            has_failed=uid in history.failed,
+            success_metadata=(
+                MappingProxyType(copy.deepcopy(metadata)) if metadata is not None else None
+            ),
+            last_succeeded_at_us=(
+                baseline_lookup(uid)
+                if baseline_lookup is not None and uid in history.successes else None
             ),
         )
+        result = fn(ctx)
+        if type(result) is not bool:
+            raise TypeError(f"trigger {name!r} must return bool, got {type(result).__name__}")
+        return result
 
 
 @dataclass(frozen=True)
@@ -377,13 +190,10 @@ class ImmediateRequeuePolicy(RequeuePolicy):
 
 
 __all__ = [
-    "DecisionReason",
     "ImmediateRequeuePolicy",
-    "PreflightAction",
-    "PreflightDecision",
     "RequeuePlan",
     "RequeuePolicy",
-    "RerunPolicy",
+    "TriggerRegistry",
     "TerminalHistory",
     "extract_trusted_metadata_timestamp_us",
     "is_trusted_success_metadata",

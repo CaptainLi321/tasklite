@@ -48,7 +48,7 @@ class TestSchedFieldsMatchWhitelist:
         self.scheduler = JobScheduler(resources={})
 
     def test_same_content_matches(self):
-        job = Job("t", "j", rerun="every_run", resources={"a": 1.0}, depends_on=["other::x"])
+        job = Job("t", "j", trigger="always", resources={"a": 1.0}, depends_on=["other::x"])
         jd = job.to_dict()
         assert self.scheduler._sched_fields_match(job, jd) is True
 
@@ -70,7 +70,7 @@ class TestSchedFieldsMatchWhitelist:
         jd = dict(job.to_dict())
         jd["attempt_no"] = 4
         jd["activation_no"] = 2
-        jd["rerun"] = "every_run"
+        jd["trigger"] = "always"
         jd["payload"] = {"k": "v2"}
         assert self.scheduler._sched_fields_match(job, jd) is True
 

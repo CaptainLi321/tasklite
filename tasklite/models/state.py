@@ -53,6 +53,7 @@ class PipelineState:
         self._failed_uids: set[str] = set(self._failed)
         self._queue_uids: set[str] = {job_uid_from_snapshot(j) for j in self._queue}
         self._in_flight_uids: set[str] = set()
+        self._trigger_skipped_uids: set[str] = set()
 
     @property
     def successes(self) -> dict[str, dict[str, Any]]:
@@ -91,6 +92,7 @@ class PipelineState:
             self._queue[0:0] = list(job_snapshots)
         else:
             self._queue.extend(job_snapshots)
+        self._trigger_skipped_uids.difference_update(job_uid_from_snapshot(j) for j in job_snapshots)
         self._queue_uids.update(job_uid_from_snapshot(j) for j in job_snapshots)
         if __debug__:
             self._assert_uids_consistent()
@@ -135,6 +137,7 @@ class PipelineState:
         """整体替换队列（死锁批量移除肇事者场景），重建 uid 索引。"""
         self._queue = list(job_snapshots)
         self._queue_uids = {job_uid_from_snapshot(j) for j in self._queue}
+        self._trigger_skipped_uids.difference_update(self._queue_uids)
         if __debug__:
             self._assert_uids_consistent()
 
@@ -241,6 +244,7 @@ class PipelineState:
 
     def mark_success(self, job_uid: str, metadata: dict[str, Any]) -> None:
         """终态转移：uid → successes（成功）。单一入口维护 successes/failed 索引。"""
+        self._trigger_skipped_uids.discard(job_uid)
         self._failed.pop(job_uid, None)
         self._failed_uids.discard(job_uid)
         self._successes[job_uid] = copy.deepcopy(metadata)
@@ -250,6 +254,7 @@ class PipelineState:
 
     def mark_failed(self, job_uid: str, metadata: dict[str, Any]) -> None:
         """终态转移：uid → failed（失败档案）。单一入口维护 successes/failed 索引。"""
+        self._trigger_skipped_uids.discard(job_uid)
         self._successes.pop(job_uid, None)
         self._success_uids.discard(job_uid)
         self._failed[job_uid] = copy.deepcopy(metadata)
@@ -298,6 +303,23 @@ class PipelineState:
     def queue_uids(self) -> set[str]:
         """队列 uid 的活索引。"""
         return self._queue_uids
+
+    @property
+    def trigger_skipped_uids(self) -> frozenset[str]:
+        """本次 run 中触发条件判定无需执行的依赖就绪标记。"""
+        return frozenset(self._trigger_skipped_uids)
+
+    def mark_trigger_skipped(self, job_uid: str) -> None:
+        """仅在跳过提交成功后记录；不伪造历史成功。"""
+        self._trigger_skipped_uids.add(job_uid)
+
+    def dependency_ready(self, job_uid: str) -> bool:
+        """活跃候选优先于历史终态与本批无需执行的判定。"""
+        return (
+            job_uid not in self._queue_uids
+            and job_uid not in self._in_flight_uids
+            and (job_uid in self._success_uids or job_uid in self._trigger_skipped_uids)
+        )
 
     @property
     def success_uids(self) -> set[str]:

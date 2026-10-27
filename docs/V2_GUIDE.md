@@ -76,7 +76,7 @@ pipeline.register_task("download", download_handler, resources={"api": 1.0})  # 
 
 Job 的字段按「规格位 / 实例位」归位：
 
-- **规格位**（可覆盖 Task 默认）：`task_type` / `job_id` / `payload` / `resources` / `depends_on` / `max_retries` / `timeout_seconds` / `timeout_is_transient` / `rerun`；
+- **规格位**（可覆盖 Task 默认）：`task_type` / `job_id` / `payload` / `resources` / `depends_on` / `max_retries` / `timeout_seconds` / `timeout_is_transient` / `trigger`；
 - **实例位**（框架运行期管理）：
   - `attempt_no`——本次激活内尝试序号，**1 起始含首次执行**；预算判定：允许执行条件 `attempt_no <= max_retries + 1`；
   - `activation_no`——激活代，每次从 successes/failed 拦截点放行重跑时 +1（初激活为 1）；
@@ -90,12 +90,16 @@ job = Job(
     payload={"url": "https://example.com/1.jpg"},   # 须可 JSON 序列化
     max_retries=3,                                   # 覆盖 Task 默认；0 = 任何失败直接进失败档案
     depends_on=[],                                   # 上游 uid 列表（DAG 依赖）
-    rerun="never",                                   # 跨会话重跑策略，None=未指定哨兵
+    trigger=None,                                   # 跨会话重跑策略，None=未指定哨兵
 )
 job.uid          # "download::img_001"——身份不变式
 ```
 
-`rerun` 四策略：`"never"`（successes/failed 命中即跳过，默认）/ `"on_failure"`（failed 命中重跑）/ `"every_run"`（命中都重跑，成功 REPLACE successes 行且 success_count+1）/ `"on_input_change"`（successes 命中比对输入指纹）。`None` 哨兵可被任务级默认策略（`set_discovery_rerun` 注入面）覆盖，显式值一律尊重。
+`trigger` 在依赖就绪后、出队与开启 Attempt 前于主进程求值；新作业与历史作业统一处理。内置名称为 `once`（默认，无成功或失败历史才执行）、`on_failure`（未成功则执行）、`always`（每次入队执行，Discovery 默认）、`on_input_change`（有可信成功时，任一声明输入自身 `mtime_us` 严格晚于成功完成时间才执行）。输入时间相等不触发；缺可信基线保守执行，可信基线下空输入或缺路径直接报错并保留候选。
+
+`Job` 的 `resources / max_retries / timeout_seconds / timeout_is_transient / trigger` 均以 `None` 表示未指定，在摄入时继承 `Task` 的对应规格；资源按键合并，显式同名键覆盖模板。`Task` 默认值依次为 `{}`、`3`、`3600`、`False`、`"once"`。快照保留未解析的 `None`，恢复后仍可继承；已解析规格随队列持久化。
+
+运行前可用 `pipeline.register_trigger("name", fn)` 注册 `Callable[[TriggerContext], bool]`，Task 与 Job 仅保存名称。`TriggerContext` 提供隔离的 `job` 快照、`has_succeeded`、`has_failed`、只读 `success_metadata` 与 `last_succeeded_at_us`。禁止覆盖内置或重复名称，未注册名称、回调异常与非 `bool` 返回值使 `run()` 原样抛错、保留候选并回收在途任务，不消耗重试预算或写入失败档案。返回 `False` 正常跳过，本次 run 的下游继续流转；该就绪标记不跨 run 持久化。同次激活的故障重试（`attempt_no > 1`）不再求值。
 
 ### Attempt：执行轨迹（append-only 旁路面）
 
@@ -109,7 +113,7 @@ job.uid          # "download::img_001"——身份不变式
 | `succeeded` | 本次执行成功 |
 | `failed` | 本次执行失败且耗尽预算（job 进失败档案） |
 | `requeued` | 本次执行以重入队收尾（瞬态失败/瞬态信号，job 继续重试） |
-| `skipped` | 激活被终态拦截点跳过（如 successes 命中且策略为 never） |
+| `skipped` | 激活被终态拦截点跳过（如 successes 命中且策略为 once） |
 
 **旁路观测面定位**：attempts 不参与六集合互斥——successes/failed 仍按 uid 唯一终态，「最终状态唯一」与「历史可追溯」由此解耦。查询经后端只读口：
 
@@ -198,7 +202,7 @@ pipeline.stop()
 |---|---|
 | `ctx.spawn(Job(...))` | 入队子 job（运行期派生唯一合法通道） |
 | `ctx.declare_output(path)` / `ctx.declare_cache(path)` | 声明产物 / 临时半成品（返回解析后规范绝对路径，应使用返回值写文件） |
-| `ctx.declare_input(path)` | 声明输入（校验存在性并记录规范绝对路径，联动 trigger / `rerun="on_input_change"`） |
+| `ctx.declare_input(path)` | 声明输入（校验存在性并记录规范绝对路径，联动 trigger / `trigger="on_input_change"`） |
 | `ctx.get_cursor(key)` / `ctx.set_cursor(key, value)` | 高水位游标读写（成功时原子提交；`value=None` 删除） |
 | `ctx.suspend_resource(name, seconds)` | 全局挂起资源（429/配额熔断，跨进程跨重启持久化） |
 | `ctx.has_succeeded(job_uid)` / `ctx.has_failed(job_uid)` / `ctx.succeeded_or_failed_job_uids()` | 成功/失败档案快照查询；并集不含 skipped、队列成员或 Attempt 历史（派发时刻快照，不实时刷新） |
@@ -229,7 +233,7 @@ pipeline.retry_failure("download::img_001")
 
 - **`FailureEntry`**：`job_uid`、`error_message`（原始错误消息/错误码）、`metadata`（完整档案元数据视图，含 `error_category` 分类码）、`payload`（原始业务 payload 快照——补跑无需外部反查参数；无可存快照时为 None）。
 - **`clear_failures(task_types=None, *, keep_fatal=True)`**：按 task_type 前缀匹配删除；`keep_fatal=False` 连确定性失败一并清理。
-- **`retry_failure(job_uid)`**：失败档案的人工补跑通道。激活代按拦截点放行语义推进——重建作业的 `activation_no` 取该 job_uid 在 attempts 轨迹中的最大激活代 +1、`attempt_no` 归 1（与 every_run 豁免放行同构，保证 attempts 表 `(activation_no, attempt_no)` 逻辑键不撞号）；payload 取档案快照，先入队后删行（崩溃窗口至多留下 queue∩failed 并存，由加载期修复收敛，不丢作业）。
+- **`retry_failure(job_uid)`**：失败档案的人工补跑通道。激活代按拦截点放行语义推进——重建作业的 `activation_no` 取该 job_uid 在 attempts 轨迹中的最大激活代 +1、`attempt_no` 归 1（与 always 触发放行同构，保证 attempts 表 `(activation_no, attempt_no)` 逻辑键不撞号）；payload 取档案快照，先入队后删行（崩溃窗口至多留下 queue∩failed 并存，由加载期修复收敛，不丢作业）。
 
 **与 attempts 轨迹的关系**：failed 表回答「当前终态是什么」（每 uid 至多一行，成功即被 successes 侧取代），attempts 表回答「历史上每次执行发生了什么」（append-only，永不删行）。`retry_failure` 补跑后，attempts 中旧的 `outcome="failed"` 行保留为轨迹证据，新激活以新 `(activation_no, attempt_no)` 追加——「最终状态唯一」与「历史可追溯」经两张面解耦。
 
@@ -321,7 +325,7 @@ Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」�
 | `ErrorTaxonomy`（taxonomy.py） | `ErrorClassifier`（errorclass.py） |
 | `TaskLite.list_suspends` | `TaskLite.list_suspensions` |
 | `pop_next_runnable` | `scan_next_runnable` |
-| `AdmissionPolicy`（policy.py） | `RerunPolicy`（admission.py） |
+| `AdmissionPolicy`（policy.py） | `TriggerRegistry`（admission.py） |
 | `BackoffGovernor` / `plan_retry` 退避计算 | 删除——`RequeuePolicy` seam 接管（默认 `ImmediateRequeuePolicy`） |
 
 其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`seed_cursor` / `content_fingerprint` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。成功档案 Python API 现使用 `successes` / `load_successes` / `delete_successes` / `seed_successes`（状态集合属性为 `PipelineState.success_uids`）；`AttemptOutcome` 使用 `success`、`will_retry`、`metadata`，`ExecutionResult` 与 `JobContext` 的 Job 对象列表使用 `spawned_jobs`。运行统计 `EMPTY_STATS` 使用 `succeeded` 与 `lock_conflict_reruns`；资源公开属性对齐为 `RateLimitResource.interval_seconds` 与 `CapacityResource.max_capacity`；`register_discovery` 分组键参数为 `group_key_func`；顶层包公开导出 `SuspendEntry`。SQL 使用 `successes`、`attempts.error_message`，worker 信封使用 `spawned_jobs/error_message`；Job 快照外层使用 `timeout_seconds`，专属入口拒绝旧字段。执行身份与文件名编码使用 `execution_id` 和 `encode_job_uid_filename`，IPC 文件名字节保持不变。

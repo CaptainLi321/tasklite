@@ -9,6 +9,8 @@ DRAINING / ABORTING 停机语义（确定性 fake 进程驱动）。
 
 from __future__ import annotations
 
+from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +19,7 @@ from typing import Any
 import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
-from tasklite.engine.admission import ImmediateRequeuePolicy, RerunPolicy
+from tasklite.engine.admission import ImmediateRequeuePolicy, TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.config import RunConfig
 from tasklite.engine.errorclass import ErrorClassifier
@@ -194,7 +196,7 @@ class RuntimeEnv:
                 channel=ExecutionChannel(self.ipc_dir),
                 classifier=ErrorClassifier(),
                 governor=DeadlockGovernor(),
-                rerun_policy=RerunPolicy(),
+                trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
                 requeue_policy=ImmediateRequeuePolicy(),
                 output_roots=tmp_path,
                 strict_picklable=strict_picklable,

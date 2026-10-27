@@ -521,7 +521,7 @@ class SQLiteStateBackend(AbstractStateBackend):
 
         失败时 on-disk 队列不变。同一事务内 ``DELETE FROM successes``——重跑
         任务失败时 successes 里的旧成功记录必须作废（最终状态唯一）；否则磁盘
-        successes∩failed 并存，破坏全局互斥。事务内单出口、原子、幂等（never
+        successes∩failed 并存，破坏全局互斥。事务内单出口、原子、幂等（once
         任务失败时 successes 本无该行，DELETE no-op）。
         """
         try:

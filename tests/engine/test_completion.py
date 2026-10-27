@@ -8,13 +8,15 @@ settle_reaped / settle_aborted 批量结算。
 
 from __future__ import annotations
 
+from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
-from tasklite.engine.admission import RerunPolicy
+from tasklite.engine.admission import TriggerRegistry
 from tasklite.engine.channel import (
     ArtifactCleanupMode,
     ExecutionChannel,
@@ -77,7 +79,7 @@ class CompletionEnv:
         self.channel = ExecutionChannel(self.ipc_dir)
         self.completion = CompletionMachine(
             store=self.store,
-            rerun_policy=RerunPolicy(),
+            trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             channel=self.channel,
             resources=self.resources,
             in_flight=self.in_flight,
@@ -85,6 +87,9 @@ class CompletionEnv:
         )
 
     def track_entry(self, job: Job, *, lease=None, attempt_id=None) -> InFlightJob:
+        snapshot = job.to_dict()
+        self.store.finalize_intake_snapshot(snapshot, job.task_type)
+        job.__dict__.update(Job.from_dict(snapshot).__dict__)
         if lease is None:
             lease = self.resources.reserve(job.task_type, job.resources, job_uid=job.uid)
         entry = InFlightJob(
@@ -358,7 +363,7 @@ class TestSpawnedJobs:
         env.store.state.register_in_flight("child::x")
         env.store.apply_success("child::x", {}, attempt_id=env.open_attempt(Job("child", "x")))
         # X 重跑中（queue，every_run 放行重跑）
-        env.store.state.spawn_jobs([Job("child", "x", rerun="every_run").to_dict()])
+        env.store.state.spawn_jobs([Job("child", "x", trigger="always").to_dict()])
 
         parent = Job("parent", "p1")
         entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
@@ -366,7 +371,7 @@ class TestSpawnedJobs:
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
-                spawned_jobs=[Job("child", "x", rerun="every_run")],
+                spawned_jobs=[Job("child", "x", trigger="always")],
             ),
             attempt_id=entry.attempt_id,
         )
@@ -386,7 +391,7 @@ class TestSpawnedJobs:
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
-                spawned_jobs=[Job("child", "y", rerun="every_run",
+                spawned_jobs=[Job("child", "y", trigger="always",
                               timeout_seconds=29, payload={"timeout_seconds": "业务时限"})],
             ),
             attempt_id=entry.attempt_id,

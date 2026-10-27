@@ -403,50 +403,26 @@ class TestRegisterResource:
                 p.register_resource(CapacityResource("gpu", 1.0))
 
 
-class TestSetDiscoveryRerun:
-    """任务级默认 rerun 注入面（discovery 宿主接缝）。"""
+class TestTaskTriggerDefaults:
+    """触发器默认规格与显式覆盖。"""
 
-    def test_default_rerun_injected_on_enqueue(self, tmp_path):
+    def test_default_trigger_injected_on_enqueue(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.register_task("discover", ok_handler)
-        p.set_discovery_rerun("discover", "every_run")
-        p.enqueue([Job("discover", "scan")])
-        (row,) = p.backend.load_queue()
-        assert row["rerun"] == "every_run"
+        p.register_task("discover", ok_handler, trigger="always")
+        p.enqueue(Job("discover", "scan"))
+        assert p.backend.load_queue()[0]["trigger"] == "always"
 
-    def test_explicit_rerun_respected(self, tmp_path):
+    def test_explicit_trigger_respected(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.register_task("discover", ok_handler)
-        p.set_discovery_rerun("discover", "every_run")
-        p.enqueue([Job("discover", "scan", rerun="never")])
-        (row,) = p.backend.load_queue()
-        assert row["rerun"] == "never"
+        p.register_task("discover", ok_handler, trigger="always")
+        p.enqueue(Job("discover", "scan", trigger="once"))
+        assert p.backend.load_queue()[0]["trigger"] == "once"
 
-    def test_non_discovery_task_default_none(self, tmp_path):
+    def test_normal_task_defaults_once(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
-        p.enqueue([Job("fetch", "a")])
-        (row,) = p.backend.load_queue()
-        assert row["rerun"] is None
-
-    def test_invalid_rerun_rejected(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with pytest.raises(ValueError, match="rerun must be one of"):
-            p.set_discovery_rerun("discover", "sometimes")
-
-    def test_invalid_task_type_rejected(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with pytest.raises(ValueError, match="'::'"):
-            p.set_discovery_rerun("dis::cover", "every_run")
-
-    def test_overwrite_warns(self, tmp_path, caplog):
-        p = make_pipeline(tmp_path)
-        p.set_discovery_rerun("discover", "every_run")
-        with caplog.at_level("WARNING"):
-            p.set_discovery_rerun("discover", "on_failure")
-        assert any(
-            "Overwriting discovery rerun" in r.message for r in caplog.records
-        )
+        p.enqueue(Job("fetch", "a"))
+        assert p.backend.load_queue()[0]["trigger"] == "once"
 
 
 class TestRegisterTransientException:

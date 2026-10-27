@@ -363,7 +363,7 @@ tasklite/
 │   ├── recovery.py      # 崩溃检测与恢复 (RecoveryOrchestrator)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel / WorkerLaunchSpec)
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler / OrderingPolicy 排序 seam / Selection 候选准入 seam)
-│   ├── admission.py     # rerun 准入 (RerunPolicy) 与重入队节奏 (RequeuePolicy seam)
+│   ├── admission.py     # trigger 注册与求值 (TriggerRegistry) 与重入队节奏 (RequeuePolicy seam)
 │   ├── governor.py      # 死锁归因仲裁与依赖宽限，消费选择停摆事实 (DeadlockGovernor)
 │   ├── selection.py     # Skip 闭包与选择停摆图事实 (SelectionMachine)
 │   ├── in_flight.py     # 在途作业租约追踪 (InFlightTracker)

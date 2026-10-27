@@ -240,7 +240,7 @@ class DeadlockGovernor:
                     job = Job.from_dict(jd)
             except (KeyError, TypeError, ValueError):
                 continue
-            if all(dep in state.successes for dep in job.depends_on):
+            if all(state.dependency_ready(dep) for dep in job.depends_on):
                 return self._grant_or_expire(missing_uids, now_mono, effective_grace)
         return False
 
