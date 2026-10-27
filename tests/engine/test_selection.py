@@ -137,7 +137,7 @@ def test_default_and_empty_rule_selection_execute_everything(fake_process, tmp_p
 
     default = run(False)
     assert default[0] is ExitReason.COMPLETED
-    assert default[1]["completed"] == 2
+    assert default[1]["succeeded"] == 2
     assert default[2] == ["convert::b", "fetch::a"]
     assert default[3] == []
     assert run(True) == default  # 空规则与扩展前逐字节等价
@@ -166,7 +166,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     summary = pipeline.run()
 
     assert summary.exit_reason is ExitReason.COMPLETED
-    assert summary.stats["completed"] == 1
+    assert summary.stats["succeeded"] == 1
     assert summary.stats["failed"] == 0 and summary.stats["skipped"] == 0
     assert summary.stats["excluded_blocked"] == 1  # rank::r（下游阻塞）
     assert sorted(pipeline.backend.load_successes()) == ["fetch::a"]
@@ -183,7 +183,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     pipeline.selection()
     second = pipeline.run()
     assert second.exit_reason is ExitReason.COMPLETED
-    assert second.stats["completed"] == 2
+    assert second.stats["succeeded"] == 2
     assert sorted(pipeline.backend.load_successes()) == [
         "convert::b",
         "fetch::a",
@@ -219,15 +219,15 @@ def test_selection_chains_replaces_and_persists_across_runs(fake_process, tmp_pa
     assert pipeline.selection(Exclude(task_type="fetch")) is pipeline
     assert pipeline.selection(Exclude(task_type="convert")) is pipeline
 
-    assert pipeline.run().stats["completed"] == 1
+    assert pipeline.run().stats["succeeded"] == 1
     second = pipeline.run()  # 规则是 pipeline 属性：下一次 run 仍生效
     assert second.exit_reason is ExitReason.COMPLETED
-    assert second.stats["completed"] == 0
+    assert second.stats["succeeded"] == 0
     assert _queued(pipeline) == ["convert::b"]
 
     pipeline.selection()  # 重置后下一次 run 消费留队作业
     third = pipeline.run()
-    assert third.stats["completed"] == 1
+    assert third.stats["succeeded"] == 1
     assert sorted(pipeline.backend.load_successes()) == ["convert::b", "fetch::a"]
     assert _queued(pipeline) == []
 
@@ -260,7 +260,7 @@ def test_exclude_validation_and_unknown_task_type(fake_process, tmp_path):
     pipeline.selection(Exclude(task_type="never_registered"))
     pipeline.register_task("fetch", ok_handler)
     pipeline.enqueue(Job("fetch", "a"))
-    assert pipeline.run().stats["completed"] == 1
+    assert pipeline.run().stats["succeeded"] == 1
 
 
 def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
@@ -274,7 +274,7 @@ def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
 
     summary = pipeline.run()
 
-    assert summary.stats["completed"] == 1
+    assert summary.stats["succeeded"] == 1
     assert gpu.acquires == 0 and gpu.used == 0.0
     assert _queued(pipeline) == ["heavy::h"]
 
@@ -309,7 +309,7 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
     # 下一次 run 去掉 Exclude：t 自行执行，已熔断的环成员保持失败档案终态。
     pipeline.selection()
     second = pipeline.run()
-    assert second.stats["completed"] == 1
+    assert second.stats["succeeded"] == 1
     assert "excluded_t::a" in pipeline.backend.load_successes()
     assert sorted(pipeline.backend.load_failed()) == ["rank::b", "rank::c"]
 
@@ -490,7 +490,7 @@ def test_skip_root_and_downstream_are_terminal_skipped(fake_process, tmp_path):
     summary = pipeline.run()
 
     assert summary.exit_reason is ExitReason.COMPLETED
-    assert summary.stats["completed"] == 1
+    assert summary.stats["succeeded"] == 1
     assert summary.stats["skipped"] == 3
     assert summary.stats["failed"] == 0 and summary.stats["cascade_failed"] == 0
     # 跳过是终态：不进 successes、不进失败档案、也不留在 queue。
@@ -588,7 +588,7 @@ def test_skip_only_queue_completes_without_execution(fake_process, tmp_path):
 
     assert summary.exit_reason is ExitReason.COMPLETED
     assert summary.stats["skipped"] == 2
-    assert summary.stats["completed"] == 0
+    assert summary.stats["succeeded"] == 0
     assert _queued(pipeline) == []
     assert pipeline.backend.load_successes() == {} and pipeline.backend.load_failed() == {}
     assert pipeline.run().stats["skipped"] == 0
@@ -623,7 +623,7 @@ def test_spawned_skip_child_is_terminal_skipped(monkeypatch, tmp_path):
     summary = pipeline.run()
 
     assert summary.exit_reason is ExitReason.COMPLETED
-    assert summary.stats["completed"] == 1
+    assert summary.stats["succeeded"] == 1
     assert summary.stats["skipped"] == 1
     assert sorted(pipeline.backend.load_successes()) == ["fetch::parent"]
     assert _queued(pipeline) == []
@@ -676,7 +676,7 @@ def test_stale_result_spawn_skips_before_dispatch_or_arbitration(
     monkeypatch.setattr(pipeline._runtime._dispatch, "dispatch_job", dispatch_after_skip)
     summary = pipeline.run()
 
-    assert summary.stats["completed"] == 1 + following
+    assert summary.stats["succeeded"] == 1 + following
     assert summary.stats["skipped"] == len(spawned)
     assert _queued(pipeline) == []
     assert pipeline.backend.load_failed() == {}
@@ -710,7 +710,7 @@ def test_stale_result_spawn_skip_respects_stop_hook(monkeypatch, tmp_path, force
 
     summary = pipeline.run()
 
-    assert summary.stats["completed"] == 1
+    assert summary.stats["succeeded"] == 1
     assert summary.stats["skipped"] == 0
     assert _queued(pipeline) == ["skip_t::child"]
     assert pipeline.backend.load_attempts("skip_t::child") == []

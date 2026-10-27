@@ -343,7 +343,7 @@ class TestRejectGates:
 class TestOrphanProbeGate:
     """预检关 4——孤儿探测 defer（lock_conflict 瞬态信号）。"""
 
-    def _defer(self, tmp_path, probe_result, stats_key="deferred_orphan"):
+    def _defer(self, tmp_path, probe_result, stats_key="lock_conflict_reruns"):
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
@@ -361,7 +361,7 @@ class TestOrphanProbeGate:
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert "t::j1" in env.store.state.queue_uids
         assert env.store.state.queue[0]["job_id"] == "j1"
-        assert env.stats["deferred_orphan"] == 1
+        assert env.stats["lock_conflict_reruns"] == 1
         rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
         assert rt.dispatch_failures == 0
         assert rt.last_retry_error == ""
@@ -375,7 +375,7 @@ class TestOrphanProbeGate:
             tmp_path, OSError(errno.EACCES, "permission denied")
         )
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert env.stats["deferred_orphan"] == 1
+        assert env.stats["lock_conflict_reruns"] == 1
         assert "t::j1" in env.store.state.queue_uids
 
 

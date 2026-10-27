@@ -313,7 +313,7 @@ class EngineRuntime:
         全零计数 + should_terminate=True + 当前停机态与退出原因透传。"""
         return StepOutcome(
             dispatched_count=0,
-            completed_count=0,
+            settled_count=0,
             is_idle=True,
             should_wait=False,
             wait_time=0.0,
@@ -475,8 +475,8 @@ class EngineRuntime:
         arbitration = self._arbitrate_deadlock(last_outcome, store)
 
         # 3. Drain 回收在途结果并统一结算
-        completed_count = self._drain_and_settle()
-        if completed_count:
+        settled_count = self._drain_and_settle()
+        if settled_count:
             # 派生作业可能带 Skip 命中或依赖已跳过上游，下一拍先收敛跳过闭包
             self._skip_dirty = True
 
@@ -484,7 +484,7 @@ class EngineRuntime:
         is_idle = store.state.is_empty and not self._in_flight
         decision = decide_wait(LoopFacts(
             stop_mode=self._session.stop_mode, has_in_flight=bool(self._in_flight),
-            store_empty=store.state.is_empty, dispatched=dispatched, completed=completed_count,
+            store_empty=store.state.is_empty, dispatched=dispatched, settled=settled_count,
             has_runnable=(last_outcome.kind is not DispatchKind.NO_CANDIDATE
                           if last_outcome is not None else True),
             min_wait=(last_outcome.standstill.min_wait
@@ -499,7 +499,7 @@ class EngineRuntime:
         )
 
         return StepOutcome(
-            dispatched_count=dispatched, completed_count=completed_count,
+            dispatched_count=dispatched, settled_count=settled_count,
             is_idle=is_idle, should_wait=decision.should_wait,
             wait_time=decision.wait_time,
             deadlock_detected=arbitration.deadlock_detected,

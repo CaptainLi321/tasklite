@@ -262,7 +262,7 @@ class TestEngineRuntimeStepPump:
         assert isinstance(outcome, StepOutcome)
         assert outcome.is_idle is True
         assert outcome.dispatched_count == 0
-        assert outcome.completed_count == 0
+        assert outcome.settled_count == 0
         assert outcome.should_terminate is True
 
     def test_step_draining_and_aborting_modes(self, tmp_path):
@@ -314,7 +314,7 @@ class TestEngineRuntimeExecutionLifecycle:
         summary = env.runtime.execute()
 
         assert summary.exit_reason is ExitReason.COMPLETED
-        assert env.runtime.stats["completed"] == 1
+        assert env.runtime.stats["succeeded"] == 1
         assert "t::j1" in env.backend.load_successes()
         assert env.backend.load_queue() == []
         # attempt 收尾钩子经单一出口触发（成功形态值对象）
@@ -350,13 +350,13 @@ class TestEngineRuntimeExecutionLifecycle:
         first_run_id = runtime.session.run_id
         assert first_run_id
 
-        runtime.session.stats["completed"] = 5
+        runtime.session.stats["succeeded"] = 5
         runtime.request_stop(force=True)
 
         runtime.execute()
         assert runtime.session.run_id != first_run_id
         assert runtime.session.stop_mode == StopMode.NONE
-        assert runtime.session.stats["completed"] == 0
+        assert runtime.session.stats["succeeded"] == 0
 
     def test_strict_picklable_unpicklable_handler_fails(self, tmp_path):
         """strict 预检失败：TypeError 上抛且起止钩子均不触发。

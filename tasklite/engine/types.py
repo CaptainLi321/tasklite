@@ -14,12 +14,12 @@ from typing import Any
 from ..models.job import Job
 
 EMPTY_STATS = {
-    "completed": 0,
+    "succeeded": 0,
     "failed": 0,
     "retried": 0,
     "skipped": 0,
     "hook_errors": 0,
-    "deferred_orphan": 0,
+    "lock_conflict_reruns": 0,
     "interrupted_reruns": 0,
     "rate_limited_reruns": 0,
     "cascade_failed": 0,
@@ -32,7 +32,7 @@ EMPTY_STATS = {
 # 完备性由 tests/engine/test_types.py 的注册表遍历锁定。
 TRANSIENT_KIND_STAT_KEYS = {
     "interrupted": "interrupted_reruns",
-    "lock_conflict": "deferred_orphan",
+    "lock_conflict": "lock_conflict_reruns",
     "rate_limited": "rate_limited_reruns",
 }
 
@@ -108,7 +108,7 @@ class StepOutcome:
     """step() 单步事件泵的执行产物。"""
 
     dispatched_count: int
-    completed_count: int
+    settled_count: int
     is_idle: bool
     should_wait: bool
     wait_time: float

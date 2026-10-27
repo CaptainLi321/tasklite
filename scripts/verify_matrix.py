@@ -58,7 +58,7 @@ def main():
         stats = pipeline.stats
 
         assert stats is not None
-        assert stats["completed"] == 2, f"Expected 2 completed, got {stats['completed']}"
+        assert stats["succeeded"] == 2, f"Expected 2 succeeded, got {stats['succeeded']}"
         assert stats["failed"] == 0, f"Expected 0 failed, got {stats['failed']}"
         assert stats["retried"] == 1, f"Expected 1 retried, got {stats['retried']}"
         assert stats["skipped"] == 0

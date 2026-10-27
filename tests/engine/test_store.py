@@ -669,7 +669,7 @@ class TestRequeueTransient:
         ("kind", "stat_key"),
         [
             ("interrupted", "interrupted_reruns"),
-            ("lock_conflict", "deferred_orphan"),
+            ("lock_conflict", "lock_conflict_reruns"),
             ("rate_limited", "rate_limited_reruns"),
         ],
     )

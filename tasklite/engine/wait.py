@@ -26,7 +26,7 @@ class LoopFacts:
     has_in_flight: bool
     store_empty: bool
     dispatched: int
-    completed: int
+    settled: int
     # 本拍是否存在「无可运行候选」信号；无调度扫描（DRAINING）时视为 True
     # （不触发无候选等待分支）
     has_runnable: bool = True
@@ -55,7 +55,7 @@ def decide_wait(facts: LoopFacts) -> WaitDecision:
     if is_idle or facts.should_terminate:
         return WaitDecision(should_wait=False, wait_time=0.0)
     if facts.has_in_flight:
-        if facts.completed == 0:
+        if facts.settled == 0:
             return WaitDecision(should_wait=True, wait_time=IN_FLIGHT_POLL_SECONDS)
         return WaitDecision(should_wait=False, wait_time=0.0)
     if facts.deadlock_wait > 0:
@@ -64,4 +64,4 @@ def decide_wait(facts: LoopFacts) -> WaitDecision:
         return WaitDecision(should_wait=True, wait_time=min(facts.min_wait, _WAIT_CAP_SECONDS))
     if facts.worker_wait > 0:
         return WaitDecision(should_wait=True, wait_time=min(facts.worker_wait, _WAIT_CAP_SECONDS))
-    return WaitDecision(should_wait=(facts.dispatched == 0 and facts.completed == 0), wait_time=0.0)
+    return WaitDecision(should_wait=(facts.dispatched == 0 and facts.settled == 0), wait_time=0.0)

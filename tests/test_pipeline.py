@@ -623,7 +623,7 @@ class TestSixStepContract:
         p.stop()
 
         assert summary.exit_reason is ExitReason.COMPLETED
-        assert summary.stats["completed"] == 2
+        assert summary.stats["succeeded"] == 2
         assert sorted(p.backend.load_successes()) == ["fetch::a", "fetch::b"]
         assert events[0] == "run_start"
         assert events[-1] == "run_end:completed"
@@ -640,7 +640,7 @@ class TestSixStepContract:
         summary = p.run()
         assert summary.run_id
         assert summary.duration_seconds >= 0
-        assert p.stats["completed"] == 1
+        assert p.stats["succeeded"] == 1
 
     def test_run_reentry_guard(self, tmp_path):
         p = make_pipeline(tmp_path)

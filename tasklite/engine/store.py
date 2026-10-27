@@ -506,7 +506,7 @@ class StateStore:
                 self._state.update_cursors(cursor_updates)
             self._state.mark_success(job_uid, success_metadata)
             self._state.unregister_in_flight(job_uid)
-            self._record_stat("completed", 1)
+            self._record_stat("succeeded", 1)
             self._finish_attempt(attempt_id, outcome=ATTEMPT_SUCCEEDED)
             spawned_uids = [job_uid_from_snapshot(j) for j in spawned_snapshots]
             return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata, spawned_uids=spawned_uids)

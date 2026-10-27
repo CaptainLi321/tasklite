@@ -150,7 +150,7 @@ class TestCompleteJobSuccess:
         assert env.store.state.successes["t::j1"]["score"] == 100
         assert env.store.state.successes["t::j1"]["last_success_run_id"] == env.session.run_id
         assert env.store.state.successes["t::j1"]["inputs"][0]["path"] == "/data/in.csv"
-        assert env.stats["completed"] == 1
+        assert env.stats["succeeded"] == 1
         assert "t::j1" not in env.store.state.in_flight_uids
         assert cleaned == [("t::j1", ArtifactCleanupMode.SUCCESS)]
         # 收尾钩子恰好一次（成功语义）

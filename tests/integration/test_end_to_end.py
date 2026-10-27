@@ -159,7 +159,7 @@ class TestEndToEnd:
         p.stop()
 
         assert summary.exit_reason is ExitReason.COMPLETED
-        assert summary.stats["completed"] == 1
+        assert summary.stats["succeeded"] == 1
         meta = p.backend.load_successes()["work::item_alpha"]
         # successes 审计键：业务 meta 原样落盘 + 框架审计键（run_count /
         # inputs 指纹清单 / 归属 run）
@@ -230,7 +230,7 @@ class TestEndToEnd:
         assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
         assert [a.attempt_no for a in attempts] == [1, 2]
         assert [a.activation_no for a in attempts] == [1, 1]
-        assert summary.stats["completed"] == 1
+        assert summary.stats["succeeded"] == 1
 
     def test_retry_failure_manual_requeue_runs_to_success(self, tmp_path):
         p = _make_pipeline(tmp_path)
@@ -250,7 +250,7 @@ class TestEndToEnd:
 
         summary = p.run()
         p.stop()
-        assert summary.stats["completed"] == 1
+        assert summary.stats["succeeded"] == 1
         meta = p.backend.load_successes()["work::item_eps"]
         assert meta["recovered"] is True
         assert meta["success_count"] == 1
@@ -272,7 +272,7 @@ class TestEndToEnd:
         p.register_task("work", ok_with_input_handler)
         p.enqueue(Job("work", "item_eta", rerun="every_run"))
         first = p.run()
-        assert first.stats["completed"] == 1
+        assert first.stats["succeeded"] == 1
         assert p.backend.load_successes()["work::item_eta"]["success_count"] == 1
 
         # 第二会话重扫：successes 命中但 every_run 豁免放行 → 新激活重跑，
@@ -281,7 +281,7 @@ class TestEndToEnd:
         second = p.run()
         p.stop()
 
-        assert second.stats["completed"] == 1
+        assert second.stats["succeeded"] == 1
         assert p.backend.load_successes()["work::item_eta"]["success_count"] == 2
 
         attempts = p.backend.load_attempts("work::item_eta")
@@ -319,7 +319,7 @@ class TestEndToEnd:
             ("work::step_one", True, False),
             ("work::step_two", True, False),
         ]
-        assert summary.stats["completed"] == 2
+        assert summary.stats["succeeded"] == 2
         assert sorted(p.backend.load_successes()) == [
             "work::step_one",
             "work::step_two",
@@ -479,7 +479,7 @@ class TestRealSubprocessFaultScenarios:
         p.stop()
 
         successes = p.backend.load_successes()
-        assert summary.stats["completed"] == 2
+        assert summary.stats["succeeded"] == 2
         assert "gated::holder" in successes
         assert "gated_plain::waiter" in successes
 

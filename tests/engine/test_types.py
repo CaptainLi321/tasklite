@@ -22,12 +22,12 @@ from tasklite.engine.types import (
 )
 
 _EXPECTED_STAT_KEYS = {
-    "completed",
+    "succeeded",
     "failed",
     "retried",
     "skipped",
     "hook_errors",
-    "deferred_orphan",
+    "lock_conflict_reruns",
     "interrupted_reruns",
     "rate_limited_reruns",
     "cascade_failed",
@@ -50,11 +50,11 @@ class TestEmptyStats:
         """不变式：RunStats 是 EMPTY_STATS 的拷贝初始化——实例计数不得
         写穿模板，否则并发 run 之间统计互污。"""
         stats = RunStats()
-        stats["completed"] += 1
+        stats["succeeded"] += 1
         stats["failed"] = 7
-        assert EMPTY_STATS["completed"] == 0
+        assert EMPTY_STATS["succeeded"] == 0
         assert EMPTY_STATS["failed"] == 0
-        assert RunStats()["completed"] == 0
+        assert RunStats()["succeeded"] == 0
 
 
 class TestTransientKindRegistry:
@@ -131,7 +131,7 @@ class TestStepOutcome:
     def _outcome() -> StepOutcome:
         return StepOutcome(
             dispatched_count=1,
-            completed_count=1,
+            settled_count=1,
             is_idle=False,
             should_wait=True,
             wait_time=0.5,

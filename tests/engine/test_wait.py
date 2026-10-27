@@ -16,7 +16,7 @@ def facts(**overrides) -> LoopFacts:
         has_in_flight=False,
         store_empty=False,
         dispatched=0,
-        completed=0,
+        settled=0,
         has_runnable=True,
         min_wait=INF,
         worker_wait=0.0,
@@ -32,7 +32,7 @@ TABLE = [
     ("空闲：store 空且无在途 → 不等待", facts(store_empty=True), (False, 0.0)),
     ("governor 终止信号 → 不等待", facts(should_terminate=True), (False, 0.0)),
     ("在途无新完成 → 0.05 轮询", facts(has_in_flight=True), (True, 0.05)),
-    ("在途有新完成 → 立即下一拍", facts(has_in_flight=True, completed=2), (False, 0.0)),
+    ("在途有新完成 → 立即下一拍", facts(has_in_flight=True, settled=2), (False, 0.0)),
     ("死锁宽限等待 → 封顶 1.0", facts(deadlock_wait=7.0), (True, 1.0)),
     ("死锁宽限短等待 → 原值", facts(deadlock_wait=0.4), (True, 0.4)),
     ("无候选且有限 min_wait → 等待", facts(has_runnable=False, min_wait=0.3), (True, 0.3)),
@@ -42,9 +42,9 @@ TABLE = [
      facts(has_runnable=False, min_wait=INF, worker_wait=5.0), (True, 1.0)),
     ("资源挂起恢复等待 → 封顶 1.0", facts(worker_wait=30.0), (True, 1.0)),
     ("DRAINING 无扫描（has_runnable=True）→ 兜底分支短等待让出",
-     facts(stop_mode=StopMode.DRAINING, dispatched=0, completed=0), (True, 0.0)),
+     facts(stop_mode=StopMode.DRAINING, dispatched=0, settled=0), (True, 0.0)),
     ("兜底分支：本拍有派发 → 不等待", facts(dispatched=3), (False, 0.0)),
-    ("兜底分支：无派发无完成 → 短等待让出", facts(dispatched=0, completed=0), (True, 0.0)),
+    ("兜底分支：无派发无完成 → 短等待让出", facts(dispatched=0, settled=0), (True, 0.0)),
 ]
 
 

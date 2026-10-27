@@ -386,17 +386,17 @@ class CompletionMachine:
         返回成功结算的作业数。
         """
         store = self._store
-        completed_count = 0
+        settled_count = 0
         for handle, result in reaped:
             entry = self._in_flight.get(handle.job_uid)
             if entry is None:
                 continue
             try:
                 self.complete_job(entry, result)
-                completed_count += 1
+                settled_count += 1
             finally:
                 self._in_flight.settle(handle.job_uid, state=store.state)
-        return completed_count
+        return settled_count
 
     def settle_aborted(
         self,

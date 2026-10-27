@@ -65,7 +65,7 @@ class TestSessionLifecycle:
         session.begin("run-1")
         session.next_dispatch_no()
         session.next_dispatch_no()
-        session.stats["completed"] = 3
+        session.stats["succeeded"] = 3
         session.request_stop(force=True)
         session.fire_run_end("error")  # 置幂等标志
 
@@ -74,7 +74,7 @@ class TestSessionLifecycle:
         assert session.dispatch_no == 0
         assert session.stop_mode == StopMode.NONE
         assert isinstance(session.stats, RunStats)
-        assert session.stats["completed"] == 0
+        assert session.stats["succeeded"] == 0
         # begin 后 fire_run_end 重新可发（幂等标志已复位）
         fired = []
         session.on_run_end = fired.append
