@@ -1152,6 +1152,7 @@ def test_success_metadata_preserves_user_keys_and_overwrites_framework_keys():
     stored = backend.load_successes()["t::j"]
     assert stored == {
         **metadata,
+        "artifacts": {},
         "success_count": 1,
         "last_succeeded_at": "2026-05-01T00:00:09+00:00",
         "last_success_run_id": "actual",
@@ -1177,3 +1178,79 @@ def test_failure_normalization_keeps_user_keys_and_unknown_attempt_sentinel():
     assert normalized["nested"] == metadata["nested"]
     assert "error_category" not in metadata
     assert "attempt_no" not in metadata
+
+
+@pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
+def test_artifact_manifest_replaces_as_part_of_success_transaction(tmp_path, backend_kind):
+    from tasklite.backend import SQLiteStateBackend
+    from tasklite.models.artifact import ArtifactDeclaration
+
+    backend = InMemoryStateBackend() if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db")
+    state = PipelineState({}, {}, {}, [])
+    store = StateStore(backend, state)
+    uid = "t::artifacts"
+    declaration = ArtifactDeclaration(str(tmp_path / "report"), name="report")
+    anonymous = ArtifactDeclaration(str(tmp_path / "private"))
+    old = {"artifacts": {"old": {"path": str(tmp_path / "old")}}}
+    seed_aid = _open_running_attempt(backend, uid, execution_id="seed.1")
+    assert backend.commit_job_success(uid, old, attempt_id=seed_aid, finished_at="2026-01-01T00:00:01+00:00")
+    state.mark_success(uid, old)
+    aid = _open_running_attempt(backend, uid)
+    store.apply_success(
+        uid, {"artifacts": {"forged": {"path": "/fake"}}, "payload": {"artifacts": "business"}},
+        declared_artifacts=[declaration, anonymous], attempt_id=aid,
+    )
+    expected = {"report": {"path": declaration.path}}
+    assert state.successes[uid]["artifacts"] == expected
+    assert backend.load_successes()[uid]["artifacts"] == expected
+    assert state.successes[uid]["payload"] == {"artifacts": "business"}
+    aid = _open_running_attempt(backend, uid, execution_id="run_abc.2")
+    store.apply_success(uid, {"artifacts": expected}, attempt_id=aid)
+    assert state.successes[uid]["artifacts"] == {}
+    assert backend.load_successes()[uid]["artifacts"] == {}
+
+
+def test_artifact_manifest_does_not_change_before_success_commit(tmp_path):
+    from tasklite.models.artifact import ArtifactDeclaration
+
+    store, state, backend = _make_store()
+    old = {"artifacts": {"old": {"path": str(tmp_path / "old")}}}
+    seed_aid = _open_running_attempt(backend, execution_id="seed.1")
+    assert backend.commit_job_success("t::1", old, attempt_id=seed_aid, finished_at="2026-01-01T00:00:01+00:00")
+    state.mark_success("t::1", old)
+    store.set_backend(CommitFailureBackend(backend, failing=["commit_job_success"]))
+    aid = _open_running_attempt(backend)
+    with pytest.raises(_CommitCrashSignal):
+        store.apply_success(
+            "t::1", {}, declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
+            attempt_id=aid,
+        )
+    assert state.successes["t::1"] == old
+    assert backend.load_successes()["t::1"] == old
+
+
+def test_sqlite_artifact_publication_rolls_back_with_cursor_transaction(tmp_path):
+    import sqlite3
+    from tasklite.backend import SQLiteStateBackend
+    from tasklite.models.artifact import ArtifactDeclaration
+
+    db_path = tmp_path / "state.db"
+    backend = SQLiteStateBackend(db_path)
+    old = {"artifacts": {"old": {"path": str(tmp_path / "old")}}}
+    seed_aid = _open_running_attempt(backend, execution_id="seed.1")
+    assert backend.commit_job_success("t::1", old, attempt_id=seed_aid, finished_at="2026-01-01T00:00:01+00:00")
+    state = PipelineState(backend.load_successes(), {}, {}, [])
+    store = StateStore(backend, state)
+    aid = _open_running_attempt(backend)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TRIGGER reject_cursor BEFORE INSERT ON cursors BEGIN SELECT RAISE(ABORT, 'cursor unavailable'); END")
+    with pytest.raises(_CommitCrashSignal):
+        store.apply_success(
+            "t::1", {}, declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
+            attempt_id=aid, cursor_updates={"batch": "2"},
+            spawned_job_snapshots=[Job("child", "1").to_dict()],
+        )
+    assert backend.load_successes()["t::1"] == old
+    assert state.successes["t::1"] == old
+    assert backend.load_cursors() == {}
+    assert backend.load_queue() == []

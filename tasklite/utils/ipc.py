@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import unquote
 
+from ..models.artifact import ArtifactDeclaration, validate_artifact_declarations
+from .artifact import ArtifactPathPolicy
 from .encoding import encode_job_uid_filename
 from .jsonutil import dump, dumps, load, loads
 
@@ -201,22 +203,44 @@ class ArtifactJournal:
     def record_output(
         self, job_uid: str, out_path: str, *, cleanup: bool = True, kind: str = "output"
     ) -> None:
-        """追加一条输出声明到落盘文件（失败静默，尽力而为）。"""
+        """将现有内部调用转换为统一授权记录。"""
+        declaration = ArtifactDeclaration(
+            os.path.abspath(out_path),
+            delete_on_failure=bool(cleanup),
+            delete_on_success=kind == "cache",
+        )
+        try:
+            self._append_artifact(job_uid, declaration)
+        except OSError:
+            pass
+
+    def _append_artifact(self, job_uid: str, declaration: ArtifactDeclaration) -> None:
         if self.ipc_dir is None:
             return
         path = self.outputs_path(job_uid)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(
-                    dumps(
-                        {"path": out_path, "cleanup": bool(cleanup), "kind": kind}
-                    )
-                    + "\n"
-                )
-                f.flush()
-        except OSError:
-            pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(dumps(declaration.to_dict()) + "\n")
+            stream.flush()
+
+    def record_artifact(self, job_uid: str, declaration: ArtifactDeclaration) -> None:
+        """校验同执行授权与路径范围后追加；持久写入错误向调用者传播。"""
+        if self.ipc_dir is None:
+            raise ValueError("ipc_dir is required to record an artifact")
+        self._validate_artifact_path(declaration)
+        previous = self.read_artifacts(job_uid)
+        declarations = validate_artifact_declarations((*previous, declaration))
+        if len(declarations) > len(previous):
+            self._append_artifact(job_uid, declaration)
+
+    def _validate_artifact_path(self, declaration: ArtifactDeclaration) -> None:
+        policy = ArtifactPathPolicy(
+            output_roots=self.output_roots,
+            protected_roots=(self.ipc_dir,) if self.ipc_dir else (),
+        )
+        resolved = policy.resolve(declaration.path, sandbox=declaration.sandbox)
+        if resolved != declaration.path:
+            raise ValueError("artifact declaration must use the canonical path")
 
     def record_input_entry(self, job_uid: str, entry: dict) -> None:
         """追加一条输入声明条目到落盘文件。"""
@@ -354,32 +378,47 @@ class ArtifactJournal:
             pass
         return paths
 
+    def read_artifacts(self, job_uid: str) -> tuple[ArtifactDeclaration, ...]:
+        """严格读取本执行授权；缺失日志为空，旧格式或损坏记录拒绝发布。"""
+        if self.ipc_dir is None:
+            return ()
+        try:
+            stream = open(self.outputs_path(job_uid), encoding="utf-8")
+        except FileNotFoundError:
+            return ()
+        declarations: list[ArtifactDeclaration] = []
+        with stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                try:
+                    declaration = ArtifactDeclaration.from_dict(loads(line))
+                except (RecursionError, TypeError, ValueError) as error:
+                    raise ValueError(f"invalid artifact declaration for {job_uid}") from error
+                if declaration.name is not None:
+                    self._validate_artifact_path(declaration)
+                declarations.append(declaration)
+        return validate_artifact_declarations(declarations)
+
     def read_outputs(self, job_uid: str) -> list[tuple[str, bool, str]]:
-        """读取一个 job 的全部已声明输出 (path, cleanup, kind)。"""
+        """为现有验证与清理提供统一授权值的 tuple 投影，坏行不授予删除权。"""
         if self.ipc_dir is None:
             return []
-        path = self.outputs_path(job_uid)
         outputs: list[tuple[str, bool, str]] = []
         try:
-            if path.exists():
-                with open(path, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            data = loads(line)
-                            if isinstance(data, dict) and isinstance(data.get("path"), str):
-                                kind = data.get("kind")
-                                if not isinstance(kind, str):
-                                    continue
-                                outputs.append((
-                                        data["path"],
-                                        bool(data.get("cleanup", True)),
-                                        kind,
-                                ))
-                        except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
-                            continue
+            with open(self.outputs_path(job_uid), encoding="utf-8") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    try:
+                        declaration = ArtifactDeclaration.from_dict(loads(line))
+                    except (RecursionError, TypeError, ValueError):
+                        continue
+                    outputs.append((
+                        declaration.path,
+                        declaration.delete_on_failure,
+                        "cache" if declaration.delete_on_success else "output",
+                    ))
         except OSError:
             pass
         return outputs

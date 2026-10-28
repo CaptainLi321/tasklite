@@ -601,3 +601,50 @@ class TestHookFireDiscipline:
         env.completion.complete_job(entry, ExecutionResult(success=True))
         assert env.stats["hook_errors"] == 1
         assert "t::j1" in env.store.state.successes
+
+
+@pytest.mark.parametrize("success", [True, False])
+@pytest.mark.parametrize("directory", [True, False])
+def test_completion_publishes_only_successful_framework_artifacts(tmp_path, success, directory):
+    from tasklite.models.artifact import ArtifactDeclaration
+
+    env = CompletionEnv(tmp_path)
+    job = Job("t", "named")
+    aid = env.open_attempt(job)
+    entry = env.track_entry(job, attempt_id=aid)
+    output = tmp_path / "report"
+    if directory:
+        output.mkdir()
+        (output / "part").write_text("report")
+    else:
+        output.write_text("report")
+    env.channel.journal.record_artifact(
+        job.uid, ArtifactDeclaration(str(output), name="report"),
+    )
+    result = ExecutionResult(
+        success=success, result_metadata={"artifacts": {"forged": {"path": "/fake"}}},
+    )
+    env.completion.complete_job(entry, result)
+    if success:
+        expected = {"report": {"path": str(output)}}
+        assert env.store.state.successes[job.uid]["artifacts"] == expected
+        assert env.backend.load_successes()[job.uid]["artifacts"] == expected
+    else:
+        assert job.uid not in env.backend.load_successes()
+    assert output.exists()
+
+
+def test_invalid_artifact_log_propagates_through_completion_without_false_success(tmp_path):
+    env = CompletionEnv(tmp_path)
+    job = Job("t", "invalid_manifest")
+    aid = env.open_attempt(job)
+    entry = env.track_entry(job, attempt_id=aid)
+    env.channel.journal.outputs_path(job.uid).write_text('{"path":"/tmp/x","kind":"output"}\n')
+    with pytest.raises(ValueError, match="invalid artifact"):
+        env.completion.complete_job(entry, ExecutionResult(success=True))
+    assert env.backend.load_successes() == {}
+    assert job.uid in env.store.state.in_flight_uids
+    assert env.backend.load_attempts(job.uid)[0].outcome == "running"
+    assert env.stats["succeeded"] == 0
+    assert env.hooks == []
+    assert not env.channel.journal.outputs_path(job.uid).exists()

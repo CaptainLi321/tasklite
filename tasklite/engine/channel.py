@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from ..exceptions import FatalError, RateLimitHit, RetryError
+from ..models.artifact import ArtifactDeclaration
 from ..models.context import JobContext
 from ..models.job import Job
 from ..utils import lockfile
@@ -764,6 +765,10 @@ class ExecutionChannel:
     def cleanup_artifacts(self, job_uid: str, *, mode: ArtifactCleanupMode) -> None:
         """统一收敛产物与 IPC 临时文件的生命周期清理。"""
         self.journal.cleanup(job_uid, mode=mode)
+
+    def read_declared_artifacts(self, job_uid: str) -> tuple[ArtifactDeclaration, ...]:
+        """读取框架授权值，日志错误不得降级为空清单后发布成功。"""
+        return self.journal.read_artifacts(job_uid)
 
     def read_declared_inputs(self, job_uid: str) -> list[str]:
         """读取任务声明的输入路径清单。"""

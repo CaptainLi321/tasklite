@@ -281,6 +281,7 @@ class CompletionMachine:
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
+        declared_artifacts = self._channel.read_declared_artifacts(uid)
         spawned_job_snapshots = self._collect_spawned_job_snapshots(uid, result.spawned_jobs)
         success_metadata = dict(result.result_metadata or {})
         declared_inputs = self._channel.read_declared_inputs(uid)
@@ -291,6 +292,7 @@ class CompletionMachine:
             spawned_job_snapshots=spawned_job_snapshots,
             cursor_updates=result.cursor_updates,
             declared_inputs=declared_inputs,
+            declared_artifacts=declared_artifacts,
             run_id=self._session.run_id,
             job_snapshot=job_snapshot,
             attempt_id=attempt_id,

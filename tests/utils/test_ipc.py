@@ -573,8 +573,8 @@ class TestResultParseContainment:
         op = journal.outputs_path(uid)
         good = tmp_path / "ok.txt"
         op.write_text(
-            json.dumps({"path": str(good), "cleanup": True, "kind": "output"}) + "\n"
-            + json.dumps({"path": "[" * 200000, "cleanup": True, "kind": "output"}) + "\n"
+            json.dumps({"path": str(good), "delete_on_failure": True}) + "\n"
+            + json.dumps({"path": "/" + "[" * 200000, "delete_on_failure": True}) + "\n"
             + "[" * 200000 + "\n",
             encoding="utf-8",
         )
@@ -583,7 +583,7 @@ class TestResultParseContainment:
 
         assert len(outputs) == 2, "深嵌套行按坏行跳过，其余行正常解析"
         assert outputs[0][0] == str(good)
-        assert outputs[1][0] == "[" * 200000
+        assert outputs[1][0] == "/" + "[" * 200000
 
     def test_read_inputs_deep_nesting_line_skipped(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
@@ -619,9 +619,9 @@ class TestResultParseContainment:
         uid = "t::a"
         p = tmp_path / "t%3A%3Aa.outputs.jsonl"
         p.write_text(
-            '{"path": "/ok_first", "cleanup": true, "kind": "output"}\n'
+            '{"path": "/ok_first", "delete_on_failure": true}\n'
             'not-json-line\n'
-            '{"path": "/ok_second", "cleanup": true, "kind": "output"}\n',
+            '{"path": "/ok_second", "delete_on_failure": true}\n',
             encoding="utf-8",
         )
         outputs = journal.read_outputs(uid)
@@ -633,9 +633,9 @@ class TestResultParseContainment:
         uid = "t::a"
         p = tmp_path / "t%3A%3Aa.outputs.jsonl"
         p.write_text(
-            '{"path": "/a", "cleanup": true, "kind": "output"}\n'
+            '{"path": "/a", "delete_on_failure": true}\n'
             '\n'
-            '{"path": "/b", "cleanup": true, "kind": "output"}\n',
+            '{"path": "/b", "delete_on_failure": true}\n',
             encoding="utf-8",
         )
         outputs = journal.read_outputs(uid)
@@ -806,3 +806,103 @@ class TestArtifactJournalCleanupModes:
         assert not broken_dir.exists(), "cleanup=True directory must be rmtree'd"
         assert keep_file.exists(), "cleanup=False file must be kept"
         assert not journal.outputs_path(uid).exists()
+
+
+class TestTypedArtifactJournal:
+    def test_authorizations_use_one_log_and_project_existing_reader(self, tmp_path):
+        from tasklite.models.artifact import ArtifactDeclaration
+
+        journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path / "out")
+        declaration = ArtifactDeclaration(
+            str(tmp_path / "out" / "report"), name="report",
+            delete_existing=True, delete_on_failure=True,
+        )
+        journal.record_artifact("t::1", declaration)
+        journal.record_artifact("t::1", declaration)
+        assert journal.read_artifacts("t::1") == (declaration,)
+        assert journal.read_outputs("t::1") == [(declaration.path, True, "output")]
+        rows = [json.loads(line) for line in journal.outputs_path("t::1").read_text().splitlines()]
+        assert rows == [declaration.to_dict()]
+        assert "kind" not in rows[0] and "cleanup" not in rows[0]
+
+    @pytest.mark.parametrize("payload", [
+        '{"path":"/tmp/old", "cleanup":true, "kind":"output"}',
+        'not json',
+        '{"path":"/tmp/output", "accepted":true}',
+    ])
+    def test_publication_rejects_invalid_or_previous_log_format(self, tmp_path, payload):
+        journal = ArtifactJournal(tmp_path)
+        journal.outputs_path("t::1").write_text(payload + "\n")
+        with pytest.raises(ValueError):
+            journal.read_artifacts("t::1")
+
+    def test_typed_record_rejects_conflict_and_noncanonical_parent_link(self, tmp_path):
+        from tasklite.models.artifact import ArtifactDeclaration
+
+        root = tmp_path / "out"
+        root.mkdir()
+        (root / "real").mkdir()
+        (root / "link").symlink_to(root / "real", target_is_directory=True)
+        journal = ArtifactJournal(tmp_path / "ipc", output_roots=root)
+        journal.record_artifact("t::1", ArtifactDeclaration(str(root / "a"), name="a"))
+        before = journal.outputs_path("t::1").read_text()
+        with pytest.raises(ValueError):
+            journal.record_artifact("t::1", ArtifactDeclaration(str(root / "b"), name="a"))
+        with pytest.raises(ValueError):
+            journal.record_artifact("t::1", ArtifactDeclaration(str(root / "link" / "c")))
+        assert journal.outputs_path("t::1").read_text() == before
+
+    def test_named_publication_rechecks_path_without_following_leaf_link(self, tmp_path):
+        from tasklite.models.artifact import ArtifactDeclaration
+
+        root = tmp_path / "out"
+        root.mkdir()
+        report = root / "report"
+        report.write_text("output")
+        journal = ArtifactJournal(tmp_path / "ipc", output_roots=root)
+        journal.record_artifact("t::1", ArtifactDeclaration(str(report), name="report"))
+        report.unlink()
+        report.symlink_to(tmp_path / "external")
+        with pytest.raises(ValueError, match="symlink"):
+            journal.read_artifacts("t::1")
+
+    def test_typed_log_io_error_is_not_an_empty_manifest(self, tmp_path, monkeypatch):
+        import builtins
+        from tasklite.models.artifact import ArtifactDeclaration
+
+        journal = ArtifactJournal(tmp_path / "ipc")
+        declaration = ArtifactDeclaration(str(tmp_path / "out"), name="report")
+        real_open = builtins.open
+
+        def denied(path, *args, **kwargs):
+            if Path(path) == journal.outputs_path("t::1"):
+                raise PermissionError("denied")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", denied)
+        with pytest.raises(PermissionError):
+            journal.read_artifacts("t::1")
+        with pytest.raises(PermissionError):
+            journal.record_artifact("t::1", declaration)
+
+    def test_typed_record_requires_an_ipc_destination(self, tmp_path):
+        from tasklite.models.artifact import ArtifactDeclaration
+
+        with pytest.raises(ValueError, match="ipc_dir"):
+            ArtifactJournal().record_artifact("t::1", ArtifactDeclaration(str(tmp_path / "report"), name="report"))
+
+    def test_typed_append_failure_propagates(self, tmp_path, monkeypatch):
+        import builtins
+        from tasklite.models.artifact import ArtifactDeclaration
+
+        journal = ArtifactJournal(tmp_path / "ipc")
+        real_open = builtins.open
+
+        def denied_append(path, mode="r", *args, **kwargs):
+            if Path(path) == journal.outputs_path("t::1") and mode == "a":
+                raise PermissionError("append denied")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", denied_append)
+        with pytest.raises(PermissionError, match="append denied"):
+            journal.record_artifact("t::1", ArtifactDeclaration(str(tmp_path / "report"), name="report"))
