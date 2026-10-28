@@ -133,6 +133,7 @@ class EngineRuntime:
             classifier=config.classifier,
             output_roots=config.output_roots,
             ipc_dir=config.ipc_dir,
+            protected_roots=config.protected_roots,
             commit_failure_threshold=config.commit_failure_threshold,
         )
 

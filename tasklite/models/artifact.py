@@ -67,3 +67,14 @@ def validate_artifact_declarations(
         else:
             accepted.append(declaration)
     return tuple(accepted)
+
+
+def append_artifact_declaration(
+    previous: tuple[ArtifactDeclaration, ...], declaration: ArtifactDeclaration,
+) -> tuple[ArtifactDeclaration, ...]:
+    """仅比较新增声明与已有声明；完整集合在成功边界复核。"""
+    for old in previous:
+        if old == declaration:
+            return previous
+        validate_artifact_declarations((old, declaration))
+    return (*previous, declaration)

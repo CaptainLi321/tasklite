@@ -7,13 +7,17 @@
 """
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import os
+import stat
 from pathlib import Path
 
+from ..utils.artifact import ArtifactPathPolicy
 from ..utils.ipc import ArtifactJournal
 from ..utils.jsonutil import dumps
+from .artifact import ArtifactDeclaration, append_artifact_declaration
 from .job import Job
 
 logger = logging.getLogger("tasklite")
@@ -34,7 +38,12 @@ class JobContext:
         fatal_exceptions: tuple[type[BaseException], ...] | None = None,
         transient_exceptions: tuple[type[BaseException], ...] | None = None,
         resource_names: frozenset | set | None = None,
+        artifact_descriptions: dict[str, dict[str, dict[str, str]]] | None = None,
+        protected_roots: tuple[str | Path, ...] = (),
     ):
+        self._artifact_descriptions = copy.deepcopy(artifact_descriptions or {})
+        self._protected_roots = tuple(protected_roots)
+        self._local_artifacts: tuple[ArtifactDeclaration, ...] = ()
         self.job = job
         self.spawned_jobs: list[Job] = []
         self.resource_suspensions: list[tuple[str, float]] = []
@@ -79,7 +88,7 @@ class JobContext:
         if self.ipc_dir is None:
             return None
         if self._journal_instance is None or self._journal_instance_dir != self.ipc_dir:
-            self._journal_instance = ArtifactJournal(self.ipc_dir)
+            self._journal_instance = ArtifactJournal(self.ipc_dir, self.output_roots, self._protected_roots)
             self._journal_instance_dir = self.ipc_dir
         return self._journal_instance
 
@@ -101,55 +110,44 @@ class JobContext:
         self.spawned_jobs.append(job)
 
     def declare_output(
-        self, path: str | Path, *, cleanup_on_fail: bool = True, sandbox: bool = True
+        self, path: str | Path, *, name: str | None = None,
+        delete_existing: bool = False, delete_on_failure: bool = False,
+        delete_on_success: bool = False, sandbox: bool = True,
     ) -> str:
-        """声明一个输出文件。
+        """声明文件或目录并返回规范绝对路径；三项删除授权相互独立。
 
-        自动创建父目录。job 失败（或重试）时，``cleanup_on_fail=True`` 的
-        已声明输出会被删除，防止半写文件残留。
-
-        ``sandbox=False`` 显式豁免路径沙盒（跨盘输出等无法归入任何
-        output_roots 的场景）——放弃越界保护，与 ``output_roots=None``
-        同语义，但逐路径声明而非全局关闭。
-
-        Returns:
-            框架将校验/清理的**解析后规范绝对路径**——handler 应用返回值
-            写文件（而非原始参数），保证写入位置与校验/清理位置一致
-            （相对路径按 output_roots 重定位，原始相对字符串按 CWD 写会
-            与校验脱节 → 误判产物缺失）。
+        声明必须早于首次写入。完全一致的重复声明幂等，不会再次删除；
+        调用方负责跨 Job 的路径独占，框架不维护全局所有权。
         """
-        return self._declare(path, cleanup_on_fail=cleanup_on_fail, sandbox=sandbox, kind="output")
-
-    def declare_cache(self, path: str | Path, *, sandbox: bool = True) -> str:
-        """声明一个**临时/cache 文件**。
-
-        语义：任务结束时（无论成败）该文件**不应存在**。
-          - 成功路径：**跳过存在性校验**（原子产出的 ``.part`` 已被
-            ``os.replace`` 到最终路径，校验必然失败），并尽力尝试删除
-            （rename 已发生则无操作）；
-          - 失败/中止路径：删除半成品。
-
-        标准用法（原子产出模式）：``tmp = ctx.declare_cache("./v.mp4.part")``
-        写 tmp → 自校验 → ``os.replace(tmp, final)``；最终路径用
-        ``ctx.declare_output("./v.mp4")`` 声明（成功校验存在 + 失败清理）。
-
-        路径沙盒与 ``declare_output`` 相同：``sandbox=False`` 显式豁免
-        （跨盘缓存等无法归入任何 output_roots 的场景）——放弃越界保护，
-        逐路径声明而非全局关闭。返回解析后的规范绝对路径。
-        """
-        return self._declare(path, cleanup_on_fail=True, sandbox=sandbox, kind="cache")
-
-    def _declare(
-        self, path: str | Path, *, cleanup_on_fail: bool, sandbox: bool, kind: str
-    ) -> str:
-        """declare_output/declare_cache 的共享实现（消除重复）。"""
-        raw = str(path)
-        resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_roots, sandbox=sandbox)
-        parent = Path(resolved).parent
-        parent.mkdir(parents=True, exist_ok=True)
-        if self._journal is not None:
-            self._journal.record_output(self.job.uid, resolved, cleanup=cleanup_on_fail, kind=kind)
+        policy = ArtifactPathPolicy(
+            output_roots=self.output_roots,
+            protected_roots=(*self._protected_roots, *((self.ipc_dir,) if self.ipc_dir else ())),
+        )
+        resolved = policy.resolve(path, sandbox=sandbox)
+        declaration = ArtifactDeclaration(
+            resolved, name=name, delete_existing=delete_existing,
+            delete_on_failure=delete_on_failure, delete_on_success=delete_on_success,
+            sandbox=sandbox,
+        )
+        journal = self._journal
+        if journal is not None:
+            journal.record_artifact(self.job.uid, declaration, prepare=True)
+        else:
+            declarations = append_artifact_declaration(self._local_artifacts, declaration)
+            if len(declarations) > len(self._local_artifacts):
+                policy.remove_existing(declaration)
+                Path(resolved).parent.mkdir(parents=True, exist_ok=True)
+                self._local_artifacts = declarations
         return resolved
+
+    def declare_cache(
+        self, path: str | Path, *, delete_existing: bool = False, sandbox: bool = True,
+    ) -> str:
+        """声明成败均清理的匿名临时磁盘产物；已有路径仍须前删授权。"""
+        return self.declare_output(
+            path, delete_existing=delete_existing, delete_on_failure=True,
+            delete_on_success=True, sandbox=sandbox,
+        )
 
     def declare_input(self, path: str | Path) -> str:
         """声明一个本地输入文件或目录：校验路径存在、记录规范绝对路径并返回该路径字符串。
@@ -164,6 +162,37 @@ class JobContext:
         if self._journal is not None:
             self._journal.record_input_file(self.job.uid, resolved)
         return resolved
+
+    def get_artifact_path(self, *, producer_job_uid: str, artifact_name: str) -> str:
+        """查询直接依赖的已成功产物；不自动声明输入或触发生产者。"""
+        for label, value in (("producer_job_uid", producer_job_uid), ("artifact_name", artifact_name)):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{label} must be a non-empty str")
+        reference = f"producer {producer_job_uid!r}, artifact {artifact_name!r}"
+        if producer_job_uid not in self.job.depends_on:
+            raise ValueError(f"{reference}: producer must be a direct dependency")
+        if producer_job_uid not in self._success_job_uids:
+            raise LookupError(f"{reference}: no successful producer in dispatch snapshot")
+        descriptions = self._artifact_descriptions.get(producer_job_uid, {})
+        if artifact_name not in descriptions:
+            raise KeyError(f"{reference}: artifact name was not published")
+        description = descriptions[artifact_name]
+        if not isinstance(description, dict) or set(description) != {"path"}:
+            raise ValueError(f"{reference}: invalid artifact description")
+        path = description["path"]
+        try:
+            ArtifactDeclaration(path, name=artifact_name)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{reference}: invalid artifact path {path!r}") from error
+        try:
+            info = os.stat(path)
+        except OSError as error:
+            raise OSError(error.errno, f"{reference}: {error.strerror}", path) from error
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            raise ValueError(f"{reference}: artifact is not a file or directory: {path}")
+        if Path(path).is_symlink() or str(Path(path).resolve()) != path:
+            raise ValueError(f"{reference}: artifact path changed: {path}")
+        return path
 
     def has_succeeded(self, job_uid: str) -> bool:
         """查询 job_uid 是否命中派发时的成功档案快照。"""

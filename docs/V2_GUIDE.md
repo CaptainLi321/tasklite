@@ -180,7 +180,7 @@ logging.getLogger("tasklite").setLevel(logging.INFO)
 
 def download_handler(job, ctx):
     """在独立子进程中执行——handler 必须模块级定义（spawn 经 pickle 下发）。"""
-    out = Path(ctx.declare_output(f"{job.job_id}.jpg"))   # 声明产物（失败自动清理半成品）
+    out = Path(ctx.declare_output(f"{job.job_id}.jpg", delete_on_failure=True))   # 声明产物（失败自动清理半成品）
     data = fetch(job.payload["url"])                       # 业务逻辑
     if data is None:
         raise RetryError("网络抖动，重入队重试")            # 瞬态失败信号
@@ -225,16 +225,53 @@ pipeline.stop()
 |---|---|
 | `ctx.spawn(Job(...))` | 入队子 job（运行期派生唯一合法通道） |
 | `ctx.declare_output(path)` / `ctx.declare_cache(path)` | 声明产物 / 临时半成品（返回解析后规范绝对路径，应使用返回值写文件） |
+| `ctx.get_artifact_path(producer_job_uid=producer_job_uid, artifact_name=artifact_name)` | 查询直接依赖的成功产物路径；不自动声明 input |
 | `ctx.declare_input(path)` | 声明输入（校验存在性并记录规范绝对路径，联动 trigger / `trigger="on_input_change"`） |
 | `ctx.get_cursor(key)` / `ctx.set_cursor(key, value)` | 高水位游标读写（成功时原子提交；`value=None` 删除） |
 | `ctx.suspend_resource(name, seconds)` | 全局挂起资源（429/配额熔断，跨进程跨重启持久化） |
 | `ctx.has_succeeded(job_uid)` / `ctx.has_failed(job_uid)` / `ctx.succeeded_or_failed_job_uids()` | 成功/失败档案快照查询；并集不含 skipped、队列成员或 Attempt 历史（派发时刻快照，不实时刷新） |
 
+产物声明接口：
+
+```python
+ctx.declare_output(path, name=None, delete_existing=False,
+                   delete_on_failure=False, delete_on_success=False, sandbox=True)
+ctx.declare_cache(path, delete_existing=False, sandbox=True)
+ctx.declare_input(path)
+ctx.get_artifact_path(producer_job_uid=producer_job_uid, artifact_name=artifact_name)
+```
+
+这些接口返回文件或目录自身的规范绝对 `str`。output/cache 的相对路径默认基于首个输出根，input 的相对路径按当前工作目录解析。声明须早于首次写入，自动创建父目录。已有路径必须独立授权 `delete_existing=True`；失败和成功清理权限不能代替前删权限。没有前删授权的重试遇到残留仍会报错，不隐含覆盖。普通 output 的三项删除授权均默认关闭，`declare_cache` 等价于匿名 output 同时启用成败清理；临时产物不允许 name。
+
+同执行的名称与规范路径一一对应；完全一致的重复声明不二次前删，改变名称、权限或 sandbox 会拒绝。同执行不能同时声明目录和内部文件。叶节点符号链接、根目录、输出根及覆盖状态/IPC 目录的路径不能声明；`sandbox=False` 只豁免输出范围。跨 Job 的不重叠写入及消费者只读由调用方保证。
+
+```python
+def build(job, ctx):
+    folder = Path(ctx.declare_output("bundle", name="bundle", delete_existing=True))
+    folder.mkdir()
+    (folder / "report.txt").write_text("result", encoding="utf-8")
+
+
+def consume(job, ctx):
+    folder = Path(ctx.get_artifact_path(
+        producer_job_uid="build::daily", artifact_name="bundle"))
+    report = Path(ctx.declare_input(folder / "report.txt"))
+    return {"text": report.read_text(encoding="utf-8")}
+
+
+# 完成 Task 注册后，显式提供完整生产者 UID 的直接依赖。
+pipeline.enqueue([Job("consume", "daily", depends_on=["build::daily"]), Job("build", "daily")])
+```
+
+getter 只查询派发时可见的成功描述；本批刚完成和有效历史成功均可引用。仅传递祖先不符合直接依赖约定。没有成功档案、没有该名称、磁盘路径缺失分别报错；路径不可访问时传播文件系统错误。查询不补依赖、不执行 trigger、不清成功历史或补跑生产者，也不自动登记 input；调用方显式声明实际读取的文件，直接声明外部路径仍可用。声明目录 input 只 stat 目录自身，不递归观察目录内容。
+
+具名清单随本次成功事务整体替换，匿名声明不发布，清单移除旧名称不授权删除旧路径。当前已接通公开声明与前删；收尾的先清理后提交及错误传播编排仍待 [实施计划 A4](IMPLEMENTATION_PLAN_2026-10.md#a4现有执行生命周期的清理顺序与错误可观察)，不承诺跨崩溃自动恢复清理。
+
 入队前可在 `run()` 外使用 `pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))`：仅排除成功档案命中的 Job，保留输入顺序；失败档案或队列中已有的 Job 仍可返回，重跑与队列去重分别由派发和入队处理。
 
 **run/stop 细节**：`run()` 返回 `RunSummary(exit_reason, stats, run_id, duration_seconds)`；`stop()` 请求 DRAINING（不再派发、在途自然完成），`stop(force=True)` 请求 ABORTING（分类消费在途任务）；`run_graceful()` 是统一包装（正常完成返回 `RunSummary`，捕获 KeyboardInterrupt 转 DRAINING 并返回 `None`）。构造期钩子三件：`on_run_start` / `on_attempt_finished(job_uid, *, outcome: AttemptOutcome)` / `on_run_end(exit_reason)`——同步、主线程、必须轻量非阻塞（抛异常只计数进 `stats["hook_errors"]`）。
 
-handler 单测用官方构造器：`from tasklite.testing import fake_ctx`——`fake_ctx(job, successes=..., failed=..., cursors=..., resources=..., tmp_root=...)`，不硬编码 JobContext 内部容器结构。
+handler 单测用官方构造器：`from tasklite.testing import fake_ctx`——`fake_ctx(job, successes=..., artifacts={producer_uid: {name: {"path": path}}}, failed=..., cursors=..., resources=..., tmp_root=...)`，不硬编码 JobContext 内部容器结构。
 
 ---
 

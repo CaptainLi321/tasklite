@@ -430,11 +430,13 @@ class ExecutionChannel:
         *,
         process_context: Any | None = None,
         output_roots: str | Path | Sequence[str | Path] | None = None,
+        protected_roots: Sequence[str | Path] = (),
     ) -> None:
         self._process_context = process_context or mp.get_context("spawn")
         self.ipc_dir = str(ipc_dir) if ipc_dir is not None else None
         # 输出沙盒信任根随 channel 注入 journal——清理消费侧的删除复检依赖
         self.output_roots = output_roots
+        self.protected_roots = tuple(protected_roots)
         # 每 run 随机结果认证令牌（run 启动屏障由 runtime 同步）；None 表示未启用
         self.result_token: str | None = None
         if self.ipc_dir:
@@ -448,7 +450,10 @@ class ExecutionChannel:
         ipc = getattr(self, "ipc_dir", None)
         cached = getattr(self, "_journal", None)
         if cached is None or cached.ipc_dir != ipc:
-            cached = ArtifactJournal(ipc, output_roots=getattr(self, "output_roots", None))
+            cached = ArtifactJournal(
+                ipc, output_roots=getattr(self, "output_roots", None),
+                protected_roots=getattr(self, "protected_roots", ()),
+            )
             self._journal = cached
         return cached
 

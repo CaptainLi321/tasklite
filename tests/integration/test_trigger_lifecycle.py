@@ -29,7 +29,7 @@ def produce_input(job, ctx):
     if mode == "fail":
         raise FatalError("upstream failed in this batch")
     if mode == "write":
-        path = Path(ctx.declare_output(ctx.output_roots / "source.txt"))
+        path = Path(ctx.declare_output(ctx.output_roots / "source.txt", delete_existing=True))
         path.write_text(job.payload.get("content", "first"), encoding="utf-8")
         if "mtime_ns" in job.payload:
             stamp = job.payload["mtime_ns"]

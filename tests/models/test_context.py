@@ -1,8 +1,5 @@
 """v2 JobContext 契约测试：spawn 预检、产物/输入声明沙盒、游标与资源挂起。
 
-移植 v1 TaskContext 相关测试（fake_ctx/sandbox/declare_cache/
-declare_input）并按 v2 API 改写；布尔参数 cleanup_on_fail/sandbox
-keyword-only 化。
 """
 
 from __future__ import annotations
@@ -129,15 +126,15 @@ class TestDeclareOutputSandbox:
         assert final.startswith(str(root))
         assert Path(final).parent.is_dir()  # 父目录自动创建
         outputs = ArtifactJournal(str(tmp_path / "ipc")).read_outputs("fetch::j1")
-        assert outputs == [(final, True, "output")]
+        assert outputs == [(final, False, "output")]
 
     def test_cleanup_flag_persisted(self, tmp_path):
         root = tmp_path / "out"
         root.mkdir()
         ipc = str(tmp_path / "ipc")
         ctx = _make_ctx(output_roots=root, ipc_dir=ipc)
-        keep = ctx.declare_output("keep.bin", cleanup_on_fail=False)
-        drop = ctx.declare_output("drop.bin")
+        keep = ctx.declare_output("keep.bin", delete_on_failure=False)
+        drop = ctx.declare_output("drop.bin", delete_on_failure=True)
         recorded = {p: (c, k) for p, c, k in ArtifactJournal(ipc).read_outputs("fetch::j1")}
         assert recorded[keep] == (False, "output")
         assert recorded[drop] == (True, "output")
@@ -154,9 +151,9 @@ class TestDeclareOutputSandbox:
         root.mkdir()
         ctx = _make_ctx(output_roots=root)
         (tmp_path / "secret.txt").write_text("secret")
-        with pytest.raises(ValueError, match="resolves outside output_roots"):
+        with pytest.raises(ValueError, match="outside output roots"):
             ctx.declare_output("../secret.txt")
-        with pytest.raises(ValueError, match="resolves outside output_roots"):
+        with pytest.raises(ValueError, match="outside output roots"):
             ctx.declare_output(str(tmp_path / "elsewhere" / "f.bin"))
 
     def test_absolute_within_root_accepted(self, tmp_path):
@@ -175,7 +172,7 @@ class TestDeclareOutputSandbox:
         ctx = _make_ctx(output_roots=root)
         final = ctx.declare_output(str(elsewhere / "cross.bin"), sandbox=False)
         assert final.startswith(str(elsewhere))
-        with pytest.raises(ValueError, match="resolves outside output_roots"):
+        with pytest.raises(ValueError, match="outside output roots"):
             ctx.declare_output(str(elsewhere / "cross2.bin"))
 
     def test_no_output_root_allows_any(self, tmp_path):
@@ -239,7 +236,7 @@ class TestMultiRootSandbox:
 
 
 class TestDeclareCache:
-    """declare_cache：kind=cache 声明与恒定 cleanup 语义。"""
+    """declare_cache：匿名成败清理授权。"""
 
     def test_cache_resolves_within_root(self, tmp_path):
         root = tmp_path / "out"
@@ -260,7 +257,7 @@ class TestDeclareCache:
         root.mkdir()
         elsewhere.mkdir()
         ctx = _make_ctx(output_roots=root)
-        with pytest.raises(ValueError, match="resolves outside output_roots"):
+        with pytest.raises(ValueError, match="outside output roots"):
             ctx.declare_cache(str(elsewhere / "c.part"))
 
     def test_cache_sandbox_false_exempts(self, tmp_path):

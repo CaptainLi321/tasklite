@@ -35,6 +35,18 @@ from tasklite.utils.jsonutil import dumps, loads
 _INCARNATION = "deadbeefdeadbeefdeadbeefdeadbeef.1"
 
 
+def _write_artifact(journal, uid, path, *, delete_on_failure=False, delete_on_success=False):
+    """从文件边界注入声明，包含供清理拒绝的非法路径。"""
+    from tasklite.utils.jsonutil import dumps
+
+    target = journal.outputs_path(uid)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as stream:
+        stream.write(dumps({"path": path, "name": None, "delete_existing": False,
+                            "delete_on_failure": delete_on_failure,
+                            "delete_on_success": delete_on_success, "sandbox": True}) + "\n")
+
+
 class StoreShim:
     """StateStore 落地前的窄契约替身：backend 活引用 + set_state + queue。"""
 
@@ -820,7 +832,7 @@ class TestAbortInFlight:
         out_file = tmp_path / "out" / "result.txt"
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text("done")
-        channel.journal.record_output(job.uid, str(out_file), cleanup=True)
+        _write_artifact(channel.journal, job.uid, str(out_file), delete_on_failure=True)
         channel.journal.write_result_atomic(
             job.uid,
             {

@@ -313,10 +313,12 @@ class TaskLite:
             self.ipc_dir,
             process_context=self._process_context,
             output_roots=self.output_roots,
+            protected_roots=(self.state_dir,),
         )
         return RunConfig.resolve(
             name=self.name,
             ipc_dir=self.ipc_dir,
+            protected_roots=(self.state_dir,),
             backend=backend,
             resources=self.resources,
             tasks=self.tasks,

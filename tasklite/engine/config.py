@@ -128,6 +128,7 @@ class RunConfig:
     ordering_policy: OrderingPolicy
     # ── 调优标量（默认值唯一落点）──
     output_roots: Path | Sequence[Path] | None = None
+    protected_roots: tuple[Path, ...] = ()
     strict_picklable: bool = True
     dependency_grace_seconds: float = DEP_GRACE_SECONDS
     commit_failure_threshold: int = COMMIT_FAILURE_THRESHOLD
@@ -152,6 +153,7 @@ class RunConfig:
         requeue_policy: RequeuePolicy | None = None,
         ordering_policy: OrderingPolicy | None = None,
         output_roots: Path | Sequence[Path] | None = None,
+        protected_roots: tuple[Path, ...] = (),
         strict_picklable: bool = True,
         dependency_grace_seconds: float | None = None,
         commit_failure_threshold: int | None = None,
@@ -169,6 +171,7 @@ class RunConfig:
         return cls(
             name=name,
             ipc_dir=ipc_dir,
+            protected_roots=protected_roots,
             backend=backend,
             resources=resources,
             tasks=tasks,

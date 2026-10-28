@@ -122,6 +122,7 @@ class DispatchMachine:
         output_roots: "Path | Sequence[Path] | None",
         ipc_dir: str,
         commit_failure_threshold: int,
+        protected_roots: tuple[Path, ...] = (),
     ) -> None:
         self._store = store
         self._scheduler = scheduler
@@ -135,6 +136,7 @@ class DispatchMachine:
         self._classifier = classifier
         self._output_roots = output_roots
         self._ipc_dir = ipc_dir
+        self._protected_roots = protected_roots
         self._commit_failure_threshold = commit_failure_threshold
 
     # ── 扫描与派发接缝 ────────────────────────────────────────────────
@@ -523,6 +525,11 @@ class DispatchMachine:
             fatal_exceptions=self._classifier.fatal_exceptions,
             transient_exceptions=self._classifier.transient_exceptions,
             resource_names=frozenset(self._resources),
+            protected_roots=self._protected_roots,
+            artifact_descriptions={
+                uid: state.successes[uid].get("artifacts", {})
+                for uid in job.depends_on if uid in state.success_uids
+            },
         )
 
     # ── 拒绝与异常分支 ────────────────────────────────────────────────

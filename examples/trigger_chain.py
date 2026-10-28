@@ -12,7 +12,7 @@ def update_source(job, ctx):
     content = job.payload["content"]
     changed = not path.exists() or path.read_text(encoding="utf-8") != content
     if changed:
-        path = Path(ctx.declare_output(path))
+        path = Path(ctx.declare_output(path, delete_existing=True))
         path.write_text(content, encoding="utf-8")
     return {"changed": changed}
 

@@ -54,6 +54,18 @@ def make_spec(
     )
 
 
+def _write_artifact(journal, uid, path, *, delete_on_failure=False, delete_on_success=False):
+    """从文件边界注入声明，包含供清理拒绝的非法路径。"""
+    from tasklite.utils.jsonutil import dumps
+
+    target = journal.outputs_path(uid)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as stream:
+        stream.write(dumps({"path": path, "name": None, "delete_existing": False,
+                            "delete_on_failure": delete_on_failure,
+                            "delete_on_success": delete_on_success, "sandbox": True}) + "\n")
+
+
 class TestExecutionChannelBasics:
     def test_init_and_directory_creation(self, tmp_path):
         ipc_dir = tmp_path / "ipc"
@@ -95,7 +107,7 @@ class TestExecutionChannelArtifactCleanup:
         channel = ExecutionChannel(tmp_path)
         uid = "job_clean"
         channel.journal.record_input_entry(uid, {"kind": "file", "path": "/tmp/x"})
-        channel.journal.record_output(uid, "/tmp/y", cleanup=False, kind="file")
+        _write_artifact(channel.journal, uid, "/tmp/y", delete_on_failure=False)
         channel.journal.record_signal(uid, "gpu", 10.0)
 
         from tasklite.utils.ipc import ArtifactCleanupMode
@@ -116,8 +128,8 @@ class TestExecutionChannelArtifactCleanup:
         output_file = tmp_path / "final.txt"
         output_file.write_text("final data")
 
-        channel.journal.record_output(uid, str(cache_file), cleanup=False, kind="cache")
-        channel.journal.record_output(uid, str(output_file), cleanup=True, kind="file")
+        _write_artifact(channel.journal, uid, str(cache_file), delete_on_failure=False, delete_on_success=True)
+        _write_artifact(channel.journal, uid, str(output_file), delete_on_failure=True)
 
         channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.SUCCESS)
 
@@ -125,7 +137,7 @@ class TestExecutionChannelArtifactCleanup:
         assert output_file.exists()
         assert not channel.journal.outputs_path(uid).exists()
 
-    def test_cleanup_failure_deletes_cleanup_on_fail_outputs(self, tmp_path):
+    def test_cleanup_failure_deletes_authorized_outputs(self, tmp_path):
         from tasklite.utils.ipc import ArtifactCleanupMode
 
         channel = ExecutionChannel(tmp_path)
@@ -135,8 +147,8 @@ class TestExecutionChannelArtifactCleanup:
         keep_file = tmp_path / "keep.txt"
         keep_file.write_text("to keep")
 
-        channel.journal.record_output(uid, str(fail_file), cleanup=True, kind="file")
-        channel.journal.record_output(uid, str(keep_file), cleanup=False, kind="file")
+        _write_artifact(channel.journal, uid, str(fail_file), delete_on_failure=True)
+        _write_artifact(channel.journal, uid, str(keep_file), delete_on_failure=False)
 
         channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
 
@@ -639,7 +651,7 @@ class TestDecodeIpcResultDefense:
 
     def test_missing_output_marks_failed(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
-        journal.record_output("t::a", str(tmp_path / "missing.jpg"), cleanup=True)
+        _write_artifact(journal, "t::a", str(tmp_path / "missing.jpg"), delete_on_failure=True)
         result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
         assert result.success is False
         assert "Missing output" in result.result_metadata["error_message"]
@@ -648,16 +660,14 @@ class TestDecodeIpcResultDefense:
         journal = ArtifactJournal(tmp_path)
         out = tmp_path / "present.jpg"
         out.write_bytes(b"x")
-        journal.record_output("t::a", str(out), cleanup=True)
+        _write_artifact(journal, "t::a", str(out), delete_on_failure=True)
         result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
         assert result.success is True
 
     def test_cache_output_skips_existence_check(self, tmp_path):
         """kind=cache 的临时文件跳过存在性校验（原子产出 .part 已被 replace）。"""
         journal = ArtifactJournal(tmp_path)
-        journal.record_output(
-            "t::a", str(tmp_path / "cache.part"), cleanup=True, kind="cache"
-        )
+        _write_artifact(journal, "t::a", str(tmp_path / "cache.part"), delete_on_failure=True, delete_on_success=True)
         result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
         assert result.success is True
 

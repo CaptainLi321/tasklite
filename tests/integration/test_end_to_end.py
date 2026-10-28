@@ -140,7 +140,7 @@ def partial_output_hang_handler(job, ctx):
     ready 标记先于挂起落盘——测试侧轮询标记出现再请求强停，避免在
     handler 尚未声明输出前击杀（竞态会让清理断言假绿）。
     """
-    partial = ctx.declare_output(ctx.output_roots / f"partial_{job.job_id}.txt")
+    partial = ctx.declare_output(ctx.output_roots / f"partial_{job.job_id}.txt", delete_on_failure=True)
     Path(partial).write_text("half-written", encoding="utf-8")
     ready = ctx.output_roots / f"ready_{job.job_id}"
     ready.write_text(job.job_id, encoding="utf-8")

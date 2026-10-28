@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import unquote
 
-from ..models.artifact import ArtifactDeclaration, validate_artifact_declarations
+from ..models.artifact import ArtifactDeclaration, append_artifact_declaration, validate_artifact_declarations
 from .artifact import ArtifactPathPolicy
 from .encoding import encode_job_uid_filename
 from .jsonutil import dump, dumps, load, loads
@@ -92,7 +92,9 @@ class ArtifactJournal:
         self,
         ipc_dir: str | Path | None = None,
         output_roots: str | Path | Sequence[str | Path] | None = None,
+        protected_roots: Sequence[str | Path] = (),
     ) -> None:
+        self.protected_roots = tuple(protected_roots)
         self.ipc_dir: str | None = str(ipc_dir) if ipc_dir is not None else None
         if output_roots is None:
             self.output_roots: list[Path] | None = None
@@ -200,20 +202,6 @@ class ArtifactJournal:
 
     # ── 声明追加写入（Worker 侧）─────────────────────────────────
 
-    def record_output(
-        self, job_uid: str, out_path: str, *, cleanup: bool = True, kind: str = "output"
-    ) -> None:
-        """将现有内部调用转换为统一授权记录。"""
-        declaration = ArtifactDeclaration(
-            os.path.abspath(out_path),
-            delete_on_failure=bool(cleanup),
-            delete_on_success=kind == "cache",
-        )
-        try:
-            self._append_artifact(job_uid, declaration)
-        except OSError:
-            pass
-
     def _append_artifact(self, job_uid: str, declaration: ArtifactDeclaration) -> None:
         if self.ipc_dir is None:
             return
@@ -223,22 +211,31 @@ class ArtifactJournal:
             stream.write(dumps(declaration.to_dict()) + "\n")
             stream.flush()
 
-    def record_artifact(self, job_uid: str, declaration: ArtifactDeclaration) -> None:
+    def record_artifact(
+        self, job_uid: str, declaration: ArtifactDeclaration, *, prepare: bool = False,
+    ) -> None:
         """校验同执行授权与路径范围后追加；持久写入错误向调用者传播。"""
         if self.ipc_dir is None:
             raise ValueError("ipc_dir is required to record an artifact")
         self._validate_artifact_path(declaration)
-        previous = self.read_artifacts(job_uid)
-        declarations = validate_artifact_declarations((*previous, declaration))
+        previous = self._read_artifact_entries(job_uid)
+        declarations = append_artifact_declaration(previous, declaration)
         if len(declarations) > len(previous):
+            if prepare:
+                self.path_policy.remove_existing(declaration)
+                Path(declaration.path).parent.mkdir(parents=True, exist_ok=True)
             self._append_artifact(job_uid, declaration)
 
-    def _validate_artifact_path(self, declaration: ArtifactDeclaration) -> None:
-        policy = ArtifactPathPolicy(
+    @property
+    def path_policy(self) -> ArtifactPathPolicy:
+        """本执行配置对应的路径与保护范围。"""
+        return ArtifactPathPolicy(
             output_roots=self.output_roots,
-            protected_roots=(self.ipc_dir,) if self.ipc_dir else (),
+            protected_roots=(*self.protected_roots, *((self.ipc_dir,) if self.ipc_dir else ())),
         )
-        resolved = policy.resolve(declaration.path, sandbox=declaration.sandbox)
+
+    def _validate_artifact_path(self, declaration: ArtifactDeclaration) -> None:
+        resolved = self.path_policy.resolve(declaration.path, sandbox=declaration.sandbox)
         if resolved != declaration.path:
             raise ValueError("artifact declaration must use the canonical path")
 
@@ -380,6 +377,9 @@ class ArtifactJournal:
 
     def read_artifacts(self, job_uid: str) -> tuple[ArtifactDeclaration, ...]:
         """严格读取本执行授权；缺失日志为空，旧格式或损坏记录拒绝发布。"""
+        return validate_artifact_declarations(self._read_artifact_entries(job_uid))
+
+    def _read_artifact_entries(self, job_uid: str) -> tuple[ArtifactDeclaration, ...]:
         if self.ipc_dir is None:
             return ()
         try:
@@ -398,7 +398,7 @@ class ArtifactJournal:
                 if declaration.name is not None:
                     self._validate_artifact_path(declaration)
                 declarations.append(declaration)
-        return validate_artifact_declarations(declarations)
+        return tuple(declarations)
 
     def read_outputs(self, job_uid: str) -> list[tuple[str, bool, str]]:
         """为现有验证与清理提供统一授权值的 tuple 投影，坏行不授予删除权。"""

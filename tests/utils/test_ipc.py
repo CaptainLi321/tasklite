@@ -22,6 +22,18 @@ from tasklite.utils.ipc import (
 _INCARNATION_FIRST = "deadbeefdeadbeefdeadbeefdeadbeef.1"
 
 
+def _write_artifact(journal, uid, path, *, delete_on_failure=False, delete_on_success=False):
+    """从文件边界注入声明，包含供清理拒绝的非法路径。"""
+    from tasklite.utils.jsonutil import dumps
+
+    target = journal.outputs_path(uid)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as stream:
+        stream.write(dumps({"path": path, "name": None, "delete_existing": False,
+                            "delete_on_failure": delete_on_failure,
+                            "delete_on_success": delete_on_success, "sandbox": True}) + "\n")
+
+
 class TestArtifactJournalPathAndSandbox:
     def test_path_construction(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
@@ -100,8 +112,8 @@ class TestArtifactJournalDeclarations:
         out_file = tmp_path / "final.data"
         cache_file = tmp_path / "temp.cache"
 
-        journal.record_output(uid, str(out_file), cleanup=True, kind="output")
-        journal.record_output(uid, str(cache_file), cleanup=True, kind="cache")
+        _write_artifact(journal, uid, str(out_file), delete_on_failure=True)
+        _write_artifact(journal, uid, str(cache_file), delete_on_failure=True, delete_on_success=True)
 
         # 产物未创建时校验失败
         ok, err = journal.verify_outputs(uid)
@@ -679,7 +691,7 @@ class TestCleanupSandboxRecheck:
         victim.mkdir()
         (victim / "precious.txt").write_text("data")
         uid = "t::poison"
-        journal.record_output(uid, str(victim), cleanup=True, kind="output")
+        _write_artifact(journal, uid, str(victim), delete_on_failure=True)
 
         journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
 
@@ -696,8 +708,8 @@ class TestCleanupSandboxRecheck:
         broken_dir.mkdir()
         (broken_dir / "sub.txt").write_text("sub")
         uid = "t::normal"
-        journal.record_output(uid, str(broken_file), cleanup=True, kind="output")
-        journal.record_output(uid, str(broken_dir), cleanup=True, kind="output")
+        _write_artifact(journal, uid, str(broken_file), delete_on_failure=True)
+        _write_artifact(journal, uid, str(broken_dir), delete_on_failure=True)
 
         journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
 
@@ -710,7 +722,7 @@ class TestCleanupSandboxRecheck:
         victim = tmp_path / "outside.cache"
         victim.write_text("data")
         uid = "t::cache"
-        journal.record_output(uid, str(victim), cleanup=True, kind="cache")
+        _write_artifact(journal, uid, str(victim), delete_on_failure=True, delete_on_success=True)
 
         journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
 
@@ -724,8 +736,8 @@ class TestCleanupSandboxRecheck:
         victim = tmp_path / "outside.txt"
         victim.write_text("data")
         uid = "t::no_roots"
-        journal.record_output(uid, str(inside), cleanup=True, kind="cache")
-        journal.record_output(uid, str(victim), cleanup=True, kind="cache")
+        _write_artifact(journal, uid, str(inside), delete_on_failure=True, delete_on_success=True)
+        _write_artifact(journal, uid, str(victim), delete_on_failure=True, delete_on_success=True)
 
         journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
 
@@ -740,10 +752,7 @@ class TestCleanupSandboxRecheck:
         (target / "f.txt").write_text("data")
         os.symlink(target, roots / "link")
         uid = "t::escape"
-        journal.record_output(
-            uid, str(roots / "link" / ".." / ".." / "real_target"),
-            cleanup=True, kind="output",
-        )
+        _write_artifact(journal, uid, str(roots / "link" / ".." / ".." / "real_target"), delete_on_failure=True)
 
         journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
 
@@ -755,7 +764,7 @@ class TestArtifactJournalCleanupModes:
         journal = ArtifactJournal(tmp_path)
         uid = "job_clean_pre"
         journal.record_signal(uid, "gpu", 1.0)
-        journal.record_output(uid, "/tmp/out", cleanup=True)
+        _write_artifact(journal, uid, "/tmp/out", delete_on_failure=True)
         journal.record_input_file(uid, "/tmp/in")
 
         assert journal.signals_path(uid).exists()
@@ -776,8 +785,8 @@ class TestArtifactJournalCleanupModes:
         final_file = tmp_path / "final.txt"
         final_file.write_text("final")
 
-        journal.record_output(uid, str(cache_file), cleanup=True, kind="cache")
-        journal.record_output(uid, str(final_file), cleanup=True, kind="output")
+        _write_artifact(journal, uid, str(cache_file), delete_on_failure=True, delete_on_success=True)
+        _write_artifact(journal, uid, str(final_file), delete_on_failure=True)
 
         journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
 
@@ -796,9 +805,9 @@ class TestArtifactJournalCleanupModes:
         keep_file = tmp_path / "keep.txt"
         keep_file.write_text("preserve")
 
-        journal.record_output(uid, str(broken_file), cleanup=True, kind="output")
-        journal.record_output(uid, str(broken_dir), cleanup=True, kind="output")
-        journal.record_output(uid, str(keep_file), cleanup=False, kind="output")
+        _write_artifact(journal, uid, str(broken_file), delete_on_failure=True)
+        _write_artifact(journal, uid, str(broken_dir), delete_on_failure=True)
+        _write_artifact(journal, uid, str(keep_file), delete_on_failure=False)
 
         journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
 

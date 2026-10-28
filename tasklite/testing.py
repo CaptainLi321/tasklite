@@ -41,6 +41,8 @@ def fake_ctx(
     job: Job,
     *,
     successes: Iterable[str] | None = None,
+    artifacts: dict[str, dict[str, dict[str, str]]] | None = None,
+    protected_roots: tuple[str | Path, ...] = (),
     failed: Iterable[str] | None = None,
     cursors: dict[str, str] | None = None,
     resources: Iterable[str] | None = None,
@@ -56,6 +58,8 @@ def fake_ctx(
     Args:
         job: 测试目标 job。
         successes: 已成功完成的 uid 集合（任意可迭代，``ctx.has_succeeded`` 命中源）。
+        artifacts: 按生产者 UID 注入具名成功描述；仍须显式提供 successes 和直接依赖。
+        protected_roots: 不可声明为产物的框架状态目录。
         failed: 已进失败档案的 uid 集合（任意可迭代，``ctx.has_failed`` 命中源）。
         cursors: 游标初值映射（``ctx.get_cursor`` 命中源）。
         resources: 已注册资源名集合——``ctx.suspend_resource`` 按名单
@@ -94,4 +98,6 @@ def fake_ctx(
         fatal_exceptions=fatal_exceptions,
         transient_exceptions=transient_exceptions,
         resource_names=frozenset(resources or ()),
+        artifact_descriptions=artifacts,
+        protected_roots=protected_roots,
     )

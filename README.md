@@ -46,7 +46,7 @@
 | **抗漂移增量探索 (Discovery)** | **内置函数式无游标去重** | 无 | 无 | 需自定义传感器 |
 | **全局限速与持久化休眠** | **内置令牌桶 + 跨重启持久化** | 无 | 需 Redis 限流组件 | 需复杂调度配置 |
 | **DAG 依赖与级联熔断** | **内置拓扑依赖 + 自动跳过** | 无 | 需 Canvas 复杂编排 | 原生支持 |
-| **产物沙盒与失败自动清理** | **内置 declare_output** | 无 | 无 | 需自定义 Hook |
+| **产物沙盒与显式清理授权** | **内置 declare_output** | 无 | 无 | 需自定义 Hook |
 
 ---
 
@@ -105,10 +105,10 @@ flowchart TD
 - 任务通过 `depends_on` 声明依赖；
 - 父任务失败进入失败档案时，所有下游依赖自动标记跳过 (`ERR_JOB_DEPENDENCY`)，避免无效计算。
 
-### 6. 📦 产物沙盒与自动清理
-- `ctx.declare_output()` 声明产出文件，内置路径遍历防御 (`../` 拒绝)；
-- 任务成功时校验物理产出完整性，任务失败时自动清理半成品文件，避免残留。
-- [ADR-0009](docs/adr/0009-artifact-authorization-and-cleanup.md) 已接受具名磁盘产物接口：可选 output 名称、独立路径查询与直接依赖校验；磁盘是产物的可靠来源，不新增持久控制状态，生产内存读取缓存暂不加入，IPC 独立推进。A1 设计已完成；A2 提供声明授权、路径删除原语与成功清单内部发布，公开接口迁移留 A3、收尾编排留 A4。
+### 6. 📦 具名磁盘产物与删除授权
+- `ctx.declare_output(path, name=...)` 声明文件或目录，返回规范绝对路径；消费方通过 `get_artifact_path` 查询直接依赖的成功产物。
+- 前删、失败删除、成功删除分别由 `delete_existing`、`delete_on_failure`、`delete_on_success` 授权，普通 output 默认均关闭；临时磁盘 `declare_cache` 固定成败清理。
+- [ADR-0009](docs/adr/0009-artifact-authorization-and-cleanup.md) 已接受具名磁盘产物接口：可选 output 名称、独立路径查询与直接依赖校验；磁盘是产物的可靠来源，不新增持久控制状态，生产内存读取缓存暂不加入，IPC 独立推进。A1 设计已完成；A2 提供声明授权、路径删除原语与成功清单内部发布，A3 已接通公开声明与查询；先清理后提交和清理错误编排留 A4。
 
 ### 7. 🌐 组合式 HTTP 网络工具与快照守卫 (HTTP Wrappers)
 - 开放 Callable 设计，支持原生 `urllib`、`requests`、`httpx` 或平台自定义签名 SDK；
@@ -149,7 +149,7 @@ logging.getLogger("tasklite").setLevel(logging.INFO)
 # 1. 定义任务处理器（在独立子进程中执行，必须模块级定义）
 def download_handler(job: Job, ctx):
     # 声明产出文件（失败时自动清理半残文件）
-    out = ctx.declare_output(f"./downloads/{job.job_id}.jpg", cleanup_on_fail=True)
+    out = ctx.declare_output(f"./downloads/{job.job_id}.jpg", delete_on_failure=True)
 
     # 模拟业务下载
     success = do_download(job.payload["url"], out)
@@ -294,7 +294,7 @@ def agent_worker(job: Job, ctx):
     
     # declare_output 返回解析后的绝对路径字符串（str），用 Path 包装后写文件，
     # 保证写入位置与框架校验/清理位置一致
-    out_path = Path(ctx.declare_output(f"./results/{job.job_id}.json", cleanup_on_fail=True))
+    out_path = Path(ctx.declare_output(f"./results/{job.job_id}.json", delete_on_failure=True))
     out_path.write_text(json.dumps(result, ensure_ascii=False))
     return True, {"tokens": result.get("usage", 0)}
 
