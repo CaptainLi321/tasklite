@@ -108,6 +108,7 @@ flowchart TD
 ### 6. 📦 产物沙盒与自动清理
 - `ctx.declare_output()` 声明产出文件，内置路径遍历防御 (`../` 拒绝)；
 - 任务成功时校验物理产出完整性，任务失败时自动清理半成品文件，避免残留。
+- 产物独立删除授权、持久接纳与清理责任正在 [ADR-0009 草案](docs/adr/0009-artifact-authorization-and-cleanup.md) 中裁决（Proposed，尚未实施）；草案签名不属于当前可用 API。
 
 ### 7. 🌐 组合式 HTTP 网络工具与快照守卫 (HTTP Wrappers)
 - 开放 Callable 设计，支持原生 `urllib`、`requests`、`httpx` 或平台自定义签名 SDK；
