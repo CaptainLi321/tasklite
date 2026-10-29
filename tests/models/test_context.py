@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from tasklite.models.artifact import ArtifactDeclaration
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
 from tasklite.utils.encoding import encode_job_uid_filename
@@ -125,8 +126,8 @@ class TestDeclareOutputSandbox:
         final = ctx.declare_output("sub/dir/out.json")
         assert final.startswith(str(root))
         assert Path(final).parent.is_dir()  # 父目录自动创建
-        outputs = ArtifactJournal(str(tmp_path / "ipc")).read_outputs("fetch::j1")
-        assert outputs == [(final, False, "output")]
+        outputs = ArtifactJournal(str(tmp_path / "ipc")).read_artifacts("fetch::j1")
+        assert outputs == (ArtifactDeclaration(final),)
 
     def test_cleanup_flag_persisted(self, tmp_path):
         root = tmp_path / "out"
@@ -135,9 +136,9 @@ class TestDeclareOutputSandbox:
         ctx = _make_ctx(output_roots=root, ipc_dir=ipc)
         keep = ctx.declare_output("keep.bin", delete_on_failure=False)
         drop = ctx.declare_output("drop.bin", delete_on_failure=True)
-        recorded = {p: (c, k) for p, c, k in ArtifactJournal(ipc).read_outputs("fetch::j1")}
-        assert recorded[keep] == (False, "output")
-        assert recorded[drop] == (True, "output")
+        recorded = {d.path: d for d in ArtifactJournal(ipc).read_artifacts("fetch::j1")}
+        assert recorded[keep] == ArtifactDeclaration(keep)
+        assert recorded[drop] == ArtifactDeclaration(drop, delete_on_failure=True)
 
     def test_cleanup_flag_is_keyword_only(self, tmp_path):
         root = tmp_path / "out"
@@ -249,7 +250,7 @@ class TestDeclareCache:
         ipc = str(tmp_path / "ipc")
         ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
         final = ctx.declare_cache("part.bin")
-        assert ArtifactJournal(ipc).read_outputs("fetch::j1") == [(final, True, "cache")]
+        assert ArtifactJournal(ipc).read_artifacts("fetch::j1") == (ArtifactDeclaration(final, delete_on_failure=True, delete_on_success=True),)
 
     def test_cache_sandbox_rejected_by_default(self, tmp_path):
         root = tmp_path / "out"

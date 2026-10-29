@@ -14,6 +14,7 @@ import os
 import stat
 from pathlib import Path
 
+from ..exceptions import _ArtifactIOError
 from ..utils.artifact import ArtifactPathPolicy
 from ..utils.ipc import ArtifactJournal
 from ..utils.jsonutil import dumps
@@ -123,7 +124,10 @@ class JobContext:
             output_roots=self.output_roots,
             protected_roots=(*self._protected_roots, *((self.ipc_dir,) if self.ipc_dir else ())),
         )
-        resolved = policy.resolve(path, sandbox=sandbox)
+        try:
+            resolved = policy.resolve(path, sandbox=sandbox)
+        except OSError as error:
+            raise _ArtifactIOError(str(error)) from error
         declaration = ArtifactDeclaration(
             resolved, name=name, delete_existing=delete_existing,
             delete_on_failure=delete_on_failure, delete_on_success=delete_on_success,

@@ -40,6 +40,13 @@ class RateLimitHit(RetryError):
     pass
 
 
+class _ArtifactIOError(BaseException):
+    """声明读写或授权清理的环境故障，需停止当前运行。
+
+    继承 BaseException，防止 handler 的 except Exception 误吞后发布成功。
+    """
+
+
 class _CommitCrashSignal(BaseException):
     """内部信号：commit 失败后已重入队，需立即崩溃。
 
@@ -61,6 +68,7 @@ __all__ = [
     "RetryError",
     "FatalError",
     "RateLimitHit",
+    "_ArtifactIOError",
     "_CommitCrashSignal",
     "_JobTerminated",
 ]

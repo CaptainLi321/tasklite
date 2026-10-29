@@ -446,8 +446,10 @@ class EngineRuntime:
         if self._session.stop_mode is not StopMode.NONE:
             if self._session.stop_mode is StopMode.ABORTING:
                 logger.warning("Force abort requested. Killing in-flight jobs.")
-                self._recovery.abort_in_flight()
-                self._recovery.save_queue_crash_safe()
+                try:
+                    self._recovery.abort_in_flight()
+                finally:
+                    self._recovery.save_queue_crash_safe()
                 return self._terminal_outcome()
             if self._in_flight:
                 draining = True
@@ -564,8 +566,12 @@ class EngineRuntime:
             # dispatch 的早置 raise，不在此处。
             self._crash_log(e)
             exit_reason = self._session.exit_reason(e).value
-            self._recovery.abort_in_flight()
-            self._recovery.save_queue_crash_safe()
+            try:
+                self._recovery.abort_in_flight()
+            except BaseException as cleanup_error:
+                logger.error(f"Abort cleanup failed: {cleanup_error}")
+            finally:
+                self._recovery.save_queue_crash_safe()
             raise
         finally:
             try:

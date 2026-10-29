@@ -146,7 +146,9 @@ def test_declaration_write_error_propagates(tmp_path):
     ipc = tmp_path / "ipc"
     ctx = fake_ctx(Job("build", "one"), ipc_dir=str(ipc))
     ArtifactJournal(ipc).outputs_path(ctx.job.uid).mkdir()
-    with pytest.raises(IsADirectoryError):
+    from tasklite.exceptions import _ArtifactIOError
+
+    with pytest.raises(_ArtifactIOError):
         ctx.declare_output(tmp_path / "result")
 
 
@@ -169,3 +171,21 @@ def test_getter_propagates_access_error_with_reference_context(tmp_path, monkeyp
     with pytest.raises(PermissionError) as caught:
         ctx.get_artifact_path(producer_job_uid="build::one", artifact_name="report")
     assert "build::one" in str(caught.value) and str(path) in str(caught.value)
+
+
+def test_output_path_io_fault_is_environment_error(tmp_path, monkeypatch):
+    import os
+    from tasklite.exceptions import _ArtifactIOError
+
+    ctx = fake_ctx(Job('build', 'one'), tmp_root=tmp_path)
+    target = tmp_path / 'result'
+    original = os.lstat
+
+    def denied(path, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError('output access denied')
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'lstat', denied)
+    with pytest.raises(_ArtifactIOError, match='output access denied'):
+        ctx.declare_output(target)

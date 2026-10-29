@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..exceptions import FatalError, RateLimitHit, RetryError
+from ..exceptions import FatalError, RateLimitHit, RetryError, _ArtifactIOError
 from ..models.artifact import ArtifactDeclaration
 from ..models.context import JobContext
 from ..models.job import Job
@@ -198,6 +198,7 @@ def _decode_ipc_result(
     cursor_updates: dict[str, str | None] = {}
     resource_suspensions: list[tuple[str, float]] = []
     transient_kind: str | None = None
+    artifact_error: str | None = None
 
     status = res.get("status") if isinstance(res, dict) else None
     legacy_keys = {"new_jobs", "error"} & res.keys() if isinstance(res, dict) else set()
@@ -222,6 +223,8 @@ def _decode_ipc_result(
         retry_requested = True
         retry_error = res.get("error_message")
         transient_kind = "interrupted"
+    elif status == "artifact_error":
+        artifact_error = str(res.get("error_message") or "Artifact declaration I/O failed")
     elif status == "fatal":
         result_metadata = {
             "error_message": res.get("error_message", "FATAL (no message)"),
@@ -244,13 +247,6 @@ def _decode_ipc_result(
         retry_error = att.retry_error
         retry_requested = att.retry_requested
 
-    if success and ipc_dir is not None:
-        ok, err = ArtifactJournal(ipc_dir, output_roots=output_roots).verify_outputs(job.uid)
-        if not ok:
-            logger.error(f"Verification failed for {job.uid}: {err}")
-            success = False
-            result_metadata = {"error_message": err}
-
     return ExecutionResult(
         success=success,
         result_metadata=result_metadata,
@@ -260,6 +256,7 @@ def _decode_ipc_result(
         cursor_updates=cursor_updates,
         resource_suspensions=resource_suspensions,
         transient_kind=transient_kind,
+        artifact_error=artifact_error,
     )
 
 
@@ -319,6 +316,8 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
             "resource_suspensions": ctx.resource_suspensions,
             "cursor_updates": ctx.cursor_updates,
         })
+    except _ArtifactIOError as e:
+        _write_result({"status": "artifact_error", "error_message": str(e)})
     except RetryError as e:
         # 限流瞬态判定必须在子进程编码侧完成：RateLimitHit 是 RetryError
         # 子类、与本类共享 status="retry" 通道，父进程侧已无异常类型可辨；
@@ -386,6 +385,7 @@ class ExecutionResult:
     resource_suspensions: list[tuple[str, float]] = field(default_factory=list)
     transient_kind: str | None = None
     will_retry: bool = False
+    artifact_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -722,8 +722,12 @@ class ExecutionChannel:
                 continue
             pending_handles.append(handle)
 
-        if pending_handles:
-            self.finalize_processes(pending_handles)
+        for handle, _ in done_pairs:
+            try:
+                handle.process.join(timeout=self._JOIN_REAP_TIMEOUT)
+            except Exception as error:
+                logger.warning(f"Completed process join failed: {error}")
+        self.finalize_processes(handles)
 
         # 杀进程后补排空（不变式：收尾排空必须晚于进程终止）。abort 序列
         # 「先排空后杀」窗口内 worker 终生前写入的 suspend 信号，唯一可靠
@@ -741,7 +745,6 @@ class ExecutionChannel:
                 (handle.job_uid, r_name, secs)
                 for r_name, secs in self._salvage_signals(handle.job_uid, None)
             )
-            self.cleanup_artifacts(handle.job_uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
             truly_cancelled.append(handle)
 
         return AbortOutcome(
@@ -777,10 +780,7 @@ class ExecutionChannel:
 
     def read_declared_inputs(self, job_uid: str) -> list[str]:
         """读取任务声明的输入路径清单。"""
-        try:
-            return self.journal.read_inputs(job_uid)
-        except Exception:
-            return []
+        return self.journal.read_inputs(job_uid)
 
 
 __all__ = [

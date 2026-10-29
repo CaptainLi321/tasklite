@@ -121,7 +121,7 @@ class TestExecutionChannelArtifactCleanup:
     def test_cleanup_success_deletes_cache_files_and_declarations(self, tmp_path):
         from tasklite.utils.ipc import ArtifactCleanupMode
 
-        channel = ExecutionChannel(tmp_path)
+        channel = ExecutionChannel(tmp_path / "ipc", output_roots=tmp_path)
         uid = "job_success"
         cache_file = tmp_path / "cache.tmp"
         cache_file.write_text("temporary data")
@@ -140,7 +140,7 @@ class TestExecutionChannelArtifactCleanup:
     def test_cleanup_failure_deletes_authorized_outputs(self, tmp_path):
         from tasklite.utils.ipc import ArtifactCleanupMode
 
-        channel = ExecutionChannel(tmp_path)
+        channel = ExecutionChannel(tmp_path / "ipc", output_roots=tmp_path)
         uid = "job_fail"
         fail_file = tmp_path / "temp_product.txt"
         fail_file.write_text("to delete")
@@ -649,12 +649,11 @@ class TestDecodeIpcResultDefense:
         assert "PROCESS_CRASH_EXITCODE_1" in result.result_metadata["error_message"]
         assert "PROCESS_CRASH_EXIT" in (result.retry_error or "")
 
-    def test_missing_output_marks_failed(self, tmp_path):
+    def test_decode_leaves_output_validation_to_completion(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
         _write_artifact(journal, "t::a", str(tmp_path / "missing.jpg"), delete_on_failure=True)
         result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
-        assert result.success is False
-        assert "Missing output" in result.result_metadata["error_message"]
+        assert result.success is True
 
     def test_present_output_passes(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
@@ -665,7 +664,7 @@ class TestDecodeIpcResultDefense:
         assert result.success is True
 
     def test_cache_output_skips_existence_check(self, tmp_path):
-        """kind=cache 的临时文件跳过存在性校验（原子产出 .part 已被 replace）。"""
+        """解码不读取临时产物；存在性校验统一交给完成机器。"""
         journal = ArtifactJournal(tmp_path)
         _write_artifact(journal, "t::a", str(tmp_path / "cache.part"), delete_on_failure=True, delete_on_success=True)
         result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
@@ -1119,9 +1118,14 @@ class TestAbortInFlight:
             pass
 
     def test_abort_with_completed_and_cancelled(self, tmp_path):
-        channel = ExecutionChannel(tmp_path)
+        ipc_dir = tmp_path / "ipc"
+        ipc_dir.mkdir()
+        channel = ExecutionChannel(ipc_dir, output_roots=tmp_path)
         job_done = Job("task", "done")
         job_pending = Job("task", "pending")
+        unfinished = tmp_path / "unfinished"
+        unfinished.write_text("partial output")
+        _write_artifact(channel.journal, job_pending.uid, str(unfinished), delete_on_failure=True)
 
         res_done = channel.journal.result_path(job_done.uid, "inc_done")
         res_done.write_text(
@@ -1131,12 +1135,12 @@ class TestAbortInFlight:
         h_done = JobHandle(
             job_uid=job_done.uid, process=self.MockProcess(),
             timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job_done,
-            ipc_dir=str(tmp_path), execution_id="inc_done",
+            ipc_dir=str(ipc_dir), execution_id="inc_done",
         )
         h_pending = JobHandle(
             job_uid=job_pending.uid, process=self.MockProcess(),
             timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job_pending,
-            ipc_dir=str(tmp_path), execution_id="inc_pending",
+            ipc_dir=str(ipc_dir), execution_id="inc_pending",
         )
 
         outcome = channel.abort_in_flight([h_done, h_pending])
@@ -1147,6 +1151,8 @@ class TestAbortInFlight:
 
         assert len(outcome.cancelled) == 1
         assert outcome.cancelled[0].job_uid == job_pending.uid
+        assert unfinished.exists()
+        assert channel.journal.outputs_path(job_pending.uid).exists()
 
     def test_abort_salvages_signal_written_before_kill(self, tmp_path):
         """杀进程后补排空：「先排空后杀」窗口内终前写入的 suspend 信号捞回。
@@ -1188,7 +1194,7 @@ class TestAbortInFlight:
 
         assert [handle.job_uid for handle in outcome.cancelled] == [job.uid]
         assert outcome.salvaged_signals == [(job.uid, "gpu", 30.0)]
-        # 信号已被消费带走，半成品清理照常执行（不留残留文件）
+        # 信号已排空并交给上层结算。
         assert not channel.journal.signals_path(job.uid).exists()
 
     def test_abort_reprobe_completed_merges_post_drain_signals(self, tmp_path):

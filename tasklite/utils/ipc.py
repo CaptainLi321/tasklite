@@ -25,12 +25,12 @@ import json
 import logging
 import os
 import re
-import shutil
 import time
 from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import unquote
 
+from ..exceptions import _ArtifactIOError
 from ..models.artifact import ArtifactDeclaration, append_artifact_declaration, validate_artifact_declarations
 from .artifact import ArtifactPathPolicy
 from .encoding import encode_job_uid_filename
@@ -217,14 +217,29 @@ class ArtifactJournal:
         """校验同执行授权与路径范围后追加；持久写入错误向调用者传播。"""
         if self.ipc_dir is None:
             raise ValueError("ipc_dir is required to record an artifact")
-        self._validate_artifact_path(declaration)
-        previous = self._read_artifact_entries(job_uid)
+        try:
+            self._validate_artifact_path(declaration)
+            previous = self._read_artifact_entries(job_uid)
+        except OSError as error:
+            raise _ArtifactIOError(str(error)) from error
         declarations = append_artifact_declaration(previous, declaration)
-        if len(declarations) > len(previous):
-            if prepare:
+        if len(declarations) == len(previous):
+            return
+        if prepare:
+            try:
                 self.path_policy.remove_existing(declaration)
+            except FileExistsError as error:
+                if not declaration.delete_existing:
+                    raise
+                raise _ArtifactIOError(str(error)) from error
+            except OSError as error:
+                raise _ArtifactIOError(str(error)) from error
+        try:
+            if prepare:
                 Path(declaration.path).parent.mkdir(parents=True, exist_ok=True)
             self._append_artifact(job_uid, declaration)
+        except OSError as error:
+            raise _ArtifactIOError(str(error)) from error
 
     @property
     def path_policy(self) -> ArtifactPathPolicy:
@@ -249,8 +264,8 @@ class ArtifactJournal:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(dumps(entry) + "\n")
                 f.flush()
-        except OSError:
-            pass
+        except OSError as error:
+            raise _ArtifactIOError(str(error)) from error
 
     def record_input_file(self, job_uid: str, resolved_path: str) -> str:
         """追加一条规范输入路径声明并返回该路径字符串。"""
@@ -353,26 +368,25 @@ class ArtifactJournal:
     # ── 读取与解析（父进程 Engine 侧）─────────────────────────────
 
     def read_inputs(self, job_uid: str) -> list[str]:
-        """读取一个 job 的全部已声明输入路径字符串列表（坏行容灾跳过）。"""
+        """严格读取输入路径；缺失日志为空，读取错误不得丢失依赖后发布成功。"""
         if self.ipc_dir is None:
             return []
-        path = self.inputs_path(job_uid)
-        paths: list[str] = []
         try:
-            if path.exists():
-                with open(path, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            data = loads(line)
-                            if isinstance(data, dict) and isinstance(data.get("path"), str) and data["path"]:
-                                paths.append(data["path"])
-                        except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
-                            continue
-        except OSError:
-            pass
+            stream = open(self.inputs_path(job_uid), encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        paths: list[str] = []
+        with stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                try:
+                    data = loads(line)
+                    if not isinstance(data, dict) or not isinstance(data.get("path"), str) or not data["path"]:
+                        raise ValueError("input path is required")
+                except (RecursionError, TypeError, ValueError) as error:
+                    raise ValueError(f"invalid input declaration for {job_uid}") from error
+                paths.append(data["path"])
         return paths
 
     def read_artifacts(self, job_uid: str) -> tuple[ArtifactDeclaration, ...]:
@@ -399,29 +413,6 @@ class ArtifactJournal:
                     self._validate_artifact_path(declaration)
                 declarations.append(declaration)
         return tuple(declarations)
-
-    def read_outputs(self, job_uid: str) -> list[tuple[str, bool, str]]:
-        """为现有验证与清理提供统一授权值的 tuple 投影，坏行不授予删除权。"""
-        if self.ipc_dir is None:
-            return []
-        outputs: list[tuple[str, bool, str]] = []
-        try:
-            with open(self.outputs_path(job_uid), encoding="utf-8") as stream:
-                for line in stream:
-                    if not line.strip():
-                        continue
-                    try:
-                        declaration = ArtifactDeclaration.from_dict(loads(line))
-                    except (RecursionError, TypeError, ValueError):
-                        continue
-                    outputs.append((
-                        declaration.path,
-                        declaration.delete_on_failure,
-                        "cache" if declaration.delete_on_success else "output",
-                    ))
-        except OSError:
-            pass
-        return outputs
 
     def drain_signals(self, job_uid: str) -> list[tuple[str, float]]:
         """读取并删除一个 job 的 suspend 信号文件（排空语义）。
@@ -630,46 +621,31 @@ class ArtifactJournal:
 
     # ── 产物校验与生命周期清理 ────────────────────────────────────
 
-    def _in_cleanup_sandbox(self, raw_path: str) -> bool:
-        """删除前的消费侧沙盒归属复检（解析符号链接与 ``..`` 后判定）。
+    def verify_artifacts(self, declarations: Sequence[ArtifactDeclaration]) -> str | None:
+        """仅验证需保留的产物；临时路径允许已被 rename 移走。"""
+        for declaration in declarations:
+            self._validate_artifact_path(declaration)
+            if not declaration.delete_on_success:
+                try:
+                    os.stat(declaration.path)
+                except FileNotFoundError:
+                    return f"Missing output {declaration.path}"
+        return None
 
-        不变式：``.outputs.jsonl`` 是 ipc_dir 上的不可信输入，声明侧校验
-        可被伪造声明绕过——任何 unlink/rmtree 前必须复检路径归属，信任
-        根为 output_roots 与 ipc_dir 的并集；无任何信任根或解析越界一律
-        拒绝清理（fail-safe 方向：漏删可人工补救，误删不可逆）。
-        """
-        candidates: list[Path] = list(self.output_roots or [])
-        if self.ipc_dir:
-            candidates.append(Path(self.ipc_dir).resolve())
-        if not candidates:
-            return False
-        try:
-            self.resolve_and_validate_path(raw_path, candidates, sandbox=True)
-        except ValueError:
-            return False
-        return True
+    def cleanup_declared_artifacts(
+        self, declarations: Sequence[ArtifactDeclaration], *, success: bool,
+    ) -> None:
+        """只执行该结局的删除授权，错误不得降级为清理完成。"""
+        policy = self.path_policy
+        for declaration in declarations:
+            policy.cleanup(declaration, success=success)
 
-    def _cleanup_sandbox_guard(self, job_uid: str, raw_path: str) -> bool:
-        """清理卫兵：归属复检失败时告警一次并示意调用方跳过该路径。"""
-        if self._in_cleanup_sandbox(raw_path):
-            return True
-        logger.error(
-            f"Refusing to clean declared path outside sandbox for {job_uid}: {raw_path}"
-        )
-        return False
-
-    def verify_outputs(self, job_uid: str) -> tuple[bool, str | None]:
-        """校验 job 的产物是否存在（忽略临时 cache）。
-
-        Returns:
-            (True, None) 表示校验通过；(False, error_msg) 表示产物缺失。
-        """
-        for out_path, _, kind in self.read_outputs(job_uid):
-            if kind == "cache":
-                continue
-            if not Path(out_path).exists():
-                return False, f"Missing output {out_path}"
-        return True, None
+    def clear_declarations(self, job_uid: str) -> None:
+        """业务转移已完成后删除声明；失败不改写已经提交的事实。"""
+        if self.ipc_dir is not None:
+            self.outputs_path(job_uid).unlink(missing_ok=True)
+            self.inputs_path(job_uid).unlink(missing_ok=True)
+        self.cleanup_ipc_files(job_uid)
 
     def cleanup_ipc_files(self, job_uid: str, execution_id: str | None = None) -> None:
         """删除某个 job 的结果/信号/临时文件（不含 outputs.jsonl）。"""
@@ -689,74 +665,13 @@ class ArtifactJournal:
                 pass
 
     def cleanup(self, job_uid: str, mode: str | ArtifactCleanupMode) -> None:
-        """根据清理模式对产物文件与声明文件进行生命周期清理。"""
-        if self.ipc_dir is None:
-            return
-
-        mode_val = mode.value if hasattr(mode, "value") else str(mode)
-
-        if mode_val == ArtifactCleanupMode.PRE_SUBMIT.value:
-            for p in (self.inputs_path(job_uid), self.outputs_path(job_uid), self.signals_path(job_uid)):
-                try:
-                    if p.exists():
-                        p.unlink()
-                except OSError:
-                    pass
-            for sp in self.iter_stale_result_paths(job_uid):
-                try:
-                    if sp.exists():
-                        sp.unlink()
-                except OSError:
-                    pass
-            return
-
-        if mode_val == ArtifactCleanupMode.SUCCESS.value:
-            try:
-                for out_path, _, kind in self.read_outputs(job_uid):
-                    if kind == "cache":
-                        if not self._cleanup_sandbox_guard(job_uid, out_path):
-                            continue
-                        out_obj = Path(out_path)
-                        if out_obj.exists():
-                            out_obj.unlink()
-                            logger.info(f"Cleaned cache file: {out_obj}")
-                op = self.outputs_path(job_uid)
-                if op.exists():
-                    op.unlink()
-                ip = self.inputs_path(job_uid)
-                if ip.exists():
-                    ip.unlink()
-            except OSError:
-                pass
-            self.cleanup_ipc_files(job_uid)
-            return
-
-        if mode_val == ArtifactCleanupMode.FAILURE_OR_RETRY.value:
-            try:
-                for out_path, cleanup, kind in self.read_outputs(job_uid):
-                    if kind == "cache" or cleanup:
-                        if not self._cleanup_sandbox_guard(job_uid, out_path):
-                            continue
-                        out_path_obj = Path(out_path)
-                        if out_path_obj.exists():
-                            if out_path_obj.is_dir():
-                                shutil.rmtree(out_path_obj)
-                            else:
-                                out_path_obj.unlink()
-                            logger.info(f"Cleaned broken output: {out_path_obj}")
-            except Exception as e:
-                logger.error(f"Could not remove outputs for {job_uid}: {e}")
-            finally:
-                try:
-                    p = self.outputs_path(job_uid)
-                    if p.exists():
-                        p.unlink()
-                    ip = self.inputs_path(job_uid)
-                    if ip.exists():
-                        ip.unlink()
-                except OSError:
-                    pass
-                self.cleanup_ipc_files(job_uid)
+        """清理本执行授权产物；派发前仅丢弃残留声明，不重放删除。"""
+        mode = ArtifactCleanupMode(mode)
+        if mode is not ArtifactCleanupMode.PRE_SUBMIT:
+            self.cleanup_declared_artifacts(
+                self.read_artifacts(job_uid), success=mode is ArtifactCleanupMode.SUCCESS,
+            )
+        self.clear_declarations(job_uid)
 
 
 __all__ = [

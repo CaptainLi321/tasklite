@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from tasklite.exceptions import _ArtifactIOError
 from tasklite.utils.encoding import encode_job_uid_filename
 from tasklite.utils.ipc import (
     ArtifactCleanupMode,
@@ -106,8 +107,8 @@ class TestArtifactJournalPathAndSandbox:
 
 
 class TestArtifactJournalDeclarations:
-    def test_record_and_verify_outputs(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
+    def test_record_and_verify_artifacts(self, tmp_path):
+        journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path)
         uid = "job_out"
         out_file = tmp_path / "final.data"
         cache_file = tmp_path / "temp.cache"
@@ -116,15 +117,13 @@ class TestArtifactJournalDeclarations:
         _write_artifact(journal, uid, str(cache_file), delete_on_failure=True, delete_on_success=True)
 
         # 产物未创建时校验失败
-        ok, err = journal.verify_outputs(uid)
-        assert ok is False
+        declarations = journal.read_artifacts(uid)
+        err = journal.verify_artifacts(declarations)
         assert "Missing output" in err
 
         # 创建正式产物后，尽管 cache 缺失，校验仍通过（cache 跳过存在性校验）
         out_file.write_text("done")
-        ok, err = journal.verify_outputs(uid)
-        assert ok is True
-        assert err is None
+        assert journal.verify_artifacts(declarations) is None
 
     def test_record_and_read_input_paths(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
@@ -565,12 +564,7 @@ class TestRawResultCodec:
 
 
 class TestResultParseContainment:
-    """结果/声明文件读取容灾的捕获面完整性：解析失控异常按损坏降级。
-
-    深嵌套 JSON 使 json 解析器抛 RecursionError——它不是 ValueError 子类，
-    容灾 except 家族漏接会让「损坏返回 None」承诺被击穿，异常沿认领/
-    收割链穿透至主循环崩溃。
-    """
+    """结果损坏按缺失处理；声明损坏必须阻止发布不完整依赖或删除授权。"""
 
     def test_read_result_deep_nesting_returns_none(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
@@ -579,7 +573,7 @@ class TestResultParseContainment:
 
         assert journal.read_result(deep) is None, "解析失控必须按损坏结果降级为 None"
 
-    def test_read_outputs_deep_nesting_line_skipped(self, tmp_path):
+    def test_read_artifacts_rejects_deep_nesting_line(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
         uid = "t::deep_outputs"
         op = journal.outputs_path(uid)
@@ -591,13 +585,10 @@ class TestResultParseContainment:
             encoding="utf-8",
         )
 
-        outputs = journal.read_outputs(uid)
+        with pytest.raises(ValueError, match="invalid artifact declaration"):
+            journal.read_artifacts(uid)
 
-        assert len(outputs) == 2, "深嵌套行按坏行跳过，其余行正常解析"
-        assert outputs[0][0] == str(good)
-        assert outputs[1][0] == "/" + "[" * 200000
-
-    def test_read_inputs_deep_nesting_line_skipped(self, tmp_path):
+    def test_read_inputs_rejects_deep_nesting_line(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
         uid = "t::deep_inputs"
         ip = journal.inputs_path(uid)
@@ -607,9 +598,8 @@ class TestResultParseContainment:
             encoding="utf-8",
         )
 
-        entries = journal.read_inputs(uid)
-
-        assert entries == ["/tmp/a"], "深嵌套行按坏行跳过"
+        with pytest.raises(ValueError):
+            journal.read_inputs(uid)
 
     def test_read_suspend_lines_deep_nesting_line_skipped(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
@@ -625,8 +615,8 @@ class TestResultParseContainment:
             "深嵌套行按坏行跳过，合法信号保留"
         )
 
-    def test_read_outputs_skips_bad_line_keeps_good_ones(self, tmp_path):
-        """坏行 + 后随好行 → 坏行跳过、好行保留（continue 语义）。"""
+    def test_read_artifacts_rejects_bad_line(self, tmp_path):
+        """坏行不能被忽略后继续授予后续声明删除权。"""
         journal = ArtifactJournal(tmp_path)
         uid = "t::a"
         p = tmp_path / "t%3A%3Aa.outputs.jsonl"
@@ -636,11 +626,10 @@ class TestResultParseContainment:
             '{"path": "/ok_second", "delete_on_failure": true}\n',
             encoding="utf-8",
         )
-        outputs = journal.read_outputs(uid)
-        assert len(outputs) == 2, "坏行应被跳过而非终止读取"
-        assert outputs[0][0] == "/ok_first" and outputs[1][0] == "/ok_second"
+        with pytest.raises(ValueError, match="invalid artifact declaration"):
+            journal.read_artifacts(uid)
 
-    def test_read_outputs_skips_empty_line(self, tmp_path):
+    def test_read_artifacts_skips_empty_line(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
         uid = "t::a"
         p = tmp_path / "t%3A%3Aa.outputs.jsonl"
@@ -650,10 +639,10 @@ class TestResultParseContainment:
             '{"path": "/b", "delete_on_failure": true}\n',
             encoding="utf-8",
         )
-        outputs = journal.read_outputs(uid)
-        assert [o[0] for o in outputs] == ["/a", "/b"]
+        outputs = journal.read_artifacts(uid)
+        assert [o.path for o in outputs] == ["/a", "/b"]
 
-    def test_read_inputs_skips_bad_line_keeps_good_ones(self, tmp_path):
+    def test_read_inputs_rejects_bad_line(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
         uid = "t::a"
         p = tmp_path / "t%3A%3Aa.inputs.jsonl"
@@ -663,17 +652,12 @@ class TestResultParseContainment:
             '{"path": "/in_second", "kind": "file", "size": 2, "mtime_ns": 2}\n',
             encoding="utf-8",
         )
-        entries = journal.read_inputs(uid)
-        assert entries == ["/in_first", "/in_second"], "坏行应被跳过而非终止读取"
+        with pytest.raises(ValueError):
+            journal.read_inputs(uid)
 
 
 class TestCleanupSandboxRecheck:
-    """清理消费侧的沙盒归属复检：outputs 声明是 ipc_dir 上的不可信输入。
-
-    声明侧的沙盒校验可被伪造的 ``.outputs.jsonl`` 声明绕过，任何删除动作
-    （unlink / rmtree）执行前必须复检路径归属——解析符号链接与 ``..`` 后
-    落在 output_roots 或 ipc_dir 之外的一律拒绝清理，绝不 rmtree。
-    """
+    """删除时复检声明范围，越界或保护目录冲突必须保留现场并报错。"""
 
     def _make_journal(self, tmp_path, with_output_root=True):
         ipc_dir = tmp_path / "ipc"
@@ -685,7 +669,7 @@ class TestCleanupSandboxRecheck:
         return ArtifactJournal(ipc_dir, output_roots=roots), ipc_dir, roots
 
     def test_failure_cleanup_refuses_out_of_sandbox_tree(self, tmp_path):
-        """失败清理对沙盒外声明路径拒绝删除（含整树 rmtree），声明文件照常清。"""
+        """拒绝沙盒外目录并保留声明供诊断。"""
         journal, _, _ = self._make_journal(tmp_path)
         victim = tmp_path / "victim_dir"
         victim.mkdir()
@@ -693,11 +677,12 @@ class TestCleanupSandboxRecheck:
         uid = "t::poison"
         _write_artifact(journal, uid, str(victim), delete_on_failure=True)
 
-        journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
+        with pytest.raises(ValueError):
+            journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
 
         assert victim.exists(), "沙盒外目录绝不能被 rmtree"
         assert (victim / "precious.txt").exists()
-        assert not journal.outputs_path(uid).exists(), "损坏声明文件本身照常清理"
+        assert journal.outputs_path(uid).exists()
 
     def test_failure_cleanup_still_removes_in_sandbox_entries(self, tmp_path):
         """沙盒内合法声明的半成品文件与目录照常清理（复检不误伤合法清理）。"""
@@ -724,12 +709,13 @@ class TestCleanupSandboxRecheck:
         uid = "t::cache"
         _write_artifact(journal, uid, str(victim), delete_on_failure=True, delete_on_success=True)
 
-        journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
+        with pytest.raises(ValueError):
+            journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
 
         assert victim.exists(), "沙盒外 cache 文件绝不能被 unlink"
 
-    def test_cleanup_without_output_roots_confines_to_ipc_dir(self, tmp_path):
-        """未注入 output_roots 时沙盒退化为 ipc_dir 自身（缺信任根即默认拒绝）。"""
+    def test_cleanup_rejects_protected_ipc_dir_without_output_roots(self, tmp_path):
+        """IPC 目录始终受保护，即使没有配置输出根。"""
         journal, ipc_dir, _ = self._make_journal(tmp_path, with_output_root=False)
         inside = ipc_dir / "scratch.tmp"
         inside.write_text("data")
@@ -739,10 +725,11 @@ class TestCleanupSandboxRecheck:
         _write_artifact(journal, uid, str(inside), delete_on_failure=True, delete_on_success=True)
         _write_artifact(journal, uid, str(victim), delete_on_failure=True, delete_on_success=True)
 
-        journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
+        with pytest.raises(ValueError, match="protected root"):
+            journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
 
-        assert not inside.exists(), "ipc_dir 内声明路径照常清理"
-        assert victim.exists(), "无信任根时沙盒外路径必须拒绝清理"
+        assert inside.exists()
+        assert victim.exists()
 
     def test_failure_cleanup_rejects_dotdot_escape_and_symlink(self, tmp_path):
         """``..`` 穿越与符号链接间接逃逸的声明路径同样拒绝清理。"""
@@ -754,7 +741,8 @@ class TestCleanupSandboxRecheck:
         uid = "t::escape"
         _write_artifact(journal, uid, str(roots / "link" / ".." / ".." / "real_target"), delete_on_failure=True)
 
-        journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
+        with pytest.raises(ValueError):
+            journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
 
         assert target.exists(), "经符号链接与 .. 逃逸出沙盒的路径必须拒绝清理"
 
@@ -778,7 +766,7 @@ class TestArtifactJournalCleanupModes:
         assert not journal.inputs_path(uid).exists()
 
     def test_cleanup_success_mode(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
+        journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path)
         uid = "job_clean_succ"
         cache_file = tmp_path / "temp.cache"
         cache_file.write_text("cache")
@@ -795,7 +783,7 @@ class TestArtifactJournalCleanupModes:
         assert not journal.outputs_path(uid).exists()
 
     def test_cleanup_failure_mode(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
+        journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path)
         uid = "job_clean_fail"
         broken_file = tmp_path / "broken.txt"
         broken_file.write_text("half written")
@@ -818,7 +806,7 @@ class TestArtifactJournalCleanupModes:
 
 
 class TestTypedArtifactJournal:
-    def test_authorizations_use_one_log_and_project_existing_reader(self, tmp_path):
+    def test_authorizations_use_one_typed_log(self, tmp_path):
         from tasklite.models.artifact import ArtifactDeclaration
 
         journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path / "out")
@@ -829,7 +817,6 @@ class TestTypedArtifactJournal:
         journal.record_artifact("t::1", declaration)
         journal.record_artifact("t::1", declaration)
         assert journal.read_artifacts("t::1") == (declaration,)
-        assert journal.read_outputs("t::1") == [(declaration.path, True, "output")]
         rows = [json.loads(line) for line in journal.outputs_path("t::1").read_text().splitlines()]
         assert rows == [declaration.to_dict()]
         assert "kind" not in rows[0] and "cleanup" not in rows[0]
@@ -891,7 +878,7 @@ class TestTypedArtifactJournal:
         monkeypatch.setattr(builtins, "open", denied)
         with pytest.raises(PermissionError):
             journal.read_artifacts("t::1")
-        with pytest.raises(PermissionError):
+        with pytest.raises(_ArtifactIOError):
             journal.record_artifact("t::1", declaration)
 
     def test_typed_record_requires_an_ipc_destination(self, tmp_path):
@@ -913,5 +900,69 @@ class TestTypedArtifactJournal:
             return real_open(path, mode, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "open", denied_append)
-        with pytest.raises(PermissionError, match="append denied"):
+        with pytest.raises(_ArtifactIOError, match="append denied"):
             journal.record_artifact("t::1", ArtifactDeclaration(str(tmp_path / "report"), name="report"))
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_cleanup_custom_directory_obeys_explicit_authorization(tmp_path, success):
+    from tasklite.models.artifact import ArtifactDeclaration
+
+    journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path / "outputs")
+    directory = tmp_path / "external" / "scratch"
+    directory.mkdir(parents=True)
+    (directory / "part").write_text("temporary")
+    declaration = ArtifactDeclaration(
+        str(directory), sandbox=False, delete_on_failure=True, delete_on_success=True,
+    )
+    journal.record_artifact("t::cleanup", declaration)
+
+    mode = ArtifactCleanupMode.SUCCESS if success else ArtifactCleanupMode.FAILURE_OR_RETRY
+    journal.cleanup("t::cleanup", mode)
+
+    assert not directory.exists()
+    assert not journal.outputs_path("t::cleanup").exists()
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_cleanup_io_failure_preserves_declarations(tmp_path, monkeypatch, success):
+    from tasklite.models.artifact import ArtifactDeclaration
+    from tasklite.utils.artifact import ArtifactPathPolicy
+
+    journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path / "outputs")
+    target = tmp_path / "outputs" / "scratch"
+    target.parent.mkdir()
+    target.write_text("temporary")
+    declaration = ArtifactDeclaration(
+        str(target), delete_on_failure=True, delete_on_success=True,
+    )
+    journal.record_artifact("t::cleanup", declaration)
+
+    def denied(self, declaration, *, success):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
+    mode = ArtifactCleanupMode.SUCCESS if success else ArtifactCleanupMode.FAILURE_OR_RETRY
+    with pytest.raises(PermissionError, match="permission denied"):
+        journal.cleanup("t::cleanup", mode)
+
+    assert target.exists()
+    assert journal.read_artifacts("t::cleanup") == (declaration,)
+
+
+def test_input_log_io_error_is_not_an_empty_dependency_list(tmp_path, monkeypatch):
+    import builtins
+
+    journal = ArtifactJournal(tmp_path / "ipc")
+    real_open = builtins.open
+
+    def denied(path, *args, **kwargs):
+        if Path(path) == journal.inputs_path("t::input"):
+            raise PermissionError("input log denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", denied)
+    with pytest.raises(PermissionError, match="input log denied"):
+        journal.read_inputs("t::input")
+    with pytest.raises(_ArtifactIOError, match="input log denied"):
+        journal.record_input_file("t::input", str(tmp_path / "source"))

@@ -30,8 +30,9 @@ if TYPE_CHECKING:
     from .resource import ResourceManager
     from .store import StateStore
 
-from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..exceptions import _ArtifactIOError, _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
+from ..models.artifact import ArtifactDeclaration
 from .channel import ArtifactCleanupMode, ExecutionResult, JobHandle
 from .errorclass import ERR_MAX_RETRIES
 from .in_flight import InFlightJob, InFlightTracker
@@ -77,8 +78,7 @@ class CompletionMachine:
         success 在 mark_success 后、failure 在 mark_failed 后），保证
         uid 在 ``is_known`` 可达的代码段内始终属于至少一个集合。
 
-        单一出口：IPC 文件生命周期集中在本方法 finally——正常路径（收割
-        已删 result/signals）与恢复路径（伪 entry）统一走清理模式分派。
+        声明只在业务结算完成后删除；提交前异常保留声明以便诊断。
         """
         uid = entry.job_uid
         terminated = False
@@ -107,13 +107,6 @@ class CompletionMachine:
             # 资源释放（无论成功/失败/重试/崩溃，由 entry 自归还）
             entry.release_resources(self._resources)
 
-            # 经 channel 深模块清理产物与 IPC 工件
-            cleanup_mode = (
-                ArtifactCleanupMode.SUCCESS if result.success
-                else ArtifactCleanupMode.FAILURE_OR_RETRY
-            )
-            self._channel.cleanup_artifacts(uid, mode=cleanup_mode)
-
         # 收尾钩子在统计更新之后（apply_result 已 +1）触发——钩子内读统计
         # 一致；单一出口经 store.fire_attempt_finished（异常隔离 + 计数），
         # 正常提交与伪 entry 都经此触发。
@@ -126,6 +119,7 @@ class CompletionMachine:
                     metadata=dict(result.result_metadata),
                 ),
             )
+        self._channel.journal.clear_declarations(uid)
 
     def apply_result(
         self,
@@ -167,6 +161,17 @@ class CompletionMachine:
         if applied_suspension:
             persist_resource_suspensions(self._store.backend, self._resources)
 
+        if result.artifact_error is not None:
+            raise _ArtifactIOError(result.artifact_error)
+        declarations = self._channel.read_declared_artifacts(uid)
+        inputs = self._channel.read_declared_inputs(uid) if result.success else ()
+        if result.success:
+            missing_output = self._channel.journal.verify_artifacts(declarations)
+            if missing_output is not None:
+                result.success = False
+                result.result_metadata = {"error_message": missing_output}
+        self._channel.journal.cleanup_declared_artifacts(declarations, success=result.success)
+
         # 2. 状态分发
         if result.retry_requested:
             self._apply_retry(uid, job, job_snapshot, result, attempt_id=attempt_id)
@@ -178,6 +183,8 @@ class CompletionMachine:
                 started_monotonic=started_monotonic,
                 attempt_id=attempt_id,
                 execution_id=execution_id,
+                declared_artifacts=declarations,
+                declared_inputs=inputs,
             )
         else:
             self._apply_failure(
@@ -276,15 +283,15 @@ class CompletionMachine:
         started_monotonic: float | None = None,
         attempt_id: int | None = None,
         execution_id: str | None = None,
+        declared_artifacts: Sequence[ArtifactDeclaration] = (),
+        declared_inputs: Sequence[str] = (),
     ) -> None:
         """成功分支：子任务去重规范化、successes 记录与 cursor 推进。"""
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
-        declared_artifacts = self._channel.read_declared_artifacts(uid)
         spawned_job_snapshots = self._collect_spawned_job_snapshots(uid, result.spawned_jobs)
         success_metadata = dict(result.result_metadata or {})
-        declared_inputs = self._channel.read_declared_inputs(uid)
 
         self._store.apply_success(
             uid,
@@ -398,6 +405,7 @@ class CompletionMachine:
         """
         store = self._store
         settled_count = 0
+        completion_error: BaseException | None = None
         for handle, result in reaped:
             entry = self._in_flight.get(handle.job_uid)
             if entry is None:
@@ -405,8 +413,13 @@ class CompletionMachine:
             try:
                 self.complete_job(entry, result)
                 settled_count += 1
+            except BaseException as error:
+                completion_error = completion_error or error
             finally:
+                self._requeue_uncommitted(entry)
                 self._in_flight.settle(handle.job_uid, state=store.state)
+        if completion_error is not None:
+            raise completion_error
         return settled_count
 
     def settle_aborted(
@@ -421,29 +434,37 @@ class CompletionMachine:
         3. 彻底清空在飞集合并透传可能的 commit 崩溃信号。
         """
         store = self._store
-        # 1. 未完成任务注销并重入队
-        for pending_entry in cancelled_entries:
-            self._in_flight.settle(pending_entry.job_uid, state=store.state)
-        job_snapshots = [entry.job_snapshot for entry in cancelled_entries]
-        if job_snapshots:
-            store.state.requeue_jobs(job_snapshots, front=True)
+        cleanup_error: BaseException | None = None
+        for entry in cancelled_entries:
+            try:
+                self._channel.cleanup_artifacts(
+                    entry.job_uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY,
+                )
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+            finally:
+                entry.release_resources(self._resources)
+                self._requeue_uncommitted(entry)
+                self._in_flight.settle(entry.job_uid, state=store.state)
 
-        # 2. 已完成任务提交
-        commit_crash: BaseException | None = None
         for entry, result in done_entries:
             try:
                 self.complete_job(entry, result)
-            except _JobTerminated:
-                pass
-            except _CommitCrashSignal as e:
-                commit_crash = e
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
             finally:
+                self._requeue_uncommitted(entry)
                 self._in_flight.settle(entry.job_uid, state=store.state)
 
-        self._in_flight.clear()
-        store.state.clear_in_flight()
-        if commit_crash is not None:
-            raise commit_crash
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _requeue_uncommitted(self, entry: InFlightJob) -> None:
+        """只回队尚未提交的原快照，已提交事实不能因尾部清理失败而重跑。"""
+        state = self._store.state
+        if entry.job_uid in state.in_flight_uids:
+            state.unregister_in_flight(entry.job_uid)
+            state.requeue_jobs([entry.job_snapshot], front=True)
 
 
 __all__ = [
