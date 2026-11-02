@@ -108,7 +108,9 @@ flowchart TD
 ### 6. 📦 具名磁盘产物与删除授权
 - `ctx.declare_output(path, name=...)` 声明文件或目录，返回规范绝对路径；消费方通过 `get_artifact_path` 查询直接依赖的成功产物。
 - 前删、失败删除、成功删除分别由 `delete_existing`、`delete_on_failure`、`delete_on_success` 授权，普通 output 默认均关闭；临时磁盘 `declare_cache` 固定成败清理。
-- [ADR-0009](docs/adr/0009-artifact-authorization-and-cleanup.md) 已接受具名磁盘产物接口：可选 output 名称、独立路径查询与直接依赖校验；磁盘是产物的可靠来源，不新增持久控制状态，生产内存读取缓存暂不加入，IPC 独立推进。A1 设计已完成；A2 提供声明授权、路径删除原语与成功清单内部发布，A3 已接通公开声明与查询；先清理后提交和清理错误编排留 A4。
+- [ADR-0009](docs/adr/0009-artifact-authorization-and-cleanup.md) 已接受具名磁盘产物接口：可选 output 名称、独立路径查询与直接依赖校验；磁盘是产物的可靠来源，不新增持久控制状态，生产内存读取缓存暂不加入，IPC 独立推进。A1 设计已完成；A2 提供声明授权、路径删除原语与成功清单内部发布，A3 已接通公开声明与查询；A4 已完成先清理后提交和清理错误编排。
+
+- [ADR-0010](docs/adr/0010-ephemeral-worker-pipe.md) 已裁决本次运行的瞬时通信与每 worker 独立 Pipe；Linux 原型已验证，Windows 与正式容量参数仍待验收。I2 未启动，生产仍使用文件 IPC。
 
 ### 7. 🌐 组合式 HTTP 网络工具与快照守卫 (HTTP Wrappers)
 - 开放 Callable 设计，支持原生 `urllib`、`requests`、`httpx` 或平台自定义签名 SDK；
