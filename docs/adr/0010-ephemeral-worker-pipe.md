@@ -45,7 +45,7 @@
 
 ## 可复现证据与验收缺口
 
-可丢弃原型仅保存在分支 **`prototype/ipc-pipe-20261102`**（提交 `95f1112`），路径 `scripts/prototypes/ipc_pipe_prototype.py`，同目录的 `ipc_pipe_README.md` 与 `ipc_pipe_output.json` 保存复现命令、环境和输出；不合入 main。基线为 `03c17bb`，Linux / Python 3.14.6 / spawn 实跑 exit 0：
+可丢弃原型仅保存在分支 **`prototype/ipc-pipe-20261102`**（最新证据提交 `270dcbb`），路径 `scripts/prototypes/ipc_pipe_prototype.py`，同目录的 `ipc_pipe_README.md` 与 `ipc_pipe_output.json` 保存复现命令、环境和输出；不合入 main。基线为 `03c17bb`，Linux / Python 3.14.6 / spawn 实跑 exit 0：
 
 - 顺序传递、重复关闭；16 条各 1 MiB 消息的有界缓冲、背压与恢复消费；4 MiB 完整帧。
 - 缓冲满时强杀可以放弃通道；这只验证输送层关闭能力，不是生产声明的交付规则。原分支 95f1112 的超限拒绝场景是已撤销候选的历史实验，最新原型已移除人为接收上限及该验收。
