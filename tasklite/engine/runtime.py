@@ -339,7 +339,7 @@ class EngineRuntime:
         worker_wait = 0.0
         dispatched = 0
         if not draining:
-            while dispatched < limit:
+            while dispatched < limit and self._session.stop_mode is StopMode.NONE:
                 outcome = self._dispatch.dispatch_next()
                 last_outcome = outcome
                 if outcome.worker_wait > 0:

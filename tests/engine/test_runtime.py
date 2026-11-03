@@ -678,6 +678,35 @@ class TestPrepareRunState:
 # ── DRAINING / ABORTING 停机语义（确定性 fake 进程）──────────────────
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_stop_during_orphan_deferral_exits_dispatch_pool(tmp_path, monkeypatch, force):
+    env = RuntimeEnv(tmp_path)
+    env.register("t")
+    runtime = env.runtime
+    runtime.store.enqueue_jobs([Job("t", "orphan", max_retries=0)])
+    probes = []
+
+    def locked(uid):
+        assert not probes, "请求停止后不得再次探测或派发同一候选"
+        probes.append(uid)
+        runtime.request_stop(force=force)
+        assert runtime.stop_mode is (StopMode.ABORTING if force else StopMode.DRAINING)
+        return False
+
+    monkeypatch.setattr(runtime.channel, "probe_orphan_lock", locked)
+    summary = runtime.execute()
+
+    assert probes == ["t::orphan"]
+    assert summary.exit_reason is (ExitReason.STOPPED_ABORTING if force else ExitReason.STOPPED_DRAINING)
+    assert summary.stats["lock_conflict_reruns"] == 1
+    assert summary.stats["retried"] == 0
+    queue = env.backend.load_queue()
+    assert len(queue) == 1 and queue[0]["attempt_no"] == 1
+    assert not queue[0].get("runtime", {}).get("last_retry_error")
+    assert env.backend.load_successes() == {} and env.backend.load_failed() == {}
+    assert not runtime.in_flight
+
+
 class TestGracefulDraining:
     def test_draining_waits_for_inflight_and_keeps_undispatched(
         self, tmp_path, monkeypatch,
