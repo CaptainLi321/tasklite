@@ -8,6 +8,36 @@
 
 暂无未发布变更。
 
+## [2.2.0] - 2026-11-04
+
+重跑触发器、具名磁盘产物、瞬时 Pipe 执行通信与全仓命名/Schema 5 统一版本（详见 [`docs/GUIDE.md`](docs/GUIDE.md) 与 [ADR-0007](docs/adr/0007-naming-schema-contract.md)～[ADR-0010](docs/adr/0010-ephemeral-worker-pipe.md)）。
+
+### 新增
+
+- **外部触发器（Trigger）与可信成功基线（[ADR-0008](docs/adr/0008-trigger-contract-and-trusted-success.md)）**：
+  - 新增 `TaskLite.register_trigger(name, fn)` 与只读判定上下文 `TriggerContext(job, has_succeeded, has_failed, success_metadata, last_succeeded_at_us)`；内置四策略 `once`（默认）、`on_failure`、`on_input_change`、`always`（Discovery 默认）。
+  - 本批依赖屏障（`A → B`）：同批入队的上下游无论正序或逆序，均等待上游本批处理完毕后再求值下游 Trigger；`attempt_no == 1` 求值准入，`attempt_no > 1` 沿用同次激活与重试预算。
+  - `on_input_change` 采用整数微秒比较（`mtime_ns // 1000 > finished_at_us`），基线时间来自 `successes` 与 `attempts` 同事务核验的可信成功完成时间。
+- **具名磁盘产物与独立删除授权（[ADR-0009](docs/adr/0009-artifact-authorization-and-cleanup.md)）**：
+  - `ctx.declare_output(path, *, name=None, delete_existing=False, delete_on_failure=False, delete_on_success=False, sandbox=True)` 支持可选具名产物发布与三项正交删除授权；`ctx.declare_cache(path, *, delete_existing=False, sandbox=True)` 为匿名成败清理薄封装。
+  - 新增 `ctx.get_artifact_path(producer_job_uid=..., artifact_name=...)`，强制校验直接 `depends_on` 成员关系并检查物理路径存在性。
+  - 完成收尾遵循「先执行授权清理、再提交业务终态」，清理或声明基础设施故障中止运行并保留原队列快照与重试预算。
+- **每 Worker 独立单向 Pipe 瞬时通信（[ADR-0010](docs/adr/0010-ephemeral-worker-pipe.md)）**：
+  - `tasklite/utils/ipc.py` 新增 `WorkerPipeSender` / `WorkerPipeReceiver` / `create_worker_pipe`，子进程与主进程通过独立单向 `multiprocessing.Pipe` 原生收发 `input`、`output`、`suspend`、`result` 四类瞬时消息，连接绑定 `job_uid` 与 `execution_id`。
+
+### 变更（向后不兼容）
+
+- **状态库升级至 Schema 5 与命名全面统一（[ADR-0007](docs/adr/0007-naming-schema-contract.md)、[ADR-0008](docs/adr/0008-trigger-contract-and-trusted-success.md)）**：
+  - SQLite `user_version` 升级为 `5`，只读预检阶段明确拒绝 `user_version <= 4` 旧库、版本 0 非空库与半建库；`commit_job_success` 在同一 `BEGIN IMMEDIATE` 事务内原子更新 `attempts` 行（`outcome='succeeded'`, `finished_at`）与 `successes` 表。
+  - 成功档案表与公开接口统一为 `successes`（`load_successes` / `delete_successes` / `seed_successes` / `filter_jobs_without_success` / `ctx.has_succeeded` / `ctx.has_failed` / `ctx.succeeded_or_failed_job_uids`）；引擎元数据表统一为 `engine_metadata`；执行身份与序号统一为 `job_uid`、`execution_id`、`dispatch_no`、`job_snapshot`；Selection 规则参数统一为 `task_type`（`matches_task_type` / `allows_task_type`）；`Task` 五项默认规格（`resources` / `max_retries` / `timeout_seconds` / `timeout_is_transient` / `trigger`）在 `Job` 未指定（`None`）时自动继承。
+- **移除旧文件 IPC 协议与冗余接口**：
+  - 彻底退役 `.result.json`、`.outputs.jsonl`、`.inputs.jsonl`、`.signals.jsonl`、`.draining`、`result_token` 及陈旧结果文件恢复协议（仅保留 `{encoded_uid}.lock` 与 `__pipeline_run__.lock` 文件锁）。
+  - 移除 `Job(..., rerun=...)`、`set_discovery_rerun`、`ctx.declare_input_uri` 及公开 `cleanup_on_fail` 参数；`docs/V2_GUIDE.md` 重命名为 [`docs/GUIDE.md`](docs/GUIDE.md)。
+
+### 修复
+
+- **孤儿锁冲突期间的停止响应**：修复派发填池循环在连续遭遇孤儿锁冲突回队时未检查 `stop_mode` 导致 `DRAINING` / `ABORTING` 停止请求延迟响应的问题。
+
 ## [2.1.0] - 2026-10-18
 
 执行选择版本：`pipeline.selection(...)` 以方法调用配置 pipeline 级规则，严格区分 **Exclude（本次不执行、原样留队、下次自动恢复）** 与 **Skip（终态跳过、下游级联、下次不再重试）** 两个单机语义。

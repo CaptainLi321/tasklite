@@ -44,7 +44,7 @@ from tasklite import (
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变（queue/successes/failed 三表 PK 与六集合互斥均以 uid 为身份） | queue 行 job_snapshot JSON（job_uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：序号、`execution_id`、起止时间、`outcome` | **append-only** 新表 `attempts` |
 
-持久层 Python 接口以 `job_snapshot` / `job_snapshots` 表示完整 Job 字典，以 `job_uid` 表示跨对象作业身份；业务输入仍称 `payload`。引擎级键值读写使用 `backend.get_engine_metadata(key)` / `backend.set_engine_metadata(key, value)`，其中 `last_run_id` 仍表示最近一次运行。当前开发落盘格式为 schema 5（`user_version=5`，包版本已切换为 2.2.0，尚未发布）。仅接纳真正空库或完整且列集合匹配的 schema 5 库；版本 0 的非空库、`user_version <= 4` 旧库、混入 wall/meta 的库或半建库均明确拒绝，不自动迁移或补齐。拒绝前使用只读连接检查，保留原库；使用匹配版本读取历史，或显式选择新的状态库路径。
+持久层 Python 接口以 `job_snapshot` / `job_snapshots` 表示完整 Job 字典，以 `job_uid` 表示跨对象作业身份；业务输入仍称 `payload`。引擎级键值读写使用 `backend.get_engine_metadata(key)` / `backend.set_engine_metadata(key, value)`，其中 `last_run_id` 仍表示最近一次运行。当前状态库格式为 schema 5（`user_version=5`，包版本 `2.2.0`）。仅接纳真正空库或完整且列集合匹配的 schema 5 库；版本 0 的非空库、`user_version <= 4` 旧库、混入 wall/meta 的库或半建库均明确拒绝，不自动迁移或补齐。拒绝前使用只读连接检查，保留原库；使用匹配版本读取历史，或显式选择新的状态库路径。
 
 schema 5 六张核心表为 `queue(job_uid, queue_position, job_snapshot)`、`successes(job_uid, metadata)`、`failed(job_uid, metadata, payload)`、`attempts(attempt_id, job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`、`cursors(key, value)` 与 `engine_metadata(key, value)`。失败档案 `metadata` 与业务 `payload` 各自原样存取；HTTP 缓存 `http_snapshots` 是独立库，不随本 schema 切换。
 

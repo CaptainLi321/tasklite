@@ -125,7 +125,7 @@ Abstract storage interface implementing atomic delta commits for job success, fa
 _Avoid_: Database, Repository, StorageDriver
 
 **SQLiteStateBackend**:
-Default ACID storage adapter using SQLite in WAL mode with immediate transactions; fresh schema (`user_version=5`, incl. the append-only `attempts` table), read-only preflight rejection of older versions (`user_version <= 4`), nonempty version 0 databases, and incomplete or mixed databases. Package version is set to 2.2.0 in local development (not yet released).
+Default ACID storage adapter using SQLite in WAL mode with immediate transactions; fresh schema (`user_version=5`, incl. the append-only `attempts` table), read-only preflight rejection of older versions (`user_version <= 4`), nonempty version 0 databases, and incomplete or mixed databases. Package version is 2.2.0.
 _Avoid_: SQLiteDriver, DBBackend
 
 **InMemoryStateBackend**:
