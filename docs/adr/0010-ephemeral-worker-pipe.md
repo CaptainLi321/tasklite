@@ -1,8 +1,8 @@
 # 0010 本次运行的瞬时 worker Pipe 通信
 
-状态：**Accepted（选型与 Interface 已裁决；I1 已定 Linux 验收完成，Windows 未实测；本轮暂停，I2 未启动）**。2026-11-02，用户确认 IPC 只负责本次运行的瞬时通信，选择每 worker 独立的 `multiprocessing.Pipe`，由一个专用 Module 封装传输与回收复杂度。业务 SQLite 恢复继续保留，通信消息不持久化、不接续、不补发，不增加持久收件箱或应用层 ACK。
+状态：**Accepted & Implemented（I1 原型裁决、I2 瞬时 Pipe 通道全面切换、I3 旧文件 IPC 协议退役均已在 Linux 完成并合入 main；按用户决策跳过 Windows 实测，无向前兼容包袱）**。2026-11-02，用户确认 IPC 只负责本次运行的瞬时通信，选择每 worker 独立的 `multiprocessing.Pipe`，由一个专用 Module 封装传输与回收复杂度。业务 SQLite 恢复继续保留，通信消息不持久化、不接续、不补发，不增加持久收件箱或应用层 ACK。
 
-文件 IPC 将在 I2/I3 全面切换后退役；本文不表示生产代码已经采用新通道。现行行为仍见 [V2 使用指南](../V2_GUIDE.md)；产物授权及清理仍遵循 [ADR-0009](0009-artifact-authorization-and-cleanup.md)。
+生产实现已落位于 `tasklite/utils/ipc.py`（`WorkerPipeSender` / `WorkerPipeReceiver` / `create_worker_pipe`），并与 `ExecutionChannel`、`ArtifactJournal`、`JobContext`、`DispatchMachine`、`RecoveryOrchestrator`、`EngineRuntime` 完成全链路接线；旧文件 IPC 协议（`.result.json`、`.outputs.jsonl`、`.inputs.jsonl`、`.signals.jsonl`、`.draining`、`result_token` 及陈旧结果接续恢复）已全部退役。现行行为见 [V2 使用指南](../V2_GUIDE.md)；产物授权及清理遵循 [ADR-0009](0009-artifact-authorization-and-cleanup.md)。
 
 ## 已确认的范围与取舍
 
@@ -76,4 +76,4 @@
 
 用户已于 2026-11-03 确认统一原生收发规则，容量不再是待决门槛。框架不加应用层大小限制，标准库/OS 的自然约束及异常照常传播，不承诺任意大消息一定成功；不增加字节额度或动态容量框架。简单有界消息条数缓冲用于背压，原型队列容量 2 仍只是实验参数。完整结果收到后才沿既有事务提交 spawn/cursor，不提前分批提交。
 
-原型已验证上述坏消息、身份不匹配、指定停止和孤儿互斥路径，不代表覆盖所有异常组合或正式通道验收。I2 保持未启动；用户要求完成 I1 后暂停，不启动 I2；Windows 证据仍缺失，不能把 Linux 结果写成跨平台全验收。
+原型已验证上述坏消息、身份不匹配、指定停止和孤儿互斥路径；随后 I2/I3 已在 `main` 完成正式生产通道切换、旧文件协议移除以及覆盖 14 类真实子进程生命周期场景的端到端集成测试（`tests/integration/test_pipe_ipc_lifecycle.py`）与通道单测（`tests/utils/test_pipe_ipc.py`）。按用户决策跳过 Windows 实测。

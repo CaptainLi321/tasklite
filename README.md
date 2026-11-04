@@ -68,15 +68,15 @@ flowchart TD
 
     Scheduler -->|"1. 检查资源 & 拓扑依赖"| State
     Scheduler -->|"2. Spawn 独立子进程 (隔离)"| Workers
-    Workers -.->|"3. 原子落盘结果/信号 (.result.json)"| State
+    Workers -.->|"3. 独立单向 Pipe 传递声明/信号/结果"| State
     Watchdog -->|"4. 轮询超时 SIGKILL 强杀"| Workers
     State -->|"5. BEGIN IMMEDIATE 原子收尾"| State
 ```
 
 ### 三层崩溃恢复防线
-1. **执行代标识 (Generation Tag)**：结果文件携带 `{uid}.{run_id}.{dispatch_no}`，前次崩溃的孤儿进程结果对新 Run 不可见；
-2. **启动期残留消费**：启动时自动识别并提交崩溃前已落盘的有效结果，不重复执行；
-3. **孤儿文件锁探测 (Lockfile Fencing)**：严格保证同一 UID 在全局只有一个物理执行体。
+1. **执行代标识与通道绑定 (Generation Fencing)**：每 worker 绑定独立单向 `Pipe` 与 `{run_id}.{dispatch_no}` 执行代标识，校验 `job_uid` 与 `execution_id`，旧执行与伪造消息无法污染状态机；
+2. **可信成功事务持久化**：IPC 仅负责本次运行的瞬时通信，已提交的成功档案、`attempts` 终态与资源挂起由 SQLite 强事务持久化，未提交在途任务重启后自动接续重做；
+3. **孤儿文件锁探测 (Lockfile Fencing)**：严格保证同一 UID 在全局只有一个物理执行体，主进程崩溃后孤儿持锁期间新 Run 自动避让。
 
 ---
 
@@ -110,7 +110,7 @@ flowchart TD
 - 前删、失败删除、成功删除分别由 `delete_existing`、`delete_on_failure`、`delete_on_success` 授权，普通 output 默认均关闭；临时磁盘 `declare_cache` 固定成败清理。
 - [ADR-0009](docs/adr/0009-artifact-authorization-and-cleanup.md) 已接受具名磁盘产物接口：可选 output 名称、独立路径查询与直接依赖校验；磁盘是产物的可靠来源，不新增持久控制状态，生产内存读取缓存暂不加入，IPC 独立推进。A1 设计已完成；A2 提供声明授权、路径删除原语与成功清单内部发布，A3 已接通公开声明与查询；A4 已完成先清理后提交和清理错误编排。
 
-- [ADR-0010](docs/adr/0010-ephemeral-worker-pipe.md) 已裁决本次运行的瞬时通信与每 worker 独立 Pipe；Linux 原型及指定完成链路已验证；所有消息统一原生收发，不做大小分类、应用层限额或分块，孤儿持锁停止响应已修复并通过真实进程验收，I1 已定 Linux 验收完成，Windows 未实测。本轮暂停于 I1，I2 未启动，生产仍使用文件 IPC。
+- [ADR-0010](docs/adr/0010-ephemeral-worker-pipe.md) 已完成每 worker 独立单向 `multiprocessing.Pipe` 瞬时通信切换与旧文件 IPC 协议退役：四类消息（`input`、`output`、`suspend`、`result`）统一使用 Pipe 原生收发，不做大小分类、应用层限额或分块；通信消息仅服务当次运行，跨重启恢复以 SQLite 持久化业务状态与文件锁（`{encoded_uid}.lock`、`__pipeline_run__.lock`）为准（Linux 已验收，按决策跳过 Windows 实测）。
 
 ### 7. 🌐 组合式 HTTP 网络工具与快照守卫 (HTTP Wrappers)
 - 开放 Callable 设计，支持原生 `urllib`、`requests`、`httpx` 或平台自定义签名 SDK；
@@ -393,7 +393,7 @@ tasklite/
 ├── testing.py           # fake_ctx：handler 单测的官方 JobContext 构造器
 ├── wrappers/            # discovery.py（增量扫描）/ http.py（网络守卫与快照）
 ├── contrib/             # 生态扩展套件与参考实现（核心不依赖）
-└── utils/               # encoding（单射 %XX 转义）/ ipc（IPC 信号与降级落盘）/ clock / jsonutil（禁NaN）/ lockfile
+└── utils/               # encoding（单射 %XX 转义）/ ipc（瞬时 Pipe 通道与产物清理原语）/ clock / jsonutil（禁NaN）/ lockfile
 ```
 
 ---
