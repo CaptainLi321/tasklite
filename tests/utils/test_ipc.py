@@ -1,75 +1,50 @@
-"""v2 ArtifactJournal 产物清单与文件级 IPC 深模块测试。
+"""v2 ArtifactJournal 产物清单与管道声明管理测试。
 
-覆盖：路径与沙盒、声明追加/读取、摘除式信号排空（孤儿回收 + uid 定界）、
-启动期残留清扫、结果原子写/两级降级/认领取舍、残留路径锚定（点后缀
-兄弟 uid 不误认）、解析容灾与清理消费侧沙盒复检。
+覆盖：路径与沙盒、声明登记与读取、管道实时上报、存在性校验、
+清理消费侧沙盒复检与生命周期模式清理。
 """
 
-import json
 import os
 from pathlib import Path
 
 import pytest
 
 from tasklite.exceptions import _ArtifactIOError
-from tasklite.utils.encoding import encode_job_uid_filename
+from tasklite.models.artifact import ArtifactDeclaration
 from tasklite.utils.ipc import (
     ArtifactCleanupMode,
     ArtifactJournal,
+    PIPE_MSG_INPUT,
+    PIPE_MSG_OUTPUT,
+    WorkerPipeMessage,
+    create_worker_pipe,
     decode_raw_result,
     encode_raw_result,
 )
 
-_INCARNATION_FIRST = "deadbeefdeadbeefdeadbeefdeadbeef.1"
 
-
-def _write_artifact(journal, uid, path, *, delete_on_failure=False, delete_on_success=False):
-    """从文件边界注入声明，包含供清理拒绝的非法路径。"""
-    from tasklite.utils.jsonutil import dumps
-
-    target = journal.outputs_path(uid)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as stream:
-        stream.write(dumps({"path": path, "name": None, "delete_existing": False,
-                            "delete_on_failure": delete_on_failure,
-                            "delete_on_success": delete_on_success, "sandbox": True}) + "\n")
+def _inject_raw_declaration(
+    journal: ArtifactJournal,
+    uid: str,
+    path: str,
+    *,
+    delete_on_failure: bool = False,
+    delete_on_success: bool = False,
+    sandbox: bool = True,
+) -> None:
+    """注入原始声明对象（供消费侧沙盒复检测试验证越界拒绝）。"""
+    decl = object.__new__(ArtifactDeclaration)
+    object.__setattr__(decl, "path", path)
+    object.__setattr__(decl, "name", None)
+    object.__setattr__(decl, "delete_existing", False)
+    object.__setattr__(decl, "delete_on_failure", delete_on_failure)
+    object.__setattr__(decl, "delete_on_success", delete_on_success)
+    object.__setattr__(decl, "sandbox", sandbox)
+    prev = journal._artifacts.get(uid, ())
+    journal._artifacts[uid] = (*prev, decl)
 
 
 class TestArtifactJournalPathAndSandbox:
-    def test_path_construction(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        uid = "t::job_1"
-        assert journal.signals_path(uid) == tmp_path / "t%3A%3Ajob_1.signals.jsonl"
-        assert journal.outputs_path(uid) == tmp_path / "t%3A%3Ajob_1.outputs.jsonl"
-        assert journal.inputs_path(uid) == tmp_path / "t%3A%3Ajob_1.inputs.jsonl"
-        assert (
-            journal.result_path(uid, "abc.1")
-            == tmp_path / "t%3A%3Ajob_1.abc.1.result.json"
-        )
-        assert (
-            journal.result_tmp_path(uid, "abc.1")
-            == tmp_path / "t%3A%3Ajob_1.abc.1.result.json.tmp"
-        )
-
-    def test_none_ipc_dir_path_builders_fail_loud(self):
-        """ipc_dir 缺省时全部路径构造入口 fail-loud。
-
-        若任一路径构造改为隐式 str(None) 兜底，写入侧会向进程 CWD 的
-        字面 ``None/`` 目录落盘测试碎屑（跨 cwd 漂移、永不清理）——
-        本测试锁定 ValueError 契约，杜绝该退化形态。
-        """
-        journal = ArtifactJournal(None)
-        assert journal.ipc_dir is None
-        for build in (
-            lambda: journal.signals_path("t::x"),
-            lambda: journal.outputs_path("t::x"),
-            lambda: journal.inputs_path("t::x"),
-            lambda: journal.result_path("t::x", _INCARNATION_FIRST),
-            lambda: journal.result_tmp_path("t::x", _INCARNATION_FIRST),
-        ):
-            with pytest.raises(ValueError, match="ipc_dir"):
-                build()
-
     def test_null_byte_rejection(self, tmp_path):
         with pytest.raises(ValueError, match="null byte"):
             ArtifactJournal.resolve_and_validate_path("bad\x00path.txt", tmp_path)
@@ -113,13 +88,20 @@ class TestArtifactJournalDeclarations:
         out_file = tmp_path / "final.data"
         cache_file = tmp_path / "temp.cache"
 
-        _write_artifact(journal, uid, str(out_file), delete_on_failure=True)
-        _write_artifact(journal, uid, str(cache_file), delete_on_failure=True, delete_on_success=True)
+        journal.record_artifact(
+            uid, ArtifactDeclaration(str(out_file), delete_on_failure=True)
+        )
+        journal.record_artifact(
+            uid,
+            ArtifactDeclaration(
+                str(cache_file), delete_on_failure=True, delete_on_success=True
+            ),
+        )
 
         # 产物未创建时校验失败
         declarations = journal.read_artifacts(uid)
         err = journal.verify_artifacts(declarations)
-        assert "Missing output" in err
+        assert err is not None and "Missing output" in err
 
         # 创建正式产物后，尽管 cache 缺失，校验仍通过（cache 跳过存在性校验）
         out_file.write_text("done")
@@ -135,416 +117,34 @@ class TestArtifactJournalDeclarations:
         journal.record_input_file(uid, "/other/path")
 
         assert journal.read_inputs(uid) == [str(data_file), "/other/path"]
-        # 落盘行仅含规范路径，不携带 size/mtime 快照
-        raw = journal.inputs_path(uid).read_text(encoding="utf-8").splitlines()
-        assert json.loads(raw[0]) == {"path": str(data_file)}
 
-    def test_signal_record_and_drain(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        uid = "job_sig"
-        journal.record_signal(uid, "gpu", 30.0)
-        journal.record_signal(uid, "api", 5.0)
-
-        signals = journal.drain_signals(uid)
-        assert signals == [("gpu", 30.0), ("api", 5.0)]
-
-        # 排空语义：再次调用返回空列表
-        signals_after = journal.drain_signals(uid)
-        assert signals_after == []
-
-        # 排空后无任何残留（规范名与摘除临时名均不存在）
-        assert not journal.signals_path(uid).exists()
-        assert list(tmp_path.glob("*.draining")) == []
-
-    def test_drain_signals_keeps_signal_appended_during_read(self, tmp_path, monkeypatch):
-        """排空读取期间的并发追加不得被抹除（摘除式排空契约）。
-
-        注入点：解析首行时向同名信号文件追加一条新信号（模拟活跃 worker
-        的 O_APPEND 追加与排空读并发）。摘除式排空下，追加经按名新建落入
-        新文件、下轮排空必须读回；「读后 truncate」会把该追加连同原内容
-        一并抹除（丢信号）。
-        """
-        import tasklite.utils.ipc as ipc_module
-
-        journal = ArtifactJournal(tmp_path)
-        uid = "job_sig_race"
-        journal.record_signal(uid, "gpu", 30.0)
-
-        real_loads = ipc_module.loads
-        signals_path = journal.signals_path(uid)
-        appended = {"done": False}
-
-        def loads_with_concurrent_append(line):
-            data = real_loads(line)
-            if not appended["done"]:
-                appended["done"] = True
-                with open(signals_path, "a", encoding="utf-8") as f:
-                    f.write('{"suspend": ["api", 5.0]}\n')
-                    f.flush()
-            return data
-
-        monkeypatch.setattr(ipc_module, "loads", loads_with_concurrent_append)
-
-        assert journal.drain_signals(uid) == [("gpu", 30.0)]
-
-        # 排空期间追加的信号在下一轮排空捞回（不丢）
-        assert journal.drain_signals(uid) == [("api", 5.0)]
-
-    def test_drain_signals_salvages_orphan_draining_file(self, tmp_path, monkeypatch):
-        """排空中途读者死亡遗留的 .draining 孤儿必须在下次排空回收（先读后删）。
-
-        注入点：排空的 unlink 抛 OSError，模拟读者进程在 rename 后、unlink
-        前被 SIGKILL/断电（同一窗口）。此刻信号内容已脱离规范命名空间、困在
-        孤儿文件中——回收协议必须先读取分发孤儿内容再删除，直接丢弃会把
-        崩溃窗口放大成永久丢信号；孤儿文件本身不得在 ipc_dir 永久累积。
-        """
-        journal = ArtifactJournal(tmp_path)
-        uid = "job_sig_orphan"
-        journal.record_signal(uid, "api", 30.0)
-
-        def dying_unlink(self, *args, **kwargs):
-            raise OSError("reader died between rename and unlink")
-
-        monkeypatch.setattr(Path, "unlink", dying_unlink)
-        # 本次读取成功，但 unlink 失败遗留孤儿
-        assert journal.drain_signals(uid) == [("api", 30.0)]
-        monkeypatch.undo()
-
-        orphans = list(tmp_path.glob("*.draining"))
-        assert len(orphans) == 1, f"unlink 失败应遗留恰好一个孤儿，实际: {orphans}"
-
-        # 重启后的下一轮排空：孤儿信号捞回且孤儿清除（不丢不重）
-        assert journal.drain_signals(uid) == [("api", 30.0)]
-        assert list(tmp_path.glob("*.draining")) == []
-        assert journal.drain_signals(uid) == []
-
-    def test_drain_signals_merges_orphan_and_live_signals(self, tmp_path):
-        """孤儿与活跃信号文件并存时两者都必须读到，孤儿先于活跃内容。"""
-        journal = ArtifactJournal(tmp_path)
-        uid = "job_sig_mixed"
-        signals_path = journal.signals_path(uid)
-        journal.record_signal(uid, "gpu", 30.0)
-        orphan = signals_path.with_name(
-            f"{signals_path.name}.{os.getpid()}.1234567890.draining"
+    def test_pipe_sender_forwards_declarations(self, tmp_path):
+        receiver, sender = create_worker_pipe(
+            job_uid="t::pipe",
+            execution_id="exec_pipe_1",
         )
-        os.rename(signals_path, orphan)
-        journal.record_signal(uid, "api", 5.0)
-
-        assert journal.drain_signals(uid) == [("gpu", 30.0), ("api", 5.0)]
-        assert list(tmp_path.glob("*.draining")) == []
-        assert not signals_path.exists()
-        assert journal.drain_signals(uid) == []
-
-    def test_drain_signals_orphan_salvage_is_uid_scoped(self, tmp_path):
-        """孤儿回收按 uid 严格定界，不得回收前缀重叠的其他 uid 的孤儿。"""
-        journal = ArtifactJournal(tmp_path)
-        uid_a, uid_b = "job::a", "job::a::sibling"
-        journal.record_signal(uid_b, "gpu", 2.0)
-        b_path = journal.signals_path(uid_b)
-        orphan_b = b_path.with_name(
-            f"{b_path.name}.{os.getpid()}.1234567891.draining"
+        journal = ArtifactJournal(
+            tmp_path / "ipc",
+            output_roots=tmp_path,
+            pipe_sender=sender,
         )
-        os.rename(b_path, orphan_b)
+        out_path = str(tmp_path / "out.txt")
+        in_path = str(tmp_path / "in.txt")
+        decl = ArtifactDeclaration(out_path, name="report", delete_on_failure=True)
+        journal.record_artifact("t::pipe", decl)
+        journal.record_input_file("t::pipe", in_path)
+        sender.close()
 
-        # a 的排空不得触及 b 的孤儿
-        assert journal.drain_signals(uid_a) == []
-        assert orphan_b.exists()
+        messages = receiver.drain_to_eof(timeout=3.0)
+        receiver.close()
 
-        # b 的排空回收自己的孤儿
-        assert journal.drain_signals(uid_b) == [("gpu", 2.0)]
-        assert not orphan_b.exists()
-
-        # 前缀恰好重叠的 uid（job::a.signals.jsonl）孤儿不得被 a 误回收
-        intruder = tmp_path / "job%3A%3Aa.signals.jsonl.signals.jsonl.7.8.draining"
-        intruder.write_text('{"suspend": ["api", 9.0]}\n', encoding="utf-8")
-        assert journal.drain_signals(uid_a) == []
-        assert intruder.exists()
-        assert journal.drain_signals("job::a.signals.jsonl") == [("api", 9.0)]
-        assert not intruder.exists()
-
-
-class TestArtifactJournalResidueSweep:
-    """启动期残留信号清扫：ipc_dir 全量排空（先读分发后删除，含孤儿）。
-
-    跨 run 崩溃可能遗留「已落盘信号却无任何再消费路径」的残留——后续
-    派发预检清理与完成收尾清理都会未读删除信号文件，启动期统一清扫
-    是该不变式的兜底回收点。
-    """
-
-    def test_drain_all_signals_recovers_residue_and_orphans(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        journal.record_signal("t::a", "api", 30.0)
-        # b 的信号文件已摘除为孤儿（排空中途读者死亡，无同名活跃文件）
-        journal.record_signal("t::b", "gpu", 5.0)
-        b_path = journal.signals_path("t::b")
-        orphan = b_path.with_name(
-            f"{b_path.name}.{os.getpid()}.1234567892.draining"
-        )
-        os.rename(b_path, orphan)
-
-        got = journal.drain_all_signals()
-
-        assert ("t::a", "api", 30.0) in got
-        assert ("t::b", "gpu", 5.0) in got
-        assert list(tmp_path.iterdir()) == []
-        # 幂等：二次清扫为空
-        assert journal.drain_all_signals() == []
-
-    def test_drain_all_signals_skips_names_outside_injective_image(self, tmp_path):
-        """文件名还原不出合法 uid（encode_job_uid_filename 像集外）时不触碰。
-
-        裸冒号不可能由 encode_job_uid_filename 产生（必被转义），该形态不在
-        协议域内，清扫不得误删。
-        """
-        journal = ArtifactJournal(tmp_path)
-        foreign = tmp_path / "weird:uid.signals.jsonl"
-        foreign.write_text('{"suspend": ["api", 1.0]}\n', encoding="utf-8")
-
-        assert journal.drain_all_signals() == []
-        assert foreign.exists()
-
-
-class TestResultWriteAndRead:
-    def test_write_and_read_result_roundtrip(self, tmp_path):
-        """结果原子写 → 可读回（无部分消息问题）。"""
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "t::j1", {"status": "success", "x": 1}, execution_id=_INCARNATION_FIRST
-        )
-        assert journal.result_path("t::j1", _INCARNATION_FIRST).exists()
-        data = journal.read_result(journal.result_path("t::j1", _INCARNATION_FIRST))
-        assert data == {"status": "success", "x": 1}
-
-    def test_write_result_no_tmp_leftover(self, tmp_path):
-        """原子写后 .tmp 文件被 rename 掉，不留残留。"""
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "t::j1", {"status": "success"}, execution_id=_INCARNATION_FIRST
-        )
-        assert not journal.result_tmp_path("t::j1", _INCARNATION_FIRST).exists()
-
-    def test_read_missing_returns_none(self, tmp_path):
-        """结果文件不存在 → None（父进程轮询未完成状态）。"""
-        journal = ArtifactJournal(tmp_path)
-        assert journal.read_result(journal.result_path("t::ghost", _INCARNATION_FIRST)) is None
-
-    def test_read_corrupt_returns_none(self, tmp_path):
-        """损坏的结果文件 → None（宁可重跑，不可崩）。"""
-        journal = ArtifactJournal(tmp_path)
-        p = journal.result_path("t::j1", _INCARNATION_FIRST)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("not json {{{")
-        assert journal.read_result(p) is None
-
-    def test_write_result_atomic_rejects_nan(self, tmp_path):
-        """写含 NaN 的结果必须抛（不落非标准 JSON）。"""
-        journal = ArtifactJournal(tmp_path)
-        with pytest.raises(ValueError):
-            journal.write_result_atomic(
-                "t::j1",
-                {"status": "success", "raw_result": {"v": float("nan")}},
-                execution_id=_INCARNATION_FIRST,
-            )
-        # 原子写失败 → 无残留文件（tmp 被清理）
-        assert not journal.result_path("t::j1", _INCARNATION_FIRST).exists()
-
-    def test_cleanup_removes_all_files(self, tmp_path):
-        """cleanup 删除结果 + 信号 + 临时文件。"""
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "t::j1", {"status": "success"}, execution_id=_INCARNATION_FIRST
-        )
-        journal.record_signal("t::j1", "api", 1.0)
-        journal.cleanup_ipc_files("t::j1")
-        assert list(Path(tmp_path).iterdir()) == []
-
-
-class TestResultWriteDegradation:
-    """两级降级：完整写两连败 → 降级写最小结果（success 改写 retry）。"""
-
-    def test_success_payload_degrades_to_retry(self, tmp_path, monkeypatch):
-        """success 完整写失败 → 降级写 retry 结果（重跑而非静默丢失）。"""
-        real_write = ArtifactJournal.write_result_atomic
-        calls: list[dict] = []
-
-        def flaky_write(journal_self, uid, result_dict, execution_id=None):
-            calls.append(result_dict)
-            # 完整 payload 模拟磁盘满（大文件写不下）；降级 payload 写成功
-            if "raw_result" in result_dict:
-                raise OSError(28, "No space left on device")
-            return real_write(journal_self, uid, result_dict, execution_id=execution_id)
-
-        monkeypatch.setattr(ArtifactJournal, "write_result_atomic", flaky_write)
-        journal = ArtifactJournal(tmp_path)
-
-        journal.write_result_with_degradation(
-            "h::a", {"status": "success", "raw_result": True}, execution_id=_INCARNATION_FIRST
-        )
-
-        res = journal.read_result("h::a", execution_id=_INCARNATION_FIRST)
-        assert res is not None, "降级写必须成功落盘（小 payload 可写）"
-        assert res["status"] == "retry", (
-            f"success 降级必须改写 retry（重跑而非丢失）: {res}"
-        )
-        assert "IPC_RESULT_WRITE_DEGRADED" in res["error_message"]
-        full_attempts = [c for c in calls if "raw_result" in c]
-        assert len(full_attempts) == 2, "完整写应先试两次再降级"
-        assert len(calls) == 3, "降级写只补一次（calls[2] 为最小 retry 结果）"
-
-    def test_transient_kind_and_auth_inherited_by_degraded_write(self, tmp_path, monkeypatch):
-        """降级写必须继承 transient_kind 与认证令牌（瞬态保真 + 认证不误拒）。"""
-        real_write = ArtifactJournal.write_result_atomic
-        token = "b" * 64
-
-        def flaky_write(journal_self, uid, result_dict, execution_id=None):
-            # 以降级标记区分：降级 payload（error 带 DEGRADED 标记）放行
-            if "IPC_RESULT_WRITE_DEGRADED" not in str(result_dict.get("error_message", "")):
-                raise OSError(28, "No space left on device")
-            return real_write(journal_self, uid, result_dict, execution_id=execution_id)
-
-        monkeypatch.setattr(ArtifactJournal, "write_result_atomic", flaky_write)
-        journal = ArtifactJournal(tmp_path)
-
-        journal.write_result_with_degradation(
-            "h::a",
-            {"status": "retry", "transient_kind": "lock_conflict", "auth": token},
-            execution_id=_INCARNATION_FIRST,
-        )
-
-        res = journal.read_result("h::a", execution_id=_INCARNATION_FIRST)
-        assert res is not None
-        assert res["status"] == "retry"
-        assert res.get("transient_kind") == "lock_conflict", (
-            f"降级写必须保留 transient_kind 结构化字段: {res}"
-        )
-        assert res.get("auth") == token, "降级结果丢失令牌会被读取侧误拒"
-
-    def test_all_writes_fail_silently_gives_up(self, tmp_path, monkeypatch):
-        """完整写 + 降级写全部失败 → 不抛 OSError、无结果文件。"""
-
-        def refusing_write(journal_self, uid, result_dict, execution_id=None):
-            raise OSError(28, "No space left on device")
-
-        monkeypatch.setattr(ArtifactJournal, "write_result_atomic", refusing_write)
-        journal = ArtifactJournal(tmp_path)
-
-        journal.write_result_with_degradation(
-            "h::a", {"status": "success", "raw_result": True}, execution_id=_INCARNATION_FIRST
-        )
-        assert not journal.result_path("h::a", _INCARNATION_FIRST).exists()
-
-
-class TestStaleResultClaim:
-    """残留结果认领：freshness 决胜、.tmp 忽略、坏形状丢弃、兄弟 uid 锚定。"""
-
-    def test_claim_prefers_latest_execution_id_same_instant(self, tmp_path):
-        """同刻多执行代残留按 (mtime_ns, execution_id_seq) 决胜。
-
-        秒级 mtime 键在同秒内排序不稳定，可能消费较旧执行代的结果。
-        把所有文件的 mtime 钉到同一纳秒，只有 seq 能区分。
-        """
-        run_id = "a" * 32
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "t::x",
-            {"status": "success", "raw_result": encode_raw_result((True, {"v": 1}))},
-            execution_id=f"{run_id}.1",
-        )
-        journal.write_result_atomic(
-            "t::x",
-            {"status": "success", "raw_result": encode_raw_result((True, {"v": 2}))},
-            execution_id=f"{run_id}.2",
-        )
-        for p in tmp_path.glob("*.result.json"):
-            os.utime(p, ns=(1234567890, 1234567890))
-
-        payload = journal.claim_stale_result_payload("t::x")
-        assert payload is not None, "应认领最新执行代的成功结果"
-        assert decode_raw_result(payload["raw_result"]) == (True, {"v": 2}), (
-            "同刻冲突必须取最新执行代"
-        )
-
-    def test_claim_ignores_tmp_leftover(self, tmp_path):
-        """认领必须忽略 .tmp 残留（孤儿 worker 正在写，读半成品无意义且危险）。"""
-        journal = ArtifactJournal(tmp_path)
-        base = encode_job_uid_filename("h::a")
-        tmp_file = tmp_path / f"{base}.result.json.tmp"
-        tmp_file.write_text('{"status": "suc')  # 部分 JSON
-
-        assert journal.claim_stale_result_payload("h::a") is None
-        assert tmp_file.exists(), "认领不得 unlink 正在写的 .tmp 文件"
-
-    def test_claim_discards_non_result_shapes(self, tmp_path):
-        """无 status 键 / 非 dict 的残留 → 丢弃返回 None（宁可重跑）。"""
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "h::a", {"not": "a result"}, execution_id=_INCARNATION_FIRST
-        )
-        assert journal.claim_stale_result_payload("h::a") is None
-        assert not journal.result_path("h::a", _INCARNATION_FIRST).exists(), (
-            "丢弃的残留文件必须被清理（防重启后重复判定）"
-        )
-
-    def test_claim_consumes_and_cleans_all_execution_ids(self, tmp_path):
-        """认领消费最新残留后，其余执行代残留一并清理。"""
-        run_id = "c" * 32
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "h::a", {"status": "retry", "error_message": "old"}, execution_id=f"{run_id}.1"
-        )
-        journal.write_result_atomic(
-            "h::a", {"status": "retry", "error_message": "new"}, execution_id=f"{run_id}.2"
-        )
-
-        payload = journal.claim_stale_result_payload("h::a")
-        assert payload is not None and payload["error_message"] == "new"
-        assert journal.iter_stale_result_paths("h::a") == []
-
-    def test_sibling_uid_dot_suffix_not_matched(self, tmp_path):
-        """点后缀兄弟 uid 的结果文件不得被误认成本 uid 的残留。"""
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "h::page.1",
-            {"status": "success", "raw_result": True},
-            execution_id=_INCARNATION_FIRST,
-        )
-        assert journal.iter_stale_result_paths("h::page") == [], (
-            "点后缀兄弟 uid 的结果文件不得被误判为本 uid 的残留"
-        )
-
-    def test_sibling_uid_deep_dot_suffix_not_matched(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "h::a.b.c",
-            {"status": "success", "raw_result": True},
-            execution_id="deadbeefdeadbeefdeadbeefdeadbeef.7",
-        )
-        assert journal.iter_stale_result_paths("h::a") == []
-
-    def test_same_uid_execution_id_still_matched(self, tmp_path):
-        """本 uid 自己的 execution_id 残留仍须被枚举（锚定修复不误伤正常路径）。"""
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "h::a",
-            {"status": "success", "raw_result": True},
-            execution_id="deadbeefdeadbeefdeadbeefdeadbeef.3",
-        )
-        found = journal.iter_stale_result_paths("h::a")
-        assert len(found) == 1, f"本 uid 残留应被枚举: {found}"
-
-    def test_cleanup_does_not_delete_sibling_result(self, tmp_path):
-        """cleanup_ipc_files 不得删除点后缀兄弟 uid 的结果文件（全链路）。"""
-        execution_id = "deadbeefdeadbeefdeadbeefdeadbeef.5"
-        journal = ArtifactJournal(tmp_path)
-        journal.write_result_atomic(
-            "h::page.1",
-            {"status": "success", "raw_result": True},
-            execution_id=execution_id,
-        )
-        journal.cleanup_ipc_files("h::page", execution_id)
-        assert journal.result_path("h::page.1", execution_id).exists(), (
-            "cleanup 不得删除兄弟 uid 的结果文件"
-        )
+        assert len(messages) == 2
+        assert isinstance(messages[0], WorkerPipeMessage)
+        assert messages[0].kind == PIPE_MSG_OUTPUT
+        assert messages[0].payload == decl.to_dict()
+        assert isinstance(messages[1], WorkerPipeMessage)
+        assert messages[1].kind == PIPE_MSG_INPUT
+        assert messages[1].payload == {"path": in_path}
 
 
 class TestRawResultCodec:
@@ -561,99 +161,6 @@ class TestRawResultCodec:
             out = decode_raw_result(["__tl_tuple_v1", bad])
             assert out == ["__tl_tuple_v1", bad], "原样返回，不抛异常"
         assert decode_raw_result(["__tl_tuple_v1", ["x", "y"]]) == ("x", "y")
-
-
-class TestResultParseContainment:
-    """结果损坏按缺失处理；声明损坏必须阻止发布不完整依赖或删除授权。"""
-
-    def test_read_result_deep_nesting_returns_none(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        deep = tmp_path / "deep.result.json"
-        deep.write_text("[" * 200000 + "]" * 200000, encoding="utf-8")
-
-        assert journal.read_result(deep) is None, "解析失控必须按损坏结果降级为 None"
-
-    def test_read_artifacts_rejects_deep_nesting_line(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        uid = "t::deep_outputs"
-        op = journal.outputs_path(uid)
-        good = tmp_path / "ok.txt"
-        op.write_text(
-            json.dumps({"path": str(good), "delete_on_failure": True}) + "\n"
-            + json.dumps({"path": "/" + "[" * 200000, "delete_on_failure": True}) + "\n"
-            + "[" * 200000 + "\n",
-            encoding="utf-8",
-        )
-
-        with pytest.raises(ValueError, match="invalid artifact declaration"):
-            journal.read_artifacts(uid)
-
-    def test_read_inputs_rejects_deep_nesting_line(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        uid = "t::deep_inputs"
-        ip = journal.inputs_path(uid)
-        ip.write_text(
-            json.dumps({"path": "/tmp/a", "kind": "file"}) + "\n"
-            + "[" * 200000 + "\n",
-            encoding="utf-8",
-        )
-
-        with pytest.raises(ValueError):
-            journal.read_inputs(uid)
-
-    def test_read_suspend_lines_deep_nesting_line_skipped(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        uid = "t::deep_signals"
-        sp = journal.signals_path(uid)
-        sp.write_text(
-            json.dumps({"suspend": ["gpu", 5.0]}) + "\n"
-            + "[" * 200000 + "\n",
-            encoding="utf-8",
-        )
-
-        assert journal.drain_signals(uid) == [("gpu", 5.0)], (
-            "深嵌套行按坏行跳过，合法信号保留"
-        )
-
-    def test_read_artifacts_rejects_bad_line(self, tmp_path):
-        """坏行不能被忽略后继续授予后续声明删除权。"""
-        journal = ArtifactJournal(tmp_path)
-        uid = "t::a"
-        p = tmp_path / "t%3A%3Aa.outputs.jsonl"
-        p.write_text(
-            '{"path": "/ok_first", "delete_on_failure": true}\n'
-            'not-json-line\n'
-            '{"path": "/ok_second", "delete_on_failure": true}\n',
-            encoding="utf-8",
-        )
-        with pytest.raises(ValueError, match="invalid artifact declaration"):
-            journal.read_artifacts(uid)
-
-    def test_read_artifacts_skips_empty_line(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        uid = "t::a"
-        p = tmp_path / "t%3A%3Aa.outputs.jsonl"
-        p.write_text(
-            '{"path": "/a", "delete_on_failure": true}\n'
-            '\n'
-            '{"path": "/b", "delete_on_failure": true}\n',
-            encoding="utf-8",
-        )
-        outputs = journal.read_artifacts(uid)
-        assert [o.path for o in outputs] == ["/a", "/b"]
-
-    def test_read_inputs_rejects_bad_line(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        uid = "t::a"
-        p = tmp_path / "t%3A%3Aa.inputs.jsonl"
-        p.write_text(
-            '{"path": "/in_first", "kind": "file", "size": 1, "mtime_ns": 1}\n'
-            'not-json\n'
-            '{"path": "/in_second", "kind": "file", "size": 2, "mtime_ns": 2}\n',
-            encoding="utf-8",
-        )
-        with pytest.raises(ValueError):
-            journal.read_inputs(uid)
 
 
 class TestCleanupSandboxRecheck:
@@ -675,14 +182,14 @@ class TestCleanupSandboxRecheck:
         victim.mkdir()
         (victim / "precious.txt").write_text("data")
         uid = "t::poison"
-        _write_artifact(journal, uid, str(victim), delete_on_failure=True)
+        _inject_raw_declaration(journal, uid, str(victim), delete_on_failure=True)
 
         with pytest.raises(ValueError):
             journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
 
         assert victim.exists(), "沙盒外目录绝不能被 rmtree"
         assert (victim / "precious.txt").exists()
-        assert journal.outputs_path(uid).exists()
+        assert len(journal.read_artifacts(uid)) == 1
 
     def test_failure_cleanup_still_removes_in_sandbox_entries(self, tmp_path):
         """沙盒内合法声明的半成品文件与目录照常清理（复检不误伤合法清理）。"""
@@ -693,8 +200,8 @@ class TestCleanupSandboxRecheck:
         broken_dir.mkdir()
         (broken_dir / "sub.txt").write_text("sub")
         uid = "t::normal"
-        _write_artifact(journal, uid, str(broken_file), delete_on_failure=True)
-        _write_artifact(journal, uid, str(broken_dir), delete_on_failure=True)
+        _inject_raw_declaration(journal, uid, str(broken_file), delete_on_failure=True)
+        _inject_raw_declaration(journal, uid, str(broken_dir), delete_on_failure=True)
 
         journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
 
@@ -707,7 +214,9 @@ class TestCleanupSandboxRecheck:
         victim = tmp_path / "outside.cache"
         victim.write_text("data")
         uid = "t::cache"
-        _write_artifact(journal, uid, str(victim), delete_on_failure=True, delete_on_success=True)
+        _inject_raw_declaration(
+            journal, uid, str(victim), delete_on_failure=True, delete_on_success=True
+        )
 
         with pytest.raises(ValueError):
             journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
@@ -722,8 +231,12 @@ class TestCleanupSandboxRecheck:
         victim = tmp_path / "outside.txt"
         victim.write_text("data")
         uid = "t::no_roots"
-        _write_artifact(journal, uid, str(inside), delete_on_failure=True, delete_on_success=True)
-        _write_artifact(journal, uid, str(victim), delete_on_failure=True, delete_on_success=True)
+        _inject_raw_declaration(
+            journal, uid, str(inside), delete_on_failure=True, delete_on_success=True
+        )
+        _inject_raw_declaration(
+            journal, uid, str(victim), delete_on_failure=True, delete_on_success=True
+        )
 
         with pytest.raises(ValueError, match="protected root"):
             journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
@@ -739,7 +252,12 @@ class TestCleanupSandboxRecheck:
         (target / "f.txt").write_text("data")
         os.symlink(target, roots / "link")
         uid = "t::escape"
-        _write_artifact(journal, uid, str(roots / "link" / ".." / ".." / "real_target"), delete_on_failure=True)
+        _inject_raw_declaration(
+            journal,
+            uid,
+            str(roots / "link" / ".." / ".." / "real_target"),
+            delete_on_failure=True,
+        )
 
         with pytest.raises(ValueError):
             journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
@@ -751,19 +269,16 @@ class TestArtifactJournalCleanupModes:
     def test_cleanup_pre_submit(self, tmp_path):
         journal = ArtifactJournal(tmp_path)
         uid = "job_clean_pre"
-        journal.record_signal(uid, "gpu", 1.0)
-        _write_artifact(journal, uid, "/tmp/out", delete_on_failure=True)
+        _inject_raw_declaration(journal, uid, "/tmp/out", delete_on_failure=True)
         journal.record_input_file(uid, "/tmp/in")
 
-        assert journal.signals_path(uid).exists()
-        assert journal.outputs_path(uid).exists()
-        assert journal.inputs_path(uid).exists()
+        assert len(journal.read_artifacts(uid)) == 1
+        assert journal.read_inputs(uid) == ["/tmp/in"]
 
         journal.cleanup(uid, ArtifactCleanupMode.PRE_SUBMIT)
 
-        assert not journal.signals_path(uid).exists()
-        assert not journal.outputs_path(uid).exists()
-        assert not journal.inputs_path(uid).exists()
+        assert journal.read_artifacts(uid) == ()
+        assert journal.read_inputs(uid) == []
 
     def test_cleanup_success_mode(self, tmp_path):
         journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path)
@@ -773,14 +288,21 @@ class TestArtifactJournalCleanupModes:
         final_file = tmp_path / "final.txt"
         final_file.write_text("final")
 
-        _write_artifact(journal, uid, str(cache_file), delete_on_failure=True, delete_on_success=True)
-        _write_artifact(journal, uid, str(final_file), delete_on_failure=True)
+        journal.record_artifact(
+            uid,
+            ArtifactDeclaration(
+                str(cache_file), delete_on_failure=True, delete_on_success=True
+            ),
+        )
+        journal.record_artifact(
+            uid, ArtifactDeclaration(str(final_file), delete_on_failure=True)
+        )
 
         journal.cleanup(uid, ArtifactCleanupMode.SUCCESS)
 
         assert not cache_file.exists(), "cache file must be cleaned on success"
         assert final_file.exists(), "product file must be retained on success"
-        assert not journal.outputs_path(uid).exists()
+        assert journal.read_artifacts(uid) == ()
 
     def test_cleanup_failure_mode(self, tmp_path):
         journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path)
@@ -793,64 +315,54 @@ class TestArtifactJournalCleanupModes:
         keep_file = tmp_path / "keep.txt"
         keep_file.write_text("preserve")
 
-        _write_artifact(journal, uid, str(broken_file), delete_on_failure=True)
-        _write_artifact(journal, uid, str(broken_dir), delete_on_failure=True)
-        _write_artifact(journal, uid, str(keep_file), delete_on_failure=False)
+        journal.record_artifact(
+            uid, ArtifactDeclaration(str(broken_file), delete_on_failure=True)
+        )
+        journal.record_artifact(
+            uid, ArtifactDeclaration(str(broken_dir), delete_on_failure=True)
+        )
+        journal.record_artifact(
+            uid, ArtifactDeclaration(str(keep_file), delete_on_failure=False)
+        )
 
         journal.cleanup(uid, ArtifactCleanupMode.FAILURE_OR_RETRY)
 
         assert not broken_file.exists(), "cleanup=True file must be unlinked"
         assert not broken_dir.exists(), "cleanup=True directory must be rmtree'd"
         assert keep_file.exists(), "cleanup=False file must be kept"
-        assert not journal.outputs_path(uid).exists()
+        assert journal.read_artifacts(uid) == ()
 
 
 class TestTypedArtifactJournal:
-    def test_authorizations_use_one_typed_log(self, tmp_path):
-        from tasklite.models.artifact import ArtifactDeclaration
-
-        journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path / "out")
+    def test_authorizations_deduplicate_identical_declaration(self, tmp_path):
+        out_root = tmp_path / "out"
+        out_root.mkdir()
+        journal = ArtifactJournal(tmp_path / "ipc", output_roots=out_root)
         declaration = ArtifactDeclaration(
-            str(tmp_path / "out" / "report"), name="report",
-            delete_existing=True, delete_on_failure=True,
+            str(out_root / "report"),
+            name="report",
+            delete_existing=True,
+            delete_on_failure=True,
         )
         journal.record_artifact("t::1", declaration)
         journal.record_artifact("t::1", declaration)
         assert journal.read_artifacts("t::1") == (declaration,)
-        rows = [json.loads(line) for line in journal.outputs_path("t::1").read_text().splitlines()]
-        assert rows == [declaration.to_dict()]
-        assert "kind" not in rows[0] and "cleanup" not in rows[0]
-
-    @pytest.mark.parametrize("payload", [
-        '{"path":"/tmp/old", "cleanup":true, "kind":"output"}',
-        'not json',
-        '{"path":"/tmp/output", "accepted":true}',
-    ])
-    def test_publication_rejects_invalid_or_previous_log_format(self, tmp_path, payload):
-        journal = ArtifactJournal(tmp_path)
-        journal.outputs_path("t::1").write_text(payload + "\n")
-        with pytest.raises(ValueError):
-            journal.read_artifacts("t::1")
 
     def test_typed_record_rejects_conflict_and_noncanonical_parent_link(self, tmp_path):
-        from tasklite.models.artifact import ArtifactDeclaration
-
         root = tmp_path / "out"
         root.mkdir()
         (root / "real").mkdir()
         (root / "link").symlink_to(root / "real", target_is_directory=True)
         journal = ArtifactJournal(tmp_path / "ipc", output_roots=root)
-        journal.record_artifact("t::1", ArtifactDeclaration(str(root / "a"), name="a"))
-        before = journal.outputs_path("t::1").read_text()
+        first = ArtifactDeclaration(str(root / "a"), name="a")
+        journal.record_artifact("t::1", first)
         with pytest.raises(ValueError):
             journal.record_artifact("t::1", ArtifactDeclaration(str(root / "b"), name="a"))
         with pytest.raises(ValueError):
             journal.record_artifact("t::1", ArtifactDeclaration(str(root / "link" / "c")))
-        assert journal.outputs_path("t::1").read_text() == before
+        assert journal.read_artifacts("t::1") == (first,)
 
     def test_named_publication_rechecks_path_without_following_leaf_link(self, tmp_path):
-        from tasklite.models.artifact import ArtifactDeclaration
-
         root = tmp_path / "out"
         root.mkdir()
         report = root / "report"
@@ -862,52 +374,24 @@ class TestTypedArtifactJournal:
         with pytest.raises(ValueError, match="symlink"):
             journal.read_artifacts("t::1")
 
-    def test_typed_log_io_error_is_not_an_empty_manifest(self, tmp_path, monkeypatch):
-        import builtins
-        from tasklite.models.artifact import ArtifactDeclaration
-
-        journal = ArtifactJournal(tmp_path / "ipc")
-        declaration = ArtifactDeclaration(str(tmp_path / "out"), name="report")
-        real_open = builtins.open
-
-        def denied(path, *args, **kwargs):
-            if Path(path) == journal.outputs_path("t::1"):
-                raise PermissionError("denied")
-            return real_open(path, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "open", denied)
-        with pytest.raises(PermissionError):
-            journal.read_artifacts("t::1")
+    def test_typed_pipe_send_failure_propagates(self, tmp_path):
+        receiver, sender = create_worker_pipe(
+            job_uid="t::1",
+            execution_id="exec_1",
+        )
+        sender.close()
+        receiver.close()
+        journal = ArtifactJournal(tmp_path / "ipc", pipe_sender=sender)
         with pytest.raises(_ArtifactIOError):
-            journal.record_artifact("t::1", declaration)
-
-    def test_typed_record_requires_an_ipc_destination(self, tmp_path):
-        from tasklite.models.artifact import ArtifactDeclaration
-
-        with pytest.raises(ValueError, match="ipc_dir"):
-            ArtifactJournal().record_artifact("t::1", ArtifactDeclaration(str(tmp_path / "report"), name="report"))
-
-    def test_typed_append_failure_propagates(self, tmp_path, monkeypatch):
-        import builtins
-        from tasklite.models.artifact import ArtifactDeclaration
-
-        journal = ArtifactJournal(tmp_path / "ipc")
-        real_open = builtins.open
-
-        def denied_append(path, mode="r", *args, **kwargs):
-            if Path(path) == journal.outputs_path("t::1") and mode == "a":
-                raise PermissionError("append denied")
-            return real_open(path, mode, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "open", denied_append)
-        with pytest.raises(_ArtifactIOError, match="append denied"):
-            journal.record_artifact("t::1", ArtifactDeclaration(str(tmp_path / "report"), name="report"))
+            journal.record_artifact(
+                "t::1", ArtifactDeclaration(str(tmp_path / "report"), name="report")
+            )
+        with pytest.raises(_ArtifactIOError):
+            journal.record_input_file("t::1", str(tmp_path / "source"))
 
 
 @pytest.mark.parametrize("success", [False, True])
 def test_cleanup_custom_directory_obeys_explicit_authorization(tmp_path, success):
-    from tasklite.models.artifact import ArtifactDeclaration
-
     journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path / "outputs")
     directory = tmp_path / "external" / "scratch"
     directory.mkdir(parents=True)
@@ -921,12 +405,11 @@ def test_cleanup_custom_directory_obeys_explicit_authorization(tmp_path, success
     journal.cleanup("t::cleanup", mode)
 
     assert not directory.exists()
-    assert not journal.outputs_path("t::cleanup").exists()
+    assert journal.read_artifacts("t::cleanup") == ()
 
 
 @pytest.mark.parametrize("success", [False, True])
 def test_cleanup_io_failure_preserves_declarations(tmp_path, monkeypatch, success):
-    from tasklite.models.artifact import ArtifactDeclaration
     from tasklite.utils.artifact import ArtifactPathPolicy
 
     journal = ArtifactJournal(tmp_path / "ipc", output_roots=tmp_path / "outputs")
@@ -948,21 +431,3 @@ def test_cleanup_io_failure_preserves_declarations(tmp_path, monkeypatch, succes
 
     assert target.exists()
     assert journal.read_artifacts("t::cleanup") == (declaration,)
-
-
-def test_input_log_io_error_is_not_an_empty_dependency_list(tmp_path, monkeypatch):
-    import builtins
-
-    journal = ArtifactJournal(tmp_path / "ipc")
-    real_open = builtins.open
-
-    def denied(path, *args, **kwargs):
-        if Path(path) == journal.inputs_path("t::input"):
-            raise PermissionError("input log denied")
-        return real_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", denied)
-    with pytest.raises(PermissionError, match="input log denied"):
-        journal.read_inputs("t::input")
-    with pytest.raises(_ArtifactIOError, match="input log denied"):
-        journal.record_input_file("t::input", str(tmp_path / "source"))

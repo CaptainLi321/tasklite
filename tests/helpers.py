@@ -12,17 +12,17 @@ from pathlib import Path
 from tasklite.pipeline import TaskLite
 
 
-def _write_fake_result(ipc_dir, uid, result_dict, execution_id=None, auth_token=None):
-    """FakeProcess 用：把 IPC 结果原子写入结果文件（与真实子进程同路径）。
-
-    execution_id 与结果认证令牌均由 WorkerLaunchSpec 携带——fake 与真实
-    子进程共享同一路径构造逻辑与令牌落盘行为，保证 drain 能读到 fake
-    写的结果且通过读取侧强校验。
-    """
-    from tasklite.utils.ipc import ArtifactJournal
-    if auth_token is not None:
-        result_dict["auth"] = auth_token
-    ArtifactJournal(ipc_dir).write_result_atomic(uid, result_dict, execution_id=execution_id)
+def _write_fake_result(
+    ipc_dir,
+    uid,
+    result_dict,
+    execution_id=None,
+    pipe_sender=None,
+):
+    """FakeProcess 用：经 WorkerLaunchSpec 绑定的瞬时管道发送端回传结果。"""
+    _ = (ipc_dir, uid, execution_id)
+    if pipe_sender is not None:
+        pipe_sender.send_result(result_dict)
 
 
 def _spec_execution_id(args):
@@ -87,7 +87,7 @@ def make_fake_process_class(outcome="success"):
                 job = spec.job
                 ipc_dir = spec.ipc_dir
                 execution_id = spec.execution_id
-                auth_token = getattr(spec, "result_token", None)
+                pipe_sender = getattr(spec, "pipe_sender", None)
                 if outcome == "success":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "success",
@@ -95,27 +95,27 @@ def make_fake_process_class(outcome="success"):
                         "spawned_jobs": [],
                         "resource_suspensions": [],
                         "cursor_updates": {},
-                    }, execution_id=execution_id, auth_token=auth_token)
+                    }, execution_id=execution_id, pipe_sender=pipe_sender)
                 elif outcome == "retry":
-                    _write_fake_result(ipc_dir, job.uid, {"status": "retry", "error_message": "transient"}, execution_id=execution_id, auth_token=auth_token)
+                    _write_fake_result(ipc_dir, job.uid, {"status": "retry", "error_message": "transient"}, execution_id=execution_id, pipe_sender=pipe_sender)
                 elif outcome == "fatal":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "fatal",
                         "error_message": "FatalError: bug",
                         "traceback": "traceback",
-                    }, execution_id=execution_id, auth_token=auth_token)
+                    }, execution_id=execution_id, pipe_sender=pipe_sender)
                 elif outcome == "fatal_exception":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "fatal",
                         "error_message": "TypeError: bad type",
                         "traceback": "traceback",
-                    }, execution_id=execution_id, auth_token=auth_token)
+                    }, execution_id=execution_id, pipe_sender=pipe_sender)
                 elif outcome == "error":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "error",
                         "error_message": "something broke",
                         "traceback": "traceback",
-                    }, execution_id=execution_id, auth_token=auth_token)
+                    }, execution_id=execution_id, pipe_sender=pipe_sender)
 
         def join(self, timeout=None):
             self._alive = False
@@ -170,7 +170,7 @@ def make_ipc_process_class(results=(), exitcode=0, stay_alive=False):
                 _write_fake_result(
                     spec.ipc_dir, spec.job.uid, payload,
                     execution_id=spec.execution_id,
-                    auth_token=getattr(spec, "result_token", None),
+                    pipe_sender=getattr(spec, "pipe_sender", None),
                 )
 
         def join(self, timeout=None):

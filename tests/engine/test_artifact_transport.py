@@ -1,6 +1,5 @@
 """声明环境故障沿执行结果返回，业务异常仍按任务错误处理。"""
 
-import json
 import multiprocessing as mp
 
 import pytest
@@ -8,7 +7,11 @@ import pytest
 from tasklite.engine.channel import WorkerLaunchSpec, _decode_ipc_result, _worker_process_entry
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
-from tasklite.utils.ipc import ArtifactJournal
+from tasklite.utils.ipc import (
+    PIPE_MSG_RESULT,
+    WorkerPipeMessage,
+    create_worker_pipe,
+)
 
 
 def _declaration_fault(job, ctx):
@@ -24,21 +27,42 @@ def _handler_io_fault(job, ctx):
     raise OSError("external tool read failed")
 
 
-@pytest.mark.parametrize("handler, infrastructure", [(_declaration_fault, True), (_handler_io_fault, False)])
+def _drain_result_payload(receiver) -> dict:
+    messages = receiver.drain_to_eof(timeout=5.0)
+    receiver.close()
+    res_msgs = [
+        m.payload
+        for m in messages
+        if isinstance(m, WorkerPipeMessage) and m.kind == PIPE_MSG_RESULT
+    ]
+    assert len(res_msgs) == 1
+    return res_msgs[0]
+
+
+@pytest.mark.parametrize(
+    "handler, infrastructure",
+    [(_declaration_fault, True), (_handler_io_fault, False)],
+)
 def test_spawn_worker_preserves_error_boundary(tmp_path, handler, infrastructure):
     job = Job("transport", "one")
     ipc_dir = tmp_path / "ipc"
     ipc_dir.mkdir()
     ctx = JobContext(job, set(), set(), {}, ipc_dir=str(ipc_dir))
-    spec = WorkerLaunchSpec(handler, job, ctx, "session.1", str(ipc_dir), 10.0, "token")
-    process = mp.get_context("spawn").Process(target=_worker_process_entry, args=(spec,))
+    mp_ctx = mp.get_context("spawn")
+    receiver, sender = create_worker_pipe(
+        mp_ctx, job_uid=job.uid, execution_id="session.1"
+    )
+    spec = WorkerLaunchSpec(
+        handler, job, ctx, "session.1", str(ipc_dir), 10.0, pipe_sender=sender
+    )
+    process = mp_ctx.Process(target=_worker_process_entry, args=(spec,))
     process.start()
+    sender.close()
     try:
         process.join(timeout=10)
         assert not process.is_alive()
         assert process.exitcode == 0
-        payload = json.loads(ArtifactJournal(ipc_dir).result_path(job.uid, "session.1").read_text())
-        assert payload["auth"] == "token"
+        payload = _drain_result_payload(receiver)
         result = _decode_ipc_result(payload, process, job)
         assert result.success is False
         if infrastructure:
@@ -48,8 +72,11 @@ def test_spawn_worker_preserves_error_boundary(tmp_path, handler, infrastructure
             assert result.result_metadata == {}
         else:
             assert result.artifact_error is None
-            assert "external tool read failed" in str(result.result_metadata or result.retry_error)
+            assert "external tool read failed" in str(
+                result.result_metadata or result.retry_error
+            )
     finally:
+        receiver.close()
         if process.is_alive():
             process.kill()
             process.join()
@@ -58,17 +85,27 @@ def test_spawn_worker_preserves_error_boundary(tmp_path, handler, infrastructure
 
 def test_success_decode_does_not_read_artifact_declarations(tmp_path):
     job = Job("transport", "one")
-    ArtifactJournal(tmp_path).outputs_path(job.uid).mkdir()
-    result = _decode_ipc_result({"status": "success", "raw_result": True}, None, job, str(tmp_path))
+    result = _decode_ipc_result(
+        {"status": "success", "raw_result": True}, None, job, str(tmp_path)
+    )
     assert result.success is True
 
 
 def test_worker_cannot_swallow_declaration_environment_fault(tmp_path):
     job = Job("transport", "inline")
     ctx = JobContext(job, set(), set(), {})
-    spec = WorkerLaunchSpec(_declaration_fault, job, ctx, "session.1", str(tmp_path), 10.0)
+    receiver, sender = create_worker_pipe(job_uid=job.uid, execution_id="session.1")
+    spec = WorkerLaunchSpec(
+        _declaration_fault,
+        job,
+        ctx,
+        "session.1",
+        str(tmp_path),
+        10.0,
+        pipe_sender=sender,
+    )
     _worker_process_entry(spec)
-    payload = json.loads(ArtifactJournal(tmp_path).result_path(job.uid, "session.1").read_text())
+    payload = _drain_result_payload(receiver)
     assert payload["status"] == "artifact_error"
     result = _decode_ipc_result(payload, None, job)
     assert result.artifact_error == "declaration write denied"
@@ -76,23 +113,19 @@ def test_worker_cannot_swallow_declaration_environment_fault(tmp_path):
 
 
 def _write_declaration_with_io_fault(job, ctx):
-    import builtins
-    from pathlib import Path
     from unittest.mock import patch
 
+    from tasklite.utils.ipc import WorkerPipeSender
+
     kind = job.payload["kind"]
-    journal = ArtifactJournal(ctx.ipc_dir)
-    declaration_path = (
-        journal.outputs_path(job.uid) if kind == "output" else journal.inputs_path(job.uid)
-    )
-    original_open = builtins.open
+    target_method = "send_output" if kind == "output" else "send_input"
 
-    def denied_open(file, mode="r", *args, **kwargs):
-        if Path(file) == declaration_path and "a" in mode:
-            raise PermissionError("declaration write denied")
-        return original_open(file, mode, *args, **kwargs)
+    def denied_send(self, *args, **kwargs):
+        from tasklite.exceptions import _ArtifactIOError
 
-    with patch("builtins.open", denied_open):
+        raise _ArtifactIOError("declaration write denied")
+
+    with patch.object(WorkerPipeSender, target_method, denied_send):
         try:
             if kind == "output":
                 ctx.declare_output(job.payload["path"])
@@ -111,9 +144,18 @@ def test_public_declaration_write_fault_bypasses_handler_exception(tmp_path, kin
     ipc = tmp_path / "ipc"
     ipc.mkdir()
     ctx = JobContext(job, set(), set(), {}, output_roots=tmp_path, ipc_dir=str(ipc))
-    spec = WorkerLaunchSpec(_write_declaration_with_io_fault, job, ctx, "session.1", str(ipc), 10.0)
+    receiver, sender = create_worker_pipe(job_uid=job.uid, execution_id="session.1")
+    spec = WorkerLaunchSpec(
+        _write_declaration_with_io_fault,
+        job,
+        ctx,
+        "session.1",
+        str(ipc),
+        10.0,
+        pipe_sender=sender,
+    )
     _worker_process_entry(spec)
-    payload = json.loads(ArtifactJournal(ipc).result_path(job.uid, "session.1").read_text())
+    payload = _drain_result_payload(receiver)
     assert payload["status"] == "artifact_error"
     result = _decode_ipc_result(payload, None, job)
     assert result.artifact_error == "declaration write denied"
@@ -133,12 +175,19 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
         path.write_text("input")
     finished = []
     pipeline = TaskLite(
-        "transport", state_dir=tmp_path / "state", output_roots=output_root,
+        "transport",
+        state_dir=tmp_path / "state",
+        output_roots=output_root,
         on_attempt_finished=lambda *args, **kwargs: finished.append((args, kwargs)),
     )
     pipeline.register_task("transport", _write_declaration_with_io_fault)
-    job = Job("transport", "one", payload={"kind": kind, "path": str(path)},
-              max_retries=3, attempt_no=2)
+    job = Job(
+        "transport",
+        "one",
+        payload={"kind": kind, "path": str(path)},
+        max_retries=3,
+        attempt_no=2,
+    )
     try:
         pipeline.enqueue(job)
         with pytest.raises(_ArtifactIOError, match="declaration write denied"):

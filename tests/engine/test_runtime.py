@@ -50,18 +50,16 @@ def ok_handler(job, ctx):
 
 
 def _write_success_result(spec) -> None:
-    """按 WorkerLaunchSpec 具名契约写成功结果文件（含认证令牌）。"""
-    ArtifactJournal(spec.ipc_dir).write_result_atomic(
-        spec.job.uid,
+    """按 WorkerLaunchSpec 具名契约通过 Pipe 发送成功结果。"""
+    assert spec.pipe_sender is not None
+    spec.pipe_sender.send_result(
         {
             "status": "success",
             "raw_result": True,
             "spawned_jobs": [],
             "resource_suspensions": [],
             "cursor_updates": {},
-            "auth": spec.result_token,
-        },
-        execution_id=spec.execution_id,
+        }
     )
 
 
@@ -650,8 +648,6 @@ class TestPrepareRunState:
 
         assert runtime.session.run_id and runtime.session.run_id != "stale"
         assert env.backend.get_engine_metadata("last_run_id") == runtime.session.run_id
-        # 认证令牌与 run_id 同生命周期轮换并同步执行通道
-        assert runtime.channel.result_token == runtime.session.result_token
         assert runtime.session.dispatch_no == 0
         assert runtime.store.state is state
 

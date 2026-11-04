@@ -5,7 +5,7 @@ import pytest
 
 from tasklite import Job
 from tasklite.testing import fake_ctx
-from tasklite.utils.ipc import ArtifactJournal
+from tasklite.utils.ipc import create_worker_pipe
 
 
 def test_named_output_is_idempotent_without_deleting_written_content(tmp_path):
@@ -14,7 +14,7 @@ def test_named_output_is_idempotent_without_deleting_written_content(tmp_path):
     Path(path).write_text("retained", encoding="utf-8")
     assert ctx.declare_output("result.txt", name="report", delete_existing=True) == path
     assert Path(path).read_text(encoding="utf-8") == "retained"
-    assert len(ArtifactJournal(ctx.ipc_dir).read_artifacts("build::one")) == 1
+    assert len(ctx._journal.read_artifacts("build::one")) == 1
 
 
 def test_getter_reads_direct_dependency_without_declaring_input(tmp_path):
@@ -27,9 +27,9 @@ def test_getter_reads_direct_dependency_without_declaring_input(tmp_path):
         artifacts={"build::one": {"bundle": {"path": str(folder)}}},
     )
     assert ctx.get_artifact_path(producer_job_uid="build::one", artifact_name="bundle") == str(folder)
-    assert ArtifactJournal(ctx.ipc_dir).read_inputs(ctx.job.uid) == []
+    assert ctx._journal.read_inputs(ctx.job.uid) == []
     report = ctx.declare_input(folder / "report.txt")
-    assert ArtifactJournal(ctx.ipc_dir).read_inputs(ctx.job.uid) == [report]
+    assert ctx._journal.read_inputs(ctx.job.uid) == [report]
 
 
 @pytest.mark.parametrize("attributes", [
@@ -78,7 +78,7 @@ def test_same_name_cannot_move_to_another_path(tmp_path):
 def test_cache_uses_anonymous_output_authorizations(tmp_path):
     ctx = fake_ctx(Job("build", "one"), tmp_root=tmp_path)
     path = ctx.declare_cache("scratch", delete_existing=True)
-    declaration, = ArtifactJournal(ctx.ipc_dir).read_artifacts(ctx.job.uid)
+    declaration, = ctx._journal.read_artifacts(ctx.job.uid)
     assert declaration.to_dict() == {
         "path": path, "name": None, "delete_existing": True,
         "delete_on_failure": True, "delete_on_success": True, "sandbox": True,
@@ -145,7 +145,13 @@ def test_injected_artifacts_are_dispatch_snapshot(tmp_path):
 def test_declaration_write_error_propagates(tmp_path):
     ipc = tmp_path / "ipc"
     ctx = fake_ctx(Job("build", "one"), ipc_dir=str(ipc))
-    ArtifactJournal(ipc).outputs_path(ctx.job.uid).mkdir()
+    receiver, sender = create_worker_pipe(
+        job_uid=ctx.job.uid,
+        execution_id="exec_err",
+    )
+    sender.close()
+    receiver.close()
+    ctx._bind_pipe_sender(sender)
     from tasklite.exceptions import _ArtifactIOError
 
     with pytest.raises(_ArtifactIOError):

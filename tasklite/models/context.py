@@ -15,10 +15,9 @@ import stat
 from pathlib import Path
 
 from ..exceptions import _ArtifactIOError
-from ..utils.artifact import ArtifactPathPolicy
-from ..utils.ipc import ArtifactJournal
+from ..utils.ipc import ArtifactJournal, WorkerPipeSender
 from ..utils.jsonutil import dumps
-from .artifact import ArtifactDeclaration, append_artifact_declaration
+from .artifact import ArtifactDeclaration
 from .job import Job
 
 logger = logging.getLogger("tasklite")
@@ -44,7 +43,7 @@ class JobContext:
     ):
         self._artifact_descriptions = copy.deepcopy(artifact_descriptions or {})
         self._protected_roots = tuple(protected_roots)
-        self._local_artifacts: tuple[ArtifactDeclaration, ...] = ()
+        self._pipe_sender: WorkerPipeSender | None = None
         self.job = job
         self.spawned_jobs: list[Job] = []
         self.resource_suspensions: list[tuple[str, float]] = []
@@ -73,25 +72,28 @@ class JobContext:
         self.transient_exceptions = (
             tuple(transient_exceptions) if transient_exceptions is not None else None
         )
-        # suspend 信号走落盘文件（{ipc_dir}/{uid}.signals.jsonl）——
-        # 进程被 kill 后文件仍在，信号不丢。
         self.ipc_dir = ipc_dir
-        # fencing 的执行代标识（{run_id}.{dispatch_no}）不经 JobContext 携带——
-        # 归 WorkerLaunchSpec（进程 seam 具名契约），worker 据它构造带
-        # execution_id 的结果文件名，孤儿进程的旧 execution_id 文件不被
-        # 新 run 看见。
         self._journal_instance: ArtifactJournal | None = None
         self._journal_instance_dir: str | None = None
 
     @property
-    def _journal(self) -> ArtifactJournal | None:
-        """当前 ipc_dir 对应的产物清单深模块实例（按目录缓存单例）。"""
-        if self.ipc_dir is None:
-            return None
+    def _journal(self) -> ArtifactJournal:
+        """当前上下文对应的产物清单深模块实例。"""
         if self._journal_instance is None or self._journal_instance_dir != self.ipc_dir:
-            self._journal_instance = ArtifactJournal(self.ipc_dir, self.output_roots, self._protected_roots)
+            self._journal_instance = ArtifactJournal(
+                self.ipc_dir,
+                self.output_roots,
+                self._protected_roots,
+                pipe_sender=self._pipe_sender,
+            )
             self._journal_instance_dir = self.ipc_dir
         return self._journal_instance
+
+    def _bind_pipe_sender(self, sender: WorkerPipeSender | None) -> None:
+        """绑定或解绑当前执行体的瞬时管道发送端。"""
+        self._pipe_sender = sender
+        if self._journal_instance is not None:
+            self._journal_instance.bind_pipe_sender(sender)
 
     def spawn(self, job: Job) -> None:
         """入队一个子 job。
@@ -120,10 +122,8 @@ class JobContext:
         声明必须早于首次写入。完全一致的重复声明幂等，不会再次删除；
         调用方负责跨 Job 的路径独占，框架不维护全局所有权。
         """
-        policy = ArtifactPathPolicy(
-            output_roots=self.output_roots,
-            protected_roots=(*self._protected_roots, *((self.ipc_dir,) if self.ipc_dir else ())),
-        )
+        journal = self._journal
+        policy = journal.path_policy
         try:
             resolved = policy.resolve(path, sandbox=sandbox)
         except OSError as error:
@@ -133,15 +133,7 @@ class JobContext:
             delete_on_failure=delete_on_failure, delete_on_success=delete_on_success,
             sandbox=sandbox,
         )
-        journal = self._journal
-        if journal is not None:
-            journal.record_artifact(self.job.uid, declaration, prepare=True)
-        else:
-            declarations = append_artifact_declaration(self._local_artifacts, declaration)
-            if len(declarations) > len(self._local_artifacts):
-                policy.remove_existing(declaration)
-                Path(resolved).parent.mkdir(parents=True, exist_ok=True)
-                self._local_artifacts = declarations
+        journal.record_artifact(self.job.uid, declaration, prepare=True)
         return resolved
 
     def declare_cache(
@@ -163,8 +155,7 @@ class JobContext:
         raw = str(path)
         resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_roots, sandbox=False)
         os.stat(resolved)
-        if self._journal is not None:
-            self._journal.record_input_file(self.job.uid, resolved)
+        self._journal.record_input_file(self.job.uid, resolved)
         return resolved
 
     def get_artifact_path(self, *, producer_job_uid: str, artifact_name: str) -> str:
@@ -237,16 +228,11 @@ class JobContext:
         非正值在入口拒绝，而非延迟到挂起清洗层静默忽略，避免调用方
         误以为 suspend 已生效。
 
-        信号立即追加到 ``{ipc_dir}/{uid}.signals.jsonl``（落盘 flush），
-        即使 handler 随后崩溃/超时，限流信息也不丢失。同时保留
-        resource_suspensions list 供正常完成路径的结果文件携带（去重
-        由挂起的 max 语义保证）。
+        挂起信号经瞬时管道实时发送至父进程，同时保留 resource_suspensions
+        供正常完成结果携带（去重由挂起的 max 语义保证）。
         """
         if not isinstance(resource_name, str) or not resource_name:
             raise TypeError(f"resource_name must be a non-empty str, got {resource_name!r}")
-        # 未注册资源名 fail-loud——typo（如 "api_v_two" vs "api"）会静默
-        # 追加，消费端按 `in resources` 静默跳过 → 用户以为限流已生效、
-        # 管线继续猛打目标 API。生产派发路径携带注册集快照，入口即拒绝。
         if resource_name not in self._resource_names:
             raise ValueError(
                 f"Unknown resource {resource_name!r} (registered: "
@@ -254,9 +240,6 @@ class JobContext:
             )
         if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
             raise TypeError(f"seconds must be a number, got {type(seconds).__name__} ({seconds!r})")
-        # 超大 int（如 10**400）使 isfinite 转 float 溢出抛 OverflowError
-        # （ArithmeticError 子类，会命中 fatal 启发式）——与非法值同路收敛
-        # 为 ValueError 明确报错，而非异常类型漂移
         try:
             finite = math.isfinite(seconds)
         except OverflowError:
@@ -264,8 +247,11 @@ class JobContext:
         if not finite or seconds <= 0:
             raise ValueError(f"seconds must be finite and > 0, got {seconds!r}")
         self.resource_suspensions.append((resource_name, seconds))
-        if self._journal is not None:
-            self._journal.record_signal(self.job.uid, resource_name, seconds)
+        if self._pipe_sender is not None:
+            try:
+                self._pipe_sender.send_suspend(resource_name, seconds)
+            except OSError:
+                pass
         logger.info(f"Job requested global suspension of resource '{resource_name}' for {seconds}s.")
 
 

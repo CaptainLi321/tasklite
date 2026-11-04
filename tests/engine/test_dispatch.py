@@ -47,11 +47,10 @@ from tasklite.models.task import Task, TaskRegistry
 
 
 class StubSession:
-    """运行会话结构契约桩：run_id / dispatch_no / result_token。"""
+    """运行会话结构契约桩：run_id / dispatch_no。"""
 
     def __init__(self, run_id: str = "a" * 32) -> None:
         self.run_id = run_id
-        self.result_token = "t" * 64
         self._dispatch_no = 0
 
     def next_dispatch_no(self) -> int:
@@ -200,7 +199,6 @@ class TestDispatchOutcomeKind:
         assert records[0].activation_no == 1
         assert records[0].attempt_no == 1
         assert spawned_specs[0].execution_id == records[0].execution_id
-        assert spawned_specs[0].result_token == env.session.result_token
 
 
 class TestDedupGate:
@@ -389,34 +387,13 @@ class TestOrphanProbeGate:
         assert "t::j1" in env.store.state.queue_uids
 
 
-class TestStaleRestoreGate:
-    """预检关 5——残留结果认领与 PRE_SUBMIT 清理。"""
+class TestPreSubmitCleanupAndActiveSignals:
+    """派发前 PRE_SUBMIT 清理与在途信号排空。"""
 
-    def test_stale_result_consumed_without_spawn(self, tmp_path, monkeypatch):
-        from tasklite.engine.channel import ExecutionResult
-
+    def test_cleans_pre_submit_before_spawn(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-        stale = ExecutionResult(success=True, result_metadata={"restored": True})
-        monkeypatch.setattr(env.channel, "claim_stale_result", lambda uid, job: stale)
-        cleaned: list[str] = []
-        monkeypatch.setattr(
-            env.channel, "cleanup_artifacts",
-            lambda uid, *, mode: cleaned.append(uid),
-        )
-
-        outcome = env.dispatch.dispatch_next()
-        assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        # 伪 entry 经完成机器单一出口收尾，attempt_id 透传（不悬空 running）
-        assert env.completion.calls == [("t::j1", stale)]
-        assert cleaned == []  # 有残留时不做 PRE_SUBMIT 清理
-
-    def test_no_stale_result_cleans_pre_submit(self, tmp_path, monkeypatch):
-        env = DispatchEnv(tmp_path)
-        env.register("t")
-        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-        monkeypatch.setattr(env.channel, "claim_stale_result", lambda uid, job: None)
         cleaned: list[str] = []
         monkeypatch.setattr(
             env.channel, "cleanup_artifacts",
@@ -431,7 +408,7 @@ class TestStaleRestoreGate:
         assert outcome.kind is DispatchKind.SPAWNED
         assert cleaned == ["t::j1"]
 
-    def test_residue_suspension_signal_applied_before_spawn(
+    def test_active_suspension_signal_applied_before_spawn(
         self, tmp_path, monkeypatch
     ):
         env = DispatchEnv(tmp_path, extra_resources={"api": RateLimitResource("api", 0.01)})
@@ -441,7 +418,6 @@ class TestStaleRestoreGate:
             env.channel, "drain_active_signals",
             lambda uids: [("t::j1", "api", 30.0)],
         )
-        monkeypatch.setattr(env.channel, "claim_stale_result", lambda uid, job: None)
         monkeypatch.setattr(
             env.channel, "spawn",
             lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
@@ -463,12 +439,11 @@ class TestRateLimitDefer:
         env.store.state.spawn_jobs([job.to_dict()])
         assert env.resources.evaluate("t", {"api": 1.0}).is_available
 
-        # 关 5 残留信号排空恰落在调度评估之后、reserve 预约之前
+        # 在途信号排空恰落在调度评估之后、reserve 预约之前
         monkeypatch.setattr(
             env.channel, "drain_active_signals",
             lambda uids: [("t::j1", "api", 30.0)],
         )
-        monkeypatch.setattr(env.channel, "claim_stale_result", lambda uid, job_: None)
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS

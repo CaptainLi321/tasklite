@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import logging
-import secrets
 from typing import Callable, TYPE_CHECKING
 
 from .types import ExitReason, StopMode, RunStats
@@ -41,9 +40,6 @@ class RunSession:
         self.on_attempt_finished = on_attempt_finished
         self.on_run_end = on_run_end
         self.run_id: str | None = None
-        # 每 run 随机结果认证令牌：随 WorkerLaunchSpec 下发 worker、随结果
-        # 落盘，主进程读取侧强校验（防 ipc_dir 写入者伪造结果文件投毒）
-        self.result_token: str | None = None
         self.dispatch_no: int = 0
         self.stop_mode: StopMode = StopMode.NONE
         self._stats = RunStats()
@@ -56,7 +52,6 @@ class RunSession:
     def begin(self, run_id: str | None = None) -> None:
         """新 run 的复位入口：全部生命周期状态归零，run_id 待分配时置 None。"""
         self.run_id = run_id
-        self.result_token = secrets.token_hex(32)
         self.dispatch_no = 0
         self.stop_mode = StopMode.NONE
         self._stats = RunStats()

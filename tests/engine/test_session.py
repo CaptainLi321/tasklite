@@ -81,15 +81,6 @@ class TestSessionLifecycle:
         session.fire_run_end("completed")
         assert fired == ["completed"]
 
-    def test_begin_generates_result_token(self):
-        session = RunSession()
-        assert session.result_token is None
-        session.begin()
-        assert isinstance(session.result_token, str) and session.result_token
-        first = session.result_token
-        session.begin()
-        assert session.result_token != first, "每次 begin 必须轮换结果认证令牌"
-
     def test_request_stop_monotonic(self):
         session = RunSession()
         assert session.request_stop(force=False) == StopMode.DRAINING

@@ -235,6 +235,10 @@ class TestWorkerPipePrimitives:
                 proc.kill()
                 proc.join(timeout=5.0)
             receiver._thread.join(timeout=3.0)
+            try:
+                receiver._conn.close()
+            except OSError:
+                pass
 
     def test_envelope_validation_and_sender_closed_errors(self):
         with pytest.raises(ValueError, match="invalid worker pipe JSON frame"):

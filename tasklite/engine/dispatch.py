@@ -1,8 +1,8 @@
-"""v2 派发机器：五关预检、两阶段资源租约与子进程 spawn 编排。
+"""v2 派发机器：四关预检、两阶段资源租约与子进程 spawn 编排。
 
-五关顺序即契约（顺序即时序约束）：dedup → dep-failed → no-handler →
-orphan-probe → stale-restore。依赖以显式窄清单注入（无共享袋），经
-``store``/``recovery`` 复用状态仓库与恢复编排深模块，不反向引用门面。
+预检顺序即契约（顺序即时序约束）：dep-failed → admit/dedup → no-handler →
+orphan-probe → pre-submit-cleanup。依赖以显式窄清单注入（无共享袋），经
+``store`` 复用状态仓库深模块，不反向引用门面。
 
 ``session`` 与 ``tasks`` 按具名 Protocol 消费（装配契约见本模块的
 ``DispatchSession`` 与 ``TaskSource``：RunSession / TaskRegistry 真实
@@ -11,7 +11,7 @@ orphan-probe → stale-restore。依赖以显式窄清单注入（无共享袋�
 
 派发即插 attempts 轨迹行（outcome=running）：execution_id
 （``run_id.dispatch_no``）在本模块生成并随行落表——dispatch_no 每次派发递增，
-同 uid 重试再派发也获得新 execution_id，与上次尝试的结果文件隔离。
+同 uid 重试再派发也获得新 execution_id，与上次尝试的执行身份严格隔离。
 """
 
 from __future__ import annotations
@@ -42,12 +42,10 @@ if TYPE_CHECKING:
         """派发/完成机器消费的运行会话装配契约（RunSession 自动满足）。
 
         ``run_id`` 是 execution_id 与 successes meta 的 run 身份事实源；
-        ``result_token`` 随 WorkerLaunchSpec 下发做结果认证；
         ``next_dispatch_no`` 为 execution_id fencing 提供单调递增序号。
         """
 
         run_id: str | None
-        result_token: str | None
 
         def next_dispatch_no(self) -> int: ...
 
@@ -71,7 +69,7 @@ from .errorclass import (
     validate_payload_errors,
 )
 from .in_flight import InFlightJob
-from .resource import RateLimitUnavailable, apply_suspend_signals
+from .resource import RateLimitUnavailable
 from .scheduler import ScheduleResult, StandstillFacts
 from .types import AttemptOutcome
 from .wait import IN_FLIGHT_POLL_SECONDS
@@ -265,10 +263,8 @@ class DispatchMachine:
                 return None
         if self.dispatch_orphan_probe(job_uid, job_snapshot, attempt_id=attempt_id):
             return None
-        if self.dispatch_stale_restore(
-            job_uid, job, job_snapshot, attempt_id=attempt_id, execution_id=execution_id
-        ):
-            return None
+        self._drain_signals_before_reserve(job_uid)
+        self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
 
         try:
             return self._spawn_entry(job_uid, job, job_snapshot, attempt_id, execution_id)
@@ -377,47 +373,11 @@ class DispatchMachine:
             return True
         return False
 
-    def dispatch_stale_restore(
-        self,
-        job_uid: str,
-        job: Job,
-        job_snapshot: dict,
-        *,
-        attempt_id: int | None = None,
-        execution_id: str | None = None,
-    ) -> bool:
-        """派发预检关 5——陈旧结果认领与派发前残留清理（stale-restore）。
-
-        1. 存在上一轮崩溃遗留的结果文件：经恢复编排层认领并按完成机器
-           单一出口提交（返回 True，不派发子进程）。
-        2. 无残留结果文件：清理已死孤儿残留声明与信号文件，准备派发新
-           子进程（返回 False）。
-
-        不变式：两条分支的收尾（完成机器清理 / PRE_SUBMIT 清理）都会
-        未读删除信号文件，残留的 suspend 信号必须先排空应用。调用前提：
-        关 4 探测已通过（锁空闲 ⇒ 无活跃追加写者），排空无损。本次派发
-        已开的轨迹行随认领结果在完成机器侧收尾（attempt_id 透传）。
-        """
-        self._salvage_residue_signals(job_uid)
-        if self._recovery.restore_stale_result(
-            job_uid, job, job_snapshot, attempt_id=attempt_id, execution_id=execution_id
-        ):
-            return True
-        self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
-        return False
-
-    def _salvage_residue_signals(self, job_uid: str) -> None:
-        """排空并应用单个 uid 跨 run 崩溃残留的 suspend 信号（先读后删）。"""
-        try:
-            signals = self._channel.drain_active_signals([job_uid])
-        except Exception as e:
-            logger.warning(f"Failed to salvage residue signals for {job_uid}: {e}")
-            return
-        apply_suspend_signals(
-            signals, self._store.backend, self._resources, origin="residue of "
-        )
-
     # ── 轨迹开行与 spawn ──────────────────────────────────────────────
+
+    def _drain_signals_before_reserve(self, job_uid: str) -> None:
+        """在 reserve 二次检查前排空在途 worker 的挂起信号。"""
+        self._recovery.apply_pending_signals(job_uid)
 
     def _open_attempt(self, job: Job) -> tuple[int | None, str]:
         """派发即插 running 轨迹行，返回 (轨迹行 id, execution_id)。
@@ -446,7 +406,7 @@ class DispatchMachine:
         载荷校验失败不走子进程：释放租约后按派发拒绝语义直接 commit。
         spawn 已启动而后续步骤异常时（entry 尚未登记在飞），此处清理
         子进程句柄后原样上抛——崩溃信号与断言信号不清理（交由运行循环
-        崩溃网/断言网处置，且子进程可能正在写结果文件）。
+        崩溃网/断言网处置）。
         """
         store = self._store
         handle = None
@@ -478,7 +438,6 @@ class DispatchMachine:
                     execution_id=execution_id,
                     ipc_dir=self._ipc_dir,
                     timeout_seconds=job.timeout_seconds,
-                    result_token=self._session.result_token,
                 ))
                 lease.claim()
 

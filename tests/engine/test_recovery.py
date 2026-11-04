@@ -36,15 +36,18 @@ _INCARNATION = "deadbeefdeadbeefdeadbeefdeadbeef.1"
 
 
 def _write_artifact(journal, uid, path, *, delete_on_failure=False, delete_on_success=False):
-    """从文件边界注入声明，包含供清理拒绝的非法路径。"""
-    from tasklite.utils.jsonutil import dumps
+    """注入产物声明到当前进程日志。"""
+    from tasklite.models.artifact import ArtifactDeclaration
 
-    target = journal.outputs_path(uid)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as stream:
-        stream.write(dumps({"path": path, "name": None, "delete_existing": False,
-                            "delete_on_failure": delete_on_failure,
-                            "delete_on_success": delete_on_success, "sandbox": True}) + "\n")
+    prev = journal._artifacts.get(uid, ())
+    journal._artifacts[uid] = (
+        *prev,
+        ArtifactDeclaration(
+            path,
+            delete_on_failure=delete_on_failure,
+            delete_on_success=delete_on_success,
+        ),
+    )
 
 
 class StoreShim:
@@ -69,24 +72,12 @@ class StoreShim:
 class FakeChannel:
     """RecoveryOrchestrator 消费面的具名替身——字段即配置。"""
 
-    def __init__(self, *, active_signals=(), all_signals=(), drain_all_error=None,
-                 abort_outcome=None, claim_result=None):
+    def __init__(self, *, active_signals=(), abort_outcome=None):
         self.active_signals = list(active_signals)
-        self.all_signals = list(all_signals)
-        self.drain_all_error = drain_all_error
         self.abort_outcome = abort_outcome
-        self.claim_result = claim_result
 
     def drain_active_signals(self, uids):
         return list(self.active_signals)
-
-    def drain_all_signals(self):
-        if self.drain_all_error is not None:
-            raise self.drain_all_error
-        return list(self.all_signals)
-
-    def claim_stale_result(self, uid, job):
-        return self.claim_result
 
     def abort_in_flight(self, handles):
         from tasklite.engine.channel import AbortOutcome
@@ -589,68 +580,9 @@ class TestSuspendPersistenceAndRestore:
         assert "api" in loads(backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS))
 
 
-class TestResidueSalvage:
-    """启动期残留信号回收：排空应用 + 即时持久化 + 异常隔离。"""
-
-    def test_salvage_residue_signals_applies_and_persists(self):
-        backend = InMemoryStateBackend()
-        resource_mgr = ResourceManager({"api": RateLimitResource("api", 1.0)})
-        orchestrator = make_recovery_orchestrator(
-            backend,
-            resource_mgr=resource_mgr,
-            channel=FakeChannel(all_signals=[("t::j1", "api", 30.0)]),
-        )
-
-        orchestrator.salvage_residue_signals()
-
-        assert "api" in resource_mgr.collect_suspensions()
-        persisted = loads(backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS))
-        assert "api" in persisted
-
-    def test_salvage_residue_signals_channel_failure_is_isolated(self):
-        """清扫原语异常只降级告警，不得打断启动序列。"""
-        backend = InMemoryStateBackend()
-        orchestrator = make_recovery_orchestrator(
-            backend,
-            resource_mgr=ResourceManager({"api": RateLimitResource("api", 1.0)}),
-            channel=FakeChannel(drain_all_error=OSError("ipc dir unavailable")),
-        )
-
-        orchestrator.salvage_residue_signals()
-
-        assert backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS) is None
-
-    def test_salvage_residue_signals_skips_unregistered_resource(self):
-        backend = InMemoryStateBackend()
-        orchestrator = make_recovery_orchestrator(
-            backend,
-            resource_mgr=ResourceManager({"api": RateLimitResource("api", 1.0)}),
-            channel=FakeChannel(all_signals=[("t::j1", "no_such", 9.0)]),
-        )
-
-        orchestrator.salvage_residue_signals()
-
-        assert backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS) is None
-
-    def test_residue_signals_from_real_channel_journal(self, tmp_path):
-        """真实 channel 落盘的跨 run 残留信号经启动清扫回收并应用。"""
-        backend = InMemoryStateBackend()
-        channel = ExecutionChannel(tmp_path)
-        channel.journal.record_signal("t::j1", "api", 60.0)
-        resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
-        orchestrator = make_recovery_orchestrator(
-            backend, resource_mgr=resource_mgr, channel=channel,
-        )
-
-        orchestrator.salvage_residue_signals()
-
-        assert resource_mgr.collect_suspensions() != {}, "残留信号必须被应用"
-        assert list(tmp_path.glob("*.signals.jsonl")) == [], "信号文件清扫干净"
-
-
 class TestLoadAndRepair:
     def test_load_and_repair_full_flow(self, tmp_path):
-        """四连加载 → 交集收敛 → 队列修复 → 挂起恢复 → 残留回收 → 落 store。"""
+        """四连加载 → 交集收敛 → 队列修复 → 挂起恢复 → 落 store。"""
         backend = InMemoryStateBackend()
         backend.seed_successes(["t::overlap", "t::done"])
         backend.append_failed("t::overlap", {"error_message": "legacy"})
@@ -662,7 +594,6 @@ class TestLoadAndRepair:
             ENGINE_METADATA_RESOURCE_SUSPENSIONS, dumps({"api": time.time() + 30.0})
         )
         channel = ExecutionChannel(tmp_path)
-        channel.journal.record_signal("t::fresh", "api", 20.0)
         resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
         store = StoreShim(backend)
         orchestrator = RecoveryOrchestrator(
@@ -676,89 +607,11 @@ class TestLoadAndRepair:
         assert store.state is state
         assert "t::overlap" not in state.successes and "t::overlap" in state.failed
         assert [f"{j['task_type']}::{j['job_id']}" for j in state.queue] == ["t::done", "t::fresh"]
-        assert resource_mgr.collect_suspensions() != {}, "挂起与残留信号都必须注入"
-        assert list(tmp_path.glob("*.signals.jsonl")) == []
-
-
-class TestRestoreStaleResult:
-    def _make(self, tmp_path, *, channel=None, completion=None):
-        backend = InMemoryStateBackend()
-        channel = channel if channel is not None else ExecutionChannel(tmp_path)
-        completion = completion if completion is not None else RecordingCompletion()
-        orchestrator = make_recovery_orchestrator(
-            backend, channel=channel,
-            in_flight=InFlightTracker(), completion=completion,
-        )
-        return orchestrator, completion
-
-    def test_no_residue_returns_false(self, tmp_path):
-        orchestrator, completion = self._make(tmp_path)
-        job = Job("t", "clean")
-
-        assert orchestrator.restore_stale_result(job.uid, job, job.to_dict()) is False
-        assert completion.completed_jobs == []
-
-    def test_residue_consumed_via_pseudo_entry(self, tmp_path):
-        """残留 success → 伪 entry 交完成机器统一收尾，不再派发子进程。"""
-        orchestrator, completion = self._make(tmp_path)
-        job = Job("t", "stale")
-        ArtifactJournal(tmp_path).write_result_atomic(
-            job.uid,
-            {
-                "status": "success",
-                "raw_result": True,
-                "spawned_jobs": [],
-                "resource_suspensions": [],
-                "cursor_updates": {},
-            },
-            execution_id=_INCARNATION,
-        )
-
-        assert orchestrator.restore_stale_result(job.uid, job, job.to_dict()) is True
-        assert len(completion.completed_jobs) == 1
-        entry, result = completion.completed_jobs[0]
-        assert entry.is_pseudo, "残留消费必须走安全伪 entry（无资源、无进程）"
-        assert entry.job_uid == job.uid
-        assert result.success is True
-
-    def test_forged_residue_rejected_by_token(self, tmp_path):
-        """跨 run/伪造残留（令牌不匹配）按无残留处理，照常派发。"""
-        channel = ExecutionChannel(tmp_path)
-        channel.result_token = "b" * 64
-        orchestrator, completion = self._make(tmp_path, channel=channel)
-        job = Job("t", "forged")
-        ArtifactJournal(tmp_path).write_result_atomic(
-            job.uid,
-            {
-                "status": "success",
-                "raw_result": {"poisoned": True},
-                "spawned_jobs": [],
-                "resource_suspensions": [],
-                "cursor_updates": {},
-            },
-            execution_id=_INCARNATION,
-        )
-
-        assert orchestrator.restore_stale_result(job.uid, job, job.to_dict()) is False
-        assert completion.completed_jobs == []
-
-    def test_job_terminated_from_completion_is_contained(self, tmp_path):
-        """残留提交触发失败档案阈值终结（_JobTerminated）不 re-raise。"""
-        from tasklite.exceptions import _JobTerminated
-
-        completion = RecordingCompletion(complete_job_error=_JobTerminated("threshold"))
-        orchestrator, _ = self._make(tmp_path, completion=completion)
-        job = Job("t", "threshold")
-        ArtifactJournal(tmp_path).write_result_atomic(
-            job.uid, {"status": "fatal", "error_message": "boom", "traceback": "tb"},
-            execution_id=_INCARNATION,
-        )
-
-        assert orchestrator.restore_stale_result(job.uid, job, job.to_dict()) is True
+        assert resource_mgr.collect_suspensions() != {}, "挂起必须注入"
 
 
 class _DoneProcess:
-    """已完成 entry 的进程桩——abort 不得 kill 它（结果已落盘）。"""
+    """已完成 entry 的进程桩——abort 不得 kill 它（结果已到达）。"""
 
     def __init__(self):
         self._alive = True
@@ -780,7 +633,7 @@ class _DoneProcess:
 
 
 class _FinishOnKillProcess:
-    """kill() 时写最终结果 + suspend 信号的进程桩（TOCTOU 窗口复现）。"""
+    """kill() 时通过通道回传最终结果 + suspend 信号的进程桩（TOCTOU 窗口复现）。"""
 
     def __init__(self, channel, uid, execution_id):
         self._alive = True
@@ -799,12 +652,11 @@ class _FinishOnKillProcess:
     def kill(self):
         self._alive = False
         self.killed = True
-        self._channel.journal.write_result_atomic(
-            self._uid,
-            {"status": "success", "raw_result": {"done": 1}},
-            execution_id=self._execution_id,
-        )
-        self._channel.journal.record_signal(self._uid, "api", 5.0)
+        self._channel._results[self._execution_id] = {
+            "status": "success",
+            "raw_result": {"done": 1},
+        }
+        self._channel._pending_signals.append((self._uid, "api", 5.0))
 
     def close(self):
         pass
@@ -813,7 +665,9 @@ class _FinishOnKillProcess:
 class TestAbortInFlight:
     def _make(self, tmp_path, *, resource_mgr=None):
         backend = InMemoryStateBackend()
-        channel = ExecutionChannel(tmp_path)
+        ipc_dir = tmp_path / "ipc"
+        ipc_dir.mkdir(parents=True, exist_ok=True)
+        channel = ExecutionChannel(ipc_dir)
         resource_mgr = resource_mgr if resource_mgr is not None else ResourceManager(
             {"api": CapacityResource("api", 1.0)}
         )
@@ -833,19 +687,15 @@ class TestAbortInFlight:
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text("done")
         _write_artifact(channel.journal, job.uid, str(out_file), delete_on_failure=True)
-        channel.journal.write_result_atomic(
-            job.uid,
-            {
-                "status": "success", "raw_result": True,
-                "spawned_jobs": [], "resource_suspensions": [], "cursor_updates": {},
-            },
-            execution_id=_INCARNATION,
-        )
+        channel._results[_INCARNATION] = {
+            "status": "success", "raw_result": True,
+            "spawned_jobs": [], "resource_suspensions": [], "cursor_updates": {},
+        }
         process = _DoneProcess()
         handle = JobHandle(
             job_uid=job.uid, process=process,
             timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
-            ipc_dir=str(tmp_path), execution_id=_INCARNATION,
+            ipc_dir=str(tmp_path / "ipc"), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
         tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], handle, None))
@@ -875,7 +725,7 @@ class TestAbortInFlight:
 
         cancelled, done = completion.settled[0]
         assert [e.job_uid for e, _ in done] == [job.uid], (
-            "kill 窗口内落盘的结果必须被重探测消费（不删结果、不取消）"
+            "kill 窗口内到达的结果必须被重探测消费（不删结果、不取消）"
         )
         assert cancelled == []
         assert done[0][1].resource_suspensions == [("api", 5.0)], (
@@ -886,7 +736,7 @@ class TestAbortInFlight:
         """abort 开头先排空 in-flight 的 suspend 信号并应用（kill 前捞回）。"""
         orchestrator, channel, _, resource_mgr = self._make(tmp_path)
         job = Job("fast", "suspend_job")
-        channel.journal.record_signal(job.uid, "api", 60.0)
+        channel._pending_signals.append((job.uid, "api", 60.0))
         process = _DoneProcess()
         handle = JobHandle(
             job_uid=job.uid, process=process,
@@ -904,7 +754,7 @@ class TestAbortInFlight:
 
     def test_abort_applies_salvaged_signals_from_outcome(self, tmp_path):
         """channel 捞回的终前信号经 AbortOutcome 带回并应用（max 幂等合并）。"""
-        from tasklite.engine.channel import AbortOutcome, ExecutionResult
+        from tasklite.engine.channel import AbortOutcome
 
         backend = InMemoryStateBackend()
         resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
@@ -915,7 +765,6 @@ class TestAbortInFlight:
                 completed=[], cancelled=[],
                 salvaged_signals=[(job.uid, "api", 30.0)],
             ),
-            claim_result=None,
         )
         orchestrator = RecoveryOrchestrator(
             store=StoreShim(backend), channel=fake_channel, resources=resource_mgr,

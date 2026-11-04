@@ -165,17 +165,13 @@ def make_instant_process_class(retry_uid: str | None = None):
                     "spawned_jobs": [],
                     "resource_suspensions": [],
                     "cursor_updates": {},
-                    "auth": spec.result_token,
                 }
                 if retry_uid is not None and spec.job.uid == retry_uid:
                     result.update({"status": "retry", "error_message": "stub failure"})
                 else:
                     result.update({"status": "success", "raw_result": True})
-                ArtifactJournal(spec.ipc_dir).write_result_atomic(
-                    spec.job.uid,
-                    result,
-                    execution_id=spec.execution_id,
-                )
+                assert spec.pipe_sender is not None
+                spec.pipe_sender.send_result(result)
             self._alive = False
 
         def is_alive(self):

@@ -8,11 +8,8 @@ RecoveryOrchestrator 统一内敛：
    persist_resource_suspensions，注入 ResourceManager）；
 3. 崩溃/异常路径安全保存队列（save_queue_crash_safe：以磁盘真相合并
    内存队列，读-改-写收敛进单个写事务）；
-4. 实时 suspend 信号排空与应用（apply_pending_signals）与启动期残留
-   信号回收（salvage_residue_signals）；
-5. 异常/停机在途任务 TOCTOU 闭环中止与收尾（abort_in_flight）；
-6. 陈旧结果恢复（restore_stale_result：派发前消费上次 run 遗留的
-   已落盘结果，避免双重执行窗口）。
+4. 实时 suspend 信号排空与应用（apply_pending_signals）；
+5. 异常/停机在途任务 TOCTOU 闭环中止与收尾（abort_in_flight）。
 
 依赖以显式窄清单注入（无共享袋）；``store`` 与 ``completion`` 两个
 协作机器按具名 Protocol 消费——``RecoveryStore``（backend 活引用 /
@@ -55,8 +52,7 @@ if TYPE_CHECKING:
     class RecoveryCompletion(Protocol):
         """恢复编排消费的完成机器契约（CompletionMachine 自动满足）。
 
-        Job 终结唯一经由完成机器收尾：残留认领走 ``complete_job`` 同一
-        出口，中止分类结算走 ``settle_aborted``。
+        Job 终结唯一经由完成机器收尾：中止分类结算走 ``settle_aborted``。
         """
 
         def complete_job(
@@ -69,8 +65,6 @@ if TYPE_CHECKING:
             done_entries: Sequence[tuple[InFlightJob, ExecutionResult]],
         ) -> None: ...
 
-from ..exceptions import _JobTerminated
-from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..utils.jsonutil import loads
 from .resource import (
@@ -120,7 +114,6 @@ class RecoveryOrchestrator:
         self.converge_terminal_overlap(successes, failed)
         queue_snapshots = self.repair_queue_on_load(queue_snapshots, successes, failed)
         self.load_resource_suspensions()
-        self.salvage_residue_signals()
 
         state = PipelineState(successes, failed, cursors, queue_snapshots)
         self._store.set_state(state)
@@ -246,27 +239,6 @@ class RecoveryOrchestrator:
         """
         persist_resource_suspensions(self._store.backend, self._resources)
 
-    def salvage_residue_signals(self) -> None:
-        """启动期回收 ipc_dir 全部跨 run 残留 suspend 信号并即时应用。
-
-        主进程在 worker ``record_signal`` 之后、同 run 任一排空点之前
-        崩溃时，信号文件存活但同 run 再无排空触点；后续派发预检清理与
-        完成收尾清理都会未读删除信号文件。启动期全量清扫（先读分发后
-        删除）是该不变式的兜底回收点；``suspend()`` 的 max 语义保证与
-        engine_metadata 恢复的挂起幂等合并。清扫原语异常只降级告警，不打断启动。
-        """
-        try:
-            signals = self._channel.drain_all_signals()
-        except Exception as e:
-            logger.warning(f"Failed to salvage residue signals: {e}")
-            return
-        apply_suspend_signals(
-            signals,
-            self._store.backend,
-            self._resources,
-            origin="salvaged from residue of ",
-        )
-
     def save_queue_crash_safe(self) -> None:
         """崩溃路径保存队列：以「磁盘真相」合并「内存队列」，避免丢失作业。
 
@@ -319,62 +291,18 @@ class RecoveryOrchestrator:
                 f"in-memory-only jobs will be re-run by at-least-once: {e}"
             )
 
-    def apply_pending_signals(self) -> None:
-        """读取所有 in-flight job 的 suspend 信号文件，即时应用。
-
-        handler 在子进程中调用 ``ctx.suspend_resource()`` 时，信号追加到
-        ``{ipc_dir}/{uid}.signals.jsonl``（落盘 flush）。此方法在主循环
-        排空阶段读取并**删除**各 job 的信号文件（排空语义）——即使
-        handler 随后崩溃/超时，落盘的限流信息也不丢失（文件仍在）。
+    def apply_pending_signals(self, extra_uid: str | None = None) -> None:
+        """读取所有 in-flight job 已发送的 suspend 信号，即时应用并持久化。
 
         ``suspend()`` 使用 max 语义，重复应用同一信号是幂等的。
         """
-        signals = self._channel.drain_active_signals(
-            self._in_flight.active_uids()
-        )
+        active = set(self._in_flight.active_uids())
+        if extra_uid is not None:
+            active.add(extra_uid)
+        signals = self._channel.drain_active_signals(active)
         apply_suspend_signals(
             signals, self._store.backend, self._resources, origin="from "
         )
-
-    def restore_stale_result(
-        self,
-        uid: str,
-        job: Job,
-        job_snapshot: dict,
-        *,
-        attempt_id: int | None = None,
-        execution_id: str | None = None,
-    ) -> bool:
-        """崩溃恢复：派发子进程前消费该 uid 的残留结果文件。
-
-        上次 run 主进程 SIGKILL/OOM/断电崩溃时，子进程可能已写好结果
-        文件但未及 commit。本方法在派发机器的 acquire/spawn 之前调用：
-        若有残留结果，直接构造伪 entry 交完成机器按同一收尾契约提交
-        （不启动子进程），避免「新子进程已启动、却被旧结果文件误判完成
-        而 kill」的双重执行窗口。``attempt_id`` 是本次派发已开的轨迹行，
-        随伪 entry 透传给完成机器按认领结果收尾（残留行不悬空为 running）。
-
-        Returns:
-            True 表示已消费残留（job 已提交/重入队，调用方不再派发子进程）；
-            False 表示无残留（含认证拒绝的跨 run/伪造残留），照常派发。
-        """
-        result = self._channel.claim_stale_result(uid, job)
-        if result is None:
-            return False
-        logger.info(f"RESTORE: {uid} (stale result from previous run, no subprocess)")
-        # （单一出口）：构造安全伪 entry 走完成机器同一条路径
-        # （acquired=[] 无资源、handle=None 无进程），复用完整的收尾契约：
-        # 失败输出清理、IPC 文件清理、身份注销。
-        entry = self._in_flight.create_pseudo_entry(uid, job_snapshot, job)
-        entry.attempt_id = attempt_id
-        entry.execution_id = execution_id
-        try:
-            self._completion.complete_job(entry, result)
-        except _JobTerminated:
-            # 残留结果提交时 commit 连续失败达阈值 → job 已失败档案终结。
-            # 不 re-raise（主循环继续），消费语义视为完成（返回 True）。
-            pass
-        return True
 
     def abort_in_flight(self) -> None:
         """异常/强制停机时：kill 进行中的子进程、消费已完成的结果、requeue。

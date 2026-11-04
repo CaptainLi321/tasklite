@@ -41,7 +41,6 @@ class StubSession:
 
     def __init__(self, run_id: str = "b" * 32) -> None:
         self.run_id = run_id
-        self.result_token = "t" * 64
 
     def next_dispatch_no(self) -> int:
         raise AssertionError("completion 不消费 dispatch_no")
@@ -635,19 +634,27 @@ def test_completion_publishes_only_successful_framework_artifacts(tmp_path, succ
 
 
 def test_invalid_artifact_log_propagates_through_completion_without_false_success(tmp_path):
+    from tasklite.models.artifact import ArtifactDeclaration
+
     env = CompletionEnv(tmp_path)
     job = Job("t", "invalid_manifest")
     aid = env.open_attempt(job)
     entry = env.track_entry(job, attempt_id=aid)
-    env.channel.journal.outputs_path(job.uid).write_text('{"path":"/tmp/x","kind":"output"}\n')
-    with pytest.raises(ValueError, match="invalid artifact"):
+    target = tmp_path / "real.txt"
+    target.write_text("ok")
+    link = tmp_path / "sym.txt"
+    link.symlink_to(target)
+    env.channel.journal._artifacts[job.uid] = (
+        ArtifactDeclaration(str(link), name="primary"),
+    )
+    with pytest.raises(ValueError, match="symlink"):
         env.completion.complete_job(entry, ExecutionResult(success=True))
     assert env.backend.load_successes() == {}
     assert job.uid in env.store.state.in_flight_uids
     assert env.backend.load_attempts(job.uid)[0].outcome == "running"
     assert env.stats["succeeded"] == 0
     assert env.hooks == []
-    assert env.channel.journal.outputs_path(job.uid).exists()
+    assert env.channel.journal._artifacts.get(job.uid) is not None
 
 
 def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, monkeypatch):
@@ -698,7 +705,7 @@ def test_cleanup_failure_preserves_original_attempt_and_no_terminal(tmp_path, mo
     assert env.backend.load_attempts(job.uid)[0].outcome == "running"
     assert entry.job_snapshot["attempt_no"] == 1
     assert env.hooks == []
-    assert env.channel.journal.outputs_path(job.uid).exists()
+    assert env.channel.journal.read_artifacts(job.uid) != ()
 
 
 def test_abort_cleanup_failure_requeues_every_original_snapshot(tmp_path, monkeypatch):

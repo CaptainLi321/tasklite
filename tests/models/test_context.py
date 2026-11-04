@@ -12,8 +12,12 @@ import pytest
 from tasklite.models.artifact import ArtifactDeclaration
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
-from tasklite.utils.encoding import encode_job_uid_filename
-from tasklite.utils.ipc import ArtifactJournal
+from tasklite.utils.ipc import (
+    ArtifactJournal,
+    PIPE_MSG_SUSPEND,
+    WorkerPipeMessage,
+    create_worker_pipe,
+)
 
 
 def _make_ctx(
@@ -126,7 +130,7 @@ class TestDeclareOutputSandbox:
         final = ctx.declare_output("sub/dir/out.json")
         assert final.startswith(str(root))
         assert Path(final).parent.is_dir()  # 父目录自动创建
-        outputs = ArtifactJournal(str(tmp_path / "ipc")).read_artifacts("fetch::j1")
+        outputs = ctx._journal.read_artifacts("fetch::j1")
         assert outputs == (ArtifactDeclaration(final),)
 
     def test_cleanup_flag_persisted(self, tmp_path):
@@ -136,7 +140,7 @@ class TestDeclareOutputSandbox:
         ctx = _make_ctx(output_roots=root, ipc_dir=ipc)
         keep = ctx.declare_output("keep.bin", delete_on_failure=False)
         drop = ctx.declare_output("drop.bin", delete_on_failure=True)
-        recorded = {d.path: d for d in ArtifactJournal(ipc).read_artifacts("fetch::j1")}
+        recorded = {d.path: d for d in ctx._journal.read_artifacts("fetch::j1")}
         assert recorded[keep] == ArtifactDeclaration(keep)
         assert recorded[drop] == ArtifactDeclaration(drop, delete_on_failure=True)
 
@@ -250,7 +254,9 @@ class TestDeclareCache:
         ipc = str(tmp_path / "ipc")
         ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
         final = ctx.declare_cache("part.bin")
-        assert ArtifactJournal(ipc).read_artifacts("fetch::j1") == (ArtifactDeclaration(final, delete_on_failure=True, delete_on_success=True),)
+        assert ctx._journal.read_artifacts("fetch::j1") == (
+            ArtifactDeclaration(final, delete_on_failure=True, delete_on_success=True),
+        )
 
     def test_cache_sandbox_rejected_by_default(self, tmp_path):
         root = tmp_path / "out"
@@ -281,7 +287,7 @@ class TestDeclareInput:
         ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
         resolved = ctx.declare_input(src)
         assert resolved == str(src.resolve())
-        assert ArtifactJournal(ipc).read_inputs("fetch::j1") == [resolved]
+        assert ctx._journal.read_inputs("fetch::j1") == [resolved]
 
     def test_directory_input_accepted(self, tmp_path):
         folder = tmp_path / "in_dir"
@@ -305,7 +311,7 @@ class TestDeclareInput:
         ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
         with pytest.raises(FileNotFoundError):
             ctx.declare_input(tmp_path / "ghost.bin")
-        assert ArtifactJournal(ipc).read_inputs("fetch::j1") == []
+        assert ctx._journal.read_inputs("fetch::j1") == []
 
     def test_uri_declaration_removed(self):
         assert not hasattr(_make_ctx(), "declare_input_uri")
@@ -331,13 +337,20 @@ class TestSuspendResource:
     def test_registered_resource_accepted(self, tmp_path):
         ipc = str(tmp_path / "ipc")
         ctx = _make_ctx(resources=frozenset({"api_known"}), ipc_dir=ipc)
+        receiver, sender = create_worker_pipe(
+            job_uid=ctx.job.uid,
+            execution_id="exec_susp_1",
+        )
+        ctx._bind_pipe_sender(sender)
         ctx.suspend_resource("api_known", 60.0)
+        sender.close()
         assert ctx.resource_suspensions == [("api_known", 60.0)]
-        # 信号立即落盘：进程被 kill 后文件仍在，信号不丢
-        signals_file = Path(ipc) / f"{encode_job_uid_filename('fetch::j1')}.signals.jsonl"
-        assert signals_file.exists()
-        lines = [json.loads(line) for line in signals_file.read_text().splitlines()]
-        assert lines == [{"suspend": ["api_known", 60.0]}]
+        messages = receiver.drain_to_eof(timeout=3.0)
+        receiver.close()
+        assert len(messages) == 1
+        assert isinstance(messages[0], WorkerPipeMessage)
+        assert messages[0].kind == PIPE_MSG_SUSPEND
+        assert messages[0].payload == ["api_known", 60.0]
 
     def test_no_resources_rejects_all(self):
         ctx = _make_ctx()

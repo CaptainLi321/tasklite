@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import pickle
-import secrets
 import signal
 import time
 import traceback
@@ -434,10 +433,9 @@ class EngineRuntime:
     def step(self, max_dispatch: int | None = None) -> StepOutcome:
         """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。
 
-        run 身份（run_id/result_token/空态装载）唯一负责者是
-        prepare_run_state（execute() 启动屏障）——store.state 恒非 None
-        （构造与 set_state 双点归一化），经 run() 外直达 step 的路径由
-        测试显式 set_state 装载，无需惰性引导。
+        run 身份（run_id/空态装载）唯一负责者是 prepare_run_state（execute()
+        启动屏障）——store.state 恒非 None（构造与 set_state 双点归一化），
+        经 run() 外直达 step 的路径由测试显式 set_state 装载，无需惰性引导。
         """
         store = self.store
 
@@ -538,11 +536,7 @@ class EngineRuntime:
         """
         self.scheduler.begin_round()
 
-        # Fencing 屏障（结果认证令牌与 run_id 同生命周期：每 run 轮换并
-        # 同步到执行通道，收割/认领/中止三条读取路径共用同一信任锚）
         self._session.run_id = uuid.uuid4().hex
-        self._session.result_token = secrets.token_hex(32)
-        self.channel.result_token = self._session.result_token
         self._session.dispatch_no = 0
         try:
             self.backend.set_engine_metadata("last_run_id", self._session.run_id)
