@@ -19,9 +19,11 @@ CORE_PACKAGE_DIRS = (
 )
 
 
-def _iter_core_python_files():
+def _iter_core_python_files() -> tuple[pathlib.Path, ...]:
+    files: list[pathlib.Path] = []
     for base in CORE_PACKAGE_DIRS:
-        yield from sorted(base.rglob("*.py"))
+        files.extend(sorted(base.rglob("*.py")))
+    return tuple(files)
 
 
 def _duplicate_members(class_node: ast.ClassDef) -> list:
