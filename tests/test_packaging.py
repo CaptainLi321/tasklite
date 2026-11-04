@@ -36,7 +36,7 @@ def test_license_expression_excludes_license_classifier():
 def test_runtime_version_matches_naming_contract():
     import tasklite
 
-    assert tasklite.__version__ == "2.2.0"
+    assert tasklite.__version__ == "2.2.1"
     assert _load_pyproject()["tool"]["setuptools"]["dynamic"]["version"] == {
         "attr": "tasklite.__version__"
     }

@@ -8,6 +8,17 @@
 
 暂无未发布变更。
 
+## [2.2.1] - 2026-11-04
+
+补丁版本：修复静态类型检查（`mypy`）报告的协议只读属性、空值收窄与多根路径类型注解问题，并将 `mypy` 纳入本地 CI 与 `pre-push` 钩子。
+
+### 修复
+
+- **静态类型检查（`mypy`）兼容**：
+  - 修复 `BulkFailureOutcome` 与 `RecoveryStore` 协议属性声明、`DiscoveryHandler._report_missing` 回调引用、`TriggerRegistry.normalize_job_snapshot` 资源合并类型标注、`JobContext` 与 `ArtifactJournal` 多根输出路径签名，以及派发/完成机器中 `timeout_seconds` / `max_retries` 空值收窄问题。
+- **本地 CI 与发布工具链**：
+  - 将 `mypy>=1.0` 纳入 `pyproject.toml` 开发依赖，新增 `make typecheck` 并集成至 `make test-matrix` 与 `scripts/pre-push` 钩子。
+
 ## [2.2.0] - 2026-11-04
 
 重跑触发器、具名磁盘产物、瞬时 Pipe 执行通信与全仓命名/Schema 5 统一版本（详见 [`docs/GUIDE.md`](docs/GUIDE.md) 与 [ADR-0007](docs/adr/0007-naming-schema-contract.md)～[ADR-0010](docs/adr/0010-ephemeral-worker-pipe.md)）。
