@@ -105,24 +105,17 @@ flowchart TD
 - 任务通过 `depends_on` 声明依赖；
 - 父任务失败进入失败档案时，所有下游依赖自动标记跳过 (`ERR_JOB_DEPENDENCY`)，避免无效计算。
 
-### 6. 📦 具名磁盘产物与删除授权
-- `ctx.declare_output(path, name=...)` 声明文件或目录，返回规范绝对路径；消费方通过 `get_artifact_path` 查询直接依赖的成功产物。
-- 前删、失败删除、成功删除分别由 `delete_existing`、`delete_on_failure`、`delete_on_success` 授权，普通 output 默认均关闭；临时磁盘 `declare_cache` 固定成败清理。
-- [ADR-0009](docs/adr/0009-artifact-authorization-and-cleanup.md)：具名产物描述随生产者成功事务原子发布，磁盘是产物的唯一可靠来源，不新增持久控制状态；收尾时先执行授权清理再提交终态，清理故障不伪报成功、不消耗业务重试预算。
-- [ADR-0010](docs/adr/0010-ephemeral-worker-pipe.md)：每 worker 绑定独立单向 `multiprocessing.Pipe` 原生收发 `input`、`output`、`suspend`、`result` 四类瞬时消息；跨重启恢复以 SQLite 持久化业务状态与文件锁（`{encoded_uid}.lock`、`__pipeline_run__.lock`）为准。
+### 6. 📦 具名磁盘产物与显式清理授权
+- `ctx.declare_output(path, name=...)` 声明文件或目录产物并随成功事务原子发布，下游通过 `ctx.get_artifact_path(...)` 安全引用直接依赖的产物路径；
+- 前置删除、失败清理与成功清理分别由 `delete_existing`、`delete_on_failure`、`delete_on_success` 显式授权（`declare_cache` 固定成败自动清理），收尾时先清理后提交。
 
 ### 7. 🌐 组合式 HTTP 网络工具与快照守卫 (HTTP Wrappers)
 - 开放 Callable 设计，支持原生 `urllib`、`requests`、`httpx` 或平台自定义签名 SDK；
-- `http_guard` 自动捕获 429、解析 `Retry-After` 并触发 `ctx.suspend_resource` 全管线挂起，收敛异常三分类；
-- `SQLiteSnapshotStore` 提供单射键原始响应快照持久化，支持全离线幂等重放；
-- 内置标准 Netscape `cookies.txt` 解析工具。
+- `http_guard` 自动捕获 429、解析 `Retry-After` 并触发 `ctx.suspend_resource` 全管线挂起，配合 `SQLiteSnapshotStore` 支持原始响应快照持久化与全离线幂等重放。
 
-### 8. 🎛️ 执行选择 (Selection)：Exclude 延迟留队 + Skip 终态跳过
-- **第三类调度扩展 seam（候选准入/选择，与 OrderingPolicy / RequeuePolicy 并列，决策见 [ADR-0006](docs/adr/0006-selection-scheduling-seam.md)）**：`pipeline.selection(Exclude(task_type="pdf_to_md"), Skip(task_type="ocr"))` 以方法调用配置 pipeline 级规则，两类语义严格区分：
-  - `Exclude`（延迟）：命中作业不派发、不消耗资源与重试预算，队列行原样保留；下游允许作业本次报 `ERR_DEPENDENCY_EXCLUDED` 并计入 `stats["excluded_blocked"]`，下一次 run 自动恢复执行；
-  - `Skip`（终态）：命中作业移出队列（不进 successes / 失败档案），下游整链级联跳过（attempt 记 `DEPENDENCY_SKIPPED`），下次运行不再重试；同一 task_type 同时命中时 Skip 优先。
-- 停摆仲裁用 **Kahn 入度消减**（波前 = successes ∪ excluded）严格区分「真死锁」（依赖环/缺口 → 既有归因熔断）与「仅被 Exclude 阻塞」（留队 + COMPLETED 收敛）；不存在固定等待兜底与忙旋，混合真实死锁不会被选择规则掩盖；
-- 默认空规则与扩展前完全等价；`Rule` 协议要求 `matches_task_type(task_type)`（缺少则注册期 fail-loud），顶层导出 `Exclude` / `Selection` / `Skip`。
+### 8. 🎛️ 调度扩展 Seam（排序 / 重试节奏 / 执行选择）
+- 核心零调度计算，提供 `OrderingPolicy`（候选访问序）、`RequeuePolicy`（重入队节奏）与 `Selection`（候选准入）三类正交扩展接缝；
+- `pipeline.selection(Exclude(task_type="..."), Skip(task_type="..."))` 支持按任务类型配置**延迟留队（Exclude）**与**终态跳过（Skip）**。
 
 ---
 
@@ -179,27 +172,11 @@ pipeline.enqueue([
 pipeline.run()
 ```
 
----
-
-## 🧭 三层模型（Task / Job / Attempt）
-
-本引擎按实时系统理论建模为三层（设计总纲 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)，上位裁决 [ADR-0005](docs/adr/0005-v2-promotion.md)）：
-
-| 层 | 定义 | 持久化 |
-|---|---|---|
-| **Task（规格）** | 进程内注册的静态模板：task_type 名、handler、默认资源、payload_schema、默认 max_retries / timeout_seconds / timeout_is_transient / trigger | 代码即规格，不落盘；注册于 `register_task` |
-| **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变 | queue 行 job_snapshot JSON（job_uid 为主键） |
-| **Attempt（执行轨迹）** | 一次物理执行的记录：attempt 序号、execution_id、起止时间、结局 | append-only 新表 `attempts` |
-
-任一 attempts 行可回溯「哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——端到端追溯链完整。完整使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**（权威）；v1 → v2 命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)；未来演进方向（CLI 直达、调度策略族）见 [ROADMAP](docs/ROADMAP.md)。**v1 已退役**（git 历史与 `v1-final` 标签留档）。
-
-```python
-from tasklite import TaskLite, Job, Task, AttemptRecord
-```
+> 引擎采用 **Task（静态规格） / Job（逻辑实例） / Attempt（执行轨迹）** 三层模型，完整 API 签名、触发器（Trigger）、产物授权、失败档案与调度扩展 seam 契约请查阅 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**。
 
 ---
 
-## 🍳 实战 Recipes
+## 🍳 常见场景速览 (Recipes)
 
 ### Recipe 1: 增量分页扫描器 (Discovery)
 
@@ -209,17 +186,14 @@ from tasklite import TaskLite, Job, Task, AttemptRecord
 from tasklite.wrappers.discovery import register_discovery
 
 def fetch_page(job, ctx, page: int):
-    # 从第 1 页开始逐页获取列表，返回空列表表示翻页结束
     return api.get_author_posts(author_id=job.payload["author_id"], page=page)
 
 def item_id(post) -> str:
-    return str(post["id"])  # 唯一内容 ID
+    return str(post["id"])
 
 def process_item(job, ctx, post, content_id: str):
-    # 发现新内容时派生子任务（content_id 已做单射编码）
     ctx.spawn(Job("download", content_id, payload={"url": post["url"]}))
 
-# 注册增量探索
 register_discovery(
     pipeline,
     task_type="discover_author",
@@ -231,39 +205,23 @@ register_discovery(
 )
 ```
 
-### Recipe 2: 视频转码与 DAG 依赖级联
+### Recipe 2: DAG 依赖级联与按输入 `mtime` 自动重跑
 
-下载完成后自动触发转码，下载若失败则自动跳过转码：
+通过 `depends_on` 声明拓扑依赖，配合 `trigger="on_input_change"` 与 `ctx.declare_input(path)` 实现 make 式级联更新（完整可运行示例见 [`examples/trigger_chain.py`](examples/trigger_chain.py)）：
 
 ```python
-# 构造具有拓扑依赖的任务链
 download_job = Job("download", "video_101", payload={"url": "https://example.com/v.mp4"})
 transcode_job = Job(
     "transcode",
     "video_101",
     payload={"preset": "1080p"},
-    depends_on=[download_job.uid],  # 依赖 download::video_101
+    depends_on=[download_job.uid],  # 上游本批就绪后再判定下游，上游失败则自动级联阻断
+    trigger="on_input_change",      # 输入文件 mtime 晚于上次可信成功完成时间才重跑
 )
 
 pipeline.enqueue([download_job, transcode_job])
 pipeline.run()
 ```
-
-同批依赖会先等待上游本次处理完毕，历史成功不会提前解锁仍在排队或运行的上游。上游本次失败时，下游按依赖失败归档。
-
-### 按输入更新重跑（稳定 Job 身份）
-
-在 `register_task(..., trigger="on_input_change")` 声明默认触发条件，handler 中用 `ctx.declare_input(path)` 声明输入；每轮仍需显式入队所需上下游。框架在上游就绪后读取输入当前 mtime，严格晚于上次可信成功完成时间才执行，下游身份保持不变。上游运行但输入未变时，下游可跳过；输出缺失不会自动触发。
-
-从仓库根目录运行[完整示例](examples/trigger_chain.py)：
-
-```sh
-python -m examples.trigger_chain --root /tmp/tasklite-trigger-demo
-```
-
-示例以 `[下游, 上游]` 逆序入队，连续提交 `alpha / alpha / beta`；使用新目录时，三轮的「成功 / 跳过」分别为 `2 / 0`、`1 / 1`、`2 / 0`。示例按内容决定上游是否写文件，框架的输入判据仍仅为 mtime。目录只检查自身时间，保留 mtime 的内容替换可能漏判。
-
-Task 的 `resources / max_retries / timeout_seconds / timeout_is_transient / trigger` 是默认规格，Job 对应参数为 `None` 时继承；显式 `0`、`False` 均保留，资源按键合并。默认 `trigger="once"`，Discovery 默认 `"always"`；自定义触发条件通过 `register_trigger(name, fn)` 注册。完整语义及旧接口迁移见 [V2 使用指南](docs/V2_GUIDE.md#触发器迁移与恢复边界)。
 
 ### Recipe 3: 遭遇 429 限流与配额熔断全局休眠
 
@@ -281,20 +239,13 @@ def fetch_handler(job, ctx):
 
 ### Recipe 4: AI Agent / 大模型批量任务断点续跑
 
-批量调用大模型处理数千条文本，多进程并发加速 + 速率控制 + 自动断点续跑：
-
 ```python
 import json
 from pathlib import Path
 from tasklite import TaskLite, Job, RateLimitResource
 
 def agent_worker(job: Job, ctx):
-    # 模拟 Agent 分析并生成结果
-    prompt = job.payload["prompt"]
-    result = call_llm(prompt)
-    
-    # declare_output 返回解析后的绝对路径字符串（str），用 Path 包装后写文件，
-    # 保证写入位置与框架校验/清理位置一致
+    result = call_llm(job.payload["prompt"])
     out_path = Path(ctx.declare_output(f"./results/{job.job_id}.json", delete_on_failure=True))
     out_path.write_text(json.dumps(result, ensure_ascii=False))
     return True, {"tokens": result.get("usage", 0)}
@@ -303,17 +254,12 @@ pipeline = TaskLite(name="agent_batch", state_dir="./agent_state", max_workers=8
 pipeline.register_resource(RateLimitResource("llm_rpm", interval_seconds=0.1))
 pipeline.register_task("analyze", agent_worker, resources={"llm_rpm": 1.0})
 
-# 入队海量任务，中途即使断网或意外中断，重启后自动跳过已完成任务接续执行
 pipeline.enqueue([
     Job("analyze", f"doc_{i}", payload={"prompt": f"分析文本 {i}"})
     for i in range(1000)
 ])
 pipeline.run()
 ```
-
-handler 可用 `ctx.has_succeeded(job_uid)`、`ctx.has_failed(job_uid)` 查询派发时的成功/失败档案快照；`ctx.succeeded_or_failed_job_uids()` 返回两者的只读并集，不含 skipped、队列成员或 Attempt 历史，不实时刷新。
-
-入队前可在 `run()` 外调用 `pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))`：仅排除成功档案命中者，保留输入顺序；失败档案和队列中已有的 Job 仍可返回。
 
 ### Recipe 5: 官方 HTTP 守卫与原始响应快照重放 (HTTP Wrappers)
 
@@ -324,12 +270,10 @@ from tasklite.wrappers.http import SQLiteSnapshotStore, http_guard, urllib_fetch
 pipeline = TaskLite("crawler", state_dir="./states")
 pipeline.register_resource(RateLimitResource("api", interval_seconds=1.0))
 
-# 原始 HTTP 响应持久化快照（独立 snapshots.db，支持全离线重放与反爬保护）
 snapshot_store = SQLiteSnapshotStore("./snapshots.db")
 cached_fetch = snapshot_store.cached(urllib_fetch)
 
 def crawler_handler(job, ctx):
-    # 429 时自动挂起 api 资源、5xx 瞬态重试、4xx 直接进失败档案
     with http_guard(ctx=ctx, resource="api", default_suspend_ttl=60.0):
         resp = cached_fetch(job.payload["url"])
         return resp.json()
@@ -339,25 +283,19 @@ pipeline.register_task("fetch", crawler_handler, resources={"api": 1.0})
 
 ---
 
+## 📚 文档导航与职责划分
 
-## 🛠️ 失败档案与运维 (Failed & Ops)
+仓库内各文档按受众与职责严格正交划分，避免重复维护：
 
-当任务重试预算耗尽或发生致命错误时，任务进入持久化**失败档案**（failed 表，与 successes 按 uid 互斥且唯一终态）。运维 API 仅限 `run()` 外调用：
-
-```python
-# 1. 检查失败详情（条目携带原始业务 payload 快照，补跑自足）
-for entry in pipeline.list_failures():
-    print(f"UID: {entry.job_uid}, 原因: {entry.error_message}, 元数据: {entry.metadata}")
-
-# 2. 清理指定类型的失败档案（默认保留 is_fatal=true 错误，可入队同名任务重跑）
-pipeline.clear_failures(task_types=["download"], keep_fatal=False)
-
-# 3. 单条人工补跑：移出档案、按档案 payload 快照队首重入队
-pipeline.retry_failure("download::img_001")
-
-# 4. 精确或前缀清理历史（successes / failed）
-pipeline.clear_history("download::")
-```
+| 文档 | 定位与职责 |
+| :--- | :--- |
+| **[`README.md`](README.md)** | **项目门户与快速上手**：解决痛点、架构概览、安装与最小示例、常见场景 Recipes 速览、目录结构 |
+| **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)** | **权威使用指南与契约手册**：公开导入面、三层模型与 Schema 5 契约、触发器与恢复边界、`JobContext` 与产物清理授权、失败档案运维 API、三类调度扩展 seam |
+| **[`CONTEXT.md`](CONTEXT.md)** | **领域通用语言词典**：核心领域模型与引擎内部组件的标准术语定义及禁用词表 |
+| **[`docs/adr/`](docs/adr/)** | **架构决策记录（ADR）**：关键架构演进、设计取舍与边界裁决依据 |
+| **[`docs/ROADMAP.md`](docs/ROADMAP.md)** | **未来演进路线图**：已分析但尚未立项实施的储备方向（实施前须立项 ADR） |
+| **[`AGENTS.md`](AGENTS.md)** | **研发红线与工作流规范**：测试门槛、原子提交纪律、分层依赖红线与注释规范 |
+| **[`CHANGELOG.md`](CHANGELOG.md)** | **版本变更日志**：各发布版本的显著特性与破坏性变更记录 |
 
 ---
 
@@ -400,5 +338,3 @@ tasklite/
 ## 📄 开源许可证
 
 本项目基于 [MIT License](LICENSE) 开源。
-
-开发中的存储契约为 schema 5（`user_version=5`，包版本已切换为 2.2.0，尚未发布）。仅接纳真正空库或完整目标形状的 schema 5；旧库（`user_version <= 4`）、版本 0 非空库与半建库在只读预检阶段明确拒绝，不自动迁移或修复。请保留原库，用匹配版本读取历史，或显式选择新状态库路径。字段与接纳边界见 [V2 使用指南](docs/V2_GUIDE.md)、[ADR-0007](docs/adr/0007-naming-schema-contract.md) 和 [ADR-0008](docs/adr/0008-trigger-contract-and-trusted-success.md)。

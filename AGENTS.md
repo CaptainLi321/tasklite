@@ -67,11 +67,13 @@
 
 ---
 
-## 四、文档与权威索引
+## 四、文档体系与职责边界
 
-- **权威使用指南**：[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)（Task/Job/Attempt 三层模型、六步契约、失败档案、调度 seam 与 v1→v2 命名映射）
-- **文档唯一总纲**：[`README.md`](README.md)
-- **架构决策记录（ADR）**：[`docs/adr/`](docs/adr/)（v2 重建总纲：ADR-0004；上位与 v1 退役：ADR-0005；命名与 schema 4 契约：ADR-0007）
-- **演进路线图**：[`docs/ROADMAP.md`](docs/ROADMAP.md)（已分析未实施方向：单任务直达 CLI、调度策略族；实施前须立项 ADR）
-- **领域概念词典**：[`CONTEXT.md`](CONTEXT.md)
-- **Discovery 需求契约**：[`tasklite/wrappers/discovery.py`](tasklite/wrappers/discovery.py)
+仓库内各文档按职责严格正交划分，修改文档时须放入对应归属文件，禁止跨文档重复堆砌契约细节：
+
+- **项目门户与快速上手（[`README.md`](README.md)）**：面向初次接入者，仅放项目定位、架构图、核心特性概览、安装与最小示例、常见场景 Recipes 速览、目录结构与文档导航；**严禁在 `README.md` 中重复堆砌底层协议、状态机规则或字段级契约**。
+- **权威使用指南与契约手册（[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)）**：面向深度使用者，系统定义公开导入面、Task/Job/Attempt 三层模型与数据库 Schema 5 契约、触发器与恢复边界、`JobContext` 与产物清理授权、失败档案与运维 API、三类调度扩展 seam（`OrderingPolicy` / `RequeuePolicy` / `Selection`）。
+- **领域概念词典（[`CONTEXT.md`](CONTEXT.md)）**：核心模型与内部组件的标准术语及禁用同义词（`_Avoid_`）。
+- **架构决策记录（[`docs/adr/`](docs/adr/)）**：记录关键架构决策、演进背景与取舍依据。
+- **演进路线图（[`docs/ROADMAP.md`](docs/ROADMAP.md)）**：记录已分析未实施方向（单任务直达 CLI、调度策略族；实施前须立项 ADR）。
+- **Discovery 需求契约**：[`tasklite/wrappers/discovery.py`](tasklite/wrappers/discovery.py) 模块级文档。

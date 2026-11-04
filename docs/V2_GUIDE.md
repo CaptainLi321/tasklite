@@ -1,22 +1,24 @@
-# TaskLite 使用指南（v2）
+# TaskLite 权威使用指南与契约手册
 
-> 本包为 [`docs/adr/0004-v2-parallel-rebuild.md`](adr/0004-v2-parallel-rebuild.md) 重建、经 [ADR-0005](adr/0005-v2-promotion.md) 上位为主包的引擎：进程隔离、SQLite WAL 状态机、六步调用契约、瞬态信号军规全部保留，模型与命名按 ADR-0004 重塑。本指南是现行**权威**使用文档；v1 历史正文已移出工作树，以 Git 历史与 `v1-final` 标签为追溯来源。
+> 本文档是 TaskLite 的**权威 API 与行为契约参考手册**，系统定义公开导入面、Task / Job / Attempt 三层模型、触发器（Trigger）与可信基线、产物声明与清理授权、失败档案与运维接口，以及三类调度扩展 seam（`OrderingPolicy` / `RequeuePolicy` / `Selection`）。项目概览与快速上手见 [`README.md`](../README.md)，架构取舍背景见 [`docs/adr/`](adr/)。
 
 ---
 
-## 1. 定位与导入
+## 1. 公开导入面与架构边界
 
-v2 即 `tasklite` 主包（上位裁决 [ADR-0005](adr/0005-v2-promotion.md)）。**唯一承诺稳定的导入面**是 `tasklite/__init__.py` 的集中导出：
+**唯一承诺稳定的顶层导入面**是 `tasklite/__init__.py` 的集中导出：
 
 ```python
 from tasklite import (
     TaskLite,                    # 门面（六步调用契约唯一入口）
     Job, Task, AttemptRecord,    # 三层模型：实例 / 规格 / 轨迹
     JobContext,                  # handler 执行上下文
+    TriggerContext,              # 自定义触发器只读判定上下文
     RetryError, FatalError, RateLimitHit,   # 异常三分类
-    FailureEntry,                # 失败档案条目
+    FailureEntry, SuspendEntry,  # 失败档案与资源挂起条目
     OrderingPolicy, FifoOrderingPolicy,     # 调度排序 seam
-    RequeuePolicy, ImmediateRequeuePolicy,  # 重入队节奏 seam
+    RequeuePolicy, ImmediateRequeuePolicy, RequeuePlan,  # 重入队节奏 seam
+    Selection, Exclude, Skip,    # 候选准入/选择 seam
     CapacityResource, RateLimitResource,    # 资源体系
     encode_identifier, encode_job_component, encode_content_id,  # 单射编码族
 )
@@ -28,8 +30,7 @@ from tasklite import (
 
 - 分层单向依赖：`tasklite/models/` 严禁 import `tasklite/engine/`（IPC 声明读写一律下沉 `tasklite/utils/ipc.py`），`tasklite/utils/` 严禁 import `tasklite/wrappers/`，核心层（engine/backend/models/utils）严禁依赖 `tasklite/contrib/`；
 - 版本单一事实源：`tasklite.__version__`（pyproject 动态读取点）；
-- **数据库零兼容**：schema 全新（含 attempts 表），旧库 fail-loud 拒识（`user_version=5`）；
-- v1 已退役：git 历史与 `v1-final` 标签留档，迁移映射见第 6 节与 ADR-0004。
+- **数据库严格版本边界**：当前状态库格式为 schema 5（`user_version=5`，含 `attempts` 表），旧库在只读预检阶段 fail-loud 拒绝，不自动迁移。
 
 ---
 
@@ -101,26 +102,15 @@ job.uid          # "download::img_001"——身份不变式
 
 运行前可用 `pipeline.register_trigger("name", fn)` 注册 `Callable[[TriggerContext], bool]`，Task 与 Job 仅保存名称。`TriggerContext` 提供隔离的 `job` 快照、`has_succeeded`、`has_failed`、只读 `success_metadata` 与 `last_succeeded_at_us`。禁止覆盖内置或重复名称，未注册名称、回调异常与非 `bool` 返回值使 `run()` 原样抛错、保留候选并回收在途任务，不消耗重试预算或写入失败档案。返回 `False` 正常跳过，本次 run 的下游继续流转；该就绪标记不跨 run 持久化。同次激活的故障重试（`attempt_no > 1`）不再求值。
 
-### 触发器迁移与恢复边界
+### 触发器与恢复边界
 
-| 旧接口或场景 | 当前写法与行为 |
-|---|---|
-| `Job(..., rerun="never")` | `Job(..., trigger="once")`；命中成功或失败历史均跳过 |
-| `rerun="every_run"` | `trigger="always"`；每次显式入队都触发 |
-| `rerun="on_failure" / "on_input_change"` | 参数改为 `trigger`，名称保持；也可在 `register_task` 统一指定 |
-| `set_discovery_rerun` | 删除；`register_discovery(..., trigger="always")` 通过 Task 规格继承，Job 可显式覆盖 |
-| `declare_input_uri(url)` | 删除；远端版本条件可写自定义 trigger，业务审计字段可放成功返回 metadata |
-| 输入历史 `(size, mtime_ns)` 快照 | `declare_input(path)` 仅记录路径；目录只 stat 自身，不递归 |
-
-不提供旧参数、旧快照键或旧策略名别名。`Job.to_dict()` 保留尚未继承的 `None`；入队与派生摄入后，已解析规格随快照持久化。恢复不会用新的 Task 默认值覆盖快照中的显式预算或超时。自定义触发器的名称随快照保存，函数每次启动由应用重新注册，函数自身无需传给 worker。
+`Job.to_dict()` 保留尚未继承的 `None`；入队与派生摄入后，已解析规格随快照持久化。恢复不会用新的 Task 默认值覆盖快照中的显式预算或超时。自定义触发器的名称随快照保存，函数每次启动由应用重新注册，函数自身无需传给 worker。
 
 使用 `on_input_change` 时，时间比较统一截断到整数微秒：`mtime_ns // 1000 > finished_at_us`，同一微秒内的差异不触发。`seed_successes` 写入的空记录、清历史后再 seed、缺完整框架成功证据的档案均无可信基线，保守执行以建立新成功。可信基线下没有输入列表、空列表或路径缺失属于配置/文件错误，`run()` 上抛并保留候选；首次执行中动态发现的缺路径在 `declare_input` 调用点报错。
 
 对于本轮显式入队的 `A → B`，即使 `[B, A]` 逆序，也先处理 A，再判定 B。A 更新输入则 B 可重跑，A 成功但未改输入则 B 可跳过；A 本轮失败时，A、B 的旧成功均不能遮蔽依赖失败。未入本批的依赖可使用有效历史成功。框架不自动扫描文件、创建或重新入队未提交的下游。
 
 `attempt_no > 1` 是已准入激活的故障重试，跨 `run()` 或主进程崩溃恢复后继续沿用同一激活与剩余预算，不重新调用 trigger。首次尝试的瞬态中断、孤儿锁冲突或限速仍保持 `attempt_no == 1`，再次派发会重新求值；这些信号不消耗重试预算、不写失败档案、不污染最近故障信息。主进程异常会回收在途任务并保存未执行候选；进程被直接杀死时，已提交的队列是恢复依据。未提交副作用可能重做，不承诺 exactly-once。
-
-数据库边界仍是 schema 5：schema 4 及更早版本在只读预检时明确拒绝，不自动迁移、不删除原库。应保留原库，用匹配版本读取历史，或显式选择独立的新状态库路径；不应把旧队列快照键改名当作已完成数据迁移。
 
 可运行的稳定身份、逆序入队与三轮 mtime 重跑示例见 [examples/trigger_chain.py](../examples/trigger_chain.py)。
 
@@ -307,7 +297,7 @@ pipeline.retry_failure("download::img_001")
 |---|---|---|---|
 | `OrderingPolicy` | 候选排序（队列访问序） | `JobScheduler.scan_next_runnable` 按 `visit_order` 首中即停 | ADR-0004 |
 | `RequeuePolicy` | 重入队节奏 | `RequeuePolicy.plan_requeue`（`StateStore.requeue_transient` / `apply_retry` 唯一消费） | ADR-0004 |
-| `Selection` | 候选准入/选择（`task_type` 维度：Exclude 延迟 / Skip 终态） | `scan_next_runnable` 候选过滤 + Skip 跳过阶段（终态收敛） + 停摆仲裁 Kahn 拓扑剥离 + 终态写入出口（`cascade_fail` / `apply_bulk_failure`）隔离 | [ADR-0006](adr/0006-selection-scheduling-seam.md)、本指南第 8 节 |
+| `Selection` | 候选准入/选择（`task_type` 维度：Exclude 延迟 / Skip 终态） | `scan_next_runnable` 候选过滤 + Skip 跳过阶段（终态收敛） + 停摆仲裁 Kahn 拓扑剥离 + 终态写入出口（`cascade_fail` / `apply_bulk_failure`）隔离 | [ADR-0006](adr/0006-selection-scheduling-seam.md) |
 
 ### OrderingPolicy：队列访问序
 
@@ -353,62 +343,11 @@ pipeline = TaskLite(name="media", state_dir="./state",
 - `transient_kind` 非 None 表示瞬态信号（`interrupted` / `lock_conflict` / `rate_limited`）——预算豁免语境下策略不得因预算耗尽拒绝重入队。瞬态信号军规（不烧重试预算 + 降级写盘 + 零污染）在「立即重入队」默认策略下自然成立；
 - 两个构造参数只做接线：不引入任何策略实现、不给 Job 增调度字段；`scan_next_runnable` 唯一选择点与 `plan_requeue` 唯一出口的结构不变。
 
-### Selection：候选准入/选择（第三类 seam）
+### Selection：候选准入/选择（Exclude 延迟留队 + Skip 终态跳过）
 
-Selection 决定「本 run 是否允许某 `task_type` 的候选进入执行」，既不是候选排序也不是重入队节奏：`pipeline.selection(Exclude(task_type="pdf_to_md"), Skip(task_type="ocr"))` 配置规则集——Exclude 延迟留队（下次 run 自动恢复），Skip 终态跳过并级联下游。API 与语义契约见**第 8 节**；分类裁决、停摆拓扑剥离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。
+Selection 属调度扩展 seam 的第三类——候选准入/选择（与 `OrderingPolicy`、`RequeuePolicy` 并列，分类裁决与停摆拓扑剥离见 [ADR-0006](adr/0006-selection-scheduling-seam.md)），决定「本 run 是否允许某 `task_type` 的候选进入执行」。
 
-### 核心禁改红线
-
-- 核心（models/backend/engine/utils）**禁止出现任何排序计算与退避计算**；
-- **Job 模型不携带** `priority` / `deadline` / `period` 字段——其存放与语义由未来调度策略 ADR 裁决；
-- 软 EDF / 优先级 / aging / 错峰 / 超期准入（依赖 Job deadline 等调度字段）等策略引入时**须新立 ADR**，以 wrapper/util 形态实现上述接缝，核心不动；
-- `Selection` 的 `task_type` 准入轴已由 [ADR-0006](adr/0006-selection-scheduling-seam.md) 定案；新增规则轴、优先级/期限类策略或修改其语义须重开 ADR。
-
----
-
-## 6. v1 → v2 命名映射
-
-完整映射表（模块层 + 标识符层 + 保留不动清单）见 [ADR-0004 命名映射表](adr/0004-v2-parallel-rebuild.md#命名映射表v1--v2)。最常用 15 条摘录：
-
-| v1 | v2 |
-|---|---|
-| `TaskLite.register_handler` | `TaskLite.register_task` |
-| `TaskLite.add_resource` | `TaskLite.register_resource` |
-| `TaskLite.list_dlq` | `TaskLite.list_failures` |
-| `TaskLite.clear_dlq` | `TaskLite.clear_failures` |
-| `DLQEntry` | `FailureEntry` |
-| `TaskContext` | `JobContext` |
-| `on_job_completed(uid, meta, success, going_to_retry)` | `on_attempt_finished(job_uid, *, outcome: AttemptOutcome)` |
-| `Job(..., retries=...)` 构造参数 | 废除——预算位收敛 `max_retries`（允许执行条件 `attempt_no <= max_retries + 1`） |
-| `sanitize_identifier` / `sanitize_job_component` / `sanitize_content_id` | `encode_identifier` / `encode_job_component` / `encode_content_id` |
-| `escape_injective` | `percent_encode` |
-| `ErrorTaxonomy`（taxonomy.py） | `ErrorClassifier`（errorclass.py） |
-| `TaskLite.list_suspends` | `TaskLite.list_suspensions` |
-| `pop_next_runnable` | `scan_next_runnable` |
-| `AdmissionPolicy`（policy.py） | `TriggerRegistry`（admission.py） |
-| `BackoffGovernor` / `plan_retry` 退避计算 | 删除——`RequeuePolicy` seam 接管（默认 `ImmediateRequeuePolicy`） |
-
-其余高频变化：`fetch_urllib` / `fetch_requests` → `urllib_fetch` / `requests_fetch`；`ERROR_TYPE_*` 九常量不迁移（`ErrorCategory` 唯一表示）；「DLQ / 死信」术语一律改称「失败档案」。`seed_cursor` / `content_fingerprint` / `DeadlockGovernor.arbitrate` 等保留不动（完整清单见 ADR）。成功档案 Python API 现使用 `successes` / `load_successes` / `delete_successes` / `seed_successes`（状态集合属性为 `PipelineState.success_uids`）；`AttemptOutcome` 使用 `success`、`will_retry`、`metadata`，`ExecutionResult` 与 `JobContext` 的 Job 对象列表使用 `spawned_jobs`。运行统计 `EMPTY_STATS` 使用 `succeeded` 与 `lock_conflict_reruns`；资源公开属性对齐为 `RateLimitResource.interval_seconds` 与 `CapacityResource.max_capacity`；`register_discovery` 分组键参数为 `group_key_func`；顶层包公开导出 `SuspendEntry`。SQL 使用 `successes`、`attempts.error_message`，worker 信封使用 `spawned_jobs/error_message`；Job 快照外层使用 `timeout_seconds`，专属入口拒绝旧字段。执行身份与锁文件名编码使用 `execution_id` 和 `encode_job_uid_filename`；执行通信已切换为每 worker 独立单向 Pipe（详见 [ADR-0010](adr/0010-ephemeral-worker-pipe.md)），旧结果/声明/信号文件协议已退役，仅保留执行锁与管线锁文件。
-
----
-
-## 7. backoff 移除说明
-
-本引擎**砍除整个退避机制**：`BackoffGovernor` 与 `backoff_base` / `backoff_max` / `backoff_until` / `backoff_wall_deadline` 全族（v1 遗产）不再存在。重试语义是**立即重入队**：
-
-- 失败（未耗尽预算）→ `ImmediateRequeuePolicy` 规划 `RequeuePlan(front=True, delay_seconds=0.0)` → 队首重入队 → 下一轮扫描即可再次派发；
-- 重试间隔不再由框架注入——若业务需要节奏（固定退避、指数退避、限速窗），经门面构造参数 `requeue_policy` 注入自定义 `RequeuePolicy`（见第 5 节示例骨架），核心零改动；
-- 瞬态信号（孤儿锁冲突 / 外部中断 / 限速）天然受益：零等待重入队 + 不烧重试预算 + 零污染，实际等待由资源挂起 TTL（`ctx.suspend_resource` 的跨重启持久化挂起）承担，而非框架级退避计时器。
-
-这一取舍的裁决依据与重开条件（退避类策略经 seam 回归须新立 ADR）见 ADR-0004「调度 seam」与「后果与重开条件」章节。
-
----
-
-## 8. 执行选择（Selection）：Exclude 延迟留队 + Skip 终态跳过
-
-Selection 属**第 5 节调度扩展 seam 的第三类——候选准入/选择**（与 OrderingPolicy、RequeuePolicy 并列），分类裁决、停摆拓扑剥离与重开条件见 [ADR-0006](adr/0006-selection-scheduling-seam.md)。本节给出使用面与语义契约。
-
-`pipeline.selection(*rules)` 是 **pipeline 属性**（不是 `run()` 的参数）：每次调用**整体替换**规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变，`RunSummary` / `ExecutionOptions` 无新增字段，`EMPTY_STATS` 新增 `excluded_blocked` 计数（本次 run 中「允许执行但仅因 Exclude 上游而无法完成」的留队作业数）。
+`pipeline.selection(*rules)` 是 **pipeline 属性**（不是 `run()` 的参数）：每次调用**整体替换**规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变，`RunSummary` / `ExecutionOptions` 无新增字段，`EMPTY_STATS` 含 `excluded_blocked` 计数（本次 run 中「允许执行但仅因 Exclude 上游而无法完成」的留队作业数）。
 
 ```python
 from tasklite import Exclude, Job, Skip, TaskLite
@@ -423,25 +362,32 @@ pipeline.selection(Exclude("a"), Skip("b"))     # 每次整体替换；同一 ta
 pipeline.selection()                            # 重置：恢复全执行
 ```
 
-规则是职责单一的值对象：`Exclude(task_type=...)`（延迟）与 `Skip(task_type=...)`（终态）均按 `job.task_type` 精确匹配；`Rule` 协议只要求 `matches_task_type(task_type)`（引擎的调度热路径与终态写入出口都按 task_type 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_task_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层 `tasklite` 导出 `Exclude` / `Selection` / `Skip`，`from tasklite.selection import ...` 子模块路径同样可用（模块名全小写）。规则只做 task_type 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨运行窗口复用。
+规则是职责单一的值对象：`Exclude(task_type=...)`（延迟）与 `Skip(task_type=...)`（终态）均按 `job.task_type` 精确匹配；`Rule` 协议只要求 `matches_task_type(task_type)`（引擎的调度热路径与终态写入出口都按 `task_type` 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_task_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层 `tasklite` 导出 `Exclude` / `Selection` / `Skip`，`from tasklite.selection import ...`（模块路径 `tasklite/selection.py`）同样可用。规则只做 `task_type` 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨运行窗口复用。
 
-### 8.1 Exclude（延迟语义：留队、下次自动重试）
+#### Exclude（延迟语义：留队、下次自动重试）
 
 - 命中作业不派发、不写 attempt 轨迹、不进入 successes/失败档案、不消耗 worker/资源与重试预算，队列行原样保留；
 - 其下游允许作业同样留队，本次 run 报 `ERR_DEPENDENCY_EXCLUDED` 并计入 `stats["excluded_blocked"]`，下一次 run（去掉 Exclude / 换 run 配置）自动恢复执行；
 - 停摆仲裁用 **Kahn 入度消减**（初始波前 = `success_uids | excluded_uids`）严格区分：允许作业存在依赖环/缺口时按既有 governor 归因熔断（`ERR_DEPENDENCY_DEADLOCK` / `ERR_DEADLOCK_GAP` / `ERR_RESOURCE_DEADLOCK` / `ERR_MALFORMED_JOB`），绝不因 Exclude 命中而掩盖；仅当剩余允许作业全部可消减且仅被 Exclude 阻塞时，`run()` 以 `ExitReason.COMPLETED` 收敛并保留队列（无固定等待、无忙旋）；
 - 终态写入出口隔离：被排除 uid 不进入失败档案（父失败级联不传播、批量熔断被过滤）。
 
-### 8.2 Skip（终态语义：跳过、下游级联、不再重试）
+#### Skip（终态语义：跳过、下游级联、不再重试）
 
 - 命中作业从 queue 移除，不进入 successes、不进入失败档案（既不成功也不失败），`stats["skipped"]` 计数，审计落 append-only attempts（`outcome="skipped"`，错误码 `SKIPPED`）；
 - 直接或间接依赖 Skip 作业的下游永远无法完成，整链级联跳过（attempt 错误码 `DEPENDENCY_SKIPPED`，含上游 uid），一并从 queue 移除，下次运行不再重试；
 - Skip 与 Exclude 同时命中时 **Skip 优先**（终态意图强于延迟意图）；Skip 级联同样优先于 Exclude——被 Skip 上游永久堵死的 Exclude 作业也一并终态跳过；
-- **判定优先级**：Skip 级联阶段在停摆仲裁之前执行——Skip 子树内即便存在依赖环/缺口，也一律按 `DEPENDENCY_SKIPPED` 归因（Skip 上游是永久死因，环是否可解已无调度意义）；Exclude 则相反，允许作业残图中的环/缺口优先按死锁归因熔断（§8.1）；
+- **判定优先级**：Skip 级联阶段在停摆仲裁之前执行——Skip 子树内即便存在依赖环/缺口，也一律按 `DEPENDENCY_SKIPPED` 归因（Skip 上游是永久死因，环是否可解已无调度意义）；Exclude 则相反，允许作业残图中的环/缺口优先按死锁归因熔断；
 - 运行期派生（`ctx.spawn`）出的 Skip 命中作业在下一拍被跳过阶段收敛，不会派发。
 
-### 8.3 集成方注意
+#### 集成方注意
 
 - selection 激活时 `run()` 可能以 `COMPLETED` 退出而持久化队列非空（Exclude 留队），完成度请按 queue 判定，不能只看退出原因；`stats["excluded_blocked"]` 给出本次被延迟的下游数量；
 - 混合场景（队列同时存在真实死锁成因的允许作业）仍按既有死锁归因/失败档案语义处理——选择规则不等于死锁豁免；
 - `selection(...)` 仅允许 `run()` 外调用；run 期调用抛 `RuntimeError`。
+
+### 核心禁改红线
+
+- 核心（models/backend/engine/utils）**禁止出现任何排序计算与退避计算**；
+- **Job 模型不携带** `priority` / `deadline` / `period` 字段——其存放与语义由未来调度策略 ADR 裁决；
+- 软 EDF / 优先级 / aging / 错峰 / 超期准入（依赖 Job deadline 等调度字段）等策略引入时**须新立 ADR**，以 wrapper/util 形态实现上述接缝，核心不动；
+- `Selection` 的 `task_type` 准入轴已由 [ADR-0006](adr/0006-selection-scheduling-seam.md) 定案；新增规则轴、优先级/期限类策略或修改其语义须重开 ADR。
