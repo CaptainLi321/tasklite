@@ -1,6 +1,6 @@
 # TaskLite
 
-A robust, embedded Python task orchestration engine featuring subprocess isolation, file-based IPC, ACID delta transactions, and multi-round fault recovery. Built on the Task / Job / Attempt three-layer model (ADR-0004; promoted to the main package by ADR-0005).
+A robust, embedded Python task orchestration engine featuring subprocess isolation, per-worker Pipe IPC with lockfile fencing, ACID delta transactions, and multi-round fault recovery. Built on the Task / Job / Attempt three-layer model (ADR-0004; promoted to the main package by ADR-0005).
 
 ## Language
 
@@ -82,7 +82,7 @@ _Avoid_: BackoffGovernor, RetryTimer, BackoffSchedule
 ### Engine Machines
 
 **DispatchMachine**:
-先等待本批依赖、处理依赖失败，再统一求值 trigger，随后处理任务查找、孤儿探测与残留认领，申请资源并派发 worker。活跃上游遮蔽历史终态；同批 trigger False 的就绪标记仅保留在当前运行内存中。
+先等待本批依赖、处理依赖失败，再统一求值 trigger，随后处理任务查找与孤儿锁探测，申请资源并派发 worker。活跃上游遮蔽历史终态；同批 trigger False 的就绪标记仅保留在当前运行内存中。
 _Avoid_: Submitter, Launcher, DispatcherService
 
 **CompletionMachine**:
@@ -102,7 +102,7 @@ Runtime tracked context for a job dispatched to an active subprocess before comp
 _Avoid_: RunningTask, ActiveProcess, WorkerHandle
 
 **WorkerLaunchSpec**:
-The frozen named contract crossing the process seam, carrying the full spawn payload (handler, job, execution context, execution_id, ipc_dir, timeout_seconds) for worker subprocess launch; execution_id belongs to the spec, not to JobContext.
+The frozen named contract crossing the process seam, carrying the full spawn payload (handler, job, execution context, execution_id, ipc_dir, timeout_seconds, pipe_sender) for worker subprocess launch; execution_id belongs to the spec, not to JobContext.
 _Avoid_: SpawnArgs, ProcessPayload
 
 **JobContext**:

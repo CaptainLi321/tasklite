@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20external-brightgreen.svg)]()
 [![ACID Persistence](https://img.shields.io/badge/persistence-SQLite%20WAL%20(ACID)-orange.svg)]()
-[![Tests](https://img.shields.io/badge/tests-2200%2B%20passed-success.svg)]()
+[![Tests](https://img.shields.io/badge/tests-2500%2B%20passed-success.svg)]()
 
 ---
 
@@ -108,9 +108,8 @@ flowchart TD
 ### 6. 📦 具名磁盘产物与删除授权
 - `ctx.declare_output(path, name=...)` 声明文件或目录，返回规范绝对路径；消费方通过 `get_artifact_path` 查询直接依赖的成功产物。
 - 前删、失败删除、成功删除分别由 `delete_existing`、`delete_on_failure`、`delete_on_success` 授权，普通 output 默认均关闭；临时磁盘 `declare_cache` 固定成败清理。
-- [ADR-0009](docs/adr/0009-artifact-authorization-and-cleanup.md) 已接受具名磁盘产物接口：可选 output 名称、独立路径查询与直接依赖校验；磁盘是产物的可靠来源，不新增持久控制状态，生产内存读取缓存暂不加入，IPC 独立推进。A1 设计已完成；A2 提供声明授权、路径删除原语与成功清单内部发布，A3 已接通公开声明与查询；A4 已完成先清理后提交和清理错误编排。
-
-- [ADR-0010](docs/adr/0010-ephemeral-worker-pipe.md) 已完成每 worker 独立单向 `multiprocessing.Pipe` 瞬时通信切换与旧文件 IPC 协议退役：四类消息（`input`、`output`、`suspend`、`result`）统一使用 Pipe 原生收发，不做大小分类、应用层限额或分块；通信消息仅服务当次运行，跨重启恢复以 SQLite 持久化业务状态与文件锁（`{encoded_uid}.lock`、`__pipeline_run__.lock`）为准（Linux 已验收，按决策跳过 Windows 实测）。
+- [ADR-0009](docs/adr/0009-artifact-authorization-and-cleanup.md)：具名产物描述随生产者成功事务原子发布，磁盘是产物的唯一可靠来源，不新增持久控制状态；收尾时先执行授权清理再提交终态，清理故障不伪报成功、不消耗业务重试预算。
+- [ADR-0010](docs/adr/0010-ephemeral-worker-pipe.md)：每 worker 绑定独立单向 `multiprocessing.Pipe` 原生收发 `input`、`output`、`suspend`、`result` 四类瞬时消息；跨重启恢复以 SQLite 持久化业务状态与文件锁（`{encoded_uid}.lock`、`__pipeline_run__.lock`）为准。
 
 ### 7. 🌐 组合式 HTTP 网络工具与快照守卫 (HTTP Wrappers)
 - 开放 Callable 设计，支持原生 `urllib`、`requests`、`httpx` 或平台自定义签名 SDK；
@@ -192,7 +191,7 @@ pipeline.run()
 | **Job（逻辑实例）** | 一次有界激活；`uid = task_type::job_id` 身份不变 | queue 行 job_snapshot JSON（job_uid 为主键） |
 | **Attempt（执行轨迹）** | 一次物理执行的记录：attempt 序号、execution_id、起止时间、结局 | append-only 新表 `attempts` |
 
-任一 attempts 行可回溯「哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——端到端追溯链完整。完整使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**（权威）；v1 → v2 命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)；未来演进方向（CLI 直达、make 式级联更新、调度策略族）见 [ROADMAP](docs/ROADMAP.md)。**v1 已退役**（git 历史与 `v1-final` 标签留档）。
+任一 attempts 行可回溯「哪次激活的第几次执行、由哪个 run 派发、结局如何、当前终态在哪、规格是什么」——端到端追溯链完整。完整使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**（权威）；v1 → v2 命名映射见 [ADR-0004](docs/adr/0004-v2-parallel-rebuild.md)；未来演进方向（CLI 直达、调度策略族）见 [ROADMAP](docs/ROADMAP.md)。**v1 已退役**（git 历史与 `v1-final` 标签留档）。
 
 ```python
 from tasklite import TaskLite, Job, Task, AttemptRecord

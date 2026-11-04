@@ -1,6 +1,6 @@
 # 0010 本次运行的瞬时 worker Pipe 通信
 
-状态：**Accepted & Implemented（I1 原型裁决、I2 瞬时 Pipe 通道全面切换、I3 旧文件 IPC 协议退役均已在 Linux 完成并合入 main；按用户决策跳过 Windows 实测，无向前兼容包袱）**。2026-11-02，用户确认 IPC 只负责本次运行的瞬时通信，选择每 worker 独立的 `multiprocessing.Pipe`，由一个专用 Module 封装传输与回收复杂度。业务 SQLite 恢复继续保留，通信消息不持久化、不接续、不补发，不增加持久收件箱或应用层 ACK。
+状态：**已接受并实施**。2026-11-02，用户确认 IPC 只负责本次运行的瞬时通信，选择每 worker 独立的 `multiprocessing.Pipe`，由一个专用 Module 封装传输与回收复杂度。业务 SQLite 恢复继续保留，通信消息不持久化、不接续、不补发，不增加持久收件箱或应用层 ACK。
 
 生产实现已落位于 `tasklite/utils/ipc.py`（`WorkerPipeSender` / `WorkerPipeReceiver` / `create_worker_pipe`），并与 `ExecutionChannel`、`ArtifactJournal`、`JobContext`、`DispatchMachine`、`RecoveryOrchestrator`、`EngineRuntime` 完成全链路接线；旧文件 IPC 协议（`.result.json`、`.outputs.jsonl`、`.inputs.jsonl`、`.signals.jsonl`、`.draining`、`result_token` 及陈旧结果接续恢复）已全部退役。现行行为见 [V2 使用指南](../V2_GUIDE.md)；产物授权及清理遵循 [ADR-0009](0009-artifact-authorization-and-cleanup.md)。
 
@@ -15,7 +15,7 @@
 
 ## 小 Interface 与所有权
 
-以下是 I2 的内部 Interface 契约，不是已经发布的方法或类型签名；精确命名留给实现。Module 放在 `utils` 或其他核心低层，模型可依赖它，不能让 `models` 反向依赖 `engine`，核心也不能依赖 wrappers/contrib。
+Module 落位于 `tasklite/utils/ipc.py`，模型可依赖它，不让 `models` 反向依赖 `engine`，核心也不依赖 `wrappers`/`contrib`。
 
 | 调用面 | 调用者需要知道的契约 |
 |---|---|
@@ -33,47 +33,24 @@
 | suspend | 资源名称及挂起时长，由主进程按现有规则应用及持久化 |
 | result | 终态结果与现有错误信息；spawn/cursor 随结果交付，并在既有成功事务内提交 |
 
-终态结果应排在该执行的声明之后；result 不等于提交成功。主进程唯一拥有六集合及业务状态，worker 只执行 handler 并发送消息；传输 Module 不执行清理、调度或终态提交。错误类型、身份不匹配、未知消息或损坏载荷须明确拒绝，不能伪造成功；协议验证与 CompletionMachine 接线仍需 I2 的确定性测试。
+终态结果排在该执行的声明之后；result 不等于提交成功。主进程唯一拥有六集合及业务状态，worker 只执行 handler 并发送消息；传输 Module 不执行清理、调度或终态提交。错误类型、身份不匹配、未知消息或损坏载荷明确拒绝，不伪造成功。
 
 ## 收尾顺序与故障边界
 
-运行中持续读取，包括等待 worker 正常退出的阶段，避免大结果因背压阻塞而与 `join` 互等。关闭或中止时先确保 worker 结束（必要时按现有超时/强杀流程），再排空本连接能完整读取的消息，将声明和 suspend 交付相应消费者，然后按现有完成出口验证、授权清理及提交，最后关闭通道。正常成功/失败、取消和异常退出路径均不能直接丢弃已完整接收的声明；损坏尾帧不能使此前完整声明消失。
+运行中持续读取，包括等待 worker 正常退出的阶段，避免大结果因背压阻塞而与 `join` 互等。关闭或中止时先确保 worker 结束（必要时按现有超时/强杀流程），再排空本连接能完整读取的消息，将声明和 suspend 交付相应消费者，然后按现有完成出口验证、授权清理及提交，最后关闭通道。正常成功/失败、取消和异常退出路径均不丢弃已完整接收的声明；损坏尾帧不使此前完整声明消失。
 
 所有终结仍经 `CompletionMachine.complete_job`；失败终态及运行钩子沿用现有唯一出口。授权清理先于业务成功提交；未提交的业务允许恢复后重做，已提交业务以 SQLite 为准，不以 Pipe 的发送/接收证明提交。产物落盘并不证明执行已成功，通信消失也不授权扫描或删除未知残留。
 
-主进程被杀不会自动杀死 worker。孤儿可能继续执行，执行锁必须严格覆盖其执行体生命周期，新主进程不能因 IPC 已消失而与同 uid 孤儿并行执行。补充实验已经验证父死子存时真实执行锁阻止恢复派发，孤儿被回收后原队列执行成功；停止响应修复及实际停止验收见下文。
+主进程被杀不会自动杀死 worker。孤儿可能继续执行，执行锁必须严格覆盖其执行体生命周期，新主进程不能因 IPC 已消失而与同 uid 孤儿并行执行。
 
-## 可复现证据与验收缺口
+## 验证覆盖
 
-可丢弃原型仅保存在分支 **`prototype/ipc-pipe-20261102`**（最新证据提交 `41f4cd3`），路径 `scripts/prototypes/ipc_pipe_prototype.py`，同目录的 `ipc_pipe_README.md` 与 `ipc_pipe_output.json` 保存复现命令、环境和输出；不合入 main。原型起点为 `03c17bb`，当前包含独立停止修复 `49f4048`，Linux / Python 3.14.6 / spawn 实跑 exit 0：
+生产通道与多进程生命周期行为由 `tests/utils/test_pipe_ipc.py`（单元级）与 `tests/integration/test_pipe_ipc_lifecycle.py`（真实 `spawn` 子进程端到端）锁定：
 
-- 顺序传递、重复关闭；16 条各 1 MiB 消息的有界缓冲、背压与恢复消费；4 MiB 完整帧。
-- 缓冲满时强杀可以放弃通道；这只验证输送层关闭能力，不是生产声明的交付规则。原分支 95f1112 的超限拒绝场景是已撤销候选的历史实验，最新原型已移除人为接收上限及该验收。
-- Linux 写入半帧并停住时，另一 worker 正常交付；强杀后报告 `got end of file during message` 并回收。
-- 强杀后排空 8 条声明，直接调用现有 `ArtifactJournal(None, output_roots=folder).cleanup_declared_artifacts(success=False)`，只删除获得失败清理授权的偶数文件；这不是 CompletionMachine 端到端验收。
-- 父进程被杀后 worker 不自动退出，再次发送报 `BrokenPipeError`，无重连。Linux 专项使用临时 subreaper 接管并显式回收孤儿，结束时恢复配置；无存活子进程或接收线程。
-
-2026-11-03 补充真实完成路径集成实验：同一可丢弃分支的 `scripts/prototypes/test_ipc_pipe_completion.py`，复现命令及原始输出见该分支 README 和 `ipc_pipe_completion_output.txt`。Linux / Python 3.14.6 / spawn，5 passed、exit 0。仅在测试内替换通信 seam，并在 worker 内临时把声明/结果/suspend 的 journal 通信切到 Pipe；真实 `_worker_process_entry`、JobContext 路径授权、执行锁、死亡归因、CompletionMachine、StateStore 和 SQLite 不替换。
-
-- Pipe 的声明及结果进入实际完成机器；具名产物、inputs、成功 Attempt/finished_at、spawn 与 cursor 在同一 SQLite 写事务中可见，独立连接在提交前仍看不到任何上述新增业务事实。父子两个真实 worker 成功；同库重开不再执行，显式再次入队按默认 trigger 跳过，worker 启动总数不变。已接收并持久化的资源挂起在重开后仍有效。
-- 真实 worker 被强杀前，主进程已完整收到两条声明；实际完成机器只删除获失败清理授权的文件。强杀和正退出码崩溃均沿现有归因消耗预算，从 Attempt 1 重入队到 2 后成功；默认非瞬态超时直接写失败档案，未变成通用断线重试。
-- 在真实清理原语注入 PermissionError：完成错误传播，无 successes/failed，SQLite 保留原队列、预算 1 与 running Attempt，文件保留。每例检查无残留子进程/接收线程或通信 JSON 文件。
-
-以上五例是指定路径的实际完成链路集成证据，后续故障补充见下文。测试 Adapter 不是可用于生产的通道；未替换生产 IPC，I2 未启动。本轮独立停止响应修复见下文。
-
-同一原型分支进一步补充 Linux 故障实验，修复停止响应后当前共 **14 passed、exit 0**；最新原始输出为该分支的 `ipc_pipe_stop_recovery_output.txt`。此前 cab928e 的 13 项输出保留为缺陷取证历史，不替代本轮真实停止验收：
-
-- DRAINING：真实 worker 声明后经确定性屏障请求正常停止，完整结果提交成功、临时产物清理、inputs 与 suspend 保存，后续候选不执行。
-- ABORTING：真实 worker 停在屏障时强停，先结束 writer、再排空交付声明与 suspend，经现有恢复/完成机器只删授权产物，原队列与预算保留；已收到完整 result 但未收割时强停仍提交成功。
-- 坏 JSON、未知种类、错误 job_uid、错误 execution_id 四例均拒绝成功，后续附带完整成功 result 也不能改变拒绝结果；已经完整收到的声明仍按授权清理，队列预算不变。
-- 真实主进程被杀后 worker 存活持执行锁；新 TaskLite 的真实孤儿探测不派发同 uid，不烧预算、不登记失败、不污染最近重试错误。杀死并回收孤儿后，锁可用且原队列实际执行成功。
-
-**停止响应缺陷已独立修复（`49f4048`）：** 填池循环此前只看已派发数量，孤儿冲突回队不会增加该数量，因而停止请求无法回到停机门。现在每轮派发前检查会话 stop_mode；确定性回归在真实 dispatch 孤儿冲突分支请求 DRAINING/ABORTING，修复前两例均因第二次 probe 失败，修复后通过。没有改变 IPC 传输或重试规则。
-
-原型基于该修复重新运行真实父死子存实验，分别请求正常停止及强制中止，run 正常返回对应停止原因；只探测一次、不启动重复 worker、预算 1 与原队列保留且无失败污染。杀死并回收孤儿后，锁恢复可用，原队列实际执行成功；不再使用确定性异常屏障代替成功停止。
-
-**I1 已定 Linux 验收完成，按用户要求暂停；Windows 仍未实测，不宣称跨平台通过。** Windows 未实测：spawn 端点所有权、背压、大帧、EOF/断链、缓冲满与半帧强杀、父死子存及线程/句柄回收均须在 Windows 验证。原型通用场景可运行，Linux 专项在 Windows 明确跳过；跳过不算通过。Windows 半帧故障注入还需采用平台适用的方法，不能照搬 `os.write` 或 `prctl`。
-
-用户已于 2026-11-03 确认统一原生收发规则，容量不再是待决门槛。框架不加应用层大小限制，标准库/OS 的自然约束及异常照常传播，不承诺任意大消息一定成功；不增加字节额度或动态容量框架。简单有界消息条数缓冲用于背压，原型队列容量 2 仍只是实验参数。完整结果收到后才沿既有事务提交 spawn/cursor，不提前分批提交。
-
-原型已验证上述坏消息、身份不匹配、指定停止和孤儿互斥路径；随后 I2/I3 已在 `main` 完成正式生产通道切换、旧文件协议移除以及覆盖 14 类真实子进程生命周期场景的端到端集成测试（`tests/integration/test_pipe_ipc_lifecycle.py`）与通道单测（`tests/utils/test_pipe_ipc.py`）。按用户决策跳过 Windows 实测。
+- **顺序、背压与大载荷**：顺序传递、幂等重复关闭、有界消息队列背压与恢复消费、多兆字节大帧完整收发。
+- **半帧与断链隔离**：单个连接写入半帧并停住时，不阻塞其他 worker 正常交付；writer 被强杀后报告残缺帧/EOF 错误并干净回收接收线程与句柄。
+- **完成事务与重开一致性**：Pipe 的声明与结果进入 `CompletionMachine`，具名产物、`inputs`、成功 `Attempt`/`finished_at`、`spawn` 与 `cursor` 在同一 SQLite 写事务中提交；已接收并持久化的资源挂起跨重启保持有效。
+- **异常退出与授权清理**：真实 worker 被强杀、非零退出或超时后，主进程排空已完整接收的声明并仅删除获得失败清理授权的文件；清理原语抛错时传播环境异常、保留原队列快照与重试预算。
+- **DRAINING / ABORTING 停机排空**：`DRAINING` 等待在途完成并提交声明、结果与 `suspend`；`ABORTING` 先终止 writer、再排空交付已收到的声明与 `suspend` 并执行失败清理（若已收到完整 `result` 则提交终态）。
+- **协议与身份防御**：损坏 JSON、未知消息种类、错误 `job_uid`、错误 `execution_id` 均明确拒绝成功提交，此前已完整收到的声明仍按失败授权清理。
+- **父死子存与孤儿锁恢复**：主进程崩溃后孤儿 worker 存活持锁期间，新 `TaskLite` 实例探测到锁冲突自动回队（不烧重试预算、不登记失败、不污染错误），且填池循环在收到停止请求时立即响应退出；孤儿回收释放锁后，原队列任务正常执行成功。

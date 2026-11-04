@@ -1,6 +1,6 @@
 # 0009 具名磁盘产物、删除授权与轻量实现边界
 
-状态：**Accepted（已接受，A1 设计完成；A2—A4 已完成并通过最终验证）**。用户已逐项确认接口，并最终确认直接依赖的局部强校验。A2 已完成统一授权值、路径/删除原语与具名成功清单内部发布，并通过最终验证；A3 已接通公开声明、直接依赖引用、fake_ctx 与状态目录保护，并通过最终验证；A4 已接通先清理后提交与基础设施错误闭环，本次已完成并暂停。当前可用接口见 [V2 使用指南](../V2_GUIDE.md)，收尾边界以下述实施状态为准。
+状态：**已接受并实施**。用户已逐项确认接口，并最终确认直接依赖的局部强校验。统一授权值、路径/删除原语、具名成功清单原子发布、公开声明与直接依赖引用、`fake_ctx`、状态目录保护以及先清理后提交与基础设施错误闭环均已完成并通过验证。当前可用接口见 [V2 使用指南](../V2_GUIDE.md)。
 
 用户在审查原 Proposed 草案后，明确要求优先简单、**不新增持久化控制状态**，随后确认先交付具名磁盘产物，不加入生产内存读取缓存，IPC 替换独立推进。该后续裁决取代原草案中依赖持久预留、父进程 ACK、清理债务与所有权释放状态机的推荐；不能把此前讨论过的强接纳方案继续视为已批准方案。
 
@@ -25,7 +25,7 @@
 
 ### IPC 是另一项工作
 
-现有文件 IPC 继续承担执行结果与控制数据传递。具名磁盘产物不是 IPC 替代品；不能因为产物可以引用或未来可能缓存，就宣称可以删除 `.result.json`、声明日志或 suspend 通道。新传输独立按 I1—I3 推进；后续 [ADR-0010](0010-ephemeral-worker-pipe.md) 已裁决瞬时 Pipe 方向与验收缺口，I2 尚未实施。本 ADR 的产物契约不因此改变。
+具名磁盘产物不是执行通信（IPC）替代品：它只负责成功产物的路径发布与直接依赖查询，而终态结果、`spawn`、`cursor`、产物声明与 `suspend` 的运行期传递由每 worker 独立单向 `Pipe` 承担（详见 [ADR-0010](0010-ephemeral-worker-pipe.md)）。
 
 ## 2. 仍然保留的授权与路径规则
 
@@ -69,16 +69,16 @@
 
 ## 4. 当前实现事实与可复用入口
 
-A2—A4 落实后的入口与边界：
+落实后的入口与边界：
 
 | 现有入口 | 实现事实及边界 |
 |---|---|
 | [context.py](../../tasklite/models/context.py) `declare_output/input/cache` 与 `get_artifact_path` | output 支持具名与三项独立删除权限；input 仅声明实际输入路径；getter 仅引用直接依赖的成功描述 |
-| [ipc.py](../../tasklite/utils/ipc.py) `record_artifact/read_artifacts` | 每 uid 的 JSONL 保存统一授权值；不是父进程接纳协议或持久清理阶段 |
+| [ipc.py](../../tasklite/utils/ipc.py) `record_artifact/read_artifacts` | 经每 worker 单向 Pipe（或测试内存缓冲）传递统一授权值；不是父进程接纳协议或持久清理阶段 |
 | [completion.py](../../tasklite/engine/completion.py) `_apply_success` | inputs 与具名 artifacts 随既有成功事务提交，整体替换清单 |
-| `CompletionMachine.complete_job` | 验证及授权清理先于业务提交；提交前错误保留日志，提交后删日志失败不撤销业务事实 |
-| [channel.py](../../tasklite/engine/channel.py) 收割与 spawn | 上行仍为 JSON 文件，下行 Context 为 pickle 快照；窄声明环境故障复用结果通道，没有新增持久控制状态 |
-| [recovery.py](../../tasklite/engine/recovery.py) 与派发预检 | 中止回收进程并保队；PRE_SUBMIT 清除旧声明，不重放产物删除或恢复清理债务 |
+| `CompletionMachine.complete_job` | 验证及授权清理先于业务提交 |
+| [channel.py](../../tasklite/engine/channel.py) 收割与 spawn | 上行经每 worker 单向 Pipe 传递，下行 Context 为 pickle 快照；窄声明环境故障复用结果通道，没有新增持久控制状态 |
+| [recovery.py](../../tasklite/engine/recovery.py) 与派发预检 | 中止回收进程并保队；PRE_SUBMIT 清空内存态旧声明，不重放产物删除或恢复清理债务 |
 
 A3 已移除公开 `cleanup_on_fail` 与内部 `record_output`，公开 cache 复用匿名 output；收尾消费者统一使用 `ArtifactDeclaration`，已移除 `read_outputs` tuple/kind 投影。
 
@@ -190,12 +190,10 @@ A2—A4 的实现与测试须覆盖：
 - A4：收缩为现有执行生命周期内的清理顺序、失败可观察与错误传播验收，不再作为持久清理债务或所有权释放机器实施票；恢复能力不得超过本稿明确边界。
 - 生产内存读取缓存只保留未来原型入口，未授权生产实现；IPC 原型与替换另按 I1—I3 推进。
 
-A2 的物理清单为 successes metadata 的 `artifacts` 字段，形如 `{artifact_name: {"path": canonical_absolute_path}}`，随现有成功事务整体替换，空清单同样发布；不持久保存类别或生命周期阶段。输出 JSONL 统一为 path/name/三项删除权限/sandbox，旧 cleanup/kind 格式不再作为声明读取，升级前须停写并确认旧 worker/锁归属。损坏声明拒绝成功提交；提交前失败保留声明日志供诊断，但不把日志视为跨崩溃清理债务。A2 交付时的内部接线限制见 [实施计划 A2](../IMPLEMENTATION_PLAN_2026-10.md#a2磁盘产物描述授权数据与删除原语)。
+物理清单为 successes metadata 的 `artifacts` 字段，形如 `{artifact_name: {"path": canonical_absolute_path}}`，随现有成功事务整体替换，空清单同样发布；不持久保存类别或生命周期阶段。输出声明统一为 `path/name/三项删除权限/sandbox`。损坏声明拒绝成功提交。
 
-A3 已通过最终验证并提交 `5d06750`。A4 在完成出口只读取一次声明，以同一局部 tuple 执行验证、清理和成功发布。清理失败先于业务提交传播，不记成功/失败、不推进重试预算；中止仍回收所有进程与资源并保存原队列。成功事务完成后删除声明日志失败保留已提交事实。
+在完成出口只读取一次声明，以同一局部 tuple 执行验证、清理和成功发布。清理失败先于业务提交传播，不记成功/失败、不推进重试预算；中止仍回收所有进程与资源并保存原队列。
 
-worker 仅把输出声明路径解析、声明日志读写与获授权前删的 I/O 故障标记为运行级环境错误，借现有结果通道交回父进程；该瞬时结果字段不落入业务持久状态。路径/授权配置错误、getter 与普通 handler 的 OSError 仍是业务错误。输入日志读取故障或损坏同样拒绝成功发布，不能静默丢失依赖。
+worker 仅把输出声明路径解析、声明发送与获授权前删的 I/O 故障标记为运行级环境错误，借结果通道交回父进程；该瞬时结果字段不落入业务持久状态。路径/授权配置错误、getter 与普通 handler 的 OSError 仍是业务错误。输入声明损坏同样拒绝成功发布，不能静默丢失依赖。
 
-获授权的前删不承诺日志失败后的回滚；失败日志仅用于诊断，不构成持久清理责任。提交前失败允许未确认业务重做；下一次派发不重放残留声明的删除权限。没有新增持久控制状态；不推送、不发布、不迁移旧库。
-
-最终验证（2026-10-29）：全量 **2548 passed、1 warning、exit 0**；`make test-matrix` **exit 0**，Python 3.10/3.11/3.12/3.13/3.14 均通过导入、类型求值与多进程冒烟，安装 pytest 的 3.14 执行 **2524 passed、24 deselected、1 warning**。未采用负载抖动放行。A3、A4 完成后暂停，I1 未启动。
+获授权的前删不承诺失败后的回滚。提交前失败允许未确认业务重做；下一次派发不重放残留声明的删除权限。没有新增持久控制状态。
