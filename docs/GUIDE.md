@@ -1,6 +1,6 @@
-# TaskLite 权威使用指南与契约手册
+# TaskLite 使用手册
 
-> 本文档是 TaskLite 的**权威 API 与行为契约参考手册**，系统定义公开导入面、Task / Job / Attempt 三层模型、触发器（Trigger）与可信基线、产物声明与清理授权、失败档案与运维接口，以及三类调度扩展 seam（`OrderingPolicy` / `RequeuePolicy` / `Selection`）。项目概览与快速上手见 [`README.md`](../README.md)，架构取舍背景见 [`docs/adr/`](adr/)。
+> 本文档是 TaskLite 的使用手册，详细说明公开导入面、Task / Job / Attempt 三层模型、触发器（Trigger）与可信基线、产物声明与清理授权、失败档案与运维接口，以及三类调度扩展 seam（`OrderingPolicy` / `RequeuePolicy` / `Selection`）。项目概览与快速上手见 [`README.md`](../README.md)，架构取舍背景见 [`docs/adr/`](adr/)。
 
 ---
 

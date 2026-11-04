@@ -191,4 +191,4 @@ class TriggerContext:
 - **R3（可信基线查询与历史管理）**：提供窄查询获取 `job_uid` 的可信 `last_succeeded_at_us`（过滤 `seed_successes` 空记录，解析微秒整数），更新 `declare_input` 仅存路径字符串并移除 `declare_input_uri`。
 - **R4（本批依赖屏障与统一条件求值时序）**：移除 recovery 与 spawn 摄入期的提前求值删行；在 `scheduler` / `dispatch` 实现本批 `active_uids` 依赖屏障与依赖失败优先；移除 `PipelineState` 的 `_is_rerun_exempt` / `rerun_active_uids`。
 - **R5（外部 trigger 接入、`Task` 模板继承与路径 `mtime` 策略）**：完成 `rerun → trigger`（`once / on_failure / on_input_change / always`）、`register_trigger`、`TriggerContext`、`Task` 5 项规格参数向 `Job` 的继承、空输入/缺文件报错与求值异常保队穿透。
-- **R6（端到端回归与权威指南同步）**：补齐跨进程 `A → B` 逆序、重试、恢复集成测试，并同步更新 `README.md`、`CONTEXT.md`、`docs/V2_GUIDE.md`。
+- **R6（端到端回归与使用手册同步）**：补齐跨进程 `A → B` 逆序、重试、恢复集成测试，并同步更新 `README.md`、`CONTEXT.md`、`docs/GUIDE.md`。

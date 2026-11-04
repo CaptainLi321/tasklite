@@ -172,7 +172,7 @@ pipeline.enqueue([
 pipeline.run()
 ```
 
-> 引擎采用 **Task（静态规格） / Job（逻辑实例） / Attempt（执行轨迹）** 三层模型，完整 API 签名、触发器（Trigger）、产物授权、失败档案与调度扩展 seam 契约请查阅 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**。
+> 引擎采用 **Task（静态规格） / Job（逻辑实例） / Attempt（执行轨迹）** 三层模型，完整 API 签名、触发器（Trigger）、产物授权、失败档案与调度扩展 seam 请查阅 **[`docs/GUIDE.md`](docs/GUIDE.md)**（使用手册）。
 
 ---
 
@@ -290,7 +290,7 @@ pipeline.register_task("fetch", crawler_handler, resources={"api": 1.0})
 | 文档 | 定位与职责 |
 | :--- | :--- |
 | **[`README.md`](README.md)** | **项目门户与快速上手**：解决痛点、架构概览、安装与最小示例、常见场景 Recipes 速览、目录结构 |
-| **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)** | **权威使用指南与契约手册**：公开导入面、三层模型与 Schema 5 契约、触发器与恢复边界、`JobContext` 与产物清理授权、失败档案运维 API、三类调度扩展 seam |
+| **[`docs/GUIDE.md`](docs/GUIDE.md)** | **使用手册**：公开导入面、三层模型与 Schema 5、触发器与恢复边界、`JobContext` 与产物清理授权、失败档案运维 API、三类调度扩展 seam |
 | **[`CONTEXT.md`](CONTEXT.md)** | **领域通用语言词典**：核心领域模型与引擎内部组件的标准术语定义及禁用词表 |
 | **[`docs/adr/`](docs/adr/)** | **架构决策记录（ADR）**：关键架构演进、设计取舍与边界裁决依据 |
 | **[`docs/ROADMAP.md`](docs/ROADMAP.md)** | **未来演进路线图**：已分析但尚未立项实施的储备方向（实施前须立项 ADR） |

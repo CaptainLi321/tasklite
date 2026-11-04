@@ -7,7 +7,7 @@
    ``tasklite/wrappers`` 与 ``tasklite/contrib``，且 models 严禁 import
    engine、utils 严禁 import wrappers（分层单向依赖红线）；
 3. contrib 空导出面且不被核心依赖；
-4. V2_GUIDE 代码块中的 tasklite 导入语句逐条可导入——文档承诺的
+4. GUIDE 代码块中的 tasklite 导入语句逐条可导入——文档承诺的
    导入路径（如 ``from tasklite import RequeuePlan``）不得漂移。
 """
 from __future__ import annotations
@@ -174,12 +174,12 @@ class TestMainSurfaceExports:
 
 
 class TestGuideImportContract:
-    """V2_GUIDE 代码块中的 tasklite 导入语句逐条可导入（文档承诺不漂移）。"""
+    """GUIDE.md 代码块中的 tasklite 导入语句逐条可导入（文档承诺不漂移）。"""
 
     def test_guide_tasklite_imports_resolve(self):
-        doc = (PROJECT_ROOT / "docs" / "V2_GUIDE.md").read_text(encoding="utf-8")
+        doc = (PROJECT_ROOT / "docs" / "GUIDE.md").read_text(encoding="utf-8")
         blocks = re.findall(r"```python\n(.+?)```", doc, flags=re.DOTALL)
-        assert blocks, "V2_GUIDE 未捕获 python 代码块，围栏标记已漂移"
+        assert blocks, "GUIDE.md 未捕获 python 代码块，围栏标记已漂移"
         stmts: list[str] = []
         for block in blocks:
             for node in ast.walk(ast.parse(block)):
@@ -191,11 +191,11 @@ class TestGuideImportContract:
                     seg = ast.get_source_segment(block, node)
                     assert seg is not None
                     stmts.append(seg)
-        assert stmts, "V2_GUIDE 代码块未捕获任何 tasklite 导入语句"
+        assert stmts, "GUIDE.md 代码块未捕获任何 tasklite 导入语句"
         joined = "\n".join(stmts)
-        assert "RequeuePlan" in joined, "V2_GUIDE §5 的 RequeuePlan 导入承诺已漂移"
+        assert "RequeuePlan" in joined, "GUIDE.md §5 的 RequeuePlan 导入承诺已漂移"
         for stmt in stmts:
-            exec(compile(stmt, "<V2_GUIDE.md>", "exec"), {})
+            exec(compile(stmt, "<GUIDE.md>", "exec"), {})
 
 
 class TestMainSurfaceIsolation:

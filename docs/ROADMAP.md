@@ -2,7 +2,7 @@
 
 > 本文件记录**已分析、未实施**的未来演进方向。每项实施前按 ADR 程序立项；
 > 状态分：`分析完备`（方案已论证，待立项 ADR）/ `已搁置`（库主明确暂缓）/ `质量投资`。
-> 已落地特性（如执行选择 [ADR-0006](adr/0006-selection-scheduling-seam.md)、make 式 `mtime` 触发器级联更新 [ADR-0008](adr/0008-trigger-contract-and-trusted-success.md)、具名磁盘产物 [ADR-0009](adr/0009-artifact-authorization-and-cleanup.md)、瞬时 Pipe 通信 [ADR-0010](adr/0010-ephemeral-worker-pipe.md)）已移出待办，详见 [adr/](adr/)、[V2_GUIDE.md](V2_GUIDE.md) 与 [README.md](../README.md)。
+> 已落地特性（如执行选择 [ADR-0006](adr/0006-selection-scheduling-seam.md)、make 式 `mtime` 触发器级联更新 [ADR-0008](adr/0008-trigger-contract-and-trusted-success.md)、具名磁盘产物 [ADR-0009](adr/0009-artifact-authorization-and-cleanup.md)、瞬时 Pipe 通信 [ADR-0010](adr/0010-ephemeral-worker-pipe.md)）已移出待办，详见 [adr/](adr/)、[GUIDE.md](GUIDE.md) 与 [README.md](../README.md)。
 
 ---
 

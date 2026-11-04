@@ -2,7 +2,7 @@
 
 状态：**已接受并实施**。2026-11-02，用户确认 IPC 只负责本次运行的瞬时通信，选择每 worker 独立的 `multiprocessing.Pipe`，由一个专用 Module 封装传输与回收复杂度。业务 SQLite 恢复继续保留，通信消息不持久化、不接续、不补发，不增加持久收件箱或应用层 ACK。
 
-生产实现已落位于 `tasklite/utils/ipc.py`（`WorkerPipeSender` / `WorkerPipeReceiver` / `create_worker_pipe`），并与 `ExecutionChannel`、`ArtifactJournal`、`JobContext`、`DispatchMachine`、`RecoveryOrchestrator`、`EngineRuntime` 完成全链路接线；旧文件 IPC 协议（`.result.json`、`.outputs.jsonl`、`.inputs.jsonl`、`.signals.jsonl`、`.draining`、`result_token` 及陈旧结果接续恢复）已全部退役。现行行为见 [V2 使用指南](../V2_GUIDE.md)；产物授权及清理遵循 [ADR-0009](0009-artifact-authorization-and-cleanup.md)。
+生产实现已落位于 `tasklite/utils/ipc.py`（`WorkerPipeSender` / `WorkerPipeReceiver` / `create_worker_pipe`），并与 `ExecutionChannel`、`ArtifactJournal`、`JobContext`、`DispatchMachine`、`RecoveryOrchestrator`、`EngineRuntime` 完成全链路接线；旧文件 IPC 协议（`.result.json`、`.outputs.jsonl`、`.inputs.jsonl`、`.signals.jsonl`、`.draining`、`result_token` 及陈旧结果接续恢复）已全部退役。现行行为见 [使用手册](../GUIDE.md)；产物授权及清理遵循 [ADR-0009](0009-artifact-authorization-and-cleanup.md)。
 
 ## 已确认的范围与取舍
 

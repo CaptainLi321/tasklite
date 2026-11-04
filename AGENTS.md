@@ -1,6 +1,6 @@
 # AGENTS.md（自动加载指针与开发红线）
 
-> 权威使用指南见 **[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)**（Task/Job/Attempt 三层模型与全部公开契约）。
+> 使用手册见 **[`docs/GUIDE.md`](docs/GUIDE.md)**（Task/Job/Attempt 三层模型与全部公开接口）。
 > 文档唯一总纲见 **[`README.md`](README.md)**（以及「设计契约」章节）。
 > 本文件定义 Agent 在本仓库开发、重构、修复时**必须绝对遵守的硬性红线与工作流纪律**。
 
@@ -72,7 +72,7 @@
 仓库内各文档按职责严格正交划分，修改文档时须放入对应归属文件，禁止跨文档重复堆砌契约细节：
 
 - **项目门户与快速上手（[`README.md`](README.md)）**：面向初次接入者，仅放项目定位、架构图、核心特性概览、安装与最小示例、常见场景 Recipes 速览、目录结构与文档导航；**严禁在 `README.md` 中重复堆砌底层协议、状态机规则或字段级契约**。
-- **权威使用指南与契约手册（[`docs/V2_GUIDE.md`](docs/V2_GUIDE.md)）**：面向深度使用者，系统定义公开导入面、Task/Job/Attempt 三层模型与数据库 Schema 5 契约、触发器与恢复边界、`JobContext` 与产物清理授权、失败档案与运维 API、三类调度扩展 seam（`OrderingPolicy` / `RequeuePolicy` / `Selection`）。
+- **使用手册（[`docs/GUIDE.md`](docs/GUIDE.md)）**：面向深度使用者，系统定义公开导入面、Task/Job/Attempt 三层模型与数据库 Schema 5、触发器与恢复边界、`JobContext` 与产物清理授权、失败档案与运维 API、三类调度扩展 seam（`OrderingPolicy` / `RequeuePolicy` / `Selection`）。
 - **领域概念词典（[`CONTEXT.md`](CONTEXT.md)）**：核心模型与内部组件的标准术语及禁用同义词（`_Avoid_`）。
 - **架构决策记录（[`docs/adr/`](docs/adr/)）**：记录关键架构决策、演进背景与取舍依据。
 - **演进路线图（[`docs/ROADMAP.md`](docs/ROADMAP.md)）**：记录已分析未实施方向（单任务直达 CLI、调度策略族；实施前须立项 ADR）。
