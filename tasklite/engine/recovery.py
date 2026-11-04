@@ -37,7 +37,7 @@ if TYPE_CHECKING:
         """恢复编排消费的状态仓库契约（StateStore 自动满足）。
 
         ``backend`` 是持久化后端活引用（加载/修复/差量落盘不经 facade
-        中转）；``queue`` 为内存队列视图（崩溃安全保存的合并侧）；
+        中转）；``state`` 为内存运行态（崩溃安全保存的队列合并侧）；
         ``set_state`` 为装载修复结果的落位口。
         """
 
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
         def backend(self) -> AbstractStateBackend: ...
 
         @property
-        def queue(self) -> list[dict[str, Any]]: ...
+        def state(self) -> PipelineState: ...
 
         def set_state(self, state: PipelineState | None) -> None: ...
 

@@ -47,8 +47,11 @@ class ScanCache(Protocol):
 class BulkFailureOutcome(Protocol):
     """批量失败转移结果的鸭子形状（失败与级联 UID 列表）。"""
 
-    failed_uids: list[str]
-    cascaded_uids: list[str]
+    @property
+    def failed_uids(self) -> list[str]: ...
+
+    @property
+    def cascaded_uids(self) -> list[str]: ...
 
 
 class ArbitrationStore(Protocol):
@@ -234,6 +237,7 @@ class DeadlockGovernor:
             if uid in missing_uids:
                 continue
             try:
+                job: JobFacts | Job
                 if scheduler is not None:
                     job = scheduler.cached_job(jd)
                 else:
@@ -345,6 +349,7 @@ class DeadlockGovernor:
             )
 
         if facts.waiting_for_dependency and store.state is not None:
+            cycle_uids: Sequence[str]
             if selection_active:
                 cycle_uids = (
                     selection_standstill.cycle_uids

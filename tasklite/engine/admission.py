@@ -81,8 +81,11 @@ class TriggerRegistry:
     def normalize_job_snapshot(self, job_snapshot: dict, task_type: str) -> bool:
         """摄入时落实 Task 五项规格，显式资源键覆盖模板默认。"""
         task = self.tasks.get(task_type) if self.tasks is not None else None
-        defaults = {
-            "resources": dict(task.resources) if task else {},
+        merged_resources: dict[str, float] = (
+            dict(task.resources) if task and task.resources else {}
+        )
+        defaults: dict[str, Any] = {
+            "resources": merged_resources,
             "max_retries": task.max_retries if task else 3,
             "timeout_seconds": task.timeout_seconds if task else 3600,
             "timeout_is_transient": task.timeout_is_transient if task else False,
@@ -91,10 +94,10 @@ class TriggerRegistry:
         changed = False
         for key, value in defaults.items():
             if key == "resources":
-                value.update(job_snapshot.get(key) or {})
-                if value != job_snapshot.get(key):
+                merged_resources.update(job_snapshot.get(key) or {})
+                if merged_resources != job_snapshot.get(key):
                     changed = True
-                job_snapshot[key] = value
+                job_snapshot[key] = merged_resources
             elif job_snapshot.get(key) is None:
                 job_snapshot[key] = value
                 changed = True

@@ -213,10 +213,11 @@ class CompletionMachine:
         transient_kind = result.transient_kind
         is_transient = transient_kind is not None
         retry_error = result.retry_error
+        max_retries = job.max_retries if job.max_retries is not None else 3
 
-        if not is_transient and job.attempt_no > job.max_retries:
+        if not is_transient and job.attempt_no > max_retries:
             logger.error(
-                f"FAIL: {uid} exceeded max retries ({job.max_retries}). "
+                f"FAIL: {uid} exceeded max retries ({max_retries}). "
                 f"Sent to failure archive."
             )
             failure_metadata: dict[str, Any] = {"error_message": ERR_MAX_RETRIES}
@@ -236,7 +237,7 @@ class CompletionMachine:
             job, job_snapshot, retry_error=retry_error, is_transient=is_transient
         )
         next_attempt = job.attempt_no if is_transient else job.attempt_no + 1
-        logger.info(f"RETRY: {uid} (attempt {next_attempt}/{job.max_retries + 1})")
+        logger.info(f"RETRY: {uid} (attempt {next_attempt}/{max_retries + 1})")
         self._store.apply_retry(
             uid,
             job_snapshot,

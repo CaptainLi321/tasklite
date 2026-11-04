@@ -217,7 +217,7 @@ class DispatchMachine:
             )
             if not should_run:
                 job_snapshot = store.state.pop_job(sched.runnable_idx)
-                attempt_id: int | None = None
+                attempt_id = None
                 try:
                     attempt_id, _ = self._open_attempt(job)
                 except Exception as e:
@@ -239,7 +239,7 @@ class DispatchMachine:
         else:
             job_snapshot = store.state.pop_job(sched.runnable_idx)
 
-        attempt_id: int | None = None
+        attempt_id = None
         try:
             attempt_id, execution_id = self._open_attempt(job)
         except Exception as e:
@@ -279,11 +279,14 @@ class DispatchMachine:
             # 原样穿透交运行循环崩溃网统一收尾。
             raise
         except KeyboardInterrupt:
-            return self._handle_interrupt(job_uid, job_snapshot)
+            self._handle_interrupt(job_uid, job_snapshot)
+            return None
         except RateLimitUnavailable as e:
-            return self._handle_rate_limit_defer(job_uid, job_snapshot, attempt_id, e)
+            self._handle_rate_limit_defer(job_uid, job_snapshot, attempt_id, e)
+            return None
         except Exception as e:
-            return self._handle_dispatch_failure(job_uid, job_snapshot, attempt_id, e)
+            self._handle_dispatch_failure(job_uid, job_snapshot, attempt_id, e)
+            return None
 
     # ── 预检关卡 ──────────────────────────────────────────────────────
 
@@ -291,7 +294,7 @@ class DispatchMachine:
         self,
         job_uid: str,
         job_snapshot: dict,
-        pending_dep_failure: str,
+        pending_dep_failure: str | None,
         *,
         attempt_id: int | None = None,
     ) -> bool:
@@ -437,7 +440,9 @@ class DispatchMachine:
                     job_context=ctx,
                     execution_id=execution_id,
                     ipc_dir=self._ipc_dir,
-                    timeout_seconds=job.timeout_seconds,
+                    timeout_seconds=float(
+                        job.timeout_seconds if job.timeout_seconds is not None else 3600.0
+                    ),
                 ))
                 lease.claim()
 

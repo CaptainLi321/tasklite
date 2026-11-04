@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Any
 
 from ..models.job import WORKER_RESOURCE
+from ..models.task import TaskRegistry
 from ..utils.jsonutil import dumps
 
 logger = logging.getLogger("tasklite")
@@ -416,14 +417,16 @@ class ResourceManager(MutableMapping[str, Resource]):
     def __init__(
         self,
         resources: Mapping[str, Resource] | None = None,
-        tasks: Mapping[str, Any] | None = None,
+        tasks: TaskRegistry | Mapping[str, Any] | None = None,
     ) -> None:
         self._resources: dict[str, Resource] = (
             dict(resources) if resources is not None else {}
         )
         # task_type → Task 规格映射（duck-typing 读 resources；
         # 规格校验单点在 models/task.py 的 Task 构造期）
-        self.tasks: Mapping[str, Any] = tasks if tasks is not None else {}
+        self.tasks: TaskRegistry | Mapping[str, Any] = (
+            tasks if tasks is not None else {}
+        )
 
     def __getitem__(self, key: str) -> Resource:
         return self._resources[key]

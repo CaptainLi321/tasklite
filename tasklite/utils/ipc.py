@@ -469,7 +469,7 @@ class ArtifactJournal:
     @staticmethod
     def resolve_and_validate_path(
         raw_path: str | Path,
-        output_roots: Path | Sequence[Path] | None = None,
+        output_roots: str | Path | Sequence[str | Path] | None = None,
         *,
         sandbox: bool = True,
     ) -> str:

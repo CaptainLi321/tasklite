@@ -495,7 +495,7 @@ class DiscoveryHandler:
                     f"Discovery full scan: {len(missing)} previously-seen "
                     f"content(s) not found this run (deleted on source?)."
                 )
-                self.on_missing(job, ctx, missing)
+                on_missing(job, ctx, missing)
         except Exception as e:
             logger.error(f"Discovery: on_missing callback failed: {e}")
 

@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import stat
+from collections.abc import Sequence
 from pathlib import Path
 
 from ..exceptions import _ArtifactIOError
@@ -32,7 +33,7 @@ class JobContext:
         success_job_uids: set | frozenset,
         failed_job_uids: set | frozenset,
         cursors: dict[str, str],
-        output_roots: Path | None = None,
+        output_roots: str | Path | Sequence[str | Path] | None = None,
         ipc_dir: str | None = None,
         transient_registry: tuple[type[BaseException], ...] = (),
         fatal_exceptions: tuple[type[BaseException], ...] | None = None,
