@@ -23,9 +23,14 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import multiprocessing as mp
 import os
+import queue
 import re
+import threading
 import time
+from dataclasses import dataclass
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import unquote
@@ -37,6 +42,337 @@ from .encoding import encode_job_uid_filename
 from .jsonutil import dump, dumps, load, loads
 
 logger = logging.getLogger("tasklite")
+
+# 管道消息种类常量
+PIPE_MSG_INPUT = "input"
+PIPE_MSG_OUTPUT = "output"
+PIPE_MSG_SUSPEND = "suspend"
+PIPE_MSG_RESULT = "result"
+VALID_PIPE_MESSAGE_KINDS = frozenset(
+    {
+        PIPE_MSG_INPUT,
+        PIPE_MSG_OUTPUT,
+        PIPE_MSG_SUSPEND,
+        PIPE_MSG_RESULT,
+    }
+)
+_PIPE_EOF = object()
+
+
+@dataclass(frozen=True)
+class WorkerPipeMessage:
+    """已校验的 worker 管道信封消息。"""
+
+    job_uid: str
+    execution_id: str
+    kind: str
+    payload: Any
+
+
+def decode_worker_pipe_message(
+    raw: bytes,
+    *,
+    expected_job_uid: str,
+    expected_execution_id: str,
+) -> WorkerPipeMessage:
+    """解析并校验单帧管道消息信封与归属身份。"""
+    try:
+        envelope = loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid worker pipe JSON frame: {exc}") from exc
+    if not isinstance(envelope, dict):
+        raise ValueError("worker pipe frame must decode to a JSON object")
+    job_uid = envelope.get("job_uid")
+    execution_id = envelope.get("execution_id")
+    kind = envelope.get("kind")
+    if job_uid != expected_job_uid:
+        raise ValueError(f"worker pipe job_uid mismatch: {job_uid!r} != {expected_job_uid!r}")
+    if execution_id != expected_execution_id:
+        raise ValueError(
+            f"worker pipe execution_id mismatch: {execution_id!r} != {expected_execution_id!r}"
+        )
+    if kind not in VALID_PIPE_MESSAGE_KINDS:
+        raise ValueError(f"unknown worker pipe message kind: {kind!r}")
+    return WorkerPipeMessage(
+        job_uid=expected_job_uid,
+        execution_id=expected_execution_id,
+        kind=kind,
+        payload=envelope.get("payload"),
+    )
+
+
+class WorkerPipeSender:
+    """Worker 侧单向管道发送端。
+
+    不变式：单连接写操作以进程内线程锁串行化；支持随 WorkerLaunchSpec
+    跨 spawn/fork 序列化传递并在子进程内重建线程锁。
+    """
+
+    def __init__(
+        self,
+        connection: Connection,
+        *,
+        job_uid: str,
+        execution_id: str,
+    ) -> None:
+        self._conn = connection
+        self.job_uid = job_uid
+        self.execution_id = execution_id
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            "conn": self._conn,
+            "job_uid": self.job_uid,
+            "execution_id": self.execution_id,
+            "closed": self._closed,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self._conn = state["conn"]
+        self.job_uid = state["job_uid"]
+        self.execution_id = state["execution_id"]
+        self._closed = state["closed"]
+        self._lock = threading.Lock()
+
+    def send_message(self, kind: str, payload: Any) -> None:
+        """编码并发送单条信封消息。"""
+        if kind not in VALID_PIPE_MESSAGE_KINDS:
+            raise ValueError(f"unknown worker pipe message kind: {kind!r}")
+        envelope = {
+            "job_uid": self.job_uid,
+            "execution_id": self.execution_id,
+            "kind": kind,
+            "payload": payload,
+        }
+        frame = dumps(envelope).encode("utf-8")
+        with self._lock:
+            if self._closed:
+                raise OSError("worker pipe sender is closed")
+            self._conn.send_bytes(frame)
+
+    def send_input(self, resolved_path: str) -> None:
+        """发送规范输入路径声明；底层管道错误转为 _ArtifactIOError。"""
+        try:
+            self.send_message(PIPE_MSG_INPUT, {"path": resolved_path})
+        except OSError as exc:
+            raise _ArtifactIOError(str(exc)) from exc
+
+    def send_output(self, declaration: ArtifactDeclaration) -> None:
+        """发送输出/缓存声明；底层管道错误转为 _ArtifactIOError。"""
+        try:
+            self.send_message(PIPE_MSG_OUTPUT, declaration.to_dict())
+        except OSError as exc:
+            raise _ArtifactIOError(str(exc)) from exc
+
+    def send_suspend(self, resource_name: str, seconds: float) -> None:
+        """发送资源挂起信号。"""
+        self.send_message(PIPE_MSG_SUSPEND, [resource_name, float(seconds)])
+
+    def send_result(self, result_dict: dict[str, Any]) -> None:
+        """发送执行结果负载。"""
+        self.send_message(PIPE_MSG_RESULT, result_dict)
+
+    def close(self) -> None:
+        """幂等关闭写端连接。"""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+
+
+class WorkerPipeReceiver:
+    """父进程侧单向管道接收端（每 worker 专用读取线程 + 有界队列）。
+
+    不变式：每个连接仅由唯一后台读取线程调用 ``recv_bytes()``，主调度线程
+    仅经有界队列非阻塞或带超时取消息；队列满时自然反压至 OS 管道缓冲区，
+    不额外开辟无限内存缓冲。
+    """
+
+    def __init__(
+        self,
+        connection: Connection,
+        *,
+        job_uid: str,
+        execution_id: str,
+        max_queued_messages: int = 64,
+    ) -> None:
+        if max_queued_messages < 1:
+            raise ValueError("max_queued_messages must be >= 1")
+        self._conn = connection
+        self.job_uid = job_uid
+        self.execution_id = execution_id
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=max_queued_messages)
+        self._stop = threading.Event()
+        self._eof = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._reader_loop,
+            name=f"tasklite-pipe-recv-{execution_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _reader_loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    raw = self._conn.recv_bytes()
+                except EOFError:
+                    break
+                except OSError as exc:
+                    if not self._stop.is_set():
+                        self._put_item(exc)
+                    break
+                if not self._put_item(raw):
+                    break
+        finally:
+            self._eof.set()
+            self._put_item(_PIPE_EOF)
+
+    def _put_item(self, item: Any) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.02)
+                return True
+            except queue.Full:
+                if item is _PIPE_EOF:
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                continue
+        return False
+
+    @property
+    def eof(self) -> bool:
+        """读取线程是否已观测到 EOF 或终止。"""
+        return self._eof.is_set()
+
+    def take_raw(self) -> list[bytes | Exception]:
+        """非阻塞取出当前已入队的全部原始帧或异常。"""
+        items: list[bytes | Exception] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is _PIPE_EOF:
+                self._eof.set()
+                break
+            items.append(item)
+        return items
+
+    def take_messages(self) -> list[WorkerPipeMessage | Exception]:
+        """非阻塞取出并解码当前已入队的全部消息（校验异常以 Exception 元素返回）。"""
+        out: list[WorkerPipeMessage | Exception] = []
+        for item in self.take_raw():
+            if isinstance(item, Exception):
+                out.append(item)
+                continue
+            try:
+                out.append(
+                    decode_worker_pipe_message(
+                        item,
+                        expected_job_uid=self.job_uid,
+                        expected_execution_id=self.execution_id,
+                    )
+                )
+            except Exception as exc:
+                out.append(exc)
+        return out
+
+    def drain_to_eof(self, timeout: float = 5.0) -> list[WorkerPipeMessage | Exception]:
+        """排空直到写端关闭触发 EOF（或超时）。"""
+        deadline = time.monotonic() + max(0.0, timeout)
+        out: list[WorkerPipeMessage | Exception] = []
+        while True:
+            out.extend(self.take_messages())
+            if self._eof.is_set():
+                out.extend(self.take_messages())
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                out.extend(self.take_messages())
+                break
+            try:
+                item = self._queue.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                continue
+            if item is _PIPE_EOF:
+                self._eof.set()
+                out.extend(self.take_messages())
+                break
+            if isinstance(item, Exception):
+                out.append(item)
+                continue
+            try:
+                out.append(
+                    decode_worker_pipe_message(
+                        item,
+                        expected_job_uid=self.job_uid,
+                        expected_execution_id=self.execution_id,
+                    )
+                )
+            except Exception as exc:
+                out.append(exc)
+        return out
+
+    def close(self, timeout: float = 3.0) -> None:
+        """幂等关闭读端连接并等待读取线程退出。
+
+        不变式：调用者必须先终止持有写端的子进程并关闭本进程残留写端句柄；
+        若写端仍存活并卡在半包写入，读取线程无法在超时内退出，此处显式抛
+        RuntimeError 暴露调用序违规。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        try:
+            self._conn.close()
+        except OSError:
+            pass
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise RuntimeError(
+                f"worker pipe receiver thread for {self.execution_id} did not exit within {timeout}s; "
+                "ensure worker process is terminated and sender handle is closed before closing receiver"
+            )
+
+
+def create_worker_pipe(
+    process_context: Any = None,
+    *,
+    job_uid: str,
+    execution_id: str,
+    max_queued_messages: int = 64,
+) -> tuple[WorkerPipeReceiver, WorkerPipeSender]:
+    """创建一对绑定的单向 (WorkerPipeReceiver, WorkerPipeSender)。"""
+    ctx = process_context if process_context is not None else mp
+    recv_conn, send_conn = ctx.Pipe(duplex=False)
+    receiver = WorkerPipeReceiver(
+        recv_conn,
+        job_uid=job_uid,
+        execution_id=execution_id,
+        max_queued_messages=max_queued_messages,
+    )
+    sender = WorkerPipeSender(
+        send_conn,
+        job_uid=job_uid,
+        execution_id=execution_id,
+    )
+    return receiver, sender
 
 # 声明/信号/结果文件的扩展名与锚定模式
 _SIGNALS_SUFFIX = ".signals.jsonl"
@@ -677,6 +1013,16 @@ class ArtifactJournal:
 __all__ = [
     "ArtifactCleanupMode",
     "ArtifactJournal",
-    "encode_raw_result",
+    "PIPE_MSG_INPUT",
+    "PIPE_MSG_OUTPUT",
+    "PIPE_MSG_RESULT",
+    "PIPE_MSG_SUSPEND",
+    "VALID_PIPE_MESSAGE_KINDS",
+    "WorkerPipeMessage",
+    "WorkerPipeReceiver",
+    "WorkerPipeSender",
+    "create_worker_pipe",
     "decode_raw_result",
+    "decode_worker_pipe_message",
+    "encode_raw_result",
 ]
