@@ -19,12 +19,12 @@
 | 提交与替换 | enqueue、ctx.spawn、filter_jobs_without_success | 部分覆盖 | 单条返回值、front 去留、显式替换；内容比较字段；过滤辅助方法是否保留；派生冲突如何导致父失败 |
 | 执行与重试 | TaskResult、Attempt、Job 四态 | 已确认方向 | Attempt 编号作用域；新结果类型的最终签名、记录结构与框架原因码 |
 | 依赖 | Job.depends_on、具名上游产物读取、governor | 部分覆盖 | 缺失与循环依赖、晚到生产者、重复 UID；历史终态与活跃候选优先级的完整矩阵；停止、取消、授权排除的交叉 |
-| 启动规则 | register_trigger、TriggerContext、内置 Trigger | 部分覆盖 | 自定义上下文最终字段；非 bool/未知名称处理；输入视图与校验时点；人工成功和档案清理对基线的影响 |
-| 选择与排序 | Selection/Exclude/Skip、OrderingPolicy | 部分覆盖 | Skip 去留与取消的关系；选择粒度；已确认按序选最靠前可执行者、不队首阻塞；排序协议参数及返回合法性；重复/遗漏候选、异常与副作用约束 |
-| 重入队节奏 | RequeuePolicy、RequeuePlan、ImmediateRequeuePolicy | 部分覆盖 | 输入包含哪些结果与预算信息；时间基准、默认值与非法返回；排空时是否还调用策略；不新增调度算法 |
-| 资源 | register_resource、Resource、CapacityResource、RateLimitResource | 部分覆盖 | 已确认主线程唯一入口、连续检查获取、多 worker 共用、查询三态、状态自管、通知且不轮询；三态类型、通知绑定/解除与等待值签名待定 |
+| 启动规则 | 内置 Trigger；现有 register_trigger/TriggerContext | 部分覆盖 | 自定义扩展不冻结；输入视图与校验时点、人工成功和档案清理对内置规则的影响待处置 |
+| 选择与排序 | Selection/Exclude/Skip、OrderingPolicy | 部分覆盖 | Skip 去留与取消的关系；选择粒度；已确认按序选最靠前可执行者、不队首阻塞；公开扩展协议暂不冻结，内部排序合法性由实现验证 |
+| 重入队节奏 | RequeuePolicy、RequeuePlan、ImmediateRequeuePolicy | 扩展暂不承诺兼容 | 保留必要内置行为，协议和内部调用由实现收敛，不作为公开扩展定稿门禁 |
+| 资源 | register_resource、Resource、CapacityResource、RateLimitResource | 部分覆盖 | 已确认主线程唯一入口、连续检查获取、多 worker 共用、查询三态、状态自管、通知且不轮询；只提供官方内置资源；三态类型与通知签名属于内部实现，不设计对外资源扩展 |
 | 资源挂起 | ctx.suspend_resource、list_suspensions；曾提议 resume_resource | 已确认删除 | 删除显式挂起接口、查询与持久化/恢复，不新增结果控制回调；资源可用性通知不属于挂起 API |
-| 文件管理 | FileSpec、declare_file/file_path、原 get_artifact_path | 已确认方向 | 默认删除参数、自定义 kind 注册、路径返回类型；本地命名访问与上游具名访问是否仍分开；可选防御入口及准确覆盖范围 |
+| 文件管理 | FileSpec/from_output、declare_file/file_path | 已确认契约 | role 三内置值、清理默认否、Path 返回、上游显式依赖统一读取、允许路径重叠、不自动创建、删除缺失目标视为完成；无文件扩展或 handler 沙箱 |
 | handler 读状态 | has_succeeded/has_failed/succeeded_or_failed_job_uids | 待系统分析 | 派发快照还是实时视图；人工成功、活跃候选遮蔽；是否暴露完整集合；与 StateSnapshot 保持语义一致 |
 | 游标 | ctx.get_cursor/set_cursor、seed_cursor | 部分覆盖 | 键空间、值类型、None 删除、同键多任务成功提交；本地读自己未提交写入；预填是覆盖还是仅不存在时写入 |
 | 查询 | StateSnapshot、现有 list_failures/list_suspensions | 部分覆盖 | 原门面查询去留；记录形状、缺失值、过滤分页；授权查询；快照关闭后的访问边界 |
@@ -67,7 +67,7 @@ ADR 新增而当前尚未实现的 make_job_uid、parse_job_uid、TaskResult、F
 ## 已确认的兼容范围
 
 1. **常用 Interface**：编排、规格与实例、handler 上下文及结果、文件声明、只读记录、明确的管理操作，纳入稳定基线。
-2. **显式扩展 Seam**：Trigger、Selection、OrderingPolicy、RequeuePolicy、资源扩展纳入稳定基线；具体签名仍须冻结。只承诺官方 SQLite／内存后端使用接口，不冻结第三方后端协议。
+2. **本版收缩范围**：不设计或冻结资源扩展，不提供文件扩展，调度扩展暂不承诺兼容、不作为定稿门禁。内部保留抽象和 Seam；常用内置能力仍需明确行为。只承诺官方 SQLite／内存后端使用接口，不冻结第三方后端协议。
 3. **可选工具**：HTTP、Discovery、测试辅助等本版本暂不保证兼容，文档必须标注。需要适配新核心，但不把这些工具的全面接口冻结作为本轮门禁。
 4. **身份工具例外**：make_job_uid／parse_job_uid 与 Job.uid 纳入稳定接口，本轮先完成可读性简化。旧编码工具逐个核查用途；纯文件 IPC／逐 Job 锁用途移除，不将文件名字符或长度规则带进公开身份。
 5. **内部 Implementation**：运行账目、注册表装配、调度状态机、底层事务校验器、可变容器不自动承诺稳定；仍需逐名整理导出清单。
@@ -80,9 +80,9 @@ ADR 新增而当前尚未实现的 make_job_uid、parse_job_uid、TaskResult、F
 
 ## 讨论与验收顺序
 
-1. 完成导出分层和保留/调整/删除清单；每项落实唯一导入路径和承诺级别。
+1. 完成导出分层和保留/调整/删除清单；每项落实唯一导入路径和承诺级别；不为已撤出本版的扩展接口继续冻结签名。
 2. 注册、初始化与校验：用重复注册、未知 Task、坏 payload、显式覆盖、初始化失败五类场景验证。
-3. 依赖、资源及调度协议：覆盖无解依赖/资源、扩展异常直接失败、正常停止排空、重试节奏及定时/主动通知唤醒。
+3. 内置依赖、资源及调度行为：覆盖无解依赖/资源、扩展异常直接失败、正常停止排空、重试节奏及定时/主动通知唤醒。
 4. handler 读取、游标、查询和管理：使用同 UID 活跃候选/旧档案、人工成功、清除档案、并发游标提交验证。
 5. 官方后端完善使用接口；Discovery、HTTP、测试工具完成新核心适配，不要求可选工具本轮接口冻结，也不引入第二套隐式结果协议。
 6. 汇总最终签名表：导入路径、参数/默认值、返回值、错误、允许调用阶段、副作用、持久化/恢复含义及最小验收场景。最后再做跨功能审查。
