@@ -15,14 +15,14 @@
 | 功能 | 源码入口 | 本轮覆盖 | 冻结前要回答的问题 |
 | --- | --- | --- | --- |
 | 初始化与生命周期 | TaskLite.__init__/run/stop/is_running；目标 close | 部分覆盖 | 参数默认值与位置参数；初始化副作用及失败后资源释放；重复运行、关闭；多线程调用边界 |
-| 注册与模型 | register_task、Task、Job、TaskRegistry | 部分覆盖 | 重复注册沿用何种错误；未知 Task 的拒绝时点；配置继承、payload_schema 校验、None 哨兵及 JSON 类型；快照字段与业务构造字段分离 |
+| 注册与模型 | register_task、Task、Job、TaskRegistry | 部分覆盖 | 重复注册禁止、可确定的提交错误立即拒绝已确认；具体错误类型及配置继承、payload_schema 校验、None 哨兵及 JSON 类型；快照字段与业务构造字段分离 |
 | 提交与替换 | enqueue、ctx.spawn、filter_jobs_without_success | 部分覆盖 | 单条返回值、front 去留、显式替换；内容比较字段；过滤辅助方法是否保留；派生冲突如何导致父失败 |
 | 执行与重试 | TaskResult、Attempt、Job 四态 | 已确认方向 | Attempt 编号作用域；新结果类型的最终签名、记录结构与框架原因码 |
 | 依赖 | Job.depends_on、具名上游产物读取、governor | 部分覆盖 | 缺失与循环依赖、晚到生产者、重复 UID；历史终态与活跃候选优先级的完整矩阵；停止、取消、授权排除的交叉 |
 | 启动规则 | register_trigger、TriggerContext、内置 Trigger | 部分覆盖 | 自定义上下文最终字段；非 bool/未知名称处理；输入视图与校验时点；人工成功和档案清理对基线的影响 |
-| 选择与排序 | Selection/Exclude/Skip、OrderingPolicy | 部分覆盖 | Skip 去留与取消的关系；选择粒度；排序协议参数及返回合法性；重复/遗漏候选、异常与副作用约束 |
+| 选择与排序 | Selection/Exclude/Skip、OrderingPolicy | 部分覆盖 | Skip 去留与取消的关系；选择粒度；已确认按序选最靠前可执行者、不队首阻塞；排序协议参数及返回合法性；重复/遗漏候选、异常与副作用约束 |
 | 重入队节奏 | RequeuePolicy、RequeuePlan、ImmediateRequeuePolicy | 部分覆盖 | 输入包含哪些结果与预算信息；时间基准、默认值与非法返回；排空时是否还调用策略；不新增调度算法 |
-| 资源 | register_resource、Resource、CapacityResource、RateLimitResource | 部分覆盖 | 已确认模板按键覆盖、统一查询/获取/释放、无类型特判、一次计时与主动通知且不轮询；通知绑定/解除与等待值最终签名、持久化边界待定 |
+| 资源 | register_resource、Resource、CapacityResource、RateLimitResource | 部分覆盖 | 已确认主线程唯一入口、连续检查获取、多 worker 共用、查询三态、状态自管、通知且不轮询；三态类型、通知绑定/解除与等待值签名待定 |
 | 资源挂起 | ctx.suspend_resource、list_suspensions；曾提议 resume_resource | 已确认删除 | 删除显式挂起接口、查询与持久化/恢复，不新增结果控制回调；资源可用性通知不属于挂起 API |
 | 文件管理 | FileSpec、declare_file/file_path、原 get_artifact_path | 已确认方向 | 默认删除参数、自定义 kind 注册、路径返回类型；本地命名访问与上游具名访问是否仍分开；可选防御入口及准确覆盖范围 |
 | handler 读状态 | has_succeeded/has_failed/succeeded_or_failed_job_uids | 待系统分析 | 派发快照还是实时视图；人工成功、活跃候选遮蔽；是否暴露完整集合；与 StateSnapshot 保持语义一致 |
@@ -31,12 +31,12 @@
 | 管理与历史 | retry_failure、clear_failures、clear_history、seed_successes；目标取消 | 部分覆盖 | 返回值和冲突矩阵；清除终态是否保留 Attempt；人工成功与队列冲突；删除历史对 Trigger、依赖和 Discovery 的影响 |
 | 事件与统计 | on_run_start/on_attempt_finished/on_run_end、RunSummary/RunStats | 部分覆盖 | Run 起止事件的最终参数和时机；启动前失败/排空再异常是否发结束事件；统计累计范围、级联与恢复计数、ExitReason 成员 |
 | 错误与验证 | exceptions、ErrorClassifier、ERR_*、ValidationResult | 部分覆盖 | 自动异常重试已撤销后哪些符号删除；框架错误公开类型；原因码与消息边界；payload 校验是否保留独立工具 |
-| 进程执行条件 | strict_picklable、handler、worker 启动与超时 | 部分覆盖 | 支持的 callable/payload/平台组合及验证时点；超时包含哪些阶段；信号安装选项；外部程序进程树边界，不承诺 OS 沙箱 |
-| 后端 | AbstractStateBackend、SQLiteStateBackend、InMemoryStateBackend、backend 属性 | 待系统分析 | 用户自定义后端是否正式支持；注入、所有权及关闭；内存模式与 StateSnapshot；新事务协议的一致性 |
-| Discovery | register_discovery、DiscoveryHandler 及三协议 | 待系统分析 | 全页命中、截断、坏项、on_missing；人工成功/取消失败/档案清除如何影响已见；多子任务整体接受后的行为 |
-| HTTP | HttpPolicy/HttpExecutor/guard 系列、响应、缓存、fetch | 待系统分析 | 不靠异常隐式重试的易用接法；请求内部重试与 Job 重试关系；删除自动资源挂起；响应缓存的身份/有效性；是否保留多个包装入口 |
-| 测试与辅助函数 | fake_ctx/running、job_ref/progress_hook/slice_list | 待系统分析 | 稳定测试入口与内部守卫工具区分；模拟授权往返和副作用；hook 新事件适配；避免依赖内部结构 |
-| 标识与序列化工具 | encode_*、content_fingerprint、percent_encode、jsonutil | 待系统分析 | 哪些继续公开；算法输出属于持久身份契约；JSON 类型与异常行为；不能以清理导出为由改变既有身份编码 |
+| 进程执行条件 | strict_picklable、handler、worker 启动与超时 | 部分覆盖 | 支持的 callable/payload/平台组合及验证时点；已确认启动至有效结果的单次执行超时、不等待进程退出才结算；信号安装选项；外部程序进程树边界，不承诺 OS 沙箱 |
+| 后端 | AbstractStateBackend、SQLiteStateBackend、InMemoryStateBackend、backend 属性 | 部分覆盖 | 仅官方 SQLite/内存使用接口稳定，第三方协议不冻结；注入、所有权及关闭、内存模式与 StateSnapshot 接法待定 |
+| Discovery | register_discovery、DiscoveryHandler 及三协议 | 可选工具，暂不承诺兼容 | 全页命中、截断、坏项、on_missing；人工成功/取消失败/档案清除如何影响已见；多子任务整体接受后的行为 |
+| HTTP | HttpPolicy/HttpExecutor/guard 系列、响应、缓存、fetch | 可选工具，暂不承诺兼容 | 不靠异常隐式重试的易用接法；请求内部重试与 Job 重试关系；删除自动资源挂起；响应缓存的身份/有效性；是否保留多个包装入口 |
+| 测试与辅助函数 | fake_ctx/running、job_ref/progress_hook/slice_list | 可选工具，暂不承诺兼容 | 当前旧文档的稳定承诺在新基线切换时同步调整；模拟授权往返和副作用；hook 新事件适配；避免依赖内部结构 |
+| 标识与序列化工具 | encode_*、content_fingerprint、percent_encode、jsonutil；目标 make_job_uid/parse_job_uid | 部分覆盖 | 已确认透明可逆身份接口及取消文件名约束；本轮允许破坏性简化，新基线输出稳定；旧工具逐项去留与 JSON 契约待定 |
 | 版本与文档 | 包导出、GUIDE、Schema/发布窗口 | 部分覆盖 | 新基线版本、记录格式支持窗口、弃用规则、官方子模块导入路径、每个公开接口的类型提示与文档 |
 
 ## 当前 TaskLite 面逐项登记
@@ -62,18 +62,21 @@
 | run_graceful | 删除 |
 | 当前构造器暴露的 tasks/resources/classifier/runtime_config 等属性 | 内部可变状态不成为稳定 Interface；仍需逐名迁移/删除清单 |
 
-ADR 新增而当前尚未实现的 TaskResult、FileSpec、StateSnapshot、close、取消、路径授权查询/撤销也必须进入最终签名表。不能只盘点旧方法而漏掉新承诺。
+ADR 新增而当前尚未实现的 make_job_uid、parse_job_uid、TaskResult、FileSpec、StateSnapshot、close、取消、路径授权查询/撤销也必须进入最终签名表。不能只盘点旧方法而漏掉新承诺。
 
-## 本轮优先裁决的兼容范围
+## 已确认的兼容范围
 
-下列是建议，不是已经接受的导出决定：
+1. **常用 Interface**：编排、规格与实例、handler 上下文及结果、文件声明、只读记录、明确的管理操作，纳入稳定基线。
+2. **显式扩展 Seam**：Trigger、Selection、OrderingPolicy、RequeuePolicy、资源扩展纳入稳定基线；具体签名仍须冻结。只承诺官方 SQLite／内存后端使用接口，不冻结第三方后端协议。
+3. **可选工具**：HTTP、Discovery、测试辅助等本版本暂不保证兼容，文档必须标注。需要适配新核心，但不把这些工具的全面接口冻结作为本轮门禁。
+4. **身份工具例外**：make_job_uid／parse_job_uid 与 Job.uid 纳入稳定接口，本轮先完成可读性简化。旧编码工具逐个核查用途；纯文件 IPC／逐 Job 锁用途移除，不将文件名字符或长度规则带进公开身份。
+5. **内部 Implementation**：运行账目、注册表装配、调度状态机、底层事务校验器、可变容器不自动承诺稳定；仍需逐名整理导出清单。
 
-1. **常用 Interface**：编排、规格与实例、handler 上下文及结果、文件声明、只读记录、明确的管理操作。
-2. **显式扩展 Seam**：Trigger、Selection、OrderingPolicy、RequeuePolicy、资源扩展；协议与默认 Adapter 分开记录。后端是否属于外部扩展必须单独裁决。
-3. **可选工具**：HTTP、Discovery、测试辅助与编码工具按公开子模块维护。官方公开工具仍需要兼容，不用“不从根包导出”规避承诺。
-4. **内部 Implementation**：运行账目、注册表装配、调度状态机、底层事务校验器、可变资源容器。建议不承诺用户直接调用或修改；具体类型逐项裁决，不在审计阶段删除。
+## 已收束的生命周期决定
 
-最先需要用户裁决：是否采用上述分层；是否正式支持第三方后端；是否保留现有身份编码工具为稳定工具面。它们决定后续需要设计哪些协议，不能在最终发布时隐式选择。
+收到完整有效结果即开始结算，不等待 worker 退出，不将 failure/retry 或无结果退出当作成功。正常收尾采用校验、清理、资源释放、原子提交、完成事件的顺序，期间不插入新派发。执行超时从 worker 启动计至有效结果到达；正常停止排空，框架扩展异常直接使 Run 失败。
+
+资源仅由主线程唯一入口管理，同一资源可以供多个 worker 使用；不引入跨执行器竞争、try_acquire 或预留协议。worker 逐 Job 锁已决定删除，保留状态库级执行／管理互斥。上述是已接受决定，不再作为待选设计反复讨论。
 
 ## 讨论与验收顺序
 
@@ -81,7 +84,7 @@ ADR 新增而当前尚未实现的 TaskResult、FileSpec、StateSnapshot、close
 2. 注册、初始化与校验：用重复注册、未知 Task、坏 payload、显式覆盖、初始化失败五类场景验证。
 3. 依赖、资源及调度协议：覆盖无解依赖/资源、扩展异常直接失败、正常停止排空、重试节奏及定时/主动通知唤醒。
 4. handler 读取、游标、查询和管理：使用同 UID 活跃候选/旧档案、人工成功、清除档案、并发游标提交验证。
-5. Discovery、HTTP、后端和测试工具：逐个确定与新核心契约的接法，不引入第二套隐式结果协议。
+5. 官方后端完善使用接口；Discovery、HTTP、测试工具完成新核心适配，不要求可选工具本轮接口冻结，也不引入第二套隐式结果协议。
 6. 汇总最终签名表：导入路径、参数/默认值、返回值、错误、允许调用阶段、副作用、持久化/恢复含义及最小验收场景。最后再做跨功能审查。
 
 Discovery 当前明确采用成功/失败快照作为已见集合，不维护扫描游标。应分析它与档案管理的耦合，而不是为它补造游标推进机制。HTTP 响应缓存与 FileSpec.cache 也不能仅因同名就假定相同生命周期。
