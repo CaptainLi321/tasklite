@@ -18,7 +18,7 @@ from pathlib import Path
 from ..exceptions import _ArtifactIOError
 from ..utils.ipc import ArtifactJournal, WorkerPipeSender
 from ..utils.jsonutil import dumps
-from .artifact import ArtifactDeclaration
+from .artifact import ArtifactDeclaration, resolve_job_files_config
 from .job import Job
 
 logger = logging.getLogger("tasklite")
@@ -41,9 +41,15 @@ class JobContext:
         resource_names: frozenset | set | None = None,
         artifact_descriptions: dict[str, dict[str, dict[str, str]]] | None = None,
         protected_roots: tuple[str | Path, ...] = (),
+        base_dir: str | Path | None = None,
     ):
         self._artifact_descriptions = copy.deepcopy(artifact_descriptions or {})
         self._protected_roots = tuple(protected_roots)
+        self.base_dir: Path = (
+            Path(os.path.abspath(os.fspath(base_dir)))
+            if base_dir is not None
+            else Path(os.path.abspath(os.getcwd()))
+        )
         self._pipe_sender: WorkerPipeSender | None = None
         self.job = job
         self.spawned_jobs: list[Job] = []
@@ -97,21 +103,26 @@ class JobContext:
             self._journal_instance.bind_pipe_sender(sender)
 
     def spawn(self, job: Job) -> None:
-        """入队一个子 job。
-
-        在子进程内立即预检 JSON 可序列化性（与 enqueue 的序列化预检对齐）。
-        坏 payload 在此抛 ValueError → handler 异常 → 父作业进失败档案，
-        而不是在 commit 阶段才崩掉整个 run。
-        """
+        """入队一个子 job（捕获固定路径基准下的独立快照并预检依赖引用与 JSON 序列化性）。"""
+        if not isinstance(job, Job):
+            raise TypeError(
+                f"spawn() expects a Job, got {type(job).__name__}"
+            )
+        job_dict = job.to_dict()
+        job_dict["files"] = resolve_job_files_config(
+            job_dict.get("files"),
+            base_dir=self.base_dir,
+            depends_on=job_dict.get("depends_on") or (),
+        )
         try:
             # allow_nan=False——默认 allow_nan=True 会让
             # float('inf')/float('nan') 通过预检，产出非标准 JSON "Infinity"。
-            dumps(job.to_dict())
+            dumps(job_dict)
         except (TypeError, ValueError) as e:
             raise ValueError(
                 f"Payload for spawned job {job.uid} is not JSON-serializable: {e}"
             ) from e
-        self.spawned_jobs.append(job)
+        self.spawned_jobs.append(Job.from_dict(job_dict))
 
     def declare_output(
         self, path: str | Path, *, name: str | None = None,

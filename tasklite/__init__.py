@@ -31,6 +31,7 @@ from .pipeline import TaskLite
 from .selection import Exclude, Selection, Skip
 
 # ── 模型层：规格 / 实例 / 轨迹 / 上下文 ──────────────────────────────
+from .models.artifact import FileSpec
 from .models.attempt import AttemptRecord
 from .models.context import JobContext
 from .models.trigger import TriggerContext
@@ -140,6 +141,7 @@ __all__ = [
     "Skip",
     # 模型层
     "AttemptRecord",
+    "FileSpec",
     "Job",
     "JobContext",
     "TriggerContext",

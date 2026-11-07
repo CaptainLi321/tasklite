@@ -505,7 +505,7 @@ class TestEnqueue:
         assert len(p.backend.load_queue()) == 1
 
     def test_same_uid_different_effective_config_raises_tasklite_error(self, tmp_path):
-        from tasklite import TaskLiteError
+        from tasklite import FileSpec, TaskLiteError
 
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler, resources={"gpu": 1.0})
@@ -513,7 +513,7 @@ class TestEnqueue:
         for conflicting_job in (
             Job("fetch", "a", payload={"x": 2}),
             Job("fetch", "a", payload={"x": 1}, depends_on=["fetch::dep"]),
-            Job("fetch", "a", payload={"x": 1}, files={"out": "p"}),
+            Job("fetch", "a", payload={"x": 1}, files={"out": FileSpec("p", role="output")}),
             Job("fetch", "a", payload={"x": 1}, resources={"gpu": 2.0}),
             Job("fetch", "a", payload={"x": 1}, max_retries_per_run=0),
             Job("fetch", "a", payload={"x": 1}, timeout_seconds=10),
@@ -550,6 +550,147 @@ class TestEnqueue:
         (row,) = p.backend.load_queue()
         assert row["payload"] == {"nested": {"items": [1, 2]}}
         assert row["resources"] == {"cpu": 2.0, "gpu": 1.0, "__workers__": 1.0}
+
+    def test_enqueue_resolves_relative_files_against_fixed_instance_base_dir(
+        self, tmp_path, monkeypatch
+    ):
+        from tasklite import FileSpec
+
+        dir_a = tmp_path / "workspace_a" / "proj"
+        dir_b = tmp_path / "workspace_b"
+        dir_a.mkdir(parents=True)
+        dir_b.mkdir(parents=True)
+
+        monkeypatch.chdir(dir_a)
+        p = make_pipeline(tmp_path / "state")
+        p.register_task("fetch", ok_handler)
+
+        # 实例创建后改变主进程工作目录，enqueue 仍使用创建 TaskLite 时的固定基准
+        monkeypatch.chdir(dir_b)
+        job = Job(
+            "fetch",
+            "a",
+            files={
+                "out": FileSpec("results/out.csv", role="output"),
+                "ext": FileSpec("../shared/in.csv", role="input"),
+            },
+        )
+        assert p.enqueue(job) is True
+        job.files["extra"] = FileSpec("other.txt", role="cache")
+
+        (row,) = p.backend.load_queue()
+        assert row["files"] == {
+            "out": {
+                "path": str(dir_a / "results" / "out.csv"),
+                "role": "output",
+                "delete_existing": False,
+                "delete_on_failure": False,
+                "delete_on_success": False,
+            },
+            "ext": {
+                "path": str(dir_a.parent / "shared" / "in.csv"),
+                "role": "input",
+                "delete_existing": False,
+                "delete_on_failure": False,
+                "delete_on_success": False,
+            },
+        }
+        # 等价的已解析绝对路径声明幂等去重返回 False
+        equivalent = Job(
+            "fetch",
+            "a",
+            files={
+                "out": FileSpec(dir_a / "results" / "out.csv", role="output"),
+                "ext": FileSpec(dir_a.parent / "shared" / "in.csv", role="input"),
+            },
+        )
+        assert p.enqueue(equivalent) is False
+
+    def test_from_output_requires_direct_dependency_and_keeps_reference_at_submission(
+        self, tmp_path, monkeypatch
+    ):
+        from tasklite import FileSpec, JobContext, TaskLiteError
+
+        p = make_pipeline(tmp_path)
+        p.register_task("generate", ok_handler)
+        p.register_task("process", ok_handler)
+        # 即使存在历史成功产物，提交时仍保留引用配置而不绑定历史路径
+        p.backend.commit_job_success(
+            "generate::001",
+            {"artifacts": {"report": {"path": str(tmp_path / "old_report.csv")}}},
+        )
+
+        missing_dep = Job(
+            "process",
+            "001",
+            files={"src": FileSpec.from_output("generate::001", "report", role="input")},
+        )
+        with pytest.raises(TaskLiteError, match="depends_on"):
+            p.enqueue(missing_dep)
+        assert p.backend.load_queue() == []
+
+        valid_consumer = Job(
+            "process",
+            "001",
+            depends_on=["generate::001"],
+            files={"src": FileSpec.from_output("generate::001", "report", role="input")},
+        )
+        assert p.enqueue(valid_consumer) is True
+        (queued,) = p.backend.load_queue()
+        assert queued["files"] == {
+            "src": {
+                "producer_uid": "generate::001",
+                "output_name": "report",
+                "role": "input",
+                "delete_existing": False,
+                "delete_on_failure": False,
+                "delete_on_success": False,
+            }
+        }
+
+        # ctx.spawn 同样使用固定基准并校验直接依赖与快照隔离
+        base_dir = tmp_path / "fixed_base"
+        other_dir = tmp_path / "worker_cwd"
+        base_dir.mkdir()
+        other_dir.mkdir()
+        ctx = JobContext(
+            Job("generate", "001"),
+            frozenset(),
+            frozenset(),
+            {},
+            base_dir=base_dir,
+        )
+        monkeypatch.chdir(other_dir)
+        with pytest.raises(TaskLiteError, match="depends_on"):
+            ctx.spawn(
+                Job(
+                    "process",
+                    "002",
+                    files={"src": FileSpec.from_output("generate::001", "report", role="input")},
+                )
+            )
+        assert ctx.spawned_jobs == []
+
+        child = Job(
+            "process",
+            "002",
+            depends_on=["generate::001"],
+            files={
+                "src": FileSpec.from_output("generate::001", "report", role="input"),
+                "out": FileSpec("out/result.csv", role="output"),
+            },
+        )
+        ctx.spawn(child)
+        child.files["mutated"] = FileSpec("mut.txt", role="cache")
+        assert len(ctx.spawned_jobs) == 1
+        spawned = ctx.spawned_jobs[0]
+        assert set(spawned.files.keys()) == {"src", "out"}
+        assert spawned.files["src"] == FileSpec.from_output(
+            "generate::001", "report", role="input"
+        )
+        assert spawned.files["out"] == FileSpec(
+            base_dir / "out" / "result.csv", role="output"
+        )
 
     def test_pending_recovery_across_runs_preserves_accepted_snapshot(self, tmp_path, monkeypatch):
         """跨次恢复 pending 不套用新 Task 默认。"""

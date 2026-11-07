@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -130,6 +131,7 @@ class TaskLite:
         deadlock_gap_max_rounds: int | None = None,
     ) -> None:
         self.name = _validate_pipeline_name(name)
+        self.base_dir: Path = Path(os.path.abspath(os.getcwd()))
         self.state_dir = self._prepare_state_dir(state_dir)
         self.output_roots = self._resolve_output_roots(output_roots)
         # 构造期局部搬运：backend 实例只向 RunConfig（装配快照）与
@@ -139,7 +141,11 @@ class TaskLite:
         # 注册表按引用共享；运行期守卫限制配置变更窗口。
         self.tasks = TaskRegistry()
         from .triggers import BUILTIN_TRIGGER_FUNCTIONS
-        self._triggers = TriggerRegistry(tasks=self.tasks, functions=BUILTIN_TRIGGER_FUNCTIONS)
+        self._triggers = TriggerRegistry(
+            tasks=self.tasks,
+            functions=BUILTIN_TRIGGER_FUNCTIONS,
+            base_dir=self.base_dir,
+        )
         self.classifier = self._build_classifier(fatal_exceptions, transient_exceptions)
         self.resources = self._build_resources(self.tasks, max_workers)
         self.ipc_dir, self._process_context = self._prepare_ipc_dir()

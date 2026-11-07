@@ -342,7 +342,7 @@ class CompletionMachine:
         for spawned_job in unique_spawned_jobs:
             try:
                 spawned_job_snapshots.append(store.normalize_spawned_job(spawned_job))
-            except ValueError as err:
+            except (ValueError, Exception) as err:
                 self._reject_spawned_job(spawned_job, err)
         logger.debug(f"Spawned {len(spawned_job_snapshots)} jobs for {parent_uid}.")
         return spawned_job_snapshots

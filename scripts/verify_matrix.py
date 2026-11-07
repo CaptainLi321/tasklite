@@ -10,7 +10,7 @@ if str(REPO_ROOT) not in sys.path:
 # 1. 基础模块与类型求值验证
 import tasklite
 from tasklite import (
-    TaskLite, Job, JobContext, RetryError, FatalError, PipelineError, RateLimitHit,
+    TaskLite, Job, JobContext, FileSpec, RetryError, FatalError, PipelineError, RateLimitHit,
     CapacityResource, RateLimitResource, Resource, FailureEntry,
     job_ref, progress_hook, slice_list, content_fingerprint,
     encode_job_component, encode_identifier, encode_content_id, encode_job_uid_filename

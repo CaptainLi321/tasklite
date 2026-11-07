@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ..backend.base import AbstractStateBackend
@@ -125,6 +126,7 @@ class StateStore:
         stats: Any | None = None,
         trigger_registry: TriggerRegistry | None = None,
         requeue_policy: RequeuePolicy | None = None,
+        base_dir: str | Path | None = None,
     ) -> None:
         self._backend = backend
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
@@ -132,7 +134,11 @@ class StateStore:
         self._classifier = classifier if classifier is not None else ErrorClassifier()
         self._on_attempt_finished = on_attempt_finished
         self._stats = stats
-        self._trigger_registry = trigger_registry if trigger_registry is not None else TriggerRegistry()
+        self._trigger_registry = (
+            trigger_registry
+            if trigger_registry is not None
+            else TriggerRegistry(base_dir=base_dir)
+        )
         # 重试节奏唯一出口：核心不做任何节奏计算，默认立即重入队。
         self._requeue_policy = (
             requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
@@ -140,6 +146,11 @@ class StateStore:
         # 执行选择（终态写入出口的排除闸门）：None = 不过滤；
         # 由 EngineRuntime 在 run 启动期单点注入，与调度器同一事实源。
         self._selection: Selection | None = None
+
+    @property
+    def base_dir(self) -> Path:
+        """当前实例固定的相对路径解析基准目录。"""
+        return self._trigger_registry.base_dir
 
     # ── 统计与事件钩子 ────────────────────────────────────────────────
 

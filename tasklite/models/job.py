@@ -25,6 +25,7 @@ from typing import Any
 
 from ..exceptions import TaskLiteError
 from ..utils.encoding import make_job_uid
+from .artifact import FileSpec, coerce_file_spec, parse_job_files_config
 from .task import (
     validate_resource_amounts,
     validate_retry_budget,
@@ -171,21 +172,11 @@ def _normalize_payload(payload: Any) -> dict[str, Any]:
     return copy.deepcopy(payload) if payload else {}
 
 
-def _normalize_files(files: Any) -> dict[str, Any]:
-    """files 入口校验与规范化：仅接受 dict[str, Any] 或 None，深拷贝隔离外部变异。"""
-    if files is not None and not isinstance(files, dict):
-        raise TypeError(
-            f"files must be a dict or None, got {type(files).__name__} ({files!r})"
-        )
-    if not files:
-        return {}
-    for key in files:
-        if not isinstance(key, str) or not key:
-            raise TypeError(
-                f"file key in files must be a non-empty str, "
-                f"got {type(key).__name__} ({key!r})"
-            )
-    return copy.deepcopy(files)
+def _normalize_files(
+    files: Any, *, allow_dict: bool = False
+) -> dict[str, FileSpec]:
+    """files 入口校验与规范化：仅接受 dict[str, FileSpec] 或 None，构造独立映射。"""
+    return parse_job_files_config(files, allow_dict=allow_dict)
 
 
 def _normalize_resources(resources: Any) -> dict[str, float]:
@@ -283,7 +274,7 @@ class Job:
         *,
         payload: dict[str, Any] | None = None,
         depends_on: Sequence[str] | None = None,
-        files: dict[str, Any] | None = None,
+        files: dict[str, FileSpec] | None = None,
         resources: dict[str, float] | None = None,
         max_retries_per_run: int | None = None,
         timeout_seconds: int | float | None = None,
@@ -298,7 +289,7 @@ class Job:
 
         self.payload = _normalize_payload(payload)
         self.depends_on = _normalize_depends_on(depends_on)
-        self.files = _normalize_files(files)
+        self.files = _normalize_files(files, allow_dict=False)
         self.resources = None if resources is None else _normalize_resources(resources)
         if max_retries_per_run is not None:
             validate_retry_budget(max_retries_per_run)
@@ -335,12 +326,13 @@ class Job:
         first_enqueued_at: str | None = None,
     ) -> Job:
         """内部私有恢复入口：重建 Job 并挂载运行期实例位与边带状态。"""
+        restored_files = _normalize_files(files, allow_dict=True)
         job = cls(
             task_type,
             job_id,
             payload=payload,
             depends_on=depends_on,
-            files=files,
+            files=restored_files,
             resources=resources,
             max_retries_per_run=max_retries_per_run,
             timeout_seconds=timeout_seconds,
@@ -368,15 +360,18 @@ class Job:
             self._runtime = JobRuntimeState.from_dict(value)
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化 job 为字典（payload/files 深拷贝、resources/depends_on 浅拷贝，
-        防外部就地变异内部状态）；``runtime`` 子 dict 显式保留——边带状态集中
-        序列化，不散装丢失。"""
+        """序列化 job 为字典（payload 深拷贝、files 导出 FileSpec JSON 字典、
+        resources/depends_on 浅拷贝，防外部就地变异内部状态）；``runtime``
+        子 dict 显式保留——边带状态集中序列化，不散装丢失。"""
         return {
             "task_type": self.task_type,
             "job_id": self.job_id,
             "payload": copy.deepcopy(self.payload),
             "depends_on": list(self.depends_on),
-            "files": copy.deepcopy(self.files),
+            "files": {
+                name: coerce_file_spec(spec, allow_dict=True).to_dict()
+                for name, spec in _normalize_files(self.files, allow_dict=True).items()
+            },
             "resources": None if self.resources is None else dict(self.resources),
             "max_retries_per_run": self.max_retries_per_run,
             "timeout_seconds": self.timeout_seconds,

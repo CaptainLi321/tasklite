@@ -4,9 +4,12 @@ from __future__ import annotations
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 
+from ..models.artifact import resolve_job_files_config
 from ..models.job import Job
 from ..models.task import TaskRegistry, validate_trigger
 from ..models.trigger import TriggerContext
@@ -94,9 +97,15 @@ class TriggerRegistry:
         *,
         tasks: TaskRegistry | None = None,
         functions: Mapping[str, Callable[[TriggerContext], bool]] | None = None,
+        base_dir: str | Path | None = None,
     ) -> None:
         self.tasks = tasks
         self.functions = dict(functions or {})
+        self.base_dir: Path = (
+            Path(os.path.abspath(os.fspath(base_dir)))
+            if base_dir is not None
+            else Path(os.path.abspath(os.getcwd()))
+        )
 
     def register(self, name: str, fn: Callable[[TriggerContext], bool]) -> None:
         validate_trigger(name)
@@ -107,7 +116,7 @@ class TriggerRegistry:
         self.functions[name] = fn
 
     def normalize_job_snapshot(self, job_snapshot: dict, task_type: str) -> bool:
-        """摄入时落实 Task 四项规格，显式资源键覆盖模板默认（空 dict 不清空默认）。"""
+        """摄入时落实 Task 四项规格与 FileSpec 快照解析（普通路径按固定基准绝对化、校验上游引用直接依赖）。"""
         task = self.tasks.get(task_type) if self.tasks is not None else None
         merged_resources: dict[str, float] = (
             dict(task.resources) if task and task.resources else {}
@@ -138,11 +147,15 @@ class TriggerRegistry:
             changed = True
         else:
             job_snapshot["depends_on"] = list(job_snapshot["depends_on"])
-        if job_snapshot.get("files") is None:
-            job_snapshot["files"] = {}
+        raw_files = job_snapshot.get("files")
+        normalized_files = resolve_job_files_config(
+            raw_files,
+            base_dir=self.base_dir,
+            depends_on=job_snapshot["depends_on"],
+        )
+        if raw_files is None or normalized_files != raw_files:
             changed = True
-        else:
-            job_snapshot["files"] = copy.deepcopy(job_snapshot["files"])
+        job_snapshot["files"] = normalized_files
         return changed
 
     def admit(

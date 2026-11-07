@@ -475,6 +475,7 @@ class DispatchMachine:
             transient_exceptions=self._classifier.transient_exceptions,
             resource_names=frozenset(self._resources),
             protected_roots=self._protected_roots,
+            base_dir=self._trigger_registry.base_dir,
             artifact_descriptions={
                 uid: state.successes[uid].get("artifacts", {})
                 for uid in job.depends_on if uid in state.success_uids

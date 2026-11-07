@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from tasklite.exceptions import TaskLiteError
+from tasklite.models.artifact import FileSpec
 from tasklite.models.job import (
     Job,
     JobRuntimeState,
@@ -42,12 +43,13 @@ class TestJobCreation:
 
     def test_create_with_all_fields(self):
         """公开构造全字段显式构造。"""
+        out_spec = FileSpec("/tmp/1.jpg", role="output")
         job = Job(
             task_type="download",
             job_id="img_001",
             payload={"url": "https://example.com/1.jpg"},
             depends_on=["parent_job"],
-            files={"output": "/tmp/1.jpg"},
+            files={"output": out_spec},
             resources={"api": 1.0, "disk": 2.5},
             max_retries_per_run=5,
             timeout_seconds=7200,
@@ -55,7 +57,7 @@ class TestJobCreation:
         )
         assert job.payload == {"url": "https://example.com/1.jpg"}
         assert job.depends_on == ["parent_job"]
-        assert job.files == {"output": "/tmp/1.jpg"}
+        assert job.files == {"output": out_spec}
         assert job.resources == {"api": 1.0, "disk": 2.5}
         assert job.max_retries_per_run == 5
         assert job.timeout_seconds == 7200
@@ -63,12 +65,13 @@ class TestJobCreation:
 
     def test_restore_with_internal_runtime_fields(self):
         """内部恢复入口 _restore 挂载运行期实例位与边带状态。"""
+        out_spec = FileSpec("/tmp/1.jpg", role="output")
         job = Job._restore(
             task_type="download",
             job_id="img_001",
             payload={"url": "https://example.com/1.jpg"},
             depends_on=["parent_job"],
-            files={"output": "/tmp/1.jpg"},
+            files={"output": out_spec.to_dict()},
             resources={"api": 1.0, "disk": 2.5},
             max_retries_per_run=5,
             timeout_seconds=7200,
@@ -77,6 +80,7 @@ class TestJobCreation:
             activation_no=3,
             first_enqueued_at="2026-01-01T00:00:00+00:00",
         )
+        assert job.files == {"output": out_spec}
         assert job.attempt_no == 2
         assert job.activation_no == 3
         assert job.first_enqueued_at == "2026-01-01T00:00:00+00:00"
@@ -99,10 +103,11 @@ class TestJobCreation:
 
     def test_files_none_defaults_to_empty_dict_and_copied(self):
         assert Job("fetch", "j1", files=None).files == {}
-        src_files = {"out": {"p": 1}}
+        spec = FileSpec("out/1.jpg", role="output")
+        src_files = {"out": spec}
         job = Job("fetch", "j1", files=src_files)
-        src_files["out"]["p"] = 99
-        assert job.files == {"out": {"p": 1}}
+        src_files["extra"] = FileSpec("out/2.jpg", role="output")
+        assert job.files == {"out": spec}
 
     def test_resources_none_defaults_to_empty_dict(self):
         assert Job("fetch", "j1", resources=None).resources is None
@@ -253,12 +258,17 @@ class TestJobSpecFieldValidation:
                 Job("t", "id", timeout_seconds=bad)
 
     def test_files_validation(self):
+        spec = FileSpec("a.txt", role="output")
         with pytest.raises(TypeError, match="files must be a dict"):
             Job("t", "id", files=["a"])  # type: ignore[arg-type]
         with pytest.raises(TypeError, match="file key in files must be a non-empty str"):
-            Job("t", "id", files={"": "x"})
+            Job("t", "id", files={"": spec})
         with pytest.raises(TypeError, match="file key in files must be a non-empty str"):
-            Job("t", "id", files={1: "x"})  # type: ignore[dict-item]
+            Job("t", "id", files={1: spec})  # type: ignore[dict-item]
+        with pytest.raises(TypeError, match="file spec in files must be a FileSpec"):
+            Job("t", "id", files={"out": "a.txt"})  # type: ignore[dict-item]
+        with pytest.raises(TypeError, match="file spec in files must be a FileSpec"):
+            Job("t", "id", files={"out": spec.to_dict()})  # type: ignore[dict-item]
 
     def test_depends_on_non_list_rejected(self):
         """先校验外层类型再迭代——str 会被肢解为字符列表。"""
@@ -368,12 +378,13 @@ class TestJobToDictFromDict:
         assert set(result.keys()) == expected_keys
 
     def test_to_dict_values_reflect_constructor_args(self):
+        spec = FileSpec("/tmp/v", role="output")
         job = Job._restore(
             task_type="process",
             job_id="p_99",
             payload={"key": "val"},
             depends_on=["a", "b"],
-            files={"f": "v"},
+            files={"f": spec},
             resources={"cpu": 0.5},
             max_retries_per_run=4,
             timeout_seconds=100,
@@ -387,7 +398,7 @@ class TestJobToDictFromDict:
         assert d["job_id"] == "p_99"
         assert d["payload"] == {"key": "val"}
         assert d["depends_on"] == ["a", "b"]
-        assert d["files"] == {"f": "v"}
+        assert d["files"] == {"f": spec.to_dict()}
         assert d["resources"] == {"cpu": 0.5}
         assert d["max_retries_per_run"] == 4
         assert d["timeout_seconds"] == 100
@@ -427,7 +438,10 @@ class TestJobToDictFromDict:
             job_id="img_001",
             payload={"url": "https://example.com/1.jpg"},
             depends_on=["parent_job"],
-            files={"out": "/tmp/1.jpg"},
+            files={
+                "out": FileSpec("/tmp/1.jpg", role="output", delete_existing=True),
+                "src": FileSpec.from_output("parent_job", "raw", role="input"),
+            },
             resources={"api": 1.0, "disk": 2.5},
             max_retries_per_run=5,
             timeout_seconds=7200,

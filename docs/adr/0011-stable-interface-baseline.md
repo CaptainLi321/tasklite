@@ -536,6 +536,44 @@ Job 与 Attempt 使用相同字段命名和分层，不将执行结果混入提�
 
 job 是完整的有效配置快照，包含身份、payload、depends_on、files 配置及资源、预算、超时、Trigger；不含内部运行账目。普通声明路径遵守提交时绝对化规则，上游文件引用仍保留引用配置，不以解析结果倒改。外层 files 按名称记录本次已解析预声明与已接收动态声明的并集，每项包含绝对 path、role 及 delete_existing/delete_on_failure/delete_on_success，不另设 inputs/outputs/caches。中断时只记录主进程实际掌握的声明，不保证动态信息完整，也不保证文件仍存在。
 
+```python
+# job["files"] 配置快照（保留上游引用配置，普通路径已按实例固定基准绝对化）
+{
+    "source": {
+        "producer_uid": "generate::report-001",
+        "output_name": "report",
+        "role": "input",
+        "delete_existing": False,
+        "delete_on_failure": False,
+        "delete_on_success": False,
+    },
+    "result": {
+        "path": "/work/results/processed.csv",
+        "role": "output",
+        "delete_existing": False,
+        "delete_on_failure": False,
+        "delete_on_success": False,
+    },
+}
+# 记录外层 files（本次已解析预声明与已接收动态声明并集，复用同一路径型结构）
+{
+    "source": {
+        "path": "/work/results/report.csv",
+        "role": "input",
+        "delete_existing": False,
+        "delete_on_failure": False,
+        "delete_on_success": False,
+    },
+    "result": {
+        "path": "/work/results/processed.csv",
+        "role": "output",
+        "delete_existing": False,
+        "delete_on_failure": False,
+        "delete_on_success": False,
+    },
+}
+```
+
 result 有值时统一为下列形状：
 
 ```python
