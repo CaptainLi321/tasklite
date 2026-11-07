@@ -48,6 +48,34 @@ def is_trusted_success_metadata(metadata: Mapping[str, Any] | None) -> bool:
     return extract_trusted_metadata_timestamp_us(metadata) is not None
 
 
+EFFECTIVE_JOB_CONFIG_KEYS = (
+    "task_type",
+    "job_id",
+    "payload",
+    "depends_on",
+    "files",
+    "resources",
+    "max_retries_per_run",
+    "timeout_seconds",
+    "trigger",
+)
+
+
+def extract_effective_job_config(job_snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """提取已解析作业快照的有效配置投影（供同 UID 幂等/冲突比较）。"""
+    return {
+        "task_type": job_snapshot.get("task_type"),
+        "job_id": job_snapshot.get("job_id"),
+        "payload": job_snapshot.get("payload") or {},
+        "depends_on": list(job_snapshot.get("depends_on") or []),
+        "files": job_snapshot.get("files") or {},
+        "resources": dict(job_snapshot.get("resources") or {}),
+        "max_retries_per_run": job_snapshot.get("max_retries_per_run"),
+        "timeout_seconds": job_snapshot.get("timeout_seconds"),
+        "trigger": job_snapshot.get("trigger"),
+    }
+
+
 class TerminalHistory(Protocol):
     """准入判定消费的终态历史契约（PipelineState 满足）。"""
 
@@ -79,16 +107,15 @@ class TriggerRegistry:
         self.functions[name] = fn
 
     def normalize_job_snapshot(self, job_snapshot: dict, task_type: str) -> bool:
-        """摄入时落实 Task 五项规格，显式资源键覆盖模板默认。"""
+        """摄入时落实 Task 四项规格，显式资源键覆盖模板默认（空 dict 不清空默认）。"""
         task = self.tasks.get(task_type) if self.tasks is not None else None
         merged_resources: dict[str, float] = (
             dict(task.resources) if task and task.resources else {}
         )
         defaults: dict[str, Any] = {
             "resources": merged_resources,
-            "max_retries": task.max_retries if task else 3,
+            "max_retries_per_run": task.max_retries_per_run if task else 3,
             "timeout_seconds": task.timeout_seconds if task else 3600,
-            "timeout_is_transient": task.timeout_is_transient if task else False,
             "trigger": task.trigger if task else "once",
         }
         changed = False
@@ -101,6 +128,21 @@ class TriggerRegistry:
             elif job_snapshot.get(key) is None:
                 job_snapshot[key] = value
                 changed = True
+        if job_snapshot.get("payload") is None:
+            job_snapshot["payload"] = {}
+            changed = True
+        else:
+            job_snapshot["payload"] = copy.deepcopy(job_snapshot["payload"])
+        if job_snapshot.get("depends_on") is None:
+            job_snapshot["depends_on"] = []
+            changed = True
+        else:
+            job_snapshot["depends_on"] = list(job_snapshot["depends_on"])
+        if job_snapshot.get("files") is None:
+            job_snapshot["files"] = {}
+            changed = True
+        else:
+            job_snapshot["files"] = copy.deepcopy(job_snapshot["files"])
         return changed
 
     def admit(
@@ -193,11 +235,13 @@ class ImmediateRequeuePolicy(RequeuePolicy):
 
 
 __all__ = [
+    "EFFECTIVE_JOB_CONFIG_KEYS",
     "ImmediateRequeuePolicy",
     "RequeuePlan",
     "RequeuePolicy",
     "TriggerRegistry",
     "TerminalHistory",
+    "extract_effective_job_config",
     "extract_trusted_metadata_timestamp_us",
     "is_trusted_success_metadata",
 ]

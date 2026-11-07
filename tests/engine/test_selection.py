@@ -122,7 +122,8 @@ def test_default_and_empty_rule_selection_execute_everything(fake_process, tmp_p
         pipeline = _pipeline(tmp_path / ("reset" if reset else "default"))
         pipeline.register_task("fetch", ok_handler)
         pipeline.register_task("convert", ok_handler)
-        pipeline.enqueue([Job("fetch", "a"), Job("convert", "b")])
+        pipeline.enqueue(Job("fetch", "a"))
+        pipeline.enqueue(Job("convert", "b"))
         if reset:
             pipeline.selection()  # 0 参数 = 重置为默认全执行
         summary = pipeline.run()
@@ -151,13 +152,9 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("convert", ok_handler)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("fetch", "a"),
-            Job("convert", "b"),
-            Job("rank", "r", depends_on=["convert::b"]),
-        ]
-    )
+    pipeline.enqueue(Job("fetch", "a"))
+    pipeline.enqueue(Job("convert", "b"))
+    pipeline.enqueue(Job("rank", "r", depends_on=["convert::b"]))
     before = {uid: row for uid, row in zip(_queued(pipeline), pipeline.backend.load_queue())}
     pipeline.selection(Exclude(task_type="convert"))
 
@@ -193,7 +190,8 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
 def test_only_excluded_jobs_finish_completed_without_failures(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("convert", ok_handler)
-    pipeline.enqueue([Job("convert", "a"), Job("convert", "b"), Job("convert", "c")])
+    for job_id in ("a", "b", "c"):
+        pipeline.enqueue(Job("convert", job_id))
     pipeline.selection(Exclude(task_type="convert"))
 
     summary = pipeline.run()
@@ -212,7 +210,8 @@ def test_selection_chains_replaces_and_persists_across_runs(fake_process, tmp_pa
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("convert", ok_handler)
-    pipeline.enqueue([Job("fetch", "a"), Job("convert", "b")])
+    pipeline.enqueue(Job("fetch", "a"))
+    pipeline.enqueue(Job("convert", "b"))
     # 链式调用 + 每次整体替换：最终只剩 convert 规则，fetch 恢复可执行。
     assert pipeline.selection(Exclude(task_type="fetch")) is pipeline
     assert pipeline.selection(Exclude(task_type="convert")) is pipeline
@@ -266,7 +265,8 @@ def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
     pipeline.register_resource(gpu)
     pipeline.register_task("heavy", ok_handler, resources={"gpu": 1.0})
     pipeline.register_task("light", ok_handler)
-    pipeline.enqueue([Job("heavy", "h"), Job("light", "l")])
+    pipeline.enqueue(Job("heavy", "h"))
+    pipeline.enqueue(Job("light", "l"))
     pipeline.selection(Exclude(task_type="heavy"))
 
     summary = pipeline.run()
@@ -284,13 +284,9 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("excluded_t", "a"),
-            Job("rank", "b", depends_on=["excluded_t::a", "rank::c"]),
-            Job("rank", "c", depends_on=["rank::b"]),
-        ]
-    )
+    pipeline.enqueue(Job("excluded_t", "a"))
+    pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a", "rank::c"]))
+    pipeline.enqueue(Job("rank", "c", depends_on=["rank::b"]))
     pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
@@ -315,12 +311,8 @@ def test_exclude_downstream_self_loop_is_failed(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("excluded_t", "a"),
-            Job("rank", "b", depends_on=["excluded_t::a", "rank::b"]),
-        ]
-    )
+    pipeline.enqueue(Job("excluded_t", "a"))
+    pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a", "rank::b"]))
     pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
@@ -336,12 +328,8 @@ def test_exclude_downstream_ghost_dependency_is_failed(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("excluded_t", "a"),
-            Job("rank", "b", depends_on=["excluded_t::a", "ghost::x"]),
-        ]
-    )
+    pipeline.enqueue(Job("excluded_t", "a"))
+    pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a", "ghost::x"]))
     pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
@@ -358,13 +346,9 @@ def test_exclude_downstream_blocks_completes_without_busy_spin(fake_process, tmp
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("excluded_t", "a"),
-            Job("rank", "b", depends_on=["excluded_t::a"]),
-            Job("rank", "c", depends_on=["rank::b"]),
-        ]
-    )
+    pipeline.enqueue(Job("excluded_t", "a"))
+    pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a"]))
+    pipeline.enqueue(Job("rank", "c", depends_on=["rank::b"]))
     pipeline.selection(Exclude(task_type="excluded_t"))
     outcome: dict = {}
 
@@ -387,13 +371,9 @@ def test_exclude_downstream_blocks_completes_without_busy_spin(fake_process, tmp
 def test_governor_cycles_do_not_archive_excluded_jobs(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("excluded_t", "a", depends_on=["excluded_t::a"]),
-            Job("rank", "c", depends_on=["rank::d"]),
-            Job("rank", "d", depends_on=["rank::c"]),
-        ]
-    )
+    pipeline.enqueue(Job("excluded_t", "a", depends_on=["excluded_t::a"]))
+    pipeline.enqueue(Job("rank", "c", depends_on=["rank::d"]))
+    pipeline.enqueue(Job("rank", "d", depends_on=["rank::c"]))
     pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
@@ -407,7 +387,7 @@ def test_governor_cycles_do_not_archive_excluded_jobs(fake_process, tmp_path):
     # 只剩被排除的自环作业时：选择仲裁直接正常收敛，队列保留。
     only = _pipeline(tmp_path / "only")
     only.register_task("excluded_t", ok_handler)
-    only.enqueue([Job("excluded_t", "a", depends_on=["excluded_t::a"])])
+    only.enqueue(Job("excluded_t", "a", depends_on=["excluded_t::a"]))
     only.selection(Exclude(task_type="excluded_t"))
     only_summary = only.run()
     assert only_summary.exit_reason is ExitReason.COMPLETED
@@ -418,12 +398,8 @@ def test_governor_cycles_do_not_archive_excluded_jobs(fake_process, tmp_path):
 
 def test_mixed_deadlock_keeps_excluded_and_fails_allowed(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
-    pipeline.enqueue(
-        [
-            Job("excluded_t", "a"),
-            Job("rank", "unknown", resources={"ghost": 1.0}),
-        ]
-    )
+    pipeline.enqueue(Job("excluded_t", "a"))
+    pipeline.enqueue(Job("rank", "unknown", resources={"ghost": 1.0}))
     pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
@@ -474,14 +450,10 @@ def test_skip_root_and_downstream_are_terminal_skipped(fake_process, tmp_path):
     pipeline.register_task("skip_t", ok_handler)
     pipeline.register_task("mid", ok_handler)
     pipeline.register_task("leaf", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("skip_t", "a"),
-            Job("mid", "b", depends_on=["skip_t::a"]),
-            Job("leaf", "c", depends_on=["mid::b"]),
-            Job("fetch", "f"),
-        ]
-    )
+    pipeline.enqueue(Job("skip_t", "a"))
+    pipeline.enqueue(Job("mid", "b", depends_on=["skip_t::a"]))
+    pipeline.enqueue(Job("leaf", "c", depends_on=["mid::b"]))
+    pipeline.enqueue(Job("fetch", "f"))
     pipeline.selection(Skip(task_type="skip_t"))
 
     summary = pipeline.run()
@@ -512,13 +484,9 @@ def test_skip_cascade_wins_over_deadlock_cycle(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("skip_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("skip_t", "s"),
-            Job("rank", "b", depends_on=["skip_t::s", "rank::c"]),
-            Job("rank", "c", depends_on=["rank::b"]),
-        ]
-    )
+    pipeline.enqueue(Job("skip_t", "s"))
+    pipeline.enqueue(Job("rank", "b", depends_on=["skip_t::s", "rank::c"]))
+    pipeline.enqueue(Job("rank", "c", depends_on=["rank::b"]))
     pipeline.selection(Skip(task_type="skip_t"))
 
     summary = pipeline.run()
@@ -544,13 +512,9 @@ def test_skip_wins_over_exclude_for_upstream_type(fake_process, tmp_path):
     pipeline.register_task("skip_t", ok_handler)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("skip_t", "a"),
-            Job("excluded_t", "b", depends_on=["skip_t::a"]),
-            Job("rank", "c", depends_on=["excluded_t::b"]),
-        ]
-    )
+    pipeline.enqueue(Job("skip_t", "a"))
+    pipeline.enqueue(Job("excluded_t", "b", depends_on=["skip_t::a"]))
+    pipeline.enqueue(Job("rank", "c", depends_on=["excluded_t::b"]))
     pipeline.selection(Skip(task_type="skip_t"), Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()
@@ -565,7 +529,7 @@ def test_skip_wins_over_exclude_for_upstream_type(fake_process, tmp_path):
 def test_skip_and_exclude_same_type_skip_wins(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("t", ok_handler)
-    pipeline.enqueue([Job("t", "a")])
+    pipeline.enqueue(Job("t", "a"))
     pipeline.selection(Skip(task_type="t"), Exclude(task_type="t"))
 
     summary = pipeline.run()
@@ -578,7 +542,8 @@ def test_skip_and_exclude_same_type_skip_wins(fake_process, tmp_path):
 def test_skip_only_queue_completes_without_execution(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("skip_t", ok_handler)
-    pipeline.enqueue([Job("skip_t", "a"), Job("skip_t", "b")])
+    pipeline.enqueue(Job("skip_t", "a"))
+    pipeline.enqueue(Job("skip_t", "b"))
     pipeline.selection(Skip(task_type="skip_t"))
 
     summary = pipeline.run()
@@ -633,13 +598,9 @@ def test_failed_parent_cascade_keeps_excluded_downstream(monkeypatch, tmp_path):
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("downstream", ok_handler)
-    pipeline.enqueue(
-        [
-            Job("fetch", "parent", max_retries=0),
-            Job("excluded_t", "child", depends_on=["fetch::parent"]),
-            Job("downstream", "grand", depends_on=["excluded_t::child"]),
-        ]
-    )
+    pipeline.enqueue(Job("fetch", "parent", max_retries_per_run=0))
+    pipeline.enqueue(Job("excluded_t", "child", depends_on=["fetch::parent"]))
+    pipeline.enqueue(Job("downstream", "grand", depends_on=["excluded_t::child"]))
     pipeline.selection(Exclude(task_type="excluded_t"))
 
     summary = pipeline.run()

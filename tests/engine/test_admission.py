@@ -58,7 +58,7 @@ class TestImmediateRequeuePolicy:
     def test_transient_kind_keeps_immediate_zero_budget_rhythm(self):
         """瞬态信号军规在立即策略下自然成立：零延迟、不因预算耗尽拒收。"""
         policy = ImmediateRequeuePolicy()
-        job_snapshot = {"task_type": "t", "job_id": "j", "max_retries": 0, "attempt_no": 1}
+        job_snapshot = {"task_type": "t", "job_id": "j", "max_retries_per_run": 0, "attempt_no": 1}
         for kind in ("interrupted", "lock_conflict", "rate_limited"):
             plan = policy.plan_requeue(job_snapshot, transient_kind=kind)
             assert plan.front is True

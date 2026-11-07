@@ -679,7 +679,7 @@ def test_stop_during_orphan_deferral_exits_dispatch_pool(tmp_path, monkeypatch, 
     env = RuntimeEnv(tmp_path)
     env.register("t")
     runtime = env.runtime
-    runtime.store.enqueue_jobs([Job("t", "orphan", max_retries=0)])
+    runtime.store.enqueue_jobs([Job("t", "orphan", max_retries_per_run=0)])
     probes = []
 
     def locked(uid):

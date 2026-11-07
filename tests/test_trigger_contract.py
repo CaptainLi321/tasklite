@@ -10,14 +10,13 @@ def test_custom_trigger_observes_inherited_task_spec(tmp_path):
     pipeline = TaskLite(name="trigger", state_dir=tmp_path, backend="memory")
     seen = []
     pipeline.register_trigger("inspect", lambda ctx: seen.append(ctx.job.to_dict()) or False)
-    pipeline.register_task("t", handle, max_retries=7, timeout_seconds=12,
-                           timeout_is_transient=True, trigger="inspect")
+    pipeline.register_task("t", handle, max_retries_per_run=7, timeout_seconds=12,
+                           trigger="inspect")
     pipeline.enqueue(Job("t", "a"))
     summary = pipeline.run()
     assert summary.stats["skipped"] == 1
-    assert seen[0]["max_retries"] == 7
+    assert seen[0]["max_retries_per_run"] == 7
     assert seen[0]["timeout_seconds"] == 12
-    assert seen[0]["timeout_is_transient"] is True
     assert seen[0]["trigger"] == "inspect"
 
 
@@ -26,7 +25,8 @@ def test_fresh_trigger_skip_allows_dependent_trigger(tmp_path):
     seen = []
     pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
     pipeline.register_task("t", handle, trigger="observe")
-    pipeline.enqueue([Job("t", "b", depends_on=["t::a"]), Job("t", "a")])
+    pipeline.enqueue(Job("t", "b", depends_on=["t::a"]))
+    pipeline.enqueue(Job("t", "a"))
     summary = pipeline.run()
     assert seen == ["t::a", "t::b"]
     assert summary.stats["skipped"] == 2
@@ -39,20 +39,20 @@ def test_task_resource_merge_and_explicit_false_zero_overrides(tmp_path):
     pipeline.register_resource(CapacityResource("gpu", 5))
     pipeline.register_resource(CapacityResource("cpu", 5))
     pipeline.register_task("t", handle, resources={"gpu": 2, "cpu": 1},
-                           max_retries=7, timeout_seconds=12,
-                           timeout_is_transient=True, trigger="always")
-    pipeline.enqueue(Job("t", "a", resources={"gpu": 0}, max_retries=0,
-                         timeout_seconds=2, timeout_is_transient=False, trigger="once"))
+                           max_retries_per_run=7, timeout_seconds=12,
+                           trigger="always")
+    pipeline.enqueue(Job("t", "a", resources={"gpu": 0}, max_retries_per_run=0,
+                         timeout_seconds=2, trigger="once"))
     row = pipeline.backend.load_queue()[0]
     assert row["resources"] == {"gpu": 0, "cpu": 1, "__workers__": 1.0}
-    assert (row["max_retries"], row["timeout_seconds"], row["timeout_is_transient"], row["trigger"]) == (0, 2, False, "once")
+    assert (row["max_retries_per_run"], row["timeout_seconds"], row["trigger"]) == (0, 2, "once")
 
 
 def test_restored_none_spec_inherits_task_before_trigger(tmp_path):
     pipeline = TaskLite(name="restore", state_dir=tmp_path, backend="memory")
     seen = []
-    pipeline.register_trigger("inspect", lambda ctx: seen.append(ctx.job.max_retries) or False)
-    pipeline.register_task("t", handle, max_retries=9, trigger="inspect")
+    pipeline.register_trigger("inspect", lambda ctx: seen.append(ctx.job.max_retries_per_run) or False)
+    pipeline.register_task("t", handle, max_retries_per_run=9, trigger="inspect")
     snapshot = Job("t", "a").to_dict()
     assert Job.from_dict(snapshot).to_dict() == snapshot
     pipeline.backend.save_queue([snapshot])
@@ -185,8 +185,8 @@ def test_failure_history_skipped_this_batch_allows_downstream(tmp_path):
     pipeline.backend.append_failed("t::a", {"error_message": "prior failure"})
     seen = []
     pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
-    pipeline.enqueue([Job("t", "b", depends_on=["t::a"], trigger="observe"),
-                      Job("t", "a", trigger="observe")])
+    pipeline.enqueue(Job("t", "b", depends_on=["t::a"], trigger="observe"))
+    pipeline.enqueue(Job("t", "a", trigger="observe"))
     pipeline.run()
     assert seen == ["t::a", "t::b"]
     assert [entry.job_uid for entry in pipeline.list_failures()] == ["t::a"]
@@ -200,7 +200,8 @@ def test_trigger_skip_is_local_to_run_and_does_not_replace_selection_skip(tmp_pa
     pipeline.register_task("parent", handle, trigger="observe")
     pipeline.register_task("child", handle, trigger="observe")
     pipeline.selection(Exclude("child"))
-    pipeline.enqueue([Job("parent", "a"), Job("child", "b", depends_on=["parent::a"])])
+    pipeline.enqueue(Job("parent", "a"))
+    pipeline.enqueue(Job("child", "b", depends_on=["parent::a"]))
     pipeline.run()
     assert seen == ["parent::a"]
     pipeline.selection()
@@ -208,7 +209,8 @@ def test_trigger_skip_is_local_to_run_and_does_not_replace_selection_skip(tmp_pa
     assert seen == ["parent::a"]
     assert [entry.job_uid for entry in pipeline.list_failures()] == ["child::b"]
     pipeline.selection(Skip("parent"))
-    pipeline.enqueue([Job("parent", "c"), Job("child", "d", depends_on=["parent::c"])])
+    pipeline.enqueue(Job("parent", "c"))
+    pipeline.enqueue(Job("child", "d", depends_on=["parent::c"]))
     summary = pipeline.run()
     assert summary.stats["skipped"] == 2
     assert seen == ["parent::a"]
@@ -224,7 +226,8 @@ def test_stop_after_trigger_skip_does_not_persist_dependency_readiness(tmp_path)
     pipeline.register_task("t", handle)
     pipeline.register_task("child", handle)
     pipeline.selection(Exclude("child"))
-    pipeline.enqueue([Job("t", "a", trigger="stop"), Job("child", "b", depends_on=["t::a"])])
+    pipeline.enqueue(Job("t", "a", trigger="stop"))
+    pipeline.enqueue(Job("child", "b", depends_on=["t::a"]))
     pipeline.run()
     assert [row["job_id"] for row in pipeline.backend.load_queue()] == ["b"]
     pipeline.selection()
@@ -252,7 +255,7 @@ def test_retry_uses_same_activation_without_rechecking_trigger(tmp_path, monkeyp
     pipeline = TaskLite(name="retry", state_dir=tmp_path, backend="memory")
     seen = []
     pipeline.register_trigger("first", lambda ctx: seen.append(ctx.job.attempt_no) or True)
-    pipeline.register_task("t", handle, max_retries=2, trigger="first")
+    pipeline.register_task("t", handle, max_retries_per_run=2, trigger="first")
     pipeline.enqueue(Job("t", "a"))
     pipeline.run()
     assert seen == [1]
@@ -287,7 +290,8 @@ def test_trigger_error_aborts_inflight_without_burning_budget(tmp_path, monkeypa
                         on_run_end=ended.append)
     pipeline.register_trigger("error", lambda ctx: 1 / 0)
     pipeline.register_task("t", handle)
-    pipeline.enqueue([Job("t", "a"), Job("t", "b", trigger="error")])
+    pipeline.enqueue(Job("t", "a"))
+    pipeline.enqueue(Job("t", "b", trigger="error"))
     with pytest.raises(ZeroDivisionError):
         pipeline.run()
     rows = {row["job_id"]: row for row in pipeline.backend.load_queue()}

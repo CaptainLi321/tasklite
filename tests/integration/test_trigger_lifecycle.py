@@ -49,8 +49,8 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     first = _pipeline(tmp_path)
     first.register_task("produce", produce_input, trigger="always")
     first.register_task("consume", consume_input, trigger="on_input_change")
-    first.enqueue([Job("consume", "result", depends_on=["produce::source"]),
-                   Job("produce", "source")])
+    first.enqueue(Job("consume", "result", depends_on=["produce::source"]))
+    first.enqueue(Job("produce", "source"))
     first_summary = first.run()
     first.stop()
     old_meta = first.backend.load_successes()["consume::result"]
@@ -67,9 +67,9 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     second.register_trigger("observe", observe_input)
     second.register_task("produce", produce_input, trigger="always")
     second.register_task("consume", consume_input, trigger="observe")
-    second.enqueue([Job("consume", "result", depends_on=["produce::source"]),
-                    Job("produce", "source", payload={"mode": mode, "content": "updated",
-                                                       "mtime_ns": (baseline_us + 1) * 1000})])
+    second.enqueue(Job("consume", "result", depends_on=["produce::source"]))
+    second.enqueue(Job("produce", "source", payload={"mode": mode, "content": "updated",
+                                                     "mtime_ns": (baseline_us + 1) * 1000}))
     summary = second.run()
     second.stop()
     if mode == "fail":
@@ -107,7 +107,7 @@ def _run_until_retry_committed(root, ready, release):
             release.wait(timeout=30)
     pipeline = _pipeline(Path(root), on_attempt_finished=park_after_retry)
     pipeline.register_trigger("gated", lambda ctx: True)
-    pipeline.register_task("retry", always_retry, max_retries=1, trigger="gated")
+    pipeline.register_task("retry", always_retry, max_retries_per_run=1, trigger="gated")
     pipeline.enqueue(Job("retry", "item"))
     pipeline.run()
 
@@ -135,11 +135,11 @@ def test_killed_engine_recovers_retry_without_resetting_activation_or_budget(tmp
     recovered = _pipeline(tmp_path)
     queued = recovered.backend.load_queue()
     assert len(queued) == 1
-    assert (queued[0]["activation_no"], queued[0]["attempt_no"], queued[0]["max_retries"]) == (1, 2, 1)
+    assert (queued[0]["activation_no"], queued[0]["attempt_no"], queued[0]["max_retries_per_run"]) == (1, 2, 1)
     def reject_rechecking(ctx):
         raise AssertionError("retry must not evaluate trigger again")
     recovered.register_trigger("gated", reject_rechecking)
-    recovered.register_task("retry", always_retry, max_retries=99, trigger="gated")
+    recovered.register_task("retry", always_retry, max_retries_per_run=99, trigger="gated")
     recovered.run()
     recovered.stop()
     records = recovered.backend.load_attempts("retry::item")
@@ -156,8 +156,8 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
     first = _pipeline(tmp_path)
     first.register_task("produce", produce_input)
     first.register_task("consume", consume_input, trigger="on_input_change")
-    first.enqueue([Job("produce", "source"),
-                   Job("consume", "result", depends_on=["produce::source"])])
+    first.enqueue(Job("produce", "source"))
+    first.enqueue(Job("consume", "result", depends_on=["produce::source"]))
     first.run()
     first.clear_history("consume::result", where=["successes"])
     if seed_after_clear:
@@ -194,7 +194,7 @@ def test_transient_first_attempt_rechecks_trigger_without_budget_or_archive_poll
     evaluated = []
     pipeline.register_trigger("observe", lambda ctx: evaluated.append(
         (ctx.job.attempt_no, ctx.has_failed, ctx.has_succeeded)) or True)
-    pipeline.register_task("transient", transient_once, max_retries=0, trigger="observe")
+    pipeline.register_task("transient", transient_once, max_retries_per_run=0, trigger="observe")
     pipeline.enqueue(Job("transient", "item", payload={"kind": kind}))
     summary = pipeline.run()
     pipeline.stop()
@@ -278,9 +278,10 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
         _wait_for_file(tmp_path / "output" / "worker_ready")
         raise RuntimeError("trigger boundary")
     pipeline.register_trigger("explode", explode_after_worker_ready)
-    pipeline.register_task("waiting", waiting_for_release, max_retries=0, trigger="always")
+    pipeline.register_task("waiting", waiting_for_release, max_retries_per_run=0, trigger="always")
     pipeline.register_task("later", discovered_child, trigger="explode")
-    pipeline.enqueue([Job("waiting", "item"), Job("later", "item")])
+    pipeline.enqueue(Job("waiting", "item"))
+    pipeline.enqueue(Job("later", "item"))
     with pytest.raises(RuntimeError, match="trigger boundary"):
         pipeline.run()
     rows = pipeline.backend.load_queue()
@@ -295,7 +296,7 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
     (tmp_path / "output" / "worker_release").write_text("release", encoding="utf-8")
     recovered = _pipeline(tmp_path)
     recovered.register_trigger("explode", lambda ctx: False)
-    recovered.register_task("waiting", waiting_for_release, max_retries=0, trigger="always")
+    recovered.register_task("waiting", waiting_for_release, max_retries_per_run=0, trigger="always")
     recovered.register_task("later", discovered_child, trigger="explode")
     summary = recovered.run()
     recovered.stop()

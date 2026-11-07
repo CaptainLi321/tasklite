@@ -2,21 +2,24 @@
 
 字段归位原则：本类只承载「这一次激活」的语义——
 
-- 规格位（可覆盖 Task 默认）：task_type / job_id / payload / resources /
-  depends_on / timeout_seconds / max_retries / timeout_is_transient / trigger；
-- 实例位（框架运行期管理）：attempt_no（本次激活内尝试序号，1 起始含
-  首次执行；预算判定：允许执行条件 ``attempt_no <= max_retries + 1``）、
-  activation_no（激活代，每次从 successes/failed 拦截点放行重跑时 +1）、
-  first_enqueued_at（UTC ISO，首次入队时间，重试不刷新，由 enqueue 填充）；
+- 规格位（可覆盖 Task 默认）：task_type / job_id / payload / depends_on /
+  files / resources / max_retries_per_run / timeout_seconds / trigger；
+- 实例位（框架运行期管理，由私有恢复入口 ``_restore`` 挂载）：attempt_no
+  （本次激活内尝试序号，1 起始含首次执行；预算判定：允许执行条件
+  ``attempt_no <= max_retries_per_run + 1``）、activation_no（激活代，
+  每次从 successes/failed 拦截点放行重跑时 +1）、first_enqueued_at（UTC
+  ISO，首次入队时间，重试不刷新，由 enqueue 填充）；
 - 运行期边带状态收敛到 ``runtime`` 单一命名空间（JobRuntimeState），随
   job_snapshot 落盘持久化——序列化只此一处，新增状态不会因散装下划线键
   漏写 to_dict 而丢失。
 
-身份不变式：``uid = task_type::job_id``，queue/successes/failed 三表主键与
-六集合互斥均以 uid 为身份；``__eq__``/``__hash__`` 仅按 uid。
+身份不变式：``uid = make_job_uid(task_type, job_id)``，queue/successes/failed
+三表主键与六集合互斥均以 uid 为身份；``__eq__``/``__hash__`` 仅按 uid。
 """
 from __future__ import annotations
 
+import copy
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,7 +30,6 @@ from .task import (
     validate_retry_budget,
     validate_task_type,
     validate_timeout_seconds,
-    validate_timeout_flag,
     validate_trigger,
 )
 
@@ -161,15 +163,29 @@ def _validate_job_id(job_id: Any) -> None:
 
 
 def _normalize_payload(payload: Any) -> dict[str, Any]:
-    """payload 入口校验与规范化：仅接受 dict 或 None。
-
-    非 dict payload 若放行，会潜伏到子进程序列化处才崩，入口拒绝。
-    """
+    """payload 入口校验与规范化：仅接受 dict 或 None，深拷贝隔离外部变异。"""
     if payload is not None and not isinstance(payload, dict):
         raise TypeError(
             f"payload must be a dict or None, got {type(payload).__name__} ({payload!r})"
         )
-    return dict(payload) if payload else {}
+    return copy.deepcopy(payload) if payload else {}
+
+
+def _normalize_files(files: Any) -> dict[str, Any]:
+    """files 入口校验与规范化：仅接受 dict[str, Any] 或 None，深拷贝隔离外部变异。"""
+    if files is not None and not isinstance(files, dict):
+        raise TypeError(
+            f"files must be a dict or None, got {type(files).__name__} ({files!r})"
+        )
+    if not files:
+        return {}
+    for key in files:
+        if not isinstance(key, str) or not key:
+            raise TypeError(
+                f"file key in files must be a non-empty str, "
+                f"got {type(key).__name__} ({key!r})"
+            )
+    return copy.deepcopy(files)
 
 
 def _normalize_resources(resources: Any) -> dict[str, float]:
@@ -243,52 +259,36 @@ def _validate_first_enqueued_at(first_enqueued_at: Any) -> None:
 
 
 class Job:
-    """一次有界激活的逻辑实例（uid = task_type::job_id 身份不变）。
+    """一次有界激活的逻辑实例（uid = make_job_uid(task_type, job_id) 身份不变）。
 
     Args:
-        task_type: 任务类型名（须匹配已注册 Task 的 task_type）。非空 str
-            且不含 ``::``（uid 分隔符）。
-        job_id: 任务类型内的唯一标识。非空 str 且不含 ``::``。
+        task_type: 任务类型名（须匹配已注册 Task 的 task_type）。非空 str。
+        job_id: 任务类型内的唯一标识。非空 str。
         payload: 传给 handler 的业务数据 dict（须可 JSON 序列化，完整
             序列化预检在 enqueue/spawn 侧执行，构造期先做 dict 类型门卫）。
+        depends_on: 上游 job uid 列表。失败的上游会级联阻断本 job。
+        files: 文件角色到文件规格的映射（默认空 dict）。
         resources: None 继承 Task 默认资源；显式映射按键合并并覆盖同名资源。
-        max_retries: None 继承 Task 重试预算；显式值覆盖模板。允许执行条件为
-            ``attempt_no <= max_retries + 1``；0 表示任何失败直接进
+        max_retries_per_run: None 继承 Task 重试预算；显式值覆盖模板。允许执行
+            条件为 ``attempt_no <= max_retries_per_run + 1``；0 表示任何失败直接进
             失败档案。
-        depends_on: 上游 job uid 列表（``task_type::job_id``）。失败的
-            上游会级联阻断本 job。
         timeout_seconds: None 继承 Task；显式秒数须为有限正数。
-        timeout_is_transient: None 继承 Task；显式控制超时是否为瞬态失败。
-            True 时看门狗超时按重试处理，而非直接进失败档案。
-        trigger: 首次尝试的触发器名称；None 继承 Task。内置 once /
-            on_failure / always / on_input_change，或 register_trigger 注册名。
-            新作业与历史作业统一求值；同次激活的故障重试不重复求值。
-        runtime: 运行期边带状态（dict 或 JobRuntimeState，由框架管理）。
-        attempt_no: 本次激活内尝试序号（实例位，框架管理，1 起始含首次
-            执行）。
-        activation_no: 激活代（实例位，框架管理，每次从 successes/failed
-            拦截点放行重跑时 +1，初激活为 1）。
-        first_enqueued_at: 首次入队时间（实例位，UTC ISO，由 enqueue
-            填充，重试不刷新；None 表示尚未入队）。
+        trigger: 首次尝试的触发器名称；None 继承 Task。
     """
 
     def __init__(
         self,
         task_type: str,
         job_id: str,
-        payload: dict[str, Any] | None = None,
-        resources: dict[str, float] | None = None,
-        max_retries: int | None = None,
-        depends_on: list[str] | None = None,
-        timeout_seconds: int | float | None = None,
         *,
-        timeout_is_transient: bool | None = None,
+        payload: dict[str, Any] | None = None,
+        depends_on: Sequence[str] | None = None,
+        files: dict[str, Any] | None = None,
+        resources: dict[str, float] | None = None,
+        max_retries_per_run: int | None = None,
+        timeout_seconds: int | float | None = None,
         trigger: str | None = None,
-        runtime: dict[str, Any] | None = None,
-        attempt_no: int = 1,
-        activation_no: int = 1,
-        first_enqueued_at: str | None = None,
-    ):
+    ) -> None:
         # 身份校验链：类型 → 非空 → 构造规范 uid
         validate_task_type(task_type)
         self.task_type = task_type
@@ -297,29 +297,63 @@ class Job:
         self._uid = make_job_uid(task_type, job_id)
 
         self.payload = _normalize_payload(payload)
-        self.resources = None if resources is None else _normalize_resources(resources)
-        if max_retries is not None:
-            validate_retry_budget(max_retries)
-        self.max_retries = max_retries
         self.depends_on = _normalize_depends_on(depends_on)
+        self.files = _normalize_files(files)
+        self.resources = None if resources is None else _normalize_resources(resources)
+        if max_retries_per_run is not None:
+            validate_retry_budget(max_retries_per_run)
+        self.max_retries_per_run = max_retries_per_run
         if timeout_seconds is not None:
             validate_timeout_seconds(timeout_seconds)
         self.timeout_seconds = timeout_seconds
-        if timeout_is_transient is not None:
-            validate_timeout_flag(timeout_is_transient)
-        self.timeout_is_transient = timeout_is_transient
         if trigger is not None:
             validate_trigger(trigger)
         self.trigger = trigger
 
-        # 实例位：框架运行期管理的激活/尝试账目与首次入队时间
+        # 实例位：公开构造初始化为默认初态，恢复路径统一经 _restore 挂载
+        self.attempt_no: int = 1
+        self.activation_no: int = 1
+        self.first_enqueued_at: str | None = None
+        self.runtime = None
+
+    @classmethod
+    def _restore(
+        cls,
+        task_type: str,
+        job_id: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        depends_on: Sequence[str] | None = None,
+        files: dict[str, Any] | None = None,
+        resources: dict[str, float] | None = None,
+        max_retries_per_run: int | None = None,
+        timeout_seconds: int | float | None = None,
+        trigger: str | None = None,
+        runtime: dict[str, Any] | JobRuntimeState | None = None,
+        attempt_no: int = 1,
+        activation_no: int = 1,
+        first_enqueued_at: str | None = None,
+    ) -> Job:
+        """内部私有恢复入口：重建 Job 并挂载运行期实例位与边带状态。"""
+        job = cls(
+            task_type,
+            job_id,
+            payload=payload,
+            depends_on=depends_on,
+            files=files,
+            resources=resources,
+            max_retries_per_run=max_retries_per_run,
+            timeout_seconds=timeout_seconds,
+            trigger=trigger,
+        )
         _validate_attempt_no(attempt_no)
-        self.attempt_no = attempt_no
+        job.attempt_no = attempt_no
         _validate_activation_no(activation_no)
-        self.activation_no = activation_no
+        job.activation_no = activation_no
         _validate_first_enqueued_at(first_enqueued_at)
-        self.first_enqueued_at = first_enqueued_at
-        self.runtime = runtime
+        job.first_enqueued_at = first_enqueued_at
+        job.runtime = runtime
+        return job
 
     @property
     def runtime(self) -> JobRuntimeState:
@@ -333,19 +367,19 @@ class Job:
         else:
             self._runtime = JobRuntimeState.from_dict(value)
 
-    def to_dict(self) -> dict:
-        """序列化 job 为字典（payload/resources/depends_on 浅拷贝，防外部
-        就地变异内部状态）；``runtime`` 子 dict 显式保留——边带状态集中
+    def to_dict(self) -> dict[str, Any]:
+        """序列化 job 为字典（payload/files 深拷贝、resources/depends_on 浅拷贝，
+        防外部就地变异内部状态）；``runtime`` 子 dict 显式保留——边带状态集中
         序列化，不散装丢失。"""
         return {
             "task_type": self.task_type,
             "job_id": self.job_id,
-            "payload": dict(self.payload),
-            "resources": None if self.resources is None else dict(self.resources),
-            "max_retries": self.max_retries,
+            "payload": copy.deepcopy(self.payload),
             "depends_on": list(self.depends_on),
+            "files": copy.deepcopy(self.files),
+            "resources": None if self.resources is None else dict(self.resources),
+            "max_retries_per_run": self.max_retries_per_run,
             "timeout_seconds": self.timeout_seconds,
-            "timeout_is_transient": self.timeout_is_transient,
             "trigger": self.trigger,
             "runtime": self.runtime.to_dict(),
             "attempt_no": self.attempt_no,
@@ -354,21 +388,25 @@ class Job:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> Job:
+    def from_dict(cls, data: dict[str, Any]) -> Job:
         """反序列化 job（缺键回默认值；trigger 缺键/None = 未指定哨兵）。"""
         if "rerun" in data:
             raise ValueError("Job 快照不接受旧字段 rerun；请使用 trigger")
         if "timeout" in data:
             raise ValueError("Job 快照不接受旧字段 timeout；请使用 timeout_seconds")
-        return cls(
+        if "max_retries" in data:
+            raise ValueError("Job 快照不接受旧字段 max_retries；请使用 max_retries_per_run")
+        if "timeout_is_transient" in data:
+            raise ValueError("Job 快照不接受已移除字段 timeout_is_transient")
+        return cls._restore(
             data["task_type"],
             data["job_id"],
-            data.get("payload", {}),
-            data.get("resources"),
-            data.get("max_retries"),
-            data.get("depends_on", []),
-            data.get("timeout_seconds"),
-            timeout_is_transient=data.get("timeout_is_transient"),
+            payload=data.get("payload", {}),
+            depends_on=data.get("depends_on", []),
+            files=data.get("files", {}),
+            resources=data.get("resources"),
+            max_retries_per_run=data.get("max_retries_per_run"),
+            timeout_seconds=data.get("timeout_seconds"),
             trigger=data.get("trigger"),
             # runtime 子 dict 显式保留——边带状态只存这一处
             runtime=data.get("runtime", {}),

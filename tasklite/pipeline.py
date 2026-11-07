@@ -63,6 +63,9 @@ def _validate_pipeline_name(name: Any) -> str:
     return name
 
 
+_UNSET: Any = object()
+
+
 class TaskLite:
     """v2 管线编排门面（Task/Job/Attempt 三层模型，六步调用契约）。
 
@@ -419,27 +422,20 @@ class TaskLite:
         self,
         task_or_type: "Task | str",
         handler: Callable[[Job, Any], Any] | None = None,
-        resources: dict[str, float] | None = None,
-        payload_schema: type | None = None,
-        max_retries: int = 3,
-        timeout_seconds: int | float = 3600,
         *,
-        timeout_is_transient: bool = False,
-        trigger: str = "once",
+        resources: dict[str, float] | None = _UNSET,
+        max_retries_per_run: int = _UNSET,
+        timeout_seconds: int | float = _UNSET,
+        trigger: str = _UNSET,
     ) -> None:
         """注册一个 Task 规格（Task 实例）或按简式参数就地构造规格。
 
-        规格式：首参传 Task 实例，其余参数必须处于默认形态——规格字段
-        以 Task 实例为准，旁置参数静默忽略会让调用方误以为覆盖生效，
-        入口 fail-loud 拒绝。
+        规格式：首参传 Task 实例，其余参数不得传入——规格字段以 Task
+        实例为准，旁置参数静默忽略会让调用方误以为覆盖生效，入口拒绝。
 
         简式：首参传 task_type str，handler 必填；resources /
-        payload_schema / max_retries / timeout_seconds / timeout_is_transient 经
-        Task 构造面校验（模型层校验单点，门面不重复实现）。
-
-        handler 返回值语义：None/True 成功；False 失败；dict 成功元数据；
-        tuple[bool, dict] 组合。抛 RetryError 推回队列重试；抛 FatalError
-        直接进失败档案（不消耗重试预算）；其余异常失败进失败档案。
+        max_retries_per_run / timeout_seconds / trigger 全部 keyword-only，
+        经 Task 构造面校验（模型层校验单点，门面不重复实现）。
 
         重复注册同一 task_type 显式报错（TaskRegistry 契约）——静默覆盖
         会让已入队 Job 挂到新 handler 上，规格与实例错配。
@@ -449,10 +445,8 @@ class TaskLite:
             self._reject_spec_overrides(
                 handler=handler,
                 resources=resources,
-                payload_schema=payload_schema,
-                max_retries=max_retries,
+                max_retries_per_run=max_retries_per_run,
                 timeout_seconds=timeout_seconds,
-                timeout_is_transient=timeout_is_transient,
                 trigger=trigger,
             )
             task = task_or_type
@@ -466,12 +460,10 @@ class TaskLite:
             task = Task(
                 task_type,
                 handler,
-                resources=resources,
-                payload_schema=payload_schema,
-                max_retries=max_retries,
-                timeout_seconds=timeout_seconds,
-                timeout_is_transient=timeout_is_transient,
-                trigger=trigger,
+                resources=None if resources is _UNSET else resources,
+                max_retries_per_run=3 if max_retries_per_run is _UNSET else max_retries_per_run,
+                timeout_seconds=3600 if timeout_seconds is _UNSET else timeout_seconds,
+                trigger="once" if trigger is _UNSET else trigger,
             )
         self.tasks.register(task)
 
@@ -479,22 +471,18 @@ class TaskLite:
     def _reject_spec_overrides(
         *,
         handler: Callable[[Job, Any], Any] | None,
-        resources: dict[str, float] | None,
-        payload_schema: type | None,
-        max_retries: int,
-        timeout_seconds: int | float,
-        timeout_is_transient: bool,
-        trigger: str,
-) -> None:
-        """规格式注册的旁置参数门卫（非默认形态一律 ValueError）。"""
+        resources: object,
+        max_retries_per_run: object,
+        timeout_seconds: object,
+        trigger: object,
+    ) -> None:
+        """规格式注册的旁置参数门卫（额外参数一律 ValueError）。"""
         if (
             handler is not None
-            or resources is not None
-            or payload_schema is not None
-            or timeout_is_transient is not False
-            or trigger != Task.trigger
-            or max_retries != Task.max_retries
-            or timeout_seconds != Task.timeout_seconds
+            or resources is not _UNSET
+            or max_retries_per_run is not _UNSET
+            or timeout_seconds is not _UNSET
+            or trigger is not _UNSET
         ):
             raise ValueError(
                 "register_task(Task, ...) takes the spec as-is; extra spec "
@@ -555,46 +543,23 @@ class TaskLite:
         self._ensure_not_running("filter_jobs_without_success")
         return self._console.filter_jobs_without_success(jobs)
 
-    def enqueue(self, jobs: Job | Sequence[Job], *, front: bool = False) -> None:
-        """入队作业（重复 uid 静默跳过，front=True 插队首）。
+    def enqueue(self, job: Job) -> bool:
+        """入队单个作业，捕获独立快照并校验同 UID 幂等/冲突。
 
-        successes 命中不在 enqueue 拦截——trigger 策略裁决属派发层（拦截点在
-        五关预检），此处抢先过滤会吞掉 always/on_failure 的豁免
-        语义。写入走后端增量 API（单事务原子插入，不做全表重写），与
-        run() 的增量 commit 并发时互不覆盖；序列化预检、任务级默认
-        trigger 注入、``__workers__`` 资源注入与 first_enqueued_at 填充
-        统一在 StateStore.enqueue_jobs 摄入管道完成。
-
-        非线程安全：不得与 ``run()`` 并发调用；运行期 handler 内生成
-        子作业用 ``ctx.spawn()``。
+        首次加入队列返回 True；同 UID 已排队且有效配置相同返回 False，
+        不同配置抛出 TaskLiteError。
         """
         self._ensure_not_running("enqueue")
-        if isinstance(jobs, Job):
-            jobs_list = [jobs]
-        elif isinstance(jobs, (list, tuple)):
-            for j in jobs:
-                if not isinstance(j, Job):
-                    raise TypeError(
-                        f"enqueue() expects Job objects, got {type(j).__name__}"
-                    )
-            jobs_list = list(jobs)
-        else:
+        if not isinstance(job, Job):
             raise TypeError(
-                "enqueue() expects a Job or a list of Job objects, "
-                f"got {type(jobs).__name__}"
+                f"enqueue() expects a Job, got {type(job).__name__}"
             )
-        if not jobs_list:
-            return
-
-        inserted = self._runtime.store.enqueue_jobs(jobs_list, front=front)
-        skipped = len(jobs_list) - len(inserted)
-        if skipped:
-            logger.info(
-                f"Enqueued {len(inserted)} job(s), skipped {skipped} "
-                f"duplicate(s)."
-            )
-        elif inserted:
-            logger.info(f"Enqueued {len(inserted)} job(s).")
+        inserted = self._runtime.store.enqueue_job(job)
+        if inserted:
+            logger.info("Enqueued 1 job(s).")
+        else:
+            logger.info("Enqueued 0 job(s), skipped 1 duplicate(s).")
+        return inserted
 
     # ── 管理面（run() 外运维委托）──────────────────────────────────
 

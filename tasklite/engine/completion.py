@@ -213,7 +213,7 @@ class CompletionMachine:
         transient_kind = result.transient_kind
         is_transient = transient_kind is not None
         retry_error = result.retry_error
-        max_retries = job.max_retries if job.max_retries is not None else 3
+        max_retries = job.max_retries_per_run if job.max_retries_per_run is not None else 3
 
         if not is_transient and job.attempt_no > max_retries:
             logger.error(

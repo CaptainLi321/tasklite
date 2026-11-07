@@ -111,7 +111,8 @@ def test_three_jobs_run_concurrently(tmp_state_dir):
     )
     pipeline.register_resource(CapacityResource("cpu", max_capacity=3.0))
     pipeline.register_task("slow", slow_window_handler, resources={"cpu": 1.0})
-    pipeline.enqueue([Job("slow", f"j{i}") for i in range(3)])
+    for i in range(3):
+        pipeline.enqueue(Job("slow", f"j{i}"))
 
     start = time.perf_counter()
     pipeline.run()
@@ -141,7 +142,8 @@ def test_workers_resource_limits_concurrency(tmp_state_dir):
         max_workers=2,
     )
     pipeline.register_task("slow", slow_window_handler)
-    pipeline.enqueue([Job("slow", f"j{i}") for i in range(4)])
+    for i in range(4):
+        pipeline.enqueue(Job("slow", f"j{i}"))
 
     start = time.perf_counter()
     pipeline.run()
@@ -170,11 +172,9 @@ def test_dependency_chain_under_concurrency(tmp_state_dir):
         max_workers=3,
     )
     pipeline.register_task("fast", fast_handler)
-    pipeline.enqueue([
-        Job("fast", "A"),
-        Job("fast", "B", depends_on=["fast::A"]),
-        Job("fast", "C", depends_on=["fast::B"]),
-    ])
+    pipeline.enqueue(Job("fast", "A"))
+    pipeline.enqueue(Job("fast", "B", depends_on=["fast::A"]))
+    pipeline.enqueue(Job("fast", "C", depends_on=["fast::B"]))
     pipeline.run()
 
     successes = pipeline.backend.load_successes()
@@ -210,7 +210,8 @@ def test_resource_capacity_respected_under_concurrency(tmp_state_dir):
     )
     pipeline.register_resource(CapacityResource("mem", max_capacity=2.0))
     pipeline.register_task("slow", slow_window_handler, resources={"mem": 1.0})
-    pipeline.enqueue([Job("slow", f"j{i}") for i in range(3)])
+    for i in range(3):
+        pipeline.enqueue(Job("slow", f"j{i}"))
 
     start = time.perf_counter()
     pipeline.run()
@@ -239,7 +240,7 @@ def test_workers_suspended_no_inflight_sleeps_not_busy_loop(tmp_state_dir, monke
         max_workers=2,
     )
     pipeline.register_task("slow", fast_handler)
-    pipeline.enqueue([Job("slow", "j1")])
+    pipeline.enqueue(Job("slow", "j1"))
     # 挂起 __workers__：can_acquire 返回 False 且没有 job 被派发（无 in-flight）
     pipeline.resources["__workers__"].suspend(60.0)
 
@@ -288,7 +289,7 @@ def test_custom_worker_resource_zero_wait_no_busy_loop(tmp_state_dir, monkeypatc
         max_workers=2,
     )
     pipeline.register_task("slow", fast_handler)
-    pipeline.enqueue([Job("slow", "j1")])
+    pipeline.enqueue(Job("slow", "j1"))
     pipeline.resources["__workers__"] = ZeroWaitResource()
 
     real_sleep = time.sleep

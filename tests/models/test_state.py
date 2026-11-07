@@ -157,7 +157,7 @@ class TestJobUidFromSnapshot:
 
     def test_full_job_snapshot_compatible(self):
         """v2 Job.to_dict 产物（含实例位字段）同样直接提取。"""
-        assert job_uid_from_snapshot(Job("t", "j", attempt_no=2).to_dict()) == "t::j"
+        assert job_uid_from_snapshot(Job._restore("t", "j", attempt_no=2).to_dict()) == "t::j"
 
     def test_corrupt_dict_falls_back_to_content_hash(self):
         """task_type/job_id 均缺失且无法重建：按内容哈希兜底（恒定、可去重）。"""

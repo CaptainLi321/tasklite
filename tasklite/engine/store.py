@@ -42,6 +42,7 @@ from .admission import (
     ImmediateRequeuePolicy,
     RequeuePolicy,
     TriggerRegistry,
+    extract_effective_job_config,
     extract_trusted_metadata_timestamp_us,
     is_trusted_success_metadata,
 )
@@ -246,12 +247,17 @@ class StateStore:
                 raise ValueError(
                     f"Payload for job {job.uid} is not JSON-serializable: {e}"
                 ) from e
-            job_snapshot = job.to_dict()
+            job_snapshot = copy.deepcopy(job.to_dict())
         elif isinstance(job, dict):
             if "task_type" not in job or "job_id" not in job:
                 raise ValueError("Job dict must contain 'task_type' and 'job_id'")
+            payload_raw = job.get("payload")
+            if payload_raw is not None and not isinstance(payload_raw, dict):
+                raise TypeError(
+                    f"Payload must be a dict or None, got {type(payload_raw).__name__}"
+                )
             try:
-                dumps(job.get("payload", {}))
+                dumps(payload_raw if payload_raw is not None else {})
             except (TypeError, ValueError) as e:
                 job_uid = job_uid_from_snapshot(job)
                 raise ValueError(
@@ -296,11 +302,31 @@ class StateStore:
         if not job_snapshot.get("first_enqueued_at"):
             job_snapshot["first_enqueued_at"] = utc_now_iso()
 
+    def enqueue_job(self, job: Job) -> bool:
+        """单作业入队摄入管道：解析有效配置、捕获独立快照并校验同 UID 幂等/冲突。"""
+        if not isinstance(job, Job):
+            raise TypeError(
+                f"enqueue() expects a Job, got {type(job).__name__}"
+            )
+        job_snapshot = self.normalize_and_validate_job(job)
+        target_uid = job.uid
+        for queued in self._backend.load_queue():
+            try:
+                queued_uid = job_uid_from_snapshot(queued)
+            except (KeyError, TypeError, ValueError, TaskLiteError):
+                continue
+            if queued_uid == target_uid:
+                if extract_effective_job_config(queued) == extract_effective_job_config(job_snapshot):
+                    return False
+                raise TaskLiteError(
+                    f"Job {target_uid!r} is already queued with different effective configuration"
+                )
+        inserted = self._backend.enqueue_jobs([job_snapshot])
+        return bool(inserted)
+
     def enqueue_jobs(
         self,
         jobs: Job | Sequence[Job] | dict[str, Any] | Sequence[dict[str, Any]],
-        *,
-        front: bool = False,
     ) -> list[str]:
         """统一作业入队摄入管道（类型校验、序列化预检、策略规范化、资源
         注入、首入队时间填充、单事务原子插入）。
@@ -321,7 +347,26 @@ class StateStore:
             return []
 
         job_snapshots = [self.normalize_and_validate_job(j) for j in jobs_list]
-        return self._backend.enqueue_jobs(job_snapshots, front=front)
+        existing_by_uid: dict[str, dict[str, Any]] = {}
+        for queued in self._backend.load_queue():
+            try:
+                existing_by_uid[job_uid_from_snapshot(queued)] = queued
+            except (KeyError, TypeError, ValueError, TaskLiteError):
+                continue
+        fresh_snapshots: list[dict[str, Any]] = []
+        for snap in job_snapshots:
+            uid = job_uid_from_snapshot(snap)
+            if uid in existing_by_uid:
+                if extract_effective_job_config(existing_by_uid[uid]) == extract_effective_job_config(snap):
+                    continue
+                raise TaskLiteError(
+                    f"Job {uid!r} is already queued with different effective configuration"
+                )
+            existing_by_uid[uid] = snap
+            fresh_snapshots.append(snap)
+        if not fresh_snapshots:
+            return []
+        return self._backend.enqueue_jobs(fresh_snapshots)
 
     def requeue_transient(
         self,

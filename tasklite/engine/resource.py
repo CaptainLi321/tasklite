@@ -466,6 +466,21 @@ class ResourceManager(MutableMapping[str, Resource]):
             return base
         return {**defaults, **base}
 
+    def _resolve_runtime_resources(
+        self,
+        task_type: str,
+        declared_resources: Mapping[str, float]
+        | Iterable[tuple[str, float]]
+        | None = None,
+    ) -> dict[str, float]:
+        if declared_resources is None or isinstance(declared_resources, Mapping):
+            base: dict[str, float] = dict(declared_resources or {})
+        else:
+            base = dict(declared_resources)
+        if WORKER_RESOURCE in base:
+            return base
+        return self.effective_resources(task_type, base)
+
     def evaluate(
         self,
         task_type: str,
@@ -474,7 +489,7 @@ class ResourceManager(MutableMapping[str, Resource]):
         | None = None,
     ) -> ResourceEvaluation:
         """评估作业所需资源的可用性与合法性。"""
-        eff = self.effective_resources(task_type, declared_resources)
+        eff = self._resolve_runtime_resources(task_type, declared_resources)
         min_wait = 0.0
         for res_name, amount in eff.items():
             res = self._resources.get(res_name)
@@ -516,7 +531,7 @@ class ResourceManager(MutableMapping[str, Resource]):
         job_uid: str | None = None,
     ) -> ResourceLease:
         """两阶段原子预约：立即占用 CapacityResource，预检 RateLimitResource。"""
-        eff = self.effective_resources(task_type, declared_resources)
+        eff = self._resolve_runtime_resources(task_type, declared_resources)
         acquired: list[tuple[str, float]] = []
         rate_limits: list[tuple[str, float]] = []
         try:

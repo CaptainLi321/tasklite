@@ -748,19 +748,6 @@ class TestWatchdogReap:
             "timeout_is_transient=False 的超时是终局，不烧重试预算"
         )
 
-    def test_timeout_transient_job_requests_retry(self, tmp_path):
-        job = Job("t", "hang_transient", timeout_is_transient=True)
-        handle = JobHandle(
-            job_uid=job.uid, process=self._HungProcess(),
-            timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
-            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
-        )
-        completed = ExecutionChannel(tmp_path).reap_completed([handle])
-        result = completed[0][1]
-        assert result.retry_requested is True, (
-            "timeout_is_transient=True 的超时按瞬态重试处理"
-        )
-
     def test_join_window_exit_attributed_by_exitcode(self, tmp_path):
         """timeout_at_monotonic 触发 join 后自然退出 → 按 exitcode 归因（NO_IPC_RESULT），不折入 TIMEOUT。"""
         job = Job("t", "natural_exit")

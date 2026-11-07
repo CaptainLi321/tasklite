@@ -9,7 +9,7 @@ from tasklite.models.attempt import AttemptRecord
 
 def test_job_timeout_seconds_roundtrip_and_user_fields():
     user = {"timeout": 17, "error": {"new_jobs": [], "fatal": True}, "timeout_seconds": 29}
-    job = Job("t", "j", payload=user, timeout_seconds=13, runtime=user)
+    job = Job._restore("t", "j", payload=user, timeout_seconds=13, runtime=user)
     snapshot = job.to_dict()
     assert snapshot["timeout_seconds"] == 13
     assert "timeout" not in snapshot

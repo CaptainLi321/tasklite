@@ -65,8 +65,6 @@ from .errorclass import (
     ERR_DISPATCH_FAILURE,
     ERR_JOB_DEPENDENCY,
     ERR_NO_HANDLER,
-    ERR_PAYLOAD_VALIDATION,
-    validate_payload_errors,
 )
 from .in_flight import InFlightJob
 from .resource import RateLimitUnavailable
@@ -206,7 +204,8 @@ class DispatchMachine:
 
         # 2. 候选就绪：求值前不 pop 丢队，异常原位留队
         peek_snapshot = store.state.queue[sched.runnable_idx]
-        self._trigger_registry.normalize_job_snapshot(peek_snapshot, peek_snapshot["task_type"])
+        if peek_snapshot.get("trigger") is None:
+            self._trigger_registry.normalize_job_snapshot(peek_snapshot, peek_snapshot["task_type"])
         job = Job.from_dict(peek_snapshot)
         job_uid = job.uid
 
@@ -417,20 +416,6 @@ class DispatchMachine:
         try:
             with lease:
                 task = self._tasks.lookup(job.task_type)
-                if task.payload_schema is not None:
-                    errors = validate_payload_errors(job.payload, task.payload_schema)
-                    if errors:
-                        logger.error(f"Payload validation failed for {job_uid}: {errors}")
-                        lease.release()
-                        failure_metadata: dict[str, Any] = {
-                            "error_message": ERR_PAYLOAD_VALIDATION,
-                            "details": errors,
-                        }
-                        self._reject_and_commit(
-                            job_uid, job_snapshot, failure_metadata, attempt_id=attempt_id
-                        )
-                        return None
-
                 ctx = self._build_context(job, store.state)
                 logger.info(f"RUN: {job_uid}")
                 started_monotonic = time.monotonic()

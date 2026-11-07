@@ -217,7 +217,7 @@ class TestRetryBudget:
 
     def test_business_retry_advances_attempt_no(self, tmp_path):
         env = CompletionEnv(tmp_path)
-        job = Job("t", "j1", max_retries=2)
+        job = Job("t", "j1", max_retries_per_run=2)
         attempt_id = env.open_attempt(job)
         entry = env.track_entry(job, attempt_id=attempt_id)
 
@@ -259,8 +259,8 @@ class TestRetryBudget:
 
     def test_budget_exhaustion_archives(self, tmp_path):
         env = CompletionEnv(tmp_path)
-        # attempt_no=2 且 max_retries=1：允许执行条件 attempt_no <= 2 已到界
-        job = Job("t", "j1", max_retries=1, attempt_no=2)
+        # attempt_no=2 且 max_retries_per_run=1：允许执行条件 attempt_no <= 2 已到界
+        job = Job._restore("t", "j1", max_retries_per_run=1, attempt_no=2)
         job.runtime.record_retry_error("first failure")
         attempt_id = env.open_attempt(job, attempt_no=2)
         entry = env.track_entry(job, attempt_id=attempt_id)
@@ -280,7 +280,7 @@ class TestRetryBudget:
     def test_transient_zero_budget_requeues_beyond_budget(self, tmp_path):
         """瞬态信号：attempt_no 超预算仍重入队，attempt_no 不推进。"""
         env = CompletionEnv(tmp_path)
-        job = Job("t", "j1", max_retries=0, attempt_no=5)
+        job = Job._restore("t", "j1", max_retries_per_run=0, attempt_no=5)
         attempt_id = env.open_attempt(job, attempt_no=5)
         entry = env.track_entry(job, attempt_id=attempt_id)
 
@@ -581,7 +581,7 @@ class TestHookFireDiscipline:
 
     def test_retry_hook_carries_going_to_retry(self, tmp_path):
         env = CompletionEnv(tmp_path)
-        job = Job("t", "j1", max_retries=3)
+        job = Job("t", "j1", max_retries_per_run=3)
         entry = env.track_entry(job)
         env.completion.complete_job(
             entry, ExecutionResult(retry_requested=True, retry_error="flaky")
@@ -686,7 +686,7 @@ def test_cleanup_failure_preserves_original_attempt_and_no_terminal(tmp_path, mo
     from tasklite.utils.artifact import ArtifactPathPolicy
 
     env = CompletionEnv(tmp_path)
-    job = Job("t", "cleanup_failure", max_retries=0)
+    job = Job("t", "cleanup_failure", max_retries_per_run=0)
     entry = env.track_entry(job, attempt_id=env.open_attempt(job))
     output = tmp_path / "output"
     output.write_text("content")
@@ -713,7 +713,7 @@ def test_abort_cleanup_failure_requeues_every_original_snapshot(tmp_path, monkey
     from tasklite.models.artifact import ArtifactDeclaration
 
     env = CompletionEnv(tmp_path)
-    entries = [env.track_entry(Job('t', name, max_retries=3)) for name in ('one', 'two')]
+    entries = [env.track_entry(Job('t', name, max_retries_per_run=3)) for name in ('one', 'two')]
     for entry in entries:
         env.channel.journal.record_artifact(entry.job_uid, ArtifactDeclaration(
             str(tmp_path / entry.job.job_id), delete_on_failure=True,

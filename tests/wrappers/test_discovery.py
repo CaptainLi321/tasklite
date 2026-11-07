@@ -607,9 +607,9 @@ def test_real_subprocess_discovery(tmp_path, monkeypatch):
         group_key_func=_rt_cursor_key,
     )
     pipeline.register_task("rt_child", _rt_child_handler)
-    pipeline.enqueue([Job("rt_disc", "seed", payload={
+    pipeline.enqueue(Job("rt_disc", "seed", payload={
         "artist_id": "1", "posts": _rt_posts_upto(5),
-    })])
+    }))
     pipeline.run()
 
     successes = pipeline.backend.load_successes()
@@ -632,17 +632,17 @@ def test_real_subprocess_rediscovery(tmp_path, monkeypatch):
     pipeline.register_task("rt_child", _rt_child_handler)
 
     # 第一次发现：0..3
-    pipeline.enqueue([Job("rt_disc2", "seed", payload={
+    pipeline.enqueue(Job("rt_disc2", "seed", payload={
         "artist_id": "2", "posts": _rt_posts_upto(4),
-    })])
+    }))
     pipeline.run()
     wall1 = pipeline.backend.load_successes()
     assert len([k for k in wall1 if k.startswith("rt_child::")]) == 4
 
     # 第二次发现：旧 0..3 + 新 10、11（新内容排最前）
-    pipeline.enqueue([Job("rt_disc2", "seed2", payload={
+    pipeline.enqueue(Job("rt_disc2", "seed2", payload={
         "artist_id": "2", "posts": _rt_posts_with_new(4, [10, 11]),
-    })])
+    }))
     pipeline.run()
 
     successes = pipeline.backend.load_successes()
@@ -662,7 +662,7 @@ def test_real_subprocess_max_pages(tmp_path, monkeypatch):
         max_pages=2,
     )
     pipeline.register_task("rt_child", _rt_child_handler)
-    pipeline.enqueue([Job("rt_disc3", "seed", payload={"artist_id": "3", "posts": posts})])
+    pipeline.enqueue(Job("rt_disc3", "seed", payload={"artist_id": "3", "posts": posts}))
     pipeline.run()  # 不应超时/失败
 
     successes = pipeline.backend.load_successes()
@@ -694,7 +694,7 @@ def test_real_subprocess_full_mode_with_max_pages(tmp_path, monkeypatch):
     ])
 
     # 派发 full 扫描：第 1、2 页即使整页全命中也不 break，继续扫到第 3 页，并在 max_pages=3 处截断
-    pipeline.enqueue([Job("rt_disc_full", "seed", payload={"artist_id": "full1", "posts": posts})])
+    pipeline.enqueue(Job("rt_disc_full", "seed", payload={"artist_id": "full1", "posts": posts}))
     pipeline.run()
 
     successes = pipeline.backend.load_successes()
@@ -726,7 +726,7 @@ def test_payload_dynamic_override_scan_mode_and_max_pages(tmp_path, monkeypatch)
     ])
 
     # 派发 job 时动态覆盖为 full 模式且 max_pages=2
-    pipeline.enqueue([
+    pipeline.enqueue(
         Job(
             "rt_disc_dyn",
             "seed",
@@ -737,7 +737,7 @@ def test_payload_dynamic_override_scan_mode_and_max_pages(tmp_path, monkeypatch)
                 "max_pages": 2,
             },
         )
-    ])
+    )
     pipeline.run()
 
     successes = pipeline.backend.load_successes()

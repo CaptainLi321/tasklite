@@ -180,7 +180,7 @@ class TestInFlightTrackerResourceRelease:
         lease = rm.reserve("t", {"gpu": 3.0}, job_uid="t::j1")
         assert gpu.used == 3.0
 
-        job = Job("t", "j1", {"gpu": 3.0})
+        job = Job("t", "j1", payload={"gpu": 3.0})
         entry = InFlightJob(job_uid="t::j1", job_snapshot=job.to_dict(), job=job, lease=lease)
         assert entry.acquired == [("gpu", 3.0)]
 

@@ -317,16 +317,21 @@ class TestRegisterTask:
             "fetch",
             ok_handler,
             resources={"api": 1.0},
-            max_retries=1,
+            max_retries_per_run=1,
             timeout_seconds=30,
-            timeout_is_transient=True,
+            trigger="always",
         )
         spec = p.tasks.lookup("fetch")
         assert spec.handler is ok_handler
         assert spec.resources == {"api": 1.0}
-        assert spec.max_retries == 1
+        assert spec.max_retries_per_run == 1
         assert spec.timeout_seconds == 30
-        assert spec.timeout_is_transient is True
+        assert spec.trigger == "always"
+
+    def test_simple_form_config_is_keyword_only(self, tmp_path):
+        p = make_pipeline(tmp_path)
+        with pytest.raises(TypeError):
+            p.register_task("fetch", ok_handler, {"api": 1.0})  # type: ignore[misc]
 
     def test_simple_form_requires_handler(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -348,13 +353,15 @@ class TestRegisterTask:
         with pytest.raises(ValueError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), resources={"a": 1})
         with pytest.raises(ValueError, match="extra spec"):
-            p.register_task(Task("fetch", ok_handler), payload_schema=dict)
+            p.register_task(Task("fetch", ok_handler), max_retries_per_run=0)
         with pytest.raises(ValueError, match="extra spec"):
-            p.register_task(Task("fetch", ok_handler), max_retries=0)
+            p.register_task(Task("fetch", ok_handler), max_retries_per_run=3)
         with pytest.raises(ValueError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), timeout_seconds=60)
         with pytest.raises(ValueError, match="extra spec"):
-            p.register_task(Task("fetch", ok_handler), timeout_is_transient=True)
+            p.register_task(Task("fetch", ok_handler), trigger="once")
+        with pytest.raises(TypeError):
+            p.register_task("fetch", ok_handler, payload_schema=dict)  # type: ignore[call-arg]
 
     def test_duplicate_registration_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -454,50 +461,144 @@ class TestRegisterTransientException:
 
 
 class TestEnqueue:
-    """enqueue 摄入：front 语义、successes 不拦、注入管道。"""
+    """enqueue 摄入：单 Job 入参、有效配置解析与幂等/冲突、快照隔离、successes 不拦。"""
 
-    def test_single_job_wrapped(self, tmp_path):
+    def test_single_job_returns_true_on_first_enqueue(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.enqueue(Job("fetch", "a"))
+        assert p.enqueue(Job("fetch", "a")) is True
         assert len(p.backend.load_queue()) == 1
 
-    def test_list_of_jobs(self, tmp_path):
+    def test_list_or_non_job_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.enqueue([Job("fetch", "a"), Job("fetch", "b")])
-        assert len(p.backend.load_queue()) == 2
+        for bad in ([Job("fetch", "a")], [], "bad", 42, {"task_type": "fetch", "job_id": "a"}):
+            with pytest.raises(TypeError, match="expects a Job"):
+                p.enqueue(bad)  # type: ignore[arg-type]
 
-    def test_empty_list_noop(self, tmp_path):
+    def test_same_uid_identical_effective_config_returns_false(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.enqueue([])
-        assert p.backend.load_queue() == []
-
-    def test_non_job_element_rejected(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with pytest.raises(TypeError, match="expects Job objects"):
-            p.enqueue([Job("fetch", "a"), "bad"])
-
-    def test_non_sequence_rejected(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with pytest.raises(TypeError, match="expects a Job"):
-            p.enqueue(42)
-
-    def test_duplicate_uid_silently_skipped(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        p.enqueue([Job("fetch", "a"), Job("fetch", "a")])
+        p.register_task(
+            "fetch",
+            ok_handler,
+            resources={"gpu": 1.0},
+            max_retries_per_run=5,
+            timeout_seconds=120,
+            trigger="once",
+        )
+        assert p.enqueue(Job("fetch", "a")) is True
+        # 显式传入与继承后的有效配置完全等价（且空 {} 不清空 Task 资源）→ 返回 False
+        assert (
+            p.enqueue(
+                Job(
+                    "fetch",
+                    "a",
+                    payload={},
+                    depends_on=[],
+                    files={},
+                    resources={},
+                    max_retries_per_run=5,
+                    timeout_seconds=120,
+                    trigger="once",
+                )
+            )
+            is False
+        )
         assert len(p.backend.load_queue()) == 1
 
-    def test_front_inserts_at_head(self, tmp_path):
+    def test_same_uid_different_effective_config_raises_tasklite_error(self, tmp_path):
+        from tasklite import TaskLiteError
+
         p = make_pipeline(tmp_path)
-        p.enqueue([Job("fetch", "tail")])
-        p.enqueue(Job("fetch", "head"), front=True)
-        queue = p.backend.load_queue()
-        assert queue[0]["job_id"] == "head"
-        assert queue[1]["job_id"] == "tail"
+        p.register_task("fetch", ok_handler, resources={"gpu": 1.0})
+        assert p.enqueue(Job("fetch", "a", payload={"x": 1})) is True
+        for conflicting_job in (
+            Job("fetch", "a", payload={"x": 2}),
+            Job("fetch", "a", payload={"x": 1}, depends_on=["fetch::dep"]),
+            Job("fetch", "a", payload={"x": 1}, files={"out": "p"}),
+            Job("fetch", "a", payload={"x": 1}, resources={"gpu": 2.0}),
+            Job("fetch", "a", payload={"x": 1}, max_retries_per_run=0),
+            Job("fetch", "a", payload={"x": 1}, timeout_seconds=10),
+            Job("fetch", "a", payload={"x": 1}, trigger="always"),
+        ):
+            with pytest.raises(TaskLiteError, match="already queued with different effective configuration"):
+                p.enqueue(conflicting_job)
+        assert len(p.backend.load_queue()) == 1
+
+    def test_front_argument_rejected(self, tmp_path):
+        p = make_pipeline(tmp_path)
+        with pytest.raises(TypeError):
+            p.enqueue(Job("fetch", "a"), front=True)  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            p.enqueue(Job("fetch", "a"), True)  # type: ignore[misc]
+
+    def test_mutating_submitted_payload_or_resources_does_not_pollute_snapshot(self, tmp_path):
+        p = make_pipeline(tmp_path)
+        task_res = {"cpu": 2.0}
+        p.register_task("fetch", ok_handler, resources=task_res)
+        src_payload = {"nested": {"items": [1, 2]}}
+        src_resources = {"gpu": 1.0}
+        job = Job("fetch", "a", payload=src_payload, resources=src_resources)
+        assert p.enqueue(job) is True
+
+        # 修改提交源字典、Task 源字典与 Job 实例属性均不得污染已接纳快照
+        task_res["cpu"] = 99.0
+        src_payload["nested"]["items"].append(3)
+        src_resources["gpu"] = 88.0
+        job.payload["nested"]["items"].append(4)
+        assert job.resources is not None
+        job.resources["gpu"] = 77.0
+
+        (row,) = p.backend.load_queue()
+        assert row["payload"] == {"nested": {"items": [1, 2]}}
+        assert row["resources"] == {"cpu": 2.0, "gpu": 1.0, "__workers__": 1.0}
+
+    def test_pending_recovery_across_runs_preserves_accepted_snapshot(self, tmp_path, monkeypatch):
+        """跨次恢复 pending 不套用新 Task 默认。"""
+        p1 = TaskLite(name="recover", state_dir=str(tmp_path), max_workers=1)
+        p1.register_resource(CapacityResource("gpu", 2.0))
+        p1.register_task(
+            "fetch",
+            ok_handler,
+            resources={"gpu": 1.0},
+            max_retries_per_run=1,
+            timeout_seconds=15,
+            trigger="once",
+        )
+        assert p1.enqueue(Job("fetch", "a")) is True
+        p1.stop()
+
+        observed: list[dict[str, Any]] = []
+
+        class CapturingProcess(make_instant_process_class()):
+            def __init__(self, *, args=(), **kwargs):
+                spec = args[0]
+                observed.append(spec.job.to_dict())
+                super().__init__(args=args, **kwargs)
+
+        monkeypatch.setattr(mp, "Process", CapturingProcess)
+        p2 = TaskLite(name="recover", state_dir=str(tmp_path), max_workers=1)
+        p2.register_resource(CapacityResource("gpu", 2.0))
+        # 新运行注册了完全不同的 Task 默认（甚至包含未注册资源 extra_vram）
+        p2.register_task(
+            "fetch",
+            ok_handler,
+            resources={"gpu": 2.0, "extra_vram": 99.0},
+            max_retries_per_run=9,
+            timeout_seconds=999,
+            trigger="always",
+        )
+        summary = p2.run()
+        p2.stop()
+        assert summary.stats["succeeded"] == 1
+        assert len(observed) == 1
+        assert observed[0]["resources"] == {"gpu": 1.0, "__workers__": 1.0}
+        assert observed[0]["max_retries_per_run"] == 1
+        assert observed[0]["timeout_seconds"] == 15
+        assert observed[0]["trigger"] == "once"
 
     def test_wall_hit_not_blocked_at_enqueue(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.seed_successes(["fetch::done"])
-        p.enqueue(Job("fetch", "done"))
+        assert p.enqueue(Job("fetch", "done")) is True
         assert len(p.backend.load_queue()) == 1
 
     def test_intake_pipeline_injections(self, tmp_path):
@@ -511,11 +612,6 @@ class TestEnqueue:
         restored = Job.from_dict(row)
         assert restored.timeout_seconds == 17
         assert restored.payload == {"timeout": "业务时限"}
-
-    def test_front_is_keyword_only(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with pytest.raises(TypeError):
-            p.enqueue(Job("fetch", "a"), True)
 
     def test_run_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -554,7 +650,8 @@ class TestFilterJobsWithoutSuccess:
     def test_enqueue_composition_only_enqueues_jobs_without_success(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.seed_successes(["fetch::done"])
-        p.enqueue(p.filter_jobs_without_success([Job("fetch", "done"), Job("fetch", "new")]))
+        for job in p.filter_jobs_without_success([Job("fetch", "done"), Job("fetch", "new")]):
+            p.enqueue(job)
         queued = {f"{r['task_type']}::{r['job_id']}" for r in p.backend.load_queue()}
         assert queued == {"fetch::new"}
 
@@ -594,7 +691,8 @@ class TestSixStepContract:
         p.register_resource(CapacityResource("gpu", 2.0))
         p.register_task("fetch", ok_handler, resources={"gpu": 1.0})
         p.register_transient_exception(BizError)
-        p.enqueue([Job("fetch", "a"), Job("fetch", "b")])
+        p.enqueue(Job("fetch", "a"))
+        p.enqueue(Job("fetch", "b"))
 
         monkeypatch.setattr(mp, "Process", make_instant_process_class())
         summary = p.run()
@@ -687,7 +785,8 @@ class TestSchedulingSeamWiring:
             on_attempt_finished=on_attempt_finished,
         )
         p.register_task("fetch", ok_handler)
-        p.enqueue([Job("fetch", "a"), Job("fetch", "b"), Job("fetch", "c")])
+        for jid in ("a", "b", "c"):
+            p.enqueue(Job("fetch", jid))
         monkeypatch.setattr(mp, "Process", make_instant_process_class())
         p.run()
 
@@ -701,7 +800,8 @@ class TestSchedulingSeamWiring:
 
         p = make_pipeline(tmp_path, on_attempt_finished=on_attempt_finished)
         p.register_task("fetch", ok_handler)
-        p.enqueue([Job("fetch", "a"), Job("fetch", "b"), Job("fetch", "c")])
+        for jid in ("a", "b", "c"):
+            p.enqueue(Job("fetch", jid))
         monkeypatch.setattr(mp, "Process", make_instant_process_class())
         p.run()
 
@@ -726,7 +826,8 @@ class TestSchedulingSeamWiring:
             on_attempt_finished=on_attempt_finished,
         )
         p.register_task("fetch", ok_handler)
-        p.enqueue([Job("fetch", "flaky", max_retries=1), Job("fetch", "later")])
+        p.enqueue(Job("fetch", "flaky", max_retries_per_run=1))
+        p.enqueue(Job("fetch", "later"))
         monkeypatch.setattr(
             mp, "Process", make_instant_process_class(retry_uid="fetch::flaky")
         )
@@ -753,7 +854,8 @@ class TestSchedulingSeamWiring:
             on_attempt_finished=on_attempt_finished,
         )
         p.register_task("fetch", ok_handler)
-        p.enqueue([Job("fetch", "flaky", max_retries=1), Job("fetch", "later")])
+        p.enqueue(Job("fetch", "flaky", max_retries_per_run=1))
+        p.enqueue(Job("fetch", "later"))
         monkeypatch.setattr(
             mp, "Process", make_instant_process_class(retry_uid="fetch::flaky")
         )

@@ -28,15 +28,16 @@ class TestTaskCreation:
     """Task 构造与默认值。"""
 
     def test_create_with_minimal_args(self):
-        """仅必填项构造：默认值对齐 v2 Job 默认。"""
+        """仅必填项构造：默认值对齐 Task 规格默认。"""
         task = Task(task_type="download", handler=_handler)
         assert task.task_type == "download"
         assert task.handler is _handler
         assert task.resources == {}
-        assert task.payload_schema is None
-        assert task.max_retries == 3
+        assert task.max_retries_per_run == 3
         assert task.timeout_seconds == 3600
-        assert task.timeout_is_transient is False
+        assert task.trigger == "once"
+        assert not hasattr(task, "payload_schema")
+        assert not hasattr(task, "timeout_is_transient")
 
     def test_create_with_all_fields(self):
         """全字段显式构造。"""
@@ -44,27 +45,40 @@ class TestTaskCreation:
             task_type="encode",
             handler=_handler,
             resources={"gpu": 1.0},
-            payload_schema=dict,
-            max_retries=5,
+            max_retries_per_run=5,
             timeout_seconds=7200,
-            timeout_is_transient=True,
+            trigger="always",
         )
         assert task.resources == {"gpu": 1.0}
-        assert task.payload_schema is dict
-        assert task.max_retries == 5
+        assert task.max_retries_per_run == 5
         assert task.timeout_seconds == 7200
-        assert task.timeout_is_transient is True
+        assert task.trigger == "always"
 
-    def test_timeout_is_transient_is_keyword_only(self):
-        """timeout_is_transient 为 kw-only：尾部布尔的位置传参显式拒绝。"""
+    def test_config_fields_are_keyword_only(self):
+        """task_type 与 handler 之后的配置参数全部 keyword-only，位置传参被拒。"""
         with pytest.raises(TypeError):
-            Task("t", _handler, None, None, 3, 3600, True)
+            Task("t", _handler, {"gpu": 1.0})  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            Task("t", _handler, None, 3, 3600, "once")  # type: ignore[misc]
+
+    def test_removed_and_job_only_fields_rejected(self):
+        """已移除字段与仅属于 Job 的字段在 Task 构造时抛出 TypeError。"""
+        for kw in (
+            {"payload_schema": dict},
+            {"max_retries": 3},
+            {"timeout_is_transient": True},
+            {"payload": {}},
+            {"depends_on": []},
+            {"files": {}},
+        ):
+            with pytest.raises(TypeError):
+                Task("t", _handler, **kw)  # type: ignore[arg-type]
 
     def test_frozen_fields_reject_assignment(self):
         """Task 为 frozen 规格：字段赋值显式拒绝。"""
         task = Task(task_type="t", handler=_handler)
         with pytest.raises(FrozenInstanceError):
-            task.max_retries = 9  # type: ignore[misc]
+            task.max_retries_per_run = 9  # type: ignore[misc]
 
     def test_resources_copied_and_isolated(self):
         """默认资源浅拷贝隔离：注册后的外部就地变异不漂移规格。"""
@@ -101,47 +115,33 @@ class TestTaskValidation:
         with pytest.raises(TypeError, match="handler must be callable"):
             Task(task_type="t", handler="not_callable")
 
-    def test_payload_schema_must_be_type_or_none(self):
-        """payload_schema 传实例/字符串在运行时校验会静默失效，入口拒绝。"""
-        with pytest.raises(TypeError, match="payload_schema must be a type"):
-            Task(task_type="t", handler=_handler, payload_schema={"k": str})
-        with pytest.raises(TypeError, match="payload_schema must be a type"):
-            Task(task_type="t", handler=_handler, payload_schema="TypedDictName")
+    def test_max_retries_per_run_matrix_rejected(self):
+        """max_retries_per_run 拒绝非 int / bool / 负值。"""
+        with pytest.raises(TypeError, match="max_retries_per_run must be an int"):
+            Task(task_type="t", handler=_handler, max_retries_per_run="3")  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="max_retries_per_run must be an int"):
+            Task(task_type="t", handler=_handler, max_retries_per_run=True)
+        with pytest.raises(ValueError, match="max_retries_per_run must be >= 0"):
+            Task(task_type="t", handler=_handler, max_retries_per_run=-1)
 
-    def test_max_retries_matrix_rejected(self):
-        """max_retries 拒绝非 int / bool / 负值。"""
-        with pytest.raises(TypeError, match="max_retries must be an int"):
-            Task(task_type="t", handler=_handler, max_retries="3")
-        with pytest.raises(TypeError, match="max_retries must be an int"):
-            Task(task_type="t", handler=_handler, max_retries=True)
-        with pytest.raises(ValueError, match="max_retries must be >= 0"):
-            Task(task_type="t", handler=_handler, max_retries=-1)
-
-    def test_max_retries_zero_allowed(self):
-        """max_retries=0：任何失败直接进失败档案（合法边界）。"""
-        task = Task(task_type="t", handler=_handler, max_retries=0)
-        assert task.max_retries == 0
+    def test_max_retries_per_run_zero_allowed(self):
+        """max_retries_per_run=0：任何失败直接进失败档案（合法边界）。"""
+        task = Task(task_type="t", handler=_handler, max_retries_per_run=0)
+        assert task.max_retries_per_run == 0
 
     def test_timeout_matrix_rejected(self):
         """timeout_seconds 拒绝非数值 / bool / 零 / 负值 / NaN / Inf / 超大 int。"""
         with pytest.raises(TypeError, match="timeout_seconds must be a number"):
-            Task(task_type="t", handler=_handler, timeout_seconds="60")
+            Task(task_type="t", handler=_handler, timeout_seconds="60")  # type: ignore[arg-type]
         with pytest.raises(TypeError, match="timeout_seconds must be a number"):
             Task(task_type="t", handler=_handler, timeout_seconds=True)
-        for bad in (0, -1, float("nan"), float("inf"), 10**400):
+        for bad in (0, -1, float("nan"), float("inf"), float("-inf"), 10**400):
             with pytest.raises(ValueError, match="timeout_seconds must be finite and > 0"):
                 Task(task_type="t", handler=_handler, timeout_seconds=bad)
 
     def test_timeout_float_accepted(self):
         task = Task(task_type="t", handler=_handler, timeout_seconds=1.5)
         assert task.timeout_seconds == 1.5
-
-    def test_timeout_is_transient_must_be_bool(self):
-        """非 bool 真值会静默改变超时归类语义，入口拒绝。"""
-        with pytest.raises(TypeError, match="timeout_is_transient must be a bool"):
-            Task(task_type="t", handler=_handler, timeout_is_transient="yes")
-        with pytest.raises(TypeError, match="timeout_is_transient must be a bool"):
-            Task(task_type="t", handler=_handler, timeout_is_transient=1)
 
     def test_resources_amount_matrix_rejected(self):
         """默认资源 amount 拒绝矩阵——bool/NaN/Inf/负值/超大 int/非数值。"""
@@ -213,9 +213,9 @@ class TestTaskRegistry:
     def test_distinct_registrations_coexist(self):
         reg = TaskRegistry()
         first = Task(task_type="a", handler=_handler)
-        second = Task(task_type="b", handler=_handler, max_retries=0)
+        second = Task(task_type="b", handler=_handler, max_retries_per_run=0)
         reg.register(first)
         reg.register(second)
         assert reg.lookup("a") is first
         assert reg.lookup("b") is second
-        assert reg.lookup("b").max_retries == 0
+        assert reg.lookup("b").max_retries_per_run == 0

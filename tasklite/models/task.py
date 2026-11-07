@@ -1,7 +1,7 @@
 """Task 规格层：进程内注册的静态任务模板（ADR-0004 三层模型的规格位）。
 
 Task = 产生同构 Job 序列的静态规格模板：task_type 名、handler、默认
-resources、payload_schema 与默认重试/超时策略。代码即规格，不落盘；
+resources 与默认重试/超时/触发策略。代码即规格，不落盘；
 注册于 TaskRegistry（``register_task`` 的唯一落点）。
 
 与 Job 的字段分工：Task 持有「该类任务全部实例共享」的默认值，Job 的
@@ -9,8 +9,8 @@ resources、payload_schema 与默认重试/超时策略。代码即规格，不�
 activation_no / first_enqueued_at）只属于单次激活，不出现在 Task。
 
 本模块同时承载模型层共享的校验单点（``validate_task_type`` /
-``validate_retry_budget`` / ``validate_timeout_seconds`` / ``validate_timeout_flag``
-/ ``validate_resource_amounts``）：Task 的规格字段与 Job 的同名字段共用
+``validate_retry_budget`` / ``validate_timeout_seconds`` /
+``validate_resource_amounts``）：Task 的规格字段与 Job 的同名字段共用
 同一套拒绝规则与报错文案，单点维护防止两侧语义漂移。
 """
 from __future__ import annotations
@@ -105,32 +105,19 @@ def _validate_handler(handler: Any) -> None:
         )
 
 
-def _validate_payload_schema(payload_schema: Any) -> None:
-    """payload_schema 入口校验：None 或类型对象。
-
-    文档约定 payload_schema 必须是 TypedDict 类；传实例/字符串等会在
-    运行时校验时静默失效，入口 fail-loud。
-    """
-    if payload_schema is not None and not isinstance(payload_schema, type):
-        raise TypeError(
-            f"payload_schema must be a type (e.g. TypedDict class) or None, "
-            f"got {type(payload_schema).__name__}"
-        )
-
-
-def validate_retry_budget(max_retries: Any) -> None:
-    """max_retries 入口校验：非 bool 的 int 且 >= 0（Task/Job 共用）。
+def validate_retry_budget(max_retries_per_run: Any) -> None:
+    """max_retries_per_run 入口校验：非 bool 的 int 且 >= 0（Task/Job 共用）。
 
     isinstance 检查必须在 < 0 之前——字符串脏数据会先触发比较处的原始
     TypeError，友好报错失效。
     """
-    if not isinstance(max_retries, int) or isinstance(max_retries, bool):
+    if not isinstance(max_retries_per_run, int) or isinstance(max_retries_per_run, bool):
         raise TypeError(
-            f"max_retries must be an int, got {type(max_retries).__name__} "
-            f"({max_retries!r})"
+            f"max_retries_per_run must be an int, got {type(max_retries_per_run).__name__} "
+            f"({max_retries_per_run!r})"
         )
-    if max_retries < 0:
-        raise ValueError(f"max_retries must be >= 0, got {max_retries}")
+    if max_retries_per_run < 0:
+        raise ValueError(f"max_retries_per_run must be >= 0, got {max_retries_per_run}")
 
 
 def validate_timeout_seconds(timeout_seconds: Any) -> None:
@@ -149,61 +136,33 @@ def validate_timeout_seconds(timeout_seconds: Any) -> None:
         raise ValueError(f"timeout_seconds must be finite and > 0, got {timeout_seconds}")
 
 
-def validate_timeout_flag(timeout_is_transient: Any) -> None:
-    """timeout_is_transient 入口校验：必须为 bool（Task/Job 共用）。
-
-    非 bool 值（如字符串）在执行侧的 ``job.timeout_is_transient`` 判断时
-    被当作真值，静默改变超时归类语义，入口拒绝。
-    """
-    if not isinstance(timeout_is_transient, bool):
-        raise TypeError(
-            f"timeout_is_transient must be a bool, got "
-            f"{type(timeout_is_transient).__name__} ({timeout_is_transient!r})"
-        )
-
-
 @dataclass(frozen=True)
 class Task:
     """产生同构 Job 序列的静态规格模板（不落盘，代码即规格）。
 
     Attributes:
         task_type: 任务类型名（须与 Job.task_type 一致）；非空 str。
-        handler: 任务处理函数，期望签名 ``handler(job, ctx)``，返回值语义：
-            None/True 表示成功，False 表示失败，dict 作为成功元数据，
-            tuple[bool, dict] 组合形式；抛 RetryError 推回队列重试，抛
-            FatalError 直接进失败档案（不消耗重试预算）。
+        handler: 任务处理函数，期望签名 ``handler(job, ctx)``。
         resources: 该类任务的默认资源占用映射；Job 构造时可用
-            ``resources`` 覆盖。构造后浅拷贝隔离外部就地变异。
-        payload_schema: 可选 TypedDict 类，派发前对 payload 做运行时
-            校验，校验失败直接进失败档案。
-        max_retries: 默认重试预算上限（对齐 v2 Job 默认 3）；允许执行
-            条件为 ``attempt_no <= max_retries + 1``。
-        timeout_seconds: 默认执行超时秒数（对齐 v2 Job 默认 3600），有限正数。
+            ``resources`` 按 key 覆盖。构造后浅拷贝隔离外部就地变异。
+        max_retries_per_run: 单次运行内默认重试预算上限（默认 3）；允许执行
+            条件为 ``attempt_no <= max_retries_per_run + 1``。
+        timeout_seconds: 默认执行超时秒数（默认 3600），有限正数。
         trigger: 首次尝试的触发器名称，默认 once；发现任务默认 always。
-        timeout_is_transient: 超时是否视为瞬态失败（默认 False 保持保守
-            语义）。True 时看门狗超时按重试处理而非直接进失败档案，
-            适用于设计上可能长跑的任务——「超时」的语义是「没跑完」，
-            不等于「确定性失败」。
     """
 
     task_type: str
     handler: Callable[..., Any]
-    resources: dict[str, float] | None = None
-    payload_schema: type | None = None
-    max_retries: int = 3
-    timeout_seconds: int | float = 3600
-    # kw-only：规格位尾部布尔以显式关键字表达，位置传参在构造点静默
-    # 漂移（如误占 timeout_seconds 位）由签名直接拒绝
-    timeout_is_transient: bool = field(kw_only=True, default=False)
+    resources: dict[str, float] | None = field(kw_only=True, default=None)
+    max_retries_per_run: int = field(kw_only=True, default=3)
+    timeout_seconds: int | float = field(kw_only=True, default=3600)
     trigger: str = field(kw_only=True, default="once")
 
     def __post_init__(self) -> None:
         validate_task_type(self.task_type)
         _validate_handler(self.handler)
-        _validate_payload_schema(self.payload_schema)
-        validate_retry_budget(self.max_retries)
+        validate_retry_budget(self.max_retries_per_run)
         validate_timeout_seconds(self.timeout_seconds)
-        validate_timeout_flag(self.timeout_is_transient)
         validate_trigger(self.trigger)
         resources_raw = self.resources if self.resources is not None else {}
         # 容器类型与 amount 校验须先于拷贝——str/序列等可迭代类型会在
@@ -277,5 +236,5 @@ __all__ = [
     "validate_retry_budget",
     "validate_task_type",
     "validate_timeout_seconds",
-    "validate_timeout_flag",
+    "validate_trigger",
 ]

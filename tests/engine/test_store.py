@@ -328,7 +328,7 @@ class TestApplyRetry:
     """apply_retry 重试重入队。"""
 
     def _retry_job_snapshot(self) -> dict:
-        return Job("t", "1", attempt_no=2).to_dict()
+        return Job._restore("t", "1", attempt_no=2).to_dict()
 
     def test_commit_path_requeues_front_and_records_stats(self):
         stats = RunStats()
@@ -720,7 +720,7 @@ class TestIntakePipeline:
 
     def test_enqueue_does_not_refresh_first_enqueued_at(self):
         store, _, _ = _make_store()
-        job = Job("t", "1", first_enqueued_at="2026-01-01T00:00:00+00:00")
+        job = Job._restore("t", "1", first_enqueued_at="2026-01-01T00:00:00+00:00")
         jd = store.normalize_and_validate_job(job)
         assert jd["first_enqueued_at"] == "2026-01-01T00:00:00+00:00"
 
@@ -756,6 +756,49 @@ class TestIntakePipeline:
         store.enqueue_jobs(src)
         src["payload"]["k"] = 999
         assert backend.load_queue()[0]["payload"]["k"] == 1
+
+    def test_enqueue_job_same_uid_idempotent_vs_conflict(self):
+        from tasklite import Task, TaskLiteError, TaskRegistry
+
+        tasks = TaskRegistry()
+        tasks.register(
+            Task(
+                "t",
+                lambda job, ctx: True,
+                resources={"gpu": 1.0},
+                max_retries_per_run=4,
+                timeout_seconds=120,
+                trigger="once",
+            )
+        )
+        store = StateStore(
+            InMemoryStateBackend(),
+            PipelineState({}, {}, {}, []),
+            trigger_registry=TriggerRegistry(tasks=tasks),
+        )
+        assert store.enqueue_job(Job("t", "1")) is True
+        # 显式传入与继承后的有效配置完全等价（且空 dict 不清空 Task 资源）→ 返回 False
+        assert (
+            store.enqueue_job(
+                Job(
+                    "t",
+                    "1",
+                    payload={},
+                    depends_on=[],
+                    files={},
+                    resources={},
+                    max_retries_per_run=4,
+                    timeout_seconds=120,
+                    trigger="once",
+                )
+            )
+            is False
+        )
+        # 有效配置不同 → 抛 TaskLiteError
+        with pytest.raises(TaskLiteError):
+            store.enqueue_job(Job("t", "1", payload={"diff": 1}))
+        with pytest.raises(TaskLiteError):
+            store.enqueue_job(Job("t", "1", max_retries_per_run=0))
 
     def test_normalize_spawned_job_matches_intake_rules(self):
         store = StateStore(

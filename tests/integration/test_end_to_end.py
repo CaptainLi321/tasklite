@@ -182,7 +182,7 @@ class TestEndToEnd:
     def test_failure_lands_in_archive_with_attempt_trace(self, tmp_path):
         p = _make_pipeline(tmp_path)
         p.register_task("work", explode_handler)
-        p.enqueue(Job("work", "item_beta", max_retries=0))
+        p.enqueue(Job("work", "item_beta", max_retries_per_run=0))
         p.run()
         p.stop()
 
@@ -201,7 +201,7 @@ class TestEndToEnd:
         p = _make_pipeline(tmp_path)
         p.register_task("work", always_transient_handler)
         p.register_transient_exception(TransientSampleError)
-        p.enqueue(Job("work", "item_gamma", max_retries=2))
+        p.enqueue(Job("work", "item_gamma", max_retries_per_run=2))
         p.run()
         p.stop()
 
@@ -217,7 +217,7 @@ class TestEndToEnd:
         p = _make_pipeline(tmp_path)
         p.register_task("work", flaky_first_attempt_handler)
         p.register_transient_exception(TransientSampleError)
-        p.enqueue(Job("work", "item_delta", max_retries=3))
+        p.enqueue(Job("work", "item_delta", max_retries_per_run=3))
         summary = p.run()
         p.stop()
 
@@ -233,7 +233,7 @@ class TestEndToEnd:
         p = _make_pipeline(tmp_path)
         p.register_task("work", fail_once_then_ok_handler)
         p.enqueue(
-            Job("work", "item_eps", payload={"k": "v"}, max_retries=0)
+            Job("work", "item_eps", payload={"k": "v"}, max_retries_per_run=0)
         )
         p.run()
 
@@ -300,13 +300,9 @@ class TestEndToEnd:
         )
         p.register_resource(CapacityResource("io_slots", 4.0))
         p.register_task("work", ok_with_input_handler)
-        p.enqueue(
-            [
-                Job("work", "step_one"),
-                Job("work", "step_two"),
-                Job("work", "step_one"),  # 重复 uid 静默去重
-            ]
-        )
+        assert p.enqueue(Job("work", "step_one")) is True
+        assert p.enqueue(Job("work", "step_two")) is True
+        assert p.enqueue(Job("work", "step_one")) is False  # 重复 uid 幂等去重
         summary = p.run()
         p.stop()
 
@@ -369,7 +365,7 @@ class TestEnvFaultExhaustion:
         """
         p = _make_pipeline(tmp_path)
         p.register_task("crash", ok_with_input_handler)
-        p.enqueue(Job("crash", "item_env_crash", max_retries=1))
+        p.enqueue(Job("crash", "item_env_crash", max_retries_per_run=1))
 
         monkeypatch.setattr(mp, "Process", make_exit_crash_process_class())
         p.run()
@@ -437,7 +433,7 @@ class TestRealSubprocessFaultScenarios:
         """短 timeout + 挂起 handler → 看门狗击杀 → 超时归因进失败档案。"""
         p = _make_pipeline(tmp_path)
         p.register_task("hung", hung_handler)
-        p.enqueue(Job("hung", "item_watchdog", timeout_seconds=0.2, max_retries=0))
+        p.enqueue(Job("hung", "item_watchdog", timeout_seconds=0.2, max_retries_per_run=0))
         p.run()
         p.stop()
 
@@ -466,12 +462,8 @@ class TestRealSubprocessFaultScenarios:
         # waiter 抢在 holder 结算前派发」的调度竞态（Windows 高负载下子进程
         # 启动可超过 interval）。依赖使 waiter 只能在 holder 终态后参与调度，
         # 挂起恢复窗口的断言才具备确定性下界。
-        p.enqueue(
-            [
-                Job("gated", "holder"),
-                Job("gated_plain", "waiter", depends_on=["gated::holder"]),
-            ]
-        )
+        p.enqueue(Job("gated", "holder"))
+        p.enqueue(Job("gated_plain", "waiter", depends_on=["gated::holder"]))
         summary = p.run()
         p.stop()
 
@@ -500,7 +492,7 @@ class TestRealSubprocessFaultScenarios:
         """
         p = _make_pipeline(tmp_path)
         p.register_task("interrupted", interrupted_first_handler)
-        p.enqueue(Job("interrupted", "item_interrupted", max_retries=1))
+        p.enqueue(Job("interrupted", "item_interrupted", max_retries_per_run=1))
         summary = p.run()
         p.stop()
 
@@ -517,7 +509,7 @@ class TestRealSubprocessFaultScenarios:
         """SystemExit 在真实子进程被 worker 捕获，以中断族串归因进失败档案。"""
         p = _make_pipeline(tmp_path)
         p.register_task("sysexit", system_exit_handler)
-        p.enqueue(Job("sysexit", "item_sysexit", max_retries=0))
+        p.enqueue(Job("sysexit", "item_sysexit", max_retries_per_run=0))
         p.run()
         p.stop()
 

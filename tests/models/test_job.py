@@ -27,46 +27,82 @@ class TestJobCreation:
         assert job.task_type == "scan"
         assert job.job_id == "scan_001"
         assert job.payload == {}
-        assert job.resources is None
-        assert job.max_retries is None
         assert job.depends_on == []
+        assert job.files == {}
+        assert job.resources is None
+        assert job.max_retries_per_run is None
         assert job.timeout_seconds is None
-        assert job.timeout_is_transient is None
         assert job.trigger is None
+        assert not hasattr(job, "max_retries")
+        assert not hasattr(job, "timeout_is_transient")
         # 实例位初值：首次激活、首次尝试、尚未入队
         assert job.attempt_no == 1
         assert job.activation_no == 1
         assert job.first_enqueued_at is None
 
     def test_create_with_all_fields(self):
-        """全字段显式构造（规格位 + 实例位）。"""
+        """公开构造全字段显式构造。"""
         job = Job(
             task_type="download",
             job_id="img_001",
             payload={"url": "https://example.com/1.jpg"},
-            resources={"api": 1.0, "disk": 2.5},
-            max_retries=5,
             depends_on=["parent_job"],
+            files={"output": "/tmp/1.jpg"},
+            resources={"api": 1.0, "disk": 2.5},
+            max_retries_per_run=5,
             timeout_seconds=7200,
-            timeout_is_transient=True,
+            trigger="on_failure",
+        )
+        assert job.payload == {"url": "https://example.com/1.jpg"}
+        assert job.depends_on == ["parent_job"]
+        assert job.files == {"output": "/tmp/1.jpg"}
+        assert job.resources == {"api": 1.0, "disk": 2.5}
+        assert job.max_retries_per_run == 5
+        assert job.timeout_seconds == 7200
+        assert job.trigger == "on_failure"
+
+    def test_restore_with_internal_runtime_fields(self):
+        """内部恢复入口 _restore 挂载运行期实例位与边带状态。"""
+        job = Job._restore(
+            task_type="download",
+            job_id="img_001",
+            payload={"url": "https://example.com/1.jpg"},
+            depends_on=["parent_job"],
+            files={"output": "/tmp/1.jpg"},
+            resources={"api": 1.0, "disk": 2.5},
+            max_retries_per_run=5,
+            timeout_seconds=7200,
             trigger="on_failure",
             attempt_no=2,
             activation_no=3,
             first_enqueued_at="2026-01-01T00:00:00+00:00",
         )
-        assert job.payload == {"url": "https://example.com/1.jpg"}
-        assert job.resources == {"api": 1.0, "disk": 2.5}
-        assert job.max_retries == 5
-        assert job.depends_on == ["parent_job"]
-        assert job.timeout_seconds == 7200
-        assert job.timeout_is_transient is True
-        assert job.trigger == "on_failure"
         assert job.attempt_no == 2
         assert job.activation_no == 3
         assert job.first_enqueued_at == "2026-01-01T00:00:00+00:00"
 
+    def test_public_constructor_rejects_internal_and_removed_params(self):
+        """公开构造拒绝内部运行态参数与已删除参数。"""
+        for kw in (
+            {"attempt_no": 2},
+            {"activation_no": 2},
+            {"first_enqueued_at": "2026-01-01T00:00:00+00:00"},
+            {"runtime": {}},
+            {"max_retries": 3},
+            {"timeout_is_transient": True},
+        ):
+            with pytest.raises(TypeError):
+                Job("t", "id", **kw)  # type: ignore[arg-type]
+
     def test_payload_none_defaults_to_empty_dict(self):
         assert Job("fetch", "j1", payload=None).payload == {}
+
+    def test_files_none_defaults_to_empty_dict_and_copied(self):
+        assert Job("fetch", "j1", files=None).files == {}
+        src_files = {"out": {"p": 1}}
+        job = Job("fetch", "j1", files=src_files)
+        src_files["out"]["p"] = 99
+        assert job.files == {"out": {"p": 1}}
 
     def test_resources_none_defaults_to_empty_dict(self):
         assert Job("fetch", "j1", resources=None).resources is None
@@ -81,9 +117,10 @@ class TestJobCreation:
     def test_depends_on_none_defaults_to_empty_list(self):
         assert Job("fetch", "j1", depends_on=None).depends_on == []
 
-    def test_timeout_is_transient_is_keyword_only(self):
-        """布尔参数 keyword-only：第 8 个位置参数（timeout_is_transient 位）
-        显式报错。"""
+    def test_all_config_after_job_id_is_keyword_only(self):
+        """job_id 之后的全部配置参数为 keyword-only，位置传参显式报错。"""
+        with pytest.raises(TypeError, match="positional argument"):
+            Job("t", "id", {"a": 1})  # type: ignore[misc]
         with pytest.raises(TypeError, match="positional argument"):
             Job("t", "id", {}, {}, 3, [], 3600, True)  # type: ignore[misc]
 
@@ -188,40 +225,40 @@ class TestJobPayloadAndResources:
 
 
 class TestJobSpecFieldValidation:
-    """max_retries / timeout_seconds / depends_on / trigger 校验。"""
+    """max_retries_per_run / timeout_seconds / depends_on / files / trigger 校验。"""
 
-    def test_negative_max_retries(self):
-        with pytest.raises(ValueError, match="max_retries must be >= 0"):
-            Job("t", "id", max_retries=-1)
+    def test_negative_max_retries_per_run(self):
+        with pytest.raises(ValueError, match="max_retries_per_run must be >= 0"):
+            Job("t", "id", max_retries_per_run=-1)
 
-    def test_non_int_max_retries(self):
-        with pytest.raises(TypeError, match="max_retries must be an int"):
-            Job("t", "id", max_retries="3")
-        with pytest.raises(TypeError, match="max_retries must be an int"):
-            Job("t", "id", max_retries=True)
+    def test_non_int_max_retries_per_run(self):
+        with pytest.raises(TypeError, match="max_retries_per_run must be an int"):
+            Job("t", "id", max_retries_per_run="3")  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="max_retries_per_run must be an int"):
+            Job("t", "id", max_retries_per_run=True)
 
-    def test_zero_max_retries_allowed(self):
-        """max_retries=0：任何失败直接进失败档案（允许执行条件
-        attempt_no <= 0 + 1 仅剩首次执行）。"""
-        job = Job("t", "id", max_retries=0)
-        assert job.max_retries == 0
+    def test_zero_max_retries_per_run_allowed(self):
+        """max_retries_per_run=0：任何失败直接进失败档案。"""
+        job = Job("t", "id", max_retries_per_run=0)
+        assert job.max_retries_per_run == 0
 
     def test_timeout_matrix_rejected(self):
         """timeout_seconds 拒绝零/负/NaN/Inf/超大 int/bool/非数值。"""
         with pytest.raises(TypeError, match="timeout_seconds must be a number"):
-            Job("t", "id", timeout_seconds="60")
+            Job("t", "id", timeout_seconds="60")  # type: ignore[arg-type]
         with pytest.raises(TypeError, match="timeout_seconds must be a number"):
             Job("t", "id", timeout_seconds=True)
-        for bad in (0, -1, float("nan"), float("inf"), 10**400):
+        for bad in (0, -1, float("nan"), float("inf"), float("-inf"), 10**400):
             with pytest.raises(ValueError, match="timeout_seconds must be finite and > 0"):
                 Job("t", "id", timeout_seconds=bad)
 
-    def test_non_bool_timeout_is_transient_rejected(self):
-        """非 bool 真值会静默改变超时归类语义，入口拒绝。"""
-        with pytest.raises(TypeError, match="timeout_is_transient must be a bool"):
-            Job("t", "id", timeout_is_transient="yes")
-        with pytest.raises(TypeError, match="timeout_is_transient must be a bool"):
-            Job("t", "id", timeout_is_transient=1)
+    def test_files_validation(self):
+        with pytest.raises(TypeError, match="files must be a dict"):
+            Job("t", "id", files=["a"])  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="file key in files must be a non-empty str"):
+            Job("t", "id", files={"": "x"})
+        with pytest.raises(TypeError, match="file key in files must be a non-empty str"):
+            Job("t", "id", files={1: "x"})  # type: ignore[dict-item]
 
     def test_depends_on_non_list_rejected(self):
         """先校验外层类型再迭代——str 会被肢解为字符列表。"""
@@ -254,34 +291,34 @@ class TestJobSpecFieldValidation:
 
 
 class TestJobInstanceFieldValidation:
-    """实例位字段校验（attempt_no / activation_no / first_enqueued_at）。"""
+    """实例位字段校验（经私有恢复入口 _restore）。"""
 
     def test_attempt_no_matrix(self):
         with pytest.raises(TypeError, match="attempt_no must be an int"):
-            Job("t", "id", attempt_no="2")
+            Job._restore("t", "id", attempt_no="2")  # type: ignore[arg-type]
         with pytest.raises(TypeError, match="attempt_no must be an int"):
-            Job("t", "id", attempt_no=True)
+            Job._restore("t", "id", attempt_no=True)
         with pytest.raises(ValueError, match="attempt_no must be >= 1"):
-            Job("t", "id", attempt_no=0)
+            Job._restore("t", "id", attempt_no=0)
 
     def test_activation_no_matrix(self):
         with pytest.raises(TypeError, match="activation_no must be an int"):
-            Job("t", "id", activation_no=1.5)
+            Job._restore("t", "id", activation_no=1.5)  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="activation_no must be >= 1"):
-            Job("t", "id", activation_no=0)
+            Job._restore("t", "id", activation_no=0)
 
     def test_first_enqueued_at_matrix(self):
         with pytest.raises(TypeError, match="first_enqueued_at must be a str or None"):
-            Job("t", "id", first_enqueued_at=12345)
+            Job._restore("t", "id", first_enqueued_at=12345)  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="non-empty"):
-            Job("t", "id", first_enqueued_at="")
+            Job._restore("t", "id", first_enqueued_at="")
 
     def test_budget_rule_alignment(self):
-        """预算判定对齐：允许执行条件 attempt_no <= max_retries + 1。"""
-        job = Job("t", "id", max_retries=3)
-        assert job.attempt_no <= job.max_retries + 1
-        retrying = Job("t", "id", max_retries=3, attempt_no=4)
-        assert retrying.attempt_no == retrying.max_retries + 1
+        """预算判定对齐：允许执行条件 attempt_no <= max_retries_per_run + 1。"""
+        job = Job("t", "id", max_retries_per_run=3)
+        assert job.attempt_no <= job.max_retries_per_run + 1
+        retrying = Job._restore("t", "id", max_retries_per_run=3, attempt_no=4)
+        assert retrying.attempt_no == retrying.max_retries_per_run + 1
 
 
 class TestJobUid:
@@ -323,21 +360,22 @@ class TestJobToDictFromDict:
     def test_to_dict_contains_all_keys(self):
         result = Job("scan", "s1").to_dict()
         expected_keys = {
-            "task_type", "job_id", "payload", "resources",
-            "max_retries", "depends_on", "timeout_seconds", "timeout_is_transient",
+            "task_type", "job_id", "payload", "depends_on", "files", "resources",
+            "max_retries_per_run", "timeout_seconds",
             "trigger", "runtime", "attempt_no", "activation_no",
             "first_enqueued_at",
         }
         assert set(result.keys()) == expected_keys
 
     def test_to_dict_values_reflect_constructor_args(self):
-        job = Job(
+        job = Job._restore(
             task_type="process",
             job_id="p_99",
             payload={"key": "val"},
-            resources={"cpu": 0.5},
-            max_retries=4,
             depends_on=["a", "b"],
+            files={"f": "v"},
+            resources={"cpu": 0.5},
+            max_retries_per_run=4,
             timeout_seconds=100,
             trigger="always",
             attempt_no=2,
@@ -348,9 +386,10 @@ class TestJobToDictFromDict:
         assert d["task_type"] == "process"
         assert d["job_id"] == "p_99"
         assert d["payload"] == {"key": "val"}
-        assert d["resources"] == {"cpu": 0.5}
-        assert d["max_retries"] == 4
         assert d["depends_on"] == ["a", "b"]
+        assert d["files"] == {"f": "v"}
+        assert d["resources"] == {"cpu": 0.5}
+        assert d["max_retries_per_run"] == 4
         assert d["timeout_seconds"] == 100
         assert d["trigger"] == "always"
         assert d["attempt_no"] == 2
@@ -360,11 +399,11 @@ class TestJobToDictFromDict:
     def test_from_dict_missing_optional_keys_uses_defaults(self):
         job = Job.from_dict({"task_type": "t", "job_id": "j"})
         assert job.payload == {}
-        assert job.resources is None
-        assert job.max_retries is None
         assert job.depends_on == []
+        assert job.files == {}
+        assert job.resources is None
+        assert job.max_retries_per_run is None
         assert job.timeout_seconds is None
-        assert job.timeout_is_transient is None
         assert job.trigger is None
         assert job.attempt_no == 1
         assert job.activation_no == 1
@@ -377,16 +416,21 @@ class TestJobToDictFromDict:
         with pytest.raises(KeyError):
             Job.from_dict({"task_type": "t"})
 
+    def test_from_dict_rejects_removed_keys(self):
+        for legacy_key in ("rerun", "timeout", "max_retries", "timeout_is_transient"):
+            with pytest.raises(ValueError, match=legacy_key):
+                Job.from_dict({"task_type": "t", "job_id": "j", legacy_key: 1})
+
     def test_roundtrip_preserves_all_fields(self):
-        original = Job(
+        original = Job._restore(
             task_type="download",
             job_id="img_001",
             payload={"url": "https://example.com/1.jpg"},
-            resources={"api": 1.0, "disk": 2.5},
-            max_retries=5,
             depends_on=["parent_job"],
+            files={"out": "/tmp/1.jpg"},
+            resources={"api": 1.0, "disk": 2.5},
+            max_retries_per_run=5,
             timeout_seconds=7200,
-            timeout_is_transient=True,
             trigger="on_input_change",
             attempt_no=3,
             activation_no=2,
@@ -396,11 +440,11 @@ class TestJobToDictFromDict:
         assert recreated.task_type == original.task_type
         assert recreated.job_id == original.job_id
         assert recreated.payload == original.payload
-        assert recreated.resources == original.resources
-        assert recreated.max_retries == original.max_retries
         assert recreated.depends_on == original.depends_on
+        assert recreated.files == original.files
+        assert recreated.resources == original.resources
+        assert recreated.max_retries_per_run == original.max_retries_per_run
         assert recreated.timeout_seconds == original.timeout_seconds
-        assert recreated.timeout_is_transient == original.timeout_is_transient
         assert recreated.trigger == original.trigger
         assert recreated.attempt_no == original.attempt_no
         assert recreated.activation_no == original.activation_no
@@ -523,7 +567,7 @@ class TestJobRuntimeState:
         assert st.last_retry_error == "42"
 
     def test_runtime_setter_accepts_dict_and_instance(self):
-        job = Job("t", "id", runtime={"_commit_failures": 1, "k": "v"})
+        job = Job._restore("t", "id", runtime={"_commit_failures": 1, "k": "v"})
         assert job.runtime.commit_failures == 1
         assert job.runtime.extra == {"k": "v"}
         shared = JobRuntimeState(commit_failures=5)
@@ -532,14 +576,14 @@ class TestJobRuntimeState:
 
 
 class TestJobWeirdInputs:
-    """对抗性构造（当前行为锁定）。"""
+    """对抗性构造与深拷贝隔离。"""
 
-    def test_payload_with_nested_mutables_shared_reference(self):
-        """payload 不做深拷贝（浅拷贝语义）——嵌套可变对象的变异可见。"""
+    def test_payload_with_nested_mutables_deep_copied(self):
+        """payload 深拷贝隔离——外部嵌套可变对象的后续变异不污染 Job。"""
         nested_list = [1, 2, 3]
         job = Job("t", "id", payload={"items": nested_list})
         nested_list.append(4)
-        assert job.payload["items"] == [1, 2, 3, 4]
+        assert job.payload["items"] == [1, 2, 3]
 
     def test_to_dict_with_non_serializable_payload(self):
         """to_dict 本身不做 JSON 序列化（预检在 enqueue 侧）。"""

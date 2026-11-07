@@ -226,13 +226,14 @@ class OpsConsole:
             (record.activation_no for record in self._store.backend.load_attempts(job_uid)),
             default=0,
         )
-        job = Job(
+        job = Job._restore(
             task_type=task_type,
             job_id=job_id,
             payload=payloads.get(job_uid) or {},
             activation_no=prior_activation + 1,
         )
-        self._store.enqueue_jobs([job], front=True)
+        job_snapshot = self._store.normalize_and_validate_job(job)
+        self._store.backend.enqueue_jobs([job_snapshot], front=True)
         self._store.backend.delete_failed([job_uid])
         state = self._store.state
         state.discard_failed(job_uid)

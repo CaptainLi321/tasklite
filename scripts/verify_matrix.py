@@ -50,10 +50,17 @@ def main():
         pipeline.register_task("task_a", handler_a, resources={"gpu": 1.0})
         pipeline.register_task("task_retry", handler_retry)
 
-        j1 = Job("task_a", "job_1", {"val": 42}, resources={"api": 1.0})
-        j2 = Job("task_retry", "job_2", {}, max_retries=2, depends_on=["task_a::job_1"])
+        j1 = Job("task_a", "job_1", payload={"val": 42}, resources={"api": 1.0})
+        j2 = Job(
+            "task_retry",
+            "job_2",
+            payload={},
+            max_retries_per_run=2,
+            depends_on=["task_a::job_1"],
+        )
 
-        pipeline.enqueue([j1, j2])
+        pipeline.enqueue(j1)
+        pipeline.enqueue(j2)
         pipeline.run()
         stats = pipeline.stats
 

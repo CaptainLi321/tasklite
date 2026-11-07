@@ -28,7 +28,6 @@ from tasklite.engine.errorclass import (
     ERR_DISPATCH_FAILURE,
     ERR_JOB_DEPENDENCY,
     ERR_NO_HANDLER,
-    ERR_PAYLOAD_VALIDATION,
     ErrorClassifier,
 )
 from tasklite.engine.in_flight import InFlightTracker
@@ -128,11 +127,10 @@ class DispatchEnv:
             commit_failure_threshold=3,
         )
 
-    def register(self, task_type: str, payload_schema=None) -> None:
+    def register(self, task_type: str) -> None:
         self.tasks.register(Task(
             task_type=task_type,
             handler=lambda job, ctx: True,
-            payload_schema=payload_schema,
         ))
 
     def spawn_handle(self, uid: str, execution_id: str):
@@ -312,33 +310,9 @@ class TestRejectGates:
         assert env.store.state.failed["child::b"]["failed_dependency"] == "parent::a"
         assert env.store.state.failed["child::c"]["error_message"] == ERR_JOB_DEPENDENCY
 
-    def test_payload_validation_failure_rejects_without_subprocess(self, tmp_path):
-        from typing import TypedDict
-
-        class Schema(TypedDict):
-            name: str
-
-        env = DispatchEnv(tmp_path)
-        env.register("t", payload_schema=Schema)
-        env.store.state.spawn_jobs([Job("t", "j1", payload={"name": 1}).to_dict()])
-
-        outcome = env.dispatch.dispatch_next()
-        assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert env.store.state.failed["t::j1"]["error_message"] == ERR_PAYLOAD_VALIDATION
-        assert env.store.state.failed["t::j1"]["details"]
-        # 载荷校验失败释放租约：工人槽位归还
-        assert env.resources["__workers__"].used == 0.0
-        records = env.backend.load_attempts("t::j1")
-        assert records[-1].outcome == "failed"
-
     def test_valid_payload_proceeds_to_spawn(self, tmp_path, monkeypatch):
-        from typing import TypedDict
-
-        class Schema(TypedDict):
-            name: str
-
         env = DispatchEnv(tmp_path)
-        env.register("t", payload_schema=Schema)
+        env.register("t")
         env.store.state.spawn_jobs([Job("t", "j1", payload={"name": "x"}).to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
@@ -626,7 +600,7 @@ class TestAdmissionEvaluationTiming:
         env.register("t")
         # 记录历史成功；若错误执行了准入评估（trigger 默认 never），将被判定为跳过
         env.store.state.mark_success("t::j1", {})
-        retry_job = Job("t", "j1", attempt_no=2, activation_no=1)
+        retry_job = Job._restore("t", "j1", attempt_no=2, activation_no=1)
         env.store.state.spawn_jobs([retry_job.to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",

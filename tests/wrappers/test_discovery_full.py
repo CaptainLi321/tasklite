@@ -105,7 +105,7 @@ class TestFullMode:
                            scan_mode="full", trigger="once")
         p.register_task("child", _child_ok)
         # 5 条 → 3 页（2/2/1）+ 空页；首次扫描无已见 → 全量 spawn
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)}))
         p.run()
         successes = p.backend.load_successes()
         children = [k for k in successes if k.startswith("child::")]
@@ -121,7 +121,7 @@ class TestFullMode:
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full")
         p.register_task("child", _child_ok)
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)}))
         p.run()
         successes = p.backend.load_successes()
         assert len([k for k in successes if k.startswith("child::")]) == 5
@@ -129,7 +129,7 @@ class TestFullMode:
         assert first_run_fetches == 4
 
         # 重跑（every_run 注入）→ full 扫完 3 页 + 空页，已见不重复 spawn
-        p.enqueue([Job("disc", "seed2", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
+        p.enqueue(Job("disc", "seed2", payload={"posts": _posts(5), "fetch_log": str(log_path)}))
         p.run()
         successes = p.backend.load_successes()
         assert len([k for k in successes if k.startswith("child::")]) == 5, \
@@ -146,12 +146,12 @@ class TestFullMode:
         register_discovery(p, "disc", _fetch, _item_id, _process, "child")
         p.register_task("child", _child_ok)
         # 首次全量（5 条 → 3 页）
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)}))
         p.run()
         first_run_fetches = self._log_count(log_path)
         assert first_run_fetches == 4
         # 重跑：page1=[4,3] 全已见 → 整页命中即停（不翻后续页）
-        p.enqueue([Job("disc", "seed2", payload={"posts": _posts(5), "fetch_log": str(log_path)})])
+        p.enqueue(Job("disc", "seed2", payload={"posts": _posts(5), "fetch_log": str(log_path)}))
         p.run()
         successes = p.backend.load_successes()
         assert len([k for k in successes if k.startswith("child::")]) == 5
@@ -194,13 +194,13 @@ class TestMissingDetection:
         report = tmp_path / "missing.txt"
 
         # 首次：5 条全扫 → 无 missing（报告文件不创建）
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(5), "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(5), "missing_report": str(report)}))
         p.run()
         assert not report.exists(), "首次扫描无已见 → 无 missing"
 
         # 删 2 条（id 4、3）→ 重跑：只见到 0..2 → missing = 已见 - 本次 = {3,4}
         posts = [{"id": 2}, {"id": 1}, {"id": 0}]
-        p.enqueue([Job("disc", "seed2", payload={"posts": posts, "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seed2", payload={"posts": posts, "missing_report": str(report)}))
         p.run()
         missing = set(report.read_text().splitlines())
         assert missing == {"3", "4"}, f"源站删除应报 missing: {missing}"
@@ -225,20 +225,20 @@ class TestMissingDetection:
         p.seed_successes([f"child::{i}" for i in range(5)])
 
         # payload 覆盖为 full：本次完整扫到全部已见内容 → 无删除
-        p.enqueue([Job("disc", "seed", payload={
+        p.enqueue(Job("disc", "seed", payload={
             "posts": _posts(5), "scan_mode": "full",
             "missing_report": str(report),
-        })])
+        }))
         p.run()
         assert not report.exists(), \
             "payload 覆盖 full 时，本次已扫到的内容不得误报 missing"
 
         # 正向对照：只扫到 2、3 → 真正删除的 0、1、4 才报 missing
         # （确认修复没有把 on_missing 整个静默掉）
-        p.enqueue([Job("disc", "seed2", payload={
+        p.enqueue(Job("disc", "seed2", payload={
             "posts": [{"id": 3}, {"id": 2}], "scan_mode": "full",
             "missing_report": str(report),
-        })])
+        }))
         p.run()
         missing = set(report.read_text().splitlines())
         assert missing == {"0", "1", "4"}, \
@@ -251,7 +251,7 @@ class TestMissingDetection:
                            on_missing=_on_missing)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(5), "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(5), "missing_report": str(report)}))
         p.run()
         assert not report.exists(), "incremental 不得触发 on_missing"
 
@@ -273,7 +273,7 @@ class TestMissingDetection:
         # Run 1：完整扫描（max_pages 默认大）→ 6 条进入 successes（known 非空）
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)}))
         p.run()
         assert not report.exists(), "完整扫描无删除 → 无 missing"
 
@@ -285,7 +285,7 @@ class TestMissingDetection:
         register_discovery(p2, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing,
                            max_pages=1)
-        p2.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p2.enqueue(Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)}))
         p2.run()
         assert not report.exists(), "max_pages 截断不得误报 missing"
 
@@ -299,7 +299,7 @@ class TestMissingDetection:
         # Run 1：正常 id_func 完整扫描 → 6 条进入 successes
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)}))
         p.run()
         assert not report.exists()
 
@@ -309,7 +309,7 @@ class TestMissingDetection:
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id_fail, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
-        p2.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p2.enqueue(Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)}))
         p2.run()
         assert not report.exists(), "id_func 全失败早停不得误报 missing"
 
@@ -324,7 +324,7 @@ class TestMissingDetection:
         # Run 1：正常完整扫描 → 6 条进入 successes（known 非空）
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)}))
         p.run()
         assert not report.exists()
 
@@ -335,7 +335,7 @@ class TestMissingDetection:
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id_partial_raise, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
-        p2.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p2.enqueue(Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)}))
         p2.run()
         assert not report.exists(), "id_func 部分失败的不完整扫描不得误报 missing"
 
@@ -348,7 +348,7 @@ class TestMissingDetection:
 
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)}))
         p.run()
         assert not report.exists()
 
@@ -357,7 +357,7 @@ class TestMissingDetection:
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id_partial_invalid, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
-        p2.enqueue([Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)})])
+        p2.enqueue(Job("disc", "seed2", payload={"posts": _posts(6), "missing_report": str(report)}))
         p2.run()
         assert not report.exists(), "id_func 非法返回的不完整扫描不得误报 missing"
 
@@ -372,19 +372,19 @@ class TestMissingDetection:
                            scan_mode="full", trigger="once", on_missing=_on_missing)
 
         # 组 A：完整扫描 4 条 → successes
-        p.enqueue([Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
-                                                 "group": "A", "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
+                                                 "group": "A", "missing_report": str(report)}))
         p.run()
         assert not report.exists()
         # 组 B：完整扫描 2 条 → successes（与 A 共享 process_task_type="child"）
-        p.enqueue([Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
-                                                 "group": "B", "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
+                                                 "group": "B", "missing_report": str(report)}))
         p.run()
         assert not report.exists()
 
         # 组 A 再次 full 扫描（只 A 的内容 0..3）→ missing 只应含 A 的已删内容
-        p.enqueue([Job("disc", "seedA2", payload={"posts": [{"id": 3}, {"id": 2}],
-                                                  "group": "A", "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seedA2", payload={"posts": [{"id": 3}, {"id": 2}],
+                                                  "group": "A", "missing_report": str(report)}))
         p.run()
         missing = set(report.read_text().splitlines()) if report.exists() else set()
         # 本组 missing 恰好 = A 的已删内容（length-prefix：3%3Ag_A）
@@ -409,19 +409,19 @@ class TestMissingDetection:
         prefix_b = f"{len('g_' + long_b)}:g_{long_b}"
 
         # 组 A（超长 key）：完整扫描 4 条 → successes
-        p.enqueue([Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
-                                                 "group": long_a, "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
+                                                 "group": long_a, "missing_report": str(report)}))
         p.run()
         assert not report.exists()
         # 组 B（另一超长 key，共享 process_task_type）：完整扫描 2 条 → successes
-        p.enqueue([Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
-                                                 "group": long_b, "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
+                                                 "group": long_b, "missing_report": str(report)}))
         p.run()
         assert not report.exists()
 
         # 组 A 只剩 0、1 → missing 应恰为 A 的已删 2、3，不混入 B 的 8、9
-        p.enqueue([Job("disc", "seedA2", payload={"posts": [{"id": 1}, {"id": 0}],
-                                                  "group": long_a, "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seedA2", payload={"posts": [{"id": 1}, {"id": 0}],
+                                                  "group": long_a, "missing_report": str(report)}))
         p.run()
         missing = set(report.read_text().splitlines()) if report.exists() else set()
         expected = {encode_content_id(prefix_a + cid) for cid in ("2", "3")}
@@ -439,14 +439,14 @@ class TestMissingDetection:
                            scan_mode="full", trigger="once", on_missing=_on_missing_boom)
 
         # 首次：5 条全扫 → 无 missing（on_missing 不调用，无异常）
-        p.enqueue([Job("disc", "seed", payload={"posts": _posts(5)})])
+        p.enqueue(Job("disc", "seed", payload={"posts": _posts(5)}))
         p.run()
         successes = p.backend.load_successes()
         assert "disc::seed" in successes
 
         # 删 2 条 → 重跑：有 missing 差集 → on_missing 抛异常 → 必须被吞
         posts = [{"id": 2}, {"id": 1}, {"id": 0}]
-        p.enqueue([Job("disc", "seed2", payload={"posts": posts})])
+        p.enqueue(Job("disc", "seed2", payload={"posts": posts}))
         p.run()
         successes = p.backend.load_successes()
         assert "disc::seed2" in successes, \
@@ -501,18 +501,18 @@ class TestCursorKeyPrefixInjective:
                            group_key_func=_group_key,
                            scan_mode="full", trigger="once", on_missing=_on_missing)
         # 组 A：4 条
-        p.enqueue([Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
-                                                 "group": "A", "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
+                                                 "group": "A", "missing_report": str(report)}))
         p.run()
         assert not report.exists()
         # 组 B：2 条
-        p.enqueue([Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
-                                                 "group": "B", "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
+                                                 "group": "B", "missing_report": str(report)}))
         p.run()
         assert not report.exists()
         # 组 A 重扫（只 A 内容）→ missing 只含 A 的已删
-        p.enqueue([Job("disc", "seedA2", payload={"posts": [{"id": 3}, {"id": 2}],
-                                                  "group": "A", "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seedA2", payload={"posts": [{"id": 3}, {"id": 2}],
+                                                  "group": "A", "missing_report": str(report)}))
         p.run()
         missing = set(report.read_text().splitlines()) if report.exists() else set()
         assert missing == {"3%3Ag_A0", "3%3Ag_A1"}, f"本组已删应报全、跨组不得误报: {missing}"
@@ -532,13 +532,13 @@ class TestSucceededOrFailedJobUidsUsage:
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
         # 首次：spawn 2 条（无已见）
-        p.enqueue([Job("disc", "seed1", payload={"posts": [{"id": 1}, {"id": 2}],
-                                                 "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seed1", payload={"posts": [{"id": 1}, {"id": 2}],
+                                                 "missing_report": str(report)}))
         p.run()
         assert not report.exists()
         # 重扫只剩 id=2 → id=1 已删 → on_missing 报差集
-        p.enqueue([Job("disc", "seed2", payload={"posts": [{"id": 2}],
-                                                 "missing_report": str(report)})])
+        p.enqueue(Job("disc", "seed2", payload={"posts": [{"id": 2}],
+                                                 "missing_report": str(report)}))
         p.run()
         missing = set(report.read_text().splitlines()) if report.exists() else set()
         assert missing == {"1"}, f"on_missing 应报已删内容 id=1: {missing}"

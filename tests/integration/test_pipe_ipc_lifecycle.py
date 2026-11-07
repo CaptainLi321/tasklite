@@ -134,7 +134,7 @@ def _run_owner_until_killed(root: str, sync_dir: str) -> None:
         backend="sqlite",
     )
     pipeline.register_task("work", orphan_locked_handler)
-    pipeline.enqueue(Job("work", "orphan", payload={"sync_dir": sync_dir}, max_retries=0))
+    pipeline.enqueue(Job("work", "orphan", payload={"sync_dir": sync_dir}, max_retries_per_run=0))
     pipeline.run()
 
 
@@ -275,7 +275,7 @@ def test_process_death_uses_existing_budget(pipelines, monkeypatch, tmp_path, mo
             "work",
             mode,
             payload={"sync_dir": str(sync_dir)},
-            max_retries=1,
+            max_retries_per_run=1,
             timeout_seconds=0.3 if mode == "timeout" else 20.0,
         )
     )
@@ -322,7 +322,7 @@ def test_process_death_uses_existing_budget(pipelines, monkeypatch, tmp_path, mo
 def test_cleanup_error_preserves_uncommitted_queue(pipelines, monkeypatch, tmp_path):
     pipeline = pipelines()
     pipeline.register_task("work", cleanup_handler)
-    pipeline.enqueue(Job("work", "cleanup", max_retries=3))
+    pipeline.enqueue(Job("work", "cleanup", max_retries_per_run=3))
 
     def unavailable(self, declaration, *, success):
         raise PermissionError("授权清理不可用")
@@ -345,10 +345,8 @@ def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_p
     sync_dir.mkdir(parents=True, exist_ok=True)
     pipeline = pipelines()
     pipeline.register_task("controlled", controlled_handler)
-    pipeline.enqueue([
-        Job("controlled", "active", payload={"sync_dir": str(sync_dir)}),
-        Job("child", "waiting"),
-    ])
+    pipeline.enqueue(Job("controlled", "active", payload={"sync_dir": str(sync_dir)}))
+    pipeline.enqueue(Job("child", "waiting"))
     channel = pipeline._runtime.channel
     requested: list[str] = []
     orig_reap = channel.reap_completed

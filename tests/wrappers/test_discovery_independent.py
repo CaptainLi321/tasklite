@@ -116,9 +116,8 @@ class FakeHost:
     def __init__(self):
         self.registered = []
 
-    def register_task(self, task_type, handler,
-                      resources=None, payload_schema=None, *, trigger="once"):
-        self.registered.append((task_type, handler, resources, payload_schema, trigger))
+    def register_task(self, task_type, handler, *, resources=None, trigger="once"):
+        self.registered.append((task_type, handler, resources, trigger))
 
 
 
@@ -136,7 +135,7 @@ class TestRegisterDiscoveryFrameworkIndependent:
             "register_discovery 必须注册框架无关的 DiscoveryHandler"
         )
         # 默认 trigger 作为 Task 规格注册
-        assert task_entry[4] == "always"
+        assert task_entry[3] == "always"
 
     def test_register_discovery_rejects_bad_host_fail_loud(self):
         """防御测试：宿主缺协议方法时立即 AttributeError，而非静默。"""

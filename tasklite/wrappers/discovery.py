@@ -181,9 +181,8 @@ class DiscoveryHost(Protocol):
         self,
         task_type: str,
         handler: Callable[..., Any],
-        resources: dict[str, float] | None = None,
-        payload_schema: type | None = None,
         *,
+        resources: dict[str, float] | None = None,
         trigger: str = "always",
     ) -> None: ...
 
@@ -531,7 +530,6 @@ def register_discovery(
     process_task_type: str,
     group_key_func: Callable[[dict[str, Any]], str] | None = None,
     resources: dict[str, float] | None = None,
-    payload_schema: type | None = None,
     max_pages: int = 1000,
     trigger: str = "always",
     scan_mode: str = "incremental",
@@ -562,7 +560,6 @@ def register_discovery(
         group_key_func: 可选。``(payload) -> str``，仅作 job_id 命名空间
             前缀（防跨分组内容 id 碰撞），无任何游标/互斥语义。
         resources: 发现任务自身的默认资源需求。
-        payload_schema: 发现任务 payload 的运行时校验 schema。
         max_pages: 单次扫描页数硬上限（活性保障条款，默认 1000）。
         trigger: discovery job 的默认跨会话重跑策略（默认 ``"always"``）
             ——enqueue 该 task_type 的 job 时自动注入（用户显式指定非默认
@@ -650,7 +647,6 @@ def register_discovery(
         task_type,
         handler,
         resources=resources,
-        payload_schema=payload_schema,
         trigger=trigger,
     )
 
