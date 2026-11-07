@@ -49,7 +49,7 @@ backend 必须显式选择；SQLite 要求提供数据库文件路径，memory �
 
 注册、提交、管理、run() 和 close() 由同一个控制线程顺序调用，不承诺并发调用安全，不要求每次检查调用线程身份。控制线程即调用 run() 的线程，独占资源分配与回收；stop() 允许其他线程调用并唤醒运行循环。其他线程观察时独立打开 StateSnapshot，不共享快照对象。
 
-run(*, selection=None, install_signals=True) -> None 默认在 Python 主线程安装 SIGINT／SIGTERM 处理器，二者均请求停止派发并正常排空；正常退出恢复原处理器。安装失败明确抛异常，不静默忽略。后台控制线程使用 install_signals=False，由宿主主线程接收信号并调用 stop()。不提供绕过库级执行互斥的参数。
+run(*, exclude=None, install_signals=True) -> None 默认在 Python 主线程安装 SIGINT／SIGTERM 处理器，二者均请求停止派发并正常排空；正常退出恢复原处理器。安装失败明确抛异常，不静默忽略。后台控制线程使用 install_signals=False，由宿主主线程接收信号并调用 stop()。不提供绕过库级执行互斥的参数。
 
 ## 异常与失败信息
 
@@ -64,7 +64,7 @@ TaskLiteError 不承诺捕获所有框架故障，底层异常的类型和消息
 - 保留 Task 规格、Job 逻辑身份、Attempt 执行轨迹。Job 身份仍由 task_type 与 job_id 确定。
 - 保留简式任务注册和 Task 对象注册。同名 Task 禁止重复注册并明确报错，本版本不提供覆盖注册；新进程可以加载更新后的 handler，不检查业务代码变化，不增加代码版本锁。Job 不再让业务构造内部运行账目；只读属性和类型提示提供有限约束，不递归冻结业务 payload，也不检查业务代码是否修改对象。
 - 公开 enqueue(job: Job) -> bool 本版本只提交一个 Job；框架捕获独立快照。首次加入队列返回 True；同 UID 已排队且有效配置相同返回 False，不同配置明确冲突。不提供 front、replace_pending 或隐式重试插队，候选顺序由 OrderingPolicy 管理；不提供批量提交接口。普通 enqueue 不清除旧终态档案，仍由 Trigger 判断是否执行。
-- 外部 enqueue 对提交时可确定的未知 Task、非法配置、不可序列化 payload 及可完成的 schema 校验立即报错，不入队、不写 failures、不产生 Attempt。资源是否可满足不另加提交前检查；依赖引用存在性在提交时检查；输入文件及运行时依赖是否满足仍在对应阶段判断。
+- 外部 enqueue 对提交时可确定的未知 Task、非法配置、不可序列化 payload 立即报错，不入队、不写 failures、不产生 Attempt。资源是否可满足不另加提交前检查；依赖引用存在性在提交时检查；输入文件及运行时依赖是否满足仍在对应阶段判断。
 - ctx.spawn 调用时捕获独立的提交声明快照，使用所属 TaskLite 实例的固定路径基准；父任务成功时由主进程解析有效配置、校验并整体提交。worker 改变工作目录不改变子任务相对路径的含义。外部单次提交与父任务一次成功中提交多个派生任务是不同场景，后者仍要求整体提交。
 - Trigger 表达本次 Run 对已入队 Job 的启动规则。它不主动入队，也不控制一次启动后的故障重试。on_failure 改名 until_success，默认仍为 once。
 
@@ -86,13 +86,39 @@ TaskLiteError 不承诺捕获所有框架故障，底层异常的类型和消息
 
 新 Run 重判 Trigger 与预算重置是两个独立规则，明确替代旧指南关于跨 Run 恢复继续沿用原启动判断的约定。异常退出后已收敛到 failed 的任务不自动回队；只有重新入队或显式管理重跑才再次成为候选。自定义 Trigger 的判断可能在两次 Run 之间改变，因此停止前曾获准执行不保证下次仍执行。
 
-Trigger 返回 False 沿用“本次无需执行”语义，不等于 Selection 排除留队，不生成新的成功证据或产物；依赖处理与具名产物存在性校验仍需遵守原契约，不能因跳过生产者就认为其产物存在。
+Trigger 返回 False 沿用“本次无需执行”语义，不等于 排除规则留队，不生成新的成功证据或产物；依赖处理与具名产物存在性校验仍需遵守原契约，不能因跳过生产者就认为其产物存在。
 
 不增加“每 UID 每 Run 最多启动一轮”的特判。同 UID 再次成为候选仍走普通去重、依赖和 Trigger；同 Run 内再次入队不得刷新重试预算。
 
-执行选择改为 run(selection=...)，只影响本次运行，被排除的任务及受影响下游留队。删除 Skip 及其终态跳过、skipped Attempt 语义；Selection 只负责本次排除。主动终结由 Run 外 set_job_status(..., "failed", recursive=...) 表达，不提供独立 cancel 接口。再次入队仍服从 Trigger，不增加永久禁止该 UID 或优先于 always 的屏障。
+运行选择使用 run(exclude=Exclude(task_type="download"))，本版本只接受单个 Exclude 或 None，不接收列表，不解析多规则组合。不保留 selection= 别名或公开 Selection 包装类。Exclude(*, task_type: str) 按完整类型名精确匹配；无匹配时无操作，None 表示不主动排除。命中任务及受影响下游本次留队，对后续派生任务同样生效；不改变排序，不提供运行中修改规则的接口。本版不实现交／并／补或自定义规则协议，但将来可通过单个组合规则对象扩展同一参数，不将“只支持简单规则”规定为永久限制。删除 Skip 及其终态跳过、skipped Attempt 语义。主动终结由 Run 外 set_job_status(..., "failed", recursive=...) 表达，不提供独立 cancel 接口。再次入队仍服从 Trigger，不增加永久禁止该 UID 或优先于 always 的屏障。
 
-内部准入统一检查：Run 允许新派发、用户 Selection 允许、当前 UID 未被本 Run 临时排除、依赖与资源就绪。临时排除仅存内存，下次 Run 清空；复用 Selection 的依赖阻塞与停摆判断，不修改 OrderingPolicy 的排序职责，不新增公开的运行期 pending 控制 Interface。Selection 不能代替在途执行终止、清理或数据库结算。
+内部准入统一检查：Run 允许新派发、用户排除规则允许、当前 UID 未被本 Run 临时排除、依赖与资源就绪。临时排除仅存内存，下次 Run 清空；复用排除规则的依赖阻塞与停摆判断，不修改 OrderingPolicy 的排序职责，不新增公开的运行期 pending 控制 Interface。排除规则不能代替在途执行终止、清理或数据库结算。
+
+### Task、Job 与注册签名
+
+身份字段及 handler 可按位置传入，其余配置均为关键字参数：
+
+```text
+Task(task_type: str, handler, *, resources=None,
+     max_retries_per_run=3, timeout_seconds=3600, trigger="once")
+Job(task_type: str, job_id: str, *, payload=None, depends_on=None,
+    files=None, resources=None, max_retries_per_run=None,
+    timeout_seconds=None, trigger=None)
+register_task(task: Task) -> None
+register_task(task_type: str, handler, *, resources=None,
+              max_retries_per_run=3, timeout_seconds=3600,
+              trigger="once") -> None
+```
+
+两种注册形式使用同一模板配置契约；传入 Task 对象时不得附带 handler 或其他配置覆盖。重复注册同名 Task 明确拒绝。Job 构造不接受 runtime、attempt_no、activation_no、first_enqueued_at 等内部运行字段。
+
+Task 是执行配置模板；payload、depends_on、files 仅属于 Job，不增加模板默认值。Job 的三者省略或为 None 时分别规范化为独立空字典、空列表、空字典；payload 要求 JSON 对象，depends_on 为 UID 序列，files 为名称到 FileSpec 的映射。资源按名称继承并覆盖，空映射不清空 Task 资源。三个标量的 None 表示继承 Task，具体值覆盖；max_retries_per_run 为非负整数，timeout_seconds 必须为有限正数，不新增无限时或关闭超时的特殊值。
+
+删除 Task 与 register_task 的 payload_schema 参数及其框架业务结构校验，不提供替代验证器。框架只检查 payload 能否按 JSON 对象契约保存；业务字段、类型与值域由用户负责，不从注解自动推导运行时验证。
+
+handler 调用固定为 handler(job: Job, ctx: JobContext) -> TaskResult，且仅同步执行。job 提供身份、业务输入和本次生效配置；ctx 提供文件声明／路径读取、派生和游标操作。修改 worker 内 Job 对象不代表修改主进程队列或状态，不提供 payload-only、ctx-only 等签名自动适配。
+
+外部提交时解析并保存有效配置；派生任务按父成功提交时的配置解析契约处理。已经接纳的 pending 跨 Run 继续使用快照，不因新进程 Task 默认值改变而刷新；新提交的 Job 使用当前模板。handler 代码始终来自本次注册，不持久化代码版本。
 
 ### 依赖闭合与动态派生
 
@@ -103,7 +129,7 @@ ctx.spawn 只能引用派发时已知的 Job、当前父 Job，以及本次 hand
 | 运行时上游事实 | 下游行为 |
 | --- | --- |
 | 有活跃 pending/running 候选 | 等待本次结果，历史成功不能绕过活跃候选 |
-| 被 Selection 或授权拒绝本次排除 | 下游本次排除并留队，不当作依赖缺失 |
+| 被排除规则或授权拒绝本次排除 | 下游本次排除并留队，不当作依赖缺失 |
 | 无活跃候选且有 successes | 依赖满足，再检查输入及具名产物 |
 | 无活跃候选且只有 failures | 失败并级联 |
 | 记录缺失，包括提交后被人工清除 | 失败并级联，不等待或从 Attempt 补推成功 |
@@ -113,7 +139,7 @@ Trigger False 只移除本次候选，不成为独立的依赖成功证据；移
 本版本不引入 Group、Join、Task 类型栅栏或组计数器。文档提供动态分支汇总用法：生成者先逐一声明子任务并收集 UID，再声明依赖这些 UID 的汇总任务，最后返回成功。子任务数可在 handler 运行时确定；汇总依赖具体实例，不能将某个 Task 类型解释为封闭任务组。以下仅示意既有接口的组合，所有派生随父成功原子发布：
 
 ```python
-def generate(ctx):
+def generate(job: Job, ctx: JobContext) -> TaskResult:
     child_uids = []
     for item_id in discover_item_ids():
         child = Job("process", item_id)
@@ -156,6 +182,17 @@ TaskResult.success(metadata={"count": 12})
 TaskResult.failure(message="无法处理", metadata={"reason": "unsupported"})
 TaskResult.retry(message="暂时不可用", consume_budget=True, metadata={})
 ```
+
+三个结果构造方法的完整参数如下，均只接受关键字：
+
+```text
+TaskResult.success(*, message: str | None = None, metadata: dict | None = None)
+TaskResult.failure(*, message: str | None = None, metadata: dict | None = None)
+TaskResult.retry(*, message: str | None = None, metadata: dict | None = None,
+                 consume_budget: bool = True)
+```
+
+metadata=None 规范化为空字典；message 为可选的可读说明，不强制失败或重试填写原因。metadata 是用户结构化业务结果，二者均不参与调度判断。consume_budget 只属于 retry；exception、annotations、文件记录由框架生成，不作为 TaskResult 构造参数。
 
 - 不再接受 None、bool、dict、二元组作为隐式结果。
 - retry 的 consume_budget 默认 True；零预算重试必须显式 False。返回 retry 不操纵资源；本版本不提供资源挂起能力。
@@ -207,6 +244,19 @@ OrderingPolicy 决定候选检查顺序，选择最靠前且满足全部启动�
 资源查询区分三种含义：可用；暂不可用（给出下次检查时间或等待通知）；明确不可满足（说明原因）。明确不可满足由正常资源查询返回，目标 Job 及依赖下游按失败规则收敛，未执行不制造 Attempt；资源方法抛异常则属于 Run 级框架故障。三态的内部类型与字段由实现确定，不能用未知等待时间推断不可满足。
 
 正常顺序为：准入与资源检查 → 必要文件授权 → 重新检查全部资源 → 持久化 Job.running → 逐项获取资源 → 产物准备与 worker 执行 → 收到有效结果及必要清理 → 释放已获取资源 → 原子提交结果。等待初始文件授权期间不占用业务资源或消费配额；资源异常遵循框架故障规则，不承诺多资源获取的事务回滚、补偿或异常后完整释放。
+
+### 内置资源的公开使用
+
+```python
+from tasklite.resource import CapacityResource, IntervalResource
+
+tasklite.register_resource(CapacityResource("slots", max_capacity=4))
+tasklite.register_resource(IntervalResource("requests", interval_seconds=2))
+```
+
+构造签名为 CapacityResource(name: str, *, max_capacity: float) 与 IntervalResource(name: str, *, interval_seconds: float)，注册入口 register_resource(resource) -> None。仅资源名支持位置参数。用户构造、注册并在 Task／Job 中声明用量；can_acquire/acquire/release 是主进程内部协议，本版不承诺用户直接调用或自定义资源扩展。同名资源重复注册明确拒绝，内部 worker 容量不能通过资源注册覆盖，最大并发只通过 max_workers 配置。
+
+RateLimitResource 改名 IntervalResource，不保留旧名别名，不改变现有间隔算法：本次获取获准后，下次获取至少等待 interval_seconds × amount，任务结束不返还时间配额。首次可立即获取；用量影响后续等待，不要求本次先积攒足够配额。它约束资源获取／Job 派发节奏，不控制 handler 内部外部请求，不承诺令牌桶或滑动窗口限速。文档示例通常使用 amount=1。
 
 ### 等待与通知契约
 
@@ -343,7 +393,7 @@ running 写入失败时禁止产物准备和 worker 启动。该记录只证明�
 - 主进程询问。等待时暂停新派发，继续收消息、结算其他在途任务及处理超时；等待授权的 worker 不计执行超时。
 - 拒绝授权或无法询问时，将当前 Job 及依赖它本次执行结果的直接、间接下游加入本 Run 临时排除，保持或回到 pending；无关任务继续，不因此结束整个 Run。不得在同 Run 重复派发和询问，也不得将这条依赖链误判死锁或级联业务失败。
 - 临时排除同时作用于后续派生任务；活跃上游遮蔽历史成功，不能用上游旧成功绕过本次排除。正常依赖调度保证这些下游尚未派发，不增加批量终止下游 worker 的机制。排除不落库、不消耗预算、不发布成功效果，下一 Run 重新判断启动与授权。
-- 运行期声明受阻时，先结束当前受阻执行并完成结算，才能把 running 改回 pending；仅修改 Selection 或发出拒绝消息不能证明 worker 已结束。不执行未经授权的清理。外部停止同样解除未完成授权等待。
+- 运行期声明受阻时，先结束当前受阻执行并完成结算，才能把 running 改回 pending；仅修改排除规则 或发出拒绝消息不能证明 worker 已结束。不执行未经授权的清理。外部停止同样解除未完成授权等待。
 
 授权管理仅提供 TaskLite.list_authorizations() -> list[dict] 与 revoke_authorization(path: str | Path) -> bool，均限 Run 外。查询记录包含规范绝对路径及文件／目录目标类型。撤销精确匹配规范化路径，删除成功返回 True，不存在返回 False；撤销目录下的某个子路径不能覆盖父目录授权，必须撤销对应目录记录。不增加拒绝列表、手工授权入口或授权管理器。
 
@@ -397,7 +447,7 @@ run() 可重复调用。stop() 只发出停止当前 Run 新派发的请求，�
 
 run() -> None：正常完成，包括发生 Job 失败的情况，以及 Ctrl+C／stop() 正常排空后，均返回 None。删除公开 stats 属性、RunSummary 和 RunStats，不提供运行摘要。数据库不可写、状态不变式损坏等框架故障直接抛异常。调用者通过 StateSnapshot 查询或比较持久化记录；快照不能完整还原 Run 退出原因，不为重建摘要增加持久化状态。
 
-Trigger、Selection、Resource 等框架扩展抛异常时，run() 直接失败并抛出异常，不将其当作普通 Job 失败后继续调度，不承诺正常排空、资源补偿、完整释放或逐条结算。Resource 的查询、获取及释放异常均适用；部分获取后出错不增加跨资源回滚协议。此决定替代此前“Trigger 异常后复用 Ctrl+C 排空再抛出”的方案，也替代 ADR-0008 中强制回收并退回 pending 的规则。
+Trigger、排除规则、Resource 等框架扩展抛异常时，run() 直接失败并抛出异常，不将其当作普通 Job 失败后继续调度，不承诺正常排空、资源补偿、完整释放或逐条结算。Resource 的查询、获取及释放异常均适用；部分获取后出错不增加跨资源回滚协议。此决定替代此前“Trigger 异常后复用 Ctrl+C 排空再抛出”的方案，也替代 ADR-0008 中强制回收并退回 pending 的规则。
 
 框架故障不保证正常收尾，不代表可以伪造或改写已经提交的结果。已提交记录保留；来不及结算的 running 由下次启动按恢复规则判失败。正常可用的运行循环仍按既定规则处理 worker 返回、超时和清理故障。Ctrl+C／stop() 是有收尾契约的正常停止，与框架故障直接失败分开。
 
@@ -453,6 +503,62 @@ get_job(uid) 返回当前 Job 的 JSON 兼容字典，不存在时返回 None；
 
 一个上下文提供一致快照，可在执行期间打开，不创建、迁移、修复数据库。重新打开才看见新提交；迭代在上下文内完成，已返回记录关闭后仍可用。采用迭代避免强制全量加载，不为分页另增公开接口。公开数据字段需要文档契约，SQL 表结构不承诺公开。待执行记录不是实时操作系统进程清单，修改返回字典不会改变框架状态。
 
+### 查询记录结构与顺序
+
+Job 与 Attempt 使用相同字段命名和分层，不将执行结果混入提交配置。以下是结构示意，省略号仅表示已有配置内容：
+
+```python
+# Job 当前记录
+{
+    "job_uid": "...",
+    "status": "succeeded",
+    "job": {...},
+    "files": {...},
+    "result": {...},
+    "run_id": "...",
+    "attempt_no": 1,
+    "started_at": "2026-11-07T08:30:00.123456Z",
+    "settled_at": "2026-11-07T08:30:02.123456Z",
+}
+# Attempt 历史记录：同形字段，但以 outcome 替代 status
+{
+    "job_uid": "...",
+    "outcome": "success",
+    "job": {...},
+    "files": {...},
+    "result": {...},
+    "run_id": "...",
+    "attempt_no": 1,
+    "started_at": "2026-11-07T08:30:00.123456Z",
+    "settled_at": "2026-11-07T08:30:02.123456Z",
+}
+```
+
+job 是完整的有效配置快照，包含身份、payload、depends_on、files 配置及资源、预算、超时、Trigger；不含内部运行账目。普通声明路径遵守提交时绝对化规则，上游文件引用仍保留引用配置，不以解析结果倒改。外层 files 按名称记录本次已解析预声明与已接收动态声明的并集，每项包含绝对 path、role 及 delete_existing/delete_on_failure/delete_on_success，不另设 inputs/outputs/caches。中断时只记录主进程实际掌握的声明，不保证动态信息完整，也不保证文件仍存在。
+
+result 有值时统一为下列形状：
+
+```python
+{
+    "message": None,
+    "exception": None,
+    "metadata": {},
+    "annotations": {},
+}
+# 有异常时，exception 为：
+{
+    "type": "ValueError",
+    "message": "原始异常消息",
+    "traceback": None,  # 有可得文本则保存文本
+}
+```
+
+message 为说明，metadata 为业务数据，annotations 为框架附加信息；exception 无异常时为 None，不构造公开分类码。当前 pending/running 尚未结算时 result=None，不将上一次重试结果附作当前结果；历史结果通过 Attempt 查询。
+
+执行归属和时间放在记录外层。无对应执行时 run_id/attempt_no/started_at 为 None；人工结算有 settled_at，但不伪造执行身份。Attempt 必须有 run_id 和 attempt_no；started_at 表示 worker 实际启动时间，未启动或恢复时无法确认则 None。settled_at 表示主进程结算时间，不冒充真实退出时刻。时间统一为 UTC ISO 8601 字符串，以 Z 表示 UTC，未知值为 None；不另存 duration。当前 pending 不挂载上一次 Attempt 的结果或执行归属；内部编号进度仍单独保留。
+
+iter_attempts(job_uid=uid) 按 attempt_no 递增返回；iter_jobs、未指定 job_uid 或仅按 task_type 过滤的 iter_attempts 不承诺顺序。查询不增加 order_by、倒序或分页参数；查询顺序不代表调度顺序。
+
 ### Run 外管理与游标
 
 常用状态管理仅保留下列入口，不增设管理器包装对象：
@@ -502,20 +608,35 @@ Run 外限制以状态库级互斥落实，而非只检查当前 Python 对象�
 
 授权管理、初始化、官方后端所有权、内存快照、线程与信号、异常简化及兼容方向均已裁决，不再作为待选方案。核心行为已收口；以下是冻结前必须完成的核查，不代表可以自行增加功能：
 
-1. 汇总模型与注册入口的最终参数、记录字段及默认值，对照下表和删除清单检查遗漏；新出现的实质冲突单独提出，不在实现时暗定。
+1. 模型与注册参数、结果构造、记录字段和默认值已经收束；实施前后对照接口表及样本验证一致性，新出现的实质冲突单独提出，不在实现时暗定。
 2. 独立对照代码验证依赖、编号、查询、授权及停止交叉行为的实现可行性，区分真实矛盾和普通实现工作。
 3. 确定发布版本号、数据库格式号、支持窗口及迁移／回退说明；当前不修改存量库。
 
+### 导入路径与扩展方向
+
+根包保留执行核心、值对象、只读入口、异常与身份工具；可扩展或未来可能扩展的能力从各自模块导入，不在根包重复再导出。导入位置与兼容承诺分开：内置资源和 Exclude 在子模块中仍属于稳定 API，但不因此开放自定义扩展协议。
+
+```python
+from tasklite import (
+    TaskLite, Task, Job, JobContext, TaskResult, FileSpec,
+    StateSnapshot, TaskLiteError, make_job_uid, parse_job_uid,
+)
+from tasklite.resource import CapacityResource, IntervalResource
+from tasklite.selection import Exclude
+```
+
+排序、重入队、Trigger 等现有或未来扩展同样归各自职责模块。HTTP、Discovery、测试辅助等保留各自模块与不保证兼容的范围，不混入稳定根包。删除公开 Selection 包装；未来交／并／补若引入，以单个组合规则对象接入 exclude，不要求当前用户理解额外容器。
+
 ### 常用公开接口索引
 
-本表集中登记调用面；具体状态与副作用契约以上文为准。尚未逐字段冻结的模型／注册签名不伪称完成，实施前须补齐可执行契约样本。
+本表集中登记调用面；具体状态与副作用契约以上文为准。模型／注册签名与查询字段见对应章节；实施时将这些样本转为契约测试，不将内部数据库字段自动公开。
 
 | 对象 | 保留或新增入口 | 调用边界 |
 | --- | --- | --- |
 | TaskLite | 构造、close、上下文管理、is_running | 内置后端；关闭规则见生命周期 |
 | TaskLite | register_task、register_resource | Run 外；Task 简式／对象注册，资源仅内置 |
 | TaskLite | enqueue(job) -> bool | Run 外，单 Job |
-| TaskLite | run(*, selection=None, install_signals=True) -> None、stop() -> None | 同一控制线程运行，stop 可跨线程 |
+| TaskLite | run(*, exclude=None, install_signals=True) -> None、stop() -> None | 同一控制线程运行，stop 可跨线程 |
 | TaskLite | set_job_status(job_or_uid, status, *, recursive, note=None) -> None | Run 外，三目标态，必须指定 recursive |
 | TaskLite | clear_history(uid, *, records) -> int | Run 外，仅明确选中的历史记录 |
 | TaskLite | get_cursor(key)、set_cursor(key, value) | Run 外读取最新提交、直接写入 |
@@ -525,12 +646,12 @@ Run 外限制以状态库级互斥落实，而非只检查当前 Python 对象�
 | StateSnapshot | open(path_or_tasklite)、get_job(uid)、iter_jobs(*, status=None, task_type=None)、iter_attempts(*, job_uid=None, task_type=None) | 一致只读快照，返回 JSON 兼容字典 |
 | 规格与结果 | Task、Job、FileSpec、TaskResult.success/failure/retry | 三层模型、文件与结果章节定义行为 |
 | 身份工具 | make_job_uid、parse_job_uid、Job.uid | 透明可逆身份，不受文件名约束 |
-| 选择与内置资源 | Selection、Exclude、CapacityResource、RateLimitResource | 不冻结自定义扩展协议 |
+| 选择与内置资源 | selection.Exclude、resource.CapacityResource/IntervalResource | 从对应模块导入；不冻结自定义扩展协议 |
 | 异常 | TaskLiteError | 仅框架主动拒绝；底层异常原样传播 |
 
-查询记录的必要信息分层如下，最终键名／时间编码仍需完整契约样本核定，不以数据库列名自动充当公开格式：Job 记录包含身份、完整配置快照、当前 status 及对应运行／终态信息；Attempt 包含身份、完整配置快照、run_id、attempt_no、outcome 和实际执行／结算信息。结果部分区分 message、exception、业务 metadata、框架 annotations、文件声明及解析路径。异常信息只保留可得证据，不猜测退出原因或时间。所有记录为 JSON 兼容字典，不新增公开记录包装类。
+记录字段以“查询记录结构与顺序”章节为准，发布前核对实现与样本一致；不得恢复公开记录包装类或将所有数据库列直接导出。
 
-目标删除面包括：name/state_dir、外部 backend 注入与 setter、strict_picklable、异常分类参数及注册、三个内部调优参数、三个生命周期回调、progress_hook、stats/RunSummary/RunStats、run_graceful/强停/跳过库锁、Skip、front/replace_pending、独立取消/重跑/人工成功/失败清理、seed_cursor、handler 成败读取、分表及 TaskLite 重复查询、资源挂起、旧错误分类与 ERR_*。根包不再导出内部后端类作为稳定使用入口；可选工具及未冻结扩展的具体导入另列发布清单，不以现有 __all__ 自动产生承诺。
+目标删除面包括：name/state_dir、外部 backend 注入与 setter、strict_picklable、异常分类参数及注册、三个内部调优参数、三个生命周期回调、progress_hook、stats/RunSummary/RunStats、run_graceful/强停/跳过库锁、Selection/Skip、selection=、多规则列表、payload_schema、RateLimitResource 旧名、front/replace_pending、独立取消/重跑/人工成功/失败清理、seed_cursor、handler 成败读取、分表及 TaskLite 重复查询、资源挂起、旧错误分类与 ERR_*。根包不再导出内部后端类作为稳定使用入口；可选工具及未冻结扩展的具体导入另列发布清单，不以现有 __all__ 自动产生承诺。
 
 ### 独立可行性核查结论
 
@@ -540,7 +661,7 @@ Run 外限制以状态库级互斥落实，而非只检查当前 Python 对象�
 - SQLite 快照上下文持有独立只读事务；内存快照固定一个一致版本，不能通过整个用户上下文持有后端锁来阻塞执行。验收需覆盖两次读取之间发生原子提交，仍观察同一版本的场景。
 - 有效结果到达后的正常结算与授权拒绝后的中止分别验证：前者不等待进程退出才能结算，后者必须先结束受阻 worker 才能将 running 改回 pending。不能机械复用一条终止／join 路径，也不新增返回后退出期限。
 
-现有实现中编号依赖历史／快照、SQLite 按操作开关连接、内存逐次锁定读取及集中进程回收的结构需要适配；这些是实施工作，不是要求恢复已删除接口的理由。最终签名与记录字段样本仍按前节补齐后再冻结。
+现有实现中编号依赖历史／快照、SQLite 按操作开关连接、内存逐次锁定读取及集中进程回收的结构需要适配；这些是实施工作，不是要求恢复已删除接口的理由。本轮新增签名与记录样本已补入相应章节；先前独立审查是静态可行性依据，不冒充这些接口已经完成运行验证。
 
 ### 按既定契约实施并验证
 

@@ -1,12 +1,12 @@
 # ADR-0011 公开 Interface 覆盖审计
 
-状态：**核心行为已裁决，独立静态可行性核查通过，最终签名／记录样本待完成**。导出证据的代码基线为 `57b50b7`，覆盖状态随已接受设计更新。本文是设计工作清单，不是已发布手册，也不新增兼容承诺；已接受行为以 [ADR-0011](0011-stable-interface-baseline.md) 为准，实施顺序见 [ROADMAP](../ROADMAP.md)。不修改当前 GUIDE 来提前宣布尚未实现的接口。
+状态：**核心行为已裁决，已有独立静态可行性核查结论，后续确认的模型签名／记录样本已同步，待实施验证**。导出证据的代码基线为 `57b50b7`，覆盖状态随已接受设计更新。本文是设计工作清单，不是已发布手册，也不新增兼容承诺；已接受行为以 [ADR-0011](0011-stable-interface-baseline.md) 为准，实施顺序见 [ROADMAP](../ROADMAP.md)。不修改当前 GUIDE 来提前宣布尚未实现的接口。
 
 ## 范围与方法
 
 核对根包与子模块的显式导出、TaskLite 方法和构造参数、JobContext、模型、资源与调度协议、后端、wrappers、hooks 和 testing。使用源码静态读取，不执行下游业务、不访问业务数据库。显式导出意味着需要裁决，不意味着最终必须承诺稳定；内部文件的 __all__ 也不能单独证明它是用户扩展协议。
 
-根包当前显式导出 73 个名称；此外 HTTP 显式导出 13 个名称，Discovery 导出 6 个名称，testing 导出 2 个名称。计数按各导入面分别计算，存在重复再导出，不能相加作为独立能力数。覆盖清单包括现有入口与 ADR 新增入口；最终记录字段、默认值、异常类型尚未逐字段冻结。
+根包当前显式导出 73 个名称；此外 HTTP 显式导出 13 个名称，Discovery 导出 6 个名称，testing 导出 2 个名称。计数按各导入面分别计算，存在重复再导出，不能相加作为独立能力数。覆盖清单包括现有入口与 ADR 新增入口；目标模型签名、结果与查询记录样本见 ADR 正文；当前导出证据不代表目标保留名单。
 
 状态含义：**已确认方向**表示 ADR 已裁决主要行为，仍可能缺签名；**部分覆盖**表示讨论过部分行为但没有闭合契约；**待系统分析**表示本轮尚未逐项分析。后两者不是代码缺陷结论。
 
@@ -15,19 +15,19 @@
 | 功能 | 源码入口 | 本轮覆盖 | 冻结前要回答的问题 |
 | --- | --- | --- | --- |
 | 初始化与生命周期 | TaskLite.__init__/run/stop/is_running/close | 已确认行为 | backend 显式选择、state_path 默认 None、max_workers=4；内置后端自主管理、构造失败释放资源；单控制线程，stop 可跨线程；独立静态核查未发现阻断，运行验证留待实施 |
-| 注册与模型 | register_task、Task、Job、TaskRegistry | 部分覆盖 | 重复注册禁止、可确定的提交错误立即拒绝已确认；错误处理按统一契约；配置继承、payload_schema 校验、None 哨兵及 JSON 类型需在最终签名样本中核对；快照字段与业务构造字段分离 |
+| 注册与模型 | register_task、Task、Job、TaskRegistry | 已确认契约 | 身份/handler 可按位置传入，配置仅关键字；Job 独占 payload/depends_on/files；删除 payload_schema；标量 None 继承，默认 3/3600/once；handler(job, ctx) |
 | 提交与替换 | enqueue、ctx.spawn | 已确认契约 | 单 Job bool 返回、同配置去重异配置冲突；删除 front/replace_pending；声明先于引用，派生随父成功整体提交 |
-| 执行与重试 | TaskResult、Attempt、Job 四态 | 已确认方向 | attempt_no 按 Job 跨 Run 递增，删除 activation_no；结果字典必需字段待样本核定；框架原因仅说明与可得异常，不分类编码 |
+| 执行与重试 | TaskResult、Attempt、Job 四态 | 已确认方向 | attempt_no 按 Job 跨 Run 递增，删除 activation_no；三结果的 message/metadata 可选，仅 retry 有 consume_budget；结果字典样本已明确；框架原因仅说明与可得异常，不分类编码 |
 | 依赖 | Job.depends_on、FileSpec.from_output、governor | 已确认契约 | 禁止悬空引用；spawn 按声明顺序；活跃上游遮蔽旧成功；缺失、失败或成环直接失败；删除宽限与潜在派生者猜测 |
 | 启动规则 | 内置 Trigger；现有 register_trigger/TriggerContext | 已确认主要行为 | 跳过不作为成功证据；人工成功、档案清理及新 Run 重判按 ADR；扩展协议不冻结 |
-| 选择与排序 | Selection/Exclude/Skip、OrderingPolicy | 已确认主要行为 | 删除 Skip；排除及下游留队；按序选择最靠前可执行者；扩展协议暂不冻结 |
+| 选择与排序 | Selection/Exclude/Skip、OrderingPolicy | 已确认主要行为 | 删除 Selection/Skip；run(exclude=单个规则) 不接受列表；Exclude 按类型精确匹配，未来可扩展组合规则；排序独立，扩展协议暂不冻结 |
 | 重入队节奏 | RequeuePolicy、RequeuePlan、ImmediateRequeuePolicy | 扩展暂不承诺兼容 | 保留必要内置行为，协议和内部调用由实现收敛，不作为公开扩展定稿门禁 |
-| 资源 | register_resource、Resource、CapacityResource、RateLimitResource | 部分覆盖 | 已确认主线程唯一入口、连续检查获取、多 worker 共用、查询三态、状态自管、通知且不轮询；只提供官方内置资源；三态类型与通知签名属于内部实现，不设计对外资源扩展 |
+| 资源 | register_resource、Resource、CapacityResource、IntervalResource | 已确认契约 | RateLimitResource 改名 IntervalResource，保留间隔乘用量算法；构造配置仅关键字、同名注册拒绝；主线程唯一入口、连续检查获取、多 worker 共用、查询三态、状态自管、通知且不轮询；只提供官方内置资源；三态类型与通知签名属于内部实现，不设计对外资源扩展 |
 | 资源挂起 | ctx.suspend_resource、list_suspensions；曾提议 resume_resource | 已确认删除 | 删除显式挂起接口、查询与持久化/恢复，不新增结果控制回调；资源可用性通知不属于挂起 API |
 | 文件管理 | FileSpec/from_output、declare_file/file_path | 已确认契约 | role 三内置值、清理默认否、Path 返回、上游显式依赖统一读取、允许路径重叠、不自动创建、删除缺失目标视为完成；无文件扩展或 handler 沙箱 |
 | handler 读状态 | has_succeeded/has_failed/succeeded_or_failed_job_uids | 已确认删除 | handler 不读取成败集合，依赖调度由主进程判断 |
 | 游标 | TaskLite/JobContext.get_cursor/set_cursor | 已确认契约 | 全局键、字符串值、None 删除、空字符串合法；worker 派发快照及自身暂存写，成功提交；主进程 Run 外直接读写；删除 seed_cursor |
-| 查询 | StateSnapshot | 已确认入口 | 仅 get_job/iter_jobs/iter_attempts，返回 JSON 兼容字典；无分表及门面重复查询；必需字段样本待汇总；open 已支持路径／实例的目标签名 |
+| 查询 | StateSnapshot | 已确认入口 | 仅 get_job/iter_jobs/iter_attempts，返回 JSON 兼容字典；无分表及门面重复查询；配置/实际文件/结果分层，job_uid 和时间归属同名；单 Job Attempt 按编号递增，其余不承诺顺序；open 接受路径／实例 |
 | 管理与历史 | set_job_status、clear_history | 已确认契约 | 三种目标状态显式 recursive；完整快照、原子级联、不造 Attempt；明确历史删除范围；删除独立取消/重跑/人工成功/失败清理入口 |
 | 事件与统计 | on_run_start/on_attempt_finished/on_run_end、stats、RunSummary/RunStats | 已确认删除 | run() -> None；快照查询持久化事实，不承诺还原退出原因，不新增摘要状态 |
 | 错误与验证 | TaskLiteError、底层异常、失败记录 | 已确认契约 | 自有异常仅主动拒绝，底层原样传播；删除分类器/重试异常/ERR_*；失败记录 message/exception/metadata，无公开原因码 |
@@ -47,9 +47,9 @@
 | is_running | 保留；单控制线程编排，跨线程 stop；不承诺任意属性并发读写 |
 | backend 属性及 setter | 删除，不开放后端实例注入或替换 |
 | stats、on_run_start、on_attempt_finished、on_run_end 属性 | 全部删除，不提供替代订阅或统计面 |
-| register_resource、register_task、register_trigger | 能力保留，完整签名和校验契约待补 |
+| register_resource、register_task、register_trigger | Task 简式／对象注册签名已定、同名拒绝；内置资源构造及注册已定；自定义 Trigger 不属于稳定扩展承诺 |
 | register_transient_exception | 已撤销异常自动映射重试；不保留同语义的注册入口 |
-| selection | 改为 run(selection=...)，不保留粘滞选择状态 |
+| selection | 删除属性及 selection= 参数；run(exclude=None) 仅接受单规则，不接受列表 |
 | filter_jobs_without_success | 不保留重复查询／过滤入口，查询统一到 StateSnapshot |
 | enqueue | 单 Job 返回 bool；同配置去重、异配置冲突；无 front 或替换入口 |
 | list_suspensions、list_failures | 删除；Job 查询统一到 StateSnapshot |
@@ -58,7 +58,7 @@
 | seed_successes | 删除；统一 set_job_status(..., "succeeded", recursive=...) |
 | seed_cursor | 删除；TaskLite/JobContext 对称 get_cursor/set_cursor |
 | stop | 幂等停止新派发，无 force；不阻塞等待在途，由 run 收尾 |
-| run | 正常完成或排空返回 None；selection=None、install_signals=True；底层异常原样传播，不公开跳过库锁 |
+| run | 正常完成或排空返回 None；exclude=None、install_signals=True；底层异常原样传播，不公开跳过库锁 |
 | run_graceful | 删除 |
 | 当前构造器暴露的 tasks/resources/classifier/runtime_config 等属性 | 内部可变状态不成为稳定 Interface；仍需逐名迁移/删除清单 |
 
@@ -80,7 +80,7 @@ ADR 新增而当前尚未实现的 make_job_uid、parse_job_uid、TaskResult、F
 
 ## 讨论与验收顺序
 
-1. 完成导出分层和保留/调整/删除清单；每项落实唯一导入路径和承诺级别；不为已撤出本版的扩展接口继续冻结签名。
+1. 完成导出分层和保留/调整/删除清单；核心从根包、可扩展能力从职责模块导入，不重复导出；每项落实承诺级别；不为已撤出本版的扩展接口继续冻结签名。
 2. 注册、初始化与校验：用重复注册、未知 Task、坏 payload、显式覆盖、初始化失败五类场景验证。
 3. 按已定契约验证依赖闭合、实际成环、资源等待、框架异常、正常停止排空与通知唤醒，不重新引入缺失依赖宽限。
 4. 按已定契约验证游标、查询和管理；handler 状态读取已删除，使用活跃候选/旧档案、人工成功、档案清除和并发游标提交检查边界。
