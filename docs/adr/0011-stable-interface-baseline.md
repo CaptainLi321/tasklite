@@ -26,8 +26,8 @@
 
 - 保留 Task 规格、Job 逻辑身份、Attempt 执行轨迹。Job 身份仍由 task_type 与 job_id 确定。
 - 保留简式任务注册和 Task 对象注册。同名 Task 禁止重复注册并明确报错，本版本不提供覆盖注册；新进程可以加载更新后的 handler，不检查业务代码变化，不增加代码版本锁。Job 不再让业务构造内部运行账目；只读属性和类型提示提供有限约束，不递归冻结业务 payload，也不检查业务代码是否修改对象。
-- 公开 enqueue 本版本只提交一个 Job；框架捕获独立快照。同 UID 已排队时，相同内容幂等去重，不同内容明确冲突；替换未执行任务必须显式进行。不得顺带扩展批量事务或批量报告 Interface。
-- 外部 enqueue 对提交时可确定的未知 Task、非法配置、不可序列化 payload 及可完成的 schema 校验立即报错，不入队、不写 failures、不产生 Attempt。资源是否可满足不另加提交前检查；输入文件、依赖等只能在后续确定的条件仍在对应阶段判断。
+- 公开 enqueue(job: Job) -> bool 本版本只提交一个 Job；框架捕获独立快照。首次加入队列返回 True；同 UID 已排队且有效配置相同返回 False，不同配置明确冲突。不提供 front、replace_pending 或隐式重试插队，候选顺序由 OrderingPolicy 管理；不提供批量提交接口。普通 enqueue 不清除旧终态档案，仍由 Trigger 判断是否执行。
+- 外部 enqueue 对提交时可确定的未知 Task、非法配置、不可序列化 payload 及可完成的 schema 校验立即报错，不入队、不写 failures、不产生 Attempt。资源是否可满足不另加提交前检查；依赖引用存在性在提交时检查；输入文件及运行时依赖是否满足仍在对应阶段判断。
 - ctx.spawn 调用时捕获独立的提交声明快照，使用所属 TaskLite 实例的固定路径基准；父任务成功时由主进程解析有效配置、校验并整体提交。worker 改变工作目录不改变子任务相对路径的含义。外部单次提交与父任务一次成功中提交多个派生任务是不同场景，后者仍要求整体提交。
 - Trigger 表达本次 Run 对已入队 Job 的启动规则。它不主动入队，也不控制一次启动后的故障重试。on_failure 改名 until_success，默认仍为 once。
 
@@ -53,9 +53,40 @@ Trigger 返回 False 沿用“本次无需执行”语义，不等于 Selection 
 
 不增加“每 UID 每 Run 最多启动一轮”的特判。同 UID 再次成为候选仍走普通去重、依赖和 Trigger；同 Run 内再次入队不得刷新重试预算。
 
-执行选择改为 run(selection=...)，只影响本次运行，被排除的任务及受影响下游留队。取消是 Run 外对 pending 的管理操作：目标与依赖它本次结果的待执行下游直接级联改为 failed，写入 failures，以框架原因区分主动取消和依赖取消，不增加取消集合，不删除业务文件。不存在或已终结的目标明确报错；遗留 running 先按恢复规则结算，不作为 pending 取消。取消结束当前提交，不表示永久禁止该 UID。再次入队仍服从 Trigger，取消没有优先于 always 的特殊屏障。
+执行选择改为 run(selection=...)，只影响本次运行，被排除的任务及受影响下游留队。删除 Skip 及其终态跳过、skipped Attempt 语义；Selection 只负责本次排除。主动终结由 Run 外 set_job_status(..., "failed", recursive=...) 表达，不提供独立 cancel 接口。再次入队仍服从 Trigger，不增加永久禁止该 UID 或优先于 always 的屏障。
 
 内部准入统一检查：Run 允许新派发、用户 Selection 允许、当前 UID 未被本 Run 临时排除、依赖与资源就绪。临时排除仅存内存，下次 Run 清空；复用 Selection 的依赖阻塞与停摆判断，不修改 OrderingPolicy 的排序职责，不新增公开的运行期 pending 控制 Interface。Selection 不能代替在途执行终止、清理或数据库结算。
+
+### 依赖闭合与动态派生
+
+采用 KISS 原则：声明先于引用，成功才满足依赖，缺失或成环直接失败，不猜测未来生产者。外部 enqueue 只能引用已存在的 Job（队列或当前终态档案）；不存在则当场拒绝，不入队、不生成失败档案或 Attempt。依赖存在不要求已经成功，pending/running 的上游允许被引用。仅有历史 Attempt 不作为依赖存在或成功的证据。
+
+ctx.spawn 只能引用派发时已知的 Job、当前父 Job，以及本次 handler 此前已经 spawn 的 Job；不允许向后引用稍后才声明的 Job，也不依赖其他并发 worker 未来提交的任务。声明时捕获快照，父成功结算时由主进程按声明顺序最终校验；任一派生不合法，父任务失败，整个派生集合与游标更新不发布。声明顺序建立引用，成功事务保证整体可见，不新增批量提交 API。
+
+| 运行时上游事实 | 下游行为 |
+| --- | --- |
+| 有活跃 pending/running 候选 | 等待本次结果，历史成功不能绕过活跃候选 |
+| 被 Selection 或授权拒绝本次排除 | 下游本次排除并留队，不当作依赖缺失 |
+| 无活跃候选且有 successes | 依赖满足，再检查输入及具名产物 |
+| 无活跃候选且只有 failures | 失败并级联 |
+| 记录缺失，包括提交后被人工清除 | 失败并级联，不等待或从 Attempt 补推成功 |
+
+Trigger False 只移除本次候选，不成为独立的依赖成功证据；移除后仍按上述终态档案判断。删除缺失依赖宽限期和潜在派生者猜测。保留实际依赖环检测，环内任务及受影响下游失败，未执行不生成 Attempt；不等待或自动修复。禁止悬空引用不意味着跨 Run 复用 UID 时天然无环，不为省去检测新增依赖配置终身不可变的限制。
+
+本版本不引入 Group、Join、Task 类型栅栏或组计数器。文档提供动态分支汇总用法：生成者先逐一声明子任务并收集 UID，再声明依赖这些 UID 的汇总任务，最后返回成功。子任务数可在 handler 运行时确定；汇总依赖具体实例，不能将某个 Task 类型解释为封闭任务组。以下仅示意既有接口的组合，所有派生随父成功原子发布：
+
+```python
+def generate(ctx):
+    child_uids = []
+    for item_id in discover_item_ids():
+        child = Job("process", item_id)
+        ctx.spawn(child)
+        child_uids.append(child.uid)
+    ctx.spawn(Job("summarize", "summary", depends_on=child_uids))
+    return TaskResult.success()
+```
+
+UID 是逻辑身份，不是完整代码、输入或外部环境的内容寻址。提交去重不等于 handler 副作用幂等，也不保证执行恰好一次。派生原子提交复用现有状态事务，不新增 Outbox 或消息转发层。
 
 ### 透明且可读的 Job 身份
 
@@ -98,7 +129,7 @@ TaskResult.retry(message="暂时不可用", consume_budget=True, metadata={})
 
 预算字段统一为 **max_retries_per_run**：每个 Job、每次 run() 独立，在内存计数，不新增持久化预算字段。首次执行之外，最多允许该数量的消耗预算重试。预算耗尽记 failed，不自动启动下一次 Run。同一 Run 再次入队保留消耗；新的 run()（包括同进程 stop 后再次调用）从零计算。跨进程重启不保留已消耗预算。
 
-每次已接纳的执行尝试均使用新的执行编号，包括零预算重试；结果结算时才追加 Attempt，不预先插入或更新 Attempt.running。Attempt 编号不是预算计数，不因预算重置而丢弃历史。尚未进入 running 的选择排除和授权拒绝不产生 Attempt；进入 running 后未启动 worker 就异常中断，也按未结算尝试处理，不探测 handler 是否执行到第一行。
+每次持久进入 running 均推进该 Job 的 attempt_no，从 1 开始，跨 Run 单调递增，包括零预算重试；保留 run_id 表达执行归属，删除 activation_no。编号不是预算计数，人工状态修改不推进编号，清理 Attempt 历史不重置或复用编号；复用 Job 的运行信息保存编号进度，不新增持久化预算或执行日志。结果结算时才追加 Attempt，不预先插入或更新 Attempt.running。尚未进入 running 的选择排除和授权拒绝不产生 Attempt；进入 running 后未启动 worker 就异常中断，也按未结算尝试处理，不探测 handler 是否执行到第一行。
 
 | 结果 | 业务 metadata | 派生任务与游标 |
 | --- | --- | --- |
@@ -114,11 +145,11 @@ TaskResult.retry(message="暂时不可用", consume_budget=True, metadata={})
 annotations={"completion_source": "manual", "note": "已由使用者确认完成"}
 ```
 
-保留人工声明成功的管理能力，但不再接受仅提供 UID 的 seed_successes([uid]) 形式：必须提供可解析的完整 Job，保存有效配置快照。人工成功仍对应 Job.succeeded，不增加第五种状态，不生成 Attempt。可记录人工登记时间，但不得伪造成执行完成时间；once、until_success 认可人工成功，on_input_change 不把人工登记时间当作可信执行成功时间。此决定替代旧接口仅凭 UID 种入成功记录的契约；具体管理签名及冲突结果仍需在实施前明确。
+人工声明成功统一通过 set_job_status 表达，完整配置来自传入 Job 或 UID 对应的既有快照。人工成功对应 Job.succeeded，不增加第五种状态，不生成 Attempt。可记录人工登记时间，但不得伪造成执行完成时间；once、until_success 认可人工成功，on_input_change 不把人工登记时间当作可信执行成功时间。
 
 所有以 Job 为主体的记录都完整保存 Job 快照：队列保存已接纳的执行配置，successes 保存最近一次成功对应的配置，failures 保存失败或取消对应的配置，attempts 在结算时保存该次执行接纳时的配置。快照包括身份、payload、依赖、FileSpec 和解析后的有效执行配置，不保存 handler 代码；handler 由当前注册 Task 提供。不通过可变的“最新 Job”记录间接引用历史。
 
-人工重跑 retry_failure(job_uid) 在同一事务内恢复失败档案的完整快照到 pending 并移除当前失败档案，保留全部 Attempt 历史。不仅恢复身份与 payload，也不静默套用新 Task 默认值。同 UID 已在队列中时明确报冲突，不覆盖；不存在失败档案时明确报错。普通 enqueue 不移除失败档案；人工重跑不增加强制执行标记或绕过 Trigger，once 因当前失败档案已移除而自然允许执行。max_retries_per_run 配置入快照，已消耗预算仍只在内存。动态文件声明、业务结果和框架原因单独记录，不倒改执行开始时的快照。游标和路径授权不是 Job 记录，不重复嵌入 Job 快照。
+人工重跑统一使用 set_job_status(..., "pending", recursive=...)，恢复完整快照并移除对应当前终态档案，保留 Attempt 历史，不静默套用新 Task 默认值。不增加强制执行标记或绕过 Trigger；once 因终态档案已移除而自然允许执行。max_retries_per_run 配置入快照，已消耗预算仍只在内存。动态文件声明、业务结果和框架原因单独记录，不倒改执行开始时的快照。游标和路径授权不是 Job 记录，不重复嵌入 Job 快照。
 
 父成功、派生任务、游标必须整体接受和提交；坏子任务不再独立失败而允许父任务成功。数据库环境故障不得伪装成业务结果；保留未提交任务的恢复条件。文件与外部请求不属于数据库事务，不能承诺回滚。
 
@@ -138,7 +169,7 @@ OrderingPolicy 决定候选检查顺序，选择最靠前且满足全部启动�
 
 资源查询区分三种含义：可用；暂不可用（给出下次检查时间或等待通知）；明确不可满足（说明原因）。明确不可满足由正常资源查询返回，目标 Job 及依赖下游按失败规则收敛，未执行不制造 Attempt；资源方法抛异常则属于 Run 级框架故障。三态的内部类型与字段由实现确定，不能用未知等待时间推断不可满足。
 
-正常顺序为：准入与资源检查 → 必要文件授权 → 重新检查全部资源 → 持久化 Job.running → 逐项获取资源 → 产物准备与 worker 执行 → 收到有效结果及必要清理 → 释放已获取资源 → 原子提交结果 → 完成事件。等待初始文件授权期间不占用业务资源或消费配额；资源异常遵循框架故障规则，不承诺多资源获取的事务回滚、补偿或异常后完整释放。
+正常顺序为：准入与资源检查 → 必要文件授权 → 重新检查全部资源 → 持久化 Job.running → 逐项获取资源 → 产物准备与 worker 执行 → 收到有效结果及必要清理 → 释放已获取资源 → 原子提交结果。等待初始文件授权期间不占用业务资源或消费配额；资源异常遵循框架故障规则，不承诺多资源获取的事务回滚、补偿或异常后完整释放。
 
 ### 等待与通知契约
 
@@ -313,7 +344,7 @@ worker 启动前完成必要授权、资源复查、Job.running 持久化、连�
 
 主进程收到完整、有效的 TaskResult，即认为本次执行已经返回并开始结算，不将 worker 进程退出作为额外成功条件。success、failure、retry 仍按各自规则处理；仅收到进程退出、没有有效结果，不是成功，仍按失败结算。handler 应在返回前完成自己负责的工作，框架不保证返回后残留的后台线程或外部程序已结束。
 
-正常收尾顺序固定为：**收到有效结果并完成结果及成功效果校验 → 主进程执行必要文件清理 → 释放本次已获取资源 → 原子提交 Attempt、Job 去向及成功效果 → 触发完成事件 → 继续调度。** 清理失败按已定规则改判失败；资源释放异常使 Run 失败，本次尚未提交，不承诺补偿。资源已释放而提交失败，也不宣称本次已结算，遗留 running 下次按恢复规则处理。释放触发的通知只标记变化，不在当前结算完成前插入新派发。
+正常收尾顺序固定为：**收到有效结果并完成结果及成功效果校验 → 主进程执行必要文件清理 → 释放本次已获取资源 → 原子提交 Attempt、Job 去向及成功效果 → 继续调度。** 清理失败按已定规则改判失败；资源释放异常使 Run 失败，本次尚未提交，不承诺补偿。资源已释放而提交失败，也不宣称本次已结算，遗留 running 下次按恢复规则处理。释放触发的通知只标记变化，不在当前结算完成前插入新派发。
 
 进程句柄、Pipe 和接收线程的回收属于 Implementation，不增加“结果返回后还必须限时退出”的业务判定，不以阻塞 join 作为收到结果后的结算前置条件。进程回收的具体实现仍须验证不会阻塞主循环或遗留运行句柄，但不借此改写有效结果。
 
@@ -325,7 +356,7 @@ run() 可重复调用。stop() 只发出停止当前 Run 新派发的请求，�
 
 删除 run_graceful()，由 run() 统一处理正常运行与 Ctrl+C 收尾。不提供 stop(force=True) 或其他公开强制终止方法。第二次及后续 Ctrl+C 仍保持正常排空，并提示正在等待在途任务，不隐式升级为强制终止；需要立即退出时由用户外部终止，按已有异常退出与遗留 running 规则处理。
 
-run() 正常结束时返回 RunSummary，包括存在任务失败的情况；Ctrl+C 或 stop() 成功完成收尾后同样返回摘要并说明停止原因。数据库不可写、状态不变式损坏等框架故障抛出异常，不返回看似完整的运行摘要。
+run() -> None：正常完成，包括发生 Job 失败的情况，以及 Ctrl+C／stop() 正常排空后，均返回 None。删除公开 stats 属性、RunSummary 和 RunStats，不提供运行摘要。数据库不可写、状态不变式损坏等框架故障直接抛异常。调用者通过 StateSnapshot 查询或比较持久化记录；快照不能完整还原 Run 退出原因，不为重建摘要增加持久化状态。
 
 Trigger、Selection、Resource 等框架扩展抛异常时，run() 直接失败并抛出异常，不将其当作普通 Job 失败后继续调度，不承诺正常排空、资源补偿、完整释放或逐条结算。Resource 的查询、获取及释放异常均适用；部分获取后出错不增加跨资源回滚协议。此决定替代此前“Trigger 异常后复用 Ctrl+C 排空再抛出”的方案，也替代 ADR-0008 中强制回收并退回 pending 的规则。
 
@@ -350,7 +381,7 @@ Ctrl+C 关闭本 Run 的派发入口，不通过枚举现有 UID 实现排除。
 | 本次终态已提交 | 保持 succeeded/failed，不受之后进程退出影响 |
 | 同次结果已提交但 Job 仍 running 等不变式冲突 | 明确报错停止，不猜测哪个记录正确 |
 
-恢复判定理由为“上次执行未完成结算，实际结果未知”，不猜测 SIGKILL、OOM 或真实死亡时刻，不以残留产物证明成功，也不证明旧 worker 已经消失。恢复记录属于原执行的 Run，记录结算时刻不能冒充进程退出时刻；不计作新 Run 执行失败，可单独报告启动收敛数量。完整事务与执行身份校验保证重复启动不会追加重复结算。
+恢复判定理由为“上次执行未完成结算，实际结果未知”，不猜测 SIGKILL、OOM 或真实死亡时刻，不以残留产物证明成功，也不证明旧 worker 已经消失。恢复记录属于原执行的 Run，记录结算时刻不能冒充进程退出时刻；不改记为新 Run 的执行。完整事务与执行身份校验保证重复启动不会追加重复结算。
 
 | 异常退出发生位置 | 下次可见记录及结论 |
 | --- | --- |
@@ -363,31 +394,52 @@ Ctrl+C 关闭本 Run 的派发入口，不通过枚举现有 UID 实现排除。
 
 主进程仍在时，worker 被终止且没有可正常结算的可信结果则 failed，保存可得退出证据；若已持有完整有效结果则按正常结算处理。主进程也来不及登记就退出时，统一由遗留 Job.running 规则收敛。数据库不可写则停止并暴露错误，不声称已完成失败登记。
 
-### 摘要与只读观察
+### 只读观察
 
-运行摘要区分退出原因与完成程度：has_failures 只表示本次产生的终态失败；has_pending 表示结束时仍有队列任务，包含选择排除；is_complete 表示正常结束且没有本次终态失败、没有剩余任务。Trigger 跳过不等于实际成功执行，统计分开。
-
-Attempt 失败次数与 Job 终态失败次数分开，授权拒绝不使 has_failures 为真，但会使 has_pending 为真、is_complete 为假。查询记录分别表达 Attempt 结局与 Job 去向。一次 Ctrl+C 收尾期间发生超时，可同时报告用户停止与存在终态失败；不得用 Run 退出原因覆盖 Job 结果。同 UID 后来成功也不抹去本 Run 已发生的失败事件。
-
-独立只读入口为 StateSnapshot，不再套外层 reader：
+独立只读入口为 StateSnapshot，不再套外层 reader，不在 TaskLite 重复提供 Job 查询接口：
 
 ```python
 with StateSnapshot.open(state_path) as state:
     current = state.get_job(job_uid)
-    record = state.get_success(job_uid)
-    failure = state.get_failure(job_uid)
-    running = list(state.iter_running())
-    failures = list(state.iter_failures(task_type="process"))
-    pending = list(state.iter_pending())
+    pending = list(state.iter_jobs(status="pending"))
+    failures = list(state.iter_jobs(status="failed", task_type="process"))
     attempts = list(state.iter_attempts(job_uid=job_uid))
-    cursor = state.get_cursor("position")
 ```
 
-get_job(uid) 返回当前 Job 记录及四态 status，不存在时返回 None；有 pending/running 候选时优先反映该候选。get_success/get_failure 查询终态档案，不代表当前候选状态。iter_running 与 iter_pending 分开，调用者无需从旧成功档案推断当前是否执行。
+get_job(uid) 返回当前 Job 的 JSON 兼容字典，不存在时返回 None；有 pending/running 候选时优先反映该候选。iter_jobs(*, status=None, task_type=None) 按当前状态查询，status=None 包含四态；iter_attempts(*, job_uid=None, task_type=None) 查询执行历史。记录采用独立字典，不新增 JobRecord／AttemptRecord 包装类。Attempt.outcome 与 Job.status 分别表达一次结果和当前去向，不能把 Attempt.failure 自动等同于 Job.failed。
 
-一个上下文提供一致快照，可在执行期间打开，不创建、迁移、修复数据库。重新打开才看见新提交；迭代在上下文内完成，已返回记录关闭后仍可用。采用迭代／分页避免强制全量加载。公开数据结构稳定，SQL 表结构不承诺公开。待执行记录不是实时操作系统进程清单。
+不提供 get_success/get_failure、iter_successes/iter_failures/iter_pending/iter_running 等分表便捷入口，也不保留 TaskLite.list_failures 等重复查询。旧终态仍供内部 Trigger 判断，不增加第二套公开档案查询面。StateSnapshot 不提供游标查询或 iter_cursors，游标通过下文的对称入口访问。
 
-查询不提供写操作。管理操作仅限 Run 外，不提供资源挂起查询或 resume_resource。不能通过修改查询返回值改变引擎。
+一个上下文提供一致快照，可在执行期间打开，不创建、迁移、修复数据库。重新打开才看见新提交；迭代在上下文内完成，已返回记录关闭后仍可用。采用迭代避免强制全量加载，不为分页另增公开接口。公开数据字段需要文档契约，SQL 表结构不承诺公开。待执行记录不是实时操作系统进程清单，修改返回字典不会改变框架状态。
+
+### Run 外管理与游标
+
+常用状态管理仅保留下列入口，不增设管理器包装对象：
+
+```text
+tasklite.enqueue(job: Job) -> bool
+tasklite.set_job_status(
+    job_or_uid: Job | str,
+    status: Literal["pending", "succeeded", "failed"],
+    *, recursive: bool, note: str | None = None,
+) -> None
+tasklite.clear_history(
+    uid: str,
+    *, records: Collection[Literal["successes", "failures", "attempts"]],
+) -> int
+```
+
+上表为接口签名示意。enqueue 表达提交执行意图；set_job_status 表达人工管理，不调用 handler。完整 Job 可直接创建未知任务的指定状态，无需先 enqueue；UID 必须能找到完整快照。传入 Job 与既有有效配置冲突时明确报错，不隐式替换。不能人工设置 running；遗留 running 先按既定恢复规则处理。
+
+recursive 必须显式指定，无默认值，三种目标状态完全对称。False 只修改目标；True 对目标及已有记录可识别的直接、间接依赖下游设置相同状态，包括已经终结的下游，不推测尚未提交的任务。整个修改原子提交，每个 Job 使用自己的完整快照。pending 清除对应当前终态并恢复队列；succeeded/failed 移出队列并保持成功失败档案互斥。人工成功注明 completion_source=manual；人工失败及级联保留原因和可选 note。以上操作不生成 Attempt，不推进编号，不执行文件清理、派生或游标更新。
+
+clear_history 必须显式指定 records，返回删除记录数，不存在返回 0；仅删除所选档案或 Attempt 历史，不移除队列、不级联、不入队、不清理文件或游标。不保留 keep_fatal 特例。删除终态会影响后续 Trigger 和依赖判断；只删 Attempt 不改变当前状态。删除 retry_failure、seed_successes、clear_failures 和独立 cancel，不提供同义兼容别名；不提供 replace_pending 或物理删除待执行队列的另一入口。
+
+删除 handler 的 has_succeeded、has_failed、succeeded_or_failed_job_uids，handler 不读取任务成败集合，调度依赖判断由主进程负责；可选工具适配这一边界。
+
+游标只是用户自定义的便捷状态记录，不承担框架进度语义。TaskLite 在 Run 外提供 get_cursor(key: str) -> str | None 和 set_cursor(key: str, value: str | None) -> None；JobContext 提供同名同形入口。键属于状态库全局空间，不自动加前缀；None 表示删除，空字符串是合法值。删除 seed_cursor，不提供 iter_cursors。
+
+TaskLite 读取最新已提交值，写入直接提交；worker 读取派发快照加自己的暂存更新，支持读到自己刚写的值。worker 更新仅随父成功原子提交，失败或重试丢弃。多个任务写同键以最后提交为准，不增加锁、合并或冲突重试。
 
 Run 外限制以状态库级互斥落实，而非只检查当前 Python 对象：不同进程的执行与管理写操作互斥，同时允许多个 StateSnapshot 只读观察。不提供绕过执行／管理互斥的公开参数。该限制不妨碍当前执行器自身的状态事务。
 
@@ -407,12 +459,11 @@ Run 外限制以状态库级互斥落实，而非只检查当前 Python 对象�
 
 ### 尚需处置的常用接口契约
 
-1. 单次提交返回值、front 去留、显式替换接口与内容比较范围；取消、重跑、人工成功的精确签名及已有队列／档案冲突结果。
-2. handler 状态读取的快照时点；游标键和值、删除、读自己未提交的更新、同键提交行为；历史清理范围及其对 Trigger、依赖的影响。
-3. 查询记录结构、过滤／分页、缺失值、原门面便捷查询去留；Attempt 编号作用域、Run 起止事件、统计键与退出原因。
-4. 内置调度的缺失／循环依赖、晚到生产者及历史产物输入视图边界；旧 Skip 的去留。按序选择可执行候选、正常停止级联、有效结果即结算已经确定。
-5. 框架文件操作授权的查询／撤销入口、环境变量和 CLI 精确名称；FileSpec、role、清理默认值、Path 返回、显式上游依赖和统一读取已确定，不再增加文件扩展或沙箱协议。
-6. 初始化参数、公共错误类型、逐项导入／删除清单；官方内存后端与 StateSnapshot 的接法；发布版本、格式版本及支持窗口。
+1. 框架文件操作授权的查询／撤销入口、环境变量和 CLI 精确名称及作用范围。
+2. 初始化参数、官方后端所有权及关闭细节、内存后端与 StateSnapshot 的接法、多线程调用边界。
+3. 公共错误类型、记录必需字段、最终签名与逐项导入／删除清单；发布版本、格式版本及支持窗口。
+
+提交及状态管理、游标、精简查询、Attempt 编号、run() 无返回摘要、公开回调删除、依赖闭合与 Skip 删除均已裁决，不再作为待选方案。FileSpec 与内置资源主要行为同样已确定；未冻结的扩展及可选工具不作为本版定稿门禁。
 
 ### 按既定契约实施并验证
 
