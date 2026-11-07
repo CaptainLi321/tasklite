@@ -70,7 +70,7 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 | 顺序 | 工作单元 | 面向公开 Interface 的验收重点 |
 | --- | --- | --- |
 | 1 | 定稿 ADR 所列剩余细节，确定发布和格式基线 | 没有把未决状态、参数或错误处理隐式固化到实现 |
-| 2 | TaskResult、业务 metadata 分离、完整 Job 快照、Attempt 与事件 | 三种返回结果、Job 四态与 successes/failures 命名、结算时追加 Attempt、失败档案原子移回队列、回调区分 Attempt 与 Job 结局、有效结果到达即结算、清理及资源释放后原子提交 |
+| 2 | TaskResult、业务 metadata 分离、完整 Job 快照、Attempt 与事件 | 三种返回结果、Job 四态与 successes/failures 命名、结算时追加 Attempt、失败档案原子移回队列、删除三个公开生命周期回调及 progress_hook，查询区分 Attempt 与 Job 结局、有效结果到达即结算、清理及资源释放后原子提交 |
 | 3 | 每 Run 内存预算、Trigger 与生命周期 | 副作用前持久化 Job.running、Attempt 与 Job 去向原子结算、跨 Run 重判与预算重置、stop 与重复 Ctrl+C 幂等排空、删除 run_graceful 与公开强停入口、Trigger／Resource 等框架异常直接失败、不保证正常排空、遗留 running 幂等判失败 |
 | 4 | 单任务提交与成功事务 | 内容冲突、实例创建时统一路径基准、提交时固定配置、快照隔离、派生任务与游标整体提交、取消级联写失败档案、重复注册拒绝、可确定提交错误立即拒绝 |
 | 5 | FileSpec 与主进程文件操作 | 预声明与动态声明取并集、判断执行前不删文件、role 三内置值、无 handler 沙箱、统一 Path 返回与 from_output 显式依赖、清理参数默认否、允许重叠路径、删除缺失视为完成、不自动创建、允许工作目录外路径、所有框架清理由主进程执行、清理失败即失败、删除后仍发布 output 描述、不增加跨 Job 路径锁 |

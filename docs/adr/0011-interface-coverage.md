@@ -29,13 +29,13 @@
 | 游标 | ctx.get_cursor/set_cursor、seed_cursor | 部分覆盖 | 键空间、值类型、None 删除、同键多任务成功提交；本地读自己未提交写入；预填是覆盖还是仅不存在时写入 |
 | 查询 | StateSnapshot、现有 list_failures/list_suspensions | 部分覆盖 | 原门面查询去留；记录形状、缺失值、过滤分页；授权查询；快照关闭后的访问边界 |
 | 管理与历史 | retry_failure、clear_failures、clear_history、seed_successes；目标取消 | 部分覆盖 | 返回值和冲突矩阵；清除终态是否保留 Attempt；人工成功与队列冲突；删除历史对 Trigger、依赖和 Discovery 的影响 |
-| 事件与统计 | on_run_start/on_attempt_finished/on_run_end、RunSummary/RunStats | 部分覆盖 | Run 起止事件的最终参数和时机；启动前失败/排空再异常是否发结束事件；统计累计范围、级联与恢复计数、ExitReason 成员 |
+| 事件与统计 | on_run_start/on_attempt_finished/on_run_end、RunSummary/RunStats | 公开回调已确认删除；摘要待收口 | 删除三个回调的构造参数和属性，不提供替代订阅；剩余统计累计范围、级联与恢复计数、ExitReason 成员待明确 |
 | 错误与验证 | exceptions、ErrorClassifier、ERR_*、ValidationResult | 部分覆盖 | 自动异常重试已撤销后哪些符号删除；框架错误公开类型；原因码与消息边界；payload 校验是否保留独立工具 |
 | 进程执行条件 | strict_picklable、handler、worker 启动与超时 | 部分覆盖 | 支持的 callable/payload/平台组合及验证时点；已确认启动至有效结果的单次执行超时、不等待进程退出才结算；信号安装选项；外部程序进程树边界，不承诺 OS 沙箱 |
 | 后端 | AbstractStateBackend、SQLiteStateBackend、InMemoryStateBackend、backend 属性 | 部分覆盖 | 仅官方 SQLite/内存使用接口稳定，第三方协议不冻结；注入、所有权及关闭、内存模式与 StateSnapshot 接法待定 |
 | Discovery | register_discovery、DiscoveryHandler 及三协议 | 可选工具，暂不承诺兼容 | 全页命中、截断、坏项、on_missing；人工成功/取消失败/档案清除如何影响已见；多子任务整体接受后的行为 |
 | HTTP | HttpPolicy/HttpExecutor/guard 系列、响应、缓存、fetch | 可选工具，暂不承诺兼容 | 不靠异常隐式重试的易用接法；请求内部重试与 Job 重试关系；删除自动资源挂起；响应缓存的身份/有效性；是否保留多个包装入口 |
-| 测试与辅助函数 | fake_ctx/running、job_ref/progress_hook/slice_list | 可选工具，暂不承诺兼容 | 当前旧文档的稳定承诺在新基线切换时同步调整；模拟授权往返和副作用；hook 新事件适配；避免依赖内部结构 |
+| 测试与辅助函数 | fake_ctx/running、job_ref/progress_hook/slice_list | 可选工具，暂不承诺兼容 | 当前旧文档的稳定承诺在新基线切换时同步调整；删除 progress_hook；模拟授权往返和副作用；避免依赖内部结构 |
 | 标识与序列化工具 | encode_*、content_fingerprint、percent_encode、jsonutil；目标 make_job_uid/parse_job_uid | 部分覆盖 | 已确认透明可逆身份接口及取消文件名约束；本轮允许破坏性简化，新基线输出稳定；旧工具逐项去留与 JSON 契约待定 |
 | 版本与文档 | 包导出、GUIDE、Schema/发布窗口 | 部分覆盖 | 新基线版本、记录格式支持窗口、弃用规则、官方子模块导入路径、每个公开接口的类型提示与文档 |
 
@@ -43,10 +43,10 @@
 
 | 现有入口 | 已接受的目标或待裁决事项 |
 | --- | --- |
-| __init__ | name/state_dir/backend/output_roots/max_workers；hook、pickle、异常分类、策略及三个调优参数，必须逐项决定保留与默认值 |
+| __init__ | 三个 hook 参数已确认删除；name/state_dir/backend/output_roots/max_workers、pickle、异常分类、策略及三个调优参数，继续逐项核定保留与默认值 |
 | is_running | 可观察性已有，关闭与跨线程语义待固定 |
 | backend 属性及 setter | 是否允许外部替换及何时替换，待裁决；不能靠可访问推定稳定 |
-| stats、on_run_start、on_attempt_finished、on_run_end 属性 | 读取/设置是否公开、运行期是否可变，待裁决 |
+| stats、on_run_start、on_attempt_finished、on_run_end 属性 | 三个回调属性删除；stats 是否公开及形态待裁决 |
 | register_resource、register_task、register_trigger | 能力保留，完整签名和校验契约待补 |
 | register_transient_exception | 已撤销异常自动映射重试；不保留同语义的注册入口 |
 | selection | 改为 run(selection=...)，不保留粘滞选择状态 |

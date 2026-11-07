@@ -114,7 +114,7 @@ TaskResult.retry(message="暂时不可用", consume_budget=True, metadata={})
 annotations={"completion_source": "manual", "note": "已由使用者确认完成"}
 ```
 
-保留人工声明成功的管理能力，但不再接受仅提供 UID 的 seed_successes([uid]) 形式：必须提供可解析的完整 Job，保存有效配置快照。人工成功仍对应 Job.succeeded，不增加第五种状态，不生成 Attempt，也不触发 Attempt 完成回调。可记录人工登记时间，但不得伪造成执行完成时间；once、until_success 认可人工成功，on_input_change 不把人工登记时间当作可信执行成功时间。此决定替代旧接口仅凭 UID 种入成功记录的契约；具体管理签名及冲突结果仍需在实施前明确。
+保留人工声明成功的管理能力，但不再接受仅提供 UID 的 seed_successes([uid]) 形式：必须提供可解析的完整 Job，保存有效配置快照。人工成功仍对应 Job.succeeded，不增加第五种状态，不生成 Attempt。可记录人工登记时间，但不得伪造成执行完成时间；once、until_success 认可人工成功，on_input_change 不把人工登记时间当作可信执行成功时间。此决定替代旧接口仅凭 UID 种入成功记录的契约；具体管理签名及冲突结果仍需在实施前明确。
 
 所有以 Job 为主体的记录都完整保存 Job 快照：队列保存已接纳的执行配置，successes 保存最近一次成功对应的配置，failures 保存失败或取消对应的配置，attempts 在结算时保存该次执行接纳时的配置。快照包括身份、payload、依赖、FileSpec 和解析后的有效执行配置，不保存 handler 代码；handler 由当前注册 Task 提供。不通过可变的“最新 Job”记录间接引用历史。
 
@@ -122,7 +122,7 @@ annotations={"completion_source": "manual", "note": "已由使用者确认完成
 
 父成功、派生任务、游标必须整体接受和提交；坏子任务不再独立失败而允许父任务成功。数据库环境故障不得伪装成业务结果；保留未提交任务的恢复条件。文件与外部请求不属于数据库事务，不能承诺回滚。
 
-完成回调仅在 Attempt 完成结算后接收单个事件对象，包含 Job 身份、Attempt 信息、业务 metadata 和独立框架原因。event.attempt.outcome 表达 success/failure/retry，event.job_status 表达本次结算后的 succeeded/failed/pending，event.reason 表达框架原因。授权拒绝可以同时是 Attempt.failure 和 Job.pending；告警不能将前者直接解释为终态任务失败。未执行的取消、Trigger 跳过不伪造 Attempt 完成事件。预算耗尽后的实际结局是 failure。回调错误只记录观测错误，不撤销提交或重试任务。不新增 interrupted 结果；停止与尚未完成记录的映射见后文。
+本版本删除公开回调 on_run_start、on_attempt_finished、on_run_end，包括构造参数与对应属性，不提供替代事件订阅接口。Run 前后操作由调用方围绕 run() 编排；执行过程使用框架日志，持久化执行结果通过只读查询观察。移除专用于完成回调的 progress_hook 便利工具。此取舍减少公开生命周期及事件载荷契约，不影响内部统一结算出口。Attempt.outcome 与结算后的 Job.status 仍分别表达执行结果和任务去向：授权拒绝可以同时是 Attempt.failure 和 Job.pending，预算耗尽后的实际结局是 failure；取消和 Trigger 跳过不伪造 Attempt。不新增 interrupted 结果；停止与尚未完成记录的映射见后文。
 
 ## 资源协议与事件驱动等待
 
@@ -294,7 +294,7 @@ pending → failed（取消等执行前终结）
 
 队列中的 Job 持久保存 pending/running 及本次执行归属，复用框架运行信息，不增加独立执行日志、心跳或持久化预算。运行时的进程句柄与临时排除仍在内存。StateSnapshot 的 pending 查询必须排除 running，不能将整张队列表直接解释为待派发集合。
 
-主进程得到结算结果后，在同一个显式写事务内追加 Attempt、更新 Job 去向及对应档案；成功时还包括派生任务和游标。Attempt 只追加已结算记录，不保存 running 阶段。不允许先写 Attempt、再另一个事务改 Job，或反过来分步落盘。数据库失败时不更新内存假装结算完成，不发送完成回调。
+主进程得到结算结果后，在同一个显式写事务内追加 Attempt、更新 Job 去向及对应档案；成功时还包括派生任务和游标。Attempt 只追加已结算记录，不保存 running 阶段。不允许先写 Attempt、再另一个事务改 Job，或反过来分步落盘。数据库失败时不更新内存假装结算完成。
 
 | 结算依据 | Attempt.outcome | Job.status / 去向 |
 | --- | --- | --- |
@@ -329,7 +329,7 @@ run() 正常结束时返回 RunSummary，包括存在任务失败的情况；Ctr
 
 Trigger、Selection、Resource 等框架扩展抛异常时，run() 直接失败并抛出异常，不将其当作普通 Job 失败后继续调度，不承诺正常排空、资源补偿、完整释放或逐条结算。Resource 的查询、获取及释放异常均适用；部分获取后出错不增加跨资源回滚协议。此决定替代此前“Trigger 异常后复用 Ctrl+C 排空再抛出”的方案，也替代 ADR-0008 中强制回收并退回 pending 的规则。
 
-框架故障不保证正常收尾，不代表可以伪造或改写已经提交的结果。已提交记录保留；来不及结算的 running 由下次启动按恢复规则判失败。正常可用的运行循环仍按既定规则处理 worker 返回、超时和清理故障；纯观察回调的错误仍按观测错误处理。Ctrl+C／stop() 是有收尾契约的正常停止，与框架故障直接失败分开。
+框架故障不保证正常收尾，不代表可以伪造或改写已经提交的结果。已提交记录保留；来不及结算的 running 由下次启动按恢复规则判失败。正常可用的运行循环仍按既定规则处理 worker 返回、超时和清理故障。Ctrl+C／stop() 是有收尾契约的正常停止，与框架故障直接失败分开。
 
 **主进程收到 Ctrl+C 的含义是停止新派发，等待当前任务完成后退出。** 不主动转发给 worker，不记成任务失败；终端可能向整个进程组投递 SIGINT，Implementation 必须保证 worker 行为符合该契约。当前任务仍受执行超时约束，完成结果与清理正常提交。未被正常结算级联终结的未派发任务保持 pending。
 
@@ -367,7 +367,7 @@ Ctrl+C 关闭本 Run 的派发入口，不通过枚举现有 UID 实现排除。
 
 运行摘要区分退出原因与完成程度：has_failures 只表示本次产生的终态失败；has_pending 表示结束时仍有队列任务，包含选择排除；is_complete 表示正常结束且没有本次终态失败、没有剩余任务。Trigger 跳过不等于实际成功执行，统计分开。
 
-Attempt 失败次数与 Job 终态失败次数分开，授权拒绝不使 has_failures 为真，但会使 has_pending 为真、is_complete 为假。回调同时表达 Attempt 结局与 Job 去向。一次 Ctrl+C 收尾期间发生超时，可同时报告用户停止与存在终态失败；不得用 Run 退出原因覆盖 Job 结果。同 UID 后来成功也不抹去本 Run 已发生的失败事件。
+Attempt 失败次数与 Job 终态失败次数分开，授权拒绝不使 has_failures 为真，但会使 has_pending 为真、is_complete 为假。查询记录分别表达 Attempt 结局与 Job 去向。一次 Ctrl+C 收尾期间发生超时，可同时报告用户停止与存在终态失败；不得用 Run 退出原因覆盖 Job 结果。同 UID 后来成功也不抹去本 Run 已发生的失败事件。
 
 独立只读入口为 StateSnapshot，不再套外层 reader：
 
