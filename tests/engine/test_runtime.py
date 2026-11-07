@@ -55,7 +55,7 @@ def _write_success_result(spec) -> None:
     spec.pipe_sender.send_result(
         {
             "status": "success",
-            "raw_result": True,
+            "metadata": {},
             "spawned_jobs": [],
             "resource_suspensions": [],
             "cursor_updates": {},

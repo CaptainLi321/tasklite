@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Sequence
 
-from ..exceptions import FatalError, RateLimitHit, RetryError
 from ..utils.clock import utc_now_iso
 
 _UnionType = getattr(types, "UnionType", None)
@@ -207,19 +206,8 @@ def _ensure_exception_class(exception_cls: type, api_name: str) -> None:
 
 
 def _validate_policy_exception_class(exception_cls: type, api_name: str) -> None:
-    """异常分类声明入口校验（fail-loud）——注册表与构造器元组两条声明路径共用。
-
-    不变式：声明类必须可 pickle——分类决策在 spawn 子进程发生，
-    声明元组随 ctx pickle 下发，非模块级类会让 spawn 派发整体失败。
-    """
+    """异常分类声明入口校验（fail-loud）。"""
     _ensure_exception_class(exception_cls, api_name)
-    if issubclass(exception_cls, (RetryError, FatalError)):
-        raise TypeError(
-            f"{api_name} cannot register a "
-            f"{'RetryError' if issubclass(exception_cls, RetryError) else 'FatalError'} "
-            f"subclass ({exception_cls!r}) — these have dedicated except branches "
-            f"that bypass the registry; registration would silently no-op."
-        )
     try:
         pickle.dumps(exception_cls)
     except (pickle.PicklingError, AttributeError, TypeError) as e:
@@ -333,12 +321,7 @@ class ErrorClassifier:
     def _classify_exception(self, exc: BaseException) -> ErrorClassification:
         msg = _safe_str(exc)
         raw_err = f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
-        is_retry = isinstance(exc, RetryError)
-        is_fatal = isinstance(exc, FatalError)
         is_interrupted = isinstance(exc, KeyboardInterrupt)
-
-        # 判定优先级：中断 > RetryError 专用分支 > 用户注册瞬态 >
-        # FatalError 专用分支 > Fatal 启发式 > Transient 启发式。
         in_reg = self.matches(exc)
         in_fatal = isinstance(exc, self._fatal_exceptions)
         in_transient = isinstance(exc, self._transient_exceptions)
@@ -355,7 +338,7 @@ class ErrorClassifier:
                 raw_error=raw_err,
             )
 
-        if is_retry or in_reg:
+        if in_reg:
             return ErrorClassification(
                 category=ErrorCategory.TRANSIENT_EXHAUSTED,
                 error_code=ERR_MAX_RETRIES,
@@ -366,7 +349,7 @@ class ErrorClassifier:
                 raw_error=raw_err,
             )
 
-        if is_fatal or in_fatal:
+        if in_fatal:
             return ErrorClassification(
                 category=ErrorCategory.FATAL,
                 error_code="",

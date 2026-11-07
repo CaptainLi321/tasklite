@@ -22,10 +22,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..exceptions import FatalError, RateLimitHit, RetryError, TaskLiteError, _ArtifactIOError
+from ..exceptions import TaskLiteError, _ArtifactIOError
 from ..models.artifact import ArtifactDeclaration
 from ..models.context import JobContext
 from ..models.job import Job
+from ..models.result import TaskResult, validate_strict_json_object
 from ..utils import lockfile
 from ..utils.ipc import (
     ArtifactCleanupMode,
@@ -38,63 +39,14 @@ from ..utils.ipc import (
     WorkerPipeReceiver,
     WorkerPipeSender,
     create_worker_pipe,
-    decode_raw_result as _decode_raw_result,
-    encode_raw_result as _encode_raw_result,
 )
-from ..utils.jsonutil import dumps
-from .errorclass import _DEFAULT_CLASSIFIER, classify_exception
+from .errorclass import _DEFAULT_CLASSIFIER
 from .types import JobHandle
 
 logger = logging.getLogger("tasklite")
 
 _KEY_TRACEBACK = "traceback"
 _RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
-
-
-def _normalize_handler_result(result: Any) -> tuple[bool, dict[str, Any]]:
-    """把 handler 返回值归一为 (success, metadata)，坏形态收敛为任务级失败。
-
-    dict/tuple(dict) 元数据必须 JSON 可序列化——含 bytes/datetime/NaN 的
-    元数据会让持久层 commit 失败进而触发崩溃契约，预检后坏 dict 直接
-    进失败档案（宁可单任务失败，不可无限崩溃重启循环）。
-    """
-    if result is None:
-        return True, {}
-    if isinstance(result, bool):
-        return result, {}
-    if isinstance(result, dict):
-        try:
-            dumps(result)
-        except (TypeError, ValueError) as e:
-            logger.error(
-                f"Handler returned dict with non-JSON-serializable metadata: {e}. "
-                f"Job will be marked as failed."
-            )
-            return False, {"error_message": f"invalid result metadata: not JSON-serializable: {e}"}
-        return True, result
-    if isinstance(result, tuple) and len(result) == 2:
-        if not isinstance(result[0], bool) or not isinstance(result[1], dict):
-            logger.error(
-                f"Handler returned invalid tuple: expected (bool, dict), got "
-                f"({type(result[0]).__name__}, {type(result[1]).__name__}). "
-                f"Job will be marked as failed."
-            )
-            return False, {"error_message": "invalid handler return tuple: expected (bool, dict)"}
-        try:
-            dumps(result[1])
-        except (TypeError, ValueError) as e:
-            logger.error(
-                f"Handler returned tuple with non-JSON-serializable metadata: {e}. "
-                f"Job will be marked as failed."
-            )
-            return False, {"error_message": f"invalid result metadata: not JSON-serializable: {e}"}
-        return result[0], result[1]
-    logger.error(
-        f"Handler returned unrecognized type: {type(result).__name__}. "
-        f"Expected None, bool, dict, or tuple(bool, dict). "
-        f"Job will be marked as failed."
-    )
-    return False, {"error_message": f"invalid handler return type: {type(result).__name__}"}
 
 
 def _parse_spawned_jobs(raw_spawned_jobs: Any) -> tuple[list[Job], str | None]:
@@ -145,50 +97,85 @@ def _parse_resource_suspensions(
     return valid, None
 
 
-def _decode_success_branch(
-    res: dict, job: Job
-) -> tuple[bool, dict[str, Any], list[Job], dict[str, str | None], list[tuple[str, float]]]:
-    """success 状态解码：raw_result 还原归一 + 三个子字段防御解析。
+def _validate_exception_dict(raw_exc: Any) -> dict[str, str] | None:
+    """校验 worker 传递的结构化异常字典（type / message / traceback）。"""
+    if raw_exc is None:
+        return None
+    if type(raw_exc) is not dict:
+        raise TypeError(f"exception must be a dict or None, got {type(raw_exc).__name__}")
+    exc_type = raw_exc.get("type")
+    exc_msg = raw_exc.get("message")
+    exc_tb = raw_exc.get("traceback")
+    if (
+        type(exc_type) is not str
+        or type(exc_msg) is not str
+        or type(exc_tb) is not str
+    ):
+        raise TypeError("exception dict must contain str fields 'type', 'message', 'traceback'")
+    return {
+        "type": exc_type,
+        "message": exc_msg,
+        "traceback": exc_tb,
+    }
 
-    返回 (success, result_metadata, spawned_jobs, cursor_updates, resource_suspensions)；
-    任一子段损坏即 success=False 且 result_metadata 携带错误串（不抛异常）。
+
+def _decode_success_branch(
+    res: dict[str, Any], job: Job
+) -> tuple[
+    bool,
+    str | None,
+    dict[str, Any],
+    list[Job],
+    dict[str, str | None],
+    list[tuple[str, float]],
+]:
+    """success 状态解码：metadata 严格 JSON 对象校验 + 三个子字段防御解析。
+
+    返回 (success, message, result_metadata, spawned_jobs, cursor_updates, resource_suspensions)；
+    任一子段损坏即 success=False、message 携带错误串且 result_metadata 为空字典（不混入框架键）。
     """
-    if "raw_result" not in res:
-        logger.error(f"Corrupt result payload for {job.uid}: missing 'raw_result' key")
-        return False, {"error_message": "CORRUPT_RESULT_FILE: missing raw_result"}, [], {}, []
+    if "metadata" not in res:
+        logger.error(f"Corrupt result payload for {job.uid}: missing 'metadata' key")
+        return False, "CORRUPT_RESULT_FILE: missing metadata", {}, [], {}, []
+    raw_msg = res.get("message")
+    if raw_msg is not None and type(raw_msg) is not str:
+        logger.error(f"Corrupt result payload for {job.uid}: invalid 'message' type")
+        return False, "CORRUPT_RESULT_FILE: invalid message type", {}, [], {}, []
     try:
-        raw_result = _decode_raw_result(res["raw_result"])
-        success, result_metadata = _normalize_handler_result(raw_result)
+        result_metadata = validate_strict_json_object(
+            res["metadata"], field_name="metadata"
+        )
     except Exception as e:
         logger.error(f"Result decode failed for {job.uid}: {e}")
-        return False, {
-            "error_message": f"CORRUPT_RESULT_FILE: decode failed: {e}",
-            _KEY_TRACEBACK: traceback.format_exc(),
-        }, [], {}, []
+        return (
+            False,
+            f"CORRUPT_RESULT_FILE: decode failed: {e}",
+            {},
+            [],
+            {},
+            [],
+        )
 
     spawned_jobs, jobs_error = _parse_spawned_jobs(res.get("spawned_jobs", []))
     if jobs_error is not None:
         logger.error(f"Malformed spawned jobs in {job.uid}: {jobs_error}")
-        return False, {"error_message": jobs_error}, [], {}, []
-
-    if not success:
-        return False, result_metadata, [], {}, []
+        return False, jobs_error, {}, [], {}, []
 
     cursor_updates, cursor_error = _parse_cursor_updates(res.get("cursor_updates", {}))
     if cursor_error is not None:
         logger.error(f"Invalid cursor_updates in {job.uid}: {cursor_error}")
-        return False, {"error_message": cursor_error}, [], {}, []
+        return False, cursor_error, {}, [], {}, []
     suspensions, suspension_error = _parse_resource_suspensions(
         res.get("resource_suspensions", [])
     )
     if suspension_error is not None:
         logger.error(f"Invalid resource_suspensions in {job.uid}: {suspension_error}")
-        return False, {"error_message": suspension_error}, [], {}, []
-    return True, result_metadata, spawned_jobs, cursor_updates, suspensions
+        return False, suspension_error, {}, [], {}, []
+    return True, raw_msg, result_metadata, spawned_jobs, cursor_updates, suspensions
 
 
 def _decode_ipc_result(
-    res: dict,
+    res: dict[str, Any],
     p: Any,
     job: Job,
     ipc_dir: str | None = None,
@@ -198,11 +185,14 @@ def _decode_ipc_result(
     """解析子进程通过管道回传的结果字典（防御解析的单一入口）。
 
     损坏/注入形态一律收敛为任务级失败或瞬态重试记账，任何输入都不
-    穿透异常；无 status 键的形态死亡归因全权交 classify_process_death
-    决策表（信号死亡与正码崩溃同表同形）。
+    穿透异常；业务 result_metadata 绝不混入框架保留键；failure 与 retry
+    不发布 spawned_jobs 与 cursor_updates。
     """
     success = False
+    message: str | None = None
     result_metadata: dict[str, Any] = {}
+    exception: dict[str, str] | None = None
+    consume_budget = False
     retry_requested = False
     retry_error: str | None = None
     spawned_jobs: list[Job] = []
@@ -212,54 +202,116 @@ def _decode_ipc_result(
     artifact_error: str | None = None
 
     status = res.get("status") if isinstance(res, dict) else None
-    legacy_keys = {"new_jobs", "error"} & res.keys() if isinstance(res, dict) else set()
+    legacy_keys = (
+        {"new_jobs", "error", "raw_result"} & res.keys()
+        if isinstance(res, dict)
+        else set()
+    )
     if legacy_keys:
-        result_metadata = {
-            "error_message": f"CORRUPT_RESULT_FILE: unsupported fields {sorted(legacy_keys)}"
-        }
+        message = f"CORRUPT_RESULT_FILE: unsupported fields {sorted(legacy_keys)}"
     elif status == "success":
         (
             success,
+            message,
             result_metadata,
             spawned_jobs,
             cursor_updates,
             resource_suspensions,
         ) = _decode_success_branch(res, job)
+    elif status == "failure":
+        try:
+            raw_msg = res.get("message")
+            if raw_msg is not None and type(raw_msg) is not str:
+                raise TypeError("message must be str or None")
+            result_metadata = validate_strict_json_object(
+                res.get("metadata", {}), field_name="metadata"
+            )
+            exception = _validate_exception_dict(res.get("exception"))
+            suspensions, suspension_error = _parse_resource_suspensions(
+                res.get("resource_suspensions", [])
+            )
+            if suspension_error is not None:
+                raise ValueError(suspension_error)
+            message = raw_msg
+            resource_suspensions = suspensions
+        except Exception as e:
+            message = f"CORRUPT_RESULT_FILE: invalid failure payload: {e}"
+            result_metadata = {}
+            exception = None
+            resource_suspensions = []
     elif status == "retry":
-        retry_requested = True
-        retry_error = res.get("error_message")
-        kind = res.get("transient_kind")
-        transient_kind = kind if isinstance(kind, str) else None
+        try:
+            raw_msg = res.get("message")
+            if raw_msg is None and isinstance(res.get("error_message"), str):
+                raw_msg = res["error_message"]
+            if raw_msg is not None and type(raw_msg) is not str:
+                raise TypeError("message must be str or None")
+            result_metadata = validate_strict_json_object(
+                res.get("metadata", {}), field_name="metadata"
+            )
+            raw_consume = res.get("consume_budget", True)
+            if type(raw_consume) is not bool:
+                raise TypeError("consume_budget must be bool")
+            suspensions, suspension_error = _parse_resource_suspensions(
+                res.get("resource_suspensions", [])
+            )
+            if suspension_error is not None:
+                raise ValueError(suspension_error)
+            kind = res.get("transient_kind")
+            transient_kind = kind if isinstance(kind, str) else None
+            retry_requested = True
+            message = raw_msg
+            retry_error = raw_msg
+            consume_budget = False if transient_kind is not None else raw_consume
+            resource_suspensions = suspensions
+        except Exception as e:
+            retry_requested = False
+            message = f"CORRUPT_RESULT_FILE: invalid retry payload: {e}"
+            result_metadata = {}
+            consume_budget = False
+            resource_suspensions = []
     elif status == "interrupted":
         retry_requested = True
-        retry_error = res.get("error_message")
+        raw_msg = (
+            res.get("message")
+            if isinstance(res.get("message"), str)
+            else res.get("error_message")
+        )
+        message = str(raw_msg) if raw_msg is not None else None
+        retry_error = message
         transient_kind = "interrupted"
+        consume_budget = False
+        suspensions, suspension_error = _parse_resource_suspensions(
+            res.get("resource_suspensions", [])
+        )
+        if suspension_error is None:
+            resource_suspensions = suspensions
     elif status == "artifact_error":
-        artifact_error = str(res.get("error_message") or "Artifact declaration I/O failed")
-    elif status == "fatal":
-        result_metadata = {
-            "error_message": res.get("error_message", "FATAL (no message)"),
-            _KEY_TRACEBACK: res.get(_KEY_TRACEBACK),
-            "is_fatal": True,
-        }
-        logger.error(f"Fatal error in {job.uid}:\n{res.get(_KEY_TRACEBACK, '')}")
+        artifact_error = str(
+            res.get("error_message")
+            or res.get("message")
+            or "Artifact declaration I/O failed"
+        )
     elif status is not None:
-        result_metadata = {
-            "error_message": res.get("error_message", f"unknown status {status!r}"),
-            _KEY_TRACEBACK: res.get(_KEY_TRACEBACK),
-        }
-        logger.error(f"Worker crashed for {job.uid}:\n{res.get(_KEY_TRACEBACK, '')}")
+        message = f"CORRUPT_RESULT_FILE: unknown status {status!r}"
+        logger.error(f"Worker returned unknown status for {job.uid}: {status!r}")
     else:
         att = _DEFAULT_CLASSIFIER.classify_process_death(
             getattr(p, "exitcode", None), timed_out=False
         )
-        result_metadata = att.result_metadata
+        raw_att_msg = att.result_metadata.get("error_message")
+        message = str(raw_att_msg) if raw_att_msg is not None else None
+        result_metadata = dict(att.result_metadata)
         retry_error = att.retry_error
         retry_requested = att.retry_requested
+        consume_budget = bool(retry_requested)
 
     return ExecutionResult(
         success=success,
         result_metadata=result_metadata,
+        message=message,
+        exception=exception,
+        consume_budget=consume_budget,
         retry_requested=retry_requested,
         retry_error=retry_error,
         spawned_jobs=spawned_jobs,
@@ -275,7 +327,7 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
 
     不变式：锁生命周期严格等于本执行体生命周期（try 前获取、finally
     释放）——锁先于 handler 获取保证同 uid 执行体全局互斥，finally 释放
-    保证执行体任何出口（含未分类异常）都交还锁并关闭管道写端。
+    保证执行体任何出口（含未捕获异常）都交还锁并关闭管道写端。
     """
     handler_func = spec.handler
     job = spec.job
@@ -302,7 +354,6 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
                 f"worker pipe result send failed for {job_uid} ({execution_id}): {exc}"
             )
 
-    transient_registry = getattr(ctx, "transient_registry", ()) or ()
     _lock_fd = None
     try:
         try:
@@ -324,61 +375,74 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
             return
         try:
             raw_result = handler_func(job, ctx)
-            _write_result({
-                "status": "success",
-                "raw_result": _encode_raw_result(raw_result),
-                "spawned_jobs": [j.to_dict() for j in ctx.spawned_jobs],
-                "resource_suspensions": ctx.resource_suspensions,
-                "cursor_updates": ctx.cursor_updates,
-            })
-        except _ArtifactIOError as e:
-            _write_result({"status": "artifact_error", "error_message": str(e)})
-        except RetryError as e:
-            retry_payload: dict[str, Any] = {"status": "retry", "error_message": str(e)}
-            if isinstance(e, RateLimitHit):
-                retry_payload["transient_kind"] = "rate_limited"
-            _write_result(retry_payload)
-        except FatalError as e:
-            _write_result({
-                "status": "fatal",
-                "error_message": str(e),
-                _KEY_TRACEBACK: traceback.format_exc(),
-            })
-        except Exception as e:
-            kind = classify_exception(
-                e,
-                transient_registry,
-                fatal_exceptions=getattr(ctx, "fatal_exceptions", None),
-                transient_exceptions=getattr(ctx, "transient_exceptions", None),
-            )
-            if kind == "retry":
-                _write_result({
-                    "status": "retry",
-                    "error_message": f"{type(e).__name__}: {e}",
-                })
-            elif kind == "fatal":
-                _write_result({
-                    "status": "fatal",
-                    "error_message": f"{type(e).__name__}: {e}",
-                    _KEY_TRACEBACK: traceback.format_exc(),
-                })
+            if isinstance(raw_result, TaskResult):
+                if raw_result.status == "success":
+                    _write_result({
+                        "status": "success",
+                        "message": raw_result.message,
+                        "metadata": raw_result.metadata,
+                        "spawned_jobs": [j.to_dict() for j in ctx.spawned_jobs],
+                        "resource_suspensions": list(ctx.resource_suspensions),
+                        "cursor_updates": dict(ctx.cursor_updates),
+                    })
+                elif raw_result.status == "failure":
+                    _write_result({
+                        "status": "failure",
+                        "message": raw_result.message,
+                        "metadata": raw_result.metadata,
+                        "exception": None,
+                        "resource_suspensions": list(ctx.resource_suspensions),
+                    })
+                else:
+                    _write_result({
+                        "status": "retry",
+                        "message": raw_result.message,
+                        "metadata": raw_result.metadata,
+                        "consume_budget": raw_result.consume_budget,
+                        "resource_suspensions": list(ctx.resource_suspensions),
+                    })
             else:
                 _write_result({
-                    "status": "error",
-                    "error_message": f"{type(e).__name__}: {e}",
-                    _KEY_TRACEBACK: traceback.format_exc(),
+                    "status": "failure",
+                    "message": (
+                        f"invalid handler return type: expected TaskResult, "
+                        f"got {type(raw_result).__name__}"
+                    ),
+                    "metadata": {},
+                    "exception": None,
+                    "resource_suspensions": list(ctx.resource_suspensions),
                 })
+        except _ArtifactIOError as e:
+            _write_result({"status": "artifact_error", "error_message": str(e)})
+        except Exception as e:
+            _write_result({
+                "status": "failure",
+                "message": f"{type(e).__name__}: {e}",
+                "metadata": {},
+                "exception": {
+                    "type": type(e).__name__,
+                    "message": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+                "resource_suspensions": list(ctx.resource_suspensions),
+            })
         except KeyboardInterrupt as e:
             _write_result({
                 "status": "interrupted",
                 "error_message": f"WORKER_INTERRUPTED: {type(e).__name__}",
-                _KEY_TRACEBACK: traceback.format_exc(),
+                "resource_suspensions": list(ctx.resource_suspensions),
             })
         except SystemExit as e:
             _write_result({
-                "status": "error",
-                "error_message": f"WORKER_INTERRUPTED: {type(e).__name__}",
-                _KEY_TRACEBACK: traceback.format_exc(),
+                "status": "failure",
+                "message": f"SystemExit: {e}",
+                "metadata": {},
+                "exception": {
+                    "type": type(e).__name__,
+                    "message": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+                "resource_suspensions": list(ctx.resource_suspensions),
             })
     finally:
         if _lock_fd is not None:
@@ -393,6 +457,9 @@ class ExecutionResult:
 
     success: bool = False
     result_metadata: dict[str, Any] = field(default_factory=dict)
+    message: str | None = None
+    exception: dict[str, str] | None = None
+    consume_budget: bool = True
     retry_requested: bool = False
     retry_error: str | None = None
     spawned_jobs: list[Job] = field(default_factory=list)
@@ -401,6 +468,30 @@ class ExecutionResult:
     transient_kind: str | None = None
     will_retry: bool = False
     artifact_error: str | None = None
+    annotations: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """业务结果元数据（与 result_metadata 同源，不含框架保留键）。"""
+        return self.result_metadata
+
+    @property
+    def error(self) -> str:
+        """结果说明/错误消息（优先取 message，回退 retry_error 或内部 error_message）。"""
+        if self.message is not None:
+            return self.message
+        if self.retry_error is not None:
+            return self.retry_error
+        raw = self.result_metadata.get("error_message")
+        return str(raw) if raw is not None else ""
+
+    @property
+    def traceback(self) -> str | None:
+        """结构化异常堆栈（无异常时为 None）。"""
+        if isinstance(self.exception, dict):
+            return self.exception.get("traceback")
+        raw_tb = self.result_metadata.get(_KEY_TRACEBACK)
+        return str(raw_tb) if raw_tb is not None else None
 
 
 @dataclass(frozen=True)
@@ -906,8 +997,5 @@ __all__ = [
     "JobHandle",
     "WorkerLaunchSpec",
     "_decode_ipc_result",
-    "_decode_raw_result",
-    "_encode_raw_result",
     "_worker_process_entry",
-    "_normalize_handler_result",
 ]

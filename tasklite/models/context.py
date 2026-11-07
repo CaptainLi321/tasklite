@@ -35,9 +35,6 @@ class JobContext:
         cursors: dict[str, str],
         output_roots: str | Path | Sequence[str | Path] | None = None,
         ipc_dir: str | None = None,
-        transient_registry: tuple[type[BaseException], ...] = (),
-        fatal_exceptions: tuple[type[BaseException], ...] | None = None,
-        transient_exceptions: tuple[type[BaseException], ...] | None = None,
         resource_names: frozenset | set | None = None,
         artifact_descriptions: dict[str, dict[str, dict[str, str]]] | None = None,
         protected_roots: tuple[str | Path, ...] = (),
@@ -65,20 +62,6 @@ class JobContext:
         # output_roots 支持多根（跨盘输出场景）——解析时
         # 路径属于**任一**根即通过沙盒校验。
         self.output_roots = output_roots
-        # 注册表快照契约：瞬态异常注册表快照随 ctx pickle 下发子进程——
-        # spawn 子进程不继承父进程函数作用域的注册，分类决策在子进程
-        # 发生，快照在此携带、worker 入口重放。
-        self.transient_registry = tuple(transient_registry)
-        # 启发式异常元组快照契约：与 transient_registry 同构随 ctx 下发。
-        # 不变式：必须保真 None 与空元组的区别——None 表示未声明（worker
-        # 回退内置默认启发式），空元组表示「整体替换为空」（关闭该侧启发
-        # 式）；None 被误存为空元组会让子进程静默关闭全部默认启发式。
-        self.fatal_exceptions = (
-            tuple(fatal_exceptions) if fatal_exceptions is not None else None
-        )
-        self.transient_exceptions = (
-            tuple(transient_exceptions) if transient_exceptions is not None else None
-        )
         self.ipc_dir = ipc_dir
         self._journal_instance: ArtifactJournal | None = None
         self._journal_instance_dir: str | None = None

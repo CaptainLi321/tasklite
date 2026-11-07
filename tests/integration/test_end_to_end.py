@@ -29,13 +29,14 @@ from pathlib import Path
 import pytest
 
 from tasklite import (
-    ERR_MAX_RETRIES,
     CapacityResource,
     ExitReason,
     Job,
     RateLimitResource,
     TaskLite,
+    TaskResult,
 )
+from tasklite.engine.errorclass import ERR_MAX_RETRIES
 
 PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
 
@@ -72,7 +73,7 @@ def ok_with_input_handler(job, ctx):
     source = ctx.output_roots / f"source_{job.job_id}.txt"
     source.write_text("seed data", encoding="utf-8")
     ctx.declare_input(source)
-    return True, {"touched": job.job_id}
+    return TaskResult.success(metadata={"touched": job.job_id})
 
 
 def explode_handler(job, ctx):
@@ -81,24 +82,24 @@ def explode_handler(job, ctx):
 
 
 def flaky_first_attempt_handler(job, ctx):
-    """首次执行抛瞬态异常，重试执行成功（磁盘标记跨子进程传递状态）。"""
+    """首次执行返回重试，重试执行成功（磁盘标记跨子进程传递状态）。"""
     marker = ctx.output_roots / f"flaky_marker_{job.job_id}"
     if marker.exists():
-        return True, {"recovered": True}
+        return TaskResult.success(metadata={"recovered": True})
     marker.write_text(job.job_id, encoding="utf-8")
-    raise TransientSampleError("transient on first attempt")
+    return TaskResult.retry(message="transient on first attempt")
 
 
 def always_transient_handler(job, ctx):
-    """恒瞬态失败 → 重试预算耗尽进失败档案。"""
-    raise TransientSampleError("always transient")
+    """恒重试失败 → 重试预算耗尽进失败档案。"""
+    return TaskResult.retry(message="always transient")
 
 
 def fail_once_then_ok_handler(job, ctx):
     """首激活失败并写标记；档案补跑激活读到标记即成功。"""
     marker = ctx.output_roots / f"fail_once_marker_{job.job_id}"
     if marker.exists():
-        return True, {"recovered": True}
+        return TaskResult.success(metadata={"recovered": True})
     marker.write_text(job.job_id, encoding="utf-8")
     raise RuntimeError("fail once then await manual trigger")
 
@@ -106,31 +107,31 @@ def fail_once_then_ok_handler(job, ctx):
 def hung_handler(job, ctx):
     """睡眠远超 timeout，等看门狗击杀（真实子进程超时场景）。"""
     time.sleep(8.0)
-    return True, {}
+    return TaskResult.success()
 
 
 def suspend_and_complete_handler(job, ctx):
     """成功并挂起 api 资源 2 秒（挂起窗口延迟同资源的后续作业）。"""
     ctx.suspend_resource("api", 2.0)
-    return True, {"suspended_by": job.job_id}
+    return TaskResult.success(metadata={"suspended_by": job.job_id})
 
 
 def plain_gated_handler(job, ctx):
     """无副作用成功（消费 api 资源的挂起恢复窗口）。"""
-    return True, {"ran_after_recovery": True}
+    return TaskResult.success(metadata={"ran_after_recovery": True})
 
 
 def interrupted_first_handler(job, ctx):
     """首次执行抛 KeyboardInterrupt；重跑（零预算瞬态）读到标记即成功。"""
     marker = ctx.output_roots / f"interrupted_marker_{job.job_id}"
     if marker.exists():
-        return True, {"recovered": True}
+        return TaskResult.success(metadata={"recovered": True})
     marker.write_text(job.job_id, encoding="utf-8")
     raise KeyboardInterrupt()
 
 
 def system_exit_handler(job, ctx):
-    """抛 SystemExit：worker 捕获后以中断族串归因落 error 通道。"""
+    """抛 SystemExit：worker 捕获后记录进失败档案。"""
     raise SystemExit(1)
 
 
@@ -145,7 +146,7 @@ def partial_output_hang_handler(job, ctx):
     ready = ctx.output_roots / f"ready_{job.job_id}"
     ready.write_text(job.job_id, encoding="utf-8")
     time.sleep(60.0)
-    return True, {}
+    return TaskResult.success()
 
 
 class TestEndToEnd:
@@ -200,7 +201,6 @@ class TestEndToEnd:
     def test_transient_retry_exhaustion_trace(self, tmp_path):
         p = _make_pipeline(tmp_path)
         p.register_task("work", always_transient_handler)
-        p.register_transient_exception(TransientSampleError)
         p.enqueue(Job("work", "item_gamma", max_retries_per_run=2))
         p.run()
         p.stop()
@@ -216,7 +216,6 @@ class TestEndToEnd:
     def test_transient_recovery_second_attempt_succeeds(self, tmp_path):
         p = _make_pipeline(tmp_path)
         p.register_task("work", flaky_first_attempt_handler)
-        p.register_transient_exception(TransientSampleError)
         p.enqueue(Job("work", "item_delta", max_retries_per_run=3))
         summary = p.run()
         p.stop()
@@ -516,5 +515,5 @@ class TestRealSubprocessFaultScenarios:
         failed = p.backend.load_failed()
         assert "sysexit::item_sysexit" in failed
         error = failed["sysexit::item_sysexit"]["error_message"]
-        assert "WORKER_INTERRUPTED" in error, f"应含中断族归因串，got: {error}"
+        assert "SystemExit" in error, f"应含 SystemExit 错误信息，got: {error}"
         assert "sysexit::item_sysexit" not in p.backend.load_successes()

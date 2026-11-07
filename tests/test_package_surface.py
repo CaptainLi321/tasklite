@@ -141,8 +141,7 @@ class TestMainSurfaceExports:
 
     _EXPORTS = frozenset(
         {
-            "FATAL_EXCEPTIONS",
-            "TRANSIENT_EXCEPTIONS",
+            "TaskResult",
             "RequeuePlan",
             "SuspendEntry",
             "validate_resource_amounts",
@@ -157,17 +156,13 @@ class TestMainSurfaceExports:
 
     def test_export_names_importable(self):
         from tasklite import (
-            FATAL_EXCEPTIONS,
-            TRANSIENT_EXCEPTIONS,
+            TaskResult,
             RequeuePlan,
             SuspendEntry,
             validate_resource_amounts,
         )
 
-        assert isinstance(FATAL_EXCEPTIONS, tuple) and isinstance(FATAL_EXCEPTIONS[0], type)
-        assert isinstance(TRANSIENT_EXCEPTIONS, tuple) and isinstance(
-            TRANSIENT_EXCEPTIONS[0], type
-        )
+        assert isinstance(TaskResult, type)
         assert isinstance(RequeuePlan, type)
         assert isinstance(SuspendEntry, type)
         assert callable(validate_resource_amounts)

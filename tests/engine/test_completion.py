@@ -259,9 +259,10 @@ class TestRetryBudget:
 
     def test_budget_exhaustion_archives(self, tmp_path):
         env = CompletionEnv(tmp_path)
-        # attempt_no=2 且 max_retries_per_run=1：允许执行条件 attempt_no <= 2 已到界
+        # attempt_no=2 且已消耗 1 次重试：max_retries_per_run=1 预算已耗尽
         job = Job._restore("t", "j1", max_retries_per_run=1, attempt_no=2)
         job.runtime.record_retry_error("first failure")
+        env.completion._record_retry(job.uid)
         attempt_id = env.open_attempt(job, attempt_no=2)
         entry = env.track_entry(job, attempt_id=attempt_id)
         entry.job_snapshot["runtime"] = job.runtime.to_dict()

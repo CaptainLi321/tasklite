@@ -18,6 +18,7 @@ successes meta 的 last_run_id 事实源；契约定义见 dispatch 模块）。
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from typing import Any, Sequence, TYPE_CHECKING
@@ -61,6 +62,21 @@ class CompletionMachine:
         self._resources = resources
         self._in_flight = in_flight
         self._session = session
+        self._fallback_retry_counts: dict[str, int] = {}
+
+    def _get_retry_count(self, uid: str) -> int:
+        getter = getattr(self._session, "get_retry_count", None)
+        if callable(getter):
+            return int(getter(uid))
+        return self._fallback_retry_counts.get(uid, 0)
+
+    def _record_retry(self, uid: str) -> int:
+        recorder = getattr(self._session, "record_retry", None)
+        if callable(recorder):
+            return int(recorder(uid))
+        updated = self._fallback_retry_counts.get(uid, 0) + 1
+        self._fallback_retry_counts[uid] = updated
+        return updated
 
     # ── 唯一收尾出口 ──────────────────────────────────────────────────
 
@@ -169,7 +185,7 @@ class CompletionMachine:
             missing_output = self._channel.journal.verify_artifacts(declarations)
             if missing_output is not None:
                 result.success = False
-                result.result_metadata = {"error_message": missing_output}
+                result.message = missing_output
         self._channel.journal.cleanup_declared_artifacts(declarations, success=result.success)
 
         # 2. 状态分发
@@ -204,39 +220,50 @@ class CompletionMachine:
     ) -> None:
         """重试分支：预算判定 → retry_job_snapshot 组装 → store.apply_retry。
 
-        瞬态信号（TRANSIENT_KIND_STAT_KEYS 登记的三类）零预算：即使
-        attempt_no 已超预算也豁免失败档案、attempt_no 不推进、
-        last_retry_error 不污染；业务失败重试推进 attempt_no+1 并记录
-        最近重试错误。节奏（何时/何处重入队）由 RequeuePolicy 唯一出口
-        承担，本分支零节奏计算。
+        重试预算按单次 Run、按 uid 独立计数（不与历史 attempt_no 挂钩）：
+        - ``consume_budget=True`` 的业务重试检查本 Run 已消耗预算，达到
+          ``max_retries_per_run`` 即转入失败终态，否则记账 +1 并推进
+          ``attempt_no + 1``；
+        - ``consume_budget=False`` 的显式重试不烧本 Run 重试预算，仍推进
+          ``attempt_no + 1`` 并记录 Attempt；
+        - 内部瞬态信号（``transient_kind`` 非 None）零预算且不推进 ``attempt_no``。
         """
         transient_kind = result.transient_kind
         is_transient = transient_kind is not None
-        retry_error = result.retry_error
+        consume_budget = bool(result.consume_budget) and not is_transient
+        retry_error = result.message if result.message is not None else result.retry_error
         max_retries = job.max_retries_per_run if job.max_retries_per_run is not None else 3
 
-        if not is_transient and job.attempt_no > max_retries:
-            logger.error(
-                f"FAIL: {uid} exceeded max retries ({max_retries}). "
-                f"Sent to failure archive."
-            )
-            failure_metadata: dict[str, Any] = {"error_message": ERR_MAX_RETRIES}
-            rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
-            if rt_state.last_retry_error:
-                failure_metadata["last_retry_error"] = rt_state.last_retry_error
-            if retry_error:
-                failure_metadata["retry_error"] = retry_error
-            self._store.apply_failure(
-                uid, failure_metadata, job_snapshot=job_snapshot, cascade=True,
-                attempt_id=attempt_id,
-            )
-            result.will_retry = False
-            return
+        if consume_budget:
+            consumed = self._get_retry_count(uid)
+            if consumed >= max_retries:
+                logger.error(
+                    f"FAIL: {uid} exceeded max retries ({max_retries}). "
+                    f"Sent to failure archive."
+                )
+                failure_metadata: dict[str, Any] = {
+                    "error_message": ERR_MAX_RETRIES,
+                    "metadata": copy.deepcopy(result.result_metadata),
+                }
+                if result.message is not None:
+                    failure_metadata["message"] = result.message
+                rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
+                if rt_state.last_retry_error:
+                    failure_metadata["last_retry_error"] = rt_state.last_retry_error
+                if retry_error:
+                    failure_metadata["retry_error"] = retry_error
+                self._store.apply_failure(
+                    uid, failure_metadata, job_snapshot=job_snapshot, cascade=True,
+                    attempt_id=attempt_id,
+                )
+                result.will_retry = False
+                return
+            self._record_retry(uid)
 
         retry_job_snapshot = self._build_retry_job_snapshot(
             job, job_snapshot, retry_error=retry_error, is_transient=is_transient
         )
-        next_attempt = job.attempt_no if is_transient else job.attempt_no + 1
+        next_attempt = job.attempt_no
         logger.info(f"RETRY: {uid} (attempt {next_attempt}/{max_retries + 1})")
         self._store.apply_retry(
             uid,
@@ -363,10 +390,10 @@ class CompletionMachine:
             entry,
             ExecutionResult(
                 success=False,
-                result_metadata={
-                    "error_message": f"INVALID_SPAWNED_JOB: job dict is not "
+                message=(
+                    f"INVALID_SPAWNED_JOB: job dict is not "
                     f"JSON-serializable: {err}"
-                },
+                ),
             ),
         )
 
@@ -379,14 +406,23 @@ class CompletionMachine:
         started_monotonic: float | None = None,
         attempt_id: int | None = None,
     ) -> None:
-        """永久失败分支：写入失败档案与级联阻断下游。"""
+        """永久失败分支：写入失败档案与级联阻断下游（不污染 result.result_metadata）。"""
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.error(
             f"FAIL: {uid} (duration {duration:.2f}s, sent to failure archive). "
-            f"Meta: {result.result_metadata}"
+            f"Message: {result.message}, Meta: {result.result_metadata}"
         )
+        failure_record: dict[str, Any] = copy.deepcopy(result.result_metadata)
+        if result.message is not None and "error_message" not in failure_record:
+            failure_record["error_message"] = result.message
+        if result.message is not None and "message" not in failure_record:
+            failure_record["message"] = result.message
+        if result.exception is not None and "exception" not in failure_record:
+            failure_record["exception"] = copy.deepcopy(result.exception)
+        if "metadata" not in failure_record:
+            failure_record["metadata"] = copy.deepcopy(result.result_metadata)
         self._store.apply_failure(
-            uid, result.result_metadata, job_snapshot=job_snapshot, cascade=True,
+            uid, failure_record, job_snapshot=job_snapshot, cascade=True,
             attempt_id=attempt_id,
         )
         result.will_retry = False

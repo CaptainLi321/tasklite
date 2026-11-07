@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import FatalError, Job, TaskLite
+from tasklite import Job, TaskLite, TaskResult
 from tasklite.triggers import on_input_change
 from tasklite.utils.clock import parse_utc_iso_to_us
 
@@ -27,21 +27,23 @@ def _pipeline(tmp_path, **overrides):
 def produce_input(job, ctx):
     mode = job.payload.get("mode", "write")
     if mode == "fail":
-        raise FatalError("upstream failed in this batch")
+        return TaskResult.failure(message="upstream failed in this batch")
     if mode == "write":
         path = Path(ctx.declare_output(ctx.output_roots / "source.txt", delete_existing=True))
         path.write_text(job.payload.get("content", "first"), encoding="utf-8")
         if "mtime_ns" in job.payload:
             stamp = job.payload["mtime_ns"]
             os.utime(path, ns=(stamp, stamp))
-    return {"pid": os.getpid(), "mode": mode}
+    return TaskResult.success(metadata={"pid": os.getpid(), "mode": mode})
 
 
 def consume_input(job, ctx):
     path = Path(ctx.declare_input(ctx.output_roots / "source.txt"))
-    return {"content": path.read_text(encoding="utf-8"), "pid": os.getpid(),
-            "parent_succeeded": ctx.has_succeeded("produce::source"),
-            "parent_failed": ctx.has_failed("produce::source")}
+    return TaskResult.success(metadata={
+        "content": path.read_text(encoding="utf-8"), "pid": os.getpid(),
+        "parent_succeeded": ctx.has_succeeded("produce::source"),
+        "parent_failed": ctx.has_failed("produce::source"),
+    })
 
 
 @pytest.mark.parametrize("mode", ["write", "unchanged", "fail"])
@@ -90,8 +92,7 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
 
 
 def always_retry(job, ctx):
-    from tasklite import RetryError
-    raise RetryError("retry until budget exhausted")
+    return TaskResult.retry(message="retry until budget exhausted")
 
 
 def _run_until_retry_committed(root, ready, release):
@@ -144,7 +145,7 @@ def test_killed_engine_recovers_retry_without_resetting_activation_or_budget(tmp
     recovered.stop()
     records = recovered.backend.load_attempts("retry::item")
     assert [(row.activation_no, row.attempt_no, row.outcome) for row in records] == [
-        (1, 1, "requeued"), (1, 2, "failed")]
+        (1, 1, "requeued"), (1, 2, "requeued"), (1, 3, "failed")]
     assert len({row.run_id for row in records}) == 2
     assert recovered.backend.load_queue() == []
     assert recovered.backend.load_successes() == {}
@@ -182,13 +183,14 @@ def transient_once(job, ctx):
         marker.write_text("seen", encoding="utf-8")
         if job.payload["kind"] == "interrupted":
             raise KeyboardInterrupt()
-        from tasklite import RateLimitHit
-        raise RateLimitHit("rate limit in worker")
-    return {"runtime": job.runtime.to_dict(), "has_failed": ctx.has_failed(job.uid),
-            "has_succeeded": ctx.has_succeeded(job.uid), "pid": os.getpid()}
+        return TaskResult.retry(message="zero budget in worker", consume_budget=False)
+    return TaskResult.success(metadata={
+        "runtime": job.runtime.to_dict(), "has_failed": ctx.has_failed(job.uid),
+        "has_succeeded": ctx.has_succeeded(job.uid), "pid": os.getpid(),
+    })
 
 
-@pytest.mark.parametrize("kind", ["interrupted", "rate_limited"])
+@pytest.mark.parametrize("kind", ["interrupted"])
 def test_transient_first_attempt_rechecks_trigger_without_budget_or_archive_pollution(tmp_path, kind):
     pipeline = _pipeline(tmp_path)
     evaluated = []
@@ -199,7 +201,7 @@ def test_transient_first_attempt_rechecks_trigger_without_budget_or_archive_poll
     summary = pipeline.run()
     pipeline.stop()
     assert evaluated == [(1, False, False), (1, False, False)]
-    assert summary.stats[f"{kind}_reruns"] == 1
+    assert summary.stats["interrupted_reruns"] == 1
     assert pipeline.backend.load_failed() == {}
     metadata = pipeline.backend.load_successes()["transient::item"]
     assert metadata["runtime"] == {}
@@ -225,7 +227,7 @@ def spawn_discovered(job, ctx, item, content_id):
 
 
 def discovered_child(job, ctx):
-    return {"pid": os.getpid(), "scan_succeeded": ctx.has_succeeded("discover::root")}
+    return TaskResult.success(metadata={"pid": os.getpid(), "scan_succeeded": ctx.has_succeeded("discover::root")})
 
 
 def test_discovery_defaults_always_and_job_once_override_across_runs(tmp_path):
@@ -268,7 +270,7 @@ def _wait_for_file(path, timeout=20):
 def waiting_for_release(job, ctx):
     (ctx.output_roots / "worker_ready").write_text(str(os.getpid()), encoding="utf-8")
     _wait_for_file(ctx.output_roots / "worker_release")
-    return {"pid": os.getpid()}
+    return TaskResult.success(metadata={"pid": os.getpid()})
 
 
 def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(tmp_path):

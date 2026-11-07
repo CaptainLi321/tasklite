@@ -114,11 +114,11 @@ class DispatchMachine:
         session: "DispatchSession",
         recovery: "RecoveryOrchestrator",
         tasks: "TaskSource",
-        classifier: "ErrorClassifier",
         output_roots: "Path | Sequence[Path] | None",
         ipc_dir: str,
         commit_failure_threshold: int,
         protected_roots: tuple[Path, ...] = (),
+        classifier: "ErrorClassifier | None" = None,
     ) -> None:
         self._store = store
         self._scheduler = scheduler
@@ -452,13 +452,7 @@ class DispatchMachine:
             raise
 
     def _build_context(self, job: Job, state: "PipelineState") -> JobContext:
-        """组装执行上下文（快照契约：注册表/启发式/资源名随 ctx 下发子进程）。"""
-        # 注册表快照契约：per-pipeline 瞬态异常注册表快照随 ctx pickle
-        # 下发——分类决策在子进程，注册表必须显式传递（不可依赖父进程
-        # 作用域，更不存在模块级可变全局）。
-        # 构造器声明的 fatal/transient 启发式元组同一契约随 ctx 下发
-        # （取已解析形态，与注册表快照在 worker 侧并集生效）；元组与
-        # 注册表同源于本 classifier 实例，父子两侧分类语义一致。
+        """组装执行上下文（资源名与已完成状态快照随 ctx 下发子进程）。"""
         # 资源名注册集快照随 ctx 下发——suspend_resource 对未注册名
         # fail-loud（typo 不静默失效）。
         # 不变式：successes/failed 活索引在快照边界冻结为 frozenset——
@@ -470,9 +464,6 @@ class DispatchMachine:
             dict(state.cursors),
             output_roots=self._output_roots,
             ipc_dir=self._ipc_dir,
-            transient_registry=self._classifier.snapshot(),
-            fatal_exceptions=self._classifier.fatal_exceptions,
-            transient_exceptions=self._classifier.transient_exceptions,
             resource_names=frozenset(self._resources),
             protected_roots=self._protected_roots,
             base_dir=self._trigger_registry.base_dir,

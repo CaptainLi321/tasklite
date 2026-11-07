@@ -10,7 +10,7 @@ if str(REPO_ROOT) not in sys.path:
 # 1. 基础模块与类型求值验证
 import tasklite
 from tasklite import (
-    TaskLite, Job, JobContext, FileSpec, RetryError, FatalError, PipelineError, RateLimitHit,
+    TaskLite, Job, JobContext, FileSpec, TaskResult,
     CapacityResource, RateLimitResource, Resource, FailureEntry,
     job_ref, progress_hook, slice_list, content_fingerprint,
     encode_job_component, encode_identifier, encode_content_id, encode_job_uid_filename
@@ -23,13 +23,13 @@ from tasklite.backend.sqlite_backend import SQLiteStateBackend
 
 def handler_a(job, ctx):
     val = job.payload.get("val")
-    return {"result": f"processed_{val}"}
+    return TaskResult.success(metadata={"result": f"processed_{val}"})
 
 
 def handler_retry(job, ctx):
     if job.attempt_no < 2:
-        raise RetryError("transient failure")
-    return True
+        return TaskResult.retry(message="transient failure")
+    return TaskResult.success()
 
 
 def main():

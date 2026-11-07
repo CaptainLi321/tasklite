@@ -128,6 +128,7 @@ from collections.abc import Callable, Iterable
 from typing import Any, Protocol
 
 from ..exceptions import TaskLiteError
+from ..models.result import TaskResult
 from ..models.task import validate_trigger
 from ..utils.encoding import (
     CONTENT_ID_ALLOWED,
@@ -507,7 +508,7 @@ class DiscoveryHandler:
         except Exception as e:
             logger.error(f"Discovery: on_missing callback failed: {e}")
 
-    def __call__(self, job: DiscoveryJob, ctx: DiscoveryContext) -> bool:
+    def __call__(self, job: DiscoveryJob, ctx: DiscoveryContext) -> TaskResult:
         prefix = self._resolve_prefix(job)
         scan_mode, effective_max_pages = self._resolve_scan_options(job)
         seen_this_run, completed_full = self._scan_pages(
@@ -518,7 +519,7 @@ class DiscoveryHandler:
         # 本模型无游标可推进——崩溃（fetch 抛异常 → 异常传播，由用户按错误
         # 分类决定重试/失败档案）即整轮重扫；已 spawn 的子任务由确定性
         # job_id 的 successes 去重吸收，不重不漏。
-        return True
+        return TaskResult.success()
 
 
 def register_discovery(

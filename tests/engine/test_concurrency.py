@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import CapacityResource, Job, TaskLite
+from tasklite import CapacityResource, Job, TaskLite, TaskResult
 
 PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
 
@@ -40,12 +40,12 @@ def slow_window_handler(job, ctx):
     end = time.time()
     window_file = ctx.output_roots / f"window_{job.job_id}.txt"
     window_file.write_text(f"{start} {end}", encoding="utf-8")
-    return True, {}
+    return TaskResult.success()
 
 
 def fast_handler(job, ctx):
     """快速 handler，用于依赖链测试（模块级可 pickle）。"""
-    return True, {"processed": job.job_id}
+    return TaskResult.success(metadata={"processed": job.job_id})
 
 
 def _load_windows(output_roots: Path) -> list[tuple[float, float]]:

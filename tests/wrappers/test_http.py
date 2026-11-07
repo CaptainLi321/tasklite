@@ -20,12 +20,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tasklite.exceptions import FatalError, RateLimitHit, RetryError
 from tasklite.wrappers.http import (
+    FatalError,
     HttpExecutor,
     HttpPolicy,
     HttpResponse,
     MemorySnapshotStore,
+    RateLimitHit,
+    RetryError,
     SQLiteSnapshotStore,
     SnapshotStore,
     format_cookie_header,

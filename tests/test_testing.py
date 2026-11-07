@@ -131,19 +131,7 @@ class TestFakeCtxSuspendGuard:
 
 
 class TestFakeCtxExtendedParams:
-    """keyword-only 扩展参数：分类声明面透传。"""
-
-    def test_fatal_and_transient_exceptions_forwarded(self):
-        class Boom(Exception):
-            pass
-
-        ctx = fake_ctx(_job(), fatal_exceptions=(Boom,), transient_exceptions=(ValueError,))
-        assert ctx.fatal_exceptions == (Boom,)
-        assert ctx.transient_exceptions == (ValueError,)
-
-    def test_transient_registry_forwarded(self):
-        ctx = fake_ctx(_job(), transient_registry=(RuntimeError,))
-        assert ctx.transient_registry == (RuntimeError,)
+    """keyword-only 扩展参数。"""
 
     def test_direct_ipc_dir_created(self, tmp_path):
         ipc = str(tmp_path / "my_ipc")

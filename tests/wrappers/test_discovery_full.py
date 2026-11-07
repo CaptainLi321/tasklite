@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import Job, TaskLite
+from tasklite import Job, TaskLite, TaskResult
 from tasklite.wrappers.discovery import encode_content_id, register_discovery
 
 PAGESIZE = 2
@@ -72,7 +72,7 @@ def _group_key(payload):
 
 
 def _child_ok(job, ctx):
-    return True
+    return TaskResult.success()
 
 
 def _pipeline(tmp_path, name="r5"):

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+from tasklite.models.result import TaskResult
 from tasklite.wrappers.discovery import (
     DiscoveryHandler,
     DiscoveryHost,
@@ -85,7 +86,7 @@ class TestDiscoveryHandlerFrameworkIndependent:
         processed.clear()
         ctx = FakeCtx(done={"child::old-b"})
         handler = _make_handler()
-        assert handler(FakeJob({"artist_id": "a1"}), ctx) is True
+        assert handler(FakeJob({"artist_id": "a1"}), ctx) == TaskResult.success()
         # old-b 已见被跳过；old-c 在第二页且未见 → 应处理；空页终止
         assert processed == ["new-a", "old-c"]
         # 契约 T2：第二页未整页命中（old-c 是新的）→ 继续到空页
@@ -98,7 +99,7 @@ class TestDiscoveryHandlerFrameworkIndependent:
         # child::vanished 已见但数据源里已不存在（源端删除）
         ctx = FakeCtx(seen={"child::vanished", "child::old-b"})
         handler = _make_handler(scan_mode="full", on_missing=_missing_cb)
-        assert handler(FakeJob({}), ctx) is True
+        assert handler(FakeJob({}), ctx) == TaskResult.success()
         assert sorted(missing_reported) == ["vanished"]
 
     def test_incremental_full_page_hit_stops(self):
@@ -106,7 +107,7 @@ class TestDiscoveryHandlerFrameworkIndependent:
         processed.clear()
         ctx = FakeCtx(done={"child::new-a", "child::old-b"})
         handler = _make_handler()
-        assert handler(FakeJob({}), ctx) is True
+        assert handler(FakeJob({}), ctx) == TaskResult.success()
         assert processed == [], "整页命中后不得处理任何 item"
 
 

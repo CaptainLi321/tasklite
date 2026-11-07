@@ -24,7 +24,7 @@ import time
 
 import pytest
 
-from tasklite import CapacityResource, ExitReason, Job, TaskLite
+from tasklite import CapacityResource, ExitReason, Job, TaskLite, TaskResult
 from tasklite.engine.resource import ENGINE_METADATA_RESOURCE_SUSPENSIONS
 from tasklite.utils.artifact import ArtifactPathPolicy
 from tasklite.utils.jsonutil import dumps, loads
@@ -40,50 +40,50 @@ def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> boo
     return bool(predicate())
 
 
-def success_handler(job: Job, ctx) -> dict:
+def success_handler(job: Job, ctx) -> TaskResult:
     output = Path(ctx.declare_output("published.txt", name="report"))
     output.write_text("已发布", encoding="utf-8")
     ctx.declare_input(output)
     ctx.set_cursor("position", "42")
     ctx.spawn(Job("child", "child"))
     ctx.suspend_resource("api", 60)
-    return {"worker_pid": os.getpid()}
+    return TaskResult.success(metadata={"worker_pid": os.getpid()})
 
 
-def child_handler(job: Job, ctx) -> dict:
-    return {"child": True}
+def child_handler(job: Job, ctx) -> TaskResult:
+    return TaskResult.success(metadata={"child": True})
 
 
-def interrupted_handler(job: Job, ctx) -> dict:
+def interrupted_handler(job: Job, ctx) -> TaskResult:
     if job.attempt_no > 1:
-        return {"recovered": True}
+        return TaskResult.success(metadata={"recovered": True})
     for filename, allowed in (("authorized.txt", True), ("retained.txt", False)):
         path = Path(ctx.declare_output(filename, delete_on_failure=allowed))
         path.write_text("半成品", encoding="utf-8")
     sync_dir = Path(job.payload["sync_dir"])
     (sync_dir / "ready").write_text(str(os.getpid()), encoding="utf-8")
     time.sleep(30.0)
-    return {"unreachable": True}
+    return TaskResult.success(metadata={"unreachable": True})
 
 
-def crash_handler(job: Job, ctx) -> dict:
+def crash_handler(job: Job, ctx) -> TaskResult:
     if job.attempt_no == 1:
         os._exit(7)
-    return {"recovered": True}
+    return TaskResult.success(metadata={"recovered": True})
 
 
-def timeout_handler(job: Job, ctx) -> dict:
+def timeout_handler(job: Job, ctx) -> TaskResult:
     time.sleep(30.0)
-    return {"unreachable": True}
+    return TaskResult.success(metadata={"unreachable": True})
 
 
-def cleanup_handler(job: Job, ctx) -> dict:
+def cleanup_handler(job: Job, ctx) -> TaskResult:
     path = Path(ctx.declare_cache("temporary.txt"))
     path.write_text("临时产物", encoding="utf-8")
-    return {"uncommitted": True}
+    return TaskResult.success(metadata={"uncommitted": True})
 
 
-def controlled_handler(job: Job, ctx) -> dict:
+def controlled_handler(job: Job, ctx) -> TaskResult:
     sync_dir = Path(job.payload["sync_dir"])
     kept = Path(ctx.declare_output("kept.txt"))
     kept.write_text("保留产物", encoding="utf-8")
@@ -93,10 +93,10 @@ def controlled_handler(job: Job, ctx) -> dict:
     ctx.suspend_resource("api", 60)
     (sync_dir / "ready").write_text(str(os.getpid()), encoding="utf-8")
     assert _wait_until(lambda: (sync_dir / "release").exists(), timeout=20.0)
-    return {"completed": True}
+    return TaskResult.success(metadata={"completed": True})
 
 
-def invalid_frame_handler(job: Job, ctx) -> dict:
+def invalid_frame_handler(job: Job, ctx) -> TaskResult:
     for filename, allowed in (("authorized.txt", True), ("retained.txt", False)):
         path = Path(ctx.declare_output(filename, delete_on_failure=allowed))
         path.write_text("错误消息之前声明的产物", encoding="utf-8")
@@ -113,17 +113,17 @@ def invalid_frame_handler(job: Job, ctx) -> dict:
             "payload": {"status": "success", "raw_result": {"untrusted": True}},
         }
         sender._conn.send_bytes(dumps(envelope).encode("utf-8"))
-    return {"untrusted": True}
+    return TaskResult.success(metadata={"untrusted": True})
 
 
-def orphan_locked_handler(job: Job, ctx) -> dict:
+def orphan_locked_handler(job: Job, ctx) -> TaskResult:
     sync_dir_raw = job.payload.get("sync_dir")
     if sync_dir_raw:
         sync_dir = Path(sync_dir_raw)
         if not (sync_dir / "orphan_done").exists():
             (sync_dir / "orphan.pid").write_text(str(os.getpid()), encoding="utf-8")
             assert _wait_until(lambda: (sync_dir / "release").exists(), timeout=30.0)
-    return {"pid": os.getpid()}
+    return TaskResult.success(metadata={"pid": os.getpid()})
 
 
 def _run_owner_until_killed(root: str, sync_dir: str) -> None:

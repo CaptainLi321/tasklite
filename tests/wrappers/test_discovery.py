@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import Job, TaskLite
+from tasklite import Job, TaskLite, TaskResult
 from tasklite.testing import fake_ctx
 from tasklite.wrappers.discovery import (
     encode_content_id,
@@ -207,7 +207,7 @@ class TestTermination:
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
         ctx = _make_ctx(job)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
         # 7 条全部是新的 → 全部被处理
         assert _seen_orig(_seen_by_handler) == {str(i) for i in range(7)}
         # 无任何 cursor 写入（纯任务模型的核心：不产生游标状态）
@@ -223,7 +223,7 @@ class TestTermination:
         seen = {"9", "8"}
         successes = {f"{PTYPE}::{encode_content_id(c)}" for c in seen}
         ctx = _make_ctx(job, successes=successes)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
         # 部分命中必须继续翻页：7 和后续页全部处理
         assert _seen_orig(_seen_by_handler) == {
             "7", "6", "5", "4", "3", "2", "1", "0",
@@ -237,7 +237,7 @@ class TestTermination:
         job = Job("discover", "seed", payload={"artist_id": "123"})
         successes = {f"{PTYPE}::{encode_content_id(str(i))}" for i in range(7)}
         ctx = _make_ctx(job, successes=successes)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
         assert _seen_by_handler == set(), "整页命中后不应处理任何 item"
 
 
@@ -254,7 +254,7 @@ class TestRediscoveryAndDeletion:
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
         ctx = _make_ctx(job)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
         assert _seen_orig(_seen_by_handler) == {str(i) for i in range(6)}
 
         # 画师发 2 个新作品（id 10, 11 → 排到最前）
@@ -262,7 +262,7 @@ class TestRediscoveryAndDeletion:
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
         ctx2 = _make_ctx(job, successes=wall2)
-        assert _handler(pipeline)(job, ctx2) is True
+        assert _handler(pipeline)(job, ctx2) == TaskResult.success()
         # 只处理新的 2 个，旧的 0-5 全部跳过
         assert _seen_orig(_seen_by_handler) == {"10", "11"}
 
@@ -273,7 +273,7 @@ class TestRediscoveryAndDeletion:
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
         ctx = _make_ctx(job)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
         assert _seen_orig(_seen_by_handler) == {str(i) for i in range(9)}
 
         # 删除中间 3 条（id 3,4,5）+ 发 1 个新作品 12
@@ -282,7 +282,7 @@ class TestRediscoveryAndDeletion:
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
         ctx2 = _make_ctx(job, successes=wall2)
-        assert _handler(pipeline)(job, ctx2) is True
+        assert _handler(pipeline)(job, ctx2) == TaskResult.success()
         # 只处理新的 12；前移的旧内容（如 page1 的 8,7）全部跳过
         assert _seen_orig(_seen_by_handler) == {"12"}
 
@@ -293,14 +293,14 @@ class TestRediscoveryAndDeletion:
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
         ctx = _make_ctx(job)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
 
         _delete_posts([0, 1])  # 删最旧
         _add_posts([{"id": 20}])
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
         ctx2 = _make_ctx(job, successes=wall2)
-        assert _handler(pipeline)(job, ctx2) is True
+        assert _handler(pipeline)(job, ctx2) == TaskResult.success()
         assert _seen_orig(_seen_by_handler) == {"20"}
 
     def test_deletion_newest_handled(self):
@@ -310,14 +310,14 @@ class TestRediscoveryAndDeletion:
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
         ctx = _make_ctx(job)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
 
         # 发新作品 10 → 处理
         _add_posts([{"id": 10}])
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
         ctx2 = _make_ctx(job, successes=wall2)
-        assert _handler(pipeline)(job, ctx2) is True
+        assert _handler(pipeline)(job, ctx2) == TaskResult.success()
         assert _seen_orig(_seen_by_handler) == {"10"}
 
         # 新作品 10 被删 → 重跑：successes 快照仍含 10（历史），不重复处理
@@ -325,7 +325,7 @@ class TestRediscoveryAndDeletion:
         wall3 = wall2 | _wall_from_seen()  # 历史 0-3 ∪ 新增 10
         _seen_by_handler.clear()
         ctx3 = _make_ctx(job, successes=wall3)
-        assert _handler(pipeline)(job, ctx3) is True
+        assert _handler(pipeline)(job, ctx3) == TaskResult.success()
         assert _seen_orig(_seen_by_handler) == set()
 
 
@@ -370,7 +370,7 @@ class TestCrashRerun:
         wall2 = _wall_from_seen()
         _seen_by_handler.clear()
         ctx2 = _make_ctx(job, successes=wall2)
-        assert _handler(pipeline)(job, ctx2) is True
+        assert _handler(pipeline)(job, ctx2) == TaskResult.success()
         assert _seen_orig(_seen_by_handler) == set(), "重跑不得重复处理"
 
 
@@ -394,7 +394,7 @@ class TestInteractionMatrix:
         # failed 快照含内容 "2"（上次进失败档案）
         failed = {f"{PTYPE}::{encode_content_id('2')}"}
         ctx = _make_ctx(job, failed=failed)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
         # 坏内容 2 不再 spawn；3、1 正常处理
         assert _seen_orig(_seen_by_handler) == {"3", "1"}
 
@@ -409,11 +409,11 @@ class TestInteractionMatrix:
         _register(pipeline)
         job = Job("discover", "seed", payload={"artist_id": "123"})
         ctx = _make_ctx(job)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
         # 模拟 successes 快照丢失 → 空 successes 重扫
         _seen_by_handler.clear()
         ctx2 = _make_ctx(job)
-        assert _handler(pipeline)(job, ctx2) is True
+        assert _handler(pipeline)(job, ctx2) == TaskResult.success()
         assert _seen_orig(_seen_by_handler) == {str(i) for i in range(6)}
 
     def test_cursor_key_namespace_prevents_id_collision(self):
@@ -426,7 +426,7 @@ class TestInteractionMatrix:
         )
         job = Job("discover", "seed", payload={"artist_id": "A"})
         ctx = _make_ctx(job)
-        assert _handler(pipeline)(job, ctx) is True
+        assert _handler(pipeline)(job, ctx) == TaskResult.success()
         # 编码后的 content_id 必须以分组前缀开头（命名空间生效）。
         # prefix = f"{len(key)}:{key}"，`:` 单射转义为 %3A
         processed = list(_seen_by_handler)
@@ -476,12 +476,12 @@ class TestDefense:
         )
         job = Job("discover", "seed", payload={})
         # 整页 id_func 全失败 → 终止扫描但不抛异常（下轮重试）
-        assert _handler(pipeline)(job, _make_ctx(job)) is True
+        assert _handler(pipeline)(job, _make_ctx(job)) == TaskResult.success()
         assert _processed_guard == []
 
         # 单 item id_func 失败 → 跳过该 item，其余照常处理
         _reset_source([{"id": 2, "good": False}])
-        assert _handler(pipeline)(job, _make_ctx(job)) is True
+        assert _handler(pipeline)(job, _make_ctx(job)) == TaskResult.success()
         assert len(_processed_guard) == 1
 
     def test_id_func_raise_isolated(self):
@@ -493,7 +493,7 @@ class TestDefense:
             pipeline, "discover", fetch_func, raising_id, process_item_func, PTYPE,
         )
         job = Job("discover", "seed", payload={})
-        assert _handler(pipeline)(job, _make_ctx(job)) is True
+        assert _handler(pipeline)(job, _make_ctx(job)) == TaskResult.success()
 
     def test_process_item_func_raise_isolated(self):
         """防御：process_item_func 抛异常的坏 item 隔离，好 item 照常。
@@ -511,7 +511,7 @@ class TestDefense:
         )
         job = Job("discover", "seed", payload={"artist_id": "123"})
         # 不抛异常（坏 item 被隔离），扫描正常完成
-        assert _handler(pipeline)(job, _make_ctx(job)) is True
+        assert _handler(pipeline)(job, _make_ctx(job)) == TaskResult.success()
         assert _seen_orig(set(_processed_guard)) == {"3", "1"}
         assert _poison_attempts["n"] == 1
         _processed_guard.clear()
@@ -520,7 +520,7 @@ class TestDefense:
             f"{PTYPE}::{encode_content_id('1')}",
         }
         ctx2 = _make_ctx(job, successes=successes)
-        assert _handler(pipeline)(job, ctx2) is True
+        assert _handler(pipeline)(job, ctx2) == TaskResult.success()
         assert _processed_guard == [], "好 item 已见不得重复处理"
         assert _poison_attempts["n"] == 2, "坏 item 无 poison 表 → 每 run 重试一次"
 
@@ -576,7 +576,7 @@ def _rt_cursor_key(payload):
 
 
 def _rt_child_handler(job, ctx):
-    return True
+    return TaskResult.success()
 
 
 def _rt_posts_upto(n):

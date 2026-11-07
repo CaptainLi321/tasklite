@@ -23,6 +23,7 @@ from tasklite.engine.resource import CapacityResource, RateLimitResource
 from tasklite.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
 from tasklite.engine.types import AttemptOutcome, ExitReason, RunSummary, StopMode
 from tasklite.models.job import Job
+from tasklite.models.result import TaskResult
 from tasklite.models.task import Task
 from tasklite.pipeline import TaskLite
 from tasklite.testing import running
@@ -31,7 +32,7 @@ from tasklite.utils.ipc import ArtifactJournal
 
 def ok_handler(job, ctx):
     """占位 handler：成功 + 空 meta（模块级可 pickle，满足 strict 预检）。"""
-    return True, {}
+    return TaskResult.success()
 
 
 class BizError(Exception):
@@ -167,9 +168,9 @@ def make_instant_process_class(retry_uid: str | None = None):
                     "cursor_updates": {},
                 }
                 if retry_uid is not None and spec.job.uid == retry_uid:
-                    result.update({"status": "retry", "error_message": "stub failure"})
+                    result.update({"status": "retry", "message": "stub failure", "consume_budget": True})
                 else:
-                    result.update({"status": "success", "raw_result": True})
+                    result.update({"status": "success", "metadata": {}})
                 assert spec.pipe_sender is not None
                 spec.pipe_sender.send_result(result)
             self._alive = False
@@ -273,7 +274,7 @@ class TestConstruction:
             raise OSError("disk full")
 
         monkeypatch.setattr(pipeline_mod, "SQLiteStateBackend", boom)
-        with pytest.raises(RuntimeError, match="SQLite backend initialization"):
+        with pytest.raises(OSError, match="disk full"):
             TaskLite("sp", tmp_path / "state", backend="sqlite")
 
     def test_max_workers_validation(self, tmp_path):
@@ -286,13 +287,11 @@ class TestConstruction:
         assert "__workers__" in p.resources
         assert p.resources["__workers__"].max_capacity == 7.0
 
-    def test_declared_exceptions_validated_at_construction(self, tmp_path):
-        with pytest.raises((TypeError, ValueError)):
+    def test_removed_exception_constructor_params_rejected(self, tmp_path):
+        with pytest.raises(TypeError):
             make_pipeline(tmp_path, fatal_exceptions=(int,))
-
-    def test_classifier_holds_declared_exceptions(self, tmp_path):
-        p = make_pipeline(tmp_path, transient_exceptions=(BizError,))
-        assert BizError in p.classifier.transient_exceptions
+        with pytest.raises(TypeError):
+            make_pipeline(tmp_path, transient_exceptions=(BizError,))
 
     def test_strict_picklable_flag_forwarded(self, tmp_path):
         assert make_pipeline(tmp_path).strict_picklable is True
@@ -431,30 +430,12 @@ class TestTaskTriggerDefaults:
         assert p.backend.load_queue()[0]["trigger"] == "once"
 
 
-class TestRegisterTransientException:
-    """瞬态异常注册委托 classifier（per-pipeline 实例态）。"""
+class TestRegisterTransientExceptionRemoved:
+    """register_transient_exception 已按 T04 从 TaskLite 门面移除。"""
 
-    def test_single_class_registered(self, tmp_path):
+    def test_method_not_present_on_pipeline(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.register_transient_exception(BizError)
-        assert p.classifier.matches(BizError("x"))
-
-    def test_sequence_bulk_registered(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        p.register_transient_exception((BizError, OtherBizError))
-        assert p.classifier.matches(BizError())
-        assert p.classifier.matches(OtherBizError())
-
-    def test_non_exception_class_rejected(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with pytest.raises((TypeError, ValueError)):
-            p.register_transient_exception(int)
-
-    def test_run_guard(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with running(p):
-            with pytest.raises(RuntimeError, match="register_transient_exception"):
-                p.register_transient_exception(BizError)
+        assert not hasattr(p, "register_transient_exception")
 
 
 # ── 入队与过滤（六步之四）────────────────────────────────────────────
@@ -831,7 +812,6 @@ class TestSixStepContract:
 
         p.register_resource(CapacityResource("gpu", 2.0))
         p.register_task("fetch", ok_handler, resources={"gpu": 1.0})
-        p.register_transient_exception(BizError)
         p.enqueue(Job("fetch", "a"))
         p.enqueue(Job("fetch", "b"))
 

@@ -11,7 +11,8 @@ import threading
 
 import pytest
 
-from tasklite import ERR_MALFORMED_JOB, Exclude, ExitReason, Job, Selection, Skip, TaskLite
+from tasklite import Exclude, ExitReason, Job, Selection, Skip, TaskLite
+from tasklite.engine.errorclass import ERR_MALFORMED_JOB
 from tasklite.engine.errorclass import (
     ERR_DEPENDENCY_DEADLOCK,
     ERR_DEPENDENCY_SKIPPED,
@@ -20,13 +21,14 @@ from tasklite.engine.errorclass import (
 from tasklite.engine.resource import Resource
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.types import EMPTY_STATS
+from tasklite.models.result import TaskResult
 from tasklite.models.state import PipelineState
 from tasklite.testing import running
 from tasklite.utils.ipc import ArtifactJournal
 
 
 def ok_handler(job, ctx):
-    return True, {}
+    return TaskResult.success()
 
 
 class CountingResource(Resource):
@@ -63,14 +65,14 @@ def _fake_process_class(*, fail_uid=None, spawn_jobs=()):
             spec = self.args[0]
             if spec.job.uid == fail_uid:
                 result = {
-                    "status": "fatal",
-                    "error_message": "FatalError: boom",
-                    "traceback": "",
+                    "status": "failure",
+                    "message": "boom",
+                    "metadata": {},
                 }
             else:
                 result = {
                     "status": "success",
-                    "raw_result": True,
+                    "metadata": {},
                     "spawned_jobs": [dict(job) for job in spawn_jobs],
                     "resource_suspensions": [],
                     "cursor_updates": {},
@@ -684,11 +686,12 @@ def test_public_surface_exports_selection_rule_types():
     import tasklite
 
     assert {"Exclude", "Selection", "Skip"} <= set(tasklite.__all__)
+    import tasklite.engine.errorclass as ec_mod
     assert {
         "ERR_SKIPPED",
         "ERR_DEPENDENCY_SKIPPED",
         "ERR_DEPENDENCY_EXCLUDED",
-    } <= set(tasklite.__all__)
+    } <= set(ec_mod.__all__)
     # 子模块名不被同名类覆盖：from tasklite.selection import ... 保持可用。
     assert tasklite.selection.__name__ == "tasklite.selection"
     assert tasklite.selection.Exclude is Exclude

@@ -49,9 +49,6 @@ def fake_ctx(
     tmp_root: Any | None = None,
     output_roots: Any | None = None,
     ipc_dir: str | None = None,
-    fatal_exceptions: tuple[type, ...] | None = None,
-    transient_exceptions: tuple[type, ...] | None = None,
-    transient_registry: tuple[type, ...] = (),
 ) -> JobContext:
     """构造 handler 单测用 JobContext。
 
@@ -72,9 +69,6 @@ def fake_ctx(
             的会话级回收）统一承担。
         output_roots: 直接指定产物根目录（与 tmp_root 互斥使用）。
         ipc_dir: 直接指定 IPC 目录（caller 选定目录，非 tmp_root 子目录）。
-        fatal_exceptions / transient_exceptions: 异常分类声明元组
-            （worker 侧 classify 接缝直测用）。
-        transient_registry: 瞬态注册表元组（与上两者同属分类声明面）。
 
     Returns:
         JobContext: 内部容器结构由本函数兜底装配的上下文实例。
@@ -94,9 +88,6 @@ def fake_ctx(
         dict(cursors) if cursors is not None else {},
         output_roots=Path(output_roots) if isinstance(output_roots, str) else output_roots,
         ipc_dir=ipc_dir,
-        transient_registry=transient_registry,
-        fatal_exceptions=fatal_exceptions,
-        transient_exceptions=transient_exceptions,
         resource_names=frozenset(resources or ()),
         artifact_descriptions=artifacts,
         protected_roots=protected_roots,

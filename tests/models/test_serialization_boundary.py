@@ -101,5 +101,5 @@ def test_worker_rejects_old_envelope_fields(legacy, status):
     )
     assert not result.success
     assert not result.retry_requested
-    assert "CORRUPT_RESULT_FILE" in result.result_metadata["error_message"]
-    assert legacy in result.result_metadata["error_message"]
+    assert "CORRUPT_RESULT_FILE" in (result.message or "")
+    assert legacy in (result.message or "")

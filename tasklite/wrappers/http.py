@@ -36,11 +36,23 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ..exceptions import FatalError, RateLimitHit, RetryError
+from ..exceptions import TaskLiteError
 from ..utils.encoding import encode_job_component
 from ..utils.jsonutil import dumps as _json_dumps, loads as _json_loads
 
 logger = logging.getLogger("tasklite.wrappers.http")
+
+
+class RetryError(TaskLiteError):
+    """HTTP wrapper 瞬态错误信号（供守卫与本地重试循环使用，handler 捕获后转 TaskResult.retry）。"""
+
+
+class FatalError(TaskLiteError):
+    """HTTP wrapper 确定性错误信号（handler 捕获后转 TaskResult.failure）。"""
+
+
+class RateLimitHit(RetryError):
+    """HTTP 429 限速命中信号（守卫挂起资源后抛出，handler 捕获后转 TaskResult.retry(consume_budget=False)）。"""
 
 # 本地就地重试的单次等待封顶——大 max_retries 下无封顶的指数递增等待会
 # 累计出巨量不可中断睡眠（wrapper 层自防；核心引擎不含等待计算，重试
@@ -1312,6 +1324,9 @@ def requests_fetch(
 
 
 __all__ = [
+    "FatalError",
+    "RateLimitHit",
+    "RetryError",
     "parse_netscape_cookies",
     "format_cookie_header",
     "HttpResponse",

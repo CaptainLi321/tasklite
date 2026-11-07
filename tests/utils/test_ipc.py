@@ -18,8 +18,6 @@ from tasklite.utils.ipc import (
     PIPE_MSG_OUTPUT,
     WorkerPipeMessage,
     create_worker_pipe,
-    decode_raw_result,
-    encode_raw_result,
 )
 
 
@@ -145,22 +143,6 @@ class TestArtifactJournalDeclarations:
         assert isinstance(messages[1], WorkerPipeMessage)
         assert messages[1].kind == PIPE_MSG_INPUT
         assert messages[1].payload == {"path": in_path}
-
-
-class TestRawResultCodec:
-    """tuple 哨兵编解码：合法编码往返、哨兵碰撞原样返回不崩。"""
-
-    def test_tuple_roundtrip(self):
-        assert decode_raw_result(encode_raw_result((True, {"v": 1}))) == (True, {"v": 1})
-        assert decode_raw_result(encode_raw_result(None)) is None
-        assert decode_raw_result(encode_raw_result({"a": 1})) == {"a": 1}
-
-    def test_sentinel_collision_non_sequence_marks_failed_not_crash(self):
-        """哨兵碰撞防御：还原段非 list/tuple → 原样返回，不抛 TypeError。"""
-        for bad in (123, {"a": 1}, "text", None):
-            out = decode_raw_result(["__tl_tuple_v1", bad])
-            assert out == ["__tl_tuple_v1", bad], "原样返回，不抛异常"
-        assert decode_raw_result(["__tl_tuple_v1", ["x", "y"]]) == ("x", "y")
 
 
 class TestCleanupSandboxRecheck:

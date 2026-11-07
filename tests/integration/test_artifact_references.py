@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import Job, TaskLite
+from tasklite import Job, TaskLite, TaskResult
 
 
 @pytest.fixture(autouse=True)
@@ -16,16 +16,18 @@ def build_bundle(job, ctx):
     folder = Path(ctx.declare_output("bundle", name="bundle", delete_existing=True))
     folder.mkdir()
     (folder / "report.txt").write_text("published", encoding="utf-8")
+    return TaskResult.success()
 
 
 def consume_bundle(job, ctx):
     folder = Path(ctx.get_artifact_path(producer_job_uid="build::one", artifact_name="bundle"))
     report = Path(ctx.declare_input(folder / "report.txt"))
-    return {"content": report.read_text(encoding="utf-8")}
+    return TaskResult.success(metadata={"content": report.read_text(encoding="utf-8")})
 
 
 def illegal_state_output(job, ctx):
     ctx.declare_output(job.payload["path"], sandbox=False, delete_existing=True)
+    return TaskResult.success()
 
 
 def _pipeline(tmp_path):

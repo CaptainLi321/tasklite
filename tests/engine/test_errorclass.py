@@ -12,7 +12,6 @@ from typing import Literal, TypedDict
 
 import pytest
 
-from tasklite.exceptions import FatalError, RateLimitHit, RetryError
 from tasklite.engine.errorclass import (
     ERR_COMMIT_FAILURE,
     ERR_DEADLOCK_GAP,
@@ -70,26 +69,6 @@ class TestClassifierStandardExceptionShapes:
 
     def test_classify_standard_exceptions(self):
         classifier = ErrorClassifier()
-
-        # RetryError
-        cl = classifier.classify(RetryError("temporary"))
-        assert cl.is_retry is True
-        assert cl.is_transient is True
-        assert cl.is_fatal is False
-        assert cl.category == ErrorCategory.TRANSIENT_EXHAUSTED
-        assert cl.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
-
-        # RateLimitHit（RetryError 子类）
-        cl_rate = classifier.classify(RateLimitHit("429"))
-        assert cl_rate.is_retry is True
-        assert cl_rate.is_transient is True
-
-        # FatalError
-        cl_fatal = classifier.classify(FatalError("bad config"))
-        assert cl_fatal.is_fatal is True
-        assert cl_fatal.is_transient is False
-        assert cl_fatal.category == ErrorCategory.FATAL
-        assert cl_fatal.error_category == ErrorCategory.FATAL.value
 
         # 内置启发式 Fatal（TypeError, KeyError 等）
         cl_type = classifier.classify(TypeError("bad type"))
@@ -704,34 +683,6 @@ class TestConstructorRejectsDedicatedAndUnpicklableClasses:
     ctx pickle 下发，spawn 派发期才失败的滞后错误必须在构造期消灭。
     """
 
-    def test_transient_registry_rejects_retry_error_subclass(self):
-        class MyRetry(RetryError):
-            pass
-
-        with pytest.raises(TypeError, match="transient_registry.*RetryError"):
-            ErrorClassifier(transient_registry=[MyRetry])
-
-    def test_transient_registry_rejects_fatal_error_subclass(self):
-        class MyFatal(FatalError):
-            pass
-
-        with pytest.raises(TypeError, match="transient_registry.*FatalError"):
-            ErrorClassifier(transient_registry=[MyFatal])
-
-    def test_fatal_exceptions_rejects_retry_error_subclass(self):
-        class MyRetry(RetryError):
-            pass
-
-        with pytest.raises(TypeError, match="fatal_exceptions.*RetryError"):
-            ErrorClassifier(fatal_exceptions=(MyRetry,))
-
-    def test_transient_exceptions_rejects_fatal_error_subclass(self):
-        class MyFatal(FatalError):
-            pass
-
-        with pytest.raises(TypeError, match="transient_exceptions.*FatalError"):
-            ErrorClassifier(transient_exceptions=(MyFatal,))
-
     def test_transient_registry_rejects_unpicklable_class(self):
         class LocalError(Exception):
             pass
@@ -747,11 +698,10 @@ class TestConstructorRejectsDedicatedAndUnpicklableClasses:
             ErrorClassifier(fatal_exceptions=(LocalError,))
 
     def test_classify_keeps_fatal_priority_for_legal_policies(self):
-        """合法策略下 fatal 判定不受注册表污染：FatalError 子类恒 fatal，
-        不得因注册表命中先于 fatal 判定而翻转为可重试。"""
+        """合法策略下 fatal 判定不受注册表污染。"""
         classifier = ErrorClassifier(transient_registry=(ConnectionError,))
-        assert classifier.classify(FatalError("f")).is_fatal is True
-        assert classifier.classify(FatalError("f")).is_retry is False
+        assert classifier.classify(TypeError("f")).is_fatal is True
+        assert classifier.classify(TypeError("f")).is_retry is False
         assert classifier.classify(ConnectionError("c")).is_retry is True
 
 
@@ -787,7 +737,6 @@ class TestTransientRegistryManagement:
         assert is_transient_exception(ConnectionResetError("conn reset"))
         assert is_transient_exception(TimeoutError("took too long"))
         assert is_transient_exception(BrokenPipeError("pipe"))
-        assert is_transient_exception(RetryError("explicit"))
         assert not is_transient_exception(KeyError("k"))
         assert not is_transient_exception(TypeError("t"))
         assert not is_transient_exception(RuntimeError("unclassified"))

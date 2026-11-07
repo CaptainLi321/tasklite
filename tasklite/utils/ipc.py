@@ -55,7 +55,6 @@ VALID_PIPE_MESSAGE_KINDS = frozenset(
     }
 )
 _PIPE_EOF = object()
-_RAW_TUPLE_SENTINEL = "__tl_tuple_v1"
 
 
 @dataclass(frozen=True)
@@ -401,30 +400,6 @@ def create_worker_pipe(
     return receiver, sender
 
 
-def encode_raw_result(raw_result: Any) -> Any:
-    """编码 handler 返回值以便 JSON 传输（tuple 经哨兵标记还原）。"""
-    if isinstance(raw_result, tuple):
-        return [_RAW_TUPLE_SENTINEL, list(raw_result)]
-    return raw_result
-
-
-def decode_raw_result(encoded: Any) -> Any:
-    """还原 handler 返回值。
-
-    哨兵碰撞防御：用户返回值恰好形如 ``[哨兵, x]`` 且还原段非 list/tuple
-    时原样返回——强行 ``tuple(x)`` 会在非序列还原段上抛 TypeError 穿透
-    收割链（单任务损坏放大为整管崩溃）。
-    """
-    if (
-        isinstance(encoded, list)
-        and len(encoded) == 2
-        and encoded[0] == _RAW_TUPLE_SENTINEL
-        and isinstance(encoded[1], (list, tuple))
-    ):
-        return tuple(encoded[1])
-    return encoded
-
-
 class ArtifactCleanupMode(str, enum.Enum):
     """产物生命周期清理模式。"""
 
@@ -626,7 +601,5 @@ __all__ = [
     "WorkerPipeReceiver",
     "WorkerPipeSender",
     "create_worker_pipe",
-    "decode_raw_result",
     "decode_worker_pipe_message",
-    "encode_raw_result",
 ]

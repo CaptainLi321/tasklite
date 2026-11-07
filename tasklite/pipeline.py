@@ -1,11 +1,10 @@
-"""v2 TaskLite 门面：用户唯一入口与六步标准调用顺序。
+"""v2 TaskLite 门面：用户唯一入口与标准调用顺序。
 
-六步契约（顺序本身是设计的一部分）：初始化 → ``register_resource`` →
-``register_task`` / ``register_discovery`` / ``register_trigger`` /
-``register_transient_exception`` →
+标准调用顺序：初始化 → ``register_resource`` →
+``register_task`` / ``register_discovery`` / ``register_trigger`` →
 ``enqueue`` → ``run`` → ``stop``；管理 API 仅限 ``run()`` 外调用。
 
-装配分区：构造器只做参数编排，backend / 分类器 / 资源 / IPC 通道 /
+装配分区：构造器只做参数编排，backend / 资源 / IPC 通道 /
 运行配置 / 运维控制台各自下沉到私有装配方法（每段可独立读测）；
 EngineRuntime 静态装配快照见 RunConfig（engine/config.py），run 期
 生命周期状态与钩子单一出口见 RunSession（engine/session.py）。
@@ -25,7 +24,7 @@ from .engine.admission import RequeuePolicy, TriggerRegistry
 from .models.trigger import TriggerContext
 from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig, resolve_tuning
-from .engine.errorclass import ErrorClassifier, validate_declared_exception_classes
+from .engine.errorclass import ErrorClassifier
 from .engine.governor import DeadlockGovernor
 from .engine.ops import OpsConsole, SuspendEntry
 from .engine.resource import CapacityResource, Resource, ResourceManager
@@ -90,8 +89,6 @@ class TaskLite:
         strict_picklable: run() 前对全部已注册 Task 的 handler 做
             pickle 预检（fail-loud）——spawn 上下文要求 handler 模块级
             可 pickle，预检把派发期才爆发的序列化失败提前到入口。
-        fatal_exceptions / transient_exceptions: 异常分类声明元组
-            （构造期 fail-loud 校验，随执行上下文快照下发子进程）。
         ordering_policy: 队列访问序策略（默认 None → FIFO，唯一解析点在
             RunConfig.resolve）；核心不含排序计算，自定义策略经
             OrderingPolicy 接缝插入，``scan_next_runnable`` 唯一
@@ -122,8 +119,6 @@ class TaskLite:
         on_run_end: Callable[[str], None] | None = None,
         on_attempt_finished: Callable[..., None] | None = None,
         strict_picklable: bool = True,
-        fatal_exceptions: tuple | None = None,
-        transient_exceptions: tuple | None = None,
         ordering_policy: OrderingPolicy | None = None,
         requeue_policy: RequeuePolicy | None = None,
         dependency_grace_seconds: float | None = None,
@@ -146,7 +141,7 @@ class TaskLite:
             functions=BUILTIN_TRIGGER_FUNCTIONS,
             base_dir=self.base_dir,
         )
-        self.classifier = self._build_classifier(fatal_exceptions, transient_exceptions)
+        self.classifier = ErrorClassifier()
         self.resources = self._build_resources(self.tasks, max_workers)
         self.ipc_dir, self._process_context = self._prepare_ipc_dir()
         self.strict_picklable = strict_picklable
@@ -209,21 +204,10 @@ class TaskLite:
         """持久化后端装配：字符串名或实例 → (backend, 标准名)。"""
         if isinstance(backend, str):
             if backend == _BACKEND_SQLITE:
-                try:
-                    return (
-                        SQLiteStateBackend(self.state_dir / f"{self.name}_state.db"),
-                        _BACKEND_SQLITE,
-                    )
-                except Exception as e:
-                    logger.critical(
-                        f"Failed to initialize SQLite backend for '{self.name}' "
-                        f"at {self.state_dir}: {e}. Check disk space, directory "
-                        f"permissions, and filesystem health."
-                    )
-                    raise RuntimeError(
-                        f"SQLite backend initialization failed for "
-                        f"'{self.name}': {e}"
-                    ) from e
+                return (
+                    SQLiteStateBackend(self.state_dir / f"{self.name}_state.db"),
+                    _BACKEND_SQLITE,
+                )
             if backend == _BACKEND_MEMORY:
                 return InMemoryStateBackend(), _BACKEND_MEMORY
             raise ValueError(
@@ -242,26 +226,6 @@ class TaskLite:
         raise TypeError(
             f"backend must be 'sqlite', 'memory', or AbstractStateBackend "
             f"instance, got {type(backend).__name__}"
-        )
-
-    @staticmethod
-    def _build_classifier(
-        fatal_exceptions: tuple | None, transient_exceptions: tuple | None
-    ) -> ErrorClassifier:
-        """错误分类器装配：声明元组物化 + 构造期 fail-loud 校验。
-
-        分类声明是 per-pipeline 实例态（不跨 pipeline/run 累积）；声明
-        元组随执行上下文 pickle 下发子进程——非 Exception / 不可 pickle
-        类与注册表路径同规在构造期拒绝，不滞后到 spawn 派发才失败。
-        """
-        fatal = tuple(fatal_exceptions) if fatal_exceptions is not None else None
-        transient = (
-            tuple(transient_exceptions) if transient_exceptions is not None else None
-        )
-        validate_declared_exception_classes(fatal, "fatal_exceptions")
-        validate_declared_exception_classes(transient, "transient_exceptions")
-        return ErrorClassifier(
-            fatal_exceptions=fatal, transient_exceptions=transient
         )
 
     @staticmethod
@@ -519,24 +483,6 @@ class TaskLite:
         """注册主进程触发条件；内置名称与重复名称不允许覆盖。"""
         self._ensure_not_running("register_trigger")
         self._triggers.register(name, fn)
-
-    def register_transient_exception(
-        self, exception_cls: "type | Sequence[type]"
-    ) -> None:
-        """把业务自有异常类注册为瞬态（自动重试），per-pipeline 语义。
-
-        接受单个异常类或类序列（序列即批量注册，等价于逐个调用）；分类
-        决策发生在子进程，类必须模块级可 pickle（classifier 入口
-        fail-loud 预检）；注册表快照随 JobContext 显式下发子进程。
-        """
-        self._ensure_not_running("register_transient_exception")
-        classes = (
-            (exception_cls,)
-            if isinstance(exception_cls, type)
-            else tuple(exception_cls)
-        )
-        for cls in classes:
-            self.classifier.register_transient(cls)
 
     # ── 入队与过滤（六步之四前置）──────────────────────────────────
 

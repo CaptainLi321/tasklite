@@ -73,7 +73,7 @@ def test_spawn_worker_preserves_error_boundary(tmp_path, handler, infrastructure
         else:
             assert result.artifact_error is None
             assert "external tool read failed" in str(
-                result.result_metadata or result.retry_error
+                result.message or result.result_metadata or result.retry_error
             )
     finally:
         receiver.close()
@@ -86,7 +86,7 @@ def test_spawn_worker_preserves_error_boundary(tmp_path, handler, infrastructure
 def test_success_decode_does_not_read_artifact_declarations(tmp_path):
     job = Job("transport", "one")
     result = _decode_ipc_result(
-        {"status": "success", "raw_result": True}, None, job, str(tmp_path)
+        {"status": "success", "metadata": {}}, None, job, str(tmp_path)
     )
     assert result.success is True
 

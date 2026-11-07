@@ -13,8 +13,9 @@ from tasklite import (
     TaskLite,                    # 门面（六步调用契约唯一入口）
     Job, Task, AttemptRecord,    # 三层模型：实例 / 规格 / 轨迹
     JobContext,                  # handler 执行上下文
+    TaskResult,                  # handler 唯一返回结果
     TriggerContext,              # 自定义触发器只读判定上下文
-    RetryError, FatalError, RateLimitHit,   # 异常三分类
+    TaskLiteError,               # 公开契约异常
     FailureEntry, SuspendEntry,  # 失败档案与资源挂起条目
     OrderingPolicy, FifoOrderingPolicy,     # 调度排序 seam
     RequeuePolicy, ImmediateRequeuePolicy, RequeuePlan,  # 重入队节奏 seam
@@ -163,7 +164,7 @@ Task 规格（进程内 TaskRegistry：handler / 默认资源 / payload_schema /
 import logging
 from pathlib import Path
 
-from tasklite import Job, RateLimitResource, RetryError, TaskLite
+from tasklite import Job, RateLimitResource, TaskLite, TaskResult
 
 logging.getLogger("tasklite").setLevel(logging.INFO)
 
@@ -173,9 +174,9 @@ def download_handler(job, ctx):
     out = Path(ctx.declare_output(f"{job.job_id}.jpg", delete_on_failure=True))   # 声明产物（失败自动清理半成品）
     data = fetch(job.payload["url"])                       # 业务逻辑
     if data is None:
-        raise RetryError("网络抖动，重入队重试")            # 瞬态失败信号
+        return TaskResult.retry(message="网络抖动，重入队重试")  # 瞬态重试结果
     out.write_bytes(data)
-    return True, {"size": len(data)}                       # (成功, 业务元数据)
+    return TaskResult.success(metadata={"size": len(data)}) # 成功与业务元数据
 
 
 # 1. 初始化（name 派生状态库文件名 {name}_state.db）
