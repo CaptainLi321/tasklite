@@ -127,10 +127,13 @@ import pickle
 from collections.abc import Callable, Iterable
 from typing import Any, Protocol
 
+from ..exceptions import TaskLiteError
 from ..models.task import validate_trigger
 from ..utils.encoding import (
     CONTENT_ID_ALLOWED,
     encode_content_id,
+    make_job_uid,
+    parse_job_uid,
     percent_encode,
 )
 
@@ -266,7 +269,7 @@ class DiscoveryHandler:
         uid 派生，是「已见判定永不失效」的前提（两处不一致 → 永不整页命中
         → 全量重扫到 max_pages）。
         """
-        return f"{self.process_task_type}::{content_id}"
+        return make_job_uid(self.process_task_type, content_id)
 
     def _resolve_prefix(self, job: DiscoveryJob) -> str:
         """可选命名空间前缀（group_key_func 仅作 job_id 分组，无游标语义）。
@@ -485,8 +488,14 @@ class DiscoveryHandler:
                 percent_encode(prefix, allowed=CONTENT_ID_ALLOWED) if prefix else ""
             )
             for uid in ctx.succeeded_or_failed_job_uids():
-                if uid.startswith(ptype_prefix):
+                try:
+                    tt, content_part = parse_job_uid(uid)
+                except TaskLiteError:
+                    if not uid.startswith(ptype_prefix):
+                        continue
+                    tt = self.process_task_type
                     content_part = uid[len(ptype_prefix):]
+                if tt == self.process_task_type:
                     if not group_prefix or _in_discovery_group(content_part, group_prefix):
                         known.add(content_part)
             missing = sorted(known - seen_this_run)

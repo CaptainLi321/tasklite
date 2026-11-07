@@ -14,6 +14,8 @@ import copy
 from collections.abc import Mapping, Set as AbstractSet
 from typing import Any
 
+from ..exceptions import TaskLiteError
+from ..utils.encoding import make_job_uid
 from .job import Job
 
 
@@ -21,11 +23,14 @@ def job_uid_from_snapshot(job_snapshot: dict) -> str:
     """从 job dict 中直接提取 uid，避免完整的 Job.from_dict 反序列化开销。"""
     task_type = job_snapshot.get("task_type")
     job_id = job_snapshot.get("job_id")
-    if task_type is not None and job_id is not None:
-        return f"{task_type}::{job_id}"
+    if isinstance(task_type, str) and task_type and isinstance(job_id, str) and job_id:
+        try:
+            return make_job_uid(task_type, job_id)
+        except TaskLiteError:
+            pass
     try:
         return Job.from_dict(job_snapshot).uid
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, TaskLiteError):
         import hashlib, json
         h = hashlib.sha256(json.dumps(job_snapshot, sort_keys=True, default=str).encode()).hexdigest()
         return f"_unknown::{h}"
@@ -149,7 +154,7 @@ class PipelineState:
         for job_snapshot in self._queue:
             try:
                 job = Job.from_dict(job_snapshot)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, TaskLiteError):
                 continue
             job_uid = job.uid
             for dep_uid in job.depends_on:
@@ -200,7 +205,7 @@ class PipelineState:
         for job_snapshot in self._queue:
             try:
                 job = Job.from_dict(job_snapshot)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, TaskLiteError):
                 continue
             if node_uids is not None and job.uid not in node_uids:
                 continue

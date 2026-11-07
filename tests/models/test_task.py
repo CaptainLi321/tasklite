@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from tasklite.exceptions import TaskLiteError
 from tasklite.models.task import Task, TaskRegistry
 
 
@@ -88,13 +89,13 @@ class TestTaskValidation:
     """Task 入口校验矩阵（fail-loud）。"""
 
     def test_task_type_rejected(self):
-        """task_type 拒绝非 str / 空 / 含 '::'。"""
-        with pytest.raises(TypeError, match="task_type must be a str"):
+        """task_type 拒绝非 str / 空；含 ':' 或 '::' 保留原值。"""
+        with pytest.raises(TaskLiteError, match="task_type must be a str"):
             Task(task_type=123, handler=_handler)
-        with pytest.raises(ValueError, match="non-empty str"):
+        with pytest.raises(TaskLiteError, match="non-empty str"):
             Task(task_type="", handler=_handler)
-        with pytest.raises(ValueError, match="must not contain '::'"):
-            Task(task_type="a::b", handler=_handler)
+        task = Task(task_type="a::b", handler=_handler)
+        assert task.task_type == "a::b"
 
     def test_handler_must_be_callable(self):
         with pytest.raises(TypeError, match="handler must be callable"):

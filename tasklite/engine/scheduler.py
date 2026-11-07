@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
+from ..exceptions import TaskLiteError
 from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Selection
@@ -305,7 +306,7 @@ class JobScheduler:
             # 捕获畸形 job dict（缺 task_type/job_id 等），记录 UID 避免整个扫描崩溃
             try:
                 job = self.cached_job(job_snapshot)
-            except (KeyError, TypeError, ValueError) as e:
+            except (KeyError, TypeError, ValueError, TaskLiteError) as e:
                 logger.error(f"Malformed job dict at index {i}: {e}")
                 malformed_uids.append(job_uid_from_snapshot(job_snapshot))
                 continue

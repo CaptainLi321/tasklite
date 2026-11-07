@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
 from ..backend.base import AbstractStateBackend
-from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..exceptions import TaskLiteError, _CommitCrashSignal, _JobTerminated
 from ..models.artifact import ArtifactDeclaration, validate_artifact_declarations
 from ..models.attempt import (
     ATTEMPT_FAILED,
@@ -36,6 +36,7 @@ from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Selection
 from ..utils.clock import parse_utc_iso_to_us, utc_now_iso
+from ..utils.encoding import parse_job_uid
 from ..utils.jsonutil import dumps
 from .admission import (
     ImmediateRequeuePolicy,
@@ -180,7 +181,7 @@ class StateStore:
         for job_snapshot in self._state.queue:
             try:
                 job = Job.from_dict(job_snapshot)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, TaskLiteError):
                 continue
             if not selection.allows_task_type(job.task_type):
                 excluded.add(job.uid)
@@ -798,9 +799,13 @@ class StateStore:
         失败时同样 requeue + 崩溃。
         """
         if job_snapshot is None:
+            try:
+                task_type, job_id = parse_job_uid(job_uid)
+            except TaskLiteError:
+                task_type, _, job_id = job_uid.partition("::")
             job_snapshot = {
-                "task_type": job_uid.split("::")[0],
-                "job_id": job_uid.split("::")[1],
+                "task_type": task_type,
+                "job_id": job_id,
             }
 
         failures = self._register_commit_failure(job_snapshot)
@@ -865,10 +870,17 @@ class StateStore:
         kept_any = False
         for job_uid, _ in uids_metas:
             matching = [j for j in queue if job_uid_from_snapshot(j) == job_uid]
-            jd = matching[0] if matching else {
-                "task_type": job_uid.split("::")[0],
-                "job_id": job_uid.split("::")[1],
-            }
+            if matching:
+                jd = matching[0]
+            else:
+                try:
+                    task_type, job_id = parse_job_uid(job_uid)
+                except TaskLiteError:
+                    task_type, _, job_id = job_uid.partition("::")
+                jd = {
+                    "task_type": task_type,
+                    "job_id": job_id,
+                }
             failures = self._register_commit_failure(jd)
             if failures >= self._threshold:
                 if self._bulk_strike_finalize(job_uid, jd, failures=failures):

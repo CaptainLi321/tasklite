@@ -17,6 +17,8 @@ import re
 import pytest
 from hypothesis import example, given, settings, strategies as st
 
+from tasklite.exceptions import TaskLiteError
+from tasklite.models.job import Job
 from tasklite.utils.encoding import (
     CONTENT_ID_ALLOWED,
     EMPTY_SENTINEL,
@@ -24,8 +26,10 @@ from tasklite.utils.encoding import (
     encode_content_id,
     encode_identifier,
     encode_job_component,
-    percent_encode,
     encode_job_uid_filename,
+    make_job_uid,
+    parse_job_uid,
+    percent_encode,
 )
 
 # 折磨字母表：转义符、路径分隔符、glob 元字符、控制字符、多字节与高低码位字符
@@ -531,3 +535,140 @@ def test_content_fingerprint_nested_containers_order_insensitive():
     assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": {"a": 2}}])
     assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": {"a": "1"}}])
     assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": [["a", 1]]}])
+
+
+# ── make_job_uid / parse_job_uid：透明可逆的 Job 身份 ────────────────
+
+
+non_empty_text = st.one_of(
+    st.text(min_size=1, max_size=60),
+    st.text(alphabet=_TORTURE_ALPHABET, min_size=1, max_size=40),
+)
+
+
+def test_make_and_parse_job_uid_preserves_printable_and_escapes_only_required():
+    # 普通可打印字符（含文件路径字符 / \ * ? [ ] 空格 Unicode）原样保留，不作文件名净化
+    uid = make_job_uid("process/sub\\task", "report-001 *?[] 日本語 🚀")
+    assert uid == "process/sub\\task::report-001 *?[] 日本語 🚀"
+    assert parse_job_uid(uid) == ("process/sub\\task", "report-001 *?[] 日本語 🚀")
+    job = Job("process/sub\\task", "report-001 *?[] 日本語 🚀")
+    assert job.uid == uid
+    assert job.task_type == "process/sub\\task"
+    assert job.job_id == "report-001 *?[] 日本語 🚀"
+
+    # 百分号、冒号和不可打印字符使用可逆 UTF-8 %XX
+    uid2 = make_job_uid("a:b%c\t\n\x00", "x::y%25\x1b\x7f\u2028")
+    assert uid2 == "a%3Ab%25c%09%0A%00::x%3A%3Ay%2525%1B%7F%E2%80%A8"
+    assert parse_job_uid(uid2) == ("a:b%c\t\n\x00", "x::y%25\x1b\x7f\u2028")
+    assert Job("a:b%c\t\n\x00", "x::y%25\x1b\x7f\u2028").uid == uid2
+
+
+def test_make_job_uid_does_not_normalize_or_truncate():
+    # 不去空格、不改大小写、不做 Unicode 归一化（NFC vs NFD）、不截断超长串
+    nfc = "\u00e9"
+    nfd = "e\u0301"
+    assert nfc != nfd
+    uid_nfc = make_job_uid("  Task  ", nfc + "x" * 500)
+    uid_nfd = make_job_uid("  Task  ", nfd + "x" * 500)
+    assert uid_nfc != uid_nfd
+    assert parse_job_uid(uid_nfc) == ("  Task  ", nfc + "x" * 500)
+    assert parse_job_uid(uid_nfd) == ("  Task  ", nfd + "x" * 500)
+
+
+def test_make_and_parse_job_uid_collision_resistance():
+    # 不同 (task_type, job_id) 组合不碰撞（含分隔符边界与预转义字面量）
+    pairs = [
+        ("a", "b::c"),
+        ("a::b", "c"),
+        ("a", "b%3A%3Ac"),
+        ("a%3A%3Ab", "c"),
+        ("a%", "3Ab"),
+        ("a", ":b"),
+        ("a:", "b"),
+        ("t", "%"),
+        ("t", "%25"),
+        ("t", "%2525"),
+        ("t", "/"),
+        ("t", "%2F"),
+    ]
+    uids = [make_job_uid(a, b) for a, b in pairs]
+    assert len(set(uids)) == len(pairs)
+    for (a, b), u in zip(pairs, uids):
+        assert parse_job_uid(u) == (a, b)
+        assert Job(a, b).uid == u
+
+
+@pytest.mark.hypothesis
+@settings(max_examples=80, deadline=None)
+@example(a="a::b", b="c%3A%3Ad")
+@example(a="%25", b="%")
+@example(a="path/to/file", b="name\x00\t\n:1")
+@given(a=non_empty_text, b=non_empty_text)
+def test_make_parse_job_uid_roundtrip_property(a, b):
+    uid = make_job_uid(a, b)
+    assert parse_job_uid(uid) == (a, b)
+    assert Job(a, b).uid == uid
+
+
+@pytest.mark.hypothesis
+@settings(max_examples=80, deadline=None)
+@example(p1=("a::b", "c"), p2=("a", "b::c"))
+@example(p1=("t", ":"), p2=("t", "%3A"))
+@given(
+    p1=st.tuples(non_empty_text, non_empty_text),
+    p2=st.tuples(non_empty_text, non_empty_text),
+)
+def test_make_job_uid_injective_property(p1, p2):
+    if p1 == p2:
+        return
+    assert make_job_uid(*p1) != make_job_uid(*p2)
+
+
+def test_make_job_uid_rejects_invalid_inputs_with_tasklite_error():
+    for bad in ("", None, 123, 1.5, True, b"a", ["a"]):
+        with pytest.raises(TaskLiteError):
+            make_job_uid(bad, "id")  # type: ignore[arg-type]
+        with pytest.raises(TaskLiteError):
+            make_job_uid("type", bad)  # type: ignore[arg-type]
+    # 孤立代理项（非法 UTF-8）拒绝
+    with pytest.raises(TaskLiteError):
+        make_job_uid("t", "\ud800")
+
+
+def test_parse_job_uid_rejects_non_canonical_uids_with_tasklite_error():
+    invalid_uids = [
+        None,
+        123,
+        "",
+        "no_separator",
+        "::id",
+        "type::",
+        "::",
+        "a::b::c",
+        "a:b::c",           # 未转义单冒号
+        "a::b:c",           # 未转义单冒号
+        "a%b::c",           # 裸 %
+        "a::b%",            # 尾部裸 %
+        "a::b%2",           # 不完整 %XX
+        "a::b%3a",          # 小写 hex 非规范
+        "a::b%GG",          # 非 hex
+        "a::%41",           # 普通可打印字符 'A' 被过度转义（非规范 UID）
+        "a::%2F",           # '/' 在 UID 中无需转义，%2F 属于非规范预编码输入
+        "a\tb::c",          # 未转义不可打印字符
+        "a::b\x00c",        # 未转义 NUL
+        "a::%FF",           # 非法 UTF-8 字节序列
+    ]
+    for bad in invalid_uids:
+        with pytest.raises(TaskLiteError):
+            parse_job_uid(bad)  # type: ignore[arg-type]
+
+
+def test_top_level_exports_identity_and_exception():
+    import tasklite
+
+    assert tasklite.make_job_uid is make_job_uid
+    assert tasklite.parse_job_uid is parse_job_uid
+    assert tasklite.TaskLiteError is TaskLiteError
+    assert "make_job_uid" in tasklite.__all__
+    assert "parse_job_uid" in tasklite.__all__
+    assert "TaskLiteError" in tasklite.__all__

@@ -19,8 +19,13 @@ import hashlib
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from ..exceptions import TaskLiteError
+
 _PERCENT_ESCAPE = "%"
 _PERCENT_ESCAPED = "%25"
+_UID_FORBIDDEN = ":%"
+_UID_SEPARATOR = "::"
+_HEX_DIGITS = frozenset("0123456789ABCDEF")
 
 # 默认禁止字符集（路径分隔符、冒号、转义符本身）
 DEFAULT_FORBIDDEN = "/\\:%"
@@ -237,6 +242,106 @@ def content_fingerprint(
     return h.hexdigest()[:16]
 
 
+def _encode_uid_component(value: str, field_name: str) -> str:
+    """校验原始身份字段并执行仅针对 %、: 与不可打印字符的 UTF-8 %XX 转义。"""
+    if not isinstance(value, str):
+        raise TaskLiteError(
+            f"{field_name} must be a non-empty str, got {type(value).__name__} ({value!r})"
+        )
+    if not value:
+        raise TaskLiteError(f"{field_name} must be a non-empty str, got {value!r}")
+    try:
+        return percent_encode(value, forbidden=_UID_FORBIDDEN)
+    except UnicodeEncodeError as exc:
+        raise TaskLiteError(
+            f"{field_name} must be valid UTF-8 str, got {value!r}"
+        ) from exc
+
+
+def _decode_uid_component(encoded: str, field_name: str) -> str:
+    """严格解析规范 UID 组成部分并还原原始字符串。"""
+    if not encoded:
+        raise TaskLiteError(f"invalid job uid: empty {field_name} component")
+    chars: list[str] = []
+    buf = bytearray()
+    i = 0
+    n = len(encoded)
+    while i < n:
+        ch = encoded[i]
+        if ch == _PERCENT_ESCAPE:
+            if i + 2 >= n:
+                raise TaskLiteError(
+                    f"invalid job uid: incomplete percent escape in {field_name} ({encoded!r})"
+                )
+            h1, h2 = encoded[i + 1], encoded[i + 2]
+            if h1 not in _HEX_DIGITS or h2 not in _HEX_DIGITS:
+                raise TaskLiteError(
+                    f"invalid job uid: non-canonical percent escape '%{h1}{h2}' in {field_name}"
+                )
+            byte_val = int(h1 + h2, 16)
+            buf.append(byte_val)
+            i += 3
+        else:
+            if buf:
+                try:
+                    decoded_run = buf.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise TaskLiteError(
+                        f"invalid job uid: invalid UTF-8 byte sequence in {field_name}"
+                    ) from exc
+                for dch in decoded_run:
+                    if dch.isprintable() and dch not in (":", "%"):
+                        raise TaskLiteError(
+                            f"invalid job uid: over-escaped character {dch!r} in {field_name}"
+                        )
+                chars.append(decoded_run)
+                buf.clear()
+            if ch == ":" or not ch.isprintable():
+                raise TaskLiteError(
+                    f"invalid job uid: unescaped character {ch!r} in {field_name}"
+                )
+            chars.append(ch)
+            i += 1
+    if buf:
+        try:
+            decoded_run = buf.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise TaskLiteError(
+                f"invalid job uid: invalid UTF-8 byte sequence in {field_name}"
+            ) from exc
+        for dch in decoded_run:
+            if dch.isprintable() and dch not in (":", "%"):
+                raise TaskLiteError(
+                    f"invalid job uid: over-escaped character {dch!r} in {field_name}"
+                )
+        chars.append(decoded_run)
+    return "".join(chars)
+
+
+def make_job_uid(task_type: str, job_id: str) -> str:
+    """校验原始 task_type、job_id 并生成规范 UID。"""
+    enc_type = _encode_uid_component(task_type, "task_type")
+    enc_id = _encode_uid_component(job_id, "job_id")
+    return f"{enc_type}{_UID_SEPARATOR}{enc_id}"
+
+
+def parse_job_uid(uid: str) -> tuple[str, str]:
+    """严格解析规范 UID，返回 (task_type, job_id) 原始字段二元组。"""
+    if not isinstance(uid, str):
+        raise TaskLiteError(
+            f"uid must be a str, got {type(uid).__name__} ({uid!r})"
+        )
+    parts = uid.split(_UID_SEPARATOR)
+    if len(parts) != 2:
+        raise TaskLiteError(
+            f"uid must contain a single '::' separator, got {uid!r}"
+        )
+    raw_type, raw_id = parts
+    task_type = _decode_uid_component(raw_type, "task_type")
+    job_id = _decode_uid_component(raw_id, "job_id")
+    return task_type, job_id
+
+
 def encode_job_uid_filename(job_uid: str) -> str:
     """把 job uid 映射为对任意文件系统安全（无 : 等保留字符）的文件名。
 
@@ -257,6 +362,8 @@ __all__ = [
     "encode_content_id",
     "encode_identifier",
     "encode_job_component",
-    "percent_encode",
     "encode_job_uid_filename",
+    "make_job_uid",
+    "parse_job_uid",
+    "percent_encode",
 ]

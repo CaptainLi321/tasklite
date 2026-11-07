@@ -10,6 +10,8 @@ from __future__ import annotations
 from typing import Any
 
 from .engine.types import AttemptOutcome
+from .exceptions import TaskLiteError
+from .utils.encoding import parse_job_uid
 
 __all__ = [
     "job_ref",
@@ -36,7 +38,10 @@ def progress_hook(job_uid: str, *, outcome: AttemptOutcome) -> None:
     重试文案为「重入队」而非任何延迟字眼——v2 重试节奏唯一经
     RequeuePolicy seam 表达，默认立即重入队，标准适配器不预设延迟语义。
     """
-    task_type = job_uid.split("::", 1)[0]
+    try:
+        task_type, _ = parse_job_uid(job_uid)
+    except TaskLiteError:
+        task_type = job_uid.split("::", 1)[0]
     ref = job_ref(outcome.metadata)
     label = f"{task_type} {ref}" if ref else task_type
     if outcome.will_retry:

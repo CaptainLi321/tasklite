@@ -10,7 +10,13 @@
 from __future__ import annotations
 
 
-class PipelineError(Exception):
+class TaskLiteError(Exception):
+    """框架主动发现调用条件不成立时抛出的公开异常。"""
+
+    pass
+
+
+class PipelineError(TaskLiteError):
     """v2 框架异常的公共基类。"""
 
     pass
@@ -64,6 +70,7 @@ class _JobTerminated(BaseException):
 
 
 __all__ = [
+    "TaskLiteError",
     "PipelineError",
     "RetryError",
     "FatalError",

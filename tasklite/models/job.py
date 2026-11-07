@@ -20,7 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..utils.encoding import encode_job_uid_filename
+from ..exceptions import TaskLiteError
+from ..utils.encoding import make_job_uid
 from .task import (
     validate_resource_amounts,
     validate_retry_budget,
@@ -29,14 +30,6 @@ from .task import (
     validate_timeout_flag,
     validate_trigger,
 )
-
-# uid 派生的 IPC 文件名（锁 / result / signals / outputs）
-# 无截断——job_id/task_type 超长时文件名超 255 字节（EXT4 单文件名字节
-# 上限）→ os.open ENAMETOOLONG → 派发侧异常未分类 → 重入队 + 崩溃重启
-# → livelock（job 永远无法执行且不进失败档案）。入口按 encode_job_uid_filename
-# 实际字节数（含转义膨胀）拒绝，fail-fast。
-# 255 - 56 = 199：56 为最坏结果文件后缀 ``.{32-hex run_id}.{seq}.result.json``。
-_MAX_SAFE_UID_BYTES = 199
 
 WORKER_RESOURCE = "__workers__"
 
@@ -147,31 +140,24 @@ _RUNTIME_FIELDS: dict[str, tuple[str, Any]] = {
 
 
 def _validate_job_id(job_id: Any) -> None:
-    """job_id 入口校验：非空 str 且不含 '::'。
+    """job_id 入口校验：非空 str。
 
-    拒绝非 str——str 强转会使数值与字符串字面量静默碰撞
-    （Job("t", 1.0).uid == Job("t", "1.0").uid == "t::1.0"），混合
+    拒绝非 str——str 强转会使数值与字符串字面量静默碰撞，混合
     数值/字符串 job_id 的管线静默合并不同任务（successes 去重吞掉后者），
     与 task_type 的 str 校验对称。
     """
     if not isinstance(job_id, str):
-        raise TypeError(
+        raise TaskLiteError(
             f"job_id must be a str, got {type(job_id).__name__} ({job_id!r})"
         )
     if not job_id:
-        raise ValueError(f"job_id must be a non-empty str, got {job_id!r}")
-    if "::" in job_id:
-        raise ValueError(f"job_id must not contain '::', got {job_id!r}")
-
-
-def _validate_uid_ipc_filename(task_type: str, job_id: str) -> None:
-    """uid 派生 IPC 文件名超 255 字节 → ENAMETOOLONG livelock，入口拒绝。"""
-    if len(encode_job_uid_filename(f"{task_type}::{job_id}").encode("utf-8")) > _MAX_SAFE_UID_BYTES:
-        raise ValueError(
-            f"task_type+job_id too long: uid-derived IPC filename would exceed "
-            f"filesystem name limit ({_MAX_SAFE_UID_BYTES} bytes max); got "
-            f"{task_type!r}::{job_id!r} — shorten to avoid ENAMETOOLONG livelock"
-        )
+        raise TaskLiteError(f"job_id must be a non-empty str, got {job_id!r}")
+    try:
+        job_id.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise TaskLiteError(
+            f"job_id must be valid UTF-8 str, got {job_id!r}"
+        ) from exc
 
 
 def _normalize_payload(payload: Any) -> dict[str, Any]:
@@ -303,12 +289,12 @@ class Job:
         activation_no: int = 1,
         first_enqueued_at: str | None = None,
     ):
-        # 身份校验链：类型 → 空值 → '::' 分隔符 → IPC 文件名长度上限
+        # 身份校验链：类型 → 非空 → 构造规范 uid
         validate_task_type(task_type)
         self.task_type = task_type
         _validate_job_id(job_id)
         self.job_id = job_id
-        _validate_uid_ipc_filename(task_type, job_id)
+        self._uid = make_job_uid(task_type, job_id)
 
         self.payload = _normalize_payload(payload)
         self.resources = None if resources is None else _normalize_resources(resources)
@@ -393,8 +379,8 @@ class Job:
 
     @property
     def uid(self) -> str:
-        """唯一标识：task_type::job_id。"""
-        return f"{self.task_type}::{self.job_id}"
+        """唯一标识：make_job_uid(task_type, job_id)。"""
+        return self._uid
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Job):

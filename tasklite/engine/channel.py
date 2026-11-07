@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..exceptions import FatalError, RateLimitHit, RetryError, _ArtifactIOError
+from ..exceptions import FatalError, RateLimitHit, RetryError, TaskLiteError, _ArtifactIOError
 from ..models.artifact import ArtifactDeclaration
 from ..models.context import JobContext
 from ..models.job import Job
@@ -109,7 +109,7 @@ def _parse_spawned_jobs(raw_spawned_jobs: Any) -> tuple[list[Job], str | None]:
     for job_snapshot in raw_spawned_jobs:
         try:
             spawned_jobs.append(Job.from_dict(job_snapshot))
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, TaskLiteError) as e:
             return [], f"invalid spawned job dict: {e}"
     return spawned_jobs, None
 

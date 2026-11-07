@@ -43,6 +43,7 @@ from .exceptions import (
     PipelineError,
     RateLimitHit,
     RetryError,
+    TaskLiteError,
 )
 
 # ── 用户钩子三件套 ───────────────────────────────────────────────────
@@ -121,8 +122,10 @@ from .utils.encoding import (
     encode_content_id,
     encode_identifier,
     encode_job_component,
-    percent_encode,
     encode_job_uid_filename,
+    make_job_uid,
+    parse_job_uid,
+    percent_encode,
 )
 
 # ── JSON 序列化统一出口 ──────────────────────────────────────────────
@@ -149,6 +152,7 @@ __all__ = [
     "PipelineError",
     "RateLimitHit",
     "RetryError",
+    "TaskLiteError",
     # 钩子三件套
     "job_ref",
     "progress_hook",
@@ -212,8 +216,10 @@ __all__ = [
     "encode_content_id",
     "encode_identifier",
     "encode_job_component",
-    "percent_encode",
     "encode_job_uid_filename",
+    "make_job_uid",
+    "parse_job_uid",
+    "percent_encode",
     # 序列化
     "jsonutil",
 ]

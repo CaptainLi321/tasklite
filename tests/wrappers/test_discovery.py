@@ -615,8 +615,8 @@ def test_real_subprocess_discovery(tmp_path, monkeypatch):
     successes = pipeline.backend.load_successes()
     child_uids = sorted(k for k in successes if k.startswith("rt_child::"))
     assert len(child_uids) == 5, f"expected 5 child jobs, got {child_uids}"
-    # 命名空间前缀生效：job_id 以 5%3Art_1 开头（length-prefix，`:`→%3A）
-    assert all(u.startswith("rt_child::4%3Art_1") for u in child_uids), child_uids
+    # 命名空间前缀生效：content_id 4%3Art_1* 经 make_job_uid 构造后前缀为 rt_child::4%253Art_1
+    assert all(u.startswith("rt_child::4%253Art_1") for u in child_uids), child_uids
     # 纯任务模型不产生任何 cursor（区别于游标式 discovery）
     cursors = pipeline.backend.load_cursors()
     assert cursors == {}, f"discovery must not write cursors: {cursors}"
@@ -648,9 +648,9 @@ def test_real_subprocess_rediscovery(tmp_path, monkeypatch):
     successes = pipeline.backend.load_successes()
     child_uids = sorted(k for k in successes if k.startswith("rt_child::"))
     assert len(child_uids) == 6, f"expected 6 total child jobs, got {len(child_uids)}"
-    # 新增项：4%3Art_210 / 4%3Art_211（length-prefix，key="rt_2" len=4）
-    assert any(u.startswith("rt_child::4%3Art_210") for u in child_uids), child_uids
-    assert any(u.startswith("rt_child::4%3Art_211") for u in child_uids), child_uids
+    # 新增项：4%3Art_210 / 4%3Art_211 经 make_job_uid 转义后为 4%253Art_210 / 4%253Art_211
+    assert any(u.startswith("rt_child::4%253Art_210") for u in child_uids), child_uids
+    assert any(u.startswith("rt_child::4%253Art_211") for u in child_uids), child_uids
 
 
 def test_real_subprocess_max_pages(tmp_path, monkeypatch):

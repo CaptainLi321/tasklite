@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from ..exceptions import TaskLiteError
 from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
 from .errorclass import (
@@ -242,7 +243,7 @@ class DeadlockGovernor:
                     job = scheduler.cached_job(jd)
                 else:
                     job = Job.from_dict(jd)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, TaskLiteError):
                 continue
             if all(state.dependency_ready(dep) for dep in job.depends_on):
                 return self._grant_or_expire(missing_uids, now_mono, effective_grace)

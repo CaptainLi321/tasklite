@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import pytest
 
+from tasklite.exceptions import TaskLiteError
 from tasklite.models.job import (
     Job,
     JobRuntimeState,
     BUILTIN_TRIGGERS,
     inject_worker_resource,
 )
-from tasklite.utils.encoding import encode_job_uid_filename
+from tasklite.utils.encoding import make_job_uid, parse_job_uid
 
 
 class TestJobCreation:
@@ -93,51 +94,51 @@ class TestJobCreation:
 
 
 class TestJobIdentityValidation:
-    """task_type / job_id 身份校验（uid 分隔符与类型门卫）。"""
+    """task_type / job_id 身份校验与透明转义。"""
 
     def test_job_id_rejects_non_str(self):
-        """Job("t", 1.0).uid == Job("t", "1.0").uid 静默碰撞合并任务，
-        入口拒绝。"""
+        """非 str job_id 显式抛 TaskLiteError 拒绝。"""
         for bad in (42, 3.14, True, b"jid"):
-            with pytest.raises(TypeError, match="job_id must be a str"):
+            with pytest.raises(TaskLiteError, match="job_id must be a str"):
                 Job("download", bad)
 
     def test_non_str_task_type_rejected(self):
-        with pytest.raises(TypeError, match="task_type must be a str"):
+        with pytest.raises(TaskLiteError, match="task_type must be a str"):
             Job(123, "id")
 
     def test_empty_string_task_type(self):
-        with pytest.raises(ValueError, match="task_type must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="task_type must be a non-empty str"):
             Job("", "id")
 
     def test_empty_string_job_id(self):
-        with pytest.raises(ValueError, match="job_id must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="job_id must be a non-empty str"):
             Job("type", "")
 
-    def test_double_colon_in_task_type_rejected(self):
-        """task_type 含 '::' 抛 ValueError，避免 uid 分隔符碰撞。"""
-        with pytest.raises(ValueError, match="task_type must not contain '::'"):
-            Job("a::b", "c")
+    def test_double_colon_in_task_type_transparently_escaped(self):
+        """task_type 含 '::' 由框架透明转义，原始属性保留原文。"""
+        job = Job("a::b", "c")
+        assert job.task_type == "a::b"
+        assert job.job_id == "c"
+        assert job.uid == "a%3A%3Ab::c"
+        assert job.uid == make_job_uid("a::b", "c")
+        assert parse_job_uid(job.uid) == ("a::b", "c")
 
-    def test_double_colon_in_job_id_rejected(self):
-        """job_id 含 '::' 抛 ValueError，避免 uid 分隔符碰撞。"""
-        with pytest.raises(ValueError, match="job_id must not contain '::'"):
-            Job("a", "b::c")
+    def test_double_colon_in_job_id_transparently_escaped(self):
+        """job_id 含 '::' 由框架透明转义，原始属性保留原文。"""
+        job = Job("a", "b::c")
+        assert job.task_type == "a"
+        assert job.job_id == "b::c"
+        assert job.uid == "a::b%3A%3Ac"
+        assert job.uid == make_job_uid("a", "b::c")
+        assert parse_job_uid(job.uid) == ("a", "b::c")
 
-    def test_oversized_job_id_rejected(self):
-        """uid 派生 IPC 文件名（锁/结果）超上限 → ENAMETOOLONG → 派发
-        livelock（永远重入队且不进失败档案），入口按转义后字节数拒绝。"""
+    def test_long_job_id_accepted_without_filename_truncation(self):
+        """移除业务身份的文件名长度约束，长 job_id 原样保留且可逆。"""
         long_id = "x" * 400
-        assert len(encode_job_uid_filename(f"t::{long_id}")) > 199
-        with pytest.raises(ValueError, match="too long"):
-            Job("t", long_id)
-
-    def test_uid_filename_boundary_accepted(self):
-        """转义后 ≤199 字节的 uid 仍可构造（边界不误杀）。"""
-        # 干净 job_id：encode_job_uid_filename 只把 :: 转义为 %3A%3A（+4 字节）
-        ok_id = "k" * 190
-        assert len(encode_job_uid_filename(f"t::{ok_id}")) <= 199
-        Job("t", ok_id)  # 不抛
+        job = Job("t", long_id)
+        assert job.job_id == long_id
+        assert job.uid == f"t::{long_id}"
+        assert parse_job_uid(job.uid) == ("t", long_id)
 
 
 class TestJobPayloadAndResources:
@@ -296,7 +297,10 @@ class TestJobUid:
         assert Job("path", "a/b/c").uid == "path::a/b/c"
 
     def test_uid_with_colons_in_job_id(self):
-        assert Job("t", "id:with:colons").uid == "t::id:with:colons"
+        job = Job("t", "id:with:colons")
+        assert job.uid == "t::id%3Awith%3Acolons"
+        assert job.uid == make_job_uid("t", "id:with:colons")
+        assert parse_job_uid(job.uid) == ("t", "id:with:colons")
 
     def test_uid_identity_after_roundtrip(self):
         original = Job("work", "w_42", payload={"x": 1})

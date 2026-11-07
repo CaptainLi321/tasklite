@@ -20,6 +20,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..exceptions import TaskLiteError
+
 
 def validate_trigger(trigger: Any) -> None:
     """触发器引用仅允许非空名称，名称解析留在主进程派发点。"""
@@ -80,18 +82,19 @@ def validate_resource_amounts(resources: Any, where: str = "resources") -> None:
 
 
 def validate_task_type(task_type: Any) -> None:
-    """task_type 入口校验：非空 str 且不含 '::'（uid 分隔符）。
-
-    Task 规格与 Job 实例共用（同名同规则），报错文案为两侧单一真相。
-    """
+    """task_type 入口校验：非空 str（Task 规格与 Job 实例共用）。"""
     if not isinstance(task_type, str):
-        raise TypeError(
+        raise TaskLiteError(
             f"task_type must be a str, got {type(task_type).__name__} ({task_type!r})"
         )
     if not task_type:
-        raise ValueError(f"task_type must be a non-empty str, got {task_type!r}")
-    if "::" in task_type:
-        raise ValueError(f"task_type must not contain '::', got {task_type!r}")
+        raise TaskLiteError(f"task_type must be a non-empty str, got {task_type!r}")
+    try:
+        task_type.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise TaskLiteError(
+            f"task_type must be valid UTF-8 str, got {task_type!r}"
+        ) from exc
 
 
 def _validate_handler(handler: Any) -> None:
@@ -164,8 +167,7 @@ class Task:
     """产生同构 Job 序列的静态规格模板（不落盘，代码即规格）。
 
     Attributes:
-        task_type: 任务类型名（须与 Job.task_type 一致）；非空 str 且不含
-            ``::``（uid 分隔符）。
+        task_type: 任务类型名（须与 Job.task_type 一致）；非空 str。
         handler: 任务处理函数，期望签名 ``handler(job, ctx)``，返回值语义：
             None/True 表示成功，False 表示失败，dict 作为成功元数据，
             tuple[bool, dict] 组合形式；抛 RetryError 推回队列重试，抛

@@ -15,8 +15,10 @@ from typing import Callable, Sequence
 from .errorclass import ErrorClassifier
 from .resource import ENGINE_METADATA_RESOURCE_SUSPENSIONS
 from .store import FailureEntry, StateStore
+from ..exceptions import TaskLiteError
 from ..models.job import Job
 from ..models.state import job_uid_from_snapshot
+from ..utils.encoding import parse_job_uid
 from ..utils.jsonutil import loads
 
 logger = logging.getLogger("tasklite")
@@ -164,10 +166,21 @@ class OpsConsole:
                         f"task_types must contain only non-empty str, got {t!r}"
                     )
             task_types = list(task_types)
+        task_type_set = set(task_types) if task_types is not None else None
         failed = self._store.backend.load_failed()
+
+        def _match_task_type(uid: str) -> bool:
+            if task_type_set is None:
+                return True
+            try:
+                tt, _ = parse_job_uid(uid)
+            except TaskLiteError:
+                tt = uid.split("::", 1)[0]
+            return tt in task_type_set
+
         to_delete = [
             uid for uid, meta in failed.items()
-            if (task_types is None or any(uid.startswith(t + "::") for t in task_types))
+            if _match_task_type(uid)
             and not (keep_fatal and isinstance(meta, dict) and meta.get("is_fatal"))
         ]
         if not to_delete:
@@ -202,7 +215,10 @@ class OpsConsole:
         failed = self._store.backend.load_failed()
         if job_uid not in failed:
             raise KeyError(f"job_uid {job_uid!r} not in failure archive")
-        task_type, _, job_id = job_uid.partition("::")
+        try:
+            task_type, job_id = parse_job_uid(job_uid)
+        except TaskLiteError:
+            task_type, _, job_id = job_uid.partition("::")
         payloads = self._store.backend.load_failure_payloads()
         # 激活代取轨迹最大值 +1（failed 拦截点放行 = 新激活代），attempt_no
         # 经 Job 模型默认归 1；payload 取档案快照（无快照回退空 dict）。
@@ -308,16 +324,12 @@ class OpsConsole:
                 f"job_uids must be a list/tuple of str, got {type(job_uids).__name__}"
             )
         for u in job_uids:
-            if not isinstance(u, str) or u.count("::") != 1:
+            try:
+                parse_job_uid(u)
+            except TaskLiteError as exc:
                 raise ValueError(
-                    f"seed_successes job_uid must be 'task_type::job_id' str with exactly "
-                    f"one '::' separator, got {u!r}"
-                )
-            task_type, job_id = u.split("::", 1)
-            if not task_type or not job_id:
-                raise ValueError(
-                    f"seed_successes job_uid must have non-empty task_type and job_id, got {u!r}"
-                )
+                    f"seed_successes job_uid must be a valid canonical 'task_type::job_id' str, got {u!r}"
+                ) from exc
         failed = self._store.backend.load_failed()
         queue_uids = set(self._store.state.queue_uids)
         queue_uids.update(job_uid_from_snapshot(jd) for jd in self._store.backend.load_queue())

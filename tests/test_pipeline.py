@@ -334,9 +334,12 @@ class TestRegisterTask:
             p.register_task("fetch")
 
     def test_simple_form_validates_task_type(self, tmp_path):
+        from tasklite import TaskLiteError
         p = make_pipeline(tmp_path)
-        with pytest.raises(ValueError, match="'::'"):
-            p.register_task("fe::tch", ok_handler)
+        with pytest.raises(TaskLiteError, match="non-empty str"):
+            p.register_task("", ok_handler)
+        p.register_task("fe::tch", ok_handler)
+        assert p.tasks.lookup("fe::tch").task_type == "fe::tch"
 
     def test_spec_form_rejects_stray_arguments(self, tmp_path):
         p = make_pipeline(tmp_path)

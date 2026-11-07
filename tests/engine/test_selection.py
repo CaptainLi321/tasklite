@@ -240,16 +240,15 @@ def test_selection_call_during_run_raises(tmp_path):
 
 
 def test_exclude_validation_and_unknown_task_type(fake_process, tmp_path):
-    with pytest.raises(TypeError):
+    from tasklite import TaskLiteError
+    with pytest.raises(TaskLiteError):
         Exclude(task_type=123)  # type: ignore[arg-type]
-    with pytest.raises(ValueError):
+    with pytest.raises(TaskLiteError):
         Exclude(task_type="")
-    with pytest.raises(ValueError):
-        Exclude(task_type="a::b")
-    with pytest.raises(TypeError):
+    assert Exclude(task_type="a::b").task_type == "a::b"
+    with pytest.raises(TaskLiteError):
         Skip(task_type=123)  # type: ignore[arg-type]
-    with pytest.raises(ValueError):
-        Skip(task_type="a::b")
+    assert Skip(task_type="a::b").task_type == "a::b"
     with pytest.raises(TypeError):
         Selection([object()])
 

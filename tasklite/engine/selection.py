@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
+from ..exceptions import TaskLiteError
 from ..models.job import Job
 from ..selection import Selection
 from .errorclass import ERR_DEPENDENCY_SKIPPED, ERR_SKIPPED
@@ -93,7 +94,7 @@ class SelectionMachine:
         for job_snapshot in queue:
             try:
                 parsed = Job.from_dict(job_snapshot)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, TaskLiteError):
                 continue  # 畸形行走既有 MALFORMED_JOB 归因
             rows[parsed.uid] = job_snapshot
             facts[parsed.uid] = (parsed.task_type, tuple(parsed.depends_on))
@@ -131,7 +132,7 @@ class SelectionMachine:
                 continue
             try:
                 job = Job.from_dict(queued_row)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, TaskLiteError):
                 continue
             if uid in seeds and self._selection.is_skipped(job.task_type):
                 error = ERR_SKIPPED
@@ -173,7 +174,7 @@ class SelectionMachine:
                     parsed.task_type,
                     tuple(parsed.depends_on),
                 )
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, TaskLiteError):
                 return None
             facts[uid] = (task_type, tuple(depends_on))
 
