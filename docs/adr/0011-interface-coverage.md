@@ -1,6 +1,6 @@
 # ADR-0011 公开 Interface 覆盖审计
 
-状态：**主要常用契约已裁决，授权管理、初始化／后端及发布接口细节待收口**。导出证据的代码基线为 `57b50b7`，覆盖状态随已接受设计更新。本文是设计工作清单，不是已发布手册，也不新增兼容承诺；已接受行为以 [ADR-0011](0011-stable-interface-baseline.md) 为准，实施顺序见 [ROADMAP](../ROADMAP.md)。不修改当前 GUIDE 来提前宣布尚未实现的接口。
+状态：**核心行为已裁决，独立静态可行性核查通过，最终签名／记录样本待完成**。导出证据的代码基线为 `57b50b7`，覆盖状态随已接受设计更新。本文是设计工作清单，不是已发布手册，也不新增兼容承诺；已接受行为以 [ADR-0011](0011-stable-interface-baseline.md) 为准，实施顺序见 [ROADMAP](../ROADMAP.md)。不修改当前 GUIDE 来提前宣布尚未实现的接口。
 
 ## 范围与方法
 
@@ -14,10 +14,10 @@
 
 | 功能 | 源码入口 | 本轮覆盖 | 冻结前要回答的问题 |
 | --- | --- | --- | --- |
-| 初始化与生命周期 | TaskLite.__init__/run/stop/is_running；目标 close | 部分覆盖 | 参数默认值与位置参数；初始化副作用及失败后资源释放；重复运行、关闭；多线程调用边界 |
-| 注册与模型 | register_task、Task、Job、TaskRegistry | 部分覆盖 | 重复注册禁止、可确定的提交错误立即拒绝已确认；具体错误类型及配置继承、payload_schema 校验、None 哨兵及 JSON 类型；快照字段与业务构造字段分离 |
+| 初始化与生命周期 | TaskLite.__init__/run/stop/is_running/close | 已确认行为 | backend 显式选择、state_path 默认 None、max_workers=4；内置后端自主管理、构造失败释放资源；单控制线程，stop 可跨线程；独立静态核查未发现阻断，运行验证留待实施 |
+| 注册与模型 | register_task、Task、Job、TaskRegistry | 部分覆盖 | 重复注册禁止、可确定的提交错误立即拒绝已确认；错误处理按统一契约；配置继承、payload_schema 校验、None 哨兵及 JSON 类型需在最终签名样本中核对；快照字段与业务构造字段分离 |
 | 提交与替换 | enqueue、ctx.spawn | 已确认契约 | 单 Job bool 返回、同配置去重异配置冲突；删除 front/replace_pending；声明先于引用，派生随父成功整体提交 |
-| 执行与重试 | TaskResult、Attempt、Job 四态 | 已确认方向 | attempt_no 按 Job 跨 Run 递增，删除 activation_no；结果字典必需字段与框架原因类型待最终签名表收口 |
+| 执行与重试 | TaskResult、Attempt、Job 四态 | 已确认方向 | attempt_no 按 Job 跨 Run 递增，删除 activation_no；结果字典必需字段待样本核定；框架原因仅说明与可得异常，不分类编码 |
 | 依赖 | Job.depends_on、FileSpec.from_output、governor | 已确认契约 | 禁止悬空引用；spawn 按声明顺序；活跃上游遮蔽旧成功；缺失、失败或成环直接失败；删除宽限与潜在派生者猜测 |
 | 启动规则 | 内置 Trigger；现有 register_trigger/TriggerContext | 已确认主要行为 | 跳过不作为成功证据；人工成功、档案清理及新 Run 重判按 ADR；扩展协议不冻结 |
 | 选择与排序 | Selection/Exclude/Skip、OrderingPolicy | 已确认主要行为 | 删除 Skip；排除及下游留队；按序选择最靠前可执行者；扩展协议暂不冻结 |
@@ -27,12 +27,12 @@
 | 文件管理 | FileSpec/from_output、declare_file/file_path | 已确认契约 | role 三内置值、清理默认否、Path 返回、上游显式依赖统一读取、允许路径重叠、不自动创建、删除缺失目标视为完成；无文件扩展或 handler 沙箱 |
 | handler 读状态 | has_succeeded/has_failed/succeeded_or_failed_job_uids | 已确认删除 | handler 不读取成败集合，依赖调度由主进程判断 |
 | 游标 | TaskLite/JobContext.get_cursor/set_cursor | 已确认契约 | 全局键、字符串值、None 删除、空字符串合法；worker 派发快照及自身暂存写，成功提交；主进程 Run 外直接读写；删除 seed_cursor |
-| 查询 | StateSnapshot | 已确认入口 | 仅 get_job/iter_jobs/iter_attempts，返回 JSON 兼容字典；无分表及门面重复查询；必需字段待汇总，内存后端接法待定 |
+| 查询 | StateSnapshot | 已确认入口 | 仅 get_job/iter_jobs/iter_attempts，返回 JSON 兼容字典；无分表及门面重复查询；必需字段样本待汇总；open 已支持路径／实例的目标签名 |
 | 管理与历史 | set_job_status、clear_history | 已确认契约 | 三种目标状态显式 recursive；完整快照、原子级联、不造 Attempt；明确历史删除范围；删除独立取消/重跑/人工成功/失败清理入口 |
 | 事件与统计 | on_run_start/on_attempt_finished/on_run_end、stats、RunSummary/RunStats | 已确认删除 | run() -> None；快照查询持久化事实，不承诺还原退出原因，不新增摘要状态 |
-| 错误与验证 | exceptions、ErrorClassifier、ERR_*、ValidationResult | 部分覆盖 | 自动异常重试已撤销后哪些符号删除；框架错误公开类型；原因码与消息边界；payload 校验是否保留独立工具 |
-| 进程执行条件 | strict_picklable、handler、worker 启动与超时 | 部分覆盖 | 支持的 callable/payload/平台组合及验证时点；已确认启动至有效结果的单次执行超时、不等待进程退出才结算；信号安装选项；外部程序进程树边界，不承诺 OS 沙箱 |
-| 后端 | AbstractStateBackend、SQLiteStateBackend、InMemoryStateBackend、backend 属性 | 部分覆盖 | 仅官方 SQLite/内存使用接口稳定，第三方协议不冻结；注入、所有权及关闭、内存模式与 StateSnapshot 接法待定 |
+| 错误与验证 | TaskLiteError、底层异常、失败记录 | 已确认契约 | 自有异常仅主动拒绝，底层原样传播；删除分类器/重试异常/ERR_*；失败记录 message/exception/metadata，无公开原因码 |
+| 进程执行条件 | handler、worker 启动与超时、run 信号 | 已确认主要行为 | 删除 strict_picklable，保留必要序列化校验；install_signals 默认 True，主线程安装失败明确抛错，后台线程显式 False；支持的 callable/平台在实施验收中写明 |
+| 后端 | TaskLite backend 选择、StateSnapshot.open | 已确认契约 | 仅 sqlite/memory，不注入自定义后端、不公开 setter；open 接受路径或 TaskLite 实例，内存仅实例生命周期，不新增 snapshot 别名 |
 | Discovery | register_discovery、DiscoveryHandler 及三协议 | 可选工具，暂不承诺兼容 | 全页命中、截断、坏项、on_missing；人工成功/取消失败/档案清除如何影响已见；多子任务整体接受后的行为 |
 | HTTP | HttpPolicy/HttpExecutor/guard 系列、响应、缓存、fetch | 可选工具，暂不承诺兼容 | 不靠异常隐式重试的易用接法；请求内部重试与 Job 重试关系；删除自动资源挂起；响应缓存的身份/有效性；是否保留多个包装入口 |
 | 测试与辅助函数 | fake_ctx/running、job_ref/progress_hook/slice_list | 可选工具，暂不承诺兼容 | 当前旧文档的稳定承诺在新基线切换时同步调整；删除 progress_hook；模拟授权往返和副作用；避免依赖内部结构 |
@@ -43,9 +43,9 @@
 
 | 现有入口 | 已接受的目标或待裁决事项 |
 | --- | --- |
-| __init__ | 三个 hook 参数已确认删除；name/state_dir/backend/output_roots/max_workers、pickle、异常分类、策略及三个调优参数，继续逐项核定保留与默认值 |
-| is_running | 可观察性已有，关闭与跨线程语义待固定 |
-| backend 属性及 setter | 是否允许外部替换及何时替换，待裁决；不能靠可访问推定稳定 |
+| __init__ | backend 必填、state_path=None、max_workers=4、output_roots=None；删除 name/state_dir、hook、pickle 开关、异常分类及三个调优参数 |
+| is_running | 保留；单控制线程编排，跨线程 stop；不承诺任意属性并发读写 |
+| backend 属性及 setter | 删除，不开放后端实例注入或替换 |
 | stats、on_run_start、on_attempt_finished、on_run_end 属性 | 全部删除，不提供替代订阅或统计面 |
 | register_resource、register_task、register_trigger | 能力保留，完整签名和校验契约待补 |
 | register_transient_exception | 已撤销异常自动映射重试；不保留同语义的注册入口 |
@@ -58,7 +58,7 @@
 | seed_successes | 删除；统一 set_job_status(..., "succeeded", recursive=...) |
 | seed_cursor | 删除；TaskLite/JobContext 对称 get_cursor/set_cursor |
 | stop | 幂等停止新派发，无 force；不阻塞等待在途，由 run 收尾 |
-| run | 正常完成或排空返回 None，框架故障抛异常；selection 已定，信号配置及其余参数待核定 |
+| run | 正常完成或排空返回 None；selection=None、install_signals=True；底层异常原样传播，不公开跳过库锁 |
 | run_graceful | 删除 |
 | 当前构造器暴露的 tasks/resources/classifier/runtime_config 等属性 | 内部可变状态不成为稳定 Interface；仍需逐名迁移/删除清单 |
 
@@ -67,7 +67,7 @@ ADR 新增而当前尚未实现的 make_job_uid、parse_job_uid、TaskResult、F
 ## 已确认的兼容范围
 
 1. **常用 Interface**：编排、规格与实例、handler 上下文及结果、文件声明、只读记录、明确的管理操作，纳入稳定基线。
-2. **本版收缩范围**：不设计或冻结资源扩展，不提供文件扩展，调度扩展暂不承诺兼容、不作为定稿门禁。内部保留抽象和 Seam；常用内置能力仍需明确行为。只承诺官方 SQLite／内存后端使用接口，不冻结第三方后端协议。
+2. **本版收缩范围**：不设计或冻结资源扩展，不提供文件扩展，调度扩展暂不承诺兼容、不作为定稿门禁。内部保留抽象和 Seam；常用内置能力仍需明确行为。只允许通过 TaskLite 选择官方 SQLite／内存后端，不开放第三方后端注入或协议。
 3. **可选工具**：HTTP、Discovery、测试辅助等本版本暂不保证兼容，文档必须标注。需要适配新核心，但不把这些工具的全面接口冻结作为本轮门禁。
 4. **身份工具例外**：make_job_uid／parse_job_uid 与 Job.uid 纳入稳定接口，本轮先完成可读性简化。旧编码工具逐个核查用途；纯文件 IPC／逐 Job 锁用途移除，不将文件名字符或长度规则带进公开身份。
 5. **内部 Implementation**：运行账目、注册表装配、调度状态机、底层事务校验器、可变容器不自动承诺稳定；仍需逐名整理导出清单。
@@ -84,7 +84,7 @@ ADR 新增而当前尚未实现的 make_job_uid、parse_job_uid、TaskResult、F
 2. 注册、初始化与校验：用重复注册、未知 Task、坏 payload、显式覆盖、初始化失败五类场景验证。
 3. 按已定契约验证依赖闭合、实际成环、资源等待、框架异常、正常停止排空与通知唤醒，不重新引入缺失依赖宽限。
 4. 按已定契约验证游标、查询和管理；handler 状态读取已删除，使用活跃候选/旧档案、人工成功、档案清除和并发游标提交检查边界。
-5. 官方后端完善使用接口；Discovery、HTTP、测试工具完成新核心适配，不要求可选工具本轮接口冻结，也不引入第二套隐式结果协议。
+5. 官方后端落实所有权与内存快照；Discovery、HTTP、测试工具完成新核心适配，不要求可选工具本轮接口冻结，也不引入第二套隐式结果协议。
 6. 汇总最终签名表：导入路径、参数/默认值、返回值、错误、允许调用阶段、副作用、持久化/恢复含义及最小验收场景。最后再做跨功能审查。
 
 Discovery 当前明确采用成功/失败快照作为已见集合，不维护扫描游标。应分析它与档案管理的耦合，而不是为它补造游标推进机制。HTTP 响应缓存与 FileSpec.cache 也不能仅因同名就假定相同生命周期。

@@ -69,16 +69,16 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 
 | 顺序 | 工作单元 | 面向公开 Interface 的验收重点 |
 | --- | --- | --- |
-| 1 | 定稿 ADR 所列剩余细节，确定发布和格式基线 | 没有把未决状态、参数或错误处理隐式固化到实现 |
-| 2 | TaskResult、业务 metadata 分离、完整 Job 快照与 Attempt | 三种返回结果、Job 四态与 successes/failures 命名、结算时追加 Attempt、统一状态管理原子恢复快照、跨 Run attempt_no 不复用、删除三个公开生命周期回调及 progress_hook，查询区分 Attempt 与 Job 结局、有效结果到达即结算、清理及资源释放后原子提交 |
+| 1 | 核对最终签名与记录样本、独立验证可行性，确定发布和格式基线 | 没有把未决状态、参数或错误处理隐式固化到实现 |
+| 2 | TaskResult、业务 metadata 分离、完整 Job 快照与 Attempt | 三种返回结果、Job 四态与 successes/failures 命名、结算时追加 Attempt、统一状态管理原子恢复快照、跨 Run attempt_no 不复用且清空历史后仍保留内部编号进度、删除三个公开生命周期回调及 progress_hook，查询区分 Attempt 与 Job 结局、有效结果到达即结算、清理及资源释放后原子提交 |
 | 3 | 每 Run 内存预算、Trigger 与生命周期 | 副作用前持久化 Job.running、Attempt 与 Job 去向原子结算、跨 Run 重判与预算重置、stop 与重复 Ctrl+C 幂等排空、run() 返回 None，删除 stats/RunSummary/RunStats、run_graceful 与公开强停入口、Trigger／Resource 等框架异常直接失败、不保证正常排空、遗留 running 幂等判失败 |
 | 4 | 单任务提交与成功事务 | 内容冲突、实例创建时统一路径基准、提交时固定配置、快照隔离、派生任务与游标整体提交、声明先于引用、派生按声明顺序校验、缺失或成环直接失败、删除 Skip 和缺失依赖宽限、重复注册拒绝、可确定提交错误立即拒绝 |
 | 5 | FileSpec 与主进程文件操作 | 预声明与动态声明取并集、判断执行前不删文件、role 三内置值、无 handler 沙箱、统一 Path 返回与 from_output 显式依赖、清理参数默认否、允许重叠路径、删除缺失视为完成、不自动创建、允许工作目录外路径、所有框架清理由主进程执行、清理失败即失败、删除后仍发布 output 描述、不增加跨 Job 路径锁 |
-| 6 | 授权与瞬时响应通道 | 首次询问、目录授权复用、拒绝后当前 Job 及依赖下游本次排除留队、无关任务继续、等待不阻断通信、旧回复拒绝 |
-| 7 | StateSnapshot 与管理操作 | 一致快照、真正只读、流式读取、状态库级执行／管理互斥、当前 Job 四态查询、set_job_status 三态显式 recursive、clear_history 显式范围、完整快照人工成功及 completion_source、主进程与 worker 对称游标、JSON 字典查询、删除重复管理查询及资源挂起接口 |
+| 6 | 授权与瞬时响应通道 | list_authorizations/revoke_authorization、TASKLITE_AUTO_APPROVE=1、首次询问、目录授权复用、拒绝后当前 Job 及依赖下游本次排除留队、无关任务继续、等待不阻断通信、旧回复拒绝 |
+| 7 | StateSnapshot 与管理操作 | 路径／TaskLite 实例打开一致快照、内存模式仅实例存活期、观察线程固定一致版本且不长期阻塞执行、真正只读、流式读取、状态库级执行／管理互斥、当前 Job 四态查询、set_job_status 三态显式 recursive、clear_history 显式范围、完整快照人工成功及 completion_source、主进程与 worker 对称游标、JSON 字典查询、删除重复管理查询及资源挂起接口 |
 | 8 | 内置资源与事件驱动等待 | 主线程唯一入口、多 worker 共用、按序选可执行者、资源三态及状态自管、无具体类型特判、授权后复查、一次计时与主动通知、无周期轮询、检查与等待之间不丢通知、无通知且无恢复时间不保证再次调度、内部协议不冻结为对外扩展 |
 | 9 | 身份接口与互斥边界 | make_job_uid/parse_job_uid 透明可逆、保留可打印字符、删除逐 Job worker 锁与专用文件名约束、保留状态库级互斥 |
-| 10 | wrappers、测试工具与公开导出收敛 | 可选工具暂不冻结兼容、同步 handler 唯一结果协议、无隐式异常重试、真实进程场景覆盖 |
+| 10 | wrappers、测试工具与公开导出收敛 | 构造采用 backend/state_path，内置后端生命周期与单控制线程、信号管理显式配置；TaskLiteError 与原样底层异常、无公开原因码；可选工具暂不冻结兼容、同步 handler 唯一结果协议、无隐式异常重试、真实进程场景覆盖 |
 | 11 | 文档切换与发布门禁 | 示例可执行、公开 Interface 契约样本、全量检查、基线格式样本与兼容策略 |
 
 各行可再拆为独立、自洽的原子提交，不合并无关变更。预算、文件往返通信、产物授权必须保留确定性并发与故障回归，不能仅通过返回形状单测验收。提交前执行全量 pytest 与 mypy；类型、签名或导入变更执行 test-matrix。不得因只重构 Interface 就删除仍保护系统不变式的测试。
