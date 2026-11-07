@@ -65,6 +65,8 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 
 公开 Interface 的覆盖审计见 [ADR-0011 覆盖清单](adr/0011-interface-coverage.md)。该清单区分已确认方向、部分覆盖和待系统分析，不作为新增行为契约；先逐项裁决公开范围，再冻结最终签名与兼容承诺。
 
+零上下文执行入口见 [ticket 队列](tickets/adr-0011/README.md)：调度者只读索引，执行 agent 按单票最小阅读包工作。票据是本节实施计划的工作单，行为契约仍只维护在 ADR。
+
 ### Module 实现地图
 
 本计划按 codebase-design 的 Depth、Locality 和 Interface 测试面组织工作；ADR 是行为依据，此处只规定代码归属与实施路径。下面的 Module 是职责集合，不要求为每一行新建类或目录。先复用已有单一出口，只有调用关系和测试需要时才移动文件；不以文件大小或类数量衡量 Depth。
