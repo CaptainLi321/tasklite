@@ -315,3 +315,35 @@ def test_authorization_denied_reverts_to_pending_and_excludes_downstream(tmp_pat
 
     # 下游 d1 在同 Run 内被排除，没有被派发
     assert "downstream::d1" not in p.backend.load_successes()
+
+
+def _overlapping_outputs_handler(job, ctx):
+    root = Path(job.payload["root"])
+    root.mkdir(exist_ok=True)
+    (root / "report").write_text("report")
+    if job.payload["dynamic"]:
+        ctx.declare_file("alias", FileSpec(root / "report", role="output"))
+        ctx.declare_file("directory", FileSpec(root, role="output"))
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("backend", ["sqlite", "memory"])
+def test_different_output_names_may_share_or_overlap_paths(tmp_path, dynamic, backend):
+    """不同文件名允许共用路径或父子路径，结算必须完整发布全部名称。"""
+    root = tmp_path / "bundle"
+    p = TaskLite(backend=backend, **({"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}))
+    p.register_task("work", _overlapping_outputs_handler)
+    files = {"report": FileSpec(root / "report", role="output")}
+    if not dynamic:
+        files.update(alias=FileSpec(root / "report", role="output"), directory=FileSpec(root, role="output"))
+    p.enqueue(Job("work", "one", files=files, payload={"root": str(root), "dynamic": dynamic}))
+    p.run()
+    assert p.backend.load_successes()["work::one"]["artifacts"] == {
+        "report": {"path": str(root / "report")},
+        "alias": {"path": str(root / "report")},
+        "directory": {"path": str(root)},
+    }
+    attempt, = p.backend.load_settled_attempts("work::one")
+    assert set(attempt["files"]) == {"report", "alias", "directory"}
+    p.close()

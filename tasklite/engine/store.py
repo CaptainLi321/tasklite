@@ -933,7 +933,11 @@ class StateStore:
         """原子终态转移：成功（同事务终结对应 attempts 行 + successes 落盘 + 清失败档案残行 + 子任务/cursor）。"""
         effective_finished_at = finished_at if finished_at is not None else utc_now_iso()
         success_metadata = copy.deepcopy(result_metadata) if result_metadata else {}
-        declarations = validate_artifact_declarations(declared_artifacts)
+        declarations = (
+            tuple(declared_artifacts)
+            if self._backend.schema_version >= TARGET_SCHEMA_VERSION
+            else validate_artifact_declarations(declared_artifacts)
+        )
         success_metadata["artifacts"] = {
             declaration.name: {"path": declaration.path}
             for declaration in declarations if declaration.name is not None
