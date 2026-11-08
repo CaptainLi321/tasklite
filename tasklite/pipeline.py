@@ -526,6 +526,29 @@ class TaskLite:
         self._ensure_not_running("seed_cursor")
         self._console.seed_cursor(key, value)
 
+    @property
+    def authorizer(self) -> Callable[[str, str], bool | None] | None:
+        """内部文件操作授权判定回调 (path, target_type) -> bool | None。"""
+        return self._runtime.store.authorizer
+
+    @authorizer.setter
+    def authorizer(self, value: Callable[[str, str], bool | None] | None) -> None:
+        self._runtime.store.authorizer = value
+
+    def list_authorizations(self) -> list[dict[str, Any]]:
+        """只读查询全部已持久化的授权记录，限 Run 外。"""
+        self._ensure_not_running("list_authorizations")
+        return self._runtime.store.list_authorizations()
+
+    def revoke_authorization(self, path: str | Path) -> bool:
+        """按规范绝对路径精确撤销授权，限 Run 外。
+
+        撤销精确匹配规范化路径，删除成功返回 True，不存在返回 False；
+        撤销目录下的某个子路径不能覆盖父目录授权，必须撤销对应目录记录。
+        """
+        self._ensure_not_running("revoke_authorization")
+        return self._runtime.store.revoke_authorization(path)
+
     # ── 运行与停机（六步之五/六）───────────────────────────────────
 
     def stop(self) -> None:

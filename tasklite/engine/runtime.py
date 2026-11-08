@@ -101,6 +101,7 @@ class EngineRuntime:
             classifier=config.classifier,
             trigger_registry=config.trigger_registry,
             requeue_policy=config.requeue_policy,
+            protected_roots=config.protected_roots,
         )
 
         self.channel: ExecutionChannel = config.channel
@@ -237,14 +238,23 @@ class EngineRuntime:
         # 3. 授权检查
         if bound_spec.delete_existing or bound_spec.delete_on_success or bound_spec.delete_on_failure:
             handle.pause_timeout()
-            try:
-                authorized = self.store.check_or_request_authorization(resolved_path)
-            finally:
+            authorized = self.store.check_or_request_authorization(resolved_path)
+            if authorized is True:
                 handle.resume_timeout()
-            if not authorized:
+            elif authorized is False:
+                handle.resume_timeout()
                 handle.auth_denied = True
                 self.channel.terminate_process(handle)
                 return {"request_id": req_id, "status": "denied"}
+            else:
+                handle.waiting_auth = True
+                handle.pending_declaration = {
+                    "req_id": req_id,
+                    "name": validated_name,
+                    "spec": bound_spec,
+                    "resolved_path": resolved_path,
+                }
+                return None
 
         # 4. 前置删除（若声明要求且目标存在）
         if bound_spec.delete_existing and os.path.exists(resolved_path):
@@ -312,6 +322,13 @@ class EngineRuntime:
     def request_stop(self) -> StopMode:
         """停机请求接口（单调状态转移，委托 RunSession，并唤醒运行循环）。"""
         mode = self._session.request_stop()
+        for handle in self._in_flight.active_handles():
+            if handle.waiting_auth:
+                handle.waiting_auth = False
+                handle.pending_declaration = None
+                handle.resume_timeout()
+                handle.auth_denied = True
+                self.channel.terminate_process(handle)
         self._notifier.notify()
         return mode
 
@@ -410,6 +427,8 @@ class EngineRuntime:
         worker_wait = 0.0
         dispatched = 0
         if not draining:
+            if any(h.waiting_auth for h in self._in_flight.active_handles()):
+                return last_outcome, worker_wait, dispatched
             while dispatched < limit and self._session.stop_mode is StopMode.NONE:
                 outcome = self._dispatch.dispatch_next()
                 last_outcome = outcome
@@ -486,6 +505,79 @@ class EngineRuntime:
             "completed with the queue preserved."
         )
 
+    def _poll_pending_authorizations(self) -> None:
+        """轮询处于等待中的文件声明授权；若已决策则恢复执行或终止。"""
+        is_stopping = self._session.stop_mode is not StopMode.NONE
+        for handle in self._in_flight.active_handles():
+            if not handle.waiting_auth:
+                continue
+            entry = self._in_flight.get(handle.job_uid)
+            decl = handle.pending_declaration
+            if decl is None or entry is None:
+                continue
+            req_id = decl["req_id"]
+            name = decl["name"]
+            spec = decl["spec"]
+            resolved_path = decl["resolved_path"]
+
+            if is_stopping:
+                handle.waiting_auth = False
+                handle.pending_declaration = None
+                handle.resume_timeout()
+                handle.auth_denied = True
+                self.channel.terminate_process(handle)
+                continue
+
+            authorized = self.store.check_or_request_authorization(resolved_path)
+            if authorized is True:
+                handle.waiting_auth = False
+                handle.pending_declaration = None
+                handle.resume_timeout()
+                if spec.delete_existing and os.path.exists(resolved_path):
+                    policy = ArtifactPathPolicy(
+                        output_roots=self.config.output_roots,
+                        protected_roots=self.config.protected_roots,
+                    )
+                    try:
+                        policy.remove_existing(ArtifactDeclaration(resolved_path, delete_existing=True))
+                    except OSError as exc:
+                        handle.auth_denied = True
+                        self.channel.terminate_process(handle)
+                        reply_sender = self.channel.get_reply_sender(handle.execution_id)
+                        if reply_sender is not None:
+                            try:
+                                reply_sender.send_reply({
+                                    "request_id": req_id,
+                                    "status": "error",
+                                    "error": f"Pre-deletion failed: {exc}",
+                                })
+                            except OSError:
+                                pass
+                        continue
+                entry.active_files[name] = spec
+                reply_sender = self.channel.get_reply_sender(handle.execution_id)
+                if reply_sender is not None:
+                    try:
+                        reply_sender.send_reply({
+                            "request_id": req_id,
+                            "status": "ok",
+                            "resolved_path": resolved_path,
+                        })
+                    except OSError:
+                        pass
+            elif authorized is False:
+                handle.waiting_auth = False
+                handle.pending_declaration = None
+                handle.resume_timeout()
+                handle.auth_denied = True
+                self.channel.terminate_process(handle)
+                reply_sender = self.channel.get_reply_sender(handle.execution_id)
+                if reply_sender is not None:
+                    try:
+                        reply_sender.send_reply({"request_id": req_id, "status": "denied"})
+                    except OSError:
+                        pass
+
     def _drain_and_settle(self) -> int:
         """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
         if not self._in_flight:
@@ -513,6 +605,8 @@ class EngineRuntime:
                 logger.info("Pipeline drained. Saving queue and exiting.")
                 self._recovery.save_queue_crash_safe()
                 return self._terminal_outcome()
+
+        self._poll_pending_authorizations()
 
         if store.state.is_empty and not self._in_flight:
             return self._terminal_outcome()

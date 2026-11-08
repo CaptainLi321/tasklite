@@ -405,8 +405,8 @@ class Job:
             trigger=data.get("trigger"),
             # runtime 子 dict 显式保留——边带状态只存这一处
             runtime=data.get("runtime", {}),
-            attempt_no=data.get("attempt_no", 1),
-            activation_no=data.get("activation_no", 1),
+            attempt_no=data["attempt_no"] if data.get("attempt_no") is not None else 1,
+            activation_no=data["activation_no"] if data.get("activation_no") is not None else 1,
             first_enqueued_at=data.get("first_enqueued_at"),
         )
 

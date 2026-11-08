@@ -129,6 +129,7 @@ class StateStore:
         trigger_registry: TriggerRegistry | None = None,
         requeue_policy: RequeuePolicy | None = None,
         base_dir: str | Path | None = None,
+        protected_roots: Sequence[str | Path] = (),
     ) -> None:
         self._backend = backend
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
@@ -147,7 +148,10 @@ class StateStore:
         )
         self._exclude: Exclude | None = None
         self._temporary_excluded_uids: set[str] = set()
-        self.authorizer: Callable[[str, str], bool] | None = None
+        self.protected_roots: tuple[Path, ...] = tuple(
+            Path(root).resolve() for root in protected_roots
+        )
+        self.authorizer: Callable[[str, str], bool | None] | None = None
 
     @property
     def base_dir(self) -> Path:
@@ -584,10 +588,31 @@ class StateStore:
 
     # ── 路径授权管理与判定 ──────────────────────────────────────────
 
+    def is_path_protected(self, path: str | Path) -> bool:
+        """检查路径是否与受保护根目录（如状态目录）重叠。"""
+        try:
+            raw = Path(os.fspath(path))
+            target = (self.base_dir / raw).resolve() if not raw.is_absolute() else raw.resolve()
+        except Exception:
+            return True
+        for root in self.protected_roots:
+            try:
+                if root.is_relative_to(target) or target.is_relative_to(root):
+                    return True
+            except (ValueError, TypeError):
+                pass
+        return False
+
     def is_path_authorized(self, path: str | Path) -> bool:
         """检查指定规范绝对路径是否命中已有授权。"""
-        norm_path = os.path.normpath(os.fspath(path))
-        return self._backend.is_path_authorized(norm_path)
+        raw = Path(os.fspath(path))
+        target = (self.base_dir / raw).resolve() if not raw.is_absolute() else raw.resolve()
+        norm_path = os.path.normpath(str(target))
+        if self._backend.is_path_authorized(norm_path):
+            return True
+        if str(path) != norm_path and self._backend.is_path_authorized(os.path.normpath(os.fspath(path))):
+            return True
+        return False
 
     def record_authorization(
         self,
@@ -597,7 +622,9 @@ class StateStore:
         authorized_at: str | None = None,
     ) -> None:
         """持久化记录一条文件系统路径授权。"""
-        norm_path = os.path.normpath(os.fspath(path))
+        raw = Path(os.fspath(path))
+        target = (self.base_dir / raw).resolve() if not raw.is_absolute() else raw.resolve()
+        norm_path = os.path.normpath(str(target))
         self._backend.record_authorization(norm_path, target_type, authorized_at=authorized_at)
 
     def list_authorizations(self) -> list[dict[str, Any]]:
@@ -606,14 +633,23 @@ class StateStore:
 
     def revoke_authorization(self, path: str | Path) -> bool:
         """按规范绝对路径精确撤销授权。"""
-        norm_path = os.path.normpath(os.fspath(path))
-        return self._backend.revoke_authorization(norm_path)
+        raw = Path(os.fspath(path))
+        target = (self.base_dir / raw).resolve() if not raw.is_absolute() else raw.resolve()
+        norm_path = os.path.normpath(str(target))
+        res = self._backend.revoke_authorization(norm_path)
+        if not res and str(path) != norm_path:
+            res = self._backend.revoke_authorization(os.path.normpath(os.fspath(path)))
+        return res
 
     def check_or_request_authorization(
         self, path: str | Path, target_type: str | None = None
-    ) -> bool:
-        """检查已有授权或发起内部授权询问；已授权或同意持久化记录并返回 True。"""
-        norm_path = os.path.normpath(os.fspath(path))
+    ) -> bool | None:
+        """检查已有授权或发起内部授权询问；已授权或同意持久化记录并返回 True，等待返回 None，拒绝返回 False。"""
+        if self.is_path_protected(path):
+            return False
+        raw = Path(os.fspath(path))
+        target = (self.base_dir / raw).resolve() if not raw.is_absolute() else raw.resolve()
+        norm_path = os.path.normpath(str(target))
         if self._backend.is_path_authorized(norm_path):
             return True
         effective_type = (
@@ -625,9 +661,14 @@ class StateStore:
             self._backend.record_authorization(norm_path, effective_type)
             return True
         if self.authorizer is not None and callable(self.authorizer):
-            if self.authorizer(norm_path, effective_type):
+            res = self.authorizer(norm_path, effective_type)
+            if res is True:
                 self._backend.record_authorization(norm_path, effective_type)
                 return True
+            elif res is False:
+                return False
+            elif res is None:
+                return None
             return False
         return False
 

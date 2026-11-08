@@ -749,6 +749,12 @@ class ExecutionChannel:
             except Exception:
                 pass
 
+    def get_reply_sender(self, execution_id: str | None) -> WorkerReplySender | None:
+        """获取指定 execution_id 的回复发送端。"""
+        if not execution_id:
+            return None
+        return self._reply_senders.get(execution_id)
+
     def _close_handle_pipe(self, execution_id: str | None) -> None:
         if not execution_id:
             return
@@ -864,6 +870,8 @@ class ExecutionChannel:
                         except Exception:
                             pass
                     self._close_handle_pipe(exec_id)
+                    self._results.pop(exec_id, None)
+                    self._errors.pop(exec_id, None)
                     self._finalize_process(p)
                     decoded = ExecutionResult(
                         success=False,
@@ -914,8 +922,8 @@ class ExecutionChannel:
                 completed.append((handle, self._collect_outcome(handle)))
                 continue
 
-            # 4. 超时：从启动到结果到达计单次超时
-            if now > handle.timeout_at_monotonic:
+            # 4. 超时：从启动到结果到达计单次超时（等待授权期间暂停不计）
+            if not handle.waiting_auth and now > handle.timeout_at_monotonic:
                 p.join(timeout=0.5)
                 if p.is_alive():
                     try:
@@ -943,6 +951,8 @@ class ExecutionChannel:
             finally:
                 self._finalize_process(p)
                 self._close_handle_pipe(exec_id)
+            self._results.pop(exec_id, None)
+            self._errors.pop(exec_id, None)
             return ExecutionResult(
                 success=False,
                 transient_kind="authorization_denied",

@@ -669,7 +669,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                         target = copy.deepcopy(requeued_job_snapshot if requeued_job_snapshot is not None else j)
                         target["status"] = "pending"
                         target["run_id"] = None
-                        target["attempt_no"] = None
+                        target["attempt_no"] = target.get("attempt_no") or 1
                         target["started_at"] = None
                         new_queue[idx] = target
                         found = True
@@ -685,7 +685,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                         target = copy.deepcopy(j)
                         target["status"] = "pending"
                         target["run_id"] = None
-                        target["attempt_no"] = None
+                        target["attempt_no"] = target.get("attempt_no") or 1
                         target["started_at"] = None
                         new_queue[idx] = target
                         break

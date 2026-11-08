@@ -90,6 +90,8 @@ class JobHandle:
     execution_id: str | None = None
     auth_denied: bool = False
     paused_remaining: float | None = None
+    waiting_auth: bool = False
+    pending_declaration: dict[str, Any] | None = None
 
     def pause_timeout(self) -> None:
         """等待外部授权或操作时暂停超时计时。"""
