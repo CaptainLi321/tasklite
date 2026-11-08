@@ -110,6 +110,10 @@ class CompletionMachine:
                 execution_id=entry.execution_id if entry.execution_id is not None else (
                     entry.handle.execution_id if entry.handle is not None else None
                 ),
+                attempt_no=entry.attempt_no,
+                run_id=entry.run_id or getattr(self._session, "run_id", "run"),
+                started_at=entry.started_at,
+                entry=entry,
             )
         except _JobTerminated:
             # commit 连续失败达阈值 → job 已失败档案终结（正常终态）。
@@ -148,6 +152,10 @@ class CompletionMachine:
         expect_in_flight: bool = True,
         attempt_id: int | None = None,
         execution_id: str | None = None,
+        attempt_no: int = 1,
+        run_id: str | None = None,
+        started_at: str | None = None,
+        entry: InFlightJob | None = None,
     ) -> None:
         """事务性提交一个执行结果到后端并同步内存。
 
@@ -186,11 +194,42 @@ class CompletionMachine:
             if missing_output is not None:
                 result.success = False
                 result.message = missing_output
+
+        spawned_job_snapshots: list[dict[str, Any]] = []
+        if result.success and result.spawned_jobs:
+            try:
+                spawned_job_snapshots = self._collect_spawned_job_snapshots(uid, result.spawned_jobs)
+            except Exception as err:
+                logger.error(f"Spawned jobs validation failed for {uid}: {err}")
+                result.success = False
+                result.message = f"Invalid spawned job: {err}"
+                spawned_job_snapshots = []
+
+        if result.success and result.cursor_updates:
+            for k, v in result.cursor_updates.items():
+                if not isinstance(k, str) or not k or (v is not None and not isinstance(v, str)):
+                    result.success = False
+                    result.message = f"Invalid cursor update: {k!r}={v!r}"
+                    break
+
         self._channel.journal.cleanup_declared_artifacts(declarations, success=result.success)
+
+        # 释放资源（必须在事务提交之前完成）
+        if entry is not None:
+            entry.release_resources(self._resources)
 
         # 2. 状态分发
         if result.retry_requested:
-            self._apply_retry(uid, job, job_snapshot, result, attempt_id=attempt_id)
+            self._apply_retry(
+                uid,
+                job,
+                job_snapshot,
+                result,
+                attempt_id=attempt_id,
+                attempt_no=attempt_no,
+                run_id=run_id,
+                started_at=started_at,
+            )
         elif result.success:
             self._apply_success(
                 uid,
@@ -201,10 +240,21 @@ class CompletionMachine:
                 execution_id=execution_id,
                 declared_artifacts=declarations,
                 declared_inputs=inputs,
+                attempt_no=attempt_no,
+                run_id=run_id,
+                started_at=started_at,
+                spawned_job_snapshots=spawned_job_snapshots,
             )
         else:
             self._apply_failure(
-                uid, job_snapshot, result, started_monotonic=started_monotonic, attempt_id=attempt_id
+                uid,
+                job_snapshot,
+                result,
+                started_monotonic=started_monotonic,
+                attempt_id=attempt_id,
+                attempt_no=attempt_no,
+                run_id=run_id,
+                started_at=started_at,
             )
 
     # ── 三态分支 ──────────────────────────────────────────────────────
@@ -217,6 +267,9 @@ class CompletionMachine:
         result: ExecutionResult,
         *,
         attempt_id: int | None = None,
+        attempt_no: int = 1,
+        run_id: str | None = None,
+        started_at: str | None = None,
     ) -> None:
         """重试分支：预算判定 → retry_job_snapshot 组装 → store.apply_retry。
 
@@ -252,9 +305,15 @@ class CompletionMachine:
                     failure_metadata["last_retry_error"] = rt_state.last_retry_error
                 if retry_error:
                     failure_metadata["retry_error"] = retry_error
-                self._store.apply_failure(
-                    uid, failure_metadata, job_snapshot=job_snapshot, cascade=True,
+                self._apply_failure(
+                    uid,
+                    job_snapshot,
+                    result,
                     attempt_id=attempt_id,
+                    attempt_no=attempt_no,
+                    run_id=run_id,
+                    started_at=started_at,
+                    failure_record_override=failure_metadata,
                 )
                 result.will_retry = False
                 return
@@ -263,15 +322,24 @@ class CompletionMachine:
         retry_job_snapshot = self._build_retry_job_snapshot(
             job, job_snapshot, retry_error=retry_error, is_transient=is_transient
         )
-        next_attempt = job.attempt_no
-        logger.info(f"RETRY: {uid} (attempt {next_attempt}/{max_retries + 1})")
+        logger.info(f"RETRY: {uid} (attempt {attempt_no})")
         self._store.apply_retry(
             uid,
             job_snapshot,
             retry_job_snapshot,
             transient_kind=transient_kind,
             attempt_id=attempt_id,
+            attempt_no=attempt_no,
+            run_id=run_id or self._session.run_id,
+            started_at=started_at,
             error_message=retry_error,
+            files=job_snapshot.get("files"),
+            result={
+                "status": "retry",
+                "message": result.message,
+                "metadata": result.result_metadata,
+                "consume_budget": result.consume_budget,
+            },
         )
         result.will_retry = True
 
@@ -313,12 +381,15 @@ class CompletionMachine:
         execution_id: str | None = None,
         declared_artifacts: Sequence[ArtifactDeclaration] = (),
         declared_inputs: Sequence[str] = (),
+        attempt_no: int = 1,
+        run_id: str | None = None,
+        started_at: str | None = None,
+        spawned_job_snapshots: Sequence[dict[str, Any]] = (),
     ) -> None:
         """成功分支：子任务去重规范化、successes 记录与 cursor 推进。"""
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
-        spawned_job_snapshots = self._collect_spawned_job_snapshots(uid, result.spawned_jobs)
         success_metadata = dict(result.result_metadata or {})
 
         self._store.apply_success(
@@ -328,25 +399,25 @@ class CompletionMachine:
             cursor_updates=result.cursor_updates,
             declared_inputs=declared_inputs,
             declared_artifacts=declared_artifacts,
-            run_id=self._session.run_id,
+            run_id=run_id or self._session.run_id,
             job_snapshot=job_snapshot,
             attempt_id=attempt_id,
             execution_id=execution_id,
+            attempt_no=attempt_no,
+            started_at=started_at,
+            files=job_snapshot.get("files"),
+            result={
+                "status": "success",
+                "message": result.message,
+                "metadata": success_metadata,
+            },
         )
         result.will_retry = False
 
     def _collect_spawned_job_snapshots(
         self, parent_uid: str, spawned_jobs: Sequence[Job]
     ) -> list[dict[str, Any]]:
-        """动态子任务去重与规范化。
-
-        去重规则：批内同 uid 只留首个；queue/in-flight 命中无条件拦截
-        （同轮不重复派发/并发双跑，优先于 trigger 豁免）；successes/failed 命中
-        经 TriggerRegistry 准入判定。规范化经 store.normalize_spawned_job
-        （策略注入 + 资源注入 + 首入队时间 + 序列化预检）；不可序列化的
-        坏子作业独立登记失败终态（拒绝语义），不连坐父作业的成功提交、
-        不触发 commit 崩溃契约。
-        """
+        """动态子任务去重与规范化。"""
         store = self._store
         spawned_job_snapshots: list[dict[str, Any]] = []
         if not spawned_jobs:
@@ -367,35 +438,9 @@ class CompletionMachine:
             unique_spawned_jobs.append(spawned_job)
 
         for spawned_job in unique_spawned_jobs:
-            try:
-                spawned_job_snapshots.append(store.normalize_spawned_job(spawned_job))
-            except (ValueError, Exception) as err:
-                self._reject_spawned_job(spawned_job, err)
+            spawned_job_snapshots.append(store.normalize_spawned_job(spawned_job))
         logger.debug(f"Spawned {len(spawned_job_snapshots)} jobs for {parent_uid}.")
         return spawned_job_snapshots
-
-    def _reject_spawned_job(self, job: Job, err: Exception) -> None:
-        """坏子作业（不可 JSON 序列化）经 ``complete_job`` 单一出口终结。
-
-        伪 entry（无资源租约、无进程、未派发故无 IPC 产物与轨迹行）承载
-        派发拒绝语义的失败结果，与崩溃残留恢复共用完整收尾契约：失败
-        终态登记（``apply_failure`` 收敛、级联下游）与收尾钩子恰好一次。
-        ``_CommitCrashSignal``（后端环境故障）穿透上抛，交由崩溃契约处理。
-        """
-        logger.error(
-            f"Spawned job {job.uid} rejected: not JSON-serializable: {err}"
-        )
-        entry = InFlightTracker.create_pseudo_entry(job.uid, job.to_dict(), job)
-        self.complete_job(
-            entry,
-            ExecutionResult(
-                success=False,
-                message=(
-                    f"INVALID_SPAWNED_JOB: job dict is not "
-                    f"JSON-serializable: {err}"
-                ),
-            ),
-        )
 
     def _apply_failure(
         self,
@@ -405,6 +450,10 @@ class CompletionMachine:
         *,
         started_monotonic: float | None = None,
         attempt_id: int | None = None,
+        attempt_no: int | None = None,
+        run_id: str | None = None,
+        started_at: str | None = None,
+        failure_record_override: dict[str, Any] | None = None,
     ) -> None:
         """永久失败分支：写入失败档案与级联阻断下游（不污染 result.result_metadata）。"""
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
@@ -412,18 +461,32 @@ class CompletionMachine:
             f"FAIL: {uid} (duration {duration:.2f}s, sent to failure archive). "
             f"Message: {result.message}, Meta: {result.result_metadata}"
         )
-        failure_record: dict[str, Any] = copy.deepcopy(result.result_metadata)
-        if result.message is not None and "error_message" not in failure_record:
-            failure_record["error_message"] = result.message
-        if result.message is not None and "message" not in failure_record:
-            failure_record["message"] = result.message
-        if result.exception is not None and "exception" not in failure_record:
-            failure_record["exception"] = copy.deepcopy(result.exception)
-        if "metadata" not in failure_record:
-            failure_record["metadata"] = copy.deepcopy(result.result_metadata)
+        failure_record: dict[str, Any] = failure_record_override if failure_record_override is not None else copy.deepcopy(result.result_metadata)
+        if failure_record_override is None:
+            if result.message is not None and "error_message" not in failure_record:
+                failure_record["error_message"] = result.message
+            if result.message is not None and "message" not in failure_record:
+                failure_record["message"] = result.message
+            if result.exception is not None and "exception" not in failure_record:
+                failure_record["exception"] = copy.deepcopy(result.exception)
+            if "metadata" not in failure_record:
+                failure_record["metadata"] = copy.deepcopy(result.result_metadata)
+
         self._store.apply_failure(
-            uid, failure_record, job_snapshot=job_snapshot, cascade=True,
+            uid,
+            failure_record,
+            job_snapshot=job_snapshot,
+            cascade=True,
             attempt_id=attempt_id,
+            attempt_no=attempt_no,
+            run_id=run_id or self._session.run_id,
+            started_at=started_at,
+            files=job_snapshot.get("files"),
+            result={
+                "status": "failure",
+                "message": result.message,
+                "metadata": result.result_metadata,
+            },
         )
         result.will_retry = False
 

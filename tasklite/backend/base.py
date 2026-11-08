@@ -93,6 +93,8 @@ def validate_attempt_finish(outcome: Any, finished_at: Any, error_message: Any) 
 
 
 class AbstractStateBackend(ABC):
+    schema_version: int = 5
+
     """管线状态持久化抽象契约（SQLite / Memory 双腿共同口径）。
 
     语义分组：

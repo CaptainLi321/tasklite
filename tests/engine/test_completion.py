@@ -417,8 +417,8 @@ class TestSpawnedJobs:
         rows = [jd for jd in env.store.state.queue if jd["job_id"] == "a"]
         assert len(rows) == 1
 
-    def test_unserializable_spawned_job_rejected_not_parent(self, tmp_path):
-        """坏子作业独立进失败档案，父作业成功提交不受连坐。"""
+    def test_unserializable_spawned_job_rejects_parent(self, tmp_path):
+        """非法子作业导致父作业失败，整个派生集合与游标不发布。"""
         env = CompletionEnv(tmp_path)
 
         class Unserializable:
@@ -435,10 +435,10 @@ class TestSpawnedJobs:
             ),
             attempt_id=entry.attempt_id,
         )
-        assert "parent::p1" in env.store.state.successes
-        assert "child::bad" in env.store.state.failed
-        assert "INVALID_SPAWNED_JOB" in env.store.state.failed["child::bad"]["error_message"]
-        # 伪 entry 无轨迹行：拒绝路径不落 attempt
+        assert "parent::p1" not in env.store.state.successes
+        assert "parent::p1" in env.store.state.failed
+        assert "Invalid spawned job" in env.store.state.failed["parent::p1"]["error_message"]
+        assert "child::bad" not in env.store.state.failed
         assert env.backend.load_attempts("child::bad") == []
 
 

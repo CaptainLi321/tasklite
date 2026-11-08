@@ -65,7 +65,9 @@ if TYPE_CHECKING:
             done_entries: Sequence[tuple[InFlightJob, ExecutionResult]],
         ) -> None: ...
 
+from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from ..models.state import PipelineState, job_uid_from_snapshot
+from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import loads
 from .resource import (
     ENGINE_METADATA_RESOURCE_SUSPENSIONS,
@@ -107,7 +109,55 @@ class RecoveryOrchestrator:
         successes = backend.load_successes()
         failed = backend.load_failed()
         cursors = backend.load_cursors()
-        queue_snapshots = backend.load_queue()
+
+        if backend.schema_version >= TARGET_SCHEMA_VERSION:
+            queue_rows = backend.load_queue_jobs()
+            for row in queue_rows:
+                u = row["job_uid"]
+                if row.get("status") == "running" and (u in successes or u in failed):
+                    raise RuntimeError(
+                        f"Invariant conflict: Job {u!r} is running in queue but already present in terminal records "
+                        f"(successes={u in successes}, failed={u in failed})"
+                    )
+
+            recovered_any = False
+            for row in queue_rows:
+                if row.get("status") == "running":
+                    u = row["job_uid"]
+                    att_no = row.get("attempt_no") or 1
+                    r_id = row.get("run_id") or "unknown"
+                    st_at = row.get("started_at")
+                    job_snap = row.get("job")
+                    msg = "上次执行未完成结算，实际结果未知"
+                    fail_meta = {
+                        "error_message": msg,
+                        "reason": "unsettled_running_recovery",
+                        "run_id": r_id,
+                        "attempt_no": att_no,
+                    }
+                    payload = job_snap.get("payload") if isinstance(job_snap, dict) else None
+                    backend.commit_job_settlement(
+                        job_uid=u,
+                        outcome="failure",
+                        attempt_no=att_no,
+                        run_id=r_id,
+                        settled_at=utc_now_iso(),
+                        started_at=st_at,
+                        job_snapshot=job_snap,
+                        error_message=msg,
+                        failure_metadata=fail_meta,
+                        payload=payload,
+                    )
+                    failed[u] = fail_meta
+                    recovered_any = True
+
+            if recovered_any:
+                queue_rows = backend.load_queue_jobs()
+            queue_snapshots = [
+                row["job"] for row in queue_rows if row.get("status") == "pending"
+            ]
+        else:
+            queue_snapshots = backend.load_queue()
 
         # 启动期队列整理与资源挂起加载（终态交集先收敛，后续修复与
         # 六集合互斥断言都依赖 successes/failed 互斥前提）

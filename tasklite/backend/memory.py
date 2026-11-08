@@ -67,6 +67,8 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     def load_queue(self) -> list[dict[str, Any]]:
         with self._lock:
+            if self.schema_version >= 6:
+                return [copy.deepcopy(j) for j in self._queue if j.get("status", "pending") == "pending"]
             return copy.deepcopy(self._queue)
 
     # 整表重写 -------------------------------------------------------
@@ -428,16 +430,45 @@ class InMemoryStateBackend(AbstractStateBackend):
     def load_attempts(self, job_uid: str) -> list[AttemptRecord]:
         """按 job_uid 读取轨迹（dict 插入序 = 自增 id 序）。"""
         with self._lock:
-            return [rec for rec in self._attempts.values() if rec.job_uid == job_uid]
+            records: list[AttemptRecord] = []
+            for rec in self._attempts.values():
+                if isinstance(rec, AttemptRecord) and rec.job_uid == job_uid:
+                    records.append(rec)
+                elif isinstance(rec, dict) and rec.get("job_uid") == job_uid:
+                    raw_outcome = str(rec.get("outcome") or "")
+                    outcome_map = {
+                        "success": "succeeded",
+                        "retry": "requeued",
+                        "failure": "failed",
+                    }
+                    mapped_outcome = outcome_map.get(raw_outcome, raw_outcome)
+                    st_at = rec.get("started_at") or "1970-01-01T00:00:00+00:00"
+                    fn_at = rec.get("settled_at") or st_at
+                    records.append(
+                        AttemptRecord(
+                            job_uid=rec["job_uid"],
+                            activation_no=1,
+                            attempt_no=rec.get("attempt_no", 1),
+                            execution_id=f"{rec.get('run_id')}.{rec.get('attempt_no', 1)}",
+                            run_id=rec.get("run_id") or "run",
+                            started_at=st_at,
+                            finished_at=fn_at,
+                            outcome=mapped_outcome or "failed",
+                            error_message=rec.get("error_message"),
+                        )
+                    )
+            return records
 
     def load_latest_succeeded_finished_at(self, job_uid: str) -> str | None:
         """按 attempt_id 倒序查找指定 job_uid 最新一条 succeeded 轨迹行的 finished_at。"""
         with self._lock:
-            for rec in reversed(self._attempts.values()):
-                if rec.job_uid == job_uid and rec.outcome == "succeeded":
-                    if isinstance(rec.finished_at, str) and rec.finished_at:
-                        return rec.finished_at
-                    return None
+            for rec in reversed(list(self._attempts.values())):
+                rec_uid = rec.job_uid if isinstance(rec, AttemptRecord) else rec.get("job_uid")
+                rec_outcome = rec.outcome if isinstance(rec, AttemptRecord) else rec.get("outcome")
+                if rec_uid == job_uid and rec_outcome in ("succeeded", "success"):
+                    ts = rec.finished_at if isinstance(rec, AttemptRecord) else (rec.get("settled_at") or rec.get("finished_at"))
+                    if isinstance(ts, str) and ts:
+                        return ts
             return None
 
     # 元数据 ---------------------------------------------------------
@@ -469,7 +500,12 @@ class InMemoryStateBackend(AbstractStateBackend):
             if job_data.get("status") == "running":
                 raise ValueError(f"Job {job_uid} is already running")
 
-            next_no = self._job_sequences.get(job_uid, 0) + 1
+            current_seq = self._job_sequences.get(job_uid)
+            if current_seq is not None:
+                next_no = current_seq + 1
+            else:
+                q_att = job_data.get("attempt_no")
+                next_no = q_att if (isinstance(q_att, int) and q_att >= 1) else 1
             self._job_sequences[job_uid] = next_no
 
             updated_job = copy.deepcopy(job_data)

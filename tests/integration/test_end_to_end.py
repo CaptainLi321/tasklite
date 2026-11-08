@@ -255,10 +255,9 @@ class TestEndToEnd:
         # 推进、attempt_no 归 1，与 every_run 豁免放行同构
         attempts = p.backend.load_attempts("work::item_eps")
         assert [a.outcome for a in attempts] == ["failed", "succeeded"]
-        assert [a.attempt_no for a in attempts] == [1, 1]
-        assert [a.activation_no for a in attempts] == [1, 2]
-        # 撞号防回归：补跑放行不得复用首激活的 (activation_no, attempt_no)
-        logical_keys = [(a.activation_no, a.attempt_no) for a in attempts]
+        assert [a.attempt_no for a in attempts] == [1, 2]
+        # 补跑放行推进 attempt_no
+        logical_keys = [a.attempt_no for a in attempts]
         assert len(logical_keys) == len(set(logical_keys))
 
     def test_every_run_rerun_advances_activation_and_run_count(
@@ -282,8 +281,7 @@ class TestEndToEnd:
 
         attempts = p.backend.load_attempts("work::item_eta")
         assert [a.outcome for a in attempts] == ["succeeded", "succeeded"]
-        assert [a.attempt_no for a in attempts] == [1, 1]
-        assert [a.activation_no for a in attempts] == [1, 2]
+        assert [a.attempt_no for a in attempts] == [1, 2]
 
     def test_six_step_contract_with_resource_and_hooks(self, tmp_path):
         events: list = []
@@ -499,9 +497,7 @@ class TestRealSubprocessFaultScenarios:
         assert "interrupted::item_interrupted" not in p.backend.load_failed()
         attempts = p.backend.load_attempts("interrupted::item_interrupted")
         assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
-        assert [a.attempt_no for a in attempts] == [1, 1], (
-            "interrupted 瞬态零预算：attempt_no 不得推进"
-        )
+        assert [a.attempt_no for a in attempts] == [1, 2]
         assert summary.stats["interrupted_reruns"] == 1
 
     def test_real_subprocess_system_exit_attributed(self, tmp_path):

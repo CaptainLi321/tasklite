@@ -57,6 +57,9 @@ class InFlightJob:
     # store 落终态；伪条目（拒绝路径）为 None。
     attempt_id: int | None = None
     execution_id: str | None = None
+    attempt_no: int = 1
+    run_id: str = ""
+    started_at: str | None = None
 
     def __post_init__(self) -> None:
         if self.lease is None:

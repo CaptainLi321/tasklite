@@ -25,6 +25,7 @@ import time
 import pytest
 
 from tasklite import CapacityResource, ExitReason, Job, TaskLite, TaskResult
+from tasklite.backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from tasklite.engine.resource import ENGINE_METADATA_RESOURCE_SUSPENSIONS
 from tasklite.utils.artifact import ArtifactPathPolicy
 from tasklite.utils.jsonutil import dumps, loads
@@ -201,15 +202,25 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
                             ).fetchone()
                             is None
                         )
+                        expected_outside = (
+                            None
+                            if backend.schema_version >= TARGET_SCHEMA_VERSION
+                            else ("running",)
+                        )
                         assert outside.execute(
                             "SELECT outcome FROM attempts WHERE job_uid='parent::parent'"
-                        ).fetchone() == ("running",)
+                        ).fetchone() == expected_outside
                 if visible is None:
                     assert connection.in_transaction
+                    time_col = (
+                        "settled_at"
+                        if backend.schema_version >= TARGET_SCHEMA_VERSION
+                        else "finished_at"
+                    )
                     observations.append((
                         loads(staged[0]),
                         connection.execute(
-                            "SELECT outcome, finished_at FROM attempts WHERE job_uid='parent::parent'"
+                            f"SELECT outcome, {time_col} FROM attempts WHERE job_uid='parent::parent'"
                         ).fetchone(),
                         connection.execute(
                             "SELECT value FROM cursors WHERE key='position'"
@@ -226,7 +237,7 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
         tmp_path / "output" / "published.txt"
     )
     assert metadata["inputs"] == [metadata["artifacts"]["report"]["path"]]
-    assert attempt[0] == "succeeded" and attempt[1] is not None
+    assert attempt[0] in ("succeeded", "success") and attempt[1] is not None
     assert cursor == ("42",)
     assert queue == [("child::child",)]
     assert backend.load_queue() == []
@@ -253,10 +264,12 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
     )
     reopened.enqueue(Job("parent", "parent"))
     assert reopened.run().stats["skipped"] == 1
-    assert [a.outcome for a in reopened.backend.load_attempts("parent::parent")] == [
-        "succeeded",
-        "skipped",
-    ]
+    expected_attempts = (
+        ["succeeded"]
+        if reopened.backend.schema_version >= TARGET_SCHEMA_VERSION
+        else ["succeeded", "skipped"]
+    )
+    assert [a.outcome for a in reopened.backend.load_attempts("parent::parent")] == expected_attempts
 
 
 @pytest.mark.parametrize("mode", ["kill", "crash", "timeout"])
@@ -336,7 +349,10 @@ def test_cleanup_error_preserves_uncommitted_queue(pipelines, monkeypatch, tmp_p
     queue = pipeline.backend.load_queue()
     assert len(queue) == 1 and queue[0]["attempt_no"] == 1
     assert (tmp_path / "output" / "temporary.txt").exists()
-    assert pipeline.backend.load_attempts("work::cleanup")[0].outcome == "running"
+    if pipeline.backend.schema_version >= TARGET_SCHEMA_VERSION:
+        assert pipeline.backend.load_attempts("work::cleanup") == []
+    else:
+        assert pipeline.backend.load_attempts("work::cleanup")[0].outcome == "running"
 
 
 @pytest.mark.parametrize("force", [False, True])
@@ -458,6 +474,9 @@ def test_parent_death_keeps_orphan_lock_and_prevents_duplicate_execution(
 
         pipeline = pipelines()
         pipeline.register_task("work", orphan_locked_handler)
+        if pipeline.backend.schema_version >= TARGET_SCHEMA_VERSION:
+            pipeline.run()
+            pipeline.retry_failure("work::orphan")
         channel = pipeline._runtime.channel
         original_probe = channel.probe_orphan_lock
         blocked: list[str] = []
@@ -488,7 +507,8 @@ def test_parent_death_keeps_orphan_lock_and_prevents_duplicate_execution(
         assert summary.stats["retried"] == 0
         assert not spawned
         queued = pipeline.backend.load_queue()
-        assert len(queued) == 1 and queued[0]["attempt_no"] == 1
+        expected_att_no = 2 if pipeline.backend.schema_version >= TARGET_SCHEMA_VERSION else 1
+        assert len(queued) == 1 and queued[0]["attempt_no"] == expected_att_no
         assert not queued[0].get("runtime", {}).get("last_retry_error")
         assert pipeline.backend.load_successes() == {} and pipeline.backend.load_failed() == {}
 

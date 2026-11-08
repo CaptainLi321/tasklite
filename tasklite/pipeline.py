@@ -19,7 +19,7 @@ from typing import Any, Callable, Sequence
 
 from .backend.base import AbstractStateBackend
 from .backend.memory import InMemoryStateBackend
-from .backend.sqlite_backend import SQLiteStateBackend
+from .backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
 from .engine.admission import RequeuePolicy, TriggerRegistry
 from .models.trigger import TriggerContext
 from .engine.channel import ExecutionChannel
@@ -204,12 +204,20 @@ class TaskLite:
         """持久化后端装配：字符串名或实例 → (backend, 标准名)。"""
         if isinstance(backend, str):
             if backend == _BACKEND_SQLITE:
-                return (
-                    SQLiteStateBackend(self.state_dir / f"{self.name}_state.db"),
-                    _BACKEND_SQLITE,
-                )
+                db_path = self.state_dir / f"{self.name}_state.db"
+                try:
+                    be: AbstractStateBackend = SQLiteStateBackend(
+                        db_path,
+                        schema_version=TARGET_SCHEMA_VERSION,
+                    )
+                except TypeError:
+                    be = SQLiteStateBackend(db_path)
+                return (be, _BACKEND_SQLITE)
             if backend == _BACKEND_MEMORY:
-                return InMemoryStateBackend(), _BACKEND_MEMORY
+                return (
+                    InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION),
+                    _BACKEND_MEMORY,
+                )
             raise ValueError(
                 f"Unknown backend: {backend!r}. Supported backends are "
                 f"'sqlite' and 'memory'."

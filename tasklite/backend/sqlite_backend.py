@@ -20,6 +20,7 @@ from .base import (
 )
 from ..models.attempt import AttemptRecord
 from ..models.state import job_uid_from_snapshot
+from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import dumps, loads
 
 logger = logging.getLogger("tasklite")
@@ -381,7 +382,12 @@ class SQLiteStateBackend(AbstractStateBackend):
             return []
         try:
             with self._get_conn() as conn:
-                cursor = conn.execute('SELECT job_snapshot FROM queue ORDER BY queue_position ASC')
+                if self.schema_version >= TARGET_SCHEMA_VERSION:
+                    cursor = conn.execute(
+                        "SELECT job_snapshot FROM queue WHERE status = 'pending' ORDER BY queue_position ASC"
+                    )
+                else:
+                    cursor = conn.execute('SELECT job_snapshot FROM queue ORDER BY queue_position ASC')
                 return [loads(row[0]) for row in cursor]
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(f"Failed to load queue from {self.path.name}: {e}") from e
@@ -885,16 +891,32 @@ class SQLiteStateBackend(AbstractStateBackend):
         validate_attempt_dispatch(record)
         try:
             with self._get_conn() as conn:
-                cur = conn.execute(
-                    'INSERT INTO attempts (job_uid, activation_no, attempt_no, '
-                    'execution_id, run_id, started_at, finished_at, outcome, error_message) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    (
-                        record.job_uid, record.activation_no, record.attempt_no,
-                        record.execution_id, record.run_id, record.started_at,
-                        record.finished_at, record.outcome, record.error_message,
-                    ),
-                )
+                if self.schema_version >= TARGET_SCHEMA_VERSION:
+                    cur = conn.execute(
+                        'INSERT INTO attempts (job_uid, attempt_no, '
+                        'run_id, started_at, settled_at, outcome, error_message) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                        (
+                            record.job_uid,
+                            record.attempt_no,
+                            record.run_id,
+                            record.started_at,
+                            record.finished_at or record.started_at or utc_now_iso(),
+                            "success" if record.outcome == "succeeded" else ("retry" if record.outcome == "requeued" else record.outcome),
+                            record.error_message,
+                        ),
+                    )
+                else:
+                    cur = conn.execute(
+                        'INSERT INTO attempts (job_uid, activation_no, attempt_no, '
+                        'execution_id, run_id, started_at, finished_at, outcome, error_message) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        (
+                            record.job_uid, record.activation_no, record.attempt_no,
+                            record.execution_id, record.run_id, record.started_at,
+                            record.finished_at, record.outcome, record.error_message,
+                        ),
+                    )
                 return int(cur.lastrowid)
         except Exception as e:
             logger.critical(
@@ -927,16 +949,24 @@ class SQLiteStateBackend(AbstractStateBackend):
                 ).fetchone()
                 if row is None:
                     return False
-                if row[0] != "running":
+                if row[0] not in ("running", "pending"):
                     raise ValueError(
                         f"attempt {attempt_id} already finalized with outcome "
                         f"{row[0]!r}; double finalization is a protocol violation"
                     )
-                conn.execute(
-                    'UPDATE attempts SET outcome = ?, finished_at = ?, error_message = ? '
-                    'WHERE attempt_id = ?',
-                    (outcome, finished_at, error_message, attempt_id),
-                )
+                mapped_outcome = "success" if outcome == "succeeded" else ("retry" if outcome == "requeued" else outcome)
+                if self.schema_version >= TARGET_SCHEMA_VERSION:
+                    conn.execute(
+                        'UPDATE attempts SET outcome = ?, settled_at = ?, error_message = ? '
+                        'WHERE attempt_id = ?',
+                        (mapped_outcome, finished_at, error_message, attempt_id),
+                    )
+                else:
+                    conn.execute(
+                        'UPDATE attempts SET outcome = ?, finished_at = ?, error_message = ? '
+                        'WHERE attempt_id = ?',
+                        (outcome, finished_at, error_message, attempt_id),
+                    )
                 return True
         except Exception as e:
             logger.critical(
@@ -949,16 +979,37 @@ class SQLiteStateBackend(AbstractStateBackend):
             return []
         try:
             with self._get_conn() as conn:
-                rows = conn.execute(
-                    'SELECT job_uid, activation_no, attempt_no, execution_id, '
-                    'run_id, started_at, finished_at, outcome, error_message '
-                    'FROM attempts WHERE job_uid = ? ORDER BY attempt_id ASC',
-                    (job_uid,),
-                ).fetchall()
-                return [
-                    AttemptRecord.from_dict(dict(zip(_TABLE_COLUMNS["attempts"][1:], row)))
-                    for row in rows
-                ]
+                if self.schema_version >= TARGET_SCHEMA_VERSION:
+                    rows = conn.execute(
+                        'SELECT job_uid, attempt_no, run_id, started_at, settled_at, outcome, error_message '
+                        'FROM attempts WHERE job_uid = ? ORDER BY attempt_id ASC',
+                        (job_uid,),
+                    ).fetchall()
+                    return [
+                        AttemptRecord(
+                            job_uid=r[0],
+                            activation_no=1,
+                            attempt_no=r[1],
+                            execution_id=f"{r[2]}.{r[1]}",
+                            run_id=r[2],
+                            started_at=r[3],
+                            finished_at=r[4],
+                            outcome="succeeded" if r[5] == "success" else ("requeued" if r[5] == "retry" else ("failed" if r[5] == "failure" else r[5])),
+                            error_message=r[6],
+                        )
+                        for r in rows
+                    ]
+                else:
+                    rows = conn.execute(
+                        'SELECT job_uid, activation_no, attempt_no, execution_id, '
+                        'run_id, started_at, finished_at, outcome, error_message '
+                        'FROM attempts WHERE job_uid = ? ORDER BY attempt_id ASC',
+                        (job_uid,),
+                    ).fetchall()
+                    return [
+                        AttemptRecord.from_dict(dict(zip(_TABLE_COLUMNS_V5["attempts"][1:], row)))
+                        for row in rows
+                    ]
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(
                 f"Failed to load attempts for {job_uid!r} from {self.path.name}: {e}"
@@ -969,12 +1020,20 @@ class SQLiteStateBackend(AbstractStateBackend):
             return None
         try:
             with self._get_conn() as conn:
-                row = conn.execute(
-                    "SELECT finished_at FROM attempts "
-                    "WHERE job_uid = ? AND outcome = 'succeeded' "
-                    "ORDER BY attempt_id DESC LIMIT 1",
-                    (job_uid,),
-                ).fetchone()
+                if self.schema_version >= TARGET_SCHEMA_VERSION:
+                    row = conn.execute(
+                        "SELECT settled_at FROM attempts "
+                        "WHERE job_uid = ? AND outcome = 'success' "
+                        "ORDER BY attempt_id DESC LIMIT 1",
+                        (job_uid,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT finished_at FROM attempts "
+                        "WHERE job_uid = ? AND outcome = 'succeeded' "
+                        "ORDER BY attempt_id DESC LIMIT 1",
+                        (job_uid,),
+                    ).fetchone()
                 if row is None or not isinstance(row[0], str) or not row[0]:
                     return None
                 return row[0]
@@ -1020,7 +1079,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         with self._get_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             row = conn.execute(
-                'SELECT status FROM queue WHERE job_uid = ?',
+                'SELECT status, attempt_no FROM queue WHERE job_uid = ?',
                 (job_uid,),
             ).fetchone()
             if row is None:
@@ -1032,7 +1091,11 @@ class SQLiteStateBackend(AbstractStateBackend):
                 'SELECT last_attempt_no FROM job_sequences WHERE job_uid = ?',
                 (job_uid,),
             ).fetchone()
-            next_no = (seq_row[0] + 1) if seq_row is not None else 1
+            if seq_row is not None:
+                next_no = seq_row[0] + 1
+            else:
+                q_attempt_no = row[1] if row[1] is not None else None
+                next_no = q_attempt_no if (isinstance(q_attempt_no, int) and q_attempt_no >= 1) else 1
 
             conn.execute(
                 'INSERT OR REPLACE INTO job_sequences (job_uid, last_attempt_no) VALUES (?, ?)',

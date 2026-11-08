@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 
         def __contains__(self, task_type: object) -> bool: ...
 
+from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.attempt import ATTEMPT_REQUEUED
 from ..models.context import JobContext
@@ -71,6 +72,7 @@ from .resource import RateLimitUnavailable
 from .scheduler import ScheduleResult, StandstillFacts
 from .types import AttemptOutcome
 from .wait import IN_FLIGHT_POLL_SECONDS
+from ..utils.clock import utc_now_iso
 
 logger = logging.getLogger("tasklite")
 
@@ -189,14 +191,15 @@ class DispatchMachine:
             job_snapshot = store.state.pop_job(sched.runnable_idx)
             job = Job.from_dict(job_snapshot)
             job_uid = job.uid
-            attempt_id: int | None = None
-            try:
-                attempt_id, _ = self._open_attempt(job)
-            except Exception as e:
-                logger.warning(
-                    f"Attempt trace append degraded for dependency failed {job_uid}: {e}"
-                )
-                attempt_id = None
+            attempt_id = None
+            if store.backend.schema_version < TARGET_SCHEMA_VERSION:
+                try:
+                    attempt_id, _ = self._open_attempt(job)
+                except Exception as e:
+                    logger.warning(
+                        f"Attempt trace append degraded for dependency failed {job_uid}: {e}"
+                    )
+                    attempt_id = None
             self.dispatch_dep_failed(
                 job_uid, job_snapshot, pending_dep_failure, attempt_id=attempt_id
             )
@@ -209,64 +212,112 @@ class DispatchMachine:
         job = Job.from_dict(peek_snapshot)
         job_uid = job.uid
 
-        # 首次激活准入 (attempt_no <= 1) vs 激活内故障重试 (attempt_no > 1)
-        if job.attempt_no <= 1:
+        # 准入求值（同 Run 内由 TaskResult.retry 产生的再次尝试不重复求值；新 Run 重新求值）
+        is_session_retry = (
+            getattr(self._session, "get_retry_count", lambda _: 0)(job_uid) > 0
+            or (store.backend.schema_version < TARGET_SCHEMA_VERSION and job.attempt_no > 1)
+        )
+        if not is_session_retry:
             should_run = self._trigger_registry.admit(
                 peek_snapshot, store.state, baseline_lookup=store.trusted_last_succeeded_at_us
             )
             if not should_run:
                 job_snapshot = store.state.pop_job(sched.runnable_idx)
                 attempt_id = None
-                try:
-                    attempt_id, _ = self._open_attempt(job)
-                except Exception as e:
-                    logger.warning(
-                        f"Attempt trace append degraded for skipped {job_uid}: {e}"
-                    )
-                    attempt_id = None
+                if store.backend.schema_version < TARGET_SCHEMA_VERSION:
+                    try:
+                        attempt_id, _ = self._open_attempt(job)
+                    except Exception as e:
+                        logger.warning(
+                            f"Attempt trace append degraded for skipped {job_uid}: {e}"
+                        )
+                        attempt_id = None
                 store.apply_skip(job_uid, job_snapshot=job_snapshot, attempt_id=attempt_id)
                 store.state.mark_trigger_skipped(job_uid)
                 return None
 
-            job.activation_no = max(
-                (record.activation_no for record in store.backend.load_attempts(job_uid)),
-                default=0,
-            ) + 1
-            job_snapshot = store.state.pop_job(sched.runnable_idx)
-            job_snapshot["activation_no"] = job.activation_no
-
-        else:
-            job_snapshot = store.state.pop_job(sched.runnable_idx)
-
-        attempt_id = None
-        try:
-            attempt_id, execution_id = self._open_attempt(job)
-        except Exception as e:
-            logger.critical(
-                f"Failed to open attempt row for {job_uid}: {e}; "
-                f"requeueing and aborting dispatch without starting handler."
-            )
-            store.state.requeue_jobs([job_snapshot], front=True)
-            raise _CommitCrashSignal(
-                f"Failed to append attempt row for {job_uid} ({e}). "
-                f"Job preserved in queue without starting handler."
-            ) from e
-        except BaseException:
-            store.state.requeue_jobs([job_snapshot], front=True)
-            raise
+            if store.backend.schema_version < TARGET_SCHEMA_VERSION and job.attempt_no <= 1:
+                job.activation_no = max(
+                    (record.activation_no for record in store.backend.load_attempts(job_uid)),
+                    default=0,
+                ) + 1
+                peek_snapshot["activation_no"] = job.activation_no
 
         if job.task_type not in self._tasks:
+            job_snapshot = store.state.pop_job(sched.runnable_idx)
+            attempt_id = None
+            if store.backend.schema_version < TARGET_SCHEMA_VERSION:
+                try:
+                    attempt_id, _ = self._open_attempt(job)
+                except Exception as e:
+                    logger.warning(
+                        f"Attempt trace append degraded for missing handler {job_uid}: {e}"
+                    )
+                    attempt_id = None
             if self.dispatch_no_handler(
                 job_uid, job_snapshot, job.task_type, attempt_id=attempt_id
             ):
                 return None
+
+        job_snapshot = store.state.pop_job(sched.runnable_idx)
+        if store.backend.schema_version < TARGET_SCHEMA_VERSION:
+            job_snapshot["activation_no"] = job.activation_no
+        started_at = utc_now_iso()
+        attempt_id = None
+        attempt_no = 1
+
+        if store.backend.schema_version >= TARGET_SCHEMA_VERSION:
+            execution_id = f"{self._session.run_id}.{self._session.next_dispatch_no()}"
+            try:
+                attempt_no = store.mark_job_running(
+                    job_uid, run_id=self._session.run_id or "run", started_at=started_at
+                )
+                job.attempt_no = attempt_no
+                job_snapshot["attempt_no"] = attempt_no
+                job_snapshot["run_id"] = self._session.run_id
+                job_snapshot["started_at"] = started_at
+            except Exception as e:
+                logger.critical(
+                    f"Failed to mark job running for {job_uid}: {e}; "
+                    f"requeueing and aborting dispatch without starting handler."
+                )
+                store.state.requeue_jobs([job_snapshot], front=True)
+                raise _CommitCrashSignal(
+                    f"Failed to mark job running for {job_uid} ({e}). "
+                    f"Job preserved in queue without starting handler."
+                ) from e
+        else:
+            try:
+                attempt_id, execution_id = self._open_attempt(job)
+            except Exception as e:
+                logger.critical(
+                    f"Failed to open attempt row for {job_uid}: {e}; "
+                    f"requeueing and aborting dispatch without starting handler."
+                )
+                store.state.requeue_jobs([job_snapshot], front=True)
+                raise _CommitCrashSignal(
+                    f"Failed to append attempt row for {job_uid} ({e}). "
+                    f"Job preserved in queue without starting handler."
+                ) from e
+            except BaseException:
+                store.state.requeue_jobs([job_snapshot], front=True)
+                raise
+
         if self.dispatch_orphan_probe(job_uid, job_snapshot, attempt_id=attempt_id):
             return None
         self._drain_signals_before_reserve(job_uid)
         self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
 
         try:
-            return self._spawn_entry(job_uid, job, job_snapshot, attempt_id, execution_id)
+            return self._spawn_entry(
+                job_uid,
+                job,
+                job_snapshot,
+                attempt_id,
+                execution_id,
+                attempt_no=attempt_no,
+                started_at=started_at,
+            )
         except _CommitCrashSignal:
             # _CommitCrashSignal 继承 BaseException——「commit 失败需崩溃」
             # 的信号不会被 except Exception 兜底误吞。re-raise 让它穿透到
@@ -402,6 +453,9 @@ class DispatchMachine:
         job_snapshot: dict,
         attempt_id: int | None,
         execution_id: str,
+        *,
+        attempt_no: int = 1,
+        started_at: str | None = None,
     ) -> InFlightJob | None:
         """两阶段资源租约 → 载荷校验 → 执行上下文组装 → spawn → 在飞登记。
 
@@ -440,6 +494,9 @@ class DispatchMachine:
                     lease=lease,
                     attempt_id=attempt_id,
                     execution_id=execution_id,
+                    attempt_no=attempt_no,
+                    run_id=self._session.run_id or "run",
+                    started_at=started_at,
                 )
                 # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
                 self._in_flight.track(entry, state=store.state)
