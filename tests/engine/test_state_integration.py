@@ -213,3 +213,36 @@ def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypat
         assert attempts[0]["outcome"] == "failure"
         assert "work::one" in reopened.backend.load_failed()
         assert effect.read_text() == "effect\n"
+
+
+def duplicate_spawn_handler(job, ctx):
+    ctx.spawn(Job("child", "fresh"))
+    if job.payload["mode"] == "batch":
+        ctx.spawn(Job("child", "same", payload={"version": 1}))
+    ctx.spawn(Job("child", "same", payload={"version": 2 if job.payload["conflict"] else 1}))
+    ctx.set_cursor("offset", "unpublished")
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("mode", ["batch", "pending"])
+@pytest.mark.parametrize("conflict", [False, True])
+def test_spawn_duplicate_configuration_checked_before_atomic_publication(tmp_path, mode, conflict):
+    """同批或忙时重复必须比较有效配置，冲突拒绝父成功及全部暂存效果。"""
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db", max_workers=1) as p:
+        p.register_task("parent", duplicate_spawn_handler)
+        p.register_task("child", child_consumer_handler)
+        p.enqueue(Job("parent", "one", payload={"mode": mode, "conflict": conflict}))
+        if mode == "pending":
+            p.enqueue(Job("child", "same", payload={"version": 1}))
+        p.run()
+        successes = p.backend.load_successes()
+        if conflict:
+            assert "parent::one" in p.backend.load_failed()
+            assert "configuration" in p.backend.load_failed()["parent::one"]["error_message"]
+            assert "child::fresh" not in successes
+            assert p.get_cursor("offset") is None
+            assert ("child::same" in successes) == (mode == "pending")
+        else:
+            assert {"parent::one", "child::same", "child::fresh"} <= successes.keys()
+            assert len(p.backend.load_settled_attempts("child::same")) == 1
+            assert p.get_cursor("offset") == "unpublished"

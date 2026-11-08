@@ -808,3 +808,21 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
     assert not env.in_flight
     assert len(env.hooks) == 1
     assert env.hooks[0][0] == second.uid
+
+
+def test_inflight_duplicate_spawn_compares_effective_configuration(tmp_path):
+    """在途同 UID 配置冲突拒绝父成功，不影响既有在途执行。"""
+    env = CompletionEnv(tmp_path)
+    child = Job("child", "same", payload={"version": 1})
+    env.track_entry(child, attempt_id=env.open_attempt(child))
+    parent = Job("parent", "one")
+    entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
+    env.completion.apply_result(
+        parent.uid, parent, entry.job_snapshot,
+        ExecutionResult(success=True, spawned_jobs=[Job("child", "same", payload={"version": 2})], cursor_updates={"offset": "bad"}),
+        attempt_id=entry.attempt_id,
+    )
+    assert parent.uid in env.store.state.failed
+    assert "configuration" in env.store.state.failed[parent.uid]["error_message"]
+    assert child.uid in env.store.state.in_flight_uids
+    assert env.backend.load_cursors() == {}

@@ -33,11 +33,12 @@ if TYPE_CHECKING:
     from .store import StateStore
 
 from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
-from ..exceptions import _ArtifactIOError, _CommitCrashSignal, _JobTerminated
+from ..exceptions import TaskLiteError, _ArtifactIOError, _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
 from ..models.artifact import ArtifactDeclaration, FileSpec
 from ..utils.artifact import ArtifactPathPolicy
 from ..utils.clock import utc_now_iso
+from .admission import extract_effective_job_config
 from .channel import ArtifactCleanupMode, ExecutionResult, JobHandle
 from .errorclass import ERR_MAX_RETRIES
 from .in_flight import InFlightJob, InFlightTracker
@@ -538,22 +539,26 @@ class CompletionMachine:
                     )
             allowed_uids.add(spawned_job.uid)
 
-        seen_in_batch: set[str] = set()
-        unique_spawned_jobs: list[Job] = []
+        busy_snapshots = {
+            Job.from_dict(snapshot).uid: snapshot for snapshot in store.state.queue
+        }
+        busy_snapshots.update({
+            uid: active.job_snapshot for uid, active in self._in_flight.items()
+        })
+        accepted: dict[str, dict[str, Any]] = {}
         for spawned_job in spawned_jobs:
             spawned_uid = spawned_job.uid
-            if spawned_uid in seen_in_batch:
-                logger.debug(f"Skipping duplicate spawn for {spawned_uid}.")
+            snapshot = store.normalize_spawned_job(spawned_job)
+            previous = accepted.get(spawned_uid, busy_snapshots.get(spawned_uid))
+            if previous is not None:
+                effective_previous = store.normalize_spawned_job(Job.from_dict(previous))
+                if extract_effective_job_config(effective_previous) != extract_effective_job_config(snapshot):
+                    raise TaskLiteError(
+                        f"Spawned job {spawned_uid!r} conflicts with existing effective configuration"
+                    )
                 continue
-            # 忙时去重：排队中或在途作业不重复入队；候选统一入队保留，由依赖就绪后求值
-            if spawned_uid in store.state.queue_uids or spawned_uid in store.state.in_flight_uids:
-                logger.debug(f"Skipping spawn for busy {spawned_uid}.")
-                continue
-            seen_in_batch.add(spawned_uid)
-            unique_spawned_jobs.append(spawned_job)
-
-        for spawned_job in unique_spawned_jobs:
-            spawned_job_snapshots.append(store.normalize_spawned_job(spawned_job))
+            accepted[spawned_uid] = snapshot
+            spawned_job_snapshots.append(snapshot)
         logger.debug(f"Spawned {len(spawned_job_snapshots)} jobs for {parent_uid}.")
         return spawned_job_snapshots
 
