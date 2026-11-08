@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tasklite import Job, StateSnapshot, TaskLite, TaskResult
 from tasklite.wrappers.http import (
     FatalError,
     HttpExecutor,
@@ -926,6 +927,8 @@ def test_snapshot_cached_urllib_native_response_status_passthrough() -> None:
 # ==============================================================================
 
 class _TestHttpHandler(BaseHTTPRequestHandler):
+    flaky_counts: dict[str, int] = {}
+
     def do_GET(self) -> None:
         if self.path == "/json":
             self.send_response(200)
@@ -941,6 +944,18 @@ class _TestHttpHandler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             self.wfile.write(b"server error")
+        elif self.path == "/flaky":
+            count = self.flaky_counts.get("c", 0) + 1
+            self.flaky_counts["c"] = count
+            if count == 1:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"flaky server error")
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status": "ok", "recovered": true}')
         elif self.path.startswith("/echo"):
             self.send_response(200)
             self.end_headers()
@@ -1259,3 +1274,89 @@ class TestHttpExecutorRetryWaitShape:
         assert len(jitter_calls) == 2
         assert jitter_calls[0] == (-0.25, 0.25)
         assert jitter_calls[1] == (-0.25, 0.25)
+
+
+# ==============================================================================
+# 8. 真实核心集成测试（TaskLite + HTTP Wrapper）
+# ==============================================================================
+
+def _fetch_success_handler(job: Job, ctx: Any) -> TaskResult:
+    resp = urllib_fetch(job.payload["url"])
+    data = resp.json()
+    return TaskResult.success(metadata={"result": data["msg"]})
+
+
+def _fetch_fatal_handler(job: Job, ctx: Any) -> TaskResult:
+    try:
+        urllib_fetch(job.payload["url"])
+    except FatalError as e:
+        return TaskResult.failure(message=str(e), metadata={"code": 404})
+    return TaskResult.success()
+
+
+def _fetch_flaky_handler(job: Job, ctx: Any) -> TaskResult:
+    try:
+        resp = urllib_fetch(job.payload["url"])
+    except RetryError:
+        return TaskResult.retry(message="server temporary error", consume_budget=True)
+    return TaskResult.success(metadata=resp.json())
+
+
+class TestHttpTaskLiteIntegration:
+    """真实 TaskLite 核心管线与 HTTP wrapper 集成。
+
+    契约：
+    1. HTTP 失败由 handler 显式捕获后构造 TaskResult（success/failure/retry），
+       框架核心不依赖隐式异常重试；
+    2. 真实集成覆盖成功、确定性失败与瞬态重试场景。
+    """
+
+    def test_http_fetch_success_in_pipeline(self, local_http_server: str, tmp_path: Path) -> None:
+        """成功场景：handler 发送 HTTP 请求获取 200，构造 TaskResult.success 返回。"""
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "http_succ.db")
+        app.register_task("http_job", _fetch_success_handler)
+        app.enqueue(Job("http_job", "j1", payload={"url": f"{local_http_server}/json"}))
+        app.run()
+
+        with StateSnapshot.open(app) as snap:
+            rec = snap.get_job("http_job::j1")
+            assert rec is not None
+            assert rec["status"] == "succeeded"
+            assert rec["result"] is not None
+            assert rec["result"]["metadata"]["result"] == "hello"
+
+    def test_http_fetch_fatal_failure_in_pipeline(self, local_http_server: str, tmp_path: Path) -> None:
+        """确定性失败场景：handler 遇到 404 FatalError，构造 TaskResult.failure 返回。"""
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "http_fatal.db")
+        app.register_task("http_fatal_job", _fetch_fatal_handler)
+        app.enqueue(Job("http_fatal_job", "j_fail", payload={"url": f"{local_http_server}/missing_404"}))
+        app.run()
+
+        with StateSnapshot.open(app) as snap:
+            rec = snap.get_job("http_fatal_job::j_fail")
+            assert rec is not None
+            assert rec["status"] == "failed"
+            assert rec["result"] is not None
+            assert rec["result"]["metadata"]["code"] == 404
+            assert "Fatal error" in rec["result"]["message"]
+
+    def test_http_fetch_retry_in_pipeline(self, local_http_server: str, tmp_path: Path) -> None:
+        """瞬态重试场景：handler 遇到 500 RetryError，构造 TaskResult.retry 返回并在第二次重试时成功。"""
+        _TestHttpHandler.flaky_counts.clear()
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "http_retry.db")
+        app.register_task("http_flaky_job", _fetch_flaky_handler, max_retries_per_run=3)
+        app.enqueue(Job("http_flaky_job", "j_retry", payload={"url": f"{local_http_server}/flaky"}))
+        app.run()
+
+        with StateSnapshot.open(app) as snap:
+            rec = snap.get_job("http_flaky_job::j_retry")
+            assert rec is not None
+            assert rec["status"] == "succeeded"
+            assert rec["result"] is not None
+            assert rec["result"]["metadata"]["recovered"] is True
+            attempts = list(snap.iter_attempts(job_uid="http_flaky_job::j_retry"))
+            assert len(attempts) == 2
+            assert attempts[0]["outcome"] == "retry"
+            assert attempts[1]["outcome"] == "success"
+
+

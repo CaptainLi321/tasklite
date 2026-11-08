@@ -1,8 +1,12 @@
 """TaskLite v2 官方轻量 HTTP 网络工具库。
 
+注意：本模块为可选工具，本版本暂不承诺向后兼容与冻结扩展协议。
+HTTP 请求失败由 handler 显式捕获后构造并返回 TaskResult（TaskResult.failure / TaskResult.retry），
+框架核心不通过隐式重试异常控制 handler，也不自动操纵资源挂起或重试预算。
+
 本模块提供面向批处理、数据同步与爬虫任务的通用 HTTP 辅助工具，主要包含：
 - http_guard: 上下文管理器，自动将 HTTP 状态码与网络异常映射为三分类异常
-  （FatalError / RetryError / RateLimitHit），并在遇到 429 时自动挂起对应资源；
+  （FatalError / RetryError / RateLimitHit）；
 - guard_request: 就地执行 + 本地快速重试形态（一次调用完成请求与守卫）；
 - guarded: 装饰器工厂形态（把请求函数包装为绑定守卫配置的函数）；
 - HttpPolicy: HTTP 状态码与异常分类策略器，支持自定义状态码与异常分类钩子；
@@ -15,7 +19,7 @@
 三种 guard 形态的分工：``guard_request`` **就地执行**目标函数并施加本地
 快速重试；``http_guard`` 是**上下文管理器**，守卫 with 块内抛出的异常与
 响应状态；``guarded`` 是**装饰器工厂**，产出可复用的守卫包装函数。三者
-共享 HttpPolicy 分类与 429 挂起联动，按调用姿势选用。
+共享 HttpPolicy 分类，按调用姿势选用。
 """
 from __future__ import annotations
 
