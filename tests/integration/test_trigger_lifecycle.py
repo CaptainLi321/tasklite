@@ -41,8 +41,6 @@ def consume_input(job, ctx):
     path = Path(ctx.declare_input(ctx.output_roots / "source.txt"))
     return TaskResult.success(metadata={
         "content": path.read_text(encoding="utf-8"), "pid": os.getpid(),
-        "parent_succeeded": ctx.has_succeeded("produce::source"),
-        "parent_failed": ctx.has_failed("produce::source"),
     })
 
 
@@ -85,8 +83,6 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
         current = second.backend.load_successes()["consume::result"]
         assert current["success_count"] == (2 if mode == "write" else 1)
         assert current["content"] == evaluated[0]
-        assert current["parent_succeeded"] is True
-        assert current["parent_failed"] is False
         assert second.backend.load_failed() == {}
     assert second.backend.load_queue() == []
 
@@ -180,8 +176,7 @@ def transient_once(job, ctx):
             raise KeyboardInterrupt()
         return TaskResult.retry(message="zero budget in worker", consume_budget=False)
     return TaskResult.success(metadata={
-        "runtime": job.runtime.to_dict(), "has_failed": ctx.has_failed(job.uid),
-        "has_succeeded": ctx.has_succeeded(job.uid), "pid": os.getpid(),
+        "runtime": job.runtime.to_dict(), "pid": os.getpid(),
     })
 
 
@@ -200,8 +195,6 @@ def test_transient_first_attempt_rechecks_trigger_without_budget_or_archive_poll
     assert pipeline.backend.load_failed() == {}
     metadata = pipeline.backend.load_successes()["transient::item"]
     assert metadata["runtime"] == {}
-    assert metadata["has_failed"] is False
-    assert metadata["has_succeeded"] is False
     assert metadata["pid"] != os.getpid()
     records = pipeline.backend.load_attempts("transient::item")
     assert [(row.attempt_no, row.outcome) for row in records] == [(1, "requeued"), (2, "succeeded")]
@@ -222,7 +215,7 @@ def spawn_discovered(job, ctx, item, content_id):
 
 
 def discovered_child(job, ctx):
-    return TaskResult.success(metadata={"pid": os.getpid(), "scan_succeeded": ctx.has_succeeded("discover::root")})
+    return TaskResult.success(metadata={"pid": os.getpid()})
 
 
 def test_discovery_defaults_always_and_job_once_override_across_runs(tmp_path):
@@ -236,7 +229,6 @@ def test_discovery_defaults_always_and_job_once_override_across_runs(tmp_path):
     first_children = {uid: metadata for uid, metadata in pipeline.backend.load_successes().items()
                       if uid.startswith("child::")}
     assert len(first_children) == 1
-    assert next(iter(first_children.values()))["scan_succeeded"] is True
     pipeline.enqueue(Job("discover", "root"))
     pipeline.run()
     calls = (tmp_path / "output" / "scan_calls").read_text(encoding="utf-8").splitlines()

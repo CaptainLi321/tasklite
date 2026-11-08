@@ -60,22 +60,16 @@ def _make_runtime(tmp_path) -> EngineRuntime:
 
 
 class TestFakeCtxBasics:
-    """默认构造与集合/游标语义。"""
+    """默认构造与游标语义。"""
 
     def test_default_state_empty(self):
         job = _job()
         ctx = fake_ctx(job)
         assert ctx.job is job
-        assert not ctx.has_succeeded("fetch::j1")
-        assert not ctx.has_failed("fetch::j1")
+        assert not hasattr(ctx, "has_succeeded")
+        assert not hasattr(ctx, "has_failed")
+        assert not hasattr(ctx, "succeeded_or_failed_job_uids")
         assert ctx.get_cursor("any") is None
-
-    def test_wall_failed_accept_any_iterable(self):
-        ctx = fake_ctx(_job(), successes=["a::1", "a::2"], failed=("b::1",))
-        assert ctx.has_succeeded("a::1")
-        assert ctx.has_succeeded("a::2")
-        assert ctx.has_failed("b::1")
-        assert ctx.succeeded_or_failed_job_uids() == frozenset({"a::1", "a::2", "b::1"})
 
     def test_cursors_mapping_visible(self):
         ctx = fake_ctx(_job(), cursors={"high_water": "2026-01-01"})

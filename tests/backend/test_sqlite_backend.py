@@ -362,7 +362,7 @@ class TestCommitJobSuccess:
             backend.save_queue([_job_snapshot("alpha"), _job_snapshot("keep")])
             backend.commit_job_failure("t::alpha", {"error_message": "prior"}, payload={"k": 1})
             backend.save_queue([_job_snapshot("alpha"), _job_snapshot("keep")])
-            backend.seed_cursor("cur", "old")
+            backend.set_cursor("cur", "old")
             hist_id = backend.append_attempt(_running_attempt("t::alpha", attempt_no=1))
             backend.update_attempt(
                 hist_id, outcome="failed", finished_at="2026-05-01T00:00:01+00:00", error_message="prior"
@@ -923,17 +923,25 @@ class TestSeedWallAndCursor:
         assert backend.seed_successes(["t::one"]) == 1
         assert backend.load_successes() == {"t::one": {}}
 
-    def test_seed_cursor_valid_roundtrip_upsert(self, tmp_path):
+    def test_set_cursor_valid_roundtrip_upsert_and_delete(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.seed_cursor("k", "v_one")
-        backend.seed_cursor("k", "v_two")
+        backend.set_cursor("k", "v_one")
+        assert backend.get_cursor("k") == "v_one"
+        backend.set_cursor("k", "v_two")
+        assert backend.get_cursor("k") == "v_two"
         assert backend.load_cursors() == {"k": "v_two"}
+        backend.set_cursor("k", None)
+        assert backend.get_cursor("k") is None
+        assert backend.load_cursors() == {}
+        backend.set_cursor("k", "")
+        assert backend.get_cursor("k") == ""
+        assert backend.load_cursors() == {"k": ""}
 
     @pytest.mark.parametrize("key,value", [(None, "v"), ("k", 123), ("", "v")])
-    def test_seed_cursor_rejects_bad_types_zero_write(self, tmp_path, key, value):
+    def test_set_cursor_rejects_bad_types_zero_write(self, tmp_path, key, value):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         with pytest.raises(TypeError):
-            backend.seed_cursor(key, value)
+            backend.set_cursor(key, value)
         assert backend.load_cursors() == {}
 
 

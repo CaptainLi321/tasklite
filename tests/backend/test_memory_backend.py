@@ -383,17 +383,25 @@ class TestMemorySeedAndCursor:
         assert b.load_successes() == {"t::one": {}}
 
     @pytest.mark.parametrize("key,value", [(None, "v"), ("k", 123), ("", "v")])
-    def test_seed_cursor_rejects_bad_types(self, key, value):
+    def test_set_cursor_rejects_bad_types(self, key, value):
         b = InMemoryStateBackend()
         with pytest.raises(TypeError):
-            b.seed_cursor(key, value)
+            b.set_cursor(key, value)
         assert b.load_cursors() == {}
 
-    def test_seed_cursor_valid_roundtrip_upsert(self):
+    def test_set_cursor_valid_roundtrip_upsert_and_delete(self):
         b = InMemoryStateBackend()
-        b.seed_cursor("k", "v_one")
-        b.seed_cursor("k", "v_two")
+        b.set_cursor("k", "v_one")
+        assert b.get_cursor("k") == "v_one"
+        b.set_cursor("k", "v_two")
+        assert b.get_cursor("k") == "v_two"
         assert b.load_cursors() == {"k": "v_two"}
+        b.set_cursor("k", None)
+        assert b.get_cursor("k") is None
+        assert b.load_cursors() == {}
+        b.set_cursor("k", "")
+        assert b.get_cursor("k") == ""
+        assert b.load_cursors() == {"k": ""}
 
 
 class TestMemorySnapshotIsolation:

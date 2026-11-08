@@ -353,7 +353,7 @@ class TestBackendCommitAtomicity:
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one")])
         b.append_failed("t::one", {"error_message": "stale"},)
-        b.seed_cursor("cur", "initial")
+        b.set_cursor("cur", "initial")
 
         # 历史已收尾行（不可被后续成功提交触碰）
         hist_id = b.append_attempt(_running_attempt("t::one", attempt_no=1))
@@ -559,21 +559,26 @@ class TestSeedWallMutualExclusion:
         assert b.load_successes()["t::fresh_one"] == {}
 
 
-class TestSeedCursorParity:
-    """seed_cursor 入口校验双腿对齐（同一非法入参同抛 TypeError）。"""
+class TestSetCursorParity:
+    """set_cursor 入口校验双腿对齐（同一非法入参同抛 TypeError）。"""
 
     @pytest.mark.parametrize("key,value", [(None, "v"), ("k", 123), ("", "v")])
     def test_bad_types_rejected_zero_write(self, dual_backend, key, value):
         b = dual_backend
         with pytest.raises(TypeError):
-            b.seed_cursor(key, value)
+            b.set_cursor(key, value)
         assert b.load_cursors() == {}
 
-    def test_valid_value_roundtrip_upsert(self, dual_backend):
+    def test_valid_value_roundtrip_upsert_and_delete(self, dual_backend):
         b = dual_backend
-        b.seed_cursor("k", "v_one")
-        b.seed_cursor("k", "v_two")
+        b.set_cursor("k", "v_one")
+        assert b.get_cursor("k") == "v_one"
+        b.set_cursor("k", "v_two")
+        assert b.get_cursor("k") == "v_two"
         assert b.load_cursors() == {"k": "v_two"}
+        b.set_cursor("k", None)
+        assert b.get_cursor("k") is None
+        assert b.load_cursors() == {}
 
 
 @pytest.mark.parametrize("payload", [None, {}, {"error": "业务", "error_message": "新业务", "nested": {"new_jobs": [], "spawned_jobs": [1]}}])

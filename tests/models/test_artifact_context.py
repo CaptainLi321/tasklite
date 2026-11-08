@@ -129,7 +129,6 @@ def test_getter_distinguishes_missing_dependency_success_name_and_path(
     with pytest.raises(expected) as caught:
         ctx.get_artifact_path(producer_job_uid="build::one", artifact_name="bundle")
     assert "build::one" in str(caught.value) and "bundle" in str(caught.value)
-    assert ctx.has_succeeded("build::one") == bool(successes)
 
 
 def test_injected_artifacts_are_dispatch_snapshot(tmp_path):

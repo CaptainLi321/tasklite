@@ -360,18 +360,19 @@ class TestSeeding:
         assert backend.load_successes()["t::archived_1"] == {}
         assert set(backend.load_failed()) == set()
 
-    def test_seed_cursor_readable_via_backend(self):
-        backend, store, console = _make_console()
-        console.seed_cursor("progress", "2026-01-01")
+    def test_store_cursor_readable_via_backend(self):
+        backend, store, _ = _make_console()
+        store.set_cursor("progress", "2026-01-01")
         assert backend.load_cursors()["progress"] == "2026-01-01"
+        assert store.get_cursor("progress") == "2026-01-01"
         assert store.state.cursors["progress"] == "2026-01-01"
 
-    def test_seed_cursor_rejects_bad_shapes(self):
-        _, _, console = _make_console()
+    def test_store_cursor_rejects_bad_shapes(self):
+        _, store, _ = _make_console()
         with pytest.raises(TypeError, match="cursor key"):
-            console.seed_cursor("", "v")
+            store.set_cursor("", "v")
         with pytest.raises(TypeError, match="cursor value"):
-            console.seed_cursor("k", 42)  # type: ignore[arg-type]
+            store.set_cursor("k", 42)  # type: ignore[arg-type]
 
 
 class TestListSuspensions:
@@ -465,7 +466,7 @@ class TestBackendSwapRebind:
         old_backend, store, console = _make_console()
         old_backend.seed_successes(["w::old"])
         old_backend.append_failed("a::old", {"error_message": "old"})
-        old_backend.seed_cursor("ck", "old")
+        old_backend.set_cursor("ck", "old")
 
         new_backend = InMemoryStateBackend()
         new_backend.append_failed("a::new", {"error_message": "new"})
@@ -482,6 +483,6 @@ class TestBackendSwapRebind:
         assert console.seed_successes(["t::new"]) == 1
         assert "t::new" in new_backend.load_successes()
         assert "t::new" not in old_backend.load_successes()
-        console.seed_cursor("k", "new")
+        store.set_cursor("k", "new")
         assert new_backend.load_cursors()["k"] == "new"
         assert old_backend.load_cursors()["ck"] == "old"

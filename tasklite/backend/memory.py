@@ -378,19 +378,24 @@ class InMemoryStateBackend(AbstractStateBackend):
                 count += 1
             return count
 
-    def seed_cursor(self, key: str, value: str) -> None:
-        """预填一个 cursor（UPSERT，幂等）。
-
-        与 SQLiteStateBackend.seed_cursor 同契约 fail-loud：key 非空 str、
-        value 必须 str——静默 str() 强转会让同一非法入参在本腿写数字串、
-        sqlite 腿抛异常（跨后端行为分歧），且与内存镜像值型漂移。
-        """
+    def get_cursor(self, key: str) -> str | None:
+        """查询单个游标的最新已提交值，不存在返回 None。"""
         if not isinstance(key, str) or not key:
             raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
-        if not isinstance(value, str):
-            raise TypeError(f"cursor value must be str, got {type(value).__name__}")
         with self._lock:
-            self._cursors[key] = value
+            return self._cursors.get(key)
+
+    def set_cursor(self, key: str, value: str | None) -> None:
+        """设置或删除单个游标（None 为删除）。"""
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+        if value is not None and not isinstance(value, str):
+            raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
+        with self._lock:
+            if value is None:
+                self._cursors.pop(key, None)
+            else:
+                self._cursors[key] = value
 
     # 尝试轨迹（append-only 旁路观测面）--------------------------------
 

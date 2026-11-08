@@ -85,7 +85,7 @@ def test_fresh_database_and_special_characters(tmp_path, empty_file):
     if empty_file:
         path.touch()
     backend = SQLiteStateBackend(path)
-    backend.seed_cursor("error", "new_jobs")
+    backend.set_cursor("error", "new_jobs")
     assert SQLiteStateBackend(path).load_cursors() == {"error": "new_jobs"}
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone() == (5,)

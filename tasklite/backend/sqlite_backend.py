@@ -876,20 +876,34 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to seed successes in {self.path.name}: {e}")
             raise
 
-    def seed_cursor(self, key: str, value: str) -> None:
-        """预填一个 cursor（UPSERT，幂等）；入口校验与 Memory 腿同契约 fail-loud。"""
+    def get_cursor(self, key: str) -> str | None:
+        """查询单个游标的最新已提交值，不存在返回 None。"""
         if not isinstance(key, str) or not key:
             raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
-        if not isinstance(value, str):
-            raise TypeError(f"cursor value must be str, got {type(value).__name__}")
+        if not self.path.exists():
+            return None
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT value FROM cursors WHERE key = ?", (key,)).fetchone()
+            return row[0] if row is not None else None
+
+    def set_cursor(self, key: str, value: str | None) -> None:
+        """设置或删除单个游标（None 为删除）。"""
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+        if value is not None and not isinstance(value, str):
+            raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
         try:
             with self._get_conn() as conn:
-                conn.execute(
-                    'INSERT OR REPLACE INTO cursors (key, value) VALUES (?, ?)',
-                    (key, value),
-                )
+                conn.execute("BEGIN IMMEDIATE")
+                if value is None:
+                    conn.execute("DELETE FROM cursors WHERE key = ?", (key,))
+                else:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO cursors (key, value) VALUES (?, ?)",
+                        (key, value),
+                    )
         except Exception as e:
-            logger.critical(f"Failed to seed cursor '{key}' in {self.path.name}: {e}")
+            logger.critical(f"Failed to set cursor '{key}' in {self.path.name}: {e}")
             raise
 
     # 尝试轨迹（append-only 旁路观测面）------------------------------------

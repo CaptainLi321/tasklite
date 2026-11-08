@@ -11,6 +11,7 @@ EngineRuntime 静态装配快照见 RunConfig（engine/config.py），run 期
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import multiprocessing as mp
 import os
@@ -35,6 +36,7 @@ from .engine.types import ExecutionOptions
 from .models.job import Job, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry
 from .selection import Exclude
+from .utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
 
@@ -349,6 +351,20 @@ class TaskLite:
                 f"current run is in progress."
             )
 
+    @contextlib.contextmanager
+    def _management_lock(self):
+        """Run 外写操作库级互斥保护。"""
+        fd = try_acquire_lock(self.ipc_dir, "__pipeline_run__", timeout=0)
+        if fd is None:
+            raise RuntimeError(
+                f"Another run() or management operation is in progress for "
+                f"{self.ipc_dir}; concurrent operations on the same state are forbidden."
+            )
+        try:
+            yield
+        finally:
+            release_lock(fd)
+
     # ── 注册面（六步之二/三）───────────────────────────────────────
 
     def register_resource(self, resource: Resource) -> None:
@@ -521,10 +537,16 @@ class TaskLite:
         self._ensure_not_running("seed_successes")
         return self._console.seed_successes(job_uids)
 
-    def seed_cursor(self, key: str, value: str) -> None:
-        """预填一个 cursor（幂等）。委托 OpsConsole。"""
-        self._ensure_not_running("seed_cursor")
-        self._console.seed_cursor(key, value)
+    def get_cursor(self, key: str) -> str | None:
+        """读取指定游标键的最新已提交值，限 Run 外。"""
+        self._ensure_not_running("get_cursor")
+        return self._runtime.store.get_cursor(key)
+
+    def set_cursor(self, key: str, value: str | None) -> None:
+        """设置或删除游标键值，写入直接持久化提交，限 Run 外。"""
+        self._ensure_not_running("set_cursor")
+        with self._management_lock():
+            self._runtime.store.set_cursor(key, value)
 
     @property
     def authorizer(self) -> Callable[[str, str], bool | None] | None:

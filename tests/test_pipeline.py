@@ -121,8 +121,11 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def seed_successes(self, *args, **kwargs):
         return self.inner.seed_successes(*args, **kwargs)
 
-    def seed_cursor(self, *args, **kwargs):
-        return self.inner.seed_cursor(*args, **kwargs)
+    def get_cursor(self, *args, **kwargs):
+        return self.inner.get_cursor(*args, **kwargs)
+
+    def set_cursor(self, *args, **kwargs):
+        return self.inner.set_cursor(*args, **kwargs)
 
     def append_attempt(self, *args, **kwargs):
         return self.inner.append_attempt(*args, **kwargs)
@@ -990,12 +993,15 @@ class TestManageApis:
     def test_list_suspensions_empty_on_fresh_state(self, tmp_path):
         assert make_pipeline(tmp_path).list_suspensions() == []
 
-    def test_seed_wall_and_seed_cursor(self, tmp_path):
+    def test_cursor_get_and_set(self, tmp_path):
         p = make_pipeline(tmp_path)
-        assert p.seed_successes(["fetch::done"]) == 1
-        assert "fetch::done" in p.backend.load_successes()
-        p.seed_cursor("page", "7")
+        assert p.get_cursor("page") is None
+        p.set_cursor("page", "7")
+        assert p.get_cursor("page") == "7"
         assert p.backend.load_cursors()["page"] == "7"
+        p.set_cursor("page", None)
+        assert p.get_cursor("page") is None
+        assert p.backend.load_cursors() == {}
 
     def test_clear_history_removes_from_both(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -1013,7 +1019,8 @@ class TestManageApis:
             ("clear_failures", lambda p: p.clear_failures()),
             ("clear_history", lambda p: p.clear_history("fetch::")),
             ("seed_successes", lambda p: p.seed_successes(["fetch::a"])),
-            ("seed_cursor", lambda p: p.seed_cursor("k", "v")),
+            ("get_cursor", lambda p: p.get_cursor("k")),
+            ("set_cursor", lambda p: p.set_cursor("k", "v")),
         ]
         for api_name, call in guarded:
             p = make_pipeline(tmp_path)

@@ -43,25 +43,14 @@ def _make_ctx(
 
 
 class TestSnapshotSemantics:
-    """successes/failed 快照与游标读写。"""
+    """游标读写与成败查询删除核查。"""
 
     def test_default_state_empty(self):
         ctx = _make_ctx()
-        assert not ctx.has_succeeded("fetch::j1")
-        assert not ctx.has_failed("fetch::j1")
+        assert not hasattr(ctx, "has_succeeded")
+        assert not hasattr(ctx, "has_failed")
+        assert not hasattr(ctx, "succeeded_or_failed_job_uids")
         assert ctx.get_cursor("any") is None
-        assert ctx.succeeded_or_failed_job_uids() == frozenset()
-
-    def test_wall_failed_snapshot_visible(self):
-        ctx = _make_ctx(successes={"a::one", "a::two"}, failed={"b::one"})
-        assert ctx.has_succeeded(job_uid="a::one")
-        assert ctx.has_succeeded("a::two")
-        assert ctx.has_failed(job_uid="b::one")
-        job_uids = ctx.succeeded_or_failed_job_uids()
-        assert isinstance(job_uids, frozenset)
-        assert job_uids == frozenset({"a::one", "a::two", "b::one"})
-        assert not ctx.has_succeeded(job_uid="b::one")
-        assert not ctx.has_failed(job_uid="a::one")
 
     def test_cursors_visible_and_updatable(self):
         ctx = _make_ctx(cursors={"high_water": "2026-01-01"})
@@ -78,12 +67,20 @@ class TestSnapshotSemantics:
         assert ctx.cursor_updates["gone"] is None
         assert ctx.get_cursor("kept") == "2"
 
+    def test_set_cursor_empty_string_is_valid(self):
+        ctx = _make_ctx()
+        ctx.set_cursor("empty_val", "")
+        assert ctx.get_cursor("empty_val") == ""
+        assert ctx.cursor_updates["empty_val"] == ""
+
     def test_set_cursor_type_guards(self):
         ctx = _make_ctx()
-        with pytest.raises(TypeError, match="cursor key must be str"):
-            ctx.set_cursor(123, "v")
-        with pytest.raises(TypeError, match="cursor value must be str"):
-            ctx.set_cursor("k", 456)
+        with pytest.raises(TypeError, match="cursor key must be a non-empty str"):
+            ctx.set_cursor(123, "v")  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="cursor key must be a non-empty str"):
+            ctx.set_cursor("", "v")
+        with pytest.raises(TypeError, match="cursor value must be str or None"):
+            ctx.set_cursor("k", 456)  # type: ignore[arg-type]
 
 
 class TestSpawn:

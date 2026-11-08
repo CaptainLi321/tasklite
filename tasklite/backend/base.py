@@ -325,14 +325,12 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def seed_cursor(self, key: str, value: str) -> None:
-        """预填一个 cursor（UPSERT 语义，幂等）——存档迁移/进度书签恢复。
+    def get_cursor(self, key: str) -> str | None:
+        """查询单个游标的最新已提交值，不存在返回 None。"""
 
-        入口校验 fail-loud：key 非空 str、value 必须 str——静默 str() 强转
-        会让同一非法入参在 sqlite 腿抛异常、memory 腿写数字串（跨后端行为
-        分歧），且与内存镜像值型漂移。discovery 的已见判定走 successes/failed，
-        「已见预填」请用 ``seed_successes``；本方法服务通用业务 cursor。
-        """
+    @abstractmethod
+    def set_cursor(self, key: str, value: str | None) -> None:
+        """设置或删除单个游标（None 为删除）。"""
 
     # 尝试轨迹（append-only 旁路观测面）--------------------------------
 

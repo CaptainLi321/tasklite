@@ -329,32 +329,22 @@ class JobContext:
             raise ValueError(f"{reference}: artifact path changed: {path}")
         return path
 
-    def has_succeeded(self, job_uid: str) -> bool:
-        """查询 job_uid 是否命中派发时的成功档案快照。"""
-        return job_uid in self._success_job_uids
-
-    def has_failed(self, job_uid: str) -> bool:
-        """查询 job_uid 是否命中派发时的失败档案快照。"""
-        return job_uid in self._failed_job_uids
-
-    def succeeded_or_failed_job_uids(self) -> frozenset:
-        """返回派发时成功与失败档案 UID 的只读并集，不包含 skipped 或执行轨迹。"""
-        return frozenset(self._success_job_uids) | frozenset(self._failed_job_uids)
-
     def get_cursor(self, key: str) -> str | None:
-        """读取高水位游标的当前值。"""
+        """读取高水位游标的当前值（含自身暂存写入）。"""
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
         return self._cursors.get(key)
 
     def set_cursor(self, key: str, value: str | None) -> None:
-        """更新游标，job 成功时原子提交。
+        """暂存游标更新，job 成功时随事务原子提交。
 
-        key 与 value 都必须是 str；``value=None`` 表示**删除**该游标
-        （与后端 None-删除语义对齐）。
+        key 必须为非空 str；value 必须为 str 或 None（None 表示删除游标，
+        空字符串为合法值）。
         """
-        if not isinstance(key, str):
-            raise TypeError(f"cursor key must be str, got {type(key).__name__}")
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
         if value is not None and not isinstance(value, str):
-            raise TypeError(f"cursor value must be str, got {type(value).__name__}")
+            raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
         self.cursor_updates[key] = value
         if value is None:
             self._cursors.pop(key, None)

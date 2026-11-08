@@ -331,9 +331,16 @@ class PipelineState:
         if __debug__:
             self._assert_terminal_uids_consistent()
 
-    def set_cursor(self, key: str, value: str) -> None:
-        """设置单个游标键值（运维接缝，seed_cursor 场景）。"""
-        self._cursors[key] = value
+    def get_cursor(self, key: str) -> str | None:
+        """获取单个游标键值。"""
+        return self._cursors.get(key)
+
+    def set_cursor(self, key: str, value: str | None) -> None:
+        """设置单个游标键值（None 表示删除）。"""
+        if value is None:
+            self._cursors.pop(key, None)
+        else:
+            self._cursors[key] = value
 
     # 只读访问 ----------------------------------------------------
 

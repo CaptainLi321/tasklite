@@ -203,6 +203,23 @@ def _in_discovery_group(content_part: str, group_prefix: str) -> bool:
     return len(head) < len(content_part) and group_prefix.startswith(head)
 
 
+def _is_entry_seen(ctx: Any, uid: str) -> bool:
+    """快照成员判定辅助：优先协议方法，次选内部快照属性，适配成败查询接口收敛。"""
+    has_succ = getattr(ctx, "has_succeeded", None)
+    if callable(has_succ):
+        return bool(has_succ(uid))
+    has_fail = getattr(ctx, "has_failed", None)
+    if callable(has_fail):
+        return bool(has_fail(uid))
+    succ_uids = getattr(ctx, "_success_job_uids", None)
+    if succ_uids is not None and uid in succ_uids:
+        return True
+    fail_uids = getattr(ctx, "_failed_job_uids", None)
+    if fail_uids is not None and uid in fail_uids:
+        return True
+    return False
+
+
 class DiscoveryHandler:
     """按 REQUIREMENTS CONTRACT 实现的增量发现 handler（纯任务模型）。
 
@@ -429,7 +446,7 @@ class DiscoveryHandler:
             # break——一路扫到空页或 max_pages（全量成本只在 fetch，已见
             # 内容仍逐条跳过）。
             page_all_seen = all(
-                ctx.has_succeeded(uid) or ctx.has_failed(uid)
+                _is_entry_seen(ctx, uid)
                 for _, _, uid in page_entries
             )
             if page_all_seen and scan_mode != "full":
@@ -453,7 +470,7 @@ class DiscoveryHandler:
         has_succeeded or has_failed），无需对同批 entry 重复查询快照。
         """
         for item, content_id, uid in page_entries:
-            if page_all_seen or ctx.has_succeeded(uid) or ctx.has_failed(uid):
+            if page_all_seen or _is_entry_seen(ctx, uid):
                 continue
             try:
                 self.process_item_func(job, ctx, item, content_id)
@@ -487,7 +504,14 @@ class DiscoveryHandler:
             group_prefix = (
                 percent_encode(prefix, allowed=CONTENT_ID_ALLOWED) if prefix else ""
             )
-            for uid in ctx.succeeded_or_failed_job_uids():
+            uids_fn = getattr(ctx, "succeeded_or_failed_job_uids", None)
+            if callable(uids_fn):
+                uids_list = uids_fn()
+            else:
+                succ_uids = set(getattr(ctx, "_success_job_uids", ()) or ())
+                fail_uids = set(getattr(ctx, "_failed_job_uids", ()) or ())
+                uids_list = succ_uids | fail_uids
+            for uid in uids_list:
                 try:
                     tt, content_part = parse_job_uid(uid)
                 except TaskLiteError:

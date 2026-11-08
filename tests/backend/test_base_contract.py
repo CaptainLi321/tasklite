@@ -46,7 +46,8 @@ EXPECTED_ABSTRACT_METHODS = {
     "delete_failed",
     "delete_successes",
     "seed_successes",
-    "seed_cursor",
+    "get_cursor",
+    "set_cursor",
     # 尝试轨迹（append-only 旁路观测面）
     "append_attempt",
     "update_attempt",

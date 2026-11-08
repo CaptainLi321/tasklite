@@ -249,6 +249,26 @@ class StateStore:
         error_message = str(metadata.get("error_message") or "")
         return error_message or None
 
+    # ── 游标（get_cursor / set_cursor）─────────────────────────────
+
+    def get_cursor(self, key: str) -> str | None:
+        """查询游标最新已提交值。"""
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+        val = self._backend.get_cursor(key)
+        if val is not None:
+            return val
+        return self._state.get_cursor(key)
+
+    def set_cursor(self, key: str, value: str | None) -> None:
+        """设置或删除单个游标键值（直接提交写后端并更新内存镜像）。"""
+        if not isinstance(key, str) or not key:
+            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+        if value is not None and not isinstance(value, str):
+            raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
+        self._backend.set_cursor(key, value)
+        self._state.set_cursor(key, value)
+
     # ── 摄入管道（enqueue / spawn）──────────────────────────────────
 
     def normalize_and_validate_job(self, job: Job | dict[str, Any]) -> dict[str, Any]:
