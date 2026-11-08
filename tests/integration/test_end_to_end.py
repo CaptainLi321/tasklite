@@ -28,11 +28,14 @@ from pathlib import Path
 import pytest
 
 from tasklite import (
-    CapacityResource,
-    IntervalResource,
     Job,
+    StateSnapshot,
     TaskLite,
     TaskResult,
+)
+from tasklite.resource import (
+    CapacityResource,
+    IntervalResource,
 )
 from tasklite.engine.errorclass import ERR_MAX_RETRIES
 
@@ -238,12 +241,14 @@ class TestEndToEnd:
         p.run()
 
         # 档案结构化查询：uid/错误/payload 快照自洽（补跑无需外部反查）
-        entries = p.list_failures()
-        assert [e.job_uid for e in entries] == ["work::item_eps"]
-        assert entries[0].payload == {"k": "v"}
+        with StateSnapshot.open(p) as snap:
+            entries = list(snap.iter_jobs(status="failed"))
+            assert [e["job_uid"] for e in entries] == ["work::item_eps"]
+            assert entries[0]["job"]["payload"] == {"k": "v"}
 
         p.set_job_status("work::item_eps", "pending", recursive=False)
-        assert p.list_failures() == []
+        with StateSnapshot.open(p) as snap:
+            assert list(snap.iter_jobs(status="failed")) == []
 
         res = p.run()
         p.stop()
@@ -299,9 +304,10 @@ class TestEndToEnd:
             "work::step_one",
             "work::step_two",
         ]
-        assert p.filter_jobs_without_success([Job("work", "step_one"), Job("work", "next")]) == [
-            Job("work", "next")
-        ]
+        with StateSnapshot.open(p) as snap:
+            succ = {j["job_uid"] for j in snap.iter_jobs(status="succeeded")}
+            candidates = [Job("work", "step_one"), Job("work", "next")]
+            assert [j for j in candidates if j.uid not in succ] == [Job("work", "next")]
 
 
 def make_exit_crash_process_class():

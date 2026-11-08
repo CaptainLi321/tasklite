@@ -142,7 +142,7 @@ def test_killed_engine_recovers_retry_without_resetting_activation_or_budget(tmp
     assert len({row.run_id for row in records}) == 2
     assert recovered.backend.load_queue() == []
     assert recovered.backend.load_successes() == {}
-    assert recovered.list_failures()[0].metadata["error_message"] == "MAX_RETRIES_EXCEEDED"
+    assert recovered.backend.load_failed()["retry::item"]["error_message"] == "MAX_RETRIES_EXCEEDED"
 
 
 @pytest.mark.parametrize("seed_after_clear", [False, True])

@@ -15,7 +15,8 @@ import threading
 
 import pytest
 
-from tasklite import Exclude, Job, TaskLite
+from tasklite import Job, TaskLite
+from tasklite.selection import Exclude
 from tasklite.engine.errorclass import (
     ERR_DEPENDENCY_DEADLOCK,
     ERR_MALFORMED_JOB,
@@ -149,7 +150,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     pipeline.run(exclude=Exclude(task_type="convert"))
 
     assert sorted(pipeline.backend.load_successes()) == ["fetch::a"]
-    assert pipeline.backend.load_failed() == {} and pipeline.list_failures() == []
+    assert pipeline.backend.load_failed() == {}
     assert _queued(pipeline) == ["convert::b", "rank::r"]
     kept = {uid: row for uid, row in zip(_queued(pipeline), pipeline.backend.load_queue())}
     assert kept == {uid: before[uid] for uid in ("convert::b", "rank::r")}
@@ -325,10 +326,11 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
 
     assert outcome["res"] is None
     assert sorted(pipeline.backend.load_successes()) == ["rank::ok"]
-    failures = pipeline.list_failures()
+    failures = pipeline.backend.load_failed()
     assert len(failures) == 1
-    assert failures[0].job_uid.startswith("_unknown::")
-    assert failures[0].metadata["error_message"] == ERR_MALFORMED_JOB
+    (failed_uid, fail_meta), = failures.items()
+    assert failed_uid.startswith("_unknown::")
+    assert fail_meta["error_message"] == ERR_MALFORMED_JOB
     assert pipeline.backend.load_queue() == []
 
 
@@ -553,8 +555,10 @@ def test_selection_machine_kahn_partition(tmp_path):
 
 def test_public_surface_and_signature_contract():
     import tasklite
+    import tasklite.selection as sel
 
-    assert "Exclude" in tasklite.__all__
+    assert "Exclude" in sel.__all__
+    assert "Exclude" not in tasklite.__all__
     assert "Selection" not in tasklite.__all__
     assert "Skip" not in tasklite.__all__
 

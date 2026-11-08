@@ -15,14 +15,19 @@ import pytest
 from pathlib import Path
 
 from tasklite import (
-    CapacityResource,
-    IntervalResource,
     Job,
-    Resource,
     TaskLite,
     TaskResult,
 )
-from tasklite.engine.resource import ResourceQueryResult, RunNotifier
+from tasklite.engine.resource import (
+    Resource,
+    ResourceQueryResult,
+    RunNotifier,
+)
+from tasklite.resource import (
+    CapacityResource,
+    IntervalResource,
+)
 
 
 def _fast_handler(job, ctx):

@@ -20,7 +20,7 @@ import subprocess
 import sys
 
 import tasklite.wrappers as wrappers_pkg
-from tasklite import contrib
+import tasklite.contrib as contrib
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = PROJECT_ROOT / "tasklite"
@@ -139,33 +139,127 @@ class TestLayeringRedLine:
 class TestMainSurfaceExports:
     """主公开面的核心导出（__all__ 同步且可导入）。"""
 
-    _EXPORTS = frozenset(
+    _CORE_10 = frozenset(
         {
+            "TaskLite",
+            "Task",
+            "Job",
+            "JobContext",
             "TaskResult",
-            "RequeuePlan",
-            "SuspendEntry",
-            "validate_resource_amounts",
+            "FileSpec",
+            "StateSnapshot",
+            "TaskLiteError",
+            "make_job_uid",
+            "parse_job_uid",
         }
     )
 
     def test_export_names_in_all(self):
         import tasklite as tasklite_pkg
 
-        missing = self._EXPORTS - set(tasklite_pkg.__all__)
-        assert not missing, f"主公开面 __all__ 缺少导出: {sorted(missing)}"
+        assert set(tasklite_pkg.__all__) == self._CORE_10, (
+            f"主公开面 __all__ 契约不一致: 差异 {set(tasklite_pkg.__all__) ^ self._CORE_10}"
+        )
 
     def test_export_names_importable(self):
         from tasklite import (
+            FileSpec,
+            Job,
+            JobContext,
+            StateSnapshot,
+            Task,
+            TaskLite,
+            TaskLiteError,
             TaskResult,
-            RequeuePlan,
-            SuspendEntry,
-            validate_resource_amounts,
+            make_job_uid,
+            parse_job_uid,
         )
 
+        assert isinstance(TaskLite, type)
+        assert isinstance(Task, type)
+        assert isinstance(Job, type)
+        assert isinstance(JobContext, type)
         assert isinstance(TaskResult, type)
-        assert isinstance(RequeuePlan, type)
-        assert isinstance(SuspendEntry, type)
-        assert callable(validate_resource_amounts)
+        assert isinstance(FileSpec, type)
+        assert isinstance(StateSnapshot, type)
+        assert issubclass(TaskLiteError, Exception)
+        assert callable(make_job_uid)
+        assert callable(parse_job_uid)
+
+    def test_submodules_exports(self):
+        from tasklite import resource, selection
+
+        assert resource.__all__ == ["CapacityResource", "IntervalResource"]
+        assert selection.__all__ == ["Exclude"]
+        assert hasattr(resource, "CapacityResource")
+        assert hasattr(resource, "IntervalResource")
+        assert not hasattr(resource, "Resource")
+        assert hasattr(selection, "Exclude")
+
+    def test_non_core_and_deleted_symbols_not_in_root(self):
+        import tasklite as tasklite_pkg
+
+        banned_from_root = [
+            "CapacityResource",
+            "IntervalResource",
+            "Resource",
+            "Exclude",
+            "Selection",
+            "Skip",
+            "RateLimitResource",
+            "AttemptRecord",
+            "FailureEntry",
+            "SuspendEntry",
+            "ImmediateRequeuePolicy",
+            "RequeuePlan",
+            "RequeuePolicy",
+            "TriggerRegistry",
+            "TriggerContext",
+            "FifoOrderingPolicy",
+            "OrderingPolicy",
+            "AttemptOutcome",
+            "ExitReason",
+            "StopMode",
+            "InMemoryStateBackend",
+            "SQLiteStateBackend",
+            "RunSummary",
+            "RunStats",
+            "ErrorClassifier",
+            "ErrorCategory",
+            "job_ref",
+            "slice_list",
+            "progress_hook",
+            "jsonutil",
+            "percent_encode",
+            "encode_identifier",
+            "encode_job_component",
+            "encode_content_id",
+            "content_fingerprint",
+        ]
+        for name in banned_from_root:
+            assert name not in tasklite_pkg.__all__, f"{name} 不应在 tasklite.__all__ 中"
+            assert not hasattr(tasklite_pkg, name), f"{name} 不应在 tasklite 根包中直接导出"
+
+    def test_tasklite_facade_no_duplicate_query_or_deleted_methods(self):
+        from tasklite import TaskLite
+
+        deleted_methods = [
+            "list_failures",
+            "list_suspensions",
+            "filter_jobs_without_success",
+            "run_graceful",
+            "retry_failure",
+            "seed_successes",
+            "clear_failures",
+            "seed_cursor",
+            "progress_hook",
+            "stats",
+            "on_run_start",
+            "on_attempt_finished",
+            "on_run_end",
+        ]
+        for method_name in deleted_methods:
+            assert not hasattr(TaskLite, method_name), f"TaskLite 不应暴露已删除方法 {method_name}"
 
 
 class TestGuideImportContract:

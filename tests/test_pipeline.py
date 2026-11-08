@@ -877,49 +877,6 @@ class TestEnqueue:
                 p.enqueue(Job("fetch", "a"))
 
 
-class TestFilterJobsWithoutSuccess:
-    """successes 过滤语义与顺序保持（委托 OpsConsole）。"""
-
-    def test_wall_hits_filtered_order_preserved(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        p.set_job_status(Job("fetch", "done1"), "succeeded", recursive=False)
-        p.set_job_status(Job("fetch", "done2"), "succeeded", recursive=False)
-        jobs = [
-            Job("fetch", "new"),
-            Job("fetch", "done1"),
-            Job("fetch", "new2"),
-            Job("fetch", "done2"),
-        ]
-        result = p.filter_jobs_without_success(jobs)
-        assert [j.uid for j in result] == ["fetch::new", "fetch::new2"]
-
-    def test_empty_input_returns_empty(self, tmp_path):
-        assert make_pipeline(tmp_path).filter_jobs_without_success([]) == []
-
-    def test_failed_entries_not_excluded(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        p.backend.append_failed("fetch::broken", {"error_message": "x"})
-        jobs = [Job("fetch", "broken"), Job("fetch", "fresh")]
-        assert [j.uid for j in p.filter_jobs_without_success(jobs)] == [
-            "fetch::broken",
-            "fetch::fresh",
-        ]
-
-    def test_enqueue_composition_only_enqueues_jobs_without_success(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        p.set_job_status(Job("fetch", "done"), "succeeded", recursive=False)
-        for job in p.filter_jobs_without_success([Job("fetch", "done"), Job("fetch", "new")]):
-            p.enqueue(job)
-        queued = {f"{r['task_type']}::{r['job_id']}" for r in p.backend.load_queue()}
-        assert queued == {"fetch::new"}
-
-    def test_run_guard(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with running(p):
-            with pytest.raises(RuntimeError, match="filter_jobs_without_success"):
-                p.filter_jobs_without_success([])
-
-
 # ── 六步契约与运行门面 ────────────────────────────────────────────────
 
 
@@ -1032,21 +989,13 @@ class TestSchedulingSeamWiring:
 class TestManageApis:
     """失败档案/挂起/种子/清史等运维 API 的委托与守卫。"""
 
-    def test_list_failures_returns_structured_entries(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        p.backend.append_failed("fetch::bad", {"error_message": "boom", "is_fatal": False})
-        entries = p.list_failures()
-        assert len(entries) == 1
-        assert entries[0].job_uid == "fetch::bad"
-        assert entries[0].error_message == "boom"
-
     def test_set_job_status_and_requeue(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
         p.set_job_status(Job("fetch", "bad"), "failed", recursive=False)
-        assert len(p.list_failures()) == 1
+        assert len(p.backend.load_failed()) == 1
         p.set_job_status("fetch::bad", "pending", recursive=False)
-        assert p.list_failures() == []
+        assert p.backend.load_failed() == {}
         (row,) = p.backend.load_queue()
         assert row["job_id"] == "bad"
 
@@ -1054,9 +1003,6 @@ class TestManageApis:
         p = make_pipeline(tmp_path)
         with pytest.raises(KeyError, match="No existing snapshot found"):
             p.set_job_status("fetch::nope", "pending", recursive=False)
-
-    def test_list_suspensions_empty_on_fresh_state(self, tmp_path):
-        assert make_pipeline(tmp_path).list_suspensions() == []
 
     def test_cursor_get_and_set(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -1081,8 +1027,6 @@ class TestManageApis:
 
     def test_run_guards_across_manage_apis(self, tmp_path):
         guarded = [
-            ("list_suspensions", lambda p: p.list_suspensions()),
-            ("list_failures", lambda p: p.list_failures()),
             ("set_job_status", lambda p: p.set_job_status(Job("fetch", "a"), "pending", recursive=False)),
             ("clear_history", lambda p: p.clear_history("fetch::a", records=["successes"])),
             ("get_cursor", lambda p: p.get_cursor("k")),

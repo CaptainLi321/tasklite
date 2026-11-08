@@ -9,9 +9,17 @@ state（PipelineState 六集合状态）、context（JobContext 执行上下文�
 ``tasklite/utils/ipc.py``）。
 """
 
+from .artifact import FileSpec
+from .context import JobContext
+from .job import Job
 from .result import TaskResult, TaskResultStatus
+from .task import Task
 
 __all__ = [
+    "FileSpec",
+    "Job",
+    "JobContext",
+    "Task",
     "TaskResult",
     "TaskResultStatus",
 ]

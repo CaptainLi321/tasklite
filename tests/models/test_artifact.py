@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import FileSpec, TaskLiteError, jsonutil
+from tasklite import FileSpec, TaskLiteError
+from tasklite.utils import jsonutil
 from tasklite.models.artifact import (
     FILE_ROLES,
     ArtifactDeclaration,

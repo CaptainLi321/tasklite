@@ -10,19 +10,18 @@
 
 ```python
 from tasklite import (
-    TaskLite,                    # 门面（六步调用契约唯一入口）
-    Job, Task, AttemptRecord,    # 三层模型：实例 / 规格 / 轨迹
-    JobContext,                  # handler 执行上下文
-    TaskResult,                  # handler 唯一返回结果
-    TriggerContext,              # 自定义触发器只读判定上下文
-    TaskLiteError,               # 公开契约异常
-    FailureEntry, SuspendEntry,  # 失败档案与资源挂起条目
-    OrderingPolicy, FifoOrderingPolicy,     # 调度排序 seam
-    RequeuePolicy, ImmediateRequeuePolicy, RequeuePlan,  # 重入队节奏 seam
-    Exclude,                     # 候选排除规则
-    CapacityResource, IntervalResource,     # 资源体系
-    encode_identifier, encode_job_component, encode_content_id,  # 单射编码族
+    TaskLite, Task, Job, JobContext, TaskResult, FileSpec,
+    StateSnapshot, TaskLiteError, make_job_uid, parse_job_uid,
 )
+from tasklite.resource import CapacityResource, IntervalResource
+from tasklite.selection import Exclude
+from tasklite.engine.scheduler import OrderingPolicy, FifoOrderingPolicy
+from tasklite.engine.admission import RequeuePolicy, ImmediateRequeuePolicy, RequeuePlan, TriggerRegistry
+from tasklite.models.trigger import TriggerContext
+from tasklite.models.attempt import AttemptRecord
+from tasklite.engine.store import FailureEntry
+from tasklite.engine.ops import SuspendEntry
+from tasklite.utils.encoding import encode_identifier, encode_job_component, encode_content_id
 ```
 
 子包路径补充：`from tasklite.wrappers.discovery import register_discovery`（增量扫描适配）、`from tasklite.wrappers.http import http_guard, urllib_fetch, SQLiteSnapshotStore`（网络守卫与快照）、`from tasklite.testing import fake_ctx`（handler 单测构造器）。wrappers 不进主 `__all__`，经 `tasklite.wrappers.*` 导入。
@@ -164,7 +163,8 @@ Task 规格（进程内 TaskRegistry：handler / 默认资源 / payload_schema /
 import logging
 from pathlib import Path
 
-from tasklite import Job, IntervalResource, TaskLite, TaskResult
+from tasklite import Job, TaskLite, TaskResult
+from tasklite.resource import IntervalResource
 
 logging.getLogger("tasklite").setLevel(logging.INFO)
 
@@ -307,7 +307,8 @@ pipeline.retry_failure("download::img_001")
 ```python
 from collections.abc import Iterable, Sequence
 
-from tasklite import OrderingPolicy, TaskLite
+from tasklite import TaskLite
+from tasklite.engine.scheduler import OrderingPolicy
 
 
 class NewestFirstPolicy(OrderingPolicy):
@@ -325,7 +326,8 @@ pipeline = TaskLite(name="media", state_dir="./state", ordering_policy=NewestFir
 核心引擎把一个失败/瞬态作业放回队列时，一律经 `plan_requeue` 取得节奏规划，自身不做任何计算。自定义策略同样经门面构造参数 `requeue_policy` 注入（None → 立即重入队）：
 
 ```python
-from tasklite import RequeuePlan, RequeuePolicy, TaskLite
+from tasklite import TaskLite
+from tasklite.engine.admission import RequeuePlan, RequeuePolicy
 
 
 class FixedDelayRequeuePolicy(RequeuePolicy):
@@ -351,7 +353,8 @@ Selection 属调度扩展 seam 的第三类——候选准入/选择（与 `Orde
 `pipeline.selection(*rules)` 是 **pipeline 属性**（不是 `run()` 的参数）：每次调用**整体替换**规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变，`RunSummary` / `ExecutionOptions` 无新增字段，`EMPTY_STATS` 含 `excluded_blocked` 计数（本次 run 中「允许执行但仅因 Exclude 上游而无法完成」的留队作业数）。
 
 ```python
-from tasklite import Exclude, Job, TaskLite
+from tasklite import Job, TaskLite
+from tasklite.selection import Exclude
 
 pipeline = TaskLite(name="research", state_dir="./state")
 pipeline.enqueue(Job("fetch", "a"))

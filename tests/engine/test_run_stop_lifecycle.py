@@ -120,7 +120,7 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
 
     # 第 1 次 Run 结束：因 stop() 停止新派发，且单次 retry 在预算内（1 <= 1），保持 pending
     assert "t_retry::j1" not in p.backend.load_successes()
-    assert len(p.list_failures()) == 0
+    assert len(p.backend.load_failed()) == 0
     assert any(jd["job_id"] == "j1" for jd in p.backend.load_queue())
     assert _TRIGGER_CALLS[0] == 1
 
@@ -133,9 +133,9 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
     p.run()
     assert _TRIGGER_CALLS[0] == 2
     # 预算耗尽后转为失败档案
-    failures = p.list_failures()
+    failures = p.backend.load_failed()
     assert len(failures) == 1
-    assert failures[0].job_uid == "t_retry::j1"
+    assert "t_retry::j1" in failures
 
 
 def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
@@ -168,7 +168,7 @@ def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
     # t_fail::j_fail 失败
     # t_downstream::j_down 级联失败
     # t_other::j_other 未派发（因为 max_workers=1 且收到 stop），保持 pending
-    failures = {f.job_uid: f for f in p.list_failures()}
+    failures = p.backend.load_failed()
     assert "t_fail::j_fail" in failures
     assert "t_downstream::j_down" in failures
 

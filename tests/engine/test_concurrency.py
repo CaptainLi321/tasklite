@@ -20,7 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import CapacityResource, Job, TaskLite, TaskResult
+from tasklite import Job, TaskLite, TaskResult
+from tasklite.resource import CapacityResource
 
 PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
 

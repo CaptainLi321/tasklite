@@ -4,10 +4,9 @@
 """
 from __future__ import annotations
 
-from .engine.resource import CapacityResource, IntervalResource, Resource
+from .engine.resource import CapacityResource, IntervalResource
 
 __all__ = [
     "CapacityResource",
     "IntervalResource",
-    "Resource",
 ]

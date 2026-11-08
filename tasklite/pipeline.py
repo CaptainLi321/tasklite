@@ -23,10 +23,9 @@ from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig, resolve_tuning
 from .engine.errorclass import ErrorClassifier
 from .engine.governor import DeadlockGovernor
-from .engine.ops import OpsConsole, SuspendEntry
+from .engine.ops import OpsConsole
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import EngineRuntime
-from .engine.store import FailureEntry
 from .engine.types import ExecutionOptions
 from .models.job import Job, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry
@@ -365,12 +364,7 @@ class TaskLite:
         self._ensure_active("register_trigger")
         self._triggers.register(name, fn)
 
-    # ── 入队与过滤（六步之四前置）──────────────────────────────────
-
-    def filter_jobs_without_success(self, jobs: Sequence[Job]) -> list[Job]:
-        """过滤出尚未成功完成的 job（uid 不在 successes 的子集，保留输入顺序）。"""
-        self._ensure_active("filter_jobs_without_success")
-        return self._console.filter_jobs_without_success(jobs)
+    # ── 入队（六步之四）──────────────────────────────────────────
 
     def enqueue(self, job: Job) -> bool:
         """入队单个作业，捕获独立快照并校验同 UID 幂等/冲突。
@@ -392,16 +386,6 @@ class TaskLite:
             return inserted
 
     # ── 管理面（run() 外运维委托）──────────────────────────────────
-
-    def list_suspensions(self) -> list[SuspendEntry]:
-        """只读查询当前仍生效的资源挂起。委托 OpsConsole。"""
-        self._ensure_active("list_suspensions")
-        return self._console.list_suspensions()
-
-    def list_failures(self) -> list[FailureEntry]:
-        """只读查询失败档案，返回结构化条目。委托 OpsConsole。"""
-        self._ensure_active("list_failures")
-        return self._console.list_failures()
 
     def set_job_status(
         self,

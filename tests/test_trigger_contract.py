@@ -36,7 +36,7 @@ def test_fresh_trigger_skip_allows_dependent_trigger():
 
 
 def test_task_resource_merge_and_explicit_false_zero_overrides():
-    from tasklite import CapacityResource
+    from tasklite.resource import CapacityResource
     pipeline = TaskLite(backend="memory")
     pipeline.register_resource(CapacityResource("gpu", max_capacity=5.0))
     pipeline.register_resource(CapacityResource("cpu", max_capacity=5.0))
@@ -72,7 +72,7 @@ def test_unknown_trigger_raises_preserving_candidate_and_budget():
         pipeline.run()
     assert pipeline.backend.load_queue() == before
     assert pipeline.backend.load_attempts("t::a") == []
-    assert list(pipeline.list_failures()) == []
+    assert pipeline.backend.load_failed() == {}
 
 
 def test_callback_failure_and_non_bool_return_preserve_queue():
@@ -91,7 +91,7 @@ def test_callback_failure_and_non_bool_return_preserve_queue():
             pipeline.run()
         assert pipeline.backend.load_queue() == before
         assert pipeline.backend.load_attempts("t::a") == []
-        assert list(pipeline.list_failures()) == []
+        assert pipeline.backend.load_failed() == {}
 
 
 def test_register_trigger_rejects_duplicate_builtin_and_invalid_callable():
@@ -113,7 +113,7 @@ def test_register_trigger_rejects_duplicate_builtin_and_invalid_callable():
 
 
 def test_builtin_trigger_matrix():
-    from tasklite import TriggerContext
+    from tasklite.models.trigger import TriggerContext
     from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
     for name, expected in {
         "once": (True, False, False),
@@ -129,7 +129,7 @@ def test_builtin_trigger_matrix():
 
 def test_mtime_microsecond_boundary_size_only_and_no_cache(tmp_path):
     import os
-    from tasklite import TriggerContext
+    from tasklite.models.trigger import TriggerContext
     from tasklite.triggers import on_input_change
     path = tmp_path / "input"
     path.write_text("first")
@@ -148,7 +148,7 @@ def test_mtime_microsecond_boundary_size_only_and_no_cache(tmp_path):
 
 def test_directory_mtime_does_not_recurse(tmp_path):
     import os
-    from tasklite import TriggerContext
+    from tasklite.models.trigger import TriggerContext
     from tasklite.triggers import on_input_change
     folder = tmp_path / "folder"
     folder.mkdir()
@@ -165,7 +165,7 @@ def test_directory_mtime_does_not_recurse(tmp_path):
 
 def test_input_contract_errors_and_untrusted_baseline(tmp_path):
     import pytest
-    from tasklite import TriggerContext
+    from tasklite.models.trigger import TriggerContext
     from tasklite.triggers import on_input_change
     for inputs in [None, [], "bad", [42], [""]]:
         ctx = TriggerContext(Job("t", "a"), True, False, {"inputs": inputs}, 1)
@@ -196,7 +196,7 @@ def test_failure_history_skipped_this_batch_allows_downstream():
 
 
 def test_trigger_skip_is_local_to_run():
-    from tasklite import Exclude
+    from tasklite.selection import Exclude
     pipeline = TaskLite(backend="memory")
     seen = []
     pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
@@ -208,7 +208,7 @@ def test_trigger_skip_is_local_to_run():
     assert seen == ["parent::a"]
     pipeline.run()
     assert seen == ["parent::a"]
-    assert [entry.job_uid for entry in pipeline.list_failures()] == ["child::b"]
+    assert list(pipeline.backend.load_failed().keys()) == ["child::b"]
 
 
 def test_stop_after_trigger_skip_does_not_persist_dependency_readiness():
@@ -216,7 +216,7 @@ def test_stop_after_trigger_skip_does_not_persist_dependency_readiness():
     def stop_and_skip(ctx):
         pipeline.stop()
         return False
-    from tasklite import Exclude
+    from tasklite.selection import Exclude
     pipeline.register_trigger("stop", stop_and_skip)
     pipeline.register_task("t", handle)
     pipeline.register_task("child", handle)
@@ -225,7 +225,7 @@ def test_stop_after_trigger_skip_does_not_persist_dependency_readiness():
     pipeline.run(exclude=Exclude(task_type="child"))
     assert [row["job_id"] for row in pipeline.backend.load_queue()] == ["b"]
     pipeline.run()
-    assert [entry.job_uid for entry in pipeline.list_failures()] == ["child::b"]
+    assert list(pipeline.backend.load_failed().keys()) == ["child::b"]
 
 
 def test_trigger_skip_does_not_grant_dependency_readiness():
@@ -248,7 +248,7 @@ def test_retry_uses_same_activation_without_rechecking_trigger(monkeypatch):
     assert seen == [1]
     records = pipeline.backend.load_attempts("t::a")
     assert [(record.activation_no, record.attempt_no) for record in records] == [(1, 1), (1, 2), (1, 3)]
-    assert len(pipeline.list_failures()) == 1
+    assert len(pipeline.backend.load_failed()) == 1
 
 
 def test_trigger_error_aborts_inflight_without_burning_budget(monkeypatch):
@@ -283,4 +283,4 @@ def test_trigger_error_aborts_inflight_without_burning_budget(monkeypatch):
     assert set(rows) == {"a", "b"}
     assert all(row["attempt_no"] == 1 for row in rows.values())
     assert pipeline.backend.load_attempts("t::b") == []
-    assert pipeline.list_failures() == []
+    assert pipeline.backend.load_failed() == {}

@@ -37,7 +37,8 @@ from tasklite.models.state import PipelineState
 
 
 def _task_specs(task_type, trigger):
-    from tasklite import Task, TaskRegistry
+    from tasklite import Task
+    from tasklite.models.task import TaskRegistry
     tasks = TaskRegistry()
     tasks.register(Task(task_type, lambda job, ctx: True, trigger=trigger))
     return tasks
@@ -760,7 +761,8 @@ class TestIntakePipeline:
         assert backend.load_queue()[0]["payload"]["k"] == 1
 
     def test_enqueue_job_same_uid_idempotent_vs_conflict(self):
-        from tasklite import Task, TaskLiteError, TaskRegistry
+        from tasklite import Task, TaskLiteError
+        from tasklite.models.task import TaskRegistry
 
         tasks = TaskRegistry()
         tasks.register(

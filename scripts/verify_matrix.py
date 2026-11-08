@@ -10,10 +10,15 @@ if str(REPO_ROOT) not in sys.path:
 # 1. 基础模块与类型求值验证
 import tasklite
 from tasklite import (
-    TaskLite, Job, JobContext, FileSpec, TaskResult,
-    CapacityResource, IntervalResource, Resource, FailureEntry,
-    job_ref, slice_list, content_fingerprint,
-    encode_job_component, encode_identifier, encode_content_id
+    TaskLite, Task, Job, JobContext, FileSpec, TaskResult, StateSnapshot, TaskLiteError,
+)
+from tasklite.resource import CapacityResource, IntervalResource
+from tasklite.hooks import job_ref, slice_list
+from tasklite.utils.encoding import (
+    content_fingerprint,
+    encode_job_component,
+    encode_identifier,
+    encode_content_id,
 )
 from tasklite.engine.admission import TriggerRegistry, RequeuePolicy, RequeuePlan
 from tasklite.engine.resource import ResourceManager, ResourceEvaluation
@@ -67,7 +72,8 @@ def main():
         assert "task_a::job_1" in successes
         assert "task_retry::job_2" in successes
         assert successes["task_a::job_1"]["result"] == "processed_42"
-        assert len(pipeline.list_failures()) == 0
+        with StateSnapshot.open(pipeline) as snap:
+            assert list(snap.iter_jobs(status="failed")) == []
 
     print("✓ End-to-end multi-process execution passed.")
 

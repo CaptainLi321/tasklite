@@ -17,7 +17,8 @@ import time
 
 import pytest
 
-from tasklite import CapacityResource, Job, TaskLite, TaskResult
+from tasklite import Job, TaskLite, TaskResult
+from tasklite.resource import CapacityResource
 from tasklite.engine.channel import (
     ExecutionChannel,
     WorkerLaunchSpec,
