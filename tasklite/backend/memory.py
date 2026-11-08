@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import threading
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .base import (
@@ -21,6 +23,7 @@ from .base import (
 )
 from ..models.attempt import AttemptRecord
 from ..models.state import job_uid_from_snapshot
+from ..utils.clock import utc_now_iso
 
 logger = logging.getLogger("tasklite")
 
@@ -45,6 +48,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         self._attempts: dict[int, Any] = {}
         self._attempt_seq = 1
         self._job_sequences: dict[str, int] = {}
+        self._authorizations: dict[str, dict[str, Any]] = {}
 
     # 全量加载 -------------------------------------------------------
 
@@ -695,6 +699,53 @@ class InMemoryStateBackend(AbstractStateBackend):
             self._failure_payloads = new_failure_payloads
             self._cursors = new_cursors
             return True
+
+    def record_authorization(
+        self,
+        path: str,
+        target_type: str,
+        *,
+        authorized_at: str | None = None,
+    ) -> None:
+        norm_path = os.path.normpath(os.fspath(path))
+        if target_type not in ("file", "directory"):
+            raise ValueError(f"target_type must be 'file' or 'directory', got {target_type!r}")
+        ts = authorized_at if authorized_at is not None else utc_now_iso()
+        with self._lock:
+            self._authorizations[norm_path] = {
+                "path": norm_path,
+                "target_type": target_type,
+                "authorized_at": ts,
+            }
+
+    def list_authorizations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            records = list(self._authorizations.values())
+            return sorted(records, key=lambda r: (r["authorized_at"], r["path"]))
+
+    def revoke_authorization(self, path: str) -> bool:
+        norm_path = os.path.normpath(os.fspath(path))
+        with self._lock:
+            if norm_path in self._authorizations:
+                del self._authorizations[norm_path]
+                return True
+            return False
+
+    def is_path_authorized(self, path: str) -> bool:
+        norm_path = os.path.normpath(os.fspath(path))
+        target_p = Path(norm_path)
+        with self._lock:
+            if norm_path in self._authorizations:
+                return True
+            for record in self._authorizations.values():
+                if record["target_type"] == "directory":
+                    dir_path = Path(record["path"])
+                    try:
+                        if target_p.is_relative_to(dir_path):
+                            return True
+                    except (ValueError, TypeError):
+                        pass
+        return False
 
 
 __all__ = ["InMemoryStateBackend"]

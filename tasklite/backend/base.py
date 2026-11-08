@@ -429,6 +429,28 @@ class AbstractStateBackend(ABC):
     def load_queue_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:
         """按 queue_position 升序加载队列行的完整信息，可选按 status 过滤。"""
 
+    @abstractmethod
+    def record_authorization(
+        self,
+        path: str,
+        target_type: str,
+        *,
+        authorized_at: str | None = None,
+    ) -> None:
+        """持久化记录一条文件系统路径授权（target_type 为 'file' 或 'directory'）。"""
+
+    @abstractmethod
+    def list_authorizations(self) -> list[dict[str, Any]]:
+        """查询全部已持久化的授权记录。"""
+
+    @abstractmethod
+    def revoke_authorization(self, path: str) -> bool:
+        """按规范绝对路径精确撤销授权，存在并删除返回 True，不存在返回 False。"""
+
+    @abstractmethod
+    def is_path_authorized(self, path: str) -> bool:
+        """检查指定规范绝对路径是否命中已有授权（精确文件匹配或已授权目录树内）。"""
+
 
 __all__ = [
     "AbstractStateBackend",

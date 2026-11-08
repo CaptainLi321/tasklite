@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -146,6 +147,7 @@ class StateStore:
         )
         self._exclude: Exclude | None = None
         self._temporary_excluded_uids: set[str] = set()
+        self.authorizer: Callable[[str, str], bool] | None = None
 
     @property
     def base_dir(self) -> Path:
@@ -579,6 +581,55 @@ class StateStore:
         动作、全部持有者必然同步。
         """
         self._backend = backend
+
+    # ── 路径授权管理与判定 ──────────────────────────────────────────
+
+    def is_path_authorized(self, path: str | Path) -> bool:
+        """检查指定规范绝对路径是否命中已有授权。"""
+        norm_path = os.path.normpath(os.fspath(path))
+        return self._backend.is_path_authorized(norm_path)
+
+    def record_authorization(
+        self,
+        path: str | Path,
+        target_type: str,
+        *,
+        authorized_at: str | None = None,
+    ) -> None:
+        """持久化记录一条文件系统路径授权。"""
+        norm_path = os.path.normpath(os.fspath(path))
+        self._backend.record_authorization(norm_path, target_type, authorized_at=authorized_at)
+
+    def list_authorizations(self) -> list[dict[str, Any]]:
+        """查询全部已持久化的授权记录。"""
+        return self._backend.list_authorizations()
+
+    def revoke_authorization(self, path: str | Path) -> bool:
+        """按规范绝对路径精确撤销授权。"""
+        norm_path = os.path.normpath(os.fspath(path))
+        return self._backend.revoke_authorization(norm_path)
+
+    def check_or_request_authorization(
+        self, path: str | Path, target_type: str | None = None
+    ) -> bool:
+        """检查已有授权或发起内部授权询问；已授权或同意持久化记录并返回 True。"""
+        norm_path = os.path.normpath(os.fspath(path))
+        if self._backend.is_path_authorized(norm_path):
+            return True
+        effective_type = (
+            target_type
+            if target_type is not None
+            else ("directory" if os.path.isdir(norm_path) else "file")
+        )
+        if os.environ.get("TASKLITE_AUTO_APPROVE") == "1":
+            self._backend.record_authorization(norm_path, effective_type)
+            return True
+        if self.authorizer is not None and callable(self.authorizer):
+            if self.authorizer(norm_path, effective_type):
+                self._backend.record_authorization(norm_path, effective_type)
+                return True
+            return False
+        return False
 
     # ── 事务性原子终态转移（apply_* 出口族）──────────────────────────
 

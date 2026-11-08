@@ -7,6 +7,7 @@ queue / successes / failed / attempts / cursors / engine_metadata 六表合一�
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -239,6 +240,13 @@ class SQLiteStateBackend(AbstractStateBackend):
                 CREATE TABLE IF NOT EXISTS engine_metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS authorizations (
+                    path TEXT PRIMARY KEY,
+                    target_type TEXT NOT NULL,
+                    authorized_at TEXT NOT NULL
                 )
             ''')
         else:
@@ -1348,6 +1356,56 @@ class SQLiteStateBackend(AbstractStateBackend):
         except Exception as e:
             logger.critical(f"Failed to commit settlement for {job_uid} in {self.path.name}: {e}")
             return False
+
+    def record_authorization(
+        self,
+        path: str,
+        target_type: str,
+        *,
+        authorized_at: str | None = None,
+    ) -> None:
+        norm_path = os.path.normpath(os.fspath(path))
+        if target_type not in ("file", "directory"):
+            raise ValueError(f"target_type must be 'file' or 'directory', got {target_type!r}")
+        ts = authorized_at if authorized_at is not None else utc_now_iso()
+        with self._get_conn() as conn:
+            conn.execute(
+                'INSERT OR REPLACE INTO authorizations (path, target_type, authorized_at) VALUES (?, ?, ?)',
+                (norm_path, target_type, ts),
+            )
+
+    def list_authorizations(self) -> list[dict[str, Any]]:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                'SELECT path, target_type, authorized_at FROM authorizations ORDER BY authorized_at ASC, path ASC'
+            )
+            return [
+                {"path": row[0], "target_type": row[1], "authorized_at": row[2]}
+                for row in cur.fetchall()
+            ]
+
+    def revoke_authorization(self, path: str) -> bool:
+        norm_path = os.path.normpath(os.fspath(path))
+        with self._get_conn() as conn:
+            cur = conn.execute('DELETE FROM authorizations WHERE path = ?', (norm_path,))
+            return bool(cur.rowcount and cur.rowcount > 0)
+
+    def is_path_authorized(self, path: str) -> bool:
+        norm_path = os.path.normpath(os.fspath(path))
+        target_p = Path(norm_path)
+        with self._get_conn() as conn:
+            cur = conn.execute('SELECT 1 FROM authorizations WHERE path = ?', (norm_path,))
+            if cur.fetchone() is not None:
+                return True
+            cur = conn.execute("SELECT path FROM authorizations WHERE target_type = 'directory'")
+            for row in cur.fetchall():
+                dir_path = Path(row[0])
+                try:
+                    if target_p.is_relative_to(dir_path):
+                        return True
+                except (ValueError, TypeError):
+                    pass
+        return False
 
 
 __all__ = ["SQLiteStateBackend", "TARGET_SCHEMA_VERSION"]
