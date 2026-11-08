@@ -117,90 +117,41 @@ class TestSpawn:
         assert len(ctx.spawned_jobs) == 1
 
 
-class TestDeclareOutputSandbox:
-    """declare_output：沙盒校验、父目录创建与声明落盘。"""
+class TestDeclareFile:
+    """动态 FileSpec 路径使用固定基准，不隐式创建业务目录。"""
 
-    def test_resolves_within_root_and_creates_parents(self, tmp_path):
-        root = tmp_path / "out"
-        root.mkdir()
-        ctx = _make_ctx(output_roots=root, ipc_dir=str(tmp_path / "ipc"))
-        final = ctx.declare_output("sub/dir/out.json")
-        assert final.startswith(str(root))
-        assert Path(final).parent.is_dir()  # 父目录自动创建
-        outputs = ctx._journal.read_artifacts("fetch::j1")
-        assert outputs == (ArtifactDeclaration(final),)
+    @pytest.mark.parametrize("method", ["declare_output", "declare_cache"])
+    def test_removed_declaration_entry_is_absent(self, method):
+        assert not hasattr(_make_ctx(), method)
 
-    def test_cleanup_flag_persisted(self, tmp_path):
-        root = tmp_path / "out"
-        root.mkdir()
-        ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_roots=root, ipc_dir=ipc)
-        keep = ctx.declare_output("keep.bin", delete_on_failure=False)
-        drop = ctx.declare_output("drop.bin", delete_on_failure=True)
-        recorded = {d.path: d for d in ctx._journal.read_artifacts("fetch::j1")}
-        assert recorded[keep] == ArtifactDeclaration(keep)
-        assert recorded[drop] == ArtifactDeclaration(drop, delete_on_failure=True)
+    def test_resolves_against_base_without_creating_parents(self, tmp_path):
+        from tasklite import FileSpec
 
-    def test_cleanup_flag_is_keyword_only(self, tmp_path):
-        root = tmp_path / "out"
-        root.mkdir()
-        ctx = _make_ctx(output_roots=root)
-        with pytest.raises(TypeError, match="positional argument"):
-            ctx.declare_output("a.bin", False)  # type: ignore[misc]
-
-    def test_path_traversal_rejected(self, tmp_path):
-        root = tmp_path / "out"
-        root.mkdir()
-        ctx = _make_ctx(output_roots=root)
-        (tmp_path / "secret.txt").write_text("secret")
-        with pytest.raises(ValueError, match="outside output roots"):
-            ctx.declare_output("../secret.txt")
-        with pytest.raises(ValueError, match="outside output roots"):
-            ctx.declare_output(str(tmp_path / "elsewhere" / "f.bin"))
-
-    def test_absolute_within_root_accepted(self, tmp_path):
-        root = tmp_path / "out"
-        root.mkdir()
-        ctx = _make_ctx(output_roots=root)
-        final = ctx.declare_output(str(root / "abs.json"))
-        assert final == str((root / "abs.json").resolve())
-
-    def test_sandbox_false_exempts_single_path(self, tmp_path):
-        """sandbox=False 逐路径豁免（跨盘输出），其余声明仍受沙盒约束。"""
-        root = tmp_path / "out"
-        root.mkdir()
-        elsewhere = tmp_path / "other_root"
-        elsewhere.mkdir()
-        ctx = _make_ctx(output_roots=root)
-        final = ctx.declare_output(str(elsewhere / "cross.bin"), sandbox=False)
-        assert final.startswith(str(elsewhere))
-        with pytest.raises(ValueError, match="outside output roots"):
-            ctx.declare_output(str(elsewhere / "cross2.bin"))
-
-    def test_no_output_root_allows_any(self, tmp_path):
         ctx = _make_ctx()
-        final = ctx.declare_output(str(tmp_path / "free.json"))
-        assert Path(final).is_absolute()
+        ctx.base_dir = tmp_path
+        final = ctx.declare_file("out", FileSpec("sub/dir/out.json", role="output"))
+        assert final == tmp_path / "sub/dir/out.json"
+        assert not final.parent.exists()
+        assert ctx.file_path("out") == final
 
-    def test_null_byte_rejected(self, tmp_path):
-        root = tmp_path / "out"
-        root.mkdir()
-        ctx = _make_ctx(output_roots=root)
-        with pytest.raises(ValueError, match="null byte"):
-            ctx.declare_output("bad\x00name")
+    def test_captured_base_is_independent_of_worker_cwd(self, tmp_path, monkeypatch):
+        from tasklite import FileSpec
 
-    def test_relative_path_relocated_to_root_not_cwd(self, tmp_path, monkeypatch):
-        """相对路径按 output_roots 重定位（而非进程 CWD），写入与校验位置
-        一致。"""
-        root = tmp_path / "out"
-        root.mkdir()
-        other_cwd = tmp_path / "cwd"
-        other_cwd.mkdir()
-        monkeypatch.chdir(other_cwd)
-        ctx = _make_ctx(output_roots=root)
-        final = ctx.declare_output("rel.json")
-        assert final.startswith(str(root))
-        assert not (other_cwd / "rel.json").exists()
+        monkeypatch.chdir(tmp_path)
+        ctx = _make_ctx()
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.chdir(other)
+        assert ctx.declare_file("out", FileSpec("relative", role="output")) == tmp_path / "relative"
+
+    def test_existing_path_remains_without_delete_request(self, tmp_path):
+        from tasklite import FileSpec
+
+        target = tmp_path / "valuable"
+        target.write_text("valuable")
+        ctx = _make_ctx()
+        assert ctx.declare_file("out", FileSpec(target, role="output")) == target
+        assert target.read_text() == "valuable"
 
 
 class TestMultiRootSandbox:
@@ -237,41 +188,19 @@ class TestMultiRootSandbox:
         assert resolved.startswith(str(root_a))
 
 
-class TestDeclareCache:
-    """declare_cache：匿名成败清理授权。"""
+class TestCacheFileSpec:
+    """cache 的清理策略只由显式 FileSpec 标志表达。"""
 
-    def test_cache_resolves_within_root(self, tmp_path):
-        root = tmp_path / "out"
-        root.mkdir()
-        ctx = _make_ctx(output_roots=root, ipc_dir=str(tmp_path / "ipc"))
-        final = ctx.declare_cache("./v.mp4.part")
-        assert final.startswith(str(root))
+    @pytest.mark.parametrize("cleanup", [False, True])
+    def test_cache_preserves_explicit_cleanup_flags(self, tmp_path, cleanup):
+        from tasklite import FileSpec
 
-    def test_cache_kind_persisted_with_cleanup_true(self, tmp_path):
-        ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
-        final = ctx.declare_cache("part.bin")
-        assert ctx._journal.read_artifacts("fetch::j1") == (
-            ArtifactDeclaration(final, delete_on_failure=True, delete_on_success=True),
-        )
-
-    def test_cache_sandbox_rejected_by_default(self, tmp_path):
-        root = tmp_path / "out"
-        elsewhere = tmp_path / "other"
-        root.mkdir()
-        elsewhere.mkdir()
-        ctx = _make_ctx(output_roots=root)
-        with pytest.raises(ValueError, match="outside output roots"):
-            ctx.declare_cache(str(elsewhere / "c.part"))
-
-    def test_cache_sandbox_false_exempts(self, tmp_path):
-        root = tmp_path / "out"
-        elsewhere = tmp_path / "other"
-        root.mkdir()
-        elsewhere.mkdir()
-        ctx = _make_ctx(output_roots=root)
-        final = ctx.declare_cache(str(elsewhere / "c.part"), sandbox=False)
-        assert final.startswith(str(elsewhere))
+        ctx = _make_ctx()
+        spec = FileSpec(tmp_path / "cache", role="cache", delete_on_success=cleanup, delete_on_failure=cleanup)
+        final = ctx.declare_file("cache", spec)
+        assert final == tmp_path / "cache"
+        assert ctx._files["cache"].delete_on_success is cleanup
+        assert ctx._files["cache"].delete_on_failure is cleanup
 
 
 class TestDeclareInput:
@@ -318,8 +247,10 @@ class TestDeclareInput:
         existing = tmp_path / "c.txt"
         existing.write_text("x")
         ctx = _make_ctx(output_roots=None, ipc_dir=None)
-        ctx.declare_output("a.bin")
-        ctx.declare_cache("b.part")
+        from tasklite import FileSpec
+
+        ctx.declare_file("out", FileSpec(tmp_path / "a.bin", role="output"))
+        ctx.declare_file("cache", FileSpec(tmp_path / "b.part", role="cache"))
         ctx.declare_input(existing)
 
 

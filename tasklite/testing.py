@@ -78,8 +78,7 @@ def fake_ctx(
             fail-loud 校验（与生产派发路径同语义）；缺省为空集，suspend
             一律拒绝（测试挂起语义必须显式传名单）。
         tmp_root: 提供时在其下创建一次性临时目录作为 ``output_roots``，
-            并建 ``ipc`` 子目录（declare_output/declare_cache 的产物
-            清单记录随之可用）。路径经 ``ctx.output_roots`` / ``ctx.ipc_dir``
+            并建 ``ipc`` 子目录供独立测试上下文使用。路径经 ``ctx.output_roots`` / ``ctx.ipc_dir``
             读取；目录清理由调用方的 tmp_root 机制（如 pytest tmp_path
             的会话级回收）统一承担。
         output_roots: 直接指定产物根目录（与 tmp_root 互斥使用）。

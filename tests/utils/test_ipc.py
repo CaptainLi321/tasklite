@@ -15,7 +15,6 @@ from tasklite.utils.ipc import (
     ArtifactCleanupMode,
     ArtifactJournal,
     PIPE_MSG_INPUT,
-    PIPE_MSG_OUTPUT,
     WorkerPipeMessage,
     create_worker_pipe,
 )
@@ -136,13 +135,11 @@ class TestArtifactJournalDeclarations:
         messages = receiver.drain_to_eof(timeout=3.0)
         receiver.close()
 
-        assert len(messages) == 2
+        assert journal.read_artifacts("t::pipe") == (decl,)
+        assert len(messages) == 1
         assert isinstance(messages[0], WorkerPipeMessage)
-        assert messages[0].kind == PIPE_MSG_OUTPUT
-        assert messages[0].payload == decl.to_dict()
-        assert isinstance(messages[1], WorkerPipeMessage)
-        assert messages[1].kind == PIPE_MSG_INPUT
-        assert messages[1].payload == {"path": in_path}
+        assert messages[0].kind == PIPE_MSG_INPUT
+        assert messages[0].payload == {"path": in_path}
 
 
 class TestCleanupSandboxRecheck:
@@ -364,10 +361,9 @@ class TestTypedArtifactJournal:
         sender.close()
         receiver.close()
         journal = ArtifactJournal(tmp_path / "ipc", pipe_sender=sender)
-        with pytest.raises(_ArtifactIOError):
-            journal.record_artifact(
-                "t::1", ArtifactDeclaration(str(tmp_path / "report"), name="report")
-            )
+        declaration = ArtifactDeclaration(str(tmp_path / "report"), name="report")
+        journal.record_artifact("t::1", declaration)
+        assert journal.read_artifacts("t::1") == (declaration,)
         with pytest.raises(_ArtifactIOError):
             journal.record_input_file("t::1", str(tmp_path / "source"))
 

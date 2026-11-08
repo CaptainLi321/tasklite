@@ -15,10 +15,10 @@ import time
 import pytest
 
 from tasklite.exceptions import _ArtifactIOError
-from tasklite.models.artifact import ArtifactDeclaration
+from tasklite.models.artifact import FileSpec
 from tasklite.utils.ipc import (
     PIPE_MSG_INPUT,
-    PIPE_MSG_OUTPUT,
+    PIPE_MSG_DECLARE,
     PIPE_MSG_RESULT,
     PIPE_MSG_SUSPEND,
     WorkerPipeMessage,
@@ -30,15 +30,8 @@ from tasklite.utils.ipc import (
 def _sequential_sender_worker(sender) -> None:
     try:
         sender.send_input("/tmp/in.txt")
-        sender.send_output(
-            ArtifactDeclaration(
-                path="/tmp/out.txt",
-                name="out",
-                delete_existing=False,
-                delete_on_success=False,
-                delete_on_failure=True,
-                sandbox=False,
-            )
+        sender.send_declare(
+            "request", "out", FileSpec("/tmp/out.txt", role="output", delete_on_failure=True).to_dict(),
         )
         sender.send_suspend("api", 2.5)
         sender.send_result({"status": "success", "result": 42})
@@ -107,7 +100,7 @@ class TestWorkerPipePrimitives:
         kinds = [m.kind for m in messages if isinstance(m, WorkerPipeMessage)]
         assert kinds == [
             PIPE_MSG_INPUT,
-            PIPE_MSG_OUTPUT,
+            PIPE_MSG_DECLARE,
             PIPE_MSG_SUSPEND,
             PIPE_MSG_RESULT,
         ]
@@ -279,17 +272,8 @@ class TestWorkerPipePrimitives:
         sender.close()
         with pytest.raises(_ArtifactIOError):
             sender.send_input("/tmp/a")
-        with pytest.raises(_ArtifactIOError):
-            sender.send_output(
-                ArtifactDeclaration(
-                    path="/tmp/b",
-                    name="b",
-                    delete_existing=False,
-                    delete_on_success=False,
-                    delete_on_failure=True,
-                    sandbox=False,
-                )
-            )
+        with pytest.raises(OSError):
+            sender.send_declare("request", "out", FileSpec("/tmp/b", role="output").to_dict())
         receiver.close()
 
         active_recv_threads = [

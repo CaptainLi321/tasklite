@@ -668,6 +668,17 @@ class CompletionMachine:
                 self._channel.cleanup_artifacts(
                     entry.job_uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY,
                 )
+                policy = ArtifactPathPolicy(
+                    output_roots=getattr(self._channel, "output_roots", None),
+                    protected_roots=self._channel.protected_roots,
+                )
+                for spec in entry.active_files.values():
+                    if (spec.delete_on_failure and spec.path
+                            and store.check_or_request_authorization(spec.path) is True):
+                        policy.cleanup(
+                            ArtifactDeclaration(spec.path, delete_on_failure=True),
+                            success=False,
+                        )
             except BaseException as error:
                 cleanup_error = cleanup_error or error
             finally:

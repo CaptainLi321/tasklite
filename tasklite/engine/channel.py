@@ -32,7 +32,6 @@ from ..utils.ipc import (
     ArtifactJournal,
     PIPE_MSG_DECLARE,
     PIPE_MSG_INPUT,
-    PIPE_MSG_OUTPUT,
     PIPE_MSG_RESULT,
     PIPE_MSG_SUSPEND,
     WorkerPipeMessage,
@@ -648,15 +647,7 @@ class ExecutionChannel:
 
     def _accept_message(self, handle: JobHandle, msg: WorkerPipeMessage) -> None:
         """消费一条已校验信封的管道消息并更新通道内存状态。"""
-        if msg.kind == PIPE_MSG_OUTPUT:
-            if not isinstance(msg.payload, dict):
-                raise ValueError(f"invalid artifact declaration for {handle.job_uid}")
-            try:
-                declaration = ArtifactDeclaration.from_dict(msg.payload)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"invalid artifact declaration for {handle.job_uid}") from exc
-            self.journal.record_artifact(handle.job_uid, declaration, prepare=False)
-        elif msg.kind == PIPE_MSG_INPUT:
+        if msg.kind == PIPE_MSG_INPUT:
             if not isinstance(msg.payload, dict):
                 raise ValueError(f"invalid input declaration for {handle.job_uid}")
             self.journal.record_input_entry(handle.job_uid, msg.payload)

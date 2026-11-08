@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import Job, TaskLite, TaskResult
+from tasklite import FileSpec, Job, TaskLite, TaskResult
 from tasklite.triggers import on_input_change
 from tasklite.utils.clock import parse_utc_iso_to_us
 
@@ -22,8 +22,10 @@ def _actual_spawn(_patch_mp_context, monkeypatch):
 def _pipeline(tmp_path, **overrides):
     out = tmp_path / "output"
     out.mkdir(parents=True, exist_ok=True)
-    return TaskLite(backend="sqlite", state_path=tmp_path / "trigger_lifecycle.db",
-                    output_roots=out, **overrides)
+    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "trigger_lifecycle.db",
+                        output_roots=out, **overrides)
+    pipeline.authorizer = lambda *args: True
+    return pipeline
 
 
 def produce_input(job, ctx):
@@ -31,7 +33,7 @@ def produce_input(job, ctx):
     if mode == "fail":
         return TaskResult.failure(message="upstream failed in this batch")
     if mode == "write":
-        path = Path(ctx.declare_output(ctx.output_roots / "source.txt", delete_existing=True))
+        path = Path(ctx.declare_file("source", FileSpec(ctx.output_roots / "source.txt", role="output", delete_existing=True)))
         path.write_text(job.payload.get("content", "first"), encoding="utf-8")
         if "mtime_ns" in job.payload:
             stamp = job.payload["mtime_ns"]

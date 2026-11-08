@@ -3,18 +3,19 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import Job
+from tasklite import FileSpec, Job, TaskLiteError
 from tasklite.testing import fake_ctx
-from tasklite.utils.ipc import create_worker_pipe
+from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
 
 
 def test_named_output_is_idempotent_without_deleting_written_content(tmp_path):
-    ctx = fake_ctx(Job("build", "one"), tmp_root=tmp_path)
-    path = ctx.declare_output("result.txt", name="report", delete_existing=True)
-    Path(path).write_text("retained", encoding="utf-8")
-    assert ctx.declare_output("result.txt", name="report", delete_existing=True) == path
-    assert Path(path).read_text(encoding="utf-8") == "retained"
-    assert len(ctx._journal.read_artifacts("build::one")) == 1
+    ctx = fake_ctx(Job("build", "one"), base_dir=tmp_path)
+    spec = FileSpec("result.txt", role="output", delete_existing=True)
+    path = ctx.declare_file("report", spec)
+    path.write_text("retained", encoding="utf-8")
+    assert ctx.declare_file("report", spec) == path
+    assert path.read_text(encoding="utf-8") == "retained"
+    assert set(ctx._files) == {"report"}
 
 
 def test_getter_reads_direct_dependency_without_declaring_input(tmp_path):
@@ -32,87 +33,44 @@ def test_getter_reads_direct_dependency_without_declaring_input(tmp_path):
     assert ctx._journal.read_inputs(ctx.job.uid) == [report]
 
 
-@pytest.mark.parametrize("attributes", [
-    {}, {"delete_on_failure": True}, {"delete_on_success": True},
-])
-def test_existing_path_requires_independent_front_delete(tmp_path, attributes):
+@pytest.mark.parametrize("role", ["output", "cache"])
+@pytest.mark.parametrize("attributes", [{}, {"delete_on_failure": True}, {"delete_on_success": True}])
+def test_existing_path_requires_explicit_delete_request(tmp_path, role, attributes):
     path = tmp_path / "existing"
     path.write_text("valuable", encoding="utf-8")
     ctx = fake_ctx(Job("build", "one"))
-    with pytest.raises(FileExistsError):
-        ctx.declare_output(path, **attributes)
+    assert ctx.declare_file("keep", FileSpec(path, role=role, **attributes)) == path
     assert path.read_text(encoding="utf-8") == "valuable"
-    assert ctx.declare_output(path, delete_existing=True, **attributes) == str(path)
+    assert ctx.declare_file("delete", FileSpec(path, role=role, delete_existing=True, **attributes)) == path
     assert not path.exists()
 
 
 @pytest.mark.parametrize("change", [
-    {"name": "alias"}, {"delete_existing": False}, {"delete_on_failure": True},
-    {"delete_on_success": True, "name": None}, {"sandbox": False},
+    {"delete_existing": False}, {"delete_on_failure": True},
+    {"delete_on_success": True}, {"role": "cache"},
 ])
-def test_changed_declaration_rejected_before_deleting_content(tmp_path, change):
-    ctx = fake_ctx(Job("build", "one"), tmp_root=tmp_path)
-    attributes = {"name": "report", "delete_existing": True}
-    path = Path(ctx.declare_output("report", **attributes))
+def test_changed_named_declaration_rejected_before_deleting_content(tmp_path, change):
+    ctx = fake_ctx(Job("build", "one"), base_dir=tmp_path)
+    attributes = {"role": "output", "delete_existing": True}
+    path = ctx.declare_file("report", FileSpec("report", **attributes))
     path.write_text("valuable", encoding="utf-8")
-    with pytest.raises(ValueError):
-        ctx.declare_output(path, **(attributes | change))
+    with pytest.raises(TaskLiteError, match="conflicts"):
+        ctx.declare_file("report", FileSpec(path, **(attributes | change)))
     assert path.read_text(encoding="utf-8") == "valuable"
 
 
-@pytest.mark.parametrize("first, second", [("folder", "folder/report"), ("folder/report", "folder")])
-def test_overlapping_paths_rejected(tmp_path, first, second):
-    ctx = fake_ctx(Job("build", "one"), tmp_root=tmp_path)
-    ctx.declare_output(first)
-    with pytest.raises(ValueError, match="overlapping"):
-        ctx.declare_output(second, delete_existing=True)
+@pytest.mark.parametrize("first, second", [("folder", "folder/report"), ("folder/report", "folder"), ("same", "same")])
+def test_different_names_allow_overlapping_paths(tmp_path, first, second):
+    ctx = fake_ctx(Job("build", "one"), base_dir=tmp_path)
+    assert ctx.declare_file("first", FileSpec(first, role="output")) == tmp_path / first
+    assert ctx.declare_file("second", FileSpec(second, role="output")) == tmp_path / second
 
 
 def test_same_name_cannot_move_to_another_path(tmp_path):
-    ctx = fake_ctx(Job("build", "one"), tmp_root=tmp_path)
-    ctx.declare_output("first", name="report")
-    with pytest.raises(ValueError, match="name already declared"):
-        ctx.declare_output("second", name="report")
-
-
-def test_cache_uses_anonymous_output_authorizations(tmp_path):
-    ctx = fake_ctx(Job("build", "one"), tmp_root=tmp_path)
-    path = ctx.declare_cache("scratch", delete_existing=True)
-    declaration, = ctx._journal.read_artifacts(ctx.job.uid)
-    assert declaration.to_dict() == {
-        "path": path, "name": None, "delete_existing": True,
-        "delete_on_failure": True, "delete_on_success": True, "sandbox": True,
-    }
-    with pytest.raises(TypeError):
-        ctx.declare_cache("other", name="forbidden")
-    with pytest.raises(ValueError):
-        ctx.declare_output("other", name="forbidden", delete_on_success=True)
-    with pytest.raises(TypeError):
-        ctx.declare_output("other", cleanup_on_fail=True)
-
-
-@pytest.mark.parametrize("relative", ["", "nested", "../"])
-def test_sandbox_exemption_does_not_allow_state_paths(tmp_path, relative):
-    state = tmp_path / "state"
-    state.mkdir()
-    ctx = fake_ctx(Job("build", "one"), protected_roots=(state,))
-    with pytest.raises(ValueError, match="protected root"):
-        ctx.declare_output(state / relative, sandbox=False, delete_existing=True)
-    assert state.is_dir()
-
-
-@pytest.mark.parametrize("target", ["root", "ipc", "leaf_link", "dangling_link"])
-def test_protected_paths_and_leaf_links_rejected(tmp_path, target):
-    ctx = fake_ctx(Job("build", "one"), tmp_root=tmp_path)
-    real = tmp_path / "real"
-    real.write_text("valuable", encoding="utf-8")
-    leaf = tmp_path / "link"
-    leaf.symlink_to(real if target != "dangling_link" else tmp_path / "missing")
-    path = {"root": ctx.output_roots, "ipc": Path(ctx.ipc_dir),
-            "leaf_link": leaf, "dangling_link": leaf}[target]
-    with pytest.raises(ValueError):
-        ctx.declare_output(path, sandbox=False, delete_existing=True)
-    assert real.read_text(encoding="utf-8") == "valuable"
+    ctx = fake_ctx(Job("build", "one"), base_dir=tmp_path)
+    ctx.declare_file("report", FileSpec("first", role="output"))
+    with pytest.raises(TaskLiteError, match="conflicts"):
+        ctx.declare_file("report", FileSpec("second", role="output"))
 
 
 @pytest.mark.parametrize("successes, dependencies, artifacts, expected", [
@@ -150,11 +108,14 @@ def test_declaration_write_error_propagates(tmp_path):
     )
     sender.close()
     receiver.close()
-    ctx._bind_pipe_sender(sender)
-    from tasklite.exceptions import _ArtifactIOError
-
-    with pytest.raises(_ArtifactIOError):
-        ctx.declare_output(tmp_path / "result")
+    reply_receiver, reply_sender = create_worker_reply_pipe(job_uid=ctx.job.uid, execution_id="exec_err")
+    ctx._bind_pipe_sender(sender, reply_receiver)
+    try:
+        with pytest.raises(OSError):
+            ctx.declare_file("result", FileSpec(tmp_path / "result", role="output"))
+    finally:
+        reply_receiver.close()
+        reply_sender.close()
 
 
 def test_getter_propagates_access_error_with_reference_context(tmp_path, monkeypatch):
@@ -184,6 +145,7 @@ def test_output_path_io_fault_is_environment_error(tmp_path, monkeypatch):
 
     ctx = fake_ctx(Job('build', 'one'), tmp_root=tmp_path)
     target = tmp_path / 'result'
+    target.write_text("valuable")
     original = os.lstat
 
     def denied(path, *args, **kwargs):
@@ -192,5 +154,5 @@ def test_output_path_io_fault_is_environment_error(tmp_path, monkeypatch):
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(os, 'lstat', denied)
-    with pytest.raises(_ArtifactIOError, match='output access denied'):
-        ctx.declare_output(target)
+    with pytest.raises(PermissionError, match='output access denied'):
+        ctx.declare_file('result', FileSpec(target, role='output', delete_existing=True))

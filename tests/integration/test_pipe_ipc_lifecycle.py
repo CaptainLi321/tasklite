@@ -24,7 +24,7 @@ import time
 
 import pytest
 
-from tasklite import Job, TaskLite, TaskResult
+from tasklite import FileSpec, Job, TaskLite, TaskResult
 from tasklite.resource import CapacityResource
 from tasklite.backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from tasklite.utils.artifact import ArtifactPathPolicy
@@ -41,7 +41,7 @@ def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> boo
 
 
 def success_handler(job: Job, ctx) -> TaskResult:
-    output = Path(ctx.declare_output("published.txt", name="report"))
+    output = Path(ctx.declare_file("report", FileSpec(ctx.output_roots / "published.txt", role="output")))
     output.write_text("已发布", encoding="utf-8")
     ctx.declare_input(output)
     ctx.set_cursor("position", "42")
@@ -58,7 +58,7 @@ def interrupted_handler(job: Job, ctx) -> TaskResult:
     if job.attempt_no > 1:
         return TaskResult.success(metadata={"recovered": True})
     for filename, allowed in (("authorized.txt", True), ("retained.txt", False)):
-        path = Path(ctx.declare_output(filename, delete_on_failure=allowed))
+        path = Path(ctx.declare_file(filename, FileSpec(ctx.output_roots / filename, role="output", delete_on_failure=allowed)))
         path.write_text("半成品", encoding="utf-8")
     sync_dir = Path(job.payload["sync_dir"])
     (sync_dir / "ready").write_text(str(os.getpid()), encoding="utf-8")
@@ -78,16 +78,16 @@ def timeout_handler(job: Job, ctx) -> TaskResult:
 
 
 def cleanup_handler(job: Job, ctx) -> TaskResult:
-    path = Path(ctx.declare_cache("temporary.txt"))
+    path = Path(ctx.declare_file("temporary", FileSpec(ctx.output_roots / "temporary.txt", role="cache", delete_on_success=True, delete_on_failure=True)))
     path.write_text("临时产物", encoding="utf-8")
     return TaskResult.success(metadata={"uncommitted": True})
 
 
 def controlled_handler(job: Job, ctx) -> TaskResult:
     sync_dir = Path(job.payload["sync_dir"])
-    kept = Path(ctx.declare_output("kept.txt"))
+    kept = Path(ctx.declare_file("kept", FileSpec(ctx.output_roots / "kept.txt", role="output")))
     kept.write_text("保留产物", encoding="utf-8")
-    temporary = Path(ctx.declare_cache("temporary.txt"))
+    temporary = Path(ctx.declare_file("temporary", FileSpec(ctx.output_roots / "temporary.txt", role="cache", delete_on_success=True, delete_on_failure=True)))
     temporary.write_text("临时产物", encoding="utf-8")
     ctx.declare_input(kept)
     ctx.suspend_resource("api", 60)
@@ -98,7 +98,7 @@ def controlled_handler(job: Job, ctx) -> TaskResult:
 
 def invalid_frame_handler(job: Job, ctx) -> TaskResult:
     for filename, allowed in (("authorized.txt", True), ("retained.txt", False)):
-        path = Path(ctx.declare_output(filename, delete_on_failure=allowed))
+        path = Path(ctx.declare_file(filename, FileSpec(ctx.output_roots / filename, role="output", delete_on_failure=allowed)))
         path.write_text("错误消息之前声明的产物", encoding="utf-8")
     fault = job.payload["fault"]
     sender = ctx._pipe_sender
@@ -127,6 +127,8 @@ def pipelines(tmp_path):
             output_roots=tmp_path / "output",
             max_workers=1,
         )
+        (tmp_path / "output").mkdir(exist_ok=True)
+        pipeline.authorizer = lambda *args: True
         pipeline.register_resource(CapacityResource("api", max_capacity=1.0))
         pipeline.register_task("child", child_handler)
         created.append(pipeline)
@@ -269,7 +271,7 @@ def test_process_death_uses_existing_budget(pipelines, monkeypatch, tmp_path, mo
                 if (
                     not killed_once
                     and (sync_dir / "ready").exists()
-                    and len(channel.read_declared_artifacts(handle.job_uid)) == 2
+                    and len(pipeline._runtime._in_flight[handle.job_uid].active_files) == 2
                 ):
                     killed_once.append(handle.execution_id or "")
                     handle.process.kill()
@@ -299,7 +301,7 @@ def test_process_death_uses_existing_budget(pipelines, monkeypatch, tmp_path, mo
     assert pipeline.backend.load_queue() == []
 
 
-def test_cleanup_error_preserves_uncommitted_queue(pipelines, monkeypatch, tmp_path):
+def test_cleanup_error_fails_without_publishing_success(pipelines, monkeypatch, tmp_path):
     pipeline = pipelines()
     pipeline.register_task("work", cleanup_handler)
     pipeline.enqueue(Job("work", "cleanup", max_retries_per_run=3))
@@ -309,18 +311,14 @@ def test_cleanup_error_preserves_uncommitted_queue(pipelines, monkeypatch, tmp_p
 
     with monkeypatch.context() as failure:
         failure.setattr(ArtifactPathPolicy, "cleanup", unavailable)
-        with pytest.raises(PermissionError, match="授权清理不可用"):
-            pipeline.run()
+        pipeline.run()
     assert pipeline.backend.load_successes() == {}
-    assert pipeline.backend.load_failed() == {}
-    rows = pipeline.backend.load_queue_jobs()
-    assert len(rows) == 1 and rows[0]["status"] == "running"
-    assert rows[0]["attempt_no"] == 1
+    failed = pipeline.backend.load_failed()["work::cleanup"]
+    assert "授权清理不可用" in failed["error_message"]
+    assert pipeline.backend.load_queue_jobs() == []
+    attempt, = pipeline.backend.load_settled_attempts("work::cleanup")
+    assert attempt["outcome"] == "failure"
     assert (tmp_path / "output" / "temporary.txt").exists()
-    if pipeline.backend.schema_version >= TARGET_SCHEMA_VERSION:
-        assert pipeline.backend.load_attempts("work::cleanup") == []
-    else:
-        assert pipeline.backend.load_attempts("work::cleanup")[0].outcome == "running"
 
 
 def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_path):
@@ -340,7 +338,7 @@ def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_p
             if (
                 not requested
                 and (sync_dir / "ready").exists()
-                and len(channel.read_declared_artifacts(handle.job_uid)) == 2
+                and len(pipeline._runtime._in_flight[handle.job_uid].active_files) == 2
             ):
                 requested.append(handle.execution_id or "")
                 pipeline.stop()

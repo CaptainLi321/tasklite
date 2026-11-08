@@ -426,3 +426,55 @@ def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, mo
     assert attempt["outcome"] == "success" and attempt["attempt_no"] == 1
     assert not target.exists()
     p.close()
+
+
+def _legacy_delete_handler(job, ctx):
+    getattr(ctx, job.payload["method"])(job.payload["path"], delete_existing=True)
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("method", ["declare_output", "declare_cache"])
+@pytest.mark.parametrize("backend", ["sqlite", "memory"])
+def test_removed_file_declaration_cannot_delete_without_authorization(tmp_path, monkeypatch, method, backend):
+    """被移除的声明入口不得绕过主进程授权删除既有文件。"""
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "valuable"
+    target.write_text("valuable")
+    p = TaskLite(backend=backend, **({"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}))
+    calls = []
+    p.authorizer = lambda *args: calls.append(args) or False
+    p.register_task("work", _legacy_delete_handler)
+    p.enqueue(Job("work", "one", payload={"path": str(target), "method": method}))
+    p.run()
+    assert target.read_text() == "valuable"
+    assert calls == []
+    assert "AttributeError" == p.backend.load_failed()["work::one"]["exception"]["type"]
+    p.close()
+
+
+def _legacy_output_message_handler(job, ctx):
+    from tasklite.utils.jsonutil import dumps
+
+    ctx._pipe_sender._conn.send_bytes(dumps({
+        "job_uid": job.uid, "execution_id": ctx._pipe_sender.execution_id,
+        "kind": "output", "payload": {
+            "path": job.payload["path"], "delete_on_success": True,
+            "delete_on_failure": True,
+        },
+    }).encode())
+    return TaskResult.success()
+
+
+def test_removed_output_message_cannot_authorize_cleanup(tmp_path, monkeypatch):
+    """单向产物帧不能作为绕过请求回复授权的删除入口。"""
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "valuable"
+    target.write_text("valuable")
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
+        p.authorizer = lambda *args: False
+        p.register_task("work", _legacy_output_message_handler)
+        p.enqueue(Job("work", "one", payload={"path": str(target)}))
+        with pytest.raises(ValueError, match="unknown worker pipe message kind"):
+            p.run()
+        assert target.read_text() == "valuable"
+        assert p.backend.load_successes() == {}

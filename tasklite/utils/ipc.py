@@ -4,9 +4,9 @@
 
 - 单向管道传输：基于 ``multiprocessing.Pipe(duplex=False)`` 的原生帧收发
   （``send_bytes`` / ``recv_bytes``），每 worker 独立读取线程与有界队列，
-  承载 ``input`` / ``output`` / ``suspend`` / ``result`` 四类信封消息；
+  承载 ``input`` / ``declare`` / ``suspend`` / ``result`` 信封消息；
 - 路径与沙盒校验：空字节防御、跨盘多根沙盒匹配、相对路径规范重定位；
-- 产物与输入声明：worker 侧预检、前删与实时管道发送，父进程侧内存态聚合、
+- 产物与输入声明：worker 侧请求回复声明，主进程侧授权、准备及内存态聚合、
   存在性校验与成败授权清理；
 - 产物生命周期清理：按 PRE_SUBMIT / SUCCESS / FAILURE_OR_RETRY 模式清理
   已声明临时文件与目录，删除前消费侧沙盒归属复检。
@@ -43,14 +43,12 @@ logger = logging.getLogger("tasklite")
 
 # 管道消息种类常量
 PIPE_MSG_INPUT = "input"
-PIPE_MSG_OUTPUT = "output"
 PIPE_MSG_SUSPEND = "suspend"
 PIPE_MSG_RESULT = "result"
 PIPE_MSG_DECLARE = "declare"
 VALID_PIPE_MESSAGE_KINDS = frozenset(
     {
         PIPE_MSG_INPUT,
-        PIPE_MSG_OUTPUT,
         PIPE_MSG_SUSPEND,
         PIPE_MSG_RESULT,
         PIPE_MSG_DECLARE,
@@ -156,13 +154,6 @@ class WorkerPipeSender:
         """发送规范输入路径声明；底层管道错误转为 _ArtifactIOError。"""
         try:
             self.send_message(PIPE_MSG_INPUT, {"path": resolved_path})
-        except OSError as exc:
-            raise _ArtifactIOError(str(exc)) from exc
-
-    def send_output(self, declaration: ArtifactDeclaration) -> None:
-        """发送输出/缓存声明；底层管道错误转为 _ArtifactIOError。"""
-        try:
-            self.send_message(PIPE_MSG_OUTPUT, declaration.to_dict())
         except OSError as exc:
             raise _ArtifactIOError(str(exc)) from exc
 
@@ -624,9 +615,9 @@ class ArtifactJournal:
     # ── 声明登记与管道发送 ────────────────────────────────────────
 
     def record_artifact(
-        self, job_uid: str, declaration: ArtifactDeclaration, *, prepare: bool = False,
+        self, job_uid: str, declaration: ArtifactDeclaration,
     ) -> None:
-        """校验同执行授权与路径范围后登记，绑定管道时同步上报父进程。"""
+        """校验路径范围并登记主进程内部产物记录，不执行准备操作。"""
         try:
             self._validate_artifact_path(declaration)
         except OSError as error:
@@ -635,21 +626,6 @@ class ArtifactJournal:
         declarations = append_artifact_declaration(previous, declaration)
         if len(declarations) == len(previous):
             return
-        if prepare:
-            try:
-                self.path_policy.remove_existing(declaration)
-            except FileExistsError as error:
-                if not declaration.delete_existing:
-                    raise
-                raise _ArtifactIOError(str(error)) from error
-            except OSError as error:
-                raise _ArtifactIOError(str(error)) from error
-            try:
-                Path(declaration.path).parent.mkdir(parents=True, exist_ok=True)
-            except OSError as error:
-                raise _ArtifactIOError(str(error)) from error
-        if self._pipe_sender is not None:
-            self._pipe_sender.send_output(declaration)
         self._artifacts[job_uid] = declarations
 
     @property
@@ -734,7 +710,6 @@ __all__ = [
     "ArtifactJournal",
     "PIPE_MSG_DECLARE",
     "PIPE_MSG_INPUT",
-    "PIPE_MSG_OUTPUT",
     "PIPE_MSG_RESULT",
     "PIPE_MSG_SUSPEND",
     "VALID_PIPE_MESSAGE_KINDS",

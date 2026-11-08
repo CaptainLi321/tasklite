@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import Job, TaskLite, TaskResult
+from tasklite import FileSpec, Job, TaskLite, TaskResult
 
 
 @pytest.fixture(autouse=True)
@@ -13,7 +13,7 @@ def _actual_spawn(_patch_mp_context, monkeypatch):
 
 
 def build_bundle(job, ctx):
-    folder = Path(ctx.declare_output("bundle", name="bundle", delete_existing=True))
+    folder = Path(ctx.declare_file("bundle", FileSpec(ctx.output_roots / "bundle", role="output", delete_existing=True)))
     folder.mkdir()
     (folder / "report.txt").write_text("published", encoding="utf-8")
     return TaskResult.success()
@@ -26,14 +26,16 @@ def consume_bundle(job, ctx):
 
 
 def illegal_state_output(job, ctx):
-    ctx.declare_output(job.payload["path"], sandbox=False, delete_existing=True)
+    ctx.declare_file("protected", FileSpec(job.payload["path"], role="output", delete_existing=True))
     return TaskResult.success()
 
 
 def _pipeline(tmp_path):
     out = tmp_path / "output"
     out.mkdir(parents=True, exist_ok=True)
-    return TaskLite(backend="sqlite", state_path=tmp_path / "artifacts.db", output_roots=out)
+    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "artifacts.db", output_roots=out)
+    pipeline.authorizer = lambda *args: True
+    return pipeline
 
 
 def test_direct_dependency_publishes_directory_for_actual_file_input(tmp_path):
@@ -86,7 +88,10 @@ def test_dispatch_protects_complete_state_directory(tmp_path):
     try:
         pipeline.enqueue(Job("unsafe", "one", payload={"path": str(pipeline.state_path)}))
         pipeline.run()
-        assert "unsafe::one" in pipeline.backend.load_failed()
+        assert pipeline.backend.load_failed() == {}
+        row, = pipeline.backend.load_queue_jobs()
+        assert row["job_uid"] == "unsafe::one" and row["status"] == "pending"
+        assert pipeline.backend.load_successes() == {}
         assert pipeline.state_path.exists()
     finally:
         pipeline.stop()

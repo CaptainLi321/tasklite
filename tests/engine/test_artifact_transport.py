@@ -5,12 +5,14 @@ import multiprocessing as mp
 import pytest
 
 from tasklite.engine.channel import WorkerLaunchSpec, _decode_ipc_result, _worker_process_entry
+from tasklite.models.artifact import FileSpec
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
 from tasklite.utils.ipc import (
     PIPE_MSG_RESULT,
     WorkerPipeMessage,
     create_worker_pipe,
+    create_worker_reply_pipe,
 )
 
 
@@ -118,7 +120,7 @@ def _write_declaration_with_io_fault(job, ctx):
     from tasklite.utils.ipc import WorkerPipeSender
 
     kind = job.payload["kind"]
-    target_method = "send_output" if kind == "output" else "send_input"
+    target_method = "send_declare" if kind == "output" else "send_input"
 
     def denied_send(self, *args, **kwargs):
         from tasklite.exceptions import _ArtifactIOError
@@ -128,7 +130,7 @@ def _write_declaration_with_io_fault(job, ctx):
     with patch.object(WorkerPipeSender, target_method, denied_send):
         try:
             if kind == "output":
-                ctx.declare_output(job.payload["path"])
+                ctx.declare_file("output", FileSpec(job.payload["path"], role="output"))
             else:
                 ctx.declare_input(job.payload["path"])
         except Exception:
@@ -145,6 +147,7 @@ def test_public_declaration_write_fault_bypasses_handler_exception(tmp_path, kin
     ipc.mkdir()
     ctx = JobContext(job, set(), set(), {}, output_roots=tmp_path, ipc_dir=str(ipc))
     receiver, sender = create_worker_pipe(job_uid=job.uid, execution_id="session.1")
+    reply_receiver, reply_sender = create_worker_reply_pipe(job_uid=job.uid, execution_id="session.1")
     spec = WorkerLaunchSpec(
         _write_declaration_with_io_fault,
         job,
@@ -153,8 +156,10 @@ def test_public_declaration_write_fault_bypasses_handler_exception(tmp_path, kin
         str(ipc),
         10.0,
         pipe_sender=sender,
+        reply_receiver=reply_receiver,
     )
     _worker_process_entry(spec)
+    reply_sender.close()
     payload = _drain_result_payload(receiver)
     assert payload["status"] == "artifact_error"
     result = _decode_ipc_result(payload, None, job)

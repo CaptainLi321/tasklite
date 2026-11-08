@@ -247,47 +247,6 @@ class JobContext:
             ) from e
         self.spawned_jobs.append(Job.from_dict(job_dict))
 
-    def declare_output(
-        self, path: str | Path, *, name: str | None = None,
-        delete_existing: bool = False, delete_on_failure: bool = False,
-        delete_on_success: bool = False, sandbox: bool = True,
-    ) -> str:
-        """声明文件或目录并返回规范绝对路径；三项删除授权相互独立。
-
-        声明必须早于首次写入。完全一致的重复声明幂等，不会再次删除；
-        调用方负责跨 Job 的路径独占，框架不维护全局所有权。
-        """
-        journal = self._journal
-        policy = journal.path_policy
-        try:
-            resolved = policy.resolve(path, sandbox=sandbox)
-        except OSError as error:
-            raise _ArtifactIOError(str(error)) from error
-        declaration = ArtifactDeclaration(
-            resolved, name=name, delete_existing=delete_existing,
-            delete_on_failure=delete_on_failure, delete_on_success=delete_on_success,
-            sandbox=sandbox,
-        )
-        journal.record_artifact(self.job.uid, declaration, prepare=True)
-        if name:
-            self._files[name] = FileSpec(
-                resolved,
-                role="output",
-                delete_existing=delete_existing,
-                delete_on_failure=delete_on_failure,
-                delete_on_success=delete_on_success,
-            )
-        return resolved
-
-    def declare_cache(
-        self, path: str | Path, *, delete_existing: bool = False, sandbox: bool = True,
-    ) -> str:
-        """声明成败均清理的匿名临时磁盘产物；已有路径仍须前删授权。"""
-        return self.declare_output(
-            path, delete_existing=delete_existing, delete_on_failure=True,
-            delete_on_success=True, sandbox=sandbox,
-        )
-
     def declare_input(self, path: str | Path) -> str:
         """声明一个本地输入文件或目录：校验路径存在、记录规范绝对路径并返回该路径字符串。
 

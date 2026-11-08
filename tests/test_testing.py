@@ -93,11 +93,13 @@ class TestFakeCtxTmpRoot:
         assert Path(ctx.ipc_dir).parent == Path(ctx.output_roots)
         assert Path(ctx.ipc_dir).is_dir()
 
-    def test_declare_output_resolved_inside_sandbox(self, tmp_path):
+    def test_declare_file_uses_explicit_output_path(self, tmp_path):
         ctx = fake_ctx(_job(), tmp_root=tmp_path)
-        final = ctx.declare_output("out.json")
+        from tasklite import FileSpec
+
+        final = ctx.declare_file("out", FileSpec(ctx.output_roots / "out.json", role="output"))
         assert str(tmp_path) in str(final)
-        assert final.startswith(str(ctx.output_roots))
+        assert final.is_relative_to(ctx.output_roots)
 
     def test_two_ctxs_get_isolated_dirs(self, tmp_path):
         ctx1 = fake_ctx(_job(), tmp_root=tmp_path)
