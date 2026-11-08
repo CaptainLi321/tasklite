@@ -86,6 +86,7 @@ class StandstillFacts:
     waiting_for_dependency: bool = False
     has_potential_spawners: bool = False
     attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
+    has_resource_waiters: bool = False
 
 
 @dataclass
@@ -110,6 +111,8 @@ class ScheduleResult:
     # 死锁归因值对象（UID 集合）
     attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
     candidate_uid: str | None = None
+    impossible_reason: str | None = None
+    has_resource_waiters: bool = False
 
     @property
     def is_runnable(self) -> bool:
@@ -133,6 +136,7 @@ class ScheduleResult:
             waiting_for_dependency=self.waiting_for_dependency,
             has_potential_spawners=self.has_potential_spawners,
             attribution=self.attribution,
+            has_resource_waiters=self.has_resource_waiters,
         )
 
 
@@ -323,6 +327,7 @@ class JobScheduler:
         missing_dependency_uids: list[str] = []
         malformed_uids: list[str] = []
         impossible_resource_uids: list[str] = []
+        has_resource_waiters = False
 
         for i in self.ordering_policy.visit_order(queue_snapshots):
             job_snapshot = queue_snapshots[i]
@@ -395,6 +400,7 @@ class JobScheduler:
                 can_run = False
             elif not eval_res.is_available:
                 can_run = False
+                has_resource_waiters = True
                 min_wait = min(min_wait, eval_res.wait_time)
 
             if not can_run:
@@ -452,6 +458,7 @@ class JobScheduler:
             kind=kind,
             attribution=attribution,
             candidate_uid=candidate_uid,
+            has_resource_waiters=has_resource_waiters,
         )
 
 

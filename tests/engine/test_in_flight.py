@@ -157,7 +157,7 @@ class TestInFlightTrackerHandlesAndPseudo:
 
 class TestInFlightTrackerResourceRelease:
     def test_release_all_resources_clears_used(self):
-        gpu = CapacityResource("gpu", 10.0)
+        gpu = CapacityResource("gpu", max_capacity=10.0)
         gpu.acquire(4.0)
         rm = ResourceManager({"gpu": gpu})
 
@@ -175,13 +175,13 @@ class TestInFlightTrackerResourceRelease:
         assert gpu.used == 0.0
 
     def test_entry_self_release_with_lease(self):
-        gpu = CapacityResource("gpu", 10.0)
+        gpu = CapacityResource("gpu", max_capacity=10.0)
         rm = ResourceManager({"gpu": gpu})
-        lease = rm.reserve("t", {"gpu": 3.0}, job_uid="t::j1")
+        acquired = rm.acquire_all("t", {"gpu": 3.0})
         assert gpu.used == 3.0
 
         job = Job("t", "j1", payload={"gpu": 3.0})
-        entry = InFlightJob(job_uid="t::j1", job_snapshot=job.to_dict(), job=job, lease=lease)
+        entry = InFlightJob(job_uid="t::j1", job_snapshot=job.to_dict(), job=job, acquired=acquired)
         assert entry.acquired == [("gpu", 3.0)]
 
         entry.release_resources(rm)
@@ -189,7 +189,7 @@ class TestInFlightTrackerResourceRelease:
         assert entry.acquired == []
 
     def test_release_resources_idempotent(self):
-        gpu = CapacityResource("gpu", 10.0)
+        gpu = CapacityResource("gpu", max_capacity=10.0)
         gpu.acquire(2.0)
         rm = ResourceManager({"gpu": gpu})
         job = Job("t", "j1")

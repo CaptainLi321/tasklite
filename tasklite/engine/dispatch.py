@@ -66,9 +66,9 @@ from .errorclass import (
     ERR_DISPATCH_FAILURE,
     ERR_JOB_DEPENDENCY,
     ERR_NO_HANDLER,
+    ERR_RESOURCE_DEADLOCK,
 )
 from .in_flight import InFlightJob
-from .resource import RateLimitUnavailable
 from .scheduler import ScheduleResult, StandstillFacts
 from .types import AttemptOutcome
 from .wait import IN_FLIGHT_POLL_SECONDS
@@ -303,8 +303,25 @@ class DispatchMachine:
                 store.state.requeue_jobs([job_snapshot], front=True)
                 raise
 
-        self._drain_signals_before_reserve(job_uid)
+        # 重新检查全部资源（授权后的全部资源检查到连续获取完成之间，不插入其他分配或回收）
+        eval_res = self._resources.evaluate(job.task_type, job.resources)
+        if eval_res.is_impossible:
+            self._reject_and_commit(
+                job_uid,
+                job_snapshot,
+                {"error_message": ERR_RESOURCE_DEADLOCK, "error_details": eval_res.reason},
+                count_as="failed",
+                attempt_id=None,
+            )
+            return None
+        if not eval_res.is_available:
+            store.state.requeue_jobs([job_snapshot], front=True)
+            return None
+
         self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
+
+        # 逐项获取资源（串行连续获取，异常属 Run 级框架故障直接上抛）
+        acquired = self._resources.acquire_all(job.task_type, job.resources, job_uid=job_uid)
 
         try:
             return self._spawn_entry(
@@ -313,6 +330,7 @@ class DispatchMachine:
                 job_snapshot,
                 attempt_id,
                 execution_id,
+                acquired,
                 attempt_no=attempt_no,
                 started_at=started_at,
             )
@@ -328,9 +346,6 @@ class DispatchMachine:
             raise
         except KeyboardInterrupt:
             self._handle_interrupt(job_uid, job_snapshot)
-            return None
-        except RateLimitUnavailable as e:
-            self._handle_rate_limit_defer(job_uid, job_snapshot, attempt_id, e)
             return None
         except Exception as e:
             self._handle_dispatch_failure(job_uid, job_snapshot, attempt_id, e)
@@ -411,60 +426,57 @@ class DispatchMachine:
         job_snapshot: dict,
         attempt_id: int | None,
         execution_id: str,
+        acquired: list[tuple[str, float]],
         *,
         attempt_no: int = 1,
         started_at: str | None = None,
     ) -> InFlightJob | None:
-        """两阶段资源租约 → 载荷校验 → 执行上下文组装 → spawn → 在飞登记。
+        """载荷校验 → 执行上下文组装 → spawn → 在飞登记。
 
-        载荷校验失败不走子进程：释放租约后按派发拒绝语义直接 commit。
         spawn 已启动而后续步骤异常时（entry 尚未登记在飞），此处清理
         子进程句柄后原样上抛——崩溃信号与断言信号不清理（交由运行循环
         崩溃网/断言网处置）。
         """
         store = self._store
         handle = None
-        lease = self._resources.reserve(job.task_type, job.resources, job_uid=job_uid)
         try:
-            with lease:
-                task = self._tasks.lookup(job.task_type)
-                ctx = self._build_context(job, store.state)
-                logger.info(f"RUN: {job_uid}")
-                started_monotonic = time.monotonic()
-                handle = self._channel.spawn(WorkerLaunchSpec(
-                    handler=task.handler,
-                    job=job,
-                    job_context=ctx,
-                    execution_id=execution_id,
-                    ipc_dir=self._ipc_dir,
-                    timeout_seconds=float(
-                        job.timeout_seconds if job.timeout_seconds is not None else 3600.0
-                    ),
-                ))
-                lease.claim()
+            task = self._tasks.lookup(job.task_type)
+            ctx = self._build_context(job, store.state)
+            logger.info(f"RUN: {job_uid}")
+            started_monotonic = time.monotonic()
+            handle = self._channel.spawn(WorkerLaunchSpec(
+                handler=task.handler,
+                job=job,
+                job_context=ctx,
+                execution_id=execution_id,
+                ipc_dir=self._ipc_dir,
+                timeout_seconds=float(
+                    job.timeout_seconds if job.timeout_seconds is not None else 3600.0
+                ),
+            ))
 
-                entry = InFlightJob(
-                    job_uid=job_uid,
-                    job_snapshot=job_snapshot,
-                    job=job,
-                    handle=handle,
-                    started_monotonic=started_monotonic,
-                    lease=lease,
-                    attempt_id=attempt_id,
-                    execution_id=execution_id,
-                    attempt_no=attempt_no,
-                    run_id=self._session.run_id or "run",
-                    started_at=started_at,
-                    known_job_uids=frozenset(
-                        store.state.queue_uids
-                        | store.state.in_flight_uids
-                        | store.state.success_uids
-                        | store.state.failed_uids
-                    ),
-                )
-                # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
-                self._in_flight.track(entry, state=store.state)
-                return entry
+            entry = InFlightJob(
+                job_uid=job_uid,
+                job_snapshot=job_snapshot,
+                job=job,
+                handle=handle,
+                started_monotonic=started_monotonic,
+                acquired=acquired,
+                attempt_id=attempt_id,
+                execution_id=execution_id,
+                attempt_no=attempt_no,
+                run_id=self._session.run_id or "run",
+                started_at=started_at,
+                known_job_uids=frozenset(
+                    store.state.queue_uids
+                    | store.state.in_flight_uids
+                    | store.state.success_uids
+                    | store.state.failed_uids
+                ),
+            )
+            # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
+            self._in_flight.track(entry, state=store.state)
+            return entry
         except (_CommitCrashSignal, AssertionError):
             raise
         except BaseException:
@@ -547,30 +559,6 @@ class DispatchMachine:
         # 不在此保存队列：内存此刻缺其他 in-flight 作业，交给运行循环的
         # 崩溃安全保存合并磁盘真相后统一保存。
         raise KeyboardInterrupt
-
-    def _handle_rate_limit_defer(
-        self,
-        job_uid: str,
-        job_snapshot: dict,
-        attempt_id: int | None,
-        exc: RateLimitUnavailable,
-    ) -> None:
-        """限速二次检查失败分支：瞬态信号降级回队（零预算 + 零污染）。
-
-        调度评估与预约之间应用的限速挂起（关 5 残留信号排空）使二次
-        检查失败——瞬态等待信号：零预算 + 降级写盘回队 + 零污染，实际
-        等待由资源挂起 TTL 承担，绝不计入 3-strike 崩溃计数。
-        """
-        logger.warning(
-            f"Deferring {job_uid}: rate limit re-check failed at reserve ({exc})."
-        )
-        self._store.requeue_transient(
-            job_snapshot,
-            transient_kind="rate_limited",
-            attempt_id=attempt_id,
-            error_message=str(exc),
-        )
-        return None
 
     def _handle_dispatch_failure(
         self,

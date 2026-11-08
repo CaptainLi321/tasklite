@@ -247,7 +247,7 @@ class TaskLite:
             )
         resources = ResourceManager(tasks=tasks)
         resources[WORKER_RESOURCE] = CapacityResource(
-            WORKER_RESOURCE, float(max_workers)
+            WORKER_RESOURCE, max_capacity=float(max_workers)
         )
         return resources
 
@@ -354,8 +354,8 @@ class TaskLite:
     def register_resource(self, resource: Resource) -> None:
         """注册一个资源调度器。
 
-        ``resource.name`` 已存在（含内部 ``__workers__``）时覆盖并告警；
-        覆盖 ``__workers__`` 即改变管线最大并发。
+        同名资源重复注册明确拒绝，内部 worker 容量不能通过资源注册覆盖，
+        最大并发只通过 max_workers 配置。
         """
         self._ensure_not_running("register_resource")
         if not isinstance(resource, Resource):
@@ -363,8 +363,13 @@ class TaskLite:
                 f"register_resource expects a Resource instance, "
                 f"got {type(resource).__name__}"
             )
+        if resource.name == WORKER_RESOURCE:
+            raise ValueError(
+                f"Cannot register internal worker resource {WORKER_RESOURCE!r}; "
+                f"worker concurrency must be configured via max_workers."
+            )
         if resource.name in self.resources:
-            logger.warning(f"Overwriting existing resource '{resource.name}'")
+            raise ValueError(f"Resource {resource.name!r} already registered")
         self.resources[resource.name] = resource
 
     def register_task(

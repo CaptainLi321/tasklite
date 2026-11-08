@@ -11,7 +11,7 @@ if str(REPO_ROOT) not in sys.path:
 import tasklite
 from tasklite import (
     TaskLite, Job, JobContext, FileSpec, TaskResult,
-    CapacityResource, RateLimitResource, Resource, FailureEntry,
+    CapacityResource, IntervalResource, Resource, FailureEntry,
     job_ref, slice_list, content_fingerprint,
     encode_job_component, encode_identifier, encode_content_id
 )
@@ -44,8 +44,8 @@ def main():
     # 2. 端到端管线运行验证（多进程、依赖拓扑、瞬态重试、资源管理、持久化）
     with tempfile.TemporaryDirectory() as tmpdir:
         pipeline = TaskLite("matrix_verify_pipeline", state_dir=tmpdir, max_workers=2)
-        pipeline.register_resource(CapacityResource("gpu", 2.0))
-        pipeline.register_resource(RateLimitResource("api", 0.05))
+        pipeline.register_resource(CapacityResource("gpu", max_capacity=2.0))
+        pipeline.register_resource(IntervalResource("api", interval_seconds=0.05))
 
         pipeline.register_task("task_a", handler_a, resources={"gpu": 1.0})
         pipeline.register_task("task_retry", handler_retry)

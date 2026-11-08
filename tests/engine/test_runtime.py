@@ -179,7 +179,7 @@ class RuntimeEnv:
         Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
         self.backend = InMemoryStateBackend()
         self.resources = ResourceManager(
-            {WORKER_RESOURCE: CapacityResource(WORKER_RESOURCE, capacity)}
+            {WORKER_RESOURCE: CapacityResource(WORKER_RESOURCE, max_capacity=capacity)}
         )
         self.tasks = TaskRegistry()
         self.hooks: list[tuple[str, AttemptOutcome]] = []

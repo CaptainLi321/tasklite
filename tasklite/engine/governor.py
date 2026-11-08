@@ -208,7 +208,7 @@ class DeadlockGovernor:
                     standstill=selection_standstill,
                 )
 
-        if facts.min_wait == float("inf"):
+        if facts.attribution.has_deadlock_causes:
             return self._resolve_deadlock(
                 facts,
                 store=store,
@@ -227,11 +227,12 @@ class DeadlockGovernor:
                 )
             else:
                 cycle_uids = store.state.find_dependency_cycles()
-            if cycle_uids:
-                logger.error(
-                    f"Deadlock detected during wait: dependency cycle "
-                    f"{sorted(set(cycle_uids))} masked by finite min_wait."
-                )
+            if cycle_uids or facts.min_wait == float("inf"):
+                if cycle_uids:
+                    logger.error(
+                        f"Deadlock detected during wait: dependency cycle "
+                        f"{sorted(set(cycle_uids))} masked by finite min_wait."
+                    )
                 return self._resolve_deadlock(
                     facts,
                     store=store,
@@ -239,6 +240,22 @@ class DeadlockGovernor:
                     selection_standstill=selection_standstill,
                     scheduler=None,
                 )
+
+
+        # 3. 资源等待（包含有限时间等待与未知时长通知等待）：不视为死锁缺口
+        if facts.has_resource_waiters:
+            self.deadlock_gap_rounds = 0
+            return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
+
+        # 4. 无成因且无任何资源等待的无限停摆 → 进入缺口重试或升级归因
+        if facts.min_wait == float("inf"):
+            return self._resolve_deadlock(
+                facts,
+                store=store,
+                selection_machine=selection_machine,
+                selection_standstill=selection_standstill,
+                scheduler=None,
+            )
 
         # 正常等待/背压结论（有限等待且无环）证明上一缺口 episode 已消解——
         # 缺口升级只统计连续轮次，非连续缺口从零计数

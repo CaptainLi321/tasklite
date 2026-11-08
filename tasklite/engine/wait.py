@@ -39,6 +39,8 @@ class LoopFacts:
     deadlock_wait: float = 0.0
     # governor 仲裁的独立终止信号（区别于 is_idle）
     should_terminate: bool = False
+    # 本拍是否刚熔断/解决死锁（已产生状态迁移，下一拍立即推进）
+    deadlock_detected: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,16 +54,18 @@ class WaitDecision:
 def decide_wait(facts: LoopFacts) -> WaitDecision:
     """等待/空闲决策唯一实现（分支次序即优先级契约）。"""
     is_idle = facts.store_empty and not facts.has_in_flight
-    if is_idle or facts.should_terminate:
+    if is_idle or facts.should_terminate or facts.deadlock_detected:
+        return WaitDecision(should_wait=False, wait_time=0.0)
+    if facts.settled > 0:
         return WaitDecision(should_wait=False, wait_time=0.0)
     if facts.has_in_flight:
-        if facts.settled == 0:
-            return WaitDecision(should_wait=True, wait_time=IN_FLIGHT_POLL_SECONDS)
-        return WaitDecision(should_wait=False, wait_time=0.0)
+        return WaitDecision(should_wait=True, wait_time=IN_FLIGHT_POLL_SECONDS)
     if facts.deadlock_wait > 0:
         return WaitDecision(should_wait=True, wait_time=min(facts.deadlock_wait, _WAIT_CAP_SECONDS))
     if not facts.has_runnable and facts.min_wait != float("inf"):
-        return WaitDecision(should_wait=True, wait_time=min(facts.min_wait, _WAIT_CAP_SECONDS))
+        return WaitDecision(should_wait=True, wait_time=facts.min_wait)
     if facts.worker_wait > 0:
         return WaitDecision(should_wait=True, wait_time=min(facts.worker_wait, _WAIT_CAP_SECONDS))
+    if not facts.has_runnable and not facts.store_empty:
+        return WaitDecision(should_wait=True, wait_time=float("inf"))
     return WaitDecision(should_wait=(facts.dispatched == 0 and facts.settled == 0), wait_time=0.0)

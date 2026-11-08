@@ -26,7 +26,6 @@ import pytest
 
 from tasklite import CapacityResource, Job, TaskLite, TaskResult
 from tasklite.backend.sqlite_backend import TARGET_SCHEMA_VERSION
-from tasklite.engine.resource import ENGINE_METADATA_RESOURCE_SUSPENSIONS
 from tasklite.utils.artifact import ArtifactPathPolicy
 from tasklite.utils.jsonutil import dumps, loads
 
@@ -128,7 +127,7 @@ def pipelines(tmp_path):
             backend="sqlite",
             max_workers=1,
         )
-        pipeline.register_resource(CapacityResource("api", 1))
+        pipeline.register_resource(CapacityResource("api", max_capacity=1.0))
         pipeline.register_task("child", child_handler)
         created.append(pipeline)
         return pipeline
@@ -218,10 +217,6 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
     assert cursor == ("42",)
     assert queue == [("child::child",)]
     assert backend.load_queue() == []
-    assert (
-        loads(backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS))["api"]
-        > time.time()
-    )
     pid = metadata["worker_pid"]
     assert pid != os.getpid()
     pipeline.stop()
@@ -233,12 +228,6 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
     assert len(reopened.backend.load_attempts("parent::parent")) == 1
     assert reopened.backend.load_successes()["parent::parent"]["worker_pid"] == pid
     assert reopened.backend.load_cursors()["position"] == "42"
-    assert (
-        loads(reopened.backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS))[
-            "api"
-        ]
-        > time.time()
-    )
     reopened.enqueue(Job("parent", "parent"))
     assert reopened.run() is None
     expected_attempts = (
@@ -364,12 +353,6 @@ def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_p
     queue = pipeline.backend.load_queue()
     assert not (tmp_path / "output" / "temporary.txt").exists()
     assert (tmp_path / "output" / "kept.txt").exists()
-    assert (
-        loads(
-            pipeline.backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS)
-        )["api"]
-        > time.time()
-    )
     assert [j["job_id"] for j in queue] == ["waiting"]
     assert pipeline.backend.load_successes()["controlled::active"]["inputs"] == [
         str(tmp_path / "output" / "kept.txt")

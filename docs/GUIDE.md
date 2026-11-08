@@ -20,7 +20,7 @@ from tasklite import (
     OrderingPolicy, FifoOrderingPolicy,     # 调度排序 seam
     RequeuePolicy, ImmediateRequeuePolicy, RequeuePlan,  # 重入队节奏 seam
     Exclude,                     # 候选排除规则
-    CapacityResource, RateLimitResource,    # 资源体系
+    CapacityResource, IntervalResource,     # 资源体系
     encode_identifier, encode_job_component, encode_content_id,  # 单射编码族
 )
 ```
@@ -164,7 +164,7 @@ Task 规格（进程内 TaskRegistry：handler / 默认资源 / payload_schema /
 import logging
 from pathlib import Path
 
-from tasklite import Job, RateLimitResource, TaskLite, TaskResult
+from tasklite import Job, IntervalResource, TaskLite, TaskResult
 
 logging.getLogger("tasklite").setLevel(logging.INFO)
 
@@ -188,7 +188,7 @@ pipeline = TaskLite(
 )
 
 # 2. 注册资源（限速/容量；max_workers 即经 __workers__ CapacityResource 实现）
-pipeline.register_resource(RateLimitResource("api", interval_seconds=0.5))
+pipeline.register_resource(IntervalResource("api", interval_seconds=0.5))
 
 # 3. 注册 Task 规格与瞬态异常
 pipeline.register_task("download", download_handler, resources={"api": 1.0})

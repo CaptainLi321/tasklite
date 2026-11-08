@@ -29,7 +29,7 @@ from tasklite.engine.errorclass import ERR_MAX_RETRIES, ErrorClassifier
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
 from tasklite.engine.resource import (
     CapacityResource,
-    RateLimitResource,
+    IntervalResource,
     ResourceManager,
 )
 from tasklite.engine.store import StateStore
@@ -61,7 +61,7 @@ class CompletionEnv:
         Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
 
         resources_map = {
-            "__workers__": CapacityResource("__workers__", 2.0),
+            "__workers__": CapacityResource("__workers__", max_capacity=2.0),
         }
         if extra_resources:
             resources_map.update(extra_resources)
@@ -87,17 +87,18 @@ class CompletionEnv:
             session=self.session,
         )
 
-    def track_entry(self, job: Job, *, lease=None, attempt_id=None) -> InFlightJob:
+    def track_entry(self, job: Job, *, lease=None, attempt_id=None, acquired=None) -> InFlightJob:
         snapshot = job.to_dict()
         self.store.finalize_intake_snapshot(snapshot, job.task_type)
         job.__dict__.update(Job.from_dict(snapshot).__dict__)
-        if lease is None:
-            lease = self.resources.reserve(job.task_type, job.resources, job_uid=job.uid)
+        if acquired is None and lease is None:
+            acquired = self.resources.acquire_all(job.task_type, job.resources, job_uid=job.uid)
         entry = InFlightJob(
             job_uid=job.uid,
             job_snapshot=job.to_dict(),
             job=job,
             lease=lease,
+            acquired=acquired if acquired is not None else [],
             attempt_id=attempt_id,
         )
         self.in_flight.track(entry, state=self.store.state)
@@ -133,7 +134,7 @@ class TestCompleteJobSuccess:
     """complete_job 成功生命周期。"""
 
     def test_success_lifecycle(self, tmp_path, monkeypatch):
-        env = CompletionEnv(tmp_path, extra_resources={"gpu": CapacityResource("gpu", 10.0)})
+        env = CompletionEnv(tmp_path, extra_resources={"gpu": CapacityResource("gpu", max_capacity=10.0)})
         job = Job("t", "j1", resources={"gpu": 2.0})
         attempt_id = env.open_attempt(job)
         entry = env.track_entry(job, attempt_id=attempt_id)
@@ -445,41 +446,22 @@ class TestSpawnedJobs:
 
 
 class TestSuspensionApplication:
-    """结果携带的资源挂起全局应用。"""
+    """资源释放契约。"""
 
-    def test_suspensions_applied_and_persisted(self, tmp_path):
-        from tasklite.utils.jsonutil import loads
+    def test_resource_released_before_commit(self, tmp_path):
+        cap = CapacityResource("slots", max_capacity=1.0)
+        env = CompletionEnv(tmp_path, extra_resources={"slots": cap})
+        cap.acquire(1.0)
+        assert cap.used == 1.0
 
-        env = CompletionEnv(
-            tmp_path, extra_resources={"api": RateLimitResource("api", 0.01)}
-        )
-        job = Job("t", "j1")
-        entry = env.track_entry(job, attempt_id=env.open_attempt(job))
-
-        env.completion.complete_job(
-            entry,
-            ExecutionResult(
-                success=True,
-                result_metadata={},
-                resource_suspensions=[("api", 30.0)],
-            ),
-        )
-        assert env.resources["api"].suspended_until() is not None
-        raw = env.backend.get_engine_metadata("resource_suspensions")
-        assert raw is not None and "api" in loads(raw)
-
-    def test_unknown_resource_suspension_skipped(self, tmp_path, caplog):
-        env = CompletionEnv(tmp_path)
-        job = Job("t", "j1")
-        entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+        job = Job("t", "j1", resources={"slots": 1.0})
+        entry = env.track_entry(job, attempt_id=env.open_attempt(job), acquired=[("slots", 1.0)])
 
         env.completion.complete_job(
             entry,
-            ExecutionResult(
-                success=True, result_metadata={}, resource_suspensions=[("ghost", 5.0)],
-            ),
+            ExecutionResult(success=True, result_metadata={}),
         )
-        assert "t::j1" in env.store.state.successes
+        assert cap.used == 0.0, "任务完成前必须释放资源"
 
 
 class TestIdentityVacuity:
@@ -780,11 +762,10 @@ def test_completion_reads_declarations_once_and_rejects_missing_output(tmp_path,
 
 
 @pytest.mark.parametrize('declaration_error', [False, True])
-def test_environment_fault_preserves_resource_suspension(tmp_path, monkeypatch, declaration_error):
+def test_environment_fault_preserves_retry_state(tmp_path, monkeypatch, declaration_error):
     from tasklite.exceptions import _ArtifactIOError
-    from tasklite.utils.jsonutil import loads
 
-    env = CompletionEnv(tmp_path, extra_resources={'api': RateLimitResource('api', 0.01)})
+    env = CompletionEnv(tmp_path, extra_resources={'api': IntervalResource('api', interval_seconds=0.01)})
     entry = env.track_entry(Job('t', 'limited'))
 
     def denied(declarations, *, success):
@@ -795,10 +776,7 @@ def test_environment_fault_preserves_resource_suspension(tmp_path, monkeypatch, 
         env.completion.complete_job(entry, ExecutionResult(
             artifact_error='write denied' if declaration_error else None,
             retry_requested=True, transient_kind='rate_limited',
-            resource_suspensions=[('api', 30.0)],
         ))
-    assert env.resources['api'].suspended_until() is not None
-    assert 'api' in loads(env.backend.get_engine_metadata('resource_suspensions'))
     assert entry.job.attempt_no == 1
     assert not env.store.state.failed
     assert not env.hooks
@@ -807,7 +785,7 @@ def test_environment_fault_preserves_resource_suspension(tmp_path, monkeypatch, 
 def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkeypatch):
     from tasklite.models.artifact import ArtifactDeclaration
 
-    env = CompletionEnv(tmp_path, extra_resources={'api': RateLimitResource('api', 0.01)})
+    env = CompletionEnv(tmp_path, extra_resources={'api': IntervalResource('api', interval_seconds=0.01)})
     first, second = Job('t', 'first'), Job('t', 'second')
     for job in (first, second):
         env.track_entry(job, attempt_id=env.open_attempt(job))
@@ -821,9 +799,8 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
     with pytest.raises(PermissionError):
         env.completion.settle_reaped([
             (env.make_handle(first.uid), ExecutionResult(success=False)),
-            (env.make_handle(second.uid), ExecutionResult(success=True, resource_suspensions=[('api', 30.0)])),
+            (env.make_handle(second.uid), ExecutionResult(success=True)),
         ])
-    assert env.resources['api'].suspended_until() is not None
     assert second.uid in env.backend.load_successes()
     assert [snapshot['job_id'] for snapshot in env.store.state.queue] == ['first']
     assert not env.store.state.failed

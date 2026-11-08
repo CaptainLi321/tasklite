@@ -36,7 +36,7 @@ from tasklite.engine.in_flight import InFlightTracker
 from tasklite.engine.recovery import RecoveryOrchestrator
 from tasklite.engine.resource import (
     CapacityResource,
-    RateLimitResource,
+    IntervalResource,
     ResourceManager,
 )
 from tasklite.engine.scheduler import JobScheduler
@@ -86,7 +86,7 @@ class DispatchEnv:
         self.output_roots = str(tmp_path / "out")
 
         resources_map = {
-            "__workers__": CapacityResource("__workers__", capacity),
+            "__workers__": CapacityResource("__workers__", max_capacity=capacity),
         }
         if extra_resources:
             resources_map.update(extra_resources)
@@ -345,52 +345,22 @@ class TestPreSubmitCleanupAndActiveSignals:
         assert outcome.kind is DispatchKind.SPAWNED
         assert cleaned == ["t::j1"]
 
-    def test_active_suspension_signal_applied_before_spawn(
-        self, tmp_path, monkeypatch
+    def test_interval_resource_defers_without_burning_budget(
+        self, tmp_path
     ):
-        env = DispatchEnv(tmp_path, extra_resources={"api": RateLimitResource("api", 0.01)})
-        env.register("t")
-        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-        monkeypatch.setattr(
-            env.channel, "drain_active_signals",
-            lambda uids: [("t::j1", "api", 30.0)],
-        )
-        monkeypatch.setattr(
-            env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
-        )
-
-        outcome = env.dispatch.dispatch_next()
-        assert outcome.kind is DispatchKind.SPAWNED
-        assert env.resources["api"].suspended_until() is not None
-
-
-class TestRateLimitDefer:
-    """限速二次检查失败：瞬态信号零预算回队。"""
-
-    def test_rate_limit_recheck_defers_transiently(self, tmp_path, monkeypatch):
-        rate_limit = RateLimitResource("api", 3600.0)
+        """IntervalResource 处于间隔窗内：作业留队，不消耗派发失败预算。"""
+        rate_limit = IntervalResource("api", interval_seconds=3600.0)
         env = DispatchEnv(tmp_path, extra_resources={"api": rate_limit})
         env.register("t")
+        rate_limit.acquire(1.0)  # 消费时间片
         job = Job("t", "j1", resources={"api": 1.0})
         env.store.state.spawn_jobs([job.to_dict()])
-        assert env.resources.evaluate("t", {"api": 1.0}).is_available
-
-        # 在途信号排空恰落在调度评估之后、reserve 预约之前
-        monkeypatch.setattr(
-            env.channel, "drain_active_signals",
-            lambda uids: [("t::j1", "api", 30.0)],
-        )
 
         outcome = env.dispatch.dispatch_next()
-        assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
+        assert outcome.kind is DispatchKind.NO_CANDIDATE
         assert "t::j1" in env.store.state.queue_uids
         rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
-        assert rt.dispatch_failures == 0, "限速二次检查不得计入派发失败 3-strike"
-        assert rt.last_retry_error == "", "瞬态信号不得污染 last_retry_error"
-        assert env.stats["rate_limited_reruns"] == 1
-        records = env.backend.load_attempts("t::j1")
-        assert records[-1].outcome == "requeued"
+        assert rt.dispatch_failures == 0, "资源等待不得计入派发失败 3-strike"
 
 
 class TestDispatchFailureStrike:

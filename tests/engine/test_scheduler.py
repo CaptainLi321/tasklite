@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tasklite.engine.resource import CapacityResource, ResourceManager
+from tasklite.engine.resource import CapacityResource, IntervalResource, ResourceManager
 from tasklite.engine.scheduler import (
     DeadlockAttribution,
     FifoOrderingPolicy,
@@ -187,7 +187,7 @@ class TestScanAttribution:
         assert result.min_wait == INF
 
     def test_impossible_resource_attribution(self):
-        cap = CapacityResource("r", 1.0)
+        cap = CapacityResource("r", max_capacity=1.0)
         scheduler = JobScheduler({"r": cap})
         state = _state([Job("t", "x", resources={"r": 99.0}).to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset())
@@ -204,8 +204,8 @@ class TestScanAttribution:
 
     def test_malformed_forces_inf_over_finite_resource_wait(self):
         """畸形归因不被其它 job 的有限资源等待遮蔽：min_wait 必须强制 inf。"""
-        gpu = CapacityResource("gpu", 4.0)
-        gpu.suspend(30.0)
+        gpu = IntervalResource("gpu", interval_seconds=30.0)
+        gpu.acquire(1.0)
         scheduler = JobScheduler({"gpu": gpu})
         state = _state(
             [
@@ -218,8 +218,8 @@ class TestScanAttribution:
         assert result.min_wait == INF, "有限资源等待不得遮蔽畸形死锁归因"
 
     def test_finite_resource_wait_reported(self):
-        gpu = CapacityResource("gpu", 4.0)
-        gpu.suspend(20.0)
+        gpu = IntervalResource("gpu", interval_seconds=20.0)
+        gpu.acquire(1.0)
         scheduler = JobScheduler({"gpu": gpu})
         state = _state([Job("t", "w", resources={"gpu": 1.0}).to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset())
@@ -243,7 +243,7 @@ class TestScanAttribution:
         assert result.waiting_for_dependency is True
 
     def test_has_potential_spawners_with_resource_blocked_job(self):
-        gpu = CapacityResource("gpu", 1.0)
+        gpu = CapacityResource("gpu", max_capacity=1.0)
         gpu.used = 1.0
         scheduler = JobScheduler({"gpu": gpu})
         state = _state(
@@ -317,7 +317,7 @@ class TestOrderingPolicySeam:
         assert result.pending_dep_failure == "t::other_parent"
 
     def test_scheduler_accepts_resource_manager_directly(self):
-        gpu = CapacityResource("gpu", 4.0)
+        gpu = CapacityResource("gpu", max_capacity=4.0)
         rm = ResourceManager({"gpu": gpu})
         scheduler = JobScheduler(rm)
         assert scheduler.resource_mgr is rm

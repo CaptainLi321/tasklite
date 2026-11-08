@@ -375,7 +375,7 @@ class TestSelectionClosedLoopArbitration:
         assert decision.standstill.blocked_uids == ("normal::2",)
 
     def test_excluded_self_loop_and_cross_exclude_cycle_leave_allowed_work_runnable(self):
-        from tasklite.engine.resource import CapacityResource
+        from tasklite.engine.resource import IntervalResource
         from tasklite.engine.scheduler import JobScheduler
         from tasklite.engine.selection import SelectionMachine
         from tasklite.engine.store import StateStore
@@ -391,8 +391,8 @@ class TestSelectionClosedLoopArbitration:
         exclude = Exclude(task_type="excluded")
         machine = SelectionMachine(store, exclude=exclude)
         store.set_run_exclusions(exclude)
-        resource = CapacityResource("api", 1)
-        resource.suspend(30)
+        resource = IntervalResource("api", interval_seconds=30.0)
+        resource.acquire(1.0)
         scheduler = JobScheduler({"api": resource})
         scheduler.reset_run(exclude)
         facts = scheduler.scan_next_runnable(store.state, set()).standstill_facts()

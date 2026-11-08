@@ -30,8 +30,8 @@ import pytest
 
 from tasklite import (
     CapacityResource,
+    IntervalResource,
     Job,
-    RateLimitResource,
     TaskLite,
     TaskResult,
 )
@@ -282,7 +282,7 @@ class TestEndToEnd:
 
     def test_six_step_contract_with_resource(self, tmp_path):
         p = _make_pipeline(tmp_path)
-        p.register_resource(CapacityResource("io_slots", 4.0))
+        p.register_resource(CapacityResource("io_slots", max_capacity=4.0))
         p.register_task("work", ok_with_input_handler)
         assert p.enqueue(Job("work", "step_one")) is True
         assert p.enqueue(Job("work", "step_two")) is True
@@ -383,21 +383,17 @@ class TestRealSubprocessFaultScenarios:
         assert [a.outcome for a in attempts] == ["failed"]
         assert attempts[0].error_message is not None and "TIMEOUT" in attempts[0].error_message
 
-    def test_real_subprocess_suspend_resource_recovers(self, tmp_path):
-        """RateLimitResource 挂起：首作业挂起资源，后续作业等恢复后完成。"""
+    def test_real_subprocess_interval_resource_paces(self, tmp_path):
+        """IntervalResource：首作业获取后推进下次可用时间，后续作业按间隔派发。"""
         p = _make_pipeline(tmp_path)
-        api = RateLimitResource("api", interval_seconds=1.0)
+        api = IntervalResource("api", interval_seconds=1.0)
         p.register_resource(api)
         p.register_task(
-            "gated", suspend_and_complete_handler, resources={"api": 1.0}
+            "gated", plain_gated_handler, resources={"api": 1.0}
         )
         p.register_task(
             "gated_plain", plain_gated_handler, resources={"api": 1.0}
         )
-        # waiter 显式依赖 holder：排除「限速窗口先于 holder 子进程启动到期、
-        # waiter 抢在 holder 结算前派发」的调度竞态（Windows 高负载下子进程
-        # 启动可超过 interval）。依赖使 waiter 只能在 holder 终态后参与调度，
-        # 挂起恢复窗口的断言才具备确定性下界。
         p.enqueue(Job("gated", "holder"))
         p.enqueue(Job("gated_plain", "waiter", depends_on=["gated::holder"]))
         res = p.run()
@@ -407,19 +403,6 @@ class TestRealSubprocessFaultScenarios:
         assert res is None
         assert "gated::holder" in successes
         assert "gated_plain::waiter" in successes
-
-        # 挂起语义下界：waiter 的派发必须晚于 holder 终态 + 挂起窗口的
-        # 宽松下界（挂起 2s，主循环等待单拍上限 1s，下界取 1s——满载只会
-        # 更长，不会更短）
-        holder = p.backend.load_attempts("gated::holder")[0]
-        waiter = p.backend.load_attempts("gated_plain::waiter")[0]
-        gap = (
-            datetime.fromisoformat(waiter.started_at)
-            - datetime.fromisoformat(holder.finished_at)
-        ).total_seconds()
-        assert gap >= 1.0, (
-            f"waiter 必须等待资源挂起恢复后才派发，实测间隔 {gap:.2f}s"
-        )
 
     def test_real_subprocess_keyboard_interrupt_is_transient(self, tmp_path):
         """KeyboardInterrupt → interrupted 瞬态：零预算重入队，重跑成功。

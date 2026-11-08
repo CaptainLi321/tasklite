@@ -182,7 +182,7 @@ def test_stop_from_another_thread_wakes_scheduler_wait(tmp_path):
     """另线程调用 stop() 能立即解除主循环等待。"""
     p = TaskLite("p_wake", state_dir=tmp_path / "state", backend="memory")
 
-    p.resources["gate"] = NeverAvailableResource("gate", 1.0)
+    p.resources["gate"] = NeverAvailableResource("gate", max_capacity=1.0)
     p.register_task("t_wait", success_handler, resources={"gate": 1.0})
     p.enqueue(Job("t_wait", "j1", resources={"gate": 1.0}))
 

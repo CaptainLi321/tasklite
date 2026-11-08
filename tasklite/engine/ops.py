@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from .errorclass import ErrorClassifier
-from .resource import ENGINE_METADATA_RESOURCE_SUSPENSIONS
 from .store import FailureEntry, StateStore
 from ..exceptions import TaskLiteError
 from ..models.job import Job
@@ -22,6 +21,8 @@ from ..utils.encoding import parse_job_uid
 from ..utils.jsonutil import loads
 
 logger = logging.getLogger("tasklite")
+
+ENGINE_METADATA_RESOURCE_SUSPENSIONS = "resource_suspensions"
 
 
 @dataclass(frozen=True)

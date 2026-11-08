@@ -21,9 +21,7 @@ from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
 from tasklite.engine.recovery import RecoveryOrchestrator
 from tasklite.engine.resource import (
-    ENGINE_METADATA_RESOURCE_SUSPENSIONS,
     CapacityResource,
-    RateLimitResource,
     ResourceManager,
 )
 from tasklite.engine.types import JobHandle
@@ -518,71 +516,9 @@ class TestCrashSafeSave:
         assert _uids(backend.load_queue()) == ["t::dup"]
 
 
-class TestSuspendPersistenceAndRestore:
-    def test_apply_pending_signals_persists_suspensions(self):
-        backend = InMemoryStateBackend()
-        resource_mgr = ResourceManager({"api": RateLimitResource("api", 1.0)})
-        orchestrator = make_recovery_orchestrator(
-            backend,
-            resource_mgr=resource_mgr,
-            channel=FakeChannel(active_signals=[("t::j1", "api", 30.0)]),
-            in_flight=InFlightTracker(),
-        )
-
-        orchestrator.apply_pending_signals()
-
-        assert backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS) is not None
-
-    def test_load_resource_suspensions_restores_into_manager(self):
-        backend = InMemoryStateBackend()
-        resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
-        backend.set_engine_metadata(
-            ENGINE_METADATA_RESOURCE_SUSPENSIONS, dumps({"api": time.time() + 30.0})
-        )
-        orchestrator = make_recovery_orchestrator(backend, resource_mgr=resource_mgr)
-
-        orchestrator.load_resource_suspensions()
-
-        assert resource_mgr.collect_suspensions() != {}, "挂起截止必须被恢复注入"
-
-    def test_load_resource_suspensions_ignores_corrupted_meta(self, caplog):
-        backend = InMemoryStateBackend()
-        resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
-        backend.set_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS, "not-json{{")
-        orchestrator = make_recovery_orchestrator(backend, resource_mgr=resource_mgr)
-
-        with caplog.at_level(logging.WARNING, logger="tasklite"):
-            orchestrator.load_resource_suspensions()
-
-        assert resource_mgr.collect_suspensions() == {}
-        assert any("Corrupted" in r.getMessage() for r in caplog.records)
-
-    def test_load_resource_suspensions_ignores_non_dict_meta(self, caplog):
-        backend = InMemoryStateBackend()
-        resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
-        backend.set_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS, dumps([1, 2]))
-        orchestrator = make_recovery_orchestrator(backend, resource_mgr=resource_mgr)
-
-        with caplog.at_level(logging.WARNING, logger="tasklite"):
-            orchestrator.load_resource_suspensions()
-
-        assert resource_mgr.collect_suspensions() == {}
-        assert any("not a dict" in r.getMessage() for r in caplog.records)
-
-    def test_persist_resource_suspensions_writes_meta(self):
-        backend = InMemoryStateBackend()
-        resource_mgr = ResourceManager({"api": RateLimitResource("api", 1.0)})
-        resource_mgr.suspend_resource("api", 15.0)
-        orchestrator = make_recovery_orchestrator(backend, resource_mgr=resource_mgr)
-
-        orchestrator.persist_resource_suspensions()
-
-        assert "api" in loads(backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS))
-
-
 class TestLoadAndRepair:
     def test_load_and_repair_full_flow(self, tmp_path):
-        """四连加载 → 交集收敛 → 队列修复 → 挂起恢复 → 落 store。"""
+        """四连加载 → 交集收敛 → 队列修复 → 落 store。"""
         backend = InMemoryStateBackend()
         backend.seed_successes(["t::overlap", "t::done"])
         backend.append_failed("t::overlap", {"error_message": "legacy"})
@@ -590,11 +526,8 @@ class TestLoadAndRepair:
             {"task_type": "t", "job_id": "done", "trigger": "once"},  # successes 残留
             {"task_type": "t", "job_id": "fresh"},
         ])
-        backend.set_engine_metadata(
-            ENGINE_METADATA_RESOURCE_SUSPENSIONS, dumps({"api": time.time() + 30.0})
-        )
         channel = ExecutionChannel(tmp_path)
-        resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
+        resource_mgr = ResourceManager({"api": CapacityResource("api", max_capacity=1.0)})
         store = StoreShim(backend)
         orchestrator = RecoveryOrchestrator(
             store=store, channel=channel, resources=resource_mgr,
@@ -607,7 +540,6 @@ class TestLoadAndRepair:
         assert store.state is state
         assert "t::overlap" not in state.successes and "t::overlap" in state.failed
         assert [f"{j['task_type']}::{j['job_id']}" for j in state.queue] == ["t::done", "t::fresh"]
-        assert resource_mgr.collect_suspensions() != {}, "挂起必须注入"
 
 
 class _DoneProcess:
@@ -669,7 +601,7 @@ class TestAbortInFlight:
         ipc_dir.mkdir(parents=True, exist_ok=True)
         channel = ExecutionChannel(ipc_dir)
         resource_mgr = resource_mgr if resource_mgr is not None else ResourceManager(
-            {"api": CapacityResource("api", 1.0)}
+            {"api": CapacityResource("api", max_capacity=1.0)}
         )
         completion = RecordingCompletion()
         orchestrator = RecoveryOrchestrator(
@@ -731,53 +663,6 @@ class TestAbortInFlight:
         assert done[0][1].resource_suspensions == [("api", 5.0)], (
             "终前写入的挂起信号并入结果（随完成提交链应用）"
         )
-
-    def test_abort_preserves_suspend_signals(self, tmp_path):
-        """abort 开头先排空 in-flight 的 suspend 信号并应用（kill 前捞回）。"""
-        orchestrator, channel, _, resource_mgr = self._make(tmp_path)
-        job = Job("fast", "suspend_job")
-        channel._pending_signals.append((job.uid, "api", 60.0))
-        process = _DoneProcess()
-        handle = JobHandle(
-            job_uid=job.uid, process=process,
-            timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
-            ipc_dir=str(tmp_path), execution_id=_INCARNATION,
-        )
-        tracker = orchestrator._in_flight
-        tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], handle, None))
-
-        orchestrator.abort_in_flight()
-
-        assert resource_mgr.collect_suspensions() != {}, (
-            "abort 必须消费并应用 suspend 信号，不随 kill 丢失"
-        )
-
-    def test_abort_applies_salvaged_signals_from_outcome(self, tmp_path):
-        """channel 捞回的终前信号经 AbortOutcome 带回并应用（max 幂等合并）。"""
-        from tasklite.engine.channel import AbortOutcome
-
-        backend = InMemoryStateBackend()
-        resource_mgr = ResourceManager({"api": CapacityResource("api", 1.0)})
-        completion = RecordingCompletion()
-        job = Job("fast", "salvage_job")
-        fake_channel = FakeChannel(
-            abort_outcome=AbortOutcome(
-                completed=[], cancelled=[],
-                salvaged_signals=[(job.uid, "api", 30.0)],
-            ),
-        )
-        orchestrator = RecoveryOrchestrator(
-            store=StoreShim(backend), channel=fake_channel, resources=resource_mgr,
-            in_flight=InFlightTracker(), trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
-            completion=completion,
-        )
-        tracker = orchestrator._in_flight
-        tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], None, None))
-
-        orchestrator.abort_in_flight()
-
-        assert resource_mgr.collect_suspensions() != {}, "捞回信号必须被应用"
-        assert backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS) is not None
 
     def test_abort_releases_resources_before_settlement(self, tmp_path):
         """已占用资源在结算前统一释放（防泄漏）。"""

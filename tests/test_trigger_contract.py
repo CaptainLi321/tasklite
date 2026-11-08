@@ -38,8 +38,8 @@ def test_fresh_trigger_skip_allows_dependent_trigger(tmp_path):
 def test_task_resource_merge_and_explicit_false_zero_overrides(tmp_path):
     from tasklite import CapacityResource
     pipeline = TaskLite(name="override", state_dir=tmp_path, backend="memory")
-    pipeline.register_resource(CapacityResource("gpu", 5))
-    pipeline.register_resource(CapacityResource("cpu", 5))
+    pipeline.register_resource(CapacityResource("gpu", max_capacity=5.0))
+    pipeline.register_resource(CapacityResource("cpu", max_capacity=5.0))
     pipeline.register_task("t", handle, resources={"gpu": 2, "cpu": 1},
                            max_retries_per_run=7, timeout_seconds=12,
                            trigger="always")

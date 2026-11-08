@@ -37,7 +37,6 @@ from ..models.artifact import ArtifactDeclaration
 from .channel import ArtifactCleanupMode, ExecutionResult, JobHandle
 from .errorclass import ERR_MAX_RETRIES
 from .in_flight import InFlightJob, InFlightTracker
-from .resource import persist_resource_suspensions
 from .types import AttemptOutcome
 
 logger = logging.getLogger("tasklite")
@@ -171,19 +170,6 @@ class CompletionMachine:
                 f"identity vacuity violation: {uid} not in-flight "
                 f"at apply_result entry"
             )
-
-        # 1. 全局应用资源挂起
-        applied_suspension = False
-        for r_name, secs in result.resource_suspensions:
-            if self._resources.suspend_resource(r_name, secs):
-                applied_suspension = True
-            else:
-                logger.warning(
-                    f"Skipping suspend for unregistered resource {r_name!r} "
-                    f"(requested by {uid})"
-                )
-        if applied_suspension:
-            persist_resource_suspensions(self._store.backend, self._resources)
 
         if result.artifact_error is not None:
             raise _ArtifactIOError(result.artifact_error)

@@ -41,7 +41,7 @@ def _make_runtime(tmp_path) -> EngineRuntime:
     ipc_dir = str(tmp_path / "ipc")
     Path(ipc_dir).mkdir(parents=True, exist_ok=True)
     resources = ResourceManager()
-    resources[WORKER_RESOURCE] = CapacityResource(WORKER_RESOURCE, 2.0)
+    resources[WORKER_RESOURCE] = CapacityResource(WORKER_RESOURCE, max_capacity=2.0)
     return EngineRuntime(
         config=RunConfig.resolve(
             name="testing_helper",

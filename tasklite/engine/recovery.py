@@ -69,11 +69,6 @@ from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import loads
-from .resource import (
-    ENGINE_METADATA_RESOURCE_SUSPENSIONS,
-    apply_suspend_signals,
-    persist_resource_suspensions,
-)
 
 logger = logging.getLogger("tasklite")
 
@@ -263,31 +258,10 @@ class RecoveryOrchestrator:
             )
 
     def load_resource_suspensions(self) -> None:
-        """从 engine_metadata 表恢复资源挂起状态（挂钟截止换算回挂起秒数注入 ResourceManager）。"""
-        try:
-            raw = self._store.backend.get_engine_metadata(ENGINE_METADATA_RESOURCE_SUSPENSIONS)
-        except Exception as e:
-            logger.warning(f"Failed to load resource suspensions from engine_metadata: {e}")
-            return
-        if raw is None:
-            return
-        try:
-            deadlines = loads(raw)
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Corrupted resource_suspensions engine_metadata, ignoring: {e}")
-            return
-        if not isinstance(deadlines, dict):
-            logger.warning("resource_suspensions engine_metadata is not a dict, ignoring")
-            return
-        self._resources.restore_suspensions(deadlines)
+        pass
 
     def persist_resource_suspensions(self) -> None:
-        """run 结束时把资源挂起截止持久化到 engine_metadata 表。
-
-        挂起的应用点即时持久化（消除 kill -9/OOM 时挂起丢失窗口）
-        经 resource.persist_resource_suspensions 共享助手落盘。
-        """
-        persist_resource_suspensions(self._store.backend, self._resources)
+        pass
 
     def save_queue_crash_safe(self) -> None:
         """崩溃路径保存队列：以「磁盘真相」合并「内存队列」，避免丢失作业。
@@ -342,48 +316,24 @@ class RecoveryOrchestrator:
             )
 
     def apply_pending_signals(self, extra_uid: str | None = None) -> None:
-        """读取所有 in-flight job 已发送的 suspend 信号，即时应用并持久化。
-
-        ``suspend()`` 使用 max 语义，重复应用同一信号是幂等的。
-        """
-        active = set(self._in_flight.active_uids())
-        if extra_uid is not None:
-            active.add(extra_uid)
-        signals = self._channel.drain_active_signals(active)
-        apply_suspend_signals(
-            signals, self._store.backend, self._resources, origin="from "
-        )
+        pass
 
     def abort_in_flight(self) -> None:
         """异常/强制停机时：kill 进行中的子进程、消费已完成的结果、requeue。
 
         在 run 主循环的 except 块和 ABORTING 停机路径调用。
         委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理），本方法
-        收敛状态机编排：排空信号 → 释放资源 → 中止分类 → 挂起补应用 →
-        统一结算。
+        收敛状态机编排：释放资源 → 中止分类 → 统一结算。
         """
         if not self._in_flight:
             return
 
-        # 1. 消费所有 in-flight 的 suspend 信号
-        self.apply_pending_signals()
-
-        # 2. 释放已占用的资源（务必在 clear 前）
+        # 1. 释放已占用的资源（务必在 clear 前）
         self._in_flight.release_all_resources(self._resources)
 
-        # 3. 委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理）
+        # 2. 委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理）
         handles = self._in_flight.active_handles()
         outcome = self._channel.abort_in_flight(handles)
-
-        # 3.5 杀进程后补排空的应用点：cancelled 任务的信号文件已随半成品
-        # 清理删除，channel 捞回的 suspend 信号只能经 AbortOutcome 带回；
-        # suspend 为 max 语义，与「先排空」阶段已应用项幂等合并。
-        apply_suspend_signals(
-            outcome.salvaged_signals,
-            self._store.backend,
-            self._resources,
-            origin="salvaged from aborted ",
-        )
 
         completed_map = {h.job_uid: res for h, res in outcome.completed}
         cancelled_entries, done_entries = self._in_flight.classify_aborted(completed_map)

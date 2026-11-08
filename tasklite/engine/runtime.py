@@ -25,6 +25,7 @@ from .errorclass import (
     ERR_DEPENDENCY_EXCLUDED,
     ErrorClassifier,
 )
+from .resource import RunNotifier
 from .selection import SelectionMachine, SelectionStandstill
 from .in_flight import InFlightTracker
 from .recovery import RecoveryOrchestrator
@@ -37,7 +38,7 @@ from .types import (
     StepOutcome,
     StopMode,
 )
-from .wait import LoopFacts, decide_wait
+from .wait import IN_FLIGHT_POLL_SECONDS, LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job
@@ -95,7 +96,7 @@ class EngineRuntime:
 
         self.channel: ExecutionChannel = config.channel
         self._in_flight: InFlightTracker = InFlightTracker()
-        self._wake_event: threading.Event = threading.Event()
+        self._notifier: RunNotifier = RunNotifier()
 
         # 构建机器依赖拓扑（recovery 依赖 completion；dispatch 依赖 recovery）
         self._completion = CompletionMachine(
@@ -188,7 +189,7 @@ class EngineRuntime:
     def request_stop(self) -> StopMode:
         """停机请求接口（单调状态转移，委托 RunSession，并唤醒运行循环）。"""
         mode = self._session.request_stop()
-        self._wake_event.set()
+        self._notifier.notify()
         return mode
 
     def execute(self, options: ExecutionOptions | None = None) -> None:
@@ -243,6 +244,7 @@ class EngineRuntime:
             self._run_body()
 
         finally:
+            self.config.resources.unbind_notifier()
             if self._run_lock_fd is not None:
                 release_lock(self._run_lock_fd)
                 self._run_lock_fd = None
@@ -418,6 +420,7 @@ class EngineRuntime:
                       if last_outcome is not None else float("inf")),
             worker_wait=worker_wait, deadlock_wait=arbitration.wait_seconds,
             should_terminate=arbitration.should_terminate,
+            deadlock_detected=arbitration.deadlock_detected,
         ))
 
         exit_reason = (
@@ -437,24 +440,34 @@ class EngineRuntime:
 
     # ── 主循环与承重网 ────────────────────────────────────────────────
 
-    def _wait(self, timeout: float) -> None:
-        """运行循环调度等待：支持测试 monkeypatch 捕获，同时由 _wake_event 实现跨线程唤醒。"""
-        if time.sleep is not _REAL_SLEEP:
-            time.sleep(timeout)
-        self._wake_event.wait(timeout=timeout)
-        self._wake_event.clear()
+    def _wait(self, timeout: float | None, last_seq: int | None = None) -> None:
+        """运行循环调度等待：支持测试 monkeypatch 捕获，同时由 _notifier 实现跨线程与 check-to-wait 唤醒。"""
+        if last_seq is not None:
+            self._notifier.wait(last_seq, timeout=timeout)
+        else:
+            if time.sleep is not _REAL_SLEEP and timeout is not None and timeout > 0:
+                time.sleep(timeout)
+            self._notifier._event.wait(timeout=timeout)
+            self._notifier._event.clear()
 
     def run_loop(self) -> None:
         """事件驱动主循环：以 step() 统一驱动填池、回收与等待（裸循环）。"""
         store = self.store
         self._in_flight.clear()
-        self._wake_event.clear()
+        self._notifier.clear()
         while not store.state.is_empty or self._in_flight:
+            last_seq = self._notifier.snapshot()
             outcome = self.step()
             if outcome.should_terminate:
                 break
-            if outcome.should_wait and outcome.wait_time > 0:
-                self._wait(outcome.wait_time)
+            if outcome.should_wait:
+                wait_time = outcome.wait_time
+                if wait_time > 0:
+                    self._wait(wait_time if wait_time != float("inf") else None, last_seq=last_seq)
+                elif bool(self._in_flight):
+                    self._wait(IN_FLIGHT_POLL_SECONDS, last_seq=last_seq)
+                elif store.state.is_empty:
+                    break
 
         logger.info(f"Pipeline {self.config.name} finished.")
         self._in_flight.clear()
@@ -468,6 +481,7 @@ class EngineRuntime:
         不下沉机器以免 session 依赖回流）；装载与修复序列归
         RecoveryOrchestrator.load_and_repair。
         """
+        self.config.resources.bind_notifier(self._notifier)
         self.scheduler.begin_round()
 
         self._session.run_id = uuid.uuid4().hex
@@ -497,10 +511,7 @@ class EngineRuntime:
                 self._recovery.save_queue_crash_safe()
             raise
         finally:
-            try:
-                self._recovery.persist_resource_suspensions()
-            except Exception as e:
-                logger.warning(f"Failed to persist resource suspensions: {e}")
+            pass
 
     @staticmethod
     def _crash_log(e: BaseException) -> None:
@@ -531,7 +542,7 @@ class EngineRuntime:
             self.request_stop()
         else:
             logger.info(f"再次收到信号 {signum}，正在等待在途任务完成，不强制终止。")
-            self._wake_event.set()
+            self._notifier.notify()
 
     def _preflight_picklable_handlers(self) -> None:
         """strict 预检：全部已注册 Task 的 handler 必须可 pickle。

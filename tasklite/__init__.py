@@ -50,7 +50,7 @@ from .hooks import job_ref, slice_list
 # ── 资源体系 ─────────────────────────────────────────────────────────
 from .engine.resource import (
     CapacityResource,
-    RateLimitResource,
+    IntervalResource,
     Resource,
 )
 
@@ -116,7 +116,7 @@ __all__ = [
     "slice_list",
     # 资源体系
     "CapacityResource",
-    "RateLimitResource",
+    "IntervalResource",
     "Resource",
     # 失败档案与挂起
     "FailureEntry",

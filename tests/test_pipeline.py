@@ -19,7 +19,7 @@ from tasklite.engine.admission import (
     RequeuePlan,
     RequeuePolicy,
 )
-from tasklite.engine.resource import CapacityResource, RateLimitResource
+from tasklite.resource import CapacityResource, IntervalResource
 from tasklite.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
 from tasklite.engine.types import AttemptOutcome, StopMode
 from tasklite.models.job import Job
@@ -396,11 +396,11 @@ class TestRegisterTask:
 
 
 class TestRegisterResource:
-    """register_resource：类型校验、覆盖告警、worker 并发覆盖。"""
+    """register_resource：类型校验、同名拒绝、worker 并发不可覆盖。"""
 
     def test_registers_into_manager(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.register_resource(RateLimitResource("api", interval_seconds=0.5))
+        p.register_resource(IntervalResource("api", interval_seconds=0.5))
         assert "api" in p.resources
 
     def test_rejects_non_resource(self, tmp_path):
@@ -408,24 +408,22 @@ class TestRegisterResource:
         with pytest.raises(TypeError, match="Resource instance"):
             p.register_resource("api")
 
-    def test_overwrite_warns(self, tmp_path, caplog):
+    def test_duplicate_registration_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.register_resource(CapacityResource("gpu", 1.0))
-        with caplog.at_level("WARNING"):
-            p.register_resource(CapacityResource("gpu", 2.0))
-        assert p.resources["gpu"].max_capacity == 2.0
-        assert any("Overwriting existing resource 'gpu'" in r.message for r in caplog.records)
+        p.register_resource(CapacityResource("gpu", max_capacity=1.0))
+        with pytest.raises(ValueError, match="already registered"):
+            p.register_resource(CapacityResource("gpu", max_capacity=2.0))
 
-    def test_override_workers_changes_concurrency(self, tmp_path):
+    def test_override_workers_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.register_resource(CapacityResource("__workers__", 9.0))
-        assert p.resources["__workers__"].max_capacity == 9.0
+        with pytest.raises(ValueError, match="internal worker resource"):
+            p.register_resource(CapacityResource("__workers__", max_capacity=9.0))
 
     def test_run_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
         with running(p):
             with pytest.raises(RuntimeError, match="register_resource"):
-                p.register_resource(CapacityResource("gpu", 1.0))
+                p.register_resource(CapacityResource("gpu", max_capacity=1.0))
 
 
 class TestTaskTriggerDefaults:
@@ -696,7 +694,7 @@ class TestEnqueue:
     def test_pending_recovery_across_runs_preserves_accepted_snapshot(self, tmp_path, monkeypatch):
         """跨次恢复 pending 不套用新 Task 默认。"""
         p1 = TaskLite(name="recover", state_dir=str(tmp_path), max_workers=1)
-        p1.register_resource(CapacityResource("gpu", 2.0))
+        p1.register_resource(CapacityResource("gpu", max_capacity=2.0))
         p1.register_task(
             "fetch",
             ok_handler,
@@ -718,7 +716,7 @@ class TestEnqueue:
 
         monkeypatch.setattr(mp, "Process", CapturingProcess)
         p2 = TaskLite(name="recover", state_dir=str(tmp_path), max_workers=1)
-        p2.register_resource(CapacityResource("gpu", 2.0))
+        p2.register_resource(CapacityResource("gpu", max_capacity=2.0))
         # 新运行注册了完全不同的 Task 默认（甚至包含未注册资源 extra_vram）
         p2.register_task(
             "fetch",
@@ -814,7 +812,7 @@ class TestSixStepContract:
     def test_full_six_step_flow(self, tmp_path, monkeypatch):
         p = make_pipeline(tmp_path)
 
-        p.register_resource(CapacityResource("gpu", 2.0))
+        p.register_resource(CapacityResource("gpu", max_capacity=2.0))
         p.register_task("fetch", ok_handler, resources={"gpu": 1.0})
         p.enqueue(Job("fetch", "a"))
         p.enqueue(Job("fetch", "b"))

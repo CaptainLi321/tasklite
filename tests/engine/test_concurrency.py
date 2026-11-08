@@ -241,8 +241,8 @@ def test_workers_suspended_no_inflight_sleeps_not_busy_loop(tmp_state_dir, monke
     )
     pipeline.register_task("slow", fast_handler)
     pipeline.enqueue(Job("slow", "j1"))
-    # 挂起 __workers__：can_acquire 返回 False 且没有 job 被派发（无 in-flight）
-    pipeline.resources["__workers__"].suspend(60.0)
+    # 占满 __workers__：can_acquire 返回 False 且没有 job 被派发（无 in-flight）
+    pipeline.resources["__workers__"].acquire(2.0)
 
     real_sleep = time.sleep
     slept: list[float] = []
@@ -279,7 +279,7 @@ def test_custom_worker_resource_zero_wait_no_busy_loop(tmp_state_dir, monkeypatc
         """不可用态恒返回 (False, 0.0) 的自定义 worker 资源。"""
 
         def __init__(self) -> None:
-            super().__init__("__workers__", 2.0)
+            super().__init__("__workers__", max_capacity=2.0)
 
         def can_acquire(self, amount: float) -> tuple[bool, float]:
             return False, 0.0
