@@ -11,12 +11,13 @@ from .base import (
     validate_queue_replacement,
 )
 from .memory import InMemoryStateBackend
-from .sqlite_backend import SQLiteStateBackend
+from .sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
 
 __all__ = [
     "AbstractStateBackend",
     "InMemoryStateBackend",
     "SQLiteStateBackend",
+    "TARGET_SCHEMA_VERSION",
     "validate_attempt_dispatch",
     "validate_attempt_finish",
     "validate_queue_replacement",

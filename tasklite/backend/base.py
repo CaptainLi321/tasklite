@@ -382,6 +382,51 @@ class AbstractStateBackend(ABC):
     def set_engine_metadata(self, key: str, value: str) -> None:
         """写入一条框架级元数据（UPSERT 语义）。失败抛异常（不吞）。"""
 
+    # 状态事务与编号（ADR-0011 目标格式与执行结算内部准备）───────────
+
+    @abstractmethod
+    def mark_job_running(self, job_uid: str, *, run_id: str, started_at: str) -> int:
+        """原子将 pending job 转为 running 并递增分配 attempt_no。"""
+
+    @abstractmethod
+    def commit_job_settlement(
+        self,
+        *,
+        job_uid: str,
+        outcome: str,
+        attempt_no: int,
+        run_id: str,
+        settled_at: str,
+        started_at: str | None = None,
+        job_snapshot: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+        error_message: str | None = None,
+        success_metadata: dict[str, Any] | None = None,
+        spawned_job_snapshots: Sequence[dict[str, Any]] = (),
+        cursor_updates: Mapping[str, str | None] | None = None,
+        failure_metadata: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        requeued_job_snapshot: dict[str, Any] | None = None,
+    ) -> bool:
+        """原子执行结算：同事务写入 Attempt、更新 Job 去向与档案、写入派生与游标。"""
+
+    @abstractmethod
+    def get_attempt_sequence(self, job_uid: str) -> int:
+        """读取指定 job_uid 的最新 attempt_no 编号进度（未派发过返回 0）。"""
+
+    @abstractmethod
+    def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
+        """按 attempt_no 升序读取指定 job_uid 的全部已结算 Attempt 记录。"""
+
+    @abstractmethod
+    def clear_attempts(self, job_uid: str) -> int:
+        """删除指定 job_uid 的 Attempt 历史（不影响 job_sequences 编号进度）。"""
+
+    @abstractmethod
+    def load_queue_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        """按 queue_position 升序加载队列行的完整信息，可选按 status 过滤。"""
+
 
 __all__ = [
     "AbstractStateBackend",

@@ -26,9 +26,10 @@ logger = logging.getLogger("tasklite")
 
 # 只接纳本代完整形状或真正空库，不提供自动迁移。
 _SCHEMA_VERSION = 5
+TARGET_SCHEMA_VERSION = 6
 
 # 核心表的精确列集合；不扩大为 SQL 类型与约束审计。
-_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+_TABLE_COLUMNS_V5: dict[str, tuple[str, ...]] = {
     "queue": ("job_uid", "queue_position", "job_snapshot"),
     "successes": ("job_uid", "metadata"),
     "failed": ("job_uid", "metadata", "payload"),
@@ -40,12 +41,30 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "engine_metadata": ("key", "value"),
 }
 
+_TABLE_COLUMNS_V6: dict[str, tuple[str, ...]] = {
+    "queue": (
+        "job_uid", "queue_position", "job_snapshot", "status", "run_id", "attempt_no", "started_at",
+    ),
+    "successes": ("job_uid", "metadata"),
+    "failed": ("job_uid", "metadata", "payload"),
+    "attempts": (
+        "attempt_id", "job_uid", "attempt_no", "run_id", "outcome", "started_at",
+        "settled_at", "job_snapshot", "files", "result", "error_message",
+    ),
+    "job_sequences": ("job_uid", "last_attempt_no"),
+    "cursors": ("key", "value"),
+    "engine_metadata": ("key", "value"),
+}
+
+_TABLE_COLUMNS = _TABLE_COLUMNS_V5
+
 
 class SQLiteStateBackend(AbstractStateBackend):
     """原子 SQLite 状态后端：逐 job 单事务碎片化的 delta 提交。"""
 
-    def __init__(self, filepath: str | Path):
+    def __init__(self, filepath: str | Path, *, schema_version: int = _SCHEMA_VERSION):
         self.path = Path(filepath)
+        self.schema_version = schema_version
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._init_db()
@@ -91,7 +110,7 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     def _schema_error(self, detail: str) -> RuntimeError:
         return RuntimeError(
-            f"{self.path}: {detail}; 目标 schema {_SCHEMA_VERSION}。"
+            f"{self.path}: {detail}; 目标 schema {self.schema_version}。"
             "请保留原库，使用匹配版本读取历史，或显式选择新的状态库路径。"
         )
 
@@ -106,12 +125,13 @@ class SQLiteStateBackend(AbstractStateBackend):
                     f"Unsupported table shape: version 0 非空库，已有对象 {sorted(objects)}"
                 )
             return version
-        if version != _SCHEMA_VERSION:
+        if version != self.schema_version:
             raise self._schema_error(f"Unsupported database schema version {version}")
         table_objects = {name: kind for name, kind in objects if kind in ("table", "view")}
         if {"wall", "meta"} & {name.casefold() for name, kind in objects if kind == "table"}:
             raise self._schema_error(f"Unsupported table shape: version {version} 含异代 wall/meta 表")
-        for table, expected in _TABLE_COLUMNS.items():
+        columns_map = _TABLE_COLUMNS_V6 if self.schema_version == TARGET_SCHEMA_VERSION else _TABLE_COLUMNS_V5
+        for table, expected in columns_map.items():
             if table_objects.get(table) != "table":
                 raise self._schema_error(
                     f"Unsupported table shape for '{table}': version {version}, "
@@ -158,67 +178,131 @@ class SQLiteStateBackend(AbstractStateBackend):
             if version == 0:
                 self._create_tables(conn)
                 self._create_indexes(conn)
-                conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                conn.execute(f"PRAGMA user_version = {self.schema_version}")
 
     def _create_tables(self, conn: sqlite3.Connection) -> None:
-        """只在已确认的空库写事务中建立六张核心表。"""
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS queue (
-                job_uid TEXT PRIMARY KEY,
-                queue_position INTEGER NOT NULL,
-                job_snapshot TEXT NOT NULL
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS successes (
-                job_uid TEXT PRIMARY KEY,
-                metadata TEXT
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS failed (
-                job_uid TEXT PRIMARY KEY,
-                metadata TEXT,
-                payload TEXT
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS attempts (
-                attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_uid TEXT NOT NULL,
-                activation_no INTEGER NOT NULL,
-                attempt_no INTEGER NOT NULL,
-                execution_id TEXT NOT NULL,
-                run_id TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                outcome TEXT NOT NULL,
-                error_message TEXT
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS cursors (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS engine_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        ''')
+        """只在已确认的空库写事务中建立核心表。"""
+        if self.schema_version == TARGET_SCHEMA_VERSION:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS queue (
+                    job_uid TEXT PRIMARY KEY,
+                    queue_position INTEGER NOT NULL,
+                    job_snapshot TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    run_id TEXT,
+                    attempt_no INTEGER,
+                    started_at TEXT
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS successes (
+                    job_uid TEXT PRIMARY KEY,
+                    metadata TEXT
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS failed (
+                    job_uid TEXT PRIMARY KEY,
+                    metadata TEXT,
+                    payload TEXT
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS attempts (
+                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_uid TEXT NOT NULL,
+                    attempt_no INTEGER NOT NULL,
+                    run_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    started_at TEXT,
+                    settled_at TEXT NOT NULL,
+                    job_snapshot TEXT,
+                    files TEXT,
+                    result TEXT,
+                    error_message TEXT
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS job_sequences (
+                    job_uid TEXT PRIMARY KEY,
+                    last_attempt_no INTEGER NOT NULL
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS cursors (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS engine_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            ''')
+        else:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS queue (
+                    job_uid TEXT PRIMARY KEY,
+                    queue_position INTEGER NOT NULL,
+                    job_snapshot TEXT NOT NULL
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS successes (
+                    job_uid TEXT PRIMARY KEY,
+                    metadata TEXT
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS failed (
+                    job_uid TEXT PRIMARY KEY,
+                    metadata TEXT,
+                    payload TEXT
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS attempts (
+                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_uid TEXT NOT NULL,
+                    activation_no INTEGER NOT NULL,
+                    attempt_no INTEGER NOT NULL,
+                    execution_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    outcome TEXT NOT NULL,
+                    error_message TEXT
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS cursors (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS engine_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            ''')
 
     def _create_indexes(self, conn: sqlite3.Connection) -> None:
         """建索引（在形状校验之后：异形表先给出明确的拒绝信息，而非
         在缺列上建索引时抛出费解的 no such column）。"""
         conn.execute('CREATE INDEX IF NOT EXISTS idx_queue_position ON queue(queue_position)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_job_uid ON attempts(job_uid)')
-        # 可信基线窄查询（job_uid + outcome 定位，rowid 即 attempt_id 隐式随索引有序）
-        conn.execute(
-            'CREATE INDEX IF NOT EXISTS idx_attempts_job_uid_outcome '
-            'ON attempts(job_uid, outcome)'
-        )
+        if self.schema_version == TARGET_SCHEMA_VERSION:
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_job_uid_outcome ON attempts(job_uid, outcome)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_job_uid_attempt_no ON attempts(job_uid, attempt_no)')
+        else:
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_attempts_job_uid_outcome '
+                'ON attempts(job_uid, outcome)'
+            )
+
 
     # 序号分配 ---------------------------------------------------------
 
@@ -320,20 +404,46 @@ class SQLiteStateBackend(AbstractStateBackend):
         conn.execute('DELETE FROM queue')
         if job_snapshots:
             seen: set[str] = set()
-            rows: list[tuple[str, int, str]] = []
-            for j in job_snapshots:
-                u = job_uid_from_snapshot(j)
-                if u in seen:
-                    logger.warning(
-                        f"save_queue: duplicate job_uid {u} dropped (kept first)."
-                    )
-                    continue
-                seen.add(u)
-                rows.append((u, len(rows), dumps(j)))
-            conn.executemany(
-                'INSERT OR REPLACE INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)',
-                rows,
-            )
+            if self.schema_version == TARGET_SCHEMA_VERSION:
+                v6_rows: list[tuple] = []
+                for j in job_snapshots:
+                    u = job_uid_from_snapshot(j)
+                    if u in seen:
+                        logger.warning(
+                            f"save_queue: duplicate job_uid {u} dropped (kept first)."
+                        )
+                        continue
+                    seen.add(u)
+                    v6_rows.append((
+                        u,
+                        len(v6_rows),
+                        dumps(j),
+                        j.get("status", "pending"),
+                        j.get("run_id"),
+                        j.get("attempt_no"),
+                        j.get("started_at"),
+                    ))
+                conn.executemany(
+                    'INSERT OR REPLACE INTO queue ('
+                    'job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at'
+                    ') VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    v6_rows,
+                )
+            else:
+                rows: list[tuple[str, int, str]] = []
+                for j in job_snapshots:
+                    u = job_uid_from_snapshot(j)
+                    if u in seen:
+                        logger.warning(
+                            f"save_queue: duplicate job_uid {u} dropped (kept first)."
+                        )
+                        continue
+                    seen.add(u)
+                    rows.append((u, len(rows), dumps(j)))
+                conn.executemany(
+                    'INSERT OR REPLACE INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)',
+                    rows,
+                )
 
     def save_queue(self, job_snapshots: list[dict[str, Any]]) -> None:
         """全量重写队列（测试装配 / replace_queue_atomic 事务内步骤，罕见 O(N)）。
@@ -644,11 +754,29 @@ class SQLiteStateBackend(AbstractStateBackend):
                 if not fresh:
                     return []
                 queue_positions = self._queue_position_range(conn, len(fresh), front=front)
-                conn.executemany(
-                    'INSERT INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)',
-                    [(job_uid_from_snapshot(j), pos, dumps(j))
-                     for j, pos in zip(fresh, queue_positions)],
-                )
+                if self.schema_version == TARGET_SCHEMA_VERSION:
+                    conn.executemany(
+                        'INSERT INTO queue (job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                        [
+                            (
+                                job_uid_from_snapshot(j),
+                                pos,
+                                dumps(j),
+                                j.get("status", "pending"),
+                                j.get("run_id"),
+                                j.get("attempt_no"),
+                                j.get("started_at"),
+                            )
+                            for j, pos in zip(fresh, queue_positions)
+                        ],
+                    )
+                else:
+                    conn.executemany(
+                        'INSERT INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)',
+                        [(job_uid_from_snapshot(j), pos, dumps(j))
+                         for j, pos in zip(fresh, queue_positions)],
+                    )
                 return [job_uid_from_snapshot(j) for j in fresh]
         except Exception as e:
             logger.critical(f"Failed to enqueue job_snapshots to {self.path.name}: {e}")
@@ -878,5 +1006,286 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to write engine_metadata '{key}' in {self.path.name}: {e}")
             raise
 
+    # 状态事务与编号（ADR-0011 目标格式与执行结算内部准备）───────────
 
-__all__ = ["SQLiteStateBackend"]
+    def mark_job_running(self, job_uid: str, *, run_id: str, started_at: str) -> int:
+        if self.schema_version < TARGET_SCHEMA_VERSION:
+            raise NotImplementedError(
+                f"mark_job_running requires schema_version >= {TARGET_SCHEMA_VERSION}"
+            )
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty str")
+        if not isinstance(started_at, str) or not started_at:
+            raise ValueError("started_at must be a non-empty str")
+        with self._get_conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute(
+                'SELECT status FROM queue WHERE job_uid = ?',
+                (job_uid,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Job {job_uid} not found in queue")
+            if row[0] == "running":
+                raise ValueError(f"Job {job_uid} is already running")
+
+            seq_row = conn.execute(
+                'SELECT last_attempt_no FROM job_sequences WHERE job_uid = ?',
+                (job_uid,),
+            ).fetchone()
+            next_no = (seq_row[0] + 1) if seq_row is not None else 1
+
+            conn.execute(
+                'INSERT OR REPLACE INTO job_sequences (job_uid, last_attempt_no) VALUES (?, ?)',
+                (job_uid, next_no),
+            )
+            conn.execute(
+                'UPDATE queue SET status = ?, run_id = ?, attempt_no = ?, started_at = ? WHERE job_uid = ?',
+                ("running", run_id, next_no, started_at, job_uid),
+            )
+            return next_no
+
+    def get_attempt_sequence(self, job_uid: str) -> int:
+        if not self.path.exists():
+            return 0
+        with self._get_conn() as conn:
+            if self.schema_version >= TARGET_SCHEMA_VERSION:
+                row = conn.execute(
+                    'SELECT last_attempt_no FROM job_sequences WHERE job_uid = ?',
+                    (job_uid,),
+                ).fetchone()
+                return row[0] if row is not None else 0
+            return 0
+
+    def clear_attempts(self, job_uid: str) -> int:
+        if not self.path.exists():
+            return 0
+        with self._get_conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            cur = conn.execute('DELETE FROM attempts WHERE job_uid = ?', (job_uid,))
+            return cur.rowcount
+
+    def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                'SELECT attempt_id, job_uid, attempt_no, run_id, outcome, started_at, settled_at, '
+                'job_snapshot, files, result, error_message '
+                'FROM attempts WHERE job_uid = ? ORDER BY attempt_no ASC',
+                (job_uid,),
+            )
+            results: list[dict[str, Any]] = []
+            for row in cursor:
+                results.append({
+                    "attempt_id": row[0],
+                    "job_uid": row[1],
+                    "attempt_no": row[2],
+                    "run_id": row[3],
+                    "outcome": row[4],
+                    "started_at": row[5],
+                    "settled_at": row[6],
+                    "job": loads(row[7]) if row[7] else None,
+                    "files": loads(row[8]) if row[8] else None,
+                    "result": loads(row[9]) if row[9] else None,
+                    "error_message": row[10],
+                })
+            return results
+
+    def load_queue_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        with self._get_conn() as conn:
+            if self.schema_version >= TARGET_SCHEMA_VERSION:
+                if status is not None:
+                    cursor = conn.execute(
+                        'SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at '
+                        'FROM queue WHERE status = ? ORDER BY queue_position ASC',
+                        (status,),
+                    )
+                else:
+                    cursor = conn.execute(
+                        'SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at '
+                        'FROM queue ORDER BY queue_position ASC'
+                    )
+                results: list[dict[str, Any]] = []
+                for row in cursor:
+                    results.append({
+                        "job_uid": row[0],
+                        "queue_position": row[1],
+                        "job": loads(row[2]),
+                        "status": row[3],
+                        "run_id": row[4],
+                        "attempt_no": row[5],
+                        "started_at": row[6],
+                    })
+                return results
+            else:
+                cursor = conn.execute(
+                    'SELECT job_uid, queue_position, job_snapshot FROM queue ORDER BY queue_position ASC'
+                )
+                return [
+                    {
+                        "job_uid": row[0],
+                        "queue_position": row[1],
+                        "job": loads(row[2]),
+                        "status": "pending",
+                        "run_id": None,
+                        "attempt_no": None,
+                        "started_at": None,
+                    }
+                    for row in cursor
+                ]
+
+    def commit_job_settlement(
+        self,
+        *,
+        job_uid: str,
+        outcome: str,
+        attempt_no: int,
+        run_id: str,
+        settled_at: str,
+        started_at: str | None = None,
+        job_snapshot: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+        error_message: str | None = None,
+        success_metadata: dict[str, Any] | None = None,
+        spawned_job_snapshots: Sequence[dict[str, Any]] = (),
+        cursor_updates: Mapping[str, str | None] | None = None,
+        failure_metadata: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        requeued_job_snapshot: dict[str, Any] | None = None,
+    ) -> bool:
+        if self.schema_version < TARGET_SCHEMA_VERSION:
+            raise NotImplementedError(
+                f"commit_job_settlement requires schema_version >= {TARGET_SCHEMA_VERSION}"
+            )
+
+        if outcome not in ("success", "failure", "retry", "pending"):
+            raise ValueError(f"Invalid outcome: {outcome}")
+        if not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 1:
+            raise TypeError(f"attempt_no must be int >= 1, got {attempt_no!r}")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError(f"run_id must be non-empty str, got {run_id!r}")
+        if not isinstance(settled_at, str) or not settled_at:
+            raise ValueError(f"settled_at must be non-empty str, got {settled_at!r}")
+        if started_at is not None and (not isinstance(started_at, str) or not started_at):
+            raise ValueError("started_at must be non-empty str or None")
+        if cursor_updates:
+            for k, v in cursor_updates.items():
+                if not isinstance(k, str) or not k:
+                    raise ValueError(f"cursor key must be a non-empty str, got {k!r}")
+                if v is not None and not isinstance(v, str):
+                    raise TypeError(f"cursor value must be str or None, got {type(v).__name__}")
+        if spawned_job_snapshots:
+            validate_queue_replacement(list(spawned_job_snapshots))
+
+        try:
+            with self._get_conn() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+
+                attempt_outcome = outcome if outcome in ("success", "failure", "retry") else "failure"
+                conn.execute(
+                    'INSERT INTO attempts ('
+                    'job_uid, attempt_no, run_id, outcome, started_at, settled_at, '
+                    'job_snapshot, files, result, error_message'
+                    ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (
+                        job_uid,
+                        attempt_no,
+                        run_id,
+                        attempt_outcome,
+                        started_at,
+                        settled_at,
+                        dumps(job_snapshot) if job_snapshot is not None else None,
+                        dumps(files) if files is not None else None,
+                        dumps(result) if result is not None else None,
+                        error_message,
+                    ),
+                )
+
+                if outcome == "success":
+                    conn.execute(
+                        'INSERT OR REPLACE INTO successes (job_uid, metadata) VALUES (?, ?)',
+                        (job_uid, dumps(success_metadata or {})),
+                    )
+                    conn.execute('DELETE FROM failed WHERE job_uid = ?', (job_uid,))
+                    conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
+
+                    if spawned_job_snapshots:
+                        queue_positions = self._queue_position_range(conn, len(spawned_job_snapshots), front=True)
+                        rows = [
+                            (
+                                job_uid_from_snapshot(j),
+                                pos,
+                                dumps(j),
+                                "pending",
+                                None,
+                                None,
+                                None,
+                            )
+                            for j, pos in zip(spawned_job_snapshots, queue_positions)
+                        ]
+                        cur = conn.executemany(
+                            'INSERT OR IGNORE INTO queue ('
+                            'job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at'
+                            ') VALUES (?, ?, ?, ?, ?, ?, ?)',
+                            rows,
+                        )
+                        if cur.rowcount is not None and cur.rowcount < len(spawned_job_snapshots):
+                            logger.critical(
+                                f"commit_job_settlement for {job_uid}: "
+                                f"{len(spawned_job_snapshots) - cur.rowcount} spawned job(s) "
+                                f"conflicted on disk. Rolling back."
+                            )
+                            raise RuntimeError(f"spawned job conflict on disk for {job_uid}")
+
+                    if cursor_updates:
+                        for k, v in cursor_updates.items():
+                            if v is None:
+                                conn.execute('DELETE FROM cursors WHERE key = ?', (k,))
+                            else:
+                                conn.execute(
+                                    'INSERT OR REPLACE INTO cursors (key, value) VALUES (?, ?)',
+                                    (k, v),
+                                )
+
+                elif outcome == "failure":
+                    conn.execute(
+                        'INSERT OR REPLACE INTO failed (job_uid, metadata, payload) VALUES (?, ?, ?)',
+                        (job_uid, dumps(failure_metadata or {}), dumps(payload) if payload is not None else None),
+                    )
+                    conn.execute('DELETE FROM successes WHERE job_uid = ?', (job_uid,))
+                    conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
+
+                elif outcome == "retry":
+                    if requeued_job_snapshot is not None:
+                        conn.execute(
+                            'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
+                            'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
+                            (dumps(requeued_job_snapshot), "pending", job_uid),
+                        )
+                    else:
+                        conn.execute(
+                            'UPDATE queue SET status = ?, run_id = NULL, attempt_no = NULL, '
+                            'started_at = NULL WHERE job_uid = ?',
+                            ("pending", job_uid),
+                        )
+
+                elif outcome == "pending":
+                    conn.execute(
+                        'UPDATE queue SET status = ?, run_id = NULL, attempt_no = NULL, '
+                        'started_at = NULL WHERE job_uid = ?',
+                        ("pending", job_uid),
+                    )
+
+            return True
+        except (ValueError, TypeError):
+            raise
+        except Exception as e:
+            logger.critical(f"Failed to commit settlement for {job_uid} in {self.path.name}: {e}")
+            return False
+
+
+__all__ = ["SQLiteStateBackend", "TARGET_SCHEMA_VERSION"]
+

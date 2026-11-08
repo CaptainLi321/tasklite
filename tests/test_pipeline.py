@@ -142,6 +142,24 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def set_engine_metadata(self, *args, **kwargs):
         return self.inner.set_engine_metadata(*args, **kwargs)
 
+    def mark_job_running(self, *args, **kwargs):
+        return self.inner.mark_job_running(*args, **kwargs)
+
+    def commit_job_settlement(self, *args, **kwargs):
+        return self.inner.commit_job_settlement(*args, **kwargs)
+
+    def get_attempt_sequence(self, *args, **kwargs):
+        return self.inner.get_attempt_sequence(*args, **kwargs)
+
+    def load_settled_attempts(self, *args, **kwargs):
+        return self.inner.load_settled_attempts(*args, **kwargs)
+
+    def clear_attempts(self, *args, **kwargs):
+        return self.inner.clear_attempts(*args, **kwargs)
+
+    def load_queue_jobs(self, *args, **kwargs):
+        return self.inner.load_queue_jobs(*args, **kwargs)
+
 
 # ── fake 进程（写 IPC 结果文件，与真实 worker 同路径）──────────────────
 

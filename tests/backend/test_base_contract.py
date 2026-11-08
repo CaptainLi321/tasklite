@@ -55,6 +55,13 @@ EXPECTED_ABSTRACT_METHODS = {
     # 元数据
     "get_engine_metadata",
     "set_engine_metadata",
+    # 状态事务与编号
+    "mark_job_running",
+    "commit_job_settlement",
+    "get_attempt_sequence",
+    "load_settled_attempts",
+    "clear_attempts",
+    "load_queue_jobs",
 }
 
 

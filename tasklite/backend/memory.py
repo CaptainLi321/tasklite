@@ -33,7 +33,8 @@ class InMemoryStateBackend(AbstractStateBackend):
     插入序即 id 序）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, schema_version: int = 5) -> None:
+        self.schema_version = schema_version
         self._lock = threading.RLock()
         self._successes: dict[str, dict[str, Any]] = {}
         self._failed: dict[str, dict[str, Any]] = {}
@@ -41,8 +42,9 @@ class InMemoryStateBackend(AbstractStateBackend):
         self._cursors: dict[str, str] = {}
         self._queue: list[dict[str, Any]] = []
         self._engine_metadata: dict[str, str] = {}
-        self._attempts: dict[int, AttemptRecord] = {}
+        self._attempts: dict[int, Any] = {}
         self._attempt_seq = 1
+        self._job_sequences: dict[str, int] = {}
 
     # 全量加载 -------------------------------------------------------
 
@@ -447,6 +449,216 @@ class InMemoryStateBackend(AbstractStateBackend):
     def set_engine_metadata(self, key: str, value: str) -> None:
         with self._lock:
             self._engine_metadata[key] = str(value)
+
+    # 状态事务与编号（ADR-0011 目标格式与执行结算内部准备）───────────
+
+    def mark_job_running(self, job_uid: str, *, run_id: str, started_at: str) -> int:
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty str")
+        if not isinstance(started_at, str) or not started_at:
+            raise ValueError("started_at must be a non-empty str")
+        with self._lock:
+            job_idx = None
+            for idx, item in enumerate(self._queue):
+                if job_uid_from_snapshot(item) == job_uid:
+                    job_idx = idx
+                    break
+            if job_idx is None:
+                raise ValueError(f"Job {job_uid} not found in queue")
+            job_data = self._queue[job_idx]
+            if job_data.get("status") == "running":
+                raise ValueError(f"Job {job_uid} is already running")
+
+            next_no = self._job_sequences.get(job_uid, 0) + 1
+            self._job_sequences[job_uid] = next_no
+
+            updated_job = copy.deepcopy(job_data)
+            updated_job["status"] = "running"
+            updated_job["run_id"] = run_id
+            updated_job["attempt_no"] = next_no
+            updated_job["started_at"] = started_at
+            self._queue[job_idx] = updated_job
+            return next_no
+
+    def get_attempt_sequence(self, job_uid: str) -> int:
+        with self._lock:
+            return self._job_sequences.get(job_uid, 0)
+
+    def clear_attempts(self, job_uid: str) -> int:
+        with self._lock:
+            initial = len(self._attempts)
+            self._attempts = {
+                k: v for k, v in self._attempts.items()
+                if (v.job_uid if isinstance(v, AttemptRecord) else v.get("job_uid")) != job_uid
+            }
+            return initial - len(self._attempts)
+
+    def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
+        with self._lock:
+            entries: list[dict[str, Any]] = []
+            for att in self._attempts.values():
+                if isinstance(att, dict) and att.get("job_uid") == job_uid:
+                    entries.append(copy.deepcopy(att))
+            entries.sort(key=lambda x: x.get("attempt_no", 0))
+            return entries
+
+    def load_queue_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            results: list[dict[str, Any]] = []
+            for pos, j in enumerate(self._queue):
+                j_status = j.get("status", "pending")
+                if status is not None and j_status != status:
+                    continue
+                results.append({
+                    "job_uid": job_uid_from_snapshot(j),
+                    "queue_position": pos,
+                    "job": copy.deepcopy(j),
+                    "status": j_status,
+                    "run_id": j.get("run_id"),
+                    "attempt_no": j.get("attempt_no"),
+                    "started_at": j.get("started_at"),
+                })
+            return results
+
+    def commit_job_settlement(
+        self,
+        *,
+        job_uid: str,
+        outcome: str,
+        attempt_no: int,
+        run_id: str,
+        settled_at: str,
+        started_at: str | None = None,
+        job_snapshot: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+        error_message: str | None = None,
+        success_metadata: dict[str, Any] | None = None,
+        spawned_job_snapshots: Sequence[dict[str, Any]] = (),
+        cursor_updates: Mapping[str, str | None] | None = None,
+        failure_metadata: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        requeued_job_snapshot: dict[str, Any] | None = None,
+    ) -> bool:
+        if outcome not in ("success", "failure", "retry", "pending"):
+            raise ValueError(f"Invalid outcome: {outcome}")
+        if not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 1:
+            raise TypeError(f"attempt_no must be int >= 1, got {attempt_no!r}")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError(f"run_id must be non-empty str, got {run_id!r}")
+        if not isinstance(settled_at, str) or not settled_at:
+            raise ValueError(f"settled_at must be non-empty str, got {settled_at!r}")
+        if started_at is not None and (not isinstance(started_at, str) or not started_at):
+            raise ValueError("started_at must be non-empty str or None")
+        if cursor_updates:
+            for k, v in cursor_updates.items():
+                if not isinstance(k, str) or not k:
+                    raise ValueError(f"cursor key must be a non-empty str, got {k!r}")
+                if v is not None and not isinstance(v, str):
+                    raise TypeError(f"cursor value must be str or None, got {type(v).__name__}")
+        if spawned_job_snapshots:
+            validate_queue_replacement(list(spawned_job_snapshots))
+
+        with self._lock:
+            new_attempts = dict(self._attempts)
+            new_attempt_id = self._attempt_seq
+            attempt_outcome = outcome if outcome in ("success", "failure", "retry") else "failure"
+            attempt_entry: dict[str, Any] = {
+                "attempt_id": new_attempt_id,
+                "job_uid": job_uid,
+                "attempt_no": attempt_no,
+                "run_id": run_id,
+                "outcome": attempt_outcome,
+                "started_at": started_at,
+                "settled_at": settled_at,
+                "job": copy.deepcopy(job_snapshot),
+                "files": copy.deepcopy(files),
+                "result": copy.deepcopy(result),
+                "error_message": error_message,
+            }
+            new_attempts[new_attempt_id] = attempt_entry
+
+            new_queue = list(self._queue)
+            new_successes = dict(self._successes)
+            new_failed = dict(self._failed)
+            new_failure_payloads = dict(self._failure_payloads)
+            new_cursors = dict(self._cursors)
+
+            if outcome == "success":
+                remaining = [j for j in new_queue if job_uid_from_snapshot(j) != job_uid]
+                if spawned_job_snapshots:
+                    remaining_uids = {job_uid_from_snapshot(j) for j in remaining}
+                    seen: set[str] = set()
+                    for sj in spawned_job_snapshots:
+                        suid = job_uid_from_snapshot(sj)
+                        if suid in remaining_uids or suid in seen:
+                            logger.critical(
+                                f"commit_job_settlement for {job_uid}: spawned job {suid} "
+                                f"conflicts with queue (drift). Returning False."
+                            )
+                            return False
+                        seen.add(suid)
+                    for s in reversed(spawned_job_snapshots):
+                        s_copy = copy.deepcopy(s)
+                        s_copy.setdefault("status", "pending")
+                        remaining.insert(0, s_copy)
+                new_queue = remaining
+
+                new_successes[job_uid] = copy.deepcopy(success_metadata or {})
+                new_failed.pop(job_uid, None)
+                new_failure_payloads.pop(job_uid, None)
+
+                if cursor_updates:
+                    for k, v in cursor_updates.items():
+                        if v is None:
+                            new_cursors.pop(k, None)
+                        else:
+                            new_cursors[k] = v
+
+            elif outcome == "failure":
+                new_queue = [j for j in new_queue if job_uid_from_snapshot(j) != job_uid]
+                new_failed[job_uid] = copy.deepcopy(failure_metadata or {})
+                if payload is not None:
+                    new_failure_payloads[job_uid] = copy.deepcopy(payload)
+                new_successes.pop(job_uid, None)
+
+            elif outcome == "retry":
+                found = False
+                for idx, j in enumerate(new_queue):
+                    if job_uid_from_snapshot(j) == job_uid:
+                        target = copy.deepcopy(requeued_job_snapshot if requeued_job_snapshot is not None else j)
+                        target["status"] = "pending"
+                        target["run_id"] = None
+                        target["attempt_no"] = None
+                        target["started_at"] = None
+                        new_queue[idx] = target
+                        found = True
+                        break
+                if not found and requeued_job_snapshot is not None:
+                    target = copy.deepcopy(requeued_job_snapshot)
+                    target["status"] = "pending"
+                    new_queue.append(target)
+
+            elif outcome == "pending":
+                for idx, j in enumerate(new_queue):
+                    if job_uid_from_snapshot(j) == job_uid:
+                        target = copy.deepcopy(j)
+                        target["status"] = "pending"
+                        target["run_id"] = None
+                        target["attempt_no"] = None
+                        target["started_at"] = None
+                        new_queue[idx] = target
+                        break
+
+            # 统一原子落变
+            self._attempts = new_attempts
+            self._attempt_seq += 1
+            self._queue = new_queue
+            self._successes = new_successes
+            self._failed = new_failed
+            self._failure_payloads = new_failure_payloads
+            self._cursors = new_cursors
+            return True
 
 
 __all__ = ["InMemoryStateBackend"]
