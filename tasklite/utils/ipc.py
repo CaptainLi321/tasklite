@@ -46,12 +46,14 @@ PIPE_MSG_INPUT = "input"
 PIPE_MSG_OUTPUT = "output"
 PIPE_MSG_SUSPEND = "suspend"
 PIPE_MSG_RESULT = "result"
+PIPE_MSG_DECLARE = "declare"
 VALID_PIPE_MESSAGE_KINDS = frozenset(
     {
         PIPE_MSG_INPUT,
         PIPE_MSG_OUTPUT,
         PIPE_MSG_SUSPEND,
         PIPE_MSG_RESULT,
+        PIPE_MSG_DECLARE,
     }
 )
 _PIPE_EOF = object()
@@ -171,6 +173,22 @@ class WorkerPipeSender:
     def send_result(self, result_dict: dict[str, Any]) -> None:
         """发送执行结果负载。"""
         self.send_message(PIPE_MSG_RESULT, result_dict)
+
+    def send_declare(
+        self,
+        request_id: str,
+        name: str,
+        spec_dict: dict[str, Any],
+    ) -> None:
+        """发送动态文件声明请求并由主进程准备。"""
+        self.send_message(
+            PIPE_MSG_DECLARE,
+            {
+                "request_id": request_id,
+                "name": name,
+                "spec": spec_dict,
+            },
+        )
 
     def close(self) -> None:
         """幂等关闭写端连接。"""
@@ -400,6 +418,128 @@ def create_worker_pipe(
     return receiver, sender
 
 
+class WorkerReplySender:
+    """主进程侧单向响应管道发送端。
+
+    不变式：绑定 execution_id 单向向对应 worker 发送处理回复。
+    """
+
+    def __init__(
+        self,
+        connection: Connection,
+        *,
+        job_uid: str,
+        execution_id: str,
+    ) -> None:
+        self._conn = connection
+        self.job_uid = job_uid
+        self.execution_id = execution_id
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def send_reply(self, payload: dict[str, Any]) -> None:
+        """编码并发送单帧回复。"""
+        envelope = {
+            "job_uid": self.job_uid,
+            "execution_id": self.execution_id,
+            "payload": payload,
+        }
+        frame = dumps(envelope).encode("utf-8")
+        with self._lock:
+            if self._closed:
+                raise OSError("worker reply sender is closed")
+            self._conn.send_bytes(frame)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+
+
+class WorkerReplyReceiver:
+    """Worker 侧单向响应管道接收端。
+
+    等待主进程回复，严格校验 execution_id 与 request_id，丢弃过期回复。
+    """
+
+    def __init__(
+        self,
+        connection: Connection,
+        *,
+        job_uid: str,
+        execution_id: str,
+    ) -> None:
+        self._conn = connection
+        self.job_uid = job_uid
+        self.execution_id = execution_id
+        self._closed = False
+
+    def wait_reply(self, request_id: str, timeout: float = 30.0) -> dict[str, Any]:
+        deadline = time.monotonic() + max(0.1, timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Worker timed out waiting for declaration reply (req={request_id})"
+                )
+            if not self._conn.poll(min(0.05, remaining)):
+                continue
+            try:
+                raw = self._conn.recv_bytes()
+            except EOFError as exc:
+                raise OSError(f"Worker reply pipe closed before receiving reply: {exc}") from exc
+            try:
+                envelope = loads(raw.decode("utf-8"))
+            except Exception:
+                continue
+            if not isinstance(envelope, dict):
+                continue
+            if envelope.get("execution_id") != self.execution_id:
+                # 拒绝过期回复或执行身份不匹配
+                continue
+            payload = envelope.get("payload")
+            if isinstance(payload, dict) and payload.get("request_id") == request_id:
+                return payload
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._conn.close()
+        except OSError:
+            pass
+
+
+def create_worker_reply_pipe(
+    process_context: Any = None,
+    *,
+    job_uid: str,
+    execution_id: str,
+) -> tuple[WorkerReplyReceiver, WorkerReplySender]:
+    """创建一对绑定的单向回复管道 (WorkerReplyReceiver[worker端], WorkerReplySender[主进程端])。"""
+    pipe_fn = getattr(process_context, "Pipe", None)
+    recv_conn, send_conn = (
+        pipe_fn(duplex=False) if callable(pipe_fn) else mp.Pipe(duplex=False)
+    )
+    receiver = WorkerReplyReceiver(
+        recv_conn,
+        job_uid=job_uid,
+        execution_id=execution_id,
+    )
+    sender = WorkerReplySender(
+        send_conn,
+        job_uid=job_uid,
+        execution_id=execution_id,
+    )
+    return receiver, sender
+
+
 class ArtifactCleanupMode(str, enum.Enum):
     """产物生命周期清理模式。"""
 
@@ -592,6 +732,7 @@ class ArtifactJournal:
 __all__ = [
     "ArtifactCleanupMode",
     "ArtifactJournal",
+    "PIPE_MSG_DECLARE",
     "PIPE_MSG_INPUT",
     "PIPE_MSG_OUTPUT",
     "PIPE_MSG_RESULT",
@@ -600,6 +741,9 @@ __all__ = [
     "WorkerPipeMessage",
     "WorkerPipeReceiver",
     "WorkerPipeSender",
+    "WorkerReplyReceiver",
+    "WorkerReplySender",
     "create_worker_pipe",
+    "create_worker_reply_pipe",
     "decode_worker_pipe_message",
 ]
