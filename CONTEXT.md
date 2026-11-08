@@ -27,7 +27,7 @@ _Avoid_: ArtifactSpec, FileDecl, OutputPath
 _Avoid_: StatusReader, StateInspector, DBViewer
 
 **Attempt**:
-一次物理执行的 append-only 轨迹记录：`(attempt_id, job_uid, attempt_no, run_id, outcome, started_at, settled_at, job_snapshot, files, result, error_message)`。派发时插入 `outcome='running'`，结算时更新终态。旁路观测面，不参与集合互斥。
+一次物理执行的 append-only 轨迹记录：`(attempt_id, job_uid, attempt_no, run_id, outcome, started_at, settled_at, job_snapshot, files, result, error_message)`。派发时只持久化 Job 的 running 与 attempt_no；结算时与 Job 状态在同一事务中追加 Attempt，不更新已提交记录。outcome 仅为 success/failure/retry；failure 描述一次执行结果，授权拒绝等情形允许 Job 回到 pending。旁路观测面，不参与集合互斥。
 _Avoid_: Trial, ExecutionLog, RunRecord
 
 **TaskRegistry**:

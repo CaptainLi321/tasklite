@@ -103,12 +103,12 @@ print(job.uid)  # "download::item_001"
 
 ### Attempt：执行轨迹（append-only 旁路面）
 
-每次子进程执行生成一条独立的 Attempt 记录。派发时插入 `outcome='running'`，结算时更新为最终结果。
+派发时只将 Job 持久化为 `running` 并分配单调递增的 `attempt_no`，不插入 Attempt。执行结算时，Attempt 与 Job 状态、档案及暂存效果在同一事务中追加；已提交的 Attempt 不再更新。异常退出遗留的 `running` 在下次启动时按失败结算，未派发的 `pending` 保留。
 
-`outcome` 词汇表（`ATTEMPT_OUTCOMES`）：
-- `running`：正在子进程中执行；
+`outcome` 词汇表：
+
 - `success`：执行成功并结算；
-- `failure`：执行失败且不再重试（已进入失败档案）；
+- `failure`：本次执行失败；通常 Job 进入 `failed`，但动态文件授权拒绝或等待期间停止时，受阻 worker 结束后 Job 回到 `pending`，本 Run 临时排除；
 - `retry`：执行失败但已安排重入队重试。
 
 **旁路观测解耦**：`attempts` 表为仅追加表，不参与成功/失败集合的互斥。系统由此实现「当前终态唯一（`successes` / `failed`）」与「历史完全可追溯（`attempts`）」的彻底正交。
@@ -326,7 +326,7 @@ with StateSnapshot.open(pipeline) as snap:
     "job_uid": "fetch::item_1",
     "attempt_no": 1,
     "run_id": "run_20261108_...",
-    "outcome": "success",               # "running" | "success" | "failure" | "retry"
+    "outcome": "success",               # "success" | "failure" | "retry"
     "started_at": "2026-11-08T10:00:00.123456Z",
     "settled_at": "2026-11-08T10:00:01.654321Z",
     "job": {...},
