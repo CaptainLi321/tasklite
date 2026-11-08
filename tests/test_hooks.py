@@ -1,18 +1,12 @@
-"""v2 用户钩子三件套回归（job_ref / progress_hook / slice_list）。
+"""v2 用户钩子回归（job_ref / slice_list）。
 
-契约：progress_hook 适配 v2 的 on_attempt_finished(uid, *, outcome)
-钩子形状（AttemptOutcome 值对象承载布尔语义）；slice_list 的三个数值
-参数 keyword-only（语义易混，裸位置传参会被类型检查静默放行）。
+契约：slice_list 的三个数值参数 keyword-only（语义易混，裸位置传参会被类型检查静默放行）。
 """
 from __future__ import annotations
 
-import io
-from contextlib import redirect_stdout
-
 import pytest
 
-from tasklite.engine.types import AttemptOutcome
-from tasklite.hooks import job_ref, progress_hook, slice_list
+from tasklite.hooks import job_ref, slice_list
 
 
 class TestJobRef:
@@ -37,51 +31,6 @@ class TestJobRef:
         assert job_ref("not-a-dict") == ""
         assert job_ref(None) == ""
         assert job_ref(12345) == ""
-
-
-class TestProgressHook:
-    """一行进度输出的三分支（重试 / 成功 / 终局失败）。"""
-
-    def test_success_line_with_ref(self):
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            progress_hook(
-                "fetch::p1",
-                outcome=AttemptOutcome(
-                    success=True, will_retry=False, metadata={"post_id": 10}
-                ),
-            )
-        assert "✓ fetch #10" in buf.getvalue()
-
-    def test_retry_line_reports_requeue(self):
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            progress_hook(
-                "fetch::p2",
-                outcome=AttemptOutcome(
-                    success=False, will_retry=True, metadata={"artist": "bob"}
-                ),
-            )
-        assert "⟳ fetch bob 失败，重入队重试" in buf.getvalue()
-
-    def test_terminal_failure_line_targets_failure_archive(self):
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            progress_hook(
-                "fetch::p3",
-                outcome=AttemptOutcome(success=False, will_retry=False, metadata={}),
-            )
-        assert "✗ fetch → 失败档案" in buf.getvalue()
-
-    def test_uid_without_ref_prints_task_type_only(self):
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            progress_hook(
-                "fetch::p4",
-                outcome=AttemptOutcome(success=True, will_retry=False, metadata={}),
-            )
-        assert "✓ fetch" in buf.getvalue()
-        assert "✓ fetch " not in buf.getvalue()
 
 
 class TestSliceList:

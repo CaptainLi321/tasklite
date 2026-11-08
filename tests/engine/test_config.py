@@ -165,9 +165,6 @@ class TestRunConfigResolve:
         assert config.deadlock_gap_max_rounds == DEADLOCK_GAP_MAX_ROUNDS
         assert config.strict_picklable is True
         assert config.output_roots is None
-        assert config.on_run_start is None
-        assert config.on_run_end is None
-        assert config.on_attempt_finished is None
 
     def test_explicit_scalars_passthrough_without_second_default(self, tmp_path):
         config = ConfigEnv(tmp_path).resolve(
@@ -187,22 +184,6 @@ class TestRunConfigResolve:
         env = ConfigEnv(tmp_path)
         with pytest.raises(ValueError, match="dependency_grace_seconds"):
             env.resolve(dependency_grace_seconds=0.0)
-
-    def test_hooks_passthrough(self, tmp_path):
-        fired_start = []
-        fired_end = []
-        fired_attempt = []
-        config = ConfigEnv(tmp_path).resolve(
-            on_run_start=lambda: fired_start.append(1),
-            on_run_end=fired_end.append,
-            on_attempt_finished=lambda uid, *, outcome: fired_attempt.append(uid),
-        )
-        config.on_run_start()
-        config.on_run_end("completed")
-        config.on_attempt_finished("t::1", outcome=None)
-        assert fired_start == [1]
-        assert fired_end == ["completed"]
-        assert fired_attempt == ["t::1"]
 
     def test_config_is_frozen(self, tmp_path):
         config = ConfigEnv(tmp_path).resolve()

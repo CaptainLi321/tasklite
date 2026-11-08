@@ -12,7 +12,7 @@ import tasklite
 from tasklite import (
     TaskLite, Job, JobContext, FileSpec, TaskResult,
     CapacityResource, RateLimitResource, Resource, FailureEntry,
-    job_ref, progress_hook, slice_list, content_fingerprint,
+    job_ref, slice_list, content_fingerprint,
     encode_job_component, encode_identifier, encode_content_id
 )
 from tasklite.engine.admission import TriggerRegistry, RequeuePolicy, RequeuePlan
@@ -37,7 +37,7 @@ def main():
 
     # 1. 基础模块与类型求值验证
     import typing
-    hints = typing.get_type_hints(TaskLite.run_graceful)
+    hints = typing.get_type_hints(TaskLite.run)
     assert "return" in hints
     print("✓ Type hints evaluated successfully.")
 
@@ -62,13 +62,6 @@ def main():
         pipeline.enqueue(j1)
         pipeline.enqueue(j2)
         pipeline.run()
-        stats = pipeline.stats
-
-        assert stats is not None
-        assert stats["succeeded"] == 2, f"Expected 2 succeeded, got {stats['succeeded']}"
-        assert stats["failed"] == 0, f"Expected 0 failed, got {stats['failed']}"
-        assert stats["retried"] == 1, f"Expected 1 retried, got {stats['retried']}"
-        assert stats["skipped"] == 0
 
         successes = pipeline.backend.load_successes()
         assert "task_a::job_1" in successes

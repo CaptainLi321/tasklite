@@ -30,11 +30,10 @@ from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import (
     AttemptOutcome,
+    ExecutionOptions,
     ExitReason,
-    RunSummary,
     StepOutcome,
     StopMode,
-    RunStats,
 )
 from tasklite.models.job import Job, WORKER_RESOURCE
 from tasklite.models.task import Task, TaskRegistry
@@ -198,13 +197,6 @@ class RuntimeEnv:
                 requeue_policy=ImmediateRequeuePolicy(),
                 output_roots=tmp_path,
                 strict_picklable=strict_picklable,
-                on_run_start=on_run_start,
-                on_run_end=on_run_end,
-                on_attempt_finished=(
-                    on_attempt_finished
-                    if on_attempt_finished is not None
-                    else (lambda uid, *, outcome: self.hooks.append((uid, outcome)))
-                ),
             ),
         )
 
@@ -225,7 +217,6 @@ class TestEngineRuntimeConfiguration:
         assert runtime.config.name == "test_runtime"
         assert runtime.stop_mode == StopMode.NONE
         assert not runtime.is_running
-        assert isinstance(runtime.stats, RunStats)
         assert isinstance(runtime.session, RunSession)
         assert isinstance(runtime.store, StateStore)
         assert runtime.channel is runtime.config.channel
@@ -237,17 +228,10 @@ class TestEngineRuntimeConfiguration:
         runtime = RuntimeEnv(tmp_path).runtime
 
         assert runtime.stop_mode == StopMode.NONE
-        # 首次 stop(force=False) -> DRAINING
-        assert runtime.request_stop(force=False) == StopMode.DRAINING
-        # 二次 stop(force=False) 升级为 ABORTING（单调）
-        assert runtime.request_stop(force=False) == StopMode.ABORTING
-        # 再次 stop 保持 ABORTING（幂等）
-        assert runtime.request_stop(force=False) == StopMode.ABORTING
-
-    def test_stop_force_direct_aborting(self, tmp_path):
-        runtime = RuntimeEnv(tmp_path).runtime
-        assert runtime.request_stop(force=True) == StopMode.ABORTING
-        assert runtime.stop_mode == StopMode.ABORTING
+        # 首次 stop() -> DRAINING
+        assert runtime.request_stop() == StopMode.DRAINING
+        # 二次 stop 保持 DRAINING（幂等，不升级强停）
+        assert runtime.request_stop() == StopMode.DRAINING
 
 
 # ── step 单步事件泵 ──────────────────────────────────────────────────
@@ -265,18 +249,13 @@ class TestEngineRuntimeStepPump:
         assert outcome.settled_count == 0
         assert outcome.should_terminate is True
 
-    def test_step_draining_and_aborting_modes(self, tmp_path):
+    def test_step_draining_mode(self, tmp_path):
         runtime = RuntimeEnv(tmp_path).runtime
 
-        runtime.request_stop(force=False)
+        runtime.request_stop()
         outcome_draining = runtime.step()
         assert outcome_draining.exit_reason == "stopped_draining"
         assert outcome_draining.should_terminate is True
-
-        runtime.request_stop(force=True)
-        outcome_aborting = runtime.step()
-        assert outcome_aborting.exit_reason == "stopped_aborting"
-        assert outcome_aborting.should_terminate is True
 
 
 # ── execute 生命周期 ─────────────────────────────────────────────────
@@ -286,20 +265,9 @@ class TestEngineRuntimeExecutionLifecycle:
     """测试 EngineRuntime 完整生命周期 execute() 与安全网。"""
 
     def test_execute_empty_queue_completed(self, tmp_path):
-        events = []
-
-        env = RuntimeEnv(
-            tmp_path, name="test_exec",
-            on_run_start=lambda: events.append("start"),
-            on_run_end=lambda reason: events.append(f"end:{reason}"),
-        )
-        summary = env.runtime.execute()
-        assert isinstance(summary, RunSummary)
-        assert summary.exit_reason is ExitReason.COMPLETED
-        assert summary.duration_seconds >= 0
-        assert summary.unhandled_exception is None
-        assert summary.run_id == env.runtime.session.run_id
-        assert events == ["start", "end:completed"]
+        env = RuntimeEnv(tmp_path, name="test_exec")
+        assert env.runtime.execute() is None
+        assert not env.runtime.is_running
 
     def test_execute_completes_job_end_to_end(self, tmp_path, monkeypatch):
         """四相泵 E2E：派发 → 回收 → 结算进 successes，attempts 轨迹收尾成功。"""
@@ -311,19 +279,12 @@ class TestEngineRuntimeExecutionLifecycle:
             SimpleNamespace(Process=make_instant_process_class()),
         )
 
-        summary = env.runtime.execute()
+        assert env.runtime.execute() is None
 
-        assert summary.exit_reason is ExitReason.COMPLETED
-        assert env.runtime.stats["succeeded"] == 1
         assert "t::j1" in env.backend.load_successes()
         assert env.backend.load_queue() == []
-        # attempt 收尾钩子经单一出口触发（成功形态值对象）
-        assert [(uid, out.success, out.will_retry) for uid, out in env.hooks] == [
-            ("t::j1", True, False)
-        ]
         records = env.backend.load_attempts("t::j1")
         assert records[-1].outcome == "succeeded"
-        assert records[-1].run_id == summary.run_id
 
     def test_unhandled_exception_propagates_via_raise_channel(self, tmp_path, monkeypatch):
         """异常通道契约：run 体内未处理异常一律经 raise 通道原样上抛，
@@ -339,9 +300,7 @@ class TestEngineRuntimeExecutionLifecycle:
         monkeypatch.undo()
         assert not runtime.is_running, "异常路径必须复位运行标志"
 
-        summary = runtime.execute()
-        assert summary.exit_reason is ExitReason.COMPLETED
-        assert summary.unhandled_exception is None
+        assert runtime.execute() is None
 
     def test_execute_resets_session_state_between_runs(self, tmp_path):
         runtime = RuntimeEnv(tmp_path).runtime
@@ -350,54 +309,34 @@ class TestEngineRuntimeExecutionLifecycle:
         first_run_id = runtime.session.run_id
         assert first_run_id
 
-        runtime.session.stats["succeeded"] = 5
-        runtime.request_stop(force=True)
+        runtime.session.record_retry("t::j1")
+        runtime.request_stop()
 
         runtime.execute()
         assert runtime.session.run_id != first_run_id
         assert runtime.session.stop_mode == StopMode.NONE
-        assert runtime.session.stats["succeeded"] == 0
+        assert runtime.session.get_retry_count("t::j1") == 0
 
     def test_strict_picklable_unpicklable_handler_fails(self, tmp_path):
-        """strict 预检失败：TypeError 上抛且起止钩子均不触发。
-
-        不变式：on_run_start/on_run_end 起止对称——预检发生在 session
-        begin 之前，run 尚未开始，fire_run_end 不得触发；错误传播语义
-        稳定（重复 execute 仍 fail-loud），运行态逐次复位。
-        """
-        events = []
-        # 不可 pickle 的 local lambda
+        """strict 预检失败：TypeError 上抛。"""
         local_fn = lambda j, c: True  # noqa: E731
-        env = RuntimeEnv(
-            tmp_path, name="test_picklable", strict_picklable=True,
-            on_run_start=lambda: events.append("start"),
-            on_run_end=lambda reason: events.append(f"end:{reason}"),
-        )
+        env = RuntimeEnv(tmp_path, name="test_picklable", strict_picklable=True)
         env.tasks.register(Task(task_type="unpicklable", handler=local_fn))
 
         with pytest.raises(TypeError, match="not picklable"):
             env.runtime.execute()
-        # run 未 begin：起止钩子均不触发（起止对称），运行态已复位
-        assert events == []
         assert not env.runtime.is_running
         assert env.runtime._run_lock_fd is None
 
         # 预检故障不留残留状态：同实例复跑仍稳定 fail-loud 且逐次复位
         with pytest.raises(TypeError, match="not picklable"):
             env.runtime.execute()
-        assert events == []
         assert not env.runtime.is_running
 
-        # 对照：可 pickle handler 的装配正常完成（钩子一对一配对触发）
-        env_ok = RuntimeEnv(
-            tmp_path / "ok", name="test_picklable_ok",
-            on_run_start=lambda: events.append("start"),
-            on_run_end=lambda reason: events.append(f"end:{reason}"),
-        )
+        # 对照：可 pickle handler 的装配正常完成
+        env_ok = RuntimeEnv(tmp_path / "ok", name="test_picklable_ok")
         env_ok.register("dummy")
-        summary = env_ok.runtime.execute()
-        assert summary.exit_reason is ExitReason.COMPLETED
-        assert events == ["start", "end:completed"]
+        assert env_ok.runtime.execute() is None
 
     def test_strict_picklable_disabled_allows_local_handler(self, tmp_path, monkeypatch):
         """预检关闭：不可 pickle handler 不在入口拒绝（交由派发期处置）。"""
@@ -409,8 +348,7 @@ class TestEngineRuntimeExecutionLifecycle:
             SimpleNamespace(Process=make_instant_process_class()),
         )
         env.runtime.store.enqueue_jobs([Job("local", "j1", payload={})])
-        summary = env.runtime.execute()
-        assert summary.exit_reason is ExitReason.COMPLETED
+        assert env.runtime.execute() is None
         assert "local::j1" in env.backend.load_successes()
 
     def test_concurrent_run_lock_rejection(self, tmp_path):
@@ -462,8 +400,7 @@ class TestEngineRuntimeInitFailureSafety:
         # 故障注入解除后，同实例可正常启动并完成（复跑成功同时证明锁已
         # 释放：遗留 fd 的 flock 会让下一次 try_acquire_lock 返回 None）
         monkeypatch.undo()
-        summary = env.runtime.execute()
-        assert summary.exit_reason is ExitReason.COMPLETED
+        assert env.runtime.execute() is None
         assert not env.runtime.is_running
         assert env.runtime._run_lock_fd is None
 
@@ -505,8 +442,7 @@ class TestEngineRuntimeInitFailureSafety:
         assert lock_fd is not None
         release_lock(lock_fd)
 
-        summary = env.runtime.execute()
-        assert summary.exit_reason is ExitReason.COMPLETED
+        assert env.runtime.execute() is None
         assert not env.runtime.is_running
 
 
@@ -530,7 +466,7 @@ class TestRunReentryGuard:
 
         def run_once():
             try:
-                runtime.execute()
+                runtime.execute(ExecutionOptions(install_signals=False))
             except BaseException as e:  # 正常路径不应抛，兜底记录便于诊断
                 run_errors.append(e)
 
@@ -542,7 +478,7 @@ class TestRunReentryGuard:
 
             # 执行期间同实例再次 run() 必须拒绝（重入守卫）
             with pytest.raises(RuntimeError, match=r"^Pipeline run\(\) already in progress"):
-                runtime.execute()
+                runtime.execute(ExecutionOptions(install_signals=False))
         finally:
             release.set()
         t.join(timeout=15)
@@ -561,7 +497,7 @@ class TestRunReentryGuard:
 class TestCrashNet:
     """_run_with_crash_net 统一异常承重网（确定性单测）。"""
 
-    def test_crash_net_aborts_saves_and_fires_run_end(self, tmp_path, monkeypatch):
+    def test_crash_net_aborts_and_saves(self, tmp_path, monkeypatch):
         runtime = RuntimeEnv(tmp_path).runtime
         calls: list[str] = []
 
@@ -575,52 +511,11 @@ class TestCrashNet:
         monkeypatch.setattr(
             runtime._recovery, "save_queue_crash_safe", lambda: calls.append("save")
         )
-        fired: list[str] = []
-        monkeypatch.setattr(runtime.session, "on_run_end", fired.append)
 
         with pytest.raises(RuntimeError, match="loop exploded"):
             runtime._run_with_crash_net()
 
         assert calls == ["abort", "save"], "承重网必须先在途清扫再崩溃保队"
-        assert fired == ["error"], "承重网必须以异常终局触发收尾钩子"
-
-    def test_crash_net_uses_session_exit_reason(self, tmp_path, monkeypatch):
-        """KI 承重网终局 reason 为 interrupted（异常类型优先）。"""
-        runtime = RuntimeEnv(tmp_path).runtime
-
-        def _interrupt():
-            raise KeyboardInterrupt
-
-        monkeypatch.setattr(runtime, "run_loop", _interrupt)
-        monkeypatch.setattr(
-            runtime._recovery, "abort_in_flight", lambda: None
-        )
-        monkeypatch.setattr(
-            runtime._recovery, "save_queue_crash_safe", lambda: None
-        )
-        fired: list[str] = []
-        monkeypatch.setattr(runtime.session, "on_run_end", fired.append)
-
-        with pytest.raises(KeyboardInterrupt):
-            runtime._run_with_crash_net()
-        assert fired == ["interrupted"]
-
-    def test_persist_suspension_failure_degraded_not_fatal(self, tmp_path, monkeypatch):
-        """收尾期挂起持久化失败降级告警，不遮蔽正常终局钩子。"""
-        runtime = RuntimeEnv(tmp_path).runtime
-        monkeypatch.setattr(runtime, "run_loop", lambda: None)
-
-        def _boom(*_a, **_kw):
-            raise OSError(5, "disk gone")
-
-        monkeypatch.setattr(
-            runtime._recovery, "persist_resource_suspensions", _boom
-        )
-        fired: list[str] = []
-        monkeypatch.setattr(runtime.session, "on_run_end", fired.append)
-
-        runtime._run_with_crash_net()
-        assert fired == ["completed"]
 
     def test_run_id_meta_failure_fails_loud(self, tmp_path, monkeypatch):
         """set_engine_metadata 失败 → execute() 抛异常，而非静默降级为无 fence 运行。"""
@@ -671,7 +566,7 @@ class TestPrepareRunState:
         assert runtime.session.run_id != first
 
 
-# ── DRAINING / ABORTING 停机语义（确定性 fake 进程）──────────────────
+# ── DRAINING 停机语义（确定性 fake 进程）────────────────────────────
 
 
 class TestGracefulDraining:
@@ -698,7 +593,7 @@ class TestGracefulDraining:
             assert enter.wait(10)
             observed["inflight_at_stop"] = len(runtime.in_flight)
             proc = next(iter(runtime.in_flight.values())).handle.process
-            runtime.request_stop()  # 默认 DRAINING：不 kill
+            runtime.request_stop()  # DRAINING：不 kill
             observed["queue_during_draining"] = [
                 jd["job_id"] for jd in runtime.store.state.queue
             ]
@@ -707,7 +602,7 @@ class TestGracefulDraining:
 
         t = threading.Thread(target=controller)
         t.start()
-        summary = runtime.execute()
+        assert runtime.execute() is None
         t.join()
 
         assert observed["inflight_at_stop"] == 1, "stop 时 in-flight 必须非空"
@@ -715,45 +610,10 @@ class TestGracefulDraining:
             "DRAINING 期间不得派发 j2，j2 必须保留在队列"
         assert observed["alive_during_draining"] is True, \
             "DRAINING 不得 kill in-flight 进程"
-        assert summary.exit_reason is ExitReason.STOPPED_DRAINING
         # DRAINING：in-flight job 完成并进 successes；j2 留磁盘队列
         assert "t::j1" in env.backend.load_successes()
         assert "t::j2" not in env.backend.load_successes()
         assert any(jd.get("job_id") == "j2" for jd in env.backend.load_queue())
-
-
-class TestForceAbort:
-    def test_aborting_kills_inflight_and_requeues(self, tmp_path, monkeypatch):
-        """ABORTING：stop(force=True) 在 in-flight 期间 kill 子进程并
-        requeue——作业未 commit 保留在磁盘队列（at-least-once）。"""
-        enter = threading.Event()
-        env = RuntimeEnv(tmp_path, capacity=1)
-        env.register("t")
-        env.runtime.store.enqueue_jobs([Job("t", "j1", payload={})])
-        monkeypatch.setattr(
-            env.runtime.channel, "_process_context",
-            SimpleNamespace(Process=make_stay_alive_process_class(enter)),
-        )
-        runtime = env.runtime
-        observed: dict[str, Any] = {}
-
-        def controller():
-            assert enter.wait(10)
-            observed["proc"] = next(iter(runtime.in_flight.values())).handle.process
-            runtime.request_stop(force=True)
-
-        t = threading.Thread(target=controller)
-        t.start()
-        summary = runtime.execute()
-        t.join()
-
-        assert summary.exit_reason is ExitReason.STOPPED_ABORTING
-        proc = observed["proc"]
-        assert proc.is_alive() is False, "ABORTING 必须 kill in-flight 子进程"
-        assert proc.exitcode == -9
-        # 作业未 commit（未进 successes），保留在磁盘队列
-        assert "t::j1" not in env.backend.load_successes()
-        assert any(jd.get("job_id") == "j1" for jd in env.backend.load_queue())
 
     def test_deadlock_detected_flag_propagates_to_step_outcome(
         self, tmp_path, monkeypatch,

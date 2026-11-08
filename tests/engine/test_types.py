@@ -15,10 +15,8 @@ from tasklite.engine.types import (
     TRANSIENT_KIND_STAT_KEYS,
     ExecutionOptions,
     ExitReason,
-    RunSummary,
     StopMode,
     StepOutcome,
-    RunStats,
 )
 
 _EXPECTED_STAT_KEYS = {
@@ -36,25 +34,11 @@ _EXPECTED_STAT_KEYS = {
 
 
 class TestEmptyStats:
-    """EMPTY_STATS 基准形状：十键全零，RunStats 以其为初始快照而非别名。"""
+    """EMPTY_STATS 基准形状：十键全零。"""
 
     def test_ten_keys_all_zero(self):
         assert set(EMPTY_STATS) == _EXPECTED_STAT_KEYS
         assert all(value == 0 for value in EMPTY_STATS.values())
-
-    def test_task_stats_initial_snapshot(self):
-        stats = RunStats()
-        assert dict(stats) == EMPTY_STATS
-
-    def test_task_stats_mutation_does_not_alias_template(self):
-        """不变式：RunStats 是 EMPTY_STATS 的拷贝初始化——实例计数不得
-        写穿模板，否则并发 run 之间统计互污。"""
-        stats = RunStats()
-        stats["succeeded"] += 1
-        stats["failed"] = 7
-        assert EMPTY_STATS["succeeded"] == 0
-        assert EMPTY_STATS["failed"] == 0
-        assert RunStats()["succeeded"] == 0
 
 
 class TestTransientKindRegistry:
@@ -86,13 +70,12 @@ class TestTransientKindRegistry:
 
 
 class TestStopMode:
-    """停机状态机三态值对象。"""
+    """停机状态机值对象。"""
 
     def test_member_values(self):
-        assert {member.name for member in StopMode} == {"NONE", "DRAINING", "ABORTING"}
+        assert {member.name for member in StopMode} == {"NONE", "DRAINING"}
         assert StopMode.NONE.value == "none"
         assert StopMode.DRAINING.value == "draining"
-        assert StopMode.ABORTING.value == "aborting"
 
 
 class TestExitReason:
@@ -102,7 +85,6 @@ class TestExitReason:
         assert {member.name for member in ExitReason} == {
             "COMPLETED",
             "STOPPED_DRAINING",
-            "STOPPED_ABORTING",
             "INTERRUPTED",
             "ERROR",
         }
@@ -116,7 +98,6 @@ class TestExecutionOptions:
     def test_defaults(self):
         options = ExecutionOptions()
         assert options.install_signals is True
-        assert options.acquire_run_lock is True
 
     def test_frozen(self):
         options = ExecutionOptions()
@@ -156,38 +137,3 @@ class TestStepOutcome:
         )
         assert outcome.should_terminate is True
         assert outcome.exit_reason == "error"
-
-
-class TestRunSummary:
-    """运行摘要契约：异常通道与摘要通道互斥。"""
-
-    @staticmethod
-    def _summary() -> RunSummary:
-        return RunSummary(
-            exit_reason=ExitReason.COMPLETED,
-            stats=RunStats(),
-            run_id="run_seed.1",
-            duration_seconds=1.25,
-        )
-
-    def test_unhandled_exception_defaults_none(self):
-        """execute() 自身永不回填 unhandled_exception（恒 None）——未处理
-        异常一律经 raise 通道原样上抛，该字段只由包装层显式回填。"""
-        summary = self._summary()
-        assert summary.unhandled_exception is None
-
-    def test_frozen(self):
-        summary = self._summary()
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            summary.run_id = "other"
-
-    def test_explicit_unhandled_exception_backfill(self):
-        exc = RuntimeError("wrapper observed crash")
-        summary = RunSummary(
-            exit_reason=ExitReason.ERROR,
-            stats=RunStats(),
-            run_id="run_seed.2",
-            duration_seconds=0.0,
-            unhandled_exception=exc,
-        )
-        assert summary.unhandled_exception is exc

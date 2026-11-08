@@ -38,11 +38,10 @@ TRANSIENT_KIND_STAT_KEYS = {
 
 
 class StopMode(enum.Enum):
-    """停机状态机三态。"""
+    """停机状态机模式。"""
 
     NONE = "none"
     DRAINING = "draining"
-    ABORTING = "aborting"
 
 
 class ExitReason(str, enum.Enum):
@@ -50,21 +49,13 @@ class ExitReason(str, enum.Enum):
 
     COMPLETED = "completed"
     STOPPED_DRAINING = "stopped_draining"
-    STOPPED_ABORTING = "stopped_aborting"
     INTERRUPTED = "interrupted"
     ERROR = "error"
 
 
-class RunStats(dict):
-    """运行统计字典（键集即公开监控面，读写一律下标风格）。"""
-
-    def __init__(self) -> None:
-        super().__init__(EMPTY_STATS)
-
-
 @dataclass(frozen=True)
 class AttemptOutcome:
-    """一次 attempt 收尾事件的不可变载荷（on_attempt_finished 钩子唯一形状）。
+    """一次 attempt 收尾事件的不可变载荷。
 
     布尔语义经值对象承载、不裸传：``success`` 与 ``will_retry``
     正交——成功 True/False；失败将重试 False/True；失败耗尽进失败档案
@@ -100,7 +91,6 @@ class ExecutionOptions:
     """execute() 单次运行的动态选项。"""
 
     install_signals: bool = True
-    acquire_run_lock: bool = True
 
 
 @dataclass(frozen=True)
@@ -118,32 +108,13 @@ class StepOutcome:
     exit_reason: str | None = None
 
 
-@dataclass(frozen=True)
-class RunSummary:
-    """引擎执行完成后的不可变运行摘要。
-
-    契约：execute() 的未处理异常一律经 raise 通道原样上抛，摘要仅在
-    无异常终结（完成/优雅停机）时返回——execute() 自身永不回填
-    unhandled_exception（恒为 None）；该字段供包装层构造异常 run 的
-    摘要时显式回填。
-    """
-
-    exit_reason: ExitReason
-    stats: RunStats
-    run_id: str
-    duration_seconds: float
-    unhandled_exception: BaseException | None = None
-
-
 __all__ = [
     "EMPTY_STATS",
     "TRANSIENT_KIND_STAT_KEYS",
     "AttemptOutcome",
     "StopMode",
     "ExitReason",
-    "RunStats",
     "ExecutionOptions",
     "JobHandle",
     "StepOutcome",
-    "RunSummary",
 ]

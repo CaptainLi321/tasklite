@@ -173,12 +173,10 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
     path = output_root / "data"
     if kind == "input":
         path.write_text("input")
-    finished = []
     pipeline = TaskLite(
         "transport",
         state_dir=tmp_path / "state",
         output_roots=output_root,
-        on_attempt_finished=lambda *args, **kwargs: finished.append((args, kwargs)),
     )
     pipeline.register_task("transport", _write_declaration_with_io_fault)
     job = Job._restore(
@@ -200,6 +198,5 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
         assert queue[0]["max_retries_per_run"] == 3
         assert pipeline.backend.load_successes() == {}
         assert pipeline.backend.load_failed() == {}
-        assert finished == []
     finally:
         pipeline.stop()

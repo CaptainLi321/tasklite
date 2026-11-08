@@ -13,8 +13,9 @@ def test_custom_trigger_observes_inherited_task_spec(tmp_path):
     pipeline.register_task("t", handle, max_retries_per_run=7, timeout_seconds=12,
                            trigger="inspect")
     pipeline.enqueue(Job("t", "a"))
-    summary = pipeline.run()
-    assert summary.stats["skipped"] == 1
+    res = pipeline.run()
+    assert res is None
+    assert pipeline.backend.load_queue() == []
     assert seen[0]["max_retries_per_run"] == 7
     assert seen[0]["timeout_seconds"] == 12
     assert seen[0]["trigger"] == "inspect"
@@ -27,9 +28,10 @@ def test_fresh_trigger_skip_allows_dependent_trigger(tmp_path):
     pipeline.register_task("t", handle, trigger="observe")
     pipeline.enqueue(Job("t", "b", depends_on=["t::a"]))
     pipeline.enqueue(Job("t", "a"))
-    summary = pipeline.run()
+    res = pipeline.run()
+    assert res is None
     assert seen == ["t::a", "t::b"]
-    assert summary.stats["skipped"] == 2
+    assert pipeline.backend.load_queue() == []
     assert list(pipeline.list_failures()) == []
 
 
@@ -211,8 +213,9 @@ def test_trigger_skip_is_local_to_run_and_does_not_replace_selection_skip(tmp_pa
     pipeline.selection(Skip("parent"))
     pipeline.enqueue(Job("parent", "c"))
     pipeline.enqueue(Job("child", "d", depends_on=["parent::c"]))
-    summary = pipeline.run()
-    assert summary.stats["skipped"] == 2
+    res = pipeline.run()
+    assert res is None
+    assert pipeline.backend.load_queue() == []
     assert seen == ["parent::a"]
 
 
@@ -285,9 +288,7 @@ def test_trigger_error_aborts_inflight_without_burning_budget(tmp_path, monkeypa
         def close(self):
             pass
     monkeypatch.setattr(mp, "Process", WaitingProcess)
-    ended = []
-    pipeline = TaskLite(name="abort", state_dir=tmp_path, backend="memory", max_workers=2,
-                        on_run_end=ended.append)
+    pipeline = TaskLite(name="abort", state_dir=tmp_path, backend="memory", max_workers=2)
     pipeline.register_trigger("error", lambda ctx: 1 / 0)
     pipeline.register_task("t", handle)
     pipeline.enqueue(Job("t", "a"))
@@ -299,4 +300,3 @@ def test_trigger_error_aborts_inflight_without_burning_budget(tmp_path, monkeypa
     assert all(row["attempt_no"] == 1 for row in rows.values())
     assert pipeline.backend.load_attempts("t::b") == []
     assert pipeline.list_failures() == []
-    assert ended == ["error"]

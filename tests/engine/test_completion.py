@@ -8,6 +8,8 @@ settle_reaped / settle_aborted 批量结算。
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
 from pathlib import Path
@@ -31,7 +33,7 @@ from tasklite.engine.resource import (
     ResourceManager,
 )
 from tasklite.engine.store import StateStore
-from tasklite.engine.types import AttemptOutcome, JobHandle, RunStats
+from tasklite.engine.types import AttemptOutcome, JobHandle
 from tasklite.models.job import Job, JobRuntimeState
 from tasklite.models.state import PipelineState
 
@@ -65,7 +67,7 @@ class CompletionEnv:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
-        self.stats = RunStats()
+        self.stats = defaultdict(int)
         self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.store = StateStore(
             self.backend,

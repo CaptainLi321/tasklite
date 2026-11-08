@@ -24,7 +24,7 @@ import time
 
 import pytest
 
-from tasklite import CapacityResource, ExitReason, Job, TaskLite, TaskResult
+from tasklite import CapacityResource, Job, TaskLite, TaskResult
 from tasklite.backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from tasklite.engine.resource import ENGINE_METADATA_RESOURCE_SUSPENSIONS
 from tasklite.utils.artifact import ArtifactPathPolicy
@@ -206,8 +206,8 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
                     ))
 
     monkeypatch.setattr(backend, "_get_conn", observe_before_commit)
-    summary = pipeline.run()
-    assert summary.stats["succeeded"] == 2
+    res = pipeline.run()
+    assert res is None
     assert len(observations) == 1
     metadata, attempt, cursor, queue = observations[0]
     assert metadata["artifacts"]["report"]["path"] == str(
@@ -229,7 +229,7 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
     reopened = pipelines()
     reopened.register_task("parent", success_handler)
     result = reopened.run()
-    assert result.stats["succeeded"] == 0
+    assert result is None
     assert len(reopened.backend.load_attempts("parent::parent")) == 1
     assert reopened.backend.load_successes()["parent::parent"]["worker_pid"] == pid
     assert reopened.backend.load_cursors()["position"] == "42"
@@ -240,7 +240,7 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
         > time.time()
     )
     reopened.enqueue(Job("parent", "parent"))
-    assert reopened.run().stats["skipped"] == 1
+    assert reopened.run() is None
     expected_attempts = (
         ["succeeded"]
         if reopened.backend.schema_version >= TARGET_SCHEMA_VERSION
@@ -288,15 +288,16 @@ def test_process_death_uses_existing_budget(pipelines, monkeypatch, tmp_path, mo
 
         monkeypatch.setattr(channel, "reap_completed", reap_and_kill)
 
-    summary = pipeline.run()
+    res = pipeline.run()
+    assert res is None
     attempts = pipeline.backend.load_attempts("work::" + mode)
     if mode == "timeout":
-        assert summary.stats["failed"] == 1 and summary.stats["retried"] == 0
+        assert len(pipeline.backend.load_failed()) == 1
         assert len(attempts) == 1 and attempts[0].outcome == "failed"
         assert attempts[0].attempt_no == 1
         assert "TIMEOUT" in str(pipeline.backend.load_failed())
     else:
-        assert summary.stats["succeeded"] == 1 and summary.stats["retried"] == 1
+        assert "work::" + mode in pipeline.backend.load_successes()
         assert [a.attempt_no for a in attempts] == [1, 2]
         assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
         expected = "PROCESS_SIGNAL_DEATH" if mode == "kill" else "PROCESS_CRASH_EXIT"
@@ -332,8 +333,7 @@ def test_cleanup_error_preserves_uncommitted_queue(pipelines, monkeypatch, tmp_p
         assert pipeline.backend.load_attempts("work::cleanup")[0].outcome == "running"
 
 
-@pytest.mark.parametrize("force", [False, True])
-def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_path, force):
+def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_path):
     sync_dir = tmp_path / "sync"
     sync_dir.mkdir(parents=True, exist_ok=True)
     pipeline = pipelines()
@@ -353,17 +353,14 @@ def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_p
                 and len(channel.read_declared_artifacts(handle.job_uid)) == 2
             ):
                 requested.append(handle.execution_id or "")
-                pipeline.stop(force=force)
-                if not force:
-                    (sync_dir / "release").write_text("go", encoding="utf-8")
+                pipeline.stop()
+                (sync_dir / "release").write_text("go", encoding="utf-8")
         return orig_reap(handles)
 
     monkeypatch.setattr(channel, "reap_completed", reap_with_stop_trigger)
-    summary = pipeline.run()
+    res = pipeline.run()
+    assert res is None
     assert requested
-    assert summary.exit_reason == (
-        ExitReason.STOPPED_ABORTING if force else ExitReason.STOPPED_DRAINING
-    )
     queue = pipeline.backend.load_queue()
     assert not (tmp_path / "output" / "temporary.txt").exists()
     assert (tmp_path / "output" / "kept.txt").exists()
@@ -373,32 +370,26 @@ def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_p
         )["api"]
         > time.time()
     )
-    if force:
-        assert {j["job_id"] for j in queue} == {"active", "waiting"}
-        assert all(j["attempt_no"] == 1 for j in queue)
-        assert pipeline.backend.load_successes() == {}
-        assert pipeline.backend.load_failed() == {}
-    else:
-        assert [j["job_id"] for j in queue] == ["waiting"]
-        assert pipeline.backend.load_successes()["controlled::active"]["inputs"] == [
-            str(tmp_path / "output" / "kept.txt")
-        ]
+    assert [j["job_id"] for j in queue] == ["waiting"]
+    assert pipeline.backend.load_successes()["controlled::active"]["inputs"] == [
+        str(tmp_path / "output" / "kept.txt")
+    ]
 
 
-def test_force_abort_commits_complete_result_already_received(pipelines, monkeypatch):
+def test_stop_commits_complete_result_already_received(pipelines, monkeypatch):
     pipeline = pipelines()
     pipeline.enqueue(Job("child", "done"))
     channel = pipeline._runtime.channel
     orig_accept = channel._accept_message
 
-    def accept_and_force_stop(handle, msg):
+    def accept_and_stop(handle, msg):
         orig_accept(handle, msg)
         if msg.kind == "result":
-            pipeline.stop(force=True)
+            pipeline.stop()
 
-    monkeypatch.setattr(channel, "_accept_message", accept_and_force_stop)
-    summary = pipeline.run()
-    assert summary.exit_reason == ExitReason.STOPPED_ABORTING
+    monkeypatch.setattr(channel, "_accept_message", accept_and_stop)
+    res = pipeline.run()
+    assert res is None
     assert pipeline.backend.load_successes()["child::done"]["child"] is True
     assert pipeline.backend.load_queue() == []
     assert pipeline.backend.load_attempts("child::done")[0].outcome == "succeeded"

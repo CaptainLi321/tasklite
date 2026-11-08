@@ -21,7 +21,7 @@ from tasklite.engine.admission import (
 )
 from tasklite.engine.resource import CapacityResource, RateLimitResource
 from tasklite.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
-from tasklite.engine.types import AttemptOutcome, ExitReason, RunSummary, StopMode
+from tasklite.engine.types import AttemptOutcome, StopMode
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.models.task import Task
@@ -164,7 +164,7 @@ class DelegatingFakeBackend(AbstractStateBackend):
 # ── fake 进程（写 IPC 结果文件，与真实 worker 同路径）──────────────────
 
 
-def make_instant_process_class(retry_uid: str | None = None):
+def make_instant_process_class(retry_uid: str | None = None, recorder: list | None = None):
     """FakeProcess：start() 即写结果并退出。
 
     ``retry_uid`` 命中的 job 写 retry 结果（走失败重试收尾路径），其余
@@ -180,6 +180,8 @@ def make_instant_process_class(retry_uid: str | None = None):
         def start(self):
             if self.args:
                 spec = self.args[0]
+                if recorder is not None:
+                    recorder.append(spec.job.uid)
                 result = {
                     "spawned_jobs": [],
                     "resource_suspensions": [],
@@ -726,9 +728,9 @@ class TestEnqueue:
             timeout_seconds=999,
             trigger="always",
         )
-        summary = p2.run()
+        p2.run()
         p2.stop()
-        assert summary.stats["succeeded"] == 1
+        assert len(p2.backend.load_successes()) == 1
         assert len(observed) == 1
         assert observed[0]["resources"] == {"gpu": 1.0, "__workers__": 1.0}
         assert observed[0]["max_retries_per_run"] == 1
@@ -810,23 +812,7 @@ class TestSixStepContract:
     → enqueue → run → stop 的完整链路（fake 进程驱动）。"""
 
     def test_full_six_step_flow(self, tmp_path, monkeypatch):
-        events: list[str] = []
-
-        def on_run_start():
-            events.append("run_start")
-
-        def on_run_end(reason):
-            events.append(f"run_end:{reason}")
-
-        def on_attempt_finished(uid, *, outcome):
-            events.append(f"attempt:{uid}:{outcome.success}")
-
-        p = make_pipeline(
-            tmp_path,
-            on_run_start=on_run_start,
-            on_run_end=on_run_end,
-            on_attempt_finished=on_attempt_finished,
-        )
+        p = make_pipeline(tmp_path)
 
         p.register_resource(CapacityResource("gpu", 2.0))
         p.register_task("fetch", ok_handler, resources={"gpu": 1.0})
@@ -834,28 +820,11 @@ class TestSixStepContract:
         p.enqueue(Job("fetch", "b"))
 
         monkeypatch.setattr(mp, "Process", make_instant_process_class())
-        summary = p.run()
+        res = p.run()
         p.stop()
 
-        assert summary.exit_reason is ExitReason.COMPLETED
-        assert summary.stats["succeeded"] == 2
+        assert res is None
         assert sorted(p.backend.load_successes()) == ["fetch::a", "fetch::b"]
-        assert events[0] == "run_start"
-        assert events[-1] == "run_end:completed"
-        assert events[1:3] == ["attempt:fetch::a:True", "attempt:fetch::b:True"]
-
-    def test_run_summary_and_hooks_via_session(self, tmp_path, monkeypatch):
-        p = make_pipeline(tmp_path, on_run_start=lambda: None)
-        assert p.on_run_start is not None
-        assert p.on_attempt_finished is None
-        assert p.on_run_end is None
-        p.register_task("fetch", ok_handler)
-        p.enqueue(Job("fetch", "a"))
-        monkeypatch.setattr(mp, "Process", make_instant_process_class())
-        summary = p.run()
-        assert summary.run_id
-        assert summary.duration_seconds >= 0
-        assert p.stats["succeeded"] == 1
 
     def test_run_reentry_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -865,26 +834,12 @@ class TestSixStepContract:
 
     def test_stop_transitions_session_state(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.stop()
-        assert p._runtime.stop_mode is StopMode.DRAINING
-        p.stop(force=True)
-        assert p._runtime.stop_mode is StopMode.ABORTING
-
-    def test_run_graceful_swallows_keyboard_interrupt(self, tmp_path, monkeypatch):
-        p = make_pipeline(tmp_path)
-
-        def raise_interrupt(options=None):
-            raise KeyboardInterrupt()
-
-        monkeypatch.setattr(p._runtime, "execute", raise_interrupt)
-        assert p.run_graceful() is None
-        assert p._runtime.stop_mode is StopMode.DRAINING
-
-    def test_run_graceful_returns_summary_on_normal_completion(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        summary = p.run_graceful()
-        assert isinstance(summary, RunSummary)
-        assert summary.exit_reason is ExitReason.COMPLETED
+        with running(p):
+            p.stop()
+            assert p._runtime.stop_mode is StopMode.DRAINING
+            # 幂等无副作用
+            p.stop()
+            assert p._runtime.stop_mode is StopMode.DRAINING
 
     def test_is_running_flag_lifecycle(self, tmp_path, monkeypatch):
         p = make_pipeline(tmp_path)
@@ -914,34 +869,25 @@ class TestSchedulingSeamWiring:
 
     def test_ordering_constructor_arg_reverses_visit_order(self, tmp_path, monkeypatch):
         order: list[str] = []
-
-        def on_attempt_finished(uid, *, outcome):
-            order.append(uid)
-
         p = make_pipeline(
             tmp_path,
             ordering_policy=NewestFirstPolicy(),
-            on_attempt_finished=on_attempt_finished,
         )
         p.register_task("fetch", ok_handler)
         for jid in ("a", "b", "c"):
             p.enqueue(Job("fetch", jid))
-        monkeypatch.setattr(mp, "Process", make_instant_process_class())
+        monkeypatch.setattr(mp, "Process", make_instant_process_class(recorder=order))
         p.run()
 
         assert order == ["fetch::c", "fetch::b", "fetch::a"]
 
     def test_ordering_default_wiring_and_fifo_equivalence(self, tmp_path, monkeypatch):
         order: list[str] = []
-
-        def on_attempt_finished(uid, *, outcome):
-            order.append(uid)
-
-        p = make_pipeline(tmp_path, on_attempt_finished=on_attempt_finished)
+        p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
         for jid in ("a", "b", "c"):
             p.enqueue(Job("fetch", jid))
-        monkeypatch.setattr(mp, "Process", make_instant_process_class())
+        monkeypatch.setattr(mp, "Process", make_instant_process_class(recorder=order))
         p.run()
 
         assert order == ["fetch::a", "fetch::b", "fetch::c"]
@@ -953,54 +899,44 @@ class TestSchedulingSeamWiring:
         self, tmp_path, monkeypatch
     ):
         """队尾重入队注入：flaky 首试失败后排在 later 之后（默认应在之前）。"""
-        order: list[tuple[str, bool]] = []
-
-        def on_attempt_finished(uid, *, outcome):
-            order.append((uid, outcome.will_retry))
-
+        order: list[str] = []
         p = make_pipeline(
             tmp_path,
             max_workers=1,
             requeue_policy=TailRequeuePolicy(),
-            on_attempt_finished=on_attempt_finished,
         )
         p.register_task("fetch", ok_handler)
         p.enqueue(Job("fetch", "flaky", max_retries_per_run=1))
         p.enqueue(Job("fetch", "later"))
         monkeypatch.setattr(
-            mp, "Process", make_instant_process_class(retry_uid="fetch::flaky")
+            mp, "Process", make_instant_process_class(retry_uid="fetch::flaky", recorder=order)
         )
         p.run()
 
-        assert [uid for uid, _ in order] == [
+        assert order == [
             "fetch::flaky", "fetch::later", "fetch::flaky",
         ]
-        assert order[0][1] is True
-        assert order[2][1] is False
         assert "fetch::later" in p.backend.load_successes()
         assert "fetch::flaky" in p.backend.load_failed()
 
     def test_requeue_default_wiring_and_front_equivalence(self, tmp_path, monkeypatch):
         """默认立即重入队（front=True）：flaky 重试先于 later 结算。"""
         order: list[str] = []
-
-        def on_attempt_finished(uid, *, outcome):
-            order.append(uid)
-
         p = make_pipeline(
             tmp_path,
             max_workers=1,
-            on_attempt_finished=on_attempt_finished,
         )
         p.register_task("fetch", ok_handler)
         p.enqueue(Job("fetch", "flaky", max_retries_per_run=1))
         p.enqueue(Job("fetch", "later"))
         monkeypatch.setattr(
-            mp, "Process", make_instant_process_class(retry_uid="fetch::flaky")
+            mp, "Process", make_instant_process_class(retry_uid="fetch::flaky", recorder=order)
         )
         p.run()
 
-        assert order == ["fetch::flaky", "fetch::flaky", "fetch::later"]
+        assert order == [
+            "fetch::flaky", "fetch::flaky", "fetch::later",
+        ]
         assert isinstance(p.runtime_config.requeue_policy, ImmediateRequeuePolicy)
         assert p._runtime.store._requeue_policy is p.runtime_config.requeue_policy
 
@@ -1093,19 +1029,6 @@ class TestRunExecutionOptions:
         finally:
             release_lock(lock_fd)
 
-    def test_acquire_run_lock_false_bypasses_reentry_lock(self, tmp_path):
-        """acquire_run_lock=False：锁被占时并发 run 不被重入锁拒绝。"""
-        from tasklite.utils.lockfile import release_lock, try_acquire_lock
-
-        p = make_pipeline(tmp_path)
-        lock_fd = try_acquire_lock(p.ipc_dir, "__pipeline_run__", timeout=0)
-        assert lock_fd is not None
-        try:
-            summary = p.run(acquire_run_lock=False)
-            assert summary.exit_reason is ExitReason.COMPLETED
-        finally:
-            release_lock(lock_fd)
-
     def test_install_signals_wiring(self, tmp_path, monkeypatch):
         """install_signals 接线：False 不安装信号陷阱，默认安装
         SIGTERM/SIGINT（记录器断言，不硬造信号场景）。"""
@@ -1132,8 +1055,8 @@ class TestRunExecutionOptions:
         p.run(install_signals=False)
         assert installed == []
 
-        summary = p.run()
-        assert summary.exit_reason is ExitReason.COMPLETED
+        res = p.run()
+        assert res is None
         assert installed == [signal_module.SIGTERM, signal_module.SIGINT]
 
 

@@ -252,17 +252,17 @@ def test_workers_suspended_no_inflight_sleeps_not_busy_loop(tmp_state_dir, monke
     monkeypatch.setattr("time.sleep", lambda seconds: slept.append(seconds))
 
     def run_pipeline() -> None:
-        pipeline.run()
+        pipeline.run(install_signals=False)
 
     thread = threading.Thread(target=run_pipeline)
     thread.start()
     deadline = time.time() + 10.0
     while not slept and time.time() < deadline:
         real_sleep(0.02)
-    pipeline.stop(force=True)
+    pipeline.stop()
     thread.join(timeout=5.0)
 
-    assert not thread.is_alive(), "stop(force) 后 run() 必须退出——无无限忙循环"
+    assert not thread.is_alive(), "stop() 后 run() 必须退出——无无限忙循环"
     assert slept, "workers 挂起 + 无 in-flight 时主循环必须进入等待睡眠，而非忙循环"
 
 
@@ -296,15 +296,15 @@ def test_custom_worker_resource_zero_wait_no_busy_loop(tmp_state_dir, monkeypatc
     slept: list[float] = []
     monkeypatch.setattr("time.sleep", lambda seconds: slept.append(seconds))
 
-    thread = threading.Thread(target=pipeline.run)
+    thread = threading.Thread(target=lambda: pipeline.run(install_signals=False))
     thread.start()
     deadline = time.time() + 10.0
     while not slept and time.time() < deadline:
         real_sleep(0.02)
-    pipeline.stop(force=True)
+    pipeline.stop()
     thread.join(timeout=5.0)
 
-    assert not thread.is_alive(), "stop(force) 后 run() 必须退出——无无限忙循环"
+    assert not thread.is_alive(), "stop() 后 run() 必须退出——无无限忙循环"
     assert slept, (
         "自定义 worker 资源返回 (False, 0.0) 必须经等待下限钳制触发 sleep，"
         "而非忙循环"

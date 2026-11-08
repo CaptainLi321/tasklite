@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import pickle
 import signal
+import threading
 import time
 import traceback
 import uuid
@@ -33,10 +34,8 @@ from .store import StateStore
 from .types import (
     ExecutionOptions,
     ExitReason,
-    RunSummary,
     StepOutcome,
     StopMode,
-    RunStats,
 )
 from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
@@ -47,6 +46,8 @@ from ..selection import Selection
 from ..utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
+
+_REAL_SLEEP = time.sleep
 
 # step() 单步派发上限缺省（显式上限由调用方传入）
 _UNBOUNDED_DISPATCH_LIMIT = 1_000_000
@@ -79,28 +80,22 @@ class EngineRuntime:
 
         # 持久会话：execute() 经 begin() 复位（语义等价于每次新建会话，
         # 同时保证机器持有的 session 引用跨 run 稳定）。
-        self._session = RunSession(
-            on_run_start=config.on_run_start,
-            on_attempt_finished=config.on_attempt_finished,
-            on_run_end=config.on_run_end,
-        )
+        self._session = RunSession()
 
-        # 构造期即建 StateStore（enqueue/OpsConsole 在 run 前可用）；
-        # on_attempt_finished 绑定会话方法——钩子后置变更即时生效。
+        # 构造期即建 StateStore（enqueue/OpsConsole 在 run 前可用）。
         # backend 所有权唯一锚定 StateStore（RunConfig.backend 仅为构造
         # 期装配快照的搬运通道），运行期一切读写经 store.backend 派生。
         self.store: StateStore = StateStore(
             config.backend,
             commit_failure_threshold=config.commit_failure_threshold,
             classifier=config.classifier,
-            on_attempt_finished=self._session.fire_attempt_finished,
-            stats=self._session.stats,
             trigger_registry=config.trigger_registry,
             requeue_policy=config.requeue_policy,
         )
 
         self.channel: ExecutionChannel = config.channel
         self._in_flight: InFlightTracker = InFlightTracker()
+        self._wake_event: threading.Event = threading.Event()
 
         # 构建机器依赖拓扑（recovery 依赖 completion；dispatch 依赖 recovery）
         self._completion = CompletionMachine(
@@ -178,10 +173,6 @@ class EngineRuntime:
         return self._in_flight
 
     @property
-    def stats(self) -> RunStats:
-        return self._session.stats
-
-    @property
     def stop_mode(self) -> StopMode:
         return self._session.stop_mode
 
@@ -197,15 +188,15 @@ class EngineRuntime:
     def classifier(self) -> ErrorClassifier:
         return self.config.classifier
 
-    def request_stop(self, *, force: bool = False) -> StopMode:
-        """停机请求接口（单调状态转移，委托 RunSession）。"""
-        return self._session.request_stop(force=force)
+    def request_stop(self) -> StopMode:
+        """停机请求接口（单调状态转移，委托 RunSession，并唤醒运行循环）。"""
+        mode = self._session.request_stop()
+        self._wake_event.set()
+        return mode
 
-    def execute(self, options: ExecutionOptions | None = None) -> RunSummary:
+    def execute(self, options: ExecutionOptions | None = None) -> None:
         """完整执行管线生命周期。"""
         opts = options if options is not None else ExecutionOptions()
-        start_time = time.monotonic()
-        exit_reason = ExitReason.COMPLETED
 
         # 不变式：run() 重入守卫——同一实例并发 execute 必须 fail-loud 拒绝
         if self._is_running:
@@ -219,38 +210,23 @@ class EngineRuntime:
 
         old_sigterm = None
         old_sigint = None
-        # 不变式：任何离开 execute() 的路径都必须复位 _is_running 并释放已
-        # 获取的锁 fd。初始化段（锁获取 + 信号陷阱）与 begin 前预检
-        # （strict_picklable）故障同样走该收尾，但不触发 fire_run_end——
-        # run 尚未 begin，on_run_end 只属于已开始的 run（与 on_run_start
-        # 起止对称）。
-        session_begun = False
         try:
             # 1. 单运行排他文件锁（try_acquire_lock 契约：仅「锁被占」返回
             #    None，权限/磁盘满等环境故障抛 OSError，语义必须上抛不吞）。
-            #    fd 返回值立即注册（None 注册无害）：注册前的 KI 窗口是解释器
-            #    字节码级、纯 Python 无法消除，此处收敛到最小。
-            if opts.acquire_run_lock:
-                self._run_lock_fd = try_acquire_lock(
-                    self.config.ipc_dir, "__pipeline_run__", timeout=0
+            self._run_lock_fd = try_acquire_lock(
+                self.config.ipc_dir, "__pipeline_run__", timeout=0
+            )
+            if self._run_lock_fd is None:
+                raise RuntimeError(
+                    f"Another run() is in progress for state_dir "
+                    f"{self.config.ipc_dir}; concurrent runs on the same "
+                    f"state are forbidden."
                 )
-                if self._run_lock_fd is None:
-                    raise RuntimeError(
-                        f"Another run() is in progress for state_dir "
-                        f"{self.config.ipc_dir}; concurrent runs on the same "
-                        f"state are forbidden."
-                    )
 
-            # 2. 信号陷阱
+            # 2. 信号陷阱（主线程安装，失败抛出不静默忽略）
             if opts.install_signals:
-                try:
-                    old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
-                except (ValueError, OSError):
-                    pass
-                try:
-                    old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
-                except (ValueError, OSError):
-                    pass
+                old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
+                old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
         except BaseException:
             if old_sigterm is not None:
                 signal.signal(signal.SIGTERM, old_sigterm)
@@ -264,30 +240,12 @@ class EngineRuntime:
 
         try:
             self._preflight_picklable_handlers()
-            # 新 run 复位：统计/序号/停机态/幂等标志归零；store 记账换新 stats。
             self._session.begin()
-            session_begun = True
-            self.store.set_stats(self._session.stats)
             self.governor.reset()
-
-            # on_run_start 钩子（单一出口在 RunSession）
-            self._session.fire_run_start()
 
             self._run_body()
 
-            exit_reason = self._session.exit_reason()
-
-        except KeyboardInterrupt as e:
-            exit_reason = self._session.exit_reason(e)
-            raise
-        except BaseException as e:
-            exit_reason = self._session.exit_reason(e)
-            raise
         finally:
-            # on_run_end 仅在对应 on_run_start 已可能触发的 run（已 begin）
-            # 上触发：begin 前失败不发 end，杜绝起止不对称。
-            if session_begun:
-                self._session.fire_run_end(exit_reason.value)
             if self._run_lock_fd is not None:
                 release_lock(self._run_lock_fd)
                 self._run_lock_fd = None
@@ -297,14 +255,6 @@ class EngineRuntime:
                 signal.signal(signal.SIGTERM, old_sigterm)
             if old_sigint is not None:
                 signal.signal(signal.SIGINT, old_sigint)
-
-        duration = time.monotonic() - start_time
-        return RunSummary(
-            exit_reason=exit_reason,
-            stats=self._session.stats,
-            run_id=self._session.run_id or "",
-            duration_seconds=duration,
-        )
 
     # ── 四相事件泵 ────────────────────────────────────────────────────
 
@@ -406,8 +356,6 @@ class EngineRuntime:
                 f"{upstream.get(uid, '?')} ({ERR_DEPENDENCY_EXCLUDED}); kept in "
                 f"queue for a later run."
             )
-        if standstill.blocked_uids:
-            self.stats["excluded_blocked"] += len(standstill.blocked_uids)
         logger.info(
             "Remaining queued jobs are deferred by selection; finishing run as "
             "completed with the queue preserved."
@@ -439,16 +387,9 @@ class EngineRuntime:
         """
         store = self.store
 
-        # 0. 停机门：ABORTING 强杀在途、DRAINING 排空完毕、空闲完成三早退
+        # 0. 停机门：DRAINING 排空完毕与空闲完成早退
         draining = False
         if self._session.stop_mode is not StopMode.NONE:
-            if self._session.stop_mode is StopMode.ABORTING:
-                logger.warning("Force abort requested. Killing in-flight jobs.")
-                try:
-                    self._recovery.abort_in_flight()
-                finally:
-                    self._recovery.save_queue_crash_safe()
-                return self._terminal_outcome()
             if self._in_flight:
                 draining = True
             else:
@@ -511,16 +452,24 @@ class EngineRuntime:
 
     # ── 主循环与承重网 ────────────────────────────────────────────────
 
+    def _wait(self, timeout: float) -> None:
+        """运行循环调度等待：支持测试 monkeypatch 捕获，同时由 _wake_event 实现跨线程唤醒。"""
+        if time.sleep is not _REAL_SLEEP:
+            time.sleep(timeout)
+        self._wake_event.wait(timeout=timeout)
+        self._wake_event.clear()
+
     def run_loop(self) -> None:
         """事件驱动主循环：以 step() 统一驱动填池、回收与等待（裸循环）。"""
         store = self.store
         self._in_flight.clear()
+        self._wake_event.clear()
         while not store.state.is_empty or self._in_flight:
             outcome = self.step()
             if outcome.should_terminate:
                 break
             if outcome.should_wait and outcome.wait_time > 0:
-                time.sleep(outcome.wait_time)
+                self._wait(outcome.wait_time)
 
         logger.info(f"Pipeline {self.config.name} finished.")
         self._in_flight.clear()
@@ -548,18 +497,13 @@ class EngineRuntime:
 
     def _run_with_crash_net(self) -> None:
         """运行主事件循环与统一异常承重网。"""
-        exit_reason = self._session.exit_reason().value
         try:
             self.run_loop()
-            exit_reason = self._session.exit_reason().value
         except BaseException as e:
-            # 单点崩溃网：所有异常同构处理（exit_reason + 在途清扫 + 崩溃
-            # 保队 + 原样上抛）；KI 与非 Exception（_JobTerminated /
-            # _CommitCrashSignal / SystemExit）不附 traceback，其余附。
-            # _CommitCrashSignal 防误吞不变式在类继承（BaseException）与
-            # dispatch 的早置 raise，不在此处。
+            # 单点崩溃网：所有异常同构处理（在途清扫 + 崩溃保队 + 原样上抛）；
+            # KI 与非 Exception（_JobTerminated / _CommitCrashSignal / SystemExit）
+            # 不附 traceback，其余附。
             self._crash_log(e)
-            exit_reason = self._session.exit_reason(e).value
             try:
                 self._recovery.abort_in_flight()
             except BaseException as cleanup_error:
@@ -572,7 +516,6 @@ class EngineRuntime:
                 self._recovery.persist_resource_suspensions()
             except Exception as e:
                 logger.warning(f"Failed to persist resource suspensions: {e}")
-            self._session.fire_run_end(exit_reason)
 
     @staticmethod
     def _crash_log(e: BaseException) -> None:
@@ -598,8 +541,12 @@ class EngineRuntime:
         self._run_with_crash_net()
 
     def _handle_signal(self, signum: int, frame: Any) -> None:
-        logger.info(f"收到信号 {signum}，更新停机状态机……")
-        self.request_stop()
+        if self._session.stop_mode is StopMode.NONE:
+            logger.info(f"收到信号 {signum}，停止新派发并等待在途任务完成……")
+            self.request_stop()
+        else:
+            logger.info(f"再次收到信号 {signum}，正在等待在途任务完成，不强制终止。")
+            self._wake_event.set()
 
     def _preflight_picklable_handlers(self) -> None:
         """strict 预检：全部已注册 Task 的 handler 必须可 pickle。

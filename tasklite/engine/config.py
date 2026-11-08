@@ -133,9 +133,6 @@ class RunConfig:
     dependency_grace_seconds: float = DEP_GRACE_SECONDS
     commit_failure_threshold: int = COMMIT_FAILURE_THRESHOLD
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
-    on_run_start: Callable[[], None] | None = None
-    on_run_end: Callable[[str], None] | None = None
-    on_attempt_finished: Callable[..., None] | None = None
 
     @classmethod
     def resolve(
@@ -158,9 +155,6 @@ class RunConfig:
         dependency_grace_seconds: float | None = None,
         commit_failure_threshold: int | None = None,
         deadlock_gap_max_rounds: int | None = None,
-        on_run_start: Callable[[], None] | None = None,
-        on_run_end: Callable[[str], None] | None = None,
-        on_attempt_finished: Callable[..., None] | None = None,
     ) -> "RunConfig":
         """唯一规范化入口：可空原始值 → 常量默认 + 最终类型。"""
         tuning = resolve_tuning(
@@ -188,9 +182,6 @@ class RunConfig:
             dependency_grace_seconds=tuning.dependency_grace_seconds,
             commit_failure_threshold=tuning.commit_failure_threshold,
             deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
-            on_run_start=on_run_start,
-            on_run_end=on_run_end,
-            on_attempt_finished=on_attempt_finished,
         )
 
 

@@ -9,6 +9,8 @@ dep-failed → no-handler → orphan-probe → stale-restore）、trigger 放行
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
 from pathlib import Path
@@ -39,7 +41,7 @@ from tasklite.engine.resource import (
 )
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.store import StateStore
-from tasklite.engine.types import AttemptOutcome, RunStats
+from tasklite.engine.types import AttemptOutcome
 from tasklite.models.job import Job, JobRuntimeState, RT_DISPATCH_FAILURES
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
@@ -90,7 +92,7 @@ class DispatchEnv:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
-        self.stats = RunStats()
+        self.stats = defaultdict(int)
         self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.store = StateStore(
             self.backend,

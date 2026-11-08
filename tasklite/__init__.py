@@ -44,8 +44,8 @@ from .exceptions import (
     TaskLiteError,
 )
 
-# ── 用户钩子三件套 ───────────────────────────────────────────────────
-from .hooks import job_ref, progress_hook, slice_list
+# ── 用户钩子 ─────────────────────────────────────────────────────────
+from .hooks import job_ref, slice_list
 
 # ── 资源体系 ─────────────────────────────────────────────────────────
 from .engine.resource import (
@@ -73,9 +73,7 @@ from .engine.scheduler import FifoOrderingPolicy, OrderingPolicy
 from .engine.types import (
     AttemptOutcome,
     ExitReason,
-    RunSummary,
     StopMode,
-    RunStats,
 )
 
 # ── 持久化后端 ───────────────────────────────────────────────────────
@@ -115,9 +113,8 @@ __all__ = [
     "validate_resource_amounts",
     # 异常族
     "TaskLiteError",
-    # 钩子三件套
+    # 钩子
     "job_ref",
-    "progress_hook",
     "slice_list",
     # 资源体系
     "CapacityResource",
@@ -136,9 +133,7 @@ __all__ = [
     # 运行值对象
     "AttemptOutcome",
     "ExitReason",
-    "RunSummary",
     "StopMode",
-    "RunStats",
     # 持久化后端
     "InMemoryStateBackend",
     "SQLiteStateBackend",

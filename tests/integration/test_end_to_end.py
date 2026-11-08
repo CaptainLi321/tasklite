@@ -30,7 +30,6 @@ import pytest
 
 from tasklite import (
     CapacityResource,
-    ExitReason,
     Job,
     RateLimitResource,
     TaskLite,
@@ -156,17 +155,16 @@ class TestEndToEnd:
         p = _make_pipeline(tmp_path)
         p.register_task("work", ok_with_input_handler)
         p.enqueue(Job("work", "item_alpha"))
-        summary = p.run()
+        res = p.run()
         p.stop()
 
-        assert summary.exit_reason is ExitReason.COMPLETED
-        assert summary.stats["succeeded"] == 1
+        assert res is None
         meta = p.backend.load_successes()["work::item_alpha"]
         # successes 审计键：业务 meta 原样落盘 + 框架审计键（success_count /
         # inputs 规范路径清单 / 归属 run）
         assert meta["touched"] == "item_alpha"
         assert meta["success_count"] == 1
-        assert meta["last_success_run_id"] == summary.run_id
+        assert meta["last_success_run_id"]
         assert len(meta["inputs"]) == 1
         assert meta["inputs"][0].endswith("source_item_alpha.txt")
 
@@ -211,22 +209,21 @@ class TestEndToEnd:
         attempts = p.backend.load_attempts("work::item_gamma")
         assert [a.attempt_no for a in attempts] == [1, 2, 3]
         assert [a.outcome for a in attempts] == ["requeued", "requeued", "failed"]
-        assert p.stats["retried"] == 2
 
     def test_transient_recovery_second_attempt_succeeds(self, tmp_path):
         p = _make_pipeline(tmp_path)
         p.register_task("work", flaky_first_attempt_handler)
         p.enqueue(Job("work", "item_delta", max_retries_per_run=3))
-        summary = p.run()
+        res = p.run()
         p.stop()
 
+        assert res is None
         assert "work::item_delta" in p.backend.load_successes()
         attempts = p.backend.load_attempts("work::item_delta")
         # 同一激活内重试推进：attempt_no 1→2，activation_no 不变
         assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
         assert [a.attempt_no for a in attempts] == [1, 2]
         assert [a.activation_no for a in attempts] == [1, 1]
-        assert summary.stats["succeeded"] == 1
 
     def test_retry_failure_manual_requeue_runs_to_success(self, tmp_path):
         p = _make_pipeline(tmp_path)
@@ -244,9 +241,9 @@ class TestEndToEnd:
         assert p.retry_failure("work::item_eps") is True
         assert p.list_failures() == []
 
-        summary = p.run()
+        res = p.run()
         p.stop()
-        assert summary.stats["succeeded"] == 1
+        assert res is None
         meta = p.backend.load_successes()["work::item_eps"]
         assert meta["recovered"] is True
         assert meta["success_count"] == 1
@@ -267,7 +264,7 @@ class TestEndToEnd:
         p.register_task("work", ok_with_input_handler)
         p.enqueue(Job("work", "item_eta", trigger="always"))
         first = p.run()
-        assert first.stats["succeeded"] == 1
+        assert first is None
         assert p.backend.load_successes()["work::item_eta"]["success_count"] == 1
 
         # 第二会话重扫：successes 命中但 every_run 豁免放行 → 新激活重跑，
@@ -276,40 +273,24 @@ class TestEndToEnd:
         second = p.run()
         p.stop()
 
-        assert second.stats["succeeded"] == 1
+        assert second is None
         assert p.backend.load_successes()["work::item_eta"]["success_count"] == 2
 
         attempts = p.backend.load_attempts("work::item_eta")
         assert [a.outcome for a in attempts] == ["succeeded", "succeeded"]
         assert [a.attempt_no for a in attempts] == [1, 2]
 
-    def test_six_step_contract_with_resource_and_hooks(self, tmp_path):
-        events: list = []
-
-        def on_attempt_finished(uid, *, outcome):
-            events.append((uid, outcome.success, outcome.will_retry))
-
-        p = _make_pipeline(
-            tmp_path,
-            on_run_start=lambda: events.append("start"),
-            on_run_end=lambda reason: events.append(f"end:{reason}"),
-            on_attempt_finished=on_attempt_finished,
-        )
+    def test_six_step_contract_with_resource(self, tmp_path):
+        p = _make_pipeline(tmp_path)
         p.register_resource(CapacityResource("io_slots", 4.0))
         p.register_task("work", ok_with_input_handler)
         assert p.enqueue(Job("work", "step_one")) is True
         assert p.enqueue(Job("work", "step_two")) is True
         assert p.enqueue(Job("work", "step_one")) is False  # 重复 uid 幂等去重
-        summary = p.run()
+        res = p.run()
         p.stop()
 
-        assert events[0] == "start"
-        assert events[-1] == "end:completed"
-        assert sorted(events[1:-1]) == [
-            ("work::step_one", True, False),
-            ("work::step_two", True, False),
-        ]
-        assert summary.stats["succeeded"] == 2
+        assert res is None
         assert sorted(p.backend.load_successes()) == [
             "work::step_one",
             "work::step_two",
@@ -381,48 +362,6 @@ class TestEnvFaultExhaustion:
         assert "crash::item_env_crash" not in p.backend.load_successes()
 
 
-class TestForceAbortCleanup:
-    """强中止（stop(force=True)）：半成品清理与 at-least-once 回队。"""
-
-    def test_force_abort_cleans_partial_outputs_and_keeps_in_queue(self, tmp_path):
-        """ABORTING：被 kill 的 in-flight job 半成品输出必须清理、job 回队。
-
-        语义不变式：被强杀作业的声明产物（物理路径）不得残留脏数据；
-        未 commit 的作业必须保留在磁盘队列可重跑（at-least-once）。
-        """
-        p = _make_pipeline(tmp_path, max_workers=1)
-        p.register_task("abortable", partial_output_hang_handler)
-        p.enqueue(Job("abortable", "item_abort"))
-
-        output_roots = tmp_path / "output"
-        partial = output_roots / "partial_item_abort.txt"
-        ready = output_roots / "ready_item_abort"
-
-        def request_force_abort_when_declared() -> None:
-            # 轮询 handler 已落盘半成品声明（上限放宽至 15s 容忍满载
-            # spawn 开销）再强停——避免击杀先于声明的竞态。
-            deadline = time.time() + 15.0
-            while not ready.exists() and time.time() < deadline:
-                time.sleep(0.05)
-            p.stop(force=True)
-
-        requester = threading.Thread(target=request_force_abort_when_declared)
-        requester.start()
-        summary = p.run()
-        requester.join(timeout=5.0)
-        p.stop()
-
-        assert summary.exit_reason is ExitReason.STOPPED_ABORTING
-        # ABORTING：半成品输出被清理
-        assert not partial.exists(), "强杀作业的半成品输出必须被清理"
-        # 作业未 commit（未进 successes），留在磁盘队列可重跑
-        assert "abortable::item_abort" not in p.backend.load_successes()
-        remaining = p.backend.load_queue()
-        assert any(
-            j.get("job_id") == "item_abort" for j in remaining
-        ), "强中止后未 commit 的作业必须保留在队列（at-least-once）"
-
-
 class TestRealSubprocessFaultScenarios:
     """真实子进程故障场景：看门狗超时击杀、限速挂起恢复、中断族信号。"""
 
@@ -461,11 +400,11 @@ class TestRealSubprocessFaultScenarios:
         # 挂起恢复窗口的断言才具备确定性下界。
         p.enqueue(Job("gated", "holder"))
         p.enqueue(Job("gated_plain", "waiter", depends_on=["gated::holder"]))
-        summary = p.run()
+        res = p.run()
         p.stop()
 
         successes = p.backend.load_successes()
-        assert summary.stats["succeeded"] == 2
+        assert res is None
         assert "gated::holder" in successes
         assert "gated_plain::waiter" in successes
 
@@ -490,15 +429,15 @@ class TestRealSubprocessFaultScenarios:
         p = _make_pipeline(tmp_path)
         p.register_task("interrupted", interrupted_first_handler)
         p.enqueue(Job("interrupted", "item_interrupted", max_retries_per_run=1))
-        summary = p.run()
+        res = p.run()
         p.stop()
 
+        assert res is None
         assert "interrupted::item_interrupted" in p.backend.load_successes()
         assert "interrupted::item_interrupted" not in p.backend.load_failed()
         attempts = p.backend.load_attempts("interrupted::item_interrupted")
         assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
         assert [a.attempt_no for a in attempts] == [1, 2]
-        assert summary.stats["interrupted_reruns"] == 1
 
     def test_real_subprocess_system_exit_attributed(self, tmp_path):
         """SystemExit 在真实子进程被 worker 捕获，以中断族串归因进失败档案。"""

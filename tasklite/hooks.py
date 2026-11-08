@@ -1,21 +1,15 @@
 """面向业务方的展示与切片工具。
 
-提供 job_ref / progress_hook / slice_list 三个便利工具，经
-``tasklite/__init__.py`` 统一导出。progress_hook 按
-``on_attempt_finished(job_uid, *, outcome)`` 钩子契约适配——布尔语义经
-AttemptOutcome 值对象承载，不裸传四个散装参数。
+提供 job_ref / slice_list 便利工具，经 ``tasklite/__init__.py`` 统一导出。
 """
 from __future__ import annotations
 
 from typing import Any
 
-from .engine.types import AttemptOutcome
-from .exceptions import TaskLiteError
 from .utils.encoding import parse_job_uid
 
 __all__ = [
     "job_ref",
-    "progress_hook",
     "slice_list",
 ]
 
@@ -30,26 +24,6 @@ def job_ref(metadata: Any) -> str:
         if "id" in metadata:
             return str(metadata["id"])
     return ""
-
-
-def progress_hook(job_uid: str, *, outcome: AttemptOutcome) -> None:
-    """控制台每 attempt 终结回调：一行进度输出（on_attempt_finished 标准适配器）。
-
-    重试文案为「重入队」而非任何延迟字眼——v2 重试节奏唯一经
-    RequeuePolicy seam 表达，默认立即重入队，标准适配器不预设延迟语义。
-    """
-    try:
-        task_type, _ = parse_job_uid(job_uid)
-    except TaskLiteError:
-        task_type = job_uid.split("::", 1)[0]
-    ref = job_ref(outcome.metadata)
-    label = f"{task_type} {ref}" if ref else task_type
-    if outcome.will_retry:
-        print(f"  ⟳ {label} 失败，重入队重试", flush=True)
-    elif outcome.success:
-        print(f"  ✓ {label}", flush=True)
-    else:
-        print(f"  ✗ {label} → 失败档案", flush=True)
 
 
 def slice_list(

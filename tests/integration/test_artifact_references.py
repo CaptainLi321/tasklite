@@ -42,7 +42,8 @@ def test_direct_dependency_publishes_directory_for_actual_file_input(tmp_path):
         pipeline.enqueue(Job("consume", "one", depends_on=["build::one"]))
         pipeline.enqueue(Job("build", "one"))
         result = pipeline.run()
-        assert result.stats["succeeded"] == 2
+        assert result is None
+        assert len(pipeline.backend.load_successes()) == 2
         successes = pipeline.backend.load_successes()
         assert successes["build::one"]["artifacts"] == {"bundle": {"path": str(tmp_path / "output" / "bundle")}}
         assert successes["consume::one"]["inputs"] == [str(tmp_path / "output" / "bundle" / "report.txt")]
@@ -64,7 +65,8 @@ def test_history_can_be_read_and_missing_disk_does_not_rerun_producer(tmp_path):
     second.register_task("consume", consume_bundle)
     try:
         second.enqueue(Job("consume", "historical", depends_on=["build::one"]))
-        assert second.run().stats["succeeded"] == 1
+        assert second.run() is None
+        assert "consume::historical" in second.backend.load_successes()
         (tmp_path / "output" / "bundle" / "report.txt").unlink()
         (tmp_path / "output" / "bundle").rmdir()
         second.enqueue(Job("consume", "missing", depends_on=["build::one"]))

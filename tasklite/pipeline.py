@@ -31,7 +31,7 @@ from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import EngineRuntime
 from .engine.scheduler import OrderingPolicy
 from .engine.store import FailureEntry
-from .engine.types import ExecutionOptions, RunSummary, RunStats
+from .engine.types import ExecutionOptions
 from .models.job import Job, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry
 from .selection import Rule, Selection
@@ -115,9 +115,6 @@ class TaskLite:
         output_roots: str | Path | Sequence[str | Path] | None = None,
         max_workers: int = _DEFAULT_MAX_WORKERS,
         *,
-        on_run_start: Callable[[], None] | None = None,
-        on_run_end: Callable[[str], None] | None = None,
-        on_attempt_finished: Callable[..., None] | None = None,
         strict_picklable: bool = True,
         ordering_policy: OrderingPolicy | None = None,
         requeue_policy: RequeuePolicy | None = None,
@@ -147,9 +144,6 @@ class TaskLite:
         self.strict_picklable = strict_picklable
         self.runtime_config = self._build_run_config(
             backend_instance,
-            on_run_start=on_run_start,
-            on_run_end=on_run_end,
-            on_attempt_finished=on_attempt_finished,
             ordering_policy=ordering_policy,
             requeue_policy=requeue_policy,
             dependency_grace_seconds=dependency_grace_seconds,
@@ -268,9 +262,6 @@ class TaskLite:
         self,
         backend: AbstractStateBackend,
         *,
-        on_run_start: Callable[[], None] | None,
-        on_run_end: Callable[[str], None] | None,
-        on_attempt_finished: Callable[..., None] | None,
         ordering_policy: OrderingPolicy | None,
         requeue_policy: RequeuePolicy | None,
         dependency_grace_seconds: float | None,
@@ -317,9 +308,6 @@ class TaskLite:
             dependency_grace_seconds=tuning.dependency_grace_seconds,
             commit_failure_threshold=tuning.commit_failure_threshold,
             deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
-            on_run_start=on_run_start,
-            on_run_end=on_run_end,
-            on_attempt_finished=on_attempt_finished,
         )
 
     # ── 运行期只读接缝 ─────────────────────────────────────────────
@@ -352,23 +340,6 @@ class TaskLite:
         # OpsConsole 等一切持有者经 store.backend 派生，必然同步。
         self._ensure_not_running("backend")
         self._runtime.store.set_backend(value)
-
-    @property
-    def stats(self) -> RunStats:
-        return self._runtime.stats
-
-    # 钩子只读直达 RunSession（钩子仅在构造期参数传入）。
-    @property
-    def on_run_start(self):
-        return self._runtime.session.on_run_start
-
-    @property
-    def on_attempt_finished(self):
-        return self._runtime.session.on_attempt_finished
-
-    @property
-    def on_run_end(self):
-        return self._runtime.session.on_run_end
 
     def _ensure_not_running(self, api_name: str) -> None:
         """管理/入队 API 的 run 期间守卫（把文档限制变成代码级 RuntimeError）。"""
@@ -571,62 +542,31 @@ class TaskLite:
 
     # ── 运行与停机（六步之五/六）───────────────────────────────────
 
-    def stop(self, *, force: bool = False) -> None:
-        """请求管线停止（停机状态机）。
+    def stop(self) -> None:
+        """请求管线停止当前 Run。
 
-        - ``stop()``（默认 DRAINING）：不再派发新 job，允许当前在途
-          自然完成后再退出（优雅停机）。
-        - ``stop(force=True)``（ABORTING）：分类消费在途任务——已完成
-          （结果文件已落盘、只差 drain 回收）的 job 走完成机器提交（进
-          successes/failed，不 kill、不删产出、不 requeue），仅对进行中的
-          job 执行 kill + 清半成品 + requeue 后退出。
+        只发出停止当前 Run 新派发的请求，由 run() 等待在途结算，
+        重复调用幂等，无活跃 Run 时无操作，不影响下一次 Run。
         """
-        self._runtime.request_stop(force=force)
+        if not self.is_running:
+            return
+        self._runtime.request_stop()
 
     def run(
         self,
         *,
         install_signals: bool = True,
-        acquire_run_lock: bool = True,
-    ) -> RunSummary:
-        """运行管线直到队列排空（或收到排空/强停请求），返回运行摘要。
-
-        install_signals / acquire_run_lock 逐参透传引擎 ExecutionOptions
-        （缺省与引擎一致、默认行为不变）：install_signals=False 不安装
-        SIGTERM/SIGINT 停机信号陷阱（宿主进程自管信号时使用）；
-        acquire_run_lock=False 跳过 state_dir 级单运行排他文件锁
-        （同库多实例的互斥协调移交宿主）。
-
-        未处理异常一律经 raise 通道原样上抛（摘要仅无异常终结时语义
-        完整）。
-        """
+    ) -> None:
+        """运行管线直到队列排空（或收到排空请求）。"""
         logger.info(
             f"=== Starting Pipeline: {self.name} "
             f"(Backend: {self.backend_type}) ==="
         )
-        return self._runtime.execute(
+        self._runtime.execute(
             ExecutionOptions(
                 install_signals=install_signals,
-                acquire_run_lock=acquire_run_lock,
             )
         )
-
-    def run_graceful(self) -> RunSummary | None:
-        """统一 run + 优雅停机包装：捕获 KeyboardInterrupt 转 DRAINING。
-
-        库函数不改变退出码（无 sys.exit）。正常完成返回 RunSummary；
-        收到 KeyboardInterrupt 时请求 stop() 转为优雅停机并返回 None。
-        """
-        try:
-            return self.run()
-        except KeyboardInterrupt:
-            logger.info("收到 KeyboardInterrupt，请求优雅停机（DRAINING）……")
-            return None
-        finally:
-            try:
-                self.stop()
-            except Exception:
-                logger.exception("run_graceful 收尾 stop 失败")
 
 
 __all__ = [

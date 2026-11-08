@@ -53,8 +53,9 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     first.register_task("consume", consume_input, trigger="on_input_change")
     first.enqueue(Job("consume", "result", depends_on=["produce::source"]))
     first.enqueue(Job("produce", "source"))
-    first_summary = first.run()
+    assert first.run() is None
     first.stop()
+    first_produce_run_id = first.backend.load_successes()["produce::source"]["last_success_run_id"]
     old_meta = first.backend.load_successes()["consume::result"]
     assert old_meta["pid"] != os.getpid()
     baseline_us = parse_utc_iso_to_us(old_meta["last_succeeded_at"])
@@ -64,7 +65,7 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     def observe_input(ctx):
         evaluated.append(Path(ctx.success_metadata["inputs"][0]).read_text(encoding="utf-8"))
         parent = second.backend.load_successes()["produce::source"]
-        assert parent["last_success_run_id"] != first_summary.run_id
+        assert parent["last_success_run_id"] != first_produce_run_id
         return on_input_change(ctx)
     second.register_trigger("observe", observe_input)
     second.register_task("produce", produce_input, trigger="always")
@@ -72,13 +73,13 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     second.enqueue(Job("consume", "result", depends_on=["produce::source"]))
     second.enqueue(Job("produce", "source", payload={"mode": mode, "content": "updated",
                                                      "mtime_ns": (baseline_us + 1) * 1000}))
-    summary = second.run()
+    res = second.run()
     second.stop()
+    assert res is None
     if mode == "fail":
         assert evaluated == []
         assert set(second.backend.load_failed()) == {"produce::source", "consume::result"}
         assert second.backend.load_successes() == {}
-        assert summary.stats["cascade_failed"] == 1
     else:
         assert evaluated == ["updated" if mode == "write" else "first"]
         current = second.backend.load_successes()["consume::result"]
@@ -86,7 +87,6 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
         assert current["content"] == evaluated[0]
         assert current["parent_succeeded"] is True
         assert current["parent_failed"] is False
-        assert summary.stats["skipped"] == (0 if mode == "write" else 1)
         assert second.backend.load_failed() == {}
     assert second.backend.load_queue() == []
 
@@ -103,7 +103,8 @@ def _run_until_retry_committed(root, ready, release):
             assert (queued[0].get("activation_no", 1), queued[0]["attempt_no"]) == (1, 2)
             ready.set()
             release.wait(timeout=30)
-    pipeline = _pipeline(Path(root), on_attempt_finished=park_after_retry)
+    pipeline = _pipeline(Path(root))
+    pipeline._runtime.store.set_on_attempt_finished(park_after_retry)
     pipeline.register_trigger("gated", lambda ctx: True)
     pipeline.register_task("retry", always_retry, max_retries_per_run=1, trigger="gated")
     pipeline.enqueue(Job("retry", "item"))
@@ -162,9 +163,9 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
     second = _pipeline(tmp_path)
     second.register_task("consume", consume_input, trigger="on_input_change")
     second.enqueue(Job("consume", "result", depends_on=["produce::source"]))
-    summary = second.run()
+    res = second.run()
     second.stop()
-    assert summary.stats["succeeded"] == 1
+    assert res is None
     assert second.backend.load_successes()["consume::result"]["success_count"] == 1
     records = second.backend.load_attempts("consume::result")
     assert [row.attempt_no for row in records] == [1, 2]
@@ -192,10 +193,10 @@ def test_transient_first_attempt_rechecks_trigger_without_budget_or_archive_poll
         (ctx.job.attempt_no, ctx.has_failed, ctx.has_succeeded)) or True)
     pipeline.register_task("transient", transient_once, max_retries_per_run=0, trigger="observe")
     pipeline.enqueue(Job("transient", "item", payload={"kind": kind}))
-    summary = pipeline.run()
+    res = pipeline.run()
     pipeline.stop()
+    assert res is None
     assert evaluated == [(1, False, False), (1, False, False)]
-    assert summary.stats["interrupted_reruns"] == 1
     assert pipeline.backend.load_failed() == {}
     metadata = pipeline.backend.load_successes()["transient::item"]
     assert metadata["runtime"] == {}
@@ -243,9 +244,9 @@ def test_discovery_defaults_always_and_job_once_override_across_runs(tmp_path):
     assert all(int(line.split(":")[1]) != os.getpid() for line in calls)
     assert pipeline.backend.load_successes()["discover::root"]["success_count"] == 2
     pipeline.enqueue(Job("discover", "root", trigger="once"))
-    summary = pipeline.run()
+    res = pipeline.run()
     pipeline.stop()
-    assert summary.stats["skipped"] == 1
+    assert res is None
     assert (tmp_path / "output" / "scan_calls").read_text(encoding="utf-8").splitlines() == calls
     assert {uid: metadata for uid, metadata in pipeline.backend.load_successes().items()
             if uid.startswith("child::")} == first_children
@@ -292,10 +293,9 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
     recovered.register_trigger("explode", lambda ctx: False)
     recovered.register_task("waiting", waiting_for_release, max_retries_per_run=0, trigger="always")
     recovered.register_task("later", discovered_child, trigger="explode")
-    summary = recovered.run()
+    res = recovered.run()
     recovered.stop()
-    assert summary.stats["succeeded"] == 1
-    assert summary.stats["skipped"] == 1
+    assert res is None
     assert recovered.backend.load_failed() == {}
     assert recovered.backend.load_queue() == []
     attempts = recovered.backend.load_attempts("waiting::item")
