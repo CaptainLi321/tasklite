@@ -56,11 +56,17 @@ if TYPE_CHECKING:
 
         def __contains__(self, task_type: object) -> bool: ...
 
+import os
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
 from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
-from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..exceptions import TaskLiteError, _CommitCrashSignal, _JobTerminated
+from ..models.artifact import ArtifactDeclaration, FileSpec
 from ..models.attempt import ATTEMPT_REQUEUED
 from ..models.context import JobContext
 from ..models.job import Job, JobRuntimeState
+from ..utils.artifact import ArtifactPathPolicy
 from .channel import ArtifactCleanupMode, WorkerLaunchSpec
 from .errorclass import (
     ERR_DISPATCH_FAILURE,
@@ -212,6 +218,22 @@ class DispatchMachine:
         job = Job.from_dict(peek_snapshot)
         job_uid = job.uid
 
+        # 依赖就绪后、Trigger判断前解析预声明文件
+        resolved_files: dict[str, FileSpec] = {}
+        if job.files:
+            try:
+                resolved_files = self._resolve_job_files(job)
+            except Exception as err:
+                job_snapshot = store.state.pop_job(sched.runnable_idx)
+                self._reject_and_commit(
+                    job_uid,
+                    job_snapshot,
+                    {"error_message": str(err)},
+                    count_as="failed",
+                    attempt_id=None,
+                )
+                return None
+
         # 准入求值（同 Run 内由 TaskResult.retry 产生的再次尝试不重复求值；新 Run 重新求值）
         is_session_retry = (
             getattr(self._session, "get_retry_count", lambda _: 0)(job_uid) > 0
@@ -259,6 +281,31 @@ class DispatchMachine:
             ):
                 return None
 
+        # 必要路径授权（未 running 不造 Attempt，授权拒绝本 Run 临时排除该作业及下游）
+        for fname, fspec in resolved_files.items():
+            if fspec.delete_existing or fspec.delete_on_success or fspec.delete_on_failure:
+                assert fspec.path is not None
+                if not store.check_or_request_authorization(fspec.path):
+                    exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
+                    if callable(exclude_fn):
+                        exclude_fn(job_uid)
+                    return None
+
+        # 再次检查全部资源（授权后的全部资源检查到连续获取完成之间，不插入其他分配或回收）
+        eval_res = self._resources.evaluate(job.task_type, job.resources)
+        if eval_res.is_impossible:
+            job_snapshot = store.state.pop_job(sched.runnable_idx)
+            self._reject_and_commit(
+                job_uid,
+                job_snapshot,
+                {"error_message": ERR_RESOURCE_DEADLOCK, "error_details": eval_res.reason},
+                count_as="failed",
+                attempt_id=None,
+            )
+            return None
+        if not eval_res.is_available:
+            return None
+
         job_snapshot = store.state.pop_job(sched.runnable_idx)
         if store.backend.schema_version < TARGET_SCHEMA_VERSION:
             job_snapshot["activation_no"] = job.activation_no
@@ -303,25 +350,31 @@ class DispatchMachine:
                 store.state.requeue_jobs([job_snapshot], front=True)
                 raise
 
-        # 重新检查全部资源（授权后的全部资源检查到连续获取完成之间，不插入其他分配或回收）
-        eval_res = self._resources.evaluate(job.task_type, job.resources)
-        if eval_res.is_impossible:
-            self._reject_and_commit(
-                job_uid,
-                job_snapshot,
-                {"error_message": ERR_RESOURCE_DEADLOCK, "error_details": eval_res.reason},
-                count_as="failed",
-                attempt_id=None,
-            )
-            return None
-        if not eval_res.is_available:
-            store.state.requeue_jobs([job_snapshot], front=True)
-            return None
-
-        self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
-
         # 逐项获取资源（串行连续获取，异常属 Run 级框架故障直接上抛）
         acquired = self._resources.acquire_all(job.task_type, job.resources, job_uid=job_uid)
+
+        self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
+        for fname, fspec in resolved_files.items():
+            if fspec.delete_existing and fspec.path and os.path.exists(fspec.path):
+                policy = ArtifactPathPolicy(
+                    output_roots=self._output_roots,
+                    protected_roots=self._protected_roots,
+                )
+                try:
+                    policy.remove_existing(ArtifactDeclaration(fspec.path, delete_existing=True))
+                except OSError as exc:
+                    self._resources.release_all(acquired)
+                    self._store.apply_failure(
+                        job_uid,
+                        {"error_message": f"Pre-deletion failed: {exc}"},
+                        job_snapshot=job_snapshot,
+                        cascade=True,
+                        attempt_no=attempt_no,
+                        run_id=self._session.run_id or "run",
+                        started_at=started_at,
+                        files={k: v.to_dict() for k, v in resolved_files.items()},
+                    )
+                    return None
 
         try:
             return self._spawn_entry(
@@ -333,6 +386,7 @@ class DispatchMachine:
                 acquired,
                 attempt_no=attempt_no,
                 started_at=started_at,
+                resolved_files=resolved_files,
             )
         except _CommitCrashSignal:
             # _CommitCrashSignal 继承 BaseException——「commit 失败需崩溃」
@@ -430,6 +484,7 @@ class DispatchMachine:
         *,
         attempt_no: int = 1,
         started_at: str | None = None,
+        resolved_files: dict[str, FileSpec] | None = None,
     ) -> InFlightJob | None:
         """载荷校验 → 执行上下文组装 → spawn → 在飞登记。
 
@@ -441,7 +496,7 @@ class DispatchMachine:
         handle = None
         try:
             task = self._tasks.lookup(job.task_type)
-            ctx = self._build_context(job, store.state)
+            ctx = self._build_context(job, store.state, files=resolved_files)
             logger.info(f"RUN: {job_uid}")
             started_monotonic = time.monotonic()
             handle = self._channel.spawn(WorkerLaunchSpec(
@@ -473,6 +528,7 @@ class DispatchMachine:
                     | store.state.success_uids
                     | store.state.failed_uids
                 ),
+                active_files=dict(resolved_files or {}),
             )
             # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
             self._in_flight.track(entry, state=store.state)
@@ -484,7 +540,12 @@ class DispatchMachine:
                 self._channel.cleanup_in_flight([handle])
             raise
 
-    def _build_context(self, job: Job, state: "PipelineState") -> JobContext:
+    def _build_context(
+        self,
+        job: Job,
+        state: "PipelineState",
+        files: Mapping[str, FileSpec] | None = None,
+    ) -> JobContext:
         """组装执行上下文（资源名与已完成状态快照随 ctx 下发子进程）。"""
         # 资源名注册集快照随 ctx 下发——suspend_resource 对未注册名
         # fail-loud（typo 不静默失效）。
@@ -510,7 +571,38 @@ class DispatchMachine:
                 uid: state.successes[uid].get("artifacts", {})
                 for uid in job.depends_on if uid in state.success_uids
             },
+            files=files,
         )
+
+    def _resolve_job_files(self, job: Job) -> dict[str, FileSpec]:
+        """准入前解析预声明文件（普通路径绝对化、上游产物引用解析与输入存在性校验）。"""
+        store = self._store
+        resolved: dict[str, FileSpec] = {}
+        for name, spec in job.files.items():
+            if spec.is_output_ref:
+                assert spec.producer_uid is not None and spec.output_name is not None
+                if spec.producer_uid not in job.depends_on:
+                    raise TaskLiteError(
+                        f"Producer {spec.producer_uid!r} not in explicit direct depends_on {list(job.depends_on)!r}"
+                    )
+                producer_artifacts = store.state.successes.get(spec.producer_uid, {}).get("artifacts", {})
+                desc = producer_artifacts.get(spec.output_name)
+                if not desc or "path" not in desc:
+                    raise TaskLiteError(
+                        f"Producer {spec.producer_uid!r} did not publish output {spec.output_name!r}"
+                    )
+                resolved_path = desc["path"]
+                if spec.role == "input" and not os.path.exists(resolved_path):
+                    raise FileNotFoundError(f"Missing input file: {resolved_path}")
+                bound_spec = spec.bind_output_path(resolved_path, base_dir=self._trigger_registry.base_dir)
+            else:
+                bound_spec = spec.resolve_against(self._trigger_registry.base_dir)
+                assert bound_spec.path is not None
+                resolved_path = bound_spec.path
+                if spec.role == "input" and not os.path.exists(resolved_path):
+                    raise FileNotFoundError(f"Missing input file: {resolved_path}")
+            resolved[name] = bound_spec
+        return resolved
 
     # ── 拒绝与异常分支 ────────────────────────────────────────────────
 

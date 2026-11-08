@@ -30,6 +30,7 @@ from ..models.result import TaskResult, validate_strict_json_object
 from ..utils.ipc import (
     ArtifactCleanupMode,
     ArtifactJournal,
+    PIPE_MSG_DECLARE,
     PIPE_MSG_INPUT,
     PIPE_MSG_OUTPUT,
     PIPE_MSG_RESULT,
@@ -37,7 +38,10 @@ from ..utils.ipc import (
     WorkerPipeMessage,
     WorkerPipeReceiver,
     WorkerPipeSender,
+    WorkerReplyReceiver,
+    WorkerReplySender,
     create_worker_pipe,
+    create_worker_reply_pipe,
 )
 from .errorclass import _DEFAULT_CLASSIFIER
 from .types import JobHandle
@@ -339,8 +343,9 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
             f"fencing requires WorkerLaunchSpec.execution_id"
         )
     pipe_sender = spec.pipe_sender
-    if pipe_sender is not None:
-        ctx._bind_pipe_sender(pipe_sender)
+    reply_receiver = spec.reply_receiver
+    if pipe_sender is not None or reply_receiver is not None:
+        ctx._bind_pipe_sender(pipe_sender, reply_receiver)
 
     def _write_result(payload: dict[str, Any]) -> None:
         if pipe_sender is None:
@@ -427,6 +432,8 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
     finally:
         if pipe_sender is not None:
             pipe_sender.close()
+        if reply_receiver is not None:
+            reply_receiver.close()
 
 
 @dataclass
@@ -487,6 +494,7 @@ class WorkerLaunchSpec:
     ipc_dir: str
     timeout_seconds: float
     pipe_sender: WorkerPipeSender | None = None
+    reply_receiver: WorkerReplyReceiver | None = None
 
 
 @dataclass(frozen=True)
@@ -521,6 +529,8 @@ class ExecutionChannel:
         self.protected_roots = tuple(protected_roots)
         self._receivers: dict[str, WorkerPipeReceiver] = {}
         self._in_process_senders: dict[str, WorkerPipeSender] = {}
+        self._reply_senders: dict[str, WorkerReplySender] = {}
+        self._declaration_handler: Callable[[JobHandle, dict[str, Any]], dict[str, Any] | None] | None = None
         self._handles: dict[str, JobHandle] = {}
         self._results: dict[str, dict[str, Any]] = {}
         self._errors: dict[str, Exception] = {}
@@ -593,8 +603,15 @@ class ExecutionChannel:
             job_uid=spec.job.uid,
             execution_id=spec.execution_id,
         )
-        spec.job_context._bind_pipe_sender(sender)
-        launch_spec = dataclasses.replace(spec, pipe_sender=sender)
+        reply_receiver, reply_sender = create_worker_reply_pipe(
+            self._process_context,
+            job_uid=spec.job.uid,
+            execution_id=spec.execution_id,
+        )
+        spec.job_context._bind_pipe_sender(sender, reply_receiver)
+        launch_spec = dataclasses.replace(
+            spec, pipe_sender=sender, reply_receiver=reply_receiver
+        )
         p = None
         try:
             p = self._process_context.Process(target=_worker_process_entry, args=(launch_spec,))
@@ -602,13 +619,17 @@ class ExecutionChannel:
         except Exception:
             sender.close()
             receiver.close()
+            reply_receiver.close()
+            reply_sender.close()
             if p is not None:
                 self._finalize_process(p)
             raise
         if isinstance(p, mp.process.BaseProcess):
             sender.close()
+            reply_receiver.close()
         else:
             self._in_process_senders[spec.execution_id] = sender
+        self._reply_senders[spec.execution_id] = reply_sender
         timeout_at_monotonic = time.monotonic() + spec.timeout_seconds
         handle = JobHandle(
             job_uid=spec.job.uid,
@@ -650,6 +671,17 @@ class ExecutionChannel:
             self._pending_signals.append(
                 (handle.job_uid, msg.payload[0], float(msg.payload[1]))
             )
+        elif msg.kind == PIPE_MSG_DECLARE:
+            if not isinstance(msg.payload, dict):
+                raise ValueError(f"invalid declare payload for {handle.job_uid}")
+            reply_sender = self._reply_senders.get(handle.execution_id or "")
+            if self._declaration_handler is not None and reply_sender is not None:
+                reply = self._declaration_handler(handle, msg.payload)
+                if reply is not None:
+                    try:
+                        reply_sender.send_reply(reply)
+                    except OSError:
+                        pass
         elif msg.kind == PIPE_MSG_RESULT:
             if not isinstance(msg.payload, dict):
                 raise ValueError(f"invalid result payload for {handle.job_uid}")
@@ -701,6 +733,22 @@ class ExecutionChannel:
         for item in receiver.drain_to_eof(timeout=self._JOIN_REAP_TIMEOUT):
             self._process_pipe_item(handle, item)
 
+    def set_declaration_handler(
+        self,
+        handler: Callable[[JobHandle, dict[str, Any]], dict[str, Any] | None] | None,
+    ) -> None:
+        self._declaration_handler = handler
+
+    def terminate_process(self, handle: JobHandle) -> None:
+        """终止指定作业的子进程。"""
+        p = handle.process
+        if p is not None:
+            try:
+                if p.is_alive():
+                    p.terminate()
+            except Exception:
+                pass
+
     def _close_handle_pipe(self, execution_id: str | None) -> None:
         if not execution_id:
             return
@@ -710,6 +758,9 @@ class ExecutionChannel:
         receiver = self._receivers.pop(execution_id, None)
         if receiver is not None:
             receiver.close(timeout=self._JOIN_REAP_TIMEOUT)
+        reply_sender = self._reply_senders.pop(execution_id, None)
+        if reply_sender is not None:
+            reply_sender.close()
 
     def _salvage_signals(
         self, job_uid: str, decoded: ExecutionResult | None
@@ -798,6 +849,30 @@ class ExecutionChannel:
             exec_id = handle.execution_id or ""
             self._receive_available(handle)
 
+            if handle.auth_denied:
+                is_alive = False
+                try:
+                    is_alive = p.is_alive()
+                except Exception:
+                    pass
+                if not is_alive:
+                    self._handles.pop(exec_id, None)
+                    receiver = self._receivers.pop(exec_id, None)
+                    if receiver is not None:
+                        try:
+                            receiver.close(timeout=0.2)
+                        except Exception:
+                            pass
+                    self._close_handle_pipe(exec_id)
+                    self._finalize_process(p)
+                    decoded = ExecutionResult(
+                        success=False,
+                        transient_kind="authorization_denied",
+                        message="authorization denied",
+                    )
+                    completed.append((handle, decoded))
+                continue
+
             # 1. 有效结果已到达：立即收割结果，不阻塞等待子进程退出
             if exec_id in self._results:
                 raw_res = self._results.pop(exec_id)
@@ -860,6 +935,19 @@ class ExecutionChannel:
         self, handle: JobHandle, res: dict | None = None, *, is_timeout: bool = False
     ) -> ExecutionResult:
         """收敛收割尾部：终止并收割子进程 → 排空管道至 EOF → 解码结果 → 关闭管道。"""
+        if handle.auth_denied:
+            p = handle.process
+            exec_id = handle.execution_id or ""
+            try:
+                self._terminate_and_join_process(p)
+            finally:
+                self._finalize_process(p)
+                self._close_handle_pipe(exec_id)
+            return ExecutionResult(
+                success=False,
+                transient_kind="authorization_denied",
+                message="authorization denied",
+            )
         p = handle.process
         exec_id = handle.execution_id or ""
         result: ExecutionResult | None = None

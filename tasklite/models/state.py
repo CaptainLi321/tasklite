@@ -179,6 +179,21 @@ class PipelineState:
                 dependents.setdefault(dep_uid, set()).add(job_uid)
         return dependents
 
+    def find_all_downstream(self, job_uid: str) -> list[str]:
+        """沿反向依赖递归找出所有直接与间接下游作业 UID（不分状态）。"""
+        dependents = self._build_dependents()
+        downstream: list[str] = []
+        stack = [job_uid]
+        seen = {job_uid}
+        while stack:
+            cur = stack.pop()
+            for dep in dependents.get(cur, ()):
+                if dep not in seen:
+                    seen.add(dep)
+                    downstream.append(dep)
+                    stack.append(dep)
+        return downstream
+
     def cascade_fail(
         self,
         failed_uid: str,

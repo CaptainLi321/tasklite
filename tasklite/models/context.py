@@ -12,13 +12,26 @@ import logging
 import math
 import os
 import stat
-from collections.abc import Sequence
+import uuid
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
-from ..exceptions import _ArtifactIOError
-from ..utils.ipc import ArtifactJournal, WorkerPipeSender
+from ..exceptions import TaskLiteError, _ArtifactIOError
+from ..utils.artifact import ArtifactPathPolicy
+from ..utils.ipc import (
+    ArtifactJournal,
+    WorkerPipeSender,
+    WorkerReplyReceiver,
+)
 from ..utils.jsonutil import dumps
-from .artifact import ArtifactDeclaration, resolve_job_files_config
+from .artifact import (
+    ArtifactDeclaration,
+    FileSpec,
+    coerce_file_spec,
+    resolve_job_files_config,
+    validate_file_name,
+)
 from .job import Job
 
 logger = logging.getLogger("tasklite")
@@ -40,6 +53,7 @@ class JobContext:
         protected_roots: tuple[str | Path, ...] = (),
         base_dir: str | Path | None = None,
         known_job_uids: frozenset[str] | set[str] | None = None,
+        files: Mapping[str, Any] | None = None,
     ):
         self._artifact_descriptions = copy.deepcopy(artifact_descriptions or {})
         self._protected_roots = tuple(protected_roots)
@@ -49,9 +63,16 @@ class JobContext:
             else Path(os.path.abspath(os.getcwd()))
         )
         self._pipe_sender: WorkerPipeSender | None = None
+        self._reply_receiver: WorkerReplyReceiver | None = None
         self.job = job
         self.spawned_jobs: list[Job] = []
         self.resource_suspensions: list[tuple[str, float]] = []
+        self._files: dict[str, FileSpec] = {}
+        init_files = files if files is not None else getattr(job, "files", None)
+        if init_files:
+            for raw_k, raw_v in init_files.items():
+                k = validate_file_name(raw_k)
+                self._files[k] = coerce_file_spec(raw_v, allow_dict=True)
         self._success_job_uids = success_job_uids
         self._failed_job_uids = failed_job_uids
         self._known_job_uids: frozenset[str] = (
@@ -85,11 +106,114 @@ class JobContext:
             self._journal_instance_dir = self.ipc_dir
         return self._journal_instance
 
-    def _bind_pipe_sender(self, sender: WorkerPipeSender | None) -> None:
-        """绑定或解绑当前执行体的瞬时管道发送端。"""
+    def _bind_pipe_sender(
+        self,
+        sender: WorkerPipeSender | None,
+        reply_receiver: WorkerReplyReceiver | None = None,
+    ) -> None:
+        """绑定或解绑当前执行体的瞬时管道发送端与回复接收端。"""
         self._pipe_sender = sender
+        self._reply_receiver = reply_receiver
         if self._journal_instance is not None:
             self._journal_instance.bind_pipe_sender(sender)
+
+    def file_path(self, name: str) -> Path:
+        """返回当前 Job 已声明文件（预声明或已完成动态声明）的规范绝对 Path。"""
+        validated_name = validate_file_name(name)
+        if validated_name not in self._files:
+            raise KeyError(f"No file declared with name {validated_name!r}")
+        spec = self._files[validated_name]
+        if spec.path is None:
+            raise TaskLiteError(f"FileSpec {validated_name!r} has no resolved path")
+        return Path(spec.path)
+
+    def declare_file(self, name: str, spec: FileSpec) -> Path:
+        """动态登记文件声明，等待主进程完成必要授权与准备操作后返回规范绝对 Path。"""
+        validated_name = validate_file_name(name)
+        if not isinstance(spec, FileSpec):
+            raise TypeError(f"declare_file expects a FileSpec, got {type(spec).__name__}")
+
+        canonical_spec = spec if spec.is_output_ref else spec.resolve_against(self.base_dir)
+        if validated_name in self._files:
+            existing = self._files[validated_name]
+            if existing.is_output_ref and spec.is_output_ref:
+                if (
+                    existing.producer_uid == spec.producer_uid
+                    and existing.output_name == spec.output_name
+                    and existing.role == spec.role
+                    and existing.delete_existing == spec.delete_existing
+                    and existing.delete_on_failure == spec.delete_on_failure
+                    and existing.delete_on_success == spec.delete_on_success
+                ):
+                    assert existing.path is not None
+                    return Path(existing.path)
+            elif not existing.is_output_ref and not spec.is_output_ref:
+                if (
+                    existing.path == canonical_spec.path
+                    and existing.role == canonical_spec.role
+                    and existing.delete_existing == canonical_spec.delete_existing
+                    and existing.delete_on_failure == canonical_spec.delete_on_failure
+                    and existing.delete_on_success == canonical_spec.delete_on_success
+                ):
+                    assert existing.path is not None
+                    return Path(existing.path)
+            raise TaskLiteError(
+                f"File declaration {validated_name!r} conflicts with existing declaration: "
+                f"{existing!r} vs {spec!r}"
+            )
+
+        if spec.is_output_ref:
+            assert spec.producer_uid is not None
+            if spec.producer_uid not in self.job.depends_on:
+                raise TaskLiteError(
+                    f"FileSpec {validated_name!r} references producer {spec.producer_uid!r} "
+                    f"which is not in explicit direct depends_on {list(self.job.depends_on)!r}"
+                )
+
+        if self._pipe_sender is not None and self._reply_receiver is not None:
+            req_id = f"req-{uuid.uuid4().hex[:8]}"
+            self._pipe_sender.send_declare(req_id, validated_name, spec.to_dict())
+            reply = self._reply_receiver.wait_reply(req_id)
+            status = reply.get("status")
+            if status == "ok":
+                resolved_path = str(reply["resolved_path"])
+                bound_spec = (
+                    spec.bind_output_path(resolved_path, base_dir=self.base_dir)
+                    if spec.is_output_ref
+                    else spec.resolve_against(self.base_dir)
+                )
+                self._files[validated_name] = bound_spec
+                return Path(resolved_path)
+            elif status == "error":
+                raise TaskLiteError(reply.get("error", "Declaration failed"))
+            elif status == "denied":
+                raise TaskLiteError("authorization denied")
+            else:
+                raise TaskLiteError(f"Unknown reply status: {status!r}")
+
+        # 本地 / 无管道回退（用于直接单测与调试）
+        if spec.is_output_ref:
+            assert spec.producer_uid is not None and spec.output_name is not None
+            desc = self._artifact_descriptions.get(spec.producer_uid, {}).get(spec.output_name)
+            if not desc or "path" not in desc:
+                raise TaskLiteError(f"producer {spec.producer_uid!r} did not publish output {spec.output_name!r}")
+            resolved_path = desc["path"]
+            if spec.role == "input" and not os.path.exists(resolved_path):
+                raise FileNotFoundError(f"Missing input file: {resolved_path}")
+            bound_spec = spec.bind_output_path(resolved_path, base_dir=self.base_dir)
+        else:
+            bound_spec = spec.resolve_against(self.base_dir)
+            assert bound_spec.path is not None
+            resolved_path = bound_spec.path
+            if spec.role == "input" and not os.path.exists(resolved_path):
+                raise FileNotFoundError(f"Missing input file: {resolved_path}")
+
+        if bound_spec.delete_existing and os.path.exists(resolved_path):
+            policy = ArtifactPathPolicy(output_roots=self.output_roots, protected_roots=self._protected_roots)
+            policy.remove_existing(ArtifactDeclaration(resolved_path, delete_existing=True))
+
+        self._files[validated_name] = bound_spec
+        return Path(resolved_path)
 
     def spawn(self, job: Job) -> None:
         """入队一个子 job（捕获固定路径基准下的独立快照并预检依赖引用与 JSON 序列化性）。"""
@@ -142,6 +266,14 @@ class JobContext:
             sandbox=sandbox,
         )
         journal.record_artifact(self.job.uid, declaration, prepare=True)
+        if name:
+            self._files[name] = FileSpec(
+                resolved,
+                role="output",
+                delete_existing=delete_existing,
+                delete_on_failure=delete_on_failure,
+                delete_on_success=delete_on_success,
+            )
         return resolved
 
     def declare_cache(

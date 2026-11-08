@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from .types import ExitReason, StopMode
 
@@ -22,6 +23,16 @@ class RunSession:
         self.dispatch_no: int = 0
         self.stop_mode: StopMode = StopMode.NONE
         self.retry_counts: dict[str, int] = {}
+        self._exclude_chain_handler: Callable[[str], None] | None = None
+
+    def bind_exclude_chain_handler(self, handler: Callable[[str], None] | None) -> None:
+        """绑定临时级联排除处理器。"""
+        self._exclude_chain_handler = handler
+
+    def temporarily_exclude_chain(self, job_uid: str) -> None:
+        """委托绑定的处理器将指定作业及其全部下游加入本 Run 临时排除。"""
+        if self._exclude_chain_handler is not None and callable(self._exclude_chain_handler):
+            self._exclude_chain_handler(job_uid)
 
     def begin(self, run_id: str | None = None) -> None:
         """新 run 的复位入口：全部生命周期状态归零，run_id 待分配时置 None。"""

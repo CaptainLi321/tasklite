@@ -160,6 +160,18 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def load_queue_jobs(self, *args, **kwargs):
         return self.inner.load_queue_jobs(*args, **kwargs)
 
+    def record_authorization(self, *args, **kwargs):
+        return self.inner.record_authorization(*args, **kwargs)
+
+    def list_authorizations(self, *args, **kwargs):
+        return self.inner.list_authorizations(*args, **kwargs)
+
+    def is_path_authorized(self, *args, **kwargs):
+        return self.inner.is_path_authorized(*args, **kwargs)
+
+    def revoke_authorization(self, *args, **kwargs):
+        return self.inner.revoke_authorization(*args, **kwargs)
+
 
 # ── fake 进程（写 IPC 结果文件，与真实 worker 同路径）──────────────────
 

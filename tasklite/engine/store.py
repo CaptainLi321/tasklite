@@ -863,6 +863,36 @@ class StateStore:
         self.handle_commit_failure_strike(job_uid, "commit_retry", job_snapshot, attempt_id=attempt_id)
         return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
 
+    def apply_pending(
+        self,
+        job_uid: str,
+        job_snapshot: dict[str, Any],
+        *,
+        attempt_no: int = 1,
+        run_id: str | None = None,
+        started_at: str | None = None,
+        files: dict[str, Any] | None = None,
+        error_message: str | None = None,
+    ) -> bool:
+        """受阻或停机执行回滚到待派发队列（写盘重置为 pending，释放在途并还原内存队列）。"""
+        settled_at = utc_now_iso()
+        committed = self._backend.commit_job_settlement(
+            job_uid=job_uid,
+            outcome="pending",
+            attempt_no=attempt_no,
+            run_id=run_id or "run",
+            settled_at=settled_at,
+            started_at=started_at,
+            job_snapshot=job_snapshot,
+            files=files,
+            error_message=error_message,
+        )
+        if committed:
+            self._state.unregister_in_flight(job_uid)
+            self._state.requeue_jobs([job_snapshot], front=True)
+            return True
+        raise _CommitCrashSignal(f"commit_job_settlement(pending) returned False for {job_uid}")
+
     def apply_skip(
         self,
         job_uid: str,

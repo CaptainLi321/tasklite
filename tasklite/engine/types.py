@@ -8,6 +8,7 @@ Handler 归属 Task 规格层（``models/task.py`` 的 Task 单点持有 handler
 from __future__ import annotations
 
 import enum
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -87,6 +88,19 @@ class JobHandle:
     job: Job
     ipc_dir: str
     execution_id: str | None = None
+    auth_denied: bool = False
+    paused_remaining: float | None = None
+
+    def pause_timeout(self) -> None:
+        """等待外部授权或操作时暂停超时计时。"""
+        if self.paused_remaining is None:
+            self.paused_remaining = max(0.0, self.timeout_at_monotonic - time.monotonic())
+
+    def resume_timeout(self) -> None:
+        """恢复超时计时。"""
+        if self.paused_remaining is not None:
+            self.timeout_at_monotonic = time.monotonic() + self.paused_remaining
+            self.paused_remaining = None
 
 
 @dataclass(frozen=True)

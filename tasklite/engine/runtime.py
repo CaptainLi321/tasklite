@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import pickle
 import signal
 import threading
@@ -35,15 +36,23 @@ from .store import StateStore
 from .types import (
     ExecutionOptions,
     ExitReason,
+    JobHandle,
     StepOutcome,
     StopMode,
 )
 from .wait import IN_FLIGHT_POLL_SECONDS, LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..models.artifact import (
+    ArtifactDeclaration,
+    FileSpec,
+    merge_named_file_spec,
+    validate_file_name,
+)
 from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Exclude
+from ..utils.artifact import ArtifactPathPolicy
 from ..utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
@@ -137,6 +146,8 @@ class EngineRuntime:
         self._exclude: Exclude | None = None
         self._temporary_excluded_uids: set[str] = set()
         self.selection_machine: SelectionMachine = SelectionMachine(self.store)
+        self.channel.set_declaration_handler(self._handle_declaration)
+        self._session.bind_exclude_chain_handler(self.temporarily_exclude_chain)
 
     def temporarily_exclude(self, job_uid: str) -> None:
         """内部排除入口：登记单个临时排除 UID（供授权拒绝等复用）。"""
@@ -144,6 +155,118 @@ class EngineRuntime:
         self.scheduler.temporarily_exclude(job_uid)
         self.store.temporarily_exclude(job_uid)
         self.selection_machine.temporarily_exclude(job_uid)
+
+    def temporarily_exclude_chain(self, job_uid: str) -> None:
+        """临时排除指定作业及其所有直接和间接下游作业。"""
+        self.temporarily_exclude(job_uid)
+        for down_uid in self.store.state.find_all_downstream(job_uid):
+            self.temporarily_exclude(down_uid)
+
+    def _handle_declaration(
+        self, handle: JobHandle, payload: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """主进程动态文件声明仲裁出口：验证引用、授权检查、前置清理并回送路径。"""
+        req_id = payload.get("request_id", "") or payload.get("req_id", "")
+        name = payload.get("name", "")
+        spec_data = payload.get("spec", {})
+        entry = self._in_flight.get(handle.job_uid)
+        if entry is None:
+            return {"request_id": req_id, "status": "error", "error": f"Job {handle.job_uid} not in flight"}
+
+        try:
+            spec = FileSpec.from_dict(spec_data)
+            validated_name = validate_file_name(name)
+        except Exception as exc:
+            return {"request_id": req_id, "status": "error", "error": str(exc)}
+
+        # 1. 幂等与冲突检查
+        if validated_name in entry.active_files:
+            existing = entry.active_files[validated_name]
+            try:
+                merged, should_delete = merge_named_file_spec(
+                    entry.active_files,
+                    validated_name,
+                    spec,
+                    base_dir=self.store.base_dir,
+                    depends_on=handle.job.depends_on,
+                )
+                return {
+                    "request_id": req_id,
+                    "status": "ok",
+                    "resolved_path": existing.path,
+                }
+            except Exception as exc:
+                return {"request_id": req_id, "status": "error", "error": str(exc)}
+
+        # 2. 上游产物引用解析
+        if spec.is_output_ref:
+            assert spec.producer_uid is not None and spec.output_name is not None
+            if spec.producer_uid not in handle.job.depends_on:
+                return {
+                    "request_id": req_id,
+                    "status": "error",
+                    "error": f"Producer {spec.producer_uid} not in explicit direct depends_on",
+                }
+            producer_artifacts = self.store.state.successes.get(spec.producer_uid, {}).get("artifacts", {})
+            desc = producer_artifacts.get(spec.output_name)
+            if not desc or "path" not in desc:
+                return {
+                    "request_id": req_id,
+                    "status": "error",
+                    "error": f"Producer {spec.producer_uid} did not publish output {spec.output_name}",
+                }
+            resolved_path = desc["path"]
+            if spec.role == "input" and not os.path.exists(resolved_path):
+                return {
+                    "request_id": req_id,
+                    "status": "error",
+                    "error": f"Missing input file: {resolved_path}",
+                }
+            bound_spec = spec.bind_output_path(resolved_path, base_dir=self.store.base_dir)
+        else:
+            bound_spec = spec.resolve_against(self.store.base_dir)
+            assert bound_spec.path is not None
+            resolved_path = bound_spec.path
+            if spec.role == "input" and not os.path.exists(resolved_path):
+                return {
+                    "request_id": req_id,
+                    "status": "error",
+                    "error": f"Missing input file: {resolved_path}",
+                }
+
+        # 3. 授权检查
+        if bound_spec.delete_existing or bound_spec.delete_on_success or bound_spec.delete_on_failure:
+            handle.pause_timeout()
+            try:
+                authorized = self.store.check_or_request_authorization(resolved_path)
+            finally:
+                handle.resume_timeout()
+            if not authorized:
+                handle.auth_denied = True
+                self.channel.terminate_process(handle)
+                return {"request_id": req_id, "status": "denied"}
+
+        # 4. 前置删除（若声明要求且目标存在）
+        if bound_spec.delete_existing and os.path.exists(resolved_path):
+            policy = ArtifactPathPolicy(
+                output_roots=self.config.output_roots,
+                protected_roots=self.config.protected_roots,
+            )
+            try:
+                policy.remove_existing(ArtifactDeclaration(resolved_path, delete_existing=True))
+            except OSError as exc:
+                return {
+                    "request_id": req_id,
+                    "status": "error",
+                    "error": f"Pre-deletion failed: {exc}",
+                }
+
+        entry.active_files[validated_name] = bound_spec
+        return {
+            "request_id": req_id,
+            "status": "ok",
+            "resolved_path": resolved_path,
+        }
 
     def is_job_excluded(self, job_uid: str, task_type: str) -> bool:
         """统一判断作业是否被排除（用户 exclude 规则或运行期临时排除）。"""

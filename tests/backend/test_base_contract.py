@@ -62,6 +62,11 @@ EXPECTED_ABSTRACT_METHODS = {
     "load_settled_attempts",
     "clear_attempts",
     "load_queue_jobs",
+    # 路径授权
+    "record_authorization",
+    "list_authorizations",
+    "is_path_authorized",
+    "revoke_authorization",
 }
 
 

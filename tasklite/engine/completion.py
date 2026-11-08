@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import time
 from typing import Any, Sequence, TYPE_CHECKING
 
@@ -33,7 +34,9 @@ if TYPE_CHECKING:
 
 from ..exceptions import _ArtifactIOError, _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
-from ..models.artifact import ArtifactDeclaration
+from ..models.artifact import ArtifactDeclaration, FileSpec
+from ..utils.artifact import ArtifactPathPolicy
+from ..utils.clock import utc_now_iso
 from .channel import ArtifactCleanupMode, ExecutionResult, JobHandle
 from .errorclass import ERR_MAX_RETRIES
 from .in_flight import InFlightJob, InFlightTracker
@@ -171,6 +174,32 @@ class CompletionMachine:
                 f"at apply_result entry"
             )
 
+        active_files: dict[str, FileSpec] = {}
+        if entry is not None and getattr(entry, "active_files", None):
+            active_files = dict(entry.active_files)
+        elif job.files:
+            active_files = {
+                k: v.resolve_against(store.base_dir) if not v.is_output_ref else v
+                for k, v in job.files.items()
+            }
+
+        if result.transient_kind == "authorization_denied":
+            self._store.apply_pending(
+                job_uid=uid,
+                job_snapshot=job_snapshot,
+                attempt_no=attempt_no,
+                run_id=run_id or getattr(self._session, "run_id", "run"),
+                started_at=started_at,
+                error_message="authorization denied",
+                files={k: v.to_dict() for k, v in active_files.items()},
+            )
+            if entry is not None:
+                entry.release_resources(self._resources)
+            exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
+            if callable(exclude_fn):
+                exclude_fn(uid)
+            return
+
         if result.artifact_error is not None:
             raise _ArtifactIOError(result.artifact_error)
         declarations = self._channel.read_declared_artifacts(uid)
@@ -202,6 +231,51 @@ class CompletionMachine:
 
         self._channel.journal.cleanup_declared_artifacts(declarations, success=result.success)
 
+        # 声明式产物主进程清理
+        if active_files:
+            policy = ArtifactPathPolicy(
+                output_roots=getattr(self._channel, "output_roots", None),
+                protected_roots=self._channel.protected_roots,
+            )
+            if result.success:
+                for fname, spec in active_files.items():
+                    if spec.delete_on_success and spec.path and os.path.exists(spec.path):
+                        if not store.check_or_request_authorization(spec.path):
+                            result.success = False
+                            result.message = f"Success cleanup authorization denied: {spec.path}"
+                            break
+                        try:
+                            policy.cleanup(
+                                ArtifactDeclaration(spec.path, delete_on_success=True),
+                                success=True,
+                            )
+                        except OSError as exc:
+                            result.success = False
+                            result.message = f"Success cleanup failed: {exc}"
+                            break
+                if not result.success:
+                    spawned_job_snapshots = []
+                    result.cursor_updates = {}
+            else:
+                for fname, spec in active_files.items():
+                    if spec.delete_on_failure and spec.path and os.path.exists(spec.path):
+                        if store.check_or_request_authorization(spec.path):
+                            try:
+                                policy.cleanup(
+                                    ArtifactDeclaration(spec.path, delete_on_failure=True),
+                                    success=False,
+                                )
+                            except OSError as exc:
+                                if result.retry_requested:
+                                    result.retry_requested = False
+                                    result.message = f"Retry cleanup failed: {exc}"
+                                else:
+                                    result.annotations["cleanup_error"] = str(exc)
+                                    if result.message:
+                                        result.message = f"{result.message} (cleanup failed: {exc})"
+                                    else:
+                                        result.message = f"Cleanup failed: {exc}"
+
         # 释放资源（必须在事务提交之前完成）
         if entry is not None:
             entry.release_resources(self._resources)
@@ -217,6 +291,7 @@ class CompletionMachine:
                 attempt_no=attempt_no,
                 run_id=run_id,
                 started_at=started_at,
+                active_files=active_files,
             )
         elif result.success:
             self._apply_success(
@@ -232,6 +307,7 @@ class CompletionMachine:
                 run_id=run_id,
                 started_at=started_at,
                 spawned_job_snapshots=spawned_job_snapshots,
+                active_files=active_files,
             )
         else:
             self._apply_failure(
@@ -243,6 +319,7 @@ class CompletionMachine:
                 attempt_no=attempt_no,
                 run_id=run_id,
                 started_at=started_at,
+                active_files=active_files,
             )
 
     # ── 三态分支 ──────────────────────────────────────────────────────
@@ -258,6 +335,7 @@ class CompletionMachine:
         attempt_no: int = 1,
         run_id: str | None = None,
         started_at: str | None = None,
+        active_files: dict[str, FileSpec] | None = None,
     ) -> None:
         """重试分支：预算判定 → retry_job_snapshot 组装 → store.apply_retry。
 
@@ -302,6 +380,7 @@ class CompletionMachine:
                     run_id=run_id,
                     started_at=started_at,
                     failure_record_override=failure_metadata,
+                    active_files=active_files,
                 )
                 result.will_retry = False
                 return
@@ -309,6 +388,11 @@ class CompletionMachine:
 
         retry_job_snapshot = self._build_retry_job_snapshot(
             job, job_snapshot, retry_error=retry_error, is_transient=is_transient
+        )
+        files_dict = (
+            {k: v.to_dict() for k, v in active_files.items()}
+            if active_files
+            else job_snapshot.get("files")
         )
         logger.info(f"RETRY: {uid} (attempt {attempt_no})")
         self._store.apply_retry(
@@ -321,7 +405,7 @@ class CompletionMachine:
             run_id=run_id or self._session.run_id,
             started_at=started_at,
             error_message=retry_error,
-            files=job_snapshot.get("files"),
+            files=files_dict,
             result={
                 "status": "retry",
                 "message": result.message,
@@ -373,27 +457,41 @@ class CompletionMachine:
         run_id: str | None = None,
         started_at: str | None = None,
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
+        active_files: dict[str, FileSpec] | None = None,
     ) -> None:
         """成功分支：子任务去重规范化、successes 记录与 cursor 推进。"""
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
         success_metadata = dict(result.result_metadata or {})
+        files_dict = (
+            {k: v.to_dict() for k, v in active_files.items()}
+            if active_files
+            else job_snapshot.get("files")
+        )
+        effective_declarations = list(declared_artifacts)
+        effective_inputs = list(declared_inputs)
+        if active_files:
+            for fname, fspec in active_files.items():
+                if fspec.role == "output" and fspec.path is not None:
+                    effective_declarations.append(ArtifactDeclaration(fspec.path, name=fname))
+                elif fspec.role == "input" and fspec.path is not None:
+                    effective_inputs.append(fspec.path)
 
         self._store.apply_success(
             uid,
             success_metadata,
             spawned_job_snapshots=spawned_job_snapshots,
             cursor_updates=result.cursor_updates,
-            declared_inputs=declared_inputs,
-            declared_artifacts=declared_artifacts,
+            declared_inputs=effective_inputs,
+            declared_artifacts=effective_declarations,
             run_id=run_id or self._session.run_id,
             job_snapshot=job_snapshot,
             attempt_id=attempt_id,
             execution_id=execution_id,
             attempt_no=attempt_no,
             started_at=started_at,
-            files=job_snapshot.get("files"),
+            files=files_dict,
             result={
                 "status": "success",
                 "message": result.message,
@@ -469,6 +567,7 @@ class CompletionMachine:
         run_id: str | None = None,
         started_at: str | None = None,
         failure_record_override: dict[str, Any] | None = None,
+        active_files: dict[str, FileSpec] | None = None,
     ) -> None:
         """永久失败分支：写入失败档案与级联阻断下游（不污染 result.result_metadata）。"""
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
@@ -487,6 +586,12 @@ class CompletionMachine:
             if "metadata" not in failure_record:
                 failure_record["metadata"] = copy.deepcopy(result.result_metadata)
 
+        files_dict = (
+            {k: v.to_dict() for k, v in active_files.items()}
+            if active_files
+            else job_snapshot.get("files")
+        )
+
         self._store.apply_failure(
             uid,
             failure_record,
@@ -496,7 +601,7 @@ class CompletionMachine:
             attempt_no=attempt_no,
             run_id=run_id or self._session.run_id,
             started_at=started_at,
-            files=job_snapshot.get("files"),
+            files=files_dict,
             result={
                 "status": "failure",
                 "message": result.message,
