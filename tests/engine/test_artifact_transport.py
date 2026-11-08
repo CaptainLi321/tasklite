@@ -190,7 +190,9 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
         pipeline.enqueue(job)
         with pytest.raises(_ArtifactIOError, match="declaration write denied"):
             pipeline.run()
-        queue = pipeline.backend.load_queue()
+        rows = pipeline.backend.load_queue_jobs()
+        assert rows[0]["status"] == "running"
+        queue = [row["job"] for row in rows]
         assert len(queue) == 1
         assert queue[0]["task_type"] == job.task_type
         assert queue[0]["job_id"] == job.job_id

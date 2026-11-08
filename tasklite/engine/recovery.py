@@ -282,6 +282,10 @@ class RecoveryOrchestrator:
         at-least-once 重扫吸收。
         """
 
+        if self._store.backend.schema_version >= TARGET_SCHEMA_VERSION:
+            # 四态队列已由逐 Job 事务持久化，异常快照不得覆盖 running 证据。
+            return
+
         def _merge(disk_queue: list) -> list:
             mem_queue = self._store.state.queue
             mem_uids = {job_uid_from_snapshot(job_snapshot) for job_snapshot in mem_queue}

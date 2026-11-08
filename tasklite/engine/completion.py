@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from .resource import ResourceManager
     from .store import StateStore
 
+from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from ..exceptions import _ArtifactIOError, _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
 from ..models.artifact import ArtifactDeclaration, FileSpec
@@ -683,6 +684,9 @@ class CompletionMachine:
 
     def _requeue_uncommitted(self, entry: InFlightJob) -> None:
         """只回队尚未提交的原快照，已提交事实不能因尾部清理失败而重跑。"""
+        if self._store.backend.schema_version >= TARGET_SCHEMA_VERSION:
+            # 未提交的执行只保留持久化 running，不能回队自动重跑副作用。
+            return
         state = self._store.state
         if entry.job_uid in state.in_flight_uids:
             state.unregister_in_flight(entry.job_uid)

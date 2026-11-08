@@ -313,8 +313,9 @@ def test_cleanup_error_preserves_uncommitted_queue(pipelines, monkeypatch, tmp_p
             pipeline.run()
     assert pipeline.backend.load_successes() == {}
     assert pipeline.backend.load_failed() == {}
-    queue = pipeline.backend.load_queue()
-    assert len(queue) == 1 and queue[0]["attempt_no"] == 1
+    rows = pipeline.backend.load_queue_jobs()
+    assert len(rows) == 1 and rows[0]["status"] == "running"
+    assert rows[0]["attempt_no"] == 1
     assert (tmp_path / "output" / "temporary.txt").exists()
     if pipeline.backend.schema_version >= TARGET_SCHEMA_VERSION:
         assert pipeline.backend.load_attempts("work::cleanup") == []
@@ -387,6 +388,7 @@ def test_invalid_message_cannot_register_success(pipelines, tmp_path, fault):
         pipeline.run()
     assert pipeline.backend.load_successes() == {}
     assert pipeline.backend.load_failed() == {}
-    assert pipeline.backend.load_queue()[0]["attempt_no"] == 1
+    row, = pipeline.backend.load_queue_jobs()
+    assert row["status"] == "running" and row["attempt_no"] == 1
     assert not (tmp_path / "output" / "authorized.txt").exists()
     assert (tmp_path / "output" / "retained.txt").exists()

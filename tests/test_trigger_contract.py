@@ -279,7 +279,11 @@ def test_trigger_error_aborts_inflight_without_burning_budget(monkeypatch):
     pipeline.enqueue(Job("t", "b", trigger="error"))
     with pytest.raises(ZeroDivisionError):
         pipeline.run()
-    rows = {row["job_id"]: row for row in pipeline.backend.load_queue()}
+    queue_rows = pipeline.backend.load_queue_jobs()
+    assert {row["job_uid"]: row["status"] for row in queue_rows} == {
+        "t::a": "running", "t::b": "pending",
+    }
+    rows = {row["job"]["job_id"]: row["job"] for row in queue_rows}
     assert set(rows) == {"a", "b"}
     assert all(row["attempt_no"] == 1 for row in rows.values())
     assert pipeline.backend.load_attempts("t::b") == []

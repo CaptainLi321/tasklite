@@ -170,3 +170,46 @@ def test_recovery_settlement_fault_preserves_running(tmp_path, monkeypatch, rais
     assert backend.load_attempts("work::orphan") == []
     assert pipeline._runtime.store.state.failed == {}
     pipeline.close()
+
+
+def unsettled_effect_handler(job, ctx):
+    with Path(job.payload["effect"]).open("a") as stream:
+        stream.write("effect\n")
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypatch, raises):
+    """结算写入故障保留 running，重开只恢复失败，不重复业务副作用。"""
+    db_path = tmp_path / "state.db"
+    effect = tmp_path / "effect.txt"
+    pipeline = TaskLite(backend="sqlite", state_path=db_path)
+    pipeline.register_task("work", unsettled_effect_handler)
+    pipeline.register_task("pending", child_consumer_handler)
+    pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
+    pipeline.enqueue(Job("pending", "two"))
+
+    def fail_settlement(**kwargs):
+        if raises:
+            raise RuntimeError("结算失败")
+        return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pipeline.backend, "commit_job_settlement", fail_settlement)
+        with pytest.raises(BaseException, match="结算失败|commit_job_settlement returned False"):
+            pipeline.run()
+    rows = pipeline.backend.load_queue_jobs()
+    assert rows[0]["status"] == "running"
+    assert pipeline.backend.load_settled_attempts("work::one") == []
+    assert effect.read_text() == "effect\n"
+    pipeline.close()
+
+    with TaskLite(backend="sqlite", state_path=db_path) as reopened:
+        reopened.register_task("work", unsettled_effect_handler)
+        reopened.register_task("pending", child_consumer_handler)
+        reopened.run()
+        attempts = reopened.backend.load_settled_attempts("work::one")
+        assert len(attempts) == 1
+        assert attempts[0]["outcome"] == "failure"
+        assert "work::one" in reopened.backend.load_failed()
+        assert effect.read_text() == "effect\n"

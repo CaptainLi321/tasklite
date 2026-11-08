@@ -278,7 +278,11 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
     pipeline.enqueue(Job("later", "item"))
     with pytest.raises(RuntimeError, match="trigger boundary"):
         pipeline.run()
-    rows = pipeline.backend.load_queue()
+    queue_rows = pipeline.backend.load_queue_jobs()
+    assert {row["job_uid"]: row["status"] for row in queue_rows} == {
+        "waiting::item": "running", "later::item": "pending",
+    }
+    rows = [row["job"] for row in queue_rows]
     assert {row["task_type"] for row in rows} == {"waiting", "later"}
     assert all(row["attempt_no"] == 1 and row["runtime"] == {} for row in rows)
     assert pipeline.backend.load_failed() == {}
@@ -294,8 +298,8 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
     res = recovered.run()
     recovered.stop()
     assert res is None
-    assert recovered.backend.load_failed() == {}
+    assert set(recovered.backend.load_failed()) == {"waiting::item"}
     assert recovered.backend.load_queue() == []
     attempts = recovered.backend.load_attempts("waiting::item")
-    assert attempts[-1].outcome == "succeeded" and attempts[-1].attempt_no >= 1
-    assert attempts[-1].outcome == "succeeded"
+    assert len(attempts) == 1
+    assert attempts[0].outcome == "failed" and attempts[0].attempt_no == 1
