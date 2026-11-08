@@ -461,7 +461,7 @@ def test_active_excluded_upstream_masks_historical_success(fake_process, tmp_pat
     pipeline.register_task("downstream", ok_handler)
 
     # upstream 历史已有成功
-    pipeline.backend.seed_successes(["upstream::u"])
+    pipeline.set_job_status(Job("upstream", "u"), "succeeded", recursive=False)
 
     # upstream 再次入队（成为活跃候选），下游依赖 upstream
     pipeline.backend.save_queue([

@@ -41,11 +41,12 @@ EXPECTED_ABSTRACT_METHODS = {
     "append_failed",
     # 增量入队
     "enqueue_jobs",
-    # 定向删除与种子
+    # 定向删除与管理
     "delete_queue_uids",
     "delete_failed",
     "delete_successes",
-    "seed_successes",
+    "apply_manual_status",
+    "clear_history",
     "get_cursor",
     "set_cursor",
     # 尝试轨迹（append-only 旁路观测面）

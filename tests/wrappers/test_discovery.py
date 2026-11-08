@@ -686,12 +686,8 @@ def test_real_subprocess_full_mode_with_max_pages(tmp_path, monkeypatch):
 
     # 预先在 successes 中塞入前两页（100, 99, 98, 97）
     # 模拟历史深处有洞（第 3 页 96, 95 未下载）
-    pipeline.seed_successes([
-        "rt_child::100",
-        "rt_child::99",
-        "rt_child::98",
-        "rt_child::97",
-    ])
+    for jid in ["100", "99", "98", "97"]:
+        pipeline.set_job_status(Job("rt_child", jid), "succeeded", recursive=False)
 
     # 派发 full 扫描：第 1、2 页即使整页全命中也不 break，继续扫到第 3 页，并在 max_pages=3 处截断
     pipeline.enqueue(Job("rt_disc_full", "seed", payload={"artist_id": "full1", "posts": posts}))
@@ -720,10 +716,8 @@ def test_payload_dynamic_override_scan_mode_and_max_pages(tmp_path, monkeypatch)
     pipeline.register_task("rt_child", _rt_child_handler)
 
     # 预置第 1 页（50, 49）到 successes
-    pipeline.seed_successes([
-        "rt_child::50",
-        "rt_child::49",
-    ])
+    for jid in ["50", "49"]:
+        pipeline.set_job_status(Job("rt_child", jid), "succeeded", recursive=False)
 
     # 派发 job 时动态覆盖为 full 模式且 max_pages=2
     pipeline.enqueue(

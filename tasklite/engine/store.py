@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -40,7 +41,7 @@ from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Exclude
 from ..utils.clock import parse_utc_iso_to_us, utc_now_iso
 from ..utils.encoding import parse_job_uid
-from ..utils.jsonutil import dumps
+from ..utils.jsonutil import dumps, loads
 from .admission import (
     ImmediateRequeuePolicy,
     RequeuePolicy,
@@ -268,6 +269,222 @@ class StateStore:
             raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
         self._backend.set_cursor(key, value)
         self._state.set_cursor(key, value)
+
+    def get_job_snapshot(self, uid: str) -> dict[str, Any] | None:
+        """查找指定 uid 的完整作业快照（依次检索队列、成功档案、失败档案与 Attempt 轨迹）。"""
+        for q_snap in self._state.queue:
+            if job_uid_from_snapshot(q_snap) == uid:
+                return copy.deepcopy(q_snap)
+        for b_snap in self._backend.load_queue():
+            if job_uid_from_snapshot(b_snap) == uid:
+                return copy.deepcopy(b_snap)
+        succ = self._backend.load_successes().get(uid)
+        if isinstance(succ, dict):
+            s_snap = succ.get("job_snapshot")
+            if isinstance(s_snap, dict):
+                return copy.deepcopy(s_snap)
+        failed = self._backend.load_failed().get(uid)
+        if isinstance(failed, dict):
+            f_snap = failed.get("job_snapshot")
+            if isinstance(f_snap, dict):
+                return copy.deepcopy(f_snap)
+        settled = self._backend.load_settled_attempts(uid)
+        for att in reversed(settled):
+            att_snap = att.get("job_snapshot")
+            if isinstance(att_snap, dict):
+                return copy.deepcopy(att_snap)
+        payloads = self._backend.load_failure_payloads()
+        if uid in payloads:
+            try:
+                tt, jid = parse_job_uid(uid)
+                rebuilt_job = Job(task_type=tt, job_id=jid, payload=payloads[uid] or {})
+                return self.normalize_and_validate_job(rebuilt_job)
+            except Exception:
+                pass
+        return None
+
+    def get_all_known_jobs(self) -> dict[str, dict[str, Any]]:
+        """检索当前已知的全部作业完整快照映射（queue/successes/failed/attempts 并集）。"""
+        known: dict[str, dict[str, Any]] = {}
+        try:
+            if hasattr(self._backend, "_get_conn") and hasattr(self._backend, "path") and self._backend.path.exists():
+                with self._backend._get_conn() as conn:
+                    cur = conn.execute("SELECT job_uid, job_snapshot FROM attempts WHERE job_snapshot IS NOT NULL")
+                    for row in cur:
+                        if row[0] not in known and row[1]:
+                            try:
+                                snap = loads(row[1])
+                                if isinstance(snap, dict):
+                                    known[row[0]] = snap
+                            except Exception:
+                                pass
+            elif hasattr(self._backend, "_attempts"):
+                with getattr(self._backend, "_lock"):
+                    for att in getattr(self._backend, "_attempts").values():
+                        snap = getattr(att, "job_snapshot", None)
+                        if isinstance(att, dict):
+                            snap = att.get("job_snapshot")
+                        u = getattr(att, "job_uid", None) or (att.get("job_uid") if isinstance(att, dict) else None)
+                        if u and isinstance(snap, dict) and u not in known:
+                            known[u] = copy.deepcopy(snap)
+        except Exception:
+            pass
+        for u, meta in self._backend.load_failed().items():
+            if isinstance(meta, dict) and isinstance(meta.get("job_snapshot"), dict):
+                known[u] = copy.deepcopy(meta["job_snapshot"])
+            elif u not in known:
+                payload = self._backend.load_failure_payloads().get(u)
+                if payload is not None:
+                    try:
+                        tt, jid = parse_job_uid(u)
+                        known[u] = self.normalize_and_validate_job(Job(task_type=tt, job_id=jid, payload=payload or {}))
+                    except Exception:
+                        pass
+        for u, meta in self._backend.load_successes().items():
+            if isinstance(meta, dict) and isinstance(meta.get("job_snapshot"), dict):
+                known[u] = copy.deepcopy(meta["job_snapshot"])
+        for snap in self._backend.load_queue():
+            u = job_uid_from_snapshot(snap)
+            known[u] = copy.deepcopy(snap)
+        for snap in self._state.queue:
+            u = job_uid_from_snapshot(snap)
+            known[u] = copy.deepcopy(snap)
+        return known
+
+    def _find_downstream_uids(self, root_uid: str, all_known: dict[str, dict[str, Any]]) -> list[str]:
+        """按已知记录的 depends_on 拓扑构建反向依赖图，遍历收集全部下游作业 UID。"""
+        adjacency: dict[str, set[str]] = defaultdict(set)
+        for u, snap in all_known.items():
+            for dep in snap.get("depends_on") or ():
+                adjacency[dep].add(u)
+        downstream: list[str] = []
+        visited = {root_uid}
+        queue = [root_uid]
+        while queue:
+            curr = queue.pop(0)
+            for child in sorted(adjacency.get(curr, ())):
+                if child not in visited:
+                    visited.add(child)
+                    queue.append(child)
+                    downstream.append(child)
+        return downstream
+
+    def set_job_status(
+        self,
+        job_or_uid: Job | str,
+        status: str,
+        *,
+        recursive: bool,
+        note: str | None = None,
+    ) -> None:
+        """人工设置作业状态（pending/succeeded/failed），原子处理目标及递归下游。"""
+        if status not in ("pending", "succeeded", "failed"):
+            raise ValueError(
+                f"status must be one of 'pending', 'succeeded', 'failed', got {status!r}"
+            )
+        if not isinstance(recursive, bool):
+            raise TypeError(f"recursive must be a bool, got {type(recursive).__name__}")
+        if note is not None and not isinstance(note, str):
+            raise TypeError(f"note must be a str or None, got {type(note).__name__}")
+
+        if isinstance(job_or_uid, Job):
+            target_job = job_or_uid
+            target_uid = job_or_uid.uid
+        elif isinstance(job_or_uid, str):
+            if not job_or_uid:
+                raise TypeError("job_or_uid cannot be empty")
+            parse_job_uid(job_or_uid)
+            target_job = None
+            target_uid = job_or_uid
+        else:
+            raise TypeError(
+                f"job_or_uid must be a Job or str, got {type(job_or_uid).__name__}"
+            )
+
+        if target_job is not None:
+            intake_snap = self.normalize_and_validate_job(target_job)
+            existing_snap = self.get_job_snapshot(target_uid)
+            if existing_snap is not None:
+                if extract_effective_job_config(existing_snap) != extract_effective_job_config(intake_snap):
+                    raise ValueError(
+                        f"Job configuration conflict for UID {target_uid!r}: "
+                        f"passed Job does not match existing effective configuration"
+                    )
+                target_snap = existing_snap
+            else:
+                target_snap = intake_snap
+        else:
+            found = self.get_job_snapshot(target_uid)
+            if found is None:
+                raise KeyError(f"No existing snapshot found for job UID {target_uid!r}")
+            target_snap = found
+
+        all_known = self.get_all_known_jobs()
+        all_known[target_uid] = target_snap
+
+        affected: list[tuple[str, dict[str, Any]]] = [(target_uid, target_snap)]
+        if recursive:
+            downstream_uids = self._find_downstream_uids(target_uid, all_known)
+            for child_uid in downstream_uids:
+                child_snap = all_known.get(child_uid)
+                if child_snap is not None:
+                    affected.append((child_uid, child_snap))
+
+        updates: list[tuple[str, str, dict[str, Any], dict[str, Any] | None]] = []
+        for u, snap in affected:
+            if status == "pending":
+                updates.append((u, "pending", snap, None))
+            elif status == "succeeded":
+                annotations = {"completion_source": "manual"}
+                if note is not None:
+                    annotations["note"] = note
+                succ_meta: dict[str, Any] = {
+                    "job_snapshot": snap,
+                    "annotations": annotations,
+                    "settled_at": utc_now_iso(),
+                    "run_id": None,
+                    "attempt_no": None,
+                    "started_at": None,
+                    "artifacts": {},
+                    "inputs": [],
+                }
+                updates.append((u, "succeeded", snap, succ_meta))
+            elif status == "failed":
+                fail_meta: dict[str, Any] = {
+                    "job_snapshot": snap,
+                    "annotations": {"completion_source": "manual"},
+                    "error_category": "manual",
+                    "error_message": note or "Manual status set to failed",
+                    "settled_at": utc_now_iso(),
+                    "run_id": None,
+                    "attempt_no": None,
+                }
+                if note is not None:
+                    fail_meta["note"] = note
+                updates.append((u, "failed", snap, fail_meta))
+
+        self._backend.apply_manual_status(updates)
+        for u, st, snap, up_meta in updates:
+            if st == "pending":
+                self._state.discard_success(u)
+                self._state.discard_failed(u)
+                self._state.remove_queued_uid(u)
+                self._state.spawn_jobs([snap], front=False)
+            elif st == "succeeded":
+                self._state.remove_queued_uid(u)
+                self._state.mark_success(u, up_meta or {})
+            elif st == "failed":
+                self._state.remove_queued_uid(u)
+                self._state.mark_failed(u, up_meta or {})
+
+    def clear_history(self, uid: str, records: set[str]) -> int:
+        """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""
+        total = self._backend.clear_history(uid, records)
+        if "successes" in records:
+            self._state.discard_success(uid)
+        if "failures" in records:
+            self._state.discard_failed(uid)
+        return total
 
     # ── 摄入管道（enqueue / spawn）──────────────────────────────────
 
@@ -726,6 +943,8 @@ class StateStore:
             success_metadata["last_success_run_id"] = run_id
         else:
             success_metadata.pop("last_success_run_id", None)
+        if job_snapshot is not None:
+            success_metadata["job_snapshot"] = copy.deepcopy(job_snapshot)
         success_metadata.pop("inputs", None)
         if declared_inputs:
             input_paths = list(dict.fromkeys(
@@ -807,6 +1026,8 @@ class StateStore:
     ) -> FailureOutcome:
         """原子终态转移：永久失败（进入失败档案 + successes 互删 + 级联下游）。"""
         normalized_meta = self._classifier.normalize_failure_metadata(failure_metadata)
+        if job_snapshot is not None:
+            normalized_meta["job_snapshot"] = copy.deepcopy(job_snapshot)
         payload = self._extract_job_payload(job_snapshot)
         if self._backend.schema_version >= TARGET_SCHEMA_VERSION and attempt_no is not None:
             effective_settled_at = settled_at if settled_at is not None else utc_now_iso()

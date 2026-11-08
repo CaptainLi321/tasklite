@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Collection, Literal, Sequence
 
 from .errorclass import ErrorClassifier
 from .store import FailureEntry, StateStore
@@ -147,214 +147,37 @@ class OpsConsole:
 
     # ── 变更操作 ──────────────────────────────────────────────────────
 
-    def clear_failures(
-        self,
-        task_types: Sequence[str] | None = None,
-        *,
-        keep_fatal: bool = True,
-    ) -> int:
-        """从失败档案删除匹配条目（默认保留 is_fatal=true 的确定性失败），
-        返回删除数。"""
-        if task_types is not None:
-            if not isinstance(task_types, (list, tuple)):
-                raise TypeError(
-                    f"task_types must be a list/tuple of str or None, "
-                    f"got {type(task_types).__name__}"
-                )
-            for t in task_types:
-                if not isinstance(t, str) or not t:
-                    raise TypeError(
-                        f"task_types must contain only non-empty str, got {t!r}"
-                    )
-            task_types = list(task_types)
-        task_type_set = set(task_types) if task_types is not None else None
-        failed = self._store.backend.load_failed()
-
-        def _match_task_type(uid: str) -> bool:
-            if task_type_set is None:
-                return True
-            try:
-                tt, _ = parse_job_uid(uid)
-            except TaskLiteError:
-                tt = uid.split("::", 1)[0]
-            return tt in task_type_set
-
-        to_delete = [
-            uid for uid, meta in failed.items()
-            if _match_task_type(uid)
-            and not (keep_fatal and isinstance(meta, dict) and meta.get("is_fatal"))
-        ]
-        if not to_delete:
-            return 0
-        deleted_count = self._store.backend.delete_failed(to_delete)
-        state = self._store.state
-        for uid in to_delete:
-            state.discard_failed(uid)
-        return deleted_count
-
-    def retry_failure(self, job_uid: str) -> bool:
-        """把失败档案中的单个作业移出档案并重新入队（人工补跑通道）。
-
-        激活代按拦截点放行语义推进：档案补跑本质是 failed 拦截点放行
-        重跑，重建作业的 ``activation_no`` 取该 job_uid 在 attempts 轨迹中的
-        最大激活代 +1、``attempt_no`` 归 1——否则补跑执行与首激活在
-        attempts 表共享同一 ``(activation_no, attempt_no)`` 逻辑键，
-        追溯面撞号；无轨迹行（带外登记）回退初激活 1。业务 payload 取
-        档案快照，经 store.enqueue_jobs 规范化（策略注入 + 资源注入 +
-        首入队时间）队首入队，再删档案行。先入队后删除的次序保证崩溃
-        窗口至多留下「queue∩failed 并存」——由加载期修复按 trigger 策略
-        收敛，绝不丢作业。已在队列驻留的 job_uid 不重复入队（enqueue 去重），
-        档案行照删（下次 run 从队列执行）。
-
-        Returns:
-            bool: 条目已从档案移除（入队完成或已驻留队列）。
-
-        Raises:
-            KeyError: job_uid 不在失败档案（typo fail-loud，静默 no-op 会
-                掩盖补跑拼写错误）。
-        """
-        failed = self._store.backend.load_failed()
-        if job_uid not in failed:
-            raise KeyError(f"job_uid {job_uid!r} not in failure archive")
-        try:
-            task_type, job_id = parse_job_uid(job_uid)
-        except TaskLiteError:
-            task_type, _, job_id = job_uid.partition("::")
-        payloads = self._store.backend.load_failure_payloads()
-        # 激活代取轨迹最大值 +1（failed 拦截点放行 = 新激活代），attempt_no
-        # 经 Job 模型默认归 1；payload 取档案快照（无快照回退空 dict）。
-        prior_activation = max(
-            (record.activation_no for record in self._store.backend.load_attempts(job_uid)),
-            default=0,
-        )
-        job = Job._restore(
-            task_type=task_type,
-            job_id=job_id,
-            payload=payloads.get(job_uid) or {},
-            activation_no=prior_activation + 1,
-        )
-        job_snapshot = self._store.normalize_and_validate_job(job)
-        self._store.backend.enqueue_jobs([job_snapshot], front=True)
-        self._store.backend.delete_failed([job_uid])
-        state = self._store.state
-        state.discard_failed(job_uid)
-        return True
-
     def clear_history(
         self,
-        targets: str | Sequence[str],
+        uid: str,
         *,
-        where: Sequence[str] = ("successes", "failed"),
-        predicate: Callable[[str], bool] | None = None,
+        records: Collection[Literal["successes", "failures", "attempts"]],
     ) -> int:
-        """从 successes 和/或失败档案删除条目。
-
-        ``predicate`` 提供官方的「Python 侧判定 + 定向批删」通道：对
-        targets 命中的 uid 逐条调用，返回 False 则保留。判定在本进程
-        完成、删除仍走后端批量删除接口，业务无需再裸连数据库绕过
-        WAL 校验与写事务纪律。
-        """
-        if isinstance(targets, str):
-            patterns = [targets]
-        elif isinstance(targets, (list, tuple)):
-            patterns = list(targets)
-        else:
+        """从指定档案和/或 Attempt 历史中删除单个 job 的记录。"""
+        if not isinstance(uid, str) or not uid:
+            raise TypeError(f"uid must be a non-empty str, got {uid!r}")
+        try:
+            parse_job_uid(uid)
+        except Exception as exc:
+            raise ValueError(
+                f"uid must be a valid canonical 'task_type::job_id' str, got {uid!r}"
+            ) from exc
+        if not isinstance(records, (list, tuple, set, frozenset)):
             raise TypeError(
-                f"targets must be a str or a list/tuple of str, "
-                f"got {type(targets).__name__} ({targets!r})"
+                f"records must be a collection of 'successes', 'failures', 'attempts', "
+                f"got {type(records).__name__}"
             )
-        for p in patterns:
-            if not isinstance(p, str):
-                raise TypeError(
-                    f"targets must contain only str, got {type(p).__name__} ({p!r})"
-                )
-        if predicate is not None and not callable(predicate):
-            raise TypeError(
-                f"predicate must be callable or None, got {type(predicate).__name__}"
-            )
-        if not isinstance(where, (list, tuple)):
-            raise TypeError(
-                f"where must be a sequence of 'successes'/'failed', "
-                f"got {type(where).__name__}"
-            )
-        where_set = set(where)
-        unknown = where_set - {"successes", "failed"}
+        records_set = set(records)
+        if not records_set:
+            raise ValueError("records must not be empty")
+        allowed = {"successes", "failures", "attempts"}
+        unknown = records_set - allowed
         if unknown:
             raise ValueError(
-                f"where contains unknown target(s): {sorted(unknown)!r}; "
-                f"allowed: 'successes', 'failed'"
+                f"records contains unknown target(s): {sorted(unknown)!r}; "
+                f"allowed: {sorted(allowed)!r}"
             )
-
-        def _matches(uid: str) -> bool:
-            hit = any(
-                uid == p or (p.endswith("::") and uid.startswith(p))
-                for p in patterns
-            )
-            return hit and (predicate is None or predicate(uid))
-
-        state = self._store.state
-        total = 0
-        if "successes" in where:
-            successes = self._store.backend.load_successes()
-            matched = [u for u in successes if _matches(u)]
-            if matched:
-                total += self._store.backend.delete_successes(matched)
-                for u in matched:
-                    state.discard_success(u)
-        if "failed" in where:
-            failed = self._store.backend.load_failed()
-            matched = [u for u in failed if _matches(u)]
-            if matched:
-                total += self._store.backend.delete_failed(matched)
-                for u in matched:
-                    state.discard_failed(u)
-        return total
-
-    def seed_successes(self, job_uids: Sequence[str]) -> int:
-        """把 job_uid 批量写入 successes（存档迁移标记「已处理」），返回实际写入数。
-
-        不变式（六集合互斥）：已在失败档案或驻留队列的 job_uid 拒绝种子。
-        failed 与 queue 两腿均以后端持久层为真相（run 前内存 state 是
-        空占位，仅查内存腿会漏掉落盘队列驻留）。预检先于任何写入
-        （backend 持久层与内存 state 双腿零写入），冲突整体拒绝——静默
-        写入会留下 successes∩failed / successes∩queue 非豁免重叠，令下一次状态
-        变更的一致性断言崩溃；失败档案记录须先经 clear_failures /
-        clear_history 显式清除，队列驻留须待 run 排空或显式清理后再种子。
-        """
-        if not isinstance(job_uids, (list, tuple)):
-            raise TypeError(
-                f"job_uids must be a list/tuple of str, got {type(job_uids).__name__}"
-            )
-        for u in job_uids:
-            try:
-                parse_job_uid(u)
-            except TaskLiteError as exc:
-                raise ValueError(
-                    f"seed_successes job_uid must be a valid canonical 'task_type::job_id' str, got {u!r}"
-                ) from exc
-        failed = self._store.backend.load_failed()
-        queue_uids = set(self._store.state.queue_uids)
-        queue_uids.update(job_uid_from_snapshot(jd) for jd in self._store.backend.load_queue())
-        conflict_failed = sorted({u for u in job_uids if u in failed})
-        conflict_queue = sorted({u for u in job_uids if u in queue_uids})
-        if conflict_failed:
-            raise ValueError(
-                f"seed_successes refuses uid(s) already in the failure archive: "
-                f"{conflict_failed}; successes/failed must stay disjoint. Clear the "
-                f"failure entries first (clear_failures/clear_history) if "
-                f"archiving is intended."
-            )
-        if conflict_queue:
-            raise ValueError(
-                f"seed_successes refuses uid(s) still resident in the queue: "
-                f"{conflict_queue}; successes/queue must stay disjoint. Drain or "
-                f"clear the queue entries first if archiving is intended."
-            )
-        written = self._store.backend.seed_successes(list(job_uids))
-        state = self._store.state
-        for u in job_uids:
-            state.add_success(u, {})
-        return written
+        return self._store.clear_history(uid, records_set)
 
 
 __all__ = [

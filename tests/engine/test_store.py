@@ -199,7 +199,7 @@ class TestTrustedLastSucceededAtUs:
         backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
         assert store.trusted_last_succeeded_at_us("t::1") is None
 
-    def test_seed_successes_empty_metadata_returns_none(self):
+    def test_manual_succeeded_empty_metadata_returns_none(self):
         store, state, backend = _make_store()
         aid = _open_running_attempt(backend, "t::1")
         backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
@@ -604,7 +604,7 @@ class TestApplyBulkFailure:
     def test_bulk_failure_keeps_wall_deleted_on_backend(self):
         """批量失败与单条失败对称：successes 同名行随事务删除。"""
         store, _, backend = _make_store()
-        backend.seed_successes(["cycle::1"])
+        backend.commit_job_success("cycle::1", {})
         store.apply_bulk_failure([("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"})])
         assert "cycle::1" not in backend.load_successes()
 

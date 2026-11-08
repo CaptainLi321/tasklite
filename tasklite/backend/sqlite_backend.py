@@ -840,41 +840,79 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to delete successes entries in {self.path.name}: {e}")
             raise
 
-    def seed_successes(self, job_uids: list[str]) -> int:
-        """把 job_uid 批量写入 successes（meta 空 dict）——存档迁移标记「已处理」。
+    def apply_manual_status(
+        self,
+        updates: Sequence[tuple[str, str, dict[str, Any], dict[str, Any] | None]],
+    ) -> None:
+        """批量原子应用人工状态变更 (job_uid, status, snapshot, metadata)。"""
+        if not updates:
+            return
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for job_uid, status, snapshot, metadata in updates:
+                if status == "pending":
+                    conn.execute("DELETE FROM successes WHERE job_uid = ?", (job_uid,))
+                    conn.execute("DELETE FROM failed WHERE job_uid = ?", (job_uid,))
+                    row = conn.execute(
+                        "SELECT queue_position FROM queue WHERE job_uid = ?", (job_uid,)
+                    ).fetchone()
+                    if self.schema_version >= TARGET_SCHEMA_VERSION:
+                        if row is not None:
+                            conn.execute(
+                                "UPDATE queue SET job_snapshot = ?, status = 'pending', run_id = NULL, attempt_no = NULL, started_at = NULL WHERE job_uid = ?",
+                                (dumps(snapshot), job_uid),
+                            )
+                        else:
+                            pos = self._queue_position_range(conn, 1, front=False)[0]
+                            conn.execute(
+                                "INSERT INTO queue (job_uid, queue_position, job_snapshot, status) VALUES (?, ?, ?, 'pending')",
+                                (job_uid, pos, dumps(snapshot)),
+                            )
+                    else:
+                        if row is not None:
+                            conn.execute(
+                                "UPDATE queue SET job_snapshot = ? WHERE job_uid = ?",
+                                (dumps(snapshot), job_uid),
+                            )
+                        else:
+                            pos = self._queue_position_range(conn, 1, front=False)[0]
+                            conn.execute(
+                                "INSERT INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)",
+                                (job_uid, pos, dumps(snapshot)),
+                            )
+                elif status == "succeeded":
+                    conn.execute("DELETE FROM queue WHERE job_uid = ?", (job_uid,))
+                    conn.execute("DELETE FROM failed WHERE job_uid = ?", (job_uid,))
+                    conn.execute(
+                        "INSERT OR REPLACE INTO successes (job_uid, metadata) VALUES (?, ?)",
+                        (job_uid, dumps(metadata or {})),
+                    )
+                elif status == "failed":
+                    conn.execute("DELETE FROM queue WHERE job_uid = ?", (job_uid,))
+                    conn.execute("DELETE FROM successes WHERE job_uid = ?", (job_uid,))
+                    payload = snapshot.get("payload") or {}
+                    conn.execute(
+                        "INSERT OR REPLACE INTO failed (job_uid, metadata, payload) VALUES (?, ?, ?)",
+                        (job_uid, dumps(metadata or {}), dumps(payload)),
+                    )
 
-        幂等：已存在的 job_uid 被覆盖（meta 重置为空）。
-        不变式：successes/failed 全局互斥——已在 failed 的 job_uid 拒绝种子；
-        冲突检查与写入收敛进同一 ``BEGIN IMMEDIATE`` 写事务（先取写锁
-        再读，详见 _get_conn），冲突时零写入（整体拒绝），不静默清除
-        失败档案记录（失败历史须先经 delete_failed 显式清除）。
-        """
-        if not job_uids:
+    def clear_history(self, uid: str, records: set[str]) -> int:
+        """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""
+        if not self.path.exists():
             return 0
-        unique_uids = list(dict.fromkeys(job_uids))
-        try:
-            with self._get_conn() as conn:
-                conn.execute('BEGIN IMMEDIATE')
-                placeholders = ','.join('?' * len(unique_uids))
-                conflict = sorted(
-                    row[0] for row in conn.execute(
-                        f'SELECT job_uid FROM failed WHERE job_uid IN ({placeholders})',
-                        unique_uids,
-                    )
-                )
-                if conflict:
-                    raise ValueError(
-                        f"seed_successes refuses job_uid(s) already in failed: {conflict}; "
-                        f"successes/failed must stay disjoint"
-                    )
-                cur = conn.executemany(
-                    'INSERT OR REPLACE INTO successes (job_uid, metadata) VALUES (?, ?)',
-                    [(u, dumps({})) for u in job_uids],
-                )
-                return cur.rowcount if cur.rowcount is not None else 0
-        except Exception as e:
-            logger.critical(f"Failed to seed successes in {self.path.name}: {e}")
-            raise
+        total = 0
+        with self._get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if "successes" in records:
+                cur = conn.execute("DELETE FROM successes WHERE job_uid = ?", (uid,))
+                total += cur.rowcount if cur.rowcount is not None else 0
+            if "failures" in records:
+                cur = conn.execute("DELETE FROM failed WHERE job_uid = ?", (uid,))
+                total += cur.rowcount if cur.rowcount is not None else 0
+            if "attempts" in records:
+                cur = conn.execute("DELETE FROM attempts WHERE job_uid = ?", (uid,))
+                total += cur.rowcount if cur.rowcount is not None else 0
+        return total
 
     def get_cursor(self, key: str) -> str | None:
         """查询单个游标的最新已提交值，不存在返回 None。"""

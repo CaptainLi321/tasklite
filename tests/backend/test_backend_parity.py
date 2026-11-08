@@ -8,7 +8,7 @@
 - attempts append-only（历史行只增不改，每行仅允许一次收尾）。
 
 另覆盖双腿契约面：commit 失败/冲突不变式（False ⇒ 后端与调用前
-完全一致）、replace_queue_atomic、替换集形状校验、seed_successes 互斥、
+完全一致）、replace_queue_atomic、替换集形状校验、apply_manual_status 互斥、
 seed_cursor 入口校验。
 """
 
@@ -305,7 +305,7 @@ class TestBackendCommitAtomicity:
     def test_bulk_failure_write_error_leaves_backend_unchanged(self, dual_backend):
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("two")])
-        b.seed_successes(["t::nine"])
+        b.apply_manual_status([("t::nine", "succeeded", _job_snapshot("nine"), None)])
         before = _snapshot(b)
 
         ok = b.commit_job_failures([
@@ -519,44 +519,70 @@ class TestQueueReplacementShapeValidation:
         assert b.load_queue() == []
 
 
-class TestSeedWallMutualExclusion:
-    """seed_successes 拒绝已存在 failed 的 uid（successes/failed 全局互斥，双腿同契约）。
+class TestApplyManualStatusAndClearHistoryParity:
+    """apply_manual_status 与 clear_history 双腿同契约对齐。"""
 
-    seed 链路若静默覆盖会留下 successes∩failed 重叠：下一次派发时状态一致性
-    断言崩溃、配合崩溃恢复形成重启循环。语义定为整体拒绝（零写入）——
-    失败档案记录须先经 delete_failed 显式清除，静默清除会丢失败历史。
-    """
-
-    def test_seed_wall_rejects_uid_already_in_failed(self, dual_backend):
+    def test_apply_manual_status_succeeded_and_failed_and_pending(self, dual_backend):
         b = dual_backend
-        b.append_failed("t::x_marks", {"error_message": "boom"})
+        snap_a = _job_snapshot("a")
+        snap_b = _job_snapshot("b")
+        snap_c = _job_snapshot("c")
 
-        with pytest.raises(ValueError, match="already in failed"):
-            b.seed_successes(["t::x_marks"])
+        # 初始入队 a, b, c
+        b.enqueue_jobs([snap_a, snap_b, snap_c])
+        assert set(_queue_uids(b)) == {"t::a", "t::b", "t::c"}
 
-        # 零写入：拒绝后 successes 不含该 uid，失败档案记录原样保留
-        assert "t::x_marks" not in b.load_successes()
-        assert "t::x_marks" in b.load_failed()
+        # manual succeeded: 从 queue 移除，写入 successes
+        b.apply_manual_status([(
+            "t::a",
+            "succeeded",
+            snap_a,
+            {"annotations": {"completion_source": "manual"}},
+        )])
+        assert "t::a" not in _queue_uids(b)
+        assert "t::a" in b.load_successes()
+        meta_a = b.load_successes()["t::a"]
+        assert meta_a.get("annotations", {}).get("completion_source") == "manual"
 
-    def test_seed_wall_conflict_is_atomic_no_partial_write(self, dual_backend):
-        """冲突批次整体拒绝：batch 内非冲突 uid 亦不得部分写入。"""
+        # manual failed: 从 queue 移除，写入 failed
+        b.apply_manual_status([(
+            "t::b",
+            "failed",
+            snap_b,
+            {"note": "测试失败", "annotations": {"completion_source": "manual"}},
+        )])
+        assert "t::b" not in _queue_uids(b)
+        assert "t::b" in b.load_failed()
+        meta_b = b.load_failed()["t::b"]
+        assert meta_b.get("note") == "测试失败"
+        assert meta_b.get("annotations", {}).get("completion_source") == "manual"
+
+        # manual pending: 从 successes/failed 恢复到 queue
+        b.apply_manual_status([("t::a", "pending", snap_a, None), ("t::b", "pending", snap_b, None)])
+        assert "t::a" not in b.load_successes()
+        assert "t::b" not in b.load_failed()
+        assert set(_queue_uids(b)) == {"t::a", "t::b", "t::c"}
+
+    def test_clear_history_parity(self, dual_backend):
         b = dual_backend
-        b.append_failed("t::bad_entry", {"error_message": "boom"})
+        snap = _job_snapshot("hist")
+        # 成功
+        b.apply_manual_status([("t::hist", "succeeded", snap, None)])
+        assert "t::hist" in b.load_successes()
+        # 清除 successes
+        deleted = b.clear_history("t::hist", records=["successes"])
+        assert deleted == 1
+        assert "t::hist" not in b.load_successes()
 
-        with pytest.raises(ValueError, match="already in failed"):
-            b.seed_successes(["t::ok_entry", "t::bad_entry", "t::ok_next"])
+        # 写入 failed
+        b.apply_manual_status([("t::hist", "failed", snap, None)])
+        assert "t::hist" in b.load_failed()
+        deleted = b.clear_history("t::hist", records=["failures"])
+        assert deleted == 1
+        assert "t::hist" not in b.load_failed()
 
-        assert set(b.load_successes()) == set()
-        assert "t::bad_entry" in b.load_failed()
-
-    def test_seed_wall_fresh_uid_idempotent(self, dual_backend):
-        """正常 seed（无 failed 冲突）行为不变：幂等覆盖写入。"""
-        b = dual_backend
-        assert b.seed_successes(["t::fresh_one", "t::fresh_two"]) == 2
-        assert set(b.load_successes()) == {"t::fresh_one", "t::fresh_two"}
-        # 幂等：重复 seed 仍成功（meta 重置为空）
-        assert b.seed_successes(["t::fresh_one"]) == 1
-        assert b.load_successes()["t::fresh_one"] == {}
+        # 空 records 或不存在
+        assert b.clear_history("t::hist", records=["successes", "failures"]) == 0
 
 
 class TestSetCursorParity:

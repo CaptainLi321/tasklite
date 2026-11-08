@@ -315,14 +315,15 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def seed_successes(self, job_uids: list[str]) -> int:
-        """把 uid 批量写入 successes（meta 为空 dict）——存档迁移标记「已处理」。
+    def apply_manual_status(
+        self,
+        updates: Sequence[tuple[str, str, dict[str, Any], dict[str, Any] | None]],
+    ) -> None:
+        """批量原子应用人工状态变更 (job_uid, status, snapshot, metadata)。"""
 
-        幂等：已存在的 uid 被覆盖（meta 重置为空）。返回实际写入行数。
-        不变式（successes/failed 全局互斥）：已在 failed 的 uid 拒绝种子——
-        冲突整体拒绝（零写入、抛 ValueError），不静默清除失败档案记录；
-        持久层与管理 API（OpsConsole.seed_successes）两层同契约。
-        """
+    @abstractmethod
+    def clear_history(self, uid: str, records: set[str]) -> int:
+        """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""
 
     @abstractmethod
     def get_cursor(self, key: str) -> str | None:

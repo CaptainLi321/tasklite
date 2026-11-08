@@ -358,25 +358,63 @@ class InMemoryStateBackend(AbstractStateBackend):
                     count += 1
             return count
 
-    def seed_successes(self, job_uids: list[str]) -> int:
-        """把 uid 批量写入 successes（meta 空 dict）。
-
-        不变式：successes/failed 全局互斥——已在 failed 的 uid 拒绝种子；
-        先查后写（同锁内），冲突整体拒绝、零写入，不静默清除失败档案
-        记录（失败历史须先经 delete_failed 显式清除）。
-        """
+    def apply_manual_status(
+        self,
+        updates: Sequence[tuple[str, str, dict[str, Any], dict[str, Any] | None]],
+    ) -> None:
+        """批量原子应用人工状态变更 (job_uid, status, snapshot, metadata)。"""
+        if not updates:
+            return
         with self._lock:
-            conflict = sorted({u for u in job_uids if u in self._failed})
-            if conflict:
-                raise ValueError(
-                    f"seed_successes refuses uid(s) already in failed: {conflict}; "
-                    f"successes/failed must stay disjoint"
-                )
-            count = 0
-            for u in job_uids:
-                self._successes[u] = {}
-                count += 1
-            return count
+            for job_uid, status, snapshot, metadata in updates:
+                snap_copy = copy.deepcopy(snapshot)
+                meta_copy = copy.deepcopy(metadata or {})
+                if status == "pending":
+                    self._successes.pop(job_uid, None)
+                    self._failed.pop(job_uid, None)
+                    self._failure_payloads.pop(job_uid, None)
+                    self._queue = [
+                        j for j in self._queue
+                        if job_uid_from_snapshot(j) != job_uid
+                    ]
+                    self._queue.append(snap_copy)
+                elif status == "succeeded":
+                    self._queue = [
+                        j for j in self._queue
+                        if job_uid_from_snapshot(j) != job_uid
+                    ]
+                    self._failed.pop(job_uid, None)
+                    self._failure_payloads.pop(job_uid, None)
+                    self._successes[job_uid] = meta_copy
+                elif status == "failed":
+                    self._queue = [
+                        j for j in self._queue
+                        if job_uid_from_snapshot(j) != job_uid
+                    ]
+                    self._successes.pop(job_uid, None)
+                    self._failed[job_uid] = meta_copy
+                    self._failure_payloads[job_uid] = snap_copy.get("payload") or {}
+
+    def clear_history(self, uid: str, records: set[str]) -> int:
+        """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""
+        total = 0
+        with self._lock:
+            if "successes" in records and uid in self._successes:
+                del self._successes[uid]
+                total += 1
+            if "failures" in records:
+                if uid in self._failed:
+                    del self._failed[uid]
+                    total += 1
+                self._failure_payloads.pop(uid, None)
+            if "attempts" in records:
+                initial = len(self._attempts)
+                self._attempts = {
+                    k: v for k, v in self._attempts.items()
+                    if getattr(v, "job_uid", None) != uid and (not isinstance(v, dict) or v.get("job_uid") != uid)
+                }
+                total += initial - len(self._attempts)
+        return total
 
     def get_cursor(self, key: str) -> str | None:
         """查询单个游标的最新已提交值，不存在返回 None。"""

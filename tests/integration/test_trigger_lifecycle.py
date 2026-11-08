@@ -151,9 +151,13 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
     first.enqueue(Job("produce", "source"))
     first.enqueue(Job("consume", "result", depends_on=["produce::source"]))
     first.run()
-    first.clear_history("consume::result", where=["successes"])
+    first.clear_history("consume::result", records=["successes"])
     if seed_after_clear:
-        first.seed_successes(["consume::result"])
+        first.set_job_status(
+            Job("consume", "result", depends_on=["produce::source"]),
+            "succeeded",
+            recursive=False,
+        )
     first.stop()
 
     second = _pipeline(tmp_path)

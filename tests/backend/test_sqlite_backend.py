@@ -898,30 +898,14 @@ class TestSqliteAttemptTrajectory:
 class TestSeedWallAndCursor:
     """种子化：successes/failed 互斥 + cursor 入口校验。"""
 
-    def test_seed_wall_writes_empty_meta_idempotently(self, tmp_path):
+    def test_apply_manual_status_and_clear_history(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        assert backend.seed_successes(["t::fresh_one", "t::fresh_two"]) == 2
-        assert backend.load_successes() == {"t::fresh_one": {}, "t::fresh_two": {}}
-        assert backend.seed_successes(["t::fresh_one"]) == 1
-        assert backend.load_successes()["t::fresh_one"] == {}
-
-    def test_seed_wall_rejects_uid_already_in_failed_atomically(self, tmp_path):
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.append_failed("t::bad", {"error_message": "boom"})
-
-        with pytest.raises(ValueError, match="already in failed"):
-            backend.seed_successes(["t::ok_entry", "t::bad", "t::ok_next"])
-
-        # 冲突整体拒绝：零写入，失败档案记录原样保留
-        assert backend.load_successes() == {}
-        assert set(backend.load_failed()) == {"t::bad"}
-
-    def test_seed_wall_after_delete_failed_succeeds(self, tmp_path):
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.append_failed("t::one", {"error_message": "boom"})
-        assert backend.delete_failed(["t::one"]) == 1
-        assert backend.seed_successes(["t::one"]) == 1
-        assert backend.load_successes() == {"t::one": {}}
+        snap = {"job_uid": "t::fresh_one", "task_type": "t", "job_id": "fresh_one", "payload": {}}
+        backend.apply_manual_status([("t::fresh_one", "succeeded", snap, None)])
+        assert "t::fresh_one" in backend.load_successes()
+        deleted = backend.clear_history("t::fresh_one", records=["successes"])
+        assert deleted == 1
+        assert "t::fresh_one" not in backend.load_successes()
 
     def test_set_cursor_valid_roundtrip_upsert_and_delete(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")

@@ -222,7 +222,8 @@ class TestMissingDetection:
         report = tmp_path / "missing.txt"
 
         # 预置已见内容 0..4（known 非空，差集才有误报素材）
-        p.seed_successes([f"child::{i}" for i in range(5)])
+        for i in range(5):
+            p.set_job_status(Job("child", str(i)), "succeeded", recursive=False)
 
         # payload 覆盖为 full：本次完整扫到全部已见内容 → 无删除
         p.enqueue(Job("disc", "seed", payload={

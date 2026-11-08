@@ -118,8 +118,11 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def delete_successes(self, *args, **kwargs):
         return self.inner.delete_successes(*args, **kwargs)
 
-    def seed_successes(self, *args, **kwargs):
-        return self.inner.seed_successes(*args, **kwargs)
+    def apply_manual_status(self, *args, **kwargs):
+        return self.inner.apply_manual_status(*args, **kwargs)
+
+    def clear_history(self, *args, **kwargs):
+        return self.inner.clear_history(*args, **kwargs)
 
     def get_cursor(self, *args, **kwargs):
         return self.inner.get_cursor(*args, **kwargs)
@@ -629,7 +632,7 @@ class TestEnqueue:
         p.register_task("generate", ok_handler)
         p.register_task("process", ok_handler)
         # 即使存在历史成功产物，提交时仍保留引用配置而不绑定历史路径
-        p.backend.seed_successes(["generate::001"])
+        p.set_job_status(Job("generate", "001"), "succeeded", recursive=False)
         p.backend._successes["generate::001"]["artifacts"] = {
             "report": {"path": str(tmp_path / "old_report.csv")}
         }
@@ -752,7 +755,7 @@ class TestEnqueue:
 
     def test_wall_hit_not_blocked_at_enqueue(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.seed_successes(["fetch::done"])
+        p.set_job_status(Job("fetch", "done"), "succeeded", recursive=False)
         assert p.enqueue(Job("fetch", "done")) is True
         assert len(p.backend.load_queue()) == 1
 
@@ -780,7 +783,8 @@ class TestFilterJobsWithoutSuccess:
 
     def test_wall_hits_filtered_order_preserved(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.seed_successes(["fetch::done1", "fetch::done2"])
+        p.set_job_status(Job("fetch", "done1"), "succeeded", recursive=False)
+        p.set_job_status(Job("fetch", "done2"), "succeeded", recursive=False)
         jobs = [
             Job("fetch", "new"),
             Job("fetch", "done1"),
@@ -804,7 +808,7 @@ class TestFilterJobsWithoutSuccess:
 
     def test_enqueue_composition_only_enqueues_jobs_without_success(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.seed_successes(["fetch::done"])
+        p.set_job_status(Job("fetch", "done"), "succeeded", recursive=False)
         for job in p.filter_jobs_without_success([Job("fetch", "done"), Job("fetch", "new")]):
             p.enqueue(job)
         queued = {f"{r['task_type']}::{r['job_id']}" for r in p.backend.load_queue()}
@@ -968,27 +972,20 @@ class TestManageApis:
         assert entries[0].job_uid == "fetch::bad"
         assert entries[0].error_message == "boom"
 
-    def test_clear_failures_removes_non_fatal(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        p.backend.append_failed("fetch::bad", {"error_message": "boom"})
-        p.backend.append_failed("fetch::bug", {"error_message": "x", "is_fatal": True})
-        removed = p.clear_failures()
-        assert removed == 1
-        assert sorted(p.backend.load_failed()) == ["fetch::bug"]
-
-    def test_retry_failure_requeues_job(self, tmp_path):
+    def test_set_job_status_and_requeue(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
-        p.backend.append_failed("fetch::bad", {"error_message": "boom"})
-        assert p.retry_failure(job_uid="fetch::bad") is True
-        assert "fetch::bad" not in p.backend.load_failed()
+        p.set_job_status(Job("fetch", "bad"), "failed", recursive=False)
+        assert len(p.list_failures()) == 1
+        p.set_job_status("fetch::bad", "pending", recursive=False)
+        assert p.list_failures() == []
         (row,) = p.backend.load_queue()
         assert row["job_id"] == "bad"
 
-    def test_retry_failure_unknown_uid_raises(self, tmp_path):
+    def test_set_job_status_unknown_uid_raises(self, tmp_path):
         p = make_pipeline(tmp_path)
-        with pytest.raises(KeyError, match="not in failure archive"):
-            p.retry_failure("fetch::nope")
+        with pytest.raises(KeyError, match="No existing snapshot found"):
+            p.set_job_status("fetch::nope", "pending", recursive=False)
 
     def test_list_suspensions_empty_on_fresh_state(self, tmp_path):
         assert make_pipeline(tmp_path).list_suspensions() == []
@@ -1003,22 +1000,23 @@ class TestManageApis:
         assert p.get_cursor("page") is None
         assert p.backend.load_cursors() == {}
 
-    def test_clear_history_removes_from_both(self, tmp_path):
+    def test_clear_history_removes_from_selected_records(self, tmp_path):
         p = make_pipeline(tmp_path)
-        p.seed_successes(["fetch::ok"])
-        p.backend.append_failed("fetch::bad", {"error_message": "x", "is_fatal": False})
-        removed = p.clear_history(["fetch::"])
-        assert removed == 2
+        p.set_job_status(Job("fetch", "ok"), "succeeded", recursive=False)
+        p.set_job_status(Job("fetch", "bad"), "failed", recursive=False)
+        removed_succ = p.clear_history("fetch::ok", records=["successes"])
+        assert removed_succ == 1
         assert p.backend.load_successes() == {}
+        removed_fail = p.clear_history("fetch::bad", records=["failures"])
+        assert removed_fail == 1
         assert p.backend.load_failed() == {}
 
     def test_run_guards_across_manage_apis(self, tmp_path):
         guarded = [
             ("list_suspensions", lambda p: p.list_suspensions()),
             ("list_failures", lambda p: p.list_failures()),
-            ("clear_failures", lambda p: p.clear_failures()),
-            ("clear_history", lambda p: p.clear_history("fetch::")),
-            ("seed_successes", lambda p: p.seed_successes(["fetch::a"])),
+            ("set_job_status", lambda p: p.set_job_status(Job("fetch", "a"), "pending", recursive=False)),
+            ("clear_history", lambda p: p.clear_history("fetch::a", records=["successes"])),
             ("get_cursor", lambda p: p.get_cursor("k")),
             ("set_cursor", lambda p: p.set_cursor("k", "v")),
         ]

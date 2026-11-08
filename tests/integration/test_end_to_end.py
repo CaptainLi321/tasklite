@@ -3,13 +3,12 @@
 覆盖六步契约的运行段全链路：spawn 子进程执行 → IPC 结果落盘 → successes
 终态（业务 meta + run_count/inputs 审计键）→ attempts 轨迹（append-only
 追溯链：activation/attempt 序号、execution_id、outcome 流转）→ 失败
-档案 → retry_failure 人工补跑 → run/stop 门面收尾。handler 全部模块级
+档案 → set_job_status 人工重置 → run/stop 门面收尾。handler 全部模块级
 （spawn 子进程经 pickle 接收）。
 
-激活代双通道对照：拦截点豁免放行（every_run）推进 activation_no+1
-并重置 attempt_no=1；失败档案人工补跑（retry_failure）同为 failed
-拦截点放行——按 attempts 轨迹最大激活代 +1 重建、attempt_no=1。两
-通道均不得与既有激活在 (activation_no, attempt_no) 逻辑键上撞号。
+激活代推进：拦截点豁免放行（every_run）推进 activation_no+1
+并重置 attempt_no=1。各通道均不得与既有激活在 (activation_no, attempt_no)
+逻辑键上撞号。
 
 故障场景补充：环境崩溃（正退出码、无结果文件）耗尽预算、强制中止的
 半成品清理与 at-least-once 回队、看门狗超时击杀、限速资源挂起恢复、
@@ -225,7 +224,7 @@ class TestEndToEnd:
         assert [a.attempt_no for a in attempts] == [1, 2]
         assert [a.activation_no for a in attempts] == [1, 1]
 
-    def test_retry_failure_manual_requeue_runs_to_success(self, tmp_path):
+    def test_manual_requeue_runs_to_success(self, tmp_path):
         p = _make_pipeline(tmp_path)
         p.register_task("work", fail_once_then_ok_handler)
         p.enqueue(
@@ -238,7 +237,7 @@ class TestEndToEnd:
         assert [e.job_uid for e in entries] == ["work::item_eps"]
         assert entries[0].payload == {"k": "v"}
 
-        assert p.retry_failure("work::item_eps") is True
+        p.set_job_status("work::item_eps", "pending", recursive=False)
         assert p.list_failures() == []
 
         res = p.run()

@@ -16,7 +16,7 @@ import logging
 import multiprocessing as mp
 import os
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Collection, Literal, Sequence
 
 from .backend.base import AbstractStateBackend
 from .backend.memory import InMemoryStateBackend
@@ -506,36 +506,31 @@ class TaskLite:
         self._ensure_not_running("list_failures")
         return self._console.list_failures()
 
-    def clear_failures(
+    def set_job_status(
         self,
-        task_types: Sequence[str] | None = None,
+        job_or_uid: Job | str,
+        status: Literal["pending", "succeeded", "failed"],
         *,
-        keep_fatal: bool = True,
-    ) -> int:
-        """从失败档案删除匹配条目。委托 OpsConsole。"""
-        self._ensure_not_running("clear_failures")
-        return self._console.clear_failures(task_types, keep_fatal=keep_fatal)
-
-    def retry_failure(self, job_uid: str) -> bool:
-        """把失败档案中的单个作业移出档案并重新入队（人工补跑）。"""
-        self._ensure_not_running("retry_failure")
-        return self._console.retry_failure(job_uid)
+        recursive: bool,
+        note: str | None = None,
+    ) -> None:
+        """人工设置作业状态（pending/succeeded/failed），限 Run 外。"""
+        self._ensure_not_running("set_job_status")
+        with self._management_lock():
+            self._runtime.store.set_job_status(
+                job_or_uid, status, recursive=recursive, note=note
+            )
 
     def clear_history(
         self,
-        targets: str | Sequence[str],
+        uid: str,
         *,
-        where: Sequence[str] = ("successes", "failed"),
-        predicate: Callable[[str], bool] | None = None,
+        records: Collection[Literal["successes", "failures", "attempts"]],
     ) -> int:
-        """从 successes 和/或失败档案删除条目。委托 OpsConsole。"""
+        """从指定档案和/或 Attempt 历史中删除单个 job 的记录，限 Run 外。"""
         self._ensure_not_running("clear_history")
-        return self._console.clear_history(targets, where=where, predicate=predicate)
-
-    def seed_successes(self, job_uids: Sequence[str]) -> int:
-        """把 uid 批量写入 successes（存档迁移标记「已处理」）。委托 OpsConsole。"""
-        self._ensure_not_running("seed_successes")
-        return self._console.seed_successes(job_uids)
+        with self._management_lock():
+            return self._console.clear_history(uid, records=records)
 
     def get_cursor(self, key: str) -> str | None:
         """读取指定游标键的最新已提交值，限 Run 外。"""

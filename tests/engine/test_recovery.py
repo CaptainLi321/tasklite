@@ -301,7 +301,10 @@ class TestTerminalOverlapConvergence:
 
     def test_overlap_converged_to_failed_in_memory_and_disk(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.seed_successes(["t::x", "t::clean"])
+        backend.apply_manual_status([
+            ("t::x", "succeeded", {"task_type": "t", "job_id": "x"}, None),
+            ("t::clean", "succeeded", {"task_type": "t", "job_id": "clean"}, None),
+        ])
         backend.append_failed("t::x", {"error_message": "boom"})
         successes = backend.load_successes()
         failed = backend.load_failed()
@@ -520,7 +523,10 @@ class TestLoadAndRepair:
     def test_load_and_repair_full_flow(self, tmp_path):
         """四连加载 → 交集收敛 → 队列修复 → 落 store。"""
         backend = InMemoryStateBackend()
-        backend.seed_successes(["t::overlap", "t::done"])
+        backend.apply_manual_status([
+            ("t::overlap", "succeeded", {"task_type": "t", "job_id": "overlap"}, None),
+            ("t::done", "succeeded", {"task_type": "t", "job_id": "done"}, None),
+        ])
         backend.append_failed("t::overlap", {"error_message": "legacy"})
         backend.enqueue_jobs([
             {"task_type": "t", "job_id": "done", "trigger": "once"},  # successes 残留
