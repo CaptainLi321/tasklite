@@ -19,7 +19,7 @@ from tasklite import (
     FailureEntry, SuspendEntry,  # 失败档案与资源挂起条目
     OrderingPolicy, FifoOrderingPolicy,     # 调度排序 seam
     RequeuePolicy, ImmediateRequeuePolicy, RequeuePlan,  # 重入队节奏 seam
-    Selection, Exclude, Skip,    # 候选准入/选择 seam
+    Exclude,                     # 候选排除规则
     CapacityResource, RateLimitResource,    # 资源体系
     encode_identifier, encode_job_component, encode_content_id,  # 单射编码族
 )
@@ -351,16 +351,13 @@ Selection 属调度扩展 seam 的第三类——候选准入/选择（与 `Orde
 `pipeline.selection(*rules)` 是 **pipeline 属性**（不是 `run()` 的参数）：每次调用**整体替换**规则集，0 参数重置为默认全执行，返回 self 支持链式；`run()` / `run_graceful()` 签名不变，`RunSummary` / `ExecutionOptions` 无新增字段，`EMPTY_STATS` 含 `excluded_blocked` 计数（本次 run 中「允许执行但仅因 Exclude 上游而无法完成」的留队作业数）。
 
 ```python
-from tasklite import Exclude, Job, Skip, TaskLite
+from tasklite import Exclude, Job, TaskLite
 
 pipeline = TaskLite(name="research", state_dir="./state")
-pipeline.selection(Exclude(task_type="pdf_to_md"))   # 本次不执行、留队（下次自动恢复）
-pipeline.enqueue([Job("fetch", "a"), Job("pdf_to_md", "p")])
-pipeline.run()                                  # 只执行 fetch，pdf_to_md 留在持久化队列
-
-pipeline.selection(Skip(task_type="ocr"))            # 终态跳过：命中作业与下游永不执行
-pipeline.selection(Exclude("a"), Skip("b"))     # 每次整体替换；同一 task_type Skip 优先
-pipeline.selection()                            # 重置：恢复全执行
+pipeline.enqueue(Job("fetch", "a"))
+pipeline.enqueue(Job("pdf_to_md", "p"))
+pipeline.run(exclude=Exclude(task_type="pdf_to_md"))   # 本次不执行、留队（下次自动恢复）
+pipeline.run()                                        # 恢复全执行：执行留队的 pdf_to_md
 ```
 
 规则是职责单一的值对象：`Exclude(task_type=...)`（延迟）与 `Skip(task_type=...)`（终态）均按 `job.task_type` 精确匹配；`Rule` 协议只要求 `matches_task_type(task_type)`（引擎的调度热路径与终态写入出口都按 `task_type` 判定），`Selection.__init__` 对缺少该入口的规则 **fail-loud 抛 `TypeError`**，不会静默漏判。规则属配置代码：`matches_task_type` 抛异常不被吞，`run()` 以 ERROR 上抛（fail-loud，绝不静默降级为全执行/全排除）。顶层 `tasklite` 导出 `Exclude` / `Selection` / `Skip`，`from tasklite.selection import ...`（模块路径 `tasklite/selection.py`）同样可用。规则只做 `task_type` 格式校验，不校验注册表存在性——选择配置可以先于 `register_task`，也可跨运行窗口复用。

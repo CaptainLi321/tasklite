@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..models.job import Job
+
+if TYPE_CHECKING:
+    from ..selection import Exclude
 
 EMPTY_STATS = {
     "succeeded": 0,
@@ -91,6 +94,7 @@ class ExecutionOptions:
     """execute() 单次运行的动态选项。"""
 
     install_signals: bool = True
+    exclude: Exclude | None = None
 
 
 @dataclass(frozen=True)

@@ -26,13 +26,13 @@ def test_fresh_trigger_skip_allows_dependent_trigger(tmp_path):
     seen = []
     pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
     pipeline.register_task("t", handle, trigger="observe")
-    pipeline.enqueue(Job("t", "b", depends_on=["t::a"]))
     pipeline.enqueue(Job("t", "a"))
+    pipeline.enqueue(Job("t", "b", depends_on=["t::a"]))
     res = pipeline.run()
     assert res is None
-    assert seen == ["t::a", "t::b"]
-    assert pipeline.backend.load_queue() == []
-    assert list(pipeline.list_failures()) == []
+    # 上游被 trigger 跳过移除候选后，下游因缺失终态记录直接失败，不得获得就绪例外
+    assert seen == ["t::a"]
+    assert "t::b" in pipeline.backend.load_failed()
 
 
 def test_task_resource_merge_and_explicit_false_zero_overrides(tmp_path):
@@ -187,36 +187,28 @@ def test_failure_history_skipped_this_batch_allows_downstream(tmp_path):
     pipeline.backend.append_failed("t::a", {"error_message": "prior failure"})
     seen = []
     pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
-    pipeline.enqueue(Job("t", "b", depends_on=["t::a"], trigger="observe"))
     pipeline.enqueue(Job("t", "a", trigger="observe"))
+    pipeline.enqueue(Job("t", "b", depends_on=["t::a"], trigger="observe"))
     pipeline.run()
-    assert seen == ["t::a", "t::b"]
-    assert [entry.job_uid for entry in pipeline.list_failures()] == ["t::a"]
+    # 上游被 trigger 跳过后，按终态档案判定；上游仅有 failure，下游级联失败，不得求值 trigger
+    assert seen == ["t::a"]
+    assert set(pipeline.backend.load_failed().keys()) == {"t::a", "t::b"}
 
 
-def test_trigger_skip_is_local_to_run_and_does_not_replace_selection_skip(tmp_path):
-    from tasklite import Exclude, Skip
+def test_trigger_skip_is_local_to_run(tmp_path):
+    from tasklite import Exclude
     pipeline = TaskLite(name="local-skip", state_dir=tmp_path, backend="memory")
     seen = []
     pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
     pipeline.register_task("parent", handle, trigger="observe")
     pipeline.register_task("child", handle, trigger="observe")
-    pipeline.selection(Exclude("child"))
     pipeline.enqueue(Job("parent", "a"))
     pipeline.enqueue(Job("child", "b", depends_on=["parent::a"]))
-    pipeline.run()
+    pipeline.run(exclude=Exclude(task_type="child"))
     assert seen == ["parent::a"]
-    pipeline.selection()
     pipeline.run()
     assert seen == ["parent::a"]
     assert [entry.job_uid for entry in pipeline.list_failures()] == ["child::b"]
-    pipeline.selection(Skip("parent"))
-    pipeline.enqueue(Job("parent", "c"))
-    pipeline.enqueue(Job("child", "d", depends_on=["parent::c"]))
-    res = pipeline.run()
-    assert res is None
-    assert pipeline.backend.load_queue() == []
-    assert seen == ["parent::a"]
 
 
 def test_stop_after_trigger_skip_does_not_persist_dependency_readiness(tmp_path):
@@ -228,27 +220,19 @@ def test_stop_after_trigger_skip_does_not_persist_dependency_readiness(tmp_path)
     pipeline.register_trigger("stop", stop_and_skip)
     pipeline.register_task("t", handle)
     pipeline.register_task("child", handle)
-    pipeline.selection(Exclude("child"))
     pipeline.enqueue(Job("t", "a", trigger="stop"))
     pipeline.enqueue(Job("child", "b", depends_on=["t::a"]))
-    pipeline.run()
+    pipeline.run(exclude=Exclude(task_type="child"))
     assert [row["job_id"] for row in pipeline.backend.load_queue()] == ["b"]
-    pipeline.selection()
     pipeline.run()
     assert [entry.job_uid for entry in pipeline.list_failures()] == ["child::b"]
 
 
-def test_same_uid_reintake_clears_trigger_skip_readiness():
+def test_trigger_skip_does_not_grant_dependency_readiness():
     from tasklite.models.state import PipelineState
     state = PipelineState({}, {}, {}, [])
     state.mark_trigger_skipped("t::a")
-    assert state.dependency_ready("t::a")
-    for intake in (state.spawn_jobs, state.requeue_jobs, state.replace_queue):
-        intake([Job("t", "a").to_dict()])
-        assert not state.dependency_ready("t::a")
-        state.pop_job(0)
-        assert not state.dependency_ready("t::a")
-        state.mark_trigger_skipped("t::a")
+    assert not state.dependency_ready("t::a")
 
 
 def test_retry_uses_same_activation_without_rechecking_trigger(tmp_path, monkeypatch):

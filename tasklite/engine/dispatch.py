@@ -455,6 +455,12 @@ class DispatchMachine:
                     attempt_no=attempt_no,
                     run_id=self._session.run_id or "run",
                     started_at=started_at,
+                    known_job_uids=frozenset(
+                        store.state.queue_uids
+                        | store.state.in_flight_uids
+                        | store.state.success_uids
+                        | store.state.failed_uids
+                    ),
                 )
                 # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
                 self._in_flight.track(entry, state=store.state)
@@ -482,6 +488,12 @@ class DispatchMachine:
             resource_names=frozenset(self._resources),
             protected_roots=self._protected_roots,
             base_dir=self._trigger_registry.base_dir,
+            known_job_uids=frozenset(
+                state.queue_uids
+                | state.in_flight_uids
+                | state.success_uids
+                | state.failed_uids
+            ),
             artifact_descriptions={
                 uid: state.successes[uid].get("artifacts", {})
                 for uid in job.depends_on if uid in state.success_uids

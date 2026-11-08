@@ -31,7 +31,7 @@ from .selection import SelectionStandstill
 
 logger = logging.getLogger("tasklite")
 
-DEP_GRACE_SECONDS = 60.0
+DEP_GRACE_SECONDS: float = 3.0
 DEADLOCK_GAP_MAX_ROUNDS = 5
 
 
@@ -103,151 +103,19 @@ class DeadlockDecision:
 
 @dataclass
 class DeadlockGovernor:
-    """统一死锁归因、依赖宽限与缺口升级治理深模块。
-
-    不变式（宽限窗语义）：宽限 episode 以缺失集快照为身份；episode 的
-    终结点有且仅有四个——超时裁决、无 spawner 裁决、派发前进信号、
-    超过一个宽限窗的残留检测。任何残留 deadline 泄漏进后续 episode
-    都会把同缺失集的新等待者零宽限误判死锁。
-    """
+    """统一死锁归因与缺口升级治理深模块。"""
 
     dependency_grace_seconds: float = DEP_GRACE_SECONDS
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
-    dep_grace_deadline: float | None = None
-    dep_grace_missing: frozenset[str] | None = None
     deadlock_gap_rounds: int = 0
 
     def reset(self) -> None:
         """重置跨轮治理状态。"""
-        self.dep_grace_deadline = None
-        self.dep_grace_missing = None
         self.deadlock_gap_rounds = 0
-
-    def _end_grace_episode(self) -> None:
-        """终结当前宽限 episode（截止时刻与缺失集快照一并清除）。
-
-        不变式：过期/残留 deadline 严禁泄漏进后续 episode——否则同缺失依赖
-        （同 uid 集合，如重试原样重入队）的新等待者继承过期 deadline
-        被零宽限立即误判死锁进失败档案，即使面对全新 spawner 也无等待机会。
-        """
-        self.dep_grace_deadline = None
-        self.dep_grace_missing = None
 
     def record_dispatch_progress(self) -> None:
-        """派发前进信号终结当前宽限 episode（消解侧唯一终结点）。
-
-        不变式：任何成功派发都证明此前的等待者已消解，残留 deadline 严禁
-        泄漏进同缺失集合的后续 episode——复发落在 (deadline, deadline+宽限窗]
-        内时时间启发式无法区分残留与活跃 episode，零宽限批量误杀只能靠
-        消解侧终结点消除。缺口升级计数同理随前进清零（缺口升级只统计
-        连续轮次，见 check_gap_or_escalate）。
-        """
-        if self.dep_grace_deadline is not None:
-            self._end_grace_episode()
+        """派发前进信号重置缺口计数。"""
         self.deadlock_gap_rounds = 0
-
-    def _grant_or_expire(
-        self,
-        missing_uids: set[str],
-        now_mono: float,
-        effective_grace: float,
-    ) -> bool:
-        """授予新宽限或裁决当前宽限已过期（授予/过期的唯一裁决点）。
-
-        返回 True 表示宽限中（主循环应继续等待）；False 表示宽限已超时
-        并已终结 episode。
-        """
-        deadline = self.dep_grace_deadline
-        if deadline is None:
-            deadline = now_mono + effective_grace
-            self.dep_grace_deadline = deadline
-            logger.warning(
-                f"DEPENDENCY GRACE: {len(missing_uids)} job(s) waiting "
-                f"on missing deps; granting {effective_grace}s "
-                f"grace (runnable job(s) may spawn them)."
-            )
-        if now_mono < deadline:
-            return True
-        self._end_grace_episode()
-        logger.error(
-            f"DEPENDENCY GRACE EXPIRED: {len(missing_uids)} job(s) "
-            f"still waiting on missing deps after "
-            f"{effective_grace}s; treating as deadlock (failure archive)."
-        )
-        return False
-
-    def check_dependency_grace(
-        self,
-        state: PipelineState,
-        missing_identifiers: Sequence[int | str] | set[str],
-        *,
-        has_potential_spawners: bool | None = None,
-        scheduler: ScanCache | None = None,
-        now: float | None = None,
-        grace_seconds: float | None = None,
-    ) -> bool:
-        """评估缺失依赖的作业是否应授予宽限期（等待潜在 spawner 产出而非立即进失败档案）。
-
-        返回 True 表示正在宽限中（主循环应继续等待）；False 表示无候选或宽限已超时。
-        （纯逻辑计算，不产生 sleep 副作用）。
-        """
-        missing_uids: set[str] = set()
-        for item in missing_identifiers:
-            if isinstance(item, str):
-                missing_uids.add(item)
-            elif isinstance(item, int) and 0 <= item < len(state.queue):
-                try:
-                    missing_uids.add(job_uid_from_snapshot(state.queue[item]))
-                except (KeyError, TypeError, ValueError):
-                    pass
-
-        if not missing_uids:
-            return False
-
-        effective_grace = (
-            float(grace_seconds) if grace_seconds is not None else self.dependency_grace_seconds
-        )
-
-        # 若缺失 UID 集合发生变化，重置宽限截止时间（新 episode）
-        if self.dep_grace_missing is not None and self.dep_grace_missing != missing_uids:
-            self.dep_grace_deadline = None
-        self.dep_grace_missing = frozenset(missing_uids)
-
-        now_mono = time.monotonic() if now is None else now
-
-        # 不变式：存活 deadline 一旦过期超过一个完整宽限窗，必为轮询中断后
-        # 的残留（等待者已消解、仲裁停摆，episode 无裁决出口终结）——严禁
-        # 复用，按新 episode 重新计账，防同 uid 集合复发时零宽限批量误杀。
-        if (
-            self.dep_grace_deadline is not None
-            and now_mono - self.dep_grace_deadline > effective_grace
-        ):
-            self._end_grace_episode()
-
-        # 若调度器已单趟给出潜在 spawner 裁决，直接复用事实
-        # （避免二次扫描队列及重复反序列化）
-        if has_potential_spawners is not None:
-            if not has_potential_spawners:
-                self._end_grace_episode()
-                return False
-            return self._grant_or_expire(missing_uids, now_mono, effective_grace)
-
-        # 回退路径：检查队列中是否存在「全部已知依赖已在 successes 中」的潜在可运行作业
-        for jd in state.queue:
-            uid = job_uid_from_snapshot(jd)
-            if uid in missing_uids:
-                continue
-            try:
-                job: JobFacts | Job
-                if scheduler is not None:
-                    job = scheduler.cached_job(jd)
-                else:
-                    job = Job.from_dict(jd)
-            except (KeyError, TypeError, ValueError, TaskLiteError):
-                continue
-            if all(state.dependency_ready(dep) for dep in job.depends_on):
-                return self._grant_or_expire(missing_uids, now_mono, effective_grace)
-        return False
 
     def check_gap_or_escalate(
         self,
@@ -431,21 +299,6 @@ class DeadlockGovernor:
                 list(effective_state.queue), unknown_uids, ERR_RESOURCE_DEADLOCK
             )
         elif missing_uids:
-            has_spawners = facts.has_potential_spawners
-            if self.check_dependency_grace(
-                effective_state,
-                missing_uids,
-                has_potential_spawners=has_spawners,
-                scheduler=scheduler,
-                grace_seconds=effective_grace,
-            ):
-                # 可归因的宽限等待（非缺口结论）终结上一缺口 episode
-                self.deadlock_gap_rounds = 0
-                return DeadlockDecision(
-                    action="grace_waiting",
-                    should_terminate=False,
-                    wait_time=0.5,
-                )
             logger.error(f"Deadlock: {len(missing_uids)} job(s) have unresolvable (missing) dependencies.")
             uids_metas = self._split_deadlock_by_uids(
                 list(effective_state.queue), missing_uids, ERR_DEPENDENCY_DEADLOCK

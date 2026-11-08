@@ -1,7 +1,11 @@
-"""执行选择（Selection）：Exclude 延迟留队与 Skip 终态跳过的语义锁定。
+"""执行选择（Exclude）与依赖闭合契约测试。
 
-run 路径用确定性 fake 进程驱动（start() 直接写 IPC 结果文件，与真实子进程
-共享同一收割代码路径），不启动真实子进程、不触网。
+验证范围：
+1. 单条 Exclude 精确匹配、留队、下游留队与下次 run 恢复；
+2. 依赖闭合：外部 enqueue 拒绝缺失依赖、spawn 顺序依赖合法性校验；
+3. 历史成功被活跃排除上游遮蔽、上游仅失败被 trigger 移除后下游级联失败；
+4. 拓扑环检测（含同 UID 重用成环）；
+5. 内部临时排除入口（供授权拒绝等复用）。
 """
 from __future__ import annotations
 
@@ -11,19 +15,19 @@ import threading
 
 import pytest
 
-from tasklite import Exclude, Job, Selection, Skip, TaskLite
-from tasklite.engine.errorclass import ERR_MALFORMED_JOB
+from tasklite import Exclude, Job, TaskLite
 from tasklite.engine.errorclass import (
     ERR_DEPENDENCY_DEADLOCK,
-    ERR_DEPENDENCY_SKIPPED,
-    ERR_SKIPPED,
+    ERR_MALFORMED_JOB,
 )
 from tasklite.engine.resource import Resource
 from tasklite.engine.scheduler import JobScheduler
+from tasklite.engine.selection import SelectionMachine, SelectionStandstill
+from tasklite.engine.store import StateStore
+from tasklite.exceptions import TaskLiteError
+from tasklite.models.context import JobContext
 from tasklite.models.result import TaskResult
-from tasklite.models.state import PipelineState
-from tasklite.testing import running
-from tasklite.utils.ipc import ArtifactJournal
+from tasklite.models.state import DependencyStatus, PipelineState
 
 
 def ok_handler(job, ctx):
@@ -113,33 +117,19 @@ def _queued(pipeline: TaskLite) -> list[str]:
     return _uids(pipeline.backend.load_queue())
 
 
-def _attempt_errors(pipeline: TaskLite, uid: str) -> list[str]:
-    return [attempt.error_message or "" for attempt in pipeline.backend.load_attempts(uid)]
-
-
 # ── 默认全执行 / Exclude 延迟语义 ─────────────────────────────────────
 
 
-def test_default_and_empty_rule_selection_execute_everything(fake_process, tmp_path):
-    def run(reset: bool):
-        pipeline = _pipeline(tmp_path / ("reset" if reset else "default"))
-        pipeline.register_task("fetch", ok_handler)
-        pipeline.register_task("convert", ok_handler)
-        pipeline.enqueue(Job("fetch", "a"))
-        pipeline.enqueue(Job("convert", "b"))
-        if reset:
-            pipeline.selection()  # 0 参数 = 重置为默认全执行
-        res = pipeline.run()
-        assert res is None
-        return (
-            sorted(pipeline.backend.load_successes()),
-            _queued(pipeline),
-        )
+def test_default_and_none_exclude_execute_everything(fake_process, tmp_path):
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task("fetch", ok_handler)
+    pipeline.register_task("convert", ok_handler)
+    pipeline.enqueue(Job("fetch", "a"))
+    pipeline.enqueue(Job("convert", "b"))
 
-    default = run(False)
-    assert default[0] == ["convert::b", "fetch::a"]
-    assert default[1] == []
-    assert run(True) == default  # 空规则与扩展前逐字节等价
+    pipeline.run(exclude=None)
+    assert sorted(pipeline.backend.load_successes()) == ["convert::b", "fetch::a"]
+    assert _queued(pipeline) == []
 
 
 def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
@@ -155,25 +145,20 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     pipeline.enqueue(Job("convert", "b"))
     pipeline.enqueue(Job("rank", "r", depends_on=["convert::b"]))
     before = {uid: row for uid, row in zip(_queued(pipeline), pipeline.backend.load_queue())}
-    pipeline.selection(Exclude(task_type="convert"))
 
-    res = pipeline.run()
-    assert res is None
+    pipeline.run(exclude=Exclude(task_type="convert"))
 
     assert sorted(pipeline.backend.load_successes()) == ["fetch::a"]
     assert pipeline.backend.load_failed() == {} and pipeline.list_failures() == []
     assert _queued(pipeline) == ["convert::b", "rank::r"]
-    # 留队行原样保留：不写 attempts、不动实例位/预算位。
     kept = {uid: row for uid, row in zip(_queued(pipeline), pipeline.backend.load_queue())}
     assert kept == {uid: before[uid] for uid in ("convert::b", "rank::r")}
     attempts = pipeline.backend.load_attempts
     assert [attempts("convert::b"), attempts("rank::r")] == [[], []]
     assert seen == ["fetch::a"]
 
-    # 下一次 run（去掉 Exclude）自动恢复：留队下游全链执行完成。
-    pipeline.selection()
-    second = pipeline.run()
-    assert second is None
+    # 下一次 run（不带 Exclude）自动恢复：留队下游全链执行完成
+    pipeline.run()
     assert sorted(pipeline.backend.load_successes()) == [
         "convert::b",
         "fetch::a",
@@ -187,72 +172,42 @@ def test_only_excluded_jobs_finish_completed_without_failures(fake_process, tmp_
     pipeline.register_task("convert", ok_handler)
     for job_id in ("a", "b", "c"):
         pipeline.enqueue(Job("convert", job_id))
-    pipeline.selection(Exclude(task_type="convert"))
 
-    res = pipeline.run()
-    assert res is None
+    pipeline.run(exclude=Exclude(task_type="convert"))
 
     assert pipeline.backend.load_successes() == {}
     assert pipeline.backend.load_failed() == {}
     assert sorted(_queued(pipeline)) == ["convert::a", "convert::b", "convert::c"]
-    # 再次 run 仍为正常完成（不空转、不判死锁、不写失败档案）。
     assert pipeline.run() is None
-    assert pipeline.backend.load_failed() == {}
+    assert sorted(pipeline.backend.load_successes()) == [
+        "convert::a",
+        "convert::b",
+        "convert::c",
+    ]
 
 
-def test_selection_chains_replaces_and_persists_across_runs(fake_process, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("fetch", ok_handler)
-    pipeline.register_task("convert", ok_handler)
-    pipeline.enqueue(Job("fetch", "a"))
-    pipeline.enqueue(Job("convert", "b"))
-    # 链式调用 + 每次整体替换：最终只剩 convert 规则，fetch 恢复可执行。
-    assert pipeline.selection(Exclude(task_type="fetch")) is pipeline
-    assert pipeline.selection(Exclude(task_type="convert")) is pipeline
+def test_exclude_validation_and_rejection_of_multiple_rules(tmp_path):
+    # Exclude 必须使用关键字参数
+    with pytest.raises(TypeError):
+        Exclude("convert")  # type: ignore[misc]
 
-    pipeline.run()
-    assert len(pipeline.backend.load_successes()) == 1
-    second = pipeline.run()  # 规则是 pipeline 属性：下一次 run 仍生效
-    assert second is None
-    assert len(pipeline.backend.load_successes()) == 1
-    assert _queued(pipeline) == ["convert::b"]
-
-    pipeline.selection()  # 重置后下一次 run 消费留队作业
-    third = pipeline.run()
-    assert third is None
-    assert sorted(pipeline.backend.load_successes()) == ["convert::b", "fetch::a"]
-    assert _queued(pipeline) == []
-
-
-def test_selection_call_during_run_raises(tmp_path):
-    pipeline = _pipeline(tmp_path)
-    with running(pipeline):
-        with pytest.raises(RuntimeError, match="selection"):
-            pipeline.selection(Exclude(task_type="fetch"))
-        with pytest.raises(RuntimeError, match="selection"):  # 引擎注入点双保险
-            pipeline._runtime.set_selection(None)
-
-
-def test_exclude_validation_and_unknown_task_type(fake_process, tmp_path):
-    from tasklite import TaskLiteError
     with pytest.raises(TaskLiteError):
         Exclude(task_type=123)  # type: ignore[arg-type]
     with pytest.raises(TaskLiteError):
         Exclude(task_type="")
-    assert Exclude(task_type="a::b").task_type == "a::b"
-    with pytest.raises(TaskLiteError):
-        Skip(task_type=123)  # type: ignore[arg-type]
-    assert Skip(task_type="a::b").task_type == "a::b"
-    with pytest.raises(TypeError):
-        Selection([object()])
 
-    # 格式合法但未注册的 task_type：不报错、无效果（规则可先于注册表配置）。
+    ex = Exclude(task_type="convert")
+    assert ex.task_type == "convert"
+    assert ex.matches_task_type("convert") is True
+    assert ex.matches_task_type("fetch") is False
+
     pipeline = _pipeline(tmp_path)
-    pipeline.selection(Exclude(task_type="never_registered"))
-    pipeline.register_task("fetch", ok_handler)
-    pipeline.enqueue(Job("fetch", "a"))
-    assert pipeline.run() is None
-    assert len(pipeline.backend.load_successes()) == 1
+    # 拒绝列表或多规则
+    with pytest.raises(TypeError, match="exclude must be an Exclude instance or None"):
+        pipeline.run(exclude=[Exclude(task_type="a")])  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="exclude must be an Exclude instance or None"):
+        pipeline.run(exclude="convert")  # type: ignore[arg-type]
 
 
 def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
@@ -263,58 +218,61 @@ def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
     pipeline.register_task("light", ok_handler)
     pipeline.enqueue(Job("heavy", "h"))
     pipeline.enqueue(Job("light", "l"))
-    pipeline.selection(Exclude(task_type="heavy"))
 
-    res = pipeline.run()
-    assert res is None
+    pipeline.run(exclude=Exclude(task_type="heavy"))
 
     assert len(pipeline.backend.load_successes()) == 1
     assert gpu.acquires == 0 and gpu.used == 0.0
     assert _queued(pipeline) == ["heavy::h"]
 
 
-# ── Exclude 停摆的拓扑剥离 ─────────────────────────────────────────
+# ── Exclude 停摆与真实死锁剥离 ─────────────────────────────────────
 
 
 def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
-    """允许作业 b<->c 的环即便挂在 Exclude 下游，也必须按死锁归因熔断。"""
+    """允许作业 b<->c 的环挂在 Exclude 下游，必须按死锁归因熔断，不被 Exclude 掩盖。"""
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(Job("excluded_t", "a"))
-    pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a", "rank::c"]))
-    pipeline.enqueue(Job("rank", "c", depends_on=["rank::b"]))
-    pipeline.selection(Exclude(task_type="excluded_t"))
 
-    res = pipeline.run()
-    assert res is None
+    # 先 enqueue a
+    pipeline.enqueue(Job("excluded_t", "a"))
+    # 构造成环：先入队 b 依赖 a，然后入队 c 依赖 b
+    pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a"]))
+    pipeline.enqueue(Job("rank", "c", depends_on=["rank::b"]))
+
+    # 手动让 b 依赖 c 构造成环（模拟同 UID 重用或已存在环）
+    queue = pipeline.backend.load_queue()
+    for row in queue:
+        if row["task_type"] == "rank" and row["job_id"] == "b":
+            row["depends_on"] = ["excluded_t::a", "rank::c"]
+    pipeline.backend.save_queue(queue)
+
+    pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
     failed = pipeline.backend.load_failed()
     assert sorted(failed) == ["rank::b", "rank::c"]
     assert all(ERR_DEPENDENCY_DEADLOCK in meta["error_message"] for meta in failed.values())
-    assert len(failed) == 2
-    # 被排除作业不被环归因波及，原样留队。
+    # 被排除作业不被环归因波及，原样留队
     assert _queued(pipeline) == ["excluded_t::a"]
 
-    # 下一次 run 去掉 Exclude：t 自行执行，已熔断的环成员保持失败档案终态。
-    pipeline.selection()
-    second = pipeline.run()
-    assert second is None
-    assert len(pipeline.backend.load_successes()) == 1
-    assert "excluded_t::a" in pipeline.backend.load_successes()
-    assert sorted(pipeline.backend.load_failed()) == ["rank::b", "rank::c"]
 
-
-def test_exclude_downstream_self_loop_is_failed(fake_process, tmp_path):
+def test_exclude_downstream_purged_dependency_is_failed(fake_process, tmp_path):
+    """下游依赖如果在入队后被人为清除（缺失依赖），下游立即熔断为死锁，排除作业原样留队。"""
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(Job("excluded_t", "a"))
-    pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a", "rank::b"]))
-    pipeline.selection(Exclude(task_type="excluded_t"))
+    pipeline.register_task("ghost_task", ok_handler)
 
-    res = pipeline.run()
-    assert res is None
+    pipeline.enqueue(Job("ghost_task", "x"))
+    pipeline.enqueue(Job("excluded_t", "a"))
+    pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a", "ghost_task::x"]))
+
+    # 模拟 ghost_task::x 被人工从队列及存储中彻底清除
+    queue = [row for row in pipeline.backend.load_queue() if row["task_type"] != "ghost_task"]
+    pipeline.backend.save_queue(queue)
+
+    pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
     failed = pipeline.backend.load_failed()
     assert list(failed) == ["rank::b"]
@@ -322,36 +280,19 @@ def test_exclude_downstream_self_loop_is_failed(fake_process, tmp_path):
     assert _queued(pipeline) == ["excluded_t::a"]
 
 
-def test_exclude_downstream_ghost_dependency_is_failed(fake_process, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("excluded_t", ok_handler)
-    pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(Job("excluded_t", "a"))
-    pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a", "ghost::x"]))
-    pipeline.selection(Exclude(task_type="excluded_t"))
-
-    res = pipeline.run()
-    assert res is None
-
-    failed = pipeline.backend.load_failed()
-    assert list(failed) == ["rank::b"]
-    assert "DEPENDENCY_DEADLOCK" in failed["rank::b"]["error_message"]
-    assert _queued(pipeline) == ["excluded_t::a"]
-
-
 def test_exclude_downstream_blocks_completes_without_busy_spin(fake_process, tmp_path):
-    """仅剩「排除 + 仅被其阻塞」时立即正常收尾，不得 0.5s 无限忙旋。"""
+    """仅剩「排除 + 仅被其阻塞」时立即正常收尾，不得忙旋。"""
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
     pipeline.enqueue(Job("excluded_t", "a"))
     pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a"]))
     pipeline.enqueue(Job("rank", "c", depends_on=["rank::b"]))
-    pipeline.selection(Exclude(task_type="excluded_t"))
+
     outcome: dict = {}
 
     def run_pipeline():
-        outcome["res"] = pipeline.run(install_signals=False)
+        outcome["res"] = pipeline.run(exclude=Exclude(task_type="excluded_t"), install_signals=False)
 
     worker = threading.Thread(target=run_pipeline, daemon=True)
     worker.start()
@@ -363,67 +304,24 @@ def test_exclude_downstream_blocks_completes_without_busy_spin(fake_process, tmp
     assert _queued(pipeline) == ["excluded_t::a", "rank::b", "rank::c"]
 
 
-def test_governor_cycles_do_not_archive_excluded_jobs(fake_process, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(Job("excluded_t", "a", depends_on=["excluded_t::a"]))
-    pipeline.enqueue(Job("rank", "c", depends_on=["rank::d"]))
-    pipeline.enqueue(Job("rank", "d", depends_on=["rank::c"]))
-    pipeline.selection(Exclude(task_type="excluded_t"))
-
-    res = pipeline.run()
-    assert res is None
-
-    # 允许作业的依赖环照旧进失败档案；被排除的自环作业留队、不进 failed。
-    assert sorted(pipeline.backend.load_failed()) == ["rank::c", "rank::d"]
-    assert _queued(pipeline) == ["excluded_t::a"]
-    assert len(pipeline.backend.load_failed()) == 2
-
-    # 只剩被排除的自环作业时：选择仲裁直接正常收敛，队列保留。
-    only = _pipeline(tmp_path / "only")
-    only.register_task("excluded_t", ok_handler)
-    only.enqueue(Job("excluded_t", "a", depends_on=["excluded_t::a"]))
-    only.selection(Exclude(task_type="excluded_t"))
-    only_res = only.run()
-    assert only_res is None
-    assert only.backend.load_failed() == {}
-    assert _queued(only) == ["excluded_t::a"]
-
-
-def test_mixed_deadlock_keeps_excluded_and_fails_allowed(fake_process, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.enqueue(Job("excluded_t", "a"))
-    pipeline.enqueue(Job("rank", "unknown", resources={"ghost": 1.0}))
-    pipeline.selection(Exclude(task_type="excluded_t"))
-
-    res = pipeline.run()
-    assert res is None
-
-    # 允许作业的未知资源按既有死锁归因进失败档案；被排除作业留队。
-    assert sorted(pipeline.backend.load_failed()) == ["rank::unknown"]
-    assert len(pipeline.backend.load_failed()) == 1
-    assert _queued(pipeline) == ["excluded_t::a"]
-
-
 def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     fake_process, tmp_path
 ):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("rank", ok_handler)
-    pipeline.selection(Exclude(task_type="excluded_t"))
-    # 畸形行（缺 job_id）带被排除 task_type：不得被选择豁免，仍走 MALFORMED_JOB。
+    # 畸形行（缺 job_id）带被排除 task_type：不得被选择豁免，仍走 MALFORMED_JOB
     pipeline.backend.save_queue(
         [{"task_type": "excluded_t"}, Job("rank", "ok").to_dict()]
     )
     outcome: dict = {}
 
     def run_pipeline():
-        outcome["res"] = pipeline.run(install_signals=False)
+        outcome["res"] = pipeline.run(exclude=Exclude(task_type="excluded_t"), install_signals=False)
 
     worker = threading.Thread(target=run_pipeline, daemon=True)
     worker.start()
     worker.join(timeout=20)
-    assert not worker.is_alive(), "selection 下畸形队列行导致 run() 挂死（忙旋）"
+    assert not worker.is_alive()
 
     assert outcome["res"] is None
     assert sorted(pipeline.backend.load_successes()) == ["rank::ok"]
@@ -434,112 +332,7 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     assert pipeline.backend.load_queue() == []
 
 
-# ── Skip 终态跳过与级联 ───────────────────────────────────────────────
-
-
-def test_skip_root_and_downstream_are_terminal_skipped(fake_process, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("fetch", ok_handler)
-    pipeline.register_task("skip_t", ok_handler)
-    pipeline.register_task("mid", ok_handler)
-    pipeline.register_task("leaf", ok_handler)
-    pipeline.enqueue(Job("skip_t", "a"))
-    pipeline.enqueue(Job("mid", "b", depends_on=["skip_t::a"]))
-    pipeline.enqueue(Job("leaf", "c", depends_on=["mid::b"]))
-    pipeline.enqueue(Job("fetch", "f"))
-    pipeline.selection(Skip(task_type="skip_t"))
-
-    res = pipeline.run()
-    assert res is None
-
-    # 跳过是终态：不进 successes、不进失败档案、也不留在 queue。
-    assert sorted(pipeline.backend.load_successes()) == ["fetch::f"]
-    assert pipeline.backend.load_failed() == {}
-    assert _queued(pipeline) == []
-    assert _attempt_errors(pipeline, "skip_t::a")[-1] == ERR_SKIPPED
-    assert _attempt_errors(pipeline, "mid::b")[-1].startswith(ERR_DEPENDENCY_SKIPPED)
-    assert _attempt_errors(pipeline, "leaf::c")[-1].startswith(ERR_DEPENDENCY_SKIPPED)
-    # 下次 run 不会重试（不在队列、不在失败档案）。
-    second = pipeline.run()
-    assert second is None
-    assert pipeline.backend.load_queue() == []
-
-
-def test_skip_cascade_wins_over_deadlock_cycle(fake_process, tmp_path):
-    """Skip 子树内的依赖环按级联跳过归因：Skip 永久语义优先于拓扑死锁。
-
-    判定优先级：Skip 级联阶段先于停摆仲裁执行。b 与 c 即便成环，也因 Skip
-    上游永久不可执行而整链终态跳过；环只在「允许作业」残图中才由 governor
-    归因（对照 test_exclude_downstream_cycle_is_failed_not_masked）。
-    """
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("skip_t", ok_handler)
-    pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(Job("skip_t", "s"))
-    pipeline.enqueue(Job("rank", "b", depends_on=["skip_t::s", "rank::c"]))
-    pipeline.enqueue(Job("rank", "c", depends_on=["rank::b"]))
-    pipeline.selection(Skip(task_type="skip_t"))
-
-    res = pipeline.run()
-    assert res is None
-
-    assert _queued(pipeline) == []
-    assert pipeline.backend.load_failed() == {}
-    assert _attempt_errors(pipeline, "skip_t::s")[-1] == ERR_SKIPPED
-    cycle_errors = (
-        _attempt_errors(pipeline, "rank::b")[-1]
-        + _attempt_errors(pipeline, "rank::c")[-1]
-    )
-    assert cycle_errors.count(ERR_DEPENDENCY_SKIPPED) == 2
-    assert ERR_DEPENDENCY_DEADLOCK not in cycle_errors
-    # 再次 run 无残留、无重试。
-    assert pipeline.run() is None
-
-
-def test_skip_wins_over_exclude_for_upstream_type(fake_process, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("skip_t", ok_handler)
-    pipeline.register_task("excluded_t", ok_handler)
-    pipeline.register_task("rank", ok_handler)
-    pipeline.enqueue(Job("skip_t", "a"))
-    pipeline.enqueue(Job("excluded_t", "b", depends_on=["skip_t::a"]))
-    pipeline.enqueue(Job("rank", "c", depends_on=["excluded_t::b"]))
-    pipeline.selection(Skip(task_type="skip_t"), Exclude(task_type="excluded_t"))
-
-    res = pipeline.run()
-    assert res is None
-
-    # Skip 的终态意图优先：Exclude 命中的下游 b 也永久不可完成，整链跳过。
-    assert _queued(pipeline) == []
-    assert pipeline.backend.load_failed() == {}
-
-
-def test_skip_and_exclude_same_type_skip_wins(fake_process, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("t", ok_handler)
-    pipeline.enqueue(Job("t", "a"))
-    pipeline.selection(Skip(task_type="t"), Exclude(task_type="t"))
-
-    res = pipeline.run()
-    assert res is None
-
-    assert _queued(pipeline) == []
-    assert pipeline.backend.load_successes() == {}
-
-
-def test_skip_only_queue_completes_without_execution(fake_process, tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("skip_t", ok_handler)
-    pipeline.enqueue(Job("skip_t", "a"))
-    pipeline.enqueue(Job("skip_t", "b"))
-    pipeline.selection(Skip(task_type="skip_t"))
-
-    res = pipeline.run()
-    assert res is None
-
-    assert _queued(pipeline) == []
-    assert pipeline.backend.load_successes() == {} and pipeline.backend.load_failed() == {}
-    assert pipeline.run() is None
+# ── 动态派生与排除 ───────────────────────────────────────────────────
 
 
 def test_spawned_excluded_child_stays_queued(monkeypatch, tmp_path):
@@ -548,32 +341,13 @@ def test_spawned_excluded_child_stays_queued(monkeypatch, tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("fetch", ok_handler)
     pipeline.enqueue(Job("fetch", "parent"))
-    pipeline.selection(Exclude(task_type="excluded_t"))
 
-    res = pipeline.run()
-    assert res is None
+    pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
     assert sorted(pipeline.backend.load_successes()) == ["fetch::parent"]
     assert pipeline.backend.load_failed() == {}
     assert _queued(pipeline) == ["excluded_t::child"]
     assert pipeline.backend.load_attempts("excluded_t::child") == []
-
-
-def test_spawned_skip_child_is_terminal_skipped(monkeypatch, tmp_path):
-    spawned = Job("skip_t", "child").to_dict()
-    monkeypatch.setattr(mp, "Process", _fake_process_class(spawn_jobs=[spawned]))
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("fetch", ok_handler)
-    pipeline.register_task("skip_t", ok_handler)
-    pipeline.enqueue(Job("fetch", "parent"))
-    pipeline.selection(Skip(task_type="skip_t"))
-
-    res = pipeline.run()
-    assert res is None
-
-    assert sorted(pipeline.backend.load_successes()) == ["fetch::parent"]
-    assert _queued(pipeline) == []
-    assert _attempt_errors(pipeline, "skip_t::child")[-1] == ERR_SKIPPED
 
 
 def test_failed_parent_cascade_keeps_excluded_downstream(monkeypatch, tmp_path):
@@ -585,253 +359,205 @@ def test_failed_parent_cascade_keeps_excluded_downstream(monkeypatch, tmp_path):
     pipeline.enqueue(Job("fetch", "parent", max_retries_per_run=0))
     pipeline.enqueue(Job("excluded_t", "child", depends_on=["fetch::parent"]))
     pipeline.enqueue(Job("downstream", "grand", depends_on=["excluded_t::child"]))
-    pipeline.selection(Exclude(task_type="excluded_t"))
 
-    res = pipeline.run()
-    assert res is None
+    pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
     assert sorted(pipeline.backend.load_failed()) == ["fetch::parent"]
     assert sorted(_queued(pipeline)) == ["downstream::grand", "excluded_t::child"]
     assert pipeline.backend.load_attempts("excluded_t::child") == []
 
 
-# ── 规则对象与调度器接线 ─────────────────────────────────────────────
+# ── 必须验收项：依赖闭合、遮蔽与 UID 重用成环 ───────────────────────
 
 
-def test_scheduler_skips_selected_before_stall_facts():
-    allowed = Job("rank", "r").to_dict()
-    excluded = Job("pdf_to_md", "p").to_dict()
-    blocked = Job("push", "x", depends_on=["pdf_to_md::p"]).to_dict()
-    state = PipelineState(successes={}, failed={}, cursors={}, queue=[excluded, blocked, allowed])
+def test_external_enqueue_rejects_missing_dependency(tmp_path):
+    """外部 enqueue 只能引用已存在的 Job（队列或终态档案）；不存在当场拒绝。"""
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task("calc", ok_handler)
 
-    scheduler = JobScheduler(resources={})
-    scheduler.selection = Selection([Exclude("pdf_to_md")])
-    result = scheduler.scan_next_runnable(state, frozenset())
-    assert result.is_runnable is True and result.runnable_idx == 2
+    # 引用完全不存在的依赖 -> 拒绝
+    with pytest.raises(TaskLiteError, match="references non-existent dependency"):
+        pipeline.enqueue(Job("calc", "b", depends_on=["calc::non_existent"]))
 
-    only_stalled = PipelineState(successes={}, failed={}, cursors={}, queue=[excluded, blocked])
-    stalled = scheduler.scan_next_runnable(only_stalled, frozenset())
-    assert stalled.kind == "none"
-    assert stalled.attribution.has_deadlock_causes is False
-    assert stalled.has_potential_spawners is False
-    assert stalled.waiting_for_dependency is True
-    assert stalled.min_wait == float("inf")
-    # Skip 命中也由调度器整体跳过（由运行期跳过阶段收敛为终态）。
-    skipped = Job("skip_t", "s").to_dict()
-    scheduler.selection = Selection([Skip("skip_t")])
-    result = scheduler.scan_next_runnable(
-        PipelineState(successes={}, failed={}, cursors={}, queue=[skipped, allowed]),
+    # 依赖存在于队列中时允许引用
+    pipeline.enqueue(Job("calc", "a"))
+    assert pipeline.enqueue(Job("calc", "b", depends_on=["calc::a"])) is True
+
+
+def test_spawn_dependency_order_contract(tmp_path):
+    """父声明 A 后 B 依赖 A 合法，反序不合法；仅引用派发时已知、父及此前声明的 Job。"""
+    parent = Job("gen", "root")
+    ctx = JobContext(
+        parent,
         frozenset(),
+        frozenset(),
+        {},
+        known_job_uids=frozenset({"known::k1"}),
     )
-    assert result.runnable_idx == 1
-    # 默认（无选择）行为与扩展前一致：队首即可运行。
-    assert JobScheduler(resources={}).scan_next_runnable(state, frozenset()).runnable_idx == 0
+
+    # 引用派发时已知 Job 合法
+    child1 = Job("proc", "c1", depends_on=["known::k1"])
+    ctx.spawn(child1)
+
+    # 引用父 Job 合法
+    child2 = Job("proc", "c2", depends_on=[parent.uid])
+    ctx.spawn(child2)
+
+    # 引用此前已声明的 child1 合法
+    child3 = Job("proc", "c3", depends_on=[child1.uid])
+    ctx.spawn(child3)
+
+    # 反序声明：child_bad 引用尚未声明的 child_future -> 当场抛 ValueError
+    child_bad = Job("proc", "c4", depends_on=["proc::c_future"])
+    with pytest.raises(ValueError, match="references non-existent, future, or cross-worker dependency"):
+        ctx.spawn(child_bad)
 
 
-def test_selection_rules_contract_and_precedence():
-    class ByType:
-        def __init__(self, task_type):
-            self.task_type = task_type
+def test_cross_worker_future_spawn_not_valid_dependency(tmp_path):
+    """跨 worker 未来产出不作为依赖证据（不在已知集合中直接拒绝）。"""
+    parent = Job("gen", "root")
+    # worker 派发时，known_job_uids 确定
+    ctx = JobContext(
+        parent,
+        frozenset(),
+        frozenset(),
+        {},
+        known_job_uids=frozenset({"worker1::done"}),
+    )
 
-        def matches_task_type(self, task_type):
-            return task_type == self.task_type
-
-    selection = Selection([ByType("pdf_to_md")])
-    assert selection.is_active is True
-    # 非 Skip 形状的自定义规则归入 Exclude 语义。
-    assert selection.is_excluded("pdf_to_md") is True
-    assert selection.is_skipped("pdf_to_md") is False
-    assert selection.allows_task_type("pdf_to_md") is False
-    assert selection.allows_task_type("rank") is True
-    assert Selection().is_active is False
-    assert Selection().allows_task_type("anything") is True
-
-    precedence = Selection([Skip(task_type="t"), Exclude(task_type="t")])
-    assert precedence.is_skipped("t") is True and precedence.is_excluded("t") is False
-    assert precedence.allows_task_type("t") is False
-    assert precedence.has_skip_rules is True
-
-    with pytest.raises(TypeError, match="matches_task_type"):
-        Selection([object()])
-
-    class RuleWithoutTaskTypeMatcher:
-        def matches_type(self, task_type):
-            return True
-
-    with pytest.raises(TypeError, match="matches_task_type"):
-        Selection([RuleWithoutTaskTypeMatcher()])
+    # 依赖其他 worker 可能在未来产出的 job
+    with pytest.raises(ValueError, match="references non-existent, future, or cross-worker dependency"):
+        ctx.spawn(Job("proc", "sub", depends_on=["worker2::future_child"]))
 
 
-def test_public_surface_exports_selection_rule_types():
-    import tasklite
+def test_upstream_only_failure_skipped_by_trigger_fails_downstream(fake_process, tmp_path):
+    """上游 only failure 被 once 跳过时下游仍失败。"""
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task("upstream", ok_handler)
+    pipeline.register_task("downstream", ok_handler)
 
-    assert {"Exclude", "Selection", "Skip"} <= set(tasklite.__all__)
-    import tasklite.engine.errorclass as ec_mod
-    assert {
-        "ERR_SKIPPED",
-        "ERR_DEPENDENCY_SKIPPED",
-        "ERR_DEPENDENCY_EXCLUDED",
-    } <= set(ec_mod.__all__)
-    # 子模块名不被同名类覆盖：from tasklite.selection import ... 保持可用。
-    assert tasklite.selection.__name__ == "tasklite.selection"
-    assert tasklite.selection.Exclude is Exclude
-    assert tasklite.selection.Selection is Selection
-    assert tasklite.selection.Skip is Skip
+    # 先让 upstream 失败并记录进失败档案
+    pipeline.backend.append_failed("upstream::u", {"error_message": "earlier failure"})
 
-
-def test_run_signatures_unchanged():
-    assert str(inspect.signature(TaskLite.run)) == "(self, *, install_signals: 'bool' = True) -> 'None'"
-    assert not hasattr(TaskLite, "run_graceful")
-
-
-def test_selection_machine_isolated_unit():
-    """SelectionMachine 深模块隔离单元测试：闭包驱逐与拓扑消减。"""
-    from tasklite.backend.memory import InMemoryStateBackend
-    from tasklite.engine.selection import SelectionMachine, SelectionStandstill
-    from tasklite.engine.store import StateStore
-    from tasklite.models.job import Job
-
-    backend = InMemoryStateBackend()
-    store = StateStore(backend)
-    selection = Selection([Skip("to_skip"), Exclude("to_exclude")])
-    machine = SelectionMachine(selection, store)
-
-    assert machine.is_active is True
-    assert machine.has_skip_rules is True
-    store.state.replace_queue([
-        Job("to_exclude", "e1").to_dict(),
-        Job("normal", "n1", depends_on=["to_exclude::e1"]).to_dict(),
+    # upstream 再次入队，默认 trigger="once"（由于已有 failure，trigger 判定为跳过）
+    pipeline.backend.save_queue([
+        Job("upstream", "u", trigger="once").to_dict(),
+        Job("downstream", "d", depends_on=["upstream::u"]).to_dict(),
     ])
-    standstill = machine.partition_standstill()
+
+    pipeline.run()
+
+    # upstream 被 trigger 跳过（移出队列），downstream 检查依赖时，upstream 只有 failure 记录，downstream 必须失败
+    failed = pipeline.backend.load_failed()
+    assert "downstream::d" in failed
+    from tasklite.engine.errorclass import ERR_JOB_DEPENDENCY
+    assert ERR_JOB_DEPENDENCY in failed["downstream::d"]["error_message"]
+
+
+def test_active_excluded_upstream_masks_historical_success(fake_process, tmp_path):
+    """历史成功被活跃排除上游遮蔽：上游被 exclude 留队时，下游不得凭历史成功直接运行。"""
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task("upstream", ok_handler)
+    pipeline.register_task("downstream", ok_handler)
+
+    # upstream 历史已有成功
+    pipeline.backend.seed_successes(["upstream::u"])
+
+    # upstream 再次入队（成为活跃候选），下游依赖 upstream
+    pipeline.backend.save_queue([
+        Job("upstream", "u").to_dict(),
+        Job("downstream", "d", depends_on=["upstream::u"]).to_dict(),
+    ])
+
+    # run 时 exclude upstream
+    pipeline.run(exclude=Exclude(task_type="upstream"))
+
+    # 历史成功被活跃候选遮蔽，upstream 被排除，downstream 也必须留队，不得偷跑
+    assert sorted(_queued(pipeline)) == ["downstream::d", "upstream::u"]
+    assert "downstream::d" not in pipeline.backend.load_successes()
+
+
+def test_uid_reuse_cycle_detection(fake_process, tmp_path):
+    """同 UID 重用造成环时有覆盖：实际拓扑环必须被检测并熔断为失败。"""
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task("step", ok_handler)
+
+    # 1. 先入队并运行 A 获得成功
+    pipeline.enqueue(Job("step", "a"))
+    pipeline.run()
+    assert "step::a" in pipeline.backend.load_successes()
+
+    # 2. 入队 B 依赖 A
+    pipeline.enqueue(Job("step", "b", depends_on=["step::a"]))
+
+    # 3. 跨 Run 复用 UID：重新入队 A，但让 A 依赖 B
+    pipeline.enqueue(Job("step", "a", depends_on=["step::b"]))
+
+    # 此时队列中 A 依赖 B，B 依赖 A，形成实际拓扑环
+    pipeline.run()
+
+    failed = pipeline.backend.load_failed()
+    assert "step::a" in failed
+    assert "step::b" in failed
+    assert ERR_DEPENDENCY_DEADLOCK in failed["step::a"]["error_message"]
+    assert ERR_DEPENDENCY_DEADLOCK in failed["step::b"]["error_message"]
+
+
+# ── 内部排除入口与停摆判定 ───────────────────────────────────────────
+
+
+def test_temporary_exclude_and_check_contract():
+    """验证调度器与运行时内部临时排除机制（供授权拒绝等复用）。"""
+    scheduler = JobScheduler(resources={})
+    assert scheduler.is_job_excluded("t::1", "t") is False
+
+    # 单次临时排除
+    scheduler.temporarily_exclude("t::1")
+    assert scheduler.is_job_excluded("t::1", "t") is True
+    assert scheduler.is_job_excluded("t::2", "t") is False
+
+    # Exclude 规则全局匹配
+    scheduler.exclude = Exclude(task_type="t")
+    assert scheduler.is_job_excluded("t::2", "t") is True
+    assert scheduler.is_job_excluded("other::1", "other") is False
+
+    # reset_run 清理临时排除
+    scheduler.reset_run()
+    assert scheduler.is_job_excluded_by_uid("t::1") is False
+
+
+def test_selection_machine_kahn_partition(tmp_path):
+    """SelectionMachine 仅保留 Exclude 停摆分析。"""
+    backend = _pipeline(tmp_path, name="test").backend
+    store = StateStore(backend)
+
+    # 无排除规则
+    sm_inactive = SelectionMachine(store)
+    assert sm_inactive.is_active is False
+    assert sm_inactive.partition_standstill() is None
+
+    # 有 Exclude 规则
+    sm_active = SelectionMachine(store, exclude=Exclude(task_type="blocked_type"))
+    assert sm_active.is_active is True
+
+    store.state.replace_queue([
+        Job("blocked_type", "b1").to_dict(),
+        Job("normal", "n1", depends_on=["blocked_type::b1"]).to_dict(),
+    ])
+    standstill = sm_active.partition_standstill()
     assert isinstance(standstill, SelectionStandstill)
-    assert standstill.excluded_uids == ("to_exclude::e1",)
+    assert standstill.excluded_uids == ("blocked_type::b1",)
     assert standstill.blocked_uids == ("normal::n1",)
     assert standstill.only_blocked_by_exclusion is True
 
-    store.state.replace_queue([
-        Job("to_skip", "s1").to_dict(),
-        Job("normal", "n2", depends_on=["to_skip::s1"]).to_dict(),
-    ])
-    seq = 0
-    def next_seq():
-        nonlocal seq
-        seq += 1
-        return seq
 
-    evicted = machine.apply_skips(run_id="run_test", dispatch_no_supplier=next_seq)
-    assert evicted == 2
-    assert store.state.is_empty is True
-    attempts = backend.load_attempts("to_skip::s1")
-    assert len(attempts) == 1 and attempts[0].outcome == "skipped"
-    attempts_child = backend.load_attempts("normal::n2")
-    assert len(attempts_child) == 1 and attempts_child[0].outcome == "skipped"
+def test_public_surface_and_signature_contract():
+    import tasklite
 
+    assert "Exclude" in tasklite.__all__
+    assert "Selection" not in tasklite.__all__
+    assert "Skip" not in tasklite.__all__
 
-@pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
-def test_partial_skip_commit_stays_removed_after_crash_save_and_reload(
-    tmp_path, monkeypatch, backend_kind
-):
-    """跳过闭包部分提交后崩溃，已提交的下游不得被保存或重启复活。"""
-    from tasklite.engine.selection import SelectionMachine
-    from tasklite.exceptions import _CommitCrashSignal
-
-    pipeline = TaskLite(name="skip_crash", state_dir=tmp_path, backend=backend_kind)
-    store = pipeline._runtime.store
-    backend = pipeline.backend
-    root = Job("skip_root", "root").to_dict()
-    child = Job("allowed", "child", depends_on=["skip_root::root"]).to_dict()
-    unrelated = Job("allowed", "unrelated").to_dict()
-    rows = [root, child, unrelated]
-    store.state.replace_queue(rows)
-    backend.save_queue(rows)
-    commit_skip = backend.commit_skip
-    calls = []
-
-    def fail_root(uid):
-        calls.append(uid)
-        return False if uid == "skip_root::root" else commit_skip(uid)
-
-    monkeypatch.setattr(backend, "commit_skip", fail_root)
-    selection = Selection([Skip("skip_root")])
-    machine = SelectionMachine(selection, store)
-    with pytest.raises(_CommitCrashSignal, match="commit_skip"):
-        machine.apply_skips(run_id="first_run", dispatch_no_supplier=lambda: 1)
-
-    assert calls == ["allowed::child", "skip_root::root"]
-    assert _uids(backend.load_queue()) == ["skip_root::root", "allowed::unrelated"]
-    assert store.state.queue_uids == {"skip_root::root", "allowed::unrelated"}
-    assert [record.outcome for record in backend.load_attempts("allowed::child")] == [
-        "skipped"
-    ]
-    assert backend.load_attempts("skip_root::root") == []
-
-    pipeline._runtime._recovery.save_queue_crash_safe()
-    assert _uids(backend.load_queue()) == ["skip_root::root", "allowed::unrelated"]
-    monkeypatch.setattr(backend, "commit_skip", commit_skip)
-    restarted = TaskLite(
-        name="skip_crash", state_dir=tmp_path,
-        backend="sqlite" if backend_kind == "sqlite" else backend,
-    )
-    restarted._runtime._recovery.load_and_repair()
-    assert _uids(restarted._runtime.store.state.queue) == [
-        "skip_root::root", "allowed::unrelated"
-    ]
-    assert SelectionMachine(selection, restarted._runtime.store).apply_skips(
-        run_id="second_run", dispatch_no_supplier=lambda: 1
-    ) == 1
-    assert _uids(restarted.backend.load_queue()) == ["allowed::unrelated"]
-    assert _uids(restarted._runtime.store.state.queue) == ["allowed::unrelated"]
-    assert len(restarted.backend.load_attempts("allowed::child")) == 1
-    assert restarted.backend.load_successes() == {}
-    assert restarted.backend.load_failed() == {}
-
-
-@pytest.mark.parametrize("rule_type", [Exclude, Skip])
-@pytest.mark.parametrize("failure_path", ["cascade", "bulk"])
-def test_selection_failure_isolation_after_equal_length_spawn(
-    tmp_path, rule_type, failure_path
-):
-    """派发与派生保持队列长度时，终态隔离仍以当前选择投影为准。"""
-    pipeline = _pipeline(tmp_path)
-    pipeline.selection(rule_type("excluded"))
-    store = pipeline._runtime.store
-    pending = Job("allowed", "pending").to_dict()
-    downstream = Job(
-        "allowed", "downstream", depends_on=["excluded::child"]
-    ).to_dict()
-    rows = [pending, downstream]
-    store.state.replace_queue(rows)
-    pipeline.backend.save_queue(rows)
-    store.apply_failure("parent::first", {"error_message": "fatal"})
-
-    dispatched = store.state.pop_job(0)
-    aid = store.record_attempt_dispatch(
-        Job("allowed", "pending"), execution_id="sel_run.1", run_id="sel_run"
-    )
-    child = Job(
-        "excluded", "child", depends_on=["parent::failing"]
-    ).to_dict()
-    store.apply_success(
-        "allowed::pending",
-        {},
-        job_snapshot=dispatched,
-        spawned_job_snapshots=[child],
-        attempt_id=aid,
-        execution_id="sel_run.1",
-    )
-    assert len(store.state.queue) == len(rows)
-
-    if failure_path == "cascade":
-        outcome = store.apply_failure("parent::failing", {"error_message": "fatal"})
-        assert outcome.cascaded_uids == []
-    else:
-        outcome = store.apply_bulk_failure(
-            [("excluded::child", {"error_message": "fatal"})]
-        )
-        assert outcome.failed_uids == []
-
-    assert _queued(pipeline) == ["excluded::child", "allowed::downstream"]
-    assert _uids(store.state.queue) == _queued(pipeline)
-    assert "excluded::child" not in pipeline.backend.load_failed()
-    assert "allowed::downstream" not in pipeline.backend.load_failed()
-
+    sig = inspect.signature(TaskLite.run)
+    assert "exclude" in sig.parameters
+    assert sig.parameters["exclude"].default is None

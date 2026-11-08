@@ -616,10 +616,10 @@ class TestEnqueue:
         p.register_task("generate", ok_handler)
         p.register_task("process", ok_handler)
         # 即使存在历史成功产物，提交时仍保留引用配置而不绑定历史路径
-        p.backend.commit_job_success(
-            "generate::001",
-            {"artifacts": {"report": {"path": str(tmp_path / "old_report.csv")}}},
-        )
+        p.backend.seed_successes(["generate::001"])
+        p.backend._successes["generate::001"]["artifacts"] = {
+            "report": {"path": str(tmp_path / "old_report.csv")}
+        }
 
         missing_dep = Job(
             "process",

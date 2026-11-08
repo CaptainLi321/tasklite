@@ -51,8 +51,8 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     first = _pipeline(tmp_path)
     first.register_task("produce", produce_input, trigger="always")
     first.register_task("consume", consume_input, trigger="on_input_change")
-    first.enqueue(Job("consume", "result", depends_on=["produce::source"]))
     first.enqueue(Job("produce", "source"))
+    first.enqueue(Job("consume", "result", depends_on=["produce::source"]))
     assert first.run() is None
     first.stop()
     first_produce_run_id = first.backend.load_successes()["produce::source"]["last_success_run_id"]

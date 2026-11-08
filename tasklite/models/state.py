@@ -12,11 +12,29 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Set as AbstractSet
-from typing import Any
+from enum import Enum
+from typing import Any, Callable
 
 from ..exceptions import TaskLiteError
 from ..utils.encoding import make_job_uid
 from .job import Job
+
+
+class DependencyStatus(str, Enum):
+    """依赖状态（单一真相源）。
+
+    - ACTIVE: 有活跃 pending/running 候选（未被排除）：下游等待
+    - EXCLUDED: 被排除规则或授权拒绝本次排除：下游留队，不当作依赖缺失
+    - SATISFIED: 无活跃候选且在 successes：依赖满足
+    - FAILED: 无活跃候选且只有 failures：依赖失败并级联
+    - MISSING: 记录缺失，包括提交后被人工清除：依赖缺失并级联
+    """
+
+    ACTIVE = "active"
+    EXCLUDED = "excluded"
+    SATISFIED = "satisfied"
+    FAILED = "failed"
+    MISSING = "missing"
 
 
 def job_uid_from_snapshot(job_snapshot: dict) -> str:
@@ -318,12 +336,46 @@ class PipelineState:
         """仅在跳过提交成功后记录；不伪造历史成功。"""
         self._trigger_skipped_uids.add(job_uid)
 
-    def dependency_ready(self, job_uid: str) -> bool:
-        """活跃候选优先于历史终态与本批无需执行的判定。"""
+    def check_dependency_status(
+        self,
+        dep_uid: str,
+        *,
+        in_flight_uids: frozenset[str] | set[str] | None = None,
+        is_dep_excluded: Callable[[str], bool] | None = None,
+    ) -> DependencyStatus:
+        """依赖状态的唯一判断位置。
+
+        | 运行时上游事实 | 下游行为 |
+        | 有活跃 pending/running 候选 | 等待本次结果，历史成功不能绕过活跃候选 |
+        | 被排除规则或授权拒绝本次排除 | 下游本次排除并留队，不当作依赖缺失 |
+        | 无活跃候选且有 successes | 依赖满足，再检查输入及具名产物 |
+        | 无活跃候选且只有 failures | 失败并级联 |
+        | 记录缺失，包括提交后被人工清除 | 失败并级联，不等待或从 Attempt 补推成功 |
+        """
+        active_in_flight = self._in_flight_uids if in_flight_uids is None else in_flight_uids
+        # 1. 活跃候选判定（队列待跑或在途执行；活跃态遮蔽历史成功）
+        if dep_uid in self._queue_uids or dep_uid in active_in_flight:
+            if is_dep_excluded is not None and is_dep_excluded(dep_uid):
+                return DependencyStatus.EXCLUDED
+            return DependencyStatus.ACTIVE
+
+        # 2. 无活跃候选时，严格按终态档案判定（Trigger False 移除候选后由本分支接管）
+        if dep_uid in self._success_uids:
+            return DependencyStatus.SATISFIED
+        if dep_uid in self._failed_uids:
+            return DependencyStatus.FAILED
+        return DependencyStatus.MISSING
+
+    def dependency_ready(
+        self,
+        job_uid: str,
+        *,
+        is_dep_excluded: Callable[[str], bool] | None = None,
+    ) -> bool:
+        """活跃候选优先于历史终态的判定（仅 SATISFIED 为就绪）。"""
         return (
-            job_uid not in self._queue_uids
-            and job_uid not in self._in_flight_uids
-            and (job_uid in self._success_uids or job_uid in self._trigger_skipped_uids)
+            self.check_dependency_status(job_uid, is_dep_excluded=is_dep_excluded)
+            == DependencyStatus.SATISFIED
         )
 
     @property
@@ -392,6 +444,7 @@ class PipelineState:
 
 
 __all__ = [
+    "DependencyStatus",
     "PipelineState",
     "job_uid_from_snapshot",
 ]

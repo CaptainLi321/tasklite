@@ -1,21 +1,19 @@
-"""v2 执行选择机器（SelectionMachine）：统筹 Skip 闭包驱逐与 Exclude 停摆剥离。
+"""v2 运行排除拓扑机器（SelectionMachine）：Exclude 与临时排除的停摆剥离。
 
-深模块契约：顶层 tasklite/selection.py 仅保留声明式规则与协议；本模块负责
-Skip 闭包与 Kahn 选择停摆投影，依赖环检测复用 PipelineState 的统一实现。
+深模块契约：顶层 tasklite/selection.py 仅保留 Exclude 值对象；本模块负责
+Kahn 排除停摆投影，依赖环检测复用 PipelineState 的统一实现。
 
-单向依赖约束：本模块仅依赖 Selection（规则集）与 StateStore（状态仓），
-避免反向耦合 JobScheduler。
+单向依赖约束：本模块仅依赖 Exclude 与 StateStore，避免反向耦合 JobScheduler。
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from ..exceptions import TaskLiteError
 from ..models.job import Job
-from ..selection import Selection
-from .errorclass import ERR_DEPENDENCY_SKIPPED, ERR_SKIPPED
+from ..selection import Exclude
 
 if TYPE_CHECKING:
     from .store import StateStore
@@ -25,17 +23,17 @@ logger = logging.getLogger("tasklite")
 
 @dataclass(frozen=True)
 class SelectionStandstill:
-    """执行选择下的停摆拓扑判定（Kahn 入度消减结果）。
+    """排除规则与临时排除下的停摆拓扑判定（Kahn 入度消减结果）。
 
-    以 ``success_uids | deferred_uids``（Exclude 命中行 + 防御性的 Skip 残留行）
-    为初始波前，对剩余「允许执行」作业做入度消减：
+    以 ``deferred_uids``（Exclude 命中行 + 运行期临时排除行）为延迟波前，
+    对剩余「允许执行」作业做入度消减：
 
     - ``stuck_uids``：入度无法消减为 0 的允许作业，可能包含环成员、缺口
       及其下游；
     - ``cycle_uids``：仅从 stuck 子图中由 PipelineState 的依赖环检测器识别
       的真实环成员，供 governor 沿用既有环归因；
     - ``blocked_uids``：入度可消减、且传递依赖最终落在 deferred 波前上的
-      允许作业——本次仅因上游被排除/跳过而无法完成，必须留队等待下次 run；
+      允许作业——本次仅因上游被排除而无法完成，必须留队等待下次 run；
     - ``unblocked_uids``：入度可消减但仍有余量（如资源等待）的允许作业，
       存在本 run 继续推进的可能，不得据此终止运行。
 
@@ -52,106 +50,52 @@ class SelectionStandstill:
 
     @property
     def only_blocked_by_exclusion(self) -> bool:
-        """剩余队列是否全部为「排除/跳过 + 仅被其阻塞」的作业。"""
+        """剩余队列是否全部为「排除 + 仅被其阻塞」的作业。"""
         return not self.stuck_uids and not self.unblocked_uids
 
 
 class SelectionMachine:
-    """执行选择深模块：统筹 Skip 闭包驱逐与 Exclude 停摆剥离。"""
+    """排除机器：统筹 Exclude 规则与运行期临时排除的停摆判定。"""
 
-    def __init__(self, selection: Selection, store: StateStore):
-        self._selection = selection
+    def __init__(
+        self,
+        store: StateStore,
+        *,
+        exclude: Exclude | None = None,
+    ):
         self._store = store
-        self._skipped_uids: set[str] = set()
+        self._exclude: Exclude | None = exclude
+        self._temporary_excluded_uids: set[str] = set()
 
     @property
     def is_active(self) -> bool:
-        return self._selection.is_active
+        return self._exclude is not None or bool(self._temporary_excluded_uids)
 
-    @property
-    def has_skip_rules(self) -> bool:
-        return self._selection.has_skip_rules
+    def set_exclusions(
+        self,
+        exclude: Exclude | None,
+        temporary_uids: set[str] | None = None,
+    ) -> None:
+        self._exclude = exclude
+        if temporary_uids is not None:
+            self._temporary_excluded_uids = set(temporary_uids)
 
-    def reset_run(self) -> None:
+    def temporarily_exclude(self, job_uid: str) -> None:
+        """内部排除入口：登记单个临时排除 UID（供授权拒绝等复用）。"""
+        self._temporary_excluded_uids.add(job_uid)
+
+    def is_excluded(self, job_uid: str, task_type: str) -> bool:
+        """判断作业是否被排除（用户 exclude 或运行期临时排除）。"""
+        if job_uid in self._temporary_excluded_uids:
+            return True
+        if self._exclude is not None and self._exclude.matches_task_type(task_type):
+            return True
+        return False
+
+    def reset_run(self, exclude: Exclude | None = None) -> None:
         """每 run 开始时复位运行期状态。"""
-        self._skipped_uids.clear()
-
-    def apply_skips(self, *, run_id: str | None, dispatch_no_supplier: Callable[[], int]) -> int:
-        """终态跳过：Skip 命中行移出 queue，下游整链级联跳过并留审计轨迹。
-
-        Skip 是永久语义（不进入 successes/失败档案，下次不再重试），审计落
-        attempts（outcome=skipped）。删除序为下游优先：崩溃中断后 Skip 根
-        仍在队列，下次 run 可重新得到同一闭包（幂等）。
-        """
-        if not self._selection.has_skip_rules:
-            return 0
-        store = self._store
-        queue = store.state.queue
-        if not queue:
-            return 0
-        rows: dict[str, dict] = {}
-        facts: dict[str, tuple[str, tuple[str, ...]]] = {}
-        for job_snapshot in queue:
-            try:
-                parsed = Job.from_dict(job_snapshot)
-            except (KeyError, TypeError, ValueError, TaskLiteError):
-                continue  # 畸形行走既有 MALFORMED_JOB 归因
-            rows[parsed.uid] = job_snapshot
-            facts[parsed.uid] = (parsed.task_type, tuple(parsed.depends_on))
-        if not facts:
-            return 0
-        dependents: dict[str, list[str]] = {}
-        for uid, (_task_type, depends_on) in facts.items():
-            for dep in depends_on:
-                dependents.setdefault(dep, []).append(uid)
-        seeds = {
-            uid
-            for uid, (task_type, depends_on) in facts.items()
-            if self._selection.is_skipped(task_type)
-            or any(dep in self._skipped_uids for dep in depends_on)
-        }
-        if not seeds:
-            return 0
-        closure = set(seeds)
-        depth: dict[str, int] = {uid: 0 for uid in seeds}
-        root_of: dict[str, str] = {uid: uid for uid in seeds}
-        stack = list(seeds)
-        while stack:
-            cur = stack.pop()
-            for child in dependents.get(cur, ()):
-                if child in closure:
-                    continue
-                closure.add(child)
-                depth[child] = depth[cur] + 1
-                root_of[child] = root_of.get(cur, cur)
-                stack.append(child)
-        skipped = 0
-        for uid in sorted(closure, key=lambda item: (-depth.get(item, 0), item)):
-            queued_row = rows.get(uid)
-            if queued_row is None:
-                continue
-            try:
-                job = Job.from_dict(queued_row)
-            except (KeyError, TypeError, ValueError, TaskLiteError):
-                continue
-            if uid in seeds and self._selection.is_skipped(job.task_type):
-                error = ERR_SKIPPED
-            else:
-                error = (
-                    f"{ERR_DEPENDENCY_SKIPPED} "
-                    f"(upstream: {root_of.get(uid, '?')})"
-                )
-            store.apply_skip(uid, job_snapshot=queued_row)
-            self._skipped_uids.add(uid)
-            store.record_attempt_skip(
-                job,
-                error,
-                run_id=run_id,
-                dispatch_no=dispatch_no_supplier(),
-            )
-            skipped += 1
-            logger.info(f"SELECTION: job {uid} skipped terminal ({error}).")
-        return skipped
+        self._exclude = exclude
+        self._temporary_excluded_uids.clear()
 
     def partition_standstill(self) -> SelectionStandstill | None:
         """以 Kahn 入度消减剥离选择停摆：区分真死锁与「仅被排除阻塞」。
@@ -159,7 +103,7 @@ class SelectionMachine:
         返回 None 表示队列存在畸形行（无可信拓扑事实），交既有
         MALFORMED_JOB 归因。纯计算、无状态变更。
         """
-        if not self._selection.is_active:
+        if not self.is_active:
             return None
         state = self._store.state
         queue = state.queue
@@ -180,12 +124,9 @@ class SelectionMachine:
 
         deferred = {
             uid for uid, (task_type, _deps) in facts.items()
-            if not self._selection.allows_task_type(task_type)
+            if self.is_excluded(uid, task_type)
         }
-        excluded = {
-            uid for uid, (task_type, _deps) in facts.items()
-            if self._selection.is_excluded(task_type)
-        }
+        excluded = set(deferred)
         allowed = set(facts) - deferred
 
         # Kahn：只有允许作业参与消减；deferred 与 successes 同为已满足波前。

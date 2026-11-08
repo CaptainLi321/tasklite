@@ -39,6 +39,7 @@ class JobContext:
         artifact_descriptions: dict[str, dict[str, dict[str, str]]] | None = None,
         protected_roots: tuple[str | Path, ...] = (),
         base_dir: str | Path | None = None,
+        known_job_uids: frozenset[str] | set[str] | None = None,
     ):
         self._artifact_descriptions = copy.deepcopy(artifact_descriptions or {})
         self._protected_roots = tuple(protected_roots)
@@ -53,6 +54,11 @@ class JobContext:
         self.resource_suspensions: list[tuple[str, float]] = []
         self._success_job_uids = success_job_uids
         self._failed_job_uids = failed_job_uids
+        self._known_job_uids: frozenset[str] = (
+            frozenset(known_job_uids)
+            if known_job_uids is not None
+            else (frozenset(success_job_uids) | frozenset(failed_job_uids))
+        )
         self._cursors = cursors
         self.cursor_updates: dict[str, str | None] = {}
         # 已注册资源名快照——suspend_resource 据此 fail-loud。
@@ -91,6 +97,13 @@ class JobContext:
             raise TypeError(
                 f"spawn() expects a Job, got {type(job).__name__}"
             )
+        # 依赖闭合：只能引用派发时已知的 Job、当前父 Job，以及本次先前声明的 Job
+        allowed_uids = self._known_job_uids | {self.job.uid} | {j.uid for j in self.spawned_jobs}
+        for dep in job.depends_on:
+            if dep not in allowed_uids:
+                raise ValueError(
+                    f"Spawned job {job.uid!r} references non-existent, future, or cross-worker dependency {dep!r}"
+                )
         job_dict = job.to_dict()
         job_dict["files"] = resolve_job_files_config(
             job_dict.get("files"),

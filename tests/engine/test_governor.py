@@ -81,26 +81,15 @@ def _spy_cycle_detection(monkeypatch):
 
 class TestGovernorBasics:
     def test_reset_clears_all_round_state(self):
-        gov = DeadlockGovernor(dependency_grace_seconds=10.0, deadlock_gap_max_rounds=3)
-        gov.dep_grace_deadline = 100.0
-        gov.dep_grace_missing = frozenset(["t::j1"])
+        gov = DeadlockGovernor(deadlock_gap_max_rounds=3)
         gov.deadlock_gap_rounds = 2
         gov.reset()
-        assert gov.dep_grace_deadline is None
-        assert gov.dep_grace_missing is None
         assert gov.deadlock_gap_rounds == 0
 
     def test_default_constants(self):
-        assert DEP_GRACE_SECONDS == 60.0
         assert DEADLOCK_GAP_MAX_ROUNDS == 5
 
     def test_decision_value_structure(self):
-        d_grace = DeadlockDecision(action="grace_waiting", should_terminate=False, wait_time=0.5)
-        assert d_grace.action == "grace_waiting"
-        assert d_grace.should_terminate is False
-        assert d_grace.wait_time == 0.5
-        assert d_grace.failed_uids == []
-
         d_resolved = DeadlockDecision(
             action="resolved", should_terminate=True, wait_time=0.0, failed_uids=["t::a"]
         )
@@ -151,192 +140,20 @@ class TestGapEscalation:
         assert gov.check_gap_or_escalate("gap") is False
         assert gov.deadlock_gap_rounds == 1
 
-    def test_gap_rounds_reset_on_grace_waiting_conclusion(self):
-        """缺口轮次间的依赖宽限裁决（非缺口结论）同样终结 gap episode。"""
-        gov = DeadlockGovernor(dependency_grace_seconds=60.0, deadlock_gap_max_rounds=5)
-        state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
+
+class TestMissingDependencyImmediateResolution:
+    def test_missing_dependency_fails_immediately_without_grace(self):
+        gov = DeadlockGovernor()
+        state = _state([Job("t", "a", depends_on=["t::missing"]).to_dict()])
         store = FakeArbitrationStore(state)
-        sched_gap = StandstillFacts(min_wait=INF)
-        sched_missing = StandstillFacts(
+        facts = StandstillFacts(
             min_wait=INF,
-            attribution=DeadlockAttribution(missing_dependency_uids=("t::b",)),
+            attribution=DeadlockAttribution(missing_dependency_uids=("t::a",)),
             has_potential_spawners=True,
         )
-
-        for _ in range(4):
-            assert gov.arbitrate(sched_gap, store).action == "gap_retrying"
-
-        # 缺口转为可归因的缺失依赖等待（宽限裁决，非缺口结论）→ 计数终结
-        assert gov.resolve_deadlock(sched_missing, store=store).action == "grace_waiting"
-        assert gov.deadlock_gap_rounds == 0
-
-        # 宽限到期后缺口复发 → 从零计数，不立即升级
-        assert gov.arbitrate(sched_gap, store).action == "gap_retrying"
-        assert gov.deadlock_gap_rounds == 1
-
-
-class TestDependencyGrace:
-    def test_grace_period_fallback_path(self):
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
-        state = _state(
-            [
-                Job("t", "a", depends_on=["t::b"]).to_dict(),
-                Job("t", "c").to_dict(),
-            ]
-        )
-        # 首次裁决：授予宽限
-        assert gov.check_dependency_grace(state, ["t::b"], now=100.0) is True
-        assert gov.dep_grace_deadline == 105.0
-        assert gov.dep_grace_missing == frozenset(["t::b"])
-
-        # 到期前：仍在宽限
-        assert gov.check_dependency_grace(state, ["t::b"], now=102.0) is True
-
-        # 到期后：宽限过期
-        assert gov.check_dependency_grace(state, ["t::b"], now=106.0) is False
-
-    def test_spawner_fast_path(self):
-        """提供 has_potential_spawners 时直接依据单趟事实裁决，零扫描 state.queue。"""
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
-        state = _state([])
-
-        assert gov.check_dependency_grace(
-            state, ["t::b"], has_potential_spawners=False, now=100.0
-        ) is False
-        assert gov.dep_grace_deadline is None
-
-        assert gov.check_dependency_grace(
-            state, ["t::b"], has_potential_spawners=True, now=100.0
-        ) is True
-        assert gov.dep_grace_deadline == 105.0
-
-        assert gov.check_dependency_grace(
-            state, ["t::b"], has_potential_spawners=True, now=102.0
-        ) is True
-
-        assert gov.check_dependency_grace(
-            state, ["t::b"], has_potential_spawners=True, now=106.0
-        ) is False
-
-    def test_grace_episode_ends_on_expiry(self):
-        """宽限超时即终结 episode：过期 deadline 不泄漏进同缺失集的新等待者。"""
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
-        state = _state(
-            [
-                Job("t", "b", depends_on=["t::x"]).to_dict(),
-                Job("t", "sp").to_dict(),
-            ]
-        )
-
-        # episode 1：授予宽限并到期
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=106.0) is False
-        assert gov.dep_grace_deadline is None
-        assert gov.dep_grace_missing is None
-
-        # episode 2：同缺失集的新等待者 + 全新 spawner → 全新宽限（非零宽限误判）
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=107.0) is True
-        assert gov.dep_grace_deadline == 112.0
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=110.0) is True
-
-    def test_grace_episode_ends_on_resolution(self):
-        """宽限成功消解（等待者转为可运行、仲裁停摆）同样终结 episode。
-
-        消解路径无 False 裁决出口，残留 deadline 以过期形态存活；同 uid 集合
-        复发（如 every_run 同 uid 重入队等待新缺失依赖）且全新 spawner 在场时
-        必须重新授予完整宽限，而非继承残留 deadline 被零宽限批量误判。
-        """
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
-        state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
-
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
-        assert gov.dep_grace_deadline == 105.0
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=101.0) is True
-
-        # 同 uid 集合远超宽限窗后复发 + 全新 spawner → 全新宽限（非零宽限误判）
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=500.0) is True
-        assert gov.dep_grace_deadline == 505.0
-        # 新 episode 内正常计时并按期超时终结
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=503.0) is True
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=506.0) is False
-        assert gov.dep_grace_deadline is None
-
-    def test_grace_episode_ends_on_no_spawner(self):
-        """无潜在 spawner 的立即裁决同样终结 episode，重启后重新授予完整宽限。"""
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
-        state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
-
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=False, now=101.0) is False
-        assert gov.dep_grace_deadline is None
-        assert gov.dep_grace_missing is None
-
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=102.0) is True
-        assert gov.dep_grace_deadline == 107.0
-
-    def test_grace_expiry_clears_deadline_fallback_path(self):
-        """回退路径（无 spawner 快道事实）的超时裁决同样终结 episode。"""
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
-        state = _state(
-            [
-                Job("t", "b", depends_on=["t::x"]).to_dict(),
-                Job("t", "sp").to_dict(),
-            ]
-        )
-
-        assert gov.check_dependency_grace(state, ["t::b"], now=100.0) is True
-        assert gov.check_dependency_grace(state, ["t::b"], now=106.0) is False
-        assert gov.dep_grace_deadline is None
-        # 同缺失集新 episode 重新授予完整宽限
-        assert gov.check_dependency_grace(state, ["t::b"], now=107.0) is True
-        assert gov.dep_grace_deadline == 112.0
-
-    def test_grace_episode_ends_on_dispatch_progress(self):
-        """派发前进信号终结宽限 episode：盲区 (deadline, deadline+宽限窗] 内的
-        同缺失集复发必须获得完整新宽限，不得继承残留 deadline 被零宽限批量误杀。
-
-        消解路径（等待者获得依赖、转为可运行被派发）无任何 False 裁决出口，
-        deadline 以过期形态残留；复发时刻距残留 deadline 不超过一个宽限窗时，
-        时间启发式无法区分「刚过期的残留」与「活跃 episode」。任何成功派发
-        都证明等待者已消解，episode 应当终结，复发自然是新 episode。
-        """
-        gov = DeadlockGovernor(dependency_grace_seconds=60.0)
-        state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
-
-        # episode：授予宽限（deadline=160），随后等待者消解并被派发
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
-        assert gov.dep_grace_deadline == 160.0
-        gov.record_dispatch_progress()
-        assert gov.dep_grace_deadline is None
-        assert gov.dep_grace_missing is None
-
-        # 同缺失集在 (160, 220] 盲区内复发 + spawner 在场 → 完整新宽限而非误杀
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=170.0) is True
-        assert gov.dep_grace_deadline == 230.0
-        # 新 episode 内正常计时并按期超时终结（超时语义不变）
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=290.0) is False
-        assert gov.dep_grace_deadline is None
-
-    def test_missing_set_change_starts_new_episode(self):
-        """缺失集变化即新 episode：deadline 重置、不继承旧窗口。"""
-        gov = DeadlockGovernor(dependency_grace_seconds=10.0)
-        state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
-
-        assert gov.check_dependency_grace(state, ["t::b"], has_potential_spawners=True, now=100.0) is True
-        assert gov.dep_grace_deadline == 110.0
-
-        # 缺失集变化 → deadline 清零重授
-        assert gov.check_dependency_grace(
-            state, ["t::b", "t::c"], has_potential_spawners=True, now=103.0
-        ) is True
-        assert gov.dep_grace_deadline == 113.0
-
-    def test_no_missing_uids_returns_false(self):
-        gov = DeadlockGovernor()
-        state = _state([Job("t", "a").to_dict()])
-        assert gov.check_dependency_grace(state, [], now=100.0) is False
-        # 越界整型下标被忽略（不产 missing）
-        assert gov.check_dependency_grace(state, [7], now=100.0) is False
+        decision = gov.resolve_deadlock(facts, store=store)
+        assert decision.action == "resolved"
+        assert state.failed["t::a"]["error_message"] == ERR_DEPENDENCY_DEADLOCK
 
 
 class TestArbitrateFacade:
@@ -438,21 +255,6 @@ class TestResolveDeadlockAttribution:
         assert decision.action == "resolved"
         assert state.failed["t::a"]["error_message"] == ERR_DEPENDENCY_DEADLOCK
 
-    def test_missing_dependency_with_spawner_graces(self):
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
-        state = _state([Job("t", "a", depends_on=["t::ghost"]).to_dict()])
-        store = FakeArbitrationStore(state)
-        facts = StandstillFacts(
-            min_wait=INF,
-            attribution=DeadlockAttribution(missing_dependency_uids=("t::a",)),
-            has_potential_spawners=True,
-        )
-        decision = gov.resolve_deadlock(facts, store=store)
-        assert decision.action == "grace_waiting"
-        assert decision.wait_time > 0
-        assert store.bulk_calls == []
-        assert state.failed == {}
-
     def test_cycle_members_failed_outside_kept(self):
         gov = DeadlockGovernor()
         state = _state(
@@ -497,16 +299,9 @@ class TestResolveDeadlockAttribution:
         facts = StandstillFacts(
             min_wait=INF,
             attribution=DeadlockAttribution(missing_dependency_uids=("t::a",)),
-            has_potential_spawners=True,
-        )
-        # 先耗尽宽限（无 spawner 事实切换），再仲裁
-        assert gov.resolve_deadlock(facts, store=store).action == "grace_waiting"
-        facts_no_spawner = StandstillFacts(
-            min_wait=INF,
-            attribution=DeadlockAttribution(missing_dependency_uids=("t::a",)),
             has_potential_spawners=False,
         )
-        decision = gov.resolve_deadlock(facts_no_spawner, store=store)
+        decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
         assert decision.should_terminate is False
         assert set(state.failed) == {"t::a"}
@@ -554,32 +349,6 @@ class TestGovernorArbitrateDeepChain:
         assert len(backend.load_queue()) == CHAIN_N
 
 
-class TestGraceRelapseAfterProgress:
-    def test_resolve_relapse_after_progress_gets_full_grace(self):
-        """死锁仲裁路径同样受益于前进终结点：盲区复发裁决为宽限而非批量熔断。"""
-        gov = DeadlockGovernor(dependency_grace_seconds=60.0)
-        state = _state([Job("t", "b", depends_on=["t::x"]).to_dict()])
-        store = FakeArbitrationStore(state)
-        sched = StandstillFacts(
-            min_wait=INF,
-            attribution=DeadlockAttribution(missing_dependency_uids=("t::b",)),
-            has_potential_spawners=True,
-        )
-
-        # episode 授予宽限（deadline=160）
-        assert gov.check_dependency_grace(
-            state, {"t::b"}, has_potential_spawners=True, now=100.0
-        ) is True
-        assert gov.dep_grace_deadline == 160.0
-
-        # 等待者消解被派发 → 前进信号终结 episode → 仲裁授予完整新宽限
-        gov.record_dispatch_progress()
-        decision = gov.resolve_deadlock(sched, store=store)
-        assert decision.action == "grace_waiting"
-        assert decision.wait_time > 0
-        assert store.bulk_calls == []
-
-
 class TestSelectionClosedLoopArbitration:
     """DeadlockGovernor.arbitrate 闭环处理执行选择停摆与零归档测试。"""
 
@@ -587,7 +356,7 @@ class TestSelectionClosedLoopArbitration:
         from tasklite.backend.memory import InMemoryStateBackend
         from tasklite.engine.selection import SelectionMachine
         from tasklite.engine.store import StateStore
-        from tasklite.selection import Exclude, Selection
+        from tasklite.selection import Exclude
 
         gov = DeadlockGovernor()
         backend = InMemoryStateBackend()
@@ -596,7 +365,7 @@ class TestSelectionClosedLoopArbitration:
             Job("ex_type", "1").to_dict(),
             Job("normal", "2", depends_on=["ex_type::1"]).to_dict(),
         ])
-        sm = SelectionMachine(Selection([Exclude("ex_type")]), store)
+        sm = SelectionMachine(store, exclude=Exclude(task_type="ex_type"))
         sched = StandstillFacts(min_wait=INF, attribution=DeadlockAttribution())
 
         decision = gov.arbitrate(sched, store=store, selection_machine=sm)
@@ -610,7 +379,7 @@ class TestSelectionClosedLoopArbitration:
         from tasklite.engine.scheduler import JobScheduler
         from tasklite.engine.selection import SelectionMachine
         from tasklite.engine.store import StateStore
-        from tasklite.selection import Exclude, Selection
+        from tasklite.selection import Exclude
 
         store = StateStore(InMemoryStateBackend())
         store.state.replace_queue([
@@ -619,13 +388,13 @@ class TestSelectionClosedLoopArbitration:
             Job("allowed", "downstream", depends_on=["excluded::e"]).to_dict(),
             Job("resource", "waiter", resources={"api": 1}).to_dict(),
         ])
-        selection = Selection([Exclude("excluded")])
-        machine = SelectionMachine(selection, store)
-        store._set_selection(selection)
+        exclude = Exclude(task_type="excluded")
+        machine = SelectionMachine(store, exclude=exclude)
+        store.set_run_exclusions(exclude)
         resource = CapacityResource("api", 1)
         resource.suspend(30)
         scheduler = JobScheduler({"api": resource})
-        scheduler.selection = selection
+        scheduler.reset_run(exclude)
         facts = scheduler.scan_next_runnable(store.state, set()).standstill_facts()
         assert 0 < facts.min_wait <= 30
         assert facts.waiting_for_dependency
@@ -651,7 +420,7 @@ class TestSelectionClosedLoopArbitration:
         from tasklite.engine.scheduler import JobScheduler
         from tasklite.engine.selection import SelectionMachine
         from tasklite.engine.store import StateStore
-        from tasklite.selection import Exclude, Selection
+        from tasklite.selection import Exclude
 
         store = StateStore(InMemoryStateBackend())
         store.state.replace_queue([
@@ -660,11 +429,11 @@ class TestSelectionClosedLoopArbitration:
             Job("t", "gap", depends_on=["t::missing"]).to_dict(),
             Job("t", "downstream", depends_on=["t::gap"]).to_dict(),
         ])
-        selection = Selection([Exclude("other")])
-        machine = SelectionMachine(selection, store)
-        store._set_selection(selection)
+        exclude = Exclude(task_type="other")
+        machine = SelectionMachine(store, exclude=exclude)
+        store.set_run_exclusions(exclude)
         scheduler = JobScheduler({})
-        scheduler.selection = selection
+        scheduler.reset_run(exclude)
         governor = DeadlockGovernor()
         standstill = machine.partition_standstill()
         assert standstill is not None

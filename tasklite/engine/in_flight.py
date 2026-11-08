@@ -60,6 +60,7 @@ class InFlightJob:
     attempt_no: int = 1
     run_id: str = ""
     started_at: str | None = None
+    known_job_uids: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         if self.lease is None:

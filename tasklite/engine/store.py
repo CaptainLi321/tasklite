@@ -36,7 +36,7 @@ from ..models.attempt import (
 )
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
 from ..models.state import PipelineState, job_uid_from_snapshot
-from ..selection import Selection
+from ..selection import Exclude
 from ..utils.clock import parse_utc_iso_to_us, utc_now_iso
 from ..utils.encoding import parse_job_uid
 from ..utils.jsonutil import dumps
@@ -144,9 +144,8 @@ class StateStore:
         self._requeue_policy = (
             requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
         )
-        # 执行选择（终态写入出口的排除闸门）：None = 不过滤；
-        # 由 EngineRuntime 在 run 启动期单点注入，与调度器同一事实源。
-        self._selection: Selection | None = None
+        self._exclude: Exclude | None = None
+        self._temporary_excluded_uids: set[str] = set()
 
     @property
     def base_dir(self) -> Path:
@@ -173,31 +172,32 @@ class StateStore:
         """设置 attempt 收尾事件回调。"""
         self._on_attempt_finished = cb
 
-    def _set_selection(self, selection: Selection | None) -> None:
-        """内部注入面：执行选择（终态写入出口的排除闸门；None = 不过滤）。
+    def set_run_exclusions(
+        self,
+        exclude: Exclude | None,
+        temporary_uids: set[str] | None = None,
+    ) -> None:
+        """内部注入面：设置本 Run 排除规则与临时排除集合。"""
+        self._exclude = exclude
+        self._temporary_excluded_uids = set(temporary_uids) if temporary_uids is not None else set()
 
-        仅 EngineRuntime 在 run 启动期调用，外部不得直接使用（避免与调度器
-        的选择事实源不一致）。
-        """
-        self._selection = selection
+    def temporarily_exclude(self, job_uid: str) -> None:
+        """登记单个临时排除 UID。"""
+        self._temporary_excluded_uids.add(job_uid)
 
     def _selection_excluded_uids(self) -> frozenset[str]:
-        """当前队列中被执行选择拦截（Exclude/Skip）的**合法作业** uid 集合。
-
-        投影随当前队列计算；畸形行无可信身份，不属于合法作业——跳过并走
-        既有 MALFORMED_JOB 归因。
-        """
-        selection = self._selection
-        if selection is None or not selection.is_active:
+        """当前队列中被排除拦截（Exclude 或临时排除）的合法作业 UID 集合。"""
+        if self._exclude is None and not self._temporary_excluded_uids:
             return frozenset()
-        excluded: set[str] = set()
-        for job_snapshot in self._state.queue:
-            try:
-                job = Job.from_dict(job_snapshot)
-            except (KeyError, TypeError, ValueError, TaskLiteError):
-                continue
-            if not selection.allows_task_type(job.task_type):
-                excluded.add(job.uid)
+        excluded: set[str] = set(self._temporary_excluded_uids)
+        if self._exclude is not None:
+            for job_snapshot in self._state.queue:
+                try:
+                    job = Job.from_dict(job_snapshot)
+                except (KeyError, TypeError, ValueError, TaskLiteError):
+                    continue
+                if self._exclude.matches_task_type(job.task_type):
+                    excluded.add(job.uid)
         return frozenset(excluded)
 
     def fire_attempt_finished(self, job_uid: str, *, outcome: AttemptOutcome) -> None:
@@ -322,6 +322,7 @@ class StateStore:
             )
         job_snapshot = self.normalize_and_validate_job(job)
         target_uid = job.uid
+
         for queued in self._backend.load_queue():
             try:
                 queued_uid = job_uid_from_snapshot(queued)
@@ -333,6 +334,18 @@ class StateStore:
                 raise TaskLiteError(
                     f"Job {target_uid!r} is already queued with different effective configuration"
                 )
+
+        # 依赖引用存在性在提交时检查：只能引用已存在的 Job（队列或当前终态档案）
+        if job.depends_on:
+            queued_snapshots = self._backend.load_queue()
+            existing_uids = {job_uid_from_snapshot(q) for q in queued_snapshots}
+            existing_uids.update(self._backend.load_successes().keys())
+            existing_uids.update(self._backend.load_failed().keys())
+            for dep in job.depends_on:
+                if dep not in existing_uids:
+                    raise TaskLiteError(
+                        f"Job {job.uid!r} references non-existent dependency {dep!r} in depends_on"
+                    )
         inserted = self._backend.enqueue_jobs([job_snapshot])
         return bool(inserted)
 
@@ -365,6 +378,20 @@ class StateStore:
                 existing_by_uid[job_uid_from_snapshot(queued)] = queued
             except (KeyError, TypeError, ValueError, TaskLiteError):
                 continue
+
+        existing_uids = set(existing_by_uid.keys())
+        existing_uids.update(self._backend.load_successes().keys())
+        existing_uids.update(self._backend.load_failed().keys())
+        for snap in job_snapshots:
+            snap_uid = job_uid_from_snapshot(snap)
+            deps = snap.get("depends_on") or []
+            for dep in deps:
+                if dep not in existing_uids:
+                    raise TaskLiteError(
+                        f"Job {snap_uid!r} references non-existent dependency {dep!r} in depends_on"
+                    )
+            existing_uids.add(snap_uid)
+
         fresh_snapshots: list[dict[str, Any]] = []
         for snap in job_snapshots:
             uid = job_uid_from_snapshot(snap)

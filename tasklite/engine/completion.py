@@ -198,7 +198,9 @@ class CompletionMachine:
         spawned_job_snapshots: list[dict[str, Any]] = []
         if result.success and result.spawned_jobs:
             try:
-                spawned_job_snapshots = self._collect_spawned_job_snapshots(uid, result.spawned_jobs)
+                spawned_job_snapshots = self._collect_spawned_job_snapshots(
+                    uid, result.spawned_jobs, entry=entry
+                )
             except Exception as err:
                 logger.error(f"Spawned jobs validation failed for {uid}: {err}")
                 result.success = False
@@ -415,13 +417,40 @@ class CompletionMachine:
         result.will_retry = False
 
     def _collect_spawned_job_snapshots(
-        self, parent_uid: str, spawned_jobs: Sequence[Job]
+        self,
+        parent_uid: str,
+        spawned_jobs: Sequence[Job],
+        *,
+        entry: InFlightJob | None = None,
     ) -> list[dict[str, Any]]:
-        """动态子任务去重与规范化。"""
+        """动态子任务声明顺序校验、去重与规范化。"""
         store = self._store
         spawned_job_snapshots: list[dict[str, Any]] = []
         if not spawned_jobs:
             return spawned_job_snapshots
+
+        # 依赖引用校验：只能引用派发时已知的 Job、当前父 Job，以及本次先前声明的 Job
+        if entry is not None and entry.known_job_uids:
+            allowed_uids: set[str] = set(entry.known_job_uids)
+        elif store.state is not None:
+            allowed_uids = (
+                set(store.state.queue_uids)
+                | set(store.state.in_flight_uids)
+                | set(store.state.success_uids)
+                | set(store.state.failed_uids)
+            )
+        else:
+            allowed_uids = set()
+        allowed_uids.add(parent_uid)
+
+        for spawned_job in spawned_jobs:
+            for dep in spawned_job.depends_on:
+                if dep not in allowed_uids:
+                    raise ValueError(
+                        f"Spawned job {spawned_job.uid!r} references non-existent, future, "
+                        f"or cross-worker dependency {dep!r}"
+                    )
+            allowed_uids.add(spawned_job.uid)
 
         seen_in_batch: set[str] = set()
         unique_spawned_jobs: list[Job] = []

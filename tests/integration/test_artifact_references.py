@@ -39,8 +39,8 @@ def test_direct_dependency_publishes_directory_for_actual_file_input(tmp_path):
     pipeline.register_task("build", build_bundle)
     pipeline.register_task("consume", consume_bundle)
     try:
-        pipeline.enqueue(Job("consume", "one", depends_on=["build::one"]))
         pipeline.enqueue(Job("build", "one"))
+        pipeline.enqueue(Job("consume", "one", depends_on=["build::one"]))
         result = pipeline.run()
         assert result is None
         assert len(pipeline.backend.load_successes()) == 2

@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 
 from ..exceptions import TaskLiteError
 from ..models.job import Job
-from ..models.state import PipelineState, job_uid_from_snapshot
-from ..selection import Selection
+from ..models.state import DependencyStatus, PipelineState, job_uid_from_snapshot
+from ..selection import Exclude
 from .resource import Resource, ResourceManager
 
 logger = logging.getLogger("tasklite")
@@ -177,11 +177,43 @@ class JobScheduler:
             self.resources = resources
             self.resource_mgr = ResourceManager(resources, tasks=tasks)
         self.ordering_policy: OrderingPolicy = ordering_policy if ordering_policy is not None else FifoOrderingPolicy()
-        # 执行选择由 EngineRuntime 单点注入（None = 默认全执行）；本属性是
-        # 内部注入面，外部不得直接赋值（须与 StateStore 的选择事实源一致）。
-        self.selection: Selection | None = None
+        self.exclude: Exclude | None = None
+        self._temporary_excluded_uids: set[str] = set()
         self._job_cache: dict[tuple[str, str], JobFacts] = {}
         self._JOB_CACHE_MAX = 100_000
+
+    def temporarily_exclude(self, job_uid: str) -> None:
+        """内部排除入口：登记单个临时排除 UID（供授权拒绝等复用）。"""
+        self._temporary_excluded_uids.add(job_uid)
+
+    def clear_temporary_exclusions(self) -> None:
+        """清空临时排除 UID 集合（每次 Run 启动时重置）。"""
+        self._temporary_excluded_uids.clear()
+
+    def is_job_excluded(self, job_uid: str, task_type: str) -> bool:
+        """统一判断作业是否被排除（用户 exclude 规则或运行期临时排除）。"""
+        if job_uid in self._temporary_excluded_uids:
+            return True
+        if self.exclude is not None and self.exclude.matches_task_type(task_type):
+            return True
+        return False
+
+    def is_job_excluded_by_uid(self, job_uid: str) -> bool:
+        """按 UID 查询是否被排除（临时排除或根据 task_type 前缀比对 exclude 规则）。"""
+        if job_uid in self._temporary_excluded_uids:
+            return True
+        if self.exclude is None:
+            return False
+        parts = job_uid.split("::", 1)
+        if len(parts) == 2:
+            return self.exclude.matches_task_type(parts[0])
+        return False
+
+    def reset_run(self, exclude: Exclude | None = None) -> None:
+        """Run 生命周期重置：固化排除规则并清空临时排除与调度缓存。"""
+        self.exclude = exclude
+        self._temporary_excluded_uids.clear()
+        self.begin_round()
 
     def begin_round(self) -> None:
         """清空调度缓存（**run 生命周期**，由运行主循环加载期调用）。
@@ -281,15 +313,6 @@ class JobScheduler:
         in_flight_set = set(in_flight_uids)
         pending_or_running = queue_uids | in_flight_set
 
-        # 本批活跃集合：活跃态遮蔽历史终态（排除被 Exclude 延迟阻断者）
-        excluded_uids: set[str] = set()
-        if self.selection is not None and self.selection.is_active:
-            for job_snapshot in queue_snapshots:
-                tt = job_snapshot.get("task_type")
-                if tt and not self.selection.allows_task_type(tt):
-                    excluded_uids.add(job_uid_from_snapshot(job_snapshot))
-        active_uids = pending_or_running - excluded_uids
-
         runnable_idx = None
         min_wait = float('inf')
         waiting_for_dependency = False
@@ -311,19 +334,12 @@ class JobScheduler:
                 malformed_uids.append(job_uid_from_snapshot(job_snapshot))
                 continue
 
-            # 执行选择：命中 Skip/Exclude 的作业在依赖/资源评估之前整体
-            # 跳过——不贡献 missing/unknown/impossible/min_wait/
-            # has_potential_spawners 任何停摆事实；Skip 由运行期跳过阶段收敛
-            # 为终态，Exclude 由停摆仲裁判为留队延迟。None / 空规则集短路。
-            selection = self.selection
-            if (
-                selection is not None
-                and selection.is_active
-                and not selection.allows_task_type(job.task_type)
-            ):
+            # 排除规则与临时排除：命中排除的作业在依赖/资源评估之前整体跳过，
+            # 不贡献 missing/unknown/impossible/min_wait/has_potential_spawners 等停摆事实。
+            if self.is_job_excluded(job.uid, job.task_type):
                 continue
 
-            # 依赖屏障与就绪判定：活跃遮蔽历史，失败优先于去重
+            # 依赖屏障与就绪判定：统一调用 state.check_dependency_status
             can_run = True
             failed_dependency = None
             has_missing_dep = False
@@ -331,28 +347,24 @@ class JobScheduler:
 
             if job.depends_on:
                 for dep_uid in job.depends_on:
-                    if dep_uid in active_uids:
-                        # 1. 依赖作业在本批活跃（队列待跑或在途执行）：必须等待其完成
+                    status = state.check_dependency_status(
+                        dep_uid,
+                        in_flight_uids=in_flight_uids,
+                        is_dep_excluded=self.is_job_excluded_by_uid,
+                    )
+                    if status == DependencyStatus.ACTIVE or status == DependencyStatus.EXCLUDED:
                         waiting_for_dep = True
                         can_run = False
-                    elif dep_uid in state.trigger_skipped_uids:
+                    elif status == DependencyStatus.SATISFIED:
                         continue
-                    elif dep_uid in failed_map:
-                        # 2. 依赖作业不在活跃集且处于失败档案：依赖失败，优先于 trigger 去重
+                    elif status == DependencyStatus.FAILED:
                         failed_dependency = dep_uid
                         can_run = False
                         break
-                    elif dep_uid in successes_map:
-                        # 3. 依赖作业不在活跃集且处于成功档案：依赖就绪
-                        continue
-                    elif dep_uid in pending_or_running:
-                        # 4. 依赖作业在队列中（如被 Exclude 延迟阻断）：等待其就绪，非缺失依赖
-                        waiting_for_dep = True
-                        can_run = False
-                    else:
-                        # 5. 依赖作业既不在活跃集/队列，也无任何终态：真正缺失依赖
+                    elif status == DependencyStatus.MISSING:
                         has_missing_dep = True
                         can_run = False
+                        break
 
             if failed_dependency:
                 if pending_dep_failure is None:

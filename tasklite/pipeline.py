@@ -34,7 +34,7 @@ from .engine.store import FailureEntry
 from .engine.types import ExecutionOptions
 from .models.job import Job, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry
-from .selection import Rule, Selection
+from .selection import Exclude
 
 logger = logging.getLogger("tasklite")
 
@@ -439,25 +439,6 @@ class TaskLite:
                 "would be silently ignored). Pass overrides inside the Task."
             )
 
-    def selection(self, *rules: Rule) -> "TaskLite":
-        """设置执行选择规则集（pipeline 属性，不是 run() 参数）。
-
-        每次调用**整体替换**规则集，0 参数 = 重置为默认全执行；返回 self
-        支持链式。两类规则语义严格区分：
-
-        - ``Exclude(task_type=...)``：本次不执行、原样留队（不写 attempt、不进
-          successes/失败档案、不消耗资源与预算），下游同样留队，下一次 run 自动
-          恢复执行；仅因排除而停摆时 `run()` 以 COMPLETED 收敛并保留队列。
-        - ``Skip(task_type=...)``：终态跳过（移出 queue、不进 successes/失败档案），
-          下游整链级联跳过（attempt 记 ``DEPENDENCY_SKIPPED``），下次不再
-          执行。
-
-        同一 task_type 同时命中时 Skip 优先。
-        """
-        self._ensure_not_running("selection")
-        self._runtime.set_selection(Selection(rules))
-        return self
-
     def register_trigger(self, name: str, fn: Callable[["TriggerContext"], bool]) -> None:
         """注册主进程触发条件；内置名称与重复名称不允许覆盖。"""
         self._ensure_not_running("register_trigger")
@@ -555,9 +536,17 @@ class TaskLite:
     def run(
         self,
         *,
+        exclude: Exclude | None = None,
         install_signals: bool = True,
     ) -> None:
-        """运行管线直到队列排空（或收到排空请求）。"""
+        """运行管线直到队列排空（或收到排空请求）。
+
+        ``exclude`` 仅接受单个 Exclude 对象或 None；命中作业及其受影响下游本次留队。
+        """
+        if exclude is not None and not isinstance(exclude, Exclude):
+            raise TypeError(
+                f"exclude must be an Exclude instance or None, got {type(exclude).__name__}"
+            )
         logger.info(
             f"=== Starting Pipeline: {self.name} "
             f"(Backend: {self.backend_type}) ==="
@@ -565,6 +554,7 @@ class TaskLite:
         self._runtime.execute(
             ExecutionOptions(
                 install_signals=install_signals,
+                exclude=exclude,
             )
         )
 

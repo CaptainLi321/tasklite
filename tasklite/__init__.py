@@ -27,8 +27,8 @@ __version__ = "2.2.1"
 # ── 门面（六步调用契约的唯一入口）────────────────────────────────────
 from .pipeline import TaskLite
 
-# ── 执行选择（pipeline 级规则值对象与规则集）─────────────────────────
-from .selection import Exclude, Selection, Skip
+# ── 执行选择（排除规则值对象）─────────────────────────────────────────
+from .selection import Exclude
 
 # ── 模型层：规格 / 实例 / 结果 / 轨迹 / 上下文 ────────────────────────
 from .models.artifact import FileSpec
@@ -98,8 +98,6 @@ __all__ = [
     "TaskLite",
     # 执行选择
     "Exclude",
-    "Selection",
-    "Skip",
     # 模型层
     "AttemptRecord",
     "FileSpec",

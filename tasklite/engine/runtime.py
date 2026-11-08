@@ -42,7 +42,7 @@ from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
-from ..selection import Selection
+from ..selection import Exclude
 from ..utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
@@ -133,27 +133,24 @@ class EngineRuntime:
 
         self._run_lock_fd: int | None = None
         self._is_running: bool = False
-        # 执行选择（pipeline 属性）：None = 默认全执行；门面经 set_selection
-        # 注入后同步到调度器与 StateStore（终态写入出口），execute() 启动期
-        # 再固化一次即 per-run 快照。
-        self._selection: Selection | None = None
-        self.selection_machine: SelectionMachine | None = None
-        # Skip 终态跳过的 run 级状态：脏标记驱动跳过阶段（run 启动 + 派生作业落队后）
-        self._skip_dirty: bool = False
+        self._exclude: Exclude | None = None
+        self._temporary_excluded_uids: set[str] = set()
+        self.selection_machine: SelectionMachine = SelectionMachine(self.store)
 
-    def set_selection(self, selection: Selection | None) -> None:
-        """注入执行选择（仅 run() 外；门面已守卫，此处提供运行期双保险）。"""
-        if self._is_running:
-            raise RuntimeError(
-                "selection() is only allowed outside run(); current run is in progress."
-            )
-        self._selection = selection
-        if selection is not None and selection.is_active:
-            self.selection_machine = SelectionMachine(selection, self.store)
-        else:
-            self.selection_machine = None
-        self.scheduler.selection = selection
-        self.store._set_selection(selection)
+    def temporarily_exclude(self, job_uid: str) -> None:
+        """内部排除入口：登记单个临时排除 UID（供授权拒绝等复用）。"""
+        self._temporary_excluded_uids.add(job_uid)
+        self.scheduler.temporarily_exclude(job_uid)
+        self.store.temporarily_exclude(job_uid)
+        self.selection_machine.temporarily_exclude(job_uid)
+
+    def is_job_excluded(self, job_uid: str, task_type: str) -> bool:
+        """统一判断作业是否被排除（用户 exclude 规则或运行期临时排除）。"""
+        if job_uid in self._temporary_excluded_uids:
+            return True
+        if self._exclude is not None and self._exclude.matches_task_type(task_type):
+            return True
+        return False
 
     @property
     def session(self) -> RunSession:
@@ -202,11 +199,11 @@ class EngineRuntime:
         if self._is_running:
             raise RuntimeError("Pipeline run() already in progress on this instance.")
         self._is_running = True
-        if self.selection_machine is not None:
-            self.selection_machine.reset_run()
-        self.scheduler.selection = self._selection
-        self.store._set_selection(self._selection)
-        self._skip_dirty = False
+        self._exclude = opts.exclude
+        self._temporary_excluded_uids.clear()
+        self.scheduler.reset_run(opts.exclude)
+        self.store.set_run_exclusions(opts.exclude, self._temporary_excluded_uids)
+        self.selection_machine.set_exclusions(opts.exclude, self._temporary_excluded_uids)
 
         old_sigterm = None
         old_sigint = None
@@ -301,9 +298,6 @@ class EngineRuntime:
                     dispatched += 1
                     continue
                 if outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS:
-                    # 残留结果认领可派生作业，必须在后续派发与仲裁前收敛 Skip。
-                    if self._session.stop_mode is StopMode.NONE:
-                        self._apply_selection_skips()
                     continue
                 break
         return last_outcome, worker_wait, dispatched
@@ -320,11 +314,17 @@ class EngineRuntime:
                 should_terminate = True
             elif not self._in_flight:
                 if self.selection_machine is not None:
-                    decision = self.governor.arbitrate(
-                        last_outcome.standstill,
-                        store=self.store,
-                        selection_machine=self.selection_machine,
-                    )
+                    try:
+                        decision = self.governor.arbitrate(
+                            last_outcome.standstill,
+                            store=self.store,
+                            selection_machine=self.selection_machine,
+                        )
+                    except TypeError:
+                        decision = self.governor.arbitrate(
+                            last_outcome.standstill,
+                            store=self.store,
+                        )
                 else:
                     decision = self.governor.arbitrate(
                         last_outcome.standstill,
@@ -361,14 +361,6 @@ class EngineRuntime:
             "completed with the queue preserved."
         )
 
-    def _apply_selection_skips(self) -> None:
-        """终态跳过：委托 SelectionMachine 收敛 Skip 闭包与审计轨迹。"""
-        if self.selection_machine is not None and self.selection_machine.has_skip_rules:
-            self.selection_machine.apply_skips(
-                run_id=self._session.run_id,
-                dispatch_no_supplier=self._session.next_dispatch_no,
-            )
-
     def _drain_and_settle(self) -> int:
         """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
         if not self._in_flight:
@@ -397,10 +389,6 @@ class EngineRuntime:
                 self._recovery.save_queue_crash_safe()
                 return self._terminal_outcome()
 
-        # 0.5 执行选择·Skip：run 启动与派生作业落队后把终态跳过收敛掉
-        if self._skip_dirty:
-            self._skip_dirty = False
-            self._apply_selection_skips()
         if store.state.is_empty and not self._in_flight:
             return self._terminal_outcome()
 
@@ -418,9 +406,6 @@ class EngineRuntime:
 
         # 3. Drain 回收在途结果并统一结算
         settled_count = self._drain_and_settle()
-        if settled_count:
-            # 派生作业可能带 Skip 命中或依赖已跳过上游，下一拍先收敛跳过闭包
-            self._skip_dirty = True
 
         # 4. 等待/空闲决策（唯一实现见 wait.decide_wait）
         is_idle = store.state.is_empty and not self._in_flight
