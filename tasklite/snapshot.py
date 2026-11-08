@@ -813,6 +813,8 @@ class StateSnapshot:
         if isinstance(source, (str, Path)):
             reader = _SqliteSnapshotReader(Path(source))
         elif hasattr(source, "backend"):
+            if getattr(source, "_closed", False):
+                raise RuntimeError("Cannot open StateSnapshot from a closed TaskLite instance.")
             b = source.backend
             if hasattr(b, "path"):
                 reader = _SqliteSnapshotReader(Path(b.path))

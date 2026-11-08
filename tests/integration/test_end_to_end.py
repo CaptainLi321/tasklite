@@ -49,14 +49,19 @@ def _subprocess_pythonpath(monkeypatch):
 
 def _make_pipeline(tmp_path, **overrides) -> TaskLite:
     """真实子进程管线（sqlite 后端 + 产物根）。"""
-    defaults: dict = dict(
-        name="e2e_pipeline",
-        state_dir=tmp_path / "state",
-        backend="sqlite",
-        output_roots=tmp_path / "output",
+    out = tmp_path / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    overrides.pop("name", None)
+    overrides.pop("state_dir", None)
+    state_path = overrides.pop("state_path", tmp_path / "e2e_state.db")
+    backend = overrides.pop("backend", "sqlite")
+    output_roots = overrides.pop("output_roots", out)
+    return TaskLite(
+        backend=backend,
+        state_path=state_path,
+        output_roots=output_roots,
+        **overrides,
     )
-    defaults.update(overrides)
-    return TaskLite(**defaults)
 
 
 # ── 模块级 handler（spawn 子进程经 pickle 接收）───────────────────────

@@ -121,10 +121,9 @@ def pipelines(tmp_path):
 
     def create() -> TaskLite:
         pipeline = TaskLite(
-            name="pipe_ipc_lifecycle",
-            state_dir=tmp_path / "state",
-            output_roots=tmp_path / "output",
             backend="sqlite",
+            state_path=tmp_path / "state.db",
+            output_roots=tmp_path / "output",
             max_workers=1,
         )
         pipeline.register_resource(CapacityResource("api", max_capacity=1.0))

@@ -123,8 +123,8 @@ class DispatchMachine:
         recovery: "RecoveryOrchestrator",
         tasks: "TaskSource",
         output_roots: "Path | Sequence[Path] | None",
-        ipc_dir: str,
-        commit_failure_threshold: int,
+        ipc_dir: str | None = None,
+        commit_failure_threshold: int = 10,
         protected_roots: tuple[Path, ...] = (),
         classifier: "ErrorClassifier | None" = None,
     ) -> None:

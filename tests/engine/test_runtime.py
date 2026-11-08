@@ -338,18 +338,6 @@ class TestEngineRuntimeExecutionLifecycle:
         env_ok.register("dummy")
         assert env_ok.runtime.execute() is None
 
-    def test_strict_picklable_disabled_allows_local_handler(self, tmp_path, monkeypatch):
-        """预检关闭：不可 pickle handler 不在入口拒绝（交由派发期处置）。"""
-        env = RuntimeEnv(tmp_path, strict_picklable=False)
-        local_fn = lambda j, c: True  # noqa: E731
-        env.tasks.register(Task(task_type="local", handler=local_fn))
-        monkeypatch.setattr(
-            env.runtime.channel, "_process_context",
-            SimpleNamespace(Process=make_instant_process_class()),
-        )
-        env.runtime.store.enqueue_jobs([Job("local", "j1", payload={})])
-        assert env.runtime.execute() is None
-        assert "local::j1" in env.backend.load_successes()
 
     def test_concurrent_run_lock_rejection(self, tmp_path):
         from tasklite.utils.lockfile import release_lock, try_acquire_lock

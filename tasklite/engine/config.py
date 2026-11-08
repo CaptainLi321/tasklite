@@ -115,8 +115,6 @@ class RunConfig:
     创建（其 on_attempt_finished 回调绑定 RunSession，随会话存活）。
     """
     # ── 装配件 ──
-    name: str
-    ipc_dir: str
     backend: AbstractStateBackend
     resources: ResourceManager
     tasks: TaskRegistry
@@ -126,7 +124,8 @@ class RunConfig:
     trigger_registry: TriggerRegistry
     requeue_policy: RequeuePolicy
     ordering_policy: OrderingPolicy
-    # ── 调优标量（默认值唯一落点）──
+    name: str = "tasklite"
+    ipc_dir: str | None = None
     output_roots: Path | Sequence[Path] | None = None
     protected_roots: tuple[Path, ...] = ()
     strict_picklable: bool = True
@@ -138,8 +137,6 @@ class RunConfig:
     def resolve(
         cls,
         *,
-        name: str,
-        ipc_dir: str,
         backend: AbstractStateBackend,
         resources: ResourceManager,
         tasks: TaskRegistry,
@@ -147,6 +144,8 @@ class RunConfig:
         classifier: ErrorClassifier,
         governor: DeadlockGovernor,
         trigger_registry: TriggerRegistry,
+        name: str = "tasklite",
+        ipc_dir: str | None = None,
         requeue_policy: RequeuePolicy | None = None,
         ordering_policy: OrderingPolicy | None = None,
         output_roots: Path | Sequence[Path] | None = None,

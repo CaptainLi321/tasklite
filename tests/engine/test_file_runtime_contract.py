@@ -42,7 +42,7 @@ def test_from_output_reference_and_resolution(tmp_path, monkeypatch):
     """from_output 保留配置引用且 Attempt 记录解析出规范绝对路径。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
-    p = TaskLite(name="t_ref", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("producer", _producer_handler)
     p.register_task("consumer", _consumer_handler)
 
@@ -83,7 +83,7 @@ def test_from_output_unpublished_name_fails_immediately(tmp_path, monkeypatch):
     """from_output 引用生产者未发布产物名称直接失败。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
-    p = TaskLite(name="t_unpub", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("producer", _producer_handler)
     p.register_task("consumer", _consumer_handler)
 
@@ -109,7 +109,7 @@ def test_from_output_missing_disk_input_fails_immediately(tmp_path, monkeypatch)
     """上游虽已发布但磁盘 input 产物缺失直接失败。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
-    p = TaskLite(name="t_missing_disk", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("producer", _producer_handler)
     p.register_task("consumer", _consumer_handler)
 
@@ -163,7 +163,7 @@ def test_duplicate_declaration_idempotent_and_conflict(tmp_path, monkeypatch):
     """同声明重复不重复删除，缺失删除目标视为完成；同名异声明报冲突。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
-    p = TaskLite(name="t_idem", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("idem", _idempotent_handler)
     p.enqueue(Job("idem", "j1"))
     p.run()
@@ -191,7 +191,7 @@ def test_input_role_cleanup_policies(tmp_path, monkeypatch):
     in_file = tmp_path / "to_clean.txt"
     in_file.write_text("temporary input", encoding="utf-8")
 
-    p = TaskLite(name="t_in_clean", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("clean_task", _clean_input_handler)
     p.enqueue(Job("clean_task", "c1"))
     p.run()
@@ -214,7 +214,7 @@ def test_success_cleanup_failure_blocks_success_spawn_and_cursor(tmp_path, monke
     """成功清理失败不发布成功/派生/游标，配置与实际文件记录分开。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
-    p = TaskLite(name="t_clean_fail", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("fail_clean", _fail_cleanup_handler)
     p.register_task("spawned", _noop_handler)
     p.enqueue(Job("fail_clean", "fc1"))
@@ -252,7 +252,7 @@ def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch)
     """handler 已失败且失败清理再次失败：保留原始失败原因，附加清理错误。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
-    p = TaskLite(name="t_fail_fail", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("failing", _failing_handler)
     p.enqueue(Job("failing", "f1"))
 
@@ -284,7 +284,7 @@ def _deny_sensitive_authorizer(path, target_type):
 def test_authorization_denied_reverts_to_pending_and_excludes_downstream(tmp_path, monkeypatch):
     """拒绝/stop期间其他在途可结算；受阻worker结束后才回pending，同Run不重复派发。"""
     monkeypatch.chdir(tmp_path)
-    p = TaskLite(name="t_auth_deny", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
 
     p.authorizer = _deny_sensitive_authorizer
     p.register_task("protected", _auth_denied_handler)

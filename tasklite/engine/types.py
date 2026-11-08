@@ -86,7 +86,7 @@ class JobHandle:
     timeout_at_monotonic: float
     timeout_seconds: float
     job: Job
-    ipc_dir: str
+    ipc_dir: str | None = None
     execution_id: str | None = None
     auth_denied: bool = False
     paused_remaining: float | None = None

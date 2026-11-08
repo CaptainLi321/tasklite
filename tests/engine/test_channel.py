@@ -340,14 +340,19 @@ class TestSpawnFailureCleanup:
         with pytest.raises(RuntimeError, match="process start failed"):
             channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), tmp_path))
 
-    def test_submit_requires_ipc_dir(self, monkeypatch):
+    def test_submit_without_ipc_dir(self, monkeypatch):
         monkeypatch.delenv("TASKLITE_IPC_DIR", raising=False)
+        started = []
+        class DummyProcess:
+            def start(self):
+                started.append(True)
         channel = ExecutionChannel(
-            process_context=type("Ctx", (), {"Process": lambda *a, **k: None})()
+            process_context=type("Ctx", (), {"Process": lambda *a, **k: DummyProcess()})()
         )
         job = Job("t", "j1")
-        with pytest.raises(ValueError, match="ipc_dir"):
-            channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), None))
+        handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), None))
+        assert handle is not None
+        assert started == [True]
 
 
 class TestHandlerInvalidReturnTypes:

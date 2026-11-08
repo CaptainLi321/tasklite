@@ -1459,6 +1459,10 @@ class SQLiteStateBackend(AbstractStateBackend):
                     pass
         return False
 
+    def close(self) -> None:
+        """关闭后端并释放资源（幂等）。"""
+        pass
+
 
 __all__ = ["SQLiteStateBackend", "TARGET_SCHEMA_VERSION"]
 

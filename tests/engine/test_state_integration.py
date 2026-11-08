@@ -37,7 +37,7 @@ def test_startup_invariant_conflict_raises_runtime_error(tmp_path: Path):
             "VALUES ('t::1', 0, '{\"task_type\":\"t\",\"job_id\":\"1\"}', 'running', 'run_old', 1, '2026-01-01T00:00:00+00:00')"
         )
 
-    pipeline = TaskLite(name="conflict", state_dir=tmp_path, backend="sqlite")
+    pipeline = TaskLite(backend="sqlite", state_path=db_path)
     with pytest.raises(RuntimeError, match="Invariant conflict"):
         pipeline.run()
 
@@ -50,7 +50,7 @@ def test_leftover_running_recovery_and_idempotence(tmp_path: Path):
     att_no = backend.mark_job_running("work::orphan", run_id="run_crash", started_at="2026-01-01T00:00:00+00:00")
     assert att_no == 1
 
-    pipeline = TaskLite(name="recovery", state_dir=tmp_path, backend="sqlite")
+    pipeline = TaskLite(backend="sqlite", state_path=db_path)
     # 启动时恢复
     pipeline.run()
 
@@ -67,7 +67,7 @@ def test_leftover_running_recovery_and_idempotence(tmp_path: Path):
     assert pipeline.backend.load_queue() == []
 
     # 再次启动，幂等不产生重复 attempts
-    pipeline2 = TaskLite(name="recovery", state_dir=tmp_path, backend="sqlite")
+    pipeline2 = TaskLite(backend="sqlite", state_path=db_path)
     pipeline2.run()
     attempts2 = pipeline2.backend.load_attempts("work::orphan")
     assert len(attempts2) == 1
@@ -85,7 +85,7 @@ def child_consumer_handler(job, ctx):
 
 def test_parent_success_atomic_with_spawned_and_cursor(tmp_path: Path):
     """父作业成功与动态派生及游标同事务提交；子作业入队为 pending，游标已落盘。"""
-    pipeline = TaskLite(name="spawn_cursor", state_dir=tmp_path, backend="sqlite", strict_picklable=False)
+    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "spawn_cursor.db")
     pipeline.register_task("parent", parent_spawn_and_cursor_handler)
     pipeline.register_task("child", child_consumer_handler)
     pipeline.enqueue(Job("parent", "p1"))
@@ -108,7 +108,7 @@ def bad_parent_handler(job, ctx):
 
 def test_invalid_spawned_job_rejects_parent_and_discards_effects(tmp_path: Path):
     """非法派生子作业导致父作业失败，所有暂存派生任务和游标更新整体丢弃。"""
-    pipeline = TaskLite(name="bad_spawn", state_dir=tmp_path, backend="sqlite", strict_picklable=False)
+    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "bad_spawn.db")
     pipeline.register_task("parent", bad_parent_handler)
     pipeline.enqueue(Job("parent", "p1"))
     pipeline.run()
@@ -136,7 +136,7 @@ def test_attempt_no_monotonic_advance_including_zero_budget_retry(tmp_path: Path
     counter_file = tmp_path / "runs.txt"
     counter_file.write_text("0")
 
-    pipeline = TaskLite(name="monotonic", state_dir=tmp_path, backend="sqlite", strict_picklable=False)
+    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "monotonic.db")
     pipeline.register_task("worker", file_counter_retry_handler)
     pipeline.enqueue(Job("worker", "m1", payload={"counter_file": str(counter_file)}))
     pipeline.run()

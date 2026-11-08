@@ -174,8 +174,8 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
     if kind == "input":
         path.write_text("input")
     pipeline = TaskLite(
-        "transport",
-        state_dir=tmp_path / "state",
+        backend="sqlite",
+        state_path=tmp_path / "transport.db",
         output_roots=output_root,
     )
     pipeline.register_task("transport", _write_declaration_with_io_fault)

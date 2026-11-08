@@ -31,10 +31,10 @@ def retry_then_succeed_handler(job, ctx):
 @pytest.fixture(params=["sqlite", "memory"])
 def pipeline_fixture(request, tmp_path):
     backend_type = request.param
+    state_path = (tmp_path / f"state_{backend_type}.db") if backend_type == "sqlite" else None
     p = TaskLite(
-        name=f"test_snap_{backend_type}",
-        state_dir=tmp_path / f"state_{backend_type}",
         backend=backend_type,
+        state_path=state_path,
     )
     p.register_task(Task("process", dummy_handler))
     p.register_task(Task("generate", dummy_handler))
@@ -62,7 +62,7 @@ class TestStateSnapshotOpeningAndClosing:
         assert s1.is_closed is True
 
         # 从 TaskLite 实例打开
-        pipeline = TaskLite("test_open", tmp_path / "pl_state", backend="memory")
+        pipeline = TaskLite(backend="memory")
         pipeline.register_task(Task("process", dummy_handler))
         pipeline.enqueue(Job("process", "m1"))
 
@@ -160,7 +160,7 @@ class TestJobRecordStructureAndPriority:
     """Job 与 Attempt 记录结构分层、FileSpec 样本与优先级。"""
 
     def test_record_structure_and_filespec_sample(self, tmp_path):
-        p = TaskLite("test_struct", tmp_path / "state", backend="sqlite")
+        p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         p.register_task(Task("generate", dummy_handler))
         p.register_task(Task("process", dummy_handler))
 
@@ -336,7 +336,7 @@ class TestQueriesAndFilters:
                 list(s.iter_jobs(status="unknown"))  # type: ignore[arg-type]
 
     def test_iter_attempts_ordered_by_attempt_no(self, tmp_path):
-        p = TaskLite("test_attempts", tmp_path / "state", backend="sqlite")
+        p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         p.register_task(Task("process", retry_then_succeed_handler))
         p.enqueue(Job("process", "j_retry", max_retries_per_run=5))
         p.run()

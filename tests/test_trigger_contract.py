@@ -6,8 +6,8 @@ def handle(job, ctx):
     return True
 
 
-def test_custom_trigger_observes_inherited_task_spec(tmp_path):
-    pipeline = TaskLite(name="trigger", state_dir=tmp_path, backend="memory")
+def test_custom_trigger_observes_inherited_task_spec():
+    pipeline = TaskLite(backend="memory")
     seen = []
     pipeline.register_trigger("inspect", lambda ctx: seen.append(ctx.job.to_dict()) or False)
     pipeline.register_task("t", handle, max_retries_per_run=7, timeout_seconds=12,
@@ -21,8 +21,8 @@ def test_custom_trigger_observes_inherited_task_spec(tmp_path):
     assert seen[0]["trigger"] == "inspect"
 
 
-def test_fresh_trigger_skip_allows_dependent_trigger(tmp_path):
-    pipeline = TaskLite(name="skip", state_dir=tmp_path, backend="memory")
+def test_fresh_trigger_skip_allows_dependent_trigger():
+    pipeline = TaskLite(backend="memory")
     seen = []
     pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
     pipeline.register_task("t", handle, trigger="observe")
@@ -35,9 +35,9 @@ def test_fresh_trigger_skip_allows_dependent_trigger(tmp_path):
     assert "t::b" in pipeline.backend.load_failed()
 
 
-def test_task_resource_merge_and_explicit_false_zero_overrides(tmp_path):
+def test_task_resource_merge_and_explicit_false_zero_overrides():
     from tasklite import CapacityResource
-    pipeline = TaskLite(name="override", state_dir=tmp_path, backend="memory")
+    pipeline = TaskLite(backend="memory")
     pipeline.register_resource(CapacityResource("gpu", max_capacity=5.0))
     pipeline.register_resource(CapacityResource("cpu", max_capacity=5.0))
     pipeline.register_task("t", handle, resources={"gpu": 2, "cpu": 1},
@@ -50,8 +50,8 @@ def test_task_resource_merge_and_explicit_false_zero_overrides(tmp_path):
     assert (row["max_retries_per_run"], row["timeout_seconds"], row["trigger"]) == (0, 2, "once")
 
 
-def test_restored_none_spec_inherits_task_before_trigger(tmp_path):
-    pipeline = TaskLite(name="restore", state_dir=tmp_path, backend="memory")
+def test_restored_none_spec_inherits_task_before_trigger():
+    pipeline = TaskLite(backend="memory")
     seen = []
     pipeline.register_trigger("inspect", lambda ctx: seen.append(ctx.job.max_retries_per_run) or False)
     pipeline.register_task("t", handle, max_retries_per_run=9, trigger="inspect")
@@ -62,9 +62,9 @@ def test_restored_none_spec_inherits_task_before_trigger(tmp_path):
     assert seen == [9]
 
 
-def test_unknown_trigger_raises_preserving_candidate_and_budget(tmp_path):
+def test_unknown_trigger_raises_preserving_candidate_and_budget():
     import pytest
-    pipeline = TaskLite(name="unknown", state_dir=tmp_path, backend="memory")
+    pipeline = TaskLite(backend="memory")
     pipeline.register_task("t", handle)
     pipeline.enqueue(Job("t", "a", trigger="missing"))
     before = pipeline.backend.load_queue()
@@ -75,14 +75,14 @@ def test_unknown_trigger_raises_preserving_candidate_and_budget(tmp_path):
     assert list(pipeline.list_failures()) == []
 
 
-def test_callback_failure_and_non_bool_return_preserve_queue(tmp_path):
+def test_callback_failure_and_non_bool_return_preserve_queue():
     import pytest
     for name, fn, error in [
         ("error", lambda ctx: 1 / 0, ZeroDivisionError),
         ("integer", lambda ctx: 1, TypeError),
         ("none", lambda ctx: None, TypeError),
     ]:
-        pipeline = TaskLite(name=name, state_dir=tmp_path / name, backend="memory")
+        pipeline = TaskLite(backend="memory")
         pipeline.register_trigger(name, fn)
         pipeline.register_task("t", handle, trigger=name)
         pipeline.enqueue(Job("t", "a"))
@@ -94,10 +94,10 @@ def test_callback_failure_and_non_bool_return_preserve_queue(tmp_path):
         assert list(pipeline.list_failures()) == []
 
 
-def test_register_trigger_rejects_duplicate_builtin_and_invalid_callable(tmp_path):
+def test_register_trigger_rejects_duplicate_builtin_and_invalid_callable():
     import pytest
     from tasklite.testing import running
-    pipeline = TaskLite(name="register", state_dir=tmp_path, backend="memory")
+    pipeline = TaskLite(backend="memory")
     for name in ["once", "on_failure", "on_input_change", "always"]:
         with pytest.raises(ValueError):
             pipeline.register_trigger(name, lambda ctx: True)
@@ -181,8 +181,8 @@ def test_input_contract_errors_and_untrusted_baseline(tmp_path):
         on_input_change(ctx)
 
 
-def test_failure_history_skipped_this_batch_allows_downstream(tmp_path):
-    pipeline = TaskLite(name="failed-skip", state_dir=tmp_path, backend="memory")
+def test_failure_history_skipped_this_batch_allows_downstream():
+    pipeline = TaskLite(backend="memory")
     pipeline.register_task("t", handle)
     pipeline.backend.append_failed("t::a", {"error_message": "prior failure"})
     seen = []
@@ -195,9 +195,9 @@ def test_failure_history_skipped_this_batch_allows_downstream(tmp_path):
     assert set(pipeline.backend.load_failed().keys()) == {"t::a", "t::b"}
 
 
-def test_trigger_skip_is_local_to_run(tmp_path):
+def test_trigger_skip_is_local_to_run():
     from tasklite import Exclude
-    pipeline = TaskLite(name="local-skip", state_dir=tmp_path, backend="memory")
+    pipeline = TaskLite(backend="memory")
     seen = []
     pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
     pipeline.register_task("parent", handle, trigger="observe")
@@ -211,8 +211,8 @@ def test_trigger_skip_is_local_to_run(tmp_path):
     assert [entry.job_uid for entry in pipeline.list_failures()] == ["child::b"]
 
 
-def test_stop_after_trigger_skip_does_not_persist_dependency_readiness(tmp_path):
-    pipeline = TaskLite(name="stop-skip", state_dir=tmp_path, backend="memory")
+def test_stop_after_trigger_skip_does_not_persist_dependency_readiness():
+    pipeline = TaskLite(backend="memory")
     def stop_and_skip(ctx):
         pipeline.stop()
         return False
@@ -235,11 +235,11 @@ def test_trigger_skip_does_not_grant_dependency_readiness():
     assert not state.dependency_ready("t::a")
 
 
-def test_retry_uses_same_activation_without_rechecking_trigger(tmp_path, monkeypatch):
+def test_retry_uses_same_activation_without_rechecking_trigger(monkeypatch):
     import multiprocessing as mp
     from tests.test_pipeline import make_instant_process_class
     monkeypatch.setattr(mp, "Process", make_instant_process_class(retry_uid="t::a"))
-    pipeline = TaskLite(name="retry", state_dir=tmp_path, backend="memory")
+    pipeline = TaskLite(backend="memory")
     seen = []
     pipeline.register_trigger("first", lambda ctx: seen.append(ctx.job.attempt_no) or True)
     pipeline.register_task("t", handle, max_retries_per_run=2, trigger="first")
@@ -251,7 +251,7 @@ def test_retry_uses_same_activation_without_rechecking_trigger(tmp_path, monkeyp
     assert len(pipeline.list_failures()) == 1
 
 
-def test_trigger_error_aborts_inflight_without_burning_budget(tmp_path, monkeypatch):
+def test_trigger_error_aborts_inflight_without_burning_budget(monkeypatch):
     import multiprocessing as mp
     import pytest
     class WaitingProcess:
@@ -272,7 +272,7 @@ def test_trigger_error_aborts_inflight_without_burning_budget(tmp_path, monkeypa
         def close(self):
             pass
     monkeypatch.setattr(mp, "Process", WaitingProcess)
-    pipeline = TaskLite(name="abort", state_dir=tmp_path, backend="memory", max_workers=2)
+    pipeline = TaskLite(backend="memory", max_workers=2)
     pipeline.register_trigger("error", lambda ctx: 1 / 0)
     pipeline.register_task("t", handle)
     pipeline.enqueue(Job("t", "a"))

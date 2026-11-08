@@ -26,7 +26,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="独立的示例状态与产物目录")
     args = parser.parse_args()
-    pipeline = TaskLite("trigger_example", state_dir=args.root / "state",
+    (args.root / "files").mkdir(parents=True, exist_ok=True)
+    pipeline = TaskLite(backend="sqlite", state_path=args.root / "state" / "trigger.db",
                         output_roots=args.root / "files")
     pipeline.register_task("source", update_source, trigger="always")
     pipeline.register_task("read", read_source, trigger="on_input_change")

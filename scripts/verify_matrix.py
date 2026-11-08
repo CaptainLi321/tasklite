@@ -43,7 +43,7 @@ def main():
 
     # 2. 端到端管线运行验证（多进程、依赖拓扑、瞬态重试、资源管理、持久化）
     with tempfile.TemporaryDirectory() as tmpdir:
-        pipeline = TaskLite("matrix_verify_pipeline", state_dir=tmpdir, max_workers=2)
+        pipeline = TaskLite(backend="sqlite", state_path=Path(tmpdir) / "matrix.db", max_workers=2)
         pipeline.register_resource(CapacityResource("gpu", max_capacity=2.0))
         pipeline.register_resource(IntervalResource("api", interval_seconds=0.05))
 

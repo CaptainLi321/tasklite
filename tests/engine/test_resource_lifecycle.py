@@ -46,8 +46,6 @@ def test_capacity_two_concurrency_and_third_starts_on_release(tmp_path):
     sync_dir.mkdir()
 
     p = TaskLite(
-        name="test_cap2",
-        state_dir=tmp_path / "state",
         backend="memory",
         max_workers=4,
     )
@@ -114,8 +112,6 @@ def test_check_to_wait_race_does_not_lose_notification():
 def test_extra_notification_wakes_earlier_than_timer(tmp_path):
     """额外通知可早于原计时唤醒。"""
     p = TaskLite(
-        name="test_wake_early",
-        state_dir=tmp_path,
         backend="memory",
         max_workers=2,
     )
@@ -157,8 +153,6 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
 def test_long_wait_no_periodic_scanning(tmp_path):
     """长等待无周期资源扫描：单次计时等待，不进行 1s/0.5s 周期轮询。"""
     p = TaskLite(
-        name="test_no_periodic",
-        state_dir=tmp_path,
         backend="memory",
         max_workers=2,
     )
@@ -211,8 +205,6 @@ def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
             pass
 
     p = TaskLite(
-        name="test_unknown_wait",
-        state_dir=tmp_path,
         backend="memory",
         max_workers=2,
     )
@@ -243,8 +235,6 @@ def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
 def test_impossible_resource_fails_job_without_unexecuted_attempt(tmp_path):
     """资源明确不可能则 Job 失败无未执行 Attempt，且级联下游。"""
     p = TaskLite(
-        name="test_impossible",
-        state_dir=tmp_path,
         backend="memory",
         max_workers=2,
     )
@@ -278,7 +268,7 @@ def test_resource_exception_fails_run(tmp_path):
         def release(self, amount: float) -> None:
             pass
 
-    p = TaskLite(name="test_err_query", state_dir=tmp_path, backend="memory")
+    p = TaskLite(backend="memory")
     p.register_resource(BadQueryResource("bad_q"))
     p.register_task("fast", _fast_handler, resources={"bad_q": 1.0})
     p.enqueue(Job("fast", "j1"))
@@ -296,7 +286,7 @@ def test_resource_exception_fails_run(tmp_path):
         def release(self, amount: float) -> None:
             pass
 
-    p2 = TaskLite(name="test_err_acq", state_dir=tmp_path / "acq", backend="memory")
+    p2 = TaskLite(backend="memory")
     p2.register_resource(BadAcquireResource("bad_acq"))
     p2.register_task("fast", _fast_handler, resources={"bad_acq": 1.0})
     p2.enqueue(Job("fast", "j2"))
@@ -314,7 +304,7 @@ def test_resource_exception_fails_run(tmp_path):
         def release(self, amount: float) -> None:
             raise RuntimeError("release exploded")
 
-    p3 = TaskLite(name="test_err_rel", state_dir=tmp_path / "rel", backend="memory")
+    p3 = TaskLite(backend="memory")
     p3.register_resource(BadReleaseResource("bad_rel"))
     p3.register_task("fast", _fast_handler, resources={"bad_rel": 1.0})
     p3.enqueue(Job("fast", "j3"))
@@ -325,7 +315,7 @@ def test_resource_exception_fails_run(tmp_path):
 
 def test_release_prior_to_final_commit_and_no_dispatch_between(tmp_path):
     """释放先于最终提交且不在两者间派发。"""
-    p = TaskLite(name="test_release_order", state_dir=tmp_path, backend="memory")
+    p = TaskLite(backend="memory")
     cap = CapacityResource("slots", max_capacity=1.0)
     p.register_resource(cap)
 

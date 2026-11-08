@@ -143,6 +143,7 @@ class EngineRuntime:
         )
 
         self._run_lock_fd: int | None = None
+        self._run_memory_locked: bool = False
         self._is_running: bool = False
         self._exclude: Exclude | None = None
         self._temporary_excluded_uids: set[str] = set()
@@ -349,17 +350,35 @@ class EngineRuntime:
         old_sigterm = None
         old_sigint = None
         try:
-            # 1. 单运行排他文件锁（try_acquire_lock 契约：仅「锁被占」返回
-            #    None，权限/磁盘满等环境故障抛 OSError，语义必须上抛不吞）。
-            self._run_lock_fd = try_acquire_lock(
-                self.config.ipc_dir, "__pipeline_run__", timeout=0
-            )
-            if self._run_lock_fd is None:
-                raise RuntimeError(
-                    f"Another run() is in progress for state_dir "
-                    f"{self.config.ipc_dir}; concurrent runs on the same "
-                    f"state are forbidden."
+            # 1. 单运行排他锁
+            if hasattr(self.store.backend, "path") and self.store.backend.path is not None:
+                self._run_lock_fd = try_acquire_lock(self.store.backend.path, timeout=0)
+                if self._run_lock_fd is None:
+                    raise RuntimeError(
+                        f"Another run() or management operation is in progress for "
+                        f"{self.store.backend.path}; concurrent runs on the same "
+                        f"state are forbidden."
+                    )
+            elif self.config.ipc_dir is not None:
+                self._run_lock_fd = try_acquire_lock(
+                    self.config.ipc_dir, "__pipeline_run__", timeout=0
                 )
+                if self._run_lock_fd is None:
+                    raise RuntimeError(
+                        f"Another run() is in progress for state_dir "
+                        f"{self.config.ipc_dir}; concurrent runs on the same "
+                        f"state are forbidden."
+                    )
+            else:
+                backend = self.store.backend
+                if not hasattr(backend, "_exec_lock"):
+                    backend._exec_lock = threading.Lock()
+                if not backend._exec_lock.acquire(blocking=False):
+                    raise RuntimeError(
+                        "Another run() or management operation is in progress; "
+                        "concurrent runs on the same state are forbidden."
+                    )
+                self._run_memory_locked = True
 
             # 2. 信号陷阱（主线程安装，失败抛出不静默忽略）
             if opts.install_signals:
@@ -373,6 +392,10 @@ class EngineRuntime:
             if self._run_lock_fd is not None:
                 release_lock(self._run_lock_fd)
                 self._run_lock_fd = None
+            if getattr(self, "_run_memory_locked", False):
+                if hasattr(self.store.backend, "_exec_lock") and self.store.backend._exec_lock.locked():
+                    self.store.backend._exec_lock.release()
+                self._run_memory_locked = False
             self._is_running = False
             raise
 
@@ -388,6 +411,10 @@ class EngineRuntime:
             if self._run_lock_fd is not None:
                 release_lock(self._run_lock_fd)
                 self._run_lock_fd = None
+            if getattr(self, "_run_memory_locked", False):
+                if hasattr(self.store.backend, "_exec_lock") and self.store.backend._exec_lock.locked():
+                    self.store.backend._exec_lock.release()
+                self._run_memory_locked = False
             self._is_running = False
 
             if old_sigterm is not None:
@@ -762,13 +789,11 @@ class EngineRuntime:
             self._notifier.notify()
 
     def _preflight_picklable_handlers(self) -> None:
-        """strict 预检：全部已注册 Task 的 handler 必须可 pickle。
+        """预检：全部已注册 Task 的 handler 必须可 pickle。
 
         spawn 进程模型下不可 pickle 的 handler 会在每次派发时崩溃——
-        构造期入口拒绝（fail-loud），而非运行期逐作业失败。
+        入口拒绝（fail-loud），而非运行期逐作业失败。
         """
-        if not self.config.strict_picklable:
-            return
         for task_type in self.tasks.task_types():
             task = self.tasks.lookup(task_type)
             try:
@@ -778,6 +803,17 @@ class EngineRuntime:
                     f"Handler for task_type '{task_type}' is not picklable: "
                     f"{task.handler!r} ({e}). Functions must be module-level."
                 ) from e
+
+    def close(self) -> None:
+        """释放运行期资源（通道、锁等）。"""
+        if self._run_lock_fd is not None:
+            release_lock(self._run_lock_fd)
+            self._run_lock_fd = None
+        if getattr(self, "_run_memory_locked", False):
+            if hasattr(self.store.backend, "_exec_lock") and self.store.backend._exec_lock.locked():
+                self.store.backend._exec_lock.release()
+            self._run_memory_locked = False
+        self.channel.close()
 
 
 __all__ = [

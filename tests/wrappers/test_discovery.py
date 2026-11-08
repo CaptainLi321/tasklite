@@ -158,7 +158,7 @@ def _make_pipeline(name="test_disc"):
     使用进程唯一临时目录（tempfile.mkdtemp），避免跨测试污染。
     """
     state_dir = tempfile.mkdtemp(prefix=f"tp_disc_{name}_")
-    return TaskLite(name=name, state_dir=state_dir, backend="sqlite")
+    return TaskLite(backend="sqlite", state_path=Path(state_dir) / f"{name}.db")
 
 
 def _make_ctx(job=None, successes=None, failed=None):
@@ -596,7 +596,7 @@ def _rt_setup(tmp_path, monkeypatch, name="rt_disc"):
     if PROJECT_ROOT not in sys.path:
         sys.path.insert(0, PROJECT_ROOT)
     monkeypatch.setenv("PYTHONPATH", PROJECT_ROOT)
-    return TaskLite(name=name, state_dir=tmp_path / "state", backend="sqlite", max_workers=3)
+    return TaskLite(backend="sqlite", state_path=tmp_path / "state" / f"{name}.db", max_workers=3)
 
 
 def test_real_subprocess_discovery(tmp_path, monkeypatch):

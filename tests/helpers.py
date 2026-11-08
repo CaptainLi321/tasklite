@@ -231,10 +231,16 @@ def patch_pipeline_manager(pipeline, monkeypatch):
     monkeypatch.setattr(pipeline._process_context, "Manager", lambda: FakeManager())
 
 
-def make_pipeline(tmp_path, name="test_pipeline", **kwargs):
+def make_pipeline(tmp_path, **kwargs):
     """Create a pipeline with sqlite backend and temp directory."""
+    kwargs.pop("name", None)
+    kwargs.pop("state_dir", None)
+    backend = kwargs.pop("backend", "sqlite")
+    state_path = kwargs.pop("state_path", tmp_path / "state.db" if backend == "sqlite" else None)
+    output_roots = kwargs.pop("output_roots", tmp_path / "output")
     return TaskLite(
-        name=name, state_dir=tmp_path / "state", backend="sqlite",
-        output_roots=tmp_path / "output",
+        backend=backend,
+        state_path=state_path,
+        output_roots=output_roots,
         **kwargs,
     )

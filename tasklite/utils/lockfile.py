@@ -10,13 +10,23 @@ import time
 from pathlib import Path
 
 
-def _lock_path(ipc_dir: str, name: str) -> Path:
-    """name → 锁文件路径。"""
-    return Path(ipc_dir) / f"{name}.lock"
+def _lock_path(ipc_dir_or_path: str | Path, name: str | None = None) -> Path:
+    """name → 锁文件路径。若 name 为 None，直接派生锁文件路径。"""
+    if name is None:
+        p = Path(ipc_dir_or_path)
+        if p.name.endswith(".lock"):
+            return p
+        return Path(str(p) + ".lock")
+    return Path(ipc_dir_or_path) / f"{name}.lock"
 
 
-def try_acquire_lock(ipc_dir: str, name: str, *, timeout: float = 0.0) -> int | None:
-    """尝试获取 ``{name}.lock`` 排他锁（非阻塞或带超时）。
+def try_acquire_lock(
+    ipc_dir_or_path: str | Path,
+    name: str | None = None,
+    *,
+    timeout: float = 0.0,
+) -> int | None:
+    """尝试获取排他锁（非阻塞或带超时）。
 
     Returns:
         成功返回 fd（调用方必须 ``release_lock``）；**仅锁被其他进程占用**
@@ -26,7 +36,7 @@ def try_acquire_lock(ipc_dir: str, name: str, *, timeout: float = 0.0) -> int | 
         OSError: 锁文件打不开/建不出（权限、磁盘满等环境故障）——与
             「锁被占」语义不同，不得混入 None。
     """
-    path = _lock_path(ipc_dir, name)
+    path = _lock_path(ipc_dir_or_path, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
     deadline = None if timeout <= 0 else time.monotonic() + timeout

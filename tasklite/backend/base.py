@@ -13,6 +13,7 @@ commit_retry / commit_skip 的事务内才删除（at-least-once 崩溃契约）
 """
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Mapping, Sequence
 
@@ -94,6 +95,7 @@ def validate_attempt_finish(outcome: Any, finished_at: Any, error_message: Any) 
 
 class AbstractStateBackend(ABC):
     schema_version: int = 5
+    _exec_lock: Any = None
 
     """管线状态持久化抽象契约（SQLite / Memory 双腿共同口径）。
 
@@ -449,6 +451,9 @@ class AbstractStateBackend(ABC):
     @abstractmethod
     def is_path_authorized(self, path: str) -> bool:
         """检查指定规范绝对路径是否命中已有授权（精确文件匹配或已授权目录树内）。"""
+
+    def close(self) -> None:
+        """关闭后端并释放资源（幂等）。"""
 
 
 __all__ = [

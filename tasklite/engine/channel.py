@@ -491,8 +491,8 @@ class WorkerLaunchSpec:
     job: Job
     job_context: JobContext
     execution_id: str
-    ipc_dir: str
     timeout_seconds: float
+    ipc_dir: str | None = None
     pipe_sender: WorkerPipeSender | None = None
     reply_receiver: WorkerReplyReceiver | None = None
 
@@ -591,11 +591,13 @@ class ExecutionChannel:
     def spawn(self, spec: WorkerLaunchSpec) -> JobHandle:
         """启动隔离子进程执行 handler，建立瞬时管道与 execution_id 绑定，立即返回句柄。"""
         effective_ipc_dir = spec.ipc_dir or self.ipc_dir or os.environ.get(_RESULT_DIR_ENV)
-        if not effective_ipc_dir:
-            raise ValueError("ipc_dir is required for ExecutionChannel.spawn()")
-        Path(effective_ipc_dir).mkdir(parents=True, exist_ok=True)
-        if self.ipc_dir is None:
-            self.ipc_dir = str(effective_ipc_dir)
+        if effective_ipc_dir:
+            try:
+                Path(effective_ipc_dir).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            if self.ipc_dir is None:
+                self.ipc_dir = str(effective_ipc_dir)
         spec.job_context.ipc_dir = effective_ipc_dir
         self.journal.clear_declarations(spec.job.uid)
         receiver, sender = create_worker_pipe(

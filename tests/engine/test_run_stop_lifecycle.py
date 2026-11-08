@@ -74,7 +74,7 @@ class NeverAvailableResource(CapacityResource):
 
 def test_stop_when_idle_is_noop_and_idempotent(tmp_path):
     """无活跃 Run 时调用 stop() 无操作、幂等，不影响后续 Run。"""
-    p = TaskLite("p_idle", state_dir=tmp_path / "state", backend="memory")
+    p = TaskLite(backend="memory")
     p.register_task("t", success_handler)
     p.enqueue(Job("t", "j1"))
 
@@ -94,7 +94,7 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
     ready_file = tmp_path / "ready_1"
     release_file = tmp_path / "release_1"
 
-    p = TaskLite("p_retry", state_dir=tmp_path / "state", backend="memory", max_workers=1)
+    p = TaskLite(backend="memory", max_workers=1)
     p.register_trigger("counting", counting_trigger)
     p.register_task(
         "t_retry",
@@ -143,7 +143,7 @@ def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
     ready_file = tmp_path / "ready_fail"
     release_file = tmp_path / "release_fail"
 
-    p = TaskLite("p_fail", state_dir=tmp_path / "state", backend="memory", max_workers=1)
+    p = TaskLite(backend="memory", max_workers=1)
     p.register_task("t_fail", file_synced_fail_handler)
     p.register_task("t_downstream", success_handler)
     p.register_task("t_other", success_handler)
@@ -180,7 +180,7 @@ def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
 
 def test_stop_from_another_thread_wakes_scheduler_wait(tmp_path):
     """另线程调用 stop() 能立即解除主循环等待。"""
-    p = TaskLite("p_wake", state_dir=tmp_path / "state", backend="memory")
+    p = TaskLite(backend="memory")
 
     p.resources["gate"] = NeverAvailableResource("gate", max_capacity=1.0)
     p.register_task("t_wait", success_handler, resources={"gate": 1.0})
@@ -212,7 +212,7 @@ def test_stop_from_another_thread_wakes_scheduler_wait(tmp_path):
 
 def test_repeat_ctrl_c_does_not_upgrade_to_force_abort(tmp_path):
     """多次 Ctrl+C 信号保持 DRAINING，不升级为强制终止。"""
-    p = TaskLite("p_sig", state_dir=tmp_path / "state", backend="memory")
+    p = TaskLite(backend="memory")
     runtime = p._runtime
 
     with running(p):
@@ -227,7 +227,7 @@ def test_repeat_ctrl_c_does_not_upgrade_to_force_abort(tmp_path):
 
 def test_framework_exception_raises_directly(tmp_path):
     """Trigger 异常直接抛出，不伪装正常排空。"""
-    p = TaskLite("p_crash", state_dir=tmp_path / "state", backend="memory")
+    p = TaskLite(backend="memory")
 
     p.register_trigger("broken", broken_trigger)
     p.register_task("t", success_handler, trigger="broken")
@@ -239,7 +239,7 @@ def test_framework_exception_raises_directly(tmp_path):
 
 def test_install_signals_in_child_thread_fails_loud_and_false_succeeds(tmp_path):
     """install_signals=True 仅主线程安装，子线程安装抛出；False 由宿主控制。"""
-    p = TaskLite("p_thread", state_dir=tmp_path / "state", backend="memory")
+    p = TaskLite(backend="memory")
     p.register_task("t", success_handler)
     p.enqueue(Job("t", "j1"))
 
@@ -278,7 +278,7 @@ def test_main_thread_install_signals_restores_original_handler(tmp_path):
     original_sigint = signal.getsignal(signal.SIGINT)
     original_sigterm = signal.getsignal(signal.SIGTERM)
 
-    p = TaskLite("p_restore", state_dir=tmp_path / "state", backend="memory")
+    p = TaskLite(backend="memory")
     p.register_task("t", success_handler)
     p.enqueue(Job("t", "j1"))
 

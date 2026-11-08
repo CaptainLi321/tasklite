@@ -121,4 +121,4 @@ def sqlite_db(tmp_path: Path) -> SQLiteStateBackend:
 @pytest.fixture
 def pipeline_sqlite(tmp_state_dir: Path) -> TaskLite:
     """TaskLite with SQLite backend, pointed at tmp_state_dir."""
-    return TaskLite(name="test_sqlite", state_dir=tmp_state_dir, backend="sqlite")
+    return TaskLite(backend="sqlite", state_path=tmp_state_dir / "test_state.db")

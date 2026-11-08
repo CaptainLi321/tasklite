@@ -31,7 +31,9 @@ def illegal_state_output(job, ctx):
 
 
 def _pipeline(tmp_path):
-    return TaskLite("artifacts", state_dir=tmp_path / "state", output_roots=tmp_path / "output")
+    out = tmp_path / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    return TaskLite(backend="sqlite", state_path=tmp_path / "artifacts.db", output_roots=out)
 
 
 def test_direct_dependency_publishes_directory_for_actual_file_input(tmp_path):
@@ -82,9 +84,9 @@ def test_dispatch_protects_complete_state_directory(tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("unsafe", illegal_state_output)
     try:
-        pipeline.enqueue(Job("unsafe", "one", payload={"path": str(tmp_path / "state")}))
+        pipeline.enqueue(Job("unsafe", "one", payload={"path": str(pipeline.state_path)}))
         pipeline.run()
         assert "unsafe::one" in pipeline.backend.load_failed()
-        assert (tmp_path / "state").is_dir()
+        assert pipeline.state_path.exists()
     finally:
         pipeline.stop()

@@ -228,71 +228,61 @@ def make_instant_process_class(retry_uid: str | None = None, recorder: list | No
     return InstantProcess
 
 
-def make_pipeline(tmp_path, **overrides) -> TaskLite:
-    """标准测试管线（memory 后端零 IO；钩子经构造期参数传入）。"""
-    defaults: dict = dict(
-        name="facade_test",
-        state_dir=tmp_path / "state",
-        backend="memory",
+def make_pipeline(tmp_path=None, **overrides) -> TaskLite:
+    """标准测试管线（memory 后端零 IO）。"""
+    overrides.pop("name", None)
+    overrides.pop("state_dir", None)
+    backend = overrides.pop("backend", "memory")
+    state_path = overrides.pop("state_path", None)
+    if backend == "sqlite" and state_path is None:
+        state_path = (tmp_path / "state.db") if tmp_path else Path("./state.db")
+    return TaskLite(
+        backend=backend,
+        state_path=state_path,
+        **overrides,
     )
-    defaults.update(overrides)
-    return TaskLite(**defaults)
 
 
 # ── 构造与装配分区 ────────────────────────────────────────────────────
 
 
 class TestConstruction:
-    """name/目录/后端/资源/分类器各装配段的行为等价。"""
+    """构造参数、目录、后端、生命周期与互斥契约。"""
 
-    def test_name_must_be_non_empty_str(self, tmp_path):
-        with pytest.raises(TypeError, match="name must be a non-empty str"):
-            TaskLite("", tmp_path / "state")
-        with pytest.raises(TypeError, match="name must be a non-empty str"):
-            TaskLite(123, tmp_path / "state")
+    def test_sqlite_requires_state_path(self, tmp_path):
+        with pytest.raises(ValueError, match="state_path"):
+            TaskLite(backend="sqlite")
+        with pytest.raises(ValueError, match="state_path"):
+            TaskLite(backend="sqlite", state_path="")
 
-    def test_name_rejects_path_separators(self, tmp_path):
-        with pytest.raises(ValueError, match="path separators"):
-            TaskLite("a/b", tmp_path / "state")
-        with pytest.raises(ValueError, match="path separators"):
-            TaskLite("a\\b", tmp_path / "state")
+    def test_memory_requires_no_state_path_and_no_disk_side_effects(self, tmp_path):
+        p = TaskLite(backend="memory")
+        assert p.state_path is None
+        assert p.backend_type == "memory"
 
-    def test_state_dir_created(self, tmp_path):
-        state = tmp_path / "nested" / "state"
-        TaskLite("p", state, backend="memory")
-        assert state.is_dir()
-
-    def test_ipc_dir_created_under_state_dir(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        assert Path(p.ipc_dir) == p.state_dir / "ipc"
-        assert Path(p.ipc_dir).is_dir()
-
-    def test_output_root_single_created_and_resolved(self, tmp_path):
-        root = tmp_path / "out"
+    def test_output_root_resolved_without_creating_dir(self, tmp_path):
+        root = tmp_path / "out_not_created"
         p = make_pipeline(tmp_path, output_roots=root)
         assert p.output_roots == root.resolve()
-        assert p.output_roots.is_dir()
+        assert not root.exists()
 
-    def test_output_root_multi_root_all_created(self, tmp_path):
+    def test_output_root_multi_root_resolved_without_creating_dir(self, tmp_path):
         roots = [tmp_path / "o1", tmp_path / "o2"]
         p = make_pipeline(tmp_path, output_roots=roots)
         assert p.output_roots == [r.resolve() for r in roots]
-        assert all(r.is_dir() for r in p.output_roots)
+        assert not roots[0].exists()
+        assert not roots[1].exists()
 
     def test_output_root_bad_type_rejected(self, tmp_path):
         with pytest.raises(TypeError, match="output_roots"):
             make_pipeline(tmp_path, output_roots=42)
 
-    def test_backend_sqlite_default_type_name(self, tmp_path):
-        p = TaskLite("sp", tmp_path / "state")
+    def test_backend_sqlite_type_name(self, tmp_path):
+        p = TaskLite(backend="sqlite", state_path=tmp_path / "test.db")
         assert p.backend_type == "sqlite"
 
     def test_backend_memory_type_name(self, tmp_path):
         p = make_pipeline(tmp_path)
-        assert p.backend_type == "memory"
-
-    def test_backend_instance_normalized_names(self, tmp_path):
-        p = TaskLite("i", tmp_path / "state", backend=InMemoryStateBackend())
         assert p.backend_type == "memory"
 
     def test_backend_unknown_string_rejected(self, tmp_path):
@@ -303,17 +293,21 @@ class TestConstruction:
         with pytest.raises(TypeError, match="backend must be"):
             make_pipeline(tmp_path, backend=object())
 
+    def test_backend_instance_rejected(self, tmp_path):
+        with pytest.raises(TypeError, match="backend must be"):
+            TaskLite(backend=InMemoryStateBackend())  # type: ignore[arg-type]
+
     def test_sqlite_init_failure_wraps_runtime_error(
         self, tmp_path, monkeypatch
     ):
         import tasklite.pipeline as pipeline_mod
 
-        def boom(_path):
+        def boom(_path, **kw):
             raise OSError("disk full")
 
         monkeypatch.setattr(pipeline_mod, "SQLiteStateBackend", boom)
         with pytest.raises(OSError, match="disk full"):
-            TaskLite("sp", tmp_path / "state", backend="sqlite")
+            TaskLite(backend="sqlite", state_path=tmp_path / "test.db")
 
     def test_max_workers_validation(self, tmp_path):
         for bad in (0, -1, True, "4", 2.5):
@@ -325,15 +319,119 @@ class TestConstruction:
         assert "__workers__" in p.resources
         assert p.resources["__workers__"].max_capacity == 7.0
 
-    def test_removed_exception_constructor_params_rejected(self, tmp_path):
-        with pytest.raises(TypeError):
-            make_pipeline(tmp_path, fatal_exceptions=(int,))
-        with pytest.raises(TypeError):
-            make_pipeline(tmp_path, transient_exceptions=(BizError,))
+    def test_removed_constructor_params_rejected(self, tmp_path):
+        for bad_kwarg in (
+            "name",
+            "state_dir",
+            "strict_picklable",
+            "ordering_policy",
+            "requeue_policy",
+            "dependency_grace_seconds",
+            "commit_failure_threshold",
+            "deadlock_gap_max_rounds",
+        ):
+            with pytest.raises(TypeError):
+                TaskLite(backend="memory", **{bad_kwarg: "val"})
 
-    def test_strict_picklable_flag_forwarded(self, tmp_path):
-        assert make_pipeline(tmp_path).strict_picklable is True
-        assert make_pipeline(tmp_path, strict_picklable=False).strict_picklable is False
+    def test_close_and_context_manager_lifecycle(self, tmp_path):
+        with TaskLite(backend="memory") as p:
+            p.register_task("fast", ok_handler)
+            p.enqueue(Job("fast", "j1"))
+            assert not p._closed
+        assert p._closed
+        # close 幂等
+        p.close()
+        # 关闭后受限调用明确拒绝
+        with pytest.raises(RuntimeError, match="closed"):
+            p.enqueue(Job("fast", "j2"))
+        with pytest.raises(RuntimeError, match="closed"):
+            p.run()
+        with pytest.raises(RuntimeError, match="closed"):
+            p.register_task("fast2", ok_handler)
+        with pytest.raises(RuntimeError, match="closed"):
+            p.register_resource(CapacityResource("res", max_capacity=1.0))
+        with pytest.raises(RuntimeError, match="closed"):
+            p.set_job_status("fast::j1", "succeeded", recursive=False)
+        with pytest.raises(RuntimeError, match="closed"):
+            p.clear_history("fast::j1", records=["successes"])
+        with pytest.raises(RuntimeError, match="closed"):
+            p.set_cursor("key", "val")
+        with pytest.raises(RuntimeError, match="closed"):
+            p.get_cursor("key")
+        with pytest.raises(RuntimeError, match="closed"):
+            p.stop()
+
+    def test_close_during_run_rejected(self, tmp_path):
+        p = TaskLite(backend="memory")
+        p.register_task("fast", ok_handler)
+        p.enqueue(Job("fast", "j1"))
+        with running(p):
+            with pytest.raises(RuntimeError, match="close.*run"):
+                p.close()
+
+    def test_state_snapshot_independent_lifecycle(self, tmp_path):
+        from tasklite.snapshot import StateSnapshot
+
+        db = tmp_path / "snap_test.db"
+        p = TaskLite(backend="sqlite", state_path=db)
+        p.register_task("t", ok_handler)
+        p.enqueue(Job("t", "j1"))
+        snap = StateSnapshot.open(p)
+        p.close()
+        # snap 独立于已关闭的实例，仍可正常查询
+        assert snap.get_job("t::j1")["status"] == "pending"
+        snap.close()
+        # 在已关闭实例上打开快照被拒绝
+        with pytest.raises(RuntimeError, match="closed"):
+            StateSnapshot.open(p)
+        # 通过路径仍可正常打开
+        with StateSnapshot.open(db) as snap2:
+            assert snap2.get_job("t::j1")["status"] == "pending"
+
+    def test_init_failure_leaves_existing_state_intact(self, tmp_path):
+        db = tmp_path / "precious.db"
+        db.write_text("precious data")
+        with pytest.raises(Exception):
+            TaskLite(backend="sqlite", state_path=db)
+        assert db.read_text() == "precious data"
+
+    def test_sqlite_and_path_snapshot_parity(self, tmp_path):
+        from tasklite.snapshot import StateSnapshot
+
+        db = tmp_path / "parity.db"
+        p = TaskLite(backend="sqlite", state_path=db)
+        p.register_task("t", ok_handler)
+        p.enqueue(Job("t", "j1"))
+        with StateSnapshot.open(p) as s1, StateSnapshot.open(db) as s2:
+            assert s1.get_job("t::j1") == s2.get_job("t::j1")
+        p.close()
+
+    def test_mutual_exclusion_between_instances_and_management(self, tmp_path):
+        from tasklite.snapshot import StateSnapshot
+        from tasklite.utils.lockfile import release_lock, try_acquire_lock
+
+        db = tmp_path / "mutex.db"
+        p1 = TaskLite(backend="sqlite", state_path=db)
+        p2 = TaskLite(backend="sqlite", state_path=db)
+        p1.register_task("t", ok_handler)
+        p2.register_task("t", ok_handler)
+        p1.enqueue(Job("t", "j1"))
+        lock_fd = try_acquire_lock(p1.state_path, timeout=0)
+        assert lock_fd is not None
+        try:
+            with pytest.raises(RuntimeError, match="Another run.*in progress"):
+                p2.run()
+            with pytest.raises(RuntimeError, match="Another run.*in progress"):
+                p2.set_job_status("t::j1", "succeeded", recursive=False)
+            with pytest.raises(RuntimeError, match="Another run.*in progress"):
+                p2.enqueue(Job("t", "j2"))
+            # 只读观察不受阻
+            with StateSnapshot.open(db) as snap:
+                assert snap.get_job("t::j1") is not None
+        finally:
+            release_lock(lock_fd)
+        p1.close()
+        p2.close()
 
 
 # ── 注册面（六步之二/三）─────────────────────────────────────────────
@@ -711,7 +809,8 @@ class TestEnqueue:
 
     def test_pending_recovery_across_runs_preserves_accepted_snapshot(self, tmp_path, monkeypatch):
         """跨次恢复 pending 不套用新 Task 默认。"""
-        p1 = TaskLite(name="recover", state_dir=str(tmp_path), max_workers=1)
+        db_path = tmp_path / "recover.db"
+        p1 = TaskLite(backend="sqlite", state_path=db_path, max_workers=1)
         p1.register_resource(CapacityResource("gpu", max_capacity=2.0))
         p1.register_task(
             "fetch",
@@ -733,7 +832,7 @@ class TestEnqueue:
                 super().__init__(args=args, **kwargs)
 
         monkeypatch.setattr(mp, "Process", CapturingProcess)
-        p2 = TaskLite(name="recover", state_dir=str(tmp_path), max_workers=1)
+        p2 = TaskLite(backend="sqlite", state_path=db_path, max_workers=1)
         p2.register_resource(CapacityResource("gpu", max_capacity=2.0))
         # 新运行注册了完全不同的 Task 默认（甚至包含未注册资源 extra_vram）
         p2.register_task(
@@ -846,7 +945,7 @@ class TestSixStepContract:
     def test_run_reentry_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
         with running(p):
-            with pytest.raises(RuntimeError, match="already in progress"):
+            with pytest.raises(RuntimeError, match="run.*in progress"):
                 p.run()
 
     def test_stop_transitions_session_state(self, tmp_path):
@@ -882,21 +981,13 @@ class TestSixStepContract:
 
 
 class TestSchedulingSeamWiring:
-    """调度策略门面构造参数：注入生效、默认不传行为等价。"""
+    """调度策略不在公开构造签名开放，默认装配行为保持。"""
 
-    def test_ordering_constructor_arg_reverses_visit_order(self, tmp_path, monkeypatch):
-        order: list[str] = []
-        p = make_pipeline(
-            tmp_path,
-            ordering_policy=NewestFirstPolicy(),
-        )
-        p.register_task("fetch", ok_handler)
-        for jid in ("a", "b", "c"):
-            p.enqueue(Job("fetch", jid))
-        monkeypatch.setattr(mp, "Process", make_instant_process_class(recorder=order))
-        p.run()
-
-        assert order == ["fetch::c", "fetch::b", "fetch::a"]
+    def test_scheduling_constructor_args_rejected(self, tmp_path):
+        with pytest.raises(TypeError):
+            TaskLite(backend="memory", ordering_policy=NewestFirstPolicy())  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            TaskLite(backend="memory", requeue_policy=TailRequeuePolicy())  # type: ignore[call-arg]
 
     def test_ordering_default_wiring_and_fifo_equivalence(self, tmp_path, monkeypatch):
         order: list[str] = []
@@ -908,33 +999,8 @@ class TestSchedulingSeamWiring:
         p.run()
 
         assert order == ["fetch::a", "fetch::b", "fetch::c"]
-        # 默认解析收敛在 RunConfig.resolve：门面不传 → FIFO 装配件直达调度器
         assert isinstance(p.runtime_config.ordering_policy, FifoOrderingPolicy)
         assert p._runtime.scheduler.ordering_policy is p.runtime_config.ordering_policy
-
-    def test_requeue_policy_constructor_arg_controls_requeue_position(
-        self, tmp_path, monkeypatch
-    ):
-        """队尾重入队注入：flaky 首试失败后排在 later 之后（默认应在之前）。"""
-        order: list[str] = []
-        p = make_pipeline(
-            tmp_path,
-            max_workers=1,
-            requeue_policy=TailRequeuePolicy(),
-        )
-        p.register_task("fetch", ok_handler)
-        p.enqueue(Job("fetch", "flaky", max_retries_per_run=1))
-        p.enqueue(Job("fetch", "later"))
-        monkeypatch.setattr(
-            mp, "Process", make_instant_process_class(retry_uid="fetch::flaky", recorder=order)
-        )
-        p.run()
-
-        assert order == [
-            "fetch::flaky", "fetch::later", "fetch::flaky",
-        ]
-        assert "fetch::later" in p.backend.load_successes()
-        assert "fetch::flaky" in p.backend.load_failed()
 
     def test_requeue_default_wiring_and_front_equivalence(self, tmp_path, monkeypatch):
         """默认立即重入队（front=True）：flaky 重试先于 later 结算。"""
@@ -954,6 +1020,8 @@ class TestSchedulingSeamWiring:
         assert order == [
             "fetch::flaky", "fetch::flaky", "fetch::later",
         ]
+        assert "fetch::later" in p.backend.load_successes()
+        assert "fetch::flaky" in p.backend.load_failed()
         assert isinstance(p.runtime_config.requeue_policy, ImmediateRequeuePolicy)
         assert p._runtime.store._requeue_policy is p.runtime_config.requeue_policy
 
@@ -1032,11 +1100,11 @@ class TestRunExecutionOptions:
     缺省与引擎默认一致（默认行为不变）。"""
 
     def test_default_run_acquires_reentry_lock(self, tmp_path):
-        """默认等价断言：run() 照常获取 state_dir 级单运行排他锁。"""
+        """默认等价断言：run() 照常获取状态库单运行排他锁。"""
         from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
-        p = make_pipeline(tmp_path)
-        lock_fd = try_acquire_lock(p.ipc_dir, "__pipeline_run__", timeout=0)
+        p = make_pipeline(tmp_path, backend="sqlite", state_path=tmp_path / "lock.db")
+        lock_fd = try_acquire_lock(p.state_path, timeout=0)
         assert lock_fd is not None
         try:
             with pytest.raises(RuntimeError, match="Another run.*in progress"):
@@ -1075,64 +1143,10 @@ class TestRunExecutionOptions:
         assert installed == [signal_module.SIGTERM, signal_module.SIGINT]
 
 
-class TestBackendSwap:
-    """backend property/setter：换库唯一动作 = 换 StateStore 锚点。"""
+class TestBackendSetterDeleted:
+    """backend setter 已删除，backend 为只读 property。"""
 
-    def test_backend_setter_rebinds_runtime_store_console(self, tmp_path):
-        """换库后全部持有者看到同一新实例（锚点收敛回归锁）。
-
-        不变式：backend 所有权唯一锚定 StateStore——pipeline setter 只做
-        「换 store 锚点」一个动作，其余持有者（门面 property / runtime /
-        OpsConsole 管理面 / enqueue 摄入面）一律经 store.backend 只读
-        派生。新增持 backend 的机器必须加入本断言——把「漏绑」从静默
-        读写旧库变成测试红灯。
-        """
+    def test_backend_setter_raises_attribute_error(self, tmp_path):
         p = make_pipeline(tmp_path)
-        new_backend = InMemoryStateBackend()
-        new_backend.append_failed("fetch::x", {"error_message": "moved"})
-        p.backend = new_backend
-        # 持有者逐一刻画：门面 property、runtime 派生引用、store 锚点
-        assert p.backend is new_backend
-        assert p._runtime.backend is new_backend
-        assert p._runtime.store.backend is new_backend
-        # 管理面（OpsConsole 经 store 派生）：读面命中新库数据
-        assert any(e.job_uid == "fetch::x" for e in p.list_failures())
-        # 摄入面（enqueue 经 store 派生）：写面命中新库
-        p.register_task("fetch", ok_handler)
-        p.enqueue(Job("fetch", "swapped"))
-        assert [jd["job_id"] for jd in new_backend.load_queue()] == ["swapped"]
-
-    def test_backend_setter_rejects_non_backend(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with pytest.raises(TypeError, match="AbstractStateBackend"):
-            p.backend = "sqlite"
-
-    def test_backend_setter_run_guard(self, tmp_path):
-        p = make_pipeline(tmp_path)
-        with running(p):
-            with pytest.raises(RuntimeError, match="backend"):
-                p.backend = InMemoryStateBackend()
-
-    def test_backend_setter_rejects_duck_typed_object(self, tmp_path):
-        """只带读写核心方法的鸭子对象显式 TypeError 拒绝（契约面单一）。"""
-        p = make_pipeline(tmp_path)
-
-        class PartialBackend:
-            def load_queue(self):
-                return []
-
-            def commit_job_success(self, job_uid, meta, **kw):
-                return True
-
-        with pytest.raises(TypeError, match="AbstractStateBackend"):
-            p.backend = PartialBackend()
-
-    def test_explicit_subclass_backend_accepted(self, tmp_path):
-        """显式 AbstractStateBackend 子类假后端：接受注入并重绑持库组件。"""
-        p = make_pipeline(tmp_path)
-        fake = DelegatingFakeBackend()
-        fake.append_failed("fetch::x", {"error_message": "subclass"})
-        p.backend = fake
-        assert p.backend is fake
-        assert p._runtime.store.backend is fake
-        assert any(e.job_uid == "fetch::x" for e in p.list_failures())
+        with pytest.raises(AttributeError):
+            p.backend = InMemoryStateBackend()

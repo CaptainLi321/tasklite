@@ -20,8 +20,10 @@ def _actual_spawn(_patch_mp_context, monkeypatch):
 
 
 def _pipeline(tmp_path, **overrides):
-    return TaskLite(name="trigger_lifecycle", state_dir=tmp_path / "state",
-                    output_roots=tmp_path / "output", backend="sqlite", **overrides)
+    out = tmp_path / "output"
+    out.mkdir(parents=True, exist_ok=True)
+    return TaskLite(backend="sqlite", state_path=tmp_path / "trigger_lifecycle.db",
+                    output_roots=out, **overrides)
 
 
 def produce_input(job, ctx):

@@ -56,7 +56,7 @@ def _cleanup_fail_handler(job, ctx):
 def _protected_path_handler(job, ctx):
     ctx.declare_file(
         "bad_out",
-        FileSpec("state/corrupt.txt", role="output", delete_existing=True),
+        FileSpec("t_auto_approve.db", role="output", delete_existing=True),
     )
     return TaskResult.success()
 
@@ -85,7 +85,7 @@ class _MutableAuthorizer:
 def test_worker_wait_authorization_concurrency_and_stop(tmp_path, monkeypatch):
     """一个 worker 等待授权时另一 worker 仍能完成，stop 解除等待且正常其他任务排空。"""
     monkeypatch.chdir(tmp_path)
-    p = TaskLite(name="t_auth_wait", state_dir=tmp_path / "state", max_workers=2)
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "t_auth_wait.db", max_workers=2)
 
     def _authorizer(path, target_type):
         if "pending_auth.txt" in str(path):
@@ -130,7 +130,7 @@ def test_worker_wait_authorization_concurrency_and_stop(tmp_path, monkeypatch):
 def test_directory_authorization_reusable_and_subpath_revocation(tmp_path, monkeypatch):
     """目录授权可复用，撤销子路径不产生父目录例外，实际清理错误与拒绝有不同去向。"""
     monkeypatch.chdir(tmp_path)
-    p = TaskLite(name="t_dir_auth", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "t_dir_auth.db")
 
     dir_path = (tmp_path / "managed_dir").resolve()
     sub_file = (dir_path / "sub" / "item.txt").resolve()
@@ -170,7 +170,7 @@ def test_cleanup_failure_vs_authorization_denial_destinations(tmp_path, monkeypa
     """实际清理错误记为 failed 档案，授权拒绝回到 pending 且不计入 failed。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
-    p = TaskLite(name="t_diff_dest", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "t_diff_dest.db")
 
     p.register_task("clean_task", _cleanup_fail_handler)
     p.enqueue(Job("clean_task", "c1"))
@@ -189,7 +189,7 @@ def test_cleanup_failure_vs_authorization_denial_destinations(tmp_path, monkeypa
 def test_late_reply_cannot_unlock_attempt_and_recheck_next_run(tmp_path, monkeypatch):
     """迟到回复不能解锁新 Attempt；拒绝后同 Run 不再询问，下次 Run 重新判断；内存授权随实例存活。"""
     monkeypatch.chdir(tmp_path)
-    p = TaskLite(name="t_late_mem", state_dir=tmp_path / "state", backend="memory")
+    p = TaskLite(backend="memory")
 
     auth_cb = _MutableAuthorizer(allowed=False)
     p.authorizer = auth_cb
@@ -248,8 +248,8 @@ def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path,
     """TASKLITE_AUTO_APPROVE=1 只自动同意实际请求路径，持久记录，保护路径仍禁止。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
-    state_dir = tmp_path / "state"
-    p = TaskLite(name="t_auto_approve", state_dir=state_dir)
+    state_path = tmp_path / "t_auto_approve.db"
+    p = TaskLite(backend="sqlite", state_path=state_path)
 
     p.register_task("good_task", _good_handler)
     p.register_task("bad_task", _protected_path_handler)
@@ -267,21 +267,19 @@ def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path,
     unrelated_path = str((tmp_path / "unrelated.txt").resolve())
     assert not any(a["path"] == unrelated_path for a in auths)
 
-    # 2. 保护路径（例如 state_dir 内部路径）即使 TASKLITE_AUTO_APPROVE=1 也严禁授权
+    # 2. 保护路径（例如 state 数据库文件）即使 TASKLITE_AUTO_APPROVE=1 也严禁授权
     p.enqueue(Job("bad_task", "b1"))
-    (state_dir / "corrupt.txt").parent.mkdir(parents=True, exist_ok=True)
-    (state_dir / "corrupt.txt").write_text("danger", encoding="utf-8")
     p.run()
 
     # bad_task 声明重叠受保护目录，直接被拒绝
     assert "bad_task::b1" not in p.backend.load_successes()
-    assert not p._runtime.store.is_path_authorized(state_dir / "corrupt.txt")
+    assert not p._runtime.store.is_path_authorized(state_path)
 
 
 def test_list_and_revoke_authorizations_surface_and_run_guard(tmp_path, monkeypatch):
     """list_authorizations 与 revoke_authorization 规范格式、精确匹配与 Run 守卫。"""
     monkeypatch.chdir(tmp_path)
-    p = TaskLite(name="t_mgmt_guard", state_dir=tmp_path / "state")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "t_mgmt_guard.db")
 
     f1 = tmp_path / "doc.txt"
     f1.write_text("data", encoding="utf-8")

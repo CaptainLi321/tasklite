@@ -76,10 +76,9 @@ def test_worker_lingers_after_result_does_not_block_and_retains_success(tmp_path
     sync_dir.mkdir(parents=True, exist_ok=True)
 
     pipeline = TaskLite(
-        name="channel_separation",
-        state_dir=tmp_path / "state",
-        output_roots=tmp_path / "output",
         backend="sqlite",
+        state_path=tmp_path / "channel_separation.db",
+        output_roots=tmp_path / "output",
         max_workers=2,
     )
     pipeline.register_task("lingering", _lingering_worker)
@@ -111,9 +110,8 @@ def test_worker_lingers_after_result_does_not_block_and_retains_success(tmp_path
 def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
     """无结果崩溃子进程留下明确错误信息并回收进程与管道句柄。"""
     pipeline = TaskLite(
-        name="channel_crash",
-        state_dir=tmp_path / "state",
         backend="sqlite",
+        state_path=tmp_path / "channel_crash.db",
         max_workers=1,
     )
     pipeline.register_task("crash", _crash_without_result)
@@ -138,9 +136,8 @@ def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
 def test_worker_timeout_terminates_and_marks_failed_without_retry(tmp_path):
     """超时结束执行并失败，不自动重试，句柄得到回收。"""
     pipeline = TaskLite(
-        name="channel_timeout",
-        state_dir=tmp_path / "state",
         backend="sqlite",
+        state_path=tmp_path / "channel_timeout.db",
         max_workers=1,
     )
     pipeline.register_task("hang", _hang_forever)
@@ -168,12 +165,11 @@ def test_worker_timeout_terminates_and_marks_failed_without_retry(tmp_path):
 
 def test_no_per_job_lock_file_and_library_mutex_valid(tmp_path):
     """逐 Job 锁不再创建，库级执行/管理互斥仍有效。"""
-    ipc_dir = tmp_path / "state" / "ipc"
+    state_path = tmp_path / "channel_mutex.db"
 
     pipeline = TaskLite(
-        name="channel_mutex",
-        state_dir=tmp_path / "state",
         backend="sqlite",
+        state_path=state_path,
         max_workers=1,
     )
     pipeline.register_task("fast", _fast_worker)
@@ -181,21 +177,20 @@ def test_no_per_job_lock_file_and_library_mutex_valid(tmp_path):
     pipeline.run()
 
     # 验证没有为 fast::j1 生成 {uid}.lock 文件
-    assert not (ipc_dir / "fast::j1.lock").exists()
-    assert not any(p.name.startswith("fast") and p.name.endswith(".lock") for p in ipc_dir.glob("*.lock"))
+    assert not any("fast" in p.name and p.name.endswith(".lock") for p in tmp_path.glob("*.lock"))
 
     # 验证库级互斥仍正常生效
-    run_lock = try_acquire_lock(str(ipc_dir), "custom_mutex")
+    run_lock = try_acquire_lock(state_path)
     assert run_lock is not None
     try:
         # 重复获取同一库级锁被互斥阻断
-        second = try_acquire_lock(str(ipc_dir), "custom_mutex")
+        second = try_acquire_lock(state_path)
         assert second is None
     finally:
         release_lock(run_lock)
 
     # 释放后可再次获取
-    third = try_acquire_lock(str(ipc_dir), "custom_mutex")
+    third = try_acquire_lock(state_path)
     assert third is not None
     release_lock(third)
     pipeline.stop()
@@ -204,9 +199,8 @@ def test_no_per_job_lock_file_and_library_mutex_valid(tmp_path):
 def test_worker_exit_error_after_result_does_not_rewrite_success(tmp_path):
     """子进程在有效结果发出后发生非零退出或崩溃，有效结果不受改写。"""
     pipeline = TaskLite(
-        name="channel_success_then_exit",
-        state_dir=tmp_path / "state",
         backend="sqlite",
+        state_path=tmp_path / "channel_success_then_exit.db",
         max_workers=1,
     )
     pipeline.register_task("die_later", _success_then_exit_error)

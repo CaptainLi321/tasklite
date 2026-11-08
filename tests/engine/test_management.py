@@ -33,7 +33,7 @@ class TestSetJobStatusCore:
     """set_job_status 核心三目标态与入参类型行为。"""
 
     def test_set_status_pending_succeeded_failed_flow(self, tmp_path):
-        app = TaskLite("test_app", state_dir=tmp_path / "state")
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         app.register_task("work", _dummy_handler)
 
         job_a = Job("work", "a")
@@ -62,14 +62,14 @@ class TestSetJobStatusCore:
         assert queue[0]["job_id"] == "a"
 
     def test_set_status_uid_unknown_raises_key_error(self, tmp_path):
-        app = TaskLite("test_app", state_dir=tmp_path / "state")
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         app.register_task("work", _dummy_handler)
 
         with pytest.raises(KeyError, match="No existing snapshot found"):
             app.set_job_status("work::unknown", "succeeded", recursive=False)
 
     def test_set_status_job_conflict_raises_value_error(self, tmp_path):
-        app = TaskLite("test_app", state_dir=tmp_path / "state")
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         app.register_task("work", _dummy_handler)
 
         job_original = Job("work", "a", payload={"ver": 1})
@@ -81,7 +81,7 @@ class TestSetJobStatusCore:
             app.set_job_status(job_conflict, "succeeded", recursive=False)
 
     def test_set_status_invalid_arguments_raises(self, tmp_path):
-        app = TaskLite("test_app", state_dir=tmp_path / "state")
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         app.register_task("work", _dummy_handler)
 
         with pytest.raises(ValueError, match="status must be one of"):
@@ -98,7 +98,7 @@ class TestSetJobStatusRecursive:
     """set_job_status 级联下游功能。"""
 
     def test_recursive_cascades_to_downstream(self, tmp_path):
-        app = TaskLite("test_app", state_dir=tmp_path / "state")
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         app.register_task("work", _dummy_handler)
 
         job_a = Job("work", "a")
@@ -127,7 +127,7 @@ class TestClearHistory:
     """clear_history 行为与不变式锁定。"""
 
     def test_clear_history_granular_records(self, tmp_path):
-        app = TaskLite("test_app", state_dir=tmp_path / "state")
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         app.register_task("work", _dummy_handler)
 
         job = Job("work", "item")
@@ -142,7 +142,7 @@ class TestClearHistory:
         assert app.get_cursor("cur") == "pos1"
 
     def test_clear_history_does_not_reset_sequences_monotonicity(self, tmp_path):
-        app = TaskLite("test_app", state_dir=tmp_path / "state")
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         app.register_task("work", _dummy_handler)
 
         app.enqueue(Job("work", "item"))
@@ -173,7 +173,7 @@ class TestManagementConcurrencyLock:
     """运行期间管理 API 的互斥锁保护。"""
 
     def test_management_apis_rejected_during_run(self, tmp_path):
-        app = TaskLite("test_app", state_dir=tmp_path / "state")
+        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
         app.register_task("work", _slow_handler)
         app.enqueue(Job("work", "slow_job"))
 

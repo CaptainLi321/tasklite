@@ -1,13 +1,8 @@
-"""v2 TaskLite 门面：用户唯一入口与标准调用顺序。
+"""TaskLite 门面：用户唯一入口与标准调用顺序。
 
 标准调用顺序：初始化 → ``register_resource`` →
-``register_task`` / ``register_discovery`` / ``register_trigger`` →
+``register_task`` / ``register_trigger`` →
 ``enqueue`` → ``run`` → ``stop``；管理 API 仅限 ``run()`` 外调用。
-
-装配分区：构造器只做参数编排，backend / 资源 / IPC 通道 /
-运行配置 / 运维控制台各自下沉到私有装配方法（每段可独立读测）；
-EngineRuntime 静态装配快照见 RunConfig（engine/config.py），run 期
-生命周期状态与钩子单一出口见 RunSession（engine/session.py）。
 """
 from __future__ import annotations
 
@@ -15,13 +10,14 @@ import contextlib
 import logging
 import multiprocessing as mp
 import os
+import threading
 from pathlib import Path
 from typing import Any, Callable, Collection, Literal, Sequence
 
 from .backend.base import AbstractStateBackend
 from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
-from .engine.admission import RequeuePolicy, TriggerRegistry
+from .engine.admission import TriggerRegistry
 from .models.trigger import TriggerContext
 from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig, resolve_tuning
@@ -30,7 +26,6 @@ from .engine.governor import DeadlockGovernor
 from .engine.ops import OpsConsole, SuspendEntry
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import EngineRuntime
-from .engine.scheduler import OrderingPolicy
 from .engine.store import FailureEntry
 from .engine.types import ExecutionOptions
 from .models.job import Job, WORKER_RESOURCE
@@ -48,197 +43,45 @@ _BACKEND_MEMORY = "memory"
 # models/job.py（全仓库唯一定义点）。
 _DEFAULT_MAX_WORKERS = 4
 
-
-def _validate_pipeline_name(name: Any) -> str:
-    """管线名入口校验：非空 str 且不含路径分隔符。
-
-    name 派生状态库文件名（{name}_state.db）——含路径分隔符时 SQLite
-    库会逃逸 state_dir（持久态与 ipc/ 分离，备份/巡检漏库）；校验先于
-    任何目录/库文件副作用，与 task_type 的入口校验惯例同规。
-    """
-    if not isinstance(name, str) or not name:
-        raise TypeError(
-            f"name must be a non-empty str, got {type(name).__name__} ({name!r})"
-        )
-    if "/" in name or "\\" in name:
-        raise ValueError(f"name must not contain path separators, got {name!r}")
-    return name
-
-
 _UNSET: Any = object()
 
 
 class TaskLite:
-    """v2 管线编排门面（Task/Job/Attempt 三层模型，六步调用契约）。
+    """管线编排门面（Task/Job/Attempt 三层模型，标准调用契约）。
 
     Args:
-        name: 管线名，派生状态库文件名（``{name}_state.db``）。
-        state_dir: 持久化状态目录（不存在则创建）。
-        backend: ``"sqlite"``（默认，ACID 保证）/"memory" 或
-            AbstractStateBackend 实例。
-        output_roots: 产物根目录（单根或多根序列）；设置后
-            declare_output 声明路径被沙盒约束在根内。
-        max_workers: 最大并发子进程数——内部 ``__workers__`` 容量资源
-            实现，可经 ``register_resource`` 覆盖。
-        on_run_start: run() 开始前同步调用（无参数）。
-        on_run_end: run() 结束时统一 finally 调用（覆盖正常/中断/崩溃
-            全部退出路径），参数为 exit_reason（completed /
-            stopped_draining / stopped_aborting / interrupted / error）。
-        on_attempt_finished: 每 attempt 收尾时同步调用（同一 job 跨
-            重试触发多次），签名 ``(job_uid, *, outcome: AttemptOutcome)``；
-            在 stats 更新之后、下一 job 派发之前调用。布尔语义经
-            AttemptOutcome 值对象承载（success 与 will_retry 正交）。
-        strict_picklable: run() 前对全部已注册 Task 的 handler 做
-            pickle 预检（fail-loud）——spawn 上下文要求 handler 模块级
-            可 pickle，预检把派发期才爆发的序列化失败提前到入口。
-        ordering_policy: 队列访问序策略（默认 None → FIFO，唯一解析点在
-            RunConfig.resolve）；核心不含排序计算，自定义策略经
-            OrderingPolicy 接缝插入，``scan_next_runnable`` 唯一
-            选择点结构不变。
-        requeue_policy: 重试节奏策略（默认 None → 立即重入队，唯一
-            解析点在 RunConfig.resolve）；重入队位置与节奏唯一经
-            RequeuePolicy 出口规划。
-        dependency_grace_seconds / commit_failure_threshold / deadlock_gap_max_rounds:
-            调优标量（可空透传，默认值唯一解析点在 resolve_tuning）。
-
-    钩子契约：同步、主线程执行、必须轻量非阻塞（重活业务方自丢线程
-    池）；抛异常只计数（``stats["hook_errors"]``）绝不影响主循环——
-    钩子按不可信代码对待。多方订阅由业务自封装分发器，框架不维护
-    监听器列表。
+        backend: "sqlite"（ACID 保证）或 "memory"（内存状态）。
+        state_path: SQLite 数据库文件路径（backend="sqlite" 时必填，memory 默认 None）。
+        max_workers: 最大并发子进程数（默认 4）。
+        output_roots: 产物根目录（单根或多根序列）；设置后沙盒校验在根内，构造不创建目录。
     """
 
     output_roots: Path | list[Path] | None = None
 
     def __init__(
         self,
-        name: str,
-        state_dir: str | Path,
-        backend: str | AbstractStateBackend = "sqlite",
-        output_roots: str | Path | Sequence[str | Path] | None = None,
-        max_workers: int = _DEFAULT_MAX_WORKERS,
         *,
-        strict_picklable: bool = True,
-        ordering_policy: OrderingPolicy | None = None,
-        requeue_policy: RequeuePolicy | None = None,
-        dependency_grace_seconds: float | None = None,
-        commit_failure_threshold: int | None = None,
-        deadlock_gap_max_rounds: int | None = None,
+        backend: Literal["sqlite", "memory"],
+        state_path: str | Path | None = None,
+        max_workers: int = _DEFAULT_MAX_WORKERS,
+        output_roots: str | Path | Sequence[str | Path] | None = None,
     ) -> None:
-        self.name = _validate_pipeline_name(name)
-        self.base_dir: Path = Path(os.path.abspath(os.getcwd()))
-        self.state_dir = self._prepare_state_dir(state_dir)
-        self.output_roots = self._resolve_output_roots(output_roots)
-        # 构造期局部搬运：backend 实例只向 RunConfig（装配快照）与
-        # StateStore（运行期所有权锚点）各交接一次，门面自身不独立持库。
-        backend_instance, self.backend_type = self._build_backend(backend)
-
-        # 注册表按引用共享；运行期守卫限制配置变更窗口。
-        self.tasks = TaskRegistry()
-        from .triggers import BUILTIN_TRIGGER_FUNCTIONS
-        self._triggers = TriggerRegistry(
-            tasks=self.tasks,
-            functions=BUILTIN_TRIGGER_FUNCTIONS,
-            base_dir=self.base_dir,
-        )
-        self.classifier = ErrorClassifier()
-        self.resources = self._build_resources(self.tasks, max_workers)
-        self.ipc_dir, self._process_context = self._prepare_ipc_dir()
-        self.strict_picklable = strict_picklable
-        self.runtime_config = self._build_run_config(
-            backend_instance,
-            ordering_policy=ordering_policy,
-            requeue_policy=requeue_policy,
-            dependency_grace_seconds=dependency_grace_seconds,
-            commit_failure_threshold=commit_failure_threshold,
-            deadlock_gap_max_rounds=deadlock_gap_max_rounds,
-        )
-
-        # 核心运行期深模块（StateStore 于其构造期创建，run 前即可经
-        # 门面使用 enqueue/管理面）
-        self._runtime = EngineRuntime(config=self.runtime_config)
-
-        # 管理段运维接缝（run() 外管理 API 委托目标；backend 经
-        # store.backend 派生，不独立持库）
-        self._console = OpsConsole(
-            store=self._runtime.store,
-            classifier=self.classifier,
-        )
-
-    # ── 构造期装配分区（各自可独立读测）────────────────────────────
-
-    @staticmethod
-    def _prepare_state_dir(state_dir: str | Path) -> Path:
-        """状态目录装配：物化 Path 并创建。"""
-        path = Path(state_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    @staticmethod
-    def _resolve_output_roots(
-        output_roots: str | Path | Sequence[str | Path] | None,
-    ) -> Path | list[Path] | None:
-        """产物根装配：单根/多根（多根时声明路径属任一根即过沙盒）。"""
-        if output_roots is None:
-            return None
-        if isinstance(output_roots, (list, tuple)):
-            roots = [Path(r).resolve() for r in output_roots]
-            for r in roots:
-                r.mkdir(parents=True, exist_ok=True)
-            return roots
-        if isinstance(output_roots, (str, Path)):
-            root = Path(output_roots).resolve()
-            root.mkdir(parents=True, exist_ok=True)
-            return root
-        raise TypeError(
-            f"output_roots must be str/Path or a sequence thereof, "
-            f"got {type(output_roots).__name__}"
-        )
-
-    def _build_backend(
-        self, backend: str | AbstractStateBackend
-    ) -> tuple[AbstractStateBackend, str]:
-        """持久化后端装配：字符串名或实例 → (backend, 标准名)。"""
-        if isinstance(backend, str):
-            if backend == _BACKEND_SQLITE:
-                db_path = self.state_dir / f"{self.name}_state.db"
-                try:
-                    be: AbstractStateBackend = SQLiteStateBackend(
-                        db_path,
-                        schema_version=TARGET_SCHEMA_VERSION,
-                    )
-                except TypeError:
-                    be = SQLiteStateBackend(db_path)
-                return (be, _BACKEND_SQLITE)
-            if backend == _BACKEND_MEMORY:
-                return (
-                    InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION),
-                    _BACKEND_MEMORY,
+        if backend not in (_BACKEND_SQLITE, _BACKEND_MEMORY):
+            if isinstance(backend, str):
+                raise ValueError(
+                    f"Unknown backend: {backend!r}. Supported backends are 'sqlite' and 'memory'."
                 )
-            raise ValueError(
-                f"Unknown backend: {backend!r}. Supported backends are "
-                f"'sqlite' and 'memory'."
+            raise TypeError(
+                f"backend must be 'sqlite' or 'memory', got {type(backend).__name__}"
             )
-        if isinstance(backend, AbstractStateBackend):
-            # 命名标准化：内置 SQLite/Memory 实例使用标准名
-            if isinstance(backend, SQLiteStateBackend):
-                backend_type = _BACKEND_SQLITE
-            elif isinstance(backend, InMemoryStateBackend):
-                backend_type = _BACKEND_MEMORY
-            else:
-                backend_type = backend.__class__.__name__
-            return backend, backend_type
-        raise TypeError(
-            f"backend must be 'sqlite', 'memory', or AbstractStateBackend "
-            f"instance, got {type(backend).__name__}"
-        )
 
-    @staticmethod
-    def _build_resources(tasks: TaskRegistry, max_workers: int) -> ResourceManager:
-        """资源管理器装配：注入 Task 默认资源读口与 worker 容量资源。
+        if backend == _BACKEND_SQLITE:
+            if state_path is None or (isinstance(state_path, str) and not state_path.strip()):
+                raise ValueError("state_path is required when backend is 'sqlite'")
+            self.state_path: Path | None = Path(state_path).resolve()
+        else:
+            self.state_path = None
 
-        防御 bool 类型：bool 是 int 子类，True < 1 为 False 会静默通过
-        再被 float(True) 变成 1 worker——显式拒绝保持类型严格。
-        """
         if (
             not isinstance(max_workers, int)
             or isinstance(max_workers, bool)
@@ -247,69 +90,137 @@ class TaskLite:
             raise ValueError(
                 f"max_workers must be an int >= 1, got {max_workers!r}"
             )
+
+        self._closed: bool = False
+        self.base_dir: Path = Path(os.path.abspath(os.getcwd()))
+        self.output_roots = self._resolve_output_roots(output_roots)
+        self.backend_type: str = backend
+
+        try:
+            backend_instance = self._build_backend(backend)
+            self.tasks = TaskRegistry()
+            from .triggers import BUILTIN_TRIGGER_FUNCTIONS
+            self._triggers = TriggerRegistry(
+                tasks=self.tasks,
+                functions=BUILTIN_TRIGGER_FUNCTIONS,
+                base_dir=self.base_dir,
+            )
+            self.classifier = ErrorClassifier()
+            self.resources = self._build_resources(self.tasks, max_workers)
+            self._process_context = mp.get_context("spawn")
+            self._channel = ExecutionChannel(
+                process_context=self._process_context,
+                output_roots=self.output_roots,
+                protected_roots=((self.state_path,) if self.state_path is not None else ()),
+            )
+            self.runtime_config = self._build_run_config(backend_instance)
+            self._runtime = EngineRuntime(config=self.runtime_config)
+            self._console = OpsConsole(
+                store=self._runtime.store,
+                classifier=self.classifier,
+            )
+        except BaseException:
+            self._cleanup_failed_init()
+            raise
+
+    def _cleanup_failed_init(self) -> None:
+        """初始化失败时释放本次创建的资源，不删除原有数据库文件。"""
+        self._closed = True
+        if hasattr(self, "_channel") and self._channel is not None:
+            try:
+                self._channel.close()
+            except Exception:
+                pass
+        if hasattr(self, "_runtime") and self._runtime is not None:
+            try:
+                self._runtime.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> TaskLite:
+        if self._closed:
+            raise RuntimeError("Cannot enter context of a closed TaskLite instance.")
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """释放资源且运行期拒绝调用，重复关闭无操作。"""
+        if self.is_running:
+            raise RuntimeError("Cannot close TaskLite while run() is in progress.")
+        if self._closed:
+            return
+        self._closed = True
+        if hasattr(self, "_channel") and self._channel is not None:
+            try:
+                self._channel.close()
+            except Exception:
+                pass
+        if hasattr(self, "_runtime") and self._runtime is not None:
+            try:
+                self._runtime.close()
+            except Exception:
+                pass
+
+    # ── 构造期装配分区 ────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_output_roots(
+        output_roots: str | Path | Sequence[str | Path] | None,
+    ) -> Path | list[Path] | None:
+        """产物根装配：单根/多根（多根时声明路径属任一根即过沙盒），不创建目录。"""
+        if output_roots is None:
+            return None
+        if isinstance(output_roots, (list, tuple)):
+            return [Path(r).resolve() for r in output_roots]
+        if isinstance(output_roots, (str, Path)):
+            return Path(output_roots).resolve()
+        raise TypeError(
+            f"output_roots must be str/Path or a sequence thereof, "
+            f"got {type(output_roots).__name__}"
+        )
+
+    def _build_backend(self, backend: str) -> AbstractStateBackend:
+        """持久化后端装配。"""
+        if backend == _BACKEND_SQLITE:
+            assert self.state_path is not None
+            return SQLiteStateBackend(
+                self.state_path,
+                schema_version=TARGET_SCHEMA_VERSION,
+            )
+        return InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION)
+
+    @staticmethod
+    def _build_resources(tasks: TaskRegistry, max_workers: int) -> ResourceManager:
+        """资源管理器装配：注入 Task 默认资源读口与 worker 容量资源。"""
         resources = ResourceManager(tasks=tasks)
         resources[WORKER_RESOURCE] = CapacityResource(
             WORKER_RESOURCE, max_capacity=float(max_workers)
         )
         return resources
 
-    def _prepare_ipc_dir(self) -> tuple[str, mp.context.BaseContext]:
-        """IPC 落盘目录装配：state_dir/ipc（子进程结果/信号写文件，
-        主进程轮询文件存在，无 mp.Queue 伪阻塞点）。"""
-        ipc_dir = str(self.state_dir / "ipc")
-        Path(ipc_dir).mkdir(parents=True, exist_ok=True)
-        return ipc_dir, mp.get_context("spawn")
-
     def _build_run_config(
         self,
         backend: AbstractStateBackend,
-        *,
-        ordering_policy: OrderingPolicy | None,
-        requeue_policy: RequeuePolicy | None,
-        dependency_grace_seconds: float | None,
-        commit_failure_threshold: int | None,
-        deadlock_gap_max_rounds: int | None,
     ) -> RunConfig:
-        """RunConfig 静态装配快照：调优唯一解析点 + 机器群前置件。
-
-        装配件按引用共享（冻结引用而非拷贝）；调优标量一律可空透传，
-        默认值唯一解析点在 resolve_tuning；调度策略（ordering_policy /
-        requeue_policy）同为可空透传，None → FIFO / 立即重入队的默认
-        收敛在 RunConfig.resolve。backend 在此仅为构造期搬运——运行期
-        所有权唯一锚定 StateStore（EngineRuntime 构造 store 时交接）。
-        """
-        tuning = resolve_tuning(
-            dependency_grace_seconds=dependency_grace_seconds,
-            commit_failure_threshold=commit_failure_threshold,
-            deadlock_gap_max_rounds=deadlock_gap_max_rounds,
-        )
-        channel = ExecutionChannel(
-            self.ipc_dir,
-            process_context=self._process_context,
-            output_roots=self.output_roots,
-            protected_roots=(self.state_dir,),
-        )
+        """RunConfig 静态装配快照。"""
+        tuning = resolve_tuning()
         return RunConfig.resolve(
-            name=self.name,
-            ipc_dir=self.ipc_dir,
-            protected_roots=(self.state_dir,),
+            name="tasklite",
+            ipc_dir=None,
+            protected_roots=((self.state_path,) if self.state_path is not None else ()),
             backend=backend,
             resources=self.resources,
             tasks=self.tasks,
-            channel=channel,
+            channel=self._channel,
             classifier=self.classifier,
             governor=DeadlockGovernor(
                 dependency_grace_seconds=tuning.dependency_grace_seconds,
                 deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
             ),
             trigger_registry=self._triggers,
-            requeue_policy=requeue_policy,
-            ordering_policy=ordering_policy,
             output_roots=self.output_roots,
-            strict_picklable=self.strict_picklable,
-            dependency_grace_seconds=tuning.dependency_grace_seconds,
-            commit_failure_threshold=tuning.commit_failure_threshold,
-            deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
         )
 
     # ── 运行期只读接缝 ─────────────────────────────────────────────
@@ -324,27 +235,12 @@ class TaskLite:
         """当前持久化后端（只读派生自 StateStore 锚点）。"""
         return self._runtime.store.backend
 
-    @backend.setter
-    def backend(self, value: AbstractStateBackend) -> None:
-        # 入口即校验：仅接受 AbstractStateBackend 实例，非后端对象（后端
-        # 名字符串、None、只带个别方法的鸭子对象）一律 fail-loud。鸭子
-        # 接受会让契约缺口的伪造后端延迟到运行期才以 AttributeError
-        # 半路爆发——契约面必须单一（显式子类化，缺方法在类构造期暴露）。
-        if not isinstance(value, AbstractStateBackend):
-            raise TypeError(
-                f"backend must be an AbstractStateBackend instance "
-                f"(use the `backend` constructor argument for "
-                f"'sqlite'/'memory'), got {type(value).__name__}"
+    def _ensure_active(self, api_name: str) -> None:
+        """管理/入队/注册 API 的状态守卫（关闭或运行期间拒绝）。"""
+        if self._closed:
+            raise RuntimeError(
+                f"Cannot call {api_name}() on a closed TaskLite instance."
             )
-        # 换库属管理段操作，仅限 run() 外调用（对齐 register_task /
-        # register_resource 守卫惯例）：运行期换库会撕裂主循环已装配的
-        # 后端引用。换库唯一动作 = 换 StateStore 锚点——runtime / 门面 /
-        # OpsConsole 等一切持有者经 store.backend 派生，必然同步。
-        self._ensure_not_running("backend")
-        self._runtime.store.set_backend(value)
-
-    def _ensure_not_running(self, api_name: str) -> None:
-        """管理/入队 API 的 run 期间守卫（把文档限制变成代码级 RuntimeError）。"""
         if self.is_running:
             raise RuntimeError(
                 f"{api_name}() is only allowed outside run(); "
@@ -354,16 +250,31 @@ class TaskLite:
     @contextlib.contextmanager
     def _management_lock(self):
         """Run 外写操作库级互斥保护。"""
-        fd = try_acquire_lock(self.ipc_dir, "__pipeline_run__", timeout=0)
-        if fd is None:
-            raise RuntimeError(
-                f"Another run() or management operation is in progress for "
-                f"{self.ipc_dir}; concurrent operations on the same state are forbidden."
-            )
-        try:
-            yield
-        finally:
-            release_lock(fd)
+        if self.state_path is not None:
+            fd = try_acquire_lock(self.state_path, timeout=0)
+            if fd is None:
+                raise RuntimeError(
+                    f"Another run() or management operation is in progress for "
+                    f"{self.state_path}; concurrent operations on the same state are forbidden."
+                )
+            try:
+                yield
+            finally:
+                release_lock(fd)
+        else:
+            backend = self.backend
+            if not hasattr(backend, "_exec_lock"):
+                backend._exec_lock = threading.Lock()
+            if not backend._exec_lock.acquire(blocking=False):
+                raise RuntimeError(
+                    "Another run() or management operation is in progress; "
+                    "concurrent operations on the same state are forbidden."
+                )
+            try:
+                yield
+            finally:
+                if backend._exec_lock.locked():
+                    backend._exec_lock.release()
 
     # ── 注册面（六步之二/三）───────────────────────────────────────
 
@@ -373,7 +284,7 @@ class TaskLite:
         同名资源重复注册明确拒绝，内部 worker 容量不能通过资源注册覆盖，
         最大并发只通过 max_workers 配置。
         """
-        self._ensure_not_running("register_resource")
+        self._ensure_active("register_resource")
         if not isinstance(resource, Resource):
             raise TypeError(
                 f"register_resource expects a Resource instance, "
@@ -398,19 +309,8 @@ class TaskLite:
         timeout_seconds: int | float = _UNSET,
         trigger: str = _UNSET,
     ) -> None:
-        """注册一个 Task 规格（Task 实例）或按简式参数就地构造规格。
-
-        规格式：首参传 Task 实例，其余参数不得传入——规格字段以 Task
-        实例为准，旁置参数静默忽略会让调用方误以为覆盖生效，入口拒绝。
-
-        简式：首参传 task_type str，handler 必填；resources /
-        max_retries_per_run / timeout_seconds / trigger 全部 keyword-only，
-        经 Task 构造面校验（模型层校验单点，门面不重复实现）。
-
-        重复注册同一 task_type 显式报错（TaskRegistry 契约）——静默覆盖
-        会让已入队 Job 挂到新 handler 上，规格与实例错配。
-        """
-        self._ensure_not_running("register_task")
+        """注册一个 Task 规格（Task 实例）或按简式参数就地构造规格。"""
+        self._ensure_active("register_task")
         if isinstance(task_or_type, Task):
             self._reject_spec_overrides(
                 handler=handler,
@@ -462,18 +362,14 @@ class TaskLite:
 
     def register_trigger(self, name: str, fn: Callable[["TriggerContext"], bool]) -> None:
         """注册主进程触发条件；内置名称与重复名称不允许覆盖。"""
-        self._ensure_not_running("register_trigger")
+        self._ensure_active("register_trigger")
         self._triggers.register(name, fn)
 
     # ── 入队与过滤（六步之四前置）──────────────────────────────────
 
     def filter_jobs_without_success(self, jobs: Sequence[Job]) -> list[Job]:
-        """过滤出尚未成功完成的 job（uid 不在 successes 的子集，保留输入顺序）。
-
-        委托 OpsConsole；边界语义（failed 不排除、队列驻留不排除）见其
-        docstring。标准姿势：``pipeline.enqueue(pipeline.filter_jobs_without_success(jobs))``。
-        """
-        self._ensure_not_running("filter_jobs_without_success")
+        """过滤出尚未成功完成的 job（uid 不在 successes 的子集，保留输入顺序）。"""
+        self._ensure_active("filter_jobs_without_success")
         return self._console.filter_jobs_without_success(jobs)
 
     def enqueue(self, job: Job) -> bool:
@@ -482,28 +378,29 @@ class TaskLite:
         首次加入队列返回 True；同 UID 已排队且有效配置相同返回 False，
         不同配置抛出 TaskLiteError。
         """
-        self._ensure_not_running("enqueue")
+        self._ensure_active("enqueue")
         if not isinstance(job, Job):
             raise TypeError(
                 f"enqueue() expects a Job, got {type(job).__name__}"
             )
-        inserted = self._runtime.store.enqueue_job(job)
-        if inserted:
-            logger.info("Enqueued 1 job(s).")
-        else:
-            logger.info("Enqueued 0 job(s), skipped 1 duplicate(s).")
-        return inserted
+        with self._management_lock():
+            inserted = self._runtime.store.enqueue_job(job)
+            if inserted:
+                logger.info("Enqueued 1 job(s).")
+            else:
+                logger.info("Enqueued 0 job(s), skipped 1 duplicate(s).")
+            return inserted
 
     # ── 管理面（run() 外运维委托）──────────────────────────────────
 
     def list_suspensions(self) -> list[SuspendEntry]:
         """只读查询当前仍生效的资源挂起。委托 OpsConsole。"""
-        self._ensure_not_running("list_suspensions")
+        self._ensure_active("list_suspensions")
         return self._console.list_suspensions()
 
     def list_failures(self) -> list[FailureEntry]:
         """只读查询失败档案，返回结构化条目。委托 OpsConsole。"""
-        self._ensure_not_running("list_failures")
+        self._ensure_active("list_failures")
         return self._console.list_failures()
 
     def set_job_status(
@@ -515,7 +412,7 @@ class TaskLite:
         note: str | None = None,
     ) -> None:
         """人工设置作业状态（pending/succeeded/failed），限 Run 外。"""
-        self._ensure_not_running("set_job_status")
+        self._ensure_active("set_job_status")
         with self._management_lock():
             self._runtime.store.set_job_status(
                 job_or_uid, status, recursive=recursive, note=note
@@ -528,43 +425,42 @@ class TaskLite:
         records: Collection[Literal["successes", "failures", "attempts"]],
     ) -> int:
         """从指定档案和/或 Attempt 历史中删除单个 job 的记录，限 Run 外。"""
-        self._ensure_not_running("clear_history")
+        self._ensure_active("clear_history")
         with self._management_lock():
             return self._console.clear_history(uid, records=records)
 
     def get_cursor(self, key: str) -> str | None:
         """读取指定游标键的最新已提交值，限 Run 外。"""
-        self._ensure_not_running("get_cursor")
+        self._ensure_active("get_cursor")
         return self._runtime.store.get_cursor(key)
 
     def set_cursor(self, key: str, value: str | None) -> None:
         """设置或删除游标键值，写入直接持久化提交，限 Run 外。"""
-        self._ensure_not_running("set_cursor")
+        self._ensure_active("set_cursor")
         with self._management_lock():
             self._runtime.store.set_cursor(key, value)
 
     @property
     def authorizer(self) -> Callable[[str, str], bool | None] | None:
         """内部文件操作授权判定回调 (path, target_type) -> bool | None。"""
+        self._ensure_active("authorizer")
         return self._runtime.store.authorizer
 
     @authorizer.setter
     def authorizer(self, value: Callable[[str, str], bool | None] | None) -> None:
+        self._ensure_active("authorizer")
         self._runtime.store.authorizer = value
 
     def list_authorizations(self) -> list[dict[str, Any]]:
         """只读查询全部已持久化的授权记录，限 Run 外。"""
-        self._ensure_not_running("list_authorizations")
+        self._ensure_active("list_authorizations")
         return self._runtime.store.list_authorizations()
 
     def revoke_authorization(self, path: str | Path) -> bool:
-        """按规范绝对路径精确撤销授权，限 Run 外。
-
-        撤销精确匹配规范化路径，删除成功返回 True，不存在返回 False；
-        撤销目录下的某个子路径不能覆盖父目录授权，必须撤销对应目录记录。
-        """
-        self._ensure_not_running("revoke_authorization")
-        return self._runtime.store.revoke_authorization(path)
+        """按规范绝对路径精确撤销授权，限 Run 外。"""
+        self._ensure_active("revoke_authorization")
+        with self._management_lock():
+            return self._runtime.store.revoke_authorization(path)
 
     # ── 运行与停机（六步之五/六）───────────────────────────────────
 
@@ -574,6 +470,8 @@ class TaskLite:
         只发出停止当前 Run 新派发的请求，由 run() 等待在途结算，
         重复调用幂等，无活跃 Run 时无操作，不影响下一次 Run。
         """
+        if self._closed:
+            raise RuntimeError("Cannot call stop() on a closed TaskLite instance.")
         if not self.is_running:
             return
         self._runtime.request_stop()
@@ -584,18 +482,13 @@ class TaskLite:
         exclude: Exclude | None = None,
         install_signals: bool = True,
     ) -> None:
-        """运行管线直到队列排空（或收到排空请求）。
-
-        ``exclude`` 仅接受单个 Exclude 对象或 None；命中作业及其受影响下游本次留队。
-        """
+        """运行管线直到队列排空（或收到排空请求）。"""
+        self._ensure_active("run")
         if exclude is not None and not isinstance(exclude, Exclude):
             raise TypeError(
                 f"exclude must be an Exclude instance or None, got {type(exclude).__name__}"
             )
-        logger.info(
-            f"=== Starting Pipeline: {self.name} "
-            f"(Backend: {self.backend_type}) ==="
-        )
+        logger.info(f"=== Starting Pipeline (Backend: {self.backend_type}) ===")
         self._runtime.execute(
             ExecutionOptions(
                 install_signals=install_signals,

@@ -105,8 +105,8 @@ def fake_process(monkeypatch):
     monkeypatch.setattr(mp, "Process", _fake_process_class())
 
 
-def _pipeline(root, name: str = "selection", **overrides) -> TaskLite:
-    return TaskLite(name=name, state_dir=root / "state", backend="memory", **overrides)
+def _pipeline(root=None, name: str = "selection", **overrides) -> TaskLite:
+    return TaskLite(backend="memory", **overrides)
 
 
 def _uids(rows) -> list[str]:

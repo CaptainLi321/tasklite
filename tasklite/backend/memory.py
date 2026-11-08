@@ -39,6 +39,7 @@ class InMemoryStateBackend(AbstractStateBackend):
     def __init__(self, *, schema_version: int = 5) -> None:
         self.schema_version = schema_version
         self._lock = threading.RLock()
+        self._exec_lock = threading.Lock()
         self._successes: dict[str, dict[str, Any]] = {}
         self._failed: dict[str, dict[str, Any]] = {}
         self._failure_payloads: dict[str, dict[str, Any]] = {}
@@ -789,6 +790,10 @@ class InMemoryStateBackend(AbstractStateBackend):
                     except (ValueError, TypeError):
                         pass
         return False
+
+    def close(self) -> None:
+        """关闭后端并释放资源（幂等）。"""
+        pass
 
 
 __all__ = ["InMemoryStateBackend"]

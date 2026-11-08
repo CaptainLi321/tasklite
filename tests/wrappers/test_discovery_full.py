@@ -76,7 +76,7 @@ def _child_ok(job, ctx):
 
 
 def _pipeline(tmp_path, name="r5"):
-    return TaskLite(name=name, state_dir=tmp_path / "state", backend="sqlite", max_workers=3)
+    return TaskLite(backend="sqlite", state_path=tmp_path / "state" / f"{name}.db", max_workers=3)
 
 
 def _posts(n):

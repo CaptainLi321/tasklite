@@ -39,6 +39,7 @@ def slow_window_handler(job, ctx):
     time.sleep(0.5)
     end = time.time()
     window_file = ctx.output_roots / f"window_{job.job_id}.txt"
+    window_file.parent.mkdir(parents=True, exist_ok=True)
     window_file.write_text(f"{start} {end}", encoding="utf-8")
     return TaskResult.success()
 
@@ -80,7 +81,8 @@ def test_scheduler_shares_task_registry_reference(tmp_state_dir):
     同时锁定合并语义：Task 默认 ∪ job 声明，声明值覆盖默认值。
     """
     pipeline = TaskLite(
-        name="test_sched_ref", state_dir=tmp_state_dir, backend="sqlite",
+        backend="sqlite",
+        state_path=tmp_state_dir / "test_sched_ref.db",
     )
     pipeline.register_resource(CapacityResource("mem", max_capacity=2.0))
     pipeline.register_task("fast_task", fast_handler, resources={"mem": 1.0})
@@ -103,9 +105,8 @@ def test_three_jobs_run_concurrently(tmp_state_dir):
     的 3 倍，仅容忍 spawn/调度开销，不承担串行回归判别。
     """
     pipeline = TaskLite(
-        name="test_concurrency",
-        state_dir=tmp_state_dir,
         backend="sqlite",
+        state_path=tmp_state_dir / "test_concurrency.db",
         output_roots=tmp_state_dir / "output",
         max_workers=3,
     )
@@ -135,9 +136,8 @@ def test_workers_resource_limits_concurrency(tmp_state_dir):
     上界取 v1 阈值的 3 倍容忍满载 spawn 开销）。
     """
     pipeline = TaskLite(
-        name="test_workers_limit",
-        state_dir=tmp_state_dir,
         backend="sqlite",
+        state_path=tmp_state_dir / "test_workers_limit.db",
         output_roots=tmp_state_dir / "output",
         max_workers=2,
     )
@@ -168,7 +168,8 @@ def test_dependency_chain_under_concurrency(tmp_state_dir):
     started_at 不得早于上游 finished_at）。
     """
     pipeline = TaskLite(
-        name="test_dep_chain", state_dir=tmp_state_dir, backend="sqlite",
+        backend="sqlite",
+        state_path=tmp_state_dir / "test_dep_chain.db",
         max_workers=3,
     )
     pipeline.register_task("fast", fast_handler)
@@ -202,9 +203,8 @@ def test_resource_capacity_respected_under_concurrency(tmp_state_dir):
     上限测试的满载适配。
     """
     pipeline = TaskLite(
-        name="test_cap_respected",
-        state_dir=tmp_state_dir,
         backend="sqlite",
+        state_path=tmp_state_dir / "test_cap_respected.db",
         output_roots=tmp_state_dir / "output",
         max_workers=3,
     )
@@ -236,7 +236,8 @@ def test_workers_suspended_no_inflight_sleeps_not_busy_loop(tmp_state_dir, monke
     后 run() 在 stop 前至少 sleep 一次。
     """
     pipeline = TaskLite(
-        name="test_workers_suspend", state_dir=tmp_state_dir, backend="sqlite",
+        backend="sqlite",
+        state_path=tmp_state_dir / "test_workers_suspend.db",
         max_workers=2,
     )
     pipeline.register_task("slow", fast_handler)
@@ -285,7 +286,8 @@ def test_custom_worker_resource_zero_wait_no_busy_loop(tmp_state_dir, monkeypatc
             return False, 0.0
 
     pipeline = TaskLite(
-        name="test_custom_worker_zero", state_dir=tmp_state_dir, backend="sqlite",
+        backend="sqlite",
+        state_path=tmp_state_dir / "test_custom_worker_zero.db",
         max_workers=2,
     )
     pipeline.register_task("slow", fast_handler)
