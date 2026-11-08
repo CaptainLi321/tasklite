@@ -72,7 +72,10 @@ class JobContext:
         if init_files:
             for raw_k, raw_v in init_files.items():
                 k = validate_file_name(raw_k)
-                self._files[k] = coerce_file_spec(raw_v, allow_dict=True)
+                spec = coerce_file_spec(raw_v, allow_dict=True)
+                if not spec.is_output_ref and spec.path is not None and not os.path.isabs(str(spec.path)):
+                    spec = spec.resolve_against(self.base_dir)
+                self._files[k] = spec
         self._success_job_uids = success_job_uids
         self._failed_job_uids = failed_job_uids
         self._known_job_uids: frozenset[str] = (

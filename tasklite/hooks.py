@@ -1,6 +1,7 @@
 """面向业务方的展示与切片工具。
 
-提供 job_ref / slice_list 便利工具，经 ``tasklite/__init__.py`` 统一导出。
+注意：本模块为可选工具，本版本暂不承诺向后兼容与冻结扩展协议。
+提供 job_ref / slice_list 便利工具，经 ``tasklite.hooks`` 导入。
 """
 from __future__ import annotations
 

@@ -16,7 +16,7 @@ import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.runtime import EngineRuntime
-from tasklite.models.job import Job
+from tasklite import FileSpec, Job, JobContext, TaskLiteError, TaskResult
 from tasklite.testing import fake_ctx, running
 
 
@@ -169,3 +169,72 @@ class TestRunningHandle:
             with running(rt):
                 raise RuntimeError("boom")
         assert rt.is_running is False
+
+
+class TestFakeCtxFilesAndResults:
+    """新 ctx 文件声明、游标与结果测试支持。"""
+
+    def test_predeclared_files_and_file_path(self, tmp_path):
+        src_path = tmp_path / "input.txt"
+        src_path.write_text("hello", encoding="utf-8")
+        job = Job("t", "j1", files={"src": FileSpec("input.txt", role="input")})
+        ctx = fake_ctx(job, base_dir=tmp_path)
+        assert ctx.file_path("src") == src_path
+
+    def test_declare_file_and_file_path(self, tmp_path):
+        job = Job("t", "j1")
+        ctx = fake_ctx(job, base_dir=tmp_path)
+        p = ctx.declare_file("out", FileSpec("output.csv", role="output"))
+        assert p == tmp_path / "output.csv"
+        assert ctx.file_path("out") == p
+
+    def test_minimal_handler_usage_with_fake_ctx(self, tmp_path):
+        in_file = tmp_path / "source.json"
+        in_file.write_text('{"records": 42}', encoding="utf-8")
+
+        def sample_handler(j: Job, c: JobContext) -> TaskResult:
+            f = c.file_path("input_data")
+            cur = c.get_cursor("step")
+            c.set_cursor("step", "2")
+            return TaskResult.success(metadata={"file_size": f.stat().st_size, "prev_step": cur})
+
+        job = Job("process", "1", files={"input_data": FileSpec(str(in_file), role="input")})
+        ctx = fake_ctx(job, cursors={"step": "1"})
+        result = sample_handler(job, ctx)
+        assert result.metadata["file_size"] > 0
+        assert result.metadata["prev_step"] == "1"
+        assert ctx.cursor_updates["step"] == "2"
+
+
+class TestFakeCtxAuthorizationAndInvariants:
+    """测试 fake 不绕过授权与状态事实（严格校验不可破坏的不变式）。"""
+
+    def test_unauthorized_artifact_reference_rejected(self):
+        spec = FileSpec.from_output(producer_uid="prod::1", output_name="report", role="input")
+        job = Job("consume", "c1", depends_on=[])  # 未在 depends_on 显式声明 producer
+        ctx = fake_ctx(job)
+        with pytest.raises(TaskLiteError, match="not in explicit direct depends_on"):
+            ctx.declare_file("input_art", spec)
+
+    def test_delete_in_protected_roots_rejected(self, tmp_path):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        target_file = state_dir / "db.sqlite"
+        target_file.write_text("protected", encoding="utf-8")
+
+        ctx = fake_ctx(Job("clean", "1"), protected_roots=(state_dir,))
+        with pytest.raises((ValueError, TaskLiteError), match="protected"):
+            ctx.declare_file("del", FileSpec(target_file, role="output", delete_existing=True))
+
+    def test_unregistered_spawn_dependency_rejected(self):
+        ctx = fake_ctx(Job("parent", "p1"))
+        bad_child = Job("child", "c1", depends_on=["other::nonexistent"])
+        with pytest.raises(ValueError, match="non-existent, future, or cross-worker dependency"):
+            ctx.spawn(bad_child)
+
+    def test_unserializable_spawn_payload_rejected(self):
+        ctx = fake_ctx(Job("parent", "p1"))
+        bad_child = Job("child", "c1", payload={"func": lambda x: x})
+        with pytest.raises(ValueError, match="not JSON-serializable"):
+            ctx.spawn(bad_child)
+

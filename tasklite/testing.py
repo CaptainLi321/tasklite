@@ -1,12 +1,24 @@
-"""v2 官方测试工具（冻结 JobContext 内部构造结构对下游测试的影响面）。
+"""v2 官方测试工具（单测 JobContext 构造器与运行状态模拟）。
 
-handler 单测需要构造 JobContext，直接以位置参数硬编码 successes/failed/
-cursors 的内部容器结构会随框架演进碎裂——本模块是唯一承诺稳定的测试
-构造入口（参数形态变更视为破坏性变更，与公开 API 同等对待）。
+注意：本模块为测试辅助工具，本版本暂不承诺向后兼容与冻结扩展协议。
+handler 单测构造 JobContext，提供对文件声明、游标、依赖引用与派生的隔离测试支持。
+``fake_ctx`` 生成真实 JobContext 实例，严格遵循产物沙盒策略、受保护路径、
+资源注册与依赖合法性校验，不绕过授权或状态事实宣称真实能力。
+
+Examples:
+    >>> from pathlib import Path
+    >>> from tasklite import Job, FileSpec, TaskResult
+    >>> from tasklite.testing import fake_ctx
+    >>> job = Job("fetch", "1", files={"out": FileSpec("data.json", role="output")})
+    >>> ctx = fake_ctx(job, tmp_root=Path("/tmp"), cursors={"since": "2026-01-01"})
+    >>> out_path = ctx.file_path("out")
+    >>> ctx.set_cursor("since", "2026-01-02")
+    >>> res = TaskResult.success(metadata={"count": 10})
 """
 from __future__ import annotations
 
 import tempfile
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -49,15 +61,18 @@ def fake_ctx(
     tmp_root: Any | None = None,
     output_roots: Any | None = None,
     ipc_dir: str | None = None,
+    base_dir: str | Path | None = None,
+    known_job_uids: Iterable[str] | None = None,
+    files: Mapping[str, Any] | None = None,
 ) -> JobContext:
     """构造 handler 单测用 JobContext。
 
     Args:
         job: 测试目标 job。
-        successes: 已成功完成的 uid 集合（任意可迭代，``ctx.has_succeeded`` 命中源）。
+        successes: 已成功完成的 uid 集合（依赖闭合与产物引用命中源）。
         artifacts: 按生产者 UID 注入具名成功描述；仍须显式提供 successes 和直接依赖。
         protected_roots: 不可声明为产物的框架状态目录。
-        failed: 已进失败档案的 uid 集合（任意可迭代，``ctx.has_failed`` 命中源）。
+        failed: 已进失败档案的 uid 集合。
         cursors: 游标初值映射（``ctx.get_cursor`` 命中源）。
         resources: 已注册资源名集合——``ctx.suspend_resource`` 按名单
             fail-loud 校验（与生产派发路径同语义）；缺省为空集，suspend
@@ -69,9 +84,12 @@ def fake_ctx(
             的会话级回收）统一承担。
         output_roots: 直接指定产物根目录（与 tmp_root 互斥使用）。
         ipc_dir: 直接指定 IPC 目录（caller 选定目录，非 tmp_root 子目录）。
+        base_dir: 相对路径解析基准目录（默认当前工作目录）。
+        known_job_uids: 允许被引用的已知 Job UID 集合（派生校验用）。
+        files: 预声明文件规范字典（默认继承 job.files）。
 
     Returns:
-        JobContext: 内部容器结构由本函数兜底装配的上下文实例。
+        JobContext: 内部容器结构由本函数兜底装配的真实上下文实例。
     """
     if tmp_root is not None:
         base = Path(tempfile.mkdtemp(dir=str(tmp_root)))
@@ -91,4 +109,8 @@ def fake_ctx(
         resource_names=frozenset(resources or ()),
         artifact_descriptions=artifacts,
         protected_roots=protected_roots,
+        base_dir=base_dir,
+        known_job_uids=frozenset(known_job_uids) if known_job_uids is not None else None,
+        files=files,
     )
+
