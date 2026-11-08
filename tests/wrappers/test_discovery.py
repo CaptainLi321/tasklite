@@ -571,6 +571,15 @@ def _rt_process(job, ctx, item, content_id):
     ctx.spawn(Job("rt_child", content_id, payload={"item": item}))
 
 
+def _rt_process_with_bad_child(job, ctx, item, content_id):
+    if item["id"] == 1:
+        bad_job = Job("rt_child", content_id, depends_on=["rt_child::nonexistent_dep"])
+        ctx.spawned_jobs.append(bad_job)
+    else:
+        ctx.spawn(Job("rt_child", content_id, payload={"item": item}))
+
+
+
 def _rt_cursor_key(payload):
     return f"rt_{payload['artist_id']}"
 
@@ -760,3 +769,34 @@ def test_invalid_payload_scan_mode_and_max_pages_rejected(tmp_path):
         job_bad_max = Job("discover", "j2", payload={"max_pages": bad_max})
         with pytest.raises(ValueError, match="max_pages"):
             h(job_bad_max, _make_ctx(job_bad_max))
+
+
+def test_real_subprocess_discovery_bad_child_rejects_parent_without_partial_publish(tmp_path, monkeypatch):
+    """Discovery 不因坏子项而允许父成功或部分发布（事务原子性保证）。"""
+    pipeline = _rt_setup(tmp_path, monkeypatch, name="rt_disc_bad_child")
+    register_discovery(
+        pipeline, "rt_disc_bad", _rt_fetch, _rt_id, _rt_process_with_bad_child, "rt_child",
+    )
+    pipeline.register_task("rt_child", _rt_child_handler)
+
+    # 提供 2 条数据：id 0 为好子项，id 1 派生坏子项
+    posts = [{"id": 1}, {"id": 0}]
+    pipeline.enqueue(Job("rt_disc_bad", "seed_bad", payload={"artist_id": "bad1", "posts": posts}))
+    pipeline.run()
+
+    # 1. 父任务必须失败，不得进入 successes
+    successes = pipeline.backend.load_successes()
+    assert "rt_disc_bad::seed_bad" not in successes
+
+    failed = pipeline.backend.load_failed()
+    assert "rt_disc_bad::seed_bad" in failed
+    assert "Invalid spawned job" in failed["rt_disc_bad::seed_bad"]["error_message"]
+
+    # 2. 不得部分发布：好子项（id 0）也禁止残留在 queue 或 successes 中
+    queue = pipeline.backend.load_queue()
+    child_queue = [q for q in queue if q["task_type"] == "rt_child"]
+    assert len(child_queue) == 0
+
+    child_successes = [k for k in successes if k.startswith("rt_child::")]
+    assert len(child_successes) == 0
+
