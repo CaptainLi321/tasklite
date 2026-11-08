@@ -407,10 +407,10 @@ class CompletionMachine:
             error_message=retry_error,
             files=files_dict,
             result={
-                "status": "retry",
                 "message": result.message,
-                "metadata": result.result_metadata,
-                "consume_budget": result.consume_budget,
+                "exception": result.exception,
+                "metadata": dict(result.result_metadata or {}),
+                "annotations": dict(result.annotations or {}),
             },
         )
         result.will_retry = True
@@ -493,9 +493,10 @@ class CompletionMachine:
             started_at=started_at,
             files=files_dict,
             result={
-                "status": "success",
                 "message": result.message,
-                "metadata": success_metadata,
+                "exception": None,
+                "metadata": dict(result.result_metadata or {}),
+                "annotations": dict(result.annotations or {}),
             },
         )
         result.will_retry = False
@@ -603,9 +604,10 @@ class CompletionMachine:
             started_at=started_at,
             files=files_dict,
             result={
-                "status": "failure",
                 "message": result.message,
-                "metadata": result.result_metadata,
+                "exception": result.exception,
+                "metadata": dict(result.result_metadata or {}),
+                "annotations": dict(result.annotations or {}),
             },
         )
         result.will_retry = False

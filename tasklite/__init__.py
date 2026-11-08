@@ -27,6 +27,9 @@ __version__ = "2.2.1"
 # ── 门面（六步调用契约的唯一入口）────────────────────────────────────
 from .pipeline import TaskLite
 
+# ── 只读观察快照 ───────────────────────────────────────────────────────
+from .snapshot import StateSnapshot
+
 # ── 执行选择（排除规则值对象）─────────────────────────────────────────
 from .selection import Exclude
 
@@ -96,6 +99,8 @@ from .utils import jsonutil
 __all__ = [
     # 门面
     "TaskLite",
+    # 只读观察快照
+    "StateSnapshot",
     # 执行选择
     "Exclude",
     # 模型层
