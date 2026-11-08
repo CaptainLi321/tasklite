@@ -347,3 +347,37 @@ def test_different_output_names_may_share_or_overlap_paths(tmp_path, dynamic, ba
     attempt, = p.backend.load_settled_attempts("work::one")
     assert set(attempt["files"]) == {"report", "alias", "directory"}
     p.close()
+
+
+def _dynamic_delete_handler(job, ctx):
+    try:
+        ctx.declare_file("target", FileSpec(job.payload["path"], role="output", delete_existing=True))
+    except Exception:
+        return TaskResult.success()
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "memory"])
+@pytest.mark.parametrize("wait", [False, True])
+def test_approved_waiting_declaration_cleanup_error_fails_job(tmp_path, monkeypatch, backend, wait):
+    """等待后获准的前删故障必须失败，不能冒充授权拒绝回 pending。"""
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "target"
+    target.write_text("valuable")
+    p = TaskLite(backend=backend, **({"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}))
+    decisions = iter([None, True] if wait else [True])
+    p.authorizer = lambda *args: next(decisions)
+    p.register_task("work", _dynamic_delete_handler)
+    p.enqueue(Job("work", "one", payload={"path": str(target)}))
+    with patch("tasklite.utils.artifact.ArtifactPathPolicy.remove_existing", side_effect=OSError("清理磁盘拒绝写入")):
+        p.run()
+    failure = p.backend.load_failed()["work::one"]
+    assert "清理磁盘拒绝写入" in failure["error_message"]
+    attempt, = p.backend.load_settled_attempts("work::one")
+    assert attempt["outcome"] == "failure"
+    assert attempt["result"]["exception"]["type"] == "OSError"
+    assert "remove_existing" in attempt["result"]["exception"]["traceback"]
+    assert "清理磁盘拒绝写入" in attempt["error_message"]
+    assert p.backend.load_queue_jobs() == []
+    assert target.read_text() == "valuable"
+    p.close()

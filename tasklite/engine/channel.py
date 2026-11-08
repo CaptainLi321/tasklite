@@ -857,7 +857,7 @@ class ExecutionChannel:
             exec_id = handle.execution_id or ""
             self._receive_available(handle)
 
-            if handle.auth_denied:
+            if handle.auth_denied or handle.preparation_error is not None:
                 is_alive = False
                 try:
                     is_alive = p.is_alive()
@@ -877,8 +877,10 @@ class ExecutionChannel:
                     self._finalize_process(p)
                     decoded = ExecutionResult(
                         success=False,
-                        transient_kind="authorization_denied",
-                        message="authorization denied",
+                        transient_kind="authorization_denied" if handle.auth_denied else None,
+                        message=(handle.preparation_error["message"]
+                                 if handle.preparation_error is not None else "authorization denied"),
+                        exception=handle.preparation_error,
                     )
                     completed.append((handle, decoded))
                 continue
@@ -945,7 +947,7 @@ class ExecutionChannel:
         self, handle: JobHandle, res: dict | None = None, *, is_timeout: bool = False
     ) -> ExecutionResult:
         """收敛收割尾部：终止并收割子进程 → 排空管道至 EOF → 解码结果 → 关闭管道。"""
-        if handle.auth_denied:
+        if handle.auth_denied or handle.preparation_error is not None:
             p = handle.process
             exec_id = handle.execution_id or ""
             try:
@@ -957,8 +959,10 @@ class ExecutionChannel:
             self._errors.pop(exec_id, None)
             return ExecutionResult(
                 success=False,
-                transient_kind="authorization_denied",
-                message="authorization denied",
+                transient_kind="authorization_denied" if handle.auth_denied else None,
+                message=(handle.preparation_error["message"]
+                         if handle.preparation_error is not None else "authorization denied"),
+                exception=handle.preparation_error,
             )
         p = handle.process
         exec_id = handle.execution_id or ""

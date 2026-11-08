@@ -89,6 +89,7 @@ class JobHandle:
     ipc_dir: str | None = None
     execution_id: str | None = None
     auth_denied: bool = False
+    preparation_error: dict[str, str] | None = None
     paused_remaining: float | None = None
     waiting_auth: bool = False
     pending_declaration: dict[str, Any] | None = None

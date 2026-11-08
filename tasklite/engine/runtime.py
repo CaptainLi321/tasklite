@@ -266,11 +266,12 @@ class EngineRuntime:
             try:
                 policy.remove_existing(ArtifactDeclaration(resolved_path, delete_existing=True))
             except OSError as exc:
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": f"Pre-deletion failed: {exc}",
+                handle.preparation_error = {
+                    "type": type(exc).__name__, "message": str(exc),
+                    "traceback": traceback.format_exc(),
                 }
+                self.channel.terminate_process(handle)
+                return None
 
         entry.active_files[validated_name] = bound_spec
         return {
@@ -568,18 +569,11 @@ class EngineRuntime:
                     try:
                         policy.remove_existing(ArtifactDeclaration(resolved_path, delete_existing=True))
                     except OSError as exc:
-                        handle.auth_denied = True
+                        handle.preparation_error = {
+                            "type": type(exc).__name__, "message": str(exc),
+                            "traceback": traceback.format_exc(),
+                        }
                         self.channel.terminate_process(handle)
-                        reply_sender = self.channel.get_reply_sender(handle.execution_id)
-                        if reply_sender is not None:
-                            try:
-                                reply_sender.send_reply({
-                                    "request_id": req_id,
-                                    "status": "error",
-                                    "error": f"Pre-deletion failed: {exc}",
-                                })
-                            except OSError:
-                                pass
                         continue
                 entry.active_files[name] = spec
                 reply_sender = self.channel.get_reply_sender(handle.execution_id)
