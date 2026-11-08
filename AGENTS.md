@@ -6,11 +6,11 @@
 
 ---
 
-## ADR-0011 实施任务入口
+## ADR-0011 稳定基线标准
 
-收到 `docs/tickets/adr-0011/` 中某张 ticket 的实现指派时，先读 [执行约定](docs/tickets/adr-0011/EXECUTION.md) 和该票最小阅读包，不需要历史聊天或完整加载全部票据。目标行为以该票指向的已接受 [ADR-0011](docs/adr/0011-stable-interface-baseline.md) 章节为准；GUIDE 与下文涉及旧 max_retries、错误分类、worker 锁、瞬态恢复、Selection、回调及旧管理接口的条款，在对应切片实施时按 ADR 明确替代，不为保留旧规则增加兼容垫片。尚未接入的切片不得宣称已实现。
+本仓库已全面接入 [ADR-0011](docs/adr/0011-stable-interface-baseline.md) 稳定接口基线。目标行为以 ADR-0011 契约章节为准。旧 max_retries、错误分类、worker 锁、瞬态恢复、旧 Selection/Skip、生命周期回调及旧管理接口已由 ADR-0011 全面替代。
 
-这一过渡说明只解决旧行为与已接受新基线的差异，不放宽测试／矩阵、原子提交、单向依赖、单射编码、单一收尾、WAL／写事务及业务数据保护要求。编号进度保留与结果结算规则按 ADR；实现完成后由最终文档票同步清理旧条款。代码、测试名和注释不写 ticket 编号。
+本基线严守测试／矩阵、原子提交、单向依赖、单射编码、单一收尾、WAL／写事务及业务数据保护要求。编号进度保留与结果结算规则按 ADR。代码、测试名和注释不写 ticket 编号。
 
 ---
 
@@ -42,9 +42,9 @@
    - SQLite `journal_mode=WAL` 必须在启动时验证生效（fail-loud，拒绝在断电可损坏模式下启动）；
    - `sqlite_backend.py` 中的序号分配与读-改-写操作必须在显式 `BEGIN IMMEDIATE` 写事务保护下执行。
 8. **瞬态信号军规**：
-   - 孤儿锁冲突（`lock_conflict`）、外部中断（`interrupted`）、限速（`RateLimitHit`）等瞬态信号，必须做到**「不烧重试预算 + 降级写盘 + 零污染」**。
+   - 外部中断（`interrupted`）、超时等瞬态信号，必须做到**「不烧重试预算 + 降级写盘 + 零污染」**；库级单锁（`__tasklite__.lock`）防多实例并发写冲突。
 9. **六步标准调用顺序**：
-   - 初始化 → `register_resource` → `register_task` / `register_discovery` / `register_transient_exception` → `enqueue` → `run` → `stop`；管理 API 仅限 `run()` 外调用。
+   - 初始化 → `register_resource` → `register_task` → `enqueue` → `run` → `stop`；管理 API（`set_job_status` / `clear_history` / `get_cursor` / `set_cursor` / `list_authorizations` / `revoke_authorization`）仅限 `run()` 外调用。
 
 ---
 
@@ -58,7 +58,7 @@
 - ❌ **严禁字面代码复读**：不写翻译代码语法的无意义废话（如 `# 遍历队列检查依赖`）。
 
 ### 2. 必须保留的高价值注释（三留）
-- ✅ **不可破坏的系统级不变式（Invariants）**：如「不变式：锁生命周期严格等于子进程执行体生命周期」、「六集合全局互斥」。
+- ✅ **不可破坏的系统级不变式（Invariants）**：如「不变式：锁生命周期严格等于主实例执行生命周期」、「状态互斥与单调自增编号」。
 - ✅ **反直觉 / 非显然的设计决策（Non-obvious Decisions）**：如 `_CommitCrashSignal` 继承 `BaseException` 的理由（“防止用户 handler 的 `except Exception` 误吞崩溃信号”）。
 - ✅ **单射性数学证明关键点**：如 `lockfile.py` 中「先 `%25` 后 `::` 转义以防 `t::x::y` 碰撞」。
 
@@ -67,11 +67,11 @@
 
 ---
 
-## 三、v2 模型与术语红线（转正，详见 [`docs/adr/0004-v2-parallel-rebuild.md`](docs/adr/0004-v2-parallel-rebuild.md) 与 [`docs/adr/0005-v2-promotion.md`](docs/adr/0005-v2-promotion.md)）
+## 三、v2 模型与术语红线（转正，详见 [`docs/adr/0004-v2-parallel-rebuild.md`](docs/adr/0004-v2-parallel-rebuild.md)、[`docs/adr/0005-v2-promotion.md`](docs/adr/0005-v2-promotion.md) 与 [`docs/adr/0011-stable-interface-baseline.md`](docs/adr/0011-stable-interface-baseline.md)）
 
-1. **术语红线**：禁用 `sanitize` / `taxonomy` / `DLQ` 旧词——编码族统一 `encode_*`，错误分类统一 `ErrorClassifier`（`engine/errorclass.py`，`ErrorCategory` 唯一表示），失败集合统一「失败档案 failed」（`FailureEntry` / `list_failures` / `clear_failures` / `retry_failure`）。
+1. **术语红线**：禁用 `sanitize` / `taxonomy` / `DLQ` 旧词——编码族统一 `encode_*`，失败集合统一「失败档案 failed」（状态管理统一 `set_job_status` / `clear_history`，只读查询统一 `StateSnapshot`）。
 2. **核心禁调度计算**：核心层（engine/backend/models/utils）内禁止任何排序计算与退避计算（backoff 全族已砍除）；重试节奏、候选排序与候选准入一律经 OrderingPolicy / RequeuePolicy / Selection seam 以**各自 seam 形态**扩展（策略 wrapper/util 或选择规则值对象），**seam 扩展须另立 ADR**；Job 模型不携带 priority / deadline / period 字段。
-3. **三层模型语义**：Task（规格，注册于 `TaskRegistry`）/ Job（逻辑实例，`uid = task_type::job_id` 身份不变）/ Attempt（append-only 执行轨迹，旁路观测面，不参与六集合互斥）；`retries` 构造参数已废除，预算位收敛 `max_retries`。
+3. **三层模型语义**：Task（规格，注册于 `TaskRegistry`）/ Job（逻辑实例，`uid = task_type::job_id` 身份不变）/ Attempt（append-only 执行轨迹，旁路观测面，不参与集合互斥）；预算位收敛 `max_retries_per_run`，handler 返回值统一收敛为 `TaskResult`（`TaskResult.success` / `TaskResult.failure` / `TaskResult.retry`）。
 
 ---
 

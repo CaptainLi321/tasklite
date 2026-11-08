@@ -1,143 +1,106 @@
-# TaskLite
+# TaskLite 领域概念词典
 
-A robust, embedded Python task orchestration engine featuring subprocess isolation, per-worker Pipe IPC with lockfile fencing, ACID delta transactions, and multi-round fault recovery. Built on the Task / Job / Attempt three-layer model (ADR-0004; promoted to the main package by ADR-0005).
+A robust, embedded Python task orchestration engine featuring subprocess isolation, per-worker Pipe IPC with library lock fencing, ACID delta transactions, and multi-round fault recovery. Built on the Task / Job / Attempt three-layer model (ADR-0004 / ADR-0005 / ADR-0011).
 
 ## Language
 
 ### Core Domain
 
 **Task**:
-进程内静态规格模板：`task_type`、handler、`resources`、`payload_schema` 及默认 `max_retries / timeout_seconds / timeout_is_transient / trigger`；代码即规格，不落盘，注册于 `TaskRegistry`。
+进程内静态规格模板：`task_type`、handler、`resources` 及默认 `max_retries_per_run / timeout_seconds`；代码即规格，不落盘，注册于 `TaskRegistry`。
 _Avoid_: Handler, JobTemplate, WorkType, Step
 
 **Job**:
-稳定身份为 `uid = f"{task_type}::{job_id}"` 的逻辑实例。五项规格 `resources / max_retries / timeout_seconds / timeout_is_transient / trigger` 为 `None` 时继承 Task，资源按键合并且显式同名键覆盖。实例位由框架管理：`attempt_no` 为同次激活内从 1 起始的尝试号，`activation_no` 为首次准入推进的激活代，`first_enqueued_at` 重试时不刷新。已持久化的显式规格恢复时不被新模板覆盖。
+稳定身份为 `uid = make_job_uid(task_type, job_id)` 的逻辑实例。规格为 `None` 时继承 Task，资源按键合并且显式同名键覆盖。实例位由框架管理：`attempt_no` 为尝试号（从 1 起始单调递增），`first_enqueued_at` 重试时不刷新。
 _Avoid_: Message, Item, Record, Execution
 
-**TriggerContext / TriggerRegistry**:
-Trigger 在主进程依赖就绪后、出队与写 Attempt 前决定是否开始一次激活；内置 `once / on_failure / on_input_change / always`，默认 once，Discovery 默认 always。应用通过 `register_trigger(name, fn)` 注册名称，Job 仅保存字符串引用。只读判定上下文提供隔离 Job 快照、历史终态和可信成功微秒基线。False 是本次无需执行，允许下游流转；Selection Skip 是永久跳过并级联，两者分离。故障重试 `attempt_no > 1` 不重复求值；异常原样上抛并保队。
+**TaskResult**:
+任务 handler 的唯一合法显式返回类型：静态构造器 `TaskResult.success`、`TaskResult.failure`、`TaskResult.retry`。携带经过校验的严格 JSON `metadata` 与可选 `message`。
+_Avoid_: ReturnTuple, BoolStatus, ExceptionRethrow
 
-**可信成功基线**:
-当前成功档案的框架元数据与同事务收尾的 succeeded Attempt 相互核验后得到的 `finished_at_us`。人工 seed 空档案与清历史后残留的旧 Attempt 不组成可信基线；缺证据保守执行。`on_input_change` 仅检查声明输入路径当前 `mtime_ns // 1000` 是否严格晚于该基线，不存历史大小/mtime，不递归目录，不因输出缺失自动触发。
+**FileSpec**:
+统一文件与产物声明值对象：携带 `path`（相对或绝对路径）、`role`（output/input/cache）以及三项显式删除授权（`delete_existing`、`delete_on_failure`、`delete_on_success`）。
+_Avoid_: ArtifactSpec, FileDecl, OutputPath
+
+**StateSnapshot**:
+统一只读一致状态快照与 JSON 查询入口：支持从数据库路径或 TaskLite 实例通过 `StateSnapshot.open(source)` 打开。提供 `get_job(uid)`、`iter_jobs(*, status=..., task_type=...)` 与 `iter_attempts(*, job_uid=..., task_type=...)`，返回符合 ADR-0011 契约的标准化 JSON 字典。
+_Avoid_: StatusReader, StateInspector, DBViewer
 
 **Attempt**:
-The append-only trace record of one physical execution: `(job_uid, activation_no, attempt_no, execution_id, run_id, started_at, finished_at, outcome, error_message)`. Row inserted at dispatch (`outcome=running`), updated at settlement; a bypass observation surface that never participates in the six-set mutual exclusion — "final state is unique" (successes/failed by uid) and "history is traceable" (attempts never deleted) are thereby decoupled.
+一次物理执行的 append-only 轨迹记录：`(attempt_id, job_uid, attempt_no, run_id, outcome, started_at, settled_at, job_snapshot, files, result, error_message)`。派发时插入 `outcome='running'`，结算时更新终态。旁路观测面，不参与集合互斥。
 _Avoid_: Trial, ExecutionLog, RunRecord
 
 **TaskRegistry**:
-The in-process registry of Task specifications: one-to-one by `task_type`; duplicate registration raises `ValueError` (silent overwrite would re-bind queued jobs to a new handler), unregistered lookup raises `KeyError`.
+进程内 Task 规格注册表：按 `task_type` 一对一绑定；重复注册显式抛出 `ValueError`，未注册查询抛出 `KeyError`。
 _Avoid_: HandlerMap, Registry, TaskStore
 
 **TaskLite**:
-The host orchestrator and primary user-facing facade configuring tasks, resources, and executing runs.
+主调度器与用户入口门面：负责组装调度循环、资源与任务注册、入队与执行，并提供 Run 外统一运维管理 API。
 _Avoid_: PipelineEngine, Runner, Master, Coordinator
 
-**RunConfig**:
-The immutable static assembly snapshot resolved once by `RunConfig.resolve()` as the single point of default-value resolution (callers pass raw Optionals, no module re-derives defaults), carried into `EngineRuntime`.
-_Avoid_: ConfigBag, SettingsDict
-
-**RunSession**:
-The per-`run()` lifecycle state holder (stop-mode transitions, stats, dispatch sequencing) serving as the single outlet for run-phase event hooks (`fire_*`) and exit-reason derivation.
-_Avoid_: RunContext, SessionState
-
-**EngineRuntime**:
-The deep execution engine unifying the event pump, step advances, dispatch preflights, result settlement, crash recoveries, and process isolation.
-_Avoid_: RunnerHelper, LoopExecutor, ExecutionService
-
-**PipelineState**:
-In-memory fast lookup container holding active collections (`_queue`, `_successes`, `_failed`, `_cursors`, and `_in_flight`) with invariant consistency checks and encapsulated mutation interfaces.
-_Avoid_: StateHolder, Store, MemoryState
-
 **Successes（成功档案）**:
-The immutable historical set of successfully executed jobs and their metadata.
+持久化成功完成作业集合及其最终元数据（`successes` 表）；按 `job_uid` 与失败档案互斥。
 _Avoid_: SuccessTable, CompletedSet, HistoryStore
 
-**Failed (失败档案)**:
-The persistent failure archive of jobs that failed permanently or exhausted their retry budget (`failed` table); mutually exclusive with successes by uid (one final state per uid). APIs: `list_failures` / `clear_failures` / `retry_failure`.
+**Failed（失败档案）**:
+持久化永久失败作业集合及其元数据与 payload 快照（`failed` 表）；按 `job_uid` 与成功档案互斥。统一经由 `set_job_status` 重置或 `clear_history` 清除，只读查询收敛至 `StateSnapshot`。
 _Avoid_: FailureLog, ErrorQueue, Trash, DLQ, DeadLetter
 
-**FailureEntry**:
-The structured archive entry: `job_uid`, `error_message`, `metadata` (full archive metadata view incl. `error_category`), `payload` (raw business payload snapshot — manual re-run needs no external lookup).
-_Avoid_: DLQEntry, ErrorRecord
-
-**ErrorClassifier**:
-The single source of truth for error tri-classification, transient-exception registration, payload validation, and process-death attribution (`tasklite/engine/errorclass.py`; `ErrorCategory` is the sole representation — no parallel `ERROR_TYPE_*` constants).
-_Avoid_: Taxonomy, ErrorTaxonomy, ClassifierService
-
 **encode_* family**:
-The reversible `%XX` percent-encoding family (`encode_identifier` / `encode_job_component` / `encode_content_id` / `percent_encode`) plus `encode_job_uid_filename` / `content_fingerprint`, guaranteeing injectivity (zero collisions) across file paths, job IDs, and discovery namespaces.
+可逆 `%XX` 单射编码族（`encode_identifier` / `encode_job_component` / `encode_content_id` / `percent_encode` 以及 `make_job_uid` / `parse_job_uid`），保证标识符与路径转换无碰撞。
 _Avoid_: Sanitizer, Slugger, Escaper, sanitize_*
 
 **OrderingPolicy**:
-The queue visit-order seam: `scan_next_runnable` is the single selection point; default `FifoOrderingPolicy` (by queue_position). Custom policies inject via the `ordering_policy` facade parameter — the core contains no scheduling arithmetic.
+队列访问序扩展接缝：默认 `FifoOrderingPolicy`（按 `queue_position` 升序访问），核心内部无调度排序计算。
 _Avoid_: SortStrategy, PriorityScheme
 
 **RequeuePolicy**:
-The single outlet for retry pacing: default `ImmediateRequeuePolicy` (`RequeuePlan(front=True, delay_seconds=0.0)`); delay-style strategies re-enter through this seam via a future ADR.
+重试节奏扩展接缝：默认 `ImmediateRequeuePolicy`（立即重入队），核心内部无退避计算。
 _Avoid_: BackoffGovernor, RetryTimer, BackoffSchedule
 
-**Selection**:
-流水线级候选准入规则集：`Exclude(task_type=...)` 延迟留队，`Skip(task_type=...)` 终态跳过并级联下游，同一任务类型由 Skip 优先。规则对象以 `task_type` 保存匹配目标，`Rule.matches_task_type(task_type)` 为匹配入口，`Selection.allows_task_type(task_type)` 判断本次运行是否允许派发；自定义非 Skip 规则采用 Exclude 语义。
+**Exclude**:
+流水线运行排除规则值对象：`Exclude(task_type=...)`，命中作业本次 run 不派发、原样留队、下次自动恢复。
+_Avoid_: SkipRule, FilterRule, IgnoreSpec
 
-### Engine Machines
+### Engine Machines & Runtime
 
 **DispatchMachine**:
-先等待本批依赖、处理依赖失败，再统一求值 trigger，随后处理任务查找与孤儿锁探测，申请资源并派发 worker。活跃上游遮蔽历史终态；同批 trigger False 的就绪标记仅保留在当前运行内存中。
+负责检查依赖、分配单调递增 `attempt_no`、校验并申请所需资源、经 WorkerPipe 派发隔离子进程。
 _Avoid_: Submitter, Launcher, DispatcherService
 
 **CompletionMachine**:
-Specialized machine handling subprocess result collection, output cleanup, resource release, and atomic backend commits.
+负责接收子进程 Pipe 结果、执行主进程授权文件清理与准备、释放资源并触发原子写事务提交。执行收尾的唯一收口出口。
 _Avoid_: Collector, ResultHandler, Finalizer
 
 **StateStore**:
-Specialized deep module unifying memory state transitions, transactional backend persistence, 3-strike crash handling, downstream failure propagation, and the failure-write guard for excluded or skipped jobs.
+统一内存状态转移与数据库持久化事务的核心模块，负责四态与成功/失败档案互斥，收敛失败登记（`apply_failure`）。
 _Avoid_: ErrorManager, DeadlockResolver, StateRepository
 
 **RecoveryOrchestrator**:
-Specialized machine responsible for startup repairs, TOCTOU-safe aborting, and crash-safe queue persistence.
+负责启动时检查残留 in-flight 执行、回收在途状态至 pending 并修复孤儿锁。
 _Avoid_: RepairService, AbortHandler, Rescuer
 
-**InFlightJob**:
-Runtime tracked context for a job dispatched to an active subprocess before completion or commit.
-_Avoid_: RunningTask, ActiveProcess, WorkerHandle
-
-**WorkerLaunchSpec**:
-The frozen named contract crossing the process seam, carrying the full spawn payload (handler, job, execution context, execution_id, ipc_dir, timeout_seconds, pipe_sender) for worker subprocess launch; execution_id belongs to the spec, not to JobContext.
-_Avoid_: SpawnArgs, ProcessPayload
-
 **JobContext**:
-The execution context handed to a handler, belonging to one job execution (`spawn` / `declare_output` / `declare_input` / cursors / `suspend_resource` / successes-failed snapshot queries).
-`has_succeeded(job_uid)` / `has_failed(job_uid)` 查询派发时的成功/失败档案快照；`succeeded_or_failed_job_uids()` 返回只读并集，不含 skipped、队列成员或 Attempt 历史，不实时刷新。
+传递给 handler 的执行上下文，属于一次物理执行：提供 `spawn`、`declare_file`、`file_path`、`get_cursor` 与 `set_cursor`。
 _Avoid_: TaskContext, ExecContext, HandlerEnv
 
-**OpsConsole**:
-The pure operations seam for management APIs used outside `run()` (list_failures / clear_failures / clear_history / seed_successes / seed_cursor), constructed with explicit `(backend, store, classifier)` dependencies and delegated to by the TaskLite facade. `filter_jobs_without_success(jobs)` 仅过滤成功档案命中者，保留输入顺序，failed 与 queued Job 仍可返回。
-_Avoid_: AdminAPI, MaintenanceService
-
-**wait / decide_wait**:
-The pure wait/idle decision functions in `engine/wait.py` consuming a `LoopFacts`-style snapshot per event-pump tick — the single implementation of wait semantics in the run loop.
-_Avoid_: WaitStrategy, SleepPolicy, pacing
-
-### Persistence & Encoders
-
-**StateBackend**:
-Abstract storage interface implementing atomic delta commits for job success, failure, retries, and skips under transaction boundaries.
-_Avoid_: Database, Repository, StorageDriver
+### Persistence
 
 **SQLiteStateBackend**:
-Default ACID storage adapter using SQLite in WAL mode with immediate transactions; fresh schema (`user_version=5`, incl. the append-only `attempts` table), read-only preflight rejection of older versions (`user_version <= 4`), nonempty version 0 databases, and incomplete or mixed databases. Package version is 2.2.0.
+默认 ACID 存储后端，采用 SQLite WAL 模式与 immediate 写事务。状态库采用 Schema 6（`user_version=6`），核心表包括 `queue`、`successes`、`failed`、`attempts`、`job_sequences`、`cursors` 与 `engine_metadata`。只读预检阶段 fail-loud 拒绝旧版本（Schema ≤ 5）与异形库。
 _Avoid_: SQLiteDriver, DBBackend
 
 **InMemoryStateBackend**:
-Zero-IO pure memory storage adapter providing snapshot-isolated transactions for ultra-fast headless testing and ephemeral pipelines.
+纯内存零 IO 存储后端，提供一致快照隔离，用于快速单测与内存管线。
 _Avoid_: MockBackend, FakeDB, MemoryStorage
 
-### Official Wrappers & Utilities
+### Optional Wrappers & Utilities
 
-**HttpPolicy**:
-Rule-based response classifier translating HTTP statuses and transport faults into TaskLite exception tri-classification (`RateLimitHit`, `RetryError`, `FatalError`).
-_Avoid_: ErrorStrategy, RetryPolicy, StatusMapper
+**wrappers.http**:
+可选网络请求与快照缓存工具（`http_guard`, `urllib_fetch`, `SQLiteSnapshotStore`）。本版不作稳定兼容承诺，文档须显式标注。
 
-**SnapshotStore**:
-Content-addressable raw HTTP transaction cache enabling offline deterministic replays and anti-crawl protection without re-fetching remote endpoints.
-_Avoid_: ResponseCache, HttpCache, PayloadStore
+**wrappers.discovery**:
+可选增量分页扫描工具（`register_discovery`）。本版不作稳定兼容承诺，文档须显式标注。
+
+**testing.fake_ctx**:
+单元测试上下文构造辅助工具。本版不作稳定兼容承诺，文档须显式标注。
