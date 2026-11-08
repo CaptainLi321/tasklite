@@ -49,6 +49,13 @@ if TYPE_CHECKING:
 
         def set_state(self, state: PipelineState | None) -> None: ...
 
+        def apply_failure(
+            self, job_uid: str, failure_metadata: dict[str, Any], *,
+            job_snapshot: dict[str, Any] | None = None,
+            cascade: bool = True, attempt_no: int | None = None,
+            run_id: str | None = None, started_at: str | None = None,
+        ) -> Any: ...
+
     class RecoveryCompletion(Protocol):
         """恢复编排消费的完成机器契约（CompletionMachine 自动满足）。
 
@@ -115,6 +122,7 @@ class RecoveryOrchestrator:
                         f"(successes={u in successes}, failed={u in failed})"
                     )
 
+            self._store.set_state(PipelineState(successes, failed, cursors, []))
             recovered_any = False
             for row in queue_rows:
                 if row.get("status") == "running":
@@ -130,20 +138,11 @@ class RecoveryOrchestrator:
                         "run_id": r_id,
                         "attempt_no": att_no,
                     }
-                    payload = job_snap.get("payload") if isinstance(job_snap, dict) else None
-                    backend.commit_job_settlement(
-                        job_uid=u,
-                        outcome="failure",
-                        attempt_no=att_no,
-                        run_id=r_id,
-                        settled_at=utc_now_iso(),
-                        started_at=st_at,
-                        job_snapshot=job_snap,
-                        error_message=msg,
-                        failure_metadata=fail_meta,
-                        payload=payload,
+                    self._store.apply_failure(
+                        u, fail_meta, job_snapshot=job_snap, cascade=False,
+                        attempt_no=att_no, run_id=r_id, started_at=st_at,
                     )
-                    failed[u] = fail_meta
+                    failed = dict(self._store.state.failed)
                     recovered_any = True
 
             if recovered_any:

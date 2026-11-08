@@ -145,3 +145,28 @@ def test_attempt_no_monotonic_advance_including_zero_budget_retry(tmp_path: Path
     assert len(attempts) == 2
     assert [a.attempt_no for a in attempts] == [1, 2]
     assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_recovery_settlement_fault_preserves_running(tmp_path, monkeypatch, raises):
+    """恢复提交失败时保留 running 与完整快照，不登记内存失败。"""
+    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+    backend = pipeline.backend
+    snapshot = {"task_type": "work", "job_id": "orphan", "payload": {"key": "value"}}
+    backend.enqueue_jobs([snapshot])
+    backend.mark_job_running("work::orphan", run_id="old", started_at="2026-01-01T00:00:00+00:00")
+
+    def fail_settlement(**kwargs):
+        if raises:
+            raise OSError("无法写入结算")
+        return False
+
+    monkeypatch.setattr(backend, "commit_job_settlement", fail_settlement)
+    with pytest.raises(BaseException, match="无法写入结算|Failed to commit failure"):
+        pipeline.run()
+    assert backend.load_queue_jobs()[0]["status"] == "running"
+    assert backend.load_queue_jobs()[0]["job"] == snapshot
+    assert backend.load_failed() == {}
+    assert backend.load_attempts("work::orphan") == []
+    assert pipeline._runtime.store.state.failed == {}
+    pipeline.close()
