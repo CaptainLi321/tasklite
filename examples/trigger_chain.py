@@ -1,48 +1,66 @@
-"""稳定 Job 身份与按输入修改时间重跑的最小可运行示例。"""
+"""稳定 Job 身份与 DAG 拓扑依赖链的最小可运行示例。"""
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from tasklite import Job, TaskLite
+from tasklite import (
+    FileSpec,
+    Job,
+    Task,
+    TaskLite,
+    TaskResult,
+)
 
 
-def update_source(job, ctx):
-    path = ctx.output_roots / "source.txt"
-    content = job.payload["content"]
-    changed = not path.exists() or path.read_text(encoding="utf-8") != content
-    if changed:
-        path = Path(ctx.declare_output(path, delete_existing=True))
-        path.write_text(content, encoding="utf-8")
-    return {"changed": changed}
+def produce_data(job, ctx):
+    """上游生产者：声明输出文件并写入业务数据。"""
+    out_path = ctx.declare_file(
+        "output_file",
+        FileSpec("source.txt", role="output", delete_existing=True),
+    )
+    content = job.payload.get("content", "default data")
+    out_path.write_text(content, encoding="utf-8")
+    return TaskResult.success(metadata={"size": len(content)})
 
 
-def read_source(job, ctx):
-    path = Path(ctx.declare_input(ctx.output_roots / "source.txt"))
-    return {"text": path.read_text(encoding="utf-8").upper()}
+def consume_data(job, ctx):
+    """下游消费者：读取上游生成的文件并进行处理。"""
+    in_path = Path(ctx.base_dir) / "source.txt"
+    text = in_path.read_text(encoding="utf-8")
+    return TaskResult.success(metadata={"uppercase": text.upper()})
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="独立的示例状态与产物目录")
     args = parser.parse_args()
-    (args.root / "files").mkdir(parents=True, exist_ok=True)
-    pipeline = TaskLite(backend="sqlite", state_path=args.root / "state" / "trigger.db",
-                        output_roots=args.root / "files")
-    pipeline.register_task("source", update_source, trigger="always")
-    pipeline.register_task("read", read_source, trigger="on_input_change")
+
+    args.root.mkdir(parents=True, exist_ok=True)
+    state_file = args.root / "state.db"
+    out_dir = args.root / "files"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pipeline = TaskLite(
+        backend="sqlite",
+        state_path=state_file,
+        output_roots=out_dir,
+    )
+    pipeline.authorizer = lambda path, target_type: True
+    pipeline.register_task(Task("produce", produce_data))
+    pipeline.register_task(Task("consume", consume_data))
+
     try:
-        for content in ("alpha", "alpha", "beta"):
-            pipeline.enqueue([
-                Job("read", "document", depends_on=["source::document"]),
-                Job("source", "document", payload={"content": content}),
-            ])
-            summary = pipeline.run()
-            text = pipeline.backend.load_successes()["read::document"]["text"]
-            print(f"输入={content} 成功={summary.stats['succeeded']} "
-                  f"跳过={summary.stats['skipped']} 结果={text}")
+        job_produce = Job("produce", "item_1", payload={"content": "hello tasklite"})
+        job_consume = Job("consume", "item_1", depends_on=["produce::item_1"])
+
+        pipeline.enqueue(job_produce)
+        pipeline.enqueue(job_consume)
+        pipeline.run(install_signals=False)
+        print("Pipeline executed successfully!")
     finally:
         pipeline.stop()
+        pipeline.close()
 
 
 if __name__ == "__main__":
