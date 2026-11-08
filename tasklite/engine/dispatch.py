@@ -88,6 +88,7 @@ class DispatchKind(enum.Enum):
 
     SPAWNED = "spawned"                    # 子进程已启动并登记在飞
     HANDLED_NO_SUBPROCESS = "handled_no_subprocess"  # 五关/校验拦截，无需子进程即终结
+    AUTHORIZATION_PENDING = "authorization_pending"
     WORKER_SATURATED = "worker_saturated"  # 工人槽位耗尽，退出填池等待
     NO_CANDIDATE = "no_candidate"          # 队列无可运行候选（停摆事实随附）
 
@@ -142,6 +143,7 @@ class DispatchMachine:
         self._ipc_dir = ipc_dir
         self._protected_roots = protected_roots
         self._commit_failure_threshold = commit_failure_threshold
+        self._authorization_pending: tuple[str | None, str, str] | None = None
 
     # ── 扫描与派发接缝 ────────────────────────────────────────────────
 
@@ -159,6 +161,24 @@ class DispatchMachine:
         - NO_CANDIDATE：无可运行作业，停摆事实随 standstill 供仲裁。
         """
         store = self._store
+        pending = self._authorization_pending
+        if pending is not None:
+            run_id, pending_uid, path = pending
+            self._authorization_pending = None
+            if run_id == self._session.run_id and pending_uid in store.state.queue_uids:
+                authorized = store.check_or_request_authorization(path)
+                if authorized is None:
+                    self._authorization_pending = pending
+                    return DispatchOutcome(
+                        kind=DispatchKind.AUTHORIZATION_PENDING,
+                        worker_wait=IN_FLIGHT_POLL_SECONDS,
+                    )
+                if authorized is False:
+                    exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
+                    if callable(exclude_fn):
+                        exclude_fn(pending_uid)
+                    return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
+
         ok, worker_wait = self._resources.can_acquire_worker(1.0)
         if not ok:
             if worker_wait <= 0:
@@ -177,6 +197,11 @@ class DispatchMachine:
             )
 
         entry = self.dispatch_job(sched)
+        if self._authorization_pending:
+            return DispatchOutcome(
+                kind=DispatchKind.AUTHORIZATION_PENDING,
+                worker_wait=IN_FLIGHT_POLL_SECONDS,
+            )
         if entry is None:
             return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
         return DispatchOutcome(kind=DispatchKind.SPAWNED, entry=entry)
@@ -285,7 +310,11 @@ class DispatchMachine:
         for fname, fspec in resolved_files.items():
             if fspec.delete_existing or fspec.delete_on_success or fspec.delete_on_failure:
                 assert fspec.path is not None
-                if not store.check_or_request_authorization(fspec.path):
+                authorized = store.check_or_request_authorization(fspec.path)
+                if authorized is None:
+                    self._authorization_pending = (self._session.run_id, job_uid, fspec.path)
+                    return None
+                if authorized is False:
                     exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
                     if callable(exclude_fn):
                         exclude_fn(job_uid)

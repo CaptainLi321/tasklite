@@ -381,3 +381,48 @@ def test_approved_waiting_declaration_cleanup_error_fails_job(tmp_path, monkeypa
     assert p.backend.load_queue_jobs() == []
     assert target.read_text() == "valuable"
     p.close()
+
+
+def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, monkeypatch):
+    """派发前待决授权留队、不占资源，等待期间仍结算已有执行。"""
+    from tasklite.resource import CapacityResource
+
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "target"
+    target.write_text("valuable")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db", max_workers=2)
+    resource = CapacityResource("disk", max_capacity=1)
+    p.register_resource(resource)
+    p.register_task("independent", _noop_handler)
+    p.register_task("protected", _noop_handler, resources={"disk": 1})
+    calls = []
+    scheduler = p._runtime.scheduler
+    scan = scheduler.scan_next_runnable
+
+    def forbidden_scan(*args, **kwargs):
+        raise AssertionError("待决授权期间禁止重新选择其他派发候选")
+
+    def authorize(*args):
+        calls.append(args)
+        assert resource.used == 0
+        assert p.backend.load_settled_attempts("protected::one") == []
+        row = next(row for row in p.backend.load_queue_jobs() if row["job_uid"] == "protected::one")
+        assert row["status"] == "pending"
+        if len(calls) == 1 or "independent::one" not in p.backend.load_successes():
+            assert "independent::later" not in p.backend.load_successes()
+            monkeypatch.setattr(scheduler, "scan_next_runnable", forbidden_scan)
+            return None
+        monkeypatch.setattr(scheduler, "scan_next_runnable", scan)
+        return True
+
+    p.authorizer = authorize
+    p.enqueue(Job("independent", "one"))
+    p.enqueue(Job("protected", "one", files={"target": FileSpec(target, role="output", delete_existing=True)}))
+    p.enqueue(Job("independent", "later"))
+    p.run()
+    assert len(calls) >= 2
+    assert set(p.backend.load_successes()) == {"independent::one", "protected::one", "independent::later"}
+    attempt, = p.backend.load_settled_attempts("protected::one")
+    assert attempt["outcome"] == "success" and attempt["attempt_no"] == 1
+    assert not target.exists()
+    p.close()
