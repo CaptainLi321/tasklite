@@ -26,7 +26,6 @@ from tasklite.utils.encoding import (
     encode_content_id,
     encode_identifier,
     encode_job_component,
-    encode_job_uid_filename,
     make_job_uid,
     parse_job_uid,
     percent_encode,
@@ -457,44 +456,6 @@ def test_empty_sentinel_outside_image_never_collides(text):
         return
     assert encode_identifier(text) != sentinel_id
     assert encode_content_id(text) != sentinel_cid
-
-
-# ── encode_job_uid_filename：单射性与文件系统危险字符逃逸 ────────────────────
-
-
-@pytest.mark.hypothesis
-@settings(max_examples=50, deadline=None)
-@example(("t::1", "t::2"))
-@example(("t::x::y", "t::x%3A%3Ay"))
-@given(pair=distinct_pair)
-def test_encode_job_uid_filename_is_injective(pair):
-    """任意 uid_a != uid_b：安全文件名映射必不同（含 '::' 复合 uid 场景）。"""
-    uid_a, uid_b = pair
-    assert encode_job_uid_filename(uid_a) != encode_job_uid_filename(uid_b)
-
-
-def test_encode_job_uid_filename_escapes_filesystem_hazards():
-    # 路径穿越
-    assert "/" not in encode_job_uid_filename("t::a/../../../etc/passwd")
-    assert "\\" not in encode_job_uid_filename("t::a\\..\\..\\b")
-    # Windows 冒号
-    assert ":" not in encode_job_uid_filename("t::a:b")
-    # NUL
-    assert "\x00" not in encode_job_uid_filename("t::a\x00b")
-    # Glob 元字符
-    for ch in "*?[]":
-        assert ch not in encode_job_uid_filename(f"t::a{ch}b")
-
-
-@pytest.mark.hypothesis
-@settings(max_examples=50, deadline=None)
-@example("t::a/../../../etc/passwd")
-@example("t::a\x00b*?[")
-@given(uid=any_text)
-def test_encode_job_uid_filename_free_of_bare_percent(uid):
-    """安全文件名不含裸 %（% 只以 %XX 成对出现，'::' 复合 uid 亦然）。"""
-    name = encode_job_uid_filename(uid)
-    assert _percent_only_as_escapes(name)
 
 
 # ── content_fingerprint：确定性、跨型隔离与序无关 ──────────────────────

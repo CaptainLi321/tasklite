@@ -29,7 +29,6 @@ from tasklite.backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from tasklite.engine.resource import ENGINE_METADATA_RESOURCE_SUSPENSIONS
 from tasklite.utils.artifact import ArtifactPathPolicy
 from tasklite.utils.jsonutil import dumps, loads
-from tasklite.utils.lockfile import probe_lock
 
 
 def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> bool:
@@ -115,28 +114,6 @@ def invalid_frame_handler(job: Job, ctx) -> TaskResult:
         }
         sender._conn.send_bytes(dumps(envelope).encode("utf-8"))
     return TaskResult.success(metadata={"untrusted": True})
-
-
-def orphan_locked_handler(job: Job, ctx) -> TaskResult:
-    sync_dir_raw = job.payload.get("sync_dir")
-    if sync_dir_raw:
-        sync_dir = Path(sync_dir_raw)
-        if not (sync_dir / "orphan_done").exists():
-            (sync_dir / "orphan.pid").write_text(str(os.getpid()), encoding="utf-8")
-            assert _wait_until(lambda: (sync_dir / "release").exists(), timeout=30.0)
-    return TaskResult.success(metadata={"pid": os.getpid()})
-
-
-def _run_owner_until_killed(root: str, sync_dir: str) -> None:
-    pipeline = TaskLite(
-        name="pipe_ipc_lifecycle",
-        state_dir=Path(root) / "state",
-        output_roots=Path(root) / "output",
-        backend="sqlite",
-    )
-    pipeline.register_task("work", orphan_locked_handler)
-    pipeline.enqueue(Job("work", "orphan", payload={"sync_dir": sync_dir}, max_retries_per_run=0))
-    pipeline.run()
 
 
 @pytest.fixture
@@ -439,95 +416,3 @@ def test_invalid_message_cannot_register_success(pipelines, tmp_path, fault):
     assert pipeline.backend.load_queue()[0]["attempt_no"] == 1
     assert not (tmp_path / "output" / "authorized.txt").exists()
     assert (tmp_path / "output" / "retained.txt").exists()
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="依赖 Linux prctl 子收割者语义验证孤儿进程")
-@pytest.mark.parametrize("force", [False, True])
-def test_parent_death_keeps_orphan_lock_and_prevents_duplicate_execution(
-    pipelines, tmp_path, monkeypatch, force
-):
-    import ctypes
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    old = ctypes.c_int()
-    assert libc.prctl(37, ctypes.byref(old), 0, 0, 0) == 0
-    assert libc.prctl(36, 1, 0, 0, 0) == 0
-    context = mp.get_context("spawn")
-    sync_dir = tmp_path / "sync"
-    sync_dir.mkdir(parents=True, exist_ok=True)
-    pid_file = sync_dir / "orphan.pid"
-    owner = context.Process(
-        target=_run_owner_until_killed,
-        args=(str(tmp_path), str(sync_dir)),
-    )
-    child_pid: int | None = None
-    try:
-        owner.start()
-        assert _wait_until(lambda: pid_file.exists() and pid_file.read_text().strip() != "", timeout=15.0)
-        child_pid = int(pid_file.read_text(encoding="utf-8").strip())
-        owner.kill()
-        owner.join(3)
-        assert not owner.is_alive()
-        os.kill(child_pid, 0)
-        ipc_dir = str(tmp_path / "state" / "ipc")
-        assert not probe_lock(ipc_dir, "work::orphan")
-
-        pipeline = pipelines()
-        pipeline.register_task("work", orphan_locked_handler)
-        if pipeline.backend.schema_version >= TARGET_SCHEMA_VERSION:
-            pipeline.run()
-            pipeline.retry_failure("work::orphan")
-        channel = pipeline._runtime.channel
-        original_probe = channel.probe_orphan_lock
-        blocked: list[str] = []
-        spawned: list[str] = []
-        orig_spawn = channel.spawn
-
-        def recording_spawn(spec):
-            spawned.append(spec.job.uid)
-            return orig_spawn(spec)
-
-        def observe_lock(uid):
-            available = original_probe(uid)
-            if not available:
-                blocked.append(uid)
-                assert len(blocked) == 1, "请求停止后不得再次探测孤儿"
-                pipeline.stop(force=force)
-            return available
-
-        with monkeypatch.context() as observation:
-            observation.setattr(channel, "probe_orphan_lock", observe_lock)
-            observation.setattr(channel, "spawn", recording_spawn)
-            summary = pipeline.run()
-        assert blocked == ["work::orphan"]
-        assert summary.exit_reason == (
-            ExitReason.STOPPED_ABORTING if force else ExitReason.STOPPED_DRAINING
-        )
-        assert summary.stats["lock_conflict_reruns"] == 1
-        assert summary.stats["retried"] == 0
-        assert not spawned
-        queued = pipeline.backend.load_queue()
-        expected_att_no = 2 if pipeline.backend.schema_version >= TARGET_SCHEMA_VERSION else 1
-        assert len(queued) == 1 and queued[0]["attempt_no"] == expected_att_no
-        assert not queued[0].get("runtime", {}).get("last_retry_error")
-        assert pipeline.backend.load_successes() == {} and pipeline.backend.load_failed() == {}
-
-        (sync_dir / "orphan_done").write_text("1", encoding="utf-8")
-        os.kill(child_pid, 9)
-        os.waitpid(child_pid, 0)
-        child_pid = None
-        assert probe_lock(ipc_dir, "work::orphan")
-        assert pipeline.run().stats["succeeded"] == 1
-        assert pipeline.backend.load_queue() == []
-    finally:
-        if owner.is_alive():
-            owner.kill()
-        owner.join(3)
-        if child_pid is not None:
-            try:
-                os.kill(child_pid, 9)
-                os.waitpid(child_pid, 0)
-            except OSError:
-                pass
-        owner.close()
-        assert libc.prctl(36, old.value, 0, 0, 0) == 0

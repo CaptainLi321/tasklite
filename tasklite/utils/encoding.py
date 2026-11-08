@@ -342,17 +342,6 @@ def parse_job_uid(uid: str) -> tuple[str, str]:
     return task_type, job_id
 
 
-def encode_job_uid_filename(job_uid: str) -> str:
-    """把 job uid 映射为对任意文件系统安全（无 : 等保留字符）的文件名。
-
-    与执行器的 result/signals/outputs/lock 路径函数共享单射性。
-    """
-    escaped = job_uid.replace(_PERCENT_ESCAPE, _PERCENT_ESCAPED)
-    for ch, enc in FS_ESCAPE_CHARS.items():
-        escaped = escaped.replace(ch, enc)
-    return escaped
-
-
 __all__ = [
     "CONTENT_ID_ALLOWED",
     "DEFAULT_FORBIDDEN",
@@ -362,7 +351,6 @@ __all__ = [
     "encode_content_id",
     "encode_identifier",
     "encode_job_component",
-    "encode_job_uid_filename",
     "make_job_uid",
     "parse_job_uid",
     "percent_encode",

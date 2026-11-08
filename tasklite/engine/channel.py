@@ -27,7 +27,6 @@ from ..models.artifact import ArtifactDeclaration
 from ..models.context import JobContext
 from ..models.job import Job
 from ..models.result import TaskResult, validate_strict_json_object
-from ..utils import lockfile
 from ..utils.ipc import (
     ArtifactCleanupMode,
     ArtifactJournal,
@@ -323,11 +322,10 @@ def _decode_ipc_result(
 
 
 def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
-    """spawn 子进程执行体入口：持锁执行 handler 并经瞬时管道发送结果。
+    """spawn 子进程执行体入口：执行 handler 并经瞬时管道发送结果。
 
-    不变式：锁生命周期严格等于本执行体生命周期（try 前获取、finally
-    释放）——锁先于 handler 获取保证同 uid 执行体全局互斥，finally 释放
-    保证执行体任何出口（含未捕获异常）都交还锁并关闭管道写端。
+    不变式：结果通过管道单向回传；执行体任何出口（含未捕获异常）
+    均在 finally 统一关闭管道写端。
     """
     handler_func = spec.handler
     job = spec.job
@@ -354,25 +352,7 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
                 f"worker pipe result send failed for {job_uid} ({execution_id}): {exc}"
             )
 
-    _lock_fd = None
     try:
-        try:
-            _lock_fd = lockfile.try_acquire_lock(ipc_dir, job_uid, timeout=2.0)
-        except OSError as e:
-            _write_result({
-                "status": "retry",
-                "transient_kind": "lock_conflict",
-                "error_message": f"LOCK_ENV_FAULT: cannot open lock file for {job_uid} "
-                         f"(errno={getattr(e, 'errno', None)}): {e}",
-            })
-            return
-        if _lock_fd is None:
-            _write_result({
-                "status": "retry",
-                "transient_kind": "lock_conflict",
-                "error_message": f"LOCK_CONFLICT: another execution body holds {job_uid} lock",
-            })
-            return
         try:
             raw_result = handler_func(job, ctx)
             if isinstance(raw_result, TaskResult):
@@ -445,8 +425,6 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
                 "resource_suspensions": list(ctx.resource_suspensions),
             })
     finally:
-        if _lock_fd is not None:
-            lockfile.release_lock(_lock_fd)
         if pipe_sender is not None:
             pipe_sender.close()
 
@@ -547,6 +525,7 @@ class ExecutionChannel:
         self._results: dict[str, dict[str, Any]] = {}
         self._errors: dict[str, Exception] = {}
         self._pending_signals: list[tuple[str, str, float]] = []
+        self._lingering_workers: list[tuple[str, Any, WorkerPipeReceiver | None]] = []
         if self.ipc_dir:
             try:
                 Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
@@ -775,10 +754,42 @@ class ExecutionChannel:
         self._salvage_signals(handle.job_uid, decoded)
         return decoded
 
+    def _reap_lingering_workers(self) -> None:
+        """非阻塞轮询已结算但残留的子进程与管道接收端，进程死亡后回收句柄。"""
+        still_lingering: list[tuple[str, Any, WorkerPipeReceiver | None]] = []
+        for exec_id, p, receiver in self._lingering_workers:
+            try:
+                alive = p.is_alive()
+            except Exception:
+                alive = False
+            if not alive:
+                if receiver is not None:
+                    try:
+                        receiver.close(timeout=0.2)
+                    except Exception as e:
+                        logger.debug(f"Lingering receiver close warning for {exec_id}: {e}")
+                self._finalize_process(p)
+            else:
+                if receiver is not None and receiver.eof:
+                    try:
+                        receiver.close(timeout=0.1)
+                        receiver = None
+                    except Exception:
+                        pass
+                still_lingering.append((exec_id, p, receiver))
+        self._lingering_workers = still_lingering
+
     def reap_completed(
         self, handles: Sequence[JobHandle]
     ) -> list[tuple[JobHandle, ExecutionResult]]:
-        """非阻塞扫描所有 in-flight handle，返回本次已完成的 (handle, result)。"""
+        """非阻塞扫描所有 in-flight handle，返回本次已完成的 (handle, result)。
+
+        有效结果到达即结算：收到完整有效 TaskResult 即认为本次执行已返回并
+        交付结算，不将 worker 进程退出作为额外成功条件，不以前置 join 阻塞
+        主循环。结果返回后仍在运行的子进程移交后台非阻塞回收，不阻塞其他 Job
+        派发或结算，亦不因之后的进程退出状态改写有效结果。
+        """
+        self._reap_lingering_workers()
         completed: list[tuple[JobHandle, ExecutionResult]] = []
 
         for handle in handles:
@@ -787,14 +798,48 @@ class ExecutionChannel:
             exec_id = handle.execution_id or ""
             self._receive_available(handle)
 
-            if exec_id in self._errors or exec_id in self._results:
+            # 1. 有效结果已到达：立即收割结果，不阻塞等待子进程退出
+            if exec_id in self._results:
+                raw_res = self._results.pop(exec_id)
+                decoded = _decode_ipc_result(
+                    raw_res, p, handle.job, handle.ipc_dir,
+                    output_roots=getattr(self, "output_roots", None),
+                )
+                self._salvage_signals(handle.job_uid, decoded)
+                self._handles.pop(exec_id, None)
+                receiver = self._receivers.pop(exec_id, None)
+                self._errors.pop(exec_id, None)
+
+                is_alive = False
+                try:
+                    is_alive = p.is_alive()
+                except Exception:
+                    pass
+
+                if not is_alive:
+                    if receiver is not None:
+                        try:
+                            receiver.close(timeout=0.2)
+                        except Exception:
+                            pass
+                    self._finalize_process(p)
+                else:
+                    self._lingering_workers.append((exec_id, p, receiver))
+
+                completed.append((handle, decoded))
+                continue
+
+            # 2. 管道异常分支
+            if exec_id in self._errors:
                 completed.append((handle, self._collect_outcome(handle)))
                 continue
 
+            # 3. 进程已死亡但无有效结果（崩溃/被终止/无结果退出）
             if not p.is_alive():
                 completed.append((handle, self._collect_outcome(handle)))
                 continue
 
+            # 4. 超时：从启动到结果到达计单次超时
             if now > handle.timeout_at_monotonic:
                 p.join(timeout=0.5)
                 if p.is_alive():
@@ -819,11 +864,6 @@ class ExecutionChannel:
         exec_id = handle.execution_id or ""
         result: ExecutionResult | None = None
         try:
-            if not is_timeout and (exec_id in self._results or res is not None):
-                try:
-                    p.join(timeout=0.5)
-                except Exception:
-                    pass
             self._terminate_and_join_process(p)
             self._drain_finished(handle)
             if exec_id in self._errors:
@@ -873,12 +913,6 @@ class ExecutionChannel:
             retry_requested=att.retry_requested,
             retry_error=att.retry_error,
         )
-
-    def probe_orphan_lock(self, job_uid: str) -> bool:
-        """非阻塞探测执行锁。True 表示无孤儿持锁可安全执行；False 表示孤儿活跃需 defer。"""
-        if self.ipc_dir is None:
-            return True
-        return lockfile.probe_lock(self.ipc_dir, job_uid)
 
     def drain_active_signals(self, uids: Iterable[str]) -> list[tuple[str, str, float]]:
         """排空指定在途任务已发送的 suspend 信号。"""
@@ -955,6 +989,15 @@ class ExecutionChannel:
 
     def cleanup_in_flight(self, handles: Sequence[JobHandle]) -> None:
         """主循环异常退出时 kill + join 所有残留 in-flight 子进程并关闭管道与声明。"""
+        for exec_id, p, receiver in self._lingering_workers:
+            try:
+                self._finalize_process(p)
+                if receiver is not None:
+                    receiver.close(timeout=0.5)
+            except Exception as e:
+                logger.error(f"Error cleaning up lingering worker {exec_id}: {e}")
+        self._lingering_workers.clear()
+
         for handle in handles:
             try:
                 self._finalize_process(handle.process)
@@ -970,11 +1013,24 @@ class ExecutionChannel:
 
     def finalize_processes(self, handles: Sequence[JobHandle]) -> None:
         """只 kill + join 残留子进程，不删声明。"""
+        for exec_id, p, receiver in self._lingering_workers:
+            try:
+                self._finalize_process(p)
+                if receiver is not None:
+                    receiver.close(timeout=0.5)
+            except Exception:
+                pass
+        self._lingering_workers.clear()
+
         for handle in handles:
             try:
                 self._finalize_process(handle.process)
             except Exception as e:
                 logger.error(f"Error finalizing in-flight job {handle.job_uid}: {e}")
+
+    def close(self) -> None:
+        """关闭通道并回收所有在途与残留子进程和管道资源。"""
+        self.cleanup_in_flight(list(self._handles.values()))
 
     def cleanup_artifacts(self, job_uid: str, *, mode: ArtifactCleanupMode) -> None:
         """统一收敛产物与内存声明的生命周期清理。"""

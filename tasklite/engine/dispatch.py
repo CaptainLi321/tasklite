@@ -1,7 +1,7 @@
 """v2 派发机器：四关预检、两阶段资源租约与子进程 spawn 编排。
 
 预检顺序即契约（顺序即时序约束）：dep-failed → admit/dedup → no-handler →
-orphan-probe → pre-submit-cleanup。依赖以显式窄清单注入（无共享袋），经
+pre-submit-cleanup。依赖以显式窄清单注入（无共享袋），经
 ``store`` 复用状态仓库深模块，不反向引用门面。
 
 ``session`` 与 ``tasks`` 按具名 Protocol 消费（装配契约见本模块的
@@ -303,8 +303,6 @@ class DispatchMachine:
                 store.state.requeue_jobs([job_snapshot], front=True)
                 raise
 
-        if self.dispatch_orphan_probe(job_uid, job_snapshot, attempt_id=attempt_id):
-            return None
         self._drain_signals_before_reserve(job_uid)
         self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
 
@@ -385,46 +383,6 @@ class DispatchMachine:
         failure_metadata = {"error_message": ERR_NO_HANDLER, "is_fatal": True}
         self._reject_and_commit(job_uid, job_snapshot, failure_metadata, attempt_id=attempt_id)
         return True
-
-    def dispatch_orphan_probe(
-        self,
-        job_uid: str,
-        job_snapshot: dict,
-        *,
-        attempt_id: int | None = None,
-    ) -> bool:
-        """派发预检关 4——孤儿探测（probe 先于 restore）。
-
-        主进程仅探测（非阻塞试锁）。锁生命周期 = 执行体生命周期：主进程
-        崩溃不释放 worker 的锁，探测失败 = 同 uid 孤儿执行体仍持锁 →
-        lock_conflict 瞬态信号降级回队（零预算、队首重入、节奏经
-        RequeuePolicy 唯一出口）本轮不派发，下轮孤儿死后正常执行。
-        probe 必须先于 stale-restore 与声明清理——孤儿存活时提前
-        return，绝不删孤儿实时声明。返回 True = 已处理（孤儿存活 defer）。
-        """
-        try:
-            probe_ok = self._channel.probe_orphan_lock(job_uid)
-        except OSError as e:
-            # 锁文件环境故障（权限/目录占位/路径超长）与「锁被占」语义
-            # 不同，但同属非作业自身故障：按孤儿锁冲突瞬态信号同构 defer
-            # （零预算、降级写盘回队、零污染），绝不放大为整 run 崩溃。
-            logger.warning(
-                f"Lock probe environment fault for {job_uid} "
-                f"(errno={getattr(e, 'errno', None)}): {e}; deferring."
-            )
-            probe_ok = False
-        if not probe_ok:
-            logger.warning(
-                f"Deferring {job_uid}: orphan execution body still holds lock."
-            )
-            self._store.requeue_transient(
-                job_snapshot,
-                transient_kind="lock_conflict",
-                attempt_id=attempt_id,
-                error_message="orphan lock conflict",
-            )
-            return True
-        return False
 
     # ── 轨迹开行与 spawn ──────────────────────────────────────────────
 

@@ -13,7 +13,7 @@ from tasklite import (
     TaskLite, Job, JobContext, FileSpec, TaskResult,
     CapacityResource, RateLimitResource, Resource, FailureEntry,
     job_ref, progress_hook, slice_list, content_fingerprint,
-    encode_job_component, encode_identifier, encode_content_id, encode_job_uid_filename
+    encode_job_component, encode_identifier, encode_content_id
 )
 from tasklite.engine.admission import TriggerRegistry, RequeuePolicy, RequeuePlan
 from tasklite.engine.resource import ResourceManager, ResourceEvaluation

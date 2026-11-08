@@ -22,7 +22,6 @@ from tasklite.engine.types import JobHandle
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
-from tasklite.utils.encoding import encode_job_uid_filename
 from tasklite.utils.ipc import (
     ArtifactJournal,
     WorkerPipeSender,
@@ -79,10 +78,6 @@ class TestExecutionChannelBasics:
         channel = ExecutionChannel(ipc_dir)
         assert ipc_dir.exists()
         assert channel.ipc_dir == str(ipc_dir)
-
-    def test_probe_orphan_lock(self, tmp_path):
-        channel = ExecutionChannel(tmp_path)
-        assert channel.probe_orphan_lock("job_probe") is True
 
     def test_drain_active_signals(self, tmp_path):
         channel = ExecutionChannel(tmp_path)
@@ -224,32 +219,6 @@ class TestWorkerWrapper:
         with pytest.raises(RuntimeError, match="execution_id"):
             _worker_process_entry(make_spec(job, lambda j, c: TaskResult.success(), tmp_path, execution_id=None))
 
-    def test_lock_conflict_writes_transient_retry(self, tmp_path, monkeypatch):
-        """锁被占 → retry + transient_kind=lock_conflict（瞬态军规 wire）。"""
-        monkeypatch.setattr(
-            "tasklite.utils.lockfile.try_acquire_lock", lambda *a, **k: None
-        )
-        job = Job("h", "a")
-        res = self._run_worker(job, lambda j, c: TaskResult.success(), tmp_path)
-
-        assert res["status"] == "retry"
-        assert res["transient_kind"] == "lock_conflict"
-        assert res["error_message"].startswith("LOCK_CONFLICT:")
-
-    def test_lock_env_fault_writes_degraded_retry(self, tmp_path):
-        """锁文件打不开（IsADirectoryError）→ 回传 retry+lock_conflict 结果。"""
-        ipc_dir = str(tmp_path / "ipc")
-        uid = "t::j1"
-        lock_name = f"{encode_job_uid_filename(uid)}.lock"
-        (Path(ipc_dir) / lock_name).mkdir(parents=True)
-
-        job = Job("t", "j1")
-        res = self._run_worker(job, lambda j, c: TaskResult.success(), ipc_dir, execution_id="r.1")
-
-        assert res["status"] == "retry"
-        assert res["transient_kind"] == "lock_conflict"
-        assert "LOCK_ENV_FAULT" in res["error_message"]
-
     def test_retry_carries_consume_budget(self, tmp_path):
         """retry 结果携带 consume_budget 经 Pipe 传递。"""
         def zero_budget(job, ctx):
@@ -358,7 +327,6 @@ class TestEnvFallbackIpcDirCoherence:
 
         completed = channel.reap_completed([handle])
         assert [(h.job_uid, r.success) for h, r in completed] == [("t::x", True)]
-        assert channel.probe_orphan_lock("t::x") is True
 
 
 class TestSpawnFailureCleanup:
