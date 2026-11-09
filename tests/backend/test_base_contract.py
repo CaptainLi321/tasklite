@@ -29,6 +29,8 @@ EXPECTED_ABSTRACT_METHODS = {
     "load_failure_payloads",
     "load_cursors",
     "load_queue",
+    "load_known_job_snapshot",
+    "load_known_job_snapshots",
     # 整表重写
     "save_queue",
     "replace_queue_atomic",

@@ -25,6 +25,7 @@ from tasklite.engine.types import AttemptOutcome, StopMode
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.models.task import Task
+from tasklite import TaskLiteError
 from tasklite.pipeline import TaskLite
 from tasklite.testing import running
 
@@ -80,6 +81,12 @@ class DelegatingFakeBackend(AbstractStateBackend):
 
     def load_queue(self, *args, **kwargs):
         return self.inner.load_queue(*args, **kwargs)
+
+    def load_known_job_snapshot(self, *args, **kwargs):
+        return self.inner.load_known_job_snapshot(*args, **kwargs)
+
+    def load_known_job_snapshots(self, *args, **kwargs):
+        return self.inner.load_known_job_snapshots(*args, **kwargs)
 
     def save_queue(self, *args, **kwargs):
         return self.inner.save_queue(*args, **kwargs)
@@ -1033,7 +1040,7 @@ class TestManageApis:
 
     def test_set_job_status_unknown_uid_raises(self, tmp_path):
         p = make_pipeline(tmp_path)
-        with pytest.raises(KeyError, match="No existing snapshot found"):
+        with pytest.raises(TaskLiteError, match="No existing snapshot found"):
             p.set_job_status("fetch::nope", "pending", recursive=False)
 
     def test_cursor_get_and_set(self, tmp_path):

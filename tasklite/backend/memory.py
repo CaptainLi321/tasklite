@@ -367,34 +367,107 @@ class InMemoryStateBackend(AbstractStateBackend):
         if not updates:
             return
         with self._lock:
+            new_successes = copy.deepcopy(self._successes)
+            new_failed = copy.deepcopy(self._failed)
+            new_failure_payloads = copy.deepcopy(self._failure_payloads)
+            new_queue = copy.deepcopy(self._queue)
             for job_uid, status, snapshot, metadata in updates:
                 snap_copy = copy.deepcopy(snapshot)
                 meta_copy = copy.deepcopy(metadata or {})
                 if status == "pending":
-                    self._successes.pop(job_uid, None)
-                    self._failed.pop(job_uid, None)
-                    self._failure_payloads.pop(job_uid, None)
-                    self._queue = [
-                        j for j in self._queue
+                    new_successes.pop(job_uid, None)
+                    new_failed.pop(job_uid, None)
+                    new_failure_payloads.pop(job_uid, None)
+                    new_queue = [
+                        j for j in new_queue
                         if job_uid_from_snapshot(j) != job_uid
                     ]
-                    self._queue.append(snap_copy)
+                    snap_copy["status"] = "pending"
+                    snap_copy["run_id"] = None
+                    snap_copy["attempt_no"] = None
+                    snap_copy["started_at"] = None
+                    new_queue.append(snap_copy)
                 elif status == "succeeded":
-                    self._queue = [
-                        j for j in self._queue
+                    new_queue = [
+                        j for j in new_queue
                         if job_uid_from_snapshot(j) != job_uid
                     ]
-                    self._failed.pop(job_uid, None)
-                    self._failure_payloads.pop(job_uid, None)
-                    self._successes[job_uid] = meta_copy
+                    new_failed.pop(job_uid, None)
+                    new_failure_payloads.pop(job_uid, None)
+                    new_successes[job_uid] = meta_copy
                 elif status == "failed":
-                    self._queue = [
-                        j for j in self._queue
+                    new_queue = [
+                        j for j in new_queue
                         if job_uid_from_snapshot(j) != job_uid
                     ]
-                    self._successes.pop(job_uid, None)
-                    self._failed[job_uid] = meta_copy
-                    self._failure_payloads[job_uid] = snap_copy.get("payload") or {}
+                    new_successes.pop(job_uid, None)
+                    new_failed[job_uid] = meta_copy
+                    new_failure_payloads[job_uid] = snap_copy.get("payload") or {}
+                else:
+                    raise ValueError(f"Unsupported manual status: {status!r}")
+
+            self._successes = new_successes
+            self._failed = new_failed
+            self._failure_payloads = new_failure_payloads
+            self._queue = new_queue
+
+    @staticmethod
+    def _snapshot_from_metadata(metadata: Any) -> dict[str, Any] | None:
+        if not isinstance(metadata, dict):
+            return None
+        snapshot = metadata.get("job_snapshot")
+        return snapshot if isinstance(snapshot, dict) else None
+
+    def load_known_job_snapshot(self, uid: str) -> dict[str, Any] | None:
+        """按队列、成功、失败、Attempt 历史的优先级读取完整配置。"""
+        with self._lock:
+            for snapshot in self._queue:
+                if job_uid_from_snapshot(snapshot) == uid:
+                    return copy.deepcopy(snapshot)
+
+            success_snapshot = self._snapshot_from_metadata(self._successes.get(uid))
+            if success_snapshot is not None:
+                return copy.deepcopy(success_snapshot)
+
+            failure_snapshot = self._snapshot_from_metadata(self._failed.get(uid))
+            if failure_snapshot is not None:
+                return copy.deepcopy(failure_snapshot)
+
+            for attempt_id in sorted(self._attempts, reverse=True):
+                attempt = self._attempts[attempt_id]
+                if not isinstance(attempt, dict) or attempt.get("job_uid") != uid:
+                    continue
+                attempt_snapshot = attempt.get("job") or attempt.get("job_snapshot")
+                if isinstance(attempt_snapshot, dict):
+                    return copy.deepcopy(attempt_snapshot)
+        return None
+
+    def load_known_job_snapshots(self) -> dict[str, dict[str, Any]]:
+        """读取全部已知 Job 的完整配置，低优先级来源先写入。"""
+        with self._lock:
+            known: dict[str, dict[str, Any]] = {}
+            for attempt_id in sorted(self._attempts):
+                attempt = self._attempts[attempt_id]
+                if not isinstance(attempt, dict):
+                    continue
+                uid = attempt.get("job_uid")
+                snapshot = attempt.get("job") or attempt.get("job_snapshot")
+                if isinstance(uid, str) and isinstance(snapshot, dict):
+                    known[uid] = copy.deepcopy(snapshot)
+
+            for uid, metadata in self._failed.items():
+                snapshot = self._snapshot_from_metadata(metadata)
+                if snapshot is not None:
+                    known[uid] = copy.deepcopy(snapshot)
+
+            for uid, metadata in self._successes.items():
+                snapshot = self._snapshot_from_metadata(metadata)
+                if snapshot is not None:
+                    known[uid] = copy.deepcopy(snapshot)
+
+            for snapshot in self._queue:
+                known[job_uid_from_snapshot(snapshot)] = copy.deepcopy(snapshot)
+        return known
 
     def clear_history(self, uid: str, records: set[str]) -> int:
         """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""

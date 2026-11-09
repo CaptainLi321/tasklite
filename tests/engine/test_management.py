@@ -1,197 +1,335 @@
-"""统一状态管理与历史清理测试。
-
-覆盖：
-1. set_job_status 目标态（pending, succeeded, failed）与递归级联；
-2. 传 Job（未知自动建立、冲突拒绝）与传 UID（未知快照 KeyError 拒绝）；
-3. 人工标记属性（completion_source=manual、note、不伪造 Attempt、Trigger 行为）；
-4. clear_history（显式 records 组合、不删队列与游标、单调编号不重置）；
-5. run() 运行期互斥锁（抛 RuntimeError）。
-"""
+"""Run 外管理与只读快照验收。"""
 
 from __future__ import annotations
 
-import threading
-import time
+import multiprocessing as mp
+from pathlib import Path
+
 import pytest
 
-from tasklite import TaskLite
-from tasklite.models.job import Job
-from tasklite.models.attempt import AttemptRecord
-from tasklite.models.result import TaskResult
+import tasklite.backend.sqlite_backend as sqlite_backend_module
+from tasklite import Job, StateSnapshot, TaskLite, TaskLiteError, TaskResult
+from tasklite.testing import running
+from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
 
 def _dummy_handler(job, ctx):
     return TaskResult.success()
 
 
-def _slow_handler(job, ctx):
-    time.sleep(0.5)
-    return TaskResult.success()
+def _make_app(backend: str, tmp_path: Path) -> TaskLite:
+    state_path = tmp_path / "state.db" if backend == "sqlite" else None
+    app = TaskLite(backend=backend, state_path=state_path)
+    app.register_task("work", _dummy_handler)
+    return app
 
 
-class TestSetJobStatusCore:
-    """set_job_status 核心三目标态与入参类型行为。"""
+@pytest.fixture(params=["sqlite", "memory"])
+def app(request, tmp_path):
+    instance = _make_app(request.param, tmp_path)
+    try:
+        yield instance
+    finally:
+        instance.close()
 
-    def test_set_status_pending_succeeded_failed_flow(self, tmp_path):
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+
+def _status(app: TaskLite, uid: str) -> dict:
+    with StateSnapshot.open(app) as snapshot:
+        record = snapshot.get_job(uid)
+        assert record is not None
+        return record
+
+
+def _blocked_management_worker(
+    state_path: str,
+    ready: object,
+    result_path: str,
+) -> None:
+    app = TaskLite(backend="sqlite", state_path=state_path)
+    try:
         app.register_task("work", _dummy_handler)
+        ready.set()
+        try:
+            app.set_job_status("work::a", "succeeded", recursive=False)
+        except BaseException as exc:
+            Path(result_path).write_text(type(exc).__name__, encoding="utf-8")
+        else:
+            Path(result_path).write_text("no-error", encoding="utf-8")
+    finally:
+        app.close()
 
-        job_a = Job("work", "a")
-        # 1. 传入完整 Job 直接建立人工成功态
-        app.set_job_status(job_a, "succeeded", recursive=False)
-        assert "work::a" in app.backend.load_successes()
-        meta = app.backend.load_successes()["work::a"]
-        assert meta.get("annotations", {}).get("completion_source") == "manual"
-        assert meta.get("job_snapshot", {}).get("job_id") == "a"
-        # 确认不生成 Attempt 记录
-        assert app.backend.load_attempts("work::a") == []
 
-        # 2. 传入 UID 变更为 failed 态，并携带 note
-        app.set_job_status("work::a", "failed", recursive=False, note="手工标记失败")
-        assert "work::a" not in app.backend.load_successes()
-        assert "work::a" in app.backend.load_failed()
-        fail_meta = app.backend.load_failed()["work::a"]
-        assert fail_meta.get("note") == "手工标记失败"
-        assert fail_meta.get("annotations", {}).get("completion_source") == "manual"
+class TestSetJobStatus:
+    """人工三态、递归闭包与异常原子性。"""
 
-        # 3. 传入 UID 恢复为 pending
-        app.set_job_status("work::a", "pending", recursive=False)
-        assert "work::a" not in app.backend.load_failed()
-        queue = app.backend.load_queue()
-        assert len(queue) == 1
-        assert queue[0]["job_id"] == "a"
+    @pytest.mark.parametrize("target_status", ["pending", "succeeded", "failed"])
+    def test_recursive_three_level_chain_is_symmetric(self, app, target_status):
+        jobs = [
+            Job("work", "a"),
+            Job("work", "b", depends_on=["work::a"]),
+            Job("work", "c", depends_on=["work::b"]),
+        ]
+        for job in jobs:
+            assert app.enqueue(job)
 
-    def test_set_status_uid_unknown_raises_key_error(self, tmp_path):
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
-        app.register_task("work", _dummy_handler)
+        app.set_job_status("work::a", "succeeded", recursive=False)
+        app.set_job_status("work::b", "failed", recursive=False)
+        app.set_job_status("work::c", "succeeded", recursive=False)
 
-        with pytest.raises(KeyError, match="No existing snapshot found"):
-            app.set_job_status("work::unknown", "succeeded", recursive=False)
+        app.set_job_status("work::a", target_status, recursive=True)
 
-    def test_set_status_job_conflict_raises_value_error(self, tmp_path):
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
-        app.register_task("work", _dummy_handler)
+        assert [_status(app, job.uid)["status"] for job in jobs] == [
+            target_status,
+            target_status,
+            target_status,
+        ]
+        with StateSnapshot.open(app) as snapshot:
+            assert list(snapshot.iter_attempts()) == []
 
-        job_original = Job("work", "a", payload={"ver": 1})
-        app.set_job_status(job_original, "succeeded", recursive=False)
+    def test_history_only_downstream_is_included(self, app):
+        parent = Job("work", "parent")
+        child = Job("work", "child", depends_on=["work::parent"])
+        app.enqueue(parent)
+        app.enqueue(child)
+        app.run()
 
-        # 传入配置不同的同一 UID Job，必须报错拒绝
-        job_conflict = Job("work", "a", payload={"ver": 2})
-        with pytest.raises(ValueError, match="conflict"):
-            app.set_job_status(job_conflict, "succeeded", recursive=False)
+        before_attempts = len(list(_snapshot_attempts(app)))
+        deleted = app.clear_history("work::child", records=["successes"])
+        assert deleted == 1
 
-    def test_set_status_invalid_arguments_raises(self, tmp_path):
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
-        app.register_task("work", _dummy_handler)
+        app.set_job_status("work::parent", "failed", recursive=True)
 
-        with pytest.raises(ValueError, match="status must be one of"):
-            app.set_job_status(Job("work", "a"), "invalid_status", recursive=False)  # type: ignore[arg-type]
+        assert _status(app, "work::parent")["status"] == "failed"
+        assert _status(app, "work::child")["status"] == "failed"
+        assert len(list(_snapshot_attempts(app))) == before_attempts
 
+    def test_snapshot_read_failure_aborts_without_mutation(self, app, monkeypatch):
+        app.enqueue(Job("work", "a"))
+
+        def fail_read():
+            raise OSError("management snapshot unavailable")
+
+        monkeypatch.setattr(
+            app._runtime.store.backend,
+            "load_known_job_snapshots",
+            fail_read,
+        )
+        with pytest.raises(OSError, match="snapshot unavailable"):
+            app.set_job_status(Job("work", "a"), "failed", recursive=True)
+
+        monkeypatch.undo()
+        assert _status(app, "work::a")["status"] == "pending"
+
+    def test_unknown_uid_and_conflicting_configuration_raise_public_error(self, app):
+        with pytest.raises(TaskLiteError, match="No existing snapshot found"):
+            app.set_job_status("work::missing", "succeeded", recursive=False)
+
+        app.set_job_status(
+            Job("work", "same", payload={"version": 1}),
+            "succeeded",
+            recursive=False,
+        )
+        with pytest.raises(TaskLiteError, match="configuration conflict"):
+            app.set_job_status(
+                Job("work", "same", payload={"version": 2}),
+                "succeeded",
+                recursive=False,
+            )
+
+    def test_invalid_arguments_are_rejected(self, app):
+        with pytest.raises(TaskLiteError, match="status must be one of"):
+            app.set_job_status(
+                Job("work", "a"),
+                "invalid",  # type: ignore[arg-type]
+                recursive=False,
+            )
         with pytest.raises(TypeError, match="recursive must be a bool"):
-            app.set_job_status(Job("work", "a"), "succeeded", recursive="yes")  # type: ignore[arg-type]
-
+            app.set_job_status(
+                Job("work", "a"),
+                "succeeded",
+                recursive="yes",  # type: ignore[arg-type]
+            )
         with pytest.raises(TypeError, match="note must be a str or None"):
-            app.set_job_status(Job("work", "a"), "succeeded", recursive=False, note=123)  # type: ignore[arg-type]
+            app.set_job_status(
+                Job("work", "a"),
+                "succeeded",
+                recursive=False,
+                note=123,  # type: ignore[arg-type]
+            )
+
+    def test_sqlite_apply_abort_rolls_back_entire_recursive_batch(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        app = _make_app("sqlite", tmp_path)
+        try:
+            for job in (
+                Job("work", "a"),
+                Job("work", "b", depends_on=["work::a"]),
+                Job("work", "c", depends_on=["work::b"]),
+            ):
+                app.enqueue(job)
+
+            real_dumps = sqlite_backend_module.dumps
+            calls = {"count": 0}
+
+            def abort_third_dump(value):
+                calls["count"] += 1
+                if calls["count"] == 3:
+                    raise RuntimeError("injected SQLite abort")
+                return real_dumps(value)
+
+            monkeypatch.setattr(sqlite_backend_module, "dumps", abort_third_dump)
+            with pytest.raises(RuntimeError, match="injected SQLite abort"):
+                app.set_job_status("work::a", "failed", recursive=True)
+            monkeypatch.undo()
+
+            with StateSnapshot.open(app) as snapshot:
+                assert {
+                    job["job_uid"]: job["status"]
+                    for job in snapshot.iter_jobs()
+                } == {
+                    "work::a": "pending",
+                    "work::b": "pending",
+                    "work::c": "pending",
+                }
+        finally:
+            app.close()
 
 
-class TestSetJobStatusRecursive:
-    """set_job_status 级联下游功能。"""
+def _snapshot_attempts(app: TaskLite):
+    with StateSnapshot.open(app) as snapshot:
+        yield from snapshot.iter_attempts()
 
-    def test_recursive_cascades_to_downstream(self, tmp_path):
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
-        app.register_task("work", _dummy_handler)
 
-        job_a = Job("work", "a")
-        job_b = Job("work", "b", depends_on=["work::a"])
-        job_c = Job("work", "c", depends_on=["work::b"])
-        app.enqueue(job_a)
-        app.enqueue(job_b)
-        app.enqueue(job_c)
+class TestCursor:
+    """游标始终以后端最新提交值为准。"""
 
-        # 非递归：仅更新目标 a
-        app.set_job_status(job_a, "failed", recursive=False)
-        assert "work::a" in app.backend.load_failed()
-        assert "work::b" not in app.backend.load_failed()
-        assert "work::c" not in app.backend.load_failed()
+    def test_empty_string_and_deletion_use_latest_commit(self, tmp_path):
+        first = _make_app("sqlite", tmp_path)
+        second = _make_app("sqlite", tmp_path)
+        try:
+            first.set_cursor("checkpoint", "")
+            assert second.get_cursor("checkpoint") == ""
 
-        # 递归：级联将直接与间接下游 (b, c) 一并置为目标态
-        app.set_job_status(job_a, "succeeded", recursive=True)
-        assert "work::a" in app.backend.load_successes()
-        assert "work::b" in app.backend.load_successes()
-        assert "work::c" in app.backend.load_successes()
-        assert app.backend.load_failed() == {}
-        assert app.backend.load_queue() == []
+            second.set_cursor("checkpoint", None)
+            assert first.get_cursor("checkpoint") is None
+
+            first.set_cursor("checkpoint", "42")
+            assert second.get_cursor("checkpoint") == "42"
+        finally:
+            first.close()
+            second.close()
+
+    def test_management_guard_rejects_cursor_access_during_run(self, tmp_path):
+        app = _make_app("memory", tmp_path)
+        try:
+            with running(app):
+                with pytest.raises(RuntimeError, match="outside run"):
+                    app.get_cursor("key")
+                with pytest.raises(RuntimeError, match="outside run"):
+                    app.set_cursor("key", "value")
+        finally:
+            app.close()
 
 
 class TestClearHistory:
-    """clear_history 行为与不变式锁定。"""
+    """清除所选历史不触碰队列、游标或编号进度。"""
 
-    def test_clear_history_granular_records(self, tmp_path):
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
-        app.register_task("work", _dummy_handler)
+    def test_granular_clear_preserves_other_facts_and_sequence(self, app):
+        app.set_cursor("cursor", "value")
+        app.enqueue(Job("work", "item"))
+        app.run()
+        first_attempt_no = next(iter(_snapshot_attempts(app)))["attempt_no"]
 
-        job = Job("work", "item")
-        app.set_job_status(job, "succeeded", recursive=False)
-        app.set_cursor("cur", "pos1")
-
-        # 仅清除 successes
-        deleted = app.clear_history("work::item", records=["successes"])
-        assert deleted == 1
-        assert "work::item" not in app.backend.load_successes()
-        # 游标不受影响
-        assert app.get_cursor("cur") == "pos1"
-
-    def test_clear_history_does_not_reset_sequences_monotonicity(self, tmp_path):
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
-        app.register_task("work", _dummy_handler)
+        deleted = app.clear_history("work::item", records=["successes", "attempts"])
+        assert deleted == 2
+        assert app.get_cursor("cursor") == "value"
+        with StateSnapshot.open(app) as snapshot:
+            assert list(snapshot.iter_attempts()) == []
+            assert list(snapshot.iter_jobs(status="succeeded")) == []
 
         app.enqueue(Job("work", "item"))
         app.run()
-        app.stop()
+        second_attempt_no = next(iter(_snapshot_attempts(app)))["attempt_no"]
+        assert second_attempt_no > first_attempt_no
 
-        attempts = app.backend.load_attempts("work::item")
-        assert len(attempts) == 1
-        first_attempt_no = attempts[0].attempt_no
-
-        # 清除历史记录
-        app.clear_history("work::item", records=["successes", "attempts"])
-        assert app.backend.load_attempts("work::item") == []
-        assert "work::item" not in app.backend.load_successes()
-
-        # 重新入队并执行
-        app.enqueue(Job("work", "item"))
-        app.run()
-        app.stop()
-
-        new_attempts = app.backend.load_attempts("work::item")
-        assert len(new_attempts) == 1
-        # 不变式：内部编号计数器单调递增，不因 clear_history 重置
-        assert new_attempts[0].attempt_no > first_attempt_no
+    def test_validation_is_stable(self, app):
+        for records, error, match in (
+            ([], ValueError, "records must not be empty"),
+            (["unknown"], ValueError, "unknown target"),
+        ):
+            with pytest.raises(error, match=match):
+                app.clear_history("work::item", records=records)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="uid"):
+            app.clear_history("", records=["successes"])
+        with pytest.raises(ValueError, match="canonical"):
+            app.clear_history("bad_uid", records=["successes"])
 
 
-class TestManagementConcurrencyLock:
-    """运行期间管理 API 的互斥锁保护。"""
+class TestManagementAuthorizationSurface:
+    """授权查询与撤销沿用同一 Run 外管理边界。"""
 
-    def test_management_apis_rejected_during_run(self, tmp_path):
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
-        app.register_task("work", _slow_handler)
-        app.enqueue(Job("work", "slow_job"))
-
-        t = threading.Thread(target=app.run, kwargs={"install_signals": False})
-        t.start()
-        # 等待 run 启动并进入派发循环
-        time.sleep(0.15)
-
+    def test_list_and_revoke_authorization(self, tmp_path):
+        app = _make_app("sqlite", tmp_path)
         try:
-            with pytest.raises(RuntimeError, match="outside run()"):
-                app.set_job_status("work::slow_job", "succeeded", recursive=False)
-            with pytest.raises(RuntimeError, match="outside run()"):
-                app.clear_history("work::slow_job", records=["successes"])
-            with pytest.raises(RuntimeError, match="outside run()"):
-                app.get_cursor("c")
-            with pytest.raises(RuntimeError, match="outside run()"):
-                app.set_cursor("c", "val")
+            path = tmp_path / "approved.txt"
+            app._runtime.store.record_authorization(path, "file")
+            assert [item["path"] for item in app.list_authorizations()] == [
+                str(path.resolve())
+            ]
+            assert app.revoke_authorization(path) is True
+            assert app.list_authorizations() == []
         finally:
-            t.join()
-            app.stop()
+            app.close()
 
+    def test_authorization_management_is_rejected_during_run(self, tmp_path):
+        app = _make_app("memory", tmp_path)
+        try:
+            with running(app):
+                with pytest.raises(RuntimeError, match="outside run"):
+                    app.list_authorizations()
+                with pytest.raises(RuntimeError, match="outside run"):
+                    app.revoke_authorization("approved.txt")
+        finally:
+            app.close()
+
+
+class TestCrossProcessManagementMutex:
+    """库级锁必须排斥其他进程的管理写，并在释放后立即可重试。"""
+
+    def test_other_process_is_rejected_then_released_lock_allows_write(self, tmp_path):
+        app = _make_app("sqlite", tmp_path)
+        result_path = tmp_path / "worker-result.txt"
+        fd = None
+        process = None
+        try:
+            app.enqueue(Job("work", "a"))
+            assert app.state_path is not None
+            fd = try_acquire_lock(app.state_path, timeout=0)
+            assert fd is not None
+
+            context = mp.get_context("spawn")
+            ready = context.Event()
+            process = context.Process(
+                target=_blocked_management_worker,
+                args=(str(app.state_path), ready, str(result_path)),
+            )
+            process.start()
+            assert ready.wait(timeout=10)
+            process.join(timeout=10)
+            assert process.exitcode == 0
+            assert result_path.read_text(encoding="utf-8") == "RuntimeError"
+
+            release_lock(fd)
+            fd = None
+            app.set_job_status("work::a", "succeeded", recursive=False)
+            assert _status(app, "work::a")["status"] == "succeeded"
+        finally:
+            if fd is not None:
+                release_lock(fd)
+            if process is not None and process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            app.close()

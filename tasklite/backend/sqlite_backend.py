@@ -910,6 +910,85 @@ class SQLiteStateBackend(AbstractStateBackend):
                         "INSERT OR REPLACE INTO failed (job_uid, metadata, payload) VALUES (?, ?, ?)",
                         (job_uid, dumps(metadata or {}), dumps(payload)),
                     )
+                else:
+                    raise ValueError(f"Unsupported manual status: {status!r}")
+
+    @staticmethod
+    def _snapshot_from_metadata(raw: str | None) -> dict[str, Any] | None:
+        if not raw:
+            return None
+        metadata = loads(raw)
+        if not isinstance(metadata, dict):
+            return None
+        snapshot = metadata.get("job_snapshot")
+        return snapshot if isinstance(snapshot, dict) else None
+
+    def load_known_job_snapshot(self, uid: str) -> dict[str, Any] | None:
+        """按队列、成功、失败、Attempt 历史的优先级读取完整配置。"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT job_snapshot FROM queue WHERE job_uid = ?", (uid,)
+            ).fetchone()
+            if row and row[0]:
+                snapshot = loads(row[0])
+                if isinstance(snapshot, dict):
+                    return snapshot
+
+            row = conn.execute(
+                "SELECT metadata FROM successes WHERE job_uid = ?", (uid,)
+            ).fetchone()
+            if row:
+                snapshot = self._snapshot_from_metadata(row[0])
+                if snapshot is not None:
+                    return snapshot
+
+            row = conn.execute(
+                "SELECT metadata FROM failed WHERE job_uid = ?", (uid,)
+            ).fetchone()
+            if row:
+                snapshot = self._snapshot_from_metadata(row[0])
+                if snapshot is not None:
+                    return snapshot
+
+            row = conn.execute(
+                "SELECT job_snapshot FROM attempts "
+                "WHERE job_uid = ? AND job_snapshot IS NOT NULL "
+                "ORDER BY attempt_id DESC LIMIT 1",
+                (uid,),
+            ).fetchone()
+            if row and row[0]:
+                snapshot = loads(row[0])
+                if isinstance(snapshot, dict):
+                    return snapshot
+        return None
+
+    def load_known_job_snapshots(self) -> dict[str, dict[str, Any]]:
+        """读取全部已知 Job 的完整配置，低优先级来源先写入。"""
+        known: dict[str, dict[str, Any]] = {}
+        with self._get_conn() as conn:
+            for uid, raw in conn.execute(
+                "SELECT job_uid, job_snapshot FROM attempts "
+                "WHERE job_snapshot IS NOT NULL ORDER BY attempt_id ASC"
+            ):
+                snapshot = loads(raw) if raw else None
+                if isinstance(snapshot, dict):
+                    known[uid] = snapshot
+
+            for uid, raw in conn.execute("SELECT job_uid, metadata FROM failed"):
+                snapshot = self._snapshot_from_metadata(raw)
+                if snapshot is not None:
+                    known[uid] = snapshot
+
+            for uid, raw in conn.execute("SELECT job_uid, metadata FROM successes"):
+                snapshot = self._snapshot_from_metadata(raw)
+                if snapshot is not None:
+                    known[uid] = snapshot
+
+            for uid, raw in conn.execute("SELECT job_uid, job_snapshot FROM queue"):
+                snapshot = loads(raw) if raw else None
+                if isinstance(snapshot, dict):
+                    known[uid] = snapshot
+        return known
 
     def clear_history(self, uid: str, records: set[str]) -> int:
         """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""

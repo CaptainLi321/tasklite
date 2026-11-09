@@ -139,6 +139,22 @@ class AbstractStateBackend(ABC):
     def load_queue(self) -> list[dict[str, Any]]:
         """按 queue_position 升序加载磁盘队列真相。"""
 
+    @abstractmethod
+    def load_known_job_snapshot(self, uid: str) -> dict[str, Any] | None:
+        """读取单个已知 Job 的完整配置快照。
+
+        优先级固定为队列（含 running）、successes、failed、Attempt 历史。
+        找不到时返回 None；读取或解码故障必须原样传播。
+        """
+
+    @abstractmethod
+    def load_known_job_snapshots(self) -> dict[str, dict[str, Any]]:
+        """读取全部已知 Job 的完整配置快照映射。
+
+        同一 UID 按队列（含 running）、successes、failed、Attempt 历史的
+        优先级选取。读取或解码故障必须原样传播。
+        """
+
     # 整表重写 -------------------------------------------------------
 
     @abstractmethod

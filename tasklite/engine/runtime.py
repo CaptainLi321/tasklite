@@ -95,7 +95,7 @@ class EngineRuntime:
         # 同时保证机器持有的 session 引用跨 run 稳定）。
         self._session = RunSession()
 
-        # 构造期即建 StateStore（enqueue/OpsConsole 在 run 前可用）。
+        # 构造期即建 StateStore（enqueue 与管理写操作在 run 前可用）。
         # backend 所有权唯一锚定 StateStore（RunConfig.backend 仅为构造
         # 期装配快照的搬运通道），运行期一切读写经 store.backend 派生。
         self.store: StateStore = StateStore(

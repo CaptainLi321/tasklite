@@ -308,7 +308,7 @@ class PipelineState:
             else:
                 self._cursors[k] = v
 
-    # 运维管理受控变更（OpsConsole 公共接缝）--------------------------
+    # 运维管理受控变更 ------------------------------------------------
 
     def discard_success(self, job_uid: str) -> None:
         """从 successes 集合移除指定 uid（运维接缝，幂等）。"""

@@ -114,10 +114,7 @@ class TaskLite:
             )
             self.runtime_config = self._build_run_config(backend_instance)
             self._runtime = EngineRuntime(config=self.runtime_config)
-            self._console = OpsConsole(
-                store=self._runtime.store,
-                classifier=self.classifier,
-            )
+            self._console = OpsConsole(self._runtime.store)
         except BaseException:
             self._cleanup_failed_init()
             raise

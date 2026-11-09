@@ -11,7 +11,7 @@
   in_flight（在飞追踪）、completion（完成机器）、recovery（恢复编排）、
   store（状态仓库）、governor（死锁治理）；
 - 运行期：session（run 生命周期）、runtime（EngineRuntime 事件泵）、
-  ops（OpsConsole 运维控制台）。
+  ops（Run 外管理接缝）。
 
 调度逻辑仅留 seam：选择点收敛在 scheduler 的 scan_next_runnable（访问
 序经 OrderingPolicy），重试节奏收敛在 RequeuePolicy（默认立即重入队）。
