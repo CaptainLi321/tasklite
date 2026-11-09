@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import inspect
-import multiprocessing as mp
 import threading
 
 import pytest
@@ -29,6 +28,7 @@ from tasklite.exceptions import TaskLiteError
 from tasklite.models.context import JobContext
 from tasklite.models.result import TaskResult
 from tasklite.models.state import DependencyStatus, PipelineState
+from tests.helpers import install_fake_process_context
 
 
 def ok_handler(job, ctx):
@@ -58,7 +58,7 @@ class CountingResource(Resource):
 
 
 def _fake_process_class(*, fail_uid=None, spawn_jobs=(), seen=None):
-    """FakeProcess：start() 即写 IPC 结果；可选指定失败 uid 与派生新作业。"""
+    """FakeProcess：start() 经 Pipe 发送结果；可选失败 UID 与派生作业。"""
 
     class InstantProcess:
         def __init__(self, target=None, args=(), kwargs=None, **_kw):
@@ -101,8 +101,8 @@ def _fake_process_class(*, fail_uid=None, spawn_jobs=(), seen=None):
 
 
 @pytest.fixture()
-def fake_process(monkeypatch):
-    monkeypatch.setattr(mp, "Process", _fake_process_class())
+def fake_process():
+    return _fake_process_class
 
 
 def _pipeline(root=None, name: str = "selection", **overrides) -> TaskLite:
@@ -122,6 +122,7 @@ def _queued(pipeline: TaskLite) -> list[str]:
 
 def test_default_and_none_exclude_execute_everything(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
+    install_fake_process_context(pipeline, fake_process())
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("convert", ok_handler)
     pipeline.enqueue(Job("fetch", "a"))
@@ -133,11 +134,11 @@ def test_default_and_none_exclude_execute_everything(fake_process, tmp_path):
 
 
 def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
-    monkeypatch, tmp_path
+    tmp_path,
 ):
     seen: list[str] = []
-    monkeypatch.setattr(mp, "Process", _fake_process_class(seen=seen))
     pipeline = _pipeline(tmp_path)
+    install_fake_process_context(pipeline, _fake_process_class(seen=seen))
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("convert", ok_handler)
     pipeline.register_task("rank", ok_handler)
@@ -169,6 +170,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
 
 def test_only_excluded_jobs_finish_completed_without_failures(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
+    install_fake_process_context(pipeline, fake_process())
     pipeline.register_task("convert", ok_handler)
     for job_id in ("a", "b", "c"):
         pipeline.enqueue(Job("convert", job_id))
@@ -302,6 +304,7 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     fake_process, tmp_path
 ):
     pipeline = _pipeline(tmp_path)
+    install_fake_process_context(pipeline, fake_process())
     pipeline.register_task("rank", ok_handler)
     # 畸形行（缺 job_id）带被排除 task_type：不得被选择豁免，仍走 MALFORMED_JOB
     pipeline._runtime.store.backend.save_queue(
@@ -330,10 +333,13 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
 # ── 动态派生与排除 ───────────────────────────────────────────────────
 
 
-def test_spawned_excluded_child_stays_queued(monkeypatch, tmp_path):
+def test_spawned_excluded_child_stays_queued(tmp_path):
     spawned = Job("excluded_t", "child").to_dict()
-    monkeypatch.setattr(mp, "Process", _fake_process_class(spawn_jobs=[spawned]))
     pipeline = _pipeline(tmp_path)
+    install_fake_process_context(
+        pipeline,
+        _fake_process_class(spawn_jobs=[spawned]),
+    )
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.enqueue(Job("fetch", "parent"))
@@ -346,9 +352,12 @@ def test_spawned_excluded_child_stays_queued(monkeypatch, tmp_path):
     assert pipeline._runtime.store.backend.load_attempts("excluded_t::child") == []
 
 
-def test_failed_parent_cascade_keeps_excluded_downstream(monkeypatch, tmp_path):
-    monkeypatch.setattr(mp, "Process", _fake_process_class(fail_uid="fetch::parent"))
+def test_failed_parent_cascade_keeps_excluded_downstream(tmp_path):
     pipeline = _pipeline(tmp_path)
+    install_fake_process_context(
+        pipeline,
+        _fake_process_class(fail_uid="fetch::parent"),
+    )
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("downstream", ok_handler)

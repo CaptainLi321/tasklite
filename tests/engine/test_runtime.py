@@ -45,7 +45,7 @@ def ok_handler(job, ctx):
     return True
 
 
-# ── fake 进程族（与真实 worker 共用 IPC 结果文件路径）──────────────────
+# ── fake 进程族（与真实 worker 共用瞬时 Pipe 边界）────────────────────
 
 
 def _write_success_result(spec) -> None:

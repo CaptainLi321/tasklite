@@ -8,8 +8,7 @@
 - 产物清理 PermissionError 阻断终态提交并保留原队列快照；
 - DRAINING / ABORTING 停机对在途声明、挂起信号与已完成结果的排空与结算；
 - 非法管道帧（损坏 JSON / 未知 kind / job_uid 不匹配 / execution_id 不匹配）
-  的零伪成功防御与失败授权清理；
-- 父进程崩溃后孤儿 worker 持有 .lock 期间的跨重启锁冲突避让与锁释放后重跑收敛。
+  的零伪成功防御与失败授权清理。
 """
 
 from __future__ import annotations
@@ -135,7 +134,10 @@ def pipelines(tmp_path):
 
     yield create
     for pipeline in created:
-        pipeline.stop()
+        try:
+            pipeline.stop()
+        finally:
+            pipeline.close()
     assert not mp.active_children()
     active_recv_threads = [
         t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")

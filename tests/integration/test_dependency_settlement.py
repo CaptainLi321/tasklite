@@ -1,24 +1,12 @@
 """依赖缺失在真实 SQLite 与并行 worker 下的结算契约。"""
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
 import threading
 import time
 from pathlib import Path
 
-import pytest
-
 from tasklite import Job, TaskLite, TaskResult
-
-
-@pytest.fixture(autouse=True)
-def _actual_spawn(_patch_mp_context, monkeypatch):
-    monkeypatch.setattr(
-        mp,
-        "get_context",
-        lambda method=None: mp.context.SpawnContext(),
-    )
 
 
 def _pipeline(tmp_path):

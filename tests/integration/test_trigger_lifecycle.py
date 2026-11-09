@@ -13,13 +13,6 @@ from tasklite.triggers import on_input_change
 from tasklite.utils.clock import parse_utc_iso_to_us
 
 
-@pytest.fixture(autouse=True)
-def _actual_spawn(_patch_mp_context, monkeypatch):
-    """本模块使用生产 spawn 上下文，不继承父进程配置。"""
-    monkeypatch.setattr(mp, "get_context", lambda method=None: mp.context.SpawnContext())
-    assert mp.get_context("spawn").get_start_method() == "spawn"
-
-
 def _pipeline(tmp_path, **overrides):
     out = tmp_path / "output"
     out.mkdir(parents=True, exist_ok=True)

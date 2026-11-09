@@ -1,14 +1,6 @@
 """具名产物在真实 spawn、历史成功及目录消费中的公开契约。"""
-import multiprocessing as mp
-
-import pytest
 
 from tasklite import FileSpec, Job, TaskLite, TaskResult
-
-
-@pytest.fixture(autouse=True)
-def _actual_spawn(_patch_mp_context, monkeypatch):
-    monkeypatch.setattr(mp, "get_context", lambda method=None: mp.context.SpawnContext())
 
 
 def build_bundle(job, ctx):

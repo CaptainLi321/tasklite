@@ -268,7 +268,7 @@ class TestNeverRaiseAgainstBrokenStr:
     classify()/validate_payload()/normalize_failure_metadata() 的 raw_error/
     expected 等字段对不可信对象取 ``str()`` 时，用户 ``__str__`` 的任意
     异常必须被吞掉并降级为占位串——分类边界内的取串失败不得让 worker
-    携 traceback 崩溃（无结果文件、失败被误归因为环境故障）。
+    携 traceback 崩溃（无有效结果、失败被误归因为环境故障）。
     """
 
     def test_classify_swallows_broken_str_across_all_target_shapes(self):

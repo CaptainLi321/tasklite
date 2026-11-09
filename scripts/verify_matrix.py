@@ -68,11 +68,14 @@ def main():
         pipeline.enqueue(j2)
         pipeline.run()
 
-        successes = pipeline._runtime.store.backend.load_successes()
-        assert "task_a::job_1" in successes
-        assert "task_retry::job_2" in successes
-        assert successes["task_a::job_1"]["result"] == "processed_42"
         with StateSnapshot.open(pipeline) as snap:
+            job_a = snap.get_job("task_a::job_1")
+            job_retry = snap.get_job("task_retry::job_2")
+            assert job_a is not None
+            assert job_a["status"] == "succeeded"
+            assert job_a["result"]["metadata"]["result"] == "processed_42"
+            assert job_retry is not None
+            assert job_retry["status"] == "succeeded"
             assert list(snap.iter_jobs(status="failed")) == []
 
     print("✓ End-to-end multi-process execution passed.")

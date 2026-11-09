@@ -1,5 +1,6 @@
 """触发器与任务模板的公开契约。"""
 from tasklite import Job, TaskLite, TaskLiteError, TaskResult
+from tests.helpers import install_fake_process_context
 
 
 def handle(job, ctx):
@@ -260,9 +261,9 @@ def test_trigger_skip_does_not_grant_dependency_readiness():
     assert not state.dependency_ready("t::a")
 
 
-def test_trigger_error_aborts_inflight_without_burning_budget(monkeypatch):
-    import multiprocessing as mp
+def test_trigger_error_aborts_inflight_without_burning_budget():
     import pytest
+
     class WaitingProcess:
         def __init__(self, **kwargs):
             self.exitcode = None
@@ -280,8 +281,8 @@ def test_trigger_error_aborts_inflight_without_burning_budget(monkeypatch):
             pass
         def close(self):
             pass
-    monkeypatch.setattr(mp, "Process", WaitingProcess)
     pipeline = TaskLite(backend="memory", max_workers=2)
+    install_fake_process_context(pipeline, WaitingProcess)
     pipeline.register_trigger("error", lambda ctx: 1 / 0)
     pipeline.register_task("t", handle)
     pipeline.enqueue(Job("t", "a"))

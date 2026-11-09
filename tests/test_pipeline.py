@@ -2,12 +2,11 @@
 
 装配分区行为等价验证：构造器拆分为 backend / 分类器 / 资源 / IPC /
 RunConfig / 运维控制台各私有装配方法后，对外契约（校验、快照、守卫、
-委托）与 v1 门面逐一对照。run 路径以确定性 fake 进程驱动（写 IPC 结果
-文件，与真实子进程共享同一收割代码路径）。
+委托）与 v1 门面逐一对照。需要确定性的 run 路径显式安装进程替身，并在
+真实单向 Pipe 边界发送结果。
 """
 from __future__ import annotations
 
-import multiprocessing as mp
 from pathlib import Path
 
 import pytest
@@ -28,6 +27,7 @@ from tasklite.models.task import Task
 from tasklite import TaskLiteError
 from tasklite.pipeline import TaskLite
 from tasklite.testing import running
+from tests.helpers import install_fake_process_context
 
 
 def ok_handler(job, ctx):
@@ -185,11 +185,11 @@ class DelegatingFakeBackend(AbstractStateBackend):
         return self.inner.revoke_authorization(*args, **kwargs)
 
 
-# ── fake 进程（写 IPC 结果文件，与真实 worker 同路径）──────────────────
+# ── 显式进程替身 ──────────────────────────────────────────────────────
 
 
 def make_instant_process_class(retry_uid: str | None = None, recorder: list | None = None):
-    """FakeProcess：start() 即写结果并退出。
+    """FakeProcess：start() 经 Pipe 发送结果并退出。
 
     ``retry_uid`` 命中的 job 写 retry 结果（走失败重试收尾路径），其余
     写成功结果——重入队位置类用例经此驱动。
@@ -912,7 +912,7 @@ class TestEnqueue:
             base_dir / "out" / "result.csv", role="output"
         )
 
-    def test_pending_recovery_across_runs_preserves_accepted_snapshot(self, tmp_path, monkeypatch):
+    def test_pending_recovery_across_runs_preserves_accepted_snapshot(self, tmp_path):
         """跨次恢复 pending 不套用新 Task 默认。"""
         db_path = tmp_path / "recover.db"
         p1 = TaskLite(backend="sqlite", state_path=db_path, max_workers=1)
@@ -936,8 +936,8 @@ class TestEnqueue:
                 observed.append(spec.job.to_dict())
                 super().__init__(args=args, **kwargs)
 
-        monkeypatch.setattr(mp, "Process", CapturingProcess)
         p2 = TaskLite(backend="sqlite", state_path=db_path, max_workers=1)
+        install_fake_process_context(p2, CapturingProcess)
         p2.register_resource(CapacityResource("gpu", max_capacity=2.0))
         # 新运行注册了完全不同的 Task 默认（甚至包含未注册资源 extra_vram）
         p2.register_task(
@@ -991,7 +991,7 @@ class TestSixStepContract:
     """初始化 → register_resource → register_task/register_transient
     → enqueue → run → stop 的完整链路（fake 进程驱动）。"""
 
-    def test_full_six_step_flow(self, tmp_path, monkeypatch):
+    def test_full_six_step_flow(self, tmp_path):
         p = make_pipeline(tmp_path)
 
         p.register_resource(CapacityResource("gpu", max_capacity=2.0))
@@ -999,7 +999,7 @@ class TestSixStepContract:
         p.enqueue(Job("fetch", "a"))
         p.enqueue(Job("fetch", "b"))
 
-        monkeypatch.setattr(mp, "Process", make_instant_process_class())
+        install_fake_process_context(p, make_instant_process_class())
         res = p.run()
         p.stop()
 
@@ -1021,7 +1021,7 @@ class TestSixStepContract:
             p.stop()
             assert p._runtime.stop_mode is StopMode.DRAINING
 
-    def test_is_running_flag_lifecycle(self, tmp_path, monkeypatch):
+    def test_is_running_flag_lifecycle(self, tmp_path):
         p = make_pipeline(tmp_path)
         assert p.is_running is False
         p.register_task("fetch", ok_handler)
@@ -1035,7 +1035,7 @@ class TestSixStepContract:
                 observed.append(p.is_running)
                 super().start()
 
-        monkeypatch.setattr(mp, "Process", ObservingProcess)
+        install_fake_process_context(p, ObservingProcess)
         p.run()
         assert observed == [True]
         assert p.is_running is False
@@ -1053,20 +1053,20 @@ class TestSchedulingSeamWiring:
         with pytest.raises(TypeError):
             TaskLite(backend="memory", requeue_policy=TailRequeuePolicy())  # type: ignore[call-arg]
 
-    def test_ordering_default_wiring_and_fifo_equivalence(self, tmp_path, monkeypatch):
+    def test_ordering_default_wiring_and_fifo_equivalence(self, tmp_path):
         order: list[str] = []
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
         for jid in ("a", "b", "c"):
             p.enqueue(Job("fetch", jid))
-        monkeypatch.setattr(mp, "Process", make_instant_process_class(recorder=order))
+        install_fake_process_context(p, make_instant_process_class(recorder=order))
         p.run()
 
         assert order == ["fetch::a", "fetch::b", "fetch::c"]
         assert isinstance(p.runtime_config.ordering_policy, FifoOrderingPolicy)
         assert p._runtime.scheduler.ordering_policy is p.runtime_config.ordering_policy
 
-    def test_requeue_default_wiring_and_front_equivalence(self, tmp_path, monkeypatch):
+    def test_requeue_default_wiring_and_front_equivalence(self, tmp_path):
         """默认立即重入队（front=True）：flaky 重试先于 later 结算。"""
         order: list[str] = []
         p = make_pipeline(
@@ -1076,8 +1076,9 @@ class TestSchedulingSeamWiring:
         p.register_task("fetch", ok_handler)
         p.enqueue(Job("fetch", "flaky", max_retries_per_run=1))
         p.enqueue(Job("fetch", "later"))
-        monkeypatch.setattr(
-            mp, "Process", make_instant_process_class(retry_uid="fetch::flaky", recorder=order)
+        install_fake_process_context(
+            p,
+            make_instant_process_class(retry_uid="fetch::flaky", recorder=order),
         )
         p.run()
 

@@ -1,257 +1,92 @@
-"""Shared mock infrastructure for pipeline integration tests.
+"""单元测试显式使用的轻量进程替身。
 
-IPC 落盘机制：FakeProcess 直接调用 ``write_result_atomic`` 写结果文件——executor 的
-``drain()`` 统一走文件轮询，fake 与真实子进程共享同一代码路径。
+替身仍在真实单向 Pipe 边界发送 WorkerLaunchSpec 结果；仅进程生命周期由
+测试同步控制。真实 spawn、EOF、退出码与超时路径必须使用原生产上下文。
 """
 
-import os
-import queue
-import time
-from pathlib import Path
+from __future__ import annotations
+
+import multiprocessing as mp
+from typing import Any, Callable, Iterable
 
 from tasklite.pipeline import TaskLite
 
 
-def _write_fake_result(
-    ipc_dir,
-    uid,
-    result_dict,
-    execution_id=None,
-    pipe_sender=None,
-):
-    """FakeProcess 用：经 WorkerLaunchSpec 绑定的瞬时管道发送端回传结果。"""
-    _ = (ipc_dir, uid, execution_id)
-    if pipe_sender is not None:
-        pipe_sender.send_result(result_dict)
+def _send_result(spec: Any, payload: dict[str, Any]) -> None:
+    sender = spec.pipe_sender
+    if sender is None:
+        raise AssertionError("fake worker 需要 WorkerLaunchSpec.pipe_sender")
+    sender.send_result(payload)
 
 
-def _spec_execution_id(args):
-    """从 FakeProcess args=(WorkerLaunchSpec,) 提取 execution_id。"""
-    if not args:
-        return None
-    return args[0].execution_id
+def make_pipe_process_class(
+    results: Iterable[dict[str, Any] | None] = (),
+    *,
+    exitcode: int = 0,
+    stay_alive: bool = False,
+    on_start: Callable[[Any], None] | None = None,
+) -> type:
+    """创建按 Pipe 结果序列驱动的进程替身。
 
-
-FIXED_AUTH_TOKEN = "c" * 64
-
-
-def ok_handler(job, ctx):
-    """占位 handler：成功 + 空 meta（模块级可 pickle，满足 strict 预检）。"""
-    return (True, {})
-
-
-def true_handler(job, ctx):
-    """占位 handler：返回 True（模块级可 pickle，满足 strict 预检）。"""
-    return True
-
-
-def none_handler(job, ctx):
-    """占位 handler：返回 None（隐含成功；模块级可 pickle）。"""
-    return None
-
-
-def pin_result_token(monkeypatch, token=FIXED_AUTH_TOKEN):
-    """固定本 run 的结果认证令牌。
-
-    预写跨 run 残留结果文件的测试用：令牌在 run 启动屏障才生成，pin 后
-    测试可与预写文件携带同一令牌（认证启用下的认领记账语义保持可测）。
+    ``results`` 中 ``None`` 表示本次启动不发送结果；最后一项供后续启动重复
+    使用。``stay_alive`` 用于固定“结果已到、进程尚未退出”的观察窗口。
     """
-    import secrets as _secrets
-    monkeypatch.setattr(_secrets, "token_hex", lambda n=32: token)
-    return token
+    sequence = list(results)
+    calls = [0]
 
+    class PipeProcess:
+        call_count = calls
 
-def make_fake_process_class(outcome="success"):
-    """Factory for FakeProcess classes with controllable outcomes.
-
-    ``start()`` 直接向结果文件写入 canned IPC 结果。
-    """
-
-    class FakeProcess:
-        def __init__(self, target=None, args=(), kwargs=None, target_pipeline=None, **_kw):
-            self.target = target
-            self.args = args
-            self.kwargs = kwargs or {}
-            self._alive = False
-            self._killed = False
-            self._joined = False
-            self.exitcode = 0
-            if target_pipeline:
-                setattr(self, '_pipeline', target_pipeline)
-
-        def start(self):
-            self._alive = True
-            # args = (WorkerLaunchSpec,)——进程 seam 具名契约
-            if self.args:
-                spec = self.args[0]
-                job = spec.job
-                ipc_dir = spec.ipc_dir
-                execution_id = spec.execution_id
-                pipe_sender = getattr(spec, "pipe_sender", None)
-                if outcome == "success":
-                    _write_fake_result(ipc_dir, job.uid, {
-                        "status": "success",
-                        "metadata": {},
-                        "spawned_jobs": [],
-                        "cursor_updates": {},
-                    }, execution_id=execution_id, pipe_sender=pipe_sender)
-                elif outcome == "retry":
-                    _write_fake_result(ipc_dir, job.uid, {
-                        "status": "retry",
-                        "message": "busy",
-                        "metadata": {},
-                        "consume_budget": True,
-                    }, execution_id=execution_id, pipe_sender=pipe_sender)
-                elif outcome == "fatal":
-                    _write_fake_result(ipc_dir, job.uid, {
-                        "status": "failure",
-                        "message": "FatalError: bug",
-                        "metadata": {},
-                        "exception": None,
-                    }, execution_id=execution_id, pipe_sender=pipe_sender)
-                elif outcome == "fatal_exception":
-                    _write_fake_result(ipc_dir, job.uid, {
-                        "status": "failure",
-                        "message": "TypeError: bad type",
-                        "metadata": {},
-                        "exception": {
-                            "type": "TypeError",
-                            "message": "bad type",
-                            "traceback": "traceback",
-                        },
-                    }, execution_id=execution_id, pipe_sender=pipe_sender)
-                elif outcome == "error":
-                    _write_fake_result(ipc_dir, job.uid, {
-                        "status": "failure",
-                        "message": "something broke",
-                        "metadata": {},
-                        "exception": None,
-                    }, execution_id=execution_id, pipe_sender=pipe_sender)
-
-        def join(self, timeout=None):
-            self._alive = False
-            self._joined = True
-
-        def is_alive(self):
-            return self._alive
-
-        def kill(self):
-            self._alive = False
-            self._joined = True
-            self._killed = True
-            self.exitcode = -9
-
-    return FakeProcess
-
-
-def make_ipc_process_class(results=(), exitcode=0, stay_alive=False):
-    """Factory for FakeProcess classes that write a fixed sequence of IPC results.
-
-    每次 ``start()`` 从 results 序列取一个结果写入结果文件。
-
-    Args:
-        results: iterable of IPC result dicts to write on each ``start()``.
-            An entry of ``None`` skips the write (simulates no IPC result).
-            The last entry repeats for subsequent calls.
-        exitcode: process exit code (used by the crash-detection path).
-        stay_alive: if True, ``is_alive()`` stays True until ``kill()`` —
-            simulates a hung subprocess for the timeout path.
-    """
-    results = list(results)
-    call_count = [0]
-    _exposed_count = call_count  # 类属性需引用外部别名（类体不解析闭包）
-
-    class FakeProcess:
-        call_count = _exposed_count  # exposed for assertions like "started twice"
-
-        def __init__(self, target=None, args=(), kwargs=None, **_kw):
+        def __init__(self, target=None, args=(), kwargs=None, **_kwargs):
             self.args = args
             self._alive = False
             self.exitcode = exitcode
 
-        def start(self):
+        def start(self) -> None:
             self._alive = stay_alive
-            if not results:
+            if not self.args:
                 return
-            idx = min(call_count[0], len(results) - 1)
-            call_count[0] += 1
-            payload = results[idx]
-            if payload is not None and self.args:
-                spec = self.args[0]
-                _write_fake_result(
-                    spec.ipc_dir, spec.job.uid, payload,
-                    execution_id=spec.execution_id,
-                    pipe_sender=getattr(spec, "pipe_sender", None),
-                )
+            spec = self.args[0]
+            if on_start is not None:
+                on_start(spec)
+            if not sequence:
+                return
+            index = min(calls[0], len(sequence) - 1)
+            calls[0] += 1
+            payload = sequence[index]
+            if payload is not None:
+                _send_result(spec, payload)
 
-        def join(self, timeout=None):
+        def join(self, timeout=None) -> None:
             if not stay_alive:
                 self._alive = False
 
-        def is_alive(self):
+        def is_alive(self) -> bool:
             return self._alive
 
-        def kill(self):
+        def kill(self) -> None:
             self._alive = False
             self.exitcode = -9
 
-    return FakeProcess
+        def close(self) -> None:
+            self._alive = False
+
+    return PipeProcess
 
 
-class FakeManager:
-    """Drop-in replacement for multiprocessing.Manager() in tests.
+class FakeSpawnContext:
+    """只替换 Process，Pipe 仍由真实 spawn 上下文创建。"""
 
-    Provides a shared list() method; __exit__ is a no-op so no real server
-    process is spawned. Use this whenever a test monkeypatches time.sleep or
-    time.monotonic to avoid the real Manager's shutdown hanging.
-    """
+    def __init__(self, process_class: type) -> None:
+        self._context = mp.get_context("spawn")
+        self.Process = process_class
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-    def list(self):
-        return []
+    def Pipe(self, *args, **kwargs):
+        return self._context.Pipe(*args, **kwargs)
 
 
-def patch_multiprocessing_for_fakes(monkeypatch, fake_process_class=None):
-    """Install fake Process/Queue/Manager across the multiprocessing modules.
-
-    Pipeline code uses both the global `multiprocessing` module and the spawn
-    context returned by `mp.get_context("spawn")`. This helper patches all
-    relevant targets so fake-based tests don't accidentally spawn real
-    subprocesses.
-
-    Args:
-        monkeypatch: pytest monkeypatch fixture.
-        fake_process_class: Fake Process class (e.g. from make_fake_process_class)
-            or None to skip Process patching.
-    """
-    monkeypatch.setattr("multiprocessing.Manager", lambda: FakeManager())
-    monkeypatch.setattr("tasklite.pipeline.mp.Manager", lambda: FakeManager())
-
-    if fake_process_class is not None:
-        monkeypatch.setattr("multiprocessing.Process", fake_process_class)
-        monkeypatch.setattr("tasklite.pipeline.mp.Process", fake_process_class)
-
-
-def patch_pipeline_manager(pipeline, monkeypatch):
-    """Replace the spawn-context Manager on a pipeline instance with FakeManager."""
-    monkeypatch.setattr(pipeline._process_context, "Manager", lambda: FakeManager())
-
-
-def make_pipeline(tmp_path, **kwargs):
-    """Create a pipeline with sqlite backend and temp directory."""
-    kwargs.pop("name", None)
-    kwargs.pop("state_dir", None)
-    backend = kwargs.pop("backend", "sqlite")
-    state_path = kwargs.pop("state_path", tmp_path / "state.db" if backend == "sqlite" else None)
-    output_roots = kwargs.pop("output_roots", tmp_path / "output")
-    return TaskLite(
-        backend=backend,
-        state_path=state_path,
-        output_roots=output_roots,
-        **kwargs,
-    )
+def install_fake_process_context(pipeline: TaskLite, process_class: type) -> None:
+    """为单个 TaskLite 实例显式安装进程替身。"""
+    context = FakeSpawnContext(process_class)
+    pipeline._process_context = context
+    pipeline._channel._process_context = context
