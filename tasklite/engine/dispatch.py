@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         """
 
         run_id: str | None
+        stop_mode: StopMode
 
         def next_dispatch_no(self) -> int: ...
 
@@ -76,7 +77,7 @@ from .errorclass import (
 )
 from .in_flight import InFlightJob
 from .scheduler import ScheduleResult, StandstillFacts
-from .types import AttemptOutcome
+from .types import AttemptOutcome, StopMode
 from .wait import IN_FLIGHT_POLL_SECONDS
 from ..utils.clock import utc_now_iso
 
@@ -311,6 +312,8 @@ class DispatchMachine:
             if fspec.delete_existing or fspec.delete_on_success or fspec.delete_on_failure:
                 assert fspec.path is not None
                 authorized = store.check_or_request_authorization(fspec.path)
+                if self._session.stop_mode is StopMode.DRAINING:
+                    return None
                 if authorized is None:
                     self._authorization_pending = (self._session.run_id, job_uid, fspec.path)
                     return None
@@ -322,6 +325,8 @@ class DispatchMachine:
 
         # 再次检查全部资源（授权后的全部资源检查到连续获取完成之间，不插入其他分配或回收）
         eval_res = self._resources.evaluate(job.task_type, job.resources)
+        if self._session.stop_mode is StopMode.DRAINING:
+            return None
         if eval_res.is_impossible:
             job_snapshot = store.state.pop_job(sched.runnable_idx)
             self._reject_and_commit(

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from tasklite import FileSpec, StateSnapshot
 from tasklite.engine.resource import CapacityResource
 from tasklite.engine.types import ExecutionOptions, StopMode
 from tasklite.models.job import Job
@@ -30,6 +31,38 @@ from tasklite.testing import running
 
 def success_handler(job, ctx):
     return TaskResult.success()
+
+
+def write_effect_handler(job, ctx):
+    Path(job.payload["effect"]).write_text("started")
+    return TaskResult.success()
+
+
+def test_stop_in_initial_authorizer_keeps_job_pending(tmp_path, monkeypatch):
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    effect = tmp_path / "effect.txt"
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
+        capacity = CapacityResource("disk", max_capacity=1)
+        pipeline.register_resource(capacity)
+        pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
+        pipeline.enqueue(Job(
+            "work", "one", payload={"effect": str(effect)},
+            files={"target": FileSpec(str(tmp_path / "output.txt"), role="output", delete_existing=True)},
+        ))
+
+        def stop_and_approve(path, target_type):
+            assert capacity.used == 0
+            pipeline.stop()
+            return True
+
+        pipeline.authorizer = stop_and_approve
+        pipeline.run()
+        with StateSnapshot.open(pipeline) as state:
+            job = state.get_job("work::one")
+            assert job is not None and job["status"] == "pending"
+            assert list(state.iter_attempts(job_uid="work::one")) == []
+        assert capacity.used == 0
+        assert not effect.exists()
 
 
 def file_synced_retry_handler(job, ctx):

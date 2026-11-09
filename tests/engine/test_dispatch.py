@@ -41,17 +41,18 @@ from tasklite.engine.resource import (
 )
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.store import StateStore
-from tasklite.engine.types import AttemptOutcome
+from tasklite.engine.types import AttemptOutcome, StopMode
 from tasklite.models.job import Job, JobRuntimeState, RT_DISPATCH_FAILURES
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
 
 
 class StubSession:
-    """运行会话结构契约桩：run_id / dispatch_no。"""
+    """派发消费的运行会话结构契约桩。"""
 
     def __init__(self, run_id: str = "a" * 32) -> None:
         self.run_id = run_id
+        self.stop_mode = StopMode.NONE
         self._dispatch_no = 0
 
     def next_dispatch_no(self) -> int:
