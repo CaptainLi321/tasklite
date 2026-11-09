@@ -3,7 +3,7 @@
 注意：本模块为测试辅助工具，本版本暂不承诺向后兼容与冻结扩展协议。
 handler 单测构造 JobContext，提供对文件声明、游标、依赖引用与派生的隔离测试支持。
 ``fake_ctx`` 生成真实 JobContext 实例，严格遵循产物沙盒策略、受保护路径、
-资源注册与依赖合法性校验，不绕过授权或状态事实宣称真实能力。
+依赖合法性校验，不绕过授权或状态事实宣称真实能力。
 
 Examples:
     >>> from pathlib import Path
@@ -57,7 +57,6 @@ def fake_ctx(
     protected_roots: tuple[str | Path, ...] = (),
     failed: Iterable[str] | None = None,
     cursors: dict[str, str] | None = None,
-    resources: Iterable[str] | None = None,
     tmp_root: Any | None = None,
     output_roots: Any | None = None,
     ipc_dir: str | None = None,
@@ -74,9 +73,6 @@ def fake_ctx(
         protected_roots: 不可声明为产物的框架状态目录。
         failed: 已进失败档案的 uid 集合。
         cursors: 游标初值映射（``ctx.get_cursor`` 命中源）。
-        resources: 已注册资源名集合——``ctx.suspend_resource`` 按名单
-            fail-loud 校验（与生产派发路径同语义）；缺省为空集，suspend
-            一律拒绝（测试挂起语义必须显式传名单）。
         tmp_root: 提供时在其下创建一次性临时目录作为 ``output_roots``，
             并建 ``ipc`` 子目录供独立测试上下文使用。路径经 ``ctx.output_roots`` / ``ctx.ipc_dir``
             读取；目录清理由调用方的 tmp_root 机制（如 pytest tmp_path
@@ -105,7 +101,6 @@ def fake_ctx(
         dict(cursors) if cursors is not None else {},
         output_roots=Path(output_roots) if isinstance(output_roots, str) else output_roots,
         ipc_dir=ipc_dir,
-        resource_names=frozenset(resources or ()),
         artifact_descriptions=artifacts,
         protected_roots=protected_roots,
         base_dir=base_dir,

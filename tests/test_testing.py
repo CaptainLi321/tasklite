@@ -2,8 +2,7 @@
 
 契约：successes/failed/cursors 的内部容器结构由构造器兜底装配（调用方传
 任意可迭代/映射即可）；tmp_root 模式提供沙盒 output_roots 与可记录的
-ipc 目录；resources 名单启用 suspend_resource 的 fail-loud 校验；
-running 句柄保证 run 期旗子复位（漏复位污染同会话后续用例）。
+ipc 目录；运行句柄保证 run 期旗子复位（漏复位污染同会话后续用例）。
 """
 from __future__ import annotations
 
@@ -107,23 +106,12 @@ class TestFakeCtxTmpRoot:
         assert Path(ctx1.output_roots) != Path(ctx2.output_roots)
 
 
-class TestFakeCtxSuspendGuard:
-    """suspend_resource 恒按已注册名单 fail-loud 校验（空名单即全拒绝）。"""
+class TestFakeCtxNoSuspensionSimulation:
+    """fake_ctx 不提供资源许可模拟参数。"""
 
-    def test_unknown_resource_rejected(self):
-        ctx = fake_ctx(_job(), resources=["api_known"])
-        with pytest.raises(ValueError, match="Unknown resource"):
-            ctx.suspend_resource("api_typo", 60.0)
-
-    def test_registered_resource_accepted(self):
-        ctx = fake_ctx(_job(), resources=["api_known"])
-        ctx.suspend_resource("api_known", 60.0)
-        assert ctx.resource_suspensions == [("api_known", 60.0)]
-
-    def test_no_resources_rejects_all(self):
-        ctx = fake_ctx(_job())
-        with pytest.raises(ValueError, match="Unknown resource"):
-            ctx.suspend_resource("anything", 60.0)
+    def test_resources_keyword_is_rejected(self):
+        with pytest.raises(TypeError, match="resources"):
+            fake_ctx(_job(), resources=["api_known"])  # type: ignore[call-arg]
 
 
 class TestFakeCtxExtendedParams:

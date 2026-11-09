@@ -2,7 +2,7 @@
 
 注意：本模块为可选工具，本版本暂不承诺向后兼容与冻结扩展协议。
 HTTP 请求失败由 handler 显式捕获后构造并返回 TaskResult（TaskResult.failure / TaskResult.retry），
-框架核心不通过隐式重试异常控制 handler，也不自动操纵资源挂起或重试预算。
+框架核心不通过隐式重试异常控制 handler，也不隐式耦合资源或重试预算。
 
 本模块提供面向批处理、数据同步与爬虫任务的通用 HTTP 辅助工具，主要包含：
 - http_guard: 上下文管理器，自动将 HTTP 状态码与网络异常映射为三分类异常
@@ -26,7 +26,6 @@ from __future__ import annotations
 import email.utils
 import hashlib
 import http.client
-import logging
 import math
 import os
 import random
@@ -44,8 +43,6 @@ from ..exceptions import TaskLiteError
 from ..utils.encoding import encode_job_component
 from ..utils.jsonutil import dumps as _json_dumps, loads as _json_loads
 
-logger = logging.getLogger("tasklite.wrappers.http")
-
 
 class RetryError(TaskLiteError):
     """HTTP wrapper 瞬态错误信号（供守卫与本地重试循环使用，handler 捕获后转 TaskResult.retry）。"""
@@ -56,7 +53,11 @@ class FatalError(TaskLiteError):
 
 
 class RateLimitHit(RetryError):
-    """HTTP 429 限速命中信号（守卫挂起资源后抛出，handler 捕获后转 TaskResult.retry(consume_budget=False)）。"""
+    """HTTP 429 限速命中信号（供 handler 显式转为 TaskResult.retry）。"""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 # 本地就地重试的单次等待封顶——大 max_retries 下无封顶的指数递增等待会
 # 累计出巨量不可中断睡眠（wrapper 层自防；核心引擎不含等待计算，重试
@@ -254,7 +255,7 @@ class HttpPolicy:
     """HTTP 状态码与传输异常分类规则器。
 
     将 HTTP 状态码与底层异常分类为三分类异常：
-    - RateLimitHit: 限流（触发资源挂起，不扣减重试预算）；
+    - RateLimitHit: 限流（由调用方决定重试节奏）；
     - FatalError: 确定性错误（如 4xx，直接进失败档案）；
     - RetryError: 瞬态错误（如 5xx、超时，触发重试）。
     """
@@ -291,9 +292,8 @@ class HttpPolicy:
             headers: 响应头 Mapping 对象。
 
         Returns:
-            解析出的正秒数；未提供、无法解析，或不具备挂起语义
-            （0、负数、非有限数、已过期的 HTTP-Date）时返回 None，由调用方
-            回落 default_suspend_ttl。
+            解析出的正秒数；未提供、无法解析或不具备有效时长语义
+            （0、负数、非有限数、已过期的 HTTP-Date）时返回 None。
         """
         if not headers:
             return None
@@ -308,16 +308,13 @@ class HttpPolicy:
         except ValueError:
             sec = None
         if sec is not None:
-            # 不变式：仅正值具备挂起语义。0/负数/非有限值必须回落
-            # default_suspend_ttl（None 契约），clamp 放行 0.0 会击穿
-            # JobContext.suspend_resource 的 seconds>0 入口校验，ValueError
-            # 在守卫 __exit__ 内替换掉限流信号。
+            # 仅正值具备有效等待语义；其余值统一由调用方视为未知。
             return sec if math.isfinite(sec) and sec > 0 else None
         try:
             parsed_tuple = email.utils.parsedate_tz(val_str)
             if parsed_tuple is not None:
                 diff = email.utils.mktime_tz(parsed_tuple) - time.time()
-                # 已过期日期与 0/负数秒同语义：无有效等待时长，回落而非 clamp
+                # 已过期日期与 0/负数秒同语义：无有效等待时长，由调用方视为未知
                 return diff if diff > 0 else None
         except Exception:
             pass
@@ -399,19 +396,6 @@ class HttpPolicy:
         return None
 
 
-def _validate_suspend_ttl(value: Any) -> float:
-    """default_suspend_ttl 构造期校验：非数值 TypeError，非有限/非正值 ValueError。
-
-    与 JobContext.suspend_resource 入口校验同构——坏配置在构造期 fail-loud，
-    而非延迟到 429 命中时才在守卫 __exit__ 内爆炸并替换限流信号。
-    """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"default_suspend_ttl must be a number, got {type(value).__name__} ({value!r})")
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"default_suspend_ttl must be finite and > 0, got {value!r}")
-    return float(value)
-
-
 def _resolve_category(cls: Any) -> type[BaseException] | None:
     """将策略分类器返回值归一为三分类基类（支持子类），非法返回值 fail-loud。
 
@@ -447,14 +431,14 @@ class http_guard:
        块内用户主动 raise 的状态异常（如 ``resp.raise_for_status()`` 抛出
        的 ``httpx.HTTPStatusError`` / ``requests.HTTPError``）同样按
        ``response.status_code`` 接管分类——raise 必须发生在守卫块内；
-    2. 遭遇 429 限流时：自动解析 Retry-After（依次取异常 `headers` 与
-       requests 风格 `exc_val.response.headers`），自动调用
-       `ctx.suspend_resource` 挂起对应的限速资源，并抛出 `RateLimitHit`；
+    2. 遭遇 429 限流时：解析 Retry-After（依次取异常 `headers` 与
+       requests 风格 `exc_val.response.headers`），抛出携带
+       `retry_after` 的 `RateLimitHit`；
     3. 遭遇 5xx/超时等瞬态错误：转换为 `RetryError` 触发调度器重试；
     4. 遭遇 4xx 等客户端错误：转换为 `FatalError` 直送失败档案。
 
     Examples:
-        >>> with http_guard(ctx=ctx, resource="api_custom"):
+        >>> with http_guard():
         ...     resp = my_request(...)
         ...     if resp.status_code != 200:
         ...         raise requests.HTTPError(response=resp)
@@ -462,23 +446,14 @@ class http_guard:
 
     def __init__(
         self,
-        ctx: Any | None = None,
-        resource: str | None = None,
         policy: HttpPolicy | None = None,
-        default_suspend_ttl: float = 60.0,
     ) -> None:
         """初始化 HTTP 守卫。
 
         Args:
-            ctx: 当前任务的 JobContext（用于调用 `ctx.suspend_resource`）。
-            resource: 关联的限速资源名称（如 'api_main'）。
             policy: 状态码与异常分类规则器（默认使用标准 HttpPolicy）。
-            default_suspend_ttl: 遭遇 429 且未提供 Retry-After 时的默认挂起秒数。
         """
-        self.ctx = ctx
-        self.resource = resource
         self.policy = policy or HttpPolicy()
-        self.default_suspend_ttl = _validate_suspend_ttl(default_suspend_ttl)
 
     def __enter__(self) -> "http_guard":
         return self
@@ -495,53 +470,27 @@ class http_guard:
         if cls is RateLimitHit:
             headers = getattr(response, "headers", None)
             retry_after = self.policy.extract_retry_after(headers)
-            ttl = retry_after if retry_after is not None else self.default_suspend_ttl
-            hit_exc = RateLimitHit(f"HTTP 429 RateLimit hit (resource={self.resource}, ttl={ttl:.1f}s)")
-            setattr(hit_exc, "_retry_after", ttl)
-            raise hit_exc
+            raise RateLimitHit(
+                f"HTTP 429 RateLimit hit (retry_after={retry_after!r})",
+                retry_after=retry_after,
+            )
         elif cls is FatalError:
             raise FatalError(f"HTTP {status_code} Fatal error")
         elif cls is RetryError:
             raise RetryError(f"HTTP {status_code} Transient server error")
 
-    def _rate_limit_ttl(self, exc_val: BaseException) -> float:
-        """解析限流挂起时长：异常携带的 _retry_after → Retry-After 头 → 默认值。
+    def _rate_limit_retry_after(self, exc_val: BaseException) -> float | None:
+        """解析限流等待时长：异常已有值优先，否则读取响应头。
 
         requests 风格异常无 headers 属性，Retry-After 挂在其 response 上。
         """
-        ttl = getattr(exc_val, "_retry_after", None)
-        if ttl is not None:
-            return ttl
+        retry_after = getattr(exc_val, "retry_after", None)
+        if retry_after is not None:
+            return retry_after
         headers = getattr(exc_val, "headers", None)
         if headers is None:
             headers = getattr(getattr(exc_val, "response", None), "headers", None)
-        retry_after = self.policy.extract_retry_after(headers)
-        return retry_after if retry_after is not None else self.default_suspend_ttl
-
-    def _emit_suspension(self, exc_val: BaseException, ttl: float) -> None:
-        """把限流挂起信号落到 ctx（入口故障降级为告警，不覆盖限流信号）。
-
-        挂起入口故障（未注册资源名的 ValueError、非法 ttl 的 TypeError 等）
-        与限流信号解耦：瞬态 RateLimitHit 是「不烧重试预算」的信号，被入口
-        校验异常覆盖即烧预算进失败档案且挂起信息丢失——失败降级为告警，
-        信号原样抛出。
-        """
-        if getattr(exc_val, "_suspended", False):
-            return
-        if self.ctx is None or self.resource is None or not hasattr(self.ctx, "suspend_resource"):
-            return
-        try:
-            self.ctx.suspend_resource(self.resource, ttl)
-            # 不变式：_suspended 仅在本守卫真实执行挂起后置位。内层守卫
-            # 因 ctx/resource 缺失未挂起时不得置位，否则外层守卫误判
-            # 「已挂起」而跳过，挂起信号既不进内存列表也不落盘。
-            setattr(exc_val, "_suspended", True)
-        except Exception as suspend_err:
-            logger.warning(
-                "suspend_resource(%r, %s) failed for rate-limit hit; "
-                "suspending skipped (%s)",
-                self.resource, ttl, suspend_err,
-            )
+        return self.policy.extract_retry_after(headers)
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if exc_val is None:
@@ -549,12 +498,15 @@ class http_guard:
 
         cls = _resolve_category(self.policy.classify_exception(exc_val))
         if cls is RateLimitHit or isinstance(exc_val, RateLimitHit):
-            ttl = self._rate_limit_ttl(exc_val)
-            self._emit_suspension(exc_val, ttl)
-
             if isinstance(exc_val, RateLimitHit):
+                if exc_val.retry_after is None:
+                    exc_val.retry_after = self._rate_limit_retry_after(exc_val)
                 raise exc_val
-            raise RateLimitHit(f"RateLimit hit: {exc_val}") from exc_val
+            retry_after = self._rate_limit_retry_after(exc_val)
+            raise RateLimitHit(
+                f"RateLimit hit: {exc_val}",
+                retry_after=retry_after,
+            ) from exc_val
 
         elif cls is FatalError:
             if isinstance(exc_val, FatalError):
@@ -575,10 +527,7 @@ def guard_request(
     *args: Any,
     max_retries: int = 0,
     retry_delay_base: float = 1.0,
-    ctx: Any | None = None,
-    resource: str | None = None,
     policy: HttpPolicy | None = None,
-    default_suspend_ttl: float = 60.0,
     **kwargs: Any,
 ) -> Any:
     """就地执行 HTTP 请求函数，提供本地快速重试与异常守卫（委托 HttpExecutor）。
@@ -587,22 +536,16 @@ def guard_request(
     脚本式调用；块状守卫用 ``http_guard``，可复用包装用 ``guarded``。
     """
     return HttpExecutor(
-        ctx=ctx,
-        resource=resource,
         policy=policy,
         max_retries=max_retries,
         retry_delay_base=retry_delay_base,
-        default_suspend_ttl=default_suspend_ttl,
     ).execute(func, *args, **kwargs)
 
 
 def guarded(
-    ctx: Any | None = None,
-    resource: str | None = None,
     policy: HttpPolicy | None = None,
     max_retries: int = 0,
     retry_delay_base: float = 1.0,
-    default_suspend_ttl: float = 60.0,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """修饰请求函数的守卫装饰器工厂（委托 HttpExecutor.wrap）。
 
@@ -610,12 +553,9 @@ def guarded(
     多处复用；就地单发调用用 ``guard_request``，块状守卫用 ``http_guard``。
     """
     return HttpExecutor(
-        ctx=ctx,
-        resource=resource,
         policy=policy,
         max_retries=max_retries,
         retry_delay_base=retry_delay_base,
-        default_suspend_ttl=default_suspend_ttl,
     ).wrap
 
 
@@ -1043,9 +983,8 @@ class HttpExecutor:
 
     统一绑定：
     1. HttpPolicy 异常与状态码分类规则；
-    2. JobContext / 限速资源 429 自动挂起；
-    3. 可选 SnapshotStore 内容寻址快照透明拦截；
-    4. 本地就地快速重试（指数递增等待封顶 + 抖动，wrapper 层自防巨量睡眠）。
+    2. 可选 SnapshotStore 内容寻址快照透明拦截；
+    3. 本地就地快速重试（指数递增等待封顶 + 抖动，wrapper 层自防巨量睡眠）。
 
     零引擎强耦合：严格遵循分层红线，仅面向开放 Callable 统一提供
     execute 与 wrap 接缝，不引入任何重型单体 Client，可在独立离线脚本或
@@ -1054,21 +993,15 @@ class HttpExecutor:
 
     def __init__(
         self,
-        ctx: Any | None = None,
-        resource: str | None = None,
         policy: HttpPolicy | None = None,
         snapshot_store: SnapshotStore | None = None,
         max_retries: int = 0,
         retry_delay_base: float = 1.0,
-        default_suspend_ttl: float = 60.0,
     ) -> None:
-        self.ctx = ctx
-        self.resource = resource
         self.policy = policy or HttpPolicy()
         self.snapshot_store = snapshot_store
         self.max_retries = max_retries
         self.retry_delay_base = retry_delay_base
-        self.default_suspend_ttl = _validate_suspend_ttl(default_suspend_ttl)
 
     @staticmethod
     def _retry_wait(attempt: int, base: float) -> float:
@@ -1098,20 +1031,13 @@ class HttpExecutor:
             if attempt > 0:
                 time.sleep(self._retry_wait(attempt, self.retry_delay_base))
             try:
-                with http_guard(
-                    ctx=self.ctx,
-                    resource=self.resource,
-                    policy=self.policy,
-                    default_suspend_ttl=self.default_suspend_ttl,
-                ) as g:
+                with http_guard(policy=self.policy) as g:
                     res = target_fn(*args, **kwargs)
                     g.check_response(res)
                     return res
             except (RateLimitHit, FatalError):
                 # 不变式：RateLimitHit 是 RetryError 子类，必须先于 RetryError 匹配。
-                # 限流等待唯一交由引擎挂起收敛（不烧预算、全管线休眠），本地不得
-                # 就地微等待重试限流端点——既无视 Retry-After，又逐 attempt 重复
-                # 下发挂起信号。
+                # 限流信号直接交给调用方，本地不得微等待重试限流端点。
                 raise
             except RetryError:
                 if attempt >= self.max_retries:
@@ -1167,9 +1093,6 @@ def urllib_fetch(
     data: bytes | str | Mapping[str, Any] | None = None,
     timeout: float = 30.0,
     policy: HttpPolicy | None = None,
-    ctx: Any | None = None,
-    resource: str | None = None,
-    default_suspend_ttl: float = 60.0,
     proxies: Mapping[str, str] | None = None,
 ) -> HttpResponse:
     """基于 Python 标准库 urllib 的 HTTP 请求实现（零外部依赖）。
@@ -1182,9 +1105,6 @@ def urllib_fetch(
         data: 请求体（支持 dict/list 自动序列化为 JSON、字符串或 bytes）。
         timeout: 超时秒数（默认 30.0s）。
         policy: 状态码与异常分类规则器。
-        ctx: 任务上下文。
-        resource: 限速资源名称。
-        default_suspend_ttl: 429 挂起秒数。
         proxies: 显式代理配置（访问 localhost/127.0.0.1 时默认不走环境变量代理）。
 
     Returns:
@@ -1214,7 +1134,7 @@ def urllib_fetch(
 
     opener = _build_urllib_opener(final_url, proxies)
 
-    with http_guard(ctx=ctx, resource=resource, policy=policy, default_suspend_ttl=default_suspend_ttl) as g:
+    with http_guard(policy=policy) as g:
         try:
             with opener.open(req, timeout=timeout) as resp:
                 status_code = resp.getcode()
@@ -1262,9 +1182,6 @@ def requests_fetch(
     json_data: Any = None,
     timeout: float = 30.0,
     policy: HttpPolicy | None = None,
-    ctx: Any | None = None,
-    resource: str | None = None,
-    default_suspend_ttl: float = 60.0,
     proxies: Mapping[str, str] | None = None,
     trust_env: bool | None = None,
     **kwargs: Any,
@@ -1281,9 +1198,6 @@ def requests_fetch(
         json_data: JSON 数据（对应 requests 的 json 参数）。
         timeout: 超时秒数。
         policy: 分类规则器。
-        ctx: 任务上下文。
-        resource: 限速资源名称。
-        default_suspend_ttl: 429 挂起秒数。
         proxies: 显式代理配置。
         trust_env: 是否使用环境变量中的代理设置。
         **kwargs: 透传给 requests 的其它参数。
@@ -1310,7 +1224,7 @@ def requests_fetch(
 
     sess, created_session = _prepare_requests_session(requests, url, session, proxies, trust_env)
 
-    with http_guard(ctx=ctx, resource=resource, policy=policy, default_suspend_ttl=default_suspend_ttl) as g:
+    with http_guard(policy=policy) as g:
         try:
             resp = sess.request(**req_kwargs)
             http_resp = HttpResponse(

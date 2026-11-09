@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import email.utils
 import io
-import math
 import socket
 import threading
 import time
@@ -16,11 +15,10 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
-from tasklite import Job, StateSnapshot, TaskLite, TaskResult
+from tasklite import Job, JobContext, StateSnapshot, TaskLite, TaskResult
 from tasklite.wrappers.http import (
     FatalError,
     HttpExecutor,
@@ -140,11 +138,7 @@ def test_http_policy_retry_after_parsing() -> None:
 
 
 def test_extract_retry_after_non_positive_returns_none() -> None:
-    """0/负数/非有限数/过期 HTTP-Date 均为「无有效时长」，返回 None 而非 clamp 0.0。
-
-    不变式：仅正值具备挂起语义。JobContext.suspend_resource 对 seconds<=0
-    fail-loud，clamp 放行的 0.0 会在守卫 __exit__ 内以 ValueError 替换限流信号。
-    """
+    """0/负数/非有限数/过期 HTTP-Date 均表示未知有效时长。"""
     policy = HttpPolicy()
 
     assert policy.extract_retry_after({"Retry-After": "0"}) is None
@@ -159,29 +153,11 @@ def test_extract_retry_after_non_positive_returns_none() -> None:
     assert policy.extract_retry_after({"Retry-After": "2.5"}) == 2.5
 
 
-class _StrictSuspendCtx:
-    """与引擎 JobContext.suspend_resource 入口校验同构的最小上下文。"""
-
-    def __init__(self) -> None:
-        self.calls: list = []
-
-    def suspend_resource(self, name: str, seconds: float) -> None:
-        if not math.isfinite(seconds) or seconds <= 0:
-            raise ValueError(f"seconds must be finite and > 0, got {seconds!r}")
-        self.calls.append((name, seconds))
-
-
 @pytest.mark.parametrize("hdrs", [{"Retry-After": "0"}, {"Retry-After": "-3"}])
-def test_http_guard_invalid_retry_after_falls_to_default_ttl(hdrs: dict) -> None:
-    """429 携带非法 Retry-After 时必须回落 default_suspend_ttl 并保持限流信号原样抛出。
-
-    挂起信号必须以正时长落盘：若 0.0 直达 suspend_resource，入口 ValueError
-    会替换 RateLimitHit，worker 兜底改写 error 终态——限流信号零落盘且任务
-    以 UNKNOWN 终态误入失败档案不再重试。
-    """
-    ctx = _StrictSuspendCtx()
-    with pytest.raises(RateLimitHit):
-        with http_guard(ctx=ctx, resource="api_x", default_suspend_ttl=60.0):
+def test_http_guard_invalid_retry_after_is_unknown(hdrs: dict) -> None:
+    """429 携带非法 Retry-After 时仍抛出限流信号，但不虚构等待时长。"""
+    with pytest.raises(RateLimitHit) as exc_info:
+        with http_guard():
             raise urllib.error.HTTPError(
                 url="https://x.com",
                 code=429,
@@ -189,21 +165,16 @@ def test_http_guard_invalid_retry_after_falls_to_default_ttl(hdrs: dict) -> None
                 hdrs=hdrs,
                 fp=None,
             )
-    assert ctx.calls == [("api_x", 60.0)]
+    assert exc_info.value.retry_after is None
 
 
 # ==============================================================================
-# 4. http_guard 守卫与引擎联动测试
+# 4. http_guard 工具级限流信号测试
 # ==============================================================================
 
-def test_http_guard_rate_limit_and_suspend() -> None:
-    mock_ctx = MagicMock()
-    mock_ctx.suspend_resource = MagicMock()
-
-    # 429 异常抛出并自动挂起
-    with pytest.raises(RateLimitHit):
-        with http_guard(ctx=mock_ctx, resource="api_twitter", default_suspend_ttl=30.0):
-            # 模拟 urllib 429
+def test_http_guard_rate_limit_signal() -> None:
+    with pytest.raises(RateLimitHit) as exc_info:
+        with http_guard():
             raise urllib.error.HTTPError(
                 url="https://x.com",
                 code=429,
@@ -211,44 +182,23 @@ def test_http_guard_rate_limit_and_suspend() -> None:
                 hdrs={"Retry-After": "75"},
                 fp=None,
             )
-
-    mock_ctx.suspend_resource.assert_called_once_with("api_twitter", 75.0)
-
-
-def test_http_guard_nested_inner_without_ctx_defers_suspension_to_outer() -> None:
-    """内层守卫无 ctx/resource 时不得置位 _suspended，挂起信号须由外层守卫落盘。
-
-    官方组合（外层带 ctx 守卫 + store.cached(urllib_fetch)）：
-    urllib_fetch 的内层守卫 ctx=None，若其无条件置位 _suspended，外层会误判
-    「已挂起」而跳过 suspend_resource——限流闭环静默失效，管线全速猛打被限流 API。
-    """
-    ctx = _StrictSuspendCtx()
-    with pytest.raises(RateLimitHit):
-        with http_guard(ctx=ctx, resource="api_feed", default_suspend_ttl=60.0):
-            with http_guard(default_suspend_ttl=60.0):
-                raise RateLimitHit("HTTP 429 RateLimit hit")
-    assert ctx.calls == [("api_feed", 60.0)]
+    assert exc_info.value.retry_after == 75.0
 
 
-def test_http_guard_nested_both_bound_suspends_exactly_once() -> None:
-    """内外层守卫均绑定 ctx/resource 时挂起信号恰好落盘一次（去重语义）。
-
-    _suspended 标志的唯一职责是向更外层守卫传播「挂起已完成」，防止同一
-    限流信号逐层重复下发 suspend_resource。
-    """
-    ctx = _StrictSuspendCtx()
-    with pytest.raises(RateLimitHit):
-        with http_guard(ctx=ctx, resource="api_outer", default_suspend_ttl=60.0):
-            with http_guard(ctx=ctx, resource="api_inner", default_suspend_ttl=30.0):
-                raise RateLimitHit("HTTP 429 RateLimit hit")
-    assert ctx.calls == [("api_inner", 30.0)]
+def test_http_guard_nested_rate_limit_preserves_signal() -> None:
+    hit = RateLimitHit("HTTP 429 RateLimit hit", retry_after=12.0)
+    with pytest.raises(RateLimitHit) as exc_info:
+        with http_guard():
+            with http_guard():
+                raise hit
+    assert exc_info.value is hit
+    assert exc_info.value.retry_after == 12.0
 
 
 def test_http_guard_requests_style_retry_after_from_response() -> None:
     """requests 风格异常无 headers 属性，Retry-After 须从 exc_val.response.headers 提取。
 
-    遗漏该回退时，requests.HTTPError 携带的 Retry-After 被静默丢弃，
-    挂起时长退化为 default_suspend_ttl。
+    遗漏该回退时，requests.HTTPError 携带的 Retry-After 会被静默丢失。
     """
 
     class _RequestsStyleHTTPError(Exception):
@@ -262,11 +212,10 @@ def test_http_guard_requests_style_retry_after_from_response() -> None:
         status_code = 429
         headers = {"Retry-After": "20"}
 
-    ctx = _StrictSuspendCtx()
-    with pytest.raises(RateLimitHit):
-        with http_guard(ctx=ctx, resource="api_x", default_suspend_ttl=60.0):
+    with pytest.raises(RateLimitHit) as exc_info:
+        with http_guard():
             raise _RequestsStyleHTTPError(_Response())
-    assert ctx.calls == [("api_x", 20.0)]
+    assert exc_info.value.retry_after == 20.0
 
 
 @pytest.mark.parametrize(
@@ -283,7 +232,7 @@ def test_http_guard_httpx_status_error_style_takeover(
     """httpx.HTTPStatusError 形态（``raise_for_status`` 主动 raise）按状态码三分类接管。
 
     契约：守卫块内任何携带 ``response.status_code`` 的库异常一律走状态码
-    分类，不落传输层模块兜底——429 的挂起退避不因「用户自己 raise」而
+    分类，不落传输层模块兜底——429 的限流等待信息不因「用户自己 raise」而
     丢失，且 Retry-After 从 ``exc.response.headers`` 提取（httpx 异常
     同样无顶层 headers 属性）。
     """
@@ -302,35 +251,20 @@ def test_http_guard_httpx_status_error_style_takeover(
             self.headers = headers
 
     headers = {"Retry-After": retry_after} if retry_after is not None else {}
-    ctx = _StrictSuspendCtx()
-    with pytest.raises(expected_exc):
-        with http_guard(ctx=ctx, resource="api_x", default_suspend_ttl=60.0):
+    with pytest.raises(expected_exc) as exc_info:
+        with http_guard():
             raise _HTTPXStatusError(_Response(status_code, headers))
     if expected_exc is RateLimitHit:
-        assert ctx.calls == [("api_x", 20.0)]
-    else:
-        assert ctx.calls == []
+        assert exc_info.value.retry_after == 20.0
 
 
-def test_default_suspend_ttl_construction_validation() -> None:
-    """default_suspend_ttl 构造期 fail-loud：非数值 TypeError，非有限/非正值 ValueError。
-
-    坏配置必须在构造期暴露，而非延迟到 429 命中时才在守卫 __exit__ 内
-    以 ValueError 替换限流信号。
-    """
-    with pytest.raises(TypeError):
-        http_guard(default_suspend_ttl="60")
-    with pytest.raises(TypeError):
-        HttpExecutor(default_suspend_ttl=True)
-    with pytest.raises(ValueError):
-        http_guard(default_suspend_ttl=0)
-    with pytest.raises(ValueError):
-        HttpExecutor(default_suspend_ttl=-1.0)
-    with pytest.raises(ValueError):
-        http_guard(default_suspend_ttl=float("inf"))
-    # 合法值构造通过
-    assert http_guard(default_suspend_ttl=1.5).default_suspend_ttl == 1.5
-    assert HttpExecutor(default_suspend_ttl=90).default_suspend_ttl == 90.0
+def test_suspend_parameters_are_rejected() -> None:
+    with pytest.raises(TypeError, match="ctx"):
+        http_guard(ctx=object())  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="resource"):
+        HttpExecutor(resource="api")  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="default_suspend_ttl"):
+        guard_request(lambda: None, default_suspend_ttl=60.0)  # type: ignore[call-arg]
 
 
 def test_http_guard_transient_and_fatal() -> None:
@@ -421,8 +355,7 @@ def test_check_response_accepts_classifier_subclasses() -> None:
         http_guard(policy=rl_policy).check_response(
             HttpResponse(status_code=429, headers={}, body=b"rate limited")
         )
-    # RateLimitHit 分支的 Retry-After 挂起语义不得因子类返回而丢失
-    assert getattr(exc_info.value, "_retry_after", None) == 60.0
+    assert exc_info.value.retry_after is None
 
     retry_policy = HttpPolicy(
         status_classifier=lambda code, resp: _CustomRetry if code == 503 else None
@@ -434,17 +367,13 @@ def test_check_response_accepts_classifier_subclasses() -> None:
 
 
 def test_guard_exit_converts_custom_classifier_subclass() -> None:
-    """exception_classifier 返回三分类子类时守卫必须完成对应转换与挂起联动。"""
-    ctx = _StrictSuspendCtx()
-    with pytest.raises(RateLimitHit):
+    """exception_classifier 返回三分类子类时守卫必须完成对应转换。"""
+    with pytest.raises(RateLimitHit) as exc_info:
         with http_guard(
-            ctx=ctx,
-            resource="api_x",
-            default_suspend_ttl=45.0,
             policy=HttpPolicy(exception_classifier=lambda exc: _CustomRateLimit),
         ):
             raise ValueError("boom")
-    assert ctx.calls == [("api_x", 45.0)]
+    assert exc_info.value.retry_after is None
 
     with pytest.raises(FatalError):
         with http_guard(policy=HttpPolicy(exception_classifier=lambda exc: _CustomFatal)):
@@ -496,16 +425,13 @@ def test_guard_request_retry_loop() -> None:
 
 
 def test_guarded_decorator() -> None:
-    mock_ctx = MagicMock()
-
-    @guarded(ctx=mock_ctx, resource="api_danbooru", default_suspend_ttl=45.0)
+    @guarded()
     def fetch_something() -> HttpResponse:
         return HttpResponse(status_code=429, headers={}, body=b"rate limited")
 
-    with pytest.raises(RateLimitHit):
+    with pytest.raises(RateLimitHit) as exc_info:
         fetch_something()
-
-    mock_ctx.suspend_resource.assert_called_once_with("api_danbooru", 45.0)
+    assert exc_info.value.retry_after is None
 
 
 # ==============================================================================
@@ -781,23 +707,21 @@ def test_snapshot_cached_distinguishes_identity_headers() -> None:
     assert call_count == 3
 
 
-def test_snapshot_cached_wrapped_urllib_fetch_429_suspension_reaches_outer_guard(
+def test_snapshot_cached_wrapped_urllib_fetch_429_signal_reaches_outer_guard(
     local_http_server: str,
 ) -> None:
-    """store.cached(urllib_fetch) 嵌套外层带 ctx 守卫时，429 挂起信号必须穿透内层落盘。
+    """store.cached(urllib_fetch) 嵌套守卫时，429 信号须穿透内层。
 
-    urllib_fetch 自带 ctx=None 内层守卫，该组合是官方推荐用法；
-    挂起时长取自真实 Retry-After 响应头。
+    外层守卫须保留内层从真实 Retry-After 响应头解析出的等待时长。
     """
     store = MemorySnapshotStore()
-    ctx = _StrictSuspendCtx()
     cached_fetch = store.cached(urllib_fetch)
 
-    with pytest.raises(RateLimitHit):
-        with http_guard(ctx=ctx, resource="api_feed", default_suspend_ttl=60.0):
+    with pytest.raises(RateLimitHit) as exc_info:
+        with http_guard():
             cached_fetch(f"{local_http_server}/429")
 
-    assert ctx.calls == [("api_feed", 15.0)]
+    assert exc_info.value.retry_after == 15.0
 
 
 def test_snapshot_cached_distinguishes_params_value_types() -> None:
@@ -1003,11 +927,25 @@ def test_urllib_fetch_post(local_http_server: str) -> None:
     assert resp.json()["received_bytes"] > 0
 
 
-def test_urllib_fetch_429_suspension(local_http_server: str) -> None:
-    mock_ctx = MagicMock()
+def test_urllib_fetch_429_signal(local_http_server: str) -> None:
+    with pytest.raises(RateLimitHit) as exc_info:
+        urllib_fetch(f"{local_http_server}/429")
+    assert exc_info.value.retry_after == 15.0
+
+
+def test_urllib_fetch_429_has_no_core_resource_side_effect(
+    local_http_server: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def _record_suspension(_self: JobContext, *args: object) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(JobContext, "suspend_resource", _record_suspension)
     with pytest.raises(RateLimitHit):
-        urllib_fetch(f"{local_http_server}/429", ctx=mock_ctx, resource="api_local")
-    mock_ctx.suspend_resource.assert_called_once_with("api_local", 15.0)
+        urllib_fetch(f"{local_http_server}/429")
+    assert calls == []
 
 
 def test_urllib_fetch_500_retry(local_http_server: str) -> None:
@@ -1075,11 +1013,10 @@ def test_requests_fetch_success(local_http_server: str) -> None:
     assert resp.json() == {"status": "ok", "msg": "hello"}
 
 
-def test_requests_fetch_429_suspension(local_http_server: str) -> None:
-    mock_ctx = MagicMock()
-    with pytest.raises(RateLimitHit):
-        requests_fetch(f"{local_http_server}/429", ctx=mock_ctx, resource="api_req")
-    mock_ctx.suspend_resource.assert_called_once_with("api_req", 15.0)
+def test_requests_fetch_429_signal(local_http_server: str) -> None:
+    with pytest.raises(RateLimitHit) as exc_info:
+        requests_fetch(f"{local_http_server}/429")
+    assert exc_info.value.retry_after == 15.0
 
 
 # ==============================================================================
@@ -1127,29 +1064,28 @@ class TestHttpExecutor:
         assert call_count == 1
 
     def test_execute_with_rate_limit_and_retry(self):
-        mock_ctx = MagicMock()
-        executor = HttpExecutor(ctx=mock_ctx, resource="api_custom", default_suspend_ttl=30.0)
+        executor = HttpExecutor()
 
         def failing_fetch(url: str):
-            resp = MagicMock()
-            resp.status_code = 429
-            resp.headers = {"Retry-After": "45"}
-            return resp
+            return HttpResponse(
+                status_code=429,
+                headers={"Retry-After": "45"},
+                body=b"rate limited",
+                url=url,
+            )
 
-        with pytest.raises(RateLimitHit):
+        with pytest.raises(RateLimitHit) as exc_info:
             executor.execute(failing_fetch, "https://example.com/rate_limited")
 
-        mock_ctx.suspend_resource.assert_called_once_with("api_custom", 45.0)
+        assert exc_info.value.retry_after == 45.0
 
     def test_execute_rate_limit_not_locally_retried(self):
         """429 必须命中 RateLimitHit 专用分支直接上抛，禁止落入本地重试循环。
 
         不变式：RateLimitHit 是 RetryError 子类，except 顺序颠倒会把限流吞进
-        本地线性微等待重试——无视 Retry-After 猛打限流端点，且挂起信号逐
-        attempt 重复落盘。限流等待唯一交由引擎挂起收敛。
+        本地线性微等待重试——无视 Retry-After 猛打限流端点。
         """
-        mock_ctx = MagicMock()
-        executor = HttpExecutor(ctx=mock_ctx, resource="api_x", max_retries=5, retry_delay_base=0.0)
+        executor = HttpExecutor(max_retries=5, retry_delay_base=0.0)
         call_count = 0
 
         def rate_limited_fetch(url: str):
@@ -1157,55 +1093,11 @@ class TestHttpExecutor:
             call_count += 1
             return HttpResponse(status_code=429, headers={"Retry-After": "30"}, body=b"rate limited", url=url)
 
-        with pytest.raises(RateLimitHit):
+        with pytest.raises(RateLimitHit) as exc_info:
             executor.execute(rate_limited_fetch, "https://example.com/rl")
 
         assert call_count == 1
-        mock_ctx.suspend_resource.assert_called_once_with("api_x", 30.0)
-
-
-def test_http_guard_suspend_failure_preserves_rate_limit_signal() -> None:
-    """suspend_resource 抛 ValueError 时守卫 __exit__ 不得以其覆盖限流信号。
-
-    资源名 typo（未注册名 fail-loud 的 ValueError）等挂起入口故障必须与
-    限流信号本身解耦：ValueError 从 __exit__ 直接穿透会把瞬态 RateLimitHit
-    替换为普通异常（烧重试预算进失败档案），且挂起信号丢失。挂起失败降级为
-    日志告警，_suspended 不置位，RateLimitHit 原样抛出。
-    """
-
-    class _RejectingCtx:
-        def __init__(self) -> None:
-            self.calls: list = []
-
-        def suspend_resource(self, name: str, seconds: float) -> None:
-            self.calls.append((name, seconds))
-            raise ValueError(
-                f"Unknown resource {name!r}; suspend request ignored"
-            )
-
-    ctx = _RejectingCtx()
-    hit = RateLimitHit("HTTP 429 RateLimit hit")
-    with pytest.raises(RateLimitHit) as exc_info:
-        with http_guard(ctx=ctx, resource="api_typo", default_suspend_ttl=60.0):
-            raise hit
-    assert exc_info.value is hit
-    assert ctx.calls == [("api_typo", 60.0)]
-    # 挂起未真实发生：不得置位 _suspended（外层守卫语义依赖）
-    assert getattr(hit, "_suspended", False) is False
-
-
-def test_http_guard_suspend_type_error_preserves_rate_limit_signal() -> None:
-    """挂起入口的 TypeError（如非法 ttl 形态）同样不覆盖限流信号。"""
-
-    class _BrokenCtx:
-        def suspend_resource(self, name: str, seconds: float) -> None:
-            raise TypeError("seconds must be a number")
-
-    hit = RateLimitHit("HTTP 429 RateLimit hit")
-    with pytest.raises(RateLimitHit) as exc_info:
-        with http_guard(ctx=_BrokenCtx(), resource="api_x", default_suspend_ttl=60.0):
-            raise hit
-    assert exc_info.value is hit
+        assert exc_info.value.retry_after == 30.0
 
 
 class TestHttpExecutorRetryWaitShape:
