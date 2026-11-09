@@ -15,6 +15,7 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import signal
 import time
 import traceback
 from collections.abc import Callable, Iterable, Sequence
@@ -320,12 +321,25 @@ def _decode_ipc_result(
     )
 
 
+def _isolate_worker_process_signals() -> None:
+    """让进程组停止信号只由主进程处理。"""
+    if os.name != "posix":
+        return
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
 def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
     """spawn 子进程执行体入口：执行 handler 并经瞬时管道发送结果。
 
     不变式：结果通过管道单向回传；执行体任何出口（含未捕获异常）
     均在 finally 统一关闭管道写端。
     """
+    _isolate_worker_process_signals()
     handler_func = spec.handler
     job = spec.job
     ctx = spec.job_context
@@ -721,7 +735,7 @@ class ExecutionChannel:
         if p is not None:
             try:
                 if p.is_alive():
-                    p.terminate()
+                    p.kill()
             except Exception:
                 pass
 
@@ -811,6 +825,32 @@ class ExecutionChannel:
                         pass
                 still_lingering.append((exec_id, p, receiver))
         self._lingering_workers = still_lingering
+
+    def wait_for_lingering_workers(self) -> None:
+        """正常 Run 收口前等待已结算 worker 退出，超时后回收残留进程。"""
+        if not self._lingering_workers:
+            return
+        deadline = time.monotonic() + self._JOIN_REAP_TIMEOUT
+        lingering = self._lingering_workers
+        self._lingering_workers = []
+        for exec_id, process, receiver in lingering:
+            remaining = deadline - time.monotonic()
+            try:
+                while process.is_alive() and remaining > 0:
+                    process.join(timeout=min(0.05, remaining))
+                    remaining = deadline - time.monotonic()
+                    if process.is_alive() and remaining > 0:
+                        time.sleep(min(0.01, remaining))
+            except Exception as exc:
+                logger.warning(f"Settled worker wait failed for {exec_id}: {exc}")
+            if process.is_alive():
+                logger.warning(f"Settled worker {exec_id} did not exit before Run end")
+            self._finalize_process(process)
+            if receiver is not None:
+                try:
+                    receiver.close(timeout=0.2)
+                except Exception as exc:
+                    logger.debug(f"Settled receiver close warning for {exec_id}: {exc}")
 
     def reap_completed(
         self, handles: Sequence[JobHandle]

@@ -10,7 +10,10 @@
 
 from __future__ import annotations
 
+import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -35,6 +38,20 @@ def success_handler(job, ctx):
 
 def write_effect_handler(job, ctx):
     Path(job.payload["effect"]).write_text("started")
+    return TaskResult.success()
+
+
+def lingering_success_handler(job, ctx):
+    release_path = Path(job.payload["release_path"])
+    done_path = Path(job.payload["done_path"])
+
+    def hold_process() -> None:
+        deadline = time.monotonic() + 20.0
+        while not release_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        done_path.write_text("done", encoding="utf-8")
+
+    threading.Thread(target=hold_process, daemon=False).start()
     return TaskResult.success()
 
 
@@ -241,6 +258,181 @@ def test_stop_from_another_thread_wakes_scheduler_wait(tmp_path):
     elapsed = time.monotonic() - t0
     assert elapsed < 1.0
     t.join(timeout=2.0)
+
+
+def test_run_waits_for_settled_worker_process_exit(tmp_path):
+    release_path = tmp_path / "release-worker"
+    done_path = tmp_path / "worker-exited"
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "worker-drain.db")
+    p.register_task("lingering", lingering_success_handler)
+    p.enqueue(Job(
+        "lingering",
+        "j1",
+        payload={"release_path": str(release_path), "done_path": str(done_path)},
+    ))
+
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def run_pipeline() -> None:
+        try:
+            p.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    deadline = time.monotonic() + 10.0
+    while "lingering::j1" not in p.backend.load_successes() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "lingering::j1" in p.backend.load_successes()
+    assert not finished.is_set(), "有效结果已结算，但 Run 必须等待 worker 进程退出"
+
+    release_path.write_text("release", encoding="utf-8")
+    runner.join(timeout=20.0)
+
+    assert not runner.is_alive()
+    assert errors == []
+    assert done_path.exists()
+    p.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="进程组信号仅在 POSIX 平台验证")
+def test_process_group_sigterm_drains_worker_and_preserves_settlement(tmp_path):
+    state_path = tmp_path / "signal.db"
+    release_path = tmp_path / "release-signal"
+    done_path = tmp_path / "signal-run-done"
+    ready_success = tmp_path / "ready-success"
+    ready_failure = tmp_path / "ready-failure"
+    project_root = Path(__file__).resolve().parents[2]
+    script = tmp_path / "run_signal_pipeline.py"
+    script.write_text(
+        f"""
+import time
+from pathlib import Path
+
+from tasklite import Job, TaskLite, TaskResult
+
+RELEASE = Path({str(release_path)!r})
+
+
+def wait_for_release():
+    deadline = time.monotonic() + 20.0
+    while not RELEASE.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def drain_success(job, ctx):
+    Path(job.payload["ready"]).write_text("ready", encoding="utf-8")
+    wait_for_release()
+    ctx.spawn(Job("spawned", "child"))
+    return TaskResult.success()
+
+
+def drain_failure(job, ctx):
+    Path(job.payload["ready"]).write_text("ready", encoding="utf-8")
+    wait_for_release()
+    return TaskResult.failure(message="drain failure")
+
+
+def unexpected_handler(job, ctx):
+    Path(job.payload["marker"]).write_text("ran", encoding="utf-8")
+    return TaskResult.success()
+
+
+def main():
+    pipeline = TaskLite(backend="sqlite", state_path={str(state_path)!r}, max_workers=2)
+    pipeline.register_task("drain_success", drain_success)
+    pipeline.register_task("drain_failure", drain_failure)
+    pipeline.register_task("spawned", unexpected_handler)
+    pipeline.register_task("dependent", unexpected_handler)
+    pipeline.register_task("other", unexpected_handler)
+    pipeline.enqueue(Job(
+        "drain_success",
+        "s1",
+        payload={{"ready": {str(ready_success)!r}}},
+    ))
+    pipeline.enqueue(Job(
+        "drain_failure",
+        "f1",
+        payload={{"ready": {str(ready_failure)!r}}},
+    ))
+    pipeline.enqueue(Job(
+        "dependent",
+        "d1",
+        depends_on=["drain_failure::f1"],
+        payload={{"marker": {str(tmp_path / "dependent-marker")!r}}},
+    ))
+    pipeline.enqueue(Job(
+        "other",
+        "o1",
+        payload={{"marker": {str(tmp_path / "other-marker")!r}}},
+    ))
+    pipeline.run()
+    Path({str(done_path)!r}).write_text("done", encoding="utf-8")
+    pipeline.close()
+
+
+if __name__ == "__main__":
+    main()
+""",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project_root)
+    process = subprocess.Popen(
+        [sys.executable, str(script)],
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 20.0
+        while (
+            not ready_success.exists() or not ready_failure.exists()
+        ) and time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.01)
+        assert ready_success.exists() and ready_failure.exists()
+
+        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, signal.SIGTERM)
+        release_path.write_text("release", encoding="utf-8")
+        stdout, stderr = process.communicate(timeout=30.0)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5.0)
+
+    assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+    assert done_path.exists()
+    with StateSnapshot.open(state_path) as state:
+        succeeded = {job["job_uid"] for job in state.iter_jobs(status="succeeded")}
+        failed = {job["job_uid"] for job in state.iter_jobs(status="failed")}
+        pending = {job["job_uid"] for job in state.iter_jobs(status="pending")}
+        attempts = {
+            job_uid: [
+                attempt["outcome"]
+                for attempt in state.iter_attempts(job_uid=job_uid)
+            ]
+            for job_uid in ("drain_success::s1", "drain_failure::f1")
+        }
+
+    assert "drain_success::s1" in succeeded
+    assert {"drain_failure::f1", "dependent::d1"} <= failed
+    assert {"spawned::child", "other::o1"} <= pending
+    assert "spawned::child" not in succeeded
+    assert "other::o1" not in succeeded
+    assert attempts["drain_success::s1"] == ["success"]
+    assert attempts["drain_failure::f1"] == ["failure"]
+    assert not (tmp_path / "dependent-marker").exists()
+    assert not (tmp_path / "other-marker").exists()
 
 
 def test_repeat_ctrl_c_does_not_upgrade_to_force_abort(tmp_path):

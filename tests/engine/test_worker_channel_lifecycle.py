@@ -1,8 +1,8 @@
 """Worker 通信通道结果到达与进程回收分离回归测试。
 
 不变式覆盖：
-1. 有效结果到达即结算：真实 worker 返回结果后即使子进程未退出，亦不阻塞其他
-   Job 结算或派发，且之后的进程退出状态绝不改写有效结果；
+1. 有效结果到达即结算：真实 worker 返回结果后即使子进程未退出，其他 Job
+   仍可结算，Run 返回前等待该进程退出且不改写有效结果；
 2. 无结果退出、启动失败与超时各自留下实际失败信息，进程和 Pipe 句柄完整回收；
 3. 逐 Job 执行锁与孤儿探测已移除，不产生隐式零预算重试；库级互斥仍有效。
 """
@@ -71,8 +71,8 @@ def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> boo
     return bool(predicate())
 
 
-def test_worker_lingers_after_result_does_not_block_and_retains_success(tmp_path):
-    """真实 worker 返回结果后未退出，不阻塞后续 Job 派发结算且有效结果不被改写。"""
+def test_worker_lingers_after_result_does_not_block_dispatch_and_run_waits(tmp_path):
+    """结果到达后继续调度其他 Job，Run 结束前等待残留 worker 退出。"""
     sync_dir = tmp_path / "sync"
     sync_dir.mkdir(parents=True, exist_ok=True)
 
@@ -88,14 +88,22 @@ def test_worker_lingers_after_result_does_not_block_and_retains_success(tmp_path
     pipeline.enqueue(Job("lingering", "j1", payload={"sync_dir": str(sync_dir)}))
     pipeline.enqueue(Job("fast", "j2"))
 
-    t0 = time.monotonic()
-    pipeline.run()
-    elapsed = time.monotonic() - t0
+    errors: list[BaseException] = []
 
-    # linger 会 sleep 3 秒，但主流程收到结果后立即完成并结算 j1 与 j2
-    # 整个 Run 耗时应远小于等待 linger 自然退出
-    assert elapsed < 2.5, f"执行时间过长 ({elapsed}s)，可能发生前置阻塞等待"
+    def run_pipeline() -> None:
+        try:
+            pipeline.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
 
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    assert _wait_until(lambda: (sync_dir / "job1_returned").exists(), timeout=10.0)
+    assert runner.is_alive(), "Run 必须等待仍在运行的已结算 worker"
+    runner.join(timeout=10.0)
+
+    assert not runner.is_alive()
+    assert errors == []
     successes = pipeline.backend.load_successes()
     assert "lingering::j1" in successes
     assert "fast::j2" in successes

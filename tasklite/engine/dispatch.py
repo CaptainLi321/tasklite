@@ -148,6 +148,10 @@ class DispatchMachine:
 
     # ── 扫描与派发接缝 ────────────────────────────────────────────────
 
+    def _dispatch_allowed(self) -> bool:
+        """新派发的唯一停止边界。"""
+        return self._session.stop_mode is StopMode.NONE
+
     def dispatch_next(self) -> DispatchOutcome:
         """统一扫描与派发接缝：工人槽位预检 → 队列扫描 → 五关预检 →
         资源租约 → 子进程派发。
@@ -162,12 +166,18 @@ class DispatchMachine:
         - NO_CANDIDATE：无可运行作业，停摆事实随 standstill 供仲裁。
         """
         store = self._store
+        if not self._dispatch_allowed():
+            self._authorization_pending = None
+            return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
+
         pending = self._authorization_pending
         if pending is not None:
             run_id, pending_uid, path = pending
             self._authorization_pending = None
             if run_id == self._session.run_id and pending_uid in store.state.queue_uids:
                 authorized = store.check_or_request_authorization(path)
+                if not self._dispatch_allowed():
+                    return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
                 if authorized is None:
                     self._authorization_pending = pending
                     return DispatchOutcome(
@@ -197,6 +207,8 @@ class DispatchMachine:
                 standstill=sched.standstill_facts(),
             )
 
+        if not self._dispatch_allowed():
+            return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
         entry = self.dispatch_job(sched)
         if self._authorization_pending:
             return DispatchOutcome(
@@ -214,7 +226,7 @@ class DispatchMachine:
         返回 InFlightJob 条目；被预检拦截（已终结/跳过/已回队）时返回 None。
         """
         store = self._store
-        if sched.runnable_idx is None:
+        if sched.runnable_idx is None or not self._dispatch_allowed():
             return None
 
         # 1. 依赖已失败分支：优先于去重/准入求值（上游失败阻断下游，不得借旧成功跳过）
@@ -312,7 +324,7 @@ class DispatchMachine:
             if fspec.delete_existing or fspec.delete_on_success or fspec.delete_on_failure:
                 assert fspec.path is not None
                 authorized = store.check_or_request_authorization(fspec.path)
-                if self._session.stop_mode is StopMode.DRAINING:
+                if not self._dispatch_allowed():
                     return None
                 if authorized is None:
                     self._authorization_pending = (self._session.run_id, job_uid, fspec.path)
@@ -325,7 +337,7 @@ class DispatchMachine:
 
         # 再次检查全部资源（授权后的全部资源检查到连续获取完成之间，不插入其他分配或回收）
         eval_res = self._resources.evaluate(job.task_type, job.resources)
-        if self._session.stop_mode is StopMode.DRAINING:
+        if not self._dispatch_allowed():
             return None
         if eval_res.is_impossible:
             job_snapshot = store.state.pop_job(sched.runnable_idx)
@@ -433,19 +445,19 @@ class DispatchMachine:
                 resolved_files=resolved_files,
             )
         except _CommitCrashSignal:
-            # _CommitCrashSignal 继承 BaseException——「commit 失败需崩溃」
-            # 的信号不会被 except Exception 兜底误吞。re-raise 让它穿透到
-            # 运行循环的崩溃处理分支（已 requeue 当前作业，不在此二次处理）。
+            self._resources.release_all(acquired)
             raise
         except AssertionError:
-            # DEBUG 断言是引擎不变式破坏信号，不是作业坏输入——不得计入
-            # 派发失败预算（3-strike 会把可正常执行的作业误送失败档案），
-            # 原样穿透交运行循环崩溃网统一收尾。
+            self._resources.release_all(acquired)
             raise
         except KeyboardInterrupt:
+            self._resources.release_all(acquired)
             self._handle_interrupt(job_uid, job_snapshot)
             return None
         except Exception as e:
+            self._resources.release_all(acquired)
+            if store.backend.schema_version >= TARGET_SCHEMA_VERSION:
+                raise
             self._handle_dispatch_failure(job_uid, job_snapshot, attempt_id, e)
             return None
 

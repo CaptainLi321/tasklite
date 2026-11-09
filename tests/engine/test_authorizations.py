@@ -22,6 +22,7 @@ from tasklite import (
     TaskLite,
     TaskResult,
 )
+from tasklite.resource import CapacityResource
 
 
 def _quick_handler(job, ctx):
@@ -458,7 +459,21 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     stopped_marker = tmp_path / "stopped-marker"
 
     p = TaskLite(backend="sqlite", state_path=tmp_path / "stop-auth.db", max_workers=2)
-    authorizer = _ControlledAuthorizer(decision=None)
+    release_observations: list[tuple[set[str], list[dict]]] = []
+
+    class ObservingCapacity(CapacityResource):
+        def release(self, amount: float) -> None:
+            release_observations.append((
+                {
+                    row["job_uid"]
+                    for row in p.backend.load_queue_jobs(status="running")
+                },
+                p.backend.load_settled_attempts("waiting::w1"),
+            ))
+            super().release(amount)
+
+    p.register_resource(ObservingCapacity("slot", max_capacity=1.0))
+    authorizer = _BlockingAuthorizer()
     p.authorizer = authorizer
     p.register_task("waiting", _declare_then_write_handler)
     p.register_task("quick", _quick_handler)
@@ -467,6 +482,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
         "waiting",
         "w1",
         payload={"path": str(target), "content": "new data"},
+        resources={"slot": 1.0},
     ))
     p.enqueue(Job("quick", "q1"))
     p.enqueue(Job(
@@ -487,12 +503,21 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     runner.start()
     try:
         assert authorizer.first_call.wait(10.0)
-        _wait_for(lambda: "quick::q1" in p.backend.load_successes())
+        _wait_for(
+            lambda: any(
+                handle.waiting_auth
+                for handle in p._runtime.in_flight.active_handles()
+            )
+        )
         p.stop()
+        running = p.backend.load_queue_jobs(status="running")
+        assert "waiting::w1" in {row["job_uid"] for row in running}
+        authorizer.release.set()
         runner.join(timeout=20.0)
         assert not runner.is_alive()
         assert errors == []
     finally:
+        authorizer.release.set()
         p.stop()
         runner.join(timeout=5.0)
 
@@ -506,6 +531,10 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     assert "waiting::w1" not in p._runtime._temporary_excluded_uids
     assert p._runtime.session.retry_counts.get("waiting::w1", 0) == 0
     assert p._runtime.in_flight.active_handles() == []
+    assert any(
+        "waiting::w1" in running_uids and not attempts
+        for running_uids, attempts in release_observations
+    )
     assert not stopped_marker.exists()
     pending_uids = {
         row["job_uid"]

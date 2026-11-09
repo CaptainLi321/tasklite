@@ -328,6 +328,50 @@ class TestRejectGates:
 class TestPreSubmitCleanupAndActiveSignals:
     """声明式前删与在途信号排空。"""
 
+    def test_authorization_approval_rechecks_all_resources(self, tmp_path, monkeypatch):
+        env = DispatchEnv(tmp_path, capacity=1)
+        env.register("t")
+        target = tmp_path / "out" / "result.txt"
+        target.parent.mkdir()
+        target.write_text("stale", encoding="utf-8")
+
+        def approve_after_consuming_slot(path, target_type):
+            env.resources["__workers__"].acquire(1.0)
+            return True
+
+        env.store.authorizer = approve_after_consuming_slot
+        env.store.state.spawn_jobs([
+            Job(
+                "t",
+                "j1",
+                resources={"__workers__": 1.0},
+                files={
+                    "result": FileSpec(
+                        target,
+                        role="output",
+                        delete_existing=True,
+                    ),
+                },
+            ).to_dict(),
+        ])
+        spawned: list[WorkerLaunchSpec] = []
+        monkeypatch.setattr(
+            env.channel,
+            "spawn",
+            lambda spec: spawned.append(spec) or env.spawn_handle(
+                spec.job.uid, spec.execution_id
+            ),
+        )
+
+        outcome = env.dispatch.dispatch_next()
+
+        assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
+        assert spawned == []
+        assert "t::j1" in env.store.state.queue_uids
+        assert target.read_text(encoding="utf-8") == "stale"
+        assert env.resources["__workers__"].used == 1.0
+        env.resources["__workers__"].release(1.0)
+
     def test_declared_delete_existing_runs_once_before_spawn(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
@@ -461,6 +505,24 @@ class TestDispatchFailureStrike:
         assert "t::j1" not in env.store.state.failed
         records = env.backend.load_attempts("t::j1")
         assert records[-1].outcome == "running"
+
+    def test_worker_start_failure_releases_acquired_slots(self, tmp_path, monkeypatch):
+        env = DispatchEnv(tmp_path, capacity=1)
+        env.register("t")
+        env.store.state.spawn_jobs([
+            Job("t", "j1", resources={"__workers__": 1.0}).to_dict(),
+        ])
+
+        def fail_spawn(spec):
+            raise OSError("process start failed")
+
+        monkeypatch.setattr(env.channel, "spawn", fail_spawn)
+
+        with pytest.raises(OSError, match="process start failed"):
+            env.dispatch.dispatch_next()
+
+        assert env.resources["__workers__"].used == 0.0
+        assert "t::j1" not in env.in_flight
 
 
 class TestGateOrderContract:

@@ -231,6 +231,9 @@ class CompletionMachine:
             and authorization_outcome.status
             in (AuthorizationStatus.DENIED, AuthorizationStatus.STOPPED)
         ):
+            # 不变式：资源释放先于 running 回退事务，Release 回调仍须观察 running。
+            if entry is not None:
+                entry.release_resources(self._resources)
             self._store.apply_pending(
                 job_uid=uid,
                 job_snapshot=job_snapshot,
@@ -249,8 +252,6 @@ class CompletionMachine:
                     },
                 },
             )
-            if entry is not None:
-                entry.release_resources(self._resources)
             if authorization_outcome.status is AuthorizationStatus.DENIED:
                 exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
                 if callable(exclude_fn):

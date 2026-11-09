@@ -501,6 +501,37 @@ def test_mark_running_failure_keeps_file_and_worker_unstarted(tmp_path, monkeypa
     assert row["job_uid"] == "work::one"
     assert row["status"] == "pending"
     assert p.backend.load_settled_attempts("work::one") == []
+    assert p.resources["__workers__"].used == 0.0
+    p.close()
+
+
+def test_worker_start_failure_releases_resources_after_running_commit(
+    tmp_path, monkeypatch,
+):
+    from tasklite.resource import CapacityResource
+
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "started"
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+    capacity = CapacityResource("slot", max_capacity=1.0)
+    p.register_resource(capacity)
+    p.register_task("work", _marker_handler, resources={"slot": 1.0})
+    p.enqueue(Job("work", "one", payload={"marker": str(marker)}))
+
+    with patch.object(
+        p._runtime.channel,
+        "spawn",
+        side_effect=OSError("worker process start failed"),
+    ):
+        with pytest.raises(OSError, match="worker process start failed"):
+            p.run()
+
+    assert not marker.exists()
+    assert capacity.used == 0.0
+    assert p.resources["__workers__"].used == 0.0
+    row, = p.backend.load_queue_jobs(status="running")
+    assert row["job_uid"] == "work::one"
+    assert p.backend.load_settled_attempts("work::one") == []
     p.close()
 
 

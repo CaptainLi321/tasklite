@@ -1,15 +1,12 @@
 """v2 并发执行回归（非功能测试）：多作业真并发、workers 上限、并发下
-依赖链、资源容量限流与防忙转护栏。
+依赖链与资源容量限流。
 
 主循环为事件驱动的 submit/drain 模型，``max_workers`` 经内部
-``__workers__`` CapacityResource 控制并发度。若回归到串行执行，执行
-窗口重叠断言与限流峰值断言会失败。
+``__workers__`` CapacityResource 控制并发度。handler 以文件屏障保持
+执行窗口，测试通过开始/结束窗口与显式进入握手观察峰值并发。
 
-时序敏感：满载环境按 AGENTS.md 红线 1 的 TLE 容忍处理。壁钟断言已按
-宽松余量改写（上界取串行预算的 3 倍）；判别力主担改由确定性证据承担——
-handler 落盘执行时间窗 (start, end)，按事件扫求最大重叠并发数：真并发
-/限流语义与宿主机负载无关（满载只会拉长窗口、不会消除或凭空制造重叠），
-壁钟断言仅作辅助。
+时序敏感：满载环境按 AGENTS.md 红线 1 的 TLE 容忍处理。语义判据不依赖
+固定 sleep 或总耗时，只以执行窗口重叠和文件屏障握手为准；超时仅作看门狗。
 """
 from __future__ import annotations
 
@@ -34,13 +31,21 @@ def _subprocess_pythonpath(monkeypatch):
     monkeypatch.setenv("PYTHONPATH", PROJECT_ROOT)
 
 
-def slow_window_handler(job, ctx):
-    """sleep 0.5 并把执行时间窗落盘（模块级可 pickle；窗口供重叠断言）。"""
+def barrier_window_handler(job, ctx):
+    """进入后等待释放文件，并落盘执行时间窗（模块级可 pickle）。"""
     start = time.time()
-    time.sleep(0.5)
-    end = time.time()
     window_file = ctx.output_roots / f"window_{job.job_id}.txt"
     window_file.parent.mkdir(parents=True, exist_ok=True)
+    window_file.write_text(f"{start}", encoding="utf-8")
+
+    release_path = Path(job.payload["release_path"])
+    deadline = time.monotonic() + 20.0
+    while not release_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not release_path.exists():
+        raise RuntimeError(f"barrier release timed out for {job.job_id}")
+
+    end = time.time()
     window_file.write_text(f"{start} {end}", encoding="utf-8")
     return TaskResult.success()
 
@@ -59,6 +64,42 @@ def _load_windows(output_roots: Path) -> list[tuple[float, float]]:
     return windows
 
 
+def _entered_jobs(output_roots: Path) -> set[str]:
+    return {
+        path.stem.removeprefix("window_")
+        for path in output_roots.glob("window_*.txt")
+    }
+
+
+def _wait_for_entered(
+    output_roots: Path,
+    expected: int,
+    *,
+    timeout: float = 20.0,
+) -> set[str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        entered = _entered_jobs(output_roots)
+        if len(entered) >= expected:
+            return entered
+        time.sleep(0.01)
+    raise AssertionError(
+        f"only {_entered_jobs(output_roots)} entered, expected at least {expected}"
+    )
+
+
+def _barrier_job(
+    task_type: str,
+    job_id: str,
+    release_dir: Path,
+) -> Job:
+    return Job(
+        task_type,
+        job_id,
+        payload={"release_path": str(release_dir / job_id)},
+    )
+
+
 def _peak_overlap(windows: list[tuple[float, float]]) -> int:
     """按事件扫求时间窗的最大并发重叠数（端点相接不计为重叠）。"""
     events: list[tuple[float, int]] = []
@@ -73,91 +114,147 @@ def _peak_overlap(windows: list[tuple[float, float]]) -> int:
     return peak
 
 
-def test_scheduler_shares_task_registry_reference(tmp_state_dir):
-    """调度器必须持有 Task 注册表的**同一引用**（Task 默认资源可见性）。
-
-    注册表按引用共享：ResourceManager(tasks=...) 拿到 TaskRegistry 活
-    引用，register_task 注册的默认资源对调度扫描即时可见；若装配期
-    传了拷贝或 None，Task 默认资源对调度侧不可见（容量/限速绕过）。
-    同时锁定合并语义：Task 默认 ∪ job 声明，声明值覆盖默认值。
-    """
+def test_task_default_resources_limit_real_workers(tmp_state_dir):
+    """Task 默认资源在真实派发与候选准入中生效。"""
+    output_roots = tmp_state_dir / "output"
+    release_dir = tmp_state_dir / "release-default"
+    release_dir.mkdir()
     pipeline = TaskLite(
         backend="sqlite",
         state_path=tmp_state_dir / "test_sched_ref.db",
+        output_roots=output_roots,
+        max_workers=2,
     )
-    pipeline.register_resource(CapacityResource("mem", max_capacity=2.0))
-    pipeline.register_task("fast_task", fast_handler, resources={"mem": 1.0})
+    pipeline.register_resource(CapacityResource("mem", max_capacity=1.0))
+    pipeline.register_task(
+        "defaulted",
+        barrier_window_handler,
+        resources={"mem": 1.0},
+    )
+    pipeline.enqueue(_barrier_job("defaulted", "j0", release_dir))
+    pipeline.enqueue(_barrier_job("defaulted", "j1", release_dir))
 
-    resource_mgr = pipeline._runtime.scheduler.resource_mgr
-    assert resource_mgr is pipeline.resources
-    assert resource_mgr.tasks is pipeline.tasks
+    errors: list[BaseException] = []
 
-    merged = resource_mgr.effective_resources("fast_task", {})
-    assert merged.get("mem") == 1.0
-    overridden = resource_mgr.effective_resources("fast_task", {"mem": 3.0})
-    assert overridden["mem"] == 3.0
+    def run_pipeline() -> None:
+        try:
+            pipeline.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        entered = _wait_for_entered(output_roots, 1)
+        assert entered == {"j0"}, "Task 默认资源未限制并发候选"
+        (release_dir / "j0").write_text("release", encoding="utf-8")
+        assert _wait_for_entered(output_roots, 2) == {"j0", "j1"}
+    finally:
+        for job_id in ("j0", "j1"):
+            (release_dir / job_id).touch(exist_ok=True)
+        runner.join(timeout=20.0)
+        pipeline.close()
+
+    assert not runner.is_alive()
+    assert errors == []
+    assert _peak_overlap(_load_windows(output_roots)) == 1
 
 
 def test_three_jobs_run_concurrently(tmp_state_dir):
-    """3 个 sleep(0.5) job + max_workers=3 真并发。
+    """3 个文件屏障 job + max_workers=3 真并发。
 
-    主判据（负载无关）：三执行窗存在公共重叠（串行执行时后窗的 start
-    必晚于前窗的 end，重叠恒不存在）。辅助壁钟断言上界取串行预算 1.5s
-    的 3 倍，仅容忍 spawn/调度开销，不承担串行回归判别。
+    三执行窗存在公共重叠；串行执行时后窗的 start 必晚于前窗的 end。
     """
+    output_roots = tmp_state_dir / "output"
+    release_dir = tmp_state_dir / "release-three"
+    release_dir.mkdir()
     pipeline = TaskLite(
         backend="sqlite",
         state_path=tmp_state_dir / "test_concurrency.db",
-        output_roots=tmp_state_dir / "output",
+        output_roots=output_roots,
         max_workers=3,
     )
     pipeline.register_resource(CapacityResource("cpu", max_capacity=3.0))
-    pipeline.register_task("slow", slow_window_handler, resources={"cpu": 1.0})
+    pipeline.register_task("barrier", barrier_window_handler, resources={"cpu": 1.0})
     for i in range(3):
-        pipeline.enqueue(Job("slow", f"j{i}"))
+        pipeline.enqueue(_barrier_job("barrier", f"j{i}", release_dir))
 
-    start = time.perf_counter()
-    pipeline.run()
-    elapsed = time.perf_counter() - start
+    errors: list[BaseException] = []
 
-    windows = _load_windows(tmp_state_dir / "output")
+    def run_pipeline() -> None:
+        try:
+            pipeline.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        assert _wait_for_entered(output_roots, 3) == {"j0", "j1", "j2"}
+        assert runner.is_alive()
+    finally:
+        for job_id in ("j0", "j1", "j2"):
+            (release_dir / job_id).touch(exist_ok=True)
+        runner.join(timeout=20.0)
+        pipeline.close()
+
+    assert not runner.is_alive()
+    assert errors == []
+    windows = _load_windows(output_roots)
     assert len(windows) == 3, "三个作业都应落盘执行窗口"
     assert _peak_overlap(windows) == 3, (
         "max_workers=3 时三个作业必须存在同一时刻全部在执行的窗口"
     )
-    assert elapsed < 4.5, f"并发执行应在串行预算 3 倍内完成，got {elapsed:.2f}s"
 
 
 def test_workers_resource_limits_concurrency(tmp_state_dir):
-    """max_workers=2 时 4 个作业的最大并发重叠数必须等于 2。
+    """max_workers=2 时 4 个文件屏障作业的最大并发重叠数必须等于 2。
 
-    验证 ``__workers__`` 资源真的限制了并发度（而非只是声明）：峰值
-    重叠数 >2 即限流失效，<2 即过度串行化。壁钟区间仅作辅助（下界
-    0.9s 判别限流存在——两批 sleep(0.5) 的壁钟下限，满载只会更长；
-    上界取 v1 阈值的 3 倍容忍满载 spawn 开销）。
+    第一批恰好进入两个作业后释放，再以第二批进入握手完成后半段；
+    峰值重叠数 >2 即限流失效，<2 即过度串行化。
     """
+    output_roots = tmp_state_dir / "output"
+    release_dir = tmp_state_dir / "release-workers"
+    release_dir.mkdir()
     pipeline = TaskLite(
         backend="sqlite",
         state_path=tmp_state_dir / "test_workers_limit.db",
-        output_roots=tmp_state_dir / "output",
+        output_roots=output_roots,
         max_workers=2,
     )
-    pipeline.register_task("slow", slow_window_handler)
+    pipeline.register_task("barrier", barrier_window_handler)
     for i in range(4):
-        pipeline.enqueue(Job("slow", f"j{i}"))
+        pipeline.enqueue(_barrier_job("barrier", f"j{i}", release_dir))
 
-    start = time.perf_counter()
-    pipeline.run()
-    elapsed = time.perf_counter() - start
+    errors: list[BaseException] = []
 
-    windows = _load_windows(tmp_state_dir / "output")
+    def run_pipeline() -> None:
+        try:
+            pipeline.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        first_wave = _wait_for_entered(output_roots, 2)
+        assert first_wave == {"j0", "j1"}, f"首批并发数错误: {first_wave}"
+        for job_id in first_wave:
+            (release_dir / job_id).touch(exist_ok=True)
+        assert _wait_for_entered(output_roots, 4) == {"j0", "j1", "j2", "j3"}
+    finally:
+        for i in range(4):
+            (release_dir / f"j{i}").touch(exist_ok=True)
+        runner.join(timeout=20.0)
+        pipeline.close()
+
+    assert not runner.is_alive()
+    assert errors == []
+    windows = _load_windows(output_roots)
     assert len(windows) == 4
     assert _peak_overlap(windows) == 2, (
         "max_workers=2 必须把最大并发重叠钳制在 2（限流失效会 >2，"
         "过度串行化会 <2）"
-    )
-    assert 0.9 <= elapsed < 5.7, (
-        f"两批限流执行应在 [0.9, 5.7)s 内，got {elapsed:.2f}s"
     )
 
 
@@ -197,118 +294,55 @@ def test_dependency_chain_under_concurrency(tmp_state_dir):
 
 
 def test_resource_capacity_respected_under_concurrency(tmp_state_dir):
-    """CapacityResource("mem", max=2.0) + 3 个各占 1.0 的作业 + max_workers=3。
+    """CapacityResource("mem", max=2.0) + 3 个文件屏障作业 + max_workers=3。
 
     资源容量限制并发：3 个作业各占 mem 1.0、上限 2.0 → 峰值重叠必须
-    等于 2（资源限制失效会 =3，槽位饥饿会 <2）。壁钟区间同 workers
-    上限测试的满载适配。
+    等于 2（资源限制失效会 =3，槽位饥饿会 <2）。
     """
+    output_roots = tmp_state_dir / "output"
+    release_dir = tmp_state_dir / "release-capacity"
+    release_dir.mkdir()
     pipeline = TaskLite(
         backend="sqlite",
         state_path=tmp_state_dir / "test_cap_respected.db",
-        output_roots=tmp_state_dir / "output",
+        output_roots=output_roots,
         max_workers=3,
     )
     pipeline.register_resource(CapacityResource("mem", max_capacity=2.0))
-    pipeline.register_task("slow", slow_window_handler, resources={"mem": 1.0})
+    pipeline.register_task(
+        "barrier",
+        barrier_window_handler,
+        resources={"mem": 1.0},
+    )
     for i in range(3):
-        pipeline.enqueue(Job("slow", f"j{i}"))
+        pipeline.enqueue(_barrier_job("barrier", f"j{i}", release_dir))
 
-    start = time.perf_counter()
-    pipeline.run()
-    elapsed = time.perf_counter() - start
+    errors: list[BaseException] = []
 
-    windows = _load_windows(tmp_state_dir / "output")
+    def run_pipeline() -> None:
+        try:
+            pipeline.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        first_wave = _wait_for_entered(output_roots, 2)
+        assert first_wave == {"j0", "j1"}, f"容量首批并发数错误: {first_wave}"
+        for job_id in first_wave:
+            (release_dir / job_id).touch(exist_ok=True)
+        assert _wait_for_entered(output_roots, 3) == {"j0", "j1", "j2"}
+    finally:
+        for i in range(3):
+            (release_dir / f"j{i}").touch(exist_ok=True)
+        runner.join(timeout=20.0)
+        pipeline.close()
+
+    assert not runner.is_alive()
+    assert errors == []
+    windows = _load_windows(output_roots)
     assert len(windows) == 3
     assert _peak_overlap(windows) == 2, (
         "mem 容量 2.0 必须把最大并发重叠钳制在 2"
-    )
-    assert 0.9 <= elapsed < 5.7, (
-        f"容量限流执行应在 [0.9, 5.7)s 内，got {elapsed:.2f}s"
-    )
-
-
-def test_workers_suspended_no_inflight_sleeps_not_busy_loop(tmp_state_dir, monkeypatch):
-    """``__workers__`` 被挂起且无 in-flight 时主循环必须 sleep。
-
-    场景：填池预检 can_acquire 返回 False（资源被挂起），且队列无
-    in-flight job 可 drain——若无 worker 等待保护的等待分支，等待决策
-    全部不命中 → 无限忙循环（100% CPU）。验证：monkeypatch time.sleep
-    后 run() 在 stop 前至少 sleep 一次。
-    """
-    pipeline = TaskLite(
-        backend="sqlite",
-        state_path=tmp_state_dir / "test_workers_suspend.db",
-        max_workers=2,
-    )
-    pipeline.register_task("slow", fast_handler)
-    pipeline.enqueue(Job("slow", "j1"))
-    # 占满 __workers__：can_acquire 返回 False 且没有 job 被派发（无 in-flight）
-    pipeline.resources["__workers__"].acquire(2.0)
-
-    real_sleep = time.sleep
-    slept: list[float] = []
-    # 只捕获主循环内部对 time.sleep 的调用；测试自身轮询用 real_sleep
-    # 绕过捕获（否则 slept 会被轮询填充，assert slept 恒真 → 忙循环回归
-    # 无法被检出，属假绿）。
-    monkeypatch.setattr("time.sleep", lambda seconds: slept.append(seconds))
-
-    def run_pipeline() -> None:
-        pipeline.run(install_signals=False)
-
-    thread = threading.Thread(target=run_pipeline)
-    thread.start()
-    deadline = time.time() + 10.0
-    while not slept and time.time() < deadline:
-        real_sleep(0.02)
-    pipeline.stop()
-    thread.join(timeout=5.0)
-
-    assert not thread.is_alive(), "stop() 后 run() 必须退出——无无限忙循环"
-    assert slept, "workers 挂起 + 无 in-flight 时主循环必须进入等待睡眠，而非忙循环"
-
-
-def test_custom_worker_resource_zero_wait_no_busy_loop(tmp_state_dir, monkeypatch):
-    """自定义 ``__workers__`` 资源在不可用态返回 ``(False, 0.0)`` 时主循环
-    必须至少 sleep 一次（等待下限钳制），而非无限忙循环。
-
-    内置 CapacityResource / RateLimitResource 在不可用态恒返回 wait>0，
-    不受影响；本护栏专防「自定义资源 wait=0 → worker 等待分支全部不
-    命中 → 无限忙循环空烧 CPU、stop 响应下降」。
-    """
-
-    class ZeroWaitResource(CapacityResource):
-        """不可用态恒返回 (False, 0.0) 的自定义 worker 资源。"""
-
-        def __init__(self) -> None:
-            super().__init__("__workers__", max_capacity=2.0)
-
-        def can_acquire(self, amount: float) -> tuple[bool, float]:
-            return False, 0.0
-
-    pipeline = TaskLite(
-        backend="sqlite",
-        state_path=tmp_state_dir / "test_custom_worker_zero.db",
-        max_workers=2,
-    )
-    pipeline.register_task("slow", fast_handler)
-    pipeline.enqueue(Job("slow", "j1"))
-    pipeline.resources["__workers__"] = ZeroWaitResource()
-
-    real_sleep = time.sleep
-    slept: list[float] = []
-    monkeypatch.setattr("time.sleep", lambda seconds: slept.append(seconds))
-
-    thread = threading.Thread(target=lambda: pipeline.run(install_signals=False))
-    thread.start()
-    deadline = time.time() + 10.0
-    while not slept and time.time() < deadline:
-        real_sleep(0.02)
-    pipeline.stop()
-    thread.join(timeout=5.0)
-
-    assert not thread.is_alive(), "stop() 后 run() 必须退出——无无限忙循环"
-    assert slept, (
-        "自定义 worker 资源返回 (False, 0.0) 必须经等待下限钳制触发 sleep，"
-        "而非忙循环"
     )

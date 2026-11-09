@@ -278,6 +278,10 @@ class EngineRuntime:
             or bound_spec.delete_on_success
             or bound_spec.delete_on_failure
         )
+        logger.info(
+            f"FILE DECLARATION: {handle.job_uid} requested "
+            f"{validated_name!r} at {resolved_path}"
+        )
         request = PendingDeclaration(
             request_id=req_id,
             name=validated_name,
@@ -288,6 +292,9 @@ class EngineRuntime:
         if not needs_authorization:
             self._record_declaration(entry, request)
             request.status = AuthorizationStatus.APPROVED
+            logger.info(
+                f"FILE DECLARATION APPROVED: {handle.job_uid} {resolved_path}"
+            )
             return self._declaration_reply(request)
 
         handle.pending_declaration = request
@@ -304,6 +311,18 @@ class EngineRuntime:
             )
         request.bound = request.bound.bind_output_path(validated_path)
         request.resolved_path = validated_path
+        if self._session.stop_mode is not StopMode.NONE:
+            self._finish_authorization(
+                handle,
+                entry,
+                request,
+                AuthorizationStatus.STOPPED,
+                f"authorization wait stopped for {validated_path}",
+            )
+            return None
+        logger.info(
+            f"FILE AUTHORIZATION WAIT: {handle.job_uid} {validated_path}"
+        )
         authorized = self.store.check_or_request_authorization(validated_path)
         if authorized is None:
             return None
@@ -356,6 +375,16 @@ class EngineRuntime:
             or handle.authorization_outcome is not None
         ):
             return None
+        if self._session.stop_mode is not StopMode.NONE:
+            message = f"authorization wait stopped for {request.resolved_path}"
+            self._finish_authorization(
+                handle, entry, request, AuthorizationStatus.STOPPED, message
+            )
+            return {
+                "request_id": request.request_id,
+                "status": "stopped",
+                "error": message,
+            }
         if authorized is False:
             message = f"authorization denied for {request.resolved_path}"
             self._finish_authorization(
@@ -398,6 +427,9 @@ class EngineRuntime:
         handle.pending_declaration = None
         handle.resume_timeout()
         self._record_declaration(entry, request)
+        logger.info(
+            f"FILE AUTHORIZATION APPROVED: {handle.job_uid} {request.resolved_path}"
+        )
         return self._declaration_reply(request)
 
     def _finish_authorization(
@@ -424,6 +456,10 @@ class EngineRuntime:
         )
         handle.resume_timeout()
         self._record_declaration(entry, request)
+        logger.info(
+            f"FILE AUTHORIZATION {status.value.upper()}: "
+            f"{handle.job_uid} {request.resolved_path} ({message})"
+        )
         self.channel.terminate_process(handle)
         return None
 
@@ -849,6 +885,7 @@ class EngineRuntime:
                     break
 
         logger.info(f"Pipeline {self.config.name} finished.")
+        self.channel.wait_for_lingering_workers()
         self._in_flight.clear()
 
     def prepare_run_state(self) -> PipelineState:
