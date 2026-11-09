@@ -40,13 +40,13 @@ from ..utils.ipc import (
     create_worker_pipe,
     create_worker_reply_pipe,
 )
-from .errorclass import _DEFAULT_CLASSIFIER
 from .types import AuthorizationOutcome, JobHandle
 
 logger = logging.getLogger("tasklite")
 
 _KEY_TRACEBACK = "traceback"
 _RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
+_SIGKILL: int | None = getattr(signal, "SIGKILL", None)
 
 
 def _parse_spawned_jobs(raw_spawned_jobs: Any) -> tuple[list[Job], str | None]:
@@ -74,27 +74,6 @@ def _parse_cursor_updates(raw_cursors: Any) -> tuple[dict[str, str | None], str 
         if not (isinstance(key, str) and (value is None or isinstance(value, str))):
             return {}, f"invalid cursor_updates value: {key!r}={value!r}"
     return dict(raw_cursors), None
-
-
-def _parse_resource_suspensions(
-    raw_suspensions: Any,
-) -> tuple[list[tuple[str, float]], str | None]:
-    """解析 resource_suspensions 字段：元素 (str, 数字) 二元组，其余报错。"""
-    if not isinstance(raw_suspensions, list):
-        return [], f"invalid resource_suspensions type: {type(raw_suspensions).__name__}"
-    valid: list[tuple[str, float]] = []
-    for item in raw_suspensions:
-        if (
-            isinstance(item, (list, tuple))
-            and len(item) == 2
-            and isinstance(item[0], str)
-            and isinstance(item[1], (int, float))
-            and not isinstance(item[1], bool)
-        ):
-            valid.append((item[0], float(item[1])))
-        else:
-            return [], f"invalid resource_suspension entry: {item!r}"
-    return valid, None
 
 
 def _validate_exception_dict(raw_exc: Any) -> dict[str, str] | None:
@@ -127,20 +106,19 @@ def _decode_success_branch(
     dict[str, Any],
     list[Job],
     dict[str, str | None],
-    list[tuple[str, float]],
 ]:
-    """success 状态解码：metadata 严格 JSON 对象校验 + 三个子字段防御解析。
+    """success 状态解码：metadata 严格 JSON 对象校验 + 子字段防御解析。
 
-    返回 (success, message, result_metadata, spawned_jobs, cursor_updates, resource_suspensions)；
+    返回 (success, message, result_metadata, spawned_jobs, cursor_updates)；
     任一子段损坏即 success=False、message 携带错误串且 result_metadata 为空字典（不混入框架键）。
     """
     if "metadata" not in res:
         logger.error(f"Corrupt result payload for {job.uid}: missing 'metadata' key")
-        return False, "CORRUPT_RESULT_FILE: missing metadata", {}, [], {}, []
+        return False, "CORRUPT_RESULT_FILE: missing metadata", {}, [], {}
     raw_msg = res.get("message")
     if raw_msg is not None and type(raw_msg) is not str:
         logger.error(f"Corrupt result payload for {job.uid}: invalid 'message' type")
-        return False, "CORRUPT_RESULT_FILE: invalid message type", {}, [], {}, []
+        return False, "CORRUPT_RESULT_FILE: invalid message type", {}, [], {}
     try:
         result_metadata = validate_strict_json_object(
             res["metadata"], field_name="metadata"
@@ -153,72 +131,75 @@ def _decode_success_branch(
             {},
             [],
             {},
-            [],
         )
 
     spawned_jobs, jobs_error = _parse_spawned_jobs(res.get("spawned_jobs", []))
     if jobs_error is not None:
         logger.error(f"Malformed spawned jobs in {job.uid}: {jobs_error}")
-        return False, jobs_error, {}, [], {}, []
+        return False, jobs_error, {}, [], {}
 
     cursor_updates, cursor_error = _parse_cursor_updates(res.get("cursor_updates", {}))
     if cursor_error is not None:
         logger.error(f"Invalid cursor_updates in {job.uid}: {cursor_error}")
-        return False, cursor_error, {}, [], {}, []
-    suspensions, suspension_error = _parse_resource_suspensions(
-        res.get("resource_suspensions", [])
+        return False, cursor_error, {}, [], {}
+    return True, raw_msg, result_metadata, spawned_jobs, cursor_updates
+
+
+def _unexpected_result_fields(res: dict[str, Any], allowed: frozenset[str]) -> list[str]:
+    return sorted(set(res) - allowed)
+
+
+def _corrupt_result(job: Job, reason: str) -> "ExecutionResult":
+    message = f"CORRUPT_RESULT_FILE: {reason}"
+    logger.error(f"Invalid worker result for {job.uid}: {reason}")
+    return ExecutionResult(
+        success=False,
+        message=message,
+        result_metadata={"error_message": message},
     )
-    if suspension_error is not None:
-        logger.error(f"Invalid resource_suspensions in {job.uid}: {suspension_error}")
-        return False, suspension_error, {}, [], {}, []
-    return True, raw_msg, result_metadata, spawned_jobs, cursor_updates, suspensions
 
 
 def _decode_ipc_result(
     res: dict[str, Any],
-    p: Any,
     job: Job,
-    ipc_dir: str | None = None,
-    *,
-    output_roots: Sequence[str | Path] | None = None,
 ) -> "ExecutionResult":
-    """解析子进程通过管道回传的结果字典（防御解析的单一入口）。
+    """解析子进程通过管道回传的显式结果字典。
 
-    损坏/注入形态一律收敛为任务级失败或瞬态重试记账，任何输入都不
-    穿透异常；业务 result_metadata 绝不混入框架保留键；failure 与 retry
-    不发布 spawned_jobs 与 cursor_updates。
+    损坏或未知形态一律收敛为一次任务级失败；进程退出、超时和外部中断
+    不伪造 TaskResult.retry。
     """
-    success = False
-    message: str | None = None
-    result_metadata: dict[str, Any] = {}
-    exception: dict[str, str] | None = None
-    consume_budget = False
-    retry_requested = False
-    retry_error: str | None = None
-    spawned_jobs: list[Job] = []
-    cursor_updates: dict[str, str | None] = {}
-    resource_suspensions: list[tuple[str, float]] = []
-    transient_kind: str | None = None
-    artifact_error: str | None = None
+    if not isinstance(res, dict):
+        return _corrupt_result(job, f"payload must be a dict, got {type(res).__name__}")
 
-    status = res.get("status") if isinstance(res, dict) else None
-    legacy_keys = (
-        {"new_jobs", "error", "raw_result"} & res.keys()
-        if isinstance(res, dict)
-        else set()
-    )
-    if legacy_keys:
-        message = f"CORRUPT_RESULT_FILE: unsupported fields {sorted(legacy_keys)}"
-    elif status == "success":
-        (
-            success,
-            message,
-            result_metadata,
-            spawned_jobs,
-            cursor_updates,
-            resource_suspensions,
-        ) = _decode_success_branch(res, job)
-    elif status == "failure":
+    status = res.get("status")
+    if status == "success":
+        unexpected = _unexpected_result_fields(
+            res,
+            frozenset(
+                {"status", "message", "metadata", "spawned_jobs", "cursor_updates"}
+            ),
+        )
+        if unexpected:
+            return _corrupt_result(job, f"unsupported fields {unexpected}")
+        success, message, result_metadata, spawned_jobs, cursor_updates = (
+            _decode_success_branch(res, job)
+        )
+        if not success:
+            return _corrupt_result(job, str(message).removeprefix("CORRUPT_RESULT_FILE: "))
+        return ExecutionResult(
+            success=True,
+            result_metadata=result_metadata,
+            message=message,
+            spawned_jobs=spawned_jobs,
+            cursor_updates=cursor_updates,
+        )
+
+    if status == "failure":
+        unexpected = _unexpected_result_fields(
+            res, frozenset({"status", "message", "metadata", "exception"})
+        )
+        if unexpected:
+            return _corrupt_result(job, f"unsupported fields {unexpected}")
         try:
             raw_msg = res.get("message")
             if raw_msg is not None and type(raw_msg) is not str:
@@ -227,99 +208,55 @@ def _decode_ipc_result(
                 res.get("metadata", {}), field_name="metadata"
             )
             exception = _validate_exception_dict(res.get("exception"))
-            suspensions, suspension_error = _parse_resource_suspensions(
-                res.get("resource_suspensions", [])
+            return ExecutionResult(
+                success=False,
+                result_metadata=result_metadata,
+                message=raw_msg,
+                exception=exception,
             )
-            if suspension_error is not None:
-                raise ValueError(suspension_error)
-            message = raw_msg
-            resource_suspensions = suspensions
         except Exception as e:
-            message = f"CORRUPT_RESULT_FILE: invalid failure payload: {e}"
-            result_metadata = {}
-            exception = None
-            resource_suspensions = []
-    elif status == "retry":
+            return _corrupt_result(job, f"invalid failure payload: {e}")
+
+    if status == "retry":
+        unexpected = _unexpected_result_fields(
+            res, frozenset({"status", "message", "metadata", "consume_budget"})
+        )
+        if unexpected:
+            return _corrupt_result(job, f"unsupported fields {unexpected}")
         try:
             raw_msg = res.get("message")
-            if raw_msg is None and isinstance(res.get("error_message"), str):
-                raw_msg = res["error_message"]
             if raw_msg is not None and type(raw_msg) is not str:
                 raise TypeError("message must be str or None")
             result_metadata = validate_strict_json_object(
                 res.get("metadata", {}), field_name="metadata"
             )
-            raw_consume = res.get("consume_budget", True)
+            raw_consume = res.get("consume_budget")
             if type(raw_consume) is not bool:
                 raise TypeError("consume_budget must be bool")
-            suspensions, suspension_error = _parse_resource_suspensions(
-                res.get("resource_suspensions", [])
+            return ExecutionResult(
+                success=False,
+                result_metadata=result_metadata,
+                message=raw_msg,
+                consume_budget=raw_consume,
+                retry_requested=True,
             )
-            if suspension_error is not None:
-                raise ValueError(suspension_error)
-            kind = res.get("transient_kind")
-            transient_kind = kind if isinstance(kind, str) else None
-            retry_requested = True
-            message = raw_msg
-            retry_error = raw_msg
-            consume_budget = False if transient_kind is not None else raw_consume
-            resource_suspensions = suspensions
         except Exception as e:
-            retry_requested = False
-            message = f"CORRUPT_RESULT_FILE: invalid retry payload: {e}"
-            result_metadata = {}
-            consume_budget = False
-            resource_suspensions = []
-    elif status == "interrupted":
-        retry_requested = True
-        raw_msg = (
-            res.get("message")
-            if isinstance(res.get("message"), str)
-            else res.get("error_message")
-        )
-        message = str(raw_msg) if raw_msg is not None else None
-        retry_error = message
-        transient_kind = "interrupted"
-        consume_budget = False
-        suspensions, suspension_error = _parse_resource_suspensions(
-            res.get("resource_suspensions", [])
-        )
-        if suspension_error is None:
-            resource_suspensions = suspensions
-    elif status == "artifact_error":
-        artifact_error = str(
-            res.get("error_message")
-            or res.get("message")
-            or "Artifact declaration I/O failed"
-        )
-    elif status is not None:
-        message = f"CORRUPT_RESULT_FILE: unknown status {status!r}"
-        logger.error(f"Worker returned unknown status for {job.uid}: {status!r}")
-    else:
-        att = _DEFAULT_CLASSIFIER.classify_process_death(
-            getattr(p, "exitcode", None), timed_out=False
-        )
-        raw_att_msg = att.result_metadata.get("error_message")
-        message = str(raw_att_msg) if raw_att_msg is not None else None
-        result_metadata = dict(att.result_metadata)
-        retry_error = att.retry_error
-        retry_requested = att.retry_requested
-        consume_budget = bool(retry_requested)
+            return _corrupt_result(job, f"invalid retry payload: {e}")
 
-    return ExecutionResult(
-        success=success,
-        result_metadata=result_metadata,
-        message=message,
-        exception=exception,
-        consume_budget=consume_budget,
-        retry_requested=retry_requested,
-        retry_error=retry_error,
-        spawned_jobs=spawned_jobs,
-        cursor_updates=cursor_updates,
-        resource_suspensions=resource_suspensions,
-        transient_kind=transient_kind,
-        artifact_error=artifact_error,
-    )
+    if status == "artifact_error":
+        unexpected = _unexpected_result_fields(
+            res, frozenset({"status", "error_message"})
+        )
+        if unexpected:
+            return _corrupt_result(job, f"unsupported fields {unexpected}")
+        raw_error = res.get("error_message")
+        if type(raw_error) is not str or not raw_error:
+            return _corrupt_result(job, "artifact_error requires a non-empty error_message")
+        return ExecutionResult(success=False, artifact_error=raw_error)
+
+    if status is None:
+        return _corrupt_result(job, "missing status")
+    return _corrupt_result(job, f"unknown status {status!r}")
 
 
 def _isolate_worker_process_signals() -> None:
@@ -377,7 +314,6 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
                         "message": raw_result.message,
                         "metadata": raw_result.metadata,
                         "spawned_jobs": [j.to_dict() for j in ctx.spawned_jobs],
-                        "resource_suspensions": list(ctx.resource_suspensions),
                         "cursor_updates": dict(ctx.cursor_updates),
                     })
                 elif raw_result.status == "failure":
@@ -386,7 +322,6 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
                         "message": raw_result.message,
                         "metadata": raw_result.metadata,
                         "exception": None,
-                        "resource_suspensions": list(ctx.resource_suspensions),
                     })
                 else:
                     _write_result({
@@ -394,7 +329,6 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
                         "message": raw_result.message,
                         "metadata": raw_result.metadata,
                         "consume_budget": raw_result.consume_budget,
-                        "resource_suspensions": list(ctx.resource_suspensions),
                     })
             else:
                 _write_result({
@@ -405,39 +339,22 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
                     ),
                     "metadata": {},
                     "exception": None,
-                    "resource_suspensions": list(ctx.resource_suspensions),
                 })
         except _ArtifactIOError as e:
             _write_result({"status": "artifact_error", "error_message": str(e)})
-        except Exception as e:
+        except BaseException as e:
             _write_result({
                 "status": "failure",
-                "message": f"{type(e).__name__}: {e}",
+                "message": (
+                    type(e).__name__ if not str(e)
+                    else f"{type(e).__name__}: {e}"
+                ),
                 "metadata": {},
                 "exception": {
                     "type": type(e).__name__,
                     "message": str(e),
                     "traceback": traceback.format_exc(),
                 },
-                "resource_suspensions": list(ctx.resource_suspensions),
-            })
-        except KeyboardInterrupt as e:
-            _write_result({
-                "status": "interrupted",
-                "error_message": f"WORKER_INTERRUPTED: {type(e).__name__}",
-                "resource_suspensions": list(ctx.resource_suspensions),
-            })
-        except SystemExit as e:
-            _write_result({
-                "status": "failure",
-                "message": f"SystemExit: {e}",
-                "metadata": {},
-                "exception": {
-                    "type": type(e).__name__,
-                    "message": str(e),
-                    "traceback": traceback.format_exc(),
-                },
-                "resource_suspensions": list(ctx.resource_suspensions),
             })
     finally:
         if pipe_sender is not None:
@@ -456,11 +373,8 @@ class ExecutionResult:
     exception: dict[str, str] | None = None
     consume_budget: bool = True
     retry_requested: bool = False
-    retry_error: str | None = None
     spawned_jobs: list[Job] = field(default_factory=list)
     cursor_updates: dict[str, str | None] = field(default_factory=dict)
-    resource_suspensions: list[tuple[str, float]] = field(default_factory=list)
-    transient_kind: str | None = None
     will_retry: bool = False
     artifact_error: str | None = None
     authorization_outcome: AuthorizationOutcome | None = None
@@ -473,11 +387,9 @@ class ExecutionResult:
 
     @property
     def error(self) -> str:
-        """结果说明/错误消息（优先取 message，回退 retry_error 或内部 error_message）。"""
+        """结果说明或错误消息。"""
         if self.message is not None:
             return self.message
-        if self.retry_error is not None:
-            return self.retry_error
         raw = self.result_metadata.get("error_message")
         return str(raw) if raw is not None else ""
 
@@ -706,7 +618,7 @@ class ExecutionChannel:
                 raise ValueError(f"invalid result payload for {handle.job_uid}")
             exec_id = handle.execution_id or ""
             if exec_id not in self._errors:
-                self._results[exec_id] = msg.payload
+                self._results.setdefault(exec_id, msg.payload)
 
     def _process_pipe_item(
         self, handle: JobHandle, item: WorkerPipeMessage | Exception
@@ -718,14 +630,14 @@ class ExecutionChannel:
             )
             return
         if isinstance(item, Exception):
-            self._errors.setdefault(exec_id, item)
-            self._results.pop(exec_id, None)
+            if exec_id not in self._results:
+                self._errors.setdefault(exec_id, item)
             return
         try:
             self._accept_message(handle, item)
         except Exception as exc:
-            self._errors.setdefault(exec_id, exc)
-            self._results.pop(exec_id, None)
+            if exec_id not in self._results:
+                self._errors.setdefault(exec_id, exc)
 
     def _receive_available(self, handle: JobHandle) -> None:
         """非阻塞拉取 handle 对应接收端当前已入队的全部消息。"""
@@ -799,9 +711,7 @@ class ExecutionChannel:
         if reply_sender is not None:
             reply_sender.close()
 
-    def _salvage_signals(
-        self, job_uid: str, decoded: ExecutionResult | None
-    ) -> list[tuple[str, float]]:
+    def _salvage_signals(self, job_uid: str) -> list[tuple[str, float]]:
         """提取该 job_uid 已收取但尚未被上层排空的挂起信号。"""
         pending: list[tuple[str, float]] = []
         remaining: list[tuple[str, str, float]] = []
@@ -811,35 +721,22 @@ class ExecutionChannel:
             else:
                 remaining.append((u, r_name, secs))
         self._pending_signals = remaining
-        if decoded is not None and pending:
-            decoded.resource_suspensions = (
-                list(decoded.resource_suspensions) + list(pending)
-            )
         return pending
 
     def _consume_result_if_present(self, handle: JobHandle) -> ExecutionResult | None:
         """读取已收到的结果负载 → 守卫过滤 → 解码 → 信号并入。
 
-        守卫契约：结果须为带 status 键的 dict 且非 interrupted 报告——
-        worker 报告被中断的结果按「未完成」处理（重入队），不作为终态。
+        守卫契约：任何字典结果都是一次尝试结果；内容损坏由解码器收敛为失败。
         """
         exec_id = getattr(handle, "execution_id", None)
         if not exec_id or exec_id in self._errors:
             return None
         raw_res = self._results.get(exec_id)
-        if not (
-            raw_res is not None
-            and isinstance(raw_res, dict)
-            and "status" in raw_res
-            and raw_res.get("status") != "interrupted"
-        ):
+        if not isinstance(raw_res, dict):
             return None
         self._results.pop(exec_id, None)
-        decoded = _decode_ipc_result(
-            raw_res, None, handle.job, self.ipc_dir,
-            output_roots=getattr(self, "output_roots", None),
-        )
-        self._salvage_signals(handle.job_uid, decoded)
+        decoded = _decode_ipc_result(raw_res, handle.job)
+        self._salvage_signals(handle.job_uid)
         return decoded
 
     def _reap_lingering_workers(self) -> None:
@@ -943,11 +840,8 @@ class ExecutionChannel:
             # 1. 有效结果已到达：立即收割结果，不阻塞等待子进程退出
             if exec_id in self._results:
                 raw_res = self._results.pop(exec_id)
-                decoded = _decode_ipc_result(
-                    raw_res, p, handle.job, handle.ipc_dir,
-                    output_roots=getattr(self, "output_roots", None),
-                )
-                self._salvage_signals(handle.job_uid, decoded)
+                decoded = _decode_ipc_result(raw_res, handle.job)
+                self._salvage_signals(handle.job_uid)
                 self._handles.pop(exec_id, None)
                 receiver = self._receivers.pop(exec_id, None)
                 self._errors.pop(exec_id, None)
@@ -989,11 +883,8 @@ class ExecutionChannel:
                         p.kill()
                     except Exception:
                         pass
-                    is_timeout = True
-                else:
-                    is_timeout = False
                 completed.append(
-                    (handle, self._collect_outcome(handle, is_timeout=is_timeout))
+                    (handle, self._collect_outcome(handle, is_timeout=True))
                 )
 
         return completed
@@ -1030,16 +921,13 @@ class ExecutionChannel:
                 self._results.pop(exec_id, None)
                 raise err
             payload = res if res is not None else self._results.pop(exec_id, None)
-            if payload is not None:
-                result = _decode_ipc_result(
-                    payload, p, handle.job, handle.ipc_dir,
-                    output_roots=getattr(self, "output_roots", None),
-                )
+            if payload is not None and not is_timeout:
+                result = _decode_ipc_result(payload, handle.job)
             else:
                 result = self._build_terminal_failure(p, handle, is_timeout=is_timeout)
         finally:
             self._finalize_process(p)
-            pending_signals = self._salvage_signals(handle.job_uid, result)
+            pending_signals = self._salvage_signals(handle.job_uid)
             if pending_signals:
                 logger.info(
                     f"Salvaged {len(pending_signals)} suspend signal(s) "
@@ -1054,23 +942,33 @@ class ExecutionChannel:
     def _build_terminal_failure(
         p: Any, handle: JobHandle, *, is_timeout: bool
     ) -> ExecutionResult:
-        """构造进程终止（崩溃/超时）但无结果消息时的 ExecutionResult。"""
-        att = _DEFAULT_CLASSIFIER.classify_process_death(
-            p.exitcode,
-            timed_out=is_timeout,
-            timeout_seconds=handle.timeout_seconds,
-            timeout_is_transient=getattr(handle.job, "timeout_is_transient", False),
-        )
-        if att.retry_requested and "signal" in att.result_metadata:
-            logger.warning(
-                f"Worker for {handle.job_uid} died by {att.result_metadata['signal']}; "
-                f"will retry (requeue pacing is owned by RequeuePolicy)"
-            )
+        """构造进程终止（崩溃/超时）但无有效结果时的失败证据。"""
+        exitcode = getattr(p, "exitcode", None)
+        metadata: dict[str, Any] = {}
+        if is_timeout:
+            message = f"TIMEOUT ({handle.timeout_seconds}s)"
+            metadata["timed_out"] = True
+        elif isinstance(exitcode, int) and not isinstance(exitcode, bool) and exitcode < 0:
+            try:
+                signal_name = signal.Signals(-exitcode).name
+            except (ValueError, AttributeError):
+                signal_name = f"SIGNO{-exitcode}"
+            message = f"PROCESS_SIGNAL_DEATH: killed by {signal_name} ({exitcode})"
+            metadata.update({
+                "signal": signal_name,
+                "oom_hint": _SIGKILL is not None and -exitcode == _SIGKILL,
+            })
+        elif isinstance(exitcode, int) and not isinstance(exitcode, bool) and exitcode > 0:
+            message = f"PROCESS_CRASH_EXITCODE_{exitcode}"
+        else:
+            message = "NO_IPC_RESULT: worker exited without a result frame"
+        metadata["error_message"] = message
+        if isinstance(exitcode, int) and not isinstance(exitcode, bool):
+            metadata["exitcode"] = exitcode
         return ExecutionResult(
             success=False,
-            result_metadata=att.result_metadata,
-            retry_requested=att.retry_requested,
-            retry_error=att.retry_error,
+            result_metadata=metadata,
+            message=message,
         )
 
     def drain_active_signals(self, uids: Iterable[str]) -> list[tuple[str, str, float]]:
@@ -1114,7 +1012,7 @@ class ExecutionChannel:
 
         for handle, decoded in done_pairs:
             self._drain_finished(handle)
-            self._salvage_signals(handle.job_uid, decoded)
+            self._salvage_signals(handle.job_uid)
             exec_id = handle.execution_id or ""
             self._close_handle_pipe(exec_id)
             self._handles.pop(exec_id, None)
@@ -1131,7 +1029,7 @@ class ExecutionChannel:
             else:
                 salvaged.extend(
                     (handle.job_uid, r_name, secs)
-                    for r_name, secs in self._salvage_signals(handle.job_uid, None)
+                    for r_name, secs in self._salvage_signals(handle.job_uid)
                 )
                 truly_cancelled.append(handle)
             exec_id = handle.execution_id or ""
@@ -1165,7 +1063,7 @@ class ExecutionChannel:
                 self._handles.pop(exec_id, None)
                 self._results.pop(exec_id, None)
                 self._errors.pop(exec_id, None)
-                self._salvage_signals(handle.job_uid, None)
+                self._salvage_signals(handle.job_uid)
             except Exception as e:
                 logger.error(f"Error cleaning up in-flight job {handle.job_uid}: {e}")
 

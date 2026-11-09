@@ -114,7 +114,9 @@ class _FinishOnKillProcess:
         self.killed = True
         self._channel._results[self._execution_id] = {
             "status": "success",
-            "raw_result": {"done": 1},
+            "metadata": {"done": 1},
+            "spawned_jobs": [],
+            "cursor_updates": {},
         }
         self._channel._pending_signals.append((self._uid, "api", 5.0))
 
@@ -153,8 +155,10 @@ class TestAbortInFlight:
             ),
         }
         channel._results[_INCARNATION] = {
-            "status": "success", "raw_result": True,
-            "spawned_jobs": [], "resource_suspensions": [], "cursor_updates": {},
+            "status": "success",
+            "metadata": {},
+            "spawned_jobs": [],
+            "cursor_updates": {},
         }
         process = _DoneProcess()
         handle = JobHandle(
@@ -201,9 +205,8 @@ class TestAbortInFlight:
             "kill 窗口内到达的结果必须被重探测消费（不删结果、不取消）"
         )
         assert cancelled == []
-        assert done[0][1].resource_suspensions == [("api", 5.0)], (
-            "终前写入的挂起信号并入结果（随完成提交链应用）"
-        )
+        assert done[0][1].success is True
+        assert channel._pending_signals == []
 
     def test_abort_releases_resources_before_settlement(self, tmp_path):
         """已占用资源在结算前统一释放（防泄漏）。"""

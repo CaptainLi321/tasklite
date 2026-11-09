@@ -808,113 +808,95 @@ def classifier():
 
 
 class TestDeathAttributionTable:
-    """classify_process_death 决策表的完备性表驱动测试。
+    """进程死亡证据表：任何退出路径都不推导隐式重试。"""
 
-    锁定不变式：
-    1. exitcode × timed_out × timeout_is_transient 全组合的 meta 形状 /
-       错误串 / 瞬态语义 / error_category；
-    2. 决策表产出的错误串族必须被 _classify_string 映射消费（死亡串不落
-       unknown）；
-    3. 瞬态军规：环境死亡烧预算（retry_requested=True）、非瞬态超时终局。
-    """
-
-    def test_transient_timeout_retries_without_meta(self, classifier):
+    def test_timeout_is_terminal_failure(self, classifier):
         att = classifier.classify_process_death(
-            None, timed_out=True, timeout_seconds=5.0, timeout_is_transient=True
-        )
-        assert att.retry_requested is True
-        assert att.result_metadata == {}
-        assert att.retry_error == f"{ERR_TIMEOUT_PREFIX}5.0s)"
-        assert att.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
-
-    def test_non_transient_timeout_is_terminal_fatal(self, classifier):
-        att = classifier.classify_process_death(
-            None, timed_out=True, timeout_seconds=3.0, timeout_is_transient=False
+            None, timed_out=True, timeout_seconds=3.0
         )
         assert att.retry_requested is False
-        assert att.result_metadata == {"error_message": f"{ERR_TIMEOUT_PREFIX}3.0s)"}
+        assert att.result_metadata == {
+            "error_message": f"{ERR_TIMEOUT_PREFIX}3.0s)",
+            "timed_out": True,
+        }
         assert att.retry_error is None
-        assert att.error_category == ErrorCategory.FATAL.value
+        assert att.error_category == ErrorCategory.UNKNOWN.value
 
     @pytest.mark.parametrize("code", [-9, -11, -15])
     def test_negative_exitcode_is_signal_death(self, classifier, code):
-        att = classifier.classify_process_death(
-            code, timed_out=False, timeout_is_transient=False
-        )
-        assert att.retry_requested is True
-        assert att.result_metadata["error_message"] == f"{ERR_PROCESS_CRASH_PREFIX}{code}"
+        att = classifier.classify_process_death(code, timed_out=False)
+        assert att.retry_requested is False
+        assert att.result_metadata["error_message"].startswith(ERR_PROCESS_SIGNAL_DEATH)
         assert "signal" in att.result_metadata
+        assert att.result_metadata["exitcode"] == code
         # oom_hint 只在平台提供 SIGKILL 时可能为真（Windows 无该常量，
         # 强杀经 proc.kill()/TerminateProcess 完成，不命中 OOM 启发式）
         assert att.result_metadata["oom_hint"] is (
             code == -9 and hasattr(signal, "SIGKILL")
         )
-        assert att.retry_error.startswith(ERR_PROCESS_SIGNAL_DEATH)
-        assert att.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
+        assert att.retry_error is None
+        assert att.error_category == ErrorCategory.UNKNOWN.value
 
     def test_signal_name_resolved_for_known_signal(self, classifier):
-        att = classifier.classify_process_death(
-            -9, timed_out=False, timeout_is_transient=False
-        )
+        att = classifier.classify_process_death(-9, timed_out=False)
         # POSIX 解析为 SIGKILL；Windows 无 9 号信号，按 SIGNO9 回退
         expected = "SIGKILL" if hasattr(signal, "SIGKILL") else "SIGNO9"
         assert att.result_metadata["signal"] == expected
 
     def test_unknown_signal_number_falls_back_to_signo(self, classifier):
-        att = classifier.classify_process_death(
-            -99, timed_out=False, timeout_is_transient=False
-        )
+        att = classifier.classify_process_death(-99, timed_out=False)
         assert att.result_metadata["signal"] == "SIGNO99"
 
     @pytest.mark.parametrize("code", [1, 2, 42])
     def test_positive_exitcode_is_env_crash(self, classifier, code):
-        att = classifier.classify_process_death(
-            code, timed_out=False, timeout_is_transient=False
-        )
-        assert att.retry_requested is True
-        assert att.result_metadata == {"error_message": f"{ERR_PROCESS_CRASH_PREFIX}{code}"}
+        att = classifier.classify_process_death(code, timed_out=False)
+        assert att.retry_requested is False
+        assert att.result_metadata == {
+            "error_message": f"{ERR_PROCESS_CRASH_PREFIX}{code}",
+            "exitcode": code,
+        }
         assert "signal" not in att.result_metadata
         assert "oom_hint" not in att.result_metadata
-        assert att.retry_error == f"PROCESS_CRASH_EXIT: worker exited with code {code}"
-        assert att.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
+        assert att.retry_error is None
+        assert att.error_category == ErrorCategory.UNKNOWN.value
 
     @pytest.mark.parametrize("code", [None, 0])
     def test_zero_or_missing_exitcode_is_no_ipc_result(self, classifier, code):
-        att = classifier.classify_process_death(
-            code, timed_out=False, timeout_is_transient=False
-        )
-        assert att.retry_requested is True
-        assert att.result_metadata == {"error_message": ERR_NO_IPC_RESULT}
-        assert att.retry_error == (
-            f"{ERR_NO_IPC_RESULT}: worker exited without writing a result file"
-        )
-        assert att.error_category == ErrorCategory.TRANSIENT_EXHAUSTED.value
+        att = classifier.classify_process_death(code, timed_out=False)
+        assert att.retry_requested is False
+        expected = {"error_message": ERR_NO_IPC_RESULT}
+        if code == 0:
+            expected["exitcode"] = 0
+        assert att.result_metadata == expected
+        assert att.retry_error is None
+        assert att.error_category == ErrorCategory.UNKNOWN.value
 
     def test_timed_out_takes_priority_over_exitcode(self, classifier):
         """timed_out 优先裁决：超时窗口内被看门狗 kill（exitcode=-9）仍按
         超时归因，不落入信号死亡分支。"""
         att = classifier.classify_process_death(
-            -9, timed_out=True, timeout_seconds=2.0, timeout_is_transient=True
+            -9, timed_out=True, timeout_seconds=2.0
         )
-        assert att.retry_requested is True
-        assert att.retry_error == f"{ERR_TIMEOUT_PREFIX}2.0s)"
+        assert att.retry_requested is False
+        assert att.result_metadata["error_message"] == f"{ERR_TIMEOUT_PREFIX}2.0s)"
+        assert att.result_metadata["exitcode"] == -9
 
 
 class TestDeathStringClassification:
-    """决策表产出的串族必须经 classify/档案分类链得到非 unknown 分类。"""
+    """进程死亡串不再映射为可重试错误分类。"""
 
     @pytest.mark.parametrize(
         "error_str, expected_type",
         [
-            (f"{ERR_TIMEOUT_PREFIX}5s)", ErrorCategory.FATAL.value),
+            (f"{ERR_TIMEOUT_PREFIX}5s)", ErrorCategory.UNKNOWN.value),
             (
                 f"{ERR_PROCESS_CRASH_PREFIX}-9",
-                ErrorCategory.TRANSIENT_EXHAUSTED.value,
+                ErrorCategory.UNKNOWN.value,
             ),
-            (ERR_NO_IPC_RESULT, ErrorCategory.TRANSIENT_EXHAUSTED.value),
+            (ERR_NO_IPC_RESULT, ErrorCategory.UNKNOWN.value),
             (
                 f"{ERR_PROCESS_SIGNAL_DEATH}: killed by SIGKILL (-9)",
-                ErrorCategory.TRANSIENT_EXHAUSTED.value,
+                ErrorCategory.UNKNOWN.value,
             ),
         ],
     )
@@ -926,19 +908,17 @@ class TestDeathStringClassification:
     def test_arbitrary_business_string_still_unknown(self, classifier):
         assert classify_error_category({"error_message": "some handler message"}) == "unknown"
 
-    def test_timeout_string_marks_fatal(self, classifier):
+    def test_timeout_string_is_not_classified_retryable(self, classifier):
         cl = classifier.classify({"error_message": f"{ERR_TIMEOUT_PREFIX}5s)"})
-        assert cl.is_fatal is True
-        assert cl.category == ErrorCategory.FATAL
+        assert cl.is_fatal is False
+        assert cl.is_retry is False
+        assert cl.category == ErrorCategory.UNKNOWN
 
     def test_decision_table_rows_carry_consistent_failed_types(self, classifier):
         """决策表每行的 error_category 与其错误串的分类结论一致——两表同源。"""
         rows = [
             classifier.classify_process_death(
-                None, timed_out=True, timeout_seconds=1.0, timeout_is_transient=True
-            ),
-            classifier.classify_process_death(
-                None, timed_out=True, timeout_seconds=1.0, timeout_is_transient=False
+                None, timed_out=True, timeout_seconds=1.0
             ),
             classifier.classify_process_death(-9, timed_out=False),
             classifier.classify_process_death(1, timed_out=False),

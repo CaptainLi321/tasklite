@@ -222,38 +222,6 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
     assert all(row.outcome == "succeeded" for row in records)
 
 
-def transient_once(job, ctx):
-    marker = ctx.output_roots / "transient_seen"
-    if not marker.exists():
-        marker.write_text("seen", encoding="utf-8")
-        if job.payload["kind"] == "interrupted":
-            raise KeyboardInterrupt()
-        return TaskResult.retry(message="zero budget in worker", consume_budget=False)
-    return TaskResult.success(metadata={
-        "runtime": job.runtime.to_dict(), "pid": os.getpid(),
-    })
-
-
-@pytest.mark.parametrize("kind", ["interrupted"])
-def test_transient_first_attempt_rechecks_trigger_without_budget_or_archive_pollution(tmp_path, kind):
-    pipeline = _pipeline(tmp_path)
-    evaluated = []
-    pipeline.register_trigger("observe", lambda ctx: evaluated.append(
-        (ctx.job.attempt_no, ctx.has_failed, ctx.has_succeeded)) or True)
-    pipeline.register_task("transient", transient_once, max_retries_per_run=0, trigger="observe")
-    pipeline.enqueue(Job("transient", "item", payload={"kind": kind}))
-    res = pipeline.run()
-    pipeline.stop()
-    assert res is None
-    assert evaluated == [(1, False, False), (1, False, False)]
-    assert pipeline.backend.load_failed() == {}
-    metadata = pipeline.backend.load_successes()["transient::item"]
-    assert metadata["runtime"] == {}
-    assert metadata["pid"] != os.getpid()
-    records = pipeline.backend.load_attempts("transient::item")
-    assert [(row.attempt_no, row.outcome) for row in records] == [(1, "requeued"), (2, "succeeded")]
-
-
 def discover_page(job, ctx, page):
     with (ctx.output_roots / "scan_calls").open("a", encoding="utf-8") as stream:
         stream.write(f"{page}:{os.getpid()}\n")

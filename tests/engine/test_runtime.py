@@ -56,7 +56,6 @@ def _write_success_result(spec) -> None:
             "status": "success",
             "metadata": {},
             "spawned_jobs": [],
-            "resource_suspensions": [],
             "cursor_updates": {},
         }
     )

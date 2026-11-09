@@ -89,17 +89,28 @@ def test_attempt_rejects_old_fields(legacy):
         AttemptRecord.from_dict(data)
 
 
-@pytest.mark.parametrize("legacy", ["new_jobs", "error"])
-@pytest.mark.parametrize("status", ["success", "retry", "interrupted", "fatal", "error"])
-def test_worker_rejects_old_envelope_fields(legacy, status):
-    from types import SimpleNamespace
+@pytest.mark.parametrize("unsupported", ["new_jobs", "error"])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "status": "success",
+            "metadata": {},
+            "spawned_jobs": [],
+            "cursor_updates": {},
+        },
+        {"status": "failure", "metadata": {}},
+        {"status": "retry", "metadata": {}, "consume_budget": True},
+    ],
+)
+def test_worker_rejects_unsupported_envelope_fields(unsupported, payload):
     from tasklite.engine.channel import _decode_ipc_result
 
     result = _decode_ipc_result(
-        {"status": status, "raw_result": True, legacy: [], "spawned_jobs": []},
-        SimpleNamespace(exitcode=0), Job("t", "j"),
+        dict(payload, **{unsupported: []}),
+        Job("t", "j"),
     )
     assert not result.success
     assert not result.retry_requested
     assert "CORRUPT_RESULT_FILE" in (result.message or "")
-    assert legacy in (result.message or "")
+    assert unsupported in (result.message or "")

@@ -169,13 +169,7 @@ class ErrorClassification:
 
 @dataclass(frozen=True)
 class DeathAttribution:
-    """子进程死亡归因决策表的行值（不可变）。
-
-    classify_process_death 是「exitcode × 超时 × timeout_is_transient →
-    瞬态/终局、result_metadata、retry_error、error_category」的单一裁决点；
-    收割路径（有结果文件解码、无结果文件终局构造、stale 认领）对同一
-    根因必须经本表得到相同形状。
-    """
+    """子进程死亡证据的不可变描述。"""
 
     retry_requested: bool
     result_metadata: dict[str, Any]
@@ -387,60 +381,35 @@ class ErrorClassifier:
         *,
         timed_out: bool,
         timeout_seconds: float = 0.0,
-        timeout_is_transient: bool = False,
     ) -> DeathAttribution:
-        """子进程死亡归因决策表（Never-Raise 契约）。
-
-        收割侧的唯一裁决点：有结果文件解码路径与无结果文件终局构造路径
-        对同一 exitcode 必须得到相同的 meta 形状与错误串。决策列：
-
-        - timed_out ∧ timeout_is_transient → 瞬态重试（meta 留空，仅 retry_error）
-        - timed_out ∧ ¬timeout_is_transient → 终局（失败档案落 fatal 型）
-        - exitcode < 0 → 信号死亡（signal/oom_hint 结构化键，烧预算瞬态）
-        - exitcode > 0 → 解释器/导入段崩溃（烧预算瞬态）
-        - exitcode ∈ {None, 0} → 无结果文件（烧预算瞬态）
-        """
+        """把超时与实际退出码收敛为失败证据，不推导隐式重试。"""
+        metadata: dict[str, Any] = {}
         if timed_out:
-            if timeout_is_transient:
-                return DeathAttribution(
-                    retry_requested=True,
-                    result_metadata={},
-                    retry_error=f"{ERR_TIMEOUT_PREFIX}{timeout_seconds}s)",
-                    error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
-                )
-            return DeathAttribution(
-                retry_requested=False,
-                result_metadata={"error_message": f"{ERR_TIMEOUT_PREFIX}{timeout_seconds}s)"},
-                retry_error=None,
-                error_category=ErrorCategory.FATAL.value,
-            )
-        if exitcode is not None and exitcode < 0:
+            metadata.update({
+                "error_message": f"{ERR_TIMEOUT_PREFIX}{timeout_seconds}s)",
+                "timed_out": True,
+            })
+        elif exitcode is not None and exitcode < 0:
             try:
                 sig_name = signal.Signals(-exitcode).name
             except (ValueError, AttributeError):
                 sig_name = f"SIGNO{-exitcode}"
-            return DeathAttribution(
-                retry_requested=True,
-                result_metadata={
-                    "error_message": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}",
-                    "signal": sig_name,
-                    "oom_hint": _SIGKILL is not None and -exitcode == _SIGKILL,
-                },
-                retry_error=f"{ERR_PROCESS_SIGNAL_DEATH}: killed by {sig_name} ({exitcode})",
-                error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
-            )
-        if exitcode:
-            return DeathAttribution(
-                retry_requested=True,
-                result_metadata={"error_message": f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}"},
-                retry_error=f"PROCESS_CRASH_EXIT: worker exited with code {exitcode}",
-                error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
-            )
+            metadata.update({
+                "error_message": f"{ERR_PROCESS_SIGNAL_DEATH}: killed by {sig_name} ({exitcode})",
+                "signal": sig_name,
+                "oom_hint": _SIGKILL is not None and -exitcode == _SIGKILL,
+            })
+        elif exitcode:
+            metadata["error_message"] = f"{ERR_PROCESS_CRASH_PREFIX}{exitcode}"
+        else:
+            metadata["error_message"] = ERR_NO_IPC_RESULT
+        if isinstance(exitcode, int) and not isinstance(exitcode, bool):
+            metadata["exitcode"] = exitcode
         return DeathAttribution(
-            retry_requested=True,
-            result_metadata={"error_message": ERR_NO_IPC_RESULT},
-            retry_error=f"{ERR_NO_IPC_RESULT}: worker exited without writing a result file",
-            error_category=ErrorCategory.TRANSIENT_EXHAUSTED.value,
+            retry_requested=False,
+            result_metadata=metadata,
+            retry_error=None,
+            error_category=ErrorCategory.UNKNOWN.value,
         )
 
     def _classify_dict(self, meta: dict[str, Any]) -> ErrorClassification:
@@ -523,13 +492,11 @@ class ErrorClassifier:
             (ERR_MAX_RETRIES, ErrorCategory.TRANSIENT_EXHAUSTED, False, False),
             (ERR_NO_HANDLER, ErrorCategory.NO_HANDLER, False, True),
             (ERR_PAYLOAD_VALIDATION, ErrorCategory.VALIDATION, False, False),
-            # 子进程死亡族（与 classify_process_death 产出串同源）——
-            # 非瞬态超时终局落 fatal 型；其余死亡/降级串落瞬态型
-            (ERR_TIMEOUT_PREFIX, ErrorCategory.FATAL, False, True),
-            (ERR_PROCESS_CRASH_PREFIX, ErrorCategory.TRANSIENT_EXHAUSTED, True, False),
-            (ERR_NO_IPC_RESULT, ErrorCategory.TRANSIENT_EXHAUSTED, True, False),
-            (ERR_PROCESS_SIGNAL_DEATH, ErrorCategory.TRANSIENT_EXHAUSTED, True, False),
-            (ERR_IPC_WRITE_DEGRADED_PREFIX, ErrorCategory.TRANSIENT_EXHAUSTED, True, False),
+            (ERR_TIMEOUT_PREFIX, ErrorCategory.UNKNOWN, False, False),
+            (ERR_PROCESS_CRASH_PREFIX, ErrorCategory.UNKNOWN, False, False),
+            (ERR_NO_IPC_RESULT, ErrorCategory.UNKNOWN, False, False),
+            (ERR_PROCESS_SIGNAL_DEATH, ErrorCategory.UNKNOWN, False, False),
+            (ERR_IPC_WRITE_DEGRADED_PREFIX, ErrorCategory.UNKNOWN, False, False),
         )
         for code, cat, trans, fatal in mapping:
             if error == code or error.startswith(code):

@@ -91,30 +91,41 @@ def make_fake_process_class(outcome="success"):
                 if outcome == "success":
                     _write_fake_result(ipc_dir, job.uid, {
                         "status": "success",
-                        "raw_result": True,
+                        "metadata": {},
                         "spawned_jobs": [],
-                        "resource_suspensions": [],
                         "cursor_updates": {},
                     }, execution_id=execution_id, pipe_sender=pipe_sender)
                 elif outcome == "retry":
-                    _write_fake_result(ipc_dir, job.uid, {"status": "retry", "error_message": "transient"}, execution_id=execution_id, pipe_sender=pipe_sender)
+                    _write_fake_result(ipc_dir, job.uid, {
+                        "status": "retry",
+                        "message": "busy",
+                        "metadata": {},
+                        "consume_budget": True,
+                    }, execution_id=execution_id, pipe_sender=pipe_sender)
                 elif outcome == "fatal":
                     _write_fake_result(ipc_dir, job.uid, {
-                        "status": "fatal",
-                        "error_message": "FatalError: bug",
-                        "traceback": "traceback",
+                        "status": "failure",
+                        "message": "FatalError: bug",
+                        "metadata": {},
+                        "exception": None,
                     }, execution_id=execution_id, pipe_sender=pipe_sender)
                 elif outcome == "fatal_exception":
                     _write_fake_result(ipc_dir, job.uid, {
-                        "status": "fatal",
-                        "error_message": "TypeError: bad type",
-                        "traceback": "traceback",
+                        "status": "failure",
+                        "message": "TypeError: bad type",
+                        "metadata": {},
+                        "exception": {
+                            "type": "TypeError",
+                            "message": "bad type",
+                            "traceback": "traceback",
+                        },
                     }, execution_id=execution_id, pipe_sender=pipe_sender)
                 elif outcome == "error":
                     _write_fake_result(ipc_dir, job.uid, {
-                        "status": "error",
-                        "error_message": "something broke",
-                        "traceback": "traceback",
+                        "status": "failure",
+                        "message": "something broke",
+                        "metadata": {},
+                        "exception": None,
                     }, execution_id=execution_id, pipe_sender=pipe_sender)
 
         def join(self, timeout=None):

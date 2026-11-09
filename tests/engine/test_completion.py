@@ -1,8 +1,8 @@
 """v2 CompletionMachine 完成机器测试：唯一收尾出口、三态分支与批量结算。
 
 覆盖：complete_job 成功/失败/重试生命周期（资源释放、清理模式、收尾
-钩子恰好一次）、重试预算判定（attempt_no 对 max_retries+1）与瞬态信号
-零预算、动态子任务去重与坏子作业拒绝、3-strike 终结的防双触发、
+钩子恰好一次）、显式重试预算判定与零预算显式重试、动态子任务去重与坏
+子作业拒绝、3-strike 终结的防双触发、
 settle_reaped / settle_aborted 批量结算。
 """
 
@@ -249,7 +249,7 @@ class TestCompleteJobFailure:
 
 
 class TestRetryBudget:
-    """重试预算判定与瞬态零预算。"""
+    """显式重试的预算判定与编号推进。"""
 
     def test_business_retry_advances_attempt_no(self, tmp_path):
         env = CompletionEnv(tmp_path)
@@ -258,7 +258,7 @@ class TestRetryBudget:
         entry = env.track_entry(job, attempt_id=attempt_id)
 
         result = ExecutionResult(
-            retry_requested=True, retry_error="connection blip"
+            retry_requested=True, message="connection blip"
         )
         env.completion.complete_job(entry, result)
 
@@ -285,7 +285,7 @@ class TestRetryBudget:
 
         env.completion.apply_result(
             "t::j1", job, job_snapshot,
-            ExecutionResult(retry_requested=True, retry_error="x"),
+            ExecutionResult(retry_requested=True, message="x"),
         )
         assert env.store.state.queue[0]["custom_note"] == "keep-me"
         assert env.store.state.queue[0]["resources"] == {"__workers__": 1.0}
@@ -303,7 +303,7 @@ class TestRetryBudget:
         entry = env.track_entry(job, attempt_id=attempt_id)
         entry.job_snapshot["runtime"] = job.runtime.to_dict()
 
-        result = ExecutionResult(retry_requested=True, retry_error="second")
+        result = ExecutionResult(retry_requested=True, message="second")
         env.completion.complete_job(entry, result)
 
         assert result.will_retry is False
@@ -314,8 +314,8 @@ class TestRetryBudget:
         assert env.stats["failed"] == 1
         assert env.backend.load_attempts("t::j1")[-1].outcome == "failed"
 
-    def test_transient_zero_budget_requeues_beyond_budget(self, tmp_path):
-        """瞬态信号：attempt_no 超预算仍重入队，attempt_no 不推进。"""
+    def test_explicit_zero_budget_retry_advances_attempt_no(self, tmp_path):
+        """显式零预算重试不受预算限制，但编号仍推进。"""
         env = CompletionEnv(tmp_path)
         job = Job._restore("t", "j1", max_retries_per_run=0, attempt_no=5)
         attempt_id = env.open_attempt(job, attempt_no=5)
@@ -323,33 +323,19 @@ class TestRetryBudget:
 
         result = ExecutionResult(
             retry_requested=True,
-            retry_error="interrupted",
-            transient_kind="interrupted",
+            message="suppressed failure",
+            consume_budget=False,
         )
         env.completion.complete_job(entry, result)
 
         assert result.will_retry is True
         assert "t::j1" not in env.store.state.failed
-        assert env.store.state.queue[0]["attempt_no"] == 5
+        assert env.store.state.queue[0]["attempt_no"] == 6
         rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
-        assert rt.last_retry_error == ""
-        assert env.stats["interrupted_reruns"] == 1
-
-    def test_rate_limited_transient_kind_counted(self, tmp_path):
-        env = CompletionEnv(tmp_path)
-        job = Job("t", "j1")
-        entry = env.track_entry(job)
-
-        env.completion.complete_job(
-            entry,
-            ExecutionResult(
-                retry_requested=True,
-                retry_error="HTTP 429",
-                transient_kind="rate_limited",
-            ),
-        )
-        assert env.stats["rate_limited_reruns"] == 1
+        assert rt.last_retry_error == "suppressed failure"
         assert env.stats["retried"] == 1
+        assert env.stats["interrupted_reruns"] == 0
+        assert env.stats["rate_limited_reruns"] == 0
 
 
 class TestThreeStrikeTermination:
@@ -635,7 +621,7 @@ class TestHookFireDiscipline:
         job = Job("t", "j1", max_retries_per_run=3)
         entry = env.track_entry(job)
         env.completion.complete_job(
-            entry, ExecutionResult(retry_requested=True, retry_error="flaky")
+            entry, ExecutionResult(retry_requested=True, message="flaky")
         )
         assert env.hooks == [
             ("t::j1", AttemptOutcome(success=False, will_retry=True, metadata={}))
@@ -842,8 +828,6 @@ def test_declaration_environment_fault_preserves_running_state(tmp_path):
             entry,
             ExecutionResult(
                 artifact_error="write denied",
-                retry_requested=True,
-                transient_kind="rate_limited",
             ),
         )
     assert entry.job.attempt_no == 1
@@ -878,7 +862,7 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
     result = ExecutionResult(
         retry_requested=True,
-        retry_error="business failure",
+        message="business failure",
         consume_budget=True,
     )
     env.completion.complete_job(entry, result)

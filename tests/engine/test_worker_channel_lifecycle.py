@@ -62,6 +62,18 @@ def _success_then_exit_error(job: Job, ctx: JobContext) -> TaskResult:
     return TaskResult.success(metadata={"returned": True})
 
 
+def _raise_handler_error(job: Job, ctx: JobContext) -> TaskResult:
+    raise ValueError("handler exploded")
+
+
+def _raise_keyboard_interrupt(job: Job, ctx: JobContext) -> TaskResult:
+    raise KeyboardInterrupt()
+
+
+def _return_invalid_result(job: Job, ctx: JobContext) -> TaskResult:
+    return {"status": "success"}  # type: ignore[return-value]
+
+
 def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -129,10 +141,11 @@ def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
     pipeline.run()
 
     failed = pipeline.backend.load_failed()
-    assert "crash::j1" in failed
+    assert list(failed) == ["crash::j1"]
     failed_meta = failed["crash::j1"]
     assert "PROCESS_CRASH_EXITCODE_42" in failed_meta.get("metadata", {}).get("error_message", "")
-    assert "42" in failed_meta.get("retry_error", "")
+    assert failed_meta["metadata"]["exitcode"] == 42
+    assert "retry_error" not in failed_meta
 
     attempts = pipeline.backend.load_attempts("crash::j1")
     assert len(attempts) == 1
@@ -140,6 +153,50 @@ def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
 
     pipeline.stop()
     assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
+
+
+@pytest.mark.parametrize(
+    ("task_type", "handler", "message", "exception_type"),
+    [
+        ("error", _raise_handler_error, "ValueError: handler exploded", "ValueError"),
+        ("interrupt", _raise_keyboard_interrupt, "KeyboardInterrupt", "KeyboardInterrupt"),
+        (
+            "invalid",
+            _return_invalid_result,
+            "invalid handler return type: expected TaskResult, got dict",
+            None,
+        ),
+    ],
+)
+def test_worker_faults_settle_one_failure(
+    tmp_path, task_type, handler, message, exception_type
+):
+    pipeline = TaskLite(
+        backend="sqlite",
+        state_path=tmp_path / f"channel_{task_type}.db",
+        max_workers=1,
+    )
+    pipeline.register_task(task_type, handler)
+    pipeline.enqueue(Job(task_type, "j1", max_retries_per_run=3))
+
+    pipeline.run()
+
+    failed = pipeline.backend.load_failed()
+    assert list(failed) == [f"{task_type}::j1"]
+    entry = failed[f"{task_type}::j1"]
+    assert entry["message"] == message
+    assert entry["error_message"] == message
+    if exception_type is None:
+        assert entry.get("exception") is None
+    else:
+        assert entry["exception"]["type"] == exception_type
+
+    attempts = pipeline.backend.load_attempts(f"{task_type}::j1")
+    assert len(attempts) == 1
+    assert attempts[0].outcome == "failed"
+    assert pipeline.backend.load_queue() == []
+
+    pipeline.stop()
 
 
 def test_worker_timeout_terminates_and_marks_failed_without_retry(tmp_path):

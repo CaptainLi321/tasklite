@@ -1,16 +1,8 @@
 """v2 完成机器：结果提交、输出清理、资源释放与在飞结算。
 
-``complete_job`` 是子进程结果的唯一收尾入口（成功/失败/重试全经此）；
-``apply_result`` 承载 retry/success/failure 三态事务提交。崩溃残留认领
-（stale-restore）归恢复编排层，经伪 entry 回流到本机器的同一收尾契约。
-依赖以显式窄清单注入（无共享袋），经 ``store`` 复用状态仓库事务深模块
-（3-strike/级联/轨迹收尾），不反向引用门面。
-
-重试预算判定在 ``_apply_retry``：允许执行条件 ``attempt_no <=
-max_retries + 1``，业务失败重试推进 ``attempt_no + 1``；瞬态信号
-（interrupted / lock_conflict / rate_limited）零预算——attempt_no 不推进、
-last_retry_error 不污染、预算耗尽也豁免失败档案。重试节奏唯一经
-StateStore.apply_retry 内的 RequeuePolicy（默认立即队首重入）。
+``complete_job`` 是子进程结果的唯一收尾入口，``apply_result`` 承载
+retry/success/failure 三态事务提交。重试预算只统计本 Run 中显式
+``TaskResult.retry`` 的消耗。
 
 ``session`` 按具名 Protocol ``DispatchSession`` 消费（``run_id`` 是
 successes meta 的 last_run_id 事实源；契约定义见 dispatch 模块）。
@@ -110,7 +102,7 @@ class CompletionMachine:
     ) -> None:
         cls._attach_cleanup_failure(result, exc)
         if result.retry_requested:
-            original_message = result.message or result.retry_error
+            original_message = result.message
             if original_message:
                 result.annotations["cleanup_original_message"] = original_message
             result.retry_requested = False
@@ -416,20 +408,13 @@ class CompletionMachine:
         started_at: str | None = None,
         active_files: dict[str, FileSpec] | None = None,
     ) -> None:
-        """重试分支：预算判定 → retry_job_snapshot 组装 → store.apply_retry。
+        """重试分支：预算判定与快照推进。
 
-        重试预算按单次 Run、按 uid 独立计数（不与历史 attempt_no 挂钩）：
-        - ``consume_budget=True`` 的业务重试检查本 Run 已消耗预算，达到
-          ``max_retries_per_run`` 即转入失败终态，否则记账 +1 并推进
-          ``attempt_no + 1``；
-        - ``consume_budget=False`` 的显式重试不烧本 Run 重试预算，仍推进
-          ``attempt_no + 1`` 并记录 Attempt；
-        - 内部瞬态信号（``transient_kind`` 非 None）零预算且不推进 ``attempt_no``。
+        ``consume_budget=True`` 时消耗本 Run 的 uid 级预算；耗尽则转为失败。
+        ``consume_budget=False`` 不消耗预算，但仍推进 attempt_no。
         """
-        transient_kind = result.transient_kind
-        is_transient = transient_kind is not None
-        consume_budget = bool(result.consume_budget) and not is_transient
-        retry_error = result.message if result.message is not None else result.retry_error
+        consume_budget = result.consume_budget
+        retry_error = result.message
         max_retries = job.max_retries_per_run if job.max_retries_per_run is not None else 3
 
         if consume_budget:
@@ -466,7 +451,7 @@ class CompletionMachine:
             self._record_retry(uid)
 
         retry_job_snapshot = self._build_retry_job_snapshot(
-            job, job_snapshot, retry_error=retry_error, is_transient=is_transient
+            job, job_snapshot, retry_error=retry_error
         )
         files_dict = (
             {k: v.to_dict() for k, v in active_files.items()}
@@ -478,7 +463,6 @@ class CompletionMachine:
             uid,
             job_snapshot,
             retry_job_snapshot,
-            transient_kind=transient_kind,
             attempt_id=attempt_id,
             attempt_no=attempt_no,
             run_id=run_id or self._session.run_id,
@@ -500,23 +484,14 @@ class CompletionMachine:
         job_snapshot: dict[str, Any],
         *,
         retry_error: str | None,
-        is_transient: bool,
     ) -> dict[str, Any]:
-        """重试字典组装：原作业原样重入队，受管键以 job 权威状态覆写。
-
-        不变式（与 Job 实例位语义对齐）：瞬态信号零预算——attempt_no
-        不推进、last_retry_error 不写；业务失败重试 attempt_no+1 并记录
-        最近重试错误。job_snapshot 顶层自定义字段随重试往返保留；resources
-        以原 job_snapshot 为准（保留已注入的 ``__workers__`` 槽位）；
-        first_enqueued_at 原样保留（重试不刷新首次入队时间）。
-        """
+        """重试字典组装：保留原快照，只推进 attempt_no 与重试说明。"""
         retry_job_snapshot = dict(job_snapshot)
-        if not is_transient:
-            job.attempt_no = job.attempt_no + 1
+        job.attempt_no = job.attempt_no + 1
         retry_job_snapshot.update(job.to_dict())
         retry_job_snapshot["resources"] = dict(job_snapshot.get("resources", {}))
         retry_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
-        if retry_error and not is_transient:
+        if retry_error:
             retry_state.record_retry_error(retry_error)
         retry_job_snapshot["runtime"] = retry_state.to_dict()
         return retry_job_snapshot

@@ -1,4 +1,4 @@
-"""v2 执行通道测试：spawn 兜底、看门狗、结果认证、解码防御、fencing 认领与中止。
+"""v2 执行通道测试：结果协议、退出证据、看门狗、解码防御与中止。
 
 以受控进程桩与内联 worker 包装确定性复现时序（无真实多进程竞速）；
 端到端（派发机器/完成机器装配后的 run 主循环）由后续门面阶段承接。
@@ -23,6 +23,8 @@ from tasklite.models.context import JobContext
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.utils.ipc import (
+    PIPE_MSG_RESULT,
+    WorkerPipeMessage,
     WorkerPipeSender,
     create_worker_pipe,
 )
@@ -72,8 +74,45 @@ class TestExecutionChannelBasics:
         assert ("job_signals", "gpu", 15.0) in signals
         assert ("job_signals", "api", 3.0) in signals
 
+    def test_duplicate_result_frame_keeps_first_payload(self, tmp_path):
+        channel = ExecutionChannel(tmp_path)
+        job = Job("t", "duplicate")
+        handle = JobHandle(
+            job_uid=job.uid,
+            process=SimpleNamespace(exitcode=None),
+            timeout_at_monotonic=time.monotonic() + 10,
+            timeout_seconds=10,
+            job=job,
+            ipc_dir=str(tmp_path),
+            execution_id=_EXECUTION_ID,
+        )
+        first = {
+            "status": "success",
+            "metadata": {"frame": 1},
+            "spawned_jobs": [],
+            "cursor_updates": {},
+        }
+        second = {
+            "status": "failure",
+            "message": "late frame",
+            "metadata": {},
+            "exception": None,
+        }
+        for payload in (first, second):
+            channel._accept_message(
+                handle,
+                WorkerPipeMessage(
+                    job_uid=job.uid,
+                    execution_id=_EXECUTION_ID,
+                    kind=PIPE_MSG_RESULT,
+                    payload=payload,
+                ),
+            )
+
+        assert channel._results[_EXECUTION_ID] == first
+
 class TestWorkerWrapper:
-    """worker 执行体入口：Pipe 结果发送、锁冲突/环境故障降级、瞬态三 kind 回传。"""
+    """worker 执行体入口：显式结果、异常失败与 Pipe 发送。"""
 
     @staticmethod
     def _run_worker(
@@ -152,14 +191,15 @@ class TestWorkerWrapper:
             assert res["status"] == "retry"
             assert res["consume_budget"] is want_consume
 
-    def test_keyboard_interrupt_writes_interrupted(self, tmp_path):
+    def test_keyboard_interrupt_writes_failure(self, tmp_path):
         def interrupted(job, ctx):
             raise KeyboardInterrupt()
 
         job = Job("h", "ki")
         res = self._run_worker(job, interrupted, tmp_path)
-        assert res["status"] == "interrupted"
-        assert res["error_message"].startswith("WORKER_INTERRUPTED:")
+        assert res["status"] == "failure"
+        assert res["message"] == "KeyboardInterrupt"
+        assert res["exception"]["type"] == "KeyboardInterrupt"
 
     def test_unhandled_exception_writes_failure_with_exception_dict(self, tmp_path):
         """未捕获异常统一结算为 failure，记录 type/message/traceback，不自动重试。"""
@@ -214,7 +254,6 @@ class TestEnvFallbackIpcDirCoherence:
                         "status": "success",
                         "metadata": {},
                         "spawned_jobs": [],
-                        "resource_suspensions": [],
                         "cursor_updates": {},
                     }
                 )
@@ -305,12 +344,11 @@ _BASE_OK = {
     "metadata": {"ok": True},
     "spawned_jobs": [],
     "cursor_updates": {},
-    "resource_suspensions": [],
 }
 
 
-def _decode(res, p=None, ipc_dir=None):
-    return _decode_ipc_result(res, p, Job("t", "a"), ipc_dir)
+def _decode(res):
+    return _decode_ipc_result(res, Job("t", "a"))
 
 
 class TestDecodeIpcResultDefense:
@@ -365,32 +403,22 @@ class TestDecodeIpcResultDefense:
         assert result.success is False
         assert "invalid cursor_updates value" in (result.message or "")
 
-    def test_resource_suspensions_bad_element_marks_failed(self):
-        res = dict(_BASE_OK, resource_suspensions=[("api", "not-a-number")])
-        result = _decode(res)
-        assert result.success is False
-        assert "invalid resource_suspension entry" in (result.message or "")
-
-    def test_resource_suspensions_not_list_marks_failed(self):
-        res = dict(_BASE_OK, resource_suspensions={"api": 1.0})
-        result = _decode(res)
-        assert result.success is False
-        assert "invalid resource_suspensions type" in (result.message or "")
-
-    def test_retry_status_extracts_transient_kind(self):
-        result = _decode({"status": "retry", "error_message": "x", "transient_kind": "rate_limited"})
+    def test_retry_status_keeps_explicit_budget_flag(self):
+        result = _decode({
+            "status": "retry",
+            "message": "x",
+            "metadata": {},
+            "consume_budget": False,
+        })
         assert result.retry_requested is True
-        assert result.transient_kind == "rate_limited"
+        assert result.consume_budget is False
+        assert result.message == "x"
 
-    def test_retry_status_non_string_kind_ignored(self):
-        result = _decode({"status": "retry", "error_message": "x", "transient_kind": 7})
-        assert result.retry_requested is True
-        assert result.transient_kind is None
-
-    def test_interrupted_status_forces_transient_kind(self):
+    def test_interrupted_status_is_corrupt_failure(self):
         result = _decode({"status": "interrupted", "error_message": "sig"})
-        assert result.retry_requested is True
-        assert result.transient_kind == "interrupted"
+        assert result.success is False
+        assert result.retry_requested is False
+        assert "unknown status 'interrupted'" in (result.message or "")
 
     def test_fatal_status_marks_failed(self):
         res = {"status": "failure", "message": "boom", "metadata": {"attempt": 1}}
@@ -404,32 +432,26 @@ class TestDecodeIpcResultDefense:
         assert result.success is False
         assert "unknown status" in (result.message or "")
 
-    def test_crash_exitcode_marks_failed(self):
-        class _P:
-            exitcode = -9
-
-        res = {"raw": "not-a-result-dict"}  # 无 status 键 → 走 exitcode 归因
-        result = _decode(res, p=_P())
+    def test_missing_status_marks_failed(self):
+        result = _decode({"raw": "not-a-result-dict"})
         assert result.success is False
-        assert "PROCESS_CRASH_EXITCODE_-9" in result.result_metadata["error_message"]
+        assert result.retry_requested is False
+        assert "missing status" in (result.message or "")
 
-    def test_missing_status_without_process_requests_retry(self):
-        """认领路径（p=None）读到无 status 的残留文件 → NO_IPC_RESULT 可重试。"""
-        result = _decode({}, None)
+    def test_empty_payload_marks_failed_without_retry(self):
+        result = _decode({})
         assert result.success is False
-        assert result.retry_requested is True
-        assert "NO_IPC_RESULT" in result.result_metadata["error_message"]
+        assert result.retry_requested is False
+        assert "missing status" in (result.message or "")
 
-    def test_nonzero_exitcode_without_status_requests_retry(self):
-        res = {"raw": "not-a-result-dict"}
-        result = _decode(res, SimpleNamespace(exitcode=1))
+    def test_result_payload_rejects_unknown_fields(self):
+        result = _decode(dict(_BASE_OK, resource_suspensions=[]))
         assert result.success is False
-        assert result.retry_requested is True
-        assert "PROCESS_CRASH_EXITCODE_1" in result.result_metadata["error_message"]
-        assert "PROCESS_CRASH_EXIT" in (result.retry_error or "")
+        assert result.retry_requested is False
+        assert "unsupported fields" in (result.message or "")
 
-    def test_decode_leaves_output_validation_to_completion(self, tmp_path):
-        result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
+    def test_decode_leaves_output_validation_to_completion(self):
+        result = _decode(dict(_BASE_OK))
         assert result.success is True
 
 
@@ -441,7 +463,6 @@ class TestDecodeConvergencePaths:
         "metadata": {},
         "spawned_jobs": 7,
         "cursor_updates": {},
-        "resource_suspensions": [],
     }
 
     class _DeadProcess:
@@ -476,59 +497,50 @@ class TestDecodeConvergencePaths:
 
 
 class TestBuildTerminalFailureDefense:
-    """无结果消息的终局构造：超时瞬态/终局、崩溃、无结果分类。"""
-
-    class _JobStub:
-        def __init__(self, timeout_is_transient):
-            self.timeout_is_transient = timeout_is_transient
+    """无结果消息的终局构造：超时、崩溃与无结果均保留失败证据。"""
 
     @staticmethod
-    def _handle(timeout_is_transient):
+    def _handle():
         return JobHandle(
             job_uid="t::a",
             process=SimpleNamespace(exitcode=None),
             timeout_at_monotonic=1.0,
             timeout_seconds=5.0,
-            job=TestBuildTerminalFailureDefense._JobStub(timeout_is_transient),
+            job=Job("t", "a"),
             ipc_dir="/tmp",
         )
 
-    def test_timeout_transient_requests_retry(self):
+    def test_timeout_marks_failed_without_retry(self):
         result = ExecutionChannel._build_terminal_failure(
-            SimpleNamespace(exitcode=None), self._handle(True), is_timeout=True,
-        )
-        assert result.success is False
-        assert result.retry_requested is True
-        assert "TIMEOUT" in (result.retry_error or "")
-
-    def test_timeout_not_transient_marks_failed(self):
-        result = ExecutionChannel._build_terminal_failure(
-            SimpleNamespace(exitcode=None), self._handle(False), is_timeout=True,
+            SimpleNamespace(exitcode=None), self._handle(), is_timeout=True,
         )
         assert result.success is False
         assert result.retry_requested is False
         assert "TIMEOUT" in result.result_metadata["error_message"]
+        assert result.result_metadata["timed_out"] is True
 
-    def test_crash_exitcode_classified(self):
+    def test_signal_death_classified(self):
         result = ExecutionChannel._build_terminal_failure(
-            SimpleNamespace(exitcode=-11), self._handle(False), is_timeout=False,
+            SimpleNamespace(exitcode=-11), self._handle(), is_timeout=False,
         )
         assert result.success is False
-        assert result.retry_requested is True
-        assert "PROCESS_CRASH_EXITCODE_-11" in result.result_metadata["error_message"]
+        assert result.retry_requested is False
+        assert "PROCESS_SIGNAL_DEATH" in result.result_metadata["error_message"]
+        assert result.result_metadata["signal"] == "SIGSEGV"
+        assert result.result_metadata["exitcode"] == -11
 
     def test_clean_exit_without_result_classified(self):
         result = ExecutionChannel._build_terminal_failure(
-            SimpleNamespace(exitcode=0), self._handle(False), is_timeout=False,
+            SimpleNamespace(exitcode=0), self._handle(), is_timeout=False,
         )
         assert result.success is False
-        assert result.retry_requested is True
+        assert result.retry_requested is False
         assert "NO_IPC_RESULT" in result.result_metadata["error_message"]
-        assert result.retry_error
+        assert result.result_metadata["exitcode"] == 0
 
 
 class TestWatchdogReap:
-    """看门狗：timeout_at_monotonic 驱动 kill；join 窗口自然退出按 exitcode 归因。"""
+    """看门狗：截止时刻的未完成执行统一归因超时。"""
 
     class _HungProcess:
         """kill 前恒活的进程桩（模拟死锁/卡死）。"""
@@ -581,12 +593,10 @@ class TestWatchdogReap:
         result = completed[0][1]
         assert result.success is False
         assert result.result_metadata["error_message"].startswith("TIMEOUT")
-        assert result.retry_requested is False, (
-            "timeout_is_transient=False 的超时是终局，不烧重试预算"
-        )
+        assert result.retry_requested is False
 
-    def test_join_window_exit_attributed_by_exitcode(self, tmp_path):
-        """timeout_at_monotonic 触发 join 后自然退出 → 按 exitcode 归因（NO_IPC_RESULT），不折入 TIMEOUT。"""
+    def test_join_window_exit_remains_timeout(self, tmp_path):
+        """截止时刻无结果即归因超时，进程在 join 窗口退出不改变原因。"""
         job = Job("t", "natural_exit")
         handle = JobHandle(
             job_uid=job.uid, process=self._DyingDuringJoinProcess(),
@@ -595,23 +605,14 @@ class TestWatchdogReap:
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         result = completed[0][1]
-        assert "NO_IPC_RESULT" in result.result_metadata["error_message"], (
-            "join 窗口内自然退出且无结果 → NO_IPC_RESULT 瞬态，非 TIMEOUT"
-        )
-        assert result.retry_requested is True
+        assert "TIMEOUT" in result.result_metadata["error_message"]
+        assert result.retry_requested is False
 
     @pytest.mark.parametrize("exitcode", [-9, 1])
-    def test_join_window_death_cluster_attributed_symmetrically(
+    def test_join_window_death_does_not_restore_retry(
         self, tmp_path, exitcode
     ):
-        """对称性基准：join 窗口内信号死亡（-9）/正码崩溃（1）按 exitcode
-        分簇归因并维持可重试。
-
-        不变式：timeout_at_monotonic 后 join 窗口内已自然退出的执行体，死亡归因全权
-        交 exitcode 分簇，与 timeout_at_monotonic 前同因事件同果——环境故障不得仅因
-        跨过 timeout_at_monotonic 就从「可重试」分裂为「零重试直落失败档案」；仅
-        kill 后仍存活的执行体才归 TIMEOUT。
-        """
+        """截止后尚无结果时，退出码不恢复隐式重试语义。"""
         job = Job("t", "cluster_death")
         handle = JobHandle(
             job_uid=job.uid, process=self._DyingDuringJoinProcess(exitcode),
@@ -621,11 +622,8 @@ class TestWatchdogReap:
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         result = completed[0][1]
         assert result.success is False
-        assert f"PROCESS_CRASH_EXITCODE_{exitcode}" in result.result_metadata["error_message"], (
-            "join 窗口内死亡必须按 exitcode 分簇归因，而非折入 TIMEOUT"
-        )
-        assert result.retry_requested is True, "同窗口死亡维持瞬态可重试（对称性）"
-        assert result.retry_error
+        assert result.retry_requested is False
+        assert "TIMEOUT" in result.result_metadata["error_message"]
 
     def test_completed_result_reaped_before_deadline(self, tmp_path):
         """结果已到达且进程仍活 → 直接按结果收割（不等 timeout_at_monotonic）。"""
@@ -635,7 +633,6 @@ class TestWatchdogReap:
             "status": "success",
             "metadata": {},
             "spawned_jobs": [],
-            "resource_suspensions": [],
             "cursor_updates": {},
         }
         handle = JobHandle(
@@ -801,11 +798,10 @@ class TestAbortInFlight:
 
         assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
         assert outcome.completed[0][1].success is True
-        assert outcome.completed[0][1].resource_suspensions == [("api", 5.0)]
         assert outcome.salvaged_signals == []
 
-    def test_abort_interrupted_result_not_treated_as_terminal(self, tmp_path):
-        """interrupted 报告按「未完成」处理：不进 completed，走 cancelled。"""
+    def test_abort_interrupted_status_settles_failure(self, tmp_path):
+        """不支持的 interrupted 状态按一次损坏结果失败结算。"""
         channel = ExecutionChannel(tmp_path)
         job = Job("task", "interrupted")
         channel._results["inc_interrupted"] = {
@@ -820,8 +816,12 @@ class TestAbortInFlight:
 
         outcome = channel.abort_in_flight([h])
 
-        assert outcome.completed == [], "被中断报告不得作为终态提交"
-        assert [handle.job_uid for handle in outcome.cancelled] == [job.uid]
+        assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
+        result = outcome.completed[0][1]
+        assert result.success is False
+        assert result.retry_requested is False
+        assert "unknown status 'interrupted'" in (result.message or "")
+        assert outcome.cancelled == []
 
     def test_abort_empty_handles_returns_empty_outcome(self, tmp_path):
         channel = ExecutionChannel(tmp_path)

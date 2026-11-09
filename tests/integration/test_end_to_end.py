@@ -10,15 +10,11 @@
 并重置 attempt_no=1。各通道均不得与既有激活在 (activation_no, attempt_no)
 逻辑键上撞号。
 
-故障场景补充：环境崩溃（正退出码、无结果文件）耗尽预算、强制中止的
-半成品清理与 at-least-once 回队、看门狗超时击杀、限速资源挂起恢复、
-中断族信号（KeyboardInterrupt 瞬态 / SystemExit 归因）——环境崩溃
-场景以受控进程桩驱动（确定性复现「进程死亡且无结果」时序），其余走
-真实子进程。
+故障场景补充：异常、SystemExit 与看门狗超时均单次失败，不自动重试；
+限速资源按间隔恢复，强制中止路径保留未提交产物语义。
 """
 from __future__ import annotations
 
-import multiprocessing as mp
 import sys
 import threading
 import time
@@ -71,10 +67,6 @@ def _make_pipeline(tmp_path, **overrides) -> TaskLite:
 # ── 模块级 handler（spawn 子进程经 pickle 接收）───────────────────────
 
 
-class TransientSampleError(Exception):
-    """业务瞬态异常样本（模块级可 pickle，经注册表快照下发子进程）。"""
-
-
 def ok_with_input_handler(job, ctx):
     """成功 + 声明输入文件 + 业务元数据（供 successes meta 审计键断言）。"""
     source = ctx.output_roots / f"source_{job.job_id}.txt"
@@ -117,43 +109,14 @@ def hung_handler(job, ctx):
     return TaskResult.success()
 
 
-def suspend_and_complete_handler(job, ctx):
-    """成功并挂起 api 资源 2 秒（挂起窗口延迟同资源的后续作业）。"""
-    ctx.suspend_resource("api", 2.0)
-    return TaskResult.success(metadata={"suspended_by": job.job_id})
-
-
 def plain_gated_handler(job, ctx):
-    """无副作用成功（消费 api 资源的挂起恢复窗口）。"""
+    """无副作用成功（消费 api 资源的间隔窗口）。"""
     return TaskResult.success(metadata={"ran_after_recovery": True})
-
-
-def interrupted_first_handler(job, ctx):
-    """首次执行抛 KeyboardInterrupt；重跑（零预算瞬态）读到标记即成功。"""
-    marker = ctx.output_roots / f"interrupted_marker_{job.job_id}"
-    if marker.exists():
-        return TaskResult.success(metadata={"recovered": True})
-    marker.write_text(job.job_id, encoding="utf-8")
-    raise KeyboardInterrupt()
 
 
 def system_exit_handler(job, ctx):
     """抛 SystemExit：worker 捕获后记录进失败档案。"""
     raise SystemExit(1)
-
-
-def partial_output_hang_handler(job, ctx):
-    """声明半成品输出后挂起长睡（强中止场景：等 stop(force) 击杀）。
-
-    ready 标记先于挂起落盘——测试侧轮询标记出现再请求强停，避免在
-    handler 尚未声明输出前击杀（竞态会让清理断言假绿）。
-    """
-    partial = ctx.declare_file("partial", FileSpec(ctx.output_roots / f"partial_{job.job_id}.txt", role="output", delete_on_failure=True))
-    Path(partial).write_text("half-written", encoding="utf-8")
-    ready = ctx.output_roots / f"ready_{job.job_id}"
-    ready.write_text(job.job_id, encoding="utf-8")
-    time.sleep(60.0)
-    return TaskResult.success()
 
 
 class TestEndToEnd:
@@ -311,68 +274,6 @@ class TestEndToEnd:
             assert [j for j in candidates if j.uid not in succ] == [Job("work", "next")]
 
 
-def make_exit_crash_process_class():
-    """环境崩溃进程桩：以 exitcode=1 退出且从不写结果文件。
-
-    确定性复现「解释器/导入段崩溃、无结果落盘」时序（真实子进程下
-    该时序不可控）；与真实子进程共享同一收割代码路径。
-    """
-
-    class ExitCrashProcess:
-        def __init__(self, target=None, args=(), kwargs=None, **_kw):
-            self._alive = False
-            self.exitcode = 1
-
-        def start(self):
-            self._alive = False
-
-        def join(self, timeout=None):
-            self._alive = False
-
-        def is_alive(self):
-            return self._alive
-
-        def kill(self):
-            self._alive = False
-
-        def close(self):
-            pass
-
-    return ExitCrashProcess
-
-
-class TestEnvFaultExhaustion:
-    """环境故障端到端：正退出码崩溃走重试预算，耗尽后档案携带终态原因。"""
-
-    def test_nonzero_exitcode_exhausts_budget_then_archive(self, tmp_path, monkeypatch):
-        """exitcode=1 崩溃 ×（max_retries=1）→ 失败档案 ERR_MAX_RETRIES
-        + last_retry_error/retry_error 携带 PROCESS_CRASH_EXIT 归因。
-
-        环境性死亡（结果文件缺失/半写通常是解释器启动失败、导入段崩溃
-        等环境问题）与信号死亡同属瞬态烧预算路径——不得零重试直判失败
-        档案。
-        """
-        p = _make_pipeline(tmp_path)
-        p.register_task("crash", ok_with_input_handler)
-        p.enqueue(Job("crash", "item_env_crash", max_retries_per_run=1))
-
-        monkeypatch.setattr(mp, "Process", make_exit_crash_process_class())
-        p.run()
-        p.stop()
-
-        failed = p.backend.load_failed()
-        assert "crash::item_env_crash" in failed
-        entry = failed["crash::item_env_crash"]
-        assert entry["error_message"] == ERR_MAX_RETRIES
-        assert "PROCESS_CRASH_EXIT" in entry.get("last_retry_error", "")
-        assert "PROCESS_CRASH_EXIT" in entry.get("retry_error", "")
-
-        attempts = p.backend.load_attempts("crash::item_env_crash")
-        assert [a.attempt_no for a in attempts] == [1, 2]
-        assert [a.outcome for a in attempts] == ["requeued", "failed"]
-        assert "crash::item_env_crash" not in p.backend.load_successes()
-
-
 class TestRealSubprocessFaultScenarios:
     """真实子进程故障场景：看门狗超时击杀、限速挂起恢复、中断族信号。"""
 
@@ -415,26 +316,8 @@ class TestRealSubprocessFaultScenarios:
         assert "gated::holder" in successes
         assert "gated_plain::waiter" in successes
 
-    def test_real_subprocess_keyboard_interrupt_is_transient(self, tmp_path):
-        """KeyboardInterrupt → interrupted 瞬态：零预算重入队，重跑成功。
-
-        瞬态军规端到端：attempt_no 不推进、不烧重试预算、不进失败档案。
-        """
-        p = _make_pipeline(tmp_path)
-        p.register_task("interrupted", interrupted_first_handler)
-        p.enqueue(Job("interrupted", "item_interrupted", max_retries_per_run=1))
-        res = p.run()
-        p.stop()
-
-        assert res is None
-        assert "interrupted::item_interrupted" in p.backend.load_successes()
-        assert "interrupted::item_interrupted" not in p.backend.load_failed()
-        attempts = p.backend.load_attempts("interrupted::item_interrupted")
-        assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
-        assert [a.attempt_no for a in attempts] == [1, 2]
-
     def test_real_subprocess_system_exit_attributed(self, tmp_path):
-        """SystemExit 在真实子进程被 worker 捕获，以中断族串归因进失败档案。"""
+        """SystemExit 在真实子进程被 worker 捕获，按业务失败证据结算。"""
         p = _make_pipeline(tmp_path)
         p.register_task("sysexit", system_exit_handler)
         p.enqueue(Job("sysexit", "item_sysexit", max_retries_per_run=0))
@@ -446,3 +329,6 @@ class TestRealSubprocessFaultScenarios:
         error = failed["sysexit::item_sysexit"]["error_message"]
         assert "SystemExit" in error, f"应含 SystemExit 错误信息，got: {error}"
         assert "sysexit::item_sysexit" not in p.backend.load_successes()
+        attempts = p.backend.load_attempts("sysexit::item_sysexit")
+        assert len(attempts) == 1
+        assert attempts[0].outcome == "failed"

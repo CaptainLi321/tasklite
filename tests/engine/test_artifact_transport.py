@@ -65,7 +65,7 @@ def test_spawn_worker_preserves_error_boundary(tmp_path, handler, infrastructure
         assert not process.is_alive()
         assert process.exitcode == 0
         payload = _drain_result_payload(receiver)
-        result = _decode_ipc_result(payload, process, job)
+        result = _decode_ipc_result(payload, job)
         assert result.success is False
         if infrastructure:
             assert payload["status"] == "artifact_error"
@@ -75,7 +75,7 @@ def test_spawn_worker_preserves_error_boundary(tmp_path, handler, infrastructure
         else:
             assert result.artifact_error is None
             assert "external tool read failed" in str(
-                result.message or result.result_metadata or result.retry_error
+                result.message or result.result_metadata
             )
     finally:
         receiver.close()
@@ -87,9 +87,7 @@ def test_spawn_worker_preserves_error_boundary(tmp_path, handler, infrastructure
 
 def test_success_decode_does_not_read_artifact_declarations(tmp_path):
     job = Job("transport", "one")
-    result = _decode_ipc_result(
-        {"status": "success", "metadata": {}}, None, job, str(tmp_path)
-    )
+    result = _decode_ipc_result({"status": "success", "metadata": {}}, job)
     assert result.success is True
 
 
@@ -109,7 +107,7 @@ def test_worker_cannot_swallow_declaration_environment_fault(tmp_path):
     _worker_process_entry(spec)
     payload = _drain_result_payload(receiver)
     assert payload["status"] == "artifact_error"
-    result = _decode_ipc_result(payload, None, job)
+    result = _decode_ipc_result(payload, job)
     assert result.artifact_error == "declaration write denied"
     assert not result.retry_requested
 
@@ -161,7 +159,7 @@ def test_public_declaration_write_fault_bypasses_handler_exception(tmp_path, kin
     reply_sender.close()
     payload = _drain_result_payload(receiver)
     assert payload["status"] == "artifact_error"
-    result = _decode_ipc_result(payload, None, job)
+    result = _decode_ipc_result(payload, job)
     assert result.artifact_error == "declaration write denied"
     assert not result.success
     assert not result.retry_requested

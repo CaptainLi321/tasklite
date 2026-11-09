@@ -80,7 +80,6 @@ def _fake_process_class(*, fail_uid=None, spawn_jobs=(), seen=None):
                     "status": "success",
                     "metadata": {},
                     "spawned_jobs": [dict(job) for job in spawn_jobs],
-                    "resource_suspensions": [],
                     "cursor_updates": {},
                 }
             assert spec.pipe_sender is not None

@@ -2,8 +2,9 @@
 
 覆盖真实 spawn 子进程下：
 - 原子成功事务（inputs / 具名 artifacts / spawned_jobs / cursor /
-  resource_suspensions / attempts）与重开恢复、once 去重跳过；
-- 子进程被信号击杀（SIGKILL）、异常退出（os._exit）、看门狗超时的预算与产物清理；
+  动态声明 / attempts）与重开恢复、once 去重跳过；
+- 子进程被信号击杀（SIGKILL）、异常退出（os._exit）、看门狗超时的
+  单次失败与产物清理；
 - 产物清理 PermissionError 阻断终态提交并保留原队列快照；
 - DRAINING / ABORTING 停机对在途声明、挂起信号与已完成结果的排空与结算；
 - 非法管道帧（损坏 JSON / 未知 kind / job_uid 不匹配 / execution_id 不匹配）
@@ -67,9 +68,7 @@ def interrupted_handler(job: Job, ctx) -> TaskResult:
 
 
 def crash_handler(job: Job, ctx) -> TaskResult:
-    if job.attempt_no == 1:
-        os._exit(7)
-    return TaskResult.success(metadata={"recovered": True})
+    os._exit(7)
 
 
 def timeout_handler(job: Job, ctx) -> TaskResult:
@@ -241,7 +240,9 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
 
 
 @pytest.mark.parametrize("mode", ["kill", "crash", "timeout"])
-def test_process_death_uses_existing_budget(pipelines, monkeypatch, tmp_path, mode):
+def test_process_death_is_single_failure_without_implicit_retry(
+    pipelines, tmp_path, mode
+):
     sync_dir = tmp_path / "sync"
     sync_dir.mkdir(parents=True, exist_ok=True)
     pipeline = pipelines()
@@ -256,48 +257,45 @@ def test_process_death_uses_existing_budget(pipelines, monkeypatch, tmp_path, mo
             "work",
             mode,
             payload={"sync_dir": str(sync_dir)},
-            max_retries_per_run=1,
-            timeout_seconds=0.3 if mode == "timeout" else 20.0,
+            max_retries_per_run=3,
+            timeout_seconds=0.3 if mode == "timeout" else 10.0,
         )
     )
-    channel = pipeline._runtime.channel
-    killed_once: list[str] = []
+    killer = None
     if mode == "kill":
-        orig_reap = channel.reap_completed
+        def kill_ready_worker():
+            assert _wait_until(lambda: (sync_dir / "ready").exists())
+            handles = list(pipeline._runtime.channel._handles.values())
+            assert len(handles) == 1
+            handles[0].process.kill()
 
-        def reap_and_kill(handles):
-            for handle in handles:
-                channel._receive_available(handle)
-                if (
-                    not killed_once
-                    and (sync_dir / "ready").exists()
-                    and len(pipeline._runtime._in_flight[handle.job_uid].active_files) == 2
-                ):
-                    killed_once.append(handle.execution_id or "")
-                    handle.process.kill()
-            return orig_reap(handles)
+        killer = threading.Thread(target=kill_ready_worker)
+        killer.start()
 
-        monkeypatch.setattr(channel, "reap_completed", reap_and_kill)
+    try:
+        res = pipeline.run()
+    finally:
+        if killer is not None:
+            killer.join(timeout=10.0)
 
-    res = pipeline.run()
     assert res is None
+    assert killer is None or not killer.is_alive()
+    failed = pipeline.backend.load_failed()
+    assert list(failed) == ["work::" + mode]
     attempts = pipeline.backend.load_attempts("work::" + mode)
-    if mode == "timeout":
-        assert len(pipeline.backend.load_failed()) == 1
-        assert len(attempts) == 1 and attempts[0].outcome == "failed"
-        assert attempts[0].attempt_no == 1
-        assert "TIMEOUT" in str(pipeline.backend.load_failed())
-    else:
-        assert "work::" + mode in pipeline.backend.load_successes()
-        assert [a.attempt_no for a in attempts] == [1, 2]
-        assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
-        expected = "PROCESS_SIGNAL_DEATH" if mode == "kill" else "PROCESS_CRASH_EXIT"
-        assert expected in (attempts[0].error_message or "")
-        assert pipeline.backend.load_failed() == {}
-        if mode == "kill":
-            assert len(killed_once) == 1
-            assert not (tmp_path / "output" / "authorized.txt").exists()
-            assert (tmp_path / "output" / "retained.txt").exists()
+    assert len(attempts) == 1
+    assert attempts[0].attempt_no == 1
+    assert attempts[0].outcome == "failed"
+    assert pipeline.backend.load_successes() == {}
+    expected = {
+        "kill": "PROCESS_SIGNAL_DEATH",
+        "crash": "PROCESS_CRASH_EXITCODE_7",
+        "timeout": "TIMEOUT",
+    }[mode]
+    assert expected in failed["work::" + mode]["error_message"]
+    if mode == "kill":
+        assert not (tmp_path / "output" / "authorized.txt").exists()
+        assert (tmp_path / "output" / "retained.txt").exists()
     assert pipeline.backend.load_queue() == []
 
 

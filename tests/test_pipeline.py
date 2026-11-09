@@ -199,15 +199,20 @@ def make_instant_process_class(retry_uid: str | None = None, recorder: list | No
                 spec = self.args[0]
                 if recorder is not None:
                     recorder.append(spec.job.uid)
-                result = {
-                    "spawned_jobs": [],
-                    "resource_suspensions": [],
-                    "cursor_updates": {},
-                }
                 if retry_uid is not None and spec.job.uid == retry_uid:
-                    result.update({"status": "retry", "message": "stub failure", "consume_budget": True})
+                    result = {
+                        "status": "retry",
+                        "message": "stub failure",
+                        "metadata": {},
+                        "consume_budget": True,
+                    }
                 else:
-                    result.update({"status": "success", "metadata": {}})
+                    result = {
+                        "status": "success",
+                        "metadata": {},
+                        "spawned_jobs": [],
+                        "cursor_updates": {},
+                    }
                 assert spec.pipe_sender is not None
                 spec.pipe_sender.send_result(result)
             self._alive = False
