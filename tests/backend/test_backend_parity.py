@@ -20,7 +20,6 @@ from tasklite.backend import InMemoryStateBackend, SQLiteStateBackend
 from tasklite.models.attempt import ATTEMPT_RUNNING, AttemptRecord
 from tasklite.models.job import Job
 from tasklite.models.state import job_uid_from_snapshot
-from tasklite.snapshot import StateSnapshot
 
 
 def _job_snapshot(job_id: str, **overrides) -> dict:
@@ -628,33 +627,3 @@ def test_archive_metadata_and_payload_are_independent_untranslated_copies(dual_b
     assert backend.load_failed() == {"t::separate": expected_metadata}
     assert backend.commit_job_failure("t::separate", {"replacement": True}, payload=None)
     assert backend.load_failure_payloads() == expected_payloads
-
-
-class TestStateSnapshotParity:
-    """StateSnapshot 在两腿后端下的只读一致性。"""
-
-    def test_state_snapshot_reads_queue_and_terminal_jobs(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([_job_snapshot("j_pend")])
-        b.commit_job_failure("t::j_fail", {"error_message": "err_fail"}, payload={"p": 1})
-        _open_and_commit_success(b, "t::j_succ", {"meta": "ok"})
-
-        with StateSnapshot.open(b) as s:
-            pend = s.get_job("t::j_pend")
-            assert pend is not None
-            assert pend["status"] == "pending"
-            assert pend["result"] is None
-
-            fail = s.get_job("t::j_fail")
-            assert fail is not None
-            assert fail["status"] == "failed"
-            assert fail["result"]["message"] == "err_fail"
-
-            succ = s.get_job("t::j_succ")
-            assert succ is not None
-            assert succ["status"] == "succeeded"
-
-            all_jobs = list(s.iter_jobs())
-            assert len(all_jobs) == 3
-            uids = {j["job_uid"] for j in all_jobs}
-            assert uids == {"t::j_pend", "t::j_fail", "t::j_succ"}

@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator, Mapping, Protocol
 
+from .backend.sqlite_backend import TARGET_SCHEMA_VERSION, _check_schema
 from .exceptions import TaskLiteError
 from .models.attempt import AttemptRecord
 from .models.state import job_uid_from_snapshot
@@ -300,119 +301,65 @@ class _SqliteSnapshotReader:
             raise FileNotFoundError(f"Database file does not exist: {db_path}")
         if db_path.is_dir():
             raise ValueError(f"Path is a directory, not a database file: {db_path}")
-        self._path = db_path
-        uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
-        self._conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30.0)
-        self._conn.execute("BEGIN")
-        self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
-        self._inspect_schema()
+        uri = db_path.resolve().as_uri() + "?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30.0)
+            try:
+                conn.execute("BEGIN")
+                if _check_schema(conn, db_path, TARGET_SCHEMA_VERSION) == 0:
+                    raise RuntimeError(f"Uninitialized TaskLite database at {db_path}")
+            except BaseException:
+                conn.close()
+                raise
+        except (RuntimeError, sqlite3.Error) as exc:
+            raise TaskLiteError(str(exc)) from exc
+        self._conn = conn
         self._closed = False
 
-    def _inspect_schema(self) -> None:
-        tables = {
-            r[0]
-            for r in self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "queue" not in tables or "attempts" not in tables:
-            raise TaskLiteError(
-                f"Database at {self._path} is uninitialized or not a valid TaskLite database"
-            )
-        queue_cols = {
-            r[1] for r in self._conn.execute("PRAGMA table_info(queue)").fetchall()
-        }
-        self._has_queue_status = "status" in queue_cols
-
-        att_cols = {
-            r[1] for r in self._conn.execute("PRAGMA table_info(attempts)").fetchall()
-        }
-        self._has_att_settled_at = "settled_at" in att_cols
-
     def _load_latest_attempt(self, uid: str) -> dict[str, Any] | None:
-        if self._has_att_settled_at:
-            row = self._conn.execute(
-                "SELECT attempt_no, run_id, outcome, started_at, settled_at, "
-                "job_snapshot, files, result, error_message "
-                "FROM attempts WHERE job_uid = ? ORDER BY attempt_id DESC LIMIT 1",
-                (uid,),
-            ).fetchone()
-            if not row:
-                return None
-            return {
-                "attempt_no": row[0],
-                "run_id": row[1],
-                "outcome": row[2],
-                "started_at": row[3],
-                "settled_at": row[4],
-                "job_snapshot": loads(row[5]) if row[5] else None,
-                "files": loads(row[6]) if row[6] else None,
-                "result": loads(row[7]) if row[7] else None,
-                "error_message": row[8],
-            }
-        else:
-            row = self._conn.execute(
-                "SELECT attempt_no, run_id, outcome, started_at, finished_at, "
-                "NULL, NULL, NULL, error_message "
-                "FROM attempts WHERE job_uid = ? ORDER BY attempt_id DESC LIMIT 1",
-                (uid,),
-            ).fetchone()
-            if not row:
-                return None
-            return {
-                "attempt_no": row[0],
-                "run_id": row[1],
-                "outcome": row[2],
-                "started_at": row[3],
-                "settled_at": row[4],
-                "job_snapshot": None,
-                "files": None,
-                "result": None,
-                "error_message": row[8],
-            }
+        row = self._conn.execute(
+            "SELECT attempt_no, run_id, outcome, started_at, settled_at, "
+            "job_snapshot, files, result, error_message "
+            "FROM attempts WHERE job_uid = ? ORDER BY attempt_id DESC LIMIT 1",
+            (uid,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "attempt_no": row[0],
+            "run_id": row[1],
+            "outcome": row[2],
+            "started_at": row[3],
+            "settled_at": row[4],
+            "job_snapshot": loads(row[5]) if row[5] else None,
+            "files": loads(row[6]) if row[6] else None,
+            "result": loads(row[7]) if row[7] else None,
+            "error_message": row[8],
+        }
 
     def get_job(self, uid: str) -> dict[str, Any] | None:
-        if self._has_queue_status:
-            row = self._conn.execute(
-                "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
-                "FROM queue WHERE job_uid = ?",
-                (uid,),
-            ).fetchone()
-            if row:
-                job_snap = loads(row[2]) if row[2] else {}
-                st = row[3] if row[3] else "pending"
-                run_id = row[4] if st == "running" else None
-                attempt_no = row[5] if st == "running" else None
-                started_at = _format_iso_z(row[6]) if st == "running" else None
-                return {
-                    "job_uid": uid,
-                    "status": st,
-                    "job": _normalize_job_config(job_snap),
-                    "files": _normalize_outer_files(job_snap.get("files")),
-                    "result": None,
-                    "run_id": run_id,
-                    "attempt_no": attempt_no,
-                    "started_at": started_at,
-                    "settled_at": None,
-                }
-        else:
-            row = self._conn.execute(
-                "SELECT job_uid, queue_position, job_snapshot FROM queue WHERE job_uid = ?",
-                (uid,),
-            ).fetchone()
-            if row:
-                job_snap = loads(row[2]) if row[2] else {}
-                return {
-                    "job_uid": uid,
-                    "status": "pending",
-                    "job": _normalize_job_config(job_snap),
-                    "files": _normalize_outer_files(job_snap.get("files")),
-                    "result": None,
-                    "run_id": None,
-                    "attempt_no": None,
-                    "started_at": None,
-                    "settled_at": None,
-                }
+        row = self._conn.execute(
+            "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
+            "FROM queue WHERE job_uid = ?",
+            (uid,),
+        ).fetchone()
+        if row:
+            job_snap = loads(row[2]) if row[2] else {}
+            st = row[3] if row[3] else "pending"
+            run_id = row[4] if st == "running" else None
+            attempt_no = row[5] if st == "running" else None
+            started_at = _format_iso_z(row[6]) if st == "running" else None
+            return {
+                "job_uid": uid,
+                "status": st,
+                "job": _normalize_job_config(job_snap),
+                "files": _normalize_outer_files(job_snap.get("files")),
+                "result": None,
+                "run_id": run_id,
+                "attempt_no": attempt_no,
+                "started_at": started_at,
+                "settled_at": None,
+            }
 
         s_row = self._conn.execute(
             "SELECT metadata FROM successes WHERE job_uid = ?", (uid,)
@@ -439,21 +386,16 @@ class _SqliteSnapshotReader:
         status: str | None = None,
         task_type: str | None = None,
     ) -> Iterator[dict[str, Any]]:
-        if self._has_queue_status:
-            q_rows = self._conn.execute(
-                "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
-                "FROM queue ORDER BY queue_position ASC"
-            ).fetchall()
-        else:
-            q_rows = self._conn.execute(
-                "SELECT job_uid, queue_position, job_snapshot FROM queue ORDER BY queue_position ASC"
-            ).fetchall()
+        q_rows = self._conn.execute(
+            "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
+            "FROM queue ORDER BY queue_position ASC"
+        ).fetchall()
 
         queue_uids: set[str] = set()
         for r in q_rows:
             uid = r[0]
             queue_uids.add(uid)
-            st = r[3] if len(r) > 3 and r[3] else "pending"
+            st = r[3]
             if status is not None and st != status:
                 continue
             if task_type is not None:
@@ -527,11 +469,6 @@ class _SqliteSnapshotReader:
         sql = (
             "SELECT attempt_no, run_id, outcome, started_at, settled_at, "
             "job_snapshot, files, result, error_message, job_uid "
-            "FROM attempts"
-            if self._has_att_settled_at
-            else
-            "SELECT attempt_no, run_id, outcome, started_at, finished_at, "
-            "NULL, NULL, NULL, error_message, job_uid "
             "FROM attempts"
         )
         params: list[Any] = []
@@ -822,10 +759,6 @@ class StateSnapshot:
                 reader = _MemorySnapshotReader(b)
             else:
                 raise TypeError(f"Unsupported backend on TaskLite instance: {type(b).__name__}")
-        elif hasattr(source, "path"):
-            reader = _SqliteSnapshotReader(Path(source.path))
-        elif hasattr(source, "_lock") and hasattr(source, "_queue"):
-            reader = _MemorySnapshotReader(source)
         else:
             raise TypeError(
                 f"source must be a str, Path, or TaskLite instance, got {type(source).__name__}"

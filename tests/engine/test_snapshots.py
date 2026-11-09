@@ -1,8 +1,10 @@
 """只读一致状态快照与 JSON 查询测试。"""
 from __future__ import annotations
 
+from contextlib import closing
 import os
 from pathlib import Path
+import sqlite3
 import pytest
 
 from tasklite import (
@@ -45,7 +47,7 @@ class TestStateSnapshotOpeningAndClosing:
     """快照生命周期与打开/关闭行为。"""
 
     def test_open_via_path_and_tasklite_instance(self, tmp_path):
-        db_path = tmp_path / "custom.db"
+        db_path = tmp_path / "custom # % space.db"
         backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
         backend.enqueue_jobs([Job("process", "j1").to_dict()])
 
@@ -60,6 +62,11 @@ class TestStateSnapshotOpeningAndClosing:
 
         assert s1.closed is True
         assert s1.is_closed is True
+        with pytest.raises(TypeError, match="source must be"):
+            StateSnapshot.open(backend)
+        with TaskLite(backend="sqlite", state_path=db_path) as sqlite_pipeline:
+            with StateSnapshot.open(sqlite_pipeline) as sqlite_snapshot:
+                assert sqlite_snapshot.get_job("process::j1") == job
 
         # 从 TaskLite 实例打开
         pipeline = TaskLite(backend="memory")
@@ -95,6 +102,7 @@ class TestStateSnapshotOpeningAndClosing:
     def test_invalid_source_and_missing_file_rejected(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             StateSnapshot.open(tmp_path / "nonexistent.db")
+        assert not list(tmp_path.iterdir())
 
         with pytest.raises(TypeError, match="source must be"):
             StateSnapshot.open(12345)  # type: ignore[arg-type]
@@ -103,10 +111,87 @@ class TestStateSnapshotOpeningAndClosing:
         empty_file.touch()
         with pytest.raises(TaskLiteError):
             StateSnapshot.open(empty_file)
+        empty_file.unlink()
+
+    @pytest.mark.parametrize(("version", "change", "message"), [
+        (5, None, "Unsupported database schema version 5"),
+        (TARGET_SCHEMA_VERSION, "DROP TABLE job_sequences", "for 'job_sequences'"),
+        (TARGET_SCHEMA_VERSION, "ALTER TABLE attempts ADD COLUMN extra TEXT", "for 'attempts'"),
+    ])
+    def test_invalid_schema_closes_connection_and_preserves_database(
+        self, tmp_path, monkeypatch, version, change, message,
+    ):
+        db_path = tmp_path / "invalid.db"
+        backend = SQLiteStateBackend(db_path, schema_version=version)
+        backend.enqueue_jobs([Job("process", "precious").to_dict()])
+        if change is not None:
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(change)
+
+        real_connect = sqlite3.connect
+        connections = []
+
+        def connect(database, *args, **kwargs):
+            assert kwargs.get("uri") is True
+            assert database == db_path.resolve().as_uri() + "?mode=ro"
+            connection = real_connect(database, *args, **kwargs)
+            connections.append(connection)
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", connect)
+        before = db_path.read_bytes()
+        with pytest.raises(TaskLiteError, match=message):
+            StateSnapshot.open(db_path)
+        assert len(connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connections[0].execute("SELECT 1")
+        assert db_path.read_bytes() == before
+        db_path.unlink()
+
+    def test_corrupt_database_is_preserved(self, tmp_path):
+        db_path = tmp_path / "corrupt.db"
+        original = b"not a SQLite database"
+        db_path.write_bytes(original)
+
+        with pytest.raises(TaskLiteError, match="not a database"):
+            StateSnapshot.open(db_path)
+
+        assert db_path.read_bytes() == original
+        db_path.unlink()
 
 
 class TestStateSnapshotIsolationAndConsistency:
     """快照隔离与多次读取一致性。"""
+
+    def test_readonly_snapshot_sees_active_wal_and_pins_first_version(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        first = Job("process", "first")
+        second = Job("process", "second")
+        with TaskLite(backend="sqlite", state_path=db_path) as pipeline:
+            pipeline.register_task(Task("process", dummy_handler))
+            with closing(sqlite3.connect(db_path)) as keeper:
+                assert keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
+                before = db_path.read_bytes()
+                pipeline.enqueue(first)
+                assert db_path.with_name(db_path.name + "-wal").stat().st_size > 0
+                assert db_path.read_bytes() == before
+
+                with StateSnapshot.open(db_path) as previous:
+                    first_record = previous.get_job(first.uid)
+                    assert first_record is not None
+                    assert first_record["status"] == "pending"
+                    assert previous.get_job(second.uid) is None
+
+                    pipeline.enqueue(second)
+
+                    assert previous.get_job(first.uid) == first_record
+                    assert previous.get_job(second.uid) is None
+                    with StateSnapshot.open(pipeline) as current:
+                        assert current.get_job(first.uid) == first_record
+                        assert {job["job_uid"] for job in current.iter_jobs()} == {
+                            first.uid, second.uid,
+                        }
+                assert db_path.read_bytes() == before
 
     def test_snapshot_remains_isolated_across_concurrent_commits(self, pipeline_fixture):
         p = pipeline_fixture

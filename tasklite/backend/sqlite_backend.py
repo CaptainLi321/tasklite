@@ -61,6 +61,52 @@ _TABLE_COLUMNS_V6: dict[str, tuple[str, ...]] = {
 _TABLE_COLUMNS = _TABLE_COLUMNS_V5
 
 
+def _schema_error(path: Path, schema_version: int, detail: str) -> RuntimeError:
+    return RuntimeError(
+        f"{path}: {detail}; 目标 schema {schema_version}。"
+        "请保留原库，使用匹配版本读取历史，或显式选择新的状态库路径。"
+    )
+
+
+def _check_schema(
+    conn: sqlite3.Connection, path: Path, schema_version: int,
+) -> int:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    objects = list(conn.execute(
+        "SELECT name, type FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'"
+    ))
+    if version == 0:
+        if objects:
+            raise _schema_error(
+                path, schema_version,
+                f"Unsupported table shape: version 0 非空库，已有对象 {sorted(objects)}"
+            )
+        return version
+    if version != schema_version:
+        raise _schema_error(path, schema_version, f"Unsupported database schema version {version}")
+    table_objects = {name: kind for name, kind in objects if kind in ("table", "view")}
+    if {"wall", "meta"} & {name.casefold() for name, kind in objects if kind == "table"}:
+        raise _schema_error(
+            path, schema_version, f"Unsupported table shape: version {version} 含异代 wall/meta 表"
+        )
+    columns_map = _TABLE_COLUMNS_V6 if schema_version == TARGET_SCHEMA_VERSION else _TABLE_COLUMNS_V5
+    for table, expected in columns_map.items():
+        if table_objects.get(table) != "table":
+            raise _schema_error(
+                path, schema_version,
+                f"Unsupported table shape for '{table}': version {version}, "
+                f"对象类型 {table_objects.get(table)!r}，必须为 table"
+            )
+        columns = {row[1] for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
+        if columns != set(expected):
+            raise _schema_error(
+                path, schema_version,
+                f"Unsupported table shape for '{table}': version {version}, "
+                f"expected columns {expected}, found {sorted(columns)}"
+            )
+    return version
+
+
 class SQLiteStateBackend(AbstractStateBackend):
     """原子 SQLite 状态后端：逐 job 单事务碎片化的 delta 提交。"""
 
@@ -111,41 +157,10 @@ class SQLiteStateBackend(AbstractStateBackend):
     # 初始化与 schema -------------------------------------------------
 
     def _schema_error(self, detail: str) -> RuntimeError:
-        return RuntimeError(
-            f"{self.path}: {detail}; 目标 schema {self.schema_version}。"
-            "请保留原库，使用匹配版本读取历史，或显式选择新的状态库路径。"
-        )
+        return _schema_error(self.path, self.schema_version, detail)
 
     def _check_schema(self, conn: sqlite3.Connection) -> int:
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        objects = list(conn.execute(
-            "SELECT name, type FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'"
-        ))
-        if version == 0:
-            if objects:
-                raise self._schema_error(
-                    f"Unsupported table shape: version 0 非空库，已有对象 {sorted(objects)}"
-                )
-            return version
-        if version != self.schema_version:
-            raise self._schema_error(f"Unsupported database schema version {version}")
-        table_objects = {name: kind for name, kind in objects if kind in ("table", "view")}
-        if {"wall", "meta"} & {name.casefold() for name, kind in objects if kind == "table"}:
-            raise self._schema_error(f"Unsupported table shape: version {version} 含异代 wall/meta 表")
-        columns_map = _TABLE_COLUMNS_V6 if self.schema_version == TARGET_SCHEMA_VERSION else _TABLE_COLUMNS_V5
-        for table, expected in columns_map.items():
-            if table_objects.get(table) != "table":
-                raise self._schema_error(
-                    f"Unsupported table shape for '{table}': version {version}, "
-                    f"对象类型 {table_objects.get(table)!r}，必须为 table"
-                )
-            columns = {row[1] for row in conn.execute(f'PRAGMA table_xinfo("{table}")')}
-            if columns != set(expected):
-                raise self._schema_error(
-                    f"Unsupported table shape for '{table}': version {version}, "
-                    f"expected columns {expected}, found {sorted(columns)}"
-                )
-        return version
+        return _check_schema(conn, self.path, self.schema_version)
 
     def _preflight_schema(self) -> None:
         try:
