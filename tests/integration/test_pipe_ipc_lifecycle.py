@@ -6,7 +6,7 @@
 - 子进程被信号击杀（SIGKILL）、异常退出（os._exit）、看门狗超时的
   单次失败与产物清理；
 - 产物清理 PermissionError 阻断终态提交并保留原队列快照；
-- DRAINING / ABORTING 停机对在途声明、挂起信号与已完成结果的排空与结算；
+- DRAINING / ABORTING 停机对在途声明与已完成结果的排空与结算；
 - 非法管道帧（损坏 JSON / 未知 kind / job_uid 不匹配 / execution_id 不匹配）
   的零伪成功防御与失败授权清理。
 """
@@ -46,7 +46,7 @@ def success_handler(job: Job, ctx) -> TaskResult:
     ctx.declare_file("source", FileSpec(output, role="input"))
     ctx.set_cursor("position", "42")
     ctx.spawn(Job("child", "child"))
-    ctx.suspend_resource("api", 60)
+    assert not hasattr(ctx, "suspend_resource")
     return TaskResult.success(metadata={"worker_pid": os.getpid()})
 
 
@@ -87,9 +87,9 @@ def controlled_handler(job: Job, ctx) -> TaskResult:
     kept.write_text("保留产物", encoding="utf-8")
     temporary = Path(ctx.declare_file("temporary", FileSpec(ctx.output_roots / "temporary.txt", role="cache", delete_on_success=True, delete_on_failure=True)))
     temporary.write_text("临时产物", encoding="utf-8")
-    ctx.declare_file("source", FileSpec(kept, role="input"))
-    ctx.suspend_resource("api", 60)
     (sync_dir / "ready").write_text(str(os.getpid()), encoding="utf-8")
+    ctx.declare_file("source", FileSpec(kept, role="input"))
+    assert not hasattr(ctx, "suspend_resource")
     assert _wait_until(lambda: (sync_dir / "release").exists(), timeout=20.0)
     return TaskResult.success(metadata={"completed": True})
 

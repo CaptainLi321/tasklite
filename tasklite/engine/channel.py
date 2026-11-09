@@ -19,7 +19,7 @@ import signal
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,7 +31,6 @@ from ..models.result import TaskResult, validate_strict_json_object
 from ..utils.ipc import (
     PIPE_MSG_DECLARE,
     PIPE_MSG_RESULT,
-    PIPE_MSG_SUSPEND,
     WorkerPipeMessage,
     WorkerPipeReceiver,
     WorkerPipeSender,
@@ -263,10 +262,12 @@ def _isolate_worker_process_signals() -> None:
     """让进程组停止信号只由主进程处理。"""
     if os.name != "posix":
         return
-    try:
-        os.setsid()
-    except OSError:
-        pass
+    setsid = getattr(os, "setsid", None)
+    if setsid is not None:
+        try:
+            setsid()
+        except OSError:
+            pass
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
@@ -424,15 +425,10 @@ class WorkerLaunchSpec:
 
 @dataclass(frozen=True)
 class AbortOutcome:
-    """强制终止/异常停机时的收尾结果。
-
-    salvaged_signals：杀进程后补排空捞回的 (uid, resource, seconds)——
-    cancelled 任务的挂起信号经本列表带回上层应用（suspend 的 max 语义保证重复应用幂等）。
-    """
+    """强制终止/异常停机时的收尾结果。"""
 
     completed: list[tuple[JobHandle, ExecutionResult]]
     cancelled: list[JobHandle]
-    salvaged_signals: list[tuple[str, str, float]] = field(default_factory=list)
 
 
 class ExecutionChannel:
@@ -460,7 +456,6 @@ class ExecutionChannel:
         self._handles: dict[str, JobHandle] = {}
         self._results: dict[str, dict[str, Any]] = {}
         self._errors: dict[str, Exception] = {}
-        self._pending_signals: list[tuple[str, str, float]] = []
         self._lingering_workers: list[tuple[str, Any, WorkerPipeReceiver | None]] = []
         self._health_stops: dict[str, threading.Event] = {}
         if self.ipc_dir:
@@ -589,20 +584,7 @@ class ExecutionChannel:
 
     def _accept_message(self, handle: JobHandle, msg: WorkerPipeMessage) -> None:
         """消费一条已校验信封的管道消息并更新通道内存状态。"""
-        if msg.kind == PIPE_MSG_SUSPEND:
-            if (
-                not isinstance(msg.payload, (list, tuple))
-                or len(msg.payload) != 2
-                or not isinstance(msg.payload[0], str)
-                or not msg.payload[0]
-                or not isinstance(msg.payload[1], (int, float))
-                or isinstance(msg.payload[1], bool)
-            ):
-                raise ValueError(f"invalid suspend signal for {handle.job_uid}: {msg.payload!r}")
-            self._pending_signals.append(
-                (handle.job_uid, msg.payload[0], float(msg.payload[1]))
-            )
-        elif msg.kind == PIPE_MSG_DECLARE:
+        if msg.kind == PIPE_MSG_DECLARE:
             if not isinstance(msg.payload, dict):
                 raise ValueError(f"invalid declare payload for {handle.job_uid}")
             reply_sender = self._reply_senders.get(handle.execution_id or "")
@@ -711,20 +693,8 @@ class ExecutionChannel:
         if reply_sender is not None:
             reply_sender.close()
 
-    def _salvage_signals(self, job_uid: str) -> list[tuple[str, float]]:
-        """提取该 job_uid 已收取但尚未被上层排空的挂起信号。"""
-        pending: list[tuple[str, float]] = []
-        remaining: list[tuple[str, str, float]] = []
-        for u, r_name, secs in self._pending_signals:
-            if u == job_uid:
-                pending.append((r_name, secs))
-            else:
-                remaining.append((u, r_name, secs))
-        self._pending_signals = remaining
-        return pending
-
     def _consume_result_if_present(self, handle: JobHandle) -> ExecutionResult | None:
-        """读取已收到的结果负载 → 守卫过滤 → 解码 → 信号并入。
+        """读取已收到的结果负载 → 守卫过滤 → 解码。
 
         守卫契约：任何字典结果都是一次尝试结果；内容损坏由解码器收敛为失败。
         """
@@ -735,9 +705,7 @@ class ExecutionChannel:
         if not isinstance(raw_res, dict):
             return None
         self._results.pop(exec_id, None)
-        decoded = _decode_ipc_result(raw_res, handle.job)
-        self._salvage_signals(handle.job_uid)
-        return decoded
+        return _decode_ipc_result(raw_res, handle.job)
 
     def _reap_lingering_workers(self) -> None:
         """非阻塞轮询已结算但残留的子进程与管道接收端，进程死亡后回收句柄。"""
@@ -841,7 +809,6 @@ class ExecutionChannel:
             if exec_id in self._results:
                 raw_res = self._results.pop(exec_id)
                 decoded = _decode_ipc_result(raw_res, handle.job)
-                self._salvage_signals(handle.job_uid)
                 self._handles.pop(exec_id, None)
                 receiver = self._receivers.pop(exec_id, None)
                 self._errors.pop(exec_id, None)
@@ -927,12 +894,6 @@ class ExecutionChannel:
                 result = self._build_terminal_failure(p, handle, is_timeout=is_timeout)
         finally:
             self._finalize_process(p)
-            pending_signals = self._salvage_signals(handle.job_uid)
-            if pending_signals:
-                logger.info(
-                    f"Salvaged {len(pending_signals)} suspend signal(s) "
-                    f"from {handle.job_uid} before IPC cleanup"
-                )
             self._close_handle_pipe(exec_id)
             self._handles.pop(exec_id, None)
             self._results.pop(exec_id, None)
@@ -971,22 +932,6 @@ class ExecutionChannel:
             message=message,
         )
 
-    def drain_active_signals(self, uids: Iterable[str]) -> list[tuple[str, str, float]]:
-        """排空指定在途任务已发送的 suspend 信号。"""
-        uid_set = set(uids)
-        for handle in list(self._handles.values()):
-            if handle.job_uid in uid_set:
-                self._receive_available(handle)
-        signals: list[tuple[str, str, float]] = []
-        remaining: list[tuple[str, str, float]] = []
-        for job_uid, r_name, secs in self._pending_signals:
-            if job_uid in uid_set:
-                signals.append((job_uid, r_name, secs))
-            else:
-                remaining.append((job_uid, r_name, secs))
-        self._pending_signals = remaining
-        return signals
-
     def abort_in_flight(self, handles: Sequence[JobHandle]) -> AbortOutcome:
         """TOCTOU 闭环中止：初查分类 → 进程终止 → 排空管道至 EOF → 重探测闭环 → 关闭管道。"""
         if not handles:
@@ -1012,14 +957,12 @@ class ExecutionChannel:
 
         for handle, decoded in done_pairs:
             self._drain_finished(handle)
-            self._salvage_signals(handle.job_uid)
             exec_id = handle.execution_id or ""
             self._close_handle_pipe(exec_id)
             self._handles.pop(exec_id, None)
             self._results.pop(exec_id, None)
             self._errors.pop(exec_id, None)
 
-        salvaged: list[tuple[str, str, float]] = []
         truly_cancelled: list[JobHandle] = []
         for handle in pending_handles:
             self._drain_finished(handle)
@@ -1027,10 +970,6 @@ class ExecutionChannel:
             if decoded is not None:
                 done_pairs.append((handle, decoded))
             else:
-                salvaged.extend(
-                    (handle.job_uid, r_name, secs)
-                    for r_name, secs in self._salvage_signals(handle.job_uid)
-                )
                 truly_cancelled.append(handle)
             exec_id = handle.execution_id or ""
             self._close_handle_pipe(exec_id)
@@ -1038,11 +977,7 @@ class ExecutionChannel:
             self._results.pop(exec_id, None)
             self._errors.pop(exec_id, None)
 
-        return AbortOutcome(
-            completed=done_pairs,
-            cancelled=truly_cancelled,
-            salvaged_signals=salvaged,
-        )
+        return AbortOutcome(completed=done_pairs, cancelled=truly_cancelled)
 
     def cleanup_in_flight(self, handles: Sequence[JobHandle]) -> None:
         """主循环异常退出时 kill + join 所有残留 in-flight 子进程并关闭管道与声明。"""
@@ -1063,7 +998,6 @@ class ExecutionChannel:
                 self._handles.pop(exec_id, None)
                 self._results.pop(exec_id, None)
                 self._errors.pop(exec_id, None)
-                self._salvage_signals(handle.job_uid)
             except Exception as e:
                 logger.error(f"Error cleaning up in-flight job {handle.job_uid}: {e}")
 

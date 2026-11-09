@@ -935,17 +935,10 @@ def test_urllib_fetch_429_signal(local_http_server: str) -> None:
 
 def test_urllib_fetch_429_has_no_core_resource_side_effect(
     local_http_server: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[object, ...]] = []
-
-    def _record_suspension(_self: JobContext, *args: object) -> None:
-        calls.append(args)
-
-    monkeypatch.setattr(JobContext, "suspend_resource", _record_suspension)
     with pytest.raises(RateLimitHit):
         urllib_fetch(f"{local_http_server}/429")
-    assert calls == []
+    assert not hasattr(JobContext, "suspend_resource")
 
 
 def test_urllib_fetch_500_retry(local_http_server: str) -> None:

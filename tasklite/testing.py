@@ -73,10 +73,9 @@ def fake_ctx(
         protected_roots: 不可声明为产物的框架状态目录。
         failed: 已进失败档案的 uid 集合。
         cursors: 游标初值映射（``ctx.get_cursor`` 命中源）。
-        tmp_root: 提供时在其下创建一次性临时目录作为 ``output_roots``，
-            并建 ``ipc`` 子目录供独立测试上下文使用。路径经 ``ctx.output_roots`` / ``ctx.ipc_dir``
-            读取；目录清理由调用方的 tmp_root 机制（如 pytest tmp_path
-            的会话级回收）统一承担。
+        tmp_root: 提供时在其下创建一次性临时目录作为 ``output_roots``。
+            目录清理由调用方的 tmp_root 机制（如 pytest tmp_path 的会话级
+            回收）统一承担。
         output_roots: 直接指定产物根目录（与 tmp_root 互斥使用）。
         ipc_dir: 直接指定 IPC 目录（caller 选定目录，非 tmp_root 子目录）。
         base_dir: 相对路径解析基准目录（默认当前工作目录）。
@@ -89,10 +88,7 @@ def fake_ctx(
     if tmp_root is not None:
         base = Path(tempfile.mkdtemp(dir=str(tmp_root)))
         output_roots = base
-        if ipc_dir is None:
-            ipc_dir = str(base / "ipc")
-            Path(ipc_dir).mkdir(parents=True, exist_ok=True)
-    elif ipc_dir is not None:
+    if ipc_dir is not None:
         Path(ipc_dir).mkdir(parents=True, exist_ok=True)
     return JobContext(
         job,

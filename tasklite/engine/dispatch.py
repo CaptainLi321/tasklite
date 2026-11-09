@@ -620,10 +620,6 @@ class DispatchMachine:
 
     # ── 轨迹开行与 spawn ──────────────────────────────────────────────
 
-    def _drain_signals_before_reserve(self, job_uid: str) -> None:
-        """在 reserve 二次检查前排空在途 worker 的挂起信号。"""
-        self._recovery.apply_pending_signals(job_uid)
-
     def _open_attempt(self, job: Job) -> tuple[int | None, str]:
         """派发即插 running 轨迹行，返回 (轨迹行 id, execution_id)。
 
@@ -725,9 +721,7 @@ class DispatchMachine:
         state: "PipelineState",
         files: Mapping[str, FileSpec] | None = None,
     ) -> JobContext:
-        """组装执行上下文（资源名与已完成状态快照随 ctx 下发子进程）。"""
-        # 资源名注册集快照随 ctx 下发——suspend_resource 对未注册名
-        # fail-loud（typo 不静默失效）。
+        """组装执行上下文（已完成状态快照随 ctx 下发子进程）。"""
         # 不变式：successes/failed 活索引在快照边界冻结为 frozenset——
         # JobContext 持有的必须是派发时刻快照，绝不引用活集合。
         return JobContext(
@@ -737,7 +731,6 @@ class DispatchMachine:
             dict(state.cursors),
             output_roots=self._output_roots,
             ipc_dir=self._ipc_dir,
-            resource_names=frozenset(self._resources),
             protected_roots=self._protected_roots,
             base_dir=self._trigger_registry.base_dir,
             known_job_uids=frozenset(

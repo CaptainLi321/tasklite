@@ -123,9 +123,6 @@ class RecoveryOrchestrator:
             )
         return state
 
-    def apply_pending_signals(self, extra_uid: str | None = None) -> None:
-        pass
-
     def abort_in_flight(self) -> None:
         """异常/强制停机时：终止进行中的子进程并消费已完成的结果。
 

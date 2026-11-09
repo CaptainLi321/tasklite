@@ -1,4 +1,4 @@
-"""v2 JobContext 契约测试：spawn 预检、产物/输入声明沙盒、游标与资源挂起。
+"""v2 JobContext 契约测试：spawn 预检、产物/输入声明沙盒与游标。
 
 """
 
@@ -12,11 +12,6 @@ import pytest
 from tasklite import FileSpec
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
-from tasklite.utils.ipc import (
-    PIPE_MSG_SUSPEND,
-    WorkerPipeMessage,
-    create_worker_pipe,
-)
 
 
 def _make_ctx(
@@ -25,7 +20,6 @@ def _make_ctx(
     successes: set[str] | None = None,
     failed: set[str] | None = None,
     cursors: dict[str, str] | None = None,
-    resources: frozenset | None = None,
     output_roots: Path | None = None,
     ipc_dir: str | None = None,
 ) -> JobContext:
@@ -37,7 +31,6 @@ def _make_ctx(
         cursors=cursors if cursors is not None else {},
         output_roots=output_roots,
         ipc_dir=ipc_dir,
-        resource_names=resources,
     )
 
 
@@ -194,53 +187,12 @@ class TestInputFileSpec:
         ) == folder
 
 
-class TestSuspendResource:
-    """suspend_resource：注册名单 fail-loud 与数值校验。"""
+class TestRemovedResourceSuspension:
+    """资源挂起接口不属于稳定 JobContext 公开面。"""
 
-    def test_unknown_resource_rejected(self):
-        ctx = _make_ctx(resources=frozenset({"api_known"}))
-        with pytest.raises(ValueError, match="Unknown resource"):
-            ctx.suspend_resource("api_typo", 60.0)
-
-    def test_registered_resource_accepted(self, tmp_path):
-        ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(resources=frozenset({"api_known"}), ipc_dir=ipc)
-        receiver, sender = create_worker_pipe(
-            job_uid=ctx.job.uid,
-            execution_id="exec_susp_1",
-        )
-        ctx._bind_pipe_sender(sender)
-        ctx.suspend_resource("api_known", 60.0)
-        sender.close()
-        assert ctx.resource_suspensions == [("api_known", 60.0)]
-        messages = receiver.drain_to_eof(timeout=3.0)
-        receiver.close()
-        assert len(messages) == 1
-        assert isinstance(messages[0], WorkerPipeMessage)
-        assert messages[0].kind == PIPE_MSG_SUSPEND
-        assert messages[0].payload == ["api_known", 60.0]
-
-    def test_no_resources_rejects_all(self):
+    def test_suspend_resource_is_absent(self):
         ctx = _make_ctx()
-        with pytest.raises(ValueError, match="Unknown resource"):
-            ctx.suspend_resource("anything", 60.0)
-
-    def test_empty_resource_name_rejected(self):
-        ctx = _make_ctx(resources=frozenset({""}))
-        with pytest.raises(TypeError, match="resource_name must be a non-empty str"):
-            ctx.suspend_resource("", 60.0)
-
-    def test_seconds_matrix_rejected(self):
-        """非数值/bool/NaN/Inf/非正/超大 int 拒绝（超大 int 收敛
-        ValueError 而非裸 OverflowError）。"""
-        ctx = _make_ctx(resources=frozenset({"api"}))
-        with pytest.raises(TypeError, match="seconds must be a number"):
-            ctx.suspend_resource("api", "60")
-        with pytest.raises(TypeError, match="seconds must be a number"):
-            ctx.suspend_resource("api", True)
-        for bad in (float("nan"), float("inf"), 0, -5.0, 10**400):
-            with pytest.raises(ValueError, match="seconds must be finite and > 0"):
-                ctx.suspend_resource("api", bad)
-        assert ctx.resource_suspensions == []
+        assert not hasattr(ctx, "suspend_resource")
+        assert not hasattr(ctx, "resource_suspensions")
 
 

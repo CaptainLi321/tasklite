@@ -33,7 +33,7 @@ _EXECUTION_ID = "deadbeefdeadbeefdeadbeefdeadbeef.1"
 
 
 def make_ctx(job: Job) -> JobContext:
-    """最小 JobContext 装配（声明/挂起默认空，ipc_dir 由 spawn 回填）。"""
+    """最小 JobContext 装配（声明默认空，ipc_dir 由 spawn 回填）。"""
     return JobContext(job, success_job_uids=set(), failed_job_uids=set(), cursors={})
 
 
@@ -64,15 +64,6 @@ class TestExecutionChannelBasics:
         channel = ExecutionChannel(ipc_dir)
         assert ipc_dir.exists()
         assert channel.ipc_dir == str(ipc_dir)
-
-    def test_drain_active_signals(self, tmp_path):
-        channel = ExecutionChannel(tmp_path)
-        channel._pending_signals.append(("job_signals", "gpu", 15.0))
-        channel._pending_signals.append(("job_signals", "api", 3.0))
-
-        signals = channel.drain_active_signals(["job_signals", "job_other"])
-        assert ("job_signals", "gpu", 15.0) in signals
-        assert ("job_signals", "api", 3.0) in signals
 
     def test_duplicate_result_frame_keeps_first_payload(self, tmp_path):
         channel = ExecutionChannel(tmp_path)
@@ -445,7 +436,7 @@ class TestDecodeIpcResultDefense:
         assert "missing status" in (result.message or "")
 
     def test_result_payload_rejects_unknown_fields(self):
-        result = _decode(dict(_BASE_OK, resource_suspensions=[]))
+        result = _decode(dict(_BASE_OK, unexpected_field=[]))
         assert result.success is False
         assert result.retry_requested is False
         assert "unsupported fields" in (result.message or "")
@@ -724,49 +715,13 @@ class TestAbortInFlight:
         assert outcome.cancelled[0].job_uid == job_pending.uid
         assert unfinished.exists()
 
-    def test_abort_salvages_signal_written_before_kill(self, tmp_path):
-        """杀进程后补排空：「先排空后杀」窗口内终前写入的 suspend 信号捞回。"""
-        channel = ExecutionChannel(tmp_path)
-        job = Job("task", "salvage")
-
-        class KillWritingProcess:
-            """kill() 时写入 suspend 信号的 stub：确定性复现终前写窗口。"""
-
-            def __init__(self):
-                self._alive = True
-
-            def is_alive(self):
-                return self._alive
-
-            def kill(self):
-                self._alive = False
-                channel._pending_signals.append((job.uid, "gpu", 30.0))
-
-            def join(self, timeout=None):
-                pass
-
-            def close(self):
-                pass
-
-        h = JobHandle(
-            job_uid=job.uid, process=KillWritingProcess(),
-            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
-            ipc_dir=str(tmp_path), execution_id="inc_salvage",
-        )
-
-        outcome = channel.abort_in_flight([h])
-
-        assert [handle.job_uid for handle in outcome.cancelled] == [job.uid]
-        assert outcome.salvaged_signals == [(job.uid, "gpu", 30.0)]
-        assert channel._pending_signals == []
-
-    def test_abort_reprobe_completed_merges_post_drain_signals(self, tmp_path):
-        """重探测完成分支：终前写入的结果与信号都被消费。"""
+    def test_abort_reprobe_consumes_result_written_on_kill(self, tmp_path):
+        """重探测完成分支：终前写入的结果仍被消费。"""
         channel = ExecutionChannel(tmp_path)
         job = Job("task", "reprobe")
 
         class FinishOnKillProcess:
-            """kill() 时写最终结果 + suspend 信号的 stub。"""
+            """kill() 时写最终结果的 stub。"""
 
             def __init__(self):
                 self._alive = True
@@ -780,7 +735,6 @@ class TestAbortInFlight:
                     "status": "success",
                     "metadata": {"done": 1},
                 }
-                channel._pending_signals.append((job.uid, "api", 5.0))
 
             def join(self, timeout=None):
                 pass
@@ -798,7 +752,6 @@ class TestAbortInFlight:
 
         assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
         assert outcome.completed[0][1].success is True
-        assert outcome.salvaged_signals == []
 
     def test_abort_interrupted_status_settles_failure(self, tmp_path):
         """不支持的 interrupted 状态按一次损坏结果失败结算。"""
@@ -828,7 +781,6 @@ class TestAbortInFlight:
         outcome = channel.abort_in_flight([])
         assert outcome.completed == []
         assert outcome.cancelled == []
-        assert outcome.salvaged_signals == []
 
 
 class TestCleanupInFlight:
@@ -836,7 +788,6 @@ class TestCleanupInFlight:
         channel = ExecutionChannel(tmp_path)
         job = Job("task", "residual")
         channel._results[_EXECUTION_ID] = {"status": "success"}
-        channel._pending_signals.append((job.uid, "api", 1.0))
         handle = JobHandle(
             job_uid=job.uid, process=TestAbortInFlight.MockProcess(),
             timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
@@ -846,4 +797,3 @@ class TestCleanupInFlight:
         channel.cleanup_in_flight([handle])
 
         assert _EXECUTION_ID not in channel._results
-        assert channel._pending_signals == []

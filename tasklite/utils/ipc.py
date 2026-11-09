@@ -4,7 +4,7 @@
 
 - 单向管道传输：基于 ``multiprocessing.Pipe(duplex=False)`` 的原生帧收发
   （``send_bytes`` / ``recv_bytes``），每 worker 独立读取线程与有界队列，
-  承载 ``declare`` / ``suspend`` / ``result`` 信封消息；
+  承载 ``declare`` / ``result`` 信封消息；
 - 动态声明：worker 侧请求回复声明，主进程侧完成解析、授权与准备；
 - 回复身份：响应严格绑定 job_uid、execution_id 与 request_id。
 
@@ -40,12 +40,10 @@ class _PipeConnection(Protocol):
 
 # 管道消息种类常量
 PIPE_MSG_INPUT = "input"
-PIPE_MSG_SUSPEND = "suspend"
 PIPE_MSG_RESULT = "result"
 PIPE_MSG_DECLARE = "declare"
 VALID_PIPE_MESSAGE_KINDS = frozenset(
     {
-        PIPE_MSG_SUSPEND,
         PIPE_MSG_RESULT,
         PIPE_MSG_DECLARE,
     }
@@ -175,10 +173,6 @@ class WorkerPipeSender:
             if self._closed:
                 raise OSError("worker pipe sender is closed")
             self._conn.send_bytes(frame)
-
-    def send_suspend(self, resource_name: str, seconds: float) -> None:
-        """发送资源挂起信号。"""
-        self.send_message(PIPE_MSG_SUSPEND, [resource_name, float(seconds)])
 
     def send_result(self, result_dict: dict[str, Any]) -> None:
         """发送执行结果负载。"""
@@ -624,7 +618,6 @@ def create_worker_reply_pipe(
 __all__ = [
     "PIPE_MSG_DECLARE",
     "PIPE_MSG_RESULT",
-    "PIPE_MSG_SUSPEND",
     "VALID_PIPE_MESSAGE_KINDS",
     "WorkerPipeMessage",
     "WorkerPipeReceiver",

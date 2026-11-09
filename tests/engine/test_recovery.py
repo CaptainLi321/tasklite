@@ -98,7 +98,7 @@ class _DoneProcess:
 
 
 class _FinishOnKillProcess:
-    """kill() 时通过通道回传最终结果 + suspend 信号的进程桩（TOCTOU 窗口复现）。"""
+    """kill() 时通过通道回传最终结果的进程桩（TOCTOU 窗口复现）。"""
 
     def __init__(self, channel, uid, execution_id):
         self._alive = True
@@ -123,7 +123,6 @@ class _FinishOnKillProcess:
             "spawned_jobs": [],
             "cursor_updates": {},
         }
-        self._channel._pending_signals.append((self._uid, "api", 5.0))
 
     def close(self):
         pass
@@ -211,7 +210,6 @@ class TestAbortInFlight:
         )
         assert cancelled == []
         assert done[0][1].success is True
-        assert channel._pending_signals == []
 
     def test_abort_releases_resources_before_settlement(self, tmp_path):
         """已占用资源在结算前统一释放（防泄漏）。"""

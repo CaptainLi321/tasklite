@@ -24,10 +24,6 @@ logger = logging.getLogger("tasklite")
 _REAL_SLEEP = time.sleep
 
 
-# 资源挂起持久化键名（运维与诊断复用）
-ENGINE_METADATA_RESOURCE_SUSPENSIONS = "resource_suspensions"
-
-
 @dataclass(frozen=True)
 class ResourceQueryResult:
     """资源可用性三态查询结果（不可变值对象）。

@@ -1,6 +1,6 @@
 """v2 JobContext：handler 执行上下文（属于一次 job 执行）。
 
-提供 spawn、产物/输入声明、游标与资源挂起 API。快照语义：每个 job
+提供 spawn、产物/输入声明与游标 API。快照语义：每个 job
 派发时构造一次，successes/failed 键集合为该时刻快照——同一 run 内后派发
 的 job 能看到先前完成的任务，不反映构造之后其他并发 in-flight job
 的完成/失败。
@@ -8,8 +8,6 @@
 from __future__ import annotations
 
 import copy
-import logging
-import math
 import os
 import uuid
 from collections.abc import Mapping, Sequence
@@ -30,11 +28,9 @@ from .artifact import (
 )
 from .job import Job
 
-logger = logging.getLogger("tasklite")
-
 
 class JobContext:
-    """传给 handler 的执行上下文：spawn / 产物声明 / 游标 / 资源挂起。"""
+    """传给 handler 的执行上下文：spawn / 产物声明 / 游标。"""
 
     def __init__(
         self,
@@ -44,7 +40,6 @@ class JobContext:
         cursors: dict[str, str],
         output_roots: str | Path | Sequence[str | Path] | None = None,
         ipc_dir: str | None = None,
-        resource_names: frozenset | set | None = None,
         artifact_descriptions: dict[str, dict[str, dict[str, str]]] | None = None,
         protected_roots: tuple[str | Path, ...] = (),
         base_dir: str | Path | None = None,
@@ -62,7 +57,6 @@ class JobContext:
         self._reply_receiver: WorkerReplyReceiver | None = None
         self.job = job
         self.spawned_jobs: list[Job] = []
-        self.resource_suspensions: list[tuple[str, float]] = []
         self._file_sources: dict[str, FileSpec] = {}
         self._files: dict[str, FileSpec] = {}
         job_files = getattr(job, "files", {}) or {}
@@ -90,10 +84,6 @@ class JobContext:
         )
         self._cursors = cursors
         self.cursor_updates: dict[str, str | None] = {}
-        # 已注册资源名快照——suspend_resource 据此 fail-loud。
-        # 不变式：恒为冻结集合；空集意味着无已注册资源，任何资源名的
-        # suspend 请求一律入口拒绝——未注册名永不静默放行。
-        self._resource_names: frozenset = frozenset(resource_names or ())
         # output_roots 支持多根（跨盘输出场景）——解析时
         # 路径属于**任一**根即通过沙盒校验。
         self.output_roots = output_roots
@@ -245,40 +235,6 @@ class JobContext:
             self._cursors.pop(key, None)
         else:
             self._cursors[key] = value
-
-    def suspend_resource(self, resource_name: str, seconds: float) -> None:
-        """请求全局挂起一个资源（如 429 限速）。
-
-        API 边界即校验（与 set_cursor 的严格校验对称）——非数值/非有限/
-        非正值在入口拒绝，而非延迟到挂起清洗层静默忽略，避免调用方
-        误以为 suspend 已生效。
-
-        挂起信号经瞬时管道实时发送至父进程，同时保留 resource_suspensions
-        供正常完成结果携带（去重由挂起的 max 语义保证）。
-        """
-        if not isinstance(resource_name, str) or not resource_name:
-            raise TypeError(f"resource_name must be a non-empty str, got {resource_name!r}")
-        if resource_name not in self._resource_names:
-            raise ValueError(
-                f"Unknown resource {resource_name!r} (registered: "
-                f"{sorted(self._resource_names)}); suspend request ignored"
-            )
-        if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
-            raise TypeError(f"seconds must be a number, got {type(seconds).__name__} ({seconds!r})")
-        try:
-            finite = math.isfinite(seconds)
-        except OverflowError:
-            finite = False
-        if not finite or seconds <= 0:
-            raise ValueError(f"seconds must be finite and > 0, got {seconds!r}")
-        self.resource_suspensions.append((resource_name, seconds))
-        if self._pipe_sender is not None:
-            try:
-                self._pipe_sender.send_suspend(resource_name, seconds)
-            except OSError:
-                pass
-        logger.info(f"Job requested global suspension of resource '{resource_name}' for {seconds}s.")
-
 
 __all__ = [
     "JobContext",

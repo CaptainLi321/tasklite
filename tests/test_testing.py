@@ -1,8 +1,8 @@
 """v2 测试辅助工具回归（fake_ctx / running）。
 
 契约：successes/failed/cursors 的内部容器结构由构造器兜底装配（调用方传
-任意可迭代/映射即可）；tmp_root 模式提供沙盒 output_roots 与可记录的
-ipc 目录；运行句柄保证 run 期旗子复位（漏复位污染同会话后续用例）。
+任意可迭代/映射即可）；tmp_root 模式仅提供沙盒 output_roots；运行句柄
+保证 run 期旗子复位（漏复位污染同会话后续用例）。
 """
 from __future__ import annotations
 
@@ -84,13 +84,13 @@ class TestFakeCtxBasics:
 
 
 class TestFakeCtxTmpRoot:
-    """tmp_root 模式：沙盒 output_roots + 可记录 ipc 目录。"""
+    """tmp_root 模式只提供沙盒 output_roots。"""
 
-    def test_output_root_and_ipc_under_tmp_root(self, tmp_path):
+    def test_output_root_under_tmp_root_without_fake_ipc_dir(self, tmp_path):
         ctx = fake_ctx(_job(), tmp_root=tmp_path)
         assert Path(ctx.output_roots).parent == tmp_path
-        assert Path(ctx.ipc_dir).parent == Path(ctx.output_roots)
-        assert Path(ctx.ipc_dir).is_dir()
+        assert ctx.ipc_dir is None
+        assert not (Path(ctx.output_roots) / "ipc").exists()
 
     def test_declare_file_uses_explicit_output_path(self, tmp_path):
         ctx = fake_ctx(_job(), tmp_root=tmp_path)

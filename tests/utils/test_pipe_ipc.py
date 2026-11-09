@@ -9,6 +9,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import struct
+import sys
 import threading
 import time
 
@@ -18,7 +19,6 @@ from tasklite.models.artifact import FileSpec
 from tasklite.utils.ipc import (
     PIPE_MSG_DECLARE,
     PIPE_MSG_RESULT,
-    PIPE_MSG_SUSPEND,
     WorkerPipeMessage,
     create_worker_pipe,
     decode_worker_pipe_message,
@@ -30,7 +30,6 @@ def _sequential_sender_worker(sender) -> None:
         sender.send_declare(
             "request", "out", FileSpec("/tmp/out.txt", role="output", delete_on_failure=True).to_dict(),
         )
-        sender.send_suspend("api", 2.5)
         sender.send_result({"status": "success", "result": 42})
     finally:
         sender.close()
@@ -102,17 +101,34 @@ class TestWorkerPipePrimitives:
         receiver.close()
         sender.close()
 
-        assert len(messages) == 3
+        assert len(messages) == 2
         assert all(isinstance(m, WorkerPipeMessage) for m in messages)
         kinds = [m.kind for m in messages if isinstance(m, WorkerPipeMessage)]
         assert kinds == [
             PIPE_MSG_DECLARE,
-            PIPE_MSG_SUSPEND,
             PIPE_MSG_RESULT,
         ]
         res_msg = messages[-1]
         assert isinstance(res_msg, WorkerPipeMessage)
         assert res_msg.payload == {"status": "success", "result": 42}
+
+    def test_suspend_message_is_not_part_of_pipe_protocol(self):
+        receiver, sender = create_worker_pipe(
+            job_uid="t::removed",
+            execution_id="exec_removed_1",
+        )
+        try:
+            assert not hasattr(sender, "send_suspend")
+            with pytest.raises(ValueError, match="unknown worker pipe message kind"):
+                decode_worker_pipe_message(
+                    b'{"job_uid":"t::removed","execution_id":"exec_removed_1",'
+                    b'"kind":"suspend","payload":["api", 1.0]}',
+                    expected_job_uid="t::removed",
+                    expected_execution_id="exec_removed_1",
+                )
+        finally:
+            sender.close()
+            receiver.close()
 
     def test_backpressure_and_resume(self):
         ctx = mp.get_context("spawn")
@@ -189,6 +205,7 @@ class TestWorkerPipePrimitives:
         receiver.close(timeout=3.0)
         assert not receiver._thread.is_alive()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe fd semantics")
     def test_partial_frame_sender_exit_reports_error_or_eof_without_hang(self):
         ctx = mp.get_context("spawn")
         receiver, sender = create_worker_pipe(
@@ -207,6 +224,7 @@ class TestWorkerPipePrimitives:
         assert proc.exitcode == 1
         assert all(isinstance(item, Exception) for item in items)
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe fd semantics")
     def test_close_raises_runtime_error_when_writer_still_alive_on_partial_frame(self):
         ctx = mp.get_context("spawn")
         receiver, sender = create_worker_pipe(

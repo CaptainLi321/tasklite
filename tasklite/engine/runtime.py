@@ -782,7 +782,6 @@ class EngineRuntime:
         """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
         if not self._in_flight:
             return 0
-        self._recovery.apply_pending_signals()
         handles = self._in_flight.active_handles()
         completed = self.channel.reap_completed(handles)
         return self._completion.settle_reaped(completed)
