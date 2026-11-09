@@ -371,13 +371,13 @@ class TestSpawnedJobs:
     """动态子任务去重与坏子作业拒绝。"""
 
     def test_spawn_dedup_queue_hit_blocks_rerun(self, tmp_path):
-        """queue/in-flight 命中无条件拦截，优先于 every_run 豁免。"""
+        """已入队的相同有效配置只保留一份，即使触发器允许重跑。"""
         env = CompletionEnv(tmp_path)
         env.register_task("child")
         env.store.state.register_in_flight("child::x")
         env.store.apply_success("child::x", {}, attempt_id=env.open_attempt(Job("child", "x")))
-        # X 重跑中（queue，every_run 放行重跑）
-        env.store.state.spawn_jobs([Job("child", "x", trigger="always").to_dict()])
+        existing = env.store.normalize_spawned_job(Job("child", "x", trigger="always"))
+        env.store.state.spawn_jobs([existing])
 
         parent = Job("parent", "p1")
         entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
@@ -388,6 +388,7 @@ class TestSpawnedJobs:
                 spawned_jobs=[Job("child", "x", trigger="always")],
             ),
             attempt_id=entry.attempt_id,
+            entry=entry,
         )
         assert "parent::p1" in env.store.state.successes
         x_rows = [jd for jd in env.store.state.queue if jd["job_id"] == "x"]
@@ -432,6 +433,34 @@ class TestSpawnedJobs:
         )
         rows = [jd for jd in env.store.state.queue if jd["job_id"] == "a"]
         assert len(rows) == 1
+
+    def test_empty_dispatch_snapshot_does_not_fall_back_to_live_state(self, tmp_path):
+        env = CompletionEnv(tmp_path)
+        env.register_task("child")
+        env.store.state.spawn_jobs([
+            env.store.normalize_and_validate_job(Job("known", "live")),
+        ])
+        parent = Job("parent", "p1")
+        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
+        assert entry.known_job_uids == frozenset()
+
+        env.completion.apply_result(
+            parent.uid,
+            parent,
+            entry.job_snapshot,
+            ExecutionResult(
+                success=True,
+                spawned_jobs=[
+                    Job("child", "future", depends_on=["known::live"]),
+                ],
+            ),
+            attempt_id=entry.attempt_id,
+            entry=entry,
+        )
+
+        assert parent.uid in env.store.state.failed
+        assert "Invalid spawned job" in env.store.state.failed[parent.uid]["error_message"]
+        assert "child::future" not in env.store.state.queue_uids
 
     def test_unserializable_spawned_job_rejects_parent(self, tmp_path):
         """非法子作业导致父作业失败，整个派生集合与游标不发布。"""

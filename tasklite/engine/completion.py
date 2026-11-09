@@ -516,7 +516,7 @@ class CompletionMachine:
             return spawned_job_snapshots
 
         # 依赖引用校验：只能引用派发时已知的 Job、当前父 Job，以及本次先前声明的 Job
-        if entry is not None and entry.known_job_uids:
+        if entry is not None:
             allowed_uids: set[str] = set(entry.known_job_uids)
         elif store.state is not None:
             allowed_uids = (
@@ -550,8 +550,7 @@ class CompletionMachine:
             snapshot = store.normalize_spawned_job(spawned_job)
             previous = accepted.get(spawned_uid, busy_snapshots.get(spawned_uid))
             if previous is not None:
-                effective_previous = store.normalize_spawned_job(Job.from_dict(previous))
-                if extract_effective_job_config(effective_previous) != extract_effective_job_config(snapshot):
+                if extract_effective_job_config(previous) != extract_effective_job_config(snapshot):
                     raise TaskLiteError(
                         f"Spawned job {spawned_uid!r} conflicts with existing effective configuration"
                     )

@@ -12,9 +12,12 @@ from contextlib import closing
 from pathlib import Path
 import os
 import sqlite3
+import threading
+import time
 import pytest
 
-from tasklite import Job, StateSnapshot, TaskLite, TaskResult
+from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
+from tasklite.resource import CapacityResource
 from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
 
 
@@ -353,9 +356,19 @@ def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypat
 
 def duplicate_spawn_handler(job, ctx):
     ctx.spawn(Job("child", "fresh"))
+    child_files = None
+    if "child_output" in job.payload:
+        child_files = {
+            "result": FileSpec(job.payload["child_output"], role="output"),
+        }
     if job.payload["mode"] == "batch":
-        ctx.spawn(Job("child", "same", payload={"version": 1}))
-    ctx.spawn(Job("child", "same", payload={"version": 2 if job.payload["conflict"] else 1}))
+        ctx.spawn(Job("child", "same", payload={"version": 1}, files=child_files))
+    ctx.spawn(Job(
+        "child",
+        "same",
+        payload={"version": 2 if job.payload["conflict"] else 1},
+        files=child_files,
+    ))
     ctx.set_cursor("offset", "unpublished")
     return TaskResult.success()
 
@@ -382,6 +395,64 @@ def test_spawn_duplicate_configuration_checked_before_atomic_publication(tmp_pat
             assert {"parent::one", "child::same", "child::fresh"} <= successes.keys()
             assert len(p.backend.load_settled_attempts("child::same")) == 1
             assert p.get_cursor("offset") == "unpublished"
+
+
+@pytest.mark.parametrize("template_changed", [False, True])
+def test_spawn_uses_persisted_effective_configuration(tmp_path, template_changed):
+    db_path = tmp_path / "state.db"
+    child_output = tmp_path / "child-output.txt"
+    original_payload = {"version": 1}
+    original_files = {"result": FileSpec(child_output, role="output")}
+    expected_files = {
+        name: spec.to_dict()
+        for name, spec in original_files.items()
+    }
+    with TaskLite(backend="sqlite", state_path=db_path, max_workers=1) as pipeline:
+        pipeline.register_task("parent", duplicate_spawn_handler)
+        pipeline.register_task("child", child_consumer_handler)
+        pipeline.enqueue(Job(
+            "parent",
+            "one",
+            payload={
+                "mode": "pending",
+                "conflict": False,
+                "child_output": str(child_output),
+            },
+        ))
+        pipeline.enqueue(Job(
+            "child",
+            "same",
+            payload=original_payload,
+            files=original_files,
+        ))
+        pipeline.set_cursor("offset", "original")
+
+    with TaskLite(backend="sqlite", state_path=db_path, max_workers=1) as pipeline:
+        pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+        pipeline.register_task(
+            "child", child_consumer_handler, resources={"disk": 1} if template_changed else {},
+        )
+        pipeline.register_task("parent", duplicate_spawn_handler)
+        pipeline.run()
+        with StateSnapshot.open(pipeline) as state:
+            attempts = list(state.iter_attempts(job_uid="parent::one"))
+            assert len(attempts) == 1
+            same = list(state.iter_attempts(job_uid="child::same"))
+            assert len(same) == 1
+            assert "disk" not in same[0]["job"]["resources"]
+            assert same[0]["job"]["payload"] == original_payload
+            assert same[0]["job"]["files"] == expected_files
+            assert same[0]["files"] == expected_files
+            if template_changed:
+                assert attempts[0]["outcome"] == "failure"
+                assert state.get_job("child::fresh") is None
+                assert list(state.iter_attempts(job_uid="child::fresh")) == []
+                assert pipeline.get_cursor("offset") == "original"
+            else:
+                assert attempts[0]["outcome"] == "success"
+                fresh = state.get_job("child::fresh")
+                assert fresh is not None and fresh["status"] == "succeeded"
+                assert pipeline.get_cursor("offset") == "unpublished"
 
 
 def unknown_spawn_handler(job, ctx):
@@ -418,3 +489,160 @@ def test_spawn_unregistered_task_fails_parent_atomically_and_survives_reopen(tmp
         assert reopened.backend.load_settled_attempts("child::sibling") == []
         assert reopened.backend.load_settled_attempts("missing::unknown") == []
         assert reopened.get_cursor("offset") == "original"
+
+
+def _wait_for_path(path: str | Path, *, timeout_seconds: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    target = Path(path)
+    while not target.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for {target}")
+        time.sleep(0.02)
+
+
+def blocked_duplicate_child_handler(job, ctx):
+    Path(job.payload["started"]).write_text("started", encoding="utf-8")
+    _wait_for_path(job.payload["release"])
+    return TaskResult.success(metadata={"version": job.payload["version"]})
+
+
+def blocked_duplicate_parent_handler(job, ctx):
+    _wait_for_path(job.payload["child_started"])
+    ctx.set_cursor("offset", "published")
+    ctx.spawn(Job(
+        "child",
+        "same",
+        payload={
+            "started": job.payload["child_started"],
+            "release": job.payload["release"],
+            "version": 2 if job.payload["conflict"] else 1,
+        },
+    ))
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_inflight_duplicate_spawn_uses_real_process_barrier(tmp_path, conflict):
+    db_path = tmp_path / "state.db"
+    child_started = tmp_path / "child-started"
+    child_release = tmp_path / "release-child"
+    errors: list[str] = []
+
+    def release_after_parent_settlement():
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            try:
+                with StateSnapshot.open(db_path) as state:
+                    attempts = list(state.iter_attempts(job_uid="parent::one"))
+                    if any(
+                        attempt["outcome"] in {"success", "failure"}
+                        for attempt in attempts
+                    ):
+                        child_release.write_text("release", encoding="utf-8")
+                        return
+            except (OSError, RuntimeError):
+                pass
+            time.sleep(0.02)
+        errors.append("parent did not settle before barrier timeout")
+
+    with TaskLite(backend="sqlite", state_path=db_path, max_workers=2) as pipeline:
+        pipeline.register_task("parent", blocked_duplicate_parent_handler)
+        pipeline.register_task("child", blocked_duplicate_child_handler)
+        child_payload = {
+            "started": str(child_started),
+            "release": str(child_release),
+            "version": 1,
+        }
+        pipeline.enqueue(Job("child", "same", payload=child_payload))
+        pipeline.enqueue(Job(
+            "parent",
+            "one",
+            payload={
+                "child_started": str(child_started),
+                "release": str(child_release),
+                "conflict": conflict,
+            },
+        ))
+        pipeline.set_cursor("offset", "original")
+
+        controller = threading.Thread(target=release_after_parent_settlement)
+        controller.start()
+        try:
+            pipeline.run()
+        finally:
+            child_release.write_text("release", encoding="utf-8")
+            controller.join(timeout=5)
+
+        assert not controller.is_alive()
+        assert errors == []
+        parent_attempts = list(pipeline.backend.load_settled_attempts("parent::one"))
+        assert len(parent_attempts) == 1
+        child_attempts = list(pipeline.backend.load_settled_attempts("child::same"))
+        assert len(child_attempts) == 1
+        assert child_attempts[0]["outcome"] == "success"
+        assert child_attempts[0]["job"]["payload"] == child_payload
+        if conflict:
+            assert parent_attempts[0]["outcome"] == "failure"
+            assert "configuration" in parent_attempts[0]["error_message"]
+            assert pipeline.get_cursor("offset") == "original"
+        else:
+            assert parent_attempts[0]["outcome"] == "success"
+            assert pipeline.get_cursor("offset") == "published"
+
+
+def late_child_handler(job, ctx):
+    return TaskResult.success(metadata={"published": True})
+
+
+def late_producer_handler(job, ctx):
+    _wait_for_path(job.payload["parent_started"])
+    ctx.spawn(Job("late_child", "target"))
+    return TaskResult.success()
+
+
+def late_parent_handler(job, ctx):
+    Path(job.payload["parent_started"]).write_text("started", encoding="utf-8")
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        with StateSnapshot.open(job.payload["db_path"]) as state:
+            attempts = list(state.iter_attempts(job_uid="late_child::target"))
+            if any(attempt["outcome"] == "success" for attempt in attempts):
+                break
+        time.sleep(0.02)
+    else:
+        raise TimeoutError("late child did not succeed")
+
+    ctx.set_cursor("offset", "unpublished")
+    ctx.spawn(Job("summary", "one", depends_on=["late_child::target"]))
+    return TaskResult.success()
+
+
+def test_dependency_on_job_published_after_parent_dispatch_is_rejected(tmp_path):
+    db_path = tmp_path / "state.db"
+    parent_started = tmp_path / "parent-started"
+    with TaskLite(backend="sqlite", state_path=db_path, max_workers=2) as pipeline:
+        pipeline.register_task("producer", late_producer_handler)
+        pipeline.register_task("parent", late_parent_handler)
+        pipeline.register_task("late_child", late_child_handler)
+        pipeline.register_task("summary", child_consumer_handler)
+        pipeline.set_cursor("offset", "original")
+        pipeline.enqueue(Job(
+            "producer",
+            "one",
+            payload={"parent_started": str(parent_started)},
+        ))
+        pipeline.enqueue(Job(
+            "parent",
+            "one",
+            payload={
+                "parent_started": str(parent_started),
+                "db_path": str(db_path),
+            },
+        ))
+        pipeline.run()
+
+        assert "late_child::target" in pipeline.backend.load_successes()
+        assert "parent::one" in pipeline.backend.load_failed()
+        assert len(pipeline.backend.load_settled_attempts("parent::one")) == 1
+        assert pipeline.backend.load_settled_attempts("summary::one") == []
+        assert pipeline.get_cursor("offset") == "original"
