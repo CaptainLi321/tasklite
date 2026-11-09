@@ -19,11 +19,7 @@ import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import TriggerRegistry
-from tasklite.engine.channel import (
-    ArtifactCleanupMode,
-    ExecutionChannel,
-    ExecutionResult,
-)
+from tasklite.engine.channel import ExecutionChannel, ExecutionResult
 from tasklite.engine.completion import CompletionMachine
 from tasklite.engine.errorclass import ERR_MAX_RETRIES, ErrorClassifier
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
@@ -34,6 +30,7 @@ from tasklite.engine.resource import (
 )
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import AttemptOutcome, JobHandle
+from tasklite.models.artifact import FileSpec
 from tasklite.models.job import Job, JobRuntimeState
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
@@ -97,7 +94,15 @@ class CompletionEnv:
     def register_task(self, task_type: str) -> None:
         self.tasks.register(Task(task_type, lambda job, ctx: None))
 
-    def track_entry(self, job: Job, *, lease=None, attempt_id=None, acquired=None) -> InFlightJob:
+    def track_entry(
+        self,
+        job: Job,
+        *,
+        lease=None,
+        attempt_id=None,
+        acquired=None,
+        files=None,
+    ) -> InFlightJob:
         snapshot = job.to_dict()
         self.store.finalize_intake_snapshot(snapshot, job.task_type)
         job.__dict__.update(Job.from_dict(snapshot).__dict__)
@@ -110,6 +115,8 @@ class CompletionEnv:
             lease=lease,
             acquired=acquired if acquired is not None else [],
             attempt_id=attempt_id,
+            active_files=dict(files if files is not None else job.files),
+            active_file_sources=dict(files if files is not None else job.files),
         )
         self.in_flight.track(entry, state=self.store.state)
         return entry
@@ -145,20 +152,28 @@ class TestCompleteJobSuccess:
 
     def test_success_lifecycle(self, tmp_path, monkeypatch):
         env = CompletionEnv(tmp_path, extra_resources={"gpu": CapacityResource("gpu", max_capacity=10.0)})
-        job = Job("t", "j1", resources={"gpu": 2.0})
+        input_file = tmp_path / "in.csv"
+        input_file.write_text("input", encoding="utf-8")
+        cache_file = tmp_path / "temporary.cache"
+        cache_file.write_text("temporary", encoding="utf-8")
+        job = Job(
+            "t",
+            "j1",
+            resources={"gpu": 2.0},
+            files={
+                "input": FileSpec(input_file, role="input"),
+                "cache": FileSpec(
+                    cache_file,
+                    role="cache",
+                    delete_on_success=True,
+                ),
+            },
+        )
         attempt_id = env.open_attempt(job)
         entry = env.track_entry(job, attempt_id=attempt_id)
+        env.store.authorizer = lambda *_args: True
 
         assert env.resources["gpu"].used == 2.0
-        cleaned: list[tuple[str, ArtifactCleanupMode]] = []
-        monkeypatch.setattr(
-            env.channel.journal, "cleanup_declared_artifacts",
-            lambda declarations, *, success: cleaned.append(success),
-        )
-        monkeypatch.setattr(
-            env.channel, "read_declared_inputs",
-            lambda uid: ["/data/in.csv"],
-        )
 
         result = ExecutionResult(success=True, result_metadata={"score": 100})
         env.completion.complete_job(entry, result)
@@ -166,10 +181,10 @@ class TestCompleteJobSuccess:
         assert env.resources["gpu"].used == 0.0
         assert env.store.state.successes["t::j1"]["score"] == 100
         assert env.store.state.successes["t::j1"]["last_success_run_id"] == env.session.run_id
-        assert env.store.state.successes["t::j1"]["inputs"] == ["/data/in.csv"]
+        assert env.store.state.successes["t::j1"]["inputs"] == [str(input_file)]
         assert env.stats["succeeded"] == 1
         assert "t::j1" not in env.store.state.in_flight_uids
-        assert cleaned == [True]
+        assert not cache_file.exists()
         # 收尾钩子恰好一次（成功语义）
         assert env.hooks == [
             ("t::j1", AttemptOutcome(success=True, will_retry=False,
@@ -201,14 +216,22 @@ class TestCompleteJobFailure:
         env.store.state.replace_queue([
             Job("child", "c1", depends_on=["t::j1"]).to_dict(),
         ])
-        job = Job("t", "j1")
+        partial = tmp_path / "partial.txt"
+        partial.write_text("partial", encoding="utf-8")
+        job = Job(
+            "t",
+            "j1",
+            files={
+                "partial": FileSpec(
+                    partial,
+                    role="output",
+                    delete_on_failure=True,
+                ),
+            },
+        )
         attempt_id = env.open_attempt(job)
         entry = env.track_entry(job, attempt_id=attempt_id)
-        cleaned: list[tuple[str, ArtifactCleanupMode]] = []
-        monkeypatch.setattr(
-            env.channel.journal, "cleanup_declared_artifacts",
-            lambda declarations, *, success: cleaned.append(success),
-        )
+        env.store.authorizer = lambda *_args: True
 
         env.completion.complete_job(
             entry, ExecutionResult(success=False, result_metadata={"error_message": "boom"})
@@ -218,7 +241,7 @@ class TestCompleteJobFailure:
         assert env.store.state.failed["child::c1"]["error_message"] == "JOB_DEPENDENCY"
         assert env.stats["failed"] == 1
         assert env.stats["cascade_failed"] == 1
-        assert cleaned[-1] is False
+        assert not partial.exists()
         assert env.backend.load_attempts("t::j1")[-1].outcome == "failed"
         finish_by_uid = {uid: fin for uid, fin in env.hooks}
         assert finish_by_uid["t::j1"].success is False
@@ -633,21 +656,19 @@ class TestHookFireDiscipline:
 @pytest.mark.parametrize("success", [True, False])
 @pytest.mark.parametrize("directory", [True, False])
 def test_completion_publishes_only_successful_framework_artifacts(tmp_path, success, directory):
-    from tasklite.models.artifact import ArtifactDeclaration
-
     env = CompletionEnv(tmp_path)
-    job = Job("t", "named")
-    aid = env.open_attempt(job)
-    entry = env.track_entry(job, attempt_id=aid)
     output = tmp_path / "report"
     if directory:
         output.mkdir()
         (output / "part").write_text("report")
     else:
         output.write_text("report")
-    env.channel.journal.record_artifact(
-        job.uid, ArtifactDeclaration(str(output), name="report"),
+    job = Job(
+        "t",
+        "named",
+        files={"report": FileSpec(output, role="output")},
     )
+    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
     result = ExecutionResult(
         success=success, result_metadata={"artifacts": {"forged": {"path": "/fake"}}},
     )
@@ -661,196 +682,257 @@ def test_completion_publishes_only_successful_framework_artifacts(tmp_path, succ
     assert output.exists()
 
 
-def test_invalid_artifact_log_propagates_through_completion_without_false_success(tmp_path):
-    from tasklite.models.artifact import ArtifactDeclaration
-
+def test_symlink_output_settles_failure_without_false_success(tmp_path):
     env = CompletionEnv(tmp_path)
-    job = Job("t", "invalid_manifest")
-    aid = env.open_attempt(job)
-    entry = env.track_entry(job, attempt_id=aid)
     target = tmp_path / "real.txt"
     target.write_text("ok")
     link = tmp_path / "sym.txt"
     link.symlink_to(target)
-    env.channel.journal._artifacts[job.uid] = (
-        ArtifactDeclaration(str(link), name="primary"),
+    job = Job(
+        "t",
+        "invalid_output",
+        files={"primary": FileSpec(link, role="output")},
     )
-    with pytest.raises(ValueError, match="symlink"):
-        env.completion.complete_job(entry, ExecutionResult(success=True))
+    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+    env.completion.complete_job(entry, ExecutionResult(success=True))
     assert env.backend.load_successes() == {}
-    assert job.uid in env.store.state.in_flight_uids
-    assert env.backend.load_attempts(job.uid)[0].outcome == "running"
+    assert job.uid in env.backend.load_failed()
+    assert "symlink" in env.backend.load_failed()[job.uid]["error_message"]
+    assert env.backend.load_attempts(job.uid)[0].outcome == "failed"
     assert env.stats["succeeded"] == 0
-    assert env.hooks == []
-    assert env.channel.journal._artifacts.get(job.uid) is not None
+    assert len(env.hooks) == 1 and env.hooks[0][1].success is False
 
 
 def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, monkeypatch):
-    from tasklite.models.artifact import ArtifactDeclaration
-
     env = CompletionEnv(tmp_path)
-    job = Job("t", "temporary_directory")
-    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
     temporary = tmp_path / "temporary"
     temporary.mkdir()
     (temporary / "part").write_text("content")
-    env.channel.journal.record_artifact(
-        job.uid, ArtifactDeclaration(str(temporary), delete_on_success=True),
+    job = Job(
+        "t",
+        "temporary_directory",
+        files={
+            "temporary": FileSpec(
+                temporary,
+                role="output",
+                delete_on_success=True,
+            ),
+        },
     )
-    commit = env.backend.commit_job_success
+    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+    env.store.authorizer = lambda *_args: True
+    commit = env.backend.commit_job_settlement
 
     def commit_after_cleanup(*args, **kwargs):
         assert not temporary.exists()
         return commit(*args, **kwargs)
 
-    monkeypatch.setattr(env.backend, "commit_job_success", commit_after_cleanup)
+    monkeypatch.setattr(env.backend, "commit_job_settlement", commit_after_cleanup)
     env.completion.complete_job(entry, ExecutionResult(success=True))
     assert job.uid in env.backend.load_successes()
+    assert env.backend.load_successes()[job.uid]["artifacts"] == {
+        "temporary": {"path": str(temporary)},
+    }
+    assert not temporary.exists()
 
 
 @pytest.mark.parametrize("success", [True, False])
-def test_cleanup_failure_preserves_original_attempt_and_no_terminal(tmp_path, monkeypatch, success):
-    from tasklite.models.artifact import ArtifactDeclaration
+def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success):
     from tasklite.utils.artifact import ArtifactPathPolicy
 
     env = CompletionEnv(tmp_path)
     job = Job("t", "cleanup_failure", max_retries_per_run=0)
-    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
     output = tmp_path / "output"
     output.write_text("content")
-    env.channel.journal.record_artifact(
-        job.uid, ArtifactDeclaration(str(output), delete_on_failure=True, delete_on_success=True),
+    cleanup_flag = (
+        {"delete_on_success": True}
+        if success
+        else {"delete_on_failure": True}
     )
+    job.files["output"] = FileSpec(
+        output,
+        role="output",
+        **cleanup_flag,
+    )
+    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+    env.store.authorizer = lambda *_args: True
 
     def fail_cleanup(self, declaration, *, success):
         raise PermissionError("cleanup unavailable")
 
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", fail_cleanup)
-    with pytest.raises(PermissionError, match="cleanup unavailable"):
-        env.completion.complete_job(entry, ExecutionResult(success=success))
+    env.completion.complete_job(entry, ExecutionResult(success=success))
     assert env.backend.load_successes() == {}
-    assert env.backend.load_failed() == {}
-    assert env.backend.load_attempts(job.uid)[0].outcome == "running"
-    assert entry.job_snapshot["attempt_no"] == 1
-    assert env.hooks == []
-    assert env.channel.journal.read_artifacts(job.uid) != ()
+    assert "cleanup unavailable" in env.backend.load_failed()[job.uid]["error_message"]
+    assert env.backend.load_attempts(job.uid)[0].outcome == "failed"
+    assert len(env.hooks) == 1 and env.hooks[0][1].success is False
+    assert output.exists()
 
 
 def test_abort_cleanup_failure_unregisters_without_requeue(tmp_path, monkeypatch):
     from tasklite.utils.artifact import ArtifactPathPolicy
-    from tasklite.models.artifact import ArtifactDeclaration
 
     env = CompletionEnv(tmp_path)
-    entries = [env.track_entry(Job('t', name, max_retries_per_run=3)) for name in ('one', 'two')]
-    for entry in entries:
-        env.channel.journal.record_artifact(entry.job_uid, ArtifactDeclaration(
-            str(tmp_path / entry.job.job_id), delete_on_failure=True,
-        ))
+    env.store.authorizer = lambda *_args: True
+    entries = [
+        env.track_entry(
+            Job("t", name, max_retries_per_run=3),
+            files={
+                "temporary": FileSpec(
+                    tmp_path / name,
+                    role="output",
+                    delete_on_failure=True,
+                ),
+            },
+        )
+        for name in ("one", "two")
+    ]
 
     def denied(self, declaration, *, success):
-        raise PermissionError('cleanup denied')
+        raise PermissionError("cleanup denied")
 
-    monkeypatch.setattr(ArtifactPathPolicy, 'cleanup', denied)
-    with pytest.raises(PermissionError, match='cleanup denied'):
+    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
+    with pytest.raises(PermissionError, match="cleanup denied"):
         env.completion.settle_aborted(entries, [])
     assert not env.in_flight
     assert not env.store.state.in_flight_uids
     assert not env.store.state.queue
-    assert env.resources['__workers__'].used == 0
+    assert env.resources["__workers__"].used == 0
     assert not env.backend.load_successes()
     assert not env.store.state.failed
     assert not env.hooks
 
 
-def test_declaration_removal_failure_preserves_committed_success(tmp_path, monkeypatch):
-    env = CompletionEnv(tmp_path)
-    job = Job('t', 'committed')
-    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
-    handle = env.make_handle(job.uid)
-
-    def denied(uid):
-        raise PermissionError('log unlink denied')
-
-    monkeypatch.setattr(env.channel.journal, 'clear_declarations', denied)
-    with pytest.raises(PermissionError, match='log unlink denied'):
-        env.completion.settle_reaped([(handle, ExecutionResult(success=True))])
-    assert job.uid in env.backend.load_successes()
-    assert not env.store.state.queue
-    assert not env.store.state.failed
-    assert not env.in_flight
-    assert len(env.hooks) == 1
-    assert env.hooks[0][1].success
-
-
-def test_completion_reads_declarations_once_and_rejects_missing_output(tmp_path, monkeypatch):
-    from tasklite.models.artifact import ArtifactDeclaration
+def test_completion_rejects_missing_output(tmp_path, monkeypatch):
+    from tasklite.utils.artifact import ArtifactPathPolicy
 
     env = CompletionEnv(tmp_path)
-    job = Job('t', 'missing')
+    missing = tmp_path / "missing"
+    job = Job(
+        "t",
+        "missing",
+        files={"data": FileSpec(missing, role="output")},
+    )
     entry = env.track_entry(job)
-    env.channel.journal.record_artifact(job.uid, ArtifactDeclaration(str(tmp_path / 'missing'), name='data'))
-    original = env.channel.journal.read_artifacts
-    calls = []
+    checked: list[str] = []
+    original = ArtifactPathPolicy.entry_exists
 
-    def read(uid):
-        calls.append(uid)
-        return original(uid)
+    def observe(self, declaration):
+        checked.append(declaration.path)
+        return original(self, declaration)
 
-    monkeypatch.setattr(env.channel.journal, 'read_artifacts', read)
+    monkeypatch.setattr(ArtifactPathPolicy, "entry_exists", observe)
     env.completion.complete_job(entry, ExecutionResult(success=True))
-    assert calls == [job.uid]
-    assert not env.backend.load_successes()
-    assert 'Missing output' in env.store.state.failed[job.uid]['error_message']
+    assert checked == [str(missing)]
+    assert env.backend.load_successes() == {}
+    assert "Missing output" in env.backend.load_failed()[job.uid]["error_message"]
 
 
-@pytest.mark.parametrize('declaration_error', [False, True])
-def test_environment_fault_preserves_retry_state(tmp_path, monkeypatch, declaration_error):
+def test_declaration_environment_fault_preserves_running_state(tmp_path):
     from tasklite.exceptions import _ArtifactIOError
 
-    env = CompletionEnv(tmp_path, extra_resources={'api': IntervalResource('api', interval_seconds=0.01)})
-    entry = env.track_entry(Job('t', 'limited'))
+    env = CompletionEnv(
+        tmp_path,
+        extra_resources={"api": IntervalResource("api", interval_seconds=0.01)},
+    )
+    entry = env.track_entry(Job("t", "limited"))
 
-    def denied(declarations, *, success):
-        raise PermissionError('cleanup denied')
-
-    monkeypatch.setattr(env.channel.journal, 'cleanup_declared_artifacts', denied)
-    with pytest.raises((_ArtifactIOError, PermissionError)):
-        env.completion.complete_job(entry, ExecutionResult(
-            artifact_error='write denied' if declaration_error else None,
-            retry_requested=True, transient_kind='rate_limited',
-        ))
+    with pytest.raises(_ArtifactIOError, match="write denied"):
+        env.completion.complete_job(
+            entry,
+            ExecutionResult(
+                artifact_error="write denied",
+                retry_requested=True,
+                transient_kind="rate_limited",
+            ),
+        )
     assert entry.job.attempt_no == 1
     assert not env.store.state.failed
     assert not env.hooks
 
 
-def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkeypatch):
-    from tasklite.models.artifact import ArtifactDeclaration
+def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypatch):
+    from tasklite.utils.artifact import ArtifactPathPolicy
 
-    env = CompletionEnv(tmp_path, extra_resources={'api': IntervalResource('api', interval_seconds=0.01)})
-    first, second = Job('t', 'first'), Job('t', 'second')
+    env = CompletionEnv(tmp_path)
+    target = tmp_path / "temporary"
+    target.write_text("partial", encoding="utf-8")
+    job = Job(
+        "t",
+        "retry_cleanup",
+        max_retries_per_run=3,
+        files={
+            "temporary": FileSpec(
+                target,
+                role="cache",
+                delete_on_failure=True,
+            ),
+        },
+    )
+    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+    env.store.authorizer = lambda *_args: True
+
+    def denied(self, declaration, *, success):
+        raise PermissionError("cleanup denied")
+
+    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
+    result = ExecutionResult(
+        retry_requested=True,
+        retry_error="business failure",
+        consume_budget=True,
+    )
+    env.completion.complete_job(entry, result)
+    assert result.will_retry is False
+    assert env.store.state.queue == []
+    assert job.uid in env.backend.load_failed()
+    assert "Retry cleanup failed" in env.backend.load_failed()[job.uid]["error_message"]
+    assert env.backend.load_attempts(job.uid)[0].outcome == "failed"
+    assert len(env.hooks) == 1
+    assert env.hooks[0][1].will_retry is False
+
+
+def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkeypatch):
+    from tasklite.utils.artifact import ArtifactPathPolicy
+
+    env = CompletionEnv(
+        tmp_path,
+        extra_resources={"api": IntervalResource("api", interval_seconds=0.01)},
+    )
+    broken = tmp_path / "broken"
+    broken.write_text("partial", encoding="utf-8")
+    first = Job(
+        "t",
+        "first",
+        files={
+            "broken": FileSpec(
+                broken,
+                role="output",
+                delete_on_failure=True,
+            ),
+        },
+    )
+    second = Job("t", "second")
     for job in (first, second):
         env.track_entry(job, attempt_id=env.open_attempt(job))
-    env.channel.journal.record_artifact(first.uid, ArtifactDeclaration(str(tmp_path / 'broken')))
+    env.store.authorizer = lambda *_args: True
 
-    def denied(declarations, *, success):
-        if declarations:
-            raise PermissionError('cleanup denied')
+    def denied(self, declaration, *, success):
+        raise PermissionError("cleanup denied")
 
-    monkeypatch.setattr(env.channel.journal, 'cleanup_declared_artifacts', denied)
-    with pytest.raises(PermissionError):
-        env.completion.settle_reaped([
+    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
+    settled = env.completion.settle_reaped([
             (env.make_handle(first.uid), ExecutionResult(success=False)),
             (env.make_handle(second.uid), ExecutionResult(success=True)),
         ])
+    assert settled == 2
     assert second.uid in env.backend.load_successes()
+    assert first.uid in env.backend.load_failed()
+    assert "cleanup denied" in env.backend.load_failed()[first.uid]["error_message"]
     assert not env.store.state.queue
-    assert env.backend.load_attempts(first.uid)[0].outcome == 'running'
-    assert not env.store.state.failed
-    assert env.resources['__workers__'].used == 0
+    assert env.backend.load_attempts(first.uid)[0].outcome == "failed"
+    assert env.resources["__workers__"].used == 0
     assert not env.in_flight
-    assert len(env.hooks) == 1
-    assert env.hooks[0][0] == second.uid
+    assert {uid for uid, _ in env.hooks} == {first.uid, second.uid}
 
 
 def test_inflight_duplicate_spawn_compares_effective_configuration(tmp_path):

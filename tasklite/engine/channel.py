@@ -23,15 +23,11 @@ from pathlib import Path
 from typing import Any
 
 from ..exceptions import TaskLiteError, _ArtifactIOError
-from ..models.artifact import ArtifactDeclaration
 from ..models.context import JobContext
 from ..models.job import Job
 from ..models.result import TaskResult, validate_strict_json_object
 from ..utils.ipc import (
-    ArtifactCleanupMode,
-    ArtifactJournal,
     PIPE_MSG_DECLARE,
-    PIPE_MSG_INPUT,
     PIPE_MSG_RESULT,
     PIPE_MSG_SUSPEND,
     WorkerPipeMessage,
@@ -541,23 +537,6 @@ class ExecutionChannel:
             except OSError:
                 pass
 
-    @property
-    def journal(self) -> ArtifactJournal:
-        ipc = getattr(self, "ipc_dir", None)
-        cached = getattr(self, "_journal", None)
-        if cached is None or cached.ipc_dir != ipc:
-            cached = ArtifactJournal(
-                ipc,
-                output_roots=getattr(self, "output_roots", None),
-                protected_roots=getattr(self, "protected_roots", ()),
-            )
-            self._journal = cached
-        return cached
-
-    @journal.setter
-    def journal(self, value: ArtifactJournal) -> None:
-        self._journal = value
-
     @staticmethod
     def _terminate_and_join_process(p: Any) -> None:
         """终止并等待子进程退出（不调用 close，保留 exitcode 供解码读取）。"""
@@ -598,7 +577,6 @@ class ExecutionChannel:
             if self.ipc_dir is None:
                 self.ipc_dir = str(effective_ipc_dir)
         spec.job_context.ipc_dir = effective_ipc_dir
-        self.journal.clear_declarations(spec.job.uid)
         receiver, sender = create_worker_pipe(
             self._process_context,
             job_uid=spec.job.uid,
@@ -647,11 +625,7 @@ class ExecutionChannel:
 
     def _accept_message(self, handle: JobHandle, msg: WorkerPipeMessage) -> None:
         """消费一条已校验信封的管道消息并更新通道内存状态。"""
-        if msg.kind == PIPE_MSG_INPUT:
-            if not isinstance(msg.payload, dict):
-                raise ValueError(f"invalid input declaration for {handle.job_uid}")
-            self.journal.record_input_entry(handle.job_uid, msg.payload)
-        elif msg.kind == PIPE_MSG_SUSPEND:
+        if msg.kind == PIPE_MSG_SUSPEND:
             if (
                 not isinstance(msg.payload, (list, tuple))
                 or len(msg.payload) != 2
@@ -1102,7 +1076,6 @@ class ExecutionChannel:
                 self._results.pop(exec_id, None)
                 self._errors.pop(exec_id, None)
                 self._salvage_signals(handle.job_uid, None)
-                self.journal.clear_declarations(handle.job_uid)
             except Exception as e:
                 logger.error(f"Error cleaning up in-flight job {handle.job_uid}: {e}")
 
@@ -1127,22 +1100,8 @@ class ExecutionChannel:
         """关闭通道并回收所有在途与残留子进程和管道资源。"""
         self.cleanup_in_flight(list(self._handles.values()))
 
-    def cleanup_artifacts(self, job_uid: str, *, mode: ArtifactCleanupMode) -> None:
-        """统一收敛产物与内存声明的生命周期清理。"""
-        self.journal.cleanup(job_uid, mode=mode)
-
-    def read_declared_artifacts(self, job_uid: str) -> tuple[ArtifactDeclaration, ...]:
-        """读取框架授权值，日志错误不得降级为空清单后发布成功。"""
-        return self.journal.read_artifacts(job_uid)
-
-    def read_declared_inputs(self, job_uid: str) -> list[str]:
-        """读取任务声明的输入路径清单。"""
-        return self.journal.read_inputs(job_uid)
-
-
 __all__ = [
     "AbortOutcome",
-    "ArtifactCleanupMode",
     "ExecutionChannel",
     "ExecutionResult",
     "JobHandle",

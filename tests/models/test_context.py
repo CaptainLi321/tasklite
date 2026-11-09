@@ -9,11 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from tasklite.models.artifact import ArtifactDeclaration
+from tasklite import FileSpec
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
 from tasklite.utils.ipc import (
-    ArtifactJournal,
     PIPE_MSG_SUSPEND,
     WorkerPipeMessage,
     create_worker_pipe,
@@ -125,8 +124,6 @@ class TestDeclareFile:
         assert not hasattr(_make_ctx(), method)
 
     def test_resolves_against_base_without_creating_parents(self, tmp_path):
-        from tasklite import FileSpec
-
         ctx = _make_ctx()
         ctx.base_dir = tmp_path
         final = ctx.declare_file("out", FileSpec("sub/dir/out.json", role="output"))
@@ -135,8 +132,6 @@ class TestDeclareFile:
         assert ctx.file_path("out") == final
 
     def test_captured_base_is_independent_of_worker_cwd(self, tmp_path, monkeypatch):
-        from tasklite import FileSpec
-
         monkeypatch.chdir(tmp_path)
         ctx = _make_ctx()
         other = tmp_path / "other"
@@ -145,8 +140,6 @@ class TestDeclareFile:
         assert ctx.declare_file("out", FileSpec("relative", role="output")) == tmp_path / "relative"
 
     def test_existing_path_remains_without_delete_request(self, tmp_path):
-        from tasklite import FileSpec
-
         target = tmp_path / "valuable"
         target.write_text("valuable")
         ctx = _make_ctx()
@@ -154,47 +147,11 @@ class TestDeclareFile:
         assert target.read_text() == "valuable"
 
 
-class TestMultiRootSandbox:
-    """多根 output_roots：路径属于任一根即通过沙盒校验。"""
-
-    def test_path_in_any_root_accepted(self, tmp_path):
-        root_a = tmp_path / "disk_a"
-        root_b = tmp_path / "disk_b"
-        root_a.mkdir()
-        root_b.mkdir()
-        resolved = ArtifactJournal.resolve_and_validate_path(
-            str(root_b / "f.bin"), [root_a, root_b], sandbox=True
-        )
-        assert resolved.startswith(str(root_b))
-
-    def test_path_outside_all_roots_rejected(self, tmp_path):
-        root_a = tmp_path / "disk_a"
-        outside = tmp_path / "outside"
-        root_a.mkdir()
-        outside.mkdir()
-        with pytest.raises(ValueError, match="resolves outside output_roots"):
-            ArtifactJournal.resolve_and_validate_path(
-                str(outside / "f.bin"), [root_a], sandbox=True
-            )
-
-    def test_relative_relocates_to_first_root(self, tmp_path):
-        root_a = tmp_path / "disk_a"
-        root_b = tmp_path / "disk_b"
-        root_a.mkdir()
-        root_b.mkdir()
-        resolved = ArtifactJournal.resolve_and_validate_path(
-            "rel.bin", [root_a, root_b], sandbox=True
-        )
-        assert resolved.startswith(str(root_a))
-
-
 class TestCacheFileSpec:
     """cache 的清理策略只由显式 FileSpec 标志表达。"""
 
     @pytest.mark.parametrize("cleanup", [False, True])
     def test_cache_preserves_explicit_cleanup_flags(self, tmp_path, cleanup):
-        from tasklite import FileSpec
-
         ctx = _make_ctx()
         spec = FileSpec(tmp_path / "cache", role="cache", delete_on_success=cleanup, delete_on_failure=cleanup)
         final = ctx.declare_file("cache", spec)
@@ -203,55 +160,38 @@ class TestCacheFileSpec:
         assert ctx._files["cache"].delete_on_failure is cleanup
 
 
-class TestDeclareInput:
-    """declare_input：声明点校验存在性，仅记录规范路径。"""
+class TestInputFileSpec:
+    """输入存在性和固定基准统一由 FileSpec 声明表达。"""
 
-    def test_path_recorded_without_fingerprint(self, tmp_path):
-        src = tmp_path / "src.bin"
-        src.write_bytes(b"payload")
-        ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
-        resolved = ctx.declare_input(src)
-        assert resolved == str(src.resolve())
-        assert ctx._journal.read_inputs("fetch::j1") == [resolved]
+    def test_missing_input_fails_without_recording(self, tmp_path):
+        ctx = _make_ctx(output_roots=tmp_path)
+        with pytest.raises(FileNotFoundError, match="Missing input file"):
+            ctx.declare_file(
+                "source",
+                FileSpec(tmp_path / "ghost.bin", role="input"),
+            )
+        assert "source" not in ctx._files
+
+    def test_relative_input_uses_instance_base(self, tmp_path, monkeypatch):
+        (tmp_path / "rel.txt").write_text("x", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        ctx = _make_ctx()
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.chdir(other)
+        assert ctx.declare_file(
+            "source",
+            FileSpec("rel.txt", role="input"),
+        ) == tmp_path / "rel.txt"
 
     def test_directory_input_accepted(self, tmp_path):
         folder = tmp_path / "in_dir"
         folder.mkdir()
-        ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
-        assert ctx.declare_input(folder) == str(folder.resolve())
-
-    def test_relative_input_resolves_against_cwd_not_sandbox(self, tmp_path, monkeypatch):
-        """declare_input 无沙盒语义（有意设计：框架不写输入文件）——相对
-        路径按进程 CWD 解析为规范绝对路径。"""
-        (tmp_path / "rel.txt").write_text("x")
-        monkeypatch.chdir(tmp_path)
-        ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_roots=tmp_path / "out", ipc_dir=ipc)
-        resolved = ctx.declare_input("rel.txt")
-        assert resolved == str((tmp_path / "rel.txt").resolve())
-
-    def test_missing_input_fails_loud_without_recording(self, tmp_path):
-        ipc = str(tmp_path / "ipc")
-        ctx = _make_ctx(output_roots=tmp_path, ipc_dir=ipc)
-        with pytest.raises(FileNotFoundError):
-            ctx.declare_input(tmp_path / "ghost.bin")
-        assert ctx._journal.read_inputs("fetch::j1") == []
-
-    def test_uri_declaration_removed(self):
-        assert not hasattr(_make_ctx(), "declare_input_uri")
-
-    def test_no_ipc_dir_declarations_are_noops(self, tmp_path):
-        """ipc_dir=None：声明调用不落盘也不报错（无清单场景）。"""
-        existing = tmp_path / "c.txt"
-        existing.write_text("x")
-        ctx = _make_ctx(output_roots=None, ipc_dir=None)
-        from tasklite import FileSpec
-
-        ctx.declare_file("out", FileSpec(tmp_path / "a.bin", role="output"))
-        ctx.declare_file("cache", FileSpec(tmp_path / "b.part", role="cache"))
-        ctx.declare_input(existing)
+        ctx = _make_ctx()
+        assert ctx.declare_file(
+            "source",
+            FileSpec(folder, role="input"),
+        ) == folder
 
 
 class TestSuspendResource:

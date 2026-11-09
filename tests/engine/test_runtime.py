@@ -37,7 +37,6 @@ from tasklite.engine.types import (
 )
 from tasklite.models.job import Job, WORKER_RESOURCE
 from tasklite.models.task import Task, TaskRegistry
-from tasklite.utils.ipc import ArtifactJournal
 
 
 def ok_handler(job, ctx):

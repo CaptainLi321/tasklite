@@ -1,6 +1,5 @@
 """具名产物在真实 spawn、历史成功及目录消费中的公开契约。"""
 import multiprocessing as mp
-from pathlib import Path
 
 import pytest
 
@@ -13,15 +12,14 @@ def _actual_spawn(_patch_mp_context, monkeypatch):
 
 
 def build_bundle(job, ctx):
-    folder = Path(ctx.declare_file("bundle", FileSpec(ctx.output_roots / "bundle", role="output", delete_existing=True)))
+    folder = ctx.file_path("bundle")
     folder.mkdir()
     (folder / "report.txt").write_text("published", encoding="utf-8")
     return TaskResult.success()
 
 
 def consume_bundle(job, ctx):
-    folder = Path(ctx.get_artifact_path(producer_job_uid="build::one", artifact_name="bundle"))
-    report = Path(ctx.declare_input(folder / "report.txt"))
+    report = ctx.file_path("source") / "report.txt"
     return TaskResult.success(metadata={"content": report.read_text(encoding="utf-8")})
 
 
@@ -43,14 +41,35 @@ def test_direct_dependency_publishes_directory_for_actual_file_input(tmp_path):
     pipeline.register_task("build", build_bundle)
     pipeline.register_task("consume", consume_bundle)
     try:
-        pipeline.enqueue(Job("build", "one"))
-        pipeline.enqueue(Job("consume", "one", depends_on=["build::one"]))
+        pipeline.enqueue(Job(
+            "build",
+            "one",
+            files={
+                "bundle": FileSpec(
+                    tmp_path / "output" / "bundle",
+                    role="output",
+                    delete_existing=True,
+                ),
+            },
+        ))
+        pipeline.enqueue(Job(
+            "consume",
+            "one",
+            depends_on=["build::one"],
+            files={
+                "source": FileSpec.from_output(
+                    "build::one", "bundle", role="input"
+                ),
+            },
+        ))
         result = pipeline.run()
         assert result is None
         assert len(pipeline.backend.load_successes()) == 2
         successes = pipeline.backend.load_successes()
         assert successes["build::one"]["artifacts"] == {"bundle": {"path": str(tmp_path / "output" / "bundle")}}
-        assert successes["consume::one"]["inputs"] == [str(tmp_path / "output" / "bundle" / "report.txt")]
+        assert successes["consume::one"]["inputs"] == [
+            str(tmp_path / "output" / "bundle")
+        ]
         assert successes["consume::one"]["content"] == "published"
     finally:
         pipeline.stop()
@@ -60,7 +79,17 @@ def test_history_can_be_read_and_missing_disk_does_not_rerun_producer(tmp_path):
     first = _pipeline(tmp_path)
     first.register_task("build", build_bundle)
     try:
-        first.enqueue(Job("build", "one"))
+        first.enqueue(Job(
+            "build",
+            "one",
+            files={
+                "bundle": FileSpec(
+                    tmp_path / "output" / "bundle",
+                    role="output",
+                    delete_existing=True,
+                ),
+            },
+        ))
         first.run()
         original = first.backend.load_successes()["build::one"]
     finally:
@@ -68,12 +97,25 @@ def test_history_can_be_read_and_missing_disk_does_not_rerun_producer(tmp_path):
     second = _pipeline(tmp_path)
     second.register_task("consume", consume_bundle)
     try:
-        second.enqueue(Job("consume", "historical", depends_on=["build::one"]))
+        consumer_files = {
+            "source": FileSpec.from_output("build::one", "bundle", role="input"),
+        }
+        second.enqueue(Job(
+            "consume",
+            "historical",
+            depends_on=["build::one"],
+            files=consumer_files,
+        ))
         assert second.run() is None
         assert "consume::historical" in second.backend.load_successes()
         (tmp_path / "output" / "bundle" / "report.txt").unlink()
         (tmp_path / "output" / "bundle").rmdir()
-        second.enqueue(Job("consume", "missing", depends_on=["build::one"]))
+        second.enqueue(Job(
+            "consume",
+            "missing",
+            depends_on=["build::one"],
+            files=consumer_files,
+        ))
         second.run()
         assert second.backend.load_successes()["build::one"] == original
         assert "consume::missing" in second.backend.load_failed()

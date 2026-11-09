@@ -11,22 +11,18 @@ import copy
 import logging
 import math
 import os
-import stat
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from ..exceptions import TaskLiteError, _ArtifactIOError
-from ..utils.artifact import ArtifactPathPolicy
 from ..utils.ipc import (
-    ArtifactJournal,
     WorkerPipeSender,
     WorkerReplyReceiver,
 )
 from ..utils.jsonutil import dumps
 from .artifact import (
-    ArtifactDeclaration,
     FileSpec,
     coerce_file_spec,
     resolve_job_files_config,
@@ -67,15 +63,24 @@ class JobContext:
         self.job = job
         self.spawned_jobs: list[Job] = []
         self.resource_suspensions: list[tuple[str, float]] = []
+        self._file_sources: dict[str, FileSpec] = {}
         self._files: dict[str, FileSpec] = {}
-        init_files = files if files is not None else getattr(job, "files", None)
-        if init_files:
-            for raw_k, raw_v in init_files.items():
-                k = validate_file_name(raw_k)
-                spec = coerce_file_spec(raw_v, allow_dict=True)
-                if not spec.is_output_ref and spec.path is not None and not os.path.isabs(str(spec.path)):
-                    spec = spec.resolve_against(self.base_dir)
-                self._files[k] = spec
+        job_files = getattr(job, "files", {}) or {}
+        resolved_files = files or {}
+        init_names = dict.fromkeys((*job_files, *resolved_files))
+        for raw_name in init_names:
+            name = validate_file_name(raw_name)
+            raw_source = job_files.get(name, resolved_files.get(name))
+            source = self._canonical_source(
+                coerce_file_spec(raw_source, allow_dict=True)
+            )
+            resolved = (
+                coerce_file_spec(resolved_files[name], allow_dict=True)
+                if name in resolved_files
+                else self._resolve_local_file(source)
+            )
+            self._file_sources[name] = source
+            self._files[name] = resolved
         self._success_job_uids = success_job_uids
         self._failed_job_uids = failed_job_uids
         self._known_job_uids: frozenset[str] = (
@@ -93,21 +98,6 @@ class JobContext:
         # 路径属于**任一**根即通过沙盒校验。
         self.output_roots = output_roots
         self.ipc_dir = ipc_dir
-        self._journal_instance: ArtifactJournal | None = None
-        self._journal_instance_dir: str | None = None
-
-    @property
-    def _journal(self) -> ArtifactJournal:
-        """当前上下文对应的产物清单深模块实例。"""
-        if self._journal_instance is None or self._journal_instance_dir != self.ipc_dir:
-            self._journal_instance = ArtifactJournal(
-                self.ipc_dir,
-                self.output_roots,
-                self._protected_roots,
-                pipe_sender=self._pipe_sender,
-            )
-            self._journal_instance_dir = self.ipc_dir
-        return self._journal_instance
 
     def _bind_pipe_sender(
         self,
@@ -117,8 +107,29 @@ class JobContext:
         """绑定或解绑当前执行体的瞬时管道发送端与回复接收端。"""
         self._pipe_sender = sender
         self._reply_receiver = reply_receiver
-        if self._journal_instance is not None:
-            self._journal_instance.bind_pipe_sender(sender)
+
+    def _canonical_source(self, spec: FileSpec) -> FileSpec:
+        """将普通路径声明按固定基准绝对化；上游引用保留配置身份。"""
+        return spec if spec.is_output_ref else spec.resolve_against(self.base_dir)
+
+    def _resolve_local_file(self, spec: FileSpec) -> FileSpec:
+        """无回复通道时解析声明供隔离测试使用；不执行任何文件删除。"""
+        if spec.is_output_ref:
+            assert spec.producer_uid is not None and spec.output_name is not None
+            desc = self._artifact_descriptions.get(spec.producer_uid, {}).get(spec.output_name)
+            if not desc or "path" not in desc:
+                raise TaskLiteError(
+                    f"producer {spec.producer_uid!r} did not publish "
+                    f"output {spec.output_name!r}"
+                )
+            resolved = spec.bind_output_path(desc["path"])
+        else:
+            resolved = self._canonical_source(spec)
+        if resolved.path is None:
+            raise TaskLiteError("FileSpec resolved without a path")
+        if resolved.role == "input" and not os.path.exists(resolved.path):
+            raise FileNotFoundError(f"Missing input file: {resolved.path}")
+        return resolved
 
     def file_path(self, name: str) -> Path:
         """返回当前 Job 已声明文件（预声明或已完成动态声明）的规范绝对 Path。"""
@@ -136,35 +147,6 @@ class JobContext:
         if not isinstance(spec, FileSpec):
             raise TypeError(f"declare_file expects a FileSpec, got {type(spec).__name__}")
 
-        canonical_spec = spec if spec.is_output_ref else spec.resolve_against(self.base_dir)
-        if validated_name in self._files:
-            existing = self._files[validated_name]
-            if existing.is_output_ref and spec.is_output_ref:
-                if (
-                    existing.producer_uid == spec.producer_uid
-                    and existing.output_name == spec.output_name
-                    and existing.role == spec.role
-                    and existing.delete_existing == spec.delete_existing
-                    and existing.delete_on_failure == spec.delete_on_failure
-                    and existing.delete_on_success == spec.delete_on_success
-                ):
-                    assert existing.path is not None
-                    return Path(existing.path)
-            elif not existing.is_output_ref and not spec.is_output_ref:
-                if (
-                    existing.path == canonical_spec.path
-                    and existing.role == canonical_spec.role
-                    and existing.delete_existing == canonical_spec.delete_existing
-                    and existing.delete_on_failure == canonical_spec.delete_on_failure
-                    and existing.delete_on_success == canonical_spec.delete_on_success
-                ):
-                    assert existing.path is not None
-                    return Path(existing.path)
-            raise TaskLiteError(
-                f"File declaration {validated_name!r} conflicts with existing declaration: "
-                f"{existing!r} vs {spec!r}"
-            )
-
         if spec.is_output_ref:
             assert spec.producer_uid is not None
             if spec.producer_uid not in self.job.depends_on:
@@ -173,18 +155,30 @@ class JobContext:
                     f"which is not in explicit direct depends_on {list(self.job.depends_on)!r}"
                 )
 
+        canonical_source = self._canonical_source(spec)
+        if validated_name in self._file_sources:
+            existing = self._file_sources[validated_name]
+            if existing == canonical_source:
+                resolved = self._files[validated_name]
+                if resolved.path is None:
+                    raise TaskLiteError(f"FileSpec {validated_name!r} has no resolved path")
+                return Path(resolved.path)
+            raise TaskLiteError(
+                f"File declaration {validated_name!r} conflicts with existing declaration: "
+                f"{existing!r} vs {canonical_source!r}"
+            )
+
         if self._pipe_sender is not None and self._reply_receiver is not None:
             req_id = f"req-{uuid.uuid4().hex[:8]}"
-            self._pipe_sender.send_declare(req_id, validated_name, spec.to_dict())
+            self._pipe_sender.send_declare(
+                req_id, validated_name, canonical_source.to_dict()
+            )
             reply = self._reply_receiver.wait_reply(req_id)
             status = reply.get("status")
             if status == "ok":
                 resolved_path = str(reply["resolved_path"])
-                bound_spec = (
-                    spec.bind_output_path(resolved_path, base_dir=self.base_dir)
-                    if spec.is_output_ref
-                    else spec.resolve_against(self.base_dir)
-                )
+                bound_spec = canonical_source.bind_output_path(resolved_path)
+                self._file_sources[validated_name] = canonical_source
                 self._files[validated_name] = bound_spec
                 return Path(resolved_path)
             elif status == "error":
@@ -194,27 +188,10 @@ class JobContext:
             else:
                 raise TaskLiteError(f"Unknown reply status: {status!r}")
 
-        # 本地 / 无管道回退（用于直接单测与调试）
-        if spec.is_output_ref:
-            assert spec.producer_uid is not None and spec.output_name is not None
-            desc = self._artifact_descriptions.get(spec.producer_uid, {}).get(spec.output_name)
-            if not desc or "path" not in desc:
-                raise TaskLiteError(f"producer {spec.producer_uid!r} did not publish output {spec.output_name!r}")
-            resolved_path = desc["path"]
-            if spec.role == "input" and not os.path.exists(resolved_path):
-                raise FileNotFoundError(f"Missing input file: {resolved_path}")
-            bound_spec = spec.bind_output_path(resolved_path, base_dir=self.base_dir)
-        else:
-            bound_spec = spec.resolve_against(self.base_dir)
-            assert bound_spec.path is not None
-            resolved_path = bound_spec.path
-            if spec.role == "input" and not os.path.exists(resolved_path):
-                raise FileNotFoundError(f"Missing input file: {resolved_path}")
-
-        if bound_spec.delete_existing and os.path.exists(resolved_path):
-            policy = ArtifactPathPolicy(output_roots=self.output_roots, protected_roots=self._protected_roots)
-            policy.remove_existing(ArtifactDeclaration(resolved_path, delete_existing=True))
-
+        bound_spec = self._resolve_local_file(canonical_source)
+        assert bound_spec.path is not None
+        resolved_path = bound_spec.path
+        self._file_sources[validated_name] = canonical_source
         self._files[validated_name] = bound_spec
         return Path(resolved_path)
 
@@ -246,50 +223,6 @@ class JobContext:
                 f"Payload for spawned job {job.uid} is not JSON-serializable: {e}"
             ) from e
         self.spawned_jobs.append(Job.from_dict(job_dict))
-
-    def declare_input(self, path: str | Path) -> str:
-        """声明一个本地输入文件或目录：校验路径存在、记录规范绝对路径并返回该路径字符串。
-
-        本方法无 ``sandbox`` 参数——框架不写或清理输入文件，相对路径按当前工作目录解析。
-        在声明点立即执行 ``os.stat(resolved)`` 校验路径存在（缺失或断链立即抛 ``FileNotFoundError`` / ``OSError``）；
-        成功提交时框架把去重保序的规范路径字符串列表 ``list[str]`` 写入 ``successes.metadata["inputs"]``。
-        """
-        raw = str(path)
-        resolved = ArtifactJournal.resolve_and_validate_path(raw, self.output_roots, sandbox=False)
-        os.stat(resolved)
-        self._journal.record_input_file(self.job.uid, resolved)
-        return resolved
-
-    def get_artifact_path(self, *, producer_job_uid: str, artifact_name: str) -> str:
-        """查询直接依赖的已成功产物；不自动声明输入或触发生产者。"""
-        for label, value in (("producer_job_uid", producer_job_uid), ("artifact_name", artifact_name)):
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{label} must be a non-empty str")
-        reference = f"producer {producer_job_uid!r}, artifact {artifact_name!r}"
-        if producer_job_uid not in self.job.depends_on:
-            raise ValueError(f"{reference}: producer must be a direct dependency")
-        if producer_job_uid not in self._success_job_uids:
-            raise LookupError(f"{reference}: no successful producer in dispatch snapshot")
-        descriptions = self._artifact_descriptions.get(producer_job_uid, {})
-        if artifact_name not in descriptions:
-            raise KeyError(f"{reference}: artifact name was not published")
-        description = descriptions[artifact_name]
-        if not isinstance(description, dict) or set(description) != {"path"}:
-            raise ValueError(f"{reference}: invalid artifact description")
-        path = description["path"]
-        try:
-            ArtifactDeclaration(path, name=artifact_name)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"{reference}: invalid artifact path {path!r}") from error
-        try:
-            info = os.stat(path)
-        except OSError as error:
-            raise OSError(error.errno, f"{reference}: {error.strerror}", path) from error
-        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
-            raise ValueError(f"{reference}: artifact is not a file or directory: {path}")
-        if Path(path).is_symlink() or str(Path(path).resolve()) != path:
-            raise ValueError(f"{reference}: artifact path changed: {path}")
-        return path
 
     def get_cursor(self, key: str) -> str | None:
         """读取高水位游标的当前值（含自身暂存写入）。"""

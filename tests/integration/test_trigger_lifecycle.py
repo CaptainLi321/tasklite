@@ -32,8 +32,12 @@ def produce_input(job, ctx):
     mode = job.payload.get("mode", "write")
     if mode == "fail":
         return TaskResult.failure(message="upstream failed in this batch")
+    path = Path(ctx.declare_file("source", FileSpec(
+        ctx.output_roots / "source.txt",
+        role="output",
+        delete_existing=mode == "write",
+    )))
     if mode == "write":
-        path = Path(ctx.declare_file("source", FileSpec(ctx.output_roots / "source.txt", role="output", delete_existing=True)))
         path.write_text(job.payload.get("content", "first"), encoding="utf-8")
         if "mtime_ns" in job.payload:
             stamp = job.payload["mtime_ns"]
@@ -42,7 +46,7 @@ def produce_input(job, ctx):
 
 
 def consume_input(job, ctx):
-    path = Path(ctx.declare_input(ctx.output_roots / "source.txt"))
+    path = ctx.file_path("source")
     return TaskResult.success(metadata={
         "content": path.read_text(encoding="utf-8"), "pid": os.getpid(),
     })
@@ -54,7 +58,17 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     first.register_task("produce", produce_input, trigger="always")
     first.register_task("consume", consume_input, trigger="on_input_change")
     first.enqueue(Job("produce", "source"))
-    first.enqueue(Job("consume", "result", depends_on=["produce::source"]))
+    consumer_files = {
+        "source": FileSpec.from_output(
+            "produce::source", "source", role="input"
+        ),
+    }
+    first.enqueue(Job(
+        "consume",
+        "result",
+        depends_on=["produce::source"],
+        files=consumer_files,
+    ))
     assert first.run() is None
     first.stop()
     first_produce_run_id = first.backend.load_successes()["produce::source"]["last_success_run_id"]
@@ -72,7 +86,12 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     second.register_trigger("observe", observe_input)
     second.register_task("produce", produce_input, trigger="always")
     second.register_task("consume", consume_input, trigger="observe")
-    second.enqueue(Job("consume", "result", depends_on=["produce::source"]))
+    second.enqueue(Job(
+        "consume",
+        "result",
+        depends_on=["produce::source"],
+        files=consumer_files,
+    ))
     second.enqueue(Job("produce", "source", payload={"mode": mode, "content": "updated",
                                                      "mtime_ns": (baseline_us + 1) * 1000}))
     res = second.run()
@@ -153,12 +172,30 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
     first.register_task("produce", produce_input)
     first.register_task("consume", consume_input, trigger="on_input_change")
     first.enqueue(Job("produce", "source"))
-    first.enqueue(Job("consume", "result", depends_on=["produce::source"]))
+    first.enqueue(Job(
+        "consume",
+        "result",
+        depends_on=["produce::source"],
+        files={
+            "source": FileSpec.from_output(
+                "produce::source", "source", role="input"
+            ),
+        },
+    ))
     first.run()
     first.clear_history("consume::result", records=["successes"])
     if seed_after_clear:
         first.set_job_status(
-            Job("consume", "result", depends_on=["produce::source"]),
+            Job(
+                "consume",
+                "result",
+                depends_on=["produce::source"],
+                files={
+                    "source": FileSpec.from_output(
+                        "produce::source", "source", role="input"
+                    ),
+                },
+            ),
             "succeeded",
             recursive=False,
         )
@@ -166,7 +203,16 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
 
     second = _pipeline(tmp_path)
     second.register_task("consume", consume_input, trigger="on_input_change")
-    second.enqueue(Job("consume", "result", depends_on=["produce::source"]))
+    second.enqueue(Job(
+        "consume",
+        "result",
+        depends_on=["produce::source"],
+        files={
+            "source": FileSpec.from_output(
+                "produce::source", "source", role="input"
+            ),
+        },
+    ))
     res = second.run()
     second.stop()
     assert res is None

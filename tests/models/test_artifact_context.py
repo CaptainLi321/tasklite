@@ -1,4 +1,5 @@
-"""公开产物声明与直接依赖引用契约。"""
+"""公开文件声明、固定路径基准与上游产物引用契约。"""
+
 from pathlib import Path
 
 import pytest
@@ -6,6 +7,12 @@ import pytest
 from tasklite import FileSpec, Job, TaskLiteError
 from tasklite.testing import fake_ctx
 from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
+
+
+def test_legacy_file_reader_and_input_entry_are_absent():
+    ctx = fake_ctx(Job("build", "one"))
+    assert not hasattr(ctx, "declare_input")
+    assert not hasattr(ctx, "get_artifact_path")
 
 
 def test_named_output_is_idempotent_without_deleting_written_content(tmp_path):
@@ -18,37 +25,65 @@ def test_named_output_is_idempotent_without_deleting_written_content(tmp_path):
     assert set(ctx._files) == {"report"}
 
 
-def test_getter_reads_direct_dependency_without_declaring_input(tmp_path):
+def test_predeclared_output_reference_is_read_through_file_path(tmp_path):
     folder = tmp_path / "bundle"
     folder.mkdir()
     (folder / "report.txt").write_text("result", encoding="utf-8")
+    job = Job(
+        "consume",
+        "one",
+        depends_on=["build::one"],
+        files={
+            "bundle": FileSpec.from_output("build::one", "bundle", role="input"),
+        },
+    )
     ctx = fake_ctx(
-        Job("consume", "one", depends_on=["build::one"]), tmp_root=tmp_path,
+        job,
         successes=["build::one"],
         artifacts={"build::one": {"bundle": {"path": str(folder)}}},
     )
-    assert ctx.get_artifact_path(producer_job_uid="build::one", artifact_name="bundle") == str(folder)
-    assert ctx._journal.read_inputs(ctx.job.uid) == []
-    report = ctx.declare_input(folder / "report.txt")
-    assert ctx._journal.read_inputs(ctx.job.uid) == [report]
+    assert ctx.file_path("bundle") == folder
 
 
-@pytest.mark.parametrize("role", ["output", "cache"])
+def test_predeclared_reference_reused_by_same_dynamic_declaration(tmp_path):
+    report = tmp_path / "report.txt"
+    report.write_text("published", encoding="utf-8")
+    source = FileSpec.from_output("build::one", "report", role="input")
+    job = Job(
+        "consume",
+        "one",
+        depends_on=["build::one"],
+        files={"source": source},
+    )
+    ctx = fake_ctx(
+        job,
+        successes=["build::one"],
+        artifacts={"build::one": {"report": {"path": str(report)}}},
+    )
+    assert ctx.declare_file("source", source) == report
+
+
 @pytest.mark.parametrize("attributes", [{}, {"delete_on_failure": True}, {"delete_on_success": True}])
-def test_existing_path_requires_explicit_delete_request(tmp_path, role, attributes):
+def test_test_context_never_executes_file_deletion_without_reply_path(tmp_path, attributes):
     path = tmp_path / "existing"
     path.write_text("valuable", encoding="utf-8")
-    ctx = fake_ctx(Job("build", "one"))
-    assert ctx.declare_file("keep", FileSpec(path, role=role, **attributes)) == path
+    ctx = fake_ctx(Job("build", "one"), base_dir=tmp_path)
+    assert ctx.declare_file(
+        "keep",
+        FileSpec(path, role="output", **attributes),
+    ) == path
     assert path.read_text(encoding="utf-8") == "valuable"
-    assert ctx.declare_file("delete", FileSpec(path, role=role, delete_existing=True, **attributes)) == path
-    assert not path.exists()
 
 
-@pytest.mark.parametrize("change", [
-    {"delete_existing": False}, {"delete_on_failure": True},
-    {"delete_on_success": True}, {"role": "cache"},
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"delete_existing": False},
+        {"delete_on_failure": True},
+        {"delete_on_success": True},
+        {"role": "cache"},
+    ],
+)
 def test_changed_named_declaration_rejected_before_deleting_content(tmp_path, change):
     ctx = fake_ctx(Job("build", "one"), base_dir=tmp_path)
     attributes = {"role": "output", "delete_existing": True}
@@ -59,7 +94,10 @@ def test_changed_named_declaration_rejected_before_deleting_content(tmp_path, ch
     assert path.read_text(encoding="utf-8") == "valuable"
 
 
-@pytest.mark.parametrize("first, second", [("folder", "folder/report"), ("folder/report", "folder"), ("same", "same")])
+@pytest.mark.parametrize(
+    "first, second",
+    [("folder", "folder/report"), ("folder/report", "folder"), ("same", "same")],
+)
 def test_different_names_allow_overlapping_paths(tmp_path, first, second):
     ctx = fake_ctx(Job("build", "one"), base_dir=tmp_path)
     assert ctx.declare_file("first", FileSpec(first, role="output")) == tmp_path / first
@@ -73,86 +111,54 @@ def test_same_name_cannot_move_to_another_path(tmp_path):
         ctx.declare_file("report", FileSpec("second", role="output"))
 
 
-@pytest.mark.parametrize("successes, dependencies, artifacts, expected", [
-    (["build::one"], [], {"bundle": {"path": "/missing"}}, ValueError),
-    ([], ["build::one"], {"bundle": {"path": "/missing"}}, LookupError),
-    (["build::one"], ["build::one"], {}, KeyError),
-    (["build::one"], ["build::one"], {"bundle": {"path": "/missing"}}, FileNotFoundError),
-])
-def test_getter_distinguishes_missing_dependency_success_name_and_path(
-    successes, dependencies, artifacts, expected,
-):
-    ctx = fake_ctx(Job("consume", "one", depends_on=dependencies),
-                   successes=successes, artifacts={"build::one": artifacts})
-    with pytest.raises(expected) as caught:
-        ctx.get_artifact_path(producer_job_uid="build::one", artifact_name="bundle")
-    assert "build::one" in str(caught.value) and "bundle" in str(caught.value)
+def test_dynamic_output_reference_requires_direct_dependency(tmp_path):
+    report = tmp_path / "report.txt"
+    report.write_text("result", encoding="utf-8")
+    ctx = fake_ctx(
+        Job("consume", "one"),
+        successes=["build::one"],
+        artifacts={"build::one": {"report": {"path": str(report)}}},
+    )
+    with pytest.raises(TaskLiteError, match="not in explicit direct depends_on"):
+        ctx.declare_file(
+            "source",
+            FileSpec.from_output("build::one", "report", role="input"),
+        )
 
 
-def test_injected_artifacts_are_dispatch_snapshot(tmp_path):
-    path = tmp_path / "result"
-    path.write_text("result", encoding="utf-8")
-    artifacts = {"build::one": {"report": {"path": str(path)}}}
-    ctx = fake_ctx(Job("consume", "one", depends_on=["build::one"]),
-                   successes=["build::one"], artifacts=artifacts)
-    artifacts["build::one"].clear()
-    assert ctx.get_artifact_path(producer_job_uid="build::one", artifact_name="report") == str(path)
+def test_unpublished_dynamic_reference_fails_without_recording(tmp_path):
+    ctx = fake_ctx(
+        Job("consume", "one", depends_on=["build::one"]),
+        successes=["build::one"],
+        artifacts={"build::one": {}},
+    )
+    with pytest.raises(TaskLiteError, match="did not publish output"):
+        ctx.declare_file(
+            "source",
+            FileSpec.from_output("build::one", "report", role="input"),
+        )
+    assert "source" not in ctx._files
 
 
 def test_declaration_write_error_propagates(tmp_path):
-    ipc = tmp_path / "ipc"
-    ctx = fake_ctx(Job("build", "one"), ipc_dir=str(ipc))
+    ctx = fake_ctx(Job("build", "one"), ipc_dir=str(tmp_path / "ipc"))
     receiver, sender = create_worker_pipe(
         job_uid=ctx.job.uid,
         execution_id="exec_err",
     )
     sender.close()
     receiver.close()
-    reply_receiver, reply_sender = create_worker_reply_pipe(job_uid=ctx.job.uid, execution_id="exec_err")
+    reply_receiver, reply_sender = create_worker_reply_pipe(
+        job_uid=ctx.job.uid,
+        execution_id="exec_err",
+    )
     ctx._bind_pipe_sender(sender, reply_receiver)
     try:
         with pytest.raises(OSError):
-            ctx.declare_file("result", FileSpec(tmp_path / "result", role="output"))
+            ctx.declare_file(
+                "result",
+                FileSpec(tmp_path / "result", role="output"),
+            )
     finally:
         reply_receiver.close()
         reply_sender.close()
-
-
-def test_getter_propagates_access_error_with_reference_context(tmp_path, monkeypatch):
-    import errno
-    import os
-
-    path = tmp_path / "report"
-    path.write_text("result", encoding="utf-8")
-    ctx = fake_ctx(Job("consume", "one", depends_on=["build::one"]), successes=["build::one"],
-                   artifacts={"build::one": {"report": {"path": str(path)}}})
-    real_stat = os.stat
-
-    def inaccessible(target, *args, **kwargs):
-        if target == str(path):
-            raise PermissionError(errno.EACCES, "denied", str(path))
-        return real_stat(target, *args, **kwargs)
-
-    monkeypatch.setattr(os, "stat", inaccessible)
-    with pytest.raises(PermissionError) as caught:
-        ctx.get_artifact_path(producer_job_uid="build::one", artifact_name="report")
-    assert "build::one" in str(caught.value) and str(path) in str(caught.value)
-
-
-def test_output_path_io_fault_is_environment_error(tmp_path, monkeypatch):
-    import os
-    from tasklite.exceptions import _ArtifactIOError
-
-    ctx = fake_ctx(Job('build', 'one'), tmp_root=tmp_path)
-    target = tmp_path / 'result'
-    target.write_text("valuable")
-    original = os.lstat
-
-    def denied(path, *args, **kwargs):
-        if Path(path) == target:
-            raise PermissionError('output access denied')
-        return original(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, 'lstat', denied)
-    with pytest.raises(PermissionError, match='output access denied'):
-        ctx.declare_file('result', FileSpec(target, role='output', delete_existing=True))

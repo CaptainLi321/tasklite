@@ -463,7 +463,7 @@ def test_pre_dispatch_removes_broken_symlink(tmp_path, monkeypatch):
         "work",
         "one",
         payload={"marker": str(marker)},
-        files={"target": FileSpec(link, role="output", delete_existing=True)},
+        files={"target": FileSpec(link, role="cache", delete_existing=True)},
     ))
     p.run()
 
@@ -576,7 +576,7 @@ def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, mo
 
     p.authorizer = authorize
     p.enqueue(Job("independent", "one"))
-    p.enqueue(Job("protected", "one", files={"target": FileSpec(target, role="output", delete_existing=True)}))
+    p.enqueue(Job("protected", "one", files={"target": FileSpec(target, role="cache", delete_existing=True)}))
     p.enqueue(Job("independent", "later"))
     p.run()
     assert len(calls) >= 2

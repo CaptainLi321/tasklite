@@ -27,7 +27,6 @@ from tasklite.models.result import TaskResult
 from tasklite.models.task import Task
 from tasklite.pipeline import TaskLite
 from tasklite.testing import running
-from tasklite.utils.ipc import ArtifactJournal
 
 
 def ok_handler(job, ctx):

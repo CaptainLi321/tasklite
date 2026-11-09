@@ -68,7 +68,7 @@ from ..models.attempt import ATTEMPT_REQUEUED
 from ..models.context import JobContext
 from ..models.job import Job, JobRuntimeState
 from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
-from .channel import ArtifactCleanupMode, WorkerLaunchSpec
+from .channel import WorkerLaunchSpec
 from .errorclass import (
     ERR_DISPATCH_FAILURE,
     ERR_JOB_DEPENDENCY,
@@ -389,7 +389,6 @@ class DispatchMachine:
         # 逐项获取资源（串行连续获取，异常属 Run 级框架故障直接上抛）
         acquired = self._resources.acquire_all(job.task_type, job.resources, job_uid=job_uid)
 
-        self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
         pre_deletes = [
             ArtifactDeclaration(fspec.path, delete_existing=True)
             for fspec in resolved_files.values()
@@ -574,6 +573,7 @@ class DispatchMachine:
                     | store.state.failed_uids
                 ),
                 active_files=dict(resolved_files or {}),
+                active_file_sources=dict(job.files),
             )
             # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
             self._in_flight.track(entry, state=store.state)

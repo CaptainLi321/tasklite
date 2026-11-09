@@ -23,7 +23,6 @@ from tasklite.models.context import JobContext
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.utils.ipc import (
-    ArtifactJournal,
     WorkerPipeSender,
     create_worker_pipe,
 )
@@ -56,21 +55,6 @@ def make_spec(
     )
 
 
-def _write_artifact(journal, uid, path, *, delete_on_failure=False, delete_on_success=False):
-    """注入产物声明到当前进程日志。"""
-    from tasklite.models.artifact import ArtifactDeclaration
-
-    prev = journal._artifacts.get(uid, ())
-    journal._artifacts[uid] = (
-        *prev,
-        ArtifactDeclaration(
-            path,
-            delete_on_failure=delete_on_failure,
-            delete_on_success=delete_on_success,
-        ),
-    )
-
-
 class TestExecutionChannelBasics:
     def test_init_and_directory_creation(self, tmp_path):
         ipc_dir = tmp_path / "ipc"
@@ -87,74 +71,6 @@ class TestExecutionChannelBasics:
         signals = channel.drain_active_signals(["job_signals", "job_other"])
         assert ("job_signals", "gpu", 15.0) in signals
         assert ("job_signals", "api", 3.0) in signals
-
-    def test_read_declared_inputs(self, tmp_path):
-        channel = ExecutionChannel(tmp_path)
-        channel.journal.record_input_entry(
-            "job_inputs", {"kind": "file", "path": "/tmp/a.txt", "size": 100, "mtime_ns": 1000}
-        )
-        inputs = channel.read_declared_inputs("job_inputs")
-        assert inputs == ["/tmp/a.txt"]
-
-    def test_journal_property_rebuilds_on_ipc_dir_change(self, tmp_path):
-        channel = ExecutionChannel()
-        assert channel.journal.ipc_dir is None
-        channel.ipc_dir = str(tmp_path)
-        assert channel.journal.ipc_dir == str(tmp_path)
-
-
-class TestExecutionChannelArtifactCleanup:
-    def test_cleanup_pre_submit(self, tmp_path):
-        channel = ExecutionChannel(tmp_path)
-        uid = "job_clean"
-        channel.journal.record_input_entry(uid, {"kind": "file", "path": "/tmp/x"})
-        _write_artifact(channel.journal, uid, "/tmp/y", delete_on_failure=False)
-
-        from tasklite.utils.ipc import ArtifactCleanupMode
-
-        channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
-
-        assert channel.journal.read_inputs(uid) == []
-        assert channel.journal.read_artifacts(uid) == ()
-
-    def test_cleanup_success_deletes_cache_files_and_declarations(self, tmp_path):
-        from tasklite.utils.ipc import ArtifactCleanupMode
-
-        channel = ExecutionChannel(tmp_path / "ipc", output_roots=tmp_path)
-        uid = "job_success"
-        cache_file = tmp_path / "cache.tmp"
-        cache_file.write_text("temporary data")
-        output_file = tmp_path / "final.txt"
-        output_file.write_text("final data")
-
-        _write_artifact(channel.journal, uid, str(cache_file), delete_on_failure=False, delete_on_success=True)
-        _write_artifact(channel.journal, uid, str(output_file), delete_on_failure=True)
-
-        channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.SUCCESS)
-
-        assert not cache_file.exists()
-        assert output_file.exists()
-        assert channel.journal.read_artifacts(uid) == ()
-
-    def test_cleanup_failure_deletes_authorized_outputs(self, tmp_path):
-        from tasklite.utils.ipc import ArtifactCleanupMode
-
-        channel = ExecutionChannel(tmp_path / "ipc", output_roots=tmp_path)
-        uid = "job_fail"
-        fail_file = tmp_path / "temp_product.txt"
-        fail_file.write_text("to delete")
-        keep_file = tmp_path / "keep.txt"
-        keep_file.write_text("to keep")
-
-        _write_artifact(channel.journal, uid, str(fail_file), delete_on_failure=True)
-        _write_artifact(channel.journal, uid, str(keep_file), delete_on_failure=False)
-
-        channel.cleanup_artifacts(uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY)
-
-        assert not fail_file.exists()
-        assert keep_file.exists()
-        assert channel.journal.read_artifacts(uid) == ()
-
 
 class TestWorkerWrapper:
     """worker 执行体入口：Pipe 结果发送、锁冲突/环境故障降级、瞬态三 kind 回传。"""
@@ -318,12 +234,11 @@ class TestEnvFallbackIpcDirCoherence:
         job = Job("t", "x")
         handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), None))
 
-        # 实例属性、journal 与 handle 派发路径同源
+        # 实例属性与 handle 的派发路径同源
         assert channel.ipc_dir == str(tmp_path), (
             "env 兜底解析成功后必须回写实例属性（收割路径的事实源）"
         )
         assert handle.ipc_dir == str(tmp_path)
-        assert channel.journal.ipc_dir == str(tmp_path)
 
         completed = channel.reap_completed([handle])
         assert [(h.job_uid, r.success) for h, r in completed] == [("t::x", True)]
@@ -508,23 +423,6 @@ class TestDecodeIpcResultDefense:
         assert "PROCESS_CRASH_EXIT" in (result.retry_error or "")
 
     def test_decode_leaves_output_validation_to_completion(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        _write_artifact(journal, "t::a", str(tmp_path / "missing.jpg"), delete_on_failure=True)
-        result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
-        assert result.success is True
-
-    def test_present_output_passes(self, tmp_path):
-        journal = ArtifactJournal(tmp_path)
-        out = tmp_path / "present.jpg"
-        out.write_bytes(b"x")
-        _write_artifact(journal, "t::a", str(out), delete_on_failure=True)
-        result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
-        assert result.success is True
-
-    def test_cache_output_skips_existence_check(self, tmp_path):
-        """解码不读取临时产物；存在性校验统一交给完成机器。"""
-        journal = ArtifactJournal(tmp_path)
-        _write_artifact(journal, "t::a", str(tmp_path / "cache.part"), delete_on_failure=True, delete_on_success=True)
         result = _decode(dict(_BASE_OK), ipc_dir=str(tmp_path))
         assert result.success is True
 
@@ -796,7 +694,6 @@ class TestAbortInFlight:
         job_pending = Job("task", "pending")
         unfinished = tmp_path / "unfinished"
         unfinished.write_text("partial output")
-        _write_artifact(channel.journal, job_pending.uid, str(unfinished), delete_on_failure=True)
 
         channel._results["inc_done"] = {
             "status": "success",
@@ -823,7 +720,6 @@ class TestAbortInFlight:
         assert len(outcome.cancelled) == 1
         assert outcome.cancelled[0].job_uid == job_pending.uid
         assert unfinished.exists()
-        assert channel.journal.read_artifacts(job_pending.uid) != ()
 
     def test_abort_salvages_signal_written_before_kill(self, tmp_path):
         """杀进程后补排空：「先排空后杀」窗口内终前写入的 suspend 信号捞回。"""

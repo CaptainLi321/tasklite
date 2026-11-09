@@ -218,15 +218,18 @@ class TestFakeCtxAuthorizationAndInvariants:
         with pytest.raises(TaskLiteError, match="not in explicit direct depends_on"):
             ctx.declare_file("input_art", spec)
 
-    def test_delete_in_protected_roots_rejected(self, tmp_path):
+    def test_test_context_does_not_delete_in_protected_roots(self, tmp_path):
         state_dir = tmp_path / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
         target_file = state_dir / "db.sqlite"
         target_file.write_text("protected", encoding="utf-8")
 
         ctx = fake_ctx(Job("clean", "1"), protected_roots=(state_dir,))
-        with pytest.raises((ValueError, TaskLiteError), match="protected"):
-            ctx.declare_file("del", FileSpec(target_file, role="output", delete_existing=True))
+        assert ctx.declare_file(
+            "del",
+            FileSpec(target_file, role="output", delete_existing=True),
+        ) == target_file
+        assert target_file.read_text(encoding="utf-8") == "protected"
 
     def test_unregistered_spawn_dependency_rejected(self):
         ctx = fake_ctx(Job("parent", "p1"))

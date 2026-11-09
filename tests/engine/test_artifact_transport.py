@@ -120,19 +120,18 @@ def _write_declaration_with_io_fault(job, ctx):
     from tasklite.utils.ipc import WorkerPipeSender
 
     kind = job.payload["kind"]
-    target_method = "send_declare" if kind == "output" else "send_input"
 
     def denied_send(self, *args, **kwargs):
         from tasklite.exceptions import _ArtifactIOError
 
         raise _ArtifactIOError("declaration write denied")
 
-    with patch.object(WorkerPipeSender, target_method, denied_send):
+    with patch.object(WorkerPipeSender, "send_declare", denied_send):
         try:
-            if kind == "output":
-                ctx.declare_file("output", FileSpec(job.payload["path"], role="output"))
-            else:
-                ctx.declare_input(job.payload["path"])
+            ctx.declare_file(
+                "declared",
+                FileSpec(job.payload["path"], role=kind),
+            )
         except Exception:
             return {"swallowed": True}
 

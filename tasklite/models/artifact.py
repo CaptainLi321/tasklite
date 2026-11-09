@@ -1,8 +1,8 @@
 """磁盘文件声明值与配置解析：FileSpec 统一声明值对象及提交期快照规范化。"""
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -50,6 +50,12 @@ def resolve_path_against_base(path: str | Path, base_dir: str | Path) -> str:
     """按固定基准目录将路径解析为词法规范的绝对路径（不创建目录或访问磁盘）。"""
     norm = _normalize_lexical_path(path)
     base_norm = _normalize_lexical_path(base_dir)
+    if os.name == "nt":
+        path_drive, path_root = os.path.splitdrive(norm)
+        if path_drive and not path_root:
+            raise ValueError(
+                f"drive-relative FileSpec paths are not portable: {norm!r}"
+            )
     if not os.path.isabs(base_norm):
         base_norm = os.path.abspath(base_norm)
     if os.path.isabs(norm):
@@ -373,7 +379,7 @@ def merge_named_file_spec(
 
 @dataclass(frozen=True)
 class ArtifactDeclaration:
-    """同执行的授权值；路径仅校验词法规范，物理归属由路径策略核验。"""
+    """一次路径清理操作的内部授权值；物理归属由路径策略核验。"""
 
     path: str
     name: str | None = None
@@ -397,51 +403,6 @@ class ArtifactDeclaration:
         for field in ("delete_existing", "delete_on_failure", "delete_on_success", "sandbox"):
             if type(getattr(self, field)) is not bool:
                 raise TypeError(f"{field} must be a bool")
-        if self.name is not None and self.delete_on_success:
-            raise ValueError("artifact name cannot be used with delete_on_success")
-
-    def to_dict(self) -> dict[str, Any]:
-        """导出声明数据，不记录执行阶段。"""
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> ArtifactDeclaration:
-        """严格读取声明字段，未知键不作为框架状态接纳。"""
-        return cls(**data)
-
-
-def validate_artifact_declarations(
-    declarations: Iterable[ArtifactDeclaration],
-) -> tuple[ArtifactDeclaration, ...]:
-    """校验同执行声明并保序收敛完全一致的重复。"""
-    accepted: list[ArtifactDeclaration] = []
-    for declaration in declarations:
-        if not isinstance(declaration, ArtifactDeclaration):
-            raise TypeError("declaration must be an ArtifactDeclaration")
-        for previous in accepted:
-            if previous == declaration:
-                break
-            path, old_path = Path(declaration.path), Path(previous.path)
-            if path == old_path:
-                raise ValueError(f"artifact path already declared with different attributes: {path}")
-            if declaration.name is not None and declaration.name == previous.name:
-                raise ValueError(f"artifact name already declared: {declaration.name!r}")
-            if path.is_relative_to(old_path) or old_path.is_relative_to(path):
-                raise ValueError(f"overlapping artifact paths: {old_path}, {path}")
-        else:
-            accepted.append(declaration)
-    return tuple(accepted)
-
-
-def append_artifact_declaration(
-    previous: tuple[ArtifactDeclaration, ...], declaration: ArtifactDeclaration,
-) -> tuple[ArtifactDeclaration, ...]:
-    """仅比较新增声明与已有声明；完整集合在成功边界复核。"""
-    for old in previous:
-        if old == declaration:
-            return previous
-        validate_artifact_declarations((old, declaration))
-    return (*previous, declaration)
 
 
 __all__ = [
@@ -455,6 +416,4 @@ __all__ = [
     "resolve_path_against_base",
     "validate_file_name",
     "ArtifactDeclaration",
-    "append_artifact_declaration",
-    "validate_artifact_declarations",
 ]

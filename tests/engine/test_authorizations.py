@@ -37,10 +37,11 @@ def _quick_handler(job, ctx):
 
 
 def _dir_handler(job, ctx):
-    ctx.declare_file(
+    path = Path(ctx.declare_file(
         "sub_file",
         FileSpec("managed_dir/sub/item.txt", role="output", delete_existing=True),
-    )
+    ))
+    path.write_text("updated", encoding="utf-8")
     return TaskResult.success()
 
 
@@ -62,15 +63,20 @@ def _protected_path_handler(job, ctx):
 
 
 def _target_handler(job, ctx):
-    ctx.declare_file(
+    path = Path(ctx.declare_file(
         "dyn_file",
         FileSpec("target.txt", role="output", delete_existing=True),
-    )
+    ))
+    path.write_text("updated", encoding="utf-8")
     return TaskResult.success()
 
 
 def _good_handler(job, ctx):
-    ctx.declare_file("out1", FileSpec("my_out.txt", role="output", delete_existing=True))
+    path = Path(ctx.declare_file(
+        "out1",
+        FileSpec("my_out.txt", role="output", delete_existing=True),
+    ))
+    path.write_text("updated", encoding="utf-8")
     return TaskResult.success()
 
 

@@ -38,7 +38,7 @@ from ..models.artifact import ArtifactDeclaration, FileSpec
 from ..utils.artifact import ArtifactPathPolicy
 from ..utils.clock import utc_now_iso
 from .admission import extract_effective_job_config
-from .channel import ArtifactCleanupMode, ExecutionResult, JobHandle
+from .channel import ExecutionResult, JobHandle
 from .errorclass import ERR_MAX_RETRIES
 from .in_flight import InFlightJob, InFlightTracker
 from .types import AttemptOutcome
@@ -184,7 +184,6 @@ class CompletionMachine:
                     metadata=dict(result.result_metadata),
                 ),
             )
-        self._channel.journal.clear_declarations(uid)
 
     def apply_result(
         self,
@@ -245,13 +244,31 @@ class CompletionMachine:
 
         if result.artifact_error is not None:
             raise _ArtifactIOError(result.artifact_error)
-        declarations = self._channel.read_declared_artifacts(uid)
-        inputs = self._channel.read_declared_inputs(uid) if result.success else ()
         if result.success:
-            missing_output = self._channel.journal.verify_artifacts(declarations)
-            if missing_output is not None:
-                result.success = False
-                result.message = missing_output
+            policy = ArtifactPathPolicy(
+                output_roots=getattr(self._channel, "output_roots", None),
+                protected_roots=self._channel.protected_roots,
+            )
+            for fname, spec in active_files.items():
+                if spec.role != "output":
+                    continue
+                if spec.path is None:
+                    result.success = False
+                    result.message = f"Missing output path for {fname!r}"
+                    break
+                try:
+                    present = policy.entry_exists(
+                        ArtifactDeclaration(spec.path, sandbox=False)
+                    )
+                except _CLEANUP_ERRORS as exc:
+                    result.success = False
+                    result.message = f"Output verification failed: {exc}"
+                    self._attach_cleanup_failure(result, exc)
+                    break
+                if not present:
+                    result.success = False
+                    result.message = f"Missing output {spec.path}"
+                    break
 
         spawned_job_snapshots: list[dict[str, Any]] = []
         if result.success and result.spawned_jobs:
@@ -271,8 +288,6 @@ class CompletionMachine:
                     result.success = False
                     result.message = f"Invalid cursor update: {k!r}={v!r}"
                     break
-
-        self._channel.journal.cleanup_declared_artifacts(declarations, success=result.success)
 
         # 声明式产物主进程清理
         if active_files:
@@ -350,8 +365,6 @@ class CompletionMachine:
                 started_monotonic=started_monotonic,
                 attempt_id=attempt_id,
                 execution_id=execution_id,
-                declared_artifacts=declarations,
-                declared_inputs=inputs,
                 attempt_no=attempt_no,
                 run_id=run_id,
                 started_at=started_at,
@@ -500,8 +513,6 @@ class CompletionMachine:
         started_monotonic: float | None = None,
         attempt_id: int | None = None,
         execution_id: str | None = None,
-        declared_artifacts: Sequence[ArtifactDeclaration] = (),
-        declared_inputs: Sequence[str] = (),
         attempt_no: int = 1,
         run_id: str | None = None,
         started_at: str | None = None,
@@ -518,12 +529,14 @@ class CompletionMachine:
             if active_files
             else job_snapshot.get("files")
         )
-        effective_declarations = list(declared_artifacts)
-        effective_inputs = list(declared_inputs)
+        effective_declarations: list[ArtifactDeclaration] = []
+        effective_inputs: list[str] = []
         if active_files:
             for fname, fspec in active_files.items():
                 if fspec.role == "output" and fspec.path is not None:
-                    effective_declarations.append(ArtifactDeclaration(fspec.path, name=fname))
+                    effective_declarations.append(
+                        ArtifactDeclaration(fspec.path, name=fname)
+                    )
                 elif fspec.role == "input" and fspec.path is not None:
                     effective_inputs.append(fspec.path)
 
@@ -717,9 +730,6 @@ class CompletionMachine:
         cleanup_error: BaseException | None = None
         for entry in cancelled_entries:
             try:
-                self._channel.cleanup_artifacts(
-                    entry.job_uid, mode=ArtifactCleanupMode.FAILURE_OR_RETRY,
-                )
                 policy = ArtifactPathPolicy(
                     output_roots=getattr(self._channel, "output_roots", None),
                     protected_roots=self._channel.protected_roots,

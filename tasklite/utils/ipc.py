@@ -1,15 +1,12 @@
-"""瞬时 Worker 管道通信与产物清单：信封协议、有界反压、声明管理与生命周期清理。
+"""瞬时 Worker 管道通信：信封协议、有界反压、声明请求与回复身份校验。
 
-统一内敛瞬时管道 IPC 与产物清单的完整生命周期管理：
+统一内敛瞬时管道 IPC：
 
 - 单向管道传输：基于 ``multiprocessing.Pipe(duplex=False)`` 的原生帧收发
   （``send_bytes`` / ``recv_bytes``），每 worker 独立读取线程与有界队列，
-  承载 ``input`` / ``declare`` / ``suspend`` / ``result`` 信封消息；
-- 路径与沙盒校验：空字节防御、跨盘多根沙盒匹配、相对路径规范重定位；
-- 产物与输入声明：worker 侧请求回复声明，主进程侧授权、准备及内存态聚合、
-  存在性校验与成败授权清理；
-- 产物生命周期清理：按 PRE_SUBMIT / SUCCESS / FAILURE_OR_RETRY 模式清理
-  已声明临时文件与目录，删除前消费侧沙盒归属复检。
+  承载 ``declare`` / ``suspend`` / ``result`` 信封消息；
+- 动态声明：worker 侧请求回复声明，主进程侧完成解析、授权与准备；
+- 回复身份：响应严格绑定 job_uid、execution_id 与 request_id。
 
 分层红线：本模块是模型层（JobContext）的 IPC 声明与信号传输下沉点；
 本层严禁出现任何重试节奏语义（节奏归 RequeuePolicy）。
@@ -17,7 +14,6 @@
 
 from __future__ import annotations
 
-import enum
 import json
 import logging
 import multiprocessing as mp
@@ -26,16 +22,9 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 from ..exceptions import _ArtifactIOError
-from ..models.artifact import (
-    ArtifactDeclaration,
-    append_artifact_declaration,
-    validate_artifact_declarations,
-)
-from .artifact import ArtifactPathPolicy
 from .jsonutil import dumps, loads
 
 logger = logging.getLogger("tasklite")
@@ -55,7 +44,6 @@ PIPE_MSG_RESULT = "result"
 PIPE_MSG_DECLARE = "declare"
 VALID_PIPE_MESSAGE_KINDS = frozenset(
     {
-        PIPE_MSG_INPUT,
         PIPE_MSG_SUSPEND,
         PIPE_MSG_RESULT,
         PIPE_MSG_DECLARE,
@@ -156,13 +144,6 @@ class WorkerPipeSender:
             if self._closed:
                 raise OSError("worker pipe sender is closed")
             self._conn.send_bytes(frame)
-
-    def send_input(self, resolved_path: str) -> None:
-        """发送规范输入路径声明；底层管道错误转为 _ArtifactIOError。"""
-        try:
-            self.send_message(PIPE_MSG_INPUT, {"path": resolved_path})
-        except OSError as exc:
-            raise _ArtifactIOError(str(exc)) from exc
 
     def send_suspend(self, resource_name: str, seconds: float) -> None:
         """发送资源挂起信号。"""
@@ -544,185 +525,8 @@ def create_worker_reply_pipe(
     return receiver, sender
 
 
-class ArtifactCleanupMode(str, enum.Enum):
-    """产物生命周期清理模式。"""
-
-    PRE_SUBMIT = "pre_submit"
-    SUCCESS = "success"
-    FAILURE_OR_RETRY = "failure_or_retry"
-
-
-class ArtifactJournal:
-    """产物清单与管道声明管理深模块。
-
-    封装沙盒越界防御、输入与输出声明登记、Worker 管道实时上报、
-    产物存在性校验与多模式文件生命周期清理逻辑。
-    """
-
-    def __init__(
-        self,
-        ipc_dir: str | Path | None = None,
-        output_roots: str | Path | Sequence[str | Path] | None = None,
-        protected_roots: Sequence[str | Path] = (),
-        *,
-        pipe_sender: WorkerPipeSender | None = None,
-    ) -> None:
-        self.protected_roots = tuple(protected_roots)
-        self.ipc_dir: str | None = str(ipc_dir) if ipc_dir is not None else None
-        if output_roots is None:
-            self.output_roots: list[Path] | None = None
-        elif isinstance(output_roots, (str, Path)):
-            self.output_roots = [Path(output_roots).resolve()]
-        else:
-            self.output_roots = [Path(r).resolve() for r in output_roots]
-        self._pipe_sender: WorkerPipeSender | None = pipe_sender
-        self._artifacts: dict[str, tuple[ArtifactDeclaration, ...]] = {}
-        self._inputs: dict[str, list[str]] = {}
-
-    def bind_pipe_sender(self, sender: WorkerPipeSender | None) -> None:
-        """绑定或解绑当前 worker 的瞬时管道发送端。"""
-        self._pipe_sender = sender
-
-    # ── 路径沙盒与规范化 ──────────────────────────────────────────
-
-    @staticmethod
-    def resolve_and_validate_path(
-        raw_path: str | Path,
-        output_roots: str | Path | Sequence[str | Path] | None = None,
-        *,
-        sandbox: bool = True,
-    ) -> str:
-        """解析声明路径为规范绝对路径（沙盒校验 + 相对重定位共用逻辑）。"""
-        raw = str(raw_path)
-        if "\x00" in raw:
-            raise ValueError(f"Output path contains a null byte: {raw!r}")
-
-        if output_roots is not None and sandbox:
-            p = Path(raw)
-            if isinstance(output_roots, (list, tuple)):
-                roots = [Path(r) for r in output_roots]
-            else:
-                roots = [Path(str(output_roots))]
-            if not p.is_absolute():
-                # 相对路径按第一个根重定位
-                p = roots[0] / p
-            resolved_path = Path(os.path.abspath(str(p)))
-            try:
-                resolved_path = resolved_path.resolve()
-            except (OSError, RuntimeError):
-                logger.debug(f"Could not resolve output path '{raw}', using abspath fallback.")
-            if not any(resolved_path.is_relative_to(r) for r in roots):
-                raise ValueError(
-                    f"Output path '{raw}' resolves outside output_roots {roots!r}"
-                )
-            return str(resolved_path)
-
-        p = Path(raw)
-        try:
-            if p.parent.exists():
-                return str(p.resolve())
-            return os.path.abspath(str(p))
-        except (OSError, RuntimeError):
-            return os.path.abspath(str(p))
-
-    # ── 声明登记与管道发送 ────────────────────────────────────────
-
-    def record_artifact(
-        self, job_uid: str, declaration: ArtifactDeclaration,
-    ) -> None:
-        """校验路径范围并登记主进程内部产物记录，不执行准备操作。"""
-        try:
-            self._validate_artifact_path(declaration)
-        except OSError as error:
-            raise _ArtifactIOError(str(error)) from error
-        previous = self._artifacts.get(job_uid, ())
-        declarations = append_artifact_declaration(previous, declaration)
-        if len(declarations) == len(previous):
-            return
-        self._artifacts[job_uid] = declarations
-
-    @property
-    def path_policy(self) -> ArtifactPathPolicy:
-        """本执行配置对应的路径与保护范围。"""
-        return ArtifactPathPolicy(
-            output_roots=self.output_roots,
-            protected_roots=(*self.protected_roots, *((self.ipc_dir,) if self.ipc_dir else ())),
-        )
-
-    def _validate_artifact_path(self, declaration: ArtifactDeclaration) -> None:
-        resolved = self.path_policy.resolve(declaration.path, sandbox=declaration.sandbox)
-        if resolved != declaration.path:
-            raise ValueError("artifact declaration must use the canonical path")
-
-    def record_input_entry(self, job_uid: str, entry: dict[str, Any]) -> None:
-        """校验并记录一条输入声明条目，绑定管道时同步上报父进程。"""
-        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not entry["path"]:
-            raise ValueError(f"invalid input declaration for {job_uid}")
-        resolved_path = entry["path"]
-        if self._pipe_sender is not None:
-            self._pipe_sender.send_input(resolved_path)
-        self._inputs.setdefault(job_uid, []).append(resolved_path)
-
-    def record_input_file(self, job_uid: str, resolved_path: str) -> str:
-        """记录一条规范输入路径声明并返回该路径字符串。"""
-        self.record_input_entry(job_uid, {"path": resolved_path})
-        return resolved_path
-
-    # ── 读取与校验（父进程 Engine 侧）─────────────────────────────
-
-    def read_inputs(self, job_uid: str) -> list[str]:
-        """读取已记录的输入路径列表。"""
-        return list(self._inputs.get(job_uid, ()))
-
-    def read_artifacts(self, job_uid: str) -> tuple[ArtifactDeclaration, ...]:
-        """严格读取并复核本执行授权清单。"""
-        declarations = self._artifacts.get(job_uid, ())
-        for declaration in declarations:
-            if declaration.name is not None:
-                self._validate_artifact_path(declaration)
-        return validate_artifact_declarations(declarations)
-
-    # ── 产物校验与生命周期清理 ────────────────────────────────────
-
-    def verify_artifacts(self, declarations: Sequence[ArtifactDeclaration]) -> str | None:
-        """仅验证需保留的产物；临时路径允许已被 rename 移走。"""
-        for declaration in declarations:
-            self._validate_artifact_path(declaration)
-            if not declaration.delete_on_success:
-                try:
-                    os.stat(declaration.path)
-                except FileNotFoundError:
-                    return f"Missing output {declaration.path}"
-        return None
-
-    def cleanup_declared_artifacts(
-        self, declarations: Sequence[ArtifactDeclaration], *, success: bool,
-    ) -> None:
-        """只执行该结局的删除授权，错误不得降级为清理完成。"""
-        policy = self.path_policy
-        for declaration in declarations:
-            policy.cleanup(declaration, success=success)
-
-    def clear_declarations(self, job_uid: str) -> None:
-        """业务转移已完成后清除内存声明；失败不改写已经提交的事实。"""
-        self._artifacts.pop(job_uid, None)
-        self._inputs.pop(job_uid, None)
-
-    def cleanup(self, job_uid: str, mode: str | ArtifactCleanupMode) -> None:
-        """清理本执行授权产物；派发前仅丢弃残留声明，不重放删除。"""
-        mode = ArtifactCleanupMode(mode)
-        if mode is not ArtifactCleanupMode.PRE_SUBMIT:
-            self.cleanup_declared_artifacts(
-                self.read_artifacts(job_uid), success=mode is ArtifactCleanupMode.SUCCESS,
-            )
-        self.clear_declarations(job_uid)
-
-
 __all__ = [
-    "ArtifactCleanupMode",
-    "ArtifactJournal",
     "PIPE_MSG_DECLARE",
-    "PIPE_MSG_INPUT",
     "PIPE_MSG_RESULT",
     "PIPE_MSG_SUSPEND",
     "VALID_PIPE_MESSAGE_KINDS",

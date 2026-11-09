@@ -79,7 +79,7 @@ def ok_with_input_handler(job, ctx):
     """成功 + 声明输入文件 + 业务元数据（供 successes meta 审计键断言）。"""
     source = ctx.output_roots / f"source_{job.job_id}.txt"
     source.write_text("seed data", encoding="utf-8")
-    ctx.declare_input(source)
+    ctx.declare_file("source", FileSpec(source, role="input"))
     return TaskResult.success(metadata={"touched": job.job_id})
 
 

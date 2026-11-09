@@ -43,7 +43,7 @@ def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> boo
 def success_handler(job: Job, ctx) -> TaskResult:
     output = Path(ctx.declare_file("report", FileSpec(ctx.output_roots / "published.txt", role="output")))
     output.write_text("已发布", encoding="utf-8")
-    ctx.declare_input(output)
+    ctx.declare_file("source", FileSpec(output, role="input"))
     ctx.set_cursor("position", "42")
     ctx.spawn(Job("child", "child"))
     ctx.suspend_resource("api", 60)
@@ -89,7 +89,7 @@ def controlled_handler(job: Job, ctx) -> TaskResult:
     kept.write_text("保留产物", encoding="utf-8")
     temporary = Path(ctx.declare_file("temporary", FileSpec(ctx.output_roots / "temporary.txt", role="cache", delete_on_success=True, delete_on_failure=True)))
     temporary.write_text("临时产物", encoding="utf-8")
-    ctx.declare_input(kept)
+    ctx.declare_file("source", FileSpec(kept, role="input"))
     ctx.suspend_resource("api", 60)
     (sync_dir / "ready").write_text(str(os.getpid()), encoding="utf-8")
     assert _wait_until(lambda: (sync_dir / "release").exists(), timeout=20.0)
@@ -338,7 +338,7 @@ def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_p
             if (
                 not requested
                 and (sync_dir / "ready").exists()
-                and len(pipeline._runtime._in_flight[handle.job_uid].active_files) == 2
+                and len(pipeline._runtime._in_flight[handle.job_uid].active_files) == 3
             ):
                 requested.append(handle.execution_id or "")
                 pipeline.stop()

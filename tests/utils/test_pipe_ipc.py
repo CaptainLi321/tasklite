@@ -14,10 +14,8 @@ import time
 
 import pytest
 
-from tasklite.exceptions import _ArtifactIOError
 from tasklite.models.artifact import FileSpec
 from tasklite.utils.ipc import (
-    PIPE_MSG_INPUT,
     PIPE_MSG_DECLARE,
     PIPE_MSG_RESULT,
     PIPE_MSG_SUSPEND,
@@ -29,7 +27,6 @@ from tasklite.utils.ipc import (
 
 def _sequential_sender_worker(sender) -> None:
     try:
-        sender.send_input("/tmp/in.txt")
         sender.send_declare(
             "request", "out", FileSpec("/tmp/out.txt", role="output", delete_on_failure=True).to_dict(),
         )
@@ -43,7 +40,17 @@ def _flood_sender_worker(sender, count: int, payload_size: int) -> None:
     blob = "x" * payload_size
     try:
         for idx in range(count):
-            sender.send_message(PIPE_MSG_INPUT, {"path": f"/tmp/{idx}_{blob}"})
+            sender.send_declare(
+                f"req-{idx}",
+                "out",
+                {
+                    "path": f"/tmp/{idx}_{blob}",
+                    "role": "output",
+                    "delete_existing": False,
+                    "delete_on_failure": False,
+                    "delete_on_success": False,
+                },
+            )
         sender.send_result({"status": "success", "count": count})
     finally:
         sender.close()
@@ -95,11 +102,10 @@ class TestWorkerPipePrimitives:
         receiver.close()
         sender.close()
 
-        assert len(messages) == 4
+        assert len(messages) == 3
         assert all(isinstance(m, WorkerPipeMessage) for m in messages)
         kinds = [m.kind for m in messages if isinstance(m, WorkerPipeMessage)]
         assert kinds == [
-            PIPE_MSG_INPUT,
             PIPE_MSG_DECLARE,
             PIPE_MSG_SUSPEND,
             PIPE_MSG_RESULT,
@@ -270,8 +276,6 @@ class TestWorkerPipePrimitives:
             execution_id="exec_closed",
         )
         sender.close()
-        with pytest.raises(_ArtifactIOError):
-            sender.send_input("/tmp/a")
         with pytest.raises(OSError):
             sender.send_declare("request", "out", FileSpec("/tmp/b", role="output").to_dict())
         receiver.close()

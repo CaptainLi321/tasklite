@@ -42,6 +42,7 @@ from tasklite.engine.resource import (
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import AttemptOutcome, StopMode
+from tasklite.models.artifact import FileSpec
 from tasklite.models.job import Job, JobRuntimeState, RT_DISPATCH_FAILURES
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
@@ -325,25 +326,38 @@ class TestRejectGates:
 
 
 class TestPreSubmitCleanupAndActiveSignals:
-    """派发前 PRE_SUBMIT 清理与在途信号排空。"""
+    """声明式前删与在途信号排空。"""
 
-    def test_cleans_pre_submit_before_spawn(self, tmp_path, monkeypatch):
+    def test_declared_delete_existing_runs_once_before_spawn(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-        cleaned: list[str] = []
-        monkeypatch.setattr(
-            env.channel, "cleanup_artifacts",
-            lambda uid, *, mode: cleaned.append(uid),
-        )
+        target = tmp_path / "out" / "result.txt"
+        target.parent.mkdir()
+        target.write_text("stale", encoding="utf-8")
+        env.store.authorizer = lambda *_args: True
+        env.store.state.spawn_jobs([
+            Job(
+                "t",
+                "j1",
+                files={
+                    "result": FileSpec(
+                        target,
+                        role="output",
+                        delete_existing=True,
+                    ),
+                },
+            ).to_dict(),
+        ])
+        spawn_observed: list[bool] = []
         monkeypatch.setattr(
             env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
+            lambda spec: spawn_observed.append(target.exists())
+            or env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.SPAWNED
-        assert cleaned == ["t::j1"]
+        assert spawn_observed == [False]
 
     def test_interval_resource_defers_without_burning_budget(
         self, tmp_path

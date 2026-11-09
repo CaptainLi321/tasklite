@@ -15,25 +15,11 @@ from tasklite.engine.resource import (
     ResourceManager,
 )
 from tasklite.engine.types import JobHandle
+from tasklite.models.artifact import FileSpec
 from tasklite.models.job import Job
 from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
 _INCARNATION = "deadbeefdeadbeefdeadbeefdeadbeef.1"
-
-
-def _write_artifact(journal, uid, path, *, delete_on_failure=False, delete_on_success=False):
-    """注入产物声明到当前进程日志。"""
-    from tasklite.models.artifact import ArtifactDeclaration
-
-    prev = journal._artifacts.get(uid, ())
-    journal._artifacts[uid] = (
-        *prev,
-        ArtifactDeclaration(
-            path,
-            delete_on_failure=delete_on_failure,
-            delete_on_success=delete_on_success,
-        ),
-    )
 
 
 def unexpected_worker(job, ctx):
@@ -159,7 +145,13 @@ class TestAbortInFlight:
         out_file = tmp_path / "out" / "result.txt"
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text("done")
-        _write_artifact(channel.journal, job.uid, str(out_file), delete_on_failure=True)
+        active_files = {
+            "out": FileSpec(
+                out_file,
+                role="output",
+                delete_on_failure=True,
+            ),
+        }
         channel._results[_INCARNATION] = {
             "status": "success", "raw_result": True,
             "spawned_jobs": [], "resource_suspensions": [], "cursor_updates": {},
@@ -171,7 +163,15 @@ class TestAbortInFlight:
             ipc_dir=str(tmp_path / "ipc"), execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
-        tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], handle, None))
+        tracker.track(InFlightJob(
+            job.uid,
+            job.to_dict(),
+            job,
+            [],
+            handle,
+            None,
+            active_files=active_files,
+        ))
 
         orchestrator.abort_in_flight()
 

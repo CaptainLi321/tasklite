@@ -62,6 +62,7 @@ class InFlightJob:
     started_at: str | None = None
     known_job_uids: frozenset[str] = field(default_factory=frozenset)
     active_files: dict[str, Any] = field(default_factory=dict)
+    active_file_sources: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.lease is None:

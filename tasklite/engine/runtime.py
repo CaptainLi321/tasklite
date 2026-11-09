@@ -181,54 +181,66 @@ class EngineRuntime:
             return {"request_id": req_id, "status": "error", "error": str(exc)}
 
         # 1. 幂等与冲突检查
-        if validated_name in entry.active_files:
-            existing = entry.active_files[validated_name]
-            try:
-                merged, should_delete = merge_named_file_spec(
-                    entry.active_files,
-                    validated_name,
-                    spec,
-                    base_dir=self.store.base_dir,
-                    depends_on=handle.job.depends_on,
-                )
-                return {
-                    "request_id": req_id,
-                    "status": "ok",
-                    "resolved_path": existing.path,
-                }
-            except Exception as exc:
-                return {"request_id": req_id, "status": "error", "error": str(exc)}
-
-        # 2. 上游产物引用解析
-        if spec.is_output_ref:
-            assert spec.producer_uid is not None and spec.output_name is not None
-            if spec.producer_uid not in handle.job.depends_on:
+        try:
+            merged, is_new = merge_named_file_spec(
+                entry.active_file_sources,
+                validated_name,
+                spec,
+                base_dir=self.store.base_dir,
+                depends_on=handle.job.depends_on,
+            )
+        except Exception as exc:
+            return {"request_id": req_id, "status": "error", "error": str(exc)}
+        source_spec = merged[validated_name]
+        if not is_new:
+            existing = entry.active_files.get(validated_name)
+            if existing is None or existing.path is None:
                 return {
                     "request_id": req_id,
                     "status": "error",
-                    "error": f"Producer {spec.producer_uid} not in explicit direct depends_on",
+                    "error": f"File declaration {validated_name!r} has no resolved path",
                 }
-            producer_artifacts = self.store.state.successes.get(spec.producer_uid, {}).get("artifacts", {})
-            desc = producer_artifacts.get(spec.output_name)
+            return {
+                "request_id": req_id,
+                "status": "ok",
+                "resolved_path": existing.path,
+            }
+
+        # 2. 上游产物引用解析
+        if source_spec.is_output_ref:
+            assert source_spec.producer_uid is not None and source_spec.output_name is not None
+            if source_spec.producer_uid not in handle.job.depends_on:
+                return {
+                    "request_id": req_id,
+                    "status": "error",
+                    "error": f"Producer {source_spec.producer_uid} not in explicit direct depends_on",
+                }
+            producer_artifacts = self.store.state.successes.get(
+                source_spec.producer_uid, {}
+            ).get("artifacts", {})
+            desc = producer_artifacts.get(source_spec.output_name)
             if not desc or "path" not in desc:
                 return {
                     "request_id": req_id,
                     "status": "error",
-                    "error": f"Producer {spec.producer_uid} did not publish output {spec.output_name}",
+                    "error": (
+                        f"Producer {source_spec.producer_uid} did not publish "
+                        f"output {source_spec.output_name}"
+                    ),
                 }
             resolved_path = desc["path"]
-            if spec.role == "input" and not os.path.exists(resolved_path):
+            if source_spec.role == "input" and not os.path.exists(resolved_path):
                 return {
                     "request_id": req_id,
                     "status": "error",
                     "error": f"Missing input file: {resolved_path}",
                 }
-            bound_spec = spec.bind_output_path(resolved_path, base_dir=self.store.base_dir)
+            bound_spec = source_spec.bind_output_path(resolved_path)
         else:
-            bound_spec = spec.resolve_against(self.store.base_dir)
+            bound_spec = source_spec.resolve_against(self.store.base_dir)
             assert bound_spec.path is not None
             resolved_path = bound_spec.path
-            if spec.role == "input" and not os.path.exists(resolved_path):
+            if source_spec.role == "input" and not os.path.exists(resolved_path):
                 return {
                     "request_id": req_id,
                     "status": "error",
@@ -244,6 +256,8 @@ class EngineRuntime:
             elif authorized is False:
                 handle.resume_timeout()
                 handle.auth_denied = True
+                entry.active_file_sources[validated_name] = source_spec
+                entry.active_files[validated_name] = bound_spec
                 self.channel.terminate_process(handle)
                 return {"request_id": req_id, "status": "denied"}
             else:
@@ -251,18 +265,20 @@ class EngineRuntime:
                 handle.pending_declaration = {
                     "req_id": req_id,
                     "name": validated_name,
-                    "spec": bound_spec,
+                    "source": source_spec,
+                    "bound": bound_spec,
                     "resolved_path": resolved_path,
                 }
                 return None
 
         # 4. 前置删除（缺失目标由路径原语幂等吸收）
+        entry.active_file_sources[validated_name] = source_spec
+        entry.active_files[validated_name] = bound_spec
         if bound_spec.delete_existing:
             policy = ArtifactPathPolicy(
                 output_roots=self.config.output_roots,
                 protected_roots=self.config.protected_roots,
             )
-            entry.active_files[validated_name] = bound_spec
             try:
                 _execute_pre_deletes(
                     policy,
@@ -276,7 +292,6 @@ class EngineRuntime:
                 self.channel.terminate_process(handle)
                 return None
 
-        entry.active_files[validated_name] = bound_spec
         return {
             "request_id": req_id,
             "status": "ok",
@@ -548,7 +563,8 @@ class EngineRuntime:
                 continue
             req_id = decl["req_id"]
             name = decl["name"]
-            spec = decl["spec"]
+            source_spec = decl["source"]
+            bound_spec = decl["bound"]
             resolved_path = decl["resolved_path"]
 
             if is_stopping:
@@ -556,6 +572,8 @@ class EngineRuntime:
                 handle.pending_declaration = None
                 handle.resume_timeout()
                 handle.auth_denied = True
+                entry.active_file_sources[name] = source_spec
+                entry.active_files[name] = bound_spec
                 self.channel.terminate_process(handle)
                 continue
 
@@ -564,12 +582,13 @@ class EngineRuntime:
                 handle.waiting_auth = False
                 handle.pending_declaration = None
                 handle.resume_timeout()
-                if spec.delete_existing:
+                entry.active_file_sources[name] = source_spec
+                entry.active_files[name] = bound_spec
+                if bound_spec.delete_existing:
                     policy = ArtifactPathPolicy(
                         output_roots=self.config.output_roots,
                         protected_roots=self.config.protected_roots,
                     )
-                    entry.active_files[name] = spec
                     try:
                         _execute_pre_deletes(
                             policy,
@@ -582,7 +601,6 @@ class EngineRuntime:
                         }
                         self.channel.terminate_process(handle)
                         continue
-                entry.active_files[name] = spec
                 reply_sender = self.channel.get_reply_sender(handle.execution_id)
                 if reply_sender is not None:
                     try:
@@ -598,6 +616,8 @@ class EngineRuntime:
                 handle.pending_declaration = None
                 handle.resume_timeout()
                 handle.auth_denied = True
+                entry.active_file_sources[name] = source_spec
+                entry.active_files[name] = bound_spec
                 self.channel.terminate_process(handle)
                 reply_sender = self.channel.get_reply_sender(handle.execution_id)
                 if reply_sender is not None:
