@@ -467,6 +467,7 @@ class AbstractStateBackend(ABC):
         failure_metadata: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
         requeued_job_snapshot: dict[str, Any] | None = None,
+        record_attempt: bool = True,
     ) -> bool:
         """原子执行结算：校验完整执行身份后写入 Attempt、Job 去向、档案与派生数据。"""
 

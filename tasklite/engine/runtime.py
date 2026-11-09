@@ -127,6 +127,7 @@ class EngineRuntime:
             in_flight=self._in_flight,
             completion=self._completion,
         )
+        self._dispatch_start_lock = threading.RLock()
         self._dispatch = DispatchMachine(
             store=self.store,
             scheduler=self.scheduler,
@@ -142,6 +143,7 @@ class EngineRuntime:
             ipc_dir=config.ipc_dir,
             protected_roots=config.protected_roots,
             commit_failure_threshold=config.commit_failure_threshold,
+            dispatch_start_lock=self._dispatch_start_lock,
         )
 
         self._run_lock_fd: int | None = None
@@ -515,7 +517,8 @@ class EngineRuntime:
 
     def request_stop(self) -> StopMode:
         """停机请求接口（单调状态转移，委托 RunSession，并唤醒运行循环）。"""
-        mode = self._session.request_stop()
+        with self._dispatch_start_lock:
+            mode = self._session.request_stop()
         for handle in self._in_flight.active_handles():
             request = handle.pending_declaration
             entry = self._in_flight.get(handle.job_uid)

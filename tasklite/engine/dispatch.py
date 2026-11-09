@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -68,7 +69,7 @@ from ..models.attempt import ATTEMPT_REQUEUED
 from ..models.context import JobContext
 from ..models.job import Job, JobRuntimeState
 from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
-from .channel import WorkerLaunchSpec
+from .channel import WorkerLaunchSpec, _WorkerLaunchCancelled
 from .errorclass import (
     ERR_DISPATCH_FAILURE,
     ERR_JOB_DEPENDENCY,
@@ -129,6 +130,7 @@ class DispatchMachine:
         commit_failure_threshold: int = 10,
         protected_roots: tuple[Path, ...] = (),
         classifier: "ErrorClassifier | None" = None,
+        dispatch_start_lock: Any | None = None,
     ) -> None:
         self._store = store
         self._scheduler = scheduler
@@ -145,6 +147,7 @@ class DispatchMachine:
         self._protected_roots = protected_roots
         self._commit_failure_threshold = commit_failure_threshold
         self._authorization_pending: tuple[str | None, str, str] | None = None
+        self._dispatch_start_lock = dispatch_start_lock or threading.RLock()
 
     # ── 扫描与派发接缝 ────────────────────────────────────────────────
 
@@ -525,7 +528,7 @@ class DispatchMachine:
         started_at: str,
         attempt_id: int | None = None,
     ) -> None:
-        """停止门越过 running 提交时，将未启动执行安全回退为 pending。"""
+        """停止门越过 running 提交时，将未启动执行回退为 pending 且不写 Attempt。"""
         if self._store.backend.schema_version >= TARGET_SCHEMA_VERSION:
             self._store.apply_pending(
                 job_uid,
@@ -535,6 +538,7 @@ class DispatchMachine:
                 run_id=self._session.run_id or "run",
                 started_at=started_at,
                 error_message="stop requested before worker launch",
+                record_attempt=False,
             )
             return
         self._store.state.requeue_jobs([job_snapshot], front=True)
@@ -658,56 +662,81 @@ class DispatchMachine:
         try:
             task = self._tasks.lookup(job.task_type)
             ctx = self._build_context(job, store.state, files=resolved_files)
-            if not self._dispatch_allowed():
-                self._resources.release_all(acquired)
-                self._rollback_unstarted_running(
+            # 不变式：停止状态转移与 worker 启动、在飞登记共用同一同步门。
+            with self._dispatch_start_lock:
+                if not self._dispatch_allowed():
+                    self._resources.release_all(acquired)
+                    self._rollback_unstarted_running(
+                        job_uid=job_uid,
+                        job_snapshot=job_snapshot,
+                        execution_id=execution_id,
+                        attempt_no=attempt_no,
+                        started_at=started_at or utc_now_iso(),
+                        attempt_id=attempt_id,
+                    )
+                    return None
+                logger.info(f"RUN: {job_uid}")
+                if not self._dispatch_allowed():
+                    self._resources.release_all(acquired)
+                    self._rollback_unstarted_running(
+                        job_uid=job_uid,
+                        job_snapshot=job_snapshot,
+                        execution_id=execution_id,
+                        attempt_no=attempt_no,
+                        started_at=started_at or utc_now_iso(),
+                        attempt_id=attempt_id,
+                    )
+                    return None
+                started_monotonic = time.monotonic()
+                handle = self._channel.spawn(WorkerLaunchSpec(
+                    handler=task.handler,
+                    job=job,
+                    job_context=ctx,
+                    execution_id=execution_id,
+                    ipc_dir=self._ipc_dir,
+                    timeout_seconds=float(
+                        job.timeout_seconds if job.timeout_seconds is not None else 3600.0
+                    ),
+                    run_id=self._session.run_id or "run",
+                    attempt_no=attempt_no,
+                    launch_guard=self._dispatch_allowed,
+                ))
+
+                entry = InFlightJob(
                     job_uid=job_uid,
                     job_snapshot=job_snapshot,
+                    job=job,
+                    handle=handle,
+                    started_monotonic=started_monotonic,
+                    acquired=acquired,
+                    attempt_id=attempt_id,
                     execution_id=execution_id,
                     attempt_no=attempt_no,
-                    started_at=started_at or utc_now_iso(),
-                    attempt_id=attempt_id,
+                    run_id=self._session.run_id or "run",
+                    started_at=started_at,
+                    known_job_uids=frozenset(
+                        store.state.queue_uids
+                        | store.state.in_flight_uids
+                        | store.state.success_uids
+                        | store.state.failed_uids
+                    ),
+                    active_files=dict(resolved_files or {}),
+                    active_file_sources=dict(job.files),
                 )
-                return None
-            logger.info(f"RUN: {job_uid}")
-            started_monotonic = time.monotonic()
-            handle = self._channel.spawn(WorkerLaunchSpec(
-                handler=task.handler,
-                job=job,
-                job_context=ctx,
-                execution_id=execution_id,
-                ipc_dir=self._ipc_dir,
-                timeout_seconds=float(
-                    job.timeout_seconds if job.timeout_seconds is not None else 3600.0
-                ),
-                run_id=self._session.run_id or "run",
-                attempt_no=attempt_no,
-            ))
-
-            entry = InFlightJob(
+                # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
+                self._in_flight.track(entry, state=store.state)
+                return entry
+        except _WorkerLaunchCancelled:
+            self._resources.release_all(acquired)
+            self._rollback_unstarted_running(
                 job_uid=job_uid,
                 job_snapshot=job_snapshot,
-                job=job,
-                handle=handle,
-                started_monotonic=started_monotonic,
-                acquired=acquired,
-                attempt_id=attempt_id,
                 execution_id=execution_id,
                 attempt_no=attempt_no,
-                run_id=self._session.run_id or "run",
-                started_at=started_at,
-                known_job_uids=frozenset(
-                    store.state.queue_uids
-                    | store.state.in_flight_uids
-                    | store.state.success_uids
-                    | store.state.failed_uids
-                ),
-                active_files=dict(resolved_files or {}),
-                active_file_sources=dict(job.files),
+                started_at=started_at or utc_now_iso(),
+                attempt_id=attempt_id,
             )
-            # 在 return 前原子登记到 in_flight 与 state 索引，避免时序真空
-            self._in_flight.track(entry, state=store.state)
-            return entry
+            return None
         except (_CommitCrashSignal, AssertionError):
             raise
         except BaseException:

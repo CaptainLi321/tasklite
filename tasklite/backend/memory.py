@@ -713,6 +713,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         failure_metadata: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
         requeued_job_snapshot: dict[str, Any] | None = None,
+        record_attempt: bool = True,
     ) -> bool:
         if outcome not in ("success", "failure", "retry", "pending"):
             raise ValueError(f"Invalid outcome: {outcome}")
@@ -757,21 +758,24 @@ class InMemoryStateBackend(AbstractStateBackend):
 
             new_attempts = dict(self._attempts)
             new_attempt_id = self._attempt_seq
-            attempt_outcome = outcome if outcome in ("success", "failure", "retry") else "failure"
-            attempt_entry: dict[str, Any] = {
-                "attempt_id": new_attempt_id,
-                "job_uid": job_uid,
-                "attempt_no": attempt_no,
-                "run_id": run_id,
-                "outcome": attempt_outcome,
-                "started_at": started_at,
-                "settled_at": settled_at,
-                "job": copy.deepcopy(job_snapshot),
-                "files": copy.deepcopy(files),
-                "result": copy.deepcopy(result),
-                "error_message": error_message,
-            }
-            new_attempts[new_attempt_id] = attempt_entry
+            if record_attempt:
+                attempt_outcome = (
+                    outcome if outcome in ("success", "failure", "retry") else "failure"
+                )
+                attempt_entry: dict[str, Any] = {
+                    "attempt_id": new_attempt_id,
+                    "job_uid": job_uid,
+                    "attempt_no": attempt_no,
+                    "run_id": run_id,
+                    "outcome": attempt_outcome,
+                    "started_at": started_at,
+                    "settled_at": settled_at,
+                    "job": copy.deepcopy(job_snapshot),
+                    "files": copy.deepcopy(files),
+                    "result": copy.deepcopy(result),
+                    "error_message": error_message,
+                }
+                new_attempts[new_attempt_id] = attempt_entry
 
             new_queue = list(self._queue)
             new_successes = dict(self._successes)
@@ -849,7 +853,8 @@ class InMemoryStateBackend(AbstractStateBackend):
 
             # 统一原子落变
             self._attempts = new_attempts
-            self._attempt_seq += 1
+            if record_attempt:
+                self._attempt_seq += 1
             self._queue = new_queue
             self._successes = new_successes
             self._failed = new_failed

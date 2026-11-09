@@ -1398,6 +1398,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         failure_metadata: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
         requeued_job_snapshot: dict[str, Any] | None = None,
+        record_attempt: bool = True,
     ) -> bool:
         if self.schema_version < TARGET_SCHEMA_VERSION:
             raise NotImplementedError(
@@ -1455,25 +1456,28 @@ class SQLiteStateBackend(AbstractStateBackend):
                 ).fetchone():
                     raise ValueError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
 
-                attempt_outcome = outcome if outcome in ("success", "failure", "retry") else "failure"
-                conn.execute(
-                    'INSERT INTO attempts ('
-                    'job_uid, attempt_no, run_id, outcome, started_at, settled_at, '
-                    'job_snapshot, files, result, error_message'
-                    ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    (
-                        job_uid,
-                        attempt_no,
-                        run_id,
-                        attempt_outcome,
-                        started_at,
-                        settled_at,
-                        dumps(job_snapshot) if job_snapshot is not None else None,
-                        dumps(files) if files is not None else None,
-                        dumps(result) if result is not None else None,
-                        error_message,
-                    ),
-                )
+                if record_attempt:
+                    attempt_outcome = (
+                        outcome if outcome in ("success", "failure", "retry") else "failure"
+                    )
+                    conn.execute(
+                        'INSERT INTO attempts ('
+                        'job_uid, attempt_no, run_id, outcome, started_at, settled_at, '
+                        'job_snapshot, files, result, error_message'
+                        ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        (
+                            job_uid,
+                            attempt_no,
+                            run_id,
+                            attempt_outcome,
+                            started_at,
+                            settled_at,
+                            dumps(job_snapshot) if job_snapshot is not None else None,
+                            dumps(files) if files is not None else None,
+                            dumps(result) if result is not None else None,
+                            error_message,
+                        ),
+                    )
 
                 if outcome == "success":
                     conn.execute(

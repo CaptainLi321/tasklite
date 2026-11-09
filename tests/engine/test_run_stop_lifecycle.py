@@ -27,6 +27,7 @@ from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.pipeline import TaskLite
 from tasklite.testing import running
+from tests.helpers import install_fake_process_context
 
 
 # ── 模块级 handler（真实跨进程协作）─────────────────────────────────────
@@ -146,8 +147,89 @@ def test_stop_after_running_mark_rolls_back_without_spawning(
             job = snapshot.get_job("work::one")
             assert job is not None and job["status"] == "pending"
             attempts = list(snapshot.iter_attempts(job_uid="work::one"))
-        assert len(attempts) == 1
-        assert attempts[0]["outcome"] == "failure"
+        assert attempts == []
+        assert capacity.used == 0
+        assert not effect.exists()
+
+
+def test_stop_inside_dispatch_log_prevents_worker_launch(tmp_path, monkeypatch):
+    effect = tmp_path / "effect.txt"
+    with TaskLite(
+        backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
+    ) as pipeline:
+        capacity = CapacityResource("disk", max_capacity=1)
+        pipeline.register_resource(capacity)
+        pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
+        pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
+
+        import tasklite.engine.dispatch as dispatch_module
+
+        original_info = dispatch_module.logger.info
+        stop_fired = False
+
+        def stop_during_run_log(message, *args, **kwargs):
+            nonlocal stop_fired
+            if message == "RUN: work::one" and not stop_fired:
+                stop_fired = True
+                pipeline.stop()
+            return original_info(message, *args, **kwargs)
+
+        monkeypatch.setattr(dispatch_module.logger, "info", stop_during_run_log)
+        pipeline.run()
+
+        assert stop_fired
+        with StateSnapshot.open(pipeline) as snapshot:
+            job = snapshot.get_job("work::one")
+            assert job is not None and job["status"] == "pending"
+            assert list(snapshot.iter_attempts(job_uid="work::one")) == []
+        assert capacity.used == 0
+        assert not effect.exists()
+
+
+def test_stop_before_process_start_prevents_worker_launch(tmp_path):
+    effect = tmp_path / "effect.txt"
+    with TaskLite(
+        backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
+    ) as pipeline:
+        capacity = CapacityResource("disk", max_capacity=1)
+        pipeline.register_resource(capacity)
+        pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
+        pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
+
+        start_calls: list[bool] = []
+        stop_fired = False
+
+        class StopBeforeStartProcess:
+            def __init__(self, **_kwargs):
+                nonlocal stop_fired
+                stop_fired = True
+                pipeline.stop()
+                self.exitcode = None
+
+            def start(self) -> None:
+                start_calls.append(True)
+
+            def is_alive(self) -> bool:
+                return False
+
+            def join(self, timeout=None) -> None:
+                pass
+
+            def kill(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        install_fake_process_context(pipeline, StopBeforeStartProcess)
+        pipeline.run()
+
+        assert stop_fired
+        assert start_calls == []
+        with StateSnapshot.open(pipeline) as snapshot:
+            job = snapshot.get_job("work::one")
+            assert job is not None and job["status"] == "pending"
+            assert list(snapshot.iter_attempts(job_uid="work::one")) == []
         assert capacity.used == 0
         assert not effect.exists()
 

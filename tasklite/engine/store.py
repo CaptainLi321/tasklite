@@ -1083,6 +1083,7 @@ class StateStore:
         error_message: str | None = None,
         result: dict[str, Any] | None = None,
         execution_id: str | None = None,
+        record_attempt: bool = True,
     ) -> bool:
         """受阻或停机执行回滚到待派发队列（写盘重置为 pending，释放在途并还原内存队列）。"""
         settled_at = utc_now_iso()
@@ -1098,6 +1099,7 @@ class StateStore:
             files=files,
             result=result,
             error_message=error_message,
+            record_attempt=record_attempt,
         )
         if committed:
             self._state.unregister_in_flight(job_uid)

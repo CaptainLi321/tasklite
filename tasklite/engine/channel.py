@@ -421,6 +421,7 @@ class WorkerLaunchSpec:
     reply_receiver: WorkerReplyReceiver | None = None
     run_id: str = ""
     attempt_no: int = 1
+    launch_guard: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -429,6 +430,10 @@ class AbortOutcome:
 
     completed: list[tuple[JobHandle, ExecutionResult]]
     cancelled: list[JobHandle]
+
+
+class _WorkerLaunchCancelled(Exception):
+    """最终启动门前观察到停止请求，子进程不得启动。"""
 
 
 class ExecutionChannel:
@@ -521,11 +526,18 @@ class ExecutionChannel:
         )
         spec.job_context._bind_pipe_sender(sender, reply_receiver)
         launch_spec = dataclasses.replace(
-            spec, pipe_sender=sender, reply_receiver=reply_receiver
+            spec,
+            pipe_sender=sender,
+            reply_receiver=reply_receiver,
+            launch_guard=None,
         )
         p = None
         try:
             p = self._process_context.Process(target=_worker_process_entry, args=(launch_spec,))
+            if spec.launch_guard is not None and not spec.launch_guard():
+                raise _WorkerLaunchCancelled(
+                    f"stop requested before worker process start for {spec.job.uid}"
+                )
             p.start()
         except Exception:
             sender.close()
@@ -1028,6 +1040,7 @@ __all__ = [
     "ExecutionResult",
     "JobHandle",
     "WorkerLaunchSpec",
+    "_WorkerLaunchCancelled",
     "_decode_ipc_result",
     "_worker_process_entry",
 ]
