@@ -82,6 +82,76 @@ def test_stop_in_initial_authorizer_keeps_job_pending(tmp_path, monkeypatch):
         assert not effect.exists()
 
 
+def test_stop_between_pop_and_running_mark_requeues_without_attempt(
+    tmp_path, monkeypatch
+):
+    effect = tmp_path / "effect.txt"
+    with TaskLite(
+        backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
+    ) as pipeline:
+        capacity = CapacityResource("disk", max_capacity=1)
+        pipeline.register_resource(capacity)
+        pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
+        pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
+
+        state_type = type(pipeline._runtime.store.state)
+        original_pop = state_type.pop_job
+        stop_requested = threading.Event()
+
+        def pop_then_stop(self, index):
+            snapshot = original_pop(self, index)
+            if not stop_requested.is_set():
+                stop_requested.set()
+                pipeline.stop()
+            return snapshot
+
+        monkeypatch.setattr(state_type, "pop_job", pop_then_stop)
+        pipeline.run()
+
+        with StateSnapshot.open(pipeline) as snapshot:
+            job = snapshot.get_job("work::one")
+            assert job is not None and job["status"] == "pending"
+            assert list(snapshot.iter_attempts(job_uid="work::one")) == []
+        assert capacity.used == 0
+        assert not effect.exists()
+
+
+def test_stop_after_running_mark_rolls_back_without_spawning(
+    tmp_path, monkeypatch
+):
+    effect = tmp_path / "effect.txt"
+    with TaskLite(
+        backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
+    ) as pipeline:
+        capacity = CapacityResource("disk", max_capacity=1)
+        pipeline.register_resource(capacity)
+        pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
+        pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
+
+        store = pipeline._runtime.store
+        original_mark_running = store.mark_job_running
+        stop_requested = threading.Event()
+
+        def mark_then_stop(*args, **kwargs):
+            attempt_no = original_mark_running(*args, **kwargs)
+            if not stop_requested.is_set():
+                stop_requested.set()
+                pipeline.stop()
+            return attempt_no
+
+        monkeypatch.setattr(store, "mark_job_running", mark_then_stop)
+        pipeline.run()
+
+        with StateSnapshot.open(pipeline) as snapshot:
+            job = snapshot.get_job("work::one")
+            assert job is not None and job["status"] == "pending"
+            attempts = list(snapshot.iter_attempts(job_uid="work::one"))
+        assert len(attempts) == 1
+        assert attempts[0]["outcome"] == "failure"
+        assert capacity.used == 0
+        assert not effect.exists()
+
+
 def file_synced_retry_handler(job, ctx):
     ready_path = Path(job.payload["ready_path"])
     release_path = Path(job.payload["release_path"])

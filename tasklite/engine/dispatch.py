@@ -359,7 +359,12 @@ class DispatchMachine:
         if not eval_res.is_available:
             return None
 
+        if not self._dispatch_allowed():
+            return None
         job_snapshot = store.state.pop_job(sched.runnable_idx)
+        if not self._dispatch_allowed():
+            store.state.requeue_jobs([job_snapshot], front=True)
+            return None
         if store.backend.schema_version < TARGET_SCHEMA_VERSION:
             job_snapshot["activation_no"] = job.activation_no
         started_at = utc_now_iso()
@@ -369,6 +374,9 @@ class DispatchMachine:
         if store.backend.schema_version >= TARGET_SCHEMA_VERSION:
             effective_run_id = self._session.run_id or "run"
             execution_id = f"{effective_run_id}.{self._session.next_dispatch_no()}"
+            if not self._dispatch_allowed():
+                store.state.requeue_jobs([job_snapshot], front=True)
+                return None
             try:
                 attempt_no = store.mark_job_running(
                     job_uid,
@@ -409,8 +417,30 @@ class DispatchMachine:
                 store.state.requeue_jobs([job_snapshot], front=True)
                 raise
 
+        if not self._dispatch_allowed():
+            self._rollback_unstarted_running(
+                job_uid=job_uid,
+                job_snapshot=job_snapshot,
+                execution_id=execution_id,
+                attempt_no=attempt_no,
+                started_at=started_at,
+                attempt_id=attempt_id,
+            )
+            return None
+
         # 逐项获取资源（串行连续获取，异常属 Run 级框架故障直接上抛）
         acquired = self._resources.acquire_all(job.task_type, job.resources, job_uid=job_uid)
+        if not self._dispatch_allowed():
+            self._resources.release_all(acquired)
+            self._rollback_unstarted_running(
+                job_uid=job_uid,
+                job_snapshot=job_snapshot,
+                execution_id=execution_id,
+                attempt_no=attempt_no,
+                started_at=started_at,
+                attempt_id=attempt_id,
+            )
+            return None
 
         pre_deletes = [
             ArtifactDeclaration(fspec.path, delete_existing=True)
@@ -444,6 +474,18 @@ class DispatchMachine:
             )
             return None
 
+        if not self._dispatch_allowed():
+            self._resources.release_all(acquired)
+            self._rollback_unstarted_running(
+                job_uid=job_uid,
+                job_snapshot=job_snapshot,
+                execution_id=execution_id,
+                attempt_no=attempt_no,
+                started_at=started_at,
+                attempt_id=attempt_id,
+            )
+            return None
+
         try:
             return self._spawn_entry(
                 job_uid,
@@ -472,6 +514,35 @@ class DispatchMachine:
                 raise
             self._handle_dispatch_failure(job_uid, job_snapshot, attempt_id, e)
             return None
+
+    def _rollback_unstarted_running(
+        self,
+        *,
+        job_uid: str,
+        job_snapshot: dict,
+        execution_id: str,
+        attempt_no: int,
+        started_at: str,
+        attempt_id: int | None = None,
+    ) -> None:
+        """停止门越过 running 提交时，将未启动执行安全回退为 pending。"""
+        if self._store.backend.schema_version >= TARGET_SCHEMA_VERSION:
+            self._store.apply_pending(
+                job_uid,
+                job_snapshot,
+                execution_id=execution_id,
+                attempt_no=attempt_no,
+                run_id=self._session.run_id or "run",
+                started_at=started_at,
+                error_message="stop requested before worker launch",
+            )
+            return
+        self._store.state.requeue_jobs([job_snapshot], front=True)
+        self._store.finish_attempt(
+            attempt_id,
+            outcome=ATTEMPT_REQUEUED,
+            error_message="stop requested before worker launch",
+        )
 
     # ── 预检关卡 ──────────────────────────────────────────────────────
 
@@ -591,6 +662,17 @@ class DispatchMachine:
         try:
             task = self._tasks.lookup(job.task_type)
             ctx = self._build_context(job, store.state, files=resolved_files)
+            if not self._dispatch_allowed():
+                self._resources.release_all(acquired)
+                self._rollback_unstarted_running(
+                    job_uid=job_uid,
+                    job_snapshot=job_snapshot,
+                    execution_id=execution_id,
+                    attempt_no=attempt_no,
+                    started_at=started_at or utc_now_iso(),
+                    attempt_id=attempt_id,
+                )
+                return None
             logger.info(f"RUN: {job_uid}")
             started_monotonic = time.monotonic()
             handle = self._channel.spawn(WorkerLaunchSpec(
