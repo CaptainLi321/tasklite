@@ -2,7 +2,7 @@
 
 ``complete_job`` 是子进程结果的唯一收尾入口，``apply_result`` 承载
 retry/success/failure 三态事务提交。重试预算只统计本 Run 中显式
-``TaskResult.retry`` 的消耗。
+``TaskResult.retry`` 的消耗；候选来源与累计数量分开登记。
 
 ``session`` 按具名 Protocol ``DispatchSession`` 消费（``run_id`` 是
 successes meta 的 last_run_id 事实源；契约定义见 dispatch 模块）。
@@ -59,6 +59,7 @@ class CompletionMachine:
         self._in_flight = in_flight
         self._session = session
         self._fallback_retry_counts: dict[str, int] = {}
+        self._fallback_retry_candidates: set[str] = set()
 
     def _get_retry_count(self, uid: str) -> int:
         getter = getattr(self._session, "get_retry_count", None)
@@ -73,6 +74,20 @@ class CompletionMachine:
         updated = self._fallback_retry_counts.get(uid, 0) + 1
         self._fallback_retry_counts[uid] = updated
         return updated
+
+    def _mark_retry_candidate(self, uid: str) -> None:
+        marker = getattr(self._session, "mark_retry_candidate", None)
+        if callable(marker):
+            marker(uid)
+        else:
+            self._fallback_retry_candidates.add(uid)
+
+    def _clear_retry_candidate(self, uid: str) -> None:
+        clearer = getattr(self._session, "clear_retry_candidate", None)
+        if callable(clearer):
+            clearer(uid)
+        else:
+            self._fallback_retry_candidates.discard(uid)
 
     @staticmethod
     def _cleanup_exception(exc: BaseException) -> dict[str, str]:
@@ -408,7 +423,7 @@ class CompletionMachine:
         started_at: str | None = None,
         active_files: dict[str, FileSpec] | None = None,
     ) -> None:
-        """重试分支：预算判定与快照推进。
+        """重试分支：预算判定、快照推进与来源登记。
 
         ``consume_budget=True`` 时消耗本 Run 的 uid 级预算；耗尽则转为失败。
         ``consume_budget=False`` 不消耗预算，但仍推进 attempt_no。
@@ -477,6 +492,7 @@ class CompletionMachine:
             },
         )
         result.will_retry = True
+        self._mark_retry_candidate(uid)
 
     @staticmethod
     def _build_retry_job_snapshot(
@@ -554,6 +570,7 @@ class CompletionMachine:
             },
         )
         result.will_retry = False
+        self._clear_retry_candidate(uid)
 
     def _collect_spawned_job_snapshots(
         self,
@@ -675,6 +692,7 @@ class CompletionMachine:
             },
         )
         result.will_retry = False
+        self._clear_retry_candidate(uid)
 
     # ── 批量结算 ──────────────────────────────────────────────────────
 

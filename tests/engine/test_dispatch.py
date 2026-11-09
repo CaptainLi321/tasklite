@@ -2,9 +2,8 @@
 
 覆盖：DispatchOutcome 单一 kind 枚举判据、五关时序契约（dedup →
 dep-failed → no-handler → orphan-probe → stale-restore）、trigger 放行的
-激活推进（activation_no+1 / attempt_no 重置）、派发即插 attempts 轨迹行
-与 execution_id 生成、瞬态信号（lock_conflict / rate_limited）零预算降级
-回队、派发失败 3-strike 收敛。
+激活推进（activation_no+1 / attempt_no 重置）、retry 候选来源与累计预算
+分离、派发即插 attempts 轨迹行与 execution_id 生成、派发失败 3-strike 收敛。
 """
 
 from __future__ import annotations
@@ -55,10 +54,24 @@ class StubSession:
         self.run_id = run_id
         self.stop_mode = StopMode.NONE
         self._dispatch_no = 0
+        self._retry_counts: dict[str, int] = {}
+        self._retry_candidates: set[str] = set()
 
     def next_dispatch_no(self) -> int:
         self._dispatch_no += 1
         return self._dispatch_no
+
+    def get_retry_count(self, job_uid: str) -> int:
+        return self._retry_counts.get(job_uid, 0)
+
+    def is_retry_candidate(self, job_uid: str) -> bool:
+        return job_uid in self._retry_candidates
+
+    def mark_retry_candidate(self, job_uid: str) -> None:
+        self._retry_candidates.add(job_uid)
+
+    def clear_retry_candidate(self, job_uid: str) -> None:
+        self._retry_candidates.discard(job_uid)
 
 
 class RecordingCompletion:
@@ -582,7 +595,7 @@ class TestTraceAppendReliability:
 
 
 class TestAdmissionEvaluationTiming:
-    """求值时序契约：求值前不 pop 丢队，重试沿用激活。"""
+    """求值时序契约：求值前不 pop 丢队，来源只覆盖显式 retry。"""
 
     def test_evaluation_exception_preserves_candidate_in_queue(self, tmp_path, monkeypatch):
         """准入求值异常时候选原位保留在队列中，不 pop 丢队。"""
@@ -603,20 +616,29 @@ class TestAdmissionEvaluationTiming:
         assert env.store.state.queue[0]["job_id"] == "j1"
         assert "t::j1" not in env.store.state.in_flight_uids
 
-    def test_in_activation_retry_bypasses_trigger_registry_and_keeps_attempt_no(self, tmp_path, monkeypatch):
-        """attempt_no > 1 沿用激活内重试，不重调策略准入。"""
+    @pytest.mark.parametrize("registered_as_retry", [False, True])
+    def test_trigger_evaluation_depends_on_retry_source_not_budget(
+        self, tmp_path, monkeypatch, registered_as_retry
+    ):
+        """累计预算不为普通候选提供准入豁免；显式来源才跳过求值。"""
         env = DispatchEnv(tmp_path)
         env.register("t")
-        # 记录历史成功；若错误执行了准入评估（trigger 默认 never），将被判定为跳过
         env.store.state.mark_success("t::j1", {})
         retry_job = Job._restore("t", "j1", attempt_no=2, activation_no=1)
         env.store.state.spawn_jobs([retry_job.to_dict()])
+        env.session._retry_counts["t::j1"] = 1
+        if registered_as_retry:
+            env.session.mark_retry_candidate("t::j1")
         monkeypatch.setattr(
             env.channel, "spawn",
             lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
         outcome = env.dispatch.dispatch_next()
-        assert outcome.kind is DispatchKind.SPAWNED
-        assert outcome.entry.job.attempt_no == 2
-        assert outcome.entry.job.activation_no == 1
+        if registered_as_retry:
+            assert outcome.kind is DispatchKind.SPAWNED
+            assert outcome.entry.job.attempt_no == 2
+        else:
+            assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
+            assert env.stats["skipped"] == 1
+            assert "t::j1" not in env.store.state.queue_uids

@@ -2,7 +2,7 @@
 
 锁定不变式（对任意生成的调用/操作序列成立）：
 - stop_mode 单调转移且幂等（NONE→DRAINING，唯一入口 request_stop，不升级强停）；
-- begin() 复位全部生命周期状态（run_id、序号、停机模式、每 Run 重试预算）；
+- begin() 复位全部生命周期状态（run_id、序号、停机模式、候选来源与每 Run 重试预算）；
 - dispatch_no 单调递增；
 - 每 Run 重试计数独立记录并在 begin() 复位。
 """
@@ -48,9 +48,11 @@ class TestSessionLifecycle:
         session.next_dispatch_no()
         session.next_dispatch_no()
         session.record_retry("t::j1")
+        session.mark_retry_candidate("t::j1")
         session.request_stop()
 
         assert session.get_retry_count("t::j1") == 1
+        assert session.is_retry_candidate("t::j1") is True
         assert session.stop_mode == StopMode.DRAINING
 
         session.begin("run-2")
@@ -58,6 +60,7 @@ class TestSessionLifecycle:
         assert session.dispatch_no == 0
         assert session.stop_mode == StopMode.NONE
         assert session.get_retry_count("t::j1") == 0
+        assert session.is_retry_candidate("t::j1") is False
 
     def test_request_stop_idempotent_no_abort_upgrade(self):
         session = RunSession()
@@ -80,6 +83,16 @@ class TestSessionLifecycle:
         assert session.record_retry("t::1") == 2
         assert session.get_retry_count("t::1") == 2
         assert session.get_retry_count("t::2") == 0
+
+    def test_retry_candidate_is_independent_from_accumulated_budget(self):
+        session = RunSession()
+        session.record_retry("t::1")
+        session.mark_retry_candidate("t::1")
+        assert session.is_retry_candidate("t::1") is True
+
+        session.clear_retry_candidate("t::1")
+        assert session.is_retry_candidate("t::1") is False
+        assert session.get_retry_count("t::1") == 1
 
 
 @pytest.mark.hypothesis

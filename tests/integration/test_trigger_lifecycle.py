@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from tasklite import FileSpec, Job, TaskLite, TaskResult
+from tasklite.engine.errorclass import ERR_MAX_RETRIES
 from tasklite.triggers import on_input_change
 from tasklite.utils.clock import parse_utc_iso_to_us
 
@@ -114,12 +115,148 @@ def always_retry(job, ctx):
     return TaskResult.retry(message="retry until budget exhausted")
 
 
+def _record_child_call(ctx) -> int:
+    calls = ctx.output_roots / "child_calls.txt"
+    with calls.open("a", encoding="utf-8") as stream:
+        stream.write(f"{ctx.job.attempt_no}\n")
+    return len(calls.read_text(encoding="utf-8").splitlines())
+
+
+def retry_budget_child(job, ctx):
+    calls = _record_child_call(ctx)
+    if calls == 1:
+        return TaskResult.retry(message="first attempt retries")
+    if calls >= 3 and job.trigger == "always":
+        return TaskResult.retry(message="ordinary rerun shares run budget")
+    return TaskResult.success(metadata={"calls": calls})
+
+
+def zero_budget_child(job, ctx):
+    calls = _record_child_call(ctx)
+    if calls == 1:
+        return TaskResult.retry(
+            message="first attempt retries without budget",
+            consume_budget=False,
+        )
+    return TaskResult.success(metadata={"calls": calls})
+
+
+def spawn_same_child(job, ctx):
+    ctx.spawn(Job(
+        "child",
+        "item",
+        trigger=job.payload["child_trigger"],
+        max_retries_per_run=job.payload["child_max_retries"],
+    ))
+    return TaskResult.success(metadata={"spawned": "child::item"})
+
+
+def retry_again_then_succeed(job, ctx):
+    if job.attempt_no == 2:
+        return TaskResult.retry(message="second run has its own budget")
+    return TaskResult.success(metadata={"resumed_at": job.attempt_no})
+
+
+@pytest.mark.parametrize(
+    ("child_trigger", "expected_outcomes", "expected_calls"),
+    [
+        ("once", ["requeued", "succeeded"], ["1", "2"]),
+        ("always", ["requeued", "succeeded", "failed"], ["1", "2", "3"]),
+    ],
+)
+def test_retry_candidate_and_later_ordinary_candidate_same_run(
+    tmp_path, child_trigger, expected_outcomes, expected_calls
+):
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task("child", retry_budget_child)
+    pipeline.register_task("parent", spawn_same_child)
+    child = Job(
+        "child",
+        "item",
+        trigger=child_trigger,
+        max_retries_per_run=1,
+    )
+    pipeline.enqueue(child)
+    pipeline.enqueue(Job(
+        "parent",
+        "p",
+        depends_on=[child.uid],
+        payload={
+            "child_trigger": child_trigger,
+            "child_max_retries": 1,
+        },
+    ))
+
+    assert pipeline.run() is None
+    pipeline.stop()
+
+    calls = (tmp_path / "output" / "child_calls.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert calls == expected_calls
+    records = pipeline.backend.load_attempts("child::item")
+    assert [record.attempt_no for record in records] == [1, 2, 3][
+        :len(expected_calls)
+    ]
+    assert [record.outcome for record in records] == expected_outcomes
+    assert len({record.run_id for record in records}) == 1
+    assert "parent::p" in pipeline.backend.load_successes()
+    if child_trigger == "always":
+        assert pipeline.backend.load_failed()["child::item"]["error_message"] == (
+            ERR_MAX_RETRIES
+        )
+    else:
+        assert pipeline.backend.load_failed() == {}
+        assert pipeline.backend.load_successes()["child::item"]["calls"] == 2
+    assert pipeline.backend.load_queue() == []
+
+
+def test_zero_budget_retry_skips_gate_without_resetting_ordinary_candidate(tmp_path):
+    pipeline = _pipeline(tmp_path)
+    evaluated: list[tuple[int, bool]] = []
+
+    def gate(ctx):
+        evaluated.append((ctx.job.attempt_no, ctx.has_succeeded))
+        return len(evaluated) == 1
+
+    pipeline.register_trigger("gate", gate)
+    pipeline.register_task("child", zero_budget_child)
+    pipeline.register_task("parent", spawn_same_child)
+    child = Job(
+        "child",
+        "item",
+        trigger="gate",
+        max_retries_per_run=0,
+    )
+    pipeline.enqueue(child)
+    pipeline.enqueue(Job(
+        "parent",
+        "p",
+        depends_on=[child.uid],
+        payload={
+            "child_trigger": "gate",
+            "child_max_retries": 0,
+        },
+    ))
+
+    assert pipeline.run() is None
+    pipeline.stop()
+
+    assert evaluated == [(1, False), (1, True)]
+    records = pipeline.backend.load_attempts("child::item")
+    assert [record.attempt_no for record in records] == [1, 2]
+    assert [record.outcome for record in records] == ["requeued", "succeeded"]
+    assert pipeline.backend.load_failed() == {}
+    assert pipeline.backend.load_successes()["child::item"]["calls"] == 2
+    assert pipeline.backend.load_queue() == []
+
+
 def _run_until_retry_committed(root, ready, release):
     """队列重试已提交的屏障供监督进程精确终止主引擎。"""
     def park_after_retry(uid, *, outcome):
         if outcome.will_retry:
             queued = pipeline.backend.load_queue()
-            assert (queued[0].get("activation_no", 1), queued[0]["attempt_no"]) == (1, 2)
+            assert queued[0]["attempt_no"] == 2
             ready.set()
             release.wait(timeout=30)
     pipeline = _pipeline(Path(root))
@@ -130,7 +267,8 @@ def _run_until_retry_committed(root, ready, release):
     pipeline.run()
 
 
-def test_killed_engine_recovers_retry_without_resetting_activation_or_budget(tmp_path):
+@pytest.mark.parametrize("gate_allows", [False, True])
+def test_new_run_rechecks_retry_pending_and_resets_budget(tmp_path, gate_allows):
     context = mp.get_context("spawn")
     ready, release = context.Event(), context.Event()
     engine = context.Process(target=_run_until_retry_committed,
@@ -153,17 +291,29 @@ def test_killed_engine_recovers_retry_without_resetting_activation_or_budget(tmp
     recovered = _pipeline(tmp_path)
     queued = recovered.backend.load_queue()
     assert len(queued) == 1
-    recovered.register_trigger("gated", lambda ctx: True)
-    recovered.register_task("retry", always_retry, max_retries_per_run=1, trigger="gated")
+    assert queued[0]["attempt_no"] == 2
+    recovered.register_trigger("gated", lambda ctx: gate_allows)
+    handler = retry_again_then_succeed if gate_allows else always_retry
+    recovered.register_task("retry", handler, max_retries_per_run=1, trigger="gated")
     recovered.run()
     recovered.stop()
     records = recovered.backend.load_attempts("retry::item")
-    assert [(row.attempt_no, row.outcome) for row in records] == [
-        (1, "requeued"), (2, "requeued"), (3, "failed")]
-    assert len({row.run_id for row in records}) == 2
     assert recovered.backend.load_queue() == []
-    assert recovered.backend.load_successes() == {}
-    assert recovered.backend.load_failed()["retry::item"]["error_message"] == "MAX_RETRIES_EXCEEDED"
+    if gate_allows:
+        assert [(row.attempt_no, row.outcome) for row in records] == [
+            (1, "requeued"),
+            (2, "requeued"),
+            (3, "succeeded"),
+        ]
+        assert len({row.run_id for row in records}) == 2
+        assert recovered.backend.load_successes()["retry::item"]["resumed_at"] == 3
+        assert recovered.backend.load_failed() == {}
+    else:
+        assert [(row.attempt_no, row.outcome) for row in records] == [
+            (1, "requeued"),
+        ]
+        assert recovered.backend.load_successes() == {}
+        assert recovered.backend.load_failed() == {}
 
 
 @pytest.mark.parametrize("seed_after_clear", [False, True])

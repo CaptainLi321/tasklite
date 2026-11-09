@@ -270,10 +270,9 @@ class DispatchMachine:
                 )
                 return None
 
-        # 准入求值（同 Run 内由 TaskResult.retry 产生的再次尝试不重复求值；新 Run 重新求值）
-        is_session_retry = (
-            getattr(self._session, "get_retry_count", lambda _: 0)(job_uid) > 0
-            or (store.backend.schema_version < TARGET_SCHEMA_VERSION and job.attempt_no > 1)
+        # 准入求值（仅显式 retry 登记的同 Run 候选跳过触发器）
+        is_session_retry = bool(
+            getattr(self._session, "is_retry_candidate", lambda _: False)(job_uid)
         )
         if not is_session_retry:
             should_run = self._trigger_registry.admit(

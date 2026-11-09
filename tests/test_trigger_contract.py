@@ -235,22 +235,6 @@ def test_trigger_skip_does_not_grant_dependency_readiness():
     assert not state.dependency_ready("t::a")
 
 
-def test_retry_uses_same_activation_without_rechecking_trigger(monkeypatch):
-    import multiprocessing as mp
-    from tests.test_pipeline import make_instant_process_class
-    monkeypatch.setattr(mp, "Process", make_instant_process_class(retry_uid="t::a"))
-    pipeline = TaskLite(backend="memory")
-    seen = []
-    pipeline.register_trigger("first", lambda ctx: seen.append(ctx.job.attempt_no) or True)
-    pipeline.register_task("t", handle, max_retries_per_run=2, trigger="first")
-    pipeline.enqueue(Job("t", "a"))
-    pipeline.run()
-    assert seen == [1]
-    records = pipeline.backend.load_attempts("t::a")
-    assert [(record.activation_no, record.attempt_no) for record in records] == [(1, 1), (1, 2), (1, 3)]
-    assert len(pipeline.backend.load_failed()) == 1
-
-
 def test_trigger_error_aborts_inflight_without_burning_budget(monkeypatch):
     import multiprocessing as mp
     import pytest

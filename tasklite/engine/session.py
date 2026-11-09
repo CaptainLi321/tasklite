@@ -2,7 +2,7 @@
 
 不变式：
 - stop_mode 单调转移（NONE→DRAINING，唯一入口 request_stop，幂等且不升级强停）；
-- begin() 是新 run 的复位入口（run_id/dispatch_no/stop_mode/重试计数归零）。
+- begin() 是新 run 的复位入口（run_id/dispatch_no/stop_mode/候选来源与重试计数归零）。
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ class RunSession:
         self.dispatch_no: int = 0
         self.stop_mode: StopMode = StopMode.NONE
         self.retry_counts: dict[str, int] = {}
+        self.retry_candidates: set[str] = set()
         self._exclude_chain_handler: Callable[[str], None] | None = None
 
     def bind_exclude_chain_handler(self, handler: Callable[[str], None] | None) -> None:
@@ -40,6 +41,7 @@ class RunSession:
         self.dispatch_no = 0
         self.stop_mode = StopMode.NONE
         self.retry_counts = {}
+        self.retry_candidates = set()
 
     def get_retry_count(self, job_uid: str) -> int:
         """查询当前 Run 内指定 uid 已消耗的重试预算次数。"""
@@ -50,6 +52,18 @@ class RunSession:
         updated = self.retry_counts.get(job_uid, 0) + 1
         self.retry_counts[job_uid] = updated
         return updated
+
+    def mark_retry_candidate(self, job_uid: str) -> None:
+        """登记本 Run 内由显式 retry 产生的下一次候选来源。"""
+        self.retry_candidates.add(job_uid)
+
+    def is_retry_candidate(self, job_uid: str) -> bool:
+        """该 uid 的下一次候选是否由本 Run 的显式 retry 产生。"""
+        return job_uid in self.retry_candidates
+
+    def clear_retry_candidate(self, job_uid: str) -> None:
+        """候选结算后清除来源；本 Run 已累计的重试预算保持不变。"""
+        self.retry_candidates.discard(job_uid)
 
     def next_dispatch_no(self) -> int:
         """fence 序号单调递增（execution_id 身份隔离的序号来源）。"""
