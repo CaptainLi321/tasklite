@@ -9,27 +9,23 @@
 ``DiscoveryHost`` 公开协议把扫描器挂到宿主上（TaskLite 是其默认实现）。
 任何实现该协议的宿主/测试桩均可直接复用。
 
-「已见集合」的实现载体：框架的 successes/failed 集合
-（``ctx.has_succeeded`` / ``ctx.has_failed`` 的 run 派发时刻快照）——
-**无 cursor、无 seen 持久化、无互斥注入、无 poison 表**。
-
-为什么成立：discovery 的 seen 集合与框架 successes/failed 集合是同一份数据
-（「这个内容处理过了」）——后者由后端 ACID 事务保证完整与持久。
-并发同 cursor_key 扫描无需互斥（「共享可变 seen 集合可被并发 REPLACE
-覆盖」的前提在本模型下不存在）：successes 由后端事务写入，最坏代价
-是重复 fetch，正确性不受影响。
+「已见集合」由 discovery 自己通过公开游标持久化：每个
+``(discovery task_type, process task_type, group key)`` 使用独立游标，
+值为本次完整 seen 集合的 JSON 快照。扫描核心不读取框架成败集合，也不
+依赖任何 handler 私有字段。游标更新只在 discovery 父任务成功时原子发布，
+失败或重试不会推进 seen。
 
 参数与行为要点：
-- ``process_task_type``（必填）：process 子任务的 task_type——整页命中判定
-  按 ``f"{process_task_type}::{content_id}"`` 查询 successes/failed 快照。
-- ``group_key_func``（可选）：仅作 job_id 命名空间前缀（防止跨分组内容 id
-  碰撞导致 successes 去重误吞），无游标语义。
-- 坏 item 由 process 子任务的任务层重试/失败档案吸收——子任务进失败档案
-  即 ``has_failed`` = 已见，不再重新 spawn；失败档案内容在 failed 快照中算
-  「已见」，含坏 item 的页可正常整页命中。
-- successes/failed 快照在 discovery job 派发时固定：同一内容本次 run 内跨页重复
-  出现时会重复 spawn（框架 successes 去重吸收，仅浪费一次 spawn 调用）。
-- 达 ``max_pages`` 截断仅记日志、不落任何游标：下次 run 仍从第 1 页完整重扫。
+- ``process_task_type``（必填）：process 子任务的 task_type，与
+  ``group_key_func`` 一起确定独立的 seen 游标范围。
+- ``group_key_func``（可选）：作 job_id 命名空间前缀，同时隔离不同组的
+  seen 游标，防止跨分组内容 id 碰撞或缺失报告串组。
+- 坏 item 由 process 子任务的任务层重试/失败档案吸收；discovery 在 process
+  回调成功并随父任务成功发布后将其记入 seen，不读取子任务终态。
+- 同一内容本次 run 内跨页重复出现时只处理一次，后续重复由本次内存 seen
+  集合吸收。
+- 达 ``max_pages`` 截断不报告缺失；本轮已成功处理的条目随父任务成功提交，
+  下次 run 仍从第 1 页重扫。
 
 回调必须为模块级可 pickle 函数（spawn 进程隔离约束，与普通 handler 一致）。
 
@@ -56,10 +52,11 @@ T2. 当且仅当整页命中时，才说明「本页及以后全是旧内容」�
       - 单页**部分**命中不算终止：必须继续翻页（本页前半仍有新内容，
         后续页仍可能有新内容）。
 T3. 仅「完整扫描」结束（整页命中或空页）才返回成功。中途停止（job 失败/
-    重启、id_func 异常中断）**不得**视为完整——本模型无游标可推进，未完成
-    的扫描必须在下一次运行完整重扫（重不漏由确定性 job_id + successes 去重吸收）。
+    重启、id_func 异常中断）**不得**视为完整——seen 游标只在父任务成功时
+    提交，未完成的扫描必须在下一次运行完整重扫（重不漏由确定性 job_id +
+    提交去重吸收）。
     **退化路径例外**：max_pages 截断与 id_func 全失败早停两处实现返回
-    **成功**（进 successes）并打醒目日志——语义上「未完整」由 discovery 默认
+    **成功**并打醒目日志——语义上「未完整」由 discovery 默认
     trigger="always" 保证下一会话重扫；若用户将 trigger 覆盖为 once，截断后
     增量链静默死亡（漏内容且无失败信号），需自行权衡。
 T4. **liveness 例外（max_pages 硬上限，默认 1000）**：持续更新源无法整页
@@ -75,25 +72,23 @@ S1. 已见集合是「自首次运行以来见过的所有内容 id 的并集」
 S2. **禁止**把已见集合截断为「最旧 N 个」「最近 N 个」或任何滑动窗口：
     截断后窗口外的已见 id 下次被误判为「新内容」→ 重复处理，且破坏
     T2 的整页命中判定。
-S3. 已见集合 = 框架 successes/failed 快照（``ctx.has_succeeded`` / ``ctx.has_failed``），
-    完整与持久由后端 ACID 事务保证。**无独立 seen 持久化、无 compact 编码**
-    ——「百万级 seen」由 successes 表承载（successes 本就是完整历史），语义无损。
-S4. 成员判定 ``f"{process_task_type}::{content_id}" in successes∪failed`` 必须
-    覆盖全部已见 id。
+S3. 已见集合 = discovery 自己维护的公开游标快照（JSON 编码的 content_id
+    列表），完整与持久由游标 ACID 写入保证；不读取框架终态档案。
+S4. 成员判定必须覆盖本组游标中的全部已见 content_id。
 
 ------------------------------------------------------------------------------
 去重与 job_id —— 必须确定性派生
 ------------------------------------------------------------------------------
 - 同一内容项（同 cursor_key 组 + 内容 id）在**任何运行/重启**中必须生成
-  **相同**的 job_id，使框架的 successes/queue 去重能吸收重复 spawn（崩溃重跑、
+  **相同**的 job_id，使框架的提交去重能吸收重复 spawn（崩溃重跑、
   并发重复扫描）。
 - **禁止**用随机后缀（uuid/时间戳）派生 job_id——随机 id 使去重失效，
   同一内容被重复执行。
 - job_id 派生 = ``encode_content_id(prefix + content_id)``：content_id
   是框架编码后的单射转义形式（干净 id 原样、脏 id UTF-8 字节百分号转义、
   超长截断 + sha256 指纹，不含 ``::``），**直接**用作子任务 job_id。
-  ``group_key_func`` 返回值仅作命名空间前缀（防跨组 id 碰撞），无游标
-  语义。派生必须与 ``process_task_type`` 的已见判定一致（同一 content_id）。
+  ``group_key_func`` 返回值作命名空间前缀（防跨组 id 碰撞）并隔离 seen
+  游标。派生必须与 ``process_task_type`` 的已见判定一致（同一 content_id）。
 
 ------------------------------------------------------------------------------
 防源端删除/漂移语义
@@ -118,30 +113,27 @@ S4. 成员判定 ``f"{process_task_type}::{content_id}" in successes∪failed`` 
 V1. 契约正确性必须由回归测试固定，至少覆盖：首次全量扫描（空集合 → 逐页
     → 空页终止）；中间翻页运行（部分命中页继续翻，整页命中终止）；重新发现
     含新内容（新 id 被处理，旧 id 被跳过）；源端删除场景（删中间/删最旧/删最新
-    → 不重不漏）；崩溃重跑（successes 快照未推进 → 完整重扫 → 去重吸收）；
+    → 不重不漏）；崩溃重跑（seen 游标未推进 → 完整重扫 → 去重吸收）；
     max_pages 截断不触发 on_missing；id_func 全失败早停不触发
     on_missing；多 cursor_key 组共享 process_task_type 时 on_missing
     只报本组。
 """
 from __future__ import annotations
 
+import json
 import logging
 import pickle
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import Any, Protocol
 
-from ..exceptions import TaskLiteError
 from ..models.result import TaskResult
 from ..models.task import validate_trigger
-from ..utils.encoding import (
-    CONTENT_ID_ALLOWED,
-    encode_content_id,
-    make_job_uid,
-    parse_job_uid,
-    percent_encode,
-)
+from ..utils.encoding import encode_content_id
 
 logger = logging.getLogger("tasklite")
+
+_SEEN_CURSOR_VERSION = 1
+_SEEN_CURSOR_PREFIX = "__tasklite_discovery_seen_v1__:"
 
 
 # 框架无关协议（G-DISCOVERY）：本模块的扫描核心**不 import 任何框架模块**。
@@ -163,14 +155,12 @@ class DiscoveryContext(Protocol):
     """扫描循环需要的最小上下文接口（框架无关）。
 
     语义契约（由宿主保证）：
-    - ``has_succeeded`` / ``has_failed``：派发时刻 successes/failed 快照成员判定；
-    - ``succeeded_or_failed_job_uids``：successes∪failed 的只读快照（full 模式 on_missing 差集用）。
-    本模块不要求也不探测任何其他 ctx 字段/方法。
+    - ``get_cursor`` / ``set_cursor``：读取并暂存本工具自己的 seen 快照。
+    本模块不要求也不探测任何成败集合或私有字段。
     """
 
-    def has_succeeded(self, job_uid: str) -> bool: ...
-    def has_failed(self, job_uid: str) -> bool: ...
-    def succeeded_or_failed_job_uids(self) -> Iterable[str]: ...
+    def get_cursor(self, key: str) -> str | None: ...
+    def set_cursor(self, key: str, value: str | None) -> None: ...
 
 
 class DiscoveryHost(Protocol):
@@ -191,55 +181,22 @@ class DiscoveryHost(Protocol):
     ) -> None: ...
 
 
-def _in_discovery_group(content_part: str, group_prefix: str) -> bool:
-    """判定编码后的 content 片段是否派生自本 cursor_key 组的未截断转义前缀。
-
-    直通域成员恰为 ``group_prefix + percent_encode(cid)``，前缀比较精确；
-    截断域成员尾部是「%_ + 全文指纹」，其保留头部仍是转义全文的前缀，故
-    互补以「组前缀以该头部为前缀」判定。不同组仅当转义前缀共享约百字符
-    以上时才可能误判——这是截断域残留信息的边界，组前缀侧永不截断使其
-    收窄到极限。
-    """
-    if content_part.startswith(group_prefix):
-        return True
-    head = content_part.split("%_", 1)[0]
-    return len(head) < len(content_part) and group_prefix.startswith(head)
-
-
-def _is_entry_seen(ctx: Any, uid: str) -> bool:
-    """快照成员判定辅助：优先协议方法，次选内部快照属性，适配成败查询接口收敛。"""
-    has_succ = getattr(ctx, "has_succeeded", None)
-    if callable(has_succ):
-        return bool(has_succ(uid))
-    has_fail = getattr(ctx, "has_failed", None)
-    if callable(has_fail):
-        return bool(has_fail(uid))
-    succ_uids = getattr(ctx, "_success_job_uids", None)
-    if succ_uids is not None and uid in succ_uids:
-        return True
-    fail_uids = getattr(ctx, "_failed_job_uids", None)
-    if fail_uids is not None and uid in fail_uids:
-        return True
-    return False
-
-
 class DiscoveryHandler:
     """按 REQUIREMENTS CONTRACT 实现的增量发现 handler（纯任务模型）。
 
     **框架无关**：本类及其扫描循环只依赖 ``DiscoveryJob`` / ``DiscoveryContext``
-    两个最小协议（payload + has_succeeded/has_failed/succeeded_or_failed_job_uids），运行时
+    两个最小协议（payload + get_cursor/set_cursor），运行时
     **不 import 任何框架模块**，可被任何实现这两个协议的宿主直接复用；
     TaskLite 只是框架默认宿主。
 
     框架负责契约规定的全部语义：
       - 从第 1 页起逐页扫描，page 由框架传入，用户 fetch_func 只拉一页；
-      - 「已见」判定 = successes/failed 快照成员判定（``ctx.has_succeeded`` /
-        ``ctx.has_failed``），完整集合由框架保证；
-      - 整页命中或空页才终止；仅完整扫描结束才返回成功（本模型无游标，
-        崩溃即整轮重扫，重不漏由确定性 job_id + successes 去重吸收）；
+      - 「已见」判定 = 本工具 seen 游标成员判定，完整集合由工具维护；
+      - 整页命中或空页才终止；崩溃即整轮重扫，seen 游标只在父任务成功时
+        原子发布；
       - 每个新 item 以编码后的 content_id 交给 ``process_item_func``，
         用户在其中 spawn 子任务，job_id 直接用框架传入的 content_id；
-      - 防源端删除与记录漂移由「完整 successes/failed 集合 + 整页命中」天然保证。
+      - 防源端删除与记录漂移由「完整 seen 游标 + 整页命中」保证。
 
     可 pickle 性：本类是模块级类；回调由用户提供，必须为模块级可 pickle
     函数（与普通 handler 的 spawn 约束一致）。
@@ -255,14 +212,14 @@ class DiscoveryHandler:
         max_pages: int = 1000,
         scan_mode: str = "incremental",
         on_missing: Callable[[DiscoveryJob, DiscoveryContext, list[str]], None] | None = None,
+        discovery_task_type: str = "discovery",
     ):
         self.fetch_func = fetch_func
         self.id_func = id_func
         self.process_item_func = process_item_func
-        # process 子任务的 task_type——整页命中判定用 f"{ptype}::{content_id}"
-        # 查询 successes/failed，必须与用户 spawn 时一致（见 register_discovery
-        # 的校验：非空 str 且不含 "::"）。
+        # process 子任务的 task_type 与 discovery task_type、分组共同隔离 seen 游标。
         self.process_task_type = process_task_type
+        self.discovery_task_type = discovery_task_type
         self.group_key_func = group_key_func
         # 单次扫描的页数硬上限。持续更新的内容源可能永远无法整页命中
         # （新内容不断把旧内容顶到后面）——无上限时扫描无限翻页，直到超时
@@ -281,22 +238,12 @@ class DiscoveryHandler:
         # 模块级可 pickle（spawn 约束）。
         self.on_missing = on_missing
 
-    def _process_uid(self, content_id: str) -> str:
-        """构造 process 子任务的 uid——与用户 spawn 时的一致。
-
-        框架传入的 content_id 已编码，用户应直接用其作 ``Job.job_id``：
-        ``Job(process_task_type, content_id, ...)``。判定与 spawn 用同一个
-        uid 派生，是「已见判定永不失效」的前提（两处不一致 → 永不整页命中
-        → 全量重扫到 max_pages）。
-        """
-        return make_job_uid(self.process_task_type, content_id)
-
     def _resolve_prefix(self, job: DiscoveryJob) -> str:
-        """可选命名空间前缀（group_key_func 仅作 job_id 分组，无游标语义）。
+        """可选命名空间前缀（同时隔离 job_id 与 seen 游标）。
 
         prefix 不能是 `key + "_"` 的裸拼接——`_` 属于干净字符集，
         `(key="ab", cid="c_d")` 与 `(key="ab_c", cid="d")` 派生相同 job_id
-        → 跨组碰撞 → successes 去重静默吞内容（数据丢失）。采用 length-prefix
+        → 跨组碰撞 → 提交去重静默吞内容（数据丢失）。采用 length-prefix
         （`{len(key)}:{key}`）：`:` 会被单射转义为 %3A，`%3A` 前的数字给出
         key 长度 → 拼接边界可复原 → 不同 (key, cid) 对永不派生相同字符串
         （单射保持）。
@@ -309,6 +256,51 @@ class DiscoveryHandler:
                 f"group_key_func must return a non-empty str, got {key!r}"
             )
         return f"{len(key)}:{key}"
+
+    def _seen_cursor_key(self, prefix: str) -> str:
+        """派生本组 seen 游标键；长度前缀保证三元组拼接单射。"""
+        scope = (
+            f"{len(self.discovery_task_type)}:{self.discovery_task_type}"
+            f"{len(self.process_task_type)}:{self.process_task_type}"
+            f"{len(prefix)}:{prefix}"
+        )
+        return _SEEN_CURSOR_PREFIX + scope
+
+    def _load_seen(self, ctx: DiscoveryContext, key: str) -> set[str]:
+        raw = ctx.get_cursor(key)
+        if raw is None:
+            return set()
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid discovery seen cursor {key!r}: {exc}") from exc
+        version = payload.get("version") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or type(version) is not int
+            or version != _SEEN_CURSOR_VERSION
+            or not isinstance(payload.get("seen"), list)
+        ):
+            raise ValueError(f"invalid discovery seen cursor {key!r}")
+        seen = payload["seen"]
+        if any(not isinstance(item, str) or not item for item in seen):
+            raise ValueError(f"invalid discovery seen cursor {key!r}")
+        return set(seen)
+
+    def _save_seen(
+        self,
+        ctx: DiscoveryContext,
+        key: str,
+        seen: set[str],
+    ) -> None:
+        payload = {
+            "version": _SEEN_CURSOR_VERSION,
+            "seen": sorted(seen),
+        }
+        ctx.set_cursor(
+            key,
+            json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+        )
 
     def _resolve_scan_options(self, job: DiscoveryJob) -> tuple[str, int]:
         """扫描模式与页数上限：job.payload 动态指定优先，否则用构造默认值。"""
@@ -340,22 +332,18 @@ class DiscoveryHandler:
         self,
         items: list[Any] | tuple[Any, ...],
         prefix: str,
-        scan_mode: str,
         seen_this_run: set[str],
-    ) -> tuple[list[tuple[Any, str, str]], bool]:
-        """逐 item 提取 (item, content_id, process uid)；返回 (entries, 页完整)。
+    ) -> tuple[list[tuple[Any, str]], bool]:
+        """逐 item 提取 (item, content_id)；返回 (entries, 页完整)。
 
         id_func 逐 item 隔离——单个坏 item（抛异常/返回空串/非 str）跳过
         （不入任何集合、下次 run 重试），不崩整个扫描（否则该 discovery 链
         永久死）。页完整 = 本页无任何 id_func 失败；失败项无法归位进
         seen_this_run，是 on_missing 差集的不可信因素。
 
-        收集判定必须读 payload 覆盖后的 scan_mode（与结尾差集判定同一变量）：
-        误读构造期默认值时，「默认 incremental + payload 指定 full」的组合
-        会让 seen_this_run 恒空 → 差集把全部已见内容误报「已删除」，触发
-        业务的破坏性动作。
+        所有成功提取的条目都进入 seen_this_run，供 full 模式缺失差集使用。
         """
-        page_entries: list[tuple[Any, str, str]] = []
+        page_entries: list[tuple[Any, str]] = []
         page_intact = True
         for item in items:
             try:
@@ -370,14 +358,13 @@ class DiscoveryHandler:
             if not isinstance(cid, str) or not cid:
                 page_intact = False
                 logger.error(
-                    f"Discovery: id_func returned non-empty str? "
+                    f"Discovery: id_func must return a non-empty str; "
                     f"{cid!r}; skipping (will retry next run)"
                 )
                 continue
             content_id = encode_content_id(prefix + cid)
-            page_entries.append((item, content_id, self._process_uid(content_id)))
-            if scan_mode == "full":
-                seen_this_run.add(content_id)
+            page_entries.append((item, content_id))
+            seen_this_run.add(content_id)
         return page_entries, page_intact
 
     def _fetch_page(
@@ -400,6 +387,7 @@ class DiscoveryHandler:
         prefix: str,
         scan_mode: str,
         effective_max_pages: int,
+        known: set[str],
     ) -> tuple[set[str], bool]:
         """逐页扫描主循环；返回 (本次扫到的 content_id 集合, 是否完整扫描)。
 
@@ -415,8 +403,8 @@ class DiscoveryHandler:
         while True:
             if page > effective_max_pages:
                 # 页数硬上限。无法整页命中的持续更新源或 full 模式指定页数
-                # 在此停止——已 spawn 的子任务由 successes 吸收；下次 run 从
-                # 第 1 页重扫。
+                # 在此停止——已成功处理的 content_id 随父任务成功提交；
+                # 下次 run 从第 1 页重扫。
                 completed_full = False
                 logger.warning(
                     f"Discovery: reached max_pages={effective_max_pages} without "
@@ -428,13 +416,13 @@ class DiscoveryHandler:
                 break  # T1a: 空页 → 页尾，终止
 
             page_entries, page_intact = self._collect_page_entries(
-                items, prefix, scan_mode, seen_this_run
+                items, prefix, seen_this_run
             )
             if not page_intact:
                 completed_full = False
 
             # 整页 id_func 全失败 = 源结构异常：终止本轮扫描避免死循环
-            # （每页都失败、successes 零增长 → max_pages 前先止损），下轮重试。
+            # （每页都失败、seen 游标零增长 → max_pages 前先止损），下轮重试。
             # 此早停也是不完整扫描——该页 item 及更深页内容仍在源上（只是
             # id_func 解析失败），差集会把这些内容误报为「已删除」。
             if not page_entries:
@@ -445,17 +433,19 @@ class DiscoveryHandler:
                 break
 
             # 单页「部分命中」不算终止——整页命中才说明本页及以后全是旧内容。
-            # 判定依据完整 successes/failed 快照。scan_mode="full" 跳过整页命中
+            # 判定依据本组完整 seen 游标。scan_mode="full" 跳过整页命中
             # break——一路扫到空页或 max_pages（全量成本只在 fetch，已见
             # 内容仍逐条跳过）。
             page_all_seen = all(
-                _is_entry_seen(ctx, uid)
-                for _, _, uid in page_entries
+                content_id in known
+                for _, content_id in page_entries
             )
             if page_all_seen and scan_mode != "full":
                 break  # 整页命中 → 终止（增量模式）
 
-            self._process_page_entries(job, ctx, page_entries, page_all_seen)
+            self._process_page_entries(
+                job, ctx, page_entries, page_all_seen, known
+            )
             page += 1
         return seen_this_run, completed_full
 
@@ -463,20 +453,21 @@ class DiscoveryHandler:
         self,
         job: DiscoveryJob,
         ctx: DiscoveryContext,
-        page_entries: list[tuple[Any, str, str]],
+        page_entries: list[tuple[Any, str]],
         page_all_seen: bool,
+        known: set[str],
     ) -> None:
         """处理本页新 item（process_item_func 逐 item 隔离——单个坏 item 不崩
         整轮扫描；跳过不入任何集合，下次 run 重试。达失败档案阈值由 process
         子任务的任务层重试/失败档案吸收，本层不计数）。整页已见时复用
-        page_all_seen 短路——循环内判定与 all 判定语义一致（均为
-        has_succeeded or has_failed），无需对同批 entry 重复查询快照。
+        page_all_seen 短路；同页重复 id 在首次成功处理后由 known 吸收。
         """
-        for item, content_id, uid in page_entries:
-            if page_all_seen or _is_entry_seen(ctx, uid):
+        for item, content_id in page_entries:
+            if page_all_seen or content_id in known:
                 continue
             try:
                 self.process_item_func(job, ctx, item, content_id)
+                known.add(content_id)
             except Exception as e:
                 logger.error(
                     f"Discovery: process_item_func failed for content "
@@ -487,44 +478,15 @@ class DiscoveryHandler:
         self,
         job: DiscoveryJob,
         ctx: DiscoveryContext,
-        prefix: str,
+        known: set[str],
         seen_this_run: set[str],
         on_missing: Callable[[DiscoveryJob, DiscoveryContext, list[str]], None],
     ) -> None:
         """full 模式差集报告：「已见但本次未扫到」= 源站删除检测。
 
-        已见集合从 successes/failed 快照筛 process_task_type 前缀；只取本组
-        （cursor_key 命名空间）的已见内容——多组共享 process_task_type 时，
-        他组内容在本组 seen_this_run 之外，不过滤会被误报为「已删除」。
-
-        组前缀必须用未截断的单射转义形态：编码输出的截断形态尾部带全文
-        指纹，两个独立编码值之间不存在前缀关系，组过滤只能依托未截断前缀
-        + 截断头部互补匹配保持精确（_in_discovery_group）。
+        known 已由本组独立 seen 游标限定，不读取框架终态档案。
         """
         try:
-            known: set[str] = set()
-            ptype_prefix = f"{self.process_task_type}::"
-            group_prefix = (
-                percent_encode(prefix, allowed=CONTENT_ID_ALLOWED) if prefix else ""
-            )
-            uids_fn = getattr(ctx, "succeeded_or_failed_job_uids", None)
-            if callable(uids_fn):
-                uids_list = uids_fn()
-            else:
-                succ_uids = set(getattr(ctx, "_success_job_uids", ()) or ())
-                fail_uids = set(getattr(ctx, "_failed_job_uids", ()) or ())
-                uids_list = succ_uids | fail_uids
-            for uid in uids_list:
-                try:
-                    tt, content_part = parse_job_uid(uid)
-                except TaskLiteError:
-                    if not uid.startswith(ptype_prefix):
-                        continue
-                    tt = self.process_task_type
-                    content_part = uid[len(ptype_prefix):]
-                if tt == self.process_task_type:
-                    if not group_prefix or _in_discovery_group(content_part, group_prefix):
-                        known.add(content_part)
             missing = sorted(known - seen_this_run)
             if missing:
                 logger.warning(
@@ -538,14 +500,17 @@ class DiscoveryHandler:
     def __call__(self, job: DiscoveryJob, ctx: DiscoveryContext) -> TaskResult:
         prefix = self._resolve_prefix(job)
         scan_mode, effective_max_pages = self._resolve_scan_options(job)
+        cursor_key = self._seen_cursor_key(prefix)
+        known = self._load_seen(ctx, cursor_key)
+        known_before = set(known)
         seen_this_run, completed_full = self._scan_pages(
-            job, ctx, prefix, scan_mode, effective_max_pages
+            job, ctx, prefix, scan_mode, effective_max_pages, known
         )
+        if known != known_before:
+            self._save_seen(ctx, cursor_key, known)
         if scan_mode == "full" and self.on_missing is not None and completed_full:
-            self._report_missing(job, ctx, prefix, seen_this_run, self.on_missing)
-        # 本模型无游标可推进——崩溃（fetch 抛异常 → 异常传播，由用户按错误
-        # 分类决定重试/失败档案）即整轮重扫；已 spawn 的子任务由确定性
-        # job_id 的 successes 去重吸收，不重不漏。
+            self._report_missing(job, ctx, known, seen_this_run, self.on_missing)
+        # 崩溃（fetch 抛异常）即整轮重扫；seen 游标只在父成功时原子发布。
         return TaskResult.success()
 
 
@@ -565,9 +530,8 @@ def register_discovery(
 ) -> None:
     """注册纯任务模型增量发现 handler（per REQUIREMENTS CONTRACT）。
 
-    按 REQUIREMENTS CONTRACT（T/S/D/M/R 条款）实现，「已见集合」直接
-    使用框架 successes/failed 集合——无 cursor、无 seen 持久化、无 poison 表、
-    无同 cursor_key 互斥注入。
+    按 REQUIREMENTS CONTRACT（T/S/D/M/R 条款）实现，「已见集合」由工具
+    自己的公开游标持久化，不读取框架终态档案或 handler 私有字段。
 
     Args:
         host: 实现 ``DiscoveryHost`` 协议的宿主（框架默认适配 = TaskLite；
@@ -582,11 +546,10 @@ def register_discovery(
             新 item 的处理逻辑（通常 spawn 一个子任务）。content_id 已经
             单射转义编码（不含 "::"、长度受限），可直接用作 ``Job.job_id``；
             spawn 的 task_type 必须是 ``process_task_type``。
-        process_task_type: process 子任务的 task_type——整页命中判定按
-            ``f"{process_task_type}::{content_id}"`` 查询 successes/failed，
-            与用户 spawn 时必须一致。
-        group_key_func: 可选。``(payload) -> str``，仅作 job_id 命名空间
-            前缀（防跨分组内容 id 碰撞），无任何游标/互斥语义。
+        process_task_type: process 子任务的 task_type，与 discovery task_type
+            和分组共同确定独立 seen 游标范围。
+        group_key_func: 可选。``(payload) -> str``，作 job_id 命名空间前缀，
+            同时隔离不同组的 seen 游标与缺失报告。
         resources: 发现任务自身的默认资源需求。
         max_pages: 单次扫描页数硬上限（活性保障条款，默认 1000）。
         trigger: discovery job 的默认跨会话重跑策略（默认 ``"always"``）
@@ -668,9 +631,9 @@ def register_discovery(
         max_pages=max_pages,
         scan_mode=scan_mode,
         on_missing=on_missing,
+        discovery_task_type=task_type,
     )
-    # 框架无关适配：只调用宿主公开协议，不触碰任何私有字段/
-    # 内部注册表——并发安全由 successes ACID + 去重保证。
+    # 框架无关适配：只调用宿主公开注册协议，不触碰私有字段或内部注册表。
     host.register_task(
         task_type,
         handler,

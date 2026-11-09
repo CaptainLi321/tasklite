@@ -1,17 +1,14 @@
-"""v2 discovery full 模式增强测试：full 扫描、missing 检测与前缀单射。
+"""Discovery full 扫描、missing 检测与前缀单射回归。
 
 覆盖：
 - scan_mode="full"：扫到空页终止（不整页命中提前停）；已见内容不重复 spawn
 - on_missing 回调：full 模式收到「已见但未扫到」差集（源端缺失/删除检测）
 - incremental 模式回归：整页命中终止
 - cursor_key 前缀单射性（length-prefix 防跨组碰撞）
-
-依赖宽限（governor）语义的用例不在本文件——v2 已收敛至
-tests/v2/engine/test_governor.py；succeeded_or_failed_job_uids 上下文 API 契约由
-tests/v2/models/test_context.py 锁定，此处仅保留 discovery 端到端回归。
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -20,6 +17,7 @@ from tasklite import Job, TaskLite, TaskResult
 from tasklite.wrappers.discovery import encode_content_id, register_discovery
 
 PAGESIZE = 2
+SEEN_PREFIX = "__tasklite_discovery_seen_v1__:"
 
 
 # ── 模块级回调（可 pickle）───────────────────────────────────────────
@@ -81,6 +79,24 @@ def _pipeline(tmp_path, name="r5"):
 
 def _posts(n):
     return sorted([{"id": i} for i in range(n)], key=lambda p: p["id"], reverse=True)
+
+
+def _seen_cursor_key(*, task_type="disc", process_type="child", group_key=None):
+    prefix = "" if group_key is None else f"{len(group_key)}:{group_key}"
+    scope = (
+        f"{len(task_type)}:{task_type}"
+        f"{len(process_type)}:{process_type}"
+        f"{len(prefix)}:{prefix}"
+    )
+    return SEEN_PREFIX + scope
+
+
+def _seen_cursor_value(seen):
+    return json.dumps(
+        {"version": 1, "seen": sorted(seen)},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -210,10 +226,7 @@ class TestMissingDetection:
         不得被误报「已删除」。
 
         handler 按默认 incremental 注册，job.payload 动态指定
-        scan_mode="full"。若 seen_this_run 的收集条件误读 handler 构造期
-        默认值（恒为 "incremental"）而非 payload 覆盖后的值——收集端恒不
-        收集，差集 = known - 空集 把全部已见内容误报 missing，而 on_missing
-        误报会触发业务的破坏性动作。"""
+        scan_mode="full"；本次扫描事实必须始终参与 missing 差集。"""
         p = _pipeline(tmp_path)
         # 不传 scan_mode → handler 默认 incremental；仅挂 on_missing
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
@@ -221,12 +234,16 @@ class TestMissingDetection:
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
 
-        # 预置已见内容 0..4（known 非空，差集才有误报素材）
-        for i in range(5):
-            p.set_job_status(Job("child", str(i)), "succeeded", recursive=False)
-
-        # payload 覆盖为 full：本次完整扫到全部已见内容 → 无删除
+        # 首次动态 full 完整扫描建立本工具自己的 seen 游标。
         p.enqueue(Job("disc", "seed", payload={
+            "posts": _posts(5), "scan_mode": "full",
+            "missing_report": str(report),
+        }))
+        p.run()
+        assert not report.exists()
+
+        # 再次完整扫描仍无删除。
+        p.enqueue(Job("disc", "seed2", payload={
             "posts": _posts(5), "scan_mode": "full",
             "missing_report": str(report),
         }))
@@ -234,16 +251,15 @@ class TestMissingDetection:
         assert not report.exists(), \
             "payload 覆盖 full 时，本次已扫到的内容不得误报 missing"
 
-        # 正向对照：只扫到 2、3 → 真正删除的 0、1、4 才报 missing
-        # （确认修复没有把 on_missing 整个静默掉）
-        p.enqueue(Job("disc", "seed2", payload={
+        # 正向对照：只扫到 2、3 → 真正删除的 0、1、4 才报 missing。
+        p.enqueue(Job("disc", "seed3", payload={
             "posts": [{"id": 3}, {"id": 2}], "scan_mode": "full",
             "missing_report": str(report),
         }))
         p.run()
         missing = set(report.read_text().splitlines())
         assert missing == {"0", "1", "4"}, \
-            f"应恰好报真实删除的 0/1/4，不得混入本次已扫到的 2/3: {missing}"
+            f"应报真实删除的 0/1/4，不得混入本次已扫到的 2/3: {missing}"
 
     def test_incremental_no_missing_callback(self, tmp_path):
         """incremental 模式不触发 on_missing（整页命中提前停，差集无意义）。"""
@@ -257,30 +273,19 @@ class TestMissingDetection:
         assert not report.exists(), "incremental 不得触发 on_missing"
 
     def test_max_pages_truncation_no_missing_report(self, tmp_path):
-        """回归：full 模式 max_pages 截断不触发 on_missing。
-
-        原测试只跑一次（首次 run successes 空 → known 空 → on_missing
-        不调用，修复前也通过）——不杀变异。正确场景：先完整扫描建立
-        successes（known 非空），再截断 run——修复前会把更深页内容误报为
-        「已删除」，修复后因 completed_full=False 不触发。
-
-        v2 TaskRegistry 拒绝重复注册：Run 2 用同库新实例重挂覆盖配置
-        （对应「重新部署换发现配置」的现实路径）。
-        """
+        """full 模式 max_pages 截断不触发 on_missing。"""
         p = _pipeline(tmp_path)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
 
-        # Run 1：完整扫描（max_pages 默认大）→ 6 条进入 successes（known 非空）
+        # 先完整扫描，建立本工具自己的 seen 游标。
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
         p.enqueue(Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)}))
         p.run()
         assert not report.exists(), "完整扫描无删除 → 无 missing"
 
-        # Run 2：同库新实例，max_pages=1 → 截断，只扫前 2 条
-        # 修复前：known 含 6 条、seen 只 2 条 → 误报 {0,1,2,3} 已删除
-        # 修复后：completed_full=False → 不触发
+        # 同库新实例，max_pages=1 → 截断，只扫前 2 条。
         p2 = _pipeline(tmp_path)
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id, _process, "child",
@@ -291,21 +296,19 @@ class TestMissingDetection:
         assert not report.exists(), "max_pages 截断不得误报 missing"
 
     def test_all_id_func_failed_early_stop_no_missing_report(self, tmp_path):
-        """残留回归：整页 id_func 全失败早停也是不完整扫描——不触发
-        on_missing（该页 item 及更深页仍在源上，只是解析失败）。"""
+        """整页 id_func 全失败早停是不完整扫描，不触发 on_missing。"""
         p = _pipeline(tmp_path)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
 
-        # Run 1：正常 id_func 完整扫描 → 6 条进入 successes
+        # 先完成一次正常扫描。
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
         p.enqueue(Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)}))
         p.run()
         assert not report.exists()
 
-        # Run 2：同库新实例，id_func 全失败 → page1 早停（completed_full=False）
-        # 修复前：completed_full 恒 True → known 6 - seen 0 → 误报全 missing
+        # 同库新实例，id_func 全失败 → page1 早停。
         p2 = _pipeline(tmp_path)
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id_fail, _process, "child",
@@ -315,23 +318,19 @@ class TestMissingDetection:
         assert not report.exists(), "id_func 全失败早停不得误报 missing"
 
     def test_partial_id_func_raise_no_missing_report(self, tmp_path):
-        """回归：full 模式单条 item 的 id_func 抛异常（同页其余成功）也是
-        不完整扫描——失败 item 无法入 seen_this_run，若扫描仍以空页完整
-        结束，差集会把仍在源上的它确定性误报为「已删除」。"""
+        """full 模式单条 id_func 抛异常是不完整扫描，不误报 missing。"""
         p = _pipeline(tmp_path)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
 
-        # Run 1：正常完整扫描 → 6 条进入 successes（known 非空）
+        # 先完成一次正常扫描。
         register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                            scan_mode="full", trigger="once", on_missing=_on_missing)
         p.enqueue(Job("disc", "seed", payload={"posts": _posts(6), "missing_report": str(report)}))
         p.run()
         assert not report.exists()
 
-        # Run 2：同库新实例。源上 6 条全在，但 id=5 的 id_func 抛异常
-        # （同页 id=4 成功，不触发整页全失败早停）——修复前 seen 缺
-        # id=5 → 误报「已删除」。
+        # 同库新实例。源上 6 条全在，但 id=5 的 id_func 抛异常。
         p2 = _pipeline(tmp_path)
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id_partial_raise, _process, "child",
@@ -341,8 +340,7 @@ class TestMissingDetection:
         assert not report.exists(), "id_func 部分失败的不完整扫描不得误报 missing"
 
     def test_partial_id_func_invalid_return_no_missing_report(self, tmp_path):
-        """回归：id_func 返回非 str 的部分失败与抛异常同责——失败 item 不入
-        seen_this_run，本轮差集不可信，不得触发 on_missing。"""
+        """id_func 非法返回值同属扫描不完整，不触发 on_missing。"""
         p = _pipeline(tmp_path)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
@@ -353,7 +351,7 @@ class TestMissingDetection:
         p.run()
         assert not report.exists()
 
-        # Run 2：同库新实例，id_func 对 id=5 返回非 str（部分失败）
+        # 同库新实例，id_func 对 id=5 返回非 str。
         p2 = _pipeline(tmp_path)
         p2.register_task("child", _child_ok)
         register_discovery(p2, "disc", _fetch, _item_id_partial_invalid, _process, "child",
@@ -363,8 +361,7 @@ class TestMissingDetection:
         assert not report.exists(), "id_func 非法返回的不完整扫描不得误报 missing"
 
     def test_on_missing_filters_own_cursor_key_group(self, tmp_path):
-        """回归：full 模式 on_missing 只报**本组**（cursor_key 命名空间）——
-        多组共享 process_task_type 时，他组内容不得误报为「已删除」。"""
+        """full 模式 on_missing 只报本组，不混入共享 process task_type 的他组。"""
         p = _pipeline(tmp_path)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
@@ -372,12 +369,12 @@ class TestMissingDetection:
                            group_key_func=_group_key,
                            scan_mode="full", trigger="once", on_missing=_on_missing)
 
-        # 组 A：完整扫描 4 条 → successes
+        # 组 A：完整扫描 4 条。
         p.enqueue(Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
                                                  "group": "A", "missing_report": str(report)}))
         p.run()
         assert not report.exists()
-        # 组 B：完整扫描 2 条 → successes（与 A 共享 process_task_type="child"）
+        # 组 B：完整扫描 2 条，与 A 共享 process_task_type。
         p.enqueue(Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
                                                  "group": "B", "missing_report": str(report)}))
         p.run()
@@ -391,12 +388,49 @@ class TestMissingDetection:
         # 本组 missing 恰好 = A 的已删内容（length-prefix：3%3Ag_A）
         assert missing == {"3%3Ag_A0", "3%3Ag_A1"}, f"本组已删应报全、跨组不得误报: {missing}"
 
-    def test_on_missing_long_cursor_key_truncated_domain(self, tmp_path):
-        """回归：超长 cursor_key（组前缀进入编码截断域）下 on_missing 仍须生效。
+    def test_on_missing_deduplicates_seen_entries(self, tmp_path):
+        """重复游标项在 missing 差集中只回调一次。"""
+        p = _pipeline(tmp_path)
+        p.register_task("child", _child_ok)
+        report = tmp_path / "missing.txt"
+        register_discovery(
+            p,
+            "disc",
+            _fetch,
+            _item_id,
+            _process,
+            "child",
+            scan_mode="full",
+            on_missing=_on_missing,
+        )
+        duplicated = [
+            encode_content_id("1"),
+            encode_content_id("1"),
+            encode_content_id("2"),
+            encode_content_id("2"),
+        ]
+        p.set_cursor(
+            _seen_cursor_key(),
+            json.dumps(
+                {"version": 1, "seen": duplicated},
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+        )
 
-        截断形态尾部带全文指纹，组前缀与成员各自编码后恒不互为前缀——
-        startswith 过滤会把本组内容全部漏出差集，missing 恒空，
-        源端删除检测对该组静默永久失效。"""
+        p.enqueue(
+            Job(
+                "disc",
+                "empty",
+                payload={"posts": [], "missing_report": str(report)},
+            )
+        )
+        p.run()
+
+        assert report.read_text().splitlines() == ["1", "2"]
+
+    def test_on_missing_long_cursor_key_truncated_domain(self, tmp_path):
+        """超长组前缀进入编码截断域时，on_missing 仍保持组隔离。"""
         p = _pipeline(tmp_path)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing.txt"
@@ -409,12 +443,12 @@ class TestMissingDetection:
         prefix_a = f"{len('g_' + long_a)}:g_{long_a}"
         prefix_b = f"{len('g_' + long_b)}:g_{long_b}"
 
-        # 组 A（超长 key）：完整扫描 4 条 → successes
+        # 组 A（超长 key）：完整扫描 4 条。
         p.enqueue(Job("disc", "seedA", payload={"posts": [{"id": i} for i in range(4)],
                                                  "group": long_a, "missing_report": str(report)}))
         p.run()
         assert not report.exists()
-        # 组 B（另一超长 key，共享 process_task_type）：完整扫描 2 条 → successes
+        # 组 B（另一超长 key，共享 process_task_type）：完整扫描 2 条。
         p.enqueue(Job("disc", "seedB", payload={"posts": [{"id": 9}, {"id": 8}],
                                                  "group": long_b, "missing_report": str(report)}))
         p.run()
@@ -468,7 +502,7 @@ class TestMissingDetection:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# cursor_key 前缀单射与 succeeded_or_failed_job_uids 端到端回归
+# cursor_key 前缀单射与 missing 端到端回归
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -477,10 +511,10 @@ class TestCursorKeyPrefixInjective:
 
     键名前缀转义必须保证单射性：
     `(key="ab", cid="c_d")` 与 `(key="ab_c", cid="d")` 派生相同 job_id
-    → 跨组碰撞 → successes 去重静默吞内容。length-prefix（{len}:{key}）修复。"""
+    → 跨组碰撞 → 提交去重静默吞内容。"""
 
     def test_prefix_collision_pair_now_distinct(self):
-        # 验证 length-prefix 前缀隔离：2:ab vs 4:ab_c → 边界可复原，派生不同
+        # 2:ab 与 4:ab_c 的边界可复原，派生不同。
         new_a = encode_content_id("2:ab" + "c_d")
         new_b = encode_content_id("4:ab_c" + "d")
         assert new_a != new_b, f"length-prefix 必须消除碰撞: {new_a} vs {new_b}"
@@ -519,14 +553,9 @@ class TestCursorKeyPrefixInjective:
         assert missing == {"3%3Ag_A0", "3%3Ag_A1"}, f"本组已删应报全、跨组不得误报: {missing}"
 
 
-class TestSucceededOrFailedJobUidsUsage:
-    """on_missing 差集计算经 ctx.succeeded_or_failed_job_uids 公开快照 API 的端到端回归。
-
-    succeeded_or_failed_job_uids 的上下文契约（successes∪failed 并集、快照语义）由
-    tests/v2/models/test_context.py 锁定，此处只验证 discovery 消费路径。"""
-
-    def test_discovery_on_missing_uses_succeeded_or_failed_job_uids(self, tmp_path):
-        """端到端回归：on_missing 差集计算经 succeeded_or_failed_job_uids 仍正确。"""
+class TestIndependentSeenCursorForMissing:
+    def test_on_missing_uses_discovery_seen_cursor(self, tmp_path):
+        """on_missing 差集来自 Discovery 自己的 seen 游标。"""
         p = _pipeline(tmp_path)
         p.register_task("child", _child_ok)
         report = tmp_path / "missing2.txt"

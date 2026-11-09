@@ -1,16 +1,7 @@
-"""v2 discovery 扫描核心框架无关性测试（协议边界验证）。
-
-架构要求：``v2/wrappers/discovery.py`` 的扫描核心（``DiscoveryHandler``）
-只依赖 ``DiscoveryJob``/``DiscoveryContext`` 两个最小协议，**不 import
-任何框架模块**；``register_discovery`` 是框架默认适配器，只依赖
-``DiscoveryHost`` 公开协议（register_task 接纳 trigger 默认规格）。
-本文件用完全自制的 FakeJob/FakeCtx/FakeHost 验证这两条边界，不经过
-TaskLite/Job/JobContext 任何一个真实框架类型。
-
-TaskLite 宿主侧的默认 trigger 继承已由
-tests/v2/test_pipeline.py 的 TestSetDiscoveryRerun 锁定，此处不重复。
-"""
+"""Discovery 扫描核心的框架无关协议边界测试。"""
 from __future__ import annotations
+
+import json
 
 import pytest
 
@@ -18,36 +9,34 @@ from tasklite.models.result import TaskResult
 from tasklite.wrappers.discovery import (
     DiscoveryHandler,
     DiscoveryHost,
+    encode_content_id,
     register_discovery,
 )
 
+SEEN_PREFIX = "__tasklite_discovery_seen_v1__:"
+
 
 class FakeJob:
-    """自制最小 job：只提供 payload（DiscoveryJob 协议的全部要求）。"""
-
     def __init__(self, payload):
         self.payload = payload
 
 
 class FakeCtx:
-    """自制最小 ctx：只实现 has_succeeded/has_failed/succeeded_or_failed_job_uids（DiscoveryContext 协议）。"""
+    """只提供公开游标读写的最小上下文。"""
 
-    def __init__(self, done=(), failed=(), seen=()):
-        self._done = set(done)
-        self._failed = set(failed)
-        self._seen = set(seen)
+    def __init__(self, cursors=None):
+        self.cursors = dict(cursors or {})
+        self.cursor_updates: dict[str, str | None] = {}
 
-    def has_succeeded(self, job_uid):
-        return job_uid in self._done
+    def get_cursor(self, key):
+        return self.cursors.get(key)
 
-    def has_failed(self, job_uid):
-        return job_uid in self._failed
-
-    def succeeded_or_failed_job_uids(self):
-        return frozenset(self._seen)
-
-
-# 模块级回调（保持与生产契约一致的可 pickle 形态）
+    def set_cursor(self, key, value):
+        self.cursor_updates[key] = value
+        if value is None:
+            self.cursors.pop(key, None)
+        else:
+            self.cursors[key] = value
 
 
 def _fetch(job, ctx, page):
@@ -70,50 +59,103 @@ def _missing_cb(job, ctx, missing):
     missing_reported.extend(missing)
 
 
-processed = []
-missing_reported = []
+processed: list[str] = []
+missing_reported: list[str] = []
+
+
+def _seen_key(*, task_type="discovery", process_type="child"):
+    scope = (
+        f"{len(task_type)}:{task_type}"
+        f"{len(process_type)}:{process_type}"
+        "0:"
+    )
+    return SEEN_PREFIX + scope
+
+
+def _seen_key_with_group(*, task_type, process_type, group_key):
+    prefix = f"{len(group_key)}:{group_key}"
+    scope = (
+        f"{len(task_type)}:{task_type}"
+        f"{len(process_type)}:{process_type}"
+        f"{len(prefix)}:{prefix}"
+    )
+    return SEEN_PREFIX + scope
+
+
+def _seen_value(seen):
+    return json.dumps(
+        {"version": 1, "seen": sorted(seen)},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _ctx(seen=()):
+    encoded = {encode_content_id(item) for item in seen}
+    return FakeCtx({_seen_key(): _seen_value(encoded)})
 
 
 def _make_handler(**kwargs):
     return DiscoveryHandler(
-        _fetch, _item_id, _process, "child", **kwargs,
+        _fetch,
+        _item_id,
+        _process,
+        "child",
+        **kwargs,
     )
 
 
 class TestDiscoveryHandlerFrameworkIndependent:
     def test_scan_runs_against_fake_job_and_ctx(self):
-        """扫描核心只依赖协议：FakeJob/FakeCtx 不经任何框架类型即可完整跑通。"""
         processed.clear()
-        ctx = FakeCtx(done={"child::old-b"})
+        ctx = _ctx({"old-b"})
         handler = _make_handler()
-        assert handler(FakeJob({"artist_id": "a1"}), ctx) == TaskResult.success()
-        # old-b 已见被跳过；old-c 在第二页且未见 → 应处理；空页终止
-        assert processed == ["new-a", "old-c"]
-        # 契约 T2：第二页未整页命中（old-c 是新的）→ 继续到空页
-        # 通过 processed 包含 old-c 已隐式验证。
 
-    def test_full_mode_uses_succeeded_or_failed_job_uids_protocol_only(self):
-        """full + on_missing 的差集计算只依赖 ctx.succeeded_or_failed_job_uids()。"""
+        assert handler(FakeJob({"artist_id": "a1"}), ctx) == TaskResult.success()
+        assert processed == ["new-a", "old-c"]
+        stored = json.loads(ctx.cursor_updates[_seen_key()])["seen"]
+        assert set(stored) == {
+            encode_content_id(item)
+            for item in ("new-a", "old-b", "old-c")
+        }
+
+    def test_full_mode_missing_uses_only_own_seen_cursor(self):
         processed.clear()
         missing_reported.clear()
-        # child::vanished 已见但数据源里已不存在（源端删除）
-        ctx = FakeCtx(seen={"child::vanished", "child::old-b"})
+        ctx = _ctx({"vanished", "old-b"})
         handler = _make_handler(scan_mode="full", on_missing=_missing_cb)
+
         assert handler(FakeJob({}), ctx) == TaskResult.success()
         assert sorted(missing_reported) == ["vanished"]
 
     def test_incremental_full_page_hit_stops(self):
-        """整页命中在 FakeCtx 上同样成立（协议成员判定即可）。"""
         processed.clear()
-        ctx = FakeCtx(done={"child::new-a", "child::old-b"})
+        ctx = _ctx({"new-a", "old-b", "old-c"})
         handler = _make_handler()
+
         assert handler(FakeJob({}), ctx) == TaskResult.success()
-        assert processed == [], "整页命中后不得处理任何 item"
+        assert processed == []
+        assert ctx.cursor_updates == {}
+
+    def test_seen_cursor_scope_is_injective(self):
+        keys = {
+            _seen_key(task_type="a", process_type="bc"),
+            _seen_key(task_type="ab", process_type="c"),
+            _seen_key_with_group(
+                task_type="a",
+                process_type="bc",
+                group_key="x",
+            ),
+            _seen_key_with_group(
+                task_type="a",
+                process_type="bc",
+                group_key="2:x",
+            ),
+        }
+        assert len(keys) == 4
 
 
 class FakeHost:
-    """实现 DiscoveryHost 协议的自制宿主（不是 TaskLite）。"""
-
     def __init__(self):
         self.registered = []
 
@@ -121,31 +163,33 @@ class FakeHost:
         self.registered.append((task_type, handler, resources, trigger))
 
 
-
 class TestRegisterDiscoveryFrameworkIndependent:
     def test_register_discovery_only_needs_discovery_host_protocol(self):
-        """适配器只调用宿主 register_task，可用 FakeHost 完成注册。"""
         host = FakeHost()
         register_discovery(
-            host, "discover", _fetch, _item_id, _process, "child",
+            host,
+            "discover",
+            _fetch,
+            _item_id,
+            _process,
+            "child",
             trigger="always",
         )
-        task_entry = host.registered[0]
-        assert task_entry[0] == "discover"
-        assert isinstance(task_entry[1], DiscoveryHandler), (
-            "register_discovery 必须注册框架无关的 DiscoveryHandler"
-        )
-        # 默认 trigger 作为 Task 规格注册
-        assert task_entry[3] == "always"
+        task_type, handler, _, trigger = host.registered[0]
+        assert task_type == "discover"
+        assert isinstance(handler, DiscoveryHandler)
+        assert trigger == "always"
 
     def test_register_discovery_rejects_bad_host_fail_loud(self):
-        """防御测试：宿主缺协议方法时立即 AttributeError，而非静默。"""
-
         class BrokenHost:
             pass
-            # 缺 register_task
 
         with pytest.raises(AttributeError):
             register_discovery(
-                BrokenHost(), "discover", _fetch, _item_id, _process, "child",
+                BrokenHost(),
+                "discover",
+                _fetch,
+                _item_id,
+                _process,
+                "child",
             )
