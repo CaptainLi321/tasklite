@@ -78,7 +78,7 @@ from .errorclass import (
 from .in_flight import InFlightJob
 from .scheduler import ScheduleResult, StandstillFacts
 from .types import AttemptOutcome, StopMode
-from .wait import IN_FLIGHT_POLL_SECONDS
+from .wait import AUTHORIZATION_RECHECK_SECONDS
 from ..utils.clock import utc_now_iso
 
 logger = logging.getLogger("tasklite")
@@ -182,7 +182,7 @@ class DispatchMachine:
                     self._authorization_pending = pending
                     return DispatchOutcome(
                         kind=DispatchKind.AUTHORIZATION_PENDING,
-                        worker_wait=IN_FLIGHT_POLL_SECONDS,
+                        worker_wait=AUTHORIZATION_RECHECK_SECONDS,
                     )
                 if authorized is False:
                     exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
@@ -192,8 +192,6 @@ class DispatchMachine:
 
         ok, worker_wait = self._resources.can_acquire_worker(1.0)
         if not ok:
-            if worker_wait <= 0:
-                worker_wait = IN_FLIGHT_POLL_SECONDS
             return DispatchOutcome(
                 kind=DispatchKind.WORKER_SATURATED,
                 worker_wait=worker_wait,
@@ -213,7 +211,7 @@ class DispatchMachine:
         if self._authorization_pending:
             return DispatchOutcome(
                 kind=DispatchKind.AUTHORIZATION_PENDING,
-                worker_wait=IN_FLIGHT_POLL_SECONDS,
+                worker_wait=AUTHORIZATION_RECHECK_SECONDS,
             )
         if entry is None:
             return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)

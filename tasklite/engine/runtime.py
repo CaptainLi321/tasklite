@@ -43,7 +43,7 @@ from .types import (
     StepOutcome,
     StopMode,
 )
-from .wait import IN_FLIGHT_POLL_SECONDS, LoopFacts, decide_wait
+from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
 from ..exceptions import _CommitCrashSignal, _JobTerminated
 from ..models.artifact import (
@@ -151,6 +151,7 @@ class EngineRuntime:
         self._temporary_excluded_uids: set[str] = set()
         self.selection_machine: SelectionMachine = SelectionMachine(self.store)
         self.channel.set_declaration_handler(self._handle_declaration)
+        self.channel.set_wakeup_callback(self._notifier.notify)
         self._session.bind_exclude_chain_handler(self.temporarily_exclude_chain)
 
     def temporarily_exclude(self, job_uid: str) -> None:
@@ -786,6 +787,17 @@ class EngineRuntime:
         completed = self.channel.reap_completed(handles)
         return self._completion.settle_reaped(completed)
 
+    def _next_in_flight_wait(self) -> float | None:
+        """返回最近执行超时；授权等待已暂停计时，不计入截止点。"""
+        deadlines = [
+            handle.timeout_at_monotonic
+            for handle in self._in_flight.active_handles()
+            if not handle.waiting_auth
+        ]
+        if not deadlines:
+            return None
+        return max(0.0, min(deadlines) - time.monotonic())
+
     def step(self, max_dispatch: int | None = None) -> StepOutcome:
         """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。
 
@@ -809,7 +821,10 @@ class EngineRuntime:
         if store.state.is_empty and not self._in_flight:
             return self._terminal_outcome()
 
-        # 1. 填池派发（仅非 DRAINING 状态且未超过单步限制）
+        # 1. 先处理 worker IPC 与结算，避免旧槽位释放抢在授权等待登记前派发。
+        settled_count = self._drain_and_settle()
+
+        # 2. 填池派发（仅非 DRAINING 状态且未超过单步限制）
         limit = max_dispatch if max_dispatch is not None else _UNBOUNDED_DISPATCH_LIMIT
         last_outcome, worker_wait, dispatched = self._fill_dispatch_pool(limit, draining)
 
@@ -818,14 +833,15 @@ class EngineRuntime:
         if dispatched > 0:
             self.governor.record_dispatch_progress()
 
-        # 2. 处理无可运行 job 与死锁判定
+        # 3. 处理无可运行 job 与死锁判定
         arbitration = self._arbitrate_deadlock(last_outcome, store)
-
-        # 3. Drain 回收在途结果并统一结算
-        settled_count = self._drain_and_settle()
 
         # 4. 等待/空闲决策（唯一实现见 wait.decide_wait）
         is_idle = store.state.is_empty and not self._in_flight
+        authorization_wait = any(
+            handle.waiting_auth
+            for handle in self._in_flight.active_handles()
+        )
         decision = decide_wait(LoopFacts(
             stop_mode=self._session.stop_mode, has_in_flight=bool(self._in_flight),
             store_empty=store.state.is_empty, dispatched=dispatched, settled=settled_count,
@@ -833,6 +849,8 @@ class EngineRuntime:
                           if last_outcome is not None else True),
             min_wait=(last_outcome.standstill.min_wait
                       if last_outcome is not None else float("inf")),
+            in_flight_wait=self._next_in_flight_wait(),
+            authorization_wait=authorization_wait,
             worker_wait=worker_wait, deadlock_wait=arbitration.wait_seconds,
             should_terminate=arbitration.should_terminate,
             deadlock_detected=arbitration.deadlock_detected,
@@ -877,12 +895,12 @@ class EngineRuntime:
                 break
             if outcome.should_wait:
                 wait_time = outcome.wait_time
-                if wait_time > 0:
-                    self._wait(wait_time if wait_time != float("inf") else None, last_seq=last_seq)
-                elif bool(self._in_flight):
-                    self._wait(IN_FLIGHT_POLL_SECONDS, last_seq=last_seq)
-                elif store.state.is_empty:
-                    break
+                self._wait(
+                    wait_time if wait_time != float("inf") else None,
+                    last_seq=last_seq,
+                )
+            elif store.state.is_empty and not self._in_flight:
+                break
 
         logger.info(f"Pipeline {self.config.name} finished.")
         self.channel.wait_for_lingering_workers()

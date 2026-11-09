@@ -139,7 +139,6 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
 
     # 此时 j2 需等待 100s。外部提前放行（重设 next_available 并通知唤醒）
     res.next_available = time.monotonic()
-    start_wake = time.monotonic()
     res.notify()
 
     # 主循环应早于 100s（< 2s）被提前唤醒并完成 j2
@@ -147,47 +146,60 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
     while "fast::j2" not in p.backend.load_successes() and time.monotonic() < deadline:
         time.sleep(0.02)
 
-    wake_duration = time.monotonic() - start_wake
     run_thread.join(timeout=5.0)
     assert not run_thread.is_alive()
 
     assert "fast::j2" in p.backend.load_successes()
-    assert wake_duration < 2.0, f"通知必须提前唤醒主循环，实测耗时 {wake_duration}s"
 
 
-def test_long_wait_no_periodic_scanning(tmp_path):
-    """长等待无周期资源扫描：单次计时等待，不进行 1s/0.5s 周期轮询。"""
+def test_long_wait_uses_single_deadline_without_resource_polling(tmp_path):
+    """长等待只安排一次到期检查，不进行固定周期资源扫描。"""
+    class CountingIntervalResource(IntervalResource):
+        def __init__(self) -> None:
+            super().__init__("long_wait", interval_seconds=3600.0)
+            self.queries = 0
+            self.queried = threading.Event()
+
+        def can_acquire(self, amount: float) -> ResourceQueryResult:
+            self.queries += 1
+            self.queried.set()
+            return super().can_acquire(amount)
+
     p = TaskLite(
         backend="memory",
         max_workers=2,
     )
-    res = IntervalResource("long_wait", interval_seconds=3600.0)
+    res = CountingIntervalResource()
     p.register_resource(res)
     res.acquire(1.0)  # 消费时间片使其需等待 3600s
     p.register_task("fast", _fast_handler, resources={"long_wait": 1.0})
     p.enqueue(Job("fast", "j1"))
 
-    # 观察 step() 的调用次数
-    step_calls = 0
-    orig_step = p._runtime.step
+    wait_entered = threading.Event()
+    wait_timeouts: list[float | None] = []
+    original_wait = p._runtime._wait
 
-    def count_step(*args, **kwargs):
-        nonlocal step_calls
-        step_calls += 1
-        return orig_step(*args, **kwargs)
+    def tracked_wait(timeout, last_seq=None):
+        wait_timeouts.append(timeout)
+        wait_entered.set()
+        return original_wait(timeout, last_seq=last_seq)
 
-    p._runtime.step = count_step  # type: ignore[assignment]
+    p._runtime._wait = tracked_wait  # type: ignore[assignment]
 
     run_thread = threading.Thread(target=p.run, kwargs={"install_signals": False})
     run_thread.start()
-
-    # 让主循环运行 0.3s
-    time.sleep(0.3)
-    p.stop()
+    try:
+        assert res.queried.wait(5.0)
+        assert wait_entered.wait(5.0)
+        assert res.queries == 1
+        assert wait_timeouts and wait_timeouts[-1] is not None
+        assert wait_timeouts[-1] > 3000.0
+    finally:
+        p.stop()
     run_thread.join(timeout=5.0)
 
-    # step 仅在初次扫描无可运行候选时调用一次，进入长等待，绝不进行高频周期轮询
-    assert step_calls <= 3, f"长等待期间不得周期轮询，实测 step 次数 {step_calls}"
+    assert not run_thread.is_alive()
+    assert res.queries == 1
 
 
 def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
@@ -218,11 +230,20 @@ def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
     p.register_task("fast", _fast_handler, resources={"ext": 1.0})
     p.enqueue(Job("fast", "j1"))
 
+    wait_entered = threading.Event()
+    original_wait = p._runtime._wait
+
+    def tracked_wait(timeout, last_seq=None):
+        if timeout is None or timeout > 5.0:
+            wait_entered.set()
+        return original_wait(timeout, last_seq=last_seq)
+
+    p._runtime._wait = tracked_wait  # type: ignore[assignment]
     run_thread = threading.Thread(target=p.run, kwargs={"install_signals": False})
     run_thread.start()
 
     # 处于暂不可用且无恢复时间，不能被推断为死锁或失败
-    time.sleep(0.1)
+    assert wait_entered.wait(5.0)
     assert "fast::j1" not in p.backend.load_failed()
 
     # 外部状态就绪并触发通知

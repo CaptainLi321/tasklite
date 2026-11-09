@@ -21,6 +21,7 @@ import os
 import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
@@ -228,6 +229,7 @@ class WorkerPipeReceiver:
         run_id: str | None = None,
         attempt_no: int | None = None,
         max_queued_messages: int = 64,
+        on_message: Callable[[], None] | None = None,
     ) -> None:
         if max_queued_messages < 1:
             raise ValueError("max_queued_messages must be >= 1")
@@ -241,6 +243,7 @@ class WorkerPipeReceiver:
         self._eof = threading.Event()
         self._delivering = False
         self._closed = False
+        self._on_message = on_message
         self._thread = threading.Thread(
             target=self._reader_loop,
             name=f"tasklite-pipe-recv-{execution_id}",
@@ -290,6 +293,11 @@ class WorkerPipeReceiver:
         while not self._stop.is_set():
             try:
                 self._queue.put(item, timeout=0.02)
+                if self._on_message is not None:
+                    try:
+                        self._on_message()
+                    except Exception:
+                        logger.exception("Worker pipe wake-up callback failed")
                 return True
             except queue.Full:
                 if item is _PIPE_EOF:
@@ -423,6 +431,7 @@ def create_worker_pipe(
     run_id: str | None = None,
     attempt_no: int | None = None,
     max_queued_messages: int = 64,
+    on_message: Callable[[], None] | None = None,
 ) -> tuple[WorkerPipeReceiver, WorkerPipeSender]:
     """创建一对绑定的单向 (WorkerPipeReceiver, WorkerPipeSender)。"""
     pipe_fn = getattr(process_context, "Pipe", None)
@@ -436,6 +445,7 @@ def create_worker_pipe(
         run_id=run_id,
         attempt_no=attempt_no,
         max_queued_messages=max_queued_messages,
+        on_message=on_message,
     )
     sender = WorkerPipeSender(
         send_conn,

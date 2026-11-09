@@ -16,6 +16,7 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import threading
 import time
 import traceback
 from collections.abc import Callable, Iterable, Sequence
@@ -543,11 +544,13 @@ class ExecutionChannel:
         self._in_process_senders: dict[str, WorkerPipeSender] = {}
         self._reply_senders: dict[str, WorkerReplySender] = {}
         self._declaration_handler: Callable[[JobHandle, dict[str, Any]], dict[str, Any] | None] | None = None
+        self._wakeup_callback: Callable[[], None] | None = None
         self._handles: dict[str, JobHandle] = {}
         self._results: dict[str, dict[str, Any]] = {}
         self._errors: dict[str, Exception] = {}
         self._pending_signals: list[tuple[str, str, float]] = []
         self._lingering_workers: list[tuple[str, Any, WorkerPipeReceiver | None]] = []
+        self._health_stops: dict[str, threading.Event] = {}
         if self.ipc_dir:
             try:
                 Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
@@ -600,6 +603,7 @@ class ExecutionChannel:
             execution_id=spec.execution_id,
             run_id=spec.run_id or None,
             attempt_no=spec.attempt_no,
+            on_message=self._notify_wakeup,
         )
         reply_receiver, reply_sender = create_worker_reply_pipe(
             self._process_context,
@@ -644,7 +648,32 @@ class ExecutionChannel:
         )
         self._receivers[spec.execution_id] = receiver
         self._handles[spec.execution_id] = handle
+        self._watch_process_health(spec.execution_id, p)
         return handle
+
+    def _watch_process_health(self, execution_id: str, process: Any) -> None:
+        """独立探测 worker 存活，仅在状态变化时唤醒主循环。"""
+        stop = threading.Event()
+        self._health_stops[execution_id] = stop
+
+        def watch() -> None:
+            try:
+                while not stop.wait(0.05):
+                    try:
+                        if not process.is_alive():
+                            self._notify_wakeup()
+                            break
+                    except Exception:
+                        self._notify_wakeup()
+                        break
+            finally:
+                self._health_stops.pop(execution_id, None)
+
+        threading.Thread(
+            target=watch,
+            name=f"tasklite-worker-health-{execution_id}",
+            daemon=True,
+        ).start()
 
     def _accept_message(self, handle: JobHandle, msg: WorkerPipeMessage) -> None:
         """消费一条已校验信封的管道消息并更新通道内存状态。"""
@@ -729,6 +758,15 @@ class ExecutionChannel:
     ) -> None:
         self._declaration_handler = handler
 
+    def set_wakeup_callback(self, callback: Callable[[], None] | None) -> None:
+        """绑定 IPC 消息到达时的主循环唤醒入口。"""
+        self._wakeup_callback = callback
+
+    def _notify_wakeup(self) -> None:
+        callback = self._wakeup_callback
+        if callback is not None:
+            callback()
+
     def terminate_process(self, handle: JobHandle) -> None:
         """终止指定作业的子进程。"""
         p = handle.process
@@ -748,6 +786,9 @@ class ExecutionChannel:
     def _close_handle_pipe(self, execution_id: str | None) -> None:
         if not execution_id:
             return
+        stop = self._health_stops.pop(execution_id, None)
+        if stop is not None:
+            stop.set()
         sender = self._in_process_senders.pop(execution_id, None)
         if sender is not None:
             sender.close()

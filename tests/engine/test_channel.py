@@ -232,16 +232,19 @@ class TestEnvFallbackIpcDirCoherence:
         channel = ExecutionChannel(process_context=fake_process_context)
 
         job = Job("t", "x")
-        handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), None))
+        try:
+            handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), None))
 
-        # 实例属性与 handle 的派发路径同源
-        assert channel.ipc_dir == str(tmp_path), (
-            "env 兜底解析成功后必须回写实例属性（收割路径的事实源）"
-        )
-        assert handle.ipc_dir == str(tmp_path)
+            # 实例属性与 handle 的派发路径同源
+            assert channel.ipc_dir == str(tmp_path), (
+                "env 兜底解析成功后必须回写实例属性（收割路径的事实源）"
+            )
+            assert handle.ipc_dir == str(tmp_path)
 
-        completed = channel.reap_completed([handle])
-        assert [(h.job_uid, r.success) for h, r in completed] == [("t::x", True)]
+            completed = channel.reap_completed([handle])
+            assert [(h.job_uid, r.success) for h, r in completed] == [("t::x", True)]
+        finally:
+            channel.close()
 
 
 class TestSpawnFailureCleanup:
@@ -265,9 +268,12 @@ class TestSpawnFailureCleanup:
             process_context=type("Ctx", (), {"Process": lambda *a, **k: DummyProcess()})()
         )
         job = Job("t", "j1")
-        handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), None))
-        assert handle is not None
-        assert started == [True]
+        try:
+            handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), None))
+            assert handle is not None
+            assert started == [True]
+        finally:
+            channel.close()
 
 
 class TestHandlerInvalidReturnTypes:

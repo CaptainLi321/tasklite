@@ -121,6 +121,112 @@ def _marker_handler(job, ctx):
     return TaskResult.success()
 
 
+def _barrier_then_declare_handler(job, ctx):
+    Path(job.payload["entered"]).write_text("entered", encoding="utf-8")
+    trigger = Path(job.payload["trigger"])
+    deadline = time.monotonic() + 10.0
+    while not trigger.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not trigger.exists():
+        raise RuntimeError("declaration trigger timed out")
+    path = Path(ctx.declare_file(
+        "dynamic",
+        FileSpec(job.payload["path"], role="output", delete_existing=True),
+    ))
+    path.write_text(job.payload["content"], encoding="utf-8")
+    return TaskResult.success()
+
+
+def _wait_for_gate_then_quick_handler(job, ctx):
+    gate = Path(job.payload["gate"])
+    deadline = time.monotonic() + 10.0
+    while not gate.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not gate.exists():
+        raise RuntimeError("quick handler gate timed out")
+    return TaskResult.success(metadata={"quick": True})
+
+
+def test_worker_declaration_wakes_main_loop_wait(tmp_path, monkeypatch, caplog):
+    """主循环等待在途事件时，真实 worker 的动态声明必须立即推进授权与日志。"""
+    monkeypatch.chdir(tmp_path)
+    caplog.set_level("INFO", logger="tasklite")
+    target = tmp_path / "waiting-declare.txt"
+    target.write_text("old", encoding="utf-8")
+    entered = tmp_path / "worker-entered"
+    trigger = tmp_path / "worker-trigger"
+
+    p = TaskLite(
+        backend="sqlite",
+        state_path=tmp_path / "declaration-wake.db",
+        max_workers=1,
+    )
+    authorizer = _ControlledAuthorizer(decision=True)
+    p.authorizer = authorizer
+    p.register_task("declared", _barrier_then_declare_handler)
+    p.register_task("follow", _quick_handler)
+    p.enqueue(Job(
+        "declared",
+        "d1",
+        payload={
+            "entered": str(entered),
+            "trigger": str(trigger),
+            "path": str(target),
+            "content": "new",
+        },
+    ))
+    p.enqueue(Job("follow", "f1"))
+
+    wait_observed = threading.Event()
+    wait_timeouts: list[float | None] = []
+    original_wait = p._runtime._wait
+
+    def tracked_wait(timeout, last_seq=None):
+        wait_timeouts.append(timeout)
+        wait_observed.set()
+        return original_wait(timeout, last_seq=last_seq)
+
+    monkeypatch.setattr(p._runtime, "_wait", tracked_wait)
+    errors: list[BaseException] = []
+
+    def run_pipeline():
+        try:
+            p.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        deadline = time.monotonic() + 10.0
+        while not entered.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert entered.exists()
+        assert wait_observed.wait(10.0), "主循环应已在等待在途完成"
+        trigger.write_text("go", encoding="utf-8")
+        assert authorizer.first_call.wait(10.0)
+        runner.join(timeout=15.0)
+        assert not runner.is_alive()
+        assert errors == []
+    finally:
+        trigger.touch(exist_ok=True)
+        p.stop()
+        runner.join(timeout=5.0)
+
+    assert any(timeout is None or timeout > 5.0 for timeout in wait_timeouts)
+    assert target.read_text(encoding="utf-8") == "new"
+    assert {
+        "declared::d1",
+        "follow::f1",
+    } <= set(p.backend.load_successes())
+    assert any("FILE DECLARATION:" in record.message for record in caplog.records)
+    assert any(
+        "FILE AUTHORIZATION APPROVED:" in record.message
+        for record in caplog.records
+    )
+    p.close()
+
+
 def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
     tmp_path, monkeypatch,
 ):
@@ -129,12 +235,13 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
     target = tmp_path / "pending_auth.txt"
     target.write_text("old", encoding="utf-8")
     third_marker = tmp_path / "third-started"
+    quick_gate = tmp_path / "quick-gate"
 
     p = TaskLite(backend="sqlite", state_path=tmp_path / "t_auth_wait.db", max_workers=2)
     authorizer = _ControlledAuthorizer(decision=None)
     p.authorizer = authorizer
     p.register_task("slow_decl", _declare_then_write_handler)
-    p.register_task("quick", _quick_handler)
+    p.register_task("quick", _wait_for_gate_then_quick_handler)
     p.register_task("third", _marker_handler)
 
     p.enqueue(Job(
@@ -142,7 +249,7 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
         "s1",
         payload={"path": str(target), "content": "updated"},
     ))
-    p.enqueue(Job("quick", "q1"))
+    p.enqueue(Job("quick", "q1", payload={"gate": str(quick_gate)}))
     p.enqueue(Job("third", "t1", payload={"marker": str(third_marker)}))
 
     gate_observed = threading.Event()
@@ -178,6 +285,7 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
     runner.start()
     try:
         assert authorizer.first_call.wait(10.0)
+        quick_gate.write_text("go", encoding="utf-8")
         _wait_for(lambda: "quick::q1" in p.backend.load_successes())
         assert "slow_decl::s1" not in p.backend.load_successes()
         assert not third_marker.exists()
@@ -457,6 +565,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     target = tmp_path / "stopped.txt"
     target.write_text("old data", encoding="utf-8")
     stopped_marker = tmp_path / "stopped-marker"
+    quick_gate = tmp_path / "quick-gate"
 
     p = TaskLite(backend="sqlite", state_path=tmp_path / "stop-auth.db", max_workers=2)
     release_observations: list[tuple[set[str], list[dict]]] = []
@@ -476,7 +585,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     authorizer = _BlockingAuthorizer()
     p.authorizer = authorizer
     p.register_task("waiting", _declare_then_write_handler)
-    p.register_task("quick", _quick_handler)
+    p.register_task("quick", _wait_for_gate_then_quick_handler)
     p.register_task("after_stop", _marker_handler)
     p.enqueue(Job(
         "waiting",
@@ -484,7 +593,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
         payload={"path": str(target), "content": "new data"},
         resources={"slot": 1.0},
     ))
-    p.enqueue(Job("quick", "q1"))
+    p.enqueue(Job("quick", "q1", payload={"gate": str(quick_gate)}))
     p.enqueue(Job(
         "after_stop",
         "a1",
@@ -503,6 +612,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     runner.start()
     try:
         assert authorizer.first_call.wait(10.0)
+        quick_gate.write_text("go", encoding="utf-8")
         _wait_for(
             lambda: any(
                 handle.waiting_auth

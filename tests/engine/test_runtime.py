@@ -12,6 +12,7 @@ from __future__ import annotations
 from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -577,6 +578,10 @@ class TestGracefulDraining:
         def controller():
             # 等 j1 派发进 in-flight（j2 因 max_workers=1 留队）
             assert enter.wait(10)
+            deadline = time.monotonic() + 10.0
+            while not runtime.in_flight and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert runtime.in_flight
             observed["inflight_at_stop"] = len(runtime.in_flight)
             proc = next(iter(runtime.in_flight.values())).handle.process
             runtime.request_stop()  # DRAINING：不 kill
