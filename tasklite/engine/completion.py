@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     from .resource import ResourceManager
     from .store import StateStore
 
-from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from ..exceptions import TaskLiteError, _ArtifactIOError, _CommitCrashSignal, _JobTerminated
 from ..models.job import Job, JobRuntimeState
 from ..models.artifact import ArtifactDeclaration, FileSpec
@@ -644,7 +643,6 @@ class CompletionMachine:
             except BaseException as error:
                 completion_error = completion_error or error
             finally:
-                self._requeue_uncommitted(entry)
                 self._in_flight.settle(handle.job_uid, state=store.state)
         if completion_error is not None:
             raise completion_error
@@ -657,7 +655,7 @@ class CompletionMachine:
     ) -> None:
         """统一结算异常或停机时分类的在飞作业。
 
-        1. 未完成任务：注销在飞并回滚重入队到队首；
+        1. 未完成任务：清理并注销内存在途索引，持久化 running 留待恢复；
         2. 已完成任务：通过 complete_job 事务提交（不重跑、不误杀）；
         3. 彻底清空在飞集合并透传可能的 commit 崩溃信号。
         """
@@ -683,7 +681,6 @@ class CompletionMachine:
                 cleanup_error = cleanup_error or error
             finally:
                 entry.release_resources(self._resources)
-                self._requeue_uncommitted(entry)
                 self._in_flight.settle(entry.job_uid, state=store.state)
 
         for entry, result in done_entries:
@@ -692,21 +689,10 @@ class CompletionMachine:
             except BaseException as error:
                 cleanup_error = cleanup_error or error
             finally:
-                self._requeue_uncommitted(entry)
                 self._in_flight.settle(entry.job_uid, state=store.state)
 
         if cleanup_error is not None:
             raise cleanup_error
-
-    def _requeue_uncommitted(self, entry: InFlightJob) -> None:
-        """只回队尚未提交的原快照，已提交事实不能因尾部清理失败而重跑。"""
-        if self._store.backend.schema_version >= TARGET_SCHEMA_VERSION:
-            # 未提交的执行只保留持久化 running，不能回队自动重跑副作用。
-            return
-        state = self._store.state
-        if entry.job_uid in state.in_flight_uids:
-            state.unregister_in_flight(entry.job_uid)
-            state.requeue_jobs([entry.job_snapshot], front=True)
 
 
 __all__ = [

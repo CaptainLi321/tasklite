@@ -644,6 +644,20 @@ class InMemoryStateBackend(AbstractStateBackend):
             validate_queue_replacement(list(spawned_job_snapshots))
 
         with self._lock:
+            running = next(
+                (item for item in self._queue if job_uid_from_snapshot(item) == job_uid), {}
+            )
+            if (running.get("status"), running.get("run_id"), running.get("attempt_no")) != (
+                "running", run_id, attempt_no,
+            ):
+                raise ValueError(f"Settlement does not match the running execution for {job_uid}")
+            if any(
+                isinstance(attempt, dict) and attempt.get("job_uid") == job_uid
+                and attempt.get("attempt_no") == attempt_no
+                for attempt in self._attempts.values()
+            ):
+                raise ValueError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
+
             new_attempts = dict(self._attempts)
             new_attempt_id = self._attempt_seq
             attempt_outcome = outcome if outcome in ("success", "failure", "retry") else "failure"

@@ -122,7 +122,6 @@ class EngineRuntime:
             channel=self.channel,
             resources=config.resources,
             in_flight=self._in_flight,
-            trigger_registry=config.trigger_registry,
             completion=self._completion,
         )
         self._dispatch = DispatchMachine(
@@ -623,8 +622,7 @@ class EngineRuntime:
             if self._in_flight:
                 draining = True
             else:
-                logger.info("Pipeline drained. Saving queue and exiting.")
-                self._recovery.save_queue_crash_safe()
+                logger.info("Pipeline drained.")
                 return self._terminal_outcome()
 
         self._poll_pending_authorizations()
@@ -711,17 +709,11 @@ class EngineRuntime:
         self._in_flight.clear()
 
     def prepare_run_state(self) -> PipelineState:
-        """加载持久化状态、初始化 run_id 屏障、执行恢复修复并构建内存
-        PipelineState。
-
-        编排层只负责 run 生命周期操作：调度轮复位与 fencing 屏障（run
-        身份是 RunSession 属物，meta 持久化与 channel 同步是横切副作用，
-        不下沉机器以免 session 依赖回流）；装载与修复序列归
-        RecoveryOrchestrator.load_and_repair。
-        """
+        """恢复持久化状态，再登记本次 Run 身份。"""
         self.config.resources.bind_notifier(self._notifier)
         self.scheduler.begin_round()
 
+        state = self._recovery.load_and_recover()
         self._session.run_id = uuid.uuid4().hex
         self._session.dispatch_no = 0
         try:
@@ -730,14 +722,14 @@ class EngineRuntime:
             logger.critical(f"Failed to persist run_id to meta table: {e}")
             raise
 
-        return self._recovery.load_and_repair()
+        return state
 
     def _run_with_crash_net(self) -> None:
         """运行主事件循环与统一异常承重网。"""
         try:
             self.run_loop()
         except BaseException as e:
-            # 单点崩溃网：所有异常同构处理（在途清扫 + 崩溃保队 + 原样上抛）；
+            # 单点崩溃网：所有异常同构处理（在途清扫并原样上抛）；
             # KI 与非 Exception（_JobTerminated / _CommitCrashSignal / SystemExit）
             # 不附 traceback，其余附。
             self._crash_log(e)
@@ -745,11 +737,7 @@ class EngineRuntime:
                 self._recovery.abort_in_flight()
             except BaseException as cleanup_error:
                 logger.error(f"Abort cleanup failed: {cleanup_error}")
-            finally:
-                self._recovery.save_queue_crash_safe()
             raise
-        finally:
-            pass
 
     @staticmethod
     def _crash_log(e: BaseException) -> None:

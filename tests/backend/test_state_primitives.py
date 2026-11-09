@@ -60,6 +60,47 @@ def v6_backend(request, tmp_path) -> AbstractStateBackend:
 class TestStatePrimitivesParity:
     """双后端事务原子性与等价性测试。"""
 
+    @pytest.mark.parametrize(("run_id", "attempt_no"), [("another-run", 1), ("run", 2)])
+    def test_settlement_for_other_execution_is_rejected(self, v6_backend, run_id, attempt_no):
+        uid = "t::parent"
+        v6_backend.enqueue_jobs([_make_job("parent")])
+        v6_backend.mark_job_running(uid, run_id="run", started_at="2026-01-01T00:00:00Z")
+        before = _state_facts(v6_backend)
+        with pytest.raises(ValueError, match="does not match the running execution"):
+            v6_backend.commit_job_settlement(
+                job_uid=uid, outcome="success", run_id=run_id, attempt_no=attempt_no,
+                settled_at="2026-01-01T00:00:01Z", success_metadata={"ok": True},
+                spawned_job_snapshots=[_make_job("child")], cursor_updates={"offset": "new"},
+            )
+        assert _state_facts(v6_backend) == before
+        assert v6_backend.load_settled_attempts(uid) == []
+
+    def test_already_settled_running_execution_is_rejected(self, v6_backend):
+        uid = "t::parent"
+        job = _make_job("parent")
+        started_at = "2026-01-01T00:00:00Z"
+        v6_backend.enqueue_jobs([job])
+        attempt_no = v6_backend.mark_job_running(uid, run_id="run", started_at=started_at)
+        assert v6_backend.commit_job_settlement(
+            job_uid=uid, outcome="retry", run_id="run", attempt_no=attempt_no,
+            settled_at="2026-01-01T00:00:01Z",
+        )
+        # 人工恢复相同 running 行，模拟队列与已结算历史矛盾。
+        v6_backend.save_queue([
+            dict(job, status="running", run_id="run", attempt_no=attempt_no, started_at=started_at),
+        ])
+        before = _state_facts(v6_backend)
+        attempts = v6_backend.load_settled_attempts(uid)
+
+        with pytest.raises(ValueError, match="already settled"):
+            v6_backend.commit_job_settlement(
+                job_uid=uid, outcome="success", run_id="run", attempt_no=attempt_no,
+                settled_at="2026-01-01T00:00:02Z",
+                spawned_job_snapshots=[_make_job("child")], cursor_updates={"offset": "new"},
+            )
+        assert _state_facts(v6_backend) == before
+        assert v6_backend.load_settled_attempts(uid) == attempts
+
     def test_atomic_settlement_failure_leaves_no_partial_state(self, v6_backend):
         b = v6_backend
         # 初始入队

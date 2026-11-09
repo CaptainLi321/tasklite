@@ -524,7 +524,7 @@ class TestSettleReaped:
 class TestSettleAborted:
     """中止分类结算。"""
 
-    def test_cancelled_requeued_done_committed(self, tmp_path):
+    def test_cancelled_not_requeued_done_committed(self, tmp_path):
         env = CompletionEnv(tmp_path)
         j1 = Job("t", "j1")
         e1 = env.track_entry(j1, attempt_id=env.open_attempt(j1))
@@ -535,7 +535,7 @@ class TestSettleAborted:
             cancelled_entries=[e1],
             done_entries=[(e2, ExecutionResult(success=True, result_metadata={}))],
         )
-        assert [jd["job_id"] for jd in env.store.state.queue] == ["j1"]
+        assert not env.store.state.queue
         assert "t::j2" in env.store.state.successes
         assert len(env.in_flight) == 0
         assert env.store.state.in_flight_uids == frozenset()
@@ -693,7 +693,7 @@ def test_cleanup_failure_preserves_original_attempt_and_no_terminal(tmp_path, mo
     assert env.channel.journal.read_artifacts(job.uid) != ()
 
 
-def test_abort_cleanup_failure_requeues_every_original_snapshot(tmp_path, monkeypatch):
+def test_abort_cleanup_failure_unregisters_without_requeue(tmp_path, monkeypatch):
     from tasklite.utils.artifact import ArtifactPathPolicy
     from tasklite.models.artifact import ArtifactDeclaration
 
@@ -712,8 +712,7 @@ def test_abort_cleanup_failure_requeues_every_original_snapshot(tmp_path, monkey
         env.completion.settle_aborted(entries, [])
     assert not env.in_flight
     assert not env.store.state.in_flight_uids
-    assert {job['job_id'] for job in env.store.state.queue} == {'one', 'two'}
-    assert all(job['attempt_no'] == 1 for job in env.store.state.queue)
+    assert not env.store.state.queue
     assert env.resources['__workers__'].used == 0
     assert not env.backend.load_successes()
     assert not env.store.state.failed
@@ -802,7 +801,8 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
             (env.make_handle(second.uid), ExecutionResult(success=True)),
         ])
     assert second.uid in env.backend.load_successes()
-    assert [snapshot['job_id'] for snapshot in env.store.state.queue] == ['first']
+    assert not env.store.state.queue
+    assert env.backend.load_attempts(first.uid)[0].outcome == 'running'
     assert not env.store.state.failed
     assert env.resources['__workers__'].used == 0
     assert not env.in_flight

@@ -485,7 +485,7 @@ class TestRunReentryGuard:
 class TestCrashNet:
     """_run_with_crash_net 统一异常承重网（确定性单测）。"""
 
-    def test_crash_net_aborts_and_saves(self, tmp_path, monkeypatch):
+    def test_crash_net_aborts_and_propagates(self, tmp_path, monkeypatch):
         runtime = RuntimeEnv(tmp_path).runtime
         calls: list[str] = []
 
@@ -496,14 +496,11 @@ class TestCrashNet:
         monkeypatch.setattr(
             runtime._recovery, "abort_in_flight", lambda: calls.append("abort")
         )
-        monkeypatch.setattr(
-            runtime._recovery, "save_queue_crash_safe", lambda: calls.append("save")
-        )
 
         with pytest.raises(RuntimeError, match="loop exploded"):
             runtime._run_with_crash_net()
 
-        assert calls == ["abort", "save"], "承重网必须先在途清扫再崩溃保队"
+        assert calls == ["abort"]
 
     def test_run_id_meta_failure_fails_loud(self, tmp_path, monkeypatch):
         """set_engine_metadata 失败 → execute() 抛异常，而非静默降级为无 fence 运行。"""

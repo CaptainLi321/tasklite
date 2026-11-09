@@ -109,7 +109,6 @@ class DispatchEnv:
             channel=self.channel,
             resources=self.resources,
             in_flight=self.in_flight,
-            trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             completion=self.completion,
         )
         self.tasks = TaskRegistry()

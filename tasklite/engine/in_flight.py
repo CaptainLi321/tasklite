@@ -171,7 +171,7 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
     def classify_aborted(
         self, completed_map: Mapping[str, Any]
     ) -> tuple[list[InFlightJob], list[tuple[InFlightJob, Any]]]:
-        """将当前在途任务分类为（已取消待重入队列表, 已完成待提交列表）。"""
+        """将当前在途任务分类为（已取消列表, 已完成待提交列表）。"""
         cancelled_entries: list[InFlightJob] = []
         done_entries: list[tuple[InFlightJob, Any]] = []
         for entry in self._entries.values():

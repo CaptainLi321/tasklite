@@ -1307,6 +1307,16 @@ class SQLiteStateBackend(AbstractStateBackend):
             with self._get_conn() as conn:
                 conn.execute('BEGIN IMMEDIATE')
 
+                running = conn.execute(
+                    "SELECT status, run_id, attempt_no FROM queue WHERE job_uid = ?", (job_uid,)
+                ).fetchone()
+                if running != ("running", run_id, attempt_no):
+                    raise ValueError(f"Settlement does not match the running execution for {job_uid}")
+                if conn.execute(
+                    "SELECT 1 FROM attempts WHERE job_uid = ? AND attempt_no = ?", (job_uid, attempt_no)
+                ).fetchone():
+                    raise ValueError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
+
                 attempt_outcome = outcome if outcome in ("success", "failure", "retry") else "failure"
                 conn.execute(
                     'INSERT INTO attempts ('
@@ -1405,6 +1415,8 @@ class SQLiteStateBackend(AbstractStateBackend):
             return True
         except (ValueError, TypeError):
             raise
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"Failed to commit settlement for {job_uid} in {self.path.name}: {exc}") from exc
         except Exception as e:
             logger.critical(f"Failed to commit settlement for {job_uid} in {self.path.name}: {e}")
             return False
