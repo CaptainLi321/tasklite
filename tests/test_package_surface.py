@@ -8,11 +8,12 @@
    engine、utils 严禁 import wrappers（分层单向依赖红线）；
 3. contrib 空导出面且不被核心依赖；
 4. GUIDE 代码块中的 tasklite 导入语句逐条可导入——文档承诺的
-   导入路径（如 ``from tasklite import RequeuePlan``）不得漂移。
+   导入路径不得漂移。
 """
 from __future__ import annotations
 
 import ast
+import inspect
 import os
 import pathlib
 import re
@@ -243,6 +244,7 @@ class TestMainSurfaceExports:
     def test_tasklite_facade_no_duplicate_query_or_deleted_methods(self):
         from tasklite import TaskLite
 
+        assert not hasattr(TaskLite, "backend")
         deleted_methods = [
             "list_failures",
             "list_suspensions",
@@ -260,6 +262,32 @@ class TestMainSurfaceExports:
         ]
         for method_name in deleted_methods:
             assert not hasattr(TaskLite, method_name), f"TaskLite 不应暴露已删除方法 {method_name}"
+
+    def test_tasklite_facade_signatures(self):
+        from tasklite import StateSnapshot, TaskLite
+
+        init_params = inspect.signature(TaskLite).parameters
+        assert list(init_params) == [
+            "backend",
+            "state_path",
+            "max_workers",
+            "output_roots",
+        ]
+        assert all(
+            param.kind is inspect.Parameter.KEYWORD_ONLY
+            for param in init_params.values()
+        )
+        assert init_params["backend"].default is inspect.Parameter.empty
+
+        clear_params = inspect.signature(TaskLite.clear_history).parameters
+        assert clear_params["records"].kind is inspect.Parameter.KEYWORD_ONLY
+
+        status_params = inspect.signature(TaskLite.set_job_status).parameters
+        assert status_params["recursive"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert status_params["recursive"].default is inspect.Parameter.empty
+
+        open_params = inspect.signature(StateSnapshot.open).parameters
+        assert list(open_params) == ["source"]
 
 
 class TestGuideImportContract:
@@ -281,8 +309,6 @@ class TestGuideImportContract:
                     assert seg is not None
                     stmts.append(seg)
         assert stmts, "GUIDE.md 代码块未捕获任何 tasklite 导入语句"
-        joined = "\n".join(stmts)
-        assert "RequeuePlan" in joined, "GUIDE.md §5 的 RequeuePlan 导入承诺已漂移"
         for stmt in stmts:
             exec(compile(stmt, "<GUIDE.md>", "exec"), {})
 

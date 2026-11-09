@@ -68,7 +68,7 @@ def main():
         pipeline.enqueue(j2)
         pipeline.run()
 
-        successes = pipeline.backend.load_successes()
+        successes = pipeline._runtime.store.backend.load_successes()
         assert "task_a::job_1" in successes
         assert "task_retry::job_2" in successes
         assert successes["task_a::job_1"]["result"] == "processed_42"

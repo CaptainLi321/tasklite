@@ -601,7 +601,7 @@ def _rt_setup(tmp_path, monkeypatch, name="rt_disc"):
 def _discovery_cursors(pipeline):
     return {
         key: value
-        for key, value in pipeline.backend.load_cursors().items()
+        for key, value in pipeline._runtime.store.backend.load_cursors().items()
         if key.startswith(SEEN_PREFIX)
     }
 
@@ -627,7 +627,7 @@ def test_real_subprocess_discovery(tmp_path, monkeypatch):
     )
     pipeline.run()
 
-    successes = pipeline.backend.load_successes()
+    successes = pipeline._runtime.store.backend.load_successes()
     child_uids = sorted(k for k in successes if k.startswith("rt_child::"))
     assert len(child_uids) == 5
     assert all(u.startswith("rt_child::4%253Art_1") for u in child_uids)
@@ -671,7 +671,7 @@ def test_real_subprocess_rediscovery(tmp_path, monkeypatch):
     )
     pipeline.run()
 
-    successes = pipeline.backend.load_successes()
+    successes = pipeline._runtime.store.backend.load_successes()
     child_uids = sorted(k for k in successes if k.startswith("rt_child::"))
     assert len(child_uids) == 6
     assert any(u.startswith("rt_child::4%253Art_210") for u in child_uids)
@@ -706,10 +706,10 @@ def test_real_subprocess_max_pages(tmp_path, monkeypatch):
     )
     pipeline.run()
 
-    successes = pipeline.backend.load_successes()
+    successes = pipeline._runtime.store.backend.load_successes()
     child_uids = [k for k in successes if k.startswith("rt_child::")]
     assert len(child_uids) == PAGESIZE_RT * 2
-    assert not pipeline.backend.load_failed()
+    assert not pipeline._runtime.store.backend.load_failed()
     seen = json.loads(next(iter(_discovery_cursors(pipeline).values())))["seen"]
     assert len(seen) == PAGESIZE_RT * 2
 
@@ -746,7 +746,7 @@ def test_real_subprocess_full_mode_with_max_pages(tmp_path, monkeypatch):
     )
     pipeline.run()
 
-    successes = pipeline.backend.load_successes()
+    successes = pipeline._runtime.store.backend.load_successes()
     child_uids = [k for k in successes if k.startswith("rt_child::")]
     assert sorted(child_uids) == ["rt_child::95", "rt_child::96"]
     assert "rt_child::98" not in successes
@@ -793,7 +793,7 @@ def test_payload_dynamic_override_scan_mode_and_max_pages(tmp_path, monkeypatch)
     )
     pipeline.run()
 
-    successes = pipeline.backend.load_successes()
+    successes = pipeline._runtime.store.backend.load_successes()
     assert "rt_child::48" in successes
     assert "rt_child::47" in successes
     assert "rt_child::46" not in successes
@@ -834,13 +834,13 @@ def test_bad_child_fails_parent_without_partial_publish(tmp_path, monkeypatch):
     )
     pipeline.run()
 
-    successes = pipeline.backend.load_successes()
+    successes = pipeline._runtime.store.backend.load_successes()
     assert "rt_disc_bad::seed_bad" not in successes
-    failed = pipeline.backend.load_failed()
+    failed = pipeline._runtime.store.backend.load_failed()
     assert "rt_disc_bad::seed_bad" in failed
     assert "Invalid spawned job" in failed["rt_disc_bad::seed_bad"]["error_message"]
 
-    queue = pipeline.backend.load_queue()
+    queue = pipeline._runtime.store.backend.load_queue()
     assert [row for row in queue if row["task_type"] == "rt_child"] == []
     assert [key for key in successes if key.startswith("rt_child::")] == []
     assert _discovery_cursors(pipeline) == {}

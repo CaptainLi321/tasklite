@@ -134,7 +134,7 @@ def test_stop_when_idle_is_noop_and_idempotent(tmp_path):
 
     # 后续 run 正常执行完毕
     p.run()
-    assert "t::j1" in p.backend.load_successes()
+    assert "t::j1" in p._runtime.store.backend.load_successes()
 
 
 def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
@@ -169,9 +169,9 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
     t.join(timeout=5.0)
 
     # 第 1 次 Run 结束：因 stop() 停止新派发，且单次 retry 在预算内（1 <= 1），保持 pending
-    assert "t_retry::j1" not in p.backend.load_successes()
-    assert len(p.backend.load_failed()) == 0
-    assert any(jd["job_id"] == "j1" for jd in p.backend.load_queue())
+    assert "t_retry::j1" not in p._runtime.store.backend.load_successes()
+    assert len(p._runtime.store.backend.load_failed()) == 0
+    assert any(jd["job_id"] == "j1" for jd in p._runtime.store.backend.load_queue())
     assert _TRIGGER_CALLS[0] == 1
 
     # 第 2 次 Run：新 Run 重新评估 Trigger，且重试预算重置
@@ -183,7 +183,7 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
     p.run()
     assert _TRIGGER_CALLS[0] == 2
     # 预算耗尽后转为失败档案
-    failures = p.backend.load_failed()
+    failures = p._runtime.store.backend.load_failed()
     assert len(failures) == 1
     assert "t_retry::j1" in failures
 
@@ -218,13 +218,13 @@ def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
     # t_fail::j_fail 失败
     # t_downstream::j_down 级联失败
     # t_other::j_other 未派发（因为 max_workers=1 且收到 stop），保持 pending
-    failures = p.backend.load_failed()
+    failures = p._runtime.store.backend.load_failed()
     assert "t_fail::j_fail" in failures
     assert "t_downstream::j_down" in failures
 
-    queue = [jd["job_id"] for jd in p.backend.load_queue()]
+    queue = [jd["job_id"] for jd in p._runtime.store.backend.load_queue()]
     assert "j_other" in queue
-    assert "t_other::j_other" not in p.backend.load_successes()
+    assert "t_other::j_other" not in p._runtime.store.backend.load_successes()
     assert "t_other::j_other" not in failures
 
 
@@ -285,9 +285,9 @@ def test_run_waits_for_settled_worker_process_exit(tmp_path):
     runner = threading.Thread(target=run_pipeline)
     runner.start()
     deadline = time.monotonic() + 10.0
-    while "lingering::j1" not in p.backend.load_successes() and time.monotonic() < deadline:
+    while "lingering::j1" not in p._runtime.store.backend.load_successes() and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert "lingering::j1" in p.backend.load_successes()
+    assert "lingering::j1" in p._runtime.store.backend.load_successes()
     assert not finished.is_set(), "有效结果已结算，但 Run 必须等待 worker 进程退出"
 
     release_path.write_text("release", encoding="utf-8")
@@ -495,7 +495,7 @@ def test_install_signals_in_child_thread_fails_loud_and_false_succeeds(tmp_path)
     t2.join(timeout=5.0)
 
     assert success_captured[0] is True
-    assert "t::j1" in p.backend.load_successes()
+    assert "t::j1" in p._runtime.store.backend.load_successes()
 
 
 def test_main_thread_install_signals_restores_original_handler(tmp_path):

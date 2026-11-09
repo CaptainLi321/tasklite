@@ -20,6 +20,7 @@ from tasklite import (
     FileSpec,
     Job,
     TaskLite,
+    TaskLiteError,
     TaskResult,
 )
 from tasklite.resource import CapacityResource
@@ -218,7 +219,7 @@ def test_worker_declaration_wakes_main_loop_wait(tmp_path, monkeypatch, caplog):
     assert {
         "declared::d1",
         "follow::f1",
-    } <= set(p.backend.load_successes())
+    } <= set(p._runtime.store.backend.load_successes())
     assert any("FILE DECLARATION:" in record.message for record in caplog.records)
     assert any(
         "FILE AUTHORIZATION APPROVED:" in record.message
@@ -286,8 +287,8 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
     try:
         assert authorizer.first_call.wait(10.0)
         quick_gate.write_text("go", encoding="utf-8")
-        _wait_for(lambda: "quick::q1" in p.backend.load_successes())
-        assert "slow_decl::s1" not in p.backend.load_successes()
+        _wait_for(lambda: "quick::q1" in p._runtime.store.backend.load_successes())
+        assert "slow_decl::s1" not in p._runtime.store.backend.load_successes()
         assert not third_marker.exists()
         assert any(handle.waiting_auth for handle in p._runtime.in_flight.active_handles())
         gate_observed.clear()
@@ -302,7 +303,7 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
         p.stop()
         runner.join(timeout=5.0)
 
-    assert set(p.backend.load_successes()) == {
+    assert set(p._runtime.store.backend.load_successes()) == {
         "slow_decl::s1",
         "quick::q1",
         "third::t1",
@@ -379,7 +380,7 @@ def test_authorization_wait_does_not_consume_execution_timeout(tmp_path, monkeyp
         p.stop()
         runner.join(timeout=5.0)
 
-    assert "work::one" in p.backend.load_successes()
+    assert "work::one" in p._runtime.store.backend.load_successes()
     assert target.read_text(encoding="utf-8") == "updated"
     p.close()
 
@@ -401,7 +402,7 @@ def test_directory_authorization_reusable_and_subpath_revocation(tmp_path, monke
 
     # 尚未授权时拒绝
     p.run()
-    assert "dir_task::d1" not in p.backend.load_successes()
+    assert "dir_task::d1" not in p._runtime.store.backend.load_successes()
 
     # 记录目录授权
     p._runtime.store.record_authorization(dir_path, "directory")
@@ -418,7 +419,7 @@ def test_directory_authorization_reusable_and_subpath_revocation(tmp_path, monke
 
     # 3. 运行：目录授权可复用，子路径声明执行成功
     reopened.run()
-    assert "dir_task::d1" in reopened.backend.load_successes()
+    assert "dir_task::d1" in reopened._runtime.store.backend.load_successes()
 
     # 4. 精确撤销父目录授权，子路径不再被授权
     assert reopened.revoke_authorization(dir_path) is True
@@ -440,10 +441,10 @@ def test_cleanup_failure_vs_authorization_denial_destinations(tmp_path, monkeypa
         p.run()
 
     # 清理错误落入 failed 档案
-    failed = p.backend.load_failed()
+    failed = p._runtime.store.backend.load_failed()
     assert "clean_task::c1" in failed
     assert "Success cleanup failed" in failed["clean_task::c1"].get("error_message", "")
-    assert "clean_task::c1" not in p.backend.load_successes()
+    assert "clean_task::c1" not in p._runtime.store.backend.load_successes()
 
 
 @pytest.mark.parametrize("deferred", [False, True], ids=["immediate", "after-wait"])
@@ -512,11 +513,11 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
         runner.join(timeout=5.0)
 
     assert target.read_text(encoding="utf-8") == "old data"
-    assert "independent::i1" in p.backend.load_successes()
-    assert set(p.backend.load_failed()) == set()
+    assert "independent::i1" in p._runtime.store.backend.load_successes()
+    assert set(p._runtime.store.backend.load_failed()) == set()
     pending_uids = {
         row["job_uid"]
-        for row in p.backend.load_queue_jobs(status="pending")
+        for row in p._runtime.store.backend.load_queue_jobs(status="pending")
     }
     assert {"target_task::t1", "middle::m1", "leaf::l1"} <= pending_uids
     assert {
@@ -528,10 +529,10 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
         "target_task::t1",
         "middle::m1",
         "leaf::l1",
-    } <= set(p.backend.load_successes())
-    assert p.backend.load_settled_attempts("middle::m1") == []
-    assert p.backend.load_settled_attempts("leaf::l1") == []
-    attempt, = p.backend.load_settled_attempts("target_task::t1")
+    } <= set(p._runtime.store.backend.load_successes())
+    assert p._runtime.store.backend.load_settled_attempts("middle::m1") == []
+    assert p._runtime.store.backend.load_settled_attempts("leaf::l1") == []
+    attempt, = p._runtime.store.backend.load_settled_attempts("target_task::t1")
     assert attempt["outcome"] == "failure"
     assert "authorization denied for" in attempt["error_message"]
     assert attempt["result"]["annotations"]["authorization_status"] == "denied"
@@ -549,8 +550,8 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
         "target_task::t1",
         "middle::m1",
         "leaf::l1",
-    } <= set(reopened.backend.load_successes())
-    attempts = reopened.backend.load_settled_attempts("target_task::t1")
+    } <= set(reopened._runtime.store.backend.load_successes())
+    attempts = reopened._runtime.store.backend.load_settled_attempts("target_task::t1")
     assert [record["outcome"] for record in attempts] == ["failure", "success"]
     assert target.read_text(encoding="utf-8") == "new data"
     reopened.close()
@@ -575,9 +576,9 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
             release_observations.append((
                 {
                     row["job_uid"]
-                    for row in p.backend.load_queue_jobs(status="running")
+                    for row in p._runtime.store.backend.load_queue_jobs(status="running")
                 },
-                p.backend.load_settled_attempts("waiting::w1"),
+                p._runtime.store.backend.load_settled_attempts("waiting::w1"),
             ))
             super().release(amount)
 
@@ -620,7 +621,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
             )
         )
         p.stop()
-        running = p.backend.load_queue_jobs(status="running")
+        running = p._runtime.store.backend.load_queue_jobs(status="running")
         assert "waiting::w1" in {row["job_uid"] for row in running}
         authorizer.release.set()
         runner.join(timeout=20.0)
@@ -632,9 +633,9 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
         runner.join(timeout=5.0)
 
     assert target.read_text(encoding="utf-8") == "old data"
-    assert p.backend.load_failed() == {}
-    assert p.backend.load_queue_jobs(status="pending")[0]["job_uid"] == "waiting::w1"
-    attempt, = p.backend.load_settled_attempts("waiting::w1")
+    assert p._runtime.store.backend.load_failed() == {}
+    assert p._runtime.store.backend.load_queue_jobs(status="pending")[0]["job_uid"] == "waiting::w1"
+    attempt, = p._runtime.store.backend.load_settled_attempts("waiting::w1")
     assert attempt["outcome"] == "failure"
     assert "authorization wait stopped for" in attempt["error_message"]
     assert attempt["result"]["annotations"]["authorization_status"] == "stopped"
@@ -648,14 +649,14 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     assert not stopped_marker.exists()
     pending_uids = {
         row["job_uid"]
-        for row in p.backend.load_queue_jobs(status="pending")
+        for row in p._runtime.store.backend.load_queue_jobs(status="pending")
     }
     assert {"waiting::w1", "after_stop::a1"} <= pending_uids
 
     authorizer.decision = True
     p.run(install_signals=False)
-    assert "waiting::w1" in p.backend.load_successes()
-    assert "after_stop::a1" in p.backend.load_successes()
+    assert "waiting::w1" in p._runtime.store.backend.load_successes()
+    assert "after_stop::a1" in p._runtime.store.backend.load_successes()
     assert stopped_marker.exists()
     assert target.read_text(encoding="utf-8") == "new data"
     p.close()
@@ -687,9 +688,9 @@ def test_auto_approve_does_not_authorize_out_of_root_dynamic_target(
 
     assert target.read_text(encoding="utf-8") == "valuable"
     assert p.list_authorizations() == []
-    failure = p.backend.load_failed()["work::one"]
+    failure = p._runtime.store.backend.load_failed()["work::one"]
     assert "outside output roots" in failure["error_message"]
-    attempt, = p.backend.load_settled_attempts("work::one")
+    attempt, = p._runtime.store.backend.load_settled_attempts("work::one")
     assert attempt["outcome"] == "failure"
     assert "work::one" not in p._runtime._temporary_excluded_uids
     p.close()
@@ -746,10 +747,10 @@ def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
     assert target.is_symlink()
     assert target.resolve() == state_path.resolve()
     assert p.list_authorizations() == []
-    assert p.backend.load_successes() == {}
-    failure = p.backend.load_failed()["work::one"]
+    assert p._runtime.store.backend.load_successes() == {}
+    failure = p._runtime.store.backend.load_failed()["work::one"]
     assert "symlink" in failure["error_message"]
-    attempt, = p.backend.load_settled_attempts("work::one")
+    attempt, = p._runtime.store.backend.load_settled_attempts("work::one")
     assert attempt["outcome"] == "failure"
     assert "work::one" not in p._runtime._temporary_excluded_uids
     p.close()
@@ -770,7 +771,7 @@ def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path,
     p.run()
 
     # 1. 实际请求路径被自动同意并持久记录
-    assert "good_task::g1" in p.backend.load_successes()
+    assert "good_task::g1" in p._runtime.store.backend.load_successes()
     auths = p.list_authorizations()
     expected_path = str((tmp_path / "my_out.txt").resolve())
     assert any(
@@ -793,13 +794,13 @@ def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path,
     )
     reopened.enqueue(Job("good_task", "g2"))
     reopened.run()
-    assert "good_task::g2" in reopened.backend.load_successes()
+    assert "good_task::g2" in reopened._runtime.store.backend.load_successes()
 
     # 3. 保护路径（例如 state 数据库文件）即使自动同意也严禁授权
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
     reopened.enqueue(Job("bad_task", "b1"))
     reopened.run()
-    assert "bad_task::b1" not in reopened.backend.load_successes()
+    assert "bad_task::b1" not in reopened._runtime.store.backend.load_successes()
     assert not reopened._runtime.store.is_path_authorized(state_path)
     reopened.close()
 
@@ -830,10 +831,10 @@ def test_list_and_revoke_authorizations_surface_and_run_guard(tmp_path, monkeypa
     assert p.revoke_authorization(f1) is False
     assert p.list_authorizations() == []
 
-    # 4. Run 运行期守卫：运行中调用 list/revoke 抛 RuntimeError
+    # 4. Run 运行期守卫：运行中调用 list/revoke 明确拒绝
     with patch.object(type(p), "is_running", new_callable=lambda: property(lambda self: True)):
-        with pytest.raises(RuntimeError, match="is only allowed outside run"):
+        with pytest.raises(TaskLiteError, match="is only allowed outside run"):
             p.list_authorizations()
 
-        with pytest.raises(RuntimeError, match="is only allowed outside run"):
+        with pytest.raises(TaskLiteError, match="is only allowed outside run"):
             p.revoke_authorization("foo.txt")

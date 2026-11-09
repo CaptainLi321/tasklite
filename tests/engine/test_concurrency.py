@@ -276,13 +276,13 @@ def test_dependency_chain_under_concurrency(tmp_state_dir):
     pipeline.enqueue(Job("fast", "C", depends_on=["fast::B"]))
     pipeline.run()
 
-    successes = pipeline.backend.load_successes()
+    successes = pipeline._runtime.store.backend.load_successes()
     assert "fast::A" in successes
     assert "fast::B" in successes
     assert "fast::C" in successes
 
     traces = {
-        uid: pipeline.backend.load_attempts(uid)[0]
+        uid: pipeline._runtime.store.backend.load_attempts(uid)[0]
         for uid in ("fast::A", "fast::B", "fast::C")
     }
     assert traces["fast::A"].finished_at <= traces["fast::B"].started_at, (

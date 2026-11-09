@@ -114,7 +114,7 @@ def _uids(rows) -> list[str]:
 
 
 def _queued(pipeline: TaskLite) -> list[str]:
-    return _uids(pipeline.backend.load_queue())
+    return _uids(pipeline._runtime.store.backend.load_queue())
 
 
 # ── 默认全执行 / Exclude 延迟语义 ─────────────────────────────────────
@@ -128,7 +128,7 @@ def test_default_and_none_exclude_execute_everything(fake_process, tmp_path):
     pipeline.enqueue(Job("convert", "b"))
 
     pipeline.run(exclude=None)
-    assert sorted(pipeline.backend.load_successes()) == ["convert::b", "fetch::a"]
+    assert sorted(pipeline._runtime.store.backend.load_successes()) == ["convert::b", "fetch::a"]
     assert _queued(pipeline) == []
 
 
@@ -144,22 +144,22 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     pipeline.enqueue(Job("fetch", "a"))
     pipeline.enqueue(Job("convert", "b"))
     pipeline.enqueue(Job("rank", "r", depends_on=["convert::b"]))
-    before = {uid: row for uid, row in zip(_queued(pipeline), pipeline.backend.load_queue())}
+    before = {uid: row for uid, row in zip(_queued(pipeline), pipeline._runtime.store.backend.load_queue())}
 
     pipeline.run(exclude=Exclude(task_type="convert"))
 
-    assert sorted(pipeline.backend.load_successes()) == ["fetch::a"]
-    assert pipeline.backend.load_failed() == {}
+    assert sorted(pipeline._runtime.store.backend.load_successes()) == ["fetch::a"]
+    assert pipeline._runtime.store.backend.load_failed() == {}
     assert _queued(pipeline) == ["convert::b", "rank::r"]
-    kept = {uid: row for uid, row in zip(_queued(pipeline), pipeline.backend.load_queue())}
+    kept = {uid: row for uid, row in zip(_queued(pipeline), pipeline._runtime.store.backend.load_queue())}
     assert kept == {uid: before[uid] for uid in ("convert::b", "rank::r")}
-    attempts = pipeline.backend.load_attempts
+    attempts = pipeline._runtime.store.backend.load_attempts
     assert [attempts("convert::b"), attempts("rank::r")] == [[], []]
     assert seen == ["fetch::a"]
 
     # 下一次 run（不带 Exclude）自动恢复：留队下游全链执行完成
     pipeline.run()
-    assert sorted(pipeline.backend.load_successes()) == [
+    assert sorted(pipeline._runtime.store.backend.load_successes()) == [
         "convert::b",
         "fetch::a",
         "rank::r",
@@ -175,11 +175,11 @@ def test_only_excluded_jobs_finish_completed_without_failures(fake_process, tmp_
 
     pipeline.run(exclude=Exclude(task_type="convert"))
 
-    assert pipeline.backend.load_successes() == {}
-    assert pipeline.backend.load_failed() == {}
+    assert pipeline._runtime.store.backend.load_successes() == {}
+    assert pipeline._runtime.store.backend.load_failed() == {}
     assert sorted(_queued(pipeline)) == ["convert::a", "convert::b", "convert::c"]
     assert pipeline.run() is None
-    assert sorted(pipeline.backend.load_successes()) == [
+    assert sorted(pipeline._runtime.store.backend.load_successes()) == [
         "convert::a",
         "convert::b",
         "convert::c",
@@ -221,7 +221,7 @@ def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
 
     pipeline.run(exclude=Exclude(task_type="heavy"))
 
-    assert len(pipeline.backend.load_successes()) == 1
+    assert len(pipeline._runtime.store.backend.load_successes()) == 1
     assert gpu.acquires == 0 and gpu.used == 0.0
     assert _queued(pipeline) == ["heavy::h"]
 
@@ -245,7 +245,7 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
 
     pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
-    failed = pipeline.backend.load_failed()
+    failed = pipeline._runtime.store.backend.load_failed()
     assert sorted(failed) == ["rank::b", "rank::c"]
     assert all(ERR_DEPENDENCY_DEADLOCK in meta["error_message"] for meta in failed.values())
     # 被排除作业不被环归因波及，原样留队
@@ -268,7 +268,7 @@ def test_exclude_downstream_purged_dependency_is_failed(fake_process, tmp_path):
 
     pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
-    failed = pipeline.backend.load_failed()
+    failed = pipeline._runtime.store.backend.load_failed()
     assert list(failed) == ["rank::b"]
     assert failed["rank::b"]["missing_dependency"] == "ghost_task::x"
     assert _queued(pipeline) == ["excluded_t::a"]
@@ -294,7 +294,7 @@ def test_exclude_downstream_blocks_completes_without_busy_spin(fake_process, tmp
     assert not worker.is_alive(), "Exclude 下游停摆导致 run() 挂死（忙旋）"
 
     assert outcome["res"] is None
-    assert pipeline.backend.load_failed() == {}
+    assert pipeline._runtime.store.backend.load_failed() == {}
     assert _queued(pipeline) == ["excluded_t::a", "rank::b", "rank::c"]
 
 
@@ -304,7 +304,7 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("rank", ok_handler)
     # 畸形行（缺 job_id）带被排除 task_type：不得被选择豁免，仍走 MALFORMED_JOB
-    pipeline.backend.save_queue(
+    pipeline._runtime.store.backend.save_queue(
         [{"task_type": "excluded_t"}, Job("rank", "ok").to_dict()]
     )
     outcome: dict = {}
@@ -318,13 +318,13 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     assert not worker.is_alive()
 
     assert outcome["res"] is None
-    assert sorted(pipeline.backend.load_successes()) == ["rank::ok"]
-    failures = pipeline.backend.load_failed()
+    assert sorted(pipeline._runtime.store.backend.load_successes()) == ["rank::ok"]
+    failures = pipeline._runtime.store.backend.load_failed()
     assert len(failures) == 1
     (failed_uid, fail_meta), = failures.items()
     assert failed_uid.startswith("_unknown::")
     assert fail_meta["error_message"] == ERR_MALFORMED_JOB
-    assert pipeline.backend.load_queue() == []
+    assert pipeline._runtime.store.backend.load_queue() == []
 
 
 # ── 动态派生与排除 ───────────────────────────────────────────────────
@@ -340,10 +340,10 @@ def test_spawned_excluded_child_stays_queued(monkeypatch, tmp_path):
 
     pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
-    assert sorted(pipeline.backend.load_successes()) == ["fetch::parent"]
-    assert pipeline.backend.load_failed() == {}
+    assert sorted(pipeline._runtime.store.backend.load_successes()) == ["fetch::parent"]
+    assert pipeline._runtime.store.backend.load_failed() == {}
     assert _queued(pipeline) == ["excluded_t::child"]
-    assert pipeline.backend.load_attempts("excluded_t::child") == []
+    assert pipeline._runtime.store.backend.load_attempts("excluded_t::child") == []
 
 
 def test_failed_parent_cascade_keeps_excluded_downstream(monkeypatch, tmp_path):
@@ -358,9 +358,9 @@ def test_failed_parent_cascade_keeps_excluded_downstream(monkeypatch, tmp_path):
 
     pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
-    assert sorted(pipeline.backend.load_failed()) == ["fetch::parent"]
+    assert sorted(pipeline._runtime.store.backend.load_failed()) == ["fetch::parent"]
     assert sorted(_queued(pipeline)) == ["downstream::grand", "excluded_t::child"]
-    assert pipeline.backend.load_attempts("excluded_t::child") == []
+    assert pipeline._runtime.store.backend.load_attempts("excluded_t::child") == []
 
 
 # ── 必须验收项：依赖闭合、遮蔽与 UID 重用成环 ───────────────────────
@@ -437,7 +437,7 @@ def test_upstream_only_failure_skipped_by_trigger_fails_downstream(fake_process,
     pipeline.enqueue(Job("downstream", "d", depends_on=["upstream::u"]))
     pipeline.run()
 
-    failed = pipeline.backend.load_failed()
+    failed = pipeline._runtime.store.backend.load_failed()
     assert "downstream::d" in failed
     from tasklite.engine.errorclass import ERR_JOB_DEPENDENCY
     assert ERR_JOB_DEPENDENCY in failed["downstream::d"]["error_message"]
@@ -457,7 +457,7 @@ def test_active_excluded_upstream_masks_historical_success(fake_process, tmp_pat
 
     # 历史成功被活跃候选遮蔽，upstream 被排除，downstream 也必须留队，不得偷跑
     assert sorted(_queued(pipeline)) == ["downstream::d", "upstream::u"]
-    assert "downstream::d" not in pipeline.backend.load_successes()
+    assert "downstream::d" not in pipeline._runtime.store.backend.load_successes()
 
 
 def test_uid_reuse_cycle_detection(fake_process, tmp_path):
@@ -468,7 +468,7 @@ def test_uid_reuse_cycle_detection(fake_process, tmp_path):
     # 1. 先入队并运行 A 获得成功
     pipeline.enqueue(Job("step", "a"))
     pipeline.run()
-    assert "step::a" in pipeline.backend.load_successes()
+    assert "step::a" in pipeline._runtime.store.backend.load_successes()
 
     # 2. 入队 B 依赖 A
     pipeline.enqueue(Job("step", "b", depends_on=["step::a"]))
@@ -479,7 +479,7 @@ def test_uid_reuse_cycle_detection(fake_process, tmp_path):
     # 此时队列中 A 依赖 B，B 依赖 A，形成实际拓扑环
     pipeline.run()
 
-    failed = pipeline.backend.load_failed()
+    failed = pipeline._runtime.store.backend.load_failed()
     assert "step::a" in failed
     assert "step::b" in failed
     assert ERR_DEPENDENCY_DEADLOCK in failed["step::a"]["error_message"]
@@ -511,7 +511,7 @@ def test_temporary_exclude_and_check_contract():
 
 def test_selection_machine_kahn_partition(tmp_path):
     """SelectionMachine 仅保留 Exclude 停摆分析。"""
-    backend = _pipeline(tmp_path, name="test").backend
+    backend = _pipeline(tmp_path, name="test")._runtime.store.backend
     store = StateStore(backend)
 
     # 无排除规则

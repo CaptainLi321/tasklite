@@ -27,6 +27,7 @@ from .engine.ops import OpsConsole
 from .engine.resource import CapacityResource, Resource, ResourceManager
 from .engine.runtime import EngineRuntime
 from .engine.types import ExecutionOptions
+from .exceptions import TaskLiteError
 from .models.job import Job, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry
 from .selection import Exclude
@@ -94,9 +95,10 @@ class TaskLite:
         self.base_dir: Path = Path(os.path.abspath(os.getcwd()))
         self.output_roots = self._resolve_output_roots(output_roots)
         self.backend_type: str = backend
+        self._backend_handle: AbstractStateBackend | None = None
 
         try:
-            backend_instance = self._build_backend(backend)
+            self._backend_handle = self._build_backend(backend)
             self.tasks = TaskRegistry()
             from .triggers import BUILTIN_TRIGGER_FUNCTIONS
             self._triggers = TriggerRegistry(
@@ -112,7 +114,7 @@ class TaskLite:
                 output_roots=self.output_roots,
                 protected_roots=((self.state_path,) if self.state_path is not None else ()),
             )
-            self.runtime_config = self._build_run_config(backend_instance)
+            self.runtime_config = self._build_run_config(self._backend_handle)
             self._runtime = EngineRuntime(config=self.runtime_config)
             self._console = OpsConsole(self._runtime.store)
         except BaseException:
@@ -132,10 +134,15 @@ class TaskLite:
                 self._runtime.close()
             except Exception:
                 pass
+        if self._backend_handle is not None:
+            try:
+                self._backend_handle.close()
+            except Exception:
+                pass
 
     def __enter__(self) -> TaskLite:
         if self._closed:
-            raise RuntimeError("Cannot enter context of a closed TaskLite instance.")
+            raise TaskLiteError("Cannot enter context of a closed TaskLite instance.")
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -144,7 +151,7 @@ class TaskLite:
     def close(self) -> None:
         """释放资源且运行期拒绝调用，重复关闭无操作。"""
         if self.is_running:
-            raise RuntimeError("Cannot close TaskLite while run() is in progress.")
+            raise TaskLiteError("Cannot close TaskLite while run() is in progress.")
         if self._closed:
             return
         self._closed = True
@@ -156,6 +163,11 @@ class TaskLite:
         if hasattr(self, "_runtime") and self._runtime is not None:
             try:
                 self._runtime.close()
+            except Exception:
+                pass
+        if self._backend_handle is not None:
+            try:
+                self._backend_handle.close()
             except Exception:
                 pass
 
@@ -225,19 +237,21 @@ class TaskLite:
         """当前管线是否正在执行中。"""
         return self._runtime.is_running
 
-    @property
-    def backend(self) -> AbstractStateBackend:
-        """当前持久化后端（只读派生自 StateStore 锚点）。"""
-        return self._runtime.store.backend
+    def _snapshot_backend(self) -> AbstractStateBackend:
+        """向只读快照提供受控实例桥接，不开放为门面属性。"""
+        backend = self._backend_handle
+        if backend is None:
+            raise RuntimeError("TaskLite backend is unavailable")
+        return backend
 
     def _ensure_active(self, api_name: str) -> None:
         """管理/入队/注册 API 的状态守卫（关闭或运行期间拒绝）。"""
         if self._closed:
-            raise RuntimeError(
+            raise TaskLiteError(
                 f"Cannot call {api_name}() on a closed TaskLite instance."
             )
         if self.is_running:
-            raise RuntimeError(
+            raise TaskLiteError(
                 f"{api_name}() is only allowed outside run(); "
                 f"current run is in progress."
             )
@@ -248,7 +262,7 @@ class TaskLite:
         if self.state_path is not None:
             fd = try_acquire_lock(self.state_path, timeout=0)
             if fd is None:
-                raise RuntimeError(
+                raise TaskLiteError(
                     f"Another run() or management operation is in progress for "
                     f"{self.state_path}; concurrent operations on the same state are forbidden."
                 )
@@ -257,11 +271,11 @@ class TaskLite:
             finally:
                 release_lock(fd)
         else:
-            backend = self.backend
+            backend = self._snapshot_backend()
             if not hasattr(backend, "_exec_lock"):
                 backend._exec_lock = threading.Lock()
             if not backend._exec_lock.acquire(blocking=False):
-                raise RuntimeError(
+                raise TaskLiteError(
                     "Another run() or management operation is in progress; "
                     "concurrent operations on the same state are forbidden."
                 )
@@ -452,7 +466,7 @@ class TaskLite:
         重复调用幂等，无活跃 Run 时无操作，不影响下一次 Run。
         """
         if self._closed:
-            raise RuntimeError("Cannot call stop() on a closed TaskLite instance.")
+            raise TaskLiteError("Cannot call stop() on a closed TaskLite instance.")
         if not self.is_running:
             return
         self._runtime.request_stop()

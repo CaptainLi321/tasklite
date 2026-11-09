@@ -130,7 +130,7 @@ class TestEndToEnd:
         p.stop()
 
         assert res is None
-        meta = p.backend.load_successes()["work::item_alpha"]
+        meta = p._runtime.store.backend.load_successes()["work::item_alpha"]
         # successes 审计键：业务 meta 原样落盘 + 框架审计键（success_count /
         # inputs 规范路径清单 / 归属 run）
         assert meta["touched"] == "item_alpha"
@@ -139,7 +139,7 @@ class TestEndToEnd:
         assert len(meta["inputs"]) == 1
         assert meta["inputs"][0].endswith("source_item_alpha.txt")
 
-        attempts = p.backend.load_attempts("work::item_alpha")
+        attempts = p._runtime.store.backend.load_attempts("work::item_alpha")
         assert len(attempts) == 1
         rec = attempts[0]
         assert rec.outcome == "succeeded"
@@ -156,13 +156,13 @@ class TestEndToEnd:
         p.run()
         p.stop()
 
-        failed = p.backend.load_failed()
+        failed = p._runtime.store.backend.load_failed()
         assert "work::item_beta" in failed
         assert "end-to-end explosion" in failed["work::item_beta"]["error_message"]
         # successes/failed 互斥：失败终态不得残留 successes 行
-        assert "work::item_beta" not in p.backend.load_successes()
+        assert "work::item_beta" not in p._runtime.store.backend.load_successes()
 
-        attempts = p.backend.load_attempts("work::item_beta")
+        attempts = p._runtime.store.backend.load_attempts("work::item_beta")
         assert len(attempts) == 1
         assert attempts[0].outcome == "failed"
         assert attempts[0].error_message is not None
@@ -174,10 +174,10 @@ class TestEndToEnd:
         p.run()
         p.stop()
 
-        meta = p.backend.load_failed()["work::item_gamma"]
+        meta = p._runtime.store.backend.load_failed()["work::item_gamma"]
         assert meta["error_message"] == ERR_MAX_RETRIES
 
-        attempts = p.backend.load_attempts("work::item_gamma")
+        attempts = p._runtime.store.backend.load_attempts("work::item_gamma")
         assert [a.attempt_no for a in attempts] == [1, 2, 3]
         assert [a.outcome for a in attempts] == ["requeued", "requeued", "failed"]
 
@@ -189,8 +189,8 @@ class TestEndToEnd:
         p.stop()
 
         assert res is None
-        assert "work::item_delta" in p.backend.load_successes()
-        attempts = p.backend.load_attempts("work::item_delta")
+        assert "work::item_delta" in p._runtime.store.backend.load_successes()
+        attempts = p._runtime.store.backend.load_attempts("work::item_delta")
         # 同一激活内重试推进：attempt_no 1→2，activation_no 不变
         assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
         assert [a.attempt_no for a in attempts] == [1, 2]
@@ -217,13 +217,13 @@ class TestEndToEnd:
         res = p.run()
         p.stop()
         assert res is None
-        meta = p.backend.load_successes()["work::item_eps"]
+        meta = p._runtime.store.backend.load_successes()["work::item_eps"]
         assert meta["recovered"] is True
         assert meta["success_count"] == 1
 
         # 档案补跑通道：failed 拦截点放行语义——激活代按轨迹最大值 +1
         # 推进、attempt_no 归 1，与 every_run 豁免放行同构
-        attempts = p.backend.load_attempts("work::item_eps")
+        attempts = p._runtime.store.backend.load_attempts("work::item_eps")
         assert [a.outcome for a in attempts] == ["failed", "succeeded"]
         assert [a.attempt_no for a in attempts] == [1, 2]
         # 补跑放行推进 attempt_no
@@ -238,7 +238,7 @@ class TestEndToEnd:
         p.enqueue(Job("work", "item_eta", trigger="always"))
         first = p.run()
         assert first is None
-        assert p.backend.load_successes()["work::item_eta"]["success_count"] == 1
+        assert p._runtime.store.backend.load_successes()["work::item_eta"]["success_count"] == 1
 
         # 第二会话重扫：successes 命中但 every_run 豁免放行 → 新激活重跑，
         # 成功 REPLACE successes 行且 run_count 从对侧终态续数
@@ -247,9 +247,9 @@ class TestEndToEnd:
         p.stop()
 
         assert second is None
-        assert p.backend.load_successes()["work::item_eta"]["success_count"] == 2
+        assert p._runtime.store.backend.load_successes()["work::item_eta"]["success_count"] == 2
 
-        attempts = p.backend.load_attempts("work::item_eta")
+        attempts = p._runtime.store.backend.load_attempts("work::item_eta")
         assert [a.outcome for a in attempts] == ["succeeded", "succeeded"]
         assert [a.attempt_no for a in attempts] == [1, 2]
 
@@ -264,7 +264,7 @@ class TestEndToEnd:
         p.stop()
 
         assert res is None
-        assert sorted(p.backend.load_successes()) == [
+        assert sorted(p._runtime.store.backend.load_successes()) == [
             "work::step_one",
             "work::step_two",
         ]
@@ -285,13 +285,13 @@ class TestRealSubprocessFaultScenarios:
         p.run()
         p.stop()
 
-        failed = p.backend.load_failed()
+        failed = p._runtime.store.backend.load_failed()
         assert "hung::item_watchdog" in failed
         error = failed["hung::item_watchdog"]["error_message"]
         assert error.startswith("TIMEOUT"), f"应归因超时，got: {error}"
-        assert "hung::item_watchdog" not in p.backend.load_successes()
+        assert "hung::item_watchdog" not in p._runtime.store.backend.load_successes()
 
-        attempts = p.backend.load_attempts("hung::item_watchdog")
+        attempts = p._runtime.store.backend.load_attempts("hung::item_watchdog")
         assert [a.outcome for a in attempts] == ["failed"]
         assert attempts[0].error_message is not None and "TIMEOUT" in attempts[0].error_message
 
@@ -311,7 +311,7 @@ class TestRealSubprocessFaultScenarios:
         res = p.run()
         p.stop()
 
-        successes = p.backend.load_successes()
+        successes = p._runtime.store.backend.load_successes()
         assert res is None
         assert "gated::holder" in successes
         assert "gated_plain::waiter" in successes
@@ -324,11 +324,11 @@ class TestRealSubprocessFaultScenarios:
         p.run()
         p.stop()
 
-        failed = p.backend.load_failed()
+        failed = p._runtime.store.backend.load_failed()
         assert "sysexit::item_sysexit" in failed
         error = failed["sysexit::item_sysexit"]["error_message"]
         assert "SystemExit" in error, f"应含 SystemExit 错误信息，got: {error}"
-        assert "sysexit::item_sysexit" not in p.backend.load_successes()
-        attempts = p.backend.load_attempts("sysexit::item_sysexit")
+        assert "sysexit::item_sysexit" not in p._runtime.store.backend.load_successes()
+        attempts = p._runtime.store.backend.load_attempts("sysexit::item_sysexit")
         assert len(attempts) == 1
         assert attempts[0].outcome == "failed"

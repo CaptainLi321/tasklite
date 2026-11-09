@@ -64,13 +64,13 @@ def test_from_output_reference_and_resolution(tmp_path, monkeypatch):
     p.run()
 
     # 1. successes 记录
-    successes = p.backend.load_successes()
+    successes = p._runtime.store.backend.load_successes()
     assert producer_job.uid in successes
     assert consumer_job.uid in successes
     assert successes[consumer_job.uid]["content"] == "hello world"
 
     # 2. 消费者 job 快照保留引用本身，Attempt 记录解析绝对路径
-    attempts = p.backend.load_settled_attempts(consumer_job.uid)
+    attempts = p._runtime.store.backend.load_settled_attempts(consumer_job.uid)
     assert len(attempts) == 1
     attempt = attempts[0]
     expected_path = str((tmp_path / "report.txt").resolve())
@@ -104,7 +104,7 @@ def test_from_output_unpublished_name_fails_immediately(tmp_path, monkeypatch):
     p.enqueue(consumer_job)
     p.run()
 
-    failed = p.backend.load_failed()
+    failed = p._runtime.store.backend.load_failed()
     assert consumer_job.uid in failed
     err_msg = failed[consumer_job.uid].get("error_message", "")
     assert "did not publish output" in err_msg
@@ -137,7 +137,7 @@ def test_from_output_missing_disk_input_fails_immediately(tmp_path, monkeypatch)
     p.enqueue(consumer_job)
     p.run()
 
-    failed = p.backend.load_failed()
+    failed = p._runtime.store.backend.load_failed()
     assert consumer_job.uid in failed
     err_msg = failed[consumer_job.uid].get("error_message", "")
     assert "Missing input file" in err_msg
@@ -173,7 +173,7 @@ def test_duplicate_declaration_idempotent_and_conflict(tmp_path, monkeypatch):
     p.enqueue(Job("idem", "j1"))
     p.run()
 
-    assert "idem::j1" in p.backend.load_successes()
+    assert "idem::j1" in p._runtime.store.backend.load_successes()
 
 
 def _clean_input_handler(job, ctx):
@@ -201,7 +201,7 @@ def test_input_role_cleanup_policies(tmp_path, monkeypatch):
     p.enqueue(Job("clean_task", "c1"))
     p.run()
 
-    assert "clean_task::c1" in p.backend.load_successes()
+    assert "clean_task::c1" in p._runtime.store.backend.load_successes()
     assert not in_file.exists()
 
 
@@ -231,21 +231,21 @@ def test_success_cleanup_failure_blocks_success_spawn_and_cursor(tmp_path, monke
         p.run()
 
     # 必须结算为 failed
-    failed = p.backend.load_failed()
+    failed = p._runtime.store.backend.load_failed()
     assert "fail_clean::fc1" in failed
     err_msg = failed["fail_clean::fc1"].get("error_message", "")
     assert "Success cleanup failed" in err_msg
-    attempts = p.backend.load_settled_attempts("fail_clean::fc1")
+    attempts = p._runtime.store.backend.load_settled_attempts("fail_clean::fc1")
     assert len(attempts) == 1 and attempts[0]["outcome"] == "failure"
     assert attempts[0]["result"]["exception"]["type"] == cleanup_error.__name__
     assert target.read_text(encoding="utf-8") == "data"
 
     # 不发布成功、不入队派生、不写入游标
-    assert "fail_clean::fc1" not in p.backend.load_successes()
-    assert "spawned::s1" not in p.backend.load_successes()
-    assert "spawned::s1" not in p.backend.load_failed()
-    assert p.backend.load_queue_jobs() == []
-    cursors = p.backend.load_cursors()
+    assert "fail_clean::fc1" not in p._runtime.store.backend.load_successes()
+    assert "spawned::s1" not in p._runtime.store.backend.load_successes()
+    assert "spawned::s1" not in p._runtime.store.backend.load_failed()
+    assert p._runtime.store.backend.load_queue_jobs() == []
+    cursors = p._runtime.store.backend.load_cursors()
     assert "cur_key" not in cursors
     assert attempts[0]["files"]["del_file"]["path"] == str(target)
 
@@ -274,7 +274,7 @@ def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch,
     ):
         p.run()
 
-    failed = p.backend.load_failed()
+    failed = p._runtime.store.backend.load_failed()
     assert "failing::f1" in failed
     meta = failed["failing::f1"]
     error_msg = meta.get("error_message", "")
@@ -282,7 +282,7 @@ def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch,
     assert "cleanup failed" in error_msg
     assert meta["exception"]["type"] == "RuntimeError"
     assert meta["cleanup_exception"]["type"] == cleanup_error.__name__
-    attempt, = p.backend.load_settled_attempts("failing::f1")
+    attempt, = p._runtime.store.backend.load_settled_attempts("failing::f1")
     assert attempt["outcome"] == "failure"
     assert attempt["result"]["exception"]["type"] == "RuntimeError"
     assert attempt["result"]["annotations"]["cleanup_exception"]["type"] == cleanup_error.__name__
@@ -322,20 +322,20 @@ def test_authorization_denied_reverts_to_pending_and_excludes_downstream(tmp_pat
     p.run()
 
     # 1. 独立作业正常成功
-    assert "independent::ind1" in p.backend.load_successes()
+    assert "independent::ind1" in p._runtime.store.backend.load_successes()
 
     # 2. 受阻作业不落 failed 档案，回到 pending 队列
-    failed = p.backend.load_failed()
+    failed = p._runtime.store.backend.load_failed()
     assert "protected::p1" not in failed
     assert "downstream::d1" not in failed
 
     # 验证 queue 中 protected::p1 仍为 pending
-    queue_jobs = p.backend.load_queue_jobs()
+    queue_jobs = p._runtime.store.backend.load_queue_jobs()
     pending_uids = [j["job_uid"] for j in queue_jobs if j.get("status") == "pending"]
     assert "protected::p1" in pending_uids
 
     # 下游 d1 在同 Run 内被排除，没有被派发
-    assert "downstream::d1" not in p.backend.load_successes()
+    assert "downstream::d1" not in p._runtime.store.backend.load_successes()
 
 
 def _overlapping_outputs_handler(job, ctx):
@@ -360,12 +360,12 @@ def test_different_output_names_may_share_or_overlap_paths(tmp_path, dynamic, ba
         files.update(alias=FileSpec(root / "report", role="output"), directory=FileSpec(root, role="output"))
     p.enqueue(Job("work", "one", files=files, payload={"root": str(root), "dynamic": dynamic}))
     p.run()
-    assert p.backend.load_successes()["work::one"]["artifacts"] == {
+    assert p._runtime.store.backend.load_successes()["work::one"]["artifacts"] == {
         "report": {"path": str(root / "report")},
         "alias": {"path": str(root / "report")},
         "directory": {"path": str(root)},
     }
-    attempt, = p.backend.load_settled_attempts("work::one")
+    attempt, = p._runtime.store.backend.load_settled_attempts("work::one")
     assert set(attempt["files"]) == {"report", "alias", "directory"}
     p.close()
 
@@ -398,15 +398,15 @@ def test_approved_waiting_declaration_cleanup_error_fails_job(
         side_effect=cleanup_error("清理磁盘拒绝写入"),
     ):
         p.run()
-    failure = p.backend.load_failed()["work::one"]
+    failure = p._runtime.store.backend.load_failed()["work::one"]
     assert "清理磁盘拒绝写入" in failure["error_message"]
-    attempt, = p.backend.load_settled_attempts("work::one")
+    attempt, = p._runtime.store.backend.load_settled_attempts("work::one")
     assert attempt["outcome"] == "failure"
     assert attempt["result"]["exception"]["type"] == cleanup_error.__name__
     assert "remove_existing" in attempt["result"]["exception"]["traceback"]
     assert "清理磁盘拒绝写入" in attempt["error_message"]
     assert attempt["files"]["target"]["path"] == str(target)
-    assert p.backend.load_queue_jobs() == []
+    assert p._runtime.store.backend.load_queue_jobs() == []
     assert target.read_text() == "valuable"
     p.close()
 
@@ -438,15 +438,15 @@ def test_pre_dispatch_cleanup_failure_settles_without_starting_worker(
 
     assert not marker.exists()
     assert target.read_text(encoding="utf-8") == "valuable"
-    failure = p.backend.load_failed()["work::one"]
+    failure = p._runtime.store.backend.load_failed()["work::one"]
     assert "Pre-deletion failed" in failure["error_message"]
     assert failure["exception"]["type"] == cleanup_error.__name__
-    attempt, = p.backend.load_settled_attempts("work::one")
+    attempt, = p._runtime.store.backend.load_settled_attempts("work::one")
     assert attempt["outcome"] == "failure"
     assert attempt["attempt_no"] == 1
     assert attempt["files"]["target"]["path"] == str(target)
-    assert p.backend.load_successes() == {}
-    assert p.backend.load_queue_jobs() == []
+    assert p._runtime.store.backend.load_successes() == {}
+    assert p._runtime.store.backend.load_queue_jobs() == []
     p.close()
 
 
@@ -469,7 +469,7 @@ def test_pre_dispatch_removes_broken_symlink(tmp_path, monkeypatch):
 
     assert marker.exists()
     assert not os.path.lexists(link)
-    assert "work::one" in p.backend.load_successes()
+    assert "work::one" in p._runtime.store.backend.load_successes()
     p.close()
 
 
@@ -491,16 +491,16 @@ def test_mark_running_failure_keeps_file_and_worker_unstarted(tmp_path, monkeypa
         files={"target": FileSpec(target, role="output", delete_existing=True)},
     ))
 
-    with patch.object(p.backend, "mark_job_running", side_effect=OSError("write failed")):
+    with patch.object(p._runtime.store.backend, "mark_job_running", side_effect=OSError("write failed")):
         with pytest.raises(_CommitCrashSignal):
             p.run()
 
     assert not marker.exists()
     assert target.read_text(encoding="utf-8") == "valuable"
-    row, = p.backend.load_queue_jobs()
+    row, = p._runtime.store.backend.load_queue_jobs()
     assert row["job_uid"] == "work::one"
     assert row["status"] == "pending"
-    assert p.backend.load_settled_attempts("work::one") == []
+    assert p._runtime.store.backend.load_settled_attempts("work::one") == []
     assert p.resources["__workers__"].used == 0.0
     p.close()
 
@@ -529,9 +529,9 @@ def test_worker_start_failure_releases_resources_after_running_commit(
     assert not marker.exists()
     assert capacity.used == 0.0
     assert p.resources["__workers__"].used == 0.0
-    row, = p.backend.load_queue_jobs(status="running")
+    row, = p._runtime.store.backend.load_queue_jobs(status="running")
     assert row["job_uid"] == "work::one"
-    assert p.backend.load_settled_attempts("work::one") == []
+    assert p._runtime.store.backend.load_settled_attempts("work::one") == []
     p.close()
 
 
@@ -561,14 +561,14 @@ def test_retry_cleanup_failure_settles_once_without_retry(
     ):
         p.run()
 
-    failure = p.backend.load_failed()["retry::one"]
+    failure = p._runtime.store.backend.load_failed()["retry::one"]
     assert "Retry cleanup failed" in failure["error_message"]
     assert failure["cleanup_original_message"] == "retry requested"
     assert failure["cleanup_exception"]["type"] == cleanup_error.__name__
-    attempt, = p.backend.load_settled_attempts("retry::one")
+    attempt, = p._runtime.store.backend.load_settled_attempts("retry::one")
     assert attempt["outcome"] == "failure"
     assert attempt["files"]["retry_file"]["path"] == str(tmp_path / "retry.txt")
-    assert p.backend.load_queue_jobs() == []
+    assert p._runtime.store.backend.load_queue_jobs() == []
     assert (tmp_path / "retry.txt").read_text(encoding="utf-8") == "retry data"
     p.close()
 
@@ -595,11 +595,11 @@ def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, mo
     def authorize(*args):
         calls.append(args)
         assert resource.used == 0
-        assert p.backend.load_settled_attempts("protected::one") == []
-        row = next(row for row in p.backend.load_queue_jobs() if row["job_uid"] == "protected::one")
+        assert p._runtime.store.backend.load_settled_attempts("protected::one") == []
+        row = next(row for row in p._runtime.store.backend.load_queue_jobs() if row["job_uid"] == "protected::one")
         assert row["status"] == "pending"
-        if len(calls) == 1 or "independent::one" not in p.backend.load_successes():
-            assert "independent::later" not in p.backend.load_successes()
+        if len(calls) == 1 or "independent::one" not in p._runtime.store.backend.load_successes():
+            assert "independent::later" not in p._runtime.store.backend.load_successes()
             monkeypatch.setattr(scheduler, "scan_next_runnable", forbidden_scan)
             return None
         monkeypatch.setattr(scheduler, "scan_next_runnable", scan)
@@ -611,8 +611,8 @@ def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, mo
     p.enqueue(Job("independent", "later"))
     p.run()
     assert len(calls) >= 2
-    assert set(p.backend.load_successes()) == {"independent::one", "protected::one", "independent::later"}
-    attempt, = p.backend.load_settled_attempts("protected::one")
+    assert set(p._runtime.store.backend.load_successes()) == {"independent::one", "protected::one", "independent::later"}
+    attempt, = p._runtime.store.backend.load_settled_attempts("protected::one")
     assert attempt["outcome"] == "success" and attempt["attempt_no"] == 1
     assert not target.exists()
     p.close()
@@ -638,7 +638,7 @@ def test_removed_file_declaration_cannot_delete_without_authorization(tmp_path, 
     p.run()
     assert target.read_text() == "valuable"
     assert calls == []
-    assert "AttributeError" == p.backend.load_failed()["work::one"]["exception"]["type"]
+    assert "AttributeError" == p._runtime.store.backend.load_failed()["work::one"]["exception"]["type"]
     p.close()
 
 
@@ -669,4 +669,4 @@ def test_removed_output_message_cannot_authorize_cleanup(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="unknown worker pipe message kind"):
             p.run()
         assert target.read_text() == "valuable"
-        assert p.backend.load_successes() == {}
+        assert p._runtime.store.backend.load_successes() == {}

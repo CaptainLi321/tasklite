@@ -93,7 +93,7 @@ def test_capacity_two_concurrency_and_third_starts_on_release(tmp_path):
     run_thread.join(timeout=5.0)
     assert not run_thread.is_alive()
 
-    successes = p.backend.load_successes()
+    successes = p._runtime.store.backend.load_successes()
     assert "sync::j1" in successes
     assert "sync::j2" in successes
     assert "sync::j3" in successes
@@ -133,9 +133,9 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
 
     # 等待 j1 完成
     deadline = time.monotonic() + 5.0
-    while "fast::j1" not in p.backend.load_successes() and time.monotonic() < deadline:
+    while "fast::j1" not in p._runtime.store.backend.load_successes() and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert "fast::j1" in p.backend.load_successes()
+    assert "fast::j1" in p._runtime.store.backend.load_successes()
 
     # 此时 j2 需等待 100s。外部提前放行（重设 next_available 并通知唤醒）
     res.next_available = time.monotonic()
@@ -143,13 +143,13 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
 
     # 主循环应早于 100s（< 2s）被提前唤醒并完成 j2
     deadline = time.monotonic() + 5.0
-    while "fast::j2" not in p.backend.load_successes() and time.monotonic() < deadline:
+    while "fast::j2" not in p._runtime.store.backend.load_successes() and time.monotonic() < deadline:
         time.sleep(0.02)
 
     run_thread.join(timeout=5.0)
     assert not run_thread.is_alive()
 
-    assert "fast::j2" in p.backend.load_successes()
+    assert "fast::j2" in p._runtime.store.backend.load_successes()
 
 
 def test_long_wait_uses_single_deadline_without_resource_polling(tmp_path):
@@ -244,18 +244,18 @@ def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
 
     # 处于暂不可用且无恢复时间，不能被推断为死锁或失败
     assert wait_entered.wait(5.0)
-    assert "fast::j1" not in p.backend.load_failed()
+    assert "fast::j1" not in p._runtime.store.backend.load_failed()
 
     # 外部状态就绪并触发通知
     ext_res.ready = True
     ext_res.notify()
 
     deadline = time.monotonic() + 5.0
-    while "fast::j1" not in p.backend.load_successes() and time.monotonic() < deadline:
+    while "fast::j1" not in p._runtime.store.backend.load_successes() and time.monotonic() < deadline:
         time.sleep(0.02)
 
     run_thread.join(timeout=5.0)
-    assert "fast::j1" in p.backend.load_successes()
+    assert "fast::j1" in p._runtime.store.backend.load_successes()
 
 
 def test_impossible_resource_fails_job_without_unexecuted_attempt(tmp_path):
@@ -273,12 +273,12 @@ def test_impossible_resource_fails_job_without_unexecuted_attempt(tmp_path):
 
     p.run(install_signals=False)
 
-    failed = p.backend.load_failed()
+    failed = p._runtime.store.backend.load_failed()
     assert "fast::j1" in failed
     assert "fast::j2" in failed
 
     # 未执行不制造 Attempt
-    attempts = p.backend.load_attempts("fast::j1")
+    attempts = p._runtime.store.backend.load_attempts("fast::j1")
     assert attempts == [], f"明确不可满足的作业不得创建 Attempt 记录，实测: {attempts}"
 
 
@@ -353,16 +353,16 @@ def test_release_prior_to_final_commit_and_no_dispatch_between(tmp_path):
         orig_release(amount)
     cap.release = hooked_release  # type: ignore[assignment]
 
-    orig_commit = p.backend.commit_job_success
-    orig_settle = p.backend.commit_job_settlement
+    orig_commit = p._runtime.store.backend.commit_job_success
+    orig_settle = p._runtime.store.backend.commit_job_settlement
     def hooked_commit(*args, **kwargs):
         events.append("committed")
         return orig_commit(*args, **kwargs)
     def hooked_settle(*args, **kwargs):
         events.append("committed")
         return orig_settle(*args, **kwargs)
-    p.backend.commit_job_success = hooked_commit  # type: ignore[assignment]
-    p.backend.commit_job_settlement = hooked_settle  # type: ignore[assignment]
+    p._runtime.store.backend.commit_job_success = hooked_commit  # type: ignore[assignment]
+    p._runtime.store.backend.commit_job_settlement = hooked_settle  # type: ignore[assignment]
 
     orig_spawn = p._runtime._dispatch.dispatch_next
     def hooked_dispatch(*args, **kwargs):

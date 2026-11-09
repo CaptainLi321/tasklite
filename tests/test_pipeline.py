@@ -308,6 +308,12 @@ class TestConstruction:
         with pytest.raises(TypeError, match="backend must be"):
             TaskLite(backend=InMemoryStateBackend())  # type: ignore[arg-type]
 
+    def test_backend_object_is_not_public(self, tmp_path):
+        p = make_pipeline(tmp_path)
+        assert not hasattr(TaskLite, "backend")
+        with pytest.raises(AttributeError):
+            getattr(p, "backend")
+
     def test_sqlite_init_failure_wraps_runtime_error(
         self, tmp_path, monkeypatch
     ):
@@ -319,6 +325,66 @@ class TestConstruction:
         monkeypatch.setattr(pipeline_mod, "SQLiteStateBackend", boom)
         with pytest.raises(OSError, match="disk full"):
             TaskLite(backend="sqlite", state_path=tmp_path / "test.db")
+
+    def test_init_failure_after_backend_creation_closes_owned_backend(
+        self, tmp_path, monkeypatch
+    ):
+        import tasklite.pipeline as pipeline_mod
+
+        backend = InMemoryStateBackend()
+        closed: list[bool] = []
+        monkeypatch.setattr(backend, "close", lambda: closed.append(True))
+        monkeypatch.setattr(
+            pipeline_mod,
+            "InMemoryStateBackend",
+            lambda **_kwargs: backend,
+        )
+
+        failure = OSError("runtime wiring failed")
+
+        def fail_runtime(**_kwargs):
+            raise failure
+
+        monkeypatch.setattr(pipeline_mod, "EngineRuntime", fail_runtime)
+        with pytest.raises(OSError) as caught:
+            TaskLite(backend="memory")
+        assert caught.value is failure
+        assert closed == [True]
+
+    def test_close_releases_owned_backend_once(self, tmp_path, monkeypatch):
+        p = make_pipeline(tmp_path)
+        backend = p._snapshot_backend()
+        closed: list[bool] = []
+        monkeypatch.setattr(backend, "close", lambda: closed.append(True))
+
+        p.close()
+        p.close()
+
+        assert closed == [True]
+
+    def test_init_failure_after_backend_creation_preserves_existing_state(
+        self, tmp_path, monkeypatch
+    ):
+        import tasklite.pipeline as pipeline_mod
+
+        db = tmp_path / "existing.db"
+        with TaskLite(backend="sqlite", state_path=db) as first:
+            first.register_task("work", ok_handler)
+            first.enqueue(Job("work", "kept"))
+
+        def fail_runtime(**_kwargs):
+            raise OSError("runtime wiring failed")
+
+        monkeypatch.setattr(pipeline_mod, "EngineRuntime", fail_runtime)
+        with pytest.raises(OSError, match="runtime wiring failed"):
+            TaskLite(backend="sqlite", state_path=db)
+
+        from tasklite.snapshot import StateSnapshot
+
+        with StateSnapshot.open(db) as snapshot:
+            record = snapshot.get_job("work::kept")
+            assert record is not None
+            assert record["status"] == "pending"
 
     def test_max_workers_validation(self, tmp_path):
         for bad in (0, -1, True, "4", 2.5):
@@ -353,31 +419,33 @@ class TestConstruction:
         # close 幂等
         p.close()
         # 关闭后受限调用明确拒绝
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             p.enqueue(Job("fast", "j2"))
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             p.run()
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             p.register_task("fast2", ok_handler)
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             p.register_resource(CapacityResource("res", max_capacity=1.0))
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             p.set_job_status("fast::j1", "succeeded", recursive=False)
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             p.clear_history("fast::j1", records=["successes"])
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             p.set_cursor("key", "val")
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             p.get_cursor("key")
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             p.stop()
+        with pytest.raises(TaskLiteError, match="closed"):
+            p.__enter__()
 
     def test_close_during_run_rejected(self, tmp_path):
         p = TaskLite(backend="memory")
         p.register_task("fast", ok_handler)
         p.enqueue(Job("fast", "j1"))
         with running(p):
-            with pytest.raises(RuntimeError, match="close.*run"):
+            with pytest.raises(TaskLiteError, match="close.*run"):
                 p.close()
 
     def test_state_snapshot_independent_lifecycle(self, tmp_path):
@@ -432,9 +500,9 @@ class TestConstruction:
         try:
             with pytest.raises(RuntimeError, match="Another run.*in progress"):
                 p2.run()
-            with pytest.raises(RuntimeError, match="Another run.*in progress"):
+            with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 p2.set_job_status("t::j1", "succeeded", recursive=False)
-            with pytest.raises(RuntimeError, match="Another run.*in progress"):
+            with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 p2.enqueue(Job("t", "j2"))
             # 只读观察不受阻
             with StateSnapshot.open(db) as snap:
@@ -519,7 +587,7 @@ class TestRegisterTask:
     def test_run_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
         with running(p):
-            with pytest.raises(RuntimeError, match="register_task"):
+            with pytest.raises(TaskLiteError, match="register_task"):
                 p.register_task("fetch", ok_handler)
 
 
@@ -550,7 +618,7 @@ class TestRegisterResource:
     def test_run_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
         with running(p):
-            with pytest.raises(RuntimeError, match="register_resource"):
+            with pytest.raises(TaskLiteError, match="register_resource"):
                 p.register_resource(CapacityResource("gpu", max_capacity=1.0))
 
 
@@ -561,19 +629,19 @@ class TestTaskTriggerDefaults:
         p = make_pipeline(tmp_path)
         p.register_task("discover", ok_handler, trigger="always")
         p.enqueue(Job("discover", "scan"))
-        assert p.backend.load_queue()[0]["trigger"] == "always"
+        assert p._runtime.store.backend.load_queue()[0]["trigger"] == "always"
 
     def test_explicit_trigger_respected(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_task("discover", ok_handler, trigger="always")
         p.enqueue(Job("discover", "scan", trigger="once"))
-        assert p.backend.load_queue()[0]["trigger"] == "once"
+        assert p._runtime.store.backend.load_queue()[0]["trigger"] == "once"
 
     def test_normal_task_defaults_once(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
         p.enqueue(Job("fetch", "a"))
-        assert p.backend.load_queue()[0]["trigger"] == "once"
+        assert p._runtime.store.backend.load_queue()[0]["trigger"] == "once"
 
 
 class TestRegisterTransientExceptionRemoved:
@@ -594,7 +662,7 @@ class TestEnqueue:
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
         assert p.enqueue(Job("fetch", "a")) is True
-        assert len(p.backend.load_queue()) == 1
+        assert len(p._runtime.store.backend.load_queue()) == 1
 
     @pytest.mark.parametrize("backend", ["memory", "sqlite"])
     def test_unregistered_task_is_rejected_without_side_effects(self, tmp_path, backend):
@@ -604,20 +672,20 @@ class TestEnqueue:
             job = Job("missing", "a")
             with pytest.raises(TaskLiteError, match="unknown task_type"):
                 p.enqueue(job)
-            assert p.backend.load_queue() == []
-            assert p.backend.load_successes() == {}
-            assert p.backend.load_failed() == {}
-            assert p.backend.load_attempts(job.uid) == []
+            assert p._runtime.store.backend.load_queue() == []
+            assert p._runtime.store.backend.load_successes() == {}
+            assert p._runtime.store.backend.load_failed() == {}
+            assert p._runtime.store.backend.load_attempts(job.uid) == []
 
             p.register_task("missing", ok_handler)
             assert p.enqueue(job) is True
-            assert [row["job_id"] for row in p.backend.load_queue()] == ["a"]
+            assert [row["job_id"] for row in p._runtime.store.backend.load_queue()] == ["a"]
 
     def test_unavailable_resource_is_allowed_at_submission(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler, resources={"gpu": 1.0})
         assert p.enqueue(Job("fetch", "a")) is True
-        (row,) = p.backend.load_queue()
+        (row,) = p._runtime.store.backend.load_queue()
         assert row["resources"]["gpu"] == 1.0
 
     def test_list_or_non_job_rejected(self, tmp_path):
@@ -654,7 +722,7 @@ class TestEnqueue:
             )
             is False
         )
-        assert len(p.backend.load_queue()) == 1
+        assert len(p._runtime.store.backend.load_queue()) == 1
 
     def test_same_uid_different_effective_config_raises_tasklite_error(self, tmp_path):
         from tasklite import FileSpec, TaskLiteError
@@ -673,7 +741,7 @@ class TestEnqueue:
         ):
             with pytest.raises(TaskLiteError, match="already queued with different effective configuration"):
                 p.enqueue(conflicting_job)
-        assert len(p.backend.load_queue()) == 1
+        assert len(p._runtime.store.backend.load_queue()) == 1
 
     def test_front_argument_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -699,7 +767,7 @@ class TestEnqueue:
         assert job.resources is not None
         job.resources["gpu"] = 77.0
 
-        (row,) = p.backend.load_queue()
+        (row,) = p._runtime.store.backend.load_queue()
         assert row["payload"] == {"nested": {"items": [1, 2]}}
         assert row["resources"] == {"cpu": 2.0, "gpu": 1.0, "__workers__": 1.0}
 
@@ -730,7 +798,7 @@ class TestEnqueue:
         assert p.enqueue(job) is True
         job.files["extra"] = FileSpec("other.txt", role="cache")
 
-        (row,) = p.backend.load_queue()
+        (row,) = p._runtime.store.backend.load_queue()
         assert row["files"] == {
             "out": {
                 "path": str(dir_a / "results" / "out.csv"),
@@ -768,7 +836,7 @@ class TestEnqueue:
         p.register_task("process", ok_handler)
         # 即使存在历史成功产物，提交时仍保留引用配置而不绑定历史路径
         p.set_job_status(Job("generate", "001"), "succeeded", recursive=False)
-        p.backend._successes["generate::001"]["artifacts"] = {
+        p._runtime.store.backend._successes["generate::001"]["artifacts"] = {
             "report": {"path": str(tmp_path / "old_report.csv")}
         }
 
@@ -779,7 +847,7 @@ class TestEnqueue:
         )
         with pytest.raises(TaskLiteError, match="depends_on"):
             p.enqueue(missing_dep)
-        assert p.backend.load_queue() == []
+        assert p._runtime.store.backend.load_queue() == []
 
         valid_consumer = Job(
             "process",
@@ -788,7 +856,7 @@ class TestEnqueue:
             files={"src": FileSpec.from_output("generate::001", "report", role="input")},
         )
         assert p.enqueue(valid_consumer) is True
-        (queued,) = p.backend.load_queue()
+        (queued,) = p._runtime.store.backend.load_queue()
         assert queued["files"] == {
             "src": {
                 "producer_uid": "generate::001",
@@ -882,7 +950,7 @@ class TestEnqueue:
         )
         p2.run()
         p2.stop()
-        assert len(p2.backend.load_successes()) == 1
+        assert len(p2._runtime.store.backend.load_successes()) == 1
         assert len(observed) == 1
         assert observed[0]["resources"] == {"gpu": 1.0, "__workers__": 1.0}
         assert observed[0]["max_retries_per_run"] == 1
@@ -894,13 +962,13 @@ class TestEnqueue:
         p.register_task("fetch", ok_handler)
         p.set_job_status(Job("fetch", "done"), "succeeded", recursive=False)
         assert p.enqueue(Job("fetch", "done")) is True
-        assert len(p.backend.load_queue()) == 1
+        assert len(p._runtime.store.backend.load_queue()) == 1
 
     def test_intake_pipeline_injections(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
         p.enqueue(Job("fetch", "a", timeout_seconds=17, payload={"timeout": "业务时限"}))
-        (row,) = p.backend.load_queue()
+        (row,) = p._runtime.store.backend.load_queue()
         assert row["resources"]["__workers__"] == 1.0
         assert row["first_enqueued_at"]
         assert row["timeout_seconds"] == 17
@@ -912,7 +980,7 @@ class TestEnqueue:
     def test_run_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
         with running(p):
-            with pytest.raises(RuntimeError, match="enqueue"):
+            with pytest.raises(TaskLiteError, match="enqueue"):
                 p.enqueue(Job("fetch", "a"))
 
 
@@ -936,12 +1004,12 @@ class TestSixStepContract:
         p.stop()
 
         assert res is None
-        assert sorted(p.backend.load_successes()) == ["fetch::a", "fetch::b"]
+        assert sorted(p._runtime.store.backend.load_successes()) == ["fetch::a", "fetch::b"]
 
     def test_run_reentry_guard(self, tmp_path):
         p = make_pipeline(tmp_path)
         with running(p):
-            with pytest.raises(RuntimeError, match="run.*in progress"):
+            with pytest.raises(TaskLiteError, match="run.*in progress"):
                 p.run()
 
     def test_stop_transitions_session_state(self, tmp_path):
@@ -1016,8 +1084,8 @@ class TestSchedulingSeamWiring:
         assert order == [
             "fetch::flaky", "fetch::flaky", "fetch::later",
         ]
-        assert "fetch::later" in p.backend.load_successes()
-        assert "fetch::flaky" in p.backend.load_failed()
+        assert "fetch::later" in p._runtime.store.backend.load_successes()
+        assert "fetch::flaky" in p._runtime.store.backend.load_failed()
         assert isinstance(p.runtime_config.requeue_policy, ImmediateRequeuePolicy)
         assert p._runtime.store._requeue_policy is p.runtime_config.requeue_policy
 
@@ -1032,10 +1100,10 @@ class TestManageApis:
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
         p.set_job_status(Job("fetch", "bad"), "failed", recursive=False)
-        assert len(p.backend.load_failed()) == 1
+        assert len(p._runtime.store.backend.load_failed()) == 1
         p.set_job_status("fetch::bad", "pending", recursive=False)
-        assert p.backend.load_failed() == {}
-        (row,) = p.backend.load_queue()
+        assert p._runtime.store.backend.load_failed() == {}
+        (row,) = p._runtime.store.backend.load_queue()
         assert row["job_id"] == "bad"
 
     def test_set_job_status_unknown_uid_raises(self, tmp_path):
@@ -1048,10 +1116,10 @@ class TestManageApis:
         assert p.get_cursor("page") is None
         p.set_cursor("page", "7")
         assert p.get_cursor("page") == "7"
-        assert p.backend.load_cursors()["page"] == "7"
+        assert p._runtime.store.backend.load_cursors()["page"] == "7"
         p.set_cursor("page", None)
         assert p.get_cursor("page") is None
-        assert p.backend.load_cursors() == {}
+        assert p._runtime.store.backend.load_cursors() == {}
 
     def test_clear_history_removes_from_selected_records(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -1059,10 +1127,10 @@ class TestManageApis:
         p.set_job_status(Job("fetch", "bad"), "failed", recursive=False)
         removed_succ = p.clear_history("fetch::ok", records=["successes"])
         assert removed_succ == 1
-        assert p.backend.load_successes() == {}
+        assert p._runtime.store.backend.load_successes() == {}
         removed_fail = p.clear_history("fetch::bad", records=["failures"])
         assert removed_fail == 1
-        assert p.backend.load_failed() == {}
+        assert p._runtime.store.backend.load_failed() == {}
 
     def test_run_guards_across_manage_apis(self, tmp_path):
         guarded = [
@@ -1074,7 +1142,7 @@ class TestManageApis:
         for api_name, call in guarded:
             p = make_pipeline(tmp_path)
             with running(p):
-                with pytest.raises(RuntimeError, match=api_name):
+                with pytest.raises(TaskLiteError, match=api_name):
                     call(p)
 
 
@@ -1132,4 +1200,4 @@ class TestBackendSetterDeleted:
     def test_backend_setter_raises_attribute_error(self, tmp_path):
         p = make_pipeline(tmp_path)
         with pytest.raises(AttributeError):
-            p.backend = InMemoryStateBackend()
+            p._runtime.store.backend = InMemoryStateBackend()

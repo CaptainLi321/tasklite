@@ -64,8 +64,8 @@ def test_direct_dependency_publishes_directory_for_actual_file_input(tmp_path):
         ))
         result = pipeline.run()
         assert result is None
-        assert len(pipeline.backend.load_successes()) == 2
-        successes = pipeline.backend.load_successes()
+        assert len(pipeline._runtime.store.backend.load_successes()) == 2
+        successes = pipeline._runtime.store.backend.load_successes()
         assert successes["build::one"]["artifacts"] == {"bundle": {"path": str(tmp_path / "output" / "bundle")}}
         assert successes["consume::one"]["inputs"] == [
             str(tmp_path / "output" / "bundle")
@@ -91,7 +91,7 @@ def test_history_can_be_read_and_missing_disk_does_not_rerun_producer(tmp_path):
             },
         ))
         first.run()
-        original = first.backend.load_successes()["build::one"]
+        original = first._runtime.store.backend.load_successes()["build::one"]
     finally:
         first.stop()
     second = _pipeline(tmp_path)
@@ -107,7 +107,7 @@ def test_history_can_be_read_and_missing_disk_does_not_rerun_producer(tmp_path):
             files=consumer_files,
         ))
         assert second.run() is None
-        assert "consume::historical" in second.backend.load_successes()
+        assert "consume::historical" in second._runtime.store.backend.load_successes()
         (tmp_path / "output" / "bundle" / "report.txt").unlink()
         (tmp_path / "output" / "bundle").rmdir()
         second.enqueue(Job(
@@ -117,8 +117,8 @@ def test_history_can_be_read_and_missing_disk_does_not_rerun_producer(tmp_path):
             files=consumer_files,
         ))
         second.run()
-        assert second.backend.load_successes()["build::one"] == original
-        assert "consume::missing" in second.backend.load_failed()
+        assert second._runtime.store.backend.load_successes()["build::one"] == original
+        assert "consume::missing" in second._runtime.store.backend.load_failed()
         assert not (tmp_path / "output" / "bundle").exists()
     finally:
         second.stop()
@@ -130,11 +130,11 @@ def test_dispatch_protects_complete_state_directory(tmp_path):
     try:
         pipeline.enqueue(Job("unsafe", "one", payload={"path": str(pipeline.state_path)}))
         pipeline.run()
-        failure = pipeline.backend.load_failed()["unsafe::one"]
+        failure = pipeline._runtime.store.backend.load_failed()["unsafe::one"]
         assert "outside output roots" in failure["error_message"]
-        assert pipeline.backend.load_successes() == {}
-        assert pipeline.backend.load_queue_jobs() == []
-        attempt, = pipeline.backend.load_settled_attempts("unsafe::one")
+        assert pipeline._runtime.store.backend.load_successes() == {}
+        assert pipeline._runtime.store.backend.load_queue_jobs() == []
+        attempt, = pipeline._runtime.store.backend.load_settled_attempts("unsafe::one")
         assert attempt["outcome"] == "failure"
         assert pipeline.state_path.exists()
     finally:

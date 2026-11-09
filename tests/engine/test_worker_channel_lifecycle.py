@@ -116,7 +116,7 @@ def test_worker_lingers_after_result_does_not_block_dispatch_and_run_waits(tmp_p
 
     assert not runner.is_alive()
     assert errors == []
-    successes = pipeline.backend.load_successes()
+    successes = pipeline._runtime.store.backend.load_successes()
     assert "lingering::j1" in successes
     assert "fast::j2" in successes
     assert successes["lingering::j1"]["step"] == 1
@@ -140,14 +140,14 @@ def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
 
     pipeline.run()
 
-    failed = pipeline.backend.load_failed()
+    failed = pipeline._runtime.store.backend.load_failed()
     assert list(failed) == ["crash::j1"]
     failed_meta = failed["crash::j1"]
     assert "PROCESS_CRASH_EXITCODE_42" in failed_meta.get("metadata", {}).get("error_message", "")
     assert failed_meta["metadata"]["exitcode"] == 42
     assert "retry_error" not in failed_meta
 
-    attempts = pipeline.backend.load_attempts("crash::j1")
+    attempts = pipeline._runtime.store.backend.load_attempts("crash::j1")
     assert len(attempts) == 1
     assert attempts[0].outcome == "failed"
 
@@ -181,7 +181,7 @@ def test_worker_faults_settle_one_failure(
 
     pipeline.run()
 
-    failed = pipeline.backend.load_failed()
+    failed = pipeline._runtime.store.backend.load_failed()
     assert list(failed) == [f"{task_type}::j1"]
     entry = failed[f"{task_type}::j1"]
     assert entry["message"] == message
@@ -191,10 +191,10 @@ def test_worker_faults_settle_one_failure(
     else:
         assert entry["exception"]["type"] == exception_type
 
-    attempts = pipeline.backend.load_attempts(f"{task_type}::j1")
+    attempts = pipeline._runtime.store.backend.load_attempts(f"{task_type}::j1")
     assert len(attempts) == 1
     assert attempts[0].outcome == "failed"
-    assert pipeline.backend.load_queue() == []
+    assert pipeline._runtime.store.backend.load_queue() == []
 
     pipeline.stop()
 
@@ -215,13 +215,13 @@ def test_worker_timeout_terminates_and_marks_failed_without_retry(tmp_path):
 
     assert elapsed < 3.0, f"超时未及时触发，耗时 {elapsed}s"
 
-    failed = pipeline.backend.load_failed()
+    failed = pipeline._runtime.store.backend.load_failed()
     assert "hang::j1" in failed
     err = failed["hang::j1"].get("error_message") or ""
     assert "TIMEOUT" in err
 
     # 验证超时未烧重试预算或自动重试，一次 Attempt 直接终结
-    attempts = pipeline.backend.load_attempts("hang::j1")
+    attempts = pipeline._runtime.store.backend.load_attempts("hang::j1")
     assert len(attempts) == 1
     assert attempts[0].outcome == "failed"
 
@@ -273,12 +273,12 @@ def test_worker_exit_error_after_result_does_not_rewrite_success(tmp_path):
     pipeline.enqueue(Job("die_later", "j1"))
     pipeline.run()
 
-    successes = pipeline.backend.load_successes()
+    successes = pipeline._runtime.store.backend.load_successes()
     assert "die_later::j1" in successes
     assert successes["die_later::j1"]["returned"] is True
-    assert pipeline.backend.load_failed() == {}
+    assert pipeline._runtime.store.backend.load_failed() == {}
 
-    attempts = pipeline.backend.load_attempts("die_later::j1")
+    attempts = pipeline._runtime.store.backend.load_attempts("die_later::j1")
     assert len(attempts) == 1
     assert attempts[0].outcome == "succeeded"
 

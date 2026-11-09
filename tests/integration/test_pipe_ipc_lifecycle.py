@@ -150,7 +150,7 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
     pipeline = pipelines()
     pipeline.register_task("parent", success_handler)
     pipeline.enqueue(Job("parent", "parent"))
-    backend = pipeline.backend
+    backend = pipeline._runtime.store.backend
     get_conn = backend._get_conn
     observations = []
 
@@ -226,17 +226,17 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
     reopened.register_task("parent", success_handler)
     result = reopened.run()
     assert result is None
-    assert len(reopened.backend.load_attempts("parent::parent")) == 1
-    assert reopened.backend.load_successes()["parent::parent"]["worker_pid"] == pid
-    assert reopened.backend.load_cursors()["position"] == "42"
+    assert len(reopened._runtime.store.backend.load_attempts("parent::parent")) == 1
+    assert reopened._runtime.store.backend.load_successes()["parent::parent"]["worker_pid"] == pid
+    assert reopened._runtime.store.backend.load_cursors()["position"] == "42"
     reopened.enqueue(Job("parent", "parent"))
     assert reopened.run() is None
     expected_attempts = (
         ["succeeded"]
-        if reopened.backend.schema_version >= TARGET_SCHEMA_VERSION
+        if reopened._runtime.store.backend.schema_version >= TARGET_SCHEMA_VERSION
         else ["succeeded", "skipped"]
     )
-    assert [a.outcome for a in reopened.backend.load_attempts("parent::parent")] == expected_attempts
+    assert [a.outcome for a in reopened._runtime.store.backend.load_attempts("parent::parent")] == expected_attempts
 
 
 @pytest.mark.parametrize("mode", ["kill", "crash", "timeout"])
@@ -280,13 +280,13 @@ def test_process_death_is_single_failure_without_implicit_retry(
 
     assert res is None
     assert killer is None or not killer.is_alive()
-    failed = pipeline.backend.load_failed()
+    failed = pipeline._runtime.store.backend.load_failed()
     assert list(failed) == ["work::" + mode]
-    attempts = pipeline.backend.load_attempts("work::" + mode)
+    attempts = pipeline._runtime.store.backend.load_attempts("work::" + mode)
     assert len(attempts) == 1
     assert attempts[0].attempt_no == 1
     assert attempts[0].outcome == "failed"
-    assert pipeline.backend.load_successes() == {}
+    assert pipeline._runtime.store.backend.load_successes() == {}
     expected = {
         "kill": "PROCESS_SIGNAL_DEATH",
         "crash": "PROCESS_CRASH_EXITCODE_7",
@@ -296,7 +296,7 @@ def test_process_death_is_single_failure_without_implicit_retry(
     if mode == "kill":
         assert not (tmp_path / "output" / "authorized.txt").exists()
         assert (tmp_path / "output" / "retained.txt").exists()
-    assert pipeline.backend.load_queue() == []
+    assert pipeline._runtime.store.backend.load_queue() == []
 
 
 def test_cleanup_error_fails_without_publishing_success(pipelines, monkeypatch, tmp_path):
@@ -310,11 +310,11 @@ def test_cleanup_error_fails_without_publishing_success(pipelines, monkeypatch, 
     with monkeypatch.context() as failure:
         failure.setattr(ArtifactPathPolicy, "cleanup", unavailable)
         pipeline.run()
-    assert pipeline.backend.load_successes() == {}
-    failed = pipeline.backend.load_failed()["work::cleanup"]
+    assert pipeline._runtime.store.backend.load_successes() == {}
+    failed = pipeline._runtime.store.backend.load_failed()["work::cleanup"]
     assert "授权清理不可用" in failed["error_message"]
-    assert pipeline.backend.load_queue_jobs() == []
-    attempt, = pipeline.backend.load_settled_attempts("work::cleanup")
+    assert pipeline._runtime.store.backend.load_queue_jobs() == []
+    attempt, = pipeline._runtime.store.backend.load_settled_attempts("work::cleanup")
     assert attempt["outcome"] == "failure"
     assert (tmp_path / "output" / "temporary.txt").exists()
 
@@ -347,11 +347,11 @@ def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_p
     res = pipeline.run()
     assert res is None
     assert requested
-    queue = pipeline.backend.load_queue()
+    queue = pipeline._runtime.store.backend.load_queue()
     assert not (tmp_path / "output" / "temporary.txt").exists()
     assert (tmp_path / "output" / "kept.txt").exists()
     assert [j["job_id"] for j in queue] == ["waiting"]
-    assert pipeline.backend.load_successes()["controlled::active"]["inputs"] == [
+    assert pipeline._runtime.store.backend.load_successes()["controlled::active"]["inputs"] == [
         str(tmp_path / "output" / "kept.txt")
     ]
 
@@ -370,9 +370,9 @@ def test_stop_commits_complete_result_already_received(pipelines, monkeypatch):
     monkeypatch.setattr(channel, "_accept_message", accept_and_stop)
     res = pipeline.run()
     assert res is None
-    assert pipeline.backend.load_successes()["child::done"]["child"] is True
-    assert pipeline.backend.load_queue() == []
-    assert pipeline.backend.load_attempts("child::done")[0].outcome == "succeeded"
+    assert pipeline._runtime.store.backend.load_successes()["child::done"]["child"] is True
+    assert pipeline._runtime.store.backend.load_queue() == []
+    assert pipeline._runtime.store.backend.load_attempts("child::done")[0].outcome == "succeeded"
 
 
 @pytest.mark.parametrize("fault", ["json", "kind", "job_uid", "execution_id"])
@@ -382,9 +382,9 @@ def test_invalid_message_cannot_register_success(pipelines, tmp_path, fault):
     pipeline.enqueue(Job("invalid", "invalid", payload={"fault": fault}))
     with pytest.raises(ValueError):
         pipeline.run()
-    assert pipeline.backend.load_successes() == {}
-    assert pipeline.backend.load_failed() == {}
-    row, = pipeline.backend.load_queue_jobs()
+    assert pipeline._runtime.store.backend.load_successes() == {}
+    assert pipeline._runtime.store.backend.load_failed() == {}
+    row, = pipeline._runtime.store.backend.load_queue_jobs()
     assert row["status"] == "running" and row["attempt_no"] == 1
     assert not (tmp_path / "output" / "authorized.txt").exists()
     assert (tmp_path / "output" / "retained.txt").exists()

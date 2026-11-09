@@ -50,10 +50,10 @@ def _wait_for_release(job, ctx):
 def _wait_until_failed(pipeline, expected, timeout=20):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if set(pipeline.backend.load_failed()) == expected:
+        if set(pipeline._runtime.store.backend.load_failed()) == expected:
             return
         time.sleep(0.01)
-    raise TimeoutError(f"失败档案未收敛：{pipeline.backend.load_failed()!r}")
+    raise TimeoutError(f"失败档案未收敛：{pipeline._runtime.store.backend.load_failed()!r}")
 
 
 def test_cleared_manual_success_settles_dependency_as_missing(tmp_path):
@@ -65,7 +65,7 @@ def test_cleared_manual_success_settles_dependency_as_missing(tmp_path):
     assert pipeline.enqueue(Job("control", "baseline")) is True
     assert pipeline.enqueue(Job("source", "prior")) is True
     pipeline.run()
-    assert len(pipeline.backend.load_attempts("source::prior")) == 1
+    assert len(pipeline._runtime.store.backend.load_attempts("source::prior")) == 1
     pipeline.set_job_status(Job("source", "up"), "succeeded", recursive=False)
     assert pipeline.enqueue(
         Job("dependent", "down", depends_on=["source::up"])
@@ -75,13 +75,13 @@ def test_cleared_manual_success_settles_dependency_as_missing(tmp_path):
     pipeline.run()
     pipeline.stop()
 
-    assert set(pipeline.backend.load_failed()) == {"dependent::down"}
-    failure = pipeline.backend.load_failed()["dependent::down"]
+    assert set(pipeline._runtime.store.backend.load_failed()) == {"dependent::down"}
+    failure = pipeline._runtime.store.backend.load_failed()["dependent::down"]
     assert failure["missing_dependency"] == "source::up"
-    assert pipeline.backend.load_attempts("dependent::down") == []
-    assert pipeline.backend.load_attempts("source::up") == []
-    assert len(pipeline.backend.load_attempts("control::baseline")) == 1
-    assert len(pipeline.backend.load_attempts("source::prior")) == 1
+    assert pipeline._runtime.store.backend.load_attempts("dependent::down") == []
+    assert pipeline._runtime.store.backend.load_attempts("source::up") == []
+    assert len(pipeline._runtime.store.backend.load_attempts("control::baseline")) == 1
+    assert len(pipeline._runtime.store.backend.load_attempts("source::prior")) == 1
 
 
 def test_missing_dependency_settles_while_unrelated_worker_is_in_flight(tmp_path):
@@ -117,11 +117,11 @@ def test_missing_dependency_settles_while_unrelated_worker_is_in_flight(tmp_path
         _wait_until_failed(pipeline, {"dependent::gap", "dependent::down"})
         rows = {
             row["job_uid"]: row["status"]
-            for row in pipeline.backend.load_queue_jobs()
+            for row in pipeline._runtime.store.backend.load_queue_jobs()
         }
         assert rows == {"blocking::unrelated": "running"}
-        assert pipeline.backend.load_attempts("dependent::gap") == []
-        assert pipeline.backend.load_attempts("dependent::down") == []
+        assert pipeline._runtime.store.backend.load_attempts("dependent::gap") == []
+        assert pipeline._runtime.store.backend.load_attempts("dependent::down") == []
     finally:
         (output / "dependency_worker_release").write_text(
             "release", encoding="utf-8"
@@ -130,7 +130,7 @@ def test_missing_dependency_settles_while_unrelated_worker_is_in_flight(tmp_path
 
     assert not runner.is_alive()
     assert errors == []
-    assert "blocking::unrelated" in pipeline.backend.load_successes()
-    attempts = pipeline.backend.load_attempts("blocking::unrelated")
+    assert "blocking::unrelated" in pipeline._runtime.store.backend.load_successes()
+    attempts = pipeline._runtime.store.backend.load_attempts("blocking::unrelated")
     assert [row.outcome for row in attempts] == ["succeeded"]
-    assert pipeline.backend.load_queue() == []
+    assert pipeline._runtime.store.backend.load_queue() == []

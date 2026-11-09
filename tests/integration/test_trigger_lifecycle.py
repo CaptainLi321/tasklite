@@ -72,8 +72,8 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     ))
     assert first.run() is None
     first.stop()
-    first_produce_run_id = first.backend.load_successes()["produce::source"]["last_success_run_id"]
-    old_meta = first.backend.load_successes()["consume::result"]
+    first_produce_run_id = first._runtime.store.backend.load_successes()["produce::source"]["last_success_run_id"]
+    old_meta = first._runtime.store.backend.load_successes()["consume::result"]
     assert old_meta["pid"] != os.getpid()
     baseline_us = parse_utc_iso_to_us(old_meta["last_succeeded_at"])
 
@@ -81,7 +81,7 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     evaluated = []
     def observe_input(ctx):
         evaluated.append(Path(ctx.success_metadata["inputs"][0]).read_text(encoding="utf-8"))
-        parent = second.backend.load_successes()["produce::source"]
+        parent = second._runtime.store.backend.load_successes()["produce::source"]
         assert parent["last_success_run_id"] != first_produce_run_id
         return on_input_change(ctx)
     second.register_trigger("observe", observe_input)
@@ -100,15 +100,15 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     assert res is None
     if mode == "fail":
         assert evaluated == []
-        assert set(second.backend.load_failed()) == {"produce::source", "consume::result"}
-        assert second.backend.load_successes() == {}
+        assert set(second._runtime.store.backend.load_failed()) == {"produce::source", "consume::result"}
+        assert second._runtime.store.backend.load_successes() == {}
     else:
         assert evaluated == ["updated" if mode == "write" else "first"]
-        current = second.backend.load_successes()["consume::result"]
+        current = second._runtime.store.backend.load_successes()["consume::result"]
         assert current["success_count"] == (2 if mode == "write" else 1)
         assert current["content"] == evaluated[0]
-        assert second.backend.load_failed() == {}
-    assert second.backend.load_queue() == []
+        assert second._runtime.store.backend.load_failed() == {}
+    assert second._runtime.store.backend.load_queue() == []
 
 
 def always_retry(job, ctx):
@@ -194,21 +194,21 @@ def test_retry_candidate_and_later_ordinary_candidate_same_run(
         encoding="utf-8"
     ).splitlines()
     assert calls == expected_calls
-    records = pipeline.backend.load_attempts("child::item")
+    records = pipeline._runtime.store.backend.load_attempts("child::item")
     assert [record.attempt_no for record in records] == [1, 2, 3][
         :len(expected_calls)
     ]
     assert [record.outcome for record in records] == expected_outcomes
     assert len({record.run_id for record in records}) == 1
-    assert "parent::p" in pipeline.backend.load_successes()
+    assert "parent::p" in pipeline._runtime.store.backend.load_successes()
     if child_trigger == "always":
-        assert pipeline.backend.load_failed()["child::item"]["error_message"] == (
+        assert pipeline._runtime.store.backend.load_failed()["child::item"]["error_message"] == (
             ERR_MAX_RETRIES
         )
     else:
-        assert pipeline.backend.load_failed() == {}
-        assert pipeline.backend.load_successes()["child::item"]["calls"] == 2
-    assert pipeline.backend.load_queue() == []
+        assert pipeline._runtime.store.backend.load_failed() == {}
+        assert pipeline._runtime.store.backend.load_successes()["child::item"]["calls"] == 2
+    assert pipeline._runtime.store.backend.load_queue() == []
 
 
 def test_zero_budget_retry_skips_gate_without_resetting_ordinary_candidate(tmp_path):
@@ -243,19 +243,19 @@ def test_zero_budget_retry_skips_gate_without_resetting_ordinary_candidate(tmp_p
     pipeline.stop()
 
     assert evaluated == [(1, False), (1, True)]
-    records = pipeline.backend.load_attempts("child::item")
+    records = pipeline._runtime.store.backend.load_attempts("child::item")
     assert [record.attempt_no for record in records] == [1, 2]
     assert [record.outcome for record in records] == ["requeued", "succeeded"]
-    assert pipeline.backend.load_failed() == {}
-    assert pipeline.backend.load_successes()["child::item"]["calls"] == 2
-    assert pipeline.backend.load_queue() == []
+    assert pipeline._runtime.store.backend.load_failed() == {}
+    assert pipeline._runtime.store.backend.load_successes()["child::item"]["calls"] == 2
+    assert pipeline._runtime.store.backend.load_queue() == []
 
 
 def _run_until_retry_committed(root, ready, release):
     """队列重试已提交的屏障供监督进程精确终止主引擎。"""
     def park_after_retry(uid, *, outcome):
         if outcome.will_retry:
-            queued = pipeline.backend.load_queue()
+            queued = pipeline._runtime.store.backend.load_queue()
             assert queued[0]["attempt_no"] == 2
             ready.set()
             release.wait(timeout=30)
@@ -289,7 +289,7 @@ def test_new_run_rechecks_retry_pending_and_resets_budget(tmp_path, gate_allows)
         engine.close()
 
     recovered = _pipeline(tmp_path)
-    queued = recovered.backend.load_queue()
+    queued = recovered._runtime.store.backend.load_queue()
     assert len(queued) == 1
     assert queued[0]["attempt_no"] == 2
     recovered.register_trigger("gated", lambda ctx: gate_allows)
@@ -297,8 +297,8 @@ def test_new_run_rechecks_retry_pending_and_resets_budget(tmp_path, gate_allows)
     recovered.register_task("retry", handler, max_retries_per_run=1, trigger="gated")
     recovered.run()
     recovered.stop()
-    records = recovered.backend.load_attempts("retry::item")
-    assert recovered.backend.load_queue() == []
+    records = recovered._runtime.store.backend.load_attempts("retry::item")
+    assert recovered._runtime.store.backend.load_queue() == []
     if gate_allows:
         assert [(row.attempt_no, row.outcome) for row in records] == [
             (1, "requeued"),
@@ -306,14 +306,14 @@ def test_new_run_rechecks_retry_pending_and_resets_budget(tmp_path, gate_allows)
             (3, "succeeded"),
         ]
         assert len({row.run_id for row in records}) == 2
-        assert recovered.backend.load_successes()["retry::item"]["resumed_at"] == 3
-        assert recovered.backend.load_failed() == {}
+        assert recovered._runtime.store.backend.load_successes()["retry::item"]["resumed_at"] == 3
+        assert recovered._runtime.store.backend.load_failed() == {}
     else:
         assert [(row.attempt_no, row.outcome) for row in records] == [
             (1, "requeued"),
         ]
-        assert recovered.backend.load_successes() == {}
-        assert recovered.backend.load_failed() == {}
+        assert recovered._runtime.store.backend.load_successes() == {}
+        assert recovered._runtime.store.backend.load_failed() == {}
 
 
 @pytest.mark.parametrize("seed_after_clear", [False, True])
@@ -366,8 +366,8 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
     res = second.run()
     second.stop()
     assert res is None
-    assert second.backend.load_successes()["consume::result"]["success_count"] == 1
-    records = second.backend.load_attempts("consume::result")
+    assert second._runtime.store.backend.load_successes()["consume::result"]["success_count"] == 1
+    records = second._runtime.store.backend.load_attempts("consume::result")
     assert [row.attempt_no for row in records] == [1, 2]
     assert all(row.outcome == "succeeded" for row in records)
 
@@ -398,7 +398,7 @@ def test_discovery_defaults_always_and_job_once_override_across_runs(tmp_path):
                        spawn_discovered, "child")
     pipeline.enqueue(Job("discover", "root"))
     pipeline.run()
-    first_children = {uid: metadata for uid, metadata in pipeline.backend.load_successes().items()
+    first_children = {uid: metadata for uid, metadata in pipeline._runtime.store.backend.load_successes().items()
                       if uid.startswith("child::")}
     assert len(first_children) == 1
     pipeline.enqueue(Job("discover", "root"))
@@ -406,13 +406,13 @@ def test_discovery_defaults_always_and_job_once_override_across_runs(tmp_path):
     calls = (tmp_path / "output" / "scan_calls").read_text(encoding="utf-8").splitlines()
     assert [line.split(":")[0] for line in calls] == ["1", "2", "1"]
     assert all(int(line.split(":")[1]) != os.getpid() for line in calls)
-    assert pipeline.backend.load_successes()["discover::root"]["success_count"] == 2
+    assert pipeline._runtime.store.backend.load_successes()["discover::root"]["success_count"] == 2
     pipeline.enqueue(Job("discover", "root", trigger="once"))
     res = pipeline.run()
     pipeline.stop()
     assert res is None
     assert (tmp_path / "output" / "scan_calls").read_text(encoding="utf-8").splitlines() == calls
-    assert {uid: metadata for uid, metadata in pipeline.backend.load_successes().items()
+    assert {uid: metadata for uid, metadata in pipeline._runtime.store.backend.load_successes().items()
             if uid.startswith("child::")} == first_children
 
 
@@ -444,16 +444,16 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
     pipeline.enqueue(Job("later", "item"))
     with pytest.raises(RuntimeError, match="trigger boundary"):
         pipeline.run()
-    queue_rows = pipeline.backend.load_queue_jobs()
+    queue_rows = pipeline._runtime.store.backend.load_queue_jobs()
     assert {row["job_uid"]: row["status"] for row in queue_rows} == {
         "waiting::item": "running", "later::item": "pending",
     }
     rows = [row["job"] for row in queue_rows]
     assert {row["task_type"] for row in rows} == {"waiting", "later"}
     assert all(row["attempt_no"] == 1 and row["runtime"] == {} for row in rows)
-    assert pipeline.backend.load_failed() == {}
-    assert pipeline.backend.load_successes() == {}
-    assert pipeline.backend.load_attempts("later::item") == []
+    assert pipeline._runtime.store.backend.load_failed() == {}
+    assert pipeline._runtime.store.backend.load_successes() == {}
+    assert pipeline._runtime.store.backend.load_attempts("later::item") == []
     assert not mp.active_children()
 
     (tmp_path / "output" / "worker_release").write_text("release", encoding="utf-8")
@@ -464,9 +464,9 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
     res = recovered.run()
     recovered.stop()
     assert res is None
-    assert set(recovered.backend.load_failed()) == {"waiting::item"}
-    assert recovered.backend.load_queue() == []
-    attempts = recovered.backend.load_attempts("waiting::item")
+    assert set(recovered._runtime.store.backend.load_failed()) == {"waiting::item"}
+    assert recovered._runtime.store.backend.load_queue() == []
+    attempts = recovered._runtime.store.backend.load_attempts("waiting::item")
     assert len(attempts) == 1
     assert attempts[0].outcome == "failed" and attempts[0].attempt_no == 1
 
@@ -496,11 +496,11 @@ def test_until_success_uses_current_sqlite_terminal_history(tmp_path):
 
     assert pipeline.enqueue(Job("work", "item")) is True
     pipeline.run()
-    assert pipeline.backend.load_attempts("work::item")[0].outcome == "succeeded"
+    assert pipeline._runtime.store.backend.load_attempts("work::item")[0].outcome == "succeeded"
 
     assert pipeline.enqueue(Job("work", "item")) is True
     pipeline.run()
-    assert len(pipeline.backend.load_attempts("work::item")) == 1
+    assert len(pipeline._runtime.store.backend.load_attempts("work::item")) == 1
 
     pipeline.clear_history("work::item", records=["successes"])
     pipeline.set_job_status(
@@ -510,7 +510,7 @@ def test_until_success_uses_current_sqlite_terminal_history(tmp_path):
     )
     assert pipeline.enqueue(Job("work", "item")) is True
     pipeline.run()
-    assert len(pipeline.backend.load_attempts("work::item")) == 2
+    assert len(pipeline._runtime.store.backend.load_attempts("work::item")) == 2
     pipeline.stop()
 
 
@@ -527,8 +527,8 @@ def test_until_success_recognizes_manual_success_without_attempt(tmp_path):
     pipeline.run()
     pipeline.stop()
 
-    assert pipeline.backend.load_attempts("work::manual") == []
-    assert pipeline.backend.load_successes()["work::manual"]["annotations"][
+    assert pipeline._runtime.store.backend.load_attempts("work::manual") == []
+    assert pipeline._runtime.store.backend.load_successes()["work::manual"]["annotations"][
         "completion_source"
     ] == "manual"
 
@@ -544,13 +544,13 @@ def test_until_success_retries_after_real_failure(tmp_path):
 
     assert pipeline.enqueue(Job("work", "item")) is True
     pipeline.run()
-    assert len(pipeline.backend.load_attempts("work::item")) == 1
+    assert len(pipeline._runtime.store.backend.load_attempts("work::item")) == 1
 
     assert pipeline.enqueue(Job("work", "item")) is True
     pipeline.run()
     pipeline.stop()
 
-    assert [row.outcome for row in pipeline.backend.load_attempts("work::item")] == [
+    assert [row.outcome for row in pipeline._runtime.store.backend.load_attempts("work::item")] == [
         "failed",
         "failed",
     ]
@@ -563,19 +563,19 @@ def test_until_success_retries_after_real_failure(tmp_path):
 def test_legacy_trigger_pending_is_preserved_and_rejected_on_use(tmp_path):
     pipeline = _pipeline(tmp_path)
     legacy = Job("work", "legacy", trigger="on_failure").to_dict()
-    pipeline.backend.save_queue([legacy])
+    pipeline._runtime.store.backend.save_queue([legacy])
     pipeline.close()
 
     reopened = _pipeline(tmp_path)
     reopened.register_task("work", _record_until_success_call)
-    assert reopened.backend.load_queue() == [legacy]
+    assert reopened._runtime.store.backend.load_queue() == [legacy]
     with pytest.raises(ValueError, match="unregistered trigger 'on_failure'"):
         reopened.run()
     reopened.stop()
 
-    assert reopened.backend.load_queue() == [legacy]
-    assert reopened.backend.load_attempts("work::legacy") == []
-    assert reopened.backend.load_failed() == {}
+    assert reopened._runtime.store.backend.load_queue() == [legacy]
+    assert reopened._runtime.store.backend.load_attempts("work::legacy") == []
+    assert reopened._runtime.store.backend.load_failed() == {}
 
 
 def test_unknown_spawned_trigger_blocks_siblings_and_cursor_publication(tmp_path):
@@ -588,9 +588,9 @@ def test_unknown_spawned_trigger_blocks_siblings_and_cursor_publication(tmp_path
     pipeline.run()
     pipeline.stop()
 
-    assert "parent::root" in pipeline.backend.load_failed()
-    assert pipeline.backend.load_successes() == {}
-    assert pipeline.backend.load_queue() == []
+    assert "parent::root" in pipeline._runtime.store.backend.load_failed()
+    assert pipeline._runtime.store.backend.load_successes() == {}
+    assert pipeline._runtime.store.backend.load_queue() == []
     assert pipeline.get_cursor("trigger/spawn") is None
-    assert pipeline.backend.load_attempts("child::good") == []
-    assert pipeline.backend.load_attempts("child::bad") == []
+    assert pipeline._runtime.store.backend.load_attempts("child::good") == []
+    assert pipeline._runtime.store.backend.load_attempts("child::bad") == []

@@ -123,7 +123,7 @@ class TestFullMode:
         # 5 条 → 3 页（2/2/1）+ 空页；首次扫描无已见 → 全量 spawn
         p.enqueue(Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)}))
         p.run()
-        successes = p.backend.load_successes()
+        successes = p._runtime.store.backend.load_successes()
         children = [k for k in successes if k.startswith("child::")]
         assert len(children) == 5, f"full 模式首次扫描应 spawn 全部 5 个: {children}"
         assert self._log_count(log_path) == 4, \
@@ -139,7 +139,7 @@ class TestFullMode:
         p.register_task("child", _child_ok)
         p.enqueue(Job("disc", "seed", payload={"posts": _posts(5), "fetch_log": str(log_path)}))
         p.run()
-        successes = p.backend.load_successes()
+        successes = p._runtime.store.backend.load_successes()
         assert len([k for k in successes if k.startswith("child::")]) == 5
         first_run_fetches = self._log_count(log_path)
         assert first_run_fetches == 4
@@ -147,7 +147,7 @@ class TestFullMode:
         # 重跑（every_run 注入）→ full 扫完 3 页 + 空页，已见不重复 spawn
         p.enqueue(Job("disc", "seed2", payload={"posts": _posts(5), "fetch_log": str(log_path)}))
         p.run()
-        successes = p.backend.load_successes()
+        successes = p._runtime.store.backend.load_successes()
         assert len([k for k in successes if k.startswith("child::")]) == 5, \
             "full 重跑不得重复 spawn 已见内容"
         second_run_fetches = self._log_count(log_path) - first_run_fetches
@@ -169,7 +169,7 @@ class TestFullMode:
         # 重跑：page1=[4,3] 全已见 → 整页命中即停（不翻后续页）
         p.enqueue(Job("disc", "seed2", payload={"posts": _posts(5), "fetch_log": str(log_path)}))
         p.run()
-        successes = p.backend.load_successes()
+        successes = p._runtime.store.backend.load_successes()
         assert len([k for k in successes if k.startswith("child::")]) == 5
         second_run_fetches = self._log_count(log_path) - first_run_fetches
         assert second_run_fetches == 1, \
@@ -476,14 +476,14 @@ class TestMissingDetection:
         # 首次：5 条全扫 → 无 missing（on_missing 不调用，无异常）
         p.enqueue(Job("disc", "seed", payload={"posts": _posts(5)}))
         p.run()
-        successes = p.backend.load_successes()
+        successes = p._runtime.store.backend.load_successes()
         assert "disc::seed" in successes
 
         # 删 2 条 → 重跑：有 missing 差集 → on_missing 抛异常 → 必须被吞
         posts = [{"id": 2}, {"id": 1}, {"id": 0}]
         p.enqueue(Job("disc", "seed2", payload={"posts": posts}))
         p.run()
-        successes = p.backend.load_successes()
+        successes = p._runtime.store.backend.load_successes()
         assert "disc::seed2" in successes, \
             "on_missing 抛异常不得让 discovery job 崩溃/进失败档案"
 

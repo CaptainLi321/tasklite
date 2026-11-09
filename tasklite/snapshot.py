@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterator, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Protocol
 
 from .backend.sqlite_backend import TARGET_SCHEMA_VERSION, _check_schema
 from .exceptions import TaskLiteError
@@ -17,6 +17,9 @@ from .models.attempt import AttemptRecord
 from .models.state import job_uid_from_snapshot
 from .utils.encoding import parse_job_uid
 from .utils.jsonutil import loads
+
+if TYPE_CHECKING:
+    from .pipeline import TaskLite
 
 
 def _format_iso_z(ts: str | None) -> str | None:
@@ -743,30 +746,33 @@ class _MemorySnapshotReader:
 class StateSnapshot:
     """一致只读状态快照（JSON 兼容字典查询）。"""
 
-    def __init__(self, source: str | Path | Any) -> None:
+    def __init__(self, source: str | Path | "TaskLite") -> None:
         self._source = source
         self._closed = False
         reader: _SnapshotReader
         if isinstance(source, (str, Path)):
             reader = _SqliteSnapshotReader(Path(source))
-        elif hasattr(source, "backend"):
-            if getattr(source, "_closed", False):
-                raise RuntimeError("Cannot open StateSnapshot from a closed TaskLite instance.")
-            b = source.backend
-            if hasattr(b, "path"):
-                reader = _SqliteSnapshotReader(Path(b.path))
-            elif hasattr(b, "_lock") and hasattr(b, "_queue"):
-                reader = _MemorySnapshotReader(b)
-            else:
-                raise TypeError(f"Unsupported backend on TaskLite instance: {type(b).__name__}")
         else:
-            raise TypeError(
-                f"source must be a str, Path, or TaskLite instance, got {type(source).__name__}"
-            )
+            from .pipeline import TaskLite
+
+            if not isinstance(source, TaskLite):
+                raise TypeError(
+                    "source must be a str, Path, or TaskLite instance, "
+                    f"got {type(source).__name__}"
+                )
+            if source._closed:
+                raise RuntimeError(
+                    "Cannot open StateSnapshot from a closed TaskLite instance."
+                )
+            backend = source._snapshot_backend()
+            if source.state_path is not None:
+                reader = _SqliteSnapshotReader(source.state_path)
+            else:
+                reader = _MemorySnapshotReader(backend)
         self._reader = reader
 
     @classmethod
-    def open(cls, source: str | Path | Any) -> StateSnapshot:
+    def open(cls, source: str | Path | "TaskLite") -> StateSnapshot:
         """打开只读快照（支持数据库路径或 TaskLite 实例）。"""
         return cls(source)
 

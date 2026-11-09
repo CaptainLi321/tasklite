@@ -226,9 +226,9 @@ class TestCursor:
         app = _make_app("memory", tmp_path)
         try:
             with running(app):
-                with pytest.raises(RuntimeError, match="outside run"):
+                with pytest.raises(TaskLiteError, match="outside run"):
                     app.get_cursor("key")
-                with pytest.raises(RuntimeError, match="outside run"):
+                with pytest.raises(TaskLiteError, match="outside run"):
                     app.set_cursor("key", "value")
         finally:
             app.close()
@@ -288,9 +288,9 @@ class TestManagementAuthorizationSurface:
         app = _make_app("memory", tmp_path)
         try:
             with running(app):
-                with pytest.raises(RuntimeError, match="outside run"):
+                with pytest.raises(TaskLiteError, match="outside run"):
                     app.list_authorizations()
-                with pytest.raises(RuntimeError, match="outside run"):
+                with pytest.raises(TaskLiteError, match="outside run"):
                     app.revoke_authorization("approved.txt")
         finally:
             app.close()
@@ -320,7 +320,7 @@ class TestCrossProcessManagementMutex:
             assert ready.wait(timeout=10)
             process.join(timeout=10)
             assert process.exitcode == 0
-            assert result_path.read_text(encoding="utf-8") == "RuntimeError"
+            assert result_path.read_text(encoding="utf-8") == "TaskLiteError"
 
             release_lock(fd)
             fd = None

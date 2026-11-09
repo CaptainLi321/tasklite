@@ -192,7 +192,7 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
         pipeline.enqueue(job)
         with pytest.raises(_ArtifactIOError, match="declaration write denied"):
             pipeline.run()
-        rows = pipeline.backend.load_queue_jobs()
+        rows = pipeline._runtime.store.backend.load_queue_jobs()
         assert rows[0]["status"] == "running"
         queue = [row["job"] for row in rows]
         assert len(queue) == 1
@@ -200,7 +200,7 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
         assert queue[0]["job_id"] == job.job_id
         assert queue[0]["attempt_no"] == 2
         assert queue[0]["max_retries_per_run"] == 3
-        assert pipeline.backend.load_successes() == {}
-        assert pipeline.backend.load_failed() == {}
+        assert pipeline._runtime.store.backend.load_successes() == {}
+        assert pipeline._runtime.store.backend.load_failed() == {}
     finally:
         pipeline.stop()
