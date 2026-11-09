@@ -27,6 +27,7 @@ if TYPE_CHECKING:
             self, job_uid: str, failure_metadata: dict[str, Any], *,
             job_snapshot: dict[str, Any] | None = None,
             cascade: bool = True, attempt_no: int | None = None,
+            execution_id: str | None = None,
             run_id: str | None = None, started_at: str | None = None,
         ) -> Any: ...
 
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
         ) -> None: ...
 
 from ..models.state import PipelineState, job_uid_from_snapshot
+from ..backend.base import execution_id_matches_run
 
 
 class RecoveryOrchestrator:
@@ -76,9 +78,13 @@ class RecoveryOrchestrator:
         running = [row for row in queue_rows if row["status"] == "running"]
         for row in running:
             uid = row["job_uid"]
-            run_id, attempt_no = row["run_id"], row["attempt_no"]
+            execution_id, run_id, attempt_no = (
+                row["execution_id"], row["run_id"], row["attempt_no"]
+            )
             if (
-                not isinstance(run_id, str) or not run_id
+                not isinstance(execution_id, str) or not execution_id
+                or not isinstance(run_id, str) or not run_id
+                or not execution_id_matches_run(execution_id, run_id)
                 or type(attempt_no) is not int or attempt_no < 1
                 or job_uid_from_snapshot(row["job"]) != uid
                 or backend.get_attempt_sequence(uid) != attempt_no
@@ -89,7 +95,8 @@ class RecoveryOrchestrator:
             ):
                 raise RuntimeError(
                     f"Invariant conflict: Job {uid!r} has an invalid or already settled running execution "
-                    f"(run_id={run_id!r}, attempt_no={attempt_no!r})"
+                    f"(execution_id={execution_id!r}, run_id={run_id!r}, "
+                    f"attempt_no={attempt_no!r})"
                 )
 
         state = PipelineState(
@@ -103,12 +110,14 @@ class RecoveryOrchestrator:
                 {
                     "error_message": "上次执行未完成结算，实际结果未知",
                     "reason": "unsettled_running_recovery",
+                    "execution_id": row["execution_id"],
                     "run_id": row["run_id"],
                     "attempt_no": row["attempt_no"],
                 },
                 job_snapshot=row["job"],
                 cascade=False,
                 attempt_no=row["attempt_no"],
+                execution_id=row["execution_id"],
                 run_id=row["run_id"],
                 started_at=row["started_at"],
             )

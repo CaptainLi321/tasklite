@@ -597,10 +597,17 @@ class StateStore:
         """
         self._finish_attempt(attempt_id, outcome=outcome, error_message=error_message)
 
-    def mark_job_running(self, job_uid: str, *, run_id: str, started_at: str) -> int:
+    def mark_job_running(
+        self, job_uid: str, *, execution_id: str, run_id: str, started_at: str
+    ) -> int:
         """记录作业进入 running 状态并推进编号（事务性单一出口）。"""
         try:
-            next_no = self._backend.mark_job_running(job_uid, run_id=run_id, started_at=started_at)
+            next_no = self._backend.mark_job_running(
+                job_uid,
+                execution_id=execution_id,
+                run_id=run_id,
+                started_at=started_at,
+            )
             for item in self._state.queue:
                 if job_uid_from_snapshot(item) == job_uid:
                     item["status"] = "running"
@@ -883,6 +890,7 @@ class StateStore:
                 job_uid=job_uid,
                 outcome="success",
                 attempt_no=attempt_no,
+                execution_id=execution_id or "",
                 run_id=run_id or "run",
                 settled_at=effective_finished_at,
                 started_at=started_at,
@@ -937,6 +945,7 @@ class StateStore:
         files: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
         attempt_id: int | None = None,
+        execution_id: str | None = None,
     ) -> FailureOutcome:
         """原子终态转移：永久失败（进入失败档案 + successes 互删 + 级联下游）。"""
         normalized_meta = self._classifier.normalize_failure_metadata(failure_metadata)
@@ -949,6 +958,7 @@ class StateStore:
                 job_uid=job_uid,
                 outcome="failure",
                 attempt_no=attempt_no,
+                execution_id=execution_id or "",
                 run_id=run_id or "run",
                 settled_at=effective_settled_at,
                 started_at=started_at,
@@ -1022,6 +1032,7 @@ class StateStore:
         result: dict[str, Any] | None = None,
         error_message: str | None = None,
         attempt_id: int | None = None,
+        execution_id: str | None = None,
     ) -> RetryOutcome:
         """原子状态转移：重试重入队（节奏经 RequeuePolicy 唯一出口）。"""
         plan = self._requeue_policy.plan_requeue(retry_job_snapshot, transient_kind=transient_kind)
@@ -1030,6 +1041,7 @@ class StateStore:
                 job_uid=job_uid,
                 outcome="retry",
                 attempt_no=attempt_no,
+                execution_id=execution_id or "",
                 run_id=run_id or "run",
                 settled_at=utc_now_iso(),
                 started_at=started_at,
@@ -1070,6 +1082,7 @@ class StateStore:
         files: dict[str, Any] | None = None,
         error_message: str | None = None,
         result: dict[str, Any] | None = None,
+        execution_id: str | None = None,
     ) -> bool:
         """受阻或停机执行回滚到待派发队列（写盘重置为 pending，释放在途并还原内存队列）。"""
         settled_at = utc_now_iso()
@@ -1077,6 +1090,7 @@ class StateStore:
             job_uid=job_uid,
             outcome="pending",
             attempt_no=attempt_no,
+            execution_id=execution_id or "",
             run_id=run_id or "run",
             settled_at=settled_at,
             started_at=started_at,

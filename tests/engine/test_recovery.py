@@ -31,7 +31,12 @@ def test_startup_recovers_under_exclusive_lock_and_preserves_pending_order(tmp_p
     backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
     backend.enqueue_jobs([Job("work", "tail").to_dict(), Job("work", "orphan").to_dict()])
     backend.enqueue_jobs([Job("work", "head").to_dict()], front=True)
-    backend.mark_job_running("work::orphan", run_id="old", started_at="2026-01-01T00:00:00Z")
+    backend.mark_job_running(
+        "work::orphan",
+        execution_id="old.1",
+        run_id="old",
+        started_at="2026-01-01T00:00:00Z",
+    )
     before = backend.load_queue_jobs()
     seen = []
 

@@ -15,6 +15,10 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .base import (
     AbstractStateBackend,
+    execution_id_matches_run,
+    public_queue_snapshot,
+    queue_snapshot_execution_id,
+    queue_snapshot_with_execution_id,
     validate_attempt_dispatch,
     validate_attempt_finish,
     validate_queue_replacement,
@@ -411,7 +415,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                     )
                 else:
                     cursor = conn.execute('SELECT job_snapshot FROM queue ORDER BY queue_position ASC')
-                return [loads(row[0]) for row in cursor]
+                return [public_queue_snapshot(loads(row[0])) for row in cursor]
         except (sqlite3.Error, OSError) as e:
             raise RuntimeError(f"Failed to load queue from {self.path.name}: {e}") from e
         except ValueError as e:
@@ -932,7 +936,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             if row and row[0]:
                 snapshot = loads(row[0])
                 if isinstance(snapshot, dict):
-                    return snapshot
+                    return public_queue_snapshot(snapshot)
 
             row = conn.execute(
                 "SELECT metadata FROM successes WHERE job_uid = ?", (uid,)
@@ -987,7 +991,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             for uid, raw in conn.execute("SELECT job_uid, job_snapshot FROM queue"):
                 snapshot = loads(raw) if raw else None
                 if isinstance(snapshot, dict):
-                    known[uid] = snapshot
+                    known[uid] = public_queue_snapshot(snapshot)
         return known
 
     def clear_history(self, uid: str, records: set[str]) -> int:
@@ -1221,25 +1225,34 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     # 状态事务与编号（ADR-0011 目标格式与执行结算内部准备）───────────
 
-    def mark_job_running(self, job_uid: str, *, run_id: str, started_at: str) -> int:
+    def mark_job_running(
+        self, job_uid: str, *, execution_id: str, run_id: str, started_at: str
+    ) -> int:
         if self.schema_version < TARGET_SCHEMA_VERSION:
             raise NotImplementedError(
                 f"mark_job_running requires schema_version >= {TARGET_SCHEMA_VERSION}"
             )
+        if not isinstance(execution_id, str) or not execution_id:
+            raise ValueError("execution_id must be a non-empty str")
         if not isinstance(run_id, str) or not run_id:
             raise ValueError("run_id must be a non-empty str")
+        if not execution_id_matches_run(execution_id, run_id):
+            raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
         if not isinstance(started_at, str) or not started_at:
             raise ValueError("started_at must be a non-empty str")
         with self._get_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             row = conn.execute(
-                'SELECT status, attempt_no FROM queue WHERE job_uid = ?',
+                'SELECT status, attempt_no, job_snapshot FROM queue WHERE job_uid = ?',
                 (job_uid,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"Job {job_uid} not found in queue")
             if row[0] == "running":
                 raise ValueError(f"Job {job_uid} is already running")
+            job_snapshot = loads(row[2])
+            if not isinstance(job_snapshot, dict):
+                raise ValueError(f"Job {job_uid} has an invalid queue snapshot")
 
             seq_row = conn.execute(
                 'SELECT last_attempt_no FROM job_sequences WHERE job_uid = ?',
@@ -1256,8 +1269,16 @@ class SQLiteStateBackend(AbstractStateBackend):
                 (job_uid, next_no),
             )
             conn.execute(
-                'UPDATE queue SET status = ?, run_id = ?, attempt_no = ?, started_at = ? WHERE job_uid = ?',
-                ("running", run_id, next_no, started_at, job_uid),
+                'UPDATE queue SET job_snapshot = ?, status = ?, run_id = ?, '
+                'attempt_no = ?, started_at = ? WHERE job_uid = ?',
+                (
+                    dumps(queue_snapshot_with_execution_id(job_snapshot, execution_id)),
+                    "running",
+                    run_id,
+                    next_no,
+                    started_at,
+                    job_uid,
+                ),
             )
             return next_no
 
@@ -1326,11 +1347,15 @@ class SQLiteStateBackend(AbstractStateBackend):
                     )
                 results: list[dict[str, Any]] = []
                 for row in cursor:
+                    stored_job = loads(row[2])
+                    if not isinstance(stored_job, dict):
+                        raise RuntimeError(f"Corrupted queue job_snapshot for {row[0]!r}")
                     results.append({
                         "job_uid": row[0],
                         "queue_position": row[1],
-                        "job": loads(row[2]),
+                        "job": public_queue_snapshot(stored_job),
                         "status": row[3],
+                        "execution_id": queue_snapshot_execution_id(stored_job),
                         "run_id": row[4],
                         "attempt_no": row[5],
                         "started_at": row[6],
@@ -1359,6 +1384,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         job_uid: str,
         outcome: str,
         attempt_no: int,
+        execution_id: str,
         run_id: str,
         settled_at: str,
         started_at: str | None = None,
@@ -1382,8 +1408,12 @@ class SQLiteStateBackend(AbstractStateBackend):
             raise ValueError(f"Invalid outcome: {outcome}")
         if not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 1:
             raise TypeError(f"attempt_no must be int >= 1, got {attempt_no!r}")
+        if not isinstance(execution_id, str) or not execution_id:
+            raise ValueError(f"execution_id must be non-empty str, got {execution_id!r}")
         if not isinstance(run_id, str) or not run_id:
             raise ValueError(f"run_id must be non-empty str, got {run_id!r}")
+        if not execution_id_matches_run(execution_id, run_id):
+            raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
         if not isinstance(settled_at, str) or not settled_at:
             raise ValueError(f"settled_at must be non-empty str, got {settled_at!r}")
         if started_at is not None and (not isinstance(started_at, str) or not started_at):
@@ -1402,10 +1432,24 @@ class SQLiteStateBackend(AbstractStateBackend):
                 conn.execute('BEGIN IMMEDIATE')
 
                 running = conn.execute(
-                    "SELECT status, run_id, attempt_no FROM queue WHERE job_uid = ?", (job_uid,)
+                    "SELECT status, run_id, attempt_no, job_snapshot "
+                    "FROM queue WHERE job_uid = ?",
+                    (job_uid,),
                 ).fetchone()
-                if running != ("running", run_id, attempt_no):
+                if running is None:
                     raise ValueError(f"Settlement does not match the running execution for {job_uid}")
+                stored_job = loads(running[3]) if running[3] else None
+                if not isinstance(stored_job, dict):
+                    raise ValueError(
+                        f"Settlement does not match the running execution for {job_uid}"
+                    )
+                if (
+                    running[:3] != ("running", run_id, attempt_no)
+                    or queue_snapshot_execution_id(stored_job) != execution_id
+                ):
+                    raise ValueError(
+                        f"Settlement does not match the running execution for {job_uid}"
+                    )
                 if conn.execute(
                     "SELECT 1 FROM attempts WHERE job_uid = ? AND attempt_no = ?", (job_uid, attempt_no)
                 ).fetchone():
@@ -1490,20 +1534,24 @@ class SQLiteStateBackend(AbstractStateBackend):
                         conn.execute(
                             'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
                             'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
-                            (dumps(requeued_job_snapshot), "pending", job_uid),
+                            (
+                                dumps(public_queue_snapshot(requeued_job_snapshot)),
+                                "pending",
+                                job_uid,
+                            ),
                         )
                     else:
                         conn.execute(
-                            'UPDATE queue SET status = ?, run_id = NULL, attempt_no = NULL, '
-                            'started_at = NULL WHERE job_uid = ?',
-                            ("pending", job_uid),
+                            'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
+                            'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
+                            (dumps(public_queue_snapshot(stored_job)), "pending", job_uid),
                         )
 
                 elif outcome == "pending":
                     conn.execute(
-                        'UPDATE queue SET status = ?, run_id = NULL, attempt_no = NULL, '
-                        'started_at = NULL WHERE job_uid = ?',
-                        ("pending", job_uid),
+                        'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
+                        'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
+                        (dumps(public_queue_snapshot(stored_job)), "pending", job_uid),
                     )
 
             return True

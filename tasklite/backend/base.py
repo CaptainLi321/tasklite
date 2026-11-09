@@ -13,11 +13,48 @@ commit_retry / commit_skip 的事务内才删除（at-least-once 崩溃契约）
 """
 from __future__ import annotations
 
+import copy
 import threading
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Mapping, Sequence
 
 from ..models.attempt import ATTEMPT_OUTCOMES, AttemptRecord
+
+
+QUEUE_EXECUTION_ID_KEY = "__tasklite_execution_id__"
+
+
+def queue_snapshot_with_execution_id(
+    job_snapshot: Mapping[str, Any], execution_id: str
+) -> dict[str, Any]:
+    """返回带内部执行代号的队列快照。"""
+    stored = dict(job_snapshot)
+    stored[QUEUE_EXECUTION_ID_KEY] = execution_id
+    return stored
+
+
+def queue_snapshot_execution_id(job_snapshot: Mapping[str, Any]) -> str | None:
+    """读取队列快照内部执行代号；旧行或非法值返回 None。"""
+    value = job_snapshot.get(QUEUE_EXECUTION_ID_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def public_queue_snapshot(job_snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """返回剥离内部执行代号的业务快照副本。"""
+    public = copy.deepcopy(dict(job_snapshot))
+    public.pop(QUEUE_EXECUTION_ID_KEY, None)
+    return public
+
+
+def execution_id_matches_run(execution_id: str, run_id: str) -> bool:
+    """执行代号必须由本 Run 与正派发序号组成。"""
+    prefix, separator, dispatch_no = execution_id.rpartition(".")
+    return (
+        bool(separator)
+        and prefix == run_id
+        and dispatch_no.isdigit()
+        and int(dispatch_no) > 0
+    )
 
 
 def validate_queue_replacement(job_snapshots: Any) -> None:
@@ -404,8 +441,10 @@ class AbstractStateBackend(ABC):
     # 状态事务与编号（ADR-0011 目标格式与执行结算内部准备）───────────
 
     @abstractmethod
-    def mark_job_running(self, job_uid: str, *, run_id: str, started_at: str) -> int:
-        """原子将 pending job 转为 running 并递增分配 attempt_no。"""
+    def mark_job_running(
+        self, job_uid: str, *, execution_id: str, run_id: str, started_at: str
+    ) -> int:
+        """原子将 pending job 转为 running，持久化完整执行身份并递增 attempt_no。"""
 
     @abstractmethod
     def commit_job_settlement(
@@ -414,6 +453,7 @@ class AbstractStateBackend(ABC):
         job_uid: str,
         outcome: str,
         attempt_no: int,
+        execution_id: str,
         run_id: str,
         settled_at: str,
         started_at: str | None = None,
@@ -428,7 +468,7 @@ class AbstractStateBackend(ABC):
         payload: dict[str, Any] | None = None,
         requeued_job_snapshot: dict[str, Any] | None = None,
     ) -> bool:
-        """原子执行结算：同事务写入 Attempt、更新 Job 去向与档案、写入派生与游标。"""
+        """原子执行结算：校验完整执行身份后写入 Attempt、Job 去向、档案与派生数据。"""
 
     @abstractmethod
     def get_attempt_sequence(self, job_uid: str) -> int:

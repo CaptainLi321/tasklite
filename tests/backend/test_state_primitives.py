@@ -19,6 +19,7 @@ from tasklite.backend import (
     SQLiteStateBackend,
     TARGET_SCHEMA_VERSION,
 )
+from tasklite.backend.base import QUEUE_EXECUTION_ID_KEY
 from tasklite.models.job import Job
 from tasklite.models.state import job_uid_from_snapshot
 
@@ -60,15 +61,30 @@ def v6_backend(request, tmp_path) -> AbstractStateBackend:
 class TestStatePrimitivesParity:
     """双后端事务原子性与等价性测试。"""
 
-    @pytest.mark.parametrize(("run_id", "attempt_no"), [("another-run", 1), ("run", 2)])
-    def test_settlement_for_other_execution_is_rejected(self, v6_backend, run_id, attempt_no):
+    @pytest.mark.parametrize(
+        ("execution_id", "run_id", "attempt_no"),
+        [
+            ("run.999", "run", 1),
+            ("another-run.999", "another-run", 1),
+            ("run.1", "run", 2),
+        ],
+    )
+    def test_settlement_for_other_execution_is_rejected(
+        self, v6_backend, execution_id, run_id, attempt_no
+    ):
         uid = "t::parent"
         v6_backend.enqueue_jobs([_make_job("parent")])
-        v6_backend.mark_job_running(uid, run_id="run", started_at="2026-01-01T00:00:00Z")
+        v6_backend.mark_job_running(
+            uid,
+            execution_id="run.1",
+            run_id="run",
+            started_at="2026-01-01T00:00:00Z",
+        )
         before = _state_facts(v6_backend)
         with pytest.raises(ValueError, match="does not match the running execution"):
             v6_backend.commit_job_settlement(
-                job_uid=uid, outcome="success", run_id=run_id, attempt_no=attempt_no,
+                job_uid=uid, outcome="success", execution_id=execution_id,
+                run_id=run_id, attempt_no=attempt_no,
                 settled_at="2026-01-01T00:00:01Z", success_metadata={"ok": True},
                 spawned_job_snapshots=[_make_job("child")], cursor_updates={"offset": "new"},
             )
@@ -80,14 +96,25 @@ class TestStatePrimitivesParity:
         job = _make_job("parent")
         started_at = "2026-01-01T00:00:00Z"
         v6_backend.enqueue_jobs([job])
-        attempt_no = v6_backend.mark_job_running(uid, run_id="run", started_at=started_at)
+        attempt_no = v6_backend.mark_job_running(
+            uid, execution_id="run.1", run_id="run", started_at=started_at
+        )
         assert v6_backend.commit_job_settlement(
-            job_uid=uid, outcome="retry", run_id="run", attempt_no=attempt_no,
+            job_uid=uid, outcome="retry", execution_id="run.1",
+            run_id="run", attempt_no=attempt_no,
             settled_at="2026-01-01T00:00:01Z",
         )
         # 人工恢复相同 running 行，模拟队列与已结算历史矛盾。
+        running_job = dict(
+            job,
+            status="running",
+            run_id="run",
+            attempt_no=attempt_no,
+            started_at=started_at,
+        )
+        running_job[QUEUE_EXECUTION_ID_KEY] = "run.1"
         v6_backend.save_queue([
-            dict(job, status="running", run_id="run", attempt_no=attempt_no, started_at=started_at),
+            running_job,
         ])
         before = _state_facts(v6_backend)
         attempts = v6_backend.load_settled_attempts(uid)
@@ -95,6 +122,7 @@ class TestStatePrimitivesParity:
         with pytest.raises(ValueError, match="already settled"):
             v6_backend.commit_job_settlement(
                 job_uid=uid, outcome="success", run_id="run", attempt_no=attempt_no,
+                execution_id="run.1",
                 settled_at="2026-01-01T00:00:02Z",
                 spawned_job_snapshots=[_make_job("child")], cursor_updates={"offset": "new"},
             )
@@ -106,7 +134,12 @@ class TestStatePrimitivesParity:
         # 初始入队
         parent_job = _make_job("parent")
         b.enqueue_jobs([parent_job])
-        b.mark_job_running("t::parent", run_id="run_1", started_at="2026-11-08T00:00:00Z")
+        b.mark_job_running(
+            "t::parent",
+            execution_id="run_1.1",
+            run_id="run_1",
+            started_at="2026-11-08T00:00:00Z",
+        )
 
         before = _state_facts(b)
         assert len(before["queue"]) == 1
@@ -118,6 +151,7 @@ class TestStatePrimitivesParity:
                 job_uid="t::parent",
                 outcome="success",
                 attempt_no=1,
+                execution_id="run_1.1",
                 run_id="run_1",
                 settled_at="2026-11-08T00:00:01Z",
                 success_metadata={"ok": True},
@@ -139,6 +173,7 @@ class TestStatePrimitivesParity:
             job_uid="t::parent",
             outcome="success",
             attempt_no=1,
+            execution_id="run_1.1",
             run_id="run_1",
             settled_at="2026-11-08T00:00:02Z",
             success_metadata={"ok": True},
@@ -155,13 +190,19 @@ class TestStatePrimitivesParity:
 
         # --- 场景 1: success ---
         b.enqueue_jobs([_make_job("job_s")])
-        att_no = b.mark_job_running("t::job_s", run_id="run_s", started_at="2026-11-08T00:00:00Z")
+        att_no = b.mark_job_running(
+            "t::job_s",
+            execution_id="run_s.1",
+            run_id="run_s",
+            started_at="2026-11-08T00:00:00Z",
+        )
         assert att_no == 1
 
         ok = b.commit_job_settlement(
             job_uid="t::job_s",
             outcome="success",
             attempt_no=1,
+            execution_id="run_s.1",
             run_id="run_s",
             started_at="2026-11-08T00:00:00Z",
             settled_at="2026-11-08T00:00:01Z",
@@ -190,12 +231,18 @@ class TestStatePrimitivesParity:
 
         # --- 场景 2: failure ---
         b.enqueue_jobs([_make_job("job_f")])
-        b.mark_job_running("t::job_f", run_id="run_f", started_at="2026-11-08T01:00:00Z")
+        b.mark_job_running(
+            "t::job_f",
+            execution_id="run_f.1",
+            run_id="run_f",
+            started_at="2026-11-08T01:00:00Z",
+        )
 
         ok = b.commit_job_settlement(
             job_uid="t::job_f",
             outcome="failure",
             attempt_no=1,
+            execution_id="run_f.1",
             run_id="run_f",
             settled_at="2026-11-08T01:00:01Z",
             failure_metadata={"error": "oom"},
@@ -211,12 +258,18 @@ class TestStatePrimitivesParity:
 
         # --- 场景 3: retry (留队重试) ---
         b.enqueue_jobs([_make_job("job_r")])
-        b.mark_job_running("t::job_r", run_id="run_r", started_at="2026-11-08T02:00:00Z")
+        b.mark_job_running(
+            "t::job_r",
+            execution_id="run_r.1",
+            run_id="run_r",
+            started_at="2026-11-08T02:00:00Z",
+        )
 
         ok = b.commit_job_settlement(
             job_uid="t::job_r",
             outcome="retry",
             attempt_no=1,
+            execution_id="run_r.1",
             run_id="run_r",
             settled_at="2026-11-08T02:00:01Z",
         )
@@ -233,12 +286,18 @@ class TestStatePrimitivesParity:
 
         # --- 场景 4: pending (授权拒绝/中断) ---
         b.enqueue_jobs([_make_job("job_p")])
-        b.mark_job_running("t::job_p", run_id="run_p", started_at="2026-11-08T03:00:00Z")
+        b.mark_job_running(
+            "t::job_p",
+            execution_id="run_p.1",
+            run_id="run_p",
+            started_at="2026-11-08T03:00:00Z",
+        )
 
         ok = b.commit_job_settlement(
             job_uid="t::job_p",
             outcome="pending",
             attempt_no=1,
+            execution_id="run_p.1",
             run_id="run_p",
             settled_at="2026-11-08T03:00:01Z",
             error_message="authorization denied",
@@ -264,7 +323,12 @@ class TestAttemptSequenceIndependence:
 
         # 1. 首次执行进入 running
         b.enqueue_jobs([_make_job("target_seq")])
-        seq1 = b.mark_job_running(job_uid, run_id="run_1", started_at="2026-11-08T00:00:00Z")
+        seq1 = b.mark_job_running(
+            job_uid,
+            execution_id="run_1.1",
+            run_id="run_1",
+            started_at="2026-11-08T00:00:00Z",
+        )
         assert seq1 == 1
         assert b.get_attempt_sequence(job_uid) == 1
 
@@ -273,6 +337,7 @@ class TestAttemptSequenceIndependence:
             job_uid=job_uid,
             outcome="success",
             attempt_no=1,
+            execution_id="run_1.1",
             run_id="run_1",
             settled_at="2026-11-08T00:00:01Z",
             success_metadata={"status": "ok"},
@@ -301,7 +366,12 @@ class TestAttemptSequenceIndependence:
 
         # 3. 重新入队并再次进入 running
         b.enqueue_jobs([_make_job("target_seq")])
-        seq2 = b.mark_job_running(job_uid, run_id="run_2", started_at="2026-11-08T01:00:00Z")
+        seq2 = b.mark_job_running(
+            job_uid,
+            execution_id="run_2.2",
+            run_id="run_2",
+            started_at="2026-11-08T01:00:00Z",
+        )
         # 关键断言：编号单调递增为 2，未重置为 1
         assert seq2 == 2
         assert b.get_attempt_sequence(job_uid) == 2
@@ -334,11 +404,17 @@ class TestDatabaseRejectionAndPreservation:
         path = tmp_path / "v6_db.db"
         backend = SQLiteStateBackend(path, schema_version=TARGET_SCHEMA_VERSION)
         backend.enqueue_jobs([_make_job("j1")])
-        backend.mark_job_running("t::j1", run_id="r1", started_at="2026-11-08T00:00:00Z")
+        backend.mark_job_running(
+            "t::j1",
+            execution_id="r1.1",
+            run_id="r1",
+            started_at="2026-11-08T00:00:00Z",
+        )
         backend.commit_job_settlement(
             job_uid="t::j1",
             outcome="success",
             attempt_no=1,
+            execution_id="r1.1",
             run_id="r1",
             settled_at="2026-11-08T00:00:01Z",
             success_metadata={"result": "preserved"},

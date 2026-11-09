@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+import json
 from pathlib import Path
 import os
 import sqlite3
@@ -17,6 +18,7 @@ import time
 import pytest
 
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
+from tasklite.backend.base import QUEUE_EXECUTION_ID_KEY
 from tasklite.resource import CapacityResource
 from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
 
@@ -27,11 +29,17 @@ def test_startup_invariant_conflict_raises_runtime_error(tmp_path: Path, outcome
     db_path = tmp_path / "conflict_state.db"
     backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
     backend.enqueue_jobs([{"task_type": "t", "job_id": "1"}])
-    backend.mark_job_running("t::1", run_id="run_old", started_at="2026-01-01T00:00:00+00:00")
+    backend.mark_job_running(
+        "t::1",
+        execution_id="run_old.1",
+        run_id="run_old",
+        started_at="2026-01-01T00:00:00+00:00",
+    )
     backend.commit_job_settlement(
         job_uid="t::1",
         outcome=outcome,
         attempt_no=1,
+        execution_id="run_old.1",
         run_id="run_old",
         settled_at="2026-01-01T00:00:01+00:00",
         success_metadata={"score": 100},
@@ -46,7 +54,12 @@ def test_startup_invariant_conflict_raises_runtime_error(tmp_path: Path, outcome
 
     # 排在冲突记录前的合法遗留执行也必须保持原样。
     backend.enqueue_jobs([{"task_type": "t", "job_id": "orphan"}], front=True)
-    backend.mark_job_running("t::orphan", run_id="run_old", started_at="2026-01-01T00:00:00Z")
+    backend.mark_job_running(
+        "t::orphan",
+        execution_id="run_old.2",
+        run_id="run_old",
+        started_at="2026-01-01T00:00:00Z",
+    )
     assert_startup_conflict_preserves_database(db_path)
 
 
@@ -71,9 +84,38 @@ def test_startup_rejects_running_identity_conflict(tmp_path, corruption):
     db_path = tmp_path / "state.db"
     backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
     backend.enqueue_jobs([Job("t", "one").to_dict()])
-    backend.mark_job_running("t::one", run_id="old", started_at="2026-01-01T00:00:00Z")
+    backend.mark_job_running(
+        "t::one",
+        execution_id="old.1",
+        run_id="old",
+        started_at="2026-01-01T00:00:00Z",
+    )
     with backend._get_conn() as conn:
         conn.execute(corruption)
+    assert_startup_conflict_preserves_database(db_path)
+
+
+def test_startup_rejects_running_execution_id_mismatch(tmp_path):
+    db_path = tmp_path / "state.db"
+    backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+    backend.enqueue_jobs([Job("t", "one").to_dict()])
+    backend.mark_job_running(
+        "t::one",
+        execution_id="old.1",
+        run_id="old",
+        started_at="2026-01-01T00:00:00Z",
+    )
+    with backend._get_conn() as conn:
+        raw = conn.execute(
+            "SELECT job_snapshot FROM queue WHERE job_uid = 't::one'"
+        ).fetchone()[0]
+        stored = json.loads(raw)
+        stored[QUEUE_EXECUTION_ID_KEY] = "other.1"
+        conn.execute(
+            "UPDATE queue SET job_snapshot = ? WHERE job_uid = 't::one'",
+            (json.dumps(stored),),
+        )
+
     assert_startup_conflict_preserves_database(db_path)
 
 
@@ -102,9 +144,15 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
     uid = "work::one"
     first = Job("work", "one").to_dict()
     backend.enqueue_jobs([first])
-    backend.mark_job_running(uid, run_id="first", started_at="2026-01-01T00:00:00Z")
+    backend.mark_job_running(
+        uid,
+        execution_id="first.1",
+        run_id="first",
+        started_at="2026-01-01T00:00:00Z",
+    )
     assert backend.commit_job_settlement(
-        job_uid=uid, outcome=old_outcome, attempt_no=1, run_id="first",
+        job_uid=uid, outcome=old_outcome, attempt_no=1,
+        execution_id="first.1", run_id="first",
         settled_at="2026-01-01T00:00:01Z", job_snapshot=first,
         success_metadata={"job_snapshot": first}, failure_metadata={"job_snapshot": first},
     )
@@ -186,7 +234,12 @@ def test_leftover_running_recovery_and_idempotence(tmp_path: Path):
     db_path = tmp_path / "recovery_state.db"
     backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
     backend.enqueue_jobs([{"task_type": "work", "job_id": "orphan"}])
-    att_no = backend.mark_job_running("work::orphan", run_id="run_crash", started_at="2026-01-01T00:00:00+00:00")
+    att_no = backend.mark_job_running(
+        "work::orphan",
+        execution_id="run_crash.1",
+        run_id="run_crash",
+        started_at="2026-01-01T00:00:00+00:00",
+    )
     assert att_no == 1
 
     pipeline = TaskLite(backend="sqlite", state_path=db_path)
@@ -293,7 +346,12 @@ def test_recovery_settlement_fault_preserves_running(tmp_path, monkeypatch, rais
     backend = pipeline._runtime.store.backend
     snapshot = {"task_type": "work", "job_id": "orphan", "payload": {"key": "value"}}
     backend.enqueue_jobs([snapshot])
-    backend.mark_job_running("work::orphan", run_id="old", started_at="2026-01-01T00:00:00+00:00")
+    backend.mark_job_running(
+        "work::orphan",
+        execution_id="old.1",
+        run_id="old",
+        started_at="2026-01-01T00:00:00+00:00",
+    )
 
     def fail_settlement(**kwargs):
         if raises:
@@ -317,6 +375,16 @@ def unsettled_effect_handler(job, ctx):
     return TaskResult.success()
 
 
+def pending_after_effect_handler(job, ctx):
+    effect = Path(job.payload["effect"])
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        if effect.exists() and effect.read_text(encoding="utf-8") == "effect\n":
+            return TaskResult.success()
+        time.sleep(0.02)
+    raise TimeoutError("work effect was not committed before pending settlement")
+
+
 @pytest.mark.parametrize("raises", [False, True])
 def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypatch, raises):
     """结算写入故障保留 running，重开只恢复失败，不重复业务副作用。"""
@@ -324,9 +392,9 @@ def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypat
     effect = tmp_path / "effect.txt"
     pipeline = TaskLite(backend="sqlite", state_path=db_path)
     pipeline.register_task("work", unsettled_effect_handler)
-    pipeline.register_task("pending", child_consumer_handler)
+    pipeline.register_task("pending", pending_after_effect_handler)
     pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
-    pipeline.enqueue(Job("pending", "two"))
+    pipeline.enqueue(Job("pending", "two", payload={"effect": str(effect)}))
 
     def fail_settlement(**kwargs):
         if raises:
@@ -334,7 +402,11 @@ def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypat
         return False
 
     with monkeypatch.context() as patch:
-        patch.setattr(pipeline._runtime.store.backend, "commit_job_settlement", fail_settlement)
+        patch.setattr(
+            pipeline._runtime.store.backend,
+            "commit_job_settlement",
+            fail_settlement,
+        )
         with pytest.raises(BaseException, match="结算失败|commit_job_settlement returned False"):
             pipeline.run()
     rows = pipeline._runtime.store.backend.load_queue_jobs()
@@ -345,7 +417,7 @@ def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypat
 
     with TaskLite(backend="sqlite", state_path=db_path) as reopened:
         reopened.register_task("work", unsettled_effect_handler)
-        reopened.register_task("pending", child_consumer_handler)
+        reopened.register_task("pending", pending_after_effect_handler)
         reopened.run()
         attempts = reopened._runtime.store.backend.load_settled_attempts("work::one")
         assert len(attempts) == 1

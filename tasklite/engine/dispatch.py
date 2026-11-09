@@ -367,14 +367,18 @@ class DispatchMachine:
         attempt_no = 1
 
         if store.backend.schema_version >= TARGET_SCHEMA_VERSION:
-            execution_id = f"{self._session.run_id}.{self._session.next_dispatch_no()}"
+            effective_run_id = self._session.run_id or "run"
+            execution_id = f"{effective_run_id}.{self._session.next_dispatch_no()}"
             try:
                 attempt_no = store.mark_job_running(
-                    job_uid, run_id=self._session.run_id or "run", started_at=started_at
+                    job_uid,
+                    execution_id=execution_id,
+                    run_id=effective_run_id,
+                    started_at=started_at,
                 )
                 job.attempt_no = attempt_no
                 job_snapshot["attempt_no"] = attempt_no
-                job_snapshot["run_id"] = self._session.run_id
+                job_snapshot["run_id"] = effective_run_id
                 job_snapshot["started_at"] = started_at
             except (_CommitCrashSignal, Exception) as e:
                 logger.critical(
@@ -432,6 +436,7 @@ class DispatchMachine:
                 job_snapshot=job_snapshot,
                 cascade=True,
                 attempt_no=attempt_no,
+                execution_id=execution_id,
                 run_id=self._session.run_id or "run",
                 started_at=started_at,
                 files={k: v.to_dict() for k, v in resolved_files.items()},

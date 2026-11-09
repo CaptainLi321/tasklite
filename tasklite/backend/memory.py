@@ -17,6 +17,11 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .base import (
     AbstractStateBackend,
+    QUEUE_EXECUTION_ID_KEY,
+    execution_id_matches_run,
+    public_queue_snapshot,
+    queue_snapshot_execution_id,
+    queue_snapshot_with_execution_id,
     validate_attempt_dispatch,
     validate_attempt_finish,
     validate_queue_replacement,
@@ -73,8 +78,11 @@ class InMemoryStateBackend(AbstractStateBackend):
     def load_queue(self) -> list[dict[str, Any]]:
         with self._lock:
             if self.schema_version >= 6:
-                return [copy.deepcopy(j) for j in self._queue if j.get("status", "pending") == "pending"]
-            return copy.deepcopy(self._queue)
+                return [
+                    public_queue_snapshot(j)
+                    for j in self._queue if j.get("status", "pending") == "pending"
+                ]
+            return [public_queue_snapshot(j) for j in self._queue]
 
     # 整表重写 -------------------------------------------------------
 
@@ -386,6 +394,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                     snap_copy["run_id"] = None
                     snap_copy["attempt_no"] = None
                     snap_copy["started_at"] = None
+                    snap_copy.pop(QUEUE_EXECUTION_ID_KEY, None)
                     new_queue.append(snap_copy)
                 elif status == "succeeded":
                     new_queue = [
@@ -423,7 +432,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             for snapshot in self._queue:
                 if job_uid_from_snapshot(snapshot) == uid:
-                    return copy.deepcopy(snapshot)
+                    return public_queue_snapshot(snapshot)
 
             success_snapshot = self._snapshot_from_metadata(self._successes.get(uid))
             if success_snapshot is not None:
@@ -466,7 +475,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                     known[uid] = copy.deepcopy(snapshot)
 
             for snapshot in self._queue:
-                known[job_uid_from_snapshot(snapshot)] = copy.deepcopy(snapshot)
+                known[job_uid_from_snapshot(snapshot)] = public_queue_snapshot(snapshot)
         return known
 
     def clear_history(self, uid: str, records: set[str]) -> int:
@@ -604,9 +613,15 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     # 状态事务与编号（ADR-0011 目标格式与执行结算内部准备）───────────
 
-    def mark_job_running(self, job_uid: str, *, run_id: str, started_at: str) -> int:
+    def mark_job_running(
+        self, job_uid: str, *, execution_id: str, run_id: str, started_at: str
+    ) -> int:
+        if not isinstance(execution_id, str) or not execution_id:
+            raise ValueError("execution_id must be a non-empty str")
         if not isinstance(run_id, str) or not run_id:
             raise ValueError("run_id must be a non-empty str")
+        if not execution_id_matches_run(execution_id, run_id):
+            raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
         if not isinstance(started_at, str) or not started_at:
             raise ValueError("started_at must be a non-empty str")
         with self._lock:
@@ -629,7 +644,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 next_no = q_att if (isinstance(q_att, int) and q_att >= 1) else 1
             self._job_sequences[job_uid] = next_no
 
-            updated_job = copy.deepcopy(job_data)
+            updated_job = queue_snapshot_with_execution_id(job_data, execution_id)
             updated_job["status"] = "running"
             updated_job["run_id"] = run_id
             updated_job["attempt_no"] = next_no
@@ -669,8 +684,9 @@ class InMemoryStateBackend(AbstractStateBackend):
                 results.append({
                     "job_uid": job_uid_from_snapshot(j),
                     "queue_position": pos,
-                    "job": copy.deepcopy(j),
+                    "job": public_queue_snapshot(j),
                     "status": j_status,
+                    "execution_id": queue_snapshot_execution_id(j),
                     "run_id": j.get("run_id"),
                     "attempt_no": j.get("attempt_no"),
                     "started_at": j.get("started_at"),
@@ -683,6 +699,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         job_uid: str,
         outcome: str,
         attempt_no: int,
+        execution_id: str,
         run_id: str,
         settled_at: str,
         started_at: str | None = None,
@@ -701,8 +718,12 @@ class InMemoryStateBackend(AbstractStateBackend):
             raise ValueError(f"Invalid outcome: {outcome}")
         if not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 1:
             raise TypeError(f"attempt_no must be int >= 1, got {attempt_no!r}")
+        if not isinstance(execution_id, str) or not execution_id:
+            raise ValueError(f"execution_id must be non-empty str, got {execution_id!r}")
         if not isinstance(run_id, str) or not run_id:
             raise ValueError(f"run_id must be non-empty str, got {run_id!r}")
+        if not execution_id_matches_run(execution_id, run_id):
+            raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
         if not isinstance(settled_at, str) or not settled_at:
             raise ValueError(f"settled_at must be non-empty str, got {settled_at!r}")
         if started_at is not None and (not isinstance(started_at, str) or not started_at):
@@ -720,9 +741,12 @@ class InMemoryStateBackend(AbstractStateBackend):
             running = next(
                 (item for item in self._queue if job_uid_from_snapshot(item) == job_uid), {}
             )
-            if (running.get("status"), running.get("run_id"), running.get("attempt_no")) != (
-                "running", run_id, attempt_no,
-            ):
+            if (
+                running.get("status"),
+                running.get("run_id"),
+                running.get("attempt_no"),
+                queue_snapshot_execution_id(running),
+            ) != ("running", run_id, attempt_no, execution_id):
                 raise ValueError(f"Settlement does not match the running execution for {job_uid}")
             if any(
                 isinstance(attempt, dict) and attempt.get("job_uid") == job_uid
@@ -802,6 +826,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                         target["run_id"] = None
                         target["attempt_no"] = target.get("attempt_no") or 1
                         target["started_at"] = None
+                        target.pop(QUEUE_EXECUTION_ID_KEY, None)
                         new_queue[idx] = target
                         found = True
                         break
@@ -818,6 +843,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                         target["run_id"] = None
                         target["attempt_no"] = target.get("attempt_no") or 1
                         target["started_at"] = None
+                        target.pop(QUEUE_EXECUTION_ID_KEY, None)
                         new_queue[idx] = target
                         break
 
