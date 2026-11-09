@@ -381,6 +381,62 @@ class TestJobRecordStructureAndPriority:
 class TestQueriesAndFilters:
     """iter_jobs 与 iter_attempts 的过滤与排序。"""
 
+    def test_sqlite_iter_jobs_streams_cursor_rows(self, tmp_path):
+        p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+        p.register_task(Task("process", dummy_handler))
+        for job_id in ("succ", "pend", "fail"):
+            p.enqueue(Job("process", job_id))
+        p.run()
+        p.set_job_status("process::pend", "pending", recursive=False)
+        p.set_job_status("process::fail", "failed", recursive=False)
+
+        class TrackedCursor:
+            def __init__(self, cursor):
+                self._cursor = cursor
+                self.steps = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                row = next(self._cursor)
+                self.steps += 1
+                return row
+
+            def fetchone(self):
+                return self._cursor.fetchone()
+
+            def fetchall(self):
+                raise AssertionError("iter_jobs must not materialize SQLite rows")
+
+        class TrackedConnection:
+            def __init__(self, conn):
+                self._conn = conn
+                self.cursors = []
+
+            def execute(self, sql, params=()):
+                cursor = TrackedCursor(self._conn.execute(sql, params))
+                self.cursors.append(cursor)
+                return cursor
+
+        with StateSnapshot.open(p) as snapshot:
+            tracked = TrackedConnection(snapshot._reader._conn)
+            snapshot._reader._conn = tracked
+
+            jobs = list(snapshot.iter_jobs())
+            assert {job["job_uid"] for job in jobs} == {
+                "process::succ",
+                "process::pend",
+                "process::fail",
+            }
+
+            before = sum(cursor.steps for cursor in tracked.cursors)
+            iterator = snapshot.iter_jobs()
+            first = next(iterator)
+            assert first["job_uid"] == "process::pend"
+            assert sum(cursor.steps for cursor in tracked.cursors) == before + 1
+            iterator.close()
+
     def test_iter_jobs_filtering_and_uniqueness(self, pipeline_fixture):
         p = pipeline_fixture
         p.enqueue(Job("process", "j_succ"))

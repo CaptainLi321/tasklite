@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -236,6 +237,36 @@ class TestCursor:
 
 class TestClearHistory:
     """清除所选历史不触碰队列、游标或编号进度。"""
+
+    def test_sqlite_cross_table_delete_rolls_back_on_trigger_error(self, tmp_path):
+        app = _make_app("sqlite", tmp_path)
+        try:
+            app.enqueue(Job("work", "item"))
+            app.run()
+            assert app.state_path is not None
+            with sqlite3.connect(app.state_path) as conn:
+                conn.execute(
+                    "CREATE TRIGGER reject_attempt_clear "
+                    "BEFORE DELETE ON attempts "
+                    "WHEN OLD.job_uid = 'work::item' "
+                    "BEGIN "
+                    "SELECT RAISE(ABORT, 'injected attempts delete failure'); "
+                    "END"
+                )
+
+            with pytest.raises(
+                sqlite3.IntegrityError, match="injected attempts delete failure"
+            ):
+                app.clear_history(
+                    "work::item", records=["successes", "attempts"]
+                )
+
+            with StateSnapshot.open(app) as snapshot:
+                job = snapshot.get_job("work::item")
+                assert job is not None and job["status"] == "succeeded"
+                assert len(list(snapshot.iter_attempts(job_uid="work::item"))) == 1
+        finally:
+            app.close()
 
     def test_granular_clear_preserves_other_facts_and_sequence(self, app):
         app.set_cursor("cursor", "value")

@@ -392,12 +392,10 @@ class _SqliteSnapshotReader:
         q_rows = self._conn.execute(
             "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
             "FROM queue ORDER BY queue_position ASC"
-        ).fetchall()
+        )
 
-        queue_uids: set[str] = set()
         for r in q_rows:
             uid = r[0]
-            queue_uids.add(uid)
             st = r[3]
             if status is not None and st != status:
                 continue
@@ -426,12 +424,13 @@ class _SqliteSnapshotReader:
 
         if status is None or status == "succeeded":
             s_rows = self._conn.execute(
-                "SELECT job_uid, metadata FROM successes"
-            ).fetchall()
+                "SELECT s.job_uid, s.metadata FROM successes AS s "
+                "WHERE NOT EXISTS ("
+                "SELECT 1 FROM queue AS q WHERE q.job_uid = s.job_uid"
+                ")"
+            )
             for r in s_rows:
                 uid = r[0]
-                if uid in queue_uids:
-                    continue
                 if task_type is not None:
                     try:
                         tt, _ = parse_job_uid(uid)
@@ -445,12 +444,13 @@ class _SqliteSnapshotReader:
 
         if status is None or status == "failed":
             f_rows = self._conn.execute(
-                "SELECT job_uid, metadata, payload FROM failed"
-            ).fetchall()
+                "SELECT f.job_uid, f.metadata, f.payload FROM failed AS f "
+                "WHERE NOT EXISTS ("
+                "SELECT 1 FROM queue AS q WHERE q.job_uid = f.job_uid"
+                ")"
+            )
             for r in f_rows:
                 uid = r[0]
-                if uid in queue_uids:
-                    continue
                 if task_type is not None:
                     try:
                         tt, _ = parse_job_uid(uid)
