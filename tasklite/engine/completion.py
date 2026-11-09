@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 import time
+import traceback
 from typing import Any, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -44,6 +44,7 @@ from .in_flight import InFlightJob, InFlightTracker
 from .types import AttemptOutcome
 
 logger = logging.getLogger("tasklite")
+_CLEANUP_ERRORS = (OSError, ValueError, NotImplementedError)
 
 
 class CompletionMachine:
@@ -80,6 +81,47 @@ class CompletionMachine:
         updated = self._fallback_retry_counts.get(uid, 0) + 1
         self._fallback_retry_counts[uid] = updated
         return updated
+
+    @staticmethod
+    def _cleanup_exception(exc: BaseException) -> dict[str, str]:
+        return {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+    @classmethod
+    def _attach_cleanup_failure(
+        cls,
+        result: ExecutionResult,
+        exc: BaseException,
+    ) -> None:
+        details = cls._cleanup_exception(exc)
+        result.annotations["cleanup_error"] = str(exc)
+        result.annotations["cleanup_exception"] = details
+        if result.exception is None:
+            result.exception = details
+
+    @classmethod
+    def _record_failure_cleanup_error(
+        cls,
+        result: ExecutionResult,
+        exc: BaseException,
+    ) -> None:
+        cls._attach_cleanup_failure(result, exc)
+        if result.retry_requested:
+            original_message = result.message or result.retry_error
+            if original_message:
+                result.annotations["cleanup_original_message"] = original_message
+            result.retry_requested = False
+            result.message = f"Retry cleanup failed: {exc}"
+            if original_message:
+                result.message = f"{result.message} (original: {original_message})"
+            return
+        if result.message:
+            result.message = f"{result.message} (cleanup failed: {exc})"
+        else:
+            result.message = f"Cleanup failed: {exc}"
 
     # ── 唯一收尾出口 ──────────────────────────────────────────────────
 
@@ -240,42 +282,48 @@ class CompletionMachine:
             )
             if result.success:
                 for fname, spec in active_files.items():
-                    if spec.delete_on_success and spec.path and os.path.exists(spec.path):
-                        if not store.check_or_request_authorization(spec.path):
-                            result.success = False
-                            result.message = f"Success cleanup authorization denied: {spec.path}"
-                            break
-                        try:
-                            policy.cleanup(
-                                ArtifactDeclaration(spec.path, delete_on_success=True),
-                                success=True,
-                            )
-                        except OSError as exc:
-                            result.success = False
-                            result.message = f"Success cleanup failed: {exc}"
-                            break
+                    if not (spec.delete_on_success and spec.path):
+                        continue
+                    declaration = ArtifactDeclaration(spec.path, delete_on_success=True)
+                    try:
+                        present = policy.entry_exists(declaration)
+                    except _CLEANUP_ERRORS as exc:
+                        result.success = False
+                        result.message = f"Success cleanup failed: {exc}"
+                        self._attach_cleanup_failure(result, exc)
+                        break
+                    if not present:
+                        continue
+                    if not store.check_or_request_authorization(spec.path):
+                        result.success = False
+                        result.message = f"Success cleanup authorization denied: {spec.path}"
+                        break
+                    try:
+                        policy.cleanup(declaration, success=True)
+                    except _CLEANUP_ERRORS as exc:
+                        result.success = False
+                        result.message = f"Success cleanup failed: {exc}"
+                        self._attach_cleanup_failure(result, exc)
+                        break
                 if not result.success:
                     spawned_job_snapshots = []
                     result.cursor_updates = {}
             else:
                 for fname, spec in active_files.items():
-                    if spec.delete_on_failure and spec.path and os.path.exists(spec.path):
-                        if store.check_or_request_authorization(spec.path):
-                            try:
-                                policy.cleanup(
-                                    ArtifactDeclaration(spec.path, delete_on_failure=True),
-                                    success=False,
-                                )
-                            except OSError as exc:
-                                if result.retry_requested:
-                                    result.retry_requested = False
-                                    result.message = f"Retry cleanup failed: {exc}"
-                                else:
-                                    result.annotations["cleanup_error"] = str(exc)
-                                    if result.message:
-                                        result.message = f"{result.message} (cleanup failed: {exc})"
-                                    else:
-                                        result.message = f"Cleanup failed: {exc}"
+                    if not (spec.delete_on_failure and spec.path):
+                        continue
+                    declaration = ArtifactDeclaration(spec.path, delete_on_failure=True)
+                    try:
+                        present = policy.entry_exists(declaration)
+                    except _CLEANUP_ERRORS as exc:
+                        self._record_failure_cleanup_error(result, exc)
+                        continue
+                    if not present or not store.check_or_request_authorization(spec.path):
+                        continue
+                    try:
+                        policy.cleanup(declaration, success=False)
+                    except _CLEANUP_ERRORS as exc:
+                        self._record_failure_cleanup_error(result, exc)
 
         # 释放资源（必须在事务提交之前完成）
         if entry is not None:
@@ -590,6 +638,13 @@ class CompletionMachine:
                 failure_record["exception"] = copy.deepcopy(result.exception)
             if "metadata" not in failure_record:
                 failure_record["metadata"] = copy.deepcopy(result.result_metadata)
+            for key in (
+                "cleanup_error",
+                "cleanup_exception",
+                "cleanup_original_message",
+            ):
+                if key in result.annotations and key not in failure_record:
+                    failure_record[key] = copy.deepcopy(result.annotations[key])
 
         files_dict = (
             {k: v.to_dict() for k, v in active_files.items()}

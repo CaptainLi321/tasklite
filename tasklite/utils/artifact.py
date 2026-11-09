@@ -18,6 +18,15 @@ from ..models.artifact import ArtifactDeclaration
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
+def _execute_pre_deletes(
+    policy: "ArtifactPathPolicy",
+    declarations: Sequence[ArtifactDeclaration],
+) -> None:
+    """按声明顺序执行前置删除；缺失目标由路径原语幂等吸收。"""
+    for declaration in declarations:
+        policy.remove_existing(declaration)
+
+
 class ArtifactPathPolicy:
     """路径范围配置；不登记全局所有权或持久执行阶段。"""
 
@@ -34,6 +43,15 @@ class ArtifactPathPolicy:
 
     def resolve(self, path: str | Path, *, sandbox: bool = True) -> str:
         """返回受允许的规范路径；不把叶链接转换为其目标授权。"""
+        return self._resolve(path, sandbox=sandbox, allow_leaf_symlink=False)
+
+    def _resolve(
+        self,
+        path: str | Path,
+        *,
+        sandbox: bool,
+        allow_leaf_symlink: bool,
+    ) -> str:
         raw = os.fspath(path)
         if not isinstance(raw, str) or not raw or "\x00" in raw:
             raise ValueError("artifact path must be a non-empty path without null bytes")
@@ -46,11 +64,25 @@ class ArtifactPathPolicy:
         except FileNotFoundError:
             leaf = None
         if leaf is not None and stat.S_ISLNK(leaf.st_mode):
-            raise ValueError(f"artifact leaf must not be a symlink: {target}")
-        try:
-            target = target.resolve()
-        except RuntimeError as error:
-            raise ValueError(f"cannot resolve artifact path: {target}") from error
+            if not allow_leaf_symlink:
+                raise ValueError(f"artifact leaf must not be a symlink: {target}")
+            try:
+                os.stat(target)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise ValueError(f"cannot inspect artifact leaf: {target}") from error
+            else:
+                raise ValueError(f"artifact leaf must not be a symlink: {target}")
+            try:
+                target = target.parent.resolve() / target.name
+            except RuntimeError as error:
+                raise ValueError(f"cannot resolve artifact path: {target}") from error
+        else:
+            try:
+                target = target.resolve()
+            except RuntimeError as error:
+                raise ValueError(f"cannot resolve artifact path: {target}") from error
         if sandbox and self.output_roots and not any(
             target.is_relative_to(root) for root in self.output_roots
         ):
@@ -67,12 +99,12 @@ class ArtifactPathPolicy:
 
     def remove_existing(self, declaration: ArtifactDeclaration) -> None:
         """仅以前删授权删除已有对象，其他清理权限不代替该授权。"""
-        target = self._target(declaration)
+        target = self._target(declaration, allow_leaf_symlink=True)
         if not self._exists(target):
             return
         if not declaration.delete_existing:
             raise FileExistsError(str(target))
-        self._remove(target, declaration)
+        self._remove(target, declaration, allow_leaf_symlink=True)
 
     def cleanup(self, declaration: ArtifactDeclaration, *, success: bool) -> None:
         """只应用指定结局的清理授权，缺失路径视为已移除。"""
@@ -84,6 +116,10 @@ class ArtifactPathPolicy:
             if self._exists(target):
                 self._remove(target, declaration)
 
+    def entry_exists(self, declaration: ArtifactDeclaration) -> bool:
+        """以非跟随方式判断声明目标是否存在；访问错误不降级为缺失。"""
+        return self._exists(self._target(declaration))
+
     @staticmethod
     def _exists(target: Path) -> bool:
         try:
@@ -92,8 +128,17 @@ class ArtifactPathPolicy:
         except FileNotFoundError:
             return False
 
-    def _target(self, declaration: ArtifactDeclaration) -> Path:
-        target = self.resolve(declaration.path, sandbox=declaration.sandbox)
+    def _target(
+        self,
+        declaration: ArtifactDeclaration,
+        *,
+        allow_leaf_symlink: bool = False,
+    ) -> Path:
+        target = self._resolve(
+            declaration.path,
+            sandbox=declaration.sandbox,
+            allow_leaf_symlink=allow_leaf_symlink,
+        )
         if target != declaration.path:
             raise ValueError(f"artifact parent path changed: {declaration.path}")
         return Path(target)
@@ -111,14 +156,20 @@ class ArtifactPathPolicy:
     def _same_object(first: os.stat_result, second: os.stat_result) -> bool:
         return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
-    def _remove(self, target: Path, declaration: ArtifactDeclaration) -> None:
+    def _remove(
+        self,
+        target: Path,
+        declaration: ArtifactDeclaration,
+        *,
+        allow_leaf_symlink: bool = False,
+    ) -> None:
         self._require_relative_operations()
         before = target.parent.stat(follow_symlinks=False)
         parent_fd = os.open(target.parent, _DIRECTORY_OPEN_FLAGS)
         try:
             if not self._same_object(before, os.fstat(parent_fd)):
                 raise ValueError(f"artifact parent identity changed: {target.parent}")
-            self._target(declaration)
+            self._target(declaration, allow_leaf_symlink=allow_leaf_symlink)
             try:
                 entry = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -129,14 +180,19 @@ class ArtifactPathPolicy:
                     raise ValueError(f"artifact directory contains a mount: {target}")
 
             def guard() -> None:
-                self._target(declaration)
+                self._target(declaration, allow_leaf_symlink=allow_leaf_symlink)
                 if not self._same_object(before, target.parent.stat(follow_symlinks=False)):
                     raise ValueError(f"artifact parent identity changed: {target.parent}")
                 current = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
                 if not self._same_object(entry, current):
                     raise ValueError(f"artifact identity changed during deletion: {target}")
 
-            self._remove_at(parent_fd, target, guard, allow_symlink=False)
+            self._remove_at(
+                parent_fd,
+                target,
+                guard,
+                allow_symlink=allow_leaf_symlink,
+            )
         finally:
             os.close(parent_fd)
 

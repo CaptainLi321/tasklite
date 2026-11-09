@@ -52,7 +52,7 @@ from ..models.artifact import (
 from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Exclude
-from ..utils.artifact import ArtifactPathPolicy
+from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
 from ..utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
@@ -256,15 +256,19 @@ class EngineRuntime:
                 }
                 return None
 
-        # 4. 前置删除（若声明要求且目标存在）
-        if bound_spec.delete_existing and os.path.exists(resolved_path):
+        # 4. 前置删除（缺失目标由路径原语幂等吸收）
+        if bound_spec.delete_existing:
             policy = ArtifactPathPolicy(
                 output_roots=self.config.output_roots,
                 protected_roots=self.config.protected_roots,
             )
+            entry.active_files[validated_name] = bound_spec
             try:
-                policy.remove_existing(ArtifactDeclaration(resolved_path, delete_existing=True))
-            except OSError as exc:
+                _execute_pre_deletes(
+                    policy,
+                    [ArtifactDeclaration(resolved_path, delete_existing=True)],
+                )
+            except (OSError, ValueError, NotImplementedError) as exc:
                 handle.preparation_error = {
                     "type": type(exc).__name__, "message": str(exc),
                     "traceback": traceback.format_exc(),
@@ -560,14 +564,18 @@ class EngineRuntime:
                 handle.waiting_auth = False
                 handle.pending_declaration = None
                 handle.resume_timeout()
-                if spec.delete_existing and os.path.exists(resolved_path):
+                if spec.delete_existing:
                     policy = ArtifactPathPolicy(
                         output_roots=self.config.output_roots,
                         protected_roots=self.config.protected_roots,
                     )
+                    entry.active_files[name] = spec
                     try:
-                        policy.remove_existing(ArtifactDeclaration(resolved_path, delete_existing=True))
-                    except OSError as exc:
+                        _execute_pre_deletes(
+                            policy,
+                            [ArtifactDeclaration(resolved_path, delete_existing=True)],
+                        )
+                    except (OSError, ValueError, NotImplementedError) as exc:
                         handle.preparation_error = {
                             "type": type(exc).__name__, "message": str(exc),
                             "traceback": traceback.format_exc(),

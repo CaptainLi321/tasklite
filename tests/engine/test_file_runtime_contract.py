@@ -38,6 +38,11 @@ def _noop_handler(job, ctx):
     return TaskResult.success()
 
 
+def _marker_handler(job, ctx):
+    Path(job.payload["marker"]).write_text("started", encoding="utf-8")
+    return TaskResult.success()
+
+
 def test_from_output_reference_and_resolution(tmp_path, monkeypatch):
     """from_output 保留配置引用且 Attempt 记录解析出规范绝对路径。"""
     monkeypatch.chdir(tmp_path)
@@ -210,7 +215,8 @@ def _fail_cleanup_handler(job, ctx):
     return TaskResult.success()
 
 
-def test_success_cleanup_failure_blocks_success_spawn_and_cursor(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cleanup_error", [OSError, ValueError, NotImplementedError])
+def test_success_cleanup_failure_blocks_success_spawn_and_cursor(tmp_path, monkeypatch, cleanup_error):
     """成功清理失败不发布成功/派生/游标，配置与实际文件记录分开。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
@@ -219,8 +225,7 @@ def test_success_cleanup_failure_blocks_success_spawn_and_cursor(tmp_path, monke
     p.register_task("spawned", _noop_handler)
     p.enqueue(Job("fail_clean", "fc1"))
 
-    # 构造清理失败：通过 mock policy.cleanup 抛 OSError
-    with patch("tasklite.utils.artifact.ArtifactPathPolicy.cleanup", side_effect=OSError("Disk write protected")):
+    with patch("tasklite.utils.artifact.ArtifactPathPolicy._remove", side_effect=cleanup_error("清理故障")):
         target = tmp_path / "undeletable.txt"
         target.write_text("data", encoding="utf-8")
         p.run()
@@ -230,13 +235,19 @@ def test_success_cleanup_failure_blocks_success_spawn_and_cursor(tmp_path, monke
     assert "fail_clean::fc1" in failed
     err_msg = failed["fail_clean::fc1"].get("error_message", "")
     assert "Success cleanup failed" in err_msg
+    attempts = p.backend.load_settled_attempts("fail_clean::fc1")
+    assert len(attempts) == 1 and attempts[0]["outcome"] == "failure"
+    assert attempts[0]["result"]["exception"]["type"] == cleanup_error.__name__
+    assert target.read_text(encoding="utf-8") == "data"
 
     # 不发布成功、不入队派生、不写入游标
     assert "fail_clean::fc1" not in p.backend.load_successes()
     assert "spawned::s1" not in p.backend.load_successes()
     assert "spawned::s1" not in p.backend.load_failed()
+    assert p.backend.load_queue_jobs() == []
     cursors = p.backend.load_cursors()
     assert "cur_key" not in cursors
+    assert attempts[0]["files"]["del_file"]["path"] == str(target)
 
 
 def _failing_handler(job, ctx):
@@ -248,7 +259,8 @@ def _failing_handler(job, ctx):
     raise RuntimeError("Business computation failed")
 
 
-def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cleanup_error", [OSError, ValueError, NotImplementedError])
+def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch, cleanup_error):
     """handler 已失败且失败清理再次失败：保留原始失败原因，附加清理错误。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
@@ -256,7 +268,10 @@ def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch)
     p.register_task("failing", _failing_handler)
     p.enqueue(Job("failing", "f1"))
 
-    with patch("tasklite.utils.artifact.ArtifactPathPolicy.cleanup", side_effect=OSError("I/O error during cleanup")):
+    with patch(
+        "tasklite.utils.artifact.ArtifactPathPolicy._remove",
+        side_effect=cleanup_error("I/O error during cleanup"),
+    ):
         p.run()
 
     failed = p.backend.load_failed()
@@ -265,6 +280,12 @@ def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch)
     error_msg = meta.get("error_message", "")
     assert "Business computation failed" in error_msg
     assert "cleanup failed" in error_msg
+    assert meta["exception"]["type"] == "RuntimeError"
+    assert meta["cleanup_exception"]["type"] == cleanup_error.__name__
+    attempt, = p.backend.load_settled_attempts("failing::f1")
+    assert attempt["outcome"] == "failure"
+    assert attempt["result"]["exception"]["type"] == "RuntimeError"
+    assert attempt["result"]["annotations"]["cleanup_exception"]["type"] == cleanup_error.__name__
 
 
 def _auth_denied_handler(job, ctx):
@@ -359,7 +380,10 @@ def _dynamic_delete_handler(job, ctx):
 
 @pytest.mark.parametrize("backend", ["sqlite", "memory"])
 @pytest.mark.parametrize("wait", [False, True])
-def test_approved_waiting_declaration_cleanup_error_fails_job(tmp_path, monkeypatch, backend, wait):
+@pytest.mark.parametrize("cleanup_error", [OSError, ValueError, NotImplementedError])
+def test_approved_waiting_declaration_cleanup_error_fails_job(
+    tmp_path, monkeypatch, backend, wait, cleanup_error,
+):
     """等待后获准的前删故障必须失败，不能冒充授权拒绝回 pending。"""
     monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
@@ -369,17 +393,152 @@ def test_approved_waiting_declaration_cleanup_error_fails_job(tmp_path, monkeypa
     p.authorizer = lambda *args: next(decisions)
     p.register_task("work", _dynamic_delete_handler)
     p.enqueue(Job("work", "one", payload={"path": str(target)}))
-    with patch("tasklite.utils.artifact.ArtifactPathPolicy.remove_existing", side_effect=OSError("清理磁盘拒绝写入")):
+    with patch(
+        "tasklite.utils.artifact.ArtifactPathPolicy.remove_existing",
+        side_effect=cleanup_error("清理磁盘拒绝写入"),
+    ):
         p.run()
     failure = p.backend.load_failed()["work::one"]
     assert "清理磁盘拒绝写入" in failure["error_message"]
     attempt, = p.backend.load_settled_attempts("work::one")
     assert attempt["outcome"] == "failure"
-    assert attempt["result"]["exception"]["type"] == "OSError"
+    assert attempt["result"]["exception"]["type"] == cleanup_error.__name__
     assert "remove_existing" in attempt["result"]["exception"]["traceback"]
     assert "清理磁盘拒绝写入" in attempt["error_message"]
+    assert attempt["files"]["target"]["path"] == str(target)
     assert p.backend.load_queue_jobs() == []
     assert target.read_text() == "valuable"
+    p.close()
+
+
+@pytest.mark.parametrize("cleanup_error", [OSError, ValueError, NotImplementedError])
+def test_pre_dispatch_cleanup_failure_settles_without_starting_worker(
+    tmp_path, monkeypatch, cleanup_error,
+):
+    """静态前删失败经统一结算登记失败，保留声明且不启动 handler。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    target = tmp_path / "target"
+    target.write_text("valuable", encoding="utf-8")
+    marker = tmp_path / "started"
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+    p.register_task("work", _marker_handler)
+    p.enqueue(Job(
+        "work",
+        "one",
+        payload={"marker": str(marker)},
+        files={"target": FileSpec(target, role="output", delete_existing=True)},
+    ))
+
+    with patch(
+        "tasklite.utils.artifact.ArtifactPathPolicy.remove_existing",
+        side_effect=cleanup_error("静态前删故障"),
+    ):
+        p.run()
+
+    assert not marker.exists()
+    assert target.read_text(encoding="utf-8") == "valuable"
+    failure = p.backend.load_failed()["work::one"]
+    assert "Pre-deletion failed" in failure["error_message"]
+    assert failure["exception"]["type"] == cleanup_error.__name__
+    attempt, = p.backend.load_settled_attempts("work::one")
+    assert attempt["outcome"] == "failure"
+    assert attempt["attempt_no"] == 1
+    assert attempt["files"]["target"]["path"] == str(target)
+    assert p.backend.load_successes() == {}
+    assert p.backend.load_queue_jobs() == []
+    p.close()
+
+
+def test_pre_dispatch_removes_broken_symlink(tmp_path, monkeypatch):
+    """断链链接按存在的目录项前删，不因其目标缺失被跳过。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    link = tmp_path / "broken-link"
+    link.symlink_to(tmp_path / "missing-target")
+    marker = tmp_path / "started"
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+    p.register_task("work", _marker_handler)
+    p.enqueue(Job(
+        "work",
+        "one",
+        payload={"marker": str(marker)},
+        files={"target": FileSpec(link, role="output", delete_existing=True)},
+    ))
+    p.run()
+
+    assert marker.exists()
+    assert not os.path.lexists(link)
+    assert "work::one" in p.backend.load_successes()
+    p.close()
+
+
+def test_mark_running_failure_keeps_file_and_worker_unstarted(tmp_path, monkeypatch):
+    """running 写失败保留 pending 队列与目标文件，不进入前删或 spawn。"""
+    from tasklite.exceptions import _CommitCrashSignal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    target = tmp_path / "target"
+    target.write_text("valuable", encoding="utf-8")
+    marker = tmp_path / "started"
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+    p.register_task("work", _marker_handler)
+    p.enqueue(Job(
+        "work",
+        "one",
+        payload={"marker": str(marker)},
+        files={"target": FileSpec(target, role="output", delete_existing=True)},
+    ))
+
+    with patch.object(p.backend, "mark_job_running", side_effect=OSError("write failed")):
+        with pytest.raises(_CommitCrashSignal):
+            p.run()
+
+    assert not marker.exists()
+    assert target.read_text(encoding="utf-8") == "valuable"
+    row, = p.backend.load_queue_jobs()
+    assert row["job_uid"] == "work::one"
+    assert row["status"] == "pending"
+    assert p.backend.load_settled_attempts("work::one") == []
+    p.close()
+
+
+def _retry_cleanup_handler(job, ctx):
+    path = Path(ctx.declare_file(
+        "retry_file",
+        FileSpec("retry.txt", role="output", delete_on_failure=True),
+    ))
+    path.write_text("retry data", encoding="utf-8")
+    return TaskResult.retry(message="retry requested")
+
+
+@pytest.mark.parametrize("cleanup_error", [OSError, ValueError, NotImplementedError])
+def test_retry_cleanup_failure_settles_once_without_retry(
+    tmp_path, monkeypatch, cleanup_error,
+):
+    """重试清理失败直接终结，单条 Attempt 同时保留重试原因与清理诊断。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+    p.register_task("retry", _retry_cleanup_handler)
+    p.enqueue(Job("retry", "one", max_retries_per_run=3))
+
+    with patch(
+        "tasklite.utils.artifact.ArtifactPathPolicy._remove",
+        side_effect=cleanup_error("重试清理故障"),
+    ):
+        p.run()
+
+    failure = p.backend.load_failed()["retry::one"]
+    assert "Retry cleanup failed" in failure["error_message"]
+    assert failure["cleanup_original_message"] == "retry requested"
+    assert failure["cleanup_exception"]["type"] == cleanup_error.__name__
+    attempt, = p.backend.load_settled_attempts("retry::one")
+    assert attempt["outcome"] == "failure"
+    assert attempt["files"]["retry_file"]["path"] == str(tmp_path / "retry.txt")
+    assert p.backend.load_queue_jobs() == []
+    assert (tmp_path / "retry.txt").read_text(encoding="utf-8") == "retry data"
     p.close()
 
 

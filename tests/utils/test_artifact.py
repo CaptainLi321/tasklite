@@ -1,10 +1,11 @@
 """产物路径与独立删除授权的文件系统行为。"""
+import os
 from pathlib import Path
 
 import pytest
 
 from tasklite.models.artifact import ArtifactDeclaration
-from tasklite.utils.artifact import ArtifactPathPolicy
+from tasklite.utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
 
 
 def test_existing_output_requires_its_own_deletion_authorization(tmp_path):
@@ -18,6 +19,49 @@ def test_existing_output_requires_its_own_deletion_authorization(tmp_path):
         policy.remove_existing(declaration)
     assert target.read_text(encoding="utf-8") == "existing"
     policy.remove_existing(ArtifactDeclaration(str(target), delete_existing=True))
+    assert not target.exists()
+
+
+def test_pre_delete_removes_broken_symlink_without_following_target(tmp_path):
+    root = tmp_path / "output"
+    root.mkdir()
+    link = root / "broken"
+    link.symlink_to(tmp_path / "missing-target")
+    policy = ArtifactPathPolicy(output_roots=root)
+    declaration = ArtifactDeclaration(str(link), delete_existing=True)
+
+    _execute_pre_deletes(policy, [declaration])
+
+    assert not os.path.lexists(link)
+
+
+def test_pre_delete_rejects_live_symlink_without_touching_target(tmp_path):
+    root = tmp_path / "output"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("precious", encoding="utf-8")
+    link = root / "live"
+    link.symlink_to(outside)
+    policy = ArtifactPathPolicy(output_roots=root)
+
+    with pytest.raises(ValueError, match="symlink"):
+        policy.remove_existing(ArtifactDeclaration(str(link), delete_existing=True))
+
+    assert link.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "precious"
+
+
+def test_pre_delete_missing_target_is_idempotent(tmp_path):
+    root = tmp_path / "output"
+    root.mkdir()
+    target = root / "missing"
+    policy = ArtifactPathPolicy(output_roots=root)
+
+    _execute_pre_deletes(
+        policy,
+        [ArtifactDeclaration(str(target), delete_existing=True)],
+    )
+
     assert not target.exists()
 
 

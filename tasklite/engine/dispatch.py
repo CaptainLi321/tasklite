@@ -67,7 +67,7 @@ from ..models.artifact import ArtifactDeclaration, FileSpec
 from ..models.attempt import ATTEMPT_REQUEUED
 from ..models.context import JobContext
 from ..models.job import Job, JobRuntimeState
-from ..utils.artifact import ArtifactPathPolicy
+from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
 from .channel import ArtifactCleanupMode, WorkerLaunchSpec
 from .errorclass import (
     ERR_DISPATCH_FAILURE,
@@ -357,12 +357,14 @@ class DispatchMachine:
                 job_snapshot["attempt_no"] = attempt_no
                 job_snapshot["run_id"] = self._session.run_id
                 job_snapshot["started_at"] = started_at
-            except Exception as e:
+            except (_CommitCrashSignal, Exception) as e:
                 logger.critical(
                     f"Failed to mark job running for {job_uid}: {e}; "
                     f"requeueing and aborting dispatch without starting handler."
                 )
                 store.state.requeue_jobs([job_snapshot], front=True)
+                if isinstance(e, _CommitCrashSignal):
+                    raise
                 raise _CommitCrashSignal(
                     f"Failed to mark job running for {job_uid} ({e}). "
                     f"Job preserved in queue without starting handler."
@@ -388,27 +390,36 @@ class DispatchMachine:
         acquired = self._resources.acquire_all(job.task_type, job.resources, job_uid=job_uid)
 
         self._channel.cleanup_artifacts(job_uid, mode=ArtifactCleanupMode.PRE_SUBMIT)
-        for fname, fspec in resolved_files.items():
-            if fspec.delete_existing and fspec.path and os.path.exists(fspec.path):
-                policy = ArtifactPathPolicy(
-                    output_roots=self._output_roots,
-                    protected_roots=self._protected_roots,
-                )
-                try:
-                    policy.remove_existing(ArtifactDeclaration(fspec.path, delete_existing=True))
-                except OSError as exc:
-                    self._resources.release_all(acquired)
-                    self._store.apply_failure(
-                        job_uid,
-                        {"error_message": f"Pre-deletion failed: {exc}"},
-                        job_snapshot=job_snapshot,
-                        cascade=True,
-                        attempt_no=attempt_no,
-                        run_id=self._session.run_id or "run",
-                        started_at=started_at,
-                        files={k: v.to_dict() for k, v in resolved_files.items()},
-                    )
-                    return None
+        pre_deletes = [
+            ArtifactDeclaration(fspec.path, delete_existing=True)
+            for fspec in resolved_files.values()
+            if fspec.delete_existing and fspec.path
+        ]
+        policy = ArtifactPathPolicy(
+            output_roots=self._output_roots,
+            protected_roots=self._protected_roots,
+        )
+        try:
+            _execute_pre_deletes(policy, pre_deletes)
+        except (OSError, ValueError, NotImplementedError) as exc:
+            self._resources.release_all(acquired)
+            message = f"Pre-deletion failed: {exc}"
+            exception = {
+                "type": type(exc).__name__, "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            self._store.apply_failure(
+                job_uid,
+                {"error_message": message, "exception": exception},
+                job_snapshot=job_snapshot,
+                cascade=True,
+                attempt_no=attempt_no,
+                run_id=self._session.run_id or "run",
+                started_at=started_at,
+                files={k: v.to_dict() for k, v in resolved_files.items()},
+                result={"message": message, "exception": exception},
+            )
+            return None
 
         try:
             return self._spawn_entry(
