@@ -301,7 +301,7 @@ class TaskLite:
     def register_task(
         self,
         task_or_type: "Task | str",
-        handler: Callable[[Job, Any], Any] | None = None,
+        handler: Callable[[Job, Any], Any] | None = _UNSET,
         *,
         resources: dict[str, float] | None = _UNSET,
         max_retries_per_run: int = _UNSET,
@@ -321,11 +321,12 @@ class TaskLite:
             task = task_or_type
         else:
             task_type = task_or_type
-            if handler is None:
+            if handler is _UNSET or handler is None:
                 raise TypeError(
                     "handler is required when registering by task_type "
                     f"(got task_type={task_type!r}, handler=None)"
                 )
+            assert handler is not None and handler is not _UNSET
             task = Task(
                 task_type,
                 handler,
@@ -347,7 +348,7 @@ class TaskLite:
     ) -> None:
         """规格式注册的旁置参数门卫（额外参数一律 ValueError）。"""
         if (
-            handler is not None
+            handler is not _UNSET
             or resources is not _UNSET
             or max_retries_per_run is not _UNSET
             or timeout_seconds is not _UNSET

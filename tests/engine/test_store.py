@@ -34,6 +34,7 @@ from tasklite.engine.types import AttemptOutcome
 from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.job import Job, WORKER_RESOURCE
 from tasklite.models.state import PipelineState
+from tasklite.models.task import TaskRegistry
 
 
 def _task_specs(task_type, trigger):
@@ -714,9 +715,13 @@ class TestIntakePipeline:
     """enqueue 摄入管道三步 + 首入队时间。"""
 
     def test_enqueue_fills_first_enqueued_at_once(self):
-        store, _, backend = _make_store()
-        inserted = store.enqueue_jobs(Job("t", "1"))
-        assert inserted == ["t::1"]
+        backend = InMemoryStateBackend()
+        store = StateStore(
+            backend,
+            PipelineState({}, {}, {}, []),
+            trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
+        )
+        assert store.enqueue_job(Job("t", "1")) is True
         row = backend.load_queue()[0]
         assert row["first_enqueued_at"]
         assert row["resources"][WORKER_RESOURCE] == 1.0
@@ -739,26 +744,33 @@ class TestIntakePipeline:
         assert jd_explicit["trigger"] == "once"
 
     def test_enqueue_rejects_unserializable_payload(self):
-        store, _, _ = _make_store()
+        store = StateStore(
+            InMemoryStateBackend(),
+            PipelineState({}, {}, {}, []),
+            trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
+        )
         with pytest.raises(ValueError, match="not JSON-serializable"):
-            store.enqueue_jobs(Job("t", "1", payload={"bad": object()}))
-        with pytest.raises(ValueError, match="not JSON-serializable"):
-            store.enqueue_jobs({"task_type": "t", "job_id": "2", "payload": {"bad": object()}})
+            store.enqueue_job(Job("t", "1", payload={"bad": object()}))
 
-    def test_enqueue_rejects_non_job_non_dict(self):
+    def test_enqueue_rejects_non_job(self):
         store, _, _ = _make_store()
         with pytest.raises(TypeError):
-            store.enqueue_jobs("not-a-job")
-        with pytest.raises(ValueError, match="task_type"):
-            store.enqueue_jobs({"job_id": "1"})
+            store.enqueue_job("not-a-job")  # type: ignore[arg-type]
 
-    def test_enqueue_dict_deep_copied(self):
-        """dict 入参深拷贝——调用方就地变异不得穿透后端镜像。"""
-        store, _, backend = _make_store()
-        src = {"task_type": "t", "job_id": "1", "payload": {"k": 1}}
-        store.enqueue_jobs(src)
-        src["payload"]["k"] = 999
-        assert backend.load_queue()[0]["payload"]["k"] == 1
+    def test_enqueue_rejects_unregistered_task(self):
+        from tasklite import TaskLiteError
+
+        backend = InMemoryStateBackend()
+        store = StateStore(
+            backend,
+            PipelineState({}, {}, {}, []),
+            trigger_registry=TriggerRegistry(tasks=TaskRegistry()),
+        )
+        job = Job("missing", "1")
+        with pytest.raises(TaskLiteError, match="unknown task_type"):
+            store.enqueue_job(job)
+        assert backend.load_queue() == []
+        assert backend.load_attempts(job.uid) == []
 
     def test_enqueue_job_same_uid_idempotent_vs_conflict(self):
         from tasklite import Task, TaskLiteError
@@ -816,9 +828,24 @@ class TestIntakePipeline:
         assert jd["first_enqueued_at"]
 
     def test_normalize_spawned_job_rejects_unserializable(self):
-        store, _, _ = _make_store()
+        store = StateStore(
+            InMemoryStateBackend(),
+            PipelineState({}, {}, {}, []),
+            trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
+        )
         with pytest.raises(ValueError, match="Spawned job"):
             store.normalize_spawned_job(Job("t", "1", payload={"bad": object()}))
+
+    def test_normalize_spawned_job_rejects_unregistered_task(self):
+        from tasklite import TaskLiteError
+
+        store = StateStore(
+            InMemoryStateBackend(),
+            PipelineState({}, {}, {}, []),
+            trigger_registry=TriggerRegistry(tasks=TaskRegistry()),
+        )
+        with pytest.raises(TaskLiteError, match="unknown task_type"):
+            store.normalize_spawned_job(Job("missing", "1"))
 
 
 class TestRequeueTransient:

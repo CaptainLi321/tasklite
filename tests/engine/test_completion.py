@@ -36,6 +36,7 @@ from tasklite.engine.store import StateStore
 from tasklite.engine.types import AttemptOutcome, JobHandle
 from tasklite.models.job import Job, JobRuntimeState
 from tasklite.models.state import PipelineState
+from tasklite.models.task import Task, TaskRegistry
 
 
 class StubSession:
@@ -69,23 +70,32 @@ class CompletionEnv:
         self.backend = InMemoryStateBackend()
         self.stats = defaultdict(int)
         self.hooks: list[tuple[str, AttemptOutcome]] = []
+        self.tasks = TaskRegistry()
+        self.trigger_registry = TriggerRegistry(
+            tasks=self.tasks,
+            functions=BUILTIN_TRIGGER_FUNCTIONS,
+        )
         self.store = StateStore(
             self.backend,
             PipelineState({}, {}, {}, []),
             stats=self.stats,
             on_attempt_finished=lambda uid, *, outcome: self.hooks.append((uid, outcome)),
+            trigger_registry=self.trigger_registry,
         )
         self.session = StubSession()
         self.in_flight = InFlightTracker()
         self.channel = ExecutionChannel(self.ipc_dir)
         self.completion = CompletionMachine(
             store=self.store,
-            trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
+            trigger_registry=self.trigger_registry,
             channel=self.channel,
             resources=self.resources,
             in_flight=self.in_flight,
             session=self.session,
         )
+
+    def register_task(self, task_type: str) -> None:
+        self.tasks.register(Task(task_type, lambda job, ctx: None))
 
     def track_entry(self, job: Job, *, lease=None, attempt_id=None, acquired=None) -> InFlightJob:
         snapshot = job.to_dict()
@@ -363,6 +373,7 @@ class TestSpawnedJobs:
     def test_spawn_dedup_queue_hit_blocks_rerun(self, tmp_path):
         """queue/in-flight 命中无条件拦截，优先于 every_run 豁免。"""
         env = CompletionEnv(tmp_path)
+        env.register_task("child")
         env.store.state.register_in_flight("child::x")
         env.store.apply_success("child::x", {}, attempt_id=env.open_attempt(Job("child", "x")))
         # X 重跑中（queue，every_run 放行重跑）
@@ -385,6 +396,7 @@ class TestSpawnedJobs:
     def test_spawn_wall_hit_every_run_admitted(self, tmp_path):
         env = CompletionEnv(tmp_path)
         env.store.state.register_in_flight("child::y")
+        env.register_task("child")
         env.store.apply_success("child::y", {}, attempt_id=env.open_attempt(Job("child", "y")))
         # successes 命中 + every_run：spawn 放行（唯一终态历史行被替换语义）
 
@@ -408,6 +420,7 @@ class TestSpawnedJobs:
     def test_spawn_dedup_within_batch(self, tmp_path):
         env = CompletionEnv(tmp_path)
         parent = Job("parent", "p1")
+        env.register_task("child")
         entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
         env.completion.apply_result(
             "parent::p1", parent, entry.job_snapshot,
@@ -423,6 +436,7 @@ class TestSpawnedJobs:
     def test_unserializable_spawned_job_rejects_parent(self, tmp_path):
         """非法子作业导致父作业失败，整个派生集合与游标不发布。"""
         env = CompletionEnv(tmp_path)
+        env.register_task("child")
 
         class Unserializable:
             pass
@@ -813,6 +827,7 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
 def test_inflight_duplicate_spawn_compares_effective_configuration(tmp_path):
     """在途同 UID 配置冲突拒绝父成功，不影响既有在途执行。"""
     env = CompletionEnv(tmp_path)
+    env.register_task("child")
     child = Job("child", "same", payload={"version": 1})
     env.track_entry(child, attempt_id=env.open_attempt(child))
     parent = Job("parent", "one")

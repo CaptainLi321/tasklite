@@ -14,7 +14,7 @@ import os
 import sqlite3
 import pytest
 
-from tasklite import Job, TaskLite, TaskResult
+from tasklite import Job, StateSnapshot, TaskLite, TaskResult
 from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
 
 
@@ -382,3 +382,39 @@ def test_spawn_duplicate_configuration_checked_before_atomic_publication(tmp_pat
             assert {"parent::one", "child::same", "child::fresh"} <= successes.keys()
             assert len(p.backend.load_settled_attempts("child::same")) == 1
             assert p.get_cursor("offset") == "unpublished"
+
+
+def unknown_spawn_handler(job, ctx):
+    ctx.spawn(Job("child", "sibling", payload={"version": 1}))
+    ctx.spawn(Job("missing", "unknown"))
+    ctx.set_cursor("offset", "unpublished")
+    return TaskResult.success()
+
+
+def test_spawn_unregistered_task_fails_parent_atomically_and_survives_reopen(tmp_path):
+    db_path = tmp_path / "state.db"
+    with TaskLite(backend="sqlite", state_path=db_path, max_workers=1) as pipeline:
+        pipeline.register_task("parent", unknown_spawn_handler)
+        pipeline.register_task("child", child_consumer_handler)
+        pipeline.set_cursor("offset", "original")
+        pipeline.enqueue(Job("parent", "one"))
+        pipeline.run()
+
+        with StateSnapshot.open(pipeline) as state:
+            assert state.get_job("parent::one")["status"] == "failed"
+            parent_attempts = list(state.iter_attempts(job_uid="parent::one"))
+            assert len(parent_attempts) == 1
+            assert parent_attempts[0]["outcome"] == "failure"
+            for uid in ("child::sibling", "missing::unknown"):
+                assert state.get_job(uid) is None
+                assert list(state.iter_attempts(job_uid=uid)) == []
+            assert pipeline.get_cursor("offset") == "original"
+
+    with TaskLite(backend="sqlite", state_path=db_path, max_workers=1) as reopened:
+        reopened.register_task("parent", unknown_spawn_handler)
+        reopened.register_task("child", child_consumer_handler)
+        reopened.run()
+        assert len(reopened.backend.load_settled_attempts("parent::one")) == 1
+        assert reopened.backend.load_settled_attempts("child::sibling") == []
+        assert reopened.backend.load_settled_attempts("missing::unknown") == []
+        assert reopened.get_cursor("offset") == "original"

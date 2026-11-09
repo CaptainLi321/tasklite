@@ -133,7 +133,7 @@ class TestClearHistory:
 
     def test_clear_history_does_not_affect_queue_or_cursors(self):
         backend, store, console = _make_console()
-        store.enqueue_jobs([Job("t", "stay_queued")])
+        backend.enqueue_jobs([Job("t", "stay_queued").to_dict()])
         store.set_cursor("cur", "val")
         backend.apply_manual_status([("t::q", "succeeded", {"task_type": "t", "job_id": "q"}, None)])
 

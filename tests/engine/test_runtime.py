@@ -193,7 +193,10 @@ class RuntimeEnv:
                 channel=ExecutionChannel(self.ipc_dir),
                 classifier=ErrorClassifier(),
                 governor=DeadlockGovernor(),
-                trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
+                trigger_registry=TriggerRegistry(
+                    tasks=self.tasks,
+                    functions=BUILTIN_TRIGGER_FUNCTIONS,
+                ),
                 requeue_policy=ImmediateRequeuePolicy(),
                 output_roots=tmp_path,
                 strict_picklable=strict_picklable,
@@ -273,7 +276,7 @@ class TestEngineRuntimeExecutionLifecycle:
         """四相泵 E2E：派发 → 回收 → 结算进 successes，attempts 轨迹收尾成功。"""
         env = RuntimeEnv(tmp_path)
         env.register("t")
-        env.runtime.store.enqueue_jobs([Job("t", "j1", payload={})])
+        assert env.runtime.store.enqueue_job(Job("t", "j1", payload={})) is True
         monkeypatch.setattr(
             env.runtime.channel, "_process_context",
             SimpleNamespace(Process=make_instant_process_class()),
@@ -443,7 +446,7 @@ class TestRunReentryGuard:
         enter, release = threading.Event(), threading.Event()
         env = RuntimeEnv(tmp_path, capacity=1)
         env.register("t")
-        env.runtime.store.enqueue_jobs([Job("t", "j1", payload={})])
+        assert env.runtime.store.enqueue_job(Job("t", "j1", payload={})) is True
         monkeypatch.setattr(
             env.runtime.channel, "_process_context",
             SimpleNamespace(Process=make_gate_process_class(enter, release)),
@@ -563,9 +566,8 @@ class TestGracefulDraining:
         enter, release = threading.Event(), threading.Event()
         env = RuntimeEnv(tmp_path, capacity=1)
         env.register("t")
-        env.runtime.store.enqueue_jobs(
-            [Job("t", "j1", payload={}), Job("t", "j2", payload={})]
-        )
+        assert env.runtime.store.enqueue_job(Job("t", "j1", payload={})) is True
+        assert env.runtime.store.enqueue_job(Job("t", "j2", payload={})) is True
         monkeypatch.setattr(
             env.runtime.channel, "_process_context",
             SimpleNamespace(Process=make_gate_process_class(enter, release)),

@@ -483,8 +483,9 @@ class TestRegisterTask:
 
     def test_spec_form_rejects_stray_arguments(self, tmp_path):
         p = make_pipeline(tmp_path)
-        with pytest.raises(ValueError, match="extra spec"):
-            p.register_task(Task("fetch", ok_handler), handler=ok_handler)
+        for handler in (ok_handler, None):
+            with pytest.raises(ValueError, match="extra spec"):
+                p.register_task(Task("fetch", ok_handler), handler=handler)
         with pytest.raises(ValueError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), resources={"a": 1})
         with pytest.raises(ValueError, match="extra spec"):
@@ -580,8 +581,33 @@ class TestEnqueue:
 
     def test_single_job_returns_true_on_first_enqueue(self, tmp_path):
         p = make_pipeline(tmp_path)
+        p.register_task("fetch", ok_handler)
         assert p.enqueue(Job("fetch", "a")) is True
         assert len(p.backend.load_queue()) == 1
+
+    @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+    def test_unregistered_task_is_rejected_without_side_effects(self, tmp_path, backend):
+        from tasklite import TaskLiteError
+
+        with make_pipeline(tmp_path, backend=backend) as p:
+            job = Job("missing", "a")
+            with pytest.raises(TaskLiteError, match="unknown task_type"):
+                p.enqueue(job)
+            assert p.backend.load_queue() == []
+            assert p.backend.load_successes() == {}
+            assert p.backend.load_failed() == {}
+            assert p.backend.load_attempts(job.uid) == []
+
+            p.register_task("missing", ok_handler)
+            assert p.enqueue(job) is True
+            assert [row["job_id"] for row in p.backend.load_queue()] == ["a"]
+
+    def test_unavailable_resource_is_allowed_at_submission(self, tmp_path):
+        p = make_pipeline(tmp_path)
+        p.register_task("fetch", ok_handler, resources={"gpu": 1.0})
+        assert p.enqueue(Job("fetch", "a")) is True
+        (row,) = p.backend.load_queue()
+        assert row["resources"]["gpu"] == 1.0
 
     def test_list_or_non_job_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -854,12 +880,14 @@ class TestEnqueue:
 
     def test_wall_hit_not_blocked_at_enqueue(self, tmp_path):
         p = make_pipeline(tmp_path)
+        p.register_task("fetch", ok_handler)
         p.set_job_status(Job("fetch", "done"), "succeeded", recursive=False)
         assert p.enqueue(Job("fetch", "done")) is True
         assert len(p.backend.load_queue()) == 1
 
     def test_intake_pipeline_injections(self, tmp_path):
         p = make_pipeline(tmp_path)
+        p.register_task("fetch", ok_handler)
         p.enqueue(Job("fetch", "a", timeout_seconds=17, payload={"timeout": "业务时限"}))
         (row,) = p.backend.load_queue()
         assert row["resources"]["__workers__"] == 1.0

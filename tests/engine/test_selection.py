@@ -342,6 +342,7 @@ def test_spawned_excluded_child_stays_queued(monkeypatch, tmp_path):
     monkeypatch.setattr(mp, "Process", _fake_process_class(spawn_jobs=[spawned]))
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("fetch", ok_handler)
+    pipeline.register_task("excluded_t", ok_handler)
     pipeline.enqueue(Job("fetch", "parent"))
 
     pipeline.run(exclude=Exclude(task_type="excluded_t"))

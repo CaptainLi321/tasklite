@@ -488,9 +488,17 @@ class StateStore:
 
     # ── 摄入管道（enqueue / spawn）──────────────────────────────────
 
+    def _require_registered_task(self, task_type: str) -> None:
+        """新声明必须对应本实例已注册的 Task。"""
+        tasks = self._trigger_registry.tasks
+        if tasks is None or task_type not in tasks:
+            raise TaskLiteError(
+                f"unknown task_type {task_type!r} (register the task before "
+                f"submitting its jobs)"
+            )
+
     def normalize_and_validate_job(self, job: Job | dict[str, Any]) -> dict[str, Any]:
-        """规范化并校验单个作业（序列化预检 → 策略注入 → 工人资源注入 →
-        首入队时间填充）。
+        """规范化非新声明作业快照（管理 API 与历史快照兼容路径）。
 
         不可 JSON 序列化的 payload 在入口拒绝——潜伏到后端落盘处才崩会
         把单作业坏输入放大为整 run 崩溃。
@@ -527,13 +535,30 @@ class StateStore:
         self.finalize_intake_snapshot(job_snapshot, str(job_snapshot["task_type"]))
         return job_snapshot
 
+    def _normalize_new_job_snapshot(self, job: Job) -> dict[str, Any]:
+        """解析并校验新声明的有效配置，要求 Task 已注册。"""
+        if not isinstance(job, Job):
+            raise TypeError(
+                f"enqueue() expects a Job, got {type(job).__name__}"
+            )
+        self._require_registered_task(job.task_type)
+        job_snapshot = copy.deepcopy(job.to_dict())
+        self.finalize_intake_snapshot(job_snapshot, job.task_type)
+        try:
+            dumps(job_snapshot)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Payload for job {job.uid} is not JSON-serializable: {e}"
+            ) from e
+        return job_snapshot
+
     def normalize_spawned_job(self, job: Job) -> dict[str, Any]:
         """动态子作业的摄入规范化（成功提交路径的 spawn 侧单点）。
 
-        与 enqueue 同规的三步收尾 + 整 dict 序列化预检；预检失败抛
-        ValueError——调用方按「拒绝该子作业、不连坐父作业成功提交、
-        不触发 commit 崩溃契约」的语义处置。
+        与 enqueue 同规执行注册事实校验、三步收尾与整 dict 序列化预检；
+        预检失败抛 ValueError，由父结算整体拒绝并转父失败。
         """
+        self._require_registered_task(job.task_type)
         job_snapshot = job.to_dict()
         self.finalize_intake_snapshot(job_snapshot, job.task_type)
         try:
@@ -563,7 +588,7 @@ class StateStore:
             raise TypeError(
                 f"enqueue() expects a Job, got {type(job).__name__}"
             )
-        job_snapshot = self.normalize_and_validate_job(job)
+        job_snapshot = self._normalize_new_job_snapshot(job)
         target_uid = job.uid
 
         for queued in self._backend.load_queue():
@@ -591,64 +616,6 @@ class StateStore:
                     )
         inserted = self._backend.enqueue_jobs([job_snapshot])
         return bool(inserted)
-
-    def enqueue_jobs(
-        self,
-        jobs: Job | Sequence[Job] | dict[str, Any] | Sequence[dict[str, Any]],
-    ) -> list[str]:
-        """统一作业入队摄入管道（类型校验、序列化预检、策略规范化、资源
-        注入、首入队时间填充、单事务原子插入）。
-
-        增量入队只写后端、不动内存镜像（内存队列在 run 启动加载期由
-        恢复编排层重建）；返回实际插入后端的作业 UID 列表（自动去重）。
-        """
-        if isinstance(jobs, (Job, dict)):
-            jobs_list = [jobs]
-        elif isinstance(jobs, (list, tuple)):
-            jobs_list = list(jobs)
-        else:
-            raise TypeError(
-                "enqueue_jobs() expects a Job or a list of Job objects/dicts, "
-                f"got {type(jobs).__name__}"
-            )
-        if not jobs_list:
-            return []
-
-        job_snapshots = [self.normalize_and_validate_job(j) for j in jobs_list]
-        existing_by_uid: dict[str, dict[str, Any]] = {}
-        for queued in self._backend.load_queue():
-            try:
-                existing_by_uid[job_uid_from_snapshot(queued)] = queued
-            except (KeyError, TypeError, ValueError, TaskLiteError):
-                continue
-
-        existing_uids = set(existing_by_uid.keys())
-        existing_uids.update(self._backend.load_successes().keys())
-        existing_uids.update(self._backend.load_failed().keys())
-        for snap in job_snapshots:
-            snap_uid = job_uid_from_snapshot(snap)
-            deps = snap.get("depends_on") or []
-            for dep in deps:
-                if dep not in existing_uids:
-                    raise TaskLiteError(
-                        f"Job {snap_uid!r} references non-existent dependency {dep!r} in depends_on"
-                    )
-            existing_uids.add(snap_uid)
-
-        fresh_snapshots: list[dict[str, Any]] = []
-        for snap in job_snapshots:
-            uid = job_uid_from_snapshot(snap)
-            if uid in existing_by_uid:
-                if extract_effective_job_config(existing_by_uid[uid]) == extract_effective_job_config(snap):
-                    continue
-                raise TaskLiteError(
-                    f"Job {uid!r} is already queued with different effective configuration"
-                )
-            existing_by_uid[uid] = snap
-            fresh_snapshots.append(snap)
-        if not fresh_snapshots:
-            return []
-        return self._backend.enqueue_jobs(fresh_snapshots)
 
     def requeue_transient(
         self,
