@@ -1,18 +1,22 @@
 # TaskLite 领域概念词典
 
-A robust, embedded Python task orchestration engine featuring subprocess isolation, per-worker Pipe IPC with library lock fencing, ACID delta transactions, and multi-round fault recovery. Built on the Task / Job / Attempt three-layer model (ADR-0004 / ADR-0005 / ADR-0011).
+嵌入式 Python 任务编排引擎，采用子进程隔离、单次执行 Pipe 通信、状态库级互斥与 ACID 事务持久化。核心模型为 Task / Job / Attempt 三层（ADR-0004 / ADR-0005 / ADR-0011）。
 
 ## Language
 
 ### Core Domain
 
 **Task**:
-进程内静态规格模板：`task_type`、handler、`resources` 及默认 `max_retries_per_run / timeout_seconds`；代码即规格，不落盘，注册于 `TaskRegistry`。
+进程内静态规格模板：`task_type`、handler、`resources`、默认 `max_retries_per_run / timeout_seconds` 与默认 `trigger`；代码即规格，不落盘，注册于 `TaskRegistry`。
 _Avoid_: Handler, JobTemplate, WorkType, Step
 
 **Job**:
-稳定身份为 `uid = make_job_uid(task_type, job_id)` 的逻辑实例。规格为 `None` 时继承 Task，资源按键合并且显式同名键覆盖。实例位由框架管理：`attempt_no` 为尝试号（从 1 起始单调递增），`first_enqueued_at` 重试时不刷新。
+稳定身份为 `uid = make_job_uid(task_type, job_id)` 的逻辑实例。未指定的预算、超时与 Trigger 继承 Task，资源按键合并且显式同名键覆盖。执行账目不属于业务构造字段，由框架在接纳与派发时维护。
 _Avoid_: Message, Item, Record, Execution
+
+**Trigger**:
+决定一次 Run 是否启动已入队 Job 的规则。内置 `once`、`until_success`、`always`、`on_input_change`；不主动入队，不控制单次启动后的故障重试。
+_Avoid_: on_failure, RetryPolicy, SchedulerFlag
 
 **TaskResult**:
 任务 handler 的唯一合法显式返回类型：静态构造器 `TaskResult.success`、`TaskResult.failure`、`TaskResult.retry`。携带经过校验的严格 JSON `metadata` 与可选 `message`。
@@ -38,6 +42,10 @@ _Avoid_: HandlerMap, Registry, TaskStore
 主调度器与用户入口门面：负责组装调度循环、资源与任务注册、入队与执行，并提供 Run 外统一运维管理 API。
 _Avoid_: PipelineEngine, Runner, Master, Coordinator
 
+**TaskLiteError**:
+TaskLite 唯一自有公开异常，表示框架主动发现的调用条件不成立；底层 Python 或数据库异常保持原类型传播。
+_Avoid_: TaskLiteException, ValidationError, RetryError, FatalError
+
 **Successes（成功档案）**:
 持久化成功完成作业集合及其最终元数据（`successes` 表）；按 `job_uid` 与失败档案互斥。
 _Avoid_: SuccessTable, CompletedSet, HistoryStore
@@ -59,7 +67,7 @@ _Avoid_: SortStrategy, PriorityScheme
 _Avoid_: BackoffGovernor, RetryTimer, BackoffSchedule
 
 **Exclude**:
-流水线运行排除规则值对象：`Exclude(task_type=...)`，命中作业本次 run 不派发、原样留队、下次自动恢复。
+流水线运行排除规则值对象：`Exclude(task_type=...)`，命中作业本次 Run 不派发、原样留队，后续未排除的 Run 重新参与候选判断。
 _Avoid_: SkipRule, FilterRule, IgnoreSpec
 
 ### Engine Machines & Runtime
@@ -77,7 +85,7 @@ _Avoid_: Collector, ResultHandler, Finalizer
 _Avoid_: ErrorManager, DeadlockResolver, StateRepository
 
 **RecoveryOrchestrator**:
-负责启动时检查残留 in-flight 执行、回收在途状态至 pending 并修复孤儿锁。
+负责装载持久状态，并按原执行身份把遗留 `running` 原子收敛为失败 Attempt 与 `failed`；保留 `pending`，不修复孤儿锁、不接续旧执行。进程内异常中止时也由其编排在途终止与统一结算。
 _Avoid_: RepairService, AbortHandler, Rescuer
 
 **JobContext**:

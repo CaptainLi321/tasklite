@@ -1,4 +1,4 @@
-"""文档文件引用存在性门禁（纯文件系统检查，毫秒级完成）。
+"""文档契约门禁。
 
 扫描 README.md 与 docs/GUIDE.md 全文，提取形如
 tests/xxx.py、tasklite/xxx.py、scripts/xxx 的文件路径引用（反引号包裹
@@ -8,10 +8,16 @@ tests/xxx.py、tasklite/xxx.py、scripts/xxx 的文件路径引用（反引号�
 
 示例性伪路径（如 ./state、./out、./downloads/）与 docs/ 前缀不在扫描
 范围内：本门禁只认 tests/、tasklite/、scripts/ 三种前缀。
+
+另在临时目录提取并运行两个最小示例，锁定生产 spawn 链路下的公开导入、
+SQLite/内存状态、快照查询与文件声明，防止文档接口漂移。
 """
 
+import os
 import pathlib
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -41,6 +47,19 @@ def _doc_refs(doc: pathlib.Path) -> list:
     return refs
 
 
+def _minimal_example(doc: pathlib.Path, heading: str) -> str:
+    """提取文档指定小节中的首个 Python 代码块。"""
+    text = doc.read_text(encoding="utf-8")
+    heading_at = text.find(heading)
+    assert heading_at >= 0, f"{doc.name} 缺少最小示例小节 {heading!r}"
+    block_at = text.find("```python\n", heading_at)
+    assert block_at >= 0, f"{doc.name} 最小示例缺少 Python 代码块"
+    code_at = block_at + len("```python\n")
+    block_end = text.find("\n```", code_at)
+    assert block_end >= 0, f"{doc.name} 最小示例代码围栏未闭合"
+    return text[code_at:block_end]
+
+
 @pytest.mark.parametrize("doc", SCANNED_DOCS, ids=lambda d: d.name)
 def test_doc_file_references_exist(doc: pathlib.Path) -> None:
     """文档引用的 tests/、tasklite/、scripts/ 路径必须在仓库根下存在。"""
@@ -58,3 +77,42 @@ def test_doc_reference_extraction_is_not_empty() -> None:
     """提取器必须从文档中捕获到引用——空提取会让存在性检查空通过。"""
     total = sum(len(_doc_refs(doc)) for doc in SCANNED_DOCS)
     assert total > 0, "扫描正则未捕获任何文档引用，存在性检查退化为空通过"
+
+
+@pytest.mark.parametrize(
+    ("doc_name", "heading"),
+    (
+        ("README.md", "### 最小示例"),
+        ("docs/GUIDE.md", "### 最小可运行示例"),
+    ),
+)
+def test_doc_minimal_example_runs_with_real_spawn(
+    doc_name: str, heading: str, tmp_path: pathlib.Path
+) -> None:
+    """README/GUIDE 最小示例必须在新目录经生产 spawn 链路真实执行。"""
+    doc = ROOT / doc_name
+    script = tmp_path / "example.py"
+    script.write_text(_minimal_example(doc, heading), encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ROOT)
+
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    if doc_name == "README.md":
+        assert "succeeded" in result.stdout
+        return
+
+    assert (tmp_path / "output" / "files" / "item_1.txt").read_text(
+        encoding="utf-8"
+    ) == "示例一"
+    assert (tmp_path / "output" / "files" / "item_2.txt").read_text(
+        encoding="utf-8"
+    ) == "示例二"

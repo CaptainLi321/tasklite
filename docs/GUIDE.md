@@ -1,6 +1,6 @@
 # TaskLite 使用手册
 
-> 本文档是 TaskLite 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、`JobContext` 与统一文件声明授权、统一状态管理与历史清理、只读一致状态快照（`StateSnapshot`），以及调度扩展接缝（`OrderingPolicy` / `RequeuePolicy` / `Exclude`）。项目概览与快速上手见 [`README.md`](../README.md)，架构决策记录见 [`docs/adr/`](adr/)。
+> 本文档是 TaskLite 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、Trigger 与恢复边界、`JobContext` 与统一文件声明授权、统一状态管理与历史清理，以及只读一致状态快照（`StateSnapshot`）。项目概览与快速上手见 [`README.md`](../README.md)，架构决策记录见 [`docs/adr/`](adr/)。
 
 ---
 
@@ -66,8 +66,9 @@ task = Task(
     "download",                    # task_type（非空 str，不含 "::"）
     my_handler,                    # handler 签名 Callable[[Job, JobContext], TaskResult]
     resources={"api": 1.0},        # 默认资源占用
-    max_retries_per_run=3,         # 单次运行内最大重试预算（默认 0）
-    timeout_seconds=3600.0,        # 执行超时秒数（默认 None）
+    max_retries_per_run=3,         # 单次运行内最大重试预算（默认 3）
+    timeout_seconds=3600.0,        # 执行超时秒数（默认 3600，必须为有限正数）
+    trigger="once",                # 本次 Run 的启动规则（默认 once）
 )
 pipeline.register_task(task)
 ```
@@ -101,9 +102,22 @@ print(job.uid)  # "download::item_001"
 
 `job.uid` 格式为 `{task_type}::{job_id}`。若标识符中包含 `::` 或 `%`，框架通过 `make_job_uid` 和 `parse_job_uid` 执行标准百分号转义，保证跨系统、跨数据库字段的单射可逆性。
 
+#### Trigger：本次 Run 的启动判断
+
+Trigger 只决定一次 Run 中已入队 Job 是否启动，不主动入队，也不控制一次启动后的故障重试。内置名称为 `once`、`until_success`、`always` 与 `on_input_change`；`until_success` 在已有失败终态时允许再次启动。
+
+| Trigger | 无终态记录 | 当前成功档案 | 当前失败档案（含取消） |
+| --- | --- | --- | --- |
+| `once` | 执行 | 跳过 | 跳过 |
+| `until_success` | 执行 | 跳过 | 执行 |
+| `always` | 执行 | 执行 | 执行 |
+| `on_input_change` | 执行 | 按输入变化契约判断 | 执行 |
+
+同一 Run 内由 `TaskResult.retry` 产生的重试不重复求值 Trigger；新 Run 接续仍在 `pending` 的任务会重新求值。Trigger 返回 False 表示本次无需执行，不产生成功证据或 Attempt，也不等同于 `Exclude` 的留队。
+
 ### Attempt：执行轨迹（append-only 旁路面）
 
-派发时只将 Job 持久化为 `running` 并分配单调递增的 `attempt_no`，不插入 Attempt。执行结算时，Attempt 与 Job 状态、档案及暂存效果在同一事务中追加；已提交的 Attempt 不再更新。异常退出遗留的 `running` 在下次启动时按失败结算，未派发的 `pending` 保留。
+派发时只将 Job 持久化为 `running` 并分配单调递增的 `attempt_no`，不插入 Attempt。执行结算时，Attempt 与 Job 状态、档案及暂存效果在同一事务中追加；已提交的 Attempt 不再更新。异常退出遗留的 `running` 在下次取得状态库执行权后按失败结算，未派发的 `pending` 保留并参与新 Run 的 Trigger 判断。
 
 `outcome` 词汇表：
 
@@ -124,6 +138,21 @@ Schema 6 包含以下核心表：
 6. `cursors(key TEXT PRIMARY KEY, value TEXT)`
 7. `engine_metadata(key TEXT PRIMARY KEY, value TEXT)`
 
+`job_sequences` 是独立编号进度，不从当前队列、终态档案或剩余 Attempt 最大值推导。清空某 UID 的全部档案与 Attempt 后重新入队，`attempt_no` 仍从该 UID 已分配到的位置继续单调递增；人工状态修改不推进编号。
+
+### 下次启动的恢复边界
+
+取得状态库级执行权后，框架先收敛遗留状态，再开始新 Run 的 Trigger 判断和派发：
+
+| 数据库事实 | 启动处理 |
+| --- | --- |
+| Job 为 `pending` | 保留，参与新 Run 启动判断，本次 Run 的重试预算从零开始 |
+| Job 为 `running` | 按原 `run_id` 与 `attempt_no` 原子追加一条失败 Attempt，转为 `failed`，失败原因记录为“上次执行未完成结算，实际结果未知” |
+| 本次终态已提交 | 保持 `succeeded` / `failed`，不受之后进程退出影响 |
+| 终态档案与当前记录冲突 | 明确报错停止，不猜测哪条记录正确 |
+
+恢复不根据残留产物或迟到 Pipe 消息补造成功，不自动接续旧执行，也不声称旧 worker 或它启动的外部程序已经停止。正常 Ctrl+C 或 `stop()` 的排空不属于异常退出恢复；只读 `StateSnapshot` 不执行恢复写入。
+
 ---
 
 ## 3. 六步标准调用顺序与最小示例
@@ -137,52 +166,32 @@ TaskLite 遵循确定性的六步调用顺序：
 ### 最小可运行示例
 
 ```python
-import logging
-from pathlib import Path
-from tasklite import TaskLite, Task, Job, TaskResult, FileSpec
+from tasklite import FileSpec, Job, Task, TaskLite, TaskResult
 from tasklite.resource import IntervalResource
 
-logging.getLogger("tasklite").setLevel(logging.INFO)
 
-# 1. 任务处理器（独立子进程中执行，必须在模块级定义以便 pickle）
 def fetch_handler(job: Job, ctx) -> TaskResult:
-    # 声明产物文件：相对路径按 output_roots 基准解析
+    # 相对路径按 TaskLite 构造时固定的工作目录解析。
     out_file = ctx.declare_file(
         "dest",
-        FileSpec(f"files/{job.job_id}.txt", role="output", delete_existing=True),
+        FileSpec(f"output/files/{job.job_id}.txt", role="output"),
     )
-    url = job.payload.get("url")
-    if not url:
-        return TaskResult.failure(message="URL 缺失，永久失败")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(job.payload["content"], encoding="utf-8")
+    return TaskResult.success()
 
-    # 业务写入
-    out_file.write_text(f"content from {url}", encoding="utf-8")
-    return TaskResult.success(metadata={"bytes": 1024})
 
-# 2. 初始化引擎（使用独立临时文件）
-pipeline = TaskLite(
-    backend="sqlite",
-    state_path="./state.db",       # 状态库文件路径
-    output_roots="./output",        # 产物根目录
-    max_workers=2,                 # 并发子进程数
-)
-pipeline.authorizer = lambda path, target_type: True  # 自动同意文件操作
-
-# 3. 注册资源与 Task 规格
-pipeline.register_resource(IntervalResource("net", interval_seconds=0.1))
-pipeline.register_task(Task("fetch", fetch_handler, resources={"net": 1.0}, max_retries_per_run=2))
-
-# 4. 入队作业
-pipeline.enqueue(Job("fetch", "item_1", payload={"url": "https://example.com/1"}))
-pipeline.enqueue(Job("fetch", "item_2", payload={"url": "https://example.com/2"}))
-
-# 5. 启动运行（阻塞至队列清空）
-pipeline.run()
-
-# 6. 停机与资源释放
-pipeline.stop()
-pipeline.close()
+if __name__ == "__main__":
+    with TaskLite(backend="sqlite", state_path="./state.db", output_roots="./output") as pipeline:
+        pipeline.register_resource(IntervalResource("net", interval_seconds=0.1))
+        pipeline.register_task(Task("fetch", fetch_handler, resources={"net": 1.0}))
+        pipeline.enqueue(Job("fetch", "item_1", payload={"content": "示例一"}))
+        pipeline.enqueue(Job("fetch", "item_2", payload={"content": "示例二"}))
+        pipeline.run()
+        pipeline.stop()
 ```
+
+实例构造时捕获主进程当前工作目录，作为该实例固定且统一的相对路径基准。`enqueue`、`ctx.spawn` 与运行期 `ctx.declare_file` 都使用该基准，不读取主进程或 worker 后来改变的工作目录；worker 改变自身 CWD 不改变子任务相对路径的含义。使用同一状态库接续执行时，应保持相同的实例路径基准；跨目录接续不在本版支持范围内。
 
 ### Handler 返回值与 TaskResult
 
@@ -190,7 +199,7 @@ Handler **必须显式返回 `TaskResult`**，严禁返回布尔值、元组或�
 
 - `TaskResult.success(*, message=None, metadata=None)`：执行成功，`metadata` 必须为严格合法的 JSON 对象；
 - `TaskResult.failure(*, message=None, metadata=None)`：确定性永久失败，直接耗尽预算进失败档案；
-- `TaskResult.retry(*, message=None, metadata=None, consume_budget=True)`：请求重试，按重入队接缝安排下次执行。
+- `TaskResult.retry(*, message=None, metadata=None, consume_budget=True)`：请求重试，按当前重入队机制安排本次 Run 内的下一次执行；预算耗尽或 Run 已停止时不会自动开启下一次 Run。
 
 ### JobContext 运行时接口
 
@@ -198,22 +207,47 @@ Handler **必须显式返回 `TaskResult`**，严禁返回布尔值、元组或�
 - `ctx.spawn(job: Job) -> None`：在子进程中动态派生子任务（父任务成功提交时原子入队，父任务失败则零发布）；
 - `ctx.declare_file(name: str, spec: FileSpec) -> Path`：动态声明文件并请求主进程授权与父目录准备；
 - `ctx.file_path(name: str) -> Path`：查询已声明文件的绝对路径；
-- `ctx.get_cursor(key: str) -> Any`：读取事务游标快照；
-- `ctx.set_cursor(key: str, value: Any) -> None`：更新游标（父任务成功提交时原子持久化）。
+- `ctx.get_cursor(key: str) -> str | None`：读取派发快照与本次暂存更新；
+- `ctx.set_cursor(key: str, value: str | None) -> None`：更新或删除游标（父任务成功提交时原子持久化，失败或重试丢弃）。
+
+### 统一文件声明
+
+预声明与运行期声明都使用同一个 `FileSpec`：
+
+```text
+FileSpec(
+    path,
+    *,
+    role="input" | "output" | "cache",
+    delete_existing=False,
+    delete_on_failure=False,
+    delete_on_success=False,
+)
+```
+
+- 名称只由 `Job(files={...})` 的字典键或 `ctx.declare_file(name, spec)` 的参数指定，不写进 `FileSpec`；
+- `role` 必填，仅支持 `input`、`output`、`cache`；`input` 禁止 `delete_existing=True`；
+- 三项删除标记默认均为 False，只有显式请求时才可能由主进程执行清理；
+- 框架不因声明自动创建文件、目录或父目录，handler 与外部程序负责实际业务写入；
+- `ctx.file_path(name)` 与 `ctx.declare_file(name, spec)` 都返回规范绝对 `Path`，且统一使用实例构造时固定的路径基准。
 
 ### 文件操作授权管理
 
-当任务声明 `delete_existing`、`delete_on_failure` 或 `delete_on_success` 时，主进程拥有排他授权检查职责：
-- 环境变量 `TASKLITE_AUTO_APPROVE=1`：对所有处于受保护根目录内的常规请求自动同意；
-- `pipeline.authorizer = Callable[[str, str], bool | None]`：自定义授权回调，返回 `True` 批准，`False` 拒绝，`None` 挂起等待；
-- 授权拒绝会使作业安全返回 pending 并不写失败档案；受保护的核心文件（状态库与锁文件）绝对禁止声明或删除；
+文件声明用于路径管理、依赖传递与清理请求，不是 handler 的写入沙箱。读取默认允许；当任务声明 `delete_existing`、`delete_on_failure` 或 `delete_on_success` 时，主进程拥有授权检查与清理执行职责：
+- 环境变量 `TASKLITE_AUTO_APPROVE=1`：自动同意本进程实际请求且未命中硬性保护规则的框架文件操作，并记录实际授权路径；
+- `pipeline.authorizer = Callable[[str, str], bool | None]`：自定义授权判定，参数为规范绝对路径与 `file` / `directory`；返回 `True` 批准并持久化，`False` 拒绝，`None` 表示暂不能决定；
+- 等待 `None` 结果时暂停新派发，继续处理已派发执行；不占用业务资源，也不消耗执行超时预算；
+- 授权拒绝或等待期间收到停止请求时，先结束受阻 worker，再追加 `failure` Attempt、把 Job 回到 `pending`，并将受影响依赖链加入本 Run 临时排除；不写失败档案、不消耗重试预算；
+- 受保护的状态库、WAL／SHM 副文件与库级锁文件绝对禁止声明或删除；
 - Run 外可调用 `pipeline.list_authorizations()` 查看当前已持久化授权，调用 `pipeline.revoke_authorization(path)` 精准撤销。
+
+授权等待是文件准备协议的一部分，不是资源挂起。`TaskResult.retry`、资源不足和授权等待具有不同语义，不共享重试或挂起入口。
 
 ---
 
 ## 4. 统一状态管理与历史运维（Run 外 API）
 
-所有运维与状态变更操作收敛在 `TaskLite` 门面，且**严格限于 `run()` 外部调用**（`run()` 执行期间调用将抛出 `RuntimeError`）：
+所有运维与状态变更操作收敛在 `TaskLite` 门面，且**严格限于 `run()` 外部调用**。在 `run()` 执行期间调用公开管理 API 或再次调用 `run()`，框架主动抛出 `TaskLiteError`；底层库自然产生的异常保持原类型传播：
 
 ### 人工变更作业状态：`set_job_status`
 
@@ -237,7 +271,7 @@ deleted_count = pipeline.clear_history("fetch::item_1", records=["successes", "a
 ```
 
 - 精准删除指定的历史集合（`successes` / `failed` / `attempts`）；
-- **不变式：内部单调编号计数器绝不重置**。清空历史后重新入队相同 `job_uid`，其新产生的 Attempt 序号依然保持单调自增（从历史最大序号之后继续），不回退到 1。
+- **不变式：内部单调编号进度绝不重置**。清空历史后重新入队相同 `job_uid`，其新产生的 Attempt 序号仍从该 UID 的独立编号进度继续单调自增，不依赖剩余历史，也不回退到 1。
 
 ### 高水位游标读写
 
@@ -338,41 +372,16 @@ with StateSnapshot.open(pipeline) as snap:
 
 ---
 
-## 6. 调度扩展接缝与规则排除
+## 6. 候选顺序、重试节奏与运行排除
 
-核心层绝对禁止任何调度排序与退避计算。调度节奏与候选准入经由三个扩展接缝以各自 seam 形态扩展：
-
-### OrderingPolicy：队列访问序
-
-调度器通过 `OrderingPolicy.visit_order` 获取候选队列的评估顺序。默认实现为 `FifoOrderingPolicy`（按入队顺序升序扫描）。
-
-```python
-from tasklite.engine.scheduler import OrderingPolicy, FifoOrderingPolicy
-
-class CustomOrderingPolicy(OrderingPolicy):
-    """自定义队列访问序策略。"""
-    def visit_order(self, queue):
-        return range(len(queue) - 1, -1, -1)
-```
-
-### RequeuePolicy：重试节奏
-
-当任务请求重试时，通过 `RequeuePolicy.plan_requeue` 规划重入队行为。默认实现为 `ImmediateRequeuePolicy`（立即插回队首重试）。
-
-```python
-from tasklite.engine.admission import RequeuePolicy, ImmediateRequeuePolicy, RequeuePlan
-
-class CustomRequeuePolicy(RequeuePolicy):
-    """自定义重试节奏策略。"""
-    def plan_requeue(self, job_snapshot, *, transient_kind=None) -> RequeuePlan:
-        return RequeuePlan(front=True, delay_seconds=0.0)
-```
+核心层不包含业务排序或退避计算。`OrderingPolicy` 与 `RequeuePolicy` 是当前内部实现接缝，本版不承诺其类名、方法签名或自定义子类兼容，也不属于公开导入面；需要冻结新的调度扩展协议时必须另立 ADR。
 
 ### Exclude：运行期临时排除
 
-通过 `run(exclude=Exclude(task_type="..."))` 排除特定类型的任务：
+公开、稳定的运行期规则是 `run(exclude=Exclude(task_type="..."))`，其中 `Exclude` 从 `tasklite.selection` 导入，本版只接受单个规则或 `None`：
 - 命中作业本次 run 不派发、不执行、不消耗重试预算，**原样保留在队列中**；
-- 下次未指定排除规则的 `run()` 启动时，留队作业自动恢复正常调度与执行。
+- 命中任务及受影响下游本次留队；规则不改变排序，也不终止已经派发的执行；
+- 下次未指定排除规则的 `run()` 启动时，留队作业重新参与候选与 Trigger 判断。
 
 ---
 
@@ -382,7 +391,7 @@ class CustomRequeuePolicy(RequeuePolicy):
 
 | 历史用法 / 预 ADR-0011 接口 | ADR-0011 稳定基线标准 | 说明 |
 |---|---|---|
-| `TaskLite(name=..., state_dir=...)` | `TaskLite(state_path="./state.db")` | 废除名称与目录组合，统一显式指定状态库文件路径 |
+| `TaskLite(name=..., state_dir=...)` | `TaskLite(backend="sqlite", state_path="./state.db")` | 后端必须显式选择；SQLite 显式指定状态库文件路径 |
 | `return True, {"data": 1}` | `return TaskResult.success(metadata={"data": 1})` | handler 返回值统一收敛为显式 `TaskResult` 值对象 |
 | `raise RetryError(...)` | `return TaskResult.retry(message=...)` | 显式重试返回，消除内部魔法异常 |
 | `ctx.declare_output(path)` | `ctx.declare_file(name, FileSpec(path, role="output"))` | 统一文件声明对象，包含明确角色与清理权限 |

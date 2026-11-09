@@ -2,7 +2,7 @@
 
 > **A Lightweight Task Orchestration Engine for Agent & Batch Pipelines.**  
 > 专为 **AI Agent 批量处理**、数据同步与采集、音视频转码、离线 ETL 与后台批处理任务打造。  
-> 核心解决「单线程处理耗时长」、「中途失败需全量重跑」、「子任务卡死拖垮主流程」等工程痛点。采用主控守护与物理子进程隔离架构，内置 SQLite WAL 事务持久化，子进程崩溃或断电不坏库，重启自动断点续跑。
+> 核心解决「单线程处理耗时长」、「中途失败需全量重跑」、「子任务卡死拖垮主流程」等工程痛点。采用主控守护与物理子进程隔离架构，内置 SQLite WAL 事务持久化：已提交终态跨进程保留；异常退出遗留的 `running` 下次启动按失败收敛，未派发的 `pending` 留队，不自动接续旧执行。
 
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -30,7 +30,7 @@
 **TaskLite 的设计定位**：  
 **零依赖的单机批处理脚手架**——只需 `pip install tasklite-engine`。
 1. **多 Worker 并发加速**：多进程并行执行，充分利用多核算力，彻底解决单线程耗时长的问题；
-2. **断点续跑防重跑**：以 SQLite WAL 事务表记录状态，已完成的任务自动跳过，失败任务根据重试预算重入队重试、预算耗尽进失败档案，杜绝因个别失败导致全量重跑；
+2. **持久状态防重跑**：以 SQLite WAL 事务表记录状态，已提交成功由后续 Trigger 判断是否跳过；失败任务按本次 Run 的重试预算重入队，预算耗尽后进入失败档案，减少个别失败导致的全量重跑；
 3. **物理隔离与容灾**：主进程只负责调度，业务逻辑在独立子进程中运行并设超时强杀，即使子任务崩溃、死锁或系统断电，状态依然完整可恢复。
 
 ---
@@ -73,10 +73,10 @@ flowchart TD
     State -->|"5. BEGIN IMMEDIATE 原子收尾"| State
 ```
 
-### 三层崩溃恢复防线
+### 三层可靠性边界
 1. **执行代标识与通道绑定 (Generation Fencing)**：每 worker 绑定独立单向 `Pipe` 与执行代标识，校验 `job_uid` 与 `execution_id`，旧执行与伪造消息无法污染状态机；
-2. **可信成功事务持久化**：IPC 仅负责本次运行的瞬时通信，已提交的成功档案与 `attempts` 终态由 SQLite 强事务持久化，未提交在途任务重启后自动接续重做；
-3. **单库级文件锁防护 (Library Lock Fencing)**：通过 `__tasklite__.lock` 互斥保护，严格保证同一状态库同时只有一个活动调度实例，避免并发写入破坏。
+2. **已结算状态事务持久化**：IPC 仅负责本次运行的瞬时通信；已提交成功、失败与 `attempts` 由 SQLite 强事务持久化。异常退出遗留的 `running` 下次按失败收敛，`pending` 留队，不自动接续旧执行；
+3. **单库级文件锁防护 (Library Lock Fencing)**：通过 `__tasklite__.lock` 互斥保护，同一状态库同时只允许一个活动调度实例或管理写操作，避免并发写入破坏。
 
 ---
 
@@ -91,7 +91,7 @@ flowchart TD
 ### 2. ⚡ SQLite WAL 状态持久化 (ACID)
 - 基于 SQLite WAL + `synchronous=FULL` 模式；
 - 状态机（`successes` 成功档案 / `queue` 待办 / `failed` 失败档案 / `attempts` 轨迹）在单次事务中原子转移；
-- 遭遇中断或异常关机时，重启后支持 At-Least-Once 接续执行。
+- 已提交终态不会因之后异常退出被改写；遗留 `running` 以“上次执行未完成结算，实际结果未知”登记失败，不根据残留产物或迟到结果补造成功。
 
 ### 3. 🔍 函数式增量探索 (Functional Discovery)
 - 针对数据同步、采集与拉取场景的无游标 (Cursor-less) 增量扫描；
@@ -103,14 +103,14 @@ flowchart TD
 
 ### 5. 🔗 DAG 拓扑依赖与级联熔断
 - 任务通过 `depends_on` 声明依赖列表；
-- 父任务失败进入失败档案时，所有下游依赖自动标记级联失败 (`JOB_DEPENDENCY`)，避免无效计算。
+- 上游失败进入失败档案时，受影响下游按依赖规则级联失败；未执行的下游不生成 Attempt，避免无效计算。
 
 ### 6. 📦 统一文件声明与主进程清理授权
 - `FileSpec` 明确文件角色（`output` / `input` / `cache`）与清理权限（`delete_existing` / `delete_on_failure` / `delete_on_success`）；
 - 主进程持有排他文件授权与清理职责，收尾时先执行授权清理后提交事务。
 
-### 7. 🎛️ 调度扩展 Seam（排序 / 重试节奏 / 规则排除）
-- 核心零调度计算，提供 `OrderingPolicy`（候选访问序）、`RequeuePolicy`（重入队节奏）与 `Exclude`（运行排除）扩展接缝；
+### 7. 🎛️ 运行排除与重试节奏
+- 内置候选访问序与重入队机制；其内部策略接缝不属于本版稳定公开扩展面；
 - `pipeline.run(exclude=Exclude(task_type="..."))` 支持按任务类型将作业安全留队至下次运行。
 
 ---
@@ -130,55 +130,21 @@ pip install tasklite-engine
 ### 最小示例
 
 ```python
-import logging
-from pathlib import Path
-from tasklite import TaskLite, Task, Job, TaskResult, FileSpec
-from tasklite.resource import IntervalResource
+from tasklite import Job, StateSnapshot, TaskLite, TaskResult
 
-logging.getLogger("tasklite").setLevel(logging.INFO)
 
-# 1. 定义任务处理器（在独立子进程中执行，必须模块级定义）
-def download_handler(job: Job, ctx) -> TaskResult:
-    # 声明产出文件（授权前置清理与失败清理）
-    out_path = ctx.declare_file(
-        "dest",
-        FileSpec(f"{job.job_id}.jpg", role="output", delete_existing=True, delete_on_failure=True),
-    )
+def greet(job, ctx):
+    return TaskResult.success(metadata={"message": f"你好，{job.payload['name']}"})
 
-    url = job.payload.get("url")
-    if not url:
-        return TaskResult.failure(message="URL 缺失，永久失败")
 
-    # 业务下载
-    success = do_download(url, out_path)
-    if not success:
-        return TaskResult.retry(message="网络抖动，立即重入队重试")
-
-    return TaskResult.success(metadata={"size": 1024, "path": str(out_path)})
-
-# 2. 初始化引擎（六步调用契约：初始化 → register_resource → register_task → enqueue → run → stop）
-pipeline = TaskLite(
-    backend="sqlite",
-    state_path="./state.db",       # 状态持久化文件（SQLite WAL）
-    output_roots="./downloads",     # 产物沙盒根目录
-    max_workers=4,                 # 并发子进程数
-)
-pipeline.authorizer = lambda path, target_type: True
-
-# 3. 注册全局限速（每秒最多 2 次请求）与 Task 规格
-pipeline.register_resource(IntervalResource("api", interval_seconds=0.5))
-pipeline.register_task(Task("download", download_handler, resources={"api": 1.0}, max_retries_per_run=3))
-
-# 4. 入队
-pipeline.enqueue(Job("download", "img_001", payload={"url": "https://example.com/1.jpg"}))
-pipeline.enqueue(Job("download", "img_002", payload={"url": "https://example.com/2.jpg"}))
-
-# 5. 启动运行（阻塞直到队列全部完成）
-pipeline.run()
-
-# 6. 停机与资源回收
-pipeline.stop()
-pipeline.close()
+if __name__ == "__main__":
+    with TaskLite(backend="memory") as pipeline:
+        pipeline.register_task("greet", greet)
+        pipeline.enqueue(Job("greet", "one", payload={"name": "TaskLite"}))
+        pipeline.run()
+        pipeline.stop()
+        with StateSnapshot.open(pipeline) as state:
+            print(state.get_job("greet::one"))
 ```
 
 > 引擎采用 **Task（静态规格） / Job（逻辑实例） / Attempt（物理轨迹）** 三层模型，完整 API 签名、只读快照（`StateSnapshot`）、文件授权、状态管理与运维接口请查阅 **[`docs/GUIDE.md`](docs/GUIDE.md)**（使用手册）。
@@ -248,7 +214,7 @@ def fetch_handler(job, ctx):
     return TaskResult.success(metadata=resp.json())
 ```
 
-### Recipe 4: AI Agent / 大模型批量任务断点续跑
+### Recipe 4: AI Agent / 大模型批量任务持久化
 
 ```python
 import json
@@ -274,6 +240,7 @@ for i in range(100):
     pipeline.enqueue(Job("analyze", f"doc_{i}", payload={"prompt": f"分析文本 {i}"}))
 
 pipeline.run()
+pipeline.stop()
 pipeline.close()
 ```
 
@@ -315,7 +282,7 @@ tasklite/
 │   ├── ops.py           # OpsConsole：run() 外纯运维接缝（管理 API 委托目标）
 │   ├── dispatch.py      # 任务派发状态机 (DispatchMachine)
 │   ├── completion.py    # 任务完成与提交单一收口 (CompletionMachine)
-│   ├── recovery.py      # 崩溃检测与启动恢复 (RecoveryOrchestrator)
+│   ├── recovery.py      # 遗留 running 收敛与在途中止编排 (RecoveryOrchestrator)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel)
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler / OrderingPolicy 排序 seam)
 │   ├── admission.py     # 重入队节奏 (RequeuePolicy seam)
