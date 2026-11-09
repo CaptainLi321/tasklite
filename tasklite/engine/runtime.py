@@ -72,7 +72,7 @@ class DeadlockArbitration:
 
     - ``deadlock_detected``: 本拍是否判定并已熔断死锁（进失败档案）；
     - ``should_terminate``: governor 独立终止信号（全队列熔断且队列清空）；
-    - ``wait_seconds``: 宽限/缺口重试的建议等待秒数（否则 0）。
+    - ``wait_seconds``: 缺口重试的建议等待秒数（否则 0）。
     """
 
     deadlock_detected: bool
@@ -828,8 +828,7 @@ class EngineRuntime:
         limit = max_dispatch if max_dispatch is not None else _UNBOUNDED_DISPATCH_LIMIT
         last_outcome, worker_wait, dispatched = self._fill_dispatch_pool(limit, draining)
 
-        # 前进信号终结宽限 episode（须先于死锁仲裁）：任何成功派发都证明
-        # 等待者已消解，同缺失集合复发按新 episode 重新授予完整宽限
+        # 前进信号终结缺口 episode（须先于死锁仲裁）。
         if dispatched > 0:
             self.governor.record_dispatch_progress()
 

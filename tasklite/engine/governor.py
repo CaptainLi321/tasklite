@@ -1,9 +1,8 @@
-"""v2 死锁治理深模块：归因、依赖宽限与缺口升级。
+"""v2 死锁治理深模块：死锁归因与缺口升级。
 
 统一内敛：
-1. 依赖缺失宽限期管理（宽限截止时刻与缺失集快照）；
-2. 死锁分类缺口连续轮次升级治理；
-3. 细粒度死锁归因分析与批量事务熔断（环检测、缺失依赖、
+1. 死锁分类缺口连续轮次升级治理；
+2. 细粒度死锁归因分析与批量事务熔断（环检测、
    未知/超容资源、畸形条目）。
 
 术语口径：死锁熔断的终态落点是失败档案（failed）——按 uid 唯一
@@ -26,23 +25,12 @@ from .errorclass import (
     ERR_MALFORMED_JOB,
     ERR_RESOURCE_DEADLOCK,
 )
-from .scheduler import JobFacts, StandstillFacts
+from .scheduler import StandstillFacts
 from .selection import SelectionStandstill
 
 logger = logging.getLogger("tasklite")
 
-DEP_GRACE_SECONDS: float = 3.0
 DEADLOCK_GAP_MAX_ROUNDS = 5
-
-
-class ScanCache(Protocol):
-    """依赖宽限回退路径复用的调度投影缓存契约（JobScheduler 自动满足）。
-
-    单趟扫描已反序列化的 Job 投影按内容键缓存复用——宽限判定逐行
-    读 ``depends_on`` 时免二次全量反序列化。
-    """
-
-    def cached_job(self, job_snapshot: dict) -> JobFacts: ...
 
 
 class BulkFailureOutcome(Protocol):
@@ -85,9 +73,9 @@ class DeadlockDecision:
     """死锁治理裁决结果（纯值对象，无阻塞副作用）。
 
     - action: "resolved" (已归因并移入失败档案) | "selection_blocked" (队列仅因执行选择排除而延迟)
-      | "grace_waiting" (正在依赖宽限期中) | "gap_retrying" (分类缺口重试中) | "none" (未检测到死锁)
+      | "gap_retrying" (分类缺口重试中) | "none" (未检测到死锁)
     - should_terminate: 是否应终止主循环（如全队列熔断完毕且队列清空，或选择排除干净收敛）
-    - wait_time: 建议外层事件泵等待的时延秒数（宽限或重试时为 0.5s，否则 0.0s）
+    - wait_time: 建议外层事件泵等待的时延秒数（缺口重试时为 0.5s，否则 0.0s）
     - failed_uids: 本轮判定失败的 UID 列表
     - cascaded_uids: 本轮级联失败的 UID 列表
     - standstill: 选择停摆事实快照（仅在 action="selection_blocked" 时附带）
@@ -105,7 +93,6 @@ class DeadlockDecision:
 class DeadlockGovernor:
     """统一死锁归因与缺口升级治理深模块。"""
 
-    dependency_grace_seconds: float = DEP_GRACE_SECONDS
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
     deadlock_gap_rounds: int = 0
 
@@ -214,7 +201,6 @@ class DeadlockGovernor:
                 store=store,
                 selection_machine=selection_machine,
                 selection_standstill=selection_standstill,
-                scheduler=None,
             )
 
         if facts.waiting_for_dependency and store.state is not None:
@@ -238,7 +224,6 @@ class DeadlockGovernor:
                     store=store,
                     selection_machine=selection_machine,
                     selection_standstill=selection_standstill,
-                    scheduler=None,
                 )
 
 
@@ -254,7 +239,6 @@ class DeadlockGovernor:
                 store=store,
                 selection_machine=selection_machine,
                 selection_standstill=selection_standstill,
-                scheduler=None,
             )
 
         # 正常等待/背压结论（有限等待且无环）证明上一缺口 episode 已消解——
@@ -267,7 +251,6 @@ class DeadlockGovernor:
         facts: StandstillFacts,
         store: ArbitrationStore,
         *,
-        scheduler: ScanCache | None = None,
         selection_machine: SelectionStandstillSource | None = None,
     ) -> DeadlockDecision:
         """直接执行死锁归因，并在入口读取当前选择停摆事实。"""
@@ -279,7 +262,6 @@ class DeadlockGovernor:
         return self._resolve_deadlock(
             facts,
             store=store,
-            scheduler=scheduler,
             selection_machine=selection_machine,
             selection_standstill=selection_standstill,
         )
@@ -289,20 +271,17 @@ class DeadlockGovernor:
         facts: StandstillFacts,
         store: ArbitrationStore,
         *,
-        scheduler: ScanCache | None,
         selection_machine: SelectionStandstillSource | None,
         selection_standstill: SelectionStandstill | None,
     ) -> DeadlockDecision:
         """以同一停摆快照完成归因与状态提交。"""
         effective_state = store.state
-        effective_grace = self.dependency_grace_seconds
         effective_gap_max = self.deadlock_gap_max_rounds
         selection_active = selection_machine is not None and selection_machine.is_active
 
         attr = facts.attribution
         malformed_uids = set(attr.malformed_uids)
         unknown_uids = set(attr.unknown_resource_uids)
-        missing_uids = set(attr.missing_dependency_uids)
         impossible_uids = set(attr.impossible_resource_uids)
 
         if malformed_uids:
@@ -314,11 +293,6 @@ class DeadlockGovernor:
             logger.error(f"Deadlock: {len(unknown_uids)} job(s) reference unknown resource(s).")
             uids_metas = self._split_deadlock_by_uids(
                 list(effective_state.queue), unknown_uids, ERR_RESOURCE_DEADLOCK
-            )
-        elif missing_uids:
-            logger.error(f"Deadlock: {len(missing_uids)} job(s) have unresolvable (missing) dependencies.")
-            uids_metas = self._split_deadlock_by_uids(
-                list(effective_state.queue), missing_uids, ERR_DEPENDENCY_DEADLOCK
             )
         elif impossible_uids:
             logger.error(f"Deadlock: {len(impossible_uids)} job(s) request impossible resource amounts (exceeds capacity).")
@@ -434,9 +408,7 @@ __all__ = [
     "ArbitrationStore",
     "BulkFailureOutcome",
     "DEADLOCK_GAP_MAX_ROUNDS",
-    "DEP_GRACE_SECONDS",
     "DeadlockDecision",
     "DeadlockGovernor",
-    "ScanCache",
     "SelectionStandstill",
 ]

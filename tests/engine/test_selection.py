@@ -235,18 +235,13 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
 
-    # 先 enqueue a
     pipeline.enqueue(Job("excluded_t", "a"))
-    # 构造成环：先入队 b 依赖 a，然后入队 c 依赖 b
     pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a"]))
     pipeline.enqueue(Job("rank", "c", depends_on=["rank::b"]))
-
-    # 手动让 b 依赖 c 构造成环（模拟同 UID 重用或已存在环）
-    queue = pipeline.backend.load_queue()
-    for row in queue:
-        if row["task_type"] == "rank" and row["job_id"] == "b":
-            row["depends_on"] = ["excluded_t::a", "rank::c"]
-    pipeline.backend.save_queue(queue)
+    pipeline.set_job_status("rank::b", "succeeded", recursive=False)
+    pipeline.enqueue(
+        Job("rank", "b", depends_on=["excluded_t::a", "rank::c"])
+    )
 
     pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
@@ -258,7 +253,7 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
 
 
 def test_exclude_downstream_purged_dependency_is_failed(fake_process, tmp_path):
-    """下游依赖如果在入队后被人为清除（缺失依赖），下游立即熔断为死锁，排除作业原样留队。"""
+    """下游依赖如果在入队后被人为清除，下游直接按缺失结算，排除作业原样留队。"""
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("rank", ok_handler)
@@ -268,15 +263,14 @@ def test_exclude_downstream_purged_dependency_is_failed(fake_process, tmp_path):
     pipeline.enqueue(Job("excluded_t", "a"))
     pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a", "ghost_task::x"]))
 
-    # 模拟 ghost_task::x 被人工从队列及存储中彻底清除
-    queue = [row for row in pipeline.backend.load_queue() if row["task_type"] != "ghost_task"]
-    pipeline.backend.save_queue(queue)
+    pipeline.set_job_status("ghost_task::x", "succeeded", recursive=False)
+    pipeline.clear_history("ghost_task::x", records=["successes"])
 
     pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
     failed = pipeline.backend.load_failed()
     assert list(failed) == ["rank::b"]
-    assert ERR_DEPENDENCY_DEADLOCK in failed["rank::b"]["error_message"]
+    assert failed["rank::b"]["missing_dependency"] == "ghost_task::x"
     assert _queued(pipeline) == ["excluded_t::a"]
 
 
@@ -438,18 +432,11 @@ def test_upstream_only_failure_skipped_by_trigger_fails_downstream(fake_process,
     pipeline.register_task("upstream", ok_handler)
     pipeline.register_task("downstream", ok_handler)
 
-    # 先让 upstream 失败并记录进失败档案
-    pipeline.backend.append_failed("upstream::u", {"error_message": "earlier failure"})
-
-    # upstream 再次入队，默认 trigger="once"（由于已有 failure，trigger 判定为跳过）
-    pipeline.backend.save_queue([
-        Job("upstream", "u", trigger="once").to_dict(),
-        Job("downstream", "d", depends_on=["upstream::u"]).to_dict(),
-    ])
-
+    pipeline.set_job_status(Job("upstream", "u"), "failed", recursive=False)
+    pipeline.enqueue(Job("upstream", "u", trigger="once"))
+    pipeline.enqueue(Job("downstream", "d", depends_on=["upstream::u"]))
     pipeline.run()
 
-    # upstream 被 trigger 跳过（移出队列），downstream 检查依赖时，upstream 只有 failure 记录，downstream 必须失败
     failed = pipeline.backend.load_failed()
     assert "downstream::d" in failed
     from tasklite.engine.errorclass import ERR_JOB_DEPENDENCY
@@ -462,16 +449,10 @@ def test_active_excluded_upstream_masks_historical_success(fake_process, tmp_pat
     pipeline.register_task("upstream", ok_handler)
     pipeline.register_task("downstream", ok_handler)
 
-    # upstream 历史已有成功
-    pipeline.set_job_status(Job("upstream", "u"), "succeeded", recursive=False)
-
-    # upstream 再次入队（成为活跃候选），下游依赖 upstream
-    pipeline.backend.save_queue([
-        Job("upstream", "u").to_dict(),
-        Job("downstream", "d", depends_on=["upstream::u"]).to_dict(),
-    ])
-
-    # run 时 exclude upstream
+    pipeline.enqueue(Job("upstream", "u"))
+    pipeline.run()
+    pipeline.enqueue(Job("upstream", "u"))
+    pipeline.enqueue(Job("downstream", "d", depends_on=["upstream::u"]))
     pipeline.run(exclude=Exclude(task_type="upstream"))
 
     # 历史成功被活跃候选遮蔽，upstream 被排除，downstream 也必须留队，不得偷跑

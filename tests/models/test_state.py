@@ -254,9 +254,10 @@ class TestFindDependencyCycles:
             _jid("outside", ["t::a"]),
         ])
 
-        assert st.find_dependency_cycles(
+        cycles = st.find_dependency_cycles(
             node_uids={"t::a", "t::b", "t::outside"}
-        ) == ["t::a", "t::b", "t::a"]
+        )
+        assert set(cycles) == {"t::a", "t::b"}
 
 
 class TestDeepGraphCycleDetection:
@@ -277,18 +278,19 @@ class TestDeepGraphCycleDetection:
         st = PipelineState({}, {}, {}, self._linear_chain(5000))
         assert st.find_dependency_cycles() == []
 
-    def test_deep_single_cycle_full_closure_exact_order(self):
-        """5000 节点单环：路径切片 + 闭点重复构成完整闭环，顺序确定。"""
+    def test_deep_single_cycle_reports_all_members(self):
+        """5000 节点单环：完整成员归因，不把回边顺序当作外部契约。"""
         n = 5000
         queue = [
             {"task_type": "t", "job_id": f"k{i}", "depends_on": [f"t::k{(i + 1) % n}"]}
             for i in range(n)
         ]
         st = PipelineState({}, {}, {}, queue)
-        assert st.find_dependency_cycles() == [f"t::k{i}" for i in range(n)] + ["t::k0"]
+        cycles = st.find_dependency_cycles()
+        assert set(cycles) == {f"t::k{i}" for i in range(n)}
 
-    def test_deep_chain_with_cycle_exact_cycle_members(self):
-        """深链（2500 节点）尾部挂接双节点环：仅环成员入结果且路径精确。"""
+    def test_deep_chain_with_cycle_reports_only_cycle_members(self):
+        """深链（2500 节点）尾部挂接双节点环：仅环成员入结果。"""
         queue = self._linear_chain(2500)
         queue[-1]["depends_on"] = ["t::c_head"]
         queue += [
@@ -296,13 +298,13 @@ class TestDeepGraphCycleDetection:
             {"task_type": "t", "job_id": "c_tail", "depends_on": ["t::c_head"]},
         ]
         st = PipelineState({}, {}, {}, queue)
-        assert st.find_dependency_cycles() == ["t::c_head", "t::c_tail", "t::c_head"]
+        assert set(st.find_dependency_cycles()) == {"t::c_head", "t::c_tail"}
 
 
 class TestCyclePathSemantics:
     """环路径口径：链不入结果、自环、共享头双环与缺失依赖。"""
 
-    def test_chain_leading_into_cycle_exact_path(self):
+    def test_chain_leading_into_cycle_excludes_chain_members(self):
         """链 x→y 挂接环 z→w→z：仅闭环节点入结果，链上节点不入。"""
         st = PipelineState({}, {}, {}, [
             _jid("x", ["t::y"]),
@@ -310,7 +312,7 @@ class TestCyclePathSemantics:
             _jid("z", ["t::w"]),
             _jid("w", ["t::z"]),
         ])
-        assert st.find_dependency_cycles() == ["t::z", "t::w", "t::z"]
+        assert set(st.find_dependency_cycles()) == {"t::z", "t::w"}
 
     def test_self_loop_alongside_acyclic_chain(self):
         """自环与无环链共存：各自独立判定，链不入结果。"""
@@ -319,7 +321,7 @@ class TestCyclePathSemantics:
             _jid("b", ["t::c"]),
             _jid("d", ["t::d"]),
         ])
-        assert st.find_dependency_cycles() == ["t::d", "t::d"]
+        assert set(st.find_dependency_cycles()) == {"t::d"}
 
     def test_multiple_back_edges_from_shared_head(self):
         """共享头部的双环（a→{b,c}，b→a，c→a）：两道回边各闭一次。
@@ -333,9 +335,7 @@ class TestCyclePathSemantics:
             _jid("c", ["t::a"]),
         ])
         result = st.find_dependency_cycles()
-        assert len(result) == 6
-        assert result[0] == result[2] == result[3] == result[5] == "t::a"
-        assert {result[1], result[4]} == {"t::b", "t::c"}
+        assert set(result) == {"t::a", "t::b", "t::c"}
 
     def test_missing_dependency_outside_queue_is_not_cycle_member(self):
         """指向队列外的缺失依赖不构成环，返回空。"""
@@ -352,7 +352,7 @@ class TestCyclePathSemantics:
             _jid("a", ["t::b"]),
             _jid("b", ["t::a"]),
         ])
-        assert st.find_dependency_cycles() == ["t::a", "t::b", "t::a"]
+        assert set(st.find_dependency_cycles()) == {"t::a", "t::b"}
 
 
 class TestCascadeFail:

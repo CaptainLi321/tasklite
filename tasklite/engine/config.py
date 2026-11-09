@@ -10,14 +10,13 @@ RunConfig 是调优参数默认值的唯一解析点：调用方一律透传可�
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence, TYPE_CHECKING
 
 from .admission import ImmediateRequeuePolicy, RequeuePolicy, TriggerRegistry
 from .errorclass import ErrorClassifier
-from .governor import DEADLOCK_GAP_MAX_ROUNDS, DEP_GRACE_SECONDS, DeadlockGovernor
+from .governor import DEADLOCK_GAP_MAX_ROUNDS, DeadlockGovernor
 from .resource import ResourceManager
 from .scheduler import FifoOrderingPolicy, OrderingPolicy
 from .store import COMMIT_FAILURE_THRESHOLD
@@ -30,8 +29,7 @@ if TYPE_CHECKING:  # 仅静态分析导入，避免运行时环形导入
 
 @dataclass(frozen=True)
 class Tuning:
-    """三参数调优标量的已解析形态（governor 构造等前置场景使用）。"""
-    dependency_grace_seconds: float
+    """两参数调优标量的已解析形态（governor 构造等前置场景使用）。"""
     commit_failure_threshold: int
     deadlock_gap_max_rounds: int
 
@@ -55,42 +53,15 @@ def _positive_int_rounds(value: int | None, default: int, name: str) -> int:
 
 def resolve_tuning(
     *,
-    dependency_grace_seconds: float | None = None,
     commit_failure_threshold: int | None = None,
     deadlock_gap_max_rounds: int | None = None,
 ) -> Tuning:
     """调优标量规范化（与 RunConfig.resolve 共用同一真相源）。
 
-    合法性域：dependency_grace_seconds 有限正实数（仅 int/float，bool/str 等
-    非数值类型 TypeError；0/负 → 依赖宽限立即判死；NaN 比较恒 False /
-    inf → 宽限永不裁决活锁）；两个轮次阈值为正整数（仅真 int——bool、
-    浮点与数字字符串一律 TypeError：浮点截断（如 1.9 → 1）会静默落入
-    「零恢复窗口」致命域，字符串强转则让类型漂移无告警穿透）。
+    两个阈值为正整数（仅真 int——bool、浮点与数字字符串一律 TypeError：
+    浮点截断（如 1.9 → 1）会静默落入「零恢复窗口」致命域，字符串强转
+    则让类型漂移无告警穿透）。
     """
-    if dependency_grace_seconds is None:
-        grace = DEP_GRACE_SECONDS
-    else:
-        if isinstance(dependency_grace_seconds, bool) or not isinstance(
-            dependency_grace_seconds, (int, float)
-        ):
-            raise TypeError(
-                f"dependency_grace_seconds must be a real number, got "
-                f"{type(dependency_grace_seconds).__name__} ({dependency_grace_seconds!r})"
-            )
-        # 超大 int 转 float 溢出抛 OverflowError（ArithmeticError 子类），
-        # 收敛为 ValueError 与其余非法值同路 fail-loud
-        try:
-            grace = float(dependency_grace_seconds)
-        except OverflowError:
-            raise ValueError(
-                f"dependency_grace_seconds must be a finite number > 0, "
-                f"got {dependency_grace_seconds!r}"
-            ) from None
-    finite_grace = math.isfinite(grace)
-    if not finite_grace or grace <= 0:
-        raise ValueError(
-            f"dependency_grace_seconds must be a finite number > 0, got {dependency_grace_seconds!r}"
-        )
     threshold = _positive_int_rounds(
         commit_failure_threshold, COMMIT_FAILURE_THRESHOLD,
         "commit_failure_threshold",
@@ -100,7 +71,6 @@ def resolve_tuning(
         "deadlock_gap_max_rounds",
     )
     return Tuning(
-        dependency_grace_seconds=grace,
         commit_failure_threshold=threshold,
         deadlock_gap_max_rounds=gap_rounds,
     )
@@ -129,7 +99,6 @@ class RunConfig:
     output_roots: Path | Sequence[Path] | None = None
     protected_roots: tuple[Path, ...] = ()
     strict_picklable: bool = True
-    dependency_grace_seconds: float = DEP_GRACE_SECONDS
     commit_failure_threshold: int = COMMIT_FAILURE_THRESHOLD
     deadlock_gap_max_rounds: int = DEADLOCK_GAP_MAX_ROUNDS
 
@@ -151,13 +120,11 @@ class RunConfig:
         output_roots: Path | Sequence[Path] | None = None,
         protected_roots: tuple[Path, ...] = (),
         strict_picklable: bool = True,
-        dependency_grace_seconds: float | None = None,
         commit_failure_threshold: int | None = None,
         deadlock_gap_max_rounds: int | None = None,
     ) -> "RunConfig":
         """唯一规范化入口：可空原始值 → 常量默认 + 最终类型。"""
         tuning = resolve_tuning(
-            dependency_grace_seconds=dependency_grace_seconds,
             commit_failure_threshold=commit_failure_threshold,
             deadlock_gap_max_rounds=deadlock_gap_max_rounds,
         )
@@ -178,7 +145,6 @@ class RunConfig:
             ordering_policy=ordering_policy if ordering_policy is not None else FifoOrderingPolicy(),
             output_roots=output_roots,
             strict_picklable=strict_picklable,
-            dependency_grace_seconds=tuning.dependency_grace_seconds,
             commit_failure_threshold=tuning.commit_failure_threshold,
             deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
         )

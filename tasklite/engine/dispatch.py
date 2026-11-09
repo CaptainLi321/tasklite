@@ -190,20 +190,21 @@ class DispatchMachine:
                         exclude_fn(pending_uid)
                     return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
 
-        ok, worker_wait = self._resources.can_acquire_worker(1.0)
-        if not ok:
-            return DispatchOutcome(
-                kind=DispatchKind.WORKER_SATURATED,
-                worker_wait=worker_wait,
-                standstill=StandstillFacts(min_wait=0.0),
-            )
-
         sched = self._scheduler.scan_next_runnable(store.state, store.state.in_flight_uids)
         if sched.runnable_idx is None:
             return DispatchOutcome(
                 kind=DispatchKind.NO_CANDIDATE,
                 standstill=sched.standstill_facts(),
             )
+
+        if sched.kind not in ("dep_failed", "dep_missing"):
+            ok, worker_wait = self._resources.can_acquire_worker(1.0)
+            if not ok:
+                return DispatchOutcome(
+                    kind=DispatchKind.WORKER_SATURATED,
+                    worker_wait=worker_wait,
+                    standstill=StandstillFacts(min_wait=0.0),
+                )
 
         if not self._dispatch_allowed():
             return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
@@ -227,7 +228,7 @@ class DispatchMachine:
         if sched.runnable_idx is None or not self._dispatch_allowed():
             return None
 
-        # 1. 依赖已失败分支：优先于去重/准入求值（上游失败阻断下游，不得借旧成功跳过）
+        # 1. 依赖终态分支：优先于去重/准入求值（失败或缺失阻断下游）。
         if sched.kind == "dep_failed":
             pending_dep_failure = sched.pending_dep_failure
             job_snapshot = store.state.pop_job(sched.runnable_idx)
@@ -244,6 +245,15 @@ class DispatchMachine:
                     attempt_id = None
             self.dispatch_dep_failed(
                 job_uid, job_snapshot, pending_dep_failure, attempt_id=attempt_id
+            )
+            return None
+        if sched.kind == "dep_missing":
+            job_snapshot = store.state.pop_job(sched.runnable_idx)
+            job_uid = Job.from_dict(job_snapshot).uid
+            self.dispatch_dep_missing(
+                job_uid,
+                job_snapshot,
+                sched.pending_dep_missing,
             )
             return None
 
@@ -485,6 +495,32 @@ class DispatchMachine:
         # 「真实业务失败率」统计不被级联稀释。
         self._reject_and_commit(
             job_uid, job_snapshot, failure_metadata, count_as="cascade_failed", attempt_id=attempt_id
+        )
+        return True
+
+    def dispatch_dep_missing(
+        self,
+        job_uid: str,
+        job_snapshot: dict,
+        pending_dep_missing: str | None,
+    ) -> bool:
+        """依赖记录缺失时直接结算失败并级联下游，不启动 worker。"""
+        if pending_dep_missing is None:
+            return False
+        logger.warning(
+            f"SKIP: {job_uid} (Dependency {pending_dep_missing} has no record)"
+        )
+        failure_metadata: dict[str, Any] = {
+            "error_message": ERR_JOB_DEPENDENCY,
+            "failed_dependency": pending_dep_missing,
+            "missing_dependency": pending_dep_missing,
+        }
+        self._reject_and_commit(
+            job_uid,
+            job_snapshot,
+            failure_metadata,
+            count_as="failed",
+            attempt_id=None,
         )
         return True
 

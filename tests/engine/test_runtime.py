@@ -605,27 +605,25 @@ class TestGracefulDraining:
         assert "t::j2" not in env.backend.load_successes()
         assert any(jd.get("job_id") == "j2" for jd in env.backend.load_queue())
 
-    def test_deadlock_detected_flag_propagates_to_step_outcome(
+    def test_missing_dependency_settles_without_deadlock_arbitration(
         self, tmp_path, monkeypatch,
     ):
-        """无可运行候选且无 in-flight 时：governor 熔断结果经命名仲裁
-        对象透传到 StepOutcome.deadlock_detected。"""
-        from tasklite.engine.governor import DeadlockDecision
-
+        """明确缺失由依赖终态路径直接结算，不进入停摆仲裁。"""
         env = RuntimeEnv(tmp_path)
         runtime = env.runtime
-        # 队列装载一个依赖缺失作业 → 调度扫描给出 NO_CANDIDATE 停摆事实
-        runtime.store.state.spawn_jobs(
-            [Job("t", "blocked", payload={}, depends_on=["t::missing"]).to_dict()],
-            front=False,
-        )
+        runtime.store.state.replace_queue([
+            Job("t", "blocked", depends_on=["t::missing"]).to_dict(),
+            Job("t", "downstream", depends_on=["t::blocked"]).to_dict(),
+        ])
         monkeypatch.setattr(
             runtime.governor, "arbitrate",
-            lambda facts, store: DeadlockDecision(
-                action="resolved", should_terminate=True,
-                failed_uids=["t::blocked"],
+            lambda *args, **kwargs: pytest.fail(
+                "明确缺失不得进入停摆仲裁"
             ),
         )
         outcome = runtime.step()
-        assert outcome.deadlock_detected is True
+        assert outcome.deadlock_detected is False
         assert outcome.should_terminate is True
+        assert set(env.backend.load_failed()) == {"t::blocked", "t::downstream"}
+        assert env.backend.load_attempts("t::blocked") == []
+        assert env.backend.load_attempts("t::downstream") == []

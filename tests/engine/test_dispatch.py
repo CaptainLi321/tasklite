@@ -176,10 +176,69 @@ class TestDispatchOutcomeKind:
 
     def test_workers_exhausted_is_worker_saturated(self, tmp_path):
         env = DispatchEnv(tmp_path, capacity=0)
+        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.WORKER_SATURATED
         assert outcome.worker_wait > 0
         assert outcome.entry is None
+
+    def test_missing_dependency_settles_without_worker_slot(self, tmp_path):
+        env = DispatchEnv(tmp_path, capacity=0)
+        env.store.state.spawn_jobs([
+            Job("t", "gap", depends_on=["t::missing"]).to_dict(),
+            Job("t", "downstream", depends_on=["t::gap"]).to_dict(),
+        ])
+
+        outcome = env.dispatch.dispatch_next()
+
+        assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
+        assert set(env.backend.load_failed()) == {"t::gap", "t::downstream"}
+        assert env.backend.load_failed()["t::gap"]["missing_dependency"] == "t::missing"
+        assert env.backend.load_attempts("t::gap") == []
+        assert env.backend.load_attempts("t::downstream") == []
+
+    def test_stop_keeps_missing_dependency_pending(self, tmp_path):
+        env = DispatchEnv(tmp_path)
+        env.session.stop_mode = StopMode.DRAINING
+        missing = Job("t", "gap", depends_on=["t::missing"]).to_dict()
+        env.store.state.spawn_jobs([missing])
+
+        outcome = env.dispatch.dispatch_next()
+
+        assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
+        assert env.backend.load_failed() == {}
+        assert env.store.state.queue == [missing]
+
+    def test_authorization_pending_precedes_missing_dependency(self, tmp_path):
+        env = DispatchEnv(tmp_path)
+        env.register("t")
+        target = tmp_path / "out" / "result.txt"
+        target.parent.mkdir()
+        target.write_text("stale", encoding="utf-8")
+        env.store.authorizer = lambda *_args: None
+        env.store.state.spawn_jobs([
+            Job(
+                "t",
+                "authorized",
+                files={
+                    "result": FileSpec(
+                        target,
+                        role="output",
+                        delete_existing=True,
+                    ),
+                },
+            ).to_dict(),
+            Job("t", "gap", depends_on=["t::missing"]).to_dict(),
+        ])
+
+        first = env.dispatch.dispatch_next()
+        second = env.dispatch.dispatch_next()
+
+        assert first.kind is DispatchKind.AUTHORIZATION_PENDING
+        assert second.kind is DispatchKind.AUTHORIZATION_PENDING
+        assert set(env.store.state.queue_uids) == {"t::authorized", "t::gap"}
+        assert env.backend.load_failed() == {}
+        assert env.backend.load_attempts("t::gap") == []
 
     def test_spawned_entry_carries_attempt_row(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)

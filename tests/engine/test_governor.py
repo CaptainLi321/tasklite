@@ -1,4 +1,4 @@
-"""v2 死锁治理器测试：四分类归因、宽限 episode 状态机、缺口升级与深链仲裁。"""
+"""v2 死锁治理器测试：归因、缺口升级与深链仲裁。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from tasklite.engine.errorclass import (
 )
 from tasklite.engine.governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
-    DEP_GRACE_SECONDS,
     DeadlockDecision,
     DeadlockGovernor,
 )
@@ -141,24 +140,9 @@ class TestGapEscalation:
         assert gov.deadlock_gap_rounds == 1
 
 
-class TestMissingDependencyImmediateResolution:
-    def test_missing_dependency_fails_immediately_without_grace(self):
-        gov = DeadlockGovernor()
-        state = _state([Job("t", "a", depends_on=["t::missing"]).to_dict()])
-        store = FakeArbitrationStore(state)
-        facts = StandstillFacts(
-            min_wait=INF,
-            attribution=DeadlockAttribution(missing_dependency_uids=("t::a",)),
-            has_potential_spawners=True,
-        )
-        decision = gov.resolve_deadlock(facts, store=store)
-        assert decision.action == "resolved"
-        assert state.failed["t::a"]["error_message"] == ERR_DEPENDENCY_DEADLOCK
-
-
 class TestArbitrateFacade:
     def test_none_facts_returns_none(self):
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
+        gov = DeadlockGovernor()
         store = FakeArbitrationStore(_state([]))
         decision = gov.arbitrate(None, store)
         assert decision.action == "none"
@@ -166,7 +150,7 @@ class TestArbitrateFacade:
         assert decision.wait_time == 0.0
 
     def test_finite_wait_without_cycle_returns_none(self):
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
+        gov = DeadlockGovernor()
         state = _state([Job("t", "a", depends_on=["t::b"]).to_dict()])
         store = FakeArbitrationStore(state)
         sched = StandstillFacts(min_wait=2.0, waiting_for_dependency=False)
@@ -177,7 +161,7 @@ class TestArbitrateFacade:
 
     def test_finite_wait_with_cycle_resolves(self):
         """有限等待但拓扑成环（掩盖死锁）→ 触发 resolve_deadlock 熔断环成员。"""
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
+        gov = DeadlockGovernor()
         state = _state(
             [
                 Job("t", "a", depends_on=["t::b"]).to_dict(),
@@ -202,7 +186,7 @@ class TestArbitrateFacade:
 
 
 class TestResolveDeadlockAttribution:
-    """四分类归因：malformed / unknown / missing / impossible + 环与缺口升级。"""
+    """三类归因：malformed / unknown / impossible + 环与缺口升级。"""
 
     def test_malformed_attribution(self):
         gov = DeadlockGovernor()
@@ -242,19 +226,6 @@ class TestResolveDeadlockAttribution:
         assert decision.action == "resolved"
         assert state.failed["t::x"]["error_message"] == ERR_RESOURCE_DEADLOCK
 
-    def test_missing_dependency_without_spawner_fails_after_grace(self):
-        gov = DeadlockGovernor(dependency_grace_seconds=5.0)
-        state = _state([Job("t", "a", depends_on=["t::ghost"]).to_dict()])
-        store = FakeArbitrationStore(state)
-        facts = StandstillFacts(
-            min_wait=INF,
-            attribution=DeadlockAttribution(missing_dependency_uids=("t::a",)),
-            has_potential_spawners=False,
-        )
-        decision = gov.resolve_deadlock(facts, store=store)
-        assert decision.action == "resolved"
-        assert state.failed["t::a"]["error_message"] == ERR_DEPENDENCY_DEADLOCK
-
     def test_cycle_members_failed_outside_kept(self):
         gov = DeadlockGovernor()
         state = _state(
@@ -291,15 +262,14 @@ class TestResolveDeadlockAttribution:
         gov = DeadlockGovernor()
         state = _state(
             [
-                Job("t", "a", depends_on=["t::ghost"]).to_dict(),
+                Job("t", "a", resources={"gpu": 99.0}).to_dict(),
                 Job("t", "c").to_dict(),
             ]
         )
         store = FakeArbitrationStore(state)
         facts = StandstillFacts(
             min_wait=INF,
-            attribution=DeadlockAttribution(missing_dependency_uids=("t::a",)),
-            has_potential_spawners=False,
+            attribution=DeadlockAttribution(impossible_resource_uids=("t::a",)),
         )
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
@@ -416,7 +386,7 @@ class TestSelectionClosedLoopArbitration:
         assert len(store.state.queue) == 4
         assert not store.state.failed
 
-    def test_missing_dependency_is_attributed_before_remaining_allowed_cycle(self):
+    def test_missing_dependency_settles_before_remaining_allowed_cycle(self):
         from tasklite.engine.scheduler import JobScheduler
         from tasklite.engine.selection import SelectionMachine
         from tasklite.engine.store import StateStore
@@ -439,29 +409,23 @@ class TestSelectionClosedLoopArbitration:
         assert standstill is not None
         assert set(standstill.cycle_uids) == {"t::a", "t::b"}
 
-        facts = scheduler.scan_next_runnable(store.state, set()).standstill_facts()
-        assert facts.attribution.missing_dependency_uids == ("t::gap",)
-        decision = governor.arbitrate(
-            facts,
-            store=store,
-            selection_machine=machine,
-        )
-        assert decision.action == "resolved"
-        assert set(store.state.failed) == {"t::gap"}
-        assert {job_uid_from_snapshot(row) for row in store.state.queue} == {
-            "t::a", "t::b", "t::downstream"
-        }
-
         candidate = scheduler.scan_next_runnable(store.state, set())
-        assert candidate.kind == "dep_failed"
+        assert candidate.kind == "dep_missing"
+        assert candidate.pending_dep_missing == "t::missing"
         assert candidate.runnable_idx is not None
-        downstream = store.state.pop_job(candidate.runnable_idx)
-        assert job_uid_from_snapshot(downstream) == "t::downstream"
+        gap = store.state.pop_job(candidate.runnable_idx)
         store.apply_failure(
-            "t::downstream",
-            {"error_message": "JOB_DEPENDENCY", "failed_dependency": "t::gap"},
-            job_snapshot=downstream,
+            "t::gap",
+            {
+                "error_message": ERR_DEPENDENCY_DEADLOCK,
+                "missing_dependency": "t::missing",
+            },
+            job_snapshot=gap,
         )
+        assert set(store.state.failed) == {"t::gap", "t::downstream"}
+        assert {job_uid_from_snapshot(row) for row in store.state.queue} == {
+            "t::a", "t::b"
+        }
 
         facts = scheduler.scan_next_runnable(store.state, set()).standstill_facts()
         assert not facts.attribution.has_deadlock_causes

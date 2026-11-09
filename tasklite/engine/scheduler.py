@@ -57,7 +57,6 @@ class DeadlockAttribution:
     """不可变死锁归因值对象，记录导致死锁的作业 UID 分类（解耦队列整型下标）。"""
 
     unknown_resource_uids: tuple[str, ...] = ()
-    missing_dependency_uids: tuple[str, ...] = ()
     malformed_uids: tuple[str, ...] = ()
     impossible_resource_uids: tuple[str, ...] = ()
 
@@ -66,7 +65,6 @@ class DeadlockAttribution:
         """是否存在死锁归因原因。"""
         return bool(
             self.unknown_resource_uids
-            or self.missing_dependency_uids
             or self.malformed_uids
             or self.impossible_resource_uids
         )
@@ -76,7 +74,7 @@ class DeadlockAttribution:
 class StandstillFacts:
     """停摆投影值对象——死锁仲裁输入的唯一形状（LoopFacts 模式）。
 
-    只携带仲裁评估所需事实（min_wait / 依赖等待 / 潜在派生者 / 归因），
+    只携带仲裁评估所需事实（min_wait / 依赖等待 / 归因），
     不含派发侧字段；派发产物构造期从 ScheduleResult 一次性投影，
     governor 不再鸭子解包多态入参形状。等待决策仍归 wait.decide_wait，
     本对象只承载事实不产出决策。
@@ -84,7 +82,6 @@ class StandstillFacts:
 
     min_wait: float = float("inf")
     waiting_for_dependency: bool = False
-    has_potential_spawners: bool = False
     attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
     has_resource_waiters: bool = False
 
@@ -93,20 +90,21 @@ class StandstillFacts:
 class ScheduleResult:
     """一次只读队列扫描的结果。
 
-    ``kind`` 显式表达 runnable_idx + pending_dep_failure + dep_failed_idx
-    的兜底关系：
+    ``kind`` 显式表达 runnable_idx 与依赖终态候选的兜底关系：
 
     - ``kind == "runnable"``：runnable_idx 指向真正可运行的 job；
     - ``kind == "dep_failed"``：runnable_idx 指向 dep-failed 兜底位置
       （pending_dep_failure 携带失败依赖，派发机器走依赖失败分支）；
+    - ``kind == "dep_missing"``：runnable_idx 指向缺失依赖兜底位置
+      （pending_dep_missing 携带缺失依赖，派发机器直接结算失败）；
     - ``kind == "none"``：无可运行 job（本轮无 job 可派发）。
     """
     runnable_idx: int | None = None
     pending_dep_failure: str | None = None
+    pending_dep_missing: str | None = None
     min_wait: float = float('inf')
     waiting_for_dependency: bool = False
-    has_potential_spawners: bool = False
-    # 结果类型（runnable / dep_failed / none）
+    # 结果类型（runnable / dep_failed / dep_missing / none）
     kind: str = "none"
     # 死锁归因值对象（UID 集合）
     attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
@@ -125,6 +123,11 @@ class ScheduleResult:
         return self.kind == "dep_failed"
 
     @property
+    def is_dep_missing(self) -> bool:
+        """是否选出了依赖缺失待结算的作业。"""
+        return self.kind == "dep_missing"
+
+    @property
     def has_candidate(self) -> bool:
         """是否存在选中的候选作业下标。"""
         return self.runnable_idx is not None
@@ -134,7 +137,6 @@ class ScheduleResult:
         return StandstillFacts(
             min_wait=self.min_wait,
             waiting_for_dependency=self.waiting_for_dependency,
-            has_potential_spawners=self.has_potential_spawners,
             attribution=self.attribution,
             has_resource_waiters=self.has_resource_waiters,
         )
@@ -232,11 +234,7 @@ class JobScheduler:
         self._job_cache.clear()
 
     def cached_job(self, job_snapshot: dict) -> JobFacts:
-        """返回 job_snapshot 的不可变调度投影（内容键缓存复用）。
-
-        公开方法：失败机器的依赖宽限路径跨模块复用同一缓存（免二次
-        全量反序列化），调度扫描本身也是唯一内部消费方。
-        """
+        """返回 job_snapshot 的不可变调度投影（内容键缓存复用）。"""
         task_type = job_snapshot.get("task_type")
         job_id = job_snapshot.get("job_id")
         if task_type is None or job_id is None:
@@ -311,20 +309,14 @@ class JobScheduler:
         死锁。
         """
         queue_snapshots = state.queue
-        successes_map = state.successes
-        failed_map = state.failed
-        queue_uids = state.queue_uids
-        in_flight_set = set(in_flight_uids)
-        pending_or_running = queue_uids | in_flight_set
 
         runnable_idx = None
         min_wait = float('inf')
         waiting_for_dependency = False
-        has_potential_spawners = False
-        pending_dep_failure: str | None = None
-        dep_failed_idx: int = -1  # 首个 dep-failed job 的索引（兜底）
+        pending_kind: str | None = None
+        pending_dep: str | None = None
+        pending_dep_idx = -1
         unknown_resource_uids: list[str] = []
-        missing_dependency_uids: list[str] = []
         malformed_uids: list[str] = []
         impossible_resource_uids: list[str] = []
         has_resource_waiters = False
@@ -339,8 +331,7 @@ class JobScheduler:
                 malformed_uids.append(job_uid_from_snapshot(job_snapshot))
                 continue
 
-            # 排除规则与临时排除：命中排除的作业在依赖/资源评估之前整体跳过，
-            # 不贡献 missing/unknown/impossible/min_wait/has_potential_spawners 等停摆事实。
+            # 排除规则与临时排除：命中排除的作业在依赖/资源评估之前整体跳过。
             if self.is_job_excluded(job.uid, job.task_type):
                 continue
 
@@ -348,6 +339,7 @@ class JobScheduler:
             can_run = True
             failed_dependency = None
             has_missing_dep = False
+            missing_dependency = None
             waiting_for_dep = False
 
             if job.depends_on:
@@ -368,25 +360,28 @@ class JobScheduler:
                         break
                     elif status == DependencyStatus.MISSING:
                         has_missing_dep = True
+                        missing_dependency = dep_uid
                         can_run = False
                         break
 
             if failed_dependency:
-                if pending_dep_failure is None:
-                    pending_dep_failure = failed_dependency
-                    dep_failed_idx = i
+                if pending_kind is None:
+                    pending_kind = "dep_failed"
+                    pending_dep = failed_dependency
+                    pending_dep_idx = i
                 continue
 
             if has_missing_dep:
                 waiting_for_dependency = True
-                missing_dependency_uids.append(job.uid)
+                if pending_kind is None:
+                    pending_kind = "dep_missing"
+                    pending_dep = missing_dependency
+                    pending_dep_idx = i
                 continue
 
             if waiting_for_dep:
                 waiting_for_dependency = True
                 continue
-
-            has_potential_spawners = True
 
             # 资源评估（unknown / impossible / wait_time 由 ResourceManager 深模块统一裁决）
             eval_res = self.resource_mgr.evaluate(job.task_type, job.resources)
@@ -409,37 +404,31 @@ class JobScheduler:
             runnable_idx = i
             break
 
-        # 兜底：整轮没有可运行 job 但存在 dep-failed job →
-        # runnable_idx 落回首个 dep-failed 位置（派发机器会处理它）。
-        if runnable_idx is None and pending_dep_failure is not None:
-            runnable_idx = dep_failed_idx
-
-        # pending_dep_failure 只在 runnable_idx 落回 dep-failed 兜底位置时才有效。
-        # 若 runnable_idx 指向真正可运行的 job（排在 dep-failed job 之后扫描选出的），
-        # 必须清空 pending_dep_failure，防止将依赖失败误判给可运行作业。
-        if runnable_idx != dep_failed_idx:
-            pending_dep_failure = None
+        # 无运行候选时按访问序把首个依赖终态问题交给派发机器结算。
+        if runnable_idx is None and pending_kind is not None:
+            runnable_idx = pending_dep_idx
+        elif runnable_idx != pending_dep_idx:
+            pending_kind = None
+            pending_dep = None
 
         attribution = DeadlockAttribution(
             unknown_resource_uids=tuple(unknown_resource_uids),
-            missing_dependency_uids=tuple(missing_dependency_uids),
             malformed_uids=tuple(malformed_uids),
             impossible_resource_uids=tuple(impossible_resource_uids),
         )
 
-        # 死锁归因类集合（impossible/unknown/missing/malformed）任一非空时
+        # 死锁归因类集合（impossible/unknown/malformed）任一非空时
         # 强制 min_wait=inf：这些类别的判定不依赖任何等待——impossible/
-        # unknown 是永久性死锁，missing 由宽限逻辑单独裁决，malformed 无法
-        # 反序列化、永远不可能变为可运行。若被队列中另一 job 的有限资源
+        # unknown 是永久性死锁，malformed 无法反序列化、永远不可能变为可运行。
+        # 若被队列中另一 job 的有限资源
         # 等待覆盖 min_wait，死锁判定被逐轮推迟到该等待终结（资源挂起
         # TTL 可达数十分钟，管线表现为卡死无日志）。
         if attribution.has_deadlock_causes and min_wait != float('inf'):
             min_wait = float('inf')
 
-        # 显式表达结果类型——兜底后 runnable_idx 与 pending_dep_failure
-        # 的关系决定 kind。
-        if runnable_idx is not None and pending_dep_failure is not None:
-            kind = "dep_failed"
+        # 显式表达结果类型——兜底后候选与依赖终态字段共同决定 kind。
+        if runnable_idx is not None and pending_kind is not None:
+            kind = pending_kind
         elif runnable_idx is not None:
             kind = "runnable"
         else:
@@ -451,10 +440,10 @@ class JobScheduler:
 
         return ScheduleResult(
             runnable_idx=runnable_idx,
-            pending_dep_failure=pending_dep_failure,
+            pending_dep_failure=pending_dep if kind == "dep_failed" else None,
+            pending_dep_missing=pending_dep if kind == "dep_missing" else None,
             min_wait=min_wait,
             waiting_for_dependency=waiting_for_dependency,
-            has_potential_spawners=has_potential_spawners,
             kind=kind,
             attribution=attribution,
             candidate_uid=candidate_uid,

@@ -215,7 +215,6 @@ class TaskLite:
             channel=self._channel,
             classifier=self.classifier,
             governor=DeadlockGovernor(
-                dependency_grace_seconds=tuning.dependency_grace_seconds,
                 deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
             ),
             trigger_registry=self._triggers,

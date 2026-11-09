@@ -2,7 +2,7 @@
 
 事件泵每拍把现场收敛为 LoopFacts 快照，经 decide_wait 求得
 WaitDecision——等待/空闲语义的唯一实现（单一真相源），表驱动单测锁定。
-等待来源包括授权决策复查、在途超时、死锁宽限/缺口等待、候选资源
+等待来源包括授权决策复查、在途超时、死锁缺口等待、候选资源
 等待与 worker 槽位等待。除授权决策外均按已知截止点或通知推进，不做
 固定周期扫描。
 """
@@ -37,7 +37,7 @@ class LoopFacts:
     authorization_wait: bool = False
     # 资源挂起最早恢复时刻，按 min 聚合各次派发结果中的正值
     worker_wait: float = 0.0
-    # governor 宽限/gap 裁决等待
+    # governor gap 裁决等待
     deadlock_wait: float = 0.0
     # governor 仲裁的独立终止信号（区别于 is_idle）
     should_terminate: bool = False

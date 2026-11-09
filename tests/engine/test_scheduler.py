@@ -15,6 +15,7 @@ from tasklite.engine.scheduler import (
 )
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
+from tasklite.selection import Exclude
 
 INF = float("inf")
 
@@ -169,13 +170,15 @@ class TestScanResultSemantics:
 
     def test_standstill_facts_projection(self):
         scheduler = JobScheduler(resources={})
-        state = _state([Job("t", "a", depends_on=["t::missing"]).to_dict()])
+        state = _state([Job("t", "a", depends_on=["t::active"]).to_dict(),
+                        Job("t", "active").to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset())
         facts = result.standstill_facts()
         assert isinstance(facts, StandstillFacts)
         assert facts.waiting_for_dependency is True
-        assert facts.attribution.missing_dependency_uids == ("t::a",)
         assert facts.min_wait == result.min_wait
+        assert result.kind == "runnable"
+        assert result.candidate_uid == "t::active"
 
 
 class TestScanAttribution:
@@ -226,35 +229,48 @@ class TestScanAttribution:
         assert result.kind == "none"
         assert 0.0 < result.min_wait <= 20.0
 
-    def test_missing_dependency_attribution(self):
+    def test_missing_dependency_is_direct_terminal_candidate(self):
         scheduler = JobScheduler(resources={})
         state = _state([Job("t", "a", depends_on=["t::missing"]).to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset())
-        assert result.attribution.missing_dependency_uids == ("t::a",)
-        assert result.waiting_for_dependency is True
-        assert result.has_potential_spawners is False
+        assert result.is_dep_missing is True
+        assert result.pending_dep_missing == "t::missing"
+        assert result.candidate_uid == "t::a"
+        assert result.attribution.has_deadlock_causes is False
 
     def test_in_flight_dependency_not_counted_missing(self):
         """依赖正在执行的 job 不算 missing（待 commit 到 successes 自然解锁）。"""
         scheduler = JobScheduler(resources={})
         state = _state([Job("t", "a", depends_on=["t::running"]).to_dict()])
         result = scheduler.scan_next_runnable(state, frozenset({"t::running"}))
-        assert result.attribution.missing_dependency_uids == ()
+        assert result.kind == "none"
         assert result.waiting_for_dependency is True
 
-    def test_has_potential_spawners_with_resource_blocked_job(self):
+    def test_missing_dependency_does_not_wait_for_resource_blocker(self):
         gpu = CapacityResource("gpu", max_capacity=1.0)
         gpu.used = 1.0
         scheduler = JobScheduler({"gpu": gpu})
         state = _state(
             [
                 Job("t", "a", depends_on=["t::missing"]).to_dict(),
-                Job("t", "spawner", resources={"gpu": 1.0}).to_dict(),
+                Job("t", "blocked", resources={"gpu": 1.0}).to_dict(),
             ]
         )
         result = scheduler.scan_next_runnable(state, frozenset())
-        assert result.runnable_idx is None
-        assert result.has_potential_spawners is True
+        assert result.is_dep_missing is True
+        assert result.candidate_uid == "t::a"
+
+    def test_excluded_missing_dependency_remains_queued(self):
+        scheduler = JobScheduler(resources={})
+        scheduler.reset_run(Exclude(task_type="t"))
+        state = _state([
+            Job("t", "a", depends_on=["t::missing"]).to_dict(),
+            Job("other", "downstream", depends_on=["t::a"]).to_dict(),
+        ])
+        result = scheduler.scan_next_runnable(state, frozenset())
+        assert result.kind == "none"
+        assert result.attribution.has_deadlock_causes is False
+        assert result.waiting_for_dependency is True
 
     def test_scan_stops_at_first_runnable(self):
         """首中即停：选中可运行 job 后不再扫描后续条目（惰性归因）。"""
@@ -330,7 +346,6 @@ class TestDeadlockAttributionValue:
     def test_has_deadlock_causes(self):
         assert DeadlockAttribution().has_deadlock_causes is False
         assert DeadlockAttribution(malformed_uids=("t::x",)).has_deadlock_causes is True
-        assert DeadlockAttribution(missing_dependency_uids=("t::x",)).has_deadlock_causes is True
         assert DeadlockAttribution(unknown_resource_uids=("t::x",)).has_deadlock_causes is True
         assert DeadlockAttribution(impossible_resource_uids=("t::x",)).has_deadlock_causes is True
 

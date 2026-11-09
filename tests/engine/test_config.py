@@ -1,8 +1,8 @@
 """v2 RunConfig 装配与调优标量唯一解析点测试。
 
 锁定契约：
-- resolve_tuning 是调优标量唯一规范化入口（None → 常量默认、int 宽限
-  → float、非法值 fail-loud）；
+- resolve_tuning 是调优标量唯一规范化入口（None → 常量默认、非法值
+  fail-loud）；
 - RunConfig.resolve 装配件按引用透传（冻结引用而非拷贝）、可空标量经
   resolve_tuning 收敛最终类型，此后任何模块不得二次默认；
 - 零退避军规：调优面不存在任何退避类配置项。
@@ -28,7 +28,6 @@ from tasklite.engine.config import RunConfig, Tuning, resolve_tuning
 from tasklite.engine.errorclass import ErrorClassifier
 from tasklite.engine.governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
-    DEP_GRACE_SECONDS,
     DeadlockGovernor,
 )
 from tasklite.engine.resource import ResourceManager
@@ -83,17 +82,11 @@ class TestResolveTuning:
     def test_defaults_match_engine_constants(self):
         tuning = resolve_tuning()
         assert tuning == Tuning(
-            dependency_grace_seconds=DEP_GRACE_SECONDS,
             commit_failure_threshold=COMMIT_FAILURE_THRESHOLD,
             deadlock_gap_max_rounds=DEADLOCK_GAP_MAX_ROUNDS,
         )
-        assert isinstance(tuning.dependency_grace_seconds, float)
         assert isinstance(tuning.commit_failure_threshold, int)
         assert isinstance(tuning.deadlock_gap_max_rounds, int)
-
-    def test_int_grace_normalized_to_float(self):
-        assert resolve_tuning(dependency_grace_seconds=5).dependency_grace_seconds == 5.0
-        assert isinstance(resolve_tuning(dependency_grace_seconds=5).dependency_grace_seconds, float)
 
     def test_explicit_rounds_passthrough(self):
         tuning = resolve_tuning(
@@ -101,16 +94,6 @@ class TestResolveTuning:
         )
         assert tuning.commit_failure_threshold == 7
         assert tuning.deadlock_gap_max_rounds == 9
-
-    @pytest.mark.parametrize("bad", [0, -1.5, float("inf"), float("nan"), -0.001])
-    def test_rejects_invalid_dep_grace_seconds(self, bad):
-        with pytest.raises(ValueError, match="dependency_grace_seconds"):
-            resolve_tuning(dependency_grace_seconds=bad)
-
-    @pytest.mark.parametrize("bad", ["60", True, [60], {"s": 1}, object()])
-    def test_rejects_non_numeric_dep_grace_seconds(self, bad):
-        with pytest.raises(TypeError, match="dependency_grace_seconds"):
-            resolve_tuning(dependency_grace_seconds=bad)
 
     @pytest.mark.parametrize("bad", [True, 1.9, 2.0, "3"])
     def test_rejects_non_int_threshold(self, bad):
@@ -135,12 +118,6 @@ class TestResolveTuning:
         with pytest.raises(ValueError):
             resolve_tuning(**kwargs)
 
-    def test_huge_int_grace_converges_to_value_error(self):
-        """超大 int 转 float 溢出收敛为 ValueError（与 NaN/inf 同路 fail-loud）。"""
-        with pytest.raises(ValueError, match="dependency_grace_seconds"):
-            resolve_tuning(dependency_grace_seconds=10 ** 400)
-
-
 class TestRunConfigResolve:
     """RunConfig.resolve 唯一默认值解析点。"""
 
@@ -160,7 +137,6 @@ class TestRunConfigResolve:
 
     def test_none_scalars_resolved_to_constant_defaults(self, tmp_path):
         config = ConfigEnv(tmp_path).resolve()
-        assert config.dependency_grace_seconds == DEP_GRACE_SECONDS
         assert config.commit_failure_threshold == COMMIT_FAILURE_THRESHOLD
         assert config.deadlock_gap_max_rounds == DEADLOCK_GAP_MAX_ROUNDS
         assert config.strict_picklable is True
@@ -168,13 +144,11 @@ class TestRunConfigResolve:
 
     def test_explicit_scalars_passthrough_without_second_default(self, tmp_path):
         config = ConfigEnv(tmp_path).resolve(
-            dependency_grace_seconds=1.5,
             commit_failure_threshold=5,
             deadlock_gap_max_rounds=2,
             strict_picklable=False,
             output_roots=Path("/tmp/out"),
         )
-        assert config.dependency_grace_seconds == 1.5
         assert config.commit_failure_threshold == 5
         assert config.deadlock_gap_max_rounds == 2
         assert config.strict_picklable is False
@@ -182,8 +156,8 @@ class TestRunConfigResolve:
 
     def test_invalid_tuning_fails_loud_at_resolve(self, tmp_path):
         env = ConfigEnv(tmp_path)
-        with pytest.raises(ValueError, match="dependency_grace_seconds"):
-            env.resolve(dependency_grace_seconds=0.0)
+        with pytest.raises(ValueError, match="commit_failure_threshold"):
+            env.resolve(commit_failure_threshold=0)
 
     def test_config_is_frozen(self, tmp_path):
         config = ConfigEnv(tmp_path).resolve()
