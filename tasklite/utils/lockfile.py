@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -54,19 +55,20 @@ def try_acquire_lock(
 
 def _try_lock_fd(fd: int) -> bool:
     """对已打开的 fd 尝试非阻塞排他锁（平台分派）。"""
-    if os.name == "nt":
+    if sys.platform == "win32":
         import msvcrt
         try:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
             return True
         except OSError:
             return False
-    import fcntl
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
+    else:
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
 
 
 def release_lock(fd: int) -> None:
@@ -74,10 +76,10 @@ def release_lock(fd: int) -> None:
     if fd is None:
         return
     try:
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
             os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
             fcntl.flock(fd, fcntl.LOCK_UN)

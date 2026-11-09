@@ -26,9 +26,8 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence
 
 from ..exceptions import _ArtifactIOError
 from ..models.artifact import (
@@ -40,6 +39,14 @@ from .artifact import ArtifactPathPolicy
 from .jsonutil import dumps, loads
 
 logger = logging.getLogger("tasklite")
+
+
+class _PipeConnection(Protocol):
+    def send_bytes(self, buf: bytes, /) -> None: ...
+    def recv_bytes(self) -> bytes: ...
+    def poll(self, timeout: float, /) -> bool: ...
+    def close(self) -> None: ...
+
 
 # 管道消息种类常量
 PIPE_MSG_INPUT = "input"
@@ -108,7 +115,7 @@ class WorkerPipeSender:
 
     def __init__(
         self,
-        connection: Connection,
+        connection: _PipeConnection,
         *,
         job_uid: str,
         execution_id: str,
@@ -203,7 +210,7 @@ class WorkerPipeReceiver:
 
     def __init__(
         self,
-        connection: Connection,
+        connection: _PipeConnection,
         *,
         job_uid: str,
         execution_id: str,
@@ -238,7 +245,13 @@ class WorkerPipeReceiver:
         try:
             while not self._stop.is_set():
                 try:
-                    if not self._conn.poll(0.05):
+                    try:
+                        ready = self._conn.poll(0.05)
+                    except BrokenPipeError as exc:
+                        if getattr(exc, "winerror", None) == 109:
+                            break
+                        raise
+                    if not ready:
                         continue
                     self._delivering = True
                     try:
@@ -417,7 +430,7 @@ class WorkerReplySender:
 
     def __init__(
         self,
-        connection: Connection,
+        connection: _PipeConnection,
         *,
         job_uid: str,
         execution_id: str,
@@ -460,7 +473,7 @@ class WorkerReplyReceiver:
 
     def __init__(
         self,
-        connection: Connection,
+        connection: _PipeConnection,
         *,
         job_uid: str,
         execution_id: str,

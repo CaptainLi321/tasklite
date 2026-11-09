@@ -15,6 +15,8 @@ from typing import Sequence
 
 from ..models.artifact import ArtifactDeclaration
 
+_DIRECTORY_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
 
 class ArtifactPathPolicy:
     """路径范围配置；不登记全局所有权或持久执行阶段。"""
@@ -112,7 +114,7 @@ class ArtifactPathPolicy:
     def _remove(self, target: Path, declaration: ArtifactDeclaration) -> None:
         self._require_relative_operations()
         before = target.parent.stat(follow_symlinks=False)
-        parent_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent_fd = os.open(target.parent, _DIRECTORY_OPEN_FLAGS)
         try:
             if not self._same_object(before, os.fstat(parent_fd)):
                 raise ValueError(f"artifact parent identity changed: {target.parent}")
@@ -179,7 +181,7 @@ class ArtifactPathPolicy:
         elif stat.S_ISDIR(entry.st_mode):
             if entry.st_dev != os.fstat(parent_fd).st_dev or os.path.ismount(target):
                 raise ValueError(f"artifact deletion must not cross a mount: {target}")
-            child_fd = os.open(target.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            child_fd = os.open(target.name, _DIRECTORY_OPEN_FLAGS,
                                dir_fd=parent_fd)
             try:
                 if not self._same_object(entry, os.fstat(child_fd)):

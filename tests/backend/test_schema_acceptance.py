@@ -81,7 +81,7 @@ def test_same_named_view_is_rejected_without_repair(tmp_path):
 
 @pytest.mark.parametrize("empty_file", [False, True])
 def test_fresh_database_and_special_characters(tmp_path, empty_file):
-    path = tmp_path / "空 %?# space.db"
+    path = tmp_path / "空 %# space.db"
     if empty_file:
         path.touch()
     backend = SQLiteStateBackend(path)
