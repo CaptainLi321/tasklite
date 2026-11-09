@@ -184,7 +184,7 @@ class JobContext:
             elif status == "error":
                 raise TaskLiteError(reply.get("error", "Declaration failed"))
             elif status == "denied":
-                raise TaskLiteError("authorization denied")
+                raise TaskLiteError(reply.get("error", "authorization denied"))
             else:
                 raise TaskLiteError(f"Unknown reply status: {status!r}")
 

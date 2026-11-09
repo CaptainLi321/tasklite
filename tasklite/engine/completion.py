@@ -41,7 +41,7 @@ from .admission import extract_effective_job_config
 from .channel import ExecutionResult, JobHandle
 from .errorclass import ERR_MAX_RETRIES
 from .in_flight import InFlightJob, InFlightTracker
-from .types import AttemptOutcome
+from .types import AttemptOutcome, AuthorizationStatus
 
 logger = logging.getLogger("tasklite")
 _CLEANUP_ERRORS = (OSError, ValueError, NotImplementedError)
@@ -225,21 +225,37 @@ class CompletionMachine:
                 for k, v in job.files.items()
             }
 
-        if result.transient_kind == "authorization_denied":
+        authorization_outcome = result.authorization_outcome
+        if (
+            authorization_outcome is not None
+            and authorization_outcome.status
+            in (AuthorizationStatus.DENIED, AuthorizationStatus.STOPPED)
+        ):
             self._store.apply_pending(
                 job_uid=uid,
                 job_snapshot=job_snapshot,
                 attempt_no=attempt_no,
                 run_id=run_id or getattr(self._session, "run_id", "run"),
                 started_at=started_at,
-                error_message="authorization denied",
+                error_message=authorization_outcome.message,
                 files={k: v.to_dict() for k, v in active_files.items()},
+                result={
+                    "message": authorization_outcome.message,
+                    "exception": None,
+                    "metadata": {},
+                    "annotations": {
+                        "authorization_status": authorization_outcome.status.value,
+                        "path": authorization_outcome.path,
+                    },
+                },
             )
             if entry is not None:
                 entry.release_resources(self._resources)
-            exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
-            if callable(exclude_fn):
-                exclude_fn(uid)
+            if authorization_outcome.status is AuthorizationStatus.DENIED:
+                exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
+                if callable(exclude_fn):
+                    exclude_fn(uid)
+            result.will_retry = False
             return
 
         if result.artifact_error is not None:

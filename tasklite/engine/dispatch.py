@@ -552,6 +552,8 @@ class DispatchMachine:
                 timeout_seconds=float(
                     job.timeout_seconds if job.timeout_seconds is not None else 3600.0
                 ),
+                run_id=self._session.run_id or "run",
+                attempt_no=attempt_no,
             ))
 
             entry = InFlightJob(

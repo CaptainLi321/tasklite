@@ -60,6 +60,8 @@ class WorkerPipeMessage:
     execution_id: str
     kind: str
     payload: Any
+    run_id: str | None = None
+    attempt_no: int | None = None
 
 
 def decode_worker_pipe_message(
@@ -67,6 +69,8 @@ def decode_worker_pipe_message(
     *,
     expected_job_uid: str,
     expected_execution_id: str,
+    expected_run_id: str | None = None,
+    expected_attempt_no: int | None = None,
 ) -> WorkerPipeMessage:
     """解析并校验单帧管道消息信封与归属身份。"""
     try:
@@ -84,6 +88,16 @@ def decode_worker_pipe_message(
         raise ValueError(
             f"worker pipe execution_id mismatch: {execution_id!r} != {expected_execution_id!r}"
         )
+    run_id = envelope.get("run_id")
+    if expected_run_id is not None and run_id != expected_run_id:
+        raise ValueError(
+            f"worker pipe run_id mismatch: {run_id!r} != {expected_run_id!r}"
+        )
+    attempt_no = envelope.get("attempt_no")
+    if expected_attempt_no is not None and attempt_no != expected_attempt_no:
+        raise ValueError(
+            f"worker pipe attempt_no mismatch: {attempt_no!r} != {expected_attempt_no!r}"
+        )
     if kind not in VALID_PIPE_MESSAGE_KINDS:
         raise ValueError(f"unknown worker pipe message kind: {kind!r}")
     return WorkerPipeMessage(
@@ -91,6 +105,12 @@ def decode_worker_pipe_message(
         execution_id=expected_execution_id,
         kind=kind,
         payload=envelope.get("payload"),
+        run_id=run_id if isinstance(run_id, str) else None,
+        attempt_no=(
+            attempt_no
+            if isinstance(attempt_no, int) and not isinstance(attempt_no, bool)
+            else None
+        ),
     )
 
 
@@ -107,10 +127,14 @@ class WorkerPipeSender:
         *,
         job_uid: str,
         execution_id: str,
+        run_id: str | None = None,
+        attempt_no: int | None = None,
     ) -> None:
         self._conn = connection
         self.job_uid = job_uid
         self.execution_id = execution_id
+        self.run_id = run_id
+        self.attempt_no = attempt_no
         self._lock = threading.Lock()
         self._closed = False
 
@@ -119,6 +143,8 @@ class WorkerPipeSender:
             "conn": self._conn,
             "job_uid": self.job_uid,
             "execution_id": self.execution_id,
+            "run_id": self.run_id,
+            "attempt_no": self.attempt_no,
             "closed": self._closed,
         }
 
@@ -126,6 +152,8 @@ class WorkerPipeSender:
         self._conn = state["conn"]
         self.job_uid = state["job_uid"]
         self.execution_id = state["execution_id"]
+        self.run_id = state.get("run_id")
+        self.attempt_no = state.get("attempt_no")
         self._closed = state["closed"]
         self._lock = threading.Lock()
 
@@ -136,6 +164,8 @@ class WorkerPipeSender:
         envelope = {
             "job_uid": self.job_uid,
             "execution_id": self.execution_id,
+            "run_id": self.run_id,
+            "attempt_no": self.attempt_no,
             "kind": kind,
             "payload": payload,
         }
@@ -195,6 +225,8 @@ class WorkerPipeReceiver:
         *,
         job_uid: str,
         execution_id: str,
+        run_id: str | None = None,
+        attempt_no: int | None = None,
         max_queued_messages: int = 64,
     ) -> None:
         if max_queued_messages < 1:
@@ -202,6 +234,8 @@ class WorkerPipeReceiver:
         self._conn = connection
         self.job_uid = job_uid
         self.execution_id = execution_id
+        self.run_id = run_id
+        self.attempt_no = attempt_no
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max_queued_messages)
         self._stop = threading.Event()
         self._eof = threading.Event()
@@ -307,6 +341,8 @@ class WorkerPipeReceiver:
                         item,
                         expected_job_uid=self.job_uid,
                         expected_execution_id=self.execution_id,
+                        expected_run_id=self.run_id,
+                        expected_attempt_no=self.attempt_no,
                     )
                 )
             except Exception as exc:
@@ -343,6 +379,8 @@ class WorkerPipeReceiver:
                         item,
                         expected_job_uid=self.job_uid,
                         expected_execution_id=self.execution_id,
+                        expected_run_id=self.run_id,
+                        expected_attempt_no=self.attempt_no,
                     )
                 )
             except Exception as exc:
@@ -382,6 +420,8 @@ def create_worker_pipe(
     *,
     job_uid: str,
     execution_id: str,
+    run_id: str | None = None,
+    attempt_no: int | None = None,
     max_queued_messages: int = 64,
 ) -> tuple[WorkerPipeReceiver, WorkerPipeSender]:
     """创建一对绑定的单向 (WorkerPipeReceiver, WorkerPipeSender)。"""
@@ -393,12 +433,16 @@ def create_worker_pipe(
         recv_conn,
         job_uid=job_uid,
         execution_id=execution_id,
+        run_id=run_id,
+        attempt_no=attempt_no,
         max_queued_messages=max_queued_messages,
     )
     sender = WorkerPipeSender(
         send_conn,
         job_uid=job_uid,
         execution_id=execution_id,
+        run_id=run_id,
+        attempt_no=attempt_no,
     )
     return receiver, sender
 
@@ -415,10 +459,14 @@ class WorkerReplySender:
         *,
         job_uid: str,
         execution_id: str,
+        run_id: str | None = None,
+        attempt_no: int | None = None,
     ) -> None:
         self._conn = connection
         self.job_uid = job_uid
         self.execution_id = execution_id
+        self.run_id = run_id
+        self.attempt_no = attempt_no
         self._lock = threading.Lock()
         self._closed = False
 
@@ -427,6 +475,8 @@ class WorkerReplySender:
         envelope = {
             "job_uid": self.job_uid,
             "execution_id": self.execution_id,
+            "run_id": self.run_id,
+            "attempt_no": self.attempt_no,
             "payload": payload,
         }
         frame = dumps(envelope).encode("utf-8")
@@ -458,25 +508,50 @@ class WorkerReplyReceiver:
         *,
         job_uid: str,
         execution_id: str,
+        run_id: str | None = None,
+        attempt_no: int | None = None,
     ) -> None:
         self._conn = connection
         self.job_uid = job_uid
         self.execution_id = execution_id
+        self.run_id = run_id
+        self.attempt_no = attempt_no
         self._closed = False
 
-    def wait_reply(self, request_id: str, timeout: float = 30.0) -> dict[str, Any]:
-        deadline = time.monotonic() + max(0.1, timeout)
+    def wait_reply(self, request_id: str, timeout: float | None = None) -> dict[str, Any]:
+        """等待匹配执行身份与请求身份的回复；默认由主进程决定释放时机。"""
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("request_id must be a non-empty str")
+        deadline = (
+            None
+            if timeout is None
+            else time.monotonic() + max(0.1, timeout)
+        )
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"Worker timed out waiting for declaration reply (req={request_id})"
-                )
-            if not self._conn.poll(min(0.05, remaining)):
+            if self._closed:
+                raise OSError("worker reply receiver is closed")
+            if deadline is None:
+                poll_timeout = 0.05
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Worker timed out waiting for declaration reply (req={request_id})"
+                    )
+                poll_timeout = min(0.05, remaining)
+            try:
+                ready = self._conn.poll(poll_timeout)
+            except (OSError, EOFError) as exc:
+                raise OSError(
+                    f"Worker reply pipe closed before receiving reply: {exc}"
+                ) from exc
+            if not ready:
                 continue
             try:
                 raw = self._conn.recv_bytes()
             except EOFError as exc:
+                raise OSError(f"Worker reply pipe closed before receiving reply: {exc}") from exc
+            except OSError as exc:
                 raise OSError(f"Worker reply pipe closed before receiving reply: {exc}") from exc
             try:
                 envelope = loads(raw.decode("utf-8"))
@@ -484,8 +559,13 @@ class WorkerReplyReceiver:
                 continue
             if not isinstance(envelope, dict):
                 continue
+            if envelope.get("job_uid") != self.job_uid:
+                continue
             if envelope.get("execution_id") != self.execution_id:
-                # 拒绝过期回复或执行身份不匹配
+                continue
+            if self.run_id is not None and envelope.get("run_id") != self.run_id:
+                continue
+            if self.attempt_no is not None and envelope.get("attempt_no") != self.attempt_no:
                 continue
             payload = envelope.get("payload")
             if isinstance(payload, dict) and payload.get("request_id") == request_id:
@@ -506,6 +586,8 @@ def create_worker_reply_pipe(
     *,
     job_uid: str,
     execution_id: str,
+    run_id: str | None = None,
+    attempt_no: int | None = None,
 ) -> tuple[WorkerReplyReceiver, WorkerReplySender]:
     """创建一对绑定的单向回复管道 (WorkerReplyReceiver[worker端], WorkerReplySender[主进程端])。"""
     pipe_fn = getattr(process_context, "Pipe", None)
@@ -516,11 +598,15 @@ def create_worker_reply_pipe(
         recv_conn,
         job_uid=job_uid,
         execution_id=execution_id,
+        run_id=run_id,
+        attempt_no=attempt_no,
     )
     sender = WorkerReplySender(
         send_conn,
         job_uid=job_uid,
         execution_id=execution_id,
+        run_id=run_id,
+        attempt_no=attempt_no,
     )
     return receiver, sender
 

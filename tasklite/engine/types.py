@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ..models.artifact import FileSpec
 from ..models.job import Job
 
 if TYPE_CHECKING:
@@ -46,6 +47,38 @@ class StopMode(enum.Enum):
 
     NONE = "none"
     DRAINING = "draining"
+
+
+class AuthorizationStatus(str, enum.Enum):
+    """动态文件声明的授权请求状态。"""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    STOPPED = "stopped"
+    PREPARATION_FAILED = "preparation_failed"
+
+
+@dataclass
+class PendingDeclaration:
+    """一次等待主进程决定的动态文件声明。"""
+
+    request_id: str
+    name: str
+    source: FileSpec
+    bound: FileSpec
+    resolved_path: str
+    status: AuthorizationStatus = AuthorizationStatus.PENDING
+
+
+@dataclass(frozen=True)
+class AuthorizationOutcome:
+    """受阻执行的终态授权结果及可持久化原因。"""
+
+    status: AuthorizationStatus
+    message: str
+    path: str
+    exception: dict[str, str] | None = None
 
 
 class ExitReason(str, enum.Enum):
@@ -88,11 +121,19 @@ class JobHandle:
     job: Job
     ipc_dir: str | None = None
     execution_id: str | None = None
-    auth_denied: bool = False
-    preparation_error: dict[str, str] | None = None
+    run_id: str | None = None
+    attempt_no: int | None = None
     paused_remaining: float | None = None
-    waiting_auth: bool = False
-    pending_declaration: dict[str, Any] | None = None
+    pending_declaration: PendingDeclaration | None = None
+    authorization_outcome: AuthorizationOutcome | None = None
+
+    @property
+    def waiting_auth(self) -> bool:
+        """当前执行是否正在等待动态文件声明授权。"""
+        return (
+            self.pending_declaration is not None
+            and self.pending_declaration.status is AuthorizationStatus.PENDING
+        )
 
     def pause_timeout(self) -> None:
         """等待外部授权或操作时暂停超时计时。"""
@@ -132,10 +173,13 @@ class StepOutcome:
 __all__ = [
     "EMPTY_STATS",
     "TRANSIENT_KIND_STAT_KEYS",
+    "AuthorizationOutcome",
+    "AuthorizationStatus",
     "AttemptOutcome",
     "StopMode",
     "ExitReason",
     "ExecutionOptions",
     "JobHandle",
+    "PendingDeclaration",
     "StepOutcome",
 ]

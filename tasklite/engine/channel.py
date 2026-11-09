@@ -39,7 +39,7 @@ from ..utils.ipc import (
     create_worker_reply_pipe,
 )
 from .errorclass import _DEFAULT_CLASSIFIER
-from .types import JobHandle
+from .types import AuthorizationOutcome, JobHandle
 
 logger = logging.getLogger("tasklite")
 
@@ -448,6 +448,7 @@ class ExecutionResult:
     transient_kind: str | None = None
     will_retry: bool = False
     artifact_error: str | None = None
+    authorization_outcome: AuthorizationOutcome | None = None
     annotations: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -490,6 +491,8 @@ class WorkerLaunchSpec:
     ipc_dir: str | None = None
     pipe_sender: WorkerPipeSender | None = None
     reply_receiver: WorkerReplyReceiver | None = None
+    run_id: str = ""
+    attempt_no: int = 1
 
 
 @dataclass(frozen=True)
@@ -581,11 +584,15 @@ class ExecutionChannel:
             self._process_context,
             job_uid=spec.job.uid,
             execution_id=spec.execution_id,
+            run_id=spec.run_id or None,
+            attempt_no=spec.attempt_no,
         )
         reply_receiver, reply_sender = create_worker_reply_pipe(
             self._process_context,
             job_uid=spec.job.uid,
             execution_id=spec.execution_id,
+            run_id=spec.run_id or None,
+            attempt_no=spec.attempt_no,
         )
         spec.job_context._bind_pipe_sender(sender, reply_receiver)
         launch_spec = dataclasses.replace(
@@ -618,6 +625,8 @@ class ExecutionChannel:
             job=spec.job,
             ipc_dir=effective_ipc_dir,
             execution_id=spec.execution_id,
+            run_id=spec.run_id or None,
+            attempt_no=spec.attempt_no,
         )
         self._receivers[spec.execution_id] = receiver
         self._handles[spec.execution_id] = handle
@@ -822,7 +831,8 @@ class ExecutionChannel:
             exec_id = handle.execution_id or ""
             self._receive_available(handle)
 
-            if handle.auth_denied or handle.preparation_error is not None:
+            authorization_outcome = handle.authorization_outcome
+            if authorization_outcome is not None:
                 is_alive = False
                 try:
                     is_alive = p.is_alive()
@@ -842,10 +852,9 @@ class ExecutionChannel:
                     self._finalize_process(p)
                     decoded = ExecutionResult(
                         success=False,
-                        transient_kind="authorization_denied" if handle.auth_denied else None,
-                        message=(handle.preparation_error["message"]
-                                 if handle.preparation_error is not None else "authorization denied"),
-                        exception=handle.preparation_error,
+                        message=authorization_outcome.message,
+                        exception=authorization_outcome.exception,
+                        authorization_outcome=authorization_outcome,
                     )
                     completed.append((handle, decoded))
                 continue
@@ -912,7 +921,8 @@ class ExecutionChannel:
         self, handle: JobHandle, res: dict | None = None, *, is_timeout: bool = False
     ) -> ExecutionResult:
         """收敛收割尾部：终止并收割子进程 → 排空管道至 EOF → 解码结果 → 关闭管道。"""
-        if handle.auth_denied or handle.preparation_error is not None:
+        authorization_outcome = handle.authorization_outcome
+        if authorization_outcome is not None:
             p = handle.process
             exec_id = handle.execution_id or ""
             try:
@@ -924,10 +934,9 @@ class ExecutionChannel:
             self._errors.pop(exec_id, None)
             return ExecutionResult(
                 success=False,
-                transient_kind="authorization_denied" if handle.auth_denied else None,
-                message=(handle.preparation_error["message"]
-                         if handle.preparation_error is not None else "authorization denied"),
-                exception=handle.preparation_error,
+                message=authorization_outcome.message,
+                exception=authorization_outcome.exception,
+                authorization_outcome=authorization_outcome,
             )
         p = handle.process
         exec_id = handle.execution_id or ""

@@ -17,6 +17,8 @@ def test_declare_frame_roundtrips_with_execution_identity():
     receiver, sender = create_worker_pipe(
         job_uid="build::one",
         execution_id="run.1",
+        run_id="run",
+        attempt_no=1,
     )
     try:
         sender.send_declare(
@@ -35,6 +37,8 @@ def test_declare_frame_roundtrips_with_execution_identity():
         message = messages[0]
         assert message.job_uid == "build::one"
         assert message.execution_id == "run.1"
+        assert message.run_id == "run"
+        assert message.attempt_no == 1
         assert message.kind == PIPE_MSG_DECLARE
         assert message.payload["name"] == "report"
         assert message.payload["request_id"] == "req-1"
@@ -105,4 +109,44 @@ def test_decode_rejects_mismatched_job_and_execution_identity():
             raw,
             expected_job_uid="build::one",
             expected_execution_id="run.1",
+        )
+
+
+def test_decode_rejects_mismatched_run_and_attempt_identity():
+    raw = json.dumps(
+        {
+            "job_uid": "build::one",
+            "execution_id": "run.2",
+            "run_id": "run-old",
+            "attempt_no": 2,
+            "kind": PIPE_MSG_DECLARE,
+            "payload": {},
+        }
+    ).encode("utf-8")
+    with pytest.raises(ValueError, match="run_id mismatch"):
+        decode_worker_pipe_message(
+            raw,
+            expected_job_uid="build::one",
+            expected_execution_id="run.2",
+            expected_run_id="run",
+            expected_attempt_no=2,
+        )
+
+    raw = json.dumps(
+        {
+            "job_uid": "build::one",
+            "execution_id": "run.2",
+            "run_id": "run",
+            "attempt_no": 1,
+            "kind": PIPE_MSG_DECLARE,
+            "payload": {},
+        }
+    ).encode("utf-8")
+    with pytest.raises(ValueError, match="attempt_no mismatch"):
+        decode_worker_pipe_message(
+            raw,
+            expected_job_uid="build::one",
+            expected_execution_id="run.2",
+            expected_run_id="run",
+            expected_attempt_no=2,
         )

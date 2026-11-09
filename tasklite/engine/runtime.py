@@ -34,9 +34,12 @@ from .scheduler import DeadlockAttribution, JobScheduler
 from .session import RunSession
 from .store import StateStore
 from .types import (
+    AuthorizationOutcome,
+    AuthorizationStatus,
     ExecutionOptions,
     ExitReason,
     JobHandle,
+    PendingDeclaration,
     StepOutcome,
     StopMode,
 )
@@ -167,12 +170,35 @@ class EngineRuntime:
         self, handle: JobHandle, payload: dict[str, Any]
     ) -> dict[str, Any] | None:
         """主进程动态文件声明仲裁出口：验证引用、授权检查、前置清理并回送路径。"""
-        req_id = payload.get("request_id", "") or payload.get("req_id", "")
+        raw_req_id = payload.get("request_id")
+        if not isinstance(raw_req_id, str) or not raw_req_id:
+            return {
+                "request_id": "",
+                "status": "error",
+                "error": "request_id must be a non-empty str",
+            }
+        req_id = raw_req_id
         name = payload.get("name", "")
         spec_data = payload.get("spec", {})
         entry = self._in_flight.get(handle.job_uid)
-        if entry is None:
-            return {"request_id": req_id, "status": "error", "error": f"Job {handle.job_uid} not in flight"}
+        if entry is None or not self._declaration_identity_matches(handle, entry):
+            return {
+                "request_id": req_id,
+                "status": "error",
+                "error": f"Job {handle.job_uid} not in flight",
+            }
+        if handle.authorization_outcome is not None:
+            return {
+                "request_id": req_id,
+                "status": "error",
+                "error": f"Job {handle.job_uid} execution is no longer accepting declarations",
+            }
+        if handle.pending_declaration is not None:
+            return {
+                "request_id": req_id,
+                "status": "error",
+                "error": f"Job {handle.job_uid} already has a pending declaration",
+            }
 
         try:
             spec = FileSpec.from_dict(spec_data)
@@ -247,34 +273,101 @@ class EngineRuntime:
                     "error": f"Missing input file: {resolved_path}",
                 }
 
-        # 3. 授权检查
-        if bound_spec.delete_existing or bound_spec.delete_on_success or bound_spec.delete_on_failure:
-            handle.pause_timeout()
-            authorized = self.store.check_or_request_authorization(resolved_path)
-            if authorized is True:
-                handle.resume_timeout()
-            elif authorized is False:
-                handle.resume_timeout()
-                handle.auth_denied = True
-                entry.active_file_sources[validated_name] = source_spec
-                entry.active_files[validated_name] = bound_spec
-                self.channel.terminate_process(handle)
-                return {"request_id": req_id, "status": "denied"}
-            else:
-                handle.waiting_auth = True
-                handle.pending_declaration = {
-                    "req_id": req_id,
-                    "name": validated_name,
-                    "source": source_spec,
-                    "bound": bound_spec,
-                    "resolved_path": resolved_path,
-                }
-                return None
+        needs_authorization = (
+            bound_spec.delete_existing
+            or bound_spec.delete_on_success
+            or bound_spec.delete_on_failure
+        )
+        request = PendingDeclaration(
+            request_id=req_id,
+            name=validated_name,
+            source=source_spec,
+            bound=bound_spec,
+            resolved_path=resolved_path,
+        )
+        if not needs_authorization:
+            self._record_declaration(entry, request)
+            request.status = AuthorizationStatus.APPROVED
+            return self._declaration_reply(request)
 
-        # 4. 前置删除（缺失目标由路径原语幂等吸收）
-        entry.active_file_sources[validated_name] = source_spec
-        entry.active_files[validated_name] = bound_spec
-        if bound_spec.delete_existing:
+        handle.pending_declaration = request
+        handle.pause_timeout()
+        validated_path, error = self._validate_declaration_target(request)
+        if error is not None:
+            return self._finish_authorization(
+                handle,
+                entry,
+                request,
+                AuthorizationStatus.PREPARATION_FAILED,
+                error["message"],
+                error,
+            )
+        request.bound = request.bound.bind_output_path(validated_path)
+        request.resolved_path = validated_path
+        authorized = self.store.check_or_request_authorization(validated_path)
+        if authorized is None:
+            return None
+        return self._apply_authorization_decision(handle, entry, request, authorized)
+
+    def _declaration_identity_matches(self, handle: JobHandle, entry: Any) -> bool:
+        """请求句柄必须与当前在飞执行使用同一 job、run、attempt 与 execution 身份。"""
+        if entry.handle is not handle or entry.job_uid != handle.job_uid:
+            return False
+        if not handle.execution_id or entry.execution_id != handle.execution_id:
+            return False
+        if handle.run_id is not None and entry.run_id != handle.run_id:
+            return False
+        if handle.attempt_no is not None and entry.attempt_no != handle.attempt_no:
+            return False
+        if self._session.run_id is not None and entry.run_id != self._session.run_id:
+            return False
+        return True
+
+    def _record_declaration(self, entry: Any, request: PendingDeclaration) -> None:
+        entry.active_file_sources[request.name] = request.source
+        entry.active_files[request.name] = request.bound
+
+    def _validate_declaration_target(
+        self, request: PendingDeclaration
+    ) -> tuple[str, dict[str, str] | None]:
+        policy = ArtifactPathPolicy(
+            output_roots=self.config.output_roots,
+            protected_roots=self.config.protected_roots,
+        )
+        try:
+            return policy.resolve(request.resolved_path), None
+        except (OSError, ValueError, NotImplementedError) as exc:
+            return request.resolved_path, {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+
+    def _apply_authorization_decision(
+        self,
+        handle: JobHandle,
+        entry: Any,
+        request: PendingDeclaration,
+        authorized: bool,
+    ) -> dict[str, Any] | None:
+        if (
+            handle.pending_declaration is not request
+            or request.status is not AuthorizationStatus.PENDING
+            or handle.authorization_outcome is not None
+        ):
+            return None
+        if authorized is False:
+            message = f"authorization denied for {request.resolved_path}"
+            self._finish_authorization(
+                handle, entry, request, AuthorizationStatus.DENIED, message
+            )
+            return {
+                "request_id": request.request_id,
+                "status": "denied",
+                "error": message,
+            }
+
+        if request.bound.delete_existing:
             policy = ArtifactPathPolicy(
                 output_roots=self.config.output_roots,
                 protected_roots=self.config.protected_roots,
@@ -282,20 +375,64 @@ class EngineRuntime:
             try:
                 _execute_pre_deletes(
                     policy,
-                    [ArtifactDeclaration(resolved_path, delete_existing=True)],
+                    [ArtifactDeclaration(request.resolved_path, delete_existing=True)],
                 )
             except (OSError, ValueError, NotImplementedError) as exc:
-                handle.preparation_error = {
-                    "type": type(exc).__name__, "message": str(exc),
+                error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
                     "traceback": traceback.format_exc(),
                 }
-                self.channel.terminate_process(handle)
+                message = f"Artifact preparation failed for {request.resolved_path}: {exc}"
+                self._finish_authorization(
+                    handle,
+                    entry,
+                    request,
+                    AuthorizationStatus.PREPARATION_FAILED,
+                    message,
+                    error,
+                )
                 return None
 
+        request.status = AuthorizationStatus.APPROVED
+        handle.pending_declaration = None
+        handle.resume_timeout()
+        self._record_declaration(entry, request)
+        return self._declaration_reply(request)
+
+    def _finish_authorization(
+        self,
+        handle: JobHandle,
+        entry: Any,
+        request: PendingDeclaration,
+        status: AuthorizationStatus,
+        message: str,
+        exception: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
+        if (
+            handle.pending_declaration is not request
+            or handle.authorization_outcome is not None
+        ):
+            return None
+        request.status = status
+        handle.pending_declaration = None
+        handle.authorization_outcome = AuthorizationOutcome(
+            status=status,
+            message=message,
+            path=request.resolved_path,
+            exception=exception,
+        )
+        handle.resume_timeout()
+        self._record_declaration(entry, request)
+        self.channel.terminate_process(handle)
+        return None
+
+    @staticmethod
+    def _declaration_reply(request: PendingDeclaration) -> dict[str, Any]:
         return {
-            "request_id": req_id,
+            "request_id": request.request_id,
             "status": "ok",
-            "resolved_path": resolved_path,
+            "resolved_path": request.resolved_path,
         }
 
     def is_job_excluded(self, job_uid: str, task_type: str) -> bool:
@@ -343,12 +480,16 @@ class EngineRuntime:
         """停机请求接口（单调状态转移，委托 RunSession，并唤醒运行循环）。"""
         mode = self._session.request_stop()
         for handle in self._in_flight.active_handles():
-            if handle.waiting_auth:
-                handle.waiting_auth = False
-                handle.pending_declaration = None
-                handle.resume_timeout()
-                handle.auth_denied = True
-                self.channel.terminate_process(handle)
+            request = handle.pending_declaration
+            entry = self._in_flight.get(handle.job_uid)
+            if request is not None and entry is not None:
+                self._finish_authorization(
+                    handle,
+                    entry,
+                    request,
+                    AuthorizationStatus.STOPPED,
+                    f"authorization wait stopped for {request.resolved_path}",
+                )
         self._notifier.notify()
         return mode
 
@@ -555,74 +696,48 @@ class EngineRuntime:
         """轮询处于等待中的文件声明授权；若已决策则恢复执行或终止。"""
         is_stopping = self._session.stop_mode is not StopMode.NONE
         for handle in self._in_flight.active_handles():
-            if not handle.waiting_auth:
+            request = handle.pending_declaration
+            if request is None or not handle.waiting_auth:
                 continue
             entry = self._in_flight.get(handle.job_uid)
-            decl = handle.pending_declaration
-            if decl is None or entry is None:
+            if entry is None or not self._declaration_identity_matches(handle, entry):
                 continue
-            req_id = decl["req_id"]
-            name = decl["name"]
-            source_spec = decl["source"]
-            bound_spec = decl["bound"]
-            resolved_path = decl["resolved_path"]
 
             if is_stopping:
-                handle.waiting_auth = False
-                handle.pending_declaration = None
-                handle.resume_timeout()
-                handle.auth_denied = True
-                entry.active_file_sources[name] = source_spec
-                entry.active_files[name] = bound_spec
-                self.channel.terminate_process(handle)
+                self._finish_authorization(
+                    handle,
+                    entry,
+                    request,
+                    AuthorizationStatus.STOPPED,
+                    f"authorization wait stopped for {request.resolved_path}",
+                )
                 continue
 
-            authorized = self.store.check_or_request_authorization(resolved_path)
-            if authorized is True:
-                handle.waiting_auth = False
-                handle.pending_declaration = None
-                handle.resume_timeout()
-                entry.active_file_sources[name] = source_spec
-                entry.active_files[name] = bound_spec
-                if bound_spec.delete_existing:
-                    policy = ArtifactPathPolicy(
-                        output_roots=self.config.output_roots,
-                        protected_roots=self.config.protected_roots,
-                    )
-                    try:
-                        _execute_pre_deletes(
-                            policy,
-                            [ArtifactDeclaration(resolved_path, delete_existing=True)],
-                        )
-                    except (OSError, ValueError, NotImplementedError) as exc:
-                        handle.preparation_error = {
-                            "type": type(exc).__name__, "message": str(exc),
-                            "traceback": traceback.format_exc(),
-                        }
-                        self.channel.terminate_process(handle)
-                        continue
+            validated_path, error = self._validate_declaration_target(request)
+            if error is not None:
+                self._finish_authorization(
+                    handle,
+                    entry,
+                    request,
+                    AuthorizationStatus.PREPARATION_FAILED,
+                    error["message"],
+                    error,
+                )
+                continue
+            request.bound = request.bound.bind_output_path(validated_path)
+            request.resolved_path = validated_path
+
+            authorized = self.store.check_or_request_authorization(validated_path)
+            if authorized is not None:
+                reply = self._apply_authorization_decision(
+                    handle, entry, request, authorized
+                )
+                if reply is None:
+                    continue
                 reply_sender = self.channel.get_reply_sender(handle.execution_id)
                 if reply_sender is not None:
                     try:
-                        reply_sender.send_reply({
-                            "request_id": req_id,
-                            "status": "ok",
-                            "resolved_path": resolved_path,
-                        })
-                    except OSError:
-                        pass
-            elif authorized is False:
-                handle.waiting_auth = False
-                handle.pending_declaration = None
-                handle.resume_timeout()
-                handle.auth_denied = True
-                entry.active_file_sources[name] = source_spec
-                entry.active_files[name] = bound_spec
-                self.channel.terminate_process(handle)
-                reply_sender = self.channel.get_reply_sender(handle.execution_id)
-                if reply_sender is not None:
-                    try:
-                        reply_sender.send_reply({"request_id": req_id, "status": "denied"})
+                        reply_sender.send_reply(reply)
                     except OSError:
                         pass
 

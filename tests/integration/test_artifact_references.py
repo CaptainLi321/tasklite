@@ -130,10 +130,12 @@ def test_dispatch_protects_complete_state_directory(tmp_path):
     try:
         pipeline.enqueue(Job("unsafe", "one", payload={"path": str(pipeline.state_path)}))
         pipeline.run()
-        assert pipeline.backend.load_failed() == {}
-        row, = pipeline.backend.load_queue_jobs()
-        assert row["job_uid"] == "unsafe::one" and row["status"] == "pending"
+        failure = pipeline.backend.load_failed()["unsafe::one"]
+        assert "outside output roots" in failure["error_message"]
         assert pipeline.backend.load_successes() == {}
+        assert pipeline.backend.load_queue_jobs() == []
+        attempt, = pipeline.backend.load_settled_attempts("unsafe::one")
+        assert attempt["outcome"] == "failure"
         assert pipeline.state_path.exists()
     finally:
         pipeline.stop()

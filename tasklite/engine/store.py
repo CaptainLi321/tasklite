@@ -1122,6 +1122,7 @@ class StateStore:
         started_at: str | None = None,
         files: dict[str, Any] | None = None,
         error_message: str | None = None,
+        result: dict[str, Any] | None = None,
     ) -> bool:
         """受阻或停机执行回滚到待派发队列（写盘重置为 pending，释放在途并还原内存队列）。"""
         settled_at = utc_now_iso()
@@ -1134,6 +1135,7 @@ class StateStore:
             started_at=started_at,
             job_snapshot=job_snapshot,
             files=files,
+            result=result,
             error_message=error_message,
         )
         if committed:

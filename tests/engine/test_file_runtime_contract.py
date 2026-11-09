@@ -616,6 +616,8 @@ def _legacy_output_message_handler(job, ctx):
 
     ctx._pipe_sender._conn.send_bytes(dumps({
         "job_uid": job.uid, "execution_id": ctx._pipe_sender.execution_id,
+        "run_id": ctx._pipe_sender.run_id,
+        "attempt_no": ctx._pipe_sender.attempt_no,
         "kind": "output", "payload": {
             "path": job.payload["path"], "delete_on_success": True,
             "delete_on_failure": True,

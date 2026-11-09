@@ -1,10 +1,10 @@
 """文件操作授权查询、撤销、自动同意与等待生命周期验收用例集。
 
 验收场景：
-1. 一个 worker 等待授权时另一 worker 仍能完成，stop 解除等待且正常其他任务排空。
-2. 目录授权可复用，撤销子路径不产生父目录例外，实际清理错误与拒绝有不同去向。
-3. 迟到回复不能解锁新 Attempt；拒绝后同 Run 不再询问，下次 Run 重新判断；内存授权随实例存活。
-4. TASKLITE_AUTO_APPROVE=1 只自动同意实际请求路径，持久记录，保护路径仍禁止。
+1. 一个 worker 等待授权时暂停新派发，另一 worker 仍能完成；stop 解除等待。
+2. 拒绝与停止均先结束受阻 worker，再原子登记失败 Attempt 并回到 pending。
+3. 仅拒绝触发本 Run 依赖链排除，SQLite 重开后重新判断并复用既有授权。
+4. 动态目标先经硬性路径校验，自动批准不能绕过输出范围或受保护路径。
 5. list_authorizations / revoke_authorization 限 Run 外调用，规范路径精确撤销。
 """
 
@@ -22,14 +22,6 @@ from tasklite import (
     TaskLite,
     TaskResult,
 )
-
-
-def _slow_declaring_handler(job, ctx):
-    ctx.declare_file(
-        "blocked_out",
-        FileSpec("pending_auth.txt", role="output", delete_existing=True),
-    )
-    return TaskResult.success()
 
 
 def _quick_handler(job, ctx):
@@ -62,15 +54,6 @@ def _protected_path_handler(job, ctx):
     return TaskResult.success()
 
 
-def _target_handler(job, ctx):
-    path = Path(ctx.declare_file(
-        "dyn_file",
-        FileSpec("target.txt", role="output", delete_existing=True),
-    ))
-    path.write_text("updated", encoding="utf-8")
-    return TaskResult.success()
-
-
 def _good_handler(job, ctx):
     path = Path(ctx.declare_file(
         "out1",
@@ -88,49 +71,208 @@ class _MutableAuthorizer:
         return self.allowed
 
 
-def test_worker_wait_authorization_concurrency_and_stop(tmp_path, monkeypatch):
-    """一个 worker 等待授权时另一 worker 仍能完成，stop 解除等待且正常其他任务排空。"""
+class _ControlledAuthorizer:
+    def __init__(self, decision: bool | None = None):
+        self.decision = decision
+        self.calls = 0
+        self.first_call = threading.Event()
+
+    def __call__(self, path: str, target_type: str) -> bool | None:
+        self.calls += 1
+        self.first_call.set()
+        return self.decision
+
+
+class _BlockingAuthorizer:
+    def __init__(self) -> None:
+        self.decision: bool | None = None
+        self.calls = 0
+        self.first_call = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, path: str, target_type: str) -> bool | None:
+        self.calls += 1
+        self.first_call.set()
+        assert self.release.wait(10.0)
+        return self.decision
+
+
+def _wait_for(predicate, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition did not become true before timeout")
+
+
+def _declare_then_write_handler(job, ctx):
+    path = Path(ctx.declare_file(
+        "dynamic",
+        FileSpec(job.payload["path"], role="output", delete_existing=True),
+    ))
+    path.write_text(job.payload["content"], encoding="utf-8")
+    return TaskResult.success()
+
+
+def _marker_handler(job, ctx):
+    Path(job.payload["marker"]).write_text("started", encoding="utf-8")
+    return TaskResult.success()
+
+
+def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
+    tmp_path, monkeypatch,
+):
+    """真实双 worker 下，授权等待暂停新派发，但不阻塞另一在途 worker 结算。"""
     monkeypatch.chdir(tmp_path)
+    target = tmp_path / "pending_auth.txt"
+    target.write_text("old", encoding="utf-8")
+    third_marker = tmp_path / "third-started"
+
     p = TaskLite(backend="sqlite", state_path=tmp_path / "t_auth_wait.db", max_workers=2)
-
-    def _authorizer(path, target_type):
-        if "pending_auth.txt" in str(path):
-            return None
-        return True
-
-    p.authorizer = _authorizer
-    p.register_task("slow_decl", _slow_declaring_handler)
+    authorizer = _ControlledAuthorizer(decision=None)
+    p.authorizer = authorizer
+    p.register_task("slow_decl", _declare_then_write_handler)
     p.register_task("quick", _quick_handler)
+    p.register_task("third", _marker_handler)
 
-    p.enqueue(Job("slow_decl", "s1"))
+    p.enqueue(Job(
+        "slow_decl",
+        "s1",
+        payload={"path": str(target), "content": "updated"},
+    ))
     p.enqueue(Job("quick", "q1"))
+    p.enqueue(Job("third", "t1", payload={"marker": str(third_marker)}))
 
-    def _stop_monitor():
-        for _ in range(50):
-            time.sleep(0.05)
-            if "quick::q1" in p.backend.load_successes():
-                p.stop()
-                break
+    gate_observed = threading.Event()
+    third_spawned = threading.Event()
+    original_fill = p._runtime._fill_dispatch_pool
+    original_spawn = p._runtime.channel.spawn
 
-    monitor_th = threading.Thread(target=_stop_monitor, daemon=True)
-    monitor_th.start()
+    def tracked_fill(limit, draining):
+        result = original_fill(limit, draining)
+        if any(
+            handle.waiting_auth
+            for handle in p._runtime.in_flight.active_handles()
+        ):
+            gate_observed.set()
+        return result
 
-    (tmp_path / "pending_auth.txt").write_text("old", encoding="utf-8")
-    p.run()
-    monitor_th.join(timeout=2.0)
+    def tracked_spawn(spec):
+        if spec.job.uid == "third::t1":
+            third_spawned.set()
+        return original_spawn(spec)
 
-    # 1. 快速 worker 正常成功完成并结算
-    successes = p.backend.load_successes()
-    assert "quick::q1" in successes
+    monkeypatch.setattr(p._runtime, "_fill_dispatch_pool", tracked_fill)
+    monkeypatch.setattr(p._runtime.channel, "spawn", tracked_spawn)
+    errors = []
 
-    # 2. 等待授权的 worker 随 stop 解除等待，安全结束执行，回到 pending
-    assert "slow_decl::s1" not in successes
-    failed = p.backend.load_failed()
-    assert "slow_decl::s1" not in failed
+    def run_pipeline():
+        try:
+            p.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
 
-    queue = p.backend.load_queue_jobs()
-    pending_uids = [j["job_uid"] for j in queue if j.get("status") == "pending"]
-    assert "slow_decl::s1" in pending_uids
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        assert authorizer.first_call.wait(10.0)
+        _wait_for(lambda: "quick::q1" in p.backend.load_successes())
+        assert "slow_decl::s1" not in p.backend.load_successes()
+        assert not third_marker.exists()
+        assert any(handle.waiting_auth for handle in p._runtime.in_flight.active_handles())
+        gate_observed.clear()
+        assert gate_observed.wait(10.0)
+        assert not third_spawned.is_set()
+
+        authorizer.decision = True
+        runner.join(timeout=20.0)
+        assert not runner.is_alive()
+        assert errors == []
+    finally:
+        p.stop()
+        runner.join(timeout=5.0)
+
+    assert set(p.backend.load_successes()) == {
+        "slow_decl::s1",
+        "quick::q1",
+        "third::t1",
+    }
+    assert target.read_text(encoding="utf-8") == "updated"
+    assert third_marker.exists()
+    p.close()
+
+
+def test_authorization_wait_does_not_consume_execution_timeout(tmp_path, monkeypatch):
+    """等待越过原执行截止后批准，恢复剩余时限并让 worker 正常完成。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "paused-timeout.txt"
+    target.write_text("old", encoding="utf-8")
+
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "paused-timeout.db")
+    authorizer = _BlockingAuthorizer()
+    p.authorizer = authorizer
+    deadline_passed = False
+    reap_after_deadline = threading.Event()
+    original_reap = p._runtime.channel.reap_completed
+
+    def tracked_reap(handles):
+        nonlocal deadline_passed
+        result = original_reap(handles)
+        if deadline_passed:
+            reap_after_deadline.set()
+        return result
+
+    monkeypatch.setattr(p._runtime.channel, "reap_completed", tracked_reap)
+    p.register_task("work", _declare_then_write_handler, timeout_seconds=30)
+    p.enqueue(Job(
+        "work",
+        "one",
+        payload={"path": str(target), "content": "updated"},
+    ))
+
+    errors = []
+
+    def run_pipeline():
+        try:
+            p.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        assert authorizer.first_call.wait(10.0)
+        _wait_for(
+            lambda: any(
+                handle.waiting_auth
+                for handle in p._runtime.in_flight.active_handles()
+            )
+        )
+        handle = next(
+            handle
+            for handle in p._runtime.in_flight.active_handles()
+            if handle.waiting_auth
+        )
+        assert handle.paused_remaining is not None
+        handle.timeout_at_monotonic = time.monotonic() - 1.0
+        deadline_passed = True
+        authorizer.release.set()
+        assert reap_after_deadline.wait(10.0)
+
+        authorizer.decision = True
+        runner.join(timeout=20.0)
+        assert not runner.is_alive()
+        assert errors == []
+    finally:
+        authorizer.release.set()
+        p.stop()
+        runner.join(timeout=5.0)
+
+    assert "work::one" in p.backend.load_successes()
+    assert target.read_text(encoding="utf-8") == "updated"
+    p.close()
 
 
 def test_directory_authorization_reusable_and_subpath_revocation(tmp_path, monkeypatch):
@@ -156,20 +298,23 @@ def test_directory_authorization_reusable_and_subpath_revocation(tmp_path, monke
     p._runtime.store.record_authorization(dir_path, "directory")
     authorizations = p.list_authorizations()
     assert any(a["path"] == str(dir_path) and a["target_type"] == "directory" for a in authorizations)
+    p.close()
 
-    # 2. 撤销子路径不能覆盖父目录授权，返回 False
-    revoked = p.revoke_authorization(sub_file)
+    # 2. SQLite 重开后目录授权仍可复用；撤销子路径不能覆盖父目录授权
+    reopened = TaskLite(backend="sqlite", state_path=tmp_path / "t_dir_auth.db")
+    reopened.register_task("dir_task", _dir_handler)
+    revoked = reopened.revoke_authorization(sub_file)
     assert revoked is False
-    # 子路径依然在父目录授权范围内
-    assert p._runtime.store.is_path_authorized(sub_file) is True
+    assert reopened._runtime.store.is_path_authorized(sub_file) is True
 
     # 3. 运行：目录授权可复用，子路径声明执行成功
-    p.run()
-    assert "dir_task::d1" in p.backend.load_successes()
+    reopened.run()
+    assert "dir_task::d1" in reopened.backend.load_successes()
 
     # 4. 精确撤销父目录授权，子路径不再被授权
-    assert p.revoke_authorization(dir_path) is True
-    assert p._runtime.store.is_path_authorized(sub_file) is False
+    assert reopened.revoke_authorization(dir_path) is True
+    assert reopened._runtime.store.is_path_authorized(sub_file) is False
+    reopened.close()
 
 
 def test_cleanup_failure_vs_authorization_denial_destinations(tmp_path, monkeypatch):
@@ -192,62 +337,283 @@ def test_cleanup_failure_vs_authorization_denial_destinations(tmp_path, monkeypa
     assert "clean_task::c1" not in p.backend.load_successes()
 
 
-def test_late_reply_cannot_unlock_attempt_and_recheck_next_run(tmp_path, monkeypatch):
-    """迟到回复不能解锁新 Attempt；拒绝后同 Run 不再询问，下次 Run 重新判断；内存授权随实例存活。"""
+@pytest.mark.parametrize("deferred", [False, True], ids=["immediate", "after-wait"])
+def test_authorization_denial_settles_attempt_and_keeps_job_pending(
+    tmp_path, monkeypatch, deferred,
+):
+    """即时与等待后拒绝都先结束 worker，再原子登记失败 Attempt 并回 pending。"""
     monkeypatch.chdir(tmp_path)
-    p = TaskLite(backend="memory")
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    state_path = tmp_path / "denial.db"
+    target = tmp_path / "target.txt"
+    target.write_text("old data", encoding="utf-8")
 
-    auth_cb = _MutableAuthorizer(allowed=False)
-    p.authorizer = auth_cb
+    p = TaskLite(backend="sqlite", state_path=state_path, max_workers=2)
+    authorizer = _ControlledAuthorizer(decision=False if not deferred else None)
+    p.authorizer = authorizer
+    p.register_task("target_task", _declare_then_write_handler)
+    p.register_task("middle", _quick_handler)
+    p.register_task("leaf", _quick_handler)
+    p.register_task("independent", _quick_handler)
 
-    p.register_task("target_task", _target_handler)
-    p.register_task("downstream", _quick_handler)
+    target_job = Job(
+        "target_task",
+        "t1",
+        payload={"path": str(target), "content": "new data"},
+        trigger="always",
+    )
+    middle_job = Job(
+        "middle",
+        "m1",
+        depends_on=["target_task::t1"],
+        trigger="always",
+    )
+    leaf_job = Job(
+        "leaf",
+        "l1",
+        depends_on=["middle::m1"],
+        trigger="always",
+    )
+    for historical_job in (target_job, middle_job, leaf_job):
+        p.set_job_status(historical_job, "succeeded", recursive=False)
+    p.enqueue(target_job)
+    p.enqueue(middle_job)
+    p.enqueue(leaf_job)
+    p.enqueue(Job("independent", "i1"))
 
-    p.enqueue(Job("target_task", "t1"))
-    p.enqueue(Job("downstream", "d1", depends_on=["target_task::t1"]))
+    errors = []
 
-    (tmp_path / "target.txt").write_text("old data", encoding="utf-8")
+    def run_pipeline():
+        try:
+            p.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
 
-    # 第一次 Run：授权拒绝
-    p.run()
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        assert authorizer.first_call.wait(10.0)
+        if deferred:
+            authorizer.decision = False
+        runner.join(timeout=20.0)
+        assert not runner.is_alive()
+        assert errors == []
+    finally:
+        p.stop()
+        runner.join(timeout=5.0)
 
-    # 1. target_task::t1 与下游 d1 被排除，未写入 failed 档案
-    assert "target_task::t1" not in p.backend.load_successes()
-    assert "downstream::d1" not in p.backend.load_successes()
-    assert "target_task::t1" not in p.backend.load_failed()
-    assert "downstream::d1" not in p.backend.load_failed()
-
-    initial_attempts = len(p.backend.load_settled_attempts("target_task::t1"))
-    # ADR-0011 约定：动态声明授权拒绝结算 Attempt.failure，Job 留 pending
-    assert initial_attempts == 1
-
-    # 2. 模拟伪造过期 execution_id 的迟到消息，验证管道不会以此制造/解锁 Attempt
-    channel = p._runtime.channel
-    channel._results["stale_exec_id"] = {
-        "status": "success",
-        "job_uid": "target_task::t1",
-        "result": {"success": True},
+    assert target.read_text(encoding="utf-8") == "old data"
+    assert "independent::i1" in p.backend.load_successes()
+    assert set(p.backend.load_failed()) == set()
+    pending_uids = {
+        row["job_uid"]
+        for row in p.backend.load_queue_jobs(status="pending")
     }
-    # step 单步推进不会拾取过期 execution_id
-    p._runtime.step()
-    attempts_after_stale = p.backend.load_settled_attempts("target_task::t1")
-    assert len(attempts_after_stale) == initial_attempts
+    assert {"target_task::t1", "middle::m1", "leaf::l1"} <= pending_uids
+    assert {
+        "target_task::t1",
+        "middle::m1",
+        "leaf::l1",
+    } <= p._runtime._temporary_excluded_uids
+    assert {
+        "target_task::t1",
+        "middle::m1",
+        "leaf::l1",
+    } <= set(p.backend.load_successes())
+    assert p.backend.load_settled_attempts("middle::m1") == []
+    assert p.backend.load_settled_attempts("leaf::l1") == []
+    attempt, = p.backend.load_settled_attempts("target_task::t1")
+    assert attempt["outcome"] == "failure"
+    assert "authorization denied for" in attempt["error_message"]
+    assert attempt["result"]["annotations"]["authorization_status"] == "denied"
+    assert p._runtime.session.retry_counts.get("target_task::t1", 0) == 0
+    p.close()
 
-    # 3. 下一次 Run 重新判断：开启授权后成功完成
-    auth_cb.allowed = True
-    p.run()
+    reopened = TaskLite(backend="sqlite", state_path=state_path, max_workers=2)
+    reopened.authorizer = _MutableAuthorizer(allowed=True)
+    reopened.register_task("target_task", _declare_then_write_handler)
+    reopened.register_task("middle", _quick_handler)
+    reopened.register_task("leaf", _quick_handler)
+    reopened.run(install_signals=False)
 
-    assert "target_task::t1" in p.backend.load_successes()
-    assert "downstream::d1" in p.backend.load_successes()
-    attempts_final = p.backend.load_settled_attempts("target_task::t1")
-    assert len(attempts_final) == 2
-    assert attempts_final[0]["outcome"] == "failure"
-    assert attempts_final[1]["outcome"] == "success"
+    assert {
+        "target_task::t1",
+        "middle::m1",
+        "leaf::l1",
+    } <= set(reopened.backend.load_successes())
+    attempts = reopened.backend.load_settled_attempts("target_task::t1")
+    assert [record["outcome"] for record in attempts] == ["failure", "success"]
+    assert target.read_text(encoding="utf-8") == "new data"
+    reopened.close()
 
-    # 4. 内存授权随实例存活：在同一实例上持久有效
-    auths = p.list_authorizations()
-    assert len(auths) >= 1
-    assert any("target.txt" in a["path"] for a in auths)
+
+def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion(
+    tmp_path, monkeypatch,
+):
+    """stop 解除授权等待，记录停止原因，关闭全 Run 派发而不排除单个 Job。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "stopped.txt"
+    target.write_text("old data", encoding="utf-8")
+    stopped_marker = tmp_path / "stopped-marker"
+
+    p = TaskLite(backend="sqlite", state_path=tmp_path / "stop-auth.db", max_workers=2)
+    authorizer = _ControlledAuthorizer(decision=None)
+    p.authorizer = authorizer
+    p.register_task("waiting", _declare_then_write_handler)
+    p.register_task("quick", _quick_handler)
+    p.register_task("after_stop", _marker_handler)
+    p.enqueue(Job(
+        "waiting",
+        "w1",
+        payload={"path": str(target), "content": "new data"},
+    ))
+    p.enqueue(Job("quick", "q1"))
+    p.enqueue(Job(
+        "after_stop",
+        "a1",
+        payload={"marker": str(stopped_marker)},
+    ))
+
+    errors = []
+
+    def run_pipeline():
+        try:
+            p.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        assert authorizer.first_call.wait(10.0)
+        _wait_for(lambda: "quick::q1" in p.backend.load_successes())
+        p.stop()
+        runner.join(timeout=20.0)
+        assert not runner.is_alive()
+        assert errors == []
+    finally:
+        p.stop()
+        runner.join(timeout=5.0)
+
+    assert target.read_text(encoding="utf-8") == "old data"
+    assert p.backend.load_failed() == {}
+    assert p.backend.load_queue_jobs(status="pending")[0]["job_uid"] == "waiting::w1"
+    attempt, = p.backend.load_settled_attempts("waiting::w1")
+    assert attempt["outcome"] == "failure"
+    assert "authorization wait stopped for" in attempt["error_message"]
+    assert attempt["result"]["annotations"]["authorization_status"] == "stopped"
+    assert "waiting::w1" not in p._runtime._temporary_excluded_uids
+    assert p._runtime.session.retry_counts.get("waiting::w1", 0) == 0
+    assert p._runtime.in_flight.active_handles() == []
+    assert not stopped_marker.exists()
+    pending_uids = {
+        row["job_uid"]
+        for row in p.backend.load_queue_jobs(status="pending")
+    }
+    assert {"waiting::w1", "after_stop::a1"} <= pending_uids
+
+    authorizer.decision = True
+    p.run(install_signals=False)
+    assert "waiting::w1" in p.backend.load_successes()
+    assert "after_stop::a1" in p.backend.load_successes()
+    assert stopped_marker.exists()
+    assert target.read_text(encoding="utf-8") == "new data"
+    p.close()
+
+
+def test_auto_approve_does_not_authorize_out_of_root_dynamic_target(
+    tmp_path, monkeypatch,
+):
+    """硬性输出范围校验先于自动授权记录，根外目标保持原样并结算失败。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("valuable", encoding="utf-8")
+
+    p = TaskLite(
+        backend="sqlite",
+        state_path=tmp_path / "outside-root.db",
+        output_roots=allowed,
+    )
+    p.register_task("work", _declare_then_write_handler)
+    p.enqueue(Job(
+        "work",
+        "one",
+        payload={"path": str(target), "content": "overwrite"},
+    ))
+    p.run(install_signals=False)
+
+    assert target.read_text(encoding="utf-8") == "valuable"
+    assert p.list_authorizations() == []
+    failure = p.backend.load_failed()["work::one"]
+    assert "outside output roots" in failure["error_message"]
+    attempt, = p.backend.load_settled_attempts("work::one")
+    assert attempt["outcome"] == "failure"
+    assert "work::one" not in p._runtime._temporary_excluded_uids
+    p.close()
+
+
+def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
+    tmp_path, monkeypatch,
+):
+    """等待期间将普通目标替换为受保护文件的链接时，后续决策仍先校验实际目标。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    target = allowed / "target.txt"
+    target.write_text("old", encoding="utf-8")
+    state_path = tmp_path / "changed-target.db"
+
+    p = TaskLite(
+        backend="sqlite",
+        state_path=state_path,
+        output_roots=allowed,
+    )
+    authorizer = _ControlledAuthorizer(decision=None)
+    p.authorizer = authorizer
+    p.register_task("work", _declare_then_write_handler)
+    p.enqueue(Job(
+        "work",
+        "one",
+        payload={"path": str(target), "content": "overwrite"},
+    ))
+
+    errors = []
+
+    def run_pipeline():
+        try:
+            p.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        assert authorizer.first_call.wait(10.0)
+        target.unlink()
+        target.symlink_to(state_path)
+        authorizer.decision = True
+        runner.join(timeout=20.0)
+        assert not runner.is_alive()
+        assert errors == []
+    finally:
+        p.stop()
+        runner.join(timeout=5.0)
+
+    assert target.is_symlink()
+    assert target.resolve() == state_path.resolve()
+    assert p.list_authorizations() == []
+    assert p.backend.load_successes() == {}
+    failure = p.backend.load_failed()["work::one"]
+    assert "symlink" in failure["error_message"]
+    attempt, = p.backend.load_settled_attempts("work::one")
+    assert attempt["outcome"] == "failure"
+    assert "work::one" not in p._runtime._temporary_excluded_uids
+    p.close()
 
 
 def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path, monkeypatch):
@@ -268,18 +634,35 @@ def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path,
     assert "good_task::g1" in p.backend.load_successes()
     auths = p.list_authorizations()
     expected_path = str((tmp_path / "my_out.txt").resolve())
-    assert any(a["path"] == expected_path for a in auths)
+    assert any(
+        a["path"] == expected_path and a["target_type"] == "file"
+        for a in auths
+    )
     # 不会预先全量授权未请求的路径或整个根目录
     unrelated_path = str((tmp_path / "unrelated.txt").resolve())
     assert not any(a["path"] == unrelated_path for a in auths)
+    p.close()
 
-    # 2. 保护路径（例如 state 数据库文件）即使 TASKLITE_AUTO_APPROVE=1 也严禁授权
-    p.enqueue(Job("bad_task", "b1"))
-    p.run()
+    # 2. SQLite 重开后精确文件授权继续复用，无需再次询问
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    reopened = TaskLite(backend="sqlite", state_path=state_path)
+    reopened.register_task("good_task", _good_handler)
+    reopened.register_task("bad_task", _protected_path_handler)
+    assert any(
+        a["path"] == expected_path and a["target_type"] == "file"
+        for a in reopened.list_authorizations()
+    )
+    reopened.enqueue(Job("good_task", "g2"))
+    reopened.run()
+    assert "good_task::g2" in reopened.backend.load_successes()
 
-    # bad_task 声明重叠受保护目录，直接被拒绝
-    assert "bad_task::b1" not in p.backend.load_successes()
-    assert not p._runtime.store.is_path_authorized(state_path)
+    # 3. 保护路径（例如 state 数据库文件）即使自动同意也严禁授权
+    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    reopened.enqueue(Job("bad_task", "b1"))
+    reopened.run()
+    assert "bad_task::b1" not in reopened.backend.load_successes()
+    assert not reopened._runtime.store.is_path_authorized(state_path)
+    reopened.close()
 
 
 def test_list_and_revoke_authorizations_surface_and_run_guard(tmp_path, monkeypatch):
