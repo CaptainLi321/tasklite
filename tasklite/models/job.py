@@ -37,7 +37,7 @@ from .task import (
 WORKER_RESOURCE = "__workers__"
 
 # 内置触发器名称；自定义触发器同样仅以名称引用。
-BUILTIN_TRIGGERS = ("once", "on_failure", "always", "on_input_change")
+BUILTIN_TRIGGERS = ("once", "until_success", "always", "on_input_change")
 
 
 def inject_worker_resource(job_snapshot: dict) -> None:

@@ -53,7 +53,7 @@ class TestJobCreation:
             resources={"api": 1.0, "disk": 2.5},
             max_retries_per_run=5,
             timeout_seconds=7200,
-            trigger="on_failure",
+            trigger="until_success",
         )
         assert job.payload == {"url": "https://example.com/1.jpg"}
         assert job.depends_on == ["parent_job"]
@@ -61,7 +61,7 @@ class TestJobCreation:
         assert job.resources == {"api": 1.0, "disk": 2.5}
         assert job.max_retries_per_run == 5
         assert job.timeout_seconds == 7200
-        assert job.trigger == "on_failure"
+        assert job.trigger == "until_success"
 
     def test_restore_with_internal_runtime_fields(self):
         """内部恢复入口 _restore 挂载运行期实例位与边带状态。"""
@@ -75,7 +75,7 @@ class TestJobCreation:
             resources={"api": 1.0, "disk": 2.5},
             max_retries_per_run=5,
             timeout_seconds=7200,
-            trigger="on_failure",
+            trigger="until_success",
             attempt_no=2,
             activation_no=3,
             first_enqueued_at="2026-01-01T00:00:00+00:00",
@@ -289,7 +289,12 @@ class TestJobSpecFieldValidation:
 
     def test_trigger_names_and_unspecified_sentinel(self):
         """trigger 四策略 + None 哨兵语义：合法值全接受，非法值拒绝。"""
-        assert BUILTIN_TRIGGERS == ("once", "on_failure", "always", "on_input_change")
+        assert BUILTIN_TRIGGERS == (
+            "once",
+            "until_success",
+            "always",
+            "on_input_change",
+        )
         for value in BUILTIN_TRIGGERS:
             assert Job("t", "id", trigger=value).trigger == value
         assert Job("t", "id").trigger is None

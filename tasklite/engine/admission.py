@@ -13,6 +13,7 @@ from ..models.artifact import resolve_job_files_config
 from ..models.job import Job
 from ..models.task import TaskRegistry, validate_trigger
 from ..models.trigger import TriggerContext
+from ..triggers import BUILTIN_TRIGGER_FUNCTIONS
 from ..utils.clock import parse_utc_iso_to_us
 
 
@@ -100,7 +101,9 @@ class TriggerRegistry:
         base_dir: str | Path | None = None,
     ) -> None:
         self.tasks = tasks
-        self.functions = dict(functions or {})
+        self.functions = dict(
+            BUILTIN_TRIGGER_FUNCTIONS if functions is None else functions
+        )
         self.base_dir: Path = (
             Path(os.path.abspath(os.fspath(base_dir)))
             if base_dir is not None
@@ -137,6 +140,9 @@ class TriggerRegistry:
             elif job_snapshot.get(key) is None:
                 job_snapshot[key] = value
                 changed = True
+        trigger = job_snapshot.get("trigger")
+        if trigger not in self.functions:
+            raise ValueError(f"unregistered trigger {trigger!r}")
         if job_snapshot.get("payload") is None:
             job_snapshot["payload"] = {}
             changed = True

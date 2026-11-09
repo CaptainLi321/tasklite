@@ -269,7 +269,7 @@ class TestDedupGate:
         # 豁免已登记（in-flight 互斥不击落 successes 命中的重跑）
         assert "t::j1" in env.store.state.in_flight_uids
 
-    def test_failed_hit_with_on_failure_reruns(self, tmp_path, monkeypatch):
+    def test_failed_hit_with_until_success_reruns(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.register_in_flight("t::j1")
@@ -277,7 +277,9 @@ class TestDedupGate:
             Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
         )
         env.store.apply_failure("t::j1", {"error_message": "boom"}, attempt_id=aid)
-        env.store.state.spawn_jobs([Job("t", "j1", trigger="on_failure").to_dict()])
+        env.store.state.spawn_jobs(
+            [Job("t", "j1", trigger="until_success").to_dict()]
+        )
         monkeypatch.setattr(
             env.channel, "spawn",
             lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),

@@ -12,7 +12,7 @@ def once(ctx: TriggerContext) -> bool:
     return not ctx.has_succeeded and not ctx.has_failed
 
 
-def on_failure(ctx: TriggerContext) -> bool:
+def until_success(ctx: TriggerContext) -> bool:
     """尚未成功的作业可执行。"""
     return not ctx.has_succeeded
 
@@ -40,7 +40,7 @@ def on_input_change(ctx: TriggerContext) -> bool:
 
 BUILTIN_TRIGGER_FUNCTIONS = {
     "once": once,
-    "on_failure": on_failure,
+    "until_success": until_success,
     "always": always,
     "on_input_change": on_input_change,
 }

@@ -1,9 +1,9 @@
 """触发器与任务模板的公开契约。"""
-from tasklite import Job, TaskLite
+from tasklite import Job, TaskLite, TaskResult
 
 
 def handle(job, ctx):
-    return True
+    return TaskResult.success()
 
 
 def test_custom_trigger_observes_inherited_task_spec():
@@ -62,17 +62,42 @@ def test_restored_none_spec_inherits_task_before_trigger():
     assert seen == [9]
 
 
-def test_unknown_trigger_raises_preserving_candidate_and_budget():
+def test_unknown_trigger_raises_preserving_candidate_and_budget(tmp_path):
     import pytest
-    pipeline = TaskLite(backend="memory")
+    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "trigger.db")
     pipeline.register_task("t", handle)
-    pipeline.enqueue(Job("t", "a", trigger="missing"))
-    before = pipeline.backend.load_queue()
+    pipeline.enqueue(Job("t", "a"))
+    before_queue = pipeline.backend.load_queue()
+    before_successes = pipeline.backend.load_successes()
+    before_failed = pipeline.backend.load_failed()
     with pytest.raises(ValueError, match="unregistered trigger"):
-        pipeline.run()
-    assert pipeline.backend.load_queue() == before
-    assert pipeline.backend.load_attempts("t::a") == []
+        pipeline.enqueue(Job("t", "b", trigger="missing"))
+    assert pipeline.backend.load_queue() == before_queue
+    assert pipeline.backend.load_successes() == before_successes
     assert pipeline.backend.load_failed() == {}
+    assert pipeline.backend.load_attempts("t::b") == []
+
+
+def test_inherited_unknown_trigger_rejected_at_enqueue(tmp_path):
+    import pytest
+    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "trigger.db")
+    pipeline.register_task("t", handle, trigger="missing")
+    with pytest.raises(ValueError, match="unregistered trigger"):
+        pipeline.enqueue(Job("t", "a"))
+    assert pipeline.backend.load_queue() == []
+    assert pipeline.backend.load_successes() == {}
+    assert pipeline.backend.load_failed() == {}
+
+
+def test_custom_trigger_is_evaluated_only_after_dependency_readiness():
+    pipeline = TaskLite(backend="memory")
+    seen = []
+    pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or True)
+    pipeline.register_task("t", handle, trigger="observe")
+    pipeline.enqueue(Job("t", "a"))
+    pipeline.enqueue(Job("t", "b", depends_on=["t::a"]))
+    pipeline.run()
+    assert seen == ["t::a", "t::b"]
 
 
 def test_callback_failure_and_non_bool_return_preserve_queue():
@@ -98,7 +123,7 @@ def test_register_trigger_rejects_duplicate_builtin_and_invalid_callable():
     import pytest
     from tasklite.testing import running
     pipeline = TaskLite(backend="memory")
-    for name in ["once", "on_failure", "on_input_change", "always"]:
+    for name in ["once", "until_success", "on_input_change", "always"]:
         with pytest.raises(ValueError):
             pipeline.register_trigger(name, lambda ctx: True)
     with pytest.raises(ValueError):
@@ -117,7 +142,7 @@ def test_builtin_trigger_matrix():
     from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
     for name, expected in {
         "once": (True, False, False),
-        "on_failure": (True, False, True),
+        "until_success": (True, False, True),
         "always": (True, True, True),
         "on_input_change": (True, True, True),
     }.items():

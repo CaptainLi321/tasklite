@@ -820,10 +820,12 @@ class TestIntakePipeline:
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(tasks=_task_specs("child", "on_failure")),
+            trigger_registry=TriggerRegistry(
+                tasks=_task_specs("child", "until_success")
+            ),
         )
         jd = store.normalize_spawned_job(Job("child", "c1"))
-        assert jd["trigger"] == "on_failure"
+        assert jd["trigger"] == "until_success"
         assert jd["resources"][WORKER_RESOURCE] == 1.0
         assert jd["first_enqueued_at"]
 

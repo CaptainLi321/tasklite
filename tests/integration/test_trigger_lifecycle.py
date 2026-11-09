@@ -469,3 +469,128 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
     attempts = recovered.backend.load_attempts("waiting::item")
     assert len(attempts) == 1
     assert attempts[0].outcome == "failed" and attempts[0].attempt_no == 1
+
+
+def _record_until_success_call(job, ctx):
+    calls = ctx.output_roots / "until_success_calls.txt"
+    with calls.open("a", encoding="utf-8") as stream:
+        stream.write(f"{job.uid}\n")
+    return TaskResult.success(metadata={"calls": len(calls.read_text().splitlines())})
+
+
+def _fail_until_success(job, ctx):
+    _record_until_success_call(job, ctx)
+    return TaskResult.failure(message="still failing")
+
+
+def _spawn_with_unknown_trigger(job, ctx):
+    ctx.set_cursor("trigger/spawn", "must-not-publish")
+    ctx.spawn(Job("child", "good", trigger="allowed"))
+    ctx.spawn(Job("child", "bad", trigger="missing"))
+    return TaskResult.success()
+
+
+def test_until_success_uses_current_sqlite_terminal_history(tmp_path):
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task("work", _record_until_success_call, trigger="until_success")
+
+    assert pipeline.enqueue(Job("work", "item")) is True
+    pipeline.run()
+    assert pipeline.backend.load_attempts("work::item")[0].outcome == "succeeded"
+
+    assert pipeline.enqueue(Job("work", "item")) is True
+    pipeline.run()
+    assert len(pipeline.backend.load_attempts("work::item")) == 1
+
+    pipeline.clear_history("work::item", records=["successes"])
+    pipeline.set_job_status(
+        Job("work", "item", trigger="until_success"),
+        "failed",
+        recursive=False,
+    )
+    assert pipeline.enqueue(Job("work", "item")) is True
+    pipeline.run()
+    assert len(pipeline.backend.load_attempts("work::item")) == 2
+    pipeline.stop()
+
+
+def test_until_success_recognizes_manual_success_without_attempt(tmp_path):
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task("work", _record_until_success_call, trigger="until_success")
+    pipeline.set_job_status(
+        Job("work", "manual", trigger="until_success"),
+        "succeeded",
+        recursive=False,
+    )
+
+    assert pipeline.enqueue(Job("work", "manual")) is True
+    pipeline.run()
+    pipeline.stop()
+
+    assert pipeline.backend.load_attempts("work::manual") == []
+    assert pipeline.backend.load_successes()["work::manual"]["annotations"][
+        "completion_source"
+    ] == "manual"
+
+
+def test_until_success_retries_after_real_failure(tmp_path):
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_task(
+        "work",
+        _fail_until_success,
+        trigger="until_success",
+        max_retries_per_run=0,
+    )
+
+    assert pipeline.enqueue(Job("work", "item")) is True
+    pipeline.run()
+    assert len(pipeline.backend.load_attempts("work::item")) == 1
+
+    assert pipeline.enqueue(Job("work", "item")) is True
+    pipeline.run()
+    pipeline.stop()
+
+    assert [row.outcome for row in pipeline.backend.load_attempts("work::item")] == [
+        "failed",
+        "failed",
+    ]
+    calls = (tmp_path / "output" / "until_success_calls.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert calls == ["work::item", "work::item"]
+
+
+def test_legacy_trigger_pending_is_preserved_and_rejected_on_use(tmp_path):
+    pipeline = _pipeline(tmp_path)
+    legacy = Job("work", "legacy", trigger="on_failure").to_dict()
+    pipeline.backend.save_queue([legacy])
+    pipeline.close()
+
+    reopened = _pipeline(tmp_path)
+    reopened.register_task("work", _record_until_success_call)
+    assert reopened.backend.load_queue() == [legacy]
+    with pytest.raises(ValueError, match="unregistered trigger 'on_failure'"):
+        reopened.run()
+    reopened.stop()
+
+    assert reopened.backend.load_queue() == [legacy]
+    assert reopened.backend.load_attempts("work::legacy") == []
+    assert reopened.backend.load_failed() == {}
+
+
+def test_unknown_spawned_trigger_blocks_siblings_and_cursor_publication(tmp_path):
+    pipeline = _pipeline(tmp_path)
+    pipeline.register_trigger("allowed", lambda ctx: True)
+    pipeline.register_task("child", _record_until_success_call)
+    pipeline.register_task("parent", _spawn_with_unknown_trigger, trigger="always")
+    pipeline.enqueue(Job("parent", "root"))
+
+    pipeline.run()
+    pipeline.stop()
+
+    assert "parent::root" in pipeline.backend.load_failed()
+    assert pipeline.backend.load_successes() == {}
+    assert pipeline.backend.load_queue() == []
+    assert pipeline.get_cursor("trigger/spawn") is None
+    assert pipeline.backend.load_attempts("child::good") == []
+    assert pipeline.backend.load_attempts("child::bad") == []
