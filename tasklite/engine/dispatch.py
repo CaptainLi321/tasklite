@@ -419,12 +419,7 @@ class DispatchMachine:
                     f"requeueing and aborting dispatch without starting handler."
                 )
                 store.state.requeue_jobs([job_snapshot], front=True)
-                if isinstance(e, _CommitCrashSignal):
-                    raise
-                raise _CommitCrashSignal(
-                    f"Failed to mark job running for {job_uid} ({e}). "
-                    f"Job preserved in queue without starting handler."
-                ) from e
+                raise
         else:
             try:
                 attempt_id, execution_id = self._open_attempt(job)

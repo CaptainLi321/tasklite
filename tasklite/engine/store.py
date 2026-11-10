@@ -583,7 +583,7 @@ class StateStore:
             return next_no
         except Exception as e:
             logger.critical(f"Failed to mark job running for {job_uid}: {e}")
-            raise _CommitCrashSignal(f"Failed to mark job {job_uid} running: {e}") from e
+            raise
 
     def record_attempt_dispatch(
         self,
@@ -831,7 +831,7 @@ class StateStore:
 
         spawned_snapshots = list(spawned_job_snapshots)
         if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            committed = self._backend.commit_job_settlement(
+            self._backend.commit_job_settlement(
                 job_uid=job_uid,
                 outcome="success",
                 attempt_no=attempt_no,
@@ -847,6 +847,7 @@ class StateStore:
                 spawned_job_snapshots=spawned_snapshots,
                 cursor_updates=cursor_updates,
             )
+            committed = True
         else:
             committed = self._backend.commit_job_success(
                 job_uid,
@@ -869,8 +870,6 @@ class StateStore:
             spawned_uids = [job_uid_from_snapshot(j) for j in spawned_snapshots]
             return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata, spawned_uids=spawned_uids)
 
-        if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            raise _CommitCrashSignal(f"commit_job_settlement returned False for {job_uid}")
         # commit 失败走 3-strike 收敛契约（旧 schema 保留）
         self.handle_commit_failure_strike(job_uid, "commit_job_success", job_snapshot, attempt_id=attempt_id)
         return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata)
@@ -901,7 +900,7 @@ class StateStore:
             normalized_meta["job_snapshot"] = copy.deepcopy(job_snapshot)
         payload = self._extract_job_payload(job_snapshot)
         if self._backend.schema_version >= TARGET_SCHEMA_VERSION and attempt_no is not None:
-            committed = self._backend.commit_job_settlement(
+            self._backend.commit_job_settlement(
                 job_uid=job_uid,
                 outcome="failure",
                 attempt_no=attempt_no,
@@ -916,6 +915,10 @@ class StateStore:
                 failure_metadata=normalized_meta,
                 payload=payload,
             )
+            committed = True
+        elif self._backend.schema_version >= TARGET_SCHEMA_VERSION:
+            self._backend.commit_job_failure(job_uid, normalized_meta, payload)
+            committed = True
         else:
             committed = self._backend.commit_job_failure(job_uid, normalized_meta, payload)
 
@@ -933,8 +936,6 @@ class StateStore:
                 cascaded_uids = self.cascade_fail(job_uid)
             return FailureOutcome(job_uid=job_uid, failure_metadata=normalized_meta, cascaded_uids=cascaded_uids)
 
-        if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            raise _CommitCrashSignal(f"Failed to commit failure for {job_uid}")
         self.handle_commit_failure_strike(
             job_uid,
             self._attempt_error(normalized_meta) or "commit_job_failure",
@@ -999,7 +1000,7 @@ class StateStore:
         """原子状态转移：重试重入队（节奏经 RequeuePolicy 唯一出口）。"""
         plan = self._requeue_policy.plan_requeue(retry_job_snapshot, transient_kind=transient_kind)
         if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            committed = self._backend.commit_job_settlement(
+            self._backend.commit_job_settlement(
                 job_uid=job_uid,
                 outcome="retry",
                 attempt_no=attempt_no,
@@ -1013,6 +1014,7 @@ class StateStore:
                 error_message=error_message,
                 requeued_job_snapshot=retry_job_snapshot,
             )
+            committed = True
         else:
             committed = self._backend.commit_retry(job_uid, retry_job_snapshot, front=plan.front)
 
@@ -1028,8 +1030,6 @@ class StateStore:
                 self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error_message=error_message)
             return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
 
-        if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            raise _CommitCrashSignal(f"commit_retry returned False for {job_uid}")
         self.handle_commit_failure_strike(job_uid, "commit_retry", job_snapshot, attempt_id=attempt_id)
         return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
 
@@ -1049,7 +1049,7 @@ class StateStore:
     ) -> bool:
         """受阻或停机执行回滚到待派发队列（写盘重置为 pending，释放在途并还原内存队列）。"""
         settled_at = utc_now_iso()
-        committed = self._backend.commit_job_settlement(
+        self._backend.commit_job_settlement(
             job_uid=job_uid,
             outcome="pending",
             attempt_no=attempt_no,
@@ -1063,11 +1063,9 @@ class StateStore:
             error_message=error_message,
             record_attempt=record_attempt,
         )
-        if committed:
-            self._state.unregister_in_flight(job_uid)
-            self._state.requeue_jobs([job_snapshot], front=True)
-            return True
-        raise _CommitCrashSignal(f"commit_job_settlement(pending) returned False for {job_uid}")
+        self._state.unregister_in_flight(job_uid)
+        self._state.requeue_jobs([job_snapshot], front=True)
+        return True
 
     def apply_skip(
         self,

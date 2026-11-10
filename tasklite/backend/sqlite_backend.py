@@ -682,7 +682,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                 conn.execute('DELETE FROM successes WHERE job_uid = ?', (job_uid,))
         except Exception as e:
             logger.critical(f"Failed to commit job failure for {job_uid} in {self.path.name}: {e}")
-            return False
+            raise
         return True
 
     def commit_skip(self, job_uid: str) -> bool:
@@ -1405,7 +1405,7 @@ class SQLiteStateBackend(AbstractStateBackend):
         payload: dict[str, Any] | None = None,
         requeued_job_snapshot: dict[str, Any] | None = None,
         record_attempt: bool = True,
-    ) -> bool:
+    ) -> None:
         if self.schema_version < TARGET_SCHEMA_VERSION:
             raise NotImplementedError(
                 f"commit_job_settlement requires schema_version >= {TARGET_SCHEMA_VERSION}"
@@ -1434,144 +1434,134 @@ class SQLiteStateBackend(AbstractStateBackend):
         if spawned_job_snapshots:
             validate_queue_replacement(list(spawned_job_snapshots))
 
-        try:
-            with self._get_conn() as conn:
-                conn.execute('BEGIN IMMEDIATE')
+        with self._get_conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
 
-                running = conn.execute(
-                    "SELECT status, run_id, attempt_no, job_snapshot "
-                    "FROM queue WHERE job_uid = ?",
-                    (job_uid,),
-                ).fetchone()
-                if running is None:
-                    raise ValueError(f"Settlement does not match the running execution for {job_uid}")
-                stored_job = loads(running[3]) if running[3] else None
-                if not isinstance(stored_job, dict):
-                    raise ValueError(
-                        f"Settlement does not match the running execution for {job_uid}"
-                    )
-                if (
-                    running[:3] != ("running", run_id, attempt_no)
-                    or queue_snapshot_execution_id(stored_job) != execution_id
-                ):
-                    raise ValueError(
-                        f"Settlement does not match the running execution for {job_uid}"
-                    )
-                if conn.execute(
-                    "SELECT 1 FROM attempts WHERE job_uid = ? AND attempt_no = ?", (job_uid, attempt_no)
-                ).fetchone():
-                    raise ValueError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
+            running = conn.execute(
+                "SELECT status, run_id, attempt_no, job_snapshot "
+                "FROM queue WHERE job_uid = ?",
+                (job_uid,),
+            ).fetchone()
+            if running is None:
+                raise TaskLiteError(f"Settlement does not match the running execution for {job_uid}")
+            stored_job = loads(running[3]) if running[3] else None
+            if not isinstance(stored_job, dict):
+                raise TaskLiteError(
+                    f"Settlement does not match the running execution for {job_uid}"
+                )
+            if (
+                running[:3] != ("running", run_id, attempt_no)
+                or queue_snapshot_execution_id(stored_job) != execution_id
+            ):
+                raise TaskLiteError(
+                    f"Settlement does not match the running execution for {job_uid}"
+                )
+            if conn.execute(
+                "SELECT 1 FROM attempts WHERE job_uid = ? AND attempt_no = ?", (job_uid, attempt_no)
+            ).fetchone():
+                raise TaskLiteError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
 
-                if record_attempt:
-                    attempt_outcome = (
-                        outcome if outcome in ("success", "failure", "retry") else "failure"
-                    )
-                    conn.execute(
-                        'INSERT INTO attempts ('
-                        'job_uid, attempt_no, run_id, outcome, started_at, settled_at, '
-                        'job_snapshot, files, result, error_message'
-                        ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            if record_attempt:
+                attempt_outcome = (
+                    outcome if outcome in ("success", "failure", "retry") else "failure"
+                )
+                conn.execute(
+                    'INSERT INTO attempts ('
+                    'job_uid, attempt_no, run_id, outcome, started_at, settled_at, '
+                    'job_snapshot, files, result, error_message'
+                    ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (
+                        job_uid,
+                        attempt_no,
+                        run_id,
+                        attempt_outcome,
+                        started_at,
+                        settled_at,
+                        dumps(job_snapshot) if job_snapshot is not None else None,
+                        dumps(files) if files is not None else None,
+                        dumps(result) if result is not None else None,
+                        error_message,
+                    ),
+                )
+
+            if outcome == "success":
+                conn.execute(
+                    'INSERT OR REPLACE INTO successes (job_uid, metadata) VALUES (?, ?)',
+                    (job_uid, dumps(success_metadata or {})),
+                )
+                conn.execute('DELETE FROM failed WHERE job_uid = ?', (job_uid,))
+                conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
+
+                if spawned_job_snapshots:
+                    queue_positions = self._queue_position_range(conn, len(spawned_job_snapshots), front=True)
+                    rows = [
                         (
+                            job_uid_from_snapshot(j),
+                            pos,
+                            dumps(j),
+                            "pending",
+                            None,
+                            None,
+                            None,
+                        )
+                        for j, pos in zip(spawned_job_snapshots, queue_positions)
+                    ]
+                    cur = conn.executemany(
+                        'INSERT OR IGNORE INTO queue ('
+                        'job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at'
+                        ') VALUES (?, ?, ?, ?, ?, ?, ?)',
+                        rows,
+                    )
+                    if cur.rowcount is not None and cur.rowcount < len(spawned_job_snapshots):
+                        logger.critical(
+                            f"commit_job_settlement for {job_uid}: "
+                            f"{len(spawned_job_snapshots) - cur.rowcount} spawned job(s) "
+                            f"conflicted on disk. Rolling back."
+                        )
+                        raise TaskLiteError(f"Spawned job conflicts with queue for {job_uid}")
+
+                if cursor_updates:
+                    for k, v in cursor_updates.items():
+                        if v is None:
+                            conn.execute('DELETE FROM cursors WHERE key = ?', (k,))
+                        else:
+                            conn.execute(
+                                'INSERT OR REPLACE INTO cursors (key, value) VALUES (?, ?)',
+                                (k, v),
+                            )
+
+            elif outcome == "failure":
+                conn.execute(
+                    'INSERT OR REPLACE INTO failed (job_uid, metadata, payload) VALUES (?, ?, ?)',
+                    (job_uid, dumps(failure_metadata or {}), dumps(payload) if payload is not None else None),
+                )
+                conn.execute('DELETE FROM successes WHERE job_uid = ?', (job_uid,))
+                conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
+
+            elif outcome == "retry":
+                if requeued_job_snapshot is not None:
+                    conn.execute(
+                        'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
+                        'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
+                        (
+                            dumps(public_queue_snapshot(requeued_job_snapshot)),
+                            "pending",
                             job_uid,
-                            attempt_no,
-                            run_id,
-                            attempt_outcome,
-                            started_at,
-                            settled_at,
-                            dumps(job_snapshot) if job_snapshot is not None else None,
-                            dumps(files) if files is not None else None,
-                            dumps(result) if result is not None else None,
-                            error_message,
                         ),
                     )
-
-                if outcome == "success":
-                    conn.execute(
-                        'INSERT OR REPLACE INTO successes (job_uid, metadata) VALUES (?, ?)',
-                        (job_uid, dumps(success_metadata or {})),
-                    )
-                    conn.execute('DELETE FROM failed WHERE job_uid = ?', (job_uid,))
-                    conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
-
-                    if spawned_job_snapshots:
-                        queue_positions = self._queue_position_range(conn, len(spawned_job_snapshots), front=True)
-                        rows = [
-                            (
-                                job_uid_from_snapshot(j),
-                                pos,
-                                dumps(j),
-                                "pending",
-                                None,
-                                None,
-                                None,
-                            )
-                            for j, pos in zip(spawned_job_snapshots, queue_positions)
-                        ]
-                        cur = conn.executemany(
-                            'INSERT OR IGNORE INTO queue ('
-                            'job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at'
-                            ') VALUES (?, ?, ?, ?, ?, ?, ?)',
-                            rows,
-                        )
-                        if cur.rowcount is not None and cur.rowcount < len(spawned_job_snapshots):
-                            logger.critical(
-                                f"commit_job_settlement for {job_uid}: "
-                                f"{len(spawned_job_snapshots) - cur.rowcount} spawned job(s) "
-                                f"conflicted on disk. Rolling back."
-                            )
-                            raise RuntimeError(f"spawned job conflict on disk for {job_uid}")
-
-                    if cursor_updates:
-                        for k, v in cursor_updates.items():
-                            if v is None:
-                                conn.execute('DELETE FROM cursors WHERE key = ?', (k,))
-                            else:
-                                conn.execute(
-                                    'INSERT OR REPLACE INTO cursors (key, value) VALUES (?, ?)',
-                                    (k, v),
-                                )
-
-                elif outcome == "failure":
-                    conn.execute(
-                        'INSERT OR REPLACE INTO failed (job_uid, metadata, payload) VALUES (?, ?, ?)',
-                        (job_uid, dumps(failure_metadata or {}), dumps(payload) if payload is not None else None),
-                    )
-                    conn.execute('DELETE FROM successes WHERE job_uid = ?', (job_uid,))
-                    conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
-
-                elif outcome == "retry":
-                    if requeued_job_snapshot is not None:
-                        conn.execute(
-                            'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
-                            'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
-                            (
-                                dumps(public_queue_snapshot(requeued_job_snapshot)),
-                                "pending",
-                                job_uid,
-                            ),
-                        )
-                    else:
-                        conn.execute(
-                            'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
-                            'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
-                            (dumps(public_queue_snapshot(stored_job)), "pending", job_uid),
-                        )
-
-                elif outcome == "pending":
+                else:
                     conn.execute(
                         'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
                         'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
                         (dumps(public_queue_snapshot(stored_job)), "pending", job_uid),
                     )
 
-            return True
-        except (ValueError, TypeError):
-            raise
-        except sqlite3.Error as exc:
-            raise RuntimeError(f"Failed to commit settlement for {job_uid} in {self.path.name}: {exc}") from exc
-        except Exception as e:
-            logger.critical(f"Failed to commit settlement for {job_uid} in {self.path.name}: {e}")
-            return False
+            elif outcome == "pending":
+                conn.execute(
+                    'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
+                    'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
+                    (dumps(public_queue_snapshot(stored_job)), "pending", job_uid),
+                )
 
     def record_authorization(
         self,

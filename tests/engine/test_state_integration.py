@@ -150,7 +150,7 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
         run_id="first",
         started_at="2026-01-01T00:00:00Z",
     )
-    assert backend.commit_job_settlement(
+    backend.commit_job_settlement(
         job_uid=uid, outcome=old_outcome, attempt_no=1,
         execution_id="first.1", run_id="first",
         settled_at="2026-01-01T00:00:01Z", job_snapshot=first,
@@ -175,9 +175,9 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
             pipeline.enqueue(Job("child", "dependent", depends_on=[uid]))
             pipeline.enqueue(Job("child", "independent"))
             current = backend.load_queue_jobs()[0]["job"]
-            with pytest.raises(RuntimeError, match="synthetic settlement failure") as error:
+            with pytest.raises(sqlite3.IntegrityError, match="synthetic settlement failure") as error:
                 pipeline.run()
-            assert isinstance(error.value.__cause__, sqlite3.IntegrityError)
+            assert error.value.__cause__ is None
 
         worker_pid = int(effect.read_text().strip())
         assert worker_pid != os.getpid()
@@ -201,9 +201,9 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
         before = list(observer.iterdump())
         with TaskLite(backend="sqlite", state_path=db_path) as pipeline:
             register(pipeline)
-            with pytest.raises(RuntimeError, match="synthetic recovery failure") as error:
+            with pytest.raises(sqlite3.IntegrityError, match="synthetic recovery failure") as error:
                 pipeline.run()
-            assert isinstance(error.value.__cause__, sqlite3.IntegrityError)
+            assert error.value.__cause__ is None
         assert list(observer.iterdump()) == before
         observer.execute("DROP TRIGGER reject_failure")
 
@@ -347,8 +347,8 @@ def test_attempt_no_monotonic_advance_including_zero_budget_retry(tmp_path: Path
     assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
 
 
-@pytest.mark.parametrize("raises", [False, True])
-def test_recovery_settlement_fault_preserves_running(tmp_path, monkeypatch, raises):
+@pytest.mark.parametrize("error_type", [OSError, sqlite3.OperationalError])
+def test_recovery_settlement_fault_preserves_running(tmp_path, monkeypatch, error_type):
     """恢复提交失败时保留 running 与完整快照，不登记内存失败。"""
     pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     backend = pipeline._runtime.store.backend
@@ -361,14 +361,15 @@ def test_recovery_settlement_fault_preserves_running(tmp_path, monkeypatch, rais
         started_at="2026-01-01T00:00:00+00:00",
     )
 
+    original = error_type("无法写入结算")
+
     def fail_settlement(**kwargs):
-        if raises:
-            raise OSError("无法写入结算")
-        return False
+        raise original
 
     monkeypatch.setattr(backend, "commit_job_settlement", fail_settlement)
-    with pytest.raises(BaseException, match="无法写入结算|Failed to commit failure"):
+    with pytest.raises(error_type, match="无法写入结算") as error:
         pipeline.run()
+    assert error.value is original
     assert backend.load_queue_jobs()[0]["status"] == "running"
     assert backend.load_queue_jobs()[0]["job"] == snapshot
     assert backend.load_failed() == {}
@@ -393,8 +394,8 @@ def pending_after_effect_handler(job, ctx):
     raise TimeoutError("work effect was not committed before pending settlement")
 
 
-@pytest.mark.parametrize("raises", [False, True])
-def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypatch, raises):
+@pytest.mark.parametrize("error_type", [OSError, sqlite3.IntegrityError])
+def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypatch, error_type):
     """结算写入故障保留 running，重开只恢复失败，不重复业务副作用。"""
     db_path = tmp_path / "state.db"
     effect = tmp_path / "effect.txt"
@@ -404,10 +405,10 @@ def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypat
     pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
     pipeline.enqueue(Job("pending", "two", payload={"effect": str(effect)}))
 
+    original = error_type("结算失败")
+
     def fail_settlement(**kwargs):
-        if raises:
-            raise RuntimeError("结算失败")
-        return False
+        raise original
 
     with monkeypatch.context() as patch:
         patch.setattr(
@@ -415,8 +416,9 @@ def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypat
             "commit_job_settlement",
             fail_settlement,
         )
-        with pytest.raises(BaseException, match="结算失败|commit_job_settlement returned False"):
+        with pytest.raises(error_type, match="结算失败") as error:
             pipeline.run()
+        assert error.value is original
     rows = pipeline._runtime.store.backend.load_queue_jobs()
     assert rows[0]["status"] == "running"
     assert pipeline._runtime.store.backend.load_settled_attempts("work::one") == []

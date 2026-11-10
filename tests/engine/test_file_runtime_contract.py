@@ -475,8 +475,6 @@ def test_pre_dispatch_removes_broken_symlink(tmp_path, monkeypatch):
 
 def test_mark_running_failure_keeps_file_and_worker_unstarted(tmp_path, monkeypatch):
     """running 写失败保留 pending 队列与目标文件，不进入前删或 spawn。"""
-    from tasklite.exceptions import _CommitCrashSignal
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
     target = tmp_path / "target"
@@ -491,9 +489,28 @@ def test_mark_running_failure_keeps_file_and_worker_unstarted(tmp_path, monkeypa
         files={"target": FileSpec(target, role="output", delete_existing=True)},
     ))
 
-    with patch.object(p._runtime.store.backend, "mark_job_running", side_effect=OSError("write failed")):
-        with pytest.raises(_CommitCrashSignal):
+    original = OSError("write failed")
+    original_traceback = None
+
+    def fail_running_write(*args, **kwargs):
+        nonlocal original_traceback
+        try:
+            raise original
+        except OSError as error:
+            original_traceback = error.__traceback__
+            raise
+
+    with patch.object(p._runtime.store.backend, "mark_job_running", side_effect=fail_running_write):
+        with pytest.raises(OSError, match="write failed") as caught:
             p.run()
+    assert caught.value is original
+    assert caught.value.__cause__ is None
+    tracebacks = []
+    current = caught.value.__traceback__
+    while current is not None:
+        tracebacks.append(current)
+        current = current.tb_next
+    assert original_traceback in tracebacks
 
     assert not marker.exists()
     assert target.read_text(encoding="utf-8") == "valuable"

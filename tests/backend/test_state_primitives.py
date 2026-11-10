@@ -83,7 +83,7 @@ class TestStatePrimitivesParity:
             started_at="2026-01-01T00:00:00Z",
         )
         before = _state_facts(v6_backend)
-        with pytest.raises(ValueError, match="does not match the running execution"):
+        with pytest.raises(TaskLiteError, match="does not match the running execution"):
             v6_backend.commit_job_settlement(
                 job_uid=uid, outcome="success", execution_id=execution_id,
                 run_id=run_id, attempt_no=attempt_no,
@@ -101,7 +101,7 @@ class TestStatePrimitivesParity:
         attempt_no = v6_backend.mark_job_running(
             uid, execution_id="run.1", run_id="run", started_at=started_at
         )
-        assert v6_backend.commit_job_settlement(
+        v6_backend.commit_job_settlement(
             job_uid=uid, outcome="retry", execution_id="run.1",
             run_id="run", attempt_no=attempt_no,
             settled_at="2026-01-01T00:00:01Z",
@@ -121,7 +121,7 @@ class TestStatePrimitivesParity:
         before = _state_facts(v6_backend)
         attempts = v6_backend.load_settled_attempts(uid)
 
-        with pytest.raises(ValueError, match="already settled"):
+        with pytest.raises(TaskLiteError, match="already settled"):
             v6_backend.commit_job_settlement(
                 job_uid=uid, outcome="success", run_id="run", attempt_no=attempt_no,
                 execution_id="run.1",
@@ -171,18 +171,18 @@ class TestStatePrimitivesParity:
         before2 = _state_facts(b)
 
         # 尝试派生同名 child
-        committed = b.commit_job_settlement(
-            job_uid="t::parent",
-            outcome="success",
-            attempt_no=1,
-            execution_id="run_1.1",
-            run_id="run_1",
-            settled_at="2026-11-08T00:00:02Z",
-            success_metadata={"ok": True},
-            spawned_job_snapshots=[_make_job("conflict_child")],
-            cursor_updates={"good_cursor": "val"},
-        )
-        assert committed is False
+        with pytest.raises(TaskLiteError, match="[Cc]onflict"):
+            b.commit_job_settlement(
+                job_uid="t::parent",
+                outcome="success",
+                attempt_no=1,
+                execution_id="run_1.1",
+                run_id="run_1",
+                settled_at="2026-11-08T00:00:02Z",
+                success_metadata={"ok": True},
+                spawned_job_snapshots=[_make_job("conflict_child")],
+                cursor_updates={"good_cursor": "val"},
+            )
         # 失败后没有任何部分子任务、游标或 Attempt 写入
         assert _state_facts(b) == before2
         assert b.load_settled_attempts("t::parent") == []
@@ -200,7 +200,7 @@ class TestStatePrimitivesParity:
         )
         assert att_no == 1
 
-        ok = b.commit_job_settlement(
+        b.commit_job_settlement(
             job_uid="t::job_s",
             outcome="success",
             attempt_no=1,
@@ -214,7 +214,6 @@ class TestStatePrimitivesParity:
             spawned_job_snapshots=[_make_job("child_s")],
             cursor_updates={"cur_1": "cval"},
         )
-        assert ok is True
 
         # 校验成功状态与副作用
         assert "t::job_s" in b.load_successes()
@@ -240,7 +239,7 @@ class TestStatePrimitivesParity:
             started_at="2026-11-08T01:00:00Z",
         )
 
-        ok = b.commit_job_settlement(
+        b.commit_job_settlement(
             job_uid="t::job_f",
             outcome="failure",
             attempt_no=1,
@@ -250,7 +249,6 @@ class TestStatePrimitivesParity:
             failure_metadata={"error": "oom"},
             payload={"input": "data"},
         )
-        assert ok is True
         assert "t::job_f" in b.load_failed()
         assert b.load_failure_payloads().get("t::job_f") == {"input": "data"}
         assert "t::job_f" not in [j["job_uid"] for j in b.load_queue_jobs()]
@@ -267,7 +265,7 @@ class TestStatePrimitivesParity:
             started_at="2026-11-08T02:00:00Z",
         )
 
-        ok = b.commit_job_settlement(
+        b.commit_job_settlement(
             job_uid="t::job_r",
             outcome="retry",
             attempt_no=1,
@@ -275,7 +273,6 @@ class TestStatePrimitivesParity:
             run_id="run_r",
             settled_at="2026-11-08T02:00:01Z",
         )
-        assert ok is True
         assert "t::job_r" not in b.load_successes()
         assert "t::job_r" not in b.load_failed()
         r_jobs = [j for j in b.load_queue_jobs() if j["job_uid"] == "t::job_r"]
@@ -295,7 +292,7 @@ class TestStatePrimitivesParity:
             started_at="2026-11-08T03:00:00Z",
         )
 
-        ok = b.commit_job_settlement(
+        b.commit_job_settlement(
             job_uid="t::job_p",
             outcome="pending",
             attempt_no=1,
@@ -304,7 +301,6 @@ class TestStatePrimitivesParity:
             settled_at="2026-11-08T03:00:01Z",
             error_message="authorization denied",
         )
-        assert ok is True
         assert "t::job_p" not in b.load_successes()
         assert "t::job_p" not in b.load_failed()
         p_jobs = [j for j in b.load_queue_jobs() if j["job_uid"] == "t::job_p"]

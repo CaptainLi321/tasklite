@@ -273,7 +273,7 @@ class AbstractStateBackend(ABC):
         记录作废（最终状态唯一），否则磁盘 successes∩failed 并存破坏互斥。
         ``payload`` 是原始业务输入快照（补跑自足，无需外部反查）；
         None 表示本路径无可存快照，保留既有快照不覆盖。
-        返回语义与 ``commit_job_success`` 一致：False ⇒ 后端未变、崩溃契约。
+        成功返回 True；写入故障原样传播，失败时后端保持调用前状态。
         """
 
     @abstractmethod
@@ -468,8 +468,12 @@ class AbstractStateBackend(ABC):
         payload: dict[str, Any] | None = None,
         requeued_job_snapshot: dict[str, Any] | None = None,
         record_attempt: bool = True,
-    ) -> bool:
-        """原子执行结算：校验完整执行身份后写入 Attempt、Job 去向、档案与派生数据。"""
+    ) -> None:
+        """原子执行结算：校验完整执行身份后写入 Attempt、Job 去向、档案与派生数据。
+
+        成功无返回值；执行身份与 running 不匹配或已结算时抛 TaskLiteError。
+        写入故障原样传播，失败时后端不变。
+        """
 
     @abstractmethod
     def get_attempt_sequence(self, job_uid: str) -> int:

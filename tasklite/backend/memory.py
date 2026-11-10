@@ -26,6 +26,7 @@ from .base import (
     validate_attempt_finish,
     validate_queue_replacement,
 )
+from ..exceptions import TaskLiteError
 from ..models.attempt import AttemptRecord
 from ..models.state import job_uid_from_snapshot
 from ..utils.clock import utc_now_iso
@@ -247,7 +248,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 return True
             except Exception as e:
                 logger.critical(f"Failed to commit job failure for {job_uid}: {e}")
-                return False
+                raise
 
     def commit_retry(
         self,
@@ -714,7 +715,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         payload: dict[str, Any] | None = None,
         requeued_job_snapshot: dict[str, Any] | None = None,
         record_attempt: bool = True,
-    ) -> bool:
+    ) -> None:
         if outcome not in ("success", "failure", "retry", "pending"):
             raise ValueError(f"Invalid outcome: {outcome}")
         if not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 1:
@@ -748,13 +749,13 @@ class InMemoryStateBackend(AbstractStateBackend):
                 running.get("attempt_no"),
                 queue_snapshot_execution_id(running),
             ) != ("running", run_id, attempt_no, execution_id):
-                raise ValueError(f"Settlement does not match the running execution for {job_uid}")
+                raise TaskLiteError(f"Settlement does not match the running execution for {job_uid}")
             if any(
                 isinstance(attempt, dict) and attempt.get("job_uid") == job_uid
                 and attempt.get("attempt_no") == attempt_no
                 for attempt in self._attempts.values()
             ):
-                raise ValueError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
+                raise TaskLiteError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
 
             new_attempts = dict(self._attempts)
             new_attempt_id = self._attempt_seq
@@ -791,11 +792,9 @@ class InMemoryStateBackend(AbstractStateBackend):
                     for sj in spawned_job_snapshots:
                         suid = job_uid_from_snapshot(sj)
                         if suid in remaining_uids or suid in seen:
-                            logger.critical(
-                                f"commit_job_settlement for {job_uid}: spawned job {suid} "
-                                f"conflicts with queue (drift). Returning False."
+                            raise TaskLiteError(
+                                f"Spawned job {suid} conflicts with queue for {job_uid}"
                             )
-                            return False
                         seen.add(suid)
                     for s in reversed(spawned_job_snapshots):
                         s_copy = copy.deepcopy(s)
@@ -860,7 +859,6 @@ class InMemoryStateBackend(AbstractStateBackend):
             self._failed = new_failed
             self._failure_payloads = new_failure_payloads
             self._cursors = new_cursors
-            return True
 
     def record_authorization(
         self,

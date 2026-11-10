@@ -322,9 +322,8 @@ class TestBackendCommitAtomicity:
         b.enqueue_jobs([_job_snapshot("one")])
         before = _snapshot(b)
 
-        ok = b.commit_job_failure("t::one", {"payload": _UncommittableMeta()})
-
-        assert ok is False
+        with pytest.raises((ValueError, TypeError)):
+            b.commit_job_failure("t::one", {"payload": _UncommittableMeta()})
         assert _snapshot(b) == before
         assert "t::one" in _queue_uids(b)
 

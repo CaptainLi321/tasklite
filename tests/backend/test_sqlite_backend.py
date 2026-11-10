@@ -441,7 +441,7 @@ class TestCommitJobFailure:
         assert set(backend.load_failed()) == {"t::one"}
         assert not (set(backend.load_successes()) & set(backend.load_failed()))
 
-    def test_transaction_failure_returns_false_and_preserves_queue(self, tmp_path):
+    def test_transaction_failure_propagates_and_preserves_queue(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.save_queue([_job_snapshot("alpha"), _job_snapshot("beta")])
 
@@ -459,9 +459,8 @@ class TestCommitJobFailure:
             return real_connect(path, *args, **kwargs)
 
         with mock.patch("sqlite3.connect", side_effect=fake_connect):
-            result = backend.commit_job_failure("t::alpha", {"error_message": "boom"})
-
-        assert result is False
+            with pytest.raises(sqlite3.OperationalError, match="disk full"):
+                backend.commit_job_failure("t::alpha", {"error_message": "boom"})
         assert _queue_uids(backend) == ["t::alpha", "t::beta"]
         assert backend.load_failed() == {}
 
@@ -719,10 +718,11 @@ class TestSqliteFailureArchive:
         backend.append_failed("t::other", {"error_message": "x"})
         assert backend.load_failure_payloads() == {}
 
-    def test_unserializable_payload_returns_false(self, tmp_path):
-        """payload 不可序列化 → 序列化异常回滚 → False（不落半行）。"""
+    def test_unserializable_payload_propagates_and_rolls_back(self, tmp_path):
+        """payload 序列化故障原样传播，不留下部分档案。"""
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        assert backend.commit_job_failure("t::one", {"error_message": "x"}, payload={"bad": object()}) is False
+        with pytest.raises(TypeError):
+            backend.commit_job_failure("t::one", {"error_message": "x"}, payload={"bad": object()})
         assert backend.load_failed() == {}
 
     def test_delete_failed_clears_meta_and_snapshot(self, tmp_path):
