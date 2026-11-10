@@ -288,7 +288,6 @@ tasklite/
 │   ├── admission.py     # 重入队节奏 (RequeuePolicy seam)
 │   ├── governor.py      # 死锁归因仲裁与依赖宽限 (DeadlockGovernor)
 │   ├── in_flight.py     # 在途作业租约追踪 (InFlightTracker)
-│   ├── errorclass.py    # 错误分类与归因 (ErrorClassifier)
 │   └── resource.py      # 内置资源实现
 ├── backend/             # SQLite WAL 强一致事务持久化后端与内存后端
 ├── models/              # Task / Job / Attempt / JobContext / TaskResult / FileSpec 数据模型

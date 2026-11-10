@@ -22,13 +22,15 @@ from tasklite.resource import CapacityResource, IntervalResource
 from tasklite.selection import Exclude
 ```
 
-可选工具（HTTP 守卫、Discovery 扫描、测试辅助等）保留在各自模块中，**本版暂不承诺稳定兼容**，导入路径为：
+可选工具（HTTP 请求、Discovery 扫描、测试辅助等）保留在各自模块中，**本版暂不承诺稳定兼容**，导入路径为：
 
 ```python
-from tasklite.wrappers.http import http_guard, urllib_fetch, SQLiteSnapshotStore
+from tasklite.wrappers.http import HttpResponse, HttpExecutor, urllib_fetch, SQLiteSnapshotStore
 from tasklite.wrappers.discovery import register_discovery
 from tasklite.testing import fake_ctx
 ```
+
+HTTP 工具返回 `HttpResponse`，4xx／5xx 响应保留状态、响应头和正文，传输异常原样抛出。handler 可显式 `return response.to_task_result()`：2xx／3xx 成功、429／5xx 申请重试、其余失败；状态码与可得的 Retry-After 秒数放在业务 metadata 中，不隐式控制资源或等待。`HttpExecutor` 仅在一次请求调用内进行有限本地重试；429 立即返回，本地耗尽返回最后响应或抛出原始传输异常。
 
 ### 架构红线与分层依赖
 

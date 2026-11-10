@@ -105,7 +105,7 @@ _Avoid_: MockBackend, FakeDB, MemoryStorage
 ### Optional Wrappers & Utilities
 
 **wrappers.http**:
-可选网络请求与快照缓存工具（`http_guard`, `urllib_fetch`, `SQLiteSnapshotStore`）。本版不作稳定兼容承诺，文档须显式标注。
+可选网络请求与快照缓存工具（`HttpResponse`, `urllib_fetch`, `SQLiteSnapshotStore`）。本版不作稳定兼容承诺，文档须显式标注。
 
 **wrappers.discovery**:
 可选增量分页扫描工具（`register_discovery`）。本版不作稳定兼容承诺，文档须显式标注。
