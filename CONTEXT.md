@@ -35,7 +35,7 @@ _Avoid_: StatusReader, StateInspector, DBViewer
 _Avoid_: Trial, ExecutionLog, RunRecord
 
 **TaskRegistry**:
-进程内 Task 规格注册表：按 `task_type` 一对一绑定；重复注册显式抛出 `ValueError`，未注册查询抛出 `KeyError`。
+进程内 Task 规格注册表：按 `task_type` 一对一绑定，重复注册明确拒绝。
 _Avoid_: HandlerMap, Registry, TaskStore
 
 **TaskLite**:
