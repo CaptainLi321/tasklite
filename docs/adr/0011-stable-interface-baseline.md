@@ -628,7 +628,9 @@ tasklite.clear_history(
 
 recursive 必须显式指定，无默认值，三种目标状态完全对称。False 只修改目标；True 对目标及已有记录可识别的直接、间接依赖下游设置相同状态，包括已经终结的下游，不推测尚未提交的任务。整个修改原子提交，每个 Job 使用自己的完整快照。pending 清除对应当前终态并恢复队列；succeeded/failed 移出队列并保持成功失败档案互斥。人工成功注明 completion_source=manual；人工失败及级联保留原因和可选 note。以上操作不生成 Attempt，不推进编号，不执行文件清理、派生或游标更新。
 
-clear_history 必须显式指定 records，返回删除记录数，不存在返回 0；仅删除所选档案或 Attempt 历史，不移除队列、不级联、不入队、不清理文件或游标。不保留 keep_fatal 特例。删除终态会影响后续 Trigger 和依赖判断；只删 Attempt 不改变当前状态。删除 retry_failure、seed_successes、clear_failures 和独立 cancel，不提供同义兼容别名；不提供 replace_pending 或物理删除待执行队列的另一入口。
+clear_history 必须显式指定 records，返回删除记录数，不存在返回 0；仅删除所选档案或 Attempt 历史，不移除队列、不级联、不入队、不清理文件或游标。不保留 keep_fatal 特例。只删 Attempt 不直接修改 Job 当前状态。删除 retry_failure、seed_successes、clear_failures 和独立 cancel，不提供同义兼容别名；不提供 replace_pending 或物理删除待执行队列的另一入口。
+
+清理 Job 终态档案或 Attempt 历史均属于显式、破坏性的运维操作，清理范围及后果由用户自行负责。清理允许使依赖这些记录的查询信息、可信执行基线、Trigger 与依赖判断发生变化，不承诺清理后仍保持清理前的判断结果。例如，清除 Attempt 后失去可信成功基线，on_input_change 可以重新执行，即使输入没有变化。框架按清理后剩余的可信记录判断，不为维持原判断增加清理前置条件、依赖拦截或历史保留保护，不保留已删除历史的隐式副本，也不补造执行证据。
 
 删除 handler 的 has_succeeded、has_failed、succeeded_or_failed_job_uids，handler 不读取任务成败集合，调度依赖判断由主进程负责；可选工具适配这一边界。
 
