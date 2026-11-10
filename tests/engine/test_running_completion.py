@@ -1,4 +1,7 @@
 """已进入 running 的执行共享结算流程，框架故障只保留恢复证据。"""
+from pathlib import Path
+import traceback
+
 import pytest
 
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
@@ -267,4 +270,153 @@ def test_stop_after_pre_delete_rolls_back_without_result(tmp_path, monkeypatch, 
     assert capacity.used == 0
     assert not target.exists()
     assert not runtime.in_flight
+    pipeline.close()
+
+
+def _replace_cache_with_directory(job, ctx):
+    if job.job_id != "committed":
+        target = ctx.file_path("cache")
+        target.unlink()
+        target.mkdir()
+        (target / "child").write_text("business", encoding="utf-8")
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("stage,cached", [
+    ("prepare", ()),
+    *((stage, cached) for stage in ("authorize", "release", "commit")
+      for cached in ((), ("fault",), ("fault", "later"), ("later", "fault"))),
+])
+def test_completion_framework_fault_stops_batch_and_cached_results(
+    tmp_path, monkeypatch, backend, cached, stage,
+):
+    fault_name = cached[0] if cached else "fault"
+    later_name = "later" if fault_name == "fault" else "fault"
+    pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db", max_workers=3)
+    capacity = CapacityResource("disk", max_capacity=3)
+    pipeline.register_resource(capacity)
+    pipeline.register_task("work", _replace_cache_with_directory, resources={"disk": 1})
+    pipeline.enqueue(Job("work", "committed"))
+    for name in ("fault", "later"):
+        target = tmp_path / name
+        target.write_text("initial", encoding="utf-8")
+        pipeline.enqueue(Job("work", name, files={
+            "cache": FileSpec(target, role="cache", delete_on_success=True),
+        }))
+    runtime = pipeline._runtime
+    completion = runtime._completion
+    store = runtime.store.backend
+    original_reap = runtime.channel.reap_completed
+    original_settle = completion.settle_reaped
+    original_prepare = completion._prepare_completion
+    original_release = runtime.config.resources.release_all
+    original_commit = store.commit_job_settlement
+    held = {}
+    armed = []
+    events = []
+    releases = []
+    identities = {}
+    committed = []
+    fault = RuntimeError("completion framework unavailable")
+    cause = OSError("underlying framework unavailable")
+
+    def fail():
+        events.append(("fault", stage))
+        raise fault from cause
+
+    def authorize(path, kind):
+        name = Path(path).name
+        if armed:
+            events.append(("authorize", name))
+            if stage == "authorize" and name == fault_name:
+                fail()
+        return True if kind == "file" or armed else None
+
+    def reap(handles):
+        held.update({handle.job_uid: (handle, result) for handle, result in original_reap(
+            [handle for handle in handles if handle.job_uid not in held]
+        )})
+        if len(held) < 3:
+            return []
+        result = [held.pop("work::" + name) for name in ("committed", "fault", "later")]
+        return result
+
+    def settle(results):
+        if not results:
+            return original_settle(results)
+        identities.update({row["job_uid"]: row for row in store.load_queue_jobs(status="running")})
+        pairs = {handle.job_uid.split("::")[1]: (handle, result) for handle, result in results}
+        original_settle([pairs["committed"], *(pairs[name] for name in cached)])
+        committed.append(store.load_settled_attempts("work::committed"))
+        armed.append(True)
+        return original_settle([pairs[name] for name in ("fault", "later") if name not in cached])
+
+    def prepare(uid, *args, **kwargs):
+        if armed and stage == "prepare" and uid == "work::" + fault_name:
+            fail()
+        return original_prepare(uid, *args, **kwargs)
+
+    def release(*args, **kwargs):
+        uid = kwargs["job_uid"]
+        releases.append(uid)
+        result = original_release(*args, **kwargs)
+        if armed and stage == "release" and uid == "work::" + fault_name:
+            fail()
+        return result
+
+    def commit(*args, **kwargs):
+        if armed:
+            events.append(("commit", args[0] if args else kwargs.get("job_uid")))
+            if stage == "commit":
+                fail()
+        return original_commit(*args, **kwargs)
+
+    original_cleanup = ArtifactPathPolicy.cleanup
+
+    def cleanup(policy, declaration, **kwargs):
+        if armed:
+            events.append(("cleanup", Path(declaration.path).name))
+        return original_cleanup(policy, declaration, **kwargs)
+
+    pipeline.authorizer = authorize
+    monkeypatch.setattr(runtime.channel, "reap_completed", reap)
+    monkeypatch.setattr(completion, "settle_reaped", settle)
+    monkeypatch.setattr(completion, "_prepare_completion", prepare)
+    monkeypatch.setattr(runtime.config.resources, "release_all", release)
+    monkeypatch.setattr(store, "commit_job_settlement", commit)
+    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", cleanup)
+    with pytest.raises(RuntimeError) as caught:
+        pipeline.run(install_signals=False)
+    assert caught.value is fault
+    assert caught.value.__cause__ is cause
+    assert "fail" in [frame.name for frame in traceback.extract_tb(caught.tb)]
+    assert events[events.index(("fault", stage)) + 1:] == []
+    assert all(name not in (later_name, "work::" + later_name) for event, name in events)
+    assert (tmp_path / later_name / "child").read_text(encoding="utf-8") == "business"
+    assert set(store.load_successes()) == {"work::committed"}
+    assert store.load_failed() == {}
+    assert {row["job_uid"] for row in store.load_queue_jobs(status="running")} == {
+        "work::fault", "work::later",
+    }
+    assert store.load_settled_attempts("work::fault") == []
+    assert store.load_settled_attempts("work::later") == []
+    assert sorted(releases) == ["work::committed", "work::fault", "work::later"]
+    assert capacity.used == 0
+    assert not runtime.in_flight
+    assert not completion.waiting_authorization
+    monkeypatch.undo()
+    pipeline.run(install_signals=False)
+    for name in ("fault", "later"):
+        uid = "work::" + name
+        attempt, = store.load_settled_attempts(uid)
+        row = identities[uid]
+        assert attempt["outcome"] == "failure"
+        assert (attempt["run_id"], attempt["attempt_no"]) == (row["run_id"], row["attempt_no"])
+        assert store.load_failed()[uid]["execution_id"] == row["execution_id"]
+    assert store.load_settled_attempts("work::committed") == committed[0]
+    before = {uid: store.load_settled_attempts(uid) for uid in identities}
+    pipeline.run(install_signals=False)
+    assert {uid: store.load_settled_attempts(uid) for uid in identities} == before
+    assert (tmp_path / later_name / "child").read_text(encoding="utf-8") == "business"
     pipeline.close()

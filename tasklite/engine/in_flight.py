@@ -78,9 +78,9 @@ class InFlightJob:
             self.lease.release()
             self.acquired = []
         elif self.acquired:
+            acquired, self.acquired = self.acquired, []
             if resource_mgr is not None:
-                resource_mgr.release_all(self.acquired, job_uid=self.job_uid)
-            self.acquired = []
+                resource_mgr.release_all(acquired, job_uid=self.job_uid)
 
 
 class InFlightTracker(MutableMapping[str, InFlightJob]):

@@ -727,13 +727,12 @@ class CompletionMachine:
 
         为每个已完成作业原子执行：
         1. 提取在飞条目；
-        2. complete_job 事务提交、释放资源租约、清理产物、触发收尾钩子；
-        3. 确保在 finally 中从 InFlightTracker 与 StateStore 中注销；
+        2. 经 complete_job 清理产物、释放资源并原子提交；
+        3. 提交后注销在途归属；框架异常交由 Run 异常回收；
         返回成功结算的作业数。
         """
         store = self._store
         settled_count = 0
-        completion_error: BaseException | None = None
         pending_results = list(self._pending_cleanup.values())
         candidates = [*pending_results, *((h, r, None) for h, r in reaped)]
         for source, result, prepared in candidates:
@@ -741,41 +740,28 @@ class CompletionMachine:
             if entry is None:
                 continue
             handle = entry.handle
-            deferred = False
-            completion_started = False
-            try:
-                if prepared is None:
-                    prepared = self._prepare_completion(entry.job_uid, entry.job, result, entry)
-                if result.authorization_outcome is None:
-                    try:
-                        self._authorize_cleanup(entry, result, prepared.active_files)
-                    except _CleanupAuthorizationPending:
-                        self._pending_cleanup[entry.job_uid] = (entry, result, prepared)
-                        if handle is not None:
-                            handle.pause_timeout()
-                        deferred = True
+            if prepared is None:
+                prepared = self._prepare_completion(entry.job_uid, entry.job, result, entry)
+            if result.authorization_outcome is None:
+                try:
+                    self._authorize_cleanup(entry, result, prepared.active_files)
+                except _CleanupAuthorizationPending:
+                    self._pending_cleanup[entry.job_uid] = (entry, result, prepared)
+                    if handle is not None:
+                        handle.pause_timeout()
+                    continue
+            elif handle is not None and entry.job_uid in self._pending_cleanup:
+                try:
+                    if handle.process.is_alive():
                         continue
-                elif handle is not None and entry.job_uid in self._pending_cleanup:
-                    try:
-                        if handle.process.is_alive():
-                            deferred = True
-                            continue
-                    except ValueError:
-                        # 有效结果交付后，非阻塞回收可能已关闭进程句柄。
-                        pass
-                completion_started = True
-                self.complete_job(entry, result, prepared=prepared)
-                settled_count += 1
-            except BaseException as error:
-                if not completion_started:
-                    entry.release_resources(self._resources)
-                completion_error = completion_error or error
-            finally:
-                if not deferred:
-                    self._pending_cleanup.pop(entry.job_uid, None)
-                    self._in_flight.settle(entry.job_uid, state=store.state)
-        if completion_error is not None:
-            raise completion_error
+                except ValueError:
+                    # 有效结果交付后，非阻塞回收可能已关闭进程句柄。
+                    pass
+            # 框架异常立即上抛，未提交条目保留归属，由异常回收统一处理。
+            self.complete_job(entry, result, prepared=prepared)
+            settled_count += 1
+            self._pending_cleanup.pop(entry.job_uid, None)
+            self._in_flight.settle(entry.job_uid, state=store.state)
         return settled_count
 
     def settle_aborted(
