@@ -111,7 +111,7 @@ def test_corrupt_database_is_not_treated_as_empty(tmp_path):
     path = tmp_path / "corrupt.db"
     data = b"not a sqlite database"
     path.write_bytes(data)
-    with pytest.raises(RuntimeError, match="无法只读确认"):
+    with pytest.raises(sqlite3.DatabaseError, match="not a database"):
         SQLiteStateBackend(path)
     assert path.read_bytes() == data
 
@@ -160,7 +160,7 @@ def test_readonly_error_never_falls_back_to_write_connection(tmp_path, monkeypat
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(sqlite3, "connect", connect)
-    with pytest.raises(RuntimeError, match="read access denied"):
+    with pytest.raises(sqlite3.OperationalError, match="read access denied"):
         SQLiteStateBackend(path)
     assert len(calls) == 1
     assert calls[0][1]["uri"] is True
@@ -218,7 +218,7 @@ def test_schema_creation_failure_rolls_back_tables_indexes_and_version(tmp_path,
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(sqlite3, "connect", connect)
-    with pytest.raises(RuntimeError, match="index creation failed"):
+    with pytest.raises(sqlite3.OperationalError, match="index creation failed"):
         SQLiteStateBackend(path)
     with real_connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone() == (0,)

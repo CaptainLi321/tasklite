@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from typing import Any
@@ -120,10 +121,10 @@ class TestSchemaInit:
         assert backend.load_queue() == []
         assert backend.load_settled_attempts("t::missing") == []
 
-    def test_unwritable_path_raises_runtime_error(self, tmp_path):
+    def test_unwritable_path_preserves_sqlite_error(self, tmp_path):
         db_path = tmp_path / "state.db"
         db_path.mkdir()  # 目录占位 → sqlite3.connect 失败
-        with pytest.raises(RuntimeError, match="SQLite backend initialization failed"):
+        with pytest.raises(sqlite3.OperationalError):
             SQLiteStateBackend(db_path)
 
 
@@ -435,7 +436,7 @@ class TestCorruptionAndLocks:
                 "INSERT INTO successes (job_uid, metadata) VALUES (?, ?)",
                 ("bad_uid", "not valid json{{{"),
             )
-        with pytest.raises(RuntimeError, match="Corrupted successes metadata"):
+        with pytest.raises(json.JSONDecodeError, match="Expecting value"):
             backend.load_successes()
 
     def test_load_queue_corrupt_job_snapshot_raises(self, tmp_path):
@@ -445,7 +446,7 @@ class TestCorruptionAndLocks:
                 "INSERT INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)",
                 ("bad", 0, "not valid json{{{"),
             )
-        with pytest.raises(RuntimeError, match="Corrupted queue job_snapshot"):
+        with pytest.raises(json.JSONDecodeError, match="Expecting value"):
             backend.load_queue()
 
     def test_load_failed_corrupt_metadata_raises(self, tmp_path):
@@ -455,7 +456,7 @@ class TestCorruptionAndLocks:
                 "INSERT INTO failed (job_uid, metadata) VALUES (?, ?)",
                 ("bad_uid", "not valid json{{{"),
             )
-        with pytest.raises(RuntimeError, match="Corrupted failed metadata"):
+        with pytest.raises(json.JSONDecodeError, match="Expecting value"):
             backend.load_failed()
 
     def test_load_queue_locked_db_raises(self, tmp_path, monkeypatch):
@@ -465,7 +466,7 @@ class TestCorruptionAndLocks:
             raise sqlite3.OperationalError("database is locked")
 
         monkeypatch.setattr(sqlite3, "connect", _locked)
-        with pytest.raises(RuntimeError, match="Failed to load queue"):
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             backend.load_queue()
 
     def test_dropped_table_rejected_on_reopen(self, tmp_path):

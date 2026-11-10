@@ -98,13 +98,8 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     def __init__(self, filepath: str | Path):
         self.path = Path(filepath)
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._init_db()
-        except TaskLiteError:
-            raise
-        except Exception as e:
-            raise self._schema_error(f"SQLite backend initialization failed: {e}") from e
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
 
     @contextmanager
     def _get_conn(self):
@@ -143,12 +138,6 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     # 初始化与 schema -------------------------------------------------
 
-    def _schema_error(self, detail: str) -> RuntimeError:
-        return RuntimeError(
-            f"{self.path}: {detail}; 目标 schema {TARGET_SCHEMA_VERSION}。"
-            "请保留原库，使用匹配版本读取历史，或显式选择新的状态库路径。"
-        )
-
     def _check_schema(self, conn: sqlite3.Connection) -> int:
         return _check_schema(conn, self.path)
 
@@ -157,15 +146,11 @@ class SQLiteStateBackend(AbstractStateBackend):
             self.path.stat()
         except FileNotFoundError:
             return
-        except OSError as exc:
-            raise self._schema_error(f"无法只读确认版本或形状：{exc}") from exc
         conn = None
         try:
             # 普通只读连接必须看到 WAL 中已提交的版本与结构。
             conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)
             self._check_schema(conn)
-        except (sqlite3.Error, OSError) as exc:
-            raise self._schema_error(f"无法只读确认版本或形状：{exc}") from exc
         finally:
             if conn is not None:
                 conn.close()
@@ -290,65 +275,42 @@ class SQLiteStateBackend(AbstractStateBackend):
     def load_successes(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
             return {}
-        try:
-            with self._get_conn() as conn:
-                cursor = conn.execute('SELECT job_uid, metadata FROM successes')
-                return {row[0]: loads(row[1]) for row in cursor}
-        except (sqlite3.Error, OSError) as e:
-            raise RuntimeError(f"Failed to load successes from {self.path.name}: {e}") from e
-        except ValueError as e:
-            raise RuntimeError(f"Corrupted successes metadata in {self.path.name}: {e}") from e
+        with self._get_conn() as conn:
+            cursor = conn.execute('SELECT job_uid, metadata FROM successes')
+            return {row[0]: loads(row[1]) for row in cursor}
 
     def load_failed(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
             return {}
-        try:
-            with self._get_conn() as conn:
-                cursor = conn.execute('SELECT job_uid, metadata FROM failed')
-                return {row[0]: loads(row[1]) for row in cursor}
-        except (sqlite3.Error, OSError) as e:
-            raise RuntimeError(f"Failed to load failed archive from {self.path.name}: {e}") from e
-        except ValueError as e:
-            raise RuntimeError(f"Corrupted failed metadata in {self.path.name}: {e}") from e
+        with self._get_conn() as conn:
+            cursor = conn.execute('SELECT job_uid, metadata FROM failed')
+            return {row[0]: loads(row[1]) for row in cursor}
 
     def load_failure_payloads(self) -> dict[str, dict[str, Any]]:
         """读取失败档案各 job_uid 的原始业务 payload 快照（无快照的 job_uid 不出现）。"""
         if not self.path.exists():
             return {}
-        try:
-            with self._get_conn() as conn:
-                cursor = conn.execute(
-                    'SELECT job_uid, payload FROM failed WHERE payload IS NOT NULL'
-                )
-                return {row[0]: loads(row[1]) for row in cursor}
-        except (sqlite3.Error, OSError) as e:
-            raise RuntimeError(f"Failed to load failure payloads from {self.path.name}: {e}") from e
-        except ValueError as e:
-            raise RuntimeError(f"Corrupted failed payload in {self.path.name}: {e}") from e
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                'SELECT job_uid, payload FROM failed WHERE payload IS NOT NULL'
+            )
+            return {row[0]: loads(row[1]) for row in cursor}
 
     def load_cursors(self) -> dict[str, str]:
         if not self.path.exists():
             return {}
-        try:
-            with self._get_conn() as conn:
-                cursor = conn.execute('SELECT key, value FROM cursors')
-                return {row[0]: row[1] for row in cursor}
-        except (sqlite3.Error, OSError) as e:
-            raise RuntimeError(f"Failed to load cursors from {self.path.name}: {e}") from e
+        with self._get_conn() as conn:
+            cursor = conn.execute('SELECT key, value FROM cursors')
+            return {row[0]: row[1] for row in cursor}
 
     def load_queue(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
-        try:
-            with self._get_conn() as conn:
-                cursor = conn.execute(
-                    "SELECT job_snapshot FROM queue WHERE status = 'pending' ORDER BY queue_position ASC"
-                )
-                return [public_queue_snapshot(loads(row[0])) for row in cursor]
-        except (sqlite3.Error, OSError) as e:
-            raise RuntimeError(f"Failed to load queue from {self.path.name}: {e}") from e
-        except ValueError as e:
-            raise RuntimeError(f"Corrupted queue job_snapshot in {self.path.name}: {e}") from e
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "SELECT job_snapshot FROM queue WHERE status = 'pending' ORDER BY queue_position ASC"
+            )
+            return [public_queue_snapshot(loads(row[0])) for row in cursor]
 
     # 整表重写 ---------------------------------------------------------
 
@@ -793,37 +755,28 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     # 尝试轨迹（append-only 旁路观测面）------------------------------------
 
-
     def load_latest_succeeded_finished_at(self, job_uid: str) -> str | None:
         if not self.path.exists():
             return None
-        try:
-            with self._get_conn() as conn:
-                row = conn.execute(
-                    "SELECT settled_at FROM attempts "
-                    "WHERE job_uid = ? AND outcome = 'success' "
-                    "ORDER BY attempt_id DESC LIMIT 1",
-                    (job_uid,),
-                ).fetchone()
-                if row is None or not isinstance(row[0], str) or not row[0]:
-                    return None
-                return row[0]
-        except (sqlite3.Error, OSError) as e:
-            raise RuntimeError(
-                f"Failed to load latest succeeded finished_at for {job_uid!r} from {self.path.name}: {e}"
-            ) from e
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT settled_at FROM attempts "
+                "WHERE job_uid = ? AND outcome = 'success' "
+                "ORDER BY attempt_id DESC LIMIT 1",
+                (job_uid,),
+            ).fetchone()
+            if row is None or not isinstance(row[0], str) or not row[0]:
+                return None
+            return row[0]
 
     # 元数据 ---------------------------------------------------------------
 
     def get_engine_metadata(self, key: str) -> str | None:
         if not self.path.exists():
             return None
-        try:
-            with self._get_conn() as conn:
-                row = conn.execute('SELECT value FROM engine_metadata WHERE key = ?', (key,)).fetchone()
-                return row[0] if row else None
-        except (sqlite3.Error, OSError) as e:
-            raise RuntimeError(f"Failed to read engine_metadata '{key}' from {self.path.name}: {e}") from e
+        with self._get_conn() as conn:
+            row = conn.execute('SELECT value FROM engine_metadata WHERE key = ?', (key,)).fetchone()
+            return row[0] if row else None
 
     def set_engine_metadata(self, key: str, value: str) -> None:
         try:
