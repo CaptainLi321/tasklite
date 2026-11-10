@@ -37,18 +37,15 @@ def _make_runtime(tmp_path) -> EngineRuntime:
     from tasklite.models.job import WORKER_RESOURCE
     from tasklite.models.task import TaskRegistry
 
-    ipc_dir = str(tmp_path / "ipc")
-    Path(ipc_dir).mkdir(parents=True, exist_ok=True)
     resources = ResourceManager()
     resources[WORKER_RESOURCE] = CapacityResource(WORKER_RESOURCE, max_capacity=2.0)
     return EngineRuntime(
         config=RunConfig.resolve(
             name="testing_helper",
-            ipc_dir=ipc_dir,
             backend=InMemoryStateBackend(),
             resources=resources,
             tasks=TaskRegistry(),
-            channel=ExecutionChannel(ipc_dir),
+            channel=ExecutionChannel(),
             governor=DeadlockGovernor(),
             trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             requeue_policy=ImmediateRequeuePolicy(),
@@ -85,10 +82,9 @@ class TestFakeCtxBasics:
 class TestFakeCtxTmpRoot:
     """tmp_root 模式只提供沙盒 output_roots。"""
 
-    def test_output_root_under_tmp_root_without_fake_ipc_dir(self, tmp_path):
+    def test_output_root_under_tmp_root(self, tmp_path):
         ctx = fake_ctx(_job(), tmp_root=tmp_path)
         assert Path(ctx.output_roots).parent == tmp_path
-        assert ctx.ipc_dir is None
         assert not (Path(ctx.output_roots) / "ipc").exists()
 
     def test_declare_file_uses_explicit_output_path(self, tmp_path):
@@ -116,22 +112,10 @@ class TestFakeCtxNoSuspensionSimulation:
 class TestFakeCtxExtendedParams:
     """keyword-only 扩展参数。"""
 
-    def test_direct_ipc_dir_created(self, tmp_path):
-        ipc = str(tmp_path / "my_ipc")
-        ctx = fake_ctx(_job(), ipc_dir=ipc)
-        assert ctx.ipc_dir == ipc
-        assert Path(ipc).is_dir()
-
     def test_direct_output_root_forwarded(self, tmp_path):
         root = tmp_path / "root"
         ctx = fake_ctx(_job(), output_roots=str(root))
         assert str(ctx.output_roots) == str(root)
-
-    def test_tmp_root_with_explicit_ipc_dir_keeps_ipc(self, tmp_path):
-        ipc = str(tmp_path / "custom_ipc")
-        ctx = fake_ctx(_job(), tmp_root=tmp_path, ipc_dir=ipc)
-        assert ctx.ipc_dir == ipc
-
 
 class TestRunningHandle:
     """running 句柄：置位/复位/目标解析。"""

@@ -59,7 +59,6 @@ def fake_ctx(
     cursors: dict[str, str] | None = None,
     tmp_root: Any | None = None,
     output_roots: Any | None = None,
-    ipc_dir: str | None = None,
     base_dir: str | Path | None = None,
     known_job_uids: Iterable[str] | None = None,
     files: Mapping[str, Any] | None = None,
@@ -77,7 +76,6 @@ def fake_ctx(
             目录清理由调用方的 tmp_root 机制（如 pytest tmp_path 的会话级
             回收）统一承担。
         output_roots: 直接指定产物根目录（与 tmp_root 互斥使用）。
-        ipc_dir: 直接指定 IPC 目录（caller 选定目录，非 tmp_root 子目录）。
         base_dir: 相对路径解析基准目录（默认当前工作目录）。
         known_job_uids: 允许被引用的已知 Job UID 集合（派生校验用）。
         files: 预声明文件规范字典（默认继承 job.files）。
@@ -88,15 +86,12 @@ def fake_ctx(
     if tmp_root is not None:
         base = Path(tempfile.mkdtemp(dir=str(tmp_root)))
         output_roots = base
-    if ipc_dir is not None:
-        Path(ipc_dir).mkdir(parents=True, exist_ok=True)
     return JobContext(
         job,
         set(successes) if successes is not None else set(),
         set(failed) if failed is not None else set(),
         dict(cursors) if cursors is not None else {},
         output_roots=Path(output_roots) if isinstance(output_roots, str) else output_roots,
-        ipc_dir=ipc_dir,
         artifact_descriptions=artifacts,
         protected_roots=protected_roots,
         base_dir=base_dir,

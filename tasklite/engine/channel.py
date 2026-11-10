@@ -43,8 +43,6 @@ from .types import AuthorizationOutcome, JobHandle
 
 logger = logging.getLogger("tasklite")
 
-_RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
-
 
 def _parse_spawned_jobs(raw_spawned_jobs: Any) -> tuple[list[Job], str | None]:
     """解析结果负载的 spawned_jobs 字段；坏形态收敛为错误串，绝不抛 TypeError。
@@ -279,7 +277,6 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
     handler_func = spec.handler
     job = spec.job
     ctx = spec.job_context
-    ipc_dir = spec.ipc_dir
     job_uid = job.uid
     execution_id = spec.execution_id
     if not execution_id:
@@ -409,7 +406,6 @@ class WorkerLaunchSpec:
     job_context: JobContext
     execution_id: str
     timeout_seconds: float
-    ipc_dir: str | None = None
     pipe_sender: WorkerPipeSender | None = None
     reply_receiver: WorkerReplyReceiver | None = None
     run_id: str = ""
@@ -436,14 +432,12 @@ class ExecutionChannel:
 
     def __init__(
         self,
-        ipc_dir: str | Path | None = None,
         *,
         process_context: Any | None = None,
         output_roots: str | Path | Sequence[str | Path] | None = None,
         protected_roots: Sequence[str | Path] = (),
     ) -> None:
         self._process_context = process_context or mp.get_context("spawn")
-        self.ipc_dir = str(ipc_dir) if ipc_dir is not None else None
         self.output_roots = output_roots
         self.protected_roots = tuple(protected_roots)
         self._receivers: dict[str, WorkerPipeReceiver] = {}
@@ -456,11 +450,6 @@ class ExecutionChannel:
         self._errors: dict[str, Exception] = {}
         self._lingering_workers: list[tuple[str, Any, WorkerPipeReceiver | None]] = []
         self._health_stops: dict[str, threading.Event] = {}
-        if self.ipc_dir:
-            try:
-                Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
-            except OSError:
-                pass
 
     @staticmethod
     def _terminate_and_join_process(p: Any) -> None:
@@ -493,15 +482,6 @@ class ExecutionChannel:
 
     def spawn(self, spec: WorkerLaunchSpec) -> JobHandle:
         """启动隔离子进程执行 handler，建立瞬时管道与 execution_id 绑定，立即返回句柄。"""
-        effective_ipc_dir = spec.ipc_dir or self.ipc_dir or os.environ.get(_RESULT_DIR_ENV)
-        if effective_ipc_dir:
-            try:
-                Path(effective_ipc_dir).mkdir(parents=True, exist_ok=True)
-            except OSError:
-                pass
-            if self.ipc_dir is None:
-                self.ipc_dir = str(effective_ipc_dir)
-        spec.job_context.ipc_dir = effective_ipc_dir
         receiver, sender = create_worker_pipe(
             self._process_context,
             job_uid=spec.job.uid,
@@ -553,7 +533,6 @@ class ExecutionChannel:
             timeout_at_monotonic=timeout_at_monotonic,
             timeout_seconds=spec.timeout_seconds,
             job=spec.job,
-            ipc_dir=effective_ipc_dir,
             execution_id=spec.execution_id,
             run_id=spec.run_id or None,
             attempt_no=spec.attempt_no,

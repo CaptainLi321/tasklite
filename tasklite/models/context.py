@@ -38,7 +38,6 @@ class JobContext:
         failed_job_uids: set | frozenset,
         cursors: dict[str, str],
         output_roots: str | Path | Sequence[str | Path] | None = None,
-        ipc_dir: str | None = None,
         artifact_descriptions: dict[str, dict[str, dict[str, str]]] | None = None,
         protected_roots: tuple[str | Path, ...] = (),
         base_dir: str | Path | None = None,
@@ -86,7 +85,6 @@ class JobContext:
         # output_roots 支持多根（跨盘输出场景）——解析时
         # 路径属于**任一**根即通过沙盒校验。
         self.output_roots = output_roots
-        self.ipc_dir = ipc_dir
 
     def _bind_pipe_sender(
         self,

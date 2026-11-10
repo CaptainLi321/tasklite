@@ -35,7 +35,6 @@ class RunConfig:
     requeue_policy: RequeuePolicy
     ordering_policy: OrderingPolicy
     name: str = "tasklite"
-    ipc_dir: str | None = None
     output_roots: Path | Sequence[Path] | None = None
     protected_roots: tuple[Path, ...] = ()
 
@@ -50,7 +49,6 @@ class RunConfig:
         governor: DeadlockGovernor,
         trigger_registry: TriggerRegistry,
         name: str = "tasklite",
-        ipc_dir: str | None = None,
         requeue_policy: RequeuePolicy | None = None,
         ordering_policy: OrderingPolicy | None = None,
         output_roots: Path | Sequence[Path] | None = None,
@@ -59,7 +57,6 @@ class RunConfig:
         """按引用装配依赖，并解析内部策略默认值。"""
         return cls(
             name=name,
-            ipc_dir=ipc_dir,
             protected_roots=protected_roots,
             backend=backend,
             resources=resources,

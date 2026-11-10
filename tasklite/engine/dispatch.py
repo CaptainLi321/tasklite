@@ -119,7 +119,6 @@ class DispatchMachine:
         completion: "CompletionMachine",
         tasks: "TaskSource",
         output_roots: "Path | Sequence[Path] | None",
-        ipc_dir: str | None = None,
         protected_roots: tuple[Path, ...] = (),
         dispatch_start_lock: Any | None = None,
     ) -> None:
@@ -134,7 +133,6 @@ class DispatchMachine:
         self._completion = completion
         self._tasks = tasks
         self._output_roots = output_roots
-        self._ipc_dir = ipc_dir
         self._protected_roots = protected_roots
         self._path_policy = ArtifactPathPolicy(
             output_roots=output_roots,
@@ -595,7 +593,6 @@ class DispatchMachine:
                     job=job,
                     job_context=ctx,
                     execution_id=execution_id,
-                    ipc_dir=self._ipc_dir,
                     timeout_seconds=float(
                         job.timeout_seconds if job.timeout_seconds is not None else 3600.0
                     ),
@@ -659,7 +656,6 @@ class DispatchMachine:
             frozenset(state.failed_uids),
             dict(state.cursors),
             output_roots=self._output_roots,
-            ipc_dir=self._ipc_dir,
             protected_roots=self._protected_roots,
             base_dir=self._trigger_registry.base_dir,
             known_job_uids=frozenset(

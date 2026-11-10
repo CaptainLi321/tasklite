@@ -210,7 +210,6 @@ class TaskLite:
         """RunConfig 静态装配快照。"""
         return RunConfig.resolve(
             name="tasklite",
-            ipc_dir=None,
             protected_roots=((self.state_path,) if self.state_path is not None else ()),
             backend=backend,
             resources=self.resources,

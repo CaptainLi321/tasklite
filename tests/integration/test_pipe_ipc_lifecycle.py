@@ -117,10 +117,11 @@ def invalid_frame_handler(job: Job, ctx) -> TaskResult:
 def pipelines(tmp_path):
     created: list[TaskLite] = []
 
-    def create() -> TaskLite:
+    def create(backend="sqlite") -> TaskLite:
+        options = {"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}
         pipeline = TaskLite(
-            backend="sqlite",
-            state_path=tmp_path / "state.db",
+            backend=backend,
+            **options,
             output_roots=tmp_path / "output",
             max_workers=1,
         )
@@ -142,9 +143,41 @@ def pipelines(tmp_path):
         t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")
     ]
     assert not active_recv_threads
-    ipc_dir = tmp_path / "state" / "ipc"
-    if ipc_dir.exists():
-        assert not list(ipc_dir.glob("*.json*"))
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_spawn_and_declarations_ignore_directory_environment(tmp_path, monkeypatch, backend):
+    ipc_path = tmp_path / "unused" / "ipc"
+    monkeypatch.setenv("TASKLITE_IPC_DIR", str(ipc_path))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    output = workspace / "output"
+    output.mkdir()
+    options = {"state_path": workspace / "state.db"} if backend == "sqlite" else {}
+    with TaskLite(backend=backend, output_roots=output, max_workers=1, **options) as pipeline:
+        pipeline.register_task("parent", success_handler)
+        pipeline.register_task("child", child_handler)
+        pipeline.enqueue(Job("parent", "parent"))
+        pipeline.run()
+        state = pipeline._runtime.store.backend
+        success = state.load_successes()["parent::parent"]
+        assert success["result"]["metadata"]["worker_pid"] != os.getpid()
+        assert success["inputs"] == [str(output / "published.txt")]
+        assert success["artifacts"]["report"]["path"] == str(output / "published.txt")
+        assert state.load_cursors()["position"] == "42"
+        assert set(state.load_successes()) == {"parent::parent", "child::child"}
+        attempt, = state.load_settled_attempts("parent::parent")
+        assert attempt["outcome"] == "success"
+        pipeline.stop()
+        assert pipeline._runtime.channel._handles == {}
+        assert pipeline._runtime.channel._receivers == {}
+        assert not ipc_path.parent.exists()
+    assert not ipc_path.parent.exists()
+    assert not mp.active_children()
+    assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
+    if backend == "memory":
+        assert set(workspace.iterdir()) == {output}
 
 
 def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch, tmp_path):
@@ -315,10 +348,11 @@ def test_cleanup_error_fails_without_publishing_success(pipelines, monkeypatch, 
     assert (tmp_path / "output" / "temporary.txt").exists()
 
 
-def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_path):
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_path, backend):
     sync_dir = tmp_path / "sync"
     sync_dir.mkdir(parents=True, exist_ok=True)
-    pipeline = pipelines()
+    pipeline = pipelines(backend)
     pipeline.register_task("controlled", controlled_handler)
     pipeline.enqueue(Job("controlled", "active", payload={"sync_dir": str(sync_dir)}))
     pipeline.enqueue(Job("child", "waiting"))
@@ -372,8 +406,9 @@ def test_stop_commits_complete_result_already_received(pipelines, monkeypatch):
 
 
 @pytest.mark.parametrize("fault", ["json", "kind", "job_uid", "execution_id"])
-def test_invalid_message_cannot_register_success(pipelines, tmp_path, fault):
-    pipeline = pipelines()
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_invalid_message_cannot_register_success(pipelines, tmp_path, fault, backend):
+    pipeline = pipelines(backend)
     pipeline.register_task("invalid", invalid_frame_handler)
     pipeline.enqueue(Job("invalid", "invalid", payload={"fault": fault}))
     with pytest.raises(ValueError):

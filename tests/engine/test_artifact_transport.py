@@ -47,15 +47,13 @@ def _drain_result_payload(receiver) -> dict:
 )
 def test_spawn_worker_preserves_error_boundary(tmp_path, handler, infrastructure):
     job = Job("transport", "one")
-    ipc_dir = tmp_path / "ipc"
-    ipc_dir.mkdir()
-    ctx = JobContext(job, set(), set(), {}, ipc_dir=str(ipc_dir))
+    ctx = JobContext(job, set(), set(), {})
     mp_ctx = mp.get_context("spawn")
     receiver, sender = create_worker_pipe(
         mp_ctx, job_uid=job.uid, execution_id="session.1"
     )
     spec = WorkerLaunchSpec(
-        handler, job, ctx, "session.1", str(ipc_dir), 10.0, pipe_sender=sender
+        handler, job, ctx, "session.1", 10.0, pipe_sender=sender
     )
     process = mp_ctx.Process(target=_worker_process_entry, args=(spec,))
     process.start()
@@ -100,7 +98,6 @@ def test_worker_cannot_swallow_declaration_environment_fault(tmp_path):
         job,
         ctx,
         "session.1",
-        str(tmp_path),
         10.0,
         pipe_sender=sender,
     )
@@ -140,9 +137,7 @@ def test_public_declaration_write_fault_bypasses_handler_exception(tmp_path, kin
     if kind == "input":
         path.write_text("input")
     job = Job("transport", "inline", payload={"kind": kind, "path": str(path)})
-    ipc = tmp_path / "ipc"
-    ipc.mkdir()
-    ctx = JobContext(job, set(), set(), {}, output_roots=tmp_path, ipc_dir=str(ipc))
+    ctx = JobContext(job, set(), set(), {}, output_roots=tmp_path)
     receiver, sender = create_worker_pipe(job_uid=job.uid, execution_id="session.1")
     reply_receiver, reply_sender = create_worker_reply_pipe(job_uid=job.uid, execution_id="session.1")
     spec = WorkerLaunchSpec(
@@ -150,7 +145,6 @@ def test_public_declaration_write_fault_bypasses_handler_exception(tmp_path, kin
         job,
         ctx,
         "session.1",
-        str(ipc),
         10.0,
         pipe_sender=sender,
         reply_receiver=reply_receiver,

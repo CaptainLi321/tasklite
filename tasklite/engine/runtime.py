@@ -134,7 +134,6 @@ class EngineRuntime:
             completion=self._completion,
             tasks=config.tasks,
             output_roots=config.output_roots,
-            ipc_dir=config.ipc_dir,
             protected_roots=config.protected_roots,
             dispatch_start_lock=self._dispatch_start_lock,
         )
@@ -549,16 +548,6 @@ class EngineRuntime:
                     raise TaskLiteError(
                         f"Another run() or management operation is in progress for "
                         f"{self.store.backend.path}; concurrent runs on the same "
-                        f"state are forbidden."
-                    )
-            elif self.config.ipc_dir is not None:
-                self._run_lock_fd = try_acquire_lock(
-                    self.config.ipc_dir, "__pipeline_run__", timeout=0
-                )
-                if self._run_lock_fd is None:
-                    raise TaskLiteError(
-                        f"Another run() is in progress for state_dir "
-                        f"{self.config.ipc_dir}; concurrent runs on the same "
                         f"state are forbidden."
                     )
             else:

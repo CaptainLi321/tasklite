@@ -7,7 +7,6 @@
 import json
 import time
 from datetime import datetime
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -33,14 +32,13 @@ _EXECUTION_ID = "deadbeefdeadbeefdeadbeefdeadbeef.1"
 
 
 def make_ctx(job: Job) -> JobContext:
-    """最小 JobContext 装配（声明默认空，ipc_dir 由 spawn 回填）。"""
+    """最小 JobContext 装配（声明默认空）。"""
     return JobContext(job, success_job_uids=set(), failed_job_uids=set(), cursors={})
 
 
 def make_spec(
     job: Job,
     handler,
-    ipc_dir,
     execution_id: str | None = _EXECUTION_ID,
     *,
     pipe_sender: WorkerPipeSender | None = None,
@@ -51,22 +49,14 @@ def make_spec(
         job=job,
         job_context=job_context if job_context is not None else make_ctx(job),
         execution_id=execution_id,  # type: ignore[arg-type]
-        ipc_dir=str(ipc_dir) if ipc_dir is not None else None,
         timeout_seconds=60.0,
         pipe_sender=pipe_sender,
     )
 
 
 class TestExecutionChannelBasics:
-    def test_init_and_directory_creation(self, tmp_path):
-        ipc_dir = tmp_path / "ipc"
-        assert not ipc_dir.exists()
-        channel = ExecutionChannel(ipc_dir)
-        assert ipc_dir.exists()
-        assert channel.ipc_dir == str(ipc_dir)
-
     def test_duplicate_result_frame_keeps_first_payload(self, tmp_path):
-        channel = ExecutionChannel(tmp_path)
+        channel = ExecutionChannel()
         job = Job("t", "duplicate")
         handle = JobHandle(
             job_uid=job.uid,
@@ -74,7 +64,6 @@ class TestExecutionChannelBasics:
             timeout_at_monotonic=time.monotonic() + 10,
             timeout_seconds=10,
             job=job,
-            ipc_dir=str(tmp_path),
             execution_id=_EXECUTION_ID,
         )
         first = {
@@ -109,7 +98,6 @@ class TestWorkerWrapper:
     def _run_worker(
         job: Job,
         handler,
-        ipc_dir,
         execution_id: str = _EXECUTION_ID,
         *,
         job_context: JobContext | None = None,
@@ -119,7 +107,6 @@ class TestWorkerWrapper:
             spec = make_spec(
                 job,
                 handler,
-                ipc_dir,
                 execution_id=execution_id,
                 pipe_sender=sender,
                 job_context=job_context,
@@ -139,7 +126,7 @@ class TestWorkerWrapper:
 
     def test_worker_writes_success_over_pipe(self, tmp_path):
         job = Job("t", "x")
-        data = self._run_worker(job, lambda j, c: TaskResult.success(metadata={"ok": 1}), tmp_path)
+        data = self._run_worker(job, lambda j, c: TaskResult.success(metadata={"ok": 1}))
         assert data["status"] == "success"
         assert data["metadata"] == {"ok": 1}
 
@@ -156,14 +143,14 @@ class TestWorkerWrapper:
             (raise_system_exit, "failure", "yexit"),
         ):
             job = Job("t", job_id)
-            data = self._run_worker(job, handler, tmp_path)
+            data = self._run_worker(job, handler)
             assert data["status"] == want_status
 
     def test_worker_rejects_missing_execution_id(self, tmp_path):
         """execution_id 缺失 fail-loud（fencing 契约破坏不得静默产出无名结果）。"""
         job = Job("t", "x")
         with pytest.raises(RuntimeError, match="execution_id"):
-            _worker_process_entry(make_spec(job, lambda j, c: TaskResult.success(), tmp_path, execution_id=None))
+            _worker_process_entry(make_spec(job, lambda j, c: TaskResult.success(), execution_id=None))
 
     def test_retry_carries_consume_budget(self, tmp_path):
         """retry 结果携带 consume_budget 经 Pipe 传递。"""
@@ -178,7 +165,7 @@ class TestWorkerWrapper:
             (burn_budget, "bb", True),
         ):
             job = Job("h", job_id)
-            res = self._run_worker(job, handler, tmp_path)
+            res = self._run_worker(job, handler)
             assert res["status"] == "retry"
             assert res["consume_budget"] is want_consume
 
@@ -187,7 +174,7 @@ class TestWorkerWrapper:
             raise KeyboardInterrupt()
 
         job = Job("h", "ki")
-        res = self._run_worker(job, interrupted, tmp_path)
+        res = self._run_worker(job, interrupted)
         assert res["status"] == "failure"
         assert res["message"] == "KeyboardInterrupt"
         assert res["exception"]["type"] == "KeyboardInterrupt"
@@ -196,7 +183,7 @@ class TestWorkerWrapper:
         """未捕获异常统一结算为 failure，记录 type/message/traceback，不自动重试。"""
         job = Job("h", "err")
         res = self._run_worker(
-            job, lambda j, c: (_ for _ in ()).throw(ValueError("boom")), tmp_path,
+            job, lambda j, c: (_ for _ in ()).throw(ValueError("boom")),
         )
         assert res["status"] == "failure"
         assert res["message"] == "ValueError: boom"
@@ -214,67 +201,12 @@ class TestWorkerWrapper:
         receiver, sender = create_worker_pipe(job_uid=job.uid, execution_id=_EXECUTION_ID)
         try:
             _worker_process_entry(make_spec(
-                job, lambda j, c: (True, {}), tmp_path, pipe_sender=sender
+                job, lambda j, c: (True, {}), pipe_sender=sender
             ))
             assert receiver.drain_to_eof(timeout=3.0) == []
         finally:
             sender.close()
             receiver.close()
-
-
-class TestEnvFallbackIpcDirCoherence:
-    """env 兜底 ipc_dir：解析成功必须回写实例属性，收割路径同源可用。"""
-
-    def test_env_fallback_spawn_reap_probe_share_same_ipc_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("TASKLITE_IPC_DIR", str(tmp_path))
-
-        class ResultWritingProcess:
-            """start() 时经 spec.pipe_sender 发送 success 结果的进程桩。"""
-
-            def __init__(self, target=None, args=(), kwargs=None, **_kw):
-                self.args = args
-                self._alive = False
-                self.exitcode = 0
-
-            def start(self):
-                spec = self.args[0]
-                self._alive = True
-                assert spec.pipe_sender is not None
-                spec.pipe_sender.send_result(
-                    {
-                        "status": "success",
-                        "metadata": {},
-                        "spawned_jobs": [],
-                        "cursor_updates": {},
-                    }
-                )
-
-            def join(self, timeout=None):
-                self._alive = False
-
-            def is_alive(self):
-                return self._alive
-
-            def kill(self):
-                self._alive = False
-
-        fake_process_context = type("Ctx", (), {"Process": ResultWritingProcess})()
-        channel = ExecutionChannel(process_context=fake_process_context)
-
-        job = Job("t", "x")
-        try:
-            handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), None))
-
-            # 实例属性与 handle 的派发路径同源
-            assert channel.ipc_dir == str(tmp_path), (
-                "env 兜底解析成功后必须回写实例属性（收割路径的事实源）"
-            )
-            assert handle.ipc_dir == str(tmp_path)
-
-            completed = channel.reap_completed([handle])
-            assert [(h.job_uid, r.success) for h, r in completed] == [("t::x", True)]
-        finally:
-            channel.close()
 
 
 class TestSpawnFailureCleanup:
@@ -283,13 +215,12 @@ class TestSpawnFailureCleanup:
             def Process(self, *args, **kwargs):
                 raise RuntimeError("process start failed")
 
-        channel = ExecutionChannel(process_context=ExplodingCtx(), ipc_dir=str(tmp_path))
+        channel = ExecutionChannel(process_context=ExplodingCtx())
         job = Job("t", "j1")
         with pytest.raises(RuntimeError, match="process start failed"):
-            channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), tmp_path))
+            channel.spawn(make_spec(job, lambda j, c: TaskResult.success()))
 
-    def test_submit_without_ipc_dir(self, monkeypatch):
-        monkeypatch.delenv("TASKLITE_IPC_DIR", raising=False)
+    def test_submit_starts_process(self):
         started = []
         class DummyProcess:
             def start(self):
@@ -299,7 +230,7 @@ class TestSpawnFailureCleanup:
         )
         job = Job("t", "j1")
         try:
-            handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success(), None))
+            handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success()))
             assert handle is not None
             assert started == [True]
         finally:
@@ -324,7 +255,7 @@ class TestHandlerInvalidReturnTypes:
     def test_non_task_result_rejected_as_failure(self, tmp_path, bad_return):
         job = Job("t", "bad")
         data = TestWorkerWrapper._run_worker(
-            job, lambda j, c: bad_return, tmp_path
+            job, lambda j, c: bad_return
         )
         assert data["status"] == "failure"
         assert "invalid handler return type: expected TaskResult" in data["message"]
@@ -477,11 +408,11 @@ class TestDecodeConvergencePaths:
 
     def test_reap_completed_contains_scalar_new_jobs_corruption(self, tmp_path):
         job = Job("t", "a")
-        channel = ExecutionChannel(tmp_path)
+        channel = ExecutionChannel()
         channel._results[_EXECUTION_ID] = dict(self._SCALAR_CORRUPT)
         handle = JobHandle(
             job_uid=job.uid, process=self._DeadProcess(), timeout_at_monotonic=1.0, timeout_seconds=5.0,
-            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
+            job=job, execution_id=_EXECUTION_ID,
         )
         completed = channel.reap_completed([handle])
         assert len(completed) == 1, "损坏任务必须被收割而非打断收割循环"
@@ -502,7 +433,6 @@ class TestBuildTerminalFailureDefense:
             timeout_at_monotonic=1.0,
             timeout_seconds=5.0,
             job=Job("t", "a"),
-            ipc_dir="/tmp",
         )
 
     def test_timeout_marks_failed_without_retry(self):
@@ -584,9 +514,9 @@ class TestWatchdogReap:
         handle = JobHandle(
             job_uid=job.uid, process=self._HungProcess(),
             timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
-            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
+            job=job, execution_id=_EXECUTION_ID,
         )
-        completed = ExecutionChannel(tmp_path).reap_completed([handle])
+        completed = ExecutionChannel().reap_completed([handle])
         assert len(completed) == 1
         result = completed[0][1]
         assert result.success is False
@@ -600,9 +530,9 @@ class TestWatchdogReap:
         handle = JobHandle(
             job_uid=job.uid, process=self._DyingDuringJoinProcess(),
             timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
-            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
+            job=job, execution_id=_EXECUTION_ID,
         )
-        completed = ExecutionChannel(tmp_path).reap_completed([handle])
+        completed = ExecutionChannel().reap_completed([handle])
         result = completed[0][1]
         assert "timed out" in (result.message or "")
         assert result.retry_requested is False
@@ -617,9 +547,9 @@ class TestWatchdogReap:
         handle = JobHandle(
             job_uid=job.uid, process=self._DyingDuringJoinProcess(exitcode),
             timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
-            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
+            job=job, execution_id=_EXECUTION_ID,
         )
-        completed = ExecutionChannel(tmp_path).reap_completed([handle])
+        completed = ExecutionChannel().reap_completed([handle])
         result = completed[0][1]
         assert result.success is False
         assert result.retry_requested is False
@@ -629,7 +559,7 @@ class TestWatchdogReap:
     def test_completed_result_reaped_before_deadline(self, tmp_path):
         """结果已到达且进程仍活 → 直接按结果收割（不等 timeout_at_monotonic）。"""
         job = Job("t", "fast")
-        channel = ExecutionChannel(tmp_path)
+        channel = ExecutionChannel()
         channel._results[_EXECUTION_ID] = {
             "status": "success",
             "metadata": {},
@@ -639,7 +569,7 @@ class TestWatchdogReap:
         handle = JobHandle(
             job_uid=job.uid, process=self._HungProcess(),
             timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0,
-            job=job, ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
+            job=job, execution_id=_EXECUTION_ID,
         )
         completed = channel.reap_completed([handle])
         assert [(h.job_uid, r.success) for h, r in completed] == [("t::fast", True)]
@@ -691,9 +621,7 @@ class TestAbortInFlight:
             pass
 
     def test_abort_with_completed_and_cancelled(self, tmp_path):
-        ipc_dir = tmp_path / "ipc"
-        ipc_dir.mkdir()
-        channel = ExecutionChannel(ipc_dir, output_roots=tmp_path)
+        channel = ExecutionChannel(output_roots=tmp_path)
         job_done = Job("task", "done")
         job_pending = Job("task", "pending")
         unfinished = tmp_path / "unfinished"
@@ -707,12 +635,12 @@ class TestAbortInFlight:
         h_done = JobHandle(
             job_uid=job_done.uid, process=self.MockProcess(),
             timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job_done,
-            ipc_dir=str(ipc_dir), execution_id="inc_done",
+            execution_id="inc_done",
         )
         h_pending = JobHandle(
             job_uid=job_pending.uid, process=self.MockProcess(),
             timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job_pending,
-            ipc_dir=str(ipc_dir), execution_id="inc_pending",
+            execution_id="inc_pending",
         )
 
         outcome = channel.abort_in_flight([h_done, h_pending])
@@ -727,7 +655,7 @@ class TestAbortInFlight:
 
     def test_abort_reprobe_consumes_result_written_on_kill(self, tmp_path):
         """重探测完成分支：终前写入的结果仍被消费。"""
-        channel = ExecutionChannel(tmp_path)
+        channel = ExecutionChannel()
         job = Job("task", "reprobe")
 
         class FinishOnKillProcess:
@@ -755,7 +683,7 @@ class TestAbortInFlight:
         h = JobHandle(
             job_uid=job.uid, process=FinishOnKillProcess(),
             timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
-            ipc_dir=str(tmp_path), execution_id="inc_reprobe",
+            execution_id="inc_reprobe",
         )
 
         outcome = channel.abort_in_flight([h])
@@ -765,7 +693,7 @@ class TestAbortInFlight:
 
     def test_abort_interrupted_status_settles_failure(self, tmp_path):
         """不支持的 interrupted 状态按一次损坏结果失败结算。"""
-        channel = ExecutionChannel(tmp_path)
+        channel = ExecutionChannel()
         job = Job("task", "interrupted")
         channel._results["inc_interrupted"] = {
             "status": "interrupted",
@@ -774,7 +702,7 @@ class TestAbortInFlight:
         h = JobHandle(
             job_uid=job.uid, process=self.MockProcess(),
             timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
-            ipc_dir=str(tmp_path), execution_id="inc_interrupted",
+            execution_id="inc_interrupted",
         )
 
         outcome = channel.abort_in_flight([h])
@@ -788,7 +716,7 @@ class TestAbortInFlight:
         assert outcome.cancelled == []
 
     def test_abort_empty_handles_returns_empty_outcome(self, tmp_path):
-        channel = ExecutionChannel(tmp_path)
+        channel = ExecutionChannel()
         outcome = channel.abort_in_flight([])
         assert outcome.completed == []
         assert outcome.cancelled == []
@@ -796,13 +724,13 @@ class TestAbortInFlight:
 
 class TestCleanupInFlight:
     def test_cleanup_in_flight_kills_and_clears_channel_state(self, tmp_path):
-        channel = ExecutionChannel(tmp_path)
+        channel = ExecutionChannel()
         job = Job("task", "residual")
         channel._results[_EXECUTION_ID] = {"status": "success"}
         handle = JobHandle(
             job_uid=job.uid, process=TestAbortInFlight.MockProcess(),
             timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
-            ipc_dir=str(tmp_path), execution_id=_EXECUTION_ID,
+            execution_id=_EXECUTION_ID,
         )
 
         channel.cleanup_in_flight([handle])

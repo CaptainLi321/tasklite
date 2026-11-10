@@ -12,7 +12,6 @@ from collections import defaultdict
 
 from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -59,8 +58,6 @@ class CompletionEnv:
     """完成机器窄依赖装配（字段即依赖清单）。"""
 
     def __init__(self, tmp_path, *, extra_resources=None):
-        self.ipc_dir = str(tmp_path / "ipc")
-        Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
 
         resources_map = {
             "__workers__": CapacityResource("__workers__", max_capacity=2.0),
@@ -83,7 +80,7 @@ class CompletionEnv:
         )
         self.session = StubSession()
         self.in_flight = InFlightTracker()
-        self.channel = ExecutionChannel(self.ipc_dir)
+        self.channel = ExecutionChannel()
         self.completion = CompletionMachine(
             store=self.store,
             trigger_registry=self.trigger_registry,
@@ -149,7 +146,6 @@ class CompletionEnv:
             timeout_at_monotonic=1e18,
             timeout_seconds=60.0,
             job=Job(*uid.split("::", 1)),
-            ipc_dir=self.ipc_dir,
             execution_id=f"{self.session.run_id}.1",
         )
 

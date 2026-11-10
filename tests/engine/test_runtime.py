@@ -6,7 +6,6 @@ from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,6 +14,7 @@ import pytest
 from tasklite import TaskLiteError
 
 from tasklite.backend.memory import InMemoryStateBackend
+from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.engine.admission import ImmediateRequeuePolicy, TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.config import RunConfig
@@ -163,10 +163,12 @@ class RuntimeEnv:
         *,
         name: str = "test_runtime",
         capacity: float = 2.0,
+        persistent: bool = False,
     ):
-        self.ipc_dir = str(tmp_path / "ipc")
-        Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
-        self.backend = InMemoryStateBackend()
+        self.backend = (
+            SQLiteStateBackend(tmp_path / "state.db")
+            if persistent else InMemoryStateBackend()
+        )
         self.resources = ResourceManager(
             {WORKER_RESOURCE: CapacityResource(WORKER_RESOURCE, max_capacity=capacity)}
         )
@@ -174,11 +176,10 @@ class RuntimeEnv:
         self.runtime = EngineRuntime(
             config=RunConfig.resolve(
                 name=name,
-                ipc_dir=self.ipc_dir,
                 backend=self.backend,
                 resources=self.resources,
                 tasks=self.tasks,
-                channel=ExecutionChannel(self.ipc_dir),
+                channel=ExecutionChannel(),
                 governor=DeadlockGovernor(),
                 trigger_registry=TriggerRegistry(
                     tasks=self.tasks,
@@ -328,19 +329,27 @@ class TestEngineRuntimeExecutionLifecycle:
         assert env_ok.runtime.execute() is None
 
 
-    def test_concurrent_run_lock_rejection(self, tmp_path):
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_concurrent_run_lock_rejection(self, tmp_path, persistent):
         from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
-        env1 = RuntimeEnv(tmp_path, name="test_lock")
-        # 模拟同 state_dir 已有 run 持锁
-        lock_fd = try_acquire_lock(env1.ipc_dir, "__pipeline_run__")
-        assert lock_fd is not None
+        env = RuntimeEnv(tmp_path, name="test_lock", persistent=persistent)
+        if persistent:
+            lock_fd = try_acquire_lock(env.backend.path)
+            assert lock_fd is not None
+        else:
+            env.backend._exec_lock = threading.Lock()
+            assert env.backend._exec_lock.acquire(blocking=False)
         try:
-            env2 = RuntimeEnv(tmp_path, name="test_lock")
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):
-                env2.runtime.execute()
+                env.runtime.execute()
         finally:
-            release_lock(lock_fd)
+            if persistent:
+                release_lock(lock_fd)
+            else:
+                env.backend._exec_lock.release()
+        assert env.runtime.execute() is None
+        env.backend.close()
 
 
 class TestEngineRuntimeInitFailureSafety:
@@ -357,10 +366,10 @@ class TestEngineRuntimeInitFailureSafety:
         import tasklite.engine.runtime as runtime_module
 
         env = RuntimeEnv(
-            tmp_path, name="test_env_failure",
+            tmp_path, name="test_env_failure", persistent=True,
         )
 
-        def _raise_env_failure(ipc_dir, uid, *, timeout=0):
+        def _raise_env_failure(state_path, *, timeout=0):
             raise OSError(13, "Permission denied")
 
         monkeypatch.setattr(runtime_module, "try_acquire_lock", _raise_env_failure)
@@ -387,7 +396,7 @@ class TestEngineRuntimeInitFailureSafety:
         import tasklite.engine.runtime as runtime_module
         from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
-        env = RuntimeEnv(tmp_path, name="test_init_interrupt")
+        env = RuntimeEnv(tmp_path, name="test_init_interrupt", persistent=True)
 
         class _InstallSignalInterrupt:
             """信号陷阱安装点抛 KeyboardInterrupt 的确定性故障注入。
@@ -411,8 +420,8 @@ class TestEngineRuntimeInitFailureSafety:
         assert not env.runtime.is_running
         assert env.runtime._run_lock_fd is None
 
-        # 直接验证 __pipeline_run__ 锁可再次获取（无 fd 泄漏）
-        lock_fd = try_acquire_lock(env.ipc_dir, "__pipeline_run__", timeout=0)
+        # 直接验证状态库锁可再次获取（无 fd 泄漏）
+        lock_fd = try_acquire_lock(env.backend.path, timeout=0)
         assert lock_fd is not None
         release_lock(lock_fd)
 

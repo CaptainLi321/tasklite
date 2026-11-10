@@ -1,6 +1,5 @@
 """公开文件声明、固定路径基准与上游产物引用契约。"""
 
-from pathlib import Path
 
 import pytest
 
@@ -141,7 +140,7 @@ def test_unpublished_dynamic_reference_fails_without_recording(tmp_path):
 
 
 def test_declaration_write_error_propagates(tmp_path):
-    ctx = fake_ctx(Job("build", "one"), ipc_dir=str(tmp_path / "ipc"))
+    ctx = fake_ctx(Job("build", "one"))
     receiver, sender = create_worker_pipe(
         job_uid=ctx.job.uid,
         execution_id="exec_err",

@@ -132,9 +132,7 @@ class _FinishOnKillProcess:
 
 class TestAbortInFlight:
     def _make(self, tmp_path, *, resource_mgr=None):
-        ipc_dir = tmp_path / "ipc"
-        ipc_dir.mkdir(parents=True, exist_ok=True)
-        channel = ExecutionChannel(ipc_dir)
+        channel = ExecutionChannel()
         resource_mgr = resource_mgr if resource_mgr is not None else ResourceManager(
             {"api": CapacityResource("api", max_capacity=1.0)}
         )
@@ -170,7 +168,7 @@ class TestAbortInFlight:
         handle = JobHandle(
             job_uid=job.uid, process=process,
             timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
-            ipc_dir=str(tmp_path / "ipc"), execution_id=_INCARNATION,
+            execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
         tracker.track(InFlightJob(
@@ -199,7 +197,7 @@ class TestAbortInFlight:
         handle = JobHandle(
             job_uid=job.uid, process=process,
             timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
-            ipc_dir=str(tmp_path), execution_id=_INCARNATION,
+            execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
         tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], handle, None))
@@ -223,7 +221,7 @@ class TestAbortInFlight:
         handle = JobHandle(
             job_uid=job.uid, process=process,
             timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
-            ipc_dir=str(tmp_path), execution_id=_INCARNATION,
+            execution_id=_INCARNATION,
         )
         tracker = orchestrator._in_flight
         tracker.track(InFlightJob(

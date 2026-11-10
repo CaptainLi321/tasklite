@@ -1,7 +1,6 @@
 """v2 跨平台单文件锁：库级执行与管理互斥（flock 互斥）。
 
-用于主进程在指定目录（如 ipc_dir 或 state_dir）获取库级互斥锁，
-防止同目录并发执行或管理冲突。
+用于主进程按状态库路径获取库级互斥锁，防止并发执行或管理冲突。
 """
 from __future__ import annotations
 
@@ -11,18 +10,18 @@ import time
 from pathlib import Path
 
 
-def _lock_path(ipc_dir_or_path: str | Path, name: str | None = None) -> Path:
+def _lock_path(directory_or_path: str | Path, name: str | None = None) -> Path:
     """name → 锁文件路径。若 name 为 None，直接派生锁文件路径。"""
     if name is None:
-        p = Path(ipc_dir_or_path)
+        p = Path(directory_or_path)
         if p.name.endswith(".lock"):
             return p
         return Path(str(p) + ".lock")
-    return Path(ipc_dir_or_path) / f"{name}.lock"
+    return Path(directory_or_path) / f"{name}.lock"
 
 
 def try_acquire_lock(
-    ipc_dir_or_path: str | Path,
+    directory_or_path: str | Path,
     name: str | None = None,
     *,
     timeout: float = 0.0,
@@ -37,7 +36,7 @@ def try_acquire_lock(
         OSError: 锁文件打不开/建不出（权限、磁盘满等环境故障）——与
             「锁被占」语义不同，不得混入 None。
     """
-    path = _lock_path(ipc_dir_or_path, name)
+    path = _lock_path(directory_or_path, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
     deadline = None if timeout <= 0 else time.monotonic() + timeout

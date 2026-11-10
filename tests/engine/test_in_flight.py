@@ -123,7 +123,6 @@ class TestInFlightTrackerHandlesAndPseudo:
             timeout_at_monotonic=100.0,
             timeout_seconds=10.0,
             job=job_real,
-            ipc_dir="/tmp/ipc",
             execution_id="run1.1",
         )
         entry_real = InFlightJob("t::j1", job_real.to_dict(), job_real, [], handle, None)
@@ -147,7 +146,6 @@ class TestInFlightTrackerHandlesAndPseudo:
             timeout_at_monotonic=500.0,
             timeout_seconds=30.0,
             job=job,
-            ipc_dir="/tmp/ipc",
             execution_id="run9.42",
         )
         entry = InFlightJob("t::jw", job.to_dict(), job, [], handle, 470.0)

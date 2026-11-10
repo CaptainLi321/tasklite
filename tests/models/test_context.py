@@ -23,7 +23,6 @@ def _make_ctx(
     failed: set[str] | None = None,
     cursors: dict[str, str] | None = None,
     output_roots: Path | None = None,
-    ipc_dir: str | None = None,
 ) -> JobContext:
     """构造测试用 JobContext（内部容器由本工厂兜底装配）。"""
     return JobContext(
@@ -32,7 +31,6 @@ def _make_ctx(
         failed_job_uids=failed if failed is not None else set(),
         cursors=cursors if cursors is not None else {},
         output_roots=output_roots,
-        ipc_dir=ipc_dir,
     )
 
 

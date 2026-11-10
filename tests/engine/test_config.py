@@ -5,7 +5,6 @@ from __future__ import annotations
 from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
 import dataclasses
-from pathlib import Path
 
 import pytest
 
@@ -37,12 +36,10 @@ class ConfigEnv:
     """最小装配集（字段即 RunConfig 装配件清单）。"""
 
     def __init__(self, tmp_path) -> None:
-        self.ipc_dir = str(tmp_path / "ipc")
-        Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
         self.backend = InMemoryStateBackend()
         self.resources = ResourceManager()
         self.tasks = TaskRegistry()
-        self.channel = ExecutionChannel(self.ipc_dir)
+        self.channel = ExecutionChannel()
         self.governor = DeadlockGovernor()
         self.trigger_registry = TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS)
         self.requeue_policy = ImmediateRequeuePolicy()
@@ -50,7 +47,6 @@ class ConfigEnv:
     def resolve(self, **overrides) -> RunConfig:
         base = dict(
             name="test_config",
-            ipc_dir=self.ipc_dir,
             backend=self.backend,
             resources=self.resources,
             tasks=self.tasks,
@@ -78,7 +74,6 @@ class TestRunConfigResolve:
         assert config.trigger_registry is env.trigger_registry
         assert config.requeue_policy is env.requeue_policy
         assert config.name == "test_config"
-        assert config.ipc_dir == env.ipc_dir
 
 
     @pytest.mark.parametrize("field", [

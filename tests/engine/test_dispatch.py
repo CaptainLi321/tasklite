@@ -6,7 +6,6 @@ from collections import defaultdict
 
 from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -85,8 +84,6 @@ class DispatchEnv:
     """派发机器窄依赖装配（字段即依赖清单）。"""
 
     def __init__(self, tmp_path, *, capacity: float = 2.0, extra_resources=None):
-        self.ipc_dir = str(tmp_path / "ipc")
-        Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
         self.output_roots = str(tmp_path / "out")
 
         resources_map = {
@@ -104,7 +101,7 @@ class DispatchEnv:
         )
         self.session = StubSession()
         self.in_flight = InFlightTracker()
-        self.channel = ExecutionChannel(self.ipc_dir)
+        self.channel = ExecutionChannel()
         self.completion = RecordingCompletion()
         self.recovery = RecoveryOrchestrator(
             store=self.store,
@@ -135,7 +132,6 @@ class DispatchEnv:
             ),
             tasks=self.tasks,
             output_roots=self.output_roots,
-            ipc_dir=self.ipc_dir,
         )
 
     def register(self, task_type: str) -> None:
@@ -153,7 +149,6 @@ class DispatchEnv:
             timeout_at_monotonic=1e18,
             timeout_seconds=60.0,
             job=Job(*uid.split("::", 1)),
-            ipc_dir=self.ipc_dir,
             execution_id=execution_id,
         )
 

@@ -81,7 +81,6 @@ class JobHandle:
     timeout_at_monotonic: float
     timeout_seconds: float
     job: Job
-    ipc_dir: str | None = None
     execution_id: str | None = None
     run_id: str | None = None
     attempt_no: int | None = None
