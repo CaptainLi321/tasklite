@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from .store import StateStore
 
 from ..exceptions import TaskLiteError, _ArtifactIOError
-from ..models.job import Job, JobRuntimeState
+from ..models.job import Job
 from ..models.artifact import ArtifactDeclaration, FileSpec
 from ..utils.artifact import ArtifactPathPolicy
 from ..utils.clock import utc_now_iso
@@ -502,7 +502,7 @@ class CompletionMachine:
         """重试分支：预算判定、快照推进与来源登记。
 
         ``consume_budget=True`` 时消耗本 Run 的 uid 级预算；耗尽则转为失败。
-        ``consume_budget=False`` 不消耗预算，但仍推进 attempt_no。
+        新执行编号仅在下次进入 running 时分配。
         """
         consume_budget = result.consume_budget
         retry_error = result.message
@@ -520,11 +520,6 @@ class CompletionMachine:
                 }
                 if result.message is not None:
                     failure_metadata["message"] = result.message
-                rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
-                if rt_state.last_retry_error:
-                    failure_metadata["last_retry_error"] = rt_state.last_retry_error
-                if retry_error:
-                    failure_metadata["retry_error"] = retry_error
                 self._apply_failure(
                     uid,
                     job_snapshot,
@@ -540,9 +535,7 @@ class CompletionMachine:
                 return
             self._record_retry(uid)
 
-        retry_job_snapshot = self._build_retry_job_snapshot(
-            job, job_snapshot, retry_error=retry_error
-        )
+        retry_job_snapshot = copy.deepcopy(job_snapshot)
         files_dict = (
             {k: v.to_dict() for k, v in active_files.items()}
             if active_files
@@ -568,24 +561,6 @@ class CompletionMachine:
         )
         result.will_retry = True
         self._mark_retry_candidate(uid)
-
-    @staticmethod
-    def _build_retry_job_snapshot(
-        job: Job,
-        job_snapshot: dict[str, Any],
-        *,
-        retry_error: str | None,
-    ) -> dict[str, Any]:
-        """重试字典组装：保留原快照，只推进 attempt_no 与重试说明。"""
-        retry_job_snapshot = dict(job_snapshot)
-        job.attempt_no = job.attempt_no + 1
-        retry_job_snapshot.update(job.to_dict())
-        retry_job_snapshot["resources"] = dict(job_snapshot.get("resources", {}))
-        retry_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
-        if retry_error:
-            retry_state.record_retry_error(retry_error)
-        retry_job_snapshot["runtime"] = retry_state.to_dict()
-        return retry_job_snapshot
 
     def _apply_success(
         self,

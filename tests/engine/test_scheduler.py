@@ -70,7 +70,6 @@ class TestSchedFieldsMatchWhitelist:
         job = Job("t", "j", resources={"a": 1.0}, depends_on=["other::x"])
         jd = dict(job.to_dict())
         jd["attempt_no"] = 4
-        jd["activation_no"] = 2
         jd["trigger"] = "always"
         jd["payload"] = {"k": "v2"}
         assert self.scheduler._sched_fields_match(job, jd) is True

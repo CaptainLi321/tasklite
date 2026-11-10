@@ -953,7 +953,6 @@ class TestEnqueue:
         p.enqueue(Job("fetch", "a", timeout_seconds=17, payload={"timeout": "业务时限"}))
         (row,) = p._runtime.store.backend.load_queue()
         assert row["resources"]["__workers__"] == 1.0
-        assert row["first_enqueued_at"]
         assert row["timeout_seconds"] == 17
         assert "timeout" not in row
         restored = Job.from_dict(row)

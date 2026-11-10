@@ -1,18 +1,4 @@
-"""v2 端到端集成测试：真实子进程跑通全链路（无任何 fake）。
-
-覆盖六步契约的运行段全链路：spawn 子进程执行 → IPC 结果落盘 → successes
-终态（业务 meta + run_count/inputs 审计键）→ attempts 轨迹（append-only
-追溯链：activation/attempt 序号、execution_id、outcome 流转）→ 失败
-档案 → set_job_status 人工重置 → run/stop 门面收尾。handler 全部模块级
-（spawn 子进程经 pickle 接收）。
-
-激活代推进：拦截点豁免放行（every_run）推进 activation_no+1
-并重置 attempt_no=1。各通道均不得与既有激活在 (activation_no, attempt_no)
-逻辑键上撞号。
-
-故障场景补充：异常、SystemExit 与看门狗超时均单次失败，不自动重试；
-限速资源按间隔恢复，强制中止路径保留未提交产物语义。
-"""
+"""真实子进程集成：成功、失败、重试、动态派生与管理操作。"""
 from __future__ import annotations
 
 import sys
@@ -95,7 +81,7 @@ def always_transient_handler(job, ctx):
 
 
 def fail_once_then_ok_handler(job, ctx):
-    """首激活失败并写标记；档案补跑激活读到标记即成功。"""
+    """首次执行失败并写标记；人工重跑读到标记即成功。"""
     marker = ctx.output_roots / f"fail_once_marker_{job.job_id}"
     if marker.exists():
         return TaskResult.success(metadata={"recovered": True})
@@ -187,7 +173,7 @@ class TestEndToEnd:
         assert res is None
         assert "work::item_delta" in p._runtime.store.backend.load_successes()
         attempts = p._runtime.store.backend.load_settled_attempts("work::item_delta")
-        # 同一激活内重试推进：attempt_no 1→2，activation_no 不变
+        # 每次进入 running 时推进编号。
         assert [a["outcome"] for a in attempts] == ["retry", "success"]
         assert [a["attempt_no"] for a in attempts] == [1, 2]
 
@@ -216,16 +202,11 @@ class TestEndToEnd:
         assert meta["result"]["metadata"]["recovered"] is True
         assert meta["success_count"] == 1
 
-        # 档案补跑通道：failed 拦截点放行语义——激活代按轨迹最大值 +1
-        # 推进、attempt_no 归 1，与 every_run 豁免放行同构
         attempts = p._runtime.store.backend.load_settled_attempts("work::item_eps")
         assert [a["outcome"] for a in attempts] == ["failure", "success"]
         assert [a["attempt_no"] for a in attempts] == [1, 2]
-        # 补跑放行推进 attempt_no
-        logical_keys = [a["attempt_no"] for a in attempts]
-        assert len(logical_keys) == len(set(logical_keys))
 
-    def test_every_run_rerun_advances_activation_and_run_count(
+    def test_always_rerun_advances_attempt_number_and_success_count(
         self, tmp_path
     ):
         p = _make_pipeline(tmp_path)
@@ -235,8 +216,6 @@ class TestEndToEnd:
         assert first is None
         assert p._runtime.store.backend.load_successes()["work::item_eta"]["success_count"] == 1
 
-        # 第二会话重扫：successes 命中但 every_run 豁免放行 → 新激活重跑，
-        # 成功 REPLACE successes 行且 run_count 从对侧终态续数
         p.enqueue(Job("work", "item_eta", trigger="always"))
         second = p.run()
         p.stop()

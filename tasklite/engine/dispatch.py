@@ -367,7 +367,7 @@ class DispatchMachine:
                 run_id=effective_run_id,
                 started_at=started_at,
             )
-            job.attempt_no = attempt_no
+            job._attempt_no = attempt_no
             job_snapshot["attempt_no"] = attempt_no
             job_snapshot["run_id"] = effective_run_id
             job_snapshot["started_at"] = started_at

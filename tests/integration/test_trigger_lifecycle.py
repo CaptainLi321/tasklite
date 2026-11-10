@@ -251,7 +251,7 @@ def _run_until_retry_committed(root, ready, release):
     def park_after_retry(uid, *, outcome):
         if outcome.will_retry:
             queued = pipeline._runtime.store.backend.load_queue()
-            assert queued[0]["attempt_no"] == 2
+            assert queued[0]["attempt_no"] == 1
             ready.set()
             release.wait(timeout=30)
     pipeline = _pipeline(Path(root))
@@ -286,7 +286,7 @@ def test_new_run_rechecks_retry_pending_and_resets_budget(tmp_path, gate_allows)
     recovered = _pipeline(tmp_path)
     queued = recovered._runtime.store.backend.load_queue()
     assert len(queued) == 1
-    assert queued[0]["attempt_no"] == 2
+    assert queued[0]["attempt_no"] == 1
     recovered.register_trigger("gated", lambda ctx: gate_allows)
     handler = retry_again_then_succeed if gate_allows else always_retry
     recovered.register_task("retry", handler, max_retries_per_run=1, trigger="gated")
@@ -445,7 +445,7 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
     }
     rows = [row["job"] for row in queue_rows]
     assert {row["task_type"] for row in rows} == {"waiting", "later"}
-    assert all(row["attempt_no"] == 1 and row["runtime"] == {} for row in rows)
+    assert all(row["attempt_no"] == 1 for row in rows)
     assert pipeline._runtime.store.backend.load_failed() == {}
     assert pipeline._runtime.store.backend.load_successes() == {}
     assert pipeline._runtime.store.backend.load_settled_attempts("later::item") == []

@@ -225,7 +225,7 @@ class JobScheduler:
         """清空调度缓存（**run 生命周期**，由运行主循环加载期调用）。
 
         内容键 + 只读字段（depends_on/resources）使缓存跨轮安全：
-        实例位字段（attempt_no/activation_no/runtime）从 live job_snapshot
+        实例位字段（attempt_no）从 live job_snapshot
         读取，重入队路径用原 resources 恢复与缓存一致，spawn 去重防同
         uid 冲突——阻塞/慢 job 阶段主循环高频轮询时避免每轮全量反序列化
         队列（大队列每轮数百毫秒 CPU 空烧）。跨 run 陈旧（清历史后重新

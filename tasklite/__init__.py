@@ -1,6 +1,6 @@
 """TaskLite：Task/Job/Attempt 三层模型的任务编排引擎（ADR-0004 / ADR-0005 / ADR-0011）。
 
-模型：Task 为进程内注册的静态规格模板；Job 为一次有界激活的逻辑实例
+模型：Task 为进程内注册的静态规格模板；Job 为具有稳定身份的逻辑实例
 （uid = task_type::job_id）；TaskResult 为 handler 唯一合法返回类型；
 Attempt 为 append-only 的执行轨迹。
 

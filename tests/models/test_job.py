@@ -1,8 +1,4 @@
-"""v2 Job 模型契约测试：字段归位、构造校验、序列化往返与 uid 身份。
-
-移植 v1 job 构造校验类测试并按 v2 字段面改写：retries/backoff_* 构造
-参数废除，新增实例位 attempt_no / activation_no / first_enqueued_at。
-"""
+"""Job 配置、执行观察与单射身份契约。"""
 
 from __future__ import annotations
 
@@ -12,7 +8,6 @@ from tasklite.exceptions import TaskLiteError
 from tasklite.models.artifact import FileSpec
 from tasklite.models.job import (
     Job,
-    JobRuntimeState,
     BUILTIN_TRIGGERS,
     inject_worker_resource,
 )
@@ -36,10 +31,16 @@ class TestJobCreation:
         assert job.trigger is None
         assert not hasattr(job, "max_retries")
         assert not hasattr(job, "timeout_is_transient")
-        # 实例位初值：首次激活、首次尝试、尚未入队
+        # 编号仅供观察，首次执行由后端分配。
         assert job.attempt_no == 1
-        assert job.activation_no == 1
-        assert job.first_enqueued_at is None
+        assert not hasattr(job, "activation_no")
+        assert not hasattr(job, "runtime")
+        assert not hasattr(job, "first_enqueued_at")
+
+    def test_execution_number_is_read_only(self):
+        job = Job("t", "id")
+        with pytest.raises(AttributeError):
+            job.attempt_no = 7
 
     def test_create_with_all_fields(self):
         """公开构造全字段显式构造。"""
@@ -63,8 +64,8 @@ class TestJobCreation:
         assert job.timeout_seconds == 7200
         assert job.trigger == "until_success"
 
-    def test_restore_with_internal_runtime_fields(self):
-        """内部恢复入口 _restore 挂载运行期实例位与边带状态。"""
+    def test_restore_with_execution_number(self):
+        """内部恢复入口挂载当前执行编号。"""
         out_spec = FileSpec("/tmp/1.jpg", role="output")
         job = Job._restore(
             task_type="download",
@@ -77,13 +78,9 @@ class TestJobCreation:
             timeout_seconds=7200,
             trigger="until_success",
             attempt_no=2,
-            activation_no=3,
-            first_enqueued_at="2026-01-01T00:00:00+00:00",
         )
         assert job.files == {"output": out_spec}
         assert job.attempt_no == 2
-        assert job.activation_no == 3
-        assert job.first_enqueued_at == "2026-01-01T00:00:00+00:00"
 
     def test_public_constructor_rejects_internal_and_removed_params(self):
         """公开构造拒绝内部运行态参数与已删除参数。"""
@@ -316,25 +313,6 @@ class TestJobInstanceFieldValidation:
         with pytest.raises(ValueError, match="attempt_no must be >= 1"):
             Job._restore("t", "id", attempt_no=0)
 
-    def test_activation_no_matrix(self):
-        with pytest.raises(TypeError, match="activation_no must be an int"):
-            Job._restore("t", "id", activation_no=1.5)  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="activation_no must be >= 1"):
-            Job._restore("t", "id", activation_no=0)
-
-    def test_first_enqueued_at_matrix(self):
-        with pytest.raises(TypeError, match="first_enqueued_at must be a str or None"):
-            Job._restore("t", "id", first_enqueued_at=12345)  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="non-empty"):
-            Job._restore("t", "id", first_enqueued_at="")
-
-    def test_budget_rule_alignment(self):
-        """预算判定对齐：允许执行条件 attempt_no <= max_retries_per_run + 1。"""
-        job = Job("t", "id", max_retries_per_run=3)
-        assert job.attempt_no <= job.max_retries_per_run + 1
-        retrying = Job._restore("t", "id", max_retries_per_run=3, attempt_no=4)
-        assert retrying.attempt_no == retrying.max_retries_per_run + 1
-
 
 class TestJobUid:
     """uid 派生与身份等价。"""
@@ -376,9 +354,7 @@ class TestJobToDictFromDict:
         result = Job("scan", "s1").to_dict()
         expected_keys = {
             "task_type", "job_id", "payload", "depends_on", "files", "resources",
-            "max_retries_per_run", "timeout_seconds",
-            "trigger", "runtime", "attempt_no", "activation_no",
-            "first_enqueued_at",
+            "max_retries_per_run", "timeout_seconds", "trigger", "attempt_no",
         }
         assert set(result.keys()) == expected_keys
 
@@ -395,8 +371,6 @@ class TestJobToDictFromDict:
             timeout_seconds=100,
             trigger="always",
             attempt_no=2,
-            activation_no=1,
-            first_enqueued_at="2026-02-02T00:00:00+00:00",
         )
         d = job.to_dict()
         assert d["task_type"] == "process"
@@ -409,8 +383,6 @@ class TestJobToDictFromDict:
         assert d["timeout_seconds"] == 100
         assert d["trigger"] == "always"
         assert d["attempt_no"] == 2
-        assert d["activation_no"] == 1
-        assert d["first_enqueued_at"] == "2026-02-02T00:00:00+00:00"
 
     def test_from_dict_missing_optional_keys_uses_defaults(self):
         job = Job.from_dict({"task_type": "t", "job_id": "j"})
@@ -422,9 +394,6 @@ class TestJobToDictFromDict:
         assert job.timeout_seconds is None
         assert job.trigger is None
         assert job.attempt_no == 1
-        assert job.activation_no == 1
-        assert job.first_enqueued_at is None
-        assert job.runtime.to_dict() == {}
 
     def test_from_dict_required_keys(self):
         with pytest.raises(KeyError):
@@ -432,10 +401,18 @@ class TestJobToDictFromDict:
         with pytest.raises(KeyError):
             Job.from_dict({"task_type": "t"})
 
-    def test_from_dict_rejects_removed_keys(self):
-        for legacy_key in ("rerun", "timeout", "max_retries", "timeout_is_transient"):
-            with pytest.raises(ValueError, match=legacy_key):
-                Job.from_dict({"task_type": "t", "job_id": "j", legacy_key: 1})
+    @pytest.mark.parametrize(
+        ("legacy_key", "current_fields"),
+        [
+            ("rerun", {"trigger": "always"}),
+            ("timeout", {"timeout_seconds": 9}),
+            ("max_retries", {"max_retries_per_run": 3}),
+            ("timeout_is_transient", {"timeout_seconds": 9}),
+        ],
+    )
+    def test_from_dict_rejects_removed_keys(self, legacy_key, current_fields):
+        with pytest.raises(TaskLiteError, match=legacy_key):
+            Job.from_dict({"task_type": "t", "job_id": "j", legacy_key: 1, **current_fields})
 
     def test_roundtrip_preserves_all_fields(self):
         original = Job._restore(
@@ -452,8 +429,6 @@ class TestJobToDictFromDict:
             timeout_seconds=7200,
             trigger="on_input_change",
             attempt_no=3,
-            activation_no=2,
-            first_enqueued_at="2026-03-03T00:00:00+00:00",
         )
         recreated = Job.from_dict(original.to_dict())
         assert recreated.task_type == original.task_type
@@ -466,8 +441,6 @@ class TestJobToDictFromDict:
         assert recreated.timeout_seconds == original.timeout_seconds
         assert recreated.trigger == original.trigger
         assert recreated.attempt_no == original.attempt_no
-        assert recreated.activation_no == original.activation_no
-        assert recreated.first_enqueued_at == original.first_enqueued_at
 
     def test_roundtrip_nested_payload(self):
         nested = {
@@ -507,91 +480,6 @@ class TestJobWorkerResource:
         job = Job("t", "id")
         inject_worker_resource(job.to_dict())
         assert job.resources is None
-
-
-class TestJobRuntimeState:
-    """JobRuntimeState 精简版：计数字段、extra 无损往返与映射协议。"""
-
-    def test_default_empty(self):
-        st = JobRuntimeState()
-        assert st.commit_failures == 0
-        assert st.dispatch_failures == 0
-        assert st.last_retry_error == ""
-        assert st.extra == {}
-        assert st.to_dict() == {}
-
-    def test_roundtrip_dict(self):
-        data = {
-            "_commit_failures": 2,
-            "_dispatch_failures": 1,
-            "_last_retry_error": "Connection reset",
-        }
-        st = JobRuntimeState.from_dict(data)
-        assert st.commit_failures == 2
-        assert st.dispatch_failures == 1
-        assert st.last_retry_error == "Connection reset"
-        assert st.to_dict() == data
-
-    def test_none_safe(self):
-        st = JobRuntimeState.from_dict(None)
-        assert st.commit_failures == 0
-        assert st.to_dict() == {}
-
-    def test_record_counters_and_retry_error(self):
-        st = JobRuntimeState()
-        assert st.record_commit_failure() == 1
-        assert st.record_commit_failure() == 2
-        assert st.record_dispatch_failure() == 1
-        st.record_retry_error("boom")
-        assert st.last_retry_error == "boom"
-        st.record_retry_error(None)
-        assert st.last_retry_error == ""
-
-    def test_extra_same_name_keys_stay_lossless(self):
-        # runtime 命名空间仅 `_` 前缀名为框架字段；与字段同名的无下划线键
-        # 属用户 extra 数据——非数值不静默丢弃、数值不被劫持为框架字段
-        data = {"commit_failures": "note", "note": "x"}
-        st = JobRuntimeState.from_dict(data)
-        assert st.commit_failures == 0
-        assert st.extra == data
-        assert st.to_dict() == data
-
-        st_two = JobRuntimeState.from_dict({"dispatch_failures": 7})
-        assert st_two.dispatch_failures == 0
-        assert st_two.extra == {"dispatch_failures": 7}
-        assert st_two.to_dict() == {"dispatch_failures": 7}
-
-    def test_stale_loose_same_name_key_cannot_revive_field(self):
-        # 同时含规范键与无下划线同名键：字段只认规范键；规范键清空后，
-        # 滞留的同名 extra 键不得在下次反序列化时复活陈旧框架值
-        st = JobRuntimeState.from_dict({"_commit_failures": 2, "commit_failures": 99})
-        assert st.commit_failures == 2
-        assert st.extra == {"commit_failures": 99}
-
-        st.commit_failures = 0
-        back = st.to_dict()
-        assert back == {"commit_failures": 99}
-        st_two = JobRuntimeState.from_dict(back)
-        assert st_two.commit_failures == 0
-
-    def test_from_dict_tolerates_dirty_counters(self):
-        """持久化容灾：脏计数（非数值/None）降级为 0，不抛异常。"""
-        st = JobRuntimeState.from_dict({
-            "_commit_failures": "many",
-            "_dispatch_failures": None,
-            "_last_retry_error": 42,
-        })
-        assert st.commit_failures == 0
-        assert st.dispatch_failures == 0
-        assert st.last_retry_error == "42"
-
-    def test_runtime_setter_accepts_dict_and_instance(self):
-        job = Job._restore("t", "id", runtime={"_commit_failures": 1, "k": "v"})
-        assert job.runtime.commit_failures == 1
-        assert job.runtime.extra == {"k": "v"}
-        shared = JobRuntimeState(commit_failures=5)
-        job.runtime = shared
-        assert job.runtime is shared
 
 
 class TestJobWeirdInputs:

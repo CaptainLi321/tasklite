@@ -1,6 +1,6 @@
 """UTC 时钟单点：引擎全部落盘时间戳的唯一生成出口。
 
-所有持久化时间戳（first_enqueued_at / started_at / finished_at /
+所有持久化时间戳（started_at / finished_at /
 last_succeeded_at / failed_at 等）统一经 ``utc_now_iso`` 生成——UTC 意识
 时区 + ISO 8601 全格式。格式漂移会破坏跨 run 的时间比较与追溯链
 排序，收敛为单点。

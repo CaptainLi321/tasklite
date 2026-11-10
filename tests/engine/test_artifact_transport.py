@@ -181,12 +181,11 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
         output_roots=output_root,
     )
     pipeline.register_task("transport", _write_declaration_with_io_fault)
-    job = Job._restore(
+    job = Job(
         "transport",
         "one",
         payload={"kind": kind, "path": str(path)},
         max_retries_per_run=3,
-        attempt_no=2,
     )
     try:
         pipeline.enqueue(job)
@@ -198,7 +197,7 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
         assert len(queue) == 1
         assert queue[0]["task_type"] == job.task_type
         assert queue[0]["job_id"] == job.job_id
-        assert queue[0]["attempt_no"] == 2
+        assert queue[0]["attempt_no"] == 1
         assert queue[0]["max_retries_per_run"] == 3
         assert pipeline._runtime.store.backend.load_successes() == {}
         assert pipeline._runtime.store.backend.load_failed() == {}

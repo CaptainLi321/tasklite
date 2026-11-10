@@ -31,7 +31,7 @@ from tasklite.engine.resource import (
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import AttemptOutcome, JobHandle
 from tasklite.models.artifact import FileSpec
-from tasklite.models.job import Job, JobRuntimeState
+from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
 
@@ -112,7 +112,7 @@ class CompletionEnv:
         if execution_id is None:
             identity = self.start_execution(job)
             execution_id, run_id, attempt_no = identity["execution_id"], identity["run_id"], identity["attempt_no"]
-        job.attempt_no = attempt_no
+        job._attempt_no = attempt_no
         snapshot = job.to_dict()
         self.store.finalize_intake_snapshot(snapshot, job.task_type)
         job.__dict__.update(Job.from_dict(snapshot).__dict__)
@@ -260,7 +260,7 @@ class TestCompleteJobFailure:
 class TestRetryBudget:
     """显式重试的预算判定与编号推进。"""
 
-    def test_business_retry_advances_attempt_no(self, tmp_path):
+    def test_business_retry_retains_settled_number_until_dispatch(self, tmp_path):
         env = CompletionEnv(tmp_path)
         job = Job("t", "j1", max_retries_per_run=2)
         identity = env.start_execution(job)
@@ -273,11 +273,11 @@ class TestRetryBudget:
 
         assert result.will_retry is True
         assert env.stats["retried"] == 1
-        assert env.store.state.queue[0]["attempt_no"] == 2
-        assert env.store.state.queue[0]["first_enqueued_at"] == job.first_enqueued_at
-        rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
-        assert rt.last_retry_error == "connection blip"
-        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "retry"
+        assert env.store.state.queue[0]["attempt_no"] == 1
+        attempt = env.backend.load_settled_attempts("t::j1")[-1]
+        assert attempt["outcome"] == "retry"
+        assert attempt["result"]["message"] == "connection blip"
+        assert entry.job.attempt_no == attempt["attempt_no"] == 1
         assert env.hooks[-1] == (
             "t::j1",
             AttemptOutcome(success=False, will_retry=True, metadata={}),
@@ -312,7 +312,6 @@ class TestRetryBudget:
         job = Job.from_dict(env.store.state.pop_job(0))
         identity = env.start_execution(job)
         entry = env.track_entry(job, **identity)
-        entry.job_snapshot["runtime"] = job.runtime.to_dict()
 
         result = ExecutionResult(retry_requested=True, message="second")
         env.completion.complete_job(entry, result)
@@ -320,10 +319,12 @@ class TestRetryBudget:
         assert result.will_retry is False
         assert "t::j1" in env.store.state.failed
         assert env.store.state.failed["t::j1"]["error_message"] == ERR_MAX_RETRIES
-        assert env.store.state.failed["t::j1"]["last_retry_error"] == "first failure"
-        assert env.store.state.failed["t::j1"]["retry_error"] == "second"
         assert env.stats["failed"] == 1
-        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "failure"
+        attempts = env.backend.load_settled_attempts("t::j1")
+        assert [(a["attempt_no"], a["outcome"], a["result"]["message"]) for a in attempts] == [
+            (1, "retry", "first failure"), (2, "failure", "second"),
+        ]
+        assert env.store.state.failed["t::j1"]["result"]["message"] == "second"
 
     def test_explicit_zero_budget_retry_advances_attempt_no(self, tmp_path):
         """显式零预算重试不受预算限制，但编号仍推进。"""
@@ -347,9 +348,7 @@ class TestRetryBudget:
 
         assert result.will_retry is True
         assert "t::j1" not in env.store.state.failed
-        assert env.store.state.queue[0]["attempt_no"] == 6
-        rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
-        assert rt.last_retry_error == "suppressed failure"
+        assert env.store.state.queue[0]["attempt_no"] == 5
         assert env.stats["retried"] == 5
         assert env.stats["interrupted_reruns"] == 0
         assert env.stats["rate_limited_reruns"] == 0

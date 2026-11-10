@@ -478,8 +478,9 @@ class TestQueriesAndFilters:
             with pytest.raises(TaskLiteError, match="status must be one of"):
                 list(s.iter_jobs(status="unknown"))  # type: ignore[arg-type]
 
-    def test_iter_attempts_ordered_by_attempt_no(self, tmp_path):
-        p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+    @pytest.mark.parametrize("backend", ["sqlite", "memory"])
+    def test_iter_attempts_ordered_by_attempt_no(self, tmp_path, backend):
+        p = TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None)
         p.register_task(Task("process", retry_then_succeed_handler))
         p.enqueue(Job("process", "j_retry", max_retries_per_run=5))
         p.run()
@@ -501,7 +502,33 @@ class TestQueriesAndFilters:
             # 结构体统一含有时间、配置、文件分层
             for a in attempts:
                 assert a["job_uid"] == "process::j_retry"
-                assert "job" in a
-                assert "files" in a
+                assert set(a) == {
+                    "job_uid", "outcome", "job", "files", "result", "run_id",
+                    "attempt_no", "started_at", "settled_at",
+                }
+                assert set(a["job"]) == {
+                    "task_type", "job_id", "payload", "depends_on", "files",
+                    "resources", "max_retries_per_run", "timeout_seconds", "trigger",
+                }
+                assert set(a["result"]) == {"message", "exception", "metadata", "annotations"}
                 assert a["settled_at"] is not None
                 assert a["run_id"] is not None
+
+        assert p.clear_history("process::j_retry", records=["successes", "failures", "attempts"]) == 4
+        with StateSnapshot.open(p) as s:
+            assert s.get_job("process::j_retry") is None
+            assert list(s.iter_attempts(job_uid="process::j_retry")) == []
+        p.enqueue(Job("process", "j_retry", max_retries_per_run=5))
+        with StateSnapshot.open(p) as s:
+            pending = s.get_job("process::j_retry")
+            assert pending["status"] == "pending"
+            assert all(pending[key] is None for key in ("result", "run_id", "attempt_no", "started_at", "settled_at"))
+        p.run()
+        with StateSnapshot.open(p) as s:
+            current = list(s.iter_attempts(job_uid="process::j_retry"))
+            assert len(current) == 1
+            assert current[0]["attempt_no"] == 4
+            assert current[0]["run_id"] != attempts[-1]["run_id"]
+            assert current[0]["job"] == attempts[-1]["job"]
+            assert current[0]["outcome"] == "success"
+        p.close()

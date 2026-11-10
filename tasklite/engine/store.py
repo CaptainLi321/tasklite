@@ -442,19 +442,12 @@ class StateStore:
         return job_snapshot
 
     def finalize_intake_snapshot(self, job_snapshot: dict[str, Any], task_type: str) -> None:
-        """校验并隔离 payload 后落实 Trigger、资源与首入队时间。
-
-        first_enqueued_at 仅在缺失时填充（UTC ISO）：重试/spawn 回流的
-        dict 已携带首次入队时间，绝不刷新——「首次入队时间」是端到端
-        追溯链的锚点。
-        """
+        """校验并隔离 payload 后落实 Trigger 与资源。"""
         job_snapshot["payload"] = validate_strict_json_object(
             job_snapshot.get("payload"), field_name="payload"
         )
         self._trigger_registry.normalize_job_snapshot(job_snapshot, task_type)
         inject_worker_resource(job_snapshot)
-        if not job_snapshot.get("first_enqueued_at"):
-            job_snapshot["first_enqueued_at"] = utc_now_iso()
 
     def enqueue_job(self, job: Job) -> bool:
         """单作业入队摄入管道：解析有效配置、捕获独立快照并校验同 UID 幂等/冲突。"""

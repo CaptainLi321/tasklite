@@ -5,8 +5,7 @@ resources 与默认重试/超时/触发策略。代码即规格，不落盘；
 注册于 TaskRegistry（``register_task`` 的唯一落点）。
 
 与 Job 的字段分工：Task 持有「该类任务全部实例共享」的默认值，Job 的
-规格位字段在构造时可覆盖这些默认；实例位字段（attempt_no /
-activation_no / first_enqueued_at）只属于单次激活，不出现在 Task。
+配置字段在构造时可覆盖这些默认；执行编号由后端分配，不属于 Task 默认配置。
 
 本模块同时承载模型层共享的校验单点（``validate_task_type`` /
 ``validate_retry_budget`` / ``validate_timeout_seconds`` /
@@ -132,8 +131,8 @@ class Task:
         handler: 任务处理函数，期望签名 ``handler(job, ctx)``。
         resources: 该类任务的默认资源占用映射；Job 构造时可用
             ``resources`` 按 key 覆盖。构造后浅拷贝隔离外部就地变异。
-        max_retries_per_run: 单次运行内默认重试预算上限（默认 3）；允许执行
-            条件为 ``attempt_no <= max_retries_per_run + 1``。
+        max_retries_per_run: 单次 Run 内默认消耗预算重试的上限（默认 3），
+            与跨 Run 的执行编号相互独立。
         timeout_seconds: 默认执行超时秒数（默认 3600），有限正数。
         trigger: 首次尝试的触发器名称，默认 once；发现任务默认 always。
     """

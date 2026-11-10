@@ -470,25 +470,8 @@ class TestApplyBulkFailure:
 
 
 class TestIntakePipeline:
-    """enqueue 摄入管道三步 + 首入队时间。"""
+    """enqueue 摄入校验、Trigger 与资源配置。"""
 
-    def test_enqueue_fills_first_enqueued_at_once(self):
-        backend = InMemoryStateBackend()
-        store = StateStore(
-            backend,
-            PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
-        )
-        assert store.enqueue_job(Job("t", "1")) is True
-        row = backend.load_queue()[0]
-        assert row["first_enqueued_at"]
-        assert row["resources"][WORKER_RESOURCE] == 1.0
-
-    def test_enqueue_does_not_refresh_first_enqueued_at(self):
-        store, _, _ = _make_store()
-        job = Job._restore("t", "1", first_enqueued_at="2026-01-01T00:00:00+00:00")
-        jd = store.normalize_and_validate_job(job)
-        assert jd["first_enqueued_at"] == "2026-01-01T00:00:00+00:00"
 
     def test_enqueue_injects_discovery_trigger_for_unspecified(self):
         store = StateStore(
@@ -587,7 +570,6 @@ class TestIntakePipeline:
         jd = store.normalize_spawned_job(Job("child", "c1"))
         assert jd["trigger"] == "until_success"
         assert jd["resources"][WORKER_RESOURCE] == 1.0
-        assert jd["first_enqueued_at"]
 
     def test_normalize_spawned_job_rejects_unserializable(self):
         store = StateStore(
@@ -864,8 +846,6 @@ def test_artifact_manifest_replaces_as_part_of_success_transaction(tmp_path, bac
     store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"artifacts": expected}, "annotations": {}}, **aid)
     assert state.successes[uid]["artifacts"] == {}
     assert backend.load_successes()[uid]["artifacts"] == {}
-
-
 
 
 @pytest.mark.parametrize("metadata", [

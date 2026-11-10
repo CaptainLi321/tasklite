@@ -852,14 +852,14 @@ class SQLiteStateBackend(AbstractStateBackend):
         with self._get_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             row = conn.execute(
-                'SELECT status, attempt_no, job_snapshot FROM queue WHERE job_uid = ?',
+                'SELECT status, job_snapshot FROM queue WHERE job_uid = ?',
                 (job_uid,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"Job {job_uid} not found in queue")
             if row[0] == "running":
                 raise ValueError(f"Job {job_uid} is already running")
-            job_snapshot = loads(row[2])
+            job_snapshot = loads(row[1])
             if not isinstance(job_snapshot, dict):
                 raise ValueError(f"Job {job_uid} has an invalid queue snapshot")
 
@@ -867,11 +867,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                 'SELECT last_attempt_no FROM job_sequences WHERE job_uid = ?',
                 (job_uid,),
             ).fetchone()
-            if seq_row is not None:
-                next_no = seq_row[0] + 1
-            else:
-                q_attempt_no = row[1] if row[1] is not None else None
-                next_no = q_attempt_no if (isinstance(q_attempt_no, int) and q_attempt_no >= 1) else 1
+            next_no = seq_row[0] + 1 if seq_row is not None else 1
 
             conn.execute(
                 'INSERT OR REPLACE INTO job_sequences (job_uid, last_attempt_no) VALUES (?, ?)',

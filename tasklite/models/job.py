@@ -1,26 +1,12 @@
-"""v2 Job 模型：一次有界激活的逻辑实例（ADR-0004 三层模型的实例位）。
+"""Job 逻辑实例：业务身份、有效配置与只读执行观察字段。
 
-字段归位原则：本类只承载「这一次激活」的语义——
-
-- 规格位（可覆盖 Task 默认）：task_type / job_id / payload / depends_on /
-  files / resources / max_retries_per_run / timeout_seconds / trigger；
-- 实例位（框架运行期管理，由私有恢复入口 ``_restore`` 挂载）：attempt_no
-  （本次激活内尝试序号，1 起始含首次执行；预算判定：允许执行条件
-  ``attempt_no <= max_retries_per_run + 1``）、activation_no（激活代，
-  每次从 successes/failed 拦截点放行重跑时 +1）、first_enqueued_at（UTC
-  ISO，首次入队时间，重试不刷新，由 enqueue 填充）；
-- 运行期边带状态收敛到 ``runtime`` 单一命名空间（JobRuntimeState），随
-  job_snapshot 落盘持久化——序列化只此一处，新增状态不会因散装下划线键
-  漏写 to_dict 而丢失。
-
-身份不变式：``uid = make_job_uid(task_type, job_id)``，queue/successes/failed
-三表主键与六集合互斥均以 uid 为身份；``__eq__``/``__hash__`` 仅按 uid。
+身份不变式：uid 仅由 task_type 与 job_id 确定；执行编号由后端进入
+running 的事务分配，跨 Run 单调递增，与重试预算相互独立。
 """
 from __future__ import annotations
 
 import copy
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 from typing import Any
 
 from ..exceptions import TaskLiteError
@@ -47,100 +33,6 @@ def inject_worker_resource(job_snapshot: dict) -> None:
     if WORKER_RESOURCE not in resources:
         resources[WORKER_RESOURCE] = 1.0
     job_snapshot["resources"] = resources
-
-
-@dataclass
-class JobRuntimeState:
-    """Job 运行期内部边带状态（强类型结构化存储）。
-
-    不变式：runtime 命名空间内仅 `_` 前缀名为框架字段，其余任意键（含与
-    字段同名的无下划线形态）一律是用户的 extra 数据——to_dict/from_dict
-    往返对 extra 命名空间无损，框架读写永不劫持或丢弃 extra 键。
-    """
-
-    commit_failures: int = 0
-    dispatch_failures: int = 0
-    last_retry_error: str = ""
-    extra: dict[str, Any] = field(default_factory=dict)
-
-    def record_retry_error(self, error: object) -> None:
-        """记录最近一次重试的错误串（空值收敛为空串）。"""
-        self.last_retry_error = str(error or "")
-
-    def record_commit_failure(self) -> int:
-        """记录一次 commit 失败并返回累计失败次数。"""
-        self.commit_failures += 1
-        return self.commit_failures
-
-    def record_dispatch_failure(self) -> int:
-        """记录一次 dispatch 失败并返回累计失败次数。"""
-        self.dispatch_failures += 1
-        return self.dispatch_failures
-
-    def to_dict(self) -> dict[str, Any]:
-        """导出持久化字典（完全保留 `_` 开头与任意 extra 字段）。"""
-        d = dict(self.extra)
-        for key, (attr, empty) in _RUNTIME_FIELDS.items():
-            val = getattr(self, attr)
-            if val != empty:
-                d[key] = val
-            else:
-                d.pop(key, None)
-        return d
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any] | JobRuntimeState | None) -> JobRuntimeState:
-        if isinstance(data, JobRuntimeState):
-            return cls(
-                commit_failures=data.commit_failures,
-                dispatch_failures=data.dispatch_failures,
-                last_retry_error=data.last_retry_error,
-                extra=dict(data.extra),
-            )
-        if not isinstance(data, dict):
-            return cls()
-
-        extra = dict(data)
-
-        def _pop_val(key: str) -> Any:
-            return extra.pop(key, None)
-
-        raw_cf = _pop_val(RT_COMMIT_FAILURES)
-        try:
-            commit_failures = int(raw_cf) if raw_cf is not None else 0
-        except (ValueError, TypeError):
-            commit_failures = 0
-
-        raw_df = _pop_val(RT_DISPATCH_FAILURES)
-        try:
-            dispatch_failures = int(raw_df) if raw_df is not None else 0
-        except (ValueError, TypeError):
-            dispatch_failures = 0
-
-        raw_re = _pop_val(RT_LAST_RETRY_ERROR)
-        last_retry_error = str(raw_re or "")
-
-        return cls(
-            commit_failures=commit_failures,
-            dispatch_failures=dispatch_failures,
-            last_retry_error=last_retry_error,
-            extra=extra,
-        )
-
-
-# runtime 规范键注册表：框架字段的单一事实源。empty 为「未设置」哨兵
-# （等于哨兵时 to_dict 导出省略）；写入侧的规范化（计数与取串）语义
-# 保留在各写入方法内显式表达。
-# runtime 规范键名常量（键名字符串的单一引用点；引擎写入侧与测试经此引用）
-RT_COMMIT_FAILURES = "_commit_failures"
-RT_DISPATCH_FAILURES = "_dispatch_failures"
-RT_LAST_RETRY_ERROR = "_last_retry_error"
-
-_RUNTIME_FIELDS: dict[str, tuple[str, Any]] = {
-    RT_COMMIT_FAILURES: ("commit_failures", 0),
-    RT_DISPATCH_FAILURES: ("dispatch_failures", 0),
-    RT_LAST_RETRY_ERROR: ("last_retry_error", ""),
-}
 
 
 def _validate_job_id(job_id: Any) -> None:
@@ -220,34 +112,8 @@ def _validate_attempt_no(attempt_no: Any) -> None:
         raise ValueError(f"attempt_no must be >= 1, got {attempt_no}")
 
 
-def _validate_activation_no(activation_no: Any) -> None:
-    """activation_no 入口校验：非 bool 的 int 且 >= 1（初激活为 1）。"""
-    if not isinstance(activation_no, int) or isinstance(activation_no, bool):
-        raise TypeError(
-            f"activation_no must be an int, got {type(activation_no).__name__} "
-            f"({activation_no!r})"
-        )
-    if activation_no < 1:
-        raise ValueError(f"activation_no must be >= 1, got {activation_no}")
-
-
-def _validate_first_enqueued_at(first_enqueued_at: Any) -> None:
-    """first_enqueued_at 入口校验：str（UTC ISO）或 None（尚未入队）。
-
-    非-str 非-None 值会以随机类型潜伏到落盘序列化处才崩，入口拒绝；
-    时间戳本身由 enqueue 单点填充，本处只做类型门卫。
-    """
-    if first_enqueued_at is not None and not isinstance(first_enqueued_at, str):
-        raise TypeError(
-            f"first_enqueued_at must be a str or None, got "
-            f"{type(first_enqueued_at).__name__} ({first_enqueued_at!r})"
-        )
-    if first_enqueued_at == "":
-        raise ValueError("first_enqueued_at must be a non-empty str or None")
-
-
 class Job:
-    """一次有界激活的逻辑实例（uid = make_job_uid(task_type, job_id) 身份不变）。
+    """具有稳定身份的逻辑实例（uid = make_job_uid(task_type, job_id) 身份不变）。
 
     Args:
         task_type: 任务类型名（须匹配已注册 Task 的 task_type）。非空 str。
@@ -257,9 +123,8 @@ class Job:
         depends_on: 上游 job uid 列表。失败的上游会级联阻断本 job。
         files: 文件角色到文件规格的映射（默认空 dict）。
         resources: None 继承 Task 默认资源；显式映射按键合并并覆盖同名资源。
-        max_retries_per_run: None 继承 Task 重试预算；显式值覆盖模板。允许执行
-            条件为 ``attempt_no <= max_retries_per_run + 1``；0 表示任何失败直接进
-            失败档案。
+        max_retries_per_run: None 继承 Task 重试预算；显式值覆盖模板。重试许可
+            由本 Run 已消耗的重试次数判定；0 表示不允许消耗预算的重试。
         timeout_seconds: None 继承 Task；显式秒数须为有限正数。
         trigger: 首次尝试的触发器名称；None 继承 Task。
     """
@@ -299,10 +164,7 @@ class Job:
         self.trigger = trigger
 
         # 实例位：公开构造初始化为默认初态，恢复路径统一经 _restore 挂载
-        self.attempt_no: int = 1
-        self.activation_no: int = 1
-        self.first_enqueued_at: str | None = None
-        self.runtime = None
+        self._attempt_no: int = 1
 
     @classmethod
     def _restore(
@@ -317,12 +179,9 @@ class Job:
         max_retries_per_run: int | None = None,
         timeout_seconds: int | float | None = None,
         trigger: str | None = None,
-        runtime: dict[str, Any] | JobRuntimeState | None = None,
         attempt_no: int = 1,
-        activation_no: int = 1,
-        first_enqueued_at: str | None = None,
     ) -> Job:
-        """内部私有恢复入口：重建 Job 并挂载运行期实例位与边带状态。"""
+        """内部恢复入口：重建有效配置并挂载执行编号。"""
         restored_files = _normalize_files(files, allow_dict=True)
         job = cls(
             task_type,
@@ -336,30 +195,16 @@ class Job:
             trigger=trigger,
         )
         _validate_attempt_no(attempt_no)
-        job.attempt_no = attempt_no
-        _validate_activation_no(activation_no)
-        job.activation_no = activation_no
-        _validate_first_enqueued_at(first_enqueued_at)
-        job.first_enqueued_at = first_enqueued_at
-        job.runtime = runtime
+        job._attempt_no = attempt_no
         return job
 
     @property
-    def runtime(self) -> JobRuntimeState:
-        """Job 运行期内部边带状态（强类型结构化存储）。"""
-        return self._runtime
-
-    @runtime.setter
-    def runtime(self, value: dict[str, Any] | JobRuntimeState | None) -> None:
-        if isinstance(value, JobRuntimeState):
-            self._runtime = value
-        else:
-            self._runtime = JobRuntimeState.from_dict(value)
+    def attempt_no(self) -> int:
+        """当前执行编号；由框架持久进入 running 时分配，与预算无关。"""
+        return self._attempt_no
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化 job 为字典（payload 深拷贝、files 导出 FileSpec JSON 字典、
-        resources/depends_on 浅拷贝，防外部就地变异内部状态）；``runtime``
-        子 dict 显式保留——边带状态集中序列化，不散装丢失。"""
+        """捕获独立配置快照及执行观察字段。"""
         return {
             "task_type": self.task_type,
             "job_id": self.job_id,
@@ -373,23 +218,20 @@ class Job:
             "max_retries_per_run": self.max_retries_per_run,
             "timeout_seconds": self.timeout_seconds,
             "trigger": self.trigger,
-            "runtime": self.runtime.to_dict(),
             "attempt_no": self.attempt_no,
-            "activation_no": self.activation_no,
-            "first_enqueued_at": self.first_enqueued_at,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Job:
         """反序列化 job（缺键回默认值；trigger 缺键/None = 未指定哨兵）。"""
         if "rerun" in data:
-            raise ValueError("Job 快照不接受旧字段 rerun；请使用 trigger")
+            raise TaskLiteError("Job 快照不接受旧字段 rerun；请使用 trigger")
         if "timeout" in data:
-            raise ValueError("Job 快照不接受旧字段 timeout；请使用 timeout_seconds")
+            raise TaskLiteError("Job 快照不接受旧字段 timeout；请使用 timeout_seconds")
         if "max_retries" in data:
-            raise ValueError("Job 快照不接受旧字段 max_retries；请使用 max_retries_per_run")
+            raise TaskLiteError("Job 快照不接受旧字段 max_retries；请使用 max_retries_per_run")
         if "timeout_is_transient" in data:
-            raise ValueError("Job 快照不接受已移除字段 timeout_is_transient")
+            raise TaskLiteError("Job 快照不接受已移除字段 timeout_is_transient")
         return cls._restore(
             data["task_type"],
             data["job_id"],
@@ -400,11 +242,7 @@ class Job:
             max_retries_per_run=data.get("max_retries_per_run"),
             timeout_seconds=data.get("timeout_seconds"),
             trigger=data.get("trigger"),
-            # runtime 子 dict 显式保留——边带状态只存这一处
-            runtime=data.get("runtime", {}),
             attempt_no=data["attempt_no"] if data.get("attempt_no") is not None else 1,
-            activation_no=data["activation_no"] if data.get("activation_no") is not None else 1,
-            first_enqueued_at=data.get("first_enqueued_at"),
         )
 
     @property
@@ -423,11 +261,7 @@ class Job:
 
 __all__ = [
     "Job",
-    "JobRuntimeState",
     "BUILTIN_TRIGGERS",
-    "RT_COMMIT_FAILURES",
-    "RT_DISPATCH_FAILURES",
-    "RT_LAST_RETRY_ERROR",
     "WORKER_RESOURCE",
     "inject_worker_resource",
 ]

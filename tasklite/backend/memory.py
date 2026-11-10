@@ -415,12 +415,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             if job_data.get("status") == "running":
                 raise ValueError(f"Job {job_uid} is already running")
 
-            current_seq = self._job_sequences.get(job_uid)
-            if current_seq is not None:
-                next_no = current_seq + 1
-            else:
-                q_att = job_data.get("attempt_no")
-                next_no = q_att if (isinstance(q_att, int) and q_att >= 1) else 1
+            next_no = self._job_sequences.get(job_uid, 0) + 1
             self._job_sequences[job_uid] = next_no
 
             updated_job = queue_snapshot_with_execution_id(job_data, execution_id)

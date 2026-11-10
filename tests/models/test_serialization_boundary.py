@@ -1,23 +1,21 @@
 """框架结构字段边界与业务数据隔离。"""
-from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 
+from tasklite import TaskLiteError
 from tasklite.models.artifact import FileSpec, resolve_job_files_config
-from tasklite.models.attempt import AttemptRecord
 from tasklite.models.job import Job
 
 
 def test_job_timeout_seconds_roundtrip_and_user_fields():
-    user = {"timeout": 17, "error": {"new_jobs": [], "fatal": True}, "timeout_seconds": 29}
-    job = Job._restore("t", "j", payload=user, timeout_seconds=13, runtime=user)
+    user = {"timeout": 17, "error": {"new_jobs": [], "fatal": True}, "timeout_seconds": 29, "runtime": {"_commit_failures": 8}, "activation_no": 4, "first_enqueued_at": "业务日期"}
+    job = Job._restore("t", "j", payload=user, timeout_seconds=13)
     snapshot = job.to_dict()
     assert snapshot["timeout_seconds"] == 13
     assert "timeout" not in snapshot
     restored = Job.from_dict(snapshot)
     assert restored.payload == user
-    assert restored.runtime.to_dict() == user
     assert restored.timeout_seconds == 13
 
 
@@ -76,17 +74,8 @@ def test_job_files_snapshot_matches_adr_sample_and_isolates_mutation(tmp_path):
 
 
 def test_job_rejects_old_timeout_even_with_new_field():
-    with pytest.raises(ValueError, match="timeout"):
+    with pytest.raises(TaskLiteError, match="timeout"):
         Job.from_dict({"task_type": "t", "job_id": "j", "timeout": 7, "timeout_seconds": 9})
-
-
-@pytest.mark.parametrize("legacy", ["incarnation", "error"])
-def test_attempt_rejects_old_fields(legacy):
-    record = AttemptRecord("t::j", 1, 1, "r.1", "r", "now", "running")
-    data = asdict(record)
-    data[legacy] = "old"
-    with pytest.raises(ValueError, match=legacy):
-        AttemptRecord.from_dict(data)
 
 
 @pytest.mark.parametrize("unsupported", ["new_jobs", "error"])

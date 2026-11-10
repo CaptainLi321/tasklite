@@ -314,12 +314,13 @@ class TestStatePrimitivesParity:
 class TestAttemptSequenceIndependence:
     """编号进度独立于可清除历史。"""
 
-    def test_cleaning_history_and_attempts_preserves_attempt_sequence(self, v6_backend):
+    @pytest.mark.parametrize("snapshot_attempt_no", [999, -7])
+    def test_cleaning_history_and_attempts_preserves_attempt_sequence(self, v6_backend, snapshot_attempt_no):
         b = v6_backend
         job_uid = "t::target_seq"
 
         # 1. 首次执行进入 running
-        b.enqueue_jobs([_make_job("target_seq")])
+        b.enqueue_jobs([_make_job("target_seq", attempt_no=snapshot_attempt_no)])
         seq1 = b.mark_job_running(
             job_uid,
             execution_id="run_1.1",
@@ -362,7 +363,7 @@ class TestAttemptSequenceIndependence:
         assert b.load_failed() == {}
 
         # 3. 重新入队并再次进入 running
-        b.enqueue_jobs([_make_job("target_seq")])
+        b.enqueue_jobs([_make_job("target_seq", attempt_no=snapshot_attempt_no)])
         seq2 = b.mark_job_running(
             job_uid,
             execution_id="run_2.2",

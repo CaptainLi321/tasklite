@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, Protocol
 
 from .backend.sqlite_backend import _check_schema
 from .exceptions import TaskLiteError
-from .models.attempt import AttemptRecord
 from .models.state import job_uid_from_snapshot
 from .utils.encoding import parse_job_uid
 from .utils.jsonutil import loads
@@ -485,12 +484,6 @@ class _SqliteSnapshotReader:
                 if tt != task_type:
                     continue
             job_snap = loads(row[5]) if row[5] else {}
-            if not job_snap:
-                try:
-                    tt, jid = parse_job_uid(uid)
-                    job_snap = {"task_type": tt, "job_id": jid}
-                except Exception:
-                    job_snap = {}
             files_data = loads(row[6]) if row[6] else {}
             res_data = loads(row[7]) if row[7] else {"message": row[8]}
             yield {
@@ -531,35 +524,11 @@ class _MemorySnapshotReader:
         self._closed = False
 
     def _load_latest_attempt(self, uid: str) -> dict[str, Any] | None:
-        matched: list[dict[str, Any]] = []
-        for v in self._attempts.values():
-            if isinstance(v, AttemptRecord) and v.job_uid == uid:
-                matched.append({
-                    "attempt_no": v.attempt_no,
-                    "run_id": v.run_id,
-                    "outcome": v.outcome,
-                    "started_at": v.started_at,
-                    "settled_at": v.finished_at,
-                    "job_snapshot": None,
-                    "files": None,
-                    "result": None,
-                    "error_message": v.error_message,
-                })
-            elif isinstance(v, dict) and v.get("job_uid") == uid:
-                matched.append({
-                    "attempt_no": v.get("attempt_no", 1),
-                    "run_id": v.get("run_id"),
-                    "outcome": v.get("outcome", "failure"),
-                    "started_at": v.get("started_at"),
-                    "settled_at": v.get("settled_at"),
-                    "job_snapshot": v.get("job") or v.get("job_snapshot") or {},
-                    "files": v.get("files") or {},
-                    "result": v.get("result"),
-                    "error_message": v.get("error_message"),
-                })
+        matched = [v for v in self._attempts.values() if v["job_uid"] == uid]
         if not matched:
             return None
-        return matched[-1]
+        latest = matched[-1]
+        return dict(latest, job_snapshot=latest["job"])
 
     def get_job(self, uid: str) -> dict[str, Any] | None:
         for j in self._queue:
@@ -663,37 +632,7 @@ class _MemorySnapshotReader:
         job_uid: str | None = None,
         task_type: str | None = None,
     ) -> Iterator[dict[str, Any]]:
-        raw_list: list[dict[str, Any]] = []
-        for v in self._attempts.values():
-            if isinstance(v, AttemptRecord):
-                raw_list.append({
-                    "job_uid": v.job_uid,
-                    "attempt_no": v.attempt_no,
-                    "run_id": v.run_id,
-                    "outcome": v.outcome,
-                    "started_at": v.started_at,
-                    "settled_at": v.finished_at,
-                    "job_snapshot": {},
-                    "files": {},
-                    "result": {"message": v.error_message} if v.error_message else None,
-                })
-            elif isinstance(v, dict):
-                raw_list.append({
-                    "job_uid": v.get("job_uid"),
-                    "attempt_no": v.get("attempt_no", 1),
-                    "run_id": v.get("run_id"),
-                    "outcome": v.get("outcome", "failure"),
-                    "started_at": v.get("started_at"),
-                    "settled_at": v.get("settled_at"),
-                    "job_snapshot": v.get("job") or v.get("job_snapshot") or {},
-                    "files": v.get("files") or {},
-                    "result": v.get("result") or (
-                        {"message": v.get("error_message")}
-                        if v.get("error_message")
-                        else None
-                    ),
-                })
-
+        raw_list = list(self._attempts.values())
         if job_uid is not None:
             raw_list = [a for a in raw_list if a["job_uid"] == job_uid]
             raw_list.sort(key=lambda x: x.get("attempt_no", 0))
@@ -709,13 +648,7 @@ class _MemorySnapshotReader:
                     continue
                 if tt != task_type:
                     continue
-            job_snap = item.get("job_snapshot") or {}
-            if not job_snap:
-                try:
-                    tt, jid = parse_job_uid(uid)
-                    job_snap = {"task_type": tt, "job_id": jid}
-                except Exception:
-                    job_snap = {}
+            job_snap = item["job"]
             yield {
                 "job_uid": uid,
                 "outcome": item["outcome"],
