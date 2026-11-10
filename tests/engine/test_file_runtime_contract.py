@@ -67,7 +67,7 @@ def test_from_output_reference_and_resolution(tmp_path, monkeypatch):
     successes = p._runtime.store.backend.load_successes()
     assert producer_job.uid in successes
     assert consumer_job.uid in successes
-    assert successes[consumer_job.uid]["content"] == "hello world"
+    assert successes[consumer_job.uid]["result"]["metadata"]["content"] == "hello world"
 
     # 2. 消费者 job 快照保留引用本身，Attempt 记录解析绝对路径
     attempts = p._runtime.store.backend.load_settled_attempts(consumer_job.uid)
@@ -280,8 +280,8 @@ def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch,
     error_msg = meta.get("error_message", "")
     assert "Business computation failed" in error_msg
     assert "cleanup failed" in error_msg
-    assert meta["exception"]["type"] == "RuntimeError"
-    assert meta["cleanup_exception"]["type"] == cleanup_error.__name__
+    assert meta["result"]["exception"]["type"] == "RuntimeError"
+    assert meta["result"]["annotations"]["cleanup_exception"]["type"] == cleanup_error.__name__
     attempt, = p._runtime.store.backend.load_settled_attempts("failing::f1")
     assert attempt["outcome"] == "failure"
     assert attempt["result"]["exception"]["type"] == "RuntimeError"
@@ -563,8 +563,8 @@ def test_retry_cleanup_failure_settles_once_without_retry(
 
     failure = p._runtime.store.backend.load_failed()["retry::one"]
     assert "Retry cleanup failed" in failure["error_message"]
-    assert failure["cleanup_original_message"] == "retry requested"
-    assert failure["cleanup_exception"]["type"] == cleanup_error.__name__
+    assert failure["result"]["annotations"]["cleanup_original_message"] == "retry requested"
+    assert failure["result"]["annotations"]["cleanup_exception"]["type"] == cleanup_error.__name__
     attempt, = p._runtime.store.backend.load_settled_attempts("retry::one")
     assert attempt["outcome"] == "failure"
     assert attempt["files"]["retry_file"]["path"] == str(tmp_path / "retry.txt")
@@ -638,7 +638,7 @@ def test_removed_file_declaration_cannot_delete_without_authorization(tmp_path, 
     p.run()
     assert target.read_text() == "valuable"
     assert calls == []
-    assert "AttributeError" == p._runtime.store.backend.load_failed()["work::one"]["exception"]["type"]
+    assert "AttributeError" == p._runtime.store.backend.load_failed()["work::one"]["result"]["exception"]["type"]
     p.close()
 
 

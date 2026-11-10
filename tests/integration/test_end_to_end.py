@@ -131,9 +131,7 @@ class TestEndToEnd:
 
         assert res is None
         meta = p._runtime.store.backend.load_successes()["work::item_alpha"]
-        # successes 审计键：业务 meta 原样落盘 + 框架审计键（success_count /
-        # inputs 规范路径清单 / 归属 run）
-        assert meta["touched"] == "item_alpha"
+        assert meta["result"]["metadata"]["touched"] == "item_alpha"
         assert meta["success_count"] == 1
         assert meta["last_success_run_id"]
         assert len(meta["inputs"]) == 1
@@ -218,7 +216,7 @@ class TestEndToEnd:
         p.stop()
         assert res is None
         meta = p._runtime.store.backend.load_successes()["work::item_eps"]
-        assert meta["recovered"] is True
+        assert meta["result"]["metadata"]["recovered"] is True
         assert meta["success_count"] == 1
 
         # 档案补跑通道：failed 拦截点放行语义——激活代按轨迹最大值 +1

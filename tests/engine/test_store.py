@@ -121,7 +121,7 @@ class TestApplySuccess:
 
         outcome = store.apply_success(
             "process::1",
-            {"score": 100},
+            result={"message": None, "exception": None, "metadata": {"score": 100}, "annotations": {}},
             run_id="run_abc",
             declared_inputs=["/tmp/a.txt"],
             attempt_id=aid,
@@ -130,7 +130,7 @@ class TestApplySuccess:
 
         assert isinstance(outcome, SuccessOutcome)
         assert outcome.job_uid == "process::1"
-        assert store.state.successes["process::1"]["score"] == 100
+        assert store.state.successes["process::1"]["result"]["metadata"]["score"] == 100
         assert store.state.successes["process::1"]["last_success_run_id"] == "run_abc"
         assert store.state.successes["process::1"]["success_count"] == 1
         assert "last_succeeded_at" in store.state.successes["process::1"]
@@ -147,7 +147,7 @@ class TestApplySuccess:
         store.apply_failure("t::1", {"error_message": "boom", "success_count": 4})
         state.register_in_flight("t::1")
         aid = _open_running_attempt(backend, "t::1")
-        store.apply_success("t::1", {}, attempt_id=aid)
+        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid)
         assert store.state.successes["t::1"]["success_count"] == 5
         assert "t::1" not in store.state.failed
 
@@ -162,7 +162,7 @@ class TestApplySuccess:
 
         outcome = store.apply_success(
             "root::1",
-            {},
+            result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
             spawned_job_snapshots=spawned,
             cursor_updates={"batch_pos": "100", "old_cursor": None},
             attempt_id=aid,
@@ -179,17 +179,18 @@ class TestApplySuccess:
         aid = _open_running_attempt(backend, "t::1")
         store.apply_success(
             "t::1",
-            {"inputs": ["/user/spoofed"]},
+            result={"message": None, "exception": None, "metadata": {"inputs": ["/user/spoofed"]}, "annotations": {}},
             declared_inputs=["/b", "/a", "/b", "", 42, {"path": "/c"}],
             attempt_id=aid,
         )
         assert store.state.successes["t::1"]["inputs"] == ["/b", "/a"]
 
-    def test_user_inputs_key_dropped_without_declarations(self):
+    def test_user_inputs_key_stays_in_result_without_declarations(self):
         store, _, backend = _make_store()
         aid = _open_running_attempt(backend, "t::1")
-        store.apply_success("t::1", {"inputs": ["/user/spoofed"]}, attempt_id=aid)
+        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {"inputs": ["/user/spoofed"]}, "annotations": {}}, attempt_id=aid)
         assert "inputs" not in store.state.successes["t::1"]
+        assert store.state.successes["t::1"]["result"]["metadata"] == {"inputs": ["/user/spoofed"]}
 
 
 class TestTrustedLastSucceededAtUs:
@@ -211,7 +212,7 @@ class TestTrustedLastSucceededAtUs:
     def test_clear_history_then_seed_rejects_old_attempts_row(self):
         store, state, backend = _make_store()
         aid = _open_running_attempt(backend, "t::1")
-        store.apply_success("t::1", {}, attempt_id=aid, finished_at="2026-05-01T00:00:05+00:00")
+        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid, finished_at="2026-05-01T00:00:05+00:00")
         assert store.trusted_last_succeeded_at_us("t::1") is not None
 
         # 模拟清空 successes 历史后人工种子
@@ -249,7 +250,7 @@ class TestTrustedLastSucceededAtUs:
         aid = _open_running_attempt(backend, "t::1")
         store.apply_success(
             "t::1",
-            {},
+            result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
             run_id="run_valid",
             attempt_id=aid,
             finished_at="1970-01-01T00:00:01.123456+00:00",
@@ -318,7 +319,7 @@ class TestApplyFailureAndCascade:
         store, _, backend = _make_store()
         store.state.register_in_flight("t::1")
         aid = _open_running_attempt(backend, "t::1")
-        store.apply_success("t::1", {}, attempt_id=aid)
+        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid)
         store.state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error_message": "again"})
 
@@ -390,7 +391,7 @@ class TestApplySkip:
     def test_skip_preserves_other_in_flight_rerun_exemption(self):
         store, state, backend = _make_store()
         aid = _open_running_attempt(backend, "t::running")
-        store.apply_success("t::running", {}, attempt_id=aid)
+        store.apply_success("t::running", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid)
         state.register_in_flight("t::running")
         pending = Job("t", "skip").to_dict()
         state.spawn_jobs([pending])
@@ -465,20 +466,20 @@ class TestCommitFailureStrike:
 
         store.state.register_in_flight("task::1")
         with pytest.raises(_CommitCrashSignal):
-            store.apply_success("task::1", {}, job_snapshot=job_snapshot)
+            store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
         assert job_snapshot["runtime"]["_commit_failures"] == 1
         assert "task::1" in store.state.queue_uids
 
         store.state.pop_job(0)
         store.state.register_in_flight("task::1")
         with pytest.raises(_CommitCrashSignal):
-            store.apply_success("task::1", {}, job_snapshot=job_snapshot)
+            store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
         assert job_snapshot["runtime"]["_commit_failures"] == 2
 
         store.state.pop_job(0)
         store.state.register_in_flight("task::1")
         with pytest.raises(_JobTerminated, match="permanently failed"):
-            store.apply_success("task::1", {}, job_snapshot=job_snapshot)
+            store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
         assert "task::1" in store.state.failed
         assert store.state.failed["task::1"]["is_fatal"] is True
         assert store.state.failed["task::1"]["error_message"] == ERR_COMMIT_FAILURE
@@ -490,11 +491,11 @@ class TestCommitFailureStrike:
         for _ in range(2):
             store.state.register_in_flight("task::1")
             with pytest.raises(_CommitCrashSignal):
-                store.apply_success("task::1", {}, job_snapshot=job_snapshot)
+                store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
             store.state.pop_job(0)
         store.state.register_in_flight("task::1")
         with pytest.raises(_JobTerminated):
-            store.apply_success("task::1", {}, job_snapshot=job_snapshot)
+            store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
 
         assert len(hooks) == 1
         uid, fin = hooks[0]
@@ -910,7 +911,7 @@ class TestAttemptTraceFinalization:
         store = StateStore(backend, state)
 
         aid_ok = self._open_running(backend, "t::ok")
-        store.apply_success("t::ok", {}, attempt_id=aid_ok)
+        store.apply_success("t::ok", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid_ok)
         assert backend.load_attempts("t::ok")[0].outcome == "succeeded"
         assert backend.load_attempts("t::ok")[0].finished_at
 
@@ -963,7 +964,7 @@ class TestAttemptTraceFinalization:
         state.register_in_flight("t::1")
 
         with pytest.raises(_CommitCrashSignal, match="commit_job_success"):
-            store.apply_success("t::1", {"score": 1}, job_snapshot=job_snapshot, attempt_id=None)
+            store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {"score": 1}, "annotations": {}}, job_snapshot=job_snapshot, attempt_id=None)
 
         assert "t::1" not in store.state.successes
         assert "t::1" not in backend.load_successes()
@@ -1091,7 +1092,7 @@ class _MutexProbe:
         elif action == "success":
             self._pop_from_memory_queue(uid)
             aid = _open_running_attempt(self.backend, uid)
-            self.store.apply_success(uid, {"score": i}, attempt_id=aid)
+            self.store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"score": i}, "annotations": {}}, attempt_id=aid)
         elif action == "failure":
             self._pop_from_memory_queue(uid)
             self.store.apply_failure(uid, {"error_message": "boom"}, job_snapshot=_job_snapshot(uid))
@@ -1157,7 +1158,7 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     assert uid not in probe.store.state.successes
 
     aid = _open_running_attempt(probe.backend, uid)
-    probe.store.apply_success(uid, {"score": 1}, attempt_id=aid)
+    probe.store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"score": 1}, "annotations": {}}, attempt_id=aid)
     assert uid in probe.store.state.successes
     assert uid not in probe.store.state.failed
 
@@ -1214,7 +1215,7 @@ class TestRecordAttemptSeam:
         assert len(backend.load_attempts("skip_type::2")) == 1
 
 
-def test_success_metadata_preserves_user_keys_and_overwrites_framework_keys():
+def test_success_metadata_is_separate_from_framework_keys():
     store, state, backend = _make_store()
     metadata = {"run_count": 73, "last_run_at": "业务时间", "last_run_id": "业务身份",
                 "success_count": 99, "last_succeeded_at": "自定义时间",
@@ -1223,41 +1224,23 @@ def test_success_metadata_preserves_user_keys_and_overwrites_framework_keys():
     aid = _open_running_attempt(backend, "t::j", execution_id="actual.1", run_id="actual")
     store.apply_success(
         "t::j",
-        metadata,
+        result={"message": None, "exception": None, "metadata": metadata, "annotations": {}},
         run_id="actual",
         attempt_id=aid,
         execution_id="actual.1",
         finished_at="2026-05-01T00:00:09+00:00",
     )
     stored = backend.load_successes()["t::j"]
-    assert stored == {
-        **metadata,
-        "artifacts": {},
-        "success_count": 1,
-        "last_succeeded_at": "2026-05-01T00:00:09+00:00",
-        "last_success_run_id": "actual",
-    }
+    assert stored["result"]["metadata"] == metadata
+    assert stored["artifacts"] == {}
+    assert stored["success_count"] == 1
+    assert stored["last_succeeded_at"] == "2026-05-01T00:00:09+00:00"
+    assert stored["last_success_run_id"] == "actual"
     (rec,) = backend.load_attempts("t::j")
     assert rec.outcome == "succeeded"
     assert rec.finished_at == "2026-05-01T00:00:09+00:00"
     metadata["nested"]["error"] = "changed"
-    assert backend.load_successes()["t::j"]["nested"] == {"error": "业务"}
-
-
-def test_failure_normalization_keeps_user_keys_and_unknown_attempt_sentinel():
-    from tasklite.engine.errorclass import ErrorClassifier
-
-    metadata = {"error_message": ERR_JOB_DEPENDENCY, "error": "业务旧键", "fatal": "业务",
-                "_attempt": 7, "nested": {"error_type": "业务分类", "fatal": False}}
-    normalized = ErrorClassifier().normalize_failure_metadata(metadata)
-    assert normalized["error_category"] == "dependency"
-    assert normalized["attempt_no"] == 0
-    assert normalized["error"] == "业务旧键"
-    assert normalized["fatal"] == "业务"
-    assert normalized["_attempt"] == 7
-    assert normalized["nested"] == metadata["nested"]
-    assert "error_category" not in metadata
-    assert "attempt_no" not in metadata
+    assert backend.load_successes()["t::j"]["result"]["metadata"]["nested"] == {"error": "业务"}
 
 
 @pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
@@ -1277,15 +1260,15 @@ def test_artifact_manifest_replaces_as_part_of_success_transaction(tmp_path, bac
     state.mark_success(uid, old)
     aid = _open_running_attempt(backend, uid)
     store.apply_success(
-        uid, {"artifacts": {"forged": {"path": "/fake"}}, "payload": {"artifacts": "business"}},
+        uid, result={"message": None, "exception": None, "metadata": {"artifacts": {"forged": {"path": "/fake"}}, "payload": {"artifacts": "business"}}, "annotations": {}},
         declared_artifacts=[declaration, anonymous], attempt_id=aid,
     )
     expected = {"report": {"path": declaration.path}}
     assert state.successes[uid]["artifacts"] == expected
     assert backend.load_successes()[uid]["artifacts"] == expected
-    assert state.successes[uid]["payload"] == {"artifacts": "business"}
+    assert state.successes[uid]["result"]["metadata"]["payload"] == {"artifacts": "business"}
     aid = _open_running_attempt(backend, uid, execution_id="run_abc.2")
-    store.apply_success(uid, {"artifacts": expected}, attempt_id=aid)
+    store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"artifacts": expected}, "annotations": {}}, attempt_id=aid)
     assert state.successes[uid]["artifacts"] == {}
     assert backend.load_successes()[uid]["artifacts"] == {}
 
@@ -1302,7 +1285,7 @@ def test_artifact_manifest_does_not_change_before_success_commit(tmp_path):
     aid = _open_running_attempt(backend)
     with pytest.raises(_CommitCrashSignal):
         store.apply_success(
-            "t::1", {}, declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
+            "t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
             attempt_id=aid,
         )
     assert state.successes["t::1"] == old
@@ -1326,7 +1309,7 @@ def test_sqlite_artifact_publication_rolls_back_with_cursor_transaction(tmp_path
         connection.execute("CREATE TRIGGER reject_cursor BEFORE INSERT ON cursors BEGIN SELECT RAISE(ABORT, 'cursor unavailable'); END")
     with pytest.raises(_CommitCrashSignal):
         store.apply_success(
-            "t::1", {}, declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
+            "t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
             attempt_id=aid, cursor_updates={"batch": "2"},
             spawned_job_snapshots=[Job("child", "1").to_dict()],
         )

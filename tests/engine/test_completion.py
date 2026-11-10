@@ -179,7 +179,7 @@ class TestCompleteJobSuccess:
         env.completion.complete_job(entry, result)
 
         assert env.resources["gpu"].used == 0.0
-        assert env.store.state.successes["t::j1"]["score"] == 100
+        assert env.store.state.successes["t::j1"]["result"]["metadata"]["score"] == 100
         assert env.store.state.successes["t::j1"]["last_success_run_id"] == env.session.run_id
         assert env.store.state.successes["t::j1"]["inputs"] == [str(input_file)]
         assert env.stats["succeeded"] == 1
@@ -234,7 +234,7 @@ class TestCompleteJobFailure:
         env.store.authorizer = lambda *_args: True
 
         env.completion.complete_job(
-            entry, ExecutionResult(success=False, result_metadata={"error_message": "boom"})
+            entry, ExecutionResult(success=False, message="boom", result_metadata={"error_message": "业务错误"})
         )
 
         assert env.store.state.failed["t::j1"]["error_message"] == "boom"
@@ -384,7 +384,7 @@ class TestSpawnedJobs:
         env = CompletionEnv(tmp_path)
         env.register_task("child")
         env.store.state.register_in_flight("child::x")
-        env.store.apply_success("child::x", {}, attempt_id=env.open_attempt(Job("child", "x")))
+        env.store.apply_success("child::x", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=env.open_attempt(Job("child", "x")))
         existing = env.store.normalize_spawned_job(Job("child", "x", trigger="always"))
         env.store.state.spawn_jobs([existing])
 
@@ -407,7 +407,7 @@ class TestSpawnedJobs:
         env = CompletionEnv(tmp_path)
         env.store.state.register_in_flight("child::y")
         env.register_task("child")
-        env.store.apply_success("child::y", {}, attempt_id=env.open_attempt(Job("child", "y")))
+        env.store.apply_success("child::y", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=env.open_attempt(Job("child", "y")))
         # successes 命中 + every_run：spawn 放行（唯一终态历史行被替换语义）
 
         parent = Job("parent", "p1")

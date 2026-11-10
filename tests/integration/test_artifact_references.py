@@ -62,7 +62,7 @@ def test_direct_dependency_publishes_directory_for_actual_file_input(tmp_path):
         assert successes["consume::one"]["inputs"] == [
             str(tmp_path / "output" / "bundle")
         ]
-        assert successes["consume::one"]["content"] == "published"
+        assert successes["consume::one"]["result"]["metadata"]["content"] == "published"
     finally:
         pipeline.stop()
 

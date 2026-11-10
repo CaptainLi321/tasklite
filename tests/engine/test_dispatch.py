@@ -286,7 +286,7 @@ class TestDedupGate:
         aid = env.store.record_attempt_dispatch(
             Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
         )
-        env.store.apply_success("t::j1", {}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
+        env.store.apply_success("t::j1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
 
         outcome = env.dispatch.dispatch_next()
@@ -305,7 +305,7 @@ class TestDedupGate:
         aid = env.store.record_attempt_dispatch(
             Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
         )
-        env.store.apply_success("t::j1", {}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
+        env.store.apply_success("t::j1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
         env.store.state.spawn_jobs([Job("t", "j1", trigger="always").to_dict()])
         monkeypatch.setattr(
             env.channel, "spawn",
@@ -614,7 +614,7 @@ class TestGateOrderContract:
         aid = env.store.record_attempt_dispatch(
             Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
         )
-        env.store.apply_success("t::j1", {}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
+        env.store.apply_success("t::j1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
         env.store.state.spawn_jobs([
             Job("t", "j1", depends_on=["dead::parent"]).to_dict()
         ])

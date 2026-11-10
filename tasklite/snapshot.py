@@ -123,7 +123,6 @@ def _build_succeeded_job_dict(
 ) -> dict[str, Any]:
     is_manual = (
         succ_meta.get("annotations", {}).get("completion_source") == "manual"
-        or (succ_meta.get("run_id") is None and att is None)
     )
     if is_manual:
         run_id = None
@@ -195,7 +194,6 @@ def _build_failed_job_dict(
 ) -> dict[str, Any]:
     is_manual = (
         fail_meta.get("annotations", {}).get("completion_source") == "manual"
-        or (fail_meta.get("run_id") is None and att is None)
     )
     if is_manual:
         run_id = None

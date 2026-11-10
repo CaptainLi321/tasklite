@@ -67,7 +67,7 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
     first.stop()
     first_produce_run_id = first._runtime.store.backend.load_successes()["produce::source"]["last_success_run_id"]
     old_meta = first._runtime.store.backend.load_successes()["consume::result"]
-    assert old_meta["pid"] != os.getpid()
+    assert old_meta["result"]["metadata"]["pid"] != os.getpid()
     baseline_us = parse_utc_iso_to_us(old_meta["last_succeeded_at"])
 
     second = _pipeline(tmp_path)
@@ -99,7 +99,7 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
         assert evaluated == ["updated" if mode == "write" else "first"]
         current = second._runtime.store.backend.load_successes()["consume::result"]
         assert current["success_count"] == (2 if mode == "write" else 1)
-        assert current["content"] == evaluated[0]
+        assert current["result"]["metadata"]["content"] == evaluated[0]
         assert second._runtime.store.backend.load_failed() == {}
     assert second._runtime.store.backend.load_queue() == []
 
@@ -200,7 +200,7 @@ def test_retry_candidate_and_later_ordinary_candidate_same_run(
         )
     else:
         assert pipeline._runtime.store.backend.load_failed() == {}
-        assert pipeline._runtime.store.backend.load_successes()["child::item"]["calls"] == 2
+        assert pipeline._runtime.store.backend.load_successes()["child::item"]["result"]["metadata"]["calls"] == 2
     assert pipeline._runtime.store.backend.load_queue() == []
 
 
@@ -240,7 +240,7 @@ def test_zero_budget_retry_skips_gate_without_resetting_ordinary_candidate(tmp_p
     assert [record.attempt_no for record in records] == [1, 2]
     assert [record.outcome for record in records] == ["requeued", "succeeded"]
     assert pipeline._runtime.store.backend.load_failed() == {}
-    assert pipeline._runtime.store.backend.load_successes()["child::item"]["calls"] == 2
+    assert pipeline._runtime.store.backend.load_successes()["child::item"]["result"]["metadata"]["calls"] == 2
     assert pipeline._runtime.store.backend.load_queue() == []
 
 
@@ -299,7 +299,7 @@ def test_new_run_rechecks_retry_pending_and_resets_budget(tmp_path, gate_allows)
             (3, "succeeded"),
         ]
         assert len({row.run_id for row in records}) == 2
-        assert recovered._runtime.store.backend.load_successes()["retry::item"]["resumed_at"] == 3
+        assert recovered._runtime.store.backend.load_successes()["retry::item"]["result"]["metadata"]["resumed_at"] == 3
         assert recovered._runtime.store.backend.load_failed() == {}
     else:
         assert [(row.attempt_no, row.outcome) for row in records] == [

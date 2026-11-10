@@ -800,8 +800,8 @@ class StateStore:
     def apply_success(
         self,
         job_uid: str,
-        result_metadata: dict[str, Any],
         *,
+        result: dict[str, Any],
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
         declared_inputs: Sequence[str] = (),
@@ -811,14 +811,13 @@ class StateStore:
         attempt_no: int = 1,
         started_at: str | None = None,
         files: dict[str, Any] | None = None,
-        result: dict[str, Any] | None = None,
         attempt_id: int | None = None,
         execution_id: str | None = None,
         finished_at: str | None = None,
     ) -> SuccessOutcome:
         """原子终态转移：成功（同事务终结对应 attempts 行 + successes 落盘 + 清失败档案残行 + 子任务/cursor）。"""
         effective_finished_at = finished_at if finished_at is not None else utc_now_iso()
-        success_metadata = copy.deepcopy(result_metadata) if result_metadata else {}
+        success_metadata = self._execution_record(result, files)
         declarations = tuple(declared_artifacts)
         success_metadata["artifacts"] = {
             declaration.name: {"path": declaration.path}
@@ -827,11 +826,8 @@ class StateStore:
         success_metadata["last_succeeded_at"] = effective_finished_at
         if run_id is not None:
             success_metadata["last_success_run_id"] = run_id
-        else:
-            success_metadata.pop("last_success_run_id", None)
         if job_snapshot is not None:
             success_metadata["job_snapshot"] = copy.deepcopy(job_snapshot)
-        success_metadata.pop("inputs", None)
         if declared_inputs:
             input_paths = list(dict.fromkeys(
                 path for path in declared_inputs if isinstance(path, str) and path
@@ -861,7 +857,7 @@ class StateStore:
                 started_at=started_at,
                 job_snapshot=job_snapshot,
                 files=files,
-                result=result,
+                result=success_metadata["result"],
                 error_message=None,
                 success_metadata=success_metadata,
                 spawned_job_snapshots=spawned_snapshots,
@@ -914,11 +910,13 @@ class StateStore:
     ) -> FailureOutcome:
         """原子终态转移：永久失败（进入失败档案 + successes 互删 + 级联下游）。"""
         normalized_meta = self._classifier.normalize_failure_metadata(failure_metadata)
+        effective_settled_at = settled_at if settled_at is not None else utc_now_iso()
+        if result is not None:
+            normalized_meta.update(self._execution_record(result, files))
         if job_snapshot is not None:
             normalized_meta["job_snapshot"] = copy.deepcopy(job_snapshot)
         payload = self._extract_job_payload(job_snapshot)
         if self._backend.schema_version >= TARGET_SCHEMA_VERSION and attempt_no is not None:
-            effective_settled_at = settled_at if settled_at is not None else utc_now_iso()
             committed = self._backend.commit_job_settlement(
                 job_uid=job_uid,
                 outcome="failure",
@@ -929,7 +927,7 @@ class StateStore:
                 started_at=started_at,
                 job_snapshot=job_snapshot,
                 files=files,
-                result=result,
+                result=normalized_meta.get("result"),
                 error_message=self._attempt_error(normalized_meta),
                 failure_metadata=normalized_meta,
                 payload=payload,
@@ -960,6 +958,21 @@ class StateStore:
             attempt_id=attempt_id,
         )
         return FailureOutcome(job_uid=job_uid, failure_metadata=normalized_meta)
+
+    @staticmethod
+    def _execution_record(
+        result: dict[str, Any], files: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """业务数据只存在于 result.metadata；档案根部仅容纳框架字段。"""
+        result = copy.deepcopy(result)
+        result["annotations"] = {
+            **result.get("annotations", {}), "completion_source": "execution",
+        }
+        return {
+            "result": result,
+            "annotations": {"completion_source": "execution"},
+            "files": copy.deepcopy(files or {}),
+        }
 
     @staticmethod
     def _extract_job_payload(job_snapshot: dict[str, Any] | None) -> dict[str, Any] | None:

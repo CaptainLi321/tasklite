@@ -220,7 +220,7 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
     assert cursor == ("42",)
     assert queue == [("child::child",)]
     assert backend.load_queue() == []
-    pid = metadata["worker_pid"]
+    pid = metadata["result"]["metadata"]["worker_pid"]
     assert pid != os.getpid()
     pipeline.stop()
 
@@ -229,7 +229,7 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
     result = reopened.run()
     assert result is None
     assert len(reopened._runtime.store.backend.load_attempts("parent::parent")) == 1
-    assert reopened._runtime.store.backend.load_successes()["parent::parent"]["worker_pid"] == pid
+    assert reopened._runtime.store.backend.load_successes()["parent::parent"]["result"]["metadata"]["worker_pid"] == pid
     assert reopened._runtime.store.backend.load_cursors()["position"] == "42"
     reopened.enqueue(Job("parent", "parent"))
     assert reopened.run() is None
@@ -372,7 +372,7 @@ def test_stop_commits_complete_result_already_received(pipelines, monkeypatch):
     monkeypatch.setattr(channel, "_accept_message", accept_and_stop)
     res = pipeline.run()
     assert res is None
-    assert pipeline._runtime.store.backend.load_successes()["child::done"]["child"] is True
+    assert pipeline._runtime.store.backend.load_successes()["child::done"]["result"]["metadata"]["child"] is True
     assert pipeline._runtime.store.backend.load_queue() == []
     assert pipeline._runtime.store.backend.load_attempts("child::done")[0].outcome == "succeeded"
 

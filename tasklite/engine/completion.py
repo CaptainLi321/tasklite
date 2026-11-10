@@ -445,7 +445,6 @@ class CompletionMachine:
                 )
                 failure_metadata: dict[str, Any] = {
                     "error_message": ERR_MAX_RETRIES,
-                    "metadata": copy.deepcopy(result.result_metadata),
                 }
                 if result.message is not None:
                     failure_metadata["message"] = result.message
@@ -537,7 +536,6 @@ class CompletionMachine:
         duration = (time.monotonic() - started_monotonic) if started_monotonic is not None else 0.0
         logger.info(f"SUCCESS: {uid} (duration {duration:.2f}s)")
 
-        success_metadata = dict(result.result_metadata or {})
         files_dict = (
             {k: v.to_dict() for k, v in active_files.items()}
             if active_files
@@ -556,7 +554,6 @@ class CompletionMachine:
 
         self._store.apply_success(
             uid,
-            success_metadata,
             spawned_job_snapshots=spawned_job_snapshots,
             cursor_updates=result.cursor_updates,
             declared_inputs=effective_inputs,
@@ -657,23 +654,10 @@ class CompletionMachine:
             f"FAIL: {uid} (duration {duration:.2f}s, sent to failure archive). "
             f"Message: {result.message}, Meta: {result.result_metadata}"
         )
-        failure_record: dict[str, Any] = failure_record_override if failure_record_override is not None else copy.deepcopy(result.result_metadata)
+        failure_record: dict[str, Any] = copy.deepcopy(failure_record_override) if failure_record_override is not None else {}
         if failure_record_override is None:
-            if result.message is not None and "error_message" not in failure_record:
+            if result.message is not None:
                 failure_record["error_message"] = result.message
-            if result.message is not None and "message" not in failure_record:
-                failure_record["message"] = result.message
-            if result.exception is not None and "exception" not in failure_record:
-                failure_record["exception"] = copy.deepcopy(result.exception)
-            if "metadata" not in failure_record:
-                failure_record["metadata"] = copy.deepcopy(result.result_metadata)
-            for key in (
-                "cleanup_error",
-                "cleanup_exception",
-                "cleanup_original_message",
-            ):
-                if key in result.annotations and key not in failure_record:
-                    failure_record[key] = copy.deepcopy(result.annotations[key])
 
         files_dict = (
             {k: v.to_dict() for k, v in active_files.items()}

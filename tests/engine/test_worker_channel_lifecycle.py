@@ -119,8 +119,8 @@ def test_worker_lingers_after_result_does_not_block_dispatch_and_run_waits(tmp_p
     successes = pipeline._runtime.store.backend.load_successes()
     assert "lingering::j1" in successes
     assert "fast::j2" in successes
-    assert successes["lingering::j1"]["step"] == 1
-    assert successes["fast::j2"]["fast"] is True
+    assert successes["lingering::j1"]["result"]["metadata"]["step"] == 1
+    assert successes["fast::j2"]["result"]["metadata"]["fast"] is True
 
     # 管道与进程资源已回收
     pipeline.stop()
@@ -143,8 +143,8 @@ def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
     failed = pipeline._runtime.store.backend.load_failed()
     assert list(failed) == ["crash::j1"]
     failed_meta = failed["crash::j1"]
-    assert "PROCESS_CRASH_EXITCODE_42" in failed_meta.get("metadata", {}).get("error_message", "")
-    assert failed_meta["metadata"]["exitcode"] == 42
+    assert failed_meta["result"]["message"] == "PROCESS_CRASH_EXITCODE_42"
+    assert failed_meta["result"]["metadata"]["exitcode"] == 42
     assert "retry_error" not in failed_meta
 
     attempts = pipeline._runtime.store.backend.load_attempts("crash::j1")
@@ -184,12 +184,12 @@ def test_worker_faults_settle_one_failure(
     failed = pipeline._runtime.store.backend.load_failed()
     assert list(failed) == [f"{task_type}::j1"]
     entry = failed[f"{task_type}::j1"]
-    assert entry["message"] == message
+    assert entry["result"]["message"] == message
     assert entry["error_message"] == message
     if exception_type is None:
-        assert entry.get("exception") is None
+        assert entry["result"]["exception"] is None
     else:
-        assert entry["exception"]["type"] == exception_type
+        assert entry["result"]["exception"]["type"] == exception_type
 
     attempts = pipeline._runtime.store.backend.load_attempts(f"{task_type}::j1")
     assert len(attempts) == 1
@@ -275,7 +275,7 @@ def test_worker_exit_error_after_result_does_not_rewrite_success(tmp_path):
 
     successes = pipeline._runtime.store.backend.load_successes()
     assert "die_later::j1" in successes
-    assert successes["die_later::j1"]["returned"] is True
+    assert successes["die_later::j1"]["result"]["metadata"]["returned"] is True
     assert pipeline._runtime.store.backend.load_failed() == {}
 
     attempts = pipeline._runtime.store.backend.load_attempts("die_later::j1")
