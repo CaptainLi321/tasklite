@@ -183,7 +183,7 @@ def _normalize_resources(resources: Any) -> dict[str, float]:
     （不可读），入口显式拒绝；数值规则委托模型层共享校验单点。
     """
     if resources is not None and not isinstance(resources, dict):
-        raise TypeError(
+        raise TaskLiteError(
             f"resources must be a dict or None, got {type(resources).__name__} ({resources!r})"
         )
     normalized = dict(resources) if resources else {}
@@ -198,12 +198,12 @@ def _normalize_depends_on(depends_on: Any) -> list[str]:
     检查会把 "parent::id" 静默肢解为字符列表，作业以依赖死锁死亡。
     """
     if depends_on is not None and not isinstance(depends_on, (list, tuple)):
-        raise TypeError(
+        raise TaskLiteError(
             f"depends_on must be a list of strings, got {type(depends_on).__name__}"
         )
     normalized = list(depends_on) if depends_on is not None else []
     if not all(isinstance(d, str) for d in normalized):
-        raise TypeError(
+        raise TaskLiteError(
             f"depends_on must contain only strings, got {normalized!r}"
         )
     return normalized

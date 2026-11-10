@@ -57,9 +57,9 @@ class TestFileSpecRolesAndCleanup:
         assert ref.delete_on_failure is delete_on_failure
         assert ref.delete_on_success is delete_on_success
 
-        with pytest.raises(ValueError, match="delete_existing"):
+        with pytest.raises(TaskLiteError, match="delete_existing"):
             FileSpec("in/raw.csv", role="input", delete_existing=True)
-        with pytest.raises(ValueError, match="delete_existing"):
+        with pytest.raises(TaskLiteError, match="delete_existing"):
             FileSpec.from_output("gen::1", "raw", role="input", delete_existing=True)
 
     @pytest.mark.parametrize("role", ["output", "cache"])
@@ -86,28 +86,28 @@ class TestFileSpecRolesAndCleanup:
             FileSpec("a.txt", "output")  # type: ignore[misc]
         with pytest.raises(TypeError, match="role"):
             FileSpec("a.txt")  # type: ignore[call-arg]
-        with pytest.raises(TypeError, match="role must be a str"):
+        with pytest.raises(TaskLiteError, match="role must be a str"):
             FileSpec("a.txt", role=123)  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="role must be one of"):
+        with pytest.raises(TaskLiteError, match="role must be one of"):
             FileSpec("a.txt", role="temp")  # type: ignore[arg-type]
         for field in ("delete_existing", "delete_on_failure", "delete_on_success"):
-            with pytest.raises(TypeError, match="bool"):
+            with pytest.raises(TaskLiteError, match="bool"):
                 FileSpec("a.txt", role="output", **{field: 1})  # type: ignore[arg-type]
 
     def test_invalid_path_and_from_output_args_rejected(self):
-        with pytest.raises(TypeError, match="str or Path"):
+        with pytest.raises(TaskLiteError, match="str or Path"):
             FileSpec(123, role="output")  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="non-empty"):
+        with pytest.raises(TaskLiteError, match="non-empty"):
             FileSpec("", role="output")
-        with pytest.raises(ValueError, match="null bytes"):
+        with pytest.raises(TaskLiteError, match="null bytes"):
             FileSpec("a\x00b", role="output")
-        with pytest.raises(TypeError, match="producer_uid must be a str"):
+        with pytest.raises(TaskLiteError, match="producer_uid must be a str"):
             FileSpec.from_output(1, "out", role="input")  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="producer_uid must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="producer_uid must be a non-empty str"):
             FileSpec.from_output("", "out", role="input")
-        with pytest.raises(TypeError, match="output_name must be a str"):
+        with pytest.raises(TaskLiteError, match="output_name must be a str"):
             FileSpec.from_output("p::1", None, role="input")  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="output_name must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="output_name must be a non-empty str"):
             FileSpec.from_output("p::1", "", role="input")
 
 
@@ -162,9 +162,9 @@ class TestFileSpecSerializationAndFilesystemSafety:
 
     def test_from_dict_rejects_unknown_or_mixed_keys(self):
         valid_path = FileSpec("/tmp/a.txt", role="output").to_dict()
-        with pytest.raises(ValueError, match="Invalid FileSpec dict keys"):
+        with pytest.raises(TaskLiteError, match="Invalid FileSpec dict keys"):
             FileSpec.from_dict({**valid_path, "sandbox": True})
-        with pytest.raises(ValueError, match="Invalid FileSpec dict keys"):
+        with pytest.raises(TaskLiteError, match="Invalid FileSpec dict keys"):
             FileSpec.from_dict({**valid_path, "producer_uid": "p::1", "output_name": "o"})
 
     def test_construction_and_serialization_never_create_dirs_or_delete_files(self, tmp_path):

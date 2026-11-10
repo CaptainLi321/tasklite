@@ -32,14 +32,14 @@ _OUTPUT_REF_SPEC_KEYS = frozenset({
 def _normalize_lexical_path(path: str | Path) -> str:
     """校验并词法规范化路径字符串（不触碰磁盘，保留相对或绝对形态）。"""
     if not isinstance(path, (str, Path)):
-        raise TypeError(
+        raise TaskLiteError(
             f"FileSpec path must be a str or Path, got {type(path).__name__}"
         )
     if isinstance(path, str) and not path:
-        raise ValueError("FileSpec path must be non-empty")
+        raise TaskLiteError("FileSpec path must be non-empty")
     raw = os.fspath(path)
     if not isinstance(raw, str) or not raw or "\x00" in raw:
-        raise ValueError("FileSpec path must be a non-empty path without null bytes")
+        raise TaskLiteError("FileSpec path must be a non-empty path without null bytes")
     norm = os.path.normpath(raw)
     if os.name == "posix" and norm.startswith("//"):
         norm = "/" + norm.lstrip("/")
@@ -53,7 +53,7 @@ def resolve_path_against_base(path: str | Path, base_dir: str | Path) -> str:
     if os.name == "nt":
         path_drive, path_root = os.path.splitdrive(norm)
         if path_drive and not path_root:
-            raise ValueError(
+            raise TaskLiteError(
                 f"drive-relative FileSpec paths are not portable: {norm!r}"
             )
     if not os.path.isabs(base_norm):
@@ -74,18 +74,18 @@ def _validate_role_and_cleanup(
     delete_on_success: Any,
 ) -> FileRole:
     if not isinstance(role, str):
-        raise TypeError(f"FileSpec role must be a str, got {type(role).__name__}")
+        raise TaskLiteError(f"FileSpec role must be a str, got {type(role).__name__}")
     if role not in FILE_ROLES:
-        raise ValueError(f"FileSpec role must be one of {FILE_ROLES}, got {role!r}")
+        raise TaskLiteError(f"FileSpec role must be one of {FILE_ROLES}, got {role!r}")
     for field_name, value in (
         ("delete_existing", delete_existing),
         ("delete_on_failure", delete_on_failure),
         ("delete_on_success", delete_on_success),
     ):
         if type(value) is not bool:
-            raise TypeError(f"{field_name} must be a bool, got {type(value).__name__}")
+            raise TaskLiteError(f"{field_name} must be a bool, got {type(value).__name__}")
     if role == "input" and delete_existing:
-        raise ValueError("input FileSpec cannot set delete_existing=True")
+        raise TaskLiteError("input FileSpec cannot set delete_existing=True")
     return cast(FileRole, role)
 
 
@@ -135,17 +135,17 @@ class FileSpec:
     ) -> FileSpec:
         """构造指向显式直接依赖上游具名 output 产物的引用声明。"""
         if not isinstance(producer_uid, str):
-            raise TypeError(
+            raise TaskLiteError(
                 f"producer_uid must be a str, got {type(producer_uid).__name__}"
             )
         if not producer_uid or "\x00" in producer_uid:
-            raise ValueError("producer_uid must be a non-empty str")
+            raise TaskLiteError("producer_uid must be a non-empty str")
         if not isinstance(output_name, str):
-            raise TypeError(
+            raise TaskLiteError(
                 f"output_name must be a str, got {type(output_name).__name__}"
             )
         if not output_name or "\x00" in output_name:
-            raise ValueError("output_name must be a non-empty str")
+            raise TaskLiteError("output_name must be a non-empty str")
         validated_role = _validate_role_and_cleanup(
             role, delete_existing, delete_on_failure, delete_on_success
         )
@@ -193,7 +193,7 @@ class FileSpec:
         else:
             abs_path = _normalize_lexical_path(resolved_path)
             if not os.path.isabs(abs_path):
-                raise ValueError(
+                raise TaskLiteError(
                     f"resolved_path must be an absolute path when base_dir is None, got {resolved_path!r}"
                 )
         return FileSpec(
@@ -227,14 +227,14 @@ class FileSpec:
     def from_dict(cls, data: Mapping[str, Any]) -> FileSpec:
         """从统一 JSON 字典表示严格还原 FileSpec，拒绝未知键或混用形态。"""
         if not isinstance(data, Mapping):
-            raise TypeError(
+            raise TaskLiteError(
                 f"FileSpec data must be a dict, got {type(data).__name__}"
             )
         keys = set(data.keys())
         if keys == _PATH_SPEC_KEYS:
             raw_path = data["path"]
             if not isinstance(raw_path, str):
-                raise TypeError(
+                raise TaskLiteError(
                     f"FileSpec JSON path must be a str, got {type(raw_path).__name__}"
                 )
             return cls(
@@ -253,7 +253,7 @@ class FileSpec:
                 delete_on_failure=data["delete_on_failure"],
                 delete_on_success=data["delete_on_success"],
             )
-        raise ValueError(
+        raise TaskLiteError(
             f"Invalid FileSpec dict keys: {sorted(keys)!r}; expected "
             f"{sorted(_PATH_SPEC_KEYS)!r} or {sorted(_OUTPUT_REF_SPEC_KEYS)!r}"
         )
@@ -262,12 +262,12 @@ class FileSpec:
 def validate_file_name(name: Any) -> str:
     """校验文件声明名称：非空且不含空字节的 str。"""
     if not isinstance(name, str) or not name:
-        raise TypeError(
+        raise TaskLiteError(
             f"file key in files must be a non-empty str, "
             f"got {type(name).__name__} ({name!r})"
         )
     if "\x00" in name:
-        raise ValueError("file key in files must not contain null bytes")
+        raise TaskLiteError("file key in files must not contain null bytes")
     return name
 
 
@@ -277,7 +277,7 @@ def coerce_file_spec(value: Any, *, allow_dict: bool = False) -> FileSpec:
         return value
     if allow_dict and isinstance(value, Mapping):
         return FileSpec.from_dict(value)
-    raise TypeError(
+    raise TaskLiteError(
         f"file spec in files must be a FileSpec, got {type(value).__name__} ({value!r})"
     )
 
@@ -291,7 +291,7 @@ def parse_job_files_config(
     if files is None:
         return {}
     if not isinstance(files, dict):
-        raise TypeError(
+        raise TaskLiteError(
             f"files must be a dict or None, got {type(files).__name__} ({files!r})"
         )
     parsed: dict[str, FileSpec] = {}
@@ -348,7 +348,7 @@ def merge_named_file_spec(
     """
     validated_name = validate_file_name(name)
     if not isinstance(spec, FileSpec):
-        raise TypeError(
+        raise TaskLiteError(
             f"spec must be a FileSpec, got {type(spec).__name__} ({spec!r})"
         )
     if spec.is_output_ref and depends_on is not None:

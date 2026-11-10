@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite import FileSpec, Job, TaskLite, TaskResult
 from tasklite.engine.errorclass import ERR_MAX_RETRIES
 from tasklite.triggers import on_input_change
@@ -562,7 +564,7 @@ def test_legacy_trigger_pending_is_preserved_and_rejected_on_use(tmp_path):
     reopened = _pipeline(tmp_path)
     reopened.register_task("work", _record_until_success_call)
     assert reopened._runtime.store.backend.load_queue() == [legacy]
-    with pytest.raises(ValueError, match="unregistered trigger 'on_failure'"):
+    with pytest.raises(TaskLiteError, match="unregistered trigger 'on_failure'"):
         reopened.run()
     reopened.stop()
 

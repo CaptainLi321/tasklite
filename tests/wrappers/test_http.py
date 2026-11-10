@@ -18,6 +18,8 @@ from typing import Any
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite import Job, JobContext, StateSnapshot, TaskLite, TaskResult
 from tasklite.wrappers.http import (
     FatalError,
@@ -389,7 +391,7 @@ def test_policy_classifier_invalid_return_fails_loud() -> None:
     unrelated_class_policy = HttpPolicy(
         status_classifier=lambda code, resp: ValueError if code == 500 else None
     )
-    with pytest.raises(TypeError):
+    with pytest.raises(TaskLiteError):
         http_guard(policy=unrelated_class_policy).check_response(
             HttpResponse(status_code=500, headers={}, body=b"err")
         )
@@ -397,7 +399,7 @@ def test_policy_classifier_invalid_return_fails_loud() -> None:
     non_class_policy = HttpPolicy(
         status_classifier=lambda code, resp: "FatalError" if code == 500 else None
     )
-    with pytest.raises(TypeError):
+    with pytest.raises(TaskLiteError):
         http_guard(policy=non_class_policy).check_response(
             HttpResponse(status_code=500, headers={}, body=b"err")
         )

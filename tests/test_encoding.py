@@ -92,9 +92,9 @@ def test_percent_encode_escapes_percent_first_under_custom_charset():
 def test_percent_encode_rejects_non_str():
     # 隐式 str() 强转会让 None 与字面 "None" 同像碰撞（多对一，破坏单射契约），
     # 非 str 输入入口显式拒绝，不做静默强转
-    with pytest.raises(TypeError):
+    with pytest.raises(TaskLiteError):
         percent_encode(None)
-    with pytest.raises(TypeError):
+    with pytest.raises(TaskLiteError):
         percent_encode(123)
 
 
@@ -224,7 +224,7 @@ def test_encode_job_component_delegation_and_invariants():
 
 
 def test_encode_family_rejects_non_str_non_none():
-    """非 str 非 None 入参显式 TypeError 拒绝，与 percent_encode 拒绝原则对齐。
+    """非 str 非 None 入参显式 TaskLiteError 拒绝，与 percent_encode 拒绝原则对齐。
 
     隐式 str() 强转会让 int 123 与 str "123" 同像碰撞（多对一，破坏单射
     契约）——三个派生编码函数是公共导出 API 的 job_id 派生防线，successes 去
@@ -232,14 +232,14 @@ def test_encode_family_rejects_non_str_non_none():
     """
     for fn in (encode_identifier, encode_job_component, encode_content_id):
         for bad in (123, 1.5, True, b"123", ["123"], ("123",)):
-            with pytest.raises(TypeError):
+            with pytest.raises(TaskLiteError):
                 fn(bad)
     # None 与空串仍走哨兵（不拒绝）
     assert encode_identifier(None) == EMPTY_SENTINEL
     assert encode_job_component(None) == EMPTY_SENTINEL
     assert encode_content_id(None) == EMPTY_SENTINEL
-    # 拒绝发生在哨兵与截断逻辑之前：即便 max_len 非法也先报 TypeError
-    with pytest.raises(TypeError):
+    # 拒绝发生在哨兵与截断逻辑之前：即便 max_len 非法也先明确拒绝
+    with pytest.raises(TaskLiteError):
         encode_identifier(123, max_len=10)
 
 
@@ -360,12 +360,12 @@ def test_small_max_len_passthrough_only_or_fails_loud(text, max_len):
     if len(escaped) <= max_len:
         assert encode_identifier(text, max_len=max_len) == escaped
     else:
-        with pytest.raises(ValueError):
+        with pytest.raises(TaskLiteError):
             encode_identifier(text, max_len=max_len)
     if len(escaped_cid) <= max_len:
         assert encode_content_id(text, max_len=max_len) == escaped_cid
     else:
-        with pytest.raises(ValueError):
+        with pytest.raises(TaskLiteError):
             encode_content_id(text, max_len=max_len)
 
 

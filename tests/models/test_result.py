@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+from tasklite import TaskLiteError
+
 import tasklite
 from tasklite import TaskResult
 from tasklite.models import TaskResult as ModelsTaskResult
@@ -52,11 +54,11 @@ class TestTaskResultExportsAndConstruction:
         assert "TaskResult" in tasklite.__all__
 
     def test_direct_instantiation_forbidden(self) -> None:
-        with pytest.raises(TypeError, match="cannot be instantiated directly"):
+        with pytest.raises(TaskLiteError, match="cannot be instantiated directly"):
             TaskResult()
-        with pytest.raises(TypeError, match="cannot be instantiated directly"):
+        with pytest.raises(TaskLiteError, match="cannot be instantiated directly"):
             TaskResult("success")
-        with pytest.raises(TypeError, match="cannot be instantiated directly"):
+        with pytest.raises(TaskLiteError, match="cannot be instantiated directly"):
             TaskResult(status="success")
 
     def test_positional_arguments_rejected(self) -> None:
@@ -127,7 +129,7 @@ class TestTaskResultExportsAndConstruction:
             TaskResult.failure(consume_budget=False)  # type: ignore[call-arg]
 
         for bad_budget in (1, 0, None, "true", _CustomInt(1)):
-            with pytest.raises(TypeError, match="consume_budget"):
+            with pytest.raises(TaskLiteError, match="consume_budget"):
                 TaskResult.retry(consume_budget=bad_budget)  # type: ignore[arg-type]
 
 
@@ -136,11 +138,11 @@ class TestTaskResultValidationAndImmutability:
 
     @pytest.mark.parametrize("bad_msg", [123, b"bytes", ["msg"], _CustomStr("sub")])
     def test_message_rejects_non_exact_str(self, bad_msg: Any) -> None:
-        with pytest.raises(TypeError, match="message"):
+        with pytest.raises(TaskLiteError, match="message"):
             TaskResult.success(message=bad_msg)
 
     def test_message_rejects_lone_surrogate(self) -> None:
-        with pytest.raises(ValueError, match="UTF-8"):
+        with pytest.raises(TaskLiteError, match="UTF-8"):
             TaskResult.failure(message="\ud800")
 
     @pytest.mark.parametrize(
@@ -155,16 +157,16 @@ class TestTaskResultValidationAndImmutability:
         ],
     )
     def test_metadata_top_level_must_be_exact_dict_or_none(self, bad_top: Any) -> None:
-        with pytest.raises(TypeError, match="metadata"):
+        with pytest.raises(TaskLiteError, match="metadata"):
             TaskResult.success(metadata=bad_top)
 
     @pytest.mark.parametrize("bad_key", [1, None, ("a",), _CustomStr("k")])
     def test_metadata_keys_must_be_exact_str(self, bad_key: Any) -> None:
-        with pytest.raises(TypeError, match="keys must be exact str"):
+        with pytest.raises(TaskLiteError, match="keys must be exact str"):
             TaskResult.success(metadata={bad_key: "v"})  # type: ignore[dict-item]
 
     def test_metadata_key_rejects_lone_surrogate(self) -> None:
-        with pytest.raises(ValueError, match="UTF-8"):
+        with pytest.raises(TaskLiteError, match="UTF-8"):
             TaskResult.success(metadata={"\ud800": 1})
 
     @pytest.mark.parametrize(
@@ -186,16 +188,16 @@ class TestTaskResultValidationAndImmutability:
         ],
     )
     def test_metadata_rejects_non_json_types_and_subclasses(self, bad_val: Any) -> None:
-        with pytest.raises(TypeError):
+        with pytest.raises(TaskLiteError):
             TaskResult.success(metadata={"bad": bad_val})
-        with pytest.raises(TypeError):
+        with pytest.raises(TaskLiteError):
             TaskResult.success(metadata={"nested": [bad_val]})
 
     @pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
     def test_metadata_rejects_non_finite_floats(self, non_finite: float) -> None:
-        with pytest.raises(ValueError, match="finite float"):
+        with pytest.raises(TaskLiteError, match="finite float"):
             TaskResult.success(metadata={"score": non_finite})
-        with pytest.raises(ValueError, match="finite float"):
+        with pytest.raises(TaskLiteError, match="finite float"):
             TaskResult.retry(metadata={"nested": {"list": [non_finite]}})
 
     def test_metadata_defensive_copy_and_immutability(self) -> None:

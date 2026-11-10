@@ -3,6 +3,8 @@ import sqlite3
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite.backend import SQLiteStateBackend
 
 
@@ -21,7 +23,7 @@ def test_nonempty_incompatible_database_is_preserved(tmp_path, version):
         conn.execute("INSERT INTO records VALUES ('precious')")
         conn.execute(f"PRAGMA user_version={version}")
     before = snapshot(path)
-    with pytest.raises(RuntimeError) as caught:
+    with pytest.raises(TaskLiteError) as caught:
         SQLiteStateBackend(path)
     assert snapshot(path) == before
     assert str(path) in str(caught.value)
@@ -40,7 +42,7 @@ def test_version_zero_with_any_application_object_is_rejected(tmp_path, setup):
     with sqlite3.connect(path) as conn:
         conn.execute(setup)
     before = snapshot(path)
-    with pytest.raises(RuntimeError, match="version 0 非空库"):
+    with pytest.raises(TaskLiteError, match="version 0 非空库"):
         SQLiteStateBackend(path)
     assert snapshot(path) == before
 
@@ -62,7 +64,7 @@ def test_existing_schema_must_remain_complete_and_unmixed(tmp_path, change):
     with sqlite3.connect(path) as conn:
         conn.execute(change)
     before = snapshot(path)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(TaskLiteError):
         SQLiteStateBackend(path)
     assert snapshot(path) == before
 
@@ -74,7 +76,7 @@ def test_same_named_view_is_rejected_without_repair(tmp_path):
         conn.execute("DROP TABLE queue")
         conn.execute("CREATE VIEW queue AS SELECT '' AS job_uid, 0 AS queue_position, '' AS job_snapshot")
     before = snapshot(path)
-    with pytest.raises(RuntimeError, match="必须为 table"):
+    with pytest.raises(TaskLiteError, match="必须为 table"):
         SQLiteStateBackend(path)
     assert snapshot(path) == before
 
@@ -131,7 +133,7 @@ def test_readonly_preflight_sees_committed_wal(tmp_path, monkeypatch):
             return real_connect(database, *args, **kwargs)
 
         monkeypatch.setattr(sqlite3, "connect", connect)
-        with pytest.raises(RuntimeError, match="schema version 3"):
+        with pytest.raises(TaskLiteError, match="schema version 3"):
             SQLiteStateBackend(path)
         assert len(calls) == 1
         assert calls[0][1]["uri"] is True
@@ -191,7 +193,7 @@ def test_initialization_rechecks_before_application_writes(tmp_path, monkeypatch
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(sqlite3, "connect", connect)
-    with pytest.raises(RuntimeError, match="schema version 3"):
+    with pytest.raises(TaskLiteError, match="schema version 3"):
         SQLiteStateBackend(path)
     assert writes == []
     with real_connect(path) as conn:
@@ -226,7 +228,7 @@ def test_version_zero_cannot_hide_user_table_with_similar_internal_prefix(tmp_pa
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE sqliteXuser (value TEXT)")
     before = snapshot(path)
-    with pytest.raises(RuntimeError, match="非空库"):
+    with pytest.raises(TaskLiteError, match="非空库"):
         SQLiteStateBackend(path)
     assert snapshot(path) == before
 
@@ -237,7 +239,7 @@ def test_core_generated_extra_column_is_rejected(tmp_path):
     with sqlite3.connect(path) as conn:
         conn.execute("ALTER TABLE queue ADD COLUMN generated TEXT GENERATED ALWAYS AS ('extra')")
     before = snapshot(path)
-    with pytest.raises(RuntimeError, match="Unsupported table shape"):
+    with pytest.raises(TaskLiteError, match="Unsupported table shape"):
         SQLiteStateBackend(path)
     assert snapshot(path) == before
 
@@ -260,6 +262,6 @@ def test_legacy_table_names_are_case_insensitive(tmp_path, legacy):
     with sqlite3.connect(path) as conn:
         conn.execute(f"CREATE TABLE {legacy} (value TEXT)")
     before = snapshot(path)
-    with pytest.raises(RuntimeError, match="异代"):
+    with pytest.raises(TaskLiteError, match="异代"):
         SQLiteStateBackend(path)
     assert snapshot(path) == before

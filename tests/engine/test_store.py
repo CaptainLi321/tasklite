@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections import defaultdict
 
 import pytest
+
+from tasklite import TaskLiteError
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
@@ -752,12 +754,12 @@ class TestIntakePipeline:
         )
         job = Job("t", "1")
         job.payload["bad"] = object()
-        with pytest.raises(TypeError, match="payload.bad"):
+        with pytest.raises(TaskLiteError, match="payload.bad"):
             store.enqueue_job(job)
 
     def test_enqueue_rejects_non_job(self):
         store, _, _ = _make_store()
-        with pytest.raises(TypeError):
+        with pytest.raises(TaskLiteError):
             store.enqueue_job("not-a-job")  # type: ignore[arg-type]
 
     def test_enqueue_rejects_unregistered_task(self):
@@ -840,7 +842,7 @@ class TestIntakePipeline:
         )
         job = Job("t", "1")
         job.payload["bad"] = object()
-        with pytest.raises(TypeError, match="payload.bad"):
+        with pytest.raises(TaskLiteError, match="payload.bad"):
             store.normalize_spawned_job(job)
 
     def test_normalize_spawned_job_rejects_unregistered_task(self):

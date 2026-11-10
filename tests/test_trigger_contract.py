@@ -71,7 +71,7 @@ def test_unknown_trigger_raises_preserving_candidate_and_budget(tmp_path):
     before_queue = pipeline._runtime.store.backend.load_queue()
     before_successes = pipeline._runtime.store.backend.load_successes()
     before_failed = pipeline._runtime.store.backend.load_failed()
-    with pytest.raises(ValueError, match="unregistered trigger"):
+    with pytest.raises(TaskLiteError, match="unregistered trigger"):
         pipeline.enqueue(Job("t", "b", trigger="missing"))
     assert pipeline._runtime.store.backend.load_queue() == before_queue
     assert pipeline._runtime.store.backend.load_successes() == before_successes
@@ -83,7 +83,7 @@ def test_inherited_unknown_trigger_rejected_at_enqueue(tmp_path):
     import pytest
     pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "trigger.db")
     pipeline.register_task("t", handle, trigger="missing")
-    with pytest.raises(ValueError, match="unregistered trigger"):
+    with pytest.raises(TaskLiteError, match="unregistered trigger"):
         pipeline.enqueue(Job("t", "a"))
     assert pipeline._runtime.store.backend.load_queue() == []
     assert pipeline._runtime.store.backend.load_successes() == {}
@@ -105,8 +105,8 @@ def test_callback_failure_and_non_bool_return_preserve_queue():
     import pytest
     for name, fn, error in [
         ("error", lambda ctx: 1 / 0, ZeroDivisionError),
-        ("integer", lambda ctx: 1, TypeError),
-        ("none", lambda ctx: None, TypeError),
+        ("integer", lambda ctx: 1, TaskLiteError),
+        ("none", lambda ctx: None, TaskLiteError),
     ]:
         pipeline = TaskLite(backend="memory")
         pipeline.register_trigger(name, fn)
@@ -125,14 +125,14 @@ def test_register_trigger_rejects_duplicate_builtin_and_invalid_callable():
     from tasklite.testing import running
     pipeline = TaskLite(backend="memory")
     for name in ["once", "until_success", "on_input_change", "always"]:
-        with pytest.raises(ValueError):
+        with pytest.raises(TaskLiteError):
             pipeline.register_trigger(name, lambda ctx: True)
-    with pytest.raises(ValueError):
+    with pytest.raises(TaskLiteError):
         pipeline.register_trigger("", lambda ctx: True)
-    with pytest.raises(TypeError):
+    with pytest.raises(TaskLiteError):
         pipeline.register_trigger("custom", 1)
     pipeline.register_trigger("custom", lambda ctx: True)
-    with pytest.raises(ValueError):
+    with pytest.raises(TaskLiteError):
         pipeline.register_trigger("custom", lambda ctx: True)
     with running(pipeline), pytest.raises(TaskLiteError):
         pipeline.register_trigger("another", lambda ctx: True)
@@ -195,7 +195,7 @@ def test_input_contract_errors_and_untrusted_baseline(tmp_path):
     from tasklite.triggers import on_input_change
     for inputs in [None, [], "bad", [42], [""]]:
         ctx = TriggerContext(Job("t", "a"), True, False, {"inputs": inputs}, 1)
-        with pytest.raises(ValueError):
+        with pytest.raises(TaskLiteError):
             on_input_change(ctx)
         assert on_input_change(TriggerContext(ctx.job, True, False, ctx.success_metadata, None)) is True
     existing = tmp_path / "exists"

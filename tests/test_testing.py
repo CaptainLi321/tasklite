@@ -222,13 +222,13 @@ class TestFakeCtxAuthorizationAndInvariants:
     def test_unregistered_spawn_dependency_rejected(self):
         ctx = fake_ctx(Job("parent", "p1"))
         bad_child = Job("child", "c1", depends_on=["other::nonexistent"])
-        with pytest.raises(ValueError, match="non-existent, future, or cross-worker dependency"):
+        with pytest.raises(TaskLiteError, match="non-existent, future, or cross-worker dependency"):
             ctx.spawn(bad_child)
 
     def test_unserializable_spawn_payload_rejected(self):
         ctx = fake_ctx(Job("parent", "p1"))
         bad_child = Job("child", "c1")
         bad_child.payload["func"] = lambda x: x
-        with pytest.raises(TypeError, match="payload.func"):
+        with pytest.raises(TaskLiteError, match="payload.func"):
             ctx.spawn(bad_child)
 

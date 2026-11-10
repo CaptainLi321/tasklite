@@ -9,6 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 
+from ..exceptions import TaskLiteError
 from ..models.artifact import resolve_job_files_config
 from ..models.job import Job
 from ..models.task import TaskRegistry, validate_trigger
@@ -113,9 +114,9 @@ class TriggerRegistry:
     def register(self, name: str, fn: Callable[[TriggerContext], bool]) -> None:
         validate_trigger(name)
         if name in self.functions:
-            raise ValueError(f"trigger {name!r} already registered")
+            raise TaskLiteError(f"trigger {name!r} already registered")
         if not callable(fn):
-            raise TypeError("trigger function must be callable")
+            raise TaskLiteError("trigger function must be callable")
         self.functions[name] = fn
 
     def normalize_job_snapshot(self, job_snapshot: dict, task_type: str) -> bool:
@@ -142,7 +143,7 @@ class TriggerRegistry:
                 changed = True
         trigger = job_snapshot.get("trigger")
         if trigger not in self.functions:
-            raise ValueError(f"unregistered trigger {trigger!r}")
+            raise TaskLiteError(f"unregistered trigger {trigger!r}")
         if job_snapshot.get("payload") is None:
             job_snapshot["payload"] = {}
             changed = True
@@ -177,7 +178,7 @@ class TriggerRegistry:
         try:
             fn = self.functions[name]
         except KeyError:
-            raise ValueError(f"unregistered trigger {name!r}") from None
+            raise TaskLiteError(f"unregistered trigger {name!r}") from None
         uid = job.uid
         metadata = history.successes.get(uid)
         ctx = TriggerContext(
@@ -194,7 +195,7 @@ class TriggerRegistry:
         )
         result = fn(ctx)
         if type(result) is not bool:
-            raise TypeError(f"trigger {name!r} must return bool, got {type(result).__name__}")
+            raise TaskLiteError(f"trigger {name!r} must return bool, got {type(result).__name__}")
         return result
 
 

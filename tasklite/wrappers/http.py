@@ -407,7 +407,7 @@ def _resolve_category(cls: Any) -> type[BaseException] | None:
     if cls is None:
         return None
     if not isinstance(cls, type) or not issubclass(cls, BaseException):
-        raise TypeError(
+        raise TaskLiteError(
             f"policy classifier must return an exception class or None, got {cls!r}"
         )
     # RateLimitHit 是 RetryError 子类，必须先于 RetryError 判定。
@@ -417,7 +417,7 @@ def _resolve_category(cls: Any) -> type[BaseException] | None:
         return FatalError
     if issubclass(cls, RetryError):
         return RetryError
-    raise TypeError(
+    raise TaskLiteError(
         "policy classifier must return RateLimitHit/FatalError/RetryError "
         f"or a subclass thereof, or None; got {cls!r}"
     )

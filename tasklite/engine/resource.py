@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from ..exceptions import TaskLiteError
 from ..models.job import WORKER_RESOURCE
 from ..models.task import TaskRegistry
 
@@ -50,7 +51,7 @@ class Resource(ABC):
 
     def __init__(self, name: str) -> None:
         if not isinstance(name, str) or not name:
-            raise ValueError(f"Resource name must be a non-empty string, got {name!r}")
+            raise TaskLiteError(f"Resource name must be a non-empty string, got {name!r}")
         self.name = name
         self._notifier: Any = None
 
@@ -95,11 +96,11 @@ class IntervalResource(Resource):
         if not isinstance(interval_seconds, (int, float)) or isinstance(
             interval_seconds, bool
         ):
-            raise TypeError(
+            raise TaskLiteError(
                 f"interval_seconds must be a number, got {type(interval_seconds).__name__}"
             )
         if not math.isfinite(interval_seconds) or interval_seconds <= 0:
-            raise ValueError(
+            raise TaskLiteError(
                 f"interval_seconds must be finite and > 0, got {interval_seconds!r}"
             )
         self.interval_seconds = float(interval_seconds)
@@ -107,7 +108,7 @@ class IntervalResource(Resource):
 
     def can_acquire(self, amount: float) -> ResourceQueryResult:
         if amount < 0:
-            raise ValueError(f"amount must be non-negative, got {amount}")
+            raise TaskLiteError(f"amount must be non-negative, got {amount}")
         now = time.monotonic()
         if now >= self.next_available:
             return ResourceQueryResult(is_available=True, wait_seconds=0.0)
@@ -119,7 +120,7 @@ class IntervalResource(Resource):
 
     def acquire(self, amount: float) -> None:
         if amount < 0:
-            raise ValueError(f"amount must be non-negative, got {amount}")
+            raise TaskLiteError(f"amount must be non-negative, got {amount}")
         now = time.monotonic()
         base_time = max(now, self.next_available)
         self.next_available = base_time + (self.interval_seconds * amount)
@@ -137,18 +138,18 @@ class CapacityResource(Resource):
     def __init__(self, name: str, *, max_capacity: float) -> None:
         super().__init__(name)
         if not isinstance(max_capacity, (int, float)) or isinstance(max_capacity, bool):
-            raise TypeError(
+            raise TaskLiteError(
                 f"max_capacity must be a number, got {type(max_capacity).__name__} ({max_capacity!r})"
             )
         if not math.isfinite(max_capacity) or max_capacity < 0:
-            raise ValueError(f"max_capacity must be finite and >= 0, got {max_capacity!r}")
+            raise TaskLiteError(f"max_capacity must be finite and >= 0, got {max_capacity!r}")
         self.max_capacity = float(max_capacity)
         self.used = 0.0
         self.release_overruns = 0
 
     def can_acquire(self, amount: float) -> ResourceQueryResult:
         if amount < 0:
-            raise ValueError(f"amount must be non-negative, got {amount}")
+            raise TaskLiteError(f"amount must be non-negative, got {amount}")
         if amount > self.max_capacity:
             return ResourceQueryResult(
                 is_available=False,
@@ -163,20 +164,20 @@ class CapacityResource(Resource):
 
     def acquire(self, amount: float) -> None:
         if amount < 0:
-            raise ValueError(f"amount must be non-negative, got {amount}")
+            raise TaskLiteError(f"amount must be non-negative, got {amount}")
         if amount > self.max_capacity:
-            raise ValueError(
+            raise TaskLiteError(
                 f"amount {amount} exceeds resource capacity {self.max_capacity}"
             )
         if self.used + amount > self.max_capacity:
-            raise RuntimeError(
+            raise TaskLiteError(
                 f"Resource '{self.name}' capacity exceeded: {self.used} + {amount} > {self.max_capacity}"
             )
         self.used += amount
 
     def release(self, amount: float) -> None:
         if amount < 0:
-            raise ValueError(f"amount must be non-negative, got {amount}")
+            raise TaskLiteError(f"amount must be non-negative, got {amount}")
         if amount > self.used:
             self.release_overruns += 1
             logger.warning(

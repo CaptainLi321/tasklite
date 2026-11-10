@@ -117,14 +117,14 @@ class JobContext:
         if resolved.path is None:
             raise TaskLiteError("FileSpec resolved without a path")
         if resolved.role == "input" and not os.path.exists(resolved.path):
-            raise FileNotFoundError(f"Missing input file: {resolved.path}")
+            raise TaskLiteError(f"Missing input file: {resolved.path}")
         return resolved
 
     def file_path(self, name: str) -> Path:
         """返回当前 Job 已声明文件（预声明或已完成动态声明）的规范绝对 Path。"""
         validated_name = validate_file_name(name)
         if validated_name not in self._files:
-            raise KeyError(f"No file declared with name {validated_name!r}")
+            raise TaskLiteError(f"No file declared with name {validated_name!r}")
         spec = self._files[validated_name]
         if spec.path is None:
             raise TaskLiteError(f"FileSpec {validated_name!r} has no resolved path")
@@ -134,7 +134,7 @@ class JobContext:
         """动态登记文件声明，等待主进程完成必要授权与准备操作后返回规范绝对 Path。"""
         validated_name = validate_file_name(name)
         if not isinstance(spec, FileSpec):
-            raise TypeError(f"declare_file expects a FileSpec, got {type(spec).__name__}")
+            raise TaskLiteError(f"declare_file expects a FileSpec, got {type(spec).__name__}")
 
         if spec.is_output_ref:
             assert spec.producer_uid is not None
@@ -187,14 +187,14 @@ class JobContext:
     def spawn(self, job: Job) -> None:
         """入队一个子 job（捕获固定路径基准下的独立快照并校验依赖引用与 JSON 对象契约）。"""
         if not isinstance(job, Job):
-            raise TypeError(
+            raise TaskLiteError(
                 f"spawn() expects a Job, got {type(job).__name__}"
             )
         # 依赖闭合：只能引用派发时已知的 Job、当前父 Job，以及本次先前声明的 Job
         allowed_uids = self._known_job_uids | {self.job.uid} | {j.uid for j in self.spawned_jobs}
         for dep in job.depends_on:
             if dep not in allowed_uids:
-                raise ValueError(
+                raise TaskLiteError(
                     f"Spawned job {job.uid!r} references non-existent, future, or cross-worker dependency {dep!r}"
                 )
         job_dict = job.to_dict()
@@ -208,7 +208,7 @@ class JobContext:
     def get_cursor(self, key: str) -> str | None:
         """读取高水位游标的当前值（含自身暂存写入）。"""
         if not isinstance(key, str) or not key:
-            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+            raise TaskLiteError(f"cursor key must be a non-empty str, got {key!r}")
         return self._cursors.get(key)
 
     def set_cursor(self, key: str, value: str | None) -> None:
@@ -218,9 +218,9 @@ class JobContext:
         空字符串为合法值）。
         """
         if not isinstance(key, str) or not key:
-            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+            raise TaskLiteError(f"cursor key must be a non-empty str, got {key!r}")
         if value is not None and not isinstance(value, str):
-            raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
+            raise TaskLiteError(f"cursor value must be str or None, got {type(value).__name__}")
         self.cursor_updates[key] = value
         if value is None:
             self._cursors.pop(key, None)

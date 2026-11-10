@@ -144,13 +144,13 @@ class TestSetJobStatus:
                 "invalid",  # type: ignore[arg-type]
                 recursive=False,
             )
-        with pytest.raises(TypeError, match="recursive must be a bool"):
+        with pytest.raises(TaskLiteError, match="recursive must be a bool"):
             app.set_job_status(
                 Job("work", "a"),
                 "succeeded",
                 recursive="yes",  # type: ignore[arg-type]
             )
-        with pytest.raises(TypeError, match="note must be a str or None"):
+        with pytest.raises(TaskLiteError, match="note must be a str or None"):
             app.set_job_status(
                 Job("work", "a"),
                 "succeeded",
@@ -288,14 +288,14 @@ class TestClearHistory:
 
     def test_validation_is_stable(self, app):
         for records, error, match in (
-            ([], ValueError, "records must not be empty"),
-            (["unknown"], ValueError, "unknown target"),
+            ([], TaskLiteError, "records must not be empty"),
+            (["unknown"], TaskLiteError, "unknown target"),
         ):
             with pytest.raises(error, match=match):
                 app.clear_history("work::item", records=records)  # type: ignore[arg-type]
-        with pytest.raises(TypeError, match="uid"):
+        with pytest.raises(TaskLiteError, match="uid"):
             app.clear_history("", records=["successes"])
-        with pytest.raises(ValueError, match="canonical"):
+        with pytest.raises(TaskLiteError, match="canonical"):
             app.clear_history("bad_uid", records=["successes"])
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.store import StateStore
 from tasklite.models.attempt import AttemptRecord
@@ -49,11 +51,11 @@ class TestClearHistoryThroughStore:
     def test_empty_and_unknown_targets_are_rejected_before_backend_write(self):
         backend, store = _make_store()
         before = backend.load_successes()
-        with pytest.raises(TypeError, match="records must be a collection"):
+        with pytest.raises(TaskLiteError, match="records must be a collection"):
             store.clear_history("t::a", "successes")  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="must not be empty"):
+        with pytest.raises(TaskLiteError, match="must not be empty"):
             store.clear_history("t::a", [])
-        with pytest.raises(ValueError, match="unknown target"):
+        with pytest.raises(TaskLiteError, match="unknown target"):
             store.clear_history("t::a", ["other"])
         assert backend.load_successes() == before
 

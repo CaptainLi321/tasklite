@@ -205,10 +205,10 @@ def test_exclude_validation_and_rejection_of_multiple_rules(tmp_path):
 
     pipeline = _pipeline(tmp_path)
     # 拒绝列表或多规则
-    with pytest.raises(TypeError, match="exclude must be an Exclude instance or None"):
+    with pytest.raises(TaskLiteError, match="exclude must be an Exclude instance or None"):
         pipeline.run(exclude=[Exclude(task_type="a")])  # type: ignore[arg-type]
 
-    with pytest.raises(TypeError, match="exclude must be an Exclude instance or None"):
+    with pytest.raises(TaskLiteError, match="exclude must be an Exclude instance or None"):
         pipeline.run(exclude="convert")  # type: ignore[arg-type]
 
 
@@ -414,7 +414,7 @@ def test_spawn_dependency_order_contract(tmp_path):
 
     # 反序声明：child_bad 引用尚未声明的 child_future -> 当场抛 ValueError
     child_bad = Job("proc", "c4", depends_on=["proc::c_future"])
-    with pytest.raises(ValueError, match="references non-existent, future, or cross-worker dependency"):
+    with pytest.raises(TaskLiteError, match="references non-existent, future, or cross-worker dependency"):
         ctx.spawn(child_bad)
 
 
@@ -431,7 +431,7 @@ def test_cross_worker_future_spawn_not_valid_dependency(tmp_path):
     )
 
     # 依赖其他 worker 可能在未来产出的 job
-    with pytest.raises(ValueError, match="references non-existent, future, or cross-worker dependency"):
+    with pytest.raises(TaskLiteError, match="references non-existent, future, or cross-worker dependency"):
         ctx.spawn(Job("proc", "sub", depends_on=["worker2::future_child"]))
 
 

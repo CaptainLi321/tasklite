@@ -256,15 +256,15 @@ class StateStore:
     def get_cursor(self, key: str) -> str | None:
         """查询游标最新已提交值。"""
         if not isinstance(key, str) or not key:
-            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+            raise TaskLiteError(f"cursor key must be a non-empty str, got {key!r}")
         return self._backend.get_cursor(key)
 
     def set_cursor(self, key: str, value: str | None) -> None:
         """设置或删除单个游标键值（直接提交写后端并更新内存镜像）。"""
         if not isinstance(key, str) or not key:
-            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+            raise TaskLiteError(f"cursor key must be a non-empty str, got {key!r}")
         if value is not None and not isinstance(value, str):
-            raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
+            raise TaskLiteError(f"cursor value must be str or None, got {type(value).__name__}")
         self._backend.set_cursor(key, value)
         self._state.set_cursor(key, value)
 
@@ -308,21 +308,21 @@ class StateStore:
                 f"status must be one of 'pending', 'succeeded', 'failed', got {status!r}"
             )
         if not isinstance(recursive, bool):
-            raise TypeError(f"recursive must be a bool, got {type(recursive).__name__}")
+            raise TaskLiteError(f"recursive must be a bool, got {type(recursive).__name__}")
         if note is not None and not isinstance(note, str):
-            raise TypeError(f"note must be a str or None, got {type(note).__name__}")
+            raise TaskLiteError(f"note must be a str or None, got {type(note).__name__}")
 
         if isinstance(job_or_uid, Job):
             target_job = job_or_uid
             target_uid = job_or_uid.uid
         elif isinstance(job_or_uid, str):
             if not job_or_uid:
-                raise TypeError("job_or_uid cannot be empty")
+                raise TaskLiteError("job_or_uid cannot be empty")
             parse_job_uid(job_or_uid)
             target_job = None
             target_uid = job_or_uid
         else:
-            raise TypeError(
+            raise TaskLiteError(
                 f"job_or_uid must be a Job or str, got {type(job_or_uid).__name__}"
             )
 
@@ -405,15 +405,15 @@ class StateStore:
     def clear_history(self, uid: str, records: Collection[str]) -> int:
         """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""
         if not isinstance(uid, str) or not uid:
-            raise TypeError(f"uid must be a non-empty str, got {uid!r}")
+            raise TaskLiteError(f"uid must be a non-empty str, got {uid!r}")
         try:
             parse_job_uid(uid)
         except Exception as exc:
-            raise ValueError(
+            raise TaskLiteError(
                 f"uid must be a valid canonical 'task_type::job_id' str, got {uid!r}"
             ) from exc
         if not isinstance(records, (list, tuple, set, frozenset)):
-            raise TypeError(
+            raise TaskLiteError(
                 "records must be a collection of 'successes', 'failures', "
                 f"'attempts', got {type(records).__name__}"
             )
@@ -421,9 +421,9 @@ class StateStore:
         allowed = {"successes", "failures", "attempts"}
         unknown = record_set - allowed
         if not record_set:
-            raise ValueError("records must not be empty")
+            raise TaskLiteError("records must not be empty")
         if unknown:
-            raise ValueError(
+            raise TaskLiteError(
                 f"records contains unknown target(s): {sorted(unknown)!r}; "
                 f"allowed: {sorted(allowed)!r}"
             )
@@ -451,10 +451,10 @@ class StateStore:
             job_snapshot = copy.deepcopy(job.to_dict())
         elif isinstance(job, dict):
             if "task_type" not in job or "job_id" not in job:
-                raise ValueError("Job dict must contain 'task_type' and 'job_id'")
+                raise TaskLiteError("Job dict must contain 'task_type' and 'job_id'")
             job_snapshot = copy.deepcopy(job)
         else:
-            raise TypeError(
+            raise TaskLiteError(
                 f"Expected Job or dict, got {type(job).__name__}"
             )
 
@@ -464,7 +464,7 @@ class StateStore:
     def _normalize_new_job_snapshot(self, job: Job) -> dict[str, Any]:
         """解析并校验新声明的有效配置，要求 Task 已注册。"""
         if not isinstance(job, Job):
-            raise TypeError(
+            raise TaskLiteError(
                 f"enqueue() expects a Job, got {type(job).__name__}"
             )
         self._require_registered_task(job.task_type)
@@ -497,7 +497,7 @@ class StateStore:
     def enqueue_job(self, job: Job) -> bool:
         """单作业入队摄入管道：解析有效配置、捕获独立快照并校验同 UID 幂等/冲突。"""
         if not isinstance(job, Job):
-            raise TypeError(
+            raise TaskLiteError(
                 f"enqueue() expects a Job, got {type(job).__name__}"
             )
         job_snapshot = self._normalize_new_job_snapshot(job)

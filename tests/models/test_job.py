@@ -188,44 +188,44 @@ class TestJobPayloadAndResources:
 
     def test_non_dict_payload_rejected(self):
         """非 dict payload 在模型入口拒绝。"""
-        with pytest.raises(TypeError, match="payload must be a dict"):
+        with pytest.raises(TaskLiteError, match="payload must be a dict"):
             Job("t", "id", payload="abc")
 
     def test_non_dict_resources_rejected(self):
-        with pytest.raises(TypeError, match="resources must be a dict"):
+        with pytest.raises(TaskLiteError, match="resources must be a dict"):
             Job("t", "id", resources=["cpu", 1.0])
 
     def test_bool_resource_amount_rejected(self):
         """bool 是 int 子类，isinstance 会放行；与 Task 默认资源校验对齐，
         入口拒绝。"""
-        with pytest.raises(TypeError, match="must be a number"):
+        with pytest.raises(TaskLiteError, match="must be a number"):
             Job("t", "id", resources={"cpu": True})
 
     def test_resource_amount_matrix_rejected(self):
         """resource amount 拒绝矩阵——NaN/Inf/负值/超大 int/非数值全覆盖。"""
-        with pytest.raises(ValueError, match="must be finite|too large"):
+        with pytest.raises(TaskLiteError, match="must be finite|too large"):
             Job("t", "id", resources={"cpu": float("nan")})
-        with pytest.raises(ValueError, match="must be finite|too large"):
+        with pytest.raises(TaskLiteError, match="must be finite|too large"):
             Job("t", "id", resources={"cpu": float("inf")})
-        with pytest.raises(ValueError, match="must be non-negative"):
+        with pytest.raises(TaskLiteError, match="must be non-negative"):
             Job("t", "id", resources={"cpu": -1.0})
-        # 超大 int 溢出收敛 ValueError，不裸抛 OverflowError
-        with pytest.raises(ValueError, match="too large"):
+        # 超大整数与非有限值采用相同拒绝规则。
+        with pytest.raises(TaskLiteError, match="too large"):
             Job("t", "id", resources={"cpu": 10**400})
-        with pytest.raises(TypeError, match="must be a number"):
+        with pytest.raises(TaskLiteError, match="must be a number"):
             Job("t", "id", resources={"cpu": "high"})
 
     def test_non_str_resource_name_rejected(self):
         """非 str 资源名：调度侧判为未知资源（永不可跑），且 JSON 落盘后
         键强转为 str，同一作业跨重启身份与账目漂移；构造期入口拒绝。"""
-        with pytest.raises(TypeError, match="must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="must be a non-empty str"):
             Job("t", "id", resources={1: 2.0})
-        with pytest.raises(TypeError, match="must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="must be a non-empty str"):
             Job("t", "id", resources={"": 2.0})
 
     def test_non_str_resource_name_rejected_via_from_dict(self):
         data = {"task_type": "t", "job_id": "id", "resources": {1: 2.0}}
-        with pytest.raises(TypeError):
+        with pytest.raises(TaskLiteError):
             Job.from_dict(data)
 
 
@@ -233,13 +233,13 @@ class TestJobSpecFieldValidation:
     """max_retries_per_run / timeout_seconds / depends_on / files / trigger 校验。"""
 
     def test_negative_max_retries_per_run(self):
-        with pytest.raises(ValueError, match="max_retries_per_run must be >= 0"):
+        with pytest.raises(TaskLiteError, match="max_retries_per_run must be >= 0"):
             Job("t", "id", max_retries_per_run=-1)
 
     def test_non_int_max_retries_per_run(self):
-        with pytest.raises(TypeError, match="max_retries_per_run must be an int"):
+        with pytest.raises(TaskLiteError, match="max_retries_per_run must be an int"):
             Job("t", "id", max_retries_per_run="3")  # type: ignore[arg-type]
-        with pytest.raises(TypeError, match="max_retries_per_run must be an int"):
+        with pytest.raises(TaskLiteError, match="max_retries_per_run must be an int"):
             Job("t", "id", max_retries_per_run=True)
 
     def test_zero_max_retries_per_run_allowed(self):
@@ -249,36 +249,36 @@ class TestJobSpecFieldValidation:
 
     def test_timeout_matrix_rejected(self):
         """timeout_seconds 拒绝零/负/NaN/Inf/超大 int/bool/非数值。"""
-        with pytest.raises(TypeError, match="timeout_seconds must be a number"):
+        with pytest.raises(TaskLiteError, match="timeout_seconds must be a number"):
             Job("t", "id", timeout_seconds="60")  # type: ignore[arg-type]
-        with pytest.raises(TypeError, match="timeout_seconds must be a number"):
+        with pytest.raises(TaskLiteError, match="timeout_seconds must be a number"):
             Job("t", "id", timeout_seconds=True)
         for bad in (0, -1, float("nan"), float("inf"), float("-inf"), 10**400):
-            with pytest.raises(ValueError, match="timeout_seconds must be finite and > 0"):
+            with pytest.raises(TaskLiteError, match="timeout_seconds must be finite and > 0"):
                 Job("t", "id", timeout_seconds=bad)
 
     def test_files_validation(self):
         spec = FileSpec("a.txt", role="output")
-        with pytest.raises(TypeError, match="files must be a dict"):
+        with pytest.raises(TaskLiteError, match="files must be a dict"):
             Job("t", "id", files=["a"])  # type: ignore[arg-type]
-        with pytest.raises(TypeError, match="file key in files must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="file key in files must be a non-empty str"):
             Job("t", "id", files={"": spec})
-        with pytest.raises(TypeError, match="file key in files must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="file key in files must be a non-empty str"):
             Job("t", "id", files={1: spec})  # type: ignore[dict-item]
-        with pytest.raises(TypeError, match="file spec in files must be a FileSpec"):
+        with pytest.raises(TaskLiteError, match="file spec in files must be a FileSpec"):
             Job("t", "id", files={"out": "a.txt"})  # type: ignore[dict-item]
-        with pytest.raises(TypeError, match="file spec in files must be a FileSpec"):
+        with pytest.raises(TaskLiteError, match="file spec in files must be a FileSpec"):
             Job("t", "id", files={"out": spec.to_dict()})  # type: ignore[dict-item]
 
     def test_depends_on_non_list_rejected(self):
         """先校验外层类型再迭代——str 会被肢解为字符列表。"""
-        with pytest.raises(TypeError, match="depends_on must be a list of strings"):
+        with pytest.raises(TaskLiteError, match="depends_on must be a list of strings"):
             Job("t", "j1", depends_on="parent::id")
 
     def test_depends_on_non_string_elements_rejected(self):
-        with pytest.raises(TypeError, match="depends_on must contain only strings"):
+        with pytest.raises(TaskLiteError, match="depends_on must contain only strings"):
             Job("t", "j1", depends_on=[123])
-        with pytest.raises(TypeError, match="depends_on must contain only strings"):
+        with pytest.raises(TaskLiteError, match="depends_on must contain only strings"):
             Job("t", "j1", depends_on=["a::b", None])
 
     def test_depends_on_empty_string_and_self_allowed(self):
@@ -299,9 +299,9 @@ class TestJobSpecFieldValidation:
             assert Job("t", "id", trigger=value).trigger == value
         assert Job("t", "id").trigger is None
         assert Job("t", "id", trigger="custom").trigger == "custom"
-        with pytest.raises(ValueError, match="trigger must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="trigger must be a non-empty str"):
             Job("t", "id", trigger="")
-        with pytest.raises(TypeError, match="trigger must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="trigger must be a non-empty str"):
             Job("t", "id", trigger=12)
 
 
@@ -611,5 +611,5 @@ class TestJobWeirdInputs:
         {"value": object()},
     ])
     def test_payload_rejects_implicit_json_conversion(self, payload):
-        with pytest.raises(TypeError, match="payload"):
+        with pytest.raises(TaskLiteError, match="payload"):
             Job("t", "id", payload=payload)

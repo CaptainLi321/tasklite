@@ -13,6 +13,8 @@ from typing import Any
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite.backend import (
     AbstractStateBackend,
     InMemoryStateBackend,
@@ -390,7 +392,7 @@ class TestDatabaseRejectionAndPreservation:
 
         before = _sqlite_snapshot(path)
 
-        with pytest.raises(RuntimeError) as caught:
+        with pytest.raises(TaskLiteError) as caught:
             SQLiteStateBackend(path, schema_version=TARGET_SCHEMA_VERSION)
 
         # 拒绝信息明确包含目标 schema 6
@@ -423,7 +425,7 @@ class TestDatabaseRejectionAndPreservation:
         before = _sqlite_snapshot(path)
 
         # 使用旧默认执行器（schema_version 5）尝试打开
-        with pytest.raises(RuntimeError) as caught:
+        with pytest.raises(TaskLiteError) as caught:
             SQLiteStateBackend(path)  # 默认 schema_version=5
 
         assert "5" in str(caught.value)

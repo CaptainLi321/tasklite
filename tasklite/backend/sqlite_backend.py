@@ -23,6 +23,7 @@ from .base import (
     validate_attempt_finish,
     validate_queue_replacement,
 )
+from ..exceptions import TaskLiteError
 from ..models.attempt import AttemptRecord
 from ..models.state import job_uid_from_snapshot
 from ..utils.clock import utc_now_iso
@@ -65,8 +66,8 @@ _TABLE_COLUMNS_V6: dict[str, tuple[str, ...]] = {
 _TABLE_COLUMNS = _TABLE_COLUMNS_V5
 
 
-def _schema_error(path: Path, schema_version: int, detail: str) -> RuntimeError:
-    return RuntimeError(
+def _schema_error(path: Path, schema_version: int, detail: str) -> TaskLiteError:
+    return TaskLiteError(
         f"{path}: {detail}; 目标 schema {schema_version}。"
         "请保留原库，使用匹配版本读取历史，或显式选择新的状态库路径。"
     )
@@ -120,6 +121,8 @@ class SQLiteStateBackend(AbstractStateBackend):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._init_db()
+        except TaskLiteError:
+            raise
         except Exception as e:
             raise self._schema_error(f"SQLite backend initialization failed: {e}") from e
 
@@ -161,7 +164,10 @@ class SQLiteStateBackend(AbstractStateBackend):
     # 初始化与 schema -------------------------------------------------
 
     def _schema_error(self, detail: str) -> RuntimeError:
-        return _schema_error(self.path, self.schema_version, detail)
+        return RuntimeError(
+            f"{self.path}: {detail}; 目标 schema {self.schema_version}。"
+            "请保留原库，使用匹配版本读取历史，或显式选择新的状态库路径。"
+        )
 
     def _check_schema(self, conn: sqlite3.Connection) -> int:
         return _check_schema(conn, self.path, self.schema_version)
@@ -190,7 +196,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             self._check_schema(conn)
             wal_row = conn.execute('PRAGMA journal_mode=WAL').fetchone()
             if not wal_row or str(wal_row[0]).lower() != 'wal':
-                raise RuntimeError(
+                raise TaskLiteError(
                     f"journal_mode=WAL could not be engaged on {self.path} "
                     f"(got {wal_row[0] if wal_row else None!r})."
                 )

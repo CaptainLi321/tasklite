@@ -5,6 +5,8 @@ import copy
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite import Job, StateSnapshot, TaskLite, TaskResult
 
 
@@ -29,7 +31,7 @@ def pipeline(request, tmp_path):
 def test_invalid_payload_is_rejected_without_records(pipeline, payload, intake):
     job = Job("t", "bad")
     job.payload = payload
-    with pytest.raises(TypeError, match="payload"):
+    with pytest.raises(TaskLiteError, match="payload"):
         if intake == "enqueue":
             pipeline.enqueue(job)
         elif intake == "manual":

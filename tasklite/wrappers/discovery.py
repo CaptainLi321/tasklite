@@ -126,6 +126,7 @@ import pickle
 from collections.abc import Callable
 from typing import Any, Protocol
 
+from ..exceptions import TaskLiteError
 from ..models.result import TaskResult
 from ..models.task import validate_trigger
 from ..utils.encoding import encode_content_id
@@ -229,7 +230,7 @@ class DiscoveryHandler:
         # "full"（跳过整页命中，一路扫到空页或 max_pages；已见内容仍逐条
         # 跳过，成本只在 fetch 不在处理）。
         if scan_mode not in ("incremental", "full"):
-            raise ValueError(
+            raise TaskLiteError(
                 f"scan_mode must be 'incremental' or 'full', got {scan_mode!r}"
             )
         self.scan_mode = scan_mode
@@ -252,7 +253,7 @@ class DiscoveryHandler:
             return ""
         key = self.group_key_func(job.payload)
         if not isinstance(key, str) or not key:
-            raise ValueError(
+            raise TaskLiteError(
                 f"group_key_func must return a non-empty str, got {key!r}"
             )
         return f"{len(key)}:{key}"
@@ -308,7 +309,7 @@ class DiscoveryHandler:
         if isinstance(job.payload, dict) and "scan_mode" in job.payload:
             payload_mode = job.payload["scan_mode"]
             if payload_mode not in ("incremental", "full"):
-                raise ValueError(
+                raise TaskLiteError(
                     f"scan_mode in payload must be 'incremental' or 'full', "
                     f"got {payload_mode!r}"
                 )
@@ -322,7 +323,7 @@ class DiscoveryHandler:
                 or isinstance(payload_max, bool)
                 or payload_max < 1
             ):
-                raise ValueError(
+                raise TaskLiteError(
                     f"max_pages in payload must be a positive int, got {payload_max!r}"
                 )
             effective_max_pages = payload_max
@@ -374,7 +375,7 @@ class DiscoveryHandler:
         不得被静默当空页终止（fail-loud：结构 bug 不伪装页尾）。"""
         items = self.fetch_func(job, ctx, page)
         if not isinstance(items, (list, tuple)):
-            raise ValueError(
+            raise TaskLiteError(
                 f"fetch_func must return a list of items, "
                 f"got {type(items).__name__}"
             )
@@ -568,22 +569,22 @@ def register_discovery(
     一致——lambda/闭包在子进程 import 时失败）。
     """
     if not isinstance(task_type, str) or not task_type:
-        raise TypeError(
+        raise TaskLiteError(
             f"task_type must be a non-empty str, "
             f"got {type(task_type).__name__} ({task_type!r})"
         )
     if "::" in task_type:
-        raise ValueError(
+        raise TaskLiteError(
             f"task_type must not contain '::' (Job.uid separator), "
             f"got {task_type!r}"
         )
     if not isinstance(process_task_type, str) or not process_task_type:
-        raise TypeError(
+        raise TaskLiteError(
             f"process_task_type must be a non-empty str, "
             f"got {type(process_task_type).__name__} ({process_task_type!r})"
         )
     if "::" in process_task_type:
-        raise ValueError(
+        raise TaskLiteError(
             f"process_task_type must not contain '::' (Job.uid separator), "
             f"got {process_task_type!r}"
         )
@@ -593,9 +594,9 @@ def register_discovery(
         ("process_item_func", process_item_func),
     ):
         if not callable(fn):
-            raise TypeError(f"{name} must be callable, got {type(fn).__name__}")
+            raise TaskLiteError(f"{name} must be callable, got {type(fn).__name__}")
     if group_key_func is not None and not callable(group_key_func):
-        raise TypeError(
+        raise TaskLiteError(
             f"group_key_func must be callable or None, "
             f"got {type(group_key_func).__name__}"
         )
@@ -614,12 +615,12 @@ def register_discovery(
         try:
             pickle.dumps(check_fn)
         except Exception as e:
-            raise TypeError(
+            raise TaskLiteError(
                 f"{check_name} must be a module-level picklable function for "
                 f"spawn subprocess propagation, got {check_fn!r}: {e}"
             ) from e
     if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
-        raise ValueError(f"max_pages must be a positive int, got {max_pages!r}")
+        raise TaskLiteError(f"max_pages must be a positive int, got {max_pages!r}")
     validate_trigger(trigger)
 
     handler = DiscoveryHandler(

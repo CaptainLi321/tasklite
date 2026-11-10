@@ -19,6 +19,8 @@ from unittest import mock
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite.backend import SQLiteStateBackend
 from tasklite.models.attempt import ATTEMPT_RUNNING, AttemptRecord
 from tasklite.models.job import Job
@@ -192,7 +194,7 @@ class TestWALAndPragmas:
                 return iter(())
 
         monkeypatch.setattr(sb.sqlite3, "connect", NoWalConn)
-        with pytest.raises(RuntimeError, match="journal_mode=WAL could not be engaged"):
+        with pytest.raises(TaskLiteError, match="journal_mode=WAL could not be engaged"):
             SQLiteStateBackend(tmp_path / "nowal_state.db")
 
 
@@ -217,14 +219,14 @@ class TestLegacyDatabaseRejected:
         """v1 旧库（版本低于 v2 首代）拒绝启动，不写迁移路径。"""
         db_path = tmp_path / "legacy_state.db"
         self._make_legacy_db(db_path, user_version=2)
-        with pytest.raises(RuntimeError, match="Unsupported database schema version"):
+        with pytest.raises(TaskLiteError, match="Unsupported database schema version"):
             SQLiteStateBackend(db_path)
 
     def test_foreign_table_shape_rejected(self, tmp_path):
         """user_version=0 但表已存在且形状不符 → 形状校验 fail-loud。"""
         db_path = tmp_path / "foreign_shape.db"
         self._make_legacy_db(db_path, user_version=0)
-        with pytest.raises(RuntimeError, match="Unsupported table shape"):
+        with pytest.raises(TaskLiteError, match="Unsupported table shape"):
             SQLiteStateBackend(db_path)
 
     def test_v1_cursors_shape_rejected(self, tmp_path):
@@ -234,7 +236,7 @@ class TestLegacyDatabaseRejected:
         conn.execute("CREATE TABLE cursors (key TEXT PRIMARY KEY, value TEXT)")
         conn.commit()
         conn.close()
-        with pytest.raises(RuntimeError, match="Unsupported table shape"):
+        with pytest.raises(TaskLiteError, match="Unsupported table shape"):
             SQLiteStateBackend(db_path)
 
 
@@ -628,7 +630,7 @@ class TestCorruptionAndLocks:
         SQLiteStateBackend(path)
         with sqlite3.connect(path) as conn:
             conn.execute("DROP TABLE queue")
-        with pytest.raises(RuntimeError, match="Unsupported table shape for 'queue'"):
+        with pytest.raises(TaskLiteError, match="Unsupported table shape for 'queue'"):
             SQLiteStateBackend(path)
 
 

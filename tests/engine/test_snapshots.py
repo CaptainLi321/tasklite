@@ -62,7 +62,7 @@ class TestStateSnapshotOpeningAndClosing:
 
         assert s1.closed is True
         assert s1.is_closed is True
-        with pytest.raises(TypeError, match="source must be"):
+        with pytest.raises(TaskLiteError, match="source must be"):
             StateSnapshot.open(backend)
         with TaskLite(backend="sqlite", state_path=db_path) as sqlite_pipeline:
             with StateSnapshot.open(sqlite_pipeline) as sqlite_snapshot:
@@ -90,21 +90,21 @@ class TestStateSnapshotOpeningAndClosing:
         s.close()
         s.close()  # 幂等
 
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             s.get_job("process::j1")
 
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             list(s.iter_jobs())
 
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             list(s.iter_attempts())
 
     def test_invalid_source_and_missing_file_rejected(self, tmp_path):
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(TaskLiteError):
             StateSnapshot.open(tmp_path / "nonexistent.db")
         assert not list(tmp_path.iterdir())
 
-        with pytest.raises(TypeError, match="source must be"):
+        with pytest.raises(TaskLiteError, match="source must be"):
             StateSnapshot.open(12345)  # type: ignore[arg-type]
 
         empty_file = tmp_path / "empty.db"
@@ -153,7 +153,7 @@ class TestStateSnapshotOpeningAndClosing:
         original = b"not a SQLite database"
         db_path.write_bytes(original)
 
-        with pytest.raises(TaskLiteError, match="not a database"):
+        with pytest.raises(sqlite3.DatabaseError, match="not a database"):
             StateSnapshot.open(db_path)
 
         assert db_path.read_bytes() == original
@@ -473,7 +473,7 @@ class TestQueriesAndFilters:
                 "process::j_pend",
             }
 
-            with pytest.raises(ValueError, match="status must be one of"):
+            with pytest.raises(TaskLiteError, match="status must be one of"):
                 list(s.iter_jobs(status="unknown"))  # type: ignore[arg-type]
 
     def test_iter_attempts_ordered_by_attempt_no(self, tmp_path):

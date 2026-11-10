@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite import FileSpec
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
@@ -67,11 +69,11 @@ class TestSnapshotSemantics:
 
     def test_set_cursor_type_guards(self):
         ctx = _make_ctx()
-        with pytest.raises(TypeError, match="cursor key must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="cursor key must be a non-empty str"):
             ctx.set_cursor(123, "v")  # type: ignore[arg-type]
-        with pytest.raises(TypeError, match="cursor key must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="cursor key must be a non-empty str"):
             ctx.set_cursor("", "v")
-        with pytest.raises(TypeError, match="cursor value must be str or None"):
+        with pytest.raises(TaskLiteError, match="cursor value must be str or None"):
             ctx.set_cursor("k", 456)  # type: ignore[arg-type]
 
 
@@ -93,7 +95,7 @@ class TestSpawn:
         ctx = _make_ctx()
         child = Job("fetch", "bad")
         child.payload["fn"] = my_func
-        with pytest.raises(TypeError, match="payload.fn"):
+        with pytest.raises(TaskLiteError, match="payload.fn"):
             ctx.spawn(child)
         assert ctx.spawned_jobs == []
 
@@ -102,7 +104,7 @@ class TestSpawn:
         ctx = _make_ctx()
         child = Job("fetch", "inf")
         child.payload["v"] = float("inf")
-        with pytest.raises(ValueError, match="finite float"):
+        with pytest.raises(TaskLiteError, match="finite float"):
             ctx.spawn(child)
 
     def test_spawn_accepts_normal_payload(self):
@@ -167,7 +169,7 @@ class TestInputFileSpec:
 
     def test_missing_input_fails_without_recording(self, tmp_path):
         ctx = _make_ctx(output_roots=tmp_path)
-        with pytest.raises(FileNotFoundError, match="Missing input file"):
+        with pytest.raises(TaskLiteError, match="Missing input file"):
             ctx.declare_file(
                 "source",
                 FileSpec(tmp_path / "ghost.bin", role="input"),

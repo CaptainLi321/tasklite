@@ -299,21 +299,18 @@ class _SqliteSnapshotReader:
 
     def __init__(self, db_path: Path) -> None:
         if not db_path.exists():
-            raise FileNotFoundError(f"Database file does not exist: {db_path}")
+            raise TaskLiteError(f"Database file does not exist: {db_path}")
         if db_path.is_dir():
-            raise ValueError(f"Path is a directory, not a database file: {db_path}")
+            raise TaskLiteError(f"Path is a directory, not a database file: {db_path}")
         uri = db_path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30.0)
         try:
-            conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30.0)
-            try:
-                conn.execute("BEGIN")
-                if _check_schema(conn, db_path, TARGET_SCHEMA_VERSION) == 0:
-                    raise RuntimeError(f"Uninitialized TaskLite database at {db_path}")
-            except BaseException:
-                conn.close()
-                raise
-        except (RuntimeError, sqlite3.Error) as exc:
-            raise TaskLiteError(str(exc)) from exc
+            conn.execute("BEGIN")
+            if _check_schema(conn, db_path, TARGET_SCHEMA_VERSION) == 0:
+                raise TaskLiteError(f"Uninitialized TaskLite database at {db_path}")
+        except BaseException:
+            conn.close()
+            raise
         self._conn = conn
         self._closed = False
 
@@ -754,12 +751,12 @@ class StateSnapshot:
             from .pipeline import TaskLite
 
             if not isinstance(source, TaskLite):
-                raise TypeError(
+                raise TaskLiteError(
                     "source must be a str, Path, or TaskLite instance, "
                     f"got {type(source).__name__}"
                 )
             if source._closed:
-                raise RuntimeError(
+                raise TaskLiteError(
                     "Cannot open StateSnapshot from a closed TaskLite instance."
                 )
             backend = source._snapshot_backend()
@@ -777,11 +774,11 @@ class StateSnapshot:
     def get_job(self, uid: str) -> dict[str, Any] | None:
         """查询指定 Job 的当前状态与配置/结果投影（不存在返回 None）。"""
         if self._closed:
-            raise RuntimeError("StateSnapshot is closed")
+            raise TaskLiteError("StateSnapshot is closed")
         if not isinstance(uid, str):
-            raise TypeError(f"job uid must be a str, got {type(uid).__name__}")
+            raise TaskLiteError(f"job uid must be a str, got {type(uid).__name__}")
         if not uid:
-            raise ValueError("job uid must be a non-empty str")
+            raise TaskLiteError("job uid must be a non-empty str")
         try:
             parse_job_uid(uid)
         except Exception:
@@ -796,17 +793,17 @@ class StateSnapshot:
     ) -> Iterator[dict[str, Any]]:
         """按当前状态与 task_type 遍历 Job 记录（status=None 包含四态；不承诺顺序）。"""
         if self._closed:
-            raise RuntimeError("StateSnapshot is closed")
+            raise TaskLiteError("StateSnapshot is closed")
         if status is not None and status not in ("pending", "running", "succeeded", "failed"):
-            raise ValueError(
+            raise TaskLiteError(
                 f"status must be one of 'pending', 'running', 'succeeded', 'failed', or None; got {status!r}"
             )
         if task_type is not None and not isinstance(task_type, str):
-            raise TypeError(f"task_type must be a str or None, got {type(task_type).__name__}")
+            raise TaskLiteError(f"task_type must be a str or None, got {type(task_type).__name__}")
 
         for job in self._reader.iter_jobs(status=status, task_type=task_type):
             if self._closed:
-                raise RuntimeError("StateSnapshot is closed")
+                raise TaskLiteError("StateSnapshot is closed")
             yield job
 
     def iter_attempts(
@@ -817,15 +814,15 @@ class StateSnapshot:
     ) -> Iterator[dict[str, Any]]:
         """遍历物理 Attempt 历史记录（指定 job_uid 时按 attempt_no 升序）。"""
         if self._closed:
-            raise RuntimeError("StateSnapshot is closed")
+            raise TaskLiteError("StateSnapshot is closed")
         if job_uid is not None and not isinstance(job_uid, str):
-            raise TypeError(f"job_uid must be a str or None, got {type(job_uid).__name__}")
+            raise TaskLiteError(f"job_uid must be a str or None, got {type(job_uid).__name__}")
         if task_type is not None and not isinstance(task_type, str):
-            raise TypeError(f"task_type must be a str or None, got {type(task_type).__name__}")
+            raise TaskLiteError(f"task_type must be a str or None, got {type(task_type).__name__}")
 
         for att in self._reader.iter_attempts(job_uid=job_uid, task_type=task_type):
             if self._closed:
-                raise RuntimeError("StateSnapshot is closed")
+                raise TaskLiteError("StateSnapshot is closed")
             yield att
 
     def close(self) -> None:

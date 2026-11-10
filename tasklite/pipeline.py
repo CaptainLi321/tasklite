@@ -68,16 +68,16 @@ class TaskLite:
     ) -> None:
         if backend not in (_BACKEND_SQLITE, _BACKEND_MEMORY):
             if isinstance(backend, str):
-                raise ValueError(
+                raise TaskLiteError(
                     f"Unknown backend: {backend!r}. Supported backends are 'sqlite' and 'memory'."
                 )
-            raise TypeError(
+            raise TaskLiteError(
                 f"backend must be 'sqlite' or 'memory', got {type(backend).__name__}"
             )
 
         if backend == _BACKEND_SQLITE:
             if state_path is None or (isinstance(state_path, str) and not state_path.strip()):
-                raise ValueError("state_path is required when backend is 'sqlite'")
+                raise TaskLiteError("state_path is required when backend is 'sqlite'")
             self.state_path: Path | None = Path(state_path).resolve()
         else:
             self.state_path = None
@@ -87,7 +87,7 @@ class TaskLite:
             or isinstance(max_workers, bool)
             or max_workers < 1
         ):
-            raise ValueError(
+            raise TaskLiteError(
                 f"max_workers must be an int >= 1, got {max_workers!r}"
             )
 
@@ -184,7 +184,7 @@ class TaskLite:
             return [Path(r).resolve() for r in output_roots]
         if isinstance(output_roots, (str, Path)):
             return Path(output_roots).resolve()
-        raise TypeError(
+        raise TaskLiteError(
             f"output_roots must be str/Path or a sequence thereof, "
             f"got {type(output_roots).__name__}"
         )
@@ -241,7 +241,7 @@ class TaskLite:
         """向只读快照提供受控实例桥接，不开放为门面属性。"""
         backend = self._backend_handle
         if backend is None:
-            raise RuntimeError("TaskLite backend is unavailable")
+            raise TaskLiteError("TaskLite backend is unavailable")
         return backend
 
     def _ensure_active(self, api_name: str) -> None:
@@ -295,17 +295,17 @@ class TaskLite:
         """
         self._ensure_active("register_resource")
         if not isinstance(resource, Resource):
-            raise TypeError(
+            raise TaskLiteError(
                 f"register_resource expects a Resource instance, "
                 f"got {type(resource).__name__}"
             )
         if resource.name == WORKER_RESOURCE:
-            raise ValueError(
+            raise TaskLiteError(
                 f"Cannot register internal worker resource {WORKER_RESOURCE!r}; "
                 f"worker concurrency must be configured via max_workers."
             )
         if resource.name in self.resources:
-            raise ValueError(f"Resource {resource.name!r} already registered")
+            raise TaskLiteError(f"Resource {resource.name!r} already registered")
         self.resources[resource.name] = resource
 
     def register_task(
@@ -332,7 +332,7 @@ class TaskLite:
         else:
             task_type = task_or_type
             if handler is _UNSET or handler is None:
-                raise TypeError(
+                raise TaskLiteError(
                     "handler is required when registering by task_type "
                     f"(got task_type={task_type!r}, handler=None)"
                 )
@@ -356,7 +356,7 @@ class TaskLite:
         timeout_seconds: object,
         trigger: object,
     ) -> None:
-        """规格式注册的旁置参数门卫（额外参数一律 ValueError）。"""
+        """规格式注册的旁置参数校验（拒绝额外参数）。"""
         if (
             handler is not _UNSET
             or resources is not _UNSET
@@ -364,7 +364,7 @@ class TaskLite:
             or timeout_seconds is not _UNSET
             or trigger is not _UNSET
         ):
-            raise ValueError(
+            raise TaskLiteError(
                 "register_task(Task, ...) takes the spec as-is; extra spec "
                 "arguments alongside a Task instance are rejected (they "
                 "would be silently ignored). Pass overrides inside the Task."
@@ -385,7 +385,7 @@ class TaskLite:
         """
         self._ensure_active("enqueue")
         if not isinstance(job, Job):
-            raise TypeError(
+            raise TaskLiteError(
                 f"enqueue() expects a Job, got {type(job).__name__}"
             )
         with self._management_lock():
@@ -480,7 +480,7 @@ class TaskLite:
         """运行管线直到队列排空（或收到排空请求）。"""
         self._ensure_active("run")
         if exclude is not None and not isinstance(exclude, Exclude):
-            raise TypeError(
+            raise TaskLiteError(
                 f"exclude must be an Exclude instance or None, got {type(exclude).__name__}"
             )
         logger.info(f"=== Starting Pipeline (Backend: {self.backend_type}) ===")

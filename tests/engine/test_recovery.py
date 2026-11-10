@@ -5,6 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite import TaskLite
 from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
 from tasklite.engine.channel import ExecutionChannel
@@ -50,7 +52,7 @@ def test_startup_recovers_under_exclusive_lock_and_preserves_pending_order(tmp_p
         lock = try_acquire_lock(db_path)
         assert lock is not None
         try:
-            with pytest.raises(RuntimeError, match="concurrent runs"):
+            with pytest.raises(TaskLiteError, match="concurrent runs"):
                 pipeline.run()
             assert backend.load_queue_jobs() == before
             assert backend.load_settled_attempts("work::orphan") == []

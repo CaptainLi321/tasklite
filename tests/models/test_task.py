@@ -112,16 +112,16 @@ class TestTaskValidation:
         assert task.task_type == "a::b"
 
     def test_handler_must_be_callable(self):
-        with pytest.raises(TypeError, match="handler must be callable"):
+        with pytest.raises(TaskLiteError, match="handler must be callable"):
             Task(task_type="t", handler="not_callable")
 
     def test_max_retries_per_run_matrix_rejected(self):
         """max_retries_per_run 拒绝非 int / bool / 负值。"""
-        with pytest.raises(TypeError, match="max_retries_per_run must be an int"):
+        with pytest.raises(TaskLiteError, match="max_retries_per_run must be an int"):
             Task(task_type="t", handler=_handler, max_retries_per_run="3")  # type: ignore[arg-type]
-        with pytest.raises(TypeError, match="max_retries_per_run must be an int"):
+        with pytest.raises(TaskLiteError, match="max_retries_per_run must be an int"):
             Task(task_type="t", handler=_handler, max_retries_per_run=True)
-        with pytest.raises(ValueError, match="max_retries_per_run must be >= 0"):
+        with pytest.raises(TaskLiteError, match="max_retries_per_run must be >= 0"):
             Task(task_type="t", handler=_handler, max_retries_per_run=-1)
 
     def test_max_retries_per_run_zero_allowed(self):
@@ -131,12 +131,12 @@ class TestTaskValidation:
 
     def test_timeout_matrix_rejected(self):
         """timeout_seconds 拒绝非数值 / bool / 零 / 负值 / NaN / Inf / 超大 int。"""
-        with pytest.raises(TypeError, match="timeout_seconds must be a number"):
+        with pytest.raises(TaskLiteError, match="timeout_seconds must be a number"):
             Task(task_type="t", handler=_handler, timeout_seconds="60")  # type: ignore[arg-type]
-        with pytest.raises(TypeError, match="timeout_seconds must be a number"):
+        with pytest.raises(TaskLiteError, match="timeout_seconds must be a number"):
             Task(task_type="t", handler=_handler, timeout_seconds=True)
         for bad in (0, -1, float("nan"), float("inf"), float("-inf"), 10**400):
-            with pytest.raises(ValueError, match="timeout_seconds must be finite and > 0"):
+            with pytest.raises(TaskLiteError, match="timeout_seconds must be finite and > 0"):
                 Task(task_type="t", handler=_handler, timeout_seconds=bad)
 
     def test_timeout_float_accepted(self):
@@ -145,26 +145,26 @@ class TestTaskValidation:
 
     def test_resources_amount_matrix_rejected(self):
         """默认资源 amount 拒绝矩阵——bool/NaN/Inf/负值/超大 int/非数值。"""
-        with pytest.raises(TypeError, match="must be a number"):
+        with pytest.raises(TaskLiteError, match="must be a number"):
             Task(task_type="t", handler=_handler, resources={"cpu": True})
-        with pytest.raises(TypeError, match="must be a number"):
+        with pytest.raises(TaskLiteError, match="must be a number"):
             Task(task_type="t", handler=_handler, resources={"cpu": "high"})
-        with pytest.raises(ValueError, match="must be finite|too large"):
+        with pytest.raises(TaskLiteError, match="must be finite|too large"):
             Task(task_type="t", handler=_handler, resources={"cpu": float("nan")})
-        with pytest.raises(ValueError, match="must be finite|too large"):
+        with pytest.raises(TaskLiteError, match="must be finite|too large"):
             Task(task_type="t", handler=_handler, resources={"cpu": float("inf")})
-        with pytest.raises(ValueError, match="must be finite|too large"):
+        with pytest.raises(TaskLiteError, match="must be finite|too large"):
             Task(task_type="t", handler=_handler, resources={"cpu": 10**400})
-        with pytest.raises(ValueError, match="must be non-negative"):
+        with pytest.raises(TaskLiteError, match="must be non-negative"):
             Task(task_type="t", handler=_handler, resources={"cpu": -1.0})
 
     def test_resources_container_and_name_rejected(self):
         """默认资源非 dict / 非 str 资源名 / 空资源名拒绝。"""
-        with pytest.raises(TypeError, match="must be a dict"):
+        with pytest.raises(TaskLiteError, match="must be a dict"):
             Task(task_type="t", handler=_handler, resources=["cpu", 1.0])
-        with pytest.raises(TypeError, match="must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="must be a non-empty str"):
             Task(task_type="t", handler=_handler, resources={1: 2.0})
-        with pytest.raises(TypeError, match="must be a non-empty str"):
+        with pytest.raises(TaskLiteError, match="must be a non-empty str"):
             Task(task_type="t", handler=_handler, resources={"": 2.0})
 
 
@@ -181,23 +181,23 @@ class TestTaskRegistry:
         """重复注册显式报错：静默覆盖会让已入队 Job 挂到新 handler。"""
         reg = TaskRegistry()
         reg.register(Task(task_type="scan", handler=_handler))
-        with pytest.raises(ValueError, match="already registered"):
+        with pytest.raises(TaskLiteError, match="already registered"):
             reg.register(Task(task_type="scan", handler=_handler))
 
-    def test_unknown_lookup_raises_keyerror(self):
+    def test_unknown_lookup_is_rejected(self):
         """未注册 lookup 显式 KeyError：拼错 task_type 的 Job 不得静默无人处理。"""
         reg = TaskRegistry()
-        with pytest.raises(KeyError, match="unknown task_type"):
+        with pytest.raises(TaskLiteError, match="unknown task_type"):
             reg.lookup("ghost")
 
     def test_lookup_rejects_non_str(self):
         reg = TaskRegistry()
-        with pytest.raises(TypeError, match="task_type must be a str"):
+        with pytest.raises(TaskLiteError, match="task_type must be a str"):
             reg.lookup(123)
 
     def test_register_rejects_non_task(self):
         reg = TaskRegistry()
-        with pytest.raises(TypeError, match="must be a Task instance"):
+        with pytest.raises(TaskLiteError, match="must be a Task instance"):
             reg.register(("scan", _handler))
 
     def test_contains_and_task_types(self):

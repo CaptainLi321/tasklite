@@ -19,6 +19,8 @@ from typing import Any
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import ImmediateRequeuePolicy, TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel
@@ -320,18 +322,18 @@ class TestEngineRuntimeExecutionLifecycle:
         assert runtime.session.get_retry_count("t::j1") == 0
 
     def test_strict_picklable_unpicklable_handler_fails(self, tmp_path):
-        """strict 预检失败：TypeError 上抛。"""
+        """不可序列化 handler 在派发前明确拒绝。"""
         local_fn = lambda j, c: True  # noqa: E731
         env = RuntimeEnv(tmp_path, name="test_picklable", strict_picklable=True)
         env.tasks.register(Task(task_type="unpicklable", handler=local_fn))
 
-        with pytest.raises(TypeError, match="not picklable"):
+        with pytest.raises(TaskLiteError, match="not picklable"):
             env.runtime.execute()
         assert not env.runtime.is_running
         assert env.runtime._run_lock_fd is None
 
         # 预检故障不留残留状态：同实例复跑仍稳定 fail-loud 且逐次复位
-        with pytest.raises(TypeError, match="not picklable"):
+        with pytest.raises(TaskLiteError, match="not picklable"):
             env.runtime.execute()
         assert not env.runtime.is_running
 
@@ -350,7 +352,7 @@ class TestEngineRuntimeExecutionLifecycle:
         assert lock_fd is not None
         try:
             env2 = RuntimeEnv(tmp_path, name="test_lock")
-            with pytest.raises(RuntimeError, match="Another run.*in progress"):
+            with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 env2.runtime.execute()
         finally:
             release_lock(lock_fd)
@@ -441,7 +443,7 @@ class TestEngineRuntimeInitFailureSafety:
 
 class TestRunReentryGuard:
     def test_reentrant_run_rejected_and_reset_after(self, tmp_path, monkeypatch):
-        """执行期间二次 execute() 必须 RuntimeError；结束后标志复位且可复跑。"""
+        """执行期间二次 execute() 明确拒绝；结束后标志复位且可复跑。"""
         enter, release = threading.Event(), threading.Event()
         env = RuntimeEnv(tmp_path, capacity=1)
         env.register("t")
@@ -467,7 +469,7 @@ class TestRunReentryGuard:
             assert runtime.is_running, "run() 执行期间 is_running 必须为真"
 
             # 执行期间同实例再次 run() 必须拒绝（重入守卫）
-            with pytest.raises(RuntimeError, match=r"^Pipeline run\(\) already in progress"):
+            with pytest.raises(TaskLiteError, match=r"^Pipeline run\(\) already in progress"):
                 runtime.execute(ExecutionOptions(install_signals=False))
         finally:
             release.set()

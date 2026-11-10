@@ -189,7 +189,7 @@ def test_input_role_cleanup_policies(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
     # 1. input 声明 delete_existing 构造期/校验即拒绝
-    with pytest.raises(ValueError, match="input FileSpec cannot set delete_existing=True"):
+    with pytest.raises(TaskLiteError, match="input FileSpec cannot set delete_existing=True"):
         FileSpec("input.txt", role="input", delete_existing=True)
 
     # 2. input 支持 delete_on_success

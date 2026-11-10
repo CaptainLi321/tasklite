@@ -13,6 +13,8 @@ import copy
 import math
 from typing import Any, Literal
 
+from ..exceptions import TaskLiteError
+
 TaskResultStatus = Literal["success", "failure", "retry"]
 
 _CONSTRUCT_TOKEN = object()
@@ -34,7 +36,7 @@ def validate_strict_json_value(value: Any, *, path: str) -> Any:
         return value
     if value_type is float:
         if not math.isfinite(value):
-            raise ValueError(
+            raise TaskLiteError(
                 f"{path} must be a finite float; got {value!r}"
             )
         return value
@@ -42,7 +44,7 @@ def validate_strict_json_value(value: Any, *, path: str) -> Any:
         try:
             value.encode("utf-8")
         except UnicodeEncodeError as exc:
-            raise ValueError(
+            raise TaskLiteError(
                 f"{path} must be valid UTF-8 string"
             ) from exc
         return value
@@ -55,18 +57,18 @@ def validate_strict_json_value(value: Any, *, path: str) -> Any:
         out: dict[str, Any] = {}
         for k, v in value.items():
             if type(k) is not str:
-                raise TypeError(
+                raise TaskLiteError(
                     f"{path} keys must be exact str, got {type(k).__name__}"
                 )
             try:
                 k.encode("utf-8")
             except UnicodeEncodeError as exc:
-                raise ValueError(
+                raise TaskLiteError(
                     f"{path} key must be valid UTF-8 string"
                 ) from exc
             out[k] = validate_strict_json_value(v, path=f"{path}.{k}")
         return out
-    raise TypeError(
+    raise TaskLiteError(
         f"{path} must be a strict JSON value (str, int, finite float, bool, None, list, dict); "
         f"got {value_type.__name__}"
     )
@@ -79,7 +81,7 @@ def validate_strict_json_object(
     if metadata is None:
         return {}
     if type(metadata) is not dict:
-        raise TypeError(
+        raise TaskLiteError(
             f"{field_name} must be a dict or None, got {type(metadata).__name__}"
         )
     result: dict[str, Any] = validate_strict_json_value(metadata, path=field_name)
@@ -91,13 +93,13 @@ def _validate_message(message: Any) -> str | None:
     if message is None:
         return None
     if type(message) is not str:
-        raise TypeError(
+        raise TaskLiteError(
             f"message must be a str or None, got {type(message).__name__}"
         )
     try:
         message.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise ValueError("message must be a valid UTF-8 string") from exc
+        raise TaskLiteError("message must be a valid UTF-8 string") from exc
     return message
 
 
@@ -121,14 +123,14 @@ class TaskResult:
         consume_budget: bool = False,
     ) -> None:
         if _token is not _CONSTRUCT_TOKEN:
-            raise TypeError(
+            raise TaskLiteError(
                 "TaskResult cannot be instantiated directly; "
                 "use TaskResult.success(), TaskResult.failure(), or TaskResult.retry()"
             )
         if status not in _VALID_STATUSES:
-            raise ValueError(f"Invalid TaskResult status: {status!r}")
+            raise TaskLiteError(f"Invalid TaskResult status: {status!r}")
         if type(consume_budget) is not bool:
-            raise TypeError(
+            raise TaskLiteError(
                 f"consume_budget must be a bool, got {type(consume_budget).__name__}"
             )
         validated_msg = _validate_message(message)

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite import Job, TaskLite, TaskResult
 from tasklite.wrappers.discovery import encode_content_id, register_discovery
 
@@ -177,7 +179,7 @@ class TestFullMode:
 
     def test_invalid_scan_mode_rejected(self, tmp_path):
         p = _pipeline(tmp_path)
-        with pytest.raises(ValueError, match="scan_mode"):
+        with pytest.raises(TaskLiteError, match="scan_mode"):
             register_discovery(p, "disc", _fetch, _item_id, _process, "child",
                                scan_mode="bogus")
 

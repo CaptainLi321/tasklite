@@ -45,7 +45,7 @@ from .types import (
 )
 from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
-from ..exceptions import _CommitCrashSignal, _JobTerminated
+from ..exceptions import TaskLiteError, _CommitCrashSignal, _JobTerminated
 from ..models.artifact import (
     ArtifactDeclaration,
     FileSpec,
@@ -539,7 +539,7 @@ class EngineRuntime:
 
         # 不变式：run() 重入守卫——同一实例并发 execute 必须 fail-loud 拒绝
         if self._is_running:
-            raise RuntimeError("Pipeline run() already in progress on this instance.")
+            raise TaskLiteError("Pipeline run() already in progress on this instance.")
         self._is_running = True
         self._exclude = opts.exclude
         self._temporary_excluded_uids.clear()
@@ -554,7 +554,7 @@ class EngineRuntime:
             if hasattr(self.store.backend, "path") and self.store.backend.path is not None:
                 self._run_lock_fd = try_acquire_lock(self.store.backend.path, timeout=0)
                 if self._run_lock_fd is None:
-                    raise RuntimeError(
+                    raise TaskLiteError(
                         f"Another run() or management operation is in progress for "
                         f"{self.store.backend.path}; concurrent runs on the same "
                         f"state are forbidden."
@@ -564,7 +564,7 @@ class EngineRuntime:
                     self.config.ipc_dir, "__pipeline_run__", timeout=0
                 )
                 if self._run_lock_fd is None:
-                    raise RuntimeError(
+                    raise TaskLiteError(
                         f"Another run() is in progress for state_dir "
                         f"{self.config.ipc_dir}; concurrent runs on the same "
                         f"state are forbidden."
@@ -574,7 +574,7 @@ class EngineRuntime:
                 if not hasattr(backend, "_exec_lock"):
                     backend._exec_lock = threading.Lock()
                 if not backend._exec_lock.acquire(blocking=False):
-                    raise RuntimeError(
+                    raise TaskLiteError(
                         "Another run() or management operation is in progress; "
                         "concurrent runs on the same state are forbidden."
                     )
@@ -980,7 +980,7 @@ class EngineRuntime:
             try:
                 pickle.dumps(task.handler)
             except Exception as e:
-                raise TypeError(
+                raise TaskLiteError(
                     f"Handler for task_type '{task_type}' is not picklable: "
                     f"{task.handler!r} ({e}). Functions must be module-level."
                 ) from e

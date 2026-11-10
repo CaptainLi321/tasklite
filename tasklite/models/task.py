@@ -26,16 +26,13 @@ from ..exceptions import TaskLiteError
 def validate_trigger(trigger: Any) -> None:
     """触发器引用仅允许非空名称，名称解析留在主进程派发点。"""
     if not isinstance(trigger, str):
-        raise TypeError("trigger must be a non-empty str")
+        raise TaskLiteError("trigger must be a non-empty str")
     if not trigger:
-        raise ValueError("trigger must be a non-empty str")
+        raise TaskLiteError("trigger must be a non-empty str")
 
 
 def _is_finite(value: Any) -> bool:
-    """math.isfinite 的溢出安全版：超出 float 范围的超大 int（如 10**400）
-    转换溢出抛 OverflowError（ArithmeticError 子类，会命中 fatal 启发式），
-    此处按「非有限」收敛，交由调用方既有 ValueError/TypeError 通道明确
-    报错。"""
+    """超大整数与非有限浮点数采用相同拒绝规则。"""
     try:
         return math.isfinite(value)
     except OverflowError:
@@ -43,39 +40,29 @@ def _is_finite(value: Any) -> bool:
 
 
 def validate_resource_amounts(resources: Any, where: str = "resources") -> None:
-    """校验资源 amount 映射（Task 默认资源与 Job resources 的共用单点）。
-
-    负值/NaN/Inf 会在调度器 acquire 时抛 ValueError（若抛在 try 之外，
-    部分资源永久泄漏），且 NaN 会毒化容量型资源的 used 账目导致 livelock，
-    构造期即入口拒绝。bool 是 int 子类，isinstance(True, (int, float))
-    为 True 会放行，故显式拒绝。非 str 资源名在调度侧判为未知资源
-    （永不可跑），且经 JSON 落盘后键强转为 str，同一作业跨重启从死锁
-    翻转为可跑（身份与账目漂移），同样入口拒绝。
-    """
+    """校验资源映射，拒绝会破坏容量账目或持久化身份的名称与数值。"""
     if not isinstance(resources, dict):
-        raise TypeError(
+        raise TaskLiteError(
             f"resources in {where} must be a dict, got {type(resources).__name__}"
         )
     for res_name, amount in resources.items():
         if not isinstance(res_name, str) or not res_name:
-            raise TypeError(
+            raise TaskLiteError(
                 f"resource name in {where} must be a non-empty str, "
                 f"got {type(res_name).__name__} ({res_name!r})"
             )
         if not isinstance(amount, (int, float)) or isinstance(amount, bool):
-            raise TypeError(
+            raise TaskLiteError(
                 f"resource '{res_name}' amount in {where} must be a number, "
                 f"got {type(amount).__name__} ({amount!r})"
             )
         if not _is_finite(amount):
-            # 超大 int（如 10**400）使 isfinite 转 float 溢出抛 OverflowError
-            # ——与 NaN/Inf 同路收敛为 ValueError，而非异常类型漂移
-            raise ValueError(
+            raise TaskLiteError(
                 f"resource '{res_name}' amount in {where} is too large "
                 f"(exceeds float range), got {amount!r}"
             )
         if amount < 0:
-            raise ValueError(
+            raise TaskLiteError(
                 f"resource '{res_name}' amount in {where} must be non-negative, "
                 f"got {amount!r}"
             )
@@ -100,7 +87,7 @@ def validate_task_type(task_type: Any) -> None:
 def _validate_handler(handler: Any) -> None:
     """handler 入口校验：必须可调用。"""
     if not callable(handler):
-        raise TypeError(
+        raise TaskLiteError(
             f"handler must be callable, got {type(handler).__name__} ({handler!r})"
         )
 
@@ -112,12 +99,12 @@ def validate_retry_budget(max_retries_per_run: Any) -> None:
     TypeError，友好报错失效。
     """
     if not isinstance(max_retries_per_run, int) or isinstance(max_retries_per_run, bool):
-        raise TypeError(
+        raise TaskLiteError(
             f"max_retries_per_run must be an int, got {type(max_retries_per_run).__name__} "
             f"({max_retries_per_run!r})"
         )
     if max_retries_per_run < 0:
-        raise ValueError(f"max_retries_per_run must be >= 0, got {max_retries_per_run}")
+        raise TaskLiteError(f"max_retries_per_run must be >= 0, got {max_retries_per_run}")
 
 
 def validate_timeout_seconds(timeout_seconds: Any) -> None:
@@ -129,11 +116,11 @@ def validate_timeout_seconds(timeout_seconds: Any) -> None:
     同样拒绝（timeout_seconds=True 被接受为 1 秒）。
     """
     if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool):
-        raise TypeError(
+        raise TaskLiteError(
             f"timeout_seconds must be a number, got {type(timeout_seconds).__name__} ({timeout_seconds!r})"
         )
     if not _is_finite(timeout_seconds) or timeout_seconds <= 0:
-        raise ValueError(f"timeout_seconds must be finite and > 0, got {timeout_seconds}")
+        raise TaskLiteError(f"timeout_seconds must be finite and > 0, got {timeout_seconds}")
 
 
 @dataclass(frozen=True)
@@ -186,29 +173,29 @@ class TaskRegistry:
         self._tasks: dict[str, Task] = {}
 
     def register(self, task: Task) -> None:
-        """注册 Task 规格；task_type 重复注册显式 ValueError。"""
+        """注册 Task 规格；task_type 重复注册明确拒绝。"""
         if not isinstance(task, Task):
-            raise TypeError(
+            raise TaskLiteError(
                 f"task must be a Task instance, got {type(task).__name__} ({task!r})"
             )
         if task.task_type in self._tasks:
-            raise ValueError(
+            raise TaskLiteError(
                 f"task_type {task.task_type!r} already registered; duplicate "
                 f"registration would silently replace the live spec"
             )
         self._tasks[task.task_type] = task
 
     def lookup(self, task_type: str) -> Task:
-        """按 task_type 查询规格；未注册显式 KeyError。"""
+        """按 task_type 查询规格；未注册明确拒绝。"""
         if not isinstance(task_type, str):
-            raise TypeError(
+            raise TaskLiteError(
                 f"task_type must be a str, got {type(task_type).__name__} "
                 f"({task_type!r})"
             )
         try:
             return self._tasks[task_type]
         except KeyError:
-            raise KeyError(
+            raise TaskLiteError(
                 f"unknown task_type {task_type!r} (register the task before "
                 f"enqueuing its jobs)"
             ) from None

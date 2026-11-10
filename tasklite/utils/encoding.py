@@ -81,11 +81,11 @@ def percent_encode(
     转义符 % 无条件优先按 %25 处理（不依赖 % 是否落在 forbidden/allowed
     集内），保证任意配置下输出中的 %XX 序列无二义性——否则自定义
     forbidden="/" 时 "/" 与字面 "%2F" 输出同形碰撞。非 str 输入显式
-    TypeError 拒绝：隐式 str() 强转会让 None 与字面 "None" 同像碰撞，
+    TaskLiteError 拒绝：隐式 str() 强转会让 None 与字面 "None" 同像碰撞，
     破坏单射契约。
     """
     if not isinstance(text, str):
-        raise TypeError(f"text must be a str, got {type(text).__name__} ({text!r})")
+        raise TaskLiteError(f"text must be a str, got {type(text).__name__} ({text!r})")
     parts = []
     if allowed is not None:
         allowed_set = set(allowed)
@@ -127,17 +127,17 @@ def encode_identifier(
     - 编码后 > max_len 的输入：截断 + "%_" + 64 位 SHA-256 全文指纹。输出
       带像集外标记，与直通域结构性不相交；同前缀长输入之间为概率防撞
       （生日界约 2^32 条同前缀长 ID），非数学全域保证；
-    - 需截断而 max_len < _TRUNC_FIXED_LEN 时抛 ValueError（截断形态无法
+    - 需截断而 max_len < _TRUNC_FIXED_LEN 时抛 TaskLiteError（截断形态无法
       压入上限，fail-loud）；直通输入对任意 max_len 均可用。
 
-    非 str 非 None 输入显式 TypeError 拒绝（与 percent_encode 拒绝原则
+    非 str 非 None 输入显式 TaskLiteError 拒绝（与 percent_encode 拒绝原则
     同源）：隐式 str() 强转会让 int 123 与 str "123" 同像碰撞，successes 去重
     依赖本函数族的单射性，跨型同像即静默吞任务。
     """
     if value is None:
         text = ""
     elif not isinstance(value, str):
-        raise TypeError(
+        raise TaskLiteError(
             f"value must be a str or None, got {type(value).__name__} ({value!r})"
         )
     else:
@@ -151,7 +151,7 @@ def encode_identifier(
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:_TRUNC_DIGEST_HEX]
     base_limit = max_len - _TRUNC_FIXED_LEN
     if base_limit < 0:
-        raise ValueError(
+        raise TaskLiteError(
             f"max_len={max_len} 不足以容纳截断指纹形态"
             f"（标记与指纹固定占 {_TRUNC_FIXED_LEN} 字符），拒绝静默突破长度上限"
         )
@@ -176,13 +176,13 @@ def encode_content_id(content_id: str | None, *, max_len: int = 120) -> str:
     """按严密 allowlist 编码 content_id（如用于 discovery 子任务派发）。
 
     None/空值返回像集外哨兵（固定形态，不随 max_len 收缩）；单射契约分级
-    与截断行为同 encode_identifier。非 str 非 None 输入显式 TypeError
+    与截断行为同 encode_identifier。非 str 非 None 输入显式 TaskLiteError
     拒绝（隐式 str() 强转的跨型同像碰撞破坏单射契约）。
     """
     if content_id is None:
         return EMPTY_SENTINEL
     if not isinstance(content_id, str):
-        raise TypeError(
+        raise TaskLiteError(
             f"content_id must be a str or None, "
             f"got {type(content_id).__name__} ({content_id!r})"
         )

@@ -14,6 +14,8 @@ import time
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite.engine.resource import (
     CapacityResource,
     IntervalResource,
@@ -153,18 +155,18 @@ class TestIntervalResource:
         monkeypatch.setattr(_RESOURCE_TIME, clock)
 
         res = IntervalResource("test", interval_seconds=2.0)
-        with pytest.raises(ValueError, match="amount must be non-negative"):
+        with pytest.raises(TaskLiteError, match="amount must be non-negative"):
             res.acquire(-1.0)
-        with pytest.raises(ValueError, match="amount must be non-negative"):
+        with pytest.raises(TaskLiteError, match="amount must be non-negative"):
             res.can_acquire(-1.0)
 
     @pytest.mark.parametrize("bad_interval", [0.0, -1.0, float("nan"), float("inf")])
     def test_invalid_interval_rejected(self, bad_interval):
-        with pytest.raises(ValueError, match="interval_seconds"):
+        with pytest.raises(TaskLiteError, match="interval_seconds"):
             IntervalResource("test", interval_seconds=bad_interval)
 
     def test_non_numeric_interval_rejected(self):
-        with pytest.raises(TypeError, match="interval_seconds"):
+        with pytest.raises(TaskLiteError, match="interval_seconds"):
             IntervalResource("test", interval_seconds=True)  # type: ignore[arg-type]
 
 
@@ -213,13 +215,13 @@ class TestCapacityResource:
 
     def test_acquire_exceeds_capacity_raises(self):
         res = CapacityResource("test", max_capacity=5.0)
-        with pytest.raises(ValueError, match="exceeds resource capacity"):
+        with pytest.raises(TaskLiteError, match="exceeds resource capacity"):
             res.acquire(6.0)
 
-    def test_acquire_beyond_available_raises_runtime_error(self):
+    def test_acquire_beyond_available_is_rejected(self):
         res = CapacityResource("test", max_capacity=5.0)
         res.acquire(4.0)
-        with pytest.raises(RuntimeError, match="capacity exceeded"):
+        with pytest.raises(TaskLiteError, match="capacity exceeded"):
             res.acquire(2.0)
 
     def test_release_notifies_bound_notifier(self):
@@ -235,7 +237,7 @@ class TestCapacityResource:
 
     @pytest.mark.parametrize("bad_capacity", [-1.0, float("nan"), float("inf")])
     def test_invalid_capacity_rejected(self, bad_capacity):
-        with pytest.raises(ValueError, match="max_capacity"):
+        with pytest.raises(TaskLiteError, match="max_capacity"):
             CapacityResource("test", max_capacity=bad_capacity)
 
 
@@ -340,7 +342,7 @@ class TestResourceManager:
         c1.acquire(1.0)
         mgr = ResourceManager({"c1": c1})
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(TaskLiteError):
             mgr.acquire_all("t", {"c1": 1.0})
 
     def test_release_all_exception_propagates(self):

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite.backend.base import AbstractStateBackend
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import (
@@ -24,7 +26,6 @@ from tasklite.engine.types import AttemptOutcome, StopMode
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.models.task import Task
-from tasklite import TaskLiteError
 from tasklite.pipeline import TaskLite
 from tasklite.testing import running
 from tests.helpers import install_fake_process_context
@@ -261,9 +262,9 @@ class TestConstruction:
     """构造参数、目录、后端、生命周期与互斥契约。"""
 
     def test_sqlite_requires_state_path(self, tmp_path):
-        with pytest.raises(ValueError, match="state_path"):
+        with pytest.raises(TaskLiteError, match="state_path"):
             TaskLite(backend="sqlite")
-        with pytest.raises(ValueError, match="state_path"):
+        with pytest.raises(TaskLiteError, match="state_path"):
             TaskLite(backend="sqlite", state_path="")
 
     def test_memory_requires_no_state_path_and_no_disk_side_effects(self, tmp_path):
@@ -285,7 +286,7 @@ class TestConstruction:
         assert not roots[1].exists()
 
     def test_output_root_bad_type_rejected(self, tmp_path):
-        with pytest.raises(TypeError, match="output_roots"):
+        with pytest.raises(TaskLiteError, match="output_roots"):
             make_pipeline(tmp_path, output_roots=42)
 
     def test_backend_sqlite_type_name(self, tmp_path):
@@ -297,15 +298,15 @@ class TestConstruction:
         assert p.backend_type == "memory"
 
     def test_backend_unknown_string_rejected(self, tmp_path):
-        with pytest.raises(ValueError, match="Unknown backend"):
+        with pytest.raises(TaskLiteError, match="Unknown backend"):
             make_pipeline(tmp_path, backend="redis")
 
     def test_backend_bad_type_rejected(self, tmp_path):
-        with pytest.raises(TypeError, match="backend must be"):
+        with pytest.raises(TaskLiteError, match="backend must be"):
             make_pipeline(tmp_path, backend=object())
 
     def test_backend_instance_rejected(self, tmp_path):
-        with pytest.raises(TypeError, match="backend must be"):
+        with pytest.raises(TaskLiteError, match="backend must be"):
             TaskLite(backend=InMemoryStateBackend())  # type: ignore[arg-type]
 
     def test_backend_object_is_not_public(self, tmp_path):
@@ -388,7 +389,7 @@ class TestConstruction:
 
     def test_max_workers_validation(self, tmp_path):
         for bad in (0, -1, True, "4", 2.5):
-            with pytest.raises(ValueError, match="max_workers"):
+            with pytest.raises(TaskLiteError, match="max_workers"):
                 make_pipeline(tmp_path, max_workers=bad)
 
     def test_worker_resource_registered_with_capacity(self, tmp_path):
@@ -461,7 +462,7 @@ class TestConstruction:
         assert snap.get_job("t::j1")["status"] == "pending"
         snap.close()
         # 在已关闭实例上打开快照被拒绝
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(TaskLiteError, match="closed"):
             StateSnapshot.open(p)
         # 通过路径仍可正常打开
         with StateSnapshot.open(db) as snap2:
@@ -498,7 +499,7 @@ class TestConstruction:
         lock_fd = try_acquire_lock(p1.state_path, timeout=0)
         assert lock_fd is not None
         try:
-            with pytest.raises(RuntimeError, match="Another run.*in progress"):
+            with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 p2.run()
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 p2.set_job_status("t::j1", "succeeded", recursive=False)
@@ -549,7 +550,7 @@ class TestRegisterTask:
 
     def test_simple_form_requires_handler(self, tmp_path):
         p = make_pipeline(tmp_path)
-        with pytest.raises(TypeError, match="handler is required"):
+        with pytest.raises(TaskLiteError, match="handler is required"):
             p.register_task("fetch")
 
     def test_simple_form_validates_task_type(self, tmp_path):
@@ -563,17 +564,17 @@ class TestRegisterTask:
     def test_spec_form_rejects_stray_arguments(self, tmp_path):
         p = make_pipeline(tmp_path)
         for handler in (ok_handler, None):
-            with pytest.raises(ValueError, match="extra spec"):
+            with pytest.raises(TaskLiteError, match="extra spec"):
                 p.register_task(Task("fetch", ok_handler), handler=handler)
-        with pytest.raises(ValueError, match="extra spec"):
+        with pytest.raises(TaskLiteError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), resources={"a": 1})
-        with pytest.raises(ValueError, match="extra spec"):
+        with pytest.raises(TaskLiteError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), max_retries_per_run=0)
-        with pytest.raises(ValueError, match="extra spec"):
+        with pytest.raises(TaskLiteError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), max_retries_per_run=3)
-        with pytest.raises(ValueError, match="extra spec"):
+        with pytest.raises(TaskLiteError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), timeout_seconds=60)
-        with pytest.raises(ValueError, match="extra spec"):
+        with pytest.raises(TaskLiteError, match="extra spec"):
             p.register_task(Task("fetch", ok_handler), trigger="once")
         with pytest.raises(TypeError):
             p.register_task("fetch", ok_handler, payload_schema=dict)  # type: ignore[call-arg]
@@ -581,7 +582,7 @@ class TestRegisterTask:
     def test_duplicate_registration_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_task("fetch", ok_handler)
-        with pytest.raises(ValueError, match="already registered"):
+        with pytest.raises(TaskLiteError, match="already registered"):
             p.register_task("fetch", ok_handler)
 
     def test_run_guard(self, tmp_path):
@@ -601,18 +602,18 @@ class TestRegisterResource:
 
     def test_rejects_non_resource(self, tmp_path):
         p = make_pipeline(tmp_path)
-        with pytest.raises(TypeError, match="Resource instance"):
+        with pytest.raises(TaskLiteError, match="Resource instance"):
             p.register_resource("api")
 
     def test_duplicate_registration_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_resource(CapacityResource("gpu", max_capacity=1.0))
-        with pytest.raises(ValueError, match="already registered"):
+        with pytest.raises(TaskLiteError, match="already registered"):
             p.register_resource(CapacityResource("gpu", max_capacity=2.0))
 
     def test_override_workers_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
-        with pytest.raises(ValueError, match="internal worker resource"):
+        with pytest.raises(TaskLiteError, match="internal worker resource"):
             p.register_resource(CapacityResource("__workers__", max_capacity=9.0))
 
     def test_run_guard(self, tmp_path):
@@ -691,7 +692,7 @@ class TestEnqueue:
     def test_list_or_non_job_rejected(self, tmp_path):
         p = make_pipeline(tmp_path)
         for bad in ([Job("fetch", "a")], [], "bad", 42, {"task_type": "fetch", "job_id": "a"}):
-            with pytest.raises(TypeError, match="expects a Job"):
+            with pytest.raises(TaskLiteError, match="expects a Job"):
                 p.enqueue(bad)  # type: ignore[arg-type]
 
     def test_same_uid_identical_effective_config_returns_false(self, tmp_path):
@@ -1159,7 +1160,7 @@ class TestRunExecutionOptions:
         lock_fd = try_acquire_lock(p.state_path, timeout=0)
         assert lock_fd is not None
         try:
-            with pytest.raises(RuntimeError, match="Another run.*in progress"):
+            with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 p.run()
         finally:
             release_lock(lock_fd)

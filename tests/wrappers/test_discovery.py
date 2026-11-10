@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tasklite import TaskLiteError
+
 from tasklite import Job, TaskLite, TaskResult
 from tasklite.testing import fake_ctx
 from tasklite.wrappers.discovery import (
@@ -413,7 +415,7 @@ class TestDefense:
             group_key_func=bad_key,
         )
         job = Job("discover", "seed", payload={})
-        with pytest.raises(ValueError, match="group_key_func"):
+        with pytest.raises(TaskLiteError, match="group_key_func"):
             _handler(pipeline)(job, _make_ctx(job))
 
     @pytest.mark.parametrize(
@@ -441,7 +443,7 @@ class TestDefense:
             pipeline, "discover", bad_fetch, id_func, process_item_func, PTYPE
         )
         job = Job("discover", "seed", payload={})
-        with pytest.raises(ValueError, match="fetch_func"):
+        with pytest.raises(TaskLiteError, match="fetch_func"):
             _handler(pipeline)(job, _make_ctx(job))
 
     def test_id_func_bad_item_isolated(self):
@@ -498,11 +500,11 @@ class TestDefense:
     def test_process_task_type_validation(self):
         _reset_source([])
         pipeline = _make_pipeline()
-        with pytest.raises(TypeError, match="process_task_type"):
+        with pytest.raises(TaskLiteError, match="process_task_type"):
             register_discovery(
                 pipeline, "discover", fetch_func, id_func, process_item_func, ""
             )
-        with pytest.raises(ValueError, match="::"):
+        with pytest.raises(TaskLiteError, match="::"):
             register_discovery(
                 pipeline,
                 "discover",
@@ -515,7 +517,7 @@ class TestDefense:
     def test_max_pages_validation(self):
         _reset_source([])
         pipeline = _make_pipeline()
-        with pytest.raises(ValueError, match="max_pages"):
+        with pytest.raises(TaskLiteError, match="max_pages"):
             register_discovery(
                 pipeline,
                 "discover",
@@ -805,12 +807,12 @@ def test_invalid_payload_scan_mode_and_max_pages_rejected():
     handler = _handler(pipeline)
 
     job_bad_mode = Job("discover", "j1", payload={"scan_mode": "invalid_mode"})
-    with pytest.raises(ValueError, match="scan_mode"):
+    with pytest.raises(TaskLiteError, match="scan_mode"):
         handler(job_bad_mode, _make_ctx(job_bad_mode))
 
     for bad_max in (0, -1, True, "10"):
         job_bad_max = Job("discover", "j2", payload={"max_pages": bad_max})
-        with pytest.raises(ValueError, match="max_pages"):
+        with pytest.raises(TaskLiteError, match="max_pages"):
             handler(job_bad_max, _make_ctx(job_bad_max))
 
 
