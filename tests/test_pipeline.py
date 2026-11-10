@@ -95,23 +95,14 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def replace_queue_atomic(self, *args, **kwargs):
         return self.inner.replace_queue_atomic(*args, **kwargs)
 
-    def commit_job_success(self, *args, **kwargs):
-        return self.inner.commit_job_success(*args, **kwargs)
-
     def commit_job_failure(self, *args, **kwargs):
         return self.inner.commit_job_failure(*args, **kwargs)
-
-    def commit_retry(self, *args, **kwargs):
-        return self.inner.commit_retry(*args, **kwargs)
 
     def commit_job_failures(self, *args, **kwargs):
         return self.inner.commit_job_failures(*args, **kwargs)
 
     def commit_skip(self, *args, **kwargs):
         return self.inner.commit_skip(*args, **kwargs)
-
-    def append_failed(self, *args, **kwargs):
-        return self.inner.append_failed(*args, **kwargs)
 
     def enqueue_jobs(self, *args, **kwargs):
         return self.inner.enqueue_jobs(*args, **kwargs)
@@ -136,15 +127,6 @@ class DelegatingFakeBackend(AbstractStateBackend):
 
     def set_cursor(self, *args, **kwargs):
         return self.inner.set_cursor(*args, **kwargs)
-
-    def append_attempt(self, *args, **kwargs):
-        return self.inner.append_attempt(*args, **kwargs)
-
-    def update_attempt(self, *args, **kwargs):
-        return self.inner.update_attempt(*args, **kwargs)
-
-    def load_attempts(self, *args, **kwargs):
-        return self.inner.load_attempts(*args, **kwargs)
 
     def load_latest_succeeded_finished_at(self, *args, **kwargs):
         return self.inner.load_latest_succeeded_finished_at(*args, **kwargs)
@@ -676,7 +658,7 @@ class TestEnqueue:
             assert p._runtime.store.backend.load_queue() == []
             assert p._runtime.store.backend.load_successes() == {}
             assert p._runtime.store.backend.load_failed() == {}
-            assert p._runtime.store.backend.load_attempts(job.uid) == []
+            assert p._runtime.store.backend.load_settled_attempts(job.uid) == []
 
             p.register_task("missing", ok_handler)
             assert p.enqueue(job) is True

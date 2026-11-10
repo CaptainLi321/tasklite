@@ -8,7 +8,6 @@ from tasklite import TaskLiteError
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.store import StateStore
-from tasklite.models.attempt import AttemptRecord
 from tasklite.models.job import Job
 
 
@@ -27,15 +26,13 @@ class TestClearHistoryThroughStore:
             ("t::success", "succeeded", {"task_type": "t", "job_id": "success"}, None),
             ("t::failure", "failed", {"task_type": "t", "job_id": "failure"}, None),
         ])
-        backend.append_attempt(AttemptRecord(
-            job_uid="t::success",
-            activation_no=1,
-            attempt_no=1,
-            execution_id="run.1",
-            run_id="run",
-            started_at="2026-01-01T00:00:00Z",
-            outcome="running",
-        ))
+        snapshot = Job("t", "success").to_dict()
+        backend.enqueue_jobs([snapshot])
+        backend.mark_job_running("t::success", execution_id="run.1", run_id="run",
+                                 started_at="2026-01-01T00:00:00Z")
+        backend.commit_job_settlement(job_uid="t::success", outcome="success", attempt_no=1,
+                                      execution_id="run.1", run_id="run",
+                                      settled_at="2026-01-01T00:00:01Z", success_metadata={})
         store.set_cursor("cursor", "value")
 
         assert store.clear_history("t::success", ["successes"]) == 1
@@ -44,7 +41,7 @@ class TestClearHistoryThroughStore:
 
         assert backend.load_successes() == {}
         assert backend.load_failed() == {}
-        assert backend.load_attempts("t::success") == []
+        assert backend.load_settled_attempts("t::success") == []
         assert backend.load_cursors() == {"cursor": "value"}
         assert [job["job_uid"] for job in backend.load_queue_jobs()] == ["t::queued"]
 

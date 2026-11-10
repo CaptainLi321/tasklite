@@ -8,7 +8,7 @@ import pytest
 from tasklite import TaskLiteError
 
 from tasklite import TaskLite
-from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
+from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
 from tasklite.engine.recovery import RecoveryOrchestrator
@@ -30,7 +30,7 @@ def unexpected_worker(job, ctx):
 
 def test_startup_recovers_under_exclusive_lock_and_preserves_pending_order(tmp_path):
     db_path = tmp_path / "state.db"
-    backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+    backend = SQLiteStateBackend(db_path)
     backend.enqueue_jobs([Job("work", "tail").to_dict(), Job("work", "orphan").to_dict()])
     backend.enqueue_jobs([Job("work", "head").to_dict()], front=True)
     backend.mark_job_running(

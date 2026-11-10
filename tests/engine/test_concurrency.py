@@ -282,13 +282,13 @@ def test_dependency_chain_under_concurrency(tmp_state_dir):
     assert "fast::C" in successes
 
     traces = {
-        uid: pipeline._runtime.store.backend.load_attempts(uid)[0]
+        uid: pipeline._runtime.store.backend.load_settled_attempts(uid)[0]
         for uid in ("fast::A", "fast::B", "fast::C")
     }
-    assert traces["fast::A"].finished_at <= traces["fast::B"].started_at, (
+    assert traces["fast::A"]["settled_at"] <= traces["fast::B"]["started_at"], (
         "B 必须在 A 终态提交之后才开始执行"
     )
-    assert traces["fast::B"].finished_at <= traces["fast::C"].started_at, (
+    assert traces["fast::B"]["settled_at"] <= traces["fast::C"]["started_at"], (
         "C 必须在 B 终态提交之后才开始执行"
     )
 

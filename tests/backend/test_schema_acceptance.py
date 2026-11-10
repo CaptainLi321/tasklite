@@ -15,7 +15,7 @@ def snapshot(path):
                 list(conn.iterdump()))
 
 
-@pytest.mark.parametrize("version", [0, 1, 2, 3, 4, 99])
+@pytest.mark.parametrize("version", [0, 1, 2, 3, 4, 5, 99])
 def test_nonempty_incompatible_database_is_preserved(tmp_path, version):
     path = tmp_path / "original.db"
     with sqlite3.connect(path) as conn:
@@ -23,11 +23,13 @@ def test_nonempty_incompatible_database_is_preserved(tmp_path, version):
         conn.execute("INSERT INTO records VALUES ('precious')")
         conn.execute(f"PRAGMA user_version={version}")
     before = snapshot(path)
+    original_bytes = path.read_bytes()
     with pytest.raises(TaskLiteError) as caught:
         SQLiteStateBackend(path)
+    assert path.read_bytes() == original_bytes
     assert snapshot(path) == before
     assert str(path) in str(caught.value)
-    assert "5" in str(caught.value)
+    assert "schema 6" in str(caught.value)
     assert "保留原库" in str(caught.value)
 
 
@@ -90,11 +92,11 @@ def test_fresh_database_and_special_characters(tmp_path, empty_file):
     backend.set_cursor("error", "new_jobs")
     assert SQLiteStateBackend(path).load_cursors() == {"error": "new_jobs"}
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (5,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (6,)
         assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
 
 
-def test_schema_four_allows_extra_user_table(tmp_path):
+def test_current_schema_allows_extra_user_table(tmp_path):
     path = tmp_path / "extra.db"
     SQLiteStateBackend(path)
     with sqlite3.connect(path) as conn:

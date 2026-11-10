@@ -8,7 +8,7 @@ import sqlite3
 import pytest
 
 from tasklite import Job, TaskLite
-from tasklite.backend import InMemoryStateBackend, SQLiteStateBackend, TARGET_SCHEMA_VERSION
+from tasklite.backend import InMemoryStateBackend, SQLiteStateBackend
 from tasklite.engine.store import StateStore
 from tasklite.models.state import PipelineState
 
@@ -62,7 +62,7 @@ def _memory_facts(state):
 @pytest.mark.parametrize("operation", ["success", "failure", "retry", "pending", "pre_failure", "running"])
 @pytest.mark.parametrize("fault_kind", ["sqlite", "os"])
 def test_sqlite_store_fault_preserves_error_and_all_state(tmp_path, monkeypatch, operation, fault_kind):
-    backend = SQLiteStateBackend(tmp_path / "state.db", schema_version=TARGET_SCHEMA_VERSION)
+    backend = SQLiteStateBackend(tmp_path / "state.db")
     job = Job("work", "one", payload={"key": "value"}).to_dict()
     backend.enqueue_jobs([job, Job("work", "tail").to_dict()])
     backend.set_cursor("offset", "original")
@@ -136,7 +136,7 @@ class _CopyFailure:
 
 @pytest.mark.parametrize("operation", ["success", "failure", "retry", "pending", "pre_failure"])
 def test_memory_transaction_fault_preserves_original_error_and_all_state(operation):
-    backend = InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION)
+    backend = InMemoryStateBackend()
     job = Job("work", "one").to_dict()
     backend.enqueue_jobs([job])
     if operation != "pre_failure":
@@ -255,7 +255,7 @@ def test_run_settlement_fault_preserves_original_identity_and_recovers(tmp_path,
 @pytest.mark.parametrize("operation", ["bulk", "cascade", "skip"])
 @pytest.mark.parametrize("fault_kind", ["sqlite", "os"])
 def test_candidate_transaction_fault_rolls_back_entire_batch(tmp_path, monkeypatch, operation, fault_kind):
-    backend = SQLiteStateBackend(tmp_path / "state.db", schema_version=TARGET_SCHEMA_VERSION)
+    backend = SQLiteStateBackend(tmp_path / "state.db")
     jobs = [Job("work", name, depends_on=["parent::one"]).to_dict()
             for name in ("one", "two", "tail")]
     backend.enqueue_jobs(jobs)
@@ -301,7 +301,7 @@ def test_candidate_transaction_fault_rolls_back_entire_batch(tmp_path, monkeypat
 
 
 def test_memory_bulk_second_copy_fault_preserves_all_state():
-    backend = InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION)
+    backend = InMemoryStateBackend()
     backend.enqueue_jobs([Job("work", name).to_dict() for name in ("one", "two")])
     before = copy.deepcopy(backend.__dict__ | {"_lock": None, "_exec_lock": None})
     original = OSError("第二条失败记录复制失败")
@@ -350,7 +350,7 @@ def test_run_candidate_fault_preserves_pending_without_attempt(tmp_path, monkeyp
 def test_memory_skip_construction_fault_preserves_all_state(monkeypatch):
     import tasklite.backend.memory as memory
 
-    backend = InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION)
+    backend = InMemoryStateBackend()
     backend.enqueue_jobs([Job("work", name).to_dict() for name in ("one", "two")])
     before = copy.deepcopy(backend.__dict__ | {"_lock": None, "_exec_lock": None})
     original = OSError("候选队列构造失败")

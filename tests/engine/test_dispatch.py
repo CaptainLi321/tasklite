@@ -100,7 +100,7 @@ class DispatchEnv:
         if extra_resources:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
-        self.backend = InMemoryStateBackend(schema_version=6)
+        self.backend = InMemoryStateBackend()
         self.stats = defaultdict(int)
         self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.store = StateStore(
@@ -525,7 +525,7 @@ def test_dispatch_and_settlement_use_current_protocol_only(tmp_path, monkeypatch
 
     env = DispatchEnv(tmp_path)
     if backend_kind == "sqlite":
-        env.backend = SQLiteStateBackend(tmp_path / "state.db", schema_version=6)
+        env.backend = SQLiteStateBackend(tmp_path / "state.db")
 
     class CurrentBackend:
         def __getattr__(self, name):

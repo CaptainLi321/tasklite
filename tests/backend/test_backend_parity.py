@@ -5,11 +5,10 @@
 - pop 后不可见（delta 终态提交后 uid 从磁盘队列消失，队列行从不单独
   「裸弹出」——弹出的 uid 只在 commit 事务内删除）；
 - 终态互斥（成功删 failed 同名行、失败删 successes 行，最终状态唯一）；
-- attempts append-only（历史行只增不改，每行仅允许一次收尾）。
+- attempts append-only（仅结算时追加，历史行只增不改）。
 
-另覆盖双腿契约面：commit 失败/冲突不变式（False ⇒ 后端与调用前
-完全一致）、replace_queue_atomic、替换集形状校验、apply_manual_status 互斥、
-seed_cursor 入口校验。
+另覆盖双腿契约面：commit 失败/冲突不变式（异常 ⇒ 后端与调用前完全一致）、replace_queue_atomic、替换集形状校验、apply_manual_status 互斥、
+游标入口校验。
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ from __future__ import annotations
 import pytest
 
 from tasklite.backend import InMemoryStateBackend, SQLiteStateBackend
-from tasklite.models.attempt import ATTEMPT_RUNNING, AttemptRecord
 from tasklite.models.job import Job
 from tasklite.models.state import job_uid_from_snapshot
 
@@ -28,35 +26,28 @@ def _job_snapshot(job_id: str, **overrides) -> dict:
     return data
 
 
-def _running_attempt(job_uid: str, attempt_no: int = 1) -> AttemptRecord:
-    return AttemptRecord(
-        job_uid=job_uid,
-        activation_no=1,
-        attempt_no=attempt_no,
-        execution_id=f"run_seed.{attempt_no}",
-        run_id="run_seed",
-        started_at="2026-05-01T00:00:00+00:00",
-        outcome="running",
+def _settle_success(
+    backend, job_uid, result_metadata, *, attempt_no=1,
+    settled_at="2026-05-01T00:00:05+00:00", **kwargs,
+):
+    snapshot = next(
+        (job for job in backend.load_queue() if job_uid_from_snapshot(job) == job_uid), None
     )
+    if snapshot is None:
+        from tasklite import parse_job_uid
 
-
-def _open_and_commit_success(
-    backend,
-    job_uid: str,
-    result_metadata: dict,
-    *,
-    attempt_no: int = 1,
-    finished_at: str = "2026-05-01T00:00:05+00:00",
-    **kwargs,
-) -> bool:
-    attempt_id = backend.append_attempt(_running_attempt(job_uid, attempt_no=attempt_no))
-    return backend.commit_job_success(
-        job_uid=job_uid,
-        result_metadata=result_metadata,
-        attempt_id=attempt_id,
-        execution_id=f"run_seed.{attempt_no}",
-        finished_at=finished_at,
-        **kwargs,
+        task_type, job_id = parse_job_uid(job_uid)
+        snapshot = Job(task_type, job_id).to_dict()
+        backend.enqueue_jobs([snapshot])
+    sequence = backend.mark_job_running(
+        job_uid, execution_id=f"run_seed.{attempt_no}", run_id="run_seed",
+        started_at="2026-05-01T00:00:00+00:00",
+    )
+    backend.commit_job_settlement(
+        job_uid=job_uid, outcome="success", attempt_no=sequence,
+        execution_id=f"run_seed.{attempt_no}", run_id="run_seed", settled_at=settled_at,
+        started_at="2026-05-01T00:00:00+00:00", job_snapshot=snapshot,
+        success_metadata=result_metadata, **kwargs,
     )
 
 
@@ -65,7 +56,7 @@ def _queue_uids(backend) -> list[str]:
 
 
 def _snapshot(backend) -> dict:
-    """与实现无关的后端状态快照，用于原子性比对（False ⇒ 全集不变）。"""
+    """后端可观察状态快照，用于故障原子性比对。"""
     return {
         "queue": _queue_uids(backend),
         "wall": backend.load_successes(),
@@ -103,7 +94,7 @@ class TestCoreContractProperties:
         b = dual_backend
         b.enqueue_jobs([_job_snapshot(j) for j in ("success_one", "fail_one", "bulk_one", "skip_one")])
 
-        assert _open_and_commit_success(b, job_uid="t::success_one", result_metadata={"ok": True}) is True
+        assert _settle_success(b, job_uid="t::success_one", result_metadata={"ok": True}) is None
         assert b.commit_job_failure(job_uid="t::fail_one", failure_metadata={"error_message": "x"}) is True
         assert b.commit_job_failures(job_uids_metadata=[("t::bulk_one", {"error_message": "y"})]) is None
         assert b.commit_skip(job_uid="t::skip_one") is None
@@ -112,15 +103,6 @@ class TestCoreContractProperties:
         assert set(b.load_successes()) == {"t::success_one"}
         assert set(b.load_failed()) == {"t::fail_one", "t::bulk_one"}
 
-    def test_popped_uid_requeued_visible_via_commit_retry(self, dual_backend):
-        """重试 delta 是同 uid DELETE+INSERT：重入队后以新行可见。"""
-        b = dual_backend
-        b.enqueue_jobs([_job_snapshot("one")])
-        requeued = _job_snapshot("one", attempt_no=2)
-        assert b.commit_retry(popped_job_uid="t::one", requeued_job_snapshot=requeued) is True
-        queue = b.load_queue()
-        assert _queue_uids(b) == ["t::one"]
-        assert queue[0]["attempt_no"] == 2
 
     def test_success_failure_mutually_delete_opposite_side(self, dual_backend):
         """终态互斥：成功删 failed 同名行、失败删 successes 行（最终状态唯一）。"""
@@ -132,9 +114,9 @@ class TestCoreContractProperties:
         ) is True
         assert b.load_failed()["t::one"] == metadata
         assert b.load_failure_payloads()["t::one"] == payload
-        _open_and_commit_success(b, "t::other", {"ok": True})
+        _settle_success(b, "t::other", {"ok": True})
 
-        assert _open_and_commit_success(b, "t::one", {"ok": True}) is True
+        assert _settle_success(b, "t::one", {"ok": True}) is None
         assert b.load_failed() == {}
         assert b.load_failure_payloads() == {}
 
@@ -142,61 +124,6 @@ class TestCoreContractProperties:
         assert b.load_successes() == {"t::one": {"ok": True}}
         assert not (set(b.load_successes()) & set(b.load_failed()))
 
-    def test_attempts_append_only_never_rewrites_history(self, dual_backend):
-        """attempts 只增不改：历史行字段稳定、每行仅一次收尾。"""
-        b = dual_backend
-        first = b.append_attempt(_running_attempt("t::one"))
-        second = b.append_attempt(_running_attempt("t::one", attempt_no=2))
-        assert first < second
-
-        assert b.update_attempt(
-            first, outcome="failed",
-            finished_at="2026-05-01T00:00:05+00:00", error_message="boom",
-        ) is True
-
-        third = b.append_attempt(_running_attempt("t::other"))
-        assert third > second
-
-        records = b.load_attempts("t::one")
-        assert [r.attempt_no for r in records] == [1, 2]
-        assert records[0].outcome == "failed"
-        assert records[0].execution_id == "run_seed.1"
-        assert records[1].outcome == ATTEMPT_RUNNING
-
-        # 已收尾行不可二次收尾；未知 id 返回 False（双腿同构）
-        with pytest.raises(ValueError, match="already finalized"):
-            b.update_attempt(
-                first, outcome="succeeded", finished_at="2026-05-01T00:00:09+00:00"
-            )
-        assert b.update_attempt(
-            999999, outcome="skipped", finished_at="2026-05-01T00:00:09+00:00"
-        ) is False
-
-    def test_load_latest_succeeded_finished_at_narrow_query(self, dual_backend):
-        """按 attempt_id 倒序精确定位最新一次成功完成时间戳，不受前后非成功行干扰。"""
-        b = dual_backend
-        assert b.load_latest_succeeded_finished_at("t::none") is None
-
-        # 仅有 running / failed 轨迹时无成功基线
-        a1 = b.append_attempt(_running_attempt("t::job", attempt_no=1))
-        b.update_attempt(a1, outcome="failed", finished_at="2026-05-01T00:00:01+00:00", error_message="boom")
-        assert b.load_latest_succeeded_finished_at("t::job") is None
-
-        # 写入第一次成功
-        a2 = b.append_attempt(_running_attempt("t::job", attempt_no=2))
-        b.update_attempt(a2, outcome="succeeded", finished_at="2026-05-01T00:00:02+00:00")
-        assert b.load_latest_succeeded_finished_at("t::job") == "2026-05-01T00:00:02+00:00"
-
-        # 写入第二次成功（时间更新）
-        a3 = b.append_attempt(_running_attempt("t::job", attempt_no=3))
-        b.update_attempt(a3, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
-        assert b.load_latest_succeeded_finished_at("t::job") == "2026-05-01T00:00:05+00:00"
-
-        # 随后发生失败重跑或在途执行，最新成功时间戳不受干扰
-        a4 = b.append_attempt(_running_attempt("t::job", attempt_no=4))
-        b.update_attempt(a4, outcome="failed", finished_at="2026-05-01T00:00:06+00:00", error_message="err")
-        b.append_attempt(_running_attempt("t::job", attempt_no=5))
-        assert b.load_latest_succeeded_finished_at("t::job") == "2026-05-01T00:00:05+00:00"
 
     def test_meta_roundtrip_upsert(self, dual_backend):
         b = dual_backend
@@ -215,92 +142,8 @@ class _UncommittableMeta:
 
 
 class TestBackendCommitAtomicity:
-    """commit_* 失败/冲突不变式：返回 False ⇒ 后端状态与调用前完全一致。
+    """commit_* 故障时原样抛异常且后端状态与调用前完全一致。"""
 
-    连续失败崩溃契约以「commit 返回 False ⇒ 后端未变」为前提做重启
-    重建，后端任何先部分落盘再报失败的路径都会让 job 及其 spawned
-    任务静默消失。
-    """
-
-    def test_spawn_conflict_returns_false_keeping_backend_unchanged(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("child")])
-        b.append_failed(job_uid="t::one", metadata={"error_message": "stale"})
-        attempt_id = b.append_attempt(_running_attempt("t::one"))
-        before = _snapshot(b)
-
-        ok = b.commit_job_success(
-            "t::one",
-            {"status": "ok"},
-            attempt_id=attempt_id,
-            execution_id="run_seed.1",
-            finished_at="2026-05-01T00:00:05+00:00",
-            spawned_job_snapshots=[_job_snapshot("child")],
-            cursor_updates={"cur": "nine"},
-        )
-
-        assert ok is False
-        # popped uid 仍在队列、attempts/successes/failed/cursors 均未被触碰
-        assert _snapshot(b) == before
-        assert b.load_attempts("t::one")[0].outcome == "running"
-        assert "t::one" in _queue_uids(b)
-
-        # 冲突被拒后后端仍可正常提交同一 job（spawned 改为不冲突的新 uid）
-        ok = b.commit_job_success(
-            "t::one",
-            {"status": "ok"},
-            attempt_id=attempt_id,
-            execution_id="run_seed.1",
-            finished_at="2026-05-01T00:00:05+00:00",
-            spawned_job_snapshots=[_job_snapshot("fresh")],
-        )
-        assert ok is True
-        # spawned 队首插入，预置的 t::child 条目保持原位
-        assert _queue_uids(b) == ["t::fresh", "t::child"]
-        assert "t::one" in b.load_successes()
-        assert b.load_attempts("t::one")[0].outcome == "succeeded"
-
-    def test_spawn_batch_duplicate_uid_rejected_without_dup_entries(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([_job_snapshot("one")])
-        attempt_id = b.append_attempt(_running_attempt("t::one"))
-        before = _snapshot(b)
-
-        ok = b.commit_job_success(
-            "t::one",
-            {},
-            attempt_id=attempt_id,
-            execution_id="run_seed.1",
-            finished_at="2026-05-01T00:00:05+00:00",
-            spawned_job_snapshots=[_job_snapshot("x_marks"), _job_snapshot("x_marks")],
-        )
-
-        assert ok is False
-        assert _snapshot(b) == before
-        assert b.load_attempts("t::one")[0].outcome == "running"
-        # 绝不产出重复队列条目却报成功
-        uids = _queue_uids(b)
-        assert len(uids) == len(set(uids))
-
-    def test_retry_uid_conflict_returns_false_keeping_queue_intact(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([_job_snapshot("alpha"), _job_snapshot("beta")])
-        before = _snapshot(b)
-
-        ok = b.commit_retry("t::alpha", _job_snapshot("beta", attempt_no=2), front=True)
-
-        assert ok is False
-        assert _snapshot(b) == before
-        assert _queue_uids(b) == ["t::alpha", "t::beta"]
-
-    def test_retry_same_uid_requeue_still_succeeds(self, dual_backend):
-        b = dual_backend
-        b.enqueue_jobs([_job_snapshot("alpha"), _job_snapshot("beta")])
-
-        assert b.commit_retry("t::alpha", _job_snapshot("alpha", attempt_no=2), front=True) is True
-        assert _queue_uids(b) == ["t::alpha", "t::beta"]
-        assert b.commit_retry("t::alpha", _job_snapshot("alpha", attempt_no=3), front=False) is True
-        assert _queue_uids(b) == ["t::beta", "t::alpha"]
 
     def test_bulk_failure_write_error_leaves_backend_unchanged(self, dual_backend):
         b = dual_backend
@@ -329,9 +172,9 @@ class TestBackendCommitAtomicity:
     def test_success_commit_with_spawn_and_cursor_still_applies(self, dual_backend):
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one")])
-        b.append_failed("t::one", {"error_message": "stale"})
+        b.commit_job_failure("t::one", {"error_message": "stale"})
 
-        ok = _open_and_commit_success(
+        ok = _settle_success(
             b,
             "t::one",
             {"status": "ok"},
@@ -339,75 +182,12 @@ class TestBackendCommitAtomicity:
             cursor_updates={"page": "two"},
         )
 
-        assert ok is True
+        assert ok is None
         assert _queue_uids(b) == ["t::child_one", "t::child_two"]
         assert b.load_successes()["t::one"]["status"] == "ok"
         # 成功 commit 清理 failed 同名残行
         assert "t::one" not in b.load_failed()
         assert b.load_cursors() == {"page": "two"}
-
-    def test_success_commit_rejects_invalid_attempt_row_keeping_all_tables_unchanged(self, dual_backend):
-        """成功提交校验 attempts 行（缺行、uid/执行代不符、已收尾），失败时全表与历史行零改动。"""
-        b = dual_backend
-        b.enqueue_jobs([_job_snapshot("one")])
-        b.append_failed("t::one", {"error_message": "stale"},)
-        b.set_cursor("cur", "initial")
-
-        # 历史已收尾行（不可被后续成功提交触碰）
-        hist_id = b.append_attempt(_running_attempt("t::one", attempt_no=1))
-        assert b.update_attempt(
-            hist_id, outcome="failed", finished_at="2026-05-01T00:00:01+00:00", error_message="boom"
-        ) is True
-        other_id = b.append_attempt(_running_attempt("t::other", attempt_no=1))
-        active_id = b.append_attempt(_running_attempt("t::one", attempt_no=2))
-        before = _snapshot(b)
-        before_attempts_one = b.load_attempts("t::one")
-        before_attempts_other = b.load_attempts("t::other")
-
-        invalid_cases = [
-            # 1. attempt_id 为 None
-            dict(attempt_id=None, execution_id="run_seed.2", finished_at="2026-05-01T00:00:05+00:00"),
-            # 2. attempt_id 不存在
-            dict(attempt_id=999999, execution_id="run_seed.2", finished_at="2026-05-01T00:00:05+00:00"),
-            # 3. attempt_id 对应其他 job_uid
-            dict(attempt_id=other_id, execution_id="run_seed.1", finished_at="2026-05-01T00:00:05+00:00"),
-            # 4. execution_id 不匹配
-            dict(attempt_id=active_id, execution_id="wrong_exec.2", finished_at="2026-05-01T00:00:05+00:00"),
-            # 5. 目标 attempt_id 已经非 running（已收尾）
-            dict(attempt_id=hist_id, execution_id="run_seed.1", finished_at="2026-05-01T00:00:05+00:00"),
-            # 6. finished_at 缺失或为空
-            dict(attempt_id=active_id, execution_id="run_seed.2", finished_at=None),
-            dict(attempt_id=active_id, execution_id="run_seed.2", finished_at=""),
-        ]
-        for case in invalid_cases:
-            ok = b.commit_job_success(
-                "t::one",
-                {"status": "ok"},
-                spawned_job_snapshots=[_job_snapshot("child")],
-                cursor_updates={"cur": "updated"},
-                **case,
-            )
-            assert ok is False, f"expected False for {case}"
-            assert _snapshot(b) == before
-            assert b.load_attempts("t::one") == before_attempts_one
-            assert b.load_attempts("t::other") == before_attempts_other
-
-        # 随后传入合法参数时正常原子提交，历史行仍不改
-        ok = b.commit_job_success(
-            "t::one",
-            {"status": "ok"},
-            attempt_id=active_id,
-            execution_id="run_seed.2",
-            finished_at="2026-05-01T00:00:05+00:00",
-            spawned_job_snapshots=[_job_snapshot("child")],
-            cursor_updates={"cur": "updated"},
-        )
-        assert ok is True
-        attempts_after = b.load_attempts("t::one")
-        assert attempts_after[0] == before_attempts_one[0]
-        assert attempts_after[1].outcome == "succeeded"
-        assert attempts_after[1].finished_at == "2026-05-01T00:00:05+00:00"
-        assert b.load_attempts("t::other") == before_attempts_other
 
 
 class TestReplaceQueueAtomic:
@@ -625,3 +405,54 @@ def test_archive_metadata_and_payload_are_independent_untranslated_copies(dual_b
     assert backend.load_failed() == {"t::separate": expected_metadata}
     assert backend.commit_job_failure("t::separate", {"replacement": True}, payload=None)
     assert backend.load_failure_payloads() == expected_payloads
+
+
+@pytest.mark.parametrize("conflict", ["existing", "duplicate"])
+def test_spawn_conflict_rolls_back_complete_settlement(dual_backend, conflict):
+    backend = dual_backend
+    backend.commit_job_failure("t::parent", {"old": True}, {"input": 1})
+    backend.enqueue_jobs([_job_snapshot("parent"), _job_snapshot("existing")])
+    backend.set_cursor("offset", "old")
+    backend.mark_job_running("t::parent", execution_id="run.1", run_id="run", started_at="start")
+    before = _snapshot(backend)
+    before_queue = backend.load_queue_jobs()
+    spawned = [_job_snapshot("existing")] if conflict == "existing" else [_job_snapshot("child")] * 2
+    from tasklite import TaskLiteError
+    with pytest.raises(TaskLiteError, match="conflict"):
+        backend.commit_job_settlement(job_uid="t::parent", outcome="success", attempt_no=1,
+                                      execution_id="run.1", run_id="run", settled_at="finish",
+                                      success_metadata={"new": True}, spawned_job_snapshots=spawned,
+                                      cursor_updates={"offset": "new"})
+    assert _snapshot(backend) == before
+    assert backend.load_queue_jobs() == before_queue
+    assert backend.load_settled_attempts("t::parent") == []
+    assert backend.get_attempt_sequence("t::parent") == 1
+
+
+def test_settled_history_is_immutable_isolated_and_orders_by_sequence(dual_backend):
+    backend = dual_backend
+    job = _job_snapshot("parent")
+    backend.enqueue_jobs([job])
+    for number, outcome in enumerate(("retry", "retry", "success"), 1):
+        assert backend.mark_job_running("t::parent", execution_id=f"run.{number}",
+                                        run_id="run", started_at=f"start-{number}") == number
+        assert len(backend.load_settled_attempts("t::parent")) == number - 1
+        backend.commit_job_settlement(job_uid="t::parent", outcome=outcome, attempt_no=number,
+                                      execution_id=f"run.{number}", run_id="run", settled_at=f"finish-{number}",
+                                      started_at=f"start-{number}", job_snapshot=job,
+                                      files={"output": {"path": "/output"}}, result={"metadata": {"n": number}})
+        if number == 1:
+            first = backend.load_settled_attempts("t::parent")[0]
+    records = backend.load_settled_attempts("t::parent")
+    assert records[0] == first
+    assert [record["attempt_no"] for record in records] == [1, 2, 3]
+    assert [record["outcome"] for record in records] == ["retry", "retry", "success"]
+    assert len({record["attempt_id"] for record in records}) == 3
+    assert backend.load_latest_succeeded_finished_at("t::parent") == "finish-3"
+    records[0]["result"]["metadata"]["n"] = 999
+    records[0]["files"]["output"]["path"] = "changed"
+    assert backend.load_settled_attempts("t::parent")[0] == first
+    assert backend.load_latest_succeeded_finished_at("t::missing") is None
+    backend.commit_job_failure("t::parent", {"preflight": True})
+    backend.commit_skip("t::parent")
+    assert backend.load_settled_attempts("t::parent")[0] == first

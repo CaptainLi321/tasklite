@@ -26,7 +26,6 @@ import pytest
 
 from tasklite import FileSpec, Job, TaskLite, TaskResult
 from tasklite.resource import CapacityResource
-from tasklite.backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from tasklite.utils.artifact import ArtifactPathPolicy
 from tasklite.utils.jsonutil import dumps, loads
 
@@ -181,25 +180,16 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
                             ).fetchone()
                             is None
                         )
-                        expected_outside = (
-                            None
-                            if backend.schema_version >= TARGET_SCHEMA_VERSION
-                            else ("running",)
-                        )
+                        expected_outside = None
                         assert outside.execute(
                             "SELECT outcome FROM attempts WHERE job_uid='parent::parent'"
                         ).fetchone() == expected_outside
                 if visible is None:
                     assert connection.in_transaction
-                    time_col = (
-                        "settled_at"
-                        if backend.schema_version >= TARGET_SCHEMA_VERSION
-                        else "finished_at"
-                    )
                     observations.append((
                         loads(staged[0]),
                         connection.execute(
-                            f"SELECT outcome, {time_col} FROM attempts WHERE job_uid='parent::parent'"
+                            "SELECT outcome, settled_at FROM attempts WHERE job_uid='parent::parent'"
                         ).fetchone(),
                         connection.execute(
                             "SELECT value FROM cursors WHERE key='position'"
@@ -216,7 +206,7 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
         tmp_path / "output" / "published.txt"
     )
     assert metadata["inputs"] == [metadata["artifacts"]["report"]["path"]]
-    assert attempt[0] in ("succeeded", "success") and attempt[1] is not None
+    assert attempt[0] == "success" and attempt[1] is not None
     assert cursor == ("42",)
     assert queue == [("child::child",)]
     assert backend.load_queue() == []
@@ -228,17 +218,13 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
     reopened.register_task("parent", success_handler)
     result = reopened.run()
     assert result is None
-    assert len(reopened._runtime.store.backend.load_attempts("parent::parent")) == 1
+    assert len(reopened._runtime.store.backend.load_settled_attempts("parent::parent")) == 1
     assert reopened._runtime.store.backend.load_successes()["parent::parent"]["result"]["metadata"]["worker_pid"] == pid
     assert reopened._runtime.store.backend.load_cursors()["position"] == "42"
     reopened.enqueue(Job("parent", "parent"))
     assert reopened.run() is None
-    expected_attempts = (
-        ["succeeded"]
-        if reopened._runtime.store.backend.schema_version >= TARGET_SCHEMA_VERSION
-        else ["succeeded", "skipped"]
-    )
-    assert [a.outcome for a in reopened._runtime.store.backend.load_attempts("parent::parent")] == expected_attempts
+    expected_attempts = ["success"]
+    assert [a["outcome"] for a in reopened._runtime.store.backend.load_settled_attempts("parent::parent")] == expected_attempts
 
 
 @pytest.mark.parametrize("mode", ["kill", "crash", "timeout"])
@@ -284,10 +270,10 @@ def test_process_death_is_single_failure_without_implicit_retry(
     assert killer is None or not killer.is_alive()
     failed = pipeline._runtime.store.backend.load_failed()
     assert list(failed) == ["work::" + mode]
-    attempts = pipeline._runtime.store.backend.load_attempts("work::" + mode)
+    attempts = pipeline._runtime.store.backend.load_settled_attempts("work::" + mode)
     assert len(attempts) == 1
-    assert attempts[0].attempt_no == 1
-    assert attempts[0].outcome == "failed"
+    assert attempts[0]["attempt_no"] == 1
+    assert attempts[0]["outcome"] == "failure"
     assert pipeline._runtime.store.backend.load_successes() == {}
     expected = {
         "kill": "signal",
@@ -382,7 +368,7 @@ def test_stop_commits_complete_result_already_received(pipelines, monkeypatch):
     assert res is None
     assert pipeline._runtime.store.backend.load_successes()["child::done"]["result"]["metadata"]["child"] is True
     assert pipeline._runtime.store.backend.load_queue() == []
-    assert pipeline._runtime.store.backend.load_attempts("child::done")[0].outcome == "succeeded"
+    assert pipeline._runtime.store.backend.load_settled_attempts("child::done")[0]["outcome"] == "success"
 
 
 @pytest.mark.parametrize("fault", ["json", "kind", "job_uid", "execution_id"])

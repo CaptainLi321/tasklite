@@ -60,7 +60,7 @@ class CommitFailureBackend:
 
 
 def _make_store(**kwargs) -> tuple[StateStore, PipelineState, InMemoryStateBackend]:
-    backend = InMemoryStateBackend(schema_version=6)
+    backend = InMemoryStateBackend()
     state = PipelineState({}, {}, {}, [])
     store = StateStore(backend, state, **kwargs)
     return store, state, backend
@@ -280,7 +280,7 @@ class TestApplySkip:
     @pytest.mark.parametrize("dispatched", [False, True])
     def test_skip_records_stat_and_clears_queue(self, dispatched):
         stats = defaultdict(int)
-        backend = InMemoryStateBackend(schema_version=6)
+        backend = InMemoryStateBackend()
         backend.save_queue([{"task_type": "t", "job_id": "1"}])
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
         store = StateStore(backend, state, stats=stats)
@@ -311,7 +311,7 @@ class TestApplySkip:
         state._assert_state_consistent()
 
     def test_skip_fault_preserves_queue_without_archive(self):
-        backend = InMemoryStateBackend(schema_version=6)
+        backend = InMemoryStateBackend()
         failing = CommitFailureBackend(backend, failing=("commit_skip",))
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
         store = StateStore(failing, state, stats={})
@@ -382,7 +382,7 @@ class TestHookSingleExit:
     def test_bulk_failure_fires_hook_per_uid(self):
         stats = defaultdict(int)
         hooks: list[tuple[str, AttemptOutcome]] = []
-        backend = InMemoryStateBackend(schema_version=6)
+        backend = InMemoryStateBackend()
         store = StateStore(
             backend,
             PipelineState({}, {}, {}, []),
@@ -400,7 +400,7 @@ class TestHookSingleExit:
 
     def test_cascade_fires_hook_per_downstream(self):
         hooks: list[tuple[str, AttemptOutcome]] = []
-        backend = InMemoryStateBackend(schema_version=6)
+        backend = InMemoryStateBackend()
         state = PipelineState(
             {}, {}, {},
             [
@@ -454,7 +454,7 @@ class TestApplyBulkFailure:
 
     @pytest.mark.parametrize("operation", ["bulk", "cascade"])
     def test_bulk_fault_preserves_state_without_failure_accounting(self, operation):
-        backend = InMemoryStateBackend(schema_version=6)
+        backend = InMemoryStateBackend()
         failing = CommitFailureBackend(backend, failing=("commit_job_failures",))
         job = Job("child", "one", depends_on=["parent::one"]).to_dict()
         state = PipelineState({}, {}, {}, [job])
@@ -473,7 +473,7 @@ class TestIntakePipeline:
     """enqueue 摄入管道三步 + 首入队时间。"""
 
     def test_enqueue_fills_first_enqueued_at_once(self):
-        backend = InMemoryStateBackend(schema_version=6)
+        backend = InMemoryStateBackend()
         store = StateStore(
             backend,
             PipelineState({}, {}, {}, []),
@@ -492,7 +492,7 @@ class TestIntakePipeline:
 
     def test_enqueue_injects_discovery_trigger_for_unspecified(self):
         store = StateStore(
-            InMemoryStateBackend(schema_version=6),
+            InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=_task_specs("scan", "always")),
         )
@@ -503,7 +503,7 @@ class TestIntakePipeline:
 
     def test_enqueue_rejects_unserializable_payload(self):
         store = StateStore(
-            InMemoryStateBackend(schema_version=6),
+            InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
         )
@@ -520,7 +520,7 @@ class TestIntakePipeline:
     def test_enqueue_rejects_unregistered_task(self):
         from tasklite import TaskLiteError
 
-        backend = InMemoryStateBackend(schema_version=6)
+        backend = InMemoryStateBackend()
         store = StateStore(
             backend,
             PipelineState({}, {}, {}, []),
@@ -548,7 +548,7 @@ class TestIntakePipeline:
             )
         )
         store = StateStore(
-            InMemoryStateBackend(schema_version=6),
+            InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=tasks),
         )
@@ -578,7 +578,7 @@ class TestIntakePipeline:
 
     def test_normalize_spawned_job_matches_intake_rules(self):
         store = StateStore(
-            InMemoryStateBackend(schema_version=6),
+            InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(
                 tasks=_task_specs("child", "until_success")
@@ -591,7 +591,7 @@ class TestIntakePipeline:
 
     def test_normalize_spawned_job_rejects_unserializable(self):
         store = StateStore(
-            InMemoryStateBackend(schema_version=6),
+            InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
         )
@@ -604,7 +604,7 @@ class TestIntakePipeline:
         from tasklite import TaskLiteError
 
         store = StateStore(
-            InMemoryStateBackend(schema_version=6),
+            InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=TaskRegistry()),
         )
@@ -622,7 +622,7 @@ class TestSnapshotAndMembership:
             {"c": "v"},
             [{"task_type": "q", "job_id": "1"}],
         )
-        return StateStore(InMemoryStateBackend(schema_version=6), state)
+        return StateStore(InMemoryStateBackend(), state)
 
     def test_membership_predicates(self):
         """成员判定经 store.state 单一访问路径（六集合统一谓词）。"""
@@ -658,7 +658,7 @@ class TestSnapshotAndMembership:
         assert store.state is fresh
         store.set_state(None)
         assert store.state.is_empty
-        new_backend = InMemoryStateBackend(schema_version=6)
+        new_backend = InMemoryStateBackend()
         store.set_backend(new_backend)
         assert store.backend is new_backend
 
@@ -712,7 +712,7 @@ class _MutexProbe:
     """对一组随机操作执行真实状态机协议，并在每步后断言互斥不变式。"""
 
     def __init__(self) -> None:
-        self.backend = InMemoryStateBackend(schema_version=6)
+        self.backend = InMemoryStateBackend()
         self.state = PipelineState({}, {}, {}, [])
         self.store = StateStore(self.backend, self.state)
 
@@ -838,7 +838,7 @@ def test_artifact_manifest_replaces_as_part_of_success_transaction(tmp_path, bac
     from tasklite.backend import SQLiteStateBackend
     from tasklite.models.artifact import ArtifactDeclaration
 
-    backend = InMemoryStateBackend(schema_version=6) if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db", schema_version=6)
+    backend = InMemoryStateBackend() if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db")
     state = PipelineState({}, {}, {}, [])
     store = StateStore(backend, state)
     uid = "t::artifacts"
@@ -896,7 +896,7 @@ def test_artifact_manifest_stays_committed_when_settlement_fails(tmp_path, monke
     from tasklite.backend import SQLiteStateBackend
     from tasklite.models.artifact import ArtifactDeclaration
 
-    backend = InMemoryStateBackend(schema_version=6) if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db", schema_version=6)
+    backend = InMemoryStateBackend() if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db")
     store = StateStore(backend)
     result = {"message": None, "exception": None, "metadata": {}, "annotations": {}}
     old = ArtifactDeclaration(str(tmp_path / "old"), name="old")
@@ -925,7 +925,7 @@ def test_sqlite_artifact_publication_rolls_back_with_cursor_transaction(tmp_path
     from tasklite.backend import SQLiteStateBackend
     from tasklite.models.artifact import ArtifactDeclaration
 
-    backend = SQLiteStateBackend(tmp_path / "state.db", schema_version=6)
+    backend = SQLiteStateBackend(tmp_path / "state.db")
     store = StateStore(backend)
     result = {"message": None, "exception": None, "metadata": {}, "annotations": {}}
     store.apply_success(

@@ -329,7 +329,7 @@ def test_schema_acceptance_and_rejection_proof(tmp_path):
     mtime_before = old_db.stat().st_mtime_ns
 
     with pytest.raises(TaskLiteError, match="Unsupported database schema version 5"):
-        SQLiteStateBackend(old_db, schema_version=TARGET_SCHEMA_VERSION)
+        SQLiteStateBackend(old_db)
 
     # 确认原文件未被覆盖或修改
     assert old_db.stat().st_mtime_ns == mtime_before
@@ -342,4 +342,4 @@ def test_schema_acceptance_and_rejection_proof(tmp_path):
     conn.close()
 
     with pytest.raises(TaskLiteError, match="version 0 非空库"):
-        SQLiteStateBackend(non_empty_v0, schema_version=TARGET_SCHEMA_VERSION)
+        SQLiteStateBackend(non_empty_v0)

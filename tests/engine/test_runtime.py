@@ -287,8 +287,8 @@ class TestEngineRuntimeExecutionLifecycle:
 
         assert "t::j1" in env.backend.load_successes()
         assert env.backend.load_queue() == []
-        records = env.backend.load_attempts("t::j1")
-        assert records[-1].outcome == "succeeded"
+        records = env.backend.load_settled_attempts("t::j1")
+        assert records[-1]["outcome"] == "success"
 
     def test_unhandled_exception_propagates_via_raise_channel(self, tmp_path, monkeypatch):
         """异常通道契约：run 体内未处理异常一律经 raise 通道原样上抛，
@@ -634,5 +634,5 @@ class TestGracefulDraining:
         assert outcome.deadlock_detected is False
         assert outcome.should_terminate is True
         assert set(env.backend.load_failed()) == {"t::blocked", "t::downstream"}
-        assert env.backend.load_attempts("t::blocked") == []
-        assert env.backend.load_attempts("t::downstream") == []
+        assert env.backend.load_settled_attempts("t::blocked") == []
+        assert env.backend.load_settled_attempts("t::downstream") == []

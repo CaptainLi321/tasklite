@@ -16,7 +16,7 @@ from typing import Any, Callable, Collection, Literal, Sequence
 
 from .backend.base import AbstractStateBackend
 from .backend.memory import InMemoryStateBackend
-from .backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
+from .backend.sqlite_backend import SQLiteStateBackend
 from .engine.admission import TriggerRegistry
 from .models.trigger import TriggerContext
 from .engine.channel import ExecutionChannel
@@ -193,11 +193,8 @@ class TaskLite:
         """持久化后端装配。"""
         if backend == _BACKEND_SQLITE:
             assert self.state_path is not None
-            return SQLiteStateBackend(
-                self.state_path,
-                schema_version=TARGET_SCHEMA_VERSION,
-            )
-        return InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION)
+            return SQLiteStateBackend(self.state_path)
+        return InMemoryStateBackend()
 
     @staticmethod
     def _build_resources(tasks: TaskRegistry, max_workers: int) -> ResourceManager:

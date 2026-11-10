@@ -68,7 +68,7 @@ class CompletionEnv:
         if extra_resources:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
-        self.backend = InMemoryStateBackend(schema_version=6)
+        self.backend = InMemoryStateBackend()
         self.stats = defaultdict(int)
         self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.tasks = TaskRegistry()

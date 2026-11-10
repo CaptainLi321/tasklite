@@ -20,14 +20,14 @@ import pytest
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
 from tasklite.backend.base import QUEUE_EXECUTION_ID_KEY
 from tasklite.resource import CapacityResource
-from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
+from tasklite.backend.sqlite_backend import SQLiteStateBackend
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "retry", "pending"])
 def test_startup_invariant_conflict_raises_runtime_error(tmp_path: Path, outcome):
     """同一次执行不能同时处于 running 与已结算。"""
     db_path = tmp_path / "conflict_state.db"
-    backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+    backend = SQLiteStateBackend(db_path)
     backend.enqueue_jobs([{"task_type": "t", "job_id": "1"}])
     backend.mark_job_running(
         "t::1",
@@ -82,7 +82,7 @@ def assert_startup_conflict_preserves_database(db_path):
 )
 def test_startup_rejects_running_identity_conflict(tmp_path, corruption):
     db_path = tmp_path / "state.db"
-    backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+    backend = SQLiteStateBackend(db_path)
     backend.enqueue_jobs([Job("t", "one").to_dict()])
     backend.mark_job_running(
         "t::one",
@@ -97,7 +97,7 @@ def test_startup_rejects_running_identity_conflict(tmp_path, corruption):
 
 def test_startup_rejects_running_execution_id_mismatch(tmp_path):
     db_path = tmp_path / "state.db"
-    backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+    backend = SQLiteStateBackend(db_path)
     backend.enqueue_jobs([Job("t", "one").to_dict()])
     backend.mark_job_running(
         "t::one",
@@ -121,11 +121,13 @@ def test_startup_rejects_running_execution_id_mismatch(tmp_path):
 
 def test_startup_terminal_overlap_is_a_conflict(tmp_path):
     db_path = tmp_path / "overlap.db"
-    backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+    backend = SQLiteStateBackend(db_path)
     backend.apply_manual_status([
         ("t::overlap", "succeeded", Job("t", "overlap").to_dict(), None),
     ])
-    backend.append_failed("t::overlap", {"error_message": "conflict"})
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO failed (job_uid, metadata) VALUES (?, ?)",
+                     ("t::overlap", '{"error_message": "conflict"}'))
     assert_startup_conflict_preserves_database(db_path)
 
 
@@ -140,7 +142,7 @@ def transaction_effect_handler(job, ctx):
 @pytest.mark.parametrize("old_outcome", ["success", "failure"])
 def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_outcome):
     db_path = tmp_path / "state.db"
-    backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+    backend = SQLiteStateBackend(db_path)
     uid = "work::one"
     first = Job("work", "one").to_dict()
     backend.enqueue_jobs([first])
@@ -232,7 +234,7 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
 def test_leftover_running_recovery_and_idempotence(tmp_path: Path):
     """崩溃窗口：running 提交后未完成结算，下次启动单次收敛为 failed，幂等不重复记行。"""
     db_path = tmp_path / "recovery_state.db"
-    backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+    backend = SQLiteStateBackend(db_path)
     backend.enqueue_jobs([{"task_type": "work", "job_id": "orphan"}])
     att_no = backend.mark_job_running(
         "work::orphan",
@@ -251,17 +253,17 @@ def test_leftover_running_recovery_and_idempotence(tmp_path: Path):
     assert failed["work::orphan"]["error_message"] == "上次执行未完成结算，实际结果未知"
     assert failed["work::orphan"]["run_id"] == "run_crash"
 
-    attempts = pipeline._runtime.store.backend.load_attempts("work::orphan")
+    attempts = pipeline._runtime.store.backend.load_settled_attempts("work::orphan")
     assert len(attempts) == 1
-    assert attempts[0].outcome == "failed"
-    assert attempts[0].attempt_no == 1
-    assert attempts[0].run_id == "run_crash"
+    assert attempts[0]["outcome"] == "failure"
+    assert attempts[0]["attempt_no"] == 1
+    assert attempts[0]["run_id"] == "run_crash"
     assert pipeline._runtime.store.backend.load_queue() == []
 
     # 再次启动，幂等不产生重复 attempts
     pipeline2 = TaskLite(backend="sqlite", state_path=db_path)
     pipeline2.run()
-    attempts2 = pipeline2._runtime.store.backend.load_attempts("work::orphan")
+    attempts2 = pipeline2._runtime.store.backend.load_settled_attempts("work::orphan")
     assert len(attempts2) == 1
 
 
@@ -315,7 +317,7 @@ def test_invalid_spawned_job_rejects_parent_and_discards_effects(tmp_path: Path,
     assert "parent::p1" in pipeline._runtime.store.backend.load_failed()
     assert "payload" in pipeline._runtime.store.backend.load_failed()["parent::p1"]["error_message"]
     assert "child::valid" not in pipeline._runtime.store.backend.load_successes()
-    assert pipeline._runtime.store.backend.load_attempts("child::valid") == []
+    assert pipeline._runtime.store.backend.load_settled_attempts("child::valid") == []
     assert "offset" not in pipeline._runtime.store.backend.load_cursors()
     assert pipeline._runtime.store.backend.load_queue() == []
 
@@ -341,10 +343,10 @@ def test_attempt_no_monotonic_advance_including_zero_budget_retry(tmp_path: Path
     pipeline.enqueue(Job("worker", "m1", payload={"counter_file": str(counter_file)}))
     pipeline.run()
 
-    attempts = pipeline._runtime.store.backend.load_attempts("worker::m1")
+    attempts = pipeline._runtime.store.backend.load_settled_attempts("worker::m1")
     assert len(attempts) == 2
-    assert [a.attempt_no for a in attempts] == [1, 2]
-    assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
+    assert [a["attempt_no"] for a in attempts] == [1, 2]
+    assert [a["outcome"] for a in attempts] == ["retry", "success"]
 
 
 @pytest.mark.parametrize("error_type", [OSError, sqlite3.OperationalError])
@@ -373,7 +375,7 @@ def test_recovery_settlement_fault_preserves_running(tmp_path, monkeypatch, erro
     assert backend.load_queue_jobs()[0]["status"] == "running"
     assert backend.load_queue_jobs()[0]["job"] == snapshot
     assert backend.load_failed() == {}
-    assert backend.load_attempts("work::orphan") == []
+    assert backend.load_settled_attempts("work::orphan") == []
     assert pipeline._runtime.store.state.failed == {}
     pipeline.close()
 

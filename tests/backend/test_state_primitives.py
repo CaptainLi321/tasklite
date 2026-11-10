@@ -19,7 +19,6 @@ from tasklite.backend import (
     AbstractStateBackend,
     InMemoryStateBackend,
     SQLiteStateBackend,
-    TARGET_SCHEMA_VERSION,
 )
 from tasklite.backend.base import QUEUE_EXECUTION_ID_KEY
 from tasklite.models.job import Job
@@ -55,9 +54,9 @@ def _sqlite_snapshot(path):
 @pytest.fixture(params=["memory", "sqlite"])
 def v6_backend(request, tmp_path) -> AbstractStateBackend:
     if request.param == "memory":
-        return InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION)
+        return InMemoryStateBackend()
     db_path = tmp_path / "v6_state.db"
-    return SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+    return SQLiteStateBackend(db_path)
 
 
 class TestStatePrimitivesParity:
@@ -387,45 +386,15 @@ class TestDatabaseRejectionAndPreservation:
             conn.execute(f"PRAGMA user_version = {old_version}")
 
         before = _sqlite_snapshot(path)
+        original_bytes = path.read_bytes()
 
         with pytest.raises(TaskLiteError) as caught:
-            SQLiteStateBackend(path, schema_version=TARGET_SCHEMA_VERSION)
+            SQLiteStateBackend(path)
 
         # 拒绝信息明确包含目标 schema 6
         assert "6" in str(caught.value)
         assert "保留原库" in str(caught.value)
 
         # 数据库内容与 user_version 严格未变
-        assert _sqlite_snapshot(path) == before
-
-    def test_legacy_executor_rejects_and_preserves_target_format(self, tmp_path):
-        path = tmp_path / "v6_db.db"
-        backend = SQLiteStateBackend(path, schema_version=TARGET_SCHEMA_VERSION)
-        backend.enqueue_jobs([_make_job("j1")])
-        backend.mark_job_running(
-            "t::j1",
-            execution_id="r1.1",
-            run_id="r1",
-            started_at="2026-11-08T00:00:00Z",
-        )
-        backend.commit_job_settlement(
-            job_uid="t::j1",
-            outcome="success",
-            attempt_no=1,
-            execution_id="r1.1",
-            run_id="r1",
-            settled_at="2026-11-08T00:00:01Z",
-            success_metadata={"result": "preserved"},
-        )
-
-        before = _sqlite_snapshot(path)
-
-        # 使用旧默认执行器（schema_version 5）尝试打开
-        with pytest.raises(TaskLiteError) as caught:
-            SQLiteStateBackend(path)  # 默认 schema_version=5
-
-        assert "5" in str(caught.value)
-        assert "Unsupported database schema version 6" in str(caught.value)
-
-        # 新库未被旧执行器改写或破坏
+        assert path.read_bytes() == original_bytes
         assert _sqlite_snapshot(path) == before

@@ -48,7 +48,7 @@ class TestStateSnapshotOpeningAndClosing:
 
     def test_open_via_path_and_tasklite_instance(self, tmp_path):
         db_path = tmp_path / "custom # % space.db"
-        backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+        backend = SQLiteStateBackend(db_path)
         backend.enqueue_jobs([Job("process", "j1").to_dict()])
 
         # 从 Path 打开
@@ -85,7 +85,7 @@ class TestStateSnapshotOpeningAndClosing:
 
     def test_operations_on_closed_snapshot_raise_error(self, tmp_path):
         db_path = tmp_path / "closed.db"
-        backend = SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+        backend = SQLiteStateBackend(db_path)
         s = StateSnapshot.open(db_path)
         s.close()
         s.close()  # 幂等
@@ -122,8 +122,10 @@ class TestStateSnapshotOpeningAndClosing:
         self, tmp_path, monkeypatch, version, change, message,
     ):
         db_path = tmp_path / "invalid.db"
-        backend = SQLiteStateBackend(db_path, schema_version=version)
+        backend = SQLiteStateBackend(db_path)
         backend.enqueue_jobs([Job("process", "precious").to_dict()])
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(f"PRAGMA user_version={version}")
         if change is not None:
             with closing(sqlite3.connect(db_path)) as conn:
                 conn.execute(change)

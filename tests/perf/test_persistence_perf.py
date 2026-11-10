@@ -1,6 +1,6 @@
 """v2 持久层性能回归防护（非功能测试）：热路径 O(1) 增量语义。
 
-锁定两条热路径不随队列规模退化——``commit_job_success`` 删一行 + 插
+锁定两条热路径不随队列规模退化——``commit_job_settlement`` 删一行 + 插
 spawned（空时零插入）、``enqueue_jobs`` 单事务增量插入，均为逐 job
 delta 操作而非整表重写。回归形态（commit/enqueue 退化成 save_queue
 式 DELETE 全表 + 重插）会让 10k 队列侧延迟膨胀两个数量级以上。
@@ -16,7 +16,6 @@ from __future__ import annotations
 import time
 
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
-from tasklite.models.attempt import AttemptRecord
 from tasklite.models.job import Job
 
 # 相对断言的判别倍数：O(1) 两侧比值 ≈1；全表重写回归下 10k 行重插与
@@ -28,49 +27,34 @@ _SAMPLE_COUNT = 3
 _QUEUE_DEPTH = 10_000
 
 
-def _bench_commit_job_success(backend: SQLiteStateBackend, *, samples: int) -> float:
-    """多次采样 commit_job_success 单事务延迟，返回最小值。"""
-    attempt_ids = [
-        backend.append_attempt(
-            AttemptRecord(
-                job_uid="test::latency_probe",
-                activation_no=i + 1,
-                attempt_no=1,
-                execution_id=f"bench_run.{i + 1}",
-                run_id="bench_run",
-                started_at="2026-05-01T00:00:00+00:00",
-                outcome="running",
-            )
-        )
-        for i in range(samples)
-    ]
+def _bench_commit_job_settlement(backend: SQLiteStateBackend, *, samples: int) -> float:
+    """多次采样 commit_job_settlement 单事务延迟，返回最小值。"""
     best = float("inf")
-    for i, attempt_id in enumerate(attempt_ids):
+    for i in range(samples):
+        backend.enqueue_jobs([Job("test", "latency_probe").to_dict()])
+        attempt_no = backend.mark_job_running("test::latency_probe", execution_id=f"bench_run.{i + 1}",
+                                              run_id="bench_run", started_at="2026-05-01T00:00:00+00:00")
         start = time.perf_counter()
-        result = backend.commit_job_success(
-            "test::latency_probe",
-            result_metadata={"ok": True},
-            attempt_id=attempt_id,
-            execution_id=f"bench_run.{i + 1}",
-            finished_at="2026-05-01T00:00:05+00:00",
-            spawned_job_snapshots=[],
-            cursor_updates={},
+        result = backend.commit_job_settlement(
+            job_uid="test::latency_probe", outcome="success", attempt_no=attempt_no,
+            execution_id=f"bench_run.{i + 1}", run_id="bench_run",
+            settled_at="2026-05-01T00:00:05+00:00", success_metadata={"ok": True},
         )
         elapsed = time.perf_counter() - start
-        assert result is True, "commit_job_success 必须成功（否则测的是失败路径延迟）"
+        assert result is None, "commit_job_settlement 必须成功（否则测的是失败路径延迟）"
         best = min(best, elapsed)
     return best
 
 
-def test_commit_job_success_scales_constant_with_queue_size(tmp_path):
-    """10k 队列下 commit_job_success 延迟保持在空库基线的常数倍内。
+def test_commit_job_settlement_scales_constant_with_queue_size(tmp_path):
+    """10k 队列下 commit_job_settlement 延迟保持在空库基线的常数倍内。
 
-    delta 语义：删 popped uid（此处不在队列，no-op）+ 插空 spawned +
-    写 successes——工作量与队列规模无关。若实现退化为整表重写，10k 队列侧
+    结算追加 Attempt、删除探针 running 行并写 successes；空 spawned 不插入。
+    工作量与队列规模无关。若实现退化为整表重写，10k 队列侧
     每次提交要重写全部行，延迟远超空库侧常数倍。
     """
     baseline_backend = SQLiteStateBackend(tmp_path / "baseline.db")
-    baseline = _bench_commit_job_success(baseline_backend, samples=_SAMPLE_COUNT)
+    baseline = _bench_commit_job_settlement(baseline_backend, samples=_SAMPLE_COUNT)
 
     busy_backend = SQLiteStateBackend(tmp_path / "busy.db")
     jobs = [
@@ -78,13 +62,12 @@ def test_commit_job_success_scales_constant_with_queue_size(tmp_path):
         for i in range(_QUEUE_DEPTH)
     ]
     busy_backend.save_queue(jobs)
-    busy = _bench_commit_job_success(busy_backend, samples=_SAMPLE_COUNT)
+    busy = _bench_commit_job_settlement(busy_backend, samples=_SAMPLE_COUNT)
 
     assert busy < max(baseline * _SCALE_FACTOR, baseline + _FLOOR_SECONDS), (
-        f"commit_job_success 疑似随队列规模退化：10k 队列 {busy * 1000:.1f}ms "
+        f"commit_job_settlement 疑似随队列规模退化：10k 队列 {busy * 1000:.1f}ms "
         f"vs 空库基线 {baseline * 1000:.1f}ms（倍数阈值 {_SCALE_FACTOR}）"
     )
-    # 队列不受影响：probe uid 不在队列、无 spawned 插入
     assert len(busy_backend.load_queue()) == _QUEUE_DEPTH
     assert "test::latency_probe" in busy_backend.load_successes()
 

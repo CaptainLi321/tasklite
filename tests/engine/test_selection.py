@@ -154,7 +154,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     assert _queued(pipeline) == ["convert::b", "rank::r"]
     kept = {uid: row for uid, row in zip(_queued(pipeline), pipeline._runtime.store.backend.load_queue())}
     assert kept == {uid: before[uid] for uid in ("convert::b", "rank::r")}
-    attempts = pipeline._runtime.store.backend.load_attempts
+    attempts = pipeline._runtime.store.backend.load_settled_attempts
     assert [attempts("convert::b"), attempts("rank::r")] == [[], []]
     assert seen == ["fetch::a"]
 
@@ -349,7 +349,7 @@ def test_spawned_excluded_child_stays_queued(tmp_path):
     assert sorted(pipeline._runtime.store.backend.load_successes()) == ["fetch::parent"]
     assert pipeline._runtime.store.backend.load_failed() == {}
     assert _queued(pipeline) == ["excluded_t::child"]
-    assert pipeline._runtime.store.backend.load_attempts("excluded_t::child") == []
+    assert pipeline._runtime.store.backend.load_settled_attempts("excluded_t::child") == []
 
 
 def test_failed_parent_cascade_keeps_excluded_downstream(tmp_path):
@@ -369,7 +369,7 @@ def test_failed_parent_cascade_keeps_excluded_downstream(tmp_path):
 
     assert sorted(pipeline._runtime.store.backend.load_failed()) == ["fetch::parent"]
     assert sorted(_queued(pipeline)) == ["downstream::grand", "excluded_t::child"]
-    assert pipeline._runtime.store.backend.load_attempts("excluded_t::child") == []
+    assert pipeline._runtime.store.backend.load_settled_attempts("excluded_t::child") == []
 
 
 # ── 必须验收项：依赖闭合、遮蔽与 UID 重用成环 ───────────────────────

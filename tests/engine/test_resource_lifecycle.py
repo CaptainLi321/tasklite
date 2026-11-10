@@ -278,7 +278,7 @@ def test_impossible_resource_fails_job_without_unexecuted_attempt(tmp_path):
     assert "fast::j2" in failed
 
     # 未执行不制造 Attempt
-    attempts = p._runtime.store.backend.load_attempts("fast::j1")
+    attempts = p._runtime.store.backend.load_settled_attempts("fast::j1")
     assert attempts == [], f"明确不可满足的作业不得创建 Attempt 记录，实测: {attempts}"
 
 
@@ -353,15 +353,10 @@ def test_release_prior_to_final_commit_and_no_dispatch_between(tmp_path):
         orig_release(amount)
     cap.release = hooked_release  # type: ignore[assignment]
 
-    orig_commit = p._runtime.store.backend.commit_job_success
     orig_settle = p._runtime.store.backend.commit_job_settlement
-    def hooked_commit(*args, **kwargs):
-        events.append("committed")
-        return orig_commit(*args, **kwargs)
     def hooked_settle(*args, **kwargs):
         events.append("committed")
         return orig_settle(*args, **kwargs)
-    p._runtime.store.backend.commit_job_success = hooked_commit  # type: ignore[assignment]
     p._runtime.store.backend.commit_job_settlement = hooked_settle  # type: ignore[assignment]
 
     orig_spawn = p._runtime._dispatch.dispatch_next

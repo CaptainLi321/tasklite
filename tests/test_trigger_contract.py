@@ -78,7 +78,7 @@ def test_unknown_trigger_raises_preserving_candidate_and_budget(tmp_path):
     assert pipeline._runtime.store.backend.load_queue() == before_queue
     assert pipeline._runtime.store.backend.load_successes() == before_successes
     assert pipeline._runtime.store.backend.load_failed() == {}
-    assert pipeline._runtime.store.backend.load_attempts("t::b") == []
+    assert pipeline._runtime.store.backend.load_settled_attempts("t::b") == []
 
 
 def test_inherited_unknown_trigger_rejected_at_enqueue(tmp_path):
@@ -118,7 +118,7 @@ def test_callback_failure_and_non_bool_return_preserve_queue():
         with pytest.raises(error):
             pipeline.run()
         assert pipeline._runtime.store.backend.load_queue() == before
-        assert pipeline._runtime.store.backend.load_attempts("t::a") == []
+        assert pipeline._runtime.store.backend.load_settled_attempts("t::a") == []
         assert pipeline._runtime.store.backend.load_failed() == {}
 
 
@@ -212,7 +212,7 @@ def test_input_contract_errors_and_untrusted_baseline(tmp_path):
 def test_failure_history_skipped_this_batch_allows_downstream():
     pipeline = TaskLite(backend="memory")
     pipeline.register_task("t", handle)
-    pipeline._runtime.store.backend.append_failed("t::a", {"error_message": "prior failure"})
+    pipeline._runtime.store.backend.commit_job_failure("t::a", {"error_message": "prior failure"})
     seen = []
     pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
     pipeline.enqueue(Job("t", "a", trigger="observe"))
@@ -298,7 +298,7 @@ def test_trigger_error_aborts_inflight_without_burning_budget():
     rows = {row["job"]["job_id"]: row["job"] for row in queue_rows}
     assert set(rows) == {"a", "b"}
     assert all(row["attempt_no"] == 1 for row in rows.values())
-    assert pipeline._runtime.store.backend.load_attempts("t::b") == []
+    assert pipeline._runtime.store.backend.load_settled_attempts("t::b") == []
     assert pipeline._runtime.store.backend.load_failed() == {}
 
 

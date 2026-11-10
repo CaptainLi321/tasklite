@@ -137,15 +137,13 @@ class TestEndToEnd:
         assert len(meta["inputs"]) == 1
         assert meta["inputs"][0].endswith("source_item_alpha.txt")
 
-        attempts = p._runtime.store.backend.load_attempts("work::item_alpha")
+        attempts = p._runtime.store.backend.load_settled_attempts("work::item_alpha")
         assert len(attempts) == 1
         rec = attempts[0]
-        assert rec.outcome == "succeeded"
-        assert rec.attempt_no == 1
-        assert rec.activation_no == 1
-        assert rec.execution_id.startswith(rec.run_id)
-        assert rec.finished_at is not None
-        assert rec.error_message is None
+        assert rec["outcome"] == "success"
+        assert rec["attempt_no"] == 1
+        assert rec["settled_at"] is not None
+        assert rec["error_message"] is None
 
     def test_failure_lands_in_archive_with_attempt_trace(self, tmp_path):
         p = _make_pipeline(tmp_path)
@@ -160,10 +158,10 @@ class TestEndToEnd:
         # successes/failed 互斥：失败终态不得残留 successes 行
         assert "work::item_beta" not in p._runtime.store.backend.load_successes()
 
-        attempts = p._runtime.store.backend.load_attempts("work::item_beta")
+        attempts = p._runtime.store.backend.load_settled_attempts("work::item_beta")
         assert len(attempts) == 1
-        assert attempts[0].outcome == "failed"
-        assert attempts[0].error_message is not None
+        assert attempts[0]["outcome"] == "failure"
+        assert attempts[0]["error_message"] is not None
 
     def test_transient_retry_exhaustion_trace(self, tmp_path):
         p = _make_pipeline(tmp_path)
@@ -175,9 +173,9 @@ class TestEndToEnd:
         meta = p._runtime.store.backend.load_failed()["work::item_gamma"]
         assert meta["error_message"] == ERR_MAX_RETRIES
 
-        attempts = p._runtime.store.backend.load_attempts("work::item_gamma")
-        assert [a.attempt_no for a in attempts] == [1, 2, 3]
-        assert [a.outcome for a in attempts] == ["requeued", "requeued", "failed"]
+        attempts = p._runtime.store.backend.load_settled_attempts("work::item_gamma")
+        assert [a["attempt_no"] for a in attempts] == [1, 2, 3]
+        assert [a["outcome"] for a in attempts] == ["retry", "retry", "failure"]
 
     def test_transient_recovery_second_attempt_succeeds(self, tmp_path):
         p = _make_pipeline(tmp_path)
@@ -188,11 +186,10 @@ class TestEndToEnd:
 
         assert res is None
         assert "work::item_delta" in p._runtime.store.backend.load_successes()
-        attempts = p._runtime.store.backend.load_attempts("work::item_delta")
+        attempts = p._runtime.store.backend.load_settled_attempts("work::item_delta")
         # 同一激活内重试推进：attempt_no 1→2，activation_no 不变
-        assert [a.outcome for a in attempts] == ["requeued", "succeeded"]
-        assert [a.attempt_no for a in attempts] == [1, 2]
-        assert [a.activation_no for a in attempts] == [1, 1]
+        assert [a["outcome"] for a in attempts] == ["retry", "success"]
+        assert [a["attempt_no"] for a in attempts] == [1, 2]
 
     def test_manual_requeue_runs_to_success(self, tmp_path):
         p = _make_pipeline(tmp_path)
@@ -221,11 +218,11 @@ class TestEndToEnd:
 
         # 档案补跑通道：failed 拦截点放行语义——激活代按轨迹最大值 +1
         # 推进、attempt_no 归 1，与 every_run 豁免放行同构
-        attempts = p._runtime.store.backend.load_attempts("work::item_eps")
-        assert [a.outcome for a in attempts] == ["failed", "succeeded"]
-        assert [a.attempt_no for a in attempts] == [1, 2]
+        attempts = p._runtime.store.backend.load_settled_attempts("work::item_eps")
+        assert [a["outcome"] for a in attempts] == ["failure", "success"]
+        assert [a["attempt_no"] for a in attempts] == [1, 2]
         # 补跑放行推进 attempt_no
-        logical_keys = [a.attempt_no for a in attempts]
+        logical_keys = [a["attempt_no"] for a in attempts]
         assert len(logical_keys) == len(set(logical_keys))
 
     def test_every_run_rerun_advances_activation_and_run_count(
@@ -247,9 +244,9 @@ class TestEndToEnd:
         assert second is None
         assert p._runtime.store.backend.load_successes()["work::item_eta"]["success_count"] == 2
 
-        attempts = p._runtime.store.backend.load_attempts("work::item_eta")
-        assert [a.outcome for a in attempts] == ["succeeded", "succeeded"]
-        assert [a.attempt_no for a in attempts] == [1, 2]
+        attempts = p._runtime.store.backend.load_settled_attempts("work::item_eta")
+        assert [a["outcome"] for a in attempts] == ["success", "success"]
+        assert [a["attempt_no"] for a in attempts] == [1, 2]
 
     def test_six_step_contract_with_resource(self, tmp_path):
         p = _make_pipeline(tmp_path)
@@ -289,9 +286,9 @@ class TestRealSubprocessFaultScenarios:
         assert "timed out" in error, f"应归因超时，got: {error}"
         assert "hung::item_watchdog" not in p._runtime.store.backend.load_successes()
 
-        attempts = p._runtime.store.backend.load_attempts("hung::item_watchdog")
-        assert [a.outcome for a in attempts] == ["failed"]
-        assert attempts[0].error_message is not None and "timed out" in attempts[0].error_message
+        attempts = p._runtime.store.backend.load_settled_attempts("hung::item_watchdog")
+        assert [a["outcome"] for a in attempts] == ["failure"]
+        assert attempts[0]["error_message"] is not None and "timed out" in attempts[0]["error_message"]
 
     def test_real_subprocess_interval_resource_paces(self, tmp_path):
         """IntervalResource：首作业获取后推进下次可用时间，后续作业按间隔派发。"""
@@ -327,6 +324,6 @@ class TestRealSubprocessFaultScenarios:
         error = failed["sysexit::item_sysexit"]["error_message"]
         assert "SystemExit" in error, f"应含 SystemExit 错误信息，got: {error}"
         assert "sysexit::item_sysexit" not in p._runtime.store.backend.load_successes()
-        attempts = p._runtime.store.backend.load_attempts("sysexit::item_sysexit")
+        attempts = p._runtime.store.backend.load_settled_attempts("sysexit::item_sysexit")
         assert len(attempts) == 1
-        assert attempts[0].outcome == "failed"
+        assert attempts[0]["outcome"] == "failure"

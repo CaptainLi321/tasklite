@@ -148,9 +148,9 @@ def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
         assert failed_meta["result"]["metadata"] == {}
         assert "retry_error" not in failed_meta
 
-        attempts = pipeline._runtime.store.backend.load_attempts("crash::j1")
+        attempts = pipeline._runtime.store.backend.load_settled_attempts("crash::j1")
         assert len(attempts) == 1
-        assert attempts[0].outcome == "failed"
+        assert attempts[0]["outcome"] == "failure"
 
         assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 
@@ -191,9 +191,9 @@ def test_worker_faults_settle_one_failure(
         else:
             assert entry["result"]["exception"]["type"] == exception_type
 
-        attempts = pipeline._runtime.store.backend.load_attempts(f"{task_type}::j1")
+        attempts = pipeline._runtime.store.backend.load_settled_attempts(f"{task_type}::j1")
         assert len(attempts) == 1
-        assert attempts[0].outcome == "failed"
+        assert attempts[0]["outcome"] == "failure"
         assert pipeline._runtime.store.backend.load_queue() == []
 
 
@@ -221,9 +221,9 @@ def test_worker_timeout_terminates_and_marks_failed_without_retry(tmp_path):
         assert failed["hang::j1"]["result"]["annotations"]["timed_out"] is True
 
         # 验证超时未烧重试预算或自动重试，一次 Attempt 直接终结
-        attempts = pipeline._runtime.store.backend.load_attempts("hang::j1")
+        attempts = pipeline._runtime.store.backend.load_settled_attempts("hang::j1")
         assert len(attempts) == 1
-        assert attempts[0].outcome == "failed"
+        assert attempts[0]["outcome"] == "failure"
 
         assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 
@@ -277,9 +277,9 @@ def test_worker_exit_error_after_result_does_not_rewrite_success(tmp_path):
         assert successes["die_later::j1"]["result"]["metadata"]["returned"] is True
         assert pipeline._runtime.store.backend.load_failed() == {}
 
-        attempts = pipeline._runtime.store.backend.load_attempts("die_later::j1")
+        attempts = pipeline._runtime.store.backend.load_settled_attempts("die_later::j1")
         assert len(attempts) == 1
-        assert attempts[0].outcome == "succeeded"
+        assert attempts[0]["outcome"] == "success"
 
         assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 

@@ -6,8 +6,6 @@
 """
 from .base import (
     AbstractStateBackend,
-    validate_attempt_dispatch,
-    validate_attempt_finish,
     validate_queue_replacement,
 )
 from .memory import InMemoryStateBackend
@@ -18,7 +16,5 @@ __all__ = [
     "InMemoryStateBackend",
     "SQLiteStateBackend",
     "TARGET_SCHEMA_VERSION",
-    "validate_attempt_dispatch",
-    "validate_attempt_finish",
     "validate_queue_replacement",
 ]

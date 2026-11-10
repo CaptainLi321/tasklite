@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
-from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
+from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.engine.store import StateStore
 
 
@@ -12,9 +12,9 @@ from tasklite.engine.store import StateStore
 def backend(request, tmp_path):
     if request.param == "sqlite":
         db_path = tmp_path / "test_auth.db"
-        return SQLiteStateBackend(db_path, schema_version=TARGET_SCHEMA_VERSION)
+        return SQLiteStateBackend(db_path)
     else:
-        return InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION)
+        return InMemoryStateBackend()
 
 
 def test_record_and_list_authorizations(backend, tmp_path):

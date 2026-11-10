@@ -11,7 +11,7 @@ from pathlib import Path
 import sqlite3
 from typing import TYPE_CHECKING, Any, Iterator, Mapping, Protocol
 
-from .backend.sqlite_backend import TARGET_SCHEMA_VERSION, _check_schema
+from .backend.sqlite_backend import _check_schema
 from .exceptions import TaskLiteError
 from .models.attempt import AttemptRecord
 from .models.state import job_uid_from_snapshot
@@ -306,7 +306,7 @@ class _SqliteSnapshotReader:
         conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30.0)
         try:
             conn.execute("BEGIN")
-            if _check_schema(conn, db_path, TARGET_SCHEMA_VERSION) == 0:
+            if _check_schema(conn, db_path) == 0:
                 raise TaskLiteError(f"Uninitialized TaskLite database at {db_path}")
         except BaseException:
             conn.close()

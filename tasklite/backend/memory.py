@@ -11,7 +11,6 @@ import copy
 import logging
 import os
 import threading
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -22,12 +21,9 @@ from .base import (
     public_queue_snapshot,
     queue_snapshot_execution_id,
     queue_snapshot_with_execution_id,
-    validate_attempt_dispatch,
-    validate_attempt_finish,
     validate_queue_replacement,
 )
 from ..exceptions import TaskLiteError
-from ..models.attempt import AttemptRecord
 from ..models.state import job_uid_from_snapshot
 from ..utils.clock import utc_now_iso
 
@@ -42,8 +38,7 @@ class InMemoryStateBackend(AbstractStateBackend):
     插入序即 id 序）。
     """
 
-    def __init__(self, *, schema_version: int = 5) -> None:
-        self.schema_version = schema_version
+    def __init__(self) -> None:
         self._lock = threading.RLock()
         self._exec_lock = threading.Lock()
         self._successes: dict[str, dict[str, Any]] = {}
@@ -52,7 +47,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         self._cursors: dict[str, str] = {}
         self._queue: list[dict[str, Any]] = []
         self._engine_metadata: dict[str, str] = {}
-        self._attempts: dict[int, Any] = {}
+        self._attempts: dict[int, dict[str, Any]] = {}
         self._attempt_seq = 1
         self._job_sequences: dict[str, int] = {}
         self._authorizations: dict[str, dict[str, Any]] = {}
@@ -78,12 +73,10 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     def load_queue(self) -> list[dict[str, Any]]:
         with self._lock:
-            if self.schema_version >= 6:
-                return [
-                    public_queue_snapshot(j)
-                    for j in self._queue if j.get("status", "pending") == "pending"
-                ]
-            return [public_queue_snapshot(j) for j in self._queue]
+            return [
+                public_queue_snapshot(j)
+                for j in self._queue if j.get("status", "pending") == "pending"
+            ]
 
     # 整表重写 -------------------------------------------------------
 
@@ -123,106 +116,6 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     # delta 提交 -----------------------------------------------------
 
-    def commit_job_success(
-        self,
-        job_uid: str,
-        result_metadata: dict,
-        *,
-        attempt_id: int | None = None,
-        execution_id: str | None = None,
-        finished_at: str | None = None,
-        spawned_job_snapshots: Sequence[dict[str, Any]] = (),
-        cursor_updates: Mapping[str, str | None] | None = None,
-    ) -> bool:
-        with self._lock:
-            try:
-                # 校验先行：全部 deepcopy、attempts 行校验与冲突判定在任何变更前完成。
-                # 不变式：返回 False / 抛异常 ⇒ successes/attempts/queue/failed/cursors 与
-                # 调用前完全一致（对齐 SQLite 事务回滚；store 的连续失败
-                # 崩溃契约以「后端未变」为前提做重启重建）。
-                if not isinstance(attempt_id, int) or isinstance(attempt_id, bool):
-                    logger.critical(
-                        f"commit_job_success for {job_uid}: attempt_id must be an int, got {attempt_id!r}"
-                    )
-                    return False
-                if execution_id is not None and (not isinstance(execution_id, str) or not execution_id):
-                    logger.critical(
-                        f"commit_job_success for {job_uid}: execution_id must be a non-empty str or None, got {execution_id!r}"
-                    )
-                    return False
-                validate_attempt_finish("succeeded", finished_at, None)
-                current_attempt = self._attempts.get(attempt_id)
-                if current_attempt is None:
-                    logger.critical(
-                        f"commit_job_success for {job_uid}: attempt {attempt_id} does not exist"
-                    )
-                    return False
-                if current_attempt.job_uid != job_uid:
-                    logger.critical(
-                        f"commit_job_success for {job_uid}: attempt {attempt_id} job_uid mismatch "
-                        f"(expected {job_uid!r}, got {current_attempt.job_uid!r})"
-                    )
-                    return False
-                if execution_id is not None and current_attempt.execution_id != execution_id:
-                    logger.critical(
-                        f"commit_job_success for {job_uid}: attempt {attempt_id} execution_id mismatch "
-                        f"(expected {execution_id!r}, got {current_attempt.execution_id!r})"
-                    )
-                    return False
-                if current_attempt.outcome != "running":
-                    logger.critical(
-                        f"commit_job_success for {job_uid}: attempt {attempt_id} already finalized "
-                        f"with outcome {current_attempt.outcome!r}"
-                    )
-                    return False
-                updated_attempt = replace(
-                    current_attempt,
-                    outcome="succeeded",
-                    finished_at=finished_at,
-                    error_message=None,
-                )
-                success_metadata = copy.deepcopy(result_metadata or {})
-                spawned_copy = [copy.deepcopy(j) for j in spawned_job_snapshots]
-                remaining = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
-                if spawned_copy:
-                    remaining_uids = {job_uid_from_snapshot(j) for j in remaining}
-                    seen: set[str] = set()
-                    for sj in spawned_copy:
-                        suid = job_uid_from_snapshot(sj)
-                        # spawned uid 撞上删除 popped 后的队列既有条目，或
-                        # 批内自相重复，均判定内存/磁盘漂移 → False 走崩溃
-                        # 契约，绝不产出重复队列条目（对齐 SQLite
-                        # INSERT OR IGNORE + rowcount 漂移检测）。
-                        if suid in remaining_uids or suid in seen:
-                            logger.critical(
-                                f"commit_job_success for {job_uid}: spawned job {suid} "
-                                f"conflicts with queue (drift). Returning False."
-                            )
-                            return False
-                        seen.add(suid)
-                cursor_sets: dict[str, str] = {}
-                cursor_dels: set[str] = set()
-                if cursor_updates:
-                    for k, v in cursor_updates.items():
-                        if v is None:
-                            cursor_dels.add(k)
-                        else:
-                            cursor_sets[k] = str(v)
-                # 校验全部通过，统一落变（落变段不再调用任何可失败操作）
-                self._attempts[attempt_id] = updated_attempt
-                self._successes[job_uid] = success_metadata
-                self._queue = spawned_copy + remaining  # 队首插入 spawned 并保序
-                # 成功 commit 清理 failed 同名残行：与「job 最终状态唯一」
-                # 语义一致，防 successes∩failed 并存。
-                self._failed.pop(job_uid, None)
-                self._failure_payloads.pop(job_uid, None)
-                self._cursors.update(cursor_sets)
-                for k in cursor_dels:
-                    self._cursors.pop(k, None)
-                return True
-            except Exception as e:
-                logger.critical(f"Failed to commit job success for {job_uid}: {e}")
-                return False
 
     def commit_job_failure(
         self, job_uid: str, failure_metadata: dict, payload: dict[str, Any] | None = None
@@ -250,35 +143,6 @@ class InMemoryStateBackend(AbstractStateBackend):
                 logger.critical(f"Failed to commit job failure for {job_uid}: {e}")
                 raise
 
-    def commit_retry(
-        self,
-        popped_job_uid: str,
-        requeued_job_snapshot: dict[str, Any],
-        *,
-        front: bool = False,
-    ) -> bool:
-        with self._lock:
-            try:
-                requeued_copy = copy.deepcopy(requeued_job_snapshot)
-                ruid = job_uid_from_snapshot(requeued_copy)
-                remaining = [j for j in self._queue if job_uid_from_snapshot(j) != popped_job_uid]
-                # 对齐 SQLite 普通 INSERT 冲突回滚：requeued uid 撞上删除
-                # popped 后的既有条目 → False 走崩溃契约，绝不产出重复条目；
-                # uid == popped_job_uid 属同 job 重插（DELETE+INSERT），安全放行。
-                if ruid != popped_job_uid and any(job_uid_from_snapshot(j) == ruid for j in remaining):
-                    logger.critical(
-                        f"commit_retry for {popped_job_uid}: requeued uid {ruid} "
-                        f"conflicts with existing queue entry. Returning False."
-                    )
-                    return False
-                if front:
-                    self._queue = [requeued_copy] + remaining
-                else:
-                    self._queue = remaining + [requeued_copy]
-                return True
-            except Exception as e:
-                logger.critical(f"Failed to commit retry for {popped_job_uid}: {e}")
-                return False
 
     def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> None:
         with self._lock:
@@ -296,9 +160,6 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             self._queue = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
 
-    def append_failed(self, job_uid: str, metadata: dict[str, Any] | None = None) -> None:
-        with self._lock:
-            self._failed[job_uid] = copy.deepcopy(metadata or {})
 
     # 增量入队 -------------------------------------------------------
 
@@ -436,9 +297,9 @@ class InMemoryStateBackend(AbstractStateBackend):
 
             for attempt_id in sorted(self._attempts, reverse=True):
                 attempt = self._attempts[attempt_id]
-                if not isinstance(attempt, dict) or attempt.get("job_uid") != uid:
+                if attempt.get("job_uid") != uid:
                     continue
-                attempt_snapshot = attempt.get("job") or attempt.get("job_snapshot")
+                attempt_snapshot = attempt.get("job")
                 if isinstance(attempt_snapshot, dict):
                     return copy.deepcopy(attempt_snapshot)
         return None
@@ -449,10 +310,8 @@ class InMemoryStateBackend(AbstractStateBackend):
             known: dict[str, dict[str, Any]] = {}
             for attempt_id in sorted(self._attempts):
                 attempt = self._attempts[attempt_id]
-                if not isinstance(attempt, dict):
-                    continue
                 uid = attempt.get("job_uid")
-                snapshot = attempt.get("job") or attempt.get("job_snapshot")
+                snapshot = attempt.get("job")
                 if isinstance(uid, str) and isinstance(snapshot, dict):
                     known[uid] = copy.deepcopy(snapshot)
 
@@ -486,7 +345,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 initial = len(self._attempts)
                 self._attempts = {
                     k: v for k, v in self._attempts.items()
-                    if getattr(v, "job_uid", None) != uid and (not isinstance(v, dict) or v.get("job_uid") != uid)
+                    if v.get("job_uid") != uid
                 }
                 total += initial - len(self._attempts)
         return total
@@ -512,85 +371,13 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     # 尝试轨迹（append-only 旁路观测面）--------------------------------
 
-    def append_attempt(self, record: AttemptRecord) -> int:
-        """派发即插行：分配自增轨迹 id 并落内存表（单语句语义，无读-改-写窗口）。"""
-        validate_attempt_dispatch(record)
-        with self._lock:
-            attempt_id = self._attempt_seq
-            self._attempt_seq += 1
-            self._attempts[attempt_id] = record
-            return attempt_id
-
-    def update_attempt(
-        self,
-        attempt_id: int,
-        *,
-        outcome: str,
-        finished_at: str,
-        error_message: str | None = None,
-    ) -> bool:
-        """收尾轨迹行：仅允许把 running 行收敛为终态一次。
-
-        读-判-写在锁内串行完成；目标 id 不存在返回 False，对已收尾行
-        再次收尾抛 ValueError（双重终结是调用方协议缺陷，fail-loud）。
-        """
-        validate_attempt_finish(outcome, finished_at, error_message)
-        with self._lock:
-            current = self._attempts.get(attempt_id)
-            if current is None:
-                return False
-            if current.outcome != "running":
-                raise ValueError(
-                    f"attempt {attempt_id} already finalized with outcome "
-                    f"{current.outcome!r}; double finalization is a protocol violation"
-                )
-            self._attempts[attempt_id] = replace(
-                current, outcome=outcome, finished_at=finished_at, error_message=error_message
-            )
-            return True
-
-    def load_attempts(self, job_uid: str) -> list[AttemptRecord]:
-        """按 job_uid 读取轨迹（dict 插入序 = 自增 id 序）。"""
-        with self._lock:
-            records: list[AttemptRecord] = []
-            for rec in self._attempts.values():
-                if isinstance(rec, AttemptRecord) and rec.job_uid == job_uid:
-                    records.append(rec)
-                elif isinstance(rec, dict) and rec.get("job_uid") == job_uid:
-                    raw_outcome = str(rec.get("outcome") or "")
-                    outcome_map = {
-                        "success": "succeeded",
-                        "retry": "requeued",
-                        "failure": "failed",
-                    }
-                    mapped_outcome = outcome_map.get(raw_outcome, raw_outcome)
-                    st_at = rec.get("started_at") or "1970-01-01T00:00:00+00:00"
-                    fn_at = rec.get("settled_at") or st_at
-                    records.append(
-                        AttemptRecord(
-                            job_uid=rec["job_uid"],
-                            activation_no=1,
-                            attempt_no=rec.get("attempt_no", 1),
-                            execution_id=f"{rec.get('run_id')}.{rec.get('attempt_no', 1)}",
-                            run_id=rec.get("run_id") or "run",
-                            started_at=st_at,
-                            finished_at=fn_at,
-                            outcome=mapped_outcome or "failed",
-                            error_message=rec.get("error_message"),
-                        )
-                    )
-            return records
 
     def load_latest_succeeded_finished_at(self, job_uid: str) -> str | None:
-        """按 attempt_id 倒序查找指定 job_uid 最新一条 succeeded 轨迹行的 finished_at。"""
+        """按 attempt_id 倒序读取指定 Job 最新成功 Attempt 的结算时间。"""
         with self._lock:
             for rec in reversed(list(self._attempts.values())):
-                rec_uid = rec.job_uid if isinstance(rec, AttemptRecord) else rec.get("job_uid")
-                rec_outcome = rec.outcome if isinstance(rec, AttemptRecord) else rec.get("outcome")
-                if rec_uid == job_uid and rec_outcome in ("succeeded", "success"):
-                    ts = rec.finished_at if isinstance(rec, AttemptRecord) else (rec.get("settled_at") or rec.get("finished_at"))
-                    if isinstance(ts, str) and ts:
-                        return ts
+                if rec.get("job_uid") == job_uid and rec.get("outcome") == "success":
+                    return rec["settled_at"]
             return None
 
     # 元数据 ---------------------------------------------------------
@@ -603,7 +390,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             self._engine_metadata[key] = str(value)
 
-    # 状态事务与编号（ADR-0011 目标格式与执行结算内部准备）───────────
+    # 状态事务与编号 -------------------------------------------------
 
     def mark_job_running(
         self, job_uid: str, *, execution_id: str, run_id: str, started_at: str
@@ -653,7 +440,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             initial = len(self._attempts)
             self._attempts = {
                 k: v for k, v in self._attempts.items()
-                if (v.job_uid if isinstance(v, AttemptRecord) else v.get("job_uid")) != job_uid
+                if v.get("job_uid") != job_uid
             }
             return initial - len(self._attempts)
 
@@ -661,7 +448,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             entries: list[dict[str, Any]] = []
             for att in self._attempts.values():
-                if isinstance(att, dict) and att.get("job_uid") == job_uid:
+                if att.get("job_uid") == job_uid:
                     entries.append(copy.deepcopy(att))
             entries.sort(key=lambda x: x.get("attempt_no", 0))
             return entries
@@ -742,7 +529,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             ) != ("running", run_id, attempt_no, execution_id):
                 raise TaskLiteError(f"Settlement does not match the running execution for {job_uid}")
             if any(
-                isinstance(attempt, dict) and attempt.get("job_uid") == job_uid
+                attempt.get("job_uid") == job_uid
                 and attempt.get("attempt_no") == attempt_no
                 for attempt in self._attempts.values()
             ):
