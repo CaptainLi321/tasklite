@@ -91,3 +91,40 @@ def test_store_check_or_request_authorization(backend, tmp_path, monkeypatch):
     monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
     assert store.check_or_request_authorization(target2) is True
     assert store.is_path_authorized(target2)
+
+
+@pytest.mark.parametrize("path_form", ["relative", "parent-link", "broken-link", "current", "parent", "root"])
+def test_store_authorization_paths_share_fixed_base_normalization(
+    backend, tmp_path, monkeypatch, path_form,
+):
+    """授权询问、记录、查询和撤销共用固定基准及父路径规范化，文件系统根保持为根。"""
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    base = tmp_path / "base"
+    other = tmp_path / "other"
+    real = tmp_path / "real"
+    for directory in (base, other, real):
+        directory.mkdir()
+    (base / "alias").symlink_to(real, target_is_directory=True)
+    (base / "broken").symlink_to(real / "missing")
+    cases = {
+        "relative": ("nested/../file", base / "file"),
+        "parent-link": ("alias/file", real / "file"),
+        "broken-link": ("broken", base / "broken"),
+        "current": (".", base),
+        "parent": ("..", tmp_path),
+        "root": (base.anchor, Path(base.anchor)),
+    }
+    path, expected = cases[path_form]
+    store = StateStore(backend=backend, base_dir=base)
+    monkeypatch.chdir(other)
+    calls = []
+    store.authorizer = lambda *args: calls.append(args) or True
+    target_type = "directory" if expected.is_dir() else "file"
+    assert store.check_or_request_authorization(path) is True
+    assert calls == [(str(expected), target_type)]
+    assert store.is_path_authorized(path)
+    store.record_authorization(path, target_type)
+    record, = store.list_authorizations()
+    assert record["path"] == str(expected)
+    assert store.revoke_authorization(path) is True
+    assert store.list_authorizations() == []

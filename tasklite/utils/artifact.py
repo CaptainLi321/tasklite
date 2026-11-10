@@ -41,9 +41,11 @@ class ArtifactPathPolicy:
         self.output_roots = tuple(Path(root).resolve() for root in (output_roots or ()))
         self.protected_roots = tuple(Path(root).resolve() for root in protected_roots)
 
-    def resolve(self, path: str | Path, *, sandbox: bool = True) -> str:
-        """返回受允许的规范路径；不把叶链接转换为其目标授权。"""
-        return self._resolve(path, sandbox=sandbox, allow_leaf_symlink=False)
+    def resolve(
+        self, path: str | Path, *, sandbox: bool = True, delete_existing: bool = False,
+    ) -> str:
+        """返回受允许的规范路径；仅前删可接受断链，不授权链接指向的目标。"""
+        return self._resolve(path, sandbox=sandbox, allow_leaf_symlink=delete_existing)
 
     def _resolve(
         self,

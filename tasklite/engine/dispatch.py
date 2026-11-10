@@ -145,6 +145,10 @@ class DispatchMachine:
         self._output_roots = output_roots
         self._ipc_dir = ipc_dir
         self._protected_roots = protected_roots
+        self._path_policy = ArtifactPathPolicy(
+            output_roots=output_roots,
+            protected_roots=protected_roots,
+        )
         self._commit_failure_threshold = commit_failure_threshold
         self._authorization_pending: tuple[str | None, str, str] | None = None
         self._dispatch_start_lock = dispatch_start_lock or threading.RLock()
@@ -175,9 +179,26 @@ class DispatchMachine:
 
         pending = self._authorization_pending
         if pending is not None:
-            run_id, pending_uid, path = pending
+            run_id, pending_uid, name = pending
             self._authorization_pending = None
             if run_id == self._session.run_id and pending_uid in store.state.queue_uids:
+                pending_idx = next(
+                    index for index, snapshot in enumerate(store.state.queue)
+                    if Job.from_dict(snapshot).uid == pending_uid
+                )
+                try:
+                    pending_files = self._resolve_job_files(
+                        Job.from_dict(store.state.queue[pending_idx])
+                    )
+                    path = pending_files[name].path
+                    assert path is not None
+                except Exception as exc:
+                    snapshot = store.state.pop_job(pending_idx)
+                    self._reject_and_commit(
+                        pending_uid, snapshot, {"error_message": str(exc)},
+                        count_as="failed", attempt_id=None,
+                    )
+                    return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
                 authorized = store.check_or_request_authorization(path)
                 if not self._dispatch_allowed():
                     return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
@@ -337,7 +358,7 @@ class DispatchMachine:
                 if not self._dispatch_allowed():
                     return None
                 if authorized is None:
-                    self._authorization_pending = (self._session.run_id, job_uid, fspec.path)
+                    self._authorization_pending = (self._session.run_id, job_uid, fname)
                     return None
                 if authorized is False:
                     exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
@@ -450,12 +471,8 @@ class DispatchMachine:
             for fspec in resolved_files.values()
             if fspec.delete_existing and fspec.path
         ]
-        policy = ArtifactPathPolicy(
-            output_roots=self._output_roots,
-            protected_roots=self._protected_roots,
-        )
         try:
-            _execute_pre_deletes(policy, pre_deletes)
+            _execute_pre_deletes(self._path_policy, pre_deletes)
         except (OSError, ValueError, NotImplementedError) as exc:
             self._resources.release_all(acquired)
             message = f"Pre-deletion failed: {exc}"
@@ -802,6 +819,11 @@ class DispatchMachine:
                 resolved_path = bound_spec.path
                 if spec.role == "input" and not os.path.exists(resolved_path):
                     raise FileNotFoundError(f"Missing input file: {resolved_path}")
+            if bound_spec.delete_existing or bound_spec.delete_on_success or bound_spec.delete_on_failure:
+                validated_path = self._path_policy.resolve(
+                    resolved_path, delete_existing=bound_spec.delete_existing,
+                )
+                bound_spec = bound_spec.bind_output_path(validated_path)
             resolved[name] = bound_spec
         return resolved
 

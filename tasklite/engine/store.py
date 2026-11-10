@@ -27,7 +27,7 @@ from typing import Any, Callable, Collection, Mapping, Sequence
 from ..backend.base import AbstractStateBackend
 from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
 from ..exceptions import TaskLiteError, _CommitCrashSignal, _JobTerminated
-from ..models.artifact import ArtifactDeclaration
+from ..models.artifact import ArtifactDeclaration, resolve_path_against_base
 from ..models.attempt import (
     ATTEMPT_FAILED,
     ATTEMPT_REQUEUED,
@@ -711,6 +711,11 @@ class StateStore:
 
     # ── 路径授权管理与判定 ──────────────────────────────────────────
 
+    def _authorization_target(self, path: str | Path) -> Path:
+        """固定基准解析父路径，保留叶目录项以免断链授权漂移到缺失目标。"""
+        target = Path(resolve_path_against_base(path, self.base_dir))
+        return target.parent.resolve() / target.name
+
     def is_path_protected(self, path: str | Path) -> bool:
         """检查路径是否与受保护根目录（如状态目录）重叠。"""
         try:
@@ -728,14 +733,8 @@ class StateStore:
 
     def is_path_authorized(self, path: str | Path) -> bool:
         """检查指定规范绝对路径是否命中已有授权。"""
-        raw = Path(os.fspath(path))
-        target = (self.base_dir / raw).resolve() if not raw.is_absolute() else raw.resolve()
-        norm_path = os.path.normpath(str(target))
-        if self._backend.is_path_authorized(norm_path):
-            return True
-        if str(path) != norm_path and self._backend.is_path_authorized(os.path.normpath(os.fspath(path))):
-            return True
-        return False
+        norm_path = str(self._authorization_target(path))
+        return self._backend.is_path_authorized(norm_path)
 
     def record_authorization(
         self,
@@ -745,9 +744,7 @@ class StateStore:
         authorized_at: str | None = None,
     ) -> None:
         """持久化记录一条文件系统路径授权。"""
-        raw = Path(os.fspath(path))
-        target = (self.base_dir / raw).resolve() if not raw.is_absolute() else raw.resolve()
-        norm_path = os.path.normpath(str(target))
+        norm_path = str(self._authorization_target(path))
         self._backend.record_authorization(norm_path, target_type, authorized_at=authorized_at)
 
     def list_authorizations(self) -> list[dict[str, Any]]:
@@ -756,13 +753,8 @@ class StateStore:
 
     def revoke_authorization(self, path: str | Path) -> bool:
         """按规范绝对路径精确撤销授权。"""
-        raw = Path(os.fspath(path))
-        target = (self.base_dir / raw).resolve() if not raw.is_absolute() else raw.resolve()
-        norm_path = os.path.normpath(str(target))
-        res = self._backend.revoke_authorization(norm_path)
-        if not res and str(path) != norm_path:
-            res = self._backend.revoke_authorization(os.path.normpath(os.fspath(path)))
-        return res
+        norm_path = str(self._authorization_target(path))
+        return self._backend.revoke_authorization(norm_path)
 
     def check_or_request_authorization(
         self, path: str | Path, target_type: str | None = None
@@ -770,9 +762,7 @@ class StateStore:
         """检查已有授权或发起内部授权询问；已授权或同意持久化记录并返回 True，等待返回 None，拒绝返回 False。"""
         if self.is_path_protected(path):
             return False
-        raw = Path(os.fspath(path))
-        target = (self.base_dir / raw).resolve() if not raw.is_absolute() else raw.resolve()
-        norm_path = os.path.normpath(str(target))
+        norm_path = str(self._authorization_target(path))
         if self._backend.is_path_authorized(norm_path):
             return True
         effective_type = (

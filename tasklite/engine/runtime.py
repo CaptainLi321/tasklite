@@ -357,7 +357,9 @@ class EngineRuntime:
             protected_roots=self.config.protected_roots,
         )
         try:
-            return policy.resolve(request.resolved_path), None
+            return policy.resolve(
+                request.resolved_path, delete_existing=request.bound.delete_existing,
+            ), None
         except (OSError, ValueError, NotImplementedError) as exc:
             return request.resolved_path, {
                 "type": type(exc).__name__,

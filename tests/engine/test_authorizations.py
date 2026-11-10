@@ -838,3 +838,201 @@ def test_list_and_revoke_authorizations_surface_and_run_guard(tmp_path, monkeypa
 
         with pytest.raises(TaskLiteError, match="is only allowed outside run"):
             p.revoke_authorization("foo.txt")
+
+
+@pytest.mark.parametrize("declaration", ["static", "dynamic"])
+@pytest.mark.parametrize("approval", ["interactive", "automatic"])
+@pytest.mark.parametrize("operation", ["delete_existing", "delete_on_success", "delete_on_failure"])
+@pytest.mark.parametrize("forbidden", ["outside", "protected", "output-root", "filesystem-root", "symlink"])
+def test_forbidden_file_operations_never_request_or_persist_authorization(
+    tmp_path, monkeypatch, declaration, approval, operation, forbidden,
+):
+    """禁止目标在静态与动态入口均先拒绝，不询问、不保存授权、不进入删除。"""
+    monkeypatch.chdir(tmp_path)
+    if approval == "automatic":
+        monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    else:
+        monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    state_path = allowed / "state.db"
+    valuable = tmp_path / "valuable"
+    valuable.write_text("valuable", encoding="utf-8")
+    targets = {
+        "outside": valuable,
+        "protected": state_path,
+        "output-root": allowed,
+        "filesystem-root": Path(allowed.anchor),
+        "symlink": allowed / "linked",
+    }
+    targets["symlink"].symlink_to(valuable)
+    target = targets[forbidden]
+    calls = []
+    removals = []
+    with TaskLite(backend="sqlite", state_path=state_path, output_roots=allowed) as p:
+        p.authorizer = lambda *args: calls.append(args) or True
+        monkeypatch.setattr(
+            "tasklite.utils.artifact.ArtifactPathPolicy._remove",
+            lambda *args, **kwargs: removals.append(args),
+        )
+        spec = FileSpec(target, role="output", **{operation: True})
+        p.register_task("work", _declare_spec_handler if declaration == "dynamic" else _quick_handler)
+        p.enqueue(Job(
+            "work", "one", payload={"spec": spec.to_dict()},
+            files={"target": spec} if declaration == "static" else {},
+        ))
+        p.run(install_signals=False)
+        assert calls == []
+        assert p.list_authorizations() == []
+        assert removals == []
+        assert valuable.read_text(encoding="utf-8") == "valuable"
+        assert target.exists()
+        assert "work::one" in p._runtime.store.backend.load_failed()
+        attempts = p._runtime.store.backend.load_settled_attempts("work::one")
+        assert len(attempts) == (1 if declaration == "dynamic" else 0)
+
+
+def _declare_spec_handler(job, ctx):
+    ctx.declare_file("target", FileSpec.from_dict(job.payload["spec"]))
+    return TaskResult.success()
+
+
+def test_static_forbidden_declaration_prevents_authorizing_other_targets(tmp_path, monkeypatch):
+    """同批预声明全部校验完成后才开始询问，禁止目标不会留下部分授权。"""
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    good = allowed / "good"
+    bad = tmp_path / "bad"
+    good.write_text("good", encoding="utf-8")
+    bad.write_text("bad", encoding="utf-8")
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db", output_roots=allowed) as p:
+        calls = []
+        p.authorizer = lambda *args: calls.append(args) or True
+        p.register_task("work", _quick_handler)
+        p.enqueue(Job("work", "one", files={
+            "good": FileSpec(good, role="output", delete_existing=True),
+            "bad": FileSpec(bad, role="output", delete_existing=True),
+        }))
+        p.run(install_signals=False)
+        assert calls == []
+        assert p.list_authorizations() == []
+        assert good.read_text(encoding="utf-8") == "good"
+        assert bad.read_text(encoding="utf-8") == "bad"
+
+
+@pytest.mark.parametrize("changed", ["waiting", "other-declaration"])
+def test_static_authorization_wait_revalidates_target_before_asking_again(tmp_path, monkeypatch, changed):
+    """待决后目标变为链接，下一次询问前拒绝且保留目标。"""
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "target"
+    valuable = tmp_path / "valuable"
+    target.write_text("old", encoding="utf-8")
+    valuable.write_text("valuable", encoding="utf-8")
+    other = tmp_path / "other"
+    other.write_text("other", encoding="utf-8")
+    changed_target = target if changed == "waiting" else other
+    calls = []
+
+    def authorize(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            changed_target.unlink()
+            changed_target.symlink_to(valuable)
+            return None
+        return True
+
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
+        p.authorizer = authorize
+        p.register_task("work", _quick_handler)
+        p.enqueue(Job("work", "one", files={
+            "target": FileSpec(target, role="output", delete_existing=True),
+            "other": FileSpec(other, role="output", delete_on_success=True),
+        }))
+        p.run(install_signals=False)
+        assert len(calls) == 1
+        assert p.list_authorizations() == []
+        assert changed_target.is_symlink()
+        assert valuable.read_text(encoding="utf-8") == "valuable"
+        assert "symlink" in p._runtime.store.backend.load_failed()["work::one"]["error_message"]
+        assert p._runtime.store.backend.load_settled_attempts("work::one") == []
+
+
+@pytest.mark.parametrize("declaration", ["static", "dynamic"])
+def test_broken_symlink_preparation_authorizes_and_removes_only_the_link(
+    tmp_path, monkeypatch, declaration,
+):
+    """前删断链时授权其目录项路径，不授权或创建缺失的链接目标。"""
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    missing = tmp_path / "missing"
+    link = tmp_path / "link"
+    link.symlink_to(missing)
+    spec = FileSpec(link, role="cache", delete_existing=True)
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
+        calls = []
+        p.authorizer = lambda *args: calls.append(args) or True
+        p.register_task("work", _declare_spec_handler if declaration == "dynamic" else _quick_handler)
+        p.enqueue(Job(
+            "work", "one", payload={"spec": spec.to_dict()},
+            files={"target": spec} if declaration == "static" else {},
+        ))
+        p.run(install_signals=False)
+        assert calls == [(str(link), "file")]
+        authorization, = p.list_authorizations()
+        assert authorization["path"] == str(link)
+        assert authorization["target_type"] == "file"
+        assert not os.path.lexists(link)
+        assert not missing.exists()
+        assert not p._runtime.store.is_path_authorized(missing)
+        assert p.revoke_authorization(missing) is False
+        assert p.revoke_authorization(link) is True
+        assert p.list_authorizations() == []
+        assert "work::one" in p._runtime.store.backend.load_successes()
+
+
+def _fixed_base_file_handler(job, ctx):
+    os.chdir(job.payload["worker_cwd"])
+    if job.payload["declaration"] == "dynamic":
+        target = ctx.declare_file(
+            "target", FileSpec("../allowed/result", role="output", delete_existing=True),
+        )
+    else:
+        target = ctx.file_path("target")
+    assert not target.exists()
+    target.write_text("updated", encoding="utf-8")
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "memory"])
+@pytest.mark.parametrize("declaration", ["static", "dynamic"])
+def test_allowed_file_operations_keep_instance_path_base(
+    tmp_path, monkeypatch, backend, declaration,
+):
+    """主进程和 worker 改变目录后，允许的相对路径仍按实例创建基准授权与准备。"""
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    base = tmp_path / "base"
+    allowed = tmp_path / "allowed"
+    other = tmp_path / "other"
+    for directory in (base, allowed, other):
+        directory.mkdir()
+    target = allowed / "result"
+    target.write_text("old", encoding="utf-8")
+    monkeypatch.chdir(base)
+    kwargs = {"state_path": base / "state.db"} if backend == "sqlite" else {}
+    with TaskLite(backend=backend, output_roots="../allowed", **kwargs) as p:
+        calls = []
+        p.authorizer = lambda *args: calls.append(args) or True
+        p.register_task("work", _fixed_base_file_handler)
+        monkeypatch.chdir(other)
+        p.enqueue(Job(
+            "work", "one", payload={"worker_cwd": str(other), "declaration": declaration},
+            files={"target": FileSpec("../allowed/result", role="output", delete_existing=True)}
+            if declaration == "static" else {},
+        ))
+        p.run(install_signals=False)
+        assert calls == [(str(target), "file")]
+        authorization, = p.list_authorizations()
+        assert authorization["path"] == str(target)
+        assert authorization["target_type"] == "file"
+        assert target.read_text(encoding="utf-8") == "updated"
+        assert "work::one" in p._runtime.store.backend.load_successes()
