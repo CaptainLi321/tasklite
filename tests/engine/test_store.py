@@ -48,7 +48,7 @@ def _task_specs(task_type, trigger):
 
 
 class CommitFailureBackend:
-    """commit 故障注入 backend：指定方法恒返 False，其余委托真实后端。
+    """commit 故障注入 backend：批量／移除抛异常，旧格式方法返回 False。
 
     ``archive_pass_through`` 时 commit_job_failure 对 3-strike 熔断 meta
     放行 True（收敛路径需要失败档案写入成功才能走到终态分支）。
@@ -78,12 +78,12 @@ class CommitFailureBackend:
 
     def commit_job_failures(self, *a, **k):
         if "commit_job_failures" in self._failing:
-            return False
+            raise OSError("批量事务写入失败")
         return self._real.commit_job_failures(*a, **k)
 
     def commit_skip(self, *a, **k):
         if "commit_skip" in self._failing:
-            return False
+            raise OSError("候选移除事务失败")
         return self._real.commit_skip(*a, **k)
 
     def __getattr__(self, name):
@@ -405,18 +405,16 @@ class TestApplySkip:
         assert state.in_flight_uids == {"t::running"}
         state._assert_state_consistent()
 
-    def test_skip_commit_failure_crashes_without_archive(self):
-        """commit_skip 失败：只 requeue + 崩溃，绝不写失败档案。"""
+    def test_skip_fault_preserves_queue_without_archive(self):
         backend = InMemoryStateBackend()
         failing = CommitFailureBackend(backend, failing=("commit_skip",))
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
         store = StateStore(failing, state, stats={})
-        state.pop_job(0)
-
-        with pytest.raises(_CommitCrashSignal, match="commit_skip"):
-            store.apply_skip("t::1", job_snapshot={"task_type": "t", "job_id": "1"})
-        assert "t::1" in store.state.queue_uids
-        assert "t::1" not in store.state.failed
+        with pytest.raises(OSError, match="候选移除事务失败"):
+            store.apply_skip("t::1")
+        assert "t::1" in state.queue_uids
+        assert state.failed == {}
+        assert store.stats == {}
 
 
 class TestMarkFailedMemoryContract:
@@ -613,105 +611,21 @@ class TestApplyBulkFailure:
         store.apply_bulk_failure([("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"})])
         assert "cycle::1" not in backend.load_successes()
 
-    def test_bulk_commit_failure_below_threshold_crashes(self):
+    @pytest.mark.parametrize("operation", ["bulk", "cascade"])
+    def test_bulk_fault_preserves_state_without_failure_accounting(self, operation):
         backend = InMemoryStateBackend()
-        failing = CommitFailureBackend(
-            backend,
-            failing=("commit_job_failures", "commit_job_failure"),
-        )
-        state = PipelineState({}, {}, {}, [{"task_type": "cycle", "job_id": "1"}])
-        store = StateStore(failing, state, commit_failure_threshold=3)
-
-        with pytest.raises(_CommitCrashSignal):
-            store.apply_bulk_failure([("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"})])
-        assert store.state.queue[0]["runtime"]["_commit_failures"] == 1
-        assert "cycle::1" not in store.state.failed
-
-
-class TestBulkStrikeConvergence:
-    """批量 3-strike 两路（死锁批量 / 级联批量）收敛语义分叉锁定。"""
-
-    def _strike_bulk_store(
-        self, hooks: list, queue_rows: list, *, threshold: int = 3
-    ) -> StateStore:
-        backend = CommitFailureBackend(
-            InMemoryStateBackend(),
-            failing=("commit_job_failures",),
-            archive_pass_through=True,
-        )
-        state = PipelineState({}, {}, {}, queue_rows)
-        return StateStore(
-            backend,
-            state,
-            commit_failure_threshold=threshold,
-            stats={},
-            on_attempt_finished=lambda uid, *, outcome: hooks.append((uid, outcome)),
-        )
-
-    def test_deadlock_and_cascade_strike_meta_converged(self):
-        """死锁批量与级联批量的熔断 meta 同规（归因统一 ERR_COMMIT_FAILURE）。"""
-        hooks_deadlock: list[tuple[str, AttemptOutcome]] = []
-        store_deadlock = self._strike_bulk_store(
-            hooks_deadlock,
-            [{"task_type": "cycle", "job_id": "1", "runtime": {"_commit_failures": 2}}],
-        )
-        outcome = store_deadlock.apply_bulk_failure(
-            [("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"})]
-        )
-        assert outcome.failed_uids == ["cycle::1"]
-        deadlock_meta = store_deadlock.state.failed["cycle::1"]
-
-        hooks_cascade: list[tuple[str, AttemptOutcome]] = []
-        store_cascade = self._strike_bulk_store(
-            hooks_cascade,
-            [
-                {"task_type": "parent", "job_id": "1"},
-                {
-                    "task_type": "child",
-                    "job_id": "1",
-                    "depends_on": ["parent::1"],
-                    "runtime": {"_commit_failures": 2},
-                },
-            ],
-        )
-        store_cascade.state.pop_job(0)
-        cascade_outcome = store_cascade.apply_failure("parent::1", {"error_message": "boom"})
-        assert cascade_outcome.cascaded_uids == ["child::1"]
-        cascade_meta = store_cascade.state.failed["child::1"]
-
-        for meta in (deadlock_meta, cascade_meta):
-            assert meta["error_message"] == ERR_COMMIT_FAILURE
-            assert meta["is_fatal"] is True
-            assert meta["commit_failures"] == 3
-        assert [uid for uid, _ in hooks_deadlock] == ["cycle::1"]
-        assert [uid for uid, _ in hooks_cascade] == ["child::1"]
-        for _, fin in hooks_deadlock + hooks_cascade:
-            assert fin.success is False and fin.will_retry is False
-            assert fin.metadata["error_message"] == ERR_COMMIT_FAILURE
-
-    def test_out_of_queue_uid_still_finalized_and_accounted(self):
-        """归因中的队列外 uid 同规计数与熔断（记账绝不静默丢失）。"""
-        hooks: list[tuple[str, AttemptOutcome]] = []
-        store = self._strike_bulk_store(
-            hooks,
-            [{"task_type": "cycle", "job_id": "1"}],
-            threshold=1,
-        )
-
-        outcome = store.apply_bulk_failure(
-            [
-                ("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"}),
-                ("ghost::9", {"error_message": "DEPENDENCY_DEADLOCK"}),
-            ]
-        )
-
-        assert outcome.failed_uids == ["cycle::1", "ghost::9"]
-        assert outcome.remaining_queue_count == 0
-        assert store.state.failed["cycle::1"]["error_message"] == ERR_COMMIT_FAILURE
-        assert store.state.failed["ghost::9"]["error_message"] == ERR_COMMIT_FAILURE
-        assert "ghost::9" not in store.state.queue_uids
-        assert sorted(uid for uid, _ in hooks) == ["cycle::1", "ghost::9"]
-        assert store.stats["failed"] == 2
+        failing = CommitFailureBackend(backend, failing=("commit_job_failures",))
+        job = Job("child", "one", depends_on=["parent::one"]).to_dict()
+        state = PipelineState({}, {}, {}, [job])
+        store = StateStore(failing, state, stats={})
+        with pytest.raises(OSError, match="批量事务写入失败"):
+            if operation == "bulk":
+                store.apply_bulk_failure([("child::one", {"error_message": "deadlock"})])
+            else:
+                store.cascade_fail("parent::one")
+        assert state.queue == [job]
+        assert state.failed == {}
+        assert store.stats == {}
 
 
 class TestIntakePipeline:

@@ -141,10 +141,9 @@ class AbstractStateBackend(ABC):
       load_cursors / load_queue）：仅启动装配与测试装配使用；
     - 整表重写（save_queue / replace_queue_atomic）：读-改-写必须经
       ``replace_queue_atomic`` 收敛进单个写事务；
-    - delta 提交（commit_job_success / commit_job_failure /
-      commit_retry / commit_job_failures / commit_skip）：逐 job 单事务
-      碎片化，禁止多 job 混合长事务；返回 False 表示持久化失败且后端
-      保持调用前状态，调用方不得推进内存镜像并走崩溃契约；
+    - 旧格式提交（commit_job_success / commit_retry）：False 表示持久化失败；
+    - 当前格式结算与批量失败／候选移除：同一调用原子提交，失败原样
+      抛出异常，调用方仅在成功后推进内存镜像；
     - 增量入队（enqueue_jobs）：不做全量覆盖，与运行中 delta 提交并发
       安全（写入侧不覆盖）；
     - 定向删除与种子（delete_queue_uids / delete_failed / delete_successes /
@@ -293,24 +292,22 @@ class AbstractStateBackend(ABC):
         """
 
     @abstractmethod
-    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> bool:
+    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> None:
         """原子批量写失败档案（死锁/级联场景）的 delta。
 
         单事务效果：failed INSERT/REPLACE 每个 uid → metadata；
         queue 按 uid 精准 DELETE（剩余条目保持原顺序）；
         successes 批量 DELETE 同名行（与 commit_job_failure 对称的最终状态唯一）。
-        任一行失败 ⇒ 整体回滚、返回 False，绝不留下「队列已删、档案未落」
+        任一行失败 ⇒ 整体回滚并原样抛出异常，绝不留下「队列已删、档案未落」
         的半成品失败态。
         """
 
     @abstractmethod
-    def commit_skip(self, job_uid: str) -> bool:
-        """delta 删除队列中已终态（重复）的 uid。
+    def commit_skip(self, job_uid: str) -> None:
+        """移除 Trigger False 或已终态重复候选的队列行。
 
-        去重命中（uid 已在 successes/failed）时调用——磁盘队列中该 uid 是残留
-        条目，直接删除以同步内存/磁盘（内存 = 磁盘 − in-flight）。
-        不写 successes/failed（重复条目不改变任何状态，只是清理）。
-        返回 True 成功；False 时 on-disk 队列不变，调用方走崩溃契约。
+        不写 successes/failed，不生成 Attempt。
+        成功无返回值；失败时队列不变，原始异常继续传播。
         """
 
     @abstractmethod

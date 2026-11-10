@@ -1074,23 +1074,14 @@ class StateStore:
         job_snapshot: dict[str, Any] | None = None,
         attempt_id: int | None = None,
     ) -> SkipOutcome:
-        """原子状态转移：终态跳过（清除磁盘与内存队列，不写 successes/failed）。"""
-        committed = self._backend.commit_skip(job_uid)
-        if committed:
-            self._state.remove_queued_uid(job_uid)
-            self._state.unregister_in_flight(job_uid)
-            self._record_stat("skipped", 1)
-            if self._backend.schema_version < TARGET_SCHEMA_VERSION:
-                self._finish_attempt(attempt_id, outcome=ATTEMPT_SKIPPED)
-            return SkipOutcome(job_uid=job_uid, was_known=True)
-
-        if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            raise _CommitCrashSignal(f"commit_skip returned False for {job_uid}")
-        self.handle_skip_commit_strike(job_uid, job_snapshot, attempt_id=attempt_id)
-        raise AssertionError(  # pragma: no cover - 契约防御
-            f"skip commit strike for {job_uid} unexpectedly returned normally; "
-            f"contract requires raising _CommitCrashSignal."
-        )
+        """原子移除候选（清除磁盘与内存队列，不写 successes/failed）。"""
+        self._backend.commit_skip(job_uid)
+        self._state.remove_queued_uid(job_uid)
+        self._state.unregister_in_flight(job_uid)
+        self._record_stat("skipped", 1)
+        if self._backend.schema_version < TARGET_SCHEMA_VERSION:
+            self._finish_attempt(attempt_id, outcome=ATTEMPT_SKIPPED)
+        return SkipOutcome(job_uid=job_uid, was_known=True)
 
     def apply_bulk_failure(
         self,
@@ -1114,41 +1105,20 @@ class StateStore:
             (job_uid, self._classifier.normalize_failure_metadata(metadata))
             for job_uid, metadata in uids_metas
         ]
-        committed = self._backend.commit_job_failures(normalized_metas)
+        self._backend.commit_job_failures(normalized_metas)
 
-        if committed:
-            failed_set = {u for u, _ in normalized_metas}
-            remaining_queue = [
-                jd for jd in self._state.queue
-                if job_uid_from_snapshot(jd) not in failed_set
-            ]
-            self._state.replace_queue(list(remaining_queue))
-            self._record_stat("failed", len(normalized_metas))
-            for job_uid, metadata in normalized_metas:
-                self._state.mark_failed(job_uid, metadata)
-                self._state.unregister_in_flight(job_uid)
-                self.fire_attempt_finished(
-                    job_uid,
-                    outcome=AttemptOutcome(success=False, will_retry=False, metadata=metadata),
-                )
-            return BulkFailureOutcome(
-                failed_uids=[u for u, _ in normalized_metas],
-                remaining_queue_count=len(self._state.queue),
-            )
-
-        if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            raise _CommitCrashSignal("Backend commit_job_failures returned False")
-
-        # 批量 commit 失败：3-strike 逐条收敛（与级联路径共用单一实现）
-        queue, kept_any = self.handle_bulk_failure_strike(
-            "commit_job_failures", normalized_metas, list(self._state.queue)
-        )
-        self._state.replace_queue(queue)
-        if kept_any:
-            raise _CommitCrashSignal(
-                f"Backend commit_job_failures returned False for "
-                f"{len(normalized_metas)} jobs. {len(queue)} kept in queue with "
-                f"incremented commit failure count. Crashing to retry."
+        failed_set = {u for u, _ in normalized_metas}
+        remaining_queue = [
+            jd for jd in self._state.queue
+            if job_uid_from_snapshot(jd) not in failed_set
+        ]
+        self._state.replace_queue(list(remaining_queue))
+        self._record_stat("failed", len(normalized_metas))
+        for job_uid, metadata in normalized_metas:
+            self.mark_failed_memory(job_uid, metadata)
+            self.fire_attempt_finished(
+                job_uid,
+                outcome=AttemptOutcome(success=False, will_retry=False, metadata=metadata),
             )
         return BulkFailureOutcome(
             failed_uids=[u for u, _ in normalized_metas],
@@ -1174,36 +1144,19 @@ class StateStore:
             (job_uid, {"error_message": ERR_JOB_DEPENDENCY, "failed_dependency": failed_uid})
             for job_uid in cascade_uids
         ]
-        committed = self._backend.commit_job_failures(cascade_metas)
-        if committed:
-            cascade_set = set(cascade_uids)
-            remaining = [
-                jd for jd in self._state.queue
-                if job_uid_from_snapshot(jd) not in cascade_set
-            ]
-            self._state.replace_queue(remaining)
-            self._record_stat("cascade_failed", len(cascade_uids))
-            for job_uid, metadata in cascade_metas:
-                self.mark_failed_memory(job_uid, metadata)
-                self.fire_attempt_finished(
-                    job_uid,
-                    outcome=AttemptOutcome(success=False, will_retry=False, metadata=metadata),
-                )
-            return cascade_uids
-
-        if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            raise _CommitCrashSignal(f"Backend commit_job_failures returned False for cascade of {failed_uid}")
-
-        # 批量 commit 失败：3-strike 逐条收敛后仍存留则崩溃
-        remaining, kept = self.handle_bulk_failure_strike(
-            "commit_job_failures", cascade_metas, list(self._state.queue)
-        )
+        self._backend.commit_job_failures(cascade_metas)
+        cascade_set = set(cascade_uids)
+        remaining = [
+            jd for jd in self._state.queue
+            if job_uid_from_snapshot(jd) not in cascade_set
+        ]
         self._state.replace_queue(remaining)
-        if kept:
-            raise _CommitCrashSignal(
-                f"Backend commit_job_failures returned False for "
-                f"{len(cascade_metas)} cascade job(s); {len(remaining)} kept in "
-                f"queue. Crashing to retry; on-disk queue preserved."
+        self._record_stat("cascade_failed", len(cascade_uids))
+        for job_uid, metadata in cascade_metas:
+            self.mark_failed_memory(job_uid, metadata)
+            self.fire_attempt_finished(
+                job_uid,
+                outcome=AttemptOutcome(success=False, will_retry=False, metadata=metadata),
             )
         return cascade_uids
 
@@ -1279,88 +1232,6 @@ class StateStore:
 
         # 未达阈值或熔断写入仍失败：requeue 并上抛崩溃信号
         self._requeue_and_crash(job_uid, job_snapshot, reason, attempt_id=attempt_id)
-
-    def handle_skip_commit_strike(
-        self,
-        job_uid: str,
-        job_snapshot: dict[str, Any] | None = None,
-        *,
-        attempt_id: int | None = None,
-    ) -> None:
-        """commit_skip 失败时的收敛处理：只 requeue + 崩溃，绝不写失败档案。"""
-        self._requeue_and_crash(job_uid, job_snapshot, "commit_skip", attempt_id=attempt_id)
-
-    def handle_bulk_failure_strike(
-        self,
-        reason: str,
-        uids_metas: list[tuple[str, dict[str, Any]]],
-        queue_job_snapshots: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """批量 commit 失败的 3-strike 逐条收敛（批量崩溃契约唯一实现）。
-
-        遍历归因全集而非仅队列内行——队列外 uid 以合成最小 dict 同规
-        计账与熔断，绝不静默丢失记账。返回（存留队列, 是否有归因作业
-        仍留队）：留队者带递增的 commit 失败计数，达阈值者经
-        ``_bulk_strike_finalize`` 熔断出队，单写也失败则留队待下次启动。
-        """
-        queue = list(queue_job_snapshots)
-        kept_any = False
-        for job_uid, _ in uids_metas:
-            matching = [j for j in queue if job_uid_from_snapshot(j) == job_uid]
-            if matching:
-                jd = matching[0]
-            else:
-                try:
-                    task_type, job_id = parse_job_uid(job_uid)
-                except TaskLiteError:
-                    task_type, _, job_id = job_uid.partition("::")
-                jd = {
-                    "task_type": task_type,
-                    "job_id": job_id,
-                }
-            failures = self._register_commit_failure(jd)
-            if failures >= self._threshold:
-                if self._bulk_strike_finalize(job_uid, jd, failures=failures):
-                    queue = [j for j in queue if job_uid_from_snapshot(j) != job_uid]
-                    continue
-                logger.critical(
-                    f"Bulk 3-strike: failure archive write also failed for "
-                    f"{job_uid} ({reason}); keeping in queue for next boot."
-                )
-            kept_any = True
-        return queue, kept_any
-
-    def _bulk_strike_finalize(
-        self,
-        job_uid: str,
-        job_snapshot: dict[str, Any],
-        *,
-        failures: int,
-    ) -> bool:
-        """批量 3-strike 熔断收尾单点（死锁批量与级联批量两路共用）。
-
-        统一语义：熔断 meta 与单条 handle_commit_failure_strike 同规——
-        归因收敛为 ERR_COMMIT_FAILURE strike_meta（原始归因让位于计数控
-        迹）；``unregister=False``——批量契约路径的失败登记与在途注销
-        分离，在途集合交由调用方统一处置。返回单写失败档案是否落盘。
-        """
-        strike_meta = {
-            "error_message": ERR_COMMIT_FAILURE,
-            "is_fatal": True,
-            "commit_failures": failures,
-        }
-        single_committed = self._backend.commit_job_failure(
-            job_uid, strike_meta, payload=self._extract_job_payload(job_snapshot)
-        )
-        if not single_committed:
-            return False
-        self.mark_failed_memory(job_uid, strike_meta, unregister=False)
-        self._record_stat("failed", 1)
-        self.fire_attempt_finished(
-            job_uid,
-            outcome=AttemptOutcome(success=False, will_retry=False, metadata=strike_meta),
-        )
-        return True
 
     def _requeue_and_crash(
         self,

@@ -50,6 +50,7 @@ def _assert_original_error(error, errors):
     assert any(frame.tb_frame.f_code.co_name == "commit_job_settlement"
                or frame.tb_frame.f_code.co_name == "commit_job_failure"
                or frame.tb_frame.f_code.co_name == "mark_job_running"
+               or frame.tb_frame.f_code.co_name in ("commit_job_failures", "commit_skip")
                for frame in tracebacks)
 
 
@@ -249,3 +250,119 @@ def test_run_settlement_fault_preserves_original_identity_and_recovers(tmp_path,
         pipeline.run(install_signals=False)
         assert backend.load_settled_attempts(job.uid) == [attempt]
         assert backend.load_cursors() == {"offset": "original"}
+
+
+@pytest.mark.parametrize("operation", ["bulk", "cascade", "skip"])
+@pytest.mark.parametrize("fault_kind", ["sqlite", "os"])
+def test_candidate_transaction_fault_rolls_back_entire_batch(tmp_path, monkeypatch, operation, fault_kind):
+    backend = SQLiteStateBackend(tmp_path / "state.db", schema_version=TARGET_SCHEMA_VERSION)
+    jobs = [Job("work", name, depends_on=["parent::one"]).to_dict()
+            for name in ("one", "two", "tail")]
+    backend.enqueue_jobs(jobs)
+    state = PipelineState(backend.load_successes(), backend.load_failed(), {}, backend.load_queue())
+    stats = {}
+    store = StateStore(backend, state, stats=stats)
+    with backend._get_conn() as connection:
+        if fault_kind == "sqlite":
+            action = ("BEFORE DELETE ON queue" if operation == "skip" else
+                      "BEFORE INSERT ON failed WHEN NEW.job_uid = 'work::two'")
+            connection.execute(f"CREATE TRIGGER reject_candidate {action} "
+                               "BEGIN SELECT RAISE(ABORT, 'candidate transaction failure'); END")
+        before_disk = list(connection.iterdump())
+    before_memory = _memory_facts(state)
+    original_get_conn = backend._get_conn
+    original = OSError("candidate transaction failure")
+    if fault_kind == "os":
+        @contextmanager
+        def failed_before_commit():
+            with original_get_conn() as connection:
+                yield connection
+                raise original
+        monkeypatch.setattr(backend, "_get_conn", failed_before_commit)
+    errors = _record_connection_errors(monkeypatch, backend)
+    with pytest.raises(sqlite3.IntegrityError if fault_kind == "sqlite" else OSError) as caught:
+        if operation == "bulk":
+            store.apply_bulk_failure([(f"work::{name}", {"error_message": "deadlock"})
+                                      for name in ("one", "two")])
+        elif operation == "cascade":
+            store.cascade_fail("parent::one")
+        else:
+            store.apply_skip("work::one")
+    _assert_original_error(caught.value, errors)
+    if fault_kind == "os":
+        assert caught.value is original
+    monkeypatch.setattr(backend, "_get_conn", original_get_conn)
+    with backend._get_conn() as connection:
+        assert list(connection.iterdump()) == before_disk
+    assert _memory_facts(state) == before_memory
+    assert stats == {}
+    assert all(backend.load_settled_attempts(f"work::{name}") == []
+                   for name in ("one", "two", "tail"))
+
+
+def test_memory_bulk_second_copy_fault_preserves_all_state():
+    backend = InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION)
+    backend.enqueue_jobs([Job("work", name).to_dict() for name in ("one", "two")])
+    before = copy.deepcopy(backend.__dict__ | {"_lock": None, "_exec_lock": None})
+    original = OSError("第二条失败记录复制失败")
+    with pytest.raises(OSError) as caught:
+        backend.commit_job_failures([("work::one", {"message": "first"}),
+                                     ("work::two", {"value": _CopyFailure(original)})])
+    assert caught.value is original
+    assert backend.__dict__ | {"_lock": None, "_exec_lock": None} == before
+
+
+@pytest.mark.parametrize("operation", ["deadlock", "skip"])
+def test_run_candidate_fault_preserves_pending_without_attempt(tmp_path, monkeypatch, operation):
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
+        pipeline.register_task("work", _unexpected_handler)
+        if operation == "deadlock":
+            # 已持久化依赖环从加载入口交由死锁仲裁处理。
+            store = pipeline._runtime.store
+            store.backend.enqueue_jobs([
+                store.normalize_and_validate_job(Job("work", "one", depends_on=["work::two"])),
+                store.normalize_and_validate_job(Job("work", "two", depends_on=["work::one"])),
+            ])
+            action = "BEFORE INSERT ON failed WHEN NEW.job_uid = 'work::two'"
+        else:
+            pipeline.register_trigger("reject", lambda ctx: False)
+            pipeline.enqueue(Job("work", "one", trigger="reject"))
+            action = "BEFORE DELETE ON queue"
+        backend = pipeline._runtime.store.backend
+        before_queue = backend.load_queue_jobs()
+        with backend._get_conn() as connection:
+            connection.execute(f"CREATE TRIGGER reject_candidate {action} "
+                               "BEGIN SELECT RAISE(ABORT, 'run candidate failure'); END")
+        errors = _record_connection_errors(monkeypatch, backend)
+        with pytest.raises(sqlite3.IntegrityError) as caught:
+            pipeline.run(install_signals=False)
+        _assert_original_error(caught.value, errors)
+        assert backend.load_queue_jobs() == before_queue
+        assert backend.load_successes() == backend.load_failed() == {}
+        assert all(backend.load_settled_attempts(f"work::{name}") == []
+                   for name in ("one", "two", "tail"))
+        assert pipeline._runtime.store.state.failed == {}
+        assert pipeline._runtime.store.state.queue_uids == {
+            row["job"]["task_type"] + "::" + row["job"]["job_id"] for row in before_queue
+        }
+
+
+def test_memory_skip_construction_fault_preserves_all_state(monkeypatch):
+    import tasklite.backend.memory as memory
+
+    backend = InMemoryStateBackend(schema_version=TARGET_SCHEMA_VERSION)
+    backend.enqueue_jobs([Job("work", name).to_dict() for name in ("one", "two")])
+    before = copy.deepcopy(backend.__dict__ | {"_lock": None, "_exec_lock": None})
+    original = OSError("候选队列构造失败")
+    original_uid = memory.job_uid_from_snapshot
+
+    def failing_uid(job):
+        if job["job_id"] == "two":
+            raise original
+        return original_uid(job)
+
+    monkeypatch.setattr(memory, "job_uid_from_snapshot", failing_uid)
+    with pytest.raises(OSError) as caught:
+        backend.commit_skip("work::one")
+    assert caught.value is original
+    assert backend.__dict__ | {"_lock": None, "_exec_lock": None} == before

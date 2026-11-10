@@ -41,7 +41,7 @@ class FakeArbitrationStore:
     def apply_bulk_failure(self, uids_metas):
         self.bulk_calls.append(list(uids_metas))
         if self.backend is not None:
-            assert self.backend.commit_job_failures(list(uids_metas)) is True
+            assert self.backend.commit_job_failures(list(uids_metas)) is None
         for uid, meta in uids_metas:
             self.state.mark_failed(uid, dict(meta))
         fail_set = {uid for uid, _ in uids_metas}

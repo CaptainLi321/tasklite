@@ -1,4 +1,6 @@
 """触发器与任务模板的公开契约。"""
+import pytest
+
 from tasklite import Job, TaskLite, TaskLiteError, TaskResult
 from tests.helpers import install_fake_process_context
 
@@ -298,3 +300,16 @@ def test_trigger_error_aborts_inflight_without_burning_budget():
     assert all(row["attempt_no"] == 1 for row in rows.values())
     assert pipeline._runtime.store.backend.load_attempts("t::b") == []
     assert pipeline._runtime.store.backend.load_failed() == {}
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_trigger_false_removes_candidate_without_terminal_or_attempt(tmp_path, backend):
+    with TaskLite(backend=backend, state_path=tmp_path / "state.db") as pipeline:
+        pipeline.register_trigger("reject", lambda ctx: False)
+        pipeline.register_task("work", handle, trigger="reject")
+        pipeline.enqueue(Job("work", "one"))
+        pipeline.run(install_signals=False)
+        state_backend = pipeline._runtime.store.backend
+        assert state_backend.load_queue_jobs() == []
+        assert state_backend.load_successes() == state_backend.load_failed() == {}
+        assert state_backend.load_settled_attempts("work::one") == []

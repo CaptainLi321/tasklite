@@ -685,15 +685,14 @@ class SQLiteStateBackend(AbstractStateBackend):
             raise
         return True
 
-    def commit_skip(self, job_uid: str) -> bool:
-        """delta 删除队列中已终态（重复）的 job_uid；不写 successes/failed。"""
+    def commit_skip(self, job_uid: str) -> None:
+        """移除 Trigger False 或重复候选；不写 successes/failed。"""
         try:
             with self._get_conn() as conn:
                 conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
         except Exception as e:
             logger.critical(f"Failed to commit skip for {job_uid} in {self.path.name}: {e}")
-            return False
-        return True
+            raise
 
     def commit_retry(
         self, popped_job_uid: str, requeued_job_snapshot: dict[str, Any], *, front: bool = False
@@ -722,7 +721,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             return False
         return True
 
-    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> bool:
+    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> None:
         """原子 delta：批量写失败档案 + 按 job_uid 精准删除队列行 + 批量清 successes 旧记录。
 
         与 commit_job_failure 对称，同一事务内批量 ``DELETE FROM successes``
@@ -745,8 +744,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                 )
         except Exception as e:
             logger.critical(f"Failed to commit bulk failure in {self.path.name}: {e}")
-            return False
-        return True
+            raise
 
     def append_failed(self, job_uid: str, metadata: dict[str, Any] | None = None) -> None:
         try:

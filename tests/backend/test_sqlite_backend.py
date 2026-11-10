@@ -474,7 +474,7 @@ class TestCommitBulkFailure:
 
         assert backend.commit_job_failures(
             [("t::a", {"err": "x"}), ("t::b", {"err": "y"})]
-        ) is True
+        ) is None
         assert backend.load_failed() == {"t::a": {"err": "x"}, "t::b": {"err": "y"}}
         assert backend.load_queue() == []
 
@@ -488,12 +488,12 @@ class TestCommitBulkFailure:
         backend = SQLiteStateBackend(tmp_path / "state.db")
         _open_and_commit_success(backend, "t::one", {"ok": True})
         _open_and_commit_success(backend, "t::two", {"ok": True})
-        assert backend.commit_job_failures([("t::one", {"error_message": "x"}), ("t::two", {"error_message": "y"})]) is True
+        assert backend.commit_job_failures([("t::one", {"error_message": "x"}), ("t::two", {"error_message": "y"})]) is None
         assert backend.load_successes() == {}
 
     def test_empty_list_is_noop(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        assert backend.commit_job_failures([]) is True
+        assert backend.commit_job_failures([]) is None
         assert backend.load_failed() == {}
 
 
@@ -576,7 +576,7 @@ class TestSaveAndEnqueueQueue:
     def test_commit_skip_removes_uid_only(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         backend.enqueue_jobs([_job_snapshot("stale"), _job_snapshot("live")])
-        assert backend.commit_skip("t::stale") is True
+        assert backend.commit_skip("t::stale") is None
         assert _queue_uids(backend) == ["t::live"]
         assert backend.load_successes() == {} and backend.load_failed() == {}
 

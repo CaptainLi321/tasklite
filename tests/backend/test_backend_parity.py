@@ -105,8 +105,8 @@ class TestCoreContractProperties:
 
         assert _open_and_commit_success(b, job_uid="t::success_one", result_metadata={"ok": True}) is True
         assert b.commit_job_failure(job_uid="t::fail_one", failure_metadata={"error_message": "x"}) is True
-        assert b.commit_job_failures(job_uids_metadata=[("t::bulk_one", {"error_message": "y"})]) is True
-        assert b.commit_skip(job_uid="t::skip_one") is True
+        assert b.commit_job_failures(job_uids_metadata=[("t::bulk_one", {"error_message": "y"})]) is None
+        assert b.commit_skip(job_uid="t::skip_one") is None
 
         assert _queue_uids(b) == []
         assert set(b.load_successes()) == {"t::success_one"}
@@ -308,12 +308,11 @@ class TestBackendCommitAtomicity:
         b.apply_manual_status([("t::nine", "succeeded", _job_snapshot("nine"), None)])
         before = _snapshot(b)
 
-        ok = b.commit_job_failures([
-            ("t::one", {"error_message": "d_one"}),
-            ("t::two", {"payload": _UncommittableMeta()}),
-        ])
-
-        assert ok is False
+        with pytest.raises((ValueError, TypeError)):
+            b.commit_job_failures([
+                ("t::one", {"error_message": "d_one"}),
+                ("t::two", {"payload": _UncommittableMeta()}),
+            ])
         # 队列绝不被整体删除、successes 绝不被清理
         assert _snapshot(b) == before
 

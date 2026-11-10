@@ -280,30 +280,21 @@ class InMemoryStateBackend(AbstractStateBackend):
                 logger.critical(f"Failed to commit retry for {popped_job_uid}: {e}")
                 return False
 
-    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> bool:
+    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> None:
         with self._lock:
-            try:
-                # 校验先行：全部失败行拷贝在任何变更前完成——任一行失败则
-                # queue/successes/failed 整体不变（对齐 SQLite 事务回滚，杜绝
-                # 「队列已整体删除、档案未落」的半成品失败态）。
-                entries = [(job_uid, copy.deepcopy(meta or {})) for job_uid, meta in job_uids_metadata]
-                fail_uids = {u for u, _ in job_uids_metadata}
-                remaining = [j for j in self._queue if job_uid_from_snapshot(j) not in fail_uids]
-                for job_uid, meta in entries:
-                    self._failed[job_uid] = meta
-                    # 级联/死锁批量失败时 successes 旧成功记录作废（最终状态
-                    # 唯一），与 commit_job_failure 对称。
-                    self._successes.pop(job_uid, None)
-                self._queue = remaining
-                return True
-            except Exception as e:
-                logger.critical(f"Failed to commit bulk failure: {e}")
-                return False
+            # 所有可失败的复制与队列构造先于统一发布。
+            entries = [(job_uid, copy.deepcopy(meta or {})) for job_uid, meta in job_uids_metadata]
+            fail_uids = {u for u, _ in entries}
+            remaining = [j for j in self._queue if job_uid_from_snapshot(j) not in fail_uids]
+            failed = self._failed | dict(entries)
+            successes = {uid: meta for uid, meta in self._successes.items() if uid not in fail_uids}
+            self._failed = failed
+            self._successes = successes
+            self._queue = remaining
 
-    def commit_skip(self, job_uid: str) -> bool:
+    def commit_skip(self, job_uid: str) -> None:
         with self._lock:
             self._queue = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
-            return True
 
     def append_failed(self, job_uid: str, metadata: dict[str, Any] | None = None) -> None:
         with self._lock:

@@ -166,19 +166,19 @@ class TestInMemoryBackendContract:
     def test_commit_job_failures_preserves_remaining_order(self):
         b = InMemoryStateBackend()
         b.enqueue_jobs([_job_snapshot(j) for j in ("first", "second", "third")])
-        assert b.commit_job_failures([("t::first", {"err": "x"}), ("t::second", {"err": "y"})]) is True
+        assert b.commit_job_failures([("t::first", {"err": "x"}), ("t::second", {"err": "y"})]) is None
         assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::third"]
         assert set(b.load_failed()) == {"t::first", "t::second"}
 
     def test_commit_job_failures_empty_is_noop(self):
         b = InMemoryStateBackend()
-        assert b.commit_job_failures([]) is True
+        assert b.commit_job_failures([]) is None
         assert b.load_failed() == {}
 
     def test_commit_skip_removes_stale_uid_only(self):
         b = InMemoryStateBackend()
         b.enqueue_jobs([_job_snapshot("stale"), _job_snapshot("live")])
-        assert b.commit_skip("t::stale") is True
+        assert b.commit_skip("t::stale") is None
         assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::live"]
         assert b.load_successes() == {} and b.load_failed() == {}
 

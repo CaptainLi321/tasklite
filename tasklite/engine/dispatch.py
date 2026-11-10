@@ -314,7 +314,7 @@ class DispatchMachine:
                 peek_snapshot, store.state, baseline_lookup=store.trusted_last_succeeded_at_us
             )
             if not should_run:
-                job_snapshot = store.state.pop_job(sched.runnable_idx)
+                job_snapshot = peek_snapshot
                 attempt_id = None
                 if store.backend.schema_version < TARGET_SCHEMA_VERSION:
                     try:

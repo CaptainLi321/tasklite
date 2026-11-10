@@ -340,12 +340,13 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
     assert "t_retry::j1" in failures
 
 
-def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path, backend):
     """停止后在途失败：下游依赖级联失败，独立未派发作业原样保持 pending。"""
     ready_file = tmp_path / "ready_fail"
     release_file = tmp_path / "release_fail"
 
-    p = TaskLite(backend="memory", max_workers=1)
+    p = TaskLite(backend=backend, state_path=tmp_path / "state.db", max_workers=1)
     p.register_task("t_fail", file_synced_fail_handler)
     p.register_task("t_downstream", success_handler)
     p.register_task("t_other", success_handler)
