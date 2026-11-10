@@ -137,6 +137,7 @@ class EngineRuntime:
             in_flight=self._in_flight,
             session=self._session,
             recovery=self._recovery,
+            completion=self._completion,
             tasks=config.tasks,
             classifier=config.classifier,
             output_roots=config.output_roots,

@@ -440,7 +440,7 @@ def test_pre_dispatch_cleanup_failure_settles_without_starting_worker(
     assert target.read_text(encoding="utf-8") == "valuable"
     failure = p._runtime.store.backend.load_failed()["work::one"]
     assert "Pre-deletion failed" in failure["error_message"]
-    assert failure["exception"]["type"] == cleanup_error.__name__
+    assert failure["result"]["exception"]["type"] == cleanup_error.__name__
     attempt, = p._runtime.store.backend.load_settled_attempts("work::one")
     assert attempt["outcome"] == "failure"
     assert attempt["attempt_no"] == 1

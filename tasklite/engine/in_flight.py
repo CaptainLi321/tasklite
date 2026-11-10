@@ -37,13 +37,11 @@ from .types import JobHandle
 
 @dataclass
 class InFlightJob:
-    """一个已派发到子进程、尚未 commit 的 job 的上下文。
+    """已进入 running、尚未提交结果的执行上下文。
 
-    由派发机器创建，传给收尾机器处理结果。内敛持有 ResourceLease 或
-    acquired 列表，提供自归还的 release_resources 接缝。
-    ``handle is None`` 表示伪 entry（崩溃恢复/abort 消费路径），此时
-    ``acquired=[]``；``started_monotonic`` 与 ``handle.timeout_at_monotonic`` 共同驱动看门狗
-    超时判定（timeout_seconds 语义）。
+    资源租约或 acquired 列表由 release_resources 幂等归还。
+    handle 为 None 时没有 worker，可携带前置操作失败时已获取的资源；
+    有 worker 时以 started_monotonic 和句柄期限驱动超时判定。
     """
 
     job_uid: str
@@ -73,7 +71,7 @@ class InFlightJob:
 
     @property
     def is_pseudo(self) -> bool:
-        """是否为伪条目（崩溃恢复或 abort 消费路径）。"""
+        """是否没有关联的 worker 句柄。"""
         return self.handle is None
 
     def release_resources(self, resource_mgr: ResourceManager | None = None) -> None:

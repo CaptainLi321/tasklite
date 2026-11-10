@@ -20,6 +20,7 @@ import pytest
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel, WorkerLaunchSpec
+from tasklite.engine.completion import CompletionMachine
 from tasklite.engine.dispatch import (
     DispatchKind,
     DispatchMachine,
@@ -136,6 +137,10 @@ class DispatchEnv:
             in_flight=self.in_flight,
             session=self.session,
             recovery=self.recovery,
+            completion=CompletionMachine(
+                store=self.store, channel=self.channel, resources=self.resources,
+                in_flight=self.in_flight, session=self.session,
+            ),
             tasks=self.tasks,
             classifier=ErrorClassifier(),
             output_roots=self.output_roots,

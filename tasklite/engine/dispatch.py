@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from ..models.task import Task
     from .admission import TriggerRegistry
     from .channel import ExecutionChannel
+    from .completion import CompletionMachine
     from .errorclass import ErrorClassifier
     from .in_flight import InFlightTracker
     from .recovery import RecoveryOrchestrator
@@ -69,7 +70,7 @@ from ..models.attempt import ATTEMPT_REQUEUED
 from ..models.context import JobContext
 from ..models.job import Job, JobRuntimeState
 from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
-from .channel import WorkerLaunchSpec, _WorkerLaunchCancelled
+from .channel import ExecutionResult, WorkerLaunchSpec, _WorkerLaunchCancelled
 from .errorclass import (
     ERR_DISPATCH_FAILURE,
     ERR_JOB_DEPENDENCY,
@@ -124,6 +125,7 @@ class DispatchMachine:
         in_flight: "InFlightTracker",
         session: "DispatchSession",
         recovery: "RecoveryOrchestrator",
+        completion: "CompletionMachine",
         tasks: "TaskSource",
         output_roots: "Path | Sequence[Path] | None",
         ipc_dir: str | None = None,
@@ -140,6 +142,7 @@ class DispatchMachine:
         self._in_flight = in_flight
         self._session = session
         self._recovery = recovery
+        self._completion = completion
         self._tasks = tasks
         self._classifier = classifier
         self._output_roots = output_roots
@@ -470,25 +473,30 @@ class DispatchMachine:
         try:
             _execute_pre_deletes(self._path_policy, pre_deletes)
         except (OSError, ValueError, NotImplementedError) as exc:
-            self._resources.release_all(acquired)
-            message = f"Pre-deletion failed: {exc}"
-            exception = {
-                "type": type(exc).__name__, "message": str(exc),
-                "traceback": traceback.format_exc(),
-            }
-            self._store.apply_failure(
-                job_uid,
-                {"error_message": message, "exception": exception},
+            entry = InFlightJob(
+                job_uid=job_uid,
                 job_snapshot=job_snapshot,
-                cascade=True,
-                attempt_no=attempt_no,
+                job=job,
+                acquired=acquired,
+                attempt_id=attempt_id,
                 execution_id=execution_id,
+                attempt_no=attempt_no,
                 run_id=self._session.run_id or "run",
-                started_at=started_at,
-                files={k: v.to_dict() for k, v in resolved_files.items()},
-                result={"message": message, "exception": exception},
+                active_files=dict(resolved_files),
+                active_file_sources=dict(job.files),
             )
+            self._in_flight.track(entry, state=store.state)
+            self._completion.settle_reaped([(entry, ExecutionResult(
+                message=f"Pre-deletion failed: {exc}",
+                exception={
+                    "type": type(exc).__name__, "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            ))])
             return None
+        except BaseException:
+            self._resources.release_all(acquired)
+            raise
 
         if not self._dispatch_allowed():
             self._resources.release_all(acquired)
@@ -522,6 +530,8 @@ class DispatchMachine:
             raise
         except KeyboardInterrupt:
             self._resources.release_all(acquired)
+            if store.backend.schema_version >= TARGET_SCHEMA_VERSION:
+                raise
             self._handle_interrupt(job_uid, job_snapshot)
             return None
         except Exception as e:

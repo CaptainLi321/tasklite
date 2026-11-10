@@ -1,6 +1,6 @@
 """v2 完成机器：结果提交、输出清理、资源释放与在飞结算。
 
-``complete_job`` 是子进程结果的唯一收尾入口，``apply_result`` 承载
+``complete_job`` 是已进入 running 的执行结果的唯一收尾入口，``apply_result`` 承载
 retry/success/failure 三态事务提交。重试预算只统计本 Run 中显式
 ``TaskResult.retry`` 的消耗；候选来源与累计数量分开登记。
 
@@ -69,7 +69,7 @@ class CompletionMachine:
         self._resources = resources
         self._in_flight = in_flight
         self._session = session
-        self._pending_cleanup: dict[str, tuple[JobHandle, ExecutionResult, _PreparedCompletion]] = {}
+        self._pending_cleanup: dict[str, tuple[InFlightJob, ExecutionResult, _PreparedCompletion]] = {}
         self._fallback_retry_counts: dict[str, int] = {}
         self._fallback_retry_candidates: set[str] = set()
 
@@ -777,9 +777,11 @@ class CompletionMachine:
     # ── 批量结算 ──────────────────────────────────────────────────────
 
     def settle_reaped(
-        self, reaped: Sequence[tuple[JobHandle, ExecutionResult]]
+        self, reaped: Sequence[tuple[JobHandle | InFlightJob, ExecutionResult]]
     ) -> int:
-        """统一结算从执行通道收割的已完成作业列表。
+        """统一结算通道结果与未启动 worker 的执行失败。
+
+        无 worker 的条目直接携带执行身份，不制造句柄或启动超时计时。
 
         为每个已完成作业原子执行：
         1. 提取在飞条目；
@@ -792,10 +794,11 @@ class CompletionMachine:
         completion_error: BaseException | None = None
         pending_results = list(self._pending_cleanup.values())
         candidates = [*pending_results, *((h, r, None) for h, r in reaped)]
-        for handle, result, prepared in candidates:
-            entry = self._in_flight.get(handle.job_uid)
+        for source, result, prepared in candidates:
+            entry = self._in_flight.get(source.job_uid)
             if entry is None:
                 continue
+            handle = entry.handle
             deferred = False
             completion_started = False
             try:
@@ -805,11 +808,12 @@ class CompletionMachine:
                     try:
                         self._authorize_cleanup(entry, result, prepared.active_files)
                     except _CleanupAuthorizationPending:
-                        self._pending_cleanup[handle.job_uid] = (handle, result, prepared)
-                        handle.pause_timeout()
+                        self._pending_cleanup[entry.job_uid] = (entry, result, prepared)
+                        if handle is not None:
+                            handle.pause_timeout()
                         deferred = True
                         continue
-                elif handle.job_uid in self._pending_cleanup:
+                elif handle is not None and entry.job_uid in self._pending_cleanup:
                     try:
                         if handle.process.is_alive():
                             deferred = True
@@ -826,8 +830,8 @@ class CompletionMachine:
                 completion_error = completion_error or error
             finally:
                 if not deferred:
-                    self._pending_cleanup.pop(handle.job_uid, None)
-                    self._in_flight.settle(handle.job_uid, state=store.state)
+                    self._pending_cleanup.pop(entry.job_uid, None)
+                    self._in_flight.settle(entry.job_uid, state=store.state)
         if completion_error is not None:
             raise completion_error
         return settled_count
