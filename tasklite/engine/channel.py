@@ -43,9 +43,7 @@ from .types import AuthorizationOutcome, JobHandle
 
 logger = logging.getLogger("tasklite")
 
-_KEY_TRACEBACK = "traceback"
 _RESULT_DIR_ENV = "TASKLITE_IPC_DIR"
-_SIGKILL: int | None = getattr(signal, "SIGKILL", None)
 
 
 def _parse_spawned_jobs(raw_spawned_jobs: Any) -> tuple[list[Job], str | None]:
@@ -113,11 +111,11 @@ def _decode_success_branch(
     """
     if "metadata" not in res:
         logger.error(f"Corrupt result payload for {job.uid}: missing 'metadata' key")
-        return False, "CORRUPT_RESULT_FILE: missing metadata", {}, [], {}
+        return False, "Invalid worker result: missing metadata", {}, [], {}
     raw_msg = res.get("message")
     if raw_msg is not None and type(raw_msg) is not str:
         logger.error(f"Corrupt result payload for {job.uid}: invalid 'message' type")
-        return False, "CORRUPT_RESULT_FILE: invalid message type", {}, [], {}
+        return False, "Invalid worker result: invalid message type", {}, [], {}
     try:
         result_metadata = validate_strict_json_object(
             res["metadata"], field_name="metadata"
@@ -126,7 +124,7 @@ def _decode_success_branch(
         logger.error(f"Result decode failed for {job.uid}: {e}")
         return (
             False,
-            f"CORRUPT_RESULT_FILE: decode failed: {e}",
+            f"Invalid worker result: decode failed: {e}",
             {},
             [],
             {},
@@ -149,12 +147,11 @@ def _unexpected_result_fields(res: dict[str, Any], allowed: frozenset[str]) -> l
 
 
 def _corrupt_result(job: Job, reason: str) -> "ExecutionResult":
-    message = f"CORRUPT_RESULT_FILE: {reason}"
+    message = f"Invalid worker result: {reason}"
     logger.error(f"Invalid worker result for {job.uid}: {reason}")
     return ExecutionResult(
         success=False,
         message=message,
-        result_metadata={"error_message": message},
     )
 
 
@@ -184,7 +181,7 @@ def _decode_ipc_result(
             _decode_success_branch(res, job)
         )
         if not success:
-            return _corrupt_result(job, str(message).removeprefix("CORRUPT_RESULT_FILE: "))
+            return _corrupt_result(job, str(message).removeprefix("Invalid worker result: "))
         return ExecutionResult(
             success=True,
             result_metadata=result_metadata,
@@ -383,24 +380,20 @@ class ExecutionResult:
 
     @property
     def metadata(self) -> dict[str, Any]:
-        """业务结果元数据（与 result_metadata 同源，不含框架保留键）。"""
+        """业务结果元数据，完整保留用户合法键名。"""
         return self.result_metadata
 
     @property
     def error(self) -> str:
         """结果说明或错误消息。"""
-        if self.message is not None:
-            return self.message
-        raw = self.result_metadata.get("error_message")
-        return str(raw) if raw is not None else ""
+        return self.message if self.message is not None else ""
 
     @property
     def traceback(self) -> str | None:
         """结构化异常堆栈（无异常时为 None）。"""
         if isinstance(self.exception, dict):
             return self.exception.get("traceback")
-        raw_tb = self.result_metadata.get(_KEY_TRACEBACK)
-        return str(raw_tb) if raw_tb is not None else None
+        return None
 
 
 @dataclass(frozen=True)
@@ -917,31 +910,27 @@ class ExecutionChannel:
     ) -> ExecutionResult:
         """构造进程终止（崩溃/超时）但无有效结果时的失败证据。"""
         exitcode = getattr(p, "exitcode", None)
-        metadata: dict[str, Any] = {}
+        annotations: dict[str, Any] = {}
         if is_timeout:
-            message = f"TIMEOUT ({handle.timeout_seconds}s)"
-            metadata["timed_out"] = True
+            message = f"Worker timed out after {handle.timeout_seconds}s"
+            annotations["timed_out"] = True
         elif isinstance(exitcode, int) and not isinstance(exitcode, bool) and exitcode < 0:
             try:
                 signal_name = signal.Signals(-exitcode).name
             except (ValueError, AttributeError):
                 signal_name = f"SIGNO{-exitcode}"
-            message = f"PROCESS_SIGNAL_DEATH: killed by {signal_name} ({exitcode})"
-            metadata.update({
-                "signal": signal_name,
-                "oom_hint": _SIGKILL is not None and -exitcode == _SIGKILL,
-            })
+            message = f"Worker exited on signal {signal_name} ({exitcode}) without a result"
+            annotations["signal"] = signal_name
         elif isinstance(exitcode, int) and not isinstance(exitcode, bool) and exitcode > 0:
-            message = f"PROCESS_CRASH_EXITCODE_{exitcode}"
+            message = f"Worker exited with code {exitcode} without a result"
         else:
-            message = "NO_IPC_RESULT: worker exited without a result frame"
-        metadata["error_message"] = message
+            message = "Worker exited without a result frame"
         if isinstance(exitcode, int) and not isinstance(exitcode, bool):
-            metadata["exitcode"] = exitcode
+            annotations["exitcode"] = exitcode
         return ExecutionResult(
             success=False,
-            result_metadata=metadata,
             message=message,
+            annotations=annotations,
         )
 
     def abort_in_flight(self, handles: Sequence[JobHandle]) -> AbortOutcome:

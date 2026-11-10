@@ -28,6 +28,7 @@ def test_business_keys_do_not_control_execution_records(pipeline, success, messa
         "annotations": annotations, "result": "业务结果", "job_snapshot": "业务快照",
         "files": "业务文件", "metadata": {"nested": [None, True, 1, "中文"]},
         "error_message": "JOB_DEPENDENCY", "error_category": "manual",
+        "traceback": "业务堆栈", "exitcode": 42, "timed_out": True, "signal": "业务信号",
         "message": "业务消息键", "exception": {"type": "业务异常"},
         "run_id": "业务运行", "attempt_no": 999, "started_at": "业务开始",
         "settled_at": "业务结束", "artifacts": "业务产物", "inputs": "业务输入",

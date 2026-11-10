@@ -286,12 +286,12 @@ class TestRealSubprocessFaultScenarios:
         failed = p._runtime.store.backend.load_failed()
         assert "hung::item_watchdog" in failed
         error = failed["hung::item_watchdog"]["error_message"]
-        assert error.startswith("TIMEOUT"), f"应归因超时，got: {error}"
+        assert "timed out" in error, f"应归因超时，got: {error}"
         assert "hung::item_watchdog" not in p._runtime.store.backend.load_successes()
 
         attempts = p._runtime.store.backend.load_attempts("hung::item_watchdog")
         assert [a.outcome for a in attempts] == ["failed"]
-        assert attempts[0].error_message is not None and "TIMEOUT" in attempts[0].error_message
+        assert attempts[0].error_message is not None and "timed out" in attempts[0].error_message
 
     def test_real_subprocess_interval_resource_paces(self, tmp_path):
         """IntervalResource：首作业获取后推进下次可用时间，后续作业按间隔派发。"""

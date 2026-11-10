@@ -290,11 +290,19 @@ def test_process_death_is_single_failure_without_implicit_retry(
     assert attempts[0].outcome == "failed"
     assert pipeline._runtime.store.backend.load_successes() == {}
     expected = {
-        "kill": "PROCESS_SIGNAL_DEATH",
-        "crash": "PROCESS_CRASH_EXITCODE_7",
-        "timeout": "TIMEOUT",
+        "kill": "signal",
+        "crash": "code 7",
+        "timeout": "timed out",
     }[mode]
-    assert expected in failed["work::" + mode]["error_message"]
+    result = failed["work::" + mode]["result"]
+    assert expected in result["message"]
+    assert result["metadata"] == {}
+    assert result["exception"] is None
+    assert "oom_hint" not in result["annotations"]
+    if mode == "timeout":
+        assert result["annotations"]["timed_out"] is True
+    else:
+        assert result["annotations"]["exitcode"] == (-9 if mode == "kill" else 7)
     if mode == "kill":
         assert not (tmp_path / "output" / "authorized.txt").exists()
         assert (tmp_path / "output" / "retained.txt").exists()

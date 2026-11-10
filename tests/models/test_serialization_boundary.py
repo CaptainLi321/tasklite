@@ -112,5 +112,5 @@ def test_worker_rejects_unsupported_envelope_fields(unsupported, payload):
     )
     assert not result.success
     assert not result.retry_requested
-    assert "CORRUPT_RESULT_FILE" in (result.message or "")
+    assert "Invalid worker result" in (result.message or "")
     assert unsupported in (result.message or "")

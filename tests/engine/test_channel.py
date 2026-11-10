@@ -350,7 +350,7 @@ class TestDecodeIpcResultDefense:
         del res["metadata"]
         result = _decode(res)
         assert result.success is False
-        assert "CORRUPT_RESULT_FILE: missing metadata" in (result.message or "")
+        assert "Invalid worker result: missing metadata" in (result.message or "")
 
     def test_success_decode_crash_converted_to_corrupt_result(self, monkeypatch):
         """解码异常兜底：success 分支解码/归一化段意外异常 → 转损坏结果。"""
@@ -360,7 +360,7 @@ class TestDecodeIpcResultDefense:
         )
         result = _decode(dict(_BASE_OK))
         assert result.success is False
-        assert (result.message or "").startswith("CORRUPT_RESULT_FILE: decode failed")
+        assert (result.message or "").startswith("Invalid worker result: decode failed")
 
     def test_new_jobs_scalar_marks_failed_not_crash(self):
         for scalar in (7, 3.5, True):
@@ -409,6 +409,7 @@ class TestDecodeIpcResultDefense:
         result = _decode({"status": "interrupted", "error_message": "sig"})
         assert result.success is False
         assert result.retry_requested is False
+        assert result.result_metadata == {}
         assert "unknown status 'interrupted'" in (result.message or "")
 
     def test_fatal_status_marks_failed(self):
@@ -427,18 +428,21 @@ class TestDecodeIpcResultDefense:
         result = _decode({"raw": "not-a-result-dict"})
         assert result.success is False
         assert result.retry_requested is False
+        assert result.result_metadata == {}
         assert "missing status" in (result.message or "")
 
     def test_empty_payload_marks_failed_without_retry(self):
         result = _decode({})
         assert result.success is False
         assert result.retry_requested is False
+        assert result.result_metadata == {}
         assert "missing status" in (result.message or "")
 
     def test_result_payload_rejects_unknown_fields(self):
         result = _decode(dict(_BASE_OK, unexpected_field=[]))
         assert result.success is False
         assert result.retry_requested is False
+        assert result.result_metadata == {}
         assert "unsupported fields" in (result.message or "")
 
     def test_decode_leaves_output_validation_to_completion(self):
@@ -507,27 +511,30 @@ class TestBuildTerminalFailureDefense:
         )
         assert result.success is False
         assert result.retry_requested is False
-        assert "TIMEOUT" in result.result_metadata["error_message"]
-        assert result.result_metadata["timed_out"] is True
+        assert result.result_metadata == {}
+        assert "timed out" in (result.message or "")
+        assert result.annotations["timed_out"] is True
 
-    def test_signal_death_classified(self):
+    def test_signal_death_preserves_evidence(self):
         result = ExecutionChannel._build_terminal_failure(
             SimpleNamespace(exitcode=-11), self._handle(), is_timeout=False,
         )
         assert result.success is False
         assert result.retry_requested is False
-        assert "PROCESS_SIGNAL_DEATH" in result.result_metadata["error_message"]
-        assert result.result_metadata["signal"] == "SIGSEGV"
-        assert result.result_metadata["exitcode"] == -11
+        assert result.result_metadata == {}
+        assert "SIGSEGV" in (result.message or "")
+        assert result.annotations["signal"] == "SIGSEGV"
+        assert result.annotations["exitcode"] == -11
 
-    def test_clean_exit_without_result_classified(self):
+    def test_clean_exit_without_result_preserves_evidence(self):
         result = ExecutionChannel._build_terminal_failure(
             SimpleNamespace(exitcode=0), self._handle(), is_timeout=False,
         )
         assert result.success is False
         assert result.retry_requested is False
-        assert "NO_IPC_RESULT" in result.result_metadata["error_message"]
-        assert result.result_metadata["exitcode"] == 0
+        assert result.result_metadata == {}
+        assert "without a result" in (result.message or "")
+        assert result.annotations["exitcode"] == 0
 
 
 class TestWatchdogReap:
@@ -583,8 +590,9 @@ class TestWatchdogReap:
         assert len(completed) == 1
         result = completed[0][1]
         assert result.success is False
-        assert result.result_metadata["error_message"].startswith("TIMEOUT")
+        assert "timed out" in (result.message or "")
         assert result.retry_requested is False
+        assert result.result_metadata == {}
 
     def test_join_window_exit_remains_timeout(self, tmp_path):
         """截止时刻无结果即归因超时，进程在 join 窗口退出不改变原因。"""
@@ -596,8 +604,9 @@ class TestWatchdogReap:
         )
         completed = ExecutionChannel(tmp_path).reap_completed([handle])
         result = completed[0][1]
-        assert "TIMEOUT" in result.result_metadata["error_message"]
+        assert "timed out" in (result.message or "")
         assert result.retry_requested is False
+        assert result.result_metadata == {}
 
     @pytest.mark.parametrize("exitcode", [-9, 1])
     def test_join_window_death_does_not_restore_retry(
@@ -614,7 +623,8 @@ class TestWatchdogReap:
         result = completed[0][1]
         assert result.success is False
         assert result.retry_requested is False
-        assert "TIMEOUT" in result.result_metadata["error_message"]
+        assert result.result_metadata == {}
+        assert "timed out" in (result.message or "")
 
     def test_completed_result_reaped_before_deadline(self, tmp_path):
         """结果已到达且进程仍活 → 直接按结果收割（不等 timeout_at_monotonic）。"""
@@ -773,6 +783,7 @@ class TestAbortInFlight:
         result = outcome.completed[0][1]
         assert result.success is False
         assert result.retry_requested is False
+        assert result.result_metadata == {}
         assert "unknown status 'interrupted'" in (result.message or "")
         assert outcome.cancelled == []
 
@@ -797,3 +808,45 @@ class TestCleanupInFlight:
         channel.cleanup_in_flight([handle])
 
         assert _EXECUTION_ID not in channel._results
+
+
+@pytest.mark.parametrize("status", ["success", "failure", "retry"])
+def test_business_error_fields_are_not_framework_evidence(status):
+    metadata = {
+        "error_message": "业务错误", "traceback": "业务堆栈",
+        "exitcode": "业务退出码", "timed_out": "业务超时",
+        "signal": "业务信号", "annotations": {"timed_out": True},
+    }
+    payload = {"status": status, "metadata": metadata}
+    if status == "retry":
+        payload["consume_budget"] = True
+    result = _decode(payload)
+    assert result.result_metadata == metadata
+    assert result.error == ""
+    assert result.traceback is None
+    assert result.annotations == {}
+    result.message = "实际说明"
+    result.exception = {"type": "ValueError", "message": "异常", "traceback": "实际堆栈"}
+    assert result.error == "实际说明"
+    assert result.traceback == "实际堆栈"
+
+
+@pytest.mark.parametrize("exitcode", [None, False, 0, 42, -9, -99])
+def test_terminal_failure_only_records_observed_exit_evidence(exitcode):
+    result = ExecutionChannel._build_terminal_failure(
+        SimpleNamespace(exitcode=exitcode), TestBuildTerminalFailureDefense._handle(),
+        is_timeout=False,
+    )
+    assert result.success is False
+    assert result.retry_requested is False
+    assert result.result_metadata == {}
+    assert result.exception is None
+    assert "oom_hint" not in result.annotations
+    if type(exitcode) is int:
+        assert result.annotations["exitcode"] == exitcode
+    else:
+        assert "exitcode" not in result.annotations
+    if type(exitcode) is int and exitcode < 0:
+        assert result.annotations["signal"]
+    else:
+        assert "signal" not in result.annotations
