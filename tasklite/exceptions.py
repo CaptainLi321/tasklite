@@ -15,25 +15,7 @@ class _ArtifactIOError(BaseException):
     """
 
 
-class _CommitCrashSignal(BaseException):
-    """内部信号：commit 失败后已重入队，需立即崩溃。
-
-    不变式：继承 ``BaseException``（而非 ``Exception``）——防止用户
-    handler 的 ``except Exception`` 误吞崩溃信号。
-    """
-
-    pass
-
-
-class _JobTerminated(BaseException):
-    """内部信号：当前 job 已终结（失败档案阈值命中），需立即停止处理。"""
-
-    pass
-
-
 __all__ = [
     "TaskLiteError",
     "_ArtifactIOError",
-    "_CommitCrashSignal",
-    "_JobTerminated",
 ]

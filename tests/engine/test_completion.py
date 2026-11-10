@@ -2,7 +2,7 @@
 
 覆盖：complete_job 成功/失败/重试生命周期（资源释放、清理模式、收尾
 钩子恰好一次）、显式重试预算判定与零预算显式重试、动态子任务去重与坏
-子作业拒绝、3-strike 终结的防双触发、
+子作业拒绝、
 settle_reaped / settle_aborted 批量结算。
 """
 
@@ -36,6 +36,10 @@ from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
 
 
+def _identity(entry):
+    return {"execution_id": entry.execution_id, "run_id": entry.run_id, "attempt_no": entry.attempt_no}
+
+
 class StubSession:
     """运行会话结构契约桩（run_id）。"""
 
@@ -64,7 +68,7 @@ class CompletionEnv:
         if extra_resources:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
-        self.backend = InMemoryStateBackend()
+        self.backend = InMemoryStateBackend(schema_version=6)
         self.stats = defaultdict(int)
         self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.tasks = TaskRegistry()
@@ -99,10 +103,16 @@ class CompletionEnv:
         job: Job,
         *,
         lease=None,
-        attempt_id=None,
+        execution_id=None,
+        run_id=None,
+        attempt_no=None,
         acquired=None,
         files=None,
     ) -> InFlightJob:
+        if execution_id is None:
+            identity = self.start_execution(job)
+            execution_id, run_id, attempt_no = identity["execution_id"], identity["run_id"], identity["attempt_no"]
+        job.attempt_no = attempt_no
         snapshot = job.to_dict()
         self.store.finalize_intake_snapshot(snapshot, job.task_type)
         job.__dict__.update(Job.from_dict(snapshot).__dict__)
@@ -114,26 +124,25 @@ class CompletionEnv:
             job=job,
             lease=lease,
             acquired=acquired if acquired is not None else [],
-            attempt_id=attempt_id,
+            execution_id=execution_id,
+            run_id=run_id,
+            attempt_no=attempt_no,
             active_files=dict(files if files is not None else job.files),
             active_file_sources=dict(files if files is not None else job.files),
         )
         self.in_flight.track(entry, state=self.store.state)
         return entry
 
-    def open_attempt(self, job: Job, *, attempt_no=1, activation_no=1) -> int:
-        from tasklite.models.attempt import AttemptRecord
 
-        record = AttemptRecord(
-            job_uid=job.uid,
-            activation_no=activation_no,
-            attempt_no=attempt_no,
-            execution_id=f"{self.session.run_id}.1",
-            run_id=self.session.run_id,
-            started_at="2026-01-01T00:00:00+00:00",
-            outcome="running",
+    def start_execution(self, job):
+        self.backend.enqueue_jobs([job.to_dict()])
+        next_no = self.backend.get_attempt_sequence(job.uid) + 1
+        execution_id = f"{self.session.run_id}.{next_no}"
+        attempt_no = self.backend.mark_job_running(
+            job.uid, execution_id=execution_id, run_id=self.session.run_id,
+            started_at="2026-01-01T00:00:00Z",
         )
-        return self.backend.append_attempt(record)
+        return {"execution_id": execution_id, "run_id": self.session.run_id, "attempt_no": attempt_no}
 
     def make_handle(self, uid: str) -> JobHandle:
         return JobHandle(
@@ -169,8 +178,8 @@ class TestCompleteJobSuccess:
                 ),
             },
         )
-        attempt_id = env.open_attempt(job)
-        entry = env.track_entry(job, attempt_id=attempt_id)
+        identity = env.start_execution(job)
+        entry = env.track_entry(job, **identity)
         env.store.authorizer = lambda *_args: True
 
         assert env.resources["gpu"].used == 2.0
@@ -190,12 +199,12 @@ class TestCompleteJobSuccess:
             ("t::j1", AttemptOutcome(success=True, will_retry=False,
                                     metadata={"score": 100}))
         ]
-        assert env.backend.load_attempts("t::j1")[-1].outcome == "succeeded"
+        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "success"
 
     def test_cursor_updates_applied(self, tmp_path):
         env = CompletionEnv(tmp_path)
         job = Job("t", "j1")
-        entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+        entry = env.track_entry(job, **env.start_execution(job))
 
         env.completion.complete_job(
             entry,
@@ -229,8 +238,8 @@ class TestCompleteJobFailure:
                 ),
             },
         )
-        attempt_id = env.open_attempt(job)
-        entry = env.track_entry(job, attempt_id=attempt_id)
+        identity = env.start_execution(job)
+        entry = env.track_entry(job, **identity)
         env.store.authorizer = lambda *_args: True
 
         env.completion.complete_job(
@@ -242,7 +251,7 @@ class TestCompleteJobFailure:
         assert env.stats["failed"] == 1
         assert env.stats["cascade_failed"] == 1
         assert not partial.exists()
-        assert env.backend.load_attempts("t::j1")[-1].outcome == "failed"
+        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "failure"
         finish_by_uid = {uid: fin for uid, fin in env.hooks}
         assert finish_by_uid["t::j1"].success is False
         assert finish_by_uid["t::j1"].will_retry is False
@@ -254,8 +263,8 @@ class TestRetryBudget:
     def test_business_retry_advances_attempt_no(self, tmp_path):
         env = CompletionEnv(tmp_path)
         job = Job("t", "j1", max_retries_per_run=2)
-        attempt_id = env.open_attempt(job)
-        entry = env.track_entry(job, attempt_id=attempt_id)
+        identity = env.start_execution(job)
+        entry = env.track_entry(job, **identity)
 
         result = ExecutionResult(
             retry_requested=True, message="connection blip"
@@ -268,7 +277,7 @@ class TestRetryBudget:
         assert env.store.state.queue[0]["first_enqueued_at"] == job.first_enqueued_at
         rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
         assert rt.last_retry_error == "connection blip"
-        assert env.backend.load_attempts("t::j1")[-1].outcome == "requeued"
+        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "retry"
         assert env.hooks[-1] == (
             "t::j1",
             AttemptOutcome(success=False, will_retry=True, metadata={}),
@@ -285,7 +294,7 @@ class TestRetryBudget:
 
         env.completion.apply_result(
             "t::j1", job, job_snapshot,
-            ExecutionResult(retry_requested=True, message="x"),
+            ExecutionResult(retry_requested=True, message="x"), **_identity(entry),
         )
         assert env.store.state.queue[0]["custom_note"] == "keep-me"
         assert env.store.state.queue[0]["resources"] == {"__workers__": 1.0}
@@ -295,12 +304,14 @@ class TestRetryBudget:
 
     def test_budget_exhaustion_archives(self, tmp_path):
         env = CompletionEnv(tmp_path)
-        # attempt_no=2 且已消耗 1 次重试：max_retries_per_run=1 预算已耗尽
-        job = Job._restore("t", "j1", max_retries_per_run=1, attempt_no=2)
-        job.runtime.record_retry_error("first failure")
-        env.completion._record_retry(job.uid)
-        attempt_id = env.open_attempt(job, attempt_no=2)
-        entry = env.track_entry(job, attempt_id=attempt_id)
+        job = Job("t", "j1", max_retries_per_run=1)
+        first = env.track_entry(job)
+        env.completion.complete_job(first, ExecutionResult(
+            retry_requested=True, message="first failure",
+        ))
+        job = Job.from_dict(env.store.state.pop_job(0))
+        identity = env.start_execution(job)
+        entry = env.track_entry(job, **identity)
         entry.job_snapshot["runtime"] = job.runtime.to_dict()
 
         result = ExecutionResult(retry_requested=True, message="second")
@@ -312,14 +323,20 @@ class TestRetryBudget:
         assert env.store.state.failed["t::j1"]["last_retry_error"] == "first failure"
         assert env.store.state.failed["t::j1"]["retry_error"] == "second"
         assert env.stats["failed"] == 1
-        assert env.backend.load_attempts("t::j1")[-1].outcome == "failed"
+        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "failure"
 
     def test_explicit_zero_budget_retry_advances_attempt_no(self, tmp_path):
         """显式零预算重试不受预算限制，但编号仍推进。"""
         env = CompletionEnv(tmp_path)
-        job = Job._restore("t", "j1", max_retries_per_run=0, attempt_no=5)
-        attempt_id = env.open_attempt(job, attempt_no=5)
-        entry = env.track_entry(job, attempt_id=attempt_id)
+        job = Job("t", "j1", max_retries_per_run=0)
+        for _ in range(4):
+            previous = env.track_entry(job)
+            env.completion.complete_job(previous, ExecutionResult(
+                retry_requested=True, consume_budget=False,
+            ))
+            env.store.state.pop_job(0)
+        identity = env.start_execution(job)
+        entry = env.track_entry(job, **identity)
 
         result = ExecutionResult(
             retry_requested=True,
@@ -333,47 +350,9 @@ class TestRetryBudget:
         assert env.store.state.queue[0]["attempt_no"] == 6
         rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
         assert rt.last_retry_error == "suppressed failure"
-        assert env.stats["retried"] == 1
+        assert env.stats["retried"] == 5
         assert env.stats["interrupted_reruns"] == 0
         assert env.stats["rate_limited_reruns"] == 0
-
-
-class TestThreeStrikeTermination:
-    """3-strike 终结路径的防双触发。"""
-
-    def test_strike_termination_hook_exactly_once(self, tmp_path):
-        class StrikeBackend:
-            """commit_job_success 恒失败、失败档案写入放行的注入桩。"""
-
-            def __init__(self, real):
-                self._real = real
-
-            def commit_job_success(self, *a, **k):
-                return False
-
-            def __getattr__(self, name):
-                return getattr(self._real, name)
-
-        env = CompletionEnv(tmp_path)
-        strike = StrikeBackend(env.backend)
-        env.store.set_backend(strike)
-
-        job = Job("t", "j1")
-        entry = env.track_entry(job)
-        # 预埋 2 次 commit 失败：本次 commit_job_success 失败即达 3-strike
-        job.runtime.commit_failures = 2
-        entry.job_snapshot["runtime"] = job.runtime.to_dict()
-
-        result = ExecutionResult(success=True, result_metadata={"score": 1})
-        env.completion.complete_job(entry, result)  # 不上抛 _JobTerminated
-
-        assert result.will_retry is False
-        assert "t::j1" in env.store.state.failed
-        assert env.store.state.failed["t::j1"]["error_message"] == "COMMIT_FAILURE"
-        # 钩子恰好一次：3-strike 分支已触发，尾部跳过
-        assert len(env.hooks) == 1
-        assert env.hooks[0][1].success is False
-        assert env.hooks[0][1].metadata["error_message"] == "COMMIT_FAILURE"
 
 
 class TestSpawnedJobs:
@@ -384,19 +363,19 @@ class TestSpawnedJobs:
         env = CompletionEnv(tmp_path)
         env.register_task("child")
         env.store.state.register_in_flight("child::x")
-        env.store.apply_success("child::x", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=env.open_attempt(Job("child", "x")))
+        env.store.apply_success("child::x", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **env.start_execution(Job("child", "x")))
         existing = env.store.normalize_spawned_job(Job("child", "x", trigger="always"))
         env.store.state.spawn_jobs([existing])
 
         parent = Job("parent", "p1")
-        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
+        entry = env.track_entry(parent, **env.start_execution(parent))
         env.completion.apply_result(
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
                 spawned_jobs=[Job("child", "x", trigger="always")],
             ),
-            attempt_id=entry.attempt_id,
+            **_identity(entry),
             entry=entry,
         )
         assert "parent::p1" in env.store.state.successes
@@ -407,11 +386,11 @@ class TestSpawnedJobs:
         env = CompletionEnv(tmp_path)
         env.store.state.register_in_flight("child::y")
         env.register_task("child")
-        env.store.apply_success("child::y", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=env.open_attempt(Job("child", "y")))
+        env.store.apply_success("child::y", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **env.start_execution(Job("child", "y")))
         # successes 命中 + every_run：spawn 放行（唯一终态历史行被替换语义）
 
         parent = Job("parent", "p1")
-        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
+        entry = env.track_entry(parent, **env.start_execution(parent))
         env.completion.apply_result(
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
@@ -419,7 +398,7 @@ class TestSpawnedJobs:
                 spawned_jobs=[Job("child", "y", trigger="always",
                               timeout_seconds=29, payload={"timeout_seconds": "业务时限"})],
             ),
-            attempt_id=entry.attempt_id,
+            **_identity(entry),
         )
         assert "parent::p1" in env.store.state.successes
         assert "child::y" in env.store.state.queue_uids
@@ -431,14 +410,14 @@ class TestSpawnedJobs:
         env = CompletionEnv(tmp_path)
         parent = Job("parent", "p1")
         env.register_task("child")
-        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
+        entry = env.track_entry(parent, **env.start_execution(parent))
         env.completion.apply_result(
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
                 success=True,
                 spawned_jobs=[Job("child", "a"), Job("child", "a")],
             ),
-            attempt_id=entry.attempt_id,
+            **_identity(entry),
         )
         rows = [jd for jd in env.store.state.queue if jd["job_id"] == "a"]
         assert len(rows) == 1
@@ -450,7 +429,7 @@ class TestSpawnedJobs:
             env.store.normalize_and_validate_job(Job("known", "live")),
         ])
         parent = Job("parent", "p1")
-        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
+        entry = env.track_entry(parent, **env.start_execution(parent))
         assert entry.known_job_uids == frozenset()
 
         env.completion.apply_result(
@@ -463,7 +442,7 @@ class TestSpawnedJobs:
                     Job("child", "future", depends_on=["known::live"]),
                 ],
             ),
-            attempt_id=entry.attempt_id,
+            **_identity(entry),
             entry=entry,
         )
 
@@ -484,7 +463,7 @@ class TestSpawnedJobs:
         child = Job("child", "bad")
         child.payload = bad_payload
         parent = Job("parent", "p1")
-        entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
+        entry = env.track_entry(parent, **env.start_execution(parent))
         env.completion.apply_result(
             "parent::p1", parent, entry.job_snapshot,
             ExecutionResult(
@@ -493,13 +472,13 @@ class TestSpawnedJobs:
                 spawned_jobs=[Job("child", "valid"), child],
                 cursor_updates={"offset": "999"},
             ),
-            attempt_id=entry.attempt_id,
+            **_identity(entry),
         )
         assert "parent::p1" not in env.store.state.successes
         assert "parent::p1" in env.store.state.failed
         assert "Invalid spawned job" in env.store.state.failed["parent::p1"]["error_message"]
         assert "child::bad" not in env.store.state.failed
-        assert env.backend.load_attempts("child::bad") == []
+        assert env.backend.load_settled_attempts("child::bad") == []
         assert env.backend.load_cursors() == {}
         assert env.store.state.queue == []
 
@@ -514,7 +493,7 @@ class TestSuspensionApplication:
         assert cap.used == 1.0
 
         job = Job("t", "j1", resources={"slots": 1.0})
-        entry = env.track_entry(job, attempt_id=env.open_attempt(job), acquired=[("slots", 1.0)])
+        entry = env.track_entry(job, **env.start_execution(job), acquired=[("slots", 1.0)])
 
         env.completion.complete_job(
             entry,
@@ -539,12 +518,12 @@ class TestIdentityVacuity:
     def test_pseudo_entry_skips_assertion(self, tmp_path):
         env = CompletionEnv(tmp_path)
         job = Job("t", "j1")
-        aid = env.open_attempt(job)
+        aid = env.start_execution(job)
         env.completion.apply_result(
             "t::j1", job, job.to_dict(),
             ExecutionResult(success=True),
             expect_in_flight=False,
-            attempt_id=aid,
+            **aid,
         )
         assert "t::j1" in env.store.state.successes
 
@@ -555,10 +534,10 @@ class TestSettleReaped:
     def test_settle_reaped_mixed_outcomes(self, tmp_path):
         env = CompletionEnv(tmp_path)
         j1 = Job("t", "j1")
-        e1 = env.track_entry(j1, attempt_id=env.open_attempt(j1))
+        e1 = env.track_entry(j1, **env.start_execution(j1))
         e1.handle = env.make_handle("t::j1")
         j2 = Job("t", "j2")
-        e2 = env.track_entry(j2, attempt_id=env.open_attempt(j2))
+        e2 = env.track_entry(j2, **env.start_execution(j2))
         e2.handle = env.make_handle("t::j2")
 
         count = env.completion.settle_reaped([
@@ -570,7 +549,7 @@ class TestSettleReaped:
         assert "t::j2" in env.store.state.failed
         assert len(env.in_flight) == 0
         assert env.store.state.in_flight_uids == frozenset()
-        assert env.backend.load_attempts("t::j1")[-1].outcome == "succeeded"
+        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "success"
 
     def test_settle_reaped_skips_unknown_handle(self, tmp_path):
         env = CompletionEnv(tmp_path)
@@ -639,7 +618,7 @@ class TestHookFireDiscipline:
             lambda uid, *, outcome: (_ for _ in ()).throw(RuntimeError("boom"))
         )
         job = Job("t", "j1")
-        entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+        entry = env.track_entry(job, **env.start_execution(job))
         env.completion.complete_job(entry, ExecutionResult(success=True))
         assert env.stats["hook_errors"] == 1
         assert "t::j1" in env.store.state.successes
@@ -660,7 +639,7 @@ def test_completion_publishes_only_successful_framework_artifacts(tmp_path, succ
         "named",
         files={"report": FileSpec(output, role="output")},
     )
-    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+    entry = env.track_entry(job, **env.start_execution(job))
     result = ExecutionResult(
         success=success, result_metadata={"artifacts": {"forged": {"path": "/fake"}}},
     )
@@ -685,12 +664,12 @@ def test_symlink_output_settles_failure_without_false_success(tmp_path):
         "invalid_output",
         files={"primary": FileSpec(link, role="output")},
     )
-    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+    entry = env.track_entry(job, **env.start_execution(job))
     env.completion.complete_job(entry, ExecutionResult(success=True))
     assert env.backend.load_successes() == {}
     assert job.uid in env.backend.load_failed()
     assert "symlink" in env.backend.load_failed()[job.uid]["error_message"]
-    assert env.backend.load_attempts(job.uid)[0].outcome == "failed"
+    assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
     assert env.stats["succeeded"] == 0
     assert len(env.hooks) == 1 and env.hooks[0][1].success is False
 
@@ -711,7 +690,7 @@ def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, mon
             ),
         },
     )
-    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+    entry = env.track_entry(job, **env.start_execution(job))
     env.store.authorizer = lambda *_args: True
     commit = env.backend.commit_job_settlement
 
@@ -746,7 +725,7 @@ def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success)
         role="output",
         **cleanup_flag,
     )
-    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+    entry = env.track_entry(job, **env.start_execution(job))
     env.store.authorizer = lambda *_args: True
 
     def fail_cleanup(self, declaration, *, success):
@@ -756,7 +735,7 @@ def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success)
     env.completion.complete_job(entry, ExecutionResult(success=success))
     assert env.backend.load_successes() == {}
     assert "cleanup unavailable" in env.backend.load_failed()[job.uid]["error_message"]
-    assert env.backend.load_attempts(job.uid)[0].outcome == "failed"
+    assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
     assert len(env.hooks) == 1 and env.hooks[0][1].success is False
     assert output.exists()
 
@@ -858,7 +837,7 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
             ),
         },
     )
-    entry = env.track_entry(job, attempt_id=env.open_attempt(job))
+    entry = env.track_entry(job, **env.start_execution(job))
     env.store.authorizer = lambda *_args: True
 
     def denied(self, declaration, *, success):
@@ -875,7 +854,7 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
     assert env.store.state.queue == []
     assert job.uid in env.backend.load_failed()
     assert "Retry cleanup failed" in env.backend.load_failed()[job.uid]["error_message"]
-    assert env.backend.load_attempts(job.uid)[0].outcome == "failed"
+    assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
     assert len(env.hooks) == 1
     assert env.hooks[0][1].will_retry is False
 
@@ -902,7 +881,7 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
     )
     second = Job("t", "second")
     for job in (first, second):
-        env.track_entry(job, attempt_id=env.open_attempt(job))
+        env.track_entry(job, **env.start_execution(job))
     env.store.authorizer = lambda *_args: True
 
     def denied(self, declaration, *, success):
@@ -918,7 +897,7 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
     assert first.uid in env.backend.load_failed()
     assert "cleanup denied" in env.backend.load_failed()[first.uid]["error_message"]
     assert not env.store.state.queue
-    assert env.backend.load_attempts(first.uid)[0].outcome == "failed"
+    assert env.backend.load_settled_attempts(first.uid)[0]["outcome"] == "failure"
     assert env.resources["__workers__"].used == 0
     assert not env.in_flight
     assert {uid for uid, _ in env.hooks} == {first.uid, second.uid}
@@ -929,13 +908,13 @@ def test_inflight_duplicate_spawn_compares_effective_configuration(tmp_path):
     env = CompletionEnv(tmp_path)
     env.register_task("child")
     child = Job("child", "same", payload={"version": 1})
-    env.track_entry(child, attempt_id=env.open_attempt(child))
+    env.track_entry(child, **env.start_execution(child))
     parent = Job("parent", "one")
-    entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
+    entry = env.track_entry(parent, **env.start_execution(parent))
     env.completion.apply_result(
         parent.uid, parent, entry.job_snapshot,
         ExecutionResult(success=True, spawned_jobs=[Job("child", "same", payload={"version": 2})], cursor_updates={"offset": "bad"}),
-        attempt_id=entry.attempt_id,
+        **_identity(entry),
     )
     assert parent.uid in env.store.state.failed
     assert "configuration" in env.store.state.failed[parent.uid]["error_message"]

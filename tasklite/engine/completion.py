@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from .resource import ResourceManager
     from .store import StateStore
 
-from ..exceptions import TaskLiteError, _ArtifactIOError, _CommitCrashSignal, _JobTerminated
+from ..exceptions import TaskLiteError, _ArtifactIOError
 from ..models.job import Job, JobRuntimeState
 from ..models.artifact import ArtifactDeclaration, FileSpec
 from ..utils.artifact import ArtifactPathPolicy
@@ -221,7 +221,6 @@ class CompletionMachine:
         声明只在业务结算完成后删除；提交前异常保留声明以便诊断。
         """
         uid = entry.job_uid
-        terminated = False
         try:
             self.apply_result(
                 uid,
@@ -230,7 +229,6 @@ class CompletionMachine:
                 result,
                 started_monotonic=entry.started_monotonic,
                 expect_in_flight=(entry.handle is not None),
-                attempt_id=entry.attempt_id,
                 execution_id=entry.execution_id if entry.execution_id is not None else (
                     entry.handle.execution_id if entry.handle is not None else None
                 ),
@@ -240,14 +238,6 @@ class CompletionMachine:
                 entry=entry,
                 prepared=prepared,
             )
-        except _JobTerminated:
-            # commit 连续失败达阈值 → job 已失败档案终结（正常终态）。
-            # store 的 3-strike 分支已触发钩子（带完整熔断 meta），此处
-            # 标记终结并跳过尾部触发——否则同一 job 触发两次钩子（第二次
-            # success 标志还与实际终态矛盾）。「每个 attempt 收尾钩子恰好
-            # 调用一次」是收尾出口的明文承诺。
-            result.will_retry = False
-            terminated = True
         finally:
             # 资源释放（无论成功/失败/重试/崩溃，由 entry 自归还）
             entry.release_resources(self._resources)
@@ -255,15 +245,14 @@ class CompletionMachine:
         # 收尾钩子在统计更新之后（apply_result 已 +1）触发——钩子内读统计
         # 一致；单一出口经 store.fire_attempt_finished（异常隔离 + 计数），
         # 正常提交与伪 entry 都经此触发。
-        if not terminated:
-            self._store.fire_attempt_finished(
-                uid,
-                outcome=AttemptOutcome(
-                    success=bool(result.success),
-                    will_retry=result.will_retry,
-                    metadata=dict(result.result_metadata),
-                ),
-            )
+        self._store.fire_attempt_finished(
+            uid,
+            outcome=AttemptOutcome(
+                success=bool(result.success),
+                will_retry=result.will_retry,
+                metadata=dict(result.result_metadata),
+            ),
+        )
 
     def _prepare_completion(
         self, uid: str, job: Job, result: ExecutionResult,
@@ -339,7 +328,6 @@ class CompletionMachine:
         *,
         started_monotonic: float | None = None,
         expect_in_flight: bool = True,
-        attempt_id: int | None = None,
         execution_id: str | None = None,
         attempt_no: int = 1,
         run_id: str | None = None,
@@ -464,7 +452,6 @@ class CompletionMachine:
                 job,
                 job_snapshot,
                 result,
-                attempt_id=attempt_id,
                 execution_id=execution_id,
                 attempt_no=attempt_no,
                 run_id=run_id,
@@ -477,7 +464,6 @@ class CompletionMachine:
                 job_snapshot,
                 result,
                 started_monotonic=started_monotonic,
-                attempt_id=attempt_id,
                 execution_id=execution_id,
                 attempt_no=attempt_no,
                 run_id=run_id,
@@ -491,7 +477,6 @@ class CompletionMachine:
                 job_snapshot,
                 result,
                 started_monotonic=started_monotonic,
-                attempt_id=attempt_id,
                 execution_id=execution_id,
                 attempt_no=attempt_no,
                 run_id=run_id,
@@ -508,7 +493,6 @@ class CompletionMachine:
         job_snapshot: dict[str, Any],
         result: ExecutionResult,
         *,
-        attempt_id: int | None = None,
         execution_id: str | None = None,
         attempt_no: int = 1,
         run_id: str | None = None,
@@ -545,7 +529,6 @@ class CompletionMachine:
                     uid,
                     job_snapshot,
                     result,
-                    attempt_id=attempt_id,
                     execution_id=execution_id,
                     attempt_no=attempt_no,
                     run_id=run_id,
@@ -570,7 +553,6 @@ class CompletionMachine:
             uid,
             job_snapshot,
             retry_job_snapshot,
-            attempt_id=attempt_id,
             execution_id=execution_id,
             attempt_no=attempt_no,
             run_id=run_id or self._session.run_id,
@@ -612,7 +594,6 @@ class CompletionMachine:
         result: ExecutionResult,
         *,
         started_monotonic: float | None = None,
-        attempt_id: int | None = None,
         execution_id: str | None = None,
         attempt_no: int = 1,
         run_id: str | None = None,
@@ -648,7 +629,6 @@ class CompletionMachine:
             declared_artifacts=effective_declarations,
             run_id=run_id or self._session.run_id,
             job_snapshot=job_snapshot,
-            attempt_id=attempt_id,
             execution_id=execution_id,
             attempt_no=attempt_no,
             started_at=started_at,
@@ -728,7 +708,6 @@ class CompletionMachine:
         result: ExecutionResult,
         *,
         started_monotonic: float | None = None,
-        attempt_id: int | None = None,
         execution_id: str | None = None,
         attempt_no: int | None = None,
         run_id: str | None = None,
@@ -758,7 +737,6 @@ class CompletionMachine:
             failure_record,
             job_snapshot=job_snapshot,
             cascade=True,
-            attempt_id=attempt_id,
             execution_id=execution_id,
             attempt_no=attempt_no,
             run_id=run_id or self._session.run_id,

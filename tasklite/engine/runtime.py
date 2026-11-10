@@ -45,7 +45,7 @@ from .types import (
 )
 from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
-from ..exceptions import TaskLiteError, _CommitCrashSignal, _JobTerminated
+from ..exceptions import TaskLiteError
 from ..models.artifact import (
     ArtifactDeclaration,
     FileSpec,
@@ -100,7 +100,6 @@ class EngineRuntime:
         # 期装配快照的搬运通道），运行期一切读写经 store.backend 派生。
         self.store: StateStore = StateStore(
             config.backend,
-            commit_failure_threshold=config.commit_failure_threshold,
             classifier=config.classifier,
             trigger_registry=config.trigger_registry,
             requeue_policy=config.requeue_policy,
@@ -143,7 +142,6 @@ class EngineRuntime:
             output_roots=config.output_roots,
             ipc_dir=config.ipc_dir,
             protected_roots=config.protected_roots,
-            commit_failure_threshold=config.commit_failure_threshold,
             dispatch_start_lock=self._dispatch_start_lock,
         )
 
@@ -938,7 +936,7 @@ class EngineRuntime:
             self.run_loop()
         except BaseException as e:
             # 单点崩溃网：所有异常同构处理（在途清扫并原样上抛）；
-            # KI 与非 Exception（_JobTerminated / _CommitCrashSignal / SystemExit）
+            # KI 与非 Exception（如 SystemExit）
             # 不附 traceback，其余附。
             self._crash_log(e)
             try:
@@ -952,10 +950,6 @@ class EngineRuntime:
         """承重网的逐类型日志分派（KI 与非 Exception 不附 traceback）。"""
         if isinstance(e, KeyboardInterrupt):
             logger.warning("Pipeline interrupted by user.")
-        elif isinstance(e, _JobTerminated):
-            logger.critical(f"Job terminated outside expected handlers: {e}")
-        elif isinstance(e, _CommitCrashSignal):
-            logger.critical(f"Backend commit failure; aborting in-flight jobs: {e}")
         elif isinstance(e, Exception):
             logger.critical(
                 f"Pipeline scheduler crashed with unhandled exception: {e}\n"

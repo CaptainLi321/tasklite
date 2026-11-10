@@ -9,7 +9,7 @@ pre-submit-cleanup。依赖以显式窄清单注入（无共享袋），经
 类型自动满足）；``output_roots`` 与 config 声明同型
 （``Path | Sequence[Path] | None``，多根输出场景）。
 
-派发即插 attempts 轨迹行（outcome=running）：execution_id
+进入 running 时分配编号，结算时追加 Attempt：execution_id
 （``run_id.dispatch_no``）在本模块生成并随行落表——dispatch_no 每次派发递增，
 同 uid 重试再派发也获得新 execution_id，与上次尝试的执行身份严格隔离。
 """
@@ -63,16 +63,13 @@ import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
-from ..exceptions import TaskLiteError, _CommitCrashSignal, _JobTerminated
+from ..exceptions import TaskLiteError
 from ..models.artifact import ArtifactDeclaration, FileSpec
-from ..models.attempt import ATTEMPT_REQUEUED
 from ..models.context import JobContext
-from ..models.job import Job, JobRuntimeState
+from ..models.job import Job
 from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
 from .channel import ExecutionResult, WorkerLaunchSpec, _WorkerLaunchCancelled
 from .errorclass import (
-    ERR_DISPATCH_FAILURE,
     ERR_JOB_DEPENDENCY,
     ERR_NO_HANDLER,
     ERR_RESOURCE_DEADLOCK,
@@ -112,7 +109,7 @@ class DispatchOutcome:
 
 
 class DispatchMachine:
-    """派发预检 + 资源租约 + 轨迹开行 + 子进程 spawn 的编排器。"""
+    """派发预检 + 资源租约 + running 编号 + 子进程 spawn 的编排器。"""
 
     def __init__(
         self,
@@ -129,7 +126,6 @@ class DispatchMachine:
         tasks: "TaskSource",
         output_roots: "Path | Sequence[Path] | None",
         ipc_dir: str | None = None,
-        commit_failure_threshold: int = 10,
         protected_roots: tuple[Path, ...] = (),
         classifier: "ErrorClassifier | None" = None,
         dispatch_start_lock: Any | None = None,
@@ -153,7 +149,6 @@ class DispatchMachine:
             protected_roots=protected_roots,
             authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
         )
-        self._commit_failure_threshold = commit_failure_threshold
         self._authorization_pending: tuple[str | None, str, str] | None = None
         self._dispatch_start_lock = dispatch_start_lock or threading.RLock()
 
@@ -200,7 +195,7 @@ class DispatchMachine:
                     snapshot = store.state.pop_job(pending_idx)
                     self._reject_and_commit(
                         pending_uid, snapshot, {"error_message": str(exc)},
-                        count_as="failed", attempt_id=None,
+                        count_as="failed",
                     )
                     return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
                 authorized = store.check_or_request_authorization(path)
@@ -247,7 +242,7 @@ class DispatchMachine:
         return DispatchOutcome(kind=DispatchKind.SPAWNED, entry=entry)
 
     def dispatch_job(self, sched: ScheduleResult) -> InFlightJob | None:
-        """统一派发单个作业：依赖失败处理 / 统一准入求值 → 出队 → 轨迹开行 →
+        """统一派发单个作业：依赖失败处理 / 统一准入求值 → 出队 → running 编号 →
         两阶段资源租约 → 子进程启动 → 在飞原子登记。
 
         返回 InFlightJob 条目；被预检拦截（已终结/跳过/已回队）时返回 None。
@@ -262,17 +257,8 @@ class DispatchMachine:
             job_snapshot = store.state.pop_job(sched.runnable_idx)
             job = Job.from_dict(job_snapshot)
             job_uid = job.uid
-            attempt_id = None
-            if store.backend.schema_version < TARGET_SCHEMA_VERSION:
-                try:
-                    attempt_id, _ = self._open_attempt(job)
-                except Exception as e:
-                    logger.warning(
-                        f"Attempt trace append degraded for dependency failed {job_uid}: {e}"
-                    )
-                    attempt_id = None
             self.dispatch_dep_failed(
-                job_uid, job_snapshot, pending_dep_failure, attempt_id=attempt_id
+                job_uid, job_snapshot, pending_dep_failure
             )
             return None
         if sched.kind == "dep_missing":
@@ -304,7 +290,6 @@ class DispatchMachine:
                     job_snapshot,
                     {"error_message": str(err)},
                     count_as="failed",
-                    attempt_id=None,
                 )
                 return None
 
@@ -318,39 +303,14 @@ class DispatchMachine:
             )
             if not should_run:
                 job_snapshot = peek_snapshot
-                attempt_id = None
-                if store.backend.schema_version < TARGET_SCHEMA_VERSION:
-                    try:
-                        attempt_id, _ = self._open_attempt(job)
-                    except Exception as e:
-                        logger.warning(
-                            f"Attempt trace append degraded for skipped {job_uid}: {e}"
-                        )
-                        attempt_id = None
-                store.apply_skip(job_uid, job_snapshot=job_snapshot, attempt_id=attempt_id)
+                store.apply_skip(job_uid, job_snapshot=job_snapshot)
                 store.state.mark_trigger_skipped(job_uid)
                 return None
 
-            if store.backend.schema_version < TARGET_SCHEMA_VERSION and job.attempt_no <= 1:
-                job.activation_no = max(
-                    (record.activation_no for record in store.backend.load_attempts(job_uid)),
-                    default=0,
-                ) + 1
-                peek_snapshot["activation_no"] = job.activation_no
-
         if job.task_type not in self._tasks:
             job_snapshot = store.state.pop_job(sched.runnable_idx)
-            attempt_id = None
-            if store.backend.schema_version < TARGET_SCHEMA_VERSION:
-                try:
-                    attempt_id, _ = self._open_attempt(job)
-                except Exception as e:
-                    logger.warning(
-                        f"Attempt trace append degraded for missing handler {job_uid}: {e}"
-                    )
-                    attempt_id = None
             if self.dispatch_no_handler(
-                job_uid, job_snapshot, job.task_type, attempt_id=attempt_id
+                job_uid, job_snapshot, job.task_type
             ):
                 return None
 
@@ -381,7 +341,6 @@ class DispatchMachine:
                 job_snapshot,
                 {"error_message": ERR_RESOURCE_DEADLOCK, "error_details": eval_res.reason},
                 count_as="failed",
-                attempt_id=None,
             )
             return None
         if not eval_res.is_available:
@@ -393,52 +352,32 @@ class DispatchMachine:
         if not self._dispatch_allowed():
             store.state.requeue_jobs([job_snapshot], front=True)
             return None
-        if store.backend.schema_version < TARGET_SCHEMA_VERSION:
-            job_snapshot["activation_no"] = job.activation_no
         started_at = utc_now_iso()
-        attempt_id = None
         attempt_no = 1
 
-        if store.backend.schema_version >= TARGET_SCHEMA_VERSION:
-            effective_run_id = self._session.run_id or "run"
-            execution_id = f"{effective_run_id}.{self._session.next_dispatch_no()}"
-            if not self._dispatch_allowed():
-                store.state.requeue_jobs([job_snapshot], front=True)
-                return None
-            try:
-                attempt_no = store.mark_job_running(
-                    job_uid,
-                    execution_id=execution_id,
-                    run_id=effective_run_id,
-                    started_at=started_at,
-                )
-                job.attempt_no = attempt_no
-                job_snapshot["attempt_no"] = attempt_no
-                job_snapshot["run_id"] = effective_run_id
-                job_snapshot["started_at"] = started_at
-            except (_CommitCrashSignal, Exception) as e:
-                logger.critical(
-                    f"Failed to mark job running for {job_uid}: {e}; "
-                    f"requeueing and aborting dispatch without starting handler."
-                )
-                store.state.requeue_jobs([job_snapshot], front=True)
-                raise
-        else:
-            try:
-                attempt_id, execution_id = self._open_attempt(job)
-            except Exception as e:
-                logger.critical(
-                    f"Failed to open attempt row for {job_uid}: {e}; "
-                    f"requeueing and aborting dispatch without starting handler."
-                )
-                store.state.requeue_jobs([job_snapshot], front=True)
-                raise _CommitCrashSignal(
-                    f"Failed to append attempt row for {job_uid} ({e}). "
-                    f"Job preserved in queue without starting handler."
-                ) from e
-            except BaseException:
-                store.state.requeue_jobs([job_snapshot], front=True)
-                raise
+        effective_run_id = self._session.run_id or "run"
+        execution_id = f"{effective_run_id}.{self._session.next_dispatch_no()}"
+        if not self._dispatch_allowed():
+            store.state.requeue_jobs([job_snapshot], front=True)
+            return None
+        try:
+            attempt_no = store.mark_job_running(
+                job_uid,
+                execution_id=execution_id,
+                run_id=effective_run_id,
+                started_at=started_at,
+            )
+            job.attempt_no = attempt_no
+            job_snapshot["attempt_no"] = attempt_no
+            job_snapshot["run_id"] = effective_run_id
+            job_snapshot["started_at"] = started_at
+        except Exception as e:
+            logger.critical(
+                f"Failed to mark job running for {job_uid}: {e}; "
+                f"requeueing and aborting dispatch without starting handler."
+            )
+            store.state.requeue_jobs([job_snapshot], front=True)
+            raise
 
         if not self._dispatch_allowed():
             self._rollback_unstarted_running(
@@ -447,7 +386,6 @@ class DispatchMachine:
                 execution_id=execution_id,
                 attempt_no=attempt_no,
                 started_at=started_at,
-                attempt_id=attempt_id,
             )
             return None
 
@@ -461,7 +399,6 @@ class DispatchMachine:
                 execution_id=execution_id,
                 attempt_no=attempt_no,
                 started_at=started_at,
-                attempt_id=attempt_id,
             )
             return None
 
@@ -478,7 +415,6 @@ class DispatchMachine:
                 job_snapshot=job_snapshot,
                 job=job,
                 acquired=acquired,
-                attempt_id=attempt_id,
                 execution_id=execution_id,
                 attempt_no=attempt_no,
                 run_id=self._session.run_id or "run",
@@ -506,7 +442,6 @@ class DispatchMachine:
                 execution_id=execution_id,
                 attempt_no=attempt_no,
                 started_at=started_at,
-                attempt_id=attempt_id,
             )
             return None
 
@@ -515,31 +450,15 @@ class DispatchMachine:
                 job_uid,
                 job,
                 job_snapshot,
-                attempt_id,
                 execution_id,
                 acquired,
                 attempt_no=attempt_no,
                 started_at=started_at,
                 resolved_files=resolved_files,
             )
-        except _CommitCrashSignal:
+        except BaseException:
             self._resources.release_all(acquired)
             raise
-        except AssertionError:
-            self._resources.release_all(acquired)
-            raise
-        except KeyboardInterrupt:
-            self._resources.release_all(acquired)
-            if store.backend.schema_version >= TARGET_SCHEMA_VERSION:
-                raise
-            self._handle_interrupt(job_uid, job_snapshot)
-            return None
-        except Exception as e:
-            self._resources.release_all(acquired)
-            if store.backend.schema_version >= TARGET_SCHEMA_VERSION:
-                raise
-            self._handle_dispatch_failure(job_uid, job_snapshot, attempt_id, e)
-            return None
 
     def _rollback_unstarted_running(
         self,
@@ -549,26 +468,17 @@ class DispatchMachine:
         execution_id: str,
         attempt_no: int,
         started_at: str,
-        attempt_id: int | None = None,
     ) -> None:
         """停止门越过 running 提交时，将未启动执行回退为 pending 且不写 Attempt。"""
-        if self._store.backend.schema_version >= TARGET_SCHEMA_VERSION:
-            self._store.apply_pending(
-                job_uid,
-                job_snapshot,
-                execution_id=execution_id,
-                attempt_no=attempt_no,
-                run_id=self._session.run_id or "run",
-                started_at=started_at,
-                error_message="stop requested before worker launch",
-                record_attempt=False,
-            )
-            return
-        self._store.state.requeue_jobs([job_snapshot], front=True)
-        self._store.finish_attempt(
-            attempt_id,
-            outcome=ATTEMPT_REQUEUED,
+        self._store.apply_pending(
+            job_uid,
+            job_snapshot,
+            execution_id=execution_id,
+            attempt_no=attempt_no,
+            run_id=self._session.run_id or "run",
+            started_at=started_at,
             error_message="stop requested before worker launch",
+            record_attempt=False,
         )
 
     # ── 预检关卡 ──────────────────────────────────────────────────────
@@ -578,14 +488,11 @@ class DispatchMachine:
         job_uid: str,
         job_snapshot: dict,
         pending_dep_failure: str | None,
-        *,
-        attempt_id: int | None = None,
     ) -> bool:
         """派发预检关 2——依赖失败（父任务已进失败档案 → 本任务依赖失败）。
 
         返回 True = 已处理（依赖失败直接 commit，含级联下游 + 钩子）；
-        仅当 pending_dep_failure 非空时调用。commit 失败走 3-strike /
-        崩溃路径。
+        仅当 pending_dep_failure 非空时调用。事务异常原样传播。
         """
         if pending_dep_failure is None:
             return False
@@ -597,7 +504,7 @@ class DispatchMachine:
         # 依赖父失败的级联下游计入 cascade_failed 而非 failed——
         # 「真实业务失败率」统计不被级联稀释。
         self._reject_and_commit(
-            job_uid, job_snapshot, failure_metadata, count_as="cascade_failed", attempt_id=attempt_id
+            job_uid, job_snapshot, failure_metadata, count_as="cascade_failed"
         )
         return True
 
@@ -623,7 +530,6 @@ class DispatchMachine:
             job_snapshot,
             failure_metadata,
             count_as="failed",
-            attempt_id=None,
         )
         return True
 
@@ -632,41 +538,24 @@ class DispatchMachine:
         job_uid: str,
         job_snapshot: dict,
         task_type: str,
-        *,
-        attempt_id: int | None = None,
     ) -> bool:
         """派发预检关 3——无对应 Task 注册（配置级错误 → fatal 进失败档案）。
 
         返回 True = 已处理（直接 commit 到失败档案并级联下游）；仅当
-        task_type not in tasks 时调用。commit 失败走 3-strike / 崩溃路径。
+        task_type not in tasks 时调用。事务异常原样传播。
         """
         logger.error(f"SKIP: {job_uid} (No handler for task_type '{task_type}')")
         failure_metadata = {"error_message": ERR_NO_HANDLER, "is_fatal": True}
-        self._reject_and_commit(job_uid, job_snapshot, failure_metadata, attempt_id=attempt_id)
+        self._reject_and_commit(job_uid, job_snapshot, failure_metadata)
         return True
 
-    # ── 轨迹开行与 spawn ──────────────────────────────────────────────
-
-    def _open_attempt(self, job: Job) -> tuple[int | None, str]:
-        """派发即插 running 轨迹行，返回 (轨迹行 id, execution_id)。
-
-        execution_id fencing 归属派发点：``{run_id}.{dispatch_no}`` 生成
-        于此并随轨迹落表；开行失败由调用方捕获以保队并中止派发。
-        """
-        execution_id = f"{self._session.run_id}.{self._session.next_dispatch_no()}"
-        attempt_id = self._store.record_attempt_dispatch(
-            job,
-            execution_id=execution_id,
-            run_id=self._session.run_id,
-        )
-        return attempt_id, execution_id
+    # ── worker 启动 ──────────────────────────────────────────────
 
     def _spawn_entry(
         self,
         job_uid: str,
         job: Job,
         job_snapshot: dict,
-        attempt_id: int | None,
         execution_id: str,
         acquired: list[tuple[str, float]],
         *,
@@ -695,7 +584,6 @@ class DispatchMachine:
                         execution_id=execution_id,
                         attempt_no=attempt_no,
                         started_at=started_at or utc_now_iso(),
-                        attempt_id=attempt_id,
                     )
                     return None
                 logger.info(f"RUN: {job_uid}")
@@ -707,7 +595,6 @@ class DispatchMachine:
                         execution_id=execution_id,
                         attempt_no=attempt_no,
                         started_at=started_at or utc_now_iso(),
-                        attempt_id=attempt_id,
                     )
                     return None
                 started_monotonic = time.monotonic()
@@ -732,7 +619,6 @@ class DispatchMachine:
                     handle=handle,
                     started_monotonic=started_monotonic,
                     acquired=acquired,
-                    attempt_id=attempt_id,
                     execution_id=execution_id,
                     attempt_no=attempt_no,
                     run_id=self._session.run_id or "run",
@@ -757,10 +643,9 @@ class DispatchMachine:
                 execution_id=execution_id,
                 attempt_no=attempt_no,
                 started_at=started_at or utc_now_iso(),
-                attempt_id=attempt_id,
             )
             return None
-        except (_CommitCrashSignal, AssertionError):
+        except AssertionError:
             raise
         except BaseException:
             if handle is not None:
@@ -842,80 +727,18 @@ class DispatchMachine:
         meta: dict,
         *,
         count_as: str = "failed",
-        attempt_id: int | None = None,
     ) -> None:
-        """拒绝作业的统一出口：委托 StateStore.apply_failure 原子终态转移。
-
-        四处拒绝路径（依赖失败 / 无 Task / 载荷校验失败 / 派发 3-strike）
-        共用本方法，彻底收敛 commit + mark_failed_memory + cascade_fail +
-        收尾钩子至 StateStore。正常返回 = 处理完成（commit 成功或 3-strike
-        失败档案成功）；_CommitCrashSignal 穿透上抛 = 后端环境故障（由
-        运行循环崩溃处理）。
-        """
-        try:
-            outcome = self._store.apply_failure(
-                job_uid, meta, job_snapshot=job_snapshot, count_as=count_as,
-                cascade=True, attempt_id=attempt_id,
-            )
-            self._store.fire_attempt_finished(
-                job_uid,
-                outcome=AttemptOutcome(
-                    success=False, will_retry=False, metadata=dict(outcome.failure_metadata)
-                ),
-            )
-        except _JobTerminated:
-            # 3-strike 失败档案成功——作业已终结（StateStore 内部已计入
-            # 指标并触发钩子）
-            return
-
-    def _handle_interrupt(self, job_uid: str, job_snapshot: dict) -> None:
-        """派发中断分支：entry 已登记交运行循环统一 abort，否则回队后上抛。"""
-        logger.warning(f"Pipeline interrupted while dispatching {job_uid}.")
-        if job_uid in self._in_flight:
-            # entry 已注册到 in_flight：此处不清理/不 requeue/不 release，
-            # 全部交给运行循环的中止收尾统一处理，避免对同一 entry 二次
-            # 释放资源、二次 requeue 同一作业。
-            raise KeyboardInterrupt
-        self._store.state.requeue_jobs([job_snapshot], front=True)
-        # 不在此保存队列：内存此刻缺其他 in-flight 作业，交给运行循环的
-        # 崩溃安全保存合并磁盘真相后统一保存。
-        raise KeyboardInterrupt
-
-    def _handle_dispatch_failure(
-        self,
-        job_uid: str,
-        job_snapshot: dict,
-        attempt_id: int | None,
-        exc: Exception,
-    ) -> None:
-        """派发异常分支：3-strike 派发失败预算收敛，未达阈值回队后上抛。"""
-        store = self._store
-        logger.error(f"Error dispatching job {job_uid}: {exc}\n{traceback.format_exc()}")
-        rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
-        failures = rt_state.record_dispatch_failure()
-        job_snapshot["runtime"] = rt_state.to_dict()
-        if failures >= self._commit_failure_threshold:
-            logger.critical(
-                f"Dispatch failed {failures} times for {job_uid} ({exc}); "
-                f"treating as deterministic bad input (e.g. unpickleable "
-                f"handler), sending to failure archive."
-            )
-            failure_metadata = {
-                "error_message": ERR_DISPATCH_FAILURE,
-                "failures": failures,
-                "detail": str(exc)[:200],
-            }
-            self._in_flight.settle(job_uid, state=store.state)
-            self._reject_and_commit(job_uid, job_snapshot, failure_metadata, attempt_id=attempt_id)
-            return None
-        self._in_flight.settle(job_uid, state=store.state)
-        store.state.requeue_jobs([job_snapshot], front=True)
-        store.finish_attempt(
-            attempt_id, outcome=ATTEMPT_REQUEUED, error_message=f"dispatch failure: {exc}"
+        """执行前拒绝统一登记失败；事务异常原样传播。"""
+        outcome = self._store.apply_failure(
+            job_uid, meta, job_snapshot=job_snapshot, count_as=count_as,
+            cascade=True,
         )
-        # 不在此保存队列：内存此刻缺其他 in-flight 作业，交给运行循环的
-        # 崩溃安全保存合并磁盘真相后统一保存。
-        raise
+        self._store.fire_attempt_finished(
+            job_uid,
+            outcome=AttemptOutcome(
+                success=False, will_retry=False, metadata=dict(outcome.failure_metadata)
+            ),
+        )
 
 
 __all__ = [

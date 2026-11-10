@@ -32,7 +32,7 @@ from tasklite.engine.governor import (
 )
 from tasklite.engine.resource import ResourceManager
 from tasklite.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
-from tasklite.engine.store import COMMIT_FAILURE_THRESHOLD
+from tasklite.engine.config import COMMIT_FAILURE_THRESHOLD
 from tasklite.models.task import TaskRegistry
 
 

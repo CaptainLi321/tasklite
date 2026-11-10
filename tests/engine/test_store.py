@@ -1,10 +1,4 @@
-"""v2 StateStore 状态仓库测试：六出口事务、失败档案、3-strike 与摄入管道。
-
-覆盖：apply_* 原子终态转移（内存/后端镜像一致）、successes/failed 互斥性质
-（hypothesis 任意操作序列）、mark_failed_memory 联动契约、commit 失败
-3-strike 收敛、enqueue 摄入三步（策略注入 / 工人资源注入 / 首入队时间
-填充）、瞬态降级回队与 attempts 旁路轨迹收尾。
-"""
+"""StateStore 当前结算、摄入与内存／持久化互斥测试。"""
 
 from __future__ import annotations
 
@@ -19,11 +13,9 @@ from hypothesis import strategies as st
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import TriggerRegistry
 from tasklite.engine.errorclass import (
-    ERR_COMMIT_FAILURE,
     ERR_JOB_DEPENDENCY,
 )
 from tasklite.engine.store import (
-    COMMIT_FAILURE_THRESHOLD,
     BulkFailureOutcome,
     FailureEntry,
     FailureOutcome,
@@ -33,7 +25,6 @@ from tasklite.engine.store import (
     SuccessOutcome,
 )
 from tasklite.engine.types import AttemptOutcome
-from tasklite.exceptions import _CommitCrashSignal, _JobTerminated
 from tasklite.models.job import Job, WORKER_RESOURCE
 from tasklite.models.state import PipelineState
 from tasklite.models.task import TaskRegistry
@@ -48,33 +39,11 @@ def _task_specs(task_type, trigger):
 
 
 class CommitFailureBackend:
-    """commit 故障注入 backend：批量／移除抛异常，旧格式方法返回 False。
+    """批量失败及候选移除的真实异常注入。"""
 
-    ``archive_pass_through`` 时 commit_job_failure 对 3-strike 熔断 meta
-    放行 True（收敛路径需要失败档案写入成功才能走到终态分支）。
-    """
-
-    def __init__(self, real_backend, *, failing=(), archive_pass_through=False):
+    def __init__(self, real_backend, *, failing=()):
         self._real = real_backend
         self._failing = frozenset(failing)
-        self._archive_pass_through = archive_pass_through
-
-    def commit_job_success(self, *a, **k):
-        if "commit_job_success" in self._failing:
-            return False
-        return self._real.commit_job_success(*a, **k)
-
-    def commit_job_failure(self, job_uid, meta, *a, **k):
-        if "commit_job_failure" in self._failing:
-            if self._archive_pass_through and meta.get("error_message") == ERR_COMMIT_FAILURE:
-                return self._real.commit_job_failure(job_uid, meta, *a, **k)
-            return False
-        return self._real.commit_job_failure(job_uid, meta, *a, **k)
-
-    def commit_retry(self, *a, **k):
-        if "commit_retry" in self._failing:
-            return False
-        return self._real.commit_retry(*a, **k)
 
     def commit_job_failures(self, *a, **k):
         if "commit_job_failures" in self._failing:
@@ -91,26 +60,24 @@ class CommitFailureBackend:
 
 
 def _make_store(**kwargs) -> tuple[StateStore, PipelineState, InMemoryStateBackend]:
-    backend = InMemoryStateBackend()
+    backend = InMemoryStateBackend(schema_version=6)
     state = PipelineState({}, {}, {}, [])
     store = StateStore(backend, state, **kwargs)
     return store, state, backend
 
 
-def _open_running_attempt(backend: InMemoryStateBackend, uid: str = "t::1", execution_id: str = "run_abc.1", run_id: str = "run_abc") -> int:
-    from tasklite.models.attempt import AttemptRecord
-
-    return backend.append_attempt(
-        AttemptRecord(
-            job_uid=uid,
-            activation_no=1,
-            attempt_no=1,
-            execution_id=execution_id,
-            run_id=run_id,
-            started_at="2026-01-01T00:00:00+00:00",
-            outcome="running",
-        )
+def _start_execution(backend, uid="t::1", execution_id=None, run_id="run_abc"):
+    task_type, job_id = uid.split("::", 1)
+    backend.enqueue_jobs([Job(task_type, job_id).to_dict()])
+    if execution_id is None:
+        execution_id = f"{run_id}.{backend.get_attempt_sequence(uid) + 1}"
+    if not execution_id.startswith(run_id + "."):
+        run_id = execution_id.rsplit(".", 1)[0]
+    attempt_no = backend.mark_job_running(
+        uid, execution_id=execution_id, run_id=run_id,
+        started_at="2026-01-01T00:00:00Z",
     )
+    return {"execution_id": execution_id, "run_id": run_id, "attempt_no": attempt_no}
 
 
 class TestApplySuccess:
@@ -119,15 +86,13 @@ class TestApplySuccess:
     def test_basic_wall_meta(self):
         store, state, backend = _make_store()
         state.register_in_flight("process::1")
-        aid = _open_running_attempt(backend, "process::1")
+        aid = _start_execution(backend, "process::1")
 
         outcome = store.apply_success(
             "process::1",
             result={"message": None, "exception": None, "metadata": {"score": 100}, "annotations": {}},
-            run_id="run_abc",
             declared_inputs=["/tmp/a.txt"],
-            attempt_id=aid,
-            execution_id="run_abc.1",
+            **aid,
         )
 
         assert isinstance(outcome, SuccessOutcome)
@@ -138,9 +103,9 @@ class TestApplySuccess:
         assert "last_succeeded_at" in store.state.successes["process::1"]
         assert store.state.successes["process::1"]["inputs"] == ["/tmp/a.txt"]
         assert "process::1" not in store.state.in_flight_uids
-        (rec,) = backend.load_attempts("process::1")
-        assert rec.outcome == "succeeded"
-        assert rec.finished_at == store.state.successes["process::1"]["last_succeeded_at"]
+        (rec,) = backend.load_settled_attempts("process::1")
+        assert rec["outcome"] == "success"
+        assert rec["settled_at"] == store.state.successes["process::1"]["last_succeeded_at"]
 
     def test_run_count_continues_from_opposite_terminal(self):
         """重跑成功从失败档案对侧终态续数（run_count 跨终态递增）。"""
@@ -148,15 +113,15 @@ class TestApplySuccess:
         state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error_message": "boom", "success_count": 4})
         state.register_in_flight("t::1")
-        aid = _open_running_attempt(backend, "t::1")
-        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid)
+        aid = _start_execution(backend, "t::1")
+        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **aid)
         assert store.state.successes["t::1"]["success_count"] == 5
         assert "t::1" not in store.state.failed
 
     def test_spawn_and_cursor_updates(self):
         store, _, backend = _make_store()
         store.state.register_in_flight("root::1")
-        aid = _open_running_attempt(backend, "root::1")
+        aid = _start_execution(backend, "root::1")
         spawned = [
             {"task_type": "child", "job_id": "c1"},
             {"task_type": "child", "job_id": "c2"},
@@ -167,7 +132,7 @@ class TestApplySuccess:
             result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
             spawned_job_snapshots=spawned,
             cursor_updates={"batch_pos": "100", "old_cursor": None},
-            attempt_id=aid,
+            **aid,
         )
 
         assert outcome.spawned_uids == ["child::c1", "child::c2"]
@@ -178,19 +143,19 @@ class TestApplySuccess:
 
     def test_declared_inputs_deduped_preserving_order(self):
         store, _, backend = _make_store()
-        aid = _open_running_attempt(backend, "t::1")
+        aid = _start_execution(backend, "t::1")
         store.apply_success(
             "t::1",
             result={"message": None, "exception": None, "metadata": {"inputs": ["/user/spoofed"]}, "annotations": {}},
             declared_inputs=["/b", "/a", "/b", "", 42, {"path": "/c"}],
-            attempt_id=aid,
+            **aid,
         )
         assert store.state.successes["t::1"]["inputs"] == ["/b", "/a"]
 
     def test_user_inputs_key_stays_in_result_without_declarations(self):
         store, _, backend = _make_store()
-        aid = _open_running_attempt(backend, "t::1")
-        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {"inputs": ["/user/spoofed"]}, "annotations": {}}, attempt_id=aid)
+        aid = _start_execution(backend, "t::1")
+        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {"inputs": ["/user/spoofed"]}, "annotations": {}}, **aid)
         assert "inputs" not in store.state.successes["t::1"]
         assert store.state.successes["t::1"]["result"]["metadata"] == {"inputs": ["/user/spoofed"]}
 
@@ -198,23 +163,11 @@ class TestApplySuccess:
 class TestTrustedLastSucceededAtUs:
     """可信成功基线查询（trusted_last_succeeded_at_us）判定矩阵。"""
 
-    def test_missing_successes_returns_none_even_with_attempts_row(self):
-        store, _, backend = _make_store()
-        aid = _open_running_attempt(backend, "t::1")
-        backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
-        assert store.trusted_last_succeeded_at_us("t::1") is None
-
-    def test_manual_succeeded_empty_metadata_returns_none(self):
-        store, state, backend = _make_store()
-        aid = _open_running_attempt(backend, "t::1")
-        backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
-        state.add_success("t::1", {})
-        assert store.trusted_last_succeeded_at_us("t::1") is None
 
     def test_clear_history_then_seed_rejects_old_attempts_row(self):
         store, state, backend = _make_store()
-        aid = _open_running_attempt(backend, "t::1")
-        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid, finished_at="2026-05-01T00:00:05+00:00")
+        aid = _start_execution(backend, "t::1")
+        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **aid, finished_at="2026-05-01T00:00:05+00:00")
         assert store.trusted_last_succeeded_at_us("t::1") is not None
 
         # 模拟清空 successes 历史后人工种子
@@ -223,57 +176,18 @@ class TestTrustedLastSucceededAtUs:
         state.add_success("t::1", {})
         assert store.trusted_last_succeeded_at_us("t::1") is None
 
-    def test_incomplete_or_corrupt_metadata_returns_none(self):
-        store, state, backend = _make_store()
-        aid = _open_running_attempt(backend, "t::1")
-        backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:05+00:00")
-
-        # 缺 success_count / 非整数
-        state.add_success("t::1", {"last_succeeded_at": "2026-05-01T00:00:05+00:00"})
-        assert store.trusted_last_succeeded_at_us("t::1") is None
-        state.add_success("t::1", {"last_succeeded_at": "2026-05-01T00:00:05+00:00", "success_count": 0})
-        assert store.trusted_last_succeeded_at_us("t::1") is None
-        state.add_success("t::1", {"last_succeeded_at": "2026-05-01T00:00:05+00:00", "success_count": True})
-        assert store.trusted_last_succeeded_at_us("t::1") is None
-
-        # 坏时间戳
-        state.add_success("t::1", {"last_succeeded_at": "corrupt", "success_count": 1})
-        assert store.trusted_last_succeeded_at_us("t::1") is None
-
-        # 空 last_success_run_id
-        state.add_success(
-            "t::1",
-            {"last_succeeded_at": "2026-05-01T00:00:05+00:00", "success_count": 1, "last_success_run_id": ""},
-        )
-        assert store.trusted_last_succeeded_at_us("t::1") is None
 
     def test_valid_success_returns_exact_integer_microseconds(self):
         store, _, backend = _make_store()
-        aid = _open_running_attempt(backend, "t::1")
+        aid = _start_execution(backend, "t::1")
         store.apply_success(
             "t::1",
             result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
-            run_id="run_valid",
-            attempt_id=aid,
+            # 执行身份来自实际 running 提交。
+            **aid,
             finished_at="1970-01-01T00:00:01.123456+00:00",
         )
         assert store.trusted_last_succeeded_at_us("t::1") == 1_123_456
-
-    def test_mismatched_finished_at_between_successes_and_attempts_returns_none(self):
-        """successes 的 last_succeeded_at 与 attempts 最新 succeeded 行时间不一致时不采信。"""
-        store, state, backend = _make_store()
-        aid = _open_running_attempt(backend, "t::1")
-        backend.update_attempt(aid, outcome="succeeded", finished_at="2026-05-01T00:00:01+00:00")
-        state.add_success(
-            "t::1",
-            {
-                "success_count": 1,
-                "last_succeeded_at": "2026-05-01T00:00:09+00:00",
-                "last_success_run_id": "run_1",
-            },
-        )
-        # 即使两者各自合法，只要不相等就不采信为基线
-        assert store.trusted_last_succeeded_at_us("t::1") is None
 
 
 class TestApplyFailureAndCascade:
@@ -305,7 +219,7 @@ class TestApplyFailureAndCascade:
         assert "parent::1" not in store.state.in_flight_uids
 
     def test_failure_payload_snapshot_skipped_when_unserializable(self, caplog):
-        """payload 快照不可序列化时降级 None——快照失败不得误触 3-strike。"""
+        """payload 快照不可序列化时降级 None，不阻断失败提交。"""
         store, _, backend = _make_store()
         job_snapshot = {
             "task_type": "t",
@@ -320,8 +234,8 @@ class TestApplyFailureAndCascade:
         """失败终态与成功终态互删对侧（内存与后端镜像同步）。"""
         store, _, backend = _make_store()
         store.state.register_in_flight("t::1")
-        aid = _open_running_attempt(backend, "t::1")
-        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid)
+        aid = _start_execution(backend, "t::1")
+        store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **aid)
         store.state.register_in_flight("t::1")
         store.apply_failure("t::1", {"error_message": "again"})
 
@@ -343,30 +257,21 @@ class TestApplyRetry:
         state.replace_queue([])
         store.state.register_in_flight("t::1")
 
+        identity = _start_execution(store.backend)
         outcome = store.apply_retry(
             "t::1",
             {"task_type": "t", "job_id": "1"},
             self._retry_job_snapshot(),
-            transient_kind="interrupted",
+            **identity,
             error_message="transient blip",
         )
 
         assert isinstance(outcome, RetryOutcome)
-        assert outcome.transient_kind == "interrupted"
+        assert outcome.transient_kind is None
         assert store.state.queue[0]["job_id"] == "1"
         assert "t::1" not in store.state.in_flight_uids
         assert stats["retried"] == 1
-        assert stats["interrupted_reruns"] == 1
-
-    def test_commit_failure_raises_crash_signal(self):
-        backend = InMemoryStateBackend()
-        failing = CommitFailureBackend(backend, failing=("commit_retry",))
-        state = PipelineState({}, {}, {}, [])
-        store = StateStore(failing, state, stats={})
-
-        with pytest.raises(_CommitCrashSignal, match="commit_retry"):
-            store.apply_retry("t::1", {"task_type": "t", "job_id": "1"}, self._retry_job_snapshot())
-        assert "t::1" in store.state.queue_uids
+        assert stats["interrupted_reruns"] == 0
 
 
 class TestApplySkip:
@@ -375,7 +280,7 @@ class TestApplySkip:
     @pytest.mark.parametrize("dispatched", [False, True])
     def test_skip_records_stat_and_clears_queue(self, dispatched):
         stats = defaultdict(int)
-        backend = InMemoryStateBackend()
+        backend = InMemoryStateBackend(schema_version=6)
         backend.save_queue([{"task_type": "t", "job_id": "1"}])
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
         store = StateStore(backend, state, stats=stats)
@@ -392,8 +297,8 @@ class TestApplySkip:
 
     def test_skip_preserves_other_in_flight_rerun_exemption(self):
         store, state, backend = _make_store()
-        aid = _open_running_attempt(backend, "t::running")
-        store.apply_success("t::running", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid)
+        aid = _start_execution(backend, "t::running")
+        store.apply_success("t::running", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **aid)
         state.register_in_flight("t::running")
         pending = Job("t", "skip").to_dict()
         state.spawn_jobs([pending])
@@ -406,7 +311,7 @@ class TestApplySkip:
         state._assert_state_consistent()
 
     def test_skip_fault_preserves_queue_without_archive(self):
-        backend = InMemoryStateBackend()
+        backend = InMemoryStateBackend(schema_version=6)
         failing = CommitFailureBackend(backend, failing=("commit_skip",))
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
         store = StateStore(failing, state, stats={})
@@ -443,72 +348,6 @@ class TestMarkFailedMemoryContract:
         assert "encode::a" not in state.success_uids
 
 
-class TestCommitFailureStrike:
-    """commit 失败 3-strike 收敛契约。"""
-
-    def _strike_store(self, hooks: list[tuple[str, AttemptOutcome]]) -> StateStore:
-        backend = CommitFailureBackend(
-            InMemoryStateBackend(),
-            failing=("commit_job_success", "commit_job_failure"),
-            archive_pass_through=True,
-        )
-        return StateStore(
-            backend,
-            PipelineState({}, {}, {}, []),
-            commit_failure_threshold=3,
-            stats={},
-            on_attempt_finished=lambda uid, *, outcome: hooks.append((uid, outcome)),
-        )
-
-    def test_threshold_retry_then_archive(self):
-        store = self._strike_store([])
-        job_snapshot = {"task_type": "task", "job_id": "1"}
-
-        store.state.register_in_flight("task::1")
-        with pytest.raises(_CommitCrashSignal):
-            store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
-        assert job_snapshot["runtime"]["_commit_failures"] == 1
-        assert "task::1" in store.state.queue_uids
-
-        store.state.pop_job(0)
-        store.state.register_in_flight("task::1")
-        with pytest.raises(_CommitCrashSignal):
-            store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
-        assert job_snapshot["runtime"]["_commit_failures"] == 2
-
-        store.state.pop_job(0)
-        store.state.register_in_flight("task::1")
-        with pytest.raises(_JobTerminated, match="permanently failed"):
-            store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
-        assert "task::1" in store.state.failed
-        assert store.state.failed["task::1"]["is_fatal"] is True
-        assert store.state.failed["task::1"]["error_message"] == ERR_COMMIT_FAILURE
-
-    def test_strike_archive_fires_hook_exactly_once(self):
-        hooks: list[tuple[str, AttemptOutcome]] = []
-        store = self._strike_store(hooks)
-        job_snapshot = {"task_type": "task", "job_id": "1"}
-        for _ in range(2):
-            store.state.register_in_flight("task::1")
-            with pytest.raises(_CommitCrashSignal):
-                store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
-            store.state.pop_job(0)
-        store.state.register_in_flight("task::1")
-        with pytest.raises(_JobTerminated):
-            store.apply_success("task::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, job_snapshot=job_snapshot)
-
-        assert len(hooks) == 1
-        uid, fin = hooks[0]
-        assert uid == "task::1"
-        assert fin.success is False
-        assert fin.will_retry is False
-        assert fin.metadata["error_message"] == ERR_COMMIT_FAILURE
-        assert store.stats["failed"] == 1
-
-    def test_default_threshold_constant(self):
-        assert COMMIT_FAILURE_THRESHOLD == 3
-
-
 class TestHookSingleExit:
     """fire_attempt_finished 单一出口与异常隔离。"""
 
@@ -543,7 +382,7 @@ class TestHookSingleExit:
     def test_bulk_failure_fires_hook_per_uid(self):
         stats = defaultdict(int)
         hooks: list[tuple[str, AttemptOutcome]] = []
-        backend = InMemoryStateBackend()
+        backend = InMemoryStateBackend(schema_version=6)
         store = StateStore(
             backend,
             PipelineState({}, {}, {}, []),
@@ -561,7 +400,7 @@ class TestHookSingleExit:
 
     def test_cascade_fires_hook_per_downstream(self):
         hooks: list[tuple[str, AttemptOutcome]] = []
-        backend = InMemoryStateBackend()
+        backend = InMemoryStateBackend(schema_version=6)
         state = PipelineState(
             {}, {}, {},
             [
@@ -607,13 +446,15 @@ class TestApplyBulkFailure:
     def test_bulk_failure_keeps_wall_deleted_on_backend(self):
         """批量失败与单条失败对称：successes 同名行随事务删除。"""
         store, _, backend = _make_store()
-        backend.commit_job_success("cycle::1", {})
+        identity = _start_execution(backend, "cycle::1")
+        store.apply_success("cycle::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **identity)
+        assert "cycle::1" in backend.load_successes()
         store.apply_bulk_failure([("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"})])
         assert "cycle::1" not in backend.load_successes()
 
     @pytest.mark.parametrize("operation", ["bulk", "cascade"])
     def test_bulk_fault_preserves_state_without_failure_accounting(self, operation):
-        backend = InMemoryStateBackend()
+        backend = InMemoryStateBackend(schema_version=6)
         failing = CommitFailureBackend(backend, failing=("commit_job_failures",))
         job = Job("child", "one", depends_on=["parent::one"]).to_dict()
         state = PipelineState({}, {}, {}, [job])
@@ -632,7 +473,7 @@ class TestIntakePipeline:
     """enqueue 摄入管道三步 + 首入队时间。"""
 
     def test_enqueue_fills_first_enqueued_at_once(self):
-        backend = InMemoryStateBackend()
+        backend = InMemoryStateBackend(schema_version=6)
         store = StateStore(
             backend,
             PipelineState({}, {}, {}, []),
@@ -651,7 +492,7 @@ class TestIntakePipeline:
 
     def test_enqueue_injects_discovery_trigger_for_unspecified(self):
         store = StateStore(
-            InMemoryStateBackend(),
+            InMemoryStateBackend(schema_version=6),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=_task_specs("scan", "always")),
         )
@@ -662,7 +503,7 @@ class TestIntakePipeline:
 
     def test_enqueue_rejects_unserializable_payload(self):
         store = StateStore(
-            InMemoryStateBackend(),
+            InMemoryStateBackend(schema_version=6),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
         )
@@ -679,7 +520,7 @@ class TestIntakePipeline:
     def test_enqueue_rejects_unregistered_task(self):
         from tasklite import TaskLiteError
 
-        backend = InMemoryStateBackend()
+        backend = InMemoryStateBackend(schema_version=6)
         store = StateStore(
             backend,
             PipelineState({}, {}, {}, []),
@@ -689,7 +530,7 @@ class TestIntakePipeline:
         with pytest.raises(TaskLiteError, match="unknown task_type"):
             store.enqueue_job(job)
         assert backend.load_queue() == []
-        assert backend.load_attempts(job.uid) == []
+        assert backend.load_settled_attempts(job.uid) == []
 
     def test_enqueue_job_same_uid_idempotent_vs_conflict(self):
         from tasklite import Task, TaskLiteError
@@ -707,7 +548,7 @@ class TestIntakePipeline:
             )
         )
         store = StateStore(
-            InMemoryStateBackend(),
+            InMemoryStateBackend(schema_version=6),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=tasks),
         )
@@ -737,7 +578,7 @@ class TestIntakePipeline:
 
     def test_normalize_spawned_job_matches_intake_rules(self):
         store = StateStore(
-            InMemoryStateBackend(),
+            InMemoryStateBackend(schema_version=6),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(
                 tasks=_task_specs("child", "until_success")
@@ -750,7 +591,7 @@ class TestIntakePipeline:
 
     def test_normalize_spawned_job_rejects_unserializable(self):
         store = StateStore(
-            InMemoryStateBackend(),
+            InMemoryStateBackend(schema_version=6),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
         )
@@ -763,130 +604,12 @@ class TestIntakePipeline:
         from tasklite import TaskLiteError
 
         store = StateStore(
-            InMemoryStateBackend(),
+            InMemoryStateBackend(schema_version=6),
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=TaskRegistry()),
         )
         with pytest.raises(TaskLiteError, match="unknown task_type"):
             store.normalize_spawned_job(Job("missing", "1"))
-
-
-class TestRequeueTransient:
-    """瞬态信号降级回队单一出口（军规）。"""
-
-    @pytest.mark.parametrize(
-        ("kind", "stat_key"),
-        [
-            ("interrupted", "interrupted_reruns"),
-            ("lock_conflict", "lock_conflict_reruns"),
-            ("rate_limited", "rate_limited_reruns"),
-        ],
-    )
-    def test_requeue_transient_records_stat_and_fronts(self, kind, stat_key):
-        stats = defaultdict(int)
-        store, state, _ = _make_store(stats=stats)
-        jd = Job("t", "1").to_dict()
-
-        store.requeue_transient(jd, transient_kind=kind)
-
-        assert state.queue[0]["job_id"] == "1"
-        assert stats[stat_key] == 1
-
-    def test_requeue_transient_leaves_runtime_untouched(self):
-        """零污染：不烧 commit/dispatch 失败预算、不写 last_retry_error。"""
-        stats = defaultdict(int)
-        store, _, _ = _make_store(stats=stats)
-        jd = Job("t", "1").to_dict()
-
-        store.requeue_transient(jd, transient_kind="rate_limited")
-
-        assert jd["runtime"] == {}
-        assert stats["retried"] == 0
-
-
-class TestAttemptTraceFinalization:
-    """apply_* 终态的 attempts 旁路轨迹收尾。"""
-
-    def _open_running(self, backend, uid="t::1"):
-        from tasklite.models.attempt import AttemptRecord
-
-        record = AttemptRecord(
-            job_uid=uid,
-            activation_no=1,
-            attempt_no=1,
-            execution_id="r" * 32 + ".1",
-            run_id="r" * 32,
-            started_at="2026-01-01T00:00:00+00:00",
-            outcome="running",
-        )
-        return backend.append_attempt(record)
-
-    def test_success_failure_retry_skip_finalize_trace(self):
-        backend = InMemoryStateBackend()
-        state = PipelineState({}, {}, {}, [])
-        store = StateStore(backend, state)
-
-        aid_ok = self._open_running(backend, "t::ok")
-        store.apply_success("t::ok", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid_ok)
-        assert backend.load_attempts("t::ok")[0].outcome == "succeeded"
-        assert backend.load_attempts("t::ok")[0].finished_at
-
-        aid_fail = self._open_running(backend, "t::fail")
-        store.apply_failure("t::fail", {"error_message": "boom"}, attempt_id=aid_fail)
-        rec = backend.load_attempts("t::fail")[0]
-        assert rec.outcome == "failed"
-        assert rec.error_message == "boom"
-
-        aid_retry = self._open_running(backend, "t::retry")
-        store.apply_retry(
-            "t::retry",
-            {"task_type": "t", "job_id": "retry"},
-            Job("t", "retry").to_dict(),
-            attempt_id=aid_retry,
-            error_message="transient",
-        )
-        rec = backend.load_attempts("t::retry")[0]
-        assert rec.outcome == "requeued"
-        assert rec.error_message == "transient"
-
-        aid_skip = self._open_running(backend, "t::skip")
-        store.apply_skip("t::skip", attempt_id=aid_skip)
-        assert backend.load_attempts("t::skip")[0].outcome == "skipped"
-
-    def test_trace_update_failure_degrades_without_blocking(self):
-        """旁路轨迹收尾失败（失败/重试/跳过路径）降级告警，不阻断主事务。"""
-        backend = InMemoryStateBackend()
-        state = PipelineState({}, {}, {}, [])
-
-        class TraceBreakingBackend(CommitFailureBackend):
-            def update_attempt(self, *a, **k):
-                raise RuntimeError("trace backend down")
-
-        store = StateStore(TraceBreakingBackend(backend), state)
-        aid = self._open_running(backend, "t::1")
-
-        store.apply_failure("t::1", {"error_message": "boom"}, attempt_id=aid)
-        assert "t::1" in store.state.failed
-
-    def test_success_missing_or_invalid_attempt_rolls_back_and_keeps_state_clean(self):
-        """成功提交缺少有效 running attempt 行时整体失败回滚，内存状态/统计/钩子不提前变化。"""
-        stats = defaultdict(int)
-        hooks: list[tuple[str, AttemptOutcome]] = []
-        store, state, backend = _make_store(
-            stats=stats,
-            on_attempt_finished=lambda uid, *, outcome: hooks.append((uid, outcome)),
-        )
-        job_snapshot = {"task_type": "t", "job_id": "1"}
-        state.register_in_flight("t::1")
-
-        with pytest.raises(_CommitCrashSignal, match="commit_job_success"):
-            store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {"score": 1}, "annotations": {}}, job_snapshot=job_snapshot, attempt_id=None)
-
-        assert "t::1" not in store.state.successes
-        assert "t::1" not in backend.load_successes()
-        assert "t::1" in store.state.queue_uids
-        assert stats["succeeded"] == 0
-        assert hooks == []
 
 
 class TestSnapshotAndMembership:
@@ -899,7 +622,7 @@ class TestSnapshotAndMembership:
             {"c": "v"},
             [{"task_type": "q", "job_id": "1"}],
         )
-        return StateStore(InMemoryStateBackend(), state)
+        return StateStore(InMemoryStateBackend(schema_version=6), state)
 
     def test_membership_predicates(self):
         """成员判定经 store.state 单一访问路径（六集合统一谓词）。"""
@@ -935,7 +658,7 @@ class TestSnapshotAndMembership:
         assert store.state is fresh
         store.set_state(None)
         assert store.state.is_empty
-        new_backend = InMemoryStateBackend()
+        new_backend = InMemoryStateBackend(schema_version=6)
         store.set_backend(new_backend)
         assert store.backend is new_backend
 
@@ -989,7 +712,7 @@ class _MutexProbe:
     """对一组随机操作执行真实状态机协议，并在每步后断言互斥不变式。"""
 
     def __init__(self) -> None:
-        self.backend = InMemoryStateBackend()
+        self.backend = InMemoryStateBackend(schema_version=6)
         self.state = PipelineState({}, {}, {}, [])
         self.store = StateStore(self.backend, self.state)
 
@@ -1007,21 +730,21 @@ class _MutexProbe:
             self.store.state.spawn_jobs([_job_snapshot(uid)], front=False)
         elif action == "success":
             self._pop_from_memory_queue(uid)
-            aid = _open_running_attempt(self.backend, uid)
-            self.store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"score": i}, "annotations": {}}, attempt_id=aid)
+            aid = _start_execution(self.backend, uid)
+            self.store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"score": i}, "annotations": {}}, **aid)
         elif action == "failure":
             self._pop_from_memory_queue(uid)
             self.store.apply_failure(uid, {"error_message": "boom"}, job_snapshot=_job_snapshot(uid))
         elif action == "mark_failed":
             # mark_failed_memory 是失败登记的内存尾段：先完成后端提交再登记
             self._pop_from_memory_queue(uid)
-            if self.backend.commit_job_failure(uid, {"error_message": "tail"}):
-                self.store.mark_failed_memory(uid, {"error_message": "tail"})
+            self.backend.commit_job_failure(uid, {"error_message": "tail"})
+            self.store.mark_failed_memory(uid, {"error_message": "tail"})
         elif action == "retry":
             if uid in self.store.state.successes or uid in self.store.state.failed:
                 return
             self._pop_from_memory_queue(uid)
-            self.store.apply_retry(uid, _job_snapshot(uid), _job_snapshot(uid))
+            self.store.apply_retry(uid, _job_snapshot(uid), _job_snapshot(uid), **_start_execution(self.backend, uid))
         elif action == "skip":
             self._pop_from_memory_queue(uid)
             self.store.apply_skip(uid)
@@ -1073,8 +796,8 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     assert uid in probe.store.state.failed
     assert uid not in probe.store.state.successes
 
-    aid = _open_running_attempt(probe.backend, uid)
-    probe.store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"score": 1}, "annotations": {}}, attempt_id=aid)
+    aid = _start_execution(probe.backend, uid)
+    probe.store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"score": 1}, "annotations": {}}, **aid)
     assert uid in probe.store.state.successes
     assert uid not in probe.store.state.failed
 
@@ -1084,66 +807,17 @@ def test_terminal_transitions_move_uid_exactly_out_of_opposite_set(i):
     probe.assert_mutex()
 
 
-class TestRecordAttemptSeam:
-    """StateStore 对 attempt 轨迹写入的统一持久化接缝测试。"""
-
-    def test_record_attempt_dispatch_success_and_propagates_failure(self):
-        backend = InMemoryStateBackend()
-        store = StateStore(backend)
-        job = Job("fetch", "1")
-
-        # 正常记录 dispatch
-        attempt_id = store.record_attempt_dispatch(
-            job, execution_id="run1.1", run_id="run1"
-        )
-        assert attempt_id is not None
-        records = backend.load_attempts("fetch::1")
-        assert len(records) == 1
-        assert records[0].outcome == "running"
-        assert records[0].execution_id == "run1.1"
-
-        # run_id 为空时不写轨迹
-        assert store.record_attempt_dispatch(job, execution_id="x", run_id=None) is None
-
-        # 开行写入失败时向上传播异常（不静默返回 None）
-        def fail_append(_record):
-            raise RuntimeError("append_attempt failed")
-
-        backend.append_attempt = fail_append  # type: ignore[method-assign]
-        with pytest.raises(RuntimeError, match="append_attempt failed"):
-            store.record_attempt_dispatch(job, execution_id="run1.2", run_id="run1")
-
-    def test_record_attempt_skip_success_and_degraded(self):
-        backend = InMemoryStateBackend()
-        store = StateStore(backend)
-        job = Job("skip_type", "2")
-
-        # 正常记录 skip
-        store.record_attempt_skip(job, "SKIPPED", run_id="run1", dispatch_no=2)
-        records = backend.load_attempts("skip_type::2")
-        assert len(records) == 1
-        assert records[0].outcome == "skipped"
-        assert records[0].error_message == "SKIPPED"
-        assert records[0].execution_id == "run1.skip.2"
-
-        # run_id 为空时不写轨迹
-        store.record_attempt_skip(job, "SKIPPED", run_id=None, dispatch_no=3)
-        assert len(backend.load_attempts("skip_type::2")) == 1
-
-
 def test_success_metadata_is_separate_from_framework_keys():
     store, state, backend = _make_store()
     metadata = {"run_count": 73, "last_run_at": "业务时间", "last_run_id": "业务身份",
                 "success_count": 99, "last_succeeded_at": "自定义时间",
                 "last_success_run_id": "自定义身份", "nested": {"error": "业务"}}
     state.register_in_flight("t::j")
-    aid = _open_running_attempt(backend, "t::j", execution_id="actual.1", run_id="actual")
+    aid = _start_execution(backend, "t::j", execution_id="actual.1", run_id="actual")
     store.apply_success(
         "t::j",
         result={"message": None, "exception": None, "metadata": metadata, "annotations": {}},
-        run_id="actual",
-        attempt_id=aid,
-        execution_id="actual.1",
+        **aid,
         finished_at="2026-05-01T00:00:09+00:00",
     )
     stored = backend.load_successes()["t::j"]
@@ -1152,9 +826,9 @@ def test_success_metadata_is_separate_from_framework_keys():
     assert stored["success_count"] == 1
     assert stored["last_succeeded_at"] == "2026-05-01T00:00:09+00:00"
     assert stored["last_success_run_id"] == "actual"
-    (rec,) = backend.load_attempts("t::j")
-    assert rec.outcome == "succeeded"
-    assert rec.finished_at == "2026-05-01T00:00:09+00:00"
+    (rec,) = backend.load_settled_attempts("t::j")
+    assert rec["outcome"] == "success"
+    assert rec["settled_at"] == "2026-05-01T00:00:09+00:00"
     metadata["nested"]["error"] = "changed"
     assert backend.load_successes()["t::j"]["result"]["metadata"]["nested"] == {"error": "业务"}
 
@@ -1164,48 +838,86 @@ def test_artifact_manifest_replaces_as_part_of_success_transaction(tmp_path, bac
     from tasklite.backend import SQLiteStateBackend
     from tasklite.models.artifact import ArtifactDeclaration
 
-    backend = InMemoryStateBackend() if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db")
+    backend = InMemoryStateBackend(schema_version=6) if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db", schema_version=6)
     state = PipelineState({}, {}, {}, [])
     store = StateStore(backend, state)
     uid = "t::artifacts"
     declaration = ArtifactDeclaration(str(tmp_path / "report"), name="report")
     anonymous = ArtifactDeclaration(str(tmp_path / "private"))
-    old = {"artifacts": {"old": {"path": str(tmp_path / "old")}}}
-    seed_aid = _open_running_attempt(backend, uid, execution_id="seed.1")
-    assert backend.commit_job_success(uid, old, attempt_id=seed_aid, finished_at="2026-01-01T00:00:01+00:00")
-    state.mark_success(uid, old)
-    aid = _open_running_attempt(backend, uid)
+    seed_aid = _start_execution(backend, uid, execution_id="seed.1")
+    store.apply_success(
+        uid, result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
+        declared_artifacts=[ArtifactDeclaration(str(tmp_path / "old"), name="old")],
+        **seed_aid,
+    )
+    assert state.successes[uid]["artifacts"] == backend.load_successes()[uid]["artifacts"]
+    aid = _start_execution(backend, uid)
     store.apply_success(
         uid, result={"message": None, "exception": None, "metadata": {"artifacts": {"forged": {"path": "/fake"}}, "payload": {"artifacts": "business"}}, "annotations": {}},
-        declared_artifacts=[declaration, anonymous], attempt_id=aid,
+        declared_artifacts=[declaration, anonymous], **aid,
     )
     expected = {"report": {"path": declaration.path}}
     assert state.successes[uid]["artifacts"] == expected
     assert backend.load_successes()[uid]["artifacts"] == expected
     assert state.successes[uid]["result"]["metadata"]["payload"] == {"artifacts": "business"}
-    aid = _open_running_attempt(backend, uid, execution_id="run_abc.2")
-    store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"artifacts": expected}, "annotations": {}}, attempt_id=aid)
+    aid = _start_execution(backend, uid, execution_id="run_abc.2")
+    store.apply_success(uid, result={"message": None, "exception": None, "metadata": {"artifacts": expected}, "annotations": {}}, **aid)
     assert state.successes[uid]["artifacts"] == {}
     assert backend.load_successes()[uid]["artifacts"] == {}
 
 
-def test_artifact_manifest_does_not_change_before_success_commit(tmp_path):
+
+
+@pytest.mark.parametrize("metadata", [
+    {},
+    {"last_succeeded_at": "2026-05-01T00:00:05Z"},
+    {"last_succeeded_at": "2026-05-01T00:00:05Z", "success_count": 0},
+    {"last_succeeded_at": "2026-05-01T00:00:05Z", "success_count": True},
+    {"last_succeeded_at": "corrupt", "success_count": 1},
+    {"last_succeeded_at": "2026-05-01T00:00:05Z", "success_count": 1, "last_success_run_id": ""},
+    {"last_succeeded_at": "2026-05-01T00:00:09Z", "success_count": 1, "last_success_run_id": "run_abc"},
+])
+def test_trusted_baseline_rejects_untrusted_or_mismatched_metadata(metadata):
+    store, state, backend = _make_store()
+    identity = _start_execution(backend)
+    store.apply_success(
+        "t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
+        finished_at="2026-05-01T00:00:05Z", **identity,
+    )
+    assert store.trusted_last_succeeded_at_us("t::1") is not None
+    state.discard_success("t::1")
+    assert store.trusted_last_succeeded_at_us("t::1") is None
+    state.mark_success("t::1", metadata)
+    assert store.trusted_last_succeeded_at_us("t::1") is None
+
+
+@pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
+def test_artifact_manifest_stays_committed_when_settlement_fails(tmp_path, monkeypatch, backend_kind):
+    from tasklite.backend import SQLiteStateBackend
     from tasklite.models.artifact import ArtifactDeclaration
 
-    store, state, backend = _make_store()
-    old = {"artifacts": {"old": {"path": str(tmp_path / "old")}}}
-    seed_aid = _open_running_attempt(backend, execution_id="seed.1")
-    assert backend.commit_job_success("t::1", old, attempt_id=seed_aid, finished_at="2026-01-01T00:00:01+00:00")
-    state.mark_success("t::1", old)
-    store.set_backend(CommitFailureBackend(backend, failing=["commit_job_success"]))
-    aid = _open_running_attempt(backend)
-    with pytest.raises(_CommitCrashSignal):
+    backend = InMemoryStateBackend(schema_version=6) if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db", schema_version=6)
+    store = StateStore(backend)
+    result = {"message": None, "exception": None, "metadata": {}, "annotations": {}}
+    old = ArtifactDeclaration(str(tmp_path / "old"), name="old")
+    store.apply_success("t::1", result=result, declared_artifacts=[old], **_start_execution(backend))
+    before = backend.load_successes()
+    identity = _start_execution(backend)
+    error = OSError("结算不可写")
+    def fail(**kwargs):
+        raise error
+    monkeypatch.setattr(backend, "commit_job_settlement", fail)
+    with pytest.raises(OSError) as caught:
         store.apply_success(
-            "t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
-            attempt_id=aid,
+            "t::1", result=result,
+            declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
+            **identity,
         )
-    assert state.successes["t::1"] == old
-    assert backend.load_successes()["t::1"] == old
+    assert caught.value is error
+    assert store.state.successes == backend.load_successes() == before
+    assert len(backend.load_settled_attempts("t::1")) == 1
+    assert backend.load_queue_jobs()[0]["status"] == "running"
+    backend.close()
 
 
 def test_sqlite_artifact_publication_rolls_back_with_cursor_transaction(tmp_path):
@@ -1213,23 +925,28 @@ def test_sqlite_artifact_publication_rolls_back_with_cursor_transaction(tmp_path
     from tasklite.backend import SQLiteStateBackend
     from tasklite.models.artifact import ArtifactDeclaration
 
-    db_path = tmp_path / "state.db"
-    backend = SQLiteStateBackend(db_path)
-    old = {"artifacts": {"old": {"path": str(tmp_path / "old")}}}
-    seed_aid = _open_running_attempt(backend, execution_id="seed.1")
-    assert backend.commit_job_success("t::1", old, attempt_id=seed_aid, finished_at="2026-01-01T00:00:01+00:00")
-    state = PipelineState(backend.load_successes(), {}, {}, [])
-    store = StateStore(backend, state)
-    aid = _open_running_attempt(backend)
-    with sqlite3.connect(db_path) as connection:
+    backend = SQLiteStateBackend(tmp_path / "state.db", schema_version=6)
+    store = StateStore(backend)
+    result = {"message": None, "exception": None, "metadata": {}, "annotations": {}}
+    store.apply_success(
+        "t::1", result=result,
+        declared_artifacts=[ArtifactDeclaration(str(tmp_path / "old"), name="old")],
+        **_start_execution(backend),
+    )
+    before = backend.load_successes()
+    identity = _start_execution(backend)
+    with backend._get_conn() as connection:
         connection.execute("CREATE TRIGGER reject_cursor BEFORE INSERT ON cursors BEGIN SELECT RAISE(ABORT, 'cursor unavailable'); END")
-    with pytest.raises(_CommitCrashSignal):
+    with pytest.raises(sqlite3.IntegrityError, match="cursor unavailable"):
         store.apply_success(
-            "t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
-            attempt_id=aid, cursor_updates={"batch": "2"},
-            spawned_job_snapshots=[Job("child", "1").to_dict()],
+            "t::1", result=result,
+            declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
+            cursor_updates={"batch": "2"}, spawned_job_snapshots=[Job("child", "1").to_dict()],
+            **identity,
         )
-    assert backend.load_successes()["t::1"] == old
-    assert state.successes["t::1"] == old
+    assert store.state.successes == backend.load_successes() == before
     assert backend.load_cursors() == {}
-    assert backend.load_queue() == []
+    assert len(backend.load_settled_attempts("t::1")) == 1
+    (running,) = backend.load_queue_jobs()
+    assert running["job_uid"] == "t::1" and running["status"] == "running"
+    backend.close()

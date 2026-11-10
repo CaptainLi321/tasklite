@@ -19,12 +19,14 @@ from .errorclass import ErrorClassifier
 from .governor import DEADLOCK_GAP_MAX_ROUNDS, DeadlockGovernor
 from .resource import ResourceManager
 from .scheduler import FifoOrderingPolicy, OrderingPolicy
-from .store import COMMIT_FAILURE_THRESHOLD
 from ..backend.base import AbstractStateBackend
 from ..models.task import TaskRegistry
 
 if TYPE_CHECKING:  # 仅静态分析导入，避免运行时环形导入
     from .channel import ExecutionChannel
+
+
+COMMIT_FAILURE_THRESHOLD = 3
 
 
 @dataclass(frozen=True)

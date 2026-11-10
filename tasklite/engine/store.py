@@ -1,6 +1,6 @@
 """v2 StateStore: 统一内存状态机与后端持久化事务的深模块。
 
-内敛原子双写一致性、六集合全局互斥、commit 失败 3-strike 收敛记账与
+内敛原子双写一致性、六集合全局互斥与
 依赖图级联分析。单一出口纪律：
 
 - Job 终结事务唯一经由本模块的 apply_* 出口族收敛（成功 / 失败 / 重试 /
@@ -10,8 +10,7 @@
   单点维护）；
 - attempt 收尾事件钩子唯一经由 ``fire_attempt_finished`` 触发（异常隔离
   + hook_errors 计数）；
-- attempts 轨迹为 append-only 观测面：成功收尾与 successes 同事务提交（可信
-  基线来源）；失败/重试/跳过收尾更新失败降级告警、绝不阻断主事务。
+- Attempt 为追加式执行轨迹，与对应结果同事务结算；事务异常原样传播。
 """
 
 from __future__ import annotations
@@ -25,18 +24,9 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Mapping, Sequence
 
 from ..backend.base import AbstractStateBackend
-from ..backend.sqlite_backend import TARGET_SCHEMA_VERSION
-from ..exceptions import TaskLiteError, _CommitCrashSignal, _JobTerminated
+from ..exceptions import TaskLiteError
 from ..models.artifact import ArtifactDeclaration, resolve_path_against_base
-from ..models.attempt import (
-    ATTEMPT_FAILED,
-    ATTEMPT_REQUEUED,
-    ATTEMPT_RUNNING,
-    ATTEMPT_SKIPPED,
-    ATTEMPT_SUCCEEDED,
-    AttemptRecord,
-)
-from ..models.job import Job, JobRuntimeState, inject_worker_resource
+from ..models.job import Job, inject_worker_resource
 from ..models.result import validate_strict_json_object
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Exclude
@@ -51,14 +41,10 @@ from .admission import (
     extract_trusted_metadata_timestamp_us,
     is_trusted_success_metadata,
 )
-from .errorclass import ERR_COMMIT_FAILURE, ERR_JOB_DEPENDENCY, ErrorClassifier
+from .errorclass import ERR_JOB_DEPENDENCY, ErrorClassifier
 from .types import TRANSIENT_KIND_STAT_KEYS, AttemptOutcome
 
 logger = logging.getLogger("tasklite")
-
-# commit 连续失败达阈值后按确定性坏输入收敛进失败档案（此前为无限崩溃
-# 重启循环）；默认 3 次。
-COMMIT_FAILURE_THRESHOLD = 3
 
 
 @dataclass(frozen=True)
@@ -124,7 +110,6 @@ class StateStore:
         backend: AbstractStateBackend,
         state: PipelineState | None = None,
         *,
-        commit_failure_threshold: int = COMMIT_FAILURE_THRESHOLD,
         classifier: ErrorClassifier | None = None,
         on_attempt_finished: Callable[..., None] | None = None,
         stats: Any | None = None,
@@ -135,7 +120,6 @@ class StateStore:
     ) -> None:
         self._backend = backend
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
-        self._threshold = commit_failure_threshold
         self._classifier = classifier if classifier is not None else ErrorClassifier()
         self._on_attempt_finished = on_attempt_finished
         self._stats = stats
@@ -222,28 +206,6 @@ class StateStore:
             logger.warning(f"on_attempt_finished hook raised for {job_uid}: {e}")
             self._record_stat("hook_errors", 1)
 
-    def _finish_attempt(
-        self, attempt_id: int | None, *, outcome: str, error_message: str | None = None
-    ) -> None:
-        """attempts 旁路轨迹行收尾；失败降级告警，绝不阻断主事务。
-
-        attempt_id 为 None 表示本次终态没有对应的已派发轨迹行（伪 entry
-        / 未派发路径），无行可收尾。
-        """
-        if attempt_id is None:
-            return
-        try:
-            self._backend.update_attempt(
-                attempt_id,
-                outcome=outcome,
-                finished_at=utc_now_iso(),
-                error_message=error_message,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Attempt trace finalization degraded for attempt {attempt_id} "
-                f"(outcome={outcome}): {e}"
-            )
 
     @staticmethod
     def _attempt_error(metadata: Mapping[str, Any]) -> str | None:
@@ -529,39 +491,6 @@ class StateStore:
         inserted = self._backend.enqueue_jobs([job_snapshot])
         return bool(inserted)
 
-    def requeue_transient(
-        self,
-        job_snapshot: dict[str, Any],
-        *,
-        transient_kind: str,
-        attempt_id: int | None = None,
-        error_message: str | None = None,
-    ) -> None:
-        """瞬态信号降级回队的单一出口（军规：零预算 + 立即重入队 + 零污染）。
-
-        节奏唯一经 RequeuePolicy 规划（默认立即、队首插队——同轮内优先
-        重扫，瞬态作业不被新入队作业排挤到队尾）；统计键走
-        TRANSIENT_KIND_STAT_KEYS 登记表；不触碰 runtime——不烧 commit /
-        dispatch 失败预算、不写 last_retry_error。``attempt_id`` 非 None 时
-        同步把已派发轨迹行收尾为 requeued（旁路观测面单一出口内闭环）。
-        """
-        plan = self._requeue_policy.plan_requeue(job_snapshot, transient_kind=transient_kind)
-        self._state.requeue_jobs([job_snapshot], front=plan.front)
-        stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
-        if stat_key:
-            self._record_stat(stat_key, 1)
-        self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error_message=error_message)
-
-    def finish_attempt(
-        self, attempt_id: int | None, *, outcome: str, error_message: str | None = None
-    ) -> None:
-        """attempts 旁路轨迹行收尾的公开接缝（不经 apply_* 事务的路径使用）。
-
-        典型消费方：派发机器的异常分支 requeue（未走 apply_retry 事务但
-        本次执行已终结为重入队）。收尾失败降级告警，不阻断主流程。
-        """
-        self._finish_attempt(attempt_id, outcome=outcome, error_message=error_message)
-
     def mark_job_running(
         self, job_uid: str, *, execution_id: str, run_id: str, started_at: str
     ) -> int:
@@ -584,64 +513,6 @@ class StateStore:
         except Exception as e:
             logger.critical(f"Failed to mark job running for {job_uid}: {e}")
             raise
-
-    def record_attempt_dispatch(
-        self,
-        job: Job,
-        *,
-        execution_id: str,
-        run_id: str | None,
-    ) -> int | None:
-        """记录作业派发尝试（写入 running 轨迹行；开行异常向外传播以阻止无行派发）。"""
-        if not run_id:
-            return None
-        record = AttemptRecord(
-            job_uid=job.uid,
-            activation_no=job.activation_no,
-            attempt_no=job.attempt_no,
-            execution_id=execution_id,
-            run_id=run_id,
-            started_at=utc_now_iso(),
-            outcome=ATTEMPT_RUNNING,
-        )
-        return self._backend.append_attempt(record)
-
-    def record_attempt_skip(
-        self,
-        job: Job,
-        error_message: str,
-        *,
-        run_id: str | None,
-        dispatch_no: int,
-    ) -> None:
-        """Skip 终态审计（旁路 attempts 轨迹：先插 running 开行，再收尾为 skipped）。"""
-        if not run_id:
-            return
-        try:
-            now = utc_now_iso()
-            execution_id = f"{run_id}.skip.{dispatch_no}"
-            attempt_id = self._backend.append_attempt(
-                AttemptRecord(
-                    job_uid=job.uid,
-                    activation_no=job.activation_no,
-                    attempt_no=job.attempt_no,
-                    execution_id=execution_id,
-                    run_id=run_id,
-                    started_at=now,
-                    outcome=ATTEMPT_RUNNING,
-                )
-            )
-            self._backend.update_attempt(
-                attempt_id,
-                outcome=ATTEMPT_SKIPPED,
-                finished_at=now,
-                error_message=error_message,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Attempt trace append degraded for skipped {job.uid}: {e}"
-            )
-
 
     def trusted_last_succeeded_at_us(
         self, job_uid: str, *, success_metadata: Mapping[str, Any] | None = None
@@ -795,7 +666,6 @@ class StateStore:
         attempt_no: int = 1,
         started_at: str | None = None,
         files: dict[str, Any] | None = None,
-        attempt_id: int | None = None,
         execution_id: str | None = None,
         finished_at: str | None = None,
     ) -> SuccessOutcome:
@@ -830,49 +700,32 @@ class StateStore:
         success_metadata["success_count"] = prev_count + 1
 
         spawned_snapshots = list(spawned_job_snapshots)
-        if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            self._backend.commit_job_settlement(
-                job_uid=job_uid,
-                outcome="success",
-                attempt_no=attempt_no,
-                execution_id=execution_id or "",
-                run_id=run_id or "run",
-                settled_at=effective_finished_at,
-                started_at=started_at,
-                job_snapshot=job_snapshot,
-                files=files,
-                result=success_metadata["result"],
-                error_message=None,
-                success_metadata=success_metadata,
-                spawned_job_snapshots=spawned_snapshots,
-                cursor_updates=cursor_updates,
-            )
-            committed = True
-        else:
-            committed = self._backend.commit_job_success(
-                job_uid,
-                success_metadata,
-                attempt_id=attempt_id,
-                execution_id=execution_id,
-                finished_at=effective_finished_at,
-                spawned_job_snapshots=spawned_snapshots,
-                cursor_updates=cursor_updates,
-            )
+        self._backend.commit_job_settlement(
+            job_uid=job_uid,
+            outcome="success",
+            attempt_no=attempt_no,
+            execution_id=execution_id or "",
+            run_id=run_id or "run",
+            settled_at=effective_finished_at,
+            started_at=started_at,
+            job_snapshot=job_snapshot,
+            files=files,
+            result=success_metadata["result"],
+            error_message=None,
+            success_metadata=success_metadata,
+            spawned_job_snapshots=spawned_snapshots,
+            cursor_updates=cursor_updates,
+        )
 
-        if committed:
-            if spawned_snapshots:
-                self._state.spawn_jobs(spawned_snapshots, front=True)
-            if cursor_updates:
-                self._state.update_cursors(cursor_updates)
-            self._state.mark_success(job_uid, success_metadata)
-            self._state.unregister_in_flight(job_uid)
-            self._record_stat("succeeded", 1)
-            spawned_uids = [job_uid_from_snapshot(j) for j in spawned_snapshots]
-            return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata, spawned_uids=spawned_uids)
-
-        # commit 失败走 3-strike 收敛契约（旧 schema 保留）
-        self.handle_commit_failure_strike(job_uid, "commit_job_success", job_snapshot, attempt_id=attempt_id)
-        return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata)
+        if spawned_snapshots:
+            self._state.spawn_jobs(spawned_snapshots, front=True)
+        if cursor_updates:
+            self._state.update_cursors(cursor_updates)
+        self._state.mark_success(job_uid, success_metadata)
+        self._state.unregister_in_flight(job_uid)
+        self._record_stat("succeeded", 1)
+        spawned_uids = [job_uid_from_snapshot(j) for j in spawned_snapshots]
+        return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata, spawned_uids=spawned_uids)
 
     def apply_failure(
         self,
@@ -888,7 +741,6 @@ class StateStore:
         settled_at: str | None = None,
         files: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
-        attempt_id: int | None = None,
         execution_id: str | None = None,
     ) -> FailureOutcome:
         """原子终态转移：永久失败（进入失败档案 + successes 互删 + 级联下游）。"""
@@ -899,7 +751,7 @@ class StateStore:
         if job_snapshot is not None:
             normalized_meta["job_snapshot"] = copy.deepcopy(job_snapshot)
         payload = self._extract_job_payload(job_snapshot)
-        if self._backend.schema_version >= TARGET_SCHEMA_VERSION and attempt_no is not None:
+        if attempt_no is not None:
             self._backend.commit_job_settlement(
                 job_uid=job_uid,
                 outcome="failure",
@@ -915,34 +767,15 @@ class StateStore:
                 failure_metadata=normalized_meta,
                 payload=payload,
             )
-            committed = True
-        elif self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            self._backend.commit_job_failure(job_uid, normalized_meta, payload)
-            committed = True
         else:
-            committed = self._backend.commit_job_failure(job_uid, normalized_meta, payload)
+            self._backend.commit_job_failure(job_uid, normalized_meta, payload)
 
-        if committed:
-            self.mark_failed_memory(job_uid, normalized_meta)
-            self._record_stat(count_as, 1)
-            if self._backend.schema_version < TARGET_SCHEMA_VERSION:
-                self._finish_attempt(
-                    attempt_id,
-                    outcome=ATTEMPT_FAILED,
-                    error_message=self._attempt_error(normalized_meta),
-                )
-            cascaded_uids: list[str] = []
-            if cascade:
-                cascaded_uids = self.cascade_fail(job_uid)
-            return FailureOutcome(job_uid=job_uid, failure_metadata=normalized_meta, cascaded_uids=cascaded_uids)
-
-        self.handle_commit_failure_strike(
-            job_uid,
-            self._attempt_error(normalized_meta) or "commit_job_failure",
-            job_snapshot,
-            attempt_id=attempt_id,
-        )
-        return FailureOutcome(job_uid=job_uid, failure_metadata=normalized_meta)
+        self.mark_failed_memory(job_uid, normalized_meta)
+        self._record_stat(count_as, 1)
+        cascaded_uids: list[str] = []
+        if cascade:
+            cascaded_uids = self.cascade_fail(job_uid)
+        return FailureOutcome(job_uid=job_uid, failure_metadata=normalized_meta, cascaded_uids=cascaded_uids)
 
     @staticmethod
     def _execution_record(
@@ -963,8 +796,7 @@ class StateStore:
     def _extract_job_payload(job_snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
         """提取可 JSON 序列化的业务 payload 快照（失败档案落盘用）。
 
-        不可序列化时降级为 None 并告警，绝不让快照失败把正常失败提交
-        打成 commit 失败（那会误触 3-strike 崩溃契约）。
+        不可序列化时降级为 None 并告警，不阻断失败提交。
         """
         if not isinstance(job_snapshot, dict):
             return None
@@ -994,43 +826,32 @@ class StateStore:
         files: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
         error_message: str | None = None,
-        attempt_id: int | None = None,
         execution_id: str | None = None,
     ) -> RetryOutcome:
         """原子状态转移：重试重入队（节奏经 RequeuePolicy 唯一出口）。"""
         plan = self._requeue_policy.plan_requeue(retry_job_snapshot, transient_kind=transient_kind)
-        if self._backend.schema_version >= TARGET_SCHEMA_VERSION:
-            self._backend.commit_job_settlement(
-                job_uid=job_uid,
-                outcome="retry",
-                attempt_no=attempt_no,
-                execution_id=execution_id or "",
-                run_id=run_id or "run",
-                settled_at=utc_now_iso(),
-                started_at=started_at,
-                job_snapshot=job_snapshot,
-                files=files,
-                result=result,
-                error_message=error_message,
-                requeued_job_snapshot=retry_job_snapshot,
-            )
-            committed = True
-        else:
-            committed = self._backend.commit_retry(job_uid, retry_job_snapshot, front=plan.front)
+        self._backend.commit_job_settlement(
+            job_uid=job_uid,
+            outcome="retry",
+            attempt_no=attempt_no,
+            execution_id=execution_id or "",
+            run_id=run_id or "run",
+            settled_at=utc_now_iso(),
+            started_at=started_at,
+            job_snapshot=job_snapshot,
+            files=files,
+            result=result,
+            error_message=error_message,
+            requeued_job_snapshot=retry_job_snapshot,
+        )
 
-        if committed:
-            self._state.unregister_in_flight(job_uid)
-            self._state.requeue_jobs([retry_job_snapshot], front=plan.front)
-            self._record_stat("retried", 1)
-            if transient_kind is not None:
-                stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
-                if stat_key:
-                    self._record_stat(stat_key, 1)
-            if self._backend.schema_version < TARGET_SCHEMA_VERSION:
-                self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error_message=error_message)
-            return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
-
-        self.handle_commit_failure_strike(job_uid, "commit_retry", job_snapshot, attempt_id=attempt_id)
+        self._state.unregister_in_flight(job_uid)
+        self._state.requeue_jobs([retry_job_snapshot], front=plan.front)
+        self._record_stat("retried", 1)
+        if transient_kind is not None:
+            stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
+            if stat_key:
+                self._record_stat(stat_key, 1)
         return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
 
     def apply_pending(
@@ -1072,15 +893,12 @@ class StateStore:
         job_uid: str,
         *,
         job_snapshot: dict[str, Any] | None = None,
-        attempt_id: int | None = None,
     ) -> SkipOutcome:
         """原子移除候选（清除磁盘与内存队列，不写 successes/failed）。"""
         self._backend.commit_skip(job_uid)
         self._state.remove_queued_uid(job_uid)
         self._state.unregister_in_flight(job_uid)
         self._record_stat("skipped", 1)
-        if self._backend.schema_version < TARGET_SCHEMA_VERSION:
-            self._finish_attempt(attempt_id, outcome=ATTEMPT_SKIPPED)
         return SkipOutcome(job_uid=job_uid, was_known=True)
 
     def apply_bulk_failure(
@@ -1160,101 +978,9 @@ class StateStore:
             )
         return cascade_uids
 
-    # ── commit 失败 3-strike 收敛契约 ─────────────────────────────────
-
-    def _register_commit_failure(self, job_snapshot: dict[str, Any]) -> int:
-        """3-strike 计数登记（计数递增的单一事实源）。
-
-        计数唯一表示是 runtime 命名空间的 ``_commit_failures``（经
-        JobRuntimeState 强类型往返）。
-        """
-        rt_state = JobRuntimeState.from_dict(job_snapshot.get("runtime"))
-        failures = rt_state.record_commit_failure()
-        job_snapshot["runtime"] = rt_state.to_dict()
-        return failures
-
-    def handle_commit_failure_strike(
-        self,
-        job_uid: str,
-        reason: str,
-        job_snapshot: dict[str, Any] | None = None,
-        *,
-        attempt_id: int | None = None,
-    ) -> None:
-        """单条 commit 失败的 3-strike 收敛处理（崩溃契约入口）。
-
-        未达阈值：requeue 内存 + 上抛 _CommitCrashSignal（磁盘队列原样
-        保留，崩溃重启后重试，防无限重试循环）；达阈值：按确定性坏输入
-        收敛进失败档案（触发钩子）并抛 _JobTerminated；阈值熔断写入也
-        失败时同样 requeue + 崩溃。
-        """
-        if job_snapshot is None:
-            try:
-                task_type, job_id = parse_job_uid(job_uid)
-            except TaskLiteError:
-                task_type, _, job_id = job_uid.partition("::")
-            job_snapshot = {
-                "task_type": task_type,
-                "job_id": job_id,
-            }
-
-        failures = self._register_commit_failure(job_snapshot)
-
-        if failures >= self._threshold:
-            logger.critical(
-                f"Backend commit failed {failures} times for {job_uid} ({reason}); "
-                f"treating as deterministic bad input, sending to failure "
-                f"archive instead of crashing."
-            )
-            strike_meta = {
-                "error_message": ERR_COMMIT_FAILURE,
-                "is_fatal": True,
-                "commit_failures": failures,
-            }
-            strike_committed = self._backend.commit_job_failure(
-                job_uid, strike_meta, payload=self._extract_job_payload(job_snapshot)
-            )
-            if strike_committed:
-                self.mark_failed_memory(job_uid, strike_meta)
-                self._record_stat("failed", 1)
-                self._finish_attempt(
-                    attempt_id, outcome=ATTEMPT_FAILED, error_message=ERR_COMMIT_FAILURE
-                )
-                self.fire_attempt_finished(
-                    job_uid,
-                    outcome=AttemptOutcome(
-                        success=False, will_retry=False, metadata=strike_meta
-                    ),
-                )
-                raise _JobTerminated(
-                    f"Job {job_uid} permanently failed after {failures} commit attempts."
-                )
-
-        # 未达阈值或熔断写入仍失败：requeue 并上抛崩溃信号
-        self._requeue_and_crash(job_uid, job_snapshot, reason, attempt_id=attempt_id)
-
-    def _requeue_and_crash(
-        self,
-        job_uid: str,
-        job_snapshot: dict[str, Any] | None,
-        reason: str,
-        *,
-        attempt_id: int | None = None,
-    ) -> None:
-        """单一出口：所有「commit 失败 → requeue 内存 + 崩溃」路径的收敛点。"""
-        self._state.unregister_in_flight(job_uid)
-        if job_snapshot is not None:
-            self._state.requeue_jobs([job_snapshot], front=True)
-        self._finish_attempt(attempt_id, outcome=ATTEMPT_REQUEUED, error_message=reason)
-        raise _CommitCrashSignal(
-            f"Backend commit returned False for {job_uid} ({reason}). "
-            f"On-disk queue preserved; crashing to avoid unbounded retry loop."
-        )
-
 
 __all__ = [
     "BulkFailureOutcome",
-    "COMMIT_FAILURE_THRESHOLD",
     "FailureEntry",
     "FailureOutcome",
     "RetryOutcome",

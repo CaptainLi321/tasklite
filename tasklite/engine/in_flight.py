@@ -51,9 +51,7 @@ class InFlightJob:
     handle: JobHandle | None = None
     started_monotonic: float | None = None
     lease: ResourceLease | None = None
-    # 已派发轨迹行 id 与执行代号：派发机器开行时落位，完成机器收尾时经
-    # store 落终态；伪条目（拒绝路径）为 None。
-    attempt_id: int | None = None
+    # 完整执行身份随 running 登记，结算时用于追加 Attempt。
     execution_id: str | None = None
     attempt_no: int = 1
     run_id: str = ""

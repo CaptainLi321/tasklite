@@ -1,10 +1,4 @@
-"""v2 DispatchMachine 派发机器测试：五关预检、两阶段租约、轨迹开行与瞬态分支。
-
-覆盖：DispatchOutcome 单一 kind 枚举判据、五关时序契约（dedup →
-dep-failed → no-handler → orphan-probe → stale-restore）、trigger 放行的
-激活推进（activation_no+1 / attempt_no 重置）、retry 候选来源与累计预算
-分离、派发即插 attempts 轨迹行与 execution_id 生成、派发失败 3-strike 收敛。
-"""
+"""派发预检、资源租约与当前 running 身份分配测试。"""
 
 from __future__ import annotations
 
@@ -27,7 +21,6 @@ from tasklite.engine.dispatch import (
     DispatchOutcome,
 )
 from tasklite.engine.errorclass import (
-    ERR_DISPATCH_FAILURE,
     ERR_JOB_DEPENDENCY,
     ERR_NO_HANDLER,
     ErrorClassifier,
@@ -43,7 +36,7 @@ from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import AttemptOutcome, StopMode
 from tasklite.models.artifact import FileSpec
-from tasklite.models.job import Job, JobRuntimeState, RT_DISPATCH_FAILURES
+from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
 
@@ -107,7 +100,7 @@ class DispatchEnv:
         if extra_resources:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
-        self.backend = InMemoryStateBackend()
+        self.backend = InMemoryStateBackend(schema_version=6)
         self.stats = defaultdict(int)
         self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.store = StateStore(
@@ -128,6 +121,12 @@ class DispatchEnv:
             completion=self.completion,
         )
         self.tasks = TaskRegistry()
+        spawn_jobs = self.store.state.spawn_jobs
+        def enqueue_pending(snapshots, *, front=False):
+            snapshots = list(snapshots)
+            self.backend.enqueue_jobs(snapshots, front=front)
+            return spawn_jobs(snapshots, front=front)
+        self.store.state.spawn_jobs = enqueue_pending
         self.dispatch = DispatchMachine(
             store=self.store,
             scheduler=JobScheduler(self.resources),
@@ -145,7 +144,6 @@ class DispatchEnv:
             classifier=ErrorClassifier(),
             output_roots=self.output_roots,
             ipc_dir=self.ipc_dir,
-            commit_failure_threshold=3,
         )
 
     def register(self, task_type: str) -> None:
@@ -199,8 +197,8 @@ class TestDispatchOutcomeKind:
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert set(env.backend.load_failed()) == {"t::gap", "t::downstream"}
         assert env.backend.load_failed()["t::gap"]["missing_dependency"] == "t::missing"
-        assert env.backend.load_attempts("t::gap") == []
-        assert env.backend.load_attempts("t::downstream") == []
+        assert env.backend.load_settled_attempts("t::gap") == []
+        assert env.backend.load_settled_attempts("t::downstream") == []
 
     def test_stop_keeps_missing_dependency_pending(self, tmp_path):
         env = DispatchEnv(tmp_path)
@@ -243,9 +241,9 @@ class TestDispatchOutcomeKind:
         assert second.kind is DispatchKind.AUTHORIZATION_PENDING
         assert set(env.store.state.queue_uids) == {"t::authorized", "t::gap"}
         assert env.backend.load_failed() == {}
-        assert env.backend.load_attempts("t::gap") == []
+        assert env.backend.load_settled_attempts("t::gap") == []
 
-    def test_spawned_entry_carries_attempt_row(self, tmp_path, monkeypatch):
+    def test_spawned_entry_carries_running_identity(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
@@ -264,19 +262,17 @@ class TestDispatchOutcomeKind:
         entry = outcome.entry
         assert entry is not None
         assert entry.job_uid == "t::j1"
-        assert entry.attempt_id is not None
+        assert entry.attempt_no == 1
+        assert env.backend.load_settled_attempts("t::j1") == []
         assert "t::j1" in env.in_flight
         assert "t::j1" in env.store.state.in_flight_uids
 
-        # 派发即插 running 轨迹行 + execution_id 生成于派发点
-        records = env.backend.load_attempts("t::j1")
-        assert len(records) == 1
-        assert records[0].outcome == "running"
-        assert records[0].execution_id == f"{env.session.run_id}.1"
-        assert records[0].run_id == env.session.run_id
-        assert records[0].activation_no == 1
-        assert records[0].attempt_no == 1
-        assert spawned_specs[0].execution_id == records[0].execution_id
+        (row,) = env.backend.load_queue_jobs()
+        assert row["status"] == "running"
+        assert row["execution_id"] == f"{env.session.run_id}.1"
+        assert row["run_id"] == env.session.run_id
+        assert row["attempt_no"] == 1
+        assert spawned_specs[0].execution_id == row["execution_id"]
 
 
 class TestDedupGate:
@@ -287,71 +283,14 @@ class TestDedupGate:
         env.register("t")
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         env.store.state.pop_job(0)
-        env.store.state.register_in_flight("t::j1")
-        aid = env.store.record_attempt_dispatch(
-            Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
-        )
-        env.store.apply_success("t::j1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
+        env.store.set_job_status("t::j1", "succeeded", recursive=False)
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert env.stats["skipped"] == 1
         assert "t::j1" not in env.store.state.queue_uids
-        # 跳过同样落轨迹行（skipped 结局）
-        records = env.backend.load_attempts("t::j1")
-        assert records[-1].outcome == "skipped"
-
-    def test_rerun_admission_advances_activation(self, tmp_path, monkeypatch):
-        """every_run 放行：activation_no+1、attempt_no 重置 1、字面 trigger 键落行。"""
-        env = DispatchEnv(tmp_path)
-        env.register("t")
-        env.store.state.register_in_flight("t::j1")
-        aid = env.store.record_attempt_dispatch(
-            Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
-        )
-        env.store.apply_success("t::j1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
-        env.store.state.spawn_jobs([Job("t", "j1", trigger="always").to_dict()])
-        monkeypatch.setattr(
-            env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
-        )
-
-        outcome = env.dispatch.dispatch_next()
-        assert outcome.kind is DispatchKind.SPAWNED
-        entry = outcome.entry
-        assert entry is not None
-        assert entry.job.activation_no == 2
-        assert entry.job.attempt_no == 1
-        assert entry.job_snapshot["trigger"] == "always"
-        assert entry.job_snapshot["activation_no"] == 2
-        assert entry.job_snapshot["attempt_no"] == 1
-        # 轨迹行按新激活代号落表
-        records = env.backend.load_attempts("t::j1")
-        assert records[-1].activation_no == 2
-        assert records[-1].attempt_no == 1
-        # 豁免已登记（in-flight 互斥不击落 successes 命中的重跑）
-        assert "t::j1" in env.store.state.in_flight_uids
-
-    def test_failed_hit_with_until_success_reruns(self, tmp_path, monkeypatch):
-        env = DispatchEnv(tmp_path)
-        env.register("t")
-        env.store.state.register_in_flight("t::j1")
-        aid = env.store.record_attempt_dispatch(
-            Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
-        )
-        env.store.apply_failure("t::j1", {"error_message": "boom"}, attempt_id=aid)
-        env.store.state.spawn_jobs(
-            [Job("t", "j1", trigger="until_success").to_dict()]
-        )
-        monkeypatch.setattr(
-            env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
-        )
-
-        outcome = env.dispatch.dispatch_next()
-        assert outcome.kind is DispatchKind.SPAWNED
-        assert outcome.entry.job.activation_no == 2
+        assert env.backend.load_settled_attempts("t::j1") == []
 
 
 class TestRejectGates:
@@ -370,8 +309,8 @@ class TestRejectGates:
             ("ghost::j1", AttemptOutcome(success=False, will_retry=False,
                                         metadata=env.store.state.failed["ghost::j1"]))
         ]
-        records = env.backend.load_attempts("ghost::j1")
-        assert records[-1].outcome == "failed"
+        records = env.backend.load_settled_attempts("ghost::j1")
+        assert records == []
 
     def test_dep_failed_gate_cascades_downstream(self, tmp_path):
         env = DispatchEnv(tmp_path)
@@ -496,112 +435,10 @@ class TestPreSubmitCleanupAndActiveSignals:
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.NO_CANDIDATE
         assert "t::j1" in env.store.state.queue_uids
-        rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
-        assert rt.dispatch_failures == 0, "资源等待不得计入派发失败 3-strike"
+        assert env.backend.get_attempt_sequence(job.uid) == 0
+        assert env.backend.load_settled_attempts(job.uid) == []
 
 
-class TestDispatchFailureStrike:
-    """派发异常分支：3-strike 派发失败预算收敛。"""
-
-    def _spawn_raises(self, env, exc):
-        def boom(spec):
-            raise exc
-
-        env.channel.spawn = boom
-
-    def test_below_threshold_requeues_and_raises(self, tmp_path):
-        env = DispatchEnv(tmp_path)
-        env.register("t")
-        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-        self._spawn_raises(env, RuntimeError("boom"))
-
-        with pytest.raises(RuntimeError, match="boom"):
-            env.dispatch.dispatch_next()
-        assert "t::j1" in env.store.state.queue_uids
-        rt = JobRuntimeState.from_dict(env.store.state.queue[0].get("runtime"))
-        assert rt.dispatch_failures == 1
-        records = env.backend.load_attempts("t::j1")
-        assert records[-1].outcome == "requeued"
-
-    def test_at_threshold_terminates_into_failure_archive(self, tmp_path):
-        env = DispatchEnv(tmp_path)
-        env.register("t")
-        jd = Job("t", "j1").to_dict()
-        jd["runtime"] = {RT_DISPATCH_FAILURES: 2}
-        env.store.state.spawn_jobs([jd])
-        self._spawn_raises(env, RuntimeError("deterministic badness"))
-
-        outcome = env.dispatch.dispatch_next()
-        assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert "t::j1" in env.store.state.failed
-        assert env.store.state.failed["t::j1"]["error_message"] == ERR_DISPATCH_FAILURE
-        assert env.store.state.failed["t::j1"]["failures"] == 3
-        records = env.backend.load_attempts("t::j1")
-        assert records[-1].outcome == "failed"
-        assert [uid for uid, _ in env.hooks] == ["t::j1"]
-
-    def test_interrupt_requeues_and_reraises(self, tmp_path):
-        env = DispatchEnv(tmp_path)
-        env.register("t")
-        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-        self._spawn_raises(env, KeyboardInterrupt())
-
-        with pytest.raises(KeyboardInterrupt):
-            env.dispatch.dispatch_next()
-        assert "t::j1" in env.store.state.queue_uids
-
-    def test_commit_crash_signal_passes_through_untouched(self, tmp_path):
-        from tasklite.exceptions import _CommitCrashSignal
-
-        env = DispatchEnv(tmp_path)
-        env.register("t")
-        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-
-        def boom(spec):
-            raise _CommitCrashSignal("backend down")
-
-        env.channel.spawn = boom
-        with pytest.raises(_CommitCrashSignal):
-            env.dispatch.dispatch_next()
-        # 崩溃信号穿透：不计派发失败预算、不写失败档案（交运行循环崩溃网
-        # 按磁盘真相统一收尾）
-        assert "t::j1" not in env.store.state.failed
-        assert env.stats["failed"] == 0
-        records = env.backend.load_attempts("t::j1")
-        assert records[-1].outcome == "running"
-
-    def test_assertion_error_passes_through(self, tmp_path):
-        env = DispatchEnv(tmp_path)
-        env.register("t")
-        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-
-        def boom(spec):
-            raise AssertionError("invariant broken")
-
-        env.channel.spawn = boom
-        with pytest.raises(AssertionError):
-            env.dispatch.dispatch_next()
-        assert "t::j1" not in env.store.state.failed
-        records = env.backend.load_attempts("t::j1")
-        assert records[-1].outcome == "running"
-
-    def test_worker_start_failure_releases_acquired_slots(self, tmp_path, monkeypatch):
-        env = DispatchEnv(tmp_path, capacity=1)
-        env.register("t")
-        env.store.state.spawn_jobs([
-            Job("t", "j1", resources={"__workers__": 1.0}).to_dict(),
-        ])
-
-        def fail_spawn(spec):
-            raise OSError("process start failed")
-
-        monkeypatch.setattr(env.channel, "spawn", fail_spawn)
-
-        with pytest.raises(OSError, match="process start failed"):
-            env.dispatch.dispatch_next()
-
-        assert env.resources["__workers__"].used == 0.0
-        assert "t::j1" not in env.in_flight
 
 
 class TestGateOrderContract:
@@ -615,11 +452,7 @@ class TestGateOrderContract:
         env.store.state.mark_failed("dead::parent", {"error_message": "dead"})
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         env.store.state.pop_job(0)
-        env.store.state.register_in_flight("t::j1")
-        aid = env.store.record_attempt_dispatch(
-            Job("t", "j1"), execution_id=f"{env.session.run_id}.1", run_id=env.session.run_id
-        )
-        env.store.apply_success("t::j1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, attempt_id=aid, execution_id=f"{env.session.run_id}.1")
+        env.store.set_job_status("t::j1", "succeeded", recursive=False)
         env.store.state.spawn_jobs([
             Job("t", "j1", depends_on=["dead::parent"]).to_dict()
         ])
@@ -631,33 +464,6 @@ class TestGateOrderContract:
         assert "t::j1" in env.store.state.failed
 
 
-class TestTraceAppendReliability:
-    """轨迹开行可靠保障：派发开行失败保队且不启动 handler。"""
-
-    def test_append_failure_preserves_queue_without_starting_handler(self, tmp_path, monkeypatch):
-        from tasklite.exceptions import _CommitCrashSignal
-
-        env = DispatchEnv(tmp_path)
-        env.register("t")
-        env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
-        monkeypatch.setattr(
-            env.backend,
-            "append_attempt",
-            lambda record: (_ for _ in ()).throw(RuntimeError("trace down")),
-        )
-        spawned: list[Any] = []
-        monkeypatch.setattr(
-            env.channel, "spawn",
-            lambda spec: spawned.append(spec) or env.spawn_handle(spec.job.uid, spec.execution_id),
-        )
-
-        with pytest.raises(_CommitCrashSignal, match="Failed to append attempt row"):
-            env.dispatch.dispatch_next()
-        assert spawned == []
-        assert "t::j1" in env.store.state.queue_uids
-        assert "t::j1" not in env.in_flight
-        assert "t::j1" not in env.store.state.in_flight_uids
-        assert env.backend.load_attempts("t::j1") == []
 
 
 class TestAdmissionEvaluationTiming:
@@ -690,7 +496,7 @@ class TestAdmissionEvaluationTiming:
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.mark_success("t::j1", {})
-        retry_job = Job._restore("t", "j1", attempt_no=2, activation_no=1)
+        retry_job = Job("t", "j1")
         env.store.state.spawn_jobs([retry_job.to_dict()])
         env.session._retry_counts["t::j1"] = 1
         if registered_as_retry:
@@ -703,8 +509,59 @@ class TestAdmissionEvaluationTiming:
         outcome = env.dispatch.dispatch_next()
         if registered_as_retry:
             assert outcome.kind is DispatchKind.SPAWNED
-            assert outcome.entry.job.attempt_no == 2
+            assert outcome.entry.job.attempt_no == 1
         else:
             assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
             assert env.stats["skipped"] == 1
             assert "t::j1" not in env.store.state.queue_uids
+
+
+@pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "retry"])
+def test_dispatch_and_settlement_use_current_protocol_only(tmp_path, monkeypatch, backend_kind, outcome):
+    """真实 running 编号与追加结算不读取格式，也不调用旧写协议。"""
+    from tasklite.backend import SQLiteStateBackend
+    from tasklite.engine.channel import ExecutionResult
+
+    env = DispatchEnv(tmp_path)
+    if backend_kind == "sqlite":
+        env.backend = SQLiteStateBackend(tmp_path / "state.db", schema_version=6)
+
+    class CurrentBackend:
+        def __getattr__(self, name):
+            if name in {
+                "schema_version", "append_attempt", "update_attempt",
+                "commit_job_success", "commit_retry",
+            }:
+                raise AssertionError(f"引擎访问已删除的执行协议：{name}")
+            return getattr(env.backend, name)
+
+    env.store.set_backend(CurrentBackend())
+    env.register("t")
+    env.store.state.spawn_jobs([Job("t", "one", max_retries_per_run=1).to_dict()])
+    monkeypatch.setattr(
+        env.channel, "spawn",
+        lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
+    )
+    entry = env.dispatch.dispatch_next().entry
+    assert entry is not None
+    assert env.backend.get_attempt_sequence(entry.job_uid) == 1
+    assert env.backend.load_settled_attempts(entry.job_uid) == []
+    env.dispatch._completion.complete_job(entry, ExecutionResult(
+        success=outcome == "success", retry_requested=outcome == "retry",
+    ))
+    (attempt,) = env.backend.load_settled_attempts(entry.job_uid)
+    assert attempt["outcome"] == outcome
+    assert attempt["run_id"] == entry.run_id
+    assert attempt["attempt_no"] == entry.attempt_no == 1
+    assert env.resources["__workers__"].used == 0
+    assert len(env.hooks) == 1
+    if outcome == "retry":
+        second = env.dispatch.dispatch_next().entry
+        assert second is not None
+        assert second.attempt_no == 2
+        assert second.execution_id != entry.execution_id
+        assert len(env.backend.load_settled_attempts(entry.job_uid)) == 1
+        env.dispatch._completion.complete_job(second, ExecutionResult(success=True))
+        assert [row["attempt_no"] for row in env.backend.load_settled_attempts(entry.job_uid)] == [1, 2]
+    env.backend.close()

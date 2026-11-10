@@ -9,8 +9,6 @@ import tasklite.exceptions as exc_mod
 from tasklite.exceptions import (
     TaskLiteError,
     _ArtifactIOError,
-    _CommitCrashSignal,
-    _JobTerminated,
 )
 
 
@@ -48,7 +46,7 @@ class TestInternalSignalsEscapeExceptException:
 
     @pytest.mark.parametrize(
         "signal_cls",
-        [_ArtifactIOError, _CommitCrashSignal, _JobTerminated],
+        [_ArtifactIOError],
         ids=lambda c: c.__name__,
     )
     def test_signals_inherit_base_exception(self, signal_cls):
@@ -59,7 +57,7 @@ class TestInternalSignalsEscapeExceptException:
 
     @pytest.mark.parametrize(
         "signal_cls",
-        [_ArtifactIOError, _CommitCrashSignal, _JobTerminated],
+        [_ArtifactIOError],
         ids=lambda c: c.__name__,
     )
     def test_signals_not_swallowed_by_except_exception(self, signal_cls):
