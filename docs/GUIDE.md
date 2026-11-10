@@ -73,7 +73,7 @@ task = Task(
 pipeline.register_task(task)
 ```
 
-`TaskRegistry` 契约：`task_type` 一对一绑定；重复注册抛出 `ValueError`，未注册执行抛出 `KeyError`。
+`TaskRegistry` 契约：`task_type` 一对一绑定；重复注册与未注册查询均抛出 `TaskLiteError`。
 
 ### Job：逻辑实例层
 
