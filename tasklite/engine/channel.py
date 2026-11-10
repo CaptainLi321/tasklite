@@ -796,6 +796,8 @@ class ExecutionChannel:
                 self._handles.pop(exec_id, None)
                 receiver = self._receivers.pop(exec_id, None)
                 self._errors.pop(exec_id, None)
+                # 结果后不再回复声明；接收端独立移交，不等待 worker 退出。
+                self._close_handle_pipe(exec_id)
 
                 is_alive = False
                 try:

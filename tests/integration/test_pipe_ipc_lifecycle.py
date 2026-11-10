@@ -158,8 +158,21 @@ def test_spawn_and_declarations_ignore_directory_environment(tmp_path, monkeypat
     with TaskLite(backend=backend, output_roots=output, max_workers=1, **options) as pipeline:
         pipeline.register_task("parent", success_handler)
         pipeline.register_task("child", child_handler)
+        channel = pipeline._runtime.channel
+        reply_senders = []
+        original_spawn = channel.spawn
+
+        def capture_reply_sender(spec):
+            handle = original_spawn(spec)
+            reply_senders.append(channel.get_reply_sender(handle.execution_id))
+            return handle
+
+        monkeypatch.setattr(channel, "spawn", capture_reply_sender)
         pipeline.enqueue(Job("parent", "parent"))
         pipeline.run()
+        assert len(reply_senders) == 2
+        assert channel._reply_senders == {}
+        assert all(sender._closed and sender._conn.closed for sender in reply_senders)
         state = pipeline._runtime.store.backend
         success = state.load_successes()["parent::parent"]
         assert success["result"]["metadata"]["worker_pid"] != os.getpid()
@@ -173,6 +186,13 @@ def test_spawn_and_declarations_ignore_directory_environment(tmp_path, monkeypat
         assert pipeline._runtime.channel._handles == {}
         assert pipeline._runtime.channel._receivers == {}
         assert not ipc_path.parent.exists()
+        pipeline.enqueue(Job("child", "next-run"))
+        pipeline.run()
+        assert len(reply_senders) == 3
+        assert channel._reply_senders == {}
+        assert all(sender._closed and sender._conn.closed for sender in reply_senders)
+    assert channel._reply_senders == {}
+    assert all(sender._closed and sender._conn.closed for sender in reply_senders)
     assert not ipc_path.parent.exists()
     assert not mp.active_children()
     assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]

@@ -17,7 +17,7 @@ from tasklite.engine.channel import (
     _decode_ipc_result,
     _worker_process_entry,
 )
-from tasklite.engine.types import JobHandle
+from tasklite.engine.types import AuthorizationOutcome, AuthorizationStatus, JobHandle
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
@@ -26,6 +26,7 @@ from tasklite.utils.ipc import (
     WorkerPipeMessage,
     WorkerPipeSender,
     create_worker_pipe,
+    create_worker_reply_pipe,
 )
 
 _EXECUTION_ID = "deadbeefdeadbeefdeadbeefdeadbeef.1"
@@ -778,3 +779,109 @@ def test_terminal_failure_only_records_observed_exit_evidence(exitcode):
         assert result.annotations["signal"]
     else:
         assert "signal" not in result.annotations
+
+
+@pytest.mark.parametrize("status", ["success", "failure", "retry"])
+@pytest.mark.parametrize("alive", [False, True])
+def test_result_releases_reply_pipe_before_worker_exit(status, alive):
+    channel = ExecutionChannel()
+    job = Job("task", "reply")
+    process = TestWatchdogReap._HungProcess()
+    process._alive = alive
+    process.joined = False
+
+    def join(timeout=None):
+        process.joined = True
+
+    process.join = join
+    handle = JobHandle(
+        job_uid=job.uid, process=process,
+        timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60,
+        job=job, execution_id=_EXECUTION_ID,
+    )
+    reply_receiver, reply_sender = create_worker_reply_pipe(
+        job_uid=job.uid, execution_id=_EXECUTION_ID,
+    )
+    receiver_closes = []
+    receiver = SimpleNamespace(
+        take_messages=lambda: [], eof=False,
+        close=lambda timeout: receiver_closes.append(timeout),
+    )
+    channel._receivers[_EXECUTION_ID] = receiver
+    channel._handles[_EXECUTION_ID] = handle
+    channel._reply_senders[_EXECUTION_ID] = reply_sender
+    channel._results[_EXECUTION_ID] = {
+        "status": status, "metadata": {"trusted": True},
+    }
+    if status == "retry":
+        channel._results[_EXECUTION_ID]["consume_budget"] = True
+    try:
+        completed = channel.reap_completed([handle])
+        assert completed[0][1].result_metadata == {"trusted": True}
+        assert completed[0][1].success is (status == "success")
+        assert completed[0][1].retry_requested is (status == "retry")
+        assert channel._reply_senders == {}
+        assert reply_sender._closed
+        assert reply_sender._conn.closed
+        if alive:
+            assert process.is_alive()
+            assert not process.joined
+            assert channel._lingering_workers == [(_EXECUTION_ID, process, receiver)]
+            assert receiver_closes == []
+        channel.close()
+        channel.close()
+        assert channel._lingering_workers == []
+        assert channel._reply_senders == {}
+    finally:
+        channel.close()
+        reply_sender.close()
+        reply_receiver.close()
+
+
+@pytest.mark.parametrize("route", ["crash", "timeout", "error", "authorization", "abort", "cleanup", "close"])
+def test_terminal_paths_release_reply_pipe(route):
+    channel = ExecutionChannel()
+    job = Job("task", "terminal")
+    process = TestWatchdogReap._HungProcess()
+    process._alive = route == "timeout"
+    handle = JobHandle(
+        job_uid=job.uid, process=process,
+        timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=1,
+        job=job, execution_id=_EXECUTION_ID,
+    )
+    reply_receiver, reply_sender = create_worker_reply_pipe(
+        job_uid=job.uid, execution_id=_EXECUTION_ID,
+    )
+    channel._handles[_EXECUTION_ID] = handle
+    channel._reply_senders[_EXECUTION_ID] = reply_sender
+    try:
+        if route == "error":
+            error = OSError("broken worker frame")
+            channel._errors[_EXECUTION_ID] = error
+            with pytest.raises(OSError) as raised:
+                channel.reap_completed([handle])
+            assert raised.value is error
+        elif route == "authorization":
+            handle.authorization_outcome = AuthorizationOutcome(
+                status=AuthorizationStatus.DENIED, message="未获授权", path="output",
+            )
+            result, = channel.reap_completed([handle])
+            assert result[1].authorization_outcome is handle.authorization_outcome
+        elif route == "abort":
+            assert channel.abort_in_flight([handle]).cancelled == [handle]
+        elif route == "cleanup":
+            channel.cleanup_in_flight([handle])
+        elif route == "close":
+            channel.close()
+        else:
+            result, = channel.reap_completed([handle])
+            assert not result[1].success
+        assert channel._reply_senders == {}
+        assert reply_sender._closed
+        assert reply_sender._conn.closed
+        channel.close()
+        assert channel._reply_senders == {}
+    finally:
+        channel.close()
+        reply_sender.close()
+        reply_receiver.close()
