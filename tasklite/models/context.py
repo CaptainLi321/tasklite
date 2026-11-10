@@ -19,7 +19,6 @@ from ..utils.ipc import (
     WorkerPipeSender,
     WorkerReplyReceiver,
 )
-from ..utils.jsonutil import dumps
 from .artifact import (
     FileSpec,
     coerce_file_spec,
@@ -186,7 +185,7 @@ class JobContext:
         return Path(resolved_path)
 
     def spawn(self, job: Job) -> None:
-        """入队一个子 job（捕获固定路径基准下的独立快照并预检依赖引用与 JSON 序列化性）。"""
+        """入队一个子 job（捕获固定路径基准下的独立快照并校验依赖引用与 JSON 对象契约）。"""
         if not isinstance(job, Job):
             raise TypeError(
                 f"spawn() expects a Job, got {type(job).__name__}"
@@ -204,14 +203,6 @@ class JobContext:
             base_dir=self.base_dir,
             depends_on=job_dict.get("depends_on") or (),
         )
-        try:
-            # allow_nan=False——默认 allow_nan=True 会让
-            # float('inf')/float('nan') 通过预检，产出非标准 JSON "Infinity"。
-            dumps(job_dict)
-        except (TypeError, ValueError) as e:
-            raise ValueError(
-                f"Payload for spawned job {job.uid} is not JSON-serializable: {e}"
-            ) from e
         self.spawned_jobs.append(Job.from_dict(job_dict))
 
     def get_cursor(self, key: str) -> str | None:

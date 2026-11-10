@@ -749,8 +749,10 @@ class TestIntakePipeline:
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
         )
-        with pytest.raises(ValueError, match="not JSON-serializable"):
-            store.enqueue_job(Job("t", "1", payload={"bad": object()}))
+        job = Job("t", "1")
+        job.payload["bad"] = object()
+        with pytest.raises(TypeError, match="payload.bad"):
+            store.enqueue_job(job)
 
     def test_enqueue_rejects_non_job(self):
         store, _, _ = _make_store()
@@ -835,8 +837,10 @@ class TestIntakePipeline:
             PipelineState({}, {}, {}, []),
             trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
         )
-        with pytest.raises(ValueError, match="Spawned job"):
-            store.normalize_spawned_job(Job("t", "1", payload={"bad": object()}))
+        job = Job("t", "1")
+        job.payload["bad"] = object()
+        with pytest.raises(TypeError, match="payload.bad"):
+            store.normalize_spawned_job(job)
 
     def test_normalize_spawned_job_rejects_unregistered_task(self):
         from tasklite import TaskLiteError

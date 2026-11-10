@@ -288,26 +288,34 @@ def test_parent_success_atomic_with_spawned_and_cursor(tmp_path: Path):
     assert pipeline._runtime.store.backend.load_cursors().get("offset") == "100"
 
 
-class BadPayload:
-    pass
-
-
 def bad_parent_handler(job, ctx):
     ctx.set_cursor("offset", "999")
-    ctx.spawn(Job("child", "bad", payload={"bad": BadPayload()}))
+    ctx.spawn(Job("child", "valid"))
+    child = Job("child", "bad")
+    child.payload = (
+        {1: "integer", "1": "string"}
+        if job.payload["bad_kind"] == "keys"
+        else {"items": [(1, 2)]}
+    )
+    ctx.spawn(child)
     return TaskResult.success(metadata={"ok": 1})
 
 
-def test_invalid_spawned_job_rejects_parent_and_discards_effects(tmp_path: Path):
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("bad_kind", ["keys", "tuple"])
+def test_invalid_spawned_job_rejects_parent_and_discards_effects(tmp_path: Path, backend, bad_kind):
     """非法派生子作业导致父作业失败，所有暂存派生任务和游标更新整体丢弃。"""
-    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "bad_spawn.db")
+    pipeline = TaskLite(backend=backend, state_path=tmp_path / "bad_spawn.db")
     pipeline.register_task("parent", bad_parent_handler)
-    pipeline.enqueue(Job("parent", "p1"))
+    pipeline.register_task("child", child_consumer_handler)
+    pipeline.enqueue(Job("parent", "p1", payload={"bad_kind": bad_kind}))
     pipeline.run()
 
     assert "parent::p1" not in pipeline._runtime.store.backend.load_successes()
     assert "parent::p1" in pipeline._runtime.store.backend.load_failed()
-    assert "not JSON-serializable" in pipeline._runtime.store.backend.load_failed()["parent::p1"]["error_message"]
+    assert "payload" in pipeline._runtime.store.backend.load_failed()["parent::p1"]["error_message"]
+    assert "child::valid" not in pipeline._runtime.store.backend.load_successes()
+    assert pipeline._runtime.store.backend.load_attempts("child::valid") == []
     assert "offset" not in pipeline._runtime.store.backend.load_cursors()
     assert pipeline._runtime.store.backend.load_queue() == []
 

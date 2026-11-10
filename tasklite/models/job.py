@@ -26,6 +26,7 @@ from typing import Any
 from ..exceptions import TaskLiteError
 from ..utils.encoding import make_job_uid
 from .artifact import FileSpec, coerce_file_spec, parse_job_files_config
+from .result import validate_strict_json_object
 from .task import (
     validate_resource_amounts,
     validate_retry_budget,
@@ -164,12 +165,8 @@ def _validate_job_id(job_id: Any) -> None:
 
 
 def _normalize_payload(payload: Any) -> dict[str, Any]:
-    """payload 入口校验与规范化：仅接受 dict 或 None，深拷贝隔离外部变异。"""
-    if payload is not None and not isinstance(payload, dict):
-        raise TypeError(
-            f"payload must be a dict or None, got {type(payload).__name__} ({payload!r})"
-        )
-    return copy.deepcopy(payload) if payload else {}
+    """按严格 JSON 对象契约捕获 payload，拒绝隐式转换并隔离外部变异。"""
+    return validate_strict_json_object(payload, field_name="payload")
 
 
 def _normalize_files(

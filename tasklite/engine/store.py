@@ -37,6 +37,7 @@ from ..models.attempt import (
     AttemptRecord,
 )
 from ..models.job import Job, JobRuntimeState, inject_worker_resource
+from ..models.result import validate_strict_json_object
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Exclude
 from ..utils.clock import parse_utc_iso_to_us, utc_now_iso
@@ -445,34 +446,12 @@ class StateStore:
             )
 
     def normalize_and_validate_job(self, job: Job | dict[str, Any]) -> dict[str, Any]:
-        """规范化非新声明作业快照（管理 API 与历史快照兼容路径）。
-
-        不可 JSON 序列化的 payload 在入口拒绝——潜伏到后端落盘处才崩会
-        把单作业坏输入放大为整 run 崩溃。
-        """
+        """捕获完整作业的独立快照并落实摄入规则。"""
         if isinstance(job, Job):
-            try:
-                dumps(job.payload)
-            except (TypeError, ValueError) as e:
-                raise ValueError(
-                    f"Payload for job {job.uid} is not JSON-serializable: {e}"
-                ) from e
             job_snapshot = copy.deepcopy(job.to_dict())
         elif isinstance(job, dict):
             if "task_type" not in job or "job_id" not in job:
                 raise ValueError("Job dict must contain 'task_type' and 'job_id'")
-            payload_raw = job.get("payload")
-            if payload_raw is not None and not isinstance(payload_raw, dict):
-                raise TypeError(
-                    f"Payload must be a dict or None, got {type(payload_raw).__name__}"
-                )
-            try:
-                dumps(payload_raw if payload_raw is not None else {})
-            except (TypeError, ValueError) as e:
-                job_uid = job_uid_from_snapshot(job)
-                raise ValueError(
-                    f"Payload for job {job_uid} is not JSON-serializable: {e}"
-                ) from e
             job_snapshot = copy.deepcopy(job)
         else:
             raise TypeError(
@@ -491,39 +470,25 @@ class StateStore:
         self._require_registered_task(job.task_type)
         job_snapshot = copy.deepcopy(job.to_dict())
         self.finalize_intake_snapshot(job_snapshot, job.task_type)
-        try:
-            dumps(job_snapshot)
-        except (TypeError, ValueError) as e:
-            raise ValueError(
-                f"Payload for job {job.uid} is not JSON-serializable: {e}"
-            ) from e
         return job_snapshot
 
     def normalize_spawned_job(self, job: Job) -> dict[str, Any]:
-        """动态子作业的摄入规范化（成功提交路径的 spawn 侧单点）。
-
-        与 enqueue 同规执行注册事实校验、三步收尾与整 dict 序列化预检；
-        预检失败抛 ValueError，由父结算整体拒绝并转父失败。
-        """
+        """动态子作业与 enqueue 共用摄入规则，非法声明由父结算整体拒绝。"""
         self._require_registered_task(job.task_type)
         job_snapshot = job.to_dict()
         self.finalize_intake_snapshot(job_snapshot, job.task_type)
-        try:
-            dumps(job_snapshot)
-        except (TypeError, ValueError) as e:
-            raise ValueError(
-                f"Spawned job {job.uid} is not JSON-serializable: {e}"
-            ) from e
         return job_snapshot
 
     def finalize_intake_snapshot(self, job_snapshot: dict[str, Any], task_type: str) -> None:
-        """摄入三步收尾：TriggerRegistry 策略注入 → ``__workers__`` 资源注入 →
-        first_enqueued_at 填充。
+        """校验并隔离 payload 后落实 Trigger、资源与首入队时间。
 
         first_enqueued_at 仅在缺失时填充（UTC ISO）：重试/spawn 回流的
         dict 已携带首次入队时间，绝不刷新——「首次入队时间」是端到端
         追溯链的锚点。
         """
+        job_snapshot["payload"] = validate_strict_json_object(
+            job_snapshot.get("payload"), field_name="payload"
+        )
         self._trigger_registry.normalize_job_snapshot(job_snapshot, task_type)
         inject_worker_resource(job_snapshot)
         if not job_snapshot.get("first_enqueued_at"):

@@ -85,28 +85,37 @@ class TestSpawn:
         assert ctx.spawned_jobs == [child]
 
     def test_spawn_rejects_non_serializable_payload(self):
-        """坏 payload 在子进程内立即预检拒绝（父作业进失败档案，而非
-        commit 阶段崩掉整个 run）。"""
+        """已构造 Job 的坏变异也须在子进程登记派生前拒绝。"""
 
         def my_func():
             pass
 
         ctx = _make_ctx()
-        with pytest.raises(ValueError, match="not JSON-serializable") as exc_info:
-            ctx.spawn(Job("fetch", "bad", payload={"fn": my_func}))
-        assert "fetch::bad" in str(exc_info.value)
+        child = Job("fetch", "bad")
+        child.payload["fn"] = my_func
+        with pytest.raises(TypeError, match="payload.fn"):
+            ctx.spawn(child)
         assert ctx.spawned_jobs == []
 
     def test_spawn_rejects_nan_payload(self):
-        """allow_nan=False：float('inf') 不得通过预检产出非标准 JSON。"""
+        """非有限浮点数在派生登记前拒绝。"""
         ctx = _make_ctx()
-        with pytest.raises(ValueError, match="not JSON-serializable"):
-            ctx.spawn(Job("fetch", "inf", payload={"v": float("inf")}))
+        child = Job("fetch", "inf")
+        child.payload["v"] = float("inf")
+        with pytest.raises(ValueError, match="finite float"):
+            ctx.spawn(child)
 
     def test_spawn_accepts_normal_payload(self):
         ctx = _make_ctx()
-        ctx.spawn(Job("fetch", "ok", payload={"url": "https://example.com/a"}))
+        payload = {"items": [None, True, False, 3, 1.25, "中文", {"": []}]}
+        child = Job("fetch", "ok", payload=payload)
+        ctx.spawn(child)
+        child.payload["items"].append("Job 变异")
+        payload["items"].append("外部变异")
         assert len(ctx.spawned_jobs) == 1
+        assert ctx.spawned_jobs[0].payload == {
+            "items": [None, True, False, 3, 1.25, "中文", {"": []}]
+        }
 
 
 class TestDeclareFile:

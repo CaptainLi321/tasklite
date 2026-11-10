@@ -227,7 +227,8 @@ class TestFakeCtxAuthorizationAndInvariants:
 
     def test_unserializable_spawn_payload_rejected(self):
         ctx = fake_ctx(Job("parent", "p1"))
-        bad_child = Job("child", "c1", payload={"func": lambda x: x})
-        with pytest.raises(ValueError, match="not JSON-serializable"):
+        bad_child = Job("child", "c1")
+        bad_child.payload["func"] = lambda x: x
+        with pytest.raises(TypeError, match="payload.func"):
             ctx.spawn(bad_child)
 

@@ -187,7 +187,7 @@ class TestJobPayloadAndResources:
     """payload / resources 容器与数值校验。"""
 
     def test_non_dict_payload_rejected(self):
-        """非 dict payload：入口显式拒绝（完整序列化预检在 enqueue 侧）。"""
+        """非 dict payload 在模型入口拒绝。"""
         with pytest.raises(TypeError, match="payload must be a dict"):
             Job("t", "id", payload="abc")
 
@@ -604,12 +604,12 @@ class TestJobWeirdInputs:
         nested_list.append(4)
         assert job.payload["items"] == [1, 2, 3]
 
-    def test_to_dict_with_non_serializable_payload(self):
-        """to_dict 本身不做 JSON 序列化（预检在 enqueue 侧）。"""
-
-        def my_func():
-            pass
-
-        job = Job("t", "id", payload={"fn": my_func})
-        d = job.to_dict()
-        assert d["payload"]["fn"] is my_func
+    @pytest.mark.parametrize("payload", [
+        {1: "integer", "1": "string"},
+        {"nested": {False: "boolean"}},
+        {"nested": [{"items": (1, 2)}]},
+        {"value": object()},
+    ])
+    def test_payload_rejects_implicit_json_conversion(self, payload):
+        with pytest.raises(TypeError, match="payload"):
+            Job("t", "id", payload=payload)

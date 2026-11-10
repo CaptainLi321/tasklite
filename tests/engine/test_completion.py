@@ -471,14 +471,18 @@ class TestSpawnedJobs:
         assert "Invalid spawned job" in env.store.state.failed[parent.uid]["error_message"]
         assert "child::future" not in env.store.state.queue_uids
 
-    def test_unserializable_spawned_job_rejects_parent(self, tmp_path):
+    @pytest.mark.parametrize("bad_payload", [
+        {1: "integer", "1": "string"},
+        {"items": [(1, 2)]},
+        {"bad": object()},
+    ])
+    def test_invalid_json_spawned_job_rejects_parent(self, tmp_path, bad_payload):
         """非法子作业导致父作业失败，整个派生集合与游标不发布。"""
         env = CompletionEnv(tmp_path)
         env.register_task("child")
 
-        class Unserializable:
-            pass
-
+        child = Job("child", "bad")
+        child.payload = bad_payload
         parent = Job("parent", "p1")
         entry = env.track_entry(parent, attempt_id=env.open_attempt(parent))
         env.completion.apply_result(
@@ -486,7 +490,8 @@ class TestSpawnedJobs:
             ExecutionResult(
                 success=True,
                 result_metadata={"ok": 1},
-                spawned_jobs=[Job("child", "bad", payload={"x": Unserializable()})],
+                spawned_jobs=[Job("child", "valid"), child],
+                cursor_updates={"offset": "999"},
             ),
             attempt_id=entry.attempt_id,
         )
@@ -495,6 +500,8 @@ class TestSpawnedJobs:
         assert "Invalid spawned job" in env.store.state.failed["parent::p1"]["error_message"]
         assert "child::bad" not in env.store.state.failed
         assert env.backend.load_attempts("child::bad") == []
+        assert env.backend.load_cursors() == {}
+        assert env.store.state.queue == []
 
 
 class TestSuspensionApplication:
