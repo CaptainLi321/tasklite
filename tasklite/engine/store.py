@@ -706,12 +706,19 @@ class StateStore:
         execution_id: str | None = None,
     ) -> FailureOutcome:
         """原子终态转移：永久失败（进入失败档案 + successes 互删 + 级联下游）。"""
-        normalized_meta = copy.deepcopy(failure_metadata)
-        effective_settled_at = settled_at if settled_at is not None else utc_now_iso()
-        if result is not None:
-            normalized_meta.update(self._execution_record(result, files))
-        if job_snapshot is not None:
-            normalized_meta["job_snapshot"] = copy.deepcopy(job_snapshot)
+        normalized_meta = self._failure_record(failure_metadata, job_snapshot)
+        effective_settled_at = settled_at if settled_at is not None else normalized_meta["settled_at"]
+        normalized_meta["settled_at"] = effective_settled_at
+        if result is not None or attempt_no is not None:
+            normalized_meta.update(self._execution_record(
+                result if result is not None else normalized_meta["result"],
+                files if files is not None else normalized_meta["files"],
+            ))
+        if attempt_no is not None:
+            normalized_meta.update(
+                run_id=run_id or "run", attempt_no=attempt_no,
+                started_at=started_at, execution_id=execution_id,
+            )
         payload = self._extract_job_payload(job_snapshot)
         if attempt_no is not None:
             self._backend.commit_job_settlement(
@@ -738,6 +745,26 @@ class StateStore:
         if cascade:
             cascaded_uids = self.cascade_fail(job_uid)
         return FailureOutcome(job_uid=job_uid, failure_metadata=normalized_meta, cascaded_uids=cascaded_uids)
+
+    @staticmethod
+    def _failure_record(
+        metadata: dict[str, Any], job_snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """当前失败档案自足；无对应执行时不得借用历史 Attempt 的事实。"""
+        record = copy.deepcopy(metadata)
+        record.update(
+            settled_at=utc_now_iso(), run_id=None, attempt_no=None, started_at=None,
+            files=copy.deepcopy((job_snapshot or {}).get("files") or {}),
+            result={
+                "message": metadata.get("error_message") or metadata.get("message"),
+                "exception": copy.deepcopy(metadata.get("exception")),
+                "metadata": {},
+                "annotations": copy.deepcopy(metadata.get("annotations") or {}),
+            },
+        )
+        if job_snapshot is not None:
+            record["job_snapshot"] = copy.deepcopy(job_snapshot)
+        return record
 
     @staticmethod
     def _execution_record(
@@ -876,8 +903,9 @@ class StateStore:
                 return BulkFailureOutcome(
                     failed_uids=[], remaining_queue_count=len(self._state.queue)
                 )
+        queued = {job_uid_from_snapshot(j): j for j in self._state.queue}
         normalized_metas = [
-            (job_uid, copy.deepcopy(metadata))
+            (job_uid, self._failure_record(metadata, queued.get(job_uid)))
             for job_uid, metadata in uids_metas
         ]
         self._backend.commit_job_failures(normalized_metas)
@@ -911,8 +939,12 @@ class StateStore:
             cascade_uids = [job_uid for job_uid in cascade_uids if job_uid not in excluded_uids]
         if not cascade_uids:
             return []
+        queued = {job_uid_from_snapshot(j): j for j in self._state.queue}
         cascade_metas = [
-            (job_uid, {"error_message": 'Dependency failed or has no record', "failed_dependency": failed_uid})
+            (job_uid, self._failure_record(
+                {"error_message": 'Dependency failed or has no record', "failed_dependency": failed_uid},
+                queued.get(job_uid),
+            ))
             for job_uid in cascade_uids
         ]
         self._backend.commit_job_failures(cascade_metas)

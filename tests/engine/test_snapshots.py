@@ -532,3 +532,201 @@ class TestQueriesAndFilters:
             assert current[0]["job"] == attempts[-1]["job"]
             assert current[0]["outcome"] == "success"
         p.close()
+
+
+def terminal_result_handler(job, ctx):
+    mode = job.payload["mode"]
+    if mode == "retry":
+        return TaskResult.retry(message="本次重试", metadata={"mode": mode})
+    if mode == "failure":
+        return TaskResult.failure(message="本次失败", metadata={"mode": mode})
+    return TaskResult.success(metadata={"mode": mode})
+
+
+def assert_current_sources(pipeline, uid, expected, attempts):
+    sources = [pipeline]
+    if pipeline.state_path is not None:
+        sources.append(pipeline.state_path)
+    for source in sources:
+        with StateSnapshot.open(source) as snapshot:
+            assert snapshot.get_job(uid) == expected
+            assert list(snapshot.iter_jobs(status=expected["status"])) == [expected]
+            assert list(snapshot.iter_attempts(job_uid=uid)) == attempts
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("prior", [None, "success", "failure"])
+@pytest.mark.parametrize("authorization_pending", [False, True])
+def test_predispatch_failure_owns_current_result_and_configuration(
+    tmp_path, monkeypatch, backend, prior, authorization_pending,
+):
+    source = tmp_path / "input"
+    source.write_text("输入")
+    with TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None) as p:
+        p.register_task("process", terminal_result_handler, trigger="always")
+        attempts = []
+        if prior is not None:
+            p.enqueue(Job("process", "one", payload={"mode": prior}))
+            p.run(install_signals=False)
+            with StateSnapshot.open(p) as snapshot:
+                attempts = list(snapshot.iter_attempts(job_uid="process::one"))
+            assert len(attempts) == 1
+        files = {"input": FileSpec(source, role="input")}
+        if authorization_pending:
+            def defer_authorization(path, target_type):
+                source.unlink()
+                return None
+
+            p.authorizer = defer_authorization
+            files["out"] = FileSpec(tmp_path / "out", role="output", delete_existing=True)
+        else:
+            source.unlink()
+        p.enqueue(Job(
+            "process", "one", payload={"mode": "current"}, files=files, timeout_seconds=7,
+        ))
+        monkeypatch.setattr("tasklite.engine.store.utc_now_iso", lambda: "2030-01-02T03:04:05+00:00")
+        p.run(install_signals=False)
+        with StateSnapshot.open(p) as snapshot:
+            current = snapshot.get_job("process::one")
+        assert current["status"] == "failed"
+        assert "Missing input file" in current["result"]["message"]
+        assert current["result"]["metadata"] == {}
+        exception = current["result"]["exception"]
+        assert exception["type"] == "FileNotFoundError"
+        assert exception["message"] == current["result"]["message"]
+        assert "_resolve_job_files" in exception["traceback"]
+        assert all(current[key] is None for key in ("run_id", "attempt_no", "started_at"))
+        assert current["settled_at"] == "2030-01-02T03:04:05Z"
+        assert current["job"]["payload"] == {"mode": "current"}
+        assert current["job"]["timeout_seconds"] == 7
+        assert current["files"]["input"]["path"] == str(source)
+        assert_current_sources(p, "process::one", current, attempts)
+        assert p.clear_history("process::one", records=["attempts"]) == len(attempts)
+        assert_current_sources(p, "process::one", current, [])
+        p.clear_history("process::one", records=["failures"])
+        with StateSnapshot.open(p) as snapshot:
+            assert snapshot.get_job("process::one") is None
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("mode", ["failure", "retry"])
+def test_executed_failure_retains_own_facts_after_attempt_cleanup(tmp_path, backend, mode):
+    with TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None) as p:
+        p.register_task("process", terminal_result_handler, trigger="always")
+        output = tmp_path / "output"
+        p.enqueue(Job("process", "one", payload={"mode": mode}, max_retries_per_run=0,
+                      files={"output": FileSpec(output, role="output")}))
+        p.run(install_signals=False)
+        with StateSnapshot.open(p) as snapshot:
+            current = snapshot.get_job("process::one")
+            attempts = list(snapshot.iter_attempts(job_uid="process::one"))
+        assert len(attempts) == 1
+        attempt = attempts[0]
+        assert current["status"] == "failed"
+        for key in ("job", "files", "result", "run_id", "attempt_no", "started_at", "settled_at"):
+            assert current[key] == attempt[key]
+        assert current["result"]["metadata"] == {"mode": mode}
+        assert current["attempt_no"] == 1
+        assert_current_sources(p, "process::one", current, attempts)
+        p.clear_history("process::one", records=["attempts"])
+        assert_current_sources(p, "process::one", current, [])
+        p.clear_history("process::one", records=["failures"])
+        with StateSnapshot.open(p) as snapshot:
+            assert snapshot.get_job("process::one") is None
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_cascaded_failure_keeps_current_config_and_settlement(tmp_path, monkeypatch, backend):
+    with TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None) as p:
+        p.register_task("process", terminal_result_handler)
+        parent = Job("process", "parent", payload={"mode": "failure"})
+        child = Job("process", "child", payload={"mode": "success"}, depends_on=[parent.uid])
+        p.enqueue(parent)
+        p.enqueue(child)
+        monkeypatch.setattr("tasklite.engine.store.utc_now_iso", lambda: "2030-01-02T03:04:05+00:00")
+        p.run(install_signals=False)
+        for source in [p] + ([p.state_path] if p.state_path is not None else []):
+            with StateSnapshot.open(source) as snapshot:
+                current = snapshot.get_job(child.uid)
+                assert current["status"] == "failed"
+                assert current["job"]["payload"] == child.payload
+                assert current["job"]["depends_on"] == [parent.uid]
+                assert current["result"]["message"] == "Dependency failed or has no record"
+                assert current["result"]["exception"] is None
+                assert current["settled_at"] == "2030-01-02T03:04:05Z"
+                assert all(current[key] is None for key in ("run_id", "attempt_no", "started_at"))
+                assert list(snapshot.iter_attempts(job_uid=child.uid)) == []
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_manual_failure_and_record_deletion_do_not_reuse_execution_history(tmp_path, backend):
+    with TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None) as p:
+        p.register_task("process", terminal_result_handler)
+        job = Job("process", "one", payload={"mode": "success"})
+        p.enqueue(job)
+        p.run(install_signals=False)
+        p.set_job_status(job.uid, "failed", recursive=False, note="人工否决")
+        with StateSnapshot.open(p) as snapshot:
+            current = snapshot.get_job(job.uid)
+            attempts = list(snapshot.iter_attempts(job_uid=job.uid))
+        assert len(attempts) == 1
+        assert current["result"]["message"] == "人工否决"
+        assert current["result"]["annotations"]["completion_source"] == "manual"
+        assert current["result"]["metadata"] == {}
+        assert all(current[key] is None for key in ("run_id", "attempt_no", "started_at"))
+        assert_current_sources(p, job.uid, current, attempts)
+        p.clear_history(job.uid, records=["failures"])
+        with StateSnapshot.open(p) as snapshot:
+            assert snapshot.get_job(job.uid) is None
+            assert list(snapshot.iter_attempts(job_uid=job.uid)) == attempts
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_running_recovery_current_failure_is_self_contained(tmp_path, backend):
+    with TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None) as p:
+        p.register_task("process", terminal_result_handler)
+        job = Job("process", "one", payload={"mode": "success"},
+                  files={"out": FileSpec(tmp_path / "out", role="output")})
+        p.enqueue(job)
+        p._runtime.store.backend.mark_job_running(
+            job.uid, execution_id="old.1", run_id="old", started_at="2026-01-01T00:00:00Z",
+        )
+        p.run(install_signals=False)
+        with StateSnapshot.open(p) as snapshot:
+            current = snapshot.get_job(job.uid)
+            attempts = list(snapshot.iter_attempts(job_uid=job.uid))
+        assert len(attempts) == 1
+        assert current["result"]["message"] == "上次执行未完成结算，实际结果未知"
+        assert current["run_id"] == "old"
+        assert current["attempt_no"] == 1
+        assert current["started_at"] == attempts[0]["started_at"]
+        assert current["settled_at"] is not None
+        assert current["job"]["payload"] == job.payload
+        assert current["files"]["out"]["path"] == str(tmp_path / "out")
+        assert current["result"] == attempts[0]["result"]
+        assert_current_sources(p, job.uid, current, attempts)
+        p.clear_history(job.uid, records=["attempts"])
+        assert_current_sources(p, job.uid, current, [])
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_bulk_predispatch_failure_preserves_config_and_current_settlement(tmp_path, backend):
+    from tasklite.engine.resource import CapacityResource
+
+    with TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None) as p:
+        p.register_resource(CapacityResource("capacity", max_capacity=1))
+        p.register_task("process", terminal_result_handler)
+        job = Job("process", "one", payload={"mode": "success"}, resources={"capacity": 2})
+        p.enqueue(job)
+        p.run(install_signals=False)
+        with StateSnapshot.open(p) as snapshot:
+            current = snapshot.get_job(job.uid)
+        assert current["status"] == "failed"
+        assert current["job"]["payload"] == job.payload
+        assert current["job"]["resources"]["capacity"] == 2
+        assert current["result"]["exception"] is None
+        assert current["result"]["message"]
+        assert current["result"]["metadata"] == {}
+        assert current["settled_at"] is not None
+        assert all(current[key] is None for key in ("run_id", "attempt_no", "started_at"))
+        assert_current_sources(p, job.uid, current, [])

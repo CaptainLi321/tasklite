@@ -189,79 +189,24 @@ def _build_failed_job_dict(
     uid: str,
     fail_meta: dict[str, Any],
     payload: dict[str, Any] | None,
-    att: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    is_manual = (
-        fail_meta.get("annotations", {}).get("completion_source") == "manual"
+    job_snap = copy.deepcopy(fail_meta.get("job_snapshot") or {})
+    if payload is not None and not job_snap.get("payload"):
+        job_snap["payload"] = copy.deepcopy(payload)
+    outer_files = _normalize_outer_files(
+        fail_meta.get("files") or job_snap.get("files")
     )
-    if is_manual:
-        run_id = None
-        attempt_no = None
-        started_at = None
-        settled_at = _format_iso_z(fail_meta.get("settled_at"))
-        job_snap = copy.deepcopy(fail_meta.get("job_snapshot") or {})
-        if payload is not None and not job_snap.get("payload"):
-            job_snap["payload"] = copy.deepcopy(payload)
-        outer_files = _normalize_outer_files(
-            fail_meta.get("files") or job_snap.get("files")
-        )
-        result = _normalize_result(
-            fail_meta.get("result")
-            or {
-                "message": fail_meta.get("error_message") or fail_meta.get("message"),
-                "exception": None,
-                "metadata": {},
-                "annotations": fail_meta.get("annotations") or {},
-            }
-        )
-    else:
-        if att:
-            run_id = att.get("run_id")
-            attempt_no = att.get("attempt_no")
-            started_at = _format_iso_z(att.get("started_at"))
-            settled_at = _format_iso_z(
-                att.get("settled_at") or fail_meta.get("settled_at")
-            )
-            job_snap = copy.deepcopy(
-                att.get("job_snapshot") or fail_meta.get("job_snapshot") or {}
-            )
-            if payload is not None and not job_snap.get("payload"):
-                job_snap["payload"] = copy.deepcopy(payload)
-            files_data = (
-                att.get("files")
-                or fail_meta.get("files")
-                or job_snap.get("files")
-            )
-            outer_files = _normalize_outer_files(files_data)
-            result = _normalize_result(
-                att.get("result")
-                or fail_meta.get("result")
-                or {
-                    "message": (
-                        att.get("error_message")
-                        or fail_meta.get("error_message")
-                        or fail_meta.get("message")
-                    )
-                }
-            )
-        else:
-            run_id = fail_meta.get("run_id")
-            attempt_no = fail_meta.get("attempt_no")
-            started_at = _format_iso_z(fail_meta.get("started_at"))
-            settled_at = _format_iso_z(fail_meta.get("settled_at"))
-            job_snap = copy.deepcopy(fail_meta.get("job_snapshot") or {})
-            if payload is not None and not job_snap.get("payload"):
-                job_snap["payload"] = copy.deepcopy(payload)
-            outer_files = _normalize_outer_files(
-                fail_meta.get("files") or job_snap.get("files")
-            )
-            result = _normalize_result(
-                fail_meta.get("result")
-                or {
-                    "message": fail_meta.get("error_message")
-                    or fail_meta.get("message")
-                }
-            )
+    result = _normalize_result(
+        fail_meta.get("result")
+        or {
+            "message": fail_meta.get("error_message") or fail_meta.get("message"),
+            "annotations": fail_meta.get("annotations") or {},
+        }
+    )
+    run_id = fail_meta.get("run_id")
+    attempt_no = fail_meta.get("attempt_no")
+    started_at = _format_iso_z(fail_meta.get("started_at"))
+    settled_at = _format_iso_z(fail_meta.get("settled_at"))
 
     return {
         "job_uid": uid,
@@ -372,8 +317,7 @@ class _SqliteSnapshotReader:
         if f_row:
             fail_meta = loads(f_row[0]) if f_row[0] else {}
             payload = loads(f_row[1]) if f_row[1] else None
-            att = self._load_latest_attempt(uid)
-            return _build_failed_job_dict(uid, fail_meta, payload, att)
+            return _build_failed_job_dict(uid, fail_meta, payload)
 
         return None
 
@@ -454,8 +398,7 @@ class _SqliteSnapshotReader:
                         continue
                 fail_meta = loads(r[1]) if r[1] else {}
                 payload = loads(r[2]) if r[2] else None
-                att = self._load_latest_attempt(uid)
-                yield _build_failed_job_dict(uid, fail_meta, payload, att)
+                yield _build_failed_job_dict(uid, fail_meta, payload)
 
     def iter_attempts(
         self,
@@ -557,8 +500,7 @@ class _MemorySnapshotReader:
         if uid in self._failed:
             fail_meta = self._failed[uid]
             payload = self._failure_payloads.get(uid)
-            att = self._load_latest_attempt(uid)
-            return _build_failed_job_dict(uid, fail_meta, payload, att)
+            return _build_failed_job_dict(uid, fail_meta, payload)
 
         return None
 
@@ -623,8 +565,7 @@ class _MemorySnapshotReader:
                     if tt != task_type:
                         continue
                 payload = self._failure_payloads.get(uid)
-                att = self._load_latest_attempt(uid)
-                yield _build_failed_job_dict(uid, fail_meta, payload, att)
+                yield _build_failed_job_dict(uid, fail_meta, payload)
 
     def iter_attempts(
         self,

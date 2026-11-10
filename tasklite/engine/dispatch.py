@@ -184,7 +184,13 @@ class DispatchMachine:
                 except Exception as exc:
                     snapshot = store.state.pop_job(pending_idx)
                     self._reject_and_commit(
-                        pending_uid, snapshot, {"error_message": str(exc)},
+                        pending_uid, snapshot, {
+                            "error_message": str(exc),
+                            "exception": {
+                                "type": type(exc).__name__, "message": str(exc),
+                                "traceback": traceback.format_exc(),
+                            },
+                        },
                         count_as="failed",
                     )
                     return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
@@ -278,7 +284,13 @@ class DispatchMachine:
                 self._reject_and_commit(
                     job_uid,
                     job_snapshot,
-                    {"error_message": str(err)},
+                    {
+                        "error_message": str(err),
+                        "exception": {
+                            "type": type(err).__name__, "message": str(err),
+                            "traceback": traceback.format_exc(),
+                        },
+                    },
                     count_as="failed",
                 )
                 return None
