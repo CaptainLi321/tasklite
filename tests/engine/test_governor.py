@@ -5,12 +5,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from tasklite.backend.memory import InMemoryStateBackend
-from tasklite.engine.errorclass import (
-    ERR_DEADLOCK_GAP,
-    ERR_DEPENDENCY_DEADLOCK,
-    ERR_MALFORMED_JOB,
-    ERR_RESOURCE_DEADLOCK,
-)
 from tasklite.engine.governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
     DeadlockDecision,
@@ -199,7 +193,7 @@ class TestResolveDeadlockAttribution:
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
         malformed_uid = job_uid_from_snapshot({"task_type": "t"})
-        assert state.failed[malformed_uid]["error_message"] == ERR_MALFORMED_JOB
+        assert state.failed[malformed_uid]["error_message"] == 'Queued job configuration is invalid'
         assert state.failed[malformed_uid]["root_cause"] is True
 
     def test_unknown_resource_attribution(self):
@@ -212,7 +206,7 @@ class TestResolveDeadlockAttribution:
         )
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
-        assert state.failed["t::x"]["error_message"] == ERR_RESOURCE_DEADLOCK
+        assert state.failed["t::x"]["error_message"] == 'Resource requirements cannot be satisfied'
 
     def test_impossible_resource_attribution(self):
         gov = DeadlockGovernor()
@@ -224,7 +218,7 @@ class TestResolveDeadlockAttribution:
         )
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
-        assert state.failed["t::x"]["error_message"] == ERR_RESOURCE_DEADLOCK
+        assert state.failed["t::x"]["error_message"] == 'Resource requirements cannot be satisfied'
 
     def test_cycle_members_failed_outside_kept(self):
         gov = DeadlockGovernor()
@@ -240,7 +234,7 @@ class TestResolveDeadlockAttribution:
         decision = gov.resolve_deadlock(facts, store=store)
         assert decision.action == "resolved"
         assert set(state.failed) == {"t::a", "t::b"}
-        assert state.failed["t::a"]["error_message"] == ERR_DEPENDENCY_DEADLOCK
+        assert state.failed["t::a"]["error_message"] == 'Dependency cycle prevents execution'
         assert [job_uid_from_snapshot(jd) for jd in state.queue] == ["t::c"]
 
     def test_unclassifiable_gap_escalates_whole_queue(self):
@@ -254,7 +248,7 @@ class TestResolveDeadlockAttribution:
         assert decision.action == "resolved"
         assert decision.should_terminate is True
         assert set(state.failed) == {"t::a", "t::b"}
-        assert state.failed["t::a"]["error_message"] == ERR_DEADLOCK_GAP
+        assert state.failed["t::a"]["error_message"] == 'Queue cannot make progress for an undetermined reason'
         assert state.queue == []
 
     def test_partial_failure_keeps_queue_not_terminating(self):
@@ -417,7 +411,7 @@ class TestSelectionClosedLoopArbitration:
         store.apply_failure(
             "t::gap",
             {
-                "error_message": ERR_DEPENDENCY_DEADLOCK,
+                "error_message": 'Dependency cycle prevents execution',
                 "missing_dependency": "t::missing",
             },
             job_snapshot=gap,

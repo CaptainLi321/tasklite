@@ -175,7 +175,7 @@ def test_authorization_waiting_and_failure_cascade(tmp_path, monkeypatch):
         assert child_job is not None
         assert child_job["status"] == "failed"
         assert child_job["result"] is not None
-        assert "JOB_DEPENDENCY" in (child_job["result"]["message"] or "")
+        assert "Dependency failed or has no record" in (child_job["result"]["message"] or "")
 
         gc_job = snap.get_job("grandchild::gc1")
         assert gc_job is not None

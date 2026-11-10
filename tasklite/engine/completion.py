@@ -32,7 +32,7 @@ from ..utils.artifact import ArtifactPathPolicy
 from ..utils.clock import utc_now_iso
 from .admission import extract_effective_job_config
 from .channel import ExecutionResult, JobHandle
-from .errorclass import ERR_MAX_RETRIES
+
 from .in_flight import InFlightJob, InFlightTracker
 from .types import AttemptOutcome, AuthorizationOutcome, AuthorizationStatus, StopMode
 
@@ -516,7 +516,7 @@ class CompletionMachine:
                     f"Sent to failure archive."
                 )
                 failure_metadata: dict[str, Any] = {
-                    "error_message": ERR_MAX_RETRIES,
+                    "error_message": 'Retry budget exhausted',
                 }
                 if result.message is not None:
                     failure_metadata["message"] = result.message

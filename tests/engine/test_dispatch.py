@@ -20,11 +20,6 @@ from tasklite.engine.dispatch import (
     DispatchMachine,
     DispatchOutcome,
 )
-from tasklite.engine.errorclass import (
-    ERR_JOB_DEPENDENCY,
-    ERR_NO_HANDLER,
-    ErrorClassifier,
-)
 from tasklite.engine.in_flight import InFlightTracker
 from tasklite.engine.recovery import RecoveryOrchestrator
 from tasklite.engine.resource import (
@@ -141,7 +136,6 @@ class DispatchEnv:
                 in_flight=self.in_flight, session=self.session,
             ),
             tasks=self.tasks,
-            classifier=ErrorClassifier(),
             output_roots=self.output_roots,
             ipc_dir=self.ipc_dir,
         )
@@ -304,7 +298,7 @@ class TestRejectGates:
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert env.stats["failed"] == 1
         assert "ghost::j1" in env.store.state.failed
-        assert env.store.state.failed["ghost::j1"]["error_message"] == ERR_NO_HANDLER
+        assert env.store.state.failed["ghost::j1"]["error_message"] == 'No registered handler for task type'
         assert env.hooks == [
             ("ghost::j1", AttemptOutcome(success=False, will_retry=False,
                                         metadata=env.store.state.failed["ghost::j1"]))
@@ -327,9 +321,9 @@ class TestRejectGates:
         outcome = env.dispatch.dispatch_job(sched)
         assert outcome is None
         assert env.stats["cascade_failed"] == 2
-        assert env.store.state.failed["child::b"]["error_message"] == ERR_JOB_DEPENDENCY
+        assert env.store.state.failed["child::b"]["error_message"] == 'Dependency failed or has no record'
         assert env.store.state.failed["child::b"]["failed_dependency"] == "parent::a"
-        assert env.store.state.failed["child::c"]["error_message"] == ERR_JOB_DEPENDENCY
+        assert env.store.state.failed["child::c"]["error_message"] == 'Dependency failed or has no record'
 
     def test_valid_payload_proceeds_to_spawn(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)

@@ -31,7 +31,7 @@ def _make_runtime(tmp_path) -> EngineRuntime:
     )
     from tasklite.engine.channel import ExecutionChannel
     from tasklite.engine.config import RunConfig
-    from tasklite.engine.errorclass import ErrorClassifier
+
     from tasklite.engine.governor import DeadlockGovernor
     from tasklite.engine.resource import CapacityResource, ResourceManager
     from tasklite.models.job import WORKER_RESOURCE
@@ -49,7 +49,6 @@ def _make_runtime(tmp_path) -> EngineRuntime:
             resources=resources,
             tasks=TaskRegistry(),
             channel=ExecutionChannel(ipc_dir),
-            classifier=ErrorClassifier(),
             governor=DeadlockGovernor(),
             trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             requeue_policy=ImmediateRequeuePolicy(),

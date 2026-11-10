@@ -22,10 +22,6 @@ from .config import RunConfig
 from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
 from .channel import ExecutionChannel
 from .completion import CompletionMachine
-from .errorclass import (
-    ERR_DEPENDENCY_EXCLUDED,
-    ErrorClassifier,
-)
 from .resource import RunNotifier
 from .selection import SelectionMachine, SelectionStandstill
 from .in_flight import InFlightTracker
@@ -100,7 +96,6 @@ class EngineRuntime:
         # 期装配快照的搬运通道），运行期一切读写经 store.backend 派生。
         self.store: StateStore = StateStore(
             config.backend,
-            classifier=config.classifier,
             trigger_registry=config.trigger_registry,
             requeue_policy=config.requeue_policy,
             protected_roots=config.protected_roots,
@@ -138,7 +133,6 @@ class EngineRuntime:
             recovery=self._recovery,
             completion=self._completion,
             tasks=config.tasks,
-            classifier=config.classifier,
             output_roots=config.output_roots,
             ipc_dir=config.ipc_dir,
             protected_roots=config.protected_roots,
@@ -513,10 +507,6 @@ class EngineRuntime:
     def state(self) -> PipelineState:
         return self.store.state
 
-    @property
-    def classifier(self) -> ErrorClassifier:
-        return self.config.classifier
-
     def request_stop(self) -> StopMode:
         """停机请求接口（单调状态转移，委托 RunSession，并唤醒运行循环）。"""
         with self._dispatch_start_lock:
@@ -728,7 +718,7 @@ class EngineRuntime:
         for uid in standstill.blocked_uids:
             logger.warning(
                 f"SELECTION: allowed job {uid} blocked by excluded upstream "
-                f"{upstream.get(uid, '?')} ({ERR_DEPENDENCY_EXCLUDED}); kept in "
+                f"{upstream.get(uid, '?')} (dependency excluded); kept in "
                 f"queue for a later run."
             )
         logger.info(

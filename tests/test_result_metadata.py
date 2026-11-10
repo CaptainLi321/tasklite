@@ -49,7 +49,7 @@ def test_business_keys_do_not_control_execution_records(pipeline, success, messa
     assert archive["files"] == {}
     if not success:
         assert archive.get("error_message") == message
-        assert archive["error_category"] != "manual"
+        assert "error_category" not in archive
     with StateSnapshot.open(pipeline) as snapshot:
         row = snapshot.get_job(job.uid)
         assert row["status"] == ("succeeded" if success else "failed")

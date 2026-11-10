@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Callable, Sequence, TYPE_CHECKING
 
 from .admission import ImmediateRequeuePolicy, RequeuePolicy, TriggerRegistry
-from .errorclass import ErrorClassifier
 from .governor import DEADLOCK_GAP_MAX_ROUNDS, DeadlockGovernor
 from .resource import ResourceManager
 from .scheduler import FifoOrderingPolicy, OrderingPolicy
@@ -91,7 +90,6 @@ class RunConfig:
     resources: ResourceManager
     tasks: TaskRegistry
     channel: "ExecutionChannel"
-    classifier: ErrorClassifier
     governor: DeadlockGovernor
     trigger_registry: TriggerRegistry
     requeue_policy: RequeuePolicy
@@ -112,7 +110,6 @@ class RunConfig:
         resources: ResourceManager,
         tasks: TaskRegistry,
         channel: "ExecutionChannel",
-        classifier: ErrorClassifier,
         governor: DeadlockGovernor,
         trigger_registry: TriggerRegistry,
         name: str = "tasklite",
@@ -138,7 +135,6 @@ class RunConfig:
             resources=resources,
             tasks=tasks,
             channel=channel,
-            classifier=classifier,
             governor=governor,
             trigger_registry=trigger_registry,
             requeue_policy=(

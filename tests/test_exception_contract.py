@@ -141,16 +141,15 @@ def test_discovery_callback_exception_keeps_identity_and_traceback(tmp_path, err
     _assert_original_error(caught, original, "fail")
 
 
-@pytest.mark.parametrize("error_type", [TypeError, ValueError, KeyError])
-def test_http_policy_exception_keeps_identity_and_traceback(error_type):
-    from tasklite.wrappers.http import HttpPolicy, HttpResponse, http_guard
+@pytest.mark.parametrize("error_type", [TypeError, ValueError, KeyError, TimeoutError])
+def test_http_transport_exception_keeps_identity_and_traceback(error_type):
+    from tasklite.wrappers.http import HttpExecutor
 
-    original = error_type("策略回调故障")
+    original = error_type("请求故障")
 
     def fail(*args):
         raise original
 
-    guard = http_guard(policy=HttpPolicy(status_classifier=fail))
     with pytest.raises(error_type) as caught:
-        guard.check_response(HttpResponse(status_code=200, headers={}, body=b""))
+        HttpExecutor(max_retries=1, retry_delay_base=0).execute(fail)
     _assert_original_error(caught, original, "fail")

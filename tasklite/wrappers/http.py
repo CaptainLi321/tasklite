@@ -1,25 +1,7 @@
-"""TaskLite v2 官方轻量 HTTP 网络工具库。
+"""可选 HTTP 请求、响应与快照工具，本版不承诺稳定兼容。
 
-注意：本模块为可选工具，本版本暂不承诺向后兼容与冻结扩展协议。
-HTTP 请求失败由 handler 显式捕获后构造并返回 TaskResult（TaskResult.failure / TaskResult.retry），
-框架核心不通过隐式重试异常控制 handler，也不隐式耦合资源或重试预算。
-
-本模块提供面向批处理、数据同步与爬虫任务的通用 HTTP 辅助工具，主要包含：
-- http_guard: 上下文管理器，自动将 HTTP 状态码与网络异常映射为三分类异常
-  （FatalError / RetryError / RateLimitHit）；
-- guard_request: 就地执行 + 本地快速重试形态（一次调用完成请求与守卫）；
-- guarded: 装饰器工厂形态（把请求函数包装为绑定守卫配置的函数）；
-- HttpPolicy: HTTP 状态码与异常分类策略器，支持自定义状态码与异常分类钩子；
-- SnapshotStore / SQLiteSnapshotStore: 原始 HTTP 响应快照存储，支持基于
-  请求单射哈希的幂等缓存与离线重放；
-- parse_netscape_cookies / format_cookie_header: Netscape 格式 cookies.txt
-  解析与请求头格式化工具；
-- urllib_fetch / requests_fetch: 开箱即用的轻量请求实现。
-
-三种 guard 形态的分工：``guard_request`` **就地执行**目标函数并施加本地
-快速重试；``http_guard`` 是**上下文管理器**，守卫 with 块内抛出的异常与
-响应状态；``guarded`` 是**装饰器工厂**，产出可复用的守卫包装函数。三者
-共享 HttpPolicy 分类，按调用姿势选用。
+请求返回原始响应，传输异常原样传播。handler 可显式返回
+response.to_task_result()，响应状态本身不会改变引擎重试预算。
 """
 from __future__ import annotations
 
@@ -39,25 +21,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ..exceptions import TaskLiteError
+from ..models.result import TaskResult
 from ..utils.encoding import encode_job_component
 from ..utils.jsonutil import dumps as _json_dumps, loads as _json_loads
 
-
-class RetryError(TaskLiteError):
-    """HTTP wrapper 瞬态错误信号（供守卫与本地重试循环使用，handler 捕获后转 TaskResult.retry）。"""
-
-
-class FatalError(TaskLiteError):
-    """HTTP wrapper 确定性错误信号（handler 捕获后转 TaskResult.failure）。"""
-
-
-class RateLimitHit(RetryError):
-    """HTTP 429 限速命中信号（供 handler 显式转为 TaskResult.retry）。"""
-
-    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
-        super().__init__(message)
-        self.retry_after = retry_after
 
 # 本地就地重试的单次等待封顶——大 max_retries 下无封顶的指数递增等待会
 # 累计出巨量不可中断睡眠（wrapper 层自防；核心引擎不含等待计算，重试
@@ -233,330 +200,43 @@ class HttpResponse:
         """大小写不敏感获取指定响应头。"""
         return self._headers.get(name.lower(), default)
 
+    def to_task_result(self) -> TaskResult:
+        """显式将响应转为任务结果；不执行睡眠、派发或预算修改。"""
+        metadata: dict[str, Any] = {"status_code": self.status_code}
+        message = f"HTTP {self.status_code}"
+        if self.status_code == 429:
+            metadata["retry_after"] = _retry_after(self.headers)
+        if self.status_code == 429 or self.status_code >= 500:
+            return TaskResult.retry(message=message, metadata=metadata)
+        if 200 <= self.status_code < 400:
+            return TaskResult.success(message=message, metadata=metadata)
+        return TaskResult.failure(message=message, metadata=metadata)
+
     def __repr__(self) -> str:
         return f"<HttpResponse [{self._status_code}] len={len(self._body)}>"
 
 
 # ==============================================================================
-# 2. 状态码与异常分类守卫（HttpPolicy & http_guard）
+# HTTP 响应结果转换与快照准入
 # ==============================================================================
 
-_DEFAULT_RATE_LIMIT_STATUSES = frozenset({429})
-_DEFAULT_FATAL_STATUSES = frozenset({400, 401, 403, 404, 405, 410, 422})
-_DEFAULT_RETRY_STATUSES = frozenset({500, 502, 503, 504, 520, 521, 522, 524})
-
-# 快照保底不写入的状态：429/5xx 属瞬态故障；408（请求超时）/425（过早）
-# 按默认分类走 4xx 兜底判 FatalError，但均为疑似过期的错误响应——被永久
-# 快照后离线重放会持续命中同一过期响应，故一律不落盘。
 _TRANSIENT_NO_SNAPSHOT_STATUSES = frozenset({408, 425, 429})
 
 
-class HttpPolicy:
-    """HTTP 状态码与传输异常分类规则器。
-
-    将 HTTP 状态码与底层异常分类为三分类异常：
-    - RateLimitHit: 限流（由调用方决定重试节奏）；
-    - FatalError: 确定性错误（如 4xx，直接进失败档案）；
-    - RetryError: 瞬态错误（如 5xx、超时，触发重试）。
-    """
-
-    def __init__(
-        self,
-        rate_limit_statuses: set[int] | None = None,
-        fatal_statuses: set[int] | None = None,
-        retry_statuses: set[int] | None = None,
-        status_classifier: Callable[[int, Any], type[BaseException] | None] | None = None,
-        exception_classifier: Callable[[BaseException], type[BaseException] | None] | None = None,
-    ) -> None:
-        """初始化分类规则器。
-
-        Args:
-            rate_limit_statuses: 判定为限流的状态码集合（默认 {429}）。
-            fatal_statuses: 判定为确定性失败的状态码集合（默认 400/401/403/404 等）。
-            retry_statuses: 判定为瞬态服务端错误的状态码集合（默认 500/502/503 等）。
-            status_classifier: 自定义状态码分类函数 ``(code, resp) -> 异常类 | None``。
-            exception_classifier: 自定义异常分类函数 ``(exc) -> 异常类 | None``。
-        """
-        self.rate_limit_statuses = set(rate_limit_statuses if rate_limit_statuses is not None else _DEFAULT_RATE_LIMIT_STATUSES)
-        self.fatal_statuses = set(fatal_statuses if fatal_statuses is not None else _DEFAULT_FATAL_STATUSES)
-        self.retry_statuses = set(retry_statuses if retry_statuses is not None else _DEFAULT_RETRY_STATUSES)
-        self.status_classifier = status_classifier
-        self.exception_classifier = exception_classifier
-
-    def extract_retry_after(self, headers: Any) -> float | None:
-        """从响应头中提取 Retry-After 字段值并解析为秒数。
-
-        支持整型秒数与标准 HTTP-Date 格式。
-
-        Args:
-            headers: 响应头 Mapping 对象。
-
-        Returns:
-            解析出的正秒数；未提供、无法解析或不具备有效时长语义
-            （0、负数、非有限数、已过期的 HTTP-Date）时返回 None。
-        """
-        if not headers:
-            return None
-        val: str | None = None
-        if hasattr(headers, "get"):
-            val = headers.get("Retry-After") or headers.get("retry-after")
-        if not val:
-            return None
-        val_str = str(val).strip()
+def _retry_after(headers: Mapping[str, str]) -> float | None:
+    """解析 Retry-After 秒数或 HTTP 日期，未知或无效时返回 None。"""
+    value = next((v for k, v in headers.items() if k.lower() == "retry-after"), None)
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
         try:
-            sec = float(val_str)
-        except ValueError:
-            sec = None
-        if sec is not None:
-            # 仅正值具备有效等待语义；其余值统一由调用方视为未知。
-            return sec if math.isfinite(sec) and sec > 0 else None
-        try:
-            parsed_tuple = email.utils.parsedate_tz(val_str)
-            if parsed_tuple is not None:
-                diff = email.utils.mktime_tz(parsed_tuple) - time.time()
-                # 已过期日期与 0/负数秒同语义：无有效等待时长，由调用方视为未知
-                return diff if diff > 0 else None
-        except Exception:
-            pass
-        return None
-
-    def classify_status(self, status_code: int, response: Any = None) -> type[BaseException] | None:
-        """分类 HTTP 状态码。
-
-        Returns:
-            对应的异常类，或 None（表示请求正常）。
-        """
-        if self.status_classifier is not None:
-            custom = self.status_classifier(status_code, response)
-            if custom is not None:
-                return custom
-
-        if status_code in self.rate_limit_statuses:
-            return RateLimitHit
-        if status_code in self.fatal_statuses:
-            return FatalError
-        if status_code in self.retry_statuses:
-            return RetryError
-        if 200 <= status_code < 400:
+            parsed = email.utils.parsedate_tz(value)
+            seconds = email.utils.mktime_tz(parsed) - time.time() if parsed else 0.0
+        except (ValueError, OverflowError, TypeError):
             return None
-        # 其它未显式声明的 4xx 默认按 FatalError，其它 5xx 按 RetryError
-        if 400 <= status_code < 500:
-            return FatalError
-        if status_code >= 500:
-            return RetryError
-        return None
-
-    def classify_exception(self, exc: BaseException) -> type[BaseException] | None:
-        """分类底层网络异常。
-
-        Returns:
-            对应的三分类异常类型或 None。
-        """
-        if isinstance(exc, (RateLimitHit, FatalError, RetryError)):
-            return type(exc)
-
-        if self.exception_classifier is not None:
-            custom = self.exception_classifier(exc)
-            if custom is not None:
-                return custom
-
-        # urllib.error.HTTPError
-        if isinstance(exc, urllib.error.HTTPError):
-            return self.classify_status(exc.code, exc)
-
-        # 契约：任何携带 ``response.status_code`` 的库异常——
-        # requests.HTTPError、httpx.HTTPStatusError（含用户在守卫块内
-        # ``raise_for_status()`` 主动 raise 的形态）、curl_cffi 同构——
-        # 一律按状态码接管分类，不落下方传输层模块兜底。
-        if hasattr(exc, "response") and getattr(exc.response, "status_code", None) is not None:
-            return self.classify_status(exc.response.status_code, exc.response)
-
-        # 瞬态传输层错误（超时、连接重置、DNS 解析失败等）。
-        # http.client.HTTPException 基类整体纳入：BadStatusLine/LineTooLong 等
-        # getresponse/read 阶段故障（代理/源站提前断连的典型形态）不是 OSError，
-        # 遗漏即裸逃逸为零重试致命错误；HTTPError 属 URLError/OSError 族而非
-        # HTTPException 家族，已在上方前置分支按状态码精确分类，不落本兜底。
-        if isinstance(
-            exc,
-            (
-                urllib.error.URLError,
-                TimeoutError,
-                ConnectionError,
-                http.client.HTTPException,
-                OSError,
-            ),
-        ):
-            return RetryError
-
-        # requests / httpx 软适配检测
-        exc_mod = getattr(exc.__class__, "__module__", "")
-        if "requests" in exc_mod or "httpx" in exc_mod or "urllib3" in exc_mod or "curl_cffi" in exc_mod:
-            return RetryError
-
-        return None
-
-
-def _resolve_category(cls: Any) -> type[BaseException] | None:
-    """将策略分类器返回值归一为三分类基类（支持子类），非法返回值 fail-loud。
-
-    status_classifier / exception_classifier 的签名允许返回三分类异常的子类；
-    消费端若以 identity 比较分派，子类会全分支不命中——4xx 错误响应被静默
-    当成功返回。返回值与三分类均无子类关系（或根本不是异常类）属违反
-    HttpPolicy 契约的编程错误，必须显式报错而非静默吞掉。
-    """
-    if cls is None:
-        return None
-    if not isinstance(cls, type) or not issubclass(cls, BaseException):
-        raise TaskLiteError(
-            f"policy classifier must return an exception class or None, got {cls!r}"
-        )
-    # RateLimitHit 是 RetryError 子类，必须先于 RetryError 判定。
-    if issubclass(cls, RateLimitHit):
-        return RateLimitHit
-    if issubclass(cls, FatalError):
-        return FatalError
-    if issubclass(cls, RetryError):
-        return RetryError
-    raise TaskLiteError(
-        "policy classifier must return RateLimitHit/FatalError/RetryError "
-        f"or a subclass thereof, or None; got {cls!r}"
-    )
-
-
-class http_guard:
-    """HTTP 请求守卫（上下文管理器形态）。
-
-    功能：
-    1. 捕获代码块内抛出的异常，或通过 `check_response` 检查响应状态码。
-       块内用户主动 raise 的状态异常（如 ``resp.raise_for_status()`` 抛出
-       的 ``httpx.HTTPStatusError`` / ``requests.HTTPError``）同样按
-       ``response.status_code`` 接管分类——raise 必须发生在守卫块内；
-    2. 遭遇 429 限流时：解析 Retry-After（依次取异常 `headers` 与
-       requests 风格 `exc_val.response.headers`），抛出携带
-       `retry_after` 的 `RateLimitHit`；
-    3. 遭遇 5xx/超时等瞬态错误：转换为 `RetryError` 触发调度器重试；
-    4. 遭遇 4xx 等客户端错误：转换为 `FatalError` 直送失败档案。
-
-    Examples:
-        >>> with http_guard():
-        ...     resp = my_request(...)
-        ...     if resp.status_code != 200:
-        ...         raise requests.HTTPError(response=resp)
-    """
-
-    def __init__(
-        self,
-        policy: HttpPolicy | None = None,
-    ) -> None:
-        """初始化 HTTP 守卫。
-
-        Args:
-            policy: 状态码与异常分类规则器（默认使用标准 HttpPolicy）。
-        """
-        self.policy = policy or HttpPolicy()
-
-    def __enter__(self) -> "http_guard":
-        return self
-
-    def check_response(self, response: Any) -> None:
-        """显式检查响应对象的状态码。"""
-        status_code = getattr(response, "status_code", None)
-        if status_code is None and hasattr(response, "getcode"):
-            status_code = response.getcode()
-        if status_code is None:
-            return
-
-        cls = _resolve_category(self.policy.classify_status(status_code, response))
-        if cls is RateLimitHit:
-            headers = getattr(response, "headers", None)
-            retry_after = self.policy.extract_retry_after(headers)
-            raise RateLimitHit(
-                f"HTTP 429 RateLimit hit (retry_after={retry_after!r})",
-                retry_after=retry_after,
-            )
-        elif cls is FatalError:
-            raise FatalError(f"HTTP {status_code} Fatal error")
-        elif cls is RetryError:
-            raise RetryError(f"HTTP {status_code} Transient server error")
-
-    def _rate_limit_retry_after(self, exc_val: BaseException) -> float | None:
-        """解析限流等待时长：异常已有值优先，否则读取响应头。
-
-        requests 风格异常无 headers 属性，Retry-After 挂在其 response 上。
-        """
-        retry_after = getattr(exc_val, "retry_after", None)
-        if retry_after is not None:
-            return retry_after
-        headers = getattr(exc_val, "headers", None)
-        if headers is None:
-            headers = getattr(getattr(exc_val, "response", None), "headers", None)
-        return self.policy.extract_retry_after(headers)
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if exc_val is None:
-            return
-
-        cls = _resolve_category(self.policy.classify_exception(exc_val))
-        if cls is RateLimitHit or isinstance(exc_val, RateLimitHit):
-            if isinstance(exc_val, RateLimitHit):
-                if exc_val.retry_after is None:
-                    exc_val.retry_after = self._rate_limit_retry_after(exc_val)
-                raise exc_val
-            retry_after = self._rate_limit_retry_after(exc_val)
-            raise RateLimitHit(
-                f"RateLimit hit: {exc_val}",
-                retry_after=retry_after,
-            ) from exc_val
-
-        elif cls is FatalError:
-            if isinstance(exc_val, FatalError):
-                raise exc_val
-            raise FatalError(f"Fatal request error: {exc_val}") from exc_val
-
-        elif cls is RetryError:
-            if isinstance(exc_val, RetryError):
-                raise exc_val
-            raise RetryError(f"Transient request error: {exc_val}") from exc_val
-
-        # 未被策略识别的代码异常原样抛出
-        return
-
-
-def guard_request(
-    func: Callable[..., Any],
-    *args: Any,
-    max_retries: int = 0,
-    retry_delay_base: float = 1.0,
-    policy: HttpPolicy | None = None,
-    **kwargs: Any,
-) -> Any:
-    """就地执行 HTTP 请求函数，提供本地快速重试与异常守卫（委托 HttpExecutor）。
-
-    guard 三形态之一：一次调用完成「执行 + 守卫 + 可选本地重试」，适合
-    脚本式调用；块状守卫用 ``http_guard``，可复用包装用 ``guarded``。
-    """
-    return HttpExecutor(
-        policy=policy,
-        max_retries=max_retries,
-        retry_delay_base=retry_delay_base,
-    ).execute(func, *args, **kwargs)
-
-
-def guarded(
-    policy: HttpPolicy | None = None,
-    max_retries: int = 0,
-    retry_delay_base: float = 1.0,
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """修饰请求函数的守卫装饰器工厂（委托 HttpExecutor.wrap）。
-
-    guard 三形态之一：产出绑定守卫配置的包装函数，适合同一请求函数在
-    多处复用；就地单发调用用 ``guard_request``，块状守卫用 ``http_guard``。
-    """
-    return HttpExecutor(
-        policy=policy,
-        max_retries=max_retries,
-        retry_delay_base=retry_delay_base,
-    ).wrap
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
 
 
 # ==============================================================================
@@ -979,26 +659,14 @@ class MemorySnapshotStore(SnapshotStore):
 # ==============================================================================
 
 class HttpExecutor:
-    """组合式轻量 HTTP 执行器深模块（开放 Callable 包装与策略绑定）。
-
-    统一绑定：
-    1. HttpPolicy 异常与状态码分类规则；
-    2. 可选 SnapshotStore 内容寻址快照透明拦截；
-    3. 本地就地快速重试（指数递增等待封顶 + 抖动，wrapper 层自防巨量睡眠）。
-
-    零引擎强耦合：严格遵循分层红线，仅面向开放 Callable 统一提供
-    execute 与 wrap 接缝，不引入任何重型单体 Client，可在独立离线脚本或
-    TaskLite handler 中自由选用。
-    """
+    """组合快照缓存与有限的本地请求重试，独立于 Job 重试预算。"""
 
     def __init__(
         self,
-        policy: HttpPolicy | None = None,
         snapshot_store: SnapshotStore | None = None,
         max_retries: int = 0,
         retry_delay_base: float = 1.0,
     ) -> None:
-        self.policy = policy or HttpPolicy()
         self.snapshot_store = snapshot_store
         self.max_retries = max_retries
         self.retry_delay_base = retry_delay_base
@@ -1023,7 +691,7 @@ class HttpExecutor:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        """执行任意底层请求函数，自动应用快照缓存、429 守卫与本地重试。"""
+        """执行请求；仅在本地重试自然网络异常与 5xx，429 立即返回。"""
         target_fn = fetch_fn
         if self.snapshot_store is not None:
             target_fn = self.snapshot_store.cached(target_fn)
@@ -1031,18 +699,19 @@ class HttpExecutor:
             if attempt > 0:
                 time.sleep(self._retry_wait(attempt, self.retry_delay_base))
             try:
-                with http_guard(policy=self.policy) as g:
-                    res = target_fn(*args, **kwargs)
-                    g.check_response(res)
-                    return res
-            except (RateLimitHit, FatalError):
-                # 不变式：RateLimitHit 是 RetryError 子类，必须先于 RetryError 匹配。
-                # 限流信号直接交给调用方，本地不得微等待重试限流端点。
-                raise
-            except RetryError:
+                response = target_fn(*args, **kwargs)
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+                if isinstance(exc, urllib.error.HTTPError):
+                    raise
                 if attempt >= self.max_retries:
                     raise
-        raise RetryError(f"Request retries exhausted ({self.max_retries} retries)")
+                continue
+            status = getattr(response, "status_code", None)
+            if status is None and hasattr(response, "getcode"):
+                status = response.getcode()
+            if status is None or status < 500 or attempt >= self.max_retries:
+                return response
+        raise AssertionError("request loop must return or raise")
 
     def wrap(self, fetch_fn: Callable[..., Any]) -> Callable[..., Any]:
         """将请求函数包装为绑定当前执行器配置的函数。"""
@@ -1092,7 +761,6 @@ def urllib_fetch(
     params: Mapping[str, Any] | None = None,
     data: bytes | str | Mapping[str, Any] | None = None,
     timeout: float = 30.0,
-    policy: HttpPolicy | None = None,
     proxies: Mapping[str, str] | None = None,
 ) -> HttpResponse:
     """基于 Python 标准库 urllib 的 HTTP 请求实现（零外部依赖）。
@@ -1104,7 +772,6 @@ def urllib_fetch(
         params: 查询参数。
         data: 请求体（支持 dict/list 自动序列化为 JSON、字符串或 bytes）。
         timeout: 超时秒数（默认 30.0s）。
-        policy: 状态码与异常分类规则器。
         proxies: 显式代理配置（访问 localhost/127.0.0.1 时默认不走环境变量代理）。
 
     Returns:
@@ -1134,21 +801,18 @@ def urllib_fetch(
 
     opener = _build_urllib_opener(final_url, proxies)
 
-    with http_guard(policy=policy) as g:
-        try:
-            with opener.open(req, timeout=timeout) as resp:
-                status_code = resp.getcode()
-                resp_headers = dict(resp.headers)
-                body = resp.read()
-                http_resp = HttpResponse(status_code=status_code, headers=resp_headers, body=body, url=final_url)
-                g.check_response(http_resp)
-                return http_resp
-        except urllib.error.HTTPError as e:
-            err_headers = dict(e.headers) if hasattr(e, "headers") else {}
-            err_body = e.read() if hasattr(e, "read") else b""
-            err_resp = HttpResponse(status_code=e.code, headers=err_headers, body=err_body, url=final_url)
-            g.check_response(err_resp)
-            return err_resp
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            status_code = resp.getcode()
+            resp_headers = dict(resp.headers)
+            body = resp.read()
+            http_resp = HttpResponse(status_code=status_code, headers=resp_headers, body=body, url=final_url)
+            return http_resp
+    except urllib.error.HTTPError as e:
+        err_headers = dict(e.headers) if hasattr(e, "headers") else {}
+        err_body = e.read() if hasattr(e, "read") else b""
+        err_resp = HttpResponse(status_code=e.code, headers=err_headers, body=err_body, url=final_url)
+        return err_resp
 
 
 def _prepare_requests_session(
@@ -1181,7 +845,6 @@ def requests_fetch(
     data: Any = None,
     json_data: Any = None,
     timeout: float = 30.0,
-    policy: HttpPolicy | None = None,
     proxies: Mapping[str, str] | None = None,
     trust_env: bool | None = None,
     **kwargs: Any,
@@ -1197,7 +860,6 @@ def requests_fetch(
         data: 表单或原始数据。
         json_data: JSON 数据（对应 requests 的 json 参数）。
         timeout: 超时秒数。
-        policy: 分类规则器。
         proxies: 显式代理配置。
         trust_env: 是否使用环境变量中的代理设置。
         **kwargs: 透传给 requests 的其它参数。
@@ -1224,34 +886,26 @@ def requests_fetch(
 
     sess, created_session = _prepare_requests_session(requests, url, session, proxies, trust_env)
 
-    with http_guard(policy=policy) as g:
-        try:
-            resp = sess.request(**req_kwargs)
-            http_resp = HttpResponse(
-                status_code=resp.status_code,
-                headers=dict(resp.headers),
-                body=resp.content,
-                url=resp.url,
-            )
-            g.check_response(http_resp)
-            return http_resp
-        finally:
-            if created_session:
-                sess.close()
+    try:
+        resp = sess.request(**req_kwargs)
+        http_resp = HttpResponse(
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+            body=resp.content,
+            url=resp.url,
+        )
+
+        return http_resp
+    finally:
+        if created_session:
+            sess.close()
 
 
 
 __all__ = [
-    "FatalError",
-    "RateLimitHit",
-    "RetryError",
     "parse_netscape_cookies",
     "format_cookie_header",
     "HttpResponse",
-    "HttpPolicy",
-    "http_guard",
-    "guard_request",
-    "guarded",
     "HttpExecutor",
     "SnapshotStore",
     "SQLiteSnapshotStore",

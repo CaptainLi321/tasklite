@@ -20,7 +20,7 @@ from tasklite.resource import (
     CapacityResource,
     IntervalResource,
 )
-from tasklite.engine.errorclass import ERR_MAX_RETRIES
+
 
 PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
 
@@ -157,7 +157,7 @@ class TestEndToEnd:
         p.stop()
 
         meta = p._runtime.store.backend.load_failed()["work::item_gamma"]
-        assert meta["error_message"] == ERR_MAX_RETRIES
+        assert meta["error_message"] == 'Retry budget exhausted'
 
         attempts = p._runtime.store.backend.load_settled_attempts("work::item_gamma")
         assert [a["attempt_no"] for a in attempts] == [1, 2, 3]

@@ -101,7 +101,7 @@ class SelectionMachine:
         """以 Kahn 入度消减剥离选择停摆：区分真死锁与「仅被排除阻塞」。
 
         返回 None 表示队列存在畸形行（无可信拓扑事实），交既有
-        MALFORMED_JOB 归因。纯计算、无状态变更。
+        配置无效归因。纯计算、无状态变更。
         """
         if not self.is_active:
             return None

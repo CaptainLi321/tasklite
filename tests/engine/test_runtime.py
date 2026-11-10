@@ -25,7 +25,7 @@ from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import ImmediateRequeuePolicy, TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.config import RunConfig
-from tasklite.engine.errorclass import ErrorClassifier
+
 from tasklite.engine.governor import DeadlockGovernor
 from tasklite.engine.resource import CapacityResource, ResourceManager
 from tasklite.engine.runtime import EngineRuntime
@@ -192,7 +192,6 @@ class RuntimeEnv:
                 resources=self.resources,
                 tasks=self.tasks,
                 channel=ExecutionChannel(self.ipc_dir),
-                classifier=ErrorClassifier(),
                 governor=DeadlockGovernor(),
                 trigger_registry=TriggerRegistry(
                     tasks=self.tasks,

@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     from .admission import TriggerRegistry
     from .channel import ExecutionChannel
     from .completion import CompletionMachine
-    from .errorclass import ErrorClassifier
     from .in_flight import InFlightTracker
     from .recovery import RecoveryOrchestrator
     from .resource import ResourceManager
@@ -69,11 +68,6 @@ from ..models.context import JobContext
 from ..models.job import Job
 from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
 from .channel import ExecutionResult, WorkerLaunchSpec, _WorkerLaunchCancelled
-from .errorclass import (
-    ERR_JOB_DEPENDENCY,
-    ERR_NO_HANDLER,
-    ERR_RESOURCE_DEADLOCK,
-)
 from .in_flight import InFlightJob
 from .scheduler import ScheduleResult, StandstillFacts
 from .types import AttemptOutcome, StopMode
@@ -127,7 +121,6 @@ class DispatchMachine:
         output_roots: "Path | Sequence[Path] | None",
         ipc_dir: str | None = None,
         protected_roots: tuple[Path, ...] = (),
-        classifier: "ErrorClassifier | None" = None,
         dispatch_start_lock: Any | None = None,
     ) -> None:
         self._store = store
@@ -140,7 +133,6 @@ class DispatchMachine:
         self._recovery = recovery
         self._completion = completion
         self._tasks = tasks
-        self._classifier = classifier
         self._output_roots = output_roots
         self._ipc_dir = ipc_dir
         self._protected_roots = protected_roots
@@ -339,7 +331,7 @@ class DispatchMachine:
             self._reject_and_commit(
                 job_uid,
                 job_snapshot,
-                {"error_message": ERR_RESOURCE_DEADLOCK, "error_details": eval_res.reason},
+                {"error_message": 'Resource requirements cannot be satisfied', "error_details": eval_res.reason},
                 count_as="failed",
             )
             return None
@@ -498,7 +490,7 @@ class DispatchMachine:
             return False
         logger.warning(f"SKIP: {job_uid} (Dependency {pending_dep_failure} failed)")
         failure_metadata: dict[str, Any] = {
-            "error_message": ERR_JOB_DEPENDENCY,
+            "error_message": 'Dependency failed or has no record',
             "failed_dependency": pending_dep_failure,
         }
         # 依赖父失败的级联下游计入 cascade_failed 而非 failed——
@@ -521,7 +513,7 @@ class DispatchMachine:
             f"SKIP: {job_uid} (Dependency {pending_dep_missing} has no record)"
         )
         failure_metadata: dict[str, Any] = {
-            "error_message": ERR_JOB_DEPENDENCY,
+            "error_message": 'Dependency failed or has no record',
             "failed_dependency": pending_dep_missing,
             "missing_dependency": pending_dep_missing,
         }
@@ -539,13 +531,13 @@ class DispatchMachine:
         job_snapshot: dict,
         task_type: str,
     ) -> bool:
-        """派发预检关 3——无对应 Task 注册（配置级错误 → fatal 进失败档案）。
+        """派发预检关 3——无对应 Task 注册（配置缺失直接进入失败档案）。
 
         返回 True = 已处理（直接 commit 到失败档案并级联下游）；仅当
         task_type not in tasks 时调用。事务异常原样传播。
         """
         logger.error(f"SKIP: {job_uid} (No handler for task_type '{task_type}')")
-        failure_metadata = {"error_message": ERR_NO_HANDLER, "is_fatal": True}
+        failure_metadata = {"error_message": 'No registered handler for task type'}
         self._reject_and_commit(job_uid, job_snapshot, failure_metadata)
         return True
 

@@ -16,10 +16,6 @@ import pytest
 
 from tasklite import Job, TaskLite
 from tasklite.selection import Exclude
-from tasklite.engine.errorclass import (
-    ERR_DEPENDENCY_DEADLOCK,
-    ERR_MALFORMED_JOB,
-)
 from tasklite.engine.resource import Resource
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.selection import SelectionMachine, SelectionStandstill
@@ -249,7 +245,7 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
 
     failed = pipeline._runtime.store.backend.load_failed()
     assert sorted(failed) == ["rank::b", "rank::c"]
-    assert all(ERR_DEPENDENCY_DEADLOCK in meta["error_message"] for meta in failed.values())
+    assert all('Dependency cycle prevents execution' in meta["error_message"] for meta in failed.values())
     # 被排除作业不被环归因波及，原样留队
     assert _queued(pipeline) == ["excluded_t::a"]
 
@@ -306,7 +302,7 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     pipeline = _pipeline(tmp_path)
     install_fake_process_context(pipeline, fake_process())
     pipeline.register_task("rank", ok_handler)
-    # 畸形行（缺 job_id）带被排除 task_type：不得被选择豁免，仍走 MALFORMED_JOB
+    # 畸形行（缺 job_id）带被排除 task_type：不得被选择豁免，仍结算为配置无效
     pipeline._runtime.store.backend.save_queue(
         [{"task_type": "excluded_t"}, Job("rank", "ok").to_dict()]
     )
@@ -326,7 +322,7 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     assert len(failures) == 1
     (failed_uid, fail_meta), = failures.items()
     assert failed_uid.startswith("_unknown::")
-    assert fail_meta["error_message"] == ERR_MALFORMED_JOB
+    assert fail_meta["error_message"] == 'Queued job configuration is invalid'
     assert pipeline._runtime.store.backend.load_queue() == []
 
 
@@ -448,8 +444,8 @@ def test_upstream_only_failure_skipped_by_trigger_fails_downstream(fake_process,
 
     failed = pipeline._runtime.store.backend.load_failed()
     assert "downstream::d" in failed
-    from tasklite.engine.errorclass import ERR_JOB_DEPENDENCY
-    assert ERR_JOB_DEPENDENCY in failed["downstream::d"]["error_message"]
+
+    assert 'Dependency failed or has no record' in failed["downstream::d"]["error_message"]
 
 
 def test_active_excluded_upstream_masks_historical_success(fake_process, tmp_path):
@@ -491,8 +487,8 @@ def test_uid_reuse_cycle_detection(fake_process, tmp_path):
     failed = pipeline._runtime.store.backend.load_failed()
     assert "step::a" in failed
     assert "step::b" in failed
-    assert ERR_DEPENDENCY_DEADLOCK in failed["step::a"]["error_message"]
-    assert ERR_DEPENDENCY_DEADLOCK in failed["step::b"]["error_message"]
+    assert 'Dependency cycle prevents execution' in failed["step::a"]["error_message"]
+    assert 'Dependency cycle prevents execution' in failed["step::b"]["error_message"]
 
 
 # ── 内部排除入口与停摆判定 ───────────────────────────────────────────

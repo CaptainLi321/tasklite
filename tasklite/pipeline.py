@@ -21,7 +21,6 @@ from .engine.admission import TriggerRegistry
 from .models.trigger import TriggerContext
 from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig, resolve_tuning
-from .engine.errorclass import ErrorClassifier
 from .engine.governor import DeadlockGovernor
 from .engine.ops import OpsConsole
 from .engine.resource import CapacityResource, Resource, ResourceManager
@@ -106,7 +105,6 @@ class TaskLite:
                 functions=BUILTIN_TRIGGER_FUNCTIONS,
                 base_dir=self.base_dir,
             )
-            self.classifier = ErrorClassifier()
             self.resources = self._build_resources(self.tasks, max_workers)
             self._process_context = mp.get_context("spawn")
             self._channel = ExecutionChannel(
@@ -219,7 +217,6 @@ class TaskLite:
             resources=self.resources,
             tasks=self.tasks,
             channel=self._channel,
-            classifier=self.classifier,
             governor=DeadlockGovernor(
                 deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
             ),

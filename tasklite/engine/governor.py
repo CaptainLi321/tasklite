@@ -19,12 +19,6 @@ from typing import Any, Protocol
 from ..exceptions import TaskLiteError
 from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
-from .errorclass import (
-    ERR_DEADLOCK_GAP,
-    ERR_DEPENDENCY_DEADLOCK,
-    ERR_MALFORMED_JOB,
-    ERR_RESOURCE_DEADLOCK,
-)
 from .scheduler import StandstillFacts
 from .selection import SelectionStandstill
 
@@ -127,7 +121,7 @@ class DeadlockGovernor:
             return False
         logger.critical(
             f"{log_prefix} persisted for {effective_max} rounds; "
-            f"escalating to whole-queue failure archive ({ERR_DEADLOCK_GAP})."
+            f"escalating to whole-queue failure archive (Queue cannot make progress for an undetermined reason)."
         )
         return True
 
@@ -287,17 +281,17 @@ class DeadlockGovernor:
         if malformed_uids:
             logger.error(f"Deadlock: {len(malformed_uids)} job(s) have malformed dict (unparseable).")
             uids_metas = self._split_deadlock_by_uids(
-                list(effective_state.queue), malformed_uids, ERR_MALFORMED_JOB
+                list(effective_state.queue), malformed_uids, 'Queued job configuration is invalid'
             )
         elif unknown_uids:
             logger.error(f"Deadlock: {len(unknown_uids)} job(s) reference unknown resource(s).")
             uids_metas = self._split_deadlock_by_uids(
-                list(effective_state.queue), unknown_uids, ERR_RESOURCE_DEADLOCK
+                list(effective_state.queue), unknown_uids, 'Resource requirements cannot be satisfied'
             )
         elif impossible_uids:
             logger.error(f"Deadlock: {len(impossible_uids)} job(s) request impossible resource amounts (exceeds capacity).")
             uids_metas = self._split_deadlock_by_uids(
-                list(effective_state.queue), impossible_uids, ERR_RESOURCE_DEADLOCK
+                list(effective_state.queue), impossible_uids, 'Resource requirements cannot be satisfied'
             )
         elif facts.waiting_for_dependency:
             if selection_active:
@@ -320,7 +314,7 @@ class DeadlockGovernor:
                         wait_time=0.5,
                     )
                 uids_metas = self._split_deadlock_by_uids(
-                    list(effective_state.queue), None, ERR_DEADLOCK_GAP
+                    list(effective_state.queue), None, 'Queue cannot make progress for an undetermined reason'
                 )
             else:
                 logger.error(
@@ -328,7 +322,7 @@ class DeadlockGovernor:
                     f"{sorted(cycle_uids)}"
                 )
                 uids_metas = self._split_deadlock_by_uids(
-                    list(effective_state.queue), cycle_uids, ERR_DEPENDENCY_DEADLOCK
+                    list(effective_state.queue), cycle_uids, 'Dependency cycle prevents execution'
                 )
         else:
             escalated = self.check_gap_or_escalate(
@@ -342,7 +336,7 @@ class DeadlockGovernor:
                     wait_time=0.5,
                 )
             uids_metas = self._split_deadlock_by_uids(
-                list(effective_state.queue), None, ERR_DEADLOCK_GAP
+                list(effective_state.queue), None, 'Queue cannot make progress for an undetermined reason'
             )
 
         # 提交批量死锁失败（失败档案单一出口）
@@ -368,11 +362,11 @@ class DeadlockGovernor:
                 logger.error(
                     "Deadlock arbitration resolved without archiving while allowed "
                     f"jobs remain stuck ({list(standstill.stuck_uids)}); attributing "
-                    f"them to {ERR_DEADLOCK_GAP} to guarantee queue reduction."
+                    f"them to Queue cannot make progress for an undetermined reason to guarantee queue reduction."
                 )
                 fallback_outcome = store.apply_bulk_failure(
                     [
-                        (uid, {"error_message": ERR_DEADLOCK_GAP, "root_cause": True})
+                        (uid, {"error_message": 'Queue cannot make progress for an undetermined reason', "root_cause": True})
                         for uid in standstill.stuck_uids
                     ]
                 )

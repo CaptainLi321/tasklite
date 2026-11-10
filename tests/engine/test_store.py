@@ -12,9 +12,6 @@ from hypothesis import strategies as st
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import TriggerRegistry
-from tasklite.engine.errorclass import (
-    ERR_JOB_DEPENDENCY,
-)
 from tasklite.engine.store import (
     BulkFailureOutcome,
     FailureEntry,
@@ -214,7 +211,7 @@ class TestApplyFailureAndCascade:
         for uid in ("parent::1", "child::1", "grandchild::1"):
             assert uid in store.state.failed
             assert uid in store.backend.load_failed()
-        assert store.state.failed["child::1"]["error_message"] == ERR_JOB_DEPENDENCY
+        assert store.state.failed["child::1"]["error_message"] == 'Dependency failed or has no record'
         assert store.state.failed["child::1"]["failed_dependency"] == "parent::1"
         assert "parent::1" not in store.state.in_flight_uids
 
@@ -391,8 +388,8 @@ class TestHookSingleExit:
         )
 
         store.apply_bulk_failure(
-            [("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"}),
-             ("cycle::2", {"error_message": "DEPENDENCY_DEADLOCK"})]
+            [("cycle::1", {"error_message": "Dependency cycle prevents execution"}),
+             ("cycle::2", {"error_message": "Dependency cycle prevents execution"})]
         )
         assert {uid for uid, _ in hooks} == {"cycle::1", "cycle::2"}
         assert all(fin.success is False and fin.will_retry is False for _, fin in hooks)
@@ -432,8 +429,8 @@ class TestApplyBulkFailure:
 
         outcome = store.apply_bulk_failure(
             [
-                ("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"}),
-                ("cycle::2", {"error_message": "DEPENDENCY_DEADLOCK"}),
+                ("cycle::1", {"error_message": "Dependency cycle prevents execution"}),
+                ("cycle::2", {"error_message": "Dependency cycle prevents execution"}),
             ],
         )
 
@@ -449,7 +446,7 @@ class TestApplyBulkFailure:
         identity = _start_execution(backend, "cycle::1")
         store.apply_success("cycle::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **identity)
         assert "cycle::1" in backend.load_successes()
-        store.apply_bulk_failure([("cycle::1", {"error_message": "DEPENDENCY_DEADLOCK"})])
+        store.apply_bulk_failure([("cycle::1", {"error_message": "Dependency cycle prevents execution"})])
         assert "cycle::1" not in backend.load_successes()
 
     @pytest.mark.parametrize("operation", ["bulk", "cascade"])

@@ -21,7 +21,7 @@ from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel, ExecutionResult
 from tasklite.engine.completion import CompletionMachine
-from tasklite.engine.errorclass import ERR_MAX_RETRIES, ErrorClassifier
+
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
 from tasklite.engine.resource import (
     CapacityResource,
@@ -247,7 +247,7 @@ class TestCompleteJobFailure:
         )
 
         assert env.store.state.failed["t::j1"]["error_message"] == "boom"
-        assert env.store.state.failed["child::c1"]["error_message"] == "JOB_DEPENDENCY"
+        assert env.store.state.failed["child::c1"]["error_message"] == "Dependency failed or has no record"
         assert env.stats["failed"] == 1
         assert env.stats["cascade_failed"] == 1
         assert not partial.exists()
@@ -318,7 +318,7 @@ class TestRetryBudget:
 
         assert result.will_retry is False
         assert "t::j1" in env.store.state.failed
-        assert env.store.state.failed["t::j1"]["error_message"] == ERR_MAX_RETRIES
+        assert env.store.state.failed["t::j1"]["error_message"] == 'Retry budget exhausted'
         assert env.stats["failed"] == 1
         attempts = env.backend.load_settled_attempts("t::j1")
         assert [(a["attempt_no"], a["outcome"], a["result"]["message"]) for a in attempts] == [

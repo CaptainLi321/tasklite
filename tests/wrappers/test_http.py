@@ -1,9 +1,4 @@
-"""v2 HTTP 包装器测试：Cookie 工具 / 分类守卫 / 快照存储 / 执行器 / 内置 fetch。
-
-移植 v1 同源测试并按 v2 命名面改写：fetch_urllib → urllib_fetch、
-fetch_requests → requests_fetch、guarded_fetch → guarded；本地重试
-等待基数参数按 v2 词汇表命名（retry_delay_base）。
-"""
+"""HTTP 响应、请求、缓存与本地重试的可观察行为。"""
 from __future__ import annotations
 
 import email.utils
@@ -22,19 +17,12 @@ from tasklite import TaskLiteError
 
 from tasklite import Job, JobContext, StateSnapshot, TaskLite, TaskResult
 from tasklite.wrappers.http import (
-    FatalError,
     HttpExecutor,
-    HttpPolicy,
     HttpResponse,
     MemorySnapshotStore,
-    RateLimitHit,
-    RetryError,
     SQLiteSnapshotStore,
     SnapshotStore,
     format_cookie_header,
-    guard_request,
-    guarded,
-    http_guard,
     parse_netscape_cookies,
     requests_fetch,
     urllib_fetch,
@@ -99,341 +87,11 @@ def test_http_response_properties() -> None:
 
 
 # ==============================================================================
-# 3. HttpPolicy 规则器测试
 # ==============================================================================
-
-def test_http_policy_classification() -> None:
-    policy = HttpPolicy()
-
-    assert policy.classify_status(200) is None
-    assert policy.classify_status(204) is None
-    assert policy.classify_status(429) is RateLimitHit
-    assert policy.classify_status(404) is FatalError
-    assert policy.classify_status(401) is FatalError
-    assert policy.classify_status(500) is RetryError
-    assert policy.classify_status(502) is RetryError
-
-    # 自定义状态码钩子
-    custom_policy = HttpPolicy(
-        status_classifier=lambda code, resp: FatalError if code == 2483 else None
-    )
-    assert custom_policy.classify_status(2483) is FatalError
-    assert custom_policy.classify_status(429) is RateLimitHit
-
-
-def test_http_policy_retry_after_parsing() -> None:
-    policy = HttpPolicy()
-
-    # 秒数格式
-    assert policy.extract_retry_after({"Retry-After": "120"}) == 120.0
-    assert policy.extract_retry_after({"retry-after": "45.5"}) == 45.5
-
-    # HTTP-Date 格式（未来时间）
-    future_http_date = email.utils.formatdate(time.time() + 300, usegmt=True)
-    parsed = policy.extract_retry_after({"Retry-After": future_http_date})
-    assert parsed is not None
-    assert 280.0 <= parsed <= 320.0
-
-    # 无效格式
-    assert policy.extract_retry_after({}) is None
-    assert policy.extract_retry_after({"Retry-After": "invalid-val"}) is None
-
-
-def test_extract_retry_after_non_positive_returns_none() -> None:
-    """0/负数/非有限数/过期 HTTP-Date 均表示未知有效时长。"""
-    policy = HttpPolicy()
-
-    assert policy.extract_retry_after({"Retry-After": "0"}) is None
-    assert policy.extract_retry_after({"Retry-After": "-5"}) is None
-    assert policy.extract_retry_after({"Retry-After": "inf"}) is None
-    assert policy.extract_retry_after({"Retry-After": "nan"}) is None
-
-    past_date = email.utils.formatdate(time.time() - 600, usegmt=True)
-    assert policy.extract_retry_after({"Retry-After": past_date}) is None
-
-    # 有效正值语义不回归
-    assert policy.extract_retry_after({"Retry-After": "2.5"}) == 2.5
-
-
-@pytest.mark.parametrize("hdrs", [{"Retry-After": "0"}, {"Retry-After": "-3"}])
-def test_http_guard_invalid_retry_after_is_unknown(hdrs: dict) -> None:
-    """429 携带非法 Retry-After 时仍抛出限流信号，但不虚构等待时长。"""
-    with pytest.raises(RateLimitHit) as exc_info:
-        with http_guard():
-            raise urllib.error.HTTPError(
-                url="https://x.com",
-                code=429,
-                msg="Too Many Requests",
-                hdrs=hdrs,
-                fp=None,
-            )
-    assert exc_info.value.retry_after is None
 
 
 # ==============================================================================
-# 4. http_guard 工具级限流信号测试
 # ==============================================================================
-
-def test_http_guard_rate_limit_signal() -> None:
-    with pytest.raises(RateLimitHit) as exc_info:
-        with http_guard():
-            raise urllib.error.HTTPError(
-                url="https://x.com",
-                code=429,
-                msg="Too Many Requests",
-                hdrs={"Retry-After": "75"},
-                fp=None,
-            )
-    assert exc_info.value.retry_after == 75.0
-
-
-def test_http_guard_nested_rate_limit_preserves_signal() -> None:
-    hit = RateLimitHit("HTTP 429 RateLimit hit", retry_after=12.0)
-    with pytest.raises(RateLimitHit) as exc_info:
-        with http_guard():
-            with http_guard():
-                raise hit
-    assert exc_info.value is hit
-    assert exc_info.value.retry_after == 12.0
-
-
-def test_http_guard_requests_style_retry_after_from_response() -> None:
-    """requests 风格异常无 headers 属性，Retry-After 须从 exc_val.response.headers 提取。
-
-    遗漏该回退时，requests.HTTPError 携带的 Retry-After 会被静默丢失。
-    """
-
-    class _RequestsStyleHTTPError(Exception):
-        """模拟官方 requests.HTTPError：仅携带 response，无 headers 属性。"""
-
-        def __init__(self, response: Any) -> None:
-            super().__init__("429 Too Many Requests")
-            self.response = response
-
-    class _Response:
-        status_code = 429
-        headers = {"Retry-After": "20"}
-
-    with pytest.raises(RateLimitHit) as exc_info:
-        with http_guard():
-            raise _RequestsStyleHTTPError(_Response())
-    assert exc_info.value.retry_after == 20.0
-
-
-@pytest.mark.parametrize(
-    "status_code, expected_exc, retry_after",
-    [
-        (429, RateLimitHit, "20"),
-        (503, RetryError, None),
-        (404, FatalError, None),
-    ],
-)
-def test_http_guard_httpx_status_error_style_takeover(
-    status_code: int, expected_exc: type, retry_after: Any,
-) -> None:
-    """httpx.HTTPStatusError 形态（``raise_for_status`` 主动 raise）按状态码三分类接管。
-
-    契约：守卫块内任何携带 ``response.status_code`` 的库异常一律走状态码
-    分类，不落传输层模块兜底——429 的限流等待信息不因「用户自己 raise」而
-    丢失，且 Retry-After 从 ``exc.response.headers`` 提取（httpx 异常
-    同样无顶层 headers 属性）。
-    """
-
-    class _HTTPXStatusError(Exception):
-        """模拟 httpx.HTTPStatusError：携带 request/response，无 headers 属性。"""
-
-        def __init__(self, response: Any) -> None:
-            super().__init__(f"HTTP status {response.status_code}")
-            self.request = object()
-            self.response = response
-
-    class _Response:
-        def __init__(self, code: int, headers: Any) -> None:
-            self.status_code = code
-            self.headers = headers
-
-    headers = {"Retry-After": retry_after} if retry_after is not None else {}
-    with pytest.raises(expected_exc) as exc_info:
-        with http_guard():
-            raise _HTTPXStatusError(_Response(status_code, headers))
-    if expected_exc is RateLimitHit:
-        assert exc_info.value.retry_after == 20.0
-
-
-def test_suspend_parameters_are_rejected() -> None:
-    with pytest.raises(TypeError, match="ctx"):
-        http_guard(ctx=object())  # type: ignore[call-arg]
-    with pytest.raises(TypeError, match="resource"):
-        HttpExecutor(resource="api")  # type: ignore[call-arg]
-    with pytest.raises(TypeError, match="default_suspend_ttl"):
-        guard_request(lambda: None, default_suspend_ttl=60.0)  # type: ignore[call-arg]
-
-
-def test_http_guard_transient_and_fatal() -> None:
-    # 500 转换为 RetryError
-    with pytest.raises(RetryError):
-        with http_guard():
-            raise urllib.error.HTTPError(
-                url="https://api.test",
-                code=500,
-                msg="Internal Server Error",
-                hdrs={},
-                fp=None,
-            )
-
-    # 网络连接异常转换为 RetryError
-    with pytest.raises(RetryError):
-        with http_guard():
-            raise urllib.error.URLError(reason="Connection refused")
-
-    # 404 转换为 FatalError
-    with pytest.raises(FatalError):
-        with http_guard():
-            raise urllib.error.HTTPError(
-                url="https://api.test",
-                code=404,
-                msg="Not Found",
-                hdrs={},
-                fp=None,
-            )
-
-
-def test_http_policy_http_exception_family_transient() -> None:
-    """http.client.HTTPException 家族整体按瞬态传输故障分类。
-
-    BadStatusLine/LineTooLong 等 getresponse/read 阶段故障（代理/源站
-    提前断连的典型形态）不是 OSError，漏判会裸逃逸为零重试致命错误。
-    """
-    import http.client
-
-    policy = HttpPolicy()
-    for exc in (
-        http.client.HTTPException("base"),
-        http.client.BadStatusLine("''"),
-        http.client.LineTooLong("header"),
-        http.client.ResponseNotReady("x"),
-        http.client.CannotSendRequest(),
-        http.client.IncompleteRead(b"partial"),
-        http.client.RemoteDisconnected("x"),
-    ):
-        assert policy.classify_exception(exc) is RetryError, type(exc).__name__
-
-    # HTTPError 同属该家族，但仍按状态码精确分类，不落入家族兜底
-    err = urllib.error.HTTPError("https://api.test", 404, "Not Found", None, io.BytesIO(b""))
-    assert policy.classify_exception(err) is FatalError
-
-
-class _CustomFatal(FatalError):
-    """模拟用户分类器返回的自定义 FatalError 子类（签名的自然用法）。"""
-
-
-class _CustomRateLimit(RateLimitHit):
-    pass
-
-
-class _CustomRetry(RetryError):
-    pass
-
-
-def test_check_response_accepts_classifier_subclasses() -> None:
-    """分类器返回三分类子类时必须命中对应分支，identity 比较会静默当成功。
-
-    status_classifier 返回自定义 FatalError 子类属签名的自然用法；若以
-    `cls is FatalError` 分派则三分类全不命中，401 错误响应被静默作为
-    成功返回，错误既不上抛也不进失败档案。
-    """
-    fatal_policy = HttpPolicy(
-        status_classifier=lambda code, resp: _CustomFatal if code == 401 else None
-    )
-    with pytest.raises(FatalError):
-        http_guard(policy=fatal_policy).check_response(
-            HttpResponse(status_code=401, headers={}, body=b"unauthorized")
-        )
-
-    rl_policy = HttpPolicy(
-        status_classifier=lambda code, resp: _CustomRateLimit if code == 429 else None
-    )
-    with pytest.raises(RateLimitHit) as exc_info:
-        http_guard(policy=rl_policy).check_response(
-            HttpResponse(status_code=429, headers={}, body=b"rate limited")
-        )
-    assert exc_info.value.retry_after is None
-
-    retry_policy = HttpPolicy(
-        status_classifier=lambda code, resp: _CustomRetry if code == 503 else None
-    )
-    with pytest.raises(RetryError):
-        http_guard(policy=retry_policy).check_response(
-            HttpResponse(status_code=503, headers={}, body=b"down")
-        )
-
-
-def test_guard_exit_converts_custom_classifier_subclass() -> None:
-    """exception_classifier 返回三分类子类时守卫必须完成对应转换。"""
-    with pytest.raises(RateLimitHit) as exc_info:
-        with http_guard(
-            policy=HttpPolicy(exception_classifier=lambda exc: _CustomRateLimit),
-        ):
-            raise ValueError("boom")
-    assert exc_info.value.retry_after is None
-
-    with pytest.raises(FatalError):
-        with http_guard(policy=HttpPolicy(exception_classifier=lambda exc: _CustomFatal)):
-            raise ValueError("boom")
-
-    with pytest.raises(RetryError):
-        with http_guard(policy=HttpPolicy(exception_classifier=lambda exc: _CustomRetry)):
-            raise ValueError("boom")
-
-
-def test_policy_classifier_invalid_return_fails_loud() -> None:
-    """分类器返回与三分类无关的异常类或非异常类必须 fail-loud，禁止静默当成功。"""
-    unrelated_class_policy = HttpPolicy(
-        status_classifier=lambda code, resp: ValueError if code == 500 else None
-    )
-    with pytest.raises(TaskLiteError):
-        http_guard(policy=unrelated_class_policy).check_response(
-            HttpResponse(status_code=500, headers={}, body=b"err")
-        )
-
-    non_class_policy = HttpPolicy(
-        status_classifier=lambda code, resp: "FatalError" if code == 500 else None
-    )
-    with pytest.raises(TaskLiteError):
-        http_guard(policy=non_class_policy).check_response(
-            HttpResponse(status_code=500, headers={}, body=b"err")
-        )
-
-
-def test_guard_request_retry_loop() -> None:
-    attempts = 0
-
-    def flaky_request() -> HttpResponse:
-        nonlocal attempts
-        attempts += 1
-        if attempts < 3:
-            raise ConnectionResetError("Connection reset by peer")
-        return HttpResponse(status_code=200, headers={}, body=b"success")
-
-    # 配置 max_retries=2, retry_delay_base=0.01 快速就地重试成功
-    resp = guard_request(flaky_request, max_retries=2, retry_delay_base=0.01)
-    assert resp.status_code == 200
-    assert attempts == 3
-
-    # 重试耗尽时抛出 RetryError
-    attempts = 0
-    with pytest.raises(RetryError):
-        guard_request(flaky_request, max_retries=1, retry_delay_base=0.01)
-
-
-def test_guarded_decorator() -> None:
-    @guarded()
-    def fetch_something() -> HttpResponse:
-        return HttpResponse(status_code=429, headers={}, body=b"rate limited")
-
-    with pytest.raises(RateLimitHit) as exc_info:
-        fetch_something()
-    assert exc_info.value.retry_after is None
 
 
 # ==============================================================================
@@ -709,23 +367,6 @@ def test_snapshot_cached_distinguishes_identity_headers() -> None:
     assert call_count == 3
 
 
-def test_snapshot_cached_wrapped_urllib_fetch_429_signal_reaches_outer_guard(
-    local_http_server: str,
-) -> None:
-    """store.cached(urllib_fetch) 嵌套守卫时，429 信号须穿透内层。
-
-    外层守卫须保留内层从真实 Retry-After 响应头解析出的等待时长。
-    """
-    store = MemorySnapshotStore()
-    cached_fetch = store.cached(urllib_fetch)
-
-    with pytest.raises(RateLimitHit) as exc_info:
-        with http_guard():
-            cached_fetch(f"{local_http_server}/429")
-
-    assert exc_info.value.retry_after == 15.0
-
-
 def test_snapshot_cached_distinguishes_params_value_types() -> None:
     """同 URL 下 params 值不同形态必须各发一次真实请求，禁止静默命中同一快照。"""
     call_count = 0
@@ -929,30 +570,6 @@ def test_urllib_fetch_post(local_http_server: str) -> None:
     assert resp.json()["received_bytes"] > 0
 
 
-def test_urllib_fetch_429_signal(local_http_server: str) -> None:
-    with pytest.raises(RateLimitHit) as exc_info:
-        urllib_fetch(f"{local_http_server}/429")
-    assert exc_info.value.retry_after == 15.0
-
-
-def test_urllib_fetch_429_has_no_core_resource_side_effect(
-    local_http_server: str,
-) -> None:
-    with pytest.raises(RateLimitHit):
-        urllib_fetch(f"{local_http_server}/429")
-    assert not hasattr(JobContext, "suspend_resource")
-
-
-def test_urllib_fetch_500_retry(local_http_server: str) -> None:
-    with pytest.raises(RetryError):
-        urllib_fetch(f"{local_http_server}/500")
-
-
-def test_urllib_fetch_404_fatal(local_http_server: str) -> None:
-    with pytest.raises(FatalError):
-        urllib_fetch(f"{local_http_server}/non_existent")
-
-
 def test_urllib_fetch_drops_none_params_like_requests(local_http_server: str) -> None:
     """params None 值与 requests 语义对齐丢弃：不上链，快照 key 与省略等价。
 
@@ -964,54 +581,11 @@ def test_urllib_fetch_drops_none_params_like_requests(local_http_server: str) ->
     assert resp.text == "/echo?a=1"
 
 
-def test_urllib_fetch_bad_status_line_raises_retry_error() -> None:
-    """残缺状态行（源站/代理提前断连）必须转换为 RetryError 退避重试。
-
-    urllib 的 do_open 只把 OSError 包装为 URLError，残缺状态行在
-    getresponse 阶段以裸 BadStatusLine 抛出——守卫必须将其归为瞬态，
-    不得放行裸异常（零重试直送失败档案）。
-    """
-    server = socket.socket()
-    server.bind(("127.0.0.1", 0))
-    server.listen(1)
-    port = server.getsockname()[1]
-    started = threading.Event()
-
-    def _broken_server() -> None:
-        try:
-            started.set()
-            conn, _ = server.accept()
-            try:
-                conn.recv(4096)
-                conn.sendall(b"HTTP/1.1 x\r\n\r\n")
-            finally:
-                conn.close()
-        except OSError:
-            pass
-        finally:
-            server.close()
-
-    t = threading.Thread(target=_broken_server, daemon=True)
-    t.start()
-    assert started.wait(timeout=5)
-    try:
-        with pytest.raises(RetryError):
-            urllib_fetch(f"http://127.0.0.1:{port}/x", timeout=5.0)
-    finally:
-        t.join(timeout=5)
-
-
 def test_requests_fetch_success(local_http_server: str) -> None:
     resp = requests_fetch(f"{local_http_server}/json")
     assert resp.status_code == 200
     assert resp.ok is True
     assert resp.json() == {"status": "ok", "msg": "hello"}
-
-
-def test_requests_fetch_429_signal(local_http_server: str) -> None:
-    with pytest.raises(RateLimitHit) as exc_info:
-        requests_fetch(f"{local_http_server}/429")
-    assert exc_info.value.retry_after == 15.0
 
 
 # ==============================================================================
@@ -1058,42 +632,6 @@ class TestHttpExecutor:
         assert resp2.text == "data"
         assert call_count == 1
 
-    def test_execute_with_rate_limit_and_retry(self):
-        executor = HttpExecutor()
-
-        def failing_fetch(url: str):
-            return HttpResponse(
-                status_code=429,
-                headers={"Retry-After": "45"},
-                body=b"rate limited",
-                url=url,
-            )
-
-        with pytest.raises(RateLimitHit) as exc_info:
-            executor.execute(failing_fetch, "https://example.com/rate_limited")
-
-        assert exc_info.value.retry_after == 45.0
-
-    def test_execute_rate_limit_not_locally_retried(self):
-        """429 必须命中 RateLimitHit 专用分支直接上抛，禁止落入本地重试循环。
-
-        不变式：RateLimitHit 是 RetryError 子类，except 顺序颠倒会把限流吞进
-        本地线性微等待重试——无视 Retry-After 猛打限流端点。
-        """
-        executor = HttpExecutor(max_retries=5, retry_delay_base=0.0)
-        call_count = 0
-
-        def rate_limited_fetch(url: str):
-            nonlocal call_count
-            call_count += 1
-            return HttpResponse(status_code=429, headers={"Retry-After": "30"}, body=b"rate limited", url=url)
-
-        with pytest.raises(RateLimitHit) as exc_info:
-            executor.execute(rate_limited_fetch, "https://example.com/rl")
-
-        assert call_count == 1
-        assert exc_info.value.retry_after == 30.0
-
 
 class TestHttpExecutorRetryWaitShape:
     """HttpExecutor 本地重试等待形态（指数递增封顶 + 抖动）。
@@ -1101,6 +639,7 @@ class TestHttpExecutorRetryWaitShape:
     线性无上限等待（base×attempt）在大 max_retries 下累计睡眠巨大；
     正确形状为 base×2^(n-1)（封顶 + ±25% 抖动）。
     """
+
 
     def _run_with_capture(self, monkeypatch, max_retries, retry_delay_base):
         import tasklite.wrappers.http as http_mod
@@ -1118,10 +657,10 @@ class TestHttpExecutorRetryWaitShape:
 
         def _flaky(*args, **kwargs):
             calls["n"] += 1
-            raise RetryError(f"transient #{calls['n']}")
+            raise ConnectionError(f"transient #{calls['n']}")
 
         executor = http_mod.HttpExecutor(max_retries=max_retries, retry_delay_base=retry_delay_base)
-        with pytest.raises(RetryError):
+        with pytest.raises(ConnectionError):
             executor.execute(_flaky)
         return sleeps
 
@@ -1137,31 +676,6 @@ class TestHttpExecutorRetryWaitShape:
         assert all(s <= 300.0 for s in sleeps)
         assert len(sleeps) == 30
 
-    def test_retry_wait_jittered(self, monkeypatch):
-        """抖动以 ±25% 延迟幅度作用于每次等待。"""
-        import tasklite.wrappers.http as http_mod
-
-        jitter_calls: list = []
-
-        def _fake_uniform(a, b):
-            jitter_calls.append((a, b))
-            return 0.0
-
-        monkeypatch.setattr(http_mod.time, "sleep", lambda s: None)
-        monkeypatch.setattr(http_mod.random, "uniform", _fake_uniform)
-
-        def _flaky(*args, **kwargs):
-            raise RetryError("transient")
-
-        executor = http_mod.HttpExecutor(max_retries=2, retry_delay_base=4.0)
-        with pytest.raises(RetryError):
-            executor.execute(_flaky)
-
-        # 与等待计算同写法：uniform(-0.25, 0.25) 后乘延迟（base=4 → 4, 8）
-        assert len(jitter_calls) == 2
-        assert jitter_calls[0] == (-0.25, 0.25)
-        assert jitter_calls[1] == (-0.25, 0.25)
-
 
 # ==============================================================================
 # 8. 真实核心集成测试（TaskLite + HTTP Wrapper）
@@ -1171,22 +685,6 @@ def _fetch_success_handler(job: Job, ctx: Any) -> TaskResult:
     resp = urllib_fetch(job.payload["url"])
     data = resp.json()
     return TaskResult.success(metadata={"result": data["msg"]})
-
-
-def _fetch_fatal_handler(job: Job, ctx: Any) -> TaskResult:
-    try:
-        urllib_fetch(job.payload["url"])
-    except FatalError as e:
-        return TaskResult.failure(message=str(e), metadata={"code": 404})
-    return TaskResult.success()
-
-
-def _fetch_flaky_handler(job: Job, ctx: Any) -> TaskResult:
-    try:
-        resp = urllib_fetch(job.payload["url"])
-    except RetryError:
-        return TaskResult.retry(message="server temporary error", consume_budget=True)
-    return TaskResult.success(metadata=resp.json())
 
 
 class TestHttpTaskLiteIntegration:
@@ -1212,38 +710,120 @@ class TestHttpTaskLiteIntegration:
             assert rec["result"] is not None
             assert rec["result"]["metadata"]["result"] == "hello"
 
-    def test_http_fetch_fatal_failure_in_pipeline(self, local_http_server: str, tmp_path: Path) -> None:
-        """确定性失败场景：handler 遇到 404 FatalError，构造 TaskResult.failure 返回。"""
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "http_fatal.db")
-        app.register_task("http_fatal_job", _fetch_fatal_handler)
-        app.enqueue(Job("http_fatal_job", "j_fail", payload={"url": f"{local_http_server}/missing_404"}))
+
+
+
+@pytest.mark.parametrize("code,status", [(200, "success"), (302, "success"), (404, "failure"), (429, "retry"), (503, "retry")])
+def test_response_explicit_task_result(code, status):
+    response = HttpResponse(status_code=code, headers={"Retry-After": "12"}, body=b"body")
+    result = response.to_task_result()
+    assert result.status == status
+    assert result.message == f"HTTP {code}"
+    assert result.metadata["status_code"] == code
+    if code == 429:
+        assert result.metadata["retry_after"] == 12.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "unknown", "Wed, 21 Oct 2015 07:28:00 GMT"])
+def test_response_unknown_retry_after(value):
+    response = HttpResponse(status_code=429, headers={"retry-after": value}, body=b"")
+    assert response.to_task_result().metadata["retry_after"] is None
+
+
+@pytest.mark.parametrize("fetch_name", ["urllib", "requests"])
+@pytest.mark.parametrize("code", [429, 500, 404])
+def test_fetch_returns_error_response(local_http_server, fetch_name, code):
+    if fetch_name == "requests":
+        pytest.importorskip("requests")
+    fetch = urllib_fetch if fetch_name == "urllib" else requests_fetch
+    response = fetch(f"{local_http_server}/{code}")
+    assert response.status_code == code
+    if code == 429:
+        assert response.headers.get("retry-after") == "15"
+        assert response.body == b"rate limited"
+
+
+@pytest.mark.parametrize("code,calls", [(429, 1), (404, 1), (503, 3)])
+def test_executor_returns_last_response_without_implicit_task_result(code, calls):
+    count = 0
+    response = HttpResponse(status_code=code, headers={}, body=b"last")
+
+    def fetch():
+        nonlocal count
+        count += 1
+        return response
+
+    assert HttpExecutor(max_retries=2, retry_delay_base=0).execute(fetch) is response
+    assert count == calls
+
+
+def test_executor_network_recovery_and_original_exhausted_exception():
+    error = ConnectionError("断线")
+    response = HttpResponse(status_code=200, headers={}, body=b"ok")
+    count = 0
+
+    def fetch():
+        nonlocal count
+        count += 1
+        if count == 1:
+            raise error
+        return response
+
+    assert HttpExecutor(max_retries=1, retry_delay_base=0).execute(fetch) is response
+    assert count == 2
+
+    def fail():
+        raise error
+
+    with pytest.raises(ConnectionError) as caught:
+        HttpExecutor(max_retries=2, retry_delay_base=0).execute(fail)
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("fetch_name", ["urllib", "requests"])
+def test_fetch_keeps_natural_transport_exception(monkeypatch, fetch_name):
+    import tasklite.wrappers.http as http_mod
+
+    original = TimeoutError("原始网络故障")
+
+    def fail(*args, **kwargs):
+        raise original
+
+    if fetch_name == "urllib":
+        class Opener:
+            open = staticmethod(fail)
+
+        monkeypatch.setattr(http_mod, "_build_urllib_opener", lambda *args: Opener())
+        fetch = urllib_fetch
+    else:
+        pytest.importorskip("requests")
+        class Session:
+            request = staticmethod(fail)
+
+        fetch = lambda url: requests_fetch(url, session=Session())
+    with pytest.raises(TimeoutError) as caught:
+        fetch("http://example.test")
+    assert caught.value is original
+    import traceback
+    assert "fail" in [frame.name for frame in traceback.extract_tb(caught.value.__traceback__)]
+
+
+def _fetch_status_handler(job, ctx):
+    return urllib_fetch(job.payload["url"]).to_task_result()
+
+
+@pytest.mark.parametrize("code,count", [(404, 1), (429, 2), (500, 2)])
+def test_handler_explicitly_returns_http_result(local_http_server, tmp_path, code, count):
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as app:
+        app.register_task("http", _fetch_status_handler, max_retries_per_run=1)
+        app.enqueue(Job("http", "a", payload={"url": f"{local_http_server}/{code}"}))
         app.run()
-
-        with StateSnapshot.open(app) as snap:
-            rec = snap.get_job("http_fatal_job::j_fail")
-            assert rec is not None
-            assert rec["status"] == "failed"
-            assert rec["result"] is not None
-            assert rec["result"]["metadata"]["code"] == 404
-            assert "Fatal error" in rec["result"]["message"]
-
-    def test_http_fetch_retry_in_pipeline(self, local_http_server: str, tmp_path: Path) -> None:
-        """瞬态重试场景：handler 遇到 500 RetryError，构造 TaskResult.retry 返回并在第二次重试时成功。"""
-        _TestHttpHandler.flaky_counts.clear()
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "http_retry.db")
-        app.register_task("http_flaky_job", _fetch_flaky_handler, max_retries_per_run=3)
-        app.enqueue(Job("http_flaky_job", "j_retry", payload={"url": f"{local_http_server}/flaky"}))
-        app.run()
-
-        with StateSnapshot.open(app) as snap:
-            rec = snap.get_job("http_flaky_job::j_retry")
-            assert rec is not None
-            assert rec["status"] == "succeeded"
-            assert rec["result"] is not None
-            assert rec["result"]["metadata"]["recovered"] is True
-            attempts = list(snap.iter_attempts(job_uid="http_flaky_job::j_retry"))
-            assert len(attempts) == 2
-            assert attempts[0]["outcome"] == "retry"
-            assert attempts[1]["outcome"] == "success"
-
-
+        with StateSnapshot.open(app) as snapshot:
+            attempts = list(snapshot.iter_attempts())
+            record = snapshot.get_job("http::a")
+        assert record["status"] == "failed"
+        assert len(attempts) == count
+        assert [a["outcome"] for a in attempts] == (["retry", "failure"] if count == 2 else ["failure"])
+        assert record["result"]["message"] == f"HTTP {code}"
+        assert record["result"]["metadata"]["status_code"] == code
+        assert record["result"]["exception"] is None

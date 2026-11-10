@@ -1,8 +1,7 @@
 """引擎值对象与枚举类型。
 
 纯数据结构，零业务逻辑依赖——可被任意模块安全导入而不触发环形导入。
-Handler 归属 Task 规格层（``models/task.py`` 的 Task 单点持有 handler、
-默认资源与 payload_schema），本模块不再有条目形态。
+Handler 与默认执行配置归属 Task 规格层（``models/task.py``）。
 """
 
 from __future__ import annotations

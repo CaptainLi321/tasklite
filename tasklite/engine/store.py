@@ -41,7 +41,6 @@ from .admission import (
     extract_trusted_metadata_timestamp_us,
     is_trusted_success_metadata,
 )
-from .errorclass import ERR_JOB_DEPENDENCY, ErrorClassifier
 from .types import TRANSIENT_KIND_STAT_KEYS, AttemptOutcome
 
 logger = logging.getLogger("tasklite")
@@ -52,7 +51,7 @@ class FailureEntry:
     """失败档案只读查询的结构化不可变条目（运维查询面的载荷形状）。
 
     - ``job_uid``: 作业唯一标识 (task_type::job_id)
-    - ``error_message``: 原始错误消息/错误码
+    - ``error_message``: 失败说明
     - ``metadata``: 完整失败档案 meta 字典视图
     - ``payload``: 原始业务 payload 快照（失败落盘无可存快照时为 None）
     """
@@ -110,7 +109,6 @@ class StateStore:
         backend: AbstractStateBackend,
         state: PipelineState | None = None,
         *,
-        classifier: ErrorClassifier | None = None,
         on_attempt_finished: Callable[..., None] | None = None,
         stats: Any | None = None,
         trigger_registry: TriggerRegistry | None = None,
@@ -120,7 +118,6 @@ class StateStore:
     ) -> None:
         self._backend = backend
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
-        self._classifier = classifier if classifier is not None else ErrorClassifier()
         self._on_attempt_finished = on_attempt_finished
         self._stats = stats
         self._trigger_registry = (
@@ -340,7 +337,6 @@ class StateStore:
                 fail_meta: dict[str, Any] = {
                     "job_snapshot": snap,
                     "annotations": {"completion_source": "manual"},
-                    "error_category": "manual",
                     "error_message": note or "Manual status set to failed",
                     "settled_at": utc_now_iso(),
                     "run_id": None,
@@ -540,11 +536,11 @@ class StateStore:
     ) -> None:
         """失败终态内存登记的唯一尾段（successes/failed 互斥单点维护）。
 
-        先经失败档案元数据规范化，再落 failed 集合——state.mark_failed
+        独立复制框架档案，再落 failed 集合——state.mark_failed
         同步摘除 successes 同名行（成功/失败互删语义）；``unregister=False``
         供批量崩溃契约路径先登记、由调用方统一处置在途集合。
         """
-        normalized = self._classifier.normalize_failure_metadata(metadata)
+        normalized = copy.deepcopy(metadata)
         self._state.mark_failed(job_uid, normalized)
         if unregister:
             self._state.unregister_in_flight(job_uid)
@@ -737,7 +733,7 @@ class StateStore:
         execution_id: str | None = None,
     ) -> FailureOutcome:
         """原子终态转移：永久失败（进入失败档案 + successes 互删 + 级联下游）。"""
-        normalized_meta = self._classifier.normalize_failure_metadata(failure_metadata)
+        normalized_meta = copy.deepcopy(failure_metadata)
         effective_settled_at = settled_at if settled_at is not None else utc_now_iso()
         if result is not None:
             normalized_meta.update(self._execution_record(result, files))
@@ -913,7 +909,7 @@ class StateStore:
                     failed_uids=[], remaining_queue_count=len(self._state.queue)
                 )
         normalized_metas = [
-            (job_uid, self._classifier.normalize_failure_metadata(metadata))
+            (job_uid, copy.deepcopy(metadata))
             for job_uid, metadata in uids_metas
         ]
         self._backend.commit_job_failures(normalized_metas)
@@ -952,7 +948,7 @@ class StateStore:
         if not cascade_uids:
             return []
         cascade_metas = [
-            (job_uid, {"error_message": ERR_JOB_DEPENDENCY, "failed_dependency": failed_uid})
+            (job_uid, {"error_message": 'Dependency failed or has no record', "failed_dependency": failed_uid})
             for job_uid in cascade_uids
         ]
         self._backend.commit_job_failures(cascade_metas)

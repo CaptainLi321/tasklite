@@ -25,7 +25,7 @@ from tasklite.engine.admission import (
 )
 from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.config import RunConfig, Tuning, resolve_tuning
-from tasklite.engine.errorclass import ErrorClassifier
+
 from tasklite.engine.governor import (
     DEADLOCK_GAP_MAX_ROUNDS,
     DeadlockGovernor,
@@ -53,7 +53,6 @@ class ConfigEnv:
         self.resources = ResourceManager()
         self.tasks = TaskRegistry()
         self.channel = ExecutionChannel(self.ipc_dir)
-        self.classifier = ErrorClassifier()
         self.governor = DeadlockGovernor()
         self.trigger_registry = TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS)
         self.requeue_policy = ImmediateRequeuePolicy()
@@ -66,7 +65,6 @@ class ConfigEnv:
             resources=self.resources,
             tasks=self.tasks,
             channel=self.channel,
-            classifier=self.classifier,
             governor=self.governor,
             trigger_registry=self.trigger_registry,
             requeue_policy=self.requeue_policy,
@@ -128,7 +126,6 @@ class TestRunConfigResolve:
         assert config.resources is env.resources
         assert config.tasks is env.tasks
         assert config.channel is env.channel
-        assert config.classifier is env.classifier
         assert config.governor is env.governor
         assert config.trigger_registry is env.trigger_registry
         assert config.requeue_policy is env.requeue_policy

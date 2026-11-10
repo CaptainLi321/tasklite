@@ -10,7 +10,7 @@ import pytest
 from tasklite import TaskLiteError
 
 from tasklite import FileSpec, Job, TaskLite, TaskResult
-from tasklite.engine.errorclass import ERR_MAX_RETRIES
+
 from tasklite.triggers import on_input_change
 from tasklite.utils.clock import parse_utc_iso_to_us
 
@@ -198,7 +198,7 @@ def test_retry_candidate_and_later_ordinary_candidate_same_run(
     assert "parent::p" in pipeline._runtime.store.backend.load_successes()
     if child_trigger == "always":
         assert pipeline._runtime.store.backend.load_failed()["child::item"]["error_message"] == (
-            ERR_MAX_RETRIES
+            'Retry budget exhausted'
         )
     else:
         assert pipeline._runtime.store.backend.load_failed() == {}

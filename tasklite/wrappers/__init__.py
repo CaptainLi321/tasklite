@@ -2,7 +2,7 @@
 
 - discovery：通用增量扫描回调封装（register_discovery + DiscoveryHandler
   + 框架无关三协议）。
-- http：官方轻量网络工具库（HttpResponse, HttpPolicy, http_guard,
+- http：官方轻量网络工具库（HttpResponse, HttpExecutor,
   SnapshotStore, urllib_fetch 等）。
 
 本包不设符号级再导出面，符号一律经 ``tasklite.wrappers.<模块>``
