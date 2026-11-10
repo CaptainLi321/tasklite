@@ -1,11 +1,4 @@
-"""v2 EngineRuntime 运行时测试：四相事件泵、承重网与停机控制流。
-
-覆盖：装配与接线、停机状态机单调流转、step 单步事件泵（空态/排空/
-强杀三早退）、execute 生命周期（起止钩子对称、异常经 raise 通道上抛、
-会话复位、strict 预检、单运行锁、初始化段故障复位）、run() 重入守卫、
-崩溃承重网（在途清扫 + 崩溃保队 + 收尾钩子）、fencing 屏障与
-DRAINING / ABORTING 停机语义（确定性 fake 进程驱动）。
-"""
+"""运行装配、序列化预检、异常保队与排空停止行为。"""
 
 from __future__ import annotations
 
@@ -32,7 +25,6 @@ from tasklite.engine.runtime import EngineRuntime
 from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import (
-    AttemptOutcome,
     ExecutionOptions,
     ExitReason,
     StepOutcome,
@@ -43,7 +35,7 @@ from tasklite.models.task import Task, TaskRegistry
 
 
 def ok_handler(job, ctx):
-    """占位 handler（模块级可 pickle，满足 strict 预检）。"""
+    """占位 handler（模块级可 pickle，满足序列化预检）。"""
     return True
 
 
@@ -171,10 +163,6 @@ class RuntimeEnv:
         *,
         name: str = "test_runtime",
         capacity: float = 2.0,
-        strict_picklable: bool = True,
-        on_run_start=None,
-        on_run_end=None,
-        on_attempt_finished=None,
     ):
         self.ipc_dir = str(tmp_path / "ipc")
         Path(self.ipc_dir).mkdir(parents=True, exist_ok=True)
@@ -183,7 +171,6 @@ class RuntimeEnv:
             {WORKER_RESOURCE: CapacityResource(WORKER_RESOURCE, max_capacity=capacity)}
         )
         self.tasks = TaskRegistry()
-        self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.runtime = EngineRuntime(
             config=RunConfig.resolve(
                 name=name,
@@ -199,7 +186,6 @@ class RuntimeEnv:
                 ),
                 requeue_policy=ImmediateRequeuePolicy(),
                 output_roots=tmp_path,
-                strict_picklable=strict_picklable,
             ),
         )
 
@@ -320,10 +306,10 @@ class TestEngineRuntimeExecutionLifecycle:
         assert runtime.session.stop_mode == StopMode.NONE
         assert runtime.session.get_retry_count("t::j1") == 0
 
-    def test_strict_picklable_unpicklable_handler_fails(self, tmp_path):
+    def test_unpicklable_handler_fails(self, tmp_path):
         """不可序列化 handler 在派发前明确拒绝。"""
         local_fn = lambda j, c: True  # noqa: E731
-        env = RuntimeEnv(tmp_path, name="test_picklable", strict_picklable=True)
+        env = RuntimeEnv(tmp_path, name="test_picklable")
         env.tasks.register(Task(task_type="unpicklable", handler=local_fn))
 
         with pytest.raises(TaskLiteError, match="not picklable"):
@@ -370,10 +356,8 @@ class TestEngineRuntimeInitFailureSafety:
         泄漏、可复跑。"""
         import tasklite.engine.runtime as runtime_module
 
-        events: list[str] = []
         env = RuntimeEnv(
             tmp_path, name="test_env_failure",
-            on_run_end=lambda reason: events.append(reason),
         )
 
         def _raise_env_failure(ipc_dir, uid, *, timeout=0):
@@ -383,10 +367,9 @@ class TestEngineRuntimeInitFailureSafety:
         with pytest.raises(OSError):
             env.runtime.execute()
 
-        # 故障路径收尾：运行标志复位、无锁 fd 残留、未开始的 run 不发 on_run_end
+        # 故障路径收尾：运行标志复位、无锁 fd 残留
         assert not env.runtime.is_running
         assert env.runtime._run_lock_fd is None
-        assert events == []
 
         # 故障注入解除后，同实例可正常启动并完成（复跑成功同时证明锁已
         # 释放：遗留 fd 的 flock 会让下一次 try_acquire_lock 返回 None）
@@ -612,6 +595,11 @@ class TestGracefulDraining:
         assert "t::j1" in env.backend.load_successes()
         assert "t::j2" not in env.backend.load_successes()
         assert any(jd.get("job_id") == "j2" for jd in env.backend.load_queue())
+        attempt, = env.backend.load_settled_attempts("t::j1")
+        assert attempt["outcome"] == "success"
+        assert env.backend.load_settled_attempts("t::j2") == []
+        assert env.resources[WORKER_RESOURCE].used == 0
+
 
     def test_missing_dependency_settles_without_deadlock_arbitration(
         self, tmp_path, monkeypatch,

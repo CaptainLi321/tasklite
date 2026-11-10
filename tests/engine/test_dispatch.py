@@ -29,7 +29,7 @@ from tasklite.engine.resource import (
 )
 from tasklite.engine.scheduler import JobScheduler
 from tasklite.engine.store import StateStore
-from tasklite.engine.types import AttemptOutcome, StopMode
+from tasklite.engine.types import StopMode
 from tasklite.models.artifact import FileSpec
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
@@ -97,12 +97,10 @@ class DispatchEnv:
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
         self.stats = defaultdict(int)
-        self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.store = StateStore(
             self.backend,
             PipelineState({}, {}, {}, []),
             stats=self.stats,
-            on_attempt_finished=lambda uid, *, outcome: self.hooks.append((uid, outcome)),
         )
         self.session = StubSession()
         self.in_flight = InFlightTracker()
@@ -290,7 +288,7 @@ class TestDedupGate:
 class TestRejectGates:
     """预检关 2/3 与载荷校验拒绝路径。"""
 
-    def test_no_handler_gate_fails_with_hook(self, tmp_path):
+    def test_no_handler_gate_archives_failure_without_attempt(self, tmp_path):
         env = DispatchEnv(tmp_path)
         env.store.state.spawn_jobs([Job("ghost", "j1").to_dict()])
 
@@ -299,10 +297,6 @@ class TestRejectGates:
         assert env.stats["failed"] == 1
         assert "ghost::j1" in env.store.state.failed
         assert env.store.state.failed["ghost::j1"]["error_message"] == 'No registered handler for task type'
-        assert env.hooks == [
-            ("ghost::j1", AttemptOutcome(success=False, will_retry=False,
-                                        metadata=env.store.state.failed["ghost::j1"]))
-        ]
         records = env.backend.load_settled_attempts("ghost::j1")
         assert records == []
 
@@ -549,7 +543,6 @@ def test_dispatch_and_settlement_use_current_protocol_only(tmp_path, monkeypatch
     assert attempt["run_id"] == entry.run_id
     assert attempt["attempt_no"] == entry.attempt_no == 1
     assert env.resources["__workers__"].used == 0
-    assert len(env.hooks) == 1
     if outcome == "retry":
         second = env.dispatch.dispatch_next().entry
         assert second is not None

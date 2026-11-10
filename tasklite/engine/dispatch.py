@@ -70,7 +70,7 @@ from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
 from .channel import ExecutionResult, WorkerLaunchSpec, _WorkerLaunchCancelled
 from .in_flight import InFlightJob
 from .scheduler import ScheduleResult, StandstillFacts
-from .types import AttemptOutcome, StopMode
+from .types import StopMode
 from .wait import AUTHORIZATION_RECHECK_SECONDS
 from ..utils.clock import utc_now_iso
 
@@ -721,15 +721,9 @@ class DispatchMachine:
         count_as: str = "failed",
     ) -> None:
         """执行前拒绝统一登记失败；事务异常原样传播。"""
-        outcome = self._store.apply_failure(
+        self._store.apply_failure(
             job_uid, meta, job_snapshot=job_snapshot, count_as=count_as,
             cascade=True,
-        )
-        self._store.fire_attempt_finished(
-            job_uid,
-            outcome=AttemptOutcome(
-                success=False, will_retry=False, metadata=dict(outcome.failure_metadata)
-            ),
         )
 
 

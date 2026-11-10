@@ -55,14 +55,6 @@ class TestImmediateRequeuePolicy:
         assert plan.front is True
         assert plan.delay_seconds == 0.0
 
-    def test_transient_kind_keeps_immediate_zero_budget_rhythm(self):
-        """瞬态信号军规在立即策略下自然成立：零延迟、不因预算耗尽拒收。"""
-        policy = ImmediateRequeuePolicy()
-        job_snapshot = {"task_type": "t", "job_id": "j", "max_retries_per_run": 0, "attempt_no": 1}
-        for kind in ("interrupted", "lock_conflict", "rate_limited"):
-            plan = policy.plan_requeue(job_snapshot, transient_kind=kind)
-            assert plan.front is True
-            assert plan.delay_seconds == 0.0
 
     def test_seam_accepts_alternate_strategy(self):
         """接缝多态：自定义节奏策略可替换默认实现，核心不改。"""
@@ -70,7 +62,7 @@ class TestImmediateRequeuePolicy:
         class TailingRequeuePolicy(RequeuePolicy):
             """尾插节奏桩：验证接缝只约定形状、不绑定默认实现。"""
 
-            def plan_requeue(self, job_snapshot, *, transient_kind=None) -> RequeuePlan:
+            def plan_requeue(self, job_snapshot) -> RequeuePlan:
                 return RequeuePlan(front=False, delay_seconds=2.5)
 
         policy: RequeuePolicy = TailingRequeuePolicy()

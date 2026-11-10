@@ -34,7 +34,7 @@ from .admission import extract_effective_job_config
 from .channel import ExecutionResult, JobHandle
 
 from .in_flight import InFlightJob, InFlightTracker
-from .types import AttemptOutcome, AuthorizationOutcome, AuthorizationStatus, StopMode
+from .types import AuthorizationOutcome, AuthorizationStatus, StopMode
 
 logger = logging.getLogger("tasklite")
 _CLEANUP_ERRORS = (OSError, ValueError, NotImplementedError)
@@ -242,17 +242,6 @@ class CompletionMachine:
             # 资源释放（无论成功/失败/重试/崩溃，由 entry 自归还）
             entry.release_resources(self._resources)
 
-        # 收尾钩子在统计更新之后（apply_result 已 +1）触发——钩子内读统计
-        # 一致；单一出口经 store.fire_attempt_finished（异常隔离 + 计数），
-        # 正常提交与伪 entry 都经此触发。
-        self._store.fire_attempt_finished(
-            uid,
-            outcome=AttemptOutcome(
-                success=bool(result.success),
-                will_retry=result.will_retry,
-                metadata=dict(result.result_metadata),
-            ),
-        )
 
     def _prepare_completion(
         self, uid: str, job: Job, result: ExecutionResult,

@@ -1,72 +1,15 @@
-"""v2 引擎值对象不变式与瞬态信号登记表完备性锁定测试。
-
-移植 v1 test_transient_signal_rules.py 的登记表层断言（kind 集合穷举 +
-统计键属公开监控面）并按 v2 词汇改写；军规四性（不烧预算 / 豁免失败档案
-/ 零污染）的行为级断言由后续 store/completion 单元的测试承接，此处锁定
-登记表与值对象本身的形状。
-"""
+"""引擎停机状态与执行选项值对象。"""
 
 import dataclasses
 
 import pytest
 
 from tasklite.engine.types import (
-    EMPTY_STATS,
-    TRANSIENT_KIND_STAT_KEYS,
     ExecutionOptions,
     ExitReason,
     StopMode,
     StepOutcome,
 )
-
-_EXPECTED_STAT_KEYS = {
-    "succeeded",
-    "failed",
-    "retried",
-    "skipped",
-    "hook_errors",
-    "lock_conflict_reruns",
-    "interrupted_reruns",
-    "rate_limited_reruns",
-    "cascade_failed",
-    "excluded_blocked",
-}
-
-
-class TestEmptyStats:
-    """EMPTY_STATS 基准形状：十键全零。"""
-
-    def test_ten_keys_all_zero(self):
-        assert set(EMPTY_STATS) == _EXPECTED_STAT_KEYS
-        assert all(value == 0 for value in EMPTY_STATS.values())
-
-
-class TestTransientKindRegistry:
-    """瞬态信号登记表完备性（v1 同源断言按 v2 词汇移植）。
-
-    登记表是瞬态军规的展开点：wire 产生端的全部 kind 必须在此登记一行，
-    且统计键必须落在公开监控面（EMPTY_STATS）内——漏登记的信号会静默
-    落入普通失败路径（烧预算 + 落失败档案）。
-    """
-
-    @pytest.mark.parametrize("stat_key", sorted(TRANSIENT_KIND_STAT_KEYS.values()))
-    def test_stat_keys_are_public_api(self, stat_key):
-        """kind→统计键映射不得指向公开 EMPTY_STATS 十键之外的键
-        （统计键逐键文档化，改键名即破坏监控面）。"""
-        assert stat_key in EMPTY_STATS
-
-    def test_known_kinds_are_all_registered(self):
-        """wire 产生端全部 kind 均已登记（decode 接受集合 == 注册表键集）。"""
-        assert set(TRANSIENT_KIND_STAT_KEYS) == {
-            "interrupted",
-            "lock_conflict",
-            "rate_limited",
-        }
-
-    def test_stat_key_per_kind_is_distinct(self):
-        """每种 kind 独立计数：统计键一一对应（重复键会让两种信号互吞计数）。"""
-        values = list(TRANSIENT_KIND_STAT_KEYS.values())
-        assert len(set(values)) == len(values)
 
 
 class TestStopMode:

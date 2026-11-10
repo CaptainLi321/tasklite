@@ -20,7 +20,7 @@ from .backend.sqlite_backend import SQLiteStateBackend
 from .engine.admission import TriggerRegistry
 from .models.trigger import TriggerContext
 from .engine.channel import ExecutionChannel
-from .engine.config import RunConfig, resolve_tuning
+from .engine.config import RunConfig
 from .engine.governor import DeadlockGovernor
 from .engine.ops import OpsConsole
 from .engine.resource import CapacityResource, Resource, ResourceManager
@@ -208,7 +208,6 @@ class TaskLite:
         backend: AbstractStateBackend,
     ) -> RunConfig:
         """RunConfig 静态装配快照。"""
-        tuning = resolve_tuning()
         return RunConfig.resolve(
             name="tasklite",
             ipc_dir=None,
@@ -217,9 +216,7 @@ class TaskLite:
             resources=self.resources,
             tasks=self.tasks,
             channel=self._channel,
-            governor=DeadlockGovernor(
-                deadlock_gap_max_rounds=tuning.deadlock_gap_max_rounds,
-            ),
+            governor=DeadlockGovernor(),
             trigger_registry=self._triggers,
             output_roots=self.output_roots,
         )

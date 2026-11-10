@@ -22,7 +22,7 @@ from tasklite.engine.admission import (
 )
 from tasklite.resource import CapacityResource, IntervalResource
 from tasklite.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
-from tasklite.engine.types import AttemptOutcome, StopMode
+from tasklite.engine.types import StopMode
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.models.task import Task
@@ -54,7 +54,7 @@ class NewestFirstPolicy(OrderingPolicy):
 class TailRequeuePolicy(RequeuePolicy):
     """恒队尾重入队策略（门面注入用样本：front 恒 False、零延迟）。"""
 
-    def plan_requeue(self, job_snapshot, *, transient_kind=None) -> RequeuePlan:
+    def plan_requeue(self, job_snapshot) -> RequeuePlan:
         return RequeuePlan(front=False, delay_seconds=0.0)
 
 

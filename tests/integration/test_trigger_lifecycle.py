@@ -248,14 +248,19 @@ def test_zero_budget_retry_skips_gate_without_resetting_ordinary_candidate(tmp_p
 
 def _run_until_retry_committed(root, ready, release):
     """队列重试已提交的屏障供监督进程精确终止主引擎。"""
-    def park_after_retry(uid, *, outcome):
-        if outcome.will_retry:
-            queued = pipeline._runtime.store.backend.load_queue()
+    pipeline = _pipeline(Path(root))
+    backend = pipeline._runtime.store.backend
+    original_commit = backend.commit_job_settlement
+
+    def commit_then_park(**kwargs):
+        original_commit(**kwargs)
+        if kwargs["outcome"] == "retry":
+            queued = backend.load_queue()
             assert queued[0]["attempt_no"] == 1
             ready.set()
             release.wait(timeout=30)
-    pipeline = _pipeline(Path(root))
-    pipeline._runtime.store.set_on_attempt_finished(park_after_retry)
+
+    backend.commit_job_settlement = commit_then_park
     pipeline.register_trigger("gated", lambda ctx: True)
     pipeline.register_task("retry", always_retry, max_retries_per_run=1, trigger="gated")
     pipeline.enqueue(Job("retry", "item"))

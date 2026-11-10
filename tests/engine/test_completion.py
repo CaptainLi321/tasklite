@@ -29,7 +29,7 @@ from tasklite.engine.resource import (
     ResourceManager,
 )
 from tasklite.engine.store import StateStore
-from tasklite.engine.types import AttemptOutcome, JobHandle
+from tasklite.engine.types import JobHandle
 from tasklite.models.artifact import FileSpec
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
@@ -70,7 +70,6 @@ class CompletionEnv:
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
         self.stats = defaultdict(int)
-        self.hooks: list[tuple[str, AttemptOutcome]] = []
         self.tasks = TaskRegistry()
         self.trigger_registry = TriggerRegistry(
             tasks=self.tasks,
@@ -80,7 +79,6 @@ class CompletionEnv:
             self.backend,
             PipelineState({}, {}, {}, []),
             stats=self.stats,
-            on_attempt_finished=lambda uid, *, outcome: self.hooks.append((uid, outcome)),
             trigger_registry=self.trigger_registry,
         )
         self.session = StubSession()
@@ -194,12 +192,8 @@ class TestCompleteJobSuccess:
         assert env.stats["succeeded"] == 1
         assert "t::j1" not in env.store.state.in_flight_uids
         assert not cache_file.exists()
-        # 收尾钩子恰好一次（成功语义）
-        assert env.hooks == [
-            ("t::j1", AttemptOutcome(success=True, will_retry=False,
-                                    metadata={"score": 100}))
-        ]
-        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "success"
+        attempt, = env.backend.load_settled_attempts("t::j1")
+        assert attempt["outcome"] == "success"
 
     def test_cursor_updates_applied(self, tmp_path):
         env = CompletionEnv(tmp_path)
@@ -251,10 +245,8 @@ class TestCompleteJobFailure:
         assert env.stats["failed"] == 1
         assert env.stats["cascade_failed"] == 1
         assert not partial.exists()
-        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "failure"
-        finish_by_uid = {uid: fin for uid, fin in env.hooks}
-        assert finish_by_uid["t::j1"].success is False
-        assert finish_by_uid["t::j1"].will_retry is False
+        attempt, = env.backend.load_settled_attempts("t::j1")
+        assert attempt["outcome"] == "failure"
 
 
 class TestRetryBudget:
@@ -274,14 +266,10 @@ class TestRetryBudget:
         assert result.will_retry is True
         assert env.stats["retried"] == 1
         assert env.store.state.queue[0]["attempt_no"] == 1
-        attempt = env.backend.load_settled_attempts("t::j1")[-1]
+        attempt, = env.backend.load_settled_attempts("t::j1")
         assert attempt["outcome"] == "retry"
         assert attempt["result"]["message"] == "connection blip"
         assert entry.job.attempt_no == attempt["attempt_no"] == 1
-        assert env.hooks[-1] == (
-            "t::j1",
-            AttemptOutcome(success=False, will_retry=True, metadata={}),
-        )
 
     def test_retry_job_snapshot_preserves_custom_fields(self, tmp_path):
         """重试 = 原作业原样重入队：顶层自定义字段与已注入资源随重试往返保留。"""
@@ -350,8 +338,6 @@ class TestRetryBudget:
         assert "t::j1" not in env.store.state.failed
         assert env.store.state.queue[0]["attempt_no"] == 5
         assert env.stats["retried"] == 5
-        assert env.stats["interrupted_reruns"] == 0
-        assert env.stats["rate_limited_reruns"] == 0
 
 
 class TestSpawnedJobs:
@@ -575,7 +561,6 @@ class TestSettleAborted:
         assert not env.in_flight
         assert not env.store.state.in_flight_uids
         assert env.resources["__workers__"].used == 0
-        assert not env.hooks
 
     def test_release_failure_still_unregisters_all_entries(self, tmp_path, monkeypatch):
         env = CompletionEnv(tmp_path)
@@ -594,33 +579,6 @@ class TestSettleAborted:
         assert not env.store.state.in_flight_uids
         assert not env.store.state.successes
         assert not second.acquired
-        assert not env.hooks
-
-
-class TestHookFireDiscipline:
-    """收尾钩子触发纪律。"""
-
-    def test_retry_hook_carries_going_to_retry(self, tmp_path):
-        env = CompletionEnv(tmp_path)
-        job = Job("t", "j1", max_retries_per_run=3)
-        entry = env.track_entry(job)
-        env.completion.complete_job(
-            entry, ExecutionResult(retry_requested=True, message="flaky")
-        )
-        assert env.hooks == [
-            ("t::j1", AttemptOutcome(success=False, will_retry=True, metadata={}))
-        ]
-
-    def test_hook_error_isolated(self, tmp_path):
-        env = CompletionEnv(tmp_path)
-        env.store.set_on_attempt_finished(
-            lambda uid, *, outcome: (_ for _ in ()).throw(RuntimeError("boom"))
-        )
-        job = Job("t", "j1")
-        entry = env.track_entry(job, **env.start_execution(job))
-        env.completion.complete_job(entry, ExecutionResult(success=True))
-        assert env.stats["hook_errors"] == 1
-        assert "t::j1" in env.store.state.successes
 
 
 @pytest.mark.parametrize("success", [True, False])
@@ -670,7 +628,6 @@ def test_symlink_output_settles_failure_without_false_success(tmp_path):
     assert "symlink" in env.backend.load_failed()[job.uid]["error_message"]
     assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
     assert env.stats["succeeded"] == 0
-    assert len(env.hooks) == 1 and env.hooks[0][1].success is False
 
 
 def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, monkeypatch):
@@ -735,7 +692,6 @@ def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success)
     assert env.backend.load_successes() == {}
     assert "cleanup unavailable" in env.backend.load_failed()[job.uid]["error_message"]
     assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
-    assert len(env.hooks) == 1 and env.hooks[0][1].success is False
     assert output.exists()
 
 
@@ -769,7 +725,6 @@ def test_abort_does_not_request_or_execute_cleanup(tmp_path, monkeypatch):
     assert env.resources["__workers__"].used == 0
     assert not env.backend.load_successes()
     assert not env.store.state.failed
-    assert not env.hooks
 
 
 def test_completion_rejects_missing_output(tmp_path, monkeypatch):
@@ -815,7 +770,6 @@ def test_declaration_environment_fault_preserves_running_state(tmp_path):
         )
     assert entry.job.attempt_no == 1
     assert not env.store.state.failed
-    assert not env.hooks
 
 
 def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypatch):
@@ -854,8 +808,6 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
     assert job.uid in env.backend.load_failed()
     assert "Retry cleanup failed" in env.backend.load_failed()[job.uid]["error_message"]
     assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
-    assert len(env.hooks) == 1
-    assert env.hooks[0][1].will_retry is False
 
 
 def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkeypatch):
@@ -899,7 +851,6 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
     assert env.backend.load_settled_attempts(first.uid)[0]["outcome"] == "failure"
     assert env.resources["__workers__"].used == 0
     assert not env.in_flight
-    assert {uid for uid, _ in env.hooks} == {first.uid, second.uid}
 
 
 def test_inflight_duplicate_spawn_compares_effective_configuration(tmp_path):

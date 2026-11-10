@@ -29,8 +29,6 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, backend, 
     runtime = pipeline._runtime
     events = []
     completed = []
-    hooks = []
-    runtime.store.set_on_attempt_finished(lambda uid, **kwargs: hooks.append(uid))
     original_complete = runtime._completion.complete_job
     original_release = capacity.release
     original_cleanup = ArtifactPathPolicy.cleanup
@@ -81,7 +79,6 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, backend, 
         assert runtime.store.state.failed == {}
         row, = runtime.store.backend.load_queue_jobs(status="running")
         assert (row["run_id"], row["attempt_no"]) == (completed[0].run_id, 1)
-        assert hooks == []
     else:
         pipeline.run(install_signals=False)
         with StateSnapshot.open(pipeline) as snapshot:
@@ -96,7 +93,6 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, backend, 
             assert attempt["result"]["exception"]["type"] == "PermissionError"
             if fault == "cleanup":
                 assert attempt["result"]["annotations"]["cleanup_error"] == "failure cleanup denied"
-        assert hooks == [job.uid]
         assert target.exists() == (fault == "cleanup")
     assert len(completed) == 1
     assert events == ["pre_delete", "cleanup", "release", "commit"]
@@ -125,8 +121,6 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
              OSError("launch framework unavailable"))
     completed = []
     cleanup = []
-    hooks = []
-    runtime.store.set_on_attempt_finished(lambda uid, **kwargs: hooks.append(uid))
 
     def fail(*args, **kwargs):
         raise error
@@ -146,7 +140,7 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
     assert runtime.store.backend.load_failed() == {}
     assert target.read_text(encoding="utf-8") == "business"
     assert capacity.used == 0
-    assert completed == cleanup == hooks == []
+    assert completed == cleanup == []
     assert runtime.store.state.queue == []
     monkeypatch.undo()
     pipeline.run(install_signals=False)

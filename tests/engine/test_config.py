@@ -1,12 +1,4 @@
-"""v2 RunConfig 装配与调优标量唯一解析点测试。
-
-锁定契约：
-- resolve_tuning 是调优标量唯一规范化入口（None → 常量默认、非法值
-  fail-loud）；
-- RunConfig.resolve 装配件按引用透传（冻结引用而非拷贝）、可空标量经
-  resolve_tuning 收敛最终类型，此后任何模块不得二次默认；
-- 零退避军规：调优面不存在任何退避类配置项。
-"""
+"""运行配置按引用装配，内部策略在装配时解析默认值。"""
 
 from __future__ import annotations
 
@@ -24,15 +16,13 @@ from tasklite.engine.admission import (
     TriggerRegistry,
 )
 from tasklite.engine.channel import ExecutionChannel
-from tasklite.engine.config import RunConfig, Tuning, resolve_tuning
+from tasklite.engine.config import RunConfig
 
 from tasklite.engine.governor import (
-    DEADLOCK_GAP_MAX_ROUNDS,
     DeadlockGovernor,
 )
 from tasklite.engine.resource import ResourceManager
 from tasklite.engine.scheduler import FifoOrderingPolicy, OrderingPolicy
-from tasklite.engine.config import COMMIT_FAILURE_THRESHOLD
 from tasklite.models.task import TaskRegistry
 
 
@@ -74,48 +64,6 @@ class ConfigEnv:
         return RunConfig.resolve(**base)
 
 
-class TestResolveTuning:
-    """resolve_tuning 唯一规范化入口。"""
-
-    def test_defaults_match_engine_constants(self):
-        tuning = resolve_tuning()
-        assert tuning == Tuning(
-            commit_failure_threshold=COMMIT_FAILURE_THRESHOLD,
-            deadlock_gap_max_rounds=DEADLOCK_GAP_MAX_ROUNDS,
-        )
-        assert isinstance(tuning.commit_failure_threshold, int)
-        assert isinstance(tuning.deadlock_gap_max_rounds, int)
-
-    def test_explicit_rounds_passthrough(self):
-        tuning = resolve_tuning(
-            commit_failure_threshold=7, deadlock_gap_max_rounds=9,
-        )
-        assert tuning.commit_failure_threshold == 7
-        assert tuning.deadlock_gap_max_rounds == 9
-
-    @pytest.mark.parametrize("bad", [True, 1.9, 2.0, "3"])
-    def test_rejects_non_int_threshold(self, bad):
-        with pytest.raises(TypeError, match="commit_failure_threshold"):
-            resolve_tuning(commit_failure_threshold=bad)
-
-    @pytest.mark.parametrize("bad", [True, 1.9, "3"])
-    def test_rejects_non_int_gap_rounds(self, bad):
-        with pytest.raises(TypeError, match="deadlock_gap_max_rounds"):
-            resolve_tuning(deadlock_gap_max_rounds=bad)
-
-    @pytest.mark.parametrize(
-        "kwargs",
-        [
-            {"commit_failure_threshold": 0},
-            {"commit_failure_threshold": -1},
-            {"deadlock_gap_max_rounds": 0},
-            {"deadlock_gap_max_rounds": -2},
-        ],
-    )
-    def test_rejects_non_positive_rounds(self, kwargs):
-        with pytest.raises(ValueError):
-            resolve_tuning(**kwargs)
-
 class TestRunConfigResolve:
     """RunConfig.resolve 唯一默认值解析点。"""
 
@@ -132,29 +80,13 @@ class TestRunConfigResolve:
         assert config.name == "test_config"
         assert config.ipc_dir == env.ipc_dir
 
-    def test_none_scalars_resolved_to_constant_defaults(self, tmp_path):
-        config = ConfigEnv(tmp_path).resolve()
-        assert config.commit_failure_threshold == COMMIT_FAILURE_THRESHOLD
-        assert config.deadlock_gap_max_rounds == DEADLOCK_GAP_MAX_ROUNDS
-        assert config.strict_picklable is True
-        assert config.output_roots is None
 
-    def test_explicit_scalars_passthrough_without_second_default(self, tmp_path):
-        config = ConfigEnv(tmp_path).resolve(
-            commit_failure_threshold=5,
-            deadlock_gap_max_rounds=2,
-            strict_picklable=False,
-            output_roots=Path("/tmp/out"),
-        )
-        assert config.commit_failure_threshold == 5
-        assert config.deadlock_gap_max_rounds == 2
-        assert config.strict_picklable is False
-        assert config.output_roots == Path("/tmp/out")
-
-    def test_invalid_tuning_fails_loud_at_resolve(self, tmp_path):
-        env = ConfigEnv(tmp_path)
-        with pytest.raises(ValueError, match="commit_failure_threshold"):
-            env.resolve(commit_failure_threshold=0)
+    @pytest.mark.parametrize("field", [
+        "strict_picklable", "commit_failure_threshold", "deadlock_gap_max_rounds",
+    ])
+    def test_configuration_rejects_removed_tuning(self, tmp_path, field):
+        with pytest.raises(TypeError, match=field):
+            ConfigEnv(tmp_path).resolve(**{field: 1})
 
     def test_config_is_frozen(self, tmp_path):
         config = ConfigEnv(tmp_path).resolve()
@@ -188,7 +120,3 @@ class TestZeroBackoffSurface:
         assert not any(self._BANNED_TERM in name for name in field_names), (
             f"调优面出现退避配置项: {field_names}"
         )
-
-    def test_no_retry_pacing_fields_on_tuning(self):
-        field_names = [f.name for f in dataclasses.fields(Tuning)]
-        assert not any(self._BANNED_TERM in name for name in field_names)

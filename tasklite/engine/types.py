@@ -17,29 +17,6 @@ from ..models.job import Job
 if TYPE_CHECKING:
     from ..selection import Exclude
 
-EMPTY_STATS = {
-    "succeeded": 0,
-    "failed": 0,
-    "retried": 0,
-    "skipped": 0,
-    "hook_errors": 0,
-    "lock_conflict_reruns": 0,
-    "interrupted_reruns": 0,
-    "rate_limited_reruns": 0,
-    "cascade_failed": 0,
-    "excluded_blocked": 0,
-}
-
-# 瞬态信号种类登记表：kind → 统计键。瞬态军规（不烧重试预算 + 豁免失败
-# 档案 + 零污染）按 kind 单值判定，新信号在此登记一行并同步 wire 写端
-# （channel worker 侧）与降级写盘保真（utils/ipc）即可全链生效；
-# 完备性由 tests/engine/test_types.py 的注册表遍历锁定。
-TRANSIENT_KIND_STAT_KEYS = {
-    "interrupted": "interrupted_reruns",
-    "lock_conflict": "lock_conflict_reruns",
-    "rate_limited": "rate_limited_reruns",
-}
-
 
 class StopMode(enum.Enum):
     """停机状态机模式。"""
@@ -87,20 +64,6 @@ class ExitReason(str, enum.Enum):
     STOPPED_DRAINING = "stopped_draining"
     INTERRUPTED = "interrupted"
     ERROR = "error"
-
-
-@dataclass(frozen=True)
-class AttemptOutcome:
-    """一次 attempt 收尾事件的不可变载荷。
-
-    布尔语义经值对象承载、不裸传：``success`` 与 ``will_retry``
-    正交——成功 True/False；失败将重试 False/True；失败耗尽进失败档案
-    False/False。``metadata`` 是终态元数据字典视图（成功或失败档案）。
-    """
-
-    success: bool
-    will_retry: bool
-    metadata: dict[str, Any]
 
 
 @dataclass
@@ -170,11 +133,8 @@ class StepOutcome:
 
 
 __all__ = [
-    "EMPTY_STATS",
-    "TRANSIENT_KIND_STAT_KEYS",
     "AuthorizationOutcome",
     "AuthorizationStatus",
-    "AttemptOutcome",
     "StopMode",
     "ExitReason",
     "ExecutionOptions",

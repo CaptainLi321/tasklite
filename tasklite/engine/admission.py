@@ -214,43 +214,17 @@ class RequeuePlan:
 
 
 class RequeuePolicy(ABC):
-    """重试节奏唯一出口的接缝契约。
-
-    核心引擎不做任何节奏计算：需要把一个失败/瞬态作业放回队列时，
-    一律经 ``plan_requeue`` 取得节奏规划（何时、何处）。瞬态信号
-    （interrupted / lock_conflict / rate_limited）不烧重试预算的军规
-    由「立即重入队」默认策略自然成立——零等待、零预算消耗。
-    """
+    """已决定重试的作业经此内部接缝规划重入队位置。"""
 
     @abstractmethod
-    def plan_requeue(
-        self,
-        job_snapshot: dict,
-        *,
-        transient_kind: str | None = None,
-    ) -> RequeuePlan:
-        """为一个待重入队的作业规划节奏。
-
-        ``transient_kind`` 非 None 表示瞬态信号（引擎值对象
-        TRANSIENT_KIND_STAT_KEYS 登记的三类）——预算豁免语境下策略
-        不得因预算耗尽拒绝重入队；返回值表达节奏与位置。
-        """
+    def plan_requeue(self, job_snapshot: dict) -> RequeuePlan:
+        """为已获准重试的作业规划节奏与位置。"""
 
 
 class ImmediateRequeuePolicy(RequeuePolicy):
-    """立即重入队策略（默认）：零延迟、插队首。
+    """默认立即插入队首；重试预算由结算机器判断。"""
 
-    语义与瞬态信号的队首重入队路径一致（锁冲突/限流/中断的降级回队
-    均为 front 插队）；业务失败重试同享该节奏——预算判定在收尾机器
-    侧先行，走到本策略的作业都已是「决定重试」的作业。
-    """
-
-    def plan_requeue(
-        self,
-        job_snapshot: dict,
-        *,
-        transient_kind: str | None = None,
-    ) -> RequeuePlan:
+    def plan_requeue(self, job_snapshot: dict) -> RequeuePlan:
         return RequeuePlan(front=True, delay_seconds=0.0)
 
 

@@ -21,7 +21,6 @@ from tasklite.engine.store import (
     StateStore,
     SuccessOutcome,
 )
-from tasklite.engine.types import AttemptOutcome
 from tasklite.models.job import Job, WORKER_RESOURCE
 from tasklite.models.state import PipelineState
 from tasklite.models.task import TaskRegistry
@@ -264,11 +263,9 @@ class TestApplyRetry:
         )
 
         assert isinstance(outcome, RetryOutcome)
-        assert outcome.transient_kind is None
         assert store.state.queue[0]["job_id"] == "1"
         assert "t::1" not in store.state.in_flight_uids
         assert stats["retried"] == 1
-        assert stats["interrupted_reruns"] == 0
 
 
 class TestApplySkip:
@@ -343,77 +340,6 @@ class TestMarkFailedMemoryContract:
         store.mark_failed_memory("encode::a", {"error_message": "boom"})
         assert "encode::a" in state.failed_uids
         assert "encode::a" not in state.success_uids
-
-
-class TestHookSingleExit:
-    """fire_attempt_finished 单一出口与异常隔离。"""
-
-    def test_hook_exception_isolated_and_counted(self):
-        stats = defaultdict(int)
-        store, _, _ = _make_store(stats=stats)
-
-        def boom(uid, *, outcome):
-            raise RuntimeError("hook failure")
-
-        store.set_on_attempt_finished(boom)
-        store.fire_attempt_finished(
-            "t::1", outcome=AttemptOutcome(success=True, will_retry=False, metadata={})
-        )
-        assert stats["hook_errors"] == 1
-
-    def test_no_callback_is_noop(self):
-        store, _, _ = _make_store()
-        store.fire_attempt_finished(
-            "t::1", outcome=AttemptOutcome(success=True, will_retry=False, metadata={})
-        )
-
-    def test_set_on_attempt_finished_rebinds(self):
-        captured: list[str] = []
-        store, _, _ = _make_store()
-        store.set_on_attempt_finished(lambda uid, *, outcome: captured.append(uid))
-        store.fire_attempt_finished(
-            "t::1", outcome=AttemptOutcome(success=False, will_retry=True, metadata={})
-        )
-        assert captured == ["t::1"]
-
-    def test_bulk_failure_fires_hook_per_uid(self):
-        stats = defaultdict(int)
-        hooks: list[tuple[str, AttemptOutcome]] = []
-        backend = InMemoryStateBackend()
-        store = StateStore(
-            backend,
-            PipelineState({}, {}, {}, []),
-            stats=stats,
-            on_attempt_finished=lambda uid, *, outcome: hooks.append((uid, outcome)),
-        )
-
-        store.apply_bulk_failure(
-            [("cycle::1", {"error_message": "Dependency cycle prevents execution"}),
-             ("cycle::2", {"error_message": "Dependency cycle prevents execution"})]
-        )
-        assert {uid for uid, _ in hooks} == {"cycle::1", "cycle::2"}
-        assert all(fin.success is False and fin.will_retry is False for _, fin in hooks)
-        assert stats["failed"] == 2
-
-    def test_cascade_fires_hook_per_downstream(self):
-        hooks: list[tuple[str, AttemptOutcome]] = []
-        backend = InMemoryStateBackend()
-        state = PipelineState(
-            {}, {}, {},
-            [
-                {"task_type": "parent", "job_id": "1"},
-                Job("child", "1", depends_on=["parent::1"]).to_dict(),
-            ],
-        )
-        store = StateStore(
-            backend, state,
-            on_attempt_finished=lambda uid, *, outcome: hooks.append((uid, outcome)),
-        )
-        state.pop_job(0)
-
-        outcome = store.apply_failure("parent::1", {"error_message": "crash"})
-        assert outcome.cascaded_uids == ["child::1"]
-        assert [uid for uid, _ in hooks] == ["child::1"]
 
 
 class TestApplyBulkFailure:

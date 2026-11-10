@@ -2,8 +2,8 @@
 
 统一聚合主循环事件泵（四相：填池派发 → 死锁仲裁 → 回收结算 → 等待
 决策）、五关预检派发、结果收敛事务、崩溃/停机恢复与在途追踪。装配
-快照见 RunConfig（engine/config.py）；一次 run 的生命周期状态与钩子
-单一出口见 RunSession（engine/session.py）。
+快照见 RunConfig（engine/config.py）；一次 run 的生命周期状态
+见 RunSession（engine/session.py）。
 """
 from __future__ import annotations
 

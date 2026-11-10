@@ -8,8 +8,6 @@
   在同一出口内对齐，内存永不领先磁盘；
 - 失败终态内存登记唯一经由 ``mark_failed_memory``（successes/failed 互斥的
   单点维护）；
-- attempt 收尾事件钩子唯一经由 ``fire_attempt_finished`` 触发（异常隔离
-  + hook_errors 计数）；
 - Attempt 为追加式执行轨迹，与对应结果同事务结算；事务异常原样传播。
 """
 
@@ -41,7 +39,6 @@ from .admission import (
     extract_trusted_metadata_timestamp_us,
     is_trusted_success_metadata,
 )
-from .types import TRANSIENT_KIND_STAT_KEYS, AttemptOutcome
 
 logger = logging.getLogger("tasklite")
 
@@ -83,7 +80,6 @@ class RetryOutcome:
     """apply_retry 原子转移结果。"""
     job_uid: str
     retry_job_snapshot: dict[str, Any]
-    transient_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,7 +105,6 @@ class StateStore:
         backend: AbstractStateBackend,
         state: PipelineState | None = None,
         *,
-        on_attempt_finished: Callable[..., None] | None = None,
         stats: Any | None = None,
         trigger_registry: TriggerRegistry | None = None,
         requeue_policy: RequeuePolicy | None = None,
@@ -118,7 +113,6 @@ class StateStore:
     ) -> None:
         self._backend = backend
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
-        self._on_attempt_finished = on_attempt_finished
         self._stats = stats
         self._trigger_registry = (
             trigger_registry
@@ -141,7 +135,7 @@ class StateStore:
         """当前实例固定的相对路径解析基准目录。"""
         return self._trigger_registry.base_dir
 
-    # ── 统计与事件钩子 ────────────────────────────────────────────────
+    # ── 内部统计 ────────────────────────────────────────────────
 
     def _record_stat(self, key: str, amount: int = 1) -> None:
         """更新统计指标（单一真相源）。"""
@@ -153,13 +147,6 @@ class StateStore:
         """统计字典引用（可能为 None）。"""
         return self._stats
 
-    def set_stats(self, stats: Any) -> None:
-        """重设统计字典（run 启动期绑定会话统计）。"""
-        self._stats = stats
-
-    def set_on_attempt_finished(self, cb: Callable[..., None] | None) -> None:
-        """设置 attempt 收尾事件回调。"""
-        self._on_attempt_finished = cb
 
     def set_run_exclusions(
         self,
@@ -188,20 +175,6 @@ class StateStore:
                 if self._exclude.matches_task_type(job.task_type):
                     excluded.add(job.uid)
         return frozenset(excluded)
-
-    def fire_attempt_finished(self, job_uid: str, *, outcome: AttemptOutcome) -> None:
-        """attempt 收尾事件钩子的单一出口（异常隔离 + hook_errors 计数）。
-
-        钩子在统计更新之后触发（调用方保证），钩子内读统计一致；钩子
-        抛异常只计数不外传——用户回调缺陷不得击穿事件泵。
-        """
-        if self._on_attempt_finished is None:
-            return
-        try:
-            self._on_attempt_finished(job_uid, outcome=outcome)
-        except Exception as e:
-            logger.warning(f"on_attempt_finished hook raised for {job_uid}: {e}")
-            self._record_stat("hook_errors", 1)
 
 
     @staticmethod
@@ -808,7 +781,6 @@ class StateStore:
         job_snapshot: dict[str, Any],
         retry_job_snapshot: dict[str, Any],
         *,
-        transient_kind: str | None = None,
         attempt_no: int = 1,
         run_id: str | None = None,
         started_at: str | None = None,
@@ -818,7 +790,7 @@ class StateStore:
         execution_id: str | None = None,
     ) -> RetryOutcome:
         """原子状态转移：重试重入队（节奏经 RequeuePolicy 唯一出口）。"""
-        plan = self._requeue_policy.plan_requeue(retry_job_snapshot, transient_kind=transient_kind)
+        plan = self._requeue_policy.plan_requeue(retry_job_snapshot)
         self._backend.commit_job_settlement(
             job_uid=job_uid,
             outcome="retry",
@@ -837,11 +809,7 @@ class StateStore:
         self._state.unregister_in_flight(job_uid)
         self._state.requeue_jobs([retry_job_snapshot], front=plan.front)
         self._record_stat("retried", 1)
-        if transient_kind is not None:
-            stat_key = TRANSIENT_KIND_STAT_KEYS.get(transient_kind)
-            if stat_key:
-                self._record_stat(stat_key, 1)
-        return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot, transient_kind=transient_kind)
+        return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot)
 
     def apply_pending(
         self,
@@ -923,10 +891,6 @@ class StateStore:
         self._record_stat("failed", len(normalized_metas))
         for job_uid, metadata in normalized_metas:
             self.mark_failed_memory(job_uid, metadata)
-            self.fire_attempt_finished(
-                job_uid,
-                outcome=AttemptOutcome(success=False, will_retry=False, metadata=metadata),
-            )
         return BulkFailureOutcome(
             failed_uids=[u for u, _ in normalized_metas],
             remaining_queue_count=len(self._state.queue),
@@ -961,10 +925,6 @@ class StateStore:
         self._record_stat("cascade_failed", len(cascade_uids))
         for job_uid, metadata in cascade_metas:
             self.mark_failed_memory(job_uid, metadata)
-            self.fire_attempt_finished(
-                job_uid,
-                outcome=AttemptOutcome(success=False, will_retry=False, metadata=metadata),
-            )
         return cascade_uids
 
 
