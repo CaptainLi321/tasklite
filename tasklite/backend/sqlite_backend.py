@@ -1606,11 +1606,14 @@ class SQLiteStateBackend(AbstractStateBackend):
             cur = conn.execute('DELETE FROM authorizations WHERE path = ?', (norm_path,))
             return bool(cur.rowcount and cur.rowcount > 0)
 
-    def is_path_authorized(self, path: str) -> bool:
+    def is_path_authorized(self, path: str, target_type: str) -> bool:
         norm_path = os.path.normpath(os.fspath(path))
         target_p = Path(norm_path)
         with self._get_conn() as conn:
-            cur = conn.execute('SELECT 1 FROM authorizations WHERE path = ?', (norm_path,))
+            cur = conn.execute(
+                'SELECT 1 FROM authorizations WHERE path = ? AND target_type = ?',
+                (norm_path, target_type),
+            )
             if cur.fetchone() is not None:
                 return True
             cur = conn.execute("SELECT path FROM authorizations WHERE target_type = 'directory'")

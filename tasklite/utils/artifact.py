@@ -35,11 +35,13 @@ class ArtifactPathPolicy:
         *,
         output_roots: str | Path | Sequence[str | Path] | None = None,
         protected_roots: Sequence[str | Path] = (),
+        authorization_check: Callable[[str, str], bool] | None = None,
     ) -> None:
         if isinstance(output_roots, (str, Path)):
             output_roots = [output_roots]
         self.output_roots = tuple(Path(root).resolve() for root in (output_roots or ()))
         self.protected_roots = tuple(Path(root).resolve() for root in protected_roots)
+        self._authorization_check = authorization_check
 
     def resolve(
         self, path: str | Path, *, sandbox: bool = True, delete_existing: bool = False,
@@ -176,6 +178,12 @@ class ArtifactPathPolicy:
                 entry = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
                 return
+
+            target_type = "directory" if stat.S_ISDIR(entry.st_mode) else "file"
+            if self._authorization_check is not None and not self._authorization_check(
+                str(target), target_type,
+            ):
+                raise PermissionError(f"artifact authorization scope changed before deletion: {target}")
 
             if stat.S_ISDIR(entry.st_mode):
                 if any(point.is_relative_to(target) for point in self._mount_points()):

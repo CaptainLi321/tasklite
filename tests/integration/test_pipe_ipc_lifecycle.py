@@ -6,9 +6,9 @@
 - 子进程被信号击杀（SIGKILL）、异常退出（os._exit）、看门狗超时的
   单次失败与产物清理；
 - 产物清理 PermissionError 阻断终态提交并保留原队列快照；
-- DRAINING / ABORTING 停机对在途声明与已完成结果的排空与结算；
+- 正常停止排空与框架异常退出后的遗留执行恢复；
 - 非法管道帧（损坏 JSON / 未知 kind / job_uid 不匹配 / execution_id 不匹配）
-  的零伪成功防御与失败授权清理。
+  的零伪成功防御与遗留 running 恢复。
 """
 
 from __future__ import annotations
@@ -396,5 +396,18 @@ def test_invalid_message_cannot_register_success(pipelines, tmp_path, fault):
     assert pipeline._runtime.store.backend.load_failed() == {}
     row, = pipeline._runtime.store.backend.load_queue_jobs()
     assert row["status"] == "running" and row["attempt_no"] == 1
-    assert not (tmp_path / "output" / "authorized.txt").exists()
+    assert pipeline._runtime.store.backend.load_settled_attempts("invalid::invalid") == []
+    assert (tmp_path / "output" / "authorized.txt").exists()
     assert (tmp_path / "output" / "retained.txt").exists()
+    pipeline.run()
+    attempt, = pipeline._runtime.store.backend.load_settled_attempts("invalid::invalid")
+    assert attempt["outcome"] == "failure"
+    assert attempt["run_id"] == row["run_id"]
+    assert attempt["attempt_no"] == row["attempt_no"]
+    assert pipeline._runtime.store.backend.load_queue_jobs() == []
+    assert pipeline._runtime.store.backend.load_successes() == {}
+    assert "invalid::invalid" in pipeline._runtime.store.backend.load_failed()
+    assert (tmp_path / "output" / "authorized.txt").exists()
+    assert (tmp_path / "output" / "retained.txt").exists()
+    pipeline.run()
+    assert pipeline._runtime.store.backend.load_settled_attempts("invalid::invalid") == [attempt]

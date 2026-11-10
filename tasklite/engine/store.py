@@ -734,7 +734,8 @@ class StateStore:
     def is_path_authorized(self, path: str | Path) -> bool:
         """检查指定规范绝对路径是否命中已有授权。"""
         norm_path = str(self._authorization_target(path))
-        return self._backend.is_path_authorized(norm_path)
+        target_type = "directory" if os.path.isdir(norm_path) else "file"
+        return self._backend.is_path_authorized(norm_path, target_type)
 
     def record_authorization(
         self,
@@ -756,34 +757,27 @@ class StateStore:
         norm_path = str(self._authorization_target(path))
         return self._backend.revoke_authorization(norm_path)
 
-    def check_or_request_authorization(
-        self, path: str | Path, target_type: str | None = None
-    ) -> bool | None:
-        """检查已有授权或发起内部授权询问；已授权或同意持久化记录并返回 True，等待返回 None，拒绝返回 False。"""
+    def check_or_request_authorization(self, path: str | Path) -> bool | None:
+        """按实际目标范围查询、询问并持久化授权；None 表示等待决策。"""
         if self.is_path_protected(path):
             return False
         norm_path = str(self._authorization_target(path))
-        if self._backend.is_path_authorized(norm_path):
-            return True
-        effective_type = (
-            target_type
-            if target_type is not None
-            else ("directory" if os.path.isdir(norm_path) else "file")
-        )
-        if os.environ.get("TASKLITE_AUTO_APPROVE") == "1":
-            self._backend.record_authorization(norm_path, effective_type)
-            return True
-        if self.authorizer is not None and callable(self.authorizer):
-            res = self.authorizer(norm_path, effective_type)
-            if res is True:
-                self._backend.record_authorization(norm_path, effective_type)
+        while True:
+            effective_type = "directory" if os.path.isdir(norm_path) else "file"
+            if self._backend.is_path_authorized(norm_path, effective_type):
                 return True
-            elif res is False:
+            if os.environ.get("TASKLITE_AUTO_APPROVE") == "1":
+                decision: bool | None = True
+            elif self.authorizer is not None:
+                decision = self.authorizer(norm_path, effective_type)
+            else:
                 return False
-            elif res is None:
-                return None
-            return False
-        return False
+            if decision is not True:
+                return None if decision is None else False
+            self._backend.record_authorization(norm_path, effective_type)
+            # 询问期间文件可能变成目录，保存的文件授权不能扩大为目录树。
+            if effective_type == "directory" or not os.path.isdir(norm_path):
+                return True
 
     # ── 事务性原子终态转移（apply_* 出口族）──────────────────────────
 

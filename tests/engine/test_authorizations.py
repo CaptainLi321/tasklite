@@ -1036,3 +1036,454 @@ def test_allowed_file_operations_keep_instance_path_base(
         assert authorization["target_type"] == "file"
         assert target.read_text(encoding="utf-8") == "updated"
         assert "work::one" in p._runtime.store.backend.load_successes()
+
+
+def _replace_file_with_tree_handler(job, ctx):
+    target = ctx.file_path("target")
+    if target.is_file():
+        target.unlink()
+    target.mkdir(exist_ok=True)
+    (target / "child").write_text("business data", encoding="utf-8")
+    if job.payload["outcome"] == "failure":
+        return TaskResult.failure("business failure")
+    if job.payload["outcome"] == "retry":
+        return TaskResult.retry(message="business retry")
+    ctx.set_cursor("tree-result", "committed")
+    return TaskResult.success(metadata={"business": "result"})
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "retry"])
+@pytest.mark.parametrize("initial,decision", [
+    (initial, decision)
+    for initial in ("file", "missing")
+    for decision in ("approve", "deny", "wait-approve", "wait-deny", "stop")
+] + [("directory", "approve")])
+def test_worker_target_type_change_requires_cleanup_scope_confirmation(
+    tmp_path, monkeypatch, backend, initial, outcome, decision,
+):
+    """真实 worker 改变目标类型后，清理授权等待、拒绝和停止均保持结算语义。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "target"
+    if initial == "file":
+        target.write_text("initial", encoding="utf-8")
+    elif initial == "directory":
+        target.mkdir()
+    p = TaskLite(backend=backend, state_path=tmp_path / "scope.db")
+    calls = []
+    waiting = threading.Event()
+    final_decision = [None if decision.startswith("wait") or decision == "stop" else decision == "approve"]
+
+    def authorize(path, kind):
+        calls.append((path, kind))
+        if len(calls) == 1:
+            return True
+        waiting.set()
+        return final_decision[0]
+
+    p.authorizer = authorize
+    p.register_task("replace", _replace_file_with_tree_handler)
+    p.register_task("downstream", _quick_handler)
+    p.enqueue(Job(
+        "replace", "one", payload={"outcome": outcome}, max_retries_per_run=1,
+        files={"target": FileSpec(
+            target, role="cache", delete_on_success=outcome == "success",
+            delete_on_failure=outcome != "success",
+        )},
+    ))
+    p.enqueue(Job("downstream", "one", depends_on=["replace::one"]))
+    errors = []
+
+    def run_pipeline():
+        try:
+            p.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        if initial != "directory" and (decision.startswith("wait") or decision == "stop"):
+            assert waiting.wait(10)
+            _wait_for(lambda: p._runtime._completion.waiting_authorization)
+            assert target.joinpath("child").read_text(encoding="utf-8") == "business data"
+            assert p._runtime.store.backend.load_settled_attempts("replace::one") == []
+            assert p._runtime.store.backend.load_queue_jobs(status="running")
+            assert p._runtime.session.retry_counts.get("replace::one", 0) == 0
+            if decision == "stop":
+                p.stop()
+            else:
+                final_decision[0] = decision == "wait-approve"
+        runner.join(timeout=20)
+        assert not runner.is_alive()
+        assert errors == []
+    finally:
+        p.stop()
+        runner.join(timeout=5)
+    accepted = initial == "directory" or decision in ("approve", "wait-approve")
+    assert calls[0] == (str(target), "directory" if initial == "directory" else "file")
+    assert all(call == (str(target), "directory") for call in calls[1:])
+    attempts = p._runtime.store.backend.load_settled_attempts("replace::one")
+    if accepted:
+        assert not target.exists()
+        if initial == "directory":
+            assert len(calls) == 1
+        elif decision == "approve":
+            assert len(calls) == 2
+        assert len(attempts) == (2 if outcome == "retry" else 1)
+        assert p.get_cursor("tree-result") == ("committed" if outcome == "success" else None)
+    else:
+        assert target.joinpath("child").read_text(encoding="utf-8") == "business data"
+        attempt, = attempts
+        assert attempt["outcome"] == "failure"
+        assert attempt["result"]["annotations"]["authorization_status"] == ("stopped" if decision == "stop" else "denied")
+        assert {row["job_uid"] for row in p._runtime.store.backend.load_queue_jobs(status="pending")} == {"replace::one", "downstream::one"}
+        assert p._runtime.store.backend.load_failed() == {}
+        assert p._runtime.store.backend.load_successes() == {}
+        assert p._runtime.session.retry_counts.get("replace::one", 0) == 0
+        assert p.get_cursor("tree-result") is None
+        assert p.list_authorizations()[0]["target_type"] == "file"
+    p.close()
+
+
+def _replace_and_linger_handler(job, ctx):
+    result = _replace_file_with_tree_handler(job, ctx)
+
+    def linger():
+        gate = Path(job.payload["exit_gate"])
+        deadline = time.monotonic() + 15
+        while not gate.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    threading.Thread(target=linger, daemon=False).start()
+    return result
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("decision", [True, False])
+def test_cleanup_wait_preserves_result_and_settles_other_worker_before_single_completion(
+    tmp_path, monkeypatch, backend, decision,
+):
+    """清理待决时继续结算在途结果、暂停新派发；只调用一次收尾且拒绝先终止进程。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "target"
+    target.write_text("initial", encoding="utf-8")
+    independent_gate, exit_gate = tmp_path / "independent", tmp_path / "exit"
+    p = TaskLite(backend=backend, state_path=tmp_path / "lifecycle.db", max_workers=2)
+    requested = threading.Event()
+    decided = [None]
+    calls = []
+
+    def authorize(path, kind):
+        calls.append(kind)
+        if kind == "file":
+            return True
+        requested.set()
+        return decided[0]
+
+    p.authorizer = authorize
+    p.register_task("replace", _replace_and_linger_handler)
+    p.register_task("independent", _wait_for_gate_then_quick_handler)
+    p.register_task("follow", _marker_handler)
+    p.enqueue(Job("replace", "one", payload={"outcome": "success", "exit_gate": str(exit_gate)},
+                  files={"target": FileSpec(target, role="cache", delete_on_success=True)}))
+    p.enqueue(Job("independent", "one", payload={"gate": str(independent_gate)}))
+    marker = tmp_path / "new-dispatch"
+    p.enqueue(Job("follow", "one", payload={"marker": str(marker)}))
+    complete_calls = []
+    original_complete = p._runtime._completion.complete_job
+    original_pending = p._runtime.store.apply_pending
+
+    def complete(entry, result, **kwargs):
+        complete_calls.append(entry.job_uid)
+        return original_complete(entry, result, **kwargs)
+
+    def pending(**kwargs):
+        handle = p._runtime.in_flight[kwargs["job_uid"]].handle
+        try:
+            alive = handle.process.is_alive()
+        except ValueError:
+            alive = False
+        assert not alive
+        return original_pending(**kwargs)
+
+    monkeypatch.setattr(p._runtime._completion, "complete_job", complete)
+    monkeypatch.setattr(p._runtime.store, "apply_pending", pending)
+    errors = []
+
+    def run_pipeline():
+        try:
+            p.run(install_signals=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_pipeline)
+    runner.start()
+    try:
+        assert requested.wait(10)
+        _wait_for(lambda: p._runtime._completion.waiting_authorization)
+        entry = p._runtime.in_flight["replace::one"]
+        assert entry.handle.process.is_alive()
+        entry.handle.timeout_at_monotonic = time.monotonic() - 1
+        independent_gate.touch()
+        _wait_for(lambda: "independent::one" in p._runtime.store.backend.load_successes())
+        assert not marker.exists()
+        assert complete_calls == ["independent::one"]
+        assert target.joinpath("child").exists()
+        decided[0] = decision
+        if decision:
+            _wait_for(lambda: "replace::one" in p._runtime.store.backend.load_successes())
+            assert entry.handle.process.is_alive()
+            assert not target.exists()
+            exit_gate.touch()
+        runner.join(20)
+        assert not runner.is_alive()
+        assert errors == []
+        assert complete_calls.count("replace::one") == 1
+        assert len(p._runtime.store.backend.load_settled_attempts("replace::one")) == 1
+    finally:
+        exit_gate.touch()
+        independent_gate.touch()
+        p.stop()
+        runner.join(5)
+        p.close()
+
+
+def _replace_file_with_link_handler(job, ctx):
+    target = ctx.file_path("target")
+    target.unlink()
+    target.symlink_to(job.payload["destination"], target_is_directory=True)
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_worker_leaf_link_replacement_never_expands_file_authorization(tmp_path, monkeypatch, backend):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "target"
+    target.write_text("initial", encoding="utf-8")
+    destination = tmp_path / "business"
+    destination.mkdir()
+    child = destination / "child"
+    child.write_text("preserve", encoding="utf-8")
+    p = TaskLite(backend=backend, state_path=tmp_path / "link.db")
+    calls = []
+    p.authorizer = lambda *args: calls.append(args) or True
+    p.register_task("replace", _replace_file_with_link_handler)
+    p.enqueue(Job("replace", "one", payload={"destination": str(destination)},
+                  files={"target": FileSpec(target, role="cache", delete_on_success=True)}))
+    p.run()
+    assert target.is_symlink()
+    assert child.read_text(encoding="utf-8") == "preserve"
+    assert calls == [(str(target), "file")]
+    assert p.list_authorizations()[0]["target_type"] == "file"
+    attempt, = p._runtime.store.backend.load_settled_attempts("replace::one")
+    assert attempt["outcome"] == "failure"
+    assert "symlink" in attempt["result"]["message"]
+    p.close()
+
+
+def _replace_second_target_handler(job, ctx):
+    second = ctx.file_path("second")
+    second.unlink()
+    second.mkdir()
+    (second / "child").write_text("second data", encoding="utf-8")
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("approve_first_tree", [True, False])
+def test_later_authorization_callback_cannot_expand_previously_checked_target(
+    tmp_path, monkeypatch, backend, approve_first_tree,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    first, second = tmp_path / "first", tmp_path / "second"
+    for path in (first, second):
+        path.write_text("initial", encoding="utf-8")
+    p = TaskLite(backend=backend, state_path=tmp_path / "changed-during-query.db")
+    calls = []
+
+    def authorize(path, kind):
+        calls.append((path, kind))
+        if path == str(second) and kind == "directory":
+            first.unlink()
+            first.mkdir()
+            (first / "child").write_text("first data", encoding="utf-8")
+        if path == str(first) and kind == "directory":
+            return approve_first_tree
+        return True
+
+    p.authorizer = authorize
+    p.register_task("replace", _replace_second_target_handler)
+    p.enqueue(Job("replace", "one", files={
+        "first": FileSpec(first, role="cache", delete_on_success=True),
+        "second": FileSpec(second, role="cache", delete_on_success=True),
+    }))
+    p.run()
+    assert calls == [(str(first), "file"), (str(second), "file"),
+                     (str(second), "directory"), (str(first), "directory")]
+    if approve_first_tree:
+        assert not first.exists() and not second.exists()
+    else:
+        assert first.joinpath("child").read_text(encoding="utf-8") == "first data"
+        assert second.joinpath("child").read_text(encoding="utf-8") == "second data"
+        assert p._runtime.store.backend.load_failed() == {}
+        assert p._runtime.store.backend.load_queue_jobs(status="pending")
+    p.close()
+
+
+def _failure_handler(job, ctx):
+    return TaskResult.failure("business failure")
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("timing", ["delete_existing", "delete_on_success", "delete_on_failure"])
+def test_type_change_at_deletion_snapshot_fails_without_directory_permission(
+    tmp_path, monkeypatch, backend, timing,
+):
+    """最后的对象快照发现范围已扩大时明确失败，不递归删除未授权目录。"""
+    from tasklite.utils.artifact import ArtifactPathPolicy
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "target"
+    target.write_text("initial", encoding="utf-8")
+    p = TaskLite(backend=backend, state_path=tmp_path / "snapshot.db")
+    calls = []
+    p.authorizer = lambda *args: calls.append(args) or True
+    p.register_task("work", _failure_handler if timing == "delete_on_failure" else _quick_handler)
+    p.enqueue(Job("work", "one", files={
+        "target": FileSpec(target, role="cache", **{timing: True}),
+    }))
+    original_remove = ArtifactPathPolicy._remove
+
+    def replace_before_snapshot(policy, path, declaration, **kwargs):
+        if path == target:
+            target.unlink()
+            target.mkdir()
+            (target / "child").write_text("preserve", encoding="utf-8")
+        return original_remove(policy, path, declaration, **kwargs)
+
+    monkeypatch.setattr(ArtifactPathPolicy, "_remove", replace_before_snapshot)
+    p.run()
+    assert target.joinpath("child").read_text(encoding="utf-8") == "preserve"
+    assert calls == [(str(target), "file")]
+    failed = p._runtime.store.backend.load_failed()["work::one"]
+    assert "authorization scope changed before deletion" in str(failed)
+    p.close()
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("cached", [False, True], ids=["channel-result", "cleanup-result"])
+@pytest.mark.parametrize("decision", [True, False, None])
+def test_run_fault_leaves_uncommitted_cleanup_result_running_for_recovery(
+    tmp_path, monkeypatch, backend, cached, decision,
+):
+    """收到有效结果不等于已提交；异常退出不补结算，下次按原身份恢复失败。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    target = tmp_path / "target"
+    target.write_text("initial", encoding="utf-8")
+    p = TaskLite(backend=backend, state_path=tmp_path / "abort-result.db")
+    final_decision = [None if cached else decision]
+    calls = []
+
+    def authorize(path, kind):
+        calls.append((path, kind))
+        return True if kind == "file" else final_decision[0]
+
+    p.authorizer = authorize
+    p.register_task("replace", _replace_file_with_tree_handler)
+    p.register_task("committed", _quick_handler)
+    p.enqueue(Job("committed", "one"))
+    p.run(install_signals=False)
+    committed = p._runtime.store.backend.load_successes()["committed::one"]
+    p.enqueue(Job("replace", "one", payload={"outcome": "success"}, files={
+        "target": FileSpec(target, role="cache", delete_on_success=True),
+    }))
+    fault = RuntimeError("framework fault after valid worker result")
+    runtime = p._runtime
+    if cached:
+        original_step = runtime.step
+
+        def faulty_step(*args, **kwargs):
+            outcome = original_step(*args, **kwargs)
+            if runtime._completion.waiting_authorization:
+                final_decision[0] = decision
+                raise fault
+            return outcome
+
+        monkeypatch.setattr(runtime, "step", faulty_step)
+    else:
+        original_drain = runtime._drain_and_settle
+
+        def faulty_drain():
+            for handle in runtime.in_flight.active_handles():
+                runtime.channel._receive_available(handle)
+                if handle.execution_id in runtime.channel._results:
+                    raise fault
+            return original_drain()
+
+        monkeypatch.setattr(runtime, "_drain_and_settle", faulty_drain)
+    with pytest.raises(RuntimeError) as caught:
+        p.run(install_signals=False)
+    assert caught.value is fault
+    assert calls == [(str(target), "file")] + ([(str(target), "directory")] if cached else [])
+    assert target.joinpath("child").read_text(encoding="utf-8") == "business data"
+    assert runtime.store.backend.load_settled_attempts("replace::one") == []
+    running, = runtime.store.backend.load_queue_jobs(status="running")
+    assert running["job_uid"] == "replace::one"
+    assert running["attempt_no"] == 1
+    assert runtime.store.backend.load_failed() == {}
+    assert runtime.store.backend.load_successes()["committed::one"] == committed
+    assert p.get_cursor("tree-result") is None
+    assert not runtime._completion.waiting_authorization
+    assert not runtime.in_flight
+    monkeypatch.undo()
+    p.run(install_signals=False)
+    attempt, = runtime.store.backend.load_settled_attempts("replace::one")
+    assert attempt["outcome"] == "failure"
+    assert attempt["run_id"] == running["run_id"]
+    assert attempt["attempt_no"] == running["attempt_no"]
+    assert runtime.store.backend.load_queue_jobs(status="running") == []
+    assert "replace::one" in runtime.store.backend.load_failed()
+    assert runtime.store.backend.load_successes()["committed::one"] == committed
+    assert target.joinpath("child").read_text(encoding="utf-8") == "business data"
+    p.run(install_signals=False)
+    assert runtime.store.backend.load_settled_attempts("replace::one") == [attempt]
+    p.close()
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_success_cleanup_error_does_not_run_unapproved_failure_cleanup(tmp_path, monkeypatch, backend):
+    from tasklite.utils.artifact import ArtifactPathPolicy
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    first, second = tmp_path / "first", tmp_path / "second"
+    for path in (first, second):
+        path.write_text("initial", encoding="utf-8")
+    p = TaskLite(backend=backend, state_path=tmp_path / "cleanup-outcome.db")
+    calls = []
+    p.authorizer = lambda *args: calls.append(args) or True
+    p.register_task("replace", _replace_second_target_handler)
+    p.enqueue(Job("replace", "one", files={
+        "first": FileSpec(first, role="cache", delete_on_success=True),
+        "second": FileSpec(second, role="cache", delete_on_failure=True),
+    }))
+
+    def fail_cleanup(policy, declaration, *, success):
+        assert declaration.path == str(first)
+        assert success
+        raise OSError("cleanup write failure")
+
+    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", fail_cleanup)
+    p.run()
+    assert first.read_text(encoding="utf-8") == "initial"
+    assert second.joinpath("child").read_text(encoding="utf-8") == "second data"
+    assert calls == [(str(first), "file"), (str(second), "file")]
+    assert "replace::one" in p._runtime.store.backend.load_failed()
+    p.close()

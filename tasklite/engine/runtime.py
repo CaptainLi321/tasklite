@@ -405,6 +405,7 @@ class EngineRuntime:
             policy = ArtifactPathPolicy(
                 output_roots=self.config.output_roots,
                 protected_roots=self.config.protected_roots,
+                authorization_check=lambda path, kind: self.store.backend.is_path_authorized(path, kind),
             )
             try:
                 _execute_pre_deletes(
@@ -656,7 +657,9 @@ class EngineRuntime:
         worker_wait = 0.0
         dispatched = 0
         if not draining:
-            if any(h.waiting_auth for h in self._in_flight.active_handles()):
+            if self._completion.waiting_authorization or any(
+                h.waiting_auth for h in self._in_flight.active_handles()
+            ):
                 return last_outcome, worker_wait, dispatched
             while dispatched < limit and self._session.stop_mode is StopMode.NONE:
                 outcome = self._dispatch.dispatch_next()
@@ -787,7 +790,10 @@ class EngineRuntime:
         """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
         if not self._in_flight:
             return 0
-        handles = self._in_flight.active_handles()
+        handles = [
+            h for h in self._in_flight.active_handles()
+            if not self._completion.has_pending_result(h)
+        ]
         completed = self.channel.reap_completed(handles)
         return self._completion.settle_reaped(completed)
 
@@ -796,7 +802,7 @@ class EngineRuntime:
         deadlines = [
             handle.timeout_at_monotonic
             for handle in self._in_flight.active_handles()
-            if not handle.waiting_auth
+            if not handle.waiting_auth and not self._completion.has_pending_result(handle)
         ]
         if not deadlines:
             return None
@@ -841,7 +847,7 @@ class EngineRuntime:
 
         # 4. 等待/空闲决策（唯一实现见 wait.decide_wait）
         is_idle = store.state.is_empty and not self._in_flight
-        authorization_wait = any(
+        authorization_wait = self._completion.waiting_authorization or any(
             handle.waiting_auth
             for handle in self._in_flight.active_handles()
         )

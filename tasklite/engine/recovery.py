@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     class RecoveryCompletion(Protocol):
         """恢复编排消费的完成机器契约（CompletionMachine 自动满足）。
 
-        Job 终结唯一经由完成机器收尾：中止分类结算走 ``settle_aborted``。
+        异常中止只清除内存在途归属，持久化 running 留给下次恢复。
         """
 
         def settle_aborted(
@@ -124,12 +124,7 @@ class RecoveryOrchestrator:
         return state
 
     def abort_in_flight(self) -> None:
-        """异常/强制停机时：终止进行中的子进程并消费已完成的结果。
-
-        在 run 主循环的 except 块和 ABORTING 停机路径调用。
-        委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理），本方法
-        收敛状态机编排：释放资源 → 中止分类 → 统一结算。
-        """
+        """框架异常退出时结束 worker 并清除内存在途归属，不补提交结果。"""
         if not self._in_flight:
             return
 
@@ -143,7 +138,7 @@ class RecoveryOrchestrator:
         completed_map = {h.job_uid: res for h, res in outcome.completed}
         cancelled_entries, done_entries = self._in_flight.classify_aborted(completed_map)
 
-        # 4. 委托完成机器统一结算已取消与已完成条目
+        # 未提交记录保持 running，不把收到结果等同于已经结算。
         self._completion.settle_aborted(cancelled_entries, done_entries)
 
 

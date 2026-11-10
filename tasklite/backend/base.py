@@ -506,8 +506,8 @@ class AbstractStateBackend(ABC):
         """按规范绝对路径精确撤销授权，存在并删除返回 True，不存在返回 False。"""
 
     @abstractmethod
-    def is_path_authorized(self, path: str) -> bool:
-        """检查指定规范绝对路径是否命中已有授权（精确文件匹配或已授权目录树内）。"""
+    def is_path_authorized(self, path: str, target_type: str) -> bool:
+        """按实际目标类型检查规范绝对路径授权；文件精确匹配，目录覆盖整树。"""
 
     def close(self) -> None:
         """关闭后端并释放资源（幂等）。"""

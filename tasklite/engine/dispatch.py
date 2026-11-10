@@ -148,6 +148,7 @@ class DispatchMachine:
         self._path_policy = ArtifactPathPolicy(
             output_roots=output_roots,
             protected_roots=protected_roots,
+            authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
         )
         self._commit_failure_threshold = commit_failure_threshold
         self._authorization_pending: tuple[str | None, str, str] | None = None

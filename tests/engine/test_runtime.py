@@ -489,20 +489,27 @@ class TestRunReentryGuard:
 class TestCrashNet:
     """_run_with_crash_net 统一异常承重网（确定性单测）。"""
 
-    def test_crash_net_aborts_and_propagates(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("abort_fails", [False, True])
+    def test_crash_net_aborts_and_propagates(self, tmp_path, monkeypatch, abort_fails):
         runtime = RuntimeEnv(tmp_path).runtime
         calls: list[str] = []
 
+        fault = RuntimeError("loop exploded")
+
         def _boom():
-            raise RuntimeError("loop exploded")
+            raise fault
+
+        def abort():
+            calls.append("abort")
+            if abort_fails:
+                raise OSError("resource release unavailable")
 
         monkeypatch.setattr(runtime, "run_loop", _boom)
-        monkeypatch.setattr(
-            runtime._recovery, "abort_in_flight", lambda: calls.append("abort")
-        )
+        monkeypatch.setattr(runtime._recovery, "abort_in_flight", abort)
 
-        with pytest.raises(RuntimeError, match="loop exploded"):
+        with pytest.raises(RuntimeError, match="loop exploded") as caught:
             runtime._run_with_crash_net()
+        assert caught.value is fault
 
         assert calls == ["abort"]
 

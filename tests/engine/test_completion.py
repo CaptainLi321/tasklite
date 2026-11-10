@@ -583,41 +583,40 @@ class TestSettleReaped:
 class TestSettleAborted:
     """中止分类结算。"""
 
-    def test_cancelled_not_requeued_done_committed(self, tmp_path):
+    def test_abort_releases_entries_without_committing_results(self, tmp_path):
         env = CompletionEnv(tmp_path)
-        j1 = Job("t", "j1")
-        e1 = env.track_entry(j1, attempt_id=env.open_attempt(j1))
-        j2 = Job("t", "j2")
-        e2 = env.track_entry(j2, attempt_id=env.open_attempt(j2))
-
+        j1, j2 = Job("t", "j1"), Job("t", "j2")
+        e1, e2 = env.track_entry(j1), env.track_entry(j2)
         env.completion.settle_aborted(
             cancelled_entries=[e1],
-            done_entries=[(e2, ExecutionResult(success=True, result_metadata={}))],
+            done_entries=[(e2, ExecutionResult(success=True))],
         )
         assert not env.store.state.queue
-        assert "t::j2" in env.store.state.successes
-        assert len(env.in_flight) == 0
-        assert env.store.state.in_flight_uids == frozenset()
+        assert not env.store.state.successes
+        assert not env.store.state.failed
+        assert not env.in_flight
+        assert not env.store.state.in_flight_uids
+        assert env.resources["__workers__"].used == 0
+        assert not env.hooks
 
-    def test_commit_crash_signal_last_one_propagates(self, tmp_path):
-        class FailingBackend(InMemoryStateBackend):
-            def commit_job_success(self, *a, **k):
-                return False
-
+    def test_release_failure_still_unregisters_all_entries(self, tmp_path, monkeypatch):
         env = CompletionEnv(tmp_path)
-        env.store.set_backend(FailingBackend())
-        j1 = Job("t", "j1")
-        e1 = env.track_entry(j1)
+        first = env.track_entry(Job("t", "first"))
+        second = env.track_entry(Job("t", "second"))
+        fault = OSError("resource release unavailable")
 
-        from tasklite.exceptions import _CommitCrashSignal
+        def fail_release(*args):
+            raise fault
 
-        with pytest.raises(_CommitCrashSignal):
-            env.completion.settle_aborted(
-                cancelled_entries=[],
-                done_entries=[(e1, ExecutionResult(success=True))],
-            )
-        assert len(env.in_flight) == 0
-        assert env.store.state.in_flight_uids == frozenset()
+        monkeypatch.setattr(first, "release_resources", fail_release)
+        with pytest.raises(OSError) as caught:
+            env.completion.settle_aborted([first], [(second, ExecutionResult(success=True))])
+        assert caught.value is fault
+        assert not env.in_flight
+        assert not env.store.state.in_flight_uids
+        assert not env.store.state.successes
+        assert not second.acquired
+        assert not env.hooks
 
 
 class TestHookFireDiscipline:
@@ -762,11 +761,11 @@ def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success)
     assert output.exists()
 
 
-def test_abort_cleanup_failure_unregisters_without_requeue(tmp_path, monkeypatch):
+def test_abort_does_not_request_or_execute_cleanup(tmp_path, monkeypatch):
     from tasklite.utils.artifact import ArtifactPathPolicy
 
     env = CompletionEnv(tmp_path)
-    env.store.authorizer = lambda *_args: True
+    env.store.authorizer = lambda *_args: pytest.fail("异常退出不能发起授权")
     entries = [
         env.track_entry(
             Job("t", name, max_retries_per_run=3),
@@ -782,11 +781,10 @@ def test_abort_cleanup_failure_unregisters_without_requeue(tmp_path, monkeypatch
     ]
 
     def denied(self, declaration, *, success):
-        raise PermissionError("cleanup denied")
+        pytest.fail("异常退出不能补执行文件清理")
 
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
-    with pytest.raises(PermissionError, match="cleanup denied"):
-        env.completion.settle_aborted(entries, [])
+    env.completion.settle_aborted(entries, [])
     assert not env.in_flight
     assert not env.store.state.in_flight_uids
     assert not env.store.state.queue

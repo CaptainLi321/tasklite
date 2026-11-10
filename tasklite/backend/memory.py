@@ -893,11 +893,12 @@ class InMemoryStateBackend(AbstractStateBackend):
                 return True
             return False
 
-    def is_path_authorized(self, path: str) -> bool:
+    def is_path_authorized(self, path: str, target_type: str) -> bool:
         norm_path = os.path.normpath(os.fspath(path))
         target_p = Path(norm_path)
         with self._lock:
-            if norm_path in self._authorizations:
+            exact = self._authorizations.get(norm_path)
+            if exact is not None and exact["target_type"] == target_type:
                 return True
             for record in self._authorizations.values():
                 if record["target_type"] == "directory":
