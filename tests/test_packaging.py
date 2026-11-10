@@ -1,10 +1,12 @@
 """发布声明契约测试：锁定 pyproject 元数据与支持面承诺的一致性。"""
 
 from pathlib import Path
+import sys
 
-import pytest
-
-tomllib = pytest.importorskip("tomllib")
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 SUPPORTED_PYTHONS = ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
