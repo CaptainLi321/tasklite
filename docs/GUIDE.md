@@ -65,7 +65,7 @@ def my_handler(job, ctx):
     return TaskResult.success(metadata={"processed": True})
 
 task = Task(
-    "download",                    # task_type（非空 str，不含 "::"）
+    "download",                    # task_type（原始非空 str）
     my_handler,                    # handler 签名 Callable[[Job, JobContext], TaskResult]
     resources={"api": 1.0},        # 默认资源占用
     max_retries_per_run=3,         # 单次运行内最大重试预算（默认 3）
@@ -102,7 +102,7 @@ print(job.uid)  # "download::item_001"
 
 #### 身份与单射编码
 
-`job.uid` 格式为 `{task_type}::{job_id}`。若标识符中包含 `::` 或 `%`，框架通过 `make_job_uid` 和 `parse_job_uid` 执行标准百分号转义，保证跨系统、跨数据库字段的单射可逆性。
+`task_type` 与 `job_id` 接收原始非空字符串，允许包含冒号。框架通过 `make_job_uid` 将百分号、冒号和不可打印字符透明转义为可逆 UTF-8 `%XX`，以 `::` 分隔两个已转义组成部分生成 `job.uid`；`parse_job_uid` 还原原始字段。调用者无需预编码或手工拼接 UID。
 
 #### Trigger：本次 Run 的启动判断
 
@@ -200,14 +200,14 @@ if __name__ == "__main__":
 Handler **必须显式返回 `TaskResult`**，严禁返回布尔值、元组或裸数据：
 
 - `TaskResult.success(*, message=None, metadata=None)`：执行成功，`metadata` 必须为严格合法的 JSON 对象；
-- `TaskResult.failure(*, message=None, metadata=None)`：确定性永久失败，直接耗尽预算进失败档案；
+- `TaskResult.failure(*, message=None, metadata=None)`：直接将 Job 结算为 `failed` 并写入失败档案，不消耗显式重试预算；
 - `TaskResult.retry(*, message=None, metadata=None, consume_budget=True)`：请求重试，按当前重入队机制安排本次 Run 内的下一次执行；预算耗尽或 Run 已停止时不会自动开启下一次 Run。
 
 ### JobContext 运行时接口
 
 传递给 handler 的 `ctx` 对象提供以下运行时能力：
 - `ctx.spawn(job: Job) -> None`：在子进程中动态派生子任务（父任务成功提交时原子入队，父任务失败则零发布）；
-- `ctx.declare_file(name: str, spec: FileSpec) -> Path`：动态声明文件并请求主进程授权与父目录准备；
+- `ctx.declare_file(name: str, spec: FileSpec) -> Path`：动态登记文件声明，等待主进程完成必要授权及显式请求的前置删除后，返回规范绝对路径；不创建父目录；
 - `ctx.file_path(name: str) -> Path`：查询已声明文件的绝对路径；
 - `ctx.get_cursor(key: str) -> str | None`：读取派发快照与本次暂存更新；
 - `ctx.set_cursor(key: str, value: str | None) -> None`：更新或删除游标（父任务成功提交时原子持久化，失败或重试丢弃）。
@@ -238,8 +238,10 @@ FileSpec(
 文件声明用于路径管理、依赖传递与清理请求，不是 handler 的写入沙箱。读取默认允许；当任务声明 `delete_existing`、`delete_on_failure` 或 `delete_on_success` 时，主进程拥有授权检查与清理执行职责：
 - 环境变量 `TASKLITE_AUTO_APPROVE=1`：自动同意本进程实际请求且未命中硬性保护规则的框架文件操作，并记录实际授权路径；
 - `pipeline.authorizer = Callable[[str, str], bool | None]`：自定义授权判定，参数为规范绝对路径与 `file` / `directory`；返回 `True` 批准并持久化，`False` 拒绝，`None` 表示暂不能决定；
-- 等待 `None` 结果时暂停新派发，继续处理已派发执行；不占用业务资源，也不消耗执行超时预算；
-- 授权拒绝或等待期间收到停止请求时，先结束受阻 worker，再追加 `failure` Attempt、把 Job 回到 `pending`，并将受影响依赖链加入本 Run 临时排除；不写失败档案、不消耗重试预算；
+- 等待 `None` 结果时暂停新派发，继续处理已派发执行；初始派发前的授权等待不占用业务资源、不消费配额，也不计执行超时；
+- 运行中动态声明或结果清理的授权待决仍持有本次已获取的资源；动态声明等待期间暂停执行超时计时，收到有效结果后的清理不计执行超时；
+- 初始派发前授权拒绝时，Job 保持 `pending`，不产生 Attempt；已进入 `running` 后授权拒绝或等待期间收到停止请求时，先结束受阻执行，再追加 `failure` Attempt、把 Job 回到 `pending`；两者均不写失败档案、不消耗重试预算；
+- 授权拒绝将受影响依赖链加入本 Run 临时排除；`stop()`／Ctrl+C 则停止整个 Run 的新派发；
 - 受保护的状态库、WAL／SHM 副文件与库级锁文件绝对禁止声明或删除；
 - Run 外可调用 `pipeline.list_authorizations()` 查看当前已持久化授权，调用 `pipeline.revoke_authorization(path)` 精准撤销。
 
@@ -272,7 +274,7 @@ pipeline.set_job_status("fetch::item_1", "succeeded", recursive=False, note="人
 deleted_count = pipeline.clear_history("fetch::item_1", records=["successes", "attempts"])
 ```
 
-- 精准删除指定的历史集合（`successes` / `failed` / `attempts`）；
+- 精准删除指定的历史集合（`successes` / `failures` / `attempts`）；
 - **不变式：内部单调编号进度绝不重置**。清空历史后重新入队相同 `job_uid`，其新产生的 Attempt 序号仍从该 UID 的独立编号进度继续单调自增，不依赖剩余历史，也不回退到 1。
 
 ### 高水位游标读写
@@ -398,7 +400,7 @@ with StateSnapshot.open(pipeline) as snap:
 | `raise RetryError(...)` | `return TaskResult.retry(message=...)` | 显式重试返回，消除内部魔法异常 |
 | `ctx.declare_output(path)` | `ctx.declare_file(name, FileSpec(path, role="output"))` | 统一文件声明对象，包含明确角色与清理权限 |
 | `ctx.get_artifact_path(...)` | `ctx.file_path(name)` 或上游预声明 | 消除旧产物查找协议，规范为已声明文件路径解析 |
-| `RateLimitResource(...)` | `IntervalResource(name, interval_seconds)` | 资源命名统一，从 `tasklite.resource` 导入 |
+| `RateLimitResource(...)` | `IntervalResource(name, interval_seconds=...)` | `interval_seconds` 必须使用关键字参数，从 `tasklite.resource` 导入 |
 | `list_failures` / `clear_failures` / `retry_failure` | `set_job_status` / `clear_history` / `StateSnapshot` | 失败档案管理收敛为统一状态与历史管理 API |
 | `pipeline.selection(...)` / `Skip` | `pipeline.run(exclude=Exclude(...))` | 删除复杂规则容器与 Skip 终态跳过，仅保留 Exclude 延迟留队 |
 | `RunSummary` / `pipeline.stats` | `pipeline.run()` 返回 `None`，查询用 `StateSnapshot` | 移除易过期的统计快照，由一致只读快照提供权威观察 |
@@ -407,5 +409,5 @@ with StateSnapshot.open(pipeline) as snap:
 
 **本引擎不提供旧版状态库的原地自动迁移**：
 - SQLite Schema 6 为全新结构（新增 `job_sequences` 表与完整 `attempts` 记录）；
-- 打开 Schema ≤ 5、非空版本 0 库或异形库时，引擎在只读预检阶段直接抛出 `RuntimeError` 拒绝启动；
+- 检测到 Schema ≤ 5、非空版本 0 库或不支持的结构时，引擎在只读预检阶段主动抛出 `TaskLiteError` 拒绝启动；文件系统、SQLite 等底层库自然产生的异常原样传播，保留原始 traceback 与异常链；
 - 存量生产业务请保留原状态数据库，使用匹配旧版本读取历史，升级时请通过新的 `state_path` 进行冷启动。
