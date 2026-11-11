@@ -49,6 +49,9 @@
    - 下次启动只能按完整执行身份把遗留 `running` 收敛为失败，保留 `pending`，不接续旧执行；库级单锁（`__tasklite__.lock`）防多实例并发写冲突。
 9. **六步标准调用顺序**：
    - 初始化 → `register_resource` → `register_task` → `enqueue` → `run` → `stop`；管理 API（`set_job_status` / `clear_history` / `get_cursor` / `set_cursor` / `list_authorizations` / `revoke_authorization`）仅限 `run()` 外调用，违规由框架主动抛 `TaskLiteError`。
+10. **执行过程文档禁止入库**：
+    - 执行计划、ticket、交接记录、审查过程报告、重构复盘、临时研究笔记及验证日志仅保留在已被 Git 忽略的本地目录（如 `.verify_tmp/`），不得暂存、提交或通过 `git add -f` 加入 Git。
+    - 不得以“先提交、后删除”方式保留这类材料；Git 历史同样不得包含。需要长期维护的公开契约、使用说明和架构决策，分别归入 GUIDE、README、CONTEXT 或 ADR，按文档职责提炼，不搬入执行流水账。
 
 ---
 
