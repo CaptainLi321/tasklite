@@ -27,39 +27,13 @@ from tasklite.engine.resource import (
     ResourceManager,
 )
 from tasklite.engine.scheduler import JobScheduler
+from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import StopMode
 from tasklite.models.artifact import FileSpec
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
-
-
-class StubSession:
-    """派发消费的运行会话结构契约桩。"""
-
-    def __init__(self, run_id: str = "a" * 32) -> None:
-        self.run_id = run_id
-        self.stop_mode = StopMode.NONE
-        self._dispatch_no = 0
-        self._retry_counts: dict[str, int] = {}
-        self._retry_candidates: set[str] = set()
-
-    def next_dispatch_no(self) -> int:
-        self._dispatch_no += 1
-        return self._dispatch_no
-
-    def get_retry_count(self, job_uid: str) -> int:
-        return self._retry_counts.get(job_uid, 0)
-
-    def is_retry_candidate(self, job_uid: str) -> bool:
-        return job_uid in self._retry_candidates
-
-    def mark_retry_candidate(self, job_uid: str) -> None:
-        self._retry_candidates.add(job_uid)
-
-    def clear_retry_candidate(self, job_uid: str) -> None:
-        self._retry_candidates.discard(job_uid)
 
 
 class RecordingCompletion:
@@ -99,7 +73,8 @@ class DispatchEnv:
             PipelineState({}, {}, {}, []),
             stats=self.stats,
         )
-        self.session = StubSession()
+        self.session = RunSession()
+        self.session.begin("a" * 32)
         self.in_flight = InFlightTracker()
         self.channel = ExecutionChannel()
         self.completion = RecordingCompletion()
@@ -481,7 +456,7 @@ class TestAdmissionEvaluationTiming:
         env.store.state.mark_success("t::j1", {})
         retry_job = Job("t", "j1")
         env.store.state.spawn_jobs([retry_job.to_dict()])
-        env.session._retry_counts["t::j1"] = 1
+        env.session.record_retry("t::j1")
         if registered_as_retry:
             env.session.mark_retry_candidate("t::j1")
         monkeypatch.setattr(

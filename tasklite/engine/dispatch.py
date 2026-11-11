@@ -4,9 +4,8 @@
 pre-submit-cleanup。依赖以显式窄清单注入（无共享袋），经
 ``store`` 复用状态仓库深模块，不反向引用门面。
 
-``session`` 与 ``tasks`` 按具名 Protocol 消费（装配契约见本模块的
-``DispatchSession`` 与 ``TaskSource``：RunSession / TaskRegistry 真实
-类型自动满足）；``output_roots`` 与 config 声明同型
+``session`` 直接使用内部 RunSession；``tasks`` 按具名 Protocol
+``TaskSource`` 消费（TaskRegistry 自动满足）。``output_roots`` 与 config 声明同型
 （``Path | Sequence[Path] | None``，多根输出场景）。
 
 进入 running 时分配编号，结算时追加 Attempt：execution_id
@@ -38,18 +37,7 @@ if TYPE_CHECKING:
     from .resource import ResourceManager
     from .scheduler import JobScheduler
     from .store import StateStore
-
-    class DispatchSession(Protocol):
-        """派发/完成机器消费的运行会话装配契约（RunSession 自动满足）。
-
-        ``run_id`` 是 execution_id 与 successes meta 的 run 身份事实源；
-        ``next_dispatch_no`` 为 execution_id fencing 提供单调递增序号。
-        """
-
-        run_id: str | None
-        stop_mode: StopMode
-
-        def next_dispatch_no(self) -> int: ...
+    from .session import RunSession
 
     class TaskSource(Protocol):
         """派发机器消费的任务规格来源契约（TaskRegistry 自动满足）。"""
@@ -114,7 +102,7 @@ class DispatchMachine:
         resources: "ResourceManager",
         channel: "ExecutionChannel",
         in_flight: "InFlightTracker",
-        session: "DispatchSession",
+        session: "RunSession",
         recovery: "RecoveryOrchestrator",
         completion: "CompletionMachine",
         tasks: "TaskSource",
@@ -204,9 +192,7 @@ class DispatchMachine:
                         worker_wait=AUTHORIZATION_RECHECK_SECONDS,
                     )
                 if authorized is False:
-                    exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
-                    if callable(exclude_fn):
-                        exclude_fn(pending_uid)
+                    self._session.temporarily_exclude_chain(pending_uid)
                     return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
 
         sched = self._scheduler.scan_next_runnable(store.state, store.state.in_flight_uids)
@@ -296,9 +282,7 @@ class DispatchMachine:
                 return None
 
         # 准入求值（仅显式 retry 登记的同 Run 候选跳过触发器）
-        is_session_retry = bool(
-            getattr(self._session, "is_retry_candidate", lambda _: False)(job_uid)
-        )
+        is_session_retry = self._session.is_retry_candidate(job_uid)
         if not is_session_retry:
             should_run = self._trigger_registry.admit(
                 peek_snapshot, store.state, baseline_lookup=store.trusted_last_succeeded_at_us
@@ -327,9 +311,7 @@ class DispatchMachine:
                     self._authorization_pending = (self._session.run_id, job_uid, fname)
                     return None
                 if authorized is False:
-                    exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
-                    if callable(exclude_fn):
-                        exclude_fn(job_uid)
+                    self._session.temporarily_exclude_chain(job_uid)
                     return None
 
         # 再次检查全部资源（授权后的全部资源检查到连续获取完成之间，不插入其他分配或回收）

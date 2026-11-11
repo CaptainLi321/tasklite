@@ -27,6 +27,7 @@ from tasklite.engine.resource import (
     IntervalResource,
     ResourceManager,
 )
+from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import JobHandle
 from tasklite.models.artifact import FileSpec
@@ -37,16 +38,6 @@ from tasklite.models.task import Task, TaskRegistry
 
 def _identity(entry):
     return {"execution_id": entry.execution_id, "run_id": entry.run_id, "attempt_no": entry.attempt_no}
-
-
-class StubSession:
-    """运行会话结构契约桩（run_id）。"""
-
-    def __init__(self, run_id: str = "b" * 32) -> None:
-        self.run_id = run_id
-
-    def next_dispatch_no(self) -> int:
-        raise AssertionError("completion 不消费 dispatch_no")
 
 
 class FakeProcess:
@@ -78,7 +69,8 @@ class CompletionEnv:
             stats=self.stats,
             trigger_registry=self.trigger_registry,
         )
-        self.session = StubSession()
+        self.session = RunSession()
+        self.session.begin("b" * 32)
         self.in_flight = InFlightTracker()
         self.channel = ExecutionChannel()
         self.completion = CompletionMachine(
@@ -266,6 +258,8 @@ class TestRetryBudget:
         assert attempt["outcome"] == "retry"
         assert attempt["result"]["message"] == "connection blip"
         assert entry.job.attempt_no == attempt["attempt_no"] == 1
+        assert env.session.get_retry_count(job.uid) == 1
+        assert env.session.is_retry_candidate(job.uid) is True
 
     def test_retry_job_snapshot_preserves_custom_fields(self, tmp_path):
         """重试 = 原作业原样重入队：顶层自定义字段与已注入资源随重试往返保留。"""
@@ -309,6 +303,8 @@ class TestRetryBudget:
             (1, "retry", "first failure"), (2, "failure", "second"),
         ]
         assert env.store.state.failed["t::j1"]["result"]["message"] == "second"
+        assert env.session.get_retry_count(job.uid) == 1
+        assert env.session.is_retry_candidate(job.uid) is False
 
     def test_explicit_zero_budget_retry_advances_attempt_no(self, tmp_path):
         """显式零预算重试不受预算限制，但编号仍推进。"""
@@ -334,6 +330,8 @@ class TestRetryBudget:
         assert "t::j1" not in env.store.state.failed
         assert env.store.state.queue[0]["attempt_no"] == 5
         assert env.stats["retried"] == 5
+        assert env.session.get_retry_count(job.uid) == 0
+        assert env.session.is_retry_candidate(job.uid) is True
 
 
 class TestSpawnedJobs:

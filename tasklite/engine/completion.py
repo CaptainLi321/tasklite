@@ -4,8 +4,8 @@
 retry/success/failure 三态事务提交。重试预算只统计本 Run 中显式
 ``TaskResult.retry`` 的消耗；候选来源与累计数量分开登记。
 
-``session`` 按具名 Protocol ``DispatchSession`` 消费（``run_id`` 是
-successes meta 的 last_run_id 事实源；契约定义见 dispatch 模块）。
+``session`` 直接使用内部 RunSession，统一持有候选来源和累计重试预算；
+``run_id`` 是 successes meta 的 last_run_id 事实源。
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from typing import Any, Sequence, TYPE_CHECKING
 if TYPE_CHECKING:
     from .admission import TriggerRegistry
     from .channel import ExecutionChannel
-    from .dispatch import DispatchSession
+    from .session import RunSession
     from .in_flight import InFlightTracker
     from .resource import ResourceManager
     from .store import StateStore
@@ -61,7 +61,7 @@ class CompletionMachine:
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
-        session: "DispatchSession",
+        session: "RunSession",
     ) -> None:
         self._store = store
         self._trigger_registry = trigger_registry
@@ -70,36 +70,6 @@ class CompletionMachine:
         self._in_flight = in_flight
         self._session = session
         self._pending_cleanup: dict[str, tuple[InFlightJob, ExecutionResult, _PreparedCompletion]] = {}
-        self._fallback_retry_counts: dict[str, int] = {}
-        self._fallback_retry_candidates: set[str] = set()
-
-    def _get_retry_count(self, uid: str) -> int:
-        getter = getattr(self._session, "get_retry_count", None)
-        if callable(getter):
-            return int(getter(uid))
-        return self._fallback_retry_counts.get(uid, 0)
-
-    def _record_retry(self, uid: str) -> int:
-        recorder = getattr(self._session, "record_retry", None)
-        if callable(recorder):
-            return int(recorder(uid))
-        updated = self._fallback_retry_counts.get(uid, 0) + 1
-        self._fallback_retry_counts[uid] = updated
-        return updated
-
-    def _mark_retry_candidate(self, uid: str) -> None:
-        marker = getattr(self._session, "mark_retry_candidate", None)
-        if callable(marker):
-            marker(uid)
-        else:
-            self._fallback_retry_candidates.add(uid)
-
-    def _clear_retry_candidate(self, uid: str) -> None:
-        clearer = getattr(self._session, "clear_retry_candidate", None)
-        if callable(clearer):
-            clearer(uid)
-        else:
-            self._fallback_retry_candidates.discard(uid)
 
     @staticmethod
     def _cleanup_exception(exc: BaseException) -> dict[str, str]:
@@ -168,14 +138,14 @@ class CompletionMachine:
                     continue
             except _CLEANUP_ERRORS:
                 continue
-            stopped = getattr(self._session, "stop_mode", StopMode.NONE) is not StopMode.NONE
+            stopped = self._session.stop_mode is not StopMode.NONE
             waiting = entry is not None and entry.job_uid in self._pending_cleanup
             if stopped and waiting:
                 status = AuthorizationStatus.STOPPED
                 message = f"authorization wait stopped for {spec.path}"
             else:
                 decision = self._store.check_or_request_authorization(spec.path)
-                stopped = getattr(self._session, "stop_mode", StopMode.NONE) is not StopMode.NONE
+                stopped = self._session.stop_mode is not StopMode.NONE
                 if stopped and (waiting or decision is None):
                     status = AuthorizationStatus.STOPPED
                     message = f"authorization wait stopped for {spec.path}"
@@ -233,7 +203,7 @@ class CompletionMachine:
                     entry.handle.execution_id if entry.handle is not None else None
                 ),
                 attempt_no=entry.attempt_no,
-                run_id=entry.run_id or getattr(self._session, "run_id", "run"),
+                run_id=entry.run_id or self._session.run_id,
                 started_at=entry.started_at,
                 entry=entry,
                 prepared=prepared,
@@ -359,7 +329,7 @@ class CompletionMachine:
                 job_snapshot=job_snapshot,
                 attempt_no=attempt_no,
                 execution_id=execution_id,
-                run_id=run_id or getattr(self._session, "run_id", "run"),
+                run_id=run_id or self._session.run_id,
                 started_at=started_at,
                 error_message=authorization_outcome.message,
                 files={k: v.to_dict() for k, v in active_files.items()},
@@ -374,9 +344,7 @@ class CompletionMachine:
                 },
             )
             if authorization_outcome.status is AuthorizationStatus.DENIED:
-                exclude_fn = getattr(self._session, "temporarily_exclude_chain", None)
-                if callable(exclude_fn):
-                    exclude_fn(uid)
+                self._session.temporarily_exclude_chain(uid)
             result.will_retry = False
             return
 
@@ -498,7 +466,7 @@ class CompletionMachine:
         max_retries = job.max_retries_per_run if job.max_retries_per_run is not None else 3
 
         if consume_budget:
-            consumed = self._get_retry_count(uid)
+            consumed = self._session.get_retry_count(uid)
             if consumed >= max_retries:
                 logger.error(
                     f"FAIL: {uid} exceeded max retries ({max_retries}). "
@@ -522,7 +490,7 @@ class CompletionMachine:
                 )
                 result.will_retry = False
                 return
-            self._record_retry(uid)
+            self._session.record_retry(uid)
 
         retry_job_snapshot = copy.deepcopy(job_snapshot)
         files_dict = (
@@ -549,7 +517,7 @@ class CompletionMachine:
             },
         )
         result.will_retry = True
-        self._mark_retry_candidate(uid)
+        self._session.mark_retry_candidate(uid)
 
     def _apply_success(
         self,
@@ -605,7 +573,7 @@ class CompletionMachine:
             },
         )
         result.will_retry = False
-        self._clear_retry_candidate(uid)
+        self._session.clear_retry_candidate(uid)
 
     def _collect_spawned_job_snapshots(
         self,
@@ -714,7 +682,7 @@ class CompletionMachine:
             },
         )
         result.will_retry = False
-        self._clear_retry_candidate(uid)
+        self._session.clear_retry_candidate(uid)
 
     # ── 批量结算 ──────────────────────────────────────────────────────
 
