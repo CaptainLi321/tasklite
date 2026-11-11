@@ -1,4 +1,5 @@
 """已进入 running 的执行共享结算流程，框架故障只保留恢复证据。"""
+from contextlib import ExitStack
 from pathlib import Path
 import multiprocessing as mp
 import traceback
@@ -452,13 +453,13 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("stage", ["resource", "pre_delete", "context", "process"])
-def test_attempt_start_time_comes_from_process_start(tmp_path, monkeypatch, backend, stage):
+def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeypatch, backend, stage):
     clock = ["2026-11-10T00:00:00Z"]
     launch_time = "2026-11-10T00:01:00Z"
     returned_time = "2026-11-10T00:02:00Z"
     target = tmp_path / "cache"
     target.write_text("business", encoding="utf-8")
-    with TaskLite(backend=backend, state_path=tmp_path / "state.db") as pipeline:
+    with TaskLite(backend=backend, state_path=tmp_path / "state.db") as pipeline, ExitStack() as snapshots:
         pipeline.authorizer = lambda path, kind: True
         capacity = CapacityResource("disk", max_capacity=1)
         pipeline.register_resource(capacity)
@@ -467,6 +468,17 @@ def test_attempt_start_time_comes_from_process_start(tmp_path, monkeypatch, back
             "cache": FileSpec(target, role="cache", delete_existing=True),
         }))
         runtime = pipeline._runtime
+        sources = [pipeline]
+        if backend == "sqlite":
+            sources.append(tmp_path / "state.db")
+        for source in sources:
+            with StateSnapshot.open(source) as snapshot:
+                pending = snapshot.get_job("work::committed")
+                assert list(snapshot.iter_jobs(status="pending")) == [pending]
+                assert all(pending[key] is None for key in (
+                    "result", "run_id", "attempt_no", "started_at", "settled_at",
+                ))
+        running_snapshots = []
         from tasklite.engine import dispatch
 
         owner, name = {
@@ -481,6 +493,17 @@ def test_attempt_start_time_comes_from_process_start(tmp_path, monkeypatch, back
         def prepare(*args, **kwargs):
             row, = runtime.store.backend.load_queue_jobs(status="running")
             identities.append(row)
+            assert not runtime.channel._handles
+            assert not runtime.in_flight
+            for source in sources:
+                snapshot = snapshots.enter_context(StateSnapshot.open(source))
+                current = snapshot.get_job("work::committed")
+                assert list(snapshot.iter_jobs(status="running")) == [current]
+                assert current["status"] == "running"
+                assert (current["run_id"], current["attempt_no"]) == (row["run_id"], row["attempt_no"])
+                assert all(current[key] is None for key in ("result", "started_at", "settled_at"))
+                assert list(snapshot.iter_attempts(job_uid="work::committed")) == []
+                running_snapshots.append((snapshot, current))
             result = original(*args, **kwargs)
             clock[0] = launch_time
             return result
@@ -510,10 +533,16 @@ def test_attempt_start_time_comes_from_process_start(tmp_path, monkeypatch, back
         assert capacity.used == 0
         row, = identities
         assert row["started_at"] == "2026-11-10T00:00:00Z"
-        with StateSnapshot.open(pipeline) as snapshot:
-            record = snapshot.get_job("work::committed")
-            attempt, = snapshot.iter_attempts(job_uid="work::committed")
-            assert attempt["outcome"] == "success"
-            assert record["started_at"] == attempt["started_at"] == launch_time
-            assert (attempt["run_id"], attempt["attempt_no"]) == (row["run_id"], row["attempt_no"])
+        for source in sources:
+            with StateSnapshot.open(source) as snapshot:
+                record = snapshot.get_job("work::committed")
+                assert list(snapshot.iter_jobs(status="succeeded")) == [record]
+                attempt, = snapshot.iter_attempts(job_uid="work::committed")
+                assert attempt["outcome"] == "success"
+                assert record["started_at"] == attempt["started_at"] == launch_time
+                assert (attempt["run_id"], attempt["attempt_no"]) == (row["run_id"], row["attempt_no"])
+        for snapshot, current in running_snapshots:
+            assert snapshot.get_job("work::committed") == current
+            assert list(snapshot.iter_jobs(status="running")) == [current]
+            assert list(snapshot.iter_attempts(job_uid="work::committed")) == []
         assert submitted == [row["execution_id"]]

@@ -115,6 +115,27 @@ def _normalize_result(raw_result: Any) -> dict[str, Any] | None:
     }
 
 
+def _build_queued_job_dict(
+    uid: str,
+    job_snap: Mapping[str, Any],
+    status: str,
+    run_id: str | None,
+    attempt_no: int | None,
+) -> dict[str, Any]:
+    """队列接纳记录不能证明 worker 实际启动；pending 不携带执行身份。"""
+    return {
+        "job_uid": uid,
+        "status": status,
+        "job": _normalize_job_config(job_snap),
+        "files": _normalize_outer_files(job_snap.get("files")),
+        "result": None,
+        "run_id": run_id if status == "running" else None,
+        "attempt_no": attempt_no if status == "running" else None,
+        "started_at": None,
+        "settled_at": None,
+    }
+
+
 def _build_succeeded_job_dict(
     uid: str,
     succ_meta: dict[str, Any],
@@ -226,27 +247,14 @@ class _SqliteSnapshotReader:
 
     def get_job(self, uid: str) -> dict[str, Any] | None:
         row = self._conn.execute(
-            "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
+            "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no "
             "FROM queue WHERE job_uid = ?",
             (uid,),
         ).fetchone()
         if row:
             job_snap = loads(row[2]) if row[2] else {}
             st = row[3] if row[3] else "pending"
-            run_id = row[4] if st == "running" else None
-            attempt_no = row[5] if st == "running" else None
-            started_at = _format_iso_z(row[6]) if st == "running" else None
-            return {
-                "job_uid": uid,
-                "status": st,
-                "job": _normalize_job_config(job_snap),
-                "files": _normalize_outer_files(job_snap.get("files")),
-                "result": None,
-                "run_id": run_id,
-                "attempt_no": attempt_no,
-                "started_at": started_at,
-                "settled_at": None,
-            }
+            return _build_queued_job_dict(uid, job_snap, st, row[4], row[5])
 
         s_row = self._conn.execute(
             "SELECT metadata FROM successes WHERE job_uid = ?", (uid,)
@@ -272,7 +280,7 @@ class _SqliteSnapshotReader:
         task_type: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         q_rows = self._conn.execute(
-            "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
+            "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no "
             "FROM queue ORDER BY queue_position ASC"
         )
 
@@ -289,20 +297,7 @@ class _SqliteSnapshotReader:
                 if tt != task_type:
                     continue
             job_snap = loads(r[2]) if r[2] else {}
-            run_id = r[4] if st == "running" else None
-            attempt_no = r[5] if st == "running" else None
-            started_at = _format_iso_z(r[6]) if st == "running" else None
-            yield {
-                "job_uid": uid,
-                "status": st,
-                "job": _normalize_job_config(job_snap),
-                "files": _normalize_outer_files(job_snap.get("files")),
-                "result": None,
-                "run_id": run_id,
-                "attempt_no": attempt_no,
-                "started_at": started_at,
-                "settled_at": None,
-            }
+            yield _build_queued_job_dict(uid, job_snap, st, r[4], r[5])
 
         if status is None or status == "succeeded":
             s_rows = self._conn.execute(
@@ -413,20 +408,9 @@ class _MemorySnapshotReader:
         for j in self._queue:
             if job_uid_from_snapshot(j) == uid:
                 st = j.get("status", "pending")
-                run_id = j.get("run_id") if st == "running" else None
-                attempt_no = j.get("attempt_no") if st == "running" else None
-                started_at = _format_iso_z(j.get("started_at")) if st == "running" else None
-                return {
-                    "job_uid": uid,
-                    "status": st,
-                    "job": _normalize_job_config(j),
-                    "files": _normalize_outer_files(j.get("files")),
-                    "result": None,
-                    "run_id": run_id,
-                    "attempt_no": attempt_no,
-                    "started_at": started_at,
-                    "settled_at": None,
-                }
+                return _build_queued_job_dict(
+                    uid, j, st, j.get("run_id"), j.get("attempt_no"),
+                )
 
         if uid in self._successes:
             succ_meta = self._successes[uid]
@@ -459,20 +443,9 @@ class _MemorySnapshotReader:
                     continue
                 if tt != task_type:
                     continue
-            run_id = j.get("run_id") if st == "running" else None
-            attempt_no = j.get("attempt_no") if st == "running" else None
-            started_at = _format_iso_z(j.get("started_at")) if st == "running" else None
-            yield {
-                "job_uid": uid,
-                "status": st,
-                "job": _normalize_job_config(j),
-                "files": _normalize_outer_files(j.get("files")),
-                "result": None,
-                "run_id": run_id,
-                "attempt_no": attempt_no,
-                "started_at": started_at,
-                "settled_at": None,
-            }
+            yield _build_queued_job_dict(
+                uid, j, st, j.get("run_id"), j.get("attempt_no"),
+            )
 
         if status is None or status == "succeeded":
             for uid, succ_meta in self._successes.items():
