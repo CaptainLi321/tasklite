@@ -220,7 +220,7 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
         (running["run_id"], 2, "failure"),
     ]
     assert attempts[1]["job"] == current
-    assert attempts[1]["started_at"] == running["started_at"]
+    assert attempts[1]["started_at"] is None
     failures = backend.load_failed()
     assert failures[uid]["job_snapshot"] == current
     assert failures[uid]["reason"] == "unsettled_running_recovery"

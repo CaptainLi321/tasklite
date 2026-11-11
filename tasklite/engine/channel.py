@@ -28,6 +28,7 @@ from ..exceptions import TaskLiteError, _ArtifactIOError
 from ..models.context import JobContext
 from ..models.job import Job
 from ..models.result import TaskResult, validate_strict_json_object
+from ..utils.clock import utc_now_iso
 from ..utils.ipc import (
     PIPE_MSG_DECLARE,
     PIPE_MSG_RESULT,
@@ -511,6 +512,7 @@ class ExecutionChannel:
                 raise _WorkerLaunchCancelled(
                     f"stop requested before worker process start for {spec.job.uid}"
                 )
+            started_at = utc_now_iso()
             p.start()
         except Exception:
             sender.close()
@@ -532,6 +534,7 @@ class ExecutionChannel:
             process=p,
             timeout_at_monotonic=timeout_at_monotonic,
             timeout_seconds=spec.timeout_seconds,
+            started_at=started_at,
             job=spec.job,
             execution_id=spec.execution_id,
             run_id=spec.run_id or None,

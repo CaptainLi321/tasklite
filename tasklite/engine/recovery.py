@@ -119,7 +119,7 @@ class RecoveryOrchestrator:
                 attempt_no=row["attempt_no"],
                 execution_id=row["execution_id"],
                 run_id=row["run_id"],
-                started_at=row["started_at"],
+                started_at=None,
             )
         return state
 

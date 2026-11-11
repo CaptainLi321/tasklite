@@ -354,7 +354,7 @@ class DispatchMachine:
         if not self._dispatch_allowed():
             store.state.requeue_jobs([job_snapshot], front=True)
             return None
-        started_at = utc_now_iso()
+        running_at = utc_now_iso()
         attempt_no = 1
 
         effective_run_id = self._session.run_id or "run"
@@ -367,12 +367,12 @@ class DispatchMachine:
                 job_uid,
                 execution_id=execution_id,
                 run_id=effective_run_id,
-                started_at=started_at,
+                started_at=running_at,
             )
             job._attempt_no = attempt_no
             job_snapshot["attempt_no"] = attempt_no
             job_snapshot["run_id"] = effective_run_id
-            job_snapshot["started_at"] = started_at
+            job_snapshot["started_at"] = running_at
         except Exception as e:
             logger.critical(
                 f"Failed to mark job running for {job_uid}: {e}; "
@@ -387,7 +387,6 @@ class DispatchMachine:
                 job_snapshot=job_snapshot,
                 execution_id=execution_id,
                 attempt_no=attempt_no,
-                started_at=started_at,
             )
             return None
 
@@ -400,7 +399,6 @@ class DispatchMachine:
                 job_snapshot=job_snapshot,
                 execution_id=execution_id,
                 attempt_no=attempt_no,
-                started_at=started_at,
             )
             return None
 
@@ -443,7 +441,6 @@ class DispatchMachine:
                 job_snapshot=job_snapshot,
                 execution_id=execution_id,
                 attempt_no=attempt_no,
-                started_at=started_at,
             )
             return None
 
@@ -455,7 +452,6 @@ class DispatchMachine:
                 execution_id,
                 acquired,
                 attempt_no=attempt_no,
-                started_at=started_at,
                 resolved_files=resolved_files,
             )
         except BaseException:
@@ -469,7 +465,6 @@ class DispatchMachine:
         job_snapshot: dict,
         execution_id: str,
         attempt_no: int,
-        started_at: str,
     ) -> None:
         """停止门越过 running 提交时，将未启动执行回退为 pending 且不写 Attempt。"""
         self._store.apply_pending(
@@ -478,7 +473,7 @@ class DispatchMachine:
             execution_id=execution_id,
             attempt_no=attempt_no,
             run_id=self._session.run_id or "run",
-            started_at=started_at,
+            started_at=None,
             error_message="stop requested before worker launch",
             record_attempt=False,
         )
@@ -562,7 +557,6 @@ class DispatchMachine:
         acquired: list[tuple[str, float]],
         *,
         attempt_no: int = 1,
-        started_at: str | None = None,
         resolved_files: dict[str, FileSpec] | None = None,
     ) -> InFlightJob | None:
         """载荷校验 → 执行上下文组装 → spawn → 在飞登记。
@@ -585,7 +579,6 @@ class DispatchMachine:
                         job_snapshot=job_snapshot,
                         execution_id=execution_id,
                         attempt_no=attempt_no,
-                        started_at=started_at or utc_now_iso(),
                     )
                     return None
                 logger.info(f"RUN: {job_uid}")
@@ -596,7 +589,6 @@ class DispatchMachine:
                         job_snapshot=job_snapshot,
                         execution_id=execution_id,
                         attempt_no=attempt_no,
-                        started_at=started_at or utc_now_iso(),
                     )
                     return None
                 started_monotonic = time.monotonic()
@@ -623,7 +615,7 @@ class DispatchMachine:
                     execution_id=execution_id,
                     attempt_no=attempt_no,
                     run_id=self._session.run_id or "run",
-                    started_at=started_at,
+                    started_at=handle.started_at,
                     known_job_uids=frozenset(
                         store.state.queue_uids
                         | store.state.in_flight_uids
@@ -643,7 +635,6 @@ class DispatchMachine:
                 job_snapshot=job_snapshot,
                 execution_id=execution_id,
                 attempt_no=attempt_no,
-                started_at=started_at or utc_now_iso(),
             )
             return None
         except AssertionError:

@@ -87,6 +87,7 @@ class JobHandle:
     paused_remaining: float | None = None
     pending_declaration: PendingDeclaration | None = None
     authorization_outcome: AuthorizationOutcome | None = None
+    started_at: str | None = None
 
     @property
     def waiting_auth(self) -> bool:
