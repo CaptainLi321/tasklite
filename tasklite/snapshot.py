@@ -118,59 +118,25 @@ def _normalize_result(raw_result: Any) -> dict[str, Any] | None:
 def _build_succeeded_job_dict(
     uid: str,
     succ_meta: dict[str, Any],
-    att: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    is_manual = (
-        succ_meta.get("annotations", {}).get("completion_source") == "manual"
+    """当前成功只投影自身档案，不从独立的 Attempt 历史补推事实。"""
+    job_snap = succ_meta.get("job_snapshot") or {}
+    outer_files = _normalize_outer_files(
+        succ_meta.get("files") or job_snap.get("files")
     )
-    if is_manual:
-        run_id = None
-        attempt_no = None
-        started_at = None
-        settled_at = _format_iso_z(
-            succ_meta.get("settled_at") or succ_meta.get("last_succeeded_at")
-        )
-        job_snap = succ_meta.get("job_snapshot") or {}
-        outer_files = _normalize_outer_files(
-            succ_meta.get("files") or job_snap.get("files")
-        )
-        result = _normalize_result(
-            succ_meta.get("result")
-            or {
-                "message": None,
-                "exception": None,
-                "metadata": {},
-                "annotations": succ_meta.get("annotations") or {},
-            }
-        )
-    else:
-        if att:
-            run_id = att.get("run_id")
-            attempt_no = att.get("attempt_no")
-            started_at = _format_iso_z(att.get("started_at"))
-            settled_at = _format_iso_z(
-                att.get("settled_at") or succ_meta.get("last_succeeded_at")
-            )
-            job_snap = att.get("job_snapshot") or succ_meta.get("job_snapshot") or {}
-            files_data = (
-                att.get("files")
-                or succ_meta.get("files")
-                or job_snap.get("files")
-            )
-            outer_files = _normalize_outer_files(files_data)
-            result = _normalize_result(att.get("result") or succ_meta.get("result"))
-        else:
-            run_id = succ_meta.get("run_id") or succ_meta.get("last_success_run_id")
-            attempt_no = succ_meta.get("attempt_no")
-            started_at = _format_iso_z(succ_meta.get("started_at"))
-            settled_at = _format_iso_z(
-                succ_meta.get("last_succeeded_at") or succ_meta.get("settled_at")
-            )
-            job_snap = succ_meta.get("job_snapshot") or {}
-            outer_files = _normalize_outer_files(
-                succ_meta.get("files") or job_snap.get("files")
-            )
-            result = _normalize_result(succ_meta.get("result"))
+    result = _normalize_result(
+        succ_meta.get("result")
+        or {
+            "message": None,
+            "exception": None,
+            "metadata": {},
+            "annotations": succ_meta.get("annotations") or {},
+        }
+    )
+    run_id = succ_meta.get("run_id")
+    attempt_no = succ_meta.get("attempt_no")
+    started_at = _format_iso_z(succ_meta.get("started_at"))
+    settled_at = _format_iso_z(succ_meta.get("settled_at"))
 
     return {
         "job_uid": uid,
@@ -258,27 +224,6 @@ class _SqliteSnapshotReader:
         self._conn = conn
         self._closed = False
 
-    def _load_latest_attempt(self, uid: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT attempt_no, run_id, outcome, started_at, settled_at, "
-            "job_snapshot, files, result, error_message "
-            "FROM attempts WHERE job_uid = ? ORDER BY attempt_id DESC LIMIT 1",
-            (uid,),
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "attempt_no": row[0],
-            "run_id": row[1],
-            "outcome": row[2],
-            "started_at": row[3],
-            "settled_at": row[4],
-            "job_snapshot": loads(row[5]) if row[5] else None,
-            "files": loads(row[6]) if row[6] else None,
-            "result": loads(row[7]) if row[7] else None,
-            "error_message": row[8],
-        }
-
     def get_job(self, uid: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
@@ -308,8 +253,7 @@ class _SqliteSnapshotReader:
         ).fetchone()
         if s_row:
             succ_meta = loads(s_row[0]) if s_row[0] else {}
-            att = self._load_latest_attempt(uid)
-            return _build_succeeded_job_dict(uid, succ_meta, att)
+            return _build_succeeded_job_dict(uid, succ_meta)
 
         f_row = self._conn.execute(
             "SELECT metadata, payload FROM failed WHERE job_uid = ?", (uid,)
@@ -377,8 +321,7 @@ class _SqliteSnapshotReader:
                     if tt != task_type:
                         continue
                 succ_meta = loads(r[1]) if r[1] else {}
-                att = self._load_latest_attempt(uid)
-                yield _build_succeeded_job_dict(uid, succ_meta, att)
+                yield _build_succeeded_job_dict(uid, succ_meta)
 
         if status is None or status == "failed":
             f_rows = self._conn.execute(
@@ -466,13 +409,6 @@ class _MemorySnapshotReader:
             self._attempts = copy.deepcopy(backend._attempts)
         self._closed = False
 
-    def _load_latest_attempt(self, uid: str) -> dict[str, Any] | None:
-        matched = [v for v in self._attempts.values() if v["job_uid"] == uid]
-        if not matched:
-            return None
-        latest = matched[-1]
-        return dict(latest, job_snapshot=latest["job"])
-
     def get_job(self, uid: str) -> dict[str, Any] | None:
         for j in self._queue:
             if job_uid_from_snapshot(j) == uid:
@@ -494,8 +430,7 @@ class _MemorySnapshotReader:
 
         if uid in self._successes:
             succ_meta = self._successes[uid]
-            att = self._load_latest_attempt(uid)
-            return _build_succeeded_job_dict(uid, succ_meta, att)
+            return _build_succeeded_job_dict(uid, succ_meta)
 
         if uid in self._failed:
             fail_meta = self._failed[uid]
@@ -550,8 +485,7 @@ class _MemorySnapshotReader:
                         continue
                     if tt != task_type:
                         continue
-                att = self._load_latest_attempt(uid)
-                yield _build_succeeded_job_dict(uid, succ_meta, att)
+                yield _build_succeeded_job_dict(uid, succ_meta)
 
         if status is None or status == "failed":
             for uid, fail_meta in self._failed.items():

@@ -634,6 +634,10 @@ class StateStore:
         """原子终态转移：成功（同事务终结对应 attempts 行 + successes 落盘 + 清失败档案残行 + 子任务/cursor）。"""
         effective_finished_at = finished_at if finished_at is not None else utc_now_iso()
         success_metadata = self._execution_record(result, files)
+        success_metadata.update(
+            run_id=run_id or "run", attempt_no=attempt_no,
+            started_at=started_at, settled_at=effective_finished_at,
+        )
         declarations = tuple(declared_artifacts)
         success_metadata["artifacts"] = {
             declaration.name: {"path": declaration.path}
