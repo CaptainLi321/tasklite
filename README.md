@@ -5,6 +5,7 @@
 > 核心解决「单线程处理耗时长」、「中途失败需全量重跑」、「子任务卡死拖垮主流程」等工程痛点。采用主控守护与物理子进程隔离架构，内置 SQLite WAL 事务持久化：已提交终态跨进程保留；异常退出遗留的 `running` 下次启动按失败收敛，未派发的 `pending` 留队，不自动接续旧执行。
 
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Version](https://img.shields.io/badge/version-3.0.0.dev0-orange.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20external-brightgreen.svg)]()
 [![ACID Persistence](https://img.shields.io/badge/persistence-SQLite%20WAL%20(ACID)-orange.svg)]()
@@ -254,6 +255,7 @@ pipeline.close()
 | :--- | :--- |
 | **[`README.md`](README.md)** | **项目门户与快速上手**：解决痛点、架构概览、安装与最小示例、常见场景 Recipes 速览、目录结构 |
 | **[`docs/GUIDE.md`](docs/GUIDE.md)** | **使用手册**：公开导入面、三层模型与 Schema 6、`JobContext` 与统一文件声明授权、失败档案与运维 API、调度扩展接缝 |
+| **[`docs/API.md`](docs/API.md)** | **公开 API 权威参考手册**：全公开类、方法、属性签名、严格 JSON 规则、返回结构与异常契约速查 |
 | **[`CONTEXT.md`](CONTEXT.md)** | **领域通用语言词典**：核心领域模型与引擎内部组件的标准术语定义及禁用词表 |
 | **[`docs/adr/`](docs/adr/)** | **架构决策记录（ADR）**：关键架构演进、设计取舍与边界裁决依据 |
 | **[`docs/ROADMAP.md`](docs/ROADMAP.md)** | **未来演进路线图**：已分析但尚未立项实施的储备方向（实施前须立项 ADR） |

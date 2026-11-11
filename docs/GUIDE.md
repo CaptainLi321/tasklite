@@ -1,6 +1,6 @@
 # TaskLite 使用手册
 
-> 本文档是 TaskLite 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、Trigger 与恢复边界、`JobContext` 与统一文件声明授权、统一状态管理与历史清理，以及只读一致状态快照（`StateSnapshot`）。项目概览与快速上手见 [`README.md`](../README.md)，架构决策记录见 [`docs/adr/`](adr/)。
+> 本文档是 TaskLite 3.0.0.dev0 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、Trigger 与恢复边界、`JobContext` 与统一文件声明授权、统一状态管理与历史清理，以及只读一致状态快照（`StateSnapshot`）。项目概览与快速上手见 [`README.md`](../README.md)，公开 API 权威参考手册见 [`docs/API.md`](API.md)，架构决策记录见 [`docs/adr/`](adr/)。
 
 ---
 
@@ -116,6 +116,9 @@ Trigger 只决定一次 Run 中已入队 Job 是否启动，不主动入队，�
 | `on_input_change` | 执行 | 按输入变化契约判断 | 执行 |
 
 同一 Run 内由 `TaskResult.retry` 产生的重试不重复求值 Trigger；新 Run 接续仍在 `pending` 的任务会重新求值。Trigger 返回 False 表示本次无需执行，不产生成功证据或 Attempt，也不等同于 `Exclude` 的留队。
+
+> [!NOTE]
+> **自定义 Trigger 扩展**：如需注册自定义 Trigger 判定函数，可通过 `pipeline.register_trigger` 注册。注意 `register_trigger` 与回调入参 `TriggerContext` 属于非稳定扩展接缝，不作稳定兼容承诺；详细签名与参数契约见 [`docs/API.md`](API.md#24-注册接口资源任务与触发规则)。
 
 ### Attempt：执行轨迹（append-only 旁路面）
 

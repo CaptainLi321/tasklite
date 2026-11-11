@@ -9,6 +9,7 @@
 | 涉及内容 | 权威文档 |
 | --- | --- |
 | 项目概览、安装、快速上手与导航 | [README.md](README.md) |
+| 公开 API 权威参考手册与详细规范 | [docs/API.md](docs/API.md) |
 | 公开接口、调用顺序、状态语义及架构边界 | [docs/GUIDE.md](docs/GUIDE.md) |
 | 领域术语、组件职责与禁用同义词 | [CONTEXT.md](CONTEXT.md) |
 | 架构决策与取舍 | [docs/adr/](docs/adr/)；修改结算、持久化、授权、停止或恢复时先读 [ADR-0011](docs/adr/0011-stable-interface-baseline.md) |

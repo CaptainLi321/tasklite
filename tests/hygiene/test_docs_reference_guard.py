@@ -13,11 +13,13 @@ tests/xxx.py、tasklite/xxx.py、scripts/xxx 的文件路径引用（反引号�
 SQLite/内存状态、快照查询与文件声明，防止文档接口漂移。
 """
 
+import ast
 import os
 import pathlib
 import re
 import subprocess
 import sys
+import textwrap
 
 import pytest
 
@@ -27,6 +29,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 SCANNED_DOCS = (
     ROOT / "README.md",
     ROOT / "docs" / "GUIDE.md",
+    ROOT / "docs" / "API.md",
 )
 
 # 路径引用提取模式：三种前缀之一开头，后接常规路径字符。
@@ -58,6 +61,32 @@ def _minimal_example(doc: pathlib.Path, heading: str) -> str:
     block_end = text.find("\n```", code_at)
     assert block_end >= 0, f"{doc.name} 最小示例代码围栏未闭合"
     return text[code_at:block_end]
+
+
+def _extract_doc_tasklite_imports(doc: pathlib.Path) -> list[tuple[int, str]]:
+    """提取文档中所有 python 代码块内针对 tasklite 的 import 语句（源码片段）。
+
+    通过 AST 解析准确提取 import / from ... import 语句；
+    若代码块存在语法错误直接抛出，杜绝将语法异常静默当空检查。
+    """
+    text = doc.read_text(encoding="utf-8")
+    blocks = re.findall(r"```python\n(.+?)```", text, flags=re.DOTALL)
+    imports = []
+    for block in blocks:
+        dedented = textwrap.dedent(block)
+        tree = ast.parse(dedented)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and (node.module or "").startswith("tasklite")
+            ) or (
+                isinstance(node, ast.Import)
+                and any(alias.name.startswith("tasklite") for alias in node.names)
+            ):
+                seg = ast.get_source_segment(dedented, node)
+                assert seg is not None
+                imports.append((getattr(node, "lineno", 1), seg))
+    return imports
 
 
 @pytest.mark.parametrize("doc", SCANNED_DOCS, ids=lambda d: d.name)
@@ -116,3 +145,16 @@ def test_doc_minimal_example_runs_with_real_spawn(
     assert (tmp_path / "output" / "files" / "item_2.txt").read_text(
         encoding="utf-8"
     ) == "示例二"
+
+
+@pytest.mark.parametrize("doc", SCANNED_DOCS, ids=lambda d: d.name)
+def test_doc_tasklite_imports_are_valid(doc: pathlib.Path) -> None:
+    """文档中所有标注为 python 的导入块必须准确导入且在真实环境中执行成功。"""
+    assert doc.exists(), f"待扫描文档不存在：{doc}"
+    imports = _extract_doc_tasklite_imports(doc)
+    assert len(imports) > 0, f"{doc.name} 未提取到任何 tasklite 导入语句，门禁可能退化"
+    for lineno, stmt in imports:
+        scope: dict = {}
+        compiled = compile(stmt, f"<{doc.name}:{lineno}>", "exec")
+        exec(compiled, scope)
+
