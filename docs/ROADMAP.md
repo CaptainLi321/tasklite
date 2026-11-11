@@ -63,7 +63,7 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 
 目标契约与接口标准集中见 [ADR-0011](adr/0011-stable-interface-baseline.md)。稳定承诺限常用 Interface、官方内置能力使用方式与已确认身份接口；不开放资源／文件扩展，调度扩展暂不承诺兼容，可选工具暂不承诺兼容，不开放自定义后端接口。旧库不提供原地迁移。
 
-公开 Interface 的覆盖审计见 [ADR-0011 覆盖清单](adr/0011-interface-coverage.md)。原实施证据见[历史 ticket 归档](tickets/adr-0011/README.md)；当前修复与最终验收见[执行计划](tickets/adr-0011-review/plan.md)。行为契约以 ADR-0011 与 [GUIDE](GUIDE.md) 为准。
+公开 Interface 的覆盖审计见 [ADR-0011 覆盖清单](adr/0011-interface-coverage.md)。行为契约以 ADR-0011 与 [GUIDE](GUIDE.md) 为准。
 
 ### Module 实现地图
 

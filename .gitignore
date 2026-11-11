@@ -63,3 +63,6 @@ _vcheck.txt
 .venv*/
 security_audit/
 reports/
+
+# 本地执行计划与过程记录
+/docs/tickets/
