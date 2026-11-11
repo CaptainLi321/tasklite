@@ -509,6 +509,8 @@ class EngineRuntime:
     def request_stop(self) -> StopMode:
         """停机请求接口（单调状态转移，委托 RunSession，并唤醒运行循环）。"""
         with self._dispatch_start_lock:
+            if not self._is_running:
+                return self._session.stop_mode
             mode = self._session.request_stop()
         for handle in self._in_flight.active_handles():
             request = handle.pending_declaration
@@ -528,19 +530,22 @@ class EngineRuntime:
         """完整执行管线生命周期。"""
         opts = options if options is not None else ExecutionOptions()
 
-        # 不变式：run() 重入守卫——同一实例并发 execute 必须 fail-loud 拒绝
-        if self._is_running:
-            raise TaskLiteError("Pipeline run() already in progress on this instance.")
-        self._is_running = True
-        self._exclude = opts.exclude
-        self._temporary_excluded_uids.clear()
-        self.scheduler.reset_run(opts.exclude)
-        self.store.set_run_exclusions(opts.exclude, self._temporary_excluded_uids)
-        self.selection_machine.set_exclusions(opts.exclude, self._temporary_excluded_uids)
+        # 会话复位与活跃发布必须原子完成；接纳 stop 后本 Run 不再复位会话。
+        with self._dispatch_start_lock:
+            if self._is_running:
+                raise TaskLiteError("Pipeline run() already in progress on this instance.")
+            self._session.begin()
+            self._is_running = True
 
         old_sigterm = None
         old_sigint = None
         try:
+            self._exclude = opts.exclude
+            self._temporary_excluded_uids.clear()
+            self.scheduler.reset_run(opts.exclude)
+            self.store.set_run_exclusions(opts.exclude, self._temporary_excluded_uids)
+            self.selection_machine.set_exclusions(opts.exclude, self._temporary_excluded_uids)
+
             # 1. 单运行排他锁
             if hasattr(self.store.backend, "path") and self.store.backend.path is not None:
                 self._run_lock_fd = try_acquire_lock(self.store.backend.path, timeout=0)
@@ -565,43 +570,36 @@ class EngineRuntime:
             if opts.install_signals:
                 old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
                 old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
-        except BaseException:
-            if old_sigterm is not None:
-                signal.signal(signal.SIGTERM, old_sigterm)
-            if old_sigint is not None:
-                signal.signal(signal.SIGINT, old_sigint)
-            if self._run_lock_fd is not None:
-                release_lock(self._run_lock_fd)
-                self._run_lock_fd = None
-            if getattr(self, "_run_memory_locked", False):
-                if hasattr(self.store.backend, "_exec_lock") and self.store.backend._exec_lock.locked():
-                    self.store.backend._exec_lock.release()
-                self._run_memory_locked = False
-            self._is_running = False
-            raise
 
-        try:
             self._preflight_picklable_handlers()
-            self._session.begin()
             self.governor.reset()
-
             self._run_body()
-
         finally:
-            self.config.resources.unbind_notifier()
-            if self._run_lock_fd is not None:
-                release_lock(self._run_lock_fd)
-                self._run_lock_fd = None
-            if getattr(self, "_run_memory_locked", False):
-                if hasattr(self.store.backend, "_exec_lock") and self.store.backend._exec_lock.locked():
-                    self.store.backend._exec_lock.release()
-                self._run_memory_locked = False
-            self._is_running = False
-
-            if old_sigterm is not None:
-                signal.signal(signal.SIGTERM, old_sigterm)
-            if old_sigint is not None:
-                signal.signal(signal.SIGINT, old_sigint)
+            # 初始化和收尾的任一故障都不能绕过执行权释放与活跃状态撤回。
+            try:
+                self.config.resources.unbind_notifier()
+            finally:
+                try:
+                    if self._run_lock_fd is not None:
+                        release_lock(self._run_lock_fd)
+                        self._run_lock_fd = None
+                finally:
+                    try:
+                        if getattr(self, "_run_memory_locked", False):
+                            if hasattr(self.store.backend, "_exec_lock") and self.store.backend._exec_lock.locked():
+                                self.store.backend._exec_lock.release()
+                            self._run_memory_locked = False
+                    finally:
+                        try:
+                            try:
+                                if old_sigterm is not None:
+                                    signal.signal(signal.SIGTERM, old_sigterm)
+                            finally:
+                                if old_sigint is not None:
+                                    signal.signal(signal.SIGINT, old_sigint)
+                        finally:
+                            with self._dispatch_start_lock:
+                                self._is_running = False
 
     # ── 四相事件泵 ────────────────────────────────────────────────────
 

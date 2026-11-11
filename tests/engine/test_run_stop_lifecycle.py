@@ -56,6 +56,229 @@ def lingering_success_handler(job, ctx):
     return TaskResult.success()
 
 
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("stage", ["preflight", "governor", "exclusions"])
+def test_stop_during_initialization_is_preserved(tmp_path, monkeypatch, backend, stage):
+    effect = tmp_path / "effect"
+    with TaskLite(
+        backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None,
+    ) as pipeline:
+        pipeline.register_task("work", write_effect_handler)
+        pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
+        runtime = pipeline._runtime
+        runtime.session.record_retry("work::one")
+        entered, proceed = threading.Event(), threading.Event()
+        errors = []
+        target, name = {
+            "preflight": (runtime, "_preflight_picklable_handlers"),
+            "governor": (runtime.governor, "reset"),
+            "exclusions": (runtime.scheduler, "reset_run"),
+        }[stage]
+        original = getattr(target, name)
+
+        def blocked(*args, **kwargs):
+            entered.set()
+            assert proceed.wait(10)
+            return original(*args, **kwargs)
+
+        def run():
+            try:
+                pipeline.run(install_signals=False)
+            except BaseException as error:
+                errors.append(error)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(target, name, blocked)
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                assert entered.wait(10)
+                assert pipeline.is_running
+                assert runtime.session.get_retry_count("work::one") == 0
+                pipeline.stop()
+                assert runtime.stop_mode == StopMode.DRAINING
+            finally:
+                proceed.set()
+                thread.join(10)
+            assert not thread.is_alive()
+            assert errors == []
+        with StateSnapshot.open(pipeline) as state:
+            job = state.get_job("work::one")
+            assert job is not None and job["status"] == "pending"
+            assert list(state.iter_attempts()) == []
+        assert not effect.exists()
+        assert not pipeline.is_running
+        pipeline.stop()
+        pipeline.run(install_signals=False)
+        assert effect.read_text() == "started"
+        with StateSnapshot.open(pipeline) as state:
+            assert [a["outcome"] for a in state.iter_attempts()] == ["success"]
+        assert runtime.stop_mode == StopMode.NONE
+
+
+def test_stop_during_execution_lock_acquisition_is_preserved(tmp_path, monkeypatch):
+    import tasklite.engine.runtime as runtime_module
+
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
+        pipeline.register_task("work", success_handler)
+        pipeline.enqueue(Job("work", "one"))
+        entered, proceed = threading.Event(), threading.Event()
+        original = runtime_module.try_acquire_lock
+        errors = []
+
+        def blocked(*args, **kwargs):
+            entered.set()
+            assert proceed.wait(10)
+            return original(*args, **kwargs)
+
+        def run():
+            try:
+                pipeline.run(install_signals=False)
+            except BaseException as error:
+                errors.append(error)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_module, "try_acquire_lock", blocked)
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                assert entered.wait(10)
+                pipeline.stop()
+            finally:
+                proceed.set()
+                thread.join(10)
+            assert not thread.is_alive()
+            assert errors == []
+        with StateSnapshot.open(pipeline) as state:
+            assert state.get_job("work::one")["status"] == "pending"
+            assert list(state.iter_attempts()) == []
+        pipeline.run(install_signals=False)
+        with StateSnapshot.open(pipeline) as state:
+            assert [a["outcome"] for a in state.iter_attempts()] == ["success"]
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("stage", ["preflight", "governor", "exclusions", "unbind"])
+def test_initialization_failure_releases_run_for_retry(tmp_path, monkeypatch, backend, stage):
+    with TaskLite(
+        backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None,
+    ) as pipeline:
+        runtime = pipeline._runtime
+        target, name = {
+            "preflight": (runtime, "_preflight_picklable_handlers"),
+            "governor": (runtime.governor, "reset"),
+            "exclusions": (runtime.scheduler, "reset_run"),
+            "unbind": (runtime.config.resources, "unbind_notifier"),
+        }[stage]
+        error = RuntimeError("initialization failed")
+
+        def fail(*args, **kwargs):
+            raise error
+
+        with monkeypatch.context() as patch:
+            patch.setattr(target, name, fail)
+            with pytest.raises(RuntimeError) as raised:
+                pipeline.run(install_signals=False)
+            assert raised.value is error
+        assert not pipeline.is_running
+        pipeline.run(install_signals=False)
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_signal_during_installation_is_preserved_and_handlers_restored(
+    tmp_path, monkeypatch, fail_second,
+):
+    import tasklite.engine.runtime as runtime_module
+
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
+        pipeline.register_task("work", success_handler)
+        pipeline.enqueue(Job("work", "one"))
+        originals = {signal.SIGTERM: object(), signal.SIGINT: object()}
+        handlers = originals.copy()
+        error = RuntimeError("signal installation failed")
+
+        def install(signum, handler):
+            previous = handlers[signum]
+            if handler == pipeline._runtime._handle_signal:
+                if signum == signal.SIGINT and fail_second:
+                    raise error
+                handlers[signum] = handler
+                handler(signum, None)
+            else:
+                handlers[signum] = handler
+            return previous
+
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_module.signal, "signal", install)
+            if fail_second:
+                with pytest.raises(RuntimeError) as raised:
+                    pipeline.run()
+                assert raised.value is error
+            else:
+                pipeline.run()
+        assert handlers == originals
+        assert not pipeline.is_running
+        with StateSnapshot.open(pipeline) as state:
+            assert state.get_job("work::one")["status"] == "pending"
+            assert list(state.iter_attempts()) == []
+        pipeline.run(install_signals=False)
+        with StateSnapshot.open(pipeline) as state:
+            assert [a["outcome"] for a in state.iter_attempts()] == ["success"]
+
+
+def test_stop_arriving_after_run_exit_does_not_mutate_session(tmp_path, monkeypatch):
+    with TaskLite(backend="memory") as pipeline:
+        runtime = pipeline._runtime
+        entered, proceed = threading.Event(), threading.Event()
+        stop_entered, stop_proceed = threading.Event(), threading.Event()
+        original_preflight = runtime._preflight_picklable_handlers
+        original_stop = runtime.request_stop
+        errors = []
+
+        def preflight():
+            entered.set()
+            assert proceed.wait(10)
+            original_preflight()
+
+        def delayed_stop():
+            stop_entered.set()
+            assert stop_proceed.wait(10)
+            return original_stop()
+
+        def run():
+            try:
+                pipeline.run(install_signals=False)
+            except BaseException as error:
+                errors.append(error)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime, "_preflight_picklable_handlers", preflight)
+            patch.setattr(runtime, "request_stop", delayed_stop)
+            run_thread = threading.Thread(target=run)
+            stop_thread = threading.Thread(target=pipeline.stop)
+            run_thread.start()
+            try:
+                assert entered.wait(10)
+                stop_thread.start()
+                assert stop_entered.wait(10)
+            finally:
+                proceed.set()
+                run_thread.join(10)
+                stop_proceed.set()
+                if stop_thread.ident is not None:
+                    stop_thread.join(10)
+            assert not run_thread.is_alive()
+            assert not stop_thread.is_alive()
+            assert errors == []
+        assert not pipeline.is_running
+        assert runtime.stop_mode == StopMode.NONE
+        pipeline.register_task("work", success_handler)
+        pipeline.enqueue(Job("work", "one"))
+        pipeline.run(install_signals=False)
+        with StateSnapshot.open(pipeline) as state:
+            assert [a["outcome"] for a in state.iter_attempts()] == ["success"]
+
+
 def test_stop_in_initial_authorizer_keeps_job_pending(tmp_path, monkeypatch):
     monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
     effect = tmp_path / "effect.txt"

@@ -457,8 +457,6 @@ class TaskLite:
         """
         if self._closed:
             raise TaskLiteError("Cannot call stop() on a closed TaskLite instance.")
-        if not self.is_running:
-            return
         self._runtime.request_stop()
 
     def run(

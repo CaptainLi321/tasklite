@@ -214,14 +214,13 @@ class TestEngineRuntimeConfiguration:
         assert runtime.tasks is env.tasks
         assert runtime.state is runtime.store.state
 
-    def test_stop_state_transitions(self, tmp_path):
+    def test_inactive_stop_keeps_session_unchanged(self, tmp_path):
         runtime = RuntimeEnv(tmp_path).runtime
 
         assert runtime.stop_mode == StopMode.NONE
-        # 首次 stop() -> DRAINING
-        assert runtime.request_stop() == StopMode.DRAINING
-        # 二次 stop 保持 DRAINING（幂等，不升级强停）
-        assert runtime.request_stop() == StopMode.DRAINING
+        assert runtime.request_stop() == StopMode.NONE
+        assert runtime.request_stop() == StopMode.NONE
+        assert runtime.stop_mode == StopMode.NONE
 
 
 # ── step 单步事件泵 ──────────────────────────────────────────────────
@@ -242,7 +241,7 @@ class TestEngineRuntimeStepPump:
     def test_step_draining_mode(self, tmp_path):
         runtime = RuntimeEnv(tmp_path).runtime
 
-        runtime.request_stop()
+        runtime.session.request_stop()
         outcome_draining = runtime.step()
         assert outcome_draining.exit_reason == "stopped_draining"
         assert outcome_draining.should_terminate is True
@@ -300,7 +299,7 @@ class TestEngineRuntimeExecutionLifecycle:
         assert first_run_id
 
         runtime.session.record_retry("t::j1")
-        runtime.request_stop()
+        runtime.session.request_stop()
 
         runtime.execute()
         assert runtime.session.run_id != first_run_id
