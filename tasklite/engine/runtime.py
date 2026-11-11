@@ -21,6 +21,7 @@ from typing import Any
 from .config import RunConfig
 from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
 from .execution_access import exclusive_state_access
+from .files import FileSpecResolver
 from .channel import ExecutionChannel
 from .completion import CompletionMachine
 from .resource import RunNotifier
@@ -121,6 +122,7 @@ class EngineRuntime:
             in_flight=self._in_flight,
             completion=self._completion,
         )
+        self.file_resolver = FileSpecResolver(self.store)
         self._dispatch_start_lock = threading.RLock()
         self._dispatch = DispatchMachine(
             store=self.store,
@@ -136,6 +138,7 @@ class EngineRuntime:
             output_roots=config.output_roots,
             protected_roots=config.protected_roots,
             dispatch_start_lock=self._dispatch_start_lock,
+            file_resolver=self.file_resolver,
         )
 
         self._is_running: bool = False
@@ -226,45 +229,16 @@ class EngineRuntime:
             }
 
         # 2. 上游产物引用解析
-        if source_spec.is_output_ref:
-            assert source_spec.producer_uid is not None and source_spec.output_name is not None
-            if source_spec.producer_uid not in handle.job.depends_on:
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": f"Producer {source_spec.producer_uid} not in explicit direct depends_on",
-                }
-            producer_artifacts = self.store.state.successes.get(
-                source_spec.producer_uid, {}
-            ).get("artifacts", {})
-            desc = producer_artifacts.get(source_spec.output_name)
-            if not desc or "path" not in desc:
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": (
-                        f"Producer {source_spec.producer_uid} did not publish "
-                        f"output {source_spec.output_name}"
-                    ),
-                }
-            resolved_path = desc["path"]
-            if source_spec.role == "input" and not os.path.exists(resolved_path):
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": f"Missing input file: {resolved_path}",
-                }
-            bound_spec = source_spec.bind_output_path(resolved_path)
-        else:
-            bound_spec = source_spec.resolve_against(self.store.base_dir)
-            assert bound_spec.path is not None
-            resolved_path = bound_spec.path
-            if source_spec.role == "input" and not os.path.exists(resolved_path):
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": f"Missing input file: {resolved_path}",
-                }
+        try:
+            bound_spec = self.file_resolver.resolve(source_spec, depends_on=handle.job.depends_on)
+        except Exception as exc:
+            return {
+                "request_id": req_id,
+                "status": "error",
+                "error": str(exc),
+            }
+        assert bound_spec.path is not None
+        resolved_path = bound_spec.path
 
         needs_authorization = (
             bound_spec.delete_existing

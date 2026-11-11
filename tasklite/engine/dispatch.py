@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from .admission import TriggerRegistry
     from .channel import ExecutionChannel
     from .completion import CompletionMachine
+    from .files import FileSpecResolver
     from .in_flight import InFlightTracker
     from .recovery import RecoveryOrchestrator
     from .resource import ResourceManager
@@ -109,6 +110,7 @@ class DispatchMachine:
         output_roots: "Path | Sequence[Path] | None",
         protected_roots: tuple[Path, ...] = (),
         dispatch_start_lock: Any | None = None,
+        file_resolver: "FileSpecResolver | None" = None,
     ) -> None:
         self._store = store
         self._scheduler = scheduler
@@ -127,6 +129,10 @@ class DispatchMachine:
             protected_roots=protected_roots,
             authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
         )
+        if file_resolver is None:
+            from .files import FileSpecResolver
+            file_resolver = FileSpecResolver(store)
+        self._file_resolver = file_resolver
         self._authorization_pending: tuple[str | None, str, str] | None = None
         self._dispatch_start_lock = dispatch_start_lock or threading.RLock()
 
@@ -658,31 +664,11 @@ class DispatchMachine:
 
     def _resolve_job_files(self, job: Job) -> dict[str, FileSpec]:
         """准入前解析预声明文件（普通路径绝对化、上游产物引用解析与输入存在性校验）。"""
-        store = self._store
         resolved: dict[str, FileSpec] = {}
         for name, spec in job.files.items():
-            if spec.is_output_ref:
-                assert spec.producer_uid is not None and spec.output_name is not None
-                if spec.producer_uid not in job.depends_on:
-                    raise TaskLiteError(
-                        f"Producer {spec.producer_uid!r} not in explicit direct depends_on {list(job.depends_on)!r}"
-                    )
-                producer_artifacts = store.state.successes.get(spec.producer_uid, {}).get("artifacts", {})
-                desc = producer_artifacts.get(spec.output_name)
-                if not desc or "path" not in desc:
-                    raise TaskLiteError(
-                        f"Producer {spec.producer_uid!r} did not publish output {spec.output_name!r}"
-                    )
-                resolved_path = desc["path"]
-                if spec.role == "input" and not os.path.exists(resolved_path):
-                    raise FileNotFoundError(f"Missing input file: {resolved_path}")
-                bound_spec = spec.bind_output_path(resolved_path, base_dir=self._trigger_registry.base_dir)
-            else:
-                bound_spec = spec.resolve_against(self._trigger_registry.base_dir)
-                assert bound_spec.path is not None
-                resolved_path = bound_spec.path
-                if spec.role == "input" and not os.path.exists(resolved_path):
-                    raise FileNotFoundError(f"Missing input file: {resolved_path}")
+            bound_spec = self._file_resolver.resolve(spec, depends_on=job.depends_on)
+            assert bound_spec.path is not None
+            resolved_path = bound_spec.path
             if bound_spec.delete_existing or bound_spec.delete_on_success or bound_spec.delete_on_failure:
                 validated_path = self._path_policy.resolve(
                     resolved_path, delete_existing=bound_spec.delete_existing,
