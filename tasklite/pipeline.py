@@ -6,11 +6,9 @@
 """
 from __future__ import annotations
 
-import contextlib
 import logging
 import multiprocessing as mp
 import os
-import threading
 from pathlib import Path
 from typing import Any, Callable, Collection, Literal, Sequence
 
@@ -21,6 +19,7 @@ from .engine.admission import TriggerRegistry
 from .models.trigger import TriggerContext
 from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig
+from .engine.execution_access import exclusive_state_access
 from .engine.governor import DeadlockGovernor
 from .engine.ops import OpsConsole
 from .engine.resource import CapacityResource, Resource, ResourceManager
@@ -30,7 +29,6 @@ from .exceptions import TaskLiteError
 from .models.job import Job, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry
 from .selection import Exclude
-from .utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
 
@@ -246,35 +244,6 @@ class TaskLite:
                 f"current run is in progress."
             )
 
-    @contextlib.contextmanager
-    def _management_lock(self):
-        """Run 外写操作库级互斥保护。"""
-        if self.state_path is not None:
-            fd = try_acquire_lock(self.state_path, timeout=0)
-            if fd is None:
-                raise TaskLiteError(
-                    f"Another run() or management operation is in progress for "
-                    f"{self.state_path}; concurrent operations on the same state are forbidden."
-                )
-            try:
-                yield
-            finally:
-                release_lock(fd)
-        else:
-            backend = self._snapshot_backend()
-            if not hasattr(backend, "_exec_lock"):
-                backend._exec_lock = threading.Lock()
-            if not backend._exec_lock.acquire(blocking=False):
-                raise TaskLiteError(
-                    "Another run() or management operation is in progress; "
-                    "concurrent operations on the same state are forbidden."
-                )
-            try:
-                yield
-            finally:
-                if backend._exec_lock.locked():
-                    backend._exec_lock.release()
-
     # ── 注册面（六步之二/三）───────────────────────────────────────
 
     def register_resource(self, resource: Resource) -> None:
@@ -378,7 +347,7 @@ class TaskLite:
             raise TaskLiteError(
                 f"enqueue() expects a Job, got {type(job).__name__}"
             )
-        with self._management_lock():
+        with exclusive_state_access(self._runtime.store.backend):
             inserted = self._runtime.store.enqueue_job(job)
             if inserted:
                 logger.info("Enqueued 1 job(s).")
@@ -398,7 +367,7 @@ class TaskLite:
     ) -> None:
         """人工设置作业状态（pending/succeeded/failed），限 Run 外。"""
         self._ensure_active("set_job_status")
-        with self._management_lock():
+        with exclusive_state_access(self._runtime.store.backend):
             self._runtime.store.set_job_status(
                 job_or_uid, status, recursive=recursive, note=note
             )
@@ -411,7 +380,7 @@ class TaskLite:
     ) -> int:
         """从指定档案和/或 Attempt 历史中删除单个 job 的记录，限 Run 外。"""
         self._ensure_active("clear_history")
-        with self._management_lock():
+        with exclusive_state_access(self._runtime.store.backend):
             return self._console.clear_history(uid, records=records)
 
     def get_cursor(self, key: str) -> str | None:
@@ -422,7 +391,7 @@ class TaskLite:
     def set_cursor(self, key: str, value: str | None) -> None:
         """设置或删除游标键值，写入直接持久化提交，限 Run 外。"""
         self._ensure_active("set_cursor")
-        with self._management_lock():
+        with exclusive_state_access(self._runtime.store.backend):
             self._runtime.store.set_cursor(key, value)
 
     @property
@@ -444,7 +413,7 @@ class TaskLite:
     def revoke_authorization(self, path: str | Path) -> bool:
         """按规范绝对路径精确撤销授权，限 Run 外。"""
         self._ensure_active("revoke_authorization")
-        with self._management_lock():
+        with exclusive_state_access(self._runtime.store.backend):
             return self._runtime.store.revoke_authorization(path)
 
     # ── 运行与停机（六步之五/六）───────────────────────────────────

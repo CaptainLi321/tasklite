@@ -20,6 +20,7 @@ from typing import Any
 
 from .config import RunConfig
 from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
+from .execution_access import exclusive_state_access
 from .channel import ExecutionChannel
 from .completion import CompletionMachine
 from .resource import RunNotifier
@@ -52,7 +53,6 @@ from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..selection import Exclude
 from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
-from ..utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
 
@@ -138,8 +138,6 @@ class EngineRuntime:
             dispatch_start_lock=self._dispatch_start_lock,
         )
 
-        self._run_lock_fd: int | None = None
-        self._run_memory_locked: bool = False
         self._is_running: bool = False
         self._exclude: Exclude | None = None
         self._temporary_excluded_uids: set[str] = set()
@@ -546,60 +544,29 @@ class EngineRuntime:
             self.store.set_run_exclusions(opts.exclude, self._temporary_excluded_uids)
             self.selection_machine.set_exclusions(opts.exclude, self._temporary_excluded_uids)
 
-            # 1. 单运行排他锁
-            if hasattr(self.store.backend, "path") and self.store.backend.path is not None:
-                self._run_lock_fd = try_acquire_lock(self.store.backend.path, timeout=0)
-                if self._run_lock_fd is None:
-                    raise TaskLiteError(
-                        f"Another run() or management operation is in progress for "
-                        f"{self.store.backend.path}; concurrent runs on the same "
-                        f"state are forbidden."
-                    )
-            else:
-                backend = self.store.backend
-                if not hasattr(backend, "_exec_lock"):
-                    backend._exec_lock = threading.Lock()
-                if not backend._exec_lock.acquire(blocking=False):
-                    raise TaskLiteError(
-                        "Another run() or management operation is in progress; "
-                        "concurrent runs on the same state are forbidden."
-                    )
-                self._run_memory_locked = True
-
-            # 2. 信号陷阱（主线程安装，失败抛出不静默忽略）
-            if opts.install_signals:
-                old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
-                old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
-
-            self._preflight_picklable_handlers()
-            self.governor.reset()
-            self._run_body()
-        finally:
-            # 初始化和收尾的任一故障都不能绕过执行权释放与活跃状态撤回。
-            try:
-                self.config.resources.unbind_notifier()
-            finally:
+            with exclusive_state_access(self.store.backend):
                 try:
-                    if self._run_lock_fd is not None:
-                        release_lock(self._run_lock_fd)
-                        self._run_lock_fd = None
+                    # 主线程安装信号处理器；失败仍由作用域归还执行权。
+                    if opts.install_signals:
+                        old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
+                        old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
+
+                    self._preflight_picklable_handlers()
+                    self.governor.reset()
+                    self._run_body()
                 finally:
-                    try:
-                        if getattr(self, "_run_memory_locked", False):
-                            if hasattr(self.store.backend, "_exec_lock") and self.store.backend._exec_lock.locked():
-                                self.store.backend._exec_lock.release()
-                            self._run_memory_locked = False
-                    finally:
-                        try:
-                            try:
-                                if old_sigterm is not None:
-                                    signal.signal(signal.SIGTERM, old_sigterm)
-                            finally:
-                                if old_sigint is not None:
-                                    signal.signal(signal.SIGINT, old_sigint)
-                        finally:
-                            with self._dispatch_start_lock:
-                                self._is_running = False
+                    self.config.resources.unbind_notifier()
+        finally:
+            try:
+                try:
+                    if old_sigterm is not None:
+                        signal.signal(signal.SIGTERM, old_sigterm)
+                finally:
+                    if old_sigint is not None:
+                        signal.signal(signal.SIGINT, old_sigint)
+            finally:
+                with self._dispatch_start_lock:
+                    self._is_running = False
 
     # ── 四相事件泵 ────────────────────────────────────────────────────
 
@@ -966,14 +933,7 @@ class EngineRuntime:
                 ) from e
 
     def close(self) -> None:
-        """释放运行期资源（通道、锁等）。"""
-        if self._run_lock_fd is not None:
-            release_lock(self._run_lock_fd)
-            self._run_lock_fd = None
-        if getattr(self, "_run_memory_locked", False):
-            if hasattr(self.store.backend, "_exec_lock") and self.store.backend._exec_lock.locked():
-                self.store.backend._exec_lock.release()
-            self._run_memory_locked = False
+        """释放运行期通道资源。"""
         self.channel.close()
 
 

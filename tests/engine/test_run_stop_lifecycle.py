@@ -117,13 +117,13 @@ def test_stop_during_initialization_is_preserved(tmp_path, monkeypatch, backend,
 
 
 def test_stop_during_execution_lock_acquisition_is_preserved(tmp_path, monkeypatch):
-    import tasklite.engine.runtime as runtime_module
+    import tasklite.engine.execution_access as access_module
 
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
         pipeline.register_task("work", success_handler)
         pipeline.enqueue(Job("work", "one"))
         entered, proceed = threading.Event(), threading.Event()
-        original = runtime_module.try_acquire_lock
+        original = access_module.try_acquire_lock
         errors = []
 
         def blocked(*args, **kwargs):
@@ -138,7 +138,7 @@ def test_stop_during_execution_lock_acquisition_is_preserved(tmp_path, monkeypat
                 errors.append(error)
 
         with monkeypatch.context() as patch:
-            patch.setattr(runtime_module, "try_acquire_lock", blocked)
+            patch.setattr(access_module, "try_acquire_lock", blocked)
             thread = threading.Thread(target=run)
             thread.start()
             try:

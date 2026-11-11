@@ -19,6 +19,7 @@ from tasklite.engine.admission import ImmediateRequeuePolicy, TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.config import RunConfig
 
+from tasklite.engine.execution_access import exclusive_state_access
 from tasklite.engine.governor import DeadlockGovernor
 from tasklite.engine.resource import CapacityResource, ResourceManager
 from tasklite.engine.runtime import EngineRuntime
@@ -315,7 +316,8 @@ class TestEngineRuntimeExecutionLifecycle:
         with pytest.raises(TaskLiteError, match="not picklable"):
             env.runtime.execute()
         assert not env.runtime.is_running
-        assert env.runtime._run_lock_fd is None
+        with exclusive_state_access(env.backend):
+            pass
 
         # 预检故障不留残留状态：同实例复跑仍稳定 fail-loud 且逐次复位
         with pytest.raises(TaskLiteError, match="not picklable"):
@@ -337,7 +339,6 @@ class TestEngineRuntimeExecutionLifecycle:
             lock_fd = try_acquire_lock(env.backend.path)
             assert lock_fd is not None
         else:
-            env.backend._exec_lock = threading.Lock()
             assert env.backend._exec_lock.acquire(blocking=False)
         try:
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):
@@ -362,7 +363,7 @@ class TestEngineRuntimeInitFailureSafety:
     def test_lock_env_failure_resets_running_and_allows_rerun(self, tmp_path, monkeypatch):
         """锁获取抛 OSError（权限/磁盘满类环境故障）后标志复位、锁无
         泄漏、可复跑。"""
-        import tasklite.engine.runtime as runtime_module
+        import tasklite.engine.execution_access as access_module
 
         env = RuntimeEnv(
             tmp_path, name="test_env_failure", persistent=True,
@@ -371,20 +372,41 @@ class TestEngineRuntimeInitFailureSafety:
         def _raise_env_failure(state_path, *, timeout=0):
             raise OSError(13, "Permission denied")
 
-        monkeypatch.setattr(runtime_module, "try_acquire_lock", _raise_env_failure)
+        monkeypatch.setattr(access_module, "try_acquire_lock", _raise_env_failure)
         with pytest.raises(OSError):
             env.runtime.execute()
 
-        # 故障路径收尾：运行标志复位、无锁 fd 残留
+        # 获取失败也必须撤回运行标志。
         assert not env.runtime.is_running
-        assert env.runtime._run_lock_fd is None
 
         # 故障注入解除后，同实例可正常启动并完成（复跑成功同时证明锁已
         # 释放：遗留 fd 的 flock 会让下一次 try_acquire_lock 返回 None）
         monkeypatch.undo()
         assert env.runtime.execute() is None
         assert not env.runtime.is_running
-        assert env.runtime._run_lock_fd is None
+        with exclusive_state_access(env.backend):
+            pass
+
+    @pytest.mark.parametrize("persistent", [False, True])
+    def test_notifier_unbind_failure_returns_access(self, tmp_path, monkeypatch, persistent):
+        env = RuntimeEnv(tmp_path, persistent=persistent)
+
+        def fail_unbind():
+            # 收尾仍持执行权，且收尾本身失败也不能泄漏执行权。
+            with pytest.raises(TaskLiteError, match="in progress"):
+                with exclusive_state_access(env.backend):
+                    pytest.fail("通知解绑前执行权不能提前归还")
+            raise RuntimeError("unbind failed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(env.runtime.config.resources, "unbind_notifier", fail_unbind)
+            with pytest.raises(RuntimeError, match="unbind failed"):
+                env.runtime.execute()
+        assert not env.runtime.is_running
+        with exclusive_state_access(env.backend):
+            pass
+        assert env.runtime.execute() is None
+        env.backend.close()
 
     def test_keyboard_interrupt_during_init_releases_lock_and_resets_flag(
         self, tmp_path, monkeypatch,
@@ -393,7 +415,6 @@ class TestEngineRuntimeInitFailureSafety:
         import signal as signal_module
 
         import tasklite.engine.runtime as runtime_module
-        from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
         env = RuntimeEnv(tmp_path, name="test_init_interrupt", persistent=True)
 
@@ -417,12 +438,8 @@ class TestEngineRuntimeInitFailureSafety:
 
         monkeypatch.undo()
         assert not env.runtime.is_running
-        assert env.runtime._run_lock_fd is None
-
-        # 直接验证状态库锁可再次获取（无 fd 泄漏）
-        lock_fd = try_acquire_lock(env.backend.path, timeout=0)
-        assert lock_fd is not None
-        release_lock(lock_fd)
+        with exclusive_state_access(env.backend):
+            pass
 
         assert env.runtime.execute() is None
         assert not env.runtime.is_running
