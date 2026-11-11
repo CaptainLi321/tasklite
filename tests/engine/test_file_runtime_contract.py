@@ -687,3 +687,116 @@ def test_removed_output_message_cannot_authorize_cleanup(tmp_path, monkeypatch):
             p.run()
         assert target.read_text() == "valuable"
         assert p._runtime.store.backend.load_successes() == {}
+
+
+def _rename_output_handler(job, ctx):
+    mode = job.payload["declaration_mode"]
+    delete_on_success = job.payload["delete_on_success"]
+    temp_path = Path(job.payload["temp_path"])
+    final_path = Path(job.payload["final_path"])
+
+    if mode == "dynamic":
+        declared = Path(ctx.declare_file(
+            "result_file",
+            FileSpec(temp_path, role="output", delete_on_success=delete_on_success),
+        ))
+        assert declared == temp_path
+    else:
+        declared = ctx.file_path("result_file")
+        assert declared == temp_path
+
+    declared.write_text("generated content", encoding="utf-8")
+    declared.rename(final_path)
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("mode", ["static", "dynamic"])
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_output_delete_on_success_allows_worker_rename(tmp_path, monkeypatch, mode, backend):
+    """成功删除的输出允许工作进程在返回前原子 rename 移走，缺失视为已移除并发布原声明。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    temp_file = tmp_path / "temp_output.txt"
+    final_file = tmp_path / "final_output.txt"
+
+    job_kwargs = {}
+    if mode == "static":
+        job_kwargs["files"] = {
+            "result_file": FileSpec(temp_file, role="output", delete_on_success=True),
+        }
+
+    backend_kwargs = {"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}
+    with TaskLite(backend=backend, **backend_kwargs) as pipeline:
+        pipeline.register_task("worker_task", _rename_output_handler)
+        pipeline.enqueue(Job(
+            "worker_task",
+            "j1",
+            payload={
+                "declaration_mode": mode,
+                "delete_on_success": True,
+                "temp_path": str(temp_file),
+                "final_path": str(final_file),
+            },
+            **job_kwargs,
+        ))
+        pipeline.run()
+
+        assert final_file.exists()
+        assert final_file.read_text(encoding="utf-8") == "generated content"
+        assert not temp_file.exists()
+
+        successes = pipeline._runtime.store.backend.load_successes()
+        assert "worker_task::j1" in successes
+        job_success = successes["worker_task::j1"]
+        assert "result_file" in job_success["artifacts"]
+        assert job_success["artifacts"]["result_file"]["path"] == str(temp_file)
+
+        attempts = pipeline._runtime.store.backend.load_settled_attempts("worker_task::j1")
+        assert len(attempts) == 1
+        assert attempts[0]["outcome"] == "success"
+        assert attempts[0]["attempt_no"] == 1
+
+
+@pytest.mark.parametrize("mode", ["static", "dynamic"])
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_output_without_delete_on_success_missing_fails(tmp_path, monkeypatch, mode, backend):
+    """非成功删除的输出若在结算前缺失或被移走，必须判为失败。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    temp_file = tmp_path / "temp_output.txt"
+    final_file = tmp_path / "final_output.txt"
+
+    job_kwargs = {}
+    if mode == "static":
+        job_kwargs["files"] = {
+            "result_file": FileSpec(temp_file, role="output", delete_on_success=False),
+        }
+
+    backend_kwargs = {"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}
+    with TaskLite(backend=backend, **backend_kwargs) as pipeline:
+        pipeline.register_task("worker_task", _rename_output_handler)
+        pipeline.enqueue(Job(
+            "worker_task",
+            "j1",
+            payload={
+                "declaration_mode": mode,
+                "delete_on_success": False,
+                "temp_path": str(temp_file),
+                "final_path": str(final_file),
+            },
+            **job_kwargs,
+        ))
+        pipeline.run()
+
+        assert final_file.exists()
+        assert not temp_file.exists()
+
+        assert "worker_task::j1" not in pipeline._runtime.store.backend.load_successes()
+        failed = pipeline._runtime.store.backend.load_failed()
+        assert "worker_task::j1" in failed
+        failure_record = failed["worker_task::j1"]
+        assert f"Missing output {temp_file}" in failure_record["result"]["message"]
+
+        attempts = pipeline._runtime.store.backend.load_settled_attempts("worker_task::j1")
+        assert len(attempts) == 1
+        assert attempts[0]["outcome"] == "failure"

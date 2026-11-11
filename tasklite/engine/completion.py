@@ -253,9 +253,12 @@ class CompletionMachine:
                     self._attach_cleanup_failure(result, exc)
                     break
                 if not present:
-                    result.success = False
-                    result.message = f"Missing output {spec.path}"
-                    break
+                    # entry_exists 仍先执行根与符号链接边界防护。若声明了成功删除，
+                    # 契约允许工作进程在返回前原子 rename 移走该临时输出，缺失视为已移除。
+                    if not spec.delete_on_success:
+                        result.success = False
+                        result.message = f"Missing output {spec.path}"
+                        break
 
         spawned_job_snapshots: list[dict[str, Any]] = []
         if result.success and result.spawned_jobs:
