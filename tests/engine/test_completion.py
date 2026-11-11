@@ -103,11 +103,13 @@ class CompletionEnv:
         snapshot = job.to_dict()
         self.store.finalize_intake_snapshot(snapshot, job.task_type)
         job.__dict__.update(Job.from_dict(snapshot).__dict__)
+        job._attempt_no = attempt_no
+        snapshot["attempt_no"] = attempt_no
         if acquired is None and lease is None:
             acquired = self.resources.acquire_all(job.task_type, job.resources, job_uid=job.uid)
         entry = InFlightJob(
             job_uid=job.uid,
-            job_snapshot=job.to_dict(),
+            job_snapshot=snapshot,
             job=job,
             lease=lease,
             acquired=acquired if acquired is not None else [],

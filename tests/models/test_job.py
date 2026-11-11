@@ -354,9 +354,10 @@ class TestJobToDictFromDict:
         result = Job("scan", "s1").to_dict()
         expected_keys = {
             "task_type", "job_id", "payload", "depends_on", "files", "resources",
-            "max_retries_per_run", "timeout_seconds", "trigger", "attempt_no",
+            "max_retries_per_run", "timeout_seconds", "trigger",
         }
         assert set(result.keys()) == expected_keys
+        assert "attempt_no" not in result
 
     def test_to_dict_values_reflect_constructor_args(self):
         spec = FileSpec("/tmp/v", role="output")
@@ -382,7 +383,8 @@ class TestJobToDictFromDict:
         assert d["max_retries_per_run"] == 4
         assert d["timeout_seconds"] == 100
         assert d["trigger"] == "always"
-        assert d["attempt_no"] == 2
+        assert "attempt_no" not in d
+        assert job.attempt_no == 2
 
     def test_from_dict_missing_optional_keys_uses_defaults(self):
         job = Job.from_dict({"task_type": "t", "job_id": "j"})
@@ -394,6 +396,10 @@ class TestJobToDictFromDict:
         assert job.timeout_seconds is None
         assert job.trigger is None
         assert job.attempt_no == 1
+
+    def test_from_dict_with_explicit_attempt_no(self):
+        job = Job.from_dict({"task_type": "t", "job_id": "j", "attempt_no": 3})
+        assert job.attempt_no == 3
 
     def test_from_dict_required_keys(self):
         with pytest.raises(KeyError):
@@ -430,6 +436,7 @@ class TestJobToDictFromDict:
             trigger="on_input_change",
             attempt_no=3,
         )
+        assert "attempt_no" not in original.to_dict()
         recreated = Job.from_dict(original.to_dict())
         assert recreated.task_type == original.task_type
         assert recreated.job_id == original.job_id
@@ -440,7 +447,7 @@ class TestJobToDictFromDict:
         assert recreated.max_retries_per_run == original.max_retries_per_run
         assert recreated.timeout_seconds == original.timeout_seconds
         assert recreated.trigger == original.trigger
-        assert recreated.attempt_no == original.attempt_no
+        assert recreated.attempt_no == 1
 
     def test_roundtrip_nested_payload(self):
         nested = {

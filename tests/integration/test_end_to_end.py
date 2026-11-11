@@ -75,6 +75,14 @@ def flaky_first_attempt_handler(job, ctx):
     return TaskResult.retry(message="transient on first attempt")
 
 
+def attempt_aware_retry_handler(job, ctx):
+    """跨子进程重试序号观察：内部使用 job.attempt_no 观察当前序号；同时断言 job.to_dict() 不含 attempt_no。"""
+    assert "attempt_no" not in job.to_dict()
+    if job.attempt_no < 3:
+        return TaskResult.retry(message=f"transient on attempt {job.attempt_no}")
+    return TaskResult.success(metadata={"final_attempt": job.attempt_no})
+
+
 def always_transient_handler(job, ctx):
     """恒重试失败 → 重试预算耗尽进失败档案。"""
     return TaskResult.retry(message="always transient")
@@ -176,6 +184,22 @@ class TestEndToEnd:
         # 每次进入 running 时推进编号。
         assert [a["outcome"] for a in attempts] == ["retry", "success"]
         assert [a["attempt_no"] for a in attempts] == [1, 2]
+
+    def test_cross_process_retry_attempt_no_observed_by_handler(self, tmp_path):
+        """实际跨进程重试序号回归验证：handler 在真实子进程中观察到自增的 job.attempt_no，且公开 job.to_dict() 不含该键。"""
+        p = _make_pipeline(tmp_path)
+        p.register_task("work", attempt_aware_retry_handler)
+        p.enqueue(Job("work", "item_retry", max_retries_per_run=3))
+        res = p.run()
+        p.stop()
+
+        assert res is None
+        assert "work::item_retry" in p._runtime.store.backend.load_successes()
+        succ_meta = p._runtime.store.backend.load_successes()["work::item_retry"]
+        assert succ_meta["result"]["metadata"]["final_attempt"] == 3
+        attempts = p._runtime.store.backend.load_settled_attempts("work::item_retry")
+        assert [a["outcome"] for a in attempts] == ["retry", "retry", "success"]
+        assert [a["attempt_no"] for a in attempts] == [1, 2, 3]
 
     def test_manual_requeue_runs_to_success(self, tmp_path):
         p = _make_pipeline(tmp_path)

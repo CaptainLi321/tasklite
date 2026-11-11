@@ -18,7 +18,7 @@ StateSnapshot, TaskLiteError, make_job_uid, parse_job_uid。
 """
 from __future__ import annotations
 
-__version__ = "2.2.1"
+__version__ = "3.0.0.dev0"
 
 # ── 门面与执行核心 ────────────────────────────────────────────────────
 from .pipeline import TaskLite

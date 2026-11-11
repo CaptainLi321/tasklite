@@ -162,7 +162,7 @@ def _make_ctx(
 def _advance_ctx(job, previous):
     committed = {
         key: value
-        for key, value in previous.cursor_updates.items()
+        for key, value in previous._cursor_updates.items()
         if isinstance(value, str)
     }
     return _make_ctx(job, cursors=committed)
@@ -186,7 +186,7 @@ def _register(pipeline, **kwargs):
 
 
 def _handler(pipeline):
-    return pipeline.tasks.get("discover").handler
+    return pipeline._tasks.get("discover").handler
 
 
 def _stored_seen(ctx, *, task_type="discover", process_type=PTYPE, group_key=None):
@@ -195,7 +195,7 @@ def _stored_seen(ctx, *, task_type="discover", process_type=PTYPE, group_key=Non
         process_type=process_type,
         group_key=group_key,
     )
-    return set(json.loads(ctx.cursor_updates[key])["seen"])
+    return set(json.loads(ctx._cursor_updates[key])["seen"])
 
 
 class TestTermination:
@@ -234,7 +234,7 @@ class TestTermination:
 
         assert _handler(pipeline)(job, ctx) == TaskResult.success()
         assert _seen_by_handler == set()
-        assert ctx.cursor_updates == {}
+        assert ctx._cursor_updates == {}
 
 
 class TestRediscoveryAndDeletion:
@@ -321,7 +321,7 @@ class TestCrashRerun:
 
         with pytest.raises(RuntimeError, match="simulated crash"):
             _handler(pipeline)(job, ctx)
-        assert ctx.cursor_updates == {}
+        assert ctx._cursor_updates == {}
 
     def test_rerun_after_crash_rescans_and_dedups(self):
         _reset_source([{"id": i} for i in range(6)])
@@ -339,7 +339,7 @@ class TestCrashRerun:
         first_ctx = _make_ctx(job)
         with pytest.raises(RuntimeError, match="simulated crash"):
             _handler(pipeline)(job, first_ctx)
-        assert first_ctx.cursor_updates == {}
+        assert first_ctx._cursor_updates == {}
 
         _seen_by_handler.clear()
         retry_ctx = _make_ctx(job)
@@ -458,7 +458,7 @@ class TestDefense:
 
         assert _handler(pipeline)(job, ctx) == TaskResult.success()
         assert _processed_guard == []
-        assert ctx.cursor_updates == {}
+        assert ctx._cursor_updates == {}
 
         _reset_source([{"id": 2, "good": False}])
         ctx2 = _make_ctx(job)
@@ -474,7 +474,7 @@ class TestDefense:
         job = Job("discover", "seed", payload={})
         ctx = _make_ctx(job)
         assert _handler(pipeline)(job, ctx) == TaskResult.success()
-        assert ctx.cursor_updates == {}
+        assert ctx._cursor_updates == {}
 
     def test_process_item_func_raise_is_retried_next_run(self):
         _reset_source([{"id": 3}, {"id": 2}, {"id": 1}])
@@ -548,7 +548,7 @@ def _rt_process(job, ctx, item, content_id):
 
 def _rt_process_with_bad_child(job, ctx, item, content_id):
     if item["id"] == 1:
-        ctx.spawned_jobs.append(
+        ctx._spawned_jobs.append(
             Job(
                 "rt_child",
                 content_id,

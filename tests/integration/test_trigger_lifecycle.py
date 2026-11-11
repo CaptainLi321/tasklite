@@ -448,9 +448,10 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
     assert {row["job_uid"]: row["status"] for row in queue_rows} == {
         "waiting::item": "running", "later::item": "pending",
     }
+    assert next(r["attempt_no"] for r in queue_rows if r["job_uid"] == "waiting::item") == 1
     rows = [row["job"] for row in queue_rows]
     assert {row["task_type"] for row in rows} == {"waiting", "later"}
-    assert all(row["attempt_no"] == 1 for row in rows)
+    assert all(Job.from_dict(row).attempt_no == 1 for row in rows)
     assert pipeline._runtime.store.backend.load_failed() == {}
     assert pipeline._runtime.store.backend.load_successes() == {}
     assert pipeline._runtime.store.backend.load_settled_attempts("later::item") == []

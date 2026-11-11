@@ -187,11 +187,11 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
             pipeline.run()
         rows = pipeline._runtime.store.backend.load_queue_jobs()
         assert rows[0]["status"] == "running"
+        assert rows[0]["attempt_no"] == 1
         queue = [row["job"] for row in rows]
         assert len(queue) == 1
         assert queue[0]["task_type"] == job.task_type
         assert queue[0]["job_id"] == job.job_id
-        assert queue[0]["attempt_no"] == 1
         assert queue[0]["max_retries_per_run"] == 3
         assert pipeline._runtime.store.backend.load_successes() == {}
         assert pipeline._runtime.store.backend.load_failed() == {}

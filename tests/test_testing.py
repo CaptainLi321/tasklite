@@ -70,13 +70,13 @@ class TestFakeCtxBasics:
         ctx = fake_ctx(_job(), cursors={"high_water": "2026-01-01"})
         assert ctx.get_cursor("high_water") == "2026-01-01"
         ctx.set_cursor("high_water", "2026-02-01")
-        assert ctx.cursor_updates["high_water"] == "2026-02-01"
+        assert ctx._cursor_updates["high_water"] == "2026-02-01"
 
     def test_spawn_appends_new_jobs(self):
         ctx = fake_ctx(_job())
         child = _job("fetch", "child")
         ctx.spawn(child)
-        assert ctx.spawned_jobs == [child]
+        assert ctx._spawned_jobs == [child]
 
 
 class TestFakeCtxTmpRoot:
@@ -176,7 +176,7 @@ class TestFakeCtxFilesAndResults:
         result = sample_handler(job, ctx)
         assert result.metadata["file_size"] > 0
         assert result.metadata["prev_step"] == "1"
-        assert ctx.cursor_updates["step"] == "2"
+        assert ctx._cursor_updates["step"] == "2"
 
 
 class TestFakeCtxAuthorizationAndInvariants:

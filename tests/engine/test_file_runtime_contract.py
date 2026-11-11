@@ -518,7 +518,7 @@ def test_mark_running_failure_keeps_file_and_worker_unstarted(tmp_path, monkeypa
     assert row["job_uid"] == "work::one"
     assert row["status"] == "pending"
     assert p._runtime.store.backend.load_settled_attempts("work::one") == []
-    assert p.resources["__workers__"].used == 0.0
+    assert p._resources["__workers__"].used == 0.0
     p.close()
 
 
@@ -545,7 +545,7 @@ def test_worker_start_failure_releases_resources_after_running_commit(
 
     assert not marker.exists()
     assert capacity.used == 0.0
-    assert p.resources["__workers__"].used == 0.0
+    assert p._resources["__workers__"].used == 0.0
     row, = p._runtime.store.backend.load_queue_jobs(status="running")
     assert row["job_uid"] == "work::one"
     assert p._runtime.store.backend.load_settled_attempts("work::one") == []

@@ -277,6 +277,8 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
     _isolate_worker_process_signals()
     handler_func = spec.handler
     job = spec.job
+    if getattr(spec, "attempt_no", None) is not None:
+        job._attempt_no = spec.attempt_no
     ctx = spec.job_context
     job_uid = job.uid
     execution_id = spec.execution_id
@@ -309,8 +311,8 @@ def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
                         "status": "success",
                         "message": raw_result.message,
                         "metadata": raw_result.metadata,
-                        "spawned_jobs": [j.to_dict() for j in ctx.spawned_jobs],
-                        "cursor_updates": dict(ctx.cursor_updates),
+                        "spawned_jobs": [j.to_dict() for j in ctx._spawned_jobs],
+                        "cursor_updates": dict(ctx._cursor_updates),
                     })
                 elif raw_result.status == "failure":
                     _write_result({

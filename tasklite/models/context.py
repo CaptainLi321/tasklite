@@ -54,7 +54,7 @@ class JobContext:
         self._pipe_sender: WorkerPipeSender | None = None
         self._reply_receiver: WorkerReplyReceiver | None = None
         self.job = job
-        self.spawned_jobs: list[Job] = []
+        self._spawned_jobs: list[Job] = []
         self._file_sources: dict[str, FileSpec] = {}
         self._files: dict[str, FileSpec] = {}
         job_files = getattr(job, "files", {}) or {}
@@ -81,7 +81,7 @@ class JobContext:
             else (frozenset(success_job_uids) | frozenset(failed_job_uids))
         )
         self._cursors = cursors
-        self.cursor_updates: dict[str, str | None] = {}
+        self._cursor_updates: dict[str, str | None] = {}
         # output_roots 支持多根（跨盘输出场景）——解析时
         # 路径属于**任一**根即通过沙盒校验。
         self.output_roots = output_roots
@@ -189,7 +189,7 @@ class JobContext:
                 f"spawn() expects a Job, got {type(job).__name__}"
             )
         # 依赖闭合：只能引用派发时已知的 Job、当前父 Job，以及本次先前声明的 Job
-        allowed_uids = self._known_job_uids | {self.job.uid} | {j.uid for j in self.spawned_jobs}
+        allowed_uids = self._known_job_uids | {self.job.uid} | {j.uid for j in self._spawned_jobs}
         for dep in job.depends_on:
             if dep not in allowed_uids:
                 raise TaskLiteError(
@@ -201,7 +201,7 @@ class JobContext:
             base_dir=self.base_dir,
             depends_on=job_dict.get("depends_on") or (),
         )
-        self.spawned_jobs.append(Job.from_dict(job_dict))
+        self._spawned_jobs.append(Job.from_dict(job_dict))
 
     def get_cursor(self, key: str) -> str | None:
         """读取高水位游标的当前值（含自身暂存写入）。"""
@@ -219,7 +219,7 @@ class JobContext:
             raise TaskLiteError(f"cursor key must be a non-empty str, got {key!r}")
         if value is not None and not isinstance(value, str):
             raise TaskLiteError(f"cursor value must be str or None, got {type(value).__name__}")
-        self.cursor_updates[key] = value
+        self._cursor_updates[key] = value
         if value is None:
             self._cursors.pop(key, None)
         else:

@@ -36,6 +36,7 @@ def _succeed_handler(job, ctx):
 
 
 def _retry_then_succeed_handler(job, ctx):
+    assert "attempt_no" not in job.to_dict()
     if job.attempt_no < 2:
         return TaskResult.retry(message="transient failure, requesting retry")
     return TaskResult.success(metadata={"final_attempt": job.attempt_no})

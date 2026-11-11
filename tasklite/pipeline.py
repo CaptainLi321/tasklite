@@ -91,27 +91,27 @@ class TaskLite:
         self._closed: bool = False
         self.base_dir: Path = Path(os.path.abspath(os.getcwd()))
         self.output_roots = self._resolve_output_roots(output_roots)
-        self.backend_type: str = backend
+        self._backend_type: str = backend
         self._backend_handle: AbstractStateBackend | None = None
 
         try:
             self._backend_handle = self._build_backend(backend)
-            self.tasks = TaskRegistry()
+            self._tasks = TaskRegistry()
             from .triggers import BUILTIN_TRIGGER_FUNCTIONS
             self._triggers = TriggerRegistry(
-                tasks=self.tasks,
+                tasks=self._tasks,
                 functions=BUILTIN_TRIGGER_FUNCTIONS,
                 base_dir=self.base_dir,
             )
-            self.resources = self._build_resources(self.tasks, max_workers)
+            self._resources = self._build_resources(self._tasks, max_workers)
             self._process_context = mp.get_context("spawn")
             self._channel = ExecutionChannel(
                 process_context=self._process_context,
                 output_roots=self.output_roots,
                 protected_roots=((self.state_path,) if self.state_path is not None else ()),
             )
-            self.runtime_config = self._build_run_config(self._backend_handle)
-            self._runtime = EngineRuntime(config=self.runtime_config)
+            self._runtime_config = self._build_run_config(self._backend_handle)
+            self._runtime = EngineRuntime(config=self._runtime_config)
             self._console = OpsConsole(self._runtime.store)
         except BaseException:
             self._cleanup_failed_init()
@@ -210,8 +210,8 @@ class TaskLite:
             name="tasklite",
             protected_roots=((self.state_path,) if self.state_path is not None else ()),
             backend=backend,
-            resources=self.resources,
-            tasks=self.tasks,
+            resources=self._resources,
+            tasks=self._tasks,
             channel=self._channel,
             governor=DeadlockGovernor(),
             trigger_registry=self._triggers,
@@ -263,9 +263,9 @@ class TaskLite:
                 f"Cannot register internal worker resource {WORKER_RESOURCE!r}; "
                 f"worker concurrency must be configured via max_workers."
             )
-        if resource.name in self.resources:
+        if resource.name in self._resources:
             raise TaskLiteError(f"Resource {resource.name!r} already registered")
-        self.resources[resource.name] = resource
+        self._resources[resource.name] = resource
 
     def register_task(
         self,
@@ -304,7 +304,7 @@ class TaskLite:
                 timeout_seconds=3600 if timeout_seconds is _UNSET else timeout_seconds,
                 trigger="once" if trigger is _UNSET else trigger,
             )
-        self.tasks.register(task)
+        self._tasks.register(task)
 
     @staticmethod
     def _reject_spec_overrides(
@@ -440,7 +440,7 @@ class TaskLite:
             raise TaskLiteError(
                 f"exclude must be an Exclude instance or None, got {type(exclude).__name__}"
             )
-        logger.info(f"=== Starting Pipeline (Backend: {self.backend_type}) ===")
+        logger.info(f"=== Starting Pipeline (Backend: {self._backend_type}) ===")
         self._runtime.execute(
             ExecutionOptions(
                 install_signals=install_signals,

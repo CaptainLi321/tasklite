@@ -204,7 +204,7 @@ class Job:
         return self._attempt_no
 
     def to_dict(self) -> dict[str, Any]:
-        """捕获独立配置快照及执行观察字段。"""
+        """捕获独立配置快照。"""
         return {
             "task_type": self.task_type,
             "job_id": self.job_id,
@@ -218,7 +218,6 @@ class Job:
             "max_retries_per_run": self.max_retries_per_run,
             "timeout_seconds": self.timeout_seconds,
             "trigger": self.trigger,
-            "attempt_no": self.attempt_no,
         }
 
     @classmethod

@@ -252,7 +252,7 @@ class TestConstruction:
     def test_memory_requires_no_state_path_and_no_disk_side_effects(self, tmp_path):
         p = TaskLite(backend="memory")
         assert p.state_path is None
-        assert p.backend_type == "memory"
+        assert p._backend_type == "memory"
 
     def test_output_root_resolved_without_creating_dir(self, tmp_path):
         root = tmp_path / "out_not_created"
@@ -273,11 +273,11 @@ class TestConstruction:
 
     def test_backend_sqlite_type_name(self, tmp_path):
         p = TaskLite(backend="sqlite", state_path=tmp_path / "test.db")
-        assert p.backend_type == "sqlite"
+        assert p._backend_type == "sqlite"
 
     def test_backend_memory_type_name(self, tmp_path):
         p = make_pipeline(tmp_path)
-        assert p.backend_type == "memory"
+        assert p._backend_type == "memory"
 
     def test_backend_unknown_string_rejected(self, tmp_path):
         with pytest.raises(TaskLiteError, match="Unknown backend"):
@@ -376,8 +376,8 @@ class TestConstruction:
 
     def test_worker_resource_registered_with_capacity(self, tmp_path):
         p = make_pipeline(tmp_path, max_workers=7)
-        assert "__workers__" in p.resources
-        assert p.resources["__workers__"].max_capacity == 7.0
+        assert "__workers__" in p._resources
+        assert p._resources["__workers__"].max_capacity == 7.0
 
     def test_removed_constructor_params_rejected(self, tmp_path):
         for bad_kwarg in (
@@ -506,7 +506,7 @@ class TestRegisterTask:
         p = make_pipeline(tmp_path)
         spec = Task("fetch", ok_handler, resources={"api": 1.0})
         p.register_task(spec)
-        assert p.tasks.lookup("fetch") is spec
+        assert p._tasks.lookup("fetch") is spec
 
     def test_register_task_simple_form_builds_spec(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -518,7 +518,7 @@ class TestRegisterTask:
             timeout_seconds=30,
             trigger="always",
         )
-        spec = p.tasks.lookup("fetch")
+        spec = p._tasks.lookup("fetch")
         assert spec.handler is ok_handler
         assert spec.resources == {"api": 1.0}
         assert spec.max_retries_per_run == 1
@@ -541,7 +541,7 @@ class TestRegisterTask:
         with pytest.raises(TaskLiteError, match="non-empty str"):
             p.register_task("", ok_handler)
         p.register_task("fe::tch", ok_handler)
-        assert p.tasks.lookup("fe::tch").task_type == "fe::tch"
+        assert p._tasks.lookup("fe::tch").task_type == "fe::tch"
 
     def test_spec_form_rejects_stray_arguments(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -580,7 +580,7 @@ class TestRegisterResource:
     def test_registers_into_manager(self, tmp_path):
         p = make_pipeline(tmp_path)
         p.register_resource(IntervalResource("api", interval_seconds=0.5))
-        assert "api" in p.resources
+        assert "api" in p._resources
 
     def test_rejects_non_resource(self, tmp_path):
         p = make_pipeline(tmp_path)
@@ -872,7 +872,7 @@ class TestEnqueue:
                     files={"src": FileSpec.from_output("generate::001", "report", role="input")},
                 )
             )
-        assert ctx.spawned_jobs == []
+        assert ctx._spawned_jobs == []
 
         child = Job(
             "process",
@@ -885,8 +885,8 @@ class TestEnqueue:
         )
         ctx.spawn(child)
         child.files["mutated"] = FileSpec("mut.txt", role="cache")
-        assert len(ctx.spawned_jobs) == 1
-        spawned = ctx.spawned_jobs[0]
+        assert len(ctx._spawned_jobs) == 1
+        spawned = ctx._spawned_jobs[0]
         assert set(spawned.files.keys()) == {"src", "out"}
         assert spawned.files["src"] == FileSpec.from_output(
             "generate::001", "report", role="input"
@@ -1045,8 +1045,8 @@ class TestSchedulingSeamWiring:
         p.run()
 
         assert order == ["fetch::a", "fetch::b", "fetch::c"]
-        assert isinstance(p.runtime_config.ordering_policy, FifoOrderingPolicy)
-        assert p._runtime.scheduler.ordering_policy is p.runtime_config.ordering_policy
+        assert isinstance(p._runtime_config.ordering_policy, FifoOrderingPolicy)
+        assert p._runtime.scheduler.ordering_policy is p._runtime_config.ordering_policy
 
     def test_requeue_default_wiring_and_front_equivalence(self, tmp_path):
         """默认立即重入队（front=True）：flaky 重试先于 later 结算。"""
@@ -1069,8 +1069,8 @@ class TestSchedulingSeamWiring:
         ]
         assert "fetch::later" in p._runtime.store.backend.load_successes()
         assert "fetch::flaky" in p._runtime.store.backend.load_failed()
-        assert isinstance(p.runtime_config.requeue_policy, ImmediateRequeuePolicy)
-        assert p._runtime.store._requeue_policy is p.runtime_config.requeue_policy
+        assert isinstance(p._runtime_config.requeue_policy, ImmediateRequeuePolicy)
+        assert p._runtime.store._requeue_policy is p._runtime_config.requeue_policy
 
 
 # ── 管理面委托（run() 外）────────────────────────────────────────────

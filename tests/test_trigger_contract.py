@@ -295,9 +295,10 @@ def test_trigger_error_aborts_inflight_without_burning_budget():
     assert {row["job_uid"]: row["status"] for row in queue_rows} == {
         "t::a": "running", "t::b": "pending",
     }
+    assert next(r["attempt_no"] for r in queue_rows if r["job_uid"] == "t::a") == 1
     rows = {row["job"]["job_id"]: row["job"] for row in queue_rows}
     assert set(rows) == {"a", "b"}
-    assert all(row["attempt_no"] == 1 for row in rows.values())
+    assert all(Job.from_dict(row).attempt_no == 1 for row in rows.values())
     assert pipeline._runtime.store.backend.load_settled_attempts("t::b") == []
     assert pipeline._runtime.store.backend.load_failed() == {}
 

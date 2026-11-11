@@ -155,6 +155,11 @@ class TestMainSurfaceExports:
         }
     )
 
+    def test_package_version(self):
+        import tasklite
+
+        assert tasklite.__version__ == "3.0.0.dev0"
+
     def test_export_names_in_all(self):
         import tasklite as tasklite_pkg
 
@@ -262,6 +267,21 @@ class TestMainSurfaceExports:
         ]
         for method_name in deleted_methods:
             assert not hasattr(TaskLite, method_name), f"TaskLite 不应暴露已删除方法 {method_name}"
+
+    def test_tasklite_internal_attributes_not_exposed(self):
+        from tasklite import TaskLite
+
+        tl = TaskLite(backend="memory")
+        for attr in ("backend_type", "tasks", "resources", "runtime_config"):
+            assert not hasattr(tl, attr), f"TaskLite 不应暴露内部属性 {attr}"
+
+    def test_job_context_internal_attributes_not_exposed(self):
+        """JobContext 仅暴露受控交互方法，不向外部暴露累积容器属性。"""
+        from tasklite import Job, JobContext
+
+        ctx = JobContext(Job("t", "1"), frozenset(), frozenset(), {})
+        for attr in ("spawned_jobs", "cursor_updates"):
+            assert not hasattr(ctx, attr), f"JobContext 不应暴露内部属性 {attr}"
 
     def test_tasklite_facade_signatures(self):
         from tasklite import StateSnapshot, TaskLite
