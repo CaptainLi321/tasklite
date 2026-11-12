@@ -5,11 +5,10 @@
 > 核心解决「单线程处理耗时长」、「中途失败需全量重跑」、「子任务卡死拖垮主流程」等工程痛点。采用主控守护与物理子进程隔离架构，内置 SQLite WAL 事务持久化：已提交终态跨进程保留；异常退出遗留的 `running` 下次启动按失败收敛，未派发的 `pending` 留队，不自动接续旧执行。
 
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-3.0.0.dev0-orange.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20external-brightgreen.svg)]()
-[![ACID Persistence](https://img.shields.io/badge/persistence-SQLite%20WAL%20(ACID)-orange.svg)]()
-[![Tests](https://img.shields.io/badge/tests-2600%2B%20passed-success.svg)]()
+[![CI](https://github.com/CaptainLi321/tasklite/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/CaptainLi321/tasklite/actions/workflows/ci.yml)
+
+当前开发版本为 **3.0.0.dev0**，公开接口与兼容性说明见 [API 参考手册](docs/API.md)。
 
 ---
 
