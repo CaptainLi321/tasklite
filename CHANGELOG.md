@@ -6,7 +6,9 @@
 
 ## [Unreleased]
 
-> **注意：本版本尚未正式发布（UNRELEASED）**。全链接口基线与验证已完成，待发布版本号及格式支持窗口待确认。
+## [3.0.0.dev0] - 2026-11-12
+
+3.0.0 的首个开发预览版，尚非稳定正式版。
 
 破坏性基线大版本：实现已接受的 [ADR-0011](docs/adr/0011-stable-interface-baseline.md) 稳定接口基线。收敛稳定公开面、升级 SQLite Schema 6 并重塑状态管理与快照查询。
 
@@ -19,12 +21,13 @@
   - `JobContext`：规范化执行上下文，提供 `spawn`、`declare_file`、`file_path`、`get_cursor` 与 `set_cursor`。
 - **状态管理与历史运维 API**：
   - `TaskLite.set_job_status(job_or_uid, status, *, recursive, note=None)`：统一支持 `pending`、`succeeded`、`failed` 三目标态，必须显式指定 `recursive` 参数。
-  - `TaskLite.clear_history(uid, *, records)`：支持精准清理 `successes`、`failed`、`attempts`，且单调编号进度不被历史清理重置。
+  - `TaskLite.clear_history(uid, *, records)`：支持精准清理 `successes`、`failures`、`attempts`（`failures` 对应失败档案），且单调编号进度不被历史清理重置。
   - `TaskLite.list_authorizations()` 与 `TaskLite.revoke_authorization(path)`：主进程文件授权查询与精准撤销。
 - **只读一致状态快照（StateSnapshot）**：
   - `StateSnapshot.open(path_or_tasklite)`：单一权威只读查询入口，SQLite 持有独立读事务，内存后端固定一致性版本；提供 `get_job`、`iter_jobs`、`iter_attempts`，输出标准规范 JSON 字典。
 - **单库级文件锁防护**：
   - 使用 `__tasklite__.lock` 互斥保护，废除旧 worker 逐任务锁。
+- **公开 API 参考手册**：新增 [docs/API.md](docs/API.md)，覆盖签名、参数、返回结构与异常边界，并加入文档路径与真实导入检查。
 
 ### 变更（向后不兼容）
 
@@ -36,6 +39,16 @@
   - `Task` / `Job` 预算参数收敛为 `max_retries_per_run`，超时参数收敛为 `timeout_seconds`。
   - 废除 `RateLimitResource` 旧名，统一为 `IntervalResource`。
   - `pipeline.run()` 正常完成返回 `None`（移除易过期的 `RunSummary` / `stats`）。
+- **内部状态封装**：`TaskLite` 的注册表、资源容器、运行配置与后端类型字段，以及 `JobContext` 的派生作业和游标更新缓冲改为私有；通过公开方法进行注册、派生与游标更新。
+- **配置序列化边界**：`Job.to_dict()` 不再包含运行账目 `attempt_no`；保留 `job.attempt_no` 只读观察属性，实际执行编号通过内部通道显式传递。
+- **扩展稳定性分级**：`register_trigger` 与 `TriggerContext` 作为非稳定扩展接缝保留，不作稳定兼容承诺。
+
+### 修复
+
+- 保留启动预检期间收到的停止请求，避免会话复位覆盖请求。
+- 重试账目由真实运行会话持有，状态库执行权统一通过作用域管理。
+- 允许配置 `delete_on_success=True` 的输出在工作进程中提前移走；仍先校验路径安全边界，并按声明发布产物描述。
+- 静态与动态文件声明共用解析逻辑，统一路径基准、直接依赖与输入存在性检查。
 
 ### 移除（向后不兼容）
 
@@ -43,7 +56,7 @@
 - 移除外部 backend 注入与 setter、`strict_picklable` 以及内部调优参数。
 - 移除 `run_graceful`、强杀参数（`stop(force=...)`）及跳过库锁选项。
 - 移除 `Skip` 终态跳过与复杂 `Selection` 容器，保留 `run(exclude=Exclude(...))`。
-- 移除 `TriggerContext` / `TriggerRegistry` 与旧 trigger 机制。
+- 根包不再导出 `TriggerContext` / `TriggerRegistry`；自定义触发器接缝不属于稳定公开面。
 - 移除 `list_failures` / `clear_failures` / `retry_failure` 旧运维入口。
 - 移除 `RateLimitHit`、`RetryError`、`FatalError` 及旧错误分类常量。
 - 移除 `JobContext` 上的 `has_succeeded` / `has_failed` / `succeeded_or_failed_job_uids` 历史查询入口。
