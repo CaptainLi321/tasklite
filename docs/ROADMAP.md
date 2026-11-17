@@ -175,7 +175,7 @@ GUIDE 须有 Trigger 行为表、结果与提交效果表、文件类型与清�
 
 ## 7. 宿主交互授权回调（`authorizer`） — 后续候选
 
-当前基线（ADR-0011）通过 `TASKLITE_AUTO_APPROVE=1` 环境变量与默认终端询问处理主进程文件授权，授权管理仅公开 `list_authorizations()` 与 `revoke_authorization()`，不向宿主程序暴露可编程的 `TaskLite.authorizer` 回调属性。
+当前基线（ADR-0011）通过 `TASKLITE_DANGEROUS_AUTO_APPROVE=1` 环境变量与默认终端询问处理主进程文件授权，授权管理仅公开 `list_authorizations()` 与 `revoke_authorization()`，不向宿主程序暴露可编程的 `TaskLite.authorizer` 回调属性。
 
 后续若需要支持 GUI/Web 宿主或自定义审批工作流动态接管授权询问，可立项 ADR 评估在构造期或独立适配口开放受控的授权判定回调协议（含异步等待与 `stop()` 唤醒语义），当前暂不作为稳定接口暴露。
 

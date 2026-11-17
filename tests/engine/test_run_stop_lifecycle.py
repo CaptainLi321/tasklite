@@ -280,7 +280,7 @@ def test_stop_arriving_after_run_exit_does_not_mutate_session(tmp_path, monkeypa
 
 
 def test_stop_in_initial_authorizer_keeps_job_pending(tmp_path, monkeypatch):
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     effect = tmp_path / "effect.txt"
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
         pipeline.register_resource(CapacityResource("disk", max_capacity=1))

@@ -316,7 +316,7 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
 def test_authorization_wait_does_not_consume_execution_timeout(tmp_path, monkeypatch):
     """等待越过原执行截止后批准，恢复剩余时限并让 worker 正常完成。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "paused-timeout.txt"
     target.write_text("old", encoding="utf-8")
 
@@ -430,7 +430,7 @@ def test_directory_authorization_reusable_and_subpath_revocation(tmp_path, monke
 def test_cleanup_failure_vs_authorization_denial_destinations(tmp_path, monkeypatch):
     """实际清理错误记为 failed 档案，授权拒绝回到 pending 且不计入 failed。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "t_diff_dest.db")
 
     p.register_task("clean_task", _cleanup_fail_handler)
@@ -453,7 +453,7 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
 ):
     """即时与等待后拒绝都先结束 worker，再原子登记失败 Attempt 并回 pending。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     state_path = tmp_path / "denial.db"
     target = tmp_path / "target.txt"
     target.write_text("old data", encoding="utf-8")
@@ -562,7 +562,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
 ):
     """stop 解除授权等待，记录停止原因，关闭全 Run 派发而不排除单个 Job。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "stopped.txt"
     target.write_text("old data", encoding="utf-8")
     stopped_marker = tmp_path / "stopped-marker"
@@ -669,7 +669,7 @@ def test_auto_approve_does_not_authorize_out_of_root_dynamic_target(
 ):
     """硬性输出范围校验先于自动授权记录，根外目标保持原样并结算失败。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     allowed = tmp_path / "allowed"
     allowed.mkdir()
     target = tmp_path / "outside.txt"
@@ -703,7 +703,7 @@ def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
 ):
     """等待期间将普通目标替换为受保护文件的链接时，后续决策仍先校验实际目标。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     allowed = tmp_path / "allowed"
     allowed.mkdir()
     target = allowed / "target.txt"
@@ -759,9 +759,9 @@ def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
 
 
 def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path, monkeypatch):
-    """TASKLITE_AUTO_APPROVE=1 只自动同意实际请求路径，持久记录，保护路径仍禁止。"""
+    """TASKLITE_DANGEROUS_AUTO_APPROVE=1 只自动同意实际请求路径，持久记录，保护路径仍禁止。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     state_path = tmp_path / "t_auto_approve.db"
     p = TaskLite(backend="sqlite", state_path=state_path)
 
@@ -786,7 +786,7 @@ def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path,
     p.close()
 
     # 2. SQLite 重开后精确文件授权继续复用，无需再次询问
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     reopened = TaskLite(backend="sqlite", state_path=state_path)
     reopened.register_task("good_task", _good_handler)
     reopened.register_task("bad_task", _protected_path_handler)
@@ -799,7 +799,7 @@ def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path,
     assert "good_task::g2" in reopened._runtime.store.backend.load_successes()
 
     # 3. 保护路径（例如 state 数据库文件）即使自动同意也严禁授权
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     reopened.enqueue(Job("bad_task", "b1"))
     reopened.run()
     assert "bad_task::b1" not in reopened._runtime.store.backend.load_successes()
@@ -852,9 +852,9 @@ def test_forbidden_file_operations_never_request_or_persist_authorization(
     """禁止目标在静态与动态入口均先拒绝，不询问、不保存授权、不进入删除。"""
     monkeypatch.chdir(tmp_path)
     if approval == "automatic":
-        monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+        monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     else:
-        monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+        monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     allowed = tmp_path / "allowed"
     allowed.mkdir()
     state_path = allowed / "state.db"
@@ -901,7 +901,7 @@ def _declare_spec_handler(job, ctx):
 
 def test_static_forbidden_declaration_prevents_authorizing_other_targets(tmp_path, monkeypatch):
     """同批预声明全部校验完成后才开始询问，禁止目标不会留下部分授权。"""
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     allowed = tmp_path / "allowed"
     allowed.mkdir()
     good = allowed / "good"
@@ -926,7 +926,7 @@ def test_static_forbidden_declaration_prevents_authorizing_other_targets(tmp_pat
 @pytest.mark.parametrize("changed", ["waiting", "other-declaration"])
 def test_static_authorization_wait_revalidates_target_before_asking_again(tmp_path, monkeypatch, changed):
     """待决后目标变为链接，下一次询问前拒绝且保留目标。"""
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
     valuable = tmp_path / "valuable"
     target.write_text("old", encoding="utf-8")
@@ -965,7 +965,7 @@ def test_broken_symlink_preparation_authorizes_and_removes_only_the_link(
     tmp_path, monkeypatch, declaration,
 ):
     """前删断链时授权其目录项路径，不授权或创建缺失的链接目标。"""
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     missing = tmp_path / "missing"
     link = tmp_path / "link"
     link.symlink_to(missing)
@@ -1011,7 +1011,7 @@ def test_allowed_file_operations_keep_instance_path_base(
     tmp_path, monkeypatch, backend, declaration,
 ):
     """主进程和 worker 改变目录后，允许的相对路径仍按实例创建基准授权与准备。"""
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     base = tmp_path / "base"
     allowed = tmp_path / "allowed"
     other = tmp_path / "other"
@@ -1066,7 +1066,7 @@ def test_worker_target_type_change_requires_cleanup_scope_confirmation(
 ):
     """真实 worker 改变目标类型后，清理授权等待、拒绝和停止均保持结算语义。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
     if initial == "file":
         target.write_text("initial", encoding="utf-8")
@@ -1169,7 +1169,7 @@ def test_cleanup_wait_preserves_result_and_settles_other_worker_before_single_co
 ):
     """清理待决时继续结算在途结果、暂停新派发；只调用一次收尾且拒绝先终止进程。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
     target.write_text("initial", encoding="utf-8")
     independent_gate, exit_gate = tmp_path / "independent", tmp_path / "exit"
@@ -1263,7 +1263,7 @@ def _replace_file_with_link_handler(job, ctx):
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_worker_leaf_link_replacement_never_expands_file_authorization(tmp_path, monkeypatch, backend):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
     target.write_text("initial", encoding="utf-8")
     destination = tmp_path / "business"
@@ -1301,7 +1301,7 @@ def test_later_authorization_callback_cannot_expand_previously_checked_target(
     tmp_path, monkeypatch, backend, approve_first_tree,
 ):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     first, second = tmp_path / "first", tmp_path / "second"
     for path in (first, second):
         path.write_text("initial", encoding="utf-8")
@@ -1350,7 +1350,7 @@ def test_type_change_at_deletion_snapshot_fails_without_directory_permission(
     from tasklite.utils.artifact import ArtifactPathPolicy
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
     target.write_text("initial", encoding="utf-8")
     p = TaskLite(backend=backend, state_path=tmp_path / "snapshot.db")
@@ -1386,7 +1386,7 @@ def test_run_fault_leaves_uncommitted_cleanup_result_running_for_recovery(
 ):
     """收到有效结果不等于已提交；异常退出不补结算，下次按原身份恢复失败。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
     target.write_text("initial", encoding="utf-8")
     p = TaskLite(backend=backend, state_path=tmp_path / "abort-result.db")
@@ -1464,7 +1464,7 @@ def test_success_cleanup_error_does_not_run_unapproved_failure_cleanup(tmp_path,
     from tasklite.utils.artifact import ArtifactPathPolicy
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     first, second = tmp_path / "first", tmp_path / "second"
     for path in (first, second):
         path.write_text("initial", encoding="utf-8")

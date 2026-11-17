@@ -38,7 +38,7 @@
    - [6.2 IntervalResource 时间间隔资源](#62-intervalresource-时间间隔资源)
    - [6.3 Exclude 运行排除规则](#63-exclude-运行排除规则)
 7. [环境变量](#7-环境变量)
-   - [7.1 TASKLITE_AUTO_APPROVE 自动授权开关](#71-tasklite_auto_approve-自动授权开关)
+   - [7.1 TASKLITE_DANGEROUS_AUTO_APPROVE 自动授权开关](#71-tasklite_dangerous_auto_approve-危险自动授权开关)
 8. [可选扩展与测试辅助模块](#8-可选扩展与测试辅助模块)
    - [8.1 tasklite.testing 单元测试工具](#81-tasklitetesting-单元测试工具)
    - [8.2 tasklite.wrappers.http HTTP 工具集](#82-tasklitewrappershttp-http-工具集)
@@ -168,7 +168,7 @@ TaskLite(
   - 内部自动以此上限向资源管理器注册内置并发容量。
 - **`output_roots`**（`str | Path | Sequence[str | Path] | None`，默认 `None`，仅关键字参数）：
   - 框架文件操作目录白名单（非 handler 写入沙箱）。构造时不触碰磁盘、不自动创建目录。
-  - 若传入 `None`（默认），不额外限制声明路径范围；若传入单个 `str | Path` 或序列，框架准备、写入或清理声明路径时必须落于这些根目录之内，即使启用 `TASKLITE_AUTO_APPROVE=1` 也不得越界；传入其他类型抛出 `TaskLiteError`。
+  - 若传入 `None`（默认），不额外限制声明路径范围；若传入单个 `str | Path` 或序列，框架准备、写入或清理声明路径时必须落于这些根目录之内，即使启用 `TASKLITE_DANGEROUS_AUTO_APPROVE=1` 也不得越界；传入其他类型抛出 `TaskLiteError`。
 - **内部基准目录**：
   - 构造时内部自动捕获当时的绝对工作目录 `Path(os.path.abspath(os.getcwd()))`，后续相对路径声明的解析均基于此固定基准，不受运行时工作目录改变影响。
 - **SQLite 状态库 Schema 6 校验**：
@@ -769,15 +769,15 @@ Exclude(*, task_type: str)
 
 ## 7. 环境变量
 
-### 7.1 TASKLITE_AUTO_APPROVE 自动授权开关
+### 7.1 TASKLITE_DANGEROUS_AUTO_APPROVE 危险自动授权开关
 
 - **精确匹配条件**：
-  - 框架仅以 `os.environ.get("TASKLITE_AUTO_APPROVE") == "1"` 做精确判定；
+  - 框架仅以 `os.environ.get("TASKLITE_DANGEROUS_AUTO_APPROVE") == "1"` 做精确判定；
   - 只有当环境变量值**严格等于字符串 `"1"`** 时生效（诸如 `"true"`、`"yes"`、`"True"` 均不生效）。
 - **持久化授权效果**：
   - 当命中 `"1"` 时，主进程遇到未授权的文件清理或准备操作时自动批准，并**将该授权永久写入状态库的 `authorizations` 表**中；后续执行直接命中库中授权。
 - **受保护路径与目录白名单硬拦截边界**：
-  - 即使设置了 `TASKLITE_AUTO_APPROVE="1"`，若目标路径属于状态库自身、锁文件或引擎受保护目录，或超出构造时显式配置的 `output_roots` 目录白名单，框架底层安全防护机制依然**硬拦截拒绝**，杜绝误删状态库或越界操作风险。
+  - 即使设置了 `TASKLITE_DANGEROUS_AUTO_APPROVE="1"`，若目标路径属于状态库自身、锁文件或引擎受保护目录，或超出构造时显式配置的 `output_roots` 目录白名单，框架底层安全防护机制依然**硬拦截拒绝**，杜绝误删状态库或越界操作风险。
 
 ---
 

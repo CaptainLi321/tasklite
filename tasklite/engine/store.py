@@ -599,7 +599,7 @@ class StateStore:
             effective_type = "directory" if os.path.isdir(norm_path) else "file"
             if self._backend.is_path_authorized(norm_path, effective_type):
                 return True
-            if os.environ.get("TASKLITE_AUTO_APPROVE") == "1":
+            if os.environ.get("TASKLITE_DANGEROUS_AUTO_APPROVE") == "1":
                 decision: bool | None = True
             elif self.authorizer is not None:
                 decision = self.authorizer(norm_path, effective_type)

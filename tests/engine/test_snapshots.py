@@ -751,7 +751,7 @@ def authorization_stopped_result_handler(job, ctx):
 def test_current_terminal_record_ignores_later_authorization_attempt(
     tmp_path, monkeypatch, backend, prior,
 ):
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "business"
     target.write_text("业务数据")
     with TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None) as p:

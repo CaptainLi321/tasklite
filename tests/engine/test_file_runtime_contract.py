@@ -46,7 +46,7 @@ def _marker_handler(job, ctx):
 def test_from_output_reference_and_resolution(tmp_path, monkeypatch):
     """from_output 保留配置引用且 Attempt 记录解析出规范绝对路径。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("producer", _producer_handler)
     p.register_task("consumer", _consumer_handler)
@@ -87,7 +87,7 @@ def test_from_output_reference_and_resolution(tmp_path, monkeypatch):
 def test_from_output_unpublished_name_fails_immediately(tmp_path, monkeypatch):
     """from_output 引用生产者未发布产物名称直接失败。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("producer", _producer_handler)
     p.register_task("consumer", _consumer_handler)
@@ -113,7 +113,7 @@ def test_from_output_unpublished_name_fails_immediately(tmp_path, monkeypatch):
 def test_from_output_missing_disk_input_fails_immediately(tmp_path, monkeypatch):
     """上游虽已发布但磁盘 input 产物缺失直接失败。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("producer", _producer_handler)
     p.register_task("consumer", _consumer_handler)
@@ -167,7 +167,7 @@ def _idempotent_handler(job, ctx):
 def test_duplicate_declaration_idempotent_and_conflict(tmp_path, monkeypatch):
     """同声明重复不重复删除，缺失删除目标视为完成；同名异声明报冲突。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("idem", _idempotent_handler)
     p.enqueue(Job("idem", "j1"))
@@ -187,7 +187,7 @@ def _clean_input_handler(job, ctx):
 def test_input_role_cleanup_policies(tmp_path, monkeypatch):
     """input 禁前删，但成功/失败删除按显式策略允许。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     # 1. input 声明 delete_existing 构造期/校验即拒绝
     with pytest.raises(TaskLiteError, match="input FileSpec cannot set delete_existing=True"):
         FileSpec("input.txt", role="input", delete_existing=True)
@@ -219,7 +219,7 @@ def _fail_cleanup_handler(job, ctx):
 def test_success_cleanup_failure_blocks_success_spawn_and_cursor(tmp_path, monkeypatch, cleanup_error):
     """成功清理失败不发布成功/派生/游标，配置与实际文件记录分开。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("fail_clean", _fail_cleanup_handler)
     p.register_task("spawned", _noop_handler)
@@ -263,7 +263,7 @@ def _failing_handler(job, ctx):
 def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch, cleanup_error):
     """handler 已失败且失败清理再次失败：保留原始失败原因，附加清理错误。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("failing", _failing_handler)
     p.enqueue(Job("failing", "f1"))
@@ -385,7 +385,7 @@ def test_approved_waiting_declaration_cleanup_error_fails_job(
     tmp_path, monkeypatch, backend, wait, cleanup_error,
 ):
     """等待后获准的前删故障必须失败，不能冒充授权拒绝回 pending。"""
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
     target.write_text("valuable")
     p = TaskLite(backend=backend, **({"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}))
@@ -417,7 +417,7 @@ def test_pre_dispatch_cleanup_failure_settles_without_starting_worker(
 ):
     """静态前删失败经统一结算登记失败，保留声明且不启动 handler。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     target = tmp_path / "target"
     target.write_text("valuable", encoding="utf-8")
     marker = tmp_path / "started"
@@ -453,7 +453,7 @@ def test_pre_dispatch_cleanup_failure_settles_without_starting_worker(
 def test_pre_dispatch_removes_broken_symlink(tmp_path, monkeypatch):
     """断链链接按存在的目录项前删，不因其目标缺失被跳过。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     link = tmp_path / "broken-link"
     link.symlink_to(tmp_path / "missing-target")
     marker = tmp_path / "started"
@@ -476,7 +476,7 @@ def test_pre_dispatch_removes_broken_symlink(tmp_path, monkeypatch):
 def test_mark_running_failure_keeps_file_and_worker_unstarted(tmp_path, monkeypatch):
     """running 写失败保留 pending 队列与目标文件，不进入前删或 spawn。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     target = tmp_path / "target"
     target.write_text("valuable", encoding="utf-8")
     marker = tmp_path / "started"
@@ -567,7 +567,7 @@ def test_retry_cleanup_failure_settles_once_without_retry(
 ):
     """重试清理失败直接终结，单条 Attempt 同时保留重试原因与清理诊断。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
     p.register_task("retry", _retry_cleanup_handler)
     p.enqueue(Job("retry", "one", max_retries_per_run=3))
@@ -594,7 +594,7 @@ def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, mo
     """派发前待决授权留队、不占资源，等待期间仍结算已有执行。"""
     from tasklite.resource import CapacityResource
 
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
     target.write_text("valuable")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db", max_workers=2)
@@ -644,7 +644,7 @@ def _legacy_delete_handler(job, ctx):
 @pytest.mark.parametrize("backend", ["sqlite", "memory"])
 def test_removed_file_declaration_cannot_delete_without_authorization(tmp_path, monkeypatch, method, backend):
     """被移除的声明入口不得绕过主进程授权删除既有文件。"""
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "valuable"
     target.write_text("valuable")
     p = TaskLite(backend=backend, **({"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}))
@@ -676,7 +676,7 @@ def _legacy_output_message_handler(job, ctx):
 
 def test_removed_output_message_cannot_authorize_cleanup(tmp_path, monkeypatch):
     """单向产物帧不能作为绕过请求回复授权的删除入口。"""
-    monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "valuable"
     target.write_text("valuable")
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
@@ -715,7 +715,7 @@ def _rename_output_handler(job, ctx):
 def test_output_delete_on_success_allows_worker_rename(tmp_path, monkeypatch, mode, backend):
     """成功删除的输出允许工作进程在返回前原子 rename 移走，缺失视为已移除并发布原声明。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     temp_file = tmp_path / "temp_output.txt"
     final_file = tmp_path / "final_output.txt"
 
@@ -762,7 +762,7 @@ def test_output_delete_on_success_allows_worker_rename(tmp_path, monkeypatch, mo
 def test_output_without_delete_on_success_missing_fails(tmp_path, monkeypatch, mode, backend):
     """非成功删除的输出若在结算前缺失或被移走，必须判为失败。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_AUTO_APPROVE", "1")
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
     temp_file = tmp_path / "temp_output.txt"
     final_file = tmp_path / "final_output.txt"
 
