@@ -137,7 +137,7 @@ def test_public_declaration_write_fault_bypasses_handler_exception(tmp_path, kin
     if kind == "input":
         path.write_text("input")
     job = Job("transport", "inline", payload={"kind": kind, "path": str(path)})
-    ctx = JobContext(job, set(), set(), {}, output_roots=tmp_path)
+    ctx = JobContext(job, set(), set(), {})
     receiver, sender = create_worker_pipe(job_uid=job.uid, execution_id="session.1")
     reply_receiver, reply_sender = create_worker_reply_pipe(job_uid=job.uid, execution_id="session.1")
     spec = WorkerLaunchSpec(
@@ -172,7 +172,6 @@ def test_run_declaration_write_fault_preserves_original_queue(tmp_path, kind):
     pipeline = TaskLite(
         backend="sqlite",
         state_path=tmp_path / "transport.db",
-        output_roots=output_root,
     )
     pipeline.register_task("transport", _write_declaration_with_io_fault)
     job = Job(

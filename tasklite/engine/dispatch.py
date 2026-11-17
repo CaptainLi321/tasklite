@@ -107,7 +107,6 @@ class DispatchMachine:
         recovery: "RecoveryOrchestrator",
         completion: "CompletionMachine",
         tasks: "TaskSource",
-        output_roots: "Path | Sequence[Path] | None",
         protected_roots: tuple[Path, ...] = (),
         dispatch_start_lock: Any | None = None,
         file_resolver: "FileSpecResolver | None" = None,
@@ -122,10 +121,8 @@ class DispatchMachine:
         self._recovery = recovery
         self._completion = completion
         self._tasks = tasks
-        self._output_roots = output_roots
         self._protected_roots = protected_roots
         self._path_policy = ArtifactPathPolicy(
-            output_roots=output_roots,
             protected_roots=protected_roots,
             authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
         )
@@ -646,7 +643,6 @@ class DispatchMachine:
             frozenset(state.success_uids),
             frozenset(state.failed_uids),
             dict(state.cursors),
-            output_roots=self._output_roots,
             protected_roots=self._protected_roots,
             base_dir=self._trigger_registry.base_dir,
             known_job_uids=frozenset(

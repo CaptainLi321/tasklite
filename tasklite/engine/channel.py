@@ -437,11 +437,9 @@ class ExecutionChannel:
         self,
         *,
         process_context: Any | None = None,
-        output_roots: str | Path | Sequence[str | Path] | None = None,
         protected_roots: Sequence[str | Path] = (),
     ) -> None:
         self._process_context = process_context or mp.get_context("spawn")
-        self.output_roots = output_roots
         self.protected_roots = tuple(protected_roots)
         self._receivers: dict[str, WorkerPipeReceiver] = {}
         self._in_process_senders: dict[str, WorkerPipeSender] = {}

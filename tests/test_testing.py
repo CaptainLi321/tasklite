@@ -49,7 +49,6 @@ def _make_runtime(tmp_path) -> EngineRuntime:
             governor=DeadlockGovernor(),
             trigger_registry=TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS),
             requeue_policy=ImmediateRequeuePolicy(),
-            output_roots=tmp_path,
         )
     )
 
@@ -80,25 +79,25 @@ class TestFakeCtxBasics:
 
 
 class TestFakeCtxTmpRoot:
-    """tmp_root 模式只提供沙盒 output_roots。"""
+    """tmp_root 模式为上下文提供隔离临时 base_dir。"""
 
-    def test_output_root_under_tmp_root(self, tmp_path):
+    def test_base_dir_under_tmp_root(self, tmp_path):
         ctx = fake_ctx(_job(), tmp_root=tmp_path)
-        assert Path(ctx._output_roots).parent == tmp_path
-        assert not (Path(ctx._output_roots) / "ipc").exists()
+        assert Path(ctx._base_dir).parent == tmp_path
+        assert not (Path(ctx._base_dir) / "ipc").exists()
 
     def test_declare_file_uses_explicit_output_path(self, tmp_path):
         ctx = fake_ctx(_job(), tmp_root=tmp_path)
         from tasklite import FileSpec
 
-        final = ctx.declare_file("out", FileSpec(ctx._output_roots / "out.json", role="output"))
+        final = ctx.declare_file("out", FileSpec("out.json", role="output"))
         assert str(tmp_path) in str(final)
-        assert final.is_relative_to(ctx._output_roots)
+        assert final.is_relative_to(ctx._base_dir)
 
     def test_two_ctxs_get_isolated_dirs(self, tmp_path):
         ctx1 = fake_ctx(_job(), tmp_root=tmp_path)
         ctx2 = fake_ctx(_job(), tmp_root=tmp_path)
-        assert Path(ctx1._output_roots) != Path(ctx2._output_roots)
+        assert Path(ctx1._base_dir) != Path(ctx2._base_dir)
 
 
 class TestFakeCtxNoSuspensionSimulation:
@@ -112,10 +111,10 @@ class TestFakeCtxNoSuspensionSimulation:
 class TestFakeCtxExtendedParams:
     """keyword-only 扩展参数。"""
 
-    def test_direct_output_root_forwarded(self, tmp_path):
+    def test_direct_base_dir_forwarded(self, tmp_path):
         root = tmp_path / "root"
-        ctx = fake_ctx(_job(), output_roots=str(root))
-        assert str(ctx._output_roots) == str(root)
+        ctx = fake_ctx(_job(), base_dir=str(root))
+        assert str(ctx._base_dir) == str(root)
 
 class TestRunningHandle:
     """running 句柄：置位/复位/目标解析。"""

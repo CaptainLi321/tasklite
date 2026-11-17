@@ -33,13 +33,9 @@ class ArtifactPathPolicy:
     def __init__(
         self,
         *,
-        output_roots: str | Path | Sequence[str | Path] | None = None,
         protected_roots: Sequence[str | Path] = (),
         authorization_check: Callable[[str, str], bool] | None = None,
     ) -> None:
-        if isinstance(output_roots, (str, Path)):
-            output_roots = [output_roots]
-        self.output_roots = tuple(Path(root).resolve() for root in (output_roots or ()))
         self.protected_roots = tuple(Path(root).resolve() for root in protected_roots)
         self._authorization_check = authorization_check
 
@@ -60,8 +56,6 @@ class ArtifactPathPolicy:
         if not isinstance(raw, str) or not raw or "\x00" in raw:
             raise ValueError("artifact path must be a non-empty path without null bytes")
         target = Path(raw)
-        if not target.is_absolute() and sandbox and self.output_roots:
-            target = self.output_roots[0] / target
         target = Path(os.path.abspath(target))
         try:
             leaf = os.lstat(target)
@@ -87,15 +81,8 @@ class ArtifactPathPolicy:
                 target = target.resolve()
             except RuntimeError as error:
                 raise ValueError(f"cannot resolve artifact path: {target}") from error
-        if sandbox and self.output_roots and not any(
-            target.is_relative_to(root) for root in self.output_roots
-        ):
-            raise ValueError(f"artifact path is outside output roots: {target}")
         if target.parent == target:
             raise ValueError(f"filesystem root cannot be an artifact: {target}")
-        for root in self.output_roots:
-            if root.is_relative_to(target):
-                raise ValueError(f"artifact must not cover an output root: {target}")
         for root in self.protected_roots:
             if root.is_relative_to(target) or target.is_relative_to(root):
                 raise ValueError(f"artifact overlaps a protected root: {target}")

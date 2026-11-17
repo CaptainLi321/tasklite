@@ -54,8 +54,7 @@ class ConfigEnv:
             governor=self.governor,
             trigger_registry=self.trigger_registry,
             requeue_policy=self.requeue_policy,
-            output_roots=None,
-        )
+            )
         base.update(overrides)
         return RunConfig.resolve(**base)
 

@@ -58,7 +58,6 @@ class DispatchEnv:
     """派发机器窄依赖装配（字段即依赖清单）。"""
 
     def __init__(self, tmp_path, *, capacity: float = 2.0, extra_resources=None):
-        self.output_roots = str(tmp_path / "out")
 
         resources_map = {
             "__workers__": CapacityResource("__workers__", max_capacity=capacity),
@@ -106,7 +105,6 @@ class DispatchEnv:
                 in_flight=self.in_flight, session=self.session,
             ),
             tasks=self.tasks,
-            output_roots=self.output_roots,
         )
 
     def register(self, task_type: str) -> None:

@@ -58,7 +58,6 @@ def fake_ctx(
     failed: Iterable[str] | None = None,
     cursors: dict[str, str] | None = None,
     tmp_root: Any | None = None,
-    output_roots: Any | None = None,
     base_dir: str | Path | None = None,
     known_job_uids: Iterable[str] | None = None,
     files: Mapping[str, Any] | None = None,
@@ -72,10 +71,9 @@ def fake_ctx(
         protected_roots: 不可声明为产物的框架状态目录。
         failed: 已进失败档案的 uid 集合。
         cursors: 游标初值映射（``ctx.get_cursor`` 命中源）。
-        tmp_root: 提供时在其下创建一次性临时目录作为 ``output_roots``。
+        tmp_root: 提供时在其下创建一次性临时目录作为相对路径解析基准（``base_dir``）。
             目录清理由调用方的 tmp_root 机制（如 pytest tmp_path 的会话级
             回收）统一承担。
-        output_roots: 直接指定产物根目录（与 tmp_root 互斥使用）。
         base_dir: 相对路径解析基准目录（默认当前工作目录）。
         known_job_uids: 允许被引用的已知 Job UID 集合（派生校验用）。
         files: 预声明文件规范字典（默认继承 job.files）。
@@ -83,15 +81,13 @@ def fake_ctx(
     Returns:
         JobContext: 内部容器结构由本函数兜底装配的真实上下文实例。
     """
-    if tmp_root is not None:
-        base = Path(tempfile.mkdtemp(dir=str(tmp_root)))
-        output_roots = base
+    if tmp_root is not None and base_dir is None:
+        base_dir = Path(tempfile.mkdtemp(dir=str(tmp_root)))
     return JobContext(
         job,
         set(successes) if successes is not None else set(),
         set(failed) if failed is not None else set(),
         dict(cursors) if cursors is not None else {},
-        output_roots=Path(output_roots) if isinstance(output_roots, str) else output_roots,
         artifact_descriptions=artifacts,
         protected_roots=protected_roots,
         base_dir=base_dir,

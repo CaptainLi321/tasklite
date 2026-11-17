@@ -187,8 +187,7 @@ class RuntimeEnv:
                     functions=BUILTIN_TRIGGER_FUNCTIONS,
                 ),
                 requeue_policy=ImmediateRequeuePolicy(),
-                output_roots=tmp_path,
-            ),
+                    ),
         )
 
     def register(self, task_type: str, handler=ok_handler) -> None:

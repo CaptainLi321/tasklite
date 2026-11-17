@@ -300,7 +300,6 @@ class TestMainSurfaceExports:
             "backend",
             "state_path",
             "max_workers",
-            "output_roots",
         ]
         assert all(
             param.kind is inspect.Parameter.KEYWORD_ONLY

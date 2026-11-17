@@ -18,8 +18,12 @@ from tasklite.utils.clock import parse_utc_iso_to_us
 def _pipeline(tmp_path, **overrides):
     out = tmp_path / "output"
     out.mkdir(parents=True, exist_ok=True)
-    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "trigger_lifecycle.db",
-                        output_roots=out, **overrides)
+    prev = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "trigger_lifecycle.db", **overrides)
+    finally:
+        os.chdir(prev)
     pipeline._runtime.store.authorizer = lambda *args: True
     return pipeline
 
@@ -29,7 +33,7 @@ def produce_input(job, ctx):
     if mode == "fail":
         return TaskResult.failure(message="upstream failed in this batch")
     path = Path(ctx.declare_file("source", FileSpec(
-        ctx._output_roots / "source.txt",
+        ctx._base_dir / "output" / "source.txt",
         role="output",
         delete_existing=mode == "write",
     )))
@@ -111,7 +115,7 @@ def always_retry(job, ctx):
 
 
 def _record_child_call(ctx) -> int:
-    calls = ctx._output_roots / "child_calls.txt"
+    calls = ctx._base_dir / "output" / "child_calls.txt"
     with calls.open("a", encoding="utf-8") as stream:
         stream.write(f"{ctx.job.attempt_no}\n")
     return len(calls.read_text(encoding="utf-8").splitlines())
@@ -373,7 +377,7 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
 
 
 def discover_page(job, ctx, page):
-    with (ctx._output_roots / "scan_calls").open("a", encoding="utf-8") as stream:
+    with (ctx._base_dir / "output" / "scan_calls").open("a", encoding="utf-8") as stream:
         stream.write(f"{page}:{os.getpid()}\n")
     return [{"id": "item"}] if page == 1 else []
 
@@ -427,8 +431,8 @@ def _wait_for_file(path, timeout=20):
 
 
 def waiting_for_release(job, ctx):
-    (ctx._output_roots / "worker_ready").write_text(str(os.getpid()), encoding="utf-8")
-    _wait_for_file(ctx._output_roots / "worker_release")
+    (ctx._base_dir / "output" / "worker_ready").write_text(str(os.getpid()), encoding="utf-8")
+    _wait_for_file(ctx._base_dir / "output" / "worker_release")
     return TaskResult.success(metadata={"pid": os.getpid()})
 
 
@@ -473,7 +477,7 @@ def test_trigger_exception_aborts_real_worker_and_preserves_recovery_candidates(
 
 
 def _record_until_success_call(job, ctx):
-    calls = ctx._output_roots / "until_success_calls.txt"
+    calls = ctx._base_dir / "output" / "until_success_calls.txt"
     with calls.open("a", encoding="utf-8") as stream:
         stream.write(f"{job.uid}\n")
     return TaskResult.success(metadata={"calls": len(calls.read_text().splitlines())})

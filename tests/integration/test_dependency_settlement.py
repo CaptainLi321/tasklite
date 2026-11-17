@@ -12,12 +12,16 @@ from tasklite import Job, TaskLite, TaskResult
 def _pipeline(tmp_path):
     output = tmp_path / "output"
     output.mkdir(parents=True, exist_ok=True)
-    return TaskLite(
-        backend="sqlite",
-        state_path=tmp_path / "dependency.db",
-        output_roots=output,
-        max_workers=2,
-    )
+    prev = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        return TaskLite(
+            backend="sqlite",
+            state_path=tmp_path / "dependency.db",
+            max_workers=2,
+        )
+    finally:
+        os.chdir(prev)
 
 
 def _succeed(job, ctx):
@@ -25,7 +29,7 @@ def _succeed(job, ctx):
 
 
 def _wait_for_release(job, ctx):
-    output = Path(ctx._output_roots)
+    output = Path(ctx._base_dir) / "output"
     (output / "dependency_worker_ready").write_text("ready", encoding="utf-8")
     deadline = time.monotonic() + 30
     while not (output / "dependency_worker_release").exists():
@@ -93,7 +97,7 @@ def test_missing_dependency_settles_while_unrelated_worker_is_in_flight(tmp_path
 
     runner = threading.Thread(target=run_pipeline, daemon=True)
     runner.start()
-    output = Path(pipeline._output_roots)
+    output = Path(pipeline._base_dir) / "output"
     try:
         ready = output / "dependency_worker_ready"
         deadline = time.monotonic() + 20

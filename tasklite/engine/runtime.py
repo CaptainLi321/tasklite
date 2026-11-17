@@ -135,7 +135,6 @@ class EngineRuntime:
             recovery=self._recovery,
             completion=self._completion,
             tasks=config.tasks,
-            output_roots=config.output_roots,
             protected_roots=config.protected_roots,
             dispatch_start_lock=self._dispatch_start_lock,
             file_resolver=self.file_resolver,
@@ -317,7 +316,6 @@ class EngineRuntime:
         self, request: PendingDeclaration
     ) -> tuple[str, dict[str, str] | None]:
         policy = ArtifactPathPolicy(
-            output_roots=self.config.output_roots,
             protected_roots=self.config.protected_roots,
         )
         try:
@@ -367,7 +365,6 @@ class EngineRuntime:
 
         if request.bound.delete_existing:
             policy = ArtifactPathPolicy(
-                output_roots=self.config.output_roots,
                 protected_roots=self.config.protected_roots,
                 authorization_check=lambda path, kind: self.store.backend.is_path_authorized(path, kind),
             )

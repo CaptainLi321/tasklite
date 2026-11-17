@@ -664,40 +664,6 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     p.close()
 
 
-def test_auto_approve_does_not_authorize_out_of_root_dynamic_target(
-    tmp_path, monkeypatch,
-):
-    """硬性输出范围校验先于自动授权记录，根外目标保持原样并结算失败。"""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
-    allowed = tmp_path / "allowed"
-    allowed.mkdir()
-    target = tmp_path / "outside.txt"
-    target.write_text("valuable", encoding="utf-8")
-
-    p = TaskLite(
-        backend="sqlite",
-        state_path=tmp_path / "outside-root.db",
-        output_roots=allowed,
-    )
-    p.register_task("work", _declare_then_write_handler)
-    p.enqueue(Job(
-        "work",
-        "one",
-        payload={"path": str(target), "content": "overwrite"},
-    ))
-    p.run(install_signals=False)
-
-    assert target.read_text(encoding="utf-8") == "valuable"
-    assert p.list_authorizations() == []
-    failure = p._runtime.store.backend.load_failed()["work::one"]
-    assert "outside output roots" in failure["error_message"]
-    attempt, = p._runtime.store.backend.load_settled_attempts("work::one")
-    assert attempt["outcome"] == "failure"
-    assert "work::one" not in p._runtime._temporary_excluded_uids
-    p.close()
-
-
 def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
     tmp_path, monkeypatch,
 ):
@@ -713,7 +679,6 @@ def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
     p = TaskLite(
         backend="sqlite",
         state_path=state_path,
-        output_roots=allowed,
     )
     authorizer = _ControlledAuthorizer(decision=None)
     p._runtime.store.authorizer = authorizer
@@ -871,7 +836,7 @@ def test_forbidden_file_operations_never_request_or_persist_authorization(
     target = targets[forbidden]
     calls = []
     removals = []
-    with TaskLite(backend="sqlite", state_path=state_path, output_roots=allowed) as p:
+    with TaskLite(backend="sqlite", state_path=state_path) as p:
         p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         monkeypatch.setattr(
             "tasklite.utils.artifact.ArtifactPathPolicy._remove",
@@ -908,7 +873,7 @@ def test_static_forbidden_declaration_prevents_authorizing_other_targets(tmp_pat
     bad = tmp_path / "bad"
     good.write_text("good", encoding="utf-8")
     bad.write_text("bad", encoding="utf-8")
-    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db", output_roots=allowed) as p:
+    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
         calls = []
         p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         p.register_task("work", _quick_handler)
@@ -1021,7 +986,7 @@ def test_allowed_file_operations_keep_instance_path_base(
     target.write_text("old", encoding="utf-8")
     monkeypatch.chdir(base)
     kwargs = {"state_path": base / "state.db"} if backend == "sqlite" else {}
-    with TaskLite(backend=backend, output_roots="../allowed", **kwargs) as p:
+    with TaskLite(backend=backend, **kwargs) as p:
         calls = []
         p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         p.register_task("work", _fixed_base_file_handler)

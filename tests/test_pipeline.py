@@ -254,23 +254,6 @@ class TestConstruction:
         assert p._state_path is None
         assert p._backend_type == "memory"
 
-    def test_output_root_resolved_without_creating_dir(self, tmp_path):
-        root = tmp_path / "out_not_created"
-        p = make_pipeline(tmp_path, output_roots=root)
-        assert p._output_roots == root.resolve()
-        assert not root.exists()
-
-    def test_output_root_multi_root_resolved_without_creating_dir(self, tmp_path):
-        roots = [tmp_path / "o1", tmp_path / "o2"]
-        p = make_pipeline(tmp_path, output_roots=roots)
-        assert p._output_roots == [r.resolve() for r in roots]
-        assert not roots[0].exists()
-        assert not roots[1].exists()
-
-    def test_output_root_bad_type_rejected(self, tmp_path):
-        with pytest.raises(TaskLiteError, match="output_roots"):
-            make_pipeline(tmp_path, output_roots=42)
-
     def test_backend_sqlite_type_name(self, tmp_path):
         p = TaskLite(backend="sqlite", state_path=tmp_path / "test.db")
         assert p._backend_type == "sqlite"

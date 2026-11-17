@@ -22,7 +22,6 @@ def _make_ctx(
     successes: set[str] | None = None,
     failed: set[str] | None = None,
     cursors: dict[str, str] | None = None,
-    output_roots: Path | None = None,
 ) -> JobContext:
     """构造测试用 JobContext（内部容器由本工厂兜底装配）。"""
     return JobContext(
@@ -30,7 +29,6 @@ def _make_ctx(
         success_job_uids=successes if successes is not None else set(),
         failed_job_uids=failed if failed is not None else set(),
         cursors=cursors if cursors is not None else {},
-        output_roots=output_roots,
     )
 
 
@@ -166,7 +164,7 @@ class TestInputFileSpec:
     """输入存在性和固定基准统一由 FileSpec 声明表达。"""
 
     def test_missing_input_fails_without_recording(self, tmp_path):
-        ctx = _make_ctx(output_roots=tmp_path)
+        ctx = _make_ctx()
         with pytest.raises(TaskLiteError, match="Missing input file"):
             ctx.declare_file(
                 "source",

@@ -126,7 +126,6 @@ class CompletionMachine:
         active_files: dict[str, FileSpec],
     ) -> None:
         policy = ArtifactPathPolicy(
-            output_roots=getattr(self._channel, "output_roots", None),
             protected_roots=self._channel.protected_roots,
         )
         for spec in active_files.values():
@@ -233,7 +232,6 @@ class CompletionMachine:
             raise _ArtifactIOError(result.artifact_error)
         if result.success:
             policy = ArtifactPathPolicy(
-                output_roots=getattr(self._channel, "output_roots", None),
                 protected_roots=self._channel.protected_roots,
             )
             for fname, spec in active_files.items():
@@ -356,7 +354,6 @@ class CompletionMachine:
         # 声明式产物主进程清理
         if active_files:
             policy = ArtifactPathPolicy(
-                output_roots=getattr(self._channel, "output_roots", None),
                 protected_roots=self._channel.protected_roots,
                 authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
             )

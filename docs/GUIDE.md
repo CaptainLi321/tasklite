@@ -187,7 +187,7 @@ def fetch_handler(job: Job, ctx) -> TaskResult:
 
 
 if __name__ == "__main__":
-    with TaskLite(backend="sqlite", state_path="./state.db", output_roots="./output") as pipeline:
+    with TaskLite(backend="sqlite", state_path="./state.db") as pipeline:
         pipeline.register_resource(IntervalResource("net", interval_seconds=0.1))
         pipeline.register_task(Task("fetch", fetch_handler, resources={"net": 1.0}))
         pipeline.enqueue(Job("fetch", "item_1", payload={"content": "示例一"}))
@@ -239,8 +239,7 @@ FileSpec(
 ### 文件操作授权管理
 
 文件声明用于路径管理、依赖传递与清理请求，不是 handler 的写入沙箱。读取默认允许；当任务声明 `delete_existing`、`delete_on_failure` 或 `delete_on_success` 时，主进程拥有授权检查与清理执行职责：
-- `TaskLite(..., output_roots=...)`（可选目录白名单）：默认 `None` 不限制；若显式配置，则框架准备、写入或清理声明路径时必须在这些根目录之内，**即使开启 `TASKLITE_DANGEROUS_AUTO_APPROVE=1` 也无法越界**，适合批处理或无人值守场景防止误删/越界；
-- 环境变量 `TASKLITE_DANGEROUS_AUTO_APPROVE=1`：自动同意本进程实际请求且未命中 `output_roots` 与硬性保护规则的框架文件操作，并记录实际授权路径；
+- 环境变量 `TASKLITE_DANGEROUS_AUTO_APPROVE=1`：危险开关，自动同意本进程实际请求且未命中硬性保护规则的框架文件操作，并记录实际授权路径；开启后框架不再逐项弹窗询问，请确保声明路径安全可控；
 - 等待授权决策时暂停新派发，继续处理已派发执行；初始派发前的授权等待不占用业务资源、不消费配额，也不计执行超时；
 - 运行中动态声明或结果清理的授权待决仍持有本次已获取的资源；动态声明等待期间暂停执行超时计时，收到有效结果后的清理不计执行超时；
 - 初始派发前授权拒绝时，Job 保持 `pending`，不产生 Attempt；已进入 `running` 后授权拒绝或等待期间收到停止请求时，先结束受阻执行，再追加 `failure` Attempt、把 Job 回到 `pending`；两者均不写失败档案、不消耗重试预算；

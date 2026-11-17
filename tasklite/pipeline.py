@@ -54,7 +54,6 @@ class TaskLite:
         backend: "sqlite"（ACID 保证）或 "memory"（内存状态）。
         state_path: SQLite 数据库文件路径（backend="sqlite" 时必填，memory 默认 None）。
         max_workers: 最大并发子进程数（默认 4）。
-        output_roots: 框架文件操作目录白名单（单根或多根序列）；默认 None 不限制，构造不创建目录。
     """
 
     def __init__(
@@ -63,7 +62,6 @@ class TaskLite:
         backend: Literal["sqlite", "memory"],
         state_path: str | Path | None = None,
         max_workers: int = _DEFAULT_MAX_WORKERS,
-        output_roots: str | Path | Sequence[str | Path] | None = None,
     ) -> None:
         if backend not in (_BACKEND_SQLITE, _BACKEND_MEMORY):
             if isinstance(backend, str):
@@ -92,7 +90,6 @@ class TaskLite:
 
         self._closed: bool = False
         self._base_dir: Path = Path(os.path.abspath(os.getcwd()))
-        self._output_roots = self._resolve_output_roots(output_roots)
         self._backend_type: str = backend
         self._backend_handle: AbstractStateBackend | None = None
 
@@ -109,7 +106,6 @@ class TaskLite:
             self._process_context = mp.get_context("spawn")
             self._channel = ExecutionChannel(
                 process_context=self._process_context,
-                output_roots=self._output_roots,
                 protected_roots=((self._state_path,) if self._state_path is not None else ()),
             )
             self._runtime_config = self._build_run_config(self._backend_handle)
@@ -171,22 +167,6 @@ class TaskLite:
 
     # ── 构造期装配分区 ────────────────────────────────────────────
 
-    @staticmethod
-    def _resolve_output_roots(
-        output_roots: str | Path | Sequence[str | Path] | None,
-    ) -> Path | list[Path] | None:
-        """产物根装配：单根/多根（多根时声明路径属任一根即过沙盒），不创建目录。"""
-        if output_roots is None:
-            return None
-        if isinstance(output_roots, (list, tuple)):
-            return [Path(r).resolve() for r in output_roots]
-        if isinstance(output_roots, (str, Path)):
-            return Path(output_roots).resolve()
-        raise TaskLiteError(
-            f"output_roots must be str/Path or a sequence thereof, "
-            f"got {type(output_roots).__name__}"
-        )
-
     def _build_backend(self, backend: str) -> AbstractStateBackend:
         """持久化后端装配。"""
         if backend == _BACKEND_SQLITE:
@@ -217,7 +197,6 @@ class TaskLite:
             channel=self._channel,
             governor=DeadlockGovernor(),
             trigger_registry=self._triggers,
-            output_roots=self._output_roots,
         )
 
     # ── 运行期只读接缝 ─────────────────────────────────────────────

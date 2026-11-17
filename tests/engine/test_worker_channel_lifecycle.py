@@ -91,7 +91,6 @@ def test_worker_lingers_after_result_does_not_block_dispatch_and_run_waits(tmp_p
     pipeline = TaskLite(
         backend="sqlite",
         state_path=tmp_path / "channel_separation.db",
-        output_roots=tmp_path / "output",
         max_workers=2,
     )
     pipeline.register_task("lingering", _lingering_worker)

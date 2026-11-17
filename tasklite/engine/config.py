@@ -35,7 +35,6 @@ class RunConfig:
     requeue_policy: RequeuePolicy
     ordering_policy: OrderingPolicy
     name: str = "tasklite"
-    output_roots: Path | Sequence[Path] | None = None
     protected_roots: tuple[Path, ...] = ()
 
     @classmethod
@@ -51,7 +50,6 @@ class RunConfig:
         name: str = "tasklite",
         requeue_policy: RequeuePolicy | None = None,
         ordering_policy: OrderingPolicy | None = None,
-        output_roots: Path | Sequence[Path] | None = None,
         protected_roots: tuple[Path, ...] = (),
     ) -> "RunConfig":
         """按引用装配依赖，并解析内部策略默认值。"""
@@ -68,7 +66,6 @@ class RunConfig:
                 requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
             ),
             ordering_policy=ordering_policy if ordering_policy is not None else FifoOrderingPolicy(),
-            output_roots=output_roots,
         )
 
 

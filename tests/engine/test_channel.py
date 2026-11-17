@@ -622,7 +622,7 @@ class TestAbortInFlight:
             pass
 
     def test_abort_with_completed_and_cancelled(self, tmp_path):
-        channel = ExecutionChannel(output_roots=tmp_path)
+        channel = ExecutionChannel()
         job_done = Job("task", "done")
         job_pending = Job("task", "pending")
         unfinished = tmp_path / "unfinished"

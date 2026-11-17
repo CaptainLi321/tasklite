@@ -13,7 +13,7 @@ def test_existing_output_requires_its_own_deletion_authorization(tmp_path):
     root.mkdir()
     target = root / "result"
     target.write_text("existing", encoding="utf-8")
-    policy = ArtifactPathPolicy(output_roots=[root])
+    policy = ArtifactPathPolicy()
     declaration = ArtifactDeclaration(str(target), delete_on_failure=True)
     with pytest.raises(FileExistsError):
         policy.remove_existing(declaration)
@@ -27,7 +27,7 @@ def test_pre_delete_removes_broken_symlink_without_following_target(tmp_path):
     root.mkdir()
     link = root / "broken"
     link.symlink_to(tmp_path / "missing-target")
-    policy = ArtifactPathPolicy(output_roots=root)
+    policy = ArtifactPathPolicy()
     declaration = ArtifactDeclaration(str(link), delete_existing=True)
 
     _execute_pre_deletes(policy, [declaration])
@@ -42,7 +42,7 @@ def test_pre_delete_rejects_live_symlink_without_touching_target(tmp_path):
     outside.write_text("precious", encoding="utf-8")
     link = root / "live"
     link.symlink_to(outside)
-    policy = ArtifactPathPolicy(output_roots=root)
+    policy = ArtifactPathPolicy()
 
     with pytest.raises(ValueError, match="symlink"):
         policy.remove_existing(ArtifactDeclaration(str(link), delete_existing=True))
@@ -55,7 +55,7 @@ def test_pre_delete_missing_target_is_idempotent(tmp_path):
     root = tmp_path / "output"
     root.mkdir()
     target = root / "missing"
-    policy = ArtifactPathPolicy(output_roots=root)
+    policy = ArtifactPathPolicy()
 
     _execute_pre_deletes(
         policy,
@@ -76,7 +76,7 @@ def test_cleanup_obeys_only_the_selected_phase_authorization(tmp_path, is_direct
         (target / "child").write_text("data", encoding="utf-8")
     else:
         target.write_text("data", encoding="utf-8")
-    policy = ArtifactPathPolicy(output_roots=root)
+    policy = ArtifactPathPolicy()
     other_phase = ArtifactDeclaration(str(target), delete_existing=True,
                                       delete_on_success=not success, delete_on_failure=success)
     policy.cleanup(other_phase, success=success)
@@ -97,7 +97,7 @@ def test_leaf_symlinks_are_rejected_without_touching_target(tmp_path, link_targe
         outside.write_text("precious", encoding="utf-8")
     link = root / "link"
     link.symlink_to(outside)
-    policy = ArtifactPathPolicy(output_roots=root)
+    policy = ArtifactPathPolicy()
     with pytest.raises(ValueError, match="symlink"):
         policy.resolve(link)
     assert link.is_symlink()
@@ -114,7 +114,7 @@ def test_safe_parent_link_returns_canonical_path_but_escape_is_rejected(tmp_path
     outside = tmp_path / "outside"
     outside.mkdir()
     (root / "escape").symlink_to(outside, target_is_directory=True)
-    policy = ArtifactPathPolicy(output_roots=root)
+    policy = ArtifactPathPolicy()
     assert policy.resolve("inside/result") == str(real / "result")
     with pytest.raises(ValueError):
         policy.resolve("escape/result")
@@ -126,7 +126,7 @@ def test_roots_and_engine_regions_are_protected_even_with_sandbox_disabled(tmp_p
     state = tmp_path / "state"
     root.mkdir()
     state.mkdir()
-    policy = ArtifactPathPolicy(output_roots=root, protected_roots=[state])
+    policy = ArtifactPathPolicy(protected_roots=[state])
     for protected in [Path(root.anchor), tmp_path, root, state, state / "ipc" / "file"]:
         with pytest.raises(ValueError):
             policy.resolve(protected, sandbox=sandbox)
@@ -141,7 +141,7 @@ def test_directory_cleanup_unlinks_nested_link_without_following_it(tmp_path):
     outside.mkdir()
     (outside / "precious").write_text("keep", encoding="utf-8")
     (target / "link").symlink_to(outside, target_is_directory=True)
-    policy = ArtifactPathPolicy(output_roots=root)
+    policy = ArtifactPathPolicy()
     policy.cleanup(ArtifactDeclaration(str(target), delete_on_success=True), success=True)
     assert not target.exists()
     assert (outside / "precious").read_text(encoding="utf-8") == "keep"
@@ -160,7 +160,7 @@ def test_disappearing_parent_during_directory_walk_is_not_reported_as_success(tm
         return names
     monkeypatch.setattr(os, "listdir", move_parent)
     monkeypatch.setattr(os, "supports_fd", os.supports_fd | {move_parent})
-    policy = ArtifactPathPolicy(output_roots=root)
+    policy = ArtifactPathPolicy()
     with pytest.raises((OSError, ValueError)):
         policy.cleanup(ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
     assert (tmp_path / "moved" / "directory" / "child").read_text(encoding="utf-8") == "keep"
@@ -180,7 +180,7 @@ def test_same_device_bind_mount_with_escaped_path_blocks_directory_cleanup(tmp_p
         return real_read(path, *args, **kwargs)
     monkeypatch.setattr(Path, "read_text", mount_table)
     assert mounted.stat().st_dev == target.stat().st_dev
-    policy = ArtifactPathPolicy(output_roots=root)
+    policy = ArtifactPathPolicy()
     with pytest.raises(ValueError, match="mount"):
         policy.cleanup(ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
     assert (mounted / "precious").read_text(encoding="utf-8") == "keep"
@@ -198,7 +198,7 @@ def test_unknown_mount_boundaries_refuse_directory_deletion(tmp_path, monkeypatc
         return real_read(path, *args, **kwargs)
     monkeypatch.setattr(Path, "read_text", denied_mount_table)
     with pytest.raises(NotImplementedError):
-        ArtifactPathPolicy(output_roots=root).cleanup(
+        ArtifactPathPolicy().cleanup(
             ArtifactDeclaration(str(target), delete_on_success=True), success=True)
     assert (target / "precious").read_text(encoding="utf-8") == "keep"
 
@@ -215,7 +215,7 @@ def test_inaccessible_output_is_reported_instead_of_treated_as_missing(tmp_path)
     private.chmod(0)
     try:
         with pytest.raises(PermissionError):
-            ArtifactPathPolicy(output_roots=root).cleanup(
+            ArtifactPathPolicy().cleanup(
                 ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
     finally:
         private.chmod(0o700)
@@ -248,7 +248,7 @@ def test_parent_replaced_during_open_is_rejected_without_deleting_replacement(tm
     monkeypatch.setattr(os, "open", replace_parent)
     monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {replace_parent})
     with pytest.raises((ValueError, OSError)):
-        ArtifactPathPolicy(output_roots=root).cleanup(
+        ArtifactPathPolicy().cleanup(
             ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
     precious = replacement / "result" if use_link else parent / "result"
     assert precious.read_text(encoding="utf-8") == "precious"
@@ -265,7 +265,7 @@ def test_normal_leaf_replace_before_cleanup_is_allowed(tmp_path):
     temporary = root / "temporary"
     temporary.write_text("replacement", encoding="utf-8")
     os.replace(temporary, target)
-    ArtifactPathPolicy(output_roots=root).cleanup(declaration, success=True)
+    ArtifactPathPolicy().cleanup(declaration, success=True)
     assert not target.exists()
 
 
@@ -277,7 +277,7 @@ def test_missing_non_following_capability_refuses_file_deletion(tmp_path, monkey
     target.write_text("keep", encoding="utf-8")
     monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
     with pytest.raises(NotImplementedError):
-        ArtifactPathPolicy(output_roots=root).cleanup(
+        ArtifactPathPolicy().cleanup(
             ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
     assert target.read_text(encoding="utf-8") == "keep"
 
@@ -293,6 +293,6 @@ def test_malformed_mount_table_does_not_authorize_recursion(tmp_path, monkeypatc
         return data if path == Path("/proc/self/mountinfo") else real_read(path, *args, **kwargs)
     monkeypatch.setattr(Path, "read_text", mount_table)
     with pytest.raises(NotImplementedError):
-        ArtifactPathPolicy(output_roots=root).cleanup(
+        ArtifactPathPolicy().cleanup(
             ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
     assert (target / "precious").read_text(encoding="utf-8") == "keep"

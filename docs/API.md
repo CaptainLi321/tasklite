@@ -153,7 +153,6 @@ TaskLite(
     backend: Literal["sqlite", "memory"],
     state_path: str | Path | None = None,
     max_workers: int = 4,
-    output_roots: str | Path | Sequence[str | Path] | None = None,
 )
 ```
 
@@ -166,9 +165,6 @@ TaskLite(
 - **`max_workers`**（`int`，默认 `4`，仅关键字参数）：
   - 最大并发工作子进程数。必须为非 `bool` 的 `int` 且 `>= 1`；非法值抛出 `TaskLiteError`。
   - 内部自动以此上限向资源管理器注册内置并发容量。
-- **`output_roots`**（`str | Path | Sequence[str | Path] | None`，默认 `None`，仅关键字参数）：
-  - 框架文件操作目录白名单（非 handler 写入沙箱）。构造时不触碰磁盘、不自动创建目录。
-  - 若传入 `None`（默认），不额外限制声明路径范围；若传入单个 `str | Path` 或序列，框架准备、写入或清理声明路径时必须落于这些根目录之内，即使启用 `TASKLITE_DANGEROUS_AUTO_APPROVE=1` 也不得越界；传入其他类型抛出 `TaskLiteError`。
 - **内部基准目录**：
   - 构造时内部自动捕获当时的绝对工作目录 `Path(os.path.abspath(os.getcwd()))`，后续相对路径声明的解析均基于此固定基准，不受运行时工作目录改变影响。
 - **SQLite 状态库 Schema 6 校验**：
@@ -182,7 +178,7 @@ TaskLite(
 - **`is_running`**（`bool`，只读）：管线当前是否正在执行 `run()` 循环中。
 
 > [!NOTE]
-> **私有化内部边界说明**：为保障面向稳定基线（[ADR-0011](adr/0011-stable-interface-baseline.md)）的封装纯洁性，内部状态与配置字段（`_state_path`, `_base_dir`, `_output_roots`, `_tasks`, `_resources`, `_runtime_config`, `_backend_type` 及内部授权回调）均彻底私有化，不再向外暴露为公开属性。调用方应始终通过 `register_task`、`register_resource`、`list_authorizations`、`revoke_authorization` 等标准公开方法与管线交互，不得将内部字段当做稳定公开 API。
+> **私有化内部边界说明**：为保障面向稳定基线（[ADR-0011](adr/0011-stable-interface-baseline.md)）的封装纯洁性，内部状态与配置字段（`_state_path`, `_base_dir`, `_tasks`, `_resources`, `_runtime_config`, `_backend_type` 及内部授权回调）均彻底私有化，不再向外暴露为公开属性。调用方应始终通过 `register_task`、`register_resource`、`list_authorizations`、`revoke_authorization` 等标准公开方法与管线交互，不得将内部字段当做稳定公开 API。
 
 ---
 
@@ -436,7 +432,7 @@ Job(
 - `ctx.job`（`Job`）：当前正在执行的作业逻辑实例；
 
 > [!NOTE]
-> **内部状态彻底私有化**：`JobContext` 仅暴露 `ctx.job` 及受控交互方法（`spawn`, `declare_file`, `file_path`, `get_cursor`, `set_cursor`）。内部字段 `_base_dir`、`_output_roots` 及累积容器 `_spawned_jobs`、`_cursor_updates` 已彻底私有化，不向外部暴露任何内部配置或累积容器属性。所有衍生作业与游标变更必须经由 `ctx.spawn()` 与 `ctx.set_cursor()` 受控登记，并在作业成功结算时由主进程原子提交。
+> **内部状态彻底私有化**：`JobContext` 仅暴露 `ctx.job` 及受控交互方法（`spawn`, `declare_file`, `file_path`, `get_cursor`, `set_cursor`）。内部字段 `_base_dir` 及累积容器 `_spawned_jobs`、`_cursor_updates` 已彻底私有化，不向外部暴露任何内部配置或累积容器属性。所有衍生作业与游标变更必须经由 `ctx.spawn()` 与 `ctx.set_cursor()` 受控登记，并在作业成功结算时由主进程原子提交。
 
 #### 公开方法
 1. **`file_path(name: str) -> Path`**：
@@ -776,8 +772,8 @@ Exclude(*, task_type: str)
   - 只有当环境变量值**严格等于字符串 `"1"`** 时生效（诸如 `"true"`、`"yes"`、`"True"` 均不生效）。
 - **持久化授权效果**：
   - 当命中 `"1"` 时，主进程遇到未授权的文件清理或准备操作时自动批准，并**将该授权永久写入状态库的 `authorizations` 表**中；后续执行直接命中库中授权。
-- **受保护路径与目录白名单硬拦截边界**：
-  - 即使设置了 `TASKLITE_DANGEROUS_AUTO_APPROVE="1"`，若目标路径属于状态库自身、锁文件或引擎受保护目录，或超出构造时显式配置的 `output_roots` 目录白名单，框架底层安全防护机制依然**硬拦截拒绝**，杜绝误删状态库或越界操作风险。
+- **受保护路径硬拦截边界**：
+  - 即使设置了 `TASKLITE_DANGEROUS_AUTO_APPROVE="1"`，若目标路径属于状态库自身、锁文件或引擎受保护目录，框架底层安全防护机制依然**硬拦截拒绝**，杜绝误删状态库风险。
 
 ---
 
@@ -804,15 +800,14 @@ fake_ctx(
     failed: Iterable[str] | None = None,
     cursors: dict[str, str] | None = None,
     tmp_root: Any | None = None,
-    output_roots: Any | None = None,
     base_dir: str | Path | None = None,
     known_job_uids: Iterable[str] | None = None,
     files: Mapping[str, Any] | None = None,
 ) -> JobContext
 ```
-- **核心职责**：构建真实的 `JobContext` 实例。严格遵循产物沙盒策略、受保护路径及依赖合法性校验；
+- **核心职责**：构建真实的 `JobContext` 实例。严格遵循受保护路径及依赖合法性校验；
 - **参数说明**：
-  - `tmp_root`：提供时自动在其下创建临时目录作为产物根（与 `output_roots` 互斥）；
+  - `tmp_root`：提供时自动在其下创建临时目录作为相对路径解析基准（`base_dir`）；
   - `successes` / `failed`：模拟历史完成与失败作业集合；
   - `artifacts`：模拟上游作业发布的具名产物描述（用于测试 `from_output` 依赖解析）；
   - `cursors`：注入初始游标字典。
