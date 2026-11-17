@@ -545,8 +545,8 @@ def terminal_result_handler(job, ctx):
 
 def assert_current_sources(pipeline, uid, expected, attempts):
     sources = [pipeline]
-    if pipeline.state_path is not None:
-        sources.append(pipeline.state_path)
+    if pipeline._state_path is not None:
+        sources.append(pipeline._state_path)
     for source in sources:
         with StateSnapshot.open(source) as snapshot:
             assert snapshot.get_job(uid) == expected
@@ -577,7 +577,7 @@ def test_predispatch_failure_owns_current_result_and_configuration(
                 source.unlink()
                 return None
 
-            p.authorizer = defer_authorization
+            p._runtime.store.authorizer = defer_authorization
             files["out"] = FileSpec(tmp_path / "out", role="output", delete_existing=True)
         else:
             source.unlink()
@@ -645,7 +645,7 @@ def test_cascaded_failure_keeps_current_config_and_settlement(tmp_path, monkeypa
         p.enqueue(child)
         monkeypatch.setattr("tasklite.engine.store.utc_now_iso", lambda: "2030-01-02T03:04:05+00:00")
         p.run(install_signals=False)
-        for source in [p] + ([p.state_path] if p.state_path is not None else []):
+        for source in [p] + ([p._state_path] if p._state_path is not None else []):
             with StateSnapshot.open(source) as snapshot:
                 current = snapshot.get_job(child.uid)
                 assert current["status"] == "failed"
@@ -711,7 +711,7 @@ def test_running_recovery_current_failure_is_self_contained(tmp_path, backend):
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_bulk_predispatch_failure_preserves_config_and_current_settlement(tmp_path, backend):
-    from tasklite.engine.resource import CapacityResource
+    from tasklite.resource import CapacityResource
 
     with TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None) as p:
         p.register_resource(CapacityResource("capacity", max_capacity=1))
@@ -775,7 +775,7 @@ def test_current_terminal_record_ignores_later_authorization_attempt(
             p.stop()
             return None
 
-        p.authorizer = defer_authorization
+        p._runtime.store.authorizer = defer_authorization
         p.enqueue(Job("process", "one", payload={"mode": "success", "block": True, "path": str(target)},
                       timeout_seconds=19, max_retries_per_run=0))
         p.run(install_signals=False)
@@ -806,7 +806,7 @@ def test_current_terminal_record_ignores_later_authorization_attempt(
         assert current["attempt_no"] == 3
         assert_current_sources(p, uid, current, attempts)
         assert p.clear_history(uid, records=["successes"]) == 1
-        for source in [p] + ([p.state_path] if p.state_path is not None else []):
+        for source in [p] + ([p._state_path] if p._state_path is not None else []):
             with StateSnapshot.open(source) as snapshot:
                 assert snapshot.get_job(uid) is None
                 assert list(snapshot.iter_jobs()) == []

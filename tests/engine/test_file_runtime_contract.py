@@ -255,7 +255,7 @@ def _failing_handler(job, ctx):
         "fail_spec",
         FileSpec("dummy.txt", role="output", delete_on_failure=True),
     )
-    (Path(ctx.base_dir) / "dummy.txt").write_text("fail data", encoding="utf-8")
+    (Path(ctx._base_dir) / "dummy.txt").write_text("fail data", encoding="utf-8")
     raise RuntimeError("Business computation failed")
 
 
@@ -307,7 +307,7 @@ def test_authorization_denied_reverts_to_pending_and_excludes_downstream(tmp_pat
     monkeypatch.chdir(tmp_path)
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
 
-    p.authorizer = _deny_sensitive_authorizer
+    p._runtime.store.authorizer = _deny_sensitive_authorizer
     p.register_task("protected", _auth_denied_handler)
     p.register_task("downstream", _noop_handler)
     p.register_task("independent", _noop_handler)
@@ -390,7 +390,7 @@ def test_approved_waiting_declaration_cleanup_error_fails_job(
     target.write_text("valuable")
     p = TaskLite(backend=backend, **({"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}))
     decisions = iter([None, True] if wait else [True])
-    p.authorizer = lambda *args: next(decisions)
+    p._runtime.store.authorizer = lambda *args: next(decisions)
     p.register_task("work", _dynamic_delete_handler)
     p.enqueue(Job("work", "one", payload={"path": str(target)}))
     with patch(
@@ -544,7 +544,7 @@ def test_worker_start_failure_releases_resources_after_running_commit(
             p.run()
 
     assert not marker.exists()
-    assert capacity.used == 0.0
+    assert p._resources["slot"].used == 0.0
     assert p._resources["__workers__"].used == 0.0
     row, = p._runtime.store.backend.load_queue_jobs(status="running")
     assert row["job_uid"] == "work::one"
@@ -598,8 +598,8 @@ def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, mo
     target = tmp_path / "target"
     target.write_text("valuable")
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db", max_workers=2)
-    resource = CapacityResource("disk", max_capacity=1)
-    p.register_resource(resource)
+    p.register_resource(CapacityResource("disk", max_capacity=1))
+    resource = p._resources["disk"]
     p.register_task("independent", _noop_handler)
     p.register_task("protected", _noop_handler, resources={"disk": 1})
     calls = []
@@ -622,7 +622,7 @@ def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, mo
         monkeypatch.setattr(scheduler, "scan_next_runnable", scan)
         return True
 
-    p.authorizer = authorize
+    p._runtime.store.authorizer = authorize
     p.enqueue(Job("independent", "one"))
     p.enqueue(Job("protected", "one", files={"target": FileSpec(target, role="cache", delete_existing=True)}))
     p.enqueue(Job("independent", "later"))
@@ -649,7 +649,7 @@ def test_removed_file_declaration_cannot_delete_without_authorization(tmp_path, 
     target.write_text("valuable")
     p = TaskLite(backend=backend, **({"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}))
     calls = []
-    p.authorizer = lambda *args: calls.append(args) or False
+    p._runtime.store.authorizer = lambda *args: calls.append(args) or False
     p.register_task("work", _legacy_delete_handler)
     p.enqueue(Job("work", "one", payload={"path": str(target), "method": method}))
     p.run()
@@ -680,7 +680,7 @@ def test_removed_output_message_cannot_authorize_cleanup(tmp_path, monkeypatch):
     target = tmp_path / "valuable"
     target.write_text("valuable")
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
-        p.authorizer = lambda *args: False
+        p._runtime.store.authorizer = lambda *args: False
         p.register_task("work", _legacy_output_message_handler)
         p.enqueue(Job("work", "one", payload={"path": str(target)}))
         with pytest.raises(ValueError, match="unknown worker pipe message kind"):

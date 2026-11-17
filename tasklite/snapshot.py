@@ -541,8 +541,8 @@ class StateSnapshot:
                     "Cannot open StateSnapshot from a closed TaskLite instance."
                 )
             backend = source._snapshot_backend()
-            if source.state_path is not None:
-                reader = _SqliteSnapshotReader(source.state_path)
+            if source._state_path is not None:
+                reader = _SqliteSnapshotReader(source._state_path)
             else:
                 reader = _MemorySnapshotReader(backend)
         self._reader = reader

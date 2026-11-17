@@ -50,3 +50,6 @@ class FileSpecResolver:
         if spec.role == "input" and not os.path.exists(resolved_path):
             raise FileNotFoundError(f"Missing input file: {resolved_path}")
         return bound_spec
+
+
+__all__ = ["FileSpecResolver"]

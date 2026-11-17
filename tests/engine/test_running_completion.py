@@ -7,7 +7,7 @@ import traceback
 import pytest
 
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
-from tasklite.engine.resource import CapacityResource
+from tasklite.resource import CapacityResource
 from tasklite.utils.artifact import ArtifactPathPolicy
 
 
@@ -23,9 +23,9 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, backend, 
     target = tmp_path / "target"
     target.write_text("business", encoding="utf-8")
     pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db")
-    pipeline.authorizer = lambda path, kind: True
-    capacity = CapacityResource("disk", max_capacity=1)
-    pipeline.register_resource(capacity)
+    pipeline._runtime.store.authorizer = lambda path, kind: True
+    pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+    capacity = pipeline._resources["disk"]
     pipeline.register_task("work", _success, resources={"disk": 1})
     job = Job("work", "one", files={
         "target": FileSpec(target, role="cache", delete_existing=True, delete_on_failure=True),
@@ -113,9 +113,9 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
     target = tmp_path / "target"
     target.write_text("business", encoding="utf-8")
     pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db")
-    pipeline.authorizer = lambda path, kind: True
-    capacity = CapacityResource("disk", max_capacity=1)
-    pipeline.register_resource(capacity)
+    pipeline._runtime.store.authorizer = lambda path, kind: True
+    pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+    capacity = pipeline._resources["disk"]
     pipeline.register_task("work", _success, resources={"disk": 1})
     pipeline.enqueue(Job("work", "one", files={
         "target": FileSpec(target, role="cache", delete_on_failure=True),
@@ -175,7 +175,7 @@ def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_pa
         decisions.append(kind)
         return True if kind == "file" else directory_decision[0]
 
-    pipeline.authorizer = authorize
+    pipeline._runtime.store.authorizer = authorize
     pipeline.register_task("work", _success)
     pipeline.enqueue(Job("work", "one", files={
         "target": FileSpec(target, role="cache", delete_existing=True, delete_on_failure=True),
@@ -242,9 +242,9 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
     target = tmp_path / "target"
     target.write_text("business", encoding="utf-8")
     pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db")
-    pipeline.authorizer = lambda path, kind: True
-    capacity = CapacityResource("disk", max_capacity=1)
-    pipeline.register_resource(capacity)
+    pipeline._runtime.store.authorizer = lambda path, kind: True
+    pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+    capacity = pipeline._resources["disk"]
     pipeline.register_task("work", _success, resources={"disk": 1})
     pipeline.enqueue(Job("work", "one", files={
         "target": FileSpec(target, role="cache", delete_existing=True, delete_on_failure=True),
@@ -322,8 +322,8 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
     fault_name = cached[0] if cached else "fault"
     later_name = "later" if fault_name == "fault" else "fault"
     pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db", max_workers=3)
-    capacity = CapacityResource("disk", max_capacity=3)
-    pipeline.register_resource(capacity)
+    pipeline.register_resource(CapacityResource("disk", max_capacity=3))
+    capacity = pipeline._resources["disk"]
     pipeline.register_task("work", _replace_cache_with_directory, resources={"disk": 1})
     pipeline.enqueue(Job("work", "committed"))
     for name in ("fault", "later"):
@@ -407,7 +407,7 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
             events.append(("cleanup", Path(declaration.path).name))
         return original_cleanup(policy, declaration, **kwargs)
 
-    pipeline.authorizer = authorize
+    pipeline._runtime.store.authorizer = authorize
     monkeypatch.setattr(runtime.channel, "reap_completed", reap)
     monkeypatch.setattr(completion, "settle_reaped", settle)
     monkeypatch.setattr(completion, "_prepare_completion", prepare)
@@ -460,9 +460,9 @@ def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeyp
     target = tmp_path / "cache"
     target.write_text("business", encoding="utf-8")
     with TaskLite(backend=backend, state_path=tmp_path / "state.db") as pipeline, ExitStack() as snapshots:
-        pipeline.authorizer = lambda path, kind: True
-        capacity = CapacityResource("disk", max_capacity=1)
-        pipeline.register_resource(capacity)
+        pipeline._runtime.store.authorizer = lambda path, kind: True
+        pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+        capacity = pipeline._resources["disk"]
         pipeline.register_task("work", _replace_cache_with_directory, resources={"disk": 1})
         pipeline.enqueue(Job("work", "committed", files={
             "cache": FileSpec(target, role="cache", delete_existing=True),

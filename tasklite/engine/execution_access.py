@@ -37,3 +37,6 @@ def exclusive_state_access(backend: AbstractStateBackend) -> Iterator[None]:
             yield
         finally:
             lock.release()
+
+
+__all__ = ["exclusive_state_access"]

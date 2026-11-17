@@ -134,7 +134,7 @@ def test_authorization_waiting_and_failure_cascade(tmp_path, monkeypatch):
             return None  # 未决授权
         return True
 
-    app.authorizer = _authorizer
+    app._runtime.store.authorizer = _authorizer
     app.register_task(Task("auth_task", _auth_required_handler))
     app.register_task(Task("fail_parent", _fail_handler))
     app.register_task(Task("child", _downstream_handler))

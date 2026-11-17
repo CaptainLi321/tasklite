@@ -269,3 +269,6 @@ class ArtifactPathPolicy:
         if not self._same_object(entry, current):
             raise ValueError(f"artifact identity changed during deletion: {target}")
         os.unlink(target.name, dir_fd=parent_fd)
+
+
+__all__ = ["ArtifactPathPolicy"]

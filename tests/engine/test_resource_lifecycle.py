@@ -20,6 +20,7 @@ from tasklite import (
     TaskResult,
 )
 from tasklite.engine.resource import (
+    IntervalResource as _InternalIntervalResource,
     Resource,
     ResourceQueryResult,
     RunNotifier,
@@ -54,8 +55,8 @@ def test_capacity_two_concurrency_and_third_starts_on_release(tmp_path):
         backend="memory",
         max_workers=4,
     )
-    cap = CapacityResource("slots", max_capacity=2.0)
-    p.register_resource(cap)
+    p.register_resource(CapacityResource("slots", max_capacity=2.0))
+    cap = p._resources["slots"]
 
     p.register_task("sync", _sync_capacity_handler, resources={"slots": 1.0})
     payload = {"dir": str(sync_dir)}
@@ -120,8 +121,8 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
         backend="memory",
         max_workers=2,
     )
-    res = IntervalResource("gate", interval_seconds=100.0)
-    p.register_resource(res)
+    p.register_resource(IntervalResource("gate", interval_seconds=100.0))
+    res = p._resources["gate"]
     p.register_task("fast", _fast_handler, resources={"gate": 1.0})
 
     p.enqueue(Job("fast", "j1"))
@@ -154,7 +155,7 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
 
 def test_long_wait_uses_single_deadline_without_resource_polling(tmp_path):
     """长等待只安排一次到期检查，不进行固定周期资源扫描。"""
-    class CountingIntervalResource(IntervalResource):
+    class CountingIntervalResource(_InternalIntervalResource):
         def __init__(self) -> None:
             super().__init__("long_wait", interval_seconds=3600.0)
             self.queries = 0
@@ -170,7 +171,7 @@ def test_long_wait_uses_single_deadline_without_resource_polling(tmp_path):
         max_workers=2,
     )
     res = CountingIntervalResource()
-    p.register_resource(res)
+    p._resources["long_wait"] = res
     res.acquire(1.0)  # 消费时间片使其需等待 3600s
     p.register_task("fast", _fast_handler, resources={"long_wait": 1.0})
     p.enqueue(Job("fast", "j1"))
@@ -226,7 +227,7 @@ def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
         max_workers=2,
     )
     ext_res = ExternalNotifierResource("ext")
-    p.register_resource(ext_res)
+    p._resources["ext"] = ext_res
     p.register_task("fast", _fast_handler, resources={"ext": 1.0})
     p.enqueue(Job("fast", "j1"))
 
@@ -295,7 +296,7 @@ def test_resource_exception_fails_run(tmp_path):
             pass
 
     p = TaskLite(backend="memory")
-    p.register_resource(BadQueryResource("bad_q"))
+    p._resources["bad_q"] = BadQueryResource("bad_q")
     p.register_task("fast", _fast_handler, resources={"bad_q": 1.0})
     p.enqueue(Job("fast", "j1"))
 
@@ -313,7 +314,7 @@ def test_resource_exception_fails_run(tmp_path):
             pass
 
     p2 = TaskLite(backend="memory")
-    p2.register_resource(BadAcquireResource("bad_acq"))
+    p2._resources["bad_acq"] = BadAcquireResource("bad_acq")
     p2.register_task("fast", _fast_handler, resources={"bad_acq": 1.0})
     p2.enqueue(Job("fast", "j2"))
 
@@ -331,7 +332,7 @@ def test_resource_exception_fails_run(tmp_path):
             raise RuntimeError("release exploded")
 
     p3 = TaskLite(backend="memory")
-    p3.register_resource(BadReleaseResource("bad_rel"))
+    p3._resources["bad_rel"] = BadReleaseResource("bad_rel")
     p3.register_task("fast", _fast_handler, resources={"bad_rel": 1.0})
     p3.enqueue(Job("fast", "j3"))
 
@@ -342,8 +343,8 @@ def test_resource_exception_fails_run(tmp_path):
 def test_release_prior_to_final_commit_and_no_dispatch_between(tmp_path):
     """释放先于最终提交且不在两者间派发。"""
     p = TaskLite(backend="memory")
-    cap = CapacityResource("slots", max_capacity=1.0)
-    p.register_resource(cap)
+    p.register_resource(CapacityResource("slots", max_capacity=1.0))
+    cap = p._resources["slots"]
 
     events: list[str] = []
 

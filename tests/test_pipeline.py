@@ -251,19 +251,19 @@ class TestConstruction:
 
     def test_memory_requires_no_state_path_and_no_disk_side_effects(self, tmp_path):
         p = TaskLite(backend="memory")
-        assert p.state_path is None
+        assert p._state_path is None
         assert p._backend_type == "memory"
 
     def test_output_root_resolved_without_creating_dir(self, tmp_path):
         root = tmp_path / "out_not_created"
         p = make_pipeline(tmp_path, output_roots=root)
-        assert p.output_roots == root.resolve()
+        assert p._output_roots == root.resolve()
         assert not root.exists()
 
     def test_output_root_multi_root_resolved_without_creating_dir(self, tmp_path):
         roots = [tmp_path / "o1", tmp_path / "o2"]
         p = make_pipeline(tmp_path, output_roots=roots)
-        assert p.output_roots == [r.resolve() for r in roots]
+        assert p._output_roots == [r.resolve() for r in roots]
         assert not roots[0].exists()
         assert not roots[1].exists()
 
@@ -478,7 +478,7 @@ class TestConstruction:
         p1.register_task("t", ok_handler)
         p2.register_task("t", ok_handler)
         p1.enqueue(Job("t", "j1"))
-        lock_fd = try_acquire_lock(p1.state_path, timeout=0)
+        lock_fd = try_acquire_lock(db, timeout=0)
         assert lock_fd is not None
         try:
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):
@@ -1137,8 +1137,9 @@ class TestRunExecutionOptions:
         """默认等价断言：run() 照常获取状态库单运行排他锁。"""
         from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
-        p = make_pipeline(tmp_path, backend="sqlite", state_path=tmp_path / "lock.db")
-        lock_fd = try_acquire_lock(p.state_path, timeout=0)
+        db = tmp_path / "lock.db"
+        p = make_pipeline(tmp_path, backend="sqlite", state_path=db)
+        lock_fd = try_acquire_lock(db, timeout=0)
         assert lock_fd is not None
         try:
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):

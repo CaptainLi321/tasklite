@@ -46,7 +46,7 @@ class JobContext:
     ):
         self._artifact_descriptions = copy.deepcopy(artifact_descriptions or {})
         self._protected_roots = tuple(protected_roots)
-        self.base_dir: Path = (
+        self._base_dir: Path = (
             Path(os.path.abspath(os.fspath(base_dir)))
             if base_dir is not None
             else Path(os.path.abspath(os.getcwd()))
@@ -84,7 +84,7 @@ class JobContext:
         self._cursor_updates: dict[str, str | None] = {}
         # output_roots 支持多根（跨盘输出场景）——解析时
         # 路径属于**任一**根即通过沙盒校验。
-        self.output_roots = output_roots
+        self._output_roots = output_roots
 
     def _bind_pipe_sender(
         self,
@@ -97,7 +97,7 @@ class JobContext:
 
     def _canonical_source(self, spec: FileSpec) -> FileSpec:
         """将普通路径声明按固定基准绝对化；上游引用保留配置身份。"""
-        return spec if spec.is_output_ref else spec._resolve_against(self.base_dir)
+        return spec if spec.is_output_ref else spec._resolve_against(self._base_dir)
 
     def _resolve_local_file(self, spec: FileSpec) -> FileSpec:
         """无回复通道时解析声明供隔离测试使用；不执行任何文件删除。"""
@@ -198,7 +198,7 @@ class JobContext:
         job_dict = job.to_dict()
         job_dict["files"] = resolve_job_files_config(
             job_dict.get("files"),
-            base_dir=self.base_dir,
+            base_dir=self._base_dir,
             depends_on=job_dict.get("depends_on") or (),
         )
         self._spawned_jobs.append(Job.from_dict(job_dict))

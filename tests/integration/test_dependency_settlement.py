@@ -25,7 +25,7 @@ def _succeed(job, ctx):
 
 
 def _wait_for_release(job, ctx):
-    output = Path(ctx.output_roots)
+    output = Path(ctx._output_roots)
     (output / "dependency_worker_ready").write_text("ready", encoding="utf-8")
     deadline = time.monotonic() + 30
     while not (output / "dependency_worker_release").exists():
@@ -93,7 +93,7 @@ def test_missing_dependency_settles_while_unrelated_worker_is_in_flight(tmp_path
 
     runner = threading.Thread(target=run_pipeline, daemon=True)
     runner.start()
-    output = Path(pipeline.output_roots)
+    output = Path(pipeline._output_roots)
     try:
         ready = output / "dependency_worker_ready"
         deadline = time.monotonic() + 20

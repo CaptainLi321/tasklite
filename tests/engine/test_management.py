@@ -243,8 +243,8 @@ class TestClearHistory:
         try:
             app.enqueue(Job("work", "item"))
             app.run()
-            assert app.state_path is not None
-            with sqlite3.connect(app.state_path) as conn:
+            assert app._state_path is not None
+            with sqlite3.connect(app._state_path) as conn:
                 conn.execute(
                     "CREATE TRIGGER reject_attempt_clear "
                     "BEFORE DELETE ON attempts "
@@ -337,15 +337,15 @@ class TestCrossProcessManagementMutex:
         process = None
         try:
             app.enqueue(Job("work", "a"))
-            assert app.state_path is not None
-            fd = try_acquire_lock(app.state_path, timeout=0)
+            assert app._state_path is not None
+            fd = try_acquire_lock(app._state_path, timeout=0)
             assert fd is not None
 
             context = mp.get_context("spawn")
             ready = context.Event()
             process = context.Process(
                 target=_blocked_management_worker,
-                args=(str(app.state_path), ready, str(result_path)),
+                args=(str(app._state_path), ready, str(result_path)),
             )
             process.start()
             assert ready.wait(timeout=10)

@@ -17,5 +17,4 @@ class _ArtifactIOError(BaseException):
 
 __all__ = [
     "TaskLiteError",
-    "_ArtifactIOError",
 ]

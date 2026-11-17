@@ -19,6 +19,13 @@ from typing import Any
 from ..exceptions import TaskLiteError
 from ..models.job import WORKER_RESOURCE
 from ..models.task import TaskRegistry
+from ..resource import (
+    CapacityResource as PublicCapacityResource,
+    IntervalResource as PublicIntervalResource,
+    _validate_interval_seconds,
+    _validate_max_capacity,
+    _validate_resource_name,
+)
 
 logger = logging.getLogger("tasklite")
 
@@ -50,9 +57,7 @@ class Resource(ABC):
     """统一内部资源基类。"""
 
     def __init__(self, name: str) -> None:
-        if not isinstance(name, str) or not name:
-            raise TaskLiteError(f"Resource name must be a non-empty string, got {name!r}")
-        self.name = name
+        self.name = _validate_resource_name(name)
         self._notifier: Any = None
 
     def bind_notifier(self, notifier: Any) -> None:
@@ -93,17 +98,7 @@ class IntervalResource(Resource):
 
     def __init__(self, name: str, *, interval_seconds: float) -> None:
         super().__init__(name)
-        if not isinstance(interval_seconds, (int, float)) or isinstance(
-            interval_seconds, bool
-        ):
-            raise TaskLiteError(
-                f"interval_seconds must be a number, got {type(interval_seconds).__name__}"
-            )
-        if not math.isfinite(interval_seconds) or interval_seconds <= 0:
-            raise TaskLiteError(
-                f"interval_seconds must be finite and > 0, got {interval_seconds!r}"
-            )
-        self.interval_seconds = float(interval_seconds)
+        self.interval_seconds = _validate_interval_seconds(interval_seconds)
         self.next_available = time.monotonic()
 
     def can_acquire(self, amount: float) -> ResourceQueryResult:
@@ -137,13 +132,7 @@ class CapacityResource(Resource):
 
     def __init__(self, name: str, *, max_capacity: float) -> None:
         super().__init__(name)
-        if not isinstance(max_capacity, (int, float)) or isinstance(max_capacity, bool):
-            raise TaskLiteError(
-                f"max_capacity must be a number, got {type(max_capacity).__name__} ({max_capacity!r})"
-            )
-        if not math.isfinite(max_capacity) or max_capacity < 0:
-            raise TaskLiteError(f"max_capacity must be finite and >= 0, got {max_capacity!r}")
-        self.max_capacity = float(max_capacity)
+        self.max_capacity = _validate_max_capacity(max_capacity)
         self.used = 0.0
         self.release_overruns = 0
 
@@ -509,10 +498,23 @@ class ResourceManager(MutableMapping[str, Resource]):
         return worker_res.can_acquire(amount)
 
 
+def adapt_resource(resource: PublicCapacityResource | PublicIntervalResource) -> Resource:
+    """将公开资源配置规格适配为引擎内部可调度资源实例。"""
+    if isinstance(resource, PublicCapacityResource):
+        return CapacityResource(resource.name, max_capacity=resource.max_capacity)
+    if isinstance(resource, PublicIntervalResource):
+        return IntervalResource(resource.name, interval_seconds=resource.interval_seconds)
+    raise TaskLiteError(
+        f"register_resource expects a CapacityResource or IntervalResource instance, "
+        f"got {type(resource).__name__}"
+    )
+
+
 __all__ = [
     "Resource",
     "IntervalResource",
     "CapacityResource",
+    "adapt_resource",
     "ResourceQueryResult",
     "ResourceEvaluation",
     "ResourceManager",

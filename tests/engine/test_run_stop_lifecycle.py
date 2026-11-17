@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from tasklite import FileSpec, StateSnapshot
-from tasklite.engine.resource import CapacityResource
+from tasklite.resource import CapacityResource
 from tasklite.engine.types import ExecutionOptions, StopMode
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
@@ -283,8 +283,8 @@ def test_stop_in_initial_authorizer_keeps_job_pending(tmp_path, monkeypatch):
     monkeypatch.delenv("TASKLITE_AUTO_APPROVE", raising=False)
     effect = tmp_path / "effect.txt"
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
-        capacity = CapacityResource("disk", max_capacity=1)
-        pipeline.register_resource(capacity)
+        pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+        capacity = pipeline._resources["disk"]
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job(
             "work", "one", payload={"effect": str(effect)},
@@ -296,7 +296,7 @@ def test_stop_in_initial_authorizer_keeps_job_pending(tmp_path, monkeypatch):
             pipeline.stop()
             return True
 
-        pipeline.authorizer = stop_and_approve
+        pipeline._runtime.store.authorizer = stop_and_approve
         pipeline.run()
         with StateSnapshot.open(pipeline) as state:
             job = state.get_job("work::one")
@@ -313,8 +313,8 @@ def test_stop_between_pop_and_running_mark_requeues_without_attempt(
     with TaskLite(
         backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
     ) as pipeline:
-        capacity = CapacityResource("disk", max_capacity=1)
-        pipeline.register_resource(capacity)
+        pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+        capacity = pipeline._resources["disk"]
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
 
@@ -347,8 +347,8 @@ def test_stop_after_running_mark_rolls_back_without_spawning(
     with TaskLite(
         backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
     ) as pipeline:
-        capacity = CapacityResource("disk", max_capacity=1)
-        pipeline.register_resource(capacity)
+        pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+        capacity = pipeline._resources["disk"]
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
 
@@ -380,8 +380,8 @@ def test_stop_inside_dispatch_log_prevents_worker_launch(tmp_path, monkeypatch):
     with TaskLite(
         backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
     ) as pipeline:
-        capacity = CapacityResource("disk", max_capacity=1)
-        pipeline.register_resource(capacity)
+        pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+        capacity = pipeline._resources["disk"]
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
 
@@ -414,8 +414,8 @@ def test_stop_before_process_start_prevents_worker_launch(tmp_path):
     with TaskLite(
         backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
     ) as pipeline:
-        capacity = CapacityResource("disk", max_capacity=1)
-        pipeline.register_resource(capacity)
+        pipeline.register_resource(CapacityResource("disk", max_capacity=1))
+        capacity = pipeline._resources["disk"]
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
 
@@ -489,7 +489,10 @@ def broken_trigger(ctx):
     raise RuntimeError("framework trigger crashed")
 
 
-class NeverAvailableResource(CapacityResource):
+from tasklite.engine.resource import CapacityResource as _InternalCapacityResource
+
+
+class NeverAvailableResource(_InternalCapacityResource):
     def can_acquire(self, amount: float) -> tuple[bool, float]:
         return False, 5.0
 
@@ -608,7 +611,7 @@ def test_stop_from_another_thread_wakes_scheduler_wait(tmp_path):
     """另线程调用 stop() 能立即解除主循环等待。"""
     p = TaskLite(backend="memory")
 
-    p.register_resource(NeverAvailableResource("gate", max_capacity=1.0))
+    p._resources["gate"] = NeverAvailableResource("gate", max_capacity=1.0)
     p.register_task("t_wait", success_handler, resources={"gate": 1.0})
     p.enqueue(Job("t_wait", "j1", resources={"gate": 1.0}))
 

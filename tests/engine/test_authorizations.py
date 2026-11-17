@@ -44,7 +44,7 @@ def _cleanup_fail_handler(job, ctx):
         "clean_target",
         FileSpec("clean_me.txt", role="output", delete_on_success=True),
     )
-    (Path(ctx.base_dir) / "clean_me.txt").write_text("content", encoding="utf-8")
+    (Path(ctx._base_dir) / "clean_me.txt").write_text("content", encoding="utf-8")
     return TaskResult.success()
 
 
@@ -163,7 +163,7 @@ def test_worker_declaration_wakes_main_loop_wait(tmp_path, monkeypatch, caplog):
         max_workers=1,
     )
     authorizer = _ControlledAuthorizer(decision=True)
-    p.authorizer = authorizer
+    p._runtime.store.authorizer = authorizer
     p.register_task("declared", _barrier_then_declare_handler)
     p.register_task("follow", _quick_handler)
     p.enqueue(Job(
@@ -240,7 +240,7 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
 
     p = TaskLite(backend="sqlite", state_path=tmp_path / "t_auth_wait.db", max_workers=2)
     authorizer = _ControlledAuthorizer(decision=None)
-    p.authorizer = authorizer
+    p._runtime.store.authorizer = authorizer
     p.register_task("slow_decl", _declare_then_write_handler)
     p.register_task("quick", _wait_for_gate_then_quick_handler)
     p.register_task("third", _marker_handler)
@@ -322,7 +322,7 @@ def test_authorization_wait_does_not_consume_execution_timeout(tmp_path, monkeyp
 
     p = TaskLite(backend="sqlite", state_path=tmp_path / "paused-timeout.db")
     authorizer = _BlockingAuthorizer()
-    p.authorizer = authorizer
+    p._runtime.store.authorizer = authorizer
     deadline_passed = False
     reap_after_deadline = threading.Event()
     original_reap = p._runtime.channel.reap_completed
@@ -396,7 +396,7 @@ def test_directory_authorization_reusable_and_subpath_revocation(tmp_path, monke
     sub_file.write_text("sub content", encoding="utf-8")
 
     # 1. 预先授予目录授权
-    p.authorizer = None
+    p._runtime.store.authorizer = None
     p.register_task("dir_task", _dir_handler)
     p.enqueue(Job("dir_task", "d1"))
 
@@ -460,7 +460,7 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
 
     p = TaskLite(backend="sqlite", state_path=state_path, max_workers=2)
     authorizer = _ControlledAuthorizer(decision=False if not deferred else None)
-    p.authorizer = authorizer
+    p._runtime.store.authorizer = authorizer
     p.register_task("target_task", _declare_then_write_handler)
     p.register_task("middle", _quick_handler)
     p.register_task("leaf", _quick_handler)
@@ -540,7 +540,7 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
     p.close()
 
     reopened = TaskLite(backend="sqlite", state_path=state_path, max_workers=2)
-    reopened.authorizer = _MutableAuthorizer(allowed=True)
+    reopened._runtime.store.authorizer = _MutableAuthorizer(allowed=True)
     reopened.register_task("target_task", _declare_then_write_handler)
     reopened.register_task("middle", _quick_handler)
     reopened.register_task("leaf", _quick_handler)
@@ -568,10 +568,12 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     stopped_marker = tmp_path / "stopped-marker"
     quick_gate = tmp_path / "quick-gate"
 
+    from tasklite.engine.resource import CapacityResource as InternalCapacityResource
+
     p = TaskLite(backend="sqlite", state_path=tmp_path / "stop-auth.db", max_workers=2)
     release_observations: list[tuple[set[str], list[dict]]] = []
 
-    class ObservingCapacity(CapacityResource):
+    class ObservingCapacity(InternalCapacityResource):
         def release(self, amount: float) -> None:
             release_observations.append((
                 {
@@ -582,9 +584,9 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
             ))
             super().release(amount)
 
-    p.register_resource(ObservingCapacity("slot", max_capacity=1.0))
+    p._resources["slot"] = ObservingCapacity("slot", max_capacity=1.0)
     authorizer = _BlockingAuthorizer()
-    p.authorizer = authorizer
+    p._runtime.store.authorizer = authorizer
     p.register_task("waiting", _declare_then_write_handler)
     p.register_task("quick", _wait_for_gate_then_quick_handler)
     p.register_task("after_stop", _marker_handler)
@@ -714,7 +716,7 @@ def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
         output_roots=allowed,
     )
     authorizer = _ControlledAuthorizer(decision=None)
-    p.authorizer = authorizer
+    p._runtime.store.authorizer = authorizer
     p.register_task("work", _declare_then_write_handler)
     p.enqueue(Job(
         "work",
@@ -870,7 +872,7 @@ def test_forbidden_file_operations_never_request_or_persist_authorization(
     calls = []
     removals = []
     with TaskLite(backend="sqlite", state_path=state_path, output_roots=allowed) as p:
-        p.authorizer = lambda *args: calls.append(args) or True
+        p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         monkeypatch.setattr(
             "tasklite.utils.artifact.ArtifactPathPolicy._remove",
             lambda *args, **kwargs: removals.append(args),
@@ -908,7 +910,7 @@ def test_static_forbidden_declaration_prevents_authorizing_other_targets(tmp_pat
     bad.write_text("bad", encoding="utf-8")
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db", output_roots=allowed) as p:
         calls = []
-        p.authorizer = lambda *args: calls.append(args) or True
+        p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         p.register_task("work", _quick_handler)
         p.enqueue(Job("work", "one", files={
             "good": FileSpec(good, role="output", delete_existing=True),
@@ -943,7 +945,7 @@ def test_static_authorization_wait_revalidates_target_before_asking_again(tmp_pa
         return True
 
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
-        p.authorizer = authorize
+        p._runtime.store.authorizer = authorize
         p.register_task("work", _quick_handler)
         p.enqueue(Job("work", "one", files={
             "target": FileSpec(target, role="output", delete_existing=True),
@@ -970,7 +972,7 @@ def test_broken_symlink_preparation_authorizes_and_removes_only_the_link(
     spec = FileSpec(link, role="cache", delete_existing=True)
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
         calls = []
-        p.authorizer = lambda *args: calls.append(args) or True
+        p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         p.register_task("work", _declare_spec_handler if declaration == "dynamic" else _quick_handler)
         p.enqueue(Job(
             "work", "one", payload={"spec": spec.to_dict()},
@@ -1021,7 +1023,7 @@ def test_allowed_file_operations_keep_instance_path_base(
     kwargs = {"state_path": base / "state.db"} if backend == "sqlite" else {}
     with TaskLite(backend=backend, output_roots="../allowed", **kwargs) as p:
         calls = []
-        p.authorizer = lambda *args: calls.append(args) or True
+        p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         p.register_task("work", _fixed_base_file_handler)
         monkeypatch.chdir(other)
         p.enqueue(Job(
@@ -1082,7 +1084,7 @@ def test_worker_target_type_change_requires_cleanup_scope_confirmation(
         waiting.set()
         return final_decision[0]
 
-    p.authorizer = authorize
+    p._runtime.store.authorizer = authorize
     p.register_task("replace", _replace_file_with_tree_handler)
     p.register_task("downstream", _quick_handler)
     p.enqueue(Job(
@@ -1183,7 +1185,7 @@ def test_cleanup_wait_preserves_result_and_settles_other_worker_before_single_co
         requested.set()
         return decided[0]
 
-    p.authorizer = authorize
+    p._runtime.store.authorizer = authorize
     p.register_task("replace", _replace_and_linger_handler)
     p.register_task("independent", _wait_for_gate_then_quick_handler)
     p.register_task("follow", _marker_handler)
@@ -1270,7 +1272,7 @@ def test_worker_leaf_link_replacement_never_expands_file_authorization(tmp_path,
     child.write_text("preserve", encoding="utf-8")
     p = TaskLite(backend=backend, state_path=tmp_path / "link.db")
     calls = []
-    p.authorizer = lambda *args: calls.append(args) or True
+    p._runtime.store.authorizer = lambda *args: calls.append(args) or True
     p.register_task("replace", _replace_file_with_link_handler)
     p.enqueue(Job("replace", "one", payload={"destination": str(destination)},
                   files={"target": FileSpec(target, role="cache", delete_on_success=True)}))
@@ -1316,7 +1318,7 @@ def test_later_authorization_callback_cannot_expand_previously_checked_target(
             return approve_first_tree
         return True
 
-    p.authorizer = authorize
+    p._runtime.store.authorizer = authorize
     p.register_task("replace", _replace_second_target_handler)
     p.enqueue(Job("replace", "one", files={
         "first": FileSpec(first, role="cache", delete_on_success=True),
@@ -1353,7 +1355,7 @@ def test_type_change_at_deletion_snapshot_fails_without_directory_permission(
     target.write_text("initial", encoding="utf-8")
     p = TaskLite(backend=backend, state_path=tmp_path / "snapshot.db")
     calls = []
-    p.authorizer = lambda *args: calls.append(args) or True
+    p._runtime.store.authorizer = lambda *args: calls.append(args) or True
     p.register_task("work", _failure_handler if timing == "delete_on_failure" else _quick_handler)
     p.enqueue(Job("work", "one", files={
         "target": FileSpec(target, role="cache", **{timing: True}),
@@ -1395,7 +1397,7 @@ def test_run_fault_leaves_uncommitted_cleanup_result_running_for_recovery(
         calls.append((path, kind))
         return True if kind == "file" else final_decision[0]
 
-    p.authorizer = authorize
+    p._runtime.store.authorizer = authorize
     p.register_task("replace", _replace_file_with_tree_handler)
     p.register_task("committed", _quick_handler)
     p.enqueue(Job("committed", "one"))
@@ -1468,7 +1470,7 @@ def test_success_cleanup_error_does_not_run_unapproved_failure_cleanup(tmp_path,
         path.write_text("initial", encoding="utf-8")
     p = TaskLite(backend=backend, state_path=tmp_path / "cleanup-outcome.db")
     calls = []
-    p.authorizer = lambda *args: calls.append(args) or True
+    p._runtime.store.authorizer = lambda *args: calls.append(args) or True
     p.register_task("replace", _replace_second_target_handler)
     p.enqueue(Job("replace", "one", files={
         "first": FileSpec(first, role="cache", delete_on_success=True),

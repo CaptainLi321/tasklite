@@ -40,7 +40,7 @@ def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> boo
 
 
 def success_handler(job: Job, ctx) -> TaskResult:
-    output = Path(ctx.declare_file("report", FileSpec(ctx.output_roots / "published.txt", role="output")))
+    output = Path(ctx.declare_file("report", FileSpec(ctx._output_roots / "published.txt", role="output")))
     output.write_text("已发布", encoding="utf-8")
     ctx.declare_file("source", FileSpec(output, role="input"))
     ctx.set_cursor("position", "42")
@@ -57,7 +57,7 @@ def interrupted_handler(job: Job, ctx) -> TaskResult:
     if job.attempt_no > 1:
         return TaskResult.success(metadata={"recovered": True})
     for filename, allowed in (("authorized.txt", True), ("retained.txt", False)):
-        path = Path(ctx.declare_file(filename, FileSpec(ctx.output_roots / filename, role="output", delete_on_failure=allowed)))
+        path = Path(ctx.declare_file(filename, FileSpec(ctx._output_roots / filename, role="output", delete_on_failure=allowed)))
         path.write_text("半成品", encoding="utf-8")
     sync_dir = Path(job.payload["sync_dir"])
     (sync_dir / "ready").write_text(str(os.getpid()), encoding="utf-8")
@@ -75,16 +75,16 @@ def timeout_handler(job: Job, ctx) -> TaskResult:
 
 
 def cleanup_handler(job: Job, ctx) -> TaskResult:
-    path = Path(ctx.declare_file("temporary", FileSpec(ctx.output_roots / "temporary.txt", role="cache", delete_on_success=True, delete_on_failure=True)))
+    path = Path(ctx.declare_file("temporary", FileSpec(ctx._output_roots / "temporary.txt", role="cache", delete_on_success=True, delete_on_failure=True)))
     path.write_text("临时产物", encoding="utf-8")
     return TaskResult.success(metadata={"uncommitted": True})
 
 
 def controlled_handler(job: Job, ctx) -> TaskResult:
     sync_dir = Path(job.payload["sync_dir"])
-    kept = Path(ctx.declare_file("kept", FileSpec(ctx.output_roots / "kept.txt", role="output")))
+    kept = Path(ctx.declare_file("kept", FileSpec(ctx._output_roots / "kept.txt", role="output")))
     kept.write_text("保留产物", encoding="utf-8")
-    temporary = Path(ctx.declare_file("temporary", FileSpec(ctx.output_roots / "temporary.txt", role="cache", delete_on_success=True, delete_on_failure=True)))
+    temporary = Path(ctx.declare_file("temporary", FileSpec(ctx._output_roots / "temporary.txt", role="cache", delete_on_success=True, delete_on_failure=True)))
     temporary.write_text("临时产物", encoding="utf-8")
     (sync_dir / "ready").write_text(str(os.getpid()), encoding="utf-8")
     ctx.declare_file("source", FileSpec(kept, role="input"))
@@ -95,7 +95,7 @@ def controlled_handler(job: Job, ctx) -> TaskResult:
 
 def invalid_frame_handler(job: Job, ctx) -> TaskResult:
     for filename, allowed in (("authorized.txt", True), ("retained.txt", False)):
-        path = Path(ctx.declare_file(filename, FileSpec(ctx.output_roots / filename, role="output", delete_on_failure=allowed)))
+        path = Path(ctx.declare_file(filename, FileSpec(ctx._output_roots / filename, role="output", delete_on_failure=allowed)))
         path.write_text("错误消息之前声明的产物", encoding="utf-8")
     fault = job.payload["fault"]
     sender = ctx._pipe_sender
@@ -126,7 +126,7 @@ def pipelines(tmp_path):
             max_workers=1,
         )
         (tmp_path / "output").mkdir(exist_ok=True)
-        pipeline.authorizer = lambda *args: True
+        pipeline._runtime.store.authorizer = lambda *args: True
         pipeline.register_resource(CapacityResource("api", max_capacity=1.0))
         pipeline.register_task("child", child_handler)
         created.append(pipeline)

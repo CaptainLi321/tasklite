@@ -16,3 +16,6 @@ class TriggerContext:
     has_failed: bool
     success_metadata: Mapping[str, Any] | None
     last_succeeded_at_us: int | None
+
+
+__all__ = ["TriggerContext"]

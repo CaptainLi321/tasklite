@@ -22,7 +22,11 @@ from .engine.config import RunConfig
 from .engine.execution_access import exclusive_state_access
 from .engine.governor import DeadlockGovernor
 from .engine.ops import OpsConsole
-from .engine.resource import CapacityResource, Resource, ResourceManager
+from .engine.resource import CapacityResource, ResourceManager, adapt_resource
+from .resource import (
+    CapacityResource as PublicCapacityResource,
+    IntervalResource as PublicIntervalResource,
+)
 from .engine.runtime import EngineRuntime
 from .engine.types import ExecutionOptions
 from .exceptions import TaskLiteError
@@ -50,10 +54,8 @@ class TaskLite:
         backend: "sqlite"（ACID 保证）或 "memory"（内存状态）。
         state_path: SQLite 数据库文件路径（backend="sqlite" 时必填，memory 默认 None）。
         max_workers: 最大并发子进程数（默认 4）。
-        output_roots: 产物根目录（单根或多根序列）；设置后沙盒校验在根内，构造不创建目录。
+        output_roots: 框架文件操作目录白名单（单根或多根序列）；默认 None 不限制，构造不创建目录。
     """
-
-    output_roots: Path | list[Path] | None = None
 
     def __init__(
         self,
@@ -75,9 +77,9 @@ class TaskLite:
         if backend == _BACKEND_SQLITE:
             if state_path is None or (isinstance(state_path, str) and not state_path.strip()):
                 raise TaskLiteError("state_path is required when backend is 'sqlite'")
-            self.state_path: Path | None = Path(state_path).resolve()
+            self._state_path: Path | None = Path(state_path).resolve()
         else:
-            self.state_path = None
+            self._state_path = None
 
         if (
             not isinstance(max_workers, int)
@@ -89,8 +91,8 @@ class TaskLite:
             )
 
         self._closed: bool = False
-        self.base_dir: Path = Path(os.path.abspath(os.getcwd()))
-        self.output_roots = self._resolve_output_roots(output_roots)
+        self._base_dir: Path = Path(os.path.abspath(os.getcwd()))
+        self._output_roots = self._resolve_output_roots(output_roots)
         self._backend_type: str = backend
         self._backend_handle: AbstractStateBackend | None = None
 
@@ -101,14 +103,14 @@ class TaskLite:
             self._triggers = TriggerRegistry(
                 tasks=self._tasks,
                 functions=BUILTIN_TRIGGER_FUNCTIONS,
-                base_dir=self.base_dir,
+                base_dir=self._base_dir,
             )
             self._resources = self._build_resources(self._tasks, max_workers)
             self._process_context = mp.get_context("spawn")
             self._channel = ExecutionChannel(
                 process_context=self._process_context,
-                output_roots=self.output_roots,
-                protected_roots=((self.state_path,) if self.state_path is not None else ()),
+                output_roots=self._output_roots,
+                protected_roots=((self._state_path,) if self._state_path is not None else ()),
             )
             self._runtime_config = self._build_run_config(self._backend_handle)
             self._runtime = EngineRuntime(config=self._runtime_config)
@@ -188,8 +190,8 @@ class TaskLite:
     def _build_backend(self, backend: str) -> AbstractStateBackend:
         """持久化后端装配。"""
         if backend == _BACKEND_SQLITE:
-            assert self.state_path is not None
-            return SQLiteStateBackend(self.state_path)
+            assert self._state_path is not None
+            return SQLiteStateBackend(self._state_path)
         return InMemoryStateBackend()
 
     @staticmethod
@@ -208,14 +210,14 @@ class TaskLite:
         """RunConfig 静态装配快照。"""
         return RunConfig.resolve(
             name="tasklite",
-            protected_roots=((self.state_path,) if self.state_path is not None else ()),
+            protected_roots=((self._state_path,) if self._state_path is not None else ()),
             backend=backend,
             resources=self._resources,
             tasks=self._tasks,
             channel=self._channel,
             governor=DeadlockGovernor(),
             trigger_registry=self._triggers,
-            output_roots=self.output_roots,
+            output_roots=self._output_roots,
         )
 
     # ── 运行期只读接缝 ─────────────────────────────────────────────
@@ -246,26 +248,25 @@ class TaskLite:
 
     # ── 注册面（六步之二/三）───────────────────────────────────────
 
-    def register_resource(self, resource: Resource) -> None:
-        """注册一个资源调度器。
+    def register_resource(
+        self,
+        resource: PublicCapacityResource | PublicIntervalResource,
+    ) -> None:
+        """注册一个官方内置资源配置（CapacityResource 或 IntervalResource）。
 
         同名资源重复注册明确拒绝，内部 worker 容量不能通过资源注册覆盖，
         最大并发只通过 max_workers 配置。
         """
         self._ensure_active("register_resource")
-        if not isinstance(resource, Resource):
-            raise TaskLiteError(
-                f"register_resource expects a Resource instance, "
-                f"got {type(resource).__name__}"
-            )
-        if resource.name == WORKER_RESOURCE:
+        adapted = adapt_resource(resource)
+        if adapted.name == WORKER_RESOURCE:
             raise TaskLiteError(
                 f"Cannot register internal worker resource {WORKER_RESOURCE!r}; "
                 f"worker concurrency must be configured via max_workers."
             )
-        if resource.name in self._resources:
-            raise TaskLiteError(f"Resource {resource.name!r} already registered")
-        self._resources[resource.name] = resource
+        if adapted.name in self._resources:
+            raise TaskLiteError(f"Resource {adapted.name!r} already registered")
+        self._resources[adapted.name] = adapted
 
     def register_task(
         self,
@@ -393,17 +394,6 @@ class TaskLite:
         self._ensure_active("set_cursor")
         with exclusive_state_access(self._runtime.store.backend):
             self._runtime.store.set_cursor(key, value)
-
-    @property
-    def authorizer(self) -> Callable[[str, str], bool | None] | None:
-        """内部文件操作授权判定回调 (path, target_type) -> bool | None。"""
-        self._ensure_active("authorizer")
-        return self._runtime.store.authorizer
-
-    @authorizer.setter
-    def authorizer(self, value: Callable[[str, str], bool | None] | None) -> None:
-        self._ensure_active("authorizer")
-        self._runtime.store.authorizer = value
 
     def list_authorizations(self) -> list[dict[str, Any]]:
         """只读查询全部已持久化的授权记录，限 Run 外。"""

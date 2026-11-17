@@ -54,11 +54,28 @@ def _ok_handler(job, ctx):
 
 
 class TestPublicImport:
-    """公开导入面契约。"""
+    """公开导入面契约：公开配置规格不暴露内部调度协议或可变账目。"""
 
-    def test_imports_match(self):
-        assert PublicCapacityResource is CapacityResource
-        assert PublicIntervalResource is IntervalResource
+    def test_public_resources_hide_internal_protocol_and_state(self):
+        cap = PublicCapacityResource("slots", max_capacity=2.0)
+        interval = PublicIntervalResource("rate", interval_seconds=1.5)
+        assert cap.name == "slots"
+        assert cap.max_capacity == 2.0
+        assert interval.name == "rate"
+        assert interval.interval_seconds == 1.5
+        for attr in (
+            "can_acquire",
+            "acquire",
+            "release",
+            "bind_notifier",
+            "unbind_notifier",
+            "notify",
+            "used",
+            "release_overruns",
+            "next_available",
+        ):
+            assert not hasattr(cap, attr), f"CapacityResource 不应暴露 {attr}"
+            assert not hasattr(interval, attr), f"IntervalResource 不应暴露 {attr}"
 
 
 class TestIntervalResource:

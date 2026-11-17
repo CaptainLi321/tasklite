@@ -24,7 +24,7 @@ def _pipeline(tmp_path):
     out = tmp_path / "output"
     out.mkdir(parents=True, exist_ok=True)
     pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "artifacts.db", output_roots=out)
-    pipeline.authorizer = lambda *args: True
+    pipeline._runtime.store.authorizer = lambda *args: True
     return pipeline
 
 
@@ -120,7 +120,7 @@ def test_dispatch_protects_complete_state_directory(tmp_path):
     pipeline = _pipeline(tmp_path)
     pipeline.register_task("unsafe", illegal_state_output)
     try:
-        pipeline.enqueue(Job("unsafe", "one", payload={"path": str(pipeline.state_path)}))
+        pipeline.enqueue(Job("unsafe", "one", payload={"path": str(pipeline._state_path)}))
         pipeline.run()
         failure = pipeline._runtime.store.backend.load_failed()["unsafe::one"]
         assert "outside output roots" in failure["error_message"]
@@ -128,6 +128,6 @@ def test_dispatch_protects_complete_state_directory(tmp_path):
         assert pipeline._runtime.store.backend.load_queue_jobs() == []
         attempt, = pipeline._runtime.store.backend.load_settled_attempts("unsafe::one")
         assert attempt["outcome"] == "failure"
-        assert pipeline.state_path.exists()
+        assert pipeline._state_path.exists()
     finally:
         pipeline.stop()

@@ -127,7 +127,7 @@ class TestDeclareFile:
 
     def test_resolves_against_base_without_creating_parents(self, tmp_path):
         ctx = _make_ctx()
-        ctx.base_dir = tmp_path
+        ctx._base_dir = tmp_path
         final = ctx.declare_file("out", FileSpec("sub/dir/out.json", role="output"))
         assert final == tmp_path / "sub/dir/out.json"
         assert not final.parent.exists()

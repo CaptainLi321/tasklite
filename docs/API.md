@@ -161,20 +161,16 @@ TaskLite(
 - **`backend`**（`Literal["sqlite", "memory"]`，必填，仅关键字参数）：
   - 必须为 `"sqlite"` 或 `"memory"`。传入其它类型或未知字符串抛出 `TaskLiteError`。
 - **`state_path`**（`str | Path | None`，默认 `None`，仅关键字参数）：
-  - 当 `backend="sqlite"` 时为**必填项**（为 `None` 或全空白字符串时抛出 `TaskLiteError`）。构造时自动转换为解析后的绝对路径 `Path(state_path).resolve()` 并保存在 `self.state_path`。
-  - 当 `backend="memory"` 时，`self.state_path` 恒固定为 `None`。
+  - 当 `backend="sqlite"` 时为**必填项**（为 `None` 或全空白字符串时抛出 `TaskLiteError`）。构造时自动转换为解析后的绝对路径 `Path(state_path).resolve()` 供内部后端使用。
+  - 当 `backend="memory"` 时固定为 `None`。
 - **`max_workers`**（`int`，默认 `4`，仅关键字参数）：
   - 最大并发工作子进程数。必须为非 `bool` 的 `int` 且 `>= 1`；非法值抛出 `TaskLiteError`。
-  - 内部自动以此上限向资源管理器注册名为 `__workers__` 的内置 `CapacityResource`。
+  - 内部自动以此上限向资源管理器注册内置并发容量。
 - **`output_roots`**（`str | Path | Sequence[str | Path] | None`，默认 `None`，仅关键字参数）：
-  - 产物沙盒根目录。构造时不触碰磁盘、不自动创建目录。
-  - 内部解析保存形态：
-    - 若传入 `None`，属性 `self.output_roots` 为 `None`；
-    - 若传入单个 `str` 或 `Path`，属性 `self.output_roots` 为单个规范绝对 `Path` 对象；
-    - 若传入序列（`list` 或 `tuple`），属性 `self.output_roots` 为绝对路径列表 `list[Path]`。
-    - 传入其他类型抛出 `TaskLiteError`。
-- **基准目录 `base_dir`**：
-  - 构造时自动固定为当前的绝对工作目录 `Path(os.path.abspath(os.getcwd()))`，后续相对路径的词法解析均基于此固定基准，不受运行时工作目录改变影响。
+  - 框架文件操作目录白名单（非 handler 写入沙箱）。构造时不触碰磁盘、不自动创建目录。
+  - 若传入 `None`（默认），不额外限制声明路径范围；若传入单个 `str | Path` 或序列，框架准备、写入或清理声明路径时必须落于这些根目录之内，即使启用 `TASKLITE_AUTO_APPROVE=1` 也不得越界；传入其他类型抛出 `TaskLiteError`。
+- **内部基准目录**：
+  - 构造时内部自动捕获当时的绝对工作目录 `Path(os.path.abspath(os.getcwd()))`，后续相对路径声明的解析均基于此固定基准，不受运行时工作目录改变影响。
 - **SQLite 状态库 Schema 6 校验**：
   - 若 `backend="sqlite"`，初始化时以 WAL 模式（`journal_mode=WAL`）连接。
   - 若数据库文件已存在且非空，严格校验 `PRAGMA user_version == 6` 及核心表结构。若版本 `<= 5`、异形库或含旧表，**fail-loud 直接抛出 `TaskLiteError` 拒绝启动**，不提供自动原地迁移。
@@ -183,16 +179,10 @@ TaskLite(
 
 ### 2.2 公开属性与生命周期状态
 
-- **`state_path`**（`Path | None`，只读）：SQLite 状态库绝对路径，内存后端为 `None`。
-- **`output_roots`**（`Path | list[Path] | None`，只读）：沙盒产物根目录。
-- **`base_dir`**（`Path`，只读）：构造时固定的绝对路径基准。
 - **`is_running`**（`bool`，只读）：管线当前是否正在执行 `run()` 循环中。
-- **`authorizer`**（`Callable[[str, str], bool | None] | None`，读写属性）：
-  - 主进程文件操作授权回调。签名为 `(path: str, target_type: str) -> bool | None`。
-  - 仅限在 `run()` 之外读取或修改，运行期或关闭后访问抛出 `TaskLiteError`。
 
 > [!NOTE]
-> **私有化内部边界说明**：为保障面向稳定基线（[ADR-0011](adr/0011-stable-interface-baseline.md)）的封装纯洁性，原内部组件属性 `tasks`（任务注册表）、`resources`（资源管理器）、`runtime_config`（引擎装配配置）及 `backend_type`（后端标识）已彻底私有化为内部字段（`_tasks`, `_resources`, `_runtime_config`, `_backend_type`），不再向外暴露为公开属性。调用方应始终通过 `register_task`、`register_resource` 等标准公开方法与管线交互，不得将可访问的内部对象或私有结构当做稳定公开 API。
+> **私有化内部边界说明**：为保障面向稳定基线（[ADR-0011](adr/0011-stable-interface-baseline.md)）的封装纯洁性，内部状态与配置字段（`_state_path`, `_base_dir`, `_output_roots`, `_tasks`, `_resources`, `_runtime_config`, `_backend_type` 及内部授权回调）均彻底私有化，不再向外暴露为公开属性。调用方应始终通过 `register_task`、`register_resource`、`list_authorizations`、`revoke_authorization` 等标准公开方法与管线交互，不得将内部字段当做稳定公开 API。
 
 ---
 
@@ -444,11 +434,9 @@ Job(
 
 #### 公开属性
 - `ctx.job`（`Job`）：当前正在执行的作业逻辑实例；
-- `ctx.base_dir`（`Path`）：当前管线基准目录；
-- `ctx.output_roots`（`Path | list[Path] | None`）：产物沙盒根目录。
 
 > [!NOTE]
-> **内部状态彻底私有化**：`JobContext` 仅暴露受控交互方法（`spawn`, `declare_file`, `file_path`, `get_cursor`, `set_cursor`）。内部累积容器 `_spawned_jobs` 与 `_cursor_updates` 已彻底私有化，不向外部暴露任何公开累积容器属性。所有衍生作业与游标变更必须经由 `ctx.spawn()` 与 `ctx.set_cursor()` 受控登记，并在作业成功结算时由主进程原子提交。
+> **内部状态彻底私有化**：`JobContext` 仅暴露 `ctx.job` 及受控交互方法（`spawn`, `declare_file`, `file_path`, `get_cursor`, `set_cursor`）。内部字段 `_base_dir`、`_output_roots` 及累积容器 `_spawned_jobs`、`_cursor_updates` 已彻底私有化，不向外部暴露任何内部配置或累积容器属性。所有衍生作业与游标变更必须经由 `ctx.spawn()` 与 `ctx.set_cursor()` 受控登记，并在作业成功结算时由主进程原子提交。
 
 #### 公开方法
 1. **`file_path(name: str) -> Path`**：
@@ -788,8 +776,8 @@ Exclude(*, task_type: str)
   - 只有当环境变量值**严格等于字符串 `"1"`** 时生效（诸如 `"true"`、`"yes"`、`"True"` 均不生效）。
 - **持久化授权效果**：
   - 当命中 `"1"` 时，主进程遇到未授权的文件清理或准备操作时自动批准，并**将该授权永久写入状态库的 `authorizations` 表**中；后续执行直接命中库中授权。
-- **受保护路径硬拦截边界**：
-  - 即使设置了 `TASKLITE_AUTO_APPROVE="1"`，若目标路径属于状态库自身、锁文件或引擎受保护目录，框架底层安全防护机制依然**硬拦截拒绝授权**，杜绝误删状态库风险。
+- **受保护路径与目录白名单硬拦截边界**：
+  - 即使设置了 `TASKLITE_AUTO_APPROVE="1"`，若目标路径属于状态库自身、锁文件或引擎受保护目录，或超出构造时显式配置的 `output_roots` 目录白名单，框架底层安全防护机制依然**硬拦截拒绝**，杜绝误删状态库或越界操作风险。
 
 ---
 
@@ -846,6 +834,7 @@ from tasklite.wrappers.http import (
     HttpResponse,
     urllib_fetch,
     requests_fetch,
+    SnapshotStore,
     SQLiteSnapshotStore,
     MemorySnapshotStore,
     HttpExecutor,

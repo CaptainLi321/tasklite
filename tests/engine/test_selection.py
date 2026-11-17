@@ -211,7 +211,7 @@ def test_exclude_validation_and_rejection_of_multiple_rules(tmp_path):
 def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     gpu = CountingResource()
-    pipeline.register_resource(gpu)
+    pipeline._resources["gpu"] = gpu
     pipeline.register_task("heavy", ok_handler, resources={"gpu": 1.0})
     pipeline.register_task("light", ok_handler)
     pipeline.enqueue(Job("heavy", "h"))

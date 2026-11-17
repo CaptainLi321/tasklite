@@ -79,3 +79,11 @@ def decide_wait(facts: LoopFacts) -> WaitDecision:
     if facts.dispatched == 0:
         return WaitDecision(should_wait=True, wait_time=float("inf"))
     return WaitDecision(should_wait=False, wait_time=0.0)
+
+
+__all__ = [
+    "AUTHORIZATION_RECHECK_SECONDS",
+    "LoopFacts",
+    "WaitDecision",
+    "decide_wait",
+]

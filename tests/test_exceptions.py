@@ -18,6 +18,7 @@ class TestPublicExceptionSurface:
     def test_tasklite_error_is_exception_subclass(self):
         assert issubclass(TaskLiteError, Exception)
         assert TaskLiteError is tasklite.TaskLiteError
+        assert exc_mod.__all__ == ["TaskLiteError"]
 
     @pytest.mark.parametrize(
         "removed_name",

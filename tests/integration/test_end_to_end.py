@@ -55,7 +55,7 @@ def _make_pipeline(tmp_path, **overrides) -> TaskLite:
 
 def ok_with_input_handler(job, ctx):
     """成功 + 声明输入文件 + 业务元数据（供 successes meta 审计键断言）。"""
-    source = ctx.output_roots / f"source_{job.job_id}.txt"
+    source = ctx._output_roots / f"source_{job.job_id}.txt"
     source.write_text("seed data", encoding="utf-8")
     ctx.declare_file("source", FileSpec(source, role="input"))
     return TaskResult.success(metadata={"touched": job.job_id})
@@ -68,7 +68,7 @@ def explode_handler(job, ctx):
 
 def flaky_first_attempt_handler(job, ctx):
     """首次执行返回重试，重试执行成功（磁盘标记跨子进程传递状态）。"""
-    marker = ctx.output_roots / f"flaky_marker_{job.job_id}"
+    marker = ctx._output_roots / f"flaky_marker_{job.job_id}"
     if marker.exists():
         return TaskResult.success(metadata={"recovered": True})
     marker.write_text(job.job_id, encoding="utf-8")
@@ -90,7 +90,7 @@ def always_transient_handler(job, ctx):
 
 def fail_once_then_ok_handler(job, ctx):
     """首次执行失败并写标记；人工重跑读到标记即成功。"""
-    marker = ctx.output_roots / f"fail_once_marker_{job.job_id}"
+    marker = ctx._output_roots / f"fail_once_marker_{job.job_id}"
     if marker.exists():
         return TaskResult.success(metadata={"recovered": True})
     marker.write_text(job.job_id, encoding="utf-8")

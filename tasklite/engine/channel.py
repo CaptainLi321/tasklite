@@ -1015,7 +1015,4 @@ __all__ = [
     "ExecutionResult",
     "JobHandle",
     "WorkerLaunchSpec",
-    "_WorkerLaunchCancelled",
-    "_decode_ipc_result",
-    "_worker_process_entry",
 ]

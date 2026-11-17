@@ -272,15 +272,24 @@ class TestMainSurfaceExports:
         from tasklite import TaskLite
 
         tl = TaskLite(backend="memory")
-        for attr in ("backend_type", "tasks", "resources", "runtime_config"):
+        for attr in (
+            "backend_type",
+            "tasks",
+            "resources",
+            "runtime_config",
+            "state_path",
+            "base_dir",
+            "output_roots",
+            "authorizer",
+        ):
             assert not hasattr(tl, attr), f"TaskLite 不应暴露内部属性 {attr}"
 
     def test_job_context_internal_attributes_not_exposed(self):
-        """JobContext 仅暴露受控交互方法，不向外部暴露累积容器属性。"""
+        """JobContext 仅暴露受控交互方法，不向外部暴露累积容器与内部路径配置属性。"""
         from tasklite import Job, JobContext
 
         ctx = JobContext(Job("t", "1"), frozenset(), frozenset(), {})
-        for attr in ("spawned_jobs", "cursor_updates"):
+        for attr in ("spawned_jobs", "cursor_updates", "base_dir", "output_roots"):
             assert not hasattr(ctx, attr), f"JobContext 不应暴露内部属性 {attr}"
 
     def test_tasklite_facade_signatures(self):

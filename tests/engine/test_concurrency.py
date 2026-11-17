@@ -34,7 +34,7 @@ def _subprocess_pythonpath(monkeypatch):
 def barrier_window_handler(job, ctx):
     """进入后等待释放文件，并落盘执行时间窗（模块级可 pickle）。"""
     start = time.time()
-    window_file = ctx.output_roots / f"window_{job.job_id}.txt"
+    window_file = ctx._output_roots / f"window_{job.job_id}.txt"
     window_file.parent.mkdir(parents=True, exist_ok=True)
     window_file.write_text(f"{start}", encoding="utf-8")
 
