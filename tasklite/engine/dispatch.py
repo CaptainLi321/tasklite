@@ -673,7 +673,7 @@ class DispatchMachine:
                 validated_path = self._path_policy.resolve(
                     resolved_path, delete_existing=bound_spec.delete_existing,
                 )
-                bound_spec = bound_spec.bind_output_path(validated_path)
+                bound_spec = bound_spec._bind_output_path(validated_path)
             resolved[name] = bound_spec
         return resolved
 

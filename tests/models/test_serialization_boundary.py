@@ -64,7 +64,7 @@ def test_job_files_snapshot_matches_adr_sample_and_isolates_mutation(tmp_path):
         base / "results" / "processed.csv", role="output"
     )
     resolved_outer = {
-        "source": restored.files["source"].bind_output_path(
+        "source": restored.files["source"]._bind_output_path(
             base / "results" / "report.csv"
         ).to_dict(),
         "result": restored.files["result"].to_dict(),

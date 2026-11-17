@@ -223,7 +223,7 @@ class CompletionMachine:
             active_files = dict(entry.active_files)
         elif job.files:
             active_files = {
-                k: v.resolve_against(store.base_dir) if not v.is_output_ref else v
+                k: v._resolve_against(store.base_dir) if not v.is_output_ref else v
                 for k, v in job.files.items()
             }
 

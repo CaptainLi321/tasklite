@@ -97,7 +97,7 @@ class JobContext:
 
     def _canonical_source(self, spec: FileSpec) -> FileSpec:
         """将普通路径声明按固定基准绝对化；上游引用保留配置身份。"""
-        return spec if spec.is_output_ref else spec.resolve_against(self.base_dir)
+        return spec if spec.is_output_ref else spec._resolve_against(self.base_dir)
 
     def _resolve_local_file(self, spec: FileSpec) -> FileSpec:
         """无回复通道时解析声明供隔离测试使用；不执行任何文件删除。"""
@@ -109,7 +109,7 @@ class JobContext:
                     f"producer {spec.producer_uid!r} did not publish "
                     f"output {spec.output_name!r}"
                 )
-            resolved = spec.bind_output_path(desc["path"])
+            resolved = spec._bind_output_path(desc["path"])
         else:
             resolved = self._canonical_source(spec)
         if resolved.path is None:
@@ -164,7 +164,7 @@ class JobContext:
             status = reply.get("status")
             if status == "ok":
                 resolved_path = str(reply["resolved_path"])
-                bound_spec = canonical_source.bind_output_path(resolved_path)
+                bound_spec = canonical_source._bind_output_path(resolved_path)
                 self._file_sources[validated_name] = canonical_source
                 self._files[validated_name] = bound_spec
                 return Path(resolved_path)

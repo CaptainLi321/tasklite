@@ -32,8 +32,7 @@
    - [4.4 iter_attempts 迭代与物理执行轨迹字典](#44-iter_attempts-迭代与物理执行轨迹字典)
 5. [单射编码工具与公开异常](#5-单射编码工具与公开异常)
    - [5.1 规范 UID 单射编解码（make_job_uid, parse_job_uid）](#51-规范-uid-单射编解码make_job_uid-parse_job_uid)
-   - [5.2 辅助可逆编码族](#52-辅助可逆编码族)
-   - [5.3 公开异常 TaskLiteError](#53-公开异常-taskliteerror)
+   - [5.2 公开异常 TaskLiteError](#52-公开异常-taskliteerror)
 6. [内置资源与运行排除](#6-内置资源与运行排除)
    - [6.1 CapacityResource 并发容量资源](#61-capacityresource-并发容量资源)
    - [6.2 IntervalResource 时间间隔资源](#62-intervalresource-时间间隔资源)
@@ -101,7 +100,7 @@ from tasklite.selection import Exclude
 
 ### 1.2 全局横切契约与严格 JSON 校验
 
-TaskLite 内部所有需持久化或跨进程 IPC 传递的配置与数据（包括 `Job.payload`、`TaskResult.metadata`、`TriggerContext.success_metadata`），均经过统一的**严格 JSON 递归校验**（`validate_strict_json_value`）：
+TaskLite 内部所有需持久化或跨进程 IPC 传递的配置与数据（包括 `Job.payload`、`TaskResult.metadata`、`TriggerContext.success_metadata`），均经过统一的**严格 JSON 递归校验**：
 
 1. **合法标量类型**：
    - `None`：归一为 `None`；
@@ -340,7 +339,7 @@ from tasklite.models.trigger import TriggerContext
   - `note`（`str | None`，默认 `None`）：人工操作备注，写入结果元数据中。
 - **缺失快照的处理差异（源码真实行为）**：
   - **传入 `Job` 实例**：若状态库中尚未存在该作业的历史快照，框架将就地校验并接受传入的 `Job` 作为有效快照，并要求其 `task_type` 已注册；若库中已存在该作业快照，会比对其有效配置，发生冲突时抛出 `TaskLiteError`；
-  - **传入 `str` 字符串（UID）**：必须先经 `parse_job_uid` 语法校验。SQLite 与内存双后端实现完全一致（均由底层 `load_known_job_snapshot` 提供），按以下优先级回退顺序检索既有快照：
+  - **传入 `str` 字符串（UID）**：必须先经 `parse_job_uid` 语法校验。SQLite 与内存双后端实现完全一致（统一检索既有有效快照），按以下优先级回退顺序检索既有快照：
     1. **`queue`**（待办/重入队队列中的作业快照）；
     2. **`successes`**（成功档案元数据中的作业快照）；
     3. **`failed`**（失败档案元数据中的作业快照）；
@@ -461,8 +460,8 @@ Job(
      - 若同名声明已存在且配置完全一致：直接幂等复用，返回先前已绑定的路径；
      - 若同名声明已存在但配置不一致：立即抛出 `TaskLiteError`；
    - **授权等待与超时暂停机制**：
-     - 当通过 IPC 向主进程请求授权或清理时，看门狗计时器**自动暂停**（`pause_timeout()`）；
-     - 授权处理完毕并回复子进程后，看门狗计时器恢复剩余时长（`resume_timeout()`），防止等待主进程人工授权导致作业被超时强杀；
+     - 当通过 IPC 向主进程请求授权或清理时，主进程看门狗计时器**自动暂停倒计时**；
+     - 授权处理完毕并回复子进程后，看门狗计时器**恢复剩余时长并顺延截止时间**，防止等待主进程人工授权导致作业被超时强杀；
      - 若主进程拒绝授权（denied），子进程抛出 `TaskLiteError("authorization denied")`。
 3. **`spawn(job: Job) -> None`**：
    - 动态衍生子作业。子作业依赖必须受限闭合于当前已知作业与父作业；
@@ -531,14 +530,12 @@ TaskResult.retry(*, message: str | None = None, metadata: dict[str, Any] | None 
    )
    ```
 
-#### 属性与方法
-- `spec.path`（`str | None`）：词法规范化路径；上游产物引用在尚未绑定前为 `None`；
-- `spec.producer_uid` / `spec.output_name`（`str | None`）：上游引用信息；
-- `spec.role`（`"input" | "output" | "cache"`）：文件角色；
-- `spec.delete_existing` / `spec.delete_on_failure` / `spec.delete_on_success`（`bool`）：三项显式删除授权开关；
-- `spec.is_output_ref`（`bool`，属性）：是否为上游产物引用；
-- `spec.resolve_against(base_dir) -> FileSpec`：按基准目录绝对化普通路径，上游引用保持原样；
-- `spec.bind_output_path(resolved_path, ...) -> FileSpec`：绑定为绝对路径 `FileSpec` 并保留清理开关；
+#### 公开属性与序列化
+- `spec.path`（`str | None`，只读）：词法规范化路径；上游产物引用在尚未绑定前为 `None`；
+- `spec.producer_uid` / `spec.output_name`（`str | None`，只读）：上游引用信息；
+- `spec.role`（`"input" | "output" | "cache"`，只读）：文件角色；
+- `spec.delete_existing` / `spec.delete_on_failure` / `spec.delete_on_success`（`bool`，只读）：三项显式删除清理开关；
+- `spec.is_output_ref`（`bool`，只读）：是否为上游产物引用；
 - `spec.to_dict() -> dict[str, Any]` 与 `FileSpec.from_dict(data) -> FileSpec`：严格 JSON 序列化与还原（未知键抛出 `TaskLiteError`）。
 
 #### 校验与清理契约
@@ -706,20 +703,7 @@ parse_job_uid(uid: str) -> tuple[str, str]
 
 ---
 
-### 5.2 辅助可逆编码族
-
-- **`percent_encode(text: str, forbidden=..., *, allowed=...) -> str`**：
-  - 严格百分号转义，转义符 `%` 无条件优先按 `%25` 处理，杜绝歧义；非 `str` 抛出 `TaskLiteError`。
-- **`encode_identifier(value: Any, *, max_len: int = 120, ...) -> str`**：
-  - 确定性单射标识符。编码后 `<= max_len` 时直通；`> max_len` 时采用 `前缀 + "%_" + 64位SHA-256指纹` 截断，标记 `"%_"` 确保截断值绝不会与任何未截断值的像集重叠。
-- **`encode_job_component(value: Any, *, max_len: int = 120) -> str`**：
-  - `job_id` 组装片段编码，规则同 `encode_identifier`。
-- **`encode_content_id(content_id: str | None, *, max_len: int = 120) -> str`**：
-  - 用于内容扫描任务的单射编码；空值返回固定哨兵 `"%untitled"`。
-
----
-
-### 5.3 公开异常 TaskLiteError
+### 5.2 公开异常 TaskLiteError
 
 ```python
 class TaskLiteError(Exception):
@@ -741,18 +725,17 @@ class TaskLiteError(Exception):
 CapacityResource(name: str, *, max_capacity: float)
 ```
 
-- **参数与属性**：
+- **参数约束**：
   - `name`（`str`）：非空资源名称；
-  - `max_capacity`（`float`）：非 `bool` 的有限数值且 `>= 0`，非法值抛出 `TaskLiteError`；
-  - `used`（`float`）：当前已被占用的资源总量，初始为 `0.0`。
-- **方法行为**：
-  - `can_acquire(amount: float) -> ResourceQueryResult`：
-    - `amount < 0` 抛出 `TaskLiteError`；
-    - `amount > max_capacity` 返回 `is_available=False, is_impossible=True`（明确不可满足，调度器直接登记该作业失败）；
-    - `used + amount <= max_capacity` 返回 `is_available=True, wait_seconds=0.0`；
-    - 否则返回 `is_available=False, wait_seconds=None, is_impossible=False`（等待在途任务释放并触发唤醒）。
-  - `acquire(amount: float) -> None`：实际占用容量；超额抛出 `TaskLiteError`。
-  - `release(amount: float) -> None`：释放容量（`used = max(0.0, used - amount)`）并自动触发通知器唤醒等待中的调度循环。
+  - `max_capacity`（`float`）：非 `bool` 的有限数值且 `>= 0`，非法值抛出 `TaskLiteError`。
+- **调度语义与准入规则**：
+  - 调度引擎在派发作业前检查当前可用容量；
+  - **明确不可满足**：若作业声明的请求用量 `amount > max_capacity`，调度引擎判定为明确不可满足，直接将该作业收敛为失败并级联下游；
+  - **容量可用**：若 `当前占用 + amount <= max_capacity`，准予获取容量并启动作业；
+  - **暂不可用等待**：若当前可用容量不足，作业保持 `pending` 留队，等待在途任务执行完成释放容量后自动唤醒调度循环重新评估；
+  - 任务执行完毕完成结算后，占用的容量由主进程自动归还。
+- **内部协议说明**：
+  - 底层资源查询与获取协议（`can_acquire`, `acquire`, `release`）由调度引擎内部在主进程调度线程串行调用，**不作为对外公开接口**；用户仅需通过 `pipeline.register_resource()` 注册并在 Task/Job 的 `resources` 中声明用量。
 
 ---
 
@@ -764,16 +747,17 @@ CapacityResource(name: str, *, max_capacity: float)
 IntervalResource(name: str, *, interval_seconds: float)
 ```
 
-- **参数与属性**：
+- **参数约束**：
   - `name`（`str`）：非空资源名称；
-  - `interval_seconds`（`float`，**仅关键字参数**）：有限正数（`> 0`），非法值抛出 `TaskLiteError`；
-  - `next_available`（`float`）：基于 `time.monotonic()` 跟踪的下一次允许获取时间戳。
-- **方法行为**：
-  - `can_acquire(amount: float) -> ResourceQueryResult`：
-    - 若当前单调时间已达到 `next_available`，返回可用；否则返回暂不可用及需等待的秒数 `wait_seconds = next_available - now`。
-  - `acquire(amount: float) -> None`：
-    - 推进 `next_available = max(now, next_available) + (interval_seconds * amount)`。
-  - `release(amount: float) -> None`：**空操作（no-op）**。已消耗的时间配额不可撤销，任务完成不返还时间配额。
+  - `interval_seconds`（`float`，**仅关键字参数**）：有限正数（`> 0`），非法值抛出 `TaskLiteError`。
+- **调度语义与准入规则**：
+  - 基于 `time.monotonic()` 跟踪下一次允许获取的时间基准；
+  - 首次请求可立即获准派发；
+  - 每次获准后，基于单调时间按 `interval_seconds * amount` 顺延下次允许获取的时间点；
+  - 若当前单调时间尚未达到下一次可用时间点，作业保持 `pending` 留队等待计时器到期唤醒，主循环在此期间可继续处理其他无冲突事件；
+  - **配额不可撤销**：时间配额为纯单向推进机制，任务执行完成不返还时间配额。
+- **内部协议说明**：
+  - 底层间隔查询与配额推进由调度引擎内部串行调度，**不作为对外公开接口**。
 
 ---
 
@@ -847,9 +831,9 @@ fake_ctx(
 
 ```text
 @contextmanager
-def running(target: TaskLite | EngineRuntime) -> Iterator[Any]
+def running(target: TaskLite) -> Iterator[Any]
 ```
-- **核心职责**：测试专用上下文管理器。将 `TaskLite` 实例私有状态临时置为运行中（`_is_running = True`），用于测试各种管理 API 的运行期守卫，退出上下文时自动复位。
+- **核心职责**：测试专用上下文管理器。将 `TaskLite` 实例临时置为运行中状态，用于测试各种管理 API 在运行期的状态守卫，退出上下文时自动复位。
 
 ---
 

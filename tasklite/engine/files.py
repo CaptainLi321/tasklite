@@ -42,9 +42,9 @@ class FileSpecResolver:
             resolved_path = desc["path"]
             if spec.role == "input" and not os.path.exists(resolved_path):
                 raise FileNotFoundError(f"Missing input file: {resolved_path}")
-            return spec.bind_output_path(resolved_path, base_dir=base_dir)
+            return spec._bind_output_path(resolved_path, base_dir=base_dir)
 
-        bound_spec = spec.resolve_against(base_dir)
+        bound_spec = spec._resolve_against(base_dir)
         assert bound_spec.path is not None
         resolved_path = bound_spec.path
         if spec.role == "input" and not os.path.exists(resolved_path):

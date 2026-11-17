@@ -164,7 +164,7 @@ class FileSpec:
         """是否为上游具名产物引用（from_output）。"""
         return self.producer_uid is not None
 
-    def resolve_against(self, base_dir: str | Path) -> FileSpec:
+    def _resolve_against(self, base_dir: str | Path) -> FileSpec:
         """按固定基准目录解析普通路径为绝对路径；上游引用保持原样。"""
         _normalize_lexical_path(base_dir)
         if self.is_output_ref:
@@ -181,7 +181,7 @@ class FileSpec:
             delete_on_success=self.delete_on_success,
         )
 
-    def bind_output_path(
+    def _bind_output_path(
         self,
         resolved_path: str | Path,
         *,
@@ -326,7 +326,7 @@ def resolve_job_files_config(
                 )
             resolved_spec = spec
         else:
-            resolved_spec = spec.resolve_against(base_dir)
+            resolved_spec = spec._resolve_against(base_dir)
         resolved[name] = resolved_spec.to_dict()
     return resolved
 
@@ -357,12 +357,12 @@ def merge_named_file_spec(
                 f"FileSpec {validated_name!r} references producer {spec.producer_uid!r} "
                 f"which is not in explicit direct depends_on {list(depends_on)!r}"
             )
-    canonical = spec.resolve_against(base_dir) if base_dir is not None else spec
+    canonical = spec._resolve_against(base_dir) if base_dir is not None else spec
     merged: dict[str, FileSpec] = {}
     for raw_key, raw_val in existing.items():
         k = validate_file_name(raw_key)
         v = coerce_file_spec(raw_val, allow_dict=True)
-        merged[k] = v.resolve_against(base_dir) if base_dir is not None else v
+        merged[k] = v._resolve_against(base_dir) if base_dir is not None else v
     if validated_name in merged:
         previous = merged[validated_name]
         if previous == canonical:

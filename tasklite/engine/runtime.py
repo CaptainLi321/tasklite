@@ -276,7 +276,7 @@ class EngineRuntime:
                 error["message"],
                 error,
             )
-        request.bound = request.bound.bind_output_path(validated_path)
+        request.bound = request.bound._bind_output_path(validated_path)
         request.resolved_path = validated_path
         if self._session.stop_mode is not StopMode.NONE:
             self._finish_authorization(
@@ -686,7 +686,7 @@ class EngineRuntime:
                     error,
                 )
                 continue
-            request.bound = request.bound.bind_output_path(validated_path)
+            request.bound = request.bound._bind_output_path(validated_path)
             request.resolved_path = validated_path
 
             authorized = self.store.check_or_request_authorization(validated_path)
