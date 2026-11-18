@@ -114,7 +114,8 @@ def invalid_frame_handler(job: Job, ctx) -> TaskResult:
 
 
 @pytest.fixture
-def pipelines(tmp_path):
+def pipelines(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     created: list[TaskLite] = []
 
     def create(backend="sqlite") -> TaskLite:

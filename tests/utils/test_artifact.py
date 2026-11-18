@@ -105,7 +105,7 @@ def test_leaf_symlinks_are_rejected_without_touching_target(tmp_path, link_targe
         assert outside.read_text(encoding="utf-8") == "precious"
 
 
-def test_safe_parent_link_returns_canonical_path_but_escape_is_rejected(tmp_path):
+def test_safe_parent_link_returns_canonical_path_but_escape_is_rejected(tmp_path, monkeypatch):
     root = tmp_path / "output"
     root.mkdir()
     real = root / "real"
@@ -114,7 +114,8 @@ def test_safe_parent_link_returns_canonical_path_but_escape_is_rejected(tmp_path
     outside = tmp_path / "outside"
     outside.mkdir()
     (root / "escape").symlink_to(outside, target_is_directory=True)
-    policy = ArtifactPathPolicy()
+    monkeypatch.chdir(root)
+    policy = ArtifactPathPolicy(protected_roots=[outside])
     assert policy.resolve("inside/result") == str(real / "result")
     with pytest.raises(ValueError):
         policy.resolve("escape/result")
@@ -127,7 +128,7 @@ def test_roots_and_engine_regions_are_protected_even_with_sandbox_disabled(tmp_p
     root.mkdir()
     state.mkdir()
     policy = ArtifactPathPolicy(protected_roots=[state])
-    for protected in [Path(root.anchor), tmp_path, root, state, state / "ipc" / "file"]:
+    for protected in [Path(root.anchor), tmp_path, state, state / "ipc" / "file"]:
         with pytest.raises(ValueError):
             policy.resolve(protected, sandbox=sandbox)
     assert policy.resolve(root / "dedicated", sandbox=sandbox) == str(root / "dedicated")

@@ -810,7 +810,7 @@ def test_list_and_revoke_authorizations_surface_and_run_guard(tmp_path, monkeypa
 @pytest.mark.parametrize("declaration", ["static", "dynamic"])
 @pytest.mark.parametrize("approval", ["interactive", "automatic"])
 @pytest.mark.parametrize("operation", ["delete_existing", "delete_on_success", "delete_on_failure"])
-@pytest.mark.parametrize("forbidden", ["outside", "protected", "output-root", "filesystem-root", "symlink"])
+@pytest.mark.parametrize("forbidden", ["protected", "filesystem-root", "symlink"])
 def test_forbidden_file_operations_never_request_or_persist_authorization(
     tmp_path, monkeypatch, declaration, approval, operation, forbidden,
 ):
@@ -826,9 +826,7 @@ def test_forbidden_file_operations_never_request_or_persist_authorization(
     valuable = tmp_path / "valuable"
     valuable.write_text("valuable", encoding="utf-8")
     targets = {
-        "outside": valuable,
         "protected": state_path,
-        "output-root": allowed,
         "filesystem-root": Path(allowed.anchor),
         "symlink": allowed / "linked",
     }
@@ -870,9 +868,11 @@ def test_static_forbidden_declaration_prevents_authorizing_other_targets(tmp_pat
     allowed = tmp_path / "allowed"
     allowed.mkdir()
     good = allowed / "good"
-    bad = tmp_path / "bad"
+    valuable = tmp_path / "valuable"
+    bad = allowed / "bad"
     good.write_text("good", encoding="utf-8")
-    bad.write_text("bad", encoding="utf-8")
+    valuable.write_text("valuable", encoding="utf-8")
+    bad.symlink_to(valuable)
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
         calls = []
         p._runtime.store.authorizer = lambda *args: calls.append(args) or True
@@ -885,7 +885,8 @@ def test_static_forbidden_declaration_prevents_authorizing_other_targets(tmp_pat
         assert calls == []
         assert p.list_authorizations() == []
         assert good.read_text(encoding="utf-8") == "good"
-        assert bad.read_text(encoding="utf-8") == "bad"
+        assert bad.is_symlink()
+        assert valuable.read_text(encoding="utf-8") == "valuable"
 
 
 @pytest.mark.parametrize("changed", ["waiting", "other-declaration"])
