@@ -306,12 +306,14 @@ class TestJobInstanceFieldValidation:
     """实例位字段校验（经私有恢复入口 _restore）。"""
 
     def test_attempt_no_matrix(self):
-        with pytest.raises(TypeError, match="attempt_no must be an int"):
+        with pytest.raises(TaskLiteError, match="attempt_no must be an int"):
             Job._restore("t", "id", attempt_no="2")  # type: ignore[arg-type]
-        with pytest.raises(TypeError, match="attempt_no must be an int"):
+        with pytest.raises(TaskLiteError, match="attempt_no must be an int"):
             Job._restore("t", "id", attempt_no=True)
-        with pytest.raises(ValueError, match="attempt_no must be >= 1"):
+        with pytest.raises(TaskLiteError, match="attempt_no must be >= 1"):
             Job._restore("t", "id", attempt_no=0)
+        with pytest.raises(TaskLiteError, match="attempt_no must be >= 1"):
+            Job._restore("t", "id", attempt_no=-1)
 
 
 class TestJobUid:
@@ -400,6 +402,11 @@ class TestJobToDictFromDict:
     def test_from_dict_with_explicit_attempt_no(self):
         job = Job.from_dict({"task_type": "t", "job_id": "j", "attempt_no": 3})
         assert job.attempt_no == 3
+
+    @pytest.mark.parametrize("bad_attempt_no", ["2", True, False, 0, -1, 1.5])
+    def test_from_dict_rejects_invalid_attempt_no_with_tasklite_error(self, bad_attempt_no):
+        with pytest.raises(TaskLiteError, match="attempt_no must be"):
+            Job.from_dict({"task_type": "t", "job_id": "j", "attempt_no": bad_attempt_no})
 
     def test_from_dict_required_keys(self):
         with pytest.raises(KeyError):

@@ -104,12 +104,12 @@ def _normalize_depends_on(depends_on: Any) -> list[str]:
 def _validate_attempt_no(attempt_no: Any) -> None:
     """attempt_no 入口校验：非 bool 的 int 且 >= 1（1 起始含首次执行）。"""
     if not isinstance(attempt_no, int) or isinstance(attempt_no, bool):
-        raise TypeError(
+        raise TaskLiteError(
             f"attempt_no must be an int, got {type(attempt_no).__name__} "
             f"({attempt_no!r})"
         )
     if attempt_no < 1:
-        raise ValueError(f"attempt_no must be >= 1, got {attempt_no}")
+        raise TaskLiteError(f"attempt_no must be >= 1, got {attempt_no}")
 
 
 class Job:

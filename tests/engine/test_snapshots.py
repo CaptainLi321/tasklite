@@ -116,6 +116,8 @@ class TestStateSnapshotOpeningAndClosing:
     @pytest.mark.parametrize(("version", "change", "message"), [
         (5, None, "Unsupported database schema version 5"),
         (TARGET_SCHEMA_VERSION, "DROP TABLE job_sequences", "for 'job_sequences'"),
+        (TARGET_SCHEMA_VERSION, "DROP TABLE authorizations", "for 'authorizations'"),
+        (TARGET_SCHEMA_VERSION, "ALTER TABLE authorizations ADD COLUMN extra TEXT", "for 'authorizations'"),
         (TARGET_SCHEMA_VERSION, "ALTER TABLE attempts ADD COLUMN extra TEXT", "for 'attempts'"),
     ])
     def test_invalid_schema_closes_connection_and_preserves_database(

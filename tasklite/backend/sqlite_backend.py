@@ -45,6 +45,7 @@ _TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "job_sequences": ("job_uid", "last_attempt_no"),
     "cursors": ("key", "value"),
     "engine_metadata": ("key", "value"),
+    "authorizations": ("path", "target_type", "authorized_at"),
 }
 
 

@@ -43,8 +43,9 @@ if TYPE_CHECKING:
             done_entries: Sequence[tuple[InFlightJob, ExecutionResult]],
         ) -> None: ...
 
-from ..models.state import PipelineState, job_uid_from_snapshot
 from ..backend.base import execution_id_matches_run
+from ..exceptions import TaskLiteError
+from ..models.state import PipelineState, job_uid_from_snapshot
 
 
 class RecoveryOrchestrator:
@@ -72,7 +73,7 @@ class RecoveryOrchestrator:
         failed = backend.load_failed()
         overlap = successes.keys() & failed.keys()
         if overlap:
-            raise RuntimeError(f"Invariant conflict: Jobs have both terminal records: {overlap}")
+            raise TaskLiteError(f"Invariant conflict: Jobs have both terminal records: {overlap}")
 
         queue_rows = backend.load_queue_jobs()
         running = [row for row in queue_rows if row["status"] == "running"]
@@ -93,7 +94,7 @@ class RecoveryOrchestrator:
                     for attempt in backend.load_settled_attempts(uid)
                 )
             ):
-                raise RuntimeError(
+                raise TaskLiteError(
                     f"Invariant conflict: Job {uid!r} has an invalid or already settled running execution "
                     f"(execution_id={execution_id!r}, run_id={run_id!r}, "
                     f"attempt_no={attempt_no!r})"

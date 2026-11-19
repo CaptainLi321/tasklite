@@ -17,14 +17,14 @@ import threading
 import time
 import pytest
 
-from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
+from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskLiteError, TaskResult
 from tasklite.backend.base import QUEUE_EXECUTION_ID_KEY
 from tasklite.resource import CapacityResource
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "retry", "pending"])
-def test_startup_invariant_conflict_raises_runtime_error(tmp_path: Path, outcome):
+def test_startup_invariant_conflict_raises_tasklite_error(tmp_path: Path, outcome):
     """同一次执行不能同时处于 running 与已结算。"""
     db_path = tmp_path / "conflict_state.db"
     backend = SQLiteStateBackend(db_path)
@@ -67,7 +67,7 @@ def assert_startup_conflict_preserves_database(db_path):
     with closing(sqlite3.connect(db_path)) as observer:
         before = list(observer.iterdump())
         with TaskLite(backend="sqlite", state_path=db_path) as pipeline:
-            with pytest.raises(RuntimeError, match="Invariant conflict"):
+            with pytest.raises(TaskLiteError, match="Invariant conflict"):
                 pipeline.run()
         assert list(observer.iterdump()) == before
 
