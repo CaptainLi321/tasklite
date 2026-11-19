@@ -142,6 +142,7 @@ Schema 6 包含以下核心表：
 5. `job_sequences(job_uid TEXT PRIMARY KEY, last_attempt_no INTEGER)`
 6. `cursors(key TEXT PRIMARY KEY, value TEXT)`
 7. `engine_metadata(key TEXT PRIMARY KEY, value TEXT)`
+8. `authorizations(path TEXT PRIMARY KEY, target_type TEXT, authorized_at TEXT)`
 
 `job_sequences` 是独立编号进度，不从当前队列、终态档案或剩余 Attempt 最大值推导。清空某 UID 的全部档案与 Attempt 后重新入队，`attempt_no` 仍从该 UID 已分配到的位置继续单调递增；人工状态修改不推进编号。
 
@@ -245,7 +246,8 @@ FileSpec(
 - 初始派发前授权拒绝时，Job 保持 `pending`，不产生 Attempt；已进入 `running` 后授权拒绝或等待期间收到停止请求时，先结束受阻执行，再追加 `failure` Attempt、把 Job 回到 `pending`；两者均不写失败档案、不消耗重试预算；
 - 授权拒绝将受影响依赖链加入本 Run 临时排除；`stop()`／Ctrl+C 则停止整个 Run 的新派发；
 - 受保护的状态库、WAL／SHM 副文件与库级锁文件绝对禁止声明或删除；
-- Run 外可调用 `pipeline.list_authorizations()` 查看当前已持久化授权，调用 `pipeline.revoke_authorization(path)` 精准撤销。
+- Run 外可调用 `pipeline.list_authorizations()` 查看当前已持久化授权，调用 `pipeline.revoke_authorization(path)` 精准撤销；
+- **平台支持边界**：当前主进程物理文件/目录安全清理（`ArtifactPathPolicy`）依赖 Linux `dir_fd` / `O_NOFOLLOW` / `O_DIRECTORY` 与 `/proc/self/mountinfo`，目前仅支持 Linux 平台。
 
 授权等待是文件准备协议的一部分，不是资源挂起。`TaskResult.retry`、资源不足和授权等待具有不同语义，不共享重试或挂起入口。
 
@@ -372,7 +374,6 @@ with StateSnapshot.open(pipeline) as snap:
     "job": {...},
     "files": {...},
     "result": {...},
-    "error_message": None,
 }
 ```
 

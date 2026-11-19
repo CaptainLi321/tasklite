@@ -93,7 +93,7 @@ from tasklite.selection import Exclude
 - `pipeline.register_trigger` 与 `TriggerContext`：自定义触发器扩展接口与判定回调上下文对象；
 - `tasklite.wrappers.http`：HTTP 请求、响应与快照存储工具；
 - `tasklite.wrappers.discovery`：基于游标去重的增量分页扫描器；
-- `tasklite.testing`：单元测试辅助工具（`fake_ctx`, `running`）；
+- `tasklite.testing`：单元测试辅助工具（`fake_ctx`, `running`, `authorizer`, `in_process_workers`, `spawned_jobs`, `cursor_updates`）；
 - `tasklite.hooks`：业务展示切片工具（`job_ref`, `slice_list`）。
 
 ---
@@ -136,8 +136,8 @@ TaskLite 遵循明确的异常边界划分：
    - 任务在通过标准库 `multiprocessing.get_context("spawn")` 创建的独立隔离子进程中执行；
    - `Task.handler` 必须是**模块顶层可寻址、可 pickle 序列化**的函数，禁止使用局部函数、闭包或未绑定 `lambda`。
 2. **主调度进程（Master Process）**：
-   - 调度循环、状态持久化、文件授权检查、清理以及 `Task.trigger` 与 `TaskLite.authorizer` 回调均**在主进程同步执行**；
-   - 自定义触发器回调与 `authorizer` 严禁发起可能导致主循环死锁的阻塞或重入操作。
+   - 调度循环、状态持久化、文件授权检查、清理以及 `Task.trigger` 回调均**在主进程同步执行**；
+   - 自定义触发器回调严禁发起可能导致主循环死锁的阻塞或重入操作。
 
 ---
 
@@ -178,7 +178,7 @@ TaskLite(
 - **`is_running`**（`bool`，只读）：管线当前是否正在执行 `run()` 循环中。
 
 > [!NOTE]
-> **私有化内部边界说明**：为保障面向稳定基线（[ADR-0011](adr/0011-stable-interface-baseline.md)）的封装纯洁性，内部状态与配置字段（`_state_path`, `_base_dir`, `_tasks`, `_resources`, `_runtime_config`, `_backend_type` 及内部授权回调）均彻底私有化，不再向外暴露为公开属性。调用方应始终通过 `register_task`、`register_resource`、`list_authorizations`、`revoke_authorization` 等标准公开方法与管线交互，不得将内部字段当做稳定公开 API。
+> **私有化内部边界说明**：为保障面向稳定基线（[ADR-0011](adr/0011-stable-interface-baseline.md)）的封装纯洁性，状态库路径、基准目录、内部任务/资源注册表、运行时装配配置、后端类型标识及内部授权回调等实现字段均彻底私有化，不再向外暴露为公开属性。调用方应始终通过 `register_task`、`register_resource`、`list_authorizations`、`revoke_authorization` 等标准公开方法与管线交互，不得将内部字段当做稳定公开 API。
 
 ---
 
@@ -292,7 +292,7 @@ from tasklite.models.trigger import TriggerContext
   - `exclude`：必须为 `Exclude` 实例或 `None`，非法类型抛出 `TaskLiteError`；
   - `install_signals`（`bool`，默认 `True`）：是否在主进程安装 `SIGTERM` 与 `SIGINT` 信号监听。
 - **内部核心执行流程**：
-  1. **状态库排他锁定**：获取 `__tasklite__.lock` 单库文件锁与写事务互斥，确保单状态库同一时刻只有一个调度实例写入；
+  1. **状态库排他锁定**：获取 `<state_path>.lock` 单库文件锁（例如 `state.db.lock`）与写事务互斥，确保单状态库同一时刻只有一个调度实例写入；
   2. **启动崩溃恢复（Recovery）**：启动预检扫描状态库。若发现上次运行异常崩溃遗留的 `running` 状态作业，将其原子收敛为失败 Attempt 并移入 `failed` 失败档案；保留处于 `pending` 状态的待办作业，不自动接续旧执行；
   3. **预检 Handler 可序列化性**：验证所有注册任务的 handler 均可被 `spawn` 子进程安全 pickle；
   4. **四相事件泵调度循环**：
@@ -432,7 +432,7 @@ Job(
 - `ctx.job`（`Job`）：当前正在执行的作业逻辑实例；
 
 > [!NOTE]
-> **内部状态彻底私有化**：`JobContext` 仅暴露 `ctx.job` 及受控交互方法（`spawn`, `declare_file`, `file_path`, `get_cursor`, `set_cursor`）。内部字段 `_base_dir` 及累积容器 `_spawned_jobs`、`_cursor_updates` 已彻底私有化，不向外部暴露任何内部配置或累积容器属性。所有衍生作业与游标变更必须经由 `ctx.spawn()` 与 `ctx.set_cursor()` 受控登记，并在作业成功结算时由主进程原子提交。
+> **内部状态彻底私有化**：`JobContext` 仅暴露 `ctx.job` 及受控交互方法（`spawn`, `declare_file`, `file_path`, `get_cursor`, `set_cursor`）。内部路径基准以及衍生作业、游标变更的暂存容器已彻底私有化，不向外部暴露任何内部配置或累积容器属性。所有衍生作业与游标变更必须经由 `ctx.spawn()` 与 `ctx.set_cursor()` 受控登记，并在作业成功结算时由主进程原子提交（单元测试观测可通过 [`tasklite.testing`](../tasklite/testing.py) 提供的 `spawned_jobs` 与 `cursor_updates` 只读辅助完成）。
 
 #### 公开方法
 1. **`file_path(name: str) -> Path`**：
@@ -528,6 +528,7 @@ TaskResult.retry(*, message: str | None = None, metadata: dict[str, Any] | None 
 - **上游直接依赖约束**：
   - `from_output` 引用的 `producer_uid`，**必须出现在当前 Job 的显式 `depends_on` 列表中**，否则在解析与动态声明时直接抛出 `TaskLiteError`；
 - **受保护路径硬拦截**：状态库文件、系统关键路径属于受保护路径，任何删除或写授权请求一律硬拦截拒绝；
+- **平台支持边界**：当前主进程物理文件/目录安全清理（`ArtifactPathPolicy`）依赖 Linux `dir_fd` / `O_NOFOLLOW` / `O_DIRECTORY` 与 `/proc/self/mountinfo`，**目前仅支持 Linux 平台**；
 - **成功结算产物检查与时序**：
   - 任务返回 `success` 后，主进程核验所有声明为 `role="output"` 的产物：
     - 若物理文件不存在，且 `delete_on_success=False`，主进程将结果改判为失败并报错 `Missing output <path>`；
@@ -590,7 +591,7 @@ snapshot.get_job(uid: str) -> dict[str, Any] | None
     "result": dict | None,     # 结算结果，仅 succeeded 与 failed 存在，未结算为 None
     "run_id": str | None,      # 运行会话标识（pending 态恒为 None）
     "attempt_no": int | None,  # 执行编号（pending 态恒为 None）
-    "started_at": str | None,  # UTC ISO 8601 启动时间戳（以 'Z' 结尾，未启动为 None）
+    "started_at": str | None,  # UTC ISO 8601 worker 实际启动时间戳（以 'Z' 结尾；未启动或未结算的 running 快照为 None）
     "settled_at": str | None,  # UTC ISO 8601 结算时间戳（以 'Z' 结尾，未结算为 None）
 }
 ```
@@ -754,7 +755,7 @@ Exclude(*, task_type: str)
 ```
 
 - **参数与属性**：
-  - `task_type`（`str`，**仅关键字参数**）：待排除的任务类型名称。必须通过 `validate_task_type` 校验。
+  - `task_type`（`str`，**仅关键字参数**）：待排除的任务类型名称。必须为合法的非空 UTF-8 字符串，否则抛出 `TaskLiteError`。
   - `matches_task_type(task_type: str) -> bool`：精确全字匹配。
 - **调度行为**：
   - 通过 `pipeline.run(exclude=Exclude(task_type="..."))` 传入；
@@ -784,10 +785,17 @@ Exclude(*, task_type: str)
 
 ### 8.1 tasklite.testing 单元测试工具
 
-位于 [`tasklite/testing.py`](../tasklite/testing.py)，为业务 handler 提供官方的隔离单测构造句柄。
+位于 [`tasklite/testing.py`](../tasklite/testing.py)，为业务 handler 与引擎集成单测提供官方的隔离构造与受控接缝句柄。
 
 ```python
-from tasklite.testing import fake_ctx, running
+from tasklite.testing import (
+    authorizer,
+    cursor_updates,
+    fake_ctx,
+    in_process_workers,
+    running,
+    spawned_jobs,
+)
 ```
 
 ```text
@@ -805,18 +813,43 @@ fake_ctx(
     files: Mapping[str, Any] | None = None,
 ) -> JobContext
 ```
-- **核心职责**：构建真实的 `JobContext` 实例。严格遵循受保护路径及依赖合法性校验；
+- **核心职责**：构建真实的 `JobContext` 实例。严格遵循受保护路径（`protected_roots`）及上游依赖闭合校验（`from_output` 要求 `producer_uid` 位于 `job.depends_on` 中，缺失 `input` 文件与真实主进程一致抛出 `FileNotFoundError`）；
 - **参数说明**：
   - `tmp_root`：提供时自动在其下创建临时目录作为相对路径解析基准（`base_dir`）；
   - `successes` / `failed`：模拟历史完成与失败作业集合；
   - `artifacts`：模拟上游作业发布的具名产物描述（用于测试 `from_output` 依赖解析）；
+  - `protected_roots`：不可声明为产物或请求删除的框架受保护路径；
   - `cursors`：注入初始游标字典。
 
 ```text
-@contextmanager
-def running(target: TaskLite) -> Iterator[Any]
+spawned_jobs(ctx: JobContext) -> list[Job]
+cursor_updates(ctx: JobContext) -> dict[str, str | None]
 ```
-- **核心职责**：测试专用上下文管理器。将 `TaskLite` 实例临时置为运行中状态，用于测试各种管理 API 在运行期的状态守卫，退出上下文时自动复位。
+- **核心职责**：只读观测辅助工具，分别返回 `ctx.spawn()` 登记的子作业列表浅拷贝与 `ctx.set_cursor()` 暂存的游标更新字典浅拷贝，消除测试代码对 `JobContext` 内部容器的直接访问。
+
+```text
+@contextmanager
+def running(target: Any) -> Iterator[Any]
+```
+- **核心职责**：测试专用上下文管理器。将 `TaskLite` / `EngineRuntime` 实例临时置为运行中状态，用于测试各种管理 API 在运行期的状态守卫，退出上下文时自动复位。
+
+```text
+@contextmanager
+def authorizer(
+    target: Any,
+    fn: Callable[[str, str], bool | None] | None,
+) -> Iterator[Any]
+```
+- **核心职责**：测试专用授权回调注入上下文管理器。为 `TaskLite` / `EngineRuntime` / `StateStore` 临时注入文件授权决策回调 `fn`，退出上下文时自动恢复原回调，防止跨用例污染。
+
+```text
+@contextmanager
+def in_process_workers(
+    target: Any,
+    process_class: type | None = None,
+) -> Iterator[Any]
+```
+- **核心职责**：轻量进程替身上下文管理器。保留真实的单向 `Pipe` 通信边界，仅将子进程创建替换为进程内线程替身（或调用方传入的自定义 `process_class`），退出上下文时自动恢复原有进程上下文。
 
 ---
 
@@ -854,7 +887,7 @@ HttpResponse(
   - `body`（`bytes`）：原始二进制响应体；
   - `text`（`str`，属性）：按 UTF-8 解码的响应文本；
   - `url`（`str`）：请求对应的目标 URL；
-  - `ok`（`bool`，属性）：`status_code < 400` 时为 `True`。
+  - `ok`（`bool`，属性）：`200 <= status_code < 300` 时为 `True`。
 - **方法**：
   - `json() -> Any`：将响应体解析为 JSON 数据；
   - `header(name: str, default: str | None = None) -> str | None`：大小写不敏感查询指定响应头；
@@ -998,6 +1031,6 @@ from tasklite.hooks import job_ref, slice_list
 ```
 
 - **`job_ref(metadata: Any) -> str`**：
-  - 从结果元数据中提取人类可读标识（依次尝试 `post_id`、`artist`、`id` 字段；未找到返回 `"-"`）；
+  - 从结果元数据中提取人类可读标识（若包含 `post_id` 返回 `f"#{post_id}"`，否则依次尝试 `artist`、`id` 并转为字符串；未找到或非字典返回 `""`）；
 - **`slice_list(items: list[Any], *, start: int | None = None, count: int | None = None, limit: int | None = None) -> list[Any]`**：
   - 仅关键字参数。分批切片工具：先按 `limit` 截断总量，再按 `[start : start + count]` 截取窗口。

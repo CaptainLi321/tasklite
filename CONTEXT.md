@@ -95,7 +95,7 @@ _Avoid_: TaskContext, ExecContext, HandlerEnv
 ### Persistence
 
 **SQLiteStateBackend**:
-默认 ACID 存储后端，采用 SQLite WAL 模式与 immediate 写事务。状态库采用 Schema 6（`user_version=6`），核心表包括 `queue`、`successes`、`failed`、`attempts`、`job_sequences`、`cursors` 与 `engine_metadata`。只读预检阶段 fail-loud 拒绝旧版本（Schema ≤ 5）与异形库。
+默认 ACID 存储后端，采用 SQLite WAL 模式与 immediate 写事务。状态库采用 Schema 6（`user_version=6`），核心表包括 `queue`、`successes`、`failed`、`attempts`、`job_sequences`、`cursors`、`engine_metadata` 与 `authorizations(path TEXT PRIMARY KEY, target_type TEXT, authorized_at TEXT)`。只读预检阶段 fail-loud 拒绝旧版本（Schema ≤ 5）与异形库。
 _Avoid_: SQLiteDriver, DBBackend
 
 **InMemoryStateBackend**:

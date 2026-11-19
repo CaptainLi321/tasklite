@@ -48,7 +48,7 @@ flowchart TD
 ### 三层可靠性边界
 1. **执行代标识与通道绑定 (Generation Fencing)**：每 worker 绑定独立单向 `Pipe` 与执行代标识，校验 `job_uid` 与 `execution_id`，旧执行与伪造消息无法污染状态机；
 2. **已结算状态事务持久化**：IPC 仅负责本次运行的瞬时通信；已提交成功、失败与 `attempts` 由 SQLite 强事务持久化。异常退出遗留的 `running` 下次按失败收敛，`pending` 留队，不自动接续旧执行；
-3. **单库级文件锁防护 (Library Lock Fencing)**：通过 `__tasklite__.lock` 互斥保护，同一状态库同时只允许一个活动调度实例或管理写操作，避免并发写入破坏。
+3. **单库级文件锁防护 (Library Lock Fencing)**：通过 `<state_path>.lock`（如 `state.db.lock`）互斥保护，同一状态库同时只允许一个活动调度实例或管理写操作，避免并发写入破坏。
 
 ---
 
@@ -204,7 +204,7 @@ def agent_worker(job: Job, ctx) -> TaskResult:
     return TaskResult.success(metadata={"tokens": result.get("usage", 0)})
 
 pipeline = TaskLite(backend="sqlite", state_path="./agent_state.db", max_workers=8)
-pipeline.authorizer = lambda p, t: True
+# 含清理标志的文件声明可通过交互授权或 TASKLITE_DANGEROUS_AUTO_APPROVE=1 确认
 pipeline.register_resource(IntervalResource("llm_rpm", interval_seconds=0.1))
 pipeline.register_task(Task("analyze", agent_worker, resources={"llm_rpm": 1.0}))
 
@@ -244,7 +244,7 @@ tasklite/
 ├── resource.py          # 内置资源公共导出门面 (CapacityResource, IntervalResource)
 ├── snapshot.py          # StateSnapshot：只读一致状态快照与标准 JSON 查询
 ├── exceptions.py        # 异常族 (TaskLiteError)
-├── testing.py           # fake_ctx：handler 单测的官方 JobContext 构造辅助
+├── testing.py           # 测试辅助工具（fake_ctx / running / authorizer / in_process_workers 等）
 ├── engine/              # 核心调度与执行引擎群
 │   ├── runtime.py       # 核心运行期深模块、主循环事件泵 (EngineRuntime)
 │   ├── config.py        # RunConfig 静态装配快照、默认值唯一解析点
@@ -252,7 +252,6 @@ tasklite/
 │   ├── wait.py          # 事件泵等待/空闲决策纯函数
 │   ├── types.py         # 引擎公共值对象单一真相源
 │   ├── store.py         # 状态事务与失败写入隔离 (StateStore)
-│   ├── ops.py           # OpsConsole：run() 外纯运维接缝（管理 API 委托目标）
 │   ├── dispatch.py      # 任务派发状态机 (DispatchMachine)
 │   ├── completion.py    # 任务完成与提交单一收口 (CompletionMachine)
 │   ├── recovery.py      # 遗留 running 收敛与在途中止编排 (RecoveryOrchestrator)
