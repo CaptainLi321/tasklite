@@ -1,6 +1,9 @@
 """具名产物在真实 spawn、历史成功及目录消费中的公开契约。"""
 
+from contextlib import contextmanager
+
 from tasklite import FileSpec, Job, TaskLite, TaskResult
+from tasklite.testing import authorizer
 
 
 def build_bundle(job, ctx):
@@ -20,19 +23,25 @@ def illegal_state_output(job, ctx):
     return TaskResult.success()
 
 
+@contextmanager
 def _pipeline(tmp_path):
     out = tmp_path / "output"
     out.mkdir(parents=True, exist_ok=True)
     pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "artifacts.db")
-    pipeline._runtime.store.authorizer = lambda *args: True
-    return pipeline
+    try:
+        with authorizer(pipeline, lambda *args: True):
+            yield pipeline
+    finally:
+        try:
+            pipeline.stop()
+        finally:
+            pipeline.close()
 
 
 def test_direct_dependency_publishes_directory_for_actual_file_input(tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("build", build_bundle)
-    pipeline.register_task("consume", consume_bundle)
-    try:
+    with _pipeline(tmp_path) as pipeline:
+        pipeline.register_task("build", build_bundle)
+        pipeline.register_task("consume", consume_bundle)
         pipeline.enqueue(Job(
             "build",
             "one",
@@ -63,14 +72,11 @@ def test_direct_dependency_publishes_directory_for_actual_file_input(tmp_path):
             str(tmp_path / "output" / "bundle")
         ]
         assert successes["consume::one"]["result"]["metadata"]["content"] == "published"
-    finally:
-        pipeline.stop()
 
 
 def test_history_can_be_read_and_missing_disk_does_not_rerun_producer(tmp_path):
-    first = _pipeline(tmp_path)
-    first.register_task("build", build_bundle)
-    try:
+    with _pipeline(tmp_path) as first:
+        first.register_task("build", build_bundle)
         first.enqueue(Job(
             "build",
             "one",
@@ -84,11 +90,8 @@ def test_history_can_be_read_and_missing_disk_does_not_rerun_producer(tmp_path):
         ))
         first.run()
         original = first._runtime.store.backend.load_successes()["build::one"]
-    finally:
-        first.stop()
-    second = _pipeline(tmp_path)
-    second.register_task("consume", consume_bundle)
-    try:
+    with _pipeline(tmp_path) as second:
+        second.register_task("consume", consume_bundle)
         consumer_files = {
             "source": FileSpec.from_output("build::one", "bundle", role="input"),
         }
@@ -112,14 +115,11 @@ def test_history_can_be_read_and_missing_disk_does_not_rerun_producer(tmp_path):
         assert second._runtime.store.backend.load_successes()["build::one"] == original
         assert "consume::missing" in second._runtime.store.backend.load_failed()
         assert not (tmp_path / "output" / "bundle").exists()
-    finally:
-        second.stop()
 
 
 def test_dispatch_protects_complete_state_directory(tmp_path):
-    pipeline = _pipeline(tmp_path)
-    pipeline.register_task("unsafe", illegal_state_output)
-    try:
+    with _pipeline(tmp_path) as pipeline:
+        pipeline.register_task("unsafe", illegal_state_output)
         pipeline.enqueue(Job("unsafe", "one", payload={"path": str(pipeline._state_path)}))
         pipeline.run()
         failure = pipeline._runtime.store.backend.load_failed()["unsafe::one"]
@@ -129,5 +129,3 @@ def test_dispatch_protects_complete_state_directory(tmp_path):
         attempt, = pipeline._runtime.store.backend.load_settled_attempts("unsafe::one")
         assert attempt["outcome"] == "failure"
         assert pipeline._state_path.exists()
-    finally:
-        pipeline.stop()

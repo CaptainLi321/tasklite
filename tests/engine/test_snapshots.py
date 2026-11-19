@@ -18,6 +18,7 @@ from tasklite import (
 )
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
+from tasklite.testing import authorizer
 
 
 def dummy_handler(job, ctx):
@@ -579,15 +580,20 @@ def test_predispatch_failure_owns_current_result_and_configuration(
                 source.unlink()
                 return None
 
-            p._runtime.store.authorizer = defer_authorization
             files["out"] = FileSpec(tmp_path / "out", role="output", delete_existing=True)
+            p.enqueue(Job(
+                "process", "one", payload={"mode": "current"}, files=files, timeout_seconds=7,
+            ))
+            monkeypatch.setattr("tasklite.engine.store.utc_now_iso", lambda: "2030-01-02T03:04:05+00:00")
+            with authorizer(p, defer_authorization):
+                p.run(install_signals=False)
         else:
             source.unlink()
-        p.enqueue(Job(
-            "process", "one", payload={"mode": "current"}, files=files, timeout_seconds=7,
-        ))
-        monkeypatch.setattr("tasklite.engine.store.utc_now_iso", lambda: "2030-01-02T03:04:05+00:00")
-        p.run(install_signals=False)
+            p.enqueue(Job(
+                "process", "one", payload={"mode": "current"}, files=files, timeout_seconds=7,
+            ))
+            monkeypatch.setattr("tasklite.engine.store.utc_now_iso", lambda: "2030-01-02T03:04:05+00:00")
+            p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             current = snapshot.get_job("process::one")
         assert current["status"] == "failed"
@@ -777,10 +783,10 @@ def test_current_terminal_record_ignores_later_authorization_attempt(
             p.stop()
             return None
 
-        p._runtime.store.authorizer = defer_authorization
         p.enqueue(Job("process", "one", payload={"mode": "success", "block": True, "path": str(target)},
                       timeout_seconds=19, max_retries_per_run=0))
-        p.run(install_signals=False)
+        with authorizer(p, defer_authorization):
+            p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             assert snapshot.get_job(uid)["status"] == "pending"
             later = list(snapshot.iter_attempts(job_uid=uid))

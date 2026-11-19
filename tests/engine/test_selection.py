@@ -24,7 +24,7 @@ from tasklite.exceptions import TaskLiteError
 from tasklite.models.context import JobContext
 from tasklite.models.result import TaskResult
 from tasklite.models.state import DependencyStatus, PipelineState
-from tests.helpers import install_fake_process_context
+from tasklite.testing import in_process_workers
 
 
 def ok_handler(job, ctx):
@@ -118,13 +118,13 @@ def _queued(pipeline: TaskLite) -> list[str]:
 
 def test_default_and_none_exclude_execute_everything(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
-    install_fake_process_context(pipeline, fake_process())
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("convert", ok_handler)
     pipeline.enqueue(Job("fetch", "a"))
     pipeline.enqueue(Job("convert", "b"))
 
-    pipeline.run(exclude=None)
+    with in_process_workers(pipeline, fake_process()):
+        pipeline.run(exclude=None)
     assert sorted(pipeline._runtime.store.backend.load_successes()) == ["convert::b", "fetch::a"]
     assert _queued(pipeline) == []
 
@@ -134,7 +134,6 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
 ):
     seen: list[str] = []
     pipeline = _pipeline(tmp_path)
-    install_fake_process_context(pipeline, _fake_process_class(seen=seen))
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("convert", ok_handler)
     pipeline.register_task("rank", ok_handler)
@@ -143,19 +142,20 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     pipeline.enqueue(Job("rank", "r", depends_on=["convert::b"]))
     before = {uid: row for uid, row in zip(_queued(pipeline), pipeline._runtime.store.backend.load_queue())}
 
-    pipeline.run(exclude=Exclude(task_type="convert"))
+    with in_process_workers(pipeline, _fake_process_class(seen=seen)):
+        pipeline.run(exclude=Exclude(task_type="convert"))
 
-    assert sorted(pipeline._runtime.store.backend.load_successes()) == ["fetch::a"]
-    assert pipeline._runtime.store.backend.load_failed() == {}
-    assert _queued(pipeline) == ["convert::b", "rank::r"]
-    kept = {uid: row for uid, row in zip(_queued(pipeline), pipeline._runtime.store.backend.load_queue())}
-    assert kept == {uid: before[uid] for uid in ("convert::b", "rank::r")}
-    attempts = pipeline._runtime.store.backend.load_settled_attempts
-    assert [attempts("convert::b"), attempts("rank::r")] == [[], []]
-    assert seen == ["fetch::a"]
+        assert sorted(pipeline._runtime.store.backend.load_successes()) == ["fetch::a"]
+        assert pipeline._runtime.store.backend.load_failed() == {}
+        assert _queued(pipeline) == ["convert::b", "rank::r"]
+        kept = {uid: row for uid, row in zip(_queued(pipeline), pipeline._runtime.store.backend.load_queue())}
+        assert kept == {uid: before[uid] for uid in ("convert::b", "rank::r")}
+        attempts = pipeline._runtime.store.backend.load_settled_attempts
+        assert [attempts("convert::b"), attempts("rank::r")] == [[], []]
+        assert seen == ["fetch::a"]
 
-    # 下一次 run（不带 Exclude）自动恢复：留队下游全链执行完成
-    pipeline.run()
+        # 下一次 run（不带 Exclude）自动恢复：留队下游全链执行完成
+        pipeline.run()
     assert sorted(pipeline._runtime.store.backend.load_successes()) == [
         "convert::b",
         "fetch::a",
@@ -166,17 +166,17 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
 
 def test_only_excluded_jobs_finish_completed_without_failures(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
-    install_fake_process_context(pipeline, fake_process())
     pipeline.register_task("convert", ok_handler)
     for job_id in ("a", "b", "c"):
         pipeline.enqueue(Job("convert", job_id))
 
-    pipeline.run(exclude=Exclude(task_type="convert"))
+    with in_process_workers(pipeline, fake_process()):
+        pipeline.run(exclude=Exclude(task_type="convert"))
 
-    assert pipeline._runtime.store.backend.load_successes() == {}
-    assert pipeline._runtime.store.backend.load_failed() == {}
-    assert sorted(_queued(pipeline)) == ["convert::a", "convert::b", "convert::c"]
-    assert pipeline.run() is None
+        assert pipeline._runtime.store.backend.load_successes() == {}
+        assert pipeline._runtime.store.backend.load_failed() == {}
+        assert sorted(_queued(pipeline)) == ["convert::a", "convert::b", "convert::c"]
+        assert pipeline.run() is None
     assert sorted(pipeline._runtime.store.backend.load_successes()) == [
         "convert::a",
         "convert::b",
@@ -300,7 +300,6 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     fake_process, tmp_path
 ):
     pipeline = _pipeline(tmp_path)
-    install_fake_process_context(pipeline, fake_process())
     pipeline.register_task("rank", ok_handler)
     # 畸形行（缺 job_id）带被排除 task_type：不得被选择豁免，仍结算为配置无效
     pipeline._runtime.store.backend.enqueue_jobs(
@@ -311,9 +310,10 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     def run_pipeline():
         outcome["res"] = pipeline.run(exclude=Exclude(task_type="excluded_t"), install_signals=False)
 
-    worker = threading.Thread(target=run_pipeline, daemon=True)
-    worker.start()
-    worker.join(timeout=20)
+    with in_process_workers(pipeline, fake_process()):
+        worker = threading.Thread(target=run_pipeline, daemon=True)
+        worker.start()
+        worker.join(timeout=20)
     assert not worker.is_alive()
 
     assert outcome["res"] is None
@@ -332,15 +332,15 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
 def test_spawned_excluded_child_stays_queued(tmp_path):
     spawned = Job("excluded_t", "child").to_dict()
     pipeline = _pipeline(tmp_path)
-    install_fake_process_context(
-        pipeline,
-        _fake_process_class(spawn_jobs=[spawned]),
-    )
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.enqueue(Job("fetch", "parent"))
 
-    pipeline.run(exclude=Exclude(task_type="excluded_t"))
+    with in_process_workers(
+        pipeline,
+        _fake_process_class(spawn_jobs=[spawned]),
+    ):
+        pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
     assert sorted(pipeline._runtime.store.backend.load_successes()) == ["fetch::parent"]
     assert pipeline._runtime.store.backend.load_failed() == {}
@@ -350,10 +350,6 @@ def test_spawned_excluded_child_stays_queued(tmp_path):
 
 def test_failed_parent_cascade_keeps_excluded_downstream(tmp_path):
     pipeline = _pipeline(tmp_path)
-    install_fake_process_context(
-        pipeline,
-        _fake_process_class(fail_uid="fetch::parent"),
-    )
     pipeline.register_task("fetch", ok_handler)
     pipeline.register_task("excluded_t", ok_handler)
     pipeline.register_task("downstream", ok_handler)
@@ -361,7 +357,11 @@ def test_failed_parent_cascade_keeps_excluded_downstream(tmp_path):
     pipeline.enqueue(Job("excluded_t", "child", depends_on=["fetch::parent"]))
     pipeline.enqueue(Job("downstream", "grand", depends_on=["excluded_t::child"]))
 
-    pipeline.run(exclude=Exclude(task_type="excluded_t"))
+    with in_process_workers(
+        pipeline,
+        _fake_process_class(fail_uid="fetch::parent"),
+    ):
+        pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
     assert sorted(pipeline._runtime.store.backend.load_failed()) == ["fetch::parent"]
     assert sorted(_queued(pipeline)) == ["downstream::grand", "excluded_t::child"]

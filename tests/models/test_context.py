@@ -14,6 +14,7 @@ from tasklite import TaskLiteError
 from tasklite import FileSpec
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
+from tasklite.testing import cursor_updates, spawned_jobs
 
 
 def _make_ctx(
@@ -46,7 +47,7 @@ class TestSnapshotSemantics:
         ctx = _make_ctx(cursors={"high_water": "2026-01-01"})
         assert ctx.get_cursor("high_water") == "2026-01-01"
         ctx.set_cursor("high_water", "2026-02-01")
-        assert ctx._cursor_updates["high_water"] == "2026-02-01"
+        assert cursor_updates(ctx)["high_water"] == "2026-02-01"
         assert ctx.get_cursor("high_water") == "2026-02-01"
 
     def test_set_cursor_none_deletes(self):
@@ -54,14 +55,14 @@ class TestSnapshotSemantics:
         ctx = _make_ctx(cursors={"gone": "1", "kept": "2"})
         ctx.set_cursor("gone", None)
         assert ctx.get_cursor("gone") is None
-        assert ctx._cursor_updates["gone"] is None
+        assert cursor_updates(ctx)["gone"] is None
         assert ctx.get_cursor("kept") == "2"
 
     def test_set_cursor_empty_string_is_valid(self):
         ctx = _make_ctx()
         ctx.set_cursor("empty_val", "")
         assert ctx.get_cursor("empty_val") == ""
-        assert ctx._cursor_updates["empty_val"] == ""
+        assert cursor_updates(ctx)["empty_val"] == ""
 
     def test_set_cursor_type_guards(self):
         ctx = _make_ctx()
@@ -80,7 +81,7 @@ class TestSpawn:
         ctx = _make_ctx()
         child = Job("fetch", "child")
         ctx.spawn(child)
-        assert ctx._spawned_jobs == [child]
+        assert spawned_jobs(ctx) == [child]
 
     def test_spawn_rejects_non_serializable_payload(self):
         """已构造 Job 的坏变异也须在子进程登记派生前拒绝。"""
@@ -93,7 +94,7 @@ class TestSpawn:
         child.payload["fn"] = my_func
         with pytest.raises(TaskLiteError, match="payload.fn"):
             ctx.spawn(child)
-        assert ctx._spawned_jobs == []
+        assert spawned_jobs(ctx) == []
 
     def test_spawn_rejects_nan_payload(self):
         """非有限浮点数在派生登记前拒绝。"""
@@ -110,8 +111,9 @@ class TestSpawn:
         ctx.spawn(child)
         child.payload["items"].append("Job 变异")
         payload["items"].append("外部变异")
-        assert len(ctx._spawned_jobs) == 1
-        assert ctx._spawned_jobs[0].payload == {
+        jobs = spawned_jobs(ctx)
+        assert len(jobs) == 1
+        assert jobs[0].payload == {
             "items": [None, True, False, 3, 1.25, "中文", {"": []}]
         }
 
@@ -165,7 +167,7 @@ class TestInputFileSpec:
 
     def test_missing_input_fails_without_recording(self, tmp_path):
         ctx = _make_ctx()
-        with pytest.raises(TaskLiteError, match="Missing input file"):
+        with pytest.raises(FileNotFoundError, match="Missing input file"):
             ctx.declare_file(
                 "source",
                 FileSpec(tmp_path / "ghost.bin", role="input"),

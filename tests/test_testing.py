@@ -15,8 +15,15 @@ import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.runtime import EngineRuntime
-from tasklite import FileSpec, Job, JobContext, TaskLiteError, TaskResult
-from tasklite.testing import fake_ctx, running
+from tasklite import FileSpec, Job, JobContext, TaskLite, TaskLiteError, TaskResult
+from tasklite.testing import (
+    authorizer,
+    cursor_updates,
+    fake_ctx,
+    in_process_workers,
+    running,
+    spawned_jobs,
+)
 
 
 def _job(task_type="fetch", job_id="j1"):
@@ -69,13 +76,19 @@ class TestFakeCtxBasics:
         ctx = fake_ctx(_job(), cursors={"high_water": "2026-01-01"})
         assert ctx.get_cursor("high_water") == "2026-01-01"
         ctx.set_cursor("high_water", "2026-02-01")
-        assert ctx._cursor_updates["high_water"] == "2026-02-01"
+        updates = cursor_updates(ctx)
+        assert updates["high_water"] == "2026-02-01"
+        updates["mutated"] = "external"
+        assert "mutated" not in cursor_updates(ctx)
 
     def test_spawn_appends_new_jobs(self):
         ctx = fake_ctx(_job())
         child = _job("fetch", "child")
         ctx.spawn(child)
-        assert ctx._spawned_jobs == [child]
+        jobs = spawned_jobs(ctx)
+        assert jobs == [child]
+        jobs.append(_job("fetch", "extra"))
+        assert spawned_jobs(ctx) == [child]
 
 
 class TestFakeCtxTmpRoot:
@@ -175,7 +188,16 @@ class TestFakeCtxFilesAndResults:
         result = sample_handler(job, ctx)
         assert result.metadata["file_size"] > 0
         assert result.metadata["prev_step"] == "1"
-        assert ctx._cursor_updates["step"] == "2"
+        assert cursor_updates(ctx)["step"] == "2"
+
+    def test_missing_input_raises_file_not_found_error(self, tmp_path):
+        job = Job("read", "1", files={"src": FileSpec(tmp_path / "missing.txt", role="input")})
+        with pytest.raises(FileNotFoundError, match="Missing input file"):
+            fake_ctx(job, base_dir=tmp_path)
+
+        ctx = fake_ctx(Job("read", "2"), base_dir=tmp_path)
+        with pytest.raises(FileNotFoundError, match="Missing input file"):
+            ctx.declare_file("src", FileSpec("missing.txt", role="input"))
 
 
 class TestFakeCtxAuthorizationAndInvariants:
@@ -188,6 +210,18 @@ class TestFakeCtxAuthorizationAndInvariants:
         with pytest.raises(TaskLiteError, match="not in explicit direct depends_on"):
             ctx.declare_file("input_art", spec)
 
+    def test_predeclared_artifact_reference_without_depends_on_rejected(self, tmp_path):
+        out_file = tmp_path / "report.txt"
+        out_file.write_text("ok", encoding="utf-8")
+        spec = FileSpec.from_output(producer_uid="prod::1", output_name="report", role="input")
+        job = Job("consume", "c1", depends_on=[], files={"input_art": spec})
+        with pytest.raises(TaskLiteError, match="not in explicit direct depends_on"):
+            fake_ctx(
+                job,
+                successes=["prod::1"],
+                artifacts={"prod::1": {"report": {"path": str(out_file)}}},
+            )
+
     def test_test_context_does_not_delete_in_protected_roots(self, tmp_path):
         state_dir = tmp_path / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -195,11 +229,24 @@ class TestFakeCtxAuthorizationAndInvariants:
         target_file.write_text("protected", encoding="utf-8")
 
         ctx = fake_ctx(Job("clean", "1"), protected_roots=(state_dir,))
-        assert ctx.declare_file(
-            "del",
-            FileSpec(target_file, role="output", delete_existing=True),
-        ) == target_file
+        with pytest.raises(TaskLiteError, match="protected root"):
+            ctx.declare_file(
+                "del",
+                FileSpec(target_file, role="output", delete_existing=True),
+            )
         assert target_file.read_text(encoding="utf-8") == "protected"
+
+        predeclared = Job(
+            "clean",
+            "2",
+            files={"out": FileSpec(target_file, role="output")},
+        )
+        with pytest.raises(TaskLiteError, match="protected root"):
+            fake_ctx(predeclared, protected_roots=(state_dir,))
+
+        outside = tmp_path / "work" / "out.txt"
+        allowed_ctx = fake_ctx(Job("clean", "3"), protected_roots=(state_dir,), base_dir=tmp_path)
+        assert allowed_ctx.declare_file("out", FileSpec(outside, role="output")) == outside
 
     def test_unregistered_spawn_dependency_rejected(self):
         ctx = fake_ctx(Job("parent", "p1"))
@@ -213,4 +260,38 @@ class TestFakeCtxAuthorizationAndInvariants:
         bad_child.payload["func"] = lambda x: x
         with pytest.raises(TaskLiteError, match="payload.func"):
             ctx.spawn(bad_child)
+
+
+def _echo_worker_handler(job: Job, ctx: JobContext) -> TaskResult:
+    return TaskResult.success(metadata={"job_id": job.job_id})
+
+
+class TestAuthorizerAndInProcessWorkersHandles:
+    """authorizer 与 in_process_workers 官方测试句柄。"""
+
+    def test_authorizer_restores_original_on_exit_and_exception(self, tmp_path):
+        with TaskLite(backend="memory") as pipeline:
+            initial = lambda p, k: False  # noqa: E731
+            with authorizer(pipeline, initial) as store:
+                assert store.authorizer is initial
+                with pytest.raises(RuntimeError, match="boom"):
+                    with authorizer(pipeline, lambda p, k: True):
+                        assert store.authorizer("x", "file") is True
+                        raise RuntimeError("boom")
+                assert store.authorizer is initial
+            assert pipeline._runtime.store.authorizer is None
+
+    def test_in_process_workers_runs_and_restores_context(self):
+        with TaskLite(backend="memory", max_workers=1) as pipeline:
+            orig_pipeline_ctx = pipeline._process_context
+            orig_channel_ctx = pipeline._channel._process_context
+            pipeline.register_task("echo", _echo_worker_handler)
+            pipeline.enqueue(Job("echo", "item"))
+            with in_process_workers(pipeline):
+                assert pipeline._process_context is not orig_pipeline_ctx
+                assert pipeline._channel._process_context is not orig_channel_ctx
+                pipeline.run(install_signals=False)
+            assert pipeline._process_context is orig_pipeline_ctx
+            assert pipeline._channel._process_context is orig_channel_ctx
+            assert "echo::item" in pipeline._runtime.store.backend.load_successes()
 

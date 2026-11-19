@@ -24,6 +24,7 @@ from tasklite import (
     TaskResult,
 )
 from tasklite.resource import CapacityResource
+from tasklite.testing import authorizer as inject_authorizer
 
 
 def _quick_handler(job, ctx):
@@ -163,7 +164,6 @@ def test_worker_declaration_wakes_main_loop_wait(tmp_path, monkeypatch, caplog):
         max_workers=1,
     )
     authorizer = _ControlledAuthorizer(decision=True)
-    p._runtime.store.authorizer = authorizer
     p.register_task("declared", _barrier_then_declare_handler)
     p.register_task("follow", _quick_handler)
     p.enqueue(Job(
@@ -196,23 +196,24 @@ def test_worker_declaration_wakes_main_loop_wait(tmp_path, monkeypatch, caplog):
         except BaseException as exc:
             errors.append(exc)
 
-    runner = threading.Thread(target=run_pipeline)
-    runner.start()
-    try:
-        deadline = time.monotonic() + 10.0
-        while not entered.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert entered.exists()
-        assert wait_observed.wait(10.0), "主循环应已在等待在途完成"
-        trigger.write_text("go", encoding="utf-8")
-        assert authorizer.first_call.wait(10.0)
-        runner.join(timeout=15.0)
-        assert not runner.is_alive()
-        assert errors == []
-    finally:
-        trigger.touch(exist_ok=True)
-        p.stop()
-        runner.join(timeout=5.0)
+    with inject_authorizer(p, authorizer):
+        runner = threading.Thread(target=run_pipeline)
+        runner.start()
+        try:
+            deadline = time.monotonic() + 10.0
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert entered.exists()
+            assert wait_observed.wait(10.0), "主循环应已在等待在途完成"
+            trigger.write_text("go", encoding="utf-8")
+            assert authorizer.first_call.wait(10.0)
+            runner.join(timeout=15.0)
+            assert not runner.is_alive()
+            assert errors == []
+        finally:
+            trigger.touch(exist_ok=True)
+            p.stop()
+            runner.join(timeout=5.0)
 
     assert any(timeout is None or timeout > 5.0 for timeout in wait_timeouts)
     assert target.read_text(encoding="utf-8") == "new"
@@ -240,7 +241,6 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
 
     p = TaskLite(backend="sqlite", state_path=tmp_path / "t_auth_wait.db", max_workers=2)
     authorizer = _ControlledAuthorizer(decision=None)
-    p._runtime.store.authorizer = authorizer
     p.register_task("slow_decl", _declare_then_write_handler)
     p.register_task("quick", _wait_for_gate_then_quick_handler)
     p.register_task("third", _marker_handler)
@@ -282,26 +282,27 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
         except BaseException as exc:
             errors.append(exc)
 
-    runner = threading.Thread(target=run_pipeline)
-    runner.start()
-    try:
-        assert authorizer.first_call.wait(10.0)
-        quick_gate.write_text("go", encoding="utf-8")
-        _wait_for(lambda: "quick::q1" in p._runtime.store.backend.load_successes())
-        assert "slow_decl::s1" not in p._runtime.store.backend.load_successes()
-        assert not third_marker.exists()
-        assert any(handle.waiting_auth for handle in p._runtime.in_flight.active_handles())
-        gate_observed.clear()
-        assert gate_observed.wait(10.0)
-        assert not third_spawned.is_set()
+    with inject_authorizer(p, authorizer):
+        runner = threading.Thread(target=run_pipeline)
+        runner.start()
+        try:
+            assert authorizer.first_call.wait(10.0)
+            quick_gate.write_text("go", encoding="utf-8")
+            _wait_for(lambda: "quick::q1" in p._runtime.store.backend.load_successes())
+            assert "slow_decl::s1" not in p._runtime.store.backend.load_successes()
+            assert not third_marker.exists()
+            assert any(handle.waiting_auth for handle in p._runtime.in_flight.active_handles())
+            gate_observed.clear()
+            assert gate_observed.wait(10.0)
+            assert not third_spawned.is_set()
 
-        authorizer.decision = True
-        runner.join(timeout=20.0)
-        assert not runner.is_alive()
-        assert errors == []
-    finally:
-        p.stop()
-        runner.join(timeout=5.0)
+            authorizer.decision = True
+            runner.join(timeout=20.0)
+            assert not runner.is_alive()
+            assert errors == []
+        finally:
+            p.stop()
+            runner.join(timeout=5.0)
 
     assert set(p._runtime.store.backend.load_successes()) == {
         "slow_decl::s1",
@@ -322,7 +323,6 @@ def test_authorization_wait_does_not_consume_execution_timeout(tmp_path, monkeyp
 
     p = TaskLite(backend="sqlite", state_path=tmp_path / "paused-timeout.db")
     authorizer = _BlockingAuthorizer()
-    p._runtime.store.authorizer = authorizer
     deadline_passed = False
     reap_after_deadline = threading.Event()
     original_reap = p._runtime.channel.reap_completed
@@ -350,35 +350,36 @@ def test_authorization_wait_does_not_consume_execution_timeout(tmp_path, monkeyp
         except BaseException as exc:
             errors.append(exc)
 
-    runner = threading.Thread(target=run_pipeline)
-    runner.start()
-    try:
-        assert authorizer.first_call.wait(10.0)
-        _wait_for(
-            lambda: any(
-                handle.waiting_auth
-                for handle in p._runtime.in_flight.active_handles()
+    with inject_authorizer(p, authorizer):
+        runner = threading.Thread(target=run_pipeline)
+        runner.start()
+        try:
+            assert authorizer.first_call.wait(10.0)
+            _wait_for(
+                lambda: any(
+                    handle.waiting_auth
+                    for handle in p._runtime.in_flight.active_handles()
+                )
             )
-        )
-        handle = next(
-            handle
-            for handle in p._runtime.in_flight.active_handles()
-            if handle.waiting_auth
-        )
-        assert handle.paused_remaining is not None
-        handle.timeout_at_monotonic = time.monotonic() - 1.0
-        deadline_passed = True
-        authorizer.release.set()
-        assert reap_after_deadline.wait(10.0)
+            handle = next(
+                handle
+                for handle in p._runtime.in_flight.active_handles()
+                if handle.waiting_auth
+            )
+            assert handle.paused_remaining is not None
+            handle.timeout_at_monotonic = time.monotonic() - 1.0
+            deadline_passed = True
+            authorizer.release.set()
+            assert reap_after_deadline.wait(10.0)
 
-        authorizer.decision = True
-        runner.join(timeout=20.0)
-        assert not runner.is_alive()
-        assert errors == []
-    finally:
-        authorizer.release.set()
-        p.stop()
-        runner.join(timeout=5.0)
+            authorizer.decision = True
+            runner.join(timeout=20.0)
+            assert not runner.is_alive()
+            assert errors == []
+        finally:
+            authorizer.release.set()
+            p.stop()
+            runner.join(timeout=5.0)
 
     assert "work::one" in p._runtime.store.backend.load_successes()
     assert target.read_text(encoding="utf-8") == "updated"
@@ -396,12 +397,12 @@ def test_directory_authorization_reusable_and_subpath_revocation(tmp_path, monke
     sub_file.write_text("sub content", encoding="utf-8")
 
     # 1. 预先授予目录授权
-    p._runtime.store.authorizer = None
     p.register_task("dir_task", _dir_handler)
     p.enqueue(Job("dir_task", "d1"))
 
     # 尚未授权时拒绝
-    p.run()
+    with inject_authorizer(p, None):
+        p.run()
     assert "dir_task::d1" not in p._runtime.store.backend.load_successes()
 
     # 记录目录授权
@@ -460,7 +461,6 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
 
     p = TaskLite(backend="sqlite", state_path=state_path, max_workers=2)
     authorizer = _ControlledAuthorizer(decision=False if not deferred else None)
-    p._runtime.store.authorizer = authorizer
     p.register_task("target_task", _declare_then_write_handler)
     p.register_task("middle", _quick_handler)
     p.register_task("leaf", _quick_handler)
@@ -499,18 +499,19 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
         except BaseException as exc:
             errors.append(exc)
 
-    runner = threading.Thread(target=run_pipeline)
-    runner.start()
-    try:
-        assert authorizer.first_call.wait(10.0)
-        if deferred:
-            authorizer.decision = False
-        runner.join(timeout=20.0)
-        assert not runner.is_alive()
-        assert errors == []
-    finally:
-        p.stop()
-        runner.join(timeout=5.0)
+    with inject_authorizer(p, authorizer):
+        runner = threading.Thread(target=run_pipeline)
+        runner.start()
+        try:
+            assert authorizer.first_call.wait(10.0)
+            if deferred:
+                authorizer.decision = False
+            runner.join(timeout=20.0)
+            assert not runner.is_alive()
+            assert errors == []
+        finally:
+            p.stop()
+            runner.join(timeout=5.0)
 
     assert target.read_text(encoding="utf-8") == "old data"
     assert "independent::i1" in p._runtime.store.backend.load_successes()
@@ -540,11 +541,11 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
     p.close()
 
     reopened = TaskLite(backend="sqlite", state_path=state_path, max_workers=2)
-    reopened._runtime.store.authorizer = _MutableAuthorizer(allowed=True)
     reopened.register_task("target_task", _declare_then_write_handler)
     reopened.register_task("middle", _quick_handler)
     reopened.register_task("leaf", _quick_handler)
-    reopened.run(install_signals=False)
+    with inject_authorizer(reopened, _MutableAuthorizer(allowed=True)):
+        reopened.run(install_signals=False)
 
     assert {
         "target_task::t1",
@@ -586,7 +587,6 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
 
     p._resources["slot"] = ObservingCapacity("slot", max_capacity=1.0)
     authorizer = _BlockingAuthorizer()
-    p._runtime.store.authorizer = authorizer
     p.register_task("waiting", _declare_then_write_handler)
     p.register_task("quick", _wait_for_gate_then_quick_handler)
     p.register_task("after_stop", _marker_handler)
@@ -611,52 +611,53 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
         except BaseException as exc:
             errors.append(exc)
 
-    runner = threading.Thread(target=run_pipeline)
-    runner.start()
-    try:
-        assert authorizer.first_call.wait(10.0)
-        quick_gate.write_text("go", encoding="utf-8")
-        _wait_for(
-            lambda: any(
-                handle.waiting_auth
-                for handle in p._runtime.in_flight.active_handles()
+    with inject_authorizer(p, authorizer):
+        runner = threading.Thread(target=run_pipeline)
+        runner.start()
+        try:
+            assert authorizer.first_call.wait(10.0)
+            quick_gate.write_text("go", encoding="utf-8")
+            _wait_for(
+                lambda: any(
+                    handle.waiting_auth
+                    for handle in p._runtime.in_flight.active_handles()
+                )
             )
+            p.stop()
+            running = p._runtime.store.backend.load_queue_jobs(status="running")
+            assert "waiting::w1" in {row["job_uid"] for row in running}
+            authorizer.release.set()
+            runner.join(timeout=20.0)
+            assert not runner.is_alive()
+            assert errors == []
+        finally:
+            authorizer.release.set()
+            p.stop()
+            runner.join(timeout=5.0)
+
+        assert target.read_text(encoding="utf-8") == "old data"
+        assert p._runtime.store.backend.load_failed() == {}
+        assert p._runtime.store.backend.load_queue_jobs(status="pending")[0]["job_uid"] == "waiting::w1"
+        attempt, = p._runtime.store.backend.load_settled_attempts("waiting::w1")
+        assert attempt["outcome"] == "failure"
+        assert "authorization wait stopped for" in attempt["error_message"]
+        assert attempt["result"]["annotations"]["authorization_status"] == "stopped"
+        assert "waiting::w1" not in p._runtime.session.temporary_excluded_uids
+        assert p._runtime.session.retry_counts.get("waiting::w1", 0) == 0
+        assert p._runtime.in_flight.active_handles() == []
+        assert any(
+            "waiting::w1" in running_uids and not attempts
+            for running_uids, attempts in release_observations
         )
-        p.stop()
-        running = p._runtime.store.backend.load_queue_jobs(status="running")
-        assert "waiting::w1" in {row["job_uid"] for row in running}
-        authorizer.release.set()
-        runner.join(timeout=20.0)
-        assert not runner.is_alive()
-        assert errors == []
-    finally:
-        authorizer.release.set()
-        p.stop()
-        runner.join(timeout=5.0)
+        assert not stopped_marker.exists()
+        pending_uids = {
+            row["job_uid"]
+            for row in p._runtime.store.backend.load_queue_jobs(status="pending")
+        }
+        assert {"waiting::w1", "after_stop::a1"} <= pending_uids
 
-    assert target.read_text(encoding="utf-8") == "old data"
-    assert p._runtime.store.backend.load_failed() == {}
-    assert p._runtime.store.backend.load_queue_jobs(status="pending")[0]["job_uid"] == "waiting::w1"
-    attempt, = p._runtime.store.backend.load_settled_attempts("waiting::w1")
-    assert attempt["outcome"] == "failure"
-    assert "authorization wait stopped for" in attempt["error_message"]
-    assert attempt["result"]["annotations"]["authorization_status"] == "stopped"
-    assert "waiting::w1" not in p._runtime.session.temporary_excluded_uids
-    assert p._runtime.session.retry_counts.get("waiting::w1", 0) == 0
-    assert p._runtime.in_flight.active_handles() == []
-    assert any(
-        "waiting::w1" in running_uids and not attempts
-        for running_uids, attempts in release_observations
-    )
-    assert not stopped_marker.exists()
-    pending_uids = {
-        row["job_uid"]
-        for row in p._runtime.store.backend.load_queue_jobs(status="pending")
-    }
-    assert {"waiting::w1", "after_stop::a1"} <= pending_uids
-
-    authorizer.decision = True
-    p.run(install_signals=False)
+        authorizer.decision = True
+        p.run(install_signals=False)
     assert "waiting::w1" in p._runtime.store.backend.load_successes()
     assert "after_stop::a1" in p._runtime.store.backend.load_successes()
     assert stopped_marker.exists()
@@ -681,7 +682,6 @@ def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
         state_path=state_path,
     )
     authorizer = _ControlledAuthorizer(decision=None)
-    p._runtime.store.authorizer = authorizer
     p.register_task("work", _declare_then_write_handler)
     p.enqueue(Job(
         "work",
@@ -697,19 +697,20 @@ def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
         except BaseException as exc:
             errors.append(exc)
 
-    runner = threading.Thread(target=run_pipeline)
-    runner.start()
-    try:
-        assert authorizer.first_call.wait(10.0)
-        target.unlink()
-        target.symlink_to(state_path)
-        authorizer.decision = True
-        runner.join(timeout=20.0)
-        assert not runner.is_alive()
-        assert errors == []
-    finally:
-        p.stop()
-        runner.join(timeout=5.0)
+    with inject_authorizer(p, authorizer):
+        runner = threading.Thread(target=run_pipeline)
+        runner.start()
+        try:
+            assert authorizer.first_call.wait(10.0)
+            target.unlink()
+            target.symlink_to(state_path)
+            authorizer.decision = True
+            runner.join(timeout=20.0)
+            assert not runner.is_alive()
+            assert errors == []
+        finally:
+            p.stop()
+            runner.join(timeout=5.0)
 
     assert target.is_symlink()
     assert target.resolve() == state_path.resolve()
@@ -835,7 +836,6 @@ def test_forbidden_file_operations_never_request_or_persist_authorization(
     calls = []
     removals = []
     with TaskLite(backend="sqlite", state_path=state_path) as p:
-        p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         monkeypatch.setattr(
             "tasklite.utils.artifact.ArtifactPathPolicy._remove",
             lambda *args, **kwargs: removals.append(args),
@@ -846,7 +846,8 @@ def test_forbidden_file_operations_never_request_or_persist_authorization(
             "work", "one", payload={"spec": spec.to_dict()},
             files={"target": spec} if declaration == "static" else {},
         ))
-        p.run(install_signals=False)
+        with inject_authorizer(p, lambda *args: calls.append(args) or True):
+            p.run(install_signals=False)
         assert calls == []
         assert p.list_authorizations() == []
         assert removals == []
@@ -875,13 +876,13 @@ def test_static_forbidden_declaration_prevents_authorizing_other_targets(tmp_pat
     bad.symlink_to(valuable)
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
         calls = []
-        p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         p.register_task("work", _quick_handler)
         p.enqueue(Job("work", "one", files={
             "good": FileSpec(good, role="output", delete_existing=True),
             "bad": FileSpec(bad, role="output", delete_existing=True),
         }))
-        p.run(install_signals=False)
+        with inject_authorizer(p, lambda *args: calls.append(args) or True):
+            p.run(install_signals=False)
         assert calls == []
         assert p.list_authorizations() == []
         assert good.read_text(encoding="utf-8") == "good"
@@ -911,13 +912,13 @@ def test_static_authorization_wait_revalidates_target_before_asking_again(tmp_pa
         return True
 
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
-        p._runtime.store.authorizer = authorize
         p.register_task("work", _quick_handler)
         p.enqueue(Job("work", "one", files={
             "target": FileSpec(target, role="output", delete_existing=True),
             "other": FileSpec(other, role="output", delete_on_success=True),
         }))
-        p.run(install_signals=False)
+        with inject_authorizer(p, authorize):
+            p.run(install_signals=False)
         assert len(calls) == 1
         assert p.list_authorizations() == []
         assert changed_target.is_symlink()
@@ -938,13 +939,13 @@ def test_broken_symlink_preparation_authorizes_and_removes_only_the_link(
     spec = FileSpec(link, role="cache", delete_existing=True)
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
         calls = []
-        p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         p.register_task("work", _declare_spec_handler if declaration == "dynamic" else _quick_handler)
         p.enqueue(Job(
             "work", "one", payload={"spec": spec.to_dict()},
             files={"target": spec} if declaration == "static" else {},
         ))
-        p.run(install_signals=False)
+        with inject_authorizer(p, lambda *args: calls.append(args) or True):
+            p.run(install_signals=False)
         assert calls == [(str(link), "file")]
         authorization, = p.list_authorizations()
         assert authorization["path"] == str(link)
@@ -989,7 +990,6 @@ def test_allowed_file_operations_keep_instance_path_base(
     kwargs = {"state_path": base / "state.db"} if backend == "sqlite" else {}
     with TaskLite(backend=backend, **kwargs) as p:
         calls = []
-        p._runtime.store.authorizer = lambda *args: calls.append(args) or True
         p.register_task("work", _fixed_base_file_handler)
         monkeypatch.chdir(other)
         p.enqueue(Job(
@@ -997,7 +997,8 @@ def test_allowed_file_operations_keep_instance_path_base(
             files={"target": FileSpec("../allowed/result", role="output", delete_existing=True)}
             if declaration == "static" else {},
         ))
-        p.run(install_signals=False)
+        with inject_authorizer(p, lambda *args: calls.append(args) or True):
+            p.run(install_signals=False)
         assert calls == [(str(target), "file")]
         authorization, = p.list_authorizations()
         assert authorization["path"] == str(target)
@@ -1050,7 +1051,6 @@ def test_worker_target_type_change_requires_cleanup_scope_confirmation(
         waiting.set()
         return final_decision[0]
 
-    p._runtime.store.authorizer = authorize
     p.register_task("replace", _replace_file_with_tree_handler)
     p.register_task("downstream", _quick_handler)
     p.enqueue(Job(
@@ -1069,26 +1069,27 @@ def test_worker_target_type_change_requires_cleanup_scope_confirmation(
         except BaseException as exc:
             errors.append(exc)
 
-    runner = threading.Thread(target=run_pipeline)
-    runner.start()
-    try:
-        if initial != "directory" and (decision.startswith("wait") or decision == "stop"):
-            assert waiting.wait(10)
-            _wait_for(lambda: p._runtime._completion.waiting_authorization)
-            assert target.joinpath("child").read_text(encoding="utf-8") == "business data"
-            assert p._runtime.store.backend.load_settled_attempts("replace::one") == []
-            assert p._runtime.store.backend.load_queue_jobs(status="running")
-            assert p._runtime.session.retry_counts.get("replace::one", 0) == 0
-            if decision == "stop":
-                p.stop()
-            else:
-                final_decision[0] = decision == "wait-approve"
-        runner.join(timeout=20)
-        assert not runner.is_alive()
-        assert errors == []
-    finally:
-        p.stop()
-        runner.join(timeout=5)
+    with inject_authorizer(p, authorize):
+        runner = threading.Thread(target=run_pipeline)
+        runner.start()
+        try:
+            if initial != "directory" and (decision.startswith("wait") or decision == "stop"):
+                assert waiting.wait(10)
+                _wait_for(lambda: p._runtime._completion.waiting_authorization)
+                assert target.joinpath("child").read_text(encoding="utf-8") == "business data"
+                assert p._runtime.store.backend.load_settled_attempts("replace::one") == []
+                assert p._runtime.store.backend.load_queue_jobs(status="running")
+                assert p._runtime.session.retry_counts.get("replace::one", 0) == 0
+                if decision == "stop":
+                    p.stop()
+                else:
+                    final_decision[0] = decision == "wait-approve"
+            runner.join(timeout=20)
+            assert not runner.is_alive()
+            assert errors == []
+        finally:
+            p.stop()
+            runner.join(timeout=5)
     accepted = initial == "directory" or decision in ("approve", "wait-approve")
     assert calls[0] == (str(target), "directory" if initial == "directory" else "file")
     assert all(call == (str(target), "directory") for call in calls[1:])
@@ -1151,7 +1152,6 @@ def test_cleanup_wait_preserves_result_and_settles_other_worker_before_single_co
         requested.set()
         return decided[0]
 
-    p._runtime.store.authorizer = authorize
     p.register_task("replace", _replace_and_linger_handler)
     p.register_task("independent", _wait_for_gate_then_quick_handler)
     p.register_task("follow", _marker_handler)
@@ -1187,36 +1187,37 @@ def test_cleanup_wait_preserves_result_and_settles_other_worker_before_single_co
         except BaseException as exc:
             errors.append(exc)
 
-    runner = threading.Thread(target=run_pipeline)
-    runner.start()
-    try:
-        assert requested.wait(10)
-        _wait_for(lambda: p._runtime._completion.waiting_authorization)
-        entry = p._runtime.in_flight["replace::one"]
-        assert entry.handle.process.is_alive()
-        entry.handle.timeout_at_monotonic = time.monotonic() - 1
-        independent_gate.touch()
-        _wait_for(lambda: "independent::one" in p._runtime.store.backend.load_successes())
-        assert not marker.exists()
-        assert complete_calls == ["independent::one"]
-        assert target.joinpath("child").exists()
-        decided[0] = decision
-        if decision:
-            _wait_for(lambda: "replace::one" in p._runtime.store.backend.load_successes())
+    with inject_authorizer(p, authorize):
+        runner = threading.Thread(target=run_pipeline)
+        runner.start()
+        try:
+            assert requested.wait(10)
+            _wait_for(lambda: p._runtime._completion.waiting_authorization)
+            entry = p._runtime.in_flight["replace::one"]
             assert entry.handle.process.is_alive()
-            assert not target.exists()
+            entry.handle.timeout_at_monotonic = time.monotonic() - 1
+            independent_gate.touch()
+            _wait_for(lambda: "independent::one" in p._runtime.store.backend.load_successes())
+            assert not marker.exists()
+            assert complete_calls == ["independent::one"]
+            assert target.joinpath("child").exists()
+            decided[0] = decision
+            if decision:
+                _wait_for(lambda: "replace::one" in p._runtime.store.backend.load_successes())
+                assert entry.handle.process.is_alive()
+                assert not target.exists()
+                exit_gate.touch()
+            runner.join(20)
+            assert not runner.is_alive()
+            assert errors == []
+            assert complete_calls.count("replace::one") == 1
+            assert len(p._runtime.store.backend.load_settled_attempts("replace::one")) == 1
+        finally:
             exit_gate.touch()
-        runner.join(20)
-        assert not runner.is_alive()
-        assert errors == []
-        assert complete_calls.count("replace::one") == 1
-        assert len(p._runtime.store.backend.load_settled_attempts("replace::one")) == 1
-    finally:
-        exit_gate.touch()
-        independent_gate.touch()
-        p.stop()
-        runner.join(5)
-        p.close()
+            independent_gate.touch()
+            p.stop()
+            runner.join(5)
+            p.close()
 
 
 def _replace_file_with_link_handler(job, ctx):
@@ -1238,11 +1239,11 @@ def test_worker_leaf_link_replacement_never_expands_file_authorization(tmp_path,
     child.write_text("preserve", encoding="utf-8")
     p = TaskLite(backend=backend, state_path=tmp_path / "link.db")
     calls = []
-    p._runtime.store.authorizer = lambda *args: calls.append(args) or True
     p.register_task("replace", _replace_file_with_link_handler)
     p.enqueue(Job("replace", "one", payload={"destination": str(destination)},
                   files={"target": FileSpec(target, role="cache", delete_on_success=True)}))
-    p.run()
+    with inject_authorizer(p, lambda *args: calls.append(args) or True):
+        p.run()
     assert target.is_symlink()
     assert child.read_text(encoding="utf-8") == "preserve"
     assert calls == [(str(target), "file")]
@@ -1284,13 +1285,13 @@ def test_later_authorization_callback_cannot_expand_previously_checked_target(
             return approve_first_tree
         return True
 
-    p._runtime.store.authorizer = authorize
     p.register_task("replace", _replace_second_target_handler)
     p.enqueue(Job("replace", "one", files={
         "first": FileSpec(first, role="cache", delete_on_success=True),
         "second": FileSpec(second, role="cache", delete_on_success=True),
     }))
-    p.run()
+    with inject_authorizer(p, authorize):
+        p.run()
     assert calls == [(str(first), "file"), (str(second), "file"),
                      (str(second), "directory"), (str(first), "directory")]
     if approve_first_tree:
@@ -1321,7 +1322,6 @@ def test_type_change_at_deletion_snapshot_fails_without_directory_permission(
     target.write_text("initial", encoding="utf-8")
     p = TaskLite(backend=backend, state_path=tmp_path / "snapshot.db")
     calls = []
-    p._runtime.store.authorizer = lambda *args: calls.append(args) or True
     p.register_task("work", _failure_handler if timing == "delete_on_failure" else _quick_handler)
     p.enqueue(Job("work", "one", files={
         "target": FileSpec(target, role="cache", **{timing: True}),
@@ -1336,7 +1336,8 @@ def test_type_change_at_deletion_snapshot_fails_without_directory_permission(
         return original_remove(policy, path, declaration, **kwargs)
 
     monkeypatch.setattr(ArtifactPathPolicy, "_remove", replace_before_snapshot)
-    p.run()
+    with inject_authorizer(p, lambda *args: calls.append(args) or True):
+        p.run()
     assert target.joinpath("child").read_text(encoding="utf-8") == "preserve"
     assert calls == [(str(target), "file")]
     failed = p._runtime.store.backend.load_failed()["work::one"]
@@ -1363,7 +1364,6 @@ def test_run_fault_leaves_uncommitted_cleanup_result_running_for_recovery(
         calls.append((path, kind))
         return True if kind == "file" else final_decision[0]
 
-    p._runtime.store.authorizer = authorize
     p.register_task("replace", _replace_file_with_tree_handler)
     p.register_task("committed", _quick_handler)
     p.enqueue(Job("committed", "one"))
@@ -1396,8 +1396,9 @@ def test_run_fault_leaves_uncommitted_cleanup_result_running_for_recovery(
             return original_drain()
 
         monkeypatch.setattr(runtime, "_drain_and_settle", faulty_drain)
-    with pytest.raises(RuntimeError) as caught:
-        p.run(install_signals=False)
+    with inject_authorizer(p, authorize):
+        with pytest.raises(RuntimeError) as caught:
+            p.run(install_signals=False)
     assert caught.value is fault
     assert calls == [(str(target), "file")] + ([(str(target), "directory")] if cached else [])
     assert target.joinpath("child").read_text(encoding="utf-8") == "business data"
@@ -1436,7 +1437,6 @@ def test_success_cleanup_error_does_not_run_unapproved_failure_cleanup(tmp_path,
         path.write_text("initial", encoding="utf-8")
     p = TaskLite(backend=backend, state_path=tmp_path / "cleanup-outcome.db")
     calls = []
-    p._runtime.store.authorizer = lambda *args: calls.append(args) or True
     p.register_task("replace", _replace_second_target_handler)
     p.enqueue(Job("replace", "one", files={
         "first": FileSpec(first, role="cache", delete_on_success=True),
@@ -1449,7 +1449,8 @@ def test_success_cleanup_error_does_not_run_unapproved_failure_cleanup(tmp_path,
         raise OSError("cleanup write failure")
 
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", fail_cleanup)
-    p.run()
+    with inject_authorizer(p, lambda *args: calls.append(args) or True):
+        p.run()
     assert first.read_text(encoding="utf-8") == "initial"
     assert second.joinpath("child").read_text(encoding="utf-8") == "second data"
     assert calls == [(str(first), "file"), (str(second), "file")]

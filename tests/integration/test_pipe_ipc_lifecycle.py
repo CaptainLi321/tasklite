@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -26,6 +26,7 @@ import pytest
 
 from tasklite import FileSpec, Job, TaskLite, TaskResult
 from tasklite.resource import CapacityResource
+from tasklite.testing import authorizer
 from tasklite.utils.artifact import ArtifactPathPolicy
 from tasklite.utils.jsonutil import dumps, loads
 
@@ -117,6 +118,7 @@ def invalid_frame_handler(job: Job, ctx) -> TaskResult:
 def pipelines(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     created: list[TaskLite] = []
+    stack = ExitStack()
 
     def create(backend="sqlite") -> TaskLite:
         options = {"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}
@@ -126,18 +128,21 @@ def pipelines(tmp_path, monkeypatch):
             max_workers=1,
         )
         (tmp_path / "output").mkdir(exist_ok=True)
-        pipeline._runtime.store.authorizer = lambda *args: True
+        stack.enter_context(authorizer(pipeline, lambda *args: True))
         pipeline.register_resource(CapacityResource("api", max_capacity=1.0))
         pipeline.register_task("child", child_handler)
         created.append(pipeline)
         return pipeline
 
-    yield create
-    for pipeline in created:
-        try:
-            pipeline.stop()
-        finally:
-            pipeline.close()
+    try:
+        yield create
+    finally:
+        stack.close()
+        for pipeline in created:
+            try:
+                pipeline.stop()
+            finally:
+                pipeline.close()
     assert not mp.active_children()
     active_recv_threads = [
         t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")

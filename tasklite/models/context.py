@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..exceptions import TaskLiteError, _ArtifactIOError
+from ..utils.artifact import ArtifactPathPolicy
 from ..utils.ipc import (
     WorkerPipeSender,
     WorkerReplyReceiver,
@@ -65,6 +66,7 @@ class JobContext:
             source = self._canonical_source(
                 coerce_file_spec(raw_source, allow_dict=True)
             )
+            self._validate_output_ref_dependency(name, source)
             resolved = (
                 coerce_file_spec(resolved_files[name], allow_dict=True)
                 if name in resolved_files
@@ -95,6 +97,16 @@ class JobContext:
         """将普通路径声明按固定基准绝对化；上游引用保留配置身份。"""
         return spec if spec.is_output_ref else spec._resolve_against(self._base_dir)
 
+    def _validate_output_ref_dependency(self, name: str, spec: FileSpec) -> None:
+        """校验上游产物引用必须显式列于当前 Job 的直接依赖中。"""
+        if spec.is_output_ref:
+            assert spec.producer_uid is not None
+            if spec.producer_uid not in self.job.depends_on:
+                raise TaskLiteError(
+                    f"FileSpec {name!r} references producer {spec.producer_uid!r} "
+                    f"which is not in explicit direct depends_on {list(self.job.depends_on)!r}"
+                )
+
     def _resolve_local_file(self, spec: FileSpec) -> FileSpec:
         """无回复通道时解析声明供隔离测试使用；不执行任何文件删除。"""
         if spec.is_output_ref:
@@ -110,8 +122,19 @@ class JobContext:
             resolved = self._canonical_source(spec)
         if resolved.path is None:
             raise TaskLiteError("FileSpec resolved without a path")
+        if self._protected_roots and (
+            resolved.role != "input"
+            or resolved.delete_existing
+            or resolved.delete_on_success
+            or resolved.delete_on_failure
+        ):
+            policy = ArtifactPathPolicy(protected_roots=self._protected_roots)
+            try:
+                policy.resolve(resolved.path, delete_existing=resolved.delete_existing)
+            except ValueError as exc:
+                raise TaskLiteError(str(exc)) from exc
         if resolved.role == "input" and not os.path.exists(resolved.path):
-            raise TaskLiteError(f"Missing input file: {resolved.path}")
+            raise FileNotFoundError(f"Missing input file: {resolved.path}")
         return resolved
 
     def file_path(self, name: str) -> Path:
@@ -130,13 +153,7 @@ class JobContext:
         if not isinstance(spec, FileSpec):
             raise TaskLiteError(f"declare_file expects a FileSpec, got {type(spec).__name__}")
 
-        if spec.is_output_ref:
-            assert spec.producer_uid is not None
-            if spec.producer_uid not in self.job.depends_on:
-                raise TaskLiteError(
-                    f"FileSpec {validated_name!r} references producer {spec.producer_uid!r} "
-                    f"which is not in explicit direct depends_on {list(self.job.depends_on)!r}"
-                )
+        self._validate_output_ref_dependency(validated_name, spec)
 
         canonical_source = self._canonical_source(spec)
         if validated_name in self._file_sources:

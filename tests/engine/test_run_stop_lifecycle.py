@@ -26,8 +26,7 @@ from tasklite.engine.types import ExecutionOptions, StopMode
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.pipeline import TaskLite
-from tasklite.testing import running
-from tests.helpers import install_fake_process_context
+from tasklite.testing import authorizer, in_process_workers, running
 
 
 # ── 模块级 handler（真实跨进程协作）─────────────────────────────────────
@@ -296,8 +295,8 @@ def test_stop_in_initial_authorizer_keeps_job_pending(tmp_path, monkeypatch):
             pipeline.stop()
             return True
 
-        pipeline._runtime.store.authorizer = stop_and_approve
-        pipeline.run()
+        with authorizer(pipeline, stop_and_approve):
+            pipeline.run()
         with StateSnapshot.open(pipeline) as state:
             job = state.get_job("work::one")
             assert job is not None and job["status"] == "pending"
@@ -444,8 +443,8 @@ def test_stop_before_process_start_prevents_worker_launch(tmp_path):
             def close(self) -> None:
                 pass
 
-        install_fake_process_context(pipeline, StopBeforeStartProcess)
-        pipeline.run()
+        with in_process_workers(pipeline, StopBeforeStartProcess):
+            pipeline.run()
 
         assert stop_fired
         assert start_calls == []

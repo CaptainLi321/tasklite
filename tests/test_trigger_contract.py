@@ -2,7 +2,7 @@
 import pytest
 
 from tasklite import Job, TaskLite, TaskLiteError, TaskResult
-from tests.helpers import install_fake_process_context
+from tasklite.testing import in_process_workers
 
 
 def handle(job, ctx):
@@ -284,13 +284,13 @@ def test_trigger_error_aborts_inflight_without_burning_budget():
         def close(self):
             pass
     pipeline = TaskLite(backend="memory", max_workers=2)
-    install_fake_process_context(pipeline, WaitingProcess)
     pipeline.register_trigger("error", lambda ctx: 1 / 0)
     pipeline.register_task("t", handle)
     pipeline.enqueue(Job("t", "a"))
     pipeline.enqueue(Job("t", "b", trigger="error"))
-    with pytest.raises(ZeroDivisionError):
-        pipeline.run()
+    with in_process_workers(pipeline, WaitingProcess):
+        with pytest.raises(ZeroDivisionError):
+            pipeline.run()
     queue_rows = pipeline._runtime.store.backend.load_queue_jobs()
     assert {row["job_uid"]: row["status"] for row in queue_rows} == {
         "t::a": "running", "t::b": "pending",

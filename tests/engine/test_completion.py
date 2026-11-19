@@ -27,6 +27,7 @@ from tasklite.engine.resource import (
 )
 from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
+from tasklite.testing import authorizer
 from tasklite.engine.types import JobHandle
 from tasklite.models.artifact import FileSpec
 from tasklite.models.job import Job
@@ -161,12 +162,12 @@ class TestCompleteJobSuccess:
         )
         identity = env.start_execution(job)
         entry = env.track_entry(job, **identity)
-        env.store.authorizer = lambda *_args: True
 
         assert env.resources["gpu"].used == 2.0
 
         result = ExecutionResult(success=True, result_metadata={"score": 100})
-        env.completion.complete_job(entry, result)
+        with authorizer(env.store, lambda *_args: True):
+            env.completion.complete_job(entry, result)
 
         assert env.resources["gpu"].used == 0.0
         assert env.store.state.successes["t::j1"]["result"]["metadata"]["score"] == 100
@@ -216,11 +217,11 @@ class TestCompleteJobFailure:
         )
         identity = env.start_execution(job)
         entry = env.track_entry(job, **identity)
-        env.store.authorizer = lambda *_args: True
 
-        env.completion.complete_job(
-            entry, ExecutionResult(success=False, message="boom", result_metadata={"error_message": "业务错误"})
-        )
+        with authorizer(env.store, lambda *_args: True):
+            env.completion.complete_job(
+                entry, ExecutionResult(success=False, message="boom", result_metadata={"error_message": "业务错误"})
+            )
 
         assert env.store.state.failed["t::j1"]["error_message"] == "boom"
         assert env.store.state.failed["child::c1"]["error_message"] == "Dependency failed or has no record"
@@ -629,7 +630,6 @@ def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, mon
         },
     )
     entry = env.track_entry(job, **env.start_execution(job))
-    env.store.authorizer = lambda *_args: True
     commit = env.backend.commit_job_settlement
 
     def commit_after_cleanup(*args, **kwargs):
@@ -637,7 +637,8 @@ def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, mon
         return commit(*args, **kwargs)
 
     monkeypatch.setattr(env.backend, "commit_job_settlement", commit_after_cleanup)
-    env.completion.complete_job(entry, ExecutionResult(success=True))
+    with authorizer(env.store, lambda *_args: True):
+        env.completion.complete_job(entry, ExecutionResult(success=True))
     assert job.uid in env.backend.load_successes()
     assert env.backend.load_successes()[job.uid]["artifacts"] == {
         "temporary": {"path": str(temporary)},
@@ -664,13 +665,13 @@ def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success)
         **cleanup_flag,
     )
     entry = env.track_entry(job, **env.start_execution(job))
-    env.store.authorizer = lambda *_args: True
 
     def fail_cleanup(self, declaration, *, success):
         raise PermissionError("cleanup unavailable")
 
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", fail_cleanup)
-    env.completion.complete_job(entry, ExecutionResult(success=success))
+    with authorizer(env.store, lambda *_args: True):
+        env.completion.complete_job(entry, ExecutionResult(success=success))
     assert env.backend.load_successes() == {}
     assert "cleanup unavailable" in env.backend.load_failed()[job.uid]["error_message"]
     assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
@@ -681,7 +682,6 @@ def test_abort_does_not_request_or_execute_cleanup(tmp_path, monkeypatch):
     from tasklite.utils.artifact import ArtifactPathPolicy
 
     env = CompletionEnv(tmp_path)
-    env.store.authorizer = lambda *_args: pytest.fail("异常退出不能发起授权")
     entries = [
         env.track_entry(
             Job("t", name, max_retries_per_run=3),
@@ -700,7 +700,8 @@ def test_abort_does_not_request_or_execute_cleanup(tmp_path, monkeypatch):
         pytest.fail("异常退出不能补执行文件清理")
 
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
-    env.completion.settle_aborted(entries, [])
+    with authorizer(env.store, lambda *_args: pytest.fail("异常退出不能发起授权")):
+        env.completion.settle_aborted(entries, [])
     assert not env.in_flight
     assert not env.store.state.in_flight_uids
     assert not env.store.state.queue
@@ -773,7 +774,6 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
         },
     )
     entry = env.track_entry(job, **env.start_execution(job))
-    env.store.authorizer = lambda *_args: True
 
     def denied(self, declaration, *, success):
         raise PermissionError("cleanup denied")
@@ -784,7 +784,8 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
         message="business failure",
         consume_budget=True,
     )
-    env.completion.complete_job(entry, result)
+    with authorizer(env.store, lambda *_args: True):
+        env.completion.complete_job(entry, result)
     assert result.will_retry is False
     assert env.store.state.queue == []
     assert job.uid in env.backend.load_failed()
@@ -815,16 +816,16 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
     second = Job("t", "second")
     for job in (first, second):
         env.track_entry(job, **env.start_execution(job))
-    env.store.authorizer = lambda *_args: True
 
     def denied(self, declaration, *, success):
         raise PermissionError("cleanup denied")
 
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
-    settled = env.completion.settle_reaped([
-            (env.make_handle(first.uid), ExecutionResult(success=False)),
-            (env.make_handle(second.uid), ExecutionResult(success=True)),
-        ])
+    with authorizer(env.store, lambda *_args: True):
+        settled = env.completion.settle_reaped([
+                (env.make_handle(first.uid), ExecutionResult(success=False)),
+                (env.make_handle(second.uid), ExecutionResult(success=True)),
+            ])
     assert settled == 2
     assert second.uid in env.backend.load_successes()
     assert first.uid in env.backend.load_failed()

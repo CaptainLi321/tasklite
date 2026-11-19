@@ -27,8 +27,7 @@ from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.models.task import Task
 from tasklite.pipeline import TaskLite
-from tasklite.testing import running
-from tests.helpers import install_fake_process_context
+from tasklite.testing import in_process_workers, running, spawned_jobs
 
 
 def ok_handler(job, ctx):
@@ -837,7 +836,7 @@ class TestEnqueue:
                     files={"src": FileSpec.from_output("generate::001", "report", role="input")},
                 )
             )
-        assert ctx._spawned_jobs == []
+        assert spawned_jobs(ctx) == []
 
         child = Job(
             "process",
@@ -850,8 +849,9 @@ class TestEnqueue:
         )
         ctx.spawn(child)
         child.files["mutated"] = FileSpec("mut.txt", role="cache")
-        assert len(ctx._spawned_jobs) == 1
-        spawned = ctx._spawned_jobs[0]
+        spawned_list = spawned_jobs(ctx)
+        assert len(spawned_list) == 1
+        spawned = spawned_list[0]
         assert set(spawned.files.keys()) == {"src", "out"}
         assert spawned.files["src"] == FileSpec.from_output(
             "generate::001", "report", role="input"
@@ -885,7 +885,6 @@ class TestEnqueue:
                 super().__init__(args=args, **kwargs)
 
         p2 = TaskLite(backend="sqlite", state_path=db_path, max_workers=1)
-        install_fake_process_context(p2, CapturingProcess)
         p2.register_resource(CapacityResource("gpu", max_capacity=2.0))
         # 新运行注册了完全不同的 Task 默认（甚至包含未注册资源 extra_vram）
         p2.register_task(
@@ -896,7 +895,8 @@ class TestEnqueue:
             timeout_seconds=999,
             trigger="always",
         )
-        p2.run()
+        with in_process_workers(p2, CapturingProcess):
+            p2.run()
         p2.stop()
         assert len(p2._runtime.store.backend.load_successes()) == 1
         assert len(observed) == 1
@@ -946,8 +946,8 @@ class TestSixStepContract:
         p.enqueue(Job("fetch", "a"))
         p.enqueue(Job("fetch", "b"))
 
-        install_fake_process_context(p, make_instant_process_class())
-        res = p.run()
+        with in_process_workers(p, make_instant_process_class()):
+            res = p.run()
         p.stop()
 
         assert res is None
@@ -982,8 +982,8 @@ class TestSixStepContract:
                 observed.append(p.is_running)
                 super().start()
 
-        install_fake_process_context(p, ObservingProcess)
-        p.run()
+        with in_process_workers(p, ObservingProcess):
+            p.run()
         assert observed == [True]
         assert p.is_running is False
 
@@ -1006,8 +1006,8 @@ class TestSchedulingSeamWiring:
         p.register_task("fetch", ok_handler)
         for jid in ("a", "b", "c"):
             p.enqueue(Job("fetch", jid))
-        install_fake_process_context(p, make_instant_process_class(recorder=order))
-        p.run()
+        with in_process_workers(p, make_instant_process_class(recorder=order)):
+            p.run()
 
         assert order == ["fetch::a", "fetch::b", "fetch::c"]
         assert isinstance(p._runtime_config.ordering_policy, FifoOrderingPolicy)
@@ -1023,11 +1023,11 @@ class TestSchedulingSeamWiring:
         p.register_task("fetch", ok_handler)
         p.enqueue(Job("fetch", "flaky", max_retries_per_run=1))
         p.enqueue(Job("fetch", "later"))
-        install_fake_process_context(
+        with in_process_workers(
             p,
             make_instant_process_class(retry_uid="fetch::flaky", recorder=order),
-        )
-        p.run()
+        ):
+            p.run()
 
         assert order == [
             "fetch::flaky", "fetch::flaky", "fetch::later",

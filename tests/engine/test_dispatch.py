@@ -28,6 +28,7 @@ from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
 from tasklite.engine.types import StopMode
 from tasklite.models.artifact import FileSpec
+from tasklite.testing import authorizer
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
@@ -164,7 +165,6 @@ class TestDispatchOutcomeKind:
         target = tmp_path / "out" / "result.txt"
         target.parent.mkdir()
         target.write_text("stale", encoding="utf-8")
-        env.store.authorizer = lambda *_args: None
         env.store.state.spawn_jobs([
             Job(
                 "t",
@@ -180,8 +180,9 @@ class TestDispatchOutcomeKind:
             Job("t", "gap", depends_on=["t::missing"]).to_dict(),
         ])
 
-        first = env.dispatch.dispatch_next()
-        second = env.dispatch.dispatch_next()
+        with authorizer(env.store, lambda *_args: None):
+            first = env.dispatch.dispatch_next()
+            second = env.dispatch.dispatch_next()
 
         assert first.kind is DispatchKind.AUTHORIZATION_PENDING
         assert second.kind is DispatchKind.AUTHORIZATION_PENDING
@@ -296,7 +297,6 @@ class TestPreSubmitCleanupAndActiveSignals:
             env.resources["__workers__"].acquire(1.0)
             return True
 
-        env.store.authorizer = approve_after_consuming_slot
         env.store.state.spawn_jobs([
             Job(
                 "t",
@@ -320,7 +320,8 @@ class TestPreSubmitCleanupAndActiveSignals:
             ),
         )
 
-        outcome = env.dispatch.dispatch_next()
+        with authorizer(env.store, approve_after_consuming_slot):
+            outcome = env.dispatch.dispatch_next()
 
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert spawned == []
@@ -335,7 +336,6 @@ class TestPreSubmitCleanupAndActiveSignals:
         target = tmp_path / "out" / "result.txt"
         target.parent.mkdir()
         target.write_text("stale", encoding="utf-8")
-        env.store.authorizer = lambda *_args: True
         env.store.state.spawn_jobs([
             Job(
                 "t",
@@ -356,7 +356,8 @@ class TestPreSubmitCleanupAndActiveSignals:
             or env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
-        outcome = env.dispatch.dispatch_next()
+        with authorizer(env.store, lambda *_args: True):
+            outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.SPAWNED
         assert spawn_observed == [False]
 

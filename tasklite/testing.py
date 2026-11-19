@@ -17,8 +17,10 @@ Examples:
 """
 from __future__ import annotations
 
+import multiprocessing as mp
 import tempfile
-from collections.abc import Mapping
+import threading
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -26,7 +28,168 @@ from typing import Any, Iterable, Iterator
 from .models.context import JobContext
 from .models.job import Job
 
-__all__ = ["fake_ctx", "running"]
+__all__ = [
+    "authorizer",
+    "cursor_updates",
+    "fake_ctx",
+    "in_process_workers",
+    "running",
+    "spawned_jobs",
+]
+
+
+class _InProcessWorker:
+    """进程内线程 Worker 替身：在真实 Pipe 边界上执行目标入口。"""
+
+    def __init__(
+        self,
+        *,
+        target: Callable[..., Any],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        self._target = target
+        self._args = args
+        self._kwargs = dict(kwargs or {})
+        self.exitcode: int | None = None
+        self._thread: threading.Thread | None = None
+
+    def _run(self) -> None:
+        try:
+            self._target(*self._args, **self._kwargs)
+            if self.exitcode is None:
+                self.exitcode = 0
+        except BaseException:
+            if self.exitcode is None:
+                self.exitcode = 1
+
+    def start(self) -> None:
+        """启动后台线程运行 worker 入口。"""
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def is_alive(self) -> bool:
+        """返回替身线程是否仍在运行。"""
+        return self._thread is not None and self._thread.is_alive()
+
+    def join(self, timeout: float | None = None) -> None:
+        """等待替身线程结束。"""
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def kill(self) -> None:
+        """标记强制终止退出码（不销毁进程内主线程）。"""
+        if self.exitcode is None:
+            self.exitcode = -9
+
+    def terminate(self) -> None:
+        """标记信号终止退出码。"""
+        if self.exitcode is None:
+            self.exitcode = -15
+
+    def close(self) -> None:
+        """释放替身线程引用。"""
+        self._thread = None
+
+
+class _InProcessSpawnContext:
+    """只替换 Process，Pipe 仍由真实 spawn 上下文创建。"""
+
+    def __init__(self, process_class: type) -> None:
+        self._context = mp.get_context("spawn")
+        self.Process = process_class
+
+    def Pipe(self, *args: Any, **kwargs: Any) -> Any:
+        return self._context.Pipe(*args, **kwargs)
+
+
+def _resolve_process_context_holders(target: Any) -> list[Any]:
+    holders: list[Any] = []
+    if hasattr(target, "_process_context"):
+        holders.append(target)
+    channel = getattr(target, "_channel", getattr(target, "channel", None))
+    if channel is not None and hasattr(channel, "_process_context") and channel not in holders:
+        holders.append(channel)
+    if not holders:
+        raise TypeError(
+            f"in_process_workers target has no _process_context: {type(target).__name__}"
+        )
+    return holders
+
+
+def _install_process_context(
+    target: Any,
+    process_class: type | None = None,
+) -> list[tuple[Any, Any]]:
+    context = _InProcessSpawnContext(process_class or _InProcessWorker)
+    holders = _resolve_process_context_holders(target)
+    previous = [(holder, holder._process_context) for holder in holders]
+    for holder in holders:
+        holder._process_context = context
+    return previous
+
+
+@contextmanager
+def authorizer(
+    target: Any,
+    fn: Callable[[str, str], bool | None] | None,
+) -> Iterator[Any]:
+    """临时为 TaskLite / EngineRuntime / StateStore 注入授权回调。
+
+    进入上下文时保存原 ``authorizer`` 并替换为 ``fn``，退出时自动恢复原值，
+    避免测试直接修改 ``_runtime.store.authorizer`` 导致跨用例污染。
+
+    Yields:
+        被注入授权回调的底层 ``StateStore`` 实例。
+    """
+    rt = getattr(target, "_runtime", target)
+    store = getattr(rt, "store", rt)
+    if not hasattr(store, "authorizer"):
+        raise TypeError(
+            f"authorizer target has no store.authorizer attribute: {type(target).__name__}"
+        )
+    previous = store.authorizer
+    store.authorizer = fn
+    try:
+        yield store
+    finally:
+        store.authorizer = previous
+
+
+@contextmanager
+def in_process_workers(
+    target: Any,
+    process_class: type | None = None,
+) -> Iterator[Any]:
+    """在测试上下文中启用进程内/线程轻量 Worker 替身。
+
+    保留真实单向 ``Pipe`` 通信边界，仅将子进程创建替换为进程内受控替身
+    （默认使用线程替身，也可显式传入自定义 ``process_class``），退出上下文时
+    自动恢复原有的 ``_process_context``。
+
+    Yields:
+        传入的 ``target`` 对象本身。
+    """
+    previous = _install_process_context(target, process_class)
+    try:
+        yield target
+    finally:
+        for holder, orig in previous:
+            holder._process_context = orig
+
+
+def spawned_jobs(ctx: JobContext) -> list[Job]:
+    """返回 ``JobContext`` 在本次执行期间通过 ``ctx.spawn()`` 登记的子作业浅拷贝。"""
+    if not isinstance(ctx, JobContext):
+        raise TypeError(f"spawned_jobs expects a JobContext, got {type(ctx).__name__}")
+    return list(ctx._spawned_jobs)
+
+
+def cursor_updates(ctx: JobContext) -> dict[str, str | None]:
+    """返回 ``JobContext`` 在本次执行期间通过 ``ctx.set_cursor()`` 暂存的游标更新浅拷贝。"""
+    if not isinstance(ctx, JobContext):
+        raise TypeError(f"cursor_updates expects a JobContext, got {type(ctx).__name__}")
+    return dict(ctx._cursor_updates)
 
 
 @contextmanager

@@ -103,7 +103,12 @@ def test_input_declaration_rejection_and_natural_filesystem_error_are_distinct(t
     import tasklite.models.context as context_module
 
     ctx = fake_ctx(Job("t", "a"), base_dir=tmp_path)
-    with pytest.raises(TaskLiteError, match="Missing input file"):
+    with pytest.raises(TaskLiteError, match="depends_on"):
+        ctx.declare_file(
+            "source",
+            FileSpec.from_output("missing::job", "out", role="input"),
+        )
+    with pytest.raises(FileNotFoundError, match="Missing input file"):
         ctx.declare_file("source", FileSpec("missing", role="input"))
 
     original = FileNotFoundError("文件系统读取故障")

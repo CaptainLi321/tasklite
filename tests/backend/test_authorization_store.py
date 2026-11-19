@@ -6,6 +6,7 @@ import pytest
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.engine.store import StateStore
+from tasklite.testing import authorizer
 
 
 @pytest.fixture(params=["sqlite", "memory"])
@@ -73,18 +74,18 @@ def test_store_check_or_request_authorization(backend, tmp_path, monkeypatch):
     assert not store.is_path_authorized(target)
 
     # 2. authorizer 回调拒绝
-    store.authorizer = lambda p, t: False
-    assert store.check_or_request_authorization(target) is False
-    assert not store.is_path_authorized(target)
+    with authorizer(store, lambda p, t: False):
+        assert store.check_or_request_authorization(target) is False
+        assert not store.is_path_authorized(target)
 
     # 3. authorizer 回调同意 -> 持久化
-    store.authorizer = lambda p, t: True
-    assert store.check_or_request_authorization(target) is True
-    assert store.is_path_authorized(target)
+    with authorizer(store, lambda p, t: True):
+        assert store.check_or_request_authorization(target) is True
+        assert store.is_path_authorized(target)
 
     # 4. 再次检查命中已有授权
-    store.authorizer = None
-    assert store.check_or_request_authorization(target) is True
+    with authorizer(store, None):
+        assert store.check_or_request_authorization(target) is True
 
     # 5. 自动同意环境变量生效
     target2 = str((tmp_path / "work" / "out2.txt").resolve())
@@ -118,9 +119,9 @@ def test_store_authorization_paths_share_fixed_base_normalization(
     store = StateStore(backend=backend, base_dir=base)
     monkeypatch.chdir(other)
     calls = []
-    store.authorizer = lambda *args: calls.append(args) or True
     target_type = "directory" if expected.is_dir() else "file"
-    assert store.check_or_request_authorization(path) is True
+    with authorizer(store, lambda *args: calls.append(args) or True):
+        assert store.check_or_request_authorization(path) is True
     assert calls == [(str(expected), target_type)]
     assert store.is_path_authorized(path)
     store.record_authorization(path, target_type)
@@ -138,19 +139,19 @@ def test_file_scope_requires_new_authorization_for_directory(backend, tmp_path, 
         target.write_text("file", encoding="utf-8")
     store = StateStore(backend=backend, base_dir=tmp_path)
     calls = []
-    store.authorizer = lambda *args: calls.append(args) or True
-    assert store.check_or_request_authorization(target) is True
+    with authorizer(store, lambda *args: calls.append(args) or True):
+        assert store.check_or_request_authorization(target) is True
     if target.exists():
         target.unlink()
     target.mkdir()
     (target / "child").write_text("preserve", encoding="utf-8")
     assert not backend.is_path_authorized(str(target), "directory")
     assert not store.is_path_authorized(target)
-    store.authorizer = lambda *args: calls.append(args) or None
-    assert store.check_or_request_authorization(target) is None
+    with authorizer(store, lambda *args: calls.append(args) or None):
+        assert store.check_or_request_authorization(target) is None
     assert backend.list_authorizations()[0]["target_type"] == "file"
-    store.authorizer = lambda *args: calls.append(args) or True
-    assert store.check_or_request_authorization(target) is True
+    with authorizer(store, lambda *args: calls.append(args) or True):
+        assert store.check_or_request_authorization(target) is True
     assert [kind for _, kind in calls] == ["file", "directory", "directory"]
     assert store.is_path_authorized(target / "child")
 
@@ -164,12 +165,12 @@ def test_parent_link_change_does_not_reuse_previous_target_authorization(backend
     alias.symlink_to(first, target_is_directory=True)
     store = StateStore(backend=backend, base_dir=tmp_path)
     calls = []
-    store.authorizer = lambda *args: calls.append(args) or True
-    assert store.check_or_request_authorization(alias / "item") is True
-    alias.unlink()
-    alias.symlink_to(second, target_is_directory=True)
-    assert not store.is_path_authorized(alias / "item")
-    assert store.check_or_request_authorization(alias / "item") is True
+    with authorizer(store, lambda *args: calls.append(args) or True):
+        assert store.check_or_request_authorization(alias / "item") is True
+        alias.unlink()
+        alias.symlink_to(second, target_is_directory=True)
+        assert not store.is_path_authorized(alias / "item")
+        assert store.check_or_request_authorization(alias / "item") is True
     assert calls == [(str(first / "item"), "file"), (str(second / "item"), "file")]
 
 
@@ -186,8 +187,8 @@ def test_type_change_inside_authorizer_cannot_expand_recorded_file_scope(backend
             return True
         return None
 
-    store.authorizer = authorize
-    assert store.check_or_request_authorization(target) is None
+    with authorizer(store, authorize):
+        assert store.check_or_request_authorization(target) is None
     assert calls == [(str(target), "file"), (str(target), "directory")]
     assert not store.is_path_authorized(target)
     assert store.list_authorizations()[0]["target_type"] == "file"

@@ -26,6 +26,7 @@ from tasklite import (
     TaskResult,
 )
 from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
+from tasklite.testing import authorizer
 
 
 # ── 模块级 Handler ────────────────────────────────────────────────────
@@ -134,7 +135,6 @@ def test_authorization_waiting_and_failure_cascade(tmp_path, monkeypatch):
             return None  # 未决授权
         return True
 
-    app._runtime.store.authorizer = _authorizer
     app.register_task(Task("auth_task", _auth_required_handler))
     app.register_task(Task("fail_parent", _fail_handler))
     app.register_task(Task("child", _downstream_handler))
@@ -162,7 +162,8 @@ def test_authorization_waiting_and_failure_cascade(tmp_path, monkeypatch):
     monitor_th = threading.Thread(target=_stop_monitor, daemon=True)
     monitor_th.start()
 
-    app.run(install_signals=False)
+    with authorizer(app, _authorizer):
+        app.run(install_signals=False)
     monitor_th.join(timeout=3.0)
 
     with StateSnapshot.open(db_path) as snap:

@@ -20,6 +20,7 @@ from tasklite import (
     TaskLiteError,
     TaskResult,
 )
+from tasklite.testing import authorizer
 
 
 def _producer_handler(job, ctx):
@@ -307,7 +308,6 @@ def test_authorization_denied_reverts_to_pending_and_excludes_downstream(tmp_pat
     monkeypatch.chdir(tmp_path)
     p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
 
-    p._runtime.store.authorizer = _deny_sensitive_authorizer
     p.register_task("protected", _auth_denied_handler)
     p.register_task("downstream", _noop_handler)
     p.register_task("independent", _noop_handler)
@@ -319,7 +319,8 @@ def test_authorization_denied_reverts_to_pending_and_excludes_downstream(tmp_pat
     (tmp_path / "sensitive.txt").write_text("secret", encoding="utf-8")
 
     # 执行当前 Run
-    p.run()
+    with authorizer(p, _deny_sensitive_authorizer):
+        p.run()
 
     # 1. 独立作业正常成功
     assert "independent::ind1" in p._runtime.store.backend.load_successes()
@@ -390,14 +391,14 @@ def test_approved_waiting_declaration_cleanup_error_fails_job(
     target.write_text("valuable")
     p = TaskLite(backend=backend, **({"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}))
     decisions = iter([None, True] if wait else [True])
-    p._runtime.store.authorizer = lambda *args: next(decisions)
     p.register_task("work", _dynamic_delete_handler)
     p.enqueue(Job("work", "one", payload={"path": str(target)}))
-    with patch(
-        "tasklite.utils.artifact.ArtifactPathPolicy.remove_existing",
-        side_effect=cleanup_error("清理磁盘拒绝写入"),
-    ):
-        p.run()
+    with authorizer(p, lambda *args: next(decisions)):
+        with patch(
+            "tasklite.utils.artifact.ArtifactPathPolicy.remove_existing",
+            side_effect=cleanup_error("清理磁盘拒绝写入"),
+        ):
+            p.run()
     failure = p._runtime.store.backend.load_failed()["work::one"]
     assert "清理磁盘拒绝写入" in failure["error_message"]
     attempt, = p._runtime.store.backend.load_settled_attempts("work::one")
@@ -622,11 +623,11 @@ def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, mo
         monkeypatch.setattr(scheduler, "scan_next_runnable", scan)
         return True
 
-    p._runtime.store.authorizer = authorize
     p.enqueue(Job("independent", "one"))
     p.enqueue(Job("protected", "one", files={"target": FileSpec(target, role="cache", delete_existing=True)}))
     p.enqueue(Job("independent", "later"))
-    p.run()
+    with authorizer(p, authorize):
+        p.run()
     assert len(calls) >= 2
     assert set(p._runtime.store.backend.load_successes()) == {"independent::one", "protected::one", "independent::later"}
     attempt, = p._runtime.store.backend.load_settled_attempts("protected::one")
@@ -649,10 +650,10 @@ def test_removed_file_declaration_cannot_delete_without_authorization(tmp_path, 
     target.write_text("valuable")
     p = TaskLite(backend=backend, **({"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}))
     calls = []
-    p._runtime.store.authorizer = lambda *args: calls.append(args) or False
     p.register_task("work", _legacy_delete_handler)
     p.enqueue(Job("work", "one", payload={"path": str(target), "method": method}))
-    p.run()
+    with authorizer(p, lambda *args: calls.append(args) or False):
+        p.run()
     assert target.read_text() == "valuable"
     assert calls == []
     assert "AttributeError" == p._runtime.store.backend.load_failed()["work::one"]["result"]["exception"]["type"]
@@ -680,11 +681,11 @@ def test_removed_output_message_cannot_authorize_cleanup(tmp_path, monkeypatch):
     target = tmp_path / "valuable"
     target.write_text("valuable")
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as p:
-        p._runtime.store.authorizer = lambda *args: False
         p.register_task("work", _legacy_output_message_handler)
         p.enqueue(Job("work", "one", payload={"path": str(target)}))
-        with pytest.raises(ValueError, match="unknown worker pipe message kind"):
-            p.run()
+        with authorizer(p, lambda *args: False):
+            with pytest.raises(ValueError, match="unknown worker pipe message kind"):
+                p.run()
         assert target.read_text() == "valuable"
         assert p._runtime.store.backend.load_successes() == {}
 

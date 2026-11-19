@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from tasklite import TaskLiteError
+from tasklite.testing import in_process_workers
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
@@ -258,17 +259,13 @@ class TestEngineRuntimeExecutionLifecycle:
         assert env.runtime.execute() is None
         assert not env.runtime.is_running
 
-    def test_execute_completes_job_end_to_end(self, tmp_path, monkeypatch):
+    def test_execute_completes_job_end_to_end(self, tmp_path):
         """四相泵 E2E：派发 → 回收 → 结算进 successes，attempts 轨迹收尾成功。"""
         env = RuntimeEnv(tmp_path)
         env.register("t")
         assert env.runtime.store.enqueue_job(Job("t", "j1", payload={})) is True
-        monkeypatch.setattr(
-            env.runtime.channel, "_process_context",
-            SimpleNamespace(Process=make_instant_process_class()),
-        )
-
-        assert env.runtime.execute() is None
+        with in_process_workers(env.runtime, make_instant_process_class()):
+            assert env.runtime.execute() is None
 
         assert "t::j1" in env.backend.load_successes()
         assert env.backend.load_queue() == []
@@ -448,16 +445,12 @@ class TestEngineRuntimeInitFailureSafety:
 
 
 class TestRunReentryGuard:
-    def test_reentrant_run_rejected_and_reset_after(self, tmp_path, monkeypatch):
+    def test_reentrant_run_rejected_and_reset_after(self, tmp_path):
         """执行期间二次 execute() 明确拒绝；结束后标志复位且可复跑。"""
         enter, release = threading.Event(), threading.Event()
         env = RuntimeEnv(tmp_path, capacity=1)
         env.register("t")
         assert env.runtime.store.enqueue_job(Job("t", "j1", payload={})) is True
-        monkeypatch.setattr(
-            env.runtime.channel, "_process_context",
-            SimpleNamespace(Process=make_gate_process_class(enter, release)),
-        )
         runtime = env.runtime
 
         run_errors: list[BaseException] = []
@@ -468,18 +461,19 @@ class TestRunReentryGuard:
             except BaseException as e:  # 正常路径不应抛，兜底记录便于诊断
                 run_errors.append(e)
 
-        t = threading.Thread(target=run_once)
-        t.start()
-        try:
-            assert enter.wait(10), "前置：execute() 应已派发执行体进入活动期"
-            assert runtime.is_running, "run() 执行期间 is_running 必须为真"
+        with in_process_workers(runtime, make_gate_process_class(enter, release)):
+            t = threading.Thread(target=run_once)
+            t.start()
+            try:
+                assert enter.wait(10), "前置：execute() 应已派发执行体进入活动期"
+                assert runtime.is_running, "run() 执行期间 is_running 必须为真"
 
-            # 执行期间同实例再次 run() 必须拒绝（重入守卫）
-            with pytest.raises(TaskLiteError, match=r"^Pipeline run\(\) already in progress"):
-                runtime.execute(ExecutionOptions(install_signals=False))
-        finally:
-            release.set()
-        t.join(timeout=15)
+                # 执行期间同实例再次 run() 必须拒绝（重入守卫）
+                with pytest.raises(TaskLiteError, match=r"^Pipeline run\(\) already in progress"):
+                    runtime.execute(ExecutionOptions(install_signals=False))
+            finally:
+                release.set()
+            t.join(timeout=15)
         assert not t.is_alive(), "首次 run() 应在放行后正常结束"
         assert run_errors == [], f"首次 run() 不得异常: {run_errors}"
         assert not runtime.is_running, "run() 结束后运行标志必须复位"
@@ -573,7 +567,7 @@ class TestPrepareRunState:
 
 class TestGracefulDraining:
     def test_draining_waits_for_inflight_and_keeps_undispatched(
-        self, tmp_path, monkeypatch,
+        self, tmp_path,
     ):
         """DRAINING：stop 时 in-flight 仍在运行 → 不 kill、等它自然完成并
         commit；未派发作业保留在磁盘队列（下次 run 继续）。"""
@@ -582,10 +576,6 @@ class TestGracefulDraining:
         env.register("t")
         assert env.runtime.store.enqueue_job(Job("t", "j1", payload={})) is True
         assert env.runtime.store.enqueue_job(Job("t", "j2", payload={})) is True
-        monkeypatch.setattr(
-            env.runtime.channel, "_process_context",
-            SimpleNamespace(Process=make_gate_process_class(enter, release)),
-        )
         runtime = env.runtime
         observed: dict[str, Any] = {}
 
@@ -605,9 +595,10 @@ class TestGracefulDraining:
             observed["alive_during_draining"] = proc.is_alive()
             release.set()  # 放行：in-flight 自然完成
 
-        t = threading.Thread(target=controller)
-        t.start()
-        assert runtime.execute() is None
+        with in_process_workers(runtime, make_gate_process_class(enter, release)):
+            t = threading.Thread(target=controller)
+            t.start()
+            assert runtime.execute() is None
         t.join()
 
         assert observed["inflight_at_stop"] == 1, "stop 时 in-flight 必须非空"

@@ -255,8 +255,8 @@ def _decode_ipc_result(
 
 
 def _isolate_worker_process_signals() -> None:
-    """让进程组停止信号只由主进程处理。"""
-    if os.name != "posix":
+    """让进程组停止信号只由主进程处理（进程内线程替身不改主线程信号）。"""
+    if os.name != "posix" or threading.current_thread() is not threading.main_thread():
         return
     setsid = getattr(os, "setsid", None)
     if setsid is not None:
