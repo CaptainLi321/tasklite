@@ -13,9 +13,8 @@ from typing import Any
 
 import pytest
 
-from tasklite import TaskLiteError
-
-from tasklite import Job, JobContext, StateSnapshot, TaskLite, TaskResult
+from tasklite import Job, StateSnapshot, TaskLite, TaskResult
+from tasklite.testing import in_process_workers
 from tasklite.wrappers.http import (
     HttpExecutor,
     HttpResponse,
@@ -82,8 +81,10 @@ def test_http_response_properties() -> None:
     assert resp.text == '{"key": "中文"}'
     assert resp.json() == {"key": "中文"}
 
-    err_resp = HttpResponse(status_code=404, headers={}, body=b"Not Found")
-    assert err_resp.ok is False
+    for code in (200, 204, 299):
+        assert HttpResponse(status_code=code, headers={}, body=b"").ok is True
+    for code in (199, 300, 404):
+        assert HttpResponse(status_code=code, headers={}, body=b"").ok is False
 
 
 # ==============================================================================
@@ -223,46 +224,29 @@ def test_snapshot_store_cached_decorator(tmp_path: Path) -> None:
     assert fetch_count == 1
 
 
-def test_snapshot_cached_distinguishes_json_data_posts() -> None:
+def test_snapshot_cached_distinguishes_json_data_posts(local_http_server: str) -> None:
     """同 URL 不同 json_data 的 POST 必须各发一次真实网络请求（Body 单射哈希契约）。
 
     json_data 是 requests_fetch 的 JSON 请求体参数名，若未纳入快照 key，
     不同 JSON 体将共享同一 key 并静默命中首个请求的响应。
     """
-    request_count = {"n": 0}
+    _TestHttpHandler.post_count = 0
+    store = MemorySnapshotStore()
+    cached_fetch = store.cached(requests_fetch)
 
-    class _CountingHandler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            content_len = int(self.headers.get("Content-Length", 0))
-            post_body = self.rfile.read(content_len)
-            request_count["n"] += 1
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"echo_len": ' + str(len(post_body)).encode() + b'}')
+    r1 = cached_fetch(f"{local_http_server}/count_post", method="POST", json_data={"action": "a"})
+    r2 = cached_fetch(
+        f"{local_http_server}/count_post",
+        method="POST",
+        json_data={"action": "another-with-longer-body"},
+    )
+    assert _TestHttpHandler.post_count == 2
+    assert r1.json()["echo_len"] != r2.json()["echo_len"]
 
-        def log_message(self, format: str, *args: Any) -> None:
-            pass
-
-    server = HTTPServer(("127.0.0.1", 0), _CountingHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    try:
-        base_url = f"http://127.0.0.1:{server.server_port}"
-        store = MemorySnapshotStore()
-        cached_fetch = store.cached(requests_fetch)
-
-        r1 = cached_fetch(f"{base_url}/api", method="POST", json_data={"action": "a"})
-        r2 = cached_fetch(f"{base_url}/api", method="POST", json_data={"action": "another-with-longer-body"})
-        assert request_count["n"] == 2
-        assert r1.json()["echo_len"] != r2.json()["echo_len"]
-
-        # 相同 json_data 重放命中快照，不再发网络请求
-        r3 = cached_fetch(f"{base_url}/api", method="POST", json_data={"action": "a"})
-        assert request_count["n"] == 2
-        assert r3.json()["echo_len"] == r1.json()["echo_len"]
-    finally:
-        server.shutdown()
+    # 相同 json_data 重放命中快照，不再发网络请求
+    r3 = cached_fetch(f"{local_http_server}/count_post", method="POST", json_data={"action": "a"})
+    assert _TestHttpHandler.post_count == 2
+    assert r3.json()["echo_len"] == r1.json()["echo_len"]
 
 
 def test_snapshot_cached_body_params_fingerprint() -> None:
@@ -495,6 +479,7 @@ def test_snapshot_cached_urllib_native_response_status_passthrough() -> None:
 
 class _TestHttpHandler(BaseHTTPRequestHandler):
     flaky_counts: dict[str, int] = {}
+    post_count: int = 0
 
     def do_GET(self) -> None:
         if self.path == "/json":
@@ -534,6 +519,13 @@ class _TestHttpHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         content_len = int(self.headers.get("Content-Length", 0))
         post_body = self.rfile.read(content_len)
+        if self.path == "/count_post":
+            type(self).post_count += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"echo_len": ' + str(len(post_body)).encode() + b'}')
+            return
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -696,19 +688,20 @@ class TestHttpTaskLiteIntegration:
     2. 真实集成覆盖成功、确定性失败与瞬态重试场景。
     """
 
-    def test_http_fetch_success_in_pipeline(self, local_http_server: str, tmp_path: Path) -> None:
+    def test_http_fetch_success_in_pipeline(self, local_http_server: str) -> None:
         """成功场景：handler 发送 HTTP 请求获取 200，构造 TaskResult.success 返回。"""
-        app = TaskLite(backend="sqlite", state_path=tmp_path / "http_succ.db")
-        app.register_task("http_job", _fetch_success_handler)
-        app.enqueue(Job("http_job", "j1", payload={"url": f"{local_http_server}/json"}))
-        app.run()
+        with TaskLite(backend="memory") as app:
+            app.register_task("http_job", _fetch_success_handler)
+            app.enqueue(Job("http_job", "j1", payload={"url": f"{local_http_server}/json"}))
+            with in_process_workers(app):
+                app.run(install_signals=False)
 
-        with StateSnapshot.open(app) as snap:
-            rec = snap.get_job("http_job::j1")
-            assert rec is not None
-            assert rec["status"] == "succeeded"
-            assert rec["result"] is not None
-            assert rec["result"]["metadata"]["result"] == "hello"
+            with StateSnapshot.open(app) as snap:
+                rec = snap.get_job("http_job::j1")
+                assert rec is not None
+                assert rec["status"] == "succeeded"
+                assert rec["result"] is not None
+                assert rec["result"]["metadata"]["result"] == "hello"
 
 
 
@@ -744,7 +737,10 @@ def test_fetch_returns_error_response(local_http_server, fetch_name, code):
 
 
 @pytest.mark.parametrize("code,calls", [(429, 1), (404, 1), (503, 3)])
-def test_executor_returns_last_response_without_implicit_task_result(code, calls):
+def test_executor_returns_last_response_without_implicit_task_result(monkeypatch, code, calls):
+    import tasklite.wrappers.http as http_mod
+
+    monkeypatch.setattr(http_mod.time, "sleep", lambda _: None)
     count = 0
     response = HttpResponse(status_code=code, headers={}, body=b"last")
 
@@ -753,11 +749,14 @@ def test_executor_returns_last_response_without_implicit_task_result(code, calls
         count += 1
         return response
 
-    assert HttpExecutor(max_retries=2, retry_delay_base=0).execute(fetch) is response
+    assert HttpExecutor(max_retries=2, retry_delay_base=0.5).execute(fetch) is response
     assert count == calls
 
 
-def test_executor_network_recovery_and_original_exhausted_exception():
+def test_executor_network_recovery_and_original_exhausted_exception(monkeypatch):
+    import tasklite.wrappers.http as http_mod
+
+    monkeypatch.setattr(http_mod.time, "sleep", lambda _: None)
     error = ConnectionError("断线")
     response = HttpResponse(status_code=200, headers={}, body=b"ok")
     count = 0
@@ -769,14 +768,14 @@ def test_executor_network_recovery_and_original_exhausted_exception():
             raise error
         return response
 
-    assert HttpExecutor(max_retries=1, retry_delay_base=0).execute(fetch) is response
+    assert HttpExecutor(max_retries=1, retry_delay_base=0.5).execute(fetch) is response
     assert count == 2
 
     def fail():
         raise error
 
     with pytest.raises(ConnectionError) as caught:
-        HttpExecutor(max_retries=2, retry_delay_base=0).execute(fail)
+        HttpExecutor(max_retries=2, retry_delay_base=0.5).execute(fail)
     assert caught.value is error
 
 
@@ -813,11 +812,12 @@ def _fetch_status_handler(job, ctx):
 
 
 @pytest.mark.parametrize("code,count", [(404, 1), (429, 2), (500, 2)])
-def test_handler_explicitly_returns_http_result(local_http_server, tmp_path, code, count):
-    with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as app:
+def test_handler_explicitly_returns_http_result(local_http_server, code, count):
+    with TaskLite(backend="memory") as app:
         app.register_task("http", _fetch_status_handler, max_retries_per_run=1)
         app.enqueue(Job("http", "a", payload={"url": f"{local_http_server}/{code}"}))
-        app.run()
+        with in_process_workers(app):
+            app.run(install_signals=False)
         with StateSnapshot.open(app) as snapshot:
             attempts = list(snapshot.iter_attempts())
             record = snapshot.get_job("http::a")
