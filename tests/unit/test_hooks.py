@@ -1,6 +1,6 @@
-"""v2 用户钩子回归（job_ref / slice_list）。
+"""用户钩子单元测试（job_ref / slice_list）。
 
-契约：slice_list 的三个数值参数 keyword-only（语义易混，裸位置传参会被类型检查静默放行）。
+契约：slice_list 的三个数值参数 keyword-only。
 """
 from __future__ import annotations
 
@@ -56,12 +56,11 @@ class TestSliceList:
         items = list(range(10))
         assert slice_list(items, start=2, count=3, limit=5) == [2, 3, 4]
 
-    def test_all_none_returns_copy_of_all(self):
+    def test_all_none_returns_all(self):
         items = list(range(10))
         result = slice_list(items, start=None, count=None, limit=None)
         assert result == items
-        assert result is not items or result == items
 
     def test_parameters_are_keyword_only(self):
         with pytest.raises(TypeError):
-            slice_list([1, 2, 3], 0, 2, None)
+            slice_list([1, 2, 3], 0, 2, None)  # type: ignore[misc]

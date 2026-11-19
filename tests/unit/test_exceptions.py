@@ -1,12 +1,19 @@
-"""公开拒绝与底层自然异常的传播契约。"""
+"""异常体系与传播契约测试：公开 TaskLiteError、已移除旧异常面与底层异常原样传播。"""
+from __future__ import annotations
+
 from pathlib import Path
 import sqlite3
 import traceback
 
 import pytest
 
-from tasklite import Job, StateSnapshot, TaskLite, TaskLiteError, TaskResult
+import tasklite
+from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskLiteError, TaskResult
+from tasklite.backend.sqlite_backend import SQLiteStateBackend
+import tasklite.exceptions as exc_mod
+import tasklite.models.context as context_module
 import tasklite.snapshot as snapshot_module
+from tasklite.testing import fake_ctx
 
 
 def _handle(job, ctx):
@@ -17,6 +24,69 @@ def _assert_original_error(caught, original, last_frame):
     assert caught.value is original
     assert traceback.extract_tb(caught.value.__traceback__)[-1].name == last_frame
     assert caught.value.__cause__ is None
+
+
+class TestPublicExceptionSurface:
+    """公开异常仅保留 TaskLiteError，旧异常与错误分类已从公开面移除。"""
+
+    def test_tasklite_error_is_exception_subclass(self):
+        assert issubclass(TaskLiteError, Exception)
+        assert TaskLiteError is tasklite.TaskLiteError
+        assert exc_mod.__all__ == ["TaskLiteError"]
+
+    @pytest.mark.parametrize(
+        "removed_name",
+        [
+            "PipelineError",
+            "RetryError",
+            "FatalError",
+            "RateLimitHit",
+            "ErrorClassifier",
+            "ErrorCategory",
+            "ErrorClassification",
+            "ERR_MAX_RETRIES",
+            "ERR_NO_HANDLER",
+            "FATAL_EXCEPTIONS",
+            "TRANSIENT_EXCEPTIONS",
+        ],
+    )
+    def test_removed_symbols_not_in_public_surface(self, removed_name: str):
+        assert not hasattr(tasklite, removed_name)
+        assert removed_name not in tasklite.__all__
+        assert not hasattr(exc_mod, removed_name)
+
+    def test_non_public_signals_inherit_base_exception_not_exception(self):
+        """exceptions 模块内非公开信号均须逃逸 except Exception。"""
+        internal_signals = [
+            obj
+            for name, obj in vars(exc_mod).items()
+            if isinstance(obj, type)
+            and issubclass(obj, BaseException)
+            and name not in exc_mod.__all__
+        ]
+        assert internal_signals, "应存在内部崩溃信号类"
+        for signal_cls in internal_signals:
+            assert issubclass(signal_cls, BaseException)
+            assert not issubclass(signal_cls, Exception)
+            try:
+                raise signal_cls("framework internal signal")
+            except Exception:
+                pytest.fail(f"内部信号 {signal_cls.__name__} 被 except Exception 误吞")
+            except signal_cls:
+                pass
+
+
+class TestStrContract:
+    """str(e) 消息透传契约。"""
+
+    def test_str_passes_message_through(self):
+        msg = "boom: 非法契约参数"
+        assert str(TaskLiteError(msg)) == msg
+
+    def test_raise_and_catch_roundtrip(self):
+        with pytest.raises(TaskLiteError, match="invalid uid") as exc_info:
+            raise TaskLiteError("invalid uid")
+        assert str(exc_info.value) == "invalid uid"
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
@@ -62,11 +132,11 @@ def test_snapshot_natural_exception_keeps_identity_and_traceback(tmp_path, monke
 def test_management_sqlite_exception_keeps_identity_and_traceback(tmp_path, monkeypatch):
     original = sqlite3.OperationalError("游标读取故障")
 
-    def fail(key):
+    def fail(self, key):
         raise original
 
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
-        monkeypatch.setattr(pipeline._runtime.store.backend, "get_cursor", fail)
+        monkeypatch.setattr(SQLiteStateBackend, "get_cursor", fail)
         with pytest.raises(sqlite3.OperationalError) as caught:
             pipeline.get_cursor("watermark")
         _assert_original_error(caught, original, "fail")
@@ -79,11 +149,11 @@ def test_python_binding_path_conversion_and_mapping_errors_remain_natural():
         TaskLite(backend="sqlite", state_path=object())
     with TaskLite(backend="memory") as pipeline:
         with pytest.raises(TypeError):
-            pipeline.enqueue()
+            pipeline.enqueue()  # type: ignore[call-arg]
         with pytest.raises(KeyError):
             Job.from_dict({})
     with pytest.raises(TypeError):
-        Path(object())
+        Path(object())  # type: ignore[arg-type]
 
 
 def test_snapshot_active_configuration_rejections_use_public_error(tmp_path):
@@ -98,10 +168,6 @@ def test_snapshot_active_configuration_rejections_use_public_error(tmp_path):
 
 
 def test_input_declaration_rejection_and_natural_filesystem_error_are_distinct(tmp_path, monkeypatch):
-    from tasklite import FileSpec
-    from tasklite.testing import fake_ctx
-    import tasklite.models.context as context_module
-
     ctx = fake_ctx(Job("t", "a"), base_dir=tmp_path)
     with pytest.raises(TaskLiteError, match="depends_on"):
         ctx.declare_file(
@@ -125,7 +191,6 @@ def test_input_declaration_rejection_and_natural_filesystem_error_are_distinct(t
 @pytest.mark.parametrize("error_type", [TypeError, ValueError, KeyError])
 @pytest.mark.parametrize("callback", ["fetch", "group"])
 def test_discovery_callback_exception_keeps_identity_and_traceback(tmp_path, error_type, callback):
-    from tasklite.testing import fake_ctx
     from tasklite.wrappers.discovery import DiscoveryHandler
 
     original = error_type("发现回调故障")

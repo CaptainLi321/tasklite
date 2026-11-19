@@ -1,15 +1,14 @@
 """utils/clock 单点测试：UTC ISO 格式与源码级裸时钟引用门禁。"""
-
 from __future__ import annotations
 
 import pathlib
 import re
 
+import pytest
+
 from tasklite.utils.clock import mtime_ns_to_us, parse_utc_iso_to_us, utc_now_iso
 
-V2_ROOT = (
-    pathlib.Path(__file__).resolve().parents[3] / "tasklite" / "v2"
-)
+TASKLITE_ROOT = pathlib.Path(__file__).resolve().parents[2] / "tasklite"
 
 # 裸时钟表达式形态：datetime.now(...) / timezone.utc —— UTC ISO 时间戳
 # 的生成收敛于 utils/clock.py 单点，其余模块出现即为绕过单点的新写点。
@@ -40,18 +39,13 @@ class TestParseUtcIsoToUs:
         assert parse_utc_iso_to_us("1970-01-01T00:00:00z") == 0
 
     def test_arbitrary_timezone_normalizes_to_utc(self):
-        # +08:00 北京时间 08:00:00 等同于 UTC 00:00:00
         assert parse_utc_iso_to_us("1970-01-01T08:00:00+08:00") == 0
 
     def test_naive_timestamp_rejected(self):
-        import pytest
-
         with pytest.raises(ValueError, match="timezone-aware"):
             parse_utc_iso_to_us("1970-01-01T00:00:00")
 
     def test_invalid_types_and_empty_strings_rejected(self):
-        import pytest
-
         with pytest.raises(TypeError):
             parse_utc_iso_to_us(None)  # type: ignore[arg-type]
         with pytest.raises(TypeError):
@@ -73,8 +67,6 @@ class TestMtimeNsToUs:
         assert mtime_ns_to_us(1_700_000_000_123_456_789) == 1_700_000_000_123_456
 
     def test_type_guards(self):
-        import pytest
-
         with pytest.raises(TypeError):
             mtime_ns_to_us("1000")  # type: ignore[arg-type]
         with pytest.raises(TypeError):
@@ -84,16 +76,16 @@ class TestMtimeNsToUs:
 
 
 def test_no_bare_clock_references_outside_clock_module():
-    """v2 源码不得在 utils/clock.py 之外出现裸时钟表达式（单点门禁）。"""
+    """tasklite 源码不得在 utils/clock.py 之外出现裸时钟表达式。"""
+    assert TASKLITE_ROOT.is_dir()
     offenders: list[str] = []
-    for path in sorted(V2_ROOT.rglob("*.py")):
+    for path in sorted(TASKLITE_ROOT.rglob("*.py")):
         if path.name == "clock.py":
             continue
         content = path.read_text(encoding="utf-8")
         for lineno, line in enumerate(content.splitlines(), start=1):
             if _BARE_CLOCK_PATTERN.search(line):
-                offenders.append(f"{path.relative_to(V2_ROOT)}:{lineno}")
+                offenders.append(f"{path.relative_to(TASKLITE_ROOT)}:{lineno}")
     assert not offenders, (
-        f"发现绕过 utils/clock 单点的裸时钟引用（应改调 utc_now_iso）: "
-        f"{offenders}"
+        f"发现绕过 utils/clock 单点的裸时钟引用（应改调 utc_now_iso）: {offenders}"
     )

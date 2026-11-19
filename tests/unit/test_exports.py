@@ -1,14 +1,13 @@
-"""包面静态契约测试：主公开面导出、指南导入承诺与分层单向依赖红线。
+"""包面静态契约与发布元数据测试：主公开面导出、分层单向依赖红线与 pyproject 一致性。
 
-锁定四条结构性契约（重构静默破坏即红）：
-1. ``tasklite`` 主公开面不吞并 wrappers/contrib——import 主包不触发
-   二者加载（wrappers 经子包路径导入，ADR-0004 裁决）；
+锁定契约：
+1. ``tasklite`` 主公开面不吞并 wrappers/contrib（wrappers 经子包路径导入）；
 2. 核心层源码（models/utils/backend/engine + 顶层模块）严禁 import
    ``tasklite/wrappers`` 与 ``tasklite/contrib``，且 models 严禁 import
-   engine、utils 严禁 import wrappers（分层单向依赖红线）；
+   engine、utils 严禁 import wrappers；
 3. contrib 空导出面且不被核心依赖；
-4. GUIDE 代码块中的 tasklite 导入语句逐条可导入——文档承诺的
-   导入路径不得漂移。
+4. GUIDE 代码块中的 tasklite 导入语句逐条可导入；
+5. pyproject.toml 元数据（支持版本、SPDX 许可证、动态版本）与运行期一致。
 """
 from __future__ import annotations
 
@@ -20,11 +19,18 @@ import re
 import subprocess
 import sys
 
-import tasklite.wrappers as wrappers_pkg
-import tasklite.contrib as contrib
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+import tasklite.contrib as contrib
+import tasklite.wrappers as wrappers_pkg
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = PROJECT_ROOT / "tasklite"
+PYPROJECT = PROJECT_ROOT / "pyproject.toml"
+SUPPORTED_PYTHONS = ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
 # 核心层源文件：顶层模块 + 四个核心子包（不含 wrappers/contrib 自身）
 CORE_FILES = sorted(
@@ -53,19 +59,21 @@ def _imported_module_names(path: pathlib.Path) -> set[str]:
             if node.level == 0:
                 names.add(node.module or "")
             else:
-                # 相对导入按包深度还原（文件所属包 = tasklite[.parent dirs]）
                 parts = path.relative_to(PROJECT_ROOT).with_suffix("").parts[:-1]
                 base = ".".join(parts[: len(parts) - (node.level - 1)])
                 names.add(f"{base}.{node.module}" if node.module else base)
     return names
 
 
+def _load_pyproject() -> dict:
+    with PYPROJECT.open("rb") as f:
+        return tomllib.load(f)
+
+
 class TestWrappersExportFace:
     """wrappers 子包导出面：仅子模块聚合，__all__ 与实际属性一一对应。"""
 
     def test_all_is_submodule_aggregation_only(self):
-        """不设符号级再导出——__all__ 收敛为子模块名单（平行承诺面删除，
-        符号一律经 ``tasklite.wrappers.<模块>`` 全路径导入）。"""
         assert wrappers_pkg.__all__ == ["discovery", "http"]
 
     def test_all_names_importable_and_equal(self):
@@ -80,7 +88,6 @@ class TestWrappersExportFace:
         assert wrappers_pkg.http is http
 
     def test_main_all_excludes_wrappers_symbols(self):
-        """主公开面不吞并 wrappers：主 __all__ 不得出现 wrappers 符号。"""
         import tasklite as tasklite_pkg
 
         wrapper_only = {"register_discovery", "http_guard", "urllib_fetch", "requests_fetch"}
@@ -98,7 +105,6 @@ class TestLayeringRedLine:
     """分层单向依赖红线（AST 静态锁定）。"""
 
     def test_core_never_imports_wrappers_or_contrib(self):
-        """核心层（models/utils/backend/engine + 顶层）严禁依赖 wrappers/contrib。"""
         offenders = {}
         for path in CORE_FILES:
             banned = {
@@ -111,7 +117,6 @@ class TestLayeringRedLine:
         assert not offenders, f"核心层出现反向依赖: {offenders}"
 
     def test_models_never_imports_engine(self):
-        """models 严禁 import engine（IPC 声明读写一律下沉 utils/ipc）。"""
         offenders = {}
         for path in sorted((PACKAGE_ROOT / "models").glob("*.py")):
             banned = {
@@ -124,7 +129,6 @@ class TestLayeringRedLine:
         assert not offenders, f"模型层出现引擎依赖: {offenders}"
 
     def test_utils_never_imports_wrappers(self):
-        """utils 严禁 import wrappers（无反向垫片）。"""
         offenders = {}
         for path in sorted((PACKAGE_ROOT / "utils").glob("*.py")):
             banned = {
@@ -140,7 +144,7 @@ class TestLayeringRedLine:
 class TestMainSurfaceExports:
     """主公开面的核心导出（__all__ 同步且可导入）。"""
 
-    _CORE_10 = frozenset(
+    _CORE_SYMBOLS = frozenset(
         {
             "TaskLite",
             "Task",
@@ -163,8 +167,8 @@ class TestMainSurfaceExports:
     def test_export_names_in_all(self):
         import tasklite as tasklite_pkg
 
-        assert set(tasklite_pkg.__all__) == self._CORE_10, (
-            f"主公开面 __all__ 契约不一致: 差异 {set(tasklite_pkg.__all__) ^ self._CORE_10}"
+        assert set(tasklite_pkg.__all__) == self._CORE_SYMBOLS, (
+            f"主公开面 __all__ 契约不一致: 差异 {set(tasklite_pkg.__all__) ^ self._CORE_SYMBOLS}"
         )
 
     def test_export_names_importable(self):
@@ -272,17 +276,20 @@ class TestMainSurfaceExports:
         from tasklite import TaskLite
 
         tl = TaskLite(backend="memory")
-        for attr in (
-            "backend_type",
-            "tasks",
-            "resources",
-            "runtime_config",
-            "state_path",
-            "base_dir",
-            "output_roots",
-            "authorizer",
-        ):
-            assert not hasattr(tl, attr), f"TaskLite 不应暴露内部属性 {attr}"
+        try:
+            for attr in (
+                "backend_type",
+                "tasks",
+                "resources",
+                "runtime_config",
+                "state_path",
+                "base_dir",
+                "output_roots",
+                "authorizer",
+            ):
+                assert not hasattr(tl, attr), f"TaskLite 不应暴露内部属性 {attr}"
+        finally:
+            tl.close()
 
     def test_job_context_internal_attributes_not_exposed(self):
         """JobContext 仅暴露受控交互方法，不向外部暴露累积容器与内部路径配置属性。"""
@@ -319,7 +326,7 @@ class TestMainSurfaceExports:
 
 
 class TestGuideImportContract:
-    """GUIDE.md 代码块中的 tasklite 导入语句逐条可导入（文档承诺不漂移）。"""
+    """GUIDE.md 代码块中的 tasklite 导入语句逐条可导入。"""
 
     def test_guide_tasklite_imports_resolve(self):
         doc = (PROJECT_ROOT / "docs" / "GUIDE.md").read_text(encoding="utf-8")
@@ -383,11 +390,35 @@ class TestMainSurfaceIsolation:
         assert result.returncode == 0, result.stderr
 
 
-def test_no_banned_vocabulary_in_adapter_layer():
-    """适配层（wrappers/contrib）禁用词零出现（词汇表红线）。
+class TestPackagingMetadata:
+    """pyproject 元数据与支持面承诺一致性。"""
 
-    禁用词以碎片拼接构造，避免本测试文件自身携带完整词形。
-    """
+    def test_classifiers_declare_full_interpreter_support(self):
+        classifiers = _load_pyproject()["project"]["classifiers"]
+        declared = {
+            c.rsplit(" ", 1)[-1]
+            for c in classifiers
+            if c.startswith("Programming Language :: Python :: 3.")
+        }
+        assert set(SUPPORTED_PYTHONS) <= declared
+
+    def test_license_expression_excludes_license_classifier(self):
+        project = _load_pyproject()["project"]
+        assert project["license"] == "MIT"
+        license_classifiers = [c for c in project["classifiers"] if c.startswith("License ::")]
+        assert license_classifiers == []
+
+    def test_runtime_version_matches_naming_contract(self):
+        import tasklite
+
+        assert tasklite.__version__ == "3.0.0.dev0"
+        assert _load_pyproject()["tool"]["setuptools"]["dynamic"]["version"] == {
+            "attr": "tasklite.__version__"
+        }
+
+
+def test_no_banned_vocabulary_in_adapter_layer():
+    """适配层（wrappers/contrib）禁用词零出现。"""
     banned = ["sani" + "tize", "tax" + "onomy", "D" + "LQ", "back" + "off"]
     for path in ADAPTER_FILES:
         content = path.read_text(encoding="utf-8").lower()

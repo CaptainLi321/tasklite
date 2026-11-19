@@ -1,4 +1,4 @@
-"""v2 单射编码族契约测试（确定性用例 + hypothesis 属性测试）。
+"""单射编码族契约测试（确定性用例 + hypothesis 属性测试）。
 
 被测契约范围（严格按各函数 docstring 声称）：
 - ``percent_encode`` / ``encode_job_uid_filename``：全域单射（任意 x != y ⟹
@@ -53,15 +53,10 @@ def _percent_only_as_escapes(out: str) -> bool:
 
 
 def test_percent_encode_basic_and_utf8():
-    # 基础字符原样保留
     assert percent_encode("hello-world_123") == "hello-world_123"
-    # % 优先转义为 %25
     assert percent_encode("100%_pure") == "100%25_pure"
-    # 路径分隔符与冒号
     assert percent_encode("a/b:c\\d") == "a%2Fb%3Ac%5Cd"
-    # 不可打印控制字符转义
     assert percent_encode("a\tb") == "a%09b"
-    # 当指定 allowed 时，非 ASCII / 特殊字符转义为 %XX
     assert percent_encode("中", allowed="abc") == "%E4%B8%AD"
     assert percent_encode("é", allowed="abc") == "%C3%A9"
 
@@ -79,23 +74,18 @@ def test_percent_encode_bijection_no_collisions():
 
 
 def test_percent_encode_escapes_percent_first_under_custom_charset():
-    # % 无条件先行转义，不依赖其是否落入自定义 forbidden/allowed 集：
-    # 否则 forbidden="/" 时 "/" 与字面 "%2F" 输出同形碰撞
     assert percent_encode("/", forbidden="/") == "%2F"
     assert percent_encode("%2F", forbidden="/") == "%252F"
     assert percent_encode("%", forbidden="/") == "%25"
     assert percent_encode("a/%", forbidden="/") == "a%2F%25"
-    # allowed 模式同样先行转义
     assert percent_encode("a%b", allowed="ab") == "a%25b"
 
 
 def test_percent_encode_rejects_non_str():
-    # 隐式 str() 强转会让 None 与字面 "None" 同像碰撞（多对一，破坏单射契约），
-    # 非 str 输入入口显式拒绝，不做静默强转
     with pytest.raises(TaskLiteError):
-        percent_encode(None)
+        percent_encode(None)  # type: ignore[arg-type]
     with pytest.raises(TaskLiteError):
-        percent_encode(123)
+        percent_encode(123)  # type: ignore[arg-type]
 
 
 @pytest.mark.hypothesis
@@ -180,7 +170,6 @@ def test_percent_escaped_first_prevents_aliasing(base):
 
 
 def test_encode_identifier_fallbacks_and_limits():
-    # 空值哨兵处于编码像集之外：与字面 "untitled" 等任何真实输入零碰撞
     assert encode_identifier("") == EMPTY_SENTINEL
     assert encode_identifier(None) == EMPTY_SENTINEL
     assert encode_identifier("untitled") == "untitled"
@@ -190,7 +179,6 @@ def test_encode_identifier_fallbacks_and_limits():
     assert encode_content_id("") != encode_content_id("untitled")
     assert encode_identifier("", fallback="custom") == "custom"
 
-    # 超长截断带像集外标记 + 64 位 SHA-256 全文指纹后缀
     long_a = "x" * 200
     long_b = "x" * 150 + "y" + "x" * 49
     res_a = encode_identifier(long_a, max_len=120)
@@ -202,7 +190,6 @@ def test_encode_identifier_fallbacks_and_limits():
 
 
 def test_encode_identifier_truncation_aligns_percent_escape():
-    # 截断命中 %XX 序列内部时，对齐修剪不完整碎片
     res_one = encode_identifier("aaaa////", max_len=20)
     prefix_one = res_one.rsplit("_", 1)[0]
     assert not prefix_one.endswith("%")
@@ -224,23 +211,15 @@ def test_encode_job_component_delegation_and_invariants():
 
 
 def test_encode_family_rejects_non_str_non_none():
-    """非 str 非 None 入参显式 TaskLiteError 拒绝，与 percent_encode 拒绝原则对齐。
-
-    隐式 str() 强转会让 int 123 与 str "123" 同像碰撞（多对一，破坏单射
-    契约）——三个派生编码函数是公共导出 API 的 job_id 派生防线，successes 去
-    重依赖其单射性，跨型同像会静默吞任务。
-    """
     for fn in (encode_identifier, encode_job_component, encode_content_id):
         for bad in (123, 1.5, True, b"123", ["123"], ("123",)):
             with pytest.raises(TaskLiteError):
-                fn(bad)
-    # None 与空串仍走哨兵（不拒绝）
+                fn(bad)  # type: ignore[arg-type]
     assert encode_identifier(None) == EMPTY_SENTINEL
     assert encode_job_component(None) == EMPTY_SENTINEL
     assert encode_content_id(None) == EMPTY_SENTINEL
-    # 拒绝发生在哨兵与截断逻辑之前：即便 max_len 非法也先明确拒绝
     with pytest.raises(TaskLiteError):
-        encode_identifier(123, max_len=10)
+        encode_identifier(123, max_len=10)  # type: ignore[arg-type]
 
 
 @pytest.mark.hypothesis
@@ -249,7 +228,6 @@ def test_encode_family_rejects_non_str_non_none():
 @example(pair=("untitled", "untitled\x00"), max_len=120)
 @given(pair=distinct_pair, max_len=st.integers(min_value=1, max_value=200))
 def test_encode_short_inputs_injective_within_claimed_scope(pair, max_len):
-    """编码后均 ≤ max_len 的非空输入对：encode 输出必不同（声称的单射域）。"""
     x, y = pair
     ex = percent_encode(x)
     ey = percent_encode(y)
@@ -265,8 +243,6 @@ def test_encode_short_inputs_injective_within_claimed_scope(pair, max_len):
 @example(text="y", max_len=18)
 @given(text=any_text, max_len=st.integers(min_value=18, max_value=200))
 def test_encode_output_respects_length_cap_and_aligned_prefix(text, max_len):
-    """max_len ≥ 18 时输出恒 ≤ max_len；截断路径带 "%_" 标记 + 16 位指纹
-    且前缀无悬挂 % 碎片。"""
     out = encode_identifier(text, max_len=max_len)
     assert len(out) <= max_len
     escaped = percent_encode(text)
@@ -292,7 +268,6 @@ def test_encode_output_respects_length_cap_and_aligned_prefix(text, max_len):
     max_len=st.integers(min_value=20, max_value=120),
 )
 def test_truncated_same_prefix_different_tail_never_collides(prefix, tail_a, tail_b, max_len):
-    """模块 docstring 声称的兜底性质：同前缀不同尾部的长串截断后不碰撞。"""
     if tail_a == tail_b:
         return
     text_a = prefix + tail_a
@@ -309,15 +284,10 @@ def test_truncated_same_prefix_different_tail_never_collides(prefix, tail_a, tai
 @example(text="y" * 500, max_len=120)
 @given(text=any_text, max_len=st.integers(min_value=18, max_value=200))
 def test_truncation_output_never_self_collides_via_passthrough(text, max_len):
-    """反例形态锁定：f(f(y)) != f(y)——截断输出不得落入直通域成为定点。"""
     escaped = percent_encode(text)
     if len(escaped) <= max_len:
         return
     out = encode_identifier(text, max_len=max_len)
-    # f(out) 只可能走两条路：out 中标记的孤立 % 被再转义为 %25（恒等直通被
-    # 排除）；或再次截断，指纹取自全文 out。两者均不与 f(y)=out 相等——
-    # 除非 out 与 y 全文相等，而那要求构造出 SHA-256 前像固定点（密码学上
-    # 不可行）。
     assert encode_identifier(out, max_len=max_len) != out
 
 
@@ -326,7 +296,6 @@ def test_truncation_output_never_self_collides_via_passthrough(text, max_len):
 @example(pair=("u", "y" * 500), max_len=120)
 @given(pair=distinct_pair, max_len=st.integers(min_value=18, max_value=200))
 def test_truncation_domain_disjoint_from_passthrough_domain(pair, max_len):
-    """短输入（直通域）与超长输入（截断域）的输出结构性不相交：f(x) != f(y)。"""
     x, y = pair
     if not x or not y or x == y:
         return
@@ -336,7 +305,6 @@ def test_truncation_domain_disjoint_from_passthrough_domain(pair, max_len):
         return
     out_x = encode_identifier(x, max_len=max_len)
     out_y = encode_identifier(y, max_len=max_len)
-    # 直通输出无孤立 %；截断输出必带 "%_" 标记（孤立 %），两域不相交
     assert _percent_only_as_escapes(out_x)
     assert not _percent_only_as_escapes(out_y)
     assert out_x != out_y
@@ -348,10 +316,7 @@ def test_truncation_domain_disjoint_from_passthrough_domain(pair, max_len):
 @example(text="y", max_len=17)
 @given(text=any_text, max_len=st.integers(min_value=1, max_value=17))
 def test_small_max_len_passthrough_only_or_fails_loud(text, max_len):
-    """max_len < 18：直通输入恒等且守上限；需截断时 fail-loud 拒绝，
-    绝不静默破上限。"""
     if not text:
-        # 空值哨兵为固定形态，不受 max_len 收缩（docstring 明示）
         assert encode_identifier(text, max_len=max_len) == EMPTY_SENTINEL
         assert encode_content_id(text, max_len=max_len) == EMPTY_SENTINEL
         return
@@ -373,19 +338,14 @@ def test_small_max_len_passthrough_only_or_fails_loud(text, max_len):
 
 
 def test_encode_content_id_strict_allowlist():
-    # 干净字符完全零转义
     assert encode_content_id("12345") == "12345"
     assert encode_content_id("normal-1.2_abc") == "normal-1.2_abc"
-
-    # 包含特殊符号或非 ASCII 触发转义
     assert encode_content_id("a::b") == "a%3A%3Ab"
     assert encode_content_id("中") == "%E4%B8%AD"
     assert encode_content_id("///") == "%2F%2F%2F"
 
 
 def test_encode_content_id_none_returns_sentinel_outside_image():
-    # None 与空值同路返回像集外哨兵：不 str() 成字面 "None" 与
-    # encode_content_id("None") 碰撞；哨兵固定形态不受 max_len 收缩
     assert encode_content_id(None) == EMPTY_SENTINEL
     assert encode_content_id(None) != encode_content_id("None")
     assert encode_content_id(None, max_len=3) == EMPTY_SENTINEL
@@ -399,19 +359,15 @@ def test_encode_content_id_none_returns_sentinel_outside_image():
 @example(text="中", max_len=120)
 @given(text=any_text, max_len=st.integers(min_value=18, max_value=200))
 def test_content_id_output_charset_is_allowlist_or_escapes(text, max_len):
-    """干净输入恒等直通；其余输出字符全部落在 allowlist ∪ {%}，且 % 后跟
-    两位大写 hex。"""
     out = encode_content_id(text, max_len=max_len)
     if text and all(c in CONTENT_ID_ALLOWED for c in text) and len(text) <= max_len:
         assert out == text
     elif not text:
-        # 空值哨兵为像集外形态（含孤立 %），不适用「% 只以 %XX 出现」约束
         assert out == EMPTY_SENTINEL
     else:
         assert out
         assert all(c in CONTENT_ID_ALLOWED or c == "%" for c in out)
         if len(percent_encode(text, allowed=CONTENT_ID_ALLOWED)) > max_len:
-            # 截断输出带像集外标记（孤立 %），豁免「% 只以 %XX 出现」约束
             assert not _percent_only_as_escapes(out)
         else:
             assert _percent_only_as_escapes(out)
@@ -422,7 +378,6 @@ def test_content_id_output_charset_is_allowlist_or_escapes(text, max_len):
 @example(pair=("a", "b"), max_len=120)
 @given(pair=distinct_pair, max_len=st.integers(min_value=9, max_value=200))
 def test_content_id_short_inputs_injective_within_claimed_scope(pair, max_len):
-    """编码后均 ≤ max_len 的非空输入对：content_id 编码输出必不同。"""
     x, y = pair
     ex = percent_encode(x, allowed=CONTENT_ID_ALLOWED)
     ey = percent_encode(y, allowed=CONTENT_ID_ALLOWED)
@@ -443,13 +398,10 @@ def test_content_id_short_inputs_injective_within_claimed_scope(pair, max_len):
 @example("untitled\x00")
 @given(text=any_text)
 def test_empty_sentinel_outside_image_never_collides(text):
-    """空值哨兵处于单射编码像集之外：任何非空输入（含字面 untitled）都
-    映射不出哨兵。"""
     sentinel_id = encode_identifier("")
     sentinel_cid = encode_content_id("")
     assert encode_identifier(None) == sentinel_id
     assert encode_content_id("") == sentinel_cid
-    # 哨兵含孤立 %（像集外形态的充要特征）
     assert not _percent_only_as_escapes(sentinel_id)
     assert not _percent_only_as_escapes(sentinel_cid)
     if not text:
@@ -471,18 +423,13 @@ def test_content_fingerprint_deterministic_and_version_salted():
 
 
 def test_content_fingerprint_rejects_type_and_delimiter_collisions():
-    # 跨型隔离：逐项 str() 强转使 1 与 "1" 不可区分，类型标记后必不同
     assert content_fingerprint([1, "2"]) != content_fingerprint(["1", 2])
-    # 定界符注入隔离：项内 \x00 不得伪装项边界
     assert content_fingerprint(["a\x00"]) != content_fingerprint(["a", ""])
     assert content_fingerprint(["a\x00s:b"]) != content_fingerprint(["a", "b"])
-    # dict 项按键排序，插入序无关
     assert content_fingerprint([{"a": 1, "b": 2}]) == content_fingerprint([{"b": 2, "a": 1}])
 
 
 def test_content_fingerprint_nested_containers_order_insensitive():
-    # 嵌套结构全 token 化：任意层级 dict（含 dict 作 value）插入序无关，
-    # 逻辑相等必同指纹（否则确定性 job_id 分叉 → successes 不命中 → 重复执行）
     assert content_fingerprint([{"k": {"a": 1, "b": 2}}]) == content_fingerprint(
         [{"k": {"b": 2, "a": 1}}]
     )
@@ -492,7 +439,6 @@ def test_content_fingerprint_nested_containers_order_insensitive():
     assert content_fingerprint([{"k": {"deep": {"z": 0, "a": [1, {"m": 3, "n": 4}]}}}]) == (
         content_fingerprint([{"k": {"deep": {"a": [1, {"n": 4, "m": 3}], "z": 0}}}])
     )
-    # 序无关不放宽单射方向：内容不同的嵌套结构、跨型 value 仍必不同
     assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": {"a": 2}}])
     assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": {"a": "1"}}])
     assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": [["a", 1]]}])
@@ -508,7 +454,6 @@ non_empty_text = st.one_of(
 
 
 def test_make_and_parse_job_uid_preserves_printable_and_escapes_only_required():
-    # 普通可打印字符（含文件路径字符 / \ * ? [ ] 空格 Unicode）原样保留，不作文件名净化
     uid = make_job_uid("process/sub\\task", "report-001 *?[] 日本語 🚀")
     assert uid == "process/sub\\task::report-001 *?[] 日本語 🚀"
     assert parse_job_uid(uid) == ("process/sub\\task", "report-001 *?[] 日本語 🚀")
@@ -517,7 +462,6 @@ def test_make_and_parse_job_uid_preserves_printable_and_escapes_only_required():
     assert job.task_type == "process/sub\\task"
     assert job.job_id == "report-001 *?[] 日本語 🚀"
 
-    # 百分号、冒号和不可打印字符使用可逆 UTF-8 %XX
     uid2 = make_job_uid("a:b%c\t\n\x00", "x::y%25\x1b\x7f\u2028")
     assert uid2 == "a%3Ab%25c%09%0A%00::x%3A%3Ay%2525%1B%7F%E2%80%A8"
     assert parse_job_uid(uid2) == ("a:b%c\t\n\x00", "x::y%25\x1b\x7f\u2028")
@@ -525,7 +469,6 @@ def test_make_and_parse_job_uid_preserves_printable_and_escapes_only_required():
 
 
 def test_make_job_uid_does_not_normalize_or_truncate():
-    # 不去空格、不改大小写、不做 Unicode 归一化（NFC vs NFD）、不截断超长串
     nfc = "\u00e9"
     nfd = "e\u0301"
     assert nfc != nfd
@@ -537,7 +480,6 @@ def test_make_job_uid_does_not_normalize_or_truncate():
 
 
 def test_make_and_parse_job_uid_collision_resistance():
-    # 不同 (task_type, job_id) 组合不碰撞（含分隔符边界与预转义字面量）
     pairs = [
         ("a", "b::c"),
         ("a::b", "c"),
@@ -591,7 +533,6 @@ def test_make_job_uid_rejects_invalid_inputs_with_tasklite_error():
             make_job_uid(bad, "id")  # type: ignore[arg-type]
         with pytest.raises(TaskLiteError):
             make_job_uid("type", bad)  # type: ignore[arg-type]
-    # 孤立代理项（非法 UTF-8）拒绝
     with pytest.raises(TaskLiteError):
         make_job_uid("t", "\ud800")
 
@@ -606,18 +547,18 @@ def test_parse_job_uid_rejects_non_canonical_uids_with_tasklite_error():
         "type::",
         "::",
         "a::b::c",
-        "a:b::c",           # 未转义单冒号
-        "a::b:c",           # 未转义单冒号
-        "a%b::c",           # 裸 %
-        "a::b%",            # 尾部裸 %
-        "a::b%2",           # 不完整 %XX
-        "a::b%3a",          # 小写 hex 非规范
-        "a::b%GG",          # 非 hex
-        "a::%41",           # 普通可打印字符 'A' 被过度转义（非规范 UID）
-        "a::%2F",           # '/' 在 UID 中无需转义，%2F 属于非规范预编码输入
-        "a\tb::c",          # 未转义不可打印字符
-        "a::b\x00c",        # 未转义 NUL
-        "a::%FF",           # 非法 UTF-8 字节序列
+        "a:b::c",
+        "a::b:c",
+        "a%b::c",
+        "a::b%",
+        "a::b%2",
+        "a::b%3a",
+        "a::b%GG",
+        "a::%41",
+        "a::%2F",
+        "a\tb::c",
+        "a::b\x00c",
+        "a::%FF",
     ]
     for bad in invalid_uids:
         with pytest.raises(TaskLiteError):

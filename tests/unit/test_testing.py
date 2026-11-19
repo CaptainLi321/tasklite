@@ -1,21 +1,21 @@
-"""v2 测试辅助工具回归（fake_ctx / running）。
-
-契约：successes/failed/cursors 的内部容器结构由构造器兜底装配（调用方传
-任意可迭代/映射即可）；tmp_root 模式仅提供沙盒 output_roots；运行句柄
-保证 run 期旗子复位（漏复位污染同会话后续用例）。
-"""
+"""tasklite.testing 官方测试辅助工具单元测试。"""
 from __future__ import annotations
-
-from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tasklite import FileSpec, Job, JobContext, StateSnapshot, TaskLite, TaskLiteError, TaskResult
 from tasklite.backend.memory import InMemoryStateBackend
+from tasklite.engine.admission import ImmediateRequeuePolicy, TriggerRegistry
+from tasklite.engine.channel import ExecutionChannel
+from tasklite.engine.config import RunConfig
+from tasklite.engine.governor import DeadlockGovernor
+from tasklite.engine.resource import CapacityResource, ResourceManager
 from tasklite.engine.runtime import EngineRuntime
-from tasklite import FileSpec, Job, JobContext, TaskLite, TaskLiteError, TaskResult
+from tasklite.models.job import WORKER_RESOURCE
+from tasklite.models.task import TaskRegistry
 from tasklite.testing import (
     authorizer,
     cursor_updates,
@@ -24,26 +24,15 @@ from tasklite.testing import (
     running,
     spawned_jobs,
 )
+from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
 
 def _job(task_type="fetch", job_id="j1"):
     return Job(task_type, job_id)
 
 
-def _make_runtime(tmp_path) -> EngineRuntime:
+def _make_runtime() -> EngineRuntime:
     """最小 EngineRuntime 装配（InMemory 后端零 IO）。"""
-    from tasklite.engine.admission import (
-        ImmediateRequeuePolicy,
-        TriggerRegistry,
-    )
-    from tasklite.engine.channel import ExecutionChannel
-    from tasklite.engine.config import RunConfig
-
-    from tasklite.engine.governor import DeadlockGovernor
-    from tasklite.engine.resource import CapacityResource, ResourceManager
-    from tasklite.models.job import WORKER_RESOURCE
-    from tasklite.models.task import TaskRegistry
-
     resources = ResourceManager()
     resources[WORKER_RESOURCE] = CapacityResource(WORKER_RESOURCE, max_capacity=2.0)
     return EngineRuntime(
@@ -72,7 +61,7 @@ class TestFakeCtxBasics:
         assert not hasattr(ctx, "succeeded_or_failed_job_uids")
         assert ctx.get_cursor("any") is None
 
-    def test_cursors_mapping_visible(self):
+    def test_cursors_mapping_visible_and_isolated(self):
         ctx = fake_ctx(_job(), cursors={"high_water": "2026-01-01"})
         assert ctx.get_cursor("high_water") == "2026-01-01"
         ctx.set_cursor("high_water", "2026-02-01")
@@ -81,7 +70,7 @@ class TestFakeCtxBasics:
         updates["mutated"] = "external"
         assert "mutated" not in cursor_updates(ctx)
 
-    def test_spawn_appends_new_jobs(self):
+    def test_spawn_appends_and_returns_shallow_copy(self):
         ctx = fake_ctx(_job())
         child = _job("fetch", "child")
         ctx.spawn(child)
@@ -90,66 +79,57 @@ class TestFakeCtxBasics:
         jobs.append(_job("fetch", "extra"))
         assert spawned_jobs(ctx) == [child]
 
+    def test_helper_type_guards(self):
+        with pytest.raises(TypeError, match="JobContext"):
+            spawned_jobs("not_ctx")  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="JobContext"):
+            cursor_updates("not_ctx")  # type: ignore[arg-type]
 
-class TestFakeCtxTmpRoot:
-    """tmp_root 模式为上下文提供隔离临时 base_dir。"""
 
-    def test_base_dir_under_tmp_root(self, tmp_path):
-        ctx = fake_ctx(_job(), tmp_root=tmp_path)
-        assert Path(ctx._base_dir).parent == tmp_path
-        assert not (Path(ctx._base_dir) / "ipc").exists()
+class TestFakeCtxTmpRootAndBaseDir:
+    """tmp_root 与 base_dir 模式提供隔离临时基准路径。"""
 
-    def test_declare_file_uses_explicit_output_path(self, tmp_path):
-        ctx = fake_ctx(_job(), tmp_root=tmp_path)
-        from tasklite import FileSpec
-
-        final = ctx.declare_file("out", FileSpec("out.json", role="output"))
-        assert str(tmp_path) in str(final)
-        assert final.is_relative_to(ctx._base_dir)
-
-    def test_two_ctxs_get_isolated_dirs(self, tmp_path):
+    def test_tmp_root_creates_isolated_subdirs(self, tmp_path):
         ctx1 = fake_ctx(_job(), tmp_root=tmp_path)
         ctx2 = fake_ctx(_job(), tmp_root=tmp_path)
-        assert Path(ctx1._base_dir) != Path(ctx2._base_dir)
-
-
-class TestFakeCtxNoSuspensionSimulation:
-    """fake_ctx 不提供资源许可模拟参数。"""
+        p1 = ctx1.declare_file("out", FileSpec("out.json", role="output"))
+        p2 = ctx2.declare_file("out", FileSpec("out.json", role="output"))
+        assert p1.parent.parent == tmp_path
+        assert p2.parent.parent == tmp_path
+        assert p1.parent != p2.parent
+        assert not (p1.parent / "ipc").exists()
 
     def test_resources_keyword_is_rejected(self):
         with pytest.raises(TypeError, match="resources"):
             fake_ctx(_job(), resources=["api_known"])  # type: ignore[call-arg]
 
-
-class TestFakeCtxExtendedParams:
-    """keyword-only 扩展参数。"""
-
     def test_direct_base_dir_forwarded(self, tmp_path):
         root = tmp_path / "root"
         ctx = fake_ctx(_job(), base_dir=str(root))
-        assert str(ctx._base_dir) == str(root)
+        assert ctx.declare_file("out", FileSpec("a.txt", role="output")) == root / "a.txt"
+
 
 class TestRunningHandle:
     """running 句柄：置位/复位/目标解析。"""
 
-    def test_sets_and_clears_flag_on_runtime(self, tmp_path):
-        rt = _make_runtime(tmp_path)
+    def test_sets_and_clears_flag_on_runtime(self):
+        rt = _make_runtime()
         assert rt.is_running is False
         with running(rt) as yielded:
             assert yielded is rt
             assert rt.is_running is True
         assert rt.is_running is False
 
-    def test_unwraps_wrapper_to_runtime(self, tmp_path):
-        rt = _make_runtime(tmp_path)
+    def test_unwraps_wrapper_to_runtime(self):
+        rt = _make_runtime()
         holder = SimpleNamespace(_runtime=rt, is_running=rt.is_running)
         with running(holder) as yielded:
             assert yielded is rt
             assert rt.is_running is True
         assert rt.is_running is False
 
-    def test_flag_cleared_on_exception(self, tmp_path):
-        rt = _make_runtime(tmp_path)
+    def test_flag_cleared_on_exception(self):
+        rt = _make_runtime()
         with pytest.raises(RuntimeError, match="boom"):
             with running(rt):
                 raise RuntimeError("boom")
@@ -157,7 +137,7 @@ class TestRunningHandle:
 
 
 class TestFakeCtxFilesAndResults:
-    """新 ctx 文件声明、游标与结果测试支持。"""
+    """文件声明、游标与结果测试支持。"""
 
     def test_predeclared_files_and_file_path(self, tmp_path):
         src_path = tmp_path / "input.txt"
@@ -201,11 +181,11 @@ class TestFakeCtxFilesAndResults:
 
 
 class TestFakeCtxAuthorizationAndInvariants:
-    """测试 fake 不绕过授权与状态事实（严格校验不可破坏的不变式）。"""
+    """测试 fake 不绕过授权与状态事实。"""
 
     def test_unauthorized_artifact_reference_rejected(self):
         spec = FileSpec.from_output(producer_uid="prod::1", output_name="report", role="input")
-        job = Job("consume", "c1", depends_on=[])  # 未在 depends_on 显式声明 producer
+        job = Job("consume", "c1", depends_on=[])
         ctx = fake_ctx(job)
         with pytest.raises(TaskLiteError, match="not in explicit direct depends_on"):
             ctx.declare_file("input_art", spec)
@@ -269,7 +249,7 @@ def _echo_worker_handler(job: Job, ctx: JobContext) -> TaskResult:
 class TestAuthorizerAndInProcessWorkersHandles:
     """authorizer 与 in_process_workers 官方测试句柄。"""
 
-    def test_authorizer_restores_original_on_exit_and_exception(self, tmp_path):
+    def test_authorizer_restores_original_on_exit_and_exception(self):
         with TaskLite(backend="memory") as pipeline:
             initial = lambda p, k: False  # noqa: E731
             with authorizer(pipeline, initial) as store:
@@ -279,7 +259,8 @@ class TestAuthorizerAndInProcessWorkersHandles:
                         assert store.authorizer("x", "file") is True
                         raise RuntimeError("boom")
                 assert store.authorizer is initial
-            assert pipeline._runtime.store.authorizer is None
+            with authorizer(pipeline, None) as restored_store:
+                assert restored_store.authorizer is None
 
     def test_in_process_workers_runs_and_restores_context(self):
         with TaskLite(backend="memory", max_workers=1) as pipeline:
@@ -293,5 +274,7 @@ class TestAuthorizerAndInProcessWorkersHandles:
                 pipeline.run(install_signals=False)
             assert pipeline._process_context is orig_pipeline_ctx
             assert pipeline._channel._process_context is orig_channel_ctx
-            assert "echo::item" in pipeline._runtime.store.backend.load_successes()
-
+            with StateSnapshot.open(pipeline) as snap:
+                record = snap.get_job("echo::item")
+                assert record is not None
+                assert record["status"] == "succeeded"

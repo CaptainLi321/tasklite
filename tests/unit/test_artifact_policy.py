@@ -1,11 +1,13 @@
-"""产物路径与独立删除授权的文件系统行为。"""
+"""产物路径策略与不跟随链接的安全删除原语单元测试。"""
+from __future__ import annotations
+
 import os
 from pathlib import Path
 
 import pytest
 
 from tasklite.models.artifact import ArtifactDeclaration
-from tasklite.utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
+from tasklite.utils.artifact import ArtifactPathPolicy
 
 
 def test_existing_output_requires_its_own_deletion_authorization(tmp_path):
@@ -30,7 +32,7 @@ def test_pre_delete_removes_broken_symlink_without_following_target(tmp_path):
     policy = ArtifactPathPolicy()
     declaration = ArtifactDeclaration(str(link), delete_existing=True)
 
-    _execute_pre_deletes(policy, [declaration])
+    policy.remove_existing(declaration)
 
     assert not os.path.lexists(link)
 
@@ -57,10 +59,7 @@ def test_pre_delete_missing_target_is_idempotent(tmp_path):
     target = root / "missing"
     policy = ArtifactPathPolicy()
 
-    _execute_pre_deletes(
-        policy,
-        [ArtifactDeclaration(str(target), delete_existing=True)],
-    )
+    policy.remove_existing(ArtifactDeclaration(str(target), delete_existing=True))
 
     assert not target.exists()
 
@@ -77,12 +76,19 @@ def test_cleanup_obeys_only_the_selected_phase_authorization(tmp_path, is_direct
     else:
         target.write_text("data", encoding="utf-8")
     policy = ArtifactPathPolicy()
-    other_phase = ArtifactDeclaration(str(target), delete_existing=True,
-                                      delete_on_success=not success, delete_on_failure=success)
+    other_phase = ArtifactDeclaration(
+        str(target),
+        delete_existing=True,
+        delete_on_success=not success,
+        delete_on_failure=success,
+    )
     policy.cleanup(other_phase, success=success)
     assert target.exists()
-    authorized = ArtifactDeclaration(str(target), delete_on_success=success,
-                                     delete_on_failure=not success)
+    authorized = ArtifactDeclaration(
+        str(target),
+        delete_on_success=success,
+        delete_on_failure=not success,
+    )
     policy.cleanup(authorized, success=success)
     assert not target.exists()
     policy.cleanup(authorized, success=success)
@@ -149,16 +155,17 @@ def test_directory_cleanup_unlinks_nested_link_without_following_it(tmp_path):
 
 
 def test_disappearing_parent_during_directory_walk_is_not_reported_as_success(tmp_path, monkeypatch):
-    import os
     root = tmp_path / "output"
     target = root / "directory"
     target.mkdir(parents=True)
     (target / "child").write_text("keep", encoding="utf-8")
     original_listdir = os.listdir
+
     def move_parent(fd):
         names = original_listdir(fd)
         root.rename(tmp_path / "moved")
         return names
+
     monkeypatch.setattr(os, "listdir", move_parent)
     monkeypatch.setattr(os, "supports_fd", os.supports_fd | {move_parent})
     policy = ArtifactPathPolicy()
@@ -175,10 +182,12 @@ def test_same_device_bind_mount_with_escaped_path_blocks_directory_cleanup(tmp_p
     (mounted / "precious").write_text("keep", encoding="utf-8")
     real_read = Path.read_text
     escaped = f"{target}/bind\\040space\\134slash"
+
     def mount_table(path, *args, **kwargs):
         if path == Path("/proc/self/mountinfo"):
             return f"1 0 0:1 / / rw - ext4 /dev/test rw\n2 1 0:1 / {escaped} rw - ext4 /dev/test rw\n"
         return real_read(path, *args, **kwargs)
+
     monkeypatch.setattr(Path, "read_text", mount_table)
     assert mounted.stat().st_dev == target.stat().st_dev
     policy = ArtifactPathPolicy()
@@ -193,19 +202,21 @@ def test_unknown_mount_boundaries_refuse_directory_deletion(tmp_path, monkeypatc
     target.mkdir(parents=True)
     (target / "precious").write_text("keep", encoding="utf-8")
     real_read = Path.read_text
+
     def denied_mount_table(path, *args, **kwargs):
         if path == Path("/proc/self/mountinfo"):
             raise PermissionError("mount information unavailable")
         return real_read(path, *args, **kwargs)
+
     monkeypatch.setattr(Path, "read_text", denied_mount_table)
     with pytest.raises(NotImplementedError):
         ArtifactPathPolicy().cleanup(
-            ArtifactDeclaration(str(target), delete_on_success=True), success=True)
+            ArtifactDeclaration(str(target), delete_on_success=True), success=True
+        )
     assert (target / "precious").read_text(encoding="utf-8") == "keep"
 
 
 def test_inaccessible_output_is_reported_instead_of_treated_as_missing(tmp_path):
-    import os
     if not hasattr(os, "geteuid") or os.geteuid() == 0:
         pytest.skip("需要普通用户的目录权限检查")
     root = tmp_path / "output"
@@ -217,15 +228,17 @@ def test_inaccessible_output_is_reported_instead_of_treated_as_missing(tmp_path)
     try:
         with pytest.raises(PermissionError):
             ArtifactPathPolicy().cleanup(
-                ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
+                ArtifactDeclaration(str(target), delete_on_failure=True), success=False
+            )
     finally:
         private.chmod(0o700)
     assert target.read_text(encoding="utf-8") == "keep"
 
 
 @pytest.mark.parametrize("use_link", [False, True])
-def test_parent_replaced_during_open_is_rejected_without_deleting_replacement(tmp_path, monkeypatch, use_link):
-    import os
+def test_parent_replaced_during_open_is_rejected_without_deleting_replacement(
+    tmp_path, monkeypatch, use_link
+):
     root = tmp_path / "output"
     parent = root / "parent"
     parent.mkdir(parents=True)
@@ -236,6 +249,7 @@ def test_parent_replaced_during_open_is_rejected_without_deleting_replacement(tm
     (replacement / "result").write_text("precious", encoding="utf-8")
     real_open = os.open
     changed = False
+
     def replace_parent(path, flags, *args, **kwargs):
         nonlocal changed
         if not changed and str(path) == str(parent) and "dir_fd" not in kwargs:
@@ -246,18 +260,19 @@ def test_parent_replaced_during_open_is_rejected_without_deleting_replacement(tm
             else:
                 replacement.rename(parent)
         return real_open(path, flags, *args, **kwargs)
+
     monkeypatch.setattr(os, "open", replace_parent)
     monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {replace_parent})
     with pytest.raises((ValueError, OSError)):
         ArtifactPathPolicy().cleanup(
-            ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
+            ArtifactDeclaration(str(target), delete_on_failure=True), success=False
+        )
     precious = replacement / "result" if use_link else parent / "result"
     assert precious.read_text(encoding="utf-8") == "precious"
     assert (root / "old_parent" / "result").read_text(encoding="utf-8") == "original"
 
 
 def test_normal_leaf_replace_before_cleanup_is_allowed(tmp_path):
-    import os
     root = tmp_path / "output"
     root.mkdir()
     target = root / "result"
@@ -271,7 +286,6 @@ def test_normal_leaf_replace_before_cleanup_is_allowed(tmp_path):
 
 
 def test_missing_non_following_capability_refuses_file_deletion(tmp_path, monkeypatch):
-    import os
     root = tmp_path / "output"
     root.mkdir()
     target = root / "result"
@@ -279,7 +293,8 @@ def test_missing_non_following_capability_refuses_file_deletion(tmp_path, monkey
     monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
     with pytest.raises(NotImplementedError):
         ArtifactPathPolicy().cleanup(
-            ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
+            ArtifactDeclaration(str(target), delete_on_failure=True), success=False
+        )
     assert target.read_text(encoding="utf-8") == "keep"
 
 
@@ -290,10 +305,13 @@ def test_malformed_mount_table_does_not_authorize_recursion(tmp_path, monkeypatc
     target.mkdir(parents=True)
     (target / "precious").write_text("keep", encoding="utf-8")
     real_read = Path.read_text
+
     def mount_table(path, *args, **kwargs):
         return data if path == Path("/proc/self/mountinfo") else real_read(path, *args, **kwargs)
+
     monkeypatch.setattr(Path, "read_text", mount_table)
     with pytest.raises(NotImplementedError):
         ArtifactPathPolicy().cleanup(
-            ArtifactDeclaration(str(target), delete_on_failure=True), success=False)
+            ArtifactDeclaration(str(target), delete_on_failure=True), success=False
+        )
     assert (target / "precious").read_text(encoding="utf-8") == "keep"
