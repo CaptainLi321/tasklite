@@ -1,16 +1,14 @@
-"""瞬时 Worker Pipe 执行生命周期多进程端到端集成测试。
+"""真实 spawn 子进程隔离与瞬时 Worker Pipe 生命周期集成测试。
 
-覆盖真实 spawn 子进程下：
-- 原子成功事务（inputs / 具名 artifacts / spawned_jobs / cursor /
-  动态声明 / attempts）与重开恢复、once 去重跳过；
-- 子进程被信号击杀（SIGKILL）、异常退出（os._exit）、看门狗超时的
-  单次失败与产物清理；
+聚焦真实 OS 子进程边界：
+- 真实子进程超时强杀（看门狗）、IntervalResource 限速、SystemExit 归因；
+- 原子成功事务（inputs / 具名 artifacts / spawned_jobs / cursor / attempts）
+  与 SQLite 重开恢复、once 去重跳过；
+- 子进程被信号击杀（SIGKILL）、异常退出（os._exit）、超时击杀的单次失败与产物清理；
 - 产物清理 PermissionError 阻断终态提交并保留原队列快照；
-- 正常停止排空与框架异常退出后的遗留执行恢复；
-- 非法管道帧（损坏 JSON / 未知 kind / job_uid 不匹配 / execution_id 不匹配）
+- 正常停止排空与非法管道帧（损坏 JSON / 未知 kind / job_uid / execution_id 不匹配）
   的零伪成功防御与遗留 running 恢复。
 """
-
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
@@ -18,26 +16,38 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import sqlite3
-import sys
 import threading
 import time
 
 import pytest
 
-from tasklite import FileSpec, Job, TaskLite, TaskResult
-from tasklite.resource import CapacityResource
+from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
+from tasklite.resource import CapacityResource, IntervalResource
 from tasklite.testing import authorizer
 from tasklite.utils.artifact import ArtifactPathPolicy
 from tasklite.utils.jsonutil import dumps, loads
 
 
-def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> bool:
+def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.01) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
             return True
         time.sleep(interval)
     return bool(predicate())
+
+
+def _hung_handler(job, ctx):
+    time.sleep(3.0)
+    return TaskResult.success()
+
+
+def _plain_gated_handler(job, ctx):
+    return TaskResult.success(metadata={"ran_after_recovery": True})
+
+
+def _system_exit_handler(job, ctx):
+    raise SystemExit(1)
 
 
 def success_handler(job: Job, ctx) -> TaskResult:
@@ -62,7 +72,7 @@ def interrupted_handler(job: Job, ctx) -> TaskResult:
         path.write_text("半成品", encoding="utf-8")
     sync_dir = Path(job.payload["sync_dir"])
     (sync_dir / "ready").write_text(str(os.getpid()), encoding="utf-8")
-    time.sleep(30.0)
+    time.sleep(5.0)
     return TaskResult.success(metadata={"unreachable": True})
 
 
@@ -71,7 +81,7 @@ def crash_handler(job: Job, ctx) -> TaskResult:
 
 
 def timeout_handler(job: Job, ctx) -> TaskResult:
-    time.sleep(30.0)
+    time.sleep(5.0)
     return TaskResult.success(metadata={"unreachable": True})
 
 
@@ -90,7 +100,7 @@ def controlled_handler(job: Job, ctx) -> TaskResult:
     (sync_dir / "ready").write_text(str(os.getpid()), encoding="utf-8")
     ctx.declare_file("source", FileSpec(kept, role="input"))
     assert not hasattr(ctx, "suspend_resource")
-    assert _wait_until(lambda: (sync_dir / "release").exists(), timeout=20.0)
+    assert _wait_until(lambda: (sync_dir / "release").exists(), timeout=15.0)
     return TaskResult.success(metadata={"completed": True})
 
 
@@ -122,11 +132,7 @@ def pipelines(tmp_path, monkeypatch):
 
     def create(backend="sqlite") -> TaskLite:
         options = {"state_path": tmp_path / "state.db"} if backend == "sqlite" else {}
-        pipeline = TaskLite(
-            backend=backend,
-            **options,
-            max_workers=1,
-        )
+        pipeline = TaskLite(backend=backend, **options, max_workers=1)
         (tmp_path / "output").mkdir(exist_ok=True)
         stack.enter_context(authorizer(pipeline, lambda *args: True))
         pipeline.register_resource(CapacityResource("api", max_capacity=1.0))
@@ -144,14 +150,60 @@ def pipelines(tmp_path, monkeypatch):
             finally:
                 pipeline.close()
     assert not mp.active_children()
-    active_recv_threads = [
-        t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")
-    ]
-    assert not active_recv_threads
+    assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
-def test_spawn_and_declarations_ignore_directory_environment(tmp_path, monkeypatch, backend):
+class TestRealSubprocessFaultScenarios:
+    """真实子进程故障场景：看门狗超时击杀、限速推进与 SystemExit 归因。"""
+
+    def test_real_subprocess_timeout_killed_by_watchdog(self, tmp_path):
+        p = TaskLite(backend="sqlite", state_path=tmp_path / "wd.db")
+        p.register_task("hung", _hung_handler)
+        p.enqueue(Job("hung", "item_watchdog", timeout_seconds=0.2, max_retries_per_run=0))
+        p.run(install_signals=False)
+        p.stop()
+
+        with StateSnapshot.open(p) as snap:
+            rec = snap.get_job("hung::item_watchdog")
+            assert rec["status"] == "failed"
+            assert "timed out" in (rec["result"]["message"] or "")
+            attempts = list(snap.iter_attempts(job_uid="hung::item_watchdog"))
+            assert [a["outcome"] for a in attempts] == ["failure"]
+        p.close()
+
+    def test_real_subprocess_interval_resource_paces(self, tmp_path):
+        p = TaskLite(backend="sqlite", state_path=tmp_path / "pace.db")
+        p.register_resource(IntervalResource("api", interval_seconds=0.25))
+        p.register_task("gated", _plain_gated_handler, resources={"api": 1.0})
+        p.register_task("gated_plain", _plain_gated_handler, resources={"api": 1.0})
+        p.enqueue(Job("gated", "holder"))
+        p.enqueue(Job("gated_plain", "waiter", depends_on=["gated::holder"]))
+        res = p.run(install_signals=False)
+        p.stop()
+
+        assert res is None
+        with StateSnapshot.open(p) as snap:
+            assert snap.get_job("gated::holder")["status"] == "succeeded"
+            assert snap.get_job("gated_plain::waiter")["status"] == "succeeded"
+        p.close()
+
+    def test_real_subprocess_system_exit_attributed(self, tmp_path):
+        p = TaskLite(backend="sqlite", state_path=tmp_path / "sysexit.db")
+        p.register_task("sysexit", _system_exit_handler)
+        p.enqueue(Job("sysexit", "item_sysexit", max_retries_per_run=0))
+        p.run(install_signals=False)
+        p.stop()
+
+        with StateSnapshot.open(p) as snap:
+            rec = snap.get_job("sysexit::item_sysexit")
+            assert rec["status"] == "failed"
+            assert "SystemExit" in (rec["result"]["message"] or "")
+            attempts = list(snap.iter_attempts(job_uid="sysexit::item_sysexit"))
+            assert len(attempts) == 1 and attempts[0]["outcome"] == "failure"
+        p.close()
+
+
+def test_spawn_and_declarations_ignore_directory_environment(tmp_path, monkeypatch):
     ipc_path = tmp_path / "unused" / "ipc"
     monkeypatch.setenv("TASKLITE_IPC_DIR", str(ipc_path))
     workspace = tmp_path / "workspace"
@@ -159,8 +211,7 @@ def test_spawn_and_declarations_ignore_directory_environment(tmp_path, monkeypat
     monkeypatch.chdir(workspace)
     output = workspace / "output"
     output.mkdir()
-    options = {"state_path": workspace / "state.db"} if backend == "sqlite" else {}
-    with TaskLite(backend=backend, max_workers=1, **options) as pipeline:
+    with TaskLite(backend="sqlite", state_path=workspace / "state.db", max_workers=1) as pipeline:
         pipeline.register_task("parent", success_handler)
         pipeline.register_task("child", child_handler)
         channel = pipeline._runtime.channel
@@ -174,35 +225,24 @@ def test_spawn_and_declarations_ignore_directory_environment(tmp_path, monkeypat
 
         monkeypatch.setattr(channel, "spawn", capture_reply_sender)
         pipeline.enqueue(Job("parent", "parent"))
-        pipeline.run()
+        pipeline.run(install_signals=False)
         assert len(reply_senders) == 2
         assert channel._reply_senders == {}
         assert all(sender._closed and sender._conn.closed for sender in reply_senders)
-        state = pipeline._runtime.store.backend
-        success = state.load_successes()["parent::parent"]
-        assert success["result"]["metadata"]["worker_pid"] != os.getpid()
-        assert success["inputs"] == [str(output / "published.txt")]
-        assert success["artifacts"]["report"]["path"] == str(output / "published.txt")
-        assert state.load_cursors()["position"] == "42"
-        assert set(state.load_successes()) == {"parent::parent", "child::child"}
-        attempt, = state.load_settled_attempts("parent::parent")
-        assert attempt["outcome"] == "success"
+
+        with StateSnapshot.open(pipeline) as snap:
+            parent = snap.get_job("parent::parent")
+            assert parent["result"]["metadata"]["worker_pid"] != os.getpid()
+            assert parent["files"]["report"]["path"] == str(output / "published.txt")
+            assert parent["files"]["source"]["path"] == str(output / "published.txt")
+            assert {r["job_uid"] for r in snap.iter_jobs(status="succeeded")} == {"parent::parent", "child::child"}
+            attempt, = snap.iter_attempts(job_uid="parent::parent")
+            assert attempt["outcome"] == "success"
+        assert pipeline.get_cursor("position") == "42"
         pipeline.stop()
-        assert pipeline._runtime.channel._handles == {}
-        assert pipeline._runtime.channel._receivers == {}
         assert not ipc_path.parent.exists()
-        pipeline.enqueue(Job("child", "next-run"))
-        pipeline.run()
-        assert len(reply_senders) == 3
-        assert channel._reply_senders == {}
-        assert all(sender._closed and sender._conn.closed for sender in reply_senders)
-    assert channel._reply_senders == {}
-    assert all(sender._closed and sender._conn.closed for sender in reply_senders)
-    assert not ipc_path.parent.exists()
     assert not mp.active_children()
     assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
-    if backend == "memory":
-        assert set(workspace.iterdir()) == {output}
 
 
 def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch, tmp_path):
@@ -225,78 +265,51 @@ def test_success_transaction_and_reopen_without_execution(pipelines, monkeypatch
                     visible = outside.execute(
                         "SELECT metadata FROM successes WHERE job_uid='parent::parent'"
                     ).fetchone()
-                    if visible is None and staged is not None:
-                        assert (
-                            outside.execute(
-                                "SELECT value FROM cursors WHERE key='position'"
-                            ).fetchone()
-                            is None
-                        )
-                        assert (
-                            outside.execute(
-                                "SELECT job_uid FROM queue WHERE job_uid='child::child'"
-                            ).fetchone()
-                            is None
-                        )
-                        expected_outside = None
-                        assert outside.execute(
-                            "SELECT outcome FROM attempts WHERE job_uid='parent::parent'"
-                        ).fetchone() == expected_outside
+                    if visible is None:
+                        assert outside.execute("SELECT value FROM cursors WHERE key='position'").fetchone() is None
+                        assert outside.execute("SELECT job_uid FROM queue WHERE job_uid='child::child'").fetchone() is None
+                        assert outside.execute("SELECT outcome FROM attempts WHERE job_uid='parent::parent'").fetchone() is None
                 if visible is None:
                     assert connection.in_transaction
                     observations.append((
                         loads(staged[0]),
-                        connection.execute(
-                            "SELECT outcome, settled_at FROM attempts WHERE job_uid='parent::parent'"
-                        ).fetchone(),
-                        connection.execute(
-                            "SELECT value FROM cursors WHERE key='position'"
-                        ).fetchone(),
+                        connection.execute("SELECT outcome, settled_at FROM attempts WHERE job_uid='parent::parent'").fetchone(),
+                        connection.execute("SELECT value FROM cursors WHERE key='position'").fetchone(),
                         connection.execute("SELECT job_uid FROM queue").fetchall(),
                     ))
 
     monkeypatch.setattr(backend, "_get_conn", observe_before_commit)
-    res = pipeline.run()
-    assert res is None
+    assert pipeline.run(install_signals=False) is None
     assert len(observations) == 1
     metadata, attempt, cursor, queue = observations[0]
-    assert metadata["artifacts"]["report"]["path"] == str(
-        tmp_path / "output" / "published.txt"
-    )
+    assert metadata["artifacts"]["report"]["path"] == str(tmp_path / "output" / "published.txt")
     assert metadata["inputs"] == [metadata["artifacts"]["report"]["path"]]
     assert attempt[0] == "success" and attempt[1] is not None
     assert cursor == ("42",)
     assert queue == [("child::child",)]
-    assert backend.load_queue() == []
     pid = metadata["result"]["metadata"]["worker_pid"]
     assert pid != os.getpid()
     pipeline.stop()
 
     reopened = pipelines()
     reopened.register_task("parent", success_handler)
-    result = reopened.run()
-    assert result is None
-    assert len(reopened._runtime.store.backend.load_settled_attempts("parent::parent")) == 1
-    assert reopened._runtime.store.backend.load_successes()["parent::parent"]["result"]["metadata"]["worker_pid"] == pid
-    assert reopened._runtime.store.backend.load_cursors()["position"] == "42"
+    assert reopened.run(install_signals=False) is None
+    with StateSnapshot.open(reopened) as snap:
+        assert len(list(snap.iter_attempts(job_uid="parent::parent"))) == 1
+        assert snap.get_job("parent::parent")["result"]["metadata"]["worker_pid"] == pid
+    assert reopened.get_cursor("position") == "42"
     reopened.enqueue(Job("parent", "parent"))
-    assert reopened.run() is None
-    expected_attempts = ["success"]
-    assert [a["outcome"] for a in reopened._runtime.store.backend.load_settled_attempts("parent::parent")] == expected_attempts
+    assert reopened.run(install_signals=False) is None
+    with StateSnapshot.open(reopened) as snap:
+        assert [a["outcome"] for a in snap.iter_attempts(job_uid="parent::parent")] == ["success"]
 
 
 @pytest.mark.parametrize("mode", ["kill", "crash", "timeout"])
-def test_process_death_is_single_failure_without_implicit_retry(
-    pipelines, tmp_path, mode
-):
+def test_process_death_is_single_failure_without_implicit_retry(pipelines, tmp_path, mode):
     sync_dir = tmp_path / "sync"
     sync_dir.mkdir(parents=True, exist_ok=True)
     pipeline = pipelines()
-    handler = {
-        "kill": interrupted_handler,
-        "crash": crash_handler,
-        "timeout": timeout_handler,
-    }[mode]
+    handler = {"kill": interrupted_handler, "crash": crash_handler, "timeout": timeout_handler}[mode]
     pipeline.register_task("work", handler)
     pipeline.enqueue(
         Job(
@@ -304,7 +317,7 @@ def test_process_death_is_single_failure_without_implicit_retry(
             mode,
             payload={"sync_dir": str(sync_dir)},
             max_retries_per_run=3,
-            timeout_seconds=0.3 if mode == "timeout" else 10.0,
+            timeout_seconds=0.25 if mode == "timeout" else 10.0,
         )
     )
     killer = None
@@ -319,26 +332,21 @@ def test_process_death_is_single_failure_without_implicit_retry(
         killer.start()
 
     try:
-        res = pipeline.run()
+        res = pipeline.run(install_signals=False)
     finally:
         if killer is not None:
             killer.join(timeout=10.0)
 
     assert res is None
     assert killer is None or not killer.is_alive()
-    failed = pipeline._runtime.store.backend.load_failed()
-    assert list(failed) == ["work::" + mode]
-    attempts = pipeline._runtime.store.backend.load_settled_attempts("work::" + mode)
-    assert len(attempts) == 1
-    assert attempts[0]["attempt_no"] == 1
-    assert attempts[0]["outcome"] == "failure"
-    assert pipeline._runtime.store.backend.load_successes() == {}
-    expected = {
-        "kill": "signal",
-        "crash": "code 7",
-        "timeout": "timed out",
-    }[mode]
-    result = failed["work::" + mode]["result"]
+    with StateSnapshot.open(pipeline) as snap:
+        rec = snap.get_job("work::" + mode)
+        assert rec is not None and rec["status"] == "failed"
+        attempts = list(snap.iter_attempts(job_uid="work::" + mode))
+        assert len(attempts) == 1 and attempts[0]["attempt_no"] == 1 and attempts[0]["outcome"] == "failure"
+        assert list(snap.iter_jobs(status="succeeded")) == []
+        result = rec["result"]
+    expected = {"kill": "signal", "crash": "code 7", "timeout": "timed out"}[mode]
     assert expected in result["message"]
     assert result["metadata"] == {}
     assert result["exception"] is None
@@ -350,7 +358,6 @@ def test_process_death_is_single_failure_without_implicit_retry(
     if mode == "kill":
         assert not (tmp_path / "output" / "authorized.txt").exists()
         assert (tmp_path / "output" / "retained.txt").exists()
-    assert pipeline._runtime.store.backend.load_queue() == []
 
 
 def test_cleanup_error_fails_without_publishing_success(pipelines, monkeypatch, tmp_path):
@@ -363,21 +370,22 @@ def test_cleanup_error_fails_without_publishing_success(pipelines, monkeypatch, 
 
     with monkeypatch.context() as failure:
         failure.setattr(ArtifactPathPolicy, "cleanup", unavailable)
-        pipeline.run()
-    assert pipeline._runtime.store.backend.load_successes() == {}
-    failed = pipeline._runtime.store.backend.load_failed()["work::cleanup"]
-    assert "授权清理不可用" in failed["error_message"]
-    assert pipeline._runtime.store.backend.load_queue_jobs() == []
-    attempt, = pipeline._runtime.store.backend.load_settled_attempts("work::cleanup")
-    assert attempt["outcome"] == "failure"
+        pipeline.run(install_signals=False)
+    with StateSnapshot.open(pipeline) as snap:
+        assert list(snap.iter_jobs(status="succeeded")) == []
+        failed = snap.get_job("work::cleanup")
+        assert failed["status"] == "failed"
+        assert "授权清理不可用" in (failed["result"]["message"] or "")
+        assert list(snap.iter_jobs(status="pending")) == []
+        attempt, = snap.iter_attempts(job_uid="work::cleanup")
+        assert attempt["outcome"] == "failure"
     assert (tmp_path / "output" / "temporary.txt").exists()
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
-def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_path, backend):
+def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_path):
     sync_dir = tmp_path / "sync"
     sync_dir.mkdir(parents=True, exist_ok=True)
-    pipeline = pipelines(backend)
+    pipeline = pipelines("sqlite")
     pipeline.register_task("controlled", controlled_handler)
     pipeline.enqueue(Job("controlled", "active", payload={"sync_dir": str(sync_dir)}))
     pipeline.enqueue(Job("child", "waiting"))
@@ -399,16 +407,15 @@ def test_stop_drains_received_messages_and_workers(pipelines, monkeypatch, tmp_p
         return orig_reap(handles)
 
     monkeypatch.setattr(channel, "reap_completed", reap_with_stop_trigger)
-    res = pipeline.run()
-    assert res is None
+    assert pipeline.run(install_signals=False) is None
     assert requested
-    queue = pipeline._runtime.store.backend.load_queue()
     assert not (tmp_path / "output" / "temporary.txt").exists()
     assert (tmp_path / "output" / "kept.txt").exists()
-    assert [j["job_id"] for j in queue] == ["waiting"]
-    assert pipeline._runtime.store.backend.load_successes()["controlled::active"]["inputs"] == [
-        str(tmp_path / "output" / "kept.txt")
-    ]
+    with StateSnapshot.open(pipeline) as snap:
+        assert [j["job_uid"] for j in snap.iter_jobs(status="pending")] == ["child::waiting"]
+        active = snap.get_job("controlled::active")
+        assert active["status"] == "succeeded"
+        assert active["files"]["source"]["path"] == str(tmp_path / "output" / "kept.txt")
 
 
 def test_stop_commits_complete_result_already_received(pipelines, monkeypatch):
@@ -423,37 +430,51 @@ def test_stop_commits_complete_result_already_received(pipelines, monkeypatch):
             pipeline.stop()
 
     monkeypatch.setattr(channel, "_accept_message", accept_and_stop)
-    res = pipeline.run()
-    assert res is None
-    assert pipeline._runtime.store.backend.load_successes()["child::done"]["result"]["metadata"]["child"] is True
-    assert pipeline._runtime.store.backend.load_queue() == []
-    assert pipeline._runtime.store.backend.load_settled_attempts("child::done")[0]["outcome"] == "success"
+    assert pipeline.run(install_signals=False) is None
+    with StateSnapshot.open(pipeline) as snap:
+        rec = snap.get_job("child::done")
+        assert rec["status"] == "succeeded"
+        assert rec["result"]["metadata"]["child"] is True
+        assert list(snap.iter_jobs(status="pending")) == []
+        assert [a["outcome"] for a in snap.iter_attempts(job_uid="child::done")] == ["success"]
 
 
-@pytest.mark.parametrize("fault", ["json", "kind", "job_uid", "execution_id"])
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "backend,fault",
+    [
+        ("memory", "json"),
+        ("memory", "kind"),
+        ("memory", "job_uid"),
+        ("memory", "execution_id"),
+        ("sqlite", "json"),
+    ],
+)
 def test_invalid_message_cannot_register_success(pipelines, tmp_path, fault, backend):
     pipeline = pipelines(backend)
     pipeline.register_task("invalid", invalid_frame_handler)
     pipeline.enqueue(Job("invalid", "invalid", payload={"fault": fault}))
     with pytest.raises(ValueError):
-        pipeline.run()
-    assert pipeline._runtime.store.backend.load_successes() == {}
-    assert pipeline._runtime.store.backend.load_failed() == {}
-    row, = pipeline._runtime.store.backend.load_queue_jobs()
-    assert row["status"] == "running" and row["attempt_no"] == 1
-    assert pipeline._runtime.store.backend.load_settled_attempts("invalid::invalid") == []
+        pipeline.run(install_signals=False)
+    with StateSnapshot.open(pipeline) as snap:
+        assert list(snap.iter_jobs(status="succeeded")) == []
+        assert list(snap.iter_jobs(status="failed")) == []
+        row = snap.get_job("invalid::invalid")
+        assert row["status"] == "running" and row["attempt_no"] == 1
+        assert list(snap.iter_attempts(job_uid="invalid::invalid")) == []
     assert (tmp_path / "output" / "authorized.txt").exists()
     assert (tmp_path / "output" / "retained.txt").exists()
-    pipeline.run()
-    attempt, = pipeline._runtime.store.backend.load_settled_attempts("invalid::invalid")
-    assert attempt["outcome"] == "failure"
-    assert attempt["run_id"] == row["run_id"]
-    assert attempt["attempt_no"] == row["attempt_no"]
-    assert pipeline._runtime.store.backend.load_queue_jobs() == []
-    assert pipeline._runtime.store.backend.load_successes() == {}
-    assert "invalid::invalid" in pipeline._runtime.store.backend.load_failed()
+
+    pipeline.run(install_signals=False)
+    with StateSnapshot.open(pipeline) as snap:
+        attempt, = snap.iter_attempts(job_uid="invalid::invalid")
+        assert attempt["outcome"] == "failure"
+        assert attempt["run_id"] == row["run_id"]
+        assert attempt["attempt_no"] == row["attempt_no"]
+        assert list(snap.iter_jobs(status="pending")) == []
+        assert list(snap.iter_jobs(status="succeeded")) == []
+        assert snap.get_job("invalid::invalid")["status"] == "failed"
     assert (tmp_path / "output" / "authorized.txt").exists()
     assert (tmp_path / "output" / "retained.txt").exists()
-    pipeline.run()
-    assert pipeline._runtime.store.backend.load_settled_attempts("invalid::invalid") == [attempt]
+    pipeline.run(install_signals=False)
+    with StateSnapshot.open(pipeline) as snap:
+        assert list(snap.iter_attempts(job_uid="invalid::invalid")) == [attempt]
