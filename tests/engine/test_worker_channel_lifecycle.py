@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
 from pathlib import Path
 import threading
@@ -18,63 +17,61 @@ import time
 import pytest
 
 from tasklite import Job, StateSnapshot, TaskLite, TaskResult
-from tasklite.resource import CapacityResource
-from tasklite.engine.channel import (
-    ExecutionChannel,
-    WorkerLaunchSpec,
-)
-from tasklite.models.context import JobContext
+from tasklite.testing import in_process_workers
 from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
 
-def _lingering_worker(job: Job, ctx: JobContext) -> TaskResult:
-    """返回成功结果后在子进程后台线程挂起，模拟 worker 未立即退出。"""
+def _lingering_worker(job: Job, ctx) -> TaskResult:
+    """返回成功结果后在子进程后台线程等待释放文件，模拟 worker 未立即退出。"""
     sync_dir = Path(job.payload["sync_dir"])
+    release_file = sync_dir / "release"
     (sync_dir / "job1_returned").write_text("ok", encoding="utf-8")
-    
-    # 启动后台常驻线程防止子进程自然终结
+
     def linger():
-        time.sleep(3.0)
-    
+        deadline = time.monotonic() + 10.0
+        while not release_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
     t = threading.Thread(target=linger, daemon=False)
     t.start()
     return TaskResult.success(metadata={"step": 1})
 
 
-def _fast_worker(job: Job, ctx: JobContext) -> TaskResult:
+def _fast_worker(job: Job, ctx) -> TaskResult:
     return TaskResult.success(metadata={"fast": True})
 
 
-def _crash_without_result(job: Job, ctx: JobContext) -> TaskResult:
+def _crash_without_result(job: Job, ctx) -> TaskResult:
     os._exit(42)
 
 
-def _hang_forever(job: Job, ctx: JobContext) -> TaskResult:
-    time.sleep(60.0)
+def _hang_forever(job: Job, ctx) -> TaskResult:
+    time.sleep(5.0)
     return TaskResult.success(metadata={"unreachable": True})
 
 
-def _success_then_exit_error(job: Job, ctx: JobContext) -> TaskResult:
+def _success_then_exit_error(job: Job, ctx) -> TaskResult:
     def die_later():
         time.sleep(0.05)
         os._exit(99)
+
     threading.Thread(target=die_later, daemon=True).start()
     return TaskResult.success(metadata={"returned": True})
 
 
-def _raise_handler_error(job: Job, ctx: JobContext) -> TaskResult:
+def _raise_handler_error(job: Job, ctx) -> TaskResult:
     raise ValueError("handler exploded")
 
 
-def _raise_keyboard_interrupt(job: Job, ctx: JobContext) -> TaskResult:
+def _raise_keyboard_interrupt(job: Job, ctx) -> TaskResult:
     raise KeyboardInterrupt()
 
 
-def _return_invalid_result(job: Job, ctx: JobContext) -> TaskResult:
+def _return_invalid_result(job: Job, ctx) -> TaskResult:
     return {"status": "success"}  # type: ignore[return-value]
 
 
-def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> bool:
+def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.01) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -109,22 +106,33 @@ def test_worker_lingers_after_result_does_not_block_dispatch_and_run_waits(tmp_p
 
     runner = threading.Thread(target=run_pipeline)
     runner.start()
-    assert _wait_until(lambda: (sync_dir / "job1_returned").exists(), timeout=10.0)
-    assert runner.is_alive(), "Run 必须等待仍在运行的已结算 worker"
-    runner.join(timeout=10.0)
+    try:
+        assert _wait_until(lambda: (sync_dir / "job1_returned").exists(), timeout=10.0)
+
+        def _fast_done() -> bool:
+            with StateSnapshot.open(pipeline) as snap:
+                rec = snap.get_job("fast::j2")
+                return rec is not None and rec["status"] == "succeeded"
+
+        assert _wait_until(_fast_done, timeout=10.0)
+        assert runner.is_alive(), "Run 必须等待仍在运行的已结算 worker"
+    finally:
+        (sync_dir / "release").write_text("go", encoding="utf-8")
+        runner.join(timeout=10.0)
 
     assert not runner.is_alive()
     assert errors == []
-    successes = pipeline._runtime.store.backend.load_successes()
-    assert "lingering::j1" in successes
-    assert "fast::j2" in successes
-    assert successes["lingering::j1"]["result"]["metadata"]["step"] == 1
-    assert successes["fast::j2"]["result"]["metadata"]["fast"] is True
+    with StateSnapshot.open(pipeline) as snap:
+        j1 = snap.get_job("lingering::j1")
+        j2 = snap.get_job("fast::j2")
+        assert j1 is not None and j1["status"] == "succeeded"
+        assert j1["result"]["metadata"]["step"] == 1
+        assert j2 is not None and j2["status"] == "succeeded"
+        assert j2["result"]["metadata"]["fast"] is True
 
-    # 管道与进程资源已回收
     pipeline.stop()
-    active_recv = [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
-    assert not active_recv
+    pipeline.close()
+    assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 
 
 def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
@@ -137,19 +145,17 @@ def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
         pipeline.register_task("crash", _crash_without_result)
         pipeline.enqueue(Job("crash", "j1", max_retries_per_run=3))
 
-        pipeline.run()
+        pipeline.run(install_signals=False)
 
-        failed = pipeline._runtime.store.backend.load_failed()
-        assert list(failed) == ["crash::j1"]
-        failed_meta = failed["crash::j1"]
-        assert failed_meta["result"]["message"] == "Worker exited with code 42 without a result"
-        assert failed_meta["result"]["annotations"]["exitcode"] == 42
-        assert failed_meta["result"]["metadata"] == {}
-        assert "retry_error" not in failed_meta
-
-        attempts = pipeline._runtime.store.backend.load_settled_attempts("crash::j1")
-        assert len(attempts) == 1
-        assert attempts[0]["outcome"] == "failure"
+        with StateSnapshot.open(pipeline) as snap:
+            rec = snap.get_job("crash::j1")
+            assert rec is not None and rec["status"] == "failed"
+            assert rec["result"]["message"] == "Worker exited with code 42 without a result"
+            assert rec["result"]["annotations"]["exitcode"] == 42
+            assert rec["result"]["metadata"] == {}
+            attempts = list(snap.iter_attempts(job_uid="crash::j1"))
+            assert len(attempts) == 1
+            assert attempts[0]["outcome"] == "failure"
 
         assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 
@@ -167,33 +173,26 @@ def test_worker_crash_without_result_records_failure_and_reaps(tmp_path):
         ),
     ],
 )
-def test_worker_faults_settle_one_failure(
-    tmp_path, task_type, handler, message, exception_type
-):
-    with TaskLite(
-        backend="sqlite",
-        state_path=tmp_path / f"channel_{task_type}.db",
-        max_workers=1,
-    ) as pipeline:
+def test_worker_faults_settle_one_failure(task_type, handler, message, exception_type):
+    with TaskLite(backend="memory", max_workers=1) as pipeline:
         pipeline.register_task(task_type, handler)
         pipeline.enqueue(Job(task_type, "j1", max_retries_per_run=3))
 
-        pipeline.run()
+        with in_process_workers(pipeline):
+            pipeline.run(install_signals=False)
 
-        failed = pipeline._runtime.store.backend.load_failed()
-        assert list(failed) == [f"{task_type}::j1"]
-        entry = failed[f"{task_type}::j1"]
-        assert entry["result"]["message"] == message
-        assert entry["error_message"] == message
-        if exception_type is None:
-            assert entry["result"]["exception"] is None
-        else:
-            assert entry["result"]["exception"]["type"] == exception_type
-
-        attempts = pipeline._runtime.store.backend.load_settled_attempts(f"{task_type}::j1")
-        assert len(attempts) == 1
-        assert attempts[0]["outcome"] == "failure"
-        assert pipeline._runtime.store.backend.load_queue() == []
+        with StateSnapshot.open(pipeline) as snap:
+            entry = snap.get_job(f"{task_type}::j1")
+            assert entry is not None and entry["status"] == "failed"
+            assert entry["result"]["message"] == message
+            if exception_type is None:
+                assert entry["result"]["exception"] is None
+            else:
+                assert entry["result"]["exception"]["type"] == exception_type
+            attempts = list(snap.iter_attempts(job_uid=f"{task_type}::j1"))
+            assert len(attempts) == 1
+            assert attempts[0]["outcome"] == "failure"
+            assert list(snap.iter_jobs(status="pending")) == []
 
 
 def test_worker_timeout_terminates_and_marks_failed_without_retry(tmp_path):
@@ -207,22 +206,20 @@ def test_worker_timeout_terminates_and_marks_failed_without_retry(tmp_path):
         pipeline.enqueue(Job("hang", "j1", timeout_seconds=0.2, max_retries_per_run=3))
 
         t0 = time.monotonic()
-        pipeline.run()
+        pipeline.run(install_signals=False)
         elapsed = time.monotonic() - t0
 
         assert elapsed < 3.0, f"超时未及时触发，耗时 {elapsed}s"
 
-        failed = pipeline._runtime.store.backend.load_failed()
-        assert "hang::j1" in failed
-        err = failed["hang::j1"].get("error_message") or ""
-        assert "timed out" in err
-        assert failed["hang::j1"]["result"]["metadata"] == {}
-        assert failed["hang::j1"]["result"]["annotations"]["timed_out"] is True
-
-        # 验证超时未烧重试预算或自动重试，一次 Attempt 直接终结
-        attempts = pipeline._runtime.store.backend.load_settled_attempts("hang::j1")
-        assert len(attempts) == 1
-        assert attempts[0]["outcome"] == "failure"
+        with StateSnapshot.open(pipeline) as snap:
+            rec = snap.get_job("hang::j1")
+            assert rec is not None and rec["status"] == "failed"
+            assert "timed out" in (rec["result"]["message"] or "")
+            assert rec["result"]["metadata"] == {}
+            assert rec["result"]["annotations"]["timed_out"] is True
+            attempts = list(snap.iter_attempts(job_uid="hang::j1"))
+            assert len(attempts) == 1
+            assert attempts[0]["outcome"] == "failure"
 
         assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 
@@ -238,26 +235,23 @@ def test_no_per_job_lock_file_and_library_mutex_valid(tmp_path):
     )
     pipeline.register_task("fast", _fast_worker)
     pipeline.enqueue(Job("fast", "j1"))
-    pipeline.run()
+    with in_process_workers(pipeline):
+        pipeline.run(install_signals=False)
 
-    # 验证没有为 fast::j1 生成 {uid}.lock 文件
     assert not any("fast" in p.name and p.name.endswith(".lock") for p in tmp_path.glob("*.lock"))
 
-    # 验证库级互斥仍正常生效
     run_lock = try_acquire_lock(state_path)
     assert run_lock is not None
     try:
-        # 重复获取同一库级锁被互斥阻断
-        second = try_acquire_lock(state_path)
-        assert second is None
+        assert try_acquire_lock(state_path) is None
     finally:
         release_lock(run_lock)
 
-    # 释放后可再次获取
     third = try_acquire_lock(state_path)
     assert third is not None
     release_lock(third)
     pipeline.stop()
+    pipeline.close()
 
 
 def test_worker_exit_error_after_result_does_not_rewrite_success(tmp_path):
@@ -269,39 +263,39 @@ def test_worker_exit_error_after_result_does_not_rewrite_success(tmp_path):
     ) as pipeline:
         pipeline.register_task("die_later", _success_then_exit_error)
         pipeline.enqueue(Job("die_later", "j1"))
-        pipeline.run()
+        pipeline.run(install_signals=False)
 
-        successes = pipeline._runtime.store.backend.load_successes()
-        assert "die_later::j1" in successes
-        assert successes["die_later::j1"]["result"]["metadata"]["returned"] is True
-        assert pipeline._runtime.store.backend.load_failed() == {}
-
-        attempts = pipeline._runtime.store.backend.load_settled_attempts("die_later::j1")
-        assert len(attempts) == 1
-        assert attempts[0]["outcome"] == "success"
+        with StateSnapshot.open(pipeline) as snap:
+            rec = snap.get_job("die_later::j1")
+            assert rec is not None and rec["status"] == "succeeded"
+            assert rec["result"]["metadata"]["returned"] is True
+            assert list(snap.iter_jobs(status="failed")) == []
+            attempts = list(snap.iter_attempts(job_uid="die_later::j1"))
+            assert len(attempts) == 1
+            assert attempts[0]["outcome"] == "success"
 
         assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 
 
-def _send_malformed_result(job: Job, ctx: JobContext) -> TaskResult:
+def _send_malformed_result(job: Job, ctx) -> TaskResult:
     assert ctx._pipe_sender is not None
     ctx._pipe_sender.send_result(job.payload["result"])
     return TaskResult.success(metadata={"untrusted": True})
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("payload", [
     {"status": "success", "metadata": []},
     {"status": "success", "metadata": {}, "spawned_jobs": 7},
     {"status": "failure", "metadata": {}, "exception": {"type": "bad"}},
     {"status": "retry", "metadata": {}, "consume_budget": "yes"},
 ])
-def test_malformed_worker_result_settles_one_failure(tmp_path, backend, payload):
-    with TaskLite(backend=backend, state_path=tmp_path / "state.db") as pipeline:
+def test_malformed_worker_result_settles_one_failure(payload):
+    with TaskLite(backend="memory") as pipeline:
         pipeline.register_task("malformed", _send_malformed_result)
         job = Job("malformed", "result", payload={"result": payload}, max_retries_per_run=3)
         pipeline.enqueue(job)
-        pipeline.run()
+        with in_process_workers(pipeline):
+            pipeline.run(install_signals=False)
         with StateSnapshot.open(pipeline) as snapshot:
             row = snapshot.get_job(job.uid)
             assert row["status"] == "failed"

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from tasklite import (
     Job,
+    StateSnapshot,
     TaskLite,
     TaskResult,
 )
@@ -29,6 +30,7 @@ from tasklite.resource import (
     CapacityResource,
     IntervalResource,
 )
+from tasklite.testing import in_process_workers
 
 
 def _fast_handler(job, ctx):
@@ -64,7 +66,11 @@ def test_capacity_two_concurrency_and_third_starts_on_release(tmp_path):
     p.enqueue(Job("sync", "j2", payload=payload))
     p.enqueue(Job("sync", "j3", payload=payload))
 
-    run_thread = threading.Thread(target=p.run, kwargs={"install_signals": False})
+    def _run():
+        with in_process_workers(p):
+            p.run(install_signals=False)
+
+    run_thread = threading.Thread(target=_run)
     run_thread.start()
 
     # 等待前两个任务启动并占用容量
@@ -72,7 +78,7 @@ def test_capacity_two_concurrency_and_third_starts_on_release(tmp_path):
     while not ((sync_dir / "started_j1").exists() and (sync_dir / "started_j2").exists()):
         if time.monotonic() > deadline:
             raise TimeoutError("j1 or j2 failed to start")
-        time.sleep(0.02)
+        time.sleep(0.01)
 
     # 第三个任务因容量为 2 暂不能启动
     assert not (sync_dir / "started_j3").exists()
@@ -85,7 +91,7 @@ def test_capacity_two_concurrency_and_third_starts_on_release(tmp_path):
     while not (sync_dir / "started_j3").exists():
         if time.monotonic() > deadline:
             raise TimeoutError("j3 failed to start after j1 release")
-        time.sleep(0.02)
+        time.sleep(0.01)
 
     # 释放剩余任务
     (sync_dir / "release_j2").touch()
@@ -94,10 +100,9 @@ def test_capacity_two_concurrency_and_third_starts_on_release(tmp_path):
     run_thread.join(timeout=5.0)
     assert not run_thread.is_alive()
 
-    successes = p._runtime.store.backend.load_successes()
-    assert "sync::j1" in successes
-    assert "sync::j2" in successes
-    assert "sync::j3" in successes
+    with StateSnapshot.open(p) as snap:
+        succeeded = {j["job_uid"] for j in snap.iter_jobs(status="succeeded")}
+    assert {"sync::j1", "sync::j2", "sync::j3"} <= succeeded
     assert cap.used == 0.0
 
 
@@ -129,14 +134,18 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
     p.enqueue(Job("fast", "j2"))
 
     # 首作业消费 100s 间隔
-    run_thread = threading.Thread(target=p.run, kwargs={"install_signals": False})
+    def _run():
+        with in_process_workers(p):
+            p.run(install_signals=False)
+
+    run_thread = threading.Thread(target=_run)
     run_thread.start()
 
     # 等待 j1 完成
     deadline = time.monotonic() + 5.0
-    while "fast::j1" not in p._runtime.store.backend.load_successes() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert "fast::j1" in p._runtime.store.backend.load_successes()
+    while (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") != "succeeded" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") == "succeeded"
 
     # 此时 j2 需等待 100s。外部提前放行（重设 next_available 并通知唤醒）
     res.next_available = time.monotonic()
@@ -144,13 +153,13 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
 
     # 主循环应早于 100s（< 2s）被提前唤醒并完成 j2
     deadline = time.monotonic() + 5.0
-    while "fast::j2" not in p._runtime.store.backend.load_successes() and time.monotonic() < deadline:
-        time.sleep(0.02)
+    while (StateSnapshot.open(p).get_job("fast::j2") or {}).get("status") != "succeeded" and time.monotonic() < deadline:
+        time.sleep(0.01)
 
     run_thread.join(timeout=5.0)
     assert not run_thread.is_alive()
 
-    assert "fast::j2" in p._runtime.store.backend.load_successes()
+    assert (StateSnapshot.open(p).get_job("fast::j2") or {}).get("status") == "succeeded"
 
 
 def test_long_wait_uses_single_deadline_without_resource_polling(tmp_path):
@@ -240,23 +249,27 @@ def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
         return original_wait(timeout, last_seq=last_seq)
 
     p._runtime._wait = tracked_wait  # type: ignore[assignment]
-    run_thread = threading.Thread(target=p.run, kwargs={"install_signals": False})
+    def _run():
+        with in_process_workers(p):
+            p.run(install_signals=False)
+
+    run_thread = threading.Thread(target=_run)
     run_thread.start()
 
     # 处于暂不可用且无恢复时间，不能被推断为死锁或失败
     assert wait_entered.wait(5.0)
-    assert "fast::j1" not in p._runtime.store.backend.load_failed()
+    assert (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") != "failed"
 
     # 外部状态就绪并触发通知
     ext_res.ready = True
     ext_res.notify()
 
     deadline = time.monotonic() + 5.0
-    while "fast::j1" not in p._runtime.store.backend.load_successes() and time.monotonic() < deadline:
-        time.sleep(0.02)
+    while (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") != "succeeded" and time.monotonic() < deadline:
+        time.sleep(0.01)
 
     run_thread.join(timeout=5.0)
-    assert "fast::j1" in p._runtime.store.backend.load_successes()
+    assert (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") == "succeeded"
 
 
 def test_impossible_resource_fails_job_without_unexecuted_attempt(tmp_path):
@@ -369,7 +382,8 @@ def test_release_prior_to_final_commit_and_no_dispatch_between(tmp_path):
     p.register_task("fast", _fast_handler, resources={"slots": 1.0})
     p.enqueue(Job("fast", "j1"))
 
-    p.run(install_signals=False)
+    with in_process_workers(p):
+        p.run(install_signals=False)
 
     assert "released" in events
     assert "committed" in events

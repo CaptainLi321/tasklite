@@ -4,18 +4,17 @@
 端到端（派发机器/完成机器装配后的 run 主循环）由后续门面阶段承接。
 """
 
-import json
+import multiprocessing as mp
+import threading
 import time
-from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
 from tasklite.engine.channel import (
     ExecutionChannel,
+    ExecutionResult,
     WorkerLaunchSpec,
-    _decode_ipc_result,
-    _worker_process_entry,
 )
 from tasklite.engine.types import AuthorizationOutcome, AuthorizationStatus, JobHandle
 from tasklite.models.context import JobContext
@@ -25,7 +24,6 @@ from tasklite.utils.ipc import (
     PIPE_MSG_RESULT,
     WorkerPipeMessage,
     WorkerPipeSender,
-    create_worker_pipe,
     create_worker_reply_pipe,
 )
 
@@ -92,8 +90,53 @@ class TestExecutionChannelBasics:
 
         assert channel._results[_EXECUTION_ID] == first
 
+class _ThreadWorker:
+    def __init__(self, *, target, args=(), kwargs=None):
+        self._target = target
+        self._args = args
+        self._kwargs = dict(kwargs or {})
+        self.exitcode: int | None = None
+        self._thread: threading.Thread | None = None
+
+    def _run(self) -> None:
+        try:
+            self._target(*self._args, **self._kwargs)
+            if self.exitcode is None:
+                self.exitcode = 0
+        except BaseException:
+            if self.exitcode is None:
+                self.exitcode = 1
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def join(self, timeout=None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def kill(self) -> None:
+        if self.exitcode is None:
+            self.exitcode = -9
+
+    def close(self) -> None:
+        self._thread = None
+
+
+class _ThreadSpawnContext:
+    def __init__(self) -> None:
+        self._ctx = mp.get_context("spawn")
+        self.Process = _ThreadWorker
+
+    def Pipe(self, *args, **kwargs):
+        return self._ctx.Pipe(*args, **kwargs)
+
+
 class TestWorkerWrapper:
-    """worker 执行体入口：显式结果、异常失败与 Pipe 发送。"""
+    """worker 执行通道端到端：显式结果、异常失败与 Pipe 收割。"""
 
     @staticmethod
     def _run_worker(
@@ -102,58 +145,88 @@ class TestWorkerWrapper:
         execution_id: str = _EXECUTION_ID,
         *,
         job_context: JobContext | None = None,
-    ) -> dict:
-        receiver, sender = create_worker_pipe(job_uid=job.uid, execution_id=execution_id)
+    ) -> ExecutionResult:
+        channel = ExecutionChannel(process_context=_ThreadSpawnContext())
         try:
             spec = make_spec(
                 job,
                 handler,
                 execution_id=execution_id,
-                pipe_sender=sender,
                 job_context=job_context,
             )
-            _worker_process_entry(spec)
-            messages = receiver.drain_to_eof(timeout=3.0)
+            handle = channel.spawn(spec)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                completed = channel.reap_completed([handle])
+                if completed:
+                    return completed[0][1]
+                time.sleep(0.005)
+            raise AssertionError("worker did not complete in time")
         finally:
-            sender.close()
-            receiver.close()
-        results = [
-            m.payload
-            for m in messages
-            if not isinstance(m, Exception) and m.kind == "result"
-        ]
-        assert len(results) == 1
-        return results[0]
+            channel.close()
 
-    def test_worker_writes_success_over_pipe(self, tmp_path):
+    def test_worker_writes_success_over_pipe(self):
         job = Job("t", "x")
-        data = self._run_worker(job, lambda j, c: TaskResult.success(metadata={"ok": 1}))
-        assert data["status"] == "success"
-        assert data["metadata"] == {"ok": 1}
+        res = self._run_worker(job, lambda j, c: TaskResult.success(metadata={"ok": 1}))
+        assert res.success is True
+        assert res.result_metadata == {"ok": 1}
 
-    def test_worker_error_payloads_sent_over_pipe(self, tmp_path):
-        """retry/failure 各状态通道的 payload 均经 Pipe 发送。"""
+    def test_worker_error_payloads_sent_over_pipe(self):
+        """retry/failure 各状态通道的 payload 均经 Pipe 发送与收割。"""
         def return_retry(job, ctx):
             return TaskResult.retry(message="t")
 
         def raise_system_exit(job, ctx):
             raise SystemExit(2)
 
-        for handler, want_status, job_id in (
-            (return_retry, "retry", "yretry"),
-            (raise_system_exit, "failure", "yexit"),
-        ):
-            job = Job("t", job_id)
-            data = self._run_worker(job, handler)
-            assert data["status"] == want_status
+        res_retry = self._run_worker(Job("t", "yretry"), return_retry)
+        assert res_retry.retry_requested is True
+        assert res_retry.success is False
 
-    def test_worker_rejects_missing_execution_id(self, tmp_path):
-        """execution_id 缺失 fail-loud（fencing 契约破坏不得静默产出无名结果）。"""
-        job = Job("t", "x")
-        with pytest.raises(RuntimeError, match="execution_id"):
-            _worker_process_entry(make_spec(job, lambda j, c: TaskResult.success(), execution_id=None))
+        res_exit = self._run_worker(Job("t", "yexit"), raise_system_exit)
+        assert res_exit.success is False
+        assert res_exit.retry_requested is False
+        assert res_exit.exception is not None and res_exit.exception["type"] == "SystemExit"
 
-    def test_retry_carries_consume_budget(self, tmp_path):
+    def test_worker_rejects_missing_execution_id(self):
+        """execution_id 缺失 fail-loud，handler 不得执行且不得产出成功结果。"""
+        called: list[bool] = []
+        channel = ExecutionChannel(process_context=_ThreadSpawnContext())
+        handle = None
+        try:
+            handle = channel.spawn(
+                make_spec(
+                    Job("t", "x"),
+                    lambda j, c: called.append(True) or TaskResult.success(),
+                    execution_id=None,
+                )
+            )
+            deadline = time.monotonic() + 5.0
+            completed = []
+            while time.monotonic() < deadline and not completed:
+                completed = channel.reap_completed([handle])
+                if not completed:
+                    time.sleep(0.005)
+            assert len(completed) == 1
+            assert completed[0][1].success is False
+            assert called == []
+        finally:
+            for mapping in (
+                channel._in_process_senders,
+                channel._reply_senders,
+            ):
+                item = mapping.pop(None, None)  # type: ignore[arg-type]
+                if item is not None:
+                    item.close()
+            recv = channel._receivers.pop(None, None)  # type: ignore[arg-type]
+            if recv is not None:
+                recv.close(timeout=1.0)
+            stop = channel._health_stops.pop(None, None)  # type: ignore[arg-type]
+            if stop is not None:
+                stop.set()
+            channel.close()
+
+    def test_retry_carries_consume_budget(self):
         """retry 结果携带 consume_budget 经 Pipe 传递。"""
         def zero_budget(job, ctx):
             return TaskResult.retry(message="no burn", consume_budget=False)
@@ -165,49 +238,40 @@ class TestWorkerWrapper:
             (zero_budget, "zb", False),
             (burn_budget, "bb", True),
         ):
-            job = Job("h", job_id)
-            res = self._run_worker(job, handler)
-            assert res["status"] == "retry"
-            assert res["consume_budget"] is want_consume
+            res = self._run_worker(Job("h", job_id), handler)
+            assert res.retry_requested is True
+            assert res.consume_budget is want_consume
 
-    def test_keyboard_interrupt_writes_failure(self, tmp_path):
+    def test_keyboard_interrupt_writes_failure(self):
         def interrupted(job, ctx):
             raise KeyboardInterrupt()
 
-        job = Job("h", "ki")
-        res = self._run_worker(job, interrupted)
-        assert res["status"] == "failure"
-        assert res["message"] == "KeyboardInterrupt"
-        assert res["exception"]["type"] == "KeyboardInterrupt"
+        res = self._run_worker(Job("h", "ki"), interrupted)
+        assert res.success is False
+        assert res.message == "KeyboardInterrupt"
+        assert res.exception is not None and res.exception["type"] == "KeyboardInterrupt"
 
-    def test_unhandled_exception_writes_failure_with_exception_dict(self, tmp_path):
+    def test_unhandled_exception_writes_failure_with_exception_dict(self):
         """未捕获异常统一结算为 failure，记录 type/message/traceback，不自动重试。"""
-        job = Job("h", "err")
         res = self._run_worker(
-            job, lambda j, c: (_ for _ in ()).throw(ValueError("boom")),
+            Job("h", "err"), lambda j, c: (_ for _ in ()).throw(ValueError("boom")),
         )
-        assert res["status"] == "failure"
-        assert res["message"] == "ValueError: boom"
-        assert res["exception"]["type"] == "ValueError"
-        assert res["exception"]["message"] == "boom"
-        assert "traceback" in res["exception"]
+        assert res.success is False
+        assert res.message == "ValueError: boom"
+        assert res.exception is not None
+        assert res.exception["type"] == "ValueError"
+        assert res.exception["message"] == "boom"
+        assert "traceback" in res.exception
 
-    def test_pipe_send_failure_exits_without_crash(self, tmp_path, monkeypatch):
-        """Pipe 发送结果遇到 OSError 时，worker 不抛未捕获异常退出。"""
+    def test_pipe_send_failure_exits_without_crash(self, monkeypatch):
+        """Pipe 发送结果遇到 OSError 时，worker 不抛未捕获异常退出，通道按无结果失败收割。"""
         def refusing_send(sender_self, payload):
             raise BrokenPipeError("pipe broken")
 
         monkeypatch.setattr(WorkerPipeSender, "send_result", refusing_send)
-        job = Job("h", "a")
-        receiver, sender = create_worker_pipe(job_uid=job.uid, execution_id=_EXECUTION_ID)
-        try:
-            _worker_process_entry(make_spec(
-                job, lambda j, c: (True, {}), pipe_sender=sender
-            ))
-            assert receiver.drain_to_eof(timeout=3.0) == []
-        finally:
-            sender.close()
-            receiver.close()
+        res = self._run_worker(Job("h", "a"), lambda j, c: TaskResult.success())
+        assert res.success is False
+        assert "without a result" in (res.message or "")
 
 
 class TestSpawnFailureCleanup:
@@ -255,11 +319,11 @@ class TestHandlerInvalidReturnTypes:
     )
     def test_non_task_result_rejected_as_failure(self, tmp_path, bad_return):
         job = Job("t", "bad")
-        data = TestWorkerWrapper._run_worker(
+        res = TestWorkerWrapper._run_worker(
             job, lambda j, c: bad_return
         )
-        assert data["status"] == "failure"
-        assert "invalid handler return type: expected TaskResult" in data["message"]
+        assert res.success is False
+        assert "invalid handler return type: expected TaskResult" in (res.message or "")
 
 
 _BASE_OK = {
@@ -271,7 +335,20 @@ _BASE_OK = {
 
 
 def _decode(res):
-    return _decode_ipc_result(res, Job("t", "a"))
+    job = Job("t", "a")
+    channel = ExecutionChannel()
+    channel._results[_EXECUTION_ID] = res
+    handle = JobHandle(
+        job_uid=job.uid,
+        process=TestDecodeConvergencePaths._DeadProcess(),
+        timeout_at_monotonic=time.monotonic() + 10.0,
+        timeout_seconds=10.0,
+        job=job,
+        execution_id=_EXECUTION_ID,
+    )
+    completed = channel.reap_completed([handle])
+    assert len(completed) == 1
+    return completed[0][1]
 
 
 class TestDecodeIpcResultDefense:

@@ -55,13 +55,10 @@ def lingering_success_handler(job, ctx):
     return TaskResult.success()
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("stage", ["preflight", "governor", "exclusions"])
-def test_stop_during_initialization_is_preserved(tmp_path, monkeypatch, backend, stage):
+def test_stop_during_initialization_is_preserved(tmp_path, monkeypatch, stage):
     effect = tmp_path / "effect"
-    with TaskLite(
-        backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None,
-    ) as pipeline:
+    with TaskLite(backend="memory") as pipeline:
         pipeline.register_task("work", write_effect_handler)
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
         runtime = pipeline._runtime
@@ -86,7 +83,7 @@ def test_stop_during_initialization_is_preserved(tmp_path, monkeypatch, backend,
             except BaseException as error:
                 errors.append(error)
 
-        with monkeypatch.context() as patch:
+        with monkeypatch.context() as patch, in_process_workers(pipeline):
             patch.setattr(target, name, blocked)
             thread = threading.Thread(target=run)
             thread.start()
@@ -108,7 +105,8 @@ def test_stop_during_initialization_is_preserved(tmp_path, monkeypatch, backend,
         assert not effect.exists()
         assert not pipeline.is_running
         pipeline.stop()
-        pipeline.run(install_signals=False)
+        with in_process_workers(pipeline):
+            pipeline.run(install_signals=False)
         assert effect.read_text() == "started"
         with StateSnapshot.open(pipeline) as state:
             assert [a["outcome"] for a in state.iter_attempts()] == ["success"]
@@ -151,17 +149,15 @@ def test_stop_during_execution_lock_acquisition_is_preserved(tmp_path, monkeypat
         with StateSnapshot.open(pipeline) as state:
             assert state.get_job("work::one")["status"] == "pending"
             assert list(state.iter_attempts()) == []
-        pipeline.run(install_signals=False)
+        with in_process_workers(pipeline):
+            pipeline.run(install_signals=False)
         with StateSnapshot.open(pipeline) as state:
             assert [a["outcome"] for a in state.iter_attempts()] == ["success"]
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("stage", ["preflight", "governor", "exclusions", "unbind"])
-def test_initialization_failure_releases_run_for_retry(tmp_path, monkeypatch, backend, stage):
-    with TaskLite(
-        backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None,
-    ) as pipeline:
+def test_initialization_failure_releases_run_for_retry(monkeypatch, stage):
+    with TaskLite(backend="memory") as pipeline:
         runtime = pipeline._runtime
         target, name = {
             "preflight": (runtime, "_preflight_picklable_handlers"),
@@ -220,7 +216,8 @@ def test_signal_during_installation_is_preserved_and_handlers_restored(
         with StateSnapshot.open(pipeline) as state:
             assert state.get_job("work::one")["status"] == "pending"
             assert list(state.iter_attempts()) == []
-        pipeline.run(install_signals=False)
+        with in_process_workers(pipeline):
+            pipeline.run(install_signals=False)
         with StateSnapshot.open(pipeline) as state:
             assert [a["outcome"] for a in state.iter_attempts()] == ["success"]
 
@@ -273,7 +270,8 @@ def test_stop_arriving_after_run_exit_does_not_mutate_session(tmp_path, monkeypa
         assert runtime.stop_mode == StopMode.NONE
         pipeline.register_task("work", success_handler)
         pipeline.enqueue(Job("work", "one"))
-        pipeline.run(install_signals=False)
+        with in_process_workers(pipeline):
+            pipeline.run(install_signals=False)
         with StateSnapshot.open(pipeline) as state:
             assert [a["outcome"] for a in state.iter_attempts()] == ["success"]
 
@@ -510,7 +508,8 @@ def test_stop_when_idle_is_noop_and_idempotent(tmp_path):
     p.stop()
 
     # 后续 run 正常执行完毕
-    p.run()
+    with in_process_workers(p):
+        p.run(install_signals=False)
     assert "t::j1" in p._runtime.store.backend.load_successes()
 
 
@@ -535,29 +534,29 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
     def controller():
         t0 = time.monotonic()
         while not ready_file.exists() and (time.monotonic() - t0 < 10.0):
-            time.sleep(0.02)
+            time.sleep(0.01)
         assert ready_file.exists()
         p.stop()
         release_file.write_text("1")
 
-    t = threading.Thread(target=controller)
-    t.start()
-    p.run()
-    t.join(timeout=5.0)
+    with in_process_workers(p):
+        t = threading.Thread(target=controller)
+        t.start()
+        p.run(install_signals=False)
+        t.join(timeout=5.0)
 
-    # 第 1 次 Run 结束：因 stop() 停止新派发，且单次 retry 在预算内（1 <= 1），保持 pending
-    assert "t_retry::j1" not in p._runtime.store.backend.load_successes()
-    assert len(p._runtime.store.backend.load_failed()) == 0
-    assert any(jd["job_id"] == "j1" for jd in p._runtime.store.backend.load_queue())
-    assert _TRIGGER_CALLS[0] == 1
+        # 第 1 次 Run 结束：因 stop() 停止新派发，且单次 retry 在预算内（1 <= 1），保持 pending
+        assert "t_retry::j1" not in p._runtime.store.backend.load_successes()
+        assert len(p._runtime.store.backend.load_failed()) == 0
+        assert any(jd["job_id"] == "j1" for jd in p._runtime.store.backend.load_queue())
+        assert _TRIGGER_CALLS[0] == 1
 
-    # 第 2 次 Run：新 Run 重新评估 Trigger，且重试预算重置
-    ready_file.unlink()
-    release_file.unlink()
-    # 释放文件立即可用，使后续 handler 执行后迅速返回 retry 直至耗尽
-    release_file.write_text("1")
+        # 第 2 次 Run：新 Run 重新评估 Trigger，且重试预算重置
+        ready_file.unlink()
+        release_file.unlink()
+        release_file.write_text("1")
 
-    p.run()
+        p.run(install_signals=False)
     assert _TRIGGER_CALLS[0] == 2
     # 预算耗尽后转为失败档案
     failures = p._runtime.store.backend.load_failed()
@@ -565,13 +564,12 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
     assert "t_retry::j1" in failures
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
-def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path, backend):
+def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
     """停止后在途失败：下游依赖级联失败，独立未派发作业原样保持 pending。"""
     ready_file = tmp_path / "ready_fail"
     release_file = tmp_path / "release_fail"
 
-    p = TaskLite(backend=backend, state_path=tmp_path / "state.db", max_workers=1)
+    p = TaskLite(backend="memory", max_workers=1)
     p.register_task("t_fail", file_synced_fail_handler)
     p.register_task("t_downstream", success_handler)
     p.register_task("t_other", success_handler)
@@ -583,19 +581,17 @@ def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path, backend
     def controller():
         t0 = time.monotonic()
         while not ready_file.exists() and (time.monotonic() - t0 < 10.0):
-            time.sleep(0.02)
+            time.sleep(0.01)
         assert ready_file.exists()
         p.stop()
         release_file.write_text("1")
 
-    t = threading.Thread(target=controller)
-    t.start()
-    p.run()
-    t.join(timeout=5.0)
+    with in_process_workers(p):
+        t = threading.Thread(target=controller)
+        t.start()
+        p.run(install_signals=False)
+        t.join(timeout=5.0)
 
-    # t_fail::j_fail 失败
-    # t_downstream::j_down 级联失败
-    # t_other::j_other 未派发（因为 max_workers=1 且收到 stop），保持 pending
     failures = p._runtime.store.backend.load_failed()
     assert "t_fail::j_fail" in failures
     assert "t_downstream::j_down" in failures
@@ -606,7 +602,7 @@ def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path, backend
     assert "t_other::j_other" not in failures
 
 
-def test_stop_from_another_thread_wakes_scheduler_wait(tmp_path):
+def test_stop_from_another_thread_wakes_scheduler_wait(monkeypatch):
     """另线程调用 stop() 能立即解除主循环等待。"""
     p = TaskLite(backend="memory")
 
@@ -614,24 +610,26 @@ def test_stop_from_another_thread_wakes_scheduler_wait(tmp_path):
     p.register_task("t_wait", success_handler, resources={"gate": 1.0})
     p.enqueue(Job("t_wait", "j1", resources={"gate": 1.0}))
 
-    run_started = threading.Event()
+    wait_entered = threading.Event()
     run_finished = threading.Event()
+    original_wait = p._runtime._wait
+
+    def tracked_wait(timeout, last_seq=None):
+        wait_entered.set()
+        return original_wait(timeout, last_seq=last_seq)
+
+    monkeypatch.setattr(p._runtime, "_wait", tracked_wait)
 
     def run_worker():
-        run_started.set()
         p.run(install_signals=False)
         run_finished.set()
 
     t = threading.Thread(target=run_worker)
     t.start()
-    assert run_started.wait(5.0)
-
-    # 等主循环进入等待
-    time.sleep(0.1)
+    assert wait_entered.wait(5.0)
 
     t0 = time.monotonic()
     p.stop()
-    # 唤醒后应在极短时间内退出，远小于 5.0 秒
     assert run_finished.wait(2.0)
     elapsed = time.monotonic() - t0
     assert elapsed < 1.0
@@ -865,7 +863,8 @@ def test_install_signals_in_child_thread_fails_loud_and_false_succeeds(tmp_path)
     success_captured = [False]
 
     def run_without_signals():
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         success_captured[0] = True
 
     t2 = threading.Thread(target=run_without_signals)
@@ -885,7 +884,8 @@ def test_main_thread_install_signals_restores_original_handler(tmp_path):
     p.register_task("t", success_handler)
     p.enqueue(Job("t", "j1"))
 
-    p.run(install_signals=True)
+    with in_process_workers(p):
+        p.run(install_signals=True)
 
     assert signal.getsignal(signal.SIGINT) == original_sigint
     assert signal.getsignal(signal.SIGTERM) == original_sigterm

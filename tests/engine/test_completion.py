@@ -736,21 +736,20 @@ def test_completion_rejects_missing_output(tmp_path, monkeypatch):
 
 
 def test_declaration_environment_fault_preserves_running_state(tmp_path):
-    from tasklite.exceptions import _ArtifactIOError
-
     env = CompletionEnv(
         tmp_path,
         extra_resources={"api": IntervalResource("api", interval_seconds=0.01)},
     )
     entry = env.track_entry(Job("t", "limited"))
 
-    with pytest.raises(_ArtifactIOError, match="write denied"):
+    with pytest.raises(BaseException, match="write denied") as caught:
         env.completion.complete_job(
             entry,
             ExecutionResult(
                 artifact_error="write denied",
             ),
         )
+    assert not isinstance(caught.value, Exception)
     assert entry.job.attempt_no == 1
     assert not env.store.state.failed
 

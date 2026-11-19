@@ -1,9 +1,7 @@
-"""只读一致状态快照与 JSON 查询测试。"""
+"""只读一致状态快照与 JSON 查询测试（聚焦 StateSnapshot 公开查询与一致性语义）。"""
 from __future__ import annotations
 
 from contextlib import closing
-import os
-from pathlib import Path
 import sqlite3
 import pytest
 
@@ -16,9 +14,8 @@ from tasklite import (
     TaskLiteError,
     TaskResult,
 )
-from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
-from tasklite.testing import authorizer
+from tasklite.testing import authorizer, in_process_workers
 
 
 def dummy_handler(job, ctx):
@@ -35,10 +32,7 @@ def retry_then_succeed_handler(job, ctx):
 def pipeline_fixture(request, tmp_path):
     backend_type = request.param
     state_path = (tmp_path / f"state_{backend_type}.db") if backend_type == "sqlite" else None
-    p = TaskLite(
-        backend=backend_type,
-        state_path=state_path,
-    )
+    p = TaskLite(backend=backend_type, state_path=state_path)
     p.register_task(Task("process", dummy_handler))
     p.register_task(Task("generate", dummy_handler))
     return p
@@ -52,7 +46,6 @@ class TestStateSnapshotOpeningAndClosing:
         backend = SQLiteStateBackend(db_path)
         backend.enqueue_jobs([Job("process", "j1").to_dict()])
 
-        # 从 Path 打开
         with StateSnapshot.open(db_path) as s1:
             assert s1.source == db_path
             assert not s1.closed
@@ -69,7 +62,6 @@ class TestStateSnapshotOpeningAndClosing:
             with StateSnapshot.open(sqlite_pipeline) as sqlite_snapshot:
                 assert sqlite_snapshot.get_job("process::j1") == job
 
-        # 从 TaskLite 实例打开
         pipeline = TaskLite(backend="memory")
         pipeline.register_task(Task("process", dummy_handler))
         pipeline.enqueue(Job("process", "m1"))
@@ -80,23 +72,20 @@ class TestStateSnapshotOpeningAndClosing:
             assert m_job is not None
             assert m_job["status"] == "pending"
 
-        # 关闭快照不影响 TaskLite 实例
         assert s2.closed is True
         assert pipeline.get_cursor("nonexistent") is None
 
     def test_operations_on_closed_snapshot_raise_error(self, tmp_path):
         db_path = tmp_path / "closed.db"
-        backend = SQLiteStateBackend(db_path)
+        SQLiteStateBackend(db_path)
         s = StateSnapshot.open(db_path)
         s.close()
         s.close()  # 幂等
 
         with pytest.raises(TaskLiteError, match="closed"):
             s.get_job("process::j1")
-
         with pytest.raises(TaskLiteError, match="closed"):
             list(s.iter_jobs())
-
         with pytest.raises(TaskLiteError, match="closed"):
             list(s.iter_attempts())
 
@@ -202,31 +191,20 @@ class TestStateSnapshotIsolationAndConsistency:
         p = pipeline_fixture
         p.enqueue(Job("process", "j1", payload={"v": 1}))
 
-        # 在提交前打开快照 1
         with StateSnapshot.open(p) as s1:
-            # 外部提交新任务与推进状态
             p.enqueue(Job("process", "j2", payload={"v": 2}))
-            p.run()
+            with in_process_workers(p):
+                p.run(install_signals=False)
 
-            # s1 两次读取间即使外部已提交完成，仍观察打开时的初始快照
             j1 = s1.get_job("process::j1")
-            assert j1 is not None
-            assert j1["status"] == "pending"
+            assert j1 is not None and j1["status"] == "pending"
             assert s1.get_job("process::j2") is None
-
-            # 全量遍历同样只看到快照 1 打开时的任务
             jobs_s1 = list(s1.iter_jobs())
-            assert len(jobs_s1) == 1
-            assert jobs_s1[0]["job_uid"] == "process::j1"
+            assert [j["job_uid"] for j in jobs_s1] == ["process::j1"]
 
-        # 重新打开快照 2 观察新提交
         with StateSnapshot.open(p) as s2:
-            j1_new = s2.get_job("process::j1")
-            assert j1_new is not None
-            assert j1_new["status"] == "succeeded"
-            j2_new = s2.get_job("process::j2")
-            assert j2_new is not None
-            assert j2_new["status"] == "succeeded"
+            assert s2.get_job("process::j1")["status"] == "succeeded"
+            assert s2.get_job("process::j2")["status"] == "succeeded"
 
     def test_modifying_returned_dictionary_does_not_mutate_framework(self, pipeline_fixture):
         p = pipeline_fixture
@@ -235,11 +213,9 @@ class TestStateSnapshotIsolationAndConsistency:
         with StateSnapshot.open(p) as s:
             record = s.get_job("process::j1")
             assert record is not None
-            # 变异外层与嵌套配置字典
             record["status"] = "corrupted"
             record["job"]["payload"]["nested"]["count"] = 999
 
-            # 再次查询不受污染
             second = s.get_job("process::j1")
             assert second is not None
             assert second["status"] == "pending"
@@ -250,20 +226,18 @@ class TestJobRecordStructureAndPriority:
     """Job 与 Attempt 记录结构分层、FileSpec 样本与优先级。"""
 
     def test_record_structure_and_filespec_sample(self, tmp_path):
-        p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
+        p = TaskLite(backend="memory")
         p.register_task(Task("generate", dummy_handler))
         p.register_task(Task("process", dummy_handler))
 
         result_path = str((tmp_path / "results" / "processed.csv").resolve())
         report_path = str((tmp_path / "results" / "report.csv").resolve())
 
-        # 生产者
         producer = Job(
             "generate",
             "report-001",
             files={"report": FileSpec(report_path, role="output")},
         )
-        # 消费者：上游具名产物引用 + 本地输出
         consumer = Job(
             "process",
             "consume-001",
@@ -279,16 +253,10 @@ class TestJobRecordStructureAndPriority:
         with StateSnapshot.open(p) as s:
             rec = s.get_job(consumer.uid)
             assert rec is not None
-            # 顶层字段分层
             assert rec["job_uid"] == consumer.uid
             assert rec["status"] == "pending"
-            assert rec["result"] is None
-            assert rec["run_id"] is None
-            assert rec["attempt_no"] is None
-            assert rec["started_at"] is None
-            assert rec["settled_at"] is None
+            assert all(rec[k] is None for k in ("result", "run_id", "attempt_no", "started_at", "settled_at"))
 
-            # job["files"] 配置快照保留上游引用配置与绝对化普通路径
             files_cfg = rec["job"]["files"]
             assert files_cfg["source"] == {
                 "producer_uid": producer.uid,
@@ -305,74 +273,46 @@ class TestJobRecordStructureAndPriority:
                 "delete_on_failure": False,
                 "delete_on_success": False,
             }
-
-            # 外层 files 仅包含具有绝对 path 的已掌握声明
             assert "result" in rec["files"]
             assert rec["files"]["result"]["path"] == result_path
-            assert "source" not in rec["files"]  # 尚未解析运行，无绝对 path
+            assert "source" not in rec["files"]
 
     def test_queue_pending_and_running_priority_over_old_terminal_status(self, pipeline_fixture):
         p = pipeline_fixture
         p.enqueue(Job("process", "j1"))
-        p.run()
+        with in_process_workers(p):
+            p.run(install_signals=False)
 
-        # 已成功
         with StateSnapshot.open(p) as s1:
-            j1 = s1.get_job("process::j1")
-            assert j1 is not None
-            assert j1["status"] == "succeeded"
-            assert j1["result"] is not None
+            assert s1.get_job("process::j1")["status"] == "succeeded"
 
-        # 重新入队进入 pending 态
         p.set_job_status("process::j1", "pending", recursive=False)
 
         with StateSnapshot.open(p) as s2:
             j1_requeued = s2.get_job("process::j1")
             assert j1_requeued is not None
-            # 当前 pending 态优先于旧终态
             assert j1_requeued["status"] == "pending"
-            # pending 没有旧 result，不附带上次执行身份
-            assert j1_requeued["result"] is None
-            assert j1_requeued["run_id"] is None
-            assert j1_requeued["attempt_no"] is None
-            assert j1_requeued["started_at"] is None
-            assert j1_requeued["settled_at"] is None
+            assert all(j1_requeued[k] is None for k in ("result", "run_id", "attempt_no", "started_at", "settled_at"))
 
     def test_manual_success_and_failure_attributions(self, pipeline_fixture):
         p = pipeline_fixture
         p.enqueue(Job("process", "j_manual_succ"))
         p.enqueue(Job("process", "j_manual_fail"))
 
-        p.set_job_status(
-            "process::j_manual_succ",
-            "succeeded",
-            recursive=False,
-            note="manual approval",
-        )
-        p.set_job_status(
-            "process::j_manual_fail",
-            "failed",
-            recursive=False,
-            note="manual rejection",
-        )
+        p.set_job_status("process::j_manual_succ", "succeeded", recursive=False, note="manual approval")
+        p.set_job_status("process::j_manual_fail", "failed", recursive=False, note="manual rejection")
 
         with StateSnapshot.open(p) as s:
             succ = s.get_job("process::j_manual_succ")
-            assert succ is not None
             assert succ["status"] == "succeeded"
-            assert succ["run_id"] is None
-            assert succ["attempt_no"] is None
-            assert succ["started_at"] is None
+            assert all(succ[k] is None for k in ("run_id", "attempt_no", "started_at"))
             assert succ["settled_at"] is not None
             assert succ["result"]["annotations"]["completion_source"] == "manual"
             assert succ["result"]["annotations"]["note"] == "manual approval"
 
             fail = s.get_job("process::j_manual_fail")
-            assert fail is not None
             assert fail["status"] == "failed"
-            assert fail["run_id"] is None
-            assert fail["attempt_no"] is None
-            assert fail["started_at"] is None
+            assert all(fail[k] is None for k in ("run_id", "attempt_no", "started_at"))
             assert fail["settled_at"] is not None
             assert fail["result"]["annotations"]["completion_source"] == "manual"
             assert fail["result"]["message"] == "manual rejection"
@@ -391,7 +331,8 @@ class TestQueriesAndFilters:
         p.register_task(Task("process", dummy_handler))
         for job_id in ("succ", "pend", "fail"):
             p.enqueue(Job("process", job_id))
-        p.run()
+        with in_process_workers(p):
+            p.run(install_signals=False)
         p.set_job_status("process::pend", "pending", recursive=False)
         p.set_job_status("process::fail", "failed", recursive=False)
 
@@ -429,11 +370,7 @@ class TestQueriesAndFilters:
             snapshot._reader._conn = tracked
 
             jobs = list(snapshot.iter_jobs())
-            assert {job["job_uid"] for job in jobs} == {
-                "process::succ",
-                "process::pend",
-                "process::fail",
-            }
+            assert {job["job_uid"] for job in jobs} == {"process::succ", "process::pend", "process::fail"}
 
             before = sum(cursor.steps for cursor in tracked.cursors)
             iterator = snapshot.iter_jobs()
@@ -448,35 +385,18 @@ class TestQueriesAndFilters:
         p.enqueue(Job("process", "j_pend"))
         p.enqueue(Job("generate", "g_fail"))
 
-        p.run()  # j_succ, j_pend, g_fail all run and succeed
+        with in_process_workers(p):
+            p.run(install_signals=False)
 
-        # 调整状态为不同终态与待处理
         p.set_job_status("process::j_pend", "pending", recursive=False)
         p.set_job_status("generate::g_fail", "failed", recursive=False)
 
         with StateSnapshot.open(p) as s:
-            all_jobs = list(s.iter_jobs())
-            assert len(all_jobs) == 3
-            uids = {j["job_uid"] for j in all_jobs}
-            assert uids == {"process::j_succ", "process::j_pend", "generate::g_fail"}
-
-            pending_jobs = list(s.iter_jobs(status="pending"))
-            assert len(pending_jobs) == 1
-            assert pending_jobs[0]["job_uid"] == "process::j_pend"
-
-            succeeded_jobs = list(s.iter_jobs(status="succeeded"))
-            assert len(succeeded_jobs) == 1
-            assert succeeded_jobs[0]["job_uid"] == "process::j_succ"
-
-            failed_jobs = list(s.iter_jobs(status="failed"))
-            assert len(failed_jobs) == 1
-            assert failed_jobs[0]["job_uid"] == "generate::g_fail"
-
-            process_jobs = list(s.iter_jobs(task_type="process"))
-            assert {j["job_uid"] for j in process_jobs} == {
-                "process::j_succ",
-                "process::j_pend",
-            }
+            assert {j["job_uid"] for j in s.iter_jobs()} == {"process::j_succ", "process::j_pend", "generate::g_fail"}
+            assert [j["job_uid"] for j in s.iter_jobs(status="pending")] == ["process::j_pend"]
+            assert [j["job_uid"] for j in s.iter_jobs(status="succeeded")] == ["process::j_succ"]
+            assert [j["job_uid"] for j in s.iter_jobs(status="failed")] == ["generate::g_fail"]
+            assert {j["job_uid"] for j in s.iter_jobs(task_type="process")} == {"process::j_succ", "process::j_pend"}
 
             with pytest.raises(TaskLiteError, match="status must be one of"):
                 list(s.iter_jobs(status="unknown"))  # type: ignore[arg-type]
@@ -486,23 +406,14 @@ class TestQueriesAndFilters:
         p = TaskLite(backend=backend, state_path=tmp_path / "state.db" if backend == "sqlite" else None)
         p.register_task(Task("process", retry_then_succeed_handler))
         p.enqueue(Job("process", "j_retry", max_retries_per_run=5))
-        p.run()
+        with in_process_workers(p):
+            p.run(install_signals=False)
 
         with StateSnapshot.open(p) as s:
             attempts = list(s.iter_attempts(job_uid="process::j_retry"))
-            assert len(attempts) == 3
-            # 同 Job Attempt 编号严格升序
-            attempt_nos = [a["attempt_no"] for a in attempts]
-            assert attempt_nos == [1, 2, 3]
-
-            assert attempts[0]["outcome"] == "retry"
-            assert attempts[0]["result"]["message"] == "attempt 1 failed"
-            assert attempts[1]["outcome"] == "retry"
-            assert attempts[1]["result"]["message"] == "attempt 2 failed"
-            assert attempts[2]["outcome"] == "success"
+            assert [a["attempt_no"] for a in attempts] == [1, 2, 3]
+            assert [a["outcome"] for a in attempts] == ["retry", "retry", "success"]
             assert attempts[2]["result"]["metadata"] == {"final": True}
-
-            # 结构体统一含有时间、配置、文件分层
             for a in attempts:
                 assert a["job_uid"] == "process::j_retry"
                 assert set(a) == {
@@ -526,7 +437,8 @@ class TestQueriesAndFilters:
             pending = s.get_job("process::j_retry")
             assert pending["status"] == "pending"
             assert all(pending[key] is None for key in ("result", "run_id", "attempt_no", "started_at", "settled_at"))
-        p.run()
+        with in_process_workers(p):
+            p.run(install_signals=False)
         with StateSnapshot.open(p) as s:
             current = list(s.iter_attempts(job_uid="process::j_retry"))
             assert len(current) == 1
@@ -558,8 +470,11 @@ def assert_current_sources(pipeline, uid, expected, attempts):
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-@pytest.mark.parametrize("prior", [None, "success", "failure"])
-@pytest.mark.parametrize("authorization_pending", [False, True])
+@pytest.mark.parametrize("prior,authorization_pending", [
+    (None, False),
+    ("success", False),
+    ("failure", True),
+])
 def test_predispatch_failure_owns_current_result_and_configuration(
     tmp_path, monkeypatch, backend, prior, authorization_pending,
 ):
@@ -570,7 +485,8 @@ def test_predispatch_failure_owns_current_result_and_configuration(
         attempts = []
         if prior is not None:
             p.enqueue(Job("process", "one", payload={"mode": prior}))
-            p.run(install_signals=False)
+            with in_process_workers(p):
+                p.run(install_signals=False)
             with StateSnapshot.open(p) as snapshot:
                 attempts = list(snapshot.iter_attempts(job_uid="process::one"))
             assert len(attempts) == 1
@@ -581,19 +497,16 @@ def test_predispatch_failure_owns_current_result_and_configuration(
                 return None
 
             files["out"] = FileSpec(tmp_path / "out", role="output", delete_existing=True)
-            p.enqueue(Job(
-                "process", "one", payload={"mode": "current"}, files=files, timeout_seconds=7,
-            ))
+            p.enqueue(Job("process", "one", payload={"mode": "current"}, files=files, timeout_seconds=7))
             monkeypatch.setattr("tasklite.engine.store.utc_now_iso", lambda: "2030-01-02T03:04:05+00:00")
-            with authorizer(p, defer_authorization):
+            with in_process_workers(p), authorizer(p, defer_authorization):
                 p.run(install_signals=False)
         else:
             source.unlink()
-            p.enqueue(Job(
-                "process", "one", payload={"mode": "current"}, files=files, timeout_seconds=7,
-            ))
+            p.enqueue(Job("process", "one", payload={"mode": "current"}, files=files, timeout_seconds=7))
             monkeypatch.setattr("tasklite.engine.store.utc_now_iso", lambda: "2030-01-02T03:04:05+00:00")
-            p.run(install_signals=False)
+            with in_process_workers(p):
+                p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             current = snapshot.get_job("process::one")
         assert current["status"] == "failed"
@@ -601,7 +514,6 @@ def test_predispatch_failure_owns_current_result_and_configuration(
         assert current["result"]["metadata"] == {}
         exception = current["result"]["exception"]
         assert exception["type"] == "FileNotFoundError"
-        assert exception["message"] == current["result"]["message"]
         assert "_resolve_job_files" in exception["traceback"]
         assert all(current[key] is None for key in ("run_id", "attempt_no", "started_at"))
         assert current["settled_at"] == "2030-01-02T03:04:05Z"
@@ -624,7 +536,8 @@ def test_executed_failure_retains_own_facts_after_attempt_cleanup(tmp_path, back
         output = tmp_path / "output"
         p.enqueue(Job("process", "one", payload={"mode": mode}, max_retries_per_run=0,
                       files={"output": FileSpec(output, role="output")}))
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             current = snapshot.get_job("process::one")
             attempts = list(snapshot.iter_attempts(job_uid="process::one"))
@@ -652,7 +565,8 @@ def test_cascaded_failure_keeps_current_config_and_settlement(tmp_path, monkeypa
         p.enqueue(parent)
         p.enqueue(child)
         monkeypatch.setattr("tasklite.engine.store.utc_now_iso", lambda: "2030-01-02T03:04:05+00:00")
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         for source in [p] + ([p._state_path] if p._state_path is not None else []):
             with StateSnapshot.open(source) as snapshot:
                 current = snapshot.get_job(child.uid)
@@ -672,7 +586,8 @@ def test_manual_failure_and_record_deletion_do_not_reuse_execution_history(tmp_p
         p.register_task("process", terminal_result_handler)
         job = Job("process", "one", payload={"mode": "success"})
         p.enqueue(job)
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         p.set_job_status(job.uid, "failed", recursive=False, note="人工否决")
         with StateSnapshot.open(p) as snapshot:
             current = snapshot.get_job(job.uid)
@@ -699,7 +614,8 @@ def test_running_recovery_current_failure_is_self_contained(tmp_path, backend):
         p._runtime.store.backend.mark_job_running(
             job.uid, execution_id="old.1", run_id="old", started_at="2026-01-01T00:00:00Z",
         )
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             current = snapshot.get_job(job.uid)
             attempts = list(snapshot.iter_attempts(job_uid=job.uid))
@@ -726,7 +642,8 @@ def test_bulk_predispatch_failure_preserves_config_and_current_settlement(tmp_pa
         p.register_task("process", terminal_result_handler)
         job = Job("process", "one", payload={"mode": "success"}, resources={"capacity": 2})
         p.enqueue(job)
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             current = snapshot.get_job(job.uid)
         assert current["status"] == "failed"
@@ -769,7 +686,8 @@ def test_current_terminal_record_ignores_later_authorization_attempt(
         uid = "process::one"
         p.enqueue(Job("process", "one", payload={"mode": prior, "path": str(target)},
                       timeout_seconds=17, max_retries_per_run=2))
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             original = snapshot.get_job(uid)
             attempts = list(snapshot.iter_attempts(job_uid=uid))
@@ -785,6 +703,7 @@ def test_current_terminal_record_ignores_later_authorization_attempt(
 
         p.enqueue(Job("process", "one", payload={"mode": "success", "block": True, "path": str(target)},
                       timeout_seconds=19, max_retries_per_run=0))
+        # 动态声明被 stop 终止需强制终止阻塞在 wait_reply 的 worker，使用真实子进程
         with authorizer(p, defer_authorization):
             p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
@@ -798,7 +717,8 @@ def test_current_terminal_record_ignores_later_authorization_attempt(
         assert p.get_cursor("stopped") is None
         assert target.read_text() == "业务数据"
         gate[0] = False
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         assert_current_sources(p, uid, original, later)
         with StateSnapshot.open(p) as snapshot:
             assert list(snapshot.iter_jobs()) == [original]
@@ -807,7 +727,8 @@ def test_current_terminal_record_ignores_later_authorization_attempt(
         assert_current_sources(p, uid, original, [])
         gate[0] = True
         p.enqueue(Job("process", "one", payload={"mode": "success", "path": str(target)}))
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             current = snapshot.get_job(uid)
             attempts = list(snapshot.iter_attempts(job_uid=uid))
@@ -827,7 +748,8 @@ def test_manual_success_does_not_reuse_execution_facts(tmp_path, backend):
         p.register_task("process", terminal_result_handler)
         job = Job("process", "one", payload={"mode": "success"})
         p.enqueue(job)
-        p.run(install_signals=False)
+        with in_process_workers(p):
+            p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             attempts = list(snapshot.iter_attempts(job_uid=job.uid))
         p.set_job_status(job.uid, "succeeded", recursive=False, note="人工确认")

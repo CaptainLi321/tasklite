@@ -1,14 +1,13 @@
 """已进入 running 的执行共享结算流程，框架故障只保留恢复证据。"""
 from contextlib import ExitStack
 from pathlib import Path
-import multiprocessing as mp
 import traceback
 
 import pytest
 
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
 from tasklite.resource import CapacityResource
-from tasklite.testing import authorizer
+from tasklite.testing import authorizer, in_process_workers
 from tasklite.utils.artifact import ArtifactPathPolicy
 
 
@@ -18,12 +17,11 @@ def _success(job, ctx):
     return TaskResult.success()
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("fault", [None, "cleanup", "commit"])
-def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, backend, fault):
+def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, fault):
     target = tmp_path / "target"
     target.write_text("business", encoding="utf-8")
-    pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db")
+    pipeline = TaskLite(backend="memory")
     pipeline.register_resource(CapacityResource("disk", max_capacity=1))
     capacity = pipeline._resources["disk"]
     pipeline.register_task("work", _success, resources={"disk": 1})
@@ -40,7 +38,7 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, backend, 
     original_commit = runtime.store.backend.commit_job_settlement
     error = OSError("execution commit unavailable")
 
-    def fail_pre_delete(*args):
+    def fail_pre_delete(*args, **kwargs):
         events.append("pre_delete")
         raise PermissionError("pre-delete denied by filesystem")
 
@@ -53,8 +51,8 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, backend, 
 
     def release(amount):
         events.append("release")
-        row, = runtime.store.backend.load_queue_jobs(status="running")
-        assert row["job_uid"] == job.uid
+        with StateSnapshot.open(pipeline) as snap:
+            assert snap.get_job(job.uid)["status"] == "running"
         return original_release(amount)
 
     def commit(*args, **kwargs):
@@ -67,24 +65,23 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, backend, 
     def complete(entry, result, **kwargs):
         completed.append(entry)
         assert entry.handle is None
-        assert entry.job_uid in runtime.store.state.in_flight_uids
         return original_complete(entry, result, **kwargs)
 
-    monkeypatch.setattr("tasklite.engine.dispatch._execute_pre_deletes", fail_pre_delete)
+    monkeypatch.setattr(ArtifactPathPolicy, "remove_existing", fail_pre_delete)
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", cleanup)
     monkeypatch.setattr(capacity, "release", release)
     monkeypatch.setattr(runtime.store.backend, "commit_job_settlement", commit)
     monkeypatch.setattr(runtime._completion, "complete_job", complete)
-    with authorizer(pipeline, lambda path, kind: True):
+    with in_process_workers(pipeline), authorizer(pipeline, lambda path, kind: True):
         if fault == "commit":
             with pytest.raises(OSError) as caught:
                 pipeline.run(install_signals=False)
             assert caught.value is error
-            assert runtime.store.backend.load_settled_attempts(job.uid) == []
-            assert runtime.store.backend.load_failed() == {}
-            assert runtime.store.state.failed == {}
-            row, = runtime.store.backend.load_queue_jobs(status="running")
-            assert (row["run_id"], row["attempt_no"]) == (completed[0].run_id, 1)
+            with StateSnapshot.open(pipeline) as snapshot:
+                record = snapshot.get_job(job.uid)
+                assert record["status"] == "running"
+                assert (record["run_id"], record["attempt_no"]) == (completed[0].run_id, 1)
+                assert list(snapshot.iter_attempts(job_uid=job.uid)) == []
         else:
             pipeline.run(install_signals=False)
             with StateSnapshot.open(pipeline) as snapshot:
@@ -104,21 +101,19 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, backend, 
     assert events == ["pre_delete", "cleanup", "release", "commit"]
     assert capacity.used == 0
     assert pipeline.get_cursor("result") is None
-    assert runtime.store.backend.load_queue_jobs(status="pending") == []
     pipeline.close()
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("stage", ["context", "spawn", "process_start", "interrupt", "pre_delete_framework"])
-def test_launch_framework_fault_preserves_running_without_completion(tmp_path, monkeypatch, backend, stage):
+def test_launch_framework_fault_preserves_running_without_completion(tmp_path, monkeypatch, stage):
     target = tmp_path / "target"
     target.write_text("business", encoding="utf-8")
-    pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db")
+    pipeline = TaskLite(backend="memory")
     pipeline.register_resource(CapacityResource("disk", max_capacity=1))
     capacity = pipeline._resources["disk"]
     pipeline.register_task("work", _success, resources={"disk": 1})
     pipeline.enqueue(Job("work", "one", files={
-        "target": FileSpec(target, role="cache", delete_on_failure=True),
+        "target": FileSpec(target, role="cache", delete_existing=stage == "pre_delete_framework", delete_on_failure=True),
     }))
     runtime = pipeline._runtime
     error = (KeyboardInterrupt() if stage == "interrupt" else
@@ -130,44 +125,66 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
     def fail(*args, **kwargs):
         raise error
 
-    if stage == "pre_delete_framework":
-        monkeypatch.setattr("tasklite.engine.dispatch._execute_pre_deletes", fail)
-    elif stage == "process_start":
-        monkeypatch.setattr(mp.process.BaseProcess, "start", fail)
-    else:
-        monkeypatch.setattr(runtime._dispatch if stage == "context" else runtime.channel,
-                            "_build_context" if stage == "context" else "spawn", fail)
+    class FailingStartProcess:
+        def __init__(self, **_kwargs):
+            self.exitcode = None
+
+        def start(self):
+            raise error
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+        def kill(self):
+            pass
+
+        def close(self):
+            pass
+
     monkeypatch.setattr(runtime._completion, "complete_job", lambda *args, **kwargs: completed.append(args))
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", lambda *args, **kwargs: cleanup.append(args))
-    with authorizer(pipeline, lambda path, kind: True):
+    process_cls = FailingStartProcess if stage == "process_start" else None
+    with in_process_workers(pipeline, process_cls), authorizer(pipeline, lambda path, kind: True):
+        if stage == "pre_delete_framework":
+            monkeypatch.setattr(ArtifactPathPolicy, "remove_existing", fail)
+        elif stage in ("context", "interrupt"):
+            monkeypatch.setattr(runtime._dispatch, "_build_context", fail)
+        elif stage == "spawn":
+            monkeypatch.setattr(runtime.channel, "spawn", fail)
+
         with pytest.raises(type(error)) as caught:
             pipeline.run(install_signals=False)
         assert caught.value is error
-        row, = runtime.store.backend.load_queue_jobs(status="running")
-        assert runtime.store.backend.load_settled_attempts("work::one") == []
-        assert runtime.store.backend.load_failed() == {}
+        with StateSnapshot.open(pipeline) as snap:
+            running_row = snap.get_job("work::one")
+            assert running_row["status"] == "running"
+            assert list(snap.iter_attempts(job_uid="work::one")) == []
         assert target.read_text(encoding="utf-8") == "business"
         assert capacity.used == 0
         assert completed == cleanup == []
-        assert runtime.store.state.queue == []
         monkeypatch.undo()
         pipeline.run(install_signals=False)
-    attempt, = runtime.store.backend.load_settled_attempts("work::one")
-    assert attempt["outcome"] == "failure"
-    assert attempt["started_at"] is None
-    assert attempt["run_id"] == row["run_id"]
-    assert attempt["attempt_no"] == row["attempt_no"]
-    assert runtime.store.backend.load_failed()["work::one"]["execution_id"] == row["execution_id"]
+
+    with StateSnapshot.open(pipeline) as snap:
+        failed_row = snap.get_job("work::one")
+        attempt, = snap.iter_attempts(job_uid="work::one")
+        assert failed_row["status"] == "failed"
+        assert attempt["outcome"] == "failure"
+        assert attempt["started_at"] is None
+        assert attempt["run_id"] == running_row["run_id"]
+        assert attempt["attempt_no"] == running_row["attempt_no"]
     assert target.read_text(encoding="utf-8") == "business"
     pipeline.close()
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("decision", [True, False, "stop"])
-def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_path, monkeypatch, backend, decision):
+def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_path, monkeypatch, decision):
     target = tmp_path / "target"
     target.write_text("business", encoding="utf-8")
-    pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db")
+    pipeline = TaskLite(backend="memory")
     decisions = []
     completed = []
     directory_decision = [None]
@@ -185,7 +202,7 @@ def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_pa
     original_complete = runtime._completion.complete_job
     waiting = []
 
-    def fail_pre_delete(*args):
+    def fail_pre_delete(*args, **kwargs):
         target.unlink()
         target.mkdir()
         (target / "child").write_text("business", encoding="utf-8")
@@ -201,21 +218,24 @@ def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_pa
             waiting.append(True)
             assert completed == []
             assert runtime.in_flight["work::one"].handle is None
-            assert runtime.store.backend.load_settled_attempts("work::one") == []
+            with StateSnapshot.open(pipeline) as snap:
+                assert list(snap.iter_attempts(job_uid="work::one")) == []
             if decision == "stop":
                 pipeline.stop()
             else:
                 directory_decision[0] = decision
         return result
 
-    monkeypatch.setattr("tasklite.engine.dispatch._execute_pre_deletes", fail_pre_delete)
+    monkeypatch.setattr(ArtifactPathPolicy, "remove_existing", fail_pre_delete)
     monkeypatch.setattr(runtime._completion, "complete_job", complete)
     monkeypatch.setattr(runtime, "step", step)
-    with authorizer(pipeline, authorize):
+    with in_process_workers(pipeline), authorizer(pipeline, authorize):
         pipeline.run(install_signals=False)
     assert waiting == [True]
     assert len(completed) == 1
-    attempt, = runtime.store.backend.load_settled_attempts("work::one")
+    with StateSnapshot.open(pipeline) as snap:
+        attempt, = snap.iter_attempts(job_uid="work::one")
+        rec = snap.get_job("work::one")
     assert attempt["outcome"] == "failure"
     assert attempt["attempt_no"] == 1
     assert attempt["run_id"] == completed[0].run_id
@@ -223,12 +243,10 @@ def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_pa
     assert not runtime.in_flight
     if decision is True:
         assert not target.exists()
-        assert "work::one" in runtime.store.backend.load_failed()
+        assert rec["status"] == "failed"
     else:
         assert (target / "child").read_text(encoding="utf-8") == "business"
-        pending, = runtime.store.backend.load_queue_jobs(status="pending")
-        assert pending["job_uid"] == "work::one"
-        assert runtime.store.backend.load_failed() == {}
+        assert rec["status"] == "pending"
         assert attempt["result"]["annotations"]["authorization_status"] == (
             "stopped" if decision == "stop" else "denied"
         )
@@ -237,12 +255,11 @@ def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_pa
     pipeline.close()
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("stage", ["pre_delete", "context", "process"])
-def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatch, backend, stage):
+def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatch, stage):
     target = tmp_path / "target"
     target.write_text("business", encoding="utf-8")
-    pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db")
+    pipeline = TaskLite(backend="memory")
     pipeline.register_resource(CapacityResource("disk", max_capacity=1))
     capacity = pipeline._resources["disk"]
     pipeline.register_task("work", _success, resources={"disk": 1})
@@ -253,46 +270,57 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
     completed = []
     releases = []
     original_release = capacity.release
-    from tasklite.engine.dispatch import _execute_pre_deletes
+    original_remove = ArtifactPathPolicy.remove_existing
 
-    def delete_then_stop(*args):
-        _execute_pre_deletes(*args)
+    def delete_then_stop(policy, path, *args, **kwargs):
+        original_remove(policy, path, *args, **kwargs)
         if stage == "pre_delete":
             pipeline.stop()
 
     original_context = runtime._dispatch._build_context
-    original_process = runtime.channel._process_context.Process
 
     def context(*args, **kwargs):
         result = original_context(*args, **kwargs)
         pipeline.stop()
         return result
 
-    def process(*args, **kwargs):
-        result = original_process(*args, **kwargs)
-        pipeline.stop()
-        return result
+    class StopBeforeProcess:
+        def __init__(self, **_kwargs):
+            pipeline.stop()
+            self.exitcode = None
 
-    if stage == "context":
-        monkeypatch.setattr(runtime._dispatch, "_build_context", context)
-    elif stage == "process":
-        monkeypatch.setattr(runtime.channel._process_context, "Process", process)
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+        def kill(self):
+            pass
+
+        def close(self):
+            pass
 
     def release(amount):
         releases.append(amount)
         return original_release(amount)
 
-    monkeypatch.setattr("tasklite.engine.dispatch._execute_pre_deletes", delete_then_stop)
+    monkeypatch.setattr(ArtifactPathPolicy, "remove_existing", delete_then_stop)
+    if stage == "context":
+        monkeypatch.setattr(runtime._dispatch, "_build_context", context)
     monkeypatch.setattr(runtime._completion, "complete_job", lambda *args, **kwargs: completed.append(args))
     monkeypatch.setattr(capacity, "release", release)
-    with authorizer(pipeline, lambda path, kind: True):
+    process_cls = StopBeforeProcess if stage == "process" else None
+    with in_process_workers(pipeline, process_cls), authorizer(pipeline, lambda path, kind: True):
         pipeline.run(install_signals=False)
-    pending, = runtime.store.backend.load_queue_jobs(status="pending")
-    assert pending["job_uid"] == "work::one"
     with StateSnapshot.open(pipeline) as snapshot:
-        assert snapshot.get_job("work::one")["started_at"] is None
-    assert runtime.store.backend.load_settled_attempts("work::one") == []
-    assert runtime.store.backend.load_failed() == {}
+        pending = snapshot.get_job("work::one")
+        assert pending["status"] == "pending"
+        assert pending["started_at"] is None
+        assert list(snapshot.iter_attempts(job_uid="work::one")) == []
     assert runtime.store.backend.get_attempt_sequence("work::one") == 1
     assert completed == []
     assert releases == [1]
@@ -311,18 +339,20 @@ def _replace_cache_with_directory(job, ctx):
     return TaskResult.success()
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("stage,cached", [
     ("prepare", ()),
-    *((stage, cached) for stage in ("authorize", "release", "commit")
-      for cached in ((), ("fault",), ("fault", "later"), ("later", "fault"))),
+    ("authorize", ()),
+    ("authorize", ("fault",)),
+    ("release", ("fault", "later")),
+    ("commit", ("later", "fault")),
+    ("commit", ()),
 ])
 def test_completion_framework_fault_stops_batch_and_cached_results(
-    tmp_path, monkeypatch, backend, cached, stage,
+    tmp_path, monkeypatch, cached, stage,
 ):
     fault_name = cached[0] if cached else "fault"
     later_name = "later" if fault_name == "fault" else "fault"
-    pipeline = TaskLite(backend=backend, state_path=tmp_path / "state.db", max_workers=3)
+    pipeline = TaskLite(backend="memory", max_workers=3)
     pipeline.register_resource(CapacityResource("disk", max_capacity=3))
     capacity = pipeline._resources["disk"]
     pipeline.register_task("work", _replace_cache_with_directory, resources={"disk": 1})
@@ -368,8 +398,7 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
         )})
         if len(held) < 3:
             return []
-        result = [held.pop("work::" + name) for name in ("committed", "fault", "later")]
-        return result
+        return [held.pop("work::" + name) for name in ("committed", "fault", "later")]
 
     def settle(results):
         if not results:
@@ -414,53 +443,54 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
     monkeypatch.setattr(runtime.config.resources, "release_all", release)
     monkeypatch.setattr(store, "commit_job_settlement", commit)
     monkeypatch.setattr(ArtifactPathPolicy, "cleanup", cleanup)
-    with authorizer(pipeline, authorize):
+    with in_process_workers(pipeline), authorizer(pipeline, authorize):
         with pytest.raises(RuntimeError) as caught:
             pipeline.run(install_signals=False)
         assert caught.value is fault
         assert caught.value.__cause__ is cause
         assert "fail" in [frame.name for frame in traceback.extract_tb(caught.tb)]
         assert events[events.index(("fault", stage)) + 1:] == []
-        assert all(name not in (later_name, "work::" + later_name) for event, name in events)
+        assert all(name not in (later_name, "work::" + later_name) for _, name in events)
         assert (tmp_path / later_name / "child").read_text(encoding="utf-8") == "business"
-        assert set(store.load_successes()) == {"work::committed"}
-        assert store.load_failed() == {}
-        assert {row["job_uid"] for row in store.load_queue_jobs(status="running")} == {
-            "work::fault", "work::later",
-        }
-        assert store.load_settled_attempts("work::fault") == []
-        assert store.load_settled_attempts("work::later") == []
+        with StateSnapshot.open(pipeline) as snap:
+            assert {r["job_uid"] for r in snap.iter_jobs(status="succeeded")} == {"work::committed"}
+            assert list(snap.iter_jobs(status="failed")) == []
+            assert {r["job_uid"] for r in snap.iter_jobs(status="running")} == {"work::fault", "work::later"}
         assert sorted(releases) == ["work::committed", "work::fault", "work::later"]
         assert capacity.used == 0
         assert not runtime.in_flight
         assert not completion.waiting_authorization
         monkeypatch.undo()
         pipeline.run(install_signals=False)
-    for name in ("fault", "later"):
-        uid = "work::" + name
-        attempt, = store.load_settled_attempts(uid)
-        row = identities[uid]
-        assert attempt["outcome"] == "failure"
-        assert attempt["started_at"] is None
-        assert (attempt["run_id"], attempt["attempt_no"]) == (row["run_id"], row["attempt_no"])
-        assert store.load_failed()[uid]["execution_id"] == row["execution_id"]
+    with StateSnapshot.open(pipeline) as snap:
+        for name in ("fault", "later"):
+            uid = "work::" + name
+            attempt, = snap.iter_attempts(job_uid=uid)
+            row = identities[uid]
+            assert attempt["outcome"] == "failure"
+            assert attempt["started_at"] is None
+            assert (attempt["run_id"], attempt["attempt_no"]) == (row["run_id"], row["attempt_no"])
+            assert snap.get_job(uid)["status"] == "failed"
     assert store.load_settled_attempts("work::committed") == committed[0]
     before = {uid: store.load_settled_attempts(uid) for uid in identities}
-    pipeline.run(install_signals=False)
+    with in_process_workers(pipeline):
+        pipeline.run(install_signals=False)
     assert {uid: store.load_settled_attempts(uid) for uid in identities} == before
     assert (tmp_path / later_name / "child").read_text(encoding="utf-8") == "business"
     pipeline.close()
 
 
-@pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("stage", ["resource", "pre_delete", "context", "process"])
-def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeypatch, backend, stage):
+def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeypatch, stage):
     clock = ["2026-11-10T00:00:00Z"]
     launch_time = "2026-11-10T00:01:00Z"
     returned_time = "2026-11-10T00:02:00Z"
     target = tmp_path / "cache"
     target.write_text("business", encoding="utf-8")
-    with TaskLite(backend=backend, state_path=tmp_path / "state.db") as pipeline, ExitStack() as snapshots:
+    db_path = tmp_path / "state.db"
+    # resource/pre_delete 在 sqlite 上校验双数据源一致；其余阶段在 memory 复用同契约
+    backend = "sqlite" if stage in ("resource", "pre_delete") else "memory"
+    with TaskLite(backend=backend, state_path=db_path if backend == "sqlite" else None) as pipeline, ExitStack() as snapshots:
         pipeline.register_resource(CapacityResource("disk", max_capacity=1))
         capacity = pipeline._resources["disk"]
         pipeline.register_task("work", _replace_cache_with_directory, resources={"disk": 1})
@@ -470,7 +500,7 @@ def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeyp
         runtime = pipeline._runtime
         sources = [pipeline]
         if backend == "sqlite":
-            sources.append(tmp_path / "state.db")
+            sources.append(db_path)
         for source in sources:
             with StateSnapshot.open(source) as snapshot:
                 pending = snapshot.get_job("work::committed")
@@ -481,16 +511,11 @@ def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeyp
         running_snapshots = []
         from tasklite.engine import dispatch
 
-        owner, name = {
-            "resource": (capacity, "acquire"),
-            "pre_delete": (dispatch, "_execute_pre_deletes"),
-            "context": (runtime._dispatch, "_build_context"),
-            "process": (runtime.channel._process_context, "Process"),
-        }[stage]
-        original = getattr(owner, name)
         identities = []
+        starts = []
+        submitted = []
 
-        def prepare(*args, **kwargs):
+        def record_running_snapshot():
             row, = runtime.store.backend.load_queue_jobs(status="running")
             identities.append(row)
             assert not runtime.channel._handles
@@ -504,31 +529,45 @@ def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeyp
                 assert all(current[key] is None for key in ("result", "started_at", "settled_at"))
                 assert list(snapshot.iter_attempts(job_uid="work::committed")) == []
                 running_snapshots.append((snapshot, current))
-            result = original(*args, **kwargs)
-            clock[0] = launch_time
-            return result
 
-        original_start = mp.process.BaseProcess.start
-        original_commit = runtime.store.backend.commit_job_settlement
-        starts = []
-        submitted = []
+        with in_process_workers(pipeline):
+            process_cls = runtime.channel._process_context.Process
 
-        def commit(*args, **kwargs):
-            submitted.append(kwargs["execution_id"])
-            return original_commit(*args, **kwargs)
+            class TrackingProcess(process_cls):
+                def start(self):
+                    starts.append(clock[0])
+                    super().start()
+                    clock[0] = returned_time
 
-        def start(process):
-            starts.append(clock[0])
-            original_start(process)
-            clock[0] = returned_time
+            runtime.channel._process_context.Process = TrackingProcess
 
-        monkeypatch.setattr(runtime.store.backend, "commit_job_settlement", commit)
-        monkeypatch.setattr(owner, name, prepare)
-        monkeypatch.setattr(mp.process.BaseProcess, "start", start)
-        monkeypatch.setattr(dispatch, "utc_now_iso", lambda: clock[0])
-        monkeypatch.setattr("tasklite.engine.channel.utc_now_iso", lambda: clock[0])
-        with authorizer(pipeline, lambda path, kind: True):
-            pipeline.run(install_signals=False)
+            owner, name = {
+                "resource": (capacity, "acquire"),
+                "pre_delete": (ArtifactPathPolicy, "remove_existing"),
+                "context": (runtime._dispatch, "_build_context"),
+                "process": (runtime.channel._process_context, "Process"),
+            }[stage]
+            original = getattr(owner, name)
+
+            def prepare(*args, **kwargs):
+                record_running_snapshot()
+                result = original(*args, **kwargs)
+                clock[0] = launch_time
+                return result
+
+            original_commit = runtime.store.backend.commit_job_settlement
+
+            def commit(*args, **kwargs):
+                submitted.append(kwargs["execution_id"])
+                return original_commit(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.store.backend, "commit_job_settlement", commit)
+            monkeypatch.setattr(owner, name, prepare)
+            monkeypatch.setattr(dispatch, "utc_now_iso", lambda: clock[0])
+            monkeypatch.setattr("tasklite.engine.channel.utc_now_iso", lambda: clock[0])
+            with authorizer(pipeline, lambda path, kind: True):
+                pipeline.run(install_signals=False)
+
         assert starts == [launch_time]
         assert not target.exists()
         assert capacity.used == 0

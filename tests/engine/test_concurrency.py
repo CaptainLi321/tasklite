@@ -17,8 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from tasklite import Job, TaskLite, TaskResult
+from tasklite import Job, StateSnapshot, TaskLite, TaskResult
 from tasklite.resource import CapacityResource
+from tasklite.testing import in_process_workers
 
 PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
 
@@ -136,7 +137,8 @@ def test_task_default_resources_limit_real_workers(tmp_state_dir):
 
     def run_pipeline() -> None:
         try:
-            pipeline.run(install_signals=False)
+            with in_process_workers(pipeline):
+                pipeline.run(install_signals=False)
         except BaseException as exc:
             errors.append(exc)
 
@@ -180,7 +182,8 @@ def test_three_jobs_run_concurrently(tmp_state_dir):
 
     def run_pipeline() -> None:
         try:
-            pipeline.run(install_signals=False)
+            with in_process_workers(pipeline):
+                pipeline.run(install_signals=False)
         except BaseException as exc:
             errors.append(exc)
 
@@ -226,7 +229,8 @@ def test_workers_resource_limits_concurrency(tmp_state_dir):
 
     def run_pipeline() -> None:
         try:
-            pipeline.run(install_signals=False)
+            with in_process_workers(pipeline):
+                pipeline.run(install_signals=False)
         except BaseException as exc:
             errors.append(exc)
 
@@ -262,25 +266,23 @@ def test_dependency_chain_under_concurrency(tmp_state_dir):
     started_at 不得早于上游 finished_at）。
     """
     pipeline = TaskLite(
-        backend="sqlite",
-        state_path=tmp_state_dir / "test_dep_chain.db",
+        backend="memory",
         max_workers=3,
     )
     pipeline.register_task("fast", fast_handler)
     pipeline.enqueue(Job("fast", "A"))
     pipeline.enqueue(Job("fast", "B", depends_on=["fast::A"]))
     pipeline.enqueue(Job("fast", "C", depends_on=["fast::B"]))
-    pipeline.run()
+    with in_process_workers(pipeline):
+        pipeline.run(install_signals=False)
 
-    successes = pipeline._runtime.store.backend.load_successes()
-    assert "fast::A" in successes
-    assert "fast::B" in successes
-    assert "fast::C" in successes
-
-    traces = {
-        uid: pipeline._runtime.store.backend.load_settled_attempts(uid)[0]
-        for uid in ("fast::A", "fast::B", "fast::C")
-    }
+    with StateSnapshot.open(pipeline) as snap:
+        for uid in ("fast::A", "fast::B", "fast::C"):
+            assert snap.get_job(uid)["status"] == "succeeded"
+        traces = {
+            uid: next(iter(snap.iter_attempts(job_uid=uid)))
+            for uid in ("fast::A", "fast::B", "fast::C")
+        }
     assert traces["fast::A"]["settled_at"] <= traces["fast::B"]["started_at"], (
         "B 必须在 A 终态提交之后才开始执行"
     )
@@ -316,7 +318,8 @@ def test_resource_capacity_respected_under_concurrency(tmp_state_dir):
 
     def run_pipeline() -> None:
         try:
-            pipeline.run(install_signals=False)
+            with in_process_workers(pipeline):
+                pipeline.run(install_signals=False)
         except BaseException as exc:
             errors.append(exc)
 
