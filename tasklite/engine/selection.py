@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from ..exceptions import TaskLiteError
 from ..models.job import Job
 from ..selection import Exclude
+from .session import RunSession
 
 if TYPE_CHECKING:
     from .store import StateStore
@@ -62,40 +63,44 @@ class SelectionMachine:
         store: StateStore,
         *,
         exclude: Exclude | None = None,
+        session: RunSession | None = None,
     ):
         self._store = store
-        self._exclude: Exclude | None = exclude
-        self._temporary_excluded_uids: set[str] = set()
+        if session is not None:
+            self._session = session
+        elif exclude is not None:
+            self._session = RunSession()
+            self._session.exclude = exclude
+        else:
+            self._session = store.session
 
     @property
     def is_active(self) -> bool:
-        return self._exclude is not None or bool(self._temporary_excluded_uids)
+        return (
+            self._session.exclude is not None
+            or bool(self._session.temporary_excluded_uids)
+        )
 
     def set_exclusions(
         self,
         exclude: Exclude | None,
         temporary_uids: set[str] | None = None,
     ) -> None:
-        self._exclude = exclude
+        self._session.exclude = exclude
         if temporary_uids is not None:
-            self._temporary_excluded_uids = set(temporary_uids)
+            self._session.temporary_excluded_uids = set(temporary_uids)
 
     def temporarily_exclude(self, job_uid: str) -> None:
         """内部排除入口：登记单个临时排除 UID（供授权拒绝等复用）。"""
-        self._temporary_excluded_uids.add(job_uid)
+        self._session.temporarily_exclude(job_uid)
 
     def is_excluded(self, job_uid: str, task_type: str) -> bool:
         """判断作业是否被排除（用户 exclude 或运行期临时排除）。"""
-        if job_uid in self._temporary_excluded_uids:
-            return True
-        if self._exclude is not None and self._exclude.matches_task_type(task_type):
-            return True
-        return False
+        return self._session.is_excluded(job_uid, task_type)
 
     def reset_run(self, exclude: Exclude | None = None) -> None:
         """每 run 开始时复位运行期状态。"""
-        self._exclude = exclude
-        self._temporary_excluded_uids.clear()
+        self._session.clear_exclusions(exclude)
 
     def partition_standstill(self) -> SelectionStandstill | None:
         """以 Kahn 入度消减剥离选择停摆：区分真死锁与「仅被排除阻塞」。

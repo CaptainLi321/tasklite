@@ -12,7 +12,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .base import (
     AbstractStateBackend,
@@ -77,42 +77,6 @@ class InMemoryStateBackend(AbstractStateBackend):
                 public_queue_snapshot(j)
                 for j in self._queue if j.get("status", "pending") == "pending"
             ]
-
-    # 整表重写 -------------------------------------------------------
-
-    def _dedup_copy(self, job_snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """整表替换行的单一出口（save_queue 与 replace_queue_atomic 共用）。
-
-        替换集先经 ``validate_queue_replacement`` 校验（与 SQLite 腿同一
-        出口、同一时机——赋值之前 fail-loud，``_queue`` 保持调用前状态）。
-        保存兜底去重：重复 uid 保留首条 + 告警，与 SQLite 腿
-        ``_rewrite_queue_rows`` 同语义；条目一律 deepcopy，杜绝外部可变
-        别名穿透快照隔离。
-        """
-        validate_queue_replacement(job_snapshots)
-        seen: set[str] = set()
-        clean: list[dict[str, Any]] = []
-        for j in job_snapshots:
-            u = job_uid_from_snapshot(j)
-            if u in seen:
-                logger.warning(f"save_queue: duplicate uid {u} dropped (kept first).")
-                continue
-            seen.add(u)
-            clean.append(copy.deepcopy(j))
-        return clean
-
-    def save_queue(self, job_snapshots: list[dict[str, Any]]) -> None:
-        with self._lock:
-            self._queue = self._dedup_copy(job_snapshots)
-
-    def replace_queue_atomic(
-        self,
-        compute: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
-    ) -> None:
-        with self._lock:
-            # 锁内读真相 → 纯计算 → 替换：compute 抛异常时 _queue 赋值
-            # 未发生，队列保持调用前状态（对齐 SQLite 腿事务回滚）。
-            self._queue = self._dedup_copy(compute(copy.deepcopy(self._queue)))
 
     # delta 提交 -----------------------------------------------------
 
@@ -186,39 +150,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 self._queue.extend(fresh)
             return [job_uid_from_snapshot(j) for j in fresh]
 
-    # 定向删除与种子 --------------------------------------------------
-
-    def delete_queue_uids(self, job_uids: list[str]) -> int:
-        """按 uid 定向批量删除队列条目，与 SQLite 腿同语义：不触碰其余条目。"""
-        if not job_uids:
-            return 0
-        with self._lock:
-            del_set = set(job_uids)
-            kept = [j for j in self._queue if job_uid_from_snapshot(j) not in del_set]
-            removed = len(self._queue) - len(kept)
-            self._queue = kept
-            return removed
-
-    def delete_failed(self, job_uids: list[str]) -> int:
-        with self._lock:
-            del_set = set(job_uids)
-            count = 0
-            for u in del_set:
-                if u in self._failed:
-                    del self._failed[u]
-                    self._failure_payloads.pop(u, None)
-                    count += 1
-            return count
-
-    def delete_successes(self, job_uids: list[str]) -> int:
-        with self._lock:
-            del_set = set(job_uids)
-            count = 0
-            for u in del_set:
-                if u in self._successes:
-                    del self._successes[u]
-                    count += 1
-            return count
+    # 管理写与查询 --------------------------------------------------
 
     def apply_manual_status(
         self,
@@ -430,14 +362,16 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             return self._job_sequences.get(job_uid, 0)
 
-    def clear_attempts(self, job_uid: str) -> int:
+    def load_consistent_snapshot(self) -> dict[str, Any]:
+        """在单锁内原子捕获一致内存状态快照供 StateSnapshot 只读查询。"""
         with self._lock:
-            initial = len(self._attempts)
-            self._attempts = {
-                k: v for k, v in self._attempts.items()
-                if v.get("job_uid") != job_uid
+            return {
+                "queue_jobs": self.load_queue_jobs(),
+                "successes": self.load_successes(),
+                "failed": self.load_failed(),
+                "failure_payloads": self.load_failure_payloads(),
+                "attempts": [copy.deepcopy(att) for att in self._attempts.values()],
             }
-            return initial - len(self._attempts)
 
     def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
         with self._lock:

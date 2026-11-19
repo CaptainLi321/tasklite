@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     from .completion import CompletionMachine
     from .files import FileSpecResolver
     from .in_flight import InFlightTracker
-    from .recovery import RecoveryOrchestrator
     from .resource import ResourceManager
     from .scheduler import JobScheduler
     from .store import StateStore
@@ -104,7 +103,6 @@ class DispatchMachine:
         channel: "ExecutionChannel",
         in_flight: "InFlightTracker",
         session: "RunSession",
-        recovery: "RecoveryOrchestrator",
         completion: "CompletionMachine",
         tasks: "TaskSource",
         protected_roots: tuple[Path, ...] = (),
@@ -118,7 +116,6 @@ class DispatchMachine:
         self._channel = channel
         self._in_flight = in_flight
         self._session = session
-        self._recovery = recovery
         self._completion = completion
         self._tasks = tasks
         self._protected_roots = protected_roots
@@ -182,7 +179,6 @@ class DispatchMachine:
                                 "traceback": traceback.format_exc(),
                             },
                         },
-                        count_as="failed",
                     )
                     return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
                 authorized = store.check_or_request_authorization(path)
@@ -195,7 +191,7 @@ class DispatchMachine:
                         worker_wait=AUTHORIZATION_RECHECK_SECONDS,
                     )
                 if authorized is False:
-                    self._session.temporarily_exclude_chain(pending_uid)
+                    self._session.temporarily_exclude_chain(pending_uid, store.state)
                     return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
 
         sched = self._scheduler.scan_next_runnable(store.state, store.state.in_flight_uids)
@@ -280,7 +276,6 @@ class DispatchMachine:
                             "traceback": traceback.format_exc(),
                         },
                     },
-                    count_as="failed",
                 )
                 return None
 
@@ -314,7 +309,7 @@ class DispatchMachine:
                     self._authorization_pending = (self._session.run_id, job_uid, fname)
                     return None
                 if authorized is False:
-                    self._session.temporarily_exclude_chain(job_uid)
+                    self._session.temporarily_exclude_chain(job_uid, store.state)
                     return None
 
         # 再次检查全部资源（授权后的全部资源检查到连续获取完成之间，不插入其他分配或回收）
@@ -327,7 +322,6 @@ class DispatchMachine:
                 job_uid,
                 job_snapshot,
                 {"error_message": 'Resource requirements cannot be satisfied', "error_details": eval_res.reason},
-                count_as="failed",
             )
             return None
         if not eval_res.is_available:
@@ -486,7 +480,7 @@ class DispatchMachine:
         # 依赖父失败的级联下游计入 cascade_failed 而非 failed——
         # 「真实业务失败率」统计不被级联稀释。
         self._reject_and_commit(
-            job_uid, job_snapshot, failure_metadata, count_as="cascade_failed"
+            job_uid, job_snapshot, failure_metadata
         )
         return True
 
@@ -511,7 +505,6 @@ class DispatchMachine:
             job_uid,
             job_snapshot,
             failure_metadata,
-            count_as="failed",
         )
         return True
 
@@ -680,13 +673,10 @@ class DispatchMachine:
         job_uid: str,
         job_snapshot: dict,
         meta: dict,
-        *,
-        count_as: str = "failed",
     ) -> None:
         """执行前拒绝统一登记失败；事务异常原样传播。"""
         self._store.apply_failure(
-            job_uid, meta, job_snapshot=job_snapshot, count_as=count_as,
-            cascade=True,
+            job_uid, meta, job_snapshot=job_snapshot, cascade=True,
         )
 
 

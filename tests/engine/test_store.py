@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-
 import pytest
 
 from tasklite import TaskLiteError
@@ -14,7 +12,6 @@ from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import TriggerRegistry
 from tasklite.engine.store import (
     BulkFailureOutcome,
-    FailureEntry,
     FailureOutcome,
     RetryOutcome,
     SkipOutcome,
@@ -135,7 +132,6 @@ class TestApplySuccess:
         assert store.state.cursors["batch_pos"] == "100"
         assert "old_cursor" not in store.state.cursors
         assert [jd["job_id"] for jd in store.state.queue] == ["c1", "c2"]
-        assert store.stats is None  # 未注入统计不炸
 
     def test_declared_inputs_deduped_preserving_order(self):
         store, _, backend = _make_store()
@@ -169,7 +165,7 @@ class TestTrustedLastSucceededAtUs:
         # 模拟清空 successes 历史后人工种子
         state.discard_success("t::1")
         assert store.trusted_last_succeeded_at_us("t::1") is None
-        state.add_success("t::1", {})
+        state.mark_success("t::1", {})
         assert store.trusted_last_succeeded_at_us("t::1") is None
 
 
@@ -247,9 +243,8 @@ class TestApplyRetry:
     def _retry_job_snapshot(self) -> dict:
         return Job._restore("t", "1", attempt_no=2).to_dict()
 
-    def test_commit_path_requeues_front_and_records_stats(self):
-        stats = defaultdict(int)
-        store, state, _ = _make_store(stats=stats)
+    def test_commit_path_requeues_front(self):
+        store, state, _ = _make_store()
         state.replace_queue([])
         store.state.register_in_flight("t::1")
 
@@ -265,19 +260,17 @@ class TestApplyRetry:
         assert isinstance(outcome, RetryOutcome)
         assert store.state.queue[0]["job_id"] == "1"
         assert "t::1" not in store.state.in_flight_uids
-        assert stats["retried"] == 1
 
 
 class TestApplySkip:
     """apply_skip 去重跳过。"""
 
     @pytest.mark.parametrize("dispatched", [False, True])
-    def test_skip_records_stat_and_clears_queue(self, dispatched):
-        stats = defaultdict(int)
+    def test_skip_clears_queue(self, dispatched):
         backend = InMemoryStateBackend()
-        backend.save_queue([{"task_type": "t", "job_id": "1"}])
+        backend.enqueue_jobs([{"task_type": "t", "job_id": "1"}])
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
-        store = StateStore(backend, state, stats=stats)
+        store = StateStore(backend, state)
         if dispatched:
             state.pop_job(0)
 
@@ -285,7 +278,6 @@ class TestApplySkip:
 
         assert isinstance(outcome, SkipOutcome)
         assert outcome.was_known is True
-        assert stats["skipped"] == 1
         assert store.state.is_empty
         assert backend.load_queue() == []
 
@@ -296,7 +288,7 @@ class TestApplySkip:
         state.register_in_flight("t::running")
         pending = Job("t", "skip").to_dict()
         state.spawn_jobs([pending])
-        backend.save_queue([pending])
+        backend.enqueue_jobs([pending])
 
         store.apply_skip("t::skip", job_snapshot=pending)
 
@@ -308,12 +300,11 @@ class TestApplySkip:
         backend = InMemoryStateBackend()
         failing = CommitFailureBackend(backend, failing=("commit_skip",))
         state = PipelineState({}, {}, {}, [{"task_type": "t", "job_id": "1"}])
-        store = StateStore(failing, state, stats={})
+        store = StateStore(failing, state)
         with pytest.raises(OSError, match="候选移除事务失败"):
             store.apply_skip("t::1")
         assert "t::1" in state.queue_uids
         assert state.failed == {}
-        assert store.stats == {}
 
 
 class TestMarkFailedMemoryContract:
@@ -336,7 +327,7 @@ class TestMarkFailedMemoryContract:
 
     def test_failed_takes_over_from_wall(self):
         store, state, _ = _make_store()
-        state.add_success("encode::a", {"prev": "ok"})
+        state.mark_success("encode::a", {"prev": "ok"})
         store.mark_failed_memory("encode::a", {"error_message": "boom"})
         assert "encode::a" in state.failed_uids
         assert "encode::a" not in state.success_uids
@@ -381,7 +372,7 @@ class TestApplyBulkFailure:
         failing = CommitFailureBackend(backend, failing=("commit_job_failures",))
         job = Job("child", "one", depends_on=["parent::one"]).to_dict()
         state = PipelineState({}, {}, {}, [job])
-        store = StateStore(failing, state, stats={})
+        store = StateStore(failing, state)
         with pytest.raises(OSError, match="批量事务写入失败"):
             if operation == "bulk":
                 store.apply_bulk_failure([("child::one", {"error_message": "deadlock"})])
@@ -389,7 +380,6 @@ class TestApplyBulkFailure:
                 store.cascade_fail("parent::one")
         assert state.queue == [job]
         assert state.failed == {}
-        assert store.stats == {}
 
 
 class TestIntakePipeline:
@@ -417,6 +407,18 @@ class TestIntakePipeline:
         job.payload["bad"] = object()
         with pytest.raises(TaskLiteError, match="payload.bad"):
             store.enqueue_job(job)
+
+    def test_enqueue_job_syncs_memory_queue_with_backend(self):
+        store = StateStore(
+            InMemoryStateBackend(),
+            PipelineState({}, {}, {}, []),
+            trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
+        )
+        assert store.enqueue_job(Job("t", "first")) is True
+        assert store.enqueue_job(Job("t", "first")) is False
+        assert [row["job_id"] for row in store.state.queue] == ["first"]
+        assert store.state.queue_uids == {"t::first"}
+        assert [row["job_id"] for row in store.backend.load_queue()] == ["first"]
 
     def test_enqueue_rejects_non_job(self):
         store, _, _ = _make_store()
@@ -566,25 +568,6 @@ class TestSnapshotAndMembership:
         new_backend = InMemoryStateBackend()
         store.set_backend(new_backend)
         assert store.backend is new_backend
-
-
-class TestFailureEntryShape:
-    """FailureEntry 数据类形状（运维查询面 4e 的载荷契约）。"""
-
-    def test_frozen_shape(self):
-        entry = FailureEntry(
-            job_uid="t::1", error_message="boom", metadata={"error_message": "boom"}, payload={"k": 1}
-        )
-        assert entry.job_uid == "t::1"
-        assert entry.error_message == "boom"
-        assert entry.metadata == {"error_message": "boom"}
-        assert entry.payload == {"k": 1}
-        with pytest.raises(Exception):
-            entry.job_uid = "t::2"  # type: ignore[misc]
-
-    def test_payload_defaults_none(self):
-        entry = FailureEntry(job_uid="t::1", error_message="x", metadata={})
-        assert entry.payload is None
 
 
 # ── successes/failed 互斥性质（hypothesis 任意操作序列）─────────────────────

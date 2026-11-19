@@ -524,7 +524,7 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
         "target_task::t1",
         "middle::m1",
         "leaf::l1",
-    } <= p._runtime._temporary_excluded_uids
+    } <= p._runtime.session.temporary_excluded_uids
     assert {
         "target_task::t1",
         "middle::m1",
@@ -641,7 +641,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
     assert attempt["outcome"] == "failure"
     assert "authorization wait stopped for" in attempt["error_message"]
     assert attempt["result"]["annotations"]["authorization_status"] == "stopped"
-    assert "waiting::w1" not in p._runtime._temporary_excluded_uids
+    assert "waiting::w1" not in p._runtime.session.temporary_excluded_uids
     assert p._runtime.session.retry_counts.get("waiting::w1", 0) == 0
     assert p._runtime.in_flight.active_handles() == []
     assert any(
@@ -719,7 +719,7 @@ def test_changed_dynamic_target_cannot_use_prior_wait_to_bypass_protection(
     assert "symlink" in failure["error_message"]
     attempt, = p._runtime.store.backend.load_settled_attempts("work::one")
     assert attempt["outcome"] == "failure"
-    assert "work::one" not in p._runtime._temporary_excluded_uids
+    assert "work::one" not in p._runtime.session.temporary_excluded_uids
     p.close()
 
 

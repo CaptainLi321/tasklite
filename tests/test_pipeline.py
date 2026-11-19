@@ -89,12 +89,6 @@ class DelegatingFakeBackend(AbstractStateBackend):
     def load_known_job_snapshots(self, *args, **kwargs):
         return self.inner.load_known_job_snapshots(*args, **kwargs)
 
-    def save_queue(self, *args, **kwargs):
-        return self.inner.save_queue(*args, **kwargs)
-
-    def replace_queue_atomic(self, *args, **kwargs):
-        return self.inner.replace_queue_atomic(*args, **kwargs)
-
     def commit_job_failure(self, *args, **kwargs):
         return self.inner.commit_job_failure(*args, **kwargs)
 
@@ -106,15 +100,6 @@ class DelegatingFakeBackend(AbstractStateBackend):
 
     def enqueue_jobs(self, *args, **kwargs):
         return self.inner.enqueue_jobs(*args, **kwargs)
-
-    def delete_queue_uids(self, *args, **kwargs):
-        return self.inner.delete_queue_uids(*args, **kwargs)
-
-    def delete_failed(self, *args, **kwargs):
-        return self.inner.delete_failed(*args, **kwargs)
-
-    def delete_successes(self, *args, **kwargs):
-        return self.inner.delete_successes(*args, **kwargs)
 
     def apply_manual_status(self, *args, **kwargs):
         return self.inner.apply_manual_status(*args, **kwargs)
@@ -148,9 +133,6 @@ class DelegatingFakeBackend(AbstractStateBackend):
 
     def load_settled_attempts(self, *args, **kwargs):
         return self.inner.load_settled_attempts(*args, **kwargs)
-
-    def clear_attempts(self, *args, **kwargs):
-        return self.inner.clear_attempts(*args, **kwargs)
 
     def load_queue_jobs(self, *args, **kwargs):
         return self.inner.load_queue_jobs(*args, **kwargs)

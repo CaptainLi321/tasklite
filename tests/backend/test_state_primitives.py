@@ -114,7 +114,8 @@ class TestStatePrimitivesParity:
             started_at=started_at,
         )
         running_job[QUEUE_EXECUTION_ID_KEY] = "run.1"
-        v6_backend.save_queue([
+        v6_backend.commit_skip(uid)
+        v6_backend.enqueue_jobs([
             running_job,
         ])
         before = _state_facts(v6_backend)
@@ -344,10 +345,8 @@ class TestAttemptSequenceIndependence:
         assert job_uid in b.load_successes()
 
         # 2. 清除档案与轨迹
-        deleted_succ = b.delete_successes([job_uid])
-        assert deleted_succ == 1
-        cleared_att = b.clear_attempts(job_uid)
-        assert cleared_att == 1
+        cleared = b.clear_history(job_uid, {"successes", "attempts"})
+        assert cleared == 2
 
         # 确认档案与轨迹完全清空
         assert job_uid not in b.load_successes()

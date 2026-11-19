@@ -5,7 +5,6 @@ from __future__ import annotations
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
 from tasklite.engine.resource import (
     CapacityResource,
-    NullResourceLease,
     ResourceManager,
 )
 from tasklite.engine.types import JobHandle
@@ -197,15 +196,11 @@ class TestInFlightTrackerResourceRelease:
         assert gpu.used == 0.0
         assert gpu.release_overruns == 0, "二次释放不得记为超量（幂等归还）"
 
-    def test_pseudo_entry_has_null_lease_and_safe_release(self):
+    def test_pseudo_entry_safe_release(self):
         job = Job("t", "j1")
         pseudo = InFlightTracker.create_pseudo_entry("t::j1", job.to_dict(), job)
-        assert isinstance(pseudo.lease, NullResourceLease)
-        assert pseudo.lease.acquired == []
+        assert pseudo.is_pseudo
         assert pseudo.acquired == []
-        # release / claim / cancel 均为安全 no-op
-        pseudo.lease.claim()
-        pseudo.lease.cancel()
         pseudo.release_resources()
         assert pseudo.acquired == []
 

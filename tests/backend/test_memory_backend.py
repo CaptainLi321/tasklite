@@ -152,12 +152,6 @@ class TestInMemoryBackendContract:
         assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::live"]
         assert b.load_successes() == {} and b.load_failed() == {}
 
-    def test_delete_queue_uids_targeted(self):
-        b = InMemoryStateBackend()
-        b.enqueue_jobs([_job_snapshot(j) for j in ("a", "b", "c")])
-        assert b.delete_queue_uids(["t::a", "t::c", "t::ghost"]) == 2
-        assert [job_uid_from_snapshot(j) for j in b.load_queue()] == ["t::b"]
-
 
 class TestMemoryFailureArchive:
     """失败档案 API：带外登记、payload 快照、定向清除、互删语义。"""
@@ -191,21 +185,6 @@ class TestMemoryFailureArchive:
         b = InMemoryStateBackend()
         b.commit_job_failure("t::other", {"error_message": "x"})
         assert b.load_failure_payloads() == {}
-
-    def test_delete_failed_clears_meta_and_snapshot(self):
-        b = InMemoryStateBackend()
-        b.commit_job_failure("t::one", {"error_message": "x"}, payload={"k": 1})
-        b.commit_job_failure("t::two", {"error_message": "y"})
-        assert b.delete_failed(["t::one", "t::ghost"]) == 1
-        assert b.load_failed() == {"t::two": {"error_message": "y"}}
-        assert b.load_failure_payloads() == {}
-
-    def test_delete_wall_targeted(self):
-        b = InMemoryStateBackend()
-        _settle_success(b, "t::one", {"ok": True})
-        _settle_success(b, "t::two", {"ok": True})
-        assert b.delete_successes(["t::one", "t::ghost"]) == 1
-        assert set(b.load_successes()) == {"t::two"}
 
     def test_success_commit_deletes_failed_same_uid(self):
         """最终状态唯一：成功 commit 删失败档案同名行（含快照）。"""

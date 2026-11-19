@@ -52,7 +52,6 @@ from ..models.artifact import (
 )
 from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
-from ..selection import Exclude
 from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
 
 logger = logging.getLogger("tasklite")
@@ -83,14 +82,16 @@ class EngineRuntime:
     def __init__(self, config: RunConfig) -> None:
         self.config = config
         self.tasks = config.tasks
-        self.scheduler = JobScheduler(
-            resources=config.resources, ordering_policy=config.ordering_policy
-        )
         self.governor = config.governor
 
         # 持久会话：execute() 经 begin() 复位（语义等价于每次新建会话，
         # 同时保证机器持有的 session 引用跨 run 稳定）。
         self._session = RunSession()
+        self.scheduler = JobScheduler(
+            resources=config.resources,
+            ordering_policy=config.ordering_policy,
+            session=self._session,
+        )
 
         # 构造期即建 StateStore（enqueue 与管理写操作在 run 前可用）。
         # backend 所有权唯一锚定 StateStore（RunConfig.backend 仅为构造
@@ -100,16 +101,16 @@ class EngineRuntime:
             trigger_registry=config.trigger_registry,
             requeue_policy=config.requeue_policy,
             protected_roots=config.protected_roots,
+            session=self._session,
         )
 
         self.channel: ExecutionChannel = config.channel
         self._in_flight: InFlightTracker = InFlightTracker()
         self._notifier: RunNotifier = RunNotifier()
 
-        # 构建机器依赖拓扑（recovery 依赖 completion；dispatch 依赖 recovery）
+        # 构建机器依赖拓扑（recovery 依赖 completion）
         self._completion = CompletionMachine(
             store=self.store,
-            trigger_registry=config.trigger_registry,
             channel=self.channel,
             resources=config.resources,
             in_flight=self._in_flight,
@@ -132,7 +133,6 @@ class EngineRuntime:
             channel=self.channel,
             in_flight=self._in_flight,
             session=self._session,
-            recovery=self._recovery,
             completion=self._completion,
             tasks=config.tasks,
             protected_roots=config.protected_roots,
@@ -141,25 +141,11 @@ class EngineRuntime:
         )
 
         self._is_running: bool = False
-        self._exclude: Exclude | None = None
-        self._temporary_excluded_uids: set[str] = set()
-        self.selection_machine: SelectionMachine = SelectionMachine(self.store)
+        self.selection_machine: SelectionMachine = SelectionMachine(
+            self.store, session=self._session
+        )
         self.channel.set_declaration_handler(self._handle_declaration)
         self.channel.set_wakeup_callback(self._notifier.notify)
-        self._session.bind_exclude_chain_handler(self.temporarily_exclude_chain)
-
-    def temporarily_exclude(self, job_uid: str) -> None:
-        """内部排除入口：登记单个临时排除 UID（供授权拒绝等复用）。"""
-        self._temporary_excluded_uids.add(job_uid)
-        self.scheduler.temporarily_exclude(job_uid)
-        self.store.temporarily_exclude(job_uid)
-        self.selection_machine.temporarily_exclude(job_uid)
-
-    def temporarily_exclude_chain(self, job_uid: str) -> None:
-        """临时排除指定作业及其所有直接和间接下游作业。"""
-        self.temporarily_exclude(job_uid)
-        for down_uid in self.store.state.find_all_downstream(job_uid):
-            self.temporarily_exclude(down_uid)
 
     def _handle_declaration(
         self, handle: JobHandle, payload: dict[str, Any]
@@ -438,14 +424,6 @@ class EngineRuntime:
             "resolved_path": request.resolved_path,
         }
 
-    def is_job_excluded(self, job_uid: str, task_type: str) -> bool:
-        """统一判断作业是否被排除（用户 exclude 规则或运行期临时排除）。"""
-        if job_uid in self._temporary_excluded_uids:
-            return True
-        if self._exclude is not None and self._exclude.matches_task_type(task_type):
-            return True
-        return False
-
     @property
     def session(self) -> RunSession:
         return self._session
@@ -509,11 +487,7 @@ class EngineRuntime:
         old_sigterm = None
         old_sigint = None
         try:
-            self._exclude = opts.exclude
-            self._temporary_excluded_uids.clear()
             self.scheduler.reset_run(opts.exclude)
-            self.store.set_run_exclusions(opts.exclude, self._temporary_excluded_uids)
-            self.selection_machine.set_exclusions(opts.exclude, self._temporary_excluded_uids)
 
             with exclusive_state_access(self.store.backend):
                 try:

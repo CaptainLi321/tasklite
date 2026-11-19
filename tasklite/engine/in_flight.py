@@ -31,7 +31,6 @@ if TYPE_CHECKING:
         def unregister_in_flight(self, job_uid: str) -> None: ...
 
 from ..models.job import Job
-from .resource import NullResourceLease, ResourceLease
 from .types import JobHandle
 
 
@@ -39,7 +38,7 @@ from .types import JobHandle
 class InFlightJob:
     """已进入 running、尚未提交结果的执行上下文。
 
-    资源租约或 acquired 列表由 release_resources 幂等归还。
+    acquired 列表由 release_resources 幂等归还。
     handle 为 None 时没有 worker，可携带前置操作失败时已获取的资源；
     有 worker 时以 started_monotonic 和句柄期限驱动超时判定。
     """
@@ -50,7 +49,6 @@ class InFlightJob:
     acquired: list[tuple[str, float]] = field(default_factory=list)
     handle: JobHandle | None = None
     started_monotonic: float | None = None
-    lease: ResourceLease | None = None
     # 完整执行身份随 running 登记，结算时用于追加 Attempt。
     execution_id: str | None = None
     attempt_no: int = 1
@@ -60,24 +58,14 @@ class InFlightJob:
     active_files: dict[str, Any] = field(default_factory=dict)
     active_file_sources: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        if self.lease is None:
-            if not self.acquired:
-                self.lease = NullResourceLease(job_uid=self.job_uid)
-        elif not self.acquired:
-            self.acquired = list(self.lease.acquired)
-
     @property
     def is_pseudo(self) -> bool:
         """是否没有关联的 worker 句柄。"""
         return self.handle is None
 
     def release_resources(self, resource_mgr: ResourceManager | None = None) -> None:
-        """释放关联的资源租约或 acquired 列表（幂等归还）。"""
-        if self.lease is not None:
-            self.lease.release()
-            self.acquired = []
-        elif self.acquired:
+        """释放关联的已获取资源列表（幂等归还）。"""
+        if self.acquired:
             acquired, self.acquired = self.acquired, []
             if resource_mgr is not None:
                 resource_mgr.release_all(acquired, job_uid=self.job_uid)
@@ -200,7 +188,6 @@ class InFlightTracker(MutableMapping[str, InFlightJob]):
             acquired=[],
             handle=None,
             started_monotonic=None,
-            lease=NullResourceLease(job_uid=job_uid),
         )
 
 

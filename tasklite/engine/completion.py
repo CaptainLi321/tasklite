@@ -18,10 +18,8 @@ from dataclasses import dataclass
 from typing import Any, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .admission import TriggerRegistry
     from .channel import ExecutionChannel
     from .session import RunSession
-    from .in_flight import InFlightTracker
     from .resource import ResourceManager
     from .store import StateStore
 
@@ -57,14 +55,12 @@ class CompletionMachine:
         self,
         *,
         store: "StateStore",
-        trigger_registry: "TriggerRegistry | None" = None,
         channel: "ExecutionChannel",
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
         session: "RunSession",
     ) -> None:
         self._store = store
-        self._trigger_registry = trigger_registry
         self._channel = channel
         self._resources = resources
         self._in_flight = in_flight
@@ -177,8 +173,8 @@ class CompletionMachine:
         """处理一个在飞作业的完成结果（唯一收尾出口）。
 
         事务性提交与内存 apply 见 ``apply_result``（两条提交路径共用）；
-        本方法额外负责在飞注销时机下推、资源释放、失败输出清理与收尾
-        钩子恰好一次。
+        本方法在提交成功后注销在途条目，资源释放在 ``apply_result``
+        内部恰好执行一次（提交前或异常兜底）。
 
         身份非真空：在飞注销**不在本方法开头**统一执行——那会造成
         「四集合真空」窗口（uid 不在 successes/failed/queue/in-flight 任一
@@ -190,26 +186,23 @@ class CompletionMachine:
         声明只在业务结算完成后删除；提交前异常保留声明以便诊断。
         """
         uid = entry.job_uid
-        try:
-            self.apply_result(
-                uid,
-                entry.job,
-                entry.job_snapshot,
-                result,
-                started_monotonic=entry.started_monotonic,
-                expect_in_flight=(entry.handle is not None),
-                execution_id=entry.execution_id if entry.execution_id is not None else (
-                    entry.handle.execution_id if entry.handle is not None else None
-                ),
-                attempt_no=entry.attempt_no,
-                run_id=entry.run_id or self._session.run_id,
-                started_at=entry.started_at,
-                entry=entry,
-                prepared=prepared,
-            )
-        finally:
-            # 资源释放（无论成功/失败/重试/崩溃，由 entry 自归还）
-            entry.release_resources(self._resources)
+        self.apply_result(
+            uid,
+            entry.job,
+            entry.job_snapshot,
+            result,
+            started_monotonic=entry.started_monotonic,
+            expect_in_flight=(entry.handle is not None),
+            execution_id=entry.execution_id if entry.execution_id is not None else (
+                entry.handle.execution_id if entry.handle is not None else None
+            ),
+            attempt_no=entry.attempt_no,
+            run_id=entry.run_id or self._session.run_id,
+            started_at=entry.started_at,
+            entry=entry,
+            prepared=prepared,
+        )
+        self._in_flight.settle(uid, state=self._store.state)
 
 
     def _prepare_completion(
@@ -310,97 +303,107 @@ class CompletionMachine:
                 f"at apply_result entry"
             )
 
-        if prepared is None:
-            prepared = self._prepare_completion(uid, job, result, entry)
-            if result.authorization_outcome is None:
-                self._authorize_cleanup(entry, result, prepared.active_files)
-        active_files = prepared.active_files
+        released = False
+        try:
+            if prepared is None:
+                prepared = self._prepare_completion(uid, job, result, entry)
+                if result.authorization_outcome is None:
+                    self._authorize_cleanup(entry, result, prepared.active_files)
+            active_files = prepared.active_files
 
-        authorization_outcome = result.authorization_outcome
-        if (
-            authorization_outcome is not None
-            and authorization_outcome.status
-            in (AuthorizationStatus.DENIED, AuthorizationStatus.STOPPED)
-        ):
-            # 不变式：资源释放先于 running 回退事务，Release 回调仍须观察 running。
-            if entry is not None:
-                entry.release_resources(self._resources)
-            self._store.apply_pending(
-                job_uid=uid,
-                job_snapshot=job_snapshot,
-                attempt_no=attempt_no,
-                execution_id=execution_id,
-                run_id=run_id or self._session.run_id,
-                started_at=started_at,
-                error_message=authorization_outcome.message,
-                files={k: v.to_dict() for k, v in active_files.items()},
-                result={
-                    "message": authorization_outcome.message,
-                    "exception": None,
-                    "metadata": {},
-                    "annotations": {
-                        "authorization_status": authorization_outcome.status.value,
-                        "path": authorization_outcome.path,
+            authorization_outcome = result.authorization_outcome
+            if (
+                authorization_outcome is not None
+                and authorization_outcome.status
+                in (AuthorizationStatus.DENIED, AuthorizationStatus.STOPPED)
+            ):
+                # 不变式：资源释放先于 running 回退事务，Release 回调仍须观察 running。
+                if entry is not None:
+                    released = True
+                    entry.release_resources(self._resources)
+                self._store.apply_pending(
+                    job_uid=uid,
+                    job_snapshot=job_snapshot,
+                    attempt_no=attempt_no,
+                    execution_id=execution_id,
+                    run_id=run_id or self._session.run_id,
+                    started_at=started_at,
+                    error_message=authorization_outcome.message,
+                    files={k: v.to_dict() for k, v in active_files.items()},
+                    result={
+                        "message": authorization_outcome.message,
+                        "exception": None,
+                        "metadata": {},
+                        "annotations": {
+                            "authorization_status": authorization_outcome.status.value,
+                            "path": authorization_outcome.path,
+                        },
                     },
-                },
-            )
-            if authorization_outcome.status is AuthorizationStatus.DENIED:
-                self._session.temporarily_exclude_chain(uid)
-            result.will_retry = False
-            return
+                )
+                if authorization_outcome.status is AuthorizationStatus.DENIED:
+                    self._session.temporarily_exclude_chain(uid, store.state)
+                result.will_retry = False
+                return
 
-        spawned_job_snapshots = prepared.spawned_job_snapshots
+            spawned_job_snapshots = prepared.spawned_job_snapshots
 
-        # 声明式产物主进程清理
-        if active_files:
-            policy = ArtifactPathPolicy(
-                protected_roots=self._channel.protected_roots,
-                authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
-            )
-            if result.success:
-                for fname, spec in active_files.items():
-                    if not (spec.delete_on_success and spec.path):
-                        continue
-                    declaration = ArtifactDeclaration(spec.path, delete_on_success=True)
-                    try:
-                        present = policy.entry_exists(declaration)
-                    except _CLEANUP_ERRORS as exc:
-                        result.success = False
-                        result.message = f"Success cleanup failed: {exc}"
-                        self._attach_cleanup_failure(result, exc)
-                        break
-                    if not present:
-                        continue
-                    try:
-                        policy.cleanup(declaration, success=True)
-                    except _CLEANUP_ERRORS as exc:
-                        result.success = False
-                        result.message = f"Success cleanup failed: {exc}"
-                        self._attach_cleanup_failure(result, exc)
-                        break
-                if not result.success:
-                    spawned_job_snapshots = []
-                    result.cursor_updates = {}
-            else:
-                for fname, spec in active_files.items():
-                    if not (spec.delete_on_failure and spec.path):
-                        continue
-                    declaration = ArtifactDeclaration(spec.path, delete_on_failure=True)
-                    try:
-                        present = policy.entry_exists(declaration)
-                    except _CLEANUP_ERRORS as exc:
-                        self._record_failure_cleanup_error(result, exc)
-                        continue
-                    if not present:
-                        continue
-                    try:
-                        policy.cleanup(declaration, success=False)
-                    except _CLEANUP_ERRORS as exc:
-                        self._record_failure_cleanup_error(result, exc)
+            # 声明式产物主进程清理
+            if active_files:
+                policy = ArtifactPathPolicy(
+                    protected_roots=self._channel.protected_roots,
+                    authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
+                )
+                if result.success:
+                    for fname, spec in active_files.items():
+                        if not (spec.delete_on_success and spec.path):
+                            continue
+                        declaration = ArtifactDeclaration(spec.path, delete_on_success=True)
+                        try:
+                            present = policy.entry_exists(declaration)
+                        except _CLEANUP_ERRORS as exc:
+                            result.success = False
+                            result.message = f"Success cleanup failed: {exc}"
+                            self._attach_cleanup_failure(result, exc)
+                            break
+                        if not present:
+                            continue
+                        try:
+                            policy.cleanup(declaration, success=True)
+                        except _CLEANUP_ERRORS as exc:
+                            result.success = False
+                            result.message = f"Success cleanup failed: {exc}"
+                            self._attach_cleanup_failure(result, exc)
+                            break
+                    if not result.success:
+                        spawned_job_snapshots = []
+                        result.cursor_updates = {}
+                else:
+                    for fname, spec in active_files.items():
+                        if not (spec.delete_on_failure and spec.path):
+                            continue
+                        declaration = ArtifactDeclaration(spec.path, delete_on_failure=True)
+                        try:
+                            present = policy.entry_exists(declaration)
+                        except _CLEANUP_ERRORS as exc:
+                            self._record_failure_cleanup_error(result, exc)
+                            continue
+                        if not present:
+                            continue
+                        try:
+                            policy.cleanup(declaration, success=False)
+                        except _CLEANUP_ERRORS as exc:
+                            self._record_failure_cleanup_error(result, exc)
 
-        # 释放资源（必须在事务提交之前完成）
-        if entry is not None:
-            entry.release_resources(self._resources)
+            # 释放资源（必须在事务提交之前完成）
+            if entry is not None:
+                released = True
+                entry.release_resources(self._resources)
+        except _CleanupAuthorizationPending:
+            raise
+        except BaseException:
+            if entry is not None and not released:
+                entry.release_resources(self._resources)
+            raise
 
         # 2. 状态分发
         if result.retry_requested:
@@ -729,7 +732,6 @@ class CompletionMachine:
             self.complete_job(entry, result, prepared=prepared)
             settled_count += 1
             self._pending_cleanup.pop(entry.job_uid, None)
-            self._in_flight.settle(entry.job_uid, state=store.state)
         return settled_count
 
     def settle_aborted(

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-
 from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
 from typing import Any
@@ -20,7 +18,6 @@ from tasklite.engine.dispatch import (
     DispatchOutcome,
 )
 from tasklite.engine.in_flight import InFlightTracker
-from tasklite.engine.recovery import RecoveryOrchestrator
 from tasklite.engine.resource import (
     CapacityResource,
     IntervalResource,
@@ -66,24 +63,14 @@ class DispatchEnv:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
-        self.stats = defaultdict(int)
         self.store = StateStore(
             self.backend,
             PipelineState({}, {}, {}, []),
-            stats=self.stats,
         )
         self.session = RunSession()
         self.session.begin("a" * 32)
         self.in_flight = InFlightTracker()
         self.channel = ExecutionChannel()
-        self.completion = RecordingCompletion()
-        self.recovery = RecoveryOrchestrator(
-            store=self.store,
-            channel=self.channel,
-            resources=self.resources,
-            in_flight=self.in_flight,
-            completion=self.completion,
-        )
         self.tasks = TaskRegistry()
         spawn_jobs = self.store.state.spawn_jobs
         def enqueue_pending(snapshots, *, front=False):
@@ -99,7 +86,6 @@ class DispatchEnv:
             channel=self.channel,
             in_flight=self.in_flight,
             session=self.session,
-            recovery=self.recovery,
             completion=CompletionMachine(
                 store=self.store, channel=self.channel, resources=self.resources,
                 in_flight=self.in_flight, session=self.session,
@@ -248,7 +234,6 @@ class TestDedupGate:
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert env.stats["skipped"] == 1
         assert "t::j1" not in env.store.state.queue_uids
         assert env.backend.load_settled_attempts("t::j1") == []
 
@@ -262,7 +247,6 @@ class TestRejectGates:
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert env.stats["failed"] == 1
         assert "ghost::j1" in env.store.state.failed
         assert env.store.state.failed["ghost::j1"]["error_message"] == 'No registered handler for task type'
         records = env.backend.load_settled_attempts("ghost::j1")
@@ -282,7 +266,6 @@ class TestRejectGates:
         )
         outcome = env.dispatch.dispatch_job(sched)
         assert outcome is None
-        assert env.stats["cascade_failed"] == 2
         assert env.store.state.failed["child::b"]["error_message"] == 'Dependency failed or has no record'
         assert env.store.state.failed["child::b"]["failed_dependency"] == "parent::a"
         assert env.store.state.failed["child::c"]["error_message"] == 'Dependency failed or has no record'
@@ -415,8 +398,6 @@ class TestGateOrderContract:
 
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-        assert env.stats["skipped"] == 0
-        assert env.stats["cascade_failed"] == 1
         assert "t::j1" in env.store.state.failed
 
 
@@ -468,7 +449,6 @@ class TestAdmissionEvaluationTiming:
             assert outcome.entry.job.attempt_no == 1
         else:
             assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
-            assert env.stats["skipped"] == 1
             assert "t::j1" not in env.store.state.queue_uids
 
 

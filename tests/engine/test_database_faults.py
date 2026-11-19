@@ -260,8 +260,7 @@ def test_candidate_transaction_fault_rolls_back_entire_batch(tmp_path, monkeypat
             for name in ("one", "two", "tail")]
     backend.enqueue_jobs(jobs)
     state = PipelineState(backend.load_successes(), backend.load_failed(), {}, backend.load_queue())
-    stats = {}
-    store = StateStore(backend, state, stats=stats)
+    store = StateStore(backend, state)
     with backend._get_conn() as connection:
         if fault_kind == "sqlite":
             action = ("BEFORE DELETE ON queue" if operation == "skip" else
@@ -295,7 +294,6 @@ def test_candidate_transaction_fault_rolls_back_entire_batch(tmp_path, monkeypat
     with backend._get_conn() as connection:
         assert list(connection.iterdump()) == before_disk
     assert _memory_facts(state) == before_memory
-    assert stats == {}
     assert all(backend.load_settled_attempts(f"work::{name}") == []
                    for name in ("one", "two", "tail"))
 

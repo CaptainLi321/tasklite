@@ -18,6 +18,7 @@ from ..models.job import Job
 from ..models.state import DependencyStatus, PipelineState, job_uid_from_snapshot
 from ..selection import Exclude
 from .resource import Resource, ResourceManager
+from .session import RunSession
 
 logger = logging.getLogger("tasklite")
 
@@ -175,6 +176,7 @@ class JobScheduler:
         tasks: Mapping[str, object] | None = None,
         *,
         ordering_policy: OrderingPolicy | None = None,
+        session: RunSession | None = None,
     ):
         if isinstance(resources, ResourceManager):
             self.resource_mgr = resources
@@ -183,42 +185,37 @@ class JobScheduler:
             self.resources = resources
             self.resource_mgr = ResourceManager(resources, tasks=tasks)
         self.ordering_policy: OrderingPolicy = ordering_policy if ordering_policy is not None else FifoOrderingPolicy()
-        self.exclude: Exclude | None = None
-        self._temporary_excluded_uids: set[str] = set()
+        self._session = session if session is not None else RunSession()
         self._job_cache: dict[tuple[str, str], JobFacts] = {}
         self._JOB_CACHE_MAX = 100_000
 
+    @property
+    def exclude(self) -> Exclude | None:
+        return self._session.exclude
+
+    @exclude.setter
+    def exclude(self, value: Exclude | None) -> None:
+        self._session.exclude = value
+
     def temporarily_exclude(self, job_uid: str) -> None:
         """内部排除入口：登记单个临时排除 UID（供授权拒绝等复用）。"""
-        self._temporary_excluded_uids.add(job_uid)
+        self._session.temporarily_exclude(job_uid)
 
     def clear_temporary_exclusions(self) -> None:
         """清空临时排除 UID 集合（每次 Run 启动时重置）。"""
-        self._temporary_excluded_uids.clear()
+        self._session.temporary_excluded_uids.clear()
 
     def is_job_excluded(self, job_uid: str, task_type: str) -> bool:
         """统一判断作业是否被排除（用户 exclude 规则或运行期临时排除）。"""
-        if job_uid in self._temporary_excluded_uids:
-            return True
-        if self.exclude is not None and self.exclude.matches_task_type(task_type):
-            return True
-        return False
+        return self._session.is_excluded(job_uid, task_type)
 
     def is_job_excluded_by_uid(self, job_uid: str) -> bool:
-        """按 UID 查询是否被排除（临时排除或根据 task_type 前缀比对 exclude 规则）。"""
-        if job_uid in self._temporary_excluded_uids:
-            return True
-        if self.exclude is None:
-            return False
-        parts = job_uid.split("::", 1)
-        if len(parts) == 2:
-            return self.exclude.matches_task_type(parts[0])
-        return False
+        """按 UID 查询是否被排除（临时排除或根据解码后的 task_type 比对 exclude 规则）。"""
+        return self._session.is_excluded_by_uid(job_uid)
 
     def reset_run(self, exclude: Exclude | None = None) -> None:
         """Run 生命周期重置：固化排除规则并清空临时排除与调度缓存。"""
-        self.exclude = exclude
-        self._temporary_excluded_uids.clear()
+        self._session.clear_exclusions(exclude)
         self.begin_round()
 
     def begin_round(self) -> None:

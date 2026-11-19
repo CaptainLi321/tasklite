@@ -186,8 +186,8 @@ class TestTerminalRecords:
 
     def test_ops_seams_idempotent(self):
         st = PipelineState({}, {}, {}, [])
-        st.add_success("t::w", {})
-        st.add_success("t::w", {"again": True})
+        st.mark_success("t::w", {})
+        st.mark_success("t::w", {"again": True})
         assert st.successes["t::w"] == {"again": True}
         st.discard_success("t::w")
         st.discard_success("t::w")  # 幂等

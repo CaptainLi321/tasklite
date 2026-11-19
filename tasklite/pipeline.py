@@ -21,7 +21,6 @@ from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig
 from .engine.execution_access import exclusive_state_access
 from .engine.governor import DeadlockGovernor
-from .engine.ops import OpsConsole
 from .engine.resource import CapacityResource, ResourceManager, adapt_resource
 from .resource import (
     CapacityResource as PublicCapacityResource,
@@ -110,7 +109,6 @@ class TaskLite:
             )
             self._runtime_config = self._build_run_config(self._backend_handle)
             self._runtime = EngineRuntime(config=self._runtime_config)
-            self._console = OpsConsole(self._runtime.store)
         except BaseException:
             self._cleanup_failed_init()
             raise
@@ -361,7 +359,7 @@ class TaskLite:
         """从指定档案和/或 Attempt 历史中删除单个 job 的记录，限 Run 外。"""
         self._ensure_active("clear_history")
         with exclusive_state_access(self._runtime.store.backend):
-            return self._console.clear_history(uid, records=records)
+            return self._runtime.store.clear_history(uid, records=records)
 
     def get_cursor(self, key: str) -> str | None:
         """读取指定游标键的最新已提交值，限 Run 外。"""

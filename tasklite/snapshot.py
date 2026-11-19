@@ -396,20 +396,19 @@ class _MemorySnapshotReader:
     """基于内存版本快照的一致快照读取器（不在用户上下文持后端锁）。"""
 
     def __init__(self, backend: Any) -> None:
-        with backend._lock:
-            self._queue = copy.deepcopy(backend._queue)
-            self._successes = copy.deepcopy(backend._successes)
-            self._failed = copy.deepcopy(backend._failed)
-            self._failure_payloads = copy.deepcopy(backend._failure_payloads)
-            self._attempts = copy.deepcopy(backend._attempts)
+        snapshot = backend.load_consistent_snapshot()
+        self._queue_jobs = snapshot["queue_jobs"]
+        self._successes = snapshot["successes"]
+        self._failed = snapshot["failed"]
+        self._failure_payloads = snapshot["failure_payloads"]
+        self._attempts = snapshot["attempts"]
         self._closed = False
 
     def get_job(self, uid: str) -> dict[str, Any] | None:
-        for j in self._queue:
-            if job_uid_from_snapshot(j) == uid:
-                st = j.get("status", "pending")
+        for row in self._queue_jobs:
+            if row["job_uid"] == uid:
                 return _build_queued_job_dict(
-                    uid, j, st, j.get("run_id"), j.get("attempt_no"),
+                    uid, row["job"], row["status"], row["run_id"], row["attempt_no"],
                 )
 
         if uid in self._successes:
@@ -430,10 +429,10 @@ class _MemorySnapshotReader:
         task_type: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         queue_uids: set[str] = set()
-        for j in self._queue:
-            uid = job_uid_from_snapshot(j)
+        for row in self._queue_jobs:
+            uid = row["job_uid"]
             queue_uids.add(uid)
-            st = j.get("status", "pending")
+            st = row["status"]
             if status is not None and st != status:
                 continue
             if task_type is not None:
@@ -444,7 +443,7 @@ class _MemorySnapshotReader:
                 if tt != task_type:
                     continue
             yield _build_queued_job_dict(
-                uid, j, st, j.get("run_id"), j.get("attempt_no"),
+                uid, row["job"], st, row["run_id"], row["attempt_no"],
             )
 
         if status is None or status == "succeeded":
@@ -480,7 +479,7 @@ class _MemorySnapshotReader:
         job_uid: str | None = None,
         task_type: str | None = None,
     ) -> Iterator[dict[str, Any]]:
-        raw_list = list(self._attempts.values())
+        raw_list = list(self._attempts)
         if job_uid is not None:
             raw_list = [a for a in raw_list if a["job_uid"] == job_uid]
             raw_list.sort(key=lambda x: x.get("attempt_no", 0))
@@ -511,7 +510,7 @@ class _MemorySnapshotReader:
 
     def close(self) -> None:
         if not self._closed:
-            self._queue.clear()
+            self._queue_jobs.clear()
             self._successes.clear()
             self._failed.clear()
             self._failure_payloads.clear()

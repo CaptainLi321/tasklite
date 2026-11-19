@@ -257,7 +257,7 @@ class TestSuccessSettlement:
 
     def test_removes_popped_uid_without_spawn(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_snapshot("target"), _job_snapshot("next")])
+        backend.enqueue_jobs([_job_snapshot("target"), _job_snapshot("next")])
 
         assert _settle_success(backend, "t::target", {"ok": True}) is None
         assert backend.load_successes() == {"t::target": {"ok": True}}
@@ -296,7 +296,7 @@ class TestCommitJobFailure:
 
     def test_records_archive_and_clears_queue(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_snapshot("doomed")])
+        backend.enqueue_jobs([_job_snapshot("doomed")])
 
         assert backend.commit_job_failure("t::doomed", {"error_message": "timeout"}) is True
         # v2 语义：失败 meta 精确等于传入（历史由 attempts 轨迹承接）
@@ -305,7 +305,7 @@ class TestCommitJobFailure:
 
     def test_preserves_remaining_queue_order(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_snapshot(j) for j in ("first", "second", "third")])
+        backend.enqueue_jobs([_job_snapshot(j) for j in ("first", "second", "third")])
         backend.commit_job_failure("t::second", {"error_message": "boom"})
         assert _queue_uids(backend) == ["t::first", "t::third"]
 
@@ -321,7 +321,7 @@ class TestCommitJobFailure:
 
     def test_transaction_failure_propagates_and_preserves_queue(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_snapshot("alpha"), _job_snapshot("beta")])
+        backend.enqueue_jobs([_job_snapshot("alpha"), _job_snapshot("beta")])
 
         real_connect = sqlite3.connect
         call_count = {"n": 0}
@@ -348,7 +348,7 @@ class TestCommitBulkFailure:
 
     def test_records_multiple_and_clears_queue(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_snapshot("a"), _job_snapshot("b")])
+        backend.enqueue_jobs([_job_snapshot("a"), _job_snapshot("b")])
 
         assert backend.commit_job_failures(
             [("t::a", {"err": "x"}), ("t::b", {"err": "y"})]
@@ -358,7 +358,7 @@ class TestCommitBulkFailure:
 
     def test_preserves_remaining_queue_order(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_snapshot(j) for j in ("dead_one", "dead_two", "keep_one", "keep_two")])
+        backend.enqueue_jobs([_job_snapshot(j) for j in ("dead_one", "dead_two", "keep_one", "keep_two")])
         backend.commit_job_failures([("t::dead_one", {"error_message": "x"}), ("t::dead_two", {"error_message": "y"})])
         assert _queue_uids(backend) == ["t::keep_one", "t::keep_two"]
 
@@ -375,33 +375,8 @@ class TestCommitBulkFailure:
         assert backend.load_failed() == {}
 
 
-class TestSaveAndEnqueueQueue:
-    """整表重写与增量入队。"""
-
-    def test_save_queue_overwrites_and_clears(self, tmp_path):
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_snapshot("one"), _job_snapshot("two")])
-        backend.save_queue([_job_snapshot("three")])
-        assert _queue_uids(backend) == ["t::three"]
-        backend.save_queue([])
-        assert backend.load_queue() == []
-
-    def test_save_queue_preserves_order_large(self, tmp_path):
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-        jobs = [_job_snapshot(f"item_{i}") for i in range(500)]
-        backend.save_queue(jobs)
-        loaded = backend.load_queue()
-        assert [j["job_id"] for j in loaded] == [f"item_{i}" for i in range(500)]
-
-    def test_save_queue_db_error_raises(self, tmp_path, monkeypatch):
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-
-        def _boom(*args, **kwargs):
-            raise sqlite3.OperationalError("disk full")
-
-        monkeypatch.setattr(sqlite3, "connect", _boom)
-        with pytest.raises(sqlite3.OperationalError, match="disk full"):
-            backend.save_queue([_job_snapshot("one")])
+class TestEnqueueAndSkipQueue:
+    """增量入队与候选移除。"""
 
     def test_enqueue_front_back_and_dedup(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
@@ -411,12 +386,6 @@ class TestSaveAndEnqueueQueue:
         # 队列已有与批次内重复都跳过
         assert backend.enqueue_jobs([_job_snapshot("base"), _job_snapshot("fresh"), _job_snapshot("fresh")]) == ["t::fresh"]
         assert _queue_uids(backend) == ["t::front", "t::base", "t::back", "t::fresh"]
-
-    def test_delete_queue_uids_targeted(self, tmp_path):
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.enqueue_jobs([_job_snapshot(j) for j in ("a", "b", "c")])
-        assert backend.delete_queue_uids(["t::a", "t::c", "t::ghost"]) == 2
-        assert _queue_uids(backend) == ["t::b"]
 
     def test_commit_skip_removes_uid_only(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
@@ -478,58 +447,6 @@ class TestCorruptionAndLocks:
             SQLiteStateBackend(path)
 
 
-class TestReplaceQueueAtomic:
-    """读-改-写收敛的整表替换（SQLite 腿写事务契约）。"""
-
-    def test_compute_runs_inside_write_transaction(self, tmp_path):
-        """compute 执行期间写锁必须已被本事务持有。
-
-        用零 busy-timeout 的探针连接尝试 BEGIN IMMEDIATE：拿到锁 = 本事务
-        未持锁（读-改-写存在无锁窗口，缺陷结构）；立即 busy 失败 = 窗口
-        已被写事务消除。确定性判定，不依赖真实多进程竞速。
-        """
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_snapshot("keep")])
-        observed: dict[str, bool] = {}
-
-        def compute(disk_q):
-            probe = sqlite3.connect(backend.path, timeout=0.0)
-            try:
-                probe.execute("BEGIN IMMEDIATE")
-                observed["lock_free"] = True
-                probe.rollback()
-            except sqlite3.OperationalError:
-                observed["lock_free"] = False
-            finally:
-                probe.close()
-            return disk_q
-
-        backend.replace_queue_atomic(compute)
-
-        assert observed["lock_free"] is False, (
-            "compute 期间他进程连接必须拿不到写锁（读-改-写已收敛进写事务）"
-        )
-
-    def test_replace_raises_and_preserves_disk_on_corrupted_payload(self, tmp_path):
-        """读阶段失败（队列行损坏）→ 异常传播 + 整体回滚，compute 不获执行机会。"""
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.save_queue([_job_snapshot("keep")])
-        with sqlite3.connect(backend.path) as conn:
-            conn.execute("UPDATE queue SET job_snapshot = 'not-json'")
-            conn.commit()
-
-        compute_called: list[Any] = []
-        with pytest.raises(ValueError):
-            backend.replace_queue_atomic(
-                lambda disk_q: compute_called.append(disk_q) or []
-            )
-
-        assert compute_called == []
-        with sqlite3.connect(backend.path) as conn:
-            rows = conn.execute("SELECT job_snapshot FROM queue").fetchall()
-        assert rows == [("not-json",)], "读失败必须回滚，磁盘行原样保留"
-
-
 class TestSqliteFailureArchive:
     """失败档案 API：append 幂等与 payload 快照面。"""
 
@@ -569,21 +486,6 @@ class TestSqliteFailureArchive:
         with pytest.raises(TypeError):
             backend.commit_job_failure("t::one", {"error_message": "x"}, payload={"bad": object()})
         assert backend.load_failed() == {}
-
-    def test_delete_failed_clears_meta_and_snapshot(self, tmp_path):
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_failure("t::one", {"error_message": "x"}, payload={"k": 1})
-        backend.commit_job_failure("t::two", {"error_message": "y"})
-        assert backend.delete_failed(["t::one", "t::ghost"]) == 1
-        assert backend.load_failed() == {"t::two": {"error_message": "y"}}
-        assert backend.load_failure_payloads() == {}
-
-    def test_delete_wall_targeted(self, tmp_path):
-        backend = SQLiteStateBackend(tmp_path / "state.db")
-        _settle_success(backend, "t::one", {"ok": True})
-        _settle_success(backend, "t::two", {"ok": True})
-        assert backend.delete_successes(["t::one", "t::ghost"]) == 1
-        assert set(backend.load_successes()) == {"t::two"}
 
 
 class TestSeedWallAndCursor:

@@ -324,13 +324,6 @@ class PipelineState:
         if __debug__:
             self._assert_terminal_uids_consistent()
 
-    def add_success(self, job_uid: str, metadata: dict[str, Any]) -> None:
-        """向 successes 集合添加 uid（运维接缝，seed_successes 场景）。"""
-        self._successes[job_uid] = metadata
-        self._success_uids.add(job_uid)
-        if __debug__:
-            self._assert_terminal_uids_consistent()
-
     def get_cursor(self, key: str) -> str | None:
         """获取单个游标键值。"""
         return self._cursors.get(key)

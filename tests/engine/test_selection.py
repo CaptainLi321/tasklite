@@ -303,7 +303,7 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     install_fake_process_context(pipeline, fake_process())
     pipeline.register_task("rank", ok_handler)
     # 畸形行（缺 job_id）带被排除 task_type：不得被选择豁免，仍结算为配置无效
-    pipeline._runtime.store.backend.save_queue(
+    pipeline._runtime.store.backend.enqueue_jobs(
         [{"task_type": "excluded_t"}, Job("rank", "ok").to_dict()]
     )
     outcome: dict = {}
@@ -512,6 +512,17 @@ def test_temporary_exclude_and_check_contract():
     # reset_run 清理临时排除
     scheduler.reset_run()
     assert scheduler.is_job_excluded_by_uid("t::1") is False
+
+
+@pytest.mark.parametrize("special_task_type", ["ns:fetch", "rate%50", "ns:rate%50"])
+def test_is_job_excluded_by_uid_decodes_colon_and_percent_task_type(special_task_type):
+    """task_type 含 ':' 或 '%' 时，is_job_excluded_by_uid 须经 parse_job_uid 解码后匹配。"""
+    scheduler = JobScheduler(resources={})
+    scheduler.reset_run(Exclude(task_type=special_task_type))
+    uid = Job(special_task_type, "j1").uid
+    assert scheduler.is_job_excluded_by_uid(uid) is True
+    assert scheduler.is_job_excluded_by_uid(Job("other:type%1", "j1").uid) is False
+    assert scheduler.is_job_excluded_by_uid("malformed-uid") is False
 
 
 def test_selection_machine_kahn_partition(tmp_path):

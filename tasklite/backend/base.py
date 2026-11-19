@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import copy
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 QUEUE_EXECUTION_ID_KEY = "__tasklite_execution_id__"
@@ -117,42 +117,6 @@ class AbstractStateBackend(ABC):
         优先级选取。读取或解码故障必须原样传播。
         """
 
-    # 整表重写 -------------------------------------------------------
-
-    @abstractmethod
-    def save_queue(self, job_snapshots: list[dict[str, Any]]) -> None:
-        """整表重写队列（测试装配 / replace_queue_atomic 的事务内步骤）。
-
-        红线：这是「无读基准的整表覆盖」——跨进程并发的 enqueue/commit
-        若提交在本方法执行前的任意时刻，其已落盘行会被无条件抹除。进程内
-        任何「先读磁盘真相再决定写什么」的合并保存（崩溃恢复路径）严禁
-        直接调用本方法，必须走 ``replace_queue_atomic`` 把读-改-写收敛进
-        单个写事务。
-
-        替换集经 ``validate_queue_replacement`` 在写变前校验：None / 非序列 /
-        元素非 dict 抛 TypeError，队列保持调用前状态（双腿一致）。
-        """
-
-    @abstractmethod
-    def replace_queue_atomic(
-        self,
-        compute: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
-    ) -> None:
-        """读-改-写收敛的整表替换：磁盘真相读取与写回在单个写事务内完成。
-
-        ``compute`` 在写锁内接收按序排列的磁盘队列快照，返回替换后的完整
-        队列。不变式：并发方（跨进程 enqueue / delta commit）要么先于本
-        事务提交（其行进入磁盘真相、参与合并，绝不丢失），要么排队等本
-        事务提交后再落盘——「读真相 → 计算 → 写回」之间不存在无锁窗口，
-        陈旧快照永远无法覆盖窗口期他进程已应答的新写入。
-
-        ``compute`` 必须是纯计算（锁内执行，不得调用任何后端写方法，否则
-        跨连接写请求会以写锁互斥死等）。单事务原子：``compute`` 抛异常或
-        写失败时整体回滚，磁盘保持调用前状态，异常向外传播。``compute``
-        返回的替换集经 ``validate_queue_replacement`` 在写变前校验（None /
-        非序列 / 元素非 dict 抛 TypeError，双腿一致，磁盘保持原状）。
-        """
-
     # delta 提交 -----------------------------------------------------
 
 
@@ -207,40 +171,7 @@ class AbstractStateBackend(ABC):
         ``replace_queue_atomic`` 收敛）。失败时事务回滚并抛异常（不吞）。
         """
 
-    # 定向删除与种子 --------------------------------------------------
-
-    @abstractmethod
-    def delete_queue_uids(self, job_uids: list[str]) -> int:
-        """按 uid 定向批量删除队列行（加载期 repair 的差量落盘唯一出口）。
-
-        与 save_queue 的全表重写相对：只 DELETE 指定 uid 的行，其余行原样
-        保留。不变式：删除集在调用前确定，不在删除集内的行（含并发进程
-        刚入队的新行）无论与本事务先后提交都必然存活——陈旧加载快照永远
-        不会覆盖他进程的新写入。单事务原子；失败抛异常（不吞），磁盘保持
-        调用前状态（残留行由下次加载重新判定，天然幂等）。返回实际删除行数。
-        """
-
-    @abstractmethod
-    def delete_failed(self, job_uids: list[str]) -> int:
-        """从失败档案批量删除指定 uid（clear_failures 的后端实现）。
-
-        返回实际删除行数（连带清除 payload 快照）。不触碰 queue/successes。
-        仅限 run() 之外调用（改变 is_known 判定基础，与 enqueue 同纪律）。
-        """
-
-    @abstractmethod
-    def delete_successes(self, job_uids: list[str]) -> int:
-        """从 successes 批量删除指定 uid（clear_history 的后端实现 + commit 路径事务内清理）。
-
-        两种调用上下文：
-        - 运行外管理 API 的批量删除；
-        - commit_job_failure / commit_job_failures 的同一事务内逐 uid 删除
-          （重跑任务重跑失败时 successes 旧记录作废，最终状态唯一）。
-
-        运行中的调用仅限 commit 事务内部（随失败档案写入原子提交，不改变
-        进行中的派发判定）；独立调用仅限 run 之外（改变 is_known 判定
-        基础，与 enqueue 同纪律）。
-        """
+    # 管理写与游标 --------------------------------------------------
 
     @abstractmethod
     def apply_manual_status(
@@ -322,10 +253,6 @@ class AbstractStateBackend(ABC):
     @abstractmethod
     def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
         """按 attempt_no 升序读取指定 job_uid 的全部已结算 Attempt 记录。"""
-
-    @abstractmethod
-    def clear_attempts(self, job_uid: str) -> int:
-        """删除指定 job_uid 的 Attempt 历史（不影响 job_sequences 编号进度）。"""
 
     @abstractmethod
     def load_queue_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:

@@ -60,7 +60,7 @@ def test_restored_none_spec_inherits_task_before_trigger():
     pipeline.register_task("t", handle, max_retries_per_run=9, trigger="inspect")
     snapshot = Job("t", "a").to_dict()
     assert Job.from_dict(snapshot).to_dict() == snapshot
-    pipeline._runtime.store.backend.save_queue([snapshot])
+    pipeline._runtime.store.backend.enqueue_jobs([snapshot])
     pipeline.run()
     assert seen == [9]
 

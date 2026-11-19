@@ -8,8 +8,6 @@ settle_reaped / settle_aborted 批量结算。
 
 from __future__ import annotations
 
-from collections import defaultdict
-
 from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
 
 from typing import Any
@@ -57,7 +55,6 @@ class CompletionEnv:
             resources_map.update(extra_resources)
         self.resources = ResourceManager(resources_map)
         self.backend = InMemoryStateBackend()
-        self.stats = defaultdict(int)
         self.tasks = TaskRegistry()
         self.trigger_registry = TriggerRegistry(
             tasks=self.tasks,
@@ -66,7 +63,6 @@ class CompletionEnv:
         self.store = StateStore(
             self.backend,
             PipelineState({}, {}, {}, []),
-            stats=self.stats,
             trigger_registry=self.trigger_registry,
         )
         self.session = RunSession()
@@ -75,7 +71,6 @@ class CompletionEnv:
         self.channel = ExecutionChannel()
         self.completion = CompletionMachine(
             store=self.store,
-            trigger_registry=self.trigger_registry,
             channel=self.channel,
             resources=self.resources,
             in_flight=self.in_flight,
@@ -89,7 +84,6 @@ class CompletionEnv:
         self,
         job: Job,
         *,
-        lease=None,
         execution_id=None,
         run_id=None,
         attempt_no=None,
@@ -105,13 +99,12 @@ class CompletionEnv:
         job.__dict__.update(Job.from_dict(snapshot).__dict__)
         job._attempt_no = attempt_no
         snapshot["attempt_no"] = attempt_no
-        if acquired is None and lease is None:
+        if acquired is None:
             acquired = self.resources.acquire_all(job.task_type, job.resources, job_uid=job.uid)
         entry = InFlightJob(
             job_uid=job.uid,
             job_snapshot=snapshot,
             job=job,
-            lease=lease,
             acquired=acquired if acquired is not None else [],
             execution_id=execution_id,
             run_id=run_id,
@@ -179,7 +172,6 @@ class TestCompleteJobSuccess:
         assert env.store.state.successes["t::j1"]["result"]["metadata"]["score"] == 100
         assert env.store.state.successes["t::j1"]["last_success_run_id"] == env.session.run_id
         assert env.store.state.successes["t::j1"]["inputs"] == [str(input_file)]
-        assert env.stats["succeeded"] == 1
         assert "t::j1" not in env.store.state.in_flight_uids
         assert not cache_file.exists()
         attempt, = env.backend.load_settled_attempts("t::j1")
@@ -232,8 +224,6 @@ class TestCompleteJobFailure:
 
         assert env.store.state.failed["t::j1"]["error_message"] == "boom"
         assert env.store.state.failed["child::c1"]["error_message"] == "Dependency failed or has no record"
-        assert env.stats["failed"] == 1
-        assert env.stats["cascade_failed"] == 1
         assert not partial.exists()
         attempt, = env.backend.load_settled_attempts("t::j1")
         assert attempt["outcome"] == "failure"
@@ -254,7 +244,6 @@ class TestRetryBudget:
         env.completion.complete_job(entry, result)
 
         assert result.will_retry is True
-        assert env.stats["retried"] == 1
         assert env.store.state.queue[0]["attempt_no"] == 1
         attempt, = env.backend.load_settled_attempts("t::j1")
         assert attempt["outcome"] == "retry"
@@ -299,7 +288,6 @@ class TestRetryBudget:
         assert result.will_retry is False
         assert "t::j1" in env.store.state.failed
         assert env.store.state.failed["t::j1"]["error_message"] == 'Retry budget exhausted'
-        assert env.stats["failed"] == 1
         attempts = env.backend.load_settled_attempts("t::j1")
         assert [(a["attempt_no"], a["outcome"], a["result"]["message"]) for a in attempts] == [
             (1, "retry", "first failure"), (2, "failure", "second"),
@@ -331,7 +319,6 @@ class TestRetryBudget:
         assert result.will_retry is True
         assert "t::j1" not in env.store.state.failed
         assert env.store.state.queue[0]["attempt_no"] == 5
-        assert env.stats["retried"] == 5
         assert env.session.get_retry_count(job.uid) == 0
         assert env.session.is_retry_candidate(job.uid) is True
 
@@ -623,7 +610,6 @@ def test_symlink_output_settles_failure_without_false_success(tmp_path):
     assert job.uid in env.backend.load_failed()
     assert "symlink" in env.backend.load_failed()[job.uid]["error_message"]
     assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
-    assert env.stats["succeeded"] == 0
 
 
 def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, monkeypatch):

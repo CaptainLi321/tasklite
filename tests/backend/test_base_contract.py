@@ -28,19 +28,13 @@ EXPECTED_ABSTRACT_METHODS = {
     "load_queue",
     "load_known_job_snapshot",
     "load_known_job_snapshots",
-    # 整表重写
-    "save_queue",
-    "replace_queue_atomic",
     # delta 提交
     "commit_job_failure",
     "commit_job_failures",
     "commit_skip",
     # 增量入队
     "enqueue_jobs",
-    # 定向删除与管理
-    "delete_queue_uids",
-    "delete_failed",
-    "delete_successes",
+    # 管理写与游标
     "apply_manual_status",
     "clear_history",
     "get_cursor",
@@ -55,7 +49,6 @@ EXPECTED_ABSTRACT_METHODS = {
     "commit_job_settlement",
     "get_attempt_sequence",
     "load_settled_attempts",
-    "clear_attempts",
     "load_queue_jobs",
     # 路径授权
     "record_authorization",

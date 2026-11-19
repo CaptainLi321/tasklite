@@ -2,21 +2,27 @@
 
 不变式：
 - stop_mode 单调转移（NONE→DRAINING，唯一入口 request_stop，幂等且不升级强停）；
-- begin() 是新 run 的复位入口（run_id/dispatch_no/stop_mode/候选来源与重试计数归零）。
+- begin() 是新 run 的复位入口（run_id/dispatch_no/stop_mode/候选来源/重试计数/排除状态归零）。
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from typing import TYPE_CHECKING
 
+from ..exceptions import TaskLiteError
+from ..selection import Exclude
+from ..utils.encoding import parse_job_uid
 from .types import ExitReason, StopMode
+
+if TYPE_CHECKING:
+    from ..models.state import PipelineState
 
 logger = logging.getLogger("tasklite")
 
 
 class RunSession:
-    """一次 run() 的可变生命周期状态。"""
+    """一次 run() 的可变生命周期状态与运行期排除单一真相源。"""
 
     def __init__(self) -> None:
         self.run_id: str | None = None
@@ -24,24 +30,58 @@ class RunSession:
         self.stop_mode: StopMode = StopMode.NONE
         self.retry_counts: dict[str, int] = {}
         self.retry_candidates: set[str] = set()
-        self._exclude_chain_handler: Callable[[str], None] | None = None
+        self.exclude: Exclude | None = None
+        self.temporary_excluded_uids: set[str] = set()
 
-    def bind_exclude_chain_handler(self, handler: Callable[[str], None] | None) -> None:
-        """绑定临时级联排除处理器。"""
-        self._exclude_chain_handler = handler
-
-    def temporarily_exclude_chain(self, job_uid: str) -> None:
-        """委托绑定的处理器将指定作业及其全部下游加入本 Run 临时排除。"""
-        if self._exclude_chain_handler is not None and callable(self._exclude_chain_handler):
-            self._exclude_chain_handler(job_uid)
-
-    def begin(self, run_id: str | None = None) -> None:
+    def begin(
+        self,
+        run_id: str | None = None,
+        *,
+        exclude: Exclude | None = None,
+    ) -> None:
         """新 run 的复位入口：全部生命周期状态归零，run_id 待分配时置 None。"""
         self.run_id = run_id
         self.dispatch_no = 0
         self.stop_mode = StopMode.NONE
         self.retry_counts = {}
         self.retry_candidates = set()
+        self.exclude = exclude
+        self.temporary_excluded_uids = set()
+
+    def temporarily_exclude(self, job_uid: str) -> None:
+        """登记单个运行期临时排除 UID（供授权拒绝等复用）。"""
+        self.temporary_excluded_uids.add(job_uid)
+
+    def temporarily_exclude_chain(self, job_uid: str, state: PipelineState) -> None:
+        """将指定作业及其所有直接和间接下游作业加入本 Run 临时排除。"""
+        self.temporarily_exclude(job_uid)
+        for down_uid in state.find_all_downstream(job_uid):
+            self.temporarily_exclude(down_uid)
+
+    def clear_exclusions(self, exclude: Exclude | None = None) -> None:
+        """重置本 Run 的排除规则并清空临时排除集合。"""
+        self.exclude = exclude
+        self.temporary_excluded_uids.clear()
+
+    def is_excluded(self, job_uid: str, task_type: str) -> bool:
+        """判断作业是否被排除（用户 exclude 规则或运行期临时排除）。"""
+        if job_uid in self.temporary_excluded_uids:
+            return True
+        if self.exclude is not None and self.exclude.matches_task_type(task_type):
+            return True
+        return False
+
+    def is_excluded_by_uid(self, job_uid: str) -> bool:
+        """按规范 UID 解码 task_type 后判断是否被排除。"""
+        if job_uid in self.temporary_excluded_uids:
+            return True
+        if self.exclude is None:
+            return False
+        try:
+            task_type, _ = parse_job_uid(job_uid)
+        except TaskLiteError:
+            return False
+        return self.exclude.matches_task_type(task_type)
 
     def get_retry_count(self, job_uid: str) -> int:
         """查询当前 Run 内指定 uid 已消耗的重试预算次数。"""

@@ -39,24 +39,9 @@ from .admission import (
     extract_trusted_metadata_timestamp_us,
     is_trusted_success_metadata,
 )
+from .session import RunSession
 
 logger = logging.getLogger("tasklite")
-
-
-@dataclass(frozen=True)
-class FailureEntry:
-    """失败档案只读查询的结构化不可变条目（运维查询面的载荷形状）。
-
-    - ``job_uid``: 作业唯一标识 (task_type::job_id)
-    - ``error_message``: 失败说明
-    - ``metadata``: 完整失败档案 meta 字典视图
-    - ``payload``: 原始业务 payload 快照（失败落盘无可存快照时为 None）
-    """
-
-    job_uid: str
-    error_message: str
-    metadata: dict[str, Any]
-    payload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -105,15 +90,14 @@ class StateStore:
         backend: AbstractStateBackend,
         state: PipelineState | None = None,
         *,
-        stats: Any | None = None,
         trigger_registry: TriggerRegistry | None = None,
         requeue_policy: RequeuePolicy | None = None,
         base_dir: str | Path | None = None,
         protected_roots: Sequence[str | Path] = (),
+        session: RunSession | None = None,
     ) -> None:
         self._backend = backend
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
-        self._stats = stats
         self._trigger_registry = (
             trigger_registry
             if trigger_registry is not None
@@ -123,8 +107,7 @@ class StateStore:
         self._requeue_policy = (
             requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
         )
-        self._exclude: Exclude | None = None
-        self._temporary_excluded_uids: set[str] = set()
+        self._session = session if session is not None else RunSession()
         self.protected_roots: tuple[Path, ...] = tuple(
             Path(root).resolve() for root in protected_roots
         )
@@ -135,18 +118,10 @@ class StateStore:
         """当前实例固定的相对路径解析基准目录。"""
         return self._trigger_registry.base_dir
 
-    # ── 内部统计 ────────────────────────────────────────────────
-
-    def _record_stat(self, key: str, amount: int = 1) -> None:
-        """更新统计指标（单一真相源）。"""
-        if self._stats is not None:
-            self._stats[key] = self._stats.get(key, 0) + amount
-
     @property
-    def stats(self) -> Any:
-        """统计字典引用（可能为 None）。"""
-        return self._stats
-
+    def session(self) -> RunSession:
+        """当前关联的运行期会话（单次 Run 排除规则与生命周期状态真相源）。"""
+        return self._session
 
     def set_run_exclusions(
         self,
@@ -154,25 +129,29 @@ class StateStore:
         temporary_uids: set[str] | None = None,
     ) -> None:
         """内部注入面：设置本 Run 排除规则与临时排除集合。"""
-        self._exclude = exclude
-        self._temporary_excluded_uids = set(temporary_uids) if temporary_uids is not None else set()
+        self._session.exclude = exclude
+        self._session.temporary_excluded_uids = (
+            set(temporary_uids) if temporary_uids is not None else set()
+        )
 
     def temporarily_exclude(self, job_uid: str) -> None:
         """登记单个临时排除 UID。"""
-        self._temporary_excluded_uids.add(job_uid)
+        self._session.temporarily_exclude(job_uid)
 
     def _selection_excluded_uids(self) -> frozenset[str]:
         """当前队列中被排除拦截（Exclude 或临时排除）的合法作业 UID 集合。"""
-        if self._exclude is None and not self._temporary_excluded_uids:
+        exclude = self._session.exclude
+        temporary_uids = self._session.temporary_excluded_uids
+        if exclude is None and not temporary_uids:
             return frozenset()
-        excluded: set[str] = set(self._temporary_excluded_uids)
-        if self._exclude is not None:
+        excluded: set[str] = set(temporary_uids)
+        if exclude is not None:
             for job_snapshot in self._state.queue:
                 try:
                     job = Job.from_dict(job_snapshot)
                 except (KeyError, TypeError, ValueError, TaskLiteError):
                     continue
-                if self._exclude.matches_task_type(job.task_type):
+                if exclude.matches_task_type(job.task_type):
                     excluded.add(job.uid)
         return frozenset(excluded)
 
@@ -451,6 +430,8 @@ class StateStore:
                         f"Job {job.uid!r} references non-existent dependency {dep!r} in depends_on"
                     )
         inserted = self._backend.enqueue_jobs([job_snapshot])
+        if inserted and target_uid not in self._state.queue_uids:
+            self._state.spawn_jobs([copy.deepcopy(job_snapshot)], front=False)
         return bool(inserted)
 
     def mark_job_running(
@@ -689,7 +670,6 @@ class StateStore:
             self._state.update_cursors(cursor_updates)
         self._state.mark_success(job_uid, success_metadata)
         self._state.unregister_in_flight(job_uid)
-        self._record_stat("succeeded", 1)
         spawned_uids = [job_uid_from_snapshot(j) for j in spawned_snapshots]
         return SuccessOutcome(job_uid=job_uid, success_metadata=success_metadata, spawned_uids=spawned_uids)
 
@@ -699,7 +679,6 @@ class StateStore:
         failure_metadata: dict[str, Any],
         *,
         job_snapshot: dict[str, Any] | None = None,
-        count_as: str = "failed",
         cascade: bool = True,
         attempt_no: int | None = None,
         run_id: str | None = None,
@@ -744,7 +723,6 @@ class StateStore:
             self._backend.commit_job_failure(job_uid, normalized_meta, payload)
 
         self.mark_failed_memory(job_uid, normalized_meta)
-        self._record_stat(count_as, 1)
         cascaded_uids: list[str] = []
         if cascade:
             cascaded_uids = self.cascade_fail(job_uid)
@@ -839,7 +817,6 @@ class StateStore:
 
         self._state.unregister_in_flight(job_uid)
         self._state.requeue_jobs([retry_job_snapshot], front=plan.front)
-        self._record_stat("retried", 1)
         return RetryOutcome(job_uid=job_uid, retry_job_snapshot=retry_job_snapshot)
 
     def apply_pending(
@@ -886,7 +863,6 @@ class StateStore:
         self._backend.commit_skip(job_uid)
         self._state.remove_queued_uid(job_uid)
         self._state.unregister_in_flight(job_uid)
-        self._record_stat("skipped", 1)
         return SkipOutcome(job_uid=job_uid, was_known=True)
 
     def apply_bulk_failure(
@@ -920,7 +896,6 @@ class StateStore:
             if job_uid_from_snapshot(jd) not in failed_set
         ]
         self._state.replace_queue(list(remaining_queue))
-        self._record_stat("failed", len(normalized_metas))
         for job_uid, metadata in normalized_metas:
             self.mark_failed_memory(job_uid, metadata)
         return BulkFailureOutcome(
@@ -958,7 +933,6 @@ class StateStore:
             if job_uid_from_snapshot(jd) not in cascade_set
         ]
         self._state.replace_queue(remaining)
-        self._record_stat("cascade_failed", len(cascade_uids))
         for job_uid, metadata in cascade_metas:
             self.mark_failed_memory(job_uid, metadata)
         return cascade_uids
@@ -966,7 +940,6 @@ class StateStore:
 
 __all__ = [
     "BulkFailureOutcome",
-    "FailureEntry",
     "FailureOutcome",
     "RetryOutcome",
     "SkipOutcome",

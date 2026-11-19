@@ -568,7 +568,7 @@ def test_until_success_retries_after_real_failure(tmp_path):
 def test_legacy_trigger_pending_is_preserved_and_rejected_on_use(tmp_path):
     pipeline = _pipeline(tmp_path)
     legacy = Job("work", "legacy", trigger="on_failure").to_dict()
-    pipeline._runtime.store.backend.save_queue([legacy])
+    pipeline._runtime.store.backend.enqueue_jobs([legacy])
     pipeline.close()
 
     reopened = _pipeline(tmp_path)

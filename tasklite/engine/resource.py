@@ -13,7 +13,6 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 from ..exceptions import TaskLiteError
@@ -194,65 +193,6 @@ class ResourceEvaluation:
     unknown_name: str | None = None
     impossible_name: str | None = None
     reason: str | None = None
-
-
-class LeaseStatus(str, Enum):
-    """资源租约状态（兼容保留）。"""
-
-    RESERVED = "reserved"
-    CLAIMED = "claimed"
-    RELEASED = "released"
-
-
-@dataclass
-class ResourceLease:
-    """资源租约（兼容保留）。"""
-
-    manager: ResourceManager | None = None
-    job_uid: str = ""
-    acquired: list[tuple[str, float]] = field(default_factory=list)
-    rate_limits: list[tuple[str, float]] = field(default_factory=list)
-    status: LeaseStatus = LeaseStatus.CLAIMED
-
-    def claim(self) -> None:
-        self.status = LeaseStatus.CLAIMED
-
-    def release(self) -> None:
-        if self.status == LeaseStatus.RELEASED:
-            return
-        self.status = LeaseStatus.RELEASED
-        if self.manager is not None and self.acquired:
-            self.manager.release_all(self.acquired, job_uid=self.job_uid)
-
-    def cancel(self) -> None:
-        self.release()
-
-    def __enter__(self) -> ResourceLease:
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if exc_type is not None and self.status != LeaseStatus.RELEASED:
-            self.release()
-
-
-@dataclass
-class NullResourceLease(ResourceLease):
-    """空资源租约。"""
-
-    manager: Any = None
-    job_uid: str = ""
-    acquired: list[tuple[str, float]] = field(default_factory=list)
-    rate_limits: list[tuple[str, float]] = field(default_factory=list)
-    status: LeaseStatus = LeaseStatus.RELEASED
-
-    def claim(self) -> None:
-        pass
-
-    def release(self) -> None:
-        pass
-
-    def cancel(self) -> None:
-        pass
 
 
 class RunNotifier:
@@ -477,19 +417,6 @@ class ResourceManager(MutableMapping[str, Resource]):
                 continue
             res.release(amount)
 
-    def reserve(
-        self,
-        task_type: str,
-        declared_resources: Mapping[str, float]
-        | Iterable[tuple[str, float]]
-        | None = None,
-        *,
-        job_uid: str | None = None,
-    ) -> ResourceLease:
-        """租约封装（直接连续获取，不再使用两阶段预扣）。"""
-        acquired = self.acquire_all(task_type, declared_resources, job_uid=job_uid)
-        return ResourceLease(manager=self, job_uid=job_uid or "", acquired=acquired)
-
     def can_acquire_worker(self, amount: float = 1.0) -> ResourceQueryResult:
         """检查工作者槽位可用性。"""
         worker_res = self._resources.get(WORKER_RESOURCE)
@@ -519,7 +446,4 @@ __all__ = [
     "ResourceEvaluation",
     "ResourceManager",
     "RunNotifier",
-    "ResourceLease",
-    "NullResourceLease",
-    "LeaseStatus",
 ]

@@ -11,7 +11,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .base import (
     AbstractStateBackend,
@@ -312,82 +312,6 @@ class SQLiteStateBackend(AbstractStateBackend):
             )
             return [public_queue_snapshot(loads(row[0])) for row in cursor]
 
-    # 整表重写 ---------------------------------------------------------
-
-    def _rewrite_queue_rows(self, conn: sqlite3.Connection, job_snapshots: list[dict[str, Any]]) -> None:
-        """queue 表整表重写的单一出口（save_queue 与 replace_queue_atomic 共用）。
-
-        写变前先经 ``validate_queue_replacement`` 校验替换集（None/非法形状
-        fail-loud 抛 TypeError，不触发 DELETE）——否则 None 会让「DELETE
-        全表 + INSERT 全跳」静默清空队列且事务正常提交。
-        保存兜底去重：传入重复 job_uid 时保留首条 + 告警（而非 REPLACE 静默
-        覆盖为最后一条）——与加载期去重策略一致，杜绝队列 job_uid 索引与
-        queue list 的漂移。调用方必须已持写事务（显式或隐式）。
-        """
-        validate_queue_replacement(job_snapshots)
-        conn.execute('DELETE FROM queue')
-        if job_snapshots:
-            seen: set[str] = set()
-            rows: list[tuple] = []
-            for j in job_snapshots:
-                u = job_uid_from_snapshot(j)
-                if u in seen:
-                    logger.warning(
-                        f"save_queue: duplicate job_uid {u} dropped (kept first)."
-                    )
-                    continue
-                seen.add(u)
-                rows.append((
-                    u,
-                    len(rows),
-                    dumps(j),
-                    j.get("status", "pending"),
-                    j.get("run_id"),
-                    j.get("attempt_no"),
-                    j.get("started_at"),
-                ))
-            conn.executemany(
-                'INSERT OR REPLACE INTO queue ('
-                'job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at'
-                ') VALUES (?, ?, ?, ?, ?, ?, ?)',
-                rows,
-            )
-
-    def save_queue(self, job_snapshots: list[dict[str, Any]]) -> None:
-        """全量重写队列（测试装配 / replace_queue_atomic 事务内步骤，罕见 O(N)）。
-
-        红线：无读基准的整表覆盖——崩溃恢复路径的「合并保存」严禁直接
-        调用本方法（读-改-写窗口会抹除窗口期他进程已应答的入队），
-        必须经 replace_queue_atomic 收敛进单个写事务。
-        """
-        try:
-            with self._get_conn() as conn:
-                self._rewrite_queue_rows(conn, job_snapshots)
-        except Exception as e:
-            logger.critical(f"Failed to save queue to {self.path.name}: {e}")
-            raise
-
-    def replace_queue_atomic(
-        self,
-        compute: Callable[[list[dict[str, Any]]], list[dict[str, Any]]],
-    ) -> None:
-        try:
-            with self._get_conn() as conn:
-                # 读-改-写事务纪律：先取写锁再读磁盘真相，compute 与写回
-                # 同事务——并发 enqueue 要么先于本事务提交（进入磁盘真相、
-                # 参与合并），要么等本事务提交后再落盘，绝无中间态覆盖。
-                conn.execute('BEGIN IMMEDIATE')
-                disk_queue = [
-                    loads(row[0])
-                    for row in conn.execute(
-                        'SELECT job_snapshot FROM queue ORDER BY queue_position ASC'
-                    )
-                ]
-                self._rewrite_queue_rows(conn, compute(disk_queue))
-        except Exception as e:
-            logger.critical(f"Failed to replace queue atomically in {self.path.name}: {e}")
-            raise
-
     # delta 提交 ---------------------------------------------------------
 
 
@@ -539,49 +463,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to enqueue job_snapshots to {self.path.name}: {e}")
             raise
 
-    # 定向删除与种子 -------------------------------------------------------
-
-    def delete_queue_uids(self, job_uids: list[str]) -> int:
-        """按 job_uid 定向批量删除队列行（加载期 repair 差量落盘），不触碰其余行。"""
-        if not job_uids:
-            return 0
-        try:
-            with self._get_conn() as conn:
-                cur = conn.executemany(
-                    'DELETE FROM queue WHERE job_uid = ?', [(u,) for u in job_uids]
-                )
-                return cur.rowcount if cur.rowcount is not None else 0
-        except Exception as e:
-            logger.critical(f"Failed to delete queue uids in {self.path.name}: {e}")
-            raise
-
-    def delete_failed(self, job_uids: list[str]) -> int:
-        """从失败档案批量删除指定 job_uid（clear_failures 的后端实现）。"""
-        if not job_uids:
-            return 0
-        try:
-            with self._get_conn() as conn:
-                cur = conn.executemany(
-                    'DELETE FROM failed WHERE job_uid = ?', [(u,) for u in job_uids]
-                )
-                return cur.rowcount if cur.rowcount is not None else 0
-        except Exception as e:
-            logger.critical(f"Failed to delete failed entries in {self.path.name}: {e}")
-            raise
-
-    def delete_successes(self, job_uids: list[str]) -> int:
-        """从 successes 批量删除指定 job_uid（clear_history 的后端实现）。"""
-        if not job_uids:
-            return 0
-        try:
-            with self._get_conn() as conn:
-                cur = conn.executemany(
-                    'DELETE FROM successes WHERE job_uid = ?', [(u,) for u in job_uids]
-                )
-                return cur.rowcount if cur.rowcount is not None else 0
-        except Exception as e:
-            logger.critical(f"Failed to delete successes entries in {self.path.name}: {e}")
-            raise
+    # 管理写与查询 -------------------------------------------------------
 
     def apply_manual_status(
         self,
@@ -849,14 +731,6 @@ class SQLiteStateBackend(AbstractStateBackend):
                 (job_uid,),
             ).fetchone()
             return row[0] if row is not None else 0
-
-    def clear_attempts(self, job_uid: str) -> int:
-        if not self.path.exists():
-            return 0
-        with self._get_conn() as conn:
-            conn.execute('BEGIN IMMEDIATE')
-            cur = conn.execute('DELETE FROM attempts WHERE job_uid = ?', (job_uid,))
-            return cur.rowcount
 
     def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
         if not self.path.exists():

@@ -61,7 +61,7 @@ def test_commit_job_settlement_scales_constant_with_queue_size(tmp_path):
         Job("test", f"existing_{i}", payload={}).to_dict()
         for i in range(_QUEUE_DEPTH)
     ]
-    busy_backend.save_queue(jobs)
+    busy_backend.enqueue_jobs(jobs)
     busy = _bench_commit_job_settlement(busy_backend, samples=_SAMPLE_COUNT)
 
     assert busy < max(baseline * _SCALE_FACTOR, baseline + _FLOOR_SECONDS), (
@@ -82,7 +82,7 @@ def test_enqueue_jobs_latency_constant_with_queue_size(tmp_path):
     """
     baseline_backend = SQLiteStateBackend(tmp_path / "enqueue_baseline.db")
     warmup = Job("test", "warmup", payload={}).to_dict()
-    baseline_backend.save_queue([warmup])
+    baseline_backend.enqueue_jobs([warmup])
 
     def _bench_sequential_enqueues(backend: SQLiteStateBackend, tag: str) -> float:
         batch = [
@@ -96,7 +96,7 @@ def test_enqueue_jobs_latency_constant_with_queue_size(tmp_path):
     baseline = _bench_sequential_enqueues(baseline_backend, "probe")
 
     busy_backend = SQLiteStateBackend(tmp_path / "enqueue_busy.db")
-    busy_backend.save_queue([
+    busy_backend.enqueue_jobs([
         Job("test", f"existing_{i}", payload={}).to_dict()
         for i in range(_QUEUE_DEPTH)
     ])
