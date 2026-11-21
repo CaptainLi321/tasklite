@@ -68,7 +68,8 @@ with pipeline.edit(
 
 - **调用时机**：仅限 `run()` 外且实例未关闭时调用，否则立即抛 `TaskLiteError`；进入 `with` 块时获取状态库单写者锁（`<state_path>.lock` / 内存写锁），退出时释放。严禁在库方法内部隐式读取 `sys.argv`。
 - **默认安全（`dry_run=True`）**：默认处于预览演练模式，执行完整闭环校验并生成 `tx.before`、`tx.after` 与 `tx.diff()`，但在退出时**丢弃暂存修改、零磁盘写入**；仅当显式传入 `dry_run=False` 且闭环校验全部通过时，才在单一写事务内原子落盘。
-- **顺序工作图模型**：进入 `with` 时基于当前持久化状态生成只读基准快照 `tx.before: StateSnapshot` 与内存可变工作图；块内每次调用原语按顺序即时更新工作图。
+- **顺序工作图模型（KISS 三表原则）**：进入 `with` 时基于当前持久化状态生成只读基准快照 `tx.before: StateSnapshot` 与内存三表工作图（`queue` / `successes` / `failed` + 待补写遗留 `running` 失败 `Attempt`）；块内每次调用原语按字面顺序即时更新对应表分区，仅强制维护 Schema 6 固有的 `successes ∩ failed == ∅` 互斥不变式。
+  - *明确 Non-goal*：`remove(entries=...)` 仅按字面清理指定分区，不做跨表隐式联动；`replace` 不承诺保留原 `queue_position`，亦不隐式清理同 `uid` 在其他分区残留的历史档案（相关风险通过 `tx.diff()` 的 `[WARNINGS]` 段与 `logger.warning` 提示用户自决）。
 
 #### 3.1.2 事务上下文对象 `tx` 的公开属性与方法
 
@@ -134,31 +135,32 @@ with pipeline.edit(
    - 类型均为内存只读 `StateSnapshot`（同 `mode="copy"`），退出 `with` 块后仍可安全访问，不持有底层连接；
    - `tx.after` 实时反映当前工作图的投影结果（结构与真实提交后再调用 `StateSnapshot.open()` 100% 同形）。
 
-7. **结构化增量与校验报告：`tx.diff() -> str`**
-   - 返回面向人类阅读的 5 段式紧凑对比文本（不承诺跨版本格式稳定，不作编程解析契约）：
+7. **结构化增量、告警与校验报告：`tx.diff() -> str`**
+   - 返回面向人类阅读的紧凑对比文本（不承诺跨版本格式稳定，不作编程解析契约）：
      1. `Before -> After` 四态计数总览；
      2. `[- REMOVED]` 移除列表（**单独置顶高亮标出被移除的 `[succeeded]` 节点**，防止 `recursive=True` 静默误删已算完成果）；
      3. `[⇄ REPLACED]` 替换列表（仅展示发生变化的 `uid`、`status`、`depends_on`、`files` 路径、`payload` 键及配置项，拒绝刷屏未变 JSON）；
      4. `[+ ADDED]` 新增列表与 `[↻ STATUS]` 纯状态流转列表；
-     5. `[VALIDATION]` 闭环体检结论（`PASS` 或全量错误明细清单）。
-   - **永不因校验失败而抛异常中断渲染**：即便工作图存在多处孤儿或文件缺失，`tx.diff()` 仍完整返回对比文本与全部错误明细，杜绝“修一个错跑一次脚本”的打地鼠体验。
+     5. `[WARNINGS]` 纯只读非阻断告警（同时同步输出 `logger.warning`），涵盖：① 删除 `[succeeded]` 节点；② 单分区 `remove` 后同 `uid` 仍在另一分区保留；③ `pending` 节点同时存在历史 `successes`/`failed` 档案（下次 `run()` 将由 `Trigger` 依残留档案判定）；④ 非 `succeeded` 上游的 `from_output(p, key)` 未出现在静态 `job_snapshot["files"]` 中（依赖运行期 `ctx.declare_file` 动态声明）；
+     6. `[VALIDATION]` 闭环体检结论（`PASS` 或全量错误明细清单）。
+   - **永不因校验失败而抛异常中断渲染**：即便工作图存在多处孤儿、环或文件缺失，`tx.diff()` 仍完整返回对比文本与全部错误明细，杜绝“修一个错跑一次脚本”的打地鼠体验。
 
 #### 3.1.3 非执行 `"succeeded"` 写入边界与提交期（`__exit__`）闭环校验
 
 凡通过 `tx.add` 或 `tx.replace` 使节点处于 `"succeeded"` 状态时：
 - **零文件删除副作用**：忽略 `FileSpec` 上的 `delete_existing` / `delete_on_success` / `delete_on_failure`，不要求 `authorizations` 清理授权，不检查输入文件磁盘存在性；
-- **严格审计隔离**：不伪造 `Attempt` 记录，外层 `files` 发布所有保留型 `role="output"`（`delete_on_success=False`）的规范绝对路径，`annotations` 写入 `{"completion_source": "manual", "note": note}`（因此不产生 `trigger="on_input_change"` 的可信执行时间基线，后续若以 `on_input_change` 重入队将按无基线触发执行）。
+- **严格审计隔离与双写发布**：不伪造 `Attempt` 记录；外层 `files` 与 `artifacts` 双写所有保留型 `role="output"`（`delete_on_success=False`）的规范绝对路径（确保下游 `FileSpec.from_output` 可在后续 `run()` 正常解析）；清除旧执行时间基线并在 `annotations` 写入 `{"completion_source": "manual", "note": note}`（不产生 `trigger="on_input_change"` 的可信执行时间基线）。
 
 当 `with` 块无未捕获异常退出时，引擎对最终工作图 $G_{\text{after}}$ 执行**单次全量攒错校验**（一次性收集全部违规项，不遇错即停）：
-1. **存活节点不受损（防删出新孤儿）**：$\forall u \in G_{\text{after}} \cap G_{\text{before}}$，凡在 `tx.before` 中原本存在的上游 $p \in u.\text{depends\_on}$，在 $G_{\text{after}}$ 中绝不允许消失（除非 $u$ 自身已被更新或一并移除）；
+1. **存活节点不受损（防删出新孤儿）**：$\forall u \in G_{\text{after}} \cap G_{\text{before}}$，凡在 `tx.before` 中原本存在的上游 $p \in u.\text{depends\_on}$ 且仍留存于 $u_{\text{after}}.\text{depends\_on}$ 中的，在 $G_{\text{after}}$ 中绝不允许消失（除非 $u$ 自身已被更新或一并移除）；
 2. **活跃与成功态零孤儿、全图无环**：$G_{\text{after}}$ 中所有处于 `pending` 和 `succeeded` 的节点（以及本次通过 `add / replace` 触碰的全部节点），其 `depends_on` 中的所有上游必须 100% 存在于 $G_{\text{after}}$ 中，且 `depends_on` 有向图严禁存在环路（注：历史上因依赖拼错在 `run()` 后归档于 `failed` 表且本次未触碰的死记录，不连坐阻塞无关分支修整）；
-3. **`from_output` 契约闭合**：上述节点声明的每个 `FileSpec.from_output(p, key)`，必须满足 `p in u.depends_on`、`key` 在 `p` 的静态 `job_snapshot` 中声明为保留型 `role="output"`，且当 `p` 处于 `succeeded` 时 `key` 已存在于 `p` 发布的外层 `files` 中；
-4. **物理产出真实在场**：本次通过 `add / replace` 处于 `"succeeded"` 的所有节点，其声明的保留型 `role="output"` 路径必须全部通过受保护路径与符号链接检查，并在磁盘上真实存在。
+3. **`from_output` 契约闭合（兼容运行期动态 `output`）**：上述节点声明的每个 `FileSpec.from_output(p, key)`，必须满足 `p in u.depends_on` 且 `p` 存在于 $G_{\text{after}}$；当 `p` 处于 `succeeded` 时，`key` 必须存在于 `p` 已发布的外层 `files` / `artifacts` 中且为保留型 `role="output"`（天然兼容运行期经 `ctx.declare_file` 动态声明的产出）；当 `p` 非 `succeeded` 时，若 `p` 的静态 `job_snapshot["files"]` 已声明 `key`，强制校验其为保留型 `role="output"`（未静态声明则以 Warning 提示其依赖运行期动态声明）；
+4. **物理产出真实在场**：本次通过 `add / replace` 处于 `"succeeded"` 的所有节点，其声明的保留型 `role="output"` 路径必须全部通过统一 `PathPolicy.inspect(..., mode="strict")`（受保护 5 路径、根路径与符号链接/Junction 检查），并在磁盘上真实存在。
 
 **退出结算规则**：
 - 若校验存在任何错误：无论 `dry_run` 取何值，一律回滚/丢弃暂存状态，并将**全部错误汇总抛出单一 `TaskLiteError`**（底层非预期 OS 异常如 `PermissionError` 或 `sqlite3` IO 故障原样向上传播）；
 - 若校验全部通过且 `dry_run=True`：丢弃暂存修改，零副作用正常退出；
-- 若校验全部通过且 `dry_run=False`：在**单个 SQLite `BEGIN IMMEDIATE` 写事务**（或内存锁临界区）内，原子写入所有待补写的遗留 `running` 失败 `Attempt` 及 `queue / successes / failed` 变更。
+- 若校验全部通过且 `dry_run=False`：经极薄 4 字段无序声明式后端提交 Seam（`GraphEditCommit`：`queue_writes` / `success_writes` / `failed_writes` / `recovery_attempts`），在**单个 SQLite `BEGIN IMMEDIATE` 写事务**（或内存锁 Copy-on-Write 临界区）内原子落盘。
 
 ---
 
