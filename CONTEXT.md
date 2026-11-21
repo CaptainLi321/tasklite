@@ -1,6 +1,6 @@
 # TaskLite 领域概念词典
 
-嵌入式 Python 任务编排引擎，采用子进程隔离、单次执行 Pipe 通信、状态库级互斥与 ACID 事务持久化。核心模型为 Task / Job / Attempt 三层（ADR-0004 / ADR-0005 / ADR-0011）。
+嵌入式 Python 任务编排引擎，采用子进程隔离、单次执行 Pipe 通信、状态库级互斥与 ACID 事务持久化。核心模型为 Task / Job / Attempt 三层（ADR-0004 / ADR-0005 / ADR-0011；Run 外运维与跨平台演进以待实施的 ADR-0012 为准）。
 
 ## Language
 
@@ -31,7 +31,7 @@ _Avoid_: ArtifactSpec, FileDecl, OutputPath
 _Avoid_: StatusReader, StateInspector, DBViewer
 
 **Attempt**:
-一次物理执行的 append-only 轨迹记录：`(attempt_id, job_uid, attempt_no, run_id, outcome, started_at, settled_at, job_snapshot, files, result, error_message)`。派发时只持久化 Job 的 running 与 attempt_no；结算时与 Job 状态在同一事务中追加 Attempt，不更新已提交记录。outcome 仅为 success/failure/retry；failure 描述一次执行结果，授权拒绝等情形允许 Job 回到 pending。旁路观测面，不参与集合互斥。
+一次物理执行的严格 append-only 轨迹记录（运维操作不可删除）：`(attempt_id, job_uid, attempt_no, run_id, outcome, started_at, settled_at, job_snapshot, files, result, error_message)`。派发时只持久化 Job 的 running 与 attempt_no；结算时与 Job 状态在同一事务中追加 Attempt，不更新已提交记录。outcome 仅为 success/failure/retry；failure 描述一次执行结果，授权拒绝等情形允许 Job 回到 pending。旁路观测面，不参与集合互斥。
 _Avoid_: Trial, ExecutionLog, RunRecord
 
 **TaskRegistry**:
@@ -50,8 +50,8 @@ _Avoid_: TaskLiteException, ValidationError, RetryError, FatalError
 持久化成功完成作业集合及其最终元数据（`successes` 表）；按 `job_uid` 与失败档案互斥。
 _Avoid_: SuccessTable, CompletedSet, HistoryStore
 
-**Failed（失败档案）**:
-持久化永久失败作业集合及其元数据与 payload 快照（`failed` 表）；按 `job_uid` 与成功档案互斥。统一经由 `set_job_status` 重置或 `clear_history` 清除，只读查询收敛至 `StateSnapshot`。
+**Failures（失败档案）**:
+持久化永久失败作业集合及其元数据与 payload 快照（底层物理表为 `failed`）；按 `job_uid` 与成功档案互斥。Run 外状态运维与清理按 ADR-0012 收敛至 `TaskLite.edit()`（取代旧版 `set_job_status` / `clear_history`），只读查询收敛至 `StateSnapshot`。
 _Avoid_: FailureLog, ErrorQueue, Trash, DLQ, DeadLetter
 
 **encode_* family**:
@@ -110,5 +110,5 @@ _Avoid_: MockBackend, FakeDB, MemoryStorage
 **wrappers.discovery**:
 可选增量分页扫描工具（`register_discovery`）。本版不作稳定兼容承诺，文档须显式标注。
 
-**testing.fake_ctx**:
-单元测试上下文构造辅助工具。本版不作稳定兼容承诺，文档须显式标注。
+**tasklite.testing**:
+单元测试与受控接缝辅助工具（`fake_ctx` / `running` / `authorizer` / `in_process_workers` / `spawned_jobs` / `cursor_updates`）。本版不作稳定兼容承诺，文档须显式标注。
