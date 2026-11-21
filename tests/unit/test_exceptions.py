@@ -10,9 +10,9 @@ import pytest
 
 import tasklite
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskLiteError, TaskResult
+from tasklite.backend import sqlite_backend as sqlite_backend_module
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
 import tasklite.exceptions as exc_mod
-import tasklite.snapshot as snapshot_module
 from tasklite.testing import fake_ctx
 
 
@@ -121,9 +121,9 @@ def test_snapshot_natural_exception_keeps_identity_and_traceback(tmp_path, monke
         raise original
 
     if operation == "connect":
-        monkeypatch.setattr(snapshot_module.sqlite3, "connect", fail)
+        monkeypatch.setattr(sqlite3, "connect", fail)
     else:
-        monkeypatch.setattr(snapshot_module, "_check_schema", fail)
+        monkeypatch.setattr(sqlite_backend_module, "_check_schema", fail)
     with pytest.raises(error_type) as caught:
         StateSnapshot(path)
     _assert_original_error(caught, original, "fail")

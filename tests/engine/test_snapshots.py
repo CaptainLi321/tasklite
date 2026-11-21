@@ -329,58 +329,55 @@ class TestJobRecordStructureAndPriority:
 class TestQueriesAndFilters:
     """iter_jobs 与 iter_attempts 的过滤与排序。"""
 
-    def test_sqlite_iter_jobs_streams_cursor_rows(self, tmp_path):
-        p = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
-        p.register_task(Task("process", dummy_handler))
-        for job_id in ("succ", "pend", "fail"):
-            p.enqueue(Job("process", job_id))
-        with in_process_workers(p):
-            p.run(install_signals=False)
-        with p.edit(dry_run=False) as tx:
-            tx.set_status("process::pend", "pending", recursive=False)
-            tx.set_status("process::fail", "failed", recursive=False)
+    def test_sqlite_iter_jobs_streams_cursor_rows(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "state.db"
+        with TaskLite(backend="sqlite", state_path=db_path) as p:
+            p.register_task(Task("process", dummy_handler))
+            for job_id in ("succ", "pend", "fail"):
+                p.enqueue(Job("process", job_id))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+            with p.edit(dry_run=False) as tx:
+                tx.set_status("process::pend", "pending", recursive=False)
+                tx.set_status("process::fail", "failed", recursive=False)
 
-        class TrackedCursor:
-            def __init__(self, cursor):
-                self._cursor = cursor
+        tracked_cursors: list[Any] = []
+        real_connect = sqlite3.connect
+
+        class TrackedCursor(sqlite3.Cursor):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
                 self.steps = 0
 
-            def __iter__(self):
-                return self
-
             def __next__(self):
-                row = next(self._cursor)
+                row = super().__next__()
                 self.steps += 1
                 return row
 
-            def fetchone(self):
-                return self._cursor.fetchone()
-
             def fetchall(self):
-                raise AssertionError("iter_jobs must not materialize SQLite rows")
+                raise AssertionError("lazy mode iter_jobs must not materialize SQLite rows via fetchall()")
 
-        class TrackedConnection:
-            def __init__(self, conn):
-                self._conn = conn
-                self.cursors = []
-
-            def execute(self, sql, params=()):
-                cursor = TrackedCursor(self._conn.execute(sql, params))
-                self.cursors.append(cursor)
+        class TrackedConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                cursor = self.cursor(factory=TrackedCursor)
+                cursor.execute(sql, parameters)
+                tracked_cursors.append(cursor)
                 return cursor
 
-        with StateSnapshot.open(p) as snapshot:
-            tracked = TrackedConnection(snapshot._reader._conn)
-            snapshot._reader._conn = tracked
+        def wrapped_connect(*args, **kwargs):
+            kwargs["factory"] = TrackedConnection
+            return real_connect(*args, **kwargs)
 
+        monkeypatch.setattr(sqlite3, "connect", wrapped_connect)
+        with StateSnapshot.open(db_path, mode="lazy") as snapshot:
             jobs = list(snapshot.iter_jobs())
             assert {job["job_uid"] for job in jobs} == {"process::succ", "process::pend", "process::fail"}
 
-            before = sum(cursor.steps for cursor in tracked.cursors)
+            before = sum(cursor.steps for cursor in tracked_cursors)
             iterator = snapshot.iter_jobs()
             first = next(iterator)
             assert first["job_uid"] == "process::pend"
-            assert sum(cursor.steps for cursor in tracked.cursors) == before + 1
+            assert sum(cursor.steps for cursor in tracked_cursors) == before + 1
             iterator.close()
 
     def test_iter_jobs_filtering_and_uniqueness(self, pipeline_fixture):
@@ -1010,31 +1007,41 @@ class TestStateSnapshotCopyMode:
             finally:
                 snap.close()
 
-    def test_from_reader_internal_factory(self):
-        class _DummyReader:
-            def __init__(self):
-                self.closed = False
+    def test_sqlite_copy_mode_survives_source_db_deletion_and_replacement(self, tmp_path):
+        """mode='copy' 打开后立刻释放句柄，删除或覆盖源 DB 文件后快照仍完整可读。"""
+        db_path = tmp_path / "replaceable.db"
+        with TaskLite(backend="sqlite", state_path=db_path) as p:
+            p.register_task("process", retry_then_succeed_handler)
+            p.enqueue(Job("process", "item", max_retries_per_run=5))
+            with in_process_workers(p):
+                p.run(install_signals=False)
 
-            def get_job(self, uid):
-                return None
+        snap = StateSnapshot.open(db_path, mode="copy")
+        try:
+            # 立刻删除源库及 WAL/SHM 旁路文件，并用全新内容覆盖，验证无文件句柄占用
+            for target in (
+                db_path,
+                db_path.with_name(f"{db_path.name}-wal"),
+                db_path.with_name(f"{db_path.name}-shm"),
+            ):
+                if target.exists():
+                    target.unlink()
+            db_path.write_bytes(b"replaced-with-unrelated-content")
 
-            def iter_jobs(self, *, status=None, task_type=None):
-                return iter(())
+            rec = snap.get_job("process::item")
+            assert rec is not None and rec["status"] == "succeeded"
+            assert [j["job_uid"] for j in snap.iter_jobs()] == ["process::item"]
+            attempts = list(snap.iter_attempts(job_uid="process::item"))
+            assert [a["attempt_no"] for a in attempts] == [1, 2, 3]
+            report = StateSnapshot.report(snap)
+            assert "process" in report
+        finally:
+            snap.close()
 
-            def iter_attempts(self, *, job_uid=None, task_type=None):
-                return iter(())
-
-            def close(self):
-                self.closed = True
-
-        reader = _DummyReader()
-        snap = StateSnapshot._from_reader(reader, source="synthetic")
-        assert snap.source == "synthetic"
-        assert not snap.closed
-        assert list(snap.iter_jobs()) == []
-        snap.close()
-        assert reader.closed is True
         assert snap.closed is True
+        snap.close()
+        with pytest.raises(TaskLiteError, match="closed"):
+            snap.get_job("process::item")
 
 
 class TestStateSnapshotReport:

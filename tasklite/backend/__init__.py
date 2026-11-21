@@ -8,10 +8,17 @@ from .base import (
     AbstractStateBackend,
     GraphEditCommit,
     RunningAttemptRecovery,
+    validate_graph_edit_commit,
     validate_queue_replacement,
+    validate_recovery_attempt_state,
 )
 from .memory import InMemoryStateBackend
-from .sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
+from .sqlite_backend import (
+    SQLiteStateBackend,
+    TARGET_SCHEMA_VERSION,
+    open_existing_sqlite_readonly,
+    verify_existing_sqlite_database,
+)
 
 __all__ = [
     "AbstractStateBackend",
@@ -20,5 +27,9 @@ __all__ = [
     "RunningAttemptRecovery",
     "SQLiteStateBackend",
     "TARGET_SCHEMA_VERSION",
+    "open_existing_sqlite_readonly",
+    "validate_graph_edit_commit",
     "validate_queue_replacement",
+    "validate_recovery_attempt_state",
+    "verify_existing_sqlite_database",
 ]

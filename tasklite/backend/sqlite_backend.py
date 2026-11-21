@@ -21,7 +21,9 @@ from .base import (
     public_queue_snapshot,
     queue_snapshot_execution_id,
     queue_snapshot_with_execution_id,
+    validate_graph_edit_commit,
     validate_queue_replacement,
+    validate_recovery_attempt_state,
 )
 from ..exceptions import TaskLiteError
 from ..models.state import job_uid_from_snapshot
@@ -95,6 +97,51 @@ def _check_schema(
                 f"expected columns {expected}, found {sorted(columns)}"
             )
     return version
+
+
+def open_existing_sqlite_readonly(
+    db_path: str | Path,
+    *,
+    begin_transaction: bool = True,
+    timeout: float = 30.0,
+) -> sqlite3.Connection:
+    """校验并以强制只读 URI 打开已存在的 TaskLite Schema 6 状态库。
+
+    按顺序拒绝不存在路径、目录、0 字节空文件、非 SQLite 文件与未初始化/不兼容
+    Schema 库；全程零磁盘写入，不生成 ``-wal`` / ``-shm`` 旁路文件。
+    """
+    path = Path(db_path)
+    if not path.exists():
+        raise TaskLiteError(f"Database file does not exist: {path}")
+    if path.is_dir():
+        raise TaskLiteError(f"Path is a directory, not a database file: {path}")
+    if path.stat().st_size == 0:
+        raise TaskLiteError(f"Uninitialized TaskLite database at {path}")
+
+    uri = path.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=timeout)
+    try:
+        if begin_transaction:
+            conn.execute("BEGIN")
+        if _check_schema(conn, path) == 0:
+            raise TaskLiteError(f"Uninitialized TaskLite database at {path}")
+    except BaseException:
+        if begin_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+        conn.close()
+        raise
+    return conn
+
+
+def verify_existing_sqlite_database(db_path: str | Path) -> Path:
+    """只读探活已存在的 TaskLite Schema 6 状态库并立即释放连接（零磁盘写入）。"""
+    path = Path(db_path)
+    conn = open_existing_sqlite_readonly(path, begin_transaction=False)
+    conn.close()
+    return path
 
 
 class SQLiteStateBackend(AbstractStateBackend):
@@ -556,31 +603,8 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     def commit_graph_edit(self, commit: GraphEditCommit) -> None:
         """在单 BEGIN IMMEDIATE 事务内复核遗留 running 补写并按触碰 uid 精准更新三表（O(Δ)）。"""
-        if not isinstance(commit, GraphEditCommit):
-            raise TypeError(f"commit must be a GraphEditCommit, got {type(commit).__name__}")
-        if (
-            not commit.queue_writes
-            and not commit.success_writes
-            and not commit.failed_writes
-            and not commit.recovery_attempts
-        ):
+        if not validate_graph_edit_commit(commit):
             return
-
-        seen_recovery: set[str] = set()
-        for rec in commit.recovery_attempts:
-            if not isinstance(rec, RunningAttemptRecovery):
-                raise TypeError(
-                    f"recovery_attempts items must be RunningAttemptRecovery, got {type(rec).__name__}"
-                )
-            if rec.job_uid in seen_recovery:
-                raise TaskLiteError(
-                    f"Duplicate recovery attempt for running job {rec.job_uid!r}"
-                )
-            seen_recovery.add(rec.job_uid)
-            if rec.job_uid not in commit.queue_writes:
-                raise TaskLiteError(
-                    f"Recovery attempt for {rec.job_uid!r} must also update or remove its queue row"
-                )
 
         with self._get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -591,34 +615,30 @@ class SQLiteStateBackend(AbstractStateBackend):
                     "SELECT status, run_id, attempt_no, job_snapshot FROM queue WHERE job_uid = ?",
                     (rec.job_uid,),
                 ).fetchone()
-                if row is None:
-                    raise TaskLiteError(
-                        f"Recovery target {rec.job_uid!r} is no longer present in queue"
-                    )
-                stored_job = loads(row[3]) if row[3] else None
-                if (
-                    not isinstance(stored_job, dict)
-                    or row[:3] != ("running", rec.run_id, rec.attempt_no)
-                    or queue_snapshot_execution_id(stored_job) != rec.execution_id
-                ):
-                    raise TaskLiteError(
-                        f"Recovery attempt does not match the running execution for {rec.job_uid!r}"
-                    )
+                stored_job = loads(row[3]) if (row is not None and row[3]) else None
+                job_dict = stored_job if isinstance(stored_job, dict) else None
                 seq_row = conn.execute(
                     "SELECT last_attempt_no FROM job_sequences WHERE job_uid = ?",
                     (rec.job_uid,),
                 ).fetchone()
-                if seq_row is None or seq_row[0] != rec.attempt_no:
-                    raise TaskLiteError(
-                        f"Recovery attempt sequence mismatch for {rec.job_uid!r}"
-                    )
-                if conn.execute(
-                    "SELECT 1 FROM attempts WHERE job_uid = ? AND attempt_no = ?",
-                    (rec.job_uid, rec.attempt_no),
-                ).fetchone():
-                    raise TaskLiteError(
-                        f"Execution for {rec.job_uid!r} attempt {rec.attempt_no} is already settled"
-                    )
+                settled = bool(
+                    conn.execute(
+                        "SELECT 1 FROM attempts WHERE job_uid = ? AND attempt_no = ?",
+                        (rec.job_uid, rec.attempt_no),
+                    ).fetchone()
+                )
+                validate_recovery_attempt_state(
+                    rec,
+                    present_in_queue=row is not None,
+                    queue_status=row[0] if (row is not None and job_dict is not None) else None,
+                    queue_run_id=row[1] if (row is not None and job_dict is not None) else None,
+                    queue_attempt_no=row[2] if (row is not None and job_dict is not None) else None,
+                    queue_execution_id=(
+                        queue_snapshot_execution_id(job_dict) if job_dict is not None else None
+                    ),
+                    attempt_sequence=seq_row[0] if seq_row is not None else None,
+                    already_settled=settled,
+                )
                 conn.execute(
                     "INSERT INTO attempts ("
                     "job_uid, attempt_no, run_id, outcome, started_at, settled_at, "
@@ -695,83 +715,6 @@ class SQLiteStateBackend(AbstractStateBackend):
                 raise TaskLiteError(
                     f"Invariant conflict: job {overlap_row[0]!r} cannot exist in both successes and failed"
                 )
-
-    @staticmethod
-    def _snapshot_from_metadata(raw: str | None) -> dict[str, Any] | None:
-        if not raw:
-            return None
-        metadata = loads(raw)
-        if not isinstance(metadata, dict):
-            return None
-        snapshot = metadata.get("job_snapshot")
-        return snapshot if isinstance(snapshot, dict) else None
-
-    def load_known_job_snapshot(self, uid: str) -> dict[str, Any] | None:
-        """按队列、成功、失败、Attempt 历史的优先级读取完整配置。"""
-        with self._get_conn() as conn:
-            row = conn.execute(
-                "SELECT job_snapshot FROM queue WHERE job_uid = ?", (uid,)
-            ).fetchone()
-            if row and row[0]:
-                snapshot = loads(row[0])
-                if isinstance(snapshot, dict):
-                    return public_queue_snapshot(snapshot)
-
-            row = conn.execute(
-                "SELECT metadata FROM successes WHERE job_uid = ?", (uid,)
-            ).fetchone()
-            if row:
-                snapshot = self._snapshot_from_metadata(row[0])
-                if snapshot is not None:
-                    return snapshot
-
-            row = conn.execute(
-                "SELECT metadata FROM failed WHERE job_uid = ?", (uid,)
-            ).fetchone()
-            if row:
-                snapshot = self._snapshot_from_metadata(row[0])
-                if snapshot is not None:
-                    return snapshot
-
-            row = conn.execute(
-                "SELECT job_snapshot FROM attempts "
-                "WHERE job_uid = ? AND job_snapshot IS NOT NULL "
-                "ORDER BY attempt_id DESC LIMIT 1",
-                (uid,),
-            ).fetchone()
-            if row and row[0]:
-                snapshot = loads(row[0])
-                if isinstance(snapshot, dict):
-                    return snapshot
-        return None
-
-    def load_known_job_snapshots(self) -> dict[str, dict[str, Any]]:
-        """读取全部已知 Job 的完整配置，低优先级来源先写入。"""
-        known: dict[str, dict[str, Any]] = {}
-        with self._get_conn() as conn:
-            for uid, raw in conn.execute(
-                "SELECT job_uid, job_snapshot FROM attempts "
-                "WHERE job_snapshot IS NOT NULL ORDER BY attempt_id ASC"
-            ):
-                snapshot = loads(raw) if raw else None
-                if isinstance(snapshot, dict):
-                    known[uid] = snapshot
-
-            for uid, raw in conn.execute("SELECT job_uid, metadata FROM failed"):
-                snapshot = self._snapshot_from_metadata(raw)
-                if snapshot is not None:
-                    known[uid] = snapshot
-
-            for uid, raw in conn.execute("SELECT job_uid, metadata FROM successes"):
-                snapshot = self._snapshot_from_metadata(raw)
-                if snapshot is not None:
-                    known[uid] = snapshot
-
-            for uid, raw in conn.execute("SELECT job_uid, job_snapshot FROM queue"):
-                snapshot = loads(raw) if raw else None
-                if isinstance(snapshot, dict):
-                    known[uid] = public_queue_snapshot(snapshot)
-        return known
 
     def get_cursor(self, key: str) -> str | None:
         """查询单个游标的最新已提交值，不存在返回 None。"""
@@ -1232,5 +1175,10 @@ class SQLiteStateBackend(AbstractStateBackend):
         pass
 
 
-__all__ = ["SQLiteStateBackend", "TARGET_SCHEMA_VERSION"]
+__all__ = [
+    "SQLiteStateBackend",
+    "TARGET_SCHEMA_VERSION",
+    "open_existing_sqlite_readonly",
+    "verify_existing_sqlite_database",
+]
 

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 import copy
 import logging
 import os
@@ -38,6 +39,7 @@ from .admission import (
     extract_trusted_metadata_timestamp_us,
     is_trusted_success_metadata,
 )
+from .execution_access import exclusive_state_access
 from .session import RunSession
 
 logger = logging.getLogger("tasklite")
@@ -229,13 +231,13 @@ class StateStore:
         self._backend.set_cursor(key, value)
         self._state.set_cursor(key, value)
 
-    def get_job_snapshot(self, uid: str) -> dict[str, Any] | None:
-        """查找指定 uid 的完整作业快照（依次检索队列、成功档案、失败档案与 Attempt 轨迹）。"""
-        return self._backend.load_known_job_snapshot(uid)
+    def exclusive_access(self) -> AbstractContextManager[None]:
+        """获取底层状态库的独占执行权上下文（供 EditTransaction 等受控协作方调用）。"""
+        return exclusive_state_access(self._backend)
 
-    def get_all_known_jobs(self) -> dict[str, dict[str, Any]]:
-        """检索当前已知的全部作业完整快照映射（queue/successes/failed/attempts 并集）。"""
-        return self._backend.load_known_job_snapshots()
+    def load_consistent_snapshot(self) -> dict[str, Any]:
+        """在单一读事务或单锁内原子捕获全部核心表一致快照。"""
+        return self._backend.load_consistent_snapshot()
 
     def apply_graph_edit(self, commit: GraphEditCommit) -> None:
         """原子提交图修整事务并在落盘成功后同步内存状态镜像。"""
@@ -281,11 +283,11 @@ class StateStore:
         self.finalize_intake_snapshot(job_snapshot, str(job_snapshot["task_type"]))
         return job_snapshot
 
-    def _normalize_new_job_snapshot(self, job: Job) -> dict[str, Any]:
+    def normalize_new_job_snapshot(self, job: Job, *, caller: str = "enqueue") -> dict[str, Any]:
         """解析并校验新声明的有效配置，要求 Task 已注册。"""
         if not isinstance(job, Job):
             raise TaskLiteError(
-                f"enqueue() expects a Job, got {type(job).__name__}"
+                f"{caller}() expects a Job, got {type(job).__name__}"
             )
         self._require_registered_task(job.task_type)
         job_snapshot = copy.deepcopy(job.to_dict())
@@ -309,11 +311,7 @@ class StateStore:
 
     def enqueue_job(self, job: Job) -> bool:
         """单作业入队摄入管道：解析有效配置、捕获独立快照并校验同 UID 幂等/冲突。"""
-        if not isinstance(job, Job):
-            raise TaskLiteError(
-                f"enqueue() expects a Job, got {type(job).__name__}"
-            )
-        job_snapshot = self._normalize_new_job_snapshot(job)
+        job_snapshot = self.normalize_new_job_snapshot(job, caller="enqueue")
         target_uid = job.uid
 
         for queued in self._backend.load_queue():

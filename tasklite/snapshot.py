@@ -3,16 +3,20 @@
 独立只读入口，支持从数据库路径或 TaskLite 实例打开；SQLite 与内存实例均
 返回同一种只读快照。一个上下文提供一致快照，不创建/迁移/修复数据库，
 关闭快照不关闭 TaskLite。
+
+内部架构：单一深投影核心（StateSnapshot 统一承载优先级裁决、字段归一化与
+过滤排序）+ 2 个薄数据适配器（SQLite 流式只读适配器与统一内存表视图适配器，
+后者统一服务于 InMemoryStateBackend、SQLite copy 模式与 EditTransaction）。
 """
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-import sqlite3
-from typing import TYPE_CHECKING, Any, Iterator, Literal, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from ._report import render_snapshot_report
-from .backend.sqlite_backend import _check_schema
+from .backend.sqlite_backend import open_existing_sqlite_readonly
 from .exceptions import TaskLiteError
 from .utils.encoding import parse_job_uid
 from .utils.jsonutil import loads
@@ -117,7 +121,7 @@ def _normalize_result(raw_result: Any) -> dict[str, Any] | None:
     }
 
 
-def _build_queued_job_dict(
+def _project_queued_job(
     uid: str,
     job_snap: Mapping[str, Any],
     status: str,
@@ -140,9 +144,9 @@ def _build_queued_job_dict(
     }
 
 
-def _build_succeeded_job_dict(
+def _project_succeeded_job(
     uid: str,
-    succ_meta: dict[str, Any],
+    succ_meta: Mapping[str, Any],
 ) -> dict[str, Any]:
     """当前成功只投影自身档案，不从独立的 Attempt 历史补推事实。"""
     job_snap = succ_meta.get("job_snapshot") or {}
@@ -158,32 +162,28 @@ def _build_succeeded_job_dict(
             "annotations": succ_meta.get("annotations") or {},
         }
     )
-    run_id = succ_meta.get("run_id")
-    attempt_no = succ_meta.get("attempt_no")
-    started_at = _format_iso_z(succ_meta.get("started_at"))
-    settled_at = _format_iso_z(succ_meta.get("settled_at"))
-
     return {
         "job_uid": uid,
         "status": "succeeded",
         "job": _normalize_job_config(job_snap),
         "files": outer_files,
         "result": result,
-        "run_id": run_id,
-        "attempt_no": attempt_no,
-        "started_at": started_at,
-        "settled_at": settled_at,
+        "run_id": succ_meta.get("run_id"),
+        "attempt_no": succ_meta.get("attempt_no"),
+        "started_at": _format_iso_z(succ_meta.get("started_at")),
+        "settled_at": _format_iso_z(succ_meta.get("settled_at")),
     }
 
 
-def _build_failed_job_dict(
+def _project_failed_job(
     uid: str,
-    fail_meta: dict[str, Any],
-    payload: dict[str, Any] | None,
+    fail_meta: Mapping[str, Any],
+    payload: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    job_snap = copy.deepcopy(fail_meta.get("job_snapshot") or {})
+    """当前失败档案投影：仅在 job_snapshot 缺 payload 时补回独立 payload 列。"""
+    job_snap = copy.deepcopy(dict(fail_meta.get("job_snapshot") or {}))
     if payload is not None and not job_snap.get("payload"):
-        job_snap["payload"] = copy.deepcopy(payload)
+        job_snap["payload"] = copy.deepcopy(dict(payload))
     outer_files = _normalize_outer_files(
         fail_meta.get("files") or job_snap.get("files")
     )
@@ -194,40 +194,42 @@ def _build_failed_job_dict(
             "annotations": fail_meta.get("annotations") or {},
         }
     )
-    run_id = fail_meta.get("run_id")
-    attempt_no = fail_meta.get("attempt_no")
-    started_at = _format_iso_z(fail_meta.get("started_at"))
-    settled_at = _format_iso_z(fail_meta.get("settled_at"))
-
     return {
         "job_uid": uid,
         "status": "failed",
         "job": _normalize_job_config(job_snap),
         "files": outer_files,
         "result": result,
-        "run_id": run_id,
-        "attempt_no": attempt_no,
-        "started_at": started_at,
-        "settled_at": settled_at,
+        "run_id": fail_meta.get("run_id"),
+        "attempt_no": fail_meta.get("attempt_no"),
+        "started_at": _format_iso_z(fail_meta.get("started_at")),
+        "settled_at": _format_iso_z(fail_meta.get("settled_at")),
     }
 
 
-def _open_sqlite_readonly_conn(db_path: Path) -> sqlite3.Connection:
-    """以强制只读 URI 打开 SQLite 库并启动一致读事务，校验 Schema 6。"""
-    if not db_path.exists():
-        raise TaskLiteError(f"Database file does not exist: {db_path}")
-    if db_path.is_dir():
-        raise TaskLiteError(f"Path is a directory, not a database file: {db_path}")
-    uri = db_path.resolve().as_uri() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30.0)
-    try:
-        conn.execute("BEGIN")
-        if _check_schema(conn, db_path) == 0:
-            raise TaskLiteError(f"Uninitialized TaskLite database at {db_path}")
-    except BaseException:
-        conn.close()
-        raise
-    return conn
+def _project_attempt(
+    uid: str,
+    attempt_no: int,
+    run_id: str,
+    outcome: str,
+    started_at: str | None,
+    settled_at: str | None,
+    job_snap: Mapping[str, Any],
+    files_data: Mapping[str, Any] | None,
+    result_data: Any,
+) -> dict[str, Any]:
+    """物理 Attempt 历史行投影为统一只读字典。"""
+    return {
+        "job_uid": uid,
+        "outcome": outcome,
+        "job": _normalize_job_config(job_snap),
+        "files": _normalize_outer_files(files_data),
+        "result": _normalize_result(result_data),
+        "run_id": run_id,
+        "attempt_no": attempt_no,
+        "started_at": _format_iso_z(started_at),
+        "settled_at": _format_iso_z(settled_at),
+    }
 
 
 def _matches_task_type(uid: str, task_type: str | None) -> bool:
@@ -240,114 +242,168 @@ def _matches_task_type(uid: str, task_type: str | None) -> bool:
     return tt == task_type
 
 
-class _SnapshotReader(Protocol):
-    def get_job(self, uid: str) -> dict[str, Any] | None: ...
-    def iter_jobs(
-        self,
-        *,
-        status: str | None = None,
-        task_type: str | None = None,
-    ) -> Iterator[dict[str, Any]]: ...
+def _decode_json_dict(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, str):
+        val = loads(raw) if raw else {}
+        return val if isinstance(val, dict) else {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _decode_json_optional_dict(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        if not raw:
+            return None
+        val = loads(raw)
+        return val if isinstance(val, dict) else None
+    return raw if isinstance(raw, dict) else None
+
+
+def _decode_attempt_result(raw_result: Any, error_message: str | None, *, fallback_empty_dict: bool) -> Any:
+    if raw_result is not None:
+        if isinstance(raw_result, str):
+            return loads(raw_result) if raw_result else ({"message": error_message} if fallback_empty_dict else None)
+        return raw_result
+    if error_message is not None:
+        return {"message": error_message}
+    return {"message": None} if fallback_empty_dict else None
+
+
+# ── 2 个薄数据适配器（流式 SQLite + 统一内存表视图）────────────────────────
+
+
+class _SnapshotAdapter(Protocol):
+    def get_queued(
+        self, uid: str
+    ) -> tuple[Mapping[str, Any], str, str | None, int | None, str | None] | None: ...
+    def get_success(self, uid: str) -> Mapping[str, Any] | None: ...
+    def get_failed(self, uid: str) -> tuple[Mapping[str, Any], Mapping[str, Any] | None] | None: ...
+    def iter_queued(
+        self, *, status: str | None = None, task_type: str | None = None
+    ) -> Iterator[tuple[str, Mapping[str, Any], str, str | None, int | None, str | None]]: ...
+    def iter_non_queued_successes(
+        self, *, task_type: str | None = None
+    ) -> Iterator[tuple[str, Mapping[str, Any]]]: ...
+    def iter_non_queued_failed(
+        self, *, task_type: str | None = None
+    ) -> Iterator[tuple[str, Mapping[str, Any], Mapping[str, Any] | None]]: ...
     def iter_attempts(
-        self,
-        *,
-        job_uid: str | None = None,
-        task_type: str | None = None,
-    ) -> Iterator[dict[str, Any]]: ...
+        self, *, job_uid: str | None = None, task_type: str | None = None
+    ) -> Iterator[
+        tuple[
+            str,
+            int,
+            str,
+            str,
+            str | None,
+            str | None,
+            Mapping[str, Any],
+            Mapping[str, Any] | None,
+            Any,
+        ]
+    ]: ...
     def close(self) -> None: ...
 
 
-class _SqliteSnapshotReader:
-    """基于独立 SQLite 只读事务的流式一致快照读取器（mode="lazy"）。"""
+class _SqliteStreamingAdapter:
+    """SQLite 流式只读适配器（mode='lazy'）：仅持单一只读事务游标按需读取。"""
 
     def __init__(self, db_path: Path) -> None:
-        self._conn = _open_sqlite_readonly_conn(db_path)
+        self._conn = open_existing_sqlite_readonly(db_path, begin_transaction=True)
         self._closed = False
 
-    def get_job(self, uid: str) -> dict[str, Any] | None:
+    def get_queued(
+        self, uid: str
+    ) -> tuple[Mapping[str, Any], str, str | None, int | None, str | None] | None:
         row = self._conn.execute(
-            "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
+            "SELECT job_snapshot, status, run_id, attempt_no, started_at "
             "FROM queue WHERE job_uid = ?",
             (uid,),
         ).fetchone()
-        if row:
-            job_snap = loads(row[2]) if row[2] else {}
-            st = row[3] if row[3] else "pending"
-            return _build_queued_job_dict(uid, job_snap, st, row[4], row[5], row[6])
-
-        s_row = self._conn.execute(
-            "SELECT metadata FROM successes WHERE job_uid = ?", (uid,)
-        ).fetchone()
-        if s_row:
-            succ_meta = loads(s_row[0]) if s_row[0] else {}
-            return _build_succeeded_job_dict(uid, succ_meta)
-
-        f_row = self._conn.execute(
-            "SELECT metadata, payload FROM failed WHERE job_uid = ?", (uid,)
-        ).fetchone()
-        if f_row:
-            fail_meta = loads(f_row[0]) if f_row[0] else {}
-            payload = loads(f_row[1]) if f_row[1] else None
-            return _build_failed_job_dict(uid, fail_meta, payload)
-
-        return None
-
-    def iter_jobs(
-        self,
-        *,
-        status: str | None = None,
-        task_type: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
-        q_rows = self._conn.execute(
-            "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
-            "FROM queue ORDER BY queue_position ASC"
+        if not row:
+            return None
+        return (
+            _decode_json_dict(row[0]),
+            row[1] if row[1] else "pending",
+            row[2],
+            row[3],
+            row[4],
         )
 
-        for r in q_rows:
+    def get_success(self, uid: str) -> Mapping[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT metadata FROM successes WHERE job_uid = ?", (uid,)
+        ).fetchone()
+        if not row:
+            return None
+        return _decode_json_dict(row[0])
+
+    def get_failed(self, uid: str) -> tuple[Mapping[str, Any], Mapping[str, Any] | None] | None:
+        row = self._conn.execute(
+            "SELECT metadata, payload FROM failed WHERE job_uid = ?", (uid,)
+        ).fetchone()
+        if not row:
+            return None
+        return _decode_json_dict(row[0]), _decode_json_optional_dict(row[1])
+
+    def iter_queued(
+        self, *, status: str | None = None, task_type: str | None = None
+    ) -> Iterator[tuple[str, Mapping[str, Any], str, str | None, int | None, str | None]]:
+        cursor = self._conn.execute(
+            "SELECT job_uid, job_snapshot, status, run_id, attempt_no, started_at "
+            "FROM queue ORDER BY queue_position ASC"
+        )
+        for r in cursor:
             uid = r[0]
-            st = r[3] if r[3] else "pending"
+            st = r[2] if r[2] else "pending"
             if status is not None and st != status:
                 continue
             if not _matches_task_type(uid, task_type):
                 continue
-            job_snap = loads(r[2]) if r[2] else {}
-            yield _build_queued_job_dict(uid, job_snap, st, r[4], r[5], r[6])
+            yield uid, _decode_json_dict(r[1]), st, r[3], r[4], r[5]
 
-        if status is None or status == "succeeded":
-            s_rows = self._conn.execute(
-                "SELECT s.job_uid, s.metadata FROM successes AS s "
-                "WHERE NOT EXISTS ("
-                "SELECT 1 FROM queue AS q WHERE q.job_uid = s.job_uid"
-                ")"
-            )
-            for r in s_rows:
-                uid = r[0]
-                if not _matches_task_type(uid, task_type):
-                    continue
-                succ_meta = loads(r[1]) if r[1] else {}
-                yield _build_succeeded_job_dict(uid, succ_meta)
+    def iter_non_queued_successes(
+        self, *, task_type: str | None = None
+    ) -> Iterator[tuple[str, Mapping[str, Any]]]:
+        cursor = self._conn.execute(
+            "SELECT s.job_uid, s.metadata FROM successes AS s "
+            "WHERE NOT EXISTS (SELECT 1 FROM queue AS q WHERE q.job_uid = s.job_uid)"
+        )
+        for r in cursor:
+            uid = r[0]
+            if not _matches_task_type(uid, task_type):
+                continue
+            yield uid, _decode_json_dict(r[1])
 
-        if status is None or status == "failed":
-            f_rows = self._conn.execute(
-                "SELECT f.job_uid, f.metadata, f.payload FROM failed AS f "
-                "WHERE NOT EXISTS ("
-                "SELECT 1 FROM queue AS q WHERE q.job_uid = f.job_uid"
-                ")"
-            )
-            for r in f_rows:
-                uid = r[0]
-                if not _matches_task_type(uid, task_type):
-                    continue
-                fail_meta = loads(r[1]) if r[1] else {}
-                payload = loads(r[2]) if r[2] else None
-                yield _build_failed_job_dict(uid, fail_meta, payload)
+    def iter_non_queued_failed(
+        self, *, task_type: str | None = None
+    ) -> Iterator[tuple[str, Mapping[str, Any], Mapping[str, Any] | None]]:
+        cursor = self._conn.execute(
+            "SELECT f.job_uid, f.metadata, f.payload FROM failed AS f "
+            "WHERE NOT EXISTS (SELECT 1 FROM queue AS q WHERE q.job_uid = f.job_uid)"
+        )
+        for r in cursor:
+            uid = r[0]
+            if not _matches_task_type(uid, task_type):
+                continue
+            yield uid, _decode_json_dict(r[1]), _decode_json_optional_dict(r[2])
 
     def iter_attempts(
-        self,
-        *,
-        job_uid: str | None = None,
-        task_type: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
+        self, *, job_uid: str | None = None, task_type: str | None = None
+    ) -> Iterator[
+        tuple[
+            str,
+            int,
+            str,
+            str,
+            str | None,
+            str | None,
+            Mapping[str, Any],
+            Mapping[str, Any] | None,
+            Any,
+        ]
+    ]:
         sql = (
             "SELECT attempt_no, run_id, outcome, started_at, settled_at, "
             "job_snapshot, files, result, error_message, job_uid "
@@ -363,20 +419,17 @@ class _SqliteSnapshotReader:
             uid = row[9]
             if not _matches_task_type(uid, task_type):
                 continue
-            job_snap = loads(row[5]) if row[5] else {}
-            files_data = loads(row[6]) if row[6] else {}
-            res_data = loads(row[7]) if row[7] else {"message": row[8]}
-            yield {
-                "job_uid": uid,
-                "outcome": row[2],
-                "job": _normalize_job_config(job_snap),
-                "files": _normalize_outer_files(files_data),
-                "result": _normalize_result(res_data),
-                "run_id": row[1],
-                "attempt_no": row[0],
-                "started_at": _format_iso_z(row[3]),
-                "settled_at": _format_iso_z(row[4]),
-            }
+            yield (
+                uid,
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                _decode_json_dict(row[5]),
+                _decode_json_dict(row[6]),
+                _decode_attempt_result(row[7], row[8], fallback_empty_dict=True),
+            )
 
     def close(self) -> None:
         if not self._closed:
@@ -391,29 +444,44 @@ class _SqliteSnapshotReader:
             self._closed = True
 
 
-class _SqliteCopySnapshotReader:
-    """基于单一只读事务拷贝原始行并立即释放连接的快照读取器（mode="copy"）。
+class _MemoryTableAdapter:
+    """统一内存表视图适配器：同时服务 InMemoryStateBackend、SQLite copy 与 EditTransaction。
 
-    大字段 JSON 列保持原始 str，仅在 get_job / iter_jobs / iter_attempts
-    命中且通过过滤条件后按需惰性 loads()，避免无谓全量反序列化并保证零句柄占用。
+    大字段 JSON 列在 SQLite copy 模式下保持原始 str，仅在命中且通过过滤条件后
+    惰性解码，避免无谓全量反序列化并保证零数据库文件句柄占用。
     """
 
-    def __init__(self, db_path: Path) -> None:
-        conn = _open_sqlite_readonly_conn(db_path)
+    def __init__(
+        self,
+        *,
+        queue_rows: list[tuple[str, Any, str, str | None, int | None, str | None]],
+        successes: dict[str, Any],
+        failed: dict[str, tuple[Any, Any]],
+        attempts: list[tuple[str, int, str, str, str | None, str | None, Any, Any, Any, str | None]],
+        attempt_result_fallback_empty_dict: bool = False,
+    ) -> None:
+        self._queue_rows = queue_rows
+        self._queue_by_uid = {row[0]: row for row in queue_rows}
+        self._successes = successes
+        self._failed = failed
+        self._attempts = attempts
+        self._attempt_result_fallback_empty_dict = attempt_result_fallback_empty_dict
+        self._closed = False
+
+    @classmethod
+    def from_sqlite_copy(cls, db_path: Path) -> _MemoryTableAdapter:
+        """在单一只读事务内读取原始行并立即释放连接（mode='copy'）。"""
+        conn = open_existing_sqlite_readonly(db_path, begin_transaction=True)
         try:
-            queue_rows = conn.execute(
-                "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
+            q_raw = conn.execute(
+                "SELECT job_uid, job_snapshot, status, run_id, attempt_no, started_at "
                 "FROM queue ORDER BY queue_position ASC"
             ).fetchall()
-            success_rows = conn.execute(
-                "SELECT job_uid, metadata FROM successes"
-            ).fetchall()
-            failed_rows = conn.execute(
-                "SELECT job_uid, metadata, payload FROM failed"
-            ).fetchall()
-            attempt_rows = conn.execute(
-                "SELECT attempt_no, run_id, outcome, started_at, settled_at, "
-                "job_snapshot, files, result, error_message, job_uid "
+            s_raw = conn.execute("SELECT job_uid, metadata FROM successes").fetchall()
+            f_raw = conn.execute("SELECT job_uid, metadata, payload FROM failed").fetchall()
+            a_raw = conn.execute(
+                "SELECT job_uid, attempt_no, run_id, outcome, started_at, settled_at, "
+                "job_snapshot, files, result, error_message "
                 "FROM attempts ORDER BY attempt_id ASC"
             ).fetchall()
         finally:
@@ -426,105 +494,202 @@ class _SqliteCopySnapshotReader:
             except Exception:
                 pass
 
-        self._queue_rows: list[tuple[Any, ...]] = queue_rows
-        self._queue_by_uid: dict[str, tuple[Any, ...]] = {
-            row[0]: row for row in queue_rows
+        queue_rows = [
+            (r[0], r[1], r[2] if r[2] else "pending", r[3], r[4], r[5])
+            for r in q_raw
+        ]
+        successes = {r[0]: r[1] for r in s_raw}
+        failed = {r[0]: (r[1], r[2]) for r in f_raw}
+        attempts = [
+            (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9])
+            for r in a_raw
+        ]
+        return cls(
+            queue_rows=queue_rows,
+            successes=successes,
+            failed=failed,
+            attempts=attempts,
+            attempt_result_fallback_empty_dict=True,
+        )
+
+    @classmethod
+    def from_consistent_snapshot(cls, snapshot: Mapping[str, Any]) -> _MemoryTableAdapter:
+        """从内存后端 load_consistent_snapshot() 捕获的一致字典视图构建适配器。"""
+        queue_rows = [
+            (
+                row["job_uid"],
+                row["job"],
+                row["status"],
+                row["run_id"],
+                row["attempt_no"],
+                row.get("started_at"),
+            )
+            for row in snapshot["queue_jobs"]
+        ]
+        successes = dict(snapshot["successes"])
+        failure_payloads = snapshot["failure_payloads"]
+        failed = {
+            uid: (meta, failure_payloads.get(uid))
+            for uid, meta in snapshot["failed"].items()
         }
-        self._successes: dict[str, str | None] = {
-            row[0]: row[1] for row in success_rows
-        }
-        self._failed: dict[str, tuple[str | None, str | None]] = {
-            row[0]: (row[1], row[2]) for row in failed_rows
-        }
-        self._attempts: list[tuple[Any, ...]] = attempt_rows
-        self._closed = False
+        attempts = [
+            (
+                item["job_uid"],
+                item["attempt_no"],
+                item["run_id"],
+                item["outcome"],
+                item.get("started_at"),
+                item.get("settled_at"),
+                item.get("job") or {},
+                item.get("files"),
+                item.get("result"),
+                item.get("error_message"),
+            )
+            for item in snapshot["attempts"]
+            if isinstance(item.get("job_uid"), str) and item.get("job_uid")
+        ]
+        return cls(
+            queue_rows=queue_rows,
+            successes=successes,
+            failed=failed,
+            attempts=attempts,
+        )
 
-    def get_job(self, uid: str) -> dict[str, Any] | None:
-        q_row = self._queue_by_uid.get(uid)
-        if q_row is not None:
-            job_snap = loads(q_row[2]) if q_row[2] else {}
-            st = q_row[3] if q_row[3] else "pending"
-            return _build_queued_job_dict(uid, job_snap, st, q_row[4], q_row[5], q_row[6])
-
-        if uid in self._successes:
-            raw_meta = self._successes[uid]
-            succ_meta = loads(raw_meta) if raw_meta else {}
-            return _build_succeeded_job_dict(uid, succ_meta)
-
-        if uid in self._failed:
-            raw_meta, raw_payload = self._failed[uid]
-            fail_meta = loads(raw_meta) if raw_meta else {}
-            payload = loads(raw_payload) if raw_payload else None
-            return _build_failed_job_dict(uid, fail_meta, payload)
-
-        return None
-
-    def iter_jobs(
-        self,
+    @classmethod
+    def from_edit_tables(
+        cls,
         *,
-        status: str | None = None,
-        task_type: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
-        for r in self._queue_rows:
-            uid = r[0]
-            st = r[3] if r[3] else "pending"
+        queue_rows: Sequence[Mapping[str, Any]],
+        successes: Mapping[str, Mapping[str, Any]],
+        failed: Mapping[str, tuple[Mapping[str, Any], Mapping[str, Any] | None]],
+        attempts: Sequence[Mapping[str, Any]],
+    ) -> _MemoryTableAdapter:
+        """从 EditTransaction 三表工作图内存副本构建适配器。"""
+        q_list = [
+            (
+                row["job_uid"],
+                row["job"],
+                row["status"],
+                row.get("run_id"),
+                row.get("attempt_no"),
+                row.get("started_at"),
+            )
+            for row in queue_rows
+        ]
+        a_list = [
+            (
+                item["job_uid"],
+                item["attempt_no"],
+                item["run_id"],
+                item["outcome"],
+                item.get("started_at"),
+                item.get("settled_at"),
+                item.get("job") or {},
+                item.get("files"),
+                item.get("result"),
+                item.get("error_message"),
+            )
+            for item in attempts
+            if isinstance(item.get("job_uid"), str) and item.get("job_uid")
+        ]
+        return cls(
+            queue_rows=q_list,
+            successes=dict(successes),
+            failed=dict(failed),
+            attempts=a_list,
+        )
+
+    def get_queued(
+        self, uid: str
+    ) -> tuple[Mapping[str, Any], str, str | None, int | None, str | None] | None:
+        row = self._queue_by_uid.get(uid)
+        if row is None:
+            return None
+        return _decode_json_dict(row[1]), row[2], row[3], row[4], row[5]
+
+    def get_success(self, uid: str) -> Mapping[str, Any] | None:
+        if uid not in self._successes:
+            return None
+        return _decode_json_dict(self._successes[uid])
+
+    def get_failed(self, uid: str) -> tuple[Mapping[str, Any], Mapping[str, Any] | None] | None:
+        if uid not in self._failed:
+            return None
+        raw_meta, raw_payload = self._failed[uid]
+        return _decode_json_dict(raw_meta), _decode_json_optional_dict(raw_payload)
+
+    def iter_queued(
+        self, *, status: str | None = None, task_type: str | None = None
+    ) -> Iterator[tuple[str, Mapping[str, Any], str, str | None, int | None, str | None]]:
+        for row in self._queue_rows:
+            uid = row[0]
+            st = row[2]
             if status is not None and st != status:
                 continue
             if not _matches_task_type(uid, task_type):
                 continue
-            job_snap = loads(r[2]) if r[2] else {}
-            yield _build_queued_job_dict(uid, job_snap, st, r[4], r[5], r[6])
+            yield uid, _decode_json_dict(row[1]), st, row[3], row[4], row[5]
 
-        if status is None or status == "succeeded":
-            for uid, raw_meta in self._successes.items():
-                if uid in self._queue_by_uid:
-                    continue
-                if not _matches_task_type(uid, task_type):
-                    continue
-                succ_meta = loads(raw_meta) if raw_meta else {}
-                yield _build_succeeded_job_dict(uid, succ_meta)
+    def iter_non_queued_successes(
+        self, *, task_type: str | None = None
+    ) -> Iterator[tuple[str, Mapping[str, Any]]]:
+        for uid, raw_meta in self._successes.items():
+            if uid in self._queue_by_uid:
+                continue
+            if not _matches_task_type(uid, task_type):
+                continue
+            yield uid, _decode_json_dict(raw_meta)
 
-        if status is None or status == "failed":
-            for uid, (raw_meta, raw_payload) in self._failed.items():
-                if uid in self._queue_by_uid:
-                    continue
-                if not _matches_task_type(uid, task_type):
-                    continue
-                fail_meta = loads(raw_meta) if raw_meta else {}
-                payload = loads(raw_payload) if raw_payload else None
-                yield _build_failed_job_dict(uid, fail_meta, payload)
+    def iter_non_queued_failed(
+        self, *, task_type: str | None = None
+    ) -> Iterator[tuple[str, Mapping[str, Any], Mapping[str, Any] | None]]:
+        for uid, (raw_meta, raw_payload) in self._failed.items():
+            if uid in self._queue_by_uid:
+                continue
+            if not _matches_task_type(uid, task_type):
+                continue
+            yield uid, _decode_json_dict(raw_meta), _decode_json_optional_dict(raw_payload)
 
     def iter_attempts(
-        self,
-        *,
-        job_uid: str | None = None,
-        task_type: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
-        rows: list[tuple[Any, ...]]
+        self, *, job_uid: str | None = None, task_type: str | None = None
+    ) -> Iterator[
+        tuple[
+            str,
+            int,
+            str,
+            str,
+            str | None,
+            str | None,
+            Mapping[str, Any],
+            Mapping[str, Any] | None,
+            Any,
+        ]
+    ]:
         if job_uid is not None:
-            rows = [r for r in self._attempts if r[9] == job_uid]
-            rows.sort(key=lambda r: r[0] if r[0] is not None else 0)
+            rows = [r for r in self._attempts if r[0] == job_uid]
+            rows.sort(key=lambda r: r[1] if r[1] is not None else 0)
         else:
             rows = self._attempts
 
         for row in rows:
-            uid = row[9]
+            uid = row[0]
             if not _matches_task_type(uid, task_type):
                 continue
-            job_snap = loads(row[5]) if row[5] else {}
-            files_data = loads(row[6]) if row[6] else {}
-            res_data = loads(row[7]) if row[7] else {"message": row[8]}
-            yield {
-                "job_uid": uid,
-                "outcome": row[2],
-                "job": _normalize_job_config(job_snap),
-                "files": _normalize_outer_files(files_data),
-                "result": _normalize_result(res_data),
-                "run_id": row[1],
-                "attempt_no": row[0],
-                "started_at": _format_iso_z(row[3]),
-                "settled_at": _format_iso_z(row[4]),
-            }
+            yield (
+                uid,
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                _decode_json_dict(row[6]),
+                _decode_json_optional_dict(row[7]),
+                _decode_attempt_result(
+                    row[8],
+                    row[9],
+                    fallback_empty_dict=self._attempt_result_fallback_empty_dict,
+                ),
+            )
 
     def close(self) -> None:
         if not self._closed:
@@ -536,123 +701,7 @@ class _SqliteCopySnapshotReader:
             self._closed = True
 
 
-class _MemorySnapshotReader:
-    """基于内存版本快照的一致快照读取器（不在用户上下文持后端锁）。"""
-
-    def __init__(self, backend: Any) -> None:
-        snapshot = backend.load_consistent_snapshot()
-        self._queue_jobs = snapshot["queue_jobs"]
-        self._successes = snapshot["successes"]
-        self._failed = snapshot["failed"]
-        self._failure_payloads = snapshot["failure_payloads"]
-        self._attempts = snapshot["attempts"]
-        self._closed = False
-
-    def get_job(self, uid: str) -> dict[str, Any] | None:
-        for row in self._queue_jobs:
-            if row["job_uid"] == uid:
-                return _build_queued_job_dict(
-                    uid,
-                    row["job"],
-                    row["status"],
-                    row["run_id"],
-                    row["attempt_no"],
-                    row.get("started_at"),
-                )
-
-        if uid in self._successes:
-            succ_meta = self._successes[uid]
-            return _build_succeeded_job_dict(uid, succ_meta)
-
-        if uid in self._failed:
-            fail_meta = self._failed[uid]
-            payload = self._failure_payloads.get(uid)
-            return _build_failed_job_dict(uid, fail_meta, payload)
-
-        return None
-
-    def iter_jobs(
-        self,
-        *,
-        status: str | None = None,
-        task_type: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
-        queue_uids: set[str] = set()
-        for row in self._queue_jobs:
-            uid = row["job_uid"]
-            queue_uids.add(uid)
-            st = row["status"]
-            if status is not None and st != status:
-                continue
-            if not _matches_task_type(uid, task_type):
-                continue
-            yield _build_queued_job_dict(
-                uid,
-                row["job"],
-                st,
-                row["run_id"],
-                row["attempt_no"],
-                row.get("started_at"),
-            )
-
-        if status is None or status == "succeeded":
-            for uid, succ_meta in self._successes.items():
-                if uid in queue_uids:
-                    continue
-                if not _matches_task_type(uid, task_type):
-                    continue
-                yield _build_succeeded_job_dict(uid, succ_meta)
-
-        if status is None or status == "failed":
-            for uid, fail_meta in self._failed.items():
-                if uid in queue_uids:
-                    continue
-                if not _matches_task_type(uid, task_type):
-                    continue
-                payload = self._failure_payloads.get(uid)
-                yield _build_failed_job_dict(uid, fail_meta, payload)
-
-    def iter_attempts(
-        self,
-        *,
-        job_uid: str | None = None,
-        task_type: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
-        raw_list = list(self._attempts)
-        if job_uid is not None:
-            raw_list = [a for a in raw_list if a["job_uid"] == job_uid]
-            raw_list.sort(key=lambda x: x.get("attempt_no", 0))
-
-        for item in raw_list:
-            uid = item["job_uid"]
-            if not uid:
-                continue
-            if not _matches_task_type(uid, task_type):
-                continue
-            job_snap = item.get("job") or {}
-            res_data = item.get("result")
-            if res_data is None and item.get("error_message") is not None:
-                res_data = {"message": item.get("error_message")}
-            yield {
-                "job_uid": uid,
-                "outcome": item["outcome"],
-                "job": _normalize_job_config(job_snap),
-                "files": _normalize_outer_files(item.get("files")),
-                "result": _normalize_result(res_data),
-                "run_id": item["run_id"],
-                "attempt_no": item["attempt_no"],
-                "started_at": _format_iso_z(item["started_at"]),
-                "settled_at": _format_iso_z(item["settled_at"]),
-            }
-
-    def close(self) -> None:
-        if not self._closed:
-            self._queue_jobs.clear()
-            self._successes.clear()
-            self._failed.clear()
-            self._failure_payloads.clear()
-            self._attempts.clear()
-            self._closed = True
+# ── 单一深投影核心 StateSnapshot ───────────────────────────────────────────
 
 
 class StateSnapshot:
@@ -670,13 +719,13 @@ class StateSnapshot:
             )
         self._source = source
         self._closed = False
-        reader: _SnapshotReader
+        adapter: _SnapshotAdapter
         if isinstance(source, (str, Path)):
             db_path = Path(source)
-            reader = (
-                _SqliteCopySnapshotReader(db_path)
+            adapter = (
+                _MemoryTableAdapter.from_sqlite_copy(db_path)
                 if mode == "copy"
-                else _SqliteSnapshotReader(db_path)
+                else _SqliteStreamingAdapter(db_path)
             )
         else:
             from .pipeline import TaskLite
@@ -692,14 +741,16 @@ class StateSnapshot:
                 )
             backend = source._snapshot_backend()
             if source._state_path is not None:
-                reader = (
-                    _SqliteCopySnapshotReader(source._state_path)
+                adapter = (
+                    _MemoryTableAdapter.from_sqlite_copy(source._state_path)
                     if mode == "copy"
-                    else _SqliteSnapshotReader(source._state_path)
+                    else _SqliteStreamingAdapter(source._state_path)
                 )
             else:
-                reader = _MemorySnapshotReader(backend)
-        self._reader: _SnapshotReader = reader
+                adapter = _MemoryTableAdapter.from_consistent_snapshot(
+                    backend.load_consistent_snapshot()
+                )
+        self._adapter: _SnapshotAdapter = adapter
 
     @classmethod
     def open(
@@ -712,17 +763,25 @@ class StateSnapshot:
         return cls(source, mode=mode)
 
     @classmethod
-    def _from_reader(
+    def _from_tables(
         cls,
-        reader: _SnapshotReader,
         *,
+        queue_rows: Sequence[Mapping[str, Any]],
+        successes: Mapping[str, Mapping[str, Any]],
+        failed: Mapping[str, tuple[Mapping[str, Any], Mapping[str, Any] | None]],
+        attempts: Sequence[Mapping[str, Any]],
         source: Any = None,
     ) -> StateSnapshot:
-        """包内私有构造入口：将内部只读读取器封装为 StateSnapshot。"""
+        """包内受控表投影入口：将三表工作图与尝试轨迹副本封装为只读 StateSnapshot。"""
         instance = cls.__new__(cls)
         instance._source = source
         instance._closed = False
-        instance._reader = reader
+        instance._adapter = _MemoryTableAdapter.from_edit_tables(
+            queue_rows=queue_rows,
+            successes=successes,
+            failed=failed,
+            attempts=attempts,
+        )
         return instance
 
     @staticmethod
@@ -759,7 +818,22 @@ class StateSnapshot:
             parse_job_uid(uid)
         except Exception:
             return None
-        return self._reader.get_job(uid)
+
+        queued = self._adapter.get_queued(uid)
+        if queued is not None:
+            job_snap, status, run_id, attempt_no, started_at = queued
+            return _project_queued_job(uid, job_snap, status, run_id, attempt_no, started_at)
+
+        succ_meta = self._adapter.get_success(uid)
+        if succ_meta is not None:
+            return _project_succeeded_job(uid, succ_meta)
+
+        failed_entry = self._adapter.get_failed(uid)
+        if failed_entry is not None:
+            fail_meta, payload = failed_entry
+            return _project_failed_job(uid, fail_meta, payload)
+
+        return None
 
     def iter_jobs(
         self,
@@ -777,10 +851,27 @@ class StateSnapshot:
         if task_type is not None and not isinstance(task_type, str):
             raise TaskLiteError(f"task_type must be a str or None, got {type(task_type).__name__}")
 
-        for job in self._reader.iter_jobs(status=status, task_type=task_type):
-            if self._closed:
-                raise TaskLiteError("StateSnapshot is closed")
-            yield job
+        if status is None or status in ("pending", "running"):
+            for uid, job_snap, st, run_id, attempt_no, started_at in self._adapter.iter_queued(
+                status=status, task_type=task_type
+            ):
+                if self._closed:
+                    raise TaskLiteError("StateSnapshot is closed")
+                yield _project_queued_job(uid, job_snap, st, run_id, attempt_no, started_at)
+
+        if status is None or status == "succeeded":
+            for uid, succ_meta in self._adapter.iter_non_queued_successes(task_type=task_type):
+                if self._closed:
+                    raise TaskLiteError("StateSnapshot is closed")
+                yield _project_succeeded_job(uid, succ_meta)
+
+        if status is None or status == "failed":
+            for uid, fail_meta, payload in self._adapter.iter_non_queued_failed(
+                task_type=task_type
+            ):
+                if self._closed:
+                    raise TaskLiteError("StateSnapshot is closed")
+                yield _project_failed_job(uid, fail_meta, payload)
 
     def iter_attempts(
         self,
@@ -796,15 +887,35 @@ class StateSnapshot:
         if task_type is not None and not isinstance(task_type, str):
             raise TaskLiteError(f"task_type must be a str or None, got {type(task_type).__name__}")
 
-        for att in self._reader.iter_attempts(job_uid=job_uid, task_type=task_type):
+        for (
+            uid,
+            attempt_no,
+            run_id,
+            outcome,
+            started_at,
+            settled_at,
+            job_snap,
+            files_data,
+            result_data,
+        ) in self._adapter.iter_attempts(job_uid=job_uid, task_type=task_type):
             if self._closed:
                 raise TaskLiteError("StateSnapshot is closed")
-            yield att
+            yield _project_attempt(
+                uid,
+                attempt_no,
+                run_id,
+                outcome,
+                started_at,
+                settled_at,
+                job_snap,
+                files_data,
+                result_data,
+            )
 
     def close(self) -> None:
         """关闭只读快照（幂等；不关闭底层的 TaskLite 实例）。"""
         if not self._closed:
-            self._reader.close()
+            self._adapter.close()
             self._closed = True
 
     @property

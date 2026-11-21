@@ -16,6 +16,7 @@ import sqlite3
 import sys
 from typing import Literal, TextIO, cast
 
+from .backend.sqlite_backend import verify_existing_sqlite_database
 from .exceptions import TaskLiteError
 from .pipeline import TaskLite
 from .snapshot import StateSnapshot
@@ -32,15 +33,10 @@ def _safe_print(text: str, *, file: TextIO) -> None:
 
 
 def _validate_existing_state_path(raw_path: str) -> Path:
-    """修改类子命令前置校验：状态库必须已存在且为文件，防止构造 TaskLite 时静默建空库。"""
+    """修改类子命令前置校验：只读探活已存在的 Schema 6 状态库，杜绝静默建空库或写入 WAL/SHM。"""
     if not raw_path or not raw_path.strip():
         raise TaskLiteError("state_path must be a non-empty file path")
-    db_path = Path(raw_path)
-    if not db_path.exists():
-        raise TaskLiteError(f"Database file does not exist: {db_path}")
-    if db_path.is_dir():
-        raise TaskLiteError(f"Path is a directory, not a database file: {db_path}")
-    return db_path
+    return verify_existing_sqlite_database(raw_path)
 
 
 def _parse_entries(raw_entries: str) -> list[Literal["queue", "successes", "failures"]]:

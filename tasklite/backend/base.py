@@ -11,6 +11,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Sequence
 
+from ..exceptions import TaskLiteError
+
 
 QUEUE_EXECUTION_ID_KEY = "__tasklite_execution_id__"
 
@@ -105,6 +107,75 @@ def validate_queue_replacement(job_snapshots: Any) -> None:
             )
 
 
+def validate_graph_edit_commit(commit: Any) -> bool:
+    """校验 GraphEditCommit 前置结构契约；若为空提交返回 False，否则返回 True。
+
+    SQLite 与 Memory 双后端同源调用，确保类型错误、重复恢复载荷或缺失队列写变
+    在进入任何写事务前 fail-loud 拒绝。
+    """
+    if not isinstance(commit, GraphEditCommit):
+        raise TypeError(f"commit must be a GraphEditCommit, got {type(commit).__name__}")
+    if (
+        not commit.queue_writes
+        and not commit.success_writes
+        and not commit.failed_writes
+        and not commit.recovery_attempts
+    ):
+        return False
+
+    seen_recovery: set[str] = set()
+    for rec in commit.recovery_attempts:
+        if not isinstance(rec, RunningAttemptRecovery):
+            raise TypeError(
+                f"recovery_attempts items must be RunningAttemptRecovery, got {type(rec).__name__}"
+            )
+        if rec.job_uid in seen_recovery:
+            raise TaskLiteError(
+                f"Duplicate recovery attempt for running job {rec.job_uid!r}"
+            )
+        seen_recovery.add(rec.job_uid)
+        if rec.job_uid not in commit.queue_writes:
+            raise TaskLiteError(
+                f"Recovery attempt for {rec.job_uid!r} must also update or remove its queue row"
+            )
+    return True
+
+
+def validate_recovery_attempt_state(
+    rec: RunningAttemptRecovery,
+    *,
+    present_in_queue: bool,
+    queue_status: str | None,
+    queue_run_id: str | None,
+    queue_attempt_no: int | None,
+    queue_execution_id: str | None,
+    attempt_sequence: int | None,
+    already_settled: bool,
+) -> None:
+    """校验遗留 running 恢复载荷与后端当前执行身份、序号进度及结算态的一致性。"""
+    if not present_in_queue:
+        raise TaskLiteError(
+            f"Recovery target {rec.job_uid!r} is no longer present in queue"
+        )
+    if (
+        queue_status,
+        queue_run_id,
+        queue_attempt_no,
+        queue_execution_id,
+    ) != ("running", rec.run_id, rec.attempt_no, rec.execution_id):
+        raise TaskLiteError(
+            f"Recovery attempt does not match the running execution for {rec.job_uid!r}"
+        )
+    if attempt_sequence is None or attempt_sequence != rec.attempt_no:
+        raise TaskLiteError(
+            f"Recovery attempt sequence mismatch for {rec.job_uid!r}"
+        )
+    if already_settled:
+        raise TaskLiteError(
+            f"Execution for {rec.job_uid!r} attempt {rec.attempt_no} is already settled"
+        )
+
+
 class AbstractStateBackend(ABC):
     """SQLite 与 Memory 共用的内部持久化 Interface。
 
@@ -136,22 +207,6 @@ class AbstractStateBackend(ABC):
     @abstractmethod
     def load_queue(self) -> list[dict[str, Any]]:
         """按 queue_position 升序加载磁盘队列真相。"""
-
-    @abstractmethod
-    def load_known_job_snapshot(self, uid: str) -> dict[str, Any] | None:
-        """读取单个已知 Job 的完整配置快照。
-
-        优先级固定为队列（含 running）、successes、failed、Attempt 历史。
-        找不到时返回 None；读取或解码故障必须原样传播。
-        """
-
-    @abstractmethod
-    def load_known_job_snapshots(self) -> dict[str, dict[str, Any]]:
-        """读取全部已知 Job 的完整配置快照映射。
-
-        同一 UID 按队列（含 running）、successes、failed、Attempt 历史的
-        优先级选取。读取或解码故障必须原样传播。
-        """
 
     # delta 提交 -----------------------------------------------------
 
@@ -331,5 +386,7 @@ __all__ = [
     "AbstractStateBackend",
     "GraphEditCommit",
     "RunningAttemptRecovery",
+    "validate_graph_edit_commit",
     "validate_queue_replacement",
+    "validate_recovery_attempt_state",
 ]

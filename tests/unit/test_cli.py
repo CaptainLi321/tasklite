@@ -182,6 +182,63 @@ class TestCliStatus:
         assert rc_bad == 1
         assert err_bad.strip() != ""
 
+    @pytest.mark.parametrize(
+        "argv_builder",
+        [
+            lambda p: ["status", str(p)],
+            lambda p: ["set-status", str(p), "step_a::up", "pending", "--no-recursive"],
+            lambda p: ["remove", str(p), "step_a::up", "--no-recursive"],
+        ],
+    )
+    def test_zero_byte_empty_file_fails_nonzero_with_zero_disk_writes(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        argv_builder,
+    ) -> None:
+        empty_db = tmp_path / "empty.db"
+        empty_db.touch()
+        assert empty_db.stat().st_size == 0
+
+        rc = main(argv_builder(empty_db))
+        captured = capsys.readouterr()
+
+        assert rc == 1
+        assert captured.out == ""
+        assert captured.err.strip() != ""
+        # 零磁盘写入：文件仍为 0 字节，且未生成 -wal/-shm 旁路文件
+        assert empty_db.stat().st_size == 0
+        assert not Path(f"{empty_db}-wal").exists()
+        assert not Path(f"{empty_db}-shm").exists()
+
+    @pytest.mark.parametrize(
+        "argv_builder",
+        [
+            lambda p: ["status", str(p)],
+            lambda p: ["set-status", str(p), "step_a::up", "pending", "--no-recursive"],
+            lambda p: ["remove", str(p), "step_a::up", "--no-recursive"],
+        ],
+    )
+    def test_non_tasklite_file_fails_nonzero_with_zero_disk_writes(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        argv_builder,
+    ) -> None:
+        foreign = tmp_path / "plain.txt"
+        original_bytes = b"not a sqlite database file"
+        foreign.write_bytes(original_bytes)
+
+        rc = main(argv_builder(foreign))
+        captured = capsys.readouterr()
+
+        assert rc == 1
+        assert captured.out == ""
+        assert captured.err.strip() != ""
+        assert foreign.read_bytes() == original_bytes
+        assert not Path(f"{foreign}-wal").exists()
+        assert not Path(f"{foreign}-shm").exists()
+
 
 class TestCliSetStatus:
     """set-status 子命令：dry-run 预览、--apply 落盘、互斥参数与防建空库。"""

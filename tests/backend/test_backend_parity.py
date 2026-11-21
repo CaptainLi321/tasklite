@@ -39,8 +39,6 @@ EXPECTED_ABSTRACT_METHODS = {
     "load_failure_payloads",
     "load_cursors",
     "load_queue",
-    "load_known_job_snapshot",
-    "load_known_job_snapshots",
     "commit_job_failure",
     "commit_job_failures",
     "commit_skip",

@@ -943,3 +943,223 @@ class TestSnapshotsDiffLifecycleAndMutex:
             fd2 = try_acquire_lock(overlap_db, timeout=0)
             assert fd2 is not None
             release_lock(fd2)
+
+
+# ── 七、异名替换清三表、显式 pending 清档案、路径即时规范与重入互斥 ─────────
+
+
+class TestReplacePartitionsCanonicalPathsAndReentrancy:
+    """覆盖双分区并存节点替换、规范路径块内可见与同实例 edit() 写重入互斥。"""
+
+    def test_rename_dual_partition_job_clears_all_three_tables_and_enforces_orphan_check(
+        self, tmp_path: Path, backend_kind: str
+    ) -> None:
+        """queue + successes 并存节点异名 replace 后旧 UID 彻底消失，未迁下游必报孤儿错。"""
+        with _make_pipeline(backend_kind, tmp_path) as p:
+            p.register_task("step", _ok_handler)
+            p.enqueue(Job("step", "old"))
+            p.enqueue(Job("step", "child", depends_on=["step::old"]))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+            # 再次入队 old，使其同时存在于 queue 与 successes
+            p.enqueue(Job("step", "old"))
+
+            # 未迁移 child 的依赖时，异名替换 old -> new 必报孤儿错误且不残留旧幽灵
+            with pytest.raises(TaskLiteError, match="lost existing dependency"):
+                with p.edit(dry_run=False) as tx:
+                    tx.replace("step::old", Job("step", "new"))
+                    assert "step::old" not in tx
+                    assert "step::new" in tx
+                    assert tx.after.get_job("step::old") is None
+
+            # 同步迁移 child 依赖后可干净提交，重开快照中彻底不存在 step::old
+            with p.edit(dry_run=False) as tx:
+                tx.replace("step::old", Job("step", "new"))
+                tx.replace("step::child", Job("step", "child", depends_on=["step::new"]))
+                assert "step::old" not in tx
+                assert "step::new" in tx
+
+            with StateSnapshot.open(p) as snap:
+                assert snap.get_job("step::old") is None
+                new_rec = snap.get_job("step::new")
+                assert new_rec is not None and new_rec["status"] == "pending"
+                child_rec = snap.get_job("step::child")
+                assert child_rec is not None and child_rec["job"]["depends_on"] == ["step::new"]
+
+    def test_explicit_pending_status_clears_residual_archive_while_none_preserves_it(
+        self, tmp_path: Path, backend_kind: str
+    ) -> None:
+        """queue + successes 并存节点显式 status='pending' 清档案且重跑生效；status=None 保留并告警。"""
+        with _make_pipeline(backend_kind, tmp_path) as p:
+            p.register_task("step", _ok_handler, trigger="once")
+            p.enqueue(Job("step", "item", payload={"ver": 1}))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+            # 再次入队使其同时在 queue 与 successes 并存
+            p.enqueue(Job("step", "item", payload={"ver": 1}))
+
+            # 1) status=None 同名替换：保留历史 successes 档案并触发历史档案告警
+            with p.edit(dry_run=True) as tx:
+                tx.replace("step::item", Job("step", "item", payload={"ver": 2}))
+                diff_inherit = tx.diff()
+                assert "historical ['successes'] archive" in diff_inherit
+
+            # 2) 显式 status='pending'：清空历史 successes 档案、无告警、下次 run() 真实执行新配置
+            with p.edit(dry_run=False) as tx:
+                tx.replace("step::item", Job("step", "item", payload={"ver": 2}), status="pending")
+                diff_explicit = tx.diff()
+                assert "historical ['successes'] archive" not in diff_explicit
+                assert "[WARNINGS]\n  (none)" in diff_explicit
+
+            with in_process_workers(p):
+                p.run(install_signals=False)
+            with StateSnapshot.open(p) as snap:
+                rec = snap.get_job("step::item")
+                assert rec is not None and rec["status"] == "succeeded"
+                assert rec["result"]["metadata"]["payload"] == {"ver": 2}
+                assert len(list(snap.iter_attempts(job_uid="step::item"))) == 2
+
+    def test_replace_many_swap_with_dual_partition_nodes_leaves_no_ghost(
+        self, tmp_path: Path, backend_kind: str
+    ) -> None:
+        """replace_many 互换含 queue + successes 并存的节点时无残留历史污染。"""
+        with _make_pipeline(backend_kind, tmp_path) as p:
+            p.register_task("step", _ok_handler, trigger="once")
+            p.enqueue(Job("step", "alpha", payload={"origin": "alpha"}))
+            p.enqueue(Job("step", "beta", payload={"origin": "beta"}))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+            # 让 alpha 和 beta 均进入 queue + successes 并存态
+            p.enqueue(Job("step", "alpha", payload={"origin": "alpha"}))
+            p.enqueue(Job("step", "beta", payload={"origin": "beta"}))
+
+            with p.edit(dry_run=False) as tx:
+                tx.replace_many({
+                    "step::alpha": Job("step", "beta", payload={"from": "alpha"}),
+                    "step::beta": Job("step", "alpha", payload={"from": "beta"}),
+                })
+                diff_txt = tx.diff()
+                # 异名互换已清空双方三表，不应残留对方历史档案告警
+                assert "historical" not in diff_txt
+
+            with in_process_workers(p):
+                p.run(install_signals=False)
+            with StateSnapshot.open(p) as snap:
+                rec_a = snap.get_job("step::alpha")
+                rec_b = snap.get_job("step::beta")
+                assert rec_a is not None and rec_a["status"] == "succeeded"
+                assert rec_b is not None and rec_b["status"] == "succeeded"
+                assert rec_a["result"]["metadata"]["payload"] == {"from": "beta"}
+                assert rec_b["result"]["metadata"]["payload"] == {"from": "alpha"}
+
+    def test_manual_succeeded_canonical_path_visible_in_context_and_no_false_diff(
+        self, tmp_path: Path, backend_kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """相对路径与父目录软链在块内 tx.after 即规范化，且等价路径替换不触发 files 假阳性 diff。"""
+        real_dir = tmp_path / "real_out"
+        real_dir.mkdir()
+        out_file = real_dir / "result.dat"
+        out_file.write_text("payload", encoding="utf-8")
+        alias_dir = tmp_path / "alias_out"
+        alias_dir.symlink_to(real_dir, target_is_directory=True)
+
+        monkeypatch.chdir(tmp_path)
+        expected_canonical = str(out_file.resolve())
+
+        with _make_pipeline(backend_kind, tmp_path) as p:
+            p.register_task("step", _ok_handler)
+
+            # 相对路径 + 父目录软链路径 add(..., status="succeeded")
+            with p.edit(dry_run=False) as tx:
+                tx.add(
+                    Job("step", "rel", files={"out": FileSpec("real_out/result.dat", role="output")}),
+                    status="succeeded",
+                )
+                tx.add(
+                    Job("step", "symparent", files={"out": FileSpec(alias_dir / "result.dat", role="output")}),
+                    status="succeeded",
+                )
+                # 块内首次读取 tx.after 即为规范绝对路径，无退出后突变
+                rel_in_ctx = tx.after.get_job("step::rel")
+                sym_in_ctx = tx.after.get_job("step::symparent")
+                assert rel_in_ctx is not None
+                assert sym_in_ctx is not None
+                assert rel_in_ctx["files"]["out"]["path"] == expected_canonical
+                assert sym_in_ctx["files"]["out"]["path"] == expected_canonical
+
+            assert tx.after.get_job("step::rel")["files"]["out"]["path"] == expected_canonical  # type: ignore[index]
+            with StateSnapshot.open(p) as snap:
+                assert snap.get_job("step::rel")["files"]["out"]["path"] == expected_canonical  # type: ignore[index]
+                assert snap.get_job("step::symparent")["files"]["out"]["path"] == expected_canonical  # type: ignore[index]
+
+            # 基准为规范绝对路径，替换为指向同一物理文件的相对路径时 diff 不误报 files 变更
+            with p.edit(dry_run=False) as tx:
+                tx.add(
+                    Job("step", "abs_base", files={"out": FileSpec(expected_canonical, role="output")}),
+                    status="succeeded",
+                )
+            with p.edit(dry_run=True) as tx:
+                tx.replace(
+                    "step::abs_base",
+                    Job("step", "abs_base", files={"out": FileSpec("real_out/result.dat", role="output")}),
+                )
+                # 块内 tx.after 已规范化
+                assert tx.after.get_job("step::abs_base")["files"]["out"]["path"] == expected_canonical  # type: ignore[index]
+                diff_txt = tx.diff()
+                assert "files{" not in diff_txt
+                assert "(no field changes)" in diff_txt
+
+    def test_editing_guard_blocks_reentrant_pipeline_apis_and_recovers_after_exit(
+        self, tmp_path: Path, backend_kind: str
+    ) -> None:
+        """with pipeline.edit() 块内调用任意同实例读写/注册/运行/关闭接口必抛 TaskLiteError 且零写入。"""
+        from tasklite.resource import CapacityResource
+
+        auth_target = tmp_path / "auth_dir"
+        auth_target.mkdir()
+
+        with _make_pipeline(backend_kind, tmp_path) as p:
+            p.register_task("t", _ok_handler)
+            p.set_cursor("seed", "v0")
+            p.grant_authorization(auth_target, target_type="directory")
+
+            with p.edit(dry_run=True):
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.enqueue(Job("t", "blocked"))
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.set_cursor("seed", "v1")
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.get_cursor("seed")
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.grant_authorization(tmp_path / "other", target_type="file")
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.list_authorizations()
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.revoke_authorization(auth_target)
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.register_task("t_extra", _ok_handler)
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.register_resource(CapacityResource("gpu", max_capacity=1))
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.register_trigger("custom_trig", lambda ctx: True)
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.run(install_signals=False)
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.close()
+                with pytest.raises(TaskLiteError, match="edit\\(\\) transaction is active"):
+                    p.edit(dry_run=True)
+
+            # 正常退出后恢复可用，且块内被拒调用均零写入
+            assert p.get_cursor("seed") == "v0"
+            assert len(p.list_authorizations()) == 1
+            with StateSnapshot.open(p) as snap:
+                assert snap.get_job("t::blocked") is None
+
+            # 异常退出后同样复位 _editing，实例恢复可用
+            with pytest.raises(RuntimeError, match="boom"):
+                with p.edit(dry_run=True):
+                    raise RuntimeError("boom")
+
+            assert p.enqueue(Job("t", "after_exception")) is True
+            p.set_cursor("seed", "v2")
+            assert p.get_cursor("seed") == "v2"

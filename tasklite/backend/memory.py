@@ -23,7 +23,9 @@ from .base import (
     public_queue_snapshot,
     queue_snapshot_execution_id,
     queue_snapshot_with_execution_id,
+    validate_graph_edit_commit,
     validate_queue_replacement,
+    validate_recovery_attempt_state,
 )
 from ..exceptions import TaskLiteError
 from ..models.state import job_uid_from_snapshot
@@ -157,31 +159,8 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     def commit_graph_edit(self, commit: GraphEditCommit) -> None:
         """在单锁 Copy-on-Write 临界区内校验并原子应用图修整变更，故障零污染。"""
-        if not isinstance(commit, GraphEditCommit):
-            raise TypeError(f"commit must be a GraphEditCommit, got {type(commit).__name__}")
-        if (
-            not commit.queue_writes
-            and not commit.success_writes
-            and not commit.failed_writes
-            and not commit.recovery_attempts
-        ):
+        if not validate_graph_edit_commit(commit):
             return
-
-        seen_recovery: set[str] = set()
-        for rec in commit.recovery_attempts:
-            if not isinstance(rec, RunningAttemptRecovery):
-                raise TypeError(
-                    f"recovery_attempts items must be RunningAttemptRecovery, got {type(rec).__name__}"
-                )
-            if rec.job_uid in seen_recovery:
-                raise TaskLiteError(
-                    f"Duplicate recovery attempt for running job {rec.job_uid!r}"
-                )
-            seen_recovery.add(rec.job_uid)
-            if rec.job_uid not in commit.queue_writes:
-                raise TaskLiteError(
-                    f"Recovery attempt for {rec.job_uid!r} must also update or remove its queue row"
-                )
 
         with self._lock:
             new_attempts = dict(self._attempts)
@@ -193,31 +172,23 @@ class InMemoryStateBackend(AbstractStateBackend):
                     (item for item in self._queue if job_uid_from_snapshot(item) == rec.job_uid),
                     None,
                 )
-                if running is None:
-                    raise TaskLiteError(
-                        f"Recovery target {rec.job_uid!r} is no longer present in queue"
-                    )
-                if (
-                    running.get("status"),
-                    running.get("run_id"),
-                    running.get("attempt_no"),
-                    queue_snapshot_execution_id(running),
-                ) != ("running", rec.run_id, rec.attempt_no, rec.execution_id):
-                    raise TaskLiteError(
-                        f"Recovery attempt does not match the running execution for {rec.job_uid!r}"
-                    )
-                if self._job_sequences.get(rec.job_uid, 0) != rec.attempt_no:
-                    raise TaskLiteError(
-                        f"Recovery attempt sequence mismatch for {rec.job_uid!r}"
-                    )
-                if any(
+                settled = any(
                     attempt.get("job_uid") == rec.job_uid
                     and attempt.get("attempt_no") == rec.attempt_no
                     for attempt in new_attempts.values()
-                ):
-                    raise TaskLiteError(
-                        f"Execution for {rec.job_uid!r} attempt {rec.attempt_no} is already settled"
-                    )
+                )
+                validate_recovery_attempt_state(
+                    rec,
+                    present_in_queue=running is not None,
+                    queue_status=running.get("status") if running is not None else None,
+                    queue_run_id=running.get("run_id") if running is not None else None,
+                    queue_attempt_no=running.get("attempt_no") if running is not None else None,
+                    queue_execution_id=(
+                        queue_snapshot_execution_id(running) if running is not None else None
+                    ),
+                    attempt_sequence=self._job_sequences.get(rec.job_uid),
+                    already_settled=settled,
+                )
                 new_attempts[new_attempt_seq] = {
                     "attempt_id": new_attempt_seq,
                     "job_uid": rec.job_uid,
@@ -283,62 +254,6 @@ class InMemoryStateBackend(AbstractStateBackend):
             self._successes = new_successes
             self._failed = new_failed
             self._failure_payloads = new_failure_payloads
-
-    @staticmethod
-    def _snapshot_from_metadata(metadata: Any) -> dict[str, Any] | None:
-        if not isinstance(metadata, dict):
-            return None
-        snapshot = metadata.get("job_snapshot")
-        return snapshot if isinstance(snapshot, dict) else None
-
-    def load_known_job_snapshot(self, uid: str) -> dict[str, Any] | None:
-        """按队列、成功、失败、Attempt 历史的优先级读取完整配置。"""
-        with self._lock:
-            for snapshot in self._queue:
-                if job_uid_from_snapshot(snapshot) == uid:
-                    return public_queue_snapshot(snapshot)
-
-            success_snapshot = self._snapshot_from_metadata(self._successes.get(uid))
-            if success_snapshot is not None:
-                return copy.deepcopy(success_snapshot)
-
-            failure_snapshot = self._snapshot_from_metadata(self._failed.get(uid))
-            if failure_snapshot is not None:
-                return copy.deepcopy(failure_snapshot)
-
-            for attempt_id in sorted(self._attempts, reverse=True):
-                attempt = self._attempts[attempt_id]
-                if attempt.get("job_uid") != uid:
-                    continue
-                attempt_snapshot = attempt.get("job")
-                if isinstance(attempt_snapshot, dict):
-                    return copy.deepcopy(attempt_snapshot)
-        return None
-
-    def load_known_job_snapshots(self) -> dict[str, dict[str, Any]]:
-        """读取全部已知 Job 的完整配置，低优先级来源先写入。"""
-        with self._lock:
-            known: dict[str, dict[str, Any]] = {}
-            for attempt_id in sorted(self._attempts):
-                attempt = self._attempts[attempt_id]
-                uid = attempt.get("job_uid")
-                snapshot = attempt.get("job")
-                if isinstance(uid, str) and isinstance(snapshot, dict):
-                    known[uid] = copy.deepcopy(snapshot)
-
-            for uid, metadata in self._failed.items():
-                snapshot = self._snapshot_from_metadata(metadata)
-                if snapshot is not None:
-                    known[uid] = copy.deepcopy(snapshot)
-
-            for uid, metadata in self._successes.items():
-                snapshot = self._snapshot_from_metadata(metadata)
-                if snapshot is not None:
-                    known[uid] = copy.deepcopy(snapshot)
-
-            for snapshot in self._queue:
-                known[job_uid_from_snapshot(snapshot)] = public_queue_snapshot(snapshot)
-        return known
 
     def get_cursor(self, key: str) -> str | None:
         """查询单个游标的最新已提交值，不存在返回 None。"""
@@ -429,7 +344,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 "failed": self.load_failed(),
                 "failure_payloads": self.load_failure_payloads(),
                 # attempts 单条记录入库时已深拷贝不可变，锁内仅浅拷贝外层列表以控制峰值内存；
-                # 查询输出的深拷贝隔离由 _MemorySnapshotReader._normalize_* 负责。
+                # 查询输出的深拷贝隔离由快照投影核心负责。
                 "attempts": list(self._attempts.values()),
                 "job_sequences": dict(self._job_sequences),
             }

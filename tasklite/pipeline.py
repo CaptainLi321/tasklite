@@ -89,6 +89,7 @@ class TaskLite:
             )
 
         self._closed: bool = False
+        self._editing: bool = False
         self._base_dir: Path = Path(os.path.abspath(os.getcwd()))
         self._backend_type: str = backend
         self._backend_handle: AbstractStateBackend | None = None
@@ -142,9 +143,14 @@ class TaskLite:
         self.close()
 
     def close(self) -> None:
-        """释放资源且运行期拒绝调用，重复关闭无操作。"""
+        """释放资源且运行期或图修整事务期间拒绝调用，重复关闭无操作。"""
         if self.is_running:
             raise TaskLiteError("Cannot close TaskLite while run() is in progress.")
+        if self._editing:
+            raise TaskLiteError(
+                "Cannot close TaskLite while an edit() transaction is active "
+                "(concurrent operations on the same TaskLite instance are forbidden)."
+            )
         if self._closed:
             return
         self._closed = True
@@ -212,8 +218,12 @@ class TaskLite:
             raise TaskLiteError("TaskLite backend is unavailable")
         return backend
 
+    def _set_editing(self, active: bool) -> None:
+        """受控事务态切换回调，仅由 EditTransaction.__enter__ / __exit__ 成对维护。"""
+        self._editing = active
+
     def _ensure_active(self, api_name: str) -> None:
-        """管理/入队/注册 API 的状态守卫（关闭或运行期间拒绝）。"""
+        """管理/入队/注册 API 的状态守卫（关闭、运行或图修整事务期间拒绝）。"""
         if self._closed:
             raise TaskLiteError(
                 f"Cannot call {api_name}() on a closed TaskLite instance."
@@ -222,6 +232,11 @@ class TaskLite:
             raise TaskLiteError(
                 f"{api_name}() is only allowed outside run(); "
                 f"current run is in progress."
+            )
+        if self._editing:
+            raise TaskLiteError(
+                f"Cannot call {api_name}() while an edit() transaction is active "
+                f"(concurrent operations on the same TaskLite instance are forbidden)."
             )
 
     # ── 注册面（六步之二/三）───────────────────────────────────────
@@ -353,6 +368,7 @@ class TaskLite:
             dry_run=dry_run,
             note=note,
             ensure_active=self._ensure_active,
+            set_editing=self._set_editing,
         )
 
     def get_cursor(self, key: str) -> str | None:
