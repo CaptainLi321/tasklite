@@ -1,19 +1,12 @@
-"""v2 执行通道：子进程 spawn、阶梯看门狗、瞬时 Pipe 收割、fencing 与 TOCTOU 中止。
+"""v2 执行通道：跨平台子进程启动、阶梯看门狗、瞬时 Pipe 收割、fencing 与 TOCTOU 中止。
 
-ExecutionChannel 统一内敛子进程派发、看门狗阶梯终止、单向 Pipe 消息收割、
-跨平台排他文件锁探测与 TOCTOU 闭环清理的底层复杂性。
-
-spawn 上下文显式取 ``mp.get_context("spawn")``：fork 会把父进程的锁
-状态/线程/连接池半成品复制进子进程（引擎侧任何锁的持有状态都会在
-子进程镜像里失真），spawn 注册表经 WorkerLaunchSpec 显式下发、不经
-继承，进程 seam 的全部载荷具名可审计。
+ExecutionChannel 统一内敛子进程派发（经 WorkerLauncher / ProcessTreeAdapter
+双层内部接缝）、看门狗阶梯终止、单向 Pipe 消息收割与 TOCTOU 闭环清理的底层复杂性。
 """
 
 from __future__ import annotations
 
-import dataclasses
 import logging
-import multiprocessing as mp
 import os
 import signal
 import threading
@@ -29,7 +22,6 @@ from ..models.context import JobContext
 from ..models.job import Job
 from ..models.result import TaskResult, validate_strict_json_object
 from ..utils.artifact import PathPolicy
-from ..utils.clock import utc_now_iso
 from ..utils.ipc import (
     PIPE_MSG_DECLARE,
     PIPE_MSG_RESULT,
@@ -38,10 +30,14 @@ from ..utils.ipc import (
     WorkerPipeSender,
     WorkerReplyReceiver,
     WorkerReplySender,
-    create_worker_pipe,
-    create_worker_reply_pipe,
 )
-from .types import AuthorizationOutcome, JobHandle
+from .launcher import (
+    LaunchedWorker,
+    SubprocessWorkerLauncher,
+    WorkerLauncher,
+    _WorkerLaunchCancelled,
+)
+from .types import AuthorizationOutcome, JobHandle, is_importing_mp_main
 
 logger = logging.getLogger("tasklite")
 
@@ -256,17 +252,17 @@ def _decode_ipc_result(
 
 
 def _isolate_worker_process_signals() -> None:
-    """让进程组停止信号只由主进程处理（进程内线程替身不改主线程信号）。"""
-    if os.name != "posix" or threading.current_thread() is not threading.main_thread():
+    """让进程组/控制台停止信号只由主进程处理（进程内线程替身不改主线程信号）。"""
+    if threading.current_thread() is not threading.main_thread():
         return
-    setsid = getattr(os, "setsid", None)
-    if setsid is not None:
-        try:
-            setsid()
-        except OSError:
-            pass
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if os.name == "posix":
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    elif os.name == "nt":
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        sigbreak = getattr(signal, "SIGBREAK", None)
+        if sigbreak is not None:
+            signal.signal(sigbreak, signal.SIG_IGN)
 
 
 def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
@@ -399,7 +395,7 @@ class ExecutionResult:
 
 @dataclass(frozen=True)
 class WorkerLaunchSpec:
-    """进程 seam 具名契约——spawn 下发子进程执行体的全部载荷。
+    """进程 seam 具名契约——下发子进程执行体的全部载荷。
 
     execution_id（``{run_id}.{dispatch_no}`` 执行身份）与管道发送端归
     本 spec，不借道 JobContext 公开属性穿透进程边界。
@@ -415,6 +411,7 @@ class WorkerLaunchSpec:
     run_id: str = ""
     attempt_no: int = 1
     launch_guard: Callable[[], bool] | None = None
+    commit_hook: Callable[[Callable[[], JobHandle]], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -425,10 +422,6 @@ class AbortOutcome:
     cancelled: list[JobHandle]
 
 
-class _WorkerLaunchCancelled(Exception):
-    """最终启动门前观察到停止请求，子进程不得启动。"""
-
-
 class ExecutionChannel:
     """标准子进程执行通道深模块实现。"""
 
@@ -437,11 +430,13 @@ class ExecutionChannel:
     def __init__(
         self,
         *,
-        process_context: Any | None = None,
+        launcher: WorkerLauncher | None = None,
         protected_roots: Sequence[str | Path] = (),
         path_policy: PathPolicy | None = None,
     ) -> None:
-        self._process_context = process_context or mp.get_context("spawn")
+        self._launcher: WorkerLauncher = (
+            launcher if launcher is not None else SubprocessWorkerLauncher()
+        )
         if path_policy is not None:
             merged_roots = tuple(dict.fromkeys((*path_policy.protected_paths, *(Path(r) for r in protected_roots))))
         else:
@@ -458,6 +453,34 @@ class ExecutionChannel:
         self._errors: dict[str, Exception] = {}
         self._lingering_workers: list[tuple[str, Any, WorkerPipeReceiver | None]] = []
         self._health_stops: dict[str, threading.Event] = {}
+        self._pending_lock = threading.Lock()
+        self._pending_launches: dict[str, threading.Event] = {}
+
+    @property
+    def has_active_workers(self) -> bool:
+        """通道是否存在在途、残留或正在握手的 worker。"""
+        self._reap_lingering_workers()
+        with self._pending_lock:
+            has_pending = bool(self._pending_launches)
+        return bool(self._handles or self._lingering_workers or has_pending)
+
+    def cancel_pending_launches(self) -> None:
+        """立即唤醒并中止全部尚在握手/预送阶段的未提交启动。"""
+        with self._pending_lock:
+            events = list(self._pending_launches.values())
+        for ev in events:
+            ev.set()
+
+    @staticmethod
+    def _kill_process(p: Any) -> None:
+        """优先调用进程树原子终止接口，兼容测试进程桩的 kill()。"""
+        kill_tree = getattr(p, "kill_tree", None)
+        if callable(kill_tree):
+            kill_tree()
+            return
+        kill = getattr(p, "kill", None)
+        if callable(kill):
+            kill()
 
     @staticmethod
     def _terminate_and_join_process(p: Any) -> None:
@@ -465,92 +488,130 @@ class ExecutionChannel:
         if getattr(p, "_closed", False):
             return
         try:
-            if p.is_alive():
-                p.kill()
+            is_alive_fn = getattr(p, "is_alive", None)
+            if callable(is_alive_fn) and is_alive_fn():
+                ExecutionChannel._kill_process(p)
         except Exception as e:
             logger.warning(f"Process kill failed during finalize: {e}")
         try:
-            if not isinstance(p, mp.process.BaseProcess) or getattr(p, "_popen", None) is not None:
-                p.join(timeout=ExecutionChannel._JOIN_REAP_TIMEOUT)
+            join_fn = getattr(p, "join", None)
+            if callable(join_fn):
+                join_fn(timeout=ExecutionChannel._JOIN_REAP_TIMEOUT)
         except Exception as e:
             logger.warning(f"Process join failed during finalize: {e}")
 
     @staticmethod
     def _finalize_process(p: Any) -> None:
-        """清理单个子进程：kill + join + close（各步失败降级但留痕，不阻断收割）。"""
+        """清理单个子进程：kill_tree + join + close（各步失败降级但留痕，不阻断收割）。"""
         if getattr(p, "_closed", False):
             return
         ExecutionChannel._terminate_and_join_process(p)
         try:
             process_close = getattr(p, "close", None)
-            if process_close is not None:
+            if callable(process_close):
                 process_close()
         except Exception as e:
             logger.warning(f"Process close failed during finalize: {e}")
 
-    def spawn(self, spec: WorkerLaunchSpec) -> JobHandle:
-        """启动隔离子进程执行 handler，建立瞬时管道与 execution_id 绑定，立即返回句柄。"""
-        receiver, sender = create_worker_pipe(
-            self._process_context,
-            job_uid=spec.job.uid,
-            execution_id=spec.execution_id,
-            run_id=spec.run_id or None,
-            attempt_no=spec.attempt_no,
-            on_message=self._notify_wakeup,
-        )
-        reply_receiver, reply_sender = create_worker_reply_pipe(
-            self._process_context,
-            job_uid=spec.job.uid,
-            execution_id=spec.execution_id,
-            run_id=spec.run_id or None,
-            attempt_no=spec.attempt_no,
-        )
-        spec.job_context._bind_pipe_sender(sender, reply_receiver)
-        launch_spec = dataclasses.replace(
-            spec,
-            pipe_sender=sender,
-            reply_receiver=reply_receiver,
-            launch_guard=None,
-        )
-        p = None
-        try:
-            p = self._process_context.Process(target=_worker_process_entry, args=(launch_spec,))
-            if spec.launch_guard is not None and not spec.launch_guard():
-                raise _WorkerLaunchCancelled(
-                    f"stop requested before worker process start for {spec.job.uid}"
-                )
-            started_at = utc_now_iso()
-            p.start()
-        except Exception:
-            sender.close()
-            receiver.close()
-            reply_receiver.close()
-            reply_sender.close()
-            if p is not None:
-                self._finalize_process(p)
-            raise
-        if isinstance(p, mp.process.BaseProcess):
-            sender.close()
-            reply_receiver.close()
-        else:
-            self._in_process_senders[spec.execution_id] = sender
-        self._reply_senders[spec.execution_id] = reply_sender
+    def _register_launched_worker(
+        self,
+        spec: WorkerLaunchSpec,
+        launched: LaunchedWorker,
+    ) -> JobHandle:
+        """将已放行的 worker 登记进通道映射并启动健康探测线程。"""
+        exec_id = spec.execution_id
+        if launched.in_process_sender is not None:
+            self._in_process_senders[exec_id] = launched.in_process_sender
+        self._reply_senders[exec_id] = launched.reply_sender
         timeout_at_monotonic = time.monotonic() + spec.timeout_seconds
         handle = JobHandle(
             job_uid=spec.job.uid,
-            process=p,
+            process=launched.handle,
             timeout_at_monotonic=timeout_at_monotonic,
             timeout_seconds=spec.timeout_seconds,
-            started_at=started_at,
+            started_at=launched.started_at,
             job=spec.job,
-            execution_id=spec.execution_id,
+            execution_id=exec_id,
             run_id=spec.run_id or None,
             attempt_no=spec.attempt_no,
         )
-        self._receivers[spec.execution_id] = receiver
-        self._handles[spec.execution_id] = handle
-        self._watch_process_health(spec.execution_id, p)
+        self._receivers[exec_id] = launched.receiver
+        self._handles[exec_id] = handle
+        self._watch_process_health(exec_id, launched.handle)
         return handle
+
+    def _unregister_launched_worker(self, exec_id: str) -> None:
+        """在提交门中途回滚时撤回通道内存登记（句柄清理由 launcher 统一负责）。"""
+        stop = self._health_stops.pop(exec_id, None)
+        if stop is not None:
+            stop.set()
+        self._in_process_senders.pop(exec_id, None)
+        self._reply_senders.pop(exec_id, None)
+        self._receivers.pop(exec_id, None)
+        self._handles.pop(exec_id, None)
+
+    def spawn(self, spec: WorkerLaunchSpec) -> JobHandle:
+        """启动隔离子进程执行 handler，经握手屏障与提交门放行并返回句柄。"""
+        if is_importing_mp_main():
+            raise RuntimeError(
+                "ExecutionChannel.spawn() cannot be called while bootstrapping a worker process. "
+                "Guard top-level execution with `if __name__ == '__main__':`."
+            )
+
+        cancel_event = threading.Event()
+        launch_key = spec.execution_id or f"_pending_{id(cancel_event)}"
+        with self._pending_lock:
+            self._pending_launches[launch_key] = cancel_event
+
+        registered_handle: JobHandle | None = None
+        try:
+            if spec.launch_guard is not None and not spec.launch_guard():
+                cancel_event.set()
+                raise _WorkerLaunchCancelled(
+                    f"stop requested before worker process start for {spec.job.uid}"
+                )
+
+            def commit_gate(
+                launched: LaunchedWorker,
+                release_fn: Callable[[], None],
+            ) -> None:
+                nonlocal registered_handle
+
+                def _finalize_launch() -> JobHandle:
+                    nonlocal registered_handle
+                    if cancel_event.is_set() or (
+                        spec.launch_guard is not None and not spec.launch_guard()
+                    ):
+                        raise _WorkerLaunchCancelled(
+                            f"stop requested before worker release for {spec.job.uid}"
+                        )
+                    release_fn()
+                    handle = self._register_launched_worker(spec, launched)
+                    registered_handle = handle
+                    return handle
+
+                try:
+                    if spec.commit_hook is not None:
+                        spec.commit_hook(_finalize_launch)
+                    else:
+                        _finalize_launch()
+                except BaseException:
+                    if registered_handle is not None:
+                        self._unregister_launched_worker(spec.execution_id)
+                        registered_handle = None
+                    raise
+
+            self._launcher.launch(
+                spec,
+                on_message=self._notify_wakeup,
+                cancel_event=cancel_event,
+                commit_gate=commit_gate,
+            )
+            assert registered_handle is not None
+            return registered_handle
+        finally:
+            with self._pending_lock:
+                self._pending_launches.pop(launch_key, None)
 
     def _watch_process_health(self, execution_id: str, process: Any) -> None:
         """独立探测 worker 存活，仅在状态变化时唤醒主循环。"""
@@ -656,12 +717,13 @@ class ExecutionChannel:
             callback()
 
     def terminate_process(self, handle: JobHandle) -> None:
-        """终止指定作业的子进程。"""
+        """终止指定作业的子进程树。"""
         p = handle.process
         if p is not None:
             try:
-                if p.is_alive():
-                    p.kill()
+                is_alive_fn = getattr(p, "is_alive", None)
+                if callable(is_alive_fn) and is_alive_fn():
+                    self._kill_process(p)
             except Exception:
                 pass
 
@@ -843,7 +905,7 @@ class ExecutionChannel:
                 p.join(timeout=0.5)
                 if p.is_alive():
                     try:
-                        p.kill()
+                        self._kill_process(p)
                     except Exception:
                         pass
                 completed.append(
@@ -899,24 +961,33 @@ class ExecutionChannel:
     def _build_terminal_failure(
         p: Any, handle: JobHandle, *, is_timeout: bool
     ) -> ExecutionResult:
-        """构造进程终止（崩溃/超时）但无有效结果时的失败证据。"""
-        exitcode = getattr(p, "exitcode", None)
+        """构造进程终止（崩溃/超时/强杀）但无有效结果时的失败证据。"""
+        raw_exitcode = getattr(p, "exitcode", None)
+        exitcode: int | None = (
+            raw_exitcode
+            if isinstance(raw_exitcode, int) and not isinstance(raw_exitcode, bool)
+            else None
+        )
+        was_force_killed = bool(getattr(p, "was_force_killed", False))
         annotations: dict[str, Any] = {}
         if is_timeout:
             message = f"Worker timed out after {handle.timeout_seconds}s"
             annotations["timed_out"] = True
-        elif isinstance(exitcode, int) and not isinstance(exitcode, bool) and exitcode < 0:
+        elif exitcode is not None and exitcode < 0:
             try:
                 signal_name = signal.Signals(-exitcode).name
             except (ValueError, AttributeError):
                 signal_name = f"SIGNO{-exitcode}"
             message = f"Worker exited on signal {signal_name} ({exitcode}) without a result"
             annotations["signal"] = signal_name
-        elif isinstance(exitcode, int) and not isinstance(exitcode, bool) and exitcode > 0:
+        elif was_force_killed:
+            message = "Worker was forcefully terminated without a result"
+            annotations["terminated"] = True
+        elif exitcode is not None and exitcode > 0:
             message = f"Worker exited with code {exitcode} without a result"
         else:
             message = "Worker exited without a result frame"
-        if isinstance(exitcode, int) and not isinstance(exitcode, bool):
+        if exitcode is not None:
             annotations["exitcode"] = exitcode
         return ExecutionResult(
             success=False,
@@ -925,7 +996,8 @@ class ExecutionChannel:
         )
 
     def abort_in_flight(self, handles: Sequence[JobHandle]) -> AbortOutcome:
-        """TOCTOU 闭环中止：初查分类 → 进程终止 → 排空管道至 EOF → 重探测闭环 → 关闭管道。"""
+        """TOCTOU 闭环中止：取消未提交启动 → 初查分类 → 进程树终止 → 排空管道至 EOF → 重探测闭环 → 关闭管道。"""
+        self.cancel_pending_launches()
         if not handles:
             return AbortOutcome(completed=[], cancelled=[])
 
@@ -972,7 +1044,8 @@ class ExecutionChannel:
         return AbortOutcome(completed=done_pairs, cancelled=truly_cancelled)
 
     def cleanup_in_flight(self, handles: Sequence[JobHandle]) -> None:
-        """主循环异常退出时 kill + join 所有残留 in-flight 子进程并关闭管道与声明。"""
+        """主循环异常退出时取消未提交启动、终止并回收所有残留 in-flight 子进程与管道。"""
+        self.cancel_pending_launches()
         for exec_id, p, receiver in self._lingering_workers:
             try:
                 self._finalize_process(p)

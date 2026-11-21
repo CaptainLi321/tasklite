@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
-import multiprocessing as mp
+import ctypes
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 
@@ -149,7 +151,7 @@ def pipelines(tmp_path, monkeypatch):
                 pipeline.stop()
             finally:
                 pipeline.close()
-    assert not mp.active_children()
+    assert all(not pipeline._runtime.channel.has_active_workers for pipeline in created)
     assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 
 
@@ -241,7 +243,7 @@ def test_spawn_and_declarations_ignore_directory_environment(tmp_path, monkeypat
         assert pipeline.get_cursor("position") == "42"
         pipeline.stop()
         assert not ipc_path.parent.exists()
-    assert not mp.active_children()
+        assert not pipeline._runtime.channel.has_active_workers
     assert not [t for t in threading.enumerate() if t.name.startswith("tasklite-pipe-recv-")]
 
 
@@ -346,15 +348,23 @@ def test_process_death_is_single_failure_without_implicit_retry(pipelines, tmp_p
         assert len(attempts) == 1 and attempts[0]["attempt_no"] == 1 and attempts[0]["outcome"] == "failure"
         assert list(snap.iter_jobs(status="succeeded")) == []
         result = rec["result"]
-    expected = {"kill": "signal", "crash": "code 7", "timeout": "timed out"}[mode]
-    assert expected in result["message"]
+    if mode == "kill":
+        if os.name == "nt":
+            assert "terminated" in result["message"]
+            assert result["annotations"]["terminated"] is True
+            assert result["annotations"]["exitcode"] == 1
+        else:
+            assert "signal" in result["message"]
+            assert result["annotations"]["exitcode"] == -9
+    elif mode == "timeout":
+        assert "timed out" in result["message"]
+        assert result["annotations"]["timed_out"] is True
+    else:
+        assert "code 7" in result["message"]
+        assert result["annotations"]["exitcode"] == 7
     assert result["metadata"] == {}
     assert result["exception"] is None
     assert "oom_hint" not in result["annotations"]
-    if mode == "timeout":
-        assert result["annotations"]["timed_out"] is True
-    else:
-        assert result["annotations"]["exitcode"] == (-9 if mode == "kill" else 7)
     if mode == "kill":
         assert not (tmp_path / "output" / "authorized.txt").exists()
         assert (tmp_path / "output" / "retained.txt").exists()
@@ -478,3 +488,290 @@ def test_invalid_message_cannot_register_success(pipelines, tmp_path, fault, bac
     pipeline.run(install_signals=False)
     with StateSnapshot.open(pipeline) as snap:
         assert list(snap.iter_attempts(job_uid="invalid::invalid")) == [attempt]
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """跨平台判定指定 PID 是否仍在运行。"""
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+
+    proc_handle = kernel.OpenProcess(0x1000, False, pid)
+    if not proc_handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel.GetExitCodeProcess(proc_handle, ctypes.byref(exit_code)):
+            return False
+        return int(exit_code.value) == 259
+    finally:
+        kernel.CloseHandle(proc_handle)
+
+
+def spawn_tree_handler(job: Job, ctx) -> TaskResult:
+    """派生两层后代进程（worker -> child -> grandchild），写出全部 PID 后阻塞等待。"""
+    sync_dir = Path(job.payload["sync_dir"])
+    grandchild_code = (
+        "import os, pathlib, time; "
+        f"pathlib.Path({str(sync_dir / 'grandchild.pid')!r}).write_text(str(os.getpid()), encoding='utf-8'); "
+        "time.sleep(60)"
+    )
+    child_code = (
+        "import os, pathlib, subprocess, sys, time; "
+        f"pathlib.Path({str(sync_dir / 'child.pid')!r}).write_text(str(os.getpid()), encoding='utf-8'); "
+        f"subprocess.Popen([sys.executable, '-c', {grandchild_code!r}]); "
+        "time.sleep(60)"
+    )
+    (sync_dir / "worker.pid").write_text(str(os.getpid()), encoding="utf-8")
+    subprocess.Popen([sys.executable, "-c", child_code])
+    time.sleep(60)
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("mode", ["timeout", "abort"])
+def test_multilevel_descendant_tree_cleaned_on_timeout_and_abort(
+    pipelines, monkeypatch, tmp_path, mode
+):
+    """超时与异常中止均必须原子回收 worker 及其多层派生孙进程树，零残留孤儿。"""
+    sync_dir = tmp_path / f"tree_{mode}"
+    sync_dir.mkdir(parents=True, exist_ok=True)
+    pipeline = pipelines("sqlite")
+    pipeline.register_task("tree", spawn_tree_handler)
+    pipeline.enqueue(
+        Job(
+            "tree",
+            mode,
+            payload={"sync_dir": str(sync_dir)},
+            timeout_seconds=1.5 if mode == "timeout" else 30.0,
+            max_retries_per_run=0,
+        )
+    )
+
+    if mode == "abort":
+        channel = pipeline._runtime.channel
+        original_reap = channel.reap_completed
+        triggered = False
+
+        def trigger_abort_once(handles):
+            nonlocal triggered
+            if not triggered and (sync_dir / "grandchild.pid").exists():
+                triggered = True
+                raise KeyboardInterrupt("simulated scheduler abort")
+            return original_reap(handles)
+
+        monkeypatch.setattr(channel, "reap_completed", trigger_abort_once)
+        with pytest.raises(KeyboardInterrupt):
+            pipeline.run(install_signals=False)
+    else:
+        pipeline.run(install_signals=False)
+
+    worker_pid = int((sync_dir / "worker.pid").read_text(encoding="utf-8").strip())
+    child_pid = int((sync_dir / "child.pid").read_text(encoding="utf-8").strip())
+    grandchild_pid = int((sync_dir / "grandchild.pid").read_text(encoding="utf-8").strip())
+    assert len({os.getpid(), worker_pid, child_pid, grandchild_pid}) == 4
+
+    assert _wait_until(
+        lambda: (
+            not _is_pid_alive(worker_pid)
+            and not _is_pid_alive(child_pid)
+            and not _is_pid_alive(grandchild_pid)
+        ),
+        timeout=10.0,
+    ), (
+        f"进程树未彻底回收: worker={_is_pid_alive(worker_pid)}, "
+        f"child={_is_pid_alive(child_pid)}, grandchild={_is_pid_alive(grandchild_pid)}"
+    )
+    assert not pipeline._runtime.channel.has_active_workers
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Job Object 绑定校验仅在 Windows 平台执行")
+def test_windows_job_object_assign_failure_fails_loud_and_kills_shell():
+    """Windows 下 AssignProcessToJobObject 失败必须立即强杀空壳、关闭 hJob 并抛 OSError。"""
+    from tasklite.engine.launcher import WindowsProcessTreeAdapter, _get_win_kernel
+
+    real_kernel, ext_limit_cls = _get_win_kernel()
+    closed_handles: list[int] = []
+
+    class _FailingAssignKernel:
+        def CreateJobObjectW(self, sec, name):
+            return real_kernel.CreateJobObjectW(sec, name)
+
+        def SetInformationJobObject(self, h_job, info_class, ptr, size):
+            return real_kernel.SetInformationJobObject(h_job, info_class, ptr, size)
+
+        def AssignProcessToJobObject(self, h_job, h_proc):
+            ctypes.set_last_error(5)  # ERROR_ACCESS_DENIED
+            return 0
+
+        def CloseHandle(self, h_job):
+            closed_handles.append(int(h_job))
+            return real_kernel.CloseHandle(h_job)
+
+    adapter = WindowsProcessTreeAdapter(
+        kernel=_FailingAssignKernel(),
+        extended_limit_cls=ext_limit_cls,
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        **adapter.popen_kwargs(),
+    )
+    try:
+        with pytest.raises(OSError, match="AssignProcessToJobObject"):
+            adapter.attach_and_wrap(proc)
+        assert len(closed_handles) == 1
+        assert proc.poll() is not None
+        assert _wait_until(lambda: not _is_pid_alive(proc.pid), timeout=5.0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Job Object 跳板进程绑定校验仅在 Windows 平台执行")
+def test_windows_job_object_assign_failure_kills_trampoline_and_real_worker(tmp_path):
+    """Windows 跳板进程（worker_pid != proc.pid）绑定 Job 失败时须同时强杀真实 worker 与跳板壳。"""
+    from tasklite.engine.launcher import WindowsProcessTreeAdapter, _get_win_kernel
+
+    real_kernel, ext_limit_cls = _get_win_kernel()
+    closed_handles: list[int] = []
+    terminated_procs: list[int] = []
+
+    class _FailingWorkerAssignKernel:
+        def CreateJobObjectW(self, sec, name):
+            return real_kernel.CreateJobObjectW(sec, name)
+
+        def SetInformationJobObject(self, h_job, info_class, ptr, size):
+            return real_kernel.SetInformationJobObject(h_job, info_class, ptr, size)
+
+        def OpenProcess(self, access, inherit, pid):
+            return real_kernel.OpenProcess(access, inherit, pid)
+
+        def AssignProcessToJobObject(self, h_job, h_proc):
+            ctypes.set_last_error(5)  # ERROR_ACCESS_DENIED
+            return 0
+
+        def TerminateProcess(self, h_proc, exit_code):
+            terminated_procs.append(int(h_proc))
+            return real_kernel.TerminateProcess(h_proc, exit_code)
+
+        def TerminateJobObject(self, h_job, exit_code):
+            return real_kernel.TerminateJobObject(h_job, exit_code)
+
+        def CloseHandle(self, h_obj):
+            closed_handles.append(int(h_obj))
+            return real_kernel.CloseHandle(h_obj)
+
+    adapter = WindowsProcessTreeAdapter(
+        kernel=_FailingWorkerAssignKernel(),
+        extended_limit_cls=ext_limit_cls,
+    )
+    real_worker_pid_file = tmp_path / "real_worker.pid"
+    real_worker_code = (
+        "import os, pathlib, time; "
+        f"pathlib.Path({str(real_worker_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8'); "
+        "time.sleep(60)"
+    )
+    trampoline_code = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {real_worker_code!r}]); "
+        "time.sleep(60)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", trampoline_code],
+        **adapter.popen_kwargs(),
+    )
+    real_worker_pid = 0
+    try:
+        assert _wait_until(lambda: real_worker_pid_file.exists(), timeout=10.0)
+        real_worker_pid = int(real_worker_pid_file.read_text(encoding="utf-8").strip())
+        assert real_worker_pid != proc.pid
+        assert _is_pid_alive(real_worker_pid)
+
+        with pytest.raises(OSError, match="AssignProcessToJobObject"):
+            adapter.attach_and_wrap(proc, worker_pid=real_worker_pid)
+
+        assert len(terminated_procs) == 1
+        assert len(closed_handles) >= 2  # h_worker_proc 与 h_worker_job 均已关闭
+        assert _wait_until(
+            lambda: not _is_pid_alive(proc.pid) and not _is_pid_alive(real_worker_pid),
+            timeout=5.0,
+        ), (
+            f"绑定失败后仍有残留进程: trampoline={_is_pid_alive(proc.pid)}, "
+            f"real_worker={_is_pid_alive(real_worker_pid)}"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        if real_worker_pid > 0 and _is_pid_alive(real_worker_pid):
+            h = real_kernel.OpenProcess(0x0001, False, real_worker_pid)
+            if h:
+                real_kernel.TerminateProcess(h, 1)
+                real_kernel.CloseHandle(h)
+
+
+def test_worker_bootstrap_fork_bomb_guard_reports_structured_failure(tmp_path):
+    """未写 if __name__ == '__main__' 守卫的脚本在子进程引导时触发重入守卫并结构化失败。"""
+    state_path = tmp_path / "guard.db"
+    enqueued_marker = tmp_path / "enqueued"
+    marker_path = tmp_path / "parent_done"
+    project_root = Path(__file__).resolve().parents[2]
+    script = tmp_path / "unguarded_script.py"
+    script.write_text(
+        f"""
+from pathlib import Path
+from tasklite import Job, TaskLite, TaskResult
+
+
+def top_handler(job, ctx):
+    return TaskResult.success()
+
+
+pipeline = TaskLite(backend="sqlite", state_path={str(state_path)!r}, max_workers=1)
+pipeline.register_task("work", top_handler)
+enqueued_marker = Path({str(enqueued_marker)!r})
+if not enqueued_marker.exists():
+    enqueued_marker.write_text("1", encoding="utf-8")
+    pipeline.enqueue(Job("work", "j1", max_retries_per_run=0))
+pipeline.run(install_signals=False)
+pipeline.close()
+Path({str(marker_path)!r}).write_text("done", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project_root)
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, f"stdout={completed.stdout}\nstderr={completed.stderr}"
+    assert marker_path.exists()
+    with StateSnapshot.open(state_path) as snap:
+        rec = snap.get_job("work::j1")
+        assert rec is not None
+        assert rec["status"] == "failed"
+        message = rec["result"]["message"] or ""
+        assert "Worker bootstrap failed" in message
+        assert "Task handler" in message
+        assert rec["result"]["exception"]["type"] == "RuntimeError"

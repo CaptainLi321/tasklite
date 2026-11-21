@@ -17,14 +17,13 @@ Examples:
 """
 from __future__ import annotations
 
-import multiprocessing as mp
 import tempfile
-import threading
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from .engine.launcher import InProcessWorkerLauncher, _InProcessWorker
 from .models.context import JobContext
 from .models.job import Job
 
@@ -38,94 +37,29 @@ __all__ = [
 ]
 
 
-class _InProcessWorker:
-    """进程内线程 Worker 替身：在真实 Pipe 边界上执行目标入口。"""
-
-    def __init__(
-        self,
-        *,
-        target: Callable[..., Any],
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> None:
-        self._target = target
-        self._args = args
-        self._kwargs = dict(kwargs or {})
-        self.exitcode: int | None = None
-        self._thread: threading.Thread | None = None
-
-    def _run(self) -> None:
-        try:
-            self._target(*self._args, **self._kwargs)
-            if self.exitcode is None:
-                self.exitcode = 0
-        except BaseException:
-            if self.exitcode is None:
-                self.exitcode = 1
-
-    def start(self) -> None:
-        """启动后台线程运行 worker 入口。"""
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def is_alive(self) -> bool:
-        """返回替身线程是否仍在运行。"""
-        return self._thread is not None and self._thread.is_alive()
-
-    def join(self, timeout: float | None = None) -> None:
-        """等待替身线程结束。"""
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-
-    def kill(self) -> None:
-        """标记强制终止退出码（不销毁进程内主线程）。"""
-        if self.exitcode is None:
-            self.exitcode = -9
-
-    def terminate(self) -> None:
-        """标记信号终止退出码。"""
-        if self.exitcode is None:
-            self.exitcode = -15
-
-    def close(self) -> None:
-        """释放替身线程引用。"""
-        self._thread = None
-
-
-class _InProcessSpawnContext:
-    """只替换 Process，Pipe 仍由真实 spawn 上下文创建。"""
-
-    def __init__(self, process_class: type) -> None:
-        self._context = mp.get_context("spawn")
-        self.Process = process_class
-
-    def Pipe(self, *args: Any, **kwargs: Any) -> Any:
-        return self._context.Pipe(*args, **kwargs)
-
-
-def _resolve_process_context_holders(target: Any) -> list[Any]:
+def _resolve_launcher_holders(target: Any) -> list[Any]:
     holders: list[Any] = []
-    if hasattr(target, "_process_context"):
+    if hasattr(target, "_launcher"):
         holders.append(target)
     channel = getattr(target, "_channel", getattr(target, "channel", None))
-    if channel is not None and hasattr(channel, "_process_context") and channel not in holders:
+    if channel is not None and hasattr(channel, "_launcher") and channel not in holders:
         holders.append(channel)
     if not holders:
         raise TypeError(
-            f"in_process_workers target has no _process_context: {type(target).__name__}"
+            f"in_process_workers target has no _launcher: {type(target).__name__}"
         )
     return holders
 
 
-def _install_process_context(
+def _install_launcher(
     target: Any,
     process_class: type | None = None,
 ) -> list[tuple[Any, Any]]:
-    context = _InProcessSpawnContext(process_class or _InProcessWorker)
-    holders = _resolve_process_context_holders(target)
-    previous = [(holder, holder._process_context) for holder in holders]
+    launcher = InProcessWorkerLauncher(process_class or _InProcessWorker)
+    holders = _resolve_launcher_holders(target)
+    previous = [(holder, holder._launcher) for holder in holders]
     for holder in holders:
-        holder._process_context = context
+        holder._launcher = launcher
     return previous
 
 
@@ -163,19 +97,19 @@ def in_process_workers(
 ) -> Iterator[Any]:
     """在测试上下文中启用进程内/线程轻量 Worker 替身。
 
-    保留真实单向 ``Pipe`` 通信边界，仅将子进程创建替换为进程内受控替身
+    保留真实单向 ``Pipe`` 通信边界，仅将子进程启动器替换为进程内受控替身
     （默认使用线程替身，也可显式传入自定义 ``process_class``），退出上下文时
-    自动恢复原有的 ``_process_context``。
+    自动恢复原有的 ``_launcher``。
 
     Yields:
         传入的 ``target`` 对象本身。
     """
-    previous = _install_process_context(target, process_class)
+    previous = _install_launcher(target, process_class)
     try:
         yield target
     finally:
         for holder, orig in previous:
-            holder._process_context = orig
+            holder._launcher = orig
 
 
 def spawned_jobs(ctx: JobContext) -> list[Job]:

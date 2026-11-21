@@ -189,6 +189,9 @@ def test_signal_during_installation_is_preserved_and_handlers_restored(
         pipeline.register_task("work", success_handler)
         pipeline.enqueue(Job("work", "one"))
         originals = {signal.SIGTERM: object(), signal.SIGINT: object()}
+        sigbreak = getattr(signal, "SIGBREAK", None)
+        if os.name == "nt" and sigbreak is not None:
+            originals[sigbreak] = object()
         handlers = originals.copy()
         error = RuntimeError("signal installation failed")
 
@@ -876,9 +879,11 @@ def test_install_signals_in_child_thread_fails_loud_and_false_succeeds(tmp_path)
 
 
 def test_main_thread_install_signals_restores_original_handler(tmp_path):
-    """主线程正常运行退出后恢复原信号处理器。"""
+    """主线程正常运行退出后按 LIFO 逆序恢复全部原信号处理器（Windows 含 SIGBREAK）。"""
     original_sigint = signal.getsignal(signal.SIGINT)
     original_sigterm = signal.getsignal(signal.SIGTERM)
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    original_sigbreak = signal.getsignal(sigbreak) if (os.name == "nt" and sigbreak is not None) else None
 
     p = TaskLite(backend="memory")
     p.register_task("t", success_handler)
@@ -889,3 +894,165 @@ def test_main_thread_install_signals_restores_original_handler(tmp_path):
 
     assert signal.getsignal(signal.SIGINT) == original_sigint
     assert signal.getsignal(signal.SIGTERM) == original_sigterm
+    if os.name == "nt" and sigbreak is not None:
+        assert signal.getsignal(sigbreak) == original_sigbreak
+
+
+def test_run_notifier_sliced_wait_wakes_promptly_on_notify():
+    """RunNotifier 长超时/无限等待可被跨线程 notify 立即唤醒且短超时精确收敛。"""
+    from tasklite.engine.resource import RunNotifier
+
+    notifier = RunNotifier()
+    seq = notifier.snapshot()
+    t0 = time.monotonic()
+    assert notifier.wait(seq, timeout=0.05) is False
+    assert time.monotonic() - t0 < 1.0
+
+    seq = notifier.snapshot()
+
+    def wake_later() -> None:
+        time.sleep(0.08)
+        notifier.notify()
+
+    waker = threading.Thread(target=wake_later, daemon=True)
+    waker.start()
+    try:
+        t1 = time.monotonic()
+        assert notifier.wait(seq, timeout=10.0) is True
+        assert time.monotonic() - t1 < 2.0
+    finally:
+        waker.join(timeout=2.0)
+
+    seq = notifier.snapshot()
+    waker_unbounded = threading.Thread(target=wake_later, daemon=True)
+    waker_unbounded.start()
+    try:
+        t2 = time.monotonic()
+        assert notifier.wait(seq, timeout=None) is True
+        assert time.monotonic() - t2 < 2.0
+    finally:
+        waker_unbounded.join(timeout=2.0)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="CTRL_BREAK_EVENT 仅在 Windows 平台验证")
+def test_windows_ctrl_break_drains_gracefully_without_killing_worker_or_grandchild(tmp_path):
+    """Windows 下 CTRL_BREAK_EVENT 触发主进程优雅排空，且绝不穿透击杀在途 worker 及其孙进程。"""
+    state_path = tmp_path / "win_break.db"
+    ready_worker = tmp_path / "ready-worker"
+    ready_grandchild = tmp_path / "ready-grandchild"
+    release_path = tmp_path / "release-grandchild"
+    grandchild_done = tmp_path / "grandchild-done"
+    done_path = tmp_path / "run-done"
+    queued_marker = tmp_path / "queued-ran"
+    project_root = Path(__file__).resolve().parents[2]
+    script = tmp_path / "run_win_break_pipeline.py"
+    script.write_text(
+        f"""
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from tasklite import Job, TaskLite, TaskResult
+
+
+def active_with_grandchild(job, ctx):
+    ready_worker = Path({str(ready_worker)!r})
+    ready_grandchild = Path({str(ready_grandchild)!r})
+    release_path = Path({str(release_path)!r})
+    grandchild_done = Path({str(grandchild_done)!r})
+
+    grandchild_code = (
+        "import os, pathlib, time; "
+        f"pathlib.Path({{str(ready_grandchild)!r}}).write_text(str(os.getpid()), encoding='utf-8'); "
+        f"release = pathlib.Path({{str(release_path)!r}}); "
+        "deadline = time.monotonic() + 25.0; "
+        "\\nwhile not release.exists() and time.monotonic() < deadline:\\n"
+        "    time.sleep(0.02)\\n"
+        "assert release.exists(), 'release timeout'\\n"
+        f"pathlib.Path({{str(grandchild_done)!r}}).write_text('grandchild_ok', encoding='utf-8')\\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", grandchild_code])
+    ready_worker.write_text(str(os.getpid()), encoding="utf-8")
+    exit_code = proc.wait(timeout=30.0)
+    if exit_code != 0:
+        return TaskResult.failure(message=f"grandchild exited with {{exit_code}}")
+    return TaskResult.success(metadata={{"grandchild_exit": exit_code}})
+
+
+def queued_handler(job, ctx):
+    Path({str(queued_marker)!r}).write_text("ran", encoding="utf-8")
+    return TaskResult.success()
+
+
+def main():
+    pipeline = TaskLite(backend="sqlite", state_path={str(state_path)!r}, max_workers=1)
+    pipeline.register_task("active", active_with_grandchild)
+    pipeline.register_task("queued", queued_handler)
+    pipeline.enqueue(Job("active", "item_active", timeout_seconds=60.0))
+    pipeline.enqueue(Job("queued", "item_queued"))
+    pipeline.run(install_signals=True)
+    Path({str(done_path)!r}).write_text("done", encoding="utf-8")
+    pipeline.close()
+
+
+if __name__ == "__main__":
+    main()
+""",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project_root)
+    process = subprocess.Popen(
+        [sys.executable, str(script)],
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    try:
+        deadline = time.monotonic() + 20.0
+        while (
+            not ready_worker.exists() or not ready_grandchild.exists()
+        ) and time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert ready_worker.exists() and ready_grandchild.exists(), (
+            f"worker/grandchild 未就绪, poll={process.poll()}"
+        )
+
+        # 连续两次投递 CTRL_BREAK_EVENT：验证幂等排空且绝不穿透击杀 worker 或孙进程
+        ctrl_break = getattr(signal, "CTRL_BREAK_EVENT")
+        os.kill(process.pid, ctrl_break)
+        time.sleep(0.15)
+        os.kill(process.pid, ctrl_break)
+        time.sleep(0.25)
+
+        # 确认主进程仍在等待在途完成，未崩溃退出
+        assert process.poll() is None, "CTRL_BREAK_EVENT 不得导致主进程在途强退"
+
+        # 放行孙进程与 worker，等待主进程优雅结算后退出
+        release_path.write_text("go", encoding="utf-8")
+        stdout, stderr = process.communicate(timeout=30.0)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5.0)
+
+    assert process.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+    assert done_path.exists()
+    assert grandchild_done.read_text(encoding="utf-8") == "grandchild_ok"
+    assert not queued_marker.exists()
+    with StateSnapshot.open(state_path) as snap:
+        active = snap.get_job("active::item_active")
+        queued = snap.get_job("queued::item_queued")
+        assert active is not None and active["status"] == "succeeded"
+        assert active["result"]["metadata"]["grandchild_exit"] == 0
+        assert queued is not None and queued["status"] == "pending"
+        assert [a["outcome"] for a in snap.iter_attempts(job_uid="active::item_active")] == ["success"]
+        assert list(snap.iter_attempts(job_uid="queued::item_queued")) == []

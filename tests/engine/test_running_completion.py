@@ -530,22 +530,20 @@ def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeyp
                 assert list(snapshot.iter_attempts(job_uid="work::committed")) == []
                 running_snapshots.append((snapshot, current))
 
-        with in_process_workers(pipeline):
-            process_cls = runtime.channel._process_context.Process
+        from tasklite.engine.launcher import _InProcessWorker
 
-            class TrackingProcess(process_cls):
-                def start(self):
-                    starts.append(clock[0])
-                    super().start()
-                    clock[0] = returned_time
+        class TrackingProcess(_InProcessWorker):
+            def start(self):
+                starts.append(clock[0])
+                super().start()
+                clock[0] = returned_time
 
-            runtime.channel._process_context.Process = TrackingProcess
-
+        with in_process_workers(pipeline, TrackingProcess):
             owner, name = {
                 "resource": (capacity, "acquire"),
                 "pre_delete": (ArtifactPathPolicy, "remove_existing"),
                 "context": (runtime._dispatch, "_build_context"),
-                "process": (runtime.channel._process_context, "Process"),
+                "process": (runtime.channel._launcher, "process_class"),
             }[stage]
             original = getattr(owner, name)
 
@@ -564,7 +562,7 @@ def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeyp
             monkeypatch.setattr(runtime.store.backend, "commit_job_settlement", commit)
             monkeypatch.setattr(owner, name, prepare)
             monkeypatch.setattr(dispatch, "utc_now_iso", lambda: clock[0])
-            monkeypatch.setattr("tasklite.engine.channel.utc_now_iso", lambda: clock[0])
+            monkeypatch.setattr("tasklite.engine.launcher.utc_now_iso", lambda: clock[0])
             with authorizer(pipeline, lambda path, kind: True):
                 pipeline.run(install_signals=False)
 

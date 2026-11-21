@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import os
 from pathlib import Path
 from typing import Any, Callable, Collection, Literal, Sequence
@@ -27,7 +26,7 @@ from .resource import (
     IntervalResource as PublicIntervalResource,
 )
 from .engine.runtime import EngineRuntime
-from .engine.types import ExecutionOptions
+from .engine.types import ExecutionOptions, is_importing_mp_main
 from .exceptions import TaskLiteError
 from .models.job import Job, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry
@@ -107,9 +106,7 @@ class TaskLite:
                 base_dir=self._base_dir,
             )
             self._resources = self._build_resources(self._tasks, max_workers)
-            self._process_context = mp.get_context("spawn")
             self._channel = ExecutionChannel(
-                process_context=self._process_context,
                 protected_roots=self._path_policy.protected_paths,
                 path_policy=self._path_policy,
             )
@@ -420,6 +417,11 @@ class TaskLite:
         install_signals: bool = True,
     ) -> None:
         """运行管线直到队列排空（或收到排空请求）。"""
+        if is_importing_mp_main():
+            raise RuntimeError(
+                "TaskLite.run() cannot be called while bootstrapping a worker process. "
+                "Wrap top-level execution in `if __name__ == '__main__':`."
+            )
         self._ensure_active("run")
         if exclude is not None and not isinstance(exclude, Exclude):
             raise TaskLiteError(

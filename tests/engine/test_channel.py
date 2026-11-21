@@ -4,10 +4,10 @@
 端到端（派发机器/完成机器装配后的 run 主循环）由后续门面阶段承接。
 """
 
-import multiprocessing as mp
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -16,6 +16,7 @@ from tasklite.engine.channel import (
     ExecutionResult,
     WorkerLaunchSpec,
 )
+from tasklite.engine.launcher import InProcessWorkerLauncher
 from tasklite.engine.types import AuthorizationOutcome, AuthorizationStatus, JobHandle
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
@@ -126,15 +127,6 @@ class _ThreadWorker:
         self._thread = None
 
 
-class _ThreadSpawnContext:
-    def __init__(self) -> None:
-        self._ctx = mp.get_context("spawn")
-        self.Process = _ThreadWorker
-
-    def Pipe(self, *args, **kwargs):
-        return self._ctx.Pipe(*args, **kwargs)
-
-
 class TestWorkerWrapper:
     """worker 执行通道端到端：显式结果、异常失败与 Pipe 收割。"""
 
@@ -146,7 +138,7 @@ class TestWorkerWrapper:
         *,
         job_context: JobContext | None = None,
     ) -> ExecutionResult:
-        channel = ExecutionChannel(process_context=_ThreadSpawnContext())
+        channel = ExecutionChannel(launcher=InProcessWorkerLauncher(_ThreadWorker))
         try:
             spec = make_spec(
                 job,
@@ -191,7 +183,7 @@ class TestWorkerWrapper:
     def test_worker_rejects_missing_execution_id(self):
         """execution_id 缺失 fail-loud，handler 不得执行且不得产出成功结果。"""
         called: list[bool] = []
-        channel = ExecutionChannel(process_context=_ThreadSpawnContext())
+        channel = ExecutionChannel(launcher=InProcessWorkerLauncher(_ThreadWorker))
         handle = None
         try:
             handle = channel.spawn(
@@ -276,11 +268,11 @@ class TestWorkerWrapper:
 
 class TestSpawnFailureCleanup:
     def test_submit_start_failure_reraises(self, tmp_path):
-        class ExplodingCtx:
-            def Process(self, *args, **kwargs):
+        class ExplodingProcess:
+            def __init__(self, *args, **kwargs):
                 raise RuntimeError("process start failed")
 
-        channel = ExecutionChannel(process_context=ExplodingCtx())
+        channel = ExecutionChannel(launcher=InProcessWorkerLauncher(ExplodingProcess))
         job = Job("t", "j1")
         with pytest.raises(RuntimeError, match="process start failed"):
             channel.spawn(make_spec(job, lambda j, c: TaskResult.success()))
@@ -288,11 +280,13 @@ class TestSpawnFailureCleanup:
     def test_submit_starts_process(self):
         started = []
         class DummyProcess:
+            def __init__(self, *args, **kwargs):
+                pass
+
             def start(self):
                 started.append(True)
-        channel = ExecutionChannel(
-            process_context=type("Ctx", (), {"Process": lambda *a, **k: DummyProcess()})()
-        )
+
+        channel = ExecutionChannel(launcher=InProcessWorkerLauncher(DummyProcess))
         job = Job("t", "j1")
         try:
             handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success()))
@@ -543,6 +537,19 @@ class TestBuildTerminalFailureDefense:
         assert result.result_metadata == {}
         assert "without a result" in (result.message or "")
         assert result.annotations["exitcode"] == 0
+
+    def test_force_killed_positive_exitcode_records_terminated_and_real_exitcode(self):
+        result = ExecutionChannel._build_terminal_failure(
+            SimpleNamespace(exitcode=1, was_force_killed=True),
+            self._handle(),
+            is_timeout=False,
+        )
+        assert result.success is False
+        assert result.retry_requested is False
+        assert "terminated" in (result.message or "")
+        assert result.annotations["terminated"] is True
+        assert result.annotations["exitcode"] == 1
+        assert "signal" not in result.annotations
 
 
 class TestWatchdogReap:
@@ -962,3 +969,131 @@ def test_terminal_paths_release_reply_pipe(route):
         channel.close()
         reply_sender.close()
         reply_receiver.close()
+
+
+def test_posix_process_handle_kill_tree_calls_killpg_before_wait(monkeypatch):
+    """POSIX 进程组强杀必须严格先 os.killpg(pgid, SIGKILL)，再在 join() 中 proc.wait()。"""
+    import tasklite.engine.launcher as launcher_module
+    from tasklite.engine.launcher import PosixProcessHandle
+
+    events: list[tuple[str, Any]] = []
+
+    class _FakePopen:
+        pid = 43210
+        returncode: int | None = None
+
+        def poll(self):
+            events.append(("poll", None))
+            return self.returncode
+
+        def wait(self, timeout=None):
+            events.append(("wait", timeout))
+            self.returncode = -9
+            return self.returncode
+
+        def kill(self):
+            events.append(("kill", None))
+
+    def fake_killpg(pgid, sig):
+        events.append(("killpg", pgid))
+
+    monkeypatch.setattr(launcher_module.os, "killpg", fake_killpg, raising=False)
+    handle = PosixProcessHandle(_FakePopen())  # type: ignore[arg-type]
+    handle.kill_tree()
+    handle.join(timeout=2.0)
+    handle.close()
+
+    assert handle.was_force_killed is True
+    assert handle.exitcode == -9
+    assert events == [("killpg", 43210), ("wait", 2.0)]
+
+
+def test_cancel_pending_launches_wakes_handshake_and_cleans_up():
+    """在冷启动/握手阻塞期间调用 cancel_pending_launches() 必须即时唤醒并零残留。"""
+    from tasklite.engine.launcher import WorkerLauncher, _WorkerLaunchCancelled
+
+    entered = threading.Event()
+    cleaned = threading.Event()
+
+    class _BlockingHandshakeLauncher(WorkerLauncher):
+        def launch(self, spec, *, on_message, cancel_event, commit_gate):
+            entered.set()
+            assert cancel_event.wait(timeout=5.0)
+            cleaned.set()
+            raise _WorkerLaunchCancelled("cancelled during handshake")
+
+    channel = ExecutionChannel(launcher=_BlockingHandshakeLauncher())
+    errors: list[BaseException] = []
+
+    def do_spawn() -> None:
+        try:
+            channel.spawn(make_spec(Job("t", "pending"), lambda j, c: TaskResult.success()))
+        except BaseException as exc:
+            errors.append(exc)
+
+    t = threading.Thread(target=do_spawn, daemon=True)
+    t.start()
+    assert entered.wait(timeout=5.0)
+    assert channel.has_active_workers is True
+    channel.cancel_pending_launches()
+    t.join(timeout=5.0)
+
+    assert cleaned.is_set()
+    assert len(errors) == 1 and isinstance(errors[0], _WorkerLaunchCancelled)
+    assert channel.has_active_workers is False
+
+
+def test_handshake_acceptor_cancel_and_join_never_deadlocks_after_done():
+    """_HandshakeAcceptor 在 _done 已置位或阻塞于 accept() 时 cancel_and_join 均不死锁。"""
+    import os
+    from multiprocessing.connection import Listener
+    from tasklite.engine.launcher import (
+        SubprocessWorkerLauncher,
+        _HandshakeAcceptor,
+        _make_ipc_address,
+    )
+
+    # 1. _done 已置位且 listener 尚未关闭（复现 _accept_loop 刚结束但 is_alive 仍为 True 的竞态）
+    addr_done, family_done = _make_ipc_address()
+    authkey_done = os.urandom(32)
+    listener_done = Listener(address=addr_done, family=family_done, authkey=authkey_done)
+    try:
+        acceptor_done = _HandshakeAcceptor(
+            listener_done,
+            address=str(listener_done.address),
+            family=family_done,
+            authkey=authkey_done,
+        )
+        acceptor_done._done.set()
+        acceptor_done._thread = SimpleNamespace(  # type: ignore[assignment]
+            is_alive=lambda: True,
+            join=lambda timeout=None: None,
+        )
+        t0 = time.monotonic()
+        acceptor_done.cancel_and_join(timeout=1.0)
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        listener_done.close()
+        SubprocessWorkerLauncher._cleanup_socket_file(addr_done, family_done)
+
+    # 2. _accept_loop 正在阻塞于 listener.accept()，cancel_and_join 经守护线程自连迅速唤醒
+    addr_live, family_live = _make_ipc_address()
+    authkey_live = os.urandom(32)
+    listener_live = Listener(address=addr_live, family=family_live, authkey=authkey_live)
+    try:
+        acceptor_live = _HandshakeAcceptor(
+            listener_live,
+            address=str(listener_live.address),
+            family=family_live,
+            authkey=authkey_live,
+        )
+        acceptor_live.start()
+        time.sleep(0.05)
+        t1 = time.monotonic()
+        acceptor_live.cancel_and_join(timeout=2.0)
+        assert time.monotonic() - t1 < 1.5
+        assert acceptor_live._done.is_set()
+        assert not acceptor_live._thread.is_alive()
+    finally:
+        listener_live.close()
+        SubprocessWorkerLauncher._cleanup_socket_file(addr_live, family_live)

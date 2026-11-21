@@ -264,16 +264,15 @@ class TestAuthorizerAndInProcessWorkersHandles:
 
     def test_in_process_workers_runs_and_restores_context(self):
         with TaskLite(backend="memory", max_workers=1) as pipeline:
-            orig_pipeline_ctx = pipeline._process_context
-            orig_channel_ctx = pipeline._channel._process_context
+            assert not hasattr(pipeline, "_process_context")
+            assert not hasattr(pipeline._channel, "_process_context")
+            orig_launcher = pipeline._channel._launcher
             pipeline.register_task("echo", _echo_worker_handler)
             pipeline.enqueue(Job("echo", "item"))
             with in_process_workers(pipeline):
-                assert pipeline._process_context is not orig_pipeline_ctx
-                assert pipeline._channel._process_context is not orig_channel_ctx
+                assert pipeline._channel._launcher is not orig_launcher
                 pipeline.run(install_signals=False)
-            assert pipeline._process_context is orig_pipeline_ctx
-            assert pipeline._channel._process_context is orig_channel_ctx
+            assert pipeline._channel._launcher is orig_launcher
             with StateSnapshot.open(pipeline) as snap:
                 record = snap.get_job("echo::item")
                 assert record is not None

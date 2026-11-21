@@ -5,20 +5,20 @@
 
 from __future__ import annotations
 
+from tasklite.engine.launcher import InProcessWorkerLauncher
 from tasklite.pipeline import TaskLite
 from tasklite.testing import (
-    _InProcessSpawnContext as FakeSpawnContext,
-    _install_process_context,
+    _install_launcher,
     in_process_workers,
 )
 
 __all__ = [
-    "FakeSpawnContext",
+    "InProcessWorkerLauncher",
     "in_process_workers",
-    "install_fake_process_context",
+    "install_fake_worker_launcher",
 ]
 
 
-def install_fake_process_context(pipeline: TaskLite, process_class: type) -> None:
-    """为单个 TaskLite 实例显式安装进程替身（委托给 tasklite.testing）。"""
-    _install_process_context(pipeline, process_class)
+def install_fake_worker_launcher(pipeline: TaskLite, process_class: type) -> None:
+    """为单个 TaskLite 实例显式安装进程替身启动器（委托给 tasklite.testing）。"""
+    _install_launcher(pipeline, process_class)

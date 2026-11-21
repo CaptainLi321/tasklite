@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -217,15 +218,39 @@ class RunNotifier:
         with self._lock:
             return self._seq
 
+    _WIN_WAIT_SLICE_SECONDS: float = 0.1
+
     def wait(self, last_seq: int, timeout: float | None = None) -> bool:
-        """如果快照后已有新通知，立即返回 True；否则进入等待，直到到期或被新通知唤醒。"""
+        """如果快照后已有新通知，立即返回 True；否则进入等待，直到到期或被新通知唤醒。
+
+        Windows 下长超时或无限等待按 <= 0.1s 切片循环，确保主线程阻塞在长作业
+        等待期间也能在 100ms 内响应 SIGBREAK / SIGINT。
+        """
         with self._lock:
             if self._seq != last_seq:
                 return True
             self._event.clear()
         if time.sleep is not _REAL_SLEEP and timeout is not None and timeout > 0:
             time.sleep(timeout)
-        return self._event.wait(timeout=timeout)
+        if os.name != "nt" or (timeout is not None and timeout <= self._WIN_WAIT_SLICE_SECONDS):
+            return self._event.wait(timeout=timeout)
+        if timeout is None:
+            while True:
+                if self._event.wait(timeout=self._WIN_WAIT_SLICE_SECONDS):
+                    return True
+                with self._lock:
+                    if self._seq != last_seq:
+                        return True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._event.is_set()
+            if self._event.wait(timeout=min(self._WIN_WAIT_SLICE_SECONDS, remaining)):
+                return True
+            with self._lock:
+                if self._seq != last_seq:
+                    return True
 
     def clear(self) -> None:
         with self._lock:

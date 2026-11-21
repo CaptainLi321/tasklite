@@ -14,7 +14,7 @@ TESTS_DIR = pathlib.Path(__file__).resolve().parent.parent
 _GUARDED_ATTRS: dict[str, str] = {
     "_is_running": "tasklite.testing.running()",
     "authorizer": "tasklite.testing.authorizer()",
-    "_process_context": "tasklite.testing.in_process_workers()",
+    "_launcher": "tasklite.testing.in_process_workers()",
 }
 
 
@@ -68,10 +68,10 @@ def test_no_direct_authorizer_assignment_in_tests():
     )
 
 
-def test_no_direct_process_context_assignment_in_tests():
-    """tests/ 内禁止对 ``_process_context`` 赋值（统一走 testing.in_process_workers()）。"""
-    offenders = _find_guarded_mutations("_process_context")
+def test_no_direct_launcher_assignment_in_tests():
+    """tests/ 内禁止对 ``_launcher`` 赋值（统一走 testing.in_process_workers()）。"""
+    offenders = _find_guarded_mutations("_launcher")
     assert not offenders, (
-        f"tests 内禁止直接赋值 _process_context（用 {_GUARDED_ATTRS['_process_context']}）："
+        f"tests 内禁止直接赋值 _launcher（用 {_GUARDED_ATTRS['_launcher']}）："
         + ", ".join(offenders)
     )

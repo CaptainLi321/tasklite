@@ -15,6 +15,8 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -456,12 +458,54 @@ class EngineRuntime:
     def state(self) -> PipelineState:
         return self.store.state
 
+    @staticmethod
+    def _stop_signals() -> tuple[signal.Signals, ...]:
+        """返回当前平台需安装的优雅停机信号列表。"""
+        sigs: list[signal.Signals] = [signal.SIGTERM, signal.SIGINT]
+        sigbreak = getattr(signal, "SIGBREAK", None)
+        if os.name == "nt" and sigbreak is not None:
+            sigs.append(sigbreak)
+        return tuple(sigs)
+
+    @contextmanager
+    def install_stop_signals(self) -> Iterator[None]:
+        """安装平台停机信号并按 LIFO 逆序恢复；安装中途失败自动回滚已装信号。"""
+        installed: list[tuple[signal.Signals, Any]] = []
+        try:
+            for sig in self._stop_signals():
+                previous = signal.signal(sig, self._handle_signal)
+                installed.append((sig, previous))
+        except BaseException:
+            for sig, previous in reversed(installed):
+                if previous is None:
+                    continue
+                try:
+                    signal.signal(sig, previous)
+                except Exception:
+                    pass
+            raise
+        try:
+            yield
+        finally:
+            first_error: BaseException | None = None
+            for sig, previous in reversed(installed):
+                if previous is None:
+                    continue
+                try:
+                    signal.signal(sig, previous)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+
     def request_stop(self) -> StopMode:
-        """停机请求接口（单调状态转移，委托 RunSession，并唤醒运行循环）。"""
+        """停机请求接口（单调状态转移，委托 RunSession，取消未提交启动并唤醒运行循环）。"""
         with self._dispatch_start_lock:
             if not self._is_running:
                 return self._session.stop_mode
             mode = self._session.request_stop()
+        self.channel.cancel_pending_launches()
         for handle in self._in_flight.active_handles():
             request = handle.pending_declaration
             entry = self._in_flight.get(handle.job_uid)
@@ -487,34 +531,25 @@ class EngineRuntime:
             self._session.begin()
             self._is_running = True
 
-        old_sigterm = None
-        old_sigint = None
         try:
             self.scheduler.reset_run(opts.exclude)
 
             with exclusive_state_access(self.store.backend):
                 try:
-                    # 主线程安装信号处理器；失败仍由作用域归还执行权。
-                    if opts.install_signals:
-                        old_sigterm = signal.signal(signal.SIGTERM, self._handle_signal)
-                        old_sigint = signal.signal(signal.SIGINT, self._handle_signal)
-
-                    self._preflight_picklable_handlers()
-                    self.governor.reset()
-                    self._run_body()
+                    # 主线程安装信号处理器；安装失败自动回滚，退出按 LIFO 逆序恢复。
+                    with (
+                        self.install_stop_signals()
+                        if opts.install_signals
+                        else nullcontext()
+                    ):
+                        self._preflight_picklable_handlers()
+                        self.governor.reset()
+                        self._run_body()
                 finally:
                     self.config.resources.unbind_notifier()
         finally:
-            try:
-                try:
-                    if old_sigterm is not None:
-                        signal.signal(signal.SIGTERM, old_sigterm)
-                finally:
-                    if old_sigint is not None:
-                        signal.signal(signal.SIGINT, old_sigint)
-            finally:
-                with self._dispatch_start_lock:
-                    self._is_running = False
+            with self._dispatch_start_lock:
+                self._is_running = False
 
     # ── 四相事件泵 ────────────────────────────────────────────────────
 

@@ -132,13 +132,39 @@ class StepOutcome:
     exit_reason: str | None = None
 
 
+# 子进程引导私有 IPC 环境变量键名与放行令牌（集中定义，避免导入链提前加载 _worker_bootstrap）
+ENV_IPC_ADDR = "_TASKLITE_IPC_ADDR"
+ENV_IPC_FAMILY = "_TASKLITE_IPC_FAMILY"
+ENV_IPC_AUTHKEY = "_TASKLITE_IPC_AUTHKEY"
+LAUNCH_GO_TOKEN = b"GO"
+
+# 引导期 __mp_main__ 重入守卫：拦截缺失 if __name__ == "__main__" 时的递归启动
+_IMPORTING_MP_MAIN: bool = False
+
+
+def is_importing_mp_main() -> bool:
+    """当前进程是否正处于 worker 引导导入 ``__mp_main__`` 阶段。"""
+    return _IMPORTING_MP_MAIN
+
+
+def _set_importing_mp_main(value: bool) -> None:
+    """内部接口：仅由 worker 引导模块在导入 __mp_main__ 前后切换重入标志。"""
+    global _IMPORTING_MP_MAIN
+    _IMPORTING_MP_MAIN = value
+
+
 __all__ = [
     "AuthorizationOutcome",
     "AuthorizationStatus",
+    "ENV_IPC_ADDR",
+    "ENV_IPC_AUTHKEY",
+    "ENV_IPC_FAMILY",
     "StopMode",
     "ExitReason",
     "ExecutionOptions",
     "JobHandle",
+    "LAUNCH_GO_TOKEN",
     "PendingDeclaration",
     "StepOutcome",
+    "is_importing_mp_main",
 ]

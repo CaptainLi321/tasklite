@@ -125,7 +125,8 @@ class RecoveryOrchestrator:
         return state
 
     def abort_in_flight(self) -> None:
-        """框架异常退出时结束 worker 并清除内存在途归属，不补提交结果。"""
+        """框架异常退出时取消半初始化启动、结束 worker 并清除内存在途归属，不补提交结果。"""
+        self._channel.cancel_pending_launches()
         if not self._in_flight:
             return
 
