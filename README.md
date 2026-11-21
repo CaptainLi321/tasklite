@@ -261,6 +261,7 @@ tasklite/
 │   ├── recovery.py      # 遗留 running 收敛与在途中止编排 (RecoveryOrchestrator)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel)
 │   ├── launcher.py      # 跨平台 Worker 启动器与进程树原子回收 (WorkerLauncher / ProcessTreeAdapter)
+│   ├── _worker_runtime.py   # 纯 Worker 侧执行入口、启动规格与跨平台停止信号单一事实源
 │   ├── _worker_bootstrap.py # Worker 子进程独立引导与握手屏障
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler / OrderingPolicy 排序 seam)
 │   ├── admission.py     # 重入队节奏 (RequeuePolicy seam)

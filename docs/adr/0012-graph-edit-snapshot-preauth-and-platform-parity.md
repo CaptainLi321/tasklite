@@ -66,10 +66,10 @@ with pipeline.edit(
 
 #### 3.1.1 生命周期与并发约束
 
-- **调用时机**：仅限 `run()` 外且实例未关闭时调用，否则立即抛 `TaskLiteError`；进入 `with` 块时获取状态库单写者锁（`<state_path>.lock` / 内存写锁），退出时释放。严禁在库方法内部隐式读取 `sys.argv`。
+- **调用时机与同实例重入互斥**：仅限 `run()` 外且实例未关闭时调用，否则立即抛 `TaskLiteError`；进入 `with` 块时获取状态库单写者锁（`<state_path>.lock` / 内存写锁）并标记实例进入编辑态（事务期间拒绝同一 `TaskLite` 实例上的 `enqueue`、`set_cursor`、`get_cursor`、`grant_authorization`、`list_authorizations`、`revoke_authorization`、`register_*`、`run`、嵌套 `edit` 与 `close`），退出时释放。严禁在库方法内部隐式读取 `sys.argv`。
 - **默认安全（`dry_run=True`）**：默认处于预览演练模式，执行完整闭环校验并生成 `tx.before`、`tx.after` 与 `tx.diff()`，但在退出时**丢弃暂存修改、零磁盘写入**；仅当显式传入 `dry_run=False` 且闭环校验全部通过时，才在单一写事务内原子落盘。
 - **顺序工作图模型（KISS 三表原则）**：进入 `with` 时基于当前持久化状态生成只读基准快照 `tx.before: StateSnapshot` 与内存三表工作图（`queue` / `successes` / `failed` + 待补写遗留 `running` 失败 `Attempt`）；块内每次调用原语按字面顺序即时更新对应表分区，仅强制维护 Schema 6 固有的 `successes ∩ failed == ∅` 互斥不变式。
-  - *明确 Non-goal*：`remove(entries=...)` 仅按字面清理指定分区，不做跨表隐式联动；`replace` 不承诺保留原 `queue_position`，亦不隐式清理同 `uid` 在其他分区残留的历史档案（相关风险通过 `tx.diff()` 的 `[WARNINGS]` 段与 `logger.warning` 提示用户自决）。
+  - *明确边界与 Non-goal*：`remove(entries=...)` 仅按字面清理指定分区，不做跨表隐式联动；`replace` / `replace_many` 不承诺保留原 `queue_position`；异名改名替换（`old_uid != new_uid`）会清空 `old_uid` 在全部三张表中的条目以消除残留幽灵节点并确保孤儿检测生效；显式指定 `status="pending"` 会同步清除目标 `uid` 的历史终态档案以对齐 `set_status(..., "pending")`；仅同名替换且 `status=None` 自动继承 `"pending"` 时保留原终态档案，并通过 `tx.diff()` 的 `[WARNINGS]` 段与 `logger.warning` 提示用户自决。
 
 #### 3.1.2 事务上下文对象 `tx` 的公开属性与方法
 
@@ -149,7 +149,7 @@ with pipeline.edit(
 
 凡通过 `tx.add` 或 `tx.replace` 使节点处于 `"succeeded"` 状态时：
 - **零文件删除副作用**：忽略 `FileSpec` 上的 `delete_existing` / `delete_on_success` / `delete_on_failure`，不要求 `authorizations` 清理授权，不检查输入文件磁盘存在性；
-- **严格审计隔离与双写发布**：不伪造 `Attempt` 记录；外层 `files` 与 `artifacts` 双写所有保留型 `role="output"`（`delete_on_success=False`）的规范绝对路径（确保下游 `FileSpec.from_output` 可在后续 `run()` 正常解析）；清除旧执行时间基线并在 `annotations` 写入 `{"completion_source": "manual", "note": note}`（不产生 `trigger="on_input_change"` 的可信执行时间基线）。
+- **严格审计隔离与双写发布**：不伪造 `Attempt` 记录；外层 `files` 与 `artifacts` 在写入工作图及验盘时即双写所有保留型 `role="output"`（`delete_on_success=False`）的规范绝对路径（确保 `with` 块内外 `tx.after`、`tx.diff()` 与落盘重开 `StateSnapshot` 100% 同形，且下游 `FileSpec.from_output` 可在后续 `run()` 正常解析）；清除旧执行时间基线并在 `annotations` 写入 `{"completion_source": "manual", "note": note}`（不产生 `trigger="on_input_change"` 的可信执行时间基线）。
 
 当 `with` 块无未捕获异常退出时，引擎对最终工作图 $G_{\text{after}}$ 执行**单次全量攒错校验**（一次性收集全部违规项，不遇错即停）：
 1. **存活节点不受损（防删出新孤儿）**：$\forall u \in G_{\text{after}} \cap G_{\text{before}}$，凡在 `tx.before` 中原本存在的上游 $p \in u.\text{depends\_on}$ 且仍留存于 $u_{\text{after}}.\text{depends\_on}$ 中的，在 $G_{\text{after}}$ 中绝不允许消失（除非 $u$ 自身已被更新或一并移除）；
@@ -236,7 +236,7 @@ python -m tasklite remove <state_path> <uid> [--entries queue,successes,failures
 
 ### 3.5 跨平台信号优雅停机与子进程树原子回收（内部契约，零新增公开 API）
 
-本节在正确性 > 可预测性 > 出错时维护复杂度 > 调度性能的裁决序下，将进程拉起、IPC 握手与 OS 进程树隔离收敛为 `ExecutionChannel` 下方的双层 Internal Seam（`WorkerLauncher` + `ManagedWorkerHandle`，以及 `ProcessTreeAdapter`），并彻底清除 `TaskLite` / `ExecutionChannel` 上过时的 `_process_context` 私有属性（`tasklite.testing.in_process_workers(target, process_class=None)` 签名保持兼容）：
+本节在正确性 > 可预测性 > 出错时维护复杂度 > 调度性能的裁决序下，将进程拉起、IPC 握手与 OS 进程树隔离收敛为 `ExecutionChannel` 下方的双层 Internal Seam（`WorkerLauncher` + `ManagedWorkerHandle`，以及 `ProcessTreeAdapter`），提取纯 worker 侧执行与统一停止信号模块 `_worker_runtime.py`，并彻底清除 `TaskLite` / `ExecutionChannel` 上过时的 `_process_context` 私有属性（`tasklite.testing.in_process_workers(target, launcher=None)` 直接接受标准 `WorkerLauncher` seam）：
 
 1. **主进程优雅停机信号与可中断等待**：
    - `run(install_signals=True)` 经 `install_stop_signals` 在 POSIX 监听 `SIGTERM` / `SIGINT`，在 Windows 监听 `SIGTERM` / `SIGINT` / `SIGBREAK`（对应 `CTRL_BREAK_EVENT`），按 LIFO 逆序恢复原处理器；统一路由至线程安全的 `self.stop()`（停止派发新作业，等待在途 worker 自然结算后退出）。
@@ -245,11 +245,11 @@ python -m tasklite remove <state_path> <uid> [--entries queue,successes,failures
 2. **单 `Listener` 双物理连接握手屏障与零停机卡顿提交门**：
    - 统一采用 `subprocess.Popen` 配合标准库 `multiprocessing.connection.Listener / Client`（Windows `AF_PIPE`、POSIX `AF_UNIX` 含长路径回退 `/tmp`，随机 32 字节 `authkey` 经私有环境变量传递并由子进程启动即 `pop`，严禁写入命令行参数）。
    - **双物理单向连接零竞态**：worker 依次向同一 `Listener` 建立 `role="uplink"`（`declare`/`result`）与 `role="downlink"`（`reply`）两条独立物理连接，收齐后立即关闭 `Listener`；完整复用 `tasklite/utils/ipc.py` 既有单向收发原语与非对称关闭契约（`result` 到达即物理关闭 `reply_sender`，`receiver` 与进程句柄同寿），彻底根除 Windows `PipeConnection._close()` 并发句柄竞态。
-   - **可中断 `accept()` 与异常清扫**：通过 `HandshakeAcceptor` 守护线程配合主线程 50ms 切片检查 `cancel_event` / `proc.poll()` / `deadline`（中断时自连发送 `role="cancel"` 立即解除阻塞，零耦合私有 `_winapi` 重叠 IO）；`ExecutionChannel` 维护 `_pending_launches` 确保 `request_stop()` 与崩溃网 `abort_in_flight()` 均可即时唤醒并清扫半初始化空壳进程树。
-   - **两阶段锁外冷启动 + 微秒级 `b"GO"` 门**：`Popen`、双连接握手、OS 进程树绑定以及预送 `prep_bytes`（纯 JSON 还原 `sys.path`/`cwd`/`__mp_main__`，内置 Fork-Bomb 重入守卫并跳过 `pytest`/`*.__main__`）与 `payload_bytes`（pickle 载荷）全部在 `_dispatch_start_lock` **之外**完成；worker 仅缓存 bytes 不执行任何用户代码；父进程在微秒级短持 `_dispatch_start_lock` 内二次校验 `_dispatch_allowed()`，通过则发 2 字节 `b"GO"` 放行并原子登记 `in_flight`，拒绝则立即强杀空壳并回退 `pending`（零副作用、不写 `Attempt`）。引导期导入或 unpickle 失败（如 handler 误写于 `if __name__ == "__main__":` 内）经已就绪 `uplink` 回传结构化 `failure` 帧并附明确提示。
+   - **可中断 `accept()` 与异常清扫**：通过 `HandshakeAcceptor` 守护线程配合主线程 50ms 切片检查 `cancel_event` / `proc.poll()` / `deadline`（中断时自连发送 `role="cancel"` 立即解除阻塞，零耦合私有 `_winapi` 重叠 IO）；`ExecutionChannel` 通过单一 `_ExecutionSession` 状态机（`prepared -> active -> lingering -> closed`）统一管理所有准备中、在途与滞留会话，确保 `request_stop()` 与崩溃网 `abort_in_flight()` 均可即时唤醒并清扫半初始化空壳进程树。
+   - **线性两阶段锁外冷启动 + 微秒级 `b"GO"` 门**：经 `prepare_spawn` → `release_spawn` / `abort_spawn` 线性控制流，`Popen`、双连接握手、OS 进程树绑定以及预送 `prep_bytes`（纯 JSON 还原 `sys.path`/`cwd`/`__mp_main__`，内置 Fork-Bomb 重入守卫并跳过 `pytest`/`*.__main__`）与 `payload_bytes`（pickle 载荷）全部在 `_dispatch_start_lock` **之外**完成；worker 仅缓存 bytes 不执行任何用户代码；父进程在微秒级短持 `_dispatch_start_lock` 内二次校验 `_dispatch_allowed()`，通过则发 2 字节 `b"GO"` 放行并原子登记 `in_flight`，拒绝则立即经 `abort_spawn` 强杀空壳并回退 `pending`（零副作用、不写 `Attempt`）。引导期导入或 unpickle 失败（如 handler 误写于 `if __name__ == "__main__":` 内）经已就绪 `uplink` 回传结构化 `failure` 帧并附明确提示。
    - **Windows 控制台隔离**：传入 `creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP`（`stdin=subprocess.DEVNULL`，继承 `stdout` / `stderr`），为 worker 分配独立无窗口隐藏控制台——彻底阻断主进程控制台 `Ctrl+C` / `Ctrl+Break` 向 worker 及其外部孙进程穿透，同时避免桌面环境弹出闪烁黑框。
 3. **进程树零竞态绑定、句柄保活与退出码归一化**：
-   - **Windows Job Object**：`WindowsProcessTreeAdapter` 在 worker 阻塞于握手屏障、尚未执行任何用户代码前创建匿名 Job Object（`ctypes` 显式声明 64 位安全的 `argtypes`/`restype`/`c_size_t`），**仅设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`**（严禁 `JOB_OBJECT_LIMIT_BREAKAWAY_OK`）；`AssignProcessToJobObject` 失败必须立即强杀空壳并 fail-loud，严禁降级裸跑。**句柄保活红线**：`hJob` 封装于 `WindowsProcessHandle` 内，`_lingering_workers` 存活期间绝不提前 `CloseHandle(hJob)`，仅在进程自然退出并 `join` 后或超时/中止经 `TerminateJobObject` + `join` 后才释放。
+   - **Windows Job Object**：`WindowsProcessTreeAdapter` 在 worker 阻塞于握手屏障、尚未执行任何用户代码前创建匿名 Job Object（`ctypes` 显式声明 64 位安全的 `argtypes`/`restype`/`c_size_t`），**仅设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`**（严禁 `JOB_OBJECT_LIMIT_BREAKAWAY_OK`）；`AssignProcessToJobObject` 失败必须立即强杀空壳并 fail-loud，严禁降级裸跑。**句柄保活红线**：`hJob` 封装于 `WindowsManagedWorkerHandle` 内，会话处于 `lingering` 期间绝不提前 `CloseHandle(hJob)`，仅在进程自然退出并 `join` 后或超时/中止经 `TerminateJobObject` + `join` 后才释放。
    - **POSIX 进程组**：`PosixProcessTreeAdapter` 以 `start_new_session=True` 原子建新进程组；超时或强杀时**严格先调用 `os.killpg(proc.pid, signal.SIGKILL)`，再调用 `proc.wait()`**，杜绝先回收组长 PID 导致的极端 PID 复用误杀。
    - **跨平台退出码归一化**：`ManagedWorkerHandle.exitcode` 忠实反映 OS 退出码（不在 Windows 伪造 `-9`），并通过 `was_force_killed` 在失败结果 `annotations` 中规范区分信号终止与框架强杀。
 

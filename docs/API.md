@@ -335,11 +335,11 @@ with pipeline.edit(
 
 - **生命周期与单写者互斥**：
   - 仅限 `run()` 外且实例未关闭时调用；`dry_run` 必须为精确 `bool`，`note` 必须为 `str | None`，否则抛 `TaskLiteError`；
-  - 进入 `with` 块时获取状态库单写者互斥锁（SQLite 为 `<state_path>.lock`，内存后端为写锁）并加载一致基准状态，退出 `with` 块时释放；同一 `EditTransaction` 实例不可重复进入，退出后禁止再调用写原语（但 `tx.before`、`tx.after` 仍可只读访问）；
+  - 进入 `with` 块时获取状态库单写者互斥锁（SQLite 为 `<state_path>.lock`，内存后端为写锁）并加载一致基准状态，同时锁定当前 `TaskLite` 实例处于编辑态（事务期间调用同一实例的 `enqueue`、`set_cursor`、`get_cursor`、`grant_authorization`、`list_authorizations`、`revoke_authorization`、`register_*`、`run`、嵌套 `edit` 或 `close` 一律立即抛 `TaskLiteError`），退出 `with` 块时释放；同一 `EditTransaction` 实例不可重复进入，退出后禁止再调用写原语（但 `tx.before`、`tx.after`、`tx.diff()` 与 `uid in tx` 仍可只读访问）；
   - 默认 `dry_run=True`：执行完整闭环校验并生成 `tx.before`、`tx.after` 与 `tx.diff()`，退出时丢弃暂存修改、零磁盘写入；仅当显式传入 `dry_run=False` 且全部校验通过时，才在单个写事务内原子落盘。
 - **三表字面工作图模型与核心不变式**：
   - 事务内部直接维护内存三表工作图（`queue` / `successes` / `failed`）以及待补写的遗留 `running` 失败 `Attempt`；块内每次原语调用按字面顺序即时更新对应分区，仅强制维护 Schema 6 固有的 `successes ∩ failed == ∅` 互斥不变式；
-  - **明确 Non-goal**：`remove(entries=...)` 仅按字面清理指定分区，不做跨表隐式联动；`replace` / `replace_many` 不承诺保留原 `queue_position`，亦不隐式清理同 `uid` 在其他分区残留的历史档案（相关风险通过 `tx.diff()` 的 `[WARNINGS]` 段与 `logger.warning` 提示用户自决）；
+  - **明确边界与 Non-goal**：`remove(entries=...)` 仅按字面清理指定分区，不做跨表隐式联动；`replace` / `replace_many` 不承诺保留原 `queue_position`；异名改名替换（`old_uid != new_uid`）会清空 `old_uid` 全部三张表分区以彻底消除残留旧节点；显式指定 `status="pending"` 会同步清除历史 `successes`/`failed` 档案；仅同名替换且 `status=None` 自动继承 `"pending"` 时保留旧终态档案（并通过 `tx.diff()` 的 `[WARNINGS]` 段与 `logger.warning` 提示用户自决）；
   - **严格不变式**：`attempts` 物理执行轨迹**永不可删**；`job_sequences` 单调递增编号进度**永不重置**；图修整事务**绝不触发任何磁盘文件删除**。
 
 ##### `EditTransaction` 公开属性与方法
@@ -372,7 +372,7 @@ with pipeline.edit(
 
 ##### 非执行 `"succeeded"` 写入边界与 `__exit__` 全量攒错闭环校验
 
-- **非执行 `"succeeded"` 边界**：凡经 `tx.add` 或 `tx.replace` 置为 `"succeeded"` 时，零文件删除副作用（忽略 `FileSpec` 删除标志、不要求路径授权、不检查输入磁盘存在性）；不伪造 `Attempt`；在外层 `files` 与 `artifacts` 双写所有保留型 `role="output"`（`delete_on_success=False`）的规范绝对路径；清除旧执行时间基线并在 `annotations` 写入 `{"completion_source": "manual"}`（附可选 `"note"`），不产生 `trigger="on_input_change"` 的可信执行时间基线。
+- **非执行 `"succeeded"` 边界**：凡经 `tx.add` 或 `tx.replace` 置为 `"succeeded"` 时，零文件删除副作用（忽略 `FileSpec` 删除标志、不要求路径授权、不检查输入磁盘存在性）；不伪造 `Attempt`；在写入工作图与验盘时即于外层 `files` 与 `artifacts` 双写所有保留型 `role="output"`（`delete_on_success=False`）的规范绝对路径（确保 `with` 块内外 `tx.after` 与落盘重开快照 100% 同形，等价路径不产生 `tx.diff()` 假阳性）；清除旧执行时间基线并在 `annotations` 写入 `{"completion_source": "manual"}`（附可选 `"note"`），不产生 `trigger="on_input_change"` 的可信执行时间基线。
 - **提交期 4 项硬 Error 单次全量攒错校验**（`with` 块无异常退出时一次性收集全部违规项，不遇错即停）：
   1. **存活节点不受损（防删出新孤儿）**：基准与最终工作图中共同存活的节点，其原已存在且仍留存于 `depends_on` 中的上游不得消失；
   2. **活跃/成功/触碰节点零孤儿与全图无环**：所有 `pending`、`succeeded` 及本次 `add`/`replace` 触碰的节点，其 `depends_on` 全部上游必须存在于最终工作图中，且 `depends_on` 有向图严禁成环（历史未触碰的 `failed` 死记录不连坐阻断无关分支）；
