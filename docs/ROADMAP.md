@@ -8,6 +8,8 @@
 
 ## 1. 单任务直达 CLI —— `分析完备，待立项 ADR`
 
+> **状态更新（ADR-0012）**：只读状态报告与纯 UID 级轻量运维 CLI（`python -m tasklite status` / `set-status` / `remove`）已由 [ADR-0012](adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md) 落地实现；本节仍待立项的是**单任务直达执行 CLI**（`python -m tasklite run --app ...`）。
+
 **动机**：单目标走「收集→分发→执行」全链路不便（补跑/调试/ad-hoc 场景）；本质是 aperiodic
 作业的直接准入（绕过 discovery 的 release 通道），与链路跑**共享同一 successes 去重与 attempts
 轨迹**——是同一状态系统的第二入口，不是系统外野路径。
@@ -27,7 +29,7 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 **红线**：CLI 不新增任何引擎语义（仅门面驱动 + ops 文本呈现）；`--input/--output` 快捷
 方式仅适用单输入单输出型 task，上下文型任务走 `--set` 或链路。
 
-**顺带收益**：运维子命令 `tasklite failures` / `retry <uid>` / `successes`（ops 面直映射）。
+**备注**：纯只读与 UID 级运维子命令（`status` / `set-status` / `remove`）已由 [ADR-0012](adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md) 独立落地，不依赖本节 `--app` 装配入口。
 
 ## 2. 调度策略族 —— `已搁置（库主 2026-10-02 裁决），解禁后逐策略小 ADR`
 
@@ -178,7 +180,7 @@ GUIDE 须有 Trigger 行为表、结果与提交效果表、文件类型与清�
 
 ## 7. 宿主交互授权回调（`authorizer`） — 后续候选
 
-当前基线（ADR-0011）通过 `TASKLITE_DANGEROUS_AUTO_APPROVE=1` 环境变量与默认终端询问处理主进程文件授权，授权管理仅公开 `list_authorizations()` 与 `revoke_authorization()`，不向宿主程序暴露可编程的 `TaskLite.authorizer` 回调属性。
+当前基线（ADR-0011 / ADR-0012）通过 `TASKLITE_DANGEROUS_AUTO_APPROVE=1` 环境变量、Run 外预授权 `grant_authorization()` 与默认终端询问处理主进程文件授权，授权管理公开 `grant_authorization()`、`list_authorizations()` 与 `revoke_authorization()`，不向宿主程序暴露可编程的 `TaskLite.authorizer` 回调属性。
 
 后续若需要支持 GUI/Web 宿主或自定义审批工作流动态接管授权询问，可立项 ADR 评估在构造期或独立适配口开放受控的授权判定回调协议（含异步等待与 `stop()` 唤醒语义），当前暂不作为稳定接口暴露。
 

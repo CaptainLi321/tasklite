@@ -1,6 +1,6 @@
 # 0012 原子图修整事务（`edit`）、零句柄快照观测、预授权对称化与跨平台进程树隔离
 
-- **状态**：**已接受（待实施）**
+- **状态**：**已接受并实施**（5 个功能切片——统一跨平台路径策略与 `grant_authorization`、原子图修整 `TaskLite.edit()` 与移除 `set_job_status`/`clear_history`、`StateSnapshot` `copy` 模式与 `report()` 及极简运维 CLI、跨平台信号隔离与进程树原子回收、以及正式文档全量切换——均已落地并通过全量测试验证）
 - **适用版本基线**：`3.0.0.dev0`（作为对 [ADR-0011](0011-stable-interface-baseline.md) 的增量修订与冻结前破坏性收敛；不推翻核心三层模型、单写者互斥与数据库格式约束）
 - **数据库 Schema 影响**：**零表结构变更**（完全兼容 SQLite Schema 6，`user_version = 6`；`SQLiteStateBackend` 与 `InMemoryStateBackend` 保持 100% 行为对等）
 
@@ -261,14 +261,14 @@ python -m tasklite remove <state_path> <uid> [--entries queue,successes,failures
 
 ```mermaid
 flowchart TD
-    CLI["CLI 模块 (tasklite.__main__)\nstatus / set-status / remove"] --> Facade["门面模块 (TaskLite)\nedit() / grant_authorization()"]
-    CLI --> Snap["只读观察模块 (StateSnapshot)\nopen(mode=lazy|copy) / report()"]
-    Facade --> EditTx["图修整事务模块 (EditTransaction)\n内存工作图 / 闭环校验器 / 结构化 Diff"]
+    CLI["CLI 模块 (tasklite/__main__.py)\nstatus / set-status / remove"] --> Facade["门面模块 (tasklite/pipeline.py)\nedit() / grant_authorization()"]
+    CLI --> Snap["只读观察模块 (tasklite/snapshot.py + tasklite/_report.py)\nopen(mode=lazy|copy) / report()"]
+    Facade --> EditTx["图修整事务模块 (tasklite/edit.py)\n内存工作图 / 闭环校验器 / 结构化 Diff"]
     EditTx --> Snap
-    EditTx --> Store["状态与结算模块 (StateStore)\n统一遗留 running 失败 Attempt 构造器"]
-    Facade --> Auth["文件声明与授权模块\n统一路径规范化 / 受保护路径与层级冲突拦截"]
-    Facade --> Runtime["执行与调度模块 (EngineRuntime)\nSIGINT / SIGTERM / SIGBREAK 信号路由"]
-    Runtime --> Channel["通信与进程管理模块 (ExecutionChannel)\nListener-Client 握手屏障 + 平台进程树 Adapter"]
+    EditTx --> Store["状态与结算模块 (tasklite/engine/store.py)\n统一遗留 running 失败 Attempt 构造器"]
+    Facade --> Auth["文件声明与授权模块 (tasklite/utils/artifact.py)\n统一路径规范化 / 受保护路径与层级冲突拦截"]
+    Facade --> Runtime["执行与调度模块 (tasklite/engine/runtime.py)\nSIGINT / SIGTERM / SIGBREAK 信号路由"]
+    Runtime --> Channel["通信与进程管理模块 (tasklite/engine/channel.py + tasklite/engine/launcher.py)\nListener-Client 握手屏障 + 平台进程树 Adapter"]
     Store --> Seam["状态存储后端 Seam"]
     Snap --> Seam
     Seam --> SQLite["SQLiteStateBackend\nWAL + BEGIN IMMEDIATE + ?mode=ro"]

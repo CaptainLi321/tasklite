@@ -1,7 +1,7 @@
 # TaskLite 公开 API 参考手册
 
-> 本文档是 TaskLite 3.0.0.dev0（Schema 6 稳定接口基线版本）的权威公开 API 参考手册。系统定义所有公开类、构造器、方法、属性、参数约束、默认值、状态转移规则、精确异常边界以及数据字典结构。  
-> 概念架构、核心模型与使用指南参见 [`docs/GUIDE.md`](GUIDE.md)，架构决策背景参见 [`docs/adr/0011-stable-interface-baseline.md`](adr/0011-stable-interface-baseline.md)，领域术语规范参见 [`CONTEXT.md`](../CONTEXT.md)。
+> 本文档是 TaskLite 3.0.0.dev0（Schema 6 稳定接口基线版本）的权威公开 API 参考手册。系统定义所有公开类、构造器、方法、属性、参数约束、默认值、状态转移规则、精确异常边界、命令行运维契约以及数据字典结构。  
+> 概念架构、核心模型与使用指南参见 [`docs/GUIDE.md`](GUIDE.md)，架构决策背景参见 [`docs/adr/0011-stable-interface-baseline.md`](adr/0011-stable-interface-baseline.md) 与 [`docs/adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md`](adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md)，领域术语规范参见 [`CONTEXT.md`](../CONTEXT.md)。
 
 ---
 
@@ -18,7 +18,7 @@
    - [2.3 上下文管理与 close() 机制](#23-上下文管理与-close-机制)
    - [2.4 注册接口（资源、任务与触发规则）](#24-注册接口资源任务与触发规则)
    - [2.5 入队与运行控制（enqueue, run, stop）](#25-入队与运行控制enqueue-run-stop)
-   - [2.6 Run 外状态运维、历史清理与授权接口](#26-run-外状态运维历史清理与授权接口)
+   - [2.6 Run 外状态运维、图修整与授权接口](#26-run-外状态运维图修整与授权接口)
 3. [核心模型与运行时上下文](#3-核心模型与运行时上下文)
    - [3.1 Task 静态规格](#31-task-静态规格)
    - [3.2 Job 逻辑实例](#32-job-逻辑实例)
@@ -30,6 +30,7 @@
    - [4.2 get_job 查询与标准化 Job 字典](#42-get_job-查询与标准化-job-字典)
    - [4.3 iter_jobs 迭代与状态过滤](#43-iter_jobs-迭代与状态过滤)
    - [4.4 iter_attempts 迭代与物理执行轨迹字典](#44-iter_attempts-迭代与物理执行轨迹字典)
+   - [4.5 StateSnapshot.report 状态报告与前后对比](#45-statesnapshotreport-状态报告与前后对比)
 5. [单射编码工具与公开异常](#5-单射编码工具与公开异常)
    - [5.1 规范 UID 单射编解码（make_job_uid, parse_job_uid）](#51-规范-uid-单射编解码make_job_uid-parse_job_uid)
    - [5.2 公开异常 TaskLiteError](#52-公开异常-taskliteerror)
@@ -37,13 +38,16 @@
    - [6.1 CapacityResource 并发容量资源](#61-capacityresource-并发容量资源)
    - [6.2 IntervalResource 时间间隔资源](#62-intervalresource-时间间隔资源)
    - [6.3 Exclude 运行排除规则](#63-exclude-运行排除规则)
-7. [环境变量](#7-环境变量)
-   - [7.1 TASKLITE_DANGEROUS_AUTO_APPROVE 自动授权开关](#71-tasklite_dangerous_auto_approve-危险自动授权开关)
-8. [可选扩展与测试辅助模块](#8-可选扩展与测试辅助模块)
-   - [8.1 tasklite.testing 单元测试工具](#81-tasklitetesting-单元测试工具)
-   - [8.2 tasklite.wrappers.http HTTP 工具集](#82-tasklitewrappershttp-http-工具集)
-   - [8.3 tasklite.wrappers.discovery 增量发现组件](#83-tasklitewrappersdiscovery-增量发现组件)
-   - [8.4 tasklite.hooks 辅助工具](#84-tasklitehooks-辅助工具)
+7. [极简运维命令行入口](#7-极简运维命令行入口)
+   - [7.1 子命令语法与行为契约](#71-子命令语法与行为契约)
+   - [7.2 安全守卫、退出码与非目标](#72-安全守卫退出码与非目标)
+8. [环境变量](#8-环境变量)
+   - [8.1 TASKLITE_DANGEROUS_AUTO_APPROVE 危险自动授权开关](#81-tasklite_dangerous_auto_approve-危险自动授权开关)
+9. [可选扩展与测试辅助模块](#9-可选扩展与测试辅助模块)
+   - [9.1 tasklite.testing 单元测试工具](#91-tasklitetesting-单元测试工具)
+   - [9.2 tasklite.wrappers.http HTTP 工具集](#92-tasklitewrappershttp-http-工具集)
+   - [9.3 tasklite.wrappers.discovery 增量发现组件](#93-tasklitewrappersdiscovery-增量发现组件)
+   - [9.4 tasklite.hooks 辅助工具](#94-tasklitehooks-辅助工具)
 
 ---
 
@@ -290,15 +294,15 @@ from tasklite.models.trigger import TriggerContext
 - 启动调度循环，驱动作业派发与执行，直至队列排空或停机；正常完成返回 `None`。
 - **参数约束**：
   - `exclude`：必须为 `Exclude` 实例或 `None`，非法类型抛出 `TaskLiteError`；
-  - `install_signals`（`bool`，默认 `True`）：是否在主进程安装 `SIGTERM` 与 `SIGINT` 信号监听。
+  - `install_signals`（`bool`，默认 `True`）：是否在主线程安装优雅停机信号处理器——POSIX 监听 `SIGTERM` 与 `SIGINT`，Windows 监听 `SIGTERM`、`SIGINT` 与 `SIGBREAK`（对应 `CTRL_BREAK_EVENT`），统一路由至线程安全的 `stop()`，退出时按 LIFO 逆序恢复原处理器；无关联控制台的 Windows 纯后台服务（如 `pythonw.exe` 或 Windows Service）无法接收 `CTRL_BREAK_EVENT`，须由宿主在进程内跨线程调用 `pipeline.stop()`。
 - **内部核心执行流程**：
   1. **状态库排他锁定**：获取 `<state_path>.lock` 单库文件锁（例如 `state.db.lock`）与写事务互斥，确保单状态库同一时刻只有一个调度实例写入；
   2. **启动崩溃恢复（Recovery）**：启动预检扫描状态库。若发现上次运行异常崩溃遗留的 `running` 状态作业，将其原子收敛为失败 Attempt 并移入 `failed` 失败档案；保留处于 `pending` 状态的待办作业，不自动接续旧执行；
-  3. **预检 Handler 可序列化性**：验证所有注册任务的 handler 均可被 `spawn` 子进程安全 pickle；
+  3. **预检 Handler 可序列化性**：验证所有注册任务的 handler 均可被隔离子进程安全 pickle；
   4. **四相事件泵调度循环**：
      - **准入与选择（Admission & Selection）**：评估 `trigger` 规则与 `exclude` 排除规则（被排除的作业原样留队）；
      - **拓扑依赖与资源仲裁（Scheduling & Resources）**：解析 DAG 依赖，检查 `CapacityResource` 与 `IntervalResource` 可用性；
-     - **物理派发（Dispatching）**：向工作子进程派发执行；
+     - **物理派发与跨平台进程树隔离（Dispatching）**：通过独立引导子进程与双单向连接握手屏障派发执行——POSIX 以 `start_new_session=True` 建立独立进程组，超时或强杀时严格先 `os.killpg(..., SIGKILL)` 后 `wait` 原子回收整棵进程组；Windows 以 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` 隔离主进程控制台信号穿透，并在放行用户代码前零竞态绑定仅含 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的匿名 Job Object，确保超时、中止或主进程退出时整棵子进程树（含多层外部孙进程）被内核原子回收；
      - **结算收口（Completion）**：在独立写事务中原子提交结果、推进 Attempt 轨迹、更新游标与释放资源。
 
 #### 3. `stop() -> None`
@@ -311,43 +315,88 @@ from tasklite.models.trigger import TriggerContext
 
 ---
 
-### 2.6 Run 外状态运维、历史清理与授权接口
+### 2.6 Run 外状态运维、图修整与授权接口
 
 > [!CAUTION]
 > 以下运维管理接口**仅允许在 `run()` 之外调用**。若在管线执行期或关闭后调用，直接抛出 `TaskLiteError`。
 
-#### 1. `set_job_status(job_or_uid, status, *, recursive, note=None) -> None`
-人工设置作业状态并原子处理级联下游。
-- **参数**：
-  - `job_or_uid`（`Job | str`）：目标作业实例或其规范 UID 字符串；
-  - `status`（`Literal["pending", "succeeded", "failed"]`）：目标状态，仅允许此三项；
-  - `recursive`（`bool`，**必填且仅关键字参数**）：是否递归将该作业的所有已知下游作业同步置为目标状态；
-  - `note`（`str | None`，默认 `None`）：人工操作备注，写入结果元数据中。
-- **缺失快照的处理差异（源码真实行为）**：
-  - **传入 `Job` 实例**：若状态库中尚未存在该作业的历史快照，框架将就地校验并接受传入的 `Job` 作为有效快照，并要求其 `task_type` 已注册；若库中已存在该作业快照，会比对其有效配置，发生冲突时抛出 `TaskLiteError`；
-  - **传入 `str` 字符串（UID）**：必须先经 `parse_job_uid` 语法校验。SQLite 与内存双后端实现完全一致（统一检索既有有效快照），按以下优先级回退顺序检索既有快照：
-    1. **`queue`**（待办/重入队队列中的作业快照）；
-    2. **`successes`**（成功档案元数据中的作业快照）；
-    3. **`failed`**（失败档案元数据中的作业快照）；
-    4. **`attempts`**（历史物理执行记录，按 `attempt_id` 倒序取最近一次执行中的完整作业快照）。  
-    若在上述全部四级来源中**均无任何既有快照**，直接抛出 `TaskLiteError(f"No existing snapshot found for job UID {target_uid!r}")`，拒绝凭空捏造未知的配置与载荷。
+#### 1. 原子图修整事务：`edit(*, dry_run=True, note=None) -> EditTransaction`
 
-#### 2. `clear_history(uid: str, *, records: Collection[str]) -> int`
-从持久化归档中精准清理指定作业的历史记录，返回删除的总行数。
-- **参数**：
-  - `uid`（`str`）：必须是符合规范单射编码的 `task_type::job_id` 字符串；
-  - `records`（`Collection[Literal["successes", "failures", "attempts"]]`，**仅关键字参数**）：
-    - 允许传入 `list`、`tuple`、`set`、`frozenset` 容器；容器不能为空；
-    - 集合元素**仅允许**包含 `"successes"`（成功档案）、`"failures"`（失败档案，对应数据库 `failed` 表）、`"attempts"`（物理执行轨迹表）；若传入未知目标抛出 `TaskLiteError`。
-- **编号进度保留**：历史清理仅删除上述归档行，**绝不重置或修改 `job_sequences` 表中的单调递增编号进度**。
-- **返回值**：`int`，受影响并被删除的数据库记录条数总和。
+位于 [`tasklite/edit.py`](../tasklite/edit.py)，是 Run 外唯一的状态图增、删、替换与状态流转入口（取代并移除了预冻结版本的 `set_job_status` 与 `clear_history`）。
 
-#### 3. `get_cursor(key: str) -> str | None` 与 `set_cursor(key: str, value: str | None) -> None`
+```text
+with pipeline.edit(
+    *,
+    dry_run: bool = True,
+    note: str | None = None,
+) as tx:
+    ...
+```
+
+- **生命周期与单写者互斥**：
+  - 仅限 `run()` 外且实例未关闭时调用；`dry_run` 必须为精确 `bool`，`note` 必须为 `str | None`，否则抛 `TaskLiteError`；
+  - 进入 `with` 块时获取状态库单写者互斥锁（SQLite 为 `<state_path>.lock`，内存后端为写锁）并加载一致基准状态，退出 `with` 块时释放；同一 `EditTransaction` 实例不可重复进入，退出后禁止再调用写原语（但 `tx.before`、`tx.after` 仍可只读访问）；
+  - 默认 `dry_run=True`：执行完整闭环校验并生成 `tx.before`、`tx.after` 与 `tx.diff()`，退出时丢弃暂存修改、零磁盘写入；仅当显式传入 `dry_run=False` 且全部校验通过时，才在单个写事务内原子落盘。
+- **三表字面工作图模型与核心不变式**：
+  - 事务内部直接维护内存三表工作图（`queue` / `successes` / `failed`）以及待补写的遗留 `running` 失败 `Attempt`；块内每次原语调用按字面顺序即时更新对应分区，仅强制维护 Schema 6 固有的 `successes ∩ failed == ∅` 互斥不变式；
+  - **明确 Non-goal**：`remove(entries=...)` 仅按字面清理指定分区，不做跨表隐式联动；`replace` / `replace_many` 不承诺保留原 `queue_position`，亦不隐式清理同 `uid` 在其他分区残留的历史档案（相关风险通过 `tx.diff()` 的 `[WARNINGS]` 段与 `logger.warning` 提示用户自决）；
+  - **严格不变式**：`attempts` 物理执行轨迹**永不可删**；`job_sequences` 单调递增编号进度**永不重置**；图修整事务**绝不触发任何磁盘文件删除**。
+
+##### `EditTransaction` 公开属性与方法
+
+1. **`uid in tx`（`__contains__(uid: object) -> bool`）**：
+   - 校验 `uid` 符合 `parse_job_uid` 规范语法（非法抛 `TaskLiteError`），返回该 `uid` 当前是否存在于三表工作图（`queue ∪ successes ∪ failed`）中。
+2. **`tx.add(job: Job, *, status: Literal["pending", "succeeded", "failed"]) -> None`**：
+   - 纯新增节点至指定分区；要求 `job` 为 `Job` 实例且 `job.task_type` 已注册、静态配置合法；若 `job.uid` 已存在于工作图中，立即抛 `TaskLiteError`（防误覆盖）。
+3. **`tx.replace(old_uid: str, new_job: Job, *, status: Literal["pending", "succeeded", "failed"] | None = None) -> None`** 与 **`tx.replace_many(mapping: Mapping[str, Job], *, status: Literal["pending", "succeeded", "failed"] | None = None) -> None`**：
+   - 演进替换既有节点（支持原地更新配置或改换 `uid`）；要求 `old_uid`（或 `mapping` 全部键）存在于工作图中、`new_job.task_type` 已注册，且目标 `new_job.uid` 不与工作图中其余存活节点冲突；`replace_many` 先统一摘除全部旧键再统一放入新节点，天然支持编号顺移或互换（`mapping` 内目标 `uid` 重复抛 `TaskLiteError`）；
+   - **状态继承（`status=None`）**：原有效态为 `pending` / `succeeded` / `failed` 时自动继承原态；若原条目为前次崩溃遗留的 `running`，自动登记一条待补写的异常中断失败 `Attempt`（`outcome="failure"`），并将继承目标态收敛为 `"failed"`（显式指定 `status="pending"` 或 `"succeeded"` 时仍补写该失败 `Attempt`，目标态按显式参数设置）；
+   - 不改动既有 `attempts` 与 `job_sequences`（换用新 `uid` 时，旧 `attempts` 原样归属 `old_uid`）。
+4. **`tx.set_status(uid: str, status: Literal["pending", "failed"], *, recursive: bool) -> None`**：
+   - 纯状态流转（零依赖 `TaskRegistry`，空管线实例与 CLI 可直接调用）；`recursive` 为必填关键字参数（精确 `bool`，无默认值）；`uid` 必须存在于工作图中；
+   - 沿用既有静态 `job_snapshot` 将 `{uid}`（及 `recursive=True` 时工作图正向 `depends_on` 闭包内的全部下游）流转为 `"pending"` 或 `"failed"`；命中遗留 `running` 自动登记补写失败 `Attempt`；
+   - 刻意不包含 `"succeeded"`——任何非执行 `"succeeded"` 必须经 `tx.add` 或 `tx.replace` 显式提供 `Job` 并通过产出验盘。
+5. **`tx.remove(uid: str, *, entries: Collection[Literal["queue", "successes", "failures"]] = ("queue", "successes", "failures"), recursive: bool) -> int`**：
+   - 按字面从指定分区移除条目（零依赖 `TaskRegistry`）；`recursive` 为必填关键字参数（无默认值）；`entries` 必须为非空集合（不可传裸 `str`/`bytes`），且仅允许 `"queue"` / `"successes"` / `"failures"`（传入 `"attempts"` 等非法值立即抛 `TaskLiteError`）；
+   - `recursive=True` 且 `uid` 存在时级联覆盖正向 `depends_on` 闭包下游；若 `"queue" in entries` 且命中遗留 `running`，自动登记补写失败 `Attempt`；返回本次在工作图中实际移除的 Job 条目数（每个 `uid` 至多计 `1`）。
+6. **`tx.before` 与 `tx.after`（`StateSnapshot`，只读属性）**：
+   - 分别为进入事务前的基准只读快照与当前暂存工作图的实时只读投影（含待补写遗留 `running` `Attempt`），与 `StateSnapshot.open(..., mode="copy")` 100% 同形，退出 `with` 块后仍永久可读且不持有底层连接。
+7. **`tx.diff() -> str`**：
+   - 返回面向人类阅读的紧凑对比文本（包含 `Before -> After` 四态计数、`[- REMOVED]` 且置顶高亮被删 `[succeeded]`、`[⇄ REPLACED]` 仅展示变化字段、`[+ ADDED]`、`[↻ STATUS]`、`[WARNINGS]` 与 `[VALIDATION]`），不承诺跨版本格式解析稳定；
+   - **永不因校验失败抛异常中断渲染**：即便存在多处校验错误，仍完整返回对比文本与全部错误明细；
+   - **4 类纯只读非阻断 Warning**（同时同步输出 `logger.warning`）：
+     1. 移除 `[succeeded]` 节点；
+     2. 单分区 `remove` 后同 `uid` 仍在另一分区保留；
+     3. `pending` 节点同时存在历史 `successes`/`failed` 档案（下次 `run()` 将由 `Trigger` 依残留档案判定）；
+     4. 非 `succeeded` 上游的 `from_output(p, key)` 未出现在静态 `job_snapshot["files"]` 中（依赖运行期 `ctx.declare_file` 动态声明）。
+
+##### 非执行 `"succeeded"` 写入边界与 `__exit__` 全量攒错闭环校验
+
+- **非执行 `"succeeded"` 边界**：凡经 `tx.add` 或 `tx.replace` 置为 `"succeeded"` 时，零文件删除副作用（忽略 `FileSpec` 删除标志、不要求路径授权、不检查输入磁盘存在性）；不伪造 `Attempt`；在外层 `files` 与 `artifacts` 双写所有保留型 `role="output"`（`delete_on_success=False`）的规范绝对路径；清除旧执行时间基线并在 `annotations` 写入 `{"completion_source": "manual"}`（附可选 `"note"`），不产生 `trigger="on_input_change"` 的可信执行时间基线。
+- **提交期 4 项硬 Error 单次全量攒错校验**（`with` 块无异常退出时一次性收集全部违规项，不遇错即停）：
+  1. **存活节点不受损（防删出新孤儿）**：基准与最终工作图中共同存活的节点，其原已存在且仍留存于 `depends_on` 中的上游不得消失；
+  2. **活跃/成功/触碰节点零孤儿与全图无环**：所有 `pending`、`succeeded` 及本次 `add`/`replace` 触碰的节点，其 `depends_on` 全部上游必须存在于最终工作图中，且 `depends_on` 有向图严禁成环（历史未触碰的 `failed` 死记录不连坐阻断无关分支）；
+  3. **`from_output` 契约闭合**：上述节点声明的每个 `FileSpec.from_output(p, key)` 必须满足 `p in depends_on` 且 `p` 存在；`p` 为 `succeeded` 时 `key` 必须存在于 `p` 已发布的外层 `files` / `artifacts` 中且为保留型 `role="output"`；`p` 非 `succeeded` 且其静态 `files` 已声明 `key` 时，强制校验其为保留型 `role="output"`；
+  4. **物理产出真实在场**：本次 `add`/`replace` 置为 `"succeeded"` 的所有节点，其声明的保留型 `role="output"` 路径必须全部通过统一 `PathPolicy` 严格检查（受保护 5 路径、根路径与符号链接/Junction 拦截）并在磁盘真实存在。
+- **退出结算规则**：存在任何校验错误时，无论 `dry_run` 取何值，一律回滚丢弃暂存修改并将**全部错误汇总抛出单一 `TaskLiteError`**（非预期底层 OS / `sqlite3` 异常原样传播）；全部通过时，`dry_run=True` 零写入退出，`dry_run=False` 经单个 `BEGIN IMMEDIATE` SQLite 写事务（或内存写锁 Copy-on-Write）原子落盘。
+
+#### 2. `get_cursor(key: str) -> str | None` 与 `set_cursor(key: str, value: str | None) -> None`
 - `get_cursor`：读取持久化游标表中最新已提交的字符串值，键不存在返回 `None`；`key` 必须为非空字符串；
-- `set_cursor`：直接以原子事务持久化写入游标键值。`value` 为 `None` 表示从表中删除该游标键；`value` 必须为 `str` 或 `None`。
+- `set_cursor`：在状态库单写者互斥下直接以原子事务持久化写入游标键值。`value` 为 `None` 表示从表中删除该游标键；`value` 必须为 `str` 或 `None`。
 
-#### 4. `list_authorizations() -> list[dict[str, Any]]` 与 `revoke_authorization(path: str | Path) -> bool`
-- **`list_authorizations()`**：只读返回所有持久化在库中的主进程路径授权记录列表。按 `authorized_at ASC, path ASC` 排序。字典字段为：
+#### 3. 路径授权管理：`grant_authorization`、`list_authorizations` 与 `revoke_authorization`
+
+- **`grant_authorization(path: str | Path, *, target_type: Literal["file", "directory"]) -> dict[str, Any]`**：
+  - Run 外一次性持久化预授权入口，在状态库单写者互斥下执行；
+  - 相对路径基于 `TaskLite` 构造期固定的 `base_dir`，经统一 `PathPolicy`（仅展开最长已存在父前缀、绝不跟随叶节点链接、统一平台盘符/长名）解析为规范绝对路径；
+  - `target_type` 为必填关键字参数（仅允许 `"file"` 或 `"directory"`）；**不要求目标路径在磁盘上已存在**，也不创建任何文件或目录；
+  - **受保护路径硬拦截**：自动保护基于 `state_path` 派生的全部 5 项内部路径（`state_path`、`-wal`、`-shm`、`-journal`、`<state_path>.lock`）以及文件系统根 / 盘符根 / UNC 根，按路径段元组双向重叠拦截，命中一律抛 `TaskLiteError`；
+  - **无 `exist_ok`，严格冲突拦截**：
+    - 若库中已存在**相同规范绝对路径**（或 Windows 下经 `os.path.normcase` 判定的大小写等价路径），无论 `target_type` 是否相同，均直接抛 `TaskLiteError`（不静默幂等、不刷新时间戳）；
+    - 若存在父子类型矛盾（如祖先已按 `"file"` 授权又授权子路径，或已存在子路径授权又将祖先按 `"file"` 授权），一律抛 `TaskLiteError`；
+    - 父子目录授权各自按精确规范绝对路径独立存取与撤销，互不隐式合并或覆盖；运行期交互式授权升级（`record_authorization` 的 `file -> directory` 覆盖）与运维期 `grant_authorization` 严格分离；
+  - **返回值**：返回与 `list_authorizations()` 单项同构的字典 `{"path": str, "target_type": str, "authorized_at": str}`。
+- **`list_authorizations() -> list[dict[str, Any]]`**：只读返回所有持久化在库中的主进程路径授权记录列表，按 `authorized_at ASC, path ASC` 排序。字典字段为：
   ```python
   {
       "path": str,           # 授权的规范绝对路径
@@ -355,7 +404,7 @@ from tasklite.models.trigger import TriggerContext
       "authorized_at": str,  # 授权时间（ISO 8601 UTC 字符串）
   }
   ```
-- **`revoke_authorization(path)`**：按词法规范绝对路径精确撤销单条持久化授权。删除成功返回 `True`，未找到返回 `False`。
+- **`revoke_authorization(path: str | Path) -> bool`**：按统一 `PathPolicy` 规范化绝对路径精确撤销单条持久化授权。删除成功返回 `True`，未找到返回 `False`。
 
 ---
 
@@ -527,8 +576,11 @@ TaskResult.retry(*, message: str | None = None, metadata: dict[str, Any] | None 
   - 当 `role="input"` 时，**严禁设置 `delete_existing=True`**，违规抛出 `TaskLiteError("input FileSpec cannot set delete_existing=True")`；
 - **上游直接依赖约束**：
   - `from_output` 引用的 `producer_uid`，**必须出现在当前 Job 的显式 `depends_on` 列表中**，否则在解析与动态声明时直接抛出 `TaskLiteError`；
-- **受保护路径硬拦截**：状态库文件、系统关键路径属于受保护路径，任何删除或写授权请求一律硬拦截拒绝；
-- **平台支持边界**：当前主进程物理文件/目录安全清理（`ArtifactPathPolicy`）依赖 Linux `dir_fd` / `O_NOFOLLOW` / `O_DIRECTORY` 与 `/proc/self/mountinfo`，**目前仅支持 Linux 平台**；
+- **受保护路径硬拦截**：状态库自身及自动派生的全部 5 项内部路径（`state_path`、`-wal`、`-shm`、`-journal`、`<state_path>.lock`）与文件系统根 / 盘符根 / UNC 根均属于受保护路径，任何删除或写授权请求一律按路径段元组双向重叠硬拦截拒绝；
+- **平台支持边界**：主进程物理文件/目录安全清理（[`tasklite/utils/artifact.py`](../tasklite/utils/artifact.py) 的 `PathPolicy`）已支持 **Linux** 与 **Windows**：
+  - **Linux（POSIX）**：依赖 `dir_fd` / `O_NOFOLLOW` / `O_DIRECTORY`、`(st_dev, st_ino)` 身份校验及 `/proc/self/mountinfo` 挂载边界校验；
+  - **Windows**：采用无特权 `kernel32`（`CreateFileW` 省略 `FILE_SHARE_DELETE` 内核级钉锁父目录 + `GetFileInformationByHandle` 身份复核 + `CloseHandle`）与 `os.lstat` 原生 `st_file_attributes` / `st_reparse_tag` 重解析点分类（放行已知非名称代理数据重解析点如 OneDrive Cloud / Dedup / WOF，精准区分 symlink）；
+  - **Windows 物理限制**：NTFS Junction / 卷挂载点与未知重解析点一律 fail-closed 拒绝；不隐式清除只读位、不掩盖文件占用错误（`WinError 32` / `WinError 5` 原样向上传播）；保留与 POSIX `fstatat -> unlinkat` 同构的同目录普通叶替换微窗口（因 `unlink` / `rmdir` 不跟随链接且 `rmdir` 拒删非空目录，绝不穿透目录外）；
 - **成功结算产物检查与时序**：
   - 任务返回 `success` 后，主进程核验所有声明为 `role="output"` 的产物：
     - 若物理文件不存在，且 `delete_on_success=False`，主进程将结果改判为失败并报错 `Missing output <path>`；
@@ -544,21 +596,29 @@ TaskResult.retry(*, message: str | None = None, metadata: dict[str, Any] | None 
 ### 4.1 快照建立与会话生命周期
 
 ```text
-StateSnapshot.open(source: str | Path | TaskLite) -> StateSnapshot
+StateSnapshot.open(
+    source: str | Path | TaskLite,
+    *,
+    mode: Literal["lazy", "copy"] = "lazy",
+) -> StateSnapshot
 ```
 
+- **模式选择（`mode`）**：
+  - `mode="lazy"`（默认）：SQLite 源持有只读事务流式按需读取，关闭快照时释放连接；内存源捕获一致版本副本；
+  - `mode="copy"`：SQLite 源在单一只读事务内读取一致快照后**立即关闭底层数据库连接**（零长期句柄占用，适合长耗时 `run()` 前后拍照对比；内部对大字段 JSON 保留原始字符串按需惰性反序列化）；内存源对只追加不可变的 `attempts` 列表采用切片浅共享以控制内存峰值；
+  - 非法 `mode`（非 `"lazy"` / `"copy"`）抛出 `TaskLiteError`。
 - **数据源语义**：
-  - **传入数据库路径（`str | Path`）**：以只读 URI 模式（`?mode=ro`）建立连接，并执行 `BEGIN` 持有只读事务。若数据库不存在、为目录或 Schema 未就绪，抛出 `TaskLiteError`；在只读事务生命周期内保证跨表查询的一致性快照；
+  - **传入数据库路径（`str | Path`）**：以只读 URI 模式（`?mode=ro`）建立连接并启动只读事务。若数据库不存在、为目录或 Schema 未就绪，直接抛出 `TaskLiteError`，**绝不新建空库文件**；在只读事务内保证跨表查询的一致性快照；
   - **传入 `TaskLite` 实例**：
     - 若实例已关闭，抛出 `TaskLiteError`；
-    - SQLite 后端连接其状态库打开只读快照；
-    - 内存后端（`memory`）在实例锁保护下建立队列与档案的完整深拷贝版本快照，后续查询与内存变动隔离；
+    - SQLite 后端按所选 `mode` 连接其状态库打开只读快照；
+    - 内存后端（`memory`）在实例锁保护下建立一致版本快照，后续查询与内存变动隔离；
     - **支持在管线运行中或空闲态安全打开**。
 - **公开属性、生命周期与释放**：
   - **`source`**（`Any`，`@property` 只读属性）：打开该快照时传入的原始源对象或数据库路径（如 `str`、`Path` 或 `TaskLite` 实例）；
   - **`closed` / `is_closed`**（`bool`，`@property` 只读属性）：检查快照是否已关闭；关闭后调用任何查询方法均抛出 `TaskLiteError("StateSnapshot is closed")`；
   - 支持上下文管理器协议：`with StateSnapshot.open(...) as snapshot:`；
-  - **`close() -> None`**：释放只读连接与内存副本；**关闭快照绝不会关闭底层的 `TaskLite` 实例**。
+  - **`close() -> None`**：释放只读连接与内存副本；**关闭快照绝不会关闭底层的 `TaskLite` 实例**；`mode="copy"` 同样兼容 `with` 与 `close()`，显式 `close()` 后继续访问仍抛 `TaskLiteError`。
 
 ---
 
@@ -591,7 +651,7 @@ snapshot.get_job(uid: str) -> dict[str, Any] | None
     "result": dict | None,     # 结算结果，仅 succeeded 与 failed 存在，未结算为 None
     "run_id": str | None,      # 运行会话标识（pending 态恒为 None）
     "attempt_no": int | None,  # 执行编号（pending 态恒为 None）
-    "started_at": str | None,  # UTC ISO 8601 worker 实际启动时间戳（以 'Z' 结尾；未启动或未结算的 running 快照为 None）
+    "started_at": str | None,  # UTC ISO 8601 worker 实际启动时间戳（以 'Z' 结尾；running 态准确投影已落盘启动时间，pending 态恒为 None）
     "settled_at": str | None,  # UTC ISO 8601 结算时间戳（以 'Z' 结尾，未结算为 None）
 }
 ```
@@ -661,6 +721,29 @@ snapshot.iter_attempts(
     "settled_at": str | None,  # UTC ISO 8601 格式结算时间戳（以 'Z' 结尾）
 }
 ```
+
+---
+
+### 4.5 StateSnapshot.report 状态报告与前后对比
+
+位于 [`tasklite/_report.py`](../tasklite/_report.py)，经 `StateSnapshot.report` 静态方法公开。
+
+```text
+StateSnapshot.report(
+    first: StateSnapshot,
+    second: StateSnapshot | None = None,
+) -> str
+```
+
+- **入参校验**：`first` 必须为未关闭的 `StateSnapshot` 实例；`second` 为 `None` 或未关闭的 `StateSnapshot` 实例；传入非 `StateSnapshot` 或已关闭快照均抛出 `TaskLiteError`。
+- **单快照模式（`second=None`）**：
+  - 输出四态计数总览（含 `succeeded` 中 `execution` / `manual` 构成）；
+  - 按 `task_type` 分组展示完成进度及历史成功 `Attempt` 耗时统计（`Avg` / `P50` / `Max`）；
+  - 展示当前在途 `running` 作业已运行秒数与基于历史成功基线的预估剩余时间（ETA）；
+  - 展示当前 `failed` 作业摘要。
+- **双快照对比模式（`first=before, second=after`）**：
+  - 以 `second`（`after`）为主干结构，叠加 `first -> second` 区间四态计数增减、状态流转汇总、新增 `Attempt` 次数/耗时统计以及本次区间新增失败明细。
+- **非编程解析契约**：返回的多行 `str` 仅供人类阅读展示，不承诺文本排版或字段格式跨版本稳定；程序化消费状态数据请使用 `get_job` / `iter_jobs` / `iter_attempts`。
 
 ---
 
@@ -764,9 +847,42 @@ Exclude(*, task_type: str)
 
 ---
 
-## 7. 环境变量
+## 7. 极简运维命令行入口
 
-### 7.1 TASKLITE_DANGEROUS_AUTO_APPROVE 危险自动授权开关
+位于 [`tasklite/__main__.py`](../tasklite/__main__.py)，通过 `python -m tasklite` 调用。严格定位于**只读观测与纯 `uid` 驱动的轻量状态运维**，不引入任何引擎调度语义，不提供需构造 `Job` 的 `add` / `replace`。
+
+### 7.1 子命令语法与行为契约
+
+```bash
+# 1. 只读状态报告（薄封装 StateSnapshot.open + StateSnapshot.report）
+python -m tasklite status <state_path>
+
+# 2. 纯状态流转（底层委托 TaskLite.edit().set_status）
+python -m tasklite set-status <state_path> <uid> <pending|failed> (--recursive | --no-recursive) [--note TEXT] [--apply]
+
+# 3. 移除状态条目（底层委托 TaskLite.edit().remove）
+python -m tasklite remove <state_path> <uid> [--entries queue,successes,failures] (--recursive | --no-recursive) [--note TEXT] [--apply]
+```
+
+- **`status <state_path>`**：以只读模式打开 SQLite 状态库并输出 `StateSnapshot.report(snap)`；绝不创建或修改数据库文件。
+- **`set-status <state_path> <uid> <pending|failed>`**：仅允许 `pending` 或 `failed`；`--recursive` 与 `--no-recursive` 为**必填互斥参数**（无默认值）；底层 100% 委托 `TaskLite.edit(dry_run=not apply, note=note)` 与 `tx.set_status(...)`。
+- **`remove <state_path> <uid>`**：`--entries` 为逗号分隔的目标分区列表（默认 `queue,successes,failures`，仅允许该三项，传入 `attempts` 等非法值报错）；`--recursive` 与 `--no-recursive` 为**必填互斥参数**；底层 100% 委托 `TaskLite.edit(dry_run=not apply, note=note)` 与 `tx.remove(...)`，永不删除 `attempts` 或磁盘文件，永不重置 `job_sequences`。
+
+### 7.2 安全守卫、退出码与非目标
+
+- **强制 `<state_path>` 与防建空库**：所有子命令必须显式传入 `<state_path>`（无默认路径）；`set-status` 与 `remove` 前置校验路径必须已存在且非目录，绝不因拼错路径静默新建空库文件。
+- **默认 dry-run 与显式 `--apply`**：修改类命令默认以 `dry_run=True` 运行并向 `stdout` 打印 `tx.diff()` 及未落盘提示；仅当显式传入 `--apply` 且闭环校验通过时才原子提交落盘。
+- **无 `--json` 选项**：CLI 输出面向人类终端阅读，不提供 `--json` 序列化协议（程序化读取请直接调用 Python `StateSnapshot` API）。
+- **标准进程退出码**：
+  - `0`：执行成功（包括 dry-run 校验通过并打印预览）；
+  - `1`：业务校验失败、状态库不存在/版本不匹配、或捕获 `TaskLiteError` / `OSError` / `sqlite3.Error`（错误信息输出至 `stderr`）；
+  - `2`：命令行参数缺失、互斥冲突或非法选项（`argparse` 标准退出码）。
+
+---
+
+## 8. 环境变量
+
+### 8.1 TASKLITE_DANGEROUS_AUTO_APPROVE 危险自动授权开关
 
 - **精确匹配条件**：
   - 框架仅以 `os.environ.get("TASKLITE_DANGEROUS_AUTO_APPROVE") == "1"` 做精确判定；
@@ -778,12 +894,12 @@ Exclude(*, task_type: str)
 
 ---
 
-## 8. 可选扩展与测试辅助模块
+## 9. 可选扩展与测试辅助模块
 
 > [!NOTE]
 > 本章节模块属于可选辅助工具，本版不作稳定兼容承诺。
 
-### 8.1 tasklite.testing 单元测试工具
+### 9.1 tasklite.testing 单元测试工具
 
 位于 [`tasklite/testing.py`](../tasklite/testing.py)，为业务 handler 与引擎集成单测提供官方的隔离构造与受控接缝句柄。
 
@@ -853,7 +969,7 @@ def in_process_workers(
 
 ---
 
-### 8.2 tasklite.wrappers.http HTTP 工具集
+### 9.2 tasklite.wrappers.http HTTP 工具集
 
 位于 [`tasklite/wrappers/http.py`](../tasklite/wrappers/http.py)。
 
@@ -976,7 +1092,7 @@ HttpExecutor(
 
 ---
 
-### 8.3 tasklite.wrappers.discovery 增量发现组件
+### 9.3 tasklite.wrappers.discovery 增量发现组件
 
 位于 [`tasklite/wrappers/discovery.py`](../tasklite/wrappers/discovery.py)。
 
@@ -1022,7 +1138,7 @@ register_discovery(
 
 ---
 
-### 8.4 tasklite.hooks 辅助工具
+### 9.4 tasklite.hooks 辅助工具
 
 位于 [`tasklite/hooks.py`](../tasklite/hooks.py)。
 

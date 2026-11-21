@@ -2,6 +2,8 @@
 
 状态：**已接受，待实施**。本记录固化接口定型讨论的最终决定，不代表当前安装版本已经提供这些能力；发布版本号、数据库版本号及下文列出的细节尚未冻结。当前使用仍以 [GUIDE](../GUIDE.md) 为准，实施及文档改版清单见 [ROADMAP](../ROADMAP.md#4-稳定-interface-基线与文档改版--已实施adr-0011)。
 
+> **后续演进提示**：本文部分条款（手工路径预授权、`set_job_status` / `clear_history` 收敛为 `TaskLite.edit()` 及 `Attempt` 永不可删、快照拷贝模式与报告等）已由 [ADR-0012](0012-graph-edit-snapshot-preauth-and-platform-parity.md) 增量修订并实施；下文保留原始裁决正文供历史追溯。
+
 ## 背景与取舍
 
 长期兼容需要覆盖调用方式、默认行为、错误结果、持久记录和扩展协议，而不只是导入名。选择在新基线发布前集中整理 Interface，不为被替代的旧返回形式、参数和入口增加兼容解析；新基线之后遵守兼容承诺。Module 的内部状态机、注册表和可变运行配置不因可访问就成为稳定 Interface。
@@ -382,6 +384,8 @@ running 写入失败时禁止产物准备和 worker 启动。该记录只证明�
 
 ## 主进程所有权、授权与通信
 
+> **后续演进提示**：本节中“不增加手工授权入口”的决定已由 [ADR-0012](0012-graph-edit-snapshot-preauth-and-platform-parity.md) 增量修订并实施（新增 `TaskLite.grant_authorization` 与跨平台路径策略）。
+
 框架所有按声明请求的前置删除、成功清理、失败／重试及停止相关清理全部由主进程执行。worker 只请求、等待准备结果及写入业务内容，不直接执行框架清理原语。
 
 文件声明用于进程与产物管理、输入输出依赖传递和后续 Run 判断，不是权限系统。handler 的直接文件写入及其调用的外部程序写入由用户全权负责。本版本不提供 handler 文件访问沙箱，FileSpec 不包含 sandbox 开关，亦不提供易被误解为沙箱的 output_roots 构造参数；这替代此前独立可选沙箱及 output_roots 的范围决定。保留框架文件操作授权及受保护路径规则，不允许借由逐文件开关绕过。保护不接管业务写入，不承诺拦截所有写后声明。
@@ -607,6 +611,8 @@ message 为说明，metadata 为业务数据，annotations 为框架附加信息
 iter_attempts(job_uid=uid) 按 attempt_no 递增返回；iter_jobs、未指定 job_uid 或仅按 task_type 过滤的 iter_attempts 不承诺顺序。查询不增加 order_by、倒序或分页参数；查询顺序不代表调度顺序。
 
 ### Run 外管理与游标
+
+> **后续演进提示**：本节中 `set_job_status` 与 `clear_history`（含删除 `attempts`）的决定已由 [ADR-0012](0012-graph-edit-snapshot-preauth-and-platform-parity.md) 增量修订并实施，统一收敛为 `TaskLite.edit()` 且 `Attempt` 永不可删。
 
 常用状态管理仅保留下列入口，不增设管理器包装对象：
 

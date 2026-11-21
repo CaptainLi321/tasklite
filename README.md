@@ -56,9 +56,9 @@ flowchart TD
 
 ### 1. 🛡️ 进程隔离与守护 (Process Isolation)
 - 主进程作为总控调度器，不执行具体的业务代码；
-- 每一个任务均在独立的 `spawn` 子进程中隔离执行；
-- 当子进程发生死循环或超时，看门狗将在指定超时后发送 `SIGKILL` 强杀子进程并自动回收资源；
-- 子进程发生异常退出或被操作系统终止时，不影响主调度进程的稳定运行。
+- 每一个任务均在独立子进程中隔离执行（POSIX 独立进程组，Windows 无窗口独立控制台 + Job Object 绑定）；
+- 当子进程发生死循环或超时，看门狗将原子回收整棵子进程树（含多层孙进程）并自动释放资源；
+- 支持 POSIX `SIGTERM`/`SIGINT` 与 Windows `SIGTERM`/`SIGINT`/`SIGBREAK` 优雅排空停机，子进程异常退出不影响主调度进程稳定运行。
 
 ### 2. ⚡ SQLite WAL 状态持久化 (ACID)
 - 基于 SQLite WAL + `synchronous=FULL` 模式；
@@ -79,10 +79,11 @@ flowchart TD
 
 ### 6. 📦 统一文件声明与主进程清理授权
 - `FileSpec` 明确文件角色（`output` / `input` / `cache`）与清理权限（`delete_existing` / `delete_on_failure` / `delete_on_success`）；
-- 主进程持有排他文件授权与清理职责，收尾时先执行授权清理后提交事务。
+- 主进程持有排他文件授权（含 Run 外 `grant_authorization` / `list_authorizations` / `revoke_authorization`）与跨平台（Linux / Windows）安全清理职责，收尾时先执行授权清理后提交事务。
 
-### 7. 🎛️ 运行排除与重试节奏
-- 内置候选访问序与重入队机制；其内部策略接缝不属于本版稳定公开扩展面；
+### 7. 🎛️ 原子图修整、只读快照与运维 CLI
+- Run 外通过 `pipeline.edit(dry_run=True)` 原子执行作业增、删、替换与状态流转，提交前全图闭环校验并支持 `tx.diff()` 预览；`attempts` 物理轨迹永不可删；
+- 只读 `StateSnapshot.open(..., mode="lazy"|"copy")` 与 `StateSnapshot.report()` 提供零句柄运行前后对比与耗时/ETA 报告；并内置极简运维 CLI（`python -m tasklite status | set-status | remove`）；
 - `pipeline.run(exclude=Exclude(task_type="..."))` 支持按任务类型将作业安全留队至下次运行。
 
 ---
@@ -240,9 +241,12 @@ pipeline.close()
 ```
 tasklite/
 ├── pipeline.py          # TaskLite 核心门面与装配
+├── edit.py              # EditTransaction：Run 外原子图修整事务与闭环校验
+├── snapshot.py          # StateSnapshot：只读一致状态快照、copy 模式与 JSON 查询
+├── _report.py           # StateSnapshot.report 状态/耗时/ETA 与前后对比渲染
+├── __main__.py          # 极简运维 CLI（python -m tasklite status / set-status / remove）
 ├── selection.py         # 执行选择规则值对象 Exclude（候选准入 seam）
 ├── resource.py          # 内置资源公共导出门面 (CapacityResource, IntervalResource)
-├── snapshot.py          # StateSnapshot：只读一致状态快照与标准 JSON 查询
 ├── exceptions.py        # 异常族 (TaskLiteError)
 ├── testing.py           # 测试辅助工具（fake_ctx / running / authorizer / in_process_workers 等）
 ├── engine/              # 核心调度与执行引擎群
@@ -256,6 +260,8 @@ tasklite/
 │   ├── completion.py    # 任务完成与提交单一收口 (CompletionMachine)
 │   ├── recovery.py      # 遗留 running 收敛与在途中止编排 (RecoveryOrchestrator)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel)
+│   ├── launcher.py      # 跨平台 Worker 启动器与进程树原子回收 (WorkerLauncher / ProcessTreeAdapter)
+│   ├── _worker_bootstrap.py # Worker 子进程独立引导与握手屏障
 │   ├── scheduler.py     # 资源调度与 DAG 依赖 (JobScheduler / OrderingPolicy 排序 seam)
 │   ├── admission.py     # 重入队节奏 (RequeuePolicy seam)
 │   ├── governor.py      # 死锁归因仲裁与依赖宽限 (DeadlockGovernor)
@@ -265,7 +271,7 @@ tasklite/
 ├── models/              # Task / Job / Attempt / JobContext / TaskResult / FileSpec 数据模型
 ├── wrappers/            # 可选工具：discovery.py（增量扫描）/ http.py（网络守卫与快照）
 ├── contrib/             # 生态扩展套件与参考实现（核心不反向依赖）
-└── utils/               # 单射编码 (%XX 转义) / 瞬时 Pipe 通道 / 文件锁 / 时钟 / JSON 校验
+└── utils/               # 单射编码 (%XX 转义) / 瞬时 Pipe 通道 / 跨平台路径策略 / 文件锁 / 时钟 / JSON 校验
 ```
 
 ---

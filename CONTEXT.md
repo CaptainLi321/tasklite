@@ -1,6 +1,6 @@
 # TaskLite 领域概念词典
 
-嵌入式 Python 任务编排引擎，采用子进程隔离、单次执行 Pipe 通信、状态库级互斥与 ACID 事务持久化。核心模型为 Task / Job / Attempt 三层（ADR-0004 / ADR-0005 / ADR-0011；Run 外运维与跨平台演进以待实施的 ADR-0012 为准）。
+嵌入式 Python 任务编排引擎，采用子进程隔离、单次执行 Pipe 通信、状态库级互斥与 ACID 事务持久化。核心模型为 Task / Job / Attempt 三层（ADR-0004 / ADR-0005 / ADR-0011 / ADR-0012）。
 
 ## Language
 
@@ -27,7 +27,7 @@ _Avoid_: ReturnTuple, BoolStatus, ExceptionRethrow
 _Avoid_: ArtifactSpec, FileDecl, OutputPath
 
 **StateSnapshot**:
-统一只读一致状态快照与 JSON 查询入口：支持从数据库路径或 TaskLite 实例通过 `StateSnapshot.open(source)` 打开。提供 `get_job(uid)`、`iter_jobs(*, status=..., task_type=...)` 与 `iter_attempts(*, job_uid=..., task_type=...)`，返回符合 ADR-0011 契约的标准化 JSON 字典。
+统一只读一致状态快照、JSON 查询与可读报告入口：支持从数据库路径或 TaskLite 实例通过 `StateSnapshot.open(source, *, mode="lazy"|"copy")` 打开（`"copy"` 模式于单一只读事务加载后立即释放 SQLite 句柄）。提供 `get_job(uid)`、`iter_jobs(*, status=..., task_type=...)`、`iter_attempts(*, job_uid=..., task_type=...)` 返回标准化 JSON 字典，以及 `StateSnapshot.report(first, second=None)` 生成单快照状态/耗时/ETA 报告与双快照增量对比报告。
 _Avoid_: StatusReader, StateInspector, DBViewer
 
 **Attempt**:
@@ -39,8 +39,12 @@ _Avoid_: Trial, ExecutionLog, RunRecord
 _Avoid_: HandlerMap, Registry, TaskStore
 
 **TaskLite**:
-主调度器与用户入口门面：负责组装调度循环、资源与任务注册、入队与执行，并提供 Run 外统一运维管理 API。
+主调度器与用户入口门面：负责组装调度循环、资源与任务注册、入队与执行，并提供 Run 外原子图修整（`edit()`）、路径预授权/查询/撤销（`grant_authorization` / `list_authorizations` / `revoke_authorization`）与游标读写 API。
 _Avoid_: PipelineEngine, Runner, Master, Coordinator
+
+**EditTransaction**:
+`TaskLite.edit(*, dry_run=True, note=None)` 返回的 Run 外原子图修整上下文对象：在状态库单写者互斥下基于内存三表工作图（`queue` / `successes` / `failed`）提供 `uid in tx`、`add`、`replace`、`replace_many`、`set_status`、`remove`、`before` / `after` 只读快照及 `diff()` 预览，退出时执行单次全量攒错闭环校验并在 `dry_run=False` 时原子提交；永不删除 `attempts` 或重置 `job_sequences`。
+_Avoid_: StateMigrator, GraphPatch, HistoryEditor
 
 **TaskLiteError**:
 TaskLite 唯一自有公开异常，表示框架主动发现的调用条件不成立；底层 Python 或数据库异常保持原类型传播。
@@ -51,7 +55,7 @@ _Avoid_: TaskLiteException, ValidationError, RetryError, FatalError
 _Avoid_: SuccessTable, CompletedSet, HistoryStore
 
 **Failures（失败档案）**:
-持久化永久失败作业集合及其元数据与 payload 快照（底层物理表为 `failed`）；按 `job_uid` 与成功档案互斥。Run 外状态运维与清理按 ADR-0012 收敛至 `TaskLite.edit()`（取代旧版 `set_job_status` / `clear_history`），只读查询收敛至 `StateSnapshot`。
+持久化永久失败作业集合及其元数据与 payload 快照（底层物理表为 `failed`）；按 `job_uid` 与成功档案互斥。Run 外状态运维、节点演进与条目清理统一经由 `TaskLite.edit()`（永不删除 `attempts`），只读查询与报告统一经由 `StateSnapshot`。
 _Avoid_: FailureLog, ErrorQueue, Trash, DLQ, DeadLetter
 
 **encode_* family**:

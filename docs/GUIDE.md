@@ -1,6 +1,6 @@
 # TaskLite 使用手册
 
-> 本文档是 TaskLite 3.0.0.dev0 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、Trigger 与恢复边界、`JobContext` 与统一文件声明授权、统一状态管理与历史清理，以及只读一致状态快照（`StateSnapshot`）。项目概览与快速上手见 [`README.md`](../README.md)，公开 API 权威参考手册见 [`docs/API.md`](API.md)，架构决策记录见 [`docs/adr/`](adr/)。
+> 本文档是 TaskLite 3.0.0.dev0 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、Trigger 与恢复边界、`JobContext` 与统一文件声明授权、原子图修整运维（`TaskLite.edit()`），以及只读一致状态快照（`StateSnapshot`）与极简运维 CLI。项目概览与快速上手见 [`README.md`](../README.md)，公开 API 权威参考手册见 [`docs/API.md`](API.md)，架构决策记录见 [`docs/adr/`](adr/)。
 
 ---
 
@@ -144,7 +144,7 @@ Schema 6 包含以下核心表：
 7. `engine_metadata(key TEXT PRIMARY KEY, value TEXT)`
 8. `authorizations(path TEXT PRIMARY KEY, target_type TEXT, authorized_at TEXT)`
 
-`job_sequences` 是独立编号进度，不从当前队列、终态档案或剩余 Attempt 最大值推导。清空某 UID 的全部档案与 Attempt 后重新入队，`attempt_no` 仍从该 UID 已分配到的位置继续单调递增；人工状态修改不推进编号。
+`job_sequences` 是独立编号进度，不从当前队列、终态档案或 `attempts` 最大值推导。通过 `TaskLite.edit()` 的 `tx.remove()` 清除某 UID 的队列与终态档案后（`attempts` 物理轨迹永不可删），重新入队相同 `job_uid`，`attempt_no` 仍从该 UID 已分配到的位置继续单调递增；人工状态修改不推进编号。
 
 ### 下次启动的恢复边界
 
@@ -167,7 +167,7 @@ TaskLite 遵循确定性的六步调用顺序：
 
 **初始化 → `register_resource` → `register_task` → `enqueue` → `run` → `stop`**
 
-> **注意**：管理类 API（`set_job_status` / `clear_history` / `get_cursor` / `set_cursor` / `list_authorizations` / `revoke_authorization`）必须在 `run()` 外调用。
+> **注意**：管理类 API（`edit()` / `get_cursor` / `set_cursor` / `grant_authorization` / `list_authorizations` / `revoke_authorization`）必须在 `run()` 外调用。
 
 ### 最小可运行示例
 
@@ -240,46 +240,74 @@ FileSpec(
 ### 文件操作授权管理
 
 文件声明用于路径管理、依赖传递与清理请求，不是 handler 的写入沙箱。读取默认允许；当任务声明 `delete_existing`、`delete_on_failure` 或 `delete_on_success` 时，主进程拥有授权检查与清理执行职责：
+- **Run 外显式预授权（推荐用于后台非交互流水线）**：
+  ```python
+  from tasklite import TaskLite
+
+  with TaskLite(backend="sqlite", state_path="./state.db") as pipeline:
+      pipeline.grant_authorization("./output", target_type="directory")
+      pipeline.grant_authorization("./output/report.csv", target_type="file")
+      print(pipeline.list_authorizations())
+      pipeline.revoke_authorization("./output/report.csv")
+  ```
+  `grant_authorization` 属于一次性持久化运维动作（跨 Run 复用，不提供 `exist_ok`）：目标路径不要求已在磁盘存在；重复授权同规范路径（含 Windows 大小写等价路径）或存在父子 `file`/`directory` 类型矛盾时，一律抛出 `TaskLiteError`；父子目录授权独立存取与撤销，互不隐式合并。
 - 环境变量 `TASKLITE_DANGEROUS_AUTO_APPROVE=1`：危险开关，自动同意本进程实际请求且未命中硬性保护规则的框架文件操作，并记录实际授权路径；开启后框架不再逐项弹窗询问，请确保声明路径安全可控；
 - 等待授权决策时暂停新派发，继续处理已派发执行；初始派发前的授权等待不占用业务资源、不消费配额，也不计执行超时；
 - 运行中动态声明或结果清理的授权待决仍持有本次已获取的资源；动态声明等待期间暂停执行超时计时，收到有效结果后的清理不计执行超时；
 - 初始派发前授权拒绝时，Job 保持 `pending`，不产生 Attempt；已进入 `running` 后授权拒绝或等待期间收到停止请求时，先结束受阻执行，再追加 `failure` Attempt、把 Job 回到 `pending`；两者均不写失败档案、不消耗重试预算；
 - 授权拒绝将受影响依赖链加入本 Run 临时排除；`stop()`／Ctrl+C 则停止整个 Run 的新派发；
-- 受保护的状态库、WAL／SHM 副文件与库级锁文件绝对禁止声明或删除；
-- Run 外可调用 `pipeline.list_authorizations()` 查看当前已持久化授权，调用 `pipeline.revoke_authorization(path)` 精准撤销；
-- **平台支持边界**：当前主进程物理文件/目录安全清理（`ArtifactPathPolicy`）依赖 Linux `dir_fd` / `O_NOFOLLOW` / `O_DIRECTORY` 与 `/proc/self/mountinfo`，目前仅支持 Linux 平台。
+- **受保护 5 路径硬拦截**：状态库自身及自动派生的全部 5 项内部路径（`state_path`、`-wal`、`-shm`、`-journal` 与 `<state_path>.lock`）以及文件系统根 / 盘符根 / UNC 根绝对禁止声明、预授权或删除；
+- **跨平台支持边界**：主进程物理文件/目录安全清理已同时支持 **Linux**（`dir_fd` / `O_NOFOLLOW` / `O_DIRECTORY` 与 `/proc/self/mountinfo`）与 **Windows**（无特权 `kernel32` 钉锁父目录 + `st_reparse_tag` 重解析点分类；Windows 下 NTFS Junction / 卷挂载点一律 fail-closed 拒绝，不隐式清除只读位，文件占用错误原样传播）。完整契约见 [`docs/API.md`](API.md#35-filespec-统一文件声明与清理授权)。
 
 授权等待是文件准备协议的一部分，不是资源挂起。`TaskResult.retry`、资源不足和授权等待具有不同语义，不共享重试或挂起入口。
 
 ---
 
-## 4. 统一状态管理与历史运维（Run 外 API）
+## 4. 统一状态管理与图修整运维（Run 外 API）
 
-所有运维与状态变更操作收敛在 `TaskLite` 门面，且**严格限于 `run()` 外部调用**。在 `run()` 执行期间调用公开管理 API 或再次调用 `run()`，框架主动抛出 `TaskLiteError`；底层库自然产生的异常保持原类型传播：
+所有运维与状态变更操作收敛在 `TaskLite` 门面，且**严格限于 `run()` 外部调用**。在 `run()` 执行期间调用公开管理 API 或再次调用 `run()`，框架主动抛出 `TaskLiteError`；底层库自然产生的异常保持原类型传播。
 
-### 人工变更作业状态：`set_job_status`
+### 原子图修整事务：`pipeline.edit()`
 
-```python
-# 将作业重置为 pending，级联重置下游依赖
-pipeline.set_job_status("fetch::item_1", "pending", recursive=True)
-
-# 或标记人工成功并附加说明
-pipeline.set_job_status("fetch::item_1", "succeeded", recursive=False, note="人工标记成功")
-```
-
-- `status` 仅支持 `"pending"`、`"succeeded"`、`"failed"` 三个合法目标态；
-- `recursive=True` 时，状态变更自动级联到其下游所有依赖作业；
-- 人工设置成功不会伪造 Attempt 记录，但在元数据中记录 `completion_source="manual"` 与可选的 `note`。
-
-### 清理历史记录：`clear_history`
+Run 外的作业新增、配置/路径演进替换、状态流转与条目移除统一经由 `with pipeline.edit(dry_run=..., note=...) as tx:` 完成：
 
 ```python
-# 精准清理选中的历史档案（返回值表示删除记录数）
-deleted_count = pipeline.clear_history("fetch::item_1", records=["successes", "attempts"])
+from tasklite import FileSpec, Job, TaskLite
+
+with TaskLite(backend="sqlite", state_path="./state.db") as pipeline:
+    pipeline.register_task("fetch", fetch_handler)
+
+    # 默认 dry_run=True：仅校验并打印 diff 预览，零磁盘写入
+    with pipeline.edit(dry_run=True, note="调大超时并重排") as tx:
+        if "fetch::item_1" in tx:
+            tx.set_status("fetch::item_1", "pending", recursive=True)
+            tx.replace(
+                "fetch::item_1",
+                Job(
+                    "fetch",
+                    "item_1",
+                    payload={"content": "示例一"},
+                    timeout_seconds=7200,
+                ),
+            )
+        print(tx.diff())
+
+    # 确认 diff 无误后，显式传入 dry_run=False 原子落盘
+    with pipeline.edit(dry_run=False, note="清理废除分支") as tx:
+        tx.remove("fetch::item_2", recursive=False)
 ```
 
-- 精准删除指定的历史集合（`successes` / `failures` / `attempts`）；
-- **不变式：内部单调编号进度绝不重置**。清空历史后重新入队相同 `job_uid`，其新产生的 Attempt 序号仍从该 UID 的独立编号进度继续单调自增，不依赖剩余历史，也不回退到 1。
+常用原语与核心原则：
+- **原语速览**：
+  - `uid in tx`：查询工作图中是否存在该 `uid`；
+  - `tx.add(job, *, status="pending"|"succeeded"|"failed")`：纯新增节点（已存在报错防误覆盖）；
+  - `tx.replace(old_uid, new_job, *, status=None)` / `tx.replace_many(mapping, *, status=None)`：演进替换节点或批量编号顺移/互换，`status=None` 自动继承原状态（遗留 `running` 自动补写失败 `Attempt` 并收敛为 `failed`）；
+  - `tx.set_status(uid, "pending"|"failed", *, recursive=...)`：沿用既有快照流转状态（`recursive` 必填，刻意不包含 `"succeeded"`）；
+  - `tx.remove(uid, *, entries=("queue", "successes", "failures"), recursive=...)`：按字面从指定分区移除条目（`recursive` 必填）；
+  - `tx.before` / `tx.after` / `tx.diff()`：获取修改前后内存只读 `StateSnapshot` 与紧凑变更/告警/校验报告（`tx.diff()` 永不因校验错误中断渲染）。
+- **提交期全量攒错与原子回滚**：退出 `with` 块时一次性校验防删出新孤儿、活跃/成功/触碰节点零孤儿与无环、`from_output` 契约闭合以及非执行 `succeeded` 物理产出在场；任一违规即汇总抛出单一 `TaskLiteError` 并整单回滚，杜绝半成品脏库。
+- **非执行 `succeeded` 与双管线拆分原则**：凡经 `tx.add` 或 `tx.replace` 置为 `"succeeded"` 且声明了保留型 `role="output"` 的节点，其产出文件必须在磁盘真实存在（零文件删除副作用、不伪造 `Attempt`、记录 `completion_source="manual"`）。若跨机仅拷贝中间层产物而不保留前段巨型文件，应在切割面拆分为两个独立 Pipeline（前段 `output` 在后段作为普通 `role="input"`），不在单库内制造无物理产物的伪成功状态。
+- **审计不变式**：`attempts` 物理执行轨迹**永不可删**，`job_sequences` 单调递增编号进度**永不重置**；`edit()` 绝不删除任何磁盘文件。完整规范见 [`docs/API.md`](API.md#26-run-外状态运维图修整与授权接口)。
 
 ### 高水位游标读写
 
@@ -290,28 +318,52 @@ value = pipeline.get_cursor("offset")
 
 ---
 
-## 5. 只读一致状态快照与 JSON 查询
+## 5. 只读一致状态快照、对比报告与运维 CLI
 
-`StateSnapshot` 是对状态库进行只读观察的单一权威入口。支持从数据库路径或 `TaskLite` 实例打开：
+`StateSnapshot` 是对状态库进行只读观察的单一权威入口。支持从数据库路径或 `TaskLite` 实例打开，并提供 `mode="lazy"`（默认流式只读事务）与 `mode="copy"`（单一事务加载后立即释放 SQLite 连接，零长期句柄占用）：
 
 ```python
 from tasklite import StateSnapshot
 
-# 方式一：从数据库路径只读打开（持有 SQLite 独立读事务）
+# 方式一：从数据库路径只读打开（mode="lazy"，持有 SQLite 独立读事务）
 with StateSnapshot.open("./state.db") as snap:
     job = snap.get_job("fetch::item_1")
     print(job["status"], job["result"])
 
-# 方式二：从 TaskLite 实例打开
-with StateSnapshot.open(pipeline) as snap:
-    for job in snap.iter_jobs(status="succeeded"):
-        print(job["job_uid"])
+# 方式二：运行前后零句柄对比（mode="copy" 立即关闭 SQLite 连接）
+before = StateSnapshot.open("./state.db", mode="copy")
+# ... 执行长耗时 pipeline.run() ...
+after = StateSnapshot.open("./state.db", mode="copy")
+print(StateSnapshot.report(before, after))
+before.close()
+after.close()
 ```
 
 ### 一致性保证
 
-- SQLite 快照持有只读连接与独立事务，外部正在进行的写入与提交不会破坏快照打开时的一致性视图；
+- `mode="lazy"` 下 SQLite 快照持有只读连接与独立事务，外部正在进行的写入与提交不会破坏快照打开时的一致性视图；
+- `mode="copy"` 在单一只读事务内读取一致快照后立即关闭底层 SQLite 连接，避免长耗时 `run()` 期间持握句柄；
 - 内存快照在打开瞬间捕获一致性版本；快照只读，不阻塞写入者。
+
+### 极简运维 CLI 速览
+
+终端排障与纯 `uid` 级轻量运维可直接调用 `python -m tasklite`（所有子命令强制必填 `<state_path>`，修改类命令默认 dry-run 仅打印 `diff`，显式传入 `--apply` 才原子落盘）：
+
+```bash
+# 查看只读状态、各 task_type 耗时统计与在途 ETA 报告
+python -m tasklite status ./state.db
+
+# 预览将指定作业及其下游重置为 pending（不写盘）
+python -m tasklite set-status ./state.db fetch::item_1 pending --recursive
+
+# 确认 diff 后显式提交落盘
+python -m tasklite set-status ./state.db fetch::item_1 pending --recursive --apply
+
+# 移除指定作业条目（默认清理 queue,successes,failures，永不删 attempts）
+python -m tasklite remove ./state.db fetch::item_2 --no-recursive --apply
+```
+
+完整 CLI 参数与退出码契约见 [`docs/API.md`](API.md#7-极简运维命令行入口)。
 
 ### 结构化 JSON 查询结果样本
 
@@ -404,7 +456,7 @@ with StateSnapshot.open(pipeline) as snap:
 | `ctx.declare_output(path)` | `ctx.declare_file(name, FileSpec(path, role="output"))` | 统一文件声明对象，包含明确角色与清理权限 |
 | `ctx.get_artifact_path(...)` | `ctx.file_path(name)` 或上游预声明 | 消除旧产物查找协议，规范为已声明文件路径解析 |
 | `RateLimitResource(...)` | `IntervalResource(name, interval_seconds=...)` | `interval_seconds` 必须使用关键字参数，从 `tasklite.resource` 导入 |
-| `list_failures` / `clear_failures` / `retry_failure` | `set_job_status` / `clear_history` / `StateSnapshot` | 失败档案管理收敛为统一状态与历史管理 API |
+| `list_failures` / `clear_failures` / `retry_failure` / `set_job_status` / `clear_history` | `pipeline.edit()` / `StateSnapshot` | 状态修改、节点演进与条目移除统一收敛至原子图修整事务 `edit()`（`attempts` 永不可删），只读观测收敛至 `StateSnapshot` |
 | `pipeline.selection(...)` / `Skip` | `pipeline.run(exclude=Exclude(...))` | 删除复杂规则容器与 Skip 终态跳过，仅保留 Exclude 延迟留队 |
 | `RunSummary` / `pipeline.stats` | `pipeline.run()` 返回 `None`，查询用 `StateSnapshot` | 移除易过期的统计快照，由一致只读快照提供权威观察 |
 
