@@ -55,6 +55,7 @@ EXPECTED_ABSTRACT_METHODS = {
     "get_attempt_sequence",
     "load_settled_attempts",
     "load_queue_jobs",
+    "grant_authorization",
     "record_authorization",
     "list_authorizations",
     "is_path_authorized",
@@ -890,3 +891,85 @@ class TestAuthorizationParity:
         target.mkdir()
         assert store.check_or_request_authorization(target) is True
         assert store.list_authorizations()[0]["target_type"] == "directory"
+
+    def test_grant_authorization_parity_conflicts_and_nested_directories(
+        self, dual_backend, tmp_path
+    ):
+        b = dual_backend
+        f1 = str((tmp_path / "single.txt").resolve())
+        d_root = str((tmp_path / "work").resolve())
+        d_sub = str((tmp_path / "work" / "sub").resolve())
+        f_inside = str((tmp_path / "work" / "sub" / "leaf.bin").resolve())
+        f_parent = str((tmp_path / "conflict_parent").resolve())
+        f_child = str((tmp_path / "conflict_parent" / "child.txt").resolve())
+        d_child = str((tmp_path / "conflict_parent2" / "sub").resolve())
+        f_ancestor = str((tmp_path / "conflict_parent2").resolve())
+
+        with pytest.raises(TaskLiteError, match="target_type"):
+            b.grant_authorization(f1, "symlink")  # type: ignore[arg-type]
+
+        rec = b.grant_authorization(f1, "file", authorized_at="2026-11-20T00:00:00Z")
+        assert rec == {
+            "path": f1,
+            "target_type": "file",
+            "authorized_at": "2026-11-20T00:00:00Z",
+        }
+        assert b.is_path_authorized(f1, "file") is True
+        assert b.is_path_authorized(f1, "directory") is False
+
+        # 同路径重复授权（同类型或异类型）一律拒绝，且不刷新时间戳
+        with pytest.raises(TaskLiteError, match="already exists"):
+            b.grant_authorization(f1, "file", authorized_at="2026-11-21T00:00:00Z")
+        with pytest.raises(TaskLiteError, match="already exists"):
+            b.grant_authorization(f1, "directory", authorized_at="2026-11-21T00:00:00Z")
+        assert b.list_authorizations() == [rec]
+
+        # 祖先已按 file 授权时，禁止再授权任何子路径（file 或 directory）
+        b.grant_authorization(f_parent, "file")
+        with pytest.raises(TaskLiteError, match="existing file authorization"):
+            b.grant_authorization(f_child, "file")
+        with pytest.raises(TaskLiteError, match="existing file authorization"):
+            b.grant_authorization(str(Path(f_parent) / "dir"), "directory")
+
+        # 已存在子路径授权时，禁止将祖先按 file 授权
+        b.grant_authorization(d_child, "directory")
+        with pytest.raises(TaskLiteError, match="descendant authorization"):
+            b.grant_authorization(f_ancestor, "file")
+
+        # 父子目录嵌套及目录下文件允许独立存取与撤销
+        r_root = b.grant_authorization(d_root, "directory")
+        r_sub = b.grant_authorization(d_sub, "directory")
+        r_leaf = b.grant_authorization(f_inside, "file")
+        assert r_root["path"] == d_root and r_sub["path"] == d_sub and r_leaf["path"] == f_inside
+        assert b.is_path_authorized(f_inside, "file") is True
+        assert b.revoke_authorization(d_sub) is True
+        # 撤销子目录后父目录仍覆盖该文件，但子目录独立条目已删除
+        assert b.is_path_authorized(f_inside, "file") is True
+        assert b.revoke_authorization(d_sub) is False
+        assert b.revoke_authorization(d_root) is True
+        # 撤销父目录后，显式授权的子文件条目依然保留
+        assert b.is_path_authorized(f_inside, "file") is True
+        assert b.revoke_authorization(f_inside) is True
+        assert b.is_path_authorized(f_inside, "file") is False
+
+    def test_windows_case_equivalence_in_backend_authorizations(self, dual_backend, tmp_path):
+        import os
+
+        if os.name != "nt":
+            pytest.skip("仅在 Windows 验证大小写等价键行为")
+        b = dual_backend
+        lower_path = str((tmp_path / "case_dir" / "item.txt").resolve())
+        upper_path = str((tmp_path / "CASE_DIR" / "ITEM.TXT").resolve())
+
+        b.grant_authorization(lower_path, "file", authorized_at="2026-11-20T00:00:00Z")
+        with pytest.raises(TaskLiteError, match="already exists"):
+            b.grant_authorization(upper_path, "file")
+        assert b.is_path_authorized(upper_path, "file") is True
+
+        # 运行期 record_authorization 大小写差异原地升级，不留双行
+        b.record_authorization(upper_path, "directory", authorized_at="2026-11-20T01:00:00Z")
+        records = b.list_authorizations()
+        assert len(records) == 1
+        assert records[0]["target_type"] == "directory"
+        assert b.revoke_authorization(lower_path) is True
+        assert b.list_authorizations() == []

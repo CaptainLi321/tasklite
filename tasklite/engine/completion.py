@@ -117,13 +117,23 @@ class CompletionMachine:
     def has_pending_result(self, handle: JobHandle) -> bool:
         return handle.job_uid in self._pending_cleanup
 
+    def _make_path_policy(
+        self,
+        *,
+        authorization_check: Any | None = None,
+    ) -> ArtifactPathPolicy:
+        """统一经 StateStore.path_policy 装配路径策略，并兼容渠道附加受保护根。"""
+        return ArtifactPathPolicy(
+            path_policy=self._store.path_policy,
+            protected_roots=self._channel.protected_roots,
+            authorization_check=authorization_check,
+        )
+
     def _authorize_cleanup(
         self, entry: InFlightJob | None, result: ExecutionResult,
         active_files: dict[str, FileSpec],
     ) -> None:
-        policy = ArtifactPathPolicy(
-            protected_roots=self._channel.protected_roots,
-        )
+        policy = self._make_path_policy()
         for spec in active_files.values():
             requested = spec.delete_on_success if result.success else spec.delete_on_failure
             if not requested or spec.path is None:
@@ -224,9 +234,7 @@ class CompletionMachine:
         if result.artifact_error is not None:
             raise _ArtifactIOError(result.artifact_error)
         if result.success:
-            policy = ArtifactPathPolicy(
-                protected_roots=self._channel.protected_roots,
-            )
+            policy = self._make_path_policy()
             for fname, spec in active_files.items():
                 if spec.role != "output":
                     continue
@@ -349,8 +357,7 @@ class CompletionMachine:
 
             # 声明式产物主进程清理
             if active_files:
-                policy = ArtifactPathPolicy(
-                    protected_roots=self._channel.protected_roots,
+                policy = self._make_path_policy(
                     authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
                 )
                 if result.success:

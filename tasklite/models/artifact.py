@@ -51,11 +51,13 @@ def resolve_path_against_base(path: str | Path, base_dir: str | Path) -> str:
     norm = _normalize_lexical_path(path)
     base_norm = _normalize_lexical_path(base_dir)
     if os.name == "nt":
-        path_drive, path_root = os.path.splitdrive(norm)
-        if path_drive and not path_root:
+        path_drive, path_tail = os.path.splitdrive(norm)
+        if path_drive and not path_drive.startswith("\\\\") and not path_tail.startswith(("\\", "/")):
             raise TaskLiteError(
                 f"drive-relative FileSpec paths are not portable: {norm!r}"
             )
+        if path_drive.startswith("\\\\") and not path_tail:
+            return f"{path_drive}\\"
     if not os.path.isabs(base_norm):
         base_norm = os.path.abspath(base_norm)
     if os.path.isabs(norm):

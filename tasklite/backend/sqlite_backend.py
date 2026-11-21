@@ -11,7 +11,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence, cast
 
 from .base import (
     AbstractStateBackend,
@@ -23,6 +23,7 @@ from .base import (
 )
 from ..exceptions import TaskLiteError
 from ..models.state import job_uid_from_snapshot
+from ..utils.artifact import TargetType, evaluate_authorization
 from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import dumps, loads
 
@@ -967,6 +968,43 @@ class SQLiteStateBackend(AbstractStateBackend):
                     (dumps(public_queue_snapshot(stored_job)), "pending", job_uid),
                 )
 
+    @staticmethod
+    def _load_auth_pairs(conn: sqlite3.Connection) -> list[tuple[str, TargetType]]:
+        rows = conn.execute('SELECT path, target_type FROM authorizations').fetchall()
+        return [(row[0], cast(TargetType, row[1])) for row in rows]
+
+    def grant_authorization(
+        self,
+        path: str,
+        target_type: Literal["file", "directory"],
+        *,
+        authorized_at: str | None = None,
+    ) -> dict[str, Any]:
+        norm_path = os.path.normpath(os.fspath(path))
+        if target_type not in ("file", "directory"):
+            raise TaskLiteError(
+                f"target_type must be 'file' or 'directory', got {target_type!r}"
+            )
+        ts = authorized_at if authorized_at is not None else utc_now_iso()
+        with self._get_conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            match = evaluate_authorization(
+                self._load_auth_pairs(conn),
+                norm_path,
+                target_type,
+            )
+            if match.grant_conflict is not None:
+                raise TaskLiteError(match.grant_conflict)
+            conn.execute(
+                'INSERT INTO authorizations (path, target_type, authorized_at) VALUES (?, ?, ?)',
+                (norm_path, target_type, ts),
+            )
+            return {
+                "path": norm_path,
+                "target_type": target_type,
+                "authorized_at": ts,
+            }
+
     def record_authorization(
         self,
         path: str,
@@ -979,6 +1017,14 @@ class SQLiteStateBackend(AbstractStateBackend):
             raise ValueError(f"target_type must be 'file' or 'directory', got {target_type!r}")
         ts = authorized_at if authorized_at is not None else utc_now_iso()
         with self._get_conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            match = evaluate_authorization(
+                self._load_auth_pairs(conn),
+                norm_path,
+                cast(TargetType, target_type),
+            )
+            if match.exact_path is not None and match.exact_path != norm_path:
+                conn.execute('DELETE FROM authorizations WHERE path = ?', (match.exact_path,))
             conn.execute(
                 'INSERT OR REPLACE INTO authorizations (path, target_type, authorized_at) VALUES (?, ?, ?)',
                 (norm_path, target_type, ts),
@@ -997,28 +1043,23 @@ class SQLiteStateBackend(AbstractStateBackend):
     def revoke_authorization(self, path: str) -> bool:
         norm_path = os.path.normpath(os.fspath(path))
         with self._get_conn() as conn:
-            cur = conn.execute('DELETE FROM authorizations WHERE path = ?', (norm_path,))
+            conn.execute('BEGIN IMMEDIATE')
+            match = evaluate_authorization(self._load_auth_pairs(conn), norm_path)
+            if match.exact_path is None:
+                return False
+            cur = conn.execute('DELETE FROM authorizations WHERE path = ?', (match.exact_path,))
             return bool(cur.rowcount and cur.rowcount > 0)
 
     def is_path_authorized(self, path: str, target_type: str) -> bool:
         norm_path = os.path.normpath(os.fspath(path))
-        target_p = Path(norm_path)
+        if target_type not in ("file", "directory"):
+            return False
         with self._get_conn() as conn:
-            cur = conn.execute(
-                'SELECT 1 FROM authorizations WHERE path = ? AND target_type = ?',
-                (norm_path, target_type),
-            )
-            if cur.fetchone() is not None:
-                return True
-            cur = conn.execute("SELECT path FROM authorizations WHERE target_type = 'directory'")
-            for row in cur.fetchall():
-                dir_path = Path(row[0])
-                try:
-                    if target_p.is_relative_to(dir_path):
-                        return True
-                except (ValueError, TypeError):
-                    pass
-        return False
+            return evaluate_authorization(
+                self._load_auth_pairs(conn),
+                norm_path,
+                cast(TargetType, target_type),
+            ).covered
 
     def close(self) -> None:
         """关闭后端并释放资源（幂等）。"""

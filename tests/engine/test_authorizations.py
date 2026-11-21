@@ -1404,3 +1404,176 @@ def test_success_cleanup_error_does_not_run_unapproved_failure_cleanup(tmp_path,
     assert calls == [(str(first), "file"), (str(second), "file")]
     assert "replace::one" in _jobs_by_status(p, "failed")
     p.close()
+
+
+# ── Run 外显式预授权 TaskLite.grant_authorization 验收用例集 ──────────────
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_grant_authorization_enables_non_interactive_run_and_persists(
+    tmp_path, monkeypatch, backend,
+):
+    """grant_authorization 支持不存在的目标、零磁盘副作用，并支撑无交互 Run 清理。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
+    state_path = tmp_path / "preauth.db"
+    kwargs = {"state_path": state_path} if backend == "sqlite" else {}
+
+    work_dir = tmp_path / "future_outputs"
+    single_file = tmp_path / "future_single.txt"
+    assert not work_dir.exists() and not single_file.exists()
+
+    with TaskLite(backend=backend, **kwargs) as p:
+        dir_rec = p.grant_authorization("future_outputs", target_type="directory")
+        file_rec = p.grant_authorization(single_file, target_type="file")
+        assert not work_dir.exists() and not single_file.exists()
+        assert dir_rec["path"] == str(work_dir.resolve())
+        assert dir_rec["target_type"] == "directory"
+        assert isinstance(dir_rec["authorized_at"], str) and dir_rec["authorized_at"]
+        assert file_rec["path"] == str(single_file.resolve())
+        assert file_rec["target_type"] == "file"
+
+        # 改变 cwd 后相对路径仍以实例构造期 base_dir 锚定
+        other_cwd = tmp_path / "other_cwd"
+        other_cwd.mkdir()
+        monkeypatch.chdir(other_cwd)
+        with pytest.raises(TaskLiteError, match="already exists"):
+            p.grant_authorization("future_outputs", target_type="directory")
+
+        # 创建目标文件并在无 authorizer 且无 AUTO_APPROVE 下直接执行前删
+        work_dir.mkdir()
+        nested = work_dir / "nested.txt"
+        nested.write_text("stale", encoding="utf-8")
+        single_file.write_text("stale-single", encoding="utf-8")
+
+        p.register_task("writer", _declare_then_write_handler)
+        p.enqueue(Job("writer", "nested", payload={"path": str(nested), "content": "fresh-nested"}))
+        p.enqueue(Job("writer", "single", payload={"path": str(single_file), "content": "fresh-single"}))
+        with in_process_workers(p), inject_authorizer(p, None):
+            p.run(install_signals=False)
+
+        assert _jobs_by_status(p, "succeeded") == {"writer::nested", "writer::single"}
+        assert nested.read_text(encoding="utf-8") == "fresh-nested"
+        assert single_file.read_text(encoding="utf-8") == "fresh-single"
+
+    if backend == "sqlite":
+        monkeypatch.chdir(tmp_path)
+        with TaskLite(backend="sqlite", state_path=state_path) as reopened:
+            assert {(r["path"], r["target_type"]) for r in reopened.list_authorizations()} == {
+                (str(work_dir.resolve()), "directory"),
+                (str(single_file.resolve()), "file"),
+            }
+
+
+def test_grant_authorization_guards_protected_paths_and_conflicts(tmp_path, monkeypatch):
+    """grant_authorization 严守 Run/关闭守卫、受保护 5 路径、根路径、链接与冲突矩阵。"""
+    import subprocess
+    import sys
+
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / "state_region"
+    state_dir.mkdir()
+    state_path = state_dir / "engine.db"
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    p = TaskLite(backend="sqlite", state_path=state_path)
+    try:
+        # 关键字参数与非法 target_type
+        with pytest.raises(TypeError):
+            p.grant_authorization(work_dir / "a.txt", "file")  # type: ignore[misc]
+        for bad_type in ("symlink", "", None, 123, True):
+            with pytest.raises(TaskLiteError, match="target_type"):
+                p.grant_authorization(work_dir / "a.txt", target_type=bad_type)  # type: ignore[arg-type]
+
+        # Run 期守卫
+        with running(p):
+            with pytest.raises(TaskLiteError, match="is only allowed outside run"):
+                p.grant_authorization(work_dir / "a.txt", target_type="file")
+
+        # 全部 5 项受保护内部路径、父目录与文件系统根一律拒绝
+        for forbidden in (
+            state_path,
+            Path(f"{state_path}-wal"),
+            Path(f"{state_path}-shm"),
+            Path(f"{state_path}-journal"),
+            Path(f"{state_path}.lock"),
+            state_dir,
+            tmp_path,
+            Path(tmp_path.anchor),
+        ):
+            with pytest.raises(TaskLiteError):
+                p.grant_authorization(forbidden, target_type="file")
+            with pytest.raises(TaskLiteError):
+                p.grant_authorization(forbidden, target_type="directory")
+
+        # Windows NTFS Junction（免特权）硬拦截
+        if sys.platform == "win32":
+            junc = work_dir / "junc_target"
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junc), str(state_dir)],
+                check=True,
+                capture_output=True,
+            )
+            try:
+                with pytest.raises(TaskLiteError, match="junction|reparse"):
+                    p.grant_authorization(junc, target_type="directory")
+            finally:
+                if os.path.lexists(junc):
+                    os.rmdir(junc)
+
+        # 重复授权与父子类型冲突矩阵
+        parent_file = work_dir / "parent_file"
+        p.grant_authorization(parent_file, target_type="file")
+        with pytest.raises(TaskLiteError, match="already exists"):
+            p.grant_authorization(parent_file, target_type="file")
+        with pytest.raises(TaskLiteError, match="already exists"):
+            p.grant_authorization(parent_file, target_type="directory")
+        with pytest.raises(TaskLiteError, match="existing file authorization"):
+            p.grant_authorization(parent_file / "child.txt", target_type="file")
+        with pytest.raises(TaskLiteError, match="existing file authorization"):
+            p.grant_authorization(parent_file / "subdir", target_type="directory")
+
+        # 已存在子授权时禁止把祖先授权为 file
+        nested_dir = work_dir / "tree" / "branch"
+        p.grant_authorization(nested_dir, target_type="directory")
+        with pytest.raises(TaskLiteError, match="descendant authorization"):
+            p.grant_authorization(work_dir / "tree", target_type="file")
+        # 但允许把祖先授权为 directory，且两者独立存取与撤销
+        p.grant_authorization(work_dir / "tree", target_type="directory")
+        assert p.revoke_authorization(nested_dir) is True
+        assert p.revoke_authorization(work_dir / "tree") is True
+
+        # Windows 大小写等价重复拒绝与跨大小写撤销
+        if os.name == "nt":
+            case_file = work_dir / "CaseTarget.txt"
+            p.grant_authorization(case_file, target_type="file")
+            with pytest.raises(TaskLiteError, match="already exists"):
+                p.grant_authorization(work_dir / "casetarget.txt", target_type="file")
+            assert p.revoke_authorization(work_dir / "CASETARGET.TXT") is True
+    finally:
+        p.close()
+
+    # 关闭后守卫
+    with pytest.raises(TaskLiteError, match="closed"):
+        p.grant_authorization(work_dir / "after_close.txt", target_type="file")
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal", ".lock"])
+def test_runtime_forbids_deleting_sqlite_sidecar_and_lock_files(tmp_path, monkeypatch, suffix):
+    """运行期文件清理同样严禁触碰 state_path 的 -wal/-shm/-journal/.lock 伴随文件。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
+    state_path = tmp_path / "engine.db"
+    sidecar = Path(f"{state_path}{suffix}")
+    with TaskLite(backend="sqlite", state_path=state_path) as p:
+        p.register_task("work", _quick_handler)
+        p.enqueue(Job(
+            "work",
+            "one",
+            files={"bad": FileSpec(sidecar, role="output", delete_existing=True)},
+        ))
+        with in_process_workers(p):
+            p.run(install_signals=False)
+        assert "work::one" in _jobs_by_status(p, "failed")
+        assert p.list_authorizations() == []

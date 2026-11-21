@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -121,7 +123,8 @@ class TestFileSpecRolesAndCleanup:
     @pytest.mark.parametrize("role", FILE_ROLES)
     def test_defaults_all_cleanup_flags_false(self, role):
         spec = FileSpec("data/item.txt", role=role)
-        assert spec.path == "data/item.txt"
+        assert spec.path == os.path.normpath("data/item.txt")
+        assert Path(spec.path) == Path("data/item.txt")
         assert spec.producer_uid is None
         assert spec.output_name is None
         assert spec.is_output_ref is False
@@ -129,6 +132,17 @@ class TestFileSpecRolesAndCleanup:
         assert spec.delete_existing is False
         assert spec.delete_on_failure is False
         assert spec.delete_on_success is False
+
+    def test_resolve_path_against_base_rejects_windows_drive_relative(self, tmp_path):
+        from tasklite.models.artifact import resolve_path_against_base
+
+        if os.name == "nt":
+            with pytest.raises(TaskLiteError, match="drive-relative"):
+                resolve_path_against_base("C:relative/file.txt", tmp_path)
+            with pytest.raises(TaskLiteError, match="drive-relative"):
+                resolve_path_against_base("C:", tmp_path)
+            assert resolve_path_against_base("\\\\server\\share", tmp_path) == "\\\\server\\share\\"
+        assert resolve_path_against_base("sub/file.txt", tmp_path) == str(tmp_path / "sub" / "file.txt")
 
     @pytest.mark.parametrize("delete_on_failure", [False, True])
     @pytest.mark.parametrize("delete_on_success", [False, True])

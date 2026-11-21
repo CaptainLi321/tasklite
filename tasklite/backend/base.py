@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import copy
 from abc import ABC, abstractmethod
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 
 QUEUE_EXECUTION_ID_KEY = "__tasklite_execution_id__"
@@ -257,6 +257,16 @@ class AbstractStateBackend(ABC):
     @abstractmethod
     def load_queue_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:
         """按 queue_position 升序加载队列行的完整信息，可选按 status 过滤。"""
+
+    @abstractmethod
+    def grant_authorization(
+        self,
+        path: str,
+        target_type: Literal["file", "directory"],
+        *,
+        authorized_at: str | None = None,
+    ) -> dict[str, Any]:
+        """原子校验冲突并新增持久化路径授权（重复或父子类型冲突抛 TaskLiteError）。"""
 
     @abstractmethod
     def record_authorization(

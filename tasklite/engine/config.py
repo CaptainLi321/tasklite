@@ -12,6 +12,7 @@ from .resource import ResourceManager
 from .scheduler import FifoOrderingPolicy, OrderingPolicy
 from ..backend.base import AbstractStateBackend
 from ..models.task import TaskRegistry
+from ..utils.artifact import PathPolicy
 
 if TYPE_CHECKING:  # 仅静态分析导入，避免运行时环形导入
     from .channel import ExecutionChannel
@@ -36,6 +37,7 @@ class RunConfig:
     ordering_policy: OrderingPolicy
     name: str = "tasklite"
     protected_roots: tuple[Path, ...] = ()
+    path_policy: PathPolicy | None = None
 
     @classmethod
     def resolve(
@@ -51,11 +53,18 @@ class RunConfig:
         requeue_policy: RequeuePolicy | None = None,
         ordering_policy: OrderingPolicy | None = None,
         protected_roots: tuple[Path, ...] = (),
+        path_policy: PathPolicy | None = None,
     ) -> "RunConfig":
         """按引用装配依赖，并解析内部策略默认值。"""
+        effective_protected = (
+            tuple(dict.fromkeys((*path_policy.protected_paths, *(Path(r) for r in protected_roots))))
+            if path_policy is not None
+            else tuple(Path(r) for r in protected_roots)
+        )
         return cls(
             name=name,
-            protected_roots=protected_roots,
+            protected_roots=effective_protected,
+            path_policy=path_policy,
             backend=backend,
             resources=resources,
             tasks=tasks,

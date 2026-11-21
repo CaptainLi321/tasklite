@@ -128,7 +128,10 @@ class JobContext:
             or resolved.delete_on_success
             or resolved.delete_on_failure
         ):
-            policy = ArtifactPathPolicy(protected_roots=self._protected_roots)
+            policy = ArtifactPathPolicy(
+                base_dir=self._base_dir,
+                protected_roots=self._protected_roots,
+            )
             try:
                 policy.resolve(resolved.path, delete_existing=resolved.delete_existing)
             except ValueError as exc:

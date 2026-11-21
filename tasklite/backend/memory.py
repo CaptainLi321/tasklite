@@ -12,7 +12,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence, cast
 
 from .base import (
     AbstractStateBackend,
@@ -25,6 +25,7 @@ from .base import (
 )
 from ..exceptions import TaskLiteError
 from ..models.state import job_uid_from_snapshot
+from ..utils.artifact import TargetType, evaluate_authorization
 from ..utils.clock import utc_now_iso
 
 logger = logging.getLogger("tasklite")
@@ -567,6 +568,41 @@ class InMemoryStateBackend(AbstractStateBackend):
             self._failure_payloads = new_failure_payloads
             self._cursors = new_cursors
 
+    def _existing_auth_pairs(self) -> list[tuple[str, TargetType]]:
+        return [
+            (rec["path"], cast(TargetType, rec["target_type"]))
+            for rec in self._authorizations.values()
+        ]
+
+    def grant_authorization(
+        self,
+        path: str,
+        target_type: Literal["file", "directory"],
+        *,
+        authorized_at: str | None = None,
+    ) -> dict[str, Any]:
+        norm_path = os.path.normpath(os.fspath(path))
+        if target_type not in ("file", "directory"):
+            raise TaskLiteError(
+                f"target_type must be 'file' or 'directory', got {target_type!r}"
+            )
+        ts = authorized_at if authorized_at is not None else utc_now_iso()
+        with self._lock:
+            match = evaluate_authorization(
+                self._existing_auth_pairs(),
+                norm_path,
+                target_type,
+            )
+            if match.grant_conflict is not None:
+                raise TaskLiteError(match.grant_conflict)
+            record = {
+                "path": norm_path,
+                "target_type": target_type,
+                "authorized_at": ts,
+            }
+            self._authorizations[norm_path] = record
+            return dict(record)
+
     def record_authorization(
         self,
         path: str,
@@ -579,6 +615,13 @@ class InMemoryStateBackend(AbstractStateBackend):
             raise ValueError(f"target_type must be 'file' or 'directory', got {target_type!r}")
         ts = authorized_at if authorized_at is not None else utc_now_iso()
         with self._lock:
+            match = evaluate_authorization(
+                self._existing_auth_pairs(),
+                norm_path,
+                cast(TargetType, target_type),
+            )
+            if match.exact_path is not None and match.exact_path != norm_path:
+                self._authorizations.pop(match.exact_path, None)
             self._authorizations[norm_path] = {
                 "path": norm_path,
                 "target_type": target_type,
@@ -587,33 +630,28 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     def list_authorizations(self) -> list[dict[str, Any]]:
         with self._lock:
-            records = list(self._authorizations.values())
+            records = [dict(rec) for rec in self._authorizations.values()]
             return sorted(records, key=lambda r: (r["authorized_at"], r["path"]))
 
     def revoke_authorization(self, path: str) -> bool:
         norm_path = os.path.normpath(os.fspath(path))
         with self._lock:
-            if norm_path in self._authorizations:
-                del self._authorizations[norm_path]
-                return True
-            return False
+            match = evaluate_authorization(self._existing_auth_pairs(), norm_path)
+            if match.exact_path is None:
+                return False
+            self._authorizations.pop(match.exact_path, None)
+            return True
 
     def is_path_authorized(self, path: str, target_type: str) -> bool:
         norm_path = os.path.normpath(os.fspath(path))
-        target_p = Path(norm_path)
+        if target_type not in ("file", "directory"):
+            return False
         with self._lock:
-            exact = self._authorizations.get(norm_path)
-            if exact is not None and exact["target_type"] == target_type:
-                return True
-            for record in self._authorizations.values():
-                if record["target_type"] == "directory":
-                    dir_path = Path(record["path"])
-                    try:
-                        if target_p.is_relative_to(dir_path):
-                            return True
-                    except (ValueError, TypeError):
-                        pass
-        return False
+            return evaluate_authorization(
+                self._existing_auth_pairs(),
+                norm_path,
+                cast(TargetType, target_type),
+            ).covered
 
     def close(self) -> None:
         """关闭后端并释放资源（幂等）。"""

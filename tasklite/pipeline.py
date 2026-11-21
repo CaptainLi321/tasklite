@@ -32,6 +32,7 @@ from .exceptions import TaskLiteError
 from .models.job import Job, WORKER_RESOURCE
 from .models.task import Task, TaskRegistry
 from .selection import Exclude
+from .utils.artifact import PathPolicy
 
 logger = logging.getLogger("tasklite")
 
@@ -91,6 +92,10 @@ class TaskLite:
         self._base_dir: Path = Path(os.path.abspath(os.getcwd()))
         self._backend_type: str = backend
         self._backend_handle: AbstractStateBackend | None = None
+        self._path_policy: PathPolicy = PathPolicy(
+            base_dir=self._base_dir,
+            state_path=self._state_path,
+        )
 
         try:
             self._backend_handle = self._build_backend(backend)
@@ -105,7 +110,8 @@ class TaskLite:
             self._process_context = mp.get_context("spawn")
             self._channel = ExecutionChannel(
                 process_context=self._process_context,
-                protected_roots=((self._state_path,) if self._state_path is not None else ()),
+                protected_roots=self._path_policy.protected_paths,
+                path_policy=self._path_policy,
             )
             self._runtime_config = self._build_run_config(self._backend_handle)
             self._runtime = EngineRuntime(config=self._runtime_config)
@@ -188,7 +194,8 @@ class TaskLite:
         """RunConfig 静态装配快照。"""
         return RunConfig.resolve(
             name="tasklite",
-            protected_roots=((self._state_path,) if self._state_path is not None else ()),
+            protected_roots=self._path_policy.protected_paths,
+            path_policy=self._path_policy,
             backend=backend,
             resources=self._resources,
             tasks=self._tasks,
@@ -371,6 +378,17 @@ class TaskLite:
         self._ensure_active("set_cursor")
         with exclusive_state_access(self._runtime.store.backend):
             self._runtime.store.set_cursor(key, value)
+
+    def grant_authorization(
+        self,
+        path: str | Path,
+        *,
+        target_type: Literal["file", "directory"],
+    ) -> dict[str, Any]:
+        """在 Run 外显式预授权单个文件或目录路径，重复或父子类型冲突抛 TaskLiteError。"""
+        self._ensure_active("grant_authorization")
+        with exclusive_state_access(self._runtime.store.backend):
+            return self._runtime.store.grant_authorization(path, target_type=target_type)
 
     def list_authorizations(self) -> list[dict[str, Any]]:
         """只读查询全部已持久化的授权记录，限 Run 外。"""

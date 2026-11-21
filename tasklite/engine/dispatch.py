@@ -118,11 +118,12 @@ class DispatchMachine:
         self._session = session
         self._completion = completion
         self._tasks = tasks
-        self._protected_roots = protected_roots
         self._path_policy = ArtifactPathPolicy(
+            path_policy=self._store.path_policy,
             protected_roots=protected_roots,
             authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
         )
+        self._protected_roots = self._path_policy.protected_roots
         if file_resolver is None:
             from .files import FileSpecResolver
             file_resolver = FileSpecResolver(store)

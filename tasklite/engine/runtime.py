@@ -101,6 +101,7 @@ class EngineRuntime:
             trigger_registry=config.trigger_registry,
             requeue_policy=config.requeue_policy,
             protected_roots=config.protected_roots,
+            path_policy=config.path_policy,
             session=self._session,
         )
 
@@ -302,6 +303,7 @@ class EngineRuntime:
         self, request: PendingDeclaration
     ) -> tuple[str, dict[str, str] | None]:
         policy = ArtifactPathPolicy(
+            path_policy=self.store.path_policy,
             protected_roots=self.config.protected_roots,
         )
         try:
@@ -351,6 +353,7 @@ class EngineRuntime:
 
         if request.bound.delete_existing:
             policy = ArtifactPathPolicy(
+                path_policy=self.store.path_policy,
                 protected_roots=self.config.protected_roots,
                 authorization_check=lambda path, kind: self.store.backend.is_path_authorized(path, kind),
             )

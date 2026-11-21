@@ -321,6 +321,11 @@ class TestMainSurfaceExports:
         assert status_params["recursive"].kind is inspect.Parameter.KEYWORD_ONLY
         assert status_params["recursive"].default is inspect.Parameter.empty
 
+        grant_params = inspect.signature(TaskLite.grant_authorization).parameters
+        assert list(grant_params) == ["self", "path", "target_type"]
+        assert grant_params["target_type"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert grant_params["target_type"].default is inspect.Parameter.empty
+
         open_params = inspect.signature(StateSnapshot.open).parameters
         assert list(open_params) == ["source"]
 
