@@ -481,7 +481,7 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
 
 
 @pytest.mark.parametrize("stage", ["resource", "pre_delete", "context", "process"])
-def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeypatch, stage):
+def test_running_snapshot_projects_queue_started_at_until_settlement(tmp_path, monkeypatch, stage):
     clock = ["2026-11-10T00:00:00Z"]
     launch_time = "2026-11-10T00:01:00Z"
     returned_time = "2026-11-10T00:02:00Z"
@@ -526,7 +526,8 @@ def test_running_snapshot_keeps_unknown_start_until_settlement(tmp_path, monkeyp
                 assert list(snapshot.iter_jobs(status="running")) == [current]
                 assert current["status"] == "running"
                 assert (current["run_id"], current["attempt_no"]) == (row["run_id"], row["attempt_no"])
-                assert all(current[key] is None for key in ("result", "started_at", "settled_at"))
+                assert current["started_at"] == row["started_at"]
+                assert all(current[key] is None for key in ("result", "settled_at"))
                 assert list(snapshot.iter_attempts(job_uid="work::committed")) == []
                 running_snapshots.append((snapshot, current))
 

@@ -327,7 +327,13 @@ class TestMainSurfaceExports:
         assert grant_params["target_type"].default is inspect.Parameter.empty
 
         open_params = inspect.signature(StateSnapshot.open).parameters
-        assert list(open_params) == ["source"]
+        assert list(open_params) == ["source", "mode"]
+        assert open_params["mode"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert open_params["mode"].default == "lazy"
+
+        report_params = inspect.signature(StateSnapshot.report).parameters
+        assert list(report_params) == ["first", "second"]
+        assert report_params["second"].default is None
 
 
 class TestGuideImportContract:

@@ -763,3 +763,528 @@ def test_manual_success_does_not_reuse_execution_facts(tmp_path, backend):
         assert_current_sources(p, job.uid, current, attempts)
         assert p.clear_history(job.uid, records=["attempts"]) == 1
         assert_current_sources(p, job.uid, current, [])
+
+
+class TestQueueStartedAtProjection:
+    """queue.started_at 在 running / pending 态下的投影契约（双后端与双模式对等）。"""
+
+    @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+    @pytest.mark.parametrize("mode", ["lazy", "copy"])
+    def test_running_projects_started_at_and_pending_is_always_none(self, tmp_path, backend, mode):
+        db_path = tmp_path / f"started_{backend}_{mode}.db"
+        with TaskLite(
+            backend=backend,
+            state_path=db_path if backend == "sqlite" else None,
+        ) as p:
+            p.register_task("process", dummy_handler)
+            j_run = Job("process", "running_one")
+            j_pend = Job("process", "pending_one")
+            p.enqueue(j_run)
+            p.enqueue(j_pend)
+            p._runtime.store.backend.mark_job_running(
+                j_run.uid,
+                execution_id="run_x.1",
+                run_id="run_x",
+                started_at="2026-06-01T12:34:56+00:00",
+            )
+            # 即使底层队列行残留 started_at，pending 态也必须投影为 None
+            if backend == "sqlite":
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.execute(
+                        "UPDATE queue SET started_at = ? WHERE job_uid = ?",
+                        ("2026-06-01T10:00:00+00:00", j_pend.uid),
+                    )
+                    conn.commit()
+            else:
+                for item in p._runtime.store.backend._queue:
+                    if item["job_id"] == "pending_one":
+                        item["started_at"] = "2026-06-01T10:00:00+00:00"
+
+            sources = [p] + ([db_path] if backend == "sqlite" else [])
+            for src in sources:
+                with StateSnapshot.open(src, mode=mode) as snap:
+                    running_rec = snap.get_job(j_run.uid)
+                    assert running_rec is not None
+                    assert running_rec["status"] == "running"
+                    assert running_rec["run_id"] == "run_x"
+                    assert running_rec["attempt_no"] == 1
+                    assert running_rec["started_at"] == "2026-06-01T12:34:56Z"
+                    assert running_rec["result"] is None
+                    assert running_rec["settled_at"] is None
+                    assert list(snap.iter_jobs(status="running")) == [running_rec]
+
+                    pending_rec = snap.get_job(j_pend.uid)
+                    assert pending_rec is not None
+                    assert pending_rec["status"] == "pending"
+                    assert pending_rec["started_at"] is None
+                    assert pending_rec["run_id"] is None
+                    assert pending_rec["attempt_no"] is None
+                    assert list(snap.iter_jobs(status="pending")) == [pending_rec]
+
+
+class TestStateSnapshotCopyMode:
+    """StateSnapshot mode='copy' 零句柄占用、惰性反序列化、隔离性与双模式同形。"""
+
+    @pytest.mark.parametrize("bad_mode", ["invalid", "", "LAZY", 123, None, True])
+    def test_invalid_mode_raises_tasklite_error(self, tmp_path, bad_mode):
+        db_path = tmp_path / "not_created.db"
+        with pytest.raises(TaskLiteError, match="mode must be"):
+            StateSnapshot.open(db_path, mode=bad_mode)  # type: ignore[arg-type]
+        with pytest.raises(TaskLiteError, match="mode must be"):
+            StateSnapshot(db_path, mode=bad_mode)  # type: ignore[arg-type]
+        assert not db_path.exists()
+
+    def test_sqlite_copy_mode_closes_connection_immediately_and_releases_file(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "copy_release.db"
+        with TaskLite(backend="sqlite", state_path=db_path) as p:
+            p.register_task("process", dummy_handler)
+            p.enqueue(Job("process", "j1", payload={"v": 1}))
+
+            real_connect = sqlite3.connect
+            opened_conns: list[sqlite3.Connection] = []
+
+            def tracking_connect(database, *args, **kwargs):
+                assert kwargs.get("uri") is True
+                assert database == db_path.resolve().as_uri() + "?mode=ro"
+                conn = real_connect(database, *args, **kwargs)
+                opened_conns.append(conn)
+                return conn
+
+            monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+            before = StateSnapshot.open(db_path, mode="copy")
+            monkeypatch.setattr(sqlite3, "connect", real_connect)
+
+            # 打开返回前即已关闭底层 SQLite 连接
+            assert len(opened_conns) == 1
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                opened_conns[0].execute("SELECT 1")
+
+            # 不调用 before.close()，跨 run() 正常写入新状态
+            p.enqueue(Job("process", "j2", payload={"v": 2}))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+
+            after = StateSnapshot.open(p, mode="copy")
+
+        # 甚至关闭 pipeline 后立即删除磁盘上的库文件，未关闭的 copy 快照仍可完整读取
+        db_path.unlink()
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
+
+        try:
+            assert before.get_job("process::j1")["status"] == "pending"
+            assert before.get_job("process::j2") is None
+            assert {j["job_uid"] for j in before.iter_jobs()} == {"process::j1"}
+
+            assert after.get_job("process::j1")["status"] == "succeeded"
+            assert after.get_job("process::j2")["status"] == "succeeded"
+            assert {j["job_uid"] for j in after.iter_jobs()} == {"process::j1", "process::j2"}
+        finally:
+            before.close()
+            after.close()
+
+        with pytest.raises(TaskLiteError, match="closed"):
+            before.get_job("process::j1")
+        with pytest.raises(TaskLiteError, match="closed"):
+            list(after.iter_jobs())
+        with pytest.raises(TaskLiteError, match="closed"):
+            list(after.iter_attempts())
+
+    def test_sqlite_copy_mode_lazily_deserializes_json_columns(self, tmp_path, monkeypatch):
+        import tasklite.snapshot as snapshot_mod
+
+        db_path = tmp_path / "lazy_json.db"
+        with TaskLite(backend="sqlite", state_path=db_path) as p:
+            p.register_task("process", terminal_result_handler)
+            for idx in range(5):
+                p.enqueue(Job("process", f"ok_{idx}", payload={"mode": "success", "n": idx}))
+            p.enqueue(Job("process", "bad_0", payload={"mode": "failure"}))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+            p.enqueue(Job("process", "pend_0", payload={"mode": "success"}))
+
+        real_loads = snapshot_mod.loads
+        load_calls = 0
+
+        def counting_loads(text):
+            nonlocal load_calls
+            load_calls += 1
+            return real_loads(text)
+
+        monkeypatch.setattr(snapshot_mod, "loads", counting_loads)
+        with StateSnapshot.open(db_path, mode="copy") as snap:
+            # open 阶段零反序列化
+            assert load_calls == 0
+
+            # get_job 命中单个 pending 作业，仅反序列化 1 次 job_snapshot
+            pend = snap.get_job("process::pend_0")
+            assert pend is not None and pend["status"] == "pending"
+            assert load_calls == 1
+
+            # iter_jobs(status="failed") 仅反序列化 1 条 failed（metadata + payload = 2 次），跳过 5 条 succeeded 与 1 条 pending
+            load_calls = 0
+            failed = list(snap.iter_jobs(status="failed"))
+            assert len(failed) == 1 and failed[0]["job_uid"] == "process::bad_0"
+            assert load_calls == 2
+
+            # iter_attempts(job_uid="process::bad_0") 仅反序列化命中的 1 条 attempt（最多 3 个 JSON 列），跳过其他 5 条
+            load_calls = 0
+            atts = list(snap.iter_attempts(job_uid="process::bad_0"))
+            assert len(atts) == 1
+            assert 1 <= load_calls <= 3
+
+    @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+    def test_copy_and_lazy_modes_are_100_percent_identical(self, tmp_path, backend):
+        db_path = tmp_path / f"parity_{backend}.db"
+        with TaskLite(
+            backend=backend,
+            state_path=db_path if backend == "sqlite" else None,
+        ) as p:
+            p.register_task("process", retry_then_succeed_handler)
+            p.register_task("generate", terminal_result_handler)
+            p.enqueue(Job("process", "ok", max_retries_per_run=5))
+            p.enqueue(Job("generate", "bad", payload={"mode": "failure"}))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+            p.enqueue(Job("process", "pend"))
+            p.enqueue(Job("generate", "run_item"))
+            p._runtime.store.backend.mark_job_running(
+                "generate::run_item",
+                execution_id="run_live.1",
+                run_id="run_live",
+                started_at="2026-07-01T08:00:00+00:00",
+            )
+
+            sources = [p] + ([db_path] if backend == "sqlite" else [])
+            for src in sources:
+                with (
+                    StateSnapshot.open(src, mode="lazy") as lazy_snap,
+                    StateSnapshot.open(src, mode="copy") as copy_snap,
+                ):
+                    for uid in ("process::ok", "generate::bad", "process::pend", "generate::run_item", "process::missing"):
+                        assert copy_snap.get_job(uid) == lazy_snap.get_job(uid)
+                    for st in (None, "pending", "running", "succeeded", "failed"):
+                        assert list(copy_snap.iter_jobs(status=st)) == list(lazy_snap.iter_jobs(status=st))
+                    for tt in (None, "process", "generate"):
+                        assert list(copy_snap.iter_jobs(task_type=tt)) == list(lazy_snap.iter_jobs(task_type=tt))
+                        assert list(copy_snap.iter_attempts(task_type=tt)) == list(lazy_snap.iter_attempts(task_type=tt))
+                    assert list(copy_snap.iter_attempts(job_uid="process::ok")) == list(
+                        lazy_snap.iter_attempts(job_uid="process::ok")
+                    )
+
+    def test_memory_shallow_attempts_isolation_across_mutations_and_clear_history(self):
+        with TaskLite(backend="memory") as p:
+            p.register_task("process", retry_then_succeed_handler)
+            p.enqueue(Job("process", "j1", payload={"nested": {"k": 1}}, max_retries_per_run=5))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+
+            snap = StateSnapshot.open(p, mode="copy")
+            try:
+                attempts_first = list(snap.iter_attempts(job_uid="process::j1"))
+                assert len(attempts_first) == 3
+                # 篡改返回字典不得污染快照或底层后端
+                attempts_first[0]["job"]["payload"]["nested"]["k"] = 999
+                attempts_first[0]["result"]["metadata"]["injected"] = True
+
+                # 即使旧 clear_history 清除了后端 attempts，已打开快照仍完全隔离
+                p.clear_history("process::j1", records=["attempts"])
+
+                attempts_second = list(snap.iter_attempts(job_uid="process::j1"))
+                assert len(attempts_second) == 3
+                assert attempts_second[0]["job"]["payload"]["nested"]["k"] == 1
+                assert "injected" not in attempts_second[0]["result"]["metadata"]
+            finally:
+                snap.close()
+
+    def test_from_reader_internal_factory(self):
+        class _DummyReader:
+            def __init__(self):
+                self.closed = False
+
+            def get_job(self, uid):
+                return None
+
+            def iter_jobs(self, *, status=None, task_type=None):
+                return iter(())
+
+            def iter_attempts(self, *, job_uid=None, task_type=None):
+                return iter(())
+
+            def close(self):
+                self.closed = True
+
+        reader = _DummyReader()
+        snap = StateSnapshot._from_reader(reader, source="synthetic")
+        assert snap.source == "synthetic"
+        assert not snap.closed
+        assert list(snap.iter_jobs()) == []
+        snap.close()
+        assert reader.closed is True
+        assert snap.closed is True
+
+
+class TestStateSnapshotReport:
+    """StateSnapshot.report 单快照与双快照对比报告验收。"""
+
+    def test_report_validation_rejects_invalid_and_closed_snapshots(self, tmp_path):
+        with TaskLite(backend="memory") as p:
+            open_snap = StateSnapshot.open(p, mode="copy")
+            closed_snap = StateSnapshot.open(p, mode="copy")
+            closed_snap.close()
+            try:
+                with pytest.raises(TaskLiteError, match="first must be a StateSnapshot"):
+                    StateSnapshot.report("not_a_snapshot")  # type: ignore[arg-type]
+                with pytest.raises(TaskLiteError, match="closed"):
+                    StateSnapshot.report(closed_snap)
+                with pytest.raises(TaskLiteError, match="second must be a StateSnapshot"):
+                    StateSnapshot.report(open_snap, "bad")  # type: ignore[arg-type]
+                with pytest.raises(TaskLiteError, match="closed"):
+                    StateSnapshot.report(open_snap, closed_snap)
+            finally:
+                open_snap.close()
+
+    @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+    def test_report_empty_database_renders_safely(self, tmp_path, backend):
+        db_path = tmp_path / f"empty_{backend}.db"
+        with TaskLite(
+            backend=backend,
+            state_path=db_path if backend == "sqlite" else None,
+        ) as p:
+            with StateSnapshot.open(p, mode="copy") as snap:
+                text = StateSnapshot.report(snap)
+                assert "Summary (total: 0):" in text
+                assert "pending:   0" in text
+                assert "running:   0" in text
+                assert "succeeded: 0 (execution: 0, manual: 0)" in text
+                assert "failed:    0" in text
+                assert "By Task Type:\n  (none)" in text
+                assert "Running Jobs (0):\n  (none)" in text
+                assert "Failed Jobs (0):\n  (none)" in text
+
+    def test_single_snapshot_report_metrics_eta_manual_and_truncation(self, tmp_path, monkeypatch):
+        import tasklite._report as report_mod
+
+        db_path = tmp_path / "report_single.db"
+        with TaskLite(backend="sqlite", state_path=db_path) as p:
+            p.register_task("train", dummy_handler)
+            p.register_task("eval", dummy_handler)
+
+            # 1) 构造 3 个 train 历史成功 Attempt（耗时分别为 10s、20s、60s -> Avg=30.0s, P50=20.0s, Max=60.0s）
+            #    以及 1 个时钟回拨样本（settled < started -> 0.00s，不产生负数）和 1 个缺失 started_at 样本（跳过）
+            backend = p._runtime.store.backend
+            for job_id, start_ts, end_ts in (
+                ("s1", "2026-08-01T00:00:00Z", "2026-08-01T00:00:10Z"),
+                ("s2", "2026-08-01T00:01:00Z", "2026-08-01T00:01:20Z"),
+                ("s3", "2026-08-01T00:02:00Z", "2026-08-01T00:03:00Z"),
+            ):
+                job = Job("train", job_id)
+                p.enqueue(job)
+                attempt_no = backend.mark_job_running(
+                    job.uid, execution_id=f"r_{job_id}.1", run_id=f"r_{job_id}", started_at=start_ts,
+                )
+                backend.commit_job_settlement(
+                    job_uid=job.uid,
+                    outcome="success",
+                    attempt_no=attempt_no,
+                    execution_id=f"r_{job_id}.1",
+                    run_id=f"r_{job_id}",
+                    started_at=start_ts,
+                    settled_at=end_ts,
+                    job_snapshot=job.to_dict(),
+                    result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
+                    success_metadata={
+                        "job_snapshot": job.to_dict(),
+                        # 刻意置空 annotations 以验证旧记录兼容归类为 execution 且不抛 KeyError
+                        "result": {"message": None, "exception": None, "metadata": {}, "annotations": {}},
+                        "run_id": f"r_{job_id}",
+                        "attempt_no": attempt_no,
+                        "started_at": start_ts,
+                        "settled_at": end_ts,
+                    },
+                )
+
+            # 缺失 started_at 的成功 Attempt（仅测试跳过逻辑，不污染 train 的 P50）
+            j_nostart = Job("eval", "e_nostart")
+            p.enqueue(j_nostart)
+            att_no = backend.mark_job_running(
+                j_nostart.uid, execution_id="r_ns.1", run_id="r_ns", started_at="2026-08-01T00:00:00Z",
+            )
+            backend.commit_job_settlement(
+                job_uid=j_nostart.uid,
+                outcome="success",
+                attempt_no=att_no,
+                execution_id="r_ns.1",
+                run_id="r_ns",
+                started_at=None,
+                settled_at="2026-08-01T00:00:05Z",
+                job_snapshot=j_nostart.to_dict(),
+                result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
+                success_metadata={
+                    "job_snapshot": j_nostart.to_dict(),
+                    "result": {"message": None, "exception": None, "metadata": {}, "annotations": {}},
+                    "run_id": "r_ns",
+                    "attempt_no": att_no,
+                    "started_at": None,
+                    "settled_at": "2026-08-01T00:00:05Z",
+                },
+            )
+
+            # 时钟回拨样本（eval_skew）验证 max(0.0, ...)
+            j_skew = Job("eval", "e_skew")
+            p.enqueue(j_skew)
+            att_skew = backend.mark_job_running(
+                j_skew.uid, execution_id="r_sk.1", run_id="r_sk", started_at="2026-08-01T00:05:00Z",
+            )
+            backend.commit_job_settlement(
+                job_uid=j_skew.uid,
+                outcome="success",
+                attempt_no=att_skew,
+                execution_id="r_sk.1",
+                run_id="r_sk",
+                started_at="2026-08-01T00:05:10Z",
+                settled_at="2026-08-01T00:05:00Z",
+                job_snapshot=j_skew.to_dict(),
+                result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
+                success_metadata={
+                    "job_snapshot": j_skew.to_dict(),
+                    "result": {"message": None, "exception": None, "metadata": {}, "annotations": {}},
+                    "run_id": "r_sk",
+                    "attempt_no": att_skew,
+                    "started_at": "2026-08-01T00:05:10Z",
+                    "settled_at": "2026-08-01T00:05:00Z",
+                },
+            )
+
+            # 2) 手工标记 succeeded（manual）
+            j_manual = Job("train", "manual_ok")
+            p.enqueue(j_manual)
+            p.set_job_status(j_manual.uid, "succeeded", recursive=False, note="verified")
+
+            # 3) 待运行 pending
+            p.enqueue(Job("train", "p1"))
+
+            # 4) 在途 running：一个有 train 历史基线（已跑 5s，P50=20s -> ETA ~15.0s）；一个无历史基线（fresh_type -> ETA=N/A）
+            p.register_task("fresh_type", dummy_handler)
+            j_run_known = Job("train", "r_known")
+            j_run_unknown = Job("fresh_type", "r_unknown")
+            p.enqueue(j_run_known)
+            p.enqueue(j_run_unknown)
+            backend.mark_job_running(
+                j_run_known.uid, execution_id="r_live.1", run_id="r_live", started_at="2026-08-01T01:00:00Z",
+            )
+            backend.mark_job_running(
+                j_run_unknown.uid, execution_id="r_live.2", run_id="r_live", started_at="2026-08-01T01:00:02Z",
+            )
+
+            # 5) 失败作业（带超长多行错误信息测试单行截断）
+            long_msg = "line1\n" + ("E" * 200)
+            j_fail = Job("train", "f1")
+            p.enqueue(j_fail)
+            p.set_job_status(j_fail.uid, "failed", recursive=False, note=long_msg)
+
+            # 固定报告当前时钟为 2026-08-01T01:00:05Z
+            monkeypatch.setattr(report_mod, "utc_now_iso", lambda: "2026-08-01T01:00:05Z")
+
+            with StateSnapshot.open(db_path, mode="copy") as snap:
+                report = StateSnapshot.report(snap)
+
+            assert "Summary (total: 10):" in report
+            assert "pending:   1" in report
+            assert "running:   2" in report
+            assert "succeeded: 6 (execution: 5, manual: 1)" in report
+            assert "failed:    1" in report
+            # train 历史耗时（n=3, Avg=30.0s, P50=20.0s, Max=1m 00.0s）
+            assert "train: pending=1, running=1, succeeded=4, failed=1 (total=7)" in report
+            assert "success duration (n=3): Avg=30.0s, P50=20.0s, Max=1m 00.0s" in report
+            # eval 时钟回拨取 0.00s 且缺失 started_at 被跳过（n=1）
+            assert "eval: pending=0, running=0, succeeded=2, failed=0 (total=2)" in report
+            assert "success duration (n=1): Avg=0.00s, P50=0.00s, Max=0.00s" in report
+            # fresh_type 无历史基线
+            assert "fresh_type: pending=0, running=1, succeeded=0, failed=0 (total=1) | success duration: N/A" in report
+            # running ETA
+            assert "train::r_known (task_type=train, attempt=1): elapsed=5.00s, ETA=~15.0s (P50=20.0s)" in report
+            assert "fresh_type::r_unknown (task_type=fresh_type, attempt=1): elapsed=3.00s, ETA=N/A (no history)" in report
+            # failed 截断摘要
+            assert "train::f1:" in report
+            assert "..." in report
+            assert ("E" * 200) not in report
+
+    @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+    def test_dual_snapshot_comparison_report(self, tmp_path, backend):
+        db_path = tmp_path / f"report_diff_{backend}.db"
+        with TaskLite(
+            backend=backend,
+            state_path=db_path if backend == "sqlite" else None,
+        ) as p:
+            p.register_task("process", retry_then_succeed_handler)
+            p.register_task("worker", terminal_result_handler)
+
+            # 预先制造 1 个旧 failed、1 个将被移除的 succeeded、2 个待运行的 pending
+            p.enqueue(Job("worker", "old_fail", payload={"mode": "failure"}))
+            p.enqueue(Job("worker", "to_remove", payload={"mode": "success"}))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+
+            p.enqueue(Job("process", "will_retry_ok", max_retries_per_run=5))
+            p.enqueue(Job("worker", "will_fail", payload={"mode": "failure"}))
+
+            # 运行前使用 mode="copy" 拍快照（不持锁不占句柄）
+            before = StateSnapshot.open(p, mode="copy")
+            try:
+                # 区间变更：新增 1 个 pending，移除 to_remove，并执行 run()
+                p.clear_history("worker::to_remove", records=["successes"])
+                p.enqueue(Job("worker", "new_ok", payload={"mode": "success"}))
+                with in_process_workers(p):
+                    p.run(install_signals=False)
+                # 再新增 1 个留队 pending
+                p.enqueue(Job("worker", "new_pending", payload={"mode": "success"}))
+
+                after = StateSnapshot.open(p, mode="copy")
+                try:
+                    diff_report = StateSnapshot.report(before, after)
+
+                    assert "Comparison: before -> after" in diff_report
+                    # before: total=4 (pending=2, running=0, succeeded=1, failed=1)
+                    # after:  total=5 (pending=1, running=0, succeeded=2, failed=2)
+                    assert "Summary (total: 5, +1):" in diff_report
+                    assert "pending:   1 (-1)" in diff_report
+                    assert "succeeded: 2 (+1)" in diff_report
+                    assert "failed:    2 (+1)" in diff_report
+
+                    # 状态转移汇总
+                    assert "pending -> succeeded: 1" in diff_report
+                    assert "pending -> failed: 1" in diff_report
+                    assert "(new) -> succeeded: 1" in diff_report
+                    assert "(new) -> pending: 1" in diff_report
+                    assert "succeeded -> (removed): 1" in diff_report
+
+                    # 新增 Attempt 统计：will_retry_ok(2 retry + 1 success) + will_fail(1 failure) + new_ok(1 success) = 5
+                    assert "New Attempts (5): success=2, failure=1, retry=2" in diff_report
+                    assert "success duration (n=2): total=" in diff_report
+
+                    # 本次区间内新进入 failed 仅包含 worker::will_fail，不包含旧的 worker::old_fail
+                    newly_failed_section = diff_report.split("Newly Failed Jobs (1):")[1].split("By Task Type:")[0]
+                    assert "worker::will_fail (pending -> failed): 本次失败" in newly_failed_section
+                    assert "worker::old_fail" not in newly_failed_section
+
+                    # 底部完整 Failed Jobs 列表则包含两个当前失败作业
+                    all_failed_section = diff_report.split("Failed Jobs (2):")[1]
+                    assert "worker::old_fail" in all_failed_section
+                    assert "worker::will_fail" in all_failed_section
+
+                    # 自对比报告应全为零增量
+                    same_report = StateSnapshot.report(after, after)
+                    assert "Summary (total: 5, +0):" in same_report
+                    assert "(no state transitions)" in same_report
+                    assert "New Attempts (0): success=0, failure=0, retry=0 | success duration: N/A" in same_report
+                    assert "Newly Failed Jobs (0):" in same_report
+                finally:
+                    after.close()
+            finally:
+                before.close()
+

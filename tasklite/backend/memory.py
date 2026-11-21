@@ -371,7 +371,9 @@ class InMemoryStateBackend(AbstractStateBackend):
                 "successes": self.load_successes(),
                 "failed": self.load_failed(),
                 "failure_payloads": self.load_failure_payloads(),
-                "attempts": [copy.deepcopy(att) for att in self._attempts.values()],
+                # attempts 单条记录入库时已深拷贝不可变，锁内仅浅拷贝外层列表以控制峰值内存；
+                # 查询输出的深拷贝隔离由 _MemorySnapshotReader._normalize_* 负责。
+                "attempts": list(self._attempts.values()),
             }
 
     def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
