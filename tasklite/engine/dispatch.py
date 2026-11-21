@@ -24,15 +24,11 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from pathlib import Path
-
     from ..models.state import PipelineState
     from ..models.task import Task
     from .admission import TriggerRegistry
     from .channel import ExecutionChannel
     from .completion import CompletionMachine
-    from .files import FileSpecResolver
     from .in_flight import InFlightTracker
     from .resource import ResourceManager
     from .scheduler import JobScheduler
@@ -46,15 +42,11 @@ if TYPE_CHECKING:
 
         def __contains__(self, task_type: object) -> bool: ...
 
-import os
-from collections.abc import Mapping, Sequence
-from pathlib import Path
+from collections.abc import Mapping
 
-from ..exceptions import TaskLiteError
-from ..models.artifact import ArtifactDeclaration, FileSpec
+from ..models.artifact import FileSpec
 from ..models.context import JobContext
 from ..models.job import Job
-from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
 from .channel import ExecutionResult, WorkerLaunchSpec, _WorkerLaunchCancelled
 from .in_flight import InFlightJob
 from .scheduler import ScheduleResult, StandstillFacts
@@ -105,9 +97,7 @@ class DispatchMachine:
         session: "RunSession",
         completion: "CompletionMachine",
         tasks: "TaskSource",
-        protected_roots: tuple[Path, ...] = (),
         dispatch_start_lock: Any | None = None,
-        file_resolver: "FileSpecResolver | None" = None,
     ) -> None:
         self._store = store
         self._scheduler = scheduler
@@ -118,16 +108,6 @@ class DispatchMachine:
         self._session = session
         self._completion = completion
         self._tasks = tasks
-        self._path_policy = ArtifactPathPolicy(
-            path_policy=self._store.path_policy,
-            protected_roots=protected_roots,
-            authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
-        )
-        self._protected_roots = self._path_policy.protected_roots
-        if file_resolver is None:
-            from .files import FileSpecResolver
-            file_resolver = FileSpecResolver(store)
-        self._file_resolver = file_resolver
         self._authorization_pending: tuple[str | None, str, str] | None = None
         self._dispatch_start_lock = dispatch_start_lock or threading.RLock()
 
@@ -382,13 +362,16 @@ class DispatchMachine:
             )
             return None
 
-        pre_deletes = [
-            ArtifactDeclaration(fspec.path, delete_existing=True)
-            for fspec in resolved_files.values()
-            if fspec.delete_existing and fspec.path
-        ]
+        policy = self._store.path_policy
+        authorize_cb = self._store.backend.is_path_authorized
         try:
-            _execute_pre_deletes(self._path_policy, pre_deletes)
+            for fspec in resolved_files.values():
+                if fspec.delete_existing and fspec.path:
+                    policy.delete(
+                        fspec.path,
+                        allow_broken_leaf_symlink=True,
+                        authorize=authorize_cb,
+                    )
         except (OSError, ValueError, NotImplementedError) as exc:
             entry = InFlightJob(
                 job_uid=job_uid,
@@ -675,7 +658,7 @@ class DispatchMachine:
             frozenset(state.success_uids),
             frozenset(state.failed_uids),
             dict(state.cursors),
-            protected_roots=self._protected_roots,
+            protected_roots=self._store.path_policy.protected_paths,
             base_dir=self._trigger_registry.base_dir,
             known_job_uids=frozenset(
                 state.queue_uids
@@ -691,19 +674,11 @@ class DispatchMachine:
         )
 
     def _resolve_job_files(self, job: Job) -> dict[str, FileSpec]:
-        """准入前解析预声明文件（普通路径绝对化、上游产物引用解析与输入存在性校验）。"""
-        resolved: dict[str, FileSpec] = {}
-        for name, spec in job.files.items():
-            bound_spec = self._file_resolver.resolve(spec, depends_on=job.depends_on)
-            assert bound_spec.path is not None
-            resolved_path = bound_spec.path
-            if bound_spec.delete_existing or bound_spec.delete_on_success or bound_spec.delete_on_failure:
-                validated_path = self._path_policy.resolve(
-                    resolved_path, delete_existing=bound_spec.delete_existing,
-                )
-                bound_spec = bound_spec._bind_output_path(validated_path)
-            resolved[name] = bound_spec
-        return resolved
+        """准入前基于统一 PathPolicy 单次原子解析预声明文件。"""
+        return {
+            name: self._store.resolve_file_spec(spec, depends_on=job.depends_on)
+            for name, spec in job.files.items()
+        }
 
     # ── 拒绝与异常分支 ────────────────────────────────────────────────
 

@@ -162,7 +162,7 @@ class TestJobCreationAndIdentity:
         with pytest.raises(AttributeError):
             job.attempt_no = 7  # type: ignore[misc]
 
-        out_spec = FileSpec("/tmp/1.jpg", role="output")
+        out_spec = FileSpec("tmp/1.jpg", role="output")
         full = Job(
             task_type="download",
             job_id="img_001",
@@ -355,7 +355,7 @@ class TestJobSerializationAndWorkerResource:
             payload=user,
             depends_on=["parent_job"],
             files={
-                "out": FileSpec("/tmp/1.jpg", role="output", delete_existing=True),
+                "out": FileSpec("tmp/1.jpg", role="output", delete_existing=True),
                 "src": FileSpec.from_output("parent_job", "raw", role="input"),
             },
             resources={"api": 1.0, "disk": 2.5},

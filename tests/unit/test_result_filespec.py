@@ -13,12 +13,13 @@ from tasklite import FileSpec, TaskLiteError, TaskResult
 from tasklite.models import TaskResult as ModelsTaskResult
 from tasklite.models.artifact import (
     FILE_ROLES,
-    ArtifactDeclaration,
     merge_named_file_spec,
     resolve_job_files_config,
+    resolve_path_against_base,
 )
 from tasklite.models.result import TaskResult as DirectTaskResult
 from tasklite.utils import jsonutil
+from tasklite.utils.artifact import validate_and_normalize_lexical
 
 
 class TestTaskResultModel:
@@ -133,16 +134,32 @@ class TestFileSpecRolesAndCleanup:
         assert spec.delete_on_failure is False
         assert spec.delete_on_success is False
 
-    def test_resolve_path_against_base_rejects_windows_drive_relative(self, tmp_path):
-        from tasklite.models.artifact import resolve_path_against_base
-
+    def test_lexical_validation_is_unified_across_platforms(self, tmp_path):
+        # Windows 词法下在 FileSpec 构造期即拒绝盘符相对、无盘符根相对及设备路径
         if os.name == "nt":
-            with pytest.raises(TaskLiteError, match="drive-relative"):
-                resolve_path_against_base("C:relative/file.txt", tmp_path)
-            with pytest.raises(TaskLiteError, match="drive-relative"):
-                resolve_path_against_base("C:", tmp_path)
+            for bad, pattern in (
+                ("C:relative/file.txt", "drive-relative"),
+                ("C:", "drive-relative"),
+                ("\\root_no_drive", "root-relative"),
+                ("/root_no_drive", "root-relative"),
+                ("\\\\.\\PhysicalDrive0", "device path"),
+                ("\\??\\C:\\x", "device path"),
+                ("\\\\?\\Volume{abc}\\x", "device path"),
+            ):
+                with pytest.raises(TaskLiteError, match=pattern):
+                    FileSpec(bad, role="output")
+                with pytest.raises(TaskLiteError, match=pattern):
+                    resolve_path_against_base(bad, tmp_path)
             assert resolve_path_against_base("\\\\server\\share", tmp_path) == "\\\\server\\share\\"
         assert resolve_path_against_base("sub/file.txt", tmp_path) == str(tmp_path / "sub" / "file.txt")
+
+        # 显式验证跨平台语义：POSIX 下反斜杠属于合法普通字符，不误伤 Linux 路径
+        assert validate_and_normalize_lexical("\\foo\\bar", is_windows=False) == "\\foo\\bar"
+        assert validate_and_normalize_lexical("C:rel", is_windows=False) == "C:rel"
+        with pytest.raises(ValueError, match="device path"):
+            validate_and_normalize_lexical("\\\\.\\PhysicalDrive0", is_windows=True)
+        with pytest.raises(ValueError, match="root-relative"):
+            validate_and_normalize_lexical("\\foo", is_windows=True)
 
     @pytest.mark.parametrize("delete_on_failure", [False, True])
     @pytest.mark.parametrize("delete_on_success", [False, True])
@@ -245,7 +262,7 @@ class TestFileSpecSerializationAndMerging:
         assert ref.is_output_ref is True and ref.path is None
         assert FileSpec.from_dict(jsonutil.loads(jsonutil.dumps(ref.to_dict()))) == ref
 
-        valid_path = FileSpec("/tmp/a.txt", role="output").to_dict()
+        valid_path = FileSpec(tmp_path / "a.txt", role="output").to_dict()
         with pytest.raises(TaskLiteError, match="Invalid FileSpec dict keys"):
             FileSpec.from_dict({**valid_path, "sandbox": True})
         with pytest.raises(TaskLiteError, match="Invalid FileSpec dict keys"):
@@ -300,24 +317,3 @@ class TestFileSpecSerializationAndMerging:
         files, _ = merge_named_file_spec(files, "work_dir", FileSpec(tmp_path / "work", role="cache"), base_dir=tmp_path)
         files, _ = merge_named_file_spec(files, "nested_part", FileSpec(tmp_path / "work" / "sub" / "part.bin", role="output"), base_dir=tmp_path)
         assert set(files.keys()) == {"raw_in", "in_place_out", "work_dir", "nested_part"}
-
-
-class TestArtifactDeclarationGuards:
-    """内部 ArtifactDeclaration 规范化路径与布尔标志守卫。"""
-
-    def test_named_declaration_and_rejections(self, tmp_path):
-        declaration = ArtifactDeclaration(
-            str(tmp_path / "result"),
-            name="result",
-            delete_on_success=True,
-        )
-        assert declaration.name == "result"
-        assert declaration.delete_on_success is True
-
-        for suffix in ("nested/../result", "./result", "nested//result", "result/"):
-            with pytest.raises(ValueError, match="normalized"):
-                ArtifactDeclaration(f"{tmp_path}/{suffix}")
-
-        for field in ("delete_existing", "delete_on_failure", "delete_on_success", "sandbox"):
-            with pytest.raises(TypeError, match="bool"):
-                ArtifactDeclaration(str(tmp_path / "result"), **{field: "false"})

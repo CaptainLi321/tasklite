@@ -18,6 +18,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import textwrap
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -128,17 +129,24 @@ class TestLayeringRedLine:
                 offenders[path.name] = sorted(banned)
         assert not offenders, f"模型层出现引擎依赖: {offenders}"
 
-    def test_utils_never_imports_wrappers(self):
+    def test_utils_never_imports_higher_layers(self):
         offenders = {}
+        forbidden = (
+            "tasklite.models",
+            "tasklite.engine",
+            "tasklite.backend",
+            "tasklite.wrappers",
+            "tasklite.contrib",
+        )
         for path in sorted((PACKAGE_ROOT / "utils").glob("*.py")):
             banned = {
                 name
                 for name in _imported_module_names(path)
-                if name.startswith("tasklite.wrappers")
+                if name.startswith(forbidden)
             }
             if banned:
                 offenders[path.name] = sorted(banned)
-        assert not offenders, f"工具层出现 wrappers 反向依赖: {offenders}"
+        assert not offenders, f"工具层出现逆向依赖: {offenders}"
 
 
 class TestMainSurfaceExports:
@@ -353,13 +361,14 @@ class TestGuideImportContract:
         assert blocks, "GUIDE.md 未捕获 python 代码块，围栏标记已漂移"
         stmts: list[str] = []
         for block in blocks:
-            for node in ast.walk(ast.parse(block)):
+            dedented = textwrap.dedent(block)
+            for node in ast.walk(ast.parse(dedented)):
                 if (
                     isinstance(node, ast.ImportFrom)
                     and node.level == 0
                     and (node.module or "").startswith("tasklite")
                 ):
-                    seg = ast.get_source_segment(block, node)
+                    seg = ast.get_source_segment(dedented, node)
                     assert seg is not None
                     stmts.append(seg)
         assert stmts, "GUIDE.md 代码块未捕获任何 tasklite 导入语句"

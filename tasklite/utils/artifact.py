@@ -28,7 +28,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
-from ..models.artifact import ArtifactDeclaration
 from .lockfile import lock_path_for
 
 PathKind = Literal["missing", "file", "directory", "broken_symlink"]
@@ -131,19 +130,33 @@ def _strip_windows_extended_prefix(path_str: str) -> str:
     return result
 
 
-def _validate_and_normalize_lexical(
+def is_platform_abs_path(
+    norm_path: str,
+    *,
+    is_windows: bool | None = None,
+) -> bool:
+    """判断词法规范化后的路径是否为目标平台绝对路径（Windows 需盘符根或 UNC）。"""
+    win = (os.name == "nt") if is_windows is None else is_windows
+    if win:
+        drive, tail = ntpath.splitdrive(norm_path)
+        return bool(drive) and tail.startswith("\\")
+    return norm_path.startswith("/")
+
+
+def validate_and_normalize_lexical(
     path: str | Path,
     *,
-    is_windows: bool,
+    is_windows: bool | None = None,
 ) -> str:
     """校验路径词法边界（拒空串/空字节/Windows 盘符相对/无盘符根相对/设备路径）。"""
+    win = (os.name == "nt") if is_windows is None else is_windows
     if not isinstance(path, (str, os.PathLike)):
         raise ValueError("artifact path must be a non-empty path without null bytes")
     raw = os.fspath(path)
     if not isinstance(raw, str) or not raw or "\x00" in raw:
         raise ValueError("artifact path must be a non-empty path without null bytes")
 
-    if not is_windows:
+    if not win:
         norm = posixpath.normpath(raw)
         if norm.startswith("//"):
             norm = "/" + norm.lstrip("/")
@@ -171,6 +184,37 @@ def _validate_and_normalize_lexical(
 
     norm = ntpath.normpath(slash_norm)
     return _strip_windows_extended_prefix(norm)
+
+
+def resolve_lexical_path(
+    path: str | Path,
+    base_dir: str | Path,
+    *,
+    is_windows: bool | None = None,
+) -> str:
+    """按固定基准目录将路径解析为词法规范绝对路径（不触碰磁盘）。"""
+    win = (os.name == "nt") if is_windows is None else is_windows
+    norm = validate_and_normalize_lexical(path, is_windows=win)
+    base_norm = validate_and_normalize_lexical(base_dir, is_windows=win)
+    if win:
+        path_drive, path_tail = ntpath.splitdrive(norm)
+        if path_drive.startswith("\\\\") and not path_tail:
+            return f"{path_drive}\\"
+        if not is_platform_abs_path(base_norm, is_windows=True):
+            base_norm = _strip_windows_extended_prefix(
+                ntpath.normpath(os.path.abspath(base_norm).replace("/", "\\"))
+            )
+        if is_platform_abs_path(norm, is_windows=True):
+            return norm
+        return _join_platform_path(base_norm, (norm,), is_windows=True)
+
+    if not is_platform_abs_path(base_norm, is_windows=False):
+        base_norm = posixpath.normpath(os.path.abspath(base_norm))
+        if base_norm.startswith("//"):
+            base_norm = "/" + base_norm.lstrip("/")
+    if is_platform_abs_path(norm, is_windows=False):
+        return norm
+    return _join_platform_path(base_norm, (norm,), is_windows=False)
 
 
 def _comparison_key_for_path(path_str: str, *, is_windows: bool) -> str:
@@ -898,36 +942,38 @@ class PathPolicy:
     def adapter(self) -> FilesystemAdapter:
         return self._adapter
 
+    @property
+    def fixed_base_dir(self) -> str | None:
+        """构造期显式固定的规范基准目录；未固定时返回 None。"""
+        return self._base_dir if self._base_dir_fixed else None
+
     def _effective_base_dir(self) -> str:
         if self._base_dir_fixed and self._base_dir is not None:
             return self._base_dir
         return self._canonicalize_anchor(os.getcwd())
 
     def _canonicalize_anchor(self, anchor: str | Path) -> str:
-        raw = _validate_and_normalize_lexical(anchor, is_windows=self._is_windows)
+        raw = validate_and_normalize_lexical(anchor, is_windows=self._is_windows)
         if not self._is_absolute(raw):
-            cwd = _validate_and_normalize_lexical(os.getcwd(), is_windows=self._is_windows)
+            cwd = validate_and_normalize_lexical(os.getcwd(), is_windows=self._is_windows)
             raw = _join_platform_path(cwd, (raw,), is_windows=self._is_windows)
         if self._adapter.path_lexists(raw):
             return self._adapter.realpath(raw)
         return raw
 
     def _is_absolute(self, norm_path: str) -> bool:
-        if self._is_windows:
-            drive, tail = ntpath.splitdrive(norm_path)
-            return bool(drive) and tail.startswith("\\")
-        return norm_path.startswith("/")
+        return is_platform_abs_path(norm_path, is_windows=self._is_windows)
 
     def comparison_key_for(self, path: str | Path) -> str:
         """为已锚定或词法路径生成纯内存平台比较键。"""
-        norm = _validate_and_normalize_lexical(path, is_windows=self._is_windows)
+        norm = validate_and_normalize_lexical(path, is_windows=self._is_windows)
         if not self._is_absolute(norm):
             norm = _join_platform_path(self._effective_base_dir(), (norm,), is_windows=self._is_windows)
         return _comparison_key_for_path(norm, is_windows=self._is_windows)
 
     def _canonicalize_path(self, path: str | Path) -> InspectedPath:
         """词法校验 + 锚定 base_dir + 展开最长已存在父前缀（绝不跟随叶链接）。"""
-        norm = _validate_and_normalize_lexical(path, is_windows=self._is_windows)
+        norm = validate_and_normalize_lexical(path, is_windows=self._is_windows)
         if not self._is_absolute(norm):
             abs_str = _join_platform_path(
                 self._effective_base_dir(), (norm,), is_windows=self._is_windows
@@ -1019,12 +1065,15 @@ class PathPolicy:
         path: str | Path,
         *,
         mode: InspectMode = "strict",
+        verify_unchanged: bool = False,
     ) -> InspectedPath:
         """统一路径规范化与安全检查入口（strict / pre_delete / lookup）。"""
         if mode not in ("strict", "pre_delete", "lookup"):
             raise ValueError(f"Unsupported inspect mode: {mode!r}")
 
         inspected = self._canonicalize_path(path)
+        if verify_unchanged and inspected.comparison_key != self.comparison_key_for(path):
+            raise ValueError(f"artifact parent path changed: {path}")
         if mode == "lookup":
             return inspected
 
@@ -1107,137 +1156,20 @@ class PathPolicy:
         )
 
 
-# ── ArtifactPathPolicy 兼容过渡层（内部完全委托 PathPolicy）─────────────
-
-
-def _execute_pre_deletes(
-    policy: "ArtifactPathPolicy",
-    declarations: Sequence[ArtifactDeclaration],
-) -> None:
-    """按声明顺序执行前置删除；缺失目标由路径原语幂等吸收。"""
-    for declaration in declarations:
-        policy.remove_existing(declaration)
-
-
-class ArtifactPathPolicy:
-    """面向既有调用方与测试接缝的兼容外观，所有策略与清理能力均委托 PathPolicy。"""
-
-    def __init__(
-        self,
-        *,
-        base_dir: str | Path | None = None,
-        state_path: str | Path | None = None,
-        protected_roots: Sequence[str | Path] = (),
-        authorization_check: Callable[[str, str], bool] | None = None,
-        adapter: FilesystemAdapter | None = None,
-        path_policy: PathPolicy | None = None,
-    ) -> None:
-        if path_policy is not None and not protected_roots and state_path is None and base_dir is None and adapter is None:
-            self._policy = path_policy
-        else:
-            merged_roots: list[str | Path] = list(protected_roots)
-            effective_adapter: FilesystemAdapter | None
-            effective_base: str | Path | None
-            if path_policy is not None:
-                merged_roots.extend(path_policy.protected_paths)
-                effective_adapter = adapter if adapter is not None else path_policy.adapter
-                effective_base = base_dir if base_dir is not None else (
-                    path_policy._base_dir if path_policy._base_dir_fixed else None
-                )
-            else:
-                effective_adapter = adapter
-                effective_base = base_dir
-            self._policy = PathPolicy(
-                base_dir=effective_base,
-                state_path=state_path,
-                protected_roots=merged_roots,
-                adapter=effective_adapter,
-            )
-        self.protected_roots: tuple[Path, ...] = self._policy.protected_paths
-        self._authorization_check = authorization_check
-
-    @property
-    def path_policy(self) -> PathPolicy:
-        return self._policy
-
-    def resolve(
-        self,
-        path: str | Path,
-        *,
-        sandbox: bool = True,
-        delete_existing: bool = False,
-    ) -> str:
-        """返回受允许的规范路径；仅前删可接受断链，不授权链接指向的目标。"""
-        _ = sandbox
-        mode: InspectMode = "pre_delete" if delete_existing else "strict"
-        return self._policy.inspect(path, mode=mode).canonical_path
-
-    def remove_existing(self, declaration: ArtifactDeclaration) -> None:
-        """仅以前删授权删除已有对象，其他清理权限不代替该授权。"""
-        inspected = self._target_inspected(declaration, allow_leaf_symlink=True)
-        if not inspected.exists:
-            return
-        if not declaration.delete_existing:
-            raise FileExistsError(inspected.canonical_path)
-        self._remove(Path(inspected.canonical_path), declaration, allow_leaf_symlink=True)
-
-    def cleanup(self, declaration: ArtifactDeclaration, *, success: bool) -> None:
-        """只应用指定结局的清理授权，缺失路径视为已移除。"""
-        if type(success) is not bool:
-            raise TypeError("success must be a bool")
-        authorized = declaration.delete_on_success if success else declaration.delete_on_failure
-        if authorized:
-            inspected = self._target_inspected(declaration)
-            if inspected.exists:
-                self._remove(Path(inspected.canonical_path), declaration)
-
-    def entry_exists(self, declaration: ArtifactDeclaration) -> bool:
-        """以非跟随方式判断声明目标是否存在；访问错误不降级为缺失。"""
-        return self._target_inspected(declaration).exists
-
-    def _target_inspected(
-        self,
-        declaration: ArtifactDeclaration,
-        *,
-        allow_leaf_symlink: bool = False,
-    ) -> InspectedPath:
-        mode: InspectMode = "pre_delete" if allow_leaf_symlink else "strict"
-        inspected = self._policy.inspect(declaration.path, mode=mode)
-        if inspected.comparison_key != self._policy.comparison_key_for(declaration.path):
-            raise ValueError(f"artifact parent path changed: {declaration.path}")
-        return inspected
-
-    def _remove(
-        self,
-        target: Path,
-        declaration: ArtifactDeclaration,
-        *,
-        allow_leaf_symlink: bool = False,
-    ) -> None:
-        _ = declaration
-        authorize_cb: Callable[[str, TargetType], bool] | None = None
-        if self._authorization_check is not None:
-            check = self._authorization_check
-
-            def authorize_cb(path_str: str, kind: TargetType) -> bool:
-                return check(path_str, kind)
-
-        self._policy.delete(
-            str(target),
-            allow_broken_leaf_symlink=allow_leaf_symlink,
-            authorize=authorize_cb,
-        )
-
-
 __all__ = [
-    "ArtifactPathPolicy",
     "AuthorizationMatch",
     "EntryInspection",
     "FilesystemAdapter",
+    "InspectMode",
     "InspectedPath",
+    "PathKind",
     "PathPolicy",
     "PosixFilesystemAdapter",
+    "TargetType",
     "WindowsFilesystemAdapter",
     "derive_protected_paths",
     "evaluate_authorization",
+    "is_platform_abs_path",
+    "resolve_lexical_path",
+    "validate_and_normalize_lexical",
 ]

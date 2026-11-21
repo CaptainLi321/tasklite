@@ -23,7 +23,6 @@ from typing import Any
 from .config import RunConfig
 from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
 from .execution_access import exclusive_state_access
-from .files import FileSpecResolver
 from .channel import ExecutionChannel
 from .completion import CompletionMachine
 from .resource import RunNotifier
@@ -47,14 +46,12 @@ from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
 from ..exceptions import TaskLiteError
 from ..models.artifact import (
-    ArtifactDeclaration,
     FileSpec,
     merge_named_file_spec,
     validate_file_name,
 )
 from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
-from ..utils.artifact import ArtifactPathPolicy, _execute_pre_deletes
 
 logger = logging.getLogger("tasklite")
 
@@ -102,7 +99,6 @@ class EngineRuntime:
             config.backend,
             trigger_registry=config.trigger_registry,
             requeue_policy=config.requeue_policy,
-            protected_roots=config.protected_roots,
             path_policy=config.path_policy,
             session=self._session,
         )
@@ -126,7 +122,6 @@ class EngineRuntime:
             in_flight=self._in_flight,
             completion=self._completion,
         )
-        self.file_resolver = FileSpecResolver(self.store)
         self._dispatch_start_lock = threading.RLock()
         self._dispatch = DispatchMachine(
             store=self.store,
@@ -138,9 +133,7 @@ class EngineRuntime:
             session=self._session,
             completion=self._completion,
             tasks=config.tasks,
-            protected_roots=config.protected_roots,
             dispatch_start_lock=self._dispatch_start_lock,
-            file_resolver=self.file_resolver,
         )
 
         self._is_running: bool = False
@@ -216,35 +209,38 @@ class EngineRuntime:
                 "resolved_path": existing.path,
             }
 
-        # 2. 上游产物引用解析
-        try:
-            bound_spec = self.file_resolver.resolve(source_spec, depends_on=handle.job.depends_on)
-        except Exception as exc:
-            return {
-                "request_id": req_id,
-                "status": "error",
-                "error": str(exc),
-            }
-        assert bound_spec.path is not None
-        resolved_path = bound_spec.path
-
+        # 2. 单次原子解析（上游引用、安全边界、存在性判定与路径绑定）
         needs_authorization = (
-            bound_spec.delete_existing
-            or bound_spec.delete_on_success
-            or bound_spec.delete_on_failure
-        )
-        logger.info(
-            f"FILE DECLARATION: {handle.job_uid} requested "
-            f"{validated_name!r} at {resolved_path}"
-        )
-        request = PendingDeclaration(
-            request_id=req_id,
-            name=validated_name,
-            source=source_spec,
-            bound=bound_spec,
-            resolved_path=resolved_path,
+            source_spec.delete_existing
+            or source_spec.delete_on_success
+            or source_spec.delete_on_failure
         )
         if not needs_authorization:
+            try:
+                bound_spec = self.store.resolve_file_spec(
+                    source_spec,
+                    depends_on=handle.job.depends_on,
+                    enforce_safety=False,
+                )
+            except Exception as exc:
+                return {
+                    "request_id": req_id,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            assert bound_spec.path is not None
+            resolved_path = bound_spec.path
+            logger.info(
+                f"FILE DECLARATION: {handle.job_uid} requested "
+                f"{validated_name!r} at {resolved_path}"
+            )
+            request = PendingDeclaration(
+                request_id=req_id,
+                name=validated_name,
+                source=source_spec,
+                bound=bound_spec,
+                resolved_path=resolved_path,
+            )
             self._record_declaration(entry, request)
             request.status = AuthorizationStatus.APPROVED
             logger.info(
@@ -252,10 +248,54 @@ class EngineRuntime:
             )
             return self._declaration_reply(request)
 
-        handle.pending_declaration = request
-        handle.pause_timeout()
-        validated_path, error = self._validate_declaration_target(request)
-        if error is not None:
+        try:
+            bound_spec = self.store.resolve_file_spec(
+                source_spec,
+                depends_on=handle.job.depends_on,
+                enforce_safety=True,
+            )
+        except (TaskLiteError, FileNotFoundError) as exc:
+            return {
+                "request_id": req_id,
+                "status": "error",
+                "error": str(exc),
+            }
+        except (OSError, ValueError, NotImplementedError) as exc:
+            error = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            if source_spec.is_output_ref and source_spec.producer_uid and source_spec.output_name:
+                desc = (
+                    self.store.state.successes.get(source_spec.producer_uid, {})
+                    .get("artifacts", {})
+                    .get(source_spec.output_name, {})
+                )
+                fallback_path = str(desc.get("path", "")) if isinstance(desc, dict) else ""
+            else:
+                fallback_path = source_spec.path or ""
+            fallback_bound = source_spec
+            if fallback_path:
+                try:
+                    fallback_path = self.store.path_policy.inspect(
+                        fallback_path, mode="lookup"
+                    ).canonical_path
+                except (OSError, ValueError, NotImplementedError):
+                    pass
+                try:
+                    fallback_bound = source_spec._bind_output_path(fallback_path)
+                except (TaskLiteError, ValueError):
+                    fallback_bound = source_spec
+            request = PendingDeclaration(
+                request_id=req_id,
+                name=validated_name,
+                source=source_spec,
+                bound=fallback_bound,
+                resolved_path=fallback_path,
+            )
+            handle.pending_declaration = request
+            handle.pause_timeout()
             return self._finish_authorization(
                 handle,
                 entry,
@@ -264,8 +304,22 @@ class EngineRuntime:
                 error["message"],
                 error,
             )
-        request.bound = request.bound._bind_output_path(validated_path)
-        request.resolved_path = validated_path
+
+        assert bound_spec.path is not None
+        validated_path = bound_spec.path
+        logger.info(
+            f"FILE DECLARATION: {handle.job_uid} requested "
+            f"{validated_name!r} at {validated_path}"
+        )
+        request = PendingDeclaration(
+            request_id=req_id,
+            name=validated_name,
+            source=source_spec,
+            bound=bound_spec,
+            resolved_path=validated_path,
+        )
+        handle.pending_declaration = request
+        handle.pause_timeout()
         if self._session.stop_mode is not StopMode.NONE:
             self._finish_authorization(
                 handle,
@@ -304,14 +358,11 @@ class EngineRuntime:
     def _validate_declaration_target(
         self, request: PendingDeclaration
     ) -> tuple[str, dict[str, str] | None]:
-        policy = ArtifactPathPolicy(
-            path_policy=self.store.path_policy,
-            protected_roots=self.config.protected_roots,
-        )
         try:
-            return policy.resolve(
-                request.resolved_path, delete_existing=request.bound.delete_existing,
-            ), None
+            return self.store.path_policy.inspect(
+                request.resolved_path,
+                mode="pre_delete" if request.bound.delete_existing else "strict",
+            ).canonical_path, None
         except (OSError, ValueError, NotImplementedError) as exc:
             return request.resolved_path, {
                 "type": type(exc).__name__,
@@ -354,15 +405,11 @@ class EngineRuntime:
             }
 
         if request.bound.delete_existing:
-            policy = ArtifactPathPolicy(
-                path_policy=self.store.path_policy,
-                protected_roots=self.config.protected_roots,
-                authorization_check=lambda path, kind: self.store.backend.is_path_authorized(path, kind),
-            )
             try:
-                _execute_pre_deletes(
-                    policy,
-                    [ArtifactDeclaration(request.resolved_path, delete_existing=True)],
+                self.store.path_policy.delete(
+                    request.resolved_path,
+                    allow_broken_leaf_symlink=True,
+                    authorize=self.store.backend.is_path_authorized,
                 )
             except (OSError, ValueError, NotImplementedError) as exc:
                 error = {
@@ -695,8 +742,9 @@ class EngineRuntime:
                     error,
                 )
                 continue
-            request.bound = request.bound._bind_output_path(validated_path)
-            request.resolved_path = validated_path
+            if validated_path != request.resolved_path:
+                request.bound = request.bound._bind_output_path(validated_path)
+                request.resolved_path = validated_path
 
             authorized = self.store.check_or_request_authorization(validated_path)
             if authorized is not None:

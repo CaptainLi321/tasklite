@@ -231,8 +231,9 @@ def test_success_cleanup_failure_blocks_success_spawn_and_cursor(tmp_path, monke
     p.register_task("spawned", _noop_handler)
     p.enqueue(Job("fail_clean", "fc1"))
 
-    with in_process_workers(p), patch(
-        "tasklite.utils.artifact.ArtifactPathPolicy._remove",
+    with in_process_workers(p), patch.object(
+        p._runtime.store.path_policy.adapter,
+        "delete_target",
         side_effect=cleanup_error("清理故障"),
     ):
         target = tmp_path / "undeletable.txt"
@@ -270,8 +271,9 @@ def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch,
     p.register_task("failing", _failing_handler)
     p.enqueue(Job("failing", "f1"))
 
-    with in_process_workers(p), patch(
-        "tasklite.utils.artifact.ArtifactPathPolicy._remove",
+    with in_process_workers(p), patch.object(
+        p._runtime.store.path_policy.adapter,
+        "delete_target",
         side_effect=cleanup_error("I/O error during cleanup"),
     ):
         p.run(install_signals=False)
@@ -384,8 +386,9 @@ def test_approved_waiting_declaration_cleanup_error_fails_job(
     p.register_task("work", _dynamic_delete_handler)
     p.enqueue(Job("work", "one", payload={"path": str(target)}))
     with authorizer(p, lambda *args: next(decisions)):
-        with patch(
-            "tasklite.utils.artifact.ArtifactPathPolicy.remove_existing",
+        with patch.object(
+            p._runtime.store.path_policy.adapter,
+            "delete_target",
             side_effect=cleanup_error("清理磁盘拒绝写入"),
         ):
             p.run(install_signals=False)
@@ -395,7 +398,7 @@ def test_approved_waiting_declaration_cleanup_error_fails_job(
     attempt, = _attempts(p, "work::one")
     assert attempt["outcome"] == "failure"
     assert attempt["result"]["exception"]["type"] == cleanup_error.__name__
-    assert "remove_existing" in attempt["result"]["exception"]["traceback"]
+    assert "delete_target" in attempt["result"]["exception"]["traceback"]
     assert attempt["files"]["target"]["path"] == str(target)
     assert target.read_text() == "valuable"
     p.close()
@@ -420,8 +423,9 @@ def test_pre_dispatch_cleanup_failure_settles_without_starting_worker(
         files={"target": FileSpec(target, role="output", delete_existing=True)},
     ))
 
-    with in_process_workers(p), patch(
-        "tasklite.utils.artifact.ArtifactPathPolicy.remove_existing",
+    with in_process_workers(p), patch.object(
+        p._runtime.store.path_policy.adapter,
+        "delete_target",
         side_effect=cleanup_error("静态前删故障"),
     ):
         p.run(install_signals=False)
@@ -553,8 +557,9 @@ def test_retry_cleanup_failure_settles_once_without_retry(tmp_path, monkeypatch,
     p.register_task("retry", _retry_cleanup_handler)
     p.enqueue(Job("retry", "one", max_retries_per_run=3))
 
-    with in_process_workers(p), patch(
-        "tasklite.utils.artifact.ArtifactPathPolicy._remove",
+    with in_process_workers(p), patch.object(
+        p._runtime.store.path_policy.adapter,
+        "delete_target",
         side_effect=cleanup_error("重试清理故障"),
     ):
         p.run(install_signals=False)

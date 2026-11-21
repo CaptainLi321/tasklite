@@ -648,8 +648,6 @@ def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, mon
 
 @pytest.mark.parametrize("success", [True, False])
 def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success):
-    from tasklite.utils.artifact import ArtifactPathPolicy
-
     env = CompletionEnv(tmp_path)
     job = Job("t", "cleanup_failure", max_retries_per_run=0)
     output = tmp_path / "output"
@@ -666,10 +664,10 @@ def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success)
     )
     entry = env.track_entry(job, **env.start_execution(job))
 
-    def fail_cleanup(self, declaration, *, success):
+    def fail_cleanup(*args, **kwargs):
         raise PermissionError("cleanup unavailable")
 
-    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", fail_cleanup)
+    monkeypatch.setattr(env.store.path_policy.adapter, "delete_target", fail_cleanup)
     with authorizer(env.store, lambda *_args: True):
         env.completion.complete_job(entry, ExecutionResult(success=success))
     assert env.backend.load_successes() == {}
@@ -679,8 +677,6 @@ def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success)
 
 
 def test_abort_does_not_request_or_execute_cleanup(tmp_path, monkeypatch):
-    from tasklite.utils.artifact import ArtifactPathPolicy
-
     env = CompletionEnv(tmp_path)
     entries = [
         env.track_entry(
@@ -696,10 +692,10 @@ def test_abort_does_not_request_or_execute_cleanup(tmp_path, monkeypatch):
         for name in ("one", "two")
     ]
 
-    def denied(self, declaration, *, success):
+    def denied(*args, **kwargs):
         pytest.fail("异常退出不能补执行文件清理")
 
-    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
+    monkeypatch.setattr(env.store.path_policy.adapter, "delete_target", denied)
     with authorizer(env.store, lambda *_args: pytest.fail("异常退出不能发起授权")):
         env.completion.settle_aborted(entries, [])
     assert not env.in_flight
@@ -711,8 +707,6 @@ def test_abort_does_not_request_or_execute_cleanup(tmp_path, monkeypatch):
 
 
 def test_completion_rejects_missing_output(tmp_path, monkeypatch):
-    from tasklite.utils.artifact import ArtifactPathPolicy
-
     env = CompletionEnv(tmp_path)
     missing = tmp_path / "missing"
     job = Job(
@@ -722,15 +716,16 @@ def test_completion_rejects_missing_output(tmp_path, monkeypatch):
     )
     entry = env.track_entry(job)
     checked: list[str] = []
-    original = ArtifactPathPolicy.entry_exists
+    adapter = env.store.path_policy.adapter
+    original = adapter.inspect_entry
 
-    def observe(self, declaration):
-        checked.append(declaration.path)
-        return original(self, declaration)
+    def observe(path):
+        checked.append(path)
+        return original(path)
 
-    monkeypatch.setattr(ArtifactPathPolicy, "entry_exists", observe)
+    monkeypatch.setattr(adapter, "inspect_entry", observe)
     env.completion.complete_job(entry, ExecutionResult(success=True))
-    assert checked == [str(missing)]
+    assert str(missing) in checked
     assert env.backend.load_successes() == {}
     assert "Missing output" in env.backend.load_failed()[job.uid]["error_message"]
 
@@ -755,8 +750,6 @@ def test_declaration_environment_fault_preserves_running_state(tmp_path):
 
 
 def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypatch):
-    from tasklite.utils.artifact import ArtifactPathPolicy
-
     env = CompletionEnv(tmp_path)
     target = tmp_path / "temporary"
     target.write_text("partial", encoding="utf-8")
@@ -774,10 +767,10 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
     )
     entry = env.track_entry(job, **env.start_execution(job))
 
-    def denied(self, declaration, *, success):
+    def denied(*args, **kwargs):
         raise PermissionError("cleanup denied")
 
-    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
+    monkeypatch.setattr(env.store.path_policy.adapter, "delete_target", denied)
     result = ExecutionResult(
         retry_requested=True,
         message="business failure",
@@ -793,8 +786,6 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
 
 
 def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkeypatch):
-    from tasklite.utils.artifact import ArtifactPathPolicy
-
     env = CompletionEnv(
         tmp_path,
         extra_resources={"api": IntervalResource("api", interval_seconds=0.01)},
@@ -816,10 +807,10 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
     for job in (first, second):
         env.track_entry(job, **env.start_execution(job))
 
-    def denied(self, declaration, *, success):
+    def denied(*args, **kwargs):
         raise PermissionError("cleanup denied")
 
-    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", denied)
+    monkeypatch.setattr(env.store.path_policy.adapter, "delete_target", denied)
     with authorizer(env.store, lambda *_args: True):
         settled = env.completion.settle_reaped([
                 (env.make_handle(first.uid), ExecutionResult(success=False)),

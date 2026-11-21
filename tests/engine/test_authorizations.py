@@ -415,8 +415,9 @@ def test_cleanup_failure_vs_authorization_denial_destinations(tmp_path, monkeypa
     p.register_task("clean_task", _cleanup_fail_handler)
     p.enqueue(Job("clean_task", "c1"))
 
-    with in_process_workers(p), patch(
-        "tasklite.utils.artifact.ArtifactPathPolicy.cleanup",
+    with in_process_workers(p), patch.object(
+        p._runtime.store.path_policy.adapter,
+        "delete_target",
         side_effect=OSError("Read-only file system"),
     ):
         p.run(install_signals=False)
@@ -777,7 +778,8 @@ def test_forbidden_file_operations_never_request_or_persist_authorization(
             # 确保 memory/sqlite 均覆盖到
             assert p._state_path == state_path
         monkeypatch.setattr(
-            "tasklite.utils.artifact.ArtifactPathPolicy._remove",
+            p._runtime.store.path_policy.adapter,
+            "delete_target",
             lambda *args, **kwargs: removals.append(args),
         )
         spec = FileSpec(target, role="output", **{operation: True})
@@ -1260,8 +1262,6 @@ def test_type_change_at_deletion_snapshot_fails_without_directory_permission(
     tmp_path, monkeypatch, timing,
 ):
     """最后的对象快照发现范围已扩大时明确失败，不递归删除未授权目录。"""
-    from tasklite.utils.artifact import ArtifactPathPolicy
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     target = tmp_path / "target"
@@ -1272,16 +1272,17 @@ def test_type_change_at_deletion_snapshot_fails_without_directory_permission(
     p.enqueue(Job("work", "one", files={
         "target": FileSpec(target, role="cache", **{timing: True}),
     }))
-    original_remove = ArtifactPathPolicy._remove
+    adapter = p._runtime.store.path_policy.adapter
+    original_delete = adapter.delete_target
 
-    def replace_before_snapshot(policy, path, declaration, **kwargs):
-        if path == target:
+    def replace_before_snapshot(path, **kwargs):
+        if Path(path) == target:
             target.unlink()
             target.mkdir()
             (target / "child").write_text("preserve", encoding="utf-8")
-        return original_remove(policy, path, declaration, **kwargs)
+        return original_delete(path, **kwargs)
 
-    monkeypatch.setattr(ArtifactPathPolicy, "_remove", replace_before_snapshot)
+    monkeypatch.setattr(adapter, "delete_target", replace_before_snapshot)
     with in_process_workers(p), inject_authorizer(p, lambda *args: calls.append(args) or True):
         p.run(install_signals=False)
     assert target.joinpath("child").read_text(encoding="utf-8") == "preserve"
@@ -1377,8 +1378,6 @@ def test_run_fault_leaves_uncommitted_cleanup_result_running_for_recovery(
 
 
 def test_success_cleanup_error_does_not_run_unapproved_failure_cleanup(tmp_path, monkeypatch):
-    from tasklite.utils.artifact import ArtifactPathPolicy
-
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
     first, second = tmp_path / "first", tmp_path / "second"
@@ -1392,12 +1391,12 @@ def test_success_cleanup_error_does_not_run_unapproved_failure_cleanup(tmp_path,
         "second": FileSpec(second, role="cache", delete_on_failure=True),
     }))
 
-    def fail_cleanup(policy, declaration, *, success):
-        assert declaration.path == str(first)
-        assert success
+    def fail_cleanup(path, *, allow_broken_leaf_symlink, **kwargs):
+        assert path == str(first)
+        assert not allow_broken_leaf_symlink
         raise OSError("cleanup write failure")
 
-    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", fail_cleanup)
+    monkeypatch.setattr(p._runtime.store.path_policy.adapter, "delete_target", fail_cleanup)
     with in_process_workers(p), inject_authorizer(p, lambda *args: calls.append(args) or True):
         p.run(install_signals=False)
     assert first.read_text(encoding="utf-8") == "initial"

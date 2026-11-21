@@ -724,25 +724,24 @@ def test_success_metadata_is_separate_from_framework_keys():
 @pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
 def test_artifact_manifest_replaces_as_part_of_success_transaction(tmp_path, backend_kind):
     from tasklite.backend import SQLiteStateBackend
-    from tasklite.models.artifact import ArtifactDeclaration
+    from tasklite.models.artifact import FileSpec
 
     backend = InMemoryStateBackend() if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db")
     state = PipelineState({}, {}, {}, [])
     store = StateStore(backend, state)
     uid = "t::artifacts"
-    declaration = ArtifactDeclaration(str(tmp_path / "report"), name="report")
-    anonymous = ArtifactDeclaration(str(tmp_path / "private"))
+    declaration = FileSpec(str(tmp_path / "report"), role="output")
     seed_aid = _start_execution(backend, uid, execution_id="seed.1")
     store.apply_success(
         uid, result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
-        declared_artifacts=[ArtifactDeclaration(str(tmp_path / "old"), name="old")],
+        declared_artifacts={"old": FileSpec(str(tmp_path / "old"), role="output")},
         **seed_aid,
     )
     assert state.successes[uid]["artifacts"] == backend.load_successes()[uid]["artifacts"]
     aid = _start_execution(backend, uid)
     store.apply_success(
         uid, result={"message": None, "exception": None, "metadata": {"artifacts": {"forged": {"path": "/fake"}}, "payload": {"artifacts": "business"}}, "annotations": {}},
-        declared_artifacts=[declaration, anonymous], **aid,
+        declared_artifacts={"report": declaration}, **aid,
     )
     expected = {"report": {"path": declaration.path}}
     assert state.successes[uid]["artifacts"] == expected
@@ -780,13 +779,13 @@ def test_trusted_baseline_rejects_untrusted_or_mismatched_metadata(metadata):
 @pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
 def test_artifact_manifest_stays_committed_when_settlement_fails(tmp_path, monkeypatch, backend_kind):
     from tasklite.backend import SQLiteStateBackend
-    from tasklite.models.artifact import ArtifactDeclaration
+    from tasklite.models.artifact import FileSpec
 
     backend = InMemoryStateBackend() if backend_kind == "memory" else SQLiteStateBackend(tmp_path / "state.db")
     store = StateStore(backend)
     result = {"message": None, "exception": None, "metadata": {}, "annotations": {}}
-    old = ArtifactDeclaration(str(tmp_path / "old"), name="old")
-    store.apply_success("t::1", result=result, declared_artifacts=[old], **_start_execution(backend))
+    old = FileSpec(str(tmp_path / "old"), role="output")
+    store.apply_success("t::1", result=result, declared_artifacts={"old": old}, **_start_execution(backend))
     before = backend.load_successes()
     identity = _start_execution(backend)
     error = OSError("结算不可写")
@@ -796,7 +795,7 @@ def test_artifact_manifest_stays_committed_when_settlement_fails(tmp_path, monke
     with pytest.raises(OSError) as caught:
         store.apply_success(
             "t::1", result=result,
-            declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
+            declared_artifacts={"new": FileSpec(str(tmp_path / "new"), role="output")},
             **identity,
         )
     assert caught.value is error
@@ -809,14 +808,14 @@ def test_artifact_manifest_stays_committed_when_settlement_fails(tmp_path, monke
 def test_sqlite_artifact_publication_rolls_back_with_cursor_transaction(tmp_path):
     import sqlite3
     from tasklite.backend import SQLiteStateBackend
-    from tasklite.models.artifact import ArtifactDeclaration
+    from tasklite.models.artifact import FileSpec
 
     backend = SQLiteStateBackend(tmp_path / "state.db")
     store = StateStore(backend)
     result = {"message": None, "exception": None, "metadata": {}, "annotations": {}}
     store.apply_success(
         "t::1", result=result,
-        declared_artifacts=[ArtifactDeclaration(str(tmp_path / "old"), name="old")],
+        declared_artifacts={"old": FileSpec(str(tmp_path / "old"), role="output")},
         **_start_execution(backend),
     )
     before = backend.load_successes()
@@ -826,7 +825,7 @@ def test_sqlite_artifact_publication_rolls_back_with_cursor_transaction(tmp_path
     with pytest.raises(sqlite3.IntegrityError, match="cursor unavailable"):
         store.apply_success(
             "t::1", result=result,
-            declared_artifacts=[ArtifactDeclaration(str(tmp_path / "new"), name="new")],
+            declared_artifacts={"new": FileSpec(str(tmp_path / "new"), role="output")},
             cursor_updates={"batch": "2"}, spawned_job_snapshots=[Job("child", "1").to_dict()],
             **identity,
         )

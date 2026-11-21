@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Sequence, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from .admission import ImmediateRequeuePolicy, RequeuePolicy, TriggerRegistry
 from .governor import DeadlockGovernor
@@ -36,7 +35,6 @@ class RunConfig:
     requeue_policy: RequeuePolicy
     ordering_policy: OrderingPolicy
     name: str = "tasklite"
-    protected_roots: tuple[Path, ...] = ()
     path_policy: PathPolicy | None = None
 
     @classmethod
@@ -52,18 +50,11 @@ class RunConfig:
         name: str = "tasklite",
         requeue_policy: RequeuePolicy | None = None,
         ordering_policy: OrderingPolicy | None = None,
-        protected_roots: tuple[Path, ...] = (),
         path_policy: PathPolicy | None = None,
     ) -> "RunConfig":
         """按引用装配依赖，并解析内部策略默认值。"""
-        effective_protected = (
-            tuple(dict.fromkeys((*path_policy.protected_paths, *(Path(r) for r in protected_roots))))
-            if path_policy is not None
-            else tuple(Path(r) for r in protected_roots)
-        )
         return cls(
             name=name,
-            protected_roots=effective_protected,
             path_policy=path_policy,
             backend=backend,
             resources=resources,

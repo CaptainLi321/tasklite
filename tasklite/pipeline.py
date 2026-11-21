@@ -107,10 +107,7 @@ class TaskLite:
                 base_dir=self._base_dir,
             )
             self._resources = self._build_resources(self._tasks, max_workers)
-            self._channel = ExecutionChannel(
-                protected_roots=self._path_policy.protected_paths,
-                path_policy=self._path_policy,
-            )
+            self._channel = ExecutionChannel()
             self._runtime_config = self._build_run_config(self._backend_handle)
             self._runtime = EngineRuntime(config=self._runtime_config)
         except BaseException:
@@ -192,7 +189,6 @@ class TaskLite:
         """RunConfig 静态装配快照。"""
         return RunConfig.resolve(
             name="tasklite",
-            protected_roots=self._path_policy.protected_paths,
             path_policy=self._path_policy,
             backend=backend,
             resources=self._resources,

@@ -22,7 +22,7 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 
 from ..backend.base import AbstractStateBackend, GraphEditCommit
 from ..exceptions import TaskLiteError
-from ..models.artifact import ArtifactDeclaration
+from ..models.artifact import FileSpec, resolve_file_spec
 from ..models.job import Job, inject_worker_resource
 from ..models.result import validate_strict_json_object
 from ..models.state import PipelineState, job_uid_from_snapshot
@@ -110,20 +110,58 @@ class StateStore:
         )
         self._session = session if session is not None else RunSession()
         if path_policy is not None:
-            self._path_policy = path_policy
+            if protected_roots or state_path is not None:
+                merged_roots = (*path_policy.protected_paths, *protected_roots)
+                effective_base: str | Path = (
+                    path_policy.fixed_base_dir
+                    if path_policy.fixed_base_dir is not None
+                    else self._trigger_registry.base_dir
+                )
+                self._path_policy = PathPolicy(
+                    base_dir=effective_base,
+                    state_path=state_path,
+                    protected_roots=merged_roots,
+                    adapter=path_policy.adapter,
+                )
+            else:
+                self._path_policy = path_policy
         else:
             self._path_policy = PathPolicy(
                 base_dir=self._trigger_registry.base_dir,
                 state_path=state_path,
                 protected_roots=protected_roots,
             )
-        self.protected_roots: tuple[Path, ...] = self._path_policy.protected_paths
         self.authorizer: Callable[[str, str], bool | None] | None = None
+
+    @property
+    def protected_roots(self) -> tuple[Path, ...]:
+        """受保护路径集合（派生自统一 PathPolicy，单一事实源）。"""
+        return self._path_policy.protected_paths
 
     @property
     def path_policy(self) -> PathPolicy:
         """统一路径规范化与受保护路径策略实例。"""
         return self._path_policy
+
+    def resolve_file_spec(
+        self,
+        spec: FileSpec,
+        *,
+        depends_on: Sequence[str],
+        enforce_safety: bool | None = None,
+    ) -> FileSpec:
+        """经统一 PathPolicy 单次原子解析 FileSpec（上游引用、安全边界、存在性判定与路径绑定）。"""
+        def _lookup(producer_uid: str, output_name: str) -> Mapping[str, Any] | None:
+            artifacts = self._state.successes.get(producer_uid, {}).get("artifacts", {})
+            return artifacts.get(output_name) if isinstance(artifacts, Mapping) else None
+
+        return resolve_file_spec(
+            spec,
+            path_policy=self._path_policy,
+            depends_on=depends_on,
+            artifact_lookup=_lookup,
+            enforce_safety=enforce_safety,
+        )
 
     @property
     def base_dir(self) -> Path:
@@ -490,7 +528,7 @@ class StateStore:
         spawned_job_snapshots: Sequence[dict[str, Any]] = (),
         cursor_updates: Mapping[str, str | None] | None = None,
         declared_inputs: Sequence[str] = (),
-        declared_artifacts: Sequence[ArtifactDeclaration] = (),
+        declared_artifacts: Mapping[str, FileSpec | str] | None = None,
         run_id: str | None = None,
         job_snapshot: dict[str, Any] | None = None,
         attempt_no: int = 1,
@@ -506,11 +544,13 @@ class StateStore:
             run_id=run_id or "run", attempt_no=attempt_no,
             started_at=started_at, settled_at=effective_finished_at,
         )
-        declarations = tuple(declared_artifacts)
-        success_metadata["artifacts"] = {
-            declaration.name: {"path": declaration.path}
-            for declaration in declarations if declaration.name is not None
-        }
+        artifacts_manifest: dict[str, dict[str, str]] = {}
+        if declared_artifacts:
+            for name, spec_or_path in declared_artifacts.items():
+                path_val = spec_or_path.path if isinstance(spec_or_path, FileSpec) else spec_or_path
+                if isinstance(name, str) and name and isinstance(path_val, str) and path_val:
+                    artifacts_manifest[name] = {"path": path_val}
+        success_metadata["artifacts"] = artifacts_manifest
         success_metadata["last_succeeded_at"] = effective_finished_at
         if run_id is not None:
             success_metadata["last_success_run_id"] = run_id

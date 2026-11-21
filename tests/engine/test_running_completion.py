@@ -8,7 +8,6 @@ import pytest
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
 from tasklite.resource import CapacityResource
 from tasklite.testing import authorizer, in_process_workers
-from tasklite.utils.artifact import ArtifactPathPolicy
 
 
 def _success(job, ctx):
@@ -34,20 +33,22 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, fault):
     completed = []
     original_complete = runtime._completion.complete_job
     original_release = capacity.release
-    original_cleanup = ArtifactPathPolicy.cleanup
+    adapter = runtime.store.path_policy.adapter
+    original_delete = adapter.delete_target
     original_commit = runtime.store.backend.commit_job_settlement
     error = OSError("execution commit unavailable")
 
-    def fail_pre_delete(*args, **kwargs):
-        events.append("pre_delete")
-        raise PermissionError("pre-delete denied by filesystem")
-
-    def cleanup(policy, declaration, **kwargs):
+    def delete_target(path, *, allow_broken_leaf_symlink, **kwargs):
+        if allow_broken_leaf_symlink:
+            events.append("pre_delete")
+            raise PermissionError("pre-delete denied by filesystem")
         events.append("cleanup")
         assert capacity.used == 1
         if fault == "cleanup":
             raise PermissionError("failure cleanup denied")
-        return original_cleanup(policy, declaration, **kwargs)
+        return original_delete(
+            path, allow_broken_leaf_symlink=allow_broken_leaf_symlink, **kwargs
+        )
 
     def release(amount):
         events.append("release")
@@ -67,8 +68,7 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, fault):
         assert entry.handle is None
         return original_complete(entry, result, **kwargs)
 
-    monkeypatch.setattr(ArtifactPathPolicy, "remove_existing", fail_pre_delete)
-    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", cleanup)
+    monkeypatch.setattr(adapter, "delete_target", delete_target)
     monkeypatch.setattr(capacity, "release", release)
     monkeypatch.setattr(runtime.store.backend, "commit_job_settlement", commit)
     monkeypatch.setattr(runtime._completion, "complete_job", complete)
@@ -144,13 +144,18 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
         def close(self):
             pass
 
+    adapter = runtime.store.path_policy.adapter
+
+    def guarded_delete(*args, allow_broken_leaf_symlink=False, **kwargs):
+        if stage == "pre_delete_framework" and allow_broken_leaf_symlink:
+            raise error
+        cleanup.append(args)
+
     monkeypatch.setattr(runtime._completion, "complete_job", lambda *args, **kwargs: completed.append(args))
-    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", lambda *args, **kwargs: cleanup.append(args))
+    monkeypatch.setattr(adapter, "delete_target", guarded_delete)
     process_cls = FailingStartProcess if stage == "process_start" else None
     with in_process_workers(pipeline, process_cls), authorizer(pipeline, lambda path, kind: True):
-        if stage == "pre_delete_framework":
-            monkeypatch.setattr(ArtifactPathPolicy, "remove_existing", fail)
-        elif stage in ("context", "interrupt"):
+        if stage in ("context", "interrupt"):
             monkeypatch.setattr(runtime._dispatch, "_build_context", fail)
         elif stage == "spawn":
             monkeypatch.setattr(runtime.channel, "spawn", fail)
@@ -202,11 +207,18 @@ def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_pa
     original_complete = runtime._completion.complete_job
     waiting = []
 
-    def fail_pre_delete(*args, **kwargs):
-        target.unlink()
-        target.mkdir()
-        (target / "child").write_text("business", encoding="utf-8")
-        raise OSError("pre-delete failed after type change")
+    adapter = runtime.store.path_policy.adapter
+    original_delete = adapter.delete_target
+
+    def fail_pre_delete(path, *, allow_broken_leaf_symlink, **kwargs):
+        if allow_broken_leaf_symlink:
+            target.unlink()
+            target.mkdir()
+            (target / "child").write_text("business", encoding="utf-8")
+            raise OSError("pre-delete failed after type change")
+        return original_delete(
+            path, allow_broken_leaf_symlink=allow_broken_leaf_symlink, **kwargs
+        )
 
     def complete(entry, result, **kwargs):
         completed.append(entry)
@@ -226,7 +238,7 @@ def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_pa
                 directory_decision[0] = decision
         return result
 
-    monkeypatch.setattr(ArtifactPathPolicy, "remove_existing", fail_pre_delete)
+    monkeypatch.setattr(adapter, "delete_target", fail_pre_delete)
     monkeypatch.setattr(runtime._completion, "complete_job", complete)
     monkeypatch.setattr(runtime, "step", step)
     with in_process_workers(pipeline), authorizer(pipeline, authorize):
@@ -270,12 +282,14 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
     completed = []
     releases = []
     original_release = capacity.release
-    original_remove = ArtifactPathPolicy.remove_existing
+    adapter = runtime.store.path_policy.adapter
+    original_delete = adapter.delete_target
 
-    def delete_then_stop(policy, path, *args, **kwargs):
-        original_remove(policy, path, *args, **kwargs)
+    def delete_then_stop(path, *args, **kwargs):
+        res = original_delete(path, *args, **kwargs)
         if stage == "pre_delete":
             pipeline.stop()
+        return res
 
     original_context = runtime._dispatch._build_context
 
@@ -308,7 +322,7 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
         releases.append(amount)
         return original_release(amount)
 
-    monkeypatch.setattr(ArtifactPathPolicy, "remove_existing", delete_then_stop)
+    monkeypatch.setattr(adapter, "delete_target", delete_then_stop)
     if stage == "context":
         monkeypatch.setattr(runtime._dispatch, "_build_context", context)
     monkeypatch.setattr(runtime._completion, "complete_job", lambda *args, **kwargs: completed.append(args))
@@ -430,19 +444,20 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
                 fail()
         return original_commit(*args, **kwargs)
 
-    original_cleanup = ArtifactPathPolicy.cleanup
+    adapter = runtime.store.path_policy.adapter
+    original_delete = adapter.delete_target
 
-    def cleanup(policy, declaration, **kwargs):
+    def delete_target(path, *args, **kwargs):
         if armed:
-            events.append(("cleanup", Path(declaration.path).name))
-        return original_cleanup(policy, declaration, **kwargs)
+            events.append(("cleanup", Path(path).name))
+        return original_delete(path, *args, **kwargs)
 
     monkeypatch.setattr(runtime.channel, "reap_completed", reap)
     monkeypatch.setattr(completion, "settle_reaped", settle)
     monkeypatch.setattr(completion, "_prepare_completion", prepare)
     monkeypatch.setattr(runtime.config.resources, "release_all", release)
     monkeypatch.setattr(store, "commit_job_settlement", commit)
-    monkeypatch.setattr(ArtifactPathPolicy, "cleanup", cleanup)
+    monkeypatch.setattr(adapter, "delete_target", delete_target)
     with in_process_workers(pipeline), authorizer(pipeline, authorize):
         with pytest.raises(RuntimeError) as caught:
             pipeline.run(install_signals=False)
@@ -542,7 +557,7 @@ def test_running_snapshot_projects_queue_started_at_until_settlement(tmp_path, m
         with in_process_workers(pipeline, TrackingProcess):
             owner, name = {
                 "resource": (capacity, "acquire"),
-                "pre_delete": (ArtifactPathPolicy, "remove_existing"),
+                "pre_delete": (runtime.store.path_policy.adapter, "delete_target"),
                 "context": (runtime._dispatch, "_build_context"),
                 "process": (runtime.channel._launcher, "process_class"),
             }[stage]

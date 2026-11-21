@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sqlite3
 import traceback
 
@@ -11,7 +12,6 @@ import tasklite
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskLiteError, TaskResult
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
 import tasklite.exceptions as exc_mod
-import tasklite.models.context as context_module
 import tasklite.snapshot as snapshot_module
 from tasklite.testing import fake_ctx
 
@@ -177,13 +177,16 @@ def test_input_declaration_rejection_and_natural_filesystem_error_are_distinct(t
     with pytest.raises(FileNotFoundError, match="Missing input file"):
         ctx.declare_file("source", FileSpec("missing", role="input"))
 
-    original = FileNotFoundError("文件系统读取故障")
+    original = PermissionError("文件系统读取故障")
+    real_lstat = os.lstat
 
-    def fail(path):
-        raise original
+    def fail(path, *args, **kwargs):
+        if Path(path).name == "missing":
+            raise original
+        return real_lstat(path, *args, **kwargs)
 
-    monkeypatch.setattr(context_module.os.path, "exists", fail)
-    with pytest.raises(FileNotFoundError) as caught:
+    monkeypatch.setattr(os, "lstat", fail)
+    with pytest.raises(PermissionError) as caught:
         ctx.declare_file("source", FileSpec("missing", role="input"))
     _assert_original_error(caught, original, "fail")
 

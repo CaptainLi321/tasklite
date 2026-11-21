@@ -25,8 +25,7 @@ if TYPE_CHECKING:
 
 from ..exceptions import TaskLiteError, _ArtifactIOError
 from ..models.job import Job
-from ..models.artifact import ArtifactDeclaration, FileSpec
-from ..utils.artifact import ArtifactPathPolicy
+from ..models.artifact import FileSpec
 from ..utils.clock import utc_now_iso
 from .admission import extract_effective_job_config
 from .channel import ExecutionResult, JobHandle
@@ -117,29 +116,17 @@ class CompletionMachine:
     def has_pending_result(self, handle: JobHandle) -> bool:
         return handle.job_uid in self._pending_cleanup
 
-    def _make_path_policy(
-        self,
-        *,
-        authorization_check: Any | None = None,
-    ) -> ArtifactPathPolicy:
-        """统一经 StateStore.path_policy 装配路径策略，并兼容渠道附加受保护根。"""
-        return ArtifactPathPolicy(
-            path_policy=self._store.path_policy,
-            protected_roots=self._channel.protected_roots,
-            authorization_check=authorization_check,
-        )
-
     def _authorize_cleanup(
         self, entry: InFlightJob | None, result: ExecutionResult,
         active_files: dict[str, FileSpec],
     ) -> None:
-        policy = self._make_path_policy()
+        policy = self._store.path_policy
         for spec in active_files.values():
             requested = spec.delete_on_success if result.success else spec.delete_on_failure
             if not requested or spec.path is None:
                 continue
             try:
-                if not policy.entry_exists(ArtifactDeclaration(spec.path)):
+                if not policy.inspect(spec.path, mode="strict", verify_unchanged=True).exists:
                     continue
             except _CLEANUP_ERRORS:
                 continue
@@ -170,7 +157,7 @@ class CompletionMachine:
             requested = spec.delete_on_success if result.success else spec.delete_on_failure
             if requested and spec.path and not self._store.is_path_authorized(spec.path):
                 try:
-                    present = policy.entry_exists(ArtifactDeclaration(spec.path))
+                    present = policy.inspect(spec.path, mode="strict", verify_unchanged=True).exists
                 except _CLEANUP_ERRORS:
                     continue
                 if present:
@@ -234,7 +221,7 @@ class CompletionMachine:
         if result.artifact_error is not None:
             raise _ArtifactIOError(result.artifact_error)
         if result.success:
-            policy = self._make_path_policy()
+            policy = self._store.path_policy
             for fname, spec in active_files.items():
                 if spec.role != "output":
                     continue
@@ -243,16 +230,16 @@ class CompletionMachine:
                     result.message = f"Missing output path for {fname!r}"
                     break
                 try:
-                    present = policy.entry_exists(
-                        ArtifactDeclaration(spec.path, sandbox=False)
-                    )
+                    present = policy.inspect(
+                        spec.path, mode="strict", verify_unchanged=True
+                    ).exists
                 except _CLEANUP_ERRORS as exc:
                     result.success = False
                     result.message = f"Output verification failed: {exc}"
                     self._attach_cleanup_failure(result, exc)
                     break
                 if not present:
-                    # entry_exists 仍先执行根与符号链接边界防护。若声明了成功删除，
+                    # strict inspect 已执行根、受保护路径与符号链接边界防护。若声明了成功删除，
                     # 契约允许工作进程在返回前原子 rename 移走该临时输出，缺失视为已移除。
                     if not spec.delete_on_success:
                         result.success = False
@@ -357,25 +344,14 @@ class CompletionMachine:
 
             # 声明式产物主进程清理
             if active_files:
-                policy = self._make_path_policy(
-                    authorization_check=lambda path, kind: self._store.backend.is_path_authorized(path, kind),
-                )
+                policy = self._store.path_policy
+                authorize_cb = self._store.backend.is_path_authorized
                 if result.success:
                     for fname, spec in active_files.items():
                         if not (spec.delete_on_success and spec.path):
                             continue
-                        declaration = ArtifactDeclaration(spec.path, delete_on_success=True)
                         try:
-                            present = policy.entry_exists(declaration)
-                        except _CLEANUP_ERRORS as exc:
-                            result.success = False
-                            result.message = f"Success cleanup failed: {exc}"
-                            self._attach_cleanup_failure(result, exc)
-                            break
-                        if not present:
-                            continue
-                        try:
-                            policy.cleanup(declaration, success=True)
+                            policy.delete(spec.path, authorize=authorize_cb)
                         except _CLEANUP_ERRORS as exc:
                             result.success = False
                             result.message = f"Success cleanup failed: {exc}"
@@ -388,16 +364,8 @@ class CompletionMachine:
                     for fname, spec in active_files.items():
                         if not (spec.delete_on_failure and spec.path):
                             continue
-                        declaration = ArtifactDeclaration(spec.path, delete_on_failure=True)
                         try:
-                            present = policy.entry_exists(declaration)
-                        except _CLEANUP_ERRORS as exc:
-                            self._record_failure_cleanup_error(result, exc)
-                            continue
-                        if not present:
-                            continue
-                        try:
-                            policy.cleanup(declaration, success=False)
+                            policy.delete(spec.path, authorize=authorize_cb)
                         except _CLEANUP_ERRORS as exc:
                             self._record_failure_cleanup_error(result, exc)
 
@@ -552,14 +520,12 @@ class CompletionMachine:
             if active_files
             else job_snapshot.get("files")
         )
-        effective_declarations: list[ArtifactDeclaration] = []
+        effective_outputs: dict[str, FileSpec] = {}
         effective_inputs: list[str] = []
         if active_files:
             for fname, fspec in active_files.items():
                 if fspec.role == "output" and fspec.path is not None:
-                    effective_declarations.append(
-                        ArtifactDeclaration(fspec.path, name=fname)
-                    )
+                    effective_outputs[fname] = fspec
                 elif fspec.role == "input" and fspec.path is not None:
                     effective_inputs.append(fspec.path)
 
@@ -568,7 +534,7 @@ class CompletionMachine:
             spawned_job_snapshots=spawned_job_snapshots,
             cursor_updates=result.cursor_updates,
             declared_inputs=effective_inputs,
-            declared_artifacts=effective_declarations,
+            declared_artifacts=effective_outputs,
             run_id=run_id or self._session.run_id,
             job_snapshot=job_snapshot,
             execution_id=execution_id,

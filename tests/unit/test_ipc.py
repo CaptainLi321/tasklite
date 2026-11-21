@@ -33,7 +33,7 @@ def _sequential_sender_worker(sender) -> None:
         sender.send_declare(
             "request",
             "out",
-            FileSpec("/tmp/out.txt", role="output", delete_on_failure=True).to_dict(),
+            FileSpec("out.txt", role="output", delete_on_failure=True).to_dict(),
         )
         sender.send_result({"status": "success", "result": 42})
     finally:
@@ -173,7 +173,7 @@ class TestWorkerPipeWireProtocol:
         receiver, sender = create_worker_pipe(job_uid="t::closed", execution_id="exec_closed")
         sender.close()
         with pytest.raises(OSError):
-            sender.send_declare("request", "out", FileSpec("/tmp/b", role="output").to_dict())
+            sender.send_declare("request", "out", FileSpec("b", role="output").to_dict())
         receiver.close()
 
 

@@ -14,14 +14,12 @@ import time
 import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from ..exceptions import TaskLiteError, _ArtifactIOError
 from ..models.context import JobContext
 from ..models.job import Job
 from ..models.result import TaskResult, validate_strict_json_object
-from ..utils.artifact import PathPolicy
 from ..utils.ipc import (
     PIPE_MSG_DECLARE,
     PIPE_MSG_RESULT,
@@ -431,18 +429,10 @@ class ExecutionChannel:
         self,
         *,
         launcher: WorkerLauncher | None = None,
-        protected_roots: Sequence[str | Path] = (),
-        path_policy: PathPolicy | None = None,
     ) -> None:
         self._launcher: WorkerLauncher = (
             launcher if launcher is not None else SubprocessWorkerLauncher()
         )
-        if path_policy is not None:
-            merged_roots = tuple(dict.fromkeys((*path_policy.protected_paths, *(Path(r) for r in protected_roots))))
-        else:
-            merged_roots = tuple(Path(r) for r in protected_roots)
-        self.protected_roots: tuple[Path, ...] = merged_roots
-        self._path_policy = path_policy
         self._receivers: dict[str, WorkerPipeReceiver] = {}
         self._in_process_senders: dict[str, WorkerPipeSender] = {}
         self._reply_senders: dict[str, WorkerReplySender] = {}

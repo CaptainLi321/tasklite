@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..exceptions import TaskLiteError, _ArtifactIOError
-from ..utils.artifact import ArtifactPathPolicy
+from ..utils.artifact import PathPolicy
 from ..utils.ipc import (
     WorkerPipeSender,
     WorkerReplyReceiver,
@@ -23,6 +23,7 @@ from ..utils.ipc import (
 from .artifact import (
     FileSpec,
     coerce_file_spec,
+    resolve_file_spec,
     resolve_job_files_config,
     validate_file_name,
 )
@@ -108,37 +109,27 @@ class JobContext:
                 )
 
     def _resolve_local_file(self, spec: FileSpec) -> FileSpec:
-        """无回复通道时解析声明供隔离测试使用；不执行任何文件删除。"""
-        if spec.is_output_ref:
-            assert spec.producer_uid is not None and spec.output_name is not None
-            desc = self._artifact_descriptions.get(spec.producer_uid, {}).get(spec.output_name)
-            if not desc or "path" not in desc:
-                raise TaskLiteError(
-                    f"producer {spec.producer_uid!r} did not publish "
-                    f"output {spec.output_name!r}"
-                )
-            resolved = spec._bind_output_path(desc["path"])
-        else:
-            resolved = self._canonical_source(spec)
-        if resolved.path is None:
-            raise TaskLiteError("FileSpec resolved without a path")
-        if self._protected_roots and (
-            resolved.role != "input"
-            or resolved.delete_existing
-            or resolved.delete_on_success
-            or resolved.delete_on_failure
-        ):
-            policy = ArtifactPathPolicy(
-                base_dir=self._base_dir,
-                protected_roots=self._protected_roots,
+        """无回复通道时复用统一 PathPolicy 解析声明供隔离测试使用；不执行任何文件删除。"""
+        policy = PathPolicy(
+            base_dir=self._base_dir,
+            protected_roots=self._protected_roots,
+        )
+        enforce_safety = bool(self._protected_roots) and (
+            spec.role != "input"
+            or spec.delete_existing
+            or spec.delete_on_success
+            or spec.delete_on_failure
+        )
+        try:
+            return resolve_file_spec(
+                spec,
+                path_policy=policy,
+                depends_on=self.job.depends_on,
+                artifact_lookup=lambda puid, oname: self._artifact_descriptions.get(puid, {}).get(oname),
+                enforce_safety=enforce_safety,
             )
-            try:
-                policy.resolve(resolved.path, delete_existing=resolved.delete_existing)
-            except ValueError as exc:
-                raise TaskLiteError(str(exc)) from exc
-        if resolved.role == "input" and not os.path.exists(resolved.path):
-            raise FileNotFoundError(f"Missing input file: {resolved.path}")
-        return resolved
+        except ValueError as exc:
+            raise TaskLiteError(str(exc)) from exc
 
     def file_path(self, name: str) -> Path:
         """返回当前 Job 已声明文件（预声明或已完成动态声明）的规范绝对 Path。"""

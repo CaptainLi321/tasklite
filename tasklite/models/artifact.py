@@ -1,13 +1,19 @@
 """磁盘文件声明值与配置解析：FileSpec 统一声明值对象及提交期快照规范化。"""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-import os
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from ..exceptions import TaskLiteError
+from ..utils.artifact import (
+    InspectMode,
+    PathPolicy,
+    is_platform_abs_path,
+    resolve_lexical_path,
+    validate_and_normalize_lexical,
+)
 
 FILE_ROLES: tuple[str, ...] = ("input", "output", "cache")
 FileRole = Literal["input", "output", "cache"]
@@ -30,43 +36,37 @@ _OUTPUT_REF_SPEC_KEYS = frozenset({
 
 
 def _normalize_lexical_path(path: str | Path) -> str:
-    """校验并词法规范化路径字符串（不触碰磁盘，保留相对或绝对形态）。"""
+    """校验并词法规范化路径字符串（复用于 PathPolicy 唯一词法规则，不触碰磁盘）。"""
     if not isinstance(path, (str, Path)):
         raise TaskLiteError(
             f"FileSpec path must be a str or Path, got {type(path).__name__}"
         )
     if isinstance(path, str) and not path:
         raise TaskLiteError("FileSpec path must be non-empty")
-    raw = os.fspath(path)
-    if not isinstance(raw, str) or not raw or "\x00" in raw:
-        raise TaskLiteError("FileSpec path must be a non-empty path without null bytes")
-    norm = os.path.normpath(raw)
-    if os.name == "posix" and norm.startswith("//"):
-        norm = "/" + norm.lstrip("/")
-    return norm
+    try:
+        return validate_and_normalize_lexical(path)
+    except ValueError as exc:
+        raise TaskLiteError(str(exc)) from exc
 
 
 def resolve_path_against_base(path: str | Path, base_dir: str | Path) -> str:
     """按固定基准目录将路径解析为词法规范的绝对路径（不创建目录或访问磁盘）。"""
-    norm = _normalize_lexical_path(path)
-    base_norm = _normalize_lexical_path(base_dir)
-    if os.name == "nt":
-        path_drive, path_tail = os.path.splitdrive(norm)
-        if path_drive and not path_drive.startswith("\\\\") and not path_tail.startswith(("\\", "/")):
-            raise TaskLiteError(
-                f"drive-relative FileSpec paths are not portable: {norm!r}"
-            )
-        if path_drive.startswith("\\\\") and not path_tail:
-            return f"{path_drive}\\"
-    if not os.path.isabs(base_norm):
-        base_norm = os.path.abspath(base_norm)
-    if os.path.isabs(norm):
-        resolved = norm
-    else:
-        resolved = os.path.normpath(os.path.join(base_norm, norm))
-    if os.name == "posix" and resolved.startswith("//"):
-        resolved = "/" + resolved.lstrip("/")
-    return resolved
+    if not isinstance(path, (str, Path)):
+        raise TaskLiteError(
+            f"FileSpec path must be a str or Path, got {type(path).__name__}"
+        )
+    if isinstance(path, str) and not path:
+        raise TaskLiteError("FileSpec path must be non-empty")
+    if not isinstance(base_dir, (str, Path)):
+        raise TaskLiteError(
+            f"FileSpec base_dir must be a str or Path, got {type(base_dir).__name__}"
+        )
+    if isinstance(base_dir, str) and not base_dir:
+        raise TaskLiteError("FileSpec base_dir must be non-empty")
+    try:
+        return resolve_lexical_path(path, base_dir)
+    except ValueError as exc:
+        raise TaskLiteError(str(exc)) from exc
 
 
 def _validate_role_and_cleanup(
@@ -194,7 +194,7 @@ class FileSpec:
             abs_path = resolve_path_against_base(resolved_path, base_dir)
         else:
             abs_path = _normalize_lexical_path(resolved_path)
-            if not os.path.isabs(abs_path):
+            if not is_platform_abs_path(abs_path):
                 raise TaskLiteError(
                     f"resolved_path must be an absolute path when base_dir is None, got {resolved_path!r}"
                 )
@@ -377,34 +377,54 @@ def merge_named_file_spec(
     return merged, True
 
 
-# ── 运行时产物声明值 ──────────────────────────────────────────────────
+def resolve_file_spec(
+    spec: FileSpec,
+    *,
+    path_policy: PathPolicy,
+    depends_on: Sequence[str] = (),
+    artifact_lookup: Callable[[str, str], Mapping[str, Any] | None] | None = None,
+    enforce_safety: bool | None = None,
+) -> FileSpec:
+    """基于 PathPolicy 单次原子解析 FileSpec（上游引用、安全边界、存在性判定与路径绑定）。
 
-@dataclass(frozen=True)
-class ArtifactDeclaration:
-    """一次路径清理操作的内部授权值；物理归属由路径策略核验。"""
+    全程经由 ``path_policy.inspect``（100% 通过 ``FilesystemAdapter``），不直调
+    ``os.path.exists``，且单次完成规范化、清理安全校验与绑定，消除重复往返。
+    """
+    if spec.is_output_ref:
+        assert spec.producer_uid is not None and spec.output_name is not None
+        if spec.producer_uid not in depends_on:
+            raise TaskLiteError(
+                f"Producer {spec.producer_uid!r} not in explicit direct depends_on {list(depends_on)!r}"
+            )
+        desc = (
+            artifact_lookup(spec.producer_uid, spec.output_name)
+            if artifact_lookup is not None
+            else None
+        )
+        if not desc or "path" not in desc:
+            raise TaskLiteError(
+                f"Producer {spec.producer_uid!r} did not publish output {spec.output_name!r}"
+            )
+        raw_path: str = desc["path"]
+    else:
+        if spec.path is None:
+            raise TaskLiteError("FileSpec resolved without a path")
+        raw_path = spec.path
 
-    path: str
-    name: str | None = None
-    delete_existing: bool = False
-    delete_on_failure: bool = False
-    delete_on_success: bool = False
-    sandbox: bool = True
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.path, str):
-            raise TypeError("artifact path must be a str")
-        if not self.path or "\x00" in self.path or not Path(self.path).is_absolute():
-            raise ValueError("artifact path must be a non-empty absolute path without null bytes")
-        if os.path.normpath(self.path) != self.path or (os.name == "posix" and self.path.startswith("//")):
-            raise ValueError("artifact path must be lexically normalized")
-        if self.name is not None:
-            if not isinstance(self.name, str):
-                raise TypeError("artifact name must be a str or None")
-            if not self.name:
-                raise ValueError("artifact name must be non-empty")
-        for field in ("delete_existing", "delete_on_failure", "delete_on_success", "sandbox"):
-            if type(getattr(self, field)) is not bool:
-                raise TypeError(f"{field} must be a bool")
+    need_safety = (
+        spec.delete_existing or spec.delete_on_success or spec.delete_on_failure
+        if enforce_safety is None
+        else enforce_safety
+    )
+    mode: InspectMode = (
+        ("pre_delete" if spec.delete_existing else "strict")
+        if need_safety
+        else "lookup"
+    )
+    inspected = path_policy.inspect(raw_path, mode=mode)
+    if spec.role == "input" and (not inspected.exists or inspected.kind == "broken_symlink"):
+        raise FileNotFoundError(f"Missing input file: {inspected.canonical_path}")
+    return spec._bind_output_path(inspected.canonical_path)
 
 
 __all__ = [
@@ -414,8 +434,8 @@ __all__ = [
     "coerce_file_spec",
     "merge_named_file_spec",
     "parse_job_files_config",
+    "resolve_file_spec",
     "resolve_job_files_config",
     "resolve_path_against_base",
     "validate_file_name",
-    "ArtifactDeclaration",
 ]
