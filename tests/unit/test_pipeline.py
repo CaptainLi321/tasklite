@@ -236,8 +236,7 @@ class TestConstruction:
             lambda: p.run(),
             lambda: p.register_task("fast2", ok_handler),
             lambda: p.register_resource(CapacityResource("res", max_capacity=1.0)),
-            lambda: p.set_job_status("fast::j1", "succeeded", recursive=False),
-            lambda: p.clear_history("fast::j1", records=["successes"]),
+            lambda: p.edit(),
             lambda: p.set_cursor("key", "val"),
             lambda: p.get_cursor("key"),
             lambda: p.stop(),
@@ -292,7 +291,8 @@ class TestConstruction:
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 p2.run()
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):
-                p2.set_job_status("t::j1", "succeeded", recursive=False)
+                with p2.edit(dry_run=False) as tx:
+                    tx.set_status("t::j1", "failed", recursive=False)
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 p2.enqueue(Job("t", "j2"))
             with StateSnapshot.open(db) as snap:
@@ -669,7 +669,8 @@ class TestEnqueue:
     def test_wall_hit_intake_and_run_guard(self, tmp_path):
         with make_pipeline(tmp_path) as p:
             p.register_task("fetch", ok_handler)
-            p.set_job_status(Job("fetch", "done"), "succeeded", recursive=False)
+            with p.edit(dry_run=False) as tx:
+                tx.add(Job("fetch", "done"), status="succeeded")
             assert p.enqueue(Job("fetch", "done")) is True
             assert p.enqueue(Job("fetch", "a", timeout_seconds=17, payload={"timeout": "业务时限"})) is True
             with StateSnapshot.open(p) as snap:
@@ -758,17 +759,20 @@ class TestSixStepAndSchedulingContract:
 class TestManageApisAndRunOptions:
     """run() 外管理 API、守卫、文件锁与信号安装。"""
 
-    def test_set_job_status_cursors_clear_history_and_guards(self, tmp_path):
+    def test_edit_cursors_and_guards(self, tmp_path):
         with make_pipeline(tmp_path) as p:
             p.register_task("fetch", ok_handler)
-            p.set_job_status(Job("fetch", "bad"), "failed", recursive=False)
+            with p.edit(dry_run=False) as tx:
+                tx.add(Job("fetch", "bad"), status="failed")
             with StateSnapshot.open(p) as snap:
                 assert snap.get_job("fetch::bad")["status"] == "failed"  # type: ignore[index]
-            p.set_job_status("fetch::bad", "pending", recursive=False)
+            with p.edit(dry_run=False) as tx:
+                tx.set_status("fetch::bad", "pending", recursive=False)
             with StateSnapshot.open(p) as snap:
                 assert snap.get_job("fetch::bad")["status"] == "pending"  # type: ignore[index]
-            with pytest.raises(TaskLiteError, match="No existing snapshot found"):
-                p.set_job_status("fetch::nope", "pending", recursive=False)
+            with pytest.raises(TaskLiteError, match="does not exist"):
+                with p.edit(dry_run=False) as tx:
+                    tx.set_status("fetch::nope", "pending", recursive=False)
 
             assert p.get_cursor("page") is None
             p.set_cursor("page", "7")
@@ -776,17 +780,18 @@ class TestManageApisAndRunOptions:
             p.set_cursor("page", None)
             assert p.get_cursor("page") is None
 
-            p.set_job_status(Job("fetch", "ok"), "succeeded", recursive=False)
-            p.set_job_status(Job("fetch", "bad_done"), "failed", recursive=False)
-            assert p.clear_history("fetch::ok", records=["successes"]) == 1
-            assert p.clear_history("fetch::bad_done", records=["failures"]) == 1
+            with p.edit(dry_run=False) as tx:
+                tx.add(Job("fetch", "ok"), status="succeeded")
+                tx.add(Job("fetch", "bad_done"), status="failed")
+            with p.edit(dry_run=False) as tx:
+                assert tx.remove("fetch::ok", entries=("successes",), recursive=False) == 1
+                assert tx.remove("fetch::bad_done", entries=("failures",), recursive=False) == 1
             with StateSnapshot.open(p) as snap:
                 assert snap.get_job("fetch::ok") is None
                 assert snap.get_job("fetch::bad_done") is None
 
             guarded = [
-                ("set_job_status", lambda pl: pl.set_job_status(Job("fetch", "a"), "pending", recursive=False)),
-                ("clear_history", lambda pl: pl.clear_history("fetch::a", records=["successes"])),
+                ("edit", lambda pl: pl.edit()),
                 ("get_cursor", lambda pl: pl.get_cursor("k")),
                 ("set_cursor", lambda pl: pl.set_cursor("k", "v")),
             ]

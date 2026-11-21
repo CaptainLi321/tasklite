@@ -286,7 +286,8 @@ class TestJobRecordStructureAndPriority:
         with StateSnapshot.open(p) as s1:
             assert s1.get_job("process::j1")["status"] == "succeeded"
 
-        p.set_job_status("process::j1", "pending", recursive=False)
+        with p.edit(dry_run=False) as tx:
+            tx.set_status("process::j1", "pending", recursive=False)
 
         with StateSnapshot.open(p) as s2:
             j1_requeued = s2.get_job("process::j1")
@@ -299,8 +300,10 @@ class TestJobRecordStructureAndPriority:
         p.enqueue(Job("process", "j_manual_succ"))
         p.enqueue(Job("process", "j_manual_fail"))
 
-        p.set_job_status("process::j_manual_succ", "succeeded", recursive=False, note="manual approval")
-        p.set_job_status("process::j_manual_fail", "failed", recursive=False, note="manual rejection")
+        with p.edit(dry_run=False, note="manual approval") as tx:
+            tx.replace("process::j_manual_succ", Job("process", "j_manual_succ"), status="succeeded")
+        with p.edit(dry_run=False, note="manual rejection") as tx:
+            tx.set_status("process::j_manual_fail", "failed", recursive=False)
 
         with StateSnapshot.open(p) as s:
             succ = s.get_job("process::j_manual_succ")
@@ -333,8 +336,9 @@ class TestQueriesAndFilters:
             p.enqueue(Job("process", job_id))
         with in_process_workers(p):
             p.run(install_signals=False)
-        p.set_job_status("process::pend", "pending", recursive=False)
-        p.set_job_status("process::fail", "failed", recursive=False)
+        with p.edit(dry_run=False) as tx:
+            tx.set_status("process::pend", "pending", recursive=False)
+            tx.set_status("process::fail", "failed", recursive=False)
 
         class TrackedCursor:
             def __init__(self, cursor):
@@ -388,8 +392,9 @@ class TestQueriesAndFilters:
         with in_process_workers(p):
             p.run(install_signals=False)
 
-        p.set_job_status("process::j_pend", "pending", recursive=False)
-        p.set_job_status("generate::g_fail", "failed", recursive=False)
+        with p.edit(dry_run=False) as tx:
+            tx.set_status("process::j_pend", "pending", recursive=False)
+            tx.set_status("generate::g_fail", "failed", recursive=False)
 
         with StateSnapshot.open(p) as s:
             assert {j["job_uid"] for j in s.iter_jobs()} == {"process::j_succ", "process::j_pend", "generate::g_fail"}
@@ -428,10 +433,11 @@ class TestQueriesAndFilters:
                 assert a["settled_at"] is not None
                 assert a["run_id"] is not None
 
-        assert p.clear_history("process::j_retry", records=["successes", "failures", "attempts"]) == 4
+        with p.edit(dry_run=False) as tx:
+            assert tx.remove("process::j_retry", entries=("successes", "failures"), recursive=False) == 1
         with StateSnapshot.open(p) as s:
             assert s.get_job("process::j_retry") is None
-            assert list(s.iter_attempts(job_uid="process::j_retry")) == []
+            assert len(list(s.iter_attempts(job_uid="process::j_retry"))) == 3
         p.enqueue(Job("process", "j_retry", max_retries_per_run=5))
         with StateSnapshot.open(p) as s:
             pending = s.get_job("process::j_retry")
@@ -441,11 +447,11 @@ class TestQueriesAndFilters:
             p.run(install_signals=False)
         with StateSnapshot.open(p) as s:
             current = list(s.iter_attempts(job_uid="process::j_retry"))
-            assert len(current) == 1
-            assert current[0]["attempt_no"] == 4
-            assert current[0]["run_id"] != attempts[-1]["run_id"]
-            assert current[0]["job"] == attempts[-1]["job"]
-            assert current[0]["outcome"] == "success"
+            assert [a["attempt_no"] for a in current] == [1, 2, 3, 4]
+            assert current[-1]["attempt_no"] == 4
+            assert current[-1]["run_id"] != attempts[-1]["run_id"]
+            assert current[-1]["job"] == attempts[-1]["job"]
+            assert current[-1]["outcome"] == "success"
         p.close()
 
 
@@ -521,11 +527,11 @@ def test_predispatch_failure_owns_current_result_and_configuration(
         assert current["job"]["timeout_seconds"] == 7
         assert current["files"]["input"]["path"] == str(source)
         assert_current_sources(p, "process::one", current, attempts)
-        assert p.clear_history("process::one", records=["attempts"]) == len(attempts)
-        assert_current_sources(p, "process::one", current, [])
-        p.clear_history("process::one", records=["failures"])
+        with p.edit(dry_run=False) as tx:
+            assert tx.remove("process::one", entries=("failures",), recursive=False) == 1
         with StateSnapshot.open(p) as snapshot:
             assert snapshot.get_job("process::one") is None
+            assert list(snapshot.iter_attempts(job_uid="process::one")) == attempts
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
@@ -549,11 +555,11 @@ def test_executed_failure_retains_own_facts_after_attempt_cleanup(tmp_path, back
         assert current["result"]["metadata"] == {"mode": mode}
         assert current["attempt_no"] == 1
         assert_current_sources(p, "process::one", current, attempts)
-        p.clear_history("process::one", records=["attempts"])
-        assert_current_sources(p, "process::one", current, [])
-        p.clear_history("process::one", records=["failures"])
+        with p.edit(dry_run=False) as tx:
+            assert tx.remove("process::one", entries=("failures",), recursive=False) == 1
         with StateSnapshot.open(p) as snapshot:
             assert snapshot.get_job("process::one") is None
+            assert list(snapshot.iter_attempts(job_uid="process::one")) == attempts
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
@@ -588,7 +594,8 @@ def test_manual_failure_and_record_deletion_do_not_reuse_execution_history(tmp_p
         p.enqueue(job)
         with in_process_workers(p):
             p.run(install_signals=False)
-        p.set_job_status(job.uid, "failed", recursive=False, note="人工否决")
+        with p.edit(dry_run=False, note="人工否决") as tx:
+            tx.set_status(job.uid, "failed", recursive=False)
         with StateSnapshot.open(p) as snapshot:
             current = snapshot.get_job(job.uid)
             attempts = list(snapshot.iter_attempts(job_uid=job.uid))
@@ -598,7 +605,8 @@ def test_manual_failure_and_record_deletion_do_not_reuse_execution_history(tmp_p
         assert current["result"]["metadata"] == {}
         assert all(current[key] is None for key in ("run_id", "attempt_no", "started_at"))
         assert_current_sources(p, job.uid, current, attempts)
-        p.clear_history(job.uid, records=["failures"])
+        with p.edit(dry_run=False) as tx:
+            assert tx.remove(job.uid, entries=("failures",), recursive=False) == 1
         with StateSnapshot.open(p) as snapshot:
             assert snapshot.get_job(job.uid) is None
             assert list(snapshot.iter_attempts(job_uid=job.uid)) == attempts
@@ -629,8 +637,6 @@ def test_running_recovery_current_failure_is_self_contained(tmp_path, backend):
         assert current["files"]["out"]["path"] == str(tmp_path / "out")
         assert current["result"] == attempts[0]["result"]
         assert_current_sources(p, job.uid, current, attempts)
-        p.clear_history(job.uid, records=["attempts"])
-        assert_current_sources(p, job.uid, current, [])
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
@@ -723,8 +729,6 @@ def test_current_terminal_record_ignores_later_authorization_attempt(
         with StateSnapshot.open(p) as snapshot:
             assert list(snapshot.iter_jobs()) == [original]
             assert snapshot.get_job("process::child") is None
-        assert p.clear_history(uid, records=["attempts"]) == 2
-        assert_current_sources(p, uid, original, [])
         gate[0] = True
         p.enqueue(Job("process", "one", payload={"mode": "success", "path": str(target)}))
         with in_process_workers(p):
@@ -733,8 +737,10 @@ def test_current_terminal_record_ignores_later_authorization_attempt(
             current = snapshot.get_job(uid)
             attempts = list(snapshot.iter_attempts(job_uid=uid))
         assert current["attempt_no"] == 3
+        assert [a["attempt_no"] for a in attempts] == [1, 2, 3]
         assert_current_sources(p, uid, current, attempts)
-        assert p.clear_history(uid, records=["successes"]) == 1
+        with p.edit(dry_run=False) as tx:
+            assert tx.remove(uid, entries=("successes",), recursive=False) == 1
         for source in [p] + ([p._state_path] if p._state_path is not None else []):
             with StateSnapshot.open(source) as snapshot:
                 assert snapshot.get_job(uid) is None
@@ -752,7 +758,8 @@ def test_manual_success_does_not_reuse_execution_facts(tmp_path, backend):
             p.run(install_signals=False)
         with StateSnapshot.open(p) as snapshot:
             attempts = list(snapshot.iter_attempts(job_uid=job.uid))
-        p.set_job_status(job.uid, "succeeded", recursive=False, note="人工确认")
+        with p.edit(dry_run=False, note="人工确认") as tx:
+            tx.replace(job.uid, job, status="succeeded")
         with StateSnapshot.open(p) as snapshot:
             current = snapshot.get_job(job.uid)
         assert current["status"] == "succeeded"
@@ -761,8 +768,6 @@ def test_manual_success_does_not_reuse_execution_facts(tmp_path, backend):
         assert all(current[key] is None for key in ("run_id", "attempt_no", "started_at"))
         assert current["settled_at"] is not None
         assert_current_sources(p, job.uid, current, attempts)
-        assert p.clear_history(job.uid, records=["attempts"]) == 1
-        assert_current_sources(p, job.uid, current, [])
 
 
 class TestQueueStartedAtProjection:
@@ -976,7 +981,7 @@ class TestStateSnapshotCopyMode:
                         lazy_snap.iter_attempts(job_uid="process::ok")
                     )
 
-    def test_memory_shallow_attempts_isolation_across_mutations_and_clear_history(self):
+    def test_memory_shallow_attempts_isolation_across_mutations_and_edit(self):
         with TaskLite(backend="memory") as p:
             p.register_task("process", retry_then_succeed_handler)
             p.enqueue(Job("process", "j1", payload={"nested": {"k": 1}}, max_retries_per_run=5))
@@ -991,8 +996,12 @@ class TestStateSnapshotCopyMode:
                 attempts_first[0]["job"]["payload"]["nested"]["k"] = 999
                 attempts_first[0]["result"]["metadata"]["injected"] = True
 
-                # 即使旧 clear_history 清除了后端 attempts，已打开快照仍完全隔离
-                p.clear_history("process::j1", records=["attempts"])
+                # 即使后续 edit() 移除成功档案并追加新执行，已打开快照仍完全隔离
+                with p.edit(dry_run=False) as tx:
+                    tx.remove("process::j1", entries=("successes",), recursive=False)
+                p.enqueue(Job("process", "j1", payload={"nested": {"k": 2}}, max_retries_per_run=5))
+                with in_process_workers(p):
+                    p.run(install_signals=False)
 
                 attempts_second = list(snap.iter_attempts(job_uid="process::j1"))
                 assert len(attempts_second) == 3
@@ -1163,7 +1172,8 @@ class TestStateSnapshotReport:
             # 2) 手工标记 succeeded（manual）
             j_manual = Job("train", "manual_ok")
             p.enqueue(j_manual)
-            p.set_job_status(j_manual.uid, "succeeded", recursive=False, note="verified")
+            with p.edit(dry_run=False, note="verified") as tx:
+                tx.replace(j_manual.uid, j_manual, status="succeeded")
 
             # 3) 待运行 pending
             p.enqueue(Job("train", "p1"))
@@ -1185,7 +1195,8 @@ class TestStateSnapshotReport:
             long_msg = "line1\n" + ("E" * 200)
             j_fail = Job("train", "f1")
             p.enqueue(j_fail)
-            p.set_job_status(j_fail.uid, "failed", recursive=False, note=long_msg)
+            with p.edit(dry_run=False, note=long_msg) as tx:
+                tx.set_status(j_fail.uid, "failed", recursive=False)
 
             # 固定报告当前时钟为 2026-08-01T01:00:05Z
             monkeypatch.setattr(report_mod, "utc_now_iso", lambda: "2026-08-01T01:00:05Z")
@@ -1237,7 +1248,8 @@ class TestStateSnapshotReport:
             before = StateSnapshot.open(p, mode="copy")
             try:
                 # 区间变更：新增 1 个 pending，移除 to_remove，并执行 run()
-                p.clear_history("worker::to_remove", records=["successes"])
+                with p.edit(dry_run=False) as tx:
+                    tx.remove("worker::to_remove", entries=("successes",), recursive=False)
                 p.enqueue(Job("worker", "new_ok", payload={"mode": "success"}))
                 with in_process_workers(p):
                     p.run(install_signals=False)

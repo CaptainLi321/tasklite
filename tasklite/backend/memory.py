@@ -16,7 +16,9 @@ from typing import Any, Literal, Mapping, Sequence, cast
 
 from .base import (
     AbstractStateBackend,
+    GraphEditCommit,
     QUEUE_EXECUTION_ID_KEY,
+    RunningAttemptRecovery,
     execution_id_matches_run,
     public_queue_snapshot,
     queue_snapshot_execution_id,
@@ -153,58 +155,134 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     # 管理写与查询 --------------------------------------------------
 
-    def apply_manual_status(
-        self,
-        updates: Sequence[tuple[str, str, dict[str, Any], dict[str, Any] | None]],
-    ) -> None:
-        """批量原子应用人工状态变更 (job_uid, status, snapshot, metadata)。"""
-        if not updates:
+    def commit_graph_edit(self, commit: GraphEditCommit) -> None:
+        """在单锁 Copy-on-Write 临界区内校验并原子应用图修整变更，故障零污染。"""
+        if not isinstance(commit, GraphEditCommit):
+            raise TypeError(f"commit must be a GraphEditCommit, got {type(commit).__name__}")
+        if (
+            not commit.queue_writes
+            and not commit.success_writes
+            and not commit.failed_writes
+            and not commit.recovery_attempts
+        ):
             return
-        with self._lock:
-            new_successes = copy.deepcopy(self._successes)
-            new_failed = copy.deepcopy(self._failed)
-            new_failure_payloads = copy.deepcopy(self._failure_payloads)
-            new_queue = copy.deepcopy(self._queue)
-            for job_uid, status, snapshot, metadata in updates:
-                snap_copy = copy.deepcopy(snapshot)
-                meta_copy = copy.deepcopy(metadata or {})
-                if status == "pending":
-                    new_successes.pop(job_uid, None)
-                    new_failed.pop(job_uid, None)
-                    new_failure_payloads.pop(job_uid, None)
-                    new_queue = [
-                        j for j in new_queue
-                        if job_uid_from_snapshot(j) != job_uid
-                    ]
-                    snap_copy["status"] = "pending"
-                    snap_copy["run_id"] = None
-                    snap_copy["attempt_no"] = None
-                    snap_copy["started_at"] = None
-                    snap_copy.pop(QUEUE_EXECUTION_ID_KEY, None)
-                    new_queue.append(snap_copy)
-                elif status == "succeeded":
-                    new_queue = [
-                        j for j in new_queue
-                        if job_uid_from_snapshot(j) != job_uid
-                    ]
-                    new_failed.pop(job_uid, None)
-                    new_failure_payloads.pop(job_uid, None)
-                    new_successes[job_uid] = meta_copy
-                elif status == "failed":
-                    new_queue = [
-                        j for j in new_queue
-                        if job_uid_from_snapshot(j) != job_uid
-                    ]
-                    new_successes.pop(job_uid, None)
-                    new_failed[job_uid] = meta_copy
-                    new_failure_payloads[job_uid] = snap_copy.get("payload") or {}
-                else:
-                    raise ValueError(f"Unsupported manual status: {status!r}")
 
+        seen_recovery: set[str] = set()
+        for rec in commit.recovery_attempts:
+            if not isinstance(rec, RunningAttemptRecovery):
+                raise TypeError(
+                    f"recovery_attempts items must be RunningAttemptRecovery, got {type(rec).__name__}"
+                )
+            if rec.job_uid in seen_recovery:
+                raise TaskLiteError(
+                    f"Duplicate recovery attempt for running job {rec.job_uid!r}"
+                )
+            seen_recovery.add(rec.job_uid)
+            if rec.job_uid not in commit.queue_writes:
+                raise TaskLiteError(
+                    f"Recovery attempt for {rec.job_uid!r} must also update or remove its queue row"
+                )
+
+        with self._lock:
+            new_attempts = dict(self._attempts)
+            new_attempt_seq = self._attempt_seq
+
+            # 1. 复核遗留 running 执行身份并追加失败 Attempt（严格 append-only）
+            for rec in commit.recovery_attempts:
+                running = next(
+                    (item for item in self._queue if job_uid_from_snapshot(item) == rec.job_uid),
+                    None,
+                )
+                if running is None:
+                    raise TaskLiteError(
+                        f"Recovery target {rec.job_uid!r} is no longer present in queue"
+                    )
+                if (
+                    running.get("status"),
+                    running.get("run_id"),
+                    running.get("attempt_no"),
+                    queue_snapshot_execution_id(running),
+                ) != ("running", rec.run_id, rec.attempt_no, rec.execution_id):
+                    raise TaskLiteError(
+                        f"Recovery attempt does not match the running execution for {rec.job_uid!r}"
+                    )
+                if self._job_sequences.get(rec.job_uid, 0) != rec.attempt_no:
+                    raise TaskLiteError(
+                        f"Recovery attempt sequence mismatch for {rec.job_uid!r}"
+                    )
+                if any(
+                    attempt.get("job_uid") == rec.job_uid
+                    and attempt.get("attempt_no") == rec.attempt_no
+                    for attempt in new_attempts.values()
+                ):
+                    raise TaskLiteError(
+                        f"Execution for {rec.job_uid!r} attempt {rec.attempt_no} is already settled"
+                    )
+                new_attempts[new_attempt_seq] = {
+                    "attempt_id": new_attempt_seq,
+                    "job_uid": rec.job_uid,
+                    "attempt_no": rec.attempt_no,
+                    "run_id": rec.run_id,
+                    "outcome": "failure",
+                    "started_at": rec.started_at,
+                    "settled_at": rec.settled_at,
+                    "job": copy.deepcopy(rec.job_snapshot),
+                    "files": copy.deepcopy(rec.files),
+                    "result": copy.deepcopy(rec.result),
+                    "error_message": rec.error_message,
+                }
+                new_attempt_seq += 1
+
+            # 2. 按触碰 uid 构造新三表（未触碰行含遗留 running 原样保留）
+            touched_queue_uids = set(commit.queue_writes)
+            new_queue = [
+                j for j in self._queue if job_uid_from_snapshot(j) not in touched_queue_uids
+            ]
+            for uid, snap in commit.queue_writes.items():
+                if snap is not None:
+                    clean = public_queue_snapshot(snap)
+                    clean["status"] = "pending"
+                    clean["run_id"] = None
+                    clean["attempt_no"] = None
+                    clean["started_at"] = None
+                    new_queue.append(clean)
+
+            new_successes = dict(self._successes)
+            for uid, meta in commit.success_writes.items():
+                if meta is None:
+                    new_successes.pop(uid, None)
+                else:
+                    new_successes[uid] = copy.deepcopy(meta)
+
+            new_failed = dict(self._failed)
+            new_failure_payloads = dict(self._failure_payloads)
+            for uid, entry in commit.failed_writes.items():
+                if entry is None:
+                    new_failed.pop(uid, None)
+                    new_failure_payloads.pop(uid, None)
+                else:
+                    fail_meta, payload = entry
+                    new_failed[uid] = copy.deepcopy(fail_meta)
+                    if payload is not None:
+                        new_failure_payloads[uid] = copy.deepcopy(payload)
+                    else:
+                        new_failure_payloads.pop(uid, None)
+
+            # 3. 强制复核 successes ∩ failed == ∅ 不变式
+            overlap = new_successes.keys() & new_failed.keys()
+            if overlap:
+                sample = next(iter(sorted(overlap)))
+                raise TaskLiteError(
+                    f"Invariant conflict: job {sample!r} cannot exist in both successes and failed"
+                )
+
+            # 4. 一次性原子发布全部引用
+            self._attempts = new_attempts
+            self._attempt_seq = new_attempt_seq
+            self._queue = new_queue
             self._successes = new_successes
             self._failed = new_failed
             self._failure_payloads = new_failure_payloads
-            self._queue = new_queue
 
     @staticmethod
     def _snapshot_from_metadata(metadata: Any) -> dict[str, Any] | None:
@@ -261,27 +339,6 @@ class InMemoryStateBackend(AbstractStateBackend):
             for snapshot in self._queue:
                 known[job_uid_from_snapshot(snapshot)] = public_queue_snapshot(snapshot)
         return known
-
-    def clear_history(self, uid: str, records: set[str]) -> int:
-        """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""
-        total = 0
-        with self._lock:
-            if "successes" in records and uid in self._successes:
-                del self._successes[uid]
-                total += 1
-            if "failures" in records:
-                if uid in self._failed:
-                    del self._failed[uid]
-                    total += 1
-                self._failure_payloads.pop(uid, None)
-            if "attempts" in records:
-                initial = len(self._attempts)
-                self._attempts = {
-                    k: v for k, v in self._attempts.items()
-                    if v.get("job_uid") != uid
-                }
-                total += initial - len(self._attempts)
-        return total
 
     def get_cursor(self, key: str) -> str | None:
         """查询单个游标的最新已提交值，不存在返回 None。"""
@@ -364,7 +421,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             return self._job_sequences.get(job_uid, 0)
 
     def load_consistent_snapshot(self) -> dict[str, Any]:
-        """在单锁内原子捕获一致内存状态快照供 StateSnapshot 只读查询。"""
+        """在单锁内原子捕获一致内存状态快照供 StateSnapshot 与 EditTransaction 只读加载。"""
         with self._lock:
             return {
                 "queue_jobs": self.load_queue_jobs(),
@@ -374,6 +431,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 # attempts 单条记录入库时已深拷贝不可变，锁内仅浅拷贝外层列表以控制峰值内存；
                 # 查询输出的深拷贝隔离由 _MemorySnapshotReader._normalize_* 负责。
                 "attempts": list(self._attempts.values()),
+                "job_sequences": dict(self._job_sequences),
             }
 
     def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:

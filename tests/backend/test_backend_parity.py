@@ -4,7 +4,7 @@
 test_authorization_store.py 与 test_state_primitives.py 中的双后端等价部分：
 - 抽象契约集合锁定、替换集门卫与持久化分层红线；
 - 核心队列 CRUD、四态结算互斥、事务原子性与失败回滚；
-- attempt_no 单调推进（独立于 clear_history）；
+- attempt_no 单调推进（独立于档案移除）；
 - 游标校验、快照隔离与路径授权存储/基准规范化。
 """
 from __future__ import annotations
@@ -20,7 +20,9 @@ import pytest
 from tasklite import TaskLiteError, parse_job_uid
 from tasklite.backend import (
     AbstractStateBackend,
+    GraphEditCommit,
     InMemoryStateBackend,
+    RunningAttemptRecovery,
     SQLiteStateBackend,
 )
 from tasklite.backend.base import QUEUE_EXECUTION_ID_KEY, validate_queue_replacement
@@ -43,8 +45,8 @@ EXPECTED_ABSTRACT_METHODS = {
     "commit_job_failures",
     "commit_skip",
     "enqueue_jobs",
-    "apply_manual_status",
-    "clear_history",
+    "load_consistent_snapshot",
+    "commit_graph_edit",
     "get_cursor",
     "set_cursor",
     "load_latest_succeeded_finished_at",
@@ -315,7 +317,9 @@ class TestBackendCommitAtomicity:
     def test_bulk_failure_write_error_leaves_backend_unchanged(self, dual_backend):
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one"), _job_snapshot("two")])
-        b.apply_manual_status([("t::nine", "succeeded", _job_snapshot("nine"), None)])
+        b.commit_graph_edit(
+            GraphEditCommit(success_writes={"t::nine": {"job_snapshot": _job_snapshot("nine")}})
+        )
         before = _snapshot(b)
 
         with pytest.raises((ValueError, TypeError)):
@@ -356,40 +360,107 @@ class TestBackendCommitAtomicity:
 # ── 管理状态切换与游标对齐 ────────────────────────────────────────────
 
 
-class TestApplyManualStatusClearHistoryAndCursors:
-    """apply_manual_status、clear_history 与 set_cursor 双腿对齐。"""
+class TestGraphEditCommitAndCursors:
+    """commit_graph_edit、load_consistent_snapshot 与 set_cursor 双腿对齐。"""
 
-    def test_apply_manual_status_succeeded_failed_and_pending(self, dual_backend):
+    def test_commit_graph_edit_three_tables_and_untouched_preservation(self, dual_backend):
         b = dual_backend
         snap_a = _job_snapshot("a")
         snap_b = _job_snapshot("b")
         snap_c = _job_snapshot("c")
         b.enqueue_jobs([snap_a, snap_b, snap_c])
+        b.mark_job_running(
+            "t::c",
+            execution_id="run_keep.1",
+            run_id="run_keep",
+            started_at="2026-05-01T00:00:00Z",
+        )
 
-        b.apply_manual_status([("t::a", "succeeded", snap_a, {"annotations": {"completion_source": "manual"}})])
+        # 仅触碰 a/b，未触碰的遗留 running 行 c 保持原状
+        b.commit_graph_edit(
+            GraphEditCommit(
+                queue_writes={"t::a": None, "t::b": None},
+                success_writes={
+                    "t::a": {"job_snapshot": snap_a, "annotations": {"completion_source": "manual"}},
+                },
+                failed_writes={
+                    "t::b": ({"job_snapshot": snap_b, "note": "测试失败"}, {"k": "v"}),
+                },
+            )
+        )
         assert "t::a" not in _queue_uids(b)
         assert b.load_successes()["t::a"]["annotations"]["completion_source"] == "manual"
-
-        b.apply_manual_status([("t::b", "failed", snap_b, {"note": "测试失败", "annotations": {"completion_source": "manual"}})])
-        assert "t::b" not in _queue_uids(b)
         assert b.load_failed()["t::b"]["note"] == "测试失败"
+        assert b.load_failure_payloads()["t::b"] == {"k": "v"}
+        q_rows = b.load_queue_jobs()
+        assert len(q_rows) == 1 and q_rows[0]["job_uid"] == "t::c" and q_rows[0]["status"] == "running"
 
-        b.apply_manual_status([("t::a", "pending", snap_a, None), ("t::b", "pending", snap_b, None)])
+        # 切回 pending 并补写遗留 running 失败 Attempt
+        rec = RunningAttemptRecovery(
+            job_uid="t::c",
+            attempt_no=1,
+            execution_id="run_keep.1",
+            run_id="run_keep",
+            started_at=None,
+            settled_at="2026-05-01T00:01:00Z",
+            job_snapshot=snap_c,
+            files={},
+            result={"message": "unsettled", "exception": None, "metadata": {}, "annotations": {}},
+            error_message="unsettled",
+        )
+        b.commit_graph_edit(
+            GraphEditCommit(
+                queue_writes={"t::a": snap_a, "t::b": snap_b, "t::c": None},
+                success_writes={"t::a": None},
+                failed_writes={"t::b": None, "t::c": ({"job_snapshot": snap_c}, None)},
+                recovery_attempts=(rec,),
+            )
+        )
         assert "t::a" not in b.load_successes()
         assert "t::b" not in b.load_failed()
-        assert set(_queue_uids(b)) == {"t::a", "t::b", "t::c"}
+        assert "t::c" in b.load_failed()
+        assert _queue_uids(b) == ["t::a", "t::b"]
+        atts = b.load_settled_attempts("t::c")
+        assert len(atts) == 1 and atts[0]["outcome"] == "failure" and atts[0]["attempt_no"] == 1
 
-    def test_clear_history_parity(self, dual_backend):
+        # load_consistent_snapshot 包含 job_sequences 与完整 6 字段
+        consistent = b.load_consistent_snapshot()
+        assert set(consistent) == {
+            "queue_jobs", "successes", "failed", "failure_payloads", "attempts", "job_sequences",
+        }
+        assert consistent["job_sequences"]["t::c"] == 1
+
+    def test_commit_graph_edit_rejects_overlap_and_rolls_back_on_fault(self, dual_backend):
         b = dual_backend
-        snap = _job_snapshot("hist")
-        b.apply_manual_status([("t::hist", "succeeded", snap, None)])
-        assert b.clear_history("t::hist", records=["successes"]) == 1
-        assert "t::hist" not in b.load_successes()
+        snap = _job_snapshot("x")
+        b.enqueue_jobs([snap])
+        before = _state_facts(b)
 
-        b.apply_manual_status([("t::hist", "failed", snap, None)])
-        assert b.clear_history("t::hist", records=["failures"]) == 1
-        assert "t::hist" not in b.load_failed()
-        assert b.clear_history("t::hist", records=["successes", "failures"]) == 0
+        with pytest.raises(TaskLiteError, match="both successes and failed"):
+            b.commit_graph_edit(
+                GraphEditCommit(
+                    queue_writes={"t::x": None},
+                    success_writes={"t::x": {"job_snapshot": snap}},
+                    failed_writes={"t::x": ({"job_snapshot": snap}, None)},
+                )
+            )
+        assert _state_facts(b) == before
+
+        with pytest.raises((ValueError, TypeError)):
+            b.commit_graph_edit(
+                GraphEditCommit(
+                    queue_writes={"t::x": None},
+                    success_writes={"t::x": {"bad": _UncommittableMeta()}},
+                )
+            )
+        assert _state_facts(b) == before
+
+    def test_backend_has_no_attempts_deletion_path(self, dual_backend):
+        assert not hasattr(dual_backend, "clear_history")
+        assert not hasattr(dual_backend, "apply_manual_status")
+        for source in sorted(BACKEND_PACKAGE_DIR.glob("*.py")):
+            text = source.read_text(encoding="utf-8")
+            assert "DELETE FROM attempts" not in text
 
     @pytest.mark.parametrize("key,value", [(None, "v"), ("k", 123), ("", "v")])
     def test_cursor_bad_types_rejected_zero_write(self, dual_backend, key, value):
@@ -692,7 +763,7 @@ class TestStatePrimitivesAndAttemptSequence:
         assert backend.load_settled_attempts("t::parent")[0] == first
 
     @pytest.mark.parametrize("snapshot_attempt_no", [999, -7])
-    def test_cleaning_history_and_attempts_preserves_attempt_sequence(
+    def test_removing_archive_preserves_attempts_and_attempt_sequence(
         self, dual_backend, snapshot_attempt_no
     ):
         b = dual_backend
@@ -709,9 +780,10 @@ class TestStatePrimitivesAndAttemptSequence:
             settled_at="2026-11-08T00:00:01Z",
             success_metadata={"status": "ok"},
         )
-        assert b.clear_history(job_uid, {"successes", "attempts"}) == 2
+        b.commit_graph_edit(GraphEditCommit(success_writes={job_uid: None}))
         assert job_uid not in b.load_successes()
-        assert b.load_settled_attempts(job_uid) == []
+        # attempts 严格 append-only 不可删除，job_sequences 亦永不重置
+        assert len(b.load_settled_attempts(job_uid)) == 1
         assert b.get_attempt_sequence(job_uid) == 1
         assert b.load_queue() == [] and b.load_successes() == {} and b.load_failed() == {}
 

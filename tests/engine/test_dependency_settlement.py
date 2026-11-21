@@ -63,9 +63,14 @@ def test_cleared_manual_success_settles_dependency_as_missing(tmp_path):
         pipeline.run(install_signals=False)
     with StateSnapshot.open(pipeline) as snap:
         assert len(list(snap.iter_attempts(job_uid="source::prior"))) == 1
-    pipeline.set_job_status(Job("source", "up"), "succeeded", recursive=False)
+    from tasklite.backend.base import GraphEditCommit
+
+    with pipeline.edit(dry_run=False) as tx:
+        tx.add(Job("source", "up"), status="succeeded")
     assert pipeline.enqueue(Job("dependent", "down", depends_on=["source::up"])) is True
-    pipeline.clear_history("source::up", records=["successes"])
+    pipeline._runtime.store.backend.commit_graph_edit(
+        GraphEditCommit(success_writes={"source::up": None})
+    )
 
     with in_process_workers(pipeline):
         pipeline.run(install_signals=False)
@@ -90,10 +95,15 @@ def test_missing_dependency_settles_while_unrelated_worker_is_in_flight(tmp_path
     pipeline.register_task("source", _succeed)
     pipeline.register_task("dependent", _succeed)
     pipeline.enqueue(Job("blocking", "unrelated", payload={"output_dir": str(output)}))
-    pipeline.set_job_status(Job("source", "up"), "succeeded", recursive=False)
+    from tasklite.backend.base import GraphEditCommit
+
+    with pipeline.edit(dry_run=False) as tx:
+        tx.add(Job("source", "up"), status="succeeded")
     pipeline.enqueue(Job("dependent", "gap", depends_on=["source::up"]))
     pipeline.enqueue(Job("dependent", "down", depends_on=["dependent::gap"]))
-    pipeline.clear_history("source::up", records=["successes"])
+    pipeline._runtime.store.backend.commit_graph_edit(
+        GraphEditCommit(success_writes={"source::up": None})
+    )
 
     errors = []
 

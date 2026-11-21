@@ -169,15 +169,18 @@ def _unexpected_handler(job, ctx):
 
 @pytest.mark.parametrize("operation", ["pre_failure", "running"])
 def test_predispatch_database_fault_propagates_without_attempt(tmp_path, monkeypatch, operation):
+    from tasklite.backend.base import GraphEditCommit
+
     path = tmp_path / "state.db"
     with TaskLite(backend="sqlite", state_path=path) as pipeline:
         pipeline.register_task("work", _unexpected_handler)
         upstream = Job("work", "upstream")
-        pipeline.set_job_status(upstream, "succeeded", recursive=False)
+        with pipeline.edit(dry_run=False) as tx:
+            tx.add(upstream, status="succeeded")
         pipeline.enqueue(Job("work", "downstream", depends_on=[upstream.uid]))
-        if operation == "pre_failure":
-            pipeline.clear_history(upstream.uid, records=["successes"])
         backend = pipeline._runtime.store.backend
+        if operation == "pre_failure":
+            backend.commit_graph_edit(GraphEditCommit(success_writes={upstream.uid: None}))
         with backend._get_conn() as connection:
             action = ("BEFORE INSERT ON failed" if operation == "pre_failure"
                       else "BEFORE UPDATE ON queue WHEN NEW.status = 'running'")

@@ -156,7 +156,7 @@ class TestTrustedLastSucceededAtUs:
     """可信成功基线查询（trusted_last_succeeded_at_us）判定矩阵。"""
 
 
-    def test_clear_history_then_seed_rejects_old_attempts_row(self):
+    def test_removed_success_then_seed_rejects_old_attempts_row(self):
         store, state, backend = _make_store()
         aid = _start_execution(backend, "t::1")
         store.apply_success("t::1", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **aid, finished_at="2026-05-01T00:00:05+00:00")

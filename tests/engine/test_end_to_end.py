@@ -167,7 +167,8 @@ class TestEndToEnd:
             assert [e["job_uid"] for e in entries] == ["work::item_eps"]
             assert entries[0]["job"]["payload"]["k"] == "v"
 
-        p.set_job_status("work::item_eps", "pending", recursive=False)
+        with p.edit(dry_run=False) as tx:
+            tx.set_status("work::item_eps", "pending", recursive=False)
         with StateSnapshot.open(p) as snap:
             assert list(snap.iter_jobs(status="failed")) == []
 

@@ -51,7 +51,8 @@ def _blocked_management_worker(
         app.register_task("work", _dummy_handler)
         ready.set()
         try:
-            app.set_job_status("work::a", "succeeded", recursive=False)
+            with app.edit(dry_run=False) as tx:
+                tx.set_status("work::a", "failed", recursive=False)
         except BaseException as exc:
             Path(result_path).write_text(type(exc).__name__, encoding="utf-8")
         else:
@@ -60,10 +61,10 @@ def _blocked_management_worker(
         app.close()
 
 
-class TestSetJobStatus:
-    """人工三态、递归闭包与异常原子性。"""
+class TestEditStatusAndAtomicity:
+    """图修整事务状态流转、递归闭包与异常原子性。"""
 
-    @pytest.mark.parametrize("target_status", ["pending", "succeeded", "failed"])
+    @pytest.mark.parametrize("target_status", ["pending", "failed"])
     def test_recursive_three_level_chain_is_symmetric(self, app, target_status):
         jobs = [
             Job("work", "a"),
@@ -73,11 +74,13 @@ class TestSetJobStatus:
         for job in jobs:
             assert app.enqueue(job)
 
-        app.set_job_status("work::a", "succeeded", recursive=False)
-        app.set_job_status("work::b", "failed", recursive=False)
-        app.set_job_status("work::c", "succeeded", recursive=False)
+        with app.edit(dry_run=False) as tx:
+            tx.replace("work::a", jobs[0], status="succeeded")
+            tx.set_status("work::b", "failed", recursive=False)
+            tx.replace("work::c", jobs[2], status="succeeded")
 
-        app.set_job_status("work::a", target_status, recursive=True)
+        with app.edit(dry_run=False) as tx:
+            tx.set_status("work::a", target_status, recursive=True)
 
         assert [_status(app, job.uid)["status"] for job in jobs] == [
             target_status,
@@ -87,23 +90,6 @@ class TestSetJobStatus:
         with StateSnapshot.open(app) as snapshot:
             assert list(snapshot.iter_attempts()) == []
 
-    def test_history_only_downstream_is_included(self, app):
-        parent = Job("work", "parent")
-        child = Job("work", "child", depends_on=["work::parent"])
-        app.enqueue(parent)
-        app.enqueue(child)
-        app.run()
-
-        before_attempts = len(list(_snapshot_attempts(app)))
-        deleted = app.clear_history("work::child", records=["successes"])
-        assert deleted == 1
-
-        app.set_job_status("work::parent", "failed", recursive=True)
-
-        assert _status(app, "work::parent")["status"] == "failed"
-        assert _status(app, "work::child")["status"] == "failed"
-        assert len(list(_snapshot_attempts(app))) == before_attempts
-
     def test_snapshot_read_failure_aborts_without_mutation(self, app, monkeypatch):
         app.enqueue(Job("work", "a"))
 
@@ -112,51 +98,40 @@ class TestSetJobStatus:
 
         monkeypatch.setattr(
             app._runtime.store.backend,
-            "load_known_job_snapshots",
+            "load_consistent_snapshot",
             fail_read,
         )
         with pytest.raises(OSError, match="snapshot unavailable"):
-            app.set_job_status(Job("work", "a"), "failed", recursive=True)
+            with app.edit(dry_run=False) as tx:
+                tx.set_status("work::a", "failed", recursive=True)
 
         monkeypatch.undo()
         assert _status(app, "work::a")["status"] == "pending"
 
-    def test_unknown_uid_and_conflicting_configuration_raise_public_error(self, app):
-        with pytest.raises(TaskLiteError, match="No existing snapshot found"):
-            app.set_job_status("work::missing", "succeeded", recursive=False)
+    def test_unknown_uid_and_duplicate_add_raise_public_error(self, app):
+        with pytest.raises(TaskLiteError, match="does not exist"):
+            with app.edit(dry_run=False) as tx:
+                tx.set_status("work::missing", "failed", recursive=False)
 
-        app.set_job_status(
-            Job("work", "same", payload={"version": 1}),
-            "succeeded",
-            recursive=False,
-        )
-        with pytest.raises(TaskLiteError, match="configuration conflict"):
-            app.set_job_status(
-                Job("work", "same", payload={"version": 2}),
-                "succeeded",
-                recursive=False,
-            )
+        with app.edit(dry_run=False) as tx:
+            tx.add(Job("work", "same", payload={"version": 1}), status="succeeded")
+
+        with pytest.raises(TaskLiteError, match="already exists"):
+            with app.edit(dry_run=False) as tx:
+                tx.add(Job("work", "same", payload={"version": 2}), status="succeeded")
 
     def test_invalid_arguments_are_rejected(self, app):
-        with pytest.raises(TaskLiteError, match="status must be one of"):
-            app.set_job_status(
-                Job("work", "a"),
-                "invalid",  # type: ignore[arg-type]
-                recursive=False,
-            )
-        with pytest.raises(TaskLiteError, match="recursive must be a bool"):
-            app.set_job_status(
-                Job("work", "a"),
-                "succeeded",
-                recursive="yes",  # type: ignore[arg-type]
-            )
+        with pytest.raises(TaskLiteError, match="dry_run must be a bool"):
+            app.edit(dry_run="yes")  # type: ignore[arg-type]
         with pytest.raises(TaskLiteError, match="note must be a str or None"):
-            app.set_job_status(
-                Job("work", "a"),
-                "succeeded",
-                recursive=False,
-                note=123,  # type: ignore[arg-type]
-            )
+            app.edit(note=123)  # type: ignore[arg-type]
+
+        app.enqueue(Job("work", "a"))
+        with app.edit(dry_run=True) as tx:
+            with pytest.raises(TaskLiteError, match="set_status"):
+                tx.set_status("work::a", "succeeded", recursive=False)  # type: ignore[arg-type]
+            with pytest.raises(TaskLiteError, match="recursive must be a bool"):
+                tx.set_status("work::a", "failed", recursive="yes")  # type: ignore[arg-type]
 
     def test_sqlite_apply_abort_rolls_back_entire_recursive_batch(
         self,
@@ -183,7 +158,8 @@ class TestSetJobStatus:
 
             monkeypatch.setattr(sqlite_backend_module, "dumps", abort_third_dump)
             with pytest.raises(RuntimeError, match="injected SQLite abort"):
-                app.set_job_status("work::a", "failed", recursive=True)
+                with app.edit(dry_run=False) as tx:
+                    tx.set_status("work::a", "failed", recursive=True)
             monkeypatch.undo()
 
             with StateSnapshot.open(app) as snapshot:
@@ -235,68 +211,75 @@ class TestCursor:
             app.close()
 
 
-class TestClearHistory:
-    """清除所选历史不触碰队列、游标或编号进度。"""
+class TestEditRemoveAndSequence:
+    """移除所选分区条目不触碰队列（未选时）、游标、attempts 或编号进度。"""
 
     def test_sqlite_cross_table_delete_rolls_back_on_trigger_error(self, tmp_path):
         app = _make_app("sqlite", tmp_path)
         try:
             app.enqueue(Job("work", "item"))
             app.run()
+            app.enqueue(Job("work", "other"))
             assert app._state_path is not None
             with sqlite3.connect(app._state_path) as conn:
                 conn.execute(
-                    "CREATE TRIGGER reject_attempt_clear "
-                    "BEFORE DELETE ON attempts "
+                    "CREATE TRIGGER reject_success_delete "
+                    "BEFORE DELETE ON successes "
                     "WHEN OLD.job_uid = 'work::item' "
                     "BEGIN "
-                    "SELECT RAISE(ABORT, 'injected attempts delete failure'); "
+                    "SELECT RAISE(ABORT, 'injected successes delete failure'); "
                     "END"
                 )
 
             with pytest.raises(
-                sqlite3.IntegrityError, match="injected attempts delete failure"
+                sqlite3.IntegrityError, match="injected successes delete failure"
             ):
-                app.clear_history(
-                    "work::item", records=["successes", "attempts"]
-                )
+                with app.edit(dry_run=False) as tx:
+                    tx.remove("work::other", entries=("queue",), recursive=False)
+                    tx.remove("work::item", entries=("successes",), recursive=False)
 
             with StateSnapshot.open(app) as snapshot:
                 job = snapshot.get_job("work::item")
                 assert job is not None and job["status"] == "succeeded"
+                other = snapshot.get_job("work::other")
+                assert other is not None and other["status"] == "pending"
                 assert len(list(snapshot.iter_attempts(job_uid="work::item"))) == 1
         finally:
             app.close()
 
-    def test_granular_clear_preserves_other_facts_and_sequence(self, app):
+    def test_granular_remove_preserves_attempts_cursors_and_sequence(self, app):
         app.set_cursor("cursor", "value")
         app.enqueue(Job("work", "item"))
         app.run()
         first_attempt_no = next(iter(_snapshot_attempts(app)))["attempt_no"]
 
-        deleted = app.clear_history("work::item", records=["successes", "attempts"])
-        assert deleted == 2
+        with app.edit(dry_run=False) as tx:
+            deleted = tx.remove("work::item", entries=("successes",), recursive=False)
+        assert deleted == 1
         assert app.get_cursor("cursor") == "value"
         with StateSnapshot.open(app) as snapshot:
-            assert list(snapshot.iter_attempts()) == []
+            # attempts 严格 append-only，不受 remove 影响
+            assert len(list(snapshot.iter_attempts(job_uid="work::item"))) == 1
             assert list(snapshot.iter_jobs(status="succeeded")) == []
 
         app.enqueue(Job("work", "item"))
         app.run()
-        second_attempt_no = next(iter(_snapshot_attempts(app)))["attempt_no"]
-        assert second_attempt_no > first_attempt_no
+        attempts = list(_snapshot_attempts(app))
+        assert [a["attempt_no"] for a in attempts] == [first_attempt_no, first_attempt_no + 1]
 
     def test_validation_is_stable(self, app):
-        for records, error, match in (
-            ([], TaskLiteError, "records must not be empty"),
-            (["unknown"], TaskLiteError, "unknown target"),
-        ):
-            with pytest.raises(error, match=match):
-                app.clear_history("work::item", records=records)  # type: ignore[arg-type]
-        with pytest.raises(TaskLiteError, match="uid"):
-            app.clear_history("", records=["successes"])
-        with pytest.raises(TaskLiteError, match="canonical"):
-            app.clear_history("bad_uid", records=["successes"])
+        with app.edit(dry_run=True) as tx:
+            for entries, error, match in (
+                ([], TaskLiteError, "entries must not be empty"),
+                (["unknown"], TaskLiteError, "unknown or forbidden"),
+                (["attempts"], TaskLiteError, "unknown or forbidden"),
+            ):
+                with pytest.raises(error, match=match):
+                    tx.remove("work::item", entries=entries, recursive=False)  # type: ignore[arg-type]
+            with pytest.raises(TaskLiteError, match="uid"):
+                tx.remove("", entries=("successes",), recursive=False)
+            with pytest.raises(TaskLiteError, match="canonical"):
+                tx.remove("bad_uid", entries=("successes",), recursive=False)
 
 
 class TestManagementAuthorizationSurface:
@@ -355,8 +338,9 @@ class TestCrossProcessManagementMutex:
 
             release_lock(fd)
             fd = None
-            app.set_job_status("work::a", "succeeded", recursive=False)
-            assert _status(app, "work::a")["status"] == "succeeded"
+            with app.edit(dry_run=False) as tx:
+                tx.set_status("work::a", "failed", recursive=False)
+            assert _status(app, "work::a")["status"] == "failed"
         finally:
             if fd is not None:
                 release_lock(fd)

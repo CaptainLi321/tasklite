@@ -166,8 +166,8 @@ def test_authorization_waiting_and_failure_cascade(tmp_path, monkeypatch):
     app.close()
 
 
-def test_clear_history_and_monotonic_sequence(tmp_path):
-    """清理历史档案不重置计数器，二次执行延续单调递增编号。"""
+def test_remove_archive_preserves_attempts_and_monotonic_sequence(tmp_path):
+    """移除终态档案不删除 append-only attempts、不重置计数器，二次执行延续单调递增编号。"""
     db_path = tmp_path / "seq.db"
     app = TaskLite(backend="sqlite", state_path=db_path)
     app.register_task(Task("work", _succeed_handler))
@@ -183,10 +183,11 @@ def test_clear_history_and_monotonic_sequence(tmp_path):
         first_attempt_no = attempts[0]["attempt_no"]
         assert first_attempt_no == 1
 
-    assert app.clear_history("work::item1", records=["successes", "attempts"]) >= 1
+    with app.edit(dry_run=False) as tx:
+        assert tx.remove("work::item1", entries=("successes",), recursive=False) == 1
     with StateSnapshot.open(db_path) as snap:
         assert snap.get_job("work::item1") is None
-        assert list(snap.iter_attempts(job_uid="work::item1")) == []
+        assert len(list(snap.iter_attempts(job_uid="work::item1"))) == 1
 
     app.enqueue(Job("work", "item1", payload={"n": 2}))
     with in_process_workers(app):
@@ -195,8 +196,8 @@ def test_clear_history_and_monotonic_sequence(tmp_path):
     with StateSnapshot.open(db_path) as snap:
         assert snap.get_job("work::item1")["status"] == "succeeded"
         new_attempts = list(snap.iter_attempts(job_uid="work::item1"))
-        assert len(new_attempts) == 1
-        assert new_attempts[0]["attempt_no"] == 2 > first_attempt_no
+        assert [a["attempt_no"] for a in new_attempts] == [1, 2]
+        assert new_attempts[-1]["attempt_no"] == 2 > first_attempt_no
     app.close()
 
 

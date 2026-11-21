@@ -120,11 +120,15 @@ def test_startup_rejects_running_execution_id_mismatch(tmp_path):
 
 
 def test_startup_terminal_overlap_is_a_conflict(tmp_path):
+    from tasklite.backend.base import GraphEditCommit
+
     db_path = tmp_path / "overlap.db"
     backend = SQLiteStateBackend(db_path)
-    backend.apply_manual_status([
-        ("t::overlap", "succeeded", Job("t", "overlap").to_dict(), None),
-    ])
+    backend.commit_graph_edit(
+        GraphEditCommit(
+            success_writes={"t::overlap": {"job_snapshot": Job("t", "overlap").to_dict()}},
+        )
+    )
     with sqlite3.connect(db_path) as conn:
         conn.execute("INSERT INTO failed (job_uid, metadata) VALUES (?, ?)",
                      ("t::overlap", '{"error_message": "conflict"}'))

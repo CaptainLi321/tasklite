@@ -219,7 +219,8 @@ class TestStrictJsonValidationMatrix:
                     if intake == "enqueue":
                         pipeline.enqueue(job)
                     else:
-                        pipeline.set_job_status(job, "succeeded", recursive=False)
+                        with pipeline.edit(dry_run=False) as tx:
+                            tx.add(job, status="succeeded")
             with StateSnapshot.open(pipeline) as snapshot:
                 assert list(snapshot.iter_jobs()) == []
                 assert list(snapshot.iter_attempts()) == []
@@ -277,8 +278,10 @@ class TestStrictJsonValidationMatrix:
         with TaskLite(backend=backend, state_path=tmp_path / "manual.db") as pipeline:
             pipeline.register_task("t", _accept_payload)
             job = Job("t", "manual", payload=expected)
-            pipeline.set_job_status(job, "succeeded", recursive=False)
-            pipeline.set_job_status(Job("t", "manual", payload=expected), "succeeded", recursive=False)
+            with pipeline.edit(dry_run=False) as tx:
+                tx.add(job, status="succeeded")
+            with pipeline.edit(dry_run=False) as tx:
+                tx.replace(job.uid, Job("t", "manual", payload=expected), status="succeeded")
             job.payload["items"].clear()
             with StateSnapshot.open(pipeline) as snapshot:
                 row = snapshot.get_job(job.uid)
@@ -351,7 +354,11 @@ class TestStrictJsonValidationMatrix:
                 assert reloaded is not None and reloaded["result"]["metadata"] == expected
 
             for status in ("failed", "succeeded", "pending"):
-                pipeline.set_job_status(job.uid, status, recursive=False, note="人工说明")
+                with pipeline.edit(dry_run=False, note="人工说明") as tx:
+                    if status == "succeeded":
+                        tx.replace(job.uid, job, status="succeeded")
+                    else:
+                        tx.set_status(job.uid, status, recursive=False)
                 with StateSnapshot.open(pipeline) as snapshot:
                     row = snapshot.get_job(job.uid)
                     assert row is not None

@@ -268,9 +268,17 @@ class TestMainSurfaceExports:
             "on_run_start",
             "on_attempt_finished",
             "on_run_end",
+            "set_job_status",
+            "clear_history",
         ]
         for method_name in deleted_methods:
             assert not hasattr(TaskLite, method_name), f"TaskLite 不应暴露已删除方法 {method_name}"
+        assert hasattr(TaskLite, "edit")
+        from tasklite.edit import EditTransaction
+        assert isinstance(EditTransaction, type)
+        import tasklite as tasklite_pkg
+        assert "EditTransaction" not in tasklite_pkg.__all__
+        assert not hasattr(tasklite_pkg, "EditTransaction")
 
     def test_tasklite_internal_attributes_not_exposed(self):
         from tasklite import TaskLite
@@ -314,12 +322,12 @@ class TestMainSurfaceExports:
         )
         assert init_params["backend"].default is inspect.Parameter.empty
 
-        clear_params = inspect.signature(TaskLite.clear_history).parameters
-        assert clear_params["records"].kind is inspect.Parameter.KEYWORD_ONLY
-
-        status_params = inspect.signature(TaskLite.set_job_status).parameters
-        assert status_params["recursive"].kind is inspect.Parameter.KEYWORD_ONLY
-        assert status_params["recursive"].default is inspect.Parameter.empty
+        edit_params = inspect.signature(TaskLite.edit).parameters
+        assert list(edit_params) == ["self", "dry_run", "note"]
+        assert edit_params["dry_run"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert edit_params["dry_run"].default is True
+        assert edit_params["note"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert edit_params["note"].default is None
 
         grant_params = inspect.signature(TaskLite.grant_authorization).parameters
         assert list(grant_params) == ["self", "path", "target_type"]

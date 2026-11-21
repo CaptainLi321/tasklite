@@ -226,11 +226,18 @@ class TestDedupGate:
     """预检关 1——去重与 trigger 放行。"""
 
     def test_wall_hit_without_rerun_skips(self, tmp_path):
+        from tasklite.backend.base import GraphEditCommit
+
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         env.store.state.pop_job(0)
-        env.store.set_job_status("t::j1", "succeeded", recursive=False)
+        env.store.apply_graph_edit(
+            GraphEditCommit(
+                queue_writes={"t::j1": None},
+                success_writes={"t::j1": {"job_snapshot": Job("t", "j1").to_dict()}},
+            )
+        )
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
 
         outcome = env.dispatch.dispatch_next()
@@ -386,13 +393,20 @@ class TestGateOrderContract:
 
     def test_dep_failed_takes_precedence_over_dedup(self, tmp_path):
         """带失败依赖的作业优先判定为依赖失败，不得借旧成功跳过。"""
+        from tasklite.backend.base import GraphEditCommit
+
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.backend.commit_job_failure("dead::parent", {"error_message": "dead"})
         env.store.state.mark_failed("dead::parent", {"error_message": "dead"})
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         env.store.state.pop_job(0)
-        env.store.set_job_status("t::j1", "succeeded", recursive=False)
+        env.store.apply_graph_edit(
+            GraphEditCommit(
+                queue_writes={"t::j1": None},
+                success_writes={"t::j1": {"job_snapshot": Job("t", "j1").to_dict()}},
+            )
+        )
         env.store.state.spawn_jobs([
             Job("t", "j1", depends_on=["dead::parent"]).to_dict()
         ])

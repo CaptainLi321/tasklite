@@ -6,6 +6,8 @@
 """
 from .base import (
     AbstractStateBackend,
+    GraphEditCommit,
+    RunningAttemptRecovery,
     validate_queue_replacement,
 )
 from .memory import InMemoryStateBackend
@@ -13,7 +15,9 @@ from .sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
 
 __all__ = [
     "AbstractStateBackend",
+    "GraphEditCommit",
     "InMemoryStateBackend",
+    "RunningAttemptRecovery",
     "SQLiteStateBackend",
     "TARGET_SCHEMA_VERSION",
     "validate_queue_replacement",

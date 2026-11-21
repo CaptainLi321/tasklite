@@ -15,6 +15,8 @@ from typing import Any, Literal, Mapping, Sequence, cast
 
 from .base import (
     AbstractStateBackend,
+    GraphEditCommit,
+    RunningAttemptRecovery,
     execution_id_matches_run,
     public_queue_snapshot,
     queue_snapshot_execution_id,
@@ -467,50 +469,232 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     # 管理写与查询 -------------------------------------------------------
 
-    def apply_manual_status(
-        self,
-        updates: Sequence[tuple[str, str, dict[str, Any], dict[str, Any] | None]],
-    ) -> None:
-        """批量原子应用人工状态变更 (job_uid, status, snapshot, metadata)。"""
-        if not updates:
+    def load_consistent_snapshot(self) -> dict[str, Any]:
+        """在单一只读事务内原子捕获全部核心表一致快照（含 job_sequences）。"""
+        if not self.path.exists():
+            return {
+                "queue_jobs": [],
+                "successes": {},
+                "failed": {},
+                "failure_payloads": {},
+                "attempts": [],
+                "job_sequences": {},
+            }
+        conn = sqlite3.connect(self.path, isolation_level=None, timeout=30.0)
+        try:
+            conn.execute("BEGIN")
+            queue_rows: list[dict[str, Any]] = []
+            for row in conn.execute(
+                "SELECT job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at "
+                "FROM queue ORDER BY queue_position ASC"
+            ):
+                stored_job = loads(row[2])
+                if not isinstance(stored_job, dict):
+                    raise RuntimeError(f"Corrupted queue job_snapshot for {row[0]!r}")
+                queue_rows.append({
+                    "job_uid": row[0],
+                    "queue_position": row[1],
+                    "job": public_queue_snapshot(stored_job),
+                    "status": row[3],
+                    "execution_id": queue_snapshot_execution_id(stored_job),
+                    "run_id": row[4],
+                    "attempt_no": row[5],
+                    "started_at": row[6],
+                })
+
+            successes = {
+                row[0]: loads(row[1])
+                for row in conn.execute("SELECT job_uid, metadata FROM successes")
+            }
+
+            failed: dict[str, dict[str, Any]] = {}
+            failure_payloads: dict[str, dict[str, Any]] = {}
+            for row in conn.execute("SELECT job_uid, metadata, payload FROM failed"):
+                failed[row[0]] = loads(row[1])
+                if row[2] is not None:
+                    failure_payloads[row[0]] = loads(row[2])
+
+            attempts: list[dict[str, Any]] = []
+            for row in conn.execute(
+                "SELECT attempt_id, job_uid, attempt_no, run_id, outcome, started_at, settled_at, "
+                "job_snapshot, files, result, error_message "
+                "FROM attempts ORDER BY attempt_id ASC"
+            ):
+                attempts.append({
+                    "attempt_id": row[0],
+                    "job_uid": row[1],
+                    "attempt_no": row[2],
+                    "run_id": row[3],
+                    "outcome": row[4],
+                    "started_at": row[5],
+                    "settled_at": row[6],
+                    "job": loads(row[7]) if row[7] else None,
+                    "files": loads(row[8]) if row[8] else None,
+                    "result": loads(row[9]) if row[9] else None,
+                    "error_message": row[10],
+                })
+
+            job_sequences = {
+                row[0]: row[1]
+                for row in conn.execute("SELECT job_uid, last_attempt_no FROM job_sequences")
+            }
+
+            return {
+                "queue_jobs": queue_rows,
+                "successes": successes,
+                "failed": failed,
+                "failure_payloads": failure_payloads,
+                "attempts": attempts,
+                "job_sequences": job_sequences,
+            }
+        finally:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            conn.close()
+
+    def commit_graph_edit(self, commit: GraphEditCommit) -> None:
+        """在单 BEGIN IMMEDIATE 事务内复核遗留 running 补写并按触碰 uid 精准更新三表（O(Δ)）。"""
+        if not isinstance(commit, GraphEditCommit):
+            raise TypeError(f"commit must be a GraphEditCommit, got {type(commit).__name__}")
+        if (
+            not commit.queue_writes
+            and not commit.success_writes
+            and not commit.failed_writes
+            and not commit.recovery_attempts
+        ):
             return
+
+        seen_recovery: set[str] = set()
+        for rec in commit.recovery_attempts:
+            if not isinstance(rec, RunningAttemptRecovery):
+                raise TypeError(
+                    f"recovery_attempts items must be RunningAttemptRecovery, got {type(rec).__name__}"
+                )
+            if rec.job_uid in seen_recovery:
+                raise TaskLiteError(
+                    f"Duplicate recovery attempt for running job {rec.job_uid!r}"
+                )
+            seen_recovery.add(rec.job_uid)
+            if rec.job_uid not in commit.queue_writes:
+                raise TaskLiteError(
+                    f"Recovery attempt for {rec.job_uid!r} must also update or remove its queue row"
+                )
+
         with self._get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            for job_uid, status, snapshot, metadata in updates:
-                if status == "pending":
-                    conn.execute("DELETE FROM successes WHERE job_uid = ?", (job_uid,))
-                    conn.execute("DELETE FROM failed WHERE job_uid = ?", (job_uid,))
-                    row = conn.execute(
-                        "SELECT queue_position FROM queue WHERE job_uid = ?", (job_uid,)
-                    ).fetchone()
-                    if row is not None:
-                        conn.execute(
-                            "UPDATE queue SET job_snapshot = ?, status = 'pending', run_id = NULL, attempt_no = NULL, started_at = NULL WHERE job_uid = ?",
-                            (dumps(snapshot), job_uid),
-                        )
-                    else:
-                        pos = self._queue_position_range(conn, 1, front=False)[0]
-                        conn.execute(
-                            "INSERT INTO queue (job_uid, queue_position, job_snapshot, status) VALUES (?, ?, ?, 'pending')",
-                            (job_uid, pos, dumps(snapshot)),
-                        )
-                elif status == "succeeded":
-                    conn.execute("DELETE FROM queue WHERE job_uid = ?", (job_uid,))
-                    conn.execute("DELETE FROM failed WHERE job_uid = ?", (job_uid,))
+
+            # 1. 复核遗留 running 执行身份并追加失败 Attempt（严格 append-only）
+            for rec in commit.recovery_attempts:
+                row = conn.execute(
+                    "SELECT status, run_id, attempt_no, job_snapshot FROM queue WHERE job_uid = ?",
+                    (rec.job_uid,),
+                ).fetchone()
+                if row is None:
+                    raise TaskLiteError(
+                        f"Recovery target {rec.job_uid!r} is no longer present in queue"
+                    )
+                stored_job = loads(row[3]) if row[3] else None
+                if (
+                    not isinstance(stored_job, dict)
+                    or row[:3] != ("running", rec.run_id, rec.attempt_no)
+                    or queue_snapshot_execution_id(stored_job) != rec.execution_id
+                ):
+                    raise TaskLiteError(
+                        f"Recovery attempt does not match the running execution for {rec.job_uid!r}"
+                    )
+                seq_row = conn.execute(
+                    "SELECT last_attempt_no FROM job_sequences WHERE job_uid = ?",
+                    (rec.job_uid,),
+                ).fetchone()
+                if seq_row is None or seq_row[0] != rec.attempt_no:
+                    raise TaskLiteError(
+                        f"Recovery attempt sequence mismatch for {rec.job_uid!r}"
+                    )
+                if conn.execute(
+                    "SELECT 1 FROM attempts WHERE job_uid = ? AND attempt_no = ?",
+                    (rec.job_uid, rec.attempt_no),
+                ).fetchone():
+                    raise TaskLiteError(
+                        f"Execution for {rec.job_uid!r} attempt {rec.attempt_no} is already settled"
+                    )
+                conn.execute(
+                    "INSERT INTO attempts ("
+                    "job_uid, attempt_no, run_id, outcome, started_at, settled_at, "
+                    "job_snapshot, files, result, error_message"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        rec.job_uid,
+                        rec.attempt_no,
+                        rec.run_id,
+                        "failure",
+                        rec.started_at,
+                        rec.settled_at,
+                        dumps(rec.job_snapshot) if rec.job_snapshot is not None else None,
+                        dumps(rec.files) if rec.files is not None else None,
+                        dumps(rec.result) if rec.result is not None else None,
+                        rec.error_message,
+                    ),
+                )
+
+            # 2. 按触碰 uid 精准更新 queue（先删后队尾顺序插入，未触碰行零扰动）
+            if commit.queue_writes:
+                conn.executemany(
+                    "DELETE FROM queue WHERE job_uid = ?",
+                    [(uid,) for uid in commit.queue_writes],
+                )
+                to_insert = [
+                    (uid, public_queue_snapshot(snap))
+                    for uid, snap in commit.queue_writes.items()
+                    if snap is not None
+                ]
+                if to_insert:
+                    positions = self._queue_position_range(conn, len(to_insert), front=False)
+                    conn.executemany(
+                        "INSERT INTO queue ("
+                        "job_uid, queue_position, job_snapshot, status, run_id, attempt_no, started_at"
+                        ") VALUES (?, ?, ?, 'pending', NULL, NULL, NULL)",
+                        [
+                            (uid, pos, dumps(snap))
+                            for (uid, snap), pos in zip(to_insert, positions)
+                        ],
+                    )
+
+            # 3. 按触碰 uid 精准更新 successes
+            for uid, meta in commit.success_writes.items():
+                if meta is None:
+                    conn.execute("DELETE FROM successes WHERE job_uid = ?", (uid,))
+                else:
                     conn.execute(
                         "INSERT OR REPLACE INTO successes (job_uid, metadata) VALUES (?, ?)",
-                        (job_uid, dumps(metadata or {})),
+                        (uid, dumps(meta)),
                     )
-                elif status == "failed":
-                    conn.execute("DELETE FROM queue WHERE job_uid = ?", (job_uid,))
-                    conn.execute("DELETE FROM successes WHERE job_uid = ?", (job_uid,))
-                    payload = snapshot.get("payload") or {}
+
+            # 4. 按触碰 uid 精准更新 failed
+            for uid, entry in commit.failed_writes.items():
+                if entry is None:
+                    conn.execute("DELETE FROM failed WHERE job_uid = ?", (uid,))
+                else:
+                    fail_meta, payload = entry
                     conn.execute(
                         "INSERT OR REPLACE INTO failed (job_uid, metadata, payload) VALUES (?, ?, ?)",
-                        (job_uid, dumps(metadata or {}), dumps(payload)),
+                        (
+                            uid,
+                            dumps(fail_meta),
+                            dumps(payload) if payload is not None else None,
+                        ),
                     )
-                else:
-                    raise ValueError(f"Unsupported manual status: {status!r}")
+
+            # 5. 提交前强制复核 successes ∩ failed == ∅ 不变式
+            overlap_row = conn.execute(
+                "SELECT s.job_uid FROM successes AS s "
+                "INNER JOIN failed AS f ON s.job_uid = f.job_uid LIMIT 1"
+            ).fetchone()
+            if overlap_row is not None:
+                raise TaskLiteError(
+                    f"Invariant conflict: job {overlap_row[0]!r} cannot exist in both successes and failed"
+                )
 
     @staticmethod
     def _snapshot_from_metadata(raw: str | None) -> dict[str, Any] | None:
@@ -588,24 +772,6 @@ class SQLiteStateBackend(AbstractStateBackend):
                 if isinstance(snapshot, dict):
                     known[uid] = public_queue_snapshot(snapshot)
         return known
-
-    def clear_history(self, uid: str, records: set[str]) -> int:
-        """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""
-        if not self.path.exists():
-            return 0
-        total = 0
-        with self._get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if "successes" in records:
-                cur = conn.execute("DELETE FROM successes WHERE job_uid = ?", (uid,))
-                total += cur.rowcount if cur.rowcount is not None else 0
-            if "failures" in records:
-                cur = conn.execute("DELETE FROM failed WHERE job_uid = ?", (uid,))
-                total += cur.rowcount if cur.rowcount is not None else 0
-            if "attempts" in records:
-                cur = conn.execute("DELETE FROM attempts WHERE job_uid = ?", (uid,))
-                total += cur.rowcount if cur.rowcount is not None else 0
-        return total
 
     def get_cursor(self, key: str) -> str | None:
         """查询单个游标的最新已提交值，不存在返回 None。"""

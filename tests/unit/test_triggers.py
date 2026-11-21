@@ -213,7 +213,8 @@ def test_input_contract_errors_and_untrusted_baseline(tmp_path):
 def test_failure_history_skipped_this_batch_allows_downstream():
     with TaskLite(backend="memory") as pipeline:
         pipeline.register_task("t", handle)
-        pipeline.set_job_status(Job("t", "a"), "failed", recursive=False, note="prior failure")
+        with pipeline.edit(dry_run=False, note="prior failure") as tx:
+            tx.add(Job("t", "a"), status="failed")
         seen = []
         pipeline.register_trigger("observe", lambda ctx: seen.append(ctx.job.uid) or False)
         pipeline.enqueue(Job("t", "a", trigger="observe"))

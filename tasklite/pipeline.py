@@ -9,11 +9,12 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Collection, Literal, Sequence
+from typing import Any, Callable, Literal
 
 from .backend.base import AbstractStateBackend
 from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
+from .edit import EditTransaction
 from .engine.admission import TriggerRegistry
 from .models.trigger import TriggerContext
 from .engine.channel import ExecutionChannel
@@ -339,31 +340,24 @@ class TaskLite:
 
     # ── 管理面（run() 外运维委托）──────────────────────────────────
 
-    def set_job_status(
+    def edit(
         self,
-        job_or_uid: Job | str,
-        status: Literal["pending", "succeeded", "failed"],
         *,
-        recursive: bool,
+        dry_run: bool = True,
         note: str | None = None,
-    ) -> None:
-        """人工设置作业状态（pending/succeeded/failed），限 Run 外。"""
-        self._ensure_active("set_job_status")
-        with exclusive_state_access(self._runtime.store.backend):
-            self._runtime.store.set_job_status(
-                job_or_uid, status, recursive=recursive, note=note
-            )
-
-    def clear_history(
-        self,
-        uid: str,
-        *,
-        records: Collection[Literal["successes", "failures", "attempts"]],
-    ) -> int:
-        """从指定档案和/或 Attempt 历史中删除单个 job 的记录，限 Run 外。"""
-        self._ensure_active("clear_history")
-        with exclusive_state_access(self._runtime.store.backend):
-            return self._runtime.store.clear_history(uid, records=records)
+    ) -> EditTransaction:
+        """进入 Run 外原子图修整事务上下文（默认 dry_run=True 预览，显式 dry_run=False 落盘）。"""
+        self._ensure_active("edit")
+        if type(dry_run) is not bool:
+            raise TaskLiteError(f"dry_run must be a bool, got {type(dry_run).__name__}")
+        if note is not None and not isinstance(note, str):
+            raise TaskLiteError(f"note must be a str or None, got {type(note).__name__}")
+        return EditTransaction(
+            self._runtime.store,
+            dry_run=dry_run,
+            note=note,
+            ensure_active=self._ensure_active,
+        )
 
     def get_cursor(self, key: str) -> str | None:
         """读取指定游标键的最新已提交值，限 Run 外。"""

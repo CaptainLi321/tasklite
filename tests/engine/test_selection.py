@@ -236,7 +236,8 @@ def test_exclude_downstream_cycle_is_failed_not_masked(fake_process, tmp_path):
     pipeline.enqueue(Job("excluded_t", "a"))
     pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a"]))
     pipeline.enqueue(Job("rank", "c", depends_on=["rank::b"]))
-    pipeline.set_job_status("rank::b", "succeeded", recursive=False)
+    with pipeline.edit(dry_run=False) as tx:
+        tx.replace("rank::b", Job("rank", "b", depends_on=["excluded_t::a"]), status="succeeded")
     pipeline.enqueue(
         Job("rank", "b", depends_on=["excluded_t::a", "rank::c"])
     )
@@ -261,8 +262,11 @@ def test_exclude_downstream_purged_dependency_is_failed(fake_process, tmp_path):
     pipeline.enqueue(Job("excluded_t", "a"))
     pipeline.enqueue(Job("rank", "b", depends_on=["excluded_t::a", "ghost_task::x"]))
 
-    pipeline.set_job_status("ghost_task::x", "succeeded", recursive=False)
-    pipeline.clear_history("ghost_task::x", records=["successes"])
+    from tasklite.backend.base import GraphEditCommit
+
+    pipeline._runtime.store.backend.commit_graph_edit(
+        GraphEditCommit(queue_writes={"ghost_task::x": None})
+    )
 
     pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
@@ -437,7 +441,8 @@ def test_upstream_only_failure_skipped_by_trigger_fails_downstream(fake_process,
     pipeline.register_task("upstream", ok_handler)
     pipeline.register_task("downstream", ok_handler)
 
-    pipeline.set_job_status(Job("upstream", "u"), "failed", recursive=False)
+    with pipeline.edit(dry_run=False) as tx:
+        tx.add(Job("upstream", "u"), status="failed")
     pipeline.enqueue(Job("upstream", "u", trigger="once"))
     pipeline.enqueue(Job("downstream", "d", depends_on=["upstream::u"]))
     pipeline.run()

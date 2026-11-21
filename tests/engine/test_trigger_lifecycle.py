@@ -344,20 +344,22 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
         ))
         with in_process_workers(first):
             first.run(install_signals=False)
-        first.clear_history("consume::result", records=["successes"])
-        if seed_after_clear:
-            first.set_job_status(
-                Job(
-                    "consume",
-                    "result",
-                    depends_on=["produce::source"],
-                    files={
-                        "source": FileSpec.from_output("produce::source", "source", role="input"),
-                    },
-                ),
-                "succeeded",
-                recursive=False,
-            )
+        with first.edit(dry_run=False) as tx:
+            if seed_after_clear:
+                tx.replace(
+                    "consume::result",
+                    Job(
+                        "consume",
+                        "result",
+                        depends_on=["produce::source"],
+                        files={
+                            "source": FileSpec.from_output("produce::source", "source", role="input"),
+                        },
+                    ),
+                    status="succeeded",
+                )
+            else:
+                tx.remove("consume::result", entries=("successes",), recursive=False)
         first.stop()
 
     with _pipeline(tmp_path) as second:
@@ -520,12 +522,8 @@ def test_until_success_uses_current_sqlite_terminal_history(tmp_path):
         with StateSnapshot.open(pipeline) as snap:
             assert len(list(snap.iter_attempts(job_uid="work::item"))) == 1
 
-        pipeline.clear_history("work::item", records=["successes"])
-        pipeline.set_job_status(
-            Job("work", "item", payload={"calls_file": calls_file}, trigger="until_success"),
-            "failed",
-            recursive=False,
-        )
+        with pipeline.edit(dry_run=False) as tx:
+            tx.set_status("work::item", "failed", recursive=False)
         assert pipeline.enqueue(Job("work", "item", payload={"calls_file": calls_file})) is True
         with in_process_workers(pipeline):
             pipeline.run(install_signals=False)
@@ -538,7 +536,8 @@ def test_until_success_recognizes_manual_success_without_attempt(tmp_path):
     calls_file = str(tmp_path / "output" / "until_success_calls.txt")
     with _pipeline(tmp_path) as pipeline:
         pipeline.register_task("work", _record_until_success_call, trigger="until_success")
-        pipeline.set_job_status(Job("work", "manual", trigger="until_success"), "succeeded", recursive=False)
+        with pipeline.edit(dry_run=False) as tx:
+            tx.add(Job("work", "manual", trigger="until_success"), status="succeeded")
 
         assert pipeline.enqueue(Job("work", "manual", payload={"calls_file": calls_file})) is True
         with in_process_workers(pipeline):

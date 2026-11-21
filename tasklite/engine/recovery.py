@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Set as AbstractSet
+import copy
 from typing import Any, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -43,9 +45,92 @@ if TYPE_CHECKING:
             done_entries: Sequence[tuple[InFlightJob, ExecutionResult]],
         ) -> None: ...
 
-from ..backend.base import execution_id_matches_run
+from ..backend.base import RunningAttemptRecovery, execution_id_matches_run
 from ..exceptions import TaskLiteError
 from ..models.state import PipelineState, job_uid_from_snapshot
+from ..utils.clock import utc_now_iso
+
+UNSETTLED_RUNNING_ERROR_MESSAGE = "上次执行未完成结算，实际结果未知"
+UNSETTLED_RUNNING_REASON = "unsettled_running_recovery"
+
+
+def validate_running_execution_identity(
+    row: Mapping[str, Any],
+    *,
+    attempt_sequence: int,
+    settled_attempt_nos: AbstractSet[int],
+) -> tuple[str, str, str, int]:
+    """校验遗留 running 队列行的执行身份完整性（无 IO 副作用纯函数）。
+
+    返回 ``(job_uid, execution_id, run_id, attempt_no)``；若身份非法、与序号进度
+    不匹配或对应 attempt_no 已存在已结算轨迹，抛 TaskLiteError。
+    """
+    uid = row.get("job_uid")
+    execution_id = row.get("execution_id")
+    run_id = row.get("run_id")
+    attempt_no = row.get("attempt_no")
+    job_snap = row.get("job")
+    if (
+        not isinstance(uid, str) or not uid
+        or not isinstance(execution_id, str) or not execution_id
+        or not isinstance(run_id, str) or not run_id
+        or not execution_id_matches_run(execution_id, run_id)
+        or type(attempt_no) is not int or attempt_no < 1
+        or not isinstance(job_snap, dict)
+        or job_uid_from_snapshot(job_snap) != uid
+        or attempt_sequence != attempt_no
+        or attempt_no in settled_attempt_nos
+    ):
+        raise TaskLiteError(
+            f"Invariant conflict: Job {uid!r} has an invalid or already settled running execution "
+            f"(execution_id={execution_id!r}, run_id={run_id!r}, "
+            f"attempt_no={attempt_no!r})"
+        )
+    return uid, execution_id, run_id, attempt_no
+
+
+def build_unsettled_running_recovery(
+    row: Mapping[str, Any],
+    *,
+    attempt_sequence: int,
+    settled_attempt_nos: AbstractSet[int],
+    settled_at: str | None = None,
+) -> tuple[RunningAttemptRecovery, dict[str, Any]]:
+    """校验遗留 running 执行身份并构造待补写失败 Attempt 与默认 failure_metadata（无 IO 副作用）。"""
+    uid, execution_id, run_id, attempt_no = validate_running_execution_identity(
+        row,
+        attempt_sequence=attempt_sequence,
+        settled_attempt_nos=settled_attempt_nos,
+    )
+    effective_settled_at = settled_at if settled_at is not None else utc_now_iso()
+    job_snap = copy.deepcopy(row["job"])
+    files = copy.deepcopy(job_snap.get("files") or {})
+    result: dict[str, Any] = {
+        "message": UNSETTLED_RUNNING_ERROR_MESSAGE,
+        "exception": None,
+        "metadata": {},
+        "annotations": {"completion_source": "execution"},
+    }
+    failure_metadata: dict[str, Any] = {
+        "error_message": UNSETTLED_RUNNING_ERROR_MESSAGE,
+        "reason": UNSETTLED_RUNNING_REASON,
+        "execution_id": execution_id,
+        "run_id": run_id,
+        "attempt_no": attempt_no,
+    }
+    recovery = RunningAttemptRecovery(
+        job_uid=uid,
+        attempt_no=attempt_no,
+        execution_id=execution_id,
+        run_id=run_id,
+        started_at=None,
+        settled_at=effective_settled_at,
+        job_snapshot=job_snap,
+        files=files,
+        result=result,
+        error_message=UNSETTLED_RUNNING_ERROR_MESSAGE,
+    )
+    return recovery, failure_metadata
 
 
 class RecoveryOrchestrator:
@@ -77,50 +162,36 @@ class RecoveryOrchestrator:
 
         queue_rows = backend.load_queue_jobs()
         running = [row for row in queue_rows if row["status"] == "running"]
+        prepared: list[tuple[dict[str, Any], RunningAttemptRecovery, dict[str, Any]]] = []
         for row in running:
             uid = row["job_uid"]
-            execution_id, run_id, attempt_no = (
-                row["execution_id"], row["run_id"], row["attempt_no"]
+            settled_nos = {
+                attempt["attempt_no"]
+                for attempt in backend.load_settled_attempts(uid)
+                if isinstance(attempt.get("attempt_no"), int)
+            }
+            recovery, failure_metadata = build_unsettled_running_recovery(
+                row,
+                attempt_sequence=backend.get_attempt_sequence(uid),
+                settled_attempt_nos=settled_nos,
             )
-            if (
-                not isinstance(execution_id, str) or not execution_id
-                or not isinstance(run_id, str) or not run_id
-                or not execution_id_matches_run(execution_id, run_id)
-                or type(attempt_no) is not int or attempt_no < 1
-                or job_uid_from_snapshot(row["job"]) != uid
-                or backend.get_attempt_sequence(uid) != attempt_no
-                or any(
-                    attempt["attempt_no"] == attempt_no
-                    for attempt in backend.load_settled_attempts(uid)
-                )
-            ):
-                raise TaskLiteError(
-                    f"Invariant conflict: Job {uid!r} has an invalid or already settled running execution "
-                    f"(execution_id={execution_id!r}, run_id={run_id!r}, "
-                    f"attempt_no={attempt_no!r})"
-                )
+            prepared.append((row, recovery, failure_metadata))
 
         state = PipelineState(
             successes, failed, backend.load_cursors(),
             [row["job"] for row in queue_rows if row["status"] == "pending"],
         )
         self._store.set_state(state)
-        for row in running:
+        for row, recovery, failure_metadata in prepared:
             self._store.apply_failure(
-                row["job_uid"],
-                {
-                    "error_message": "上次执行未完成结算，实际结果未知",
-                    "reason": "unsettled_running_recovery",
-                    "execution_id": row["execution_id"],
-                    "run_id": row["run_id"],
-                    "attempt_no": row["attempt_no"],
-                },
+                recovery.job_uid,
+                failure_metadata,
                 job_snapshot=row["job"],
                 cascade=False,
-                attempt_no=row["attempt_no"],
-                execution_id=row["execution_id"],
-                run_id=row["run_id"],
-                started_at=None,
+                attempt_no=recovery.attempt_no,
+                execution_id=recovery.execution_id,
+                run_id=recovery.run_id,
+                started_at=recovery.started_at,
             )
         return state
 
@@ -146,4 +217,8 @@ class RecoveryOrchestrator:
 
 __all__ = [
     "RecoveryOrchestrator",
+    "UNSETTLED_RUNNING_ERROR_MESSAGE",
+    "UNSETTLED_RUNNING_REASON",
+    "build_unsettled_running_recovery",
+    "validate_running_execution_identity",
 ]

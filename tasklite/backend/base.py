@@ -1,16 +1,52 @@
 """当前持久层内部 Interface 与共享入口门卫。
 
 队列状态、追加式 Attempt、终态档案、派生 Job 和游标由一次结算原子提交。
-successes 与 failed 按 UID 互斥；Attempt 仅作执行轨迹，编号独立于可清理历史。
+successes 与 failed 按 UID 互斥；Attempt 仅作严格 append-only 执行轨迹，
+编号独立于任何状态修整操作且永不可删。
 """
 from __future__ import annotations
 
 import copy
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Sequence
 
 
 QUEUE_EXECUTION_ID_KEY = "__tasklite_execution_id__"
+
+
+@dataclass(frozen=True)
+class RunningAttemptRecovery:
+    """遗留 running 执行的待补写失败 Attempt 载荷。"""
+
+    job_uid: str
+    attempt_no: int
+    execution_id: str
+    run_id: str
+    started_at: str | None
+    settled_at: str
+    job_snapshot: dict[str, Any]
+    files: dict[str, Any] | None
+    result: dict[str, Any]
+    error_message: str | None
+
+
+@dataclass(frozen=True)
+class GraphEditCommit:
+    """图修整事务声明式后端提交载荷（O(Δ) 仅含触碰 uid）。
+
+    - ``queue_writes``: ``uid -> job_snapshot | None``（``None`` 删除；非 ``None`` 写入为 ``pending`` 并排入队尾）
+    - ``success_writes``: ``uid -> metadata | None``（``None`` 删除；非 ``None`` 写入 successes）
+    - ``failed_writes``: ``uid -> (metadata, payload) | None``（``None`` 删除；非 ``None`` 写入 failed）
+    - ``recovery_attempts``: 待补写的遗留 running 失败 Attempt 序列
+    """
+
+    queue_writes: Mapping[str, dict[str, Any] | None] = field(default_factory=dict)
+    success_writes: Mapping[str, dict[str, Any] | None] = field(default_factory=dict)
+    failed_writes: Mapping[str, tuple[dict[str, Any], dict[str, Any] | None] | None] = field(
+        default_factory=dict
+    )
+    recovery_attempts: tuple[RunningAttemptRecovery, ...] = ()
 
 
 def queue_snapshot_with_execution_id(
@@ -171,18 +207,15 @@ class AbstractStateBackend(ABC):
         ``replace_queue_atomic`` 收敛）。失败时事务回滚并抛异常（不吞）。
         """
 
-    # 管理写与游标 --------------------------------------------------
+    # 管理写、一致快照与游标 -----------------------------------------
 
     @abstractmethod
-    def apply_manual_status(
-        self,
-        updates: Sequence[tuple[str, str, dict[str, Any], dict[str, Any] | None]],
-    ) -> None:
-        """批量原子应用人工状态变更 (job_uid, status, snapshot, metadata)。"""
+    def load_consistent_snapshot(self) -> dict[str, Any]:
+        """在单一读事务或单锁内原子捕获一致状态快照（含 queue_jobs/successes/failed/failure_payloads/attempts/job_sequences）。"""
 
     @abstractmethod
-    def clear_history(self, uid: str, records: set[str]) -> int:
-        """从 successes/failed/attempts 清除指定 job_uid 的记录，返回删除条数。"""
+    def commit_graph_edit(self, commit: GraphEditCommit) -> None:
+        """在单一写事务或锁内原子应用声明式图修整变更，绝不删除 attempts 或重置 job_sequences。"""
 
     @abstractmethod
     def get_cursor(self, key: str) -> str | None:
@@ -296,5 +329,7 @@ class AbstractStateBackend(ABC):
 
 __all__ = [
     "AbstractStateBackend",
+    "GraphEditCommit",
+    "RunningAttemptRecovery",
     "validate_queue_replacement",
 ]

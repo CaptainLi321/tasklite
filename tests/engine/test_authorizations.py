@@ -453,8 +453,9 @@ def test_authorization_denial_settles_attempt_and_keeps_job_pending(
     )
     middle_job = Job("middle", "m1", depends_on=["target_task::t1"], trigger="always")
     leaf_job = Job("leaf", "l1", depends_on=["middle::m1"], trigger="always")
-    for historical_job in (target_job, middle_job, leaf_job):
-        p.set_job_status(historical_job, "succeeded", recursive=False)
+    with p.edit(dry_run=False) as tx:
+        for historical_job in (target_job, middle_job, leaf_job):
+            tx.add(historical_job, status="succeeded")
     p.enqueue(target_job)
     p.enqueue(middle_job)
     p.enqueue(leaf_job)
