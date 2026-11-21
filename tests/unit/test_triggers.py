@@ -267,36 +267,83 @@ def test_trigger_skip_does_not_grant_dependency_readiness():
 
 
 def test_trigger_error_aborts_inflight_without_burning_budget():
-    class WaitingProcess:
-        def __init__(self, **kwargs):
+    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
+    from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
+
+    class _WaitingHandle:
+        pid = None
+
+        def __init__(self, sender, reply_receiver) -> None:
+            self._sender = sender
+            self._reply_receiver = reply_receiver
             self.exitcode = None
             self.alive = False
+            self.was_force_killed = False
 
-        def start(self):
+        def start(self) -> None:
             self.alive = True
 
-        def is_alive(self):
+        def _close_pipes(self) -> None:
+            if self._sender is not None:
+                self._sender.close()
+                self._sender = None
+            if self._reply_receiver is not None:
+                self._reply_receiver.close()
+                self._reply_receiver = None
+
+        def is_alive(self) -> bool:
             return self.alive
 
-        def kill(self):
+        def kill_tree(self) -> None:
             self.alive = False
             self.exitcode = -9
+            self.was_force_killed = True
+            self._close_pipes()
 
-        def terminate(self):
-            self.kill()
-
-        def join(self, timeout=None):
+        def join(self, timeout=None) -> None:
             pass
 
-        def close(self):
-            pass
+        def close(self) -> None:
+            self.alive = False
+            self._close_pipes()
+
+    class _WaitingLauncher(WorkerLauncher):
+        def prepare(self, spec, *, on_message, cancel_event):
+            receiver, sender = create_worker_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+                on_message=on_message,
+            )
+            reply_receiver, reply_sender = create_worker_reply_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+            )
+            handle = _WaitingHandle(sender, reply_receiver)
+
+            def _abort():
+                handle.kill_tree()
+                handle.close()
+                reply_sender.close()
+                receiver.close(timeout=2.0)
+
+            return PreparedWorker(
+                handle=handle,
+                receiver=receiver,
+                reply_sender=reply_sender,
+                on_release=handle.start,
+                on_abort=_abort,
+            )
 
     with TaskLite(backend="memory", max_workers=2) as pipeline:
         pipeline.register_trigger("error", lambda ctx: 1 / 0)
         pipeline.register_task("t", handle)
         pipeline.enqueue(Job("t", "a"))
         pipeline.enqueue(Job("t", "b", trigger="error"))
-        with in_process_workers(pipeline, WaitingProcess):
+        with in_process_workers(pipeline, _WaitingLauncher()):
             with pytest.raises(ZeroDivisionError):
                 pipeline.run()
         with StateSnapshot.open(pipeline) as snap:

@@ -20,6 +20,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
+from ._worker_runtime import stop_signals
 from .config import RunConfig
 from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
 from .execution_access import exclusive_state_access
@@ -507,12 +508,8 @@ class EngineRuntime:
 
     @staticmethod
     def _stop_signals() -> tuple[signal.Signals, ...]:
-        """返回当前平台需安装的优雅停机信号列表。"""
-        sigs: list[signal.Signals] = [signal.SIGTERM, signal.SIGINT]
-        sigbreak = getattr(signal, "SIGBREAK", None)
-        if os.name == "nt" and sigbreak is not None:
-            sigs.append(sigbreak)
-        return tuple(sigs)
+        """返回当前平台需安装的优雅停机信号列表（委托唯一信号表）。"""
+        return stop_signals(signal)
 
     @contextmanager
     def install_stop_signals(self) -> Iterator[None]:

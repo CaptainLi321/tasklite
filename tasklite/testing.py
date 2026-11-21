@@ -1,4 +1,4 @@
-"""v2 官方测试工具（单测 JobContext 构造器与运行状态模拟）。
+"""v2 官方测试工具（单测 JobContext 构造器、进程内 WorkerLauncher 与运行状态模拟）。
 
 注意：本模块为测试辅助工具，本版本暂不承诺向后兼容与冻结扩展协议。
 handler 单测构造 JobContext，提供对文件声明、游标、依赖引用与派生的隔离测试支持。
@@ -17,17 +17,31 @@ Examples:
 """
 from __future__ import annotations
 
+import dataclasses
 import tempfile
+import threading
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .engine.launcher import InProcessWorkerLauncher, _InProcessWorker
+from .engine._worker_runtime import WorkerLaunchSpec, run_worker_entry
+from .engine.launcher import (
+    PreparedWorker,
+    WorkerLauncher,
+    _WorkerLaunchCancelled,
+)
 from .models.context import JobContext
 from .models.job import Job
+from .utils.ipc import (
+    WorkerPipeSender,
+    WorkerReplyReceiver,
+    create_worker_pipe,
+    create_worker_reply_pipe,
+)
 
 __all__ = [
+    "InProcessWorkerLauncher",
     "authorizer",
     "cursor_updates",
     "fake_ctx",
@@ -35,6 +49,206 @@ __all__ = [
     "running",
     "spawned_jobs",
 ]
+
+
+class _ThreadWorkerHandle:
+    """进程内线程 Worker 句柄：直接实现 ``ManagedWorkerHandle`` 并管理 worker 侧管道端点。
+
+    不变式：与真实 OS 子进程退出/强杀时内核立即关闭写端 FD 保持一致，线程退出、
+    ``kill_tree()`` 或 ``close()`` 均会幂等关闭 worker 侧 ``pipe_sender`` 与
+    ``reply_receiver``，令父进程侧 ``drain_to_eof`` 立即观测到 EOF，无需
+    ``ExecutionChannel`` 对进程内替身保留特殊清理分支。
+    """
+
+    def __init__(
+        self,
+        *,
+        entry: Callable[[], None],
+        pipe_sender: WorkerPipeSender,
+        reply_receiver: WorkerReplyReceiver,
+    ) -> None:
+        self._entry = entry
+        self._pipe_sender: WorkerPipeSender | None = pipe_sender
+        self._reply_receiver: WorkerReplyReceiver | None = reply_receiver
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._exitcode: int | None = None
+        self._was_force_killed = False
+        self._closed = False
+
+    def _close_worker_pipes(self) -> None:
+        with self._lock:
+            sender = self._pipe_sender
+            reply_receiver = self._reply_receiver
+            self._pipe_sender = None
+            self._reply_receiver = None
+        if sender is not None:
+            try:
+                sender.close()
+            except OSError:
+                pass
+        if reply_receiver is not None:
+            try:
+                reply_receiver.close()
+            except OSError:
+                pass
+
+    def _run(self) -> None:
+        try:
+            self._entry()
+            with self._lock:
+                if self._exitcode is None:
+                    self._exitcode = 0
+        except BaseException:
+            with self._lock:
+                if self._exitcode is None:
+                    self._exitcode = 1
+        finally:
+            self._close_worker_pipes()
+
+    def start(self) -> None:
+        """启动后台线程运行 worker 执行体。"""
+        with self._lock:
+            if self._closed:
+                return
+            thread = threading.Thread(target=self._run, daemon=True)
+            self._thread = thread
+        thread.start()
+
+    @property
+    def pid(self) -> int | None:
+        return None
+
+    @property
+    def exitcode(self) -> int | None:
+        with self._lock:
+            return self._exitcode
+
+    @property
+    def was_force_killed(self) -> bool:
+        with self._lock:
+            return self._was_force_killed
+
+    def is_alive(self) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def join(self, timeout: float | None = None) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+        if not self.is_alive():
+            self._close_worker_pipes()
+
+    def kill_tree(self) -> None:
+        with self._lock:
+            self._was_force_killed = True
+            if self._exitcode is None:
+                self._exitcode = -9
+        self._close_worker_pipes()
+
+    def kill(self) -> None:
+        self.kill_tree()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._thread = None
+        self._close_worker_pipes()
+
+
+class InProcessWorkerLauncher(WorkerLauncher):
+    """基于真实双工 Pipe 与后台线程的进程内标准 ``WorkerLauncher`` 实现。"""
+
+    def __init__(
+        self,
+        *,
+        entry: Callable[[WorkerLaunchSpec], None] = run_worker_entry,
+    ) -> None:
+        self._entry = entry
+
+    def prepare(
+        self,
+        spec: WorkerLaunchSpec,
+        *,
+        on_message: Callable[[], None] | None,
+        cancel_event: threading.Event,
+    ) -> PreparedWorker:
+        if cancel_event.is_set():
+            raise _WorkerLaunchCancelled(
+                f"stop requested before worker launch for {spec.job.uid}"
+            )
+
+        receiver, sender = create_worker_pipe(
+            job_uid=spec.job.uid,
+            execution_id=spec.execution_id,
+            run_id=spec.run_id or None,
+            attempt_no=spec.attempt_no,
+            on_message=on_message,
+        )
+        reply_receiver, reply_sender = create_worker_reply_pipe(
+            job_uid=spec.job.uid,
+            execution_id=spec.execution_id,
+            run_id=spec.run_id or None,
+            attempt_no=spec.attempt_no,
+        )
+        spec.job_context._bind_pipe_sender(sender, reply_receiver)
+        launch_spec = dataclasses.replace(
+            spec,
+            pipe_sender=sender,
+            reply_receiver=reply_receiver,
+        )
+        handle = _ThreadWorkerHandle(
+            entry=lambda: self._entry(launch_spec),
+            pipe_sender=sender,
+            reply_receiver=reply_receiver,
+        )
+
+        def _release() -> None:
+            if cancel_event.is_set():
+                raise _WorkerLaunchCancelled(
+                    f"stop requested before worker start for {spec.job.uid}"
+                )
+            handle.start()
+
+        def _abort() -> None:
+            try:
+                if handle.is_alive():
+                    handle.kill_tree()
+            except Exception:
+                pass
+            try:
+                handle.join(timeout=5.0)
+            except Exception:
+                pass
+            try:
+                handle.close()
+            except Exception:
+                pass
+            try:
+                reply_sender.close()
+            except Exception:
+                pass
+            try:
+                receiver.close(timeout=2.0)
+            except Exception:
+                pass
+
+        return PreparedWorker(
+            handle=handle,
+            receiver=receiver,
+            reply_sender=reply_sender,
+            on_release=_release,
+            on_abort=_abort,
+        )
 
 
 def _resolve_launcher_holders(target: Any) -> list[Any]:
@@ -53,13 +267,20 @@ def _resolve_launcher_holders(target: Any) -> list[Any]:
 
 def _install_launcher(
     target: Any,
-    process_class: type | None = None,
+    launcher: WorkerLauncher | None = None,
 ) -> list[tuple[Any, Any]]:
-    launcher = InProcessWorkerLauncher(process_class or _InProcessWorker)
+    if launcher is not None and not isinstance(launcher, WorkerLauncher):
+        raise TypeError(
+            f"in_process_workers expects a WorkerLauncher instance or None, "
+            f"got {type(launcher).__name__}"
+        )
+    effective_launcher: WorkerLauncher = (
+        launcher if launcher is not None else InProcessWorkerLauncher()
+    )
     holders = _resolve_launcher_holders(target)
     previous = [(holder, holder._launcher) for holder in holders]
     for holder in holders:
-        holder._launcher = launcher
+        holder._launcher = effective_launcher
     return previous
 
 
@@ -93,18 +314,18 @@ def authorizer(
 @contextmanager
 def in_process_workers(
     target: Any,
-    process_class: type | None = None,
+    launcher: WorkerLauncher | None = None,
 ) -> Iterator[Any]:
-    """在测试上下文中启用进程内/线程轻量 Worker 替身。
+    """在测试上下文中启用进程内/自定义 ``WorkerLauncher`` 替身。
 
-    保留真实单向 ``Pipe`` 通信边界，仅将子进程启动器替换为进程内受控替身
-    （默认使用线程替身，也可显式传入自定义 ``process_class``），退出上下文时
-    自动恢复原有的 ``_launcher``。
+    保留真实单向 ``Pipe`` 通信边界，仅将子进程启动器替换为标准 ``WorkerLauncher``
+    实例（默认使用线程替身 ``InProcessWorkerLauncher()``），退出上下文时自动恢复
+    原有的 ``_launcher``。
 
     Yields:
         传入的 ``target`` 对象本身。
     """
-    previous = _install_launcher(target, process_class)
+    previous = _install_launcher(target, launcher)
     try:
         yield target
     finally:
@@ -191,4 +412,3 @@ def fake_ctx(
         known_job_uids=frozenset(known_job_uids) if known_job_uids is not None else None,
         files=files,
     )
-

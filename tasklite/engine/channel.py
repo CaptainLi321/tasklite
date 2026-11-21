@@ -1,36 +1,35 @@
-"""v2 执行通道：跨平台子进程启动、阶梯看门狗、瞬时 Pipe 收割、fencing 与 TOCTOU 中止。
+"""v2 执行通道：线性两阶段启动、单一会话状态机、阶梯看门狗、瞬时 Pipe 收割与 TOCTOU 中止。
 
-ExecutionChannel 统一内敛子进程派发（经 WorkerLauncher / ProcessTreeAdapter
-双层内部接缝）、看门狗阶梯终止、单向 Pipe 消息收割与 TOCTOU 闭环清理的底层复杂性。
+ExecutionChannel 以每执行单一会话对象（``_ExecutionSession``）统一管理
+``prepared -> active -> lingering -> closed`` 全生命周期状态，通过
+``prepare_spawn -> release_spawn / abort_spawn`` 线性两阶段协议驱动底层
+``WorkerLauncher``，对真实子进程与进程内替身完全透明无特判。
 """
 
 from __future__ import annotations
 
+import enum
 import logging
-import os
 import signal
 import threading
 import time
-import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..exceptions import TaskLiteError, _ArtifactIOError
-from ..models.context import JobContext
+from ..exceptions import TaskLiteError
 from ..models.job import Job
-from ..models.result import TaskResult, validate_strict_json_object
+from ..models.result import validate_strict_json_object
 from ..utils.ipc import (
     PIPE_MSG_DECLARE,
     PIPE_MSG_RESULT,
     WorkerPipeMessage,
     WorkerPipeReceiver,
-    WorkerPipeSender,
-    WorkerReplyReceiver,
     WorkerReplySender,
 )
+from ._worker_runtime import WorkerLaunchSpec
 from .launcher import (
-    LaunchedWorker,
+    PreparedWorker,
     SubprocessWorkerLauncher,
     WorkerLauncher,
     _WorkerLaunchCancelled,
@@ -249,113 +248,6 @@ def _decode_ipc_result(
     return _corrupt_result(job, f"unknown status {status!r}")
 
 
-def _isolate_worker_process_signals() -> None:
-    """让进程组/控制台停止信号只由主进程处理（进程内线程替身不改主线程信号）。"""
-    if threading.current_thread() is not threading.main_thread():
-        return
-    if os.name == "posix":
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    elif os.name == "nt":
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        sigbreak = getattr(signal, "SIGBREAK", None)
-        if sigbreak is not None:
-            signal.signal(sigbreak, signal.SIG_IGN)
-
-
-def _worker_process_entry(spec: "WorkerLaunchSpec") -> None:
-    """spawn 子进程执行体入口：执行 handler 并经瞬时管道发送结果。
-
-    不变式：结果通过管道单向回传；执行体任何出口（含未捕获异常）
-    均在 finally 统一关闭管道写端。
-    """
-    _isolate_worker_process_signals()
-    handler_func = spec.handler
-    job = spec.job
-    if getattr(spec, "attempt_no", None) is not None:
-        job._attempt_no = spec.attempt_no
-    ctx = spec.job_context
-    job_uid = job.uid
-    execution_id = spec.execution_id
-    if not execution_id:
-        raise RuntimeError(
-            f"worker started without execution_id for {job_uid}: "
-            f"fencing requires WorkerLaunchSpec.execution_id"
-        )
-    pipe_sender = spec.pipe_sender
-    reply_receiver = spec.reply_receiver
-    if pipe_sender is not None or reply_receiver is not None:
-        ctx._bind_pipe_sender(pipe_sender, reply_receiver)
-
-    def _write_result(payload: dict[str, Any]) -> None:
-        if pipe_sender is None:
-            return
-        try:
-            pipe_sender.send_result(payload)
-        except OSError as exc:
-            logger.error(
-                f"worker pipe result send failed for {job_uid} ({execution_id}): {exc}"
-            )
-
-    try:
-        try:
-            raw_result = handler_func(job, ctx)
-            if isinstance(raw_result, TaskResult):
-                if raw_result.status == "success":
-                    _write_result({
-                        "status": "success",
-                        "message": raw_result.message,
-                        "metadata": raw_result.metadata,
-                        "spawned_jobs": [j.to_dict() for j in ctx._spawned_jobs],
-                        "cursor_updates": dict(ctx._cursor_updates),
-                    })
-                elif raw_result.status == "failure":
-                    _write_result({
-                        "status": "failure",
-                        "message": raw_result.message,
-                        "metadata": raw_result.metadata,
-                        "exception": None,
-                    })
-                else:
-                    _write_result({
-                        "status": "retry",
-                        "message": raw_result.message,
-                        "metadata": raw_result.metadata,
-                        "consume_budget": raw_result.consume_budget,
-                    })
-            else:
-                _write_result({
-                    "status": "failure",
-                    "message": (
-                        f"invalid handler return type: expected TaskResult, "
-                        f"got {type(raw_result).__name__}"
-                    ),
-                    "metadata": {},
-                    "exception": None,
-                })
-        except _ArtifactIOError as e:
-            _write_result({"status": "artifact_error", "error_message": str(e)})
-        except BaseException as e:
-            _write_result({
-                "status": "failure",
-                "message": (
-                    type(e).__name__ if not str(e)
-                    else f"{type(e).__name__}: {e}"
-                ),
-                "metadata": {},
-                "exception": {
-                    "type": type(e).__name__,
-                    "message": str(e),
-                    "traceback": traceback.format_exc(),
-                },
-            })
-    finally:
-        if pipe_sender is not None:
-            pipe_sender.close()
-        if reply_receiver is not None:
-            reply_receiver.close()
-
-
 @dataclass
 class ExecutionResult:
     """单次子进程执行的收割产物（收割/中止路径共形）。"""
@@ -392,32 +284,45 @@ class ExecutionResult:
 
 
 @dataclass(frozen=True)
-class WorkerLaunchSpec:
-    """进程 seam 具名契约——下发子进程执行体的全部载荷。
-
-    execution_id（``{run_id}.{dispatch_no}`` 执行身份）与管道发送端归
-    本 spec，不借道 JobContext 公开属性穿透进程边界。
-    """
-
-    handler: Callable[[Job, JobContext], Any]
-    job: Job
-    job_context: JobContext
-    execution_id: str
-    timeout_seconds: float
-    pipe_sender: WorkerPipeSender | None = None
-    reply_receiver: WorkerReplyReceiver | None = None
-    run_id: str = ""
-    attempt_no: int = 1
-    launch_guard: Callable[[], bool] | None = None
-    commit_hook: Callable[[Callable[[], JobHandle]], None] | None = None
-
-
-@dataclass(frozen=True)
 class AbortOutcome:
     """强制终止/异常停机时的收尾结果。"""
 
     completed: list[tuple[JobHandle, ExecutionResult]]
     cancelled: list[JobHandle]
+
+
+@dataclass(frozen=True)
+class PreparedLaunch:
+    """已完成冷启动准备、等待主进程放行或中止的执行令牌。"""
+
+    spec: WorkerLaunchSpec
+    session_key: str
+
+
+class _SessionState(str, enum.Enum):
+    """单次 worker 执行会话的显式状态机（单向推进至 closed）。"""
+
+    PREPARED = "prepared"
+    ACTIVE = "active"
+    LINGERING = "lingering"
+    CLOSED = "closed"
+
+
+@dataclass
+class _ExecutionSession:
+    """单次 worker 执行的唯一会话状态对象（取代多份并行字典与残留列表）。"""
+
+    session_key: str
+    state: _SessionState = _SessionState.PREPARED
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    prepared_worker: PreparedWorker | None = None
+    handle: JobHandle | None = None
+    process: Any = None
+    receiver: WorkerPipeReceiver | None = None
+    reply_sender: WorkerReplySender | None = None
+    health_stop: threading.Event | None = None
+    result: dict[str, Any] | None = None
+    error: Exception | None = None
 
 
 class ExecutionChannel:
@@ -433,31 +338,61 @@ class ExecutionChannel:
         self._launcher: WorkerLauncher = (
             launcher if launcher is not None else SubprocessWorkerLauncher()
         )
-        self._receivers: dict[str, WorkerPipeReceiver] = {}
-        self._in_process_senders: dict[str, WorkerPipeSender] = {}
-        self._reply_senders: dict[str, WorkerReplySender] = {}
+        self._sessions_lock = threading.RLock()
+        self._sessions: dict[str, _ExecutionSession] = {}
         self._declaration_handler: Callable[[JobHandle, dict[str, Any]], dict[str, Any] | None] | None = None
         self._wakeup_callback: Callable[[], None] | None = None
-        self._handles: dict[str, JobHandle] = {}
-        self._results: dict[str, dict[str, Any]] = {}
-        self._errors: dict[str, Exception] = {}
-        self._lingering_workers: list[tuple[str, Any, WorkerPipeReceiver | None]] = []
-        self._health_stops: dict[str, threading.Event] = {}
-        self._pending_lock = threading.Lock()
-        self._pending_launches: dict[str, threading.Event] = {}
+
+    def _find_session(self, handle: JobHandle) -> _ExecutionSession | None:
+        exec_id = handle.execution_id
+        with self._sessions_lock:
+            if exec_id:
+                session = self._sessions.get(exec_id)
+                if session is not None:
+                    return session
+            for session in self._sessions.values():
+                if session.handle is handle:
+                    return session
+        return None
+
+    def _get_session_by_id(self, execution_id: str | None) -> _ExecutionSession | None:
+        if not execution_id:
+            return None
+        with self._sessions_lock:
+            return self._sessions.get(execution_id)
 
     @property
     def has_active_workers(self) -> bool:
-        """通道是否存在在途、残留或正在握手的 worker。"""
+        """通道是否存在准备中、在途或残留的 worker 会话。"""
         self._reap_lingering_workers()
-        with self._pending_lock:
-            has_pending = bool(self._pending_launches)
-        return bool(self._handles or self._lingering_workers or has_pending)
+        with self._sessions_lock:
+            return any(
+                session.state is not _SessionState.CLOSED
+                for session in self._sessions.values()
+            )
+
+    def active_handles(self) -> list[JobHandle]:
+        """返回当前处于 ``active`` 状态的全部在途执行句柄快照。"""
+        with self._sessions_lock:
+            return [
+                session.handle
+                for session in self._sessions.values()
+                if session.state is _SessionState.ACTIVE and session.handle is not None
+            ]
+
+    def has_received_result(self, execution_id: str | None) -> bool:
+        """查询指定执行会话是否已通过管道收到结果帧（未消费）。"""
+        session = self._get_session_by_id(execution_id)
+        return session is not None and session.result is not None
 
     def cancel_pending_launches(self) -> None:
-        """立即唤醒并中止全部尚在握手/预送阶段的未提交启动。"""
-        with self._pending_lock:
-            events = list(self._pending_launches.values())
+        """立即唤醒并中止全部尚在准备/握手阶段的未放行启动。"""
+        with self._sessions_lock:
+            events = [
+                session.cancel_event
+                for session in self._sessions.values()
+                if session.state is _SessionState.PREPARED
+            ]
         for ev in events:
             ev.set()
 
@@ -503,16 +438,177 @@ class ExecutionChannel:
         except Exception as e:
             logger.warning(f"Process close failed during finalize: {e}")
 
-    def _register_launched_worker(
+    def _stop_health_watch(self, session: _ExecutionSession) -> None:
+        with self._sessions_lock:
+            stop = session.health_stop
+            session.health_stop = None
+        if stop is not None:
+            stop.set()
+
+    def _close_reply_sender(self, session: _ExecutionSession) -> None:
+        with self._sessions_lock:
+            reply_sender = session.reply_sender
+            session.reply_sender = None
+        if reply_sender is not None:
+            try:
+                reply_sender.close()
+            except Exception as exc:
+                logger.debug(f"Reply sender close warning for {session.session_key}: {exc}")
+
+    def _close_receiver(
         self,
-        spec: WorkerLaunchSpec,
-        launched: LaunchedWorker,
-    ) -> JobHandle:
-        """将已放行的 worker 登记进通道映射并启动健康探测线程。"""
-        exec_id = spec.execution_id
-        if launched.in_process_sender is not None:
-            self._in_process_senders[exec_id] = launched.in_process_sender
-        self._reply_senders[exec_id] = launched.reply_sender
+        session: _ExecutionSession,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        with self._sessions_lock:
+            receiver = session.receiver
+            session.receiver = None
+        if receiver is not None:
+            try:
+                receiver.close(
+                    timeout=self._JOIN_REAP_TIMEOUT if timeout is None else timeout
+                )
+            except Exception as exc:
+                logger.debug(f"Receiver close warning for {session.session_key}: {exc}")
+
+    def _transition_to_lingering(self, session: _ExecutionSession) -> None:
+        """将已产出结果但进程尚未退出的会话转入 lingering（保活 process 与 receiver）。"""
+        self._stop_health_watch(session)
+        self._close_reply_sender(session)
+        with self._sessions_lock:
+            session.handle = None
+            session.result = None
+            session.error = None
+            session.state = _SessionState.LINGERING
+
+    def _close_session(
+        self,
+        session: _ExecutionSession | None,
+        *,
+        finalize_process: bool = True,
+        receiver_timeout: float | None = None,
+    ) -> None:
+        """幂等关闭单个会话：停止健康探测、关闭全部管道、按需回收进程并移出状态表。"""
+        if session is None:
+            return
+        with self._sessions_lock:
+            health_stop = session.health_stop
+            session.health_stop = None
+            process = session.process
+            prepared_worker = session.prepared_worker
+            reply_sender = session.reply_sender
+            receiver = session.receiver
+            session.prepared_worker = None
+            session.handle = None
+            session.process = None
+            session.reply_sender = None
+            session.receiver = None
+            session.result = None
+            session.error = None
+            session.state = _SessionState.CLOSED
+            self._sessions.pop(session.session_key, None)
+
+        if health_stop is not None:
+            health_stop.set()
+        if prepared_worker is not None:
+            try:
+                prepared_worker.abort()
+            except Exception as exc:
+                logger.error(f"Prepared worker abort warning for {session.session_key}: {exc}")
+        if finalize_process and process is not None:
+            self._finalize_process(process)
+        if reply_sender is not None:
+            try:
+                reply_sender.close()
+            except Exception as exc:
+                logger.debug(f"Reply sender close warning for {session.session_key}: {exc}")
+        if receiver is not None:
+            try:
+                receiver.close(
+                    timeout=self._JOIN_REAP_TIMEOUT if receiver_timeout is None else receiver_timeout
+                )
+            except Exception as exc:
+                logger.debug(f"Receiver close warning for {session.session_key}: {exc}")
+
+    # ── 线性两阶段启动协议（prepare_spawn -> release_spawn / abort_spawn）──
+
+    def prepare_spawn(self, spec: WorkerLaunchSpec) -> PreparedLaunch:
+        """阶段一：冷启动 worker 并完成握手与进程树绑定，停在放行门前。"""
+        if is_importing_mp_main():
+            raise RuntimeError(
+                "ExecutionChannel.spawn() cannot be called while bootstrapping a worker process. "
+                "Guard top-level execution with `if __name__ == '__main__':`."
+            )
+
+        cancel_event = threading.Event()
+        session_key = spec.execution_id if spec.execution_id else f"_pending_{id(cancel_event)}"
+        session = _ExecutionSession(
+            session_key=session_key,
+            state=_SessionState.PREPARED,
+            cancel_event=cancel_event,
+        )
+        with self._sessions_lock:
+            self._sessions[session_key] = session
+
+        try:
+            prepared_worker = self._launcher.prepare(
+                spec,
+                on_message=self._notify_wakeup,
+                cancel_event=cancel_event,
+            )
+            with self._sessions_lock:
+                if session.state is _SessionState.CLOSED or cancel_event.is_set():
+                    session.state = _SessionState.CLOSED
+                    self._sessions.pop(session_key, None)
+                    should_abort = True
+                else:
+                    session.prepared_worker = prepared_worker
+                    should_abort = False
+            if should_abort:
+                prepared_worker.abort()
+                raise _WorkerLaunchCancelled(
+                    f"stop requested before worker release for {spec.job.uid}"
+                )
+            return PreparedLaunch(spec=spec, session_key=session_key)
+        except BaseException:
+            with self._sessions_lock:
+                session.prepared_worker = None
+                session.state = _SessionState.CLOSED
+                self._sessions.pop(session_key, None)
+            raise
+
+    def release_spawn(self, prepared: PreparedLaunch) -> JobHandle:
+        """阶段二（正常路径）：放行 worker（发送 b"GO"），转入 active 并返回句柄。"""
+        spec = prepared.spec
+        with self._sessions_lock:
+            session = self._sessions.get(prepared.session_key)
+            if session is None or session.state is not _SessionState.PREPARED:
+                raise RuntimeError(
+                    f"Cannot release execution session {prepared.session_key!r}: not prepared"
+                )
+            prepared_worker = session.prepared_worker
+            if prepared_worker is None:
+                raise RuntimeError(
+                    f"Cannot release execution session {prepared.session_key!r}: missing prepared worker"
+                )
+            cancelled = session.cancel_event.is_set()
+
+        if cancelled:
+            self.abort_spawn(prepared)
+            raise _WorkerLaunchCancelled(
+                f"stop requested before worker release for {spec.job.uid}"
+            )
+
+        try:
+            launched = prepared_worker.release()
+        except BaseException:
+            with self._sessions_lock:
+                session.prepared_worker = None
+                session.state = _SessionState.CLOSED
+                self._sessions.pop(prepared.session_key, None)
+            raise
+
         timeout_at_monotonic = time.monotonic() + spec.timeout_seconds
         handle = JobHandle(
             job_uid=spec.job.uid,
@@ -521,92 +617,50 @@ class ExecutionChannel:
             timeout_seconds=spec.timeout_seconds,
             started_at=launched.started_at,
             job=spec.job,
-            execution_id=exec_id,
+            execution_id=spec.execution_id,
             run_id=spec.run_id or None,
             attempt_no=spec.attempt_no,
         )
-        self._receivers[exec_id] = launched.receiver
-        self._handles[exec_id] = handle
-        self._watch_process_health(exec_id, launched.handle)
+        with self._sessions_lock:
+            session.prepared_worker = None
+            session.handle = handle
+            session.process = launched.handle
+            session.receiver = launched.receiver
+            session.reply_sender = launched.reply_sender
+            session.state = _SessionState.ACTIVE
+        self._watch_process_health(session)
         return handle
 
-    def _unregister_launched_worker(self, exec_id: str) -> None:
-        """在提交门中途回滚时撤回通道内存登记（句柄清理由 launcher 统一负责）。"""
-        stop = self._health_stops.pop(exec_id, None)
-        if stop is not None:
-            stop.set()
-        self._in_process_senders.pop(exec_id, None)
-        self._reply_senders.pop(exec_id, None)
-        self._receivers.pop(exec_id, None)
-        self._handles.pop(exec_id, None)
+    def abort_spawn(self, prepared: PreparedLaunch) -> None:
+        """阶段二（中止路径）：幂等终止并回收尚未放行的 worker 与会话。"""
+        with self._sessions_lock:
+            session = self._sessions.get(prepared.session_key)
+            if session is None:
+                return
+            session.cancel_event.set()
+            if session.state is not _SessionState.PREPARED:
+                return
+            prepared_worker = session.prepared_worker
+            session.prepared_worker = None
+            session.state = _SessionState.CLOSED
+            self._sessions.pop(prepared.session_key, None)
+        if prepared_worker is not None:
+            prepared_worker.abort()
 
     def spawn(self, spec: WorkerLaunchSpec) -> JobHandle:
-        """启动隔离子进程执行 handler，经握手屏障与提交门放行并返回句柄。"""
-        if is_importing_mp_main():
-            raise RuntimeError(
-                "ExecutionChannel.spawn() cannot be called while bootstrapping a worker process. "
-                "Guard top-level execution with `if __name__ == '__main__':`."
-            )
-
-        cancel_event = threading.Event()
-        launch_key = spec.execution_id or f"_pending_{id(cancel_event)}"
-        with self._pending_lock:
-            self._pending_launches[launch_key] = cancel_event
-
-        registered_handle: JobHandle | None = None
+        """单步便捷启动接口：连续执行 prepare_spawn 与 release_spawn。"""
+        prepared = self.prepare_spawn(spec)
         try:
-            if spec.launch_guard is not None and not spec.launch_guard():
-                cancel_event.set()
-                raise _WorkerLaunchCancelled(
-                    f"stop requested before worker process start for {spec.job.uid}"
-                )
+            return self.release_spawn(prepared)
+        except BaseException:
+            self.abort_spawn(prepared)
+            raise
 
-            def commit_gate(
-                launched: LaunchedWorker,
-                release_fn: Callable[[], None],
-            ) -> None:
-                nonlocal registered_handle
-
-                def _finalize_launch() -> JobHandle:
-                    nonlocal registered_handle
-                    if cancel_event.is_set() or (
-                        spec.launch_guard is not None and not spec.launch_guard()
-                    ):
-                        raise _WorkerLaunchCancelled(
-                            f"stop requested before worker release for {spec.job.uid}"
-                        )
-                    release_fn()
-                    handle = self._register_launched_worker(spec, launched)
-                    registered_handle = handle
-                    return handle
-
-                try:
-                    if spec.commit_hook is not None:
-                        spec.commit_hook(_finalize_launch)
-                    else:
-                        _finalize_launch()
-                except BaseException:
-                    if registered_handle is not None:
-                        self._unregister_launched_worker(spec.execution_id)
-                        registered_handle = None
-                    raise
-
-            self._launcher.launch(
-                spec,
-                on_message=self._notify_wakeup,
-                cancel_event=cancel_event,
-                commit_gate=commit_gate,
-            )
-            assert registered_handle is not None
-            return registered_handle
-        finally:
-            with self._pending_lock:
-                self._pending_launches.pop(launch_key, None)
-
-    def _watch_process_health(self, execution_id: str, process: Any) -> None:
+    def _watch_process_health(self, session: _ExecutionSession) -> None:
         """独立探测 worker 存活，仅在状态变化时唤醒主循环。"""
         stop = threading.Event()
-        self._health_stops[execution_id] = stop
+        process = session.process
+        session.health_stop = stop
 
         def watch() -> None:
             try:
@@ -619,20 +673,22 @@ class ExecutionChannel:
                         self._notify_wakeup()
                         break
             finally:
-                self._health_stops.pop(execution_id, None)
+                if session.health_stop is stop:
+                    session.health_stop = None
 
         threading.Thread(
             target=watch,
-            name=f"tasklite-worker-health-{execution_id}",
+            name=f"tasklite-worker-health-{session.session_key}",
             daemon=True,
         ).start()
 
     def _accept_message(self, handle: JobHandle, msg: WorkerPipeMessage) -> None:
-        """消费一条已校验信封的管道消息并更新通道内存状态。"""
+        """消费一条已校验信封的管道消息并更新会话状态。"""
+        session = self._find_session(handle)
         if msg.kind == PIPE_MSG_DECLARE:
             if not isinstance(msg.payload, dict):
                 raise ValueError(f"invalid declare payload for {handle.job_uid}")
-            reply_sender = self._reply_senders.get(handle.execution_id or "")
+            reply_sender = session.reply_sender if session is not None else None
             if self._declaration_handler is not None and reply_sender is not None:
                 reply = self._declaration_handler(handle, msg.payload)
                 if reply is not None:
@@ -643,13 +699,13 @@ class ExecutionChannel:
         elif msg.kind == PIPE_MSG_RESULT:
             if not isinstance(msg.payload, dict):
                 raise ValueError(f"invalid result payload for {handle.job_uid}")
-            exec_id = handle.execution_id or ""
-            if exec_id not in self._errors:
-                self._results.setdefault(exec_id, msg.payload)
+            if session is not None and session.error is None and session.result is None:
+                session.result = msg.payload
 
     def _process_pipe_item(
         self, handle: JobHandle, item: WorkerPipeMessage | Exception
     ) -> None:
+        session = self._find_session(handle)
         exec_id = handle.execution_id or ""
         if isinstance(item, OSError):
             logger.debug(
@@ -657,38 +713,29 @@ class ExecutionChannel:
             )
             return
         if isinstance(item, Exception):
-            if exec_id not in self._results:
-                self._errors.setdefault(exec_id, item)
+            if session is not None and session.result is None and session.error is None:
+                session.error = item
             return
         try:
             self._accept_message(handle, item)
         except Exception as exc:
-            if exec_id not in self._results:
-                self._errors.setdefault(exec_id, exc)
+            if session is not None and session.result is None and session.error is None:
+                session.error = exc
 
     def _receive_available(self, handle: JobHandle) -> None:
         """非阻塞拉取 handle 对应接收端当前已入队的全部消息。"""
-        exec_id = handle.execution_id
-        if not exec_id:
+        session = self._find_session(handle)
+        if session is None or session.receiver is None:
             return
-        receiver = self._receivers.get(exec_id)
-        if receiver is None:
-            return
-        for item in receiver.take_messages():
+        for item in session.receiver.take_messages():
             self._process_pipe_item(handle, item)
 
     def _drain_finished(self, handle: JobHandle) -> None:
-        """在进程终止后关闭写端并排空接收端直至 EOF。"""
-        exec_id = handle.execution_id
-        if not exec_id:
+        """在进程终止后排空接收端直至 EOF。"""
+        session = self._find_session(handle)
+        if session is None or session.receiver is None:
             return
-        sender = self._in_process_senders.pop(exec_id, None)
-        if sender is not None:
-            sender.close()
-        receiver = self._receivers.get(exec_id)
-        if receiver is None:
-            return
-        for item in receiver.drain_to_eof(timeout=self._JOIN_REAP_TIMEOUT):
+        for item in session.receiver.drain_to_eof(timeout=self._JOIN_REAP_TIMEOUT):
             self._process_pipe_item(handle, item)
 
     def set_declaration_handler(
@@ -718,91 +765,69 @@ class ExecutionChannel:
                 pass
 
     def get_reply_sender(self, execution_id: str | None) -> WorkerReplySender | None:
-        """获取指定 execution_id 的回复发送端。"""
-        if not execution_id:
+        """获取指定活跃会话的回复发送端。"""
+        session = self._get_session_by_id(execution_id)
+        if session is None or session.state is not _SessionState.ACTIVE:
             return None
-        return self._reply_senders.get(execution_id)
-
-    def _close_handle_pipe(self, execution_id: str | None) -> None:
-        if not execution_id:
-            return
-        stop = self._health_stops.pop(execution_id, None)
-        if stop is not None:
-            stop.set()
-        sender = self._in_process_senders.pop(execution_id, None)
-        if sender is not None:
-            sender.close()
-        receiver = self._receivers.pop(execution_id, None)
-        if receiver is not None:
-            receiver.close(timeout=self._JOIN_REAP_TIMEOUT)
-        reply_sender = self._reply_senders.pop(execution_id, None)
-        if reply_sender is not None:
-            reply_sender.close()
+        return session.reply_sender
 
     def _consume_result_if_present(self, handle: JobHandle) -> ExecutionResult | None:
-        """读取已收到的结果负载 → 守卫过滤 → 解码。
-
-        守卫契约：任何字典结果都是一次尝试结果；内容损坏由解码器收敛为失败。
-        """
-        exec_id = getattr(handle, "execution_id", None)
-        if not exec_id or exec_id in self._errors:
+        """读取已收到的结果负载 → 守卫过滤 → 解码。"""
+        session = self._find_session(handle)
+        if session is None or session.error is not None:
             return None
-        raw_res = self._results.get(exec_id)
+        raw_res = session.result
         if not isinstance(raw_res, dict):
             return None
-        self._results.pop(exec_id, None)
+        session.result = None
         return _decode_ipc_result(raw_res, handle.job)
 
     def _reap_lingering_workers(self) -> None:
-        """非阻塞轮询已结算但残留的子进程与管道接收端，进程死亡后回收句柄。"""
-        still_lingering: list[tuple[str, Any, WorkerPipeReceiver | None]] = []
-        for exec_id, p, receiver in self._lingering_workers:
+        """非阻塞轮询已结算但残留的 lingering 会话，进程死亡后回收句柄与接收端。"""
+        with self._sessions_lock:
+            lingering = [
+                s for s in self._sessions.values()
+                if s.state is _SessionState.LINGERING
+            ]
+        for session in lingering:
+            p = session.process
             try:
-                alive = p.is_alive()
+                alive = p is not None and p.is_alive()
             except Exception:
                 alive = False
             if not alive:
-                if receiver is not None:
-                    try:
-                        receiver.close(timeout=0.2)
-                    except Exception as e:
-                        logger.debug(f"Lingering receiver close warning for {exec_id}: {e}")
-                self._finalize_process(p)
-            else:
-                if receiver is not None and receiver.eof:
-                    try:
-                        receiver.close(timeout=0.1)
-                        receiver = None
-                    except Exception:
-                        pass
-                still_lingering.append((exec_id, p, receiver))
-        self._lingering_workers = still_lingering
+                self._close_session(session, finalize_process=True, receiver_timeout=0.2)
+            elif session.receiver is not None and session.receiver.eof:
+                self._close_receiver(session, timeout=0.1)
 
     def wait_for_lingering_workers(self) -> None:
-        """正常 Run 收口前等待已结算 worker 退出，超时后回收残留进程。"""
-        if not self._lingering_workers:
+        """正常 Run 收口前等待已结算 lingering 会话退出，超时后回收残留进程。"""
+        with self._sessions_lock:
+            lingering = [
+                s for s in self._sessions.values()
+                if s.state is _SessionState.LINGERING
+            ]
+        if not lingering:
             return
         deadline = time.monotonic() + self._JOIN_REAP_TIMEOUT
-        lingering = self._lingering_workers
-        self._lingering_workers = []
-        for exec_id, process, receiver in lingering:
-            remaining = deadline - time.monotonic()
-            try:
-                while process.is_alive() and remaining > 0:
-                    process.join(timeout=min(0.05, remaining))
-                    remaining = deadline - time.monotonic()
-                    if process.is_alive() and remaining > 0:
-                        time.sleep(min(0.01, remaining))
-            except Exception as exc:
-                logger.warning(f"Settled worker wait failed for {exec_id}: {exc}")
-            if process.is_alive():
-                logger.warning(f"Settled worker {exec_id} did not exit before Run end")
-            self._finalize_process(process)
-            if receiver is not None:
+        for session in lingering:
+            process = session.process
+            if process is not None:
+                remaining = deadline - time.monotonic()
                 try:
-                    receiver.close(timeout=0.2)
+                    while process.is_alive() and remaining > 0:
+                        process.join(timeout=min(0.05, remaining))
+                        remaining = deadline - time.monotonic()
+                        if process.is_alive() and remaining > 0:
+                            time.sleep(min(0.01, remaining))
                 except Exception as exc:
-                    logger.debug(f"Settled receiver close warning for {exec_id}: {exc}")
+                    logger.warning(f"Settled worker wait failed for {session.session_key}: {exc}")
+                try:
+                    if process.is_alive():
+                        logger.warning(f"Settled worker {session.session_key} did not exit before Run end")
+                except Exception:
+                    pass
+            self._close_session(session, finalize_process=True, receiver_timeout=0.2)
 
     def reap_completed(
         self, handles: Sequence[JobHandle]
@@ -811,8 +836,8 @@ class ExecutionChannel:
 
         有效结果到达即结算：收到完整有效 TaskResult 即认为本次执行已返回并
         交付结算，不将 worker 进程退出作为额外成功条件，不以前置 join 阻塞
-        主循环。结果返回后仍在运行的子进程移交后台非阻塞回收，不阻塞其他 Job
-        派发或结算，亦不因之后的进程退出状态改写有效结果。
+        主循环。结果返回后仍在运行的子进程转入 lingering 后台非阻塞回收，
+        不阻塞其他 Job 派发或结算，亦不因之后的进程退出状态改写有效结果。
         """
         self._reap_lingering_workers()
         completed: list[tuple[JobHandle, ExecutionResult]] = []
@@ -820,7 +845,7 @@ class ExecutionChannel:
         for handle in handles:
             now = time.monotonic()
             p = handle.process
-            exec_id = handle.execution_id or ""
+            session = self._find_session(handle)
             self._receive_available(handle)
 
             authorization_outcome = handle.authorization_outcome
@@ -831,17 +856,10 @@ class ExecutionChannel:
                 except Exception:
                     pass
                 if not is_alive:
-                    self._handles.pop(exec_id, None)
-                    receiver = self._receivers.pop(exec_id, None)
-                    if receiver is not None:
-                        try:
-                            receiver.close(timeout=0.2)
-                        except Exception:
-                            pass
-                    self._close_handle_pipe(exec_id)
-                    self._results.pop(exec_id, None)
-                    self._errors.pop(exec_id, None)
-                    self._finalize_process(p)
+                    if session is not None:
+                        self._close_session(session, finalize_process=True, receiver_timeout=0.2)
+                    else:
+                        self._finalize_process(p)
                     decoded = ExecutionResult(
                         success=False,
                         message=authorization_outcome.message,
@@ -852,14 +870,10 @@ class ExecutionChannel:
                 continue
 
             # 1. 有效结果已到达：立即收割结果，不阻塞等待子进程退出
-            if exec_id in self._results:
-                raw_res = self._results.pop(exec_id)
+            if session is not None and session.result is not None:
+                raw_res = session.result
+                session.result = None
                 decoded = _decode_ipc_result(raw_res, handle.job)
-                self._handles.pop(exec_id, None)
-                receiver = self._receivers.pop(exec_id, None)
-                self._errors.pop(exec_id, None)
-                # 结果后不再回复声明；接收端独立移交，不等待 worker 退出。
-                self._close_handle_pipe(exec_id)
 
                 is_alive = False
                 try:
@@ -868,20 +882,16 @@ class ExecutionChannel:
                     pass
 
                 if not is_alive:
-                    if receiver is not None:
-                        try:
-                            receiver.close(timeout=0.2)
-                        except Exception:
-                            pass
-                    self._finalize_process(p)
+                    self._close_session(session, finalize_process=True, receiver_timeout=0.2)
                 else:
-                    self._lingering_workers.append((exec_id, p, receiver))
+                    # 结果后不再回复声明；会话转入 lingering，保活进程句柄与接收端。
+                    self._transition_to_lingering(session)
 
                 completed.append((handle, decoded))
                 continue
 
             # 2. 管道异常分支
-            if exec_id in self._errors:
+            if session is not None and session.error is not None:
                 completed.append((handle, self._collect_outcome(handle)))
                 continue
 
@@ -907,44 +917,50 @@ class ExecutionChannel:
     def _collect_outcome(
         self, handle: JobHandle, res: dict | None = None, *, is_timeout: bool = False
     ) -> ExecutionResult:
-        """收敛收割尾部：终止并收割子进程 → 排空管道至 EOF → 解码结果 → 关闭管道。"""
+        """收敛收割尾部：终止并收割子进程 → 排空管道至 EOF → 解码结果 → 关闭会话。"""
+        p = handle.process
+        session = self._find_session(handle)
         authorization_outcome = handle.authorization_outcome
         if authorization_outcome is not None:
-            p = handle.process
-            exec_id = handle.execution_id or ""
             try:
                 self._terminate_and_join_process(p)
             finally:
-                self._finalize_process(p)
-                self._close_handle_pipe(exec_id)
-            self._results.pop(exec_id, None)
-            self._errors.pop(exec_id, None)
+                if session is not None:
+                    self._close_session(session, finalize_process=True)
+                else:
+                    self._finalize_process(p)
             return ExecutionResult(
                 success=False,
                 message=authorization_outcome.message,
                 exception=authorization_outcome.exception,
                 authorization_outcome=authorization_outcome,
             )
-        p = handle.process
-        exec_id = handle.execution_id or ""
+
         result: ExecutionResult | None = None
         try:
             self._terminate_and_join_process(p)
             self._drain_finished(handle)
-            if exec_id in self._errors:
-                err = self._errors.pop(exec_id)
-                self._results.pop(exec_id, None)
+            if session is not None and session.error is not None:
+                err = session.error
+                session.error = None
+                session.result = None
                 raise err
-            payload = res if res is not None else self._results.pop(exec_id, None)
+            payload = (
+                res
+                if res is not None
+                else (session.result if session is not None else None)
+            )
+            if session is not None:
+                session.result = None
             if payload is not None and not is_timeout:
                 result = _decode_ipc_result(payload, handle.job)
             else:
                 result = self._build_terminal_failure(p, handle, is_timeout=is_timeout)
         finally:
-            self._finalize_process(p)
-            self._close_handle_pipe(exec_id)
-            self._handles.pop(exec_id, None)
-            self._results.pop(exec_id, None)
+            if session is not None:
+                self._close_session(session, finalize_process=True)
+            else:
+                self._finalize_process(p)
         return result
 
     @staticmethod
@@ -986,7 +1002,7 @@ class ExecutionChannel:
         )
 
     def abort_in_flight(self, handles: Sequence[JobHandle]) -> AbortOutcome:
-        """TOCTOU 闭环中止：取消未提交启动 → 初查分类 → 进程树终止 → 排空管道至 EOF → 重探测闭环 → 关闭管道。"""
+        """TOCTOU 闭环中止：取消未放行启动 → 初查分类 → 进程树终止 → 排空管道至 EOF → 重探测闭环 → 关闭会话。"""
         self.cancel_pending_launches()
         if not handles:
             return AbortOutcome(completed=[], cancelled=[])
@@ -1009,13 +1025,9 @@ class ExecutionChannel:
                 logger.warning(f"Completed process join failed: {error}")
         self.finalize_processes(handles)
 
-        for handle, decoded in done_pairs:
+        for handle, _ in done_pairs:
             self._drain_finished(handle)
-            exec_id = handle.execution_id or ""
-            self._close_handle_pipe(exec_id)
-            self._handles.pop(exec_id, None)
-            self._results.pop(exec_id, None)
-            self._errors.pop(exec_id, None)
+            self._close_session(self._find_session(handle), finalize_process=False)
 
         truly_cancelled: list[JobHandle] = []
         for handle in pending_handles:
@@ -1025,47 +1037,46 @@ class ExecutionChannel:
                 done_pairs.append((handle, decoded))
             else:
                 truly_cancelled.append(handle)
-            exec_id = handle.execution_id or ""
-            self._close_handle_pipe(exec_id)
-            self._handles.pop(exec_id, None)
-            self._results.pop(exec_id, None)
-            self._errors.pop(exec_id, None)
+            self._close_session(self._find_session(handle), finalize_process=False)
 
         return AbortOutcome(completed=done_pairs, cancelled=truly_cancelled)
 
     def cleanup_in_flight(self, handles: Sequence[JobHandle]) -> None:
-        """主循环异常退出时取消未提交启动、终止并回收所有残留 in-flight 子进程与管道。"""
+        """主循环异常退出时取消未放行启动、终止并回收所有残留与在途会话。"""
         self.cancel_pending_launches()
-        for exec_id, p, receiver in self._lingering_workers:
+        with self._sessions_lock:
+            lingering = [
+                s for s in self._sessions.values()
+                if s.state is _SessionState.LINGERING
+            ]
+        for session in lingering:
             try:
-                self._finalize_process(p)
-                if receiver is not None:
-                    receiver.close(timeout=0.5)
+                self._close_session(session, finalize_process=True, receiver_timeout=0.5)
             except Exception as e:
-                logger.error(f"Error cleaning up lingering worker {exec_id}: {e}")
-        self._lingering_workers.clear()
+                logger.error(f"Error cleaning up lingering worker {session.session_key}: {e}")
 
         for handle in handles:
             try:
-                self._finalize_process(handle.process)
-                exec_id = handle.execution_id or ""
-                self._close_handle_pipe(exec_id)
-                self._handles.pop(exec_id, None)
-                self._results.pop(exec_id, None)
-                self._errors.pop(exec_id, None)
+                handle_session = self._find_session(handle)
+                if handle_session is not None:
+                    self._close_session(handle_session, finalize_process=True)
+                else:
+                    self._finalize_process(handle.process)
             except Exception as e:
                 logger.error(f"Error cleaning up in-flight job {handle.job_uid}: {e}")
 
     def finalize_processes(self, handles: Sequence[JobHandle]) -> None:
-        """只 kill + join 残留子进程，不删声明。"""
-        for exec_id, p, receiver in self._lingering_workers:
+        """清理全部 lingering 会话，并对指定在途句柄执行 kill_tree + join + close。"""
+        with self._sessions_lock:
+            lingering = [
+                s for s in self._sessions.values()
+                if s.state is _SessionState.LINGERING
+            ]
+        for session in lingering:
             try:
-                self._finalize_process(p)
-                if receiver is not None:
-                    receiver.close(timeout=0.5)
+                self._close_session(session, finalize_process=True, receiver_timeout=0.5)
             except Exception:
                 pass
-        self._lingering_workers.clear()
 
         for handle in handles:
             try:
@@ -1074,13 +1085,23 @@ class ExecutionChannel:
                 logger.error(f"Error finalizing in-flight job {handle.job_uid}: {e}")
 
     def close(self) -> None:
-        """关闭通道并回收所有在途与残留子进程和管道资源。"""
-        self.cleanup_in_flight(list(self._handles.values()))
+        """关闭通道并回收所有准备中、在途与残留会话的进程和管道资源。"""
+        self.cancel_pending_launches()
+        self.cleanup_in_flight(self.active_handles())
+        with self._sessions_lock:
+            remaining = list(self._sessions.values())
+        for session in remaining:
+            try:
+                self._close_session(session, finalize_process=True, receiver_timeout=0.5)
+            except Exception as e:
+                logger.error(f"Error closing remaining session {session.session_key}: {e}")
+
 
 __all__ = [
     "AbortOutcome",
     "ExecutionChannel",
     "ExecutionResult",
     "JobHandle",
+    "PreparedLaunch",
     "WorkerLaunchSpec",
 ]

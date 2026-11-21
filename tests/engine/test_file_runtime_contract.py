@@ -526,7 +526,7 @@ def test_worker_start_failure_releases_resources_after_running_commit(tmp_path, 
     p.enqueue(Job("work", "one", payload={"marker": str(marker)}))
 
     with in_process_workers(p), patch.object(
-        p._runtime.channel, "spawn", side_effect=OSError("worker process start failed")
+        p._runtime.channel, "prepare_spawn", side_effect=OSError("worker process start failed")
     ):
         with pytest.raises(OSError, match="worker process start failed"):
             p.run(install_signals=False)

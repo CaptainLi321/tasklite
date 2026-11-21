@@ -112,6 +112,23 @@ class DispatchEnv:
             execution_id=execution_id,
         )
 
+    def stub_channel_spawn(self, monkeypatch, on_spawn=None) -> None:
+        """在派发单测中以最小两阶段桩替换 channel.prepare_spawn/release_spawn。"""
+        from tasklite.engine.channel import PreparedLaunch
+
+        def fake_prepare(spec: WorkerLaunchSpec) -> PreparedLaunch:
+            return PreparedLaunch(spec=spec, session_key=spec.execution_id)
+
+        def fake_release(prepared: PreparedLaunch):
+            spec = prepared.spec
+            if on_spawn is not None:
+                return on_spawn(spec)
+            return self.spawn_handle(spec.job.uid, spec.execution_id)
+
+        monkeypatch.setattr(self.channel, "prepare_spawn", fake_prepare)
+        monkeypatch.setattr(self.channel, "release_spawn", fake_release)
+        monkeypatch.setattr(self.channel, "abort_spawn", lambda _prepared: None)
+
 
 class TestDispatchOutcomeKind:
     """dispatch_next 的单一 kind 枚举判据。"""
@@ -196,12 +213,10 @@ class TestDispatchOutcomeKind:
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
 
         spawned_specs: list[WorkerLaunchSpec] = []
-        monkeypatch.setattr(
-            env.channel,
-            "spawn",
-            lambda spec: spawned_specs.append(spec) or env.spawn_handle(
-                spec.job.uid, spec.execution_id
-            ),
+        env.stub_channel_spawn(
+            monkeypatch,
+            on_spawn=lambda spec: spawned_specs.append(spec)
+            or env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
         outcome = env.dispatch.dispatch_next()
@@ -282,10 +297,7 @@ class TestRejectGates:
         env = DispatchEnv(tmp_path)
         env.register("t")
         env.store.state.spawn_jobs([Job("t", "j1", payload={"name": "x"}).to_dict()])
-        monkeypatch.setattr(
-            env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
-        )
+        env.stub_channel_spawn(monkeypatch)
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.SPAWNED
 
@@ -319,12 +331,10 @@ class TestPreSubmitCleanupAndActiveSignals:
             ).to_dict(),
         ])
         spawned: list[WorkerLaunchSpec] = []
-        monkeypatch.setattr(
-            env.channel,
-            "spawn",
-            lambda spec: spawned.append(spec) or env.spawn_handle(
-                spec.job.uid, spec.execution_id
-            ),
+        env.stub_channel_spawn(
+            monkeypatch,
+            on_spawn=lambda spec: spawned.append(spec)
+            or env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
         with authorizer(env.store, approve_after_consuming_slot):
@@ -357,9 +367,9 @@ class TestPreSubmitCleanupAndActiveSignals:
             ).to_dict(),
         ])
         spawn_observed: list[bool] = []
-        monkeypatch.setattr(
-            env.channel, "spawn",
-            lambda spec: spawn_observed.append(target.exists())
+        env.stub_channel_spawn(
+            monkeypatch,
+            on_spawn=lambda spec: spawn_observed.append(target.exists())
             or env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
@@ -453,10 +463,7 @@ class TestAdmissionEvaluationTiming:
         env.session.record_retry("t::j1")
         if registered_as_retry:
             env.session.mark_retry_candidate("t::j1")
-        monkeypatch.setattr(
-            env.channel, "spawn",
-            lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
-        )
+        env.stub_channel_spawn(monkeypatch)
 
         outcome = env.dispatch.dispatch_next()
         if registered_as_retry:
@@ -490,10 +497,7 @@ def test_dispatch_and_settlement_use_current_protocol_only(tmp_path, monkeypatch
     env.store.set_backend(CurrentBackend())
     env.register("t")
     env.store.state.spawn_jobs([Job("t", "one", max_retries_per_run=1).to_dict()])
-    monkeypatch.setattr(
-        env.channel, "spawn",
-        lambda spec: env.spawn_handle(spec.job.uid, spec.execution_id),
-    )
+    env.stub_channel_spawn(monkeypatch)
     entry = env.dispatch.dispatch_next().entry
     assert entry is not None
     assert env.backend.get_attempt_sequence(entry.job_uid) == 1

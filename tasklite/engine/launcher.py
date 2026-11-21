@@ -1,17 +1,19 @@
-"""Worker 启动器与跨平台进程树内部接缝。
+"""Worker 启动器与跨平台进程树内部接缝（纯生产子进程实现）。
 
 收拢两层内部接缝：
-1. WorkerLauncher + ManagedWorkerHandle + LaunchedWorker：
-   隔离真实子进程与进程内测试替身的启动、握手、强杀和句柄生命周期；
-2. ProcessTreeAdapter：
-   隔离 Windows Job Object（无窗口独立控制台 + 仅 KILL_ON_JOB_CLOSE）与
-   POSIX 独立会话进程组（start_new_session + 先 killpg 后 wait）的底层差异。
+1. WorkerLauncher + PreparedWorker + ManagedWorkerHandle + LaunchedWorker：
+   以线性两阶段协议（``prepare()`` 冷启动与握手停在放行门前 → ``release()`` 发送
+   ``b"GO"`` 或 ``abort()`` 零泄漏回收）隔离真实子进程生命周期；
+2. ProcessTreeAdapter + _BasePopenWorkerHandle：
+   抽取 Windows / POSIX 共用的 ``Popen`` 等待、退出码缓存与幂等关闭骨架，仅在
+   ``WindowsManagedWorkerHandle``（无窗口独立控制台 + 匿名 Job Object + 跳板
+   嵌套绑定 + lingering 保活 ``hJob``）与 ``PosixManagedWorkerHandle``（独立会话
+   进程组 + 先 ``killpg`` 后 ``wait``）中保留真实平台差异。
 """
 
 from __future__ import annotations
 
 import ctypes
-import dataclasses
 import json
 import logging
 import os
@@ -28,25 +30,17 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import Any, Protocol
 
 from ..utils.clock import utc_now_iso
-from ..utils.ipc import (
-    WorkerPipeReceiver,
-    WorkerPipeSender,
-    WorkerReplySender,
-    create_worker_pipe,
-    create_worker_reply_pipe,
-)
+from ..utils.ipc import WorkerPipeReceiver, WorkerReplySender
+from ._worker_runtime import WorkerLaunchSpec
 from .types import (
     ENV_IPC_ADDR,
     ENV_IPC_AUTHKEY,
     ENV_IPC_FAMILY,
     LAUNCH_GO_TOKEN,
 )
-
-if TYPE_CHECKING:
-    from .channel import WorkerLaunchSpec
 
 logger = logging.getLogger("tasklite")
 
@@ -99,31 +93,86 @@ class ManagedWorkerHandle(Protocol):
 
 @dataclass
 class LaunchedWorker:
-    """一次已完成握手并准备放行的 worker 启动产物。"""
+    """一次已放行的 worker 启动产物。"""
 
     handle: ManagedWorkerHandle
     receiver: WorkerPipeReceiver
     reply_sender: WorkerReplySender
     started_at: str
-    in_process_sender: WorkerPipeSender | None = None
 
 
-CommitGate = Callable[[LaunchedWorker, Callable[[], None]], None]
+class PreparedWorker:
+    """已完成冷启动、握手与进程树绑定，停在放行门前的待放行 worker。
+
+    两阶段线性契约：
+    - ``release()``：记录启动时间戳并放行 worker（如发送 ``b"GO"``），返回 ``LaunchedWorker``；
+      若放行本身失败则自动执行 ``abort()`` 后原样上抛；
+    - ``abort()``：幂等终止并回收进程树、句柄与全部双工连接，确保任意未放行路径零泄漏。
+    """
+
+    def __init__(
+        self,
+        *,
+        handle: ManagedWorkerHandle,
+        receiver: WorkerPipeReceiver,
+        reply_sender: WorkerReplySender,
+        on_release: Callable[[], None],
+        on_abort: Callable[[], None],
+    ) -> None:
+        self.handle = handle
+        self.receiver = receiver
+        self.reply_sender = reply_sender
+        self._on_release = on_release
+        self._on_abort = on_abort
+        self._lock = threading.Lock()
+        self._released = False
+        self._aborted = False
+
+    def release(self) -> LaunchedWorker:
+        """放行 worker 开始执行 handler 并返回已启动产物。"""
+        with self._lock:
+            if self._aborted:
+                raise RuntimeError("PreparedWorker already aborted")
+            if self._released:
+                raise RuntimeError("PreparedWorker already released")
+            self._released = True
+        started_at = utc_now_iso()
+        try:
+            self._on_release()
+        except BaseException:
+            self.abort()
+            raise
+        return LaunchedWorker(
+            handle=self.handle,
+            receiver=self.receiver,
+            reply_sender=self.reply_sender,
+            started_at=started_at,
+        )
+
+    def abort(self) -> None:
+        """幂等中止未放行的 worker 并回收进程树、句柄与双工连接。"""
+        with self._lock:
+            if self._aborted:
+                return
+            self._aborted = True
+        self._on_abort()
 
 
 class WorkerLauncher(ABC):
     """Worker 启动器抽象接缝。"""
 
     @abstractmethod
-    def launch(
+    def prepare(
         self,
-        spec: "WorkerLaunchSpec",
+        spec: WorkerLaunchSpec,
         *,
         on_message: Callable[[], None] | None,
         cancel_event: threading.Event,
-        commit_gate: CommitGate,
-    ) -> LaunchedWorker:
-        """启动 worker，在 commit_gate 内完成最终放行；任一阶段失败须零泄漏清理。"""
+    ) -> PreparedWorker:
+        """冷启动 worker 并完成握手与进程树绑定，停在放行门前返回 PreparedWorker。
+
+        准备阶段任何失败或取消必须零泄漏清理后再抛出异常。
+        """
 
 
 class ProcessTreeAdapter(ABC):
@@ -145,6 +194,101 @@ class ProcessTreeAdapter(ABC):
     @abstractmethod
     def kill_unattached(self, proc: subprocess.Popen[Any]) -> None:
         """强杀并回收尚未完成进程树绑定的空壳子进程。"""
+
+
+# ── Popen 公共句柄基类 ───────────────────────────────────────────────────────
+
+
+class _BasePopenWorkerHandle(ABC):
+    """Windows 与 POSIX 共用的 ``Popen`` 句柄生命周期骨架。
+
+    统一承载线程安全的 ``pid`` / ``exitcode`` / ``was_force_killed`` /
+    ``is_alive`` / ``join`` / ``kill`` / ``close`` 骨架；平台子类仅实现
+    ``kill_tree()`` 与可选的退出/关闭钩子。
+    """
+
+    def __init__(self, proc: subprocess.Popen[Any]) -> None:
+        self._proc = proc
+        self._lock = threading.RLock()
+        self._was_force_killed = False
+        self._closed = False
+        self._cached_exitcode: int | None = None
+
+    def _on_exited_locked(self) -> None:
+        """子类钩子（在 ``self._lock`` 内调用）：子进程被观测到已退出时触发。"""
+
+    def _take_close_resources_locked(self) -> Any:
+        """子类钩子（在 ``self._lock`` 内调用）：取出待释放的平台原生句柄。"""
+        return None
+
+    def _release_close_resources(self, resources: Any) -> None:
+        """子类钩子（在锁外调用）：释放由 ``_take_close_resources_locked`` 取出的资源。"""
+
+    @property
+    def pid(self) -> int | None:
+        return self._proc.pid
+
+    @property
+    def exitcode(self) -> int | None:
+        with self._lock:
+            if self._cached_exitcode is not None:
+                return self._cached_exitcode
+            if self._closed:
+                return self._proc.returncode
+            code = self._proc.poll()
+            if code is not None:
+                self._cached_exitcode = code
+                self._on_exited_locked()
+            return code
+
+    @property
+    def was_force_killed(self) -> bool:
+        with self._lock:
+            return self._was_force_killed
+
+    def is_alive(self) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            code = self._proc.poll()
+            if code is not None:
+                self._cached_exitcode = code
+                self._on_exited_locked()
+                return False
+            return True
+
+    def join(self, timeout: float | None = None) -> None:
+        with self._lock:
+            if self._closed:
+                return
+        try:
+            code = self._proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return
+        except OSError:
+            return
+        with self._lock:
+            self._cached_exitcode = code
+            self._on_exited_locked()
+
+    @abstractmethod
+    def kill_tree(self) -> None:
+        """按当前平台语义原子终止整棵进程树。"""
+
+    def kill(self) -> None:
+        """兼容测试调用接口，直接委托进程树终止。"""
+        self.kill_tree()
+
+    def close(self) -> None:
+        """幂等关闭句柄并释放平台原生资源。"""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._cached_exitcode is None:
+                self._cached_exitcode = self._proc.returncode
+            resources = self._take_close_resources_locked()
+        self._release_close_resources(resources)
 
 
 # ── Windows 进程树适配（无窗口独立控制台 + Job Object）────────────────────────
@@ -237,12 +381,12 @@ def _win_os_error(action: str, err_code: int) -> OSError:
     return OSError(err_code, f"{action} failed: {message}")
 
 
-class WindowsProcessHandle:
+class WindowsManagedWorkerHandle(_BasePopenWorkerHandle):
     """绑定 Windows 匿名 Job Object 的线程安全进程树句柄。
 
-    不变式：``hJob`` 在句柄存活及 ``_lingering_workers`` 期间始终保活，
-    ``kill_tree()`` 仅调用 ``TerminateJobObject`` 终止进程树，仅在 ``close()``
-    时才幂等释放 ``hJob``，避免提前关闭 Job 句柄误杀仍在收尾的进程。
+    不变式：``hJob`` 在句柄存活及 lingering 期间始终保活，``kill_tree()`` 仅调用
+    ``TerminateJobObject`` 终止进程树，仅在 ``close()`` 时才幂等释放 ``hJob``，
+    避免提前关闭 Job 句柄误杀仍在收尾的进程。
     """
 
     def __init__(
@@ -251,61 +395,13 @@ class WindowsProcessHandle:
         h_jobs: int | Sequence[int],
         kernel: Any,
     ) -> None:
-        self._proc = proc
+        super().__init__(proc)
         self._h_jobs: tuple[int, ...] = (
             (int(h_jobs),)
             if isinstance(h_jobs, int)
             else tuple(int(h) for h in h_jobs)
         )
         self._kernel = kernel
-        self._lock = threading.RLock()
-        self._was_force_killed = False
-        self._closed = False
-        self._cached_exitcode: int | None = None
-
-    @property
-    def pid(self) -> int | None:
-        return self._proc.pid
-
-    @property
-    def exitcode(self) -> int | None:
-        with self._lock:
-            if self._cached_exitcode is not None:
-                return self._cached_exitcode
-            if self._closed:
-                return self._proc.returncode
-            code = self._proc.poll()
-            if code is not None:
-                self._cached_exitcode = code
-            return code
-
-    @property
-    def was_force_killed(self) -> bool:
-        with self._lock:
-            return self._was_force_killed
-
-    def is_alive(self) -> bool:
-        with self._lock:
-            if self._closed:
-                return False
-            code = self._proc.poll()
-            if code is not None:
-                self._cached_exitcode = code
-                return False
-            return True
-
-    def join(self, timeout: float | None = None) -> None:
-        with self._lock:
-            if self._closed:
-                return
-        try:
-            code = self._proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return
-        except OSError:
-            return
-        with self._lock:
-            self._cached_exitcode = code
 
     def kill_tree(self) -> None:
         """通过 TerminateJobObject 原子终止整棵进程树（不提前关闭 hJob）。"""
@@ -323,21 +419,13 @@ class WindowsProcessHandle:
         except OSError:
             pass
 
-    def kill(self) -> None:
-        """兼容测试调用接口，直接委托进程树终止。"""
-        self.kill_tree()
+    def _take_close_resources_locked(self) -> tuple[int, ...]:
+        h_jobs = self._h_jobs
+        self._h_jobs = ()
+        return h_jobs
 
-    def close(self) -> None:
-        """幂等释放 Job Object 句柄与底层进程引用。"""
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self._cached_exitcode is None:
-                self._cached_exitcode = self._proc.returncode
-            h_jobs = self._h_jobs
-            self._h_jobs = ()
-        for h_job in h_jobs:
+    def _release_close_resources(self, resources: Any) -> None:
+        for h_job in resources:
             try:
                 self._kernel.CloseHandle(h_job)
             except Exception as exc:
@@ -475,7 +563,7 @@ class WindowsProcessTreeAdapter(ProcessTreeAdapter):
             self.kill_unattached(proc)
             raise
 
-        return WindowsProcessHandle(proc, created_jobs, kernel)
+        return WindowsManagedWorkerHandle(proc, created_jobs, kernel)
 
     def kill_unattached(self, proc: subprocess.Popen[Any]) -> None:
         try:
@@ -492,7 +580,7 @@ class WindowsProcessTreeAdapter(ProcessTreeAdapter):
 # ── POSIX 进程树适配（独立会话 + 先 killpg 后 wait）──────────────────────────
 
 
-class PosixProcessHandle:
+class PosixManagedWorkerHandle(_BasePopenWorkerHandle):
     """POSIX 独立会话进程组句柄。
 
     不变式：``kill_tree()`` 严格在组长进程尚未被 ``wait()`` 回收前向整个进程组
@@ -500,60 +588,12 @@ class PosixProcessHandle:
     """
 
     def __init__(self, proc: subprocess.Popen[Any]) -> None:
-        self._proc = proc
+        super().__init__(proc)
         self._pgid = proc.pid
-        self._lock = threading.RLock()
-        self._was_force_killed = False
         self._reaped = False
-        self._closed = False
-        self._cached_exitcode: int | None = None
 
-    @property
-    def pid(self) -> int | None:
-        return self._proc.pid
-
-    @property
-    def exitcode(self) -> int | None:
-        with self._lock:
-            if self._cached_exitcode is not None:
-                return self._cached_exitcode
-            if self._closed:
-                return self._proc.returncode
-            code = self._proc.poll()
-            if code is not None:
-                self._cached_exitcode = code
-                self._reaped = True
-            return code
-
-    @property
-    def was_force_killed(self) -> bool:
-        with self._lock:
-            return self._was_force_killed
-
-    def is_alive(self) -> bool:
-        with self._lock:
-            if self._closed:
-                return False
-            code = self._proc.poll()
-            if code is not None:
-                self._cached_exitcode = code
-                self._reaped = True
-                return False
-            return True
-
-    def join(self, timeout: float | None = None) -> None:
-        with self._lock:
-            if self._closed:
-                return
-        try:
-            code = self._proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return
-        except OSError:
-            return
-        with self._lock:
-            self._cached_exitcode = code
-            self._reaped = True
+    def _on_exited_locked(self) -> None:
+        self._reaped = True
 
     def kill_tree(self) -> None:
         """先对进程组发送 SIGKILL（不提前 wait 组长），再由 join() 回收。"""
@@ -580,18 +620,6 @@ class PosixProcessHandle:
             except OSError:
                 pass
 
-    def kill(self) -> None:
-        """兼容测试调用接口，直接委托进程组终止。"""
-        self.kill_tree()
-
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self._cached_exitcode is None:
-                self._cached_exitcode = self._proc.returncode
-
 
 class PosixProcessTreeAdapter(ProcessTreeAdapter):
     """POSIX 进程树隔离适配器：start_new_session 建新进程组。"""
@@ -608,7 +636,7 @@ class PosixProcessTreeAdapter(ProcessTreeAdapter):
         *,
         worker_pid: int | None = None,
     ) -> ManagedWorkerHandle:
-        return PosixProcessHandle(proc)
+        return PosixManagedWorkerHandle(proc)
 
     def kill_unattached(self, proc: subprocess.Popen[Any]) -> None:
         killpg = getattr(os, "killpg", None)
@@ -799,7 +827,7 @@ def _should_skip_main_path(main_path: str) -> bool:
     return not path.is_file()
 
 
-def _build_prep_data(spec: "WorkerLaunchSpec") -> dict[str, Any]:
+def _build_prep_data(spec: WorkerLaunchSpec) -> dict[str, Any]:
     """构造子进程纯 JSON 引导数据（路径、工作目录、__mp_main__ 与执行身份）。"""
     expanded_sys_path = [
         _ORIGINAL_DIR if entry == "" else entry for entry in sys.path
@@ -877,14 +905,41 @@ class SubprocessWorkerLauncher(WorkerLauncher):
             except OSError:
                 pass
 
-    def launch(
+    @staticmethod
+    def _abort_prepared_resources(
+        managed_handle: ManagedWorkerHandle,
+        reply_sender: WorkerReplySender,
+        receiver: WorkerPipeReceiver,
+    ) -> None:
+        """中止已绑定进程树但尚未放行的子进程，确保进程树、Job 句柄与双工连接零泄漏。"""
+        try:
+            managed_handle.kill_tree()
+        except Exception:
+            pass
+        try:
+            managed_handle.join(timeout=5.0)
+        except Exception:
+            pass
+        try:
+            reply_sender.close()
+        except Exception:
+            pass
+        try:
+            receiver.close(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            managed_handle.close()
+        except Exception:
+            pass
+
+    def prepare(
         self,
-        spec: "WorkerLaunchSpec",
+        spec: WorkerLaunchSpec,
         *,
         on_message: Callable[[], None] | None,
         cancel_event: threading.Event,
-        commit_gate: CommitGate,
-    ) -> LaunchedWorker:
+    ) -> PreparedWorker:
         if cancel_event.is_set():
             raise _WorkerLaunchCancelled(
                 f"stop requested before worker launch for {spec.job.uid}"
@@ -981,7 +1036,7 @@ class SubprocessWorkerLauncher(WorkerLauncher):
                     f"stop requested after process tree attach for {spec.job.uid}"
                 )
 
-            # 第一阶段下发预序列化数据（worker 仅缓存字节，仍阻塞于放行门）
+            # 第一阶段下发预序列化数据（worker 仅缓存字节，仍阻塞于 b"GO" 放行门）
             downlink.send_bytes(prep_bytes)
             downlink.send_bytes(payload_bytes)
 
@@ -1003,20 +1058,30 @@ class SubprocessWorkerLauncher(WorkerLauncher):
                 attempt_no=spec.attempt_no,
             )
 
-            launched = LaunchedWorker(
-                handle=managed_handle,
-                receiver=receiver,
-                reply_sender=reply_sender,
-                started_at="",
-                in_process_sender=None,
+            bound_handle = managed_handle
+            bound_receiver = receiver
+            bound_reply_sender = reply_sender
+            bound_downlink = downlink
+            bound_cancel = cancel_event
+
+            def _release_subprocess() -> None:
+                if bound_cancel.is_set():
+                    raise _WorkerLaunchCancelled(
+                        f"stop requested before release for {spec.job.uid}"
+                    )
+                bound_downlink.send_bytes(LAUNCH_GO_TOKEN)
+
+            return PreparedWorker(
+                handle=bound_handle,
+                receiver=bound_receiver,
+                reply_sender=bound_reply_sender,
+                on_release=_release_subprocess,
+                on_abort=lambda: self._abort_prepared_resources(
+                    bound_handle,
+                    bound_reply_sender,
+                    bound_receiver,
+                ),
             )
-
-            def release_fn() -> None:
-                launched.started_at = utc_now_iso()
-                downlink.send_bytes(LAUNCH_GO_TOKEN)
-
-            commit_gate(launched, release_fn)
-            return launched
         except BaseException:
             # 清理顺序红线：先非阻塞唤醒 acceptor 并尽快关 listener（打断任何未接通的
             # 唤醒自连），再终止进程树，随后复核 acceptor 退出并关闭 receiver/reply_sender 与句柄。
@@ -1093,228 +1158,18 @@ class SubprocessWorkerLauncher(WorkerLauncher):
             raise
 
 
-# ── 进程内替身启动器（供 tasklite.testing.in_process_workers 使用）────────────
-
-
-class _InProcessWorker:
-    """进程内线程 Worker 替身：在真实 Pipe 边界上执行目标入口。"""
-
-    def __init__(
-        self,
-        *,
-        target: Callable[..., Any],
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> None:
-        self._target = target
-        self._args = args
-        self._kwargs = dict(kwargs or {})
-        self.exitcode: int | None = None
-        self._thread: threading.Thread | None = None
-
-    def _run(self) -> None:
-        try:
-            self._target(*self._args, **self._kwargs)
-            if self.exitcode is None:
-                self.exitcode = 0
-        except BaseException:
-            if self.exitcode is None:
-                self.exitcode = 1
-
-    def start(self) -> None:
-        """启动后台线程运行 worker 入口。"""
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def is_alive(self) -> bool:
-        """返回替身线程是否仍在运行。"""
-        return self._thread is not None and self._thread.is_alive()
-
-    def join(self, timeout: float | None = None) -> None:
-        """等待替身线程结束。"""
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-
-    def kill(self) -> None:
-        """标记强制终止退出码（不销毁进程内主线程）。"""
-        if self.exitcode is None:
-            self.exitcode = -9
-
-    def terminate(self) -> None:
-        """标记信号终止退出码。"""
-        if self.exitcode is None:
-            self.exitcode = -15
-
-    def close(self) -> None:
-        """释放替身线程引用。"""
-        self._thread = None
-
-
-class InProcessWorkerHandle:
-    """包装进程内线程替身或测试自定义进程桩的句柄。"""
-
-    def __init__(self, proc: Any) -> None:
-        self._proc = proc
-        self._lock = threading.RLock()
-        self._was_force_killed = False
-        self._closed = False
-
-    @property
-    def pid(self) -> int | None:
-        raw_pid = getattr(self._proc, "pid", None)
-        return raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
-
-    @property
-    def exitcode(self) -> int | None:
-        return getattr(self._proc, "exitcode", None)
-
-    @property
-    def was_force_killed(self) -> bool:
-        with self._lock:
-            return self._was_force_killed
-
-    def is_alive(self) -> bool:
-        with self._lock:
-            if self._closed:
-                return False
-        is_alive_fn = getattr(self._proc, "is_alive", None)
-        if callable(is_alive_fn):
-            return bool(is_alive_fn())
-        return False
-
-    def join(self, timeout: float | None = None) -> None:
-        with self._lock:
-            if self._closed:
-                return
-        join_fn = getattr(self._proc, "join", None)
-        if callable(join_fn):
-            join_fn(timeout=timeout)
-
-    def kill_tree(self) -> None:
-        with self._lock:
-            self._was_force_killed = True
-        kill_fn = getattr(self._proc, "kill", None)
-        if callable(kill_fn):
-            kill_fn()
-
-    def kill(self) -> None:
-        self.kill_tree()
-
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-        close_fn = getattr(self._proc, "close", None)
-        if callable(close_fn):
-            close_fn()
-
-
-class InProcessWorkerLauncher(WorkerLauncher):
-    """进程内 Worker 替身启动器：保留真实单向 Pipe 边界，支持自定义 process_class。"""
-
-    def __init__(self, process_class: type | None = None) -> None:
-        self.process_class: type = process_class or _InProcessWorker
-
-    def launch(
-        self,
-        spec: "WorkerLaunchSpec",
-        *,
-        on_message: Callable[[], None] | None,
-        cancel_event: threading.Event,
-        commit_gate: CommitGate,
-    ) -> LaunchedWorker:
-        if cancel_event.is_set():
-            raise _WorkerLaunchCancelled(
-                f"stop requested before worker launch for {spec.job.uid}"
-            )
-
-        from .channel import _worker_process_entry
-
-        receiver, sender = create_worker_pipe(
-            job_uid=spec.job.uid,
-            execution_id=spec.execution_id,
-            run_id=spec.run_id or None,
-            attempt_no=spec.attempt_no,
-            on_message=on_message,
-        )
-        reply_receiver, reply_sender = create_worker_reply_pipe(
-            job_uid=spec.job.uid,
-            execution_id=spec.execution_id,
-            run_id=spec.run_id or None,
-            attempt_no=spec.attempt_no,
-        )
-        spec.job_context._bind_pipe_sender(sender, reply_receiver)
-        launch_spec = dataclasses.replace(
-            spec,
-            pipe_sender=sender,
-            reply_receiver=reply_receiver,
-            launch_guard=None,
-            commit_hook=None,
-        )
-
-        raw_proc: Any = None
-        handle: InProcessWorkerHandle | None = None
-        try:
-            raw_proc = self.process_class(target=_worker_process_entry, args=(launch_spec,))
-            handle = InProcessWorkerHandle(raw_proc)
-            launched = LaunchedWorker(
-                handle=handle,
-                receiver=receiver,
-                reply_sender=reply_sender,
-                started_at="",
-                in_process_sender=sender,
-            )
-
-            def release_fn() -> None:
-                if cancel_event.is_set():
-                    raise _WorkerLaunchCancelled(
-                        f"stop requested before worker start for {spec.job.uid}"
-                    )
-                launched.started_at = utc_now_iso()
-                raw_proc.start()
-
-            commit_gate(launched, release_fn)
-            return launched
-        except BaseException:
-            sender.close()
-            reply_receiver.close()
-            reply_sender.close()
-            if handle is not None:
-                try:
-                    if handle.is_alive():
-                        handle.kill_tree()
-                except Exception:
-                    pass
-                try:
-                    handle.join(timeout=5.0)
-                except Exception:
-                    pass
-                try:
-                    handle.close()
-                except Exception:
-                    pass
-            try:
-                receiver.close(timeout=2.0)
-            except Exception:
-                pass
-            raise
-
-
 __all__ = [
-    "CommitGate",
-    "InProcessWorkerHandle",
-    "InProcessWorkerLauncher",
     "LaunchedWorker",
     "ManagedWorkerHandle",
-    "PosixProcessHandle",
+    "PosixManagedWorkerHandle",
     "PosixProcessTreeAdapter",
+    "PreparedWorker",
     "ProcessTreeAdapter",
     "SubprocessWorkerLauncher",
-    "WindowsProcessHandle",
+    "WindowsManagedWorkerHandle",
     "WindowsProcessTreeAdapter",
     "WorkerLauncher",
-    "_InProcessWorker",
+    "_BasePopenWorkerHandle",
     "_WorkerLaunchCancelled",
     "default_process_tree_adapter",
 ]

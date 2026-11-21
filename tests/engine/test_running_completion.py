@@ -125,12 +125,14 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
     def fail(*args, **kwargs):
         raise error
 
-    class FailingStartProcess:
-        def __init__(self, **_kwargs):
-            self.exitcode = None
+    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
+    from tasklite.testing import InProcessWorkerLauncher
+    from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
 
-        def start(self):
-            raise error
+    class _NoopHandle:
+        pid = None
+        exitcode = None
+        was_force_killed = False
 
         def is_alive(self):
             return False
@@ -138,11 +140,41 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
         def join(self, timeout=None):
             pass
 
-        def kill(self):
+        def kill_tree(self):
             pass
 
         def close(self):
             pass
+
+    class _FailingReleaseLauncher(WorkerLauncher):
+        def prepare(self, spec, *, on_message, cancel_event):
+            receiver, sender = create_worker_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+                on_message=on_message,
+            )
+            reply_receiver, reply_sender = create_worker_reply_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+            )
+
+            def _abort():
+                sender.close()
+                reply_receiver.close()
+                reply_sender.close()
+                receiver.close(timeout=2.0)
+
+            return PreparedWorker(
+                handle=_NoopHandle(),
+                receiver=receiver,
+                reply_sender=reply_sender,
+                on_release=fail,
+                on_abort=_abort,
+            )
 
     adapter = runtime.store.path_policy.adapter
 
@@ -153,12 +185,12 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
 
     monkeypatch.setattr(runtime._completion, "complete_job", lambda *args, **kwargs: completed.append(args))
     monkeypatch.setattr(adapter, "delete_target", guarded_delete)
-    process_cls = FailingStartProcess if stage == "process_start" else None
-    with in_process_workers(pipeline, process_cls), authorizer(pipeline, lambda path, kind: True):
+    launcher = _FailingReleaseLauncher() if stage == "process_start" else None
+    with in_process_workers(pipeline, launcher), authorizer(pipeline, lambda path, kind: True):
         if stage in ("context", "interrupt"):
             monkeypatch.setattr(runtime._dispatch, "_build_context", fail)
         elif stage == "spawn":
-            monkeypatch.setattr(runtime.channel, "spawn", fail)
+            monkeypatch.setattr(runtime.channel, "prepare_spawn", fail)
 
         with pytest.raises(type(error)) as caught:
             pipeline.run(install_signals=False)
@@ -171,6 +203,7 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
         assert capacity.used == 0
         assert completed == cleanup == []
         monkeypatch.undo()
+    with in_process_workers(pipeline), authorizer(pipeline, lambda path, kind: True):
         pipeline.run(install_signals=False)
 
     with StateSnapshot.open(pipeline) as snap:
@@ -298,13 +331,13 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
         pipeline.stop()
         return result
 
-    class StopBeforeProcess:
-        def __init__(self, **_kwargs):
-            pipeline.stop()
-            self.exitcode = None
+    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
+    from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
 
-        def start(self):
-            pass
+    class _NoopHandle:
+        pid = None
+        exitcode = None
+        was_force_killed = False
 
         def is_alive(self):
             return False
@@ -312,11 +345,42 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
         def join(self, timeout=None):
             pass
 
-        def kill(self):
+        def kill_tree(self):
             pass
 
         def close(self):
             pass
+
+    class _StopOnPrepareLauncher(WorkerLauncher):
+        def prepare(self, spec, *, on_message, cancel_event):
+            pipeline.stop()
+            receiver, sender = create_worker_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+                on_message=on_message,
+            )
+            reply_receiver, reply_sender = create_worker_reply_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+            )
+
+            def _abort():
+                sender.close()
+                reply_receiver.close()
+                reply_sender.close()
+                receiver.close(timeout=2.0)
+
+            return PreparedWorker(
+                handle=_NoopHandle(),
+                receiver=receiver,
+                reply_sender=reply_sender,
+                on_release=lambda: None,
+                on_abort=_abort,
+            )
 
     def release(amount):
         releases.append(amount)
@@ -327,8 +391,8 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
         monkeypatch.setattr(runtime._dispatch, "_build_context", context)
     monkeypatch.setattr(runtime._completion, "complete_job", lambda *args, **kwargs: completed.append(args))
     monkeypatch.setattr(capacity, "release", release)
-    process_cls = StopBeforeProcess if stage == "process" else None
-    with in_process_workers(pipeline, process_cls), authorizer(pipeline, lambda path, kind: True):
+    launcher = _StopOnPrepareLauncher() if stage == "process" else None
+    with in_process_workers(pipeline, launcher), authorizer(pipeline, lambda path, kind: True):
         pipeline.run(install_signals=False)
     with StateSnapshot.open(pipeline) as snapshot:
         pending = snapshot.get_job("work::one")
@@ -533,7 +597,7 @@ def test_running_snapshot_projects_queue_started_at_until_settlement(tmp_path, m
         def record_running_snapshot():
             row, = runtime.store.backend.load_queue_jobs(status="running")
             identities.append(row)
-            assert not runtime.channel._handles
+            assert not runtime.channel.active_handles()
             assert not runtime.in_flight
             for source in sources:
                 snapshot = snapshots.enter_context(StateSnapshot.open(source))
@@ -546,20 +610,38 @@ def test_running_snapshot_projects_queue_started_at_until_settlement(tmp_path, m
                 assert list(snapshot.iter_attempts(job_uid="work::committed")) == []
                 running_snapshots.append((snapshot, current))
 
-        from tasklite.engine.launcher import _InProcessWorker
+        from tasklite.engine.launcher import PreparedWorker
+        from tasklite.testing import InProcessWorkerLauncher
 
-        class TrackingProcess(_InProcessWorker):
-            def start(self):
-                starts.append(clock[0])
-                super().start()
-                clock[0] = returned_time
+        class _TrackingLauncher(InProcessWorkerLauncher):
+            def prepare(self, spec, *, on_message, cancel_event):
+                prepared = super().prepare(
+                    spec,
+                    on_message=on_message,
+                    cancel_event=cancel_event,
+                )
+                orig_release = prepared._on_release
 
-        with in_process_workers(pipeline, TrackingProcess):
+                def tracked_release():
+                    starts.append(clock[0])
+                    orig_release()
+                    clock[0] = returned_time
+
+                return PreparedWorker(
+                    handle=prepared.handle,
+                    receiver=prepared.receiver,
+                    reply_sender=prepared.reply_sender,
+                    on_release=tracked_release,
+                    on_abort=prepared.abort,
+                )
+
+        tracking_launcher = _TrackingLauncher()
+        with in_process_workers(pipeline, tracking_launcher):
             owner, name = {
                 "resource": (capacity, "acquire"),
                 "pre_delete": (runtime.store.path_policy.adapter, "delete_target"),
                 "context": (runtime._dispatch, "_build_context"),
-                "process": (runtime.channel._launcher, "process_class"),
+                "process": (tracking_launcher, "prepare"),
             }[stage]
             original = getattr(owner, name)
 

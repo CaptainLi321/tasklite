@@ -53,52 +53,98 @@ class CountingResource(Resource):
         return None
 
 
-def _fake_process_class(*, fail_uid=None, spawn_jobs=(), seen=None):
-    """FakeProcess：start() 经 Pipe 发送结果；可选失败 UID 与派生作业。"""
+def _make_stub_launcher(*, fail_uid=None, spawn_jobs=(), seen=None):
+    """受控 WorkerLauncher：release() 经 Pipe 发送结果；可选失败 UID 与派生作业。"""
+    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
+    from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
 
-    class InstantProcess:
-        def __init__(self, target=None, args=(), kwargs=None, **_kw):
-            self.args = args
-            self.exitcode = 0
+    class _InstantHandle:
+        pid = None
+        exitcode = 0
+        was_force_killed = False
 
-        def start(self):
-            spec = self.args[0]
-            if seen is not None:
-                seen.append(spec.job.uid)
-            if spec.job.uid == fail_uid:
-                result = {
-                    "status": "failure",
-                    "message": "boom",
-                    "metadata": {},
-                }
-            else:
-                result = {
-                    "status": "success",
-                    "metadata": {},
-                    "spawned_jobs": [dict(job) for job in spawn_jobs],
-                    "cursor_updates": {},
-                }
-            assert spec.pipe_sender is not None
-            spec.pipe_sender.send_result(result)
+        def __init__(self, sender, reply_receiver) -> None:
+            self._sender = sender
+            self._reply_receiver = reply_receiver
 
-        def is_alive(self):
+        def _close_pipes(self) -> None:
+            if self._sender is not None:
+                self._sender.close()
+                self._sender = None
+            if self._reply_receiver is not None:
+                self._reply_receiver.close()
+                self._reply_receiver = None
+
+        def is_alive(self) -> bool:
             return False
 
-        def join(self, timeout=None):
-            pass
+        def join(self, timeout=None) -> None:
+            self._close_pipes()
 
-        def kill(self):
+        def kill_tree(self) -> None:
+            self.was_force_killed = True
             self.exitcode = -9
+            self._close_pipes()
 
-        def close(self):
-            pass
+        def close(self) -> None:
+            self._close_pipes()
 
-    return InstantProcess
+    class _StubLauncher(WorkerLauncher):
+        def prepare(self, spec, *, on_message, cancel_event):
+            receiver, sender = create_worker_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+                on_message=on_message,
+            )
+            reply_receiver, reply_sender = create_worker_reply_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+            )
+            handle = _InstantHandle(sender, reply_receiver)
+
+            def _release():
+                if seen is not None:
+                    seen.append(spec.job.uid)
+                if spec.job.uid == fail_uid:
+                    result = {
+                        "status": "failure",
+                        "message": "boom",
+                        "metadata": {},
+                    }
+                else:
+                    result = {
+                        "status": "success",
+                        "metadata": {},
+                        "spawned_jobs": [dict(job) for job in spawn_jobs],
+                        "cursor_updates": {},
+                    }
+                sender.send_result(result)
+                handle._close_pipes()
+
+            def _abort():
+                handle.kill_tree()
+                handle.close()
+                reply_sender.close()
+                receiver.close(timeout=2.0)
+
+            return PreparedWorker(
+                handle=handle,
+                receiver=receiver,
+                reply_sender=reply_sender,
+                on_release=_release,
+                on_abort=_abort,
+            )
+
+    return _StubLauncher()
 
 
 @pytest.fixture()
 def fake_process():
-    return _fake_process_class
+    return _make_stub_launcher
 
 
 def _pipeline(root=None, name: str = "selection", **overrides) -> TaskLite:
@@ -142,7 +188,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     pipeline.enqueue(Job("rank", "r", depends_on=["convert::b"]))
     before = {uid: row for uid, row in zip(_queued(pipeline), pipeline._runtime.store.backend.load_queue())}
 
-    with in_process_workers(pipeline, _fake_process_class(seen=seen)):
+    with in_process_workers(pipeline, _make_stub_launcher(seen=seen)):
         pipeline.run(exclude=Exclude(task_type="convert"))
 
         assert sorted(pipeline._runtime.store.backend.load_successes()) == ["fetch::a"]
@@ -342,7 +388,7 @@ def test_spawned_excluded_child_stays_queued(tmp_path):
 
     with in_process_workers(
         pipeline,
-        _fake_process_class(spawn_jobs=[spawned]),
+        _make_stub_launcher(spawn_jobs=[spawned]),
     ):
         pipeline.run(exclude=Exclude(task_type="excluded_t"))
 
@@ -363,7 +409,7 @@ def test_failed_parent_cascade_keeps_excluded_downstream(tmp_path):
 
     with in_process_workers(
         pipeline,
-        _fake_process_class(fail_uid="fetch::parent"),
+        _make_stub_launcher(fail_uid="fetch::parent"),
     ):
         pipeline.run(exclude=Exclude(task_type="excluded_t"))
 

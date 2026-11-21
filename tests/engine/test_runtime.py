@@ -41,13 +41,12 @@ def ok_handler(job, ctx):
     return True
 
 
-# ── fake 进程族（与真实 worker 共用瞬时 Pipe 边界）────────────────────
+# ── 受控 WorkerLauncher 族（与真实 worker 共用瞬时 Pipe 边界）──────────
 
 
-def _write_success_result(spec) -> None:
-    """按 WorkerLaunchSpec 具名契约通过 Pipe 发送成功结果。"""
-    assert spec.pipe_sender is not None
-    spec.pipe_sender.send_result(
+def _write_success_result(pipe_sender) -> None:
+    """按 WorkerPipeSender 契约通过 Pipe 发送成功结果。"""
+    pipe_sender.send_result(
         {
             "status": "success",
             "metadata": {},
@@ -57,103 +56,170 @@ def _write_success_result(spec) -> None:
     )
 
 
-def make_instant_process_class():
-    """FakeProcess：start() 即写成功结果并退出（E2E 冒烟用）。"""
+class _InstantHandle:
+    """立即完成退出的受控 ManagedWorkerHandle。"""
 
-    class InstantProcess:
-        def __init__(self, target=None, args=(), kwargs=None, **_kw):
-            self.args = args
-            self._alive = False
-            self.exitcode = 0
+    pid = None
+    exitcode = 0
+    was_force_killed = False
 
-        def start(self):
-            if self.args:
-                _write_success_result(self.args[0])
-            self._alive = False
+    def __init__(self, sender, reply_receiver) -> None:
+        self._sender = sender
+        self._reply_receiver = reply_receiver
 
-        def is_alive(self):
-            return False
+    def _close_pipes(self) -> None:
+        if self._sender is not None:
+            self._sender.close()
+            self._sender = None
+        if self._reply_receiver is not None:
+            self._reply_receiver.close()
+            self._reply_receiver = None
 
-        def join(self, timeout=None):
-            pass
+    def is_alive(self) -> bool:
+        return False
 
-        def kill(self):
-            self.exitcode = -9
+    def join(self, timeout=None) -> None:
+        self._close_pipes()
 
-        def close(self):
-            pass
+    def kill_tree(self) -> None:
+        self.was_force_killed = True
+        self.exitcode = -9
+        self._close_pipes()
 
-    return InstantProcess
+    def close(self) -> None:
+        self._close_pipes()
 
 
-def make_gate_process_class(enter_event, release_event):
-    """FakeProcess：start() 置位 enter_event 后保持 alive；release_event
-    置位后写成功结果并退出——精确控制「执行体活动期」窗口。"""
+def make_instant_launcher():
+    """受控 WorkerLauncher：release() 即写成功结果并退出（E2E 冒烟用）。"""
+    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
+    from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
 
-    class GateProcess:
-        def __init__(self, target=None, args=(), kwargs=None, **_kw):
-            self.args = args
+    class _InstantLauncher(WorkerLauncher):
+        def prepare(self, spec, *, on_message, cancel_event):
+            receiver, sender = create_worker_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+                on_message=on_message,
+            )
+            reply_receiver, reply_sender = create_worker_reply_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+            )
+            handle = _InstantHandle(sender, reply_receiver)
+
+            def _release():
+                _write_success_result(sender)
+                handle._close_pipes()
+
+            def _abort():
+                handle.kill_tree()
+                handle.close()
+                reply_sender.close()
+                receiver.close(timeout=2.0)
+
+            return PreparedWorker(
+                handle=handle,
+                receiver=receiver,
+                reply_sender=reply_sender,
+                on_release=_release,
+                on_abort=_abort,
+            )
+
+    return _InstantLauncher()
+
+
+def make_gate_launcher(enter_event, release_event):
+    """受控 WorkerLauncher：release() 置位 enter_event 后保持 alive；
+    release_event 置位后写成功结果并退出——精确控制「执行体活动期」窗口。"""
+    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
+    from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
+
+    class _GateHandle:
+        pid = None
+
+        def __init__(self, sender, reply_receiver) -> None:
+            self._sender = sender
+            self._reply_receiver = reply_receiver
             self._alive = False
             self._written = False
             self.exitcode = 0
+            self.was_force_killed = False
 
-        def start(self):
+        def start(self) -> None:
             self._alive = True
             enter_event.set()
 
-        def _complete_if_released(self):
+        def _close_pipes(self) -> None:
+            if self._sender is not None:
+                self._sender.close()
+                self._sender = None
+            if self._reply_receiver is not None:
+                self._reply_receiver.close()
+                self._reply_receiver = None
+
+        def _complete_if_released(self) -> None:
             if not release_event.is_set() or self._written:
                 return
             self._written = True
-            if self.args:
-                _write_success_result(self.args[0])
+            if self._sender is not None:
+                _write_success_result(self._sender)
             self._alive = False
+            self._close_pipes()
 
-        def is_alive(self):
+        def is_alive(self) -> bool:
             self._complete_if_released()
             return self._alive
 
-        def join(self, timeout=None):
+        def join(self, timeout=None) -> None:
             self._complete_if_released()
 
-        def kill(self):
+        def kill_tree(self) -> None:
             self._alive = False
             self.exitcode = -9
+            self.was_force_killed = True
+            self._close_pipes()
 
-        def close(self):
-            pass
-
-    return GateProcess
-
-
-def make_stay_alive_process_class(enter_event):
-    """FakeProcess：start() 置位 enter_event 后永不写结果、保持 alive
-    （被 kill 才退出）。"""
-
-    class StayAliveProcess:
-        def __init__(self, target=None, args=(), kwargs=None, **_kw):
-            self.args = args
+        def close(self) -> None:
             self._alive = False
-            self.exitcode = 0
+            self._close_pipes()
 
-        def start(self):
-            self._alive = True
-            enter_event.set()
+    class _GateLauncher(WorkerLauncher):
+        def prepare(self, spec, *, on_message, cancel_event):
+            receiver, sender = create_worker_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+                on_message=on_message,
+            )
+            reply_receiver, reply_sender = create_worker_reply_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+            )
+            handle = _GateHandle(sender, reply_receiver)
 
-        def is_alive(self):
-            return self._alive
+            def _abort():
+                handle.kill_tree()
+                handle.close()
+                reply_sender.close()
+                receiver.close(timeout=2.0)
 
-        def join(self, timeout=None):
-            pass
+            return PreparedWorker(
+                handle=handle,
+                receiver=receiver,
+                reply_sender=reply_sender,
+                on_release=handle.start,
+                on_abort=_abort,
+            )
 
-        def kill(self):
-            self._alive = False
-            self.exitcode = -9
-
-        def close(self):
-            pass
-
-    return StayAliveProcess
+    return _GateLauncher()
 
 
 class RuntimeEnv:
@@ -264,7 +330,7 @@ class TestEngineRuntimeExecutionLifecycle:
         env = RuntimeEnv(tmp_path)
         env.register("t")
         assert env.runtime.store.enqueue_job(Job("t", "j1", payload={})) is True
-        with in_process_workers(env.runtime, make_instant_process_class()):
+        with in_process_workers(env.runtime, make_instant_launcher()):
             assert env.runtime.execute() is None
 
         assert "t::j1" in env.backend.load_successes()
@@ -461,7 +527,7 @@ class TestRunReentryGuard:
             except BaseException as e:  # 正常路径不应抛，兜底记录便于诊断
                 run_errors.append(e)
 
-        with in_process_workers(runtime, make_gate_process_class(enter, release)):
+        with in_process_workers(runtime, make_gate_launcher(enter, release)):
             t = threading.Thread(target=run_once)
             t.start()
             try:
@@ -595,7 +661,7 @@ class TestGracefulDraining:
             observed["alive_during_draining"] = proc.is_alive()
             release.set()  # 放行：in-flight 自然完成
 
-        with in_process_workers(runtime, make_gate_process_class(enter, release)):
+        with in_process_workers(runtime, make_gate_launcher(enter, release)):
             t = threading.Thread(target=controller)
             t.start()
             assert runtime.execute() is None

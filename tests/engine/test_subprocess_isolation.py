@@ -217,18 +217,20 @@ def test_spawn_and_declarations_ignore_directory_environment(tmp_path, monkeypat
         pipeline.register_task("child", child_handler)
         channel = pipeline._runtime.channel
         reply_senders = []
-        original_spawn = channel.spawn
+        execution_ids = []
+        original_release = channel.release_spawn
 
-        def capture_reply_sender(spec):
-            handle = original_spawn(spec)
+        def capture_reply_sender(prepared):
+            handle = original_release(prepared)
+            execution_ids.append(handle.execution_id)
             reply_senders.append(channel.get_reply_sender(handle.execution_id))
             return handle
 
-        monkeypatch.setattr(channel, "spawn", capture_reply_sender)
+        monkeypatch.setattr(channel, "release_spawn", capture_reply_sender)
         pipeline.enqueue(Job("parent", "parent"))
         pipeline.run(install_signals=False)
         assert len(reply_senders) == 2
-        assert channel._reply_senders == {}
+        assert all(channel.get_reply_sender(eid) is None for eid in execution_ids)
         assert all(sender._closed and sender._conn.closed for sender in reply_senders)
 
         with StateSnapshot.open(pipeline) as snap:
@@ -325,7 +327,7 @@ def test_process_death_is_single_failure_without_implicit_retry(pipelines, tmp_p
     if mode == "kill":
         def kill_ready_worker():
             assert _wait_until(lambda: (sync_dir / "ready").exists())
-            handles = list(pipeline._runtime.channel._handles.values())
+            handles = pipeline._runtime.channel.active_handles()
             assert len(handles) == 1
             handles[0].process.kill()
 

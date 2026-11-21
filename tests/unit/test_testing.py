@@ -277,3 +277,18 @@ class TestAuthorizerAndInProcessWorkersHandles:
                 record = snap.get_job("echo::item")
                 assert record is not None
                 assert record["status"] == "succeeded"
+
+    def test_in_process_workers_accepts_custom_launcher_and_rejects_non_launcher(self):
+        from tasklite.testing import InProcessWorkerLauncher
+
+        with TaskLite(backend="memory", max_workers=1) as pipeline:
+            orig_launcher = pipeline._channel._launcher
+            custom = InProcessWorkerLauncher()
+            with in_process_workers(pipeline, custom):
+                assert pipeline._channel._launcher is custom
+            assert pipeline._channel._launcher is orig_launcher
+
+            with pytest.raises(TypeError, match="WorkerLauncher"):
+                with in_process_workers(pipeline, object):  # type: ignore[arg-type]
+                    pass
+            assert pipeline._channel._launcher is orig_launcher

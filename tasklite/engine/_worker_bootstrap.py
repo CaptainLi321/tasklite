@@ -1,13 +1,13 @@
 """隔离子进程两阶段引导入口与 Fork-Bomb 重入守卫。
 
 由 ``SubprocessWorkerLauncher`` 以 ``python -m tasklite.engine._worker_bootstrap`` 启动，
-严格执行两阶段握手协议：
+仅导入纯 worker 侧模块，严格执行两阶段握手协议：
 1. 立即清除私有 IPC 环境变量并屏蔽停止信号；
 2. 依次向父进程 ``Listener`` 建立 ``uplink`` 与 ``downlink`` 双物理连接；
 3. 阻塞接收预序列化的 ``prep_bytes`` 与 ``payload_bytes``（仅缓存字节，不导入用户代码）；
 4. 阻塞等待父进程 ``b"GO"`` 放行门（此时进程树绑定已零竞态完成）；
 5. 放行后置位 ``_IMPORTING_MP_MAIN`` 重入守卫，还原 ``sys.path`` / ``cwd`` / ``__mp_main__``，
-   反序列化执行载荷并进入 ``_worker_process_entry``；引导期任何故障经 ``uplink`` 回传
+   反序列化执行载荷并进入 ``run_worker_entry``；引导期任何故障经 ``uplink`` 回传
    结构化 ``failure`` 帧，绝不静默退出。
 """
 
@@ -17,7 +17,6 @@ import json
 import os
 import pickle
 import runpy
-import signal
 import sys
 import traceback
 import types
@@ -25,6 +24,11 @@ from multiprocessing.connection import Client
 from typing import Any
 
 from ..utils.ipc import WorkerPipeSender, WorkerReplyReceiver
+from ._worker_runtime import (
+    WorkerLaunchSpec,
+    ignore_worker_stop_signals,
+    run_worker_entry,
+)
 from .types import (
     ENV_IPC_ADDR,
     ENV_IPC_AUTHKEY,
@@ -32,18 +36,6 @@ from .types import (
     LAUNCH_GO_TOKEN,
     _set_importing_mp_main,
 )
-
-
-def _ignore_stop_signals() -> None:
-    """在建立连接与加载用户代码前忽略停止信号，避免主进程停机信号穿透 worker。"""
-    if os.name == "posix":
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    elif os.name == "nt":
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        sigbreak = getattr(signal, "SIGBREAK", None)
-        if sigbreak is not None:
-            signal.signal(sigbreak, signal.SIG_IGN)
 
 
 def _import_mp_main_from_name(mod_name: str) -> None:
@@ -121,7 +113,7 @@ def _bootstrap_main() -> None:
         sys.stderr.write("tasklite worker bootstrap missing required IPC environment variables\n")
         sys.exit(2)
 
-    _ignore_stop_signals()
+    ignore_worker_stop_signals()
 
     try:
         authkey = bytes.fromhex(authkey_hex)
@@ -203,8 +195,6 @@ def _bootstrap_main() -> None:
     try:
         _restore_environment(prep_data)
         spec_payload = pickle.loads(payload_bytes)
-        from .channel import WorkerLaunchSpec, _worker_process_entry
-
         launch_spec = WorkerLaunchSpec(
             handler=spec_payload["handler"],
             job=spec_payload["job"],
@@ -222,7 +212,7 @@ def _bootstrap_main() -> None:
         reply_receiver.close()
         return
 
-    _worker_process_entry(launch_spec)
+    run_worker_entry(launch_spec)
 
 
 if __name__ == "__main__":

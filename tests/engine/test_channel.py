@@ -1,11 +1,18 @@
-"""v2 执行通道测试：结果协议、退出证据、看门狗、解码防御与中止。
+"""v2 执行通道测试：线性两阶段启动、单一会话状态机、结果协议、看门狗、解码防御与中止。
 
-以受控进程桩与内联 worker 包装确定性复现时序（无真实多进程竞速）；
-端到端（派发机器/完成机器装配后的 run 主循环）由后续门面阶段承接。
+通过标准 ``WorkerLauncher`` / ``ManagedWorkerHandle`` 接缝与真实 Pipe 契约验证通道行为，
+不直接探测或改写通道私有字典。
 """
 
+from __future__ import annotations
+
+import ast
+import os
+import pathlib
 import threading
 import time
+from collections.abc import Callable
+from multiprocessing.connection import Listener
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,19 +23,31 @@ from tasklite.engine.channel import (
     ExecutionResult,
     WorkerLaunchSpec,
 )
-from tasklite.engine.launcher import InProcessWorkerLauncher
+from tasklite.engine.launcher import (
+    PosixManagedWorkerHandle,
+    PreparedWorker,
+    SubprocessWorkerLauncher,
+    WindowsManagedWorkerHandle,
+    WorkerLauncher,
+    _HandshakeAcceptor,
+    _WorkerLaunchCancelled,
+    _make_ipc_address,
+)
 from tasklite.engine.types import AuthorizationOutcome, AuthorizationStatus, JobHandle
 from tasklite.models.context import JobContext
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
+from tasklite.testing import InProcessWorkerLauncher
 from tasklite.utils.ipc import (
     PIPE_MSG_RESULT,
     WorkerPipeMessage,
     WorkerPipeSender,
+    create_worker_pipe,
     create_worker_reply_pipe,
 )
 
 _EXECUTION_ID = "deadbeefdeadbeefdeadbeefdeadbeef.1"
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def make_ctx(job: Job) -> JobContext:
@@ -38,34 +57,203 @@ def make_ctx(job: Job) -> JobContext:
 
 def make_spec(
     job: Job,
-    handler,
+    handler: Callable[[Job, JobContext], Any],
     execution_id: str | None = _EXECUTION_ID,
     *,
     pipe_sender: WorkerPipeSender | None = None,
     job_context: JobContext | None = None,
+    timeout_seconds: float = 60.0,
 ) -> WorkerLaunchSpec:
     return WorkerLaunchSpec(
         handler=handler,
         job=job,
         job_context=job_context if job_context is not None else make_ctx(job),
         execution_id=execution_id,  # type: ignore[arg-type]
-        timeout_seconds=60.0,
+        timeout_seconds=timeout_seconds,
         pipe_sender=pipe_sender,
     )
 
 
-class TestExecutionChannelBasics:
-    def test_duplicate_result_frame_keeps_first_payload(self, tmp_path):
-        channel = ExecutionChannel()
-        job = Job("t", "duplicate")
-        handle = JobHandle(
-            job_uid=job.uid,
-            process=SimpleNamespace(exitcode=None),
-            timeout_at_monotonic=time.monotonic() + 10,
-            timeout_seconds=10,
-            job=job,
-            execution_id=_EXECUTION_ID,
+class _ControlledWorkerHandle:
+    """可编程受控句柄（直接实现 ManagedWorkerHandle，并遵循退出/强杀即关写端契约）。"""
+
+    def __init__(
+        self,
+        *,
+        pipe_sender: WorkerPipeSender | None = None,
+        reply_receiver: Any = None,
+        alive: bool = False,
+        exitcode: int | None = 0,
+        die_on_join: bool = False,
+        on_kill: Callable[[_ControlledWorkerHandle], None] | None = None,
+    ) -> None:
+        self._pipe_sender = pipe_sender
+        self._reply_receiver = reply_receiver
+        self._alive = alive
+        self._exitcode = exitcode
+        self._die_on_join = die_on_join
+        self._on_kill = on_kill
+        self._was_force_killed = False
+        self._closed = False
+        self.joined = False
+        self.killed = False
+        self.closed = False
+
+    def _close_pipes(self) -> None:
+        if self._pipe_sender is not None:
+            try:
+                self._pipe_sender.close()
+            except OSError:
+                pass
+            self._pipe_sender = None
+        if self._reply_receiver is not None:
+            try:
+                self._reply_receiver.close()
+            except OSError:
+                pass
+            self._reply_receiver = None
+
+    @property
+    def pid(self) -> int | None:
+        return None
+
+    @property
+    def exitcode(self) -> int | None:
+        return self._exitcode
+
+    @property
+    def was_force_killed(self) -> bool:
+        return self._was_force_killed
+
+    def is_alive(self) -> bool:
+        return self._alive and not self._closed
+
+    def join(self, timeout: float | None = None) -> None:
+        self.joined = True
+        if self._die_on_join:
+            self._alive = False
+        if not self._alive:
+            self._close_pipes()
+
+    def kill_tree(self) -> None:
+        self._was_force_killed = True
+        self.killed = True
+        if self._on_kill is not None:
+            self._on_kill(self)
+        self._alive = False
+        if self._exitcode is None:
+            self._exitcode = -9
+        self._close_pipes()
+
+    def kill(self) -> None:
+        self.kill_tree()
+
+    def close(self) -> None:
+        self._closed = True
+        self.closed = True
+        self._alive = False
+        self._close_pipes()
+
+
+class _ScriptedLauncher(WorkerLauncher):
+    """按脚本向真实 Pipe 写入帧或模拟存活/挂起/强杀窗口的标准 WorkerLauncher。"""
+
+    def __init__(
+        self,
+        *,
+        on_release: Callable[[WorkerLaunchSpec, WorkerPipeSender, _ControlledWorkerHandle], None] | None = None,
+        alive: bool = False,
+        exitcode: int | None = 0,
+        die_on_join: bool = False,
+        on_kill: Callable[[WorkerPipeSender, _ControlledWorkerHandle], None] | None = None,
+        close_sender_on_release: bool = True,
+    ) -> None:
+        self._on_release = on_release
+        self._alive = alive
+        self._exitcode = exitcode
+        self._die_on_join = die_on_join
+        self._on_kill = on_kill
+        self._close_sender_on_release = close_sender_on_release
+        self.handles: list[_ControlledWorkerHandle] = []
+        self.reply_receivers: list[Any] = []
+        self.abort_count = 0
+
+    def prepare(
+        self,
+        spec: WorkerLaunchSpec,
+        *,
+        on_message: Callable[[], None] | None,
+        cancel_event: threading.Event,
+    ) -> PreparedWorker:
+        if cancel_event.is_set():
+            raise _WorkerLaunchCancelled("cancelled before prepare")
+        receiver, sender = create_worker_pipe(
+            job_uid=spec.job.uid,
+            execution_id=spec.execution_id,
+            run_id=spec.run_id or None,
+            attempt_no=spec.attempt_no,
+            on_message=on_message,
         )
+        reply_receiver, reply_sender = create_worker_reply_pipe(
+            job_uid=spec.job.uid,
+            execution_id=spec.execution_id,
+            run_id=spec.run_id or None,
+            attempt_no=spec.attempt_no,
+        )
+        self.reply_receivers.append(reply_receiver)
+
+        def _kill_cb(h: _ControlledWorkerHandle) -> None:
+            if self._on_kill is not None:
+                self._on_kill(sender, h)
+
+        handle = _ControlledWorkerHandle(
+            pipe_sender=sender,
+            reply_receiver=reply_receiver,
+            alive=self._alive,
+            exitcode=self._exitcode,
+            die_on_join=self._die_on_join,
+            on_kill=_kill_cb if self._on_kill is not None else None,
+        )
+        self.handles.append(handle)
+
+        def _release() -> None:
+            if self._on_release is not None:
+                self._on_release(spec, sender, handle)
+            if self._close_sender_on_release and not handle.is_alive():
+                handle._close_pipes()
+
+        def _abort() -> None:
+            self.abort_count += 1
+            handle.kill_tree()
+            handle.close()
+            reply_sender.close()
+            receiver.close(timeout=2.0)
+
+        return PreparedWorker(
+            handle=handle,
+            receiver=receiver,
+            reply_sender=reply_sender,
+            on_release=_release,
+            on_abort=_abort,
+        )
+
+
+def _wait_for_reap(
+    channel: ExecutionChannel,
+    handles: list[JobHandle],
+    timeout: float = 5.0,
+) -> list[tuple[JobHandle, ExecutionResult]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        completed = channel.reap_completed(handles)
+        if completed:
+            return completed
+        time.sleep(0.005)
+    raise AssertionError("worker did not complete in time")
+
+
+class TestExecutionChannelBasics:
+    def test_duplicate_result_frame_keeps_first_payload(self):
         first = {
             "status": "success",
             "metadata": {"frame": 1},
@@ -78,53 +266,21 @@ class TestExecutionChannelBasics:
             "metadata": {},
             "exception": None,
         }
-        for payload in (first, second):
-            channel._accept_message(
-                handle,
-                WorkerPipeMessage(
-                    job_uid=job.uid,
-                    execution_id=_EXECUTION_ID,
-                    kind=PIPE_MSG_RESULT,
-                    payload=payload,
-                ),
-            )
 
-        assert channel._results[_EXECUTION_ID] == first
+        def send_two(_spec, sender, _handle):
+            sender.send_result(first)
+            sender.send_result(second)
 
-class _ThreadWorker:
-    def __init__(self, *, target, args=(), kwargs=None):
-        self._target = target
-        self._args = args
-        self._kwargs = dict(kwargs or {})
-        self.exitcode: int | None = None
-        self._thread: threading.Thread | None = None
-
-    def _run(self) -> None:
+        channel = ExecutionChannel(launcher=_ScriptedLauncher(on_release=send_two))
         try:
-            self._target(*self._args, **self._kwargs)
-            if self.exitcode is None:
-                self.exitcode = 0
-        except BaseException:
-            if self.exitcode is None:
-                self.exitcode = 1
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def join(self, timeout=None) -> None:
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-
-    def kill(self) -> None:
-        if self.exitcode is None:
-            self.exitcode = -9
-
-    def close(self) -> None:
-        self._thread = None
+            handle = channel.spawn(make_spec(Job("t", "duplicate"), lambda j, c: TaskResult.success()))
+            completed = _wait_for_reap(channel, [handle])
+            assert len(completed) == 1
+            assert completed[0][1].success is True
+            assert completed[0][1].result_metadata == {"frame": 1}
+            assert not channel.has_active_workers
+        finally:
+            channel.close()
 
 
 class TestWorkerWrapper:
@@ -133,12 +289,12 @@ class TestWorkerWrapper:
     @staticmethod
     def _run_worker(
         job: Job,
-        handler,
+        handler: Callable[[Job, JobContext], Any],
         execution_id: str = _EXECUTION_ID,
         *,
         job_context: JobContext | None = None,
     ) -> ExecutionResult:
-        channel = ExecutionChannel(launcher=InProcessWorkerLauncher(_ThreadWorker))
+        channel = ExecutionChannel(launcher=InProcessWorkerLauncher())
         try:
             spec = make_spec(
                 job,
@@ -147,13 +303,8 @@ class TestWorkerWrapper:
                 job_context=job_context,
             )
             handle = channel.spawn(spec)
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                completed = channel.reap_completed([handle])
-                if completed:
-                    return completed[0][1]
-                time.sleep(0.005)
-            raise AssertionError("worker did not complete in time")
+            completed = _wait_for_reap(channel, [handle])
+            return completed[0][1]
         finally:
             channel.close()
 
@@ -165,6 +316,7 @@ class TestWorkerWrapper:
 
     def test_worker_error_payloads_sent_over_pipe(self):
         """retry/failure 各状态通道的 payload 均经 Pipe 发送与收割。"""
+
         def return_retry(job, ctx):
             return TaskResult.retry(message="t")
 
@@ -181,10 +333,9 @@ class TestWorkerWrapper:
         assert res_exit.exception is not None and res_exit.exception["type"] == "SystemExit"
 
     def test_worker_rejects_missing_execution_id(self):
-        """execution_id 缺失 fail-loud，handler 不得执行且不得产出成功结果。"""
+        """execution_id 缺失 fail-loud，handler 不得执行且通道自动回收会话。"""
         called: list[bool] = []
-        channel = ExecutionChannel(launcher=InProcessWorkerLauncher(_ThreadWorker))
-        handle = None
+        channel = ExecutionChannel(launcher=InProcessWorkerLauncher())
         try:
             handle = channel.spawn(
                 make_spec(
@@ -193,33 +344,17 @@ class TestWorkerWrapper:
                     execution_id=None,
                 )
             )
-            deadline = time.monotonic() + 5.0
-            completed = []
-            while time.monotonic() < deadline and not completed:
-                completed = channel.reap_completed([handle])
-                if not completed:
-                    time.sleep(0.005)
+            completed = _wait_for_reap(channel, [handle])
             assert len(completed) == 1
             assert completed[0][1].success is False
             assert called == []
+            assert not channel.has_active_workers
         finally:
-            for mapping in (
-                channel._in_process_senders,
-                channel._reply_senders,
-            ):
-                item = mapping.pop(None, None)  # type: ignore[arg-type]
-                if item is not None:
-                    item.close()
-            recv = channel._receivers.pop(None, None)  # type: ignore[arg-type]
-            if recv is not None:
-                recv.close(timeout=1.0)
-            stop = channel._health_stops.pop(None, None)  # type: ignore[arg-type]
-            if stop is not None:
-                stop.set()
             channel.close()
 
     def test_retry_carries_consume_budget(self):
         """retry 结果携带 consume_budget 经 Pipe 传递。"""
+
         def zero_budget(job, ctx):
             return TaskResult.retry(message="no burn", consume_budget=False)
 
@@ -257,6 +392,7 @@ class TestWorkerWrapper:
 
     def test_pipe_send_failure_exits_without_crash(self, monkeypatch):
         """Pipe 发送结果遇到 OSError 时，worker 不抛未捕获异常退出，通道按无结果失败收割。"""
+
         def refusing_send(sender_self, payload):
             raise BrokenPipeError("pipe broken")
 
@@ -266,34 +402,87 @@ class TestWorkerWrapper:
         assert "without a result" in (res.message or "")
 
 
-class TestSpawnFailureCleanup:
-    def test_submit_start_failure_reraises(self, tmp_path):
-        class ExplodingProcess:
-            def __init__(self, *args, **kwargs):
+class TestSpawnFailureAndTwoPhaseContract:
+    def test_prepare_failure_reraises_without_leaking_session(self):
+        class _ExplodingLauncher(WorkerLauncher):
+            def prepare(self, spec, *, on_message, cancel_event):
                 raise RuntimeError("process start failed")
 
-        channel = ExecutionChannel(launcher=InProcessWorkerLauncher(ExplodingProcess))
+        channel = ExecutionChannel(launcher=_ExplodingLauncher())
         job = Job("t", "j1")
         with pytest.raises(RuntimeError, match="process start failed"):
             channel.spawn(make_spec(job, lambda j, c: TaskResult.success()))
+        assert not channel.has_active_workers
+        assert channel.active_handles() == []
 
-    def test_submit_starts_process(self):
-        started = []
-        class DummyProcess:
-            def __init__(self, *args, **kwargs):
-                pass
+    def test_two_phase_abort_before_release_never_runs_and_cleans_up(self):
+        """prepare_spawn 后若在放行前调用 abort_spawn：不得放行执行且零泄漏回收句柄与连接。"""
+        released: list[bool] = []
+        launcher = _ScriptedLauncher(
+            on_release=lambda _spec, _sender, _handle: released.append(True),
+            alive=True,
+            close_sender_on_release=False,
+        )
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            prepared = channel.prepare_spawn(
+                make_spec(Job("t", "j_abort"), lambda j, c: TaskResult.success())
+            )
+            assert channel.has_active_workers is True
+            assert channel.active_handles() == []
 
-            def start(self):
-                started.append(True)
+            channel.abort_spawn(prepared)
+            channel.abort_spawn(prepared)  # 幂等
 
-        channel = ExecutionChannel(launcher=InProcessWorkerLauncher(DummyProcess))
+            assert released == []
+            assert launcher.abort_count == 1
+            assert launcher.handles[0].killed is True
+            assert launcher.handles[0].closed is True
+            assert channel.has_active_workers is False
+            assert channel.active_handles() == []
+        finally:
+            channel.close()
+
+    def test_release_failure_aborts_prepared_worker_and_clears_session(self):
+        """release_spawn 阶段异常必须自动 abort 并清理会话。"""
+        launcher = _ScriptedLauncher(
+            on_release=lambda _spec, _sender, _handle: (_ for _ in ()).throw(
+                BrokenPipeError("gate send failed")
+            ),
+            alive=True,
+            close_sender_on_release=False,
+        )
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            prepared = channel.prepare_spawn(
+                make_spec(Job("t", "j_rel_fail"), lambda j, c: TaskResult.success())
+            )
+            with pytest.raises(BrokenPipeError, match="gate send failed"):
+                channel.release_spawn(prepared)
+            assert launcher.abort_count == 1
+            assert launcher.handles[0].closed is True
+            assert channel.has_active_workers is False
+            assert channel.active_handles() == []
+        finally:
+            channel.close()
+
+    def test_submit_starts_worker_and_registers_active_handle(self):
+        started: list[bool] = []
+        launcher = _ScriptedLauncher(
+            on_release=lambda _spec, _sender, _handle: started.append(True),
+            alive=True,
+            close_sender_on_release=False,
+        )
+        channel = ExecutionChannel(launcher=launcher)
         job = Job("t", "j1")
         try:
             handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success()))
             assert handle is not None
             assert started == [True]
+            assert channel.active_handles() == [handle]
         finally:
             channel.close()
+        assert not channel.has_active_workers
 
 
 class TestHandlerInvalidReturnTypes:
@@ -311,11 +500,9 @@ class TestHandlerInvalidReturnTypes:
             "success",
         ],
     )
-    def test_non_task_result_rejected_as_failure(self, tmp_path, bad_return):
+    def test_non_task_result_rejected_as_failure(self, bad_return):
         job = Job("t", "bad")
-        res = TestWorkerWrapper._run_worker(
-            job, lambda j, c: bad_return
-        )
+        res = TestWorkerWrapper._run_worker(job, lambda j, c: bad_return)
         assert res.success is False
         assert "invalid handler return type: expected TaskResult" in (res.message or "")
 
@@ -328,21 +515,23 @@ _BASE_OK = {
 }
 
 
-def _decode(res):
+def _decode(res: dict[str, Any]) -> ExecutionResult:
+    """通过真实 Pipe + ExecutionChannel.spawn/reap_completed 契约解码单条结果负载。"""
     job = Job("t", "a")
-    channel = ExecutionChannel()
-    channel._results[_EXECUTION_ID] = res
-    handle = JobHandle(
-        job_uid=job.uid,
-        process=TestDecodeConvergencePaths._DeadProcess(),
-        timeout_at_monotonic=time.monotonic() + 10.0,
-        timeout_seconds=10.0,
-        job=job,
-        execution_id=_EXECUTION_ID,
+    launcher = _ScriptedLauncher(
+        on_release=lambda _spec, sender, _handle: sender.send_result(res),
+        alive=False,
+        exitcode=0,
     )
-    completed = channel.reap_completed([handle])
-    assert len(completed) == 1
-    return completed[0][1]
+    channel = ExecutionChannel(launcher=launcher)
+    try:
+        handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success()))
+        completed = _wait_for_reap(channel, [handle])
+        assert len(completed) == 1
+        assert not channel.has_active_workers
+        return completed[0][1]
+    finally:
+        channel.close()
 
 
 class TestDecodeIpcResultDefense:
@@ -463,35 +652,25 @@ class TestDecodeConvergencePaths:
         "cursor_updates": {},
     }
 
-    class _DeadProcess:
-        exitcode = 0
-
-        def is_alive(self):
-            return False
-
-        def join(self, timeout=None):
-            pass
-
-        def kill(self):
-            pass
-
-        def close(self):
-            pass
-
-    def test_reap_completed_contains_scalar_new_jobs_corruption(self, tmp_path):
+    def test_reap_completed_contains_scalar_new_jobs_corruption(self):
         job = Job("t", "a")
-        channel = ExecutionChannel()
-        channel._results[_EXECUTION_ID] = dict(self._SCALAR_CORRUPT)
-        handle = JobHandle(
-            job_uid=job.uid, process=self._DeadProcess(), timeout_at_monotonic=1.0, timeout_seconds=5.0,
-            job=job, execution_id=_EXECUTION_ID,
+        launcher = _ScriptedLauncher(
+            on_release=lambda _spec, sender, _handle: sender.send_result(dict(self._SCALAR_CORRUPT)),
+            alive=False,
+            exitcode=0,
         )
-        completed = channel.reap_completed([handle])
-        assert len(completed) == 1, "损坏任务必须被收割而非打断收割循环"
-        result = completed[0][1]
-        assert result.success is False
-        assert "invalid spawned_jobs type" in (result.message or "")
-        assert _EXECUTION_ID not in channel._results
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success()))
+            completed = _wait_for_reap(channel, [handle])
+            assert len(completed) == 1, "损坏任务必须被收割而非打断收割循环"
+            result = completed[0][1]
+            assert result.success is False
+            assert "invalid spawned_jobs type" in (result.message or "")
+            assert not channel.has_received_result(_EXECUTION_ID)
+            assert not channel.has_active_workers
+        finally:
+            channel.close()
 
 
 class TestBuildTerminalFailureDefense:
@@ -555,109 +734,89 @@ class TestBuildTerminalFailureDefense:
 class TestWatchdogReap:
     """看门狗：截止时刻的未完成执行统一归因超时。"""
 
-    class _HungProcess:
-        """kill 前恒活的进程桩（模拟死锁/卡死）。"""
-
-        def __init__(self):
-            self._alive = True
-            self.exitcode = None
-
-        def is_alive(self):
-            return self._alive
-
-        def join(self, timeout=None):
-            pass
-
-        def kill(self):
-            self._alive = False
-            self.exitcode = -9
-
-        def close(self):
-            pass
-
-    class _DyingDuringJoinProcess:
-        """join 窗口内自然退出的进程桩（无结果消息，exitcode 可注入）。"""
-
-        def __init__(self, exitcode: int = 0):
-            self._alive = True
-            self.exitcode = exitcode
-
-        def is_alive(self):
-            return self._alive
-
-        def join(self, timeout=None):
-            self._alive = False
-
-        def kill(self):
-            self._alive = False
-
-        def close(self):
-            pass
-
-    def test_deadline_kill_attributed_to_timeout(self, tmp_path):
+    def test_deadline_kill_attributed_to_timeout(self):
         job = Job("t", "hang")
-        handle = JobHandle(
-            job_uid=job.uid, process=self._HungProcess(),
-            timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
-            job=job, execution_id=_EXECUTION_ID,
-        )
-        completed = ExecutionChannel().reap_completed([handle])
-        assert len(completed) == 1
-        result = completed[0][1]
-        assert result.success is False
-        assert "timed out" in (result.message or "")
-        assert result.retry_requested is False
-        assert result.result_metadata == {}
+        launcher = _ScriptedLauncher(alive=True, exitcode=None, close_sender_on_release=False)
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            handle = channel.spawn(
+                make_spec(job, lambda j, c: TaskResult.success(), timeout_seconds=-1.0)
+            )
+            completed = channel.reap_completed([handle])
+            assert len(completed) == 1
+            result = completed[0][1]
+            assert result.success is False
+            assert "timed out" in (result.message or "")
+            assert result.retry_requested is False
+            assert result.result_metadata == {}
+            assert not channel.has_active_workers
+        finally:
+            channel.close()
 
-    def test_join_window_exit_remains_timeout(self, tmp_path):
+    def test_join_window_exit_remains_timeout(self):
         """截止时刻无结果即归因超时，进程在 join 窗口退出不改变原因。"""
         job = Job("t", "natural_exit")
-        handle = JobHandle(
-            job_uid=job.uid, process=self._DyingDuringJoinProcess(),
-            timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
-            job=job, execution_id=_EXECUTION_ID,
+        launcher = _ScriptedLauncher(
+            alive=True, exitcode=0, die_on_join=True, close_sender_on_release=False
         )
-        completed = ExecutionChannel().reap_completed([handle])
-        result = completed[0][1]
-        assert "timed out" in (result.message or "")
-        assert result.retry_requested is False
-        assert result.result_metadata == {}
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            handle = channel.spawn(
+                make_spec(job, lambda j, c: TaskResult.success(), timeout_seconds=-1.0)
+            )
+            completed = channel.reap_completed([handle])
+            result = completed[0][1]
+            assert "timed out" in (result.message or "")
+            assert result.retry_requested is False
+            assert result.result_metadata == {}
+            assert not channel.has_active_workers
+        finally:
+            channel.close()
 
     @pytest.mark.parametrize("exitcode", [-9, 1])
-    def test_join_window_death_does_not_restore_retry(
-        self, tmp_path, exitcode
-    ):
+    def test_join_window_death_does_not_restore_retry(self, exitcode):
         """截止后尚无结果时，退出码不恢复隐式重试语义。"""
         job = Job("t", "cluster_death")
-        handle = JobHandle(
-            job_uid=job.uid, process=self._DyingDuringJoinProcess(exitcode),
-            timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=2.0,
-            job=job, execution_id=_EXECUTION_ID,
+        launcher = _ScriptedLauncher(
+            alive=True, exitcode=exitcode, die_on_join=True, close_sender_on_release=False
         )
-        completed = ExecutionChannel().reap_completed([handle])
-        result = completed[0][1]
-        assert result.success is False
-        assert result.retry_requested is False
-        assert result.result_metadata == {}
-        assert "timed out" in (result.message or "")
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            handle = channel.spawn(
+                make_spec(job, lambda j, c: TaskResult.success(), timeout_seconds=-1.0)
+            )
+            completed = channel.reap_completed([handle])
+            result = completed[0][1]
+            assert result.success is False
+            assert result.retry_requested is False
+            assert result.result_metadata == {}
+            assert "timed out" in (result.message or "")
+        finally:
+            channel.close()
 
-    def test_completed_result_reaped_before_deadline(self, tmp_path):
-        """结果已到达且进程仍活 → 直接按结果收割（不等 timeout_at_monotonic）。"""
+    def test_completed_result_reaped_before_deadline(self):
+        """结果已到达且进程仍活 → 直接按结果收割并转入 lingering（不等 timeout_at_monotonic）。"""
         job = Job("t", "fast")
-        channel = ExecutionChannel()
-        channel._results[_EXECUTION_ID] = {
-            "status": "success",
-            "metadata": {},
-            "spawned_jobs": [],
-            "cursor_updates": {},
-        }
-        handle = JobHandle(
-            job_uid=job.uid, process=self._HungProcess(),
-            timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0,
-            job=job, execution_id=_EXECUTION_ID,
+        launcher = _ScriptedLauncher(
+            on_release=lambda _spec, sender, _handle: sender.send_result(dict(_BASE_OK)),
+            alive=True,
+            exitcode=None,
+            close_sender_on_release=False,
         )
-        completed = channel.reap_completed([handle])
-        assert [(h.job_uid, r.success) for h, r in completed] == [("t::fast", True)]
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            handle = channel.spawn(
+                make_spec(job, lambda j, c: TaskResult.success(), timeout_seconds=60.0)
+            )
+            completed = _wait_for_reap(channel, [handle])
+            assert [(h.job_uid, r.success) for h, r in completed] == [("t::fast", True)]
+            assert channel.active_handles() == []
+            assert channel.has_active_workers is True  # lingering 阶段仍保活
+            launcher.handles[0]._alive = False
+            assert channel.has_active_workers is False
+            assert launcher.handles[0].closed is True
+        finally:
+            channel.close()
 
 
 class TestFinalizeProcessKillRace:
@@ -688,119 +847,104 @@ class TestFinalizeProcessKillRace:
 
 
 class TestAbortInFlight:
-    class MockProcess:
-        def __init__(self):
-            self._alive = False
-            self.exitcode = 0
-
-        def is_alive(self):
-            return self._alive
-
-        def kill(self):
-            pass
-
-        def join(self, timeout=None):
-            pass
-
-        def close(self):
-            pass
-
     def test_abort_with_completed_and_cancelled(self, tmp_path):
-        channel = ExecutionChannel()
-        job_done = Job("task", "done")
-        job_pending = Job("task", "pending")
         unfinished = tmp_path / "unfinished"
         unfinished.write_text("partial output")
 
-        channel._results["inc_done"] = {
-            "status": "success",
-            "metadata": {"done": 1},
-        }
+        def send_for_done(spec, sender, _handle):
+            if spec.execution_id == "inc_done":
+                sender.send_result({"status": "success", "metadata": {"done": 1}})
 
-        h_done = JobHandle(
-            job_uid=job_done.uid, process=self.MockProcess(),
-            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job_done,
-            execution_id="inc_done",
+        launcher = _ScriptedLauncher(
+            on_release=send_for_done,
+            alive=False,
+            exitcode=0,
+            close_sender_on_release=True,
         )
-        h_pending = JobHandle(
-            job_uid=job_pending.uid, process=self.MockProcess(),
-            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job_pending,
-            execution_id="inc_pending",
-        )
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            h_done = channel.spawn(
+                make_spec(Job("task", "done"), lambda j, c: TaskResult.success(), execution_id="inc_done")
+            )
+            h_pending = channel.spawn(
+                make_spec(Job("task", "pending"), lambda j, c: TaskResult.success(), execution_id="inc_pending")
+            )
+            # 等待 done 的结果帧入队
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                channel._receive_available(h_done)
+                if channel.has_received_result("inc_done"):
+                    break
+                time.sleep(0.005)
 
-        outcome = channel.abort_in_flight([h_done, h_pending])
-        assert len(outcome.completed) == 1
-        assert outcome.completed[0][0].job_uid == job_done.uid
-        assert outcome.completed[0][1].success is True
-        assert outcome.completed[0][1].result_metadata == {"done": 1}
+            outcome = channel.abort_in_flight([h_done, h_pending])
+            assert len(outcome.completed) == 1
+            assert outcome.completed[0][0].job_uid == "task::done"
+            assert outcome.completed[0][1].success is True
+            assert outcome.completed[0][1].result_metadata == {"done": 1}
 
-        assert len(outcome.cancelled) == 1
-        assert outcome.cancelled[0].job_uid == job_pending.uid
-        assert unfinished.exists()
+            assert len(outcome.cancelled) == 1
+            assert outcome.cancelled[0].job_uid == "task::pending"
+            assert unfinished.exists()
+            assert not channel.has_active_workers
+        finally:
+            channel.close()
 
-    def test_abort_reprobe_consumes_result_written_on_kill(self, tmp_path):
+    def test_abort_reprobe_consumes_result_written_on_kill(self):
         """重探测完成分支：终前写入的结果仍被消费。"""
-        channel = ExecutionChannel()
         job = Job("task", "reprobe")
 
-        class FinishOnKillProcess:
-            """kill() 时写最终结果的 stub。"""
+        def write_on_kill(sender: WorkerPipeSender, _handle: _ControlledWorkerHandle) -> None:
+            sender.send_result({"status": "success", "metadata": {"done": 1}})
 
-            def __init__(self):
-                self._alive = True
-
-            def is_alive(self):
-                return self._alive
-
-            def kill(self):
-                self._alive = False
-                channel._results["inc_reprobe"] = {
-                    "status": "success",
-                    "metadata": {"done": 1},
-                }
-
-            def join(self, timeout=None):
-                pass
-
-            def close(self):
-                pass
-
-        h = JobHandle(
-            job_uid=job.uid, process=FinishOnKillProcess(),
-            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
-            execution_id="inc_reprobe",
+        launcher = _ScriptedLauncher(
+            alive=True,
+            exitcode=0,
+            on_kill=write_on_kill,
+            close_sender_on_release=False,
         )
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            h = channel.spawn(
+                make_spec(job, lambda j, c: TaskResult.success(), execution_id="inc_reprobe")
+            )
+            outcome = channel.abort_in_flight([h])
+            assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
+            assert outcome.completed[0][1].success is True
+            assert outcome.completed[0][1].result_metadata == {"done": 1}
+            assert not channel.has_active_workers
+        finally:
+            channel.close()
 
-        outcome = channel.abort_in_flight([h])
-
-        assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
-        assert outcome.completed[0][1].success is True
-
-    def test_abort_interrupted_status_settles_failure(self, tmp_path):
+    def test_abort_interrupted_status_settles_failure(self):
         """不支持的 interrupted 状态按一次损坏结果失败结算。"""
-        channel = ExecutionChannel()
         job = Job("task", "interrupted")
-        channel._results["inc_interrupted"] = {
-            "status": "interrupted",
-            "error_message": "WORKER_INTERRUPTED: KeyboardInterrupt",
-        }
-        h = JobHandle(
-            job_uid=job.uid, process=self.MockProcess(),
-            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
-            execution_id="inc_interrupted",
+        launcher = _ScriptedLauncher(
+            on_release=lambda _spec, sender, _handle: sender.send_result({
+                "status": "interrupted",
+                "error_message": "WORKER_INTERRUPTED: KeyboardInterrupt",
+            }),
+            alive=False,
+            exitcode=0,
         )
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            h = channel.spawn(
+                make_spec(job, lambda j, c: TaskResult.success(), execution_id="inc_interrupted")
+            )
+            outcome = channel.abort_in_flight([h])
+            assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
+            result = outcome.completed[0][1]
+            assert result.success is False
+            assert result.retry_requested is False
+            assert result.result_metadata == {}
+            assert "unknown status 'interrupted'" in (result.message or "")
+            assert outcome.cancelled == []
+            assert not channel.has_active_workers
+        finally:
+            channel.close()
 
-        outcome = channel.abort_in_flight([h])
-
-        assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
-        result = outcome.completed[0][1]
-        assert result.success is False
-        assert result.retry_requested is False
-        assert result.result_metadata == {}
-        assert "unknown status 'interrupted'" in (result.message or "")
-        assert outcome.cancelled == []
-
-    def test_abort_empty_handles_returns_empty_outcome(self, tmp_path):
+    def test_abort_empty_handles_returns_empty_outcome(self):
         channel = ExecutionChannel()
         outcome = channel.abort_in_flight([])
         assert outcome.completed == []
@@ -808,19 +952,24 @@ class TestAbortInFlight:
 
 
 class TestCleanupInFlight:
-    def test_cleanup_in_flight_kills_and_clears_channel_state(self, tmp_path):
-        channel = ExecutionChannel()
+    def test_cleanup_in_flight_kills_and_clears_channel_state(self):
         job = Job("task", "residual")
-        channel._results[_EXECUTION_ID] = {"status": "success"}
-        handle = JobHandle(
-            job_uid=job.uid, process=TestAbortInFlight.MockProcess(),
-            timeout_at_monotonic=time.monotonic() + 10, timeout_seconds=10, job=job,
-            execution_id=_EXECUTION_ID,
+        launcher = _ScriptedLauncher(
+            on_release=lambda _spec, sender, _handle: sender.send_result({"status": "success"}),
+            alive=True,
+            exitcode=0,
+            close_sender_on_release=False,
         )
-
-        channel.cleanup_in_flight([handle])
-
-        assert _EXECUTION_ID not in channel._results
+        channel = ExecutionChannel(launcher=launcher)
+        try:
+            handle = channel.spawn(make_spec(job, lambda j, c: TaskResult.success()))
+            channel.cleanup_in_flight([handle])
+            assert not channel.has_received_result(_EXECUTION_ID)
+            assert channel.active_handles() == []
+            assert not channel.has_active_workers
+            assert launcher.handles[0].closed is True
+        finally:
+            channel.close()
 
 
 @pytest.mark.parametrize("status", ["success", "failure", "retry"])
@@ -830,7 +979,7 @@ def test_business_error_fields_are_not_framework_evidence(status):
         "exitcode": "业务退出码", "timed_out": "业务超时",
         "signal": "业务信号", "annotations": {"timed_out": True},
     }
-    payload = {"status": status, "metadata": metadata}
+    payload: dict[str, Any] = {"status": status, "metadata": metadata}
     if status == "retry":
         payload["consume_budget"] = True
     result = _decode(payload)
@@ -868,83 +1017,75 @@ def test_terminal_failure_only_records_observed_exit_evidence(exitcode):
 @pytest.mark.parametrize("status", ["success", "failure", "retry"])
 @pytest.mark.parametrize("alive", [False, True])
 def test_result_releases_reply_pipe_before_worker_exit(status, alive):
-    channel = ExecutionChannel()
-    job = Job("task", "reply")
-    process = TestWatchdogReap._HungProcess()
-    process._alive = alive
-    process.joined = False
-
-    def join(timeout=None):
-        process.joined = True
-
-    process.join = join
-    handle = JobHandle(
-        job_uid=job.uid, process=process,
-        timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60,
-        job=job, execution_id=_EXECUTION_ID,
-    )
-    reply_receiver, reply_sender = create_worker_reply_pipe(
-        job_uid=job.uid, execution_id=_EXECUTION_ID,
-    )
-    receiver_closes = []
-    receiver = SimpleNamespace(
-        take_messages=lambda: [], eof=False,
-        close=lambda timeout: receiver_closes.append(timeout),
-    )
-    channel._receivers[_EXECUTION_ID] = receiver
-    channel._handles[_EXECUTION_ID] = handle
-    channel._reply_senders[_EXECUTION_ID] = reply_sender
-    channel._results[_EXECUTION_ID] = {
-        "status": status, "metadata": {"trusted": True},
-    }
+    payload: dict[str, Any] = {"status": status, "metadata": {"trusted": True}}
     if status == "retry":
-        channel._results[_EXECUTION_ID]["consume_budget"] = True
+        payload["consume_budget"] = True
+    launcher = _ScriptedLauncher(
+        on_release=lambda _spec, sender, _handle: sender.send_result(payload),
+        alive=alive,
+        exitcode=None if alive else 0,
+        close_sender_on_release=not alive,
+    )
+    channel = ExecutionChannel(launcher=launcher)
     try:
-        completed = channel.reap_completed([handle])
+        handle = channel.spawn(
+            make_spec(Job("task", "reply"), lambda j, c: TaskResult.success(), timeout_seconds=60.0)
+        )
+        reply_sender = channel.get_reply_sender(_EXECUTION_ID)
+        assert reply_sender is not None
+
+        completed = _wait_for_reap(channel, [handle])
         assert completed[0][1].result_metadata == {"trusted": True}
         assert completed[0][1].success is (status == "success")
         assert completed[0][1].retry_requested is (status == "retry")
-        assert channel._reply_senders == {}
+        assert channel.get_reply_sender(_EXECUTION_ID) is None
         assert reply_sender._closed
         assert reply_sender._conn.closed
+        assert channel.active_handles() == []
+
+        proc = launcher.handles[0]
         if alive:
-            assert process.is_alive()
-            assert not process.joined
-            assert channel._lingering_workers == [(_EXECUTION_ID, process, receiver)]
-            assert receiver_closes == []
+            assert proc.is_alive()
+            assert not proc.joined
+            assert channel.has_active_workers is True
+        else:
+            assert channel.has_active_workers is False
+
         channel.close()
         channel.close()
-        assert channel._lingering_workers == []
-        assert channel._reply_senders == {}
+        assert channel.has_active_workers is False
+        assert channel.get_reply_sender(_EXECUTION_ID) is None
+        assert proc.closed is True
     finally:
         channel.close()
-        reply_sender.close()
-        reply_receiver.close()
 
 
 @pytest.mark.parametrize("route", ["crash", "timeout", "error", "authorization", "abort", "cleanup", "close"])
-def test_terminal_paths_release_reply_pipe(route):
-    channel = ExecutionChannel()
-    job = Job("task", "terminal")
-    process = TestWatchdogReap._HungProcess()
-    process._alive = route == "timeout"
-    handle = JobHandle(
-        job_uid=job.uid, process=process,
-        timeout_at_monotonic=time.monotonic() - 1, timeout_seconds=1,
-        job=job, execution_id=_EXECUTION_ID,
+def test_terminal_paths_release_reply_pipe_and_session(route):
+    def emit_corrupt_frame(_spec, sender, _handle):
+        sender._conn.send_bytes(b"{corrupt-json-frame")
+
+    launcher = _ScriptedLauncher(
+        on_release=emit_corrupt_frame if route == "error" else None,
+        alive=(route == "timeout"),
+        exitcode=None if route == "timeout" else 1,
+        close_sender_on_release=(route not in ("timeout",)),
     )
-    reply_receiver, reply_sender = create_worker_reply_pipe(
-        job_uid=job.uid, execution_id=_EXECUTION_ID,
-    )
-    channel._handles[_EXECUTION_ID] = handle
-    channel._reply_senders[_EXECUTION_ID] = reply_sender
+    channel = ExecutionChannel(launcher=launcher)
     try:
+        handle = channel.spawn(
+            make_spec(
+                Job("task", "terminal"),
+                lambda j, c: TaskResult.success(),
+                timeout_seconds=-1.0 if route == "timeout" else 60.0,
+            )
+        )
+        reply_sender = channel.get_reply_sender(_EXECUTION_ID)
+        assert reply_sender is not None
+
         if route == "error":
-            error = OSError("broken worker frame")
-            channel._errors[_EXECUTION_ID] = error
-            with pytest.raises(OSError) as raised:
-                channel.reap_completed([handle])
-            assert raised.value is error
+            with pytest.raises(ValueError):
+                _wait_for_reap(channel, [handle])
         elif route == "authorization":
             handle.authorization_outcome = AuthorizationOutcome(
                 status=AuthorizationStatus.DENIED, message="未获授权", path="output",
@@ -960,21 +1101,40 @@ def test_terminal_paths_release_reply_pipe(route):
         else:
             result, = channel.reap_completed([handle])
             assert not result[1].success
-        assert channel._reply_senders == {}
+
+        assert channel.get_reply_sender(_EXECUTION_ID) is None
+        assert channel.active_handles() == []
+        assert channel.has_active_workers is False
         assert reply_sender._closed
         assert reply_sender._conn.closed
         channel.close()
-        assert channel._reply_senders == {}
+        assert channel.has_active_workers is False
     finally:
         channel.close()
-        reply_sender.close()
-        reply_receiver.close()
 
 
-def test_posix_process_handle_kill_tree_calls_killpg_before_wait(monkeypatch):
+def test_collect_outcome_authorization_clears_active_session():
+    """直接经 _collect_outcome 处理 authorization_outcome 时不得遗留活跃会话或句柄引用。"""
+    launcher = _ScriptedLauncher(alive=True, exitcode=None, close_sender_on_release=False)
+    channel = ExecutionChannel(launcher=launcher)
+    try:
+        handle = channel.spawn(make_spec(Job("task", "auth_collect"), lambda j, c: TaskResult.success()))
+        handle.authorization_outcome = AuthorizationOutcome(
+            status=AuthorizationStatus.STOPPED, message="stopped", path="out",
+        )
+        outcome = channel._collect_outcome(handle)
+        assert outcome.authorization_outcome is handle.authorization_outcome
+        assert channel.active_handles() == []
+        assert channel.get_reply_sender(_EXECUTION_ID) is None
+        assert channel.has_active_workers is False
+        assert launcher.handles[0].closed is True
+    finally:
+        channel.close()
+
+
+def test_posix_managed_worker_handle_kill_tree_calls_killpg_before_wait(monkeypatch):
     """POSIX 进程组强杀必须严格先 os.killpg(pgid, SIGKILL)，再在 join() 中 proc.wait()。"""
     import tasklite.engine.launcher as launcher_module
-    from tasklite.engine.launcher import PosixProcessHandle
 
     events: list[tuple[str, Any]] = []
 
@@ -998,7 +1158,7 @@ def test_posix_process_handle_kill_tree_calls_killpg_before_wait(monkeypatch):
         events.append(("killpg", pgid))
 
     monkeypatch.setattr(launcher_module.os, "killpg", fake_killpg, raising=False)
-    handle = PosixProcessHandle(_FakePopen())  # type: ignore[arg-type]
+    handle = PosixManagedWorkerHandle(_FakePopen())  # type: ignore[arg-type]
     handle.kill_tree()
     handle.join(timeout=2.0)
     handle.close()
@@ -1008,15 +1168,59 @@ def test_posix_process_handle_kill_tree_calls_killpg_before_wait(monkeypatch):
     assert events == [("killpg", 43210), ("wait", 2.0)]
 
 
+def test_windows_managed_worker_handle_keeps_hjob_until_close():
+    """WindowsManagedWorkerHandle 在 kill_tree 后保活 hJob，仅在 close() 时幂等关闭。"""
+    events: list[tuple[str, int]] = []
+
+    class _FakeKernel:
+        def TerminateJobObject(self, h_job: int, code: int) -> int:
+            events.append(("terminate_job", h_job))
+            return 1
+
+        def CloseHandle(self, h_job: int) -> int:
+            events.append(("close_handle", h_job))
+            return 1
+
+    class _FakePopen:
+        pid = 9001
+        returncode: int | None = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 1
+            return 1
+
+        def kill(self):
+            self.returncode = 1
+
+    handle = WindowsManagedWorkerHandle(_FakePopen(), [101, 202], _FakeKernel())  # type: ignore[arg-type]
+    handle.kill_tree()
+    assert handle.was_force_killed is True
+    assert events == [("terminate_job", 101), ("terminate_job", 202)]
+
+    handle.join(timeout=1.0)
+    assert handle.exitcode == 1
+    assert ("close_handle", 101) not in events
+
+    handle.close()
+    handle.close()  # 幂等
+    assert events == [
+        ("terminate_job", 101),
+        ("terminate_job", 202),
+        ("close_handle", 101),
+        ("close_handle", 202),
+    ]
+
+
 def test_cancel_pending_launches_wakes_handshake_and_cleans_up():
     """在冷启动/握手阻塞期间调用 cancel_pending_launches() 必须即时唤醒并零残留。"""
-    from tasklite.engine.launcher import WorkerLauncher, _WorkerLaunchCancelled
-
     entered = threading.Event()
     cleaned = threading.Event()
 
     class _BlockingHandshakeLauncher(WorkerLauncher):
-        def launch(self, spec, *, on_message, cancel_event, commit_gate):
+        def prepare(self, spec, *, on_message, cancel_event):
             entered.set()
             assert cancel_event.wait(timeout=5.0)
             cleaned.set()
@@ -1045,15 +1249,6 @@ def test_cancel_pending_launches_wakes_handshake_and_cleans_up():
 
 def test_handshake_acceptor_cancel_and_join_never_deadlocks_after_done():
     """_HandshakeAcceptor 在 _done 已置位或阻塞于 accept() 时 cancel_and_join 均不死锁。"""
-    import os
-    from multiprocessing.connection import Listener
-    from tasklite.engine.launcher import (
-        SubprocessWorkerLauncher,
-        _HandshakeAcceptor,
-        _make_ipc_address,
-    )
-
-    # 1. _done 已置位且 listener 尚未关闭（复现 _accept_loop 刚结束但 is_alive 仍为 True 的竞态）
     addr_done, family_done = _make_ipc_address()
     authkey_done = os.urandom(32)
     listener_done = Listener(address=addr_done, family=family_done, authkey=authkey_done)
@@ -1076,7 +1271,6 @@ def test_handshake_acceptor_cancel_and_join_never_deadlocks_after_done():
         listener_done.close()
         SubprocessWorkerLauncher._cleanup_socket_file(addr_done, family_done)
 
-    # 2. _accept_loop 正在阻塞于 listener.accept()，cancel_and_join 经守护线程自连迅速唤醒
     addr_live, family_live = _make_ipc_address()
     authkey_live = os.urandom(32)
     listener_live = Listener(address=addr_live, family=family_live, authkey=authkey_live)
@@ -1097,3 +1291,52 @@ def test_handshake_acceptor_cancel_and_join_never_deadlocks_after_done():
     finally:
         listener_live.close()
         SubprocessWorkerLauncher._cleanup_socket_file(addr_live, family_live)
+
+
+def _collect_imported_modules(path: pathlib.Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                imported.add(node.module or "")
+            else:
+                parts = path.relative_to(_REPO_ROOT).with_suffix("").parts[:-1]
+                base = ".".join(parts[: len(parts) - (node.level - 1)])
+                imported.add(f"{base}.{node.module}" if node.module else base)
+    return imported
+
+
+def test_worker_bootstrap_and_runtime_do_not_import_parent_scheduler_tree():
+    """纯 worker 侧模块严禁导入 ExecutionChannel 或父进程调度树，launcher 严禁反向导入 channel 或测试双体。"""
+    forbidden_for_worker = {
+        "tasklite.engine.channel",
+        "tasklite.engine.launcher",
+        "tasklite.engine.dispatch",
+        "tasklite.engine.runtime",
+        "tasklite.engine.completion",
+        "tasklite.engine.recovery",
+        "tasklite.engine.scheduler",
+        "tasklite.engine.store",
+        "tasklite.engine.governor",
+        "tasklite.pipeline",
+        "tasklite.testing",
+    }
+    for rel_path in (
+        "tasklite/engine/_worker_bootstrap.py",
+        "tasklite/engine/_worker_runtime.py",
+    ):
+        imports = _collect_imported_modules(_REPO_ROOT / rel_path)
+        leaked = sorted(imports & forbidden_for_worker)
+        assert not leaked, f"{rel_path} 不得导入父进程模块: {leaked}"
+
+    launcher_path = _REPO_ROOT / "tasklite/engine/launcher.py"
+    launcher_imports = _collect_imported_modules(launcher_path)
+    assert "tasklite.engine.channel" not in launcher_imports
+    assert "tasklite.testing" not in launcher_imports
+    launcher_src = launcher_path.read_text(encoding="utf-8")
+    assert "InProcessWorkerLauncher" not in launcher_src
+    assert "_InProcessWorker" not in launcher_src

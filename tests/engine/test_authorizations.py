@@ -263,7 +263,7 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
     gate_observed = threading.Event()
     third_spawned = threading.Event()
     original_fill = p._runtime._fill_dispatch_pool
-    original_spawn = p._runtime.channel.spawn
+    original_prepare = p._runtime.channel.prepare_spawn
 
     def tracked_fill(limit, draining):
         result = original_fill(limit, draining)
@@ -271,13 +271,13 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
             gate_observed.set()
         return result
 
-    def tracked_spawn(spec):
+    def tracked_prepare(spec):
         if spec.job.uid == "third::t1":
             third_spawned.set()
-        return original_spawn(spec)
+        return original_prepare(spec)
 
     monkeypatch.setattr(p._runtime, "_fill_dispatch_pool", tracked_fill)
-    monkeypatch.setattr(p._runtime.channel, "spawn", tracked_spawn)
+    monkeypatch.setattr(p._runtime.channel, "prepare_spawn", tracked_prepare)
     errors = []
 
     def run_pipeline():
@@ -1339,7 +1339,7 @@ def test_run_fault_leaves_uncommitted_cleanup_result_running_for_recovery(
         def faulty_drain():
             for handle in runtime.in_flight.active_handles():
                 runtime.channel._receive_available(handle)
-                if handle.execution_id in runtime.channel._results:
+                if runtime.channel.has_received_result(handle.execution_id):
                     raise fault
             return original_drain()
 

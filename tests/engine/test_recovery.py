@@ -9,8 +9,9 @@ from tasklite import TaskLiteError
 
 from tasklite import TaskLite
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
-from tasklite.engine.channel import ExecutionChannel
+from tasklite.engine.channel import ExecutionChannel, WorkerLaunchSpec
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
+from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
 from tasklite.engine.recovery import RecoveryOrchestrator
 from tasklite.engine.resource import (
     CapacityResource,
@@ -18,7 +19,10 @@ from tasklite.engine.resource import (
 )
 from tasklite.engine.types import JobHandle
 from tasklite.models.artifact import FileSpec
+from tasklite.models.context import JobContext
 from tasklite.models.job import Job
+from tasklite.models.result import TaskResult
+from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
 from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
 _INCARNATION = "deadbeefdeadbeefdeadbeefdeadbeef.1"
@@ -78,37 +82,57 @@ class RecordingCompletion:
 
 
 class _DoneProcess:
-    """已完成 entry 的进程桩——abort 不得 kill 它（结果已到达）。"""
+    """已完成 entry 的句柄桩——abort 不得 kill 它（结果已到达）。"""
 
-    def __init__(self):
+    def __init__(self, pipe_sender=None, reply_receiver=None):
         self._alive = True
         self.exitcode = 0
         self.killed = False
+        self.was_force_killed = False
+        self.pid = None
+        self._pipe_sender = pipe_sender
+        self._reply_receiver = reply_receiver
+
+    def _close_pipes(self):
+        if self._pipe_sender is not None:
+            self._pipe_sender.close()
+            self._pipe_sender = None
+        if self._reply_receiver is not None:
+            self._reply_receiver.close()
+            self._reply_receiver = None
 
     def is_alive(self):
         return self._alive
 
     def join(self, timeout=None):
         self._alive = False
+        self._close_pipes()
 
-    def kill(self):
+    def kill_tree(self):
         self._alive = False
         self.killed = True
+        self.was_force_killed = True
+        self._close_pipes()
+
+    def kill(self):
+        self.kill_tree()
 
     def close(self):
-        pass
+        self._alive = False
+        self._close_pipes()
 
 
 class _FinishOnKillProcess:
-    """kill() 时通过通道回传最终结果的进程桩（TOCTOU 窗口复现）。"""
+    """kill_tree() 时通过真实 Pipe 回传最终结果的句柄桩（TOCTOU 窗口复现）。"""
 
-    def __init__(self, channel, uid, execution_id):
+    def __init__(self, pipe_sender, reply_receiver):
         self._alive = True
         self.exitcode = 0
         self.killed = False
-        self._channel = channel
-        self._uid = uid
-        self._execution_id = execution_id
+        self.was_force_killed = False
+        self.pid = None
+        self._pipe_sender = pipe_sender
+        self._reply_receiver = reply_receiver
 
     def is_alive(self):
         return self._alive
@@ -116,23 +140,106 @@ class _FinishOnKillProcess:
     def join(self, timeout=None):
         pass
 
-    def kill(self):
+    def kill_tree(self):
         self._alive = False
         self.killed = True
-        self._channel._results[self._execution_id] = {
-            "status": "success",
-            "metadata": {"done": 1},
-            "spawned_jobs": [],
-            "cursor_updates": {},
-        }
+        self.was_force_killed = True
+        if self._pipe_sender is not None:
+            self._pipe_sender.send_result(
+                {
+                    "status": "success",
+                    "metadata": {"done": 1},
+                    "spawned_jobs": [],
+                    "cursor_updates": {},
+                }
+            )
+            self._pipe_sender.close()
+            self._pipe_sender = None
+        if self._reply_receiver is not None:
+            self._reply_receiver.close()
+            self._reply_receiver = None
+
+    def kill(self):
+        self.kill_tree()
 
     def close(self):
-        pass
+        if self._pipe_sender is not None:
+            self._pipe_sender.close()
+            self._pipe_sender = None
+        if self._reply_receiver is not None:
+            self._reply_receiver.close()
+            self._reply_receiver = None
+
+
+class _RecoveryStubLauncher(WorkerLauncher):
+    """复现已完成与 kill-window TOCTOU 两种 abort 场景的最小 WorkerLauncher。"""
+
+    def __init__(self, *, mode: str):
+        self._mode = mode
+        self.handles: list[object] = []
+
+    def prepare(self, spec, *, on_message, cancel_event):
+        receiver, sender = create_worker_pipe(
+            job_uid=spec.job.uid,
+            execution_id=spec.execution_id,
+            run_id=spec.run_id or None,
+            attempt_no=spec.attempt_no,
+            on_message=on_message,
+        )
+        reply_receiver, reply_sender = create_worker_reply_pipe(
+            job_uid=spec.job.uid,
+            execution_id=spec.execution_id,
+            run_id=spec.run_id or None,
+            attempt_no=spec.attempt_no,
+        )
+        if self._mode == "done":
+            handle = _DoneProcess(pipe_sender=sender, reply_receiver=reply_receiver)
+
+            def _release():
+                sender.send_result(
+                    {
+                        "status": "success",
+                        "metadata": {},
+                        "spawned_jobs": [],
+                        "cursor_updates": {},
+                    }
+                )
+        else:
+            handle = _FinishOnKillProcess(pipe_sender=sender, reply_receiver=reply_receiver)
+
+            def _release():
+                pass
+
+        self.handles.append(handle)
+
+        def _abort():
+            handle.kill_tree()
+            handle.close()
+            reply_sender.close()
+            receiver.close(timeout=2.0)
+
+        return PreparedWorker(
+            handle=handle,
+            receiver=receiver,
+            reply_sender=reply_sender,
+            on_release=_release,
+            on_abort=_abort,
+        )
+
+
+def _make_launch_spec(job: Job) -> WorkerLaunchSpec:
+    return WorkerLaunchSpec(
+        handler=lambda j, c: TaskResult.success(),
+        job=job,
+        job_context=JobContext(job, frozenset(), frozenset(), {}),
+        execution_id=_INCARNATION,
+        timeout_seconds=60.0,
+    )
 
 
 class TestAbortInFlight:
-    def _make(self, tmp_path, *, resource_mgr=None):
-        channel = ExecutionChannel()
+    def _make(self, tmp_path, *, resource_mgr=None, launcher=None):
+        channel = ExecutionChannel(launcher=launcher)
         resource_mgr = resource_mgr if resource_mgr is not None else ResourceManager(
             {"api": CapacityResource("api", max_capacity=1.0)}
         )
@@ -146,7 +253,8 @@ class TestAbortInFlight:
 
     def test_abort_consumes_completed_result(self, tmp_path):
         """已完成未收割的 entry：结果被消费提交（进 done），不 kill、不取消。"""
-        orchestrator, channel, completion, _ = self._make(tmp_path)
+        launcher = _RecoveryStubLauncher(mode="done")
+        orchestrator, channel, completion, _ = self._make(tmp_path, launcher=launcher)
         job = Job("fast", "done_job")
         out_file = tmp_path / "out" / "result.txt"
         out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -158,58 +266,57 @@ class TestAbortInFlight:
                 delete_on_failure=True,
             ),
         }
-        channel._results[_INCARNATION] = {
-            "status": "success",
-            "metadata": {},
-            "spawned_jobs": [],
-            "cursor_updates": {},
-        }
-        process = _DoneProcess()
-        handle = JobHandle(
-            job_uid=job.uid, process=process,
-            timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
-            execution_id=_INCARNATION,
-        )
-        tracker = orchestrator._in_flight
-        tracker.track(InFlightJob(
-            job.uid,
-            job.to_dict(),
-            job,
-            [],
-            handle,
-            None,
-            active_files=active_files,
-        ))
+        try:
+            handle = channel.spawn(_make_launch_spec(job))
+            process = launcher.handles[0]
+            # 等待 Pipe 结果入队
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                channel._receive_available(handle)
+                if channel.has_received_result(_INCARNATION):
+                    break
+                time.sleep(0.005)
+            tracker = orchestrator._in_flight
+            tracker.track(InFlightJob(
+                job.uid,
+                job.to_dict(),
+                job,
+                [],
+                handle,
+                None,
+                active_files=active_files,
+            ))
 
-        orchestrator.abort_in_flight()
+            orchestrator.abort_in_flight()
 
-        assert process.killed is False, "已完成 entry 不得被 kill"
-        cancelled, done = completion.settled[0]
-        assert [e.job_uid for e, _ in done] == [job.uid], "已完成结果必须交完成机器提交"
-        assert cancelled == []
-        assert out_file.exists(), "成功产出的物理输出必须保留"
+            assert process.killed is False, "已完成 entry 不得被 kill"
+            cancelled, done = completion.settled[0]
+            assert [e.job_uid for e, _ in done] == [job.uid], "已完成结果必须交完成机器提交"
+            assert cancelled == []
+            assert out_file.exists(), "成功产出的物理输出必须保留"
+        finally:
+            channel.close()
 
     def test_abort_toctou_result_appears_during_kill(self, tmp_path):
         """分类时无结果 → kill 窗口内 worker 写完结果 → 重探测移入 done 消费。"""
-        orchestrator, channel, completion, _ = self._make(tmp_path)
+        launcher = _RecoveryStubLauncher(mode="finish_on_kill")
+        orchestrator, channel, completion, _ = self._make(tmp_path, launcher=launcher)
         job = Job("fast", "toctou")
-        process = _FinishOnKillProcess(channel, job.uid, _INCARNATION)
-        handle = JobHandle(
-            job_uid=job.uid, process=process,
-            timeout_at_monotonic=time.monotonic() + 60, timeout_seconds=60.0, job=job,
-            execution_id=_INCARNATION,
-        )
-        tracker = orchestrator._in_flight
-        tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], handle, None))
+        try:
+            handle = channel.spawn(_make_launch_spec(job))
+            tracker = orchestrator._in_flight
+            tracker.track(InFlightJob(job.uid, job.to_dict(), job, [], handle, None))
 
-        orchestrator.abort_in_flight()
+            orchestrator.abort_in_flight()
 
-        cancelled, done = completion.settled[0]
-        assert [e.job_uid for e, _ in done] == [job.uid], (
-            "kill 窗口内到达的结果必须被重探测消费（不删结果、不取消）"
-        )
-        assert cancelled == []
-        assert done[0][1].success is True
+            cancelled, done = completion.settled[0]
+            assert [e.job_uid for e, _ in done] == [job.uid], (
+                "kill 窗口内到达的结果必须被重探测消费（不删结果、不取消）"
+            )
+            assert cancelled == []
+            assert done[0][1].success is True
+        finally:
+            channel.close()
 
     def test_abort_releases_resources_before_settlement(self, tmp_path):
         """已占用资源在结算前统一释放（防泄漏）。"""

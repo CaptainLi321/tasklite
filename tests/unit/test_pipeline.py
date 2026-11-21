@@ -44,17 +44,69 @@ class TailRequeuePolicy(RequeuePolicy):
         return RequeuePlan(front=False, delay_seconds=0.0)
 
 
-def make_instant_process_class(retry_uid: str | None = None, recorder: list | None = None):
-    """FakeProcess：start() 经 Pipe 发送结果并退出。"""
+def make_instant_launcher(
+    retry_uid: str | None = None,
+    recorder: list | None = None,
+    on_prepare=None,
+    on_release=None,
+):
+    """受控 WorkerLauncher：release() 经 Pipe 发送结果并立即退出。"""
+    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
+    from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
 
-    class InstantProcess:
-        def __init__(self, target=None, args=(), kwargs=None, **_kw):
-            self.args = args
-            self.exitcode = 0
+    class _InstantHandle:
+        pid = None
+        exitcode = 0
+        was_force_killed = False
 
-        def start(self):
-            if self.args:
-                spec = self.args[0]
+        def __init__(self, sender, reply_receiver) -> None:
+            self._sender = sender
+            self._reply_receiver = reply_receiver
+
+        def _close_pipes(self) -> None:
+            if self._sender is not None:
+                self._sender.close()
+                self._sender = None
+            if self._reply_receiver is not None:
+                self._reply_receiver.close()
+                self._reply_receiver = None
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout=None) -> None:
+            self._close_pipes()
+
+        def kill_tree(self) -> None:
+            self.was_force_killed = True
+            self.exitcode = -9
+            self._close_pipes()
+
+        def close(self) -> None:
+            self._close_pipes()
+
+    class _InstantLauncher(WorkerLauncher):
+        def prepare(self, spec, *, on_message, cancel_event):
+            if on_prepare is not None:
+                on_prepare(spec)
+            receiver, sender = create_worker_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+                on_message=on_message,
+            )
+            reply_receiver, reply_sender = create_worker_reply_pipe(
+                job_uid=spec.job.uid,
+                execution_id=spec.execution_id,
+                run_id=spec.run_id or None,
+                attempt_no=spec.attempt_no,
+            )
+            handle = _InstantHandle(sender, reply_receiver)
+
+            def _release():
+                if on_release is not None:
+                    on_release(spec)
                 if recorder is not None:
                     recorder.append(spec.job.uid)
                 if retry_uid is not None and spec.job.uid == retry_uid:
@@ -71,22 +123,24 @@ def make_instant_process_class(retry_uid: str | None = None, recorder: list | No
                         "spawned_jobs": [],
                         "cursor_updates": {},
                     }
-                assert spec.pipe_sender is not None
-                spec.pipe_sender.send_result(result)
+                sender.send_result(result)
+                handle._close_pipes()
 
-        def is_alive(self):
-            return False
+            def _abort():
+                handle.kill_tree()
+                handle.close()
+                reply_sender.close()
+                receiver.close(timeout=2.0)
 
-        def join(self, timeout=None):
-            pass
+            return PreparedWorker(
+                handle=handle,
+                receiver=receiver,
+                reply_sender=reply_sender,
+                on_release=_release,
+                on_abort=_abort,
+            )
 
-        def kill(self):
-            self.exitcode = -9
-
-        def close(self):
-            pass
-
-    return InstantProcess
+    return _InstantLauncher()
 
 
 def make_pipeline(tmp_path=None, **overrides) -> TaskLite:
@@ -204,7 +258,7 @@ class TestConstruction:
             p.register_task("over", ok_handler, resources={"__workers__": 8.0})
             p.enqueue(Job("fit", "ok"))
             p.enqueue(Job("over", "fail"))
-            with in_process_workers(p, make_instant_process_class()):
+            with in_process_workers(p, make_instant_launcher()):
                 p.run(install_signals=False)
             with StateSnapshot.open(p) as snap:
                 assert snap.get_job("fit::ok")["status"] == "succeeded"  # type: ignore[index]
@@ -640,12 +694,6 @@ class TestEnqueue:
 
         observed: list[dict[str, Any]] = []
 
-        class CapturingProcess(make_instant_process_class()):
-            def __init__(self, *, args=(), **kwargs):
-                spec = args[0]
-                observed.append(spec.job.to_dict())
-                super().__init__(args=args, **kwargs)
-
         with TaskLite(backend="sqlite", state_path=db_path, max_workers=1) as p2:
             p2.register_resource(CapacityResource("gpu", max_capacity=2.0))
             p2.register_task(
@@ -656,7 +704,10 @@ class TestEnqueue:
                 timeout_seconds=999,
                 trigger="always",
             )
-            with in_process_workers(p2, CapturingProcess):
+            with in_process_workers(
+                p2,
+                make_instant_launcher(on_prepare=lambda spec: observed.append(spec.job.to_dict())),
+            ):
                 p2.run()
             with StateSnapshot.open(p2) as snap:
                 assert snap.get_job("fetch::a")["status"] == "succeeded"  # type: ignore[index]
@@ -694,7 +745,7 @@ class TestSixStepAndSchedulingContract:
             p.enqueue(Job("fetch", "a"))
             p.enqueue(Job("fetch", "b"))
 
-            with in_process_workers(p, make_instant_process_class()):
+            with in_process_workers(p, make_instant_launcher()):
                 res = p.run()
             p.stop()
             assert res is None
@@ -715,12 +766,10 @@ class TestSixStepAndSchedulingContract:
             p.enqueue(Job("fetch", "a"))
             observed: list[bool] = []
 
-            class ObservingProcess(make_instant_process_class()):
-                def start(self):
-                    observed.append(p.is_running)
-                    super().start()
-
-            with in_process_workers(p, ObservingProcess):
+            with in_process_workers(
+                p,
+                make_instant_launcher(on_release=lambda _spec: observed.append(p.is_running)),
+            ):
                 p.run()
             assert observed == [True]
             assert p.is_running is False
@@ -736,7 +785,7 @@ class TestSixStepAndSchedulingContract:
             p.register_task("fetch", ok_handler)
             for jid in ("a", "b", "c"):
                 p.enqueue(Job("fetch", jid))
-            with in_process_workers(p, make_instant_process_class(recorder=order)):
+            with in_process_workers(p, make_instant_launcher(recorder=order)):
                 p.run()
         assert order == ["fetch::a", "fetch::b", "fetch::c"]
 
@@ -747,7 +796,7 @@ class TestSixStepAndSchedulingContract:
             p2.enqueue(Job("fetch", "later"))
             with in_process_workers(
                 p2,
-                make_instant_process_class(retry_uid="fetch::flaky", recorder=requeue_order),
+                make_instant_launcher(retry_uid="fetch::flaky", recorder=requeue_order),
             ):
                 p2.run()
             with StateSnapshot.open(p2) as snap:

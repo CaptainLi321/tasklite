@@ -410,6 +410,9 @@ def test_stop_inside_dispatch_log_prevents_worker_launch(tmp_path, monkeypatch):
 
 
 def test_stop_before_process_start_prevents_worker_launch(tmp_path):
+    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
+    from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
+
     effect = tmp_path / "effect.txt"
     with TaskLite(
         backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
@@ -420,17 +423,13 @@ def test_stop_before_process_start_prevents_worker_launch(tmp_path):
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
 
         start_calls: list[bool] = []
+        abort_calls: list[bool] = []
         stop_fired = False
 
-        class StopBeforeStartProcess:
-            def __init__(self, **_kwargs):
-                nonlocal stop_fired
-                stop_fired = True
-                pipeline.stop()
-                self.exitcode = None
-
-            def start(self) -> None:
-                start_calls.append(True)
+        class _NoopHandle:
+            pid = None
+            exitcode = None
+            was_force_killed = False
 
             def is_alive(self) -> bool:
                 return False
@@ -438,17 +437,52 @@ def test_stop_before_process_start_prevents_worker_launch(tmp_path):
             def join(self, timeout=None) -> None:
                 pass
 
-            def kill(self) -> None:
+            def kill_tree(self) -> None:
                 pass
 
             def close(self) -> None:
                 pass
 
-        with in_process_workers(pipeline, StopBeforeStartProcess):
+        class _StopOnPrepareLauncher(WorkerLauncher):
+            def prepare(self, spec, *, on_message, cancel_event):
+                nonlocal stop_fired
+                stop_fired = True
+                pipeline.stop()
+                receiver, sender = create_worker_pipe(
+                    job_uid=spec.job.uid,
+                    execution_id=spec.execution_id,
+                    run_id=spec.run_id or None,
+                    attempt_no=spec.attempt_no,
+                    on_message=on_message,
+                )
+                reply_receiver, reply_sender = create_worker_reply_pipe(
+                    job_uid=spec.job.uid,
+                    execution_id=spec.execution_id,
+                    run_id=spec.run_id or None,
+                    attempt_no=spec.attempt_no,
+                )
+
+                def _abort() -> None:
+                    abort_calls.append(True)
+                    sender.close()
+                    reply_receiver.close()
+                    reply_sender.close()
+                    receiver.close(timeout=2.0)
+
+                return PreparedWorker(
+                    handle=_NoopHandle(),
+                    receiver=receiver,
+                    reply_sender=reply_sender,
+                    on_release=lambda: start_calls.append(True),
+                    on_abort=_abort,
+                )
+
+        with in_process_workers(pipeline, _StopOnPrepareLauncher()):
             pipeline.run()
 
         assert stop_fired
         assert start_calls == []
+        assert abort_calls == [True]
         with StateSnapshot.open(pipeline) as snapshot:
             job = snapshot.get_job("work::one")
             assert job is not None and job["status"] == "pending"

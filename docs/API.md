@@ -962,10 +962,10 @@ def authorizer(
 @contextmanager
 def in_process_workers(
     target: Any,
-    process_class: type | None = None,
+    launcher: WorkerLauncher | None = None,
 ) -> Iterator[Any]
 ```
-- **核心职责**：轻量进程替身上下文管理器。保留真实的单向 `Pipe` 通信边界，仅将子进程创建替换为进程内线程替身（或调用方传入的自定义 `process_class`），退出上下文时自动恢复原有进程上下文。
+- **核心职责**：轻量进程替身上下文管理器。保留真实的单向 `Pipe` 通信边界，仅将子进程启动器替换为标准 `WorkerLauncher` 实例（默认使用进程内线程替身 `InProcessWorkerLauncher()`），退出上下文时自动恢复原有启动器。
 
 ---
 
