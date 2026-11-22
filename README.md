@@ -217,6 +217,18 @@ pipeline.stop()
 pipeline.close()
 ```
 
+### 完整可运行示例索引
+
+仓库 `examples/` 提供开箱自演示脚本（零参数即可在临时目录独立运行并自检）：
+
+| 示例脚本 | 演示主题 |
+| :--- | :--- |
+| [`examples/trigger_chain.py`](examples/trigger_chain.py) | DAG 依赖链、`FileSpec.from_output` 具名产物传递、Run 外目录预授权与 `StateSnapshot` 验收 |
+| [`examples/rate_limit_and_retry.py`](examples/rate_limit_and_retry.py) | `IntervalResource` 周期限速、`CapacityResource` 并发配额、`TaskResult.retry` 自动重试与预算耗尽落盘、物理轨迹观测 |
+| [`examples/dynamic_spawn_and_cursor.py`](examples/dynamic_spawn_and_cursor.py) | `ctx.spawn` 动态衍生、`ctx.get_cursor` / `ctx.set_cursor` 事务游标与 `register_discovery` 两轮增量分页发现 |
+| [`examples/snapshot_report_and_exclude.py`](examples/snapshot_report_and_exclude.py) | `StateSnapshot.open(..., mode="copy")` 前后对比报告、`Exclude` 选择性留队与 `trigger="on_input_change"` |
+| [`examples/edit_migrations/`](examples/edit_migrations/) | 5 个 `pipeline.edit()` 原子图迁移脚本（换盘搬迁、历史缓存纳管、分支改名、调大超时重跑、中间插层） |
+
 ---
 
 ## 📚 文档导航与职责划分

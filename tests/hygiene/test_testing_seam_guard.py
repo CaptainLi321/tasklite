@@ -92,7 +92,7 @@ def _find_guarded_mutations(attr_name: str) -> list[str]:
 
 
 def _find_resources_attr_accesses() -> list[str]:
-    """检测 tests/ 中任意对 ``._resources`` 的访问或赋值。"""
+    """检测 tests/ 中任意对 ``._resources`` 的访问、赋值、getattr 或 patch.object。"""
     offenders: list[str] = []
     for path in sorted(TESTS_DIR.rglob("*.py")):
         if "hygiene" in path.parts:
@@ -104,16 +104,24 @@ def _find_resources_attr_accesses() -> list[str]:
                 offenders.append(f"{rel}:{node.lineno}")
             elif isinstance(node, ast.Call):
                 func = node.func
-                is_setattr = (
-                    (isinstance(func, ast.Name) and func.id == "setattr")
-                    or (isinstance(func, ast.Attribute) and func.attr == "setattr")
+                is_attr_hook = (
+                    (isinstance(func, ast.Name) and func.id in ("setattr", "getattr"))
+                    or (
+                        isinstance(func, ast.Attribute)
+                        and func.attr in ("setattr", "getattr", "object")
+                    )
                 )
-                if (
-                    is_setattr
-                    and len(node.args) >= 2
-                    and isinstance(node.args[1], ast.Constant)
-                    and node.args[1].value == "_resources"
-                ):
+                if not is_attr_hook:
+                    continue
+                target_attr = None
+                if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                    target_attr = node.args[1].value
+                else:
+                    for kw in node.keywords:
+                        if kw.arg in ("attribute", "name") and isinstance(kw.value, ast.Constant):
+                            target_attr = kw.value.value
+                            break
+                if target_attr == "_resources":
                     offenders.append(f"{rel}:{node.lineno}")
     return offenders
 

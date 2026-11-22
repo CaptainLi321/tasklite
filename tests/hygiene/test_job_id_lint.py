@@ -1,13 +1,12 @@
-"""确定性 job_id 静态 lint（/ 红线：禁止 uuid/时间戳/随机后缀）。
+"""确定性 job_id 静态 lint（红线：禁止 uuid / 时间戳 / 随机后缀与 run_ 拼接）。
 
 框架本身不允许用随机/时间戳派生 job_id；本测试用 AST 扫描 `tasklite`
-源码中的 ``Job(...)`` 构造，确保 job_id 表达式不调用随机/时钟/ uuid 函数。
-消费方如需同样的守卫，可复用本文件逻辑。
+源码中的 ``Job(...)`` 构造，确保 job_id 表达式不调用随机/时钟/uuid 函数，
+也不使用形如 ``f"run_{seq}"`` 的运行序拼接。消费方如需同样的守卫，可复用本文件逻辑。
 """
 
 import ast
 import pathlib
-import sys
 
 import pytest
 
@@ -47,12 +46,17 @@ def _has_banned_call(expr):
                 func_name = sub.func.attr
             if func_name in _BANNED_CALLS:
                 return True
-    # 简单拒绝含 `run_` 前缀拼接的 f-string（历史 `run_{seq}` hack）
-    if isinstance(expr, ast.JoinedStr):
-        for val in expr.values:
-            if isinstance(val, ast.FormattedValue):
-                # 只对 `run_` 字面量拼接做提示性拦截（不拦截正常业务 id）
-                pass
+    # 拒绝形如 f"run_{seq}" 的运行序拼接（不拦截正常业务 id）
+    if isinstance(expr, ast.JoinedStr) and expr.values:
+        first = expr.values[0]
+        has_dynamic = any(isinstance(v, ast.FormattedValue) for v in expr.values)
+        if (
+            has_dynamic
+            and isinstance(first, ast.Constant)
+            and isinstance(first.value, str)
+            and first.value.startswith("run_")
+        ):
+            return True
     return False
 
 
@@ -66,5 +70,26 @@ def test_job_id_has_no_random_or_clock_calls(path):
         if _has_banned_call(expr):
             bad.append(ast.unparse(expr))
     assert not bad, (
-        f"job_id 禁止使用随机/时钟函数（确定性红线）: {path} -> {bad}"
+        f"job_id 禁止使用随机/时钟函数或 run_ 序拼接（确定性红线）: {path} -> {bad}"
     )
+
+
+def test_job_id_lint_self_check():
+    """自检：确保违禁模式被准确拦截且合法业务 ID 放行。"""
+    banned_samples = [
+        'Job("t", str(uuid4()))',
+        'Job("t", job_id=f"item_{time.time()}")',
+        'Job("t", f"run_{seq}")',
+    ]
+    for code in banned_samples:
+        exprs = list(_iter_job_id_exprs(ast.parse(code)))
+        assert len(exprs) == 1 and _has_banned_call(exprs[0]), f"应拦截：{code}"
+
+    allowed_samples = [
+        'Job("t", "item_1")',
+        'Job("t", f"item_{idx}")',
+        'Job("t", job_id="run_static_name")',
+    ]
+    for code in allowed_samples:
+        exprs = list(_iter_job_id_exprs(ast.parse(code)))
+        assert len(exprs) == 1 and not _has_banned_call(exprs[0]), f"不应误拦：{code}"

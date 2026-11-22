@@ -22,7 +22,20 @@ import typing
 
 import pytest
 
-CORE_PACKAGES = ("tasklite.utils", "tasklite.models", "tasklite.backend", "tasklite.engine")
+CORE_PACKAGES = (
+    "tasklite.utils",
+    "tasklite.models",
+    "tasklite.backend",
+    "tasklite.engine",
+    "tasklite.pipeline",
+    "tasklite.edit",
+    "tasklite.snapshot",
+    "tasklite._report",
+    "tasklite.resource",
+    "tasklite.selection",
+    "tasklite.__main__",
+    "tasklite.testing",
+)
 
 
 def _is_static_only_branch(test) -> bool:

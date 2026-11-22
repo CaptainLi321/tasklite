@@ -478,3 +478,17 @@ python -m tasklite remove ./state.db fetch::item_2 --no-recursive --apply
 - SQLite Schema 6 为全新结构（新增 `job_sequences` 表与完整 `attempts` 记录）；
 - 检测到 Schema ≤ 5、非空版本 0 库或不支持的结构时，引擎在只读预检阶段主动抛出 `TaskLiteError` 拒绝启动；文件系统、SQLite 等底层库自然产生的异常原样传播，保留原始 traceback 与异常链；
 - 存量生产业务请保留原状态数据库，使用匹配旧版本读取历史，升级时请通过新的 `state_path` 进行冷启动。
+
+---
+
+## 8. 常用场景可运行示例索引
+
+仓库 `examples/` 提供覆盖高频场景的完整可运行脚本，均支持零参数在临时目录自包含运行与断言验收：
+
+| 示例脚本 | 覆盖能力与场景 |
+| :--- | :--- |
+| [`examples/trigger_chain.py`](../examples/trigger_chain.py) | DAG 依赖链（`depends_on`）、具名产物传递（`FileSpec.from_output`）、`ctx.file_path`、Run 外显式预授权与 `StateSnapshot` 验收 |
+| [`examples/rate_limit_and_retry.py`](../examples/rate_limit_and_retry.py) | `IntervalResource` 周期限速、`CapacityResource` 并发配额、`TaskResult.retry` 重试与 `max_retries_per_run` 预算耗尽、`iter_attempts` 轨迹观测 |
+| [`examples/dynamic_spawn_and_cursor.py`](../examples/dynamic_spawn_and_cursor.py) | `ctx.spawn` 动态衍生、`ctx.get_cursor` / `ctx.set_cursor` 事务游标持久化、`register_discovery` 两轮增量分页扫描与整页命中刹车 |
+| [`examples/snapshot_report_and_exclude.py`](../examples/snapshot_report_and_exclude.py) | `StateSnapshot.open(..., mode="copy")` 前后对比与 `StateSnapshot.report`、`Exclude` 选择性留队与 `trigger="on_input_change"` |
+| [`examples/edit_migrations/`](../examples/edit_migrations/) | 5 个 Run 外 `pipeline.edit()` 原子图迁移参考脚本（详见第 4 节迁移表） |
