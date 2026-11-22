@@ -16,10 +16,9 @@ from .backend.memory import InMemoryStateBackend
 from .backend.sqlite_backend import SQLiteStateBackend
 from .edit import EditTransaction
 from .engine.admission import TriggerRegistry
-from .models.trigger import TriggerContext
+from .models.trigger import BUILTIN_TRIGGER_FUNCTIONS, TriggerContext
 from .engine.channel import ExecutionChannel
 from .engine.config import RunConfig
-from .engine.execution_access import exclusive_state_access
 from .engine.governor import DeadlockGovernor
 from .engine.resource import CapacityResource, ResourceManager, adapt_resource
 from .resource import (
@@ -101,12 +100,7 @@ class TaskLite:
         try:
             self._backend_handle = self._build_backend(backend)
             self._tasks = TaskRegistry()
-            from .triggers import BUILTIN_TRIGGER_FUNCTIONS
-            self._triggers = TriggerRegistry(
-                tasks=self._tasks,
-                functions=BUILTIN_TRIGGER_FUNCTIONS,
-                base_dir=self._base_dir,
-            )
+            self._triggers = TriggerRegistry(functions=BUILTIN_TRIGGER_FUNCTIONS)
             self._resources = self._build_resources(self._tasks, max_workers)
             self._channel = ExecutionChannel()
             self._runtime_config = self._build_run_config(self._backend_handle)
@@ -211,12 +205,18 @@ class TaskLite:
         """当前管线是否正在执行中。"""
         return self._runtime.is_running
 
-    def _snapshot_backend(self) -> AbstractStateBackend:
-        """向只读快照提供受控实例桥接，不开放为门面属性。"""
+    def _open_snapshot_source(self) -> tuple[Literal["sqlite", "memory"], Path | dict[str, Any]]:
+        """受控包内快照源接缝：在门面内完成关闭校验与 SQLite 路径 / 内存一致快照分发。"""
+        if self._closed:
+            raise TaskLiteError(
+                "Cannot open StateSnapshot from a closed TaskLite instance."
+            )
         backend = self._backend_handle
         if backend is None:
             raise TaskLiteError("TaskLite backend is unavailable")
-        return backend
+        if self._state_path is not None:
+            return ("sqlite", self._state_path)
+        return ("memory", backend.load_consistent_snapshot())
 
     def _set_editing(self, active: bool) -> None:
         """受控事务态切换回调，仅由 EditTransaction.__enter__ / __exit__ 成对维护。"""
@@ -341,7 +341,7 @@ class TaskLite:
             raise TaskLiteError(
                 f"enqueue() expects a Job, got {type(job).__name__}"
             )
-        with exclusive_state_access(self._runtime.store.backend):
+        with self._runtime.store.exclusive_access():
             inserted = self._runtime.store.enqueue_job(job)
             if inserted:
                 logger.info("Enqueued 1 job(s).")
@@ -379,7 +379,7 @@ class TaskLite:
     def set_cursor(self, key: str, value: str | None) -> None:
         """设置或删除游标键值，写入直接持久化提交，限 Run 外。"""
         self._ensure_active("set_cursor")
-        with exclusive_state_access(self._runtime.store.backend):
+        with self._runtime.store.exclusive_access():
             self._runtime.store.set_cursor(key, value)
 
     def grant_authorization(
@@ -390,7 +390,7 @@ class TaskLite:
     ) -> dict[str, Any]:
         """在 Run 外显式预授权单个文件或目录路径，重复或父子类型冲突抛 TaskLiteError。"""
         self._ensure_active("grant_authorization")
-        with exclusive_state_access(self._runtime.store.backend):
+        with self._runtime.store.exclusive_access():
             return self._runtime.store.grant_authorization(path, target_type=target_type)
 
     def list_authorizations(self) -> list[dict[str, Any]]:
@@ -401,7 +401,7 @@ class TaskLite:
     def revoke_authorization(self, path: str | Path) -> bool:
         """按规范绝对路径精确撤销授权，限 Run 外。"""
         self._ensure_active("revoke_authorization")
-        with exclusive_state_access(self._runtime.store.backend):
+        with self._runtime.store.exclusive_access():
             return self._runtime.store.revoke_authorization(path)
 
     # ── 运行与停机（六步之五/六）───────────────────────────────────

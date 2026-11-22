@@ -18,6 +18,13 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from ._report import render_snapshot_report
 from .backend.sqlite_backend import open_existing_sqlite_readonly
 from .exceptions import TaskLiteError
+from .models.records import (
+    extract_archive_result,
+    extract_effective_job_config,
+    extract_job_snapshot_from_archive,
+    normalize_outer_files,
+    normalize_result_record,
+)
 from .utils.encoding import parse_job_uid
 from .utils.jsonutil import loads
 
@@ -36,91 +43,6 @@ def _format_iso_z(ts: str | None) -> str | None:
     return ts
 
 
-def _normalize_job_config(snap: Mapping[str, Any]) -> dict[str, Any]:
-    """提取有效配置快照（包含身份、payload、depends_on、files 及资源、预算、超时、Trigger）。"""
-    raw_files = snap.get("files") or {}
-    files_dict: dict[str, Any] = {}
-    for name, spec in raw_files.items():
-        if hasattr(spec, "to_dict"):
-            files_dict[name] = spec.to_dict()
-        elif isinstance(spec, dict):
-            files_dict[name] = copy.deepcopy(spec)
-        else:
-            files_dict[name] = spec
-    return {
-        "task_type": snap.get("task_type"),
-        "job_id": snap.get("job_id"),
-        "payload": copy.deepcopy(snap.get("payload") or {}),
-        "depends_on": list(snap.get("depends_on") or []),
-        "files": files_dict,
-        "resources": dict(snap.get("resources") or {}),
-        "max_retries_per_run": snap.get("max_retries_per_run"),
-        "timeout_seconds": snap.get("timeout_seconds"),
-        "trigger": snap.get("trigger"),
-    }
-
-
-def _normalize_outer_files(raw_files: Mapping[str, Any] | None) -> dict[str, Any]:
-    """外层 files 规范化：按名称记录已解析预声明与动态声明并集（必须含绝对 path）。"""
-    if not raw_files:
-        return {}
-    normalized: dict[str, Any] = {}
-    for name, spec in raw_files.items():
-        if hasattr(spec, "to_dict"):
-            d = spec.to_dict()
-        elif isinstance(spec, dict):
-            d = copy.deepcopy(spec)
-        else:
-            continue
-        if d.get("path") is not None:
-            normalized[name] = {
-                "path": d["path"],
-                "role": d.get("role", "output"),
-                "delete_existing": bool(d.get("delete_existing", False)),
-                "delete_on_failure": bool(d.get("delete_on_failure", False)),
-                "delete_on_success": bool(d.get("delete_on_success", False)),
-            }
-    return normalized
-
-
-def _normalize_result(raw_result: Any) -> dict[str, Any] | None:
-    """结算结果规范化为 unified 字典形状（message / exception / metadata / annotations）。"""
-    if raw_result is None:
-        return None
-    if not isinstance(raw_result, dict):
-        return {
-            "message": str(raw_result),
-            "exception": None,
-            "metadata": {},
-            "annotations": {},
-        }
-    msg = raw_result.get("message")
-    if msg is not None:
-        msg = str(msg)
-    raw_exc = raw_result.get("exception")
-    exc_dict: dict[str, Any] | None = None
-    if isinstance(raw_exc, dict):
-        exc_dict = {
-            "type": str(raw_exc.get("type", "Exception")),
-            "message": str(raw_exc.get("message", "")),
-            "traceback": (
-                str(raw_exc["traceback"])
-                if raw_exc.get("traceback") is not None
-                else None
-            ),
-        }
-    meta = raw_result.get("metadata")
-    meta_dict = copy.deepcopy(meta) if isinstance(meta, dict) else {}
-    ann = raw_result.get("annotations")
-    ann_dict = copy.deepcopy(ann) if isinstance(ann, dict) else {}
-    return {
-        "message": msg,
-        "exception": exc_dict,
-        "metadata": meta_dict,
-        "annotations": ann_dict,
-    }
-
-
 def _project_queued_job(
     uid: str,
     job_snap: Mapping[str, Any],
@@ -134,8 +56,8 @@ def _project_queued_job(
     return {
         "job_uid": uid,
         "status": status,
-        "job": _normalize_job_config(job_snap),
-        "files": _normalize_outer_files(job_snap.get("files")),
+        "job": extract_effective_job_config(job_snap),
+        "files": normalize_outer_files(job_snap.get("files")),
         "result": None,
         "run_id": run_id if is_running else None,
         "attempt_no": attempt_no if is_running else None,
@@ -149,25 +71,16 @@ def _project_succeeded_job(
     succ_meta: Mapping[str, Any],
 ) -> dict[str, Any]:
     """当前成功只投影自身档案，不从独立的 Attempt 历史补推事实。"""
-    job_snap = succ_meta.get("job_snapshot") or {}
-    outer_files = _normalize_outer_files(
+    job_snap = extract_job_snapshot_from_archive(uid, succ_meta, fill_missing_identity=False)
+    outer_files = normalize_outer_files(
         succ_meta.get("files") or job_snap.get("files")
-    )
-    result = _normalize_result(
-        succ_meta.get("result")
-        or {
-            "message": None,
-            "exception": None,
-            "metadata": {},
-            "annotations": succ_meta.get("annotations") or {},
-        }
     )
     return {
         "job_uid": uid,
         "status": "succeeded",
-        "job": _normalize_job_config(job_snap),
+        "job": extract_effective_job_config(job_snap),
         "files": outer_files,
-        "result": result,
+        "result": extract_archive_result(succ_meta, is_failure=False),
         "run_id": succ_meta.get("run_id"),
         "attempt_no": succ_meta.get("attempt_no"),
         "started_at": _format_iso_z(succ_meta.get("started_at")),
@@ -181,25 +94,18 @@ def _project_failed_job(
     payload: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """当前失败档案投影：仅在 job_snapshot 缺 payload 时补回独立 payload 列。"""
-    job_snap = copy.deepcopy(dict(fail_meta.get("job_snapshot") or {}))
-    if payload is not None and not job_snap.get("payload"):
-        job_snap["payload"] = copy.deepcopy(dict(payload))
-    outer_files = _normalize_outer_files(
-        fail_meta.get("files") or job_snap.get("files")
+    job_snap = extract_job_snapshot_from_archive(
+        uid, fail_meta, payload=payload, fill_missing_identity=False
     )
-    result = _normalize_result(
-        fail_meta.get("result")
-        or {
-            "message": fail_meta.get("error_message") or fail_meta.get("message"),
-            "annotations": fail_meta.get("annotations") or {},
-        }
+    outer_files = normalize_outer_files(
+        fail_meta.get("files") or job_snap.get("files")
     )
     return {
         "job_uid": uid,
         "status": "failed",
-        "job": _normalize_job_config(job_snap),
+        "job": extract_effective_job_config(job_snap),
         "files": outer_files,
-        "result": result,
+        "result": extract_archive_result(fail_meta, is_failure=True),
         "run_id": fail_meta.get("run_id"),
         "attempt_no": fail_meta.get("attempt_no"),
         "started_at": _format_iso_z(fail_meta.get("started_at")),
@@ -222,9 +128,9 @@ def _project_attempt(
     return {
         "job_uid": uid,
         "outcome": outcome,
-        "job": _normalize_job_config(job_snap),
-        "files": _normalize_outer_files(files_data),
-        "result": _normalize_result(result_data),
+        "job": extract_effective_job_config(job_snap),
+        "files": normalize_outer_files(files_data),
+        "result": normalize_result_record(result_data),
         "run_id": run_id,
         "attempt_no": attempt_no,
         "started_at": _format_iso_z(started_at),
@@ -735,21 +641,17 @@ class StateSnapshot:
                     "source must be a str, Path, or TaskLite instance, "
                     f"got {type(source).__name__}"
                 )
-            if source._closed:
-                raise TaskLiteError(
-                    "Cannot open StateSnapshot from a closed TaskLite instance."
-                )
-            backend = source._snapshot_backend()
-            if source._state_path is not None:
+            kind, payload = source._open_snapshot_source()
+            if kind == "sqlite":
+                assert isinstance(payload, Path)
                 adapter = (
-                    _MemoryTableAdapter.from_sqlite_copy(source._state_path)
+                    _MemoryTableAdapter.from_sqlite_copy(payload)
                     if mode == "copy"
-                    else _SqliteStreamingAdapter(source._state_path)
+                    else _SqliteStreamingAdapter(payload)
                 )
             else:
-                adapter = _MemoryTableAdapter.from_consistent_snapshot(
-                    backend.load_consistent_snapshot()
-                )
+                assert isinstance(payload, Mapping)
+                adapter = _MemoryTableAdapter.from_consistent_snapshot(payload)
         self._adapter: _SnapshotAdapter = adapter
 
     @classmethod
@@ -920,11 +822,6 @@ class StateSnapshot:
 
     @property
     def closed(self) -> bool:
-        """快照是否已关闭。"""
-        return self._closed
-
-    @property
-    def is_closed(self) -> bool:
         """快照是否已关闭。"""
         return self._closed
 

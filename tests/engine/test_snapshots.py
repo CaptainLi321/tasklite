@@ -49,13 +49,12 @@ class TestStateSnapshotOpeningAndClosing:
         with StateSnapshot.open(db_path) as s1:
             assert s1.source == db_path
             assert not s1.closed
-            assert not s1.is_closed
             job = s1.get_job("process::j1")
             assert job is not None
             assert job["status"] == "pending"
 
         assert s1.closed is True
-        assert s1.is_closed is True
+        assert not hasattr(s1, "is_closed")
         with pytest.raises(TaskLiteError, match="source must be"):
             StateSnapshot.open(backend)
         with TaskLite(backend="sqlite", state_path=db_path) as sqlite_pipeline:

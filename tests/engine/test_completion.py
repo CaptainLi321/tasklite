@@ -8,7 +8,7 @@ settle_reaped / settle_aborted 批量结算。
 
 from __future__ import annotations
 
-from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+from tasklite.models.trigger import BUILTIN_TRIGGER_FUNCTIONS
 
 from typing import Any
 
@@ -58,12 +58,12 @@ class CompletionEnv:
         self.backend = InMemoryStateBackend()
         self.tasks = TaskRegistry()
         self.trigger_registry = TriggerRegistry(
-            tasks=self.tasks,
             functions=BUILTIN_TRIGGER_FUNCTIONS,
         )
         self.store = StateStore(
             self.backend,
             PipelineState({}, {}, {}, []),
+            tasks=self.tasks,
             trigger_registry=self.trigger_registry,
         )
         self.session = RunSession()
@@ -333,7 +333,7 @@ class TestSpawnedJobs:
         env.register_task("child")
         env.store.state.register_in_flight("child::x")
         env.store.apply_success("child::x", result={"message": None, "exception": None, "metadata": {}, "annotations": {}}, **env.start_execution(Job("child", "x")))
-        existing = env.store.normalize_spawned_job(Job("child", "x", trigger="always"))
+        existing = env.store.normalize_new_job_snapshot(Job("child", "x", trigger="always"), caller="spawn")
         env.store.state.spawn_jobs([existing])
 
         parent = Job("parent", "p1")
@@ -394,8 +394,9 @@ class TestSpawnedJobs:
     def test_empty_dispatch_snapshot_does_not_fall_back_to_live_state(self, tmp_path):
         env = CompletionEnv(tmp_path)
         env.register_task("child")
+        env.register_task("known")
         env.store.state.spawn_jobs([
-            env.store.normalize_and_validate_job(Job("known", "live")),
+            env.store.normalize_new_job_snapshot(Job("known", "live")),
         ])
         parent = Job("parent", "p1")
         entry = env.track_entry(parent, **env.start_execution(parent))

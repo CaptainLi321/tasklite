@@ -23,7 +23,6 @@ from typing import Any
 from ._worker_runtime import stop_signals
 from .config import RunConfig
 from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
-from .execution_access import exclusive_state_access
 from .channel import ExecutionChannel
 from .completion import CompletionMachine
 from .resource import RunNotifier
@@ -98,6 +97,7 @@ class EngineRuntime:
         # 期装配快照的搬运通道），运行期一切读写经 store.backend 派生。
         self.store: StateStore = StateStore(
             config.backend,
+            tasks=config.tasks,
             trigger_registry=config.trigger_registry,
             requeue_policy=config.requeue_policy,
             path_policy=config.path_policy,
@@ -578,7 +578,7 @@ class EngineRuntime:
         try:
             self.scheduler.reset_run(opts.exclude)
 
-            with exclusive_state_access(self.store.backend):
+            with self.store.exclusive_access():
                 try:
                     # 主线程安装信号处理器；安装失败自动回滚，退出按 LIFO 逆序恢复。
                     with (

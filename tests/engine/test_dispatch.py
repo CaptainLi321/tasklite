@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+from tasklite.models.trigger import BUILTIN_TRIGGER_FUNCTIONS
 
 from typing import Any
 
@@ -407,7 +407,7 @@ class TestGateOrderContract:
 
         env = DispatchEnv(tmp_path)
         env.register("t")
-        env.backend.commit_job_failure("dead::parent", {"error_message": "dead"})
+        env.backend.commit_job_failures([("dead::parent", {"error_message": "dead"})])
         env.store.state.mark_failed("dead::parent", {"error_message": "dead"})
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         env.store.state.pop_job(0)

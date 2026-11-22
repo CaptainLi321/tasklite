@@ -262,7 +262,7 @@ def test_leftover_running_recovery_and_idempotence(tmp_path: Path):
     assert attempts[0]["outcome"] == "failure"
     assert attempts[0]["attempt_no"] == 1
     assert attempts[0]["run_id"] == "run_crash"
-    assert pipeline._runtime.store.backend.load_queue() == []
+    assert pipeline._runtime.store.backend.load_queue_jobs(status="pending") == []
 
     # 再次启动，幂等不产生重复 attempts
     pipeline2 = TaskLite(backend="sqlite", state_path=db_path)
@@ -323,7 +323,7 @@ def test_invalid_spawned_job_rejects_parent_and_discards_effects(tmp_path: Path,
     assert "child::valid" not in pipeline._runtime.store.backend.load_successes()
     assert pipeline._runtime.store.backend.load_settled_attempts("child::valid") == []
     assert "offset" not in pipeline._runtime.store.backend.load_cursors()
-    assert pipeline._runtime.store.backend.load_queue() == []
+    assert pipeline._runtime.store.backend.load_queue_jobs(status="pending") == []
 
 
 def file_counter_retry_handler(job, ctx):

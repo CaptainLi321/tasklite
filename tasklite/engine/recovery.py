@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping, Set as AbstractSet
 import copy
 from typing import Any, Protocol, TYPE_CHECKING
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
 
 from ..backend.base import RunningAttemptRecovery, execution_id_matches_run
 from ..exceptions import TaskLiteError
+from ..models.records import build_result_record
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..utils.clock import utc_now_iso
 
@@ -105,12 +107,10 @@ def build_unsettled_running_recovery(
     effective_settled_at = settled_at if settled_at is not None else utc_now_iso()
     job_snap = copy.deepcopy(row["job"])
     files = copy.deepcopy(job_snap.get("files") or {})
-    result: dict[str, Any] = {
-        "message": UNSETTLED_RUNNING_ERROR_MESSAGE,
-        "exception": None,
-        "metadata": {},
-        "annotations": {"completion_source": "execution"},
-    }
+    result = build_result_record(
+        message=UNSETTLED_RUNNING_ERROR_MESSAGE,
+        annotations={"completion_source": "execution"},
+    )
     failure_metadata: dict[str, Any] = {
         "error_message": UNSETTLED_RUNNING_ERROR_MESSAGE,
         "reason": UNSETTLED_RUNNING_REASON,
@@ -152,33 +152,38 @@ class RecoveryOrchestrator:
         self._completion = completion
 
     def load_and_recover(self) -> PipelineState:
-        """先检查全部冲突，再按原执行身份逐个结算遗留 running。"""
-        backend = self._store.backend
-        successes = backend.load_successes()
-        failed = backend.load_failed()
+        """单次一致快照装载并校验全部冲突，再按原执行身份逐个结算遗留 running。"""
+        snap = self._store.backend.load_consistent_snapshot()
+        successes = snap["successes"]
+        failed = snap["failed"]
         overlap = successes.keys() & failed.keys()
         if overlap:
             raise TaskLiteError(f"Invariant conflict: Jobs have both terminal records: {overlap}")
 
-        queue_rows = backend.load_queue_jobs()
+        queue_rows = snap["queue_jobs"]
         running = [row for row in queue_rows if row["status"] == "running"]
         prepared: list[tuple[dict[str, Any], RunningAttemptRecovery, dict[str, Any]]] = []
-        for row in running:
-            uid = row["job_uid"]
-            settled_nos = {
-                attempt["attempt_no"]
-                for attempt in backend.load_settled_attempts(uid)
-                if isinstance(attempt.get("attempt_no"), int)
-            }
-            recovery, failure_metadata = build_unsettled_running_recovery(
-                row,
-                attempt_sequence=backend.get_attempt_sequence(uid),
-                settled_attempt_nos=settled_nos,
-            )
-            prepared.append((row, recovery, failure_metadata))
+        if running:
+            job_sequences = snap.get("job_sequences") or {}
+            settled_by_uid: dict[str, set[int]] = defaultdict(set)
+            for attempt in snap.get("attempts") or ():
+                att_uid = attempt.get("job_uid")
+                att_no = attempt.get("attempt_no")
+                if isinstance(att_uid, str) and isinstance(att_no, int):
+                    settled_by_uid[att_uid].add(att_no)
+            for row in running:
+                uid = row["job_uid"]
+                recovery, failure_metadata = build_unsettled_running_recovery(
+                    row,
+                    attempt_sequence=job_sequences.get(uid, 0),
+                    settled_attempt_nos=settled_by_uid.get(uid, frozenset()),
+                )
+                prepared.append((row, recovery, failure_metadata))
 
         state = PipelineState(
-            successes, failed, backend.load_cursors(),
+            successes,
+            failed,
+            snap["cursors"],
             [row["job"] for row in queue_rows if row["status"] == "pending"],
         )
         self._store.set_state(state)

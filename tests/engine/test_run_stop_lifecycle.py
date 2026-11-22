@@ -114,13 +114,13 @@ def test_stop_during_initialization_is_preserved(tmp_path, monkeypatch, stage):
 
 
 def test_stop_during_execution_lock_acquisition_is_preserved(tmp_path, monkeypatch):
-    import tasklite.engine.execution_access as access_module
+    import tasklite.backend.sqlite_backend as sqlite_backend_module
 
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
         pipeline.register_task("work", success_handler)
         pipeline.enqueue(Job("work", "one"))
         entered, proceed = threading.Event(), threading.Event()
-        original = access_module.try_acquire_lock
+        original = sqlite_backend_module.try_acquire_lock
         errors = []
 
         def blocked(*args, **kwargs):
@@ -135,7 +135,7 @@ def test_stop_during_execution_lock_acquisition_is_preserved(tmp_path, monkeypat
                 errors.append(error)
 
         with monkeypatch.context() as patch:
-            patch.setattr(access_module, "try_acquire_lock", blocked)
+            patch.setattr(sqlite_backend_module, "try_acquire_lock", blocked)
             thread = threading.Thread(target=run)
             thread.start()
             try:
@@ -585,7 +585,7 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
         # 第 1 次 Run 结束：因 stop() 停止新派发，且单次 retry 在预算内（1 <= 1），保持 pending
         assert "t_retry::j1" not in p._runtime.store.backend.load_successes()
         assert len(p._runtime.store.backend.load_failed()) == 0
-        assert any(jd["job_id"] == "j1" for jd in p._runtime.store.backend.load_queue())
+        assert any(row["job"]["job_id"] == "j1" for row in p._runtime.store.backend.load_queue_jobs(status="pending"))
         assert _TRIGGER_CALLS[0] == 1
 
         # 第 2 次 Run：新 Run 重新评估 Trigger，且重试预算重置
@@ -633,7 +633,7 @@ def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
     assert "t_fail::j_fail" in failures
     assert "t_downstream::j_down" in failures
 
-    queue = [jd["job_id"] for jd in p._runtime.store.backend.load_queue()]
+    queue = [row["job"]["job_id"] for row in p._runtime.store.backend.load_queue_jobs(status="pending")]
     assert "j_other" in queue
     assert "t_other::j_other" not in p._runtime.store.backend.load_successes()
     assert "t_other::j_other" not in failures

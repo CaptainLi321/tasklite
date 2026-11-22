@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+from tasklite.models.trigger import BUILTIN_TRIGGER_FUNCTIONS
 
 import dataclasses
 

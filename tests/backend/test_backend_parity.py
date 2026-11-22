@@ -34,12 +34,10 @@ from tasklite.testing import authorizer
 BACKEND_PACKAGE_DIR = pathlib.Path(__file__).resolve().parents[2] / "tasklite" / "backend"
 
 EXPECTED_ABSTRACT_METHODS = {
+    "exclusive_access",
     "load_successes",
     "load_failed",
-    "load_failure_payloads",
     "load_cursors",
-    "load_queue",
-    "commit_job_failure",
     "commit_job_failures",
     "commit_skip",
     "enqueue_jobs",
@@ -48,7 +46,6 @@ EXPECTED_ABSTRACT_METHODS = {
     "get_cursor",
     "set_cursor",
     "load_latest_succeeded_finished_at",
-    "get_engine_metadata",
     "set_engine_metadata",
     "mark_job_running",
     "commit_job_settlement",
@@ -61,6 +58,14 @@ EXPECTED_ABSTRACT_METHODS = {
     "is_path_authorized",
     "revoke_authorization",
 }
+
+
+def _pending_queue(backend: AbstractStateBackend) -> list[dict[str, Any]]:
+    return [row["job"] for row in backend.load_queue_jobs(status="pending")]
+
+
+def _failure_payloads(backend: AbstractStateBackend) -> dict[str, dict[str, Any]]:
+    return backend.load_consistent_snapshot()["failure_payloads"]
 
 
 def _job_snapshot(job_id: str, **overrides: Any) -> dict[str, Any]:
@@ -79,7 +84,7 @@ def _settle_success(
     **kwargs: Any,
 ) -> None:
     snapshot = next(
-        (job for job in backend.load_queue() if job_uid_from_snapshot(job) == job_uid), None
+        (job for job in _pending_queue(backend) if job_uid_from_snapshot(job) == job_uid), None
     )
     if snapshot is None:
         task_type, job_id = parse_job_uid(job_uid)
@@ -106,28 +111,30 @@ def _settle_success(
 
 
 def _queue_uids(backend: AbstractStateBackend) -> list[str]:
-    return [job_uid_from_snapshot(j) for j in backend.load_queue()]
+    return [job_uid_from_snapshot(j) for j in _pending_queue(backend)]
 
 
 def _snapshot(backend: AbstractStateBackend) -> dict[str, Any]:
     """后端可观察状态快照，用于故障原子性比对。"""
+    consistent = backend.load_consistent_snapshot()
     return {
         "queue": _queue_uids(backend),
-        "wall": backend.load_successes(),
-        "failed": backend.load_failed(),
-        "failure_payloads": backend.load_failure_payloads(),
-        "cursors": backend.load_cursors(),
+        "wall": consistent["successes"],
+        "failed": consistent["failed"],
+        "failure_payloads": consistent["failure_payloads"],
+        "cursors": consistent["cursors"],
     }
 
 
 def _state_facts(backend: AbstractStateBackend) -> dict[str, Any]:
     """提取后端全部可观测事实，用于双后端等价性核对。"""
+    consistent = backend.load_consistent_snapshot()
     return {
-        "queue": backend.load_queue_jobs(),
-        "successes": backend.load_successes(),
-        "failed": backend.load_failed(),
-        "failure_payloads": backend.load_failure_payloads(),
-        "cursors": backend.load_cursors(),
+        "queue": consistent["queue_jobs"],
+        "successes": consistent["successes"],
+        "failed": consistent["failed"],
+        "failure_payloads": consistent["failure_payloads"],
+        "cursors": consistent["cursors"],
     }
 
 
@@ -211,11 +218,10 @@ class TestCoreContractProperties:
         b = dual_backend
         assert b.load_successes() == {}
         assert b.load_failed() == {}
-        assert b.load_failure_payloads() == {}
+        assert _failure_payloads(b) == {}
         assert b.load_cursors() == {}
-        assert b.load_queue() == []
+        assert _pending_queue(b) == []
         assert b.load_settled_attempts("t::missing") == []
-        assert b.get_engine_metadata("any") is None
 
     def test_enqueue_visible_idempotent_and_ordered(self, dual_backend):
         b = dual_backend
@@ -233,8 +239,8 @@ class TestCoreContractProperties:
         b.enqueue_jobs([_job_snapshot(j) for j in ("success_one", "fail_one", "bulk_one", "skip_one", "keep_one")])
 
         assert _settle_success(b, job_uid="t::success_one", result_metadata={"ok": True}) is None
-        assert b.commit_job_failure(job_uid="t::fail_one", failure_metadata={"error_message": "x"}) is True
-        assert b.commit_job_failures(job_uids_metadata=[("t::bulk_one", {"error_message": "y"})]) is None
+        assert b.commit_job_failures([("t::fail_one", {"error_message": "x"})]) is None
+        assert b.commit_job_failures([("t::bulk_one", {"error_message": "y"})]) is None
         assert b.commit_skip(job_uid="t::skip_one") is None
         assert b.commit_job_failures([]) is None
 
@@ -246,53 +252,51 @@ class TestCoreContractProperties:
         b = dual_backend
         metadata = {"error_message": "stale", "payload": "档案元数据", "nested": {"new_jobs": [1]}}
         payload = {"error": "业务输入", "metadata": "业务值", "nested": {"timeout": 9}}
-        assert b.commit_job_failure(job_uid="t::one", failure_metadata=metadata, payload=payload) is True
+        assert b.commit_job_failures([("t::one", metadata, payload)]) is None
         assert b.load_failed()["t::one"] == metadata
-        assert b.load_failure_payloads()["t::one"] == payload
+        assert _failure_payloads(b)["t::one"] == payload
         _settle_success(b, "t::other", {"ok": True})
 
         assert _settle_success(b, "t::one", {"ok": True}) is None
         assert b.load_failed() == {}
-        assert b.load_failure_payloads() == {}
+        assert _failure_payloads(b) == {}
 
-        assert b.commit_job_failure("t::other", {"error_message": "boom"}) is True
+        assert b.commit_job_failures([("t::other", {"error_message": "boom"})]) is None
         assert b.load_successes() == {"t::one": {"ok": True}}
         assert not (set(b.load_successes()) & set(b.load_failed()))
 
     def test_failure_archive_overwrite_empty_and_payload_retention(self, dual_backend):
         b = dual_backend
-        b.commit_job_failure("t::nil", {})
+        b.commit_job_failures([("t::nil", {})])
         assert b.load_failed() == {"t::nil": {}}
-        assert b.load_failure_payloads() == {}
+        assert _failure_payloads(b) == {}
 
-        assert b.commit_job_failure("t::dup", {"first": 1}, payload={"v": 1}) is True
-        assert b.load_failure_payloads() == {"t::dup": {"v": 1}}
-        assert b.commit_job_failure("t::dup", {"second": 2}, payload={"v": 2}) is True
+        assert b.commit_job_failures([("t::dup", {"first": 1}, {"v": 1})]) is None
+        assert _failure_payloads(b) == {"t::dup": {"v": 1}}
+        assert b.commit_job_failures([("t::dup", {"second": 2}, {"v": 2})]) is None
         assert b.load_failed()["t::dup"] == {"second": 2}
-        assert b.load_failure_payloads() == {"t::dup": {"v": 2}}
-        b.commit_job_failure("t::dup", {"third": 3})
+        assert _failure_payloads(b) == {"t::dup": {"v": 2}}
+        b.commit_job_failures([("t::dup", {"third": 3})])
         assert b.load_failed()["t::dup"] == {"third": 3}
-        assert b.load_failure_payloads() == {"t::dup": {"v": 2}}
+        assert _failure_payloads(b) == {"t::dup": {"v": 2}}
 
-    def test_meta_roundtrip_upsert(self, dual_backend):
+    def test_meta_upsert_idempotent(self, dual_backend):
         b = dual_backend
-        assert b.get_engine_metadata("fencing") is None
         b.set_engine_metadata("fencing", "run_seed")
         b.set_engine_metadata("fencing", "run_next")
-        assert b.get_engine_metadata("fencing") == "run_next"
 
     def test_snapshot_isolation_on_reads_and_writes(self, dual_backend):
         b = dual_backend
         job = _job_snapshot("one", payload={"x": 1})
         b.enqueue_jobs([job])
         job["payload"]["x"] = 999
-        q_snap = b.load_queue()
+        q_snap = _pending_queue(b)
         q_snap[0]["payload"]["x"] = 888
         q_snap.pop()
-        assert b.load_queue()[0]["payload"] == {"x": 1}
+        assert _pending_queue(b)[0]["payload"] == {"x": 1}
 
         _settle_success(b, "t::one", {"meta": {"v": 1}})
-        b.commit_job_failure("t::two", {"meta": {"v": 2}})
+        b.commit_job_failures([("t::two", {"meta": {"v": 2}})])
         b.load_successes()["t::one"]["meta"]["v"] = 999
         b.load_failed()["t::two"]["meta"]["v"] = 999
         assert b.load_successes()["t::one"]["meta"] == {"v": 1}
@@ -333,14 +337,14 @@ class TestBackendCommitAtomicity:
         before = _snapshot(b)
 
         with pytest.raises((ValueError, TypeError)):
-            b.commit_job_failure("t::one", {"payload": _UncommittableMeta()})
+            b.commit_job_failures([("t::one", {"payload": _UncommittableMeta()})])
         assert _snapshot(b) == before
         assert "t::one" in _queue_uids(b)
 
     def test_success_commit_with_spawn_and_cursor_applies_atomically(self, dual_backend):
         b = dual_backend
         b.enqueue_jobs([_job_snapshot("one")])
-        b.commit_job_failure("t::one", {"error_message": "stale"})
+        b.commit_job_failures([("t::one", {"error_message": "stale"})])
 
         _settle_success(
             b,
@@ -389,7 +393,7 @@ class TestGraphEditCommitAndCursors:
         assert "t::a" not in _queue_uids(b)
         assert b.load_successes()["t::a"]["annotations"]["completion_source"] == "manual"
         assert b.load_failed()["t::b"]["note"] == "测试失败"
-        assert b.load_failure_payloads()["t::b"] == {"k": "v"}
+        assert _failure_payloads(b)["t::b"] == {"k": "v"}
         q_rows = b.load_queue_jobs()
         assert len(q_rows) == 1 and q_rows[0]["job_uid"] == "t::c" and q_rows[0]["status"] == "running"
 
@@ -421,11 +425,13 @@ class TestGraphEditCommitAndCursors:
         atts = b.load_settled_attempts("t::c")
         assert len(atts) == 1 and atts[0]["outcome"] == "failure" and atts[0]["attempt_no"] == 1
 
-        # load_consistent_snapshot 包含 job_sequences 与完整 6 字段
+        # load_consistent_snapshot 包含 cursors 与 job_sequences 等完整 7 字段
+        b.set_cursor("c_snap", "v_snap")
         consistent = b.load_consistent_snapshot()
         assert set(consistent) == {
-            "queue_jobs", "successes", "failed", "failure_payloads", "attempts", "job_sequences",
+            "queue_jobs", "successes", "failed", "failure_payloads", "cursors", "attempts", "job_sequences",
         }
+        assert consistent["cursors"] == {"c_snap": "v_snap"}
         assert consistent["job_sequences"]["t::c"] == 1
 
     def test_commit_graph_edit_rejects_overlap_and_rolls_back_on_fault(self, dual_backend):
@@ -497,17 +503,17 @@ def test_archive_metadata_and_payload_are_independent_untranslated_copies(dual_b
     }
     expected_metadata = copy.deepcopy(metadata)
     expected_payload = copy.deepcopy(payload)
-    assert dual_backend.commit_job_failure("t::separate", metadata, payload=payload)
+    dual_backend.commit_job_failures([("t::separate", metadata, payload)])
     metadata["nested"]["timeout"] = 99
     if payload:
         payload["nested"]["new_jobs"].append(99)
     assert dual_backend.load_failed() == {"t::separate": expected_metadata}
     expected_payloads = {} if payload is None else {"t::separate": expected_payload}
-    assert dual_backend.load_failure_payloads() == expected_payloads
+    assert _failure_payloads(dual_backend) == expected_payloads
     dual_backend.load_failed()["t::separate"]["nested"]["timeout"] = 999
     assert dual_backend.load_failed() == {"t::separate": expected_metadata}
-    assert dual_backend.commit_job_failure("t::separate", {"replacement": True}, payload=None)
-    assert dual_backend.load_failure_payloads() == expected_payloads
+    dual_backend.commit_job_failures([("t::separate", {"replacement": True}, None)])
+    assert _failure_payloads(dual_backend) == expected_payloads
 
 
 # ── 状态机四态结算、冲突回滚与 Attempt 编号独立性 ─────────────────────
@@ -622,7 +628,7 @@ class TestStatePrimitivesAndAttemptSequence:
     @pytest.mark.parametrize("conflict", ["existing", "duplicate"])
     def test_spawn_conflict_rolls_back_complete_settlement(self, dual_backend, conflict):
         backend = dual_backend
-        backend.commit_job_failure("t::parent", {"old": True}, {"input": 1})
+        backend.commit_job_failures([("t::parent", {"old": True}, {"input": 1})])
         backend.enqueue_jobs([_job_snapshot("parent"), _job_snapshot("existing")])
         backend.set_cursor("offset", "old")
         backend.mark_job_running("t::parent", execution_id="run.1", run_id="run", started_at="start")
@@ -685,7 +691,7 @@ class TestStatePrimitivesAndAttemptSequence:
             payload={"input": "data"},
         )
         assert "t::job_f" in b.load_failed()
-        assert b.load_failure_payloads().get("t::job_f") == {"input": "data"}
+        assert _failure_payloads(b).get("t::job_f") == {"input": "data"}
         assert b.load_settled_attempts("t::job_f")[0]["outcome"] == "failure"
 
         # retry
@@ -756,7 +762,7 @@ class TestStatePrimitivesAndAttemptSequence:
         records[0]["files"]["output"]["path"] = "changed"
         assert backend.load_settled_attempts("t::parent")[0] == first
         assert backend.load_latest_succeeded_finished_at("t::missing") is None
-        backend.commit_job_failure("t::parent", {"preflight": True})
+        backend.commit_job_failures([("t::parent", {"preflight": True})])
         backend.commit_skip("t::parent")
         assert backend.load_settled_attempts("t::parent")[0] == first
 
@@ -783,7 +789,7 @@ class TestStatePrimitivesAndAttemptSequence:
         # attempts 严格 append-only 不可删除，job_sequences 亦永不重置
         assert len(b.load_settled_attempts(job_uid)) == 1
         assert b.get_attempt_sequence(job_uid) == 1
-        assert b.load_queue() == [] and b.load_successes() == {} and b.load_failed() == {}
+        assert _pending_queue(b) == [] and b.load_successes() == {} and b.load_failed() == {}
 
         b.enqueue_jobs([_job_snapshot("target_seq", attempt_no=snapshot_attempt_no)])
         assert b.mark_job_running(job_uid, execution_id="run_2.2", run_id="run_2", started_at="2026-11-08T01:00:00Z") == 2

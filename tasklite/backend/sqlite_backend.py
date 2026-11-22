@@ -7,29 +7,38 @@
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence, cast
 
 from .base import (
     AbstractStateBackend,
+    FailureEntry,
     GraphEditCommit,
-    RunningAttemptRecovery,
-    execution_id_matches_run,
+    is_valid_authorization_target_type,
+    normalize_authorization_path,
+    normalize_failure_entries,
     public_queue_snapshot,
     queue_snapshot_execution_id,
     queue_snapshot_with_execution_id,
+    resolve_authorized_at,
+    validate_authorization_target_type,
+    validate_cursor_key,
+    validate_cursor_value,
     validate_graph_edit_commit,
-    validate_queue_replacement,
+    validate_mark_job_running_args,
+    validate_mark_job_running_state,
     validate_recovery_attempt_state,
+    validate_running_settlement_state,
+    validate_settlement_args,
 )
 from ..exceptions import TaskLiteError
 from ..models.state import job_uid_from_snapshot
 from ..utils.artifact import TargetType, evaluate_authorization
-from ..utils.clock import utc_now_iso
 from ..utils.jsonutil import dumps, loads
+from ..utils.lockfile import release_lock, try_acquire_lock
 
 logger = logging.getLogger("tasklite")
 
@@ -153,28 +162,25 @@ class SQLiteStateBackend(AbstractStateBackend):
         self._init_db()
 
     @contextmanager
-    def _get_conn(self):
+    def exclusive_access(self) -> Iterator[None]:
+        """非阻塞获取 ``<state_path>.lock`` 跨进程文件锁，离开作用域归还。"""
+        fd = try_acquire_lock(self.path, timeout=0)
+        if fd is None:
+            raise TaskLiteError(
+                f"Another run() or management operation is in progress for "
+                f"{self.path}; concurrent runs or management operations on the same state are forbidden."
+            )
+        try:
+            yield
+        finally:
+            release_lock(fd)
+
+    @contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """连接上下文管理器：成功时 commit，异常时 rollback，始终 close。
 
-        ``__exit__`` 中显式 ``conn.close()``——事务管理与连接关闭都由
-        上下文管理器承担，调用方无法泄漏 fd。
-
-        ``synchronous=FULL`` 是 per-connection 设置，每次新建连接都需设置；
-        ``journal_mode=WAL`` 是 database-level，仅在 ``_init_db`` 中设置一次。
-        持久化保障：WAL+NORMAL 下 commit 不 fsync WAL，断电可回滚最后若干
-        事务——执行中 job 的回滚可被 at-least-once 重跑吸收，但 enqueue
-        应答后断电时 INSERT 事务消失且无 job 可重跑（任务静默蒸发）。
-        FULL 保证已应答事务落盘。
-
-        读-改-写事务纪律：``sqlite3`` 传统隔离模式只为 DML 隐式开事务，
-        SELECT 在 autocommit 下逐条取快照——「读 min/max(queue_position) → 分配 →
-        INSERT」「读 payload 快照 → REPLACE」「读 running 轨迹行 →
-        UPDATE」若不显式开事务，两个连接会基于同一份旧快照各算各的，
-        落盘出现重复 queue_position（idx_queue_position 非唯一，拦不住）或丢快照。此类
-        方法必须在任何 SELECT 之前显式 ``BEGIN IMMEDIATE``：先取写锁再
-        读，读与写在同一事务内；并发方要么先于本事务提交（本事务读到其
-        结果），要么排队等锁。锁等待由 connect(timeout=30.0) 的 busy
-        timeout 承担——并发方等待写锁而非立即报 database is locked。
+        ``synchronous=FULL`` 保证已应答事务落盘；读-改-写方法必须在任意 SELECT
+        之前显式 ``BEGIN IMMEDIATE`` 串行化写事务。
         """
         conn = sqlite3.connect(self.path, timeout=30.0)
         try:
@@ -291,33 +297,27 @@ class SQLiteStateBackend(AbstractStateBackend):
         ''')
 
     def _create_indexes(self, conn: sqlite3.Connection) -> None:
-        """建索引（在形状校验之后：异形表先给出明确的拒绝信息，而非
-        在缺列上建索引时抛出费解的 no such column）。"""
+        """建索引（在形状校验之后：异形表先给出明确的拒绝信息）。"""
         conn.execute('CREATE INDEX IF NOT EXISTS idx_queue_position ON queue(queue_position)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_job_uid ON attempts(job_uid)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_job_uid_outcome ON attempts(job_uid, outcome)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_attempts_job_uid_attempt_no ON attempts(job_uid, attempt_no)')
 
-
     # 序号分配 ---------------------------------------------------------
 
     def _queue_position_range(self, conn: sqlite3.Connection, count: int, front: bool) -> list[int]:
-        """分配 count 个保序 queue_position：front 取 min_queue_position - count..min_queue_position-1，back 取 max_queue_position+1..。
-
-        调用方必须已通过 ``BEGIN IMMEDIATE`` 持写事务：MIN/MAX 的读
-        与调用方随后的 INSERT 必须原子——否则两个连接读到同一 min/max
-        后各自分配，落盘重复 queue_position（idx_queue_position 非唯一索引，拦不住），
-        队头保序契约被破坏。
-        """
+        """分配 count 个保序 queue_position；调用方必须已持 ``BEGIN IMMEDIATE`` 写事务。"""
         if count <= 0:
             return []
-        min_queue_position, max_queue_position = conn.execute('SELECT MIN(queue_position), MAX(queue_position) FROM queue').fetchone()
-        if min_queue_position is None:  # 空表
+        min_queue_position, max_queue_position = conn.execute(
+            'SELECT MIN(queue_position), MAX(queue_position) FROM queue'
+        ).fetchone()
+        if min_queue_position is None:
             min_queue_position, max_queue_position = 0, -1
         if front:
             base = min_queue_position - count
-            return list(range(base, min_queue_position))  # 首条最小，保序
+            return list(range(base, min_queue_position))
         base = max_queue_position + 1
         return list(range(base, base + count))
 
@@ -337,16 +337,6 @@ class SQLiteStateBackend(AbstractStateBackend):
             cursor = conn.execute('SELECT job_uid, metadata FROM failed')
             return {row[0]: loads(row[1]) for row in cursor}
 
-    def load_failure_payloads(self) -> dict[str, dict[str, Any]]:
-        """读取失败档案各 job_uid 的原始业务 payload 快照（无快照的 job_uid 不出现）。"""
-        if not self.path.exists():
-            return {}
-        with self._get_conn() as conn:
-            cursor = conn.execute(
-                'SELECT job_uid, payload FROM failed WHERE payload IS NOT NULL'
-            )
-            return {row[0]: loads(row[1]) for row in cursor}
-
     def load_cursors(self) -> dict[str, str]:
         if not self.path.exists():
             return {}
@@ -354,39 +344,16 @@ class SQLiteStateBackend(AbstractStateBackend):
             cursor = conn.execute('SELECT key, value FROM cursors')
             return {row[0]: row[1] for row in cursor}
 
-    def load_queue(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        with self._get_conn() as conn:
-            cursor = conn.execute(
-                "SELECT job_snapshot FROM queue WHERE status = 'pending' ORDER BY queue_position ASC"
-            )
-            return [public_queue_snapshot(loads(row[0])) for row in cursor]
-
     # delta 提交 ---------------------------------------------------------
-
 
     def _write_failed_row(
         self,
         conn: sqlite3.Connection,
         job_uid: str,
-        meta: dict,
+        meta: dict[str, Any],
         payload: dict[str, Any] | None = None,
     ) -> None:
-        """失败档案行写入的单一出口（commit_job_failure / commit_job_failures 共用）。
-
-        failed 按 job_uid 唯一终态：INSERT OR REPLACE（最终状态唯一）；失败
-        次数与执行时间线由 attempts 旁路轨迹承接，本表不注入计数字段、
-        不解释 meta 内容。
-
-        ``payload`` 是原始业务输入的 JSON 快照（补跑用）；传 None
-        时保留既有快照不覆盖——无 payload 的写入路径（bulk 级联/append）
-        不得抹掉此前快照。
-
-        调用方必须已通过 ``BEGIN IMMEDIATE`` 持写事务：保留快照的
-        SELECT → REPLACE 序列在 autocommit 下会丢并发快照（两个连接各
-        基于同一旧行决定保留/覆盖，交错落盘后快照来源不确定）。
-        """
+        """失败档案行写入单出口（``payload=None`` 保留既有快照，须在 ``BEGIN IMMEDIATE`` 内调用）。"""
         row = conn.execute(
             'SELECT payload FROM failed WHERE job_uid = ?', (job_uid,)
         ).fetchone()
@@ -398,31 +365,29 @@ class SQLiteStateBackend(AbstractStateBackend):
         )
         conn.execute(
             'INSERT OR REPLACE INTO failed (job_uid, metadata, payload) VALUES (?, ?, ?)',
-            (job_uid, dumps(merged),
-             dumps(effective_payload) if effective_payload is not None else None),
+            (
+                job_uid,
+                dumps(merged),
+                dumps(effective_payload) if effective_payload is not None else None,
+            ),
         )
 
-    def commit_job_failure(
-        self, job_uid: str, failure_metadata: dict, payload: dict[str, Any] | None = None
-    ) -> bool:
-        """原子 delta：写失败档案 + 删 popped job_uid + 删 successes 同名行。
-
-        失败时 on-disk 队列不变。同一事务内 ``DELETE FROM successes``——重跑
-        任务失败时 successes 里的旧成功记录必须作废（最终状态唯一）；否则磁盘
-        successes∩failed 并存，破坏全局互斥。事务内单出口、原子、幂等（once
-        任务失败时 successes 本无该行，DELETE no-op）。
-        """
+    def commit_job_failures(self, entries: Sequence[FailureEntry]) -> None:
+        """原子批量写失败档案 + 按 job_uid 删除队列行 + 清理 successes 对侧记录。"""
+        normalized = normalize_failure_entries(entries)
+        if not normalized:
+            return
         try:
             with self._get_conn() as conn:
-                # 快照保留的读-改-写必须持写事务串行化（详见 _get_conn）。
                 conn.execute('BEGIN IMMEDIATE')
-                self._write_failed_row(conn, job_uid, failure_metadata, payload)
-                conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
-                conn.execute('DELETE FROM successes WHERE job_uid = ?', (job_uid,))
+                for job_uid, meta, payload in normalized:
+                    self._write_failed_row(conn, job_uid, meta, payload)
+                uid_params = [(job_uid,) for job_uid, _, _ in normalized]
+                conn.executemany('DELETE FROM queue WHERE job_uid = ?', uid_params)
+                conn.executemany('DELETE FROM successes WHERE job_uid = ?', uid_params)
         except Exception as e:
-            logger.critical(f"Failed to commit job failure for {job_uid} in {self.path.name}: {e}")
+            logger.critical(f"Failed to commit failure archive entries in {self.path.name}: {e}")
             raise
-        return True
 
     def commit_skip(self, job_uid: str) -> None:
         """移除 Trigger False 或重复候选；不写 successes/failed。"""
@@ -433,49 +398,14 @@ class SQLiteStateBackend(AbstractStateBackend):
             logger.critical(f"Failed to commit skip for {job_uid} in {self.path.name}: {e}")
             raise
 
-
-    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> None:
-        """原子 delta：批量写失败档案 + 按 job_uid 精准删除队列行 + 批量清 successes 旧记录。
-
-        与 commit_job_failure 对称，同一事务内批量 ``DELETE FROM successes``
-        ——重跑任务被级联/死锁批量失败时，successes 旧成功记录作废（最终状态
-        唯一）；剩余（未删除）行保持原 queue_position 顺序。失败时 on-disk 队列不变。
-        """
-        try:
-            with self._get_conn() as conn:
-                # 快照保留的读-改-写必须持写事务串行化（详见 _get_conn）。
-                conn.execute('BEGIN IMMEDIATE')
-                for job_uid, meta in job_uids_metadata:
-                    self._write_failed_row(conn, job_uid, meta)
-                conn.executemany(
-                    'DELETE FROM queue WHERE job_uid = ?',
-                    [(job_uid,) for job_uid, _ in job_uids_metadata],
-                )
-                conn.executemany(
-                    'DELETE FROM successes WHERE job_uid = ?',
-                    [(job_uid,) for job_uid, _ in job_uids_metadata],
-                )
-        except Exception as e:
-            logger.critical(f"Failed to commit bulk failure in {self.path.name}: {e}")
-            raise
-
-
     # 增量入队 -----------------------------------------------------------
 
     def enqueue_jobs(self, job_snapshots: list[dict[str, Any]], *, front: bool = False) -> list[str]:
-        """批量增量入队：单事务原子插入，跳过重复 job_uid。
-
-        与 save_queue 的区别：不做 DELETE 全表重写——与运行中 run() 的
-        delta commit 并发时不覆盖其已提交变更（写入侧不覆盖，读-改-写
-        窗口仍由 replace_queue_atomic 收敛）。失败抛异常（不吞）。
-        """
+        """批量增量入队：单事务原子插入，跳过重复 job_uid。"""
         if not job_snapshots:
             return []
         try:
             with self._get_conn() as conn:
-                # 去重 SELECT 与 queue_position 分配读必须与后续 INSERT 同事务：
-                # 先取写锁再读，并发 front 入队才不会基于过期 min/max(queue_position)
-                # 分配出重复 queue_position（事务纪律详见 _get_conn docstring）。
                 conn.execute('BEGIN IMMEDIATE')
                 existing = {
                     row[0] for row in conn.execute('SELECT job_uid FROM queue')
@@ -484,8 +414,6 @@ class SQLiteStateBackend(AbstractStateBackend):
                 batch_seen: set[str] = set()
                 for j in job_snapshots:
                     u = job_uid_from_snapshot(j)
-                    # 批次内重复（同一 enqueue 调用传相同 job_uid 两次）与
-                    # 队列中已有的 job_uid 都跳过（首个存储，后续跳过）。
                     if u in existing or u in batch_seen:
                         continue
                     batch_seen.add(u)
@@ -517,13 +445,14 @@ class SQLiteStateBackend(AbstractStateBackend):
     # 管理写与查询 -------------------------------------------------------
 
     def load_consistent_snapshot(self) -> dict[str, Any]:
-        """在单一只读事务内原子捕获全部核心表一致快照（含 job_sequences）。"""
+        """在单一只读事务内原子捕获全部核心表一致快照（含 cursors 与 job_sequences）。"""
         if not self.path.exists():
             return {
                 "queue_jobs": [],
                 "successes": {},
                 "failed": {},
                 "failure_payloads": {},
+                "cursors": {},
                 "attempts": [],
                 "job_sequences": {},
             }
@@ -561,6 +490,11 @@ class SQLiteStateBackend(AbstractStateBackend):
                 if row[2] is not None:
                     failure_payloads[row[0]] = loads(row[2])
 
+            cursors = {
+                row[0]: row[1]
+                for row in conn.execute("SELECT key, value FROM cursors")
+            }
+
             attempts: list[dict[str, Any]] = []
             for row in conn.execute(
                 "SELECT attempt_id, job_uid, attempt_no, run_id, outcome, started_at, settled_at, "
@@ -591,6 +525,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                 "successes": successes,
                 "failed": failed,
                 "failure_payloads": failure_payloads,
+                "cursors": cursors,
                 "attempts": attempts,
                 "job_sequences": job_sequences,
             }
@@ -609,7 +544,6 @@ class SQLiteStateBackend(AbstractStateBackend):
         with self._get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
 
-            # 1. 复核遗留 running 执行身份并追加失败 Attempt（严格 append-only）
             for rec in commit.recovery_attempts:
                 row = conn.execute(
                     "SELECT status, run_id, attempt_no, job_snapshot FROM queue WHERE job_uid = ?",
@@ -658,7 +592,6 @@ class SQLiteStateBackend(AbstractStateBackend):
                     ),
                 )
 
-            # 2. 按触碰 uid 精准更新 queue（先删后队尾顺序插入，未触碰行零扰动）
             if commit.queue_writes:
                 conn.executemany(
                     "DELETE FROM queue WHERE job_uid = ?",
@@ -681,7 +614,6 @@ class SQLiteStateBackend(AbstractStateBackend):
                         ],
                     )
 
-            # 3. 按触碰 uid 精准更新 successes
             for uid, meta in commit.success_writes.items():
                 if meta is None:
                     conn.execute("DELETE FROM successes WHERE job_uid = ?", (uid,))
@@ -691,7 +623,6 @@ class SQLiteStateBackend(AbstractStateBackend):
                         (uid, dumps(meta)),
                     )
 
-            # 4. 按触碰 uid 精准更新 failed
             for uid, entry in commit.failed_writes.items():
                 if entry is None:
                     conn.execute("DELETE FROM failed WHERE job_uid = ?", (uid,))
@@ -706,7 +637,6 @@ class SQLiteStateBackend(AbstractStateBackend):
                         ),
                     )
 
-            # 5. 提交前强制复核 successes ∩ failed == ∅ 不变式
             overlap_row = conn.execute(
                 "SELECT s.job_uid FROM successes AS s "
                 "INNER JOIN failed AS f ON s.job_uid = f.job_uid LIMIT 1"
@@ -718,8 +648,7 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     def get_cursor(self, key: str) -> str | None:
         """查询单个游标的最新已提交值，不存在返回 None。"""
-        if not isinstance(key, str) or not key:
-            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+        validate_cursor_key(key)
         if not self.path.exists():
             return None
         with self._get_conn() as conn:
@@ -728,10 +657,8 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     def set_cursor(self, key: str, value: str | None) -> None:
         """设置或删除单个游标（None 为删除）。"""
-        if not isinstance(key, str) or not key:
-            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
-        if value is not None and not isinstance(value, str):
-            raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
+        validate_cursor_key(key)
+        validate_cursor_value(value)
         try:
             with self._get_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -764,13 +691,6 @@ class SQLiteStateBackend(AbstractStateBackend):
 
     # 元数据 ---------------------------------------------------------------
 
-    def get_engine_metadata(self, key: str) -> str | None:
-        if not self.path.exists():
-            return None
-        with self._get_conn() as conn:
-            row = conn.execute('SELECT value FROM engine_metadata WHERE key = ?', (key,)).fetchone()
-            return row[0] if row else None
-
     def set_engine_metadata(self, key: str, value: str) -> None:
         try:
             with self._get_conn() as conn:
@@ -787,24 +707,21 @@ class SQLiteStateBackend(AbstractStateBackend):
     def mark_job_running(
         self, job_uid: str, *, execution_id: str, run_id: str, started_at: str
     ) -> int:
-        if not isinstance(execution_id, str) or not execution_id:
-            raise ValueError("execution_id must be a non-empty str")
-        if not isinstance(run_id, str) or not run_id:
-            raise ValueError("run_id must be a non-empty str")
-        if not execution_id_matches_run(execution_id, run_id):
-            raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
-        if not isinstance(started_at, str) or not started_at:
-            raise ValueError("started_at must be a non-empty str")
+        validate_mark_job_running_args(
+            execution_id=execution_id, run_id=run_id, started_at=started_at
+        )
         with self._get_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             row = conn.execute(
                 'SELECT status, job_snapshot FROM queue WHERE job_uid = ?',
                 (job_uid,),
             ).fetchone()
-            if row is None:
-                raise ValueError(f"Job {job_uid} not found in queue")
-            if row[0] == "running":
-                raise ValueError(f"Job {job_uid} is already running")
+            validate_mark_job_running_state(
+                job_uid,
+                present_in_queue=row is not None,
+                queue_status=row[0] if row is not None else None,
+            )
+            assert row is not None
             job_snapshot = loads(row[1])
             if not isinstance(job_snapshot, dict):
                 raise ValueError(f"Job {job_uid} has an invalid queue snapshot")
@@ -924,29 +841,16 @@ class SQLiteStateBackend(AbstractStateBackend):
         requeued_job_snapshot: dict[str, Any] | None = None,
         record_attempt: bool = True,
     ) -> None:
-
-        if outcome not in ("success", "failure", "retry", "pending"):
-            raise ValueError(f"Invalid outcome: {outcome}")
-        if not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 1:
-            raise TypeError(f"attempt_no must be int >= 1, got {attempt_no!r}")
-        if not isinstance(execution_id, str) or not execution_id:
-            raise ValueError(f"execution_id must be non-empty str, got {execution_id!r}")
-        if not isinstance(run_id, str) or not run_id:
-            raise ValueError(f"run_id must be non-empty str, got {run_id!r}")
-        if not execution_id_matches_run(execution_id, run_id):
-            raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
-        if not isinstance(settled_at, str) or not settled_at:
-            raise ValueError(f"settled_at must be non-empty str, got {settled_at!r}")
-        if started_at is not None and (not isinstance(started_at, str) or not started_at):
-            raise ValueError("started_at must be non-empty str or None")
-        if cursor_updates:
-            for k, v in cursor_updates.items():
-                if not isinstance(k, str) or not k:
-                    raise ValueError(f"cursor key must be a non-empty str, got {k!r}")
-                if v is not None and not isinstance(v, str):
-                    raise TypeError(f"cursor value must be str or None, got {type(v).__name__}")
-        if spawned_job_snapshots:
-            validate_queue_replacement(list(spawned_job_snapshots))
+        validate_settlement_args(
+            outcome=outcome,
+            attempt_no=attempt_no,
+            execution_id=execution_id,
+            run_id=run_id,
+            settled_at=settled_at,
+            started_at=started_at,
+            cursor_updates=cursor_updates,
+            spawned_job_snapshots=spawned_job_snapshots,
+        )
 
         with self._get_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -956,24 +860,29 @@ class SQLiteStateBackend(AbstractStateBackend):
                 "FROM queue WHERE job_uid = ?",
                 (job_uid,),
             ).fetchone()
-            if running is None:
-                raise TaskLiteError(f"Settlement does not match the running execution for {job_uid}")
-            stored_job = loads(running[3]) if running[3] else None
-            if not isinstance(stored_job, dict):
-                raise TaskLiteError(
-                    f"Settlement does not match the running execution for {job_uid}"
-                )
-            if (
-                running[:3] != ("running", run_id, attempt_no)
-                or queue_snapshot_execution_id(stored_job) != execution_id
-            ):
-                raise TaskLiteError(
-                    f"Settlement does not match the running execution for {job_uid}"
-                )
-            if conn.execute(
-                "SELECT 1 FROM attempts WHERE job_uid = ? AND attempt_no = ?", (job_uid, attempt_no)
-            ).fetchone():
-                raise TaskLiteError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
+            stored_job = loads(running[3]) if (running is not None and running[3]) else None
+            job_dict = stored_job if isinstance(stored_job, dict) else None
+            settled = bool(
+                conn.execute(
+                    "SELECT 1 FROM attempts WHERE job_uid = ? AND attempt_no = ?",
+                    (job_uid, attempt_no),
+                ).fetchone()
+            )
+            validate_running_settlement_state(
+                job_uid,
+                present_in_queue=running is not None and job_dict is not None,
+                queue_status=running[0] if (running is not None and job_dict is not None) else None,
+                queue_run_id=running[1] if (running is not None and job_dict is not None) else None,
+                queue_attempt_no=running[2] if (running is not None and job_dict is not None) else None,
+                queue_execution_id=(
+                    queue_snapshot_execution_id(job_dict) if job_dict is not None else None
+                ),
+                run_id=run_id,
+                attempt_no=attempt_no,
+                execution_id=execution_id,
+                already_settled=settled,
+            )
+            assert job_dict is not None
 
             if record_attempt:
                 attempt_outcome = (
@@ -1053,28 +962,22 @@ class SQLiteStateBackend(AbstractStateBackend):
                 conn.execute('DELETE FROM queue WHERE job_uid = ?', (job_uid,))
 
             elif outcome == "retry":
-                if requeued_job_snapshot is not None:
-                    conn.execute(
-                        'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
-                        'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
-                        (
-                            dumps(public_queue_snapshot(requeued_job_snapshot)),
-                            "pending",
-                            job_uid,
-                        ),
-                    )
-                else:
-                    conn.execute(
-                        'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
-                        'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
-                        (dumps(public_queue_snapshot(stored_job)), "pending", job_uid),
-                    )
+                target_snap = (
+                    public_queue_snapshot(requeued_job_snapshot)
+                    if requeued_job_snapshot is not None
+                    else public_queue_snapshot(job_dict)
+                )
+                conn.execute(
+                    'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
+                    'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
+                    (dumps(target_snap), "pending", job_uid),
+                )
 
             elif outcome == "pending":
                 conn.execute(
                     'UPDATE queue SET job_snapshot = ?, status = ?, run_id = NULL, '
                     'attempt_no = NULL, started_at = NULL WHERE job_uid = ?',
-                    (dumps(public_queue_snapshot(stored_job)), "pending", job_uid),
+                    (dumps(public_queue_snapshot(job_dict)), "pending", job_uid),
                 )
 
     @staticmethod
@@ -1089,28 +992,25 @@ class SQLiteStateBackend(AbstractStateBackend):
         *,
         authorized_at: str | None = None,
     ) -> dict[str, Any]:
-        norm_path = os.path.normpath(os.fspath(path))
-        if target_type not in ("file", "directory"):
-            raise TaskLiteError(
-                f"target_type must be 'file' or 'directory', got {target_type!r}"
-            )
-        ts = authorized_at if authorized_at is not None else utc_now_iso()
+        norm_path = normalize_authorization_path(path)
+        validated_type = validate_authorization_target_type(target_type, error_type=TaskLiteError)
+        ts = resolve_authorized_at(authorized_at)
         with self._get_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             match = evaluate_authorization(
                 self._load_auth_pairs(conn),
                 norm_path,
-                target_type,
+                validated_type,
             )
             if match.grant_conflict is not None:
                 raise TaskLiteError(match.grant_conflict)
             conn.execute(
                 'INSERT INTO authorizations (path, target_type, authorized_at) VALUES (?, ?, ?)',
-                (norm_path, target_type, ts),
+                (norm_path, validated_type, ts),
             )
             return {
                 "path": norm_path,
-                "target_type": target_type,
+                "target_type": validated_type,
                 "authorized_at": ts,
             }
 
@@ -1121,22 +1021,21 @@ class SQLiteStateBackend(AbstractStateBackend):
         *,
         authorized_at: str | None = None,
     ) -> None:
-        norm_path = os.path.normpath(os.fspath(path))
-        if target_type not in ("file", "directory"):
-            raise ValueError(f"target_type must be 'file' or 'directory', got {target_type!r}")
-        ts = authorized_at if authorized_at is not None else utc_now_iso()
+        norm_path = normalize_authorization_path(path)
+        validated_type = validate_authorization_target_type(target_type, error_type=ValueError)
+        ts = resolve_authorized_at(authorized_at)
         with self._get_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             match = evaluate_authorization(
                 self._load_auth_pairs(conn),
                 norm_path,
-                cast(TargetType, target_type),
+                validated_type,
             )
             if match.exact_path is not None and match.exact_path != norm_path:
                 conn.execute('DELETE FROM authorizations WHERE path = ?', (match.exact_path,))
             conn.execute(
                 'INSERT OR REPLACE INTO authorizations (path, target_type, authorized_at) VALUES (?, ?, ?)',
-                (norm_path, target_type, ts),
+                (norm_path, validated_type, ts),
             )
 
     def list_authorizations(self) -> list[dict[str, Any]]:
@@ -1150,7 +1049,7 @@ class SQLiteStateBackend(AbstractStateBackend):
             ]
 
     def revoke_authorization(self, path: str) -> bool:
-        norm_path = os.path.normpath(os.fspath(path))
+        norm_path = normalize_authorization_path(path)
         with self._get_conn() as conn:
             conn.execute('BEGIN IMMEDIATE')
             match = evaluate_authorization(self._load_auth_pairs(conn), norm_path)
@@ -1160,8 +1059,8 @@ class SQLiteStateBackend(AbstractStateBackend):
             return bool(cur.rowcount and cur.rowcount > 0)
 
     def is_path_authorized(self, path: str, target_type: str) -> bool:
-        norm_path = os.path.normpath(os.fspath(path))
-        if target_type not in ("file", "directory"):
+        norm_path = normalize_authorization_path(path)
+        if not is_valid_authorization_target_type(target_type):
             return False
         with self._get_conn() as conn:
             return evaluate_authorization(
@@ -1181,4 +1080,3 @@ __all__ = [
     "open_existing_sqlite_readonly",
     "verify_existing_sqlite_database",
 ]
-

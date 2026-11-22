@@ -8,11 +8,10 @@ import pytest
 from tasklite import Job, StateSnapshot, TaskLite, TaskLiteError, TaskResult
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.models.state import PipelineState
-from tasklite.models.trigger import TriggerContext
+from tasklite.models.trigger import BUILTIN_TRIGGER_FUNCTIONS, TriggerContext, on_input_change
 from tasklite.resource import CapacityResource
 from tasklite.selection import Exclude
 from tasklite.testing import in_process_workers, running
-from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS, on_input_change
 
 
 def handle(job, ctx):
@@ -258,12 +257,6 @@ def test_stop_after_trigger_skip_does_not_persist_dependency_readiness():
         pipeline.run()
         with StateSnapshot.open(pipeline) as snap:
             assert [r["job_uid"] for r in snap.iter_jobs(status="failed")] == ["child::b"]
-
-
-def test_trigger_skip_does_not_grant_dependency_readiness():
-    state = PipelineState({}, {}, {}, [])
-    state.mark_trigger_skipped("t::a")
-    assert not state.dependency_ready("t::a")
 
 
 def test_trigger_error_aborts_inflight_without_burning_budget():

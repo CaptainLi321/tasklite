@@ -1,7 +1,8 @@
 """原子图修整事务上下文（EditTransaction，ADR-0012 §3.1）。
 
 提供 Run 外唯一的状态图增、删、替换与纯状态流转事务：
-- 内存直接维护三表工作图（queue / successes / failed）+ 待补写遗留 running 失败 Attempt；
+- 内存通过轻量三表视图容器 ``_GraphTables`` 维护基准态与工作图（queue / successes / failed）
+  + 待补写遗留 running 失败 Attempt；
 - 仅强制维护 Schema 6 固有的 ``successes ∩ failed == ∅`` 互斥不变式；
 - ``set_status`` 与 ``remove`` 零依赖 ``TaskRegistry``（空实例与 CLI 可直接使用）；
 - 退出提交期单次全量攒错（防删出新孤儿、活跃/成功/触碰节点零孤儿与无环、
@@ -11,9 +12,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Mapping
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import sys
 from typing import Any, Literal
@@ -22,9 +23,14 @@ from .backend.base import GraphEditCommit, RunningAttemptRecovery
 from .engine.recovery import build_unsettled_running_recovery
 from .engine.store import StateStore
 from .exceptions import TaskLiteError
+from .models.graph import build_dependents_index, collect_downstream, find_cycle_components
 from .models.job import Job
+from .models.records import (
+    build_manual_failure_entry,
+    build_manual_success_record,
+    extract_job_snapshot_from_archive,
+)
 from .snapshot import StateSnapshot
-from .utils.clock import utc_now_iso
 from .utils.encoding import parse_job_uid
 
 logger = logging.getLogger("tasklite")
@@ -53,6 +59,76 @@ class _QueueSlot:
     queue_position: int | None = None
 
 
+@dataclass
+class _GraphTables:
+    """轻量三表视图容器，统一承载 ``queue > successes > failed`` 优先级查询与投影。"""
+
+    queue: dict[str, _QueueSlot] = field(default_factory=dict)
+    successes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    failed: dict[str, tuple[dict[str, Any], dict[str, Any] | None]] = field(default_factory=dict)
+
+    def all_uids(self) -> set[str]:
+        return set(self.queue) | set(self.successes) | set(self.failed)
+
+    def __contains__(self, uid: object) -> bool:
+        return isinstance(uid, str) and (
+            uid in self.queue or uid in self.successes or uid in self.failed
+        )
+
+    def effective_status(self, uid: str) -> Literal["pending", "running", "succeeded", "failed"] | None:
+        slot = self.queue.get(uid)
+        if slot is not None:
+            return slot.status
+        if uid in self.successes:
+            return "succeeded"
+        if uid in self.failed:
+            return "failed"
+        return None
+
+    def effective_snapshot(self, uid: str) -> dict[str, Any] | None:
+        slot = self.queue.get(uid)
+        if slot is not None:
+            return copy.deepcopy(slot.job_snapshot)
+        if uid in self.successes:
+            return extract_job_snapshot_from_archive(
+                uid, self.successes[uid], fill_missing_identity=True
+            )
+        if uid in self.failed:
+            meta, payload = self.failed[uid]
+            return extract_job_snapshot_from_archive(
+                uid, meta, payload=payload, fill_missing_identity=True
+            )
+        return None
+
+    def count_statuses(self) -> dict[str, int]:
+        counts = {s: 0 for s in _STATUS_ORDER}
+        for uid in self.all_uids():
+            st = self.effective_status(uid)
+            if st in counts:
+                counts[st] += 1
+        return counts
+
+    def to_snapshot(self, *, attempts: list[dict[str, Any]], source: str) -> StateSnapshot:
+        queue_rows = [
+            {
+                "job_uid": slot.job_uid,
+                "job": copy.deepcopy(slot.job_snapshot),
+                "status": slot.status,
+                "run_id": slot.run_id,
+                "attempt_no": slot.attempt_no,
+                "started_at": slot.started_at,
+            }
+            for slot in self.queue.values()
+        ]
+        return StateSnapshot._from_tables(
+            queue_rows=queue_rows,
+            successes=copy.deepcopy(self.successes),
+            failed=copy.deepcopy(self.failed),
+            attempts=attempts,
+            source=source,
+        )
+
+
 @dataclass(frozen=True)
 class _ValidationReport:
     """闭环体检结果：硬错误、OS 异常与只读告警。"""
@@ -75,44 +151,6 @@ def _validate_uid(uid: Any, *, param_name: str = "uid") -> str:
     return uid
 
 
-def _fallback_snapshot_for_uid(uid: str) -> dict[str, Any]:
-    task_type, job_id = parse_job_uid(uid)
-    return {
-        "task_type": task_type,
-        "job_id": job_id,
-        "payload": {},
-        "depends_on": [],
-        "files": {},
-        "resources": {},
-    }
-
-
-def _extract_snapshot_from_failed(
-    uid: str,
-    fail_meta: Mapping[str, Any],
-    payload: dict[str, Any] | None,
-) -> dict[str, Any]:
-    raw_snap = fail_meta.get("job_snapshot")
-    snap = copy.deepcopy(raw_snap) if isinstance(raw_snap, dict) else _fallback_snapshot_for_uid(uid)
-    if "task_type" not in snap or "job_id" not in snap:
-        task_type, job_id = parse_job_uid(uid)
-        snap.setdefault("task_type", task_type)
-        snap.setdefault("job_id", job_id)
-    if payload is not None and not snap.get("payload"):
-        snap["payload"] = copy.deepcopy(payload)
-    return snap
-
-
-def _extract_snapshot_from_success(uid: str, succ_meta: Mapping[str, Any]) -> dict[str, Any]:
-    raw_snap = succ_meta.get("job_snapshot")
-    snap = copy.deepcopy(raw_snap) if isinstance(raw_snap, dict) else _fallback_snapshot_for_uid(uid)
-    if "task_type" not in snap or "job_id" not in snap:
-        task_type, job_id = parse_job_uid(uid)
-        snap.setdefault("task_type", task_type)
-        snap.setdefault("job_id", job_id)
-    return snap
-
-
 def _format_signed(delta: int) -> str:
     if delta > 0:
         return f"+{delta}"
@@ -128,61 +166,6 @@ def _summarize_file_entry(spec: Any) -> str:
     if spec.get("producer_uid") is not None:
         return f"from_output({spec['producer_uid']!r}, {spec.get('output_name')!r}, role={role!r})"
     return f"{spec.get('path')!r} (role={role!r})"
-
-
-def _find_cycles_iterative(
-    nodes: Collection[str],
-    edges: Mapping[str, Collection[str]],
-) -> list[list[str]]:
-    """迭代式 Kosaraju 强连通分量检测，返回所有含环节点集合（零递归深度限制）。"""
-    node_set = set(nodes)
-    adj: dict[str, list[str]] = {
-        u: [v for v in edges.get(u, ()) if v in node_set]
-        for u in node_set
-    }
-    rev: dict[str, list[str]] = {u: [] for u in node_set}
-    for u, nbrs in adj.items():
-        for v in nbrs:
-            rev[v].append(u)
-
-    visited: set[str] = set()
-    order: list[str] = []
-    for root in sorted(node_set):
-        if root in visited:
-            continue
-        visited.add(root)
-        stack: list[tuple[str, Iterator[str]]] = [(root, iter(adj[root]))]
-        while stack:
-            cur, it = stack[-1]
-            try:
-                nxt = next(it)
-            except StopIteration:
-                stack.pop()
-                order.append(cur)
-                continue
-            if nxt not in visited:
-                visited.add(nxt)
-                stack.append((nxt, iter(adj[nxt])))
-
-    assigned: set[str] = set()
-    cycles: list[list[str]] = []
-    for root in reversed(order):
-        if root in assigned:
-            continue
-        comp: list[str] = []
-        dfs_stack = [root]
-        assigned.add(root)
-        while dfs_stack:
-            cur = dfs_stack.pop()
-            comp.append(cur)
-            for nxt in rev[cur]:
-                if nxt not in assigned:
-                    assigned.add(nxt)
-                    dfs_stack.append(nxt)
-        if len(comp) > 1 or (len(comp) == 1 and comp[0] in adj[comp[0]]):
-            cycles.append(sorted(comp))
-    cycles.sort()
-    return cycles
 
 
 class EditTransaction:
@@ -208,19 +191,13 @@ class EditTransaction:
         self._exited = False
         self._lock_cm: Any = None
 
-        # 基准只读状态（__enter__ 单次加载）
-        self._base_queue: dict[str, _QueueSlot] = {}
+        # 基准只读三表视图与可变工作三表视图
+        self._base = _GraphTables()
+        self._work = _GraphTables()
         self._base_running_rows: dict[str, dict[str, Any]] = {}
-        self._base_successes: dict[str, dict[str, Any]] = {}
-        self._base_failed: dict[str, tuple[dict[str, Any], dict[str, Any] | None]] = {}
         self._base_attempts: list[dict[str, Any]] = []
         self._job_sequences: dict[str, int] = {}
         self._settled_attempt_nos: dict[str, frozenset[int]] = {}
-
-        # 可变三表工作图 + 待补写遗留 running 失败 Attempt
-        self._queue: dict[str, _QueueSlot] = {}
-        self._successes: dict[str, dict[str, Any]] = {}
-        self._failed: dict[str, tuple[dict[str, Any], dict[str, Any] | None]] = {}
         self._recovery_attempts: dict[str, RunningAttemptRecovery] = {}
 
         # 变更与告警追踪（用于闭环校验与结构化 diff）
@@ -290,27 +267,22 @@ class EditTransaction:
                     started_at=row.get("started_at"),
                     queue_position=row.get("queue_position"),
                 )
-                self._base_queue[uid] = copy.deepcopy(slot)
-                self._queue[uid] = slot
+                self._base.queue[uid] = copy.deepcopy(slot)
+                self._work.queue[uid] = slot
                 if st == "running":
                     self._base_running_rows[uid] = copy.deepcopy(row)
 
             for uid, meta in successes.items():
-                self._base_successes[uid] = copy.deepcopy(meta)
-                self._successes[uid] = copy.deepcopy(meta)
+                self._base.successes[uid] = copy.deepcopy(meta)
+                self._work.successes[uid] = copy.deepcopy(meta)
 
             for uid, meta in failed.items():
                 payload = failure_payloads.get(uid)
-                self._base_failed[uid] = (copy.deepcopy(meta), copy.deepcopy(payload))
-                self._failed[uid] = (copy.deepcopy(meta), copy.deepcopy(payload))
+                self._base.failed[uid] = (copy.deepcopy(meta), copy.deepcopy(payload))
+                self._work.failed[uid] = (copy.deepcopy(meta), copy.deepcopy(payload))
 
-            base_uids = self._base_all_uids()
-            self._origin_of = {uid: uid for uid in base_uids}
-
-            self._before_snapshot = self._build_snapshot(
-                queue_slots=[copy.deepcopy(s) for s in self._base_queue.values()],
-                successes=copy.deepcopy(self._base_successes),
-                failed=copy.deepcopy(self._base_failed),
+            self._origin_of = {uid: uid for uid in self._base.all_uids()}
+            self._before_snapshot = self._base.to_snapshot(
                 attempts=copy.deepcopy(self._base_attempts),
                 source="edit:before",
             )
@@ -376,85 +348,22 @@ class EditTransaction:
         self._version += 1
         self._after_cache = None
 
-    # ── 基础查询与内部三表访问 ─────────────────────────────────────────
-
-    def _base_all_uids(self) -> set[str]:
-        return set(self._base_queue) | set(self._base_successes) | set(self._base_failed)
-
-    def _current_all_uids(self) -> set[str]:
-        return set(self._queue) | set(self._successes) | set(self._failed)
-
-    def _exists(self, uid: str) -> bool:
-        return uid in self._queue or uid in self._successes or uid in self._failed
-
-    def _base_effective_status(self, uid: str) -> Literal["pending", "running", "succeeded", "failed"] | None:
-        slot = self._base_queue.get(uid)
-        if slot is not None:
-            return slot.status
-        if uid in self._base_successes:
-            return "succeeded"
-        if uid in self._base_failed:
-            return "failed"
-        return None
-
-    def _effective_status(self, uid: str) -> Literal["pending", "running", "succeeded", "failed"] | None:
-        slot = self._queue.get(uid)
-        if slot is not None:
-            return slot.status
-        if uid in self._successes:
-            return "succeeded"
-        if uid in self._failed:
-            return "failed"
-        return None
-
-    def _base_effective_snapshot(self, uid: str) -> dict[str, Any] | None:
-        slot = self._base_queue.get(uid)
-        if slot is not None:
-            return copy.deepcopy(slot.job_snapshot)
-        if uid in self._base_successes:
-            return _extract_snapshot_from_success(uid, self._base_successes[uid])
-        if uid in self._base_failed:
-            meta, payload = self._base_failed[uid]
-            return _extract_snapshot_from_failed(uid, meta, payload)
-        return None
-
-    def _effective_snapshot(self, uid: str) -> dict[str, Any] | None:
-        slot = self._queue.get(uid)
-        if slot is not None:
-            return copy.deepcopy(slot.job_snapshot)
-        if uid in self._successes:
-            return _extract_snapshot_from_success(uid, self._successes[uid])
-        if uid in self._failed:
-            meta, payload = self._failed[uid]
-            return _extract_snapshot_from_failed(uid, meta, payload)
-        return None
+    # ── 工作图遍历与遗留 running 恢复准备 ──────────────────────────────
 
     def _collect_downstream_uids(self, root_uid: str) -> list[str]:
         """沿当前工作图有效快照的正向 depends_on 闭包收集全部下游 uid（确定性字典序）。"""
-        dependents: dict[str, set[str]] = defaultdict(set)
-        for uid in self._current_all_uids():
-            snap = self._effective_snapshot(uid)
+        edges: dict[str, list[str]] = {}
+        for uid in self._work.all_uids():
+            snap = self._work.effective_snapshot(uid)
             if snap is None:
                 continue
-            for dep in snap.get("depends_on") or ():
-                if isinstance(dep, str):
-                    dependents[dep].add(uid)
-
-        result: list[str] = []
-        visited = {root_uid}
-        frontier = [root_uid]
-        while frontier:
-            curr = frontier.pop(0)
-            for child in sorted(dependents.get(curr, ())):
-                if child not in visited:
-                    visited.add(child)
-                    result.append(child)
-                    frontier.append(child)
-        return result
+            edges[uid] = [dep for dep in (snap.get("depends_on") or ()) if isinstance(dep, str)]
+        dependents = build_dependents_index(edges)
+        return collect_downstream(root_uid, dependents)
 
     def _prepare_running_recovery(self, uid: str) -> RunningAttemptRecovery | None:
         """若 uid 当前处于遗留 running，预校验并构造恢复记录（不产生副作用）。"""
-        slot = self._queue.get(uid)
+        slot = self._work.queue.get(uid)
         if slot is None or slot.status != "running":
             return None
         if uid in self._recovery_attempts:
@@ -471,93 +380,13 @@ class EditTransaction:
         )
         return recovery
 
-    def _build_manual_success_metadata(self, job_snapshot: dict[str, Any]) -> dict[str, Any]:
-        """构造非执行 manual succeeded 档案：双写保留型 output、清执行基线、零 Attempt。"""
-        annotations: dict[str, Any] = {"completion_source": "manual"}
-        if self._note is not None:
-            annotations["note"] = self._note
-
-        path_policy = self._store.path_policy
-        raw_files = job_snapshot.get("files") or {}
-        outer_files: dict[str, Any] = {}
-        artifacts: dict[str, dict[str, str]] = {}
-        for name, raw_spec in raw_files.items():
-            if not isinstance(raw_spec, Mapping):
-                continue
-            if raw_spec.get("role") == "output" and not bool(raw_spec.get("delete_on_success", False)):
-                path = raw_spec.get("path")
-                if isinstance(path, str) and path:
-                    # 提前经 lookup 解析规范路径，使块内 tx.after 与退出后落盘快照一致；
-                    # 非法或不可访问路径回退保留原值，留待 _validate(mode='strict') 统一汇报。
-                    try:
-                        effective_path = path_policy.inspect(path, mode="lookup").canonical_path
-                    except (ValueError, OSError):
-                        effective_path = path
-                    outer_files[name] = {
-                        "path": effective_path,
-                        "role": "output",
-                        "delete_existing": bool(raw_spec.get("delete_existing", False)),
-                        "delete_on_failure": bool(raw_spec.get("delete_on_failure", False)),
-                        "delete_on_success": False,
-                    }
-                    artifacts[name] = {"path": effective_path}
-
-        return {
-            "job_snapshot": copy.deepcopy(job_snapshot),
-            "files": outer_files,
-            "artifacts": artifacts,
-            "inputs": [],
-            "result": {
-                "message": None,
-                "exception": None,
-                "metadata": {},
-                "annotations": dict(annotations),
-            },
-            "annotations": annotations,
-            "settled_at": utc_now_iso(),
-            "run_id": None,
-            "attempt_no": None,
-            "started_at": None,
-        }
-
-    def _build_manual_failure_entry(
-        self,
-        job_snapshot: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        """构造非执行 manual failed 档案与 payload 快照。"""
-        annotations: dict[str, Any] = {"completion_source": "manual"}
-        if self._note is not None:
-            annotations["note"] = self._note
-        error_message = self._note if self._note is not None else "Manual status set to failed"
-        fail_meta: dict[str, Any] = {
-            "job_snapshot": copy.deepcopy(job_snapshot),
-            "files": copy.deepcopy(job_snapshot.get("files") or {}),
-            "result": {
-                "message": error_message,
-                "exception": None,
-                "metadata": {},
-                "annotations": dict(annotations),
-            },
-            "annotations": annotations,
-            "error_message": error_message,
-            "settled_at": utc_now_iso(),
-            "run_id": None,
-            "attempt_no": None,
-            "started_at": None,
-        }
-        if self._note is not None:
-            fail_meta["note"] = self._note
-        raw_payload = job_snapshot.get("payload")
-        payload_copy = copy.deepcopy(raw_payload) if isinstance(raw_payload, dict) else None
-        return fail_meta, payload_copy
-
     # ── 6 个公开原语 ───────────────────────────────────────────────────
 
     def __contains__(self, uid: object) -> bool:
         """存在性查询：校验 canonical uid 语法，返回是否存在于三表工作图。"""
         self._require_entered()
         valid_uid = _validate_uid(uid)
-        return self._exists(valid_uid)
+        return valid_uid in self._work
 
     def add(
         self,
@@ -574,19 +403,21 @@ class EditTransaction:
                 f"status must be one of 'pending', 'succeeded', 'failed', got {status!r}"
             )
         uid = job.uid
-        if self._exists(uid):
+        if uid in self._work:
             raise TaskLiteError(
                 f"Job {uid!r} already exists in working graph (use replace() to update it)"
             )
         snap = self._store.normalize_new_job_snapshot(job, caller="add")
 
         if status == "pending":
-            self._queue[uid] = _QueueSlot(job_uid=uid, job_snapshot=snap, status="pending")
+            self._work.queue[uid] = _QueueSlot(job_uid=uid, job_snapshot=snap, status="pending")
         elif status == "succeeded":
-            self._successes[uid] = self._build_manual_success_metadata(snap)
+            self._work.successes[uid] = build_manual_success_record(
+                snap, path_policy=self._store.path_policy, note=self._note
+            )
             self._written_succeeded_uids.add(uid)
         else:
-            self._failed[uid] = self._build_manual_failure_entry(snap)
+            self._work.failed[uid] = build_manual_failure_entry(snap, note=self._note)
 
         self._touched_uids.add(uid)
         self._added_or_replaced_uids.add(uid)
@@ -652,12 +483,12 @@ class EditTransaction:
         prepared: list[tuple[str, str, str, str, dict[str, Any], RunningAttemptRecovery | None]] = []
 
         # Phase 0：模拟摘除所有旧键后的剩余分区占用集合（异名替换必须清空三表以杜绝幽灵旧节点）
-        sim_queue = set(self._queue)
-        sim_succ = set(self._successes)
-        sim_fail = set(self._failed)
+        sim_queue = set(self._work.queue)
+        sim_succ = set(self._work.successes)
+        sim_fail = set(self._work.failed)
 
         for old_uid, new_job in pairs:
-            old_status = self._effective_status(old_uid)
+            old_status = self._work.effective_status(old_uid)
             if old_status is None:
                 raise TaskLiteError(f"Job {old_uid!r} does not exist in working graph")
             new_uid = new_job.uid
@@ -693,7 +524,7 @@ class EditTransaction:
                 raise TaskLiteError(
                     f"Replacement target UID {new_uid!r} conflicts with existing job in working graph"
                 )
-            if new_uid not in old_uids and self._exists(new_uid):
+            if new_uid not in old_uids and new_uid in self._work:
                 raise TaskLiteError(
                     f"Replacement target UID {new_uid!r} conflicts with existing job in working graph"
                 )
@@ -704,23 +535,23 @@ class EditTransaction:
             if recovery is not None and old_uid not in self._recovery_attempts:
                 self._recovery_attempts[old_uid] = recovery
             if old_uid != new_uid:
-                self._queue.pop(old_uid, None)
-                self._successes.pop(old_uid, None)
-                self._failed.pop(old_uid, None)
+                self._work.queue.pop(old_uid, None)
+                self._work.successes.pop(old_uid, None)
+                self._work.failed.pop(old_uid, None)
                 self._written_succeeded_uids.discard(old_uid)
                 self._replaced_in_place_uids.discard(old_uid)
                 self._added_or_replaced_uids.discard(old_uid)
                 self._partial_removed_uids.discard(old_uid)
             elif prev_status in ("pending", "running"):
-                self._queue.pop(old_uid, None)
+                self._work.queue.pop(old_uid, None)
             elif prev_status == "succeeded":
-                self._successes.pop(old_uid, None)
+                self._work.successes.pop(old_uid, None)
                 self._written_succeeded_uids.discard(old_uid)
             elif prev_status == "failed":
-                self._failed.pop(old_uid, None)
+                self._work.failed.pop(old_uid, None)
 
             if old_uid in self._origin_of:
-                if not self._exists(old_uid) or old_uid == new_uid:
+                if old_uid not in self._work or old_uid == new_uid:
                     orig_for_old[old_uid] = self._origin_of.pop(old_uid)
                 else:
                     orig_for_old[old_uid] = self._origin_of[old_uid]
@@ -731,21 +562,23 @@ class EditTransaction:
         for old_uid, new_uid, _old_status, next_status, snap, _recovery in prepared:
             if next_status == "pending":
                 if status is not None:
-                    self._successes.pop(new_uid, None)
-                    self._failed.pop(new_uid, None)
+                    self._work.successes.pop(new_uid, None)
+                    self._work.failed.pop(new_uid, None)
                     self._written_succeeded_uids.discard(new_uid)
-                self._queue.pop(new_uid, None)
-                self._queue[new_uid] = _QueueSlot(
+                self._work.queue.pop(new_uid, None)
+                self._work.queue[new_uid] = _QueueSlot(
                     job_uid=new_uid, job_snapshot=snap, status="pending"
                 )
             elif next_status == "succeeded":
-                self._failed.pop(new_uid, None)
-                self._successes[new_uid] = self._build_manual_success_metadata(snap)
+                self._work.failed.pop(new_uid, None)
+                self._work.successes[new_uid] = build_manual_success_record(
+                    snap, path_policy=self._store.path_policy, note=self._note
+                )
                 self._written_succeeded_uids.add(new_uid)
             else:
-                self._successes.pop(new_uid, None)
+                self._work.successes.pop(new_uid, None)
                 self._written_succeeded_uids.discard(new_uid)
-                self._failed[new_uid] = self._build_manual_failure_entry(snap)
+                self._work.failed[new_uid] = build_manual_failure_entry(snap, note=self._note)
 
             orig = orig_for_old.get(old_uid)
             if orig is not None:
@@ -774,7 +607,7 @@ class EditTransaction:
             )
         if type(recursive) is not bool:
             raise TaskLiteError(f"recursive must be a bool, got {type(recursive).__name__}")
-        if not self._exists(valid_uid):
+        if valid_uid not in self._work:
             raise TaskLiteError(f"Job {valid_uid!r} does not exist in working graph")
 
         targets = [valid_uid]
@@ -784,7 +617,7 @@ class EditTransaction:
         # 前置校验全部待恢复的遗留 running
         prepared: list[tuple[str, dict[str, Any], RunningAttemptRecovery | None]] = []
         for t_uid in targets:
-            snap = self._effective_snapshot(t_uid)
+            snap = self._work.effective_snapshot(t_uid)
             if snap is None:
                 continue
             recovery = self._prepare_running_recovery(t_uid)
@@ -794,18 +627,18 @@ class EditTransaction:
             if recovery is not None and t_uid not in self._recovery_attempts:
                 self._recovery_attempts[t_uid] = recovery
             if status == "pending":
-                self._successes.pop(t_uid, None)
+                self._work.successes.pop(t_uid, None)
                 self._written_succeeded_uids.discard(t_uid)
-                self._failed.pop(t_uid, None)
-                self._queue.pop(t_uid, None)
-                self._queue[t_uid] = _QueueSlot(
+                self._work.failed.pop(t_uid, None)
+                self._work.queue.pop(t_uid, None)
+                self._work.queue[t_uid] = _QueueSlot(
                     job_uid=t_uid, job_snapshot=snap, status="pending"
                 )
             else:
-                self._queue.pop(t_uid, None)
-                self._successes.pop(t_uid, None)
+                self._work.queue.pop(t_uid, None)
+                self._work.successes.pop(t_uid, None)
                 self._written_succeeded_uids.discard(t_uid)
-                self._failed[t_uid] = self._build_manual_failure_entry(snap)
+                self._work.failed[t_uid] = build_manual_failure_entry(snap, note=self._note)
             self._touched_uids.add(t_uid)
 
         self._bump_version()
@@ -842,7 +675,7 @@ class EditTransaction:
             )
 
         targets = [valid_uid]
-        if recursive and self._exists(valid_uid):
+        if recursive and valid_uid in self._work:
             targets.extend(self._collect_downstream_uids(valid_uid))
 
         # 前置校验若删 queue 时命中的遗留 running
@@ -857,23 +690,23 @@ class EditTransaction:
         is_partial = entry_set != _VALID_REMOVE_ENTRIES
         for t_uid in targets:
             removed_any = False
-            if "queue" in entry_set and t_uid in self._queue:
+            if "queue" in entry_set and t_uid in self._work.queue:
                 if t_uid in recoveries and t_uid not in self._recovery_attempts:
                     self._recovery_attempts[t_uid] = recoveries[t_uid]
-                del self._queue[t_uid]
+                del self._work.queue[t_uid]
                 removed_any = True
-            if "successes" in entry_set and t_uid in self._successes:
-                del self._successes[t_uid]
+            if "successes" in entry_set and t_uid in self._work.successes:
+                del self._work.successes[t_uid]
                 self._written_succeeded_uids.discard(t_uid)
                 removed_any = True
-            if "failures" in entry_set and t_uid in self._failed:
-                del self._failed[t_uid]
+            if "failures" in entry_set and t_uid in self._work.failed:
+                del self._work.failed[t_uid]
                 removed_any = True
 
             if removed_any:
                 removed_count += 1
                 self._touched_uids.add(t_uid)
-                if not self._exists(t_uid):
+                if t_uid not in self._work:
                     self._origin_of.pop(t_uid, None)
                     self._replaced_in_place_uids.discard(t_uid)
                     self._added_or_replaced_uids.discard(t_uid)
@@ -885,34 +718,6 @@ class EditTransaction:
         return removed_count
 
     # ── 快照视图与结构化 Diff ──────────────────────────────────────────
-
-    @staticmethod
-    def _build_snapshot(
-        *,
-        queue_slots: list[_QueueSlot],
-        successes: dict[str, dict[str, Any]],
-        failed: dict[str, tuple[dict[str, Any], dict[str, Any] | None]],
-        attempts: list[dict[str, Any]],
-        source: str,
-    ) -> StateSnapshot:
-        queue_rows = [
-            {
-                "job_uid": slot.job_uid,
-                "job": slot.job_snapshot,
-                "status": slot.status,
-                "run_id": slot.run_id,
-                "attempt_no": slot.attempt_no,
-                "started_at": slot.started_at,
-            }
-            for slot in queue_slots
-        ]
-        return StateSnapshot._from_tables(
-            queue_rows=queue_rows,
-            successes=successes,
-            failed=failed,
-            attempts=attempts,
-            source=source,
-        )
 
     def _overlay_attempts(self) -> list[dict[str, Any]]:
         combined = copy.deepcopy(self._base_attempts)
@@ -950,10 +755,7 @@ class EditTransaction:
         self._require_entered()
         if self._after_cache is not None and self._after_cache[0] == self._version:
             return self._after_cache[1]
-        snap = self._build_snapshot(
-            queue_slots=[copy.deepcopy(s) for s in self._queue.values()],
-            successes=copy.deepcopy(self._successes),
-            failed=copy.deepcopy(self._failed),
+        snap = self._work.to_snapshot(
             attempts=self._overlay_attempts(),
             source="edit:after",
         )
@@ -966,8 +768,8 @@ class EditTransaction:
         report = self._validate(capture_os_errors=True)
         self._emit_warnings(report.warnings)
 
-        before_counts = self._count_statuses(is_before=True)
-        after_counts = self._count_statuses(is_before=False)
+        before_counts = self._base.count_statuses()
+        after_counts = self._work.count_statuses()
         before_total = sum(before_counts.values())
         after_total = sum(after_counts.values())
 
@@ -989,25 +791,23 @@ class EditTransaction:
 
         removed_uids, replaced_pairs, added_uids, status_changes = self._classify_diff_changes()
 
-        # 2. [- REMOVED]（单独置顶高亮被移除的 [succeeded] 节点）
         lines.append("")
         lines.append("[- REMOVED]")
         if not removed_uids:
             lines.append("  (none)")
         else:
             removed_succeeded = [
-                u for u in removed_uids if self._base_effective_status(u) == "succeeded"
+                u for u in removed_uids if self._base.effective_status(u) == "succeeded"
             ]
             removed_other = [
-                u for u in removed_uids if self._base_effective_status(u) != "succeeded"
+                u for u in removed_uids if self._base.effective_status(u) != "succeeded"
             ]
             for u in removed_succeeded:
                 lines.append(f"  - [succeeded] {u}  (!) removed completed job")
             for u in removed_other:
-                st = self._base_effective_status(u) or "unknown"
+                st = self._base.effective_status(u) or "unknown"
                 lines.append(f"  - [{st}] {u}")
 
-        # 3. [⇄ REPLACED]（仅展示变化字段，拒绝刷屏未变 JSON）
         lines.append("")
         lines.append("[⇄ REPLACED]")
         if not replaced_pairs:
@@ -1015,22 +815,21 @@ class EditTransaction:
         else:
             for orig_uid, new_uid in replaced_pairs:
                 header = f"  ⇄ {orig_uid} -> {new_uid}" if orig_uid != new_uid else f"  ⇄ {new_uid}"
-                b_st = self._base_effective_status(orig_uid)
-                a_st = self._effective_status(new_uid)
+                b_st = self._base.effective_status(orig_uid)
+                a_st = self._work.effective_status(new_uid)
                 changes = self._format_replacement_field_diffs(orig_uid, new_uid, b_st, a_st)
                 if changes:
                     lines.append(f"{header}: " + "; ".join(changes))
                 else:
                     lines.append(f"{header}: (no field changes)")
 
-        # 4. [+ ADDED] & [↻ STATUS]
         lines.append("")
         lines.append("[+ ADDED]")
         if not added_uids:
             lines.append("  (none)")
         else:
             for u in added_uids:
-                st = self._effective_status(u) or "unknown"
+                st = self._work.effective_status(u) or "unknown"
                 lines.append(f"  + [{st}] {u}")
 
         lines.append("")
@@ -1041,7 +840,6 @@ class EditTransaction:
             for u, prev_st, next_st in status_changes:
                 lines.append(f"  ↻ {u}: {prev_st} -> {next_st}")
 
-        # 5. [WARNINGS]
         lines.append("")
         lines.append("[WARNINGS]")
         if not report.warnings:
@@ -1050,7 +848,6 @@ class EditTransaction:
             for warn in report.warnings:
                 lines.append(f"  ! {warn}")
 
-        # 6. [VALIDATION]
         lines.append("")
         lines.append("[VALIDATION]")
         if not report.errors and not report.os_errors:
@@ -1067,20 +864,11 @@ class EditTransaction:
 
         return "\n".join(lines)
 
-    def _count_statuses(self, *, is_before: bool) -> dict[str, int]:
-        counts = {s: 0 for s in _STATUS_ORDER}
-        uids = self._base_all_uids() if is_before else self._current_all_uids()
-        for uid in uids:
-            st = self._base_effective_status(uid) if is_before else self._effective_status(uid)
-            if st in counts:
-                counts[st] += 1
-        return counts
-
     def _classify_diff_changes(
         self,
     ) -> tuple[list[str], list[tuple[str, str]], list[str], list[tuple[str, str, str]]]:
-        g_before = self._base_all_uids()
-        g_after = self._current_all_uids()
+        g_before = self._base.all_uids()
+        g_after = self._work.all_uids()
 
         surviving_origins = {
             orig for cur, orig in self._origin_of.items() if cur in g_after
@@ -1101,8 +889,8 @@ class EditTransaction:
         for u in sorted(g_after & g_before):
             if u in replaced_cur_uids:
                 continue
-            b_st = self._base_effective_status(u)
-            a_st = self._effective_status(u)
+            b_st = self._base.effective_status(u)
+            a_st = self._work.effective_status(u)
             if b_st is not None and a_st is not None and b_st != a_st:
                 status_changes.append((u, b_st, a_st))
 
@@ -1195,15 +983,14 @@ class EditTransaction:
         os_errors: list[str] = []
         warnings: list[str] = []
 
-        g_before = self._base_all_uids()
-        g_after = self._current_all_uids()
+        g_before = self._base.all_uids()
+        g_after = self._work.all_uids()
 
-        # 缓存当前有效快照与状态
         after_status: dict[str, str] = {}
         after_snaps: dict[str, dict[str, Any]] = {}
         for uid in g_after:
-            st = self._effective_status(uid)
-            snap = self._effective_snapshot(uid)
+            st = self._work.effective_status(uid)
+            snap = self._work.effective_snapshot(uid)
             if st is not None:
                 after_status[uid] = st
             if snap is not None:
@@ -1212,7 +999,7 @@ class EditTransaction:
         # ── 硬 Error 1：防删出新孤儿（存活节点原本存在的上游不可消失）
         reported_missing_edges: set[tuple[str, str]] = set()
         for u in sorted(g_after & g_before):
-            b_snap = self._base_effective_snapshot(u)
+            b_snap = self._base.effective_snapshot(u)
             a_snap = after_snaps.get(u)
             if b_snap is None or a_snap is None:
                 continue
@@ -1249,7 +1036,7 @@ class EditTransaction:
             for u in g_after
             if u in after_snaps
         }
-        for cycle in _find_cycles_iterative(g_after, edges):
+        for cycle in find_cycle_components(g_after, edges):
             if any(node in checked_nodes for node in cycle):
                 errors.append(
                     f"Dependency cycle detected involving: {', '.join(cycle)}"
@@ -1285,7 +1072,7 @@ class EditTransaction:
 
                 p_status = after_status.get(p)
                 if p_status == "succeeded":
-                    succ_meta = self._successes.get(p) or {}
+                    succ_meta = self._work.successes.get(p) or {}
                     p_outer_files = succ_meta.get("files") or {}
                     p_artifacts = succ_meta.get("artifacts") or {}
                     file_desc = (
@@ -1345,7 +1132,7 @@ class EditTransaction:
         for uid in sorted(self._written_succeeded_uids):
             if after_status.get(uid) != "succeeded":
                 continue
-            manual_succ_meta = self._successes.get(uid)
+            manual_succ_meta = self._work.successes.get(uid)
             if manual_succ_meta is None:
                 continue
             snap = manual_succ_meta.get("job_snapshot") or {}
@@ -1386,7 +1173,6 @@ class EditTransaction:
                     )
                 else:
                     # 验盘确认的规范路径当场同步回填至外层 files/artifacts 并失效 after 缓存
-                    # （不递增 _version，避免触发重复 Warning 日志）
                     canonical_path = inspected.canonical_path
                     outer_files = manual_succ_meta.setdefault("files", {})
                     artifacts = manual_succ_meta.setdefault("artifacts", {})
@@ -1405,18 +1191,18 @@ class EditTransaction:
         # ── 只读 Warning #1 / #2 / #3（Warning #4 已在 Error 3 循环收集）
         removed_uids, _, _, _ = self._classify_diff_changes()
         for uid in removed_uids:
-            if self._base_effective_status(uid) == "succeeded":
+            if self._base.effective_status(uid) == "succeeded":
                 warnings.append(f"Removing completed [succeeded] job {uid!r}")
 
         for uid in sorted(self._partial_removed_uids):
             if uid not in g_after:
                 continue
             remaining_parts: list[str] = []
-            if uid in self._queue:
+            if uid in self._work.queue:
                 remaining_parts.append("queue")
-            if uid in self._successes:
+            if uid in self._work.successes:
                 remaining_parts.append("successes")
-            if uid in self._failed:
+            if uid in self._work.failed:
                 remaining_parts.append("failures")
             if remaining_parts:
                 warnings.append(
@@ -1428,9 +1214,9 @@ class EditTransaction:
             if after_status.get(uid) != "pending":
                 continue
             archives: list[str] = []
-            if uid in self._successes:
+            if uid in self._work.successes:
                 archives.append("successes")
-            if uid in self._failed:
+            if uid in self._work.failed:
                 archives.append("failures")
             if archives:
                 warnings.append(
@@ -1448,11 +1234,11 @@ class EditTransaction:
 
     def _build_commit(self) -> GraphEditCommit:
         queue_writes: dict[str, dict[str, Any] | None] = {}
-        for uid in self._base_queue:
-            if uid not in self._queue:
+        for uid in self._base.queue:
+            if uid not in self._work.queue:
                 queue_writes[uid] = None
-        for uid, slot in self._queue.items():
-            base_slot = self._base_queue.get(uid)
+        for uid, slot in self._work.queue.items():
+            base_slot = self._base.queue.get(uid)
             if (
                 base_slot is None
                 or slot.queue_position is None
@@ -1462,19 +1248,19 @@ class EditTransaction:
                 queue_writes[uid] = copy.deepcopy(slot.job_snapshot)
 
         success_writes: dict[str, dict[str, Any] | None] = {}
-        for uid in self._base_successes:
-            if uid not in self._successes:
+        for uid in self._base.successes:
+            if uid not in self._work.successes:
                 success_writes[uid] = None
-        for uid, meta in self._successes.items():
-            if uid not in self._base_successes or meta != self._base_successes[uid]:
+        for uid, meta in self._work.successes.items():
+            if uid not in self._base.successes or meta != self._base.successes[uid]:
                 success_writes[uid] = copy.deepcopy(meta)
 
         failed_writes: dict[str, tuple[dict[str, Any], dict[str, Any] | None] | None] = {}
-        for uid in self._base_failed:
-            if uid not in self._failed:
+        for uid in self._base.failed:
+            if uid not in self._work.failed:
                 failed_writes[uid] = None
-        for uid, entry in self._failed.items():
-            if uid not in self._base_failed or entry != self._base_failed[uid]:
+        for uid, entry in self._work.failed.items():
+            if uid not in self._base.failed or entry != self._base.failed[uid]:
                 failed_writes[uid] = (copy.deepcopy(entry[0]), copy.deepcopy(entry[1]))
 
         return GraphEditCommit(

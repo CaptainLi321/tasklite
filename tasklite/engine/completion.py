@@ -26,8 +26,8 @@ if TYPE_CHECKING:
 from ..exceptions import TaskLiteError, _ArtifactIOError
 from ..models.job import Job
 from ..models.artifact import FileSpec
+from ..models.records import build_result_record, extract_effective_job_config
 from ..utils.clock import utc_now_iso
-from .admission import extract_effective_job_config
 from .channel import ExecutionResult, JobHandle
 
 from .in_flight import InFlightJob, InFlightTracker
@@ -325,15 +325,13 @@ class CompletionMachine:
                     started_at=started_at,
                     error_message=authorization_outcome.message,
                     files={k: v.to_dict() for k, v in active_files.items()},
-                    result={
-                        "message": authorization_outcome.message,
-                        "exception": None,
-                        "metadata": {},
-                        "annotations": {
+                    result=build_result_record(
+                        message=authorization_outcome.message,
+                        annotations={
                             "authorization_status": authorization_outcome.status.value,
                             "path": authorization_outcome.path,
                         },
-                    },
+                    ),
                 )
                 if authorization_outcome.status is AuthorizationStatus.DENIED:
                     self._session.temporarily_exclude_chain(uid, store.state)
@@ -487,12 +485,12 @@ class CompletionMachine:
             started_at=started_at,
             error_message=retry_error,
             files=files_dict,
-            result={
-                "message": result.message,
-                "exception": result.exception,
-                "metadata": dict(result.result_metadata or {}),
-                "annotations": dict(result.annotations or {}),
-            },
+            result=build_result_record(
+                message=result.message,
+                exception=result.exception,
+                metadata=result.result_metadata,
+                annotations=result.annotations,
+            ),
         )
         result.will_retry = True
         self._session.mark_retry_candidate(uid)
@@ -541,12 +539,11 @@ class CompletionMachine:
             attempt_no=attempt_no,
             started_at=started_at,
             files=files_dict,
-            result={
-                "message": result.message,
-                "exception": None,
-                "metadata": dict(result.result_metadata or {}),
-                "annotations": dict(result.annotations or {}),
-            },
+            result=build_result_record(
+                message=result.message,
+                metadata=result.result_metadata,
+                annotations=result.annotations,
+            ),
         )
         result.will_retry = False
         self._session.clear_retry_candidate(uid)
@@ -596,7 +593,7 @@ class CompletionMachine:
         accepted: dict[str, dict[str, Any]] = {}
         for spawned_job in spawned_jobs:
             spawned_uid = spawned_job.uid
-            snapshot = store.normalize_spawned_job(spawned_job)
+            snapshot = store.normalize_new_job_snapshot(spawned_job, caller="spawn")
             previous = accepted.get(spawned_uid, busy_snapshots.get(spawned_uid))
             if previous is not None:
                 if extract_effective_job_config(previous) != extract_effective_job_config(snapshot):
@@ -650,12 +647,12 @@ class CompletionMachine:
             run_id=run_id or self._session.run_id,
             started_at=started_at,
             files=files_dict,
-            result={
-                "message": result.message,
-                "exception": result.exception,
-                "metadata": dict(result.result_metadata or {}),
-                "annotations": dict(result.annotations or {}),
-            },
+            result=build_result_record(
+                message=result.message,
+                exception=result.exception,
+                metadata=result.result_metadata,
+                annotations=result.annotations,
+            ),
         )
         result.will_retry = False
         self._session.clear_retry_candidate(uid)

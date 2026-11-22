@@ -68,7 +68,7 @@ def test_commit_job_settlement_scales_constant_with_queue_size(tmp_path):
         f"commit_job_settlement 疑似随队列规模退化：10k 队列 {busy * 1000:.1f}ms "
         f"vs 空库基线 {baseline * 1000:.1f}ms（倍数阈值 {_SCALE_FACTOR}）"
     )
-    assert len(busy_backend.load_queue()) == _QUEUE_DEPTH
+    assert len(busy_backend.load_queue_jobs(status="pending")) == _QUEUE_DEPTH
     assert "test::latency_probe" in busy_backend.load_successes()
 
 
@@ -106,4 +106,4 @@ def test_enqueue_jobs_latency_constant_with_queue_size(tmp_path):
         f"enqueue_jobs 疑似随队列规模退化：10k 队列 {busy * 1000:.1f}ms/次 "
         f"vs 空库基线 {baseline * 1000:.1f}ms/次（倍数阈值 {_SCALE_FACTOR}）"
     )
-    assert len(busy_backend.load_queue()) == _QUEUE_DEPTH + 50
+    assert len(busy_backend.load_queue_jobs(status="pending")) == _QUEUE_DEPTH + 50

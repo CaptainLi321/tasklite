@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from ..exceptions import TaskLiteError
 from ..utils.encoding import make_job_uid
+from .graph import build_dependents_index, collect_downstream, find_cycle_members
 from .job import Job
 
 
@@ -76,7 +77,6 @@ class PipelineState:
         self._failed_uids: set[str] = set(self._failed)
         self._queue_uids: set[str] = {job_uid_from_snapshot(j) for j in self._queue}
         self._in_flight_uids: set[str] = set()
-        self._trigger_skipped_uids: set[str] = set()
 
     @property
     def successes(self) -> dict[str, dict[str, Any]]:
@@ -115,7 +115,6 @@ class PipelineState:
             self._queue[0:0] = list(job_snapshots)
         else:
             self._queue.extend(job_snapshots)
-        self._trigger_skipped_uids.difference_update(job_uid_from_snapshot(j) for j in job_snapshots)
         self._queue_uids.update(job_uid_from_snapshot(j) for j in job_snapshots)
         if __debug__:
             self._assert_uids_consistent()
@@ -160,39 +159,30 @@ class PipelineState:
         """整体替换队列（死锁批量移除肇事者场景），重建 uid 索引。"""
         self._queue = list(job_snapshots)
         self._queue_uids = {job_uid_from_snapshot(j) for j in self._queue}
-        self._trigger_skipped_uids.difference_update(self._queue_uids)
         if __debug__:
             self._assert_uids_consistent()
 
-    # 级联失败（按需计算反向依赖）-------------------------------
+    # 依赖图与级联失败（复用无状态纯图原语）-------------------------
 
-    def _build_dependents(self) -> dict[str, set[str]]:
-        """按需从当前 _queue 构建反向依赖索引 dependents[dep_uid] -> {job_uid...}。"""
-        dependents: dict[str, set[str]] = {}
+    def _queue_dependency_edges(
+        self, *, node_uids: AbstractSet[str] | None = None
+    ) -> dict[str, list[str]]:
+        """提取当前 _queue 的正向依赖映射 ``job_uid -> depends_on``。"""
+        edges: dict[str, list[str]] = {}
         for job_snapshot in self._queue:
             try:
                 job = Job.from_dict(job_snapshot)
             except (KeyError, TypeError, ValueError, TaskLiteError):
                 continue
-            job_uid = job.uid
-            for dep_uid in job.depends_on:
-                dependents.setdefault(dep_uid, set()).add(job_uid)
-        return dependents
+            if node_uids is not None and job.uid not in node_uids:
+                continue
+            edges[job.uid] = list(job.depends_on)
+        return edges
 
     def find_all_downstream(self, job_uid: str) -> list[str]:
         """沿反向依赖递归找出所有直接与间接下游作业 UID（不分状态）。"""
-        dependents = self._build_dependents()
-        downstream: list[str] = []
-        stack = [job_uid]
-        seen = {job_uid}
-        while stack:
-            cur = stack.pop()
-            for dep in dependents.get(cur, ()):
-                if dep not in seen:
-                    seen.add(dep)
-                    downstream.append(dep)
-                    stack.append(dep)
-        return downstream
+        dependents = build_dependents_index(self._queue_dependency_edges())
+        return collect_downstream(job_uid, dependents)
 
     def cascade_fail(
         self,
@@ -205,84 +195,21 @@ class PipelineState:
         ``excluded_uids`` 是传播终止点（执行选择排除的作业）：既不加入级联
         集合，也不向其下游继续传播——这些作业原样留队，由后续 run 消费。
         """
-        dependents = self._build_dependents()
-        cascade: list[str] = []
-        stack = [failed_uid]
-        seen = {failed_uid}
-        while stack:
-            cur = stack.pop()
-            for downstream in dependents.get(cur, ()):
-                if downstream in excluded_uids:
-                    continue
-                if downstream not in seen and downstream not in self._successes \
-                        and downstream not in self._failed:
-                    seen.add(downstream)
-                    cascade.append(downstream)
-                    stack.append(downstream)
-        return cascade
+        dependents = build_dependents_index(self._queue_dependency_edges())
+        stop_at = excluded_uids | self._success_uids | self._failed_uids
+        return collect_downstream(failed_uid, dependents, stop_at=stop_at)
 
     def find_dependency_cycles(
         self, *, node_uids: AbstractSet[str] | None = None
     ) -> list[str]:
-        """在当前 _queue 的依赖图中找出所有依赖环成员。
-
-        ``node_uids`` 限定参与构图的队列节点；节点范围外的依赖边不参与环检测。
-
-        不变式：返回全部实际环成员；成员可能因多条回边重复出现，调用方按集合
-        归因，不依赖遍历顺序或闭点重复次数。
-        实现为显式栈仿真调用栈：栈帧持有节点的依赖迭代器，弹帧即回溯置黑，
-        遍历序与递归形式逐一致且深度不受解释器递归上限约束——深链队列
-        （深度超递归限制）不得因环检测本身崩溃。
-        """
-        edges: dict[str, set[str]] = {}
-        for job_snapshot in self._queue:
-            try:
-                job = Job.from_dict(job_snapshot)
-            except (KeyError, TypeError, ValueError, TaskLiteError):
-                continue
-            if node_uids is not None and job.uid not in node_uids:
-                continue
-            edges[job.uid] = set(job.depends_on)
-
-        color: dict[str, int] = {}
-        cycle_members: list[str] = []
-        path_stack: list[str] = []
-        frame_deps: list[Any] = []
-
-        for root in list(edges):
-            if color.get(root, 0) != 0:
-                continue
-            color[root] = 1
-            path_stack.append(root)
-            frame_deps.append(iter(edges.get(root, ())))
-            while frame_deps:
-                try:
-                    dep = next(frame_deps[-1])
-                except StopIteration:
-                    frame_deps.pop()
-                    color[path_stack.pop()] = 2
-                    continue
-                if dep not in edges:
-                    continue
-                dep_color = color.get(dep, 0)
-                if dep_color == 1:
-                    try:
-                        start = path_stack.index(dep)
-                    except ValueError:
-                        start = 0
-                    cycle_members.extend(path_stack[start:])
-                    cycle_members.append(dep)
-                elif dep_color == 0:
-                    color[dep] = 1
-                    path_stack.append(dep)
-                    frame_deps.append(iter(edges.get(dep, ())))
-        return cycle_members
+        """在当前 _queue 的依赖图中找出所有依赖环成员（迭代式 Kosaraju，零递归深度限制）。"""
+        edges = self._queue_dependency_edges(node_uids=node_uids)
+        return find_cycle_members(edges.keys(), edges)
 
     # 完成/失败记录 ------------------------------------------------
 
     def mark_success(self, job_uid: str, metadata: dict[str, Any]) -> None:
         """终态转移：uid → successes（成功）。单一入口维护 successes/failed 索引。"""
-        self._trigger_skipped_uids.discard(job_uid)
         self._failed.pop(job_uid, None)
         self._failed_uids.discard(job_uid)
         self._successes[job_uid] = copy.deepcopy(metadata)
@@ -292,7 +219,6 @@ class PipelineState:
 
     def mark_failed(self, job_uid: str, metadata: dict[str, Any]) -> None:
         """终态转移：uid → failed（失败档案）。单一入口维护 successes/failed 索引。"""
-        self._trigger_skipped_uids.discard(job_uid)
         self._successes.pop(job_uid, None)
         self._success_uids.discard(job_uid)
         self._failed[job_uid] = copy.deepcopy(metadata)
@@ -307,22 +233,6 @@ class PipelineState:
                 self._cursors.pop(k, None)
             else:
                 self._cursors[k] = v
-
-    # 运维管理受控变更 ------------------------------------------------
-
-    def discard_success(self, job_uid: str) -> None:
-        """从 successes 集合移除指定 uid（运维接缝，幂等）。"""
-        self._successes.pop(job_uid, None)
-        self._success_uids.discard(job_uid)
-        if __debug__:
-            self._assert_terminal_uids_consistent()
-
-    def discard_failed(self, job_uid: str) -> None:
-        """从 failed 集合移除指定 uid（运维接缝，幂等）。"""
-        self._failed.pop(job_uid, None)
-        self._failed_uids.discard(job_uid)
-        if __debug__:
-            self._assert_terminal_uids_consistent()
 
     def get_cursor(self, key: str) -> str | None:
         """获取单个游标键值。"""
@@ -341,15 +251,6 @@ class PipelineState:
     def queue_uids(self) -> set[str]:
         """队列 uid 的活索引。"""
         return self._queue_uids
-
-    @property
-    def trigger_skipped_uids(self) -> frozenset[str]:
-        """本次 run 中触发条件判定无需执行的依赖就绪标记。"""
-        return frozenset(self._trigger_skipped_uids)
-
-    def mark_trigger_skipped(self, job_uid: str) -> None:
-        """仅在跳过提交成功后记录；不伪造历史成功。"""
-        self._trigger_skipped_uids.add(job_uid)
 
     def check_dependency_status(
         self,

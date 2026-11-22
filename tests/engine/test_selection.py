@@ -155,8 +155,12 @@ def _uids(rows) -> list[str]:
     return [f"{row['task_type']}::{row['job_id']}" for row in rows]
 
 
+def _pending_queue(pipeline: TaskLite) -> list[dict]:
+    return [row["job"] for row in pipeline._runtime.store.backend.load_queue_jobs(status="pending")]
+
+
 def _queued(pipeline: TaskLite) -> list[str]:
-    return _uids(pipeline._runtime.store.backend.load_queue())
+    return _uids(_pending_queue(pipeline))
 
 
 # ── 默认全执行 / Exclude 延迟语义 ─────────────────────────────────────
@@ -186,7 +190,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
     pipeline.enqueue(Job("fetch", "a"))
     pipeline.enqueue(Job("convert", "b"))
     pipeline.enqueue(Job("rank", "r", depends_on=["convert::b"]))
-    before = {uid: row for uid, row in zip(_queued(pipeline), pipeline._runtime.store.backend.load_queue())}
+    before = {uid: row for uid, row in zip(_queued(pipeline), _pending_queue(pipeline))}
 
     with in_process_workers(pipeline, _make_stub_launcher(seen=seen)):
         pipeline.run(exclude=Exclude(task_type="convert"))
@@ -194,7 +198,7 @@ def test_excluded_and_downstream_jobs_stay_queued_then_auto_retry(
         assert sorted(pipeline._runtime.store.backend.load_successes()) == ["fetch::a"]
         assert pipeline._runtime.store.backend.load_failed() == {}
         assert _queued(pipeline) == ["convert::b", "rank::r"]
-        kept = {uid: row for uid, row in zip(_queued(pipeline), pipeline._runtime.store.backend.load_queue())}
+        kept = {uid: row for uid, row in zip(_queued(pipeline), _pending_queue(pipeline))}
         assert kept == {uid: before[uid] for uid in ("convert::b", "rank::r")}
         attempts = pipeline._runtime.store.backend.load_settled_attempts
         assert [attempts("convert::b"), attempts("rank::r")] == [[], []]
@@ -373,7 +377,7 @@ def test_malformed_excluded_row_finishes_via_existing_failure_semantics(
     (failed_uid, fail_meta), = failures.items()
     assert failed_uid.startswith("_unknown::")
     assert fail_meta["error_message"] == 'Queued job configuration is invalid'
-    assert pipeline._runtime.store.backend.load_queue() == []
+    assert _pending_queue(pipeline) == []
 
 
 # ── 动态派生与排除 ───────────────────────────────────────────────────

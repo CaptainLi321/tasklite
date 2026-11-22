@@ -237,7 +237,7 @@ class DispatchMachine:
         # 2. 候选就绪：求值前不 pop 丢队，异常原位留队
         peek_snapshot = store.state.queue[sched.runnable_idx]
         if peek_snapshot.get("trigger") is None:
-            self._trigger_registry.normalize_job_snapshot(peek_snapshot, peek_snapshot["task_type"])
+            store.finalize_intake_snapshot(peek_snapshot, peek_snapshot["task_type"])
         job = Job.from_dict(peek_snapshot)
         job_uid = job.uid
 
@@ -270,7 +270,6 @@ class DispatchMachine:
             if not should_run:
                 job_snapshot = peek_snapshot
                 store.apply_skip(job_uid, job_snapshot=job_snapshot)
-                store.state.mark_trigger_skipped(job_uid)
                 return None
 
         if job.task_type not in self._tasks:
@@ -636,7 +635,7 @@ class DispatchMachine:
             frozenset(state.failed_uids),
             dict(state.cursors),
             protected_roots=self._store.path_policy.protected_paths,
-            base_dir=self._trigger_registry.base_dir,
+            base_dir=self._store.base_dir,
             known_job_uids=frozenset(
                 state.queue_uids
                 | state.in_flight_uids

@@ -163,7 +163,8 @@ class TestTrustedLastSucceededAtUs:
         assert store.trusted_last_succeeded_at_us("t::1") is not None
 
         # 模拟清空 successes 历史后人工种子
-        state.discard_success("t::1")
+        state.successes.pop("t::1", None)
+        state.success_uids.discard("t::1")
         assert store.trusted_last_succeeded_at_us("t::1") is None
         state.mark_success("t::1", {})
         assert store.trusted_last_succeeded_at_us("t::1") is None
@@ -220,7 +221,7 @@ class TestApplyFailureAndCascade:
         }
         store.apply_failure("t::1", {"error_message": "x"}, job_snapshot=job_snapshot)
         assert "t::1" in store.state.failed
-        assert "t::1" not in backend.load_failure_payloads()
+        assert "t::1" not in backend.load_consistent_snapshot()["failure_payloads"]
 
     def test_failure_clears_wall_on_both_sides(self):
         """失败终态与成功终态互删对侧（内存与后端镜像同步）。"""
@@ -279,7 +280,7 @@ class TestApplySkip:
         assert isinstance(outcome, SkipOutcome)
         assert outcome.was_known is True
         assert store.state.is_empty
-        assert backend.load_queue() == []
+        assert backend.load_queue_jobs(status="pending") == []
 
     def test_skip_preserves_other_in_flight_rerun_exemption(self):
         store, state, backend = _make_store()
@@ -390,18 +391,18 @@ class TestIntakePipeline:
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(tasks=_task_specs("scan", "always")),
+            tasks=_task_specs("scan", "always"),
         )
-        jd = store.normalize_and_validate_job(Job("scan", "1"))
+        jd = store.normalize_new_job_snapshot(Job("scan", "1"))
         assert jd["trigger"] == "always"
-        jd_explicit = store.normalize_and_validate_job(Job("scan", "2", trigger="once"))
+        jd_explicit = store.normalize_new_job_snapshot(Job("scan", "2", trigger="once"))
         assert jd_explicit["trigger"] == "once"
 
     def test_enqueue_rejects_unserializable_payload(self):
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
+            tasks=_task_specs("t", "once"),
         )
         job = Job("t", "1")
         job.payload["bad"] = object()
@@ -412,13 +413,13 @@ class TestIntakePipeline:
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
+            tasks=_task_specs("t", "once"),
         )
         assert store.enqueue_job(Job("t", "first")) is True
         assert store.enqueue_job(Job("t", "first")) is False
         assert [row["job_id"] for row in store.state.queue] == ["first"]
         assert store.state.queue_uids == {"t::first"}
-        assert [row["job_id"] for row in store.backend.load_queue()] == ["first"]
+        assert [row["job"]["job_id"] for row in store.backend.load_queue_jobs(status="pending")] == ["first"]
 
     def test_enqueue_rejects_non_job(self):
         store, _, _ = _make_store()
@@ -432,12 +433,12 @@ class TestIntakePipeline:
         store = StateStore(
             backend,
             PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(tasks=TaskRegistry()),
+            tasks=TaskRegistry(),
         )
         job = Job("missing", "1")
         with pytest.raises(TaskLiteError, match="unknown task_type"):
             store.enqueue_job(job)
-        assert backend.load_queue() == []
+        assert backend.load_queue_jobs(status="pending") == []
         assert backend.load_settled_attempts(job.uid) == []
 
     def test_enqueue_job_same_uid_idempotent_vs_conflict(self):
@@ -458,7 +459,7 @@ class TestIntakePipeline:
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(tasks=tasks),
+            tasks=tasks,
         )
         assert store.enqueue_job(Job("t", "1")) is True
         # 显式传入与继承后的有效配置完全等价（且空 dict 不清空 Task 资源）→ 返回 False
@@ -488,11 +489,9 @@ class TestIntakePipeline:
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(
-                tasks=_task_specs("child", "until_success")
-            ),
+            tasks=_task_specs("child", "until_success"),
         )
-        jd = store.normalize_spawned_job(Job("child", "c1"))
+        jd = store.normalize_new_job_snapshot(Job("child", "c1"), caller="spawn")
         assert jd["trigger"] == "until_success"
         assert jd["resources"][WORKER_RESOURCE] == 1.0
 
@@ -500,12 +499,12 @@ class TestIntakePipeline:
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(tasks=_task_specs("t", "once")),
+            tasks=_task_specs("t", "once"),
         )
         job = Job("t", "1")
         job.payload["bad"] = object()
         with pytest.raises(TaskLiteError, match="payload.bad"):
-            store.normalize_spawned_job(job)
+            store.normalize_new_job_snapshot(job, caller="spawn")
 
     def test_normalize_spawned_job_rejects_unregistered_task(self):
         from tasklite import TaskLiteError
@@ -513,10 +512,45 @@ class TestIntakePipeline:
         store = StateStore(
             InMemoryStateBackend(),
             PipelineState({}, {}, {}, []),
-            trigger_registry=TriggerRegistry(tasks=TaskRegistry()),
+            tasks=TaskRegistry(),
         )
         with pytest.raises(TaskLiteError, match="unknown task_type"):
-            store.normalize_spawned_job(Job("missing", "1"))
+            store.normalize_new_job_snapshot(Job("missing", "1"), caller="spawn")
+
+    @pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
+    def test_enqueue_handles_legacy_running_conflict_and_downstream_dependency(self, tmp_path, backend_kind):
+        """遗留 running 作业参与入队幂等/冲突判定与下游依赖存在性校验（双后端回归）。"""
+        from tasklite.backend import SQLiteStateBackend
+
+        backend = (
+            InMemoryStateBackend()
+            if backend_kind == "memory"
+            else SQLiteStateBackend(tmp_path / "legacy_running.db")
+        )
+        try:
+            tasks = _task_specs("work", "once")
+            store = StateStore(backend, PipelineState({}, {}, {}, []), tasks=tasks)
+            upstream = Job("work", "a", payload={"v": 1})
+            assert store.enqueue_job(upstream) is True
+            backend.mark_job_running(
+                upstream.uid,
+                execution_id="crashed_run.1",
+                run_id="crashed_run",
+                started_at="2026-05-01T00:00:00Z",
+            )
+
+            # 1. 同 UID 配置一致仍幂等返回 False；配置不同必抛 TaskLiteError（不再漏判静默 False）
+            assert store.enqueue_job(Job("work", "a", payload={"v": 1})) is False
+            with pytest.raises(TaskLiteError, match="already queued with different effective configuration"):
+                store.enqueue_job(Job("work", "a", payload={"v": 2}))
+
+            # 2. 下游依赖遗留 running 上游允许入队（不再误拒为依赖不存在）
+            downstream = Job("work", "b", depends_on=[upstream.uid])
+            assert store.enqueue_job(downstream) is True
+            rows = {row["job_uid"]: row["status"] for row in backend.load_queue_jobs()}
+            assert rows == {"work::a": "running", "work::b": "pending"}
+        finally:
+            backend.close()
 
 
 class TestSnapshotAndMembership:
@@ -626,7 +660,7 @@ class _MutexProbe:
         elif action == "mark_failed":
             # mark_failed_memory 是失败登记的内存尾段：先完成后端提交再登记
             self._pop_from_memory_queue(uid)
-            self.backend.commit_job_failure(uid, {"error_message": "tail"})
+            self.backend.commit_job_failures([(uid, {"error_message": "tail"})])
             self.store.mark_failed_memory(uid, {"error_message": "tail"})
         elif action == "retry":
             if uid in self.store.state.successes or uid in self.store.state.failed:
@@ -770,7 +804,8 @@ def test_trusted_baseline_rejects_untrusted_or_mismatched_metadata(metadata):
         finished_at="2026-05-01T00:00:05Z", **identity,
     )
     assert store.trusted_last_succeeded_at_us("t::1") is not None
-    state.discard_success("t::1")
+    state.successes.pop("t::1", None)
+    state.success_uids.discard("t::1")
     assert store.trusted_last_succeeded_at_us("t::1") is None
     state.mark_success("t::1", metadata)
     assert store.trusted_last_succeeded_at_us("t::1") is None
@@ -835,3 +870,74 @@ def test_sqlite_artifact_publication_rolls_back_with_cursor_transaction(tmp_path
     (running,) = backend.load_queue_jobs()
     assert running["job_uid"] == "t::1" and running["status"] == "running"
     backend.close()
+
+
+def _store_test_ok_handler(job, ctx):
+    from tasklite import TaskResult
+    return TaskResult.success()
+
+
+@pytest.mark.parametrize("backend_kind", ["memory", "sqlite"])
+def test_pipeline_enqueue_against_legacy_running_and_run_recovery(tmp_path, backend_kind):
+    """端到端双后端回归：库内存在遗留 running 时，同 UID 冲突拦截、下游允许入队且后续 run() 按 DAG 收敛。"""
+    from tasklite import StateSnapshot, TaskLite
+
+    kwargs = {"state_path": tmp_path / "legacy_run.db"} if backend_kind == "sqlite" else {}
+    with TaskLite(backend=backend_kind, **kwargs) as pipeline:
+        pipeline.register_task("work", _store_test_ok_handler)
+        assert pipeline.enqueue(Job("work", "a", payload={"v": 1})) is True
+        pipeline._runtime.store.backend.mark_job_running(
+            "work::a",
+            execution_id="crashed.1",
+            run_id="crashed",
+            started_at="2026-05-01T00:00:00Z",
+        )
+
+        # 同 UID 同配置幂等返回 False；不同配置抛出 TaskLiteError
+        assert pipeline.enqueue(Job("work", "a", payload={"v": 1})) is False
+        with pytest.raises(TaskLiteError, match="already queued with different effective configuration"):
+            pipeline.enqueue(Job("work", "a", payload={"v": 2}))
+
+        # 下游依赖遗留 running 允许入队
+        assert pipeline.enqueue(Job("work", "b", depends_on=["work::a"])) is True
+
+        # run() 恢复遗留 running 为失败，随后下游按依赖失败收敛
+        pipeline.run(install_signals=False)
+        with StateSnapshot.open(pipeline) as snap:
+            a_rec = snap.get_job("work::a")
+            b_rec = snap.get_job("work::b")
+            assert a_rec is not None and a_rec["status"] == "failed"
+            assert b_rec is not None and b_rec["status"] == "failed"
+            assert list(snap.iter_jobs(status="pending")) == []
+
+
+def test_manual_failure_archive_omits_redundant_root_note_and_reads_legacy_root_note():
+    """人工失败档案仅在 annotations 记录 note（根部不再多写），读路径仍向后兼容旧库根部 note。"""
+    from tasklite import StateSnapshot, TaskLite, TaskResult
+    from tasklite.models.records import extract_archive_result
+
+    def _ok(job, ctx):
+        return TaskResult.success()
+
+    with TaskLite(backend="memory") as pipeline:
+        pipeline.register_task("work", _ok)
+        with pipeline.edit(dry_run=False, note="人工标记失败") as tx:
+            tx.add(Job("work", "f1"), status="failed")
+
+        raw_meta = pipeline._runtime.store.backend.load_failed()["work::f1"]
+        assert "note" not in raw_meta
+        assert raw_meta["annotations"]["note"] == "人工标记失败"
+        assert raw_meta["result"]["annotations"]["note"] == "人工标记失败"
+
+        with StateSnapshot.open(pipeline) as snap:
+            rec = snap.get_job("work::f1")
+            assert rec is not None
+            assert rec["result"]["annotations"]["note"] == "人工标记失败"
+
+    # 读路径向后兼容存量 Schema 6 根部 note 字段
+    legacy_result = extract_archive_result(
+        {"error_message": "legacy fail", "note": "旧库说明"},
+        is_failure=True,
+    )
+    assert legacy_result is not None
+    assert legacy_result["annotations"]["note"] == "旧库说明"

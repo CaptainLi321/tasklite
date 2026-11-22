@@ -7,14 +7,23 @@ successes 与 failed 按 UID 互斥；Attempt 仅作严格 append-only 执行轨
 from __future__ import annotations
 
 import copy
+import os
 from abc import ABC, abstractmethod
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence, TypeAlias, cast
 
 from ..exceptions import TaskLiteError
+from ..utils.artifact import TargetType
+from ..utils.clock import utc_now_iso
 
 
 QUEUE_EXECUTION_ID_KEY = "__tasklite_execution_id__"
+
+FailureEntry: TypeAlias = (
+    tuple[str, dict[str, Any]]
+    | tuple[str, dict[str, Any], dict[str, Any] | None]
+)
 
 
 @dataclass(frozen=True)
@@ -85,14 +94,10 @@ def execution_id_matches_run(execution_id: str, run_id: str) -> bool:
 
 
 def validate_queue_replacement(job_snapshots: Any) -> None:
-    """整表替换集统一形状校验（save_queue / replace_queue_atomic 共用）。
+    """队列快照序列形状校验（用于 ``commit_job_settlement`` 派生作业入队前守卫）。
 
-    契约：替换集必须是 job dict 的 list/tuple（与 load_queue 行形态一致）；
-    None（compute 漏写 return 的笔误形态）或非序列、元素非 dict 均属契约
-    违约，fail-loud 抛 TypeError。
-    不变式：双腿必须在任何写变（DELETE / 赋值）之前调用本校验——None 若
-    混过校验，SQLite 腿「DELETE 全表成功 + INSERT 全跳过」会静默清空整条
-    队列且事务正常提交，与 Memory 腿抛 TypeError 且队列原状形成行为分叉。
+    契约：入参必须是 job dict 的 list/tuple；None、非序列或非 dict 元素均属
+    契约违约，双后端须在进入任何写事务前调用本校验并 fail-loud 抛 TypeError。
     """
     if not isinstance(job_snapshots, (list, tuple)):
         raise TypeError(
@@ -105,6 +110,159 @@ def validate_queue_replacement(job_snapshots: Any) -> None:
                 f"queue replacement item #{i} must be a job dict, "
                 f"got {type(job_snapshot).__name__}"
             )
+
+
+def normalize_failure_entries(
+    entries: Sequence[FailureEntry],
+) -> list[tuple[str, dict[str, Any], dict[str, Any] | None]]:
+    """校验并展开批量失败条目，统一规范为 ``(job_uid, failure_metadata, payload)`` 三元组。"""
+    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+        raise TypeError(f"failure entries must be a sequence, got {type(entries).__name__}")
+    normalized: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = []
+    for i, item in enumerate(entries):
+        if not isinstance(item, tuple) or len(item) not in (2, 3):
+            raise TypeError(
+                f"failure entry #{i} must be a (job_uid, metadata[, payload]) tuple, "
+                f"got {type(item).__name__}"
+            )
+        job_uid = item[0]
+        meta = item[1]
+        payload = item[2] if len(item) == 3 else None
+        if not isinstance(job_uid, str) or not job_uid:
+            raise TypeError(f"failure entry #{i} job_uid must be a non-empty str, got {job_uid!r}")
+        if not isinstance(meta, dict):
+            raise TypeError(
+                f"failure entry #{i} metadata must be a dict, got {type(meta).__name__}"
+            )
+        if payload is not None and not isinstance(payload, dict):
+            raise TypeError(
+                f"failure entry #{i} payload must be a dict or None, got {type(payload).__name__}"
+            )
+        normalized.append((job_uid, meta, payload))
+    return normalized
+
+
+def validate_cursor_key(key: Any, *, error_type: type[Exception] = TypeError) -> str:
+    """校验游标键必须为非空 str。"""
+    if not isinstance(key, str) or not key:
+        raise error_type(f"cursor key must be a non-empty str, got {key!r}")
+    return key
+
+
+def validate_cursor_value(value: Any) -> str | None:
+    """校验游标值必须为 str 或 None。"""
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
+    return value
+
+
+def validate_mark_job_running_args(
+    *, execution_id: Any, run_id: Any, started_at: Any
+) -> None:
+    """校验 ``mark_job_running`` 前置入参（SQLite / Memory 双后端同源调用）。"""
+    if not isinstance(execution_id, str) or not execution_id:
+        raise ValueError("execution_id must be a non-empty str")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("run_id must be a non-empty str")
+    if not execution_id_matches_run(execution_id, run_id):
+        raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
+    if not isinstance(started_at, str) or not started_at:
+        raise ValueError("started_at must be a non-empty str")
+
+
+def validate_mark_job_running_state(
+    job_uid: str,
+    *,
+    present_in_queue: bool,
+    queue_status: str | None,
+) -> None:
+    """校验 ``mark_job_running`` 队列行当前状态（必须存在且未处于 running）。"""
+    if not present_in_queue:
+        raise ValueError(f"Job {job_uid} not found in queue")
+    if queue_status == "running":
+        raise ValueError(f"Job {job_uid} is already running")
+
+
+def validate_settlement_args(
+    *,
+    outcome: Any,
+    attempt_no: Any,
+    execution_id: Any,
+    run_id: Any,
+    settled_at: Any,
+    started_at: Any,
+    cursor_updates: Mapping[str, str | None] | None,
+    spawned_job_snapshots: Sequence[dict[str, Any]],
+) -> None:
+    """校验 ``commit_job_settlement`` 前置入参（SQLite / Memory 双后端同源调用）。"""
+    if outcome not in ("success", "failure", "retry", "pending"):
+        raise ValueError(f"Invalid outcome: {outcome}")
+    if not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 1:
+        raise TypeError(f"attempt_no must be int >= 1, got {attempt_no!r}")
+    if not isinstance(execution_id, str) or not execution_id:
+        raise ValueError(f"execution_id must be non-empty str, got {execution_id!r}")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError(f"run_id must be non-empty str, got {run_id!r}")
+    if not execution_id_matches_run(execution_id, run_id):
+        raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
+    if not isinstance(settled_at, str) or not settled_at:
+        raise ValueError(f"settled_at must be non-empty str, got {settled_at!r}")
+    if started_at is not None and (not isinstance(started_at, str) or not started_at):
+        raise ValueError("started_at must be non-empty str or None")
+    if cursor_updates:
+        for k, v in cursor_updates.items():
+            validate_cursor_key(k, error_type=ValueError)
+            validate_cursor_value(v)
+    if spawned_job_snapshots:
+        validate_queue_replacement(list(spawned_job_snapshots))
+
+
+def validate_running_settlement_state(
+    job_uid: str,
+    *,
+    present_in_queue: bool,
+    queue_status: str | None,
+    queue_run_id: str | None,
+    queue_attempt_no: int | None,
+    queue_execution_id: str | None,
+    run_id: str,
+    attempt_no: int,
+    execution_id: str,
+    already_settled: bool,
+) -> None:
+    """校验待结算执行与队列 running 身份严格匹配且对应 attempt 尚未结算。"""
+    if (
+        not present_in_queue
+        or (queue_status, queue_run_id, queue_attempt_no, queue_execution_id)
+        != ("running", run_id, attempt_no, execution_id)
+    ):
+        raise TaskLiteError(f"Settlement does not match the running execution for {job_uid}")
+    if already_settled:
+        raise TaskLiteError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
+
+
+def normalize_authorization_path(path: str | os.PathLike[str]) -> str:
+    """规范化后端路径授权存储主键。"""
+    return os.path.normpath(os.fspath(path))
+
+
+def is_valid_authorization_target_type(target_type: Any) -> bool:
+    """判断路径授权目标类型是否为合法的 'file' 或 'directory'。"""
+    return target_type in ("file", "directory")
+
+
+def validate_authorization_target_type(
+    target_type: Any, *, error_type: type[Exception] = ValueError
+) -> TargetType:
+    """校验路径授权目标类型并返回类型收窄结果。"""
+    if not is_valid_authorization_target_type(target_type):
+        raise error_type(f"target_type must be 'file' or 'directory', got {target_type!r}")
+    return cast(TargetType, target_type)
+
+
+def resolve_authorized_at(authorized_at: str | None) -> str:
+    """解析路径授权时间戳，缺省回填当前 UTC ISO 串。"""
+    return authorized_at if authorized_at is not None else utc_now_iso()
 
 
 def validate_graph_edit_commit(commit: Any) -> bool:
@@ -179,12 +337,16 @@ def validate_recovery_attempt_state(
 class AbstractStateBackend(ABC):
     """SQLite 与 Memory 共用的内部持久化 Interface。
 
-    当前执行只经 commit_job_settlement 追加结算；执行前失败、批量失败与
-    候选移除各自原子提交。写入故障原样传播，调用方提交成功后才发布内存。
-    整表读改写必须使用 replace_queue_atomic；历史清理不触碰编号进度。
+    当前执行只经 ``commit_job_settlement`` 追加结算；执行前/批量失败与
+    候选移除各自原子提交；独占执行权由后端经 ``exclusive_access`` 自治。
+    写入故障原样传播，调用方提交成功后才发布内存；历史清理不触碰编号进度。
     """
 
-    _exec_lock: Any = None
+    # 独占执行权 -----------------------------------------------------
+
+    @abstractmethod
+    def exclusive_access(self) -> AbstractContextManager[None]:
+        """非阻塞取得本后端独占执行权，离开作用域时归还本次取得的锁。"""
 
     # 全量加载 -------------------------------------------------------
 
@@ -197,47 +359,19 @@ class AbstractStateBackend(ABC):
         """加载全部失败档案终态（uid → 失败 meta）。"""
 
     @abstractmethod
-    def load_failure_payloads(self) -> dict[str, dict[str, Any]]:
-        """读取失败档案各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
-
-    @abstractmethod
     def load_cursors(self) -> dict[str, str]:
         """加载全部游标（key → value）。"""
 
-    @abstractmethod
-    def load_queue(self) -> list[dict[str, Any]]:
-        """按 queue_position 升序加载磁盘队列真相。"""
-
     # delta 提交 -----------------------------------------------------
 
-
     @abstractmethod
-    def commit_job_failure(
-        self,
-        job_uid: str,
-        failure_metadata: dict,
-        payload: dict[str, Any] | None = None,
-    ) -> bool:
-        """原子持久化一个失败 job 的 delta（写入失败档案）。
+    def commit_job_failures(self, entries: Sequence[FailureEntry]) -> None:
+        """原子批量写失败档案（单条执行前拒绝 / 死锁 / 级联共用单一原语）。
 
-        单事务效果：failed INSERT/REPLACE uid → failure_metadata；
-        queue DELETE uid；successes DELETE 同名行——重跑任务重试耗尽时旧成功
-        记录作废（最终状态唯一），否则磁盘 successes∩failed 并存破坏互斥。
-        ``payload`` 是原始业务输入快照（补跑自足，无需外部反查）；
-        None 表示本路径无可存快照，保留既有快照不覆盖。
-        成功返回 True；写入故障原样传播，失败时后端保持调用前状态。
-        """
-
-
-    @abstractmethod
-    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> None:
-        """原子批量写失败档案（死锁/级联场景）的 delta。
-
-        单事务效果：failed INSERT/REPLACE 每个 uid → metadata；
-        queue 按 uid 精准 DELETE（剩余条目保持原顺序）；
-        successes 批量 DELETE 同名行（与 commit_job_failure 对称的最终状态唯一）。
-        任一行失败 ⇒ 整体回滚并原样抛出异常，绝不留下「队列已删、档案未落」
-        的半成品失败态。
+        每项为 ``(job_uid, failure_metadata)`` 或 ``(job_uid, failure_metadata, payload)``：
+        单事务效果为 failed INSERT/REPLACE（``payload=None`` 保留既有快照不覆盖）、
+        queue 按 uid 精准 DELETE（剩余条目保持原顺序）、successes 批量 DELETE 同名行
+        （维护 ``successes ∩ failed == ∅``）。空序列幂等无操作；任一行失败则整体回滚并上抛。
         """
 
     @abstractmethod
@@ -248,25 +382,21 @@ class AbstractStateBackend(ABC):
         成功无返回值；失败时队列不变，原始异常继续传播。
         """
 
-
     # 增量入队 -------------------------------------------------------
 
     @abstractmethod
     def enqueue_jobs(self, job_snapshots: list[dict[str, Any]], *, front: bool = False) -> list[str]:
         """批量增量入队：按 front 在队列头/尾插入 job_snapshots（保序），单事务原子。
 
-        跳过与现有队列重复的 uid（含批次内重复，首个存储），返回实际插入
-        的 uid 列表。与 commit_* 的 delta 语义对齐：不做全表重写——运行中
-        run() 的 delta commit 与该入队并发时，不会因全量 save_queue 覆盖而
-        丢失 run() 已提交的变更（写入侧不覆盖，读-改-写窗口仍由
-        ``replace_queue_atomic`` 收敛）。失败时事务回滚并抛异常（不吞）。
+        跳过与现有队列重复的 uid（含批次内重复，首个存储），返回实际插入的 uid 列表；
+        不做全表覆盖，失败时事务回滚并原样抛异常。
         """
 
     # 管理写、一致快照与游标 -----------------------------------------
 
     @abstractmethod
     def load_consistent_snapshot(self) -> dict[str, Any]:
-        """在单一读事务或单锁内原子捕获一致状态快照（含 queue_jobs/successes/failed/failure_payloads/attempts/job_sequences）。"""
+        """在单一读事务或单锁内原子捕获一致状态快照（含 queue_jobs/successes/failed/failure_payloads/cursors/attempts/job_sequences）。"""
 
     @abstractmethod
     def commit_graph_edit(self, commit: GraphEditCommit) -> None:
@@ -282,16 +412,11 @@ class AbstractStateBackend(ABC):
 
     # 尝试轨迹（append-only 旁路观测面）--------------------------------
 
-
     @abstractmethod
     def load_latest_succeeded_finished_at(self, job_uid: str) -> str | None:
         """读取指定 Job 最新一条 success Attempt 的 settled_at；无则返回 None。"""
 
     # 元数据 ---------------------------------------------------------
-
-    @abstractmethod
-    def get_engine_metadata(self, key: str) -> str | None:
-        """读取一条框架级元数据（如 fencing 的 last_run_id）。无则返回 None。"""
 
     @abstractmethod
     def set_engine_metadata(self, key: str, value: str) -> None:
@@ -384,9 +509,26 @@ class AbstractStateBackend(ABC):
 
 __all__ = [
     "AbstractStateBackend",
+    "FailureEntry",
     "GraphEditCommit",
+    "QUEUE_EXECUTION_ID_KEY",
     "RunningAttemptRecovery",
+    "execution_id_matches_run",
+    "is_valid_authorization_target_type",
+    "normalize_authorization_path",
+    "normalize_failure_entries",
+    "public_queue_snapshot",
+    "queue_snapshot_execution_id",
+    "queue_snapshot_with_execution_id",
+    "resolve_authorized_at",
+    "validate_authorization_target_type",
+    "validate_cursor_key",
+    "validate_cursor_value",
     "validate_graph_edit_commit",
+    "validate_mark_job_running_args",
+    "validate_mark_job_running_state",
     "validate_queue_replacement",
     "validate_recovery_attempt_state",
+    "validate_running_settlement_state",
+    "validate_settlement_args",
 ]

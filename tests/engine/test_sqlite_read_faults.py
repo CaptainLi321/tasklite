@@ -141,9 +141,8 @@ def test_public_read_fault_is_original_without_task_failure(tmp_path, monkeypatc
 
 @pytest.mark.parametrize('reader,table', [
     ('load_successes', 'successes'), ('load_failed', 'failed'),
-    ('load_failure_payloads', 'failed'), ('load_cursors', 'cursors'),
-    ('load_queue', 'queue'), ('load_latest_succeeded_finished_at', 'attempts'),
-    ('get_engine_metadata', 'engine_metadata'),
+    ('load_cursors', 'cursors'), ('load_queue_jobs', 'queue'),
+    ('load_consistent_snapshot', 'failed'), ('load_latest_succeeded_finished_at', 'attempts'),
 ])
 def test_backend_read_fault_preserves_original_error(tmp_path, monkeypatch, reader, table):
     backend = SQLiteStateBackend(tmp_path / 'state.db')
@@ -151,7 +150,7 @@ def test_backend_read_fault_preserves_original_error(tmp_path, monkeypatch, read
         monkeypatch,
         lambda action, first, second: action == sqlite3.SQLITE_READ and first == table,
     )
-    args = ('work::one',) if reader in ('load_latest_succeeded_finished_at', 'get_engine_metadata') else ()
+    args = ('work::one',) if reader == 'load_latest_succeeded_finished_at' else ()
     with pytest.raises(sqlite3.DatabaseError) as caught:
         getattr(backend, reader)(*args)
     _assert_original(caught, errors)
@@ -198,8 +197,8 @@ def test_filesystem_fault_preserves_existing_exception_chain(tmp_path, monkeypat
 @pytest.mark.parametrize('reader,table,column', [
     ('load_successes', 'successes', 'metadata'),
     ('load_failed', 'failed', 'metadata'),
-    ('load_failure_payloads', 'failed', 'payload'),
-    ('load_queue', 'queue', 'job_snapshot'),
+    ('load_consistent_snapshot', 'failed', 'payload'),
+    ('load_queue_jobs', 'queue', 'job_snapshot'),
 ])
 def test_corrupt_json_read_preserves_decoder_error(tmp_path, monkeypatch, reader, table, column):
     import json
@@ -207,7 +206,7 @@ def test_corrupt_json_read_preserves_decoder_error(tmp_path, monkeypatch, reader
 
     backend = SQLiteStateBackend(tmp_path / 'state.db')
     backend.enqueue_jobs([Job('work', 'one').to_dict()])
-    backend.commit_job_failure('work::failed', {'message': '业务失败'}, {'key': 'value'})
+    backend.commit_job_failures([('work::failed', {'message': '业务失败'}, {'key': 'value'})])
     with backend._get_conn() as connection:
         if table == 'successes':
             connection.execute("INSERT INTO successes VALUES ('work::success', 'broken')")

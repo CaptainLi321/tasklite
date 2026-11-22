@@ -34,6 +34,10 @@ def _job_snapshot(job_id: str, **overrides: Any) -> dict[str, Any]:
     return data
 
 
+def _pending_queue(backend: SQLiteStateBackend) -> list[dict[str, Any]]:
+    return [row["job"] for row in backend.load_queue_jobs(status="pending")]
+
+
 def _settle_success(
     backend: SQLiteStateBackend,
     job_uid: str,
@@ -44,7 +48,7 @@ def _settle_success(
     **kwargs: Any,
 ) -> None:
     snapshot = next(
-        (job for job in backend.load_queue() if job_uid_from_snapshot(job) == job_uid), None
+        (job for job in _pending_queue(backend) if job_uid_from_snapshot(job) == job_uid), None
     )
     if snapshot is None:
         task_type, job_id = parse_job_uid(job_uid)
@@ -71,7 +75,7 @@ def _settle_success(
 
 
 def _queue_uids(backend: SQLiteStateBackend) -> list[str]:
-    return [job_uid_from_snapshot(j) for j in backend.load_queue()]
+    return [job_uid_from_snapshot(j) for j in _pending_queue(backend)]
 
 
 def _db_snapshot(path) -> tuple[Any, Any, list[str]]:
@@ -218,7 +222,7 @@ class TestSchemaInitAndAcceptance:
     def test_existing_schema_must_remain_complete_and_unmixed(self, tmp_path, change):
         path = tmp_path / "existing.db"
         backend = SQLiteStateBackend(path)
-        backend.commit_job_failure("t::j", {"sentinel": "metadata"}, {"sentinel": "payload"})
+        backend.commit_job_failures([("t::j", {"sentinel": "metadata"}, {"sentinel": "payload"})])
         backend.close()
         with sqlite3.connect(path) as conn:
             conn.execute(change)
@@ -443,7 +447,7 @@ class TestSqliteFaultsCorruptionAndPersistence:
 
         with mock.patch("sqlite3.connect", side_effect=fake_connect):
             with pytest.raises(sqlite3.OperationalError, match="disk full"):
-                backend.commit_job_failure("t::alpha", {"error_message": "boom"})
+                backend.commit_job_failures([("t::alpha", {"error_message": "boom"})])
         assert _queue_uids(backend) == ["t::alpha", "t::beta"]
         assert backend.load_failed() == {}
         backend.close()
@@ -451,7 +455,7 @@ class TestSqliteFaultsCorruptionAndPersistence:
     def test_unserializable_payload_propagates_and_rolls_back(self, tmp_path):
         backend = SQLiteStateBackend(tmp_path / "state.db")
         with pytest.raises(TypeError):
-            backend.commit_job_failure("t::one", {"error_message": "x"}, payload={"bad": object()})
+            backend.commit_job_failures([("t::one", {"error_message": "x"}, {"bad": object()})])
         assert backend.load_failed() == {}
         backend.close()
 
@@ -467,7 +471,7 @@ class TestSqliteFaultsCorruptionAndPersistence:
             conn.execute("DELETE FROM successes")
             conn.execute("INSERT INTO queue (job_uid, queue_position, job_snapshot) VALUES (?, ?, ?)", ("bad_q", 0, "not valid json{{{"))
         with pytest.raises(json.JSONDecodeError, match="Expecting value"):
-            backend.load_queue()
+            backend.load_queue_jobs(status="pending")
 
         with sqlite3.connect(path) as conn:
             conn.execute("DELETE FROM queue")
@@ -484,7 +488,7 @@ class TestSqliteFaultsCorruptionAndPersistence:
 
         monkeypatch.setattr(sqlite3, "connect", _locked)
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
-            backend.load_queue()
+            backend.load_queue_jobs(status="pending")
         backend.close()
 
     @pytest.mark.parametrize(
@@ -503,7 +507,7 @@ class TestSqliteFaultsCorruptionAndPersistence:
         self, tmp_path, operation, table
     ):
         backend = SQLiteStateBackend(tmp_path / "state.db")
-        backend.commit_job_failure("t::parent", {"old": True}, {"input": 1})
+        backend.commit_job_failures([("t::parent", {"old": True}, {"input": 1})])
         backend.enqueue_jobs([_job_snapshot("parent"), _job_snapshot("other")])
         backend.set_cursor("remove", "old")
         backend.mark_job_running("t::parent", execution_id="run.1", run_id="run", started_at="start")
@@ -568,9 +572,10 @@ class TestConcurrentMixedWrites:
                     spawned_job_snapshots=[{"task_type": "s", "job_id": f"s{tid}-{k}"}],
                     cursor_updates={f"cur_{tid}": str(k)},
                 )
-                backend.commit_job_failure("shared::uid", {"error_message": "boom"})
-                if not backend.commit_job_failure(f"f::{tid}-{k}", {"error_message": "x"}):
-                    errors.append(f"commit_job_failure returned False (t{tid} k{k})")
+                backend.commit_job_failures([
+                    ("shared::uid", {"error_message": "boom"}),
+                    (f"f::{tid}-{k}", {"error_message": "x"}),
+                ])
         except Exception as e:
             errors.append(f"thread {tid} failed: {e!r}")
 
@@ -647,8 +652,8 @@ class TestInterleavedTwoConnections:
         backend_b = SQLiteStateBackend(db_path)
         try:
             for i in range(20):
-                backend_a.commit_job_failure("t::u", {"round": i})
-                backend_b.commit_job_failure("t::u", {"round": i})
+                backend_a.commit_job_failures([("t::u", {"round": i})])
+                backend_b.commit_job_failures([("t::u", {"round": i})])
 
             failed = backend_a.load_failed()
             assert set(failed) == {"t::u"}

@@ -48,7 +48,6 @@ def _assert_original_error(error, errors):
         current = current.tb_next
     assert original_traceback in tracebacks
     assert any(frame.tb_frame.f_code.co_name == "commit_job_settlement"
-               or frame.tb_frame.f_code.co_name == "commit_job_failure"
                or frame.tb_frame.f_code.co_name == "mark_job_running"
                or frame.tb_frame.f_code.co_name in ("commit_job_failures", "commit_skip")
                for frame in tracebacks)
@@ -68,8 +67,12 @@ def test_sqlite_store_fault_preserves_error_and_all_state(tmp_path, monkeypatch,
     backend.set_cursor("offset", "original")
     if operation not in ("pre_failure", "running"):
         backend.mark_job_running("work::one", execution_id="old.1", run_id="old", started_at=STARTED)
-    state = PipelineState(backend.load_successes(), backend.load_failed(),
-                          backend.load_cursors(), backend.load_queue())
+    state = PipelineState(
+        backend.load_successes(),
+        backend.load_failed(),
+        backend.load_cursors(),
+        [row["job"] for row in backend.load_queue_jobs(status="pending")],
+    )
     store = StateStore(backend, state)
     if operation not in ("pre_failure", "running"):
         state.pop_job(0)
@@ -146,7 +149,7 @@ def test_memory_transaction_fault_preserves_original_error_and_all_state(operati
     bad = {"value": _CopyFailure(original)}
     with pytest.raises(OSError) as caught:
         if operation == "pre_failure":
-            backend.commit_job_failure("work::one", bad)
+            backend.commit_job_failures([("work::one", bad)])
         else:
             kwargs = dict(job_uid="work::one", outcome=operation, attempt_no=1,
                           execution_id="old.1", run_id="old", settled_at=STARTED)
@@ -262,7 +265,12 @@ def test_candidate_transaction_fault_rolls_back_entire_batch(tmp_path, monkeypat
     jobs = [Job("work", name, depends_on=["parent::one"]).to_dict()
             for name in ("one", "two", "tail")]
     backend.enqueue_jobs(jobs)
-    state = PipelineState(backend.load_successes(), backend.load_failed(), {}, backend.load_queue())
+    state = PipelineState(
+        backend.load_successes(),
+        backend.load_failed(),
+        {},
+        [row["job"] for row in backend.load_queue_jobs(status="pending")],
+    )
     store = StateStore(backend, state)
     with backend._get_conn() as connection:
         if fault_kind == "sqlite":
@@ -321,8 +329,8 @@ def test_run_candidate_fault_preserves_pending_without_attempt(tmp_path, monkeyp
             # 已持久化依赖环从加载入口交由死锁仲裁处理。
             store = pipeline._runtime.store
             store.backend.enqueue_jobs([
-                store.normalize_and_validate_job(Job("work", "one", depends_on=["work::two"])),
-                store.normalize_and_validate_job(Job("work", "two", depends_on=["work::one"])),
+                store.normalize_new_job_snapshot(Job("work", "one", depends_on=["work::two"])),
+                store.normalize_new_job_snapshot(Job("work", "two", depends_on=["work::one"])),
             ])
             action = "BEFORE INSERT ON failed WHEN NEW.job_uid = 'work::two'"
         else:

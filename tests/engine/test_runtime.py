@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+from tasklite.models.trigger import BUILTIN_TRIGGER_FUNCTIONS
 
 import threading
 import time
@@ -20,7 +20,6 @@ from tasklite.engine.admission import ImmediateRequeuePolicy, TriggerRegistry
 from tasklite.engine.channel import ExecutionChannel
 from tasklite.engine.config import RunConfig
 
-from tasklite.engine.execution_access import exclusive_state_access
 from tasklite.engine.governor import DeadlockGovernor
 from tasklite.engine.resource import CapacityResource, ResourceManager
 from tasklite.engine.runtime import EngineRuntime
@@ -250,7 +249,6 @@ class RuntimeEnv:
                 channel=ExecutionChannel(),
                 governor=DeadlockGovernor(),
                 trigger_registry=TriggerRegistry(
-                    tasks=self.tasks,
                     functions=BUILTIN_TRIGGER_FUNCTIONS,
                 ),
                 requeue_policy=ImmediateRequeuePolicy(),
@@ -334,7 +332,7 @@ class TestEngineRuntimeExecutionLifecycle:
             assert env.runtime.execute() is None
 
         assert "t::j1" in env.backend.load_successes()
-        assert env.backend.load_queue() == []
+        assert env.backend.load_queue_jobs(status="pending") == []
         records = env.backend.load_settled_attempts("t::j1")
         assert records[-1]["outcome"] == "success"
 
@@ -378,7 +376,7 @@ class TestEngineRuntimeExecutionLifecycle:
         with pytest.raises(TaskLiteError, match="not picklable"):
             env.runtime.execute()
         assert not env.runtime.is_running
-        with exclusive_state_access(env.backend):
+        with env.backend.exclusive_access():
             pass
 
         # 预检故障不留残留状态：同实例复跑仍稳定 fail-loud 且逐次复位
@@ -394,22 +392,10 @@ class TestEngineRuntimeExecutionLifecycle:
 
     @pytest.mark.parametrize("persistent", [False, True])
     def test_concurrent_run_lock_rejection(self, tmp_path, persistent):
-        from tasklite.utils.lockfile import release_lock, try_acquire_lock
-
         env = RuntimeEnv(tmp_path, name="test_lock", persistent=persistent)
-        if persistent:
-            lock_fd = try_acquire_lock(env.backend.path)
-            assert lock_fd is not None
-        else:
-            assert env.backend._exec_lock.acquire(blocking=False)
-        try:
+        with env.backend.exclusive_access():
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 env.runtime.execute()
-        finally:
-            if persistent:
-                release_lock(lock_fd)
-            else:
-                env.backend._exec_lock.release()
         assert env.runtime.execute() is None
         env.backend.close()
 
@@ -425,7 +411,7 @@ class TestEngineRuntimeInitFailureSafety:
     def test_lock_env_failure_resets_running_and_allows_rerun(self, tmp_path, monkeypatch):
         """锁获取抛 OSError（权限/磁盘满类环境故障）后标志复位、锁无
         泄漏、可复跑。"""
-        import tasklite.engine.execution_access as access_module
+        import tasklite.backend.sqlite_backend as sqlite_backend_module
 
         env = RuntimeEnv(
             tmp_path, name="test_env_failure", persistent=True,
@@ -434,7 +420,7 @@ class TestEngineRuntimeInitFailureSafety:
         def _raise_env_failure(state_path, *, timeout=0):
             raise OSError(13, "Permission denied")
 
-        monkeypatch.setattr(access_module, "try_acquire_lock", _raise_env_failure)
+        monkeypatch.setattr(sqlite_backend_module, "try_acquire_lock", _raise_env_failure)
         with pytest.raises(OSError):
             env.runtime.execute()
 
@@ -446,7 +432,7 @@ class TestEngineRuntimeInitFailureSafety:
         monkeypatch.undo()
         assert env.runtime.execute() is None
         assert not env.runtime.is_running
-        with exclusive_state_access(env.backend):
+        with env.backend.exclusive_access():
             pass
 
     @pytest.mark.parametrize("persistent", [False, True])
@@ -456,7 +442,7 @@ class TestEngineRuntimeInitFailureSafety:
         def fail_unbind():
             # 收尾仍持执行权，且收尾本身失败也不能泄漏执行权。
             with pytest.raises(TaskLiteError, match="in progress"):
-                with exclusive_state_access(env.backend):
+                with env.backend.exclusive_access():
                     pytest.fail("通知解绑前执行权不能提前归还")
             raise RuntimeError("unbind failed")
 
@@ -465,7 +451,7 @@ class TestEngineRuntimeInitFailureSafety:
             with pytest.raises(RuntimeError, match="unbind failed"):
                 env.runtime.execute()
         assert not env.runtime.is_running
-        with exclusive_state_access(env.backend):
+        with env.backend.exclusive_access():
             pass
         assert env.runtime.execute() is None
         env.backend.close()
@@ -500,7 +486,7 @@ class TestEngineRuntimeInitFailureSafety:
 
         monkeypatch.undo()
         assert not env.runtime.is_running
-        with exclusive_state_access(env.backend):
+        with env.backend.exclusive_access():
             pass
 
         assert env.runtime.execute() is None
@@ -604,7 +590,7 @@ class TestPrepareRunState:
         state = runtime.prepare_run_state()
 
         assert runtime.session.run_id and runtime.session.run_id != "stale"
-        assert env.backend.get_engine_metadata("last_run_id") == runtime.session.run_id
+        assert env.backend._engine_metadata["last_run_id"] == runtime.session.run_id
         assert runtime.session.dispatch_no == 0
         assert runtime.store.state is state
 
@@ -675,7 +661,7 @@ class TestGracefulDraining:
         # DRAINING：in-flight job 完成并进 successes；j2 留磁盘队列
         assert "t::j1" in env.backend.load_successes()
         assert "t::j2" not in env.backend.load_successes()
-        assert any(jd.get("job_id") == "j2" for jd in env.backend.load_queue())
+        assert any(row["job"].get("job_id") == "j2" for row in env.backend.load_queue_jobs(status="pending"))
         attempt, = env.backend.load_settled_attempts("t::j1")
         assert attempt["outcome"] == "success"
         assert env.backend.load_settled_attempts("t::j2") == []

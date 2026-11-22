@@ -10,7 +10,7 @@ import pytest
 
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskLiteError, TaskResult
 from tasklite.testing import authorizer, in_process_workers
-from tasklite.triggers import on_input_change
+from tasklite.models.trigger import on_input_change
 from tasklite.utils.clock import parse_utc_iso_to_us
 
 
@@ -272,7 +272,7 @@ def _run_until_retry_committed(root, ready, release):
         def commit_then_park(**kwargs):
             original_commit(**kwargs)
             if kwargs["outcome"] == "retry":
-                queued = backend.load_queue()
+                queued = [row["job"] for row in backend.load_queue_jobs(status="pending")]
                 assert queued[0]["attempt_no"] == 1
                 ready.set()
                 release.wait(timeout=30)
@@ -576,12 +576,12 @@ def test_legacy_trigger_pending_is_preserved_and_rejected_on_use(tmp_path):
 
     with _pipeline(tmp_path) as reopened:
         reopened.register_task("work", _record_until_success_call)
-        assert reopened._runtime.store.backend.load_queue() == [legacy]
+        assert [row["job"] for row in reopened._runtime.store.backend.load_queue_jobs(status="pending")] == [legacy]
         with pytest.raises(TaskLiteError, match="unregistered trigger 'on_failure'"):
             reopened.run(install_signals=False)
         reopened.stop()
 
-        assert reopened._runtime.store.backend.load_queue() == [legacy]
+        assert [row["job"] for row in reopened._runtime.store.backend.load_queue_jobs(status="pending")] == [legacy]
         with StateSnapshot.open(reopened) as snap:
             assert list(snap.iter_attempts(job_uid="work::legacy")) == []
             assert list(snap.iter_jobs(status="failed")) == []

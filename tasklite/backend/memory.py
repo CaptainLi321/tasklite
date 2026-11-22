@@ -2,35 +2,43 @@
 
 实现 AbstractStateBackend 完整契约，提供零文件系统 IO 的纯内存状态
 存储：瞬态管线、单元测试、沙盒执行。快照隔离的 delta 事务语义与
-SQLite 腿对齐——「校验先行、统一落变」模拟事务回滚：返回 False 或
-抛异常时全部集合与调用前完全一致。
+SQLite 腿对齐——「校验先行、统一落变」模拟事务回滚：抛异常时全部集合
+与调用前完全一致。
 """
 from __future__ import annotations
 
 import copy
 import logging
-import os
 import threading
-from pathlib import Path
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Literal, Mapping, Sequence, cast
 
 from .base import (
     AbstractStateBackend,
+    FailureEntry,
     GraphEditCommit,
     QUEUE_EXECUTION_ID_KEY,
-    RunningAttemptRecovery,
-    execution_id_matches_run,
+    is_valid_authorization_target_type,
+    normalize_authorization_path,
+    normalize_failure_entries,
     public_queue_snapshot,
     queue_snapshot_execution_id,
     queue_snapshot_with_execution_id,
+    resolve_authorized_at,
+    validate_authorization_target_type,
+    validate_cursor_key,
+    validate_cursor_value,
     validate_graph_edit_commit,
-    validate_queue_replacement,
+    validate_mark_job_running_args,
+    validate_mark_job_running_state,
     validate_recovery_attempt_state,
+    validate_running_settlement_state,
+    validate_settlement_args,
 )
 from ..exceptions import TaskLiteError
 from ..models.state import job_uid_from_snapshot
 from ..utils.artifact import TargetType, evaluate_authorization
-from ..utils.clock import utc_now_iso
 
 logger = logging.getLogger("tasklite")
 
@@ -57,6 +65,19 @@ class InMemoryStateBackend(AbstractStateBackend):
         self._job_sequences: dict[str, int] = {}
         self._authorizations: dict[str, dict[str, Any]] = {}
 
+    @contextmanager
+    def exclusive_access(self) -> Iterator[None]:
+        """非阻塞获取内存后端进程内独占执行锁，离开作用域归还。"""
+        if not self._exec_lock.acquire(blocking=False):
+            raise TaskLiteError(
+                "Another run() or management operation is in progress; "
+                "concurrent runs or management operations on the same state are forbidden."
+            )
+        try:
+            yield
+        finally:
+            self._exec_lock.release()
+
     # 全量加载 -------------------------------------------------------
 
     def load_successes(self) -> dict[str, dict[str, Any]]:
@@ -67,68 +88,49 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             return copy.deepcopy(self._failed)
 
-    def load_failure_payloads(self) -> dict[str, dict[str, Any]]:
-        """读取失败档案各 uid 的原始业务 payload 快照（无快照的 uid 不出现）。"""
-        with self._lock:
-            return copy.deepcopy(self._failure_payloads)
-
     def load_cursors(self) -> dict[str, str]:
         with self._lock:
             return dict(self._cursors)
 
-    def load_queue(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return [
-                public_queue_snapshot(j)
-                for j in self._queue if j.get("status", "pending") == "pending"
-            ]
-
     # delta 提交 -----------------------------------------------------
 
-
-    def commit_job_failure(
-        self, job_uid: str, failure_metadata: dict, payload: dict[str, Any] | None = None
-    ) -> bool:
+    def commit_job_failures(self, entries: Sequence[FailureEntry]) -> None:
+        normalized = normalize_failure_entries(entries)
+        if not normalized:
+            return
         with self._lock:
             try:
-                # 校验先行：失败 meta 与 payload 快照的拷贝在变更前完成，
-                # 任一步失败 ⇒ failed/queue/successes 整体不变（对齐 SQLite 回滚）。
-                meta_copy = copy.deepcopy(failure_metadata or {})
-                payload_copy = (
-                    copy.deepcopy(payload) if payload is not None else None
-                )
-                remaining = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
-                self._failed[job_uid] = meta_copy
-                # payload 快照 latest-wins；None 表示本路径无 payload，保留
-                # 既有快照（与 SQLite 腿 _write_failed_row 的保留语义对齐）。
-                if payload_copy is not None:
-                    self._failure_payloads[job_uid] = payload_copy
-                self._queue = remaining
-                # 同一事务语义内清理 successes 旧记录：重跑任务失败时旧成功
-                # 记录作废（最终状态唯一），防 successes∩failed 并存。
-                self._successes.pop(job_uid, None)
-                return True
+                # 所有可失败的复制与队列构造先于统一发布（payload=None 保留既有快照）。
+                staged = [
+                    (
+                        job_uid,
+                        copy.deepcopy(meta or {}),
+                        copy.deepcopy(payload) if payload is not None else None,
+                    )
+                    for job_uid, meta, payload in normalized
+                ]
+                fail_uids = {uid for uid, _, _ in staged}
+                new_failed = dict(self._failed)
+                new_payloads = dict(self._failure_payloads)
+                for uid, meta_copy, payload_copy in staged:
+                    new_failed[uid] = meta_copy
+                    if payload_copy is not None:
+                        new_payloads[uid] = payload_copy
+                new_successes = {
+                    uid: meta for uid, meta in self._successes.items() if uid not in fail_uids
+                }
+                new_queue = [j for j in self._queue if job_uid_from_snapshot(j) not in fail_uids]
+                self._failed = new_failed
+                self._failure_payloads = new_payloads
+                self._successes = new_successes
+                self._queue = new_queue
             except Exception as e:
-                logger.critical(f"Failed to commit job failure for {job_uid}: {e}")
+                logger.critical(f"Failed to commit failure archive entries: {e}")
                 raise
-
-
-    def commit_job_failures(self, job_uids_metadata: list[tuple[str, dict]]) -> None:
-        with self._lock:
-            # 所有可失败的复制与队列构造先于统一发布。
-            entries = [(job_uid, copy.deepcopy(meta or {})) for job_uid, meta in job_uids_metadata]
-            fail_uids = {u for u, _ in entries}
-            remaining = [j for j in self._queue if job_uid_from_snapshot(j) not in fail_uids]
-            failed = self._failed | dict(entries)
-            successes = {uid: meta for uid, meta in self._successes.items() if uid not in fail_uids}
-            self._failed = failed
-            self._successes = successes
-            self._queue = remaining
 
     def commit_skip(self, job_uid: str) -> None:
         with self._lock:
             self._queue = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
-
 
     # 增量入队 -------------------------------------------------------
 
@@ -141,8 +143,6 @@ class InMemoryStateBackend(AbstractStateBackend):
             batch_seen: set[str] = set()
             for j in job_snapshots:
                 u = job_uid_from_snapshot(j)
-                # 批次内重复（同一调用传相同 uid 两次）与队列中已有的
-                # uid 都跳过（首个存储，后续跳过）。
                 if u in existing or u in batch_seen:
                     continue
                 batch_seen.add(u)
@@ -166,7 +166,6 @@ class InMemoryStateBackend(AbstractStateBackend):
             new_attempts = dict(self._attempts)
             new_attempt_seq = self._attempt_seq
 
-            # 1. 复核遗留 running 执行身份并追加失败 Attempt（严格 append-only）
             for rec in commit.recovery_attempts:
                 running = next(
                     (item for item in self._queue if job_uid_from_snapshot(item) == rec.job_uid),
@@ -204,7 +203,6 @@ class InMemoryStateBackend(AbstractStateBackend):
                 }
                 new_attempt_seq += 1
 
-            # 2. 按触碰 uid 构造新三表（未触碰行含遗留 running 原样保留）
             touched_queue_uids = set(commit.queue_writes)
             new_queue = [
                 j for j in self._queue if job_uid_from_snapshot(j) not in touched_queue_uids
@@ -239,7 +237,6 @@ class InMemoryStateBackend(AbstractStateBackend):
                     else:
                         new_failure_payloads.pop(uid, None)
 
-            # 3. 强制复核 successes ∩ failed == ∅ 不变式
             overlap = new_successes.keys() & new_failed.keys()
             if overlap:
                 sample = next(iter(sorted(overlap)))
@@ -247,7 +244,6 @@ class InMemoryStateBackend(AbstractStateBackend):
                     f"Invariant conflict: job {sample!r} cannot exist in both successes and failed"
                 )
 
-            # 4. 一次性原子发布全部引用
             self._attempts = new_attempts
             self._attempt_seq = new_attempt_seq
             self._queue = new_queue
@@ -257,17 +253,14 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     def get_cursor(self, key: str) -> str | None:
         """查询单个游标的最新已提交值，不存在返回 None。"""
-        if not isinstance(key, str) or not key:
-            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
+        validate_cursor_key(key)
         with self._lock:
             return self._cursors.get(key)
 
     def set_cursor(self, key: str, value: str | None) -> None:
         """设置或删除单个游标（None 为删除）。"""
-        if not isinstance(key, str) or not key:
-            raise TypeError(f"cursor key must be a non-empty str, got {key!r}")
-        if value is not None and not isinstance(value, str):
-            raise TypeError(f"cursor value must be str or None, got {type(value).__name__}")
+        validate_cursor_key(key)
+        validate_cursor_value(value)
         with self._lock:
             if value is None:
                 self._cursors.pop(key, None)
@@ -275,7 +268,6 @@ class InMemoryStateBackend(AbstractStateBackend):
                 self._cursors[key] = value
 
     # 尝试轨迹（append-only 旁路观测面）--------------------------------
-
 
     def load_latest_succeeded_finished_at(self, job_uid: str) -> str | None:
         """按 attempt_id 倒序读取指定 Job 最新成功 Attempt 的结算时间。"""
@@ -287,10 +279,6 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     # 元数据 ---------------------------------------------------------
 
-    def get_engine_metadata(self, key: str) -> str | None:
-        with self._lock:
-            return self._engine_metadata.get(key)
-
     def set_engine_metadata(self, key: str, value: str) -> None:
         with self._lock:
             self._engine_metadata[key] = str(value)
@@ -300,25 +288,22 @@ class InMemoryStateBackend(AbstractStateBackend):
     def mark_job_running(
         self, job_uid: str, *, execution_id: str, run_id: str, started_at: str
     ) -> int:
-        if not isinstance(execution_id, str) or not execution_id:
-            raise ValueError("execution_id must be a non-empty str")
-        if not isinstance(run_id, str) or not run_id:
-            raise ValueError("run_id must be a non-empty str")
-        if not execution_id_matches_run(execution_id, run_id):
-            raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
-        if not isinstance(started_at, str) or not started_at:
-            raise ValueError("started_at must be a non-empty str")
+        validate_mark_job_running_args(
+            execution_id=execution_id, run_id=run_id, started_at=started_at
+        )
         with self._lock:
             job_idx = None
             for idx, item in enumerate(self._queue):
                 if job_uid_from_snapshot(item) == job_uid:
                     job_idx = idx
                     break
-            if job_idx is None:
-                raise ValueError(f"Job {job_uid} not found in queue")
+            validate_mark_job_running_state(
+                job_uid,
+                present_in_queue=job_idx is not None,
+                queue_status=self._queue[job_idx].get("status") if job_idx is not None else None,
+            )
+            assert job_idx is not None
             job_data = self._queue[job_idx]
-            if job_data.get("status") == "running":
-                raise ValueError(f"Job {job_uid} is already running")
 
             next_no = self._job_sequences.get(job_uid, 0) + 1
             self._job_sequences[job_uid] = next_no
@@ -336,13 +321,14 @@ class InMemoryStateBackend(AbstractStateBackend):
             return self._job_sequences.get(job_uid, 0)
 
     def load_consistent_snapshot(self) -> dict[str, Any]:
-        """在单锁内原子捕获一致内存状态快照供 StateSnapshot 与 EditTransaction 只读加载。"""
+        """在单锁内原子捕获一致内存状态快照供恢复、入队、StateSnapshot 与 EditTransaction 使用。"""
         with self._lock:
             return {
                 "queue_jobs": self.load_queue_jobs(),
-                "successes": self.load_successes(),
-                "failed": self.load_failed(),
-                "failure_payloads": self.load_failure_payloads(),
+                "successes": copy.deepcopy(self._successes),
+                "failed": copy.deepcopy(self._failed),
+                "failure_payloads": copy.deepcopy(self._failure_payloads),
+                "cursors": dict(self._cursors),
                 # attempts 单条记录入库时已深拷贝不可变，锁内仅浅拷贝外层列表以控制峰值内存；
                 # 查询输出的深拷贝隔离由快照投影核心负责。
                 "attempts": list(self._attempts.values()),
@@ -399,46 +385,40 @@ class InMemoryStateBackend(AbstractStateBackend):
         requeued_job_snapshot: dict[str, Any] | None = None,
         record_attempt: bool = True,
     ) -> None:
-        if outcome not in ("success", "failure", "retry", "pending"):
-            raise ValueError(f"Invalid outcome: {outcome}")
-        if not isinstance(attempt_no, int) or isinstance(attempt_no, bool) or attempt_no < 1:
-            raise TypeError(f"attempt_no must be int >= 1, got {attempt_no!r}")
-        if not isinstance(execution_id, str) or not execution_id:
-            raise ValueError(f"execution_id must be non-empty str, got {execution_id!r}")
-        if not isinstance(run_id, str) or not run_id:
-            raise ValueError(f"run_id must be non-empty str, got {run_id!r}")
-        if not execution_id_matches_run(execution_id, run_id):
-            raise ValueError(f"execution_id {execution_id!r} does not belong to run {run_id!r}")
-        if not isinstance(settled_at, str) or not settled_at:
-            raise ValueError(f"settled_at must be non-empty str, got {settled_at!r}")
-        if started_at is not None and (not isinstance(started_at, str) or not started_at):
-            raise ValueError("started_at must be non-empty str or None")
-        if cursor_updates:
-            for k, v in cursor_updates.items():
-                if not isinstance(k, str) or not k:
-                    raise ValueError(f"cursor key must be a non-empty str, got {k!r}")
-                if v is not None and not isinstance(v, str):
-                    raise TypeError(f"cursor value must be str or None, got {type(v).__name__}")
-        if spawned_job_snapshots:
-            validate_queue_replacement(list(spawned_job_snapshots))
+        validate_settlement_args(
+            outcome=outcome,
+            attempt_no=attempt_no,
+            execution_id=execution_id,
+            run_id=run_id,
+            settled_at=settled_at,
+            started_at=started_at,
+            cursor_updates=cursor_updates,
+            spawned_job_snapshots=spawned_job_snapshots,
+        )
 
         with self._lock:
             running = next(
-                (item for item in self._queue if job_uid_from_snapshot(item) == job_uid), {}
+                (item for item in self._queue if job_uid_from_snapshot(item) == job_uid), None
             )
-            if (
-                running.get("status"),
-                running.get("run_id"),
-                running.get("attempt_no"),
-                queue_snapshot_execution_id(running),
-            ) != ("running", run_id, attempt_no, execution_id):
-                raise TaskLiteError(f"Settlement does not match the running execution for {job_uid}")
-            if any(
+            settled = any(
                 attempt.get("job_uid") == job_uid
                 and attempt.get("attempt_no") == attempt_no
                 for attempt in self._attempts.values()
-            ):
-                raise TaskLiteError(f"Execution for {job_uid} attempt {attempt_no} is already settled")
+            )
+            validate_running_settlement_state(
+                job_uid,
+                present_in_queue=running is not None,
+                queue_status=running.get("status") if running is not None else None,
+                queue_run_id=running.get("run_id") if running is not None else None,
+                queue_attempt_no=running.get("attempt_no") if running is not None else None,
+                queue_execution_id=(
+                    queue_snapshot_execution_id(running) if running is not None else None
+                ),
+                run_id=run_id,
+                attempt_no=attempt_no,
+                execution_id=execution_id,
+                already_settled=settled,
+            )
 
             new_attempts = dict(self._attempts)
             new_attempt_id = self._attempt_seq
@@ -533,7 +513,6 @@ class InMemoryStateBackend(AbstractStateBackend):
                         new_queue[idx] = target
                         break
 
-            # 统一原子落变
             self._attempts = new_attempts
             if record_attempt:
                 self._attempt_seq += 1
@@ -556,23 +535,20 @@ class InMemoryStateBackend(AbstractStateBackend):
         *,
         authorized_at: str | None = None,
     ) -> dict[str, Any]:
-        norm_path = os.path.normpath(os.fspath(path))
-        if target_type not in ("file", "directory"):
-            raise TaskLiteError(
-                f"target_type must be 'file' or 'directory', got {target_type!r}"
-            )
-        ts = authorized_at if authorized_at is not None else utc_now_iso()
+        norm_path = normalize_authorization_path(path)
+        validated_type = validate_authorization_target_type(target_type, error_type=TaskLiteError)
+        ts = resolve_authorized_at(authorized_at)
         with self._lock:
             match = evaluate_authorization(
                 self._existing_auth_pairs(),
                 norm_path,
-                target_type,
+                validated_type,
             )
             if match.grant_conflict is not None:
                 raise TaskLiteError(match.grant_conflict)
             record = {
                 "path": norm_path,
-                "target_type": target_type,
+                "target_type": validated_type,
                 "authorized_at": ts,
             }
             self._authorizations[norm_path] = record
@@ -585,21 +561,20 @@ class InMemoryStateBackend(AbstractStateBackend):
         *,
         authorized_at: str | None = None,
     ) -> None:
-        norm_path = os.path.normpath(os.fspath(path))
-        if target_type not in ("file", "directory"):
-            raise ValueError(f"target_type must be 'file' or 'directory', got {target_type!r}")
-        ts = authorized_at if authorized_at is not None else utc_now_iso()
+        norm_path = normalize_authorization_path(path)
+        validated_type = validate_authorization_target_type(target_type, error_type=ValueError)
+        ts = resolve_authorized_at(authorized_at)
         with self._lock:
             match = evaluate_authorization(
                 self._existing_auth_pairs(),
                 norm_path,
-                cast(TargetType, target_type),
+                validated_type,
             )
             if match.exact_path is not None and match.exact_path != norm_path:
                 self._authorizations.pop(match.exact_path, None)
             self._authorizations[norm_path] = {
                 "path": norm_path,
-                "target_type": target_type,
+                "target_type": validated_type,
                 "authorized_at": ts,
             }
 
@@ -609,7 +584,7 @@ class InMemoryStateBackend(AbstractStateBackend):
             return sorted(records, key=lambda r: (r["authorized_at"], r["path"]))
 
     def revoke_authorization(self, path: str) -> bool:
-        norm_path = os.path.normpath(os.fspath(path))
+        norm_path = normalize_authorization_path(path)
         with self._lock:
             match = evaluate_authorization(self._existing_auth_pairs(), norm_path)
             if match.exact_path is None:
@@ -618,8 +593,8 @@ class InMemoryStateBackend(AbstractStateBackend):
             return True
 
     def is_path_authorized(self, path: str, target_type: str) -> bool:
-        norm_path = os.path.normpath(os.fspath(path))
-        if target_type not in ("file", "directory"):
+        norm_path = normalize_authorization_path(path)
+        if not is_valid_authorization_target_type(target_type):
             return False
         with self._lock:
             return evaluate_authorization(

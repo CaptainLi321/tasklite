@@ -6,6 +6,7 @@
 """
 from .base import (
     AbstractStateBackend,
+    FailureEntry,
     GraphEditCommit,
     RunningAttemptRecovery,
     validate_graph_edit_commit,
@@ -22,6 +23,7 @@ from .sqlite_backend import (
 
 __all__ = [
     "AbstractStateBackend",
+    "FailureEntry",
     "GraphEditCommit",
     "InMemoryStateBackend",
     "RunningAttemptRecovery",

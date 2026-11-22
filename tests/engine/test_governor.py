@@ -310,7 +310,7 @@ class TestGovernorArbitrateDeepChain:
         assert set(store.state.queue_uids) == {f"t::j{i}" for i in range(CHAIN_N)}
         # 持久层同步：仅环成员落失败档案，磁盘队列保留全链
         assert set(backend.load_failed()) == {"t::c0", "t::c1"}
-        assert len(backend.load_queue()) == CHAIN_N
+        assert len(backend.load_queue_jobs(status="pending")) == CHAIN_N
 
 
 class TestSelectionClosedLoopArbitration:

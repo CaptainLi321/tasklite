@@ -1,10 +1,9 @@
 """v2 StateStore: 统一内存状态机与后端持久化事务的深模块。
 
-内敛原子双写一致性、六集合全局互斥与
-依赖图级联分析。单一出口纪律：
+内敛原子双写一致性、六集合全局互斥与依赖图级联分析。单一出口纪律：
 
 - Job 终结事务唯一经由本模块的 apply_* 出口族收敛（成功 / 失败 / 重试 /
-  跳过 / 批量失败 / 级联）——backend commit + 内存镜像 + 统计 + 级联
+  跳过 / 批量失败 / 级联）——backend commit + 内存镜像 + 级联
   在同一出口内对齐，内存永不领先磁盘；
 - 失败终态内存登记唯一经由 ``mark_failed_memory``（successes/failed 互斥的
   单点维护）；
@@ -13,10 +12,10 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
 import copy
 import logging
 import os
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
@@ -24,22 +23,25 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 from ..backend.base import AbstractStateBackend, GraphEditCommit
 from ..exceptions import TaskLiteError
 from ..models.artifact import FileSpec, resolve_file_spec
-from ..models.job import Job, inject_worker_resource
-from ..models.result import validate_strict_json_object
+from ..models.job import Job
+from ..models.records import (
+    build_execution_failure_record,
+    build_execution_success_record,
+    extract_effective_job_config,
+    extract_serializable_payload,
+    normalize_job_intake_snapshot,
+)
 from ..models.state import PipelineState, job_uid_from_snapshot
+from ..models.task import TaskRegistry
 from ..selection import Exclude
 from ..utils.artifact import InspectedPath, PathPolicy
 from ..utils.clock import parse_utc_iso_to_us, utc_now_iso
-from ..utils.jsonutil import dumps
 from .admission import (
     ImmediateRequeuePolicy,
     RequeuePolicy,
     TriggerRegistry,
-    extract_effective_job_config,
     extract_trusted_metadata_timestamp_us,
-    is_trusted_success_metadata,
 )
-from .execution_access import exclusive_state_access
 from .session import RunSession
 
 logger = logging.getLogger("tasklite")
@@ -91,6 +93,7 @@ class StateStore:
         backend: AbstractStateBackend,
         state: PipelineState | None = None,
         *,
+        tasks: TaskRegistry | None = None,
         trigger_registry: TriggerRegistry | None = None,
         requeue_policy: RequeuePolicy | None = None,
         base_dir: str | Path | None = None,
@@ -101,23 +104,26 @@ class StateStore:
     ) -> None:
         self._backend = backend
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
+        self._tasks = tasks
         self._trigger_registry = (
-            trigger_registry
-            if trigger_registry is not None
-            else TriggerRegistry(base_dir=base_dir)
+            trigger_registry if trigger_registry is not None else TriggerRegistry()
         )
         # 重试节奏唯一出口：核心不做任何节奏计算，默认立即重入队。
         self._requeue_policy = (
             requeue_policy if requeue_policy is not None else ImmediateRequeuePolicy()
         )
         self._session = session if session is not None else RunSession()
+
+        fallback_base: str | Path = (
+            base_dir if base_dir is not None else Path(os.path.abspath(os.getcwd()))
+        )
         if path_policy is not None:
-            if protected_roots or state_path is not None:
+            if protected_roots or state_path is not None or path_policy.fixed_base_dir is None:
                 merged_roots = (*path_policy.protected_paths, *protected_roots)
                 effective_base: str | Path = (
                     path_policy.fixed_base_dir
                     if path_policy.fixed_base_dir is not None
-                    else self._trigger_registry.base_dir
+                    else fallback_base
                 )
                 self._path_policy = PathPolicy(
                     base_dir=effective_base,
@@ -129,7 +135,7 @@ class StateStore:
                 self._path_policy = path_policy
         else:
             self._path_policy = PathPolicy(
-                base_dir=self._trigger_registry.base_dir,
+                base_dir=fallback_base,
                 state_path=state_path,
                 protected_roots=protected_roots,
             )
@@ -167,8 +173,9 @@ class StateStore:
 
     @property
     def base_dir(self) -> Path:
-        """当前实例固定的相对路径解析基准目录。"""
-        return self._trigger_registry.base_dir
+        """当前实例固定的相对路径解析基准目录（直接派生自 PathPolicy）。"""
+        assert self._path_policy.fixed_base_dir is not None
+        return Path(self._path_policy.fixed_base_dir)
 
     @property
     def session(self) -> RunSession:
@@ -207,7 +214,6 @@ class StateStore:
                     excluded.add(job.uid)
         return frozenset(excluded)
 
-
     @staticmethod
     def _attempt_error(metadata: Mapping[str, Any]) -> str | None:
         """从失败 meta 提取轨迹行错误串（空串收敛为 None）。"""
@@ -232,15 +238,15 @@ class StateStore:
         self._state.set_cursor(key, value)
 
     def exclusive_access(self) -> AbstractContextManager[None]:
-        """获取底层状态库的独占执行权上下文（供 EditTransaction 等受控协作方调用）。"""
-        return exclusive_state_access(self._backend)
+        """获取底层状态库的独占执行权上下文（委托后端独占执行权契约）。"""
+        return self._backend.exclusive_access()
 
     def load_consistent_snapshot(self) -> dict[str, Any]:
         """在单一读事务或单锁内原子捕获全部核心表一致快照。"""
         return self._backend.load_consistent_snapshot()
 
     def apply_graph_edit(self, commit: GraphEditCommit) -> None:
-        """原子提交图修整事务并在落盘成功后同步内存状态镜像。"""
+        """原子提交图修整事务并在落盘成功后以单次一致快照同步内存状态镜像。"""
         if (
             not commit.queue_writes
             and not commit.success_writes
@@ -249,42 +255,26 @@ class StateStore:
         ):
             return
         self._backend.commit_graph_edit(commit)
+        snap = self._backend.load_consistent_snapshot()
         self._state = PipelineState(
-            self._backend.load_successes(),
-            self._backend.load_failed(),
-            self._backend.load_cursors(),
-            self._backend.load_queue(),
+            snap["successes"],
+            snap["failed"],
+            snap["cursors"],
+            [row["job"] for row in snap["queue_jobs"] if row["status"] == "pending"],
         )
 
-    # ── 摄入管道（enqueue / spawn）──────────────────────────────────
+    # ── 摄入管道（enqueue / spawn / edit add-replace 单一入口）────────
 
     def _require_registered_task(self, task_type: str) -> None:
         """新声明必须对应本实例已注册的 Task。"""
-        tasks = self._trigger_registry.tasks
-        if tasks is None or task_type not in tasks:
+        if self._tasks is None or task_type not in self._tasks:
             raise TaskLiteError(
                 f"unknown task_type {task_type!r} (register the task before "
                 f"submitting its jobs)"
             )
 
-    def normalize_and_validate_job(self, job: Job | dict[str, Any]) -> dict[str, Any]:
-        """捕获完整作业的独立快照并落实摄入规则。"""
-        if isinstance(job, Job):
-            job_snapshot = copy.deepcopy(job.to_dict())
-        elif isinstance(job, dict):
-            if "task_type" not in job or "job_id" not in job:
-                raise TaskLiteError("Job dict must contain 'task_type' and 'job_id'")
-            job_snapshot = copy.deepcopy(job)
-        else:
-            raise TaskLiteError(
-                f"Expected Job or dict, got {type(job).__name__}"
-            )
-
-        self.finalize_intake_snapshot(job_snapshot, str(job_snapshot["task_type"]))
-        return job_snapshot
-
     def normalize_new_job_snapshot(self, job: Job, *, caller: str = "enqueue") -> dict[str, Any]:
-        """解析并校验新声明的有效配置，要求 Task 已注册。"""
+        """摄入唯一入口：校验 Task 已注册，捕获独立快照并落实规格继承、FileSpec 解析与触发器校验。"""
         if not isinstance(job, Job):
             raise TaskLiteError(
                 f"{caller}() expects a Job, got {type(job).__name__}"
@@ -294,42 +284,38 @@ class StateStore:
         self.finalize_intake_snapshot(job_snapshot, job.task_type)
         return job_snapshot
 
-    def normalize_spawned_job(self, job: Job) -> dict[str, Any]:
-        """动态子作业与 enqueue 共用摄入规则，非法声明由父结算整体拒绝。"""
-        self._require_registered_task(job.task_type)
-        job_snapshot = job.to_dict()
-        self.finalize_intake_snapshot(job_snapshot, job.task_type)
-        return job_snapshot
-
     def finalize_intake_snapshot(self, job_snapshot: dict[str, Any], task_type: str) -> None:
-        """校验并隔离 payload 后落实 Trigger 与资源。"""
-        job_snapshot["payload"] = validate_strict_json_object(
-            job_snapshot.get("payload"), field_name="payload"
-        )
-        self._trigger_registry.normalize_job_snapshot(job_snapshot, task_type)
-        inject_worker_resource(job_snapshot)
+        """落实 Task→Job 规格继承、FileSpec 解析、worker 槽位注入与已注册 Trigger 校验。"""
+        task = self._tasks.get(task_type) if self._tasks is not None else None
+        normalize_job_intake_snapshot(job_snapshot, task=task, base_dir=self.base_dir)
+        self._trigger_registry.require_registered(job_snapshot.get("trigger"))
 
     def enqueue_job(self, job: Job) -> bool:
-        """单作业入队摄入管道：解析有效配置、捕获独立快照并校验同 UID 幂等/冲突。"""
+        """单作业入队摄入管道：单次一致快照校验全队列（含 pending/running）同 UID 幂等/冲突与依赖存在性。"""
         job_snapshot = self.normalize_new_job_snapshot(job, caller="enqueue")
         target_uid = job.uid
 
-        for queued in self._backend.load_queue():
-            try:
-                queued_uid = job_uid_from_snapshot(queued)
-            except (KeyError, TypeError, ValueError, TaskLiteError):
-                continue
-            if queued_uid == target_uid:
-                if extract_effective_job_config(queued) == extract_effective_job_config(job_snapshot):
-                    return False
-                raise TaskLiteError(
-                    f"Job {target_uid!r} is already queued with different effective configuration"
-                )
+        queue_rows = self._backend.load_queue_jobs()
 
-        # 依赖引用存在性在提交时检查：只能引用已存在的 Job（队列或当前终态档案）
+        for row in queue_rows:
+            if row.get("job_uid") != target_uid:
+                continue
+            queued = row.get("job")
+            if (
+                isinstance(queued, Mapping)
+                and extract_effective_job_config(queued) == extract_effective_job_config(job_snapshot)
+            ):
+                return False
+            raise TaskLiteError(
+                f"Job {target_uid!r} is already queued with different effective configuration"
+            )
+
+        # 依赖引用存在性按最小读集查验：允许引用全队列（含遗留 running）及终态档案，
+        # 避免扫描无关的 attempts/cursors 表。
         if job.depends_on:
-            queued_snapshots = self._backend.load_queue()
-            existing_uids = {job_uid_from_snapshot(q) for q in queued_snapshots}
+            existing_uids: set[str] = {
+                row["job_uid"] for row in queue_rows if isinstance(row.get("job_uid"), str)
+            }
             existing_uids.update(self._backend.load_successes().keys())
             existing_uids.update(self._backend.load_failed().keys())
             for dep in job.depends_on:
@@ -337,6 +323,7 @@ class StateStore:
                     raise TaskLiteError(
                         f"Job {job.uid!r} references non-existent dependency {dep!r} in depends_on"
                     )
+
         inserted = self._backend.enqueue_jobs([job_snapshot])
         if inserted and target_uid not in self._state.queue_uids:
             self._state.spawn_jobs([copy.deepcopy(job_snapshot)], front=False)
@@ -368,13 +355,7 @@ class StateStore:
     def trusted_last_succeeded_at_us(
         self, job_uid: str, *, success_metadata: Mapping[str, Any] | None = None
     ) -> int | None:
-        """可信成功基线（整数微秒）：无可信档案则返回 None（调用方保守执行）。
-
-        不变式：基线只取自同事务提交的 attempts succeeded 行；先以 successes
-        档案框架元数据（seed 的空字典、缺键或坏值一律不可信）为闸门，且校验
-        successes 框架时间戳与 attempts 实际完成时间戳严格一致，防止
-        移除 successes 后残留的旧 attempts 成功行被拼接成伪基线。
-        """
+        """可信成功基线（整数微秒）：无可信档案则返回 None（调用方保守执行）。"""
         if success_metadata is None:
             success_metadata = self._state.successes.get(job_uid)
         meta_ts = extract_trusted_metadata_timestamp_us(success_metadata)
@@ -396,12 +377,7 @@ class StateStore:
     def mark_failed_memory(
         self, job_uid: str, metadata: dict[str, Any], *, unregister: bool = True
     ) -> None:
-        """失败终态内存登记的唯一尾段（successes/failed 互斥单点维护）。
-
-        独立复制框架档案，再落 failed 集合——state.mark_failed
-        同步摘除 successes 同名行（成功/失败互删语义）；``unregister=False``
-        供批量崩溃契约路径先登记、由调用方统一处置在途集合。
-        """
+        """失败终态内存登记的唯一尾段（successes/failed 互斥单点维护）。"""
         normalized = copy.deepcopy(metadata)
         self._state.mark_failed(job_uid, normalized)
         if unregister:
@@ -409,8 +385,7 @@ class StateStore:
 
     @property
     def state(self) -> PipelineState:
-        """底层 PipelineState 引用（内存状态唯一访问路径，供调度器/
-        恢复编排层/机器群直读）。"""
+        """底层 PipelineState 引用（内存状态唯一访问路径）。"""
         return self._state
 
     @property
@@ -423,12 +398,7 @@ class StateStore:
         self._state = state if state is not None else PipelineState({}, {}, {}, [])
 
     def set_backend(self, backend: AbstractStateBackend) -> None:
-        """换库唯一锚点：backend 所有权归 StateStore 单持。
-
-        不变式：本方法是全引擎唯一的后端重绑定点——其余组件（runtime /
-        门面管理面）一律经 ``store.backend`` 只读派生，换库一处
-        动作、全部持有者必然同步。
-        """
+        """换库唯一锚点：backend 所有权归 StateStore 单持。"""
         self._backend = backend
 
     # ── 路径授权管理与判定 ──────────────────────────────────────────
@@ -439,10 +409,6 @@ class StateStore:
             return self._path_policy.inspect(path, mode="lookup")
         except ValueError as exc:
             raise TaskLiteError(str(exc)) from exc
-
-    def _authorization_target(self, path: str | Path) -> Path:
-        """固定基准解析父路径，保留叶目录项以免断链授权漂移到缺失目标。"""
-        return Path(self._inspect_lookup(path).canonical_path)
 
     def is_path_protected(self, path: str | Path) -> bool:
         """检查路径是否与受保护路径集合（含 state_path 5 项）双向重叠。"""
@@ -537,39 +503,19 @@ class StateStore:
     ) -> SuccessOutcome:
         """原子终态转移：成功（同事务终结对应 attempts 行 + successes 落盘 + 清失败档案残行 + 子任务/cursor）。"""
         effective_finished_at = finished_at if finished_at is not None else utc_now_iso()
-        success_metadata = self._execution_record(result, files)
-        success_metadata.update(
-            run_id=run_id or "run", attempt_no=attempt_no,
-            started_at=started_at, settled_at=effective_finished_at,
-        )
-        artifacts_manifest: dict[str, dict[str, str]] = {}
-        if declared_artifacts:
-            for name, spec_or_path in declared_artifacts.items():
-                path_val = spec_or_path.path if isinstance(spec_or_path, FileSpec) else spec_or_path
-                if isinstance(name, str) and name and isinstance(path_val, str) and path_val:
-                    artifacts_manifest[name] = {"path": path_val}
-        success_metadata["artifacts"] = artifacts_manifest
-        success_metadata["last_succeeded_at"] = effective_finished_at
-        if run_id is not None:
-            success_metadata["last_success_run_id"] = run_id
-        if job_snapshot is not None:
-            success_metadata["job_snapshot"] = copy.deepcopy(job_snapshot)
-        if declared_inputs:
-            input_paths = list(dict.fromkeys(
-                path for path in declared_inputs if isinstance(path, str) and path
-            ))
-            if input_paths:
-                success_metadata["inputs"] = input_paths
-
-        # 增量记录 success_count（防御非 int 脏数据；重跑成功从对侧终态续数）
         prev_meta = self._state.successes.get(job_uid) or self._state.failed.get(job_uid)
-        prev_count = 0
-        if isinstance(prev_meta, dict):
-            try:
-                prev_count = int(prev_meta.get("success_count", 0))
-            except (TypeError, ValueError):
-                prev_count = 0
-        success_metadata["success_count"] = prev_count + 1
+        success_metadata = build_execution_success_record(
+            result=result,
+            files=files,
+            run_id=run_id,
+            attempt_no=attempt_no,
+            started_at=started_at,
+            settled_at=effective_finished_at,
+            declared_inputs=declared_inputs,
+            declared_artifacts=declared_artifacts,
+            job_snapshot=job_snapshot,
+            prev_meta=prev_meta,
+        )
 
         spawned_snapshots = list(spawned_job_snapshots)
         self._backend.commit_job_settlement(
@@ -614,20 +560,19 @@ class StateStore:
         execution_id: str | None = None,
     ) -> FailureOutcome:
         """原子终态转移：永久失败（进入失败档案 + successes 互删 + 级联下游）。"""
-        normalized_meta = self._failure_record(failure_metadata, job_snapshot)
-        effective_settled_at = settled_at if settled_at is not None else normalized_meta["settled_at"]
-        normalized_meta["settled_at"] = effective_settled_at
-        if result is not None or attempt_no is not None:
-            normalized_meta.update(self._execution_record(
-                result if result is not None else normalized_meta["result"],
-                files if files is not None else normalized_meta["files"],
-            ))
-        if attempt_no is not None:
-            normalized_meta.update(
-                run_id=run_id or "run", attempt_no=attempt_no,
-                started_at=started_at, execution_id=execution_id,
-            )
-        payload = self._extract_job_payload(job_snapshot)
+        effective_settled_at = settled_at if settled_at is not None else utc_now_iso()
+        normalized_meta = build_execution_failure_record(
+            failure_metadata,
+            job_snapshot=job_snapshot,
+            settled_at=effective_settled_at,
+            attempt_no=attempt_no,
+            run_id=run_id,
+            started_at=started_at,
+            files=files,
+            result=result,
+            execution_id=execution_id,
+        )
+        payload = extract_serializable_payload(job_snapshot)
         if attempt_no is not None:
             self._backend.commit_job_settlement(
                 job_uid=job_uid,
@@ -645,69 +590,13 @@ class StateStore:
                 payload=payload,
             )
         else:
-            self._backend.commit_job_failure(job_uid, normalized_meta, payload)
+            self._backend.commit_job_failures([(job_uid, normalized_meta, payload)])
 
         self.mark_failed_memory(job_uid, normalized_meta)
         cascaded_uids: list[str] = []
         if cascade:
             cascaded_uids = self.cascade_fail(job_uid)
         return FailureOutcome(job_uid=job_uid, failure_metadata=normalized_meta, cascaded_uids=cascaded_uids)
-
-    @staticmethod
-    def _failure_record(
-        metadata: dict[str, Any], job_snapshot: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        """当前失败档案自足；无对应执行时不得借用历史 Attempt 的事实。"""
-        record = copy.deepcopy(metadata)
-        record.update(
-            settled_at=utc_now_iso(), run_id=None, attempt_no=None, started_at=None,
-            files=copy.deepcopy((job_snapshot or {}).get("files") or {}),
-            result={
-                "message": metadata.get("error_message") or metadata.get("message"),
-                "exception": copy.deepcopy(metadata.get("exception")),
-                "metadata": {},
-                "annotations": copy.deepcopy(metadata.get("annotations") or {}),
-            },
-        )
-        if job_snapshot is not None:
-            record["job_snapshot"] = copy.deepcopy(job_snapshot)
-        return record
-
-    @staticmethod
-    def _execution_record(
-        result: dict[str, Any], files: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        """业务数据只存在于 result.metadata；档案根部仅容纳框架字段。"""
-        result = copy.deepcopy(result)
-        result["annotations"] = {
-            **result.get("annotations", {}), "completion_source": "execution",
-        }
-        return {
-            "result": result,
-            "annotations": {"completion_source": "execution"},
-            "files": copy.deepcopy(files or {}),
-        }
-
-    @staticmethod
-    def _extract_job_payload(job_snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
-        """提取可 JSON 序列化的业务 payload 快照（失败档案落盘用）。
-
-        不可序列化时降级为 None 并告警，不阻断失败提交。
-        """
-        if not isinstance(job_snapshot, dict):
-            return None
-        payload = job_snapshot.get("payload")
-        if not isinstance(payload, dict):
-            return None
-        try:
-            dumps(payload)
-        except (TypeError, ValueError):
-            logger.warning(
-                f"Job payload for {job_snapshot.get('job_id', '?')} is not "
-                f"JSON-serializable; failure archive payload snapshot skipped."
-            )
-            return None
-        return payload
 
     def apply_retry(
         self,
@@ -794,11 +683,7 @@ class StateStore:
         self,
         uids_metas: Sequence[tuple[str, dict[str, Any]]],
     ) -> BulkFailureOutcome:
-        """原子批量失败（死锁归因或批量熔断）；剩余队列由失败集单点派生。
-
-        执行选择激活时按队列行 task_type 过滤被排除/跳过 uid：它们绝不进入
-        失败档案（过滤后为空则直接返回空结果，由运行期选择仲裁收敛）。
-        """
+        """原子批量失败（死锁归因或批量熔断）；剩余队列由失败集单点派生。"""
         excluded_uids = self._selection_excluded_uids()
         if excluded_uids:
             uids_metas = [
@@ -810,7 +695,14 @@ class StateStore:
                 )
         queued = {job_uid_from_snapshot(j): j for j in self._state.queue}
         normalized_metas = [
-            (job_uid, self._failure_record(metadata, queued.get(job_uid)))
+            (
+                job_uid,
+                build_execution_failure_record(
+                    metadata,
+                    job_snapshot=queued.get(job_uid),
+                    settled_at=utc_now_iso(),
+                ),
+            )
             for job_uid, metadata in uids_metas
         ]
         self._backend.commit_job_failures(normalized_metas)
@@ -829,26 +721,25 @@ class StateStore:
         )
 
     def cascade_fail(self, failed_uid: str) -> list[str]:
-        """父作业失败后 O(1) 级联标记全部下游为依赖失败。
-
-        执行选择激活时，被排除作业是传播终止点：不进入级联失败集合，也不
-        向其下游继续传播（下游保持待依赖留队，由后续 run 消费）。
-        """
+        """父作业失败后级联标记全部下游为依赖失败。"""
         excluded_uids = self._selection_excluded_uids()
         cascade_uids = self._state.cascade_fail(
             failed_uid, excluded_uids=excluded_uids
         )
         if excluded_uids:
-            # 兜底过滤：终态写入出口绝不接受被排除 uid（与 DFS 终止点双保险）。
             cascade_uids = [job_uid for job_uid in cascade_uids if job_uid not in excluded_uids]
         if not cascade_uids:
             return []
         queued = {job_uid_from_snapshot(j): j for j in self._state.queue}
         cascade_metas = [
-            (job_uid, self._failure_record(
-                {"error_message": 'Dependency failed or has no record', "failed_dependency": failed_uid},
-                queued.get(job_uid),
-            ))
+            (
+                job_uid,
+                build_execution_failure_record(
+                    {"error_message": 'Dependency failed or has no record', "failed_dependency": failed_uid},
+                    job_snapshot=queued.get(job_uid),
+                    settled_at=utc_now_iso(),
+                ),
+            )
             for job_uid in cascade_uids
         ]
         self._backend.commit_job_failures(cascade_metas)

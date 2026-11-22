@@ -137,14 +137,8 @@ class TestJobUidFromSnapshotAndTerminalRecords:
         st.mark_success("t::w", {})
         st.mark_success("t::w", {"again": True})
         assert st.successes["t::w"] == {"again": True}
-        st.discard_success("t::w")
-        st.discard_success("t::w")
-        assert "t::w" not in st.success_uids
-
         st.mark_failed("t::f", {})
-        st.discard_failed("t::f")
-        st.discard_failed("t::f")
-        assert "t::f" not in st.failed_uids
+        assert "t::f" in st.failed_uids
         st.set_cursor("k", "v")
         assert st.cursors["k"] == "v"
 

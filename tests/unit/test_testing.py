@@ -24,7 +24,7 @@ from tasklite.testing import (
     running,
     spawned_jobs,
 )
-from tasklite.triggers import BUILTIN_TRIGGER_FUNCTIONS
+from tasklite.models.trigger import BUILTIN_TRIGGER_FUNCTIONS
 
 
 def _job(task_type="fetch", job_id="j1"):
