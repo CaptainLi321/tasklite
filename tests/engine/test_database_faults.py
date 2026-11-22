@@ -58,6 +58,10 @@ def _memory_facts(state):
                           state._in_flight_uids))
 
 
+def _settled_attempts(backend, uid: str) -> list[dict]:
+    return [a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == uid]
+
+
 @pytest.mark.parametrize("operation", ["success", "failure", "retry", "pending", "pre_failure", "running"])
 @pytest.mark.parametrize("fault_kind", ["sqlite", "os"])
 def test_sqlite_store_fault_preserves_error_and_all_state(tmp_path, monkeypatch, operation, fault_kind):
@@ -67,11 +71,12 @@ def test_sqlite_store_fault_preserves_error_and_all_state(tmp_path, monkeypatch,
     backend.set_cursor("offset", "original")
     if operation not in ("pre_failure", "running"):
         backend.mark_job_running("work::one", execution_id="old.1", run_id="old", started_at=STARTED)
+    snap = backend.load_consistent_snapshot()
     state = PipelineState(
-        backend.load_successes(),
-        backend.load_failed(),
-        backend.load_cursors(),
-        [row["job"] for row in backend.load_queue_jobs(status="pending")],
+        snap["successes"],
+        snap["failed"],
+        snap["cursors"],
+        [row["job"] for row in snap["queue_jobs"] if row["status"] == "pending"],
     )
     store = StateStore(backend, state)
     if operation not in ("pre_failure", "running"):
@@ -126,7 +131,7 @@ def test_sqlite_store_fault_preserves_error_and_all_state(tmp_path, monkeypatch,
     monkeypatch.setattr(backend, "_get_conn", original_get_conn)
     with backend._get_conn() as connection:
         assert list(connection.iterdump()) == before_disk
-    assert backend.load_settled_attempts("work::one") == []
+    assert _settled_attempts(backend, "work::one") == []
 
 
 class _CopyFailure:
@@ -199,7 +204,7 @@ def test_predispatch_database_fault_propagates_without_attempt(tmp_path, monkeyp
         # Run 身份在派发前独立提交，不属于失败结算事务。
         assert [line for line in after if not line.startswith('INSERT INTO "engine_metadata"')] == before
         assert backend.load_queue_jobs()[0]["status"] == "pending"
-        assert backend.load_settled_attempts("work::downstream") == []
+        assert _settled_attempts(backend, "work::downstream") == []
         assert pipeline._runtime.store.state.failed == {}
 
 
@@ -240,22 +245,22 @@ def test_run_settlement_fault_preserves_original_identity_and_recovers(tmp_path,
         running, = backend.load_queue_jobs()
         assert running["status"] == "running"
         assert running["job"] == submitted
-        assert backend.load_settled_attempts(job.uid) == []
+        assert _settled_attempts(backend, job.uid) == []
         assert backend.load_successes() == backend.load_failed() == {}
-        assert backend.load_cursors() == {"offset": "original"}
+        assert backend.load_consistent_snapshot()["cursors"] == {"offset": "original"}
         state = pipeline._runtime.store.state
         assert state.successes == state.failed == {}
         assert state.cursors == {"offset": "original"}
         with backend._get_conn() as connection:
             connection.execute("DROP TRIGGER reject_settlement")
         pipeline.run(install_signals=False)
-        attempt, = backend.load_settled_attempts(job.uid)
+        attempt, = _settled_attempts(backend, job.uid)
         assert (attempt["outcome"], attempt["run_id"], attempt["attempt_no"], attempt["job"]) == (
             "failure", running["run_id"], running["attempt_no"], running["job"],
         )
         pipeline.run(install_signals=False)
-        assert backend.load_settled_attempts(job.uid) == [attempt]
-        assert backend.load_cursors() == {"offset": "original"}
+        assert _settled_attempts(backend, job.uid) == [attempt]
+        assert backend.load_consistent_snapshot()["cursors"] == {"offset": "original"}
 
 
 @pytest.mark.parametrize("operation", ["bulk", "cascade", "skip"])
@@ -305,7 +310,7 @@ def test_candidate_transaction_fault_rolls_back_entire_batch(tmp_path, monkeypat
     with backend._get_conn() as connection:
         assert list(connection.iterdump()) == before_disk
     assert _memory_facts(state) == before_memory
-    assert all(backend.load_settled_attempts(f"work::{name}") == []
+    assert all(_settled_attempts(backend, f"work::{name}") == []
                    for name in ("one", "two", "tail"))
 
 
@@ -348,7 +353,7 @@ def test_run_candidate_fault_preserves_pending_without_attempt(tmp_path, monkeyp
         _assert_original_error(caught.value, errors)
         assert backend.load_queue_jobs() == before_queue
         assert backend.load_successes() == backend.load_failed() == {}
-        assert all(backend.load_settled_attempts(f"work::{name}") == []
+        assert all(_settled_attempts(backend, f"work::{name}") == []
                    for name in ("one", "two", "tail"))
         assert pipeline._runtime.store.state.failed == {}
         assert pipeline._runtime.store.state.queue_uids == {
@@ -356,22 +361,19 @@ def test_run_candidate_fault_preserves_pending_without_attempt(tmp_path, monkeyp
         }
 
 
-def test_memory_skip_construction_fault_preserves_all_state(monkeypatch):
-    import tasklite.backend.memory as memory
-
+def test_memory_skip_construction_fault_preserves_all_state():
     backend = InMemoryStateBackend()
     backend.enqueue_jobs([Job("work", name).to_dict() for name in ("one", "two")])
     before = copy.deepcopy(backend.__dict__ | {"_lock": None, "_exec_lock": None})
     original = OSError("候选队列构造失败")
-    original_uid = memory.job_uid_from_snapshot
 
-    def failing_uid(job):
-        if job["job_id"] == "two":
-            raise original
-        return original_uid(job)
+    class _FailingUid(str):
+        def __ne__(self, other: object) -> bool:
+            if other == "work::two":
+                raise original
+            return super().__ne__(other)
 
-    monkeypatch.setattr(memory, "job_uid_from_snapshot", failing_uid)
     with pytest.raises(OSError) as caught:
-        backend.commit_skip("work::one")
+        backend.commit_skip(_FailingUid("work::one"))
     assert caught.value is original
     assert backend.__dict__ | {"_lock": None, "_exec_lock": None} == before

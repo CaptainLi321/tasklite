@@ -63,7 +63,7 @@ def _start_execution(backend, uid="t::1", execution_id=None, run_id="run_abc"):
     task_type, job_id = uid.split("::", 1)
     backend.enqueue_jobs([Job(task_type, job_id).to_dict()])
     if execution_id is None:
-        execution_id = f"{run_id}.{backend.get_attempt_sequence(uid) + 1}"
+        execution_id = f"{run_id}.{backend.load_consistent_snapshot()['job_sequences'].get(uid, 0) + 1}"
     if not execution_id.startswith(run_id + "."):
         run_id = execution_id.rsplit(".", 1)[0]
     attempt_no = backend.mark_job_running(
@@ -96,7 +96,7 @@ class TestApplySuccess:
         assert "last_succeeded_at" in store.state.successes["process::1"]
         assert store.state.successes["process::1"]["inputs"] == ["/tmp/a.txt"]
         assert "process::1" not in store.state.in_flight_uids
-        (rec,) = backend.load_settled_attempts("process::1")
+        (rec,) = [a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "process::1"]
         assert rec["outcome"] == "success"
         assert rec["settled_at"] == store.state.successes["process::1"]["last_succeeded_at"]
 
@@ -439,7 +439,7 @@ class TestIntakePipeline:
         with pytest.raises(TaskLiteError, match="unknown task_type"):
             store.enqueue_job(job)
         assert backend.load_queue_jobs(status="pending") == []
-        assert backend.load_settled_attempts(job.uid) == []
+        assert [a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == job.uid] == []
 
     def test_enqueue_job_same_uid_idempotent_vs_conflict(self):
         from tasklite import Task, TaskLiteError
@@ -566,13 +566,15 @@ class TestSnapshotAndMembership:
         return StateStore(InMemoryStateBackend(), state)
 
     def test_membership_predicates(self):
-        """成员判定经 store.state 单一访问路径（六集合统一谓词）。"""
+        """成员判定经 store.state 单一访问路径（各集合活索引一致）。"""
         store = self._probe_store()
         assert "w::1" in store.state.successes
         assert "f::1" in store.state.failed
-        assert store.state.is_known("w::1")
-        assert store.state.is_known("q::1")
-        assert not store.state.is_known("unknown::1")
+        assert "q::1" in store.state.queue_uids
+        assert "unknown::1" not in store.state.success_uids
+        assert "unknown::1" not in store.state.failed_uids
+        assert "unknown::1" not in store.state.queue_uids
+        assert "unknown::1" not in store.state.in_flight_uids
         assert store.state.cursors == {"c": "v"}
 
     def test_uid_index_liveness_contract(self):
@@ -647,7 +649,12 @@ class _MutexProbe:
     def apply(self, action: str, i: int) -> None:
         uid = _UID_POOL[i]
         if action == "enqueue":
-            if self.store.state.is_known(uid) or uid in self.store.state.queue_uids:
+            if (
+                uid in self.store.state.success_uids
+                or uid in self.store.state.failed_uids
+                or uid in self.store.state.queue_uids
+                or uid in self.store.state.in_flight_uids
+            ):
                 return
             self.store.state.spawn_jobs([_job_snapshot(uid)], front=False)
         elif action == "success":
@@ -748,7 +755,7 @@ def test_success_metadata_is_separate_from_framework_keys():
     assert stored["success_count"] == 1
     assert stored["last_succeeded_at"] == "2026-05-01T00:00:09+00:00"
     assert stored["last_success_run_id"] == "actual"
-    (rec,) = backend.load_settled_attempts("t::j")
+    (rec,) = [a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "t::j"]
     assert rec["outcome"] == "success"
     assert rec["settled_at"] == "2026-05-01T00:00:09+00:00"
     metadata["nested"]["error"] = "changed"
@@ -835,7 +842,7 @@ def test_artifact_manifest_stays_committed_when_settlement_fails(tmp_path, monke
         )
     assert caught.value is error
     assert store.state.successes == backend.load_successes() == before
-    assert len(backend.load_settled_attempts("t::1")) == 1
+    assert len([a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "t::1"]) == 1
     assert backend.load_queue_jobs()[0]["status"] == "running"
     backend.close()
 
@@ -865,8 +872,9 @@ def test_sqlite_artifact_publication_rolls_back_with_cursor_transaction(tmp_path
             **identity,
         )
     assert store.state.successes == backend.load_successes() == before
-    assert backend.load_cursors() == {}
-    assert len(backend.load_settled_attempts("t::1")) == 1
+    snap = backend.load_consistent_snapshot()
+    assert snap["cursors"] == {}
+    assert len([a for a in snap["attempts"] if a["job_uid"] == "t::1"]) == 1
     (running,) = backend.load_queue_jobs()
     assert running["job_uid"] == "t::1" and running["status"] == "running"
     backend.close()

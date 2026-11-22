@@ -148,8 +148,7 @@ class TestDispatchOutcomeKind:
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert set(env.backend.load_failed()) == {"t::gap", "t::downstream"}
         assert env.backend.load_failed()["t::gap"]["missing_dependency"] == "t::missing"
-        assert env.backend.load_settled_attempts("t::gap") == []
-        assert env.backend.load_settled_attempts("t::downstream") == []
+        assert [a for a in env.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] in ("t::gap", "t::downstream")] == []
 
     def test_stop_keeps_missing_dependency_pending(self, tmp_path):
         env = DispatchEnv(tmp_path)
@@ -194,7 +193,7 @@ class TestDispatchOutcomeKind:
         assert second.worker_wait == 0.0
         assert set(env.store.state.queue_uids) == {"t::authorized", "t::gap"}
         assert env.backend.load_failed() == {}
-        assert env.backend.load_settled_attempts("t::gap") == []
+        assert [a for a in env.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "t::gap"] == []
 
     def test_spawned_entry_carries_running_identity(self, tmp_path, monkeypatch):
         env = DispatchEnv(tmp_path)
@@ -214,7 +213,7 @@ class TestDispatchOutcomeKind:
         assert entry is not None
         assert entry.job_uid == "t::j1"
         assert entry.attempt_no == 1
-        assert env.backend.load_settled_attempts("t::j1") == []
+        assert [a for a in env.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "t::j1"] == []
         assert "t::j1" in env.in_flight
         assert "t::j1" in env.store.state.in_flight_uids
 
@@ -247,7 +246,7 @@ class TestDedupGate:
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert "t::j1" not in env.store.state.queue_uids
-        assert env.backend.load_settled_attempts("t::j1") == []
+        assert [a for a in env.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "t::j1"] == []
 
 
 class TestRejectGates:
@@ -261,7 +260,7 @@ class TestRejectGates:
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
         assert "ghost::j1" in env.store.state.failed
         assert env.store.state.failed["ghost::j1"]["error_message"] == 'No registered handler for task type'
-        records = env.backend.load_settled_attempts("ghost::j1")
+        records = [a for a in env.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "ghost::j1"]
         assert records == []
 
     def test_dep_failed_gate_cascades_downstream(self, tmp_path):
@@ -381,8 +380,9 @@ class TestPreSubmitCleanupAndActiveSignals:
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.NO_CANDIDATE
         assert "t::j1" in env.store.state.queue_uids
-        assert env.backend.get_attempt_sequence(job.uid) == 0
-        assert env.backend.load_settled_attempts(job.uid) == []
+        snap = env.backend.load_consistent_snapshot()
+        assert snap["job_sequences"].get(job.uid, 0) == 0
+        assert [a for a in snap["attempts"] if a["job_uid"] == job.uid] == []
 
 
 
@@ -489,12 +489,13 @@ def test_dispatch_and_settlement_use_current_protocol_only(tmp_path, monkeypatch
     env.stub_channel_spawn(monkeypatch)
     entry = env.dispatch.dispatch_next().entry
     assert entry is not None
-    assert env.backend.get_attempt_sequence(entry.job_uid) == 1
-    assert env.backend.load_settled_attempts(entry.job_uid) == []
+    snap = env.backend.load_consistent_snapshot()
+    assert snap["job_sequences"].get(entry.job_uid, 0) == 1
+    assert [a for a in snap["attempts"] if a["job_uid"] == entry.job_uid] == []
     env.dispatch._completion.complete_job(entry, ExecutionResult(
         success=outcome == "success", retry_requested=outcome == "retry",
     ))
-    (attempt,) = env.backend.load_settled_attempts(entry.job_uid)
+    (attempt,) = [a for a in env.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == entry.job_uid]
     assert attempt["outcome"] == outcome
     assert attempt["run_id"] == entry.run_id
     assert attempt["attempt_no"] == entry.attempt_no == 1
@@ -504,7 +505,7 @@ def test_dispatch_and_settlement_use_current_protocol_only(tmp_path, monkeypatch
         assert second is not None
         assert second.attempt_no == 2
         assert second.execution_id != entry.execution_id
-        assert len(env.backend.load_settled_attempts(entry.job_uid)) == 1
+        assert len([a for a in env.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == entry.job_uid]) == 1
         env.dispatch._completion.complete_job(second, ExecutionResult(success=True))
-        assert [row["attempt_no"] for row in env.backend.load_settled_attempts(entry.job_uid)] == [1, 2]
+        assert [row["attempt_no"] for row in env.backend.load_consistent_snapshot()["attempts"] if row["job_uid"] == entry.job_uid] == [1, 2]
     env.backend.close()

@@ -12,19 +12,18 @@ import logging
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence, cast
 
 from .base import (
     AbstractStateBackend,
     FailureEntry,
     GraphEditCommit,
-    QUEUE_EXECUTION_ID_KEY,
     is_valid_authorization_target_type,
     normalize_authorization_path,
     normalize_failure_entries,
     public_queue_snapshot,
     queue_snapshot_execution_id,
-    queue_snapshot_with_execution_id,
     resolve_authorized_at,
     validate_authorization_target_type,
     validate_cursor_key,
@@ -43,6 +42,19 @@ from ..utils.artifact import TargetType, evaluate_authorization
 logger = logging.getLogger("tasklite")
 
 
+@dataclass
+class _MemoryQueueRow:
+    """纯内存队列结构化行记录（与 SQLite ``queue`` 表列职责逐一对应，不向业务快照混写运行态键）。"""
+
+    job_uid: str
+    job_snapshot: dict[str, Any]
+    status: str = "pending"
+    execution_id: str | None = None
+    run_id: str | None = None
+    attempt_no: int | None = None
+    started_at: str | None = None
+
+
 class InMemoryStateBackend(AbstractStateBackend):
     """纯内存状态后端：单锁串行化 + 深拷贝隔离的快照语义。
 
@@ -58,7 +70,7 @@ class InMemoryStateBackend(AbstractStateBackend):
         self._failed: dict[str, dict[str, Any]] = {}
         self._failure_payloads: dict[str, dict[str, Any]] = {}
         self._cursors: dict[str, str] = {}
-        self._queue: list[dict[str, Any]] = []
+        self._queue: list[_MemoryQueueRow] = []
         self._engine_metadata: dict[str, str] = {}
         self._attempts: dict[int, dict[str, Any]] = {}
         self._attempt_seq = 1
@@ -88,10 +100,6 @@ class InMemoryStateBackend(AbstractStateBackend):
         with self._lock:
             return copy.deepcopy(self._failed)
 
-    def load_cursors(self) -> dict[str, str]:
-        with self._lock:
-            return dict(self._cursors)
-
     # delta 提交 -----------------------------------------------------
 
     def commit_job_failures(self, entries: Sequence[FailureEntry]) -> None:
@@ -119,7 +127,7 @@ class InMemoryStateBackend(AbstractStateBackend):
                 new_successes = {
                     uid: meta for uid, meta in self._successes.items() if uid not in fail_uids
                 }
-                new_queue = [j for j in self._queue if job_uid_from_snapshot(j) not in fail_uids]
+                new_queue = [row for row in self._queue if row.job_uid not in fail_uids]
                 self._failed = new_failed
                 self._failure_payloads = new_payloads
                 self._successes = new_successes
@@ -130,7 +138,7 @@ class InMemoryStateBackend(AbstractStateBackend):
 
     def commit_skip(self, job_uid: str) -> None:
         with self._lock:
-            self._queue = [j for j in self._queue if job_uid_from_snapshot(j) != job_uid]
+            self._queue = [row for row in self._queue if row.job_uid != job_uid]
 
     # 增量入队 -------------------------------------------------------
 
@@ -138,22 +146,32 @@ class InMemoryStateBackend(AbstractStateBackend):
         if not job_snapshots:
             return []
         with self._lock:
-            existing = {job_uid_from_snapshot(j) for j in self._queue}
-            fresh: list[dict[str, Any]] = []
+            existing = {row.job_uid for row in self._queue}
+            fresh: list[_MemoryQueueRow] = []
             batch_seen: set[str] = set()
             for j in job_snapshots:
                 u = job_uid_from_snapshot(j)
                 if u in existing or u in batch_seen:
                     continue
                 batch_seen.add(u)
-                fresh.append(copy.deepcopy(j))
+                fresh.append(
+                    _MemoryQueueRow(
+                        job_uid=u,
+                        job_snapshot=public_queue_snapshot(j),
+                        status=j.get("status", "pending"),
+                        execution_id=queue_snapshot_execution_id(j),
+                        run_id=j.get("run_id"),
+                        attempt_no=j.get("attempt_no"),
+                        started_at=j.get("started_at"),
+                    )
+                )
             if not fresh:
                 return []
             if front:
                 self._queue[0:0] = fresh
             else:
                 self._queue.extend(fresh)
-            return [job_uid_from_snapshot(j) for j in fresh]
+            return [row.job_uid for row in fresh]
 
     # 管理写与查询 --------------------------------------------------
 
@@ -168,7 +186,7 @@ class InMemoryStateBackend(AbstractStateBackend):
 
             for rec in commit.recovery_attempts:
                 running = next(
-                    (item for item in self._queue if job_uid_from_snapshot(item) == rec.job_uid),
+                    (row for row in self._queue if row.job_uid == rec.job_uid),
                     None,
                 )
                 settled = any(
@@ -179,12 +197,10 @@ class InMemoryStateBackend(AbstractStateBackend):
                 validate_recovery_attempt_state(
                     rec,
                     present_in_queue=running is not None,
-                    queue_status=running.get("status") if running is not None else None,
-                    queue_run_id=running.get("run_id") if running is not None else None,
-                    queue_attempt_no=running.get("attempt_no") if running is not None else None,
-                    queue_execution_id=(
-                        queue_snapshot_execution_id(running) if running is not None else None
-                    ),
+                    queue_status=running.status if running is not None else None,
+                    queue_run_id=running.run_id if running is not None else None,
+                    queue_attempt_no=running.attempt_no if running is not None else None,
+                    queue_execution_id=running.execution_id if running is not None else None,
                     attempt_sequence=self._job_sequences.get(rec.job_uid),
                     already_settled=settled,
                 )
@@ -205,16 +221,21 @@ class InMemoryStateBackend(AbstractStateBackend):
 
             touched_queue_uids = set(commit.queue_writes)
             new_queue = [
-                j for j in self._queue if job_uid_from_snapshot(j) not in touched_queue_uids
+                row for row in self._queue if row.job_uid not in touched_queue_uids
             ]
             for uid, snap in commit.queue_writes.items():
                 if snap is not None:
-                    clean = public_queue_snapshot(snap)
-                    clean["status"] = "pending"
-                    clean["run_id"] = None
-                    clean["attempt_no"] = None
-                    clean["started_at"] = None
-                    new_queue.append(clean)
+                    new_queue.append(
+                        _MemoryQueueRow(
+                            job_uid=uid,
+                            job_snapshot=public_queue_snapshot(snap),
+                            status="pending",
+                            execution_id=None,
+                            run_id=None,
+                            attempt_no=None,
+                            started_at=None,
+                        )
+                    )
 
             new_successes = dict(self._successes)
             for uid, meta in commit.success_writes.items():
@@ -293,32 +314,31 @@ class InMemoryStateBackend(AbstractStateBackend):
         )
         with self._lock:
             job_idx = None
-            for idx, item in enumerate(self._queue):
-                if job_uid_from_snapshot(item) == job_uid:
+            for idx, row in enumerate(self._queue):
+                if row.job_uid == job_uid:
                     job_idx = idx
                     break
             validate_mark_job_running_state(
                 job_uid,
                 present_in_queue=job_idx is not None,
-                queue_status=self._queue[job_idx].get("status") if job_idx is not None else None,
+                queue_status=self._queue[job_idx].status if job_idx is not None else None,
             )
             assert job_idx is not None
-            job_data = self._queue[job_idx]
+            current = self._queue[job_idx]
 
             next_no = self._job_sequences.get(job_uid, 0) + 1
             self._job_sequences[job_uid] = next_no
 
-            updated_job = queue_snapshot_with_execution_id(job_data, execution_id)
-            updated_job["status"] = "running"
-            updated_job["run_id"] = run_id
-            updated_job["attempt_no"] = next_no
-            updated_job["started_at"] = started_at
-            self._queue[job_idx] = updated_job
+            self._queue[job_idx] = _MemoryQueueRow(
+                job_uid=current.job_uid,
+                job_snapshot=current.job_snapshot,
+                status="running",
+                execution_id=execution_id,
+                run_id=run_id,
+                attempt_no=next_no,
+                started_at=started_at,
+            )
             return next_no
-
-    def get_attempt_sequence(self, job_uid: str) -> int:
-        with self._lock:
-            return self._job_sequences.get(job_uid, 0)
 
     def load_consistent_snapshot(self) -> dict[str, Any]:
         """在单锁内原子捕获一致内存状态快照供恢复、入队、StateSnapshot 与 EditTransaction 使用。"""
@@ -335,31 +355,21 @@ class InMemoryStateBackend(AbstractStateBackend):
                 "job_sequences": dict(self._job_sequences),
             }
 
-    def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
-        with self._lock:
-            entries: list[dict[str, Any]] = []
-            for att in self._attempts.values():
-                if att.get("job_uid") == job_uid:
-                    entries.append(copy.deepcopy(att))
-            entries.sort(key=lambda x: x.get("attempt_no", 0))
-            return entries
-
     def load_queue_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
             results: list[dict[str, Any]] = []
-            for pos, j in enumerate(self._queue):
-                j_status = j.get("status", "pending")
-                if status is not None and j_status != status:
+            for pos, row in enumerate(self._queue):
+                if status is not None and row.status != status:
                     continue
                 results.append({
-                    "job_uid": job_uid_from_snapshot(j),
+                    "job_uid": row.job_uid,
                     "queue_position": pos,
-                    "job": public_queue_snapshot(j),
-                    "status": j_status,
-                    "execution_id": queue_snapshot_execution_id(j),
-                    "run_id": j.get("run_id"),
-                    "attempt_no": j.get("attempt_no"),
-                    "started_at": j.get("started_at"),
+                    "job": copy.deepcopy(row.job_snapshot),
+                    "status": row.status,
+                    "execution_id": row.execution_id,
+                    "run_id": row.run_id,
+                    "attempt_no": row.attempt_no,
+                    "started_at": row.started_at,
                 })
             return results
 
@@ -398,7 +408,7 @@ class InMemoryStateBackend(AbstractStateBackend):
 
         with self._lock:
             running = next(
-                (item for item in self._queue if job_uid_from_snapshot(item) == job_uid), None
+                (row for row in self._queue if row.job_uid == job_uid), None
             )
             settled = any(
                 attempt.get("job_uid") == job_uid
@@ -408,12 +418,10 @@ class InMemoryStateBackend(AbstractStateBackend):
             validate_running_settlement_state(
                 job_uid,
                 present_in_queue=running is not None,
-                queue_status=running.get("status") if running is not None else None,
-                queue_run_id=running.get("run_id") if running is not None else None,
-                queue_attempt_no=running.get("attempt_no") if running is not None else None,
-                queue_execution_id=(
-                    queue_snapshot_execution_id(running) if running is not None else None
-                ),
+                queue_status=running.status if running is not None else None,
+                queue_run_id=running.run_id if running is not None else None,
+                queue_attempt_no=running.attempt_no if running is not None else None,
+                queue_execution_id=running.execution_id if running is not None else None,
                 run_id=run_id,
                 attempt_no=attempt_no,
                 execution_id=execution_id,
@@ -448,10 +456,11 @@ class InMemoryStateBackend(AbstractStateBackend):
             new_cursors = dict(self._cursors)
 
             if outcome == "success":
-                remaining = [j for j in new_queue if job_uid_from_snapshot(j) != job_uid]
+                remaining = [row for row in new_queue if row.job_uid != job_uid]
                 if spawned_job_snapshots:
-                    remaining_uids = {job_uid_from_snapshot(j) for j in remaining}
+                    remaining_uids = {row.job_uid for row in remaining}
                     seen: set[str] = set()
+                    staged_spawned: list[_MemoryQueueRow] = []
                     for sj in spawned_job_snapshots:
                         suid = job_uid_from_snapshot(sj)
                         if suid in remaining_uids or suid in seen:
@@ -459,10 +468,18 @@ class InMemoryStateBackend(AbstractStateBackend):
                                 f"Spawned job {suid} conflicts with queue for {job_uid}"
                             )
                         seen.add(suid)
-                    for s in reversed(spawned_job_snapshots):
-                        s_copy = copy.deepcopy(s)
-                        s_copy.setdefault("status", "pending")
-                        remaining.insert(0, s_copy)
+                        staged_spawned.append(
+                            _MemoryQueueRow(
+                                job_uid=suid,
+                                job_snapshot=public_queue_snapshot(sj),
+                                status="pending",
+                                execution_id=None,
+                                run_id=None,
+                                attempt_no=None,
+                                started_at=None,
+                            )
+                        )
+                    remaining[0:0] = staged_spawned
                 new_queue = remaining
 
                 new_successes[job_uid] = copy.deepcopy(success_metadata or {})
@@ -477,40 +494,43 @@ class InMemoryStateBackend(AbstractStateBackend):
                             new_cursors[k] = v
 
             elif outcome == "failure":
-                new_queue = [j for j in new_queue if job_uid_from_snapshot(j) != job_uid]
+                new_queue = [row for row in new_queue if row.job_uid != job_uid]
                 new_failed[job_uid] = copy.deepcopy(failure_metadata or {})
                 if payload is not None:
                     new_failure_payloads[job_uid] = copy.deepcopy(payload)
                 new_successes.pop(job_uid, None)
 
             elif outcome == "retry":
-                found = False
-                for idx, j in enumerate(new_queue):
-                    if job_uid_from_snapshot(j) == job_uid:
-                        target = copy.deepcopy(requeued_job_snapshot if requeued_job_snapshot is not None else j)
-                        target["status"] = "pending"
-                        target["run_id"] = None
-                        target["attempt_no"] = target.get("attempt_no") or 1
-                        target["started_at"] = None
-                        target.pop(QUEUE_EXECUTION_ID_KEY, None)
-                        new_queue[idx] = target
-                        found = True
+                for idx, row in enumerate(new_queue):
+                    if row.job_uid == job_uid:
+                        target_snap = (
+                            public_queue_snapshot(requeued_job_snapshot)
+                            if requeued_job_snapshot is not None
+                            else copy.deepcopy(row.job_snapshot)
+                        )
+                        new_queue[idx] = _MemoryQueueRow(
+                            job_uid=row.job_uid,
+                            job_snapshot=target_snap,
+                            status="pending",
+                            execution_id=None,
+                            run_id=None,
+                            attempt_no=None,
+                            started_at=None,
+                        )
                         break
-                if not found and requeued_job_snapshot is not None:
-                    target = copy.deepcopy(requeued_job_snapshot)
-                    target["status"] = "pending"
-                    new_queue.append(target)
 
             elif outcome == "pending":
-                for idx, j in enumerate(new_queue):
-                    if job_uid_from_snapshot(j) == job_uid:
-                        target = copy.deepcopy(j)
-                        target["status"] = "pending"
-                        target["run_id"] = None
-                        target["attempt_no"] = target.get("attempt_no") or 1
-                        target["started_at"] = None
-                        target.pop(QUEUE_EXECUTION_ID_KEY, None)
-                        new_queue[idx] = target
+                for idx, row in enumerate(new_queue):
+                    if row.job_uid == job_uid:
+                        new_queue[idx] = _MemoryQueueRow(
+                            job_uid=row.job_uid,
+                            job_snapshot=copy.deepcopy(row.job_snapshot),
+                            status="pending",
+                            execution_id=None,
+                            run_id=None,
+                            attempt_no=None,
+                            started_at=None,
+                        )
                         break
 
             self._attempts = new_attempts

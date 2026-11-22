@@ -163,7 +163,7 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
         success_metadata={"job_snapshot": first}, failure_metadata={"job_snapshot": first},
     )
     backend.set_cursor("offset", "original")
-    history = backend.load_settled_attempts(uid)
+    history = [a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == uid]
     effect = tmp_path / "worker.txt"
 
     def register(pipeline):
@@ -194,10 +194,11 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
         assert [(row["job_uid"], row["status"]) for row in queue[1:]] == [
             ("child::dependent", "pending"), ("child::independent", "pending"),
         ]
-        assert backend.load_settled_attempts(uid) == history
+        snap_mid = backend.load_consistent_snapshot()
+        assert [a for a in snap_mid["attempts"] if a["job_uid"] == uid] == history
         assert (uid in backend.load_successes()) == (old_outcome == "success")
         assert (uid in backend.load_failed()) == (old_outcome == "failure")
-        assert backend.load_cursors() == {"offset": "original"}
+        assert snap_mid["cursors"] == {"offset": "original"}
 
         observer.execute("DROP TRIGGER reject_cursor")
         observer.execute(
@@ -218,7 +219,8 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
             register(pipeline)
             pipeline.run()
 
-    attempts = backend.load_settled_attempts(uid)
+    snap_final = backend.load_consistent_snapshot()
+    attempts = [a for a in snap_final["attempts"] if a["job_uid"] == uid]
     assert attempts[:1] == history
     assert [(a["run_id"], a["attempt_no"], a["outcome"]) for a in attempts[1:]] == [
         (running["run_id"], 2, "failure"),
@@ -229,9 +231,9 @@ def test_recovery_replaces_previous_terminal_without_replaying(tmp_path, old_out
     assert failures[uid]["job_snapshot"] == current
     assert failures[uid]["reason"] == "unsettled_running_recovery"
     assert failures["child::dependent"]["failed_dependency"] == uid
-    assert backend.load_settled_attempts("child::dependent") == []
+    assert [a for a in snap_final["attempts"] if a["job_uid"] == "child::dependent"] == []
     assert set(backend.load_successes()) == {"child::independent"}
-    assert backend.load_cursors() == {"offset": "original"}
+    assert snap_final["cursors"] == {"offset": "original"}
     assert effect.read_text() == f"{worker_pid}\n"
 
 

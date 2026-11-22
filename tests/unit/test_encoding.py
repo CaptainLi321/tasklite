@@ -22,10 +22,8 @@ from tasklite.models.job import Job
 from tasklite.utils.encoding import (
     CONTENT_ID_ALLOWED,
     EMPTY_SENTINEL,
-    content_fingerprint,
     encode_content_id,
     encode_identifier,
-    encode_job_component,
     make_job_uid,
     parse_job_uid,
     percent_encode,
@@ -203,20 +201,19 @@ def test_encode_identifier_truncation_aligns_percent_escape():
     assert len(res_two) <= 21
 
 
-def test_encode_job_component_delegation_and_invariants():
-    assert encode_job_component("a::b/c\\d") == "a%3A%3Ab%2Fc%5Cd"
-    assert encode_job_component("") == EMPTY_SENTINEL
-    assert "::" not in encode_job_component("x::y")
-    assert encode_job_component("abc-_.123") == "abc-_.123"
+def test_encode_identifier_component_invariants():
+    assert encode_identifier("a::b/c\\d") == "a%3A%3Ab%2Fc%5Cd"
+    assert encode_identifier("") == EMPTY_SENTINEL
+    assert "::" not in encode_identifier("x::y")
+    assert encode_identifier("abc-_.123") == "abc-_.123"
 
 
 def test_encode_family_rejects_non_str_non_none():
-    for fn in (encode_identifier, encode_job_component, encode_content_id):
+    for fn in (encode_identifier, encode_content_id):
         for bad in (123, 1.5, True, b"123", ["123"], ("123",)):
             with pytest.raises(TaskLiteError):
                 fn(bad)  # type: ignore[arg-type]
     assert encode_identifier(None) == EMPTY_SENTINEL
-    assert encode_job_component(None) == EMPTY_SENTINEL
     assert encode_content_id(None) == EMPTY_SENTINEL
     with pytest.raises(TaskLiteError):
         encode_identifier(123, max_len=10)  # type: ignore[arg-type]
@@ -408,40 +405,6 @@ def test_empty_sentinel_outside_image_never_collides(text):
         return
     assert encode_identifier(text) != sentinel_id
     assert encode_content_id(text) != sentinel_cid
-
-
-# ── content_fingerprint：确定性、跨型隔离与序无关 ──────────────────────
-
-
-def test_content_fingerprint_deterministic_and_version_salted():
-    parts = ["encode", "dir/a.mkv", 100, "sub.ass"]
-    a = content_fingerprint(parts, version="2")
-    assert a == content_fingerprint(parts, version="2")
-    assert a != content_fingerprint(parts, version="3")
-    assert a != content_fingerprint(["encode", "dir/a.mkv", 101, "sub.ass"], version="2")
-    assert len(a) == 16
-
-
-def test_content_fingerprint_rejects_type_and_delimiter_collisions():
-    assert content_fingerprint([1, "2"]) != content_fingerprint(["1", 2])
-    assert content_fingerprint(["a\x00"]) != content_fingerprint(["a", ""])
-    assert content_fingerprint(["a\x00s:b"]) != content_fingerprint(["a", "b"])
-    assert content_fingerprint([{"a": 1, "b": 2}]) == content_fingerprint([{"b": 2, "a": 1}])
-
-
-def test_content_fingerprint_nested_containers_order_insensitive():
-    assert content_fingerprint([{"k": {"a": 1, "b": 2}}]) == content_fingerprint(
-        [{"k": {"b": 2, "a": 1}}]
-    )
-    assert content_fingerprint([{"a": [{"x": 1, "y": 2}, "s"]}]) == content_fingerprint(
-        [{"a": [{"y": 2, "x": 1}, "s"]}]
-    )
-    assert content_fingerprint([{"k": {"deep": {"z": 0, "a": [1, {"m": 3, "n": 4}]}}}]) == (
-        content_fingerprint([{"k": {"deep": {"a": [1, {"n": 4, "m": 3}], "z": 0}}}])
-    )
-    assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": {"a": 2}}])
-    assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": {"a": "1"}}])
-    assert content_fingerprint([{"k": {"a": 1}}]) != content_fingerprint([{"k": [["a", 1]]}])
 
 
 # ── make_job_uid / parse_job_uid：透明可逆的 Job 身份 ────────────────

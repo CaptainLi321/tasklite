@@ -117,9 +117,15 @@ class CompletionEnv:
         return entry
 
 
+    def settled_attempts(self, uid: str) -> list[dict]:
+        return [
+            a for a in self.backend.load_consistent_snapshot()["attempts"]
+            if a["job_uid"] == uid
+        ]
+
     def start_execution(self, job):
         self.backend.enqueue_jobs([job.to_dict()])
-        next_no = self.backend.get_attempt_sequence(job.uid) + 1
+        next_no = self.backend.load_consistent_snapshot()["job_sequences"].get(job.uid, 0) + 1
         execution_id = f"{self.session.run_id}.{next_no}"
         attempt_no = self.backend.mark_job_running(
             job.uid, execution_id=execution_id, run_id=self.session.run_id,
@@ -175,7 +181,7 @@ class TestCompleteJobSuccess:
         assert env.store.state.successes["t::j1"]["inputs"] == [str(input_file)]
         assert "t::j1" not in env.store.state.in_flight_uids
         assert not cache_file.exists()
-        attempt, = env.backend.load_settled_attempts("t::j1")
+        attempt, = env.settled_attempts("t::j1")
         assert attempt["outcome"] == "success"
 
     def test_cursor_updates_applied(self, tmp_path):
@@ -226,7 +232,7 @@ class TestCompleteJobFailure:
         assert env.store.state.failed["t::j1"]["error_message"] == "boom"
         assert env.store.state.failed["child::c1"]["error_message"] == "Dependency failed or has no record"
         assert not partial.exists()
-        attempt, = env.backend.load_settled_attempts("t::j1")
+        attempt, = env.settled_attempts("t::j1")
         assert attempt["outcome"] == "failure"
 
 
@@ -246,7 +252,7 @@ class TestRetryBudget:
 
         assert result.will_retry is True
         assert env.store.state.queue[0]["attempt_no"] == 1
-        attempt, = env.backend.load_settled_attempts("t::j1")
+        attempt, = env.settled_attempts("t::j1")
         assert attempt["outcome"] == "retry"
         assert attempt["result"]["message"] == "connection blip"
         assert entry.job.attempt_no == attempt["attempt_no"] == 1
@@ -289,7 +295,7 @@ class TestRetryBudget:
         assert result.will_retry is False
         assert "t::j1" in env.store.state.failed
         assert env.store.state.failed["t::j1"]["error_message"] == 'Retry budget exhausted'
-        attempts = env.backend.load_settled_attempts("t::j1")
+        attempts = env.settled_attempts("t::j1")
         assert [(a["attempt_no"], a["outcome"], a["result"]["message"]) for a in attempts] == [
             (1, "retry", "first failure"), (2, "failure", "second"),
         ]
@@ -448,8 +454,8 @@ class TestSpawnedJobs:
         assert "parent::p1" in env.store.state.failed
         assert "Invalid spawned job" in env.store.state.failed["parent::p1"]["error_message"]
         assert "child::bad" not in env.store.state.failed
-        assert env.backend.load_settled_attempts("child::bad") == []
-        assert env.backend.load_cursors() == {}
+        assert env.settled_attempts("child::bad") == []
+        assert env.backend.load_consistent_snapshot()["cursors"] == {}
         assert env.store.state.queue == []
 
 
@@ -519,7 +525,7 @@ class TestSettleReaped:
         assert "t::j2" in env.store.state.failed
         assert len(env.in_flight) == 0
         assert env.store.state.in_flight_uids == frozenset()
-        assert env.backend.load_settled_attempts("t::j1")[-1]["outcome"] == "success"
+        assert env.settled_attempts("t::j1")[-1]["outcome"] == "success"
 
     def test_settle_reaped_skips_unknown_handle(self, tmp_path):
         env = CompletionEnv(tmp_path)
@@ -609,7 +615,7 @@ def test_symlink_output_settles_failure_without_false_success(tmp_path):
     assert env.backend.load_successes() == {}
     assert job.uid in env.backend.load_failed()
     assert "symlink" in env.backend.load_failed()[job.uid]["error_message"]
-    assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
+    assert env.settled_attempts(job.uid)[0]["outcome"] == "failure"
 
 
 def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, monkeypatch):
@@ -671,7 +677,7 @@ def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success)
         env.completion.complete_job(entry, ExecutionResult(success=success))
     assert env.backend.load_successes() == {}
     assert "cleanup unavailable" in env.backend.load_failed()[job.uid]["error_message"]
-    assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
+    assert env.settled_attempts(job.uid)[0]["outcome"] == "failure"
     assert output.exists()
 
 
@@ -781,7 +787,7 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
     assert env.store.state.queue == []
     assert job.uid in env.backend.load_failed()
     assert "Retry cleanup failed" in env.backend.load_failed()[job.uid]["error_message"]
-    assert env.backend.load_settled_attempts(job.uid)[0]["outcome"] == "failure"
+    assert env.settled_attempts(job.uid)[0]["outcome"] == "failure"
 
 
 def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkeypatch):
@@ -820,7 +826,7 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
     assert first.uid in env.backend.load_failed()
     assert "cleanup denied" in env.backend.load_failed()[first.uid]["error_message"]
     assert not env.store.state.queue
-    assert env.backend.load_settled_attempts(first.uid)[0]["outcome"] == "failure"
+    assert env.settled_attempts(first.uid)[0]["outcome"] == "failure"
     assert env.resources["__workers__"].used == 0
     assert not env.in_flight
 
@@ -841,4 +847,4 @@ def test_inflight_duplicate_spawn_compares_effective_configuration(tmp_path):
     assert parent.uid in env.store.state.failed
     assert "configuration" in env.store.state.failed[parent.uid]["error_message"]
     assert child.uid in env.store.state.in_flight_uids
-    assert env.backend.load_cursors() == {}
+    assert env.backend.load_consistent_snapshot()["cursors"] == {}

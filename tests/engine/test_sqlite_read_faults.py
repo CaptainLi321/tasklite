@@ -136,12 +136,12 @@ def test_public_read_fault_is_original_without_task_failure(tmp_path, monkeypatc
         assert backend.load_queue_jobs() == before_queue
         assert backend.load_successes() == before_successes
         assert backend.load_failed() == {}
-        assert len(backend.load_settled_attempts(job.uid)) == (1 if entry == 'trusted_baseline' else 0)
+        assert len([a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == job.uid]) == (1 if entry == 'trusted_baseline' else 0)
 
 
 @pytest.mark.parametrize('reader,table', [
     ('load_successes', 'successes'), ('load_failed', 'failed'),
-    ('load_cursors', 'cursors'), ('load_queue_jobs', 'queue'),
+    ('get_cursor', 'cursors'), ('load_queue_jobs', 'queue'),
     ('load_consistent_snapshot', 'failed'), ('load_latest_succeeded_finished_at', 'attempts'),
 ])
 def test_backend_read_fault_preserves_original_error(tmp_path, monkeypatch, reader, table):
@@ -150,7 +150,7 @@ def test_backend_read_fault_preserves_original_error(tmp_path, monkeypatch, read
         monkeypatch,
         lambda action, first, second: action == sqlite3.SQLITE_READ and first == table,
     )
-    args = ('work::one',) if reader == 'load_latest_succeeded_finished_at' else ()
+    args = ('work::one',) if reader in ('load_latest_succeeded_finished_at', 'get_cursor') else ()
     with pytest.raises(sqlite3.DatabaseError) as caught:
         getattr(backend, reader)(*args)
     _assert_original(caught, errors)

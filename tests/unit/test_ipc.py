@@ -24,6 +24,8 @@ from tasklite.utils.ipc import (
     PIPE_MSG_RESULT,
     VALID_PIPE_MESSAGE_KINDS,
     WorkerPipeMessage,
+    WorkerPipeReceiver,
+    WorkerPipeSender,
     create_worker_pipe,
     create_worker_reply_pipe,
     decode_handshake_frame,
@@ -32,7 +34,8 @@ from tasklite.utils.ipc import (
 )
 
 
-def _sequential_sender_worker(sender) -> None:
+def _sequential_sender_worker(send_conn, job_uid: str, execution_id: str) -> None:
+    sender = WorkerPipeSender(send_conn, job_uid=job_uid, execution_id=execution_id)
     try:
         sender.send_declare(
             "request",
@@ -44,7 +47,10 @@ def _sequential_sender_worker(sender) -> None:
         sender.close()
 
 
-def _flood_sender_worker(sender, count: int, payload_size: int) -> None:
+def _flood_sender_worker(
+    send_conn, job_uid: str, execution_id: str, count: int, payload_size: int
+) -> None:
+    sender = WorkerPipeSender(send_conn, job_uid=job_uid, execution_id=execution_id)
     blob = "x" * payload_size
     try:
         for idx in range(count):
@@ -64,22 +70,23 @@ def _flood_sender_worker(sender, count: int, payload_size: int) -> None:
         sender.close()
 
 
-def _large_frame_worker(sender, size_bytes: int) -> None:
+def _large_frame_worker(send_conn, job_uid: str, execution_id: str, size_bytes: int) -> None:
+    sender = WorkerPipeSender(send_conn, job_uid=job_uid, execution_id=execution_id)
     try:
         sender.send_result({"status": "success", "blob": "a" * size_bytes})
     finally:
         sender.close()
 
 
-def _partial_frame_crash_worker(sender) -> None:
-    fd = sender._conn.fileno()
+def _partial_frame_crash_worker(send_conn) -> None:
+    fd = send_conn.fileno()
     header = struct.pack("!i", 65536)
     os.write(fd, header + b"partial-corrupt!")
     os._exit(1)
 
 
-def _partial_frame_hold_open_worker(sender, ready_evt, release_evt) -> None:
-    fd = sender._conn.fileno()
+def _partial_frame_hold_open_worker(send_conn, ready_evt, release_evt) -> None:
+    fd = send_conn.fileno()
     header = struct.pack("!i", 65536)
     os.write(fd, header + b"partial-hold")
     ready_evt.set()
@@ -199,10 +206,11 @@ class TestWorkerPipeSpawnTransport:
 
     def test_sequential_delivery_and_idempotent_close(self):
         ctx = mp.get_context("spawn")
-        receiver, sender = create_worker_pipe(ctx, job_uid="t::seq", execution_id="exec_seq_1")
-        proc = ctx.Process(target=_sequential_sender_worker, args=(sender,))
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        receiver = WorkerPipeReceiver(recv_conn, job_uid="t::seq", execution_id="exec_seq_1")
+        proc = ctx.Process(target=_sequential_sender_worker, args=(send_conn, "t::seq", "exec_seq_1"))
         proc.start()
-        sender.close()
+        send_conn.close()
 
         proc.join(timeout=10.0)
         assert proc.exitcode == 0
@@ -210,7 +218,6 @@ class TestWorkerPipeSpawnTransport:
         messages = receiver.drain_to_eof(timeout=5.0)
         receiver.close()
         receiver.close()
-        sender.close()
 
         assert len(messages) == 2
         assert all(isinstance(m, WorkerPipeMessage) for m in messages)
@@ -224,15 +231,18 @@ class TestWorkerPipeSpawnTransport:
 
     def test_backpressure_and_resume(self):
         ctx = mp.get_context("spawn")
-        receiver, sender = create_worker_pipe(
-            ctx,
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        receiver = WorkerPipeReceiver(
+            recv_conn,
             job_uid="t::bp",
             execution_id="exec_bp_1",
             max_queued_messages=2,
         )
-        proc = ctx.Process(target=_flood_sender_worker, args=(sender, 30, 8192))
+        proc = ctx.Process(
+            target=_flood_sender_worker, args=(send_conn, "t::bp", "exec_bp_1", 30, 8192)
+        )
         proc.start()
-        sender.close()
+        send_conn.close()
 
         collected: list[WorkerPipeMessage | Exception] = []
         deadline = time.monotonic() + 15.0
@@ -255,11 +265,14 @@ class TestWorkerPipeSpawnTransport:
 
     def test_four_mib_large_frame(self):
         ctx = mp.get_context("spawn")
-        receiver, sender = create_worker_pipe(ctx, job_uid="t::large", execution_id="exec_large_1")
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        receiver = WorkerPipeReceiver(recv_conn, job_uid="t::large", execution_id="exec_large_1")
         target_bytes = 4 * 1024 * 1024
-        proc = ctx.Process(target=_large_frame_worker, args=(sender, target_bytes))
+        proc = ctx.Process(
+            target=_large_frame_worker, args=(send_conn, "t::large", "exec_large_1", target_bytes)
+        )
         proc.start()
-        sender.close()
+        send_conn.close()
 
         messages = receiver.drain_to_eof(timeout=15.0)
         proc.join(timeout=5.0)
@@ -274,15 +287,19 @@ class TestWorkerPipeSpawnTransport:
 
     def test_kill_sender_when_buffer_full_recovers_cleanly(self):
         ctx = mp.get_context("spawn")
-        receiver, sender = create_worker_pipe(
-            ctx,
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        receiver = WorkerPipeReceiver(
+            recv_conn,
             job_uid="t::kill_full",
             execution_id="exec_kill_full_1",
             max_queued_messages=1,
         )
-        proc = ctx.Process(target=_flood_sender_worker, args=(sender, 500, 32768))
+        proc = ctx.Process(
+            target=_flood_sender_worker,
+            args=(send_conn, "t::kill_full", "exec_kill_full_1", 500, 32768),
+        )
         proc.start()
-        sender.close()
+        send_conn.close()
 
         time.sleep(0.2)
         assert proc.is_alive()
@@ -295,10 +312,11 @@ class TestWorkerPipeSpawnTransport:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe fd semantics")
     def test_partial_frame_sender_exit_reports_error_or_eof_without_hang(self):
         ctx = mp.get_context("spawn")
-        receiver, sender = create_worker_pipe(ctx, job_uid="t::partial", execution_id="exec_partial_1")
-        proc = ctx.Process(target=_partial_frame_crash_worker, args=(sender,))
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        receiver = WorkerPipeReceiver(recv_conn, job_uid="t::partial", execution_id="exec_partial_1")
+        proc = ctx.Process(target=_partial_frame_crash_worker, args=(send_conn,))
         proc.start()
-        sender.close()
+        send_conn.close()
 
         proc.join(timeout=5.0)
         items = receiver.drain_to_eof(timeout=3.0)
@@ -310,15 +328,16 @@ class TestWorkerPipeSpawnTransport:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipe fd semantics")
     def test_close_raises_runtime_error_when_writer_still_alive_on_partial_frame(self):
         ctx = mp.get_context("spawn")
-        receiver, sender = create_worker_pipe(ctx, job_uid="t::hold", execution_id="exec_hold_1")
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        receiver = WorkerPipeReceiver(recv_conn, job_uid="t::hold", execution_id="exec_hold_1")
         ready_evt = ctx.Event()
         release_evt = ctx.Event()
         proc = ctx.Process(
             target=_partial_frame_hold_open_worker,
-            args=(sender, ready_evt, release_evt),
+            args=(send_conn, ready_evt, release_evt),
         )
         proc.start()
-        sender.close()
+        send_conn.close()
 
         assert ready_evt.wait(timeout=5.0)
         try:
@@ -345,9 +364,7 @@ class TestWorkerReplyPipe:
     """Worker 与主进程双向响应管道往返、陈旧帧过滤与 EOF 唤醒。"""
 
     def test_reply_pipe_roundtrip(self):
-        ctx = mp.get_context("spawn")
         w_recv, m_send = create_worker_reply_pipe(
-            ctx,
             job_uid="job-1",
             execution_id="run-1.1",
             run_id="run-1",
@@ -364,9 +381,7 @@ class TestWorkerReplyPipe:
             m_send.close()
 
     def test_reply_pipe_ignores_stale_identity_and_request_then_accepts_correct_reply(self):
-        ctx = mp.get_context("spawn")
         w_recv, m_send = create_worker_reply_pipe(
-            ctx,
             job_uid="job-1",
             execution_id="run-1.2",
             run_id="run-1",
@@ -402,9 +417,7 @@ class TestWorkerReplyPipe:
             m_send.close()
 
     def test_reply_pipe_default_wait_has_no_private_deadline(self):
-        ctx = mp.get_context("spawn")
         w_recv, m_send = create_worker_reply_pipe(
-            ctx,
             job_uid="job-1",
             execution_id="run-1.3",
             run_id="run-1",
@@ -433,9 +446,7 @@ class TestWorkerReplyPipe:
             worker.join(timeout=2.0)
 
     def test_reply_pipe_eof_wakes_default_wait(self):
-        ctx = mp.get_context("spawn")
         w_recv, m_send = create_worker_reply_pipe(
-            ctx,
             job_uid="job-1",
             execution_id="run-1.4",
             run_id="run-1",

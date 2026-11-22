@@ -17,15 +17,13 @@ from __future__ import annotations
 import json
 import logging
 import multiprocessing as mp
-import os
 import queue
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
-from ..exceptions import _ArtifactIOError
 from .jsonutil import dumps, loads
 
 logger = logging.getLogger("tasklite")
@@ -157,8 +155,7 @@ def decode_worker_pipe_message(
 class WorkerPipeSender:
     """Worker 侧单向管道发送端。
 
-    不变式：单连接写操作以进程内线程锁串行化；支持随 WorkerLaunchSpec
-    跨 spawn/fork 序列化传递并在子进程内重建线程锁。
+    不变式：单连接写操作以进程内线程锁串行化；在子进程引导完成连接握手后构造。
     """
 
     def __init__(
@@ -177,25 +174,6 @@ class WorkerPipeSender:
         self.attempt_no = attempt_no
         self._lock = threading.Lock()
         self._closed = False
-
-    def __getstate__(self) -> dict[str, Any]:
-        return {
-            "conn": self._conn,
-            "job_uid": self.job_uid,
-            "execution_id": self.execution_id,
-            "run_id": self.run_id,
-            "attempt_no": self.attempt_no,
-            "closed": self._closed,
-        }
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        self._conn = state["conn"]
-        self.job_uid = state["job_uid"]
-        self.execution_id = state["execution_id"]
-        self.run_id = state.get("run_id")
-        self.attempt_no = state.get("attempt_no")
-        self._closed = state["closed"]
-        self._lock = threading.Lock()
 
     def send_message(self, kind: str, payload: Any) -> None:
         """编码并发送单条信封消息。"""
@@ -459,7 +437,6 @@ class WorkerPipeReceiver:
 
 
 def create_worker_pipe(
-    process_context: Any = None,
     *,
     job_uid: str,
     execution_id: str,
@@ -469,10 +446,7 @@ def create_worker_pipe(
     on_message: Callable[[], None] | None = None,
 ) -> tuple[WorkerPipeReceiver, WorkerPipeSender]:
     """创建一对绑定的单向 (WorkerPipeReceiver, WorkerPipeSender)。"""
-    pipe_fn = getattr(process_context, "Pipe", None)
-    recv_conn, send_conn = (
-        pipe_fn(duplex=False) if callable(pipe_fn) else mp.Pipe(duplex=False)
-    )
+    recv_conn, send_conn = mp.Pipe(duplex=False)
     receiver = WorkerPipeReceiver(
         recv_conn,
         job_uid=job_uid,
@@ -627,7 +601,6 @@ class WorkerReplyReceiver:
 
 
 def create_worker_reply_pipe(
-    process_context: Any = None,
     *,
     job_uid: str,
     execution_id: str,
@@ -635,10 +608,7 @@ def create_worker_reply_pipe(
     attempt_no: int | None = None,
 ) -> tuple[WorkerReplyReceiver, WorkerReplySender]:
     """创建一对绑定的单向回复管道 (WorkerReplyReceiver[worker端], WorkerReplySender[主进程端])。"""
-    pipe_fn = getattr(process_context, "Pipe", None)
-    recv_conn, send_conn = (
-        pipe_fn(duplex=False) if callable(pipe_fn) else mp.Pipe(duplex=False)
-    )
+    recv_conn, send_conn = mp.Pipe(duplex=False)
     receiver = WorkerReplyReceiver(
         recv_conn,
         job_uid=job_uid,

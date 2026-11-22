@@ -60,7 +60,7 @@ def test_startup_recovers_under_exclusive_lock_and_preserves_pending_order(tmp_p
             with pytest.raises(TaskLiteError, match="concurrent runs"):
                 pipeline.run()
             assert backend.load_queue_jobs() == before
-            assert backend.load_settled_attempts("work::orphan") == []
+            assert [a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "work::orphan"] == []
         finally:
             release_lock(lock)
         pipeline.run()
@@ -68,8 +68,9 @@ def test_startup_recovers_under_exclusive_lock_and_preserves_pending_order(tmp_p
     assert seen == ["head", "tail"]
     assert backend.load_queue_jobs() == []
     assert backend.load_failed().keys() == {"work::orphan"}
-    assert backend.load_settled_attempts("work::head") == []
-    assert backend.load_settled_attempts("work::tail") == []
+    atts = backend.load_consistent_snapshot()["attempts"]
+    assert [a for a in atts if a["job_uid"] == "work::head"] == []
+    assert [a for a in atts if a["job_uid"] == "work::tail"] == []
 
 
 class _DoneProcess:
@@ -333,7 +334,7 @@ class TestAbortInFlight:
             # 1. 绝不补提交结果，也不越权清理残留文件
             assert store.backend.load_successes() == {}
             assert store.backend.load_failed() == {}
-            assert store.backend.load_settled_attempts(job.uid) == []
+            assert [a for a in store.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == job.uid] == []
             assert out_file.exists()
 
             # 2. 通道/进程/内存追踪/资源均已完成单口径清理，零双重释放
@@ -354,7 +355,7 @@ class TestAbortInFlight:
             assert job.uid in recovered_state.failed
             assert job.uid not in recovered_state.successes
             assert store.backend.load_queue_jobs() == []
-            (attempt,) = store.backend.load_settled_attempts(job.uid)
+            (attempt,) = [a for a in store.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == job.uid]
             assert attempt["outcome"] == "failure"
             assert attempt["run_id"] == _RUN_ID
             assert attempt["attempt_no"] == attempt_no

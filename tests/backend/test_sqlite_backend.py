@@ -132,7 +132,7 @@ class TestSchemaInitAndAcceptance:
 
         b_second = SQLiteStateBackend(db_path)
         assert b_second.load_successes() == {"t::one": {"ok": True}}
-        assert b_second.load_cursors() == {"c": "v"}
+        assert b_second.load_consistent_snapshot()["cursors"] == {"c": "v"}
         assert _queue_uids(b_second) == ["t::queued"]
         b_second.close()
 
@@ -145,7 +145,7 @@ class TestSchemaInitAndAcceptance:
         backend.set_cursor("error", "new_jobs")
         backend.close()
         reopened = SQLiteStateBackend(path)
-        assert reopened.load_cursors() == {"error": "new_jobs"}
+        assert reopened.load_consistent_snapshot()["cursors"] == {"error": "new_jobs"}
         reopened.close()
         with sqlite3.connect(path) as conn:
             assert conn.execute("PRAGMA user_version").fetchone() == (6,)
@@ -531,19 +531,20 @@ class TestSqliteFaultsCorruptionAndPersistence:
             )
         with sqlite3.connect(backend.path) as conn:
             assert list(conn.iterdump()) == before
-        assert backend.load_settled_attempts("t::parent") == []
-        assert backend.get_attempt_sequence("t::parent") == 1
+        snap = backend.load_consistent_snapshot()
+        assert [a for a in snap["attempts"] if a["job_uid"] == "t::parent"] == []
+        assert snap["job_sequences"].get("t::parent", 0) == 1
         backend.close()
 
     def test_settled_history_persists_across_instances(self, tmp_path):
         path = tmp_path / "state.db"
         backend = SQLiteStateBackend(path)
         _settle_success(backend, "t::parent", {"ok": True})
-        before = backend.load_settled_attempts("t::parent")
+        before = [a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "t::parent"]
         backend.close()
 
         reopened = SQLiteStateBackend(path)
-        assert reopened.load_settled_attempts("t::parent") == before
+        assert [a for a in reopened.load_consistent_snapshot()["attempts"] if a["job_uid"] == "t::parent"] == before
         assert reopened.load_latest_succeeded_finished_at("t::parent") == "2026-05-01T00:00:05+00:00"
         reopened.close()
 

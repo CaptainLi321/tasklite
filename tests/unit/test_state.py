@@ -51,15 +51,6 @@ class TestQueueOrdering:
 class TestSixSetMutex:
     """集合互斥：queue / in-flight / successes / failed 与状态一致性。"""
 
-    def test_is_known_covers_all_four_sources(self):
-        st = PipelineState({"w1": {}}, {"f1": {}}, {}, [_jid("q1")])
-        st.register_in_flight("i1")
-        assert st.is_known("w1")
-        assert st.is_known("f1")
-        assert st.is_known("t::q1")
-        assert st.is_known("i1")
-        assert not st.is_known("ghost")
-
     def test_dispatch_flow_and_overlap_assertion(self):
         st = PipelineState({}, {}, {}, [_jid("x")])
         st.pop_job(0)
@@ -91,14 +82,14 @@ class TestSixSetMutex:
         with pytest.raises(AssertionError, match="both successes and failed"):
             st_bad._assert_state_consistent()
 
-    def test_unregister_clear_and_inverse_transitions(self):
+    def test_unregister_and_inverse_transitions(self):
         st = PipelineState({}, {}, {}, [])
         st.register_in_flight("a")
         st.register_in_flight("b")
         assert st.in_flight_uids == frozenset({"a", "b"})
         st.unregister_in_flight("a")
         assert st.in_flight_uids == frozenset({"b"})
-        st.clear_in_flight()
+        st.unregister_in_flight("b")
         assert st.in_flight_uids == frozenset()
 
         st.mark_failed("t::x", {"error_message": "boom"})

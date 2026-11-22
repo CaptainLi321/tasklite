@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 
 from ..models.result import TaskResult
-from ..utils.encoding import encode_job_component
+from ..utils.encoding import encode_identifier
 from ..utils.jsonutil import dumps as _json_dumps, loads as _json_loads
 
 
@@ -334,7 +334,7 @@ class SnapshotStore:
             raw_bytes = SnapshotStore._body_bytes(body)
             body_hash = f"_{hashlib.sha256(raw_bytes).hexdigest()[:16]}"
 
-        url_component = encode_job_component(norm_url)
+        url_component = encode_identifier(norm_url)
         params_hash = SnapshotStore._params_fingerprint(params)
         header_hash = SnapshotStore._identity_headers_fingerprint(headers)
         return f"{norm_method}::{url_component}{body_hash}{params_hash}{header_hash}"

@@ -56,8 +56,9 @@ class TestEditTransactionThroughStore:
 
         assert backend.load_successes() == {}
         assert backend.load_failed() == {}
-        assert len(backend.load_settled_attempts("t::success")) == 1
-        assert backend.load_cursors() == {"cursor": "value"}
+        snap = backend.load_consistent_snapshot()
+        assert len([a for a in snap["attempts"] if a["job_uid"] == "t::success"]) == 1
+        assert snap["cursors"] == {"cursor": "value"}
         assert [job["job_uid"] for job in backend.load_queue_jobs()] == ["t::queued"]
 
     def test_empty_and_unknown_targets_are_rejected_before_backend_write(self):

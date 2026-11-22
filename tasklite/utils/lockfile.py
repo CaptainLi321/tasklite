@@ -19,13 +19,6 @@ def lock_path_for(state_path: str | Path) -> Path:
     return Path(f"{p}.lock")
 
 
-def _lock_path(directory_or_path: str | Path, name: str | None = None) -> Path:
-    """name → 锁文件路径。若 name 为 None，直接派生锁文件路径。"""
-    if name is None:
-        return lock_path_for(directory_or_path)
-    return Path(directory_or_path) / f"{name}.lock"
-
-
 def _is_lock_contention(exc: OSError) -> bool:
     """判断 OSError 是否属于锁争用（而非无效 fd 或底层 IO 故障）。"""
     if sys.platform == "win32":
@@ -37,12 +30,11 @@ def _is_lock_contention(exc: OSError) -> bool:
 
 
 def try_acquire_lock(
-    directory_or_path: str | Path,
-    name: str | None = None,
+    state_path: str | Path,
     *,
     timeout: float = 0.0,
 ) -> int | None:
-    """尝试获取排他锁（非阻塞或带超时）。
+    """尝试获取状态库排他锁（非阻塞或带超时）。
 
     Returns:
         成功返回 fd（调用方必须 ``release_lock``）；**仅锁被其他进程占用**
@@ -52,7 +44,7 @@ def try_acquire_lock(
         OSError: 锁文件打不开/建不出/IO 故障（权限、磁盘满、无效 fd 等）——与
             「锁被占」语义不同，不得混入 None。
     """
-    path = _lock_path(directory_or_path, name)
+    path = lock_path_for(state_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
     deadline = None if timeout <= 0 else time.monotonic() + timeout

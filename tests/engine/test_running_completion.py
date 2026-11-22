@@ -402,7 +402,7 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
         assert pending["status"] == "pending"
         assert pending["started_at"] is None
         assert list(snapshot.iter_attempts(job_uid="work::one")) == []
-    assert runtime.store.backend.get_attempt_sequence("work::one") == 1
+    assert runtime.store.backend.load_consistent_snapshot()["job_sequences"].get("work::one", 0) == 1
     assert completed == []
     assert releases == [1]
     assert capacity.used == 0
@@ -487,7 +487,7 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
         identities.update({row["job_uid"]: row for row in store.load_queue_jobs(status="running")})
         pairs = {handle.job_uid.split("::")[1]: (handle, result) for handle, result in results}
         original_settle([pairs["committed"], *(pairs[name] for name in cached)])
-        committed.append(store.load_settled_attempts("work::committed"))
+        committed.append([a for a in store.load_consistent_snapshot()["attempts"] if a["job_uid"] == "work::committed"])
         armed.append(True)
         return original_settle([pairs[name] for name in ("fault", "later") if name not in cached])
 
@@ -550,11 +550,13 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
             assert attempt["started_at"] is None
             assert (attempt["run_id"], attempt["attempt_no"]) == (row["run_id"], row["attempt_no"])
             assert snap.get_job(uid)["status"] == "failed"
-    assert store.load_settled_attempts("work::committed") == committed[0]
-    before = {uid: store.load_settled_attempts(uid) for uid in identities}
+    snap_after = store.load_consistent_snapshot()
+    assert [a for a in snap_after["attempts"] if a["job_uid"] == "work::committed"] == committed[0]
+    before = {uid: [a for a in snap_after["attempts"] if a["job_uid"] == uid] for uid in identities}
     with in_process_workers(pipeline):
         pipeline.run(install_signals=False)
-    assert {uid: store.load_settled_attempts(uid) for uid in identities} == before
+    snap_final = store.load_consistent_snapshot()
+    assert {uid: [a for a in snap_final["attempts"] if a["job_uid"] == uid] for uid in identities} == before
     assert (tmp_path / later_name / "child").read_text(encoding="utf-8") == "business"
     pipeline.close()
 

@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from ..exceptions import TaskLiteError
@@ -28,7 +28,7 @@ _UID_SEPARATOR = "::"
 _HEX_DIGITS = frozenset("0123456789ABCDEF")
 
 # 默认禁止字符集（路径分隔符、冒号、转义符本身）
-DEFAULT_FORBIDDEN = "/\\:%"
+_DEFAULT_FORBIDDEN = "/\\:%"
 
 # 内容 ID 允许字符集（仅字母、数字、短横线、下划线、点）
 CONTENT_ID_ALLOWED = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
@@ -57,7 +57,7 @@ _TRUNC_FIXED_LEN = len(_TRUNC_MARKER) + _TRUNC_DIGEST_HEX
 
 def percent_encode(
     text: str,
-    forbidden: str | Sequence[str] | None = DEFAULT_FORBIDDEN,
+    forbidden: str | Sequence[str] | None = _DEFAULT_FORBIDDEN,
     *,
     allowed: str | Sequence[str] | None = None,
 ) -> str:
@@ -85,7 +85,7 @@ def percent_encode(
             else:
                 parts.append("".join(f"%{b:02X}" for b in ch.encode("utf-8")))
     else:
-        forbidden_set = set(forbidden or DEFAULT_FORBIDDEN)
+        forbidden_set = set(forbidden or _DEFAULT_FORBIDDEN)
         for ch in text:
             if ch == _PERCENT_ESCAPE:
                 parts.append(_PERCENT_ESCAPED)
@@ -100,7 +100,7 @@ def encode_identifier(
     value: Any,
     *,
     max_len: int = 120,
-    forbidden: str | Sequence[str] | None = DEFAULT_FORBIDDEN,
+    forbidden: str | Sequence[str] | None = _DEFAULT_FORBIDDEN,
     allowed: str | Sequence[str] | None = None,
     fallback: str = EMPTY_SENTINEL,
 ) -> str:
@@ -151,15 +151,6 @@ def encode_identifier(
     return f"{prefix}{_TRUNC_MARKER}{digest}"
 
 
-def encode_job_component(value: Any, *, max_len: int = 120) -> str:
-    """把任意字符串编码为可作 job_id 成分的串（不删字符）。
-
-    单射契约分级见 encode_identifier：直通域全域单射；截断输出带像集外
-    标记，与直通域结构性不相交，截断域内为 64 位指纹概率防撞。
-    """
-    return encode_identifier(value, max_len=max_len)
-
-
 def encode_content_id(content_id: str | None, *, max_len: int = 120) -> str:
     """按严密 allowlist 编码 content_id（如用于 discovery 子任务派发）。
 
@@ -181,53 +172,6 @@ def encode_content_id(content_id: str | None, *, max_len: int = 120) -> str:
     if all(c in CONTENT_ID_ALLOWED for c in text) and len(text) <= max_len:
         return text
     return encode_identifier(text, max_len=max_len, allowed=CONTENT_ID_ALLOWED)
-
-
-def _fingerprint_token(value: Any) -> str:
-    """指纹项 → 带类型标记的确定性 token。
-
-    类型标记隔离跨型碰撞（1 与 "1" 编码必不同）；repr 把内容中的控制字符
-    （含 \\x00）转义为字面反斜杠序列，token 中不出现裸 \\x00，项内注入
-    定界符伪装项边界的碰撞被结构性排除。dict 递归 token 化后按键 token
-    排序——键 token 含类型标记且对任意不同键必不同，排序仅由键决定；
-    任意嵌套层级（含 dict 作 value）均序无关。
-    """
-    if isinstance(value, bool):
-        return "b" + repr(value)
-    if isinstance(value, int):
-        return "i" + repr(value)
-    if isinstance(value, float):
-        return "f" + repr(value)
-    if isinstance(value, str):
-        return "s" + repr(value)
-    if isinstance(value, dict):
-        return "d" + repr(sorted(
-            (_fingerprint_token(k), _fingerprint_token(v))
-            for k, v in value.items()
-        ))
-    if isinstance(value, (list, tuple)):
-        return "l" + repr([_fingerprint_token(v) for v in value])
-    return "o" + repr(value)
-
-
-def content_fingerprint(
-    parts: Iterable[str | int | float],
-    *,
-    version: str = "",
-) -> str:
-    """内容指纹 → 确定性 job_id 片段（sha1，截 16 位，可读）。
-
-    任何输入变化（含 bump version 盐）→ 指纹变化 → successes 不命中 → 重跑。
-    与「job_id 确定性、禁止随机后缀」红线一致：给定输入恒同指纹。
-    """
-    h = hashlib.sha1()
-    if version:
-        h.update(_fingerprint_token(version).encode("utf-8", errors="replace"))
-        h.update(b"\x00")
-    for p in parts:
-        h.update(_fingerprint_token(p).encode("utf-8", errors="replace"))
-        h.update(b"\x00")
-    return h.hexdigest()[:16]
 
 
 def _encode_uid_component(value: str, field_name: str) -> str:
@@ -326,12 +270,9 @@ def parse_job_uid(uid: str) -> tuple[str, str]:
 
 __all__ = [
     "CONTENT_ID_ALLOWED",
-    "DEFAULT_FORBIDDEN",
     "EMPTY_SENTINEL",
-    "content_fingerprint",
     "encode_content_id",
     "encode_identifier",
-    "encode_job_component",
     "make_job_uid",
     "parse_job_uid",
     "percent_encode",

@@ -166,14 +166,17 @@ def _decode_json_optional_dict(raw: Any) -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
-def _decode_attempt_result(raw_result: Any, error_message: str | None, *, fallback_empty_dict: bool) -> Any:
+def _decode_attempt_result(raw_result: Any, error_message: str | None) -> Any:
+    """将 Attempt 原始结果解码为可交给 normalize_result_record 归一化为 4 键字典的载荷。"""
     if raw_result is not None:
         if isinstance(raw_result, str):
-            return loads(raw_result) if raw_result else ({"message": error_message} if fallback_empty_dict else None)
-        return raw_result
-    if error_message is not None:
-        return {"message": error_message}
-    return {"message": None} if fallback_empty_dict else None
+            if raw_result:
+                decoded = loads(raw_result)
+                if decoded is not None:
+                    return decoded
+        else:
+            return raw_result
+    return {"message": error_message}
 
 
 # ── 2 个薄数据适配器（流式 SQLite + 统一内存表视图）────────────────────────
@@ -319,6 +322,8 @@ class _SqliteStreamingAdapter:
         if job_uid is not None:
             sql += " WHERE job_uid = ? ORDER BY attempt_no ASC"
             params.append(job_uid)
+        else:
+            sql += " ORDER BY attempt_id ASC"
 
         cursor = self._conn.execute(sql, params)
         for row in cursor:
@@ -334,7 +339,7 @@ class _SqliteStreamingAdapter:
                 row[4],
                 _decode_json_dict(row[5]),
                 _decode_json_dict(row[6]),
-                _decode_attempt_result(row[7], row[8], fallback_empty_dict=True),
+                _decode_attempt_result(row[7], row[8]),
             )
 
     def close(self) -> None:
@@ -364,14 +369,12 @@ class _MemoryTableAdapter:
         successes: dict[str, Any],
         failed: dict[str, tuple[Any, Any]],
         attempts: list[tuple[str, int, str, str, str | None, str | None, Any, Any, Any, str | None]],
-        attempt_result_fallback_empty_dict: bool = False,
     ) -> None:
         self._queue_rows = queue_rows
         self._queue_by_uid = {row[0]: row for row in queue_rows}
         self._successes = successes
         self._failed = failed
         self._attempts = attempts
-        self._attempt_result_fallback_empty_dict = attempt_result_fallback_empty_dict
         self._closed = False
 
     @classmethod
@@ -415,50 +418,21 @@ class _MemoryTableAdapter:
             successes=successes,
             failed=failed,
             attempts=attempts,
-            attempt_result_fallback_empty_dict=True,
         )
 
     @classmethod
     def from_consistent_snapshot(cls, snapshot: Mapping[str, Any]) -> _MemoryTableAdapter:
         """从内存后端 load_consistent_snapshot() 捕获的一致字典视图构建适配器。"""
-        queue_rows = [
-            (
-                row["job_uid"],
-                row["job"],
-                row["status"],
-                row["run_id"],
-                row["attempt_no"],
-                row.get("started_at"),
-            )
-            for row in snapshot["queue_jobs"]
-        ]
-        successes = dict(snapshot["successes"])
         failure_payloads = snapshot["failure_payloads"]
         failed = {
             uid: (meta, failure_payloads.get(uid))
             for uid, meta in snapshot["failed"].items()
         }
-        attempts = [
-            (
-                item["job_uid"],
-                item["attempt_no"],
-                item["run_id"],
-                item["outcome"],
-                item.get("started_at"),
-                item.get("settled_at"),
-                item.get("job") or {},
-                item.get("files"),
-                item.get("result"),
-                item.get("error_message"),
-            )
-            for item in snapshot["attempts"]
-            if isinstance(item.get("job_uid"), str) and item.get("job_uid")
-        ]
-        return cls(
-            queue_rows=queue_rows,
-            successes=successes,
+        return cls.from_edit_tables(
+            queue_rows=snapshot["queue_jobs"],
+            successes=snapshot["successes"],
             failed=failed,
-            attempts=attempts,
+            attempts=snapshot["attempts"],
         )
 
     @classmethod
@@ -470,7 +444,7 @@ class _MemoryTableAdapter:
         failed: Mapping[str, tuple[Mapping[str, Any], Mapping[str, Any] | None]],
         attempts: Sequence[Mapping[str, Any]],
     ) -> _MemoryTableAdapter:
-        """从 EditTransaction 三表工作图内存副本构建适配器。"""
+        """从内存字典表视图（load_consistent_snapshot 与 EditTransaction 共用）构建适配器。"""
         q_list = [
             (
                 row["job_uid"],
@@ -590,11 +564,7 @@ class _MemoryTableAdapter:
                 row[5],
                 _decode_json_dict(row[6]),
                 _decode_json_optional_dict(row[7]),
-                _decode_attempt_result(
-                    row[8],
-                    row[9],
-                    fallback_empty_dict=self._attempt_result_fallback_empty_dict,
-                ),
+                _decode_attempt_result(row[8], row[9]),
             )
 
     def close(self) -> None:

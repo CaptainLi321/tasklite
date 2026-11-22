@@ -14,8 +14,6 @@ from tasklite import (
 )
 from tasklite.resource import CapacityResource, IntervalResource
 from tasklite.utils.encoding import (
-    content_fingerprint,
-    encode_job_component,
     encode_identifier,
     encode_content_id,
 )

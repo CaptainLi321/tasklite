@@ -798,8 +798,8 @@ class TestQueueStartedAtProjection:
                     conn.commit()
             else:
                 for item in p._runtime.store.backend._queue:
-                    if item["job_id"] == "pending_one":
-                        item["started_at"] = "2026-06-01T10:00:00+00:00"
+                    if item.job_uid == j_pend.uid:
+                        item.started_at = "2026-06-01T10:00:00+00:00"
 
             sources = [p] + ([db_path] if backend == "sqlite" else [])
             for src in sources:
@@ -1041,6 +1041,92 @@ class TestStateSnapshotCopyMode:
         snap.close()
         with pytest.raises(TaskLiteError, match="closed"):
             snap.get_job("process::item")
+
+    def test_empty_attempt_result_projection_identical_across_backends_modes_and_edit(self, tmp_path):
+        """空 Attempt.result（result=None, error_message=None/str）在 SQLite(lazy/copy)、Memory 与 EditTransaction 下 100% 同形。"""
+        expected_empty_result = {
+            "message": None,
+            "exception": None,
+            "metadata": {},
+            "annotations": {},
+        }
+        expected_err_result = {
+            "message": "raw error fallback",
+            "exception": None,
+            "metadata": {},
+            "annotations": {},
+        }
+
+        collected_all: list[list[dict]] = []
+        collected_by_uid: list[list[dict]] = []
+        for backend_kind in ("sqlite", "memory"):
+            db_path = tmp_path / f"empty_result_{backend_kind}.db"
+            with TaskLite(
+                backend=backend_kind,
+                state_path=db_path if backend_kind == "sqlite" else None,
+            ) as p:
+                p.register_task("process", dummy_handler)
+                j1 = Job("process", "null_both")
+                j2 = Job("process", "null_with_err")
+                p.enqueue(j1)
+                p.enqueue(j2)
+                b = p._runtime.store.backend
+                b.mark_job_running(j1.uid, execution_id="r1.1", run_id="r1", started_at="2026-08-01T00:00:00Z")
+                b.commit_job_settlement(
+                    job_uid=j1.uid,
+                    outcome="success",
+                    attempt_no=1,
+                    execution_id="r1.1",
+                    run_id="r1",
+                    started_at="2026-08-01T00:00:00Z",
+                    settled_at="2026-08-01T00:00:01Z",
+                    job_snapshot=j1.to_dict(),
+                    result=None,
+                    error_message=None,
+                    success_metadata={"job_snapshot": j1.to_dict()},
+                )
+                b.mark_job_running(j2.uid, execution_id="r1.2", run_id="r1", started_at="2026-08-01T00:00:02Z")
+                b.commit_job_settlement(
+                    job_uid=j2.uid,
+                    outcome="failure",
+                    attempt_no=1,
+                    execution_id="r1.2",
+                    run_id="r1",
+                    started_at="2026-08-01T00:00:02Z",
+                    settled_at="2026-08-01T00:00:03Z",
+                    job_snapshot=j2.to_dict(),
+                    result=None,
+                    error_message="raw error fallback",
+                    failure_metadata={"job_snapshot": j2.to_dict()},
+                )
+
+                sources = [p] + ([db_path] if backend_kind == "sqlite" else [])
+                for src in sources:
+                    for mode in ("lazy", "copy"):
+                        with StateSnapshot.open(src, mode=mode) as snap:
+                            all_atts = list(snap.iter_attempts())
+                            uid_atts = list(snap.iter_attempts(job_uid=j1.uid))
+                            assert [a["job_uid"] for a in all_atts] == [j1.uid, j2.uid]
+                            assert all_atts[0]["result"] == expected_empty_result
+                            assert all_atts[1]["result"] == expected_err_result
+                            assert uid_atts[0]["result"] == expected_empty_result
+                            collected_all.append(all_atts)
+                            collected_by_uid.append(uid_atts)
+
+                with p.edit(dry_run=True) as tx:
+                    for tx_snap in (tx.before, tx.after):
+                        all_atts = list(tx_snap.iter_attempts())
+                        uid_atts = list(tx_snap.iter_attempts(job_uid=j1.uid))
+                        assert [a["job_uid"] for a in all_atts] == [j1.uid, j2.uid]
+                        assert all_atts[0]["result"] == expected_empty_result
+                        assert all_atts[1]["result"] == expected_err_result
+                        collected_all.append(all_atts)
+                        collected_by_uid.append(uid_atts)
+
+        for entry in collected_all[1:]:
+            assert entry == collected_all[0]
+        for entry in collected_by_uid[1:]:
+            assert entry == collected_by_uid[0]
 
 
 class TestStateSnapshotReport:

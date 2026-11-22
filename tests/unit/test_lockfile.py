@@ -21,28 +21,29 @@ class TestFlockMutex:
         assert lock_path_for(derived) == derived
 
     def test_second_acquire_while_held_fails(self, tmp_path):
-        lock_name = "pipeline_run_test"
-        fd_first = try_acquire_lock(str(tmp_path), lock_name)
+        state_db = tmp_path / "pipeline_run_test.db"
+        other_db = tmp_path / "pipeline_run_other.db"
+        fd_first = try_acquire_lock(state_db)
         assert fd_first is not None, "无竞争时首次加锁必须成功"
         try:
-            fd_other = try_acquire_lock(str(tmp_path), "pipeline_run_other")
-            assert fd_other is not None, "不同名称加锁不得被无关持锁者阻塞"
+            fd_other = try_acquire_lock(other_db)
+            assert fd_other is not None, "不同状态库路径加锁不得被无关持锁者阻塞"
             release_lock(fd_other)
-            fd_second = try_acquire_lock(str(tmp_path), lock_name)
-            assert fd_second is None, "持锁期间同名二次加锁必须失败（锁互斥）"
+            fd_second = try_acquire_lock(state_db)
+            assert fd_second is None, "持锁期间同路径二次加锁必须失败（锁互斥）"
         finally:
             release_lock(fd_first)
-        fd_third = try_acquire_lock(str(tmp_path), lock_name)
+        fd_third = try_acquire_lock(state_db)
         assert fd_third is not None, "释放后必须能重新获取锁"
         release_lock(fd_third)
 
     def test_acquire_timeout_returns_none_while_held(self, tmp_path):
-        lock_name = "render_timeout"
-        fd = try_acquire_lock(str(tmp_path), lock_name)
+        state_db = tmp_path / "render_timeout.db"
+        fd = try_acquire_lock(state_db)
         assert fd is not None
         try:
             started_at = time.monotonic()
-            got = try_acquire_lock(str(tmp_path), lock_name, timeout=0.4)
+            got = try_acquire_lock(state_db, timeout=0.4)
             elapsed = time.monotonic() - started_at
             assert got is None, "持锁期间带超时加锁必须超时返回 None"
             assert elapsed >= 0.3, "deadline 前不得提前返回"
@@ -50,17 +51,17 @@ class TestFlockMutex:
             release_lock(fd)
 
     def test_lock_file_never_unlinked_after_release(self, tmp_path):
-        lock_name = "keep_file"
-        fd = try_acquire_lock(str(tmp_path), lock_name)
+        state_db = tmp_path / "keep_file.db"
+        fd = try_acquire_lock(state_db)
         assert fd is not None
         release_lock(fd)
-        assert (tmp_path / f"{lock_name}.lock").exists()
+        assert lock_path_for(state_db).exists()
 
     def test_lock_env_fault_raises_not_none(self, tmp_path):
-        lock_name = "keep_file"
-        (tmp_path / f"{lock_name}.lock").mkdir()
+        state_db = tmp_path / "keep_file.db"
+        lock_path_for(state_db).mkdir()
         with pytest.raises(OSError):
-            try_acquire_lock(str(tmp_path), lock_name)
+            try_acquire_lock(state_db)
 
     def test_try_lock_fd_propagates_non_contention_oserror(self, tmp_path, monkeypatch):
         """非争用类 OSError（如 EIO / EBADF）必须原样向上传播，绝不伪装为锁被占用。"""

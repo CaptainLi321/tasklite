@@ -37,7 +37,6 @@ EXPECTED_ABSTRACT_METHODS = {
     "exclusive_access",
     "load_successes",
     "load_failed",
-    "load_cursors",
     "commit_job_failures",
     "commit_skip",
     "enqueue_jobs",
@@ -49,8 +48,6 @@ EXPECTED_ABSTRACT_METHODS = {
     "set_engine_metadata",
     "mark_job_running",
     "commit_job_settlement",
-    "get_attempt_sequence",
-    "load_settled_attempts",
     "load_queue_jobs",
     "grant_authorization",
     "record_authorization",
@@ -66,6 +63,24 @@ def _pending_queue(backend: AbstractStateBackend) -> list[dict[str, Any]]:
 
 def _failure_payloads(backend: AbstractStateBackend) -> dict[str, dict[str, Any]]:
     return backend.load_consistent_snapshot()["failure_payloads"]
+
+
+def _cursors(backend: AbstractStateBackend) -> dict[str, str]:
+    return backend.load_consistent_snapshot()["cursors"]
+
+
+def _attempt_sequence(backend: AbstractStateBackend, job_uid: str) -> int:
+    return backend.load_consistent_snapshot()["job_sequences"].get(job_uid, 0)
+
+
+def _settled_attempts(backend: AbstractStateBackend, job_uid: str) -> list[dict[str, Any]]:
+    attempts = [
+        copy.deepcopy(att)
+        for att in backend.load_consistent_snapshot()["attempts"]
+        if att.get("job_uid") == job_uid
+    ]
+    attempts.sort(key=lambda item: item.get("attempt_no", 0))
+    return attempts
 
 
 def _job_snapshot(job_id: str, **overrides: Any) -> dict[str, Any]:
@@ -219,9 +234,9 @@ class TestCoreContractProperties:
         assert b.load_successes() == {}
         assert b.load_failed() == {}
         assert _failure_payloads(b) == {}
-        assert b.load_cursors() == {}
+        assert _cursors(b) == {}
         assert _pending_queue(b) == []
-        assert b.load_settled_attempts("t::missing") == []
+        assert _settled_attempts(b, "t::missing") == []
 
     def test_enqueue_visible_idempotent_and_ordered(self, dual_backend):
         b = dual_backend
@@ -356,7 +371,7 @@ class TestBackendCommitAtomicity:
         assert _queue_uids(b) == ["t::child_one", "t::child_two"]
         assert b.load_successes()["t::one"]["status"] == "ok"
         assert "t::one" not in b.load_failed()
-        assert b.load_cursors() == {"page": "two"}
+        assert _cursors(b) == {"page": "two"}
 
 
 # ── 管理状态切换与游标对齐 ────────────────────────────────────────────
@@ -422,7 +437,7 @@ class TestGraphEditCommitAndCursors:
         assert "t::b" not in b.load_failed()
         assert "t::c" in b.load_failed()
         assert _queue_uids(b) == ["t::a", "t::b"]
-        atts = b.load_settled_attempts("t::c")
+        atts = _settled_attempts(b, "t::c")
         assert len(atts) == 1 and atts[0]["outcome"] == "failure" and atts[0]["attempt_no"] == 1
 
         # load_consistent_snapshot 包含 cursors 与 job_sequences 等完整 7 字段
@@ -470,7 +485,7 @@ class TestGraphEditCommitAndCursors:
     def test_cursor_bad_types_rejected_zero_write(self, dual_backend, key, value):
         with pytest.raises(TypeError):
             dual_backend.set_cursor(key, value)
-        assert dual_backend.load_cursors() == {}
+        assert _cursors(dual_backend) == {}
 
     def test_cursor_valid_roundtrip_upsert_empty_and_delete(self, dual_backend):
         b = dual_backend
@@ -478,13 +493,13 @@ class TestGraphEditCommitAndCursors:
         assert b.get_cursor("k") == "v_one"
         b.set_cursor("k", "v_two")
         assert b.get_cursor("k") == "v_two"
-        assert b.load_cursors() == {"k": "v_two"}
+        assert _cursors(b) == {"k": "v_two"}
         b.set_cursor("k", None)
         assert b.get_cursor("k") is None
-        assert b.load_cursors() == {}
+        assert _cursors(b) == {}
         b.set_cursor("k", "")
         assert b.get_cursor("k") == ""
-        assert b.load_cursors() == {"k": ""}
+        assert _cursors(b) == {"k": ""}
 
 
 @pytest.mark.parametrize(
@@ -548,7 +563,7 @@ class TestStatePrimitivesAndAttemptSequence:
                 cursor_updates={"offset": "new"},
             )
         assert _state_facts(dual_backend) == before
-        assert dual_backend.load_settled_attempts(uid) == []
+        assert _settled_attempts(dual_backend, uid) == []
 
     def test_already_settled_running_execution_is_rejected(self, dual_backend):
         uid = "t::parent"
@@ -571,7 +586,7 @@ class TestStatePrimitivesAndAttemptSequence:
         dual_backend.commit_skip(uid)
         dual_backend.enqueue_jobs([running_job])
         before = _state_facts(dual_backend)
-        attempts = dual_backend.load_settled_attempts(uid)
+        attempts = _settled_attempts(dual_backend, uid)
 
         with pytest.raises(TaskLiteError, match="already settled"):
             dual_backend.commit_job_settlement(
@@ -585,7 +600,7 @@ class TestStatePrimitivesAndAttemptSequence:
                 cursor_updates={"offset": "new"},
             )
         assert _state_facts(dual_backend) == before
-        assert dual_backend.load_settled_attempts(uid) == attempts
+        assert _settled_attempts(dual_backend, uid) == attempts
 
     def test_atomic_settlement_failure_leaves_no_partial_state(self, dual_backend):
         b = dual_backend
@@ -606,7 +621,7 @@ class TestStatePrimitivesAndAttemptSequence:
                 cursor_updates={"bad_cursor": 12345},  # type: ignore[dict-item]
             )
         assert _state_facts(b) == before
-        assert b.load_settled_attempts("t::parent") == []
+        assert _settled_attempts(b, "t::parent") == []
 
         b.enqueue_jobs([_job_snapshot("conflict_child")])
         before2 = _state_facts(b)
@@ -623,7 +638,7 @@ class TestStatePrimitivesAndAttemptSequence:
                 cursor_updates={"good_cursor": "val"},
             )
         assert _state_facts(b) == before2
-        assert b.load_settled_attempts("t::parent") == []
+        assert _settled_attempts(b, "t::parent") == []
 
     @pytest.mark.parametrize("conflict", ["existing", "duplicate"])
     def test_spawn_conflict_rolls_back_complete_settlement(self, dual_backend, conflict):
@@ -649,8 +664,8 @@ class TestStatePrimitivesAndAttemptSequence:
             )
         assert _snapshot(backend) == before
         assert backend.load_queue_jobs() == before_queue
-        assert backend.load_settled_attempts("t::parent") == []
-        assert backend.get_attempt_sequence("t::parent") == 1
+        assert _settled_attempts(backend, "t::parent") == []
+        assert _attempt_sequence(backend, "t::parent") == 1
 
     def test_settlement_outcomes_parity(self, dual_backend):
         b = dual_backend
@@ -673,9 +688,9 @@ class TestStatePrimitivesAndAttemptSequence:
             cursor_updates={"cur_1": "cval"},
         )
         assert "t::job_s" in b.load_successes()
-        assert b.load_cursors() == {"cur_1": "cval"}
+        assert _cursors(b) == {"cur_1": "cval"}
         assert [(j["job_uid"], j["status"]) for j in b.load_queue_jobs()] == [("t::child_s", "pending")]
-        assert b.load_settled_attempts("t::job_s")[0]["outcome"] == "success"
+        assert _settled_attempts(b, "t::job_s")[0]["outcome"] == "success"
 
         # failure
         b.enqueue_jobs([_job_snapshot("job_f")])
@@ -692,7 +707,7 @@ class TestStatePrimitivesAndAttemptSequence:
         )
         assert "t::job_f" in b.load_failed()
         assert _failure_payloads(b).get("t::job_f") == {"input": "data"}
-        assert b.load_settled_attempts("t::job_f")[0]["outcome"] == "failure"
+        assert _settled_attempts(b, "t::job_f")[0]["outcome"] == "failure"
 
         # retry
         b.enqueue_jobs([_job_snapshot("job_r")])
@@ -706,8 +721,13 @@ class TestStatePrimitivesAndAttemptSequence:
             settled_at="2026-11-08T02:00:01Z",
         )
         r_jobs = [j for j in b.load_queue_jobs() if j["job_uid"] == "t::job_r"]
-        assert len(r_jobs) == 1 and r_jobs[0]["status"] == "pending" and r_jobs[0]["run_id"] is None
-        assert b.load_settled_attempts("t::job_r")[0]["outcome"] == "retry"
+        assert len(r_jobs) == 1
+        assert r_jobs[0]["status"] == "pending"
+        assert r_jobs[0]["run_id"] is None
+        assert r_jobs[0]["attempt_no"] is None
+        assert r_jobs[0]["started_at"] is None
+        assert r_jobs[0]["execution_id"] is None
+        assert _settled_attempts(b, "t::job_r")[0]["outcome"] == "retry"
 
         # pending (authorization denied / abort)
         b.enqueue_jobs([_job_snapshot("job_p")])
@@ -722,9 +742,108 @@ class TestStatePrimitivesAndAttemptSequence:
             error_message="authorization denied",
         )
         p_jobs = [j for j in b.load_queue_jobs() if j["job_uid"] == "t::job_p"]
-        assert len(p_jobs) == 1 and p_jobs[0]["status"] == "pending"
-        p_att = b.load_settled_attempts("t::job_p")
+        assert len(p_jobs) == 1
+        assert p_jobs[0]["status"] == "pending"
+        assert p_jobs[0]["run_id"] is None
+        assert p_jobs[0]["attempt_no"] is None
+        assert p_jobs[0]["started_at"] is None
+        assert p_jobs[0]["execution_id"] is None
+        p_att = _settled_attempts(b, "t::job_p")
         assert len(p_att) == 1 and p_att[0]["outcome"] == "failure" and p_att[0]["error_message"] == "authorization denied"
+
+    def test_queue_row_strict_parity_across_running_retry_pending_and_spawn(self, tmp_path):
+        """SQLite 与 Memory 双后端在 running / retry / pending / spawn 路径下队列行逐键等价且零脏键泄漏。"""
+        dirty_keys = {"status", "run_id", "attempt_no", "started_at", QUEUE_EXECUTION_ID_KEY}
+        mem = InMemoryStateBackend()
+        sql = SQLiteStateBackend(tmp_path / "strict_parity.db")
+        try:
+            def assert_queue_strict_equal() -> None:
+                mem_rows = mem.load_queue_jobs()
+                sql_rows = sql.load_queue_jobs()
+                assert mem_rows == sql_rows
+                assert mem.load_consistent_snapshot()["queue_jobs"] == sql.load_consistent_snapshot()["queue_jobs"]
+                for row in mem_rows:
+                    assert dirty_keys.isdisjoint(row["job"].keys()), f"业务快照泄漏运行态键: {row['job']}"
+
+            initial = [_job_snapshot("j_retry", payload={"v": 1}), _job_snapshot("j_pend", payload={"v": 2}), _job_snapshot("j_ok", payload={"v": 3})]
+            mem.enqueue_jobs(copy.deepcopy(initial))
+            sql.enqueue_jobs(copy.deepcopy(initial))
+            assert_queue_strict_equal()
+
+            # mark_job_running 后双后端行完全一致，且业务快照零脏键
+            for b in (mem, sql):
+                assert b.mark_job_running("t::j_retry", execution_id="r1.1", run_id="r1", started_at="2026-11-08T00:00:00Z") == 1
+                assert b.mark_job_running("t::j_pend", execution_id="r1.2", run_id="r1", started_at="2026-11-08T00:00:01Z") == 1
+                assert b.mark_job_running("t::j_ok", execution_id="r1.3", run_id="r1", started_at="2026-11-08T00:00:02Z") == 1
+            assert_queue_strict_equal()
+
+            # retry（无 requeued_job_snapshot）与 pending 结算：attempt_no 统一清零为 None
+            for b in (mem, sql):
+                b.commit_job_settlement(
+                    job_uid="t::j_retry",
+                    outcome="retry",
+                    attempt_no=1,
+                    execution_id="r1.1",
+                    run_id="r1",
+                    settled_at="2026-11-08T00:00:10Z",
+                )
+                b.commit_job_settlement(
+                    job_uid="t::j_pend",
+                    outcome="pending",
+                    attempt_no=1,
+                    execution_id="r1.2",
+                    run_id="r1",
+                    settled_at="2026-11-08T00:00:11Z",
+                )
+            assert_queue_strict_equal()
+            for row in mem.load_queue_jobs():
+                if row["job_uid"] in ("t::j_retry", "t::j_pend"):
+                    assert row["status"] == "pending"
+                    assert row["run_id"] is None
+                    assert row["attempt_no"] is None
+                    assert row["started_at"] is None
+                    assert row["execution_id"] is None
+
+            # retry（带 requeued_job_snapshot）后同样零脏键且 attempt_no 为 None
+            requeued_snap = _job_snapshot("j_retry", payload={"v": 10})
+            for b in (mem, sql):
+                assert b.mark_job_running("t::j_retry", execution_id="r2.1", run_id="r2", started_at="2026-11-08T00:01:00Z") == 2
+                b.commit_job_settlement(
+                    job_uid="t::j_retry",
+                    outcome="retry",
+                    attempt_no=2,
+                    execution_id="r2.1",
+                    run_id="r2",
+                    settled_at="2026-11-08T00:01:05Z",
+                    requeued_job_snapshot=copy.deepcopy(requeued_snap),
+                )
+            assert_queue_strict_equal()
+
+            # success + spawned_job_snapshots 派生入队行零脏键、逐键等价（注意 queue_position 语义比较）
+            spawned = [_job_snapshot("child_1", payload={"c": 1})]
+            for b in (mem, sql):
+                b.commit_job_settlement(
+                    job_uid="t::j_ok",
+                    outcome="success",
+                    attempt_no=1,
+                    execution_id="r1.3",
+                    run_id="r1",
+                    settled_at="2026-11-08T00:02:00Z",
+                    success_metadata={"ok": True},
+                    spawned_job_snapshots=copy.deepcopy(spawned),
+                )
+            mem_rows = mem.load_queue_jobs()
+            sql_rows = sql.load_queue_jobs()
+            assert [
+                {k: v for k, v in row.items() if k != "queue_position"} for row in mem_rows
+            ] == [
+                {k: v for k, v in row.items() if k != "queue_position"} for row in sql_rows
+            ]
+            for row in mem_rows:
+                assert dirty_keys.isdisjoint(row["job"].keys())
+        finally:
+            mem.close()
+            sql.close()
 
     def test_settled_history_is_immutable_isolated_and_orders_by_sequence(self, dual_backend):
         backend = dual_backend
@@ -737,7 +856,9 @@ class TestStatePrimitivesAndAttemptSequence:
                 )
                 == number
             )
-            assert len(backend.load_settled_attempts("t::parent")) == number - 1
+            assert len(_settled_attempts(backend, "t::parent")) == number - 1
+            files_arg = {"output": {"path": "/output"}}
+            result_arg = {"metadata": {"n": number}}
             backend.commit_job_settlement(
                 job_uid="t::parent",
                 outcome=outcome,
@@ -747,12 +868,14 @@ class TestStatePrimitivesAndAttemptSequence:
                 settled_at=f"finish-{number}",
                 started_at=f"start-{number}",
                 job_snapshot=job,
-                files={"output": {"path": "/output"}},
-                result={"metadata": {"n": number}},
+                files=files_arg,
+                result=result_arg,
             )
+            files_arg["output"]["path"] = "mutated-after-commit"
+            result_arg["metadata"]["n"] = 999
             if number == 1:
-                first = backend.load_settled_attempts("t::parent")[0]
-        records = backend.load_settled_attempts("t::parent")
+                first = _settled_attempts(backend, "t::parent")[0]
+        records = _settled_attempts(backend, "t::parent")
         assert records[0] == first
         assert [record["attempt_no"] for record in records] == [1, 2, 3]
         assert [record["outcome"] for record in records] == ["retry", "retry", "success"]
@@ -760,11 +883,11 @@ class TestStatePrimitivesAndAttemptSequence:
         assert backend.load_latest_succeeded_finished_at("t::parent") == "finish-3"
         records[0]["result"]["metadata"]["n"] = 999
         records[0]["files"]["output"]["path"] = "changed"
-        assert backend.load_settled_attempts("t::parent")[0] == first
+        assert _settled_attempts(backend, "t::parent")[0] == first
         assert backend.load_latest_succeeded_finished_at("t::missing") is None
         backend.commit_job_failures([("t::parent", {"preflight": True})])
         backend.commit_skip("t::parent")
-        assert backend.load_settled_attempts("t::parent")[0] == first
+        assert _settled_attempts(backend, "t::parent")[0] == first
 
     @pytest.mark.parametrize("snapshot_attempt_no", [999, -7])
     def test_removing_archive_preserves_attempts_and_attempt_sequence(
@@ -774,7 +897,7 @@ class TestStatePrimitivesAndAttemptSequence:
         job_uid = "t::target_seq"
         b.enqueue_jobs([_job_snapshot("target_seq", attempt_no=snapshot_attempt_no)])
         assert b.mark_job_running(job_uid, execution_id="run_1.1", run_id="run_1", started_at="2026-11-08T00:00:00Z") == 1
-        assert b.get_attempt_sequence(job_uid) == 1
+        assert _attempt_sequence(b, job_uid) == 1
         b.commit_job_settlement(
             job_uid=job_uid,
             outcome="success",
@@ -787,13 +910,13 @@ class TestStatePrimitivesAndAttemptSequence:
         b.commit_graph_edit(GraphEditCommit(success_writes={job_uid: None}))
         assert job_uid not in b.load_successes()
         # attempts 严格 append-only 不可删除，job_sequences 亦永不重置
-        assert len(b.load_settled_attempts(job_uid)) == 1
-        assert b.get_attempt_sequence(job_uid) == 1
+        assert len(_settled_attempts(b, job_uid)) == 1
+        assert _attempt_sequence(b, job_uid) == 1
         assert _pending_queue(b) == [] and b.load_successes() == {} and b.load_failed() == {}
 
         b.enqueue_jobs([_job_snapshot("target_seq", attempt_no=snapshot_attempt_no)])
         assert b.mark_job_running(job_uid, execution_id="run_2.2", run_id="run_2", started_at="2026-11-08T01:00:00Z") == 2
-        assert b.get_attempt_sequence(job_uid) == 2
+        assert _attempt_sequence(b, job_uid) == 2
 
 
 # ── 授权存储与 StateStore 授权校验对齐 ────────────────────────────────

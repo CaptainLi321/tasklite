@@ -149,12 +149,6 @@ class PipelineState:
         if __debug__:
             self._assert_state_consistent()
 
-    def clear_in_flight(self) -> None:
-        """清空 in-flight 集合（中止回收路径使用）。"""
-        self._in_flight_uids.clear()
-        if __debug__:
-            self._assert_state_consistent()
-
     def replace_queue(self, job_snapshots: list[dict[str, Any]]) -> None:
         """整体替换队列（死锁批量移除肇事者场景），重建 uid 索引。"""
         self._queue = list(job_snapshots)
@@ -313,15 +307,6 @@ class PipelineState:
     def is_empty(self) -> bool:
         """队列是否为空。"""
         return not self._queue
-
-    def is_known(self, job_uid: str) -> bool:
-        """作业是否在系统中的统一谓词。"""
-        return (
-            job_uid in self._successes
-            or job_uid in self._failed
-            or job_uid in self._queue_uids
-            or job_uid in self._in_flight_uids
-        )
 
     # 内部 ---------------------------------------------------------
 

@@ -129,7 +129,7 @@ class CompletionMachine:
 
         身份非真空：在飞注销下推到 ``apply_result`` 内部分支（retry 在重入队前、
         success 在 mark_success 后、failure 在 mark_failed 后），保证
-        uid 在 ``is_known`` 可达的代码段内始终属于至少一个集合。
+        uid 在状态流转可达的代码段内始终属于至少一个集合。
         """
         uid = entry.job_uid
         exec_id = (

@@ -337,13 +337,6 @@ class SQLiteStateBackend(AbstractStateBackend):
             cursor = conn.execute('SELECT job_uid, metadata FROM failed')
             return {row[0]: loads(row[1]) for row in cursor}
 
-    def load_cursors(self) -> dict[str, str]:
-        if not self.path.exists():
-            return {}
-        with self._get_conn() as conn:
-            cursor = conn.execute('SELECT key, value FROM cursors')
-            return {row[0]: row[1] for row in cursor}
-
     # delta 提交 ---------------------------------------------------------
 
     def _write_failed_row(
@@ -749,43 +742,6 @@ class SQLiteStateBackend(AbstractStateBackend):
                 ),
             )
             return next_no
-
-    def get_attempt_sequence(self, job_uid: str) -> int:
-        if not self.path.exists():
-            return 0
-        with self._get_conn() as conn:
-            row = conn.execute(
-                'SELECT last_attempt_no FROM job_sequences WHERE job_uid = ?',
-                (job_uid,),
-            ).fetchone()
-            return row[0] if row is not None else 0
-
-    def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        with self._get_conn() as conn:
-            cursor = conn.execute(
-                'SELECT attempt_id, job_uid, attempt_no, run_id, outcome, started_at, settled_at, '
-                'job_snapshot, files, result, error_message '
-                'FROM attempts WHERE job_uid = ? ORDER BY attempt_no ASC',
-                (job_uid,),
-            )
-            results: list[dict[str, Any]] = []
-            for row in cursor:
-                results.append({
-                    "attempt_id": row[0],
-                    "job_uid": row[1],
-                    "attempt_no": row[2],
-                    "run_id": row[3],
-                    "outcome": row[4],
-                    "started_at": row[5],
-                    "settled_at": row[6],
-                    "job": loads(row[7]) if row[7] else None,
-                    "files": loads(row[8]) if row[8] else None,
-                    "result": loads(row[9]) if row[9] else None,
-                    "error_message": row[10],
-                })
-            return results
 
     def load_queue_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:
         if not self.path.exists():

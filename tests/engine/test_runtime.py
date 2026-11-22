@@ -330,7 +330,7 @@ class TestEngineRuntimeExecutionLifecycle:
 
         assert "t::j1" in env.backend.load_successes()
         assert env.backend.load_queue_jobs(status="pending") == []
-        records = env.backend.load_settled_attempts("t::j1")
+        records = [a for a in env.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "t::j1"]
         assert records[-1]["outcome"] == "success"
 
     def test_unhandled_exception_propagates_via_raise_channel(self, tmp_path, monkeypatch):
@@ -657,9 +657,10 @@ class TestGracefulDraining:
         assert "t::j1" in env.backend.load_successes()
         assert "t::j2" not in env.backend.load_successes()
         assert any(row["job"].get("job_id") == "j2" for row in env.backend.load_queue_jobs(status="pending"))
-        attempt, = env.backend.load_settled_attempts("t::j1")
+        atts = env.backend.load_consistent_snapshot()["attempts"]
+        attempt, = [a for a in atts if a["job_uid"] == "t::j1"]
         assert attempt["outcome"] == "success"
-        assert env.backend.load_settled_attempts("t::j2") == []
+        assert [a for a in atts if a["job_uid"] == "t::j2"] == []
         assert env.resources[WORKER_RESOURCE].used == 0
 
 
@@ -683,5 +684,6 @@ class TestGracefulDraining:
         assert outcome.deadlock_detected is False
         assert outcome.should_terminate is True
         assert set(env.backend.load_failed()) == {"t::blocked", "t::downstream"}
-        assert env.backend.load_settled_attempts("t::blocked") == []
-        assert env.backend.load_settled_attempts("t::downstream") == []
+        atts = env.backend.load_consistent_snapshot()["attempts"]
+        assert [a for a in atts if a["job_uid"] == "t::blocked"] == []
+        assert [a for a in atts if a["job_uid"] == "t::downstream"] == []

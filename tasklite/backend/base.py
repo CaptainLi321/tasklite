@@ -358,10 +358,6 @@ class AbstractStateBackend(ABC):
     def load_failed(self) -> dict[str, dict[str, Any]]:
         """加载全部失败档案终态（uid → 失败 meta）。"""
 
-    @abstractmethod
-    def load_cursors(self) -> dict[str, str]:
-        """加载全部游标（key → value）。"""
-
     # delta 提交 -----------------------------------------------------
 
     @abstractmethod
@@ -458,14 +454,6 @@ class AbstractStateBackend(ABC):
         成功无返回值；执行身份与 running 不匹配或已结算时抛 TaskLiteError。
         写入故障原样传播，失败时后端不变。
         """
-
-    @abstractmethod
-    def get_attempt_sequence(self, job_uid: str) -> int:
-        """读取指定 job_uid 的最新 attempt_no 编号进度（未派发过返回 0）。"""
-
-    @abstractmethod
-    def load_settled_attempts(self, job_uid: str) -> list[dict[str, Any]]:
-        """按 attempt_no 升序读取指定 job_uid 的全部已结算 Attempt 记录。"""
 
     @abstractmethod
     def load_queue_jobs(self, *, status: str | None = None) -> list[dict[str, Any]]:

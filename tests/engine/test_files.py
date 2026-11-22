@@ -24,7 +24,7 @@ def _record_success(
 ):
     task_type, job_id = uid.split("::", 1)
     backend.enqueue_jobs([Job(task_type, job_id).to_dict()])
-    execution_id = f"{run_id}.{backend.get_attempt_sequence(uid) + 1}"
+    execution_id = f"{run_id}.{backend.load_consistent_snapshot()['job_sequences'].get(uid, 0) + 1}"
     attempt_no = backend.mark_job_running(
         uid,
         execution_id=execution_id,

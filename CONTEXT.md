@@ -59,7 +59,7 @@ _Avoid_: SuccessTable, CompletedSet, HistoryStore
 _Avoid_: FailureLog, ErrorQueue, Trash, DLQ, DeadLetter
 
 **encode_* family**:
-可逆 `%XX` 单射编码族（`encode_identifier` / `encode_job_component` / `encode_content_id` / `percent_encode` 以及 `make_job_uid` / `parse_job_uid`），保证标识符与路径转换无碰撞。
+可逆 `%XX` 单射编码族（`encode_identifier` / `encode_content_id` / `percent_encode` 以及 `make_job_uid` / `parse_job_uid`），保证标识符与路径转换无碰撞。
 _Avoid_: Sanitizer, Slugger, Escaper, sanitize_*
 
 **OrderingPolicy**:
