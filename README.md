@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/CaptainLi321/tasklite/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/CaptainLi321/tasklite/actions/workflows/ci.yml)
 
-当前开发版本为 **3.0.0.dev1**，公开接口与兼容性说明见 [API 参考手册](docs/API.md)。
+当前开发版本为 **3.0.0.dev2**，公开接口与兼容性说明见 [API 参考手册](docs/API.md)。
 
 ---
 
@@ -232,6 +232,7 @@ pipeline.close()
 | **[`docs/adr/`](docs/adr/)** | **架构决策记录（ADR）**：关键架构演进、设计取舍与边界裁决依据 |
 | **[`docs/ROADMAP.md`](docs/ROADMAP.md)** | **未来演进路线图**：已分析但尚未立项实施的储备方向（实施前须立项 ADR） |
 | **[`AGENTS.md`](AGENTS.md)** | **研发红线与工作流规范**：测试门槛、原子提交纪律、分层依赖红线与注释规范 |
+| **[`examples/edit_migrations/`](examples/edit_migrations/)** | **原子图迁移参考脚本**：换盘搬迁、历史缓存纳管、分支改名、调大超时重跑、中间插层 5 个可运行模板 |
 | **[`CHANGELOG.md`](CHANGELOG.md)** | **版本变更日志**：各发布版本的显著特性与破坏性变更记录 |
 
 ---

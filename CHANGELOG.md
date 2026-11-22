@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 
+## [3.0.0.dev2] - 2026-11-22
+
+3.0.0 的第三个开发预览版：补充 5 种常见 `TaskLite.edit()` 原子图迁移可运行参考脚本，并同步至使用手册与项目导航。
+
+### 新增
+
+- **原子图迁移参考示例（`examples/edit_migrations/`）**：新增 5 个支持自包含演示与真实库 `--apply` 落盘的参考脚本——换盘搬迁（`01_relocate_paths.py`）、历史游离缓存纳管（`02_adopt_legacy_cache.py`）、新增维度分支改名（`03_rename_branch_dimension.py`）、局部调大 `timeout_seconds` 级联重跑（`04_bump_timeout_and_rerun.py`）与 4 层拓扑中间插层扩为 5 层（`05_insert_middle_layer.py`），并在 `docs/GUIDE.md` 与 `README.md` 建立索引。
+
 ## [3.0.0.dev1] - 2026-11-22
 
 3.0.0 的第二个开发预览版，完整落地 [ADR-0012](docs/adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md) 并完成核心引擎、跨平台进程树与存储层的深度架构收敛。

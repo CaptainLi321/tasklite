@@ -1,6 +1,6 @@
 # TaskLite 使用手册
 
-> 本文档是 TaskLite 3.0.0.dev1 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、Trigger 与恢复边界、`JobContext` 与统一文件声明授权、原子图修整运维（`TaskLite.edit()`），以及只读一致状态快照（`StateSnapshot`）与极简运维 CLI。项目概览与快速上手见 [`README.md`](../README.md)，公开 API 权威参考手册见 [`docs/API.md`](API.md)，架构决策记录见 [`docs/adr/`](adr/)。
+> 本文档是 TaskLite 3.0.0.dev2 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、Trigger 与恢复边界、`JobContext` 与统一文件声明授权、原子图修整运维（`TaskLite.edit()`），以及只读一致状态快照（`StateSnapshot`）与极简运维 CLI。项目概览与快速上手见 [`README.md`](../README.md)，公开 API 权威参考手册见 [`docs/API.md`](API.md)，架构决策记录见 [`docs/adr/`](adr/)。
 
 ---
 
@@ -308,6 +308,18 @@ with TaskLite(backend="sqlite", state_path="./state.db") as pipeline:
 - **提交期全量攒错与原子回滚**：退出 `with` 块时一次性校验防删出新孤儿、活跃/成功/触碰节点零孤儿与无环、`from_output` 契约闭合以及非执行 `succeeded` 物理产出在场；任一违规即汇总抛出单一 `TaskLiteError` 并整单回滚，杜绝半成品脏库。
 - **非执行 `succeeded` 与双管线拆分原则**：凡经 `tx.add` 或 `tx.replace` 置为 `"succeeded"` 且声明了保留型 `role="output"` 的节点，其产出文件必须在磁盘真实存在（零文件删除副作用、不伪造 `Attempt`、记录 `completion_source="manual"`）。若跨机仅拷贝中间层产物而不保留前段巨型文件，应在切割面拆分为两个独立 Pipeline（前段 `output` 在后段作为普通 `role="input"`），不在单库内制造无物理产物的伪成功状态。
 - **审计不变式**：`attempts` 物理执行轨迹**永不可删**，`job_sequences` 单调递增编号进度**永不重置**；`edit()` 绝不删除任何磁盘文件。完整规范见 [`docs/API.md`](API.md#26-run-外状态运维图修整与授权接口)。
+
+#### 常见图迁移参考脚本
+
+仓库在 `examples/edit_migrations/` 提供了 5 个开箱即跑的原子图迁移参考脚本（默认不传 `--state-path` 可直接运行自包含演示，传入 `--state-path` 时默认 `dry_run=True` 预览、加 `--apply` 落盘）：
+
+| 迁移场景 | 参考脚本 | 核心原语 |
+| :--- | :--- | :--- |
+| 1. 换盘符 / 多盘符目录搬迁 | [`01_relocate_paths.py`](../examples/edit_migrations/01_relocate_paths.py) | `if job.uid in tx: tx.replace(job.uid, job)` |
+| 2. 历史游离缓存纳管 | [`02_adopt_legacy_cache.py`](../examples/edit_migrations/02_adopt_legacy_cache.py) | `tx.add(cache_job, status="succeeded")` |
+| 3. 新增维度致老枝条改名与顺移 | [`03_rename_branch_dimension.py`](../examples/edit_migrations/03_rename_branch_dimension.py) | `tx.replace_many(mapping)` |
+| 4. 局部调大 `timeout_seconds` 级联重跑 | [`04_bump_timeout_and_rerun.py`](../examples/edit_migrations/04_bump_timeout_and_rerun.py) | `tx.set_status(..., "pending", recursive=True)` + `tx.replace(..., status="pending")` |
+| 5. 4 层拓扑中间插层扩为 5 层 | [`05_insert_middle_layer.py`](../examples/edit_migrations/05_insert_middle_layer.py) | `tx.add(mid_job, status="succeeded")` + `tx.replace(downstream, ...)` |
 
 ### 高水位游标读写
 
