@@ -361,9 +361,18 @@ class FilesystemAdapter(ABC):
 
     is_windows: bool
 
-    @abstractmethod
     def path_lexists(self, path: str) -> bool:
         """非跟随判断路径是否存在（权限错误必须原样传播）。"""
+        try:
+            os.lstat(path)
+            return True
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+
+    @staticmethod
+    def _same_lstat(first: os.stat_result, second: os.stat_result) -> bool:
+        """基于设备号与 inode / 文件索引比对两次非跟随 stat 是否指向同一对象。"""
+        return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
     @abstractmethod
     def realpath(self, path: str) -> str:
@@ -394,13 +403,6 @@ class PosixFilesystemAdapter(FilesystemAdapter):
 
     is_windows = False
 
-    def path_lexists(self, path: str) -> bool:
-        try:
-            os.lstat(path)
-            return True
-        except (FileNotFoundError, NotADirectoryError):
-            return False
-
     def realpath(self, path: str) -> str:
         try:
             resolved = os.path.realpath(path)
@@ -427,8 +429,6 @@ class PosixFilesystemAdapter(FilesystemAdapter):
             except OSError as error:
                 raise ValueError(f"cannot inspect artifact leaf: {path}") from error
             return EntryInspection("live_symlink")
-        if getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
-            return EntryInspection("unsafe_reparse")
         if stat.S_ISDIR(st.st_mode):
             return EntryInspection("directory")
         if stat.S_ISREG(st.st_mode):
@@ -449,10 +449,6 @@ class PosixFilesystemAdapter(FilesystemAdapter):
             raise NotImplementedError("safe directory enumeration is unavailable")
         if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
             raise NotImplementedError("non-following artifact deletion is unavailable")
-
-    @staticmethod
-    def _same_object(first: os.stat_result, second: os.stat_result) -> bool:
-        return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
     @staticmethod
     def _mount_points() -> tuple[Path, ...]:
@@ -492,7 +488,7 @@ class PosixFilesystemAdapter(FilesystemAdapter):
         before = target_path.parent.stat(follow_symlinks=False)
         parent_fd = os.open(target_path.parent, _DIRECTORY_OPEN_FLAGS)
         try:
-            if not self._same_object(before, os.fstat(parent_fd)):
+            if not self._same_lstat(before, os.fstat(parent_fd)):
                 raise ValueError(f"artifact parent identity changed: {target_path.parent}")
             revalidate()
             try:
@@ -512,10 +508,10 @@ class PosixFilesystemAdapter(FilesystemAdapter):
 
             def guard() -> None:
                 revalidate()
-                if not self._same_object(before, target_path.parent.stat(follow_symlinks=False)):
+                if not self._same_lstat(before, target_path.parent.stat(follow_symlinks=False)):
                     raise ValueError(f"artifact parent identity changed: {target_path.parent}")
                 current = os.stat(target_path.name, dir_fd=parent_fd, follow_symlinks=False)
-                if not self._same_object(entry, current):
+                if not self._same_lstat(entry, current):
                     raise ValueError(f"artifact identity changed during deletion: {target_path}")
 
             self._remove_at(
@@ -538,25 +534,23 @@ class PosixFilesystemAdapter(FilesystemAdapter):
     ) -> None:
         guard()
         parent_now = target.parent.stat(follow_symlinks=False)
-        if not self._same_object(parent_now, os.fstat(parent_fd)):
+        if not self._same_lstat(parent_now, os.fstat(parent_fd)):
             raise ValueError(f"artifact directory identity changed: {target.parent}")
         entry = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
         if stat.S_ISLNK(entry.st_mode):
             if not allow_symlink:
                 raise ValueError(f"artifact leaf must not be a symlink: {target}")
-        elif getattr(entry, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
-            raise ValueError(f"artifact contains an unsafe reparse point: {target}")
         elif stat.S_ISDIR(entry.st_mode):
             if entry.st_dev != os.fstat(parent_fd).st_dev or os.path.ismount(target):
                 raise ValueError(f"artifact deletion must not cross a mount: {target}")
             child_fd = os.open(target.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
             try:
-                if not self._same_object(entry, os.fstat(child_fd)):
+                if not self._same_lstat(entry, os.fstat(child_fd)):
                     raise ValueError(f"artifact directory identity changed: {target}")
                 for name in os.listdir(child_fd):
                     self._remove_at(child_fd, target / name, guard, allow_symlink=True)
                 guard()
-                if not self._same_object(
+                if not self._same_lstat(
                     entry, os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
                 ):
                     raise ValueError(f"artifact directory identity changed: {target}")
@@ -568,7 +562,7 @@ class PosixFilesystemAdapter(FilesystemAdapter):
             raise ValueError(f"unsupported artifact object: {target}")
         guard()
         current = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
-        if not self._same_object(entry, current):
+        if not self._same_lstat(entry, current):
             raise ValueError(f"artifact identity changed during deletion: {target}")
         os.unlink(target.name, dir_fd=parent_fd)
 
@@ -667,13 +661,6 @@ class WindowsFilesystemAdapter(FilesystemAdapter):
 
     is_windows = True
 
-    def path_lexists(self, path: str) -> bool:
-        try:
-            os.lstat(path)
-            return True
-        except (FileNotFoundError, NotADirectoryError):
-            return False
-
     def realpath(self, path: str) -> str:
         try:
             resolved = os.path.realpath(path)
@@ -702,27 +689,23 @@ class WindowsFilesystemAdapter(FilesystemAdapter):
         return candidate
 
     @staticmethod
-    def _same_lstat(first: os.stat_result, second: os.stat_result) -> bool:
-        return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
-
-    @staticmethod
     def _open_pinned_directory(path: str) -> int:
         """以省略 FILE_SHARE_DELETE 的句柄钉锁目录，防止清理期间被重命名或移走。"""
-        if sys.platform != "win32":
-            raise NotImplementedError("WindowsFilesystemAdapter requires Windows")
-        handle = _kernel32.CreateFileW(
-            path,
-            _FILE_READ_ATTRIBUTES,
-            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
-            None,
-            _OPEN_EXISTING,
-            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-        if handle is None or handle == _INVALID_HANDLE_VALUE:
-            err = ctypes.get_last_error()
-            raise ctypes.WinError(err)
-        return int(handle)
+        if sys.platform == "win32":
+            handle = _kernel32.CreateFileW(
+                path,
+                _FILE_READ_ATTRIBUTES,
+                _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                None,
+                _OPEN_EXISTING,
+                _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+            if handle is None or handle == _INVALID_HANDLE_VALUE:
+                err = ctypes.get_last_error()
+                raise ctypes.WinError(err)
+            return int(handle)
+        raise NotImplementedError("WindowsFilesystemAdapter requires Windows")
 
     @staticmethod
     def _close_handle(handle: int) -> None:
@@ -732,14 +715,14 @@ class WindowsFilesystemAdapter(FilesystemAdapter):
     @staticmethod
     def _get_handle_info(handle: int) -> tuple[int, int, int]:
         """读取句柄的 (dwFileAttributes, dwVolumeSerialNumber, nFileIndex64)。"""
-        if sys.platform != "win32":
-            raise NotImplementedError("WindowsFilesystemAdapter requires Windows")
-        info = _BY_HANDLE_FILE_INFORMATION()
-        if not _kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
-            err = ctypes.get_last_error()
-            raise ctypes.WinError(err)
-        file_index = (info.nFileIndexHigh << 32) | info.nFileIndexLow
-        return (int(info.dwFileAttributes), int(info.dwVolumeSerialNumber), int(file_index))
+        if sys.platform == "win32":
+            info = _BY_HANDLE_FILE_INFORMATION()
+            if not _kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+                err = ctypes.get_last_error()
+                raise ctypes.WinError(err)
+            file_index = (info.nFileIndexHigh << 32) | info.nFileIndexLow
+            return (int(info.dwFileAttributes), int(info.dwVolumeSerialNumber), int(file_index))
+        raise NotImplementedError("WindowsFilesystemAdapter requires Windows")
 
     @classmethod
     def _verify_pinned_dir(

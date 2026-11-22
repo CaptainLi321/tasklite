@@ -585,7 +585,7 @@ class StateSnapshot:
 
     def __init__(
         self,
-        source: str | Path | "TaskLite",
+        source: str | Path | TaskLite,
         *,
         mode: Literal["lazy", "copy"] = "lazy",
     ) -> None:
@@ -627,7 +627,7 @@ class StateSnapshot:
     @classmethod
     def open(
         cls,
-        source: str | Path | "TaskLite",
+        source: str | Path | TaskLite,
         *,
         mode: Literal["lazy", "copy"] = "lazy",
     ) -> StateSnapshot:

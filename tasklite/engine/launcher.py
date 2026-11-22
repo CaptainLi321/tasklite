@@ -327,8 +327,17 @@ class _BasePopenWorkerHandle(ABC):
 # ── Windows 进程树适配（无窗口独立控制台 + Job Object）────────────────────────
 
 
+def _win_get_last_error() -> int:
+    """跨平台读取 Win32 线程错误码，确保非 Windows 静态类型检查收窄安全。"""
+    if sys.platform == "win32":
+        return ctypes.get_last_error()
+    return 0
+
+
 def _build_win_job_structures() -> tuple[Any, Any]:
     """按 64 位安全对齐构造 Windows Job Object ctypes 结构体并绑定 kernel32。"""
+    if sys.platform != "win32":
+        raise NotImplementedError("Windows Job Object requires Windows")
     from ctypes import wintypes
 
     class _BasicLimitInfo(ctypes.Structure):
@@ -493,7 +502,7 @@ class WindowsProcessTreeAdapter(ProcessTreeAdapter):
         """创建仅启用 KILL_ON_JOB_CLOSE（严禁 BREAKAWAY_OK）的匿名 Job Object。"""
         h_job = kernel.CreateJobObjectW(None, None)
         if not h_job:
-            err = ctypes.get_last_error()
+            err = _win_get_last_error()
             raise _win_os_error("CreateJobObjectW", err)
         try:
             info = extended_limit_cls()
@@ -505,7 +514,7 @@ class WindowsProcessTreeAdapter(ProcessTreeAdapter):
                 ctypes.sizeof(info),
             )
             if not ok:
-                err = ctypes.get_last_error()
+                err = _win_get_last_error()
                 raise _win_os_error("SetInformationJobObject", err)
         except BaseException:
             try:
@@ -547,7 +556,7 @@ class WindowsProcessTreeAdapter(ProcessTreeAdapter):
                     int(worker_pid),
                 )
                 if not h_worker_proc:
-                    err = ctypes.get_last_error()
+                    err = _win_get_last_error()
                     raise _win_os_error("OpenProcess", err)
                 worker_assigned = False
                 try:
@@ -555,7 +564,7 @@ class WindowsProcessTreeAdapter(ProcessTreeAdapter):
                     created_jobs.append(h_worker_job)
                     ok = kernel.AssignProcessToJobObject(h_worker_job, int(h_worker_proc))
                     if not ok:
-                        err = ctypes.get_last_error()
+                        err = _win_get_last_error()
                         raise _win_os_error("AssignProcessToJobObject", err)
                     worker_assigned = True
                 except BaseException:
@@ -581,7 +590,7 @@ class WindowsProcessTreeAdapter(ProcessTreeAdapter):
                 raise OSError("subprocess.Popen missing native _handle on Windows")
             ok = kernel.AssignProcessToJobObject(h_proc_job, int(raw_handle))
             if not ok:
-                err = ctypes.get_last_error()
+                err = _win_get_last_error()
                 raise _win_os_error("AssignProcessToJobObject", err)
         except BaseException:
             for h_job in created_jobs:

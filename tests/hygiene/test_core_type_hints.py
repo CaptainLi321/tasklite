@@ -17,25 +17,22 @@ property 的类型注解必须能被 ``typing.get_type_hints`` 解析。
 import ast
 import importlib
 import inspect
+import pathlib
 import pkgutil
 import typing
 
 import pytest
 
-CORE_PACKAGES = (
-    "tasklite.utils",
-    "tasklite.models",
-    "tasklite.backend",
-    "tasklite.engine",
-    "tasklite.pipeline",
-    "tasklite.edit",
-    "tasklite.snapshot",
-    "tasklite._report",
-    "tasklite.resource",
-    "tasklite.selection",
-    "tasklite.__main__",
-    "tasklite.testing",
-)
+import tasklite
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+def _iter_core_modules():
+    """自动发现 tasklite 包下全部源码模块，避免新增顶层模块或子包静默逃逸。"""
+    yield "tasklite"
+    for mod in pkgutil.walk_packages(tasklite.__path__, prefix="tasklite."):
+        yield mod.name
 
 
 def _is_static_only_branch(test) -> bool:
@@ -120,17 +117,6 @@ def _resolve_hints(func, module):
         return typing.get_type_hints(func, localns=_fallback_namespace(_type_checking_only_names(module)))
 
 
-def _iter_core_modules():
-    for pkg_name in CORE_PACKAGES:
-        pkg = importlib.import_module(pkg_name)
-        pkg_path = getattr(pkg, "__path__", None)
-        if pkg_path is None:
-            yield pkg_name
-            continue
-        for mod in pkgutil.walk_packages(pkg_path, prefix=pkg_name + "."):
-            yield mod.name
-
-
 def _iter_annotated_callables():
     cases = []
     for mod_name in _iter_core_modules():
@@ -175,3 +161,23 @@ def test_type_hints_resolvable(module_name, qualname):
     elif isinstance(obj, property):
         obj = obj.fget
     _resolve_hints(obj, module)
+
+
+def test_no_string_literal_inside_pep604_union():
+    """Python 3.10-3.13 在 from __future__ import annotations 下对 A | 'B' 抛 TypeError。"""
+    violations: list[str] = []
+    pkg_dir = _REPO_ROOT / "tasklite"
+    for py_file in sorted(pkg_dir.rglob("*.py")):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+                if any(
+                    isinstance(side, ast.Constant) and isinstance(side.value, str)
+                    for side in (node.left, node.right)
+                ):
+                    rel = py_file.relative_to(_REPO_ROOT).as_posix()
+                    violations.append(f"{rel}:{node.lineno}: {ast.unparse(node)}")
+    assert not violations, (
+        "PEP 604 `|` 联合注解中禁止混用字符串字面量（Python 3.10-3.13 get_type_hints 不兼容）：\n"
+        + "\n".join(violations)
+    )
