@@ -1190,3 +1190,72 @@ class TestAuthorizationParity:
         assert records[0]["target_type"] == "directory"
         assert b.revoke_authorization(lower_path) is True
         assert b.list_authorizations() == []
+
+    def test_settlement_failure_none_payload_clears_stale_payload(self, dual_backend):
+        """双后端对等：先带 payload 失败，再重入队以 payload=None 失败时须清空旧 payload。"""
+        b = dual_backend
+        uid = "t::stale_payload"
+        snap = {"task_type": "t", "job_id": "stale_payload", "payload": {"v": 1}}
+        b.enqueue_jobs([snap])
+        b.mark_job_running(uid, execution_id="r1.1", run_id="r1", started_at="2026-01-01T00:00:00Z")
+        b.commit_job_settlement(
+            job_uid=uid,
+            outcome="failure",
+            attempt_no=1,
+            execution_id="r1.1",
+            run_id="r1",
+            settled_at="2026-01-01T00:00:01Z",
+            job_snapshot=snap,
+            failure_metadata={"error_message": "first"},
+            payload={"old_key": "stale_value"},
+        )
+        assert b.load_consistent_snapshot()["failure_payloads"].get(uid) == {"old_key": "stale_value"}
+
+        b.enqueue_jobs([snap])
+        b.mark_job_running(uid, execution_id="r2.1", run_id="r2", started_at="2026-01-01T00:01:00Z")
+        b.commit_job_settlement(
+            job_uid=uid,
+            outcome="failure",
+            attempt_no=2,
+            execution_id="r2.1",
+            run_id="r2",
+            settled_at="2026-01-01T00:01:01Z",
+            job_snapshot=snap,
+            failure_metadata={"error_message": "second"},
+            payload=None,
+        )
+        assert uid not in b.load_consistent_snapshot()["failure_payloads"]
+
+    def test_settlement_success_spawned_jobs_strip_internal_execution_id(self, dual_backend):
+        """双后端对等：成功结算派生作业落库时统一剥离内部执行代号键。"""
+        from tasklite.backend.base import QUEUE_EXECUTION_ID_KEY
+
+        b = dual_backend
+        parent_uid = "t::parent"
+        child_uid = "t::child"
+        parent_snap = {"task_type": "t", "job_id": "parent", "payload": {}}
+        child_snap = {
+            "task_type": "t",
+            "job_id": "child",
+            "payload": {"k": 1},
+            QUEUE_EXECUTION_ID_KEY: "leaked.1",
+        }
+        b.enqueue_jobs([parent_snap])
+        b.mark_job_running(
+            parent_uid, execution_id="r1.1", run_id="r1", started_at="2026-01-01T00:00:00Z"
+        )
+        b.commit_job_settlement(
+            job_uid=parent_uid,
+            outcome="success",
+            attempt_no=1,
+            execution_id="r1.1",
+            run_id="r1",
+            settled_at="2026-01-01T00:00:01Z",
+            job_snapshot=parent_snap,
+            success_metadata={"result": {"ok": True}},
+            spawned_job_snapshots=[child_snap],
+        )
+        queued = b.load_queue_jobs()
+        assert len(queued) == 1
+        assert queued[0]["job_uid"] == child_uid
+        assert QUEUE_EXECUTION_ID_KEY not in queued[0]["job"]

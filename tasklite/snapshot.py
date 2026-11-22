@@ -338,7 +338,7 @@ class _SqliteStreamingAdapter:
                 row[3],
                 row[4],
                 _decode_json_dict(row[5]),
-                _decode_json_dict(row[6]),
+                _decode_json_optional_dict(row[6]),
                 _decode_attempt_result(row[7], row[8]),
             )
 

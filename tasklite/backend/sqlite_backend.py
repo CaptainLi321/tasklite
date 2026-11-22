@@ -877,7 +877,7 @@ class SQLiteStateBackend(AbstractStateBackend):
                         (
                             job_uid_from_snapshot(j),
                             pos,
-                            dumps(j),
+                            dumps(public_queue_snapshot(j)),
                             "pending",
                             None,
                             None,

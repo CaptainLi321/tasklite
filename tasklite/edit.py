@@ -131,11 +131,12 @@ class _GraphTables:
 
 @dataclass(frozen=True)
 class _ValidationReport:
-    """闭环体检结果：硬错误、OS 异常与只读告警。"""
+    """闭环体检纯计算结果：硬错误、OS 异常、只读告警及验盘规范路径修正表。"""
 
     errors: tuple[str, ...]
     os_errors: tuple[str, ...]
     warnings: tuple[str, ...]
+    canonical_output_paths: tuple[tuple[str, str, str], ...] = ()
 
 
 def _validate_uid(uid: Any, *, param_name: str = "uid") -> str:
@@ -309,6 +310,8 @@ class EditTransaction:
                 raise TaskLiteError(
                     f"EditTransaction validation failed ({len(report.errors)} error(s)):\n{summary}"
                 )
+
+            self._apply_canonical_output_paths(report.canonical_output_paths)
 
             if not self._dry_run:
                 commit = self._build_commit()
@@ -763,10 +766,11 @@ class EditTransaction:
         return snap
 
     def diff(self) -> str:
-        """生成面向人类的 6 段紧凑对比报告（永不因校验失败或 OSError 抛异常）。"""
+        """生成面向人类的 6 段紧凑对比报告（纯只读预览，永不修改工作图或因校验/OSError 抛异常）。"""
         self._require_entered()
         report = self._validate(capture_os_errors=True)
-        self._emit_warnings(report.warnings)
+        if self._active:
+            self._emit_warnings(report.warnings)
 
         before_counts = self._base.count_statuses()
         after_counts = self._work.count_statuses()
@@ -976,12 +980,37 @@ class EditTransaction:
         for warn in warnings:
             logger.warning("TaskLite edit warning: %s", warn)
 
+    def _apply_canonical_output_paths(
+        self, updates: tuple[tuple[str, str, str], ...]
+    ) -> None:
+        """仅在退出校验通过后的受控收尾阶段将验盘确认的规范路径回填至工作图。"""
+        if not updates:
+            return
+        changed = False
+        for uid, fname, canonical_path in updates:
+            manual_succ_meta = self._work.successes.get(uid)
+            if manual_succ_meta is None:
+                continue
+            outer_files = manual_succ_meta.setdefault("files", {})
+            artifacts = manual_succ_meta.setdefault("artifacts", {})
+            existing_file = outer_files.get(fname)
+            if isinstance(existing_file, dict) and existing_file.get("path") != canonical_path:
+                existing_file["path"] = canonical_path
+                changed = True
+            existing_art = artifacts.get(fname)
+            if not isinstance(existing_art, dict) or existing_art.get("path") != canonical_path:
+                artifacts[fname] = {"path": canonical_path}
+                changed = True
+        if changed:
+            self._after_cache = None
+
     # ── 4 项硬 Error 单次全量攒错 + 4 类只读 Warning ──────────────────
 
     def _validate(self, *, capture_os_errors: bool) -> _ValidationReport:
         errors: list[str] = []
         os_errors: list[str] = []
         warnings: list[str] = []
+        canonical_output_paths: list[tuple[str, str, str]] = []
 
         g_before = self._base.all_uids()
         g_after = self._work.all_uids()
@@ -1172,21 +1201,7 @@ class EditTransaction:
                         f"{inspected.canonical_path}"
                     )
                 else:
-                    # 验盘确认的规范路径当场同步回填至外层 files/artifacts 并失效 after 缓存
-                    canonical_path = inspected.canonical_path
-                    outer_files = manual_succ_meta.setdefault("files", {})
-                    artifacts = manual_succ_meta.setdefault("artifacts", {})
-                    changed = False
-                    existing_file = outer_files.get(fname)
-                    if isinstance(existing_file, dict) and existing_file.get("path") != canonical_path:
-                        existing_file["path"] = canonical_path
-                        changed = True
-                    existing_art = artifacts.get(fname)
-                    if not isinstance(existing_art, dict) or existing_art.get("path") != canonical_path:
-                        artifacts[fname] = {"path": canonical_path}
-                        changed = True
-                    if changed:
-                        self._after_cache = None
+                    canonical_output_paths.append((uid, fname, inspected.canonical_path))
 
         # ── 只读 Warning #1 / #2 / #3（Warning #4 已在 Error 3 循环收集）
         removed_uids, _, _, _ = self._classify_diff_changes()
@@ -1228,6 +1243,7 @@ class EditTransaction:
             errors=tuple(errors),
             os_errors=tuple(os_errors),
             warnings=tuple(warnings),
+            canonical_output_paths=tuple(canonical_output_paths),
         )
 
     # ── O(Δ) 声明式提交载荷构造 ───────────────────────────────────────

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+import copy
 import logging
 import sqlite3
 from pathlib import Path
@@ -1165,3 +1166,33 @@ class TestReplacePartitionsCanonicalPathsAndReentrancy:
             assert p.enqueue(Job("t", "after_exception")) is True
             p.set_cursor("seed", "v2")
             assert p.get_cursor("seed") == "v2"
+
+    @pytest.mark.parametrize("backend_kind", ["sqlite", "memory"])
+    def test_diff_is_pure_read_only_without_mutating_work_or_frozen_after(
+        self, backend_kind, tmp_path
+    ):
+        """diff() 预览严格只读：块内与退出后调用均不得原地改写工作图或使冻结 tx.after 失效。"""
+        out_file = tmp_path / "cached.txt"
+        out_file.write_text("ok", encoding="utf-8")
+
+        with _make_pipeline(backend_kind, tmp_path) as p:
+            p.register_task("t", _ok_handler)
+            with p.edit(dry_run=True) as tx:
+                tx.add(
+                    Job("t", "manual_ok", files={"out": FileSpec(out_file, role="output")}),
+                    status="succeeded",
+                )
+                work_before_diff = copy.deepcopy(tx._work.successes)
+                cached_after_before = tx.after
+                _ = tx.diff()
+                assert tx._work.successes == work_before_diff
+                assert tx.after is cached_after_before
+
+            # 退出后冻结的 tx.after 稳定可读，再次调用 diff() 仍不改写工作图或破坏冻结缓存
+            frozen_after = tx.after
+            work_after_exit = copy.deepcopy(tx._work.successes)
+            version_before = tx._logged_warnings_version
+            _ = tx.diff()
+            assert tx.after is frozen_after
+            assert tx._work.successes == work_after_exit
+            assert tx._logged_warnings_version == version_before

@@ -498,6 +498,8 @@ class InMemoryStateBackend(AbstractStateBackend):
                 new_failed[job_uid] = copy.deepcopy(failure_metadata or {})
                 if payload is not None:
                     new_failure_payloads[job_uid] = copy.deepcopy(payload)
+                else:
+                    new_failure_payloads.pop(job_uid, None)
                 new_successes.pop(job_uid, None)
 
             elif outcome == "retry":
