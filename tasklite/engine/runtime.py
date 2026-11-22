@@ -1,14 +1,13 @@
-"""EngineRuntime：v2 核心运行期深模块（装配 + 薄事件泵）。
+"""EngineRuntime：v2 核心运行期深模块（装配 + 薄四相事件泵）。
 
-统一聚合主循环事件泵（四相：填池派发 → 死锁仲裁 → 回收结算 → 等待
-决策）、五关预检派发、结果收敛事务、崩溃/停机恢复与在途追踪。装配
-快照见 RunConfig（engine/config.py）；一次 run 的生命周期状态
-见 RunSession（engine/session.py）。
+统一聚合主循环事件泵（四相：回收结算 → 填池派发 → 死锁仲裁 → 等待决策）、
+机器群装配、停机信号管理与异常承重网。主进程文件声明与三类授权等待统一
+下沉至 ``AuthorizationCoordinator``；一次 run 的生命周期与排除状态归属
+``RunSession``。
 """
 from __future__ import annotations
 
 import logging
-import os
 import pickle
 import signal
 import threading
@@ -20,38 +19,24 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
-from ._worker_runtime import stop_signals
-from .config import RunConfig
-from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
-from .channel import ExecutionChannel
-from .completion import CompletionMachine
-from .resource import RunNotifier
-from .selection import SelectionMachine, SelectionStandstill
-from .in_flight import InFlightTracker
-from .recovery import RecoveryOrchestrator
-from .scheduler import DeadlockAttribution, JobScheduler
-from .session import RunSession
-from .store import StateStore
-from .types import (
-    AuthorizationOutcome,
-    AuthorizationStatus,
-    ExecutionOptions,
-    ExitReason,
-    JobHandle,
-    PendingDeclaration,
-    StepOutcome,
-    StopMode,
-)
-from .wait import LoopFacts, decide_wait
 from ..backend.base import AbstractStateBackend
 from ..exceptions import TaskLiteError
-from ..models.artifact import (
-    FileSpec,
-    merge_named_file_spec,
-    validate_file_name,
-)
-from ..models.job import Job
-from ..models.state import PipelineState, job_uid_from_snapshot
+from ..models.state import PipelineState
+from ._worker_runtime import stop_signals
+from .authorization import AuthorizationCoordinator
+from .channel import ExecutionChannel
+from .completion import CompletionMachine
+from .config import RunConfig
+from .dispatch import DispatchKind, DispatchMachine, DispatchOutcome
+from .governor import SelectionStandstill
+from .in_flight import InFlightTracker
+from .recovery import RecoveryOrchestrator
+from .resource import RunNotifier
+from .scheduler import JobScheduler
+from .session import RunSession
+from .store import StateStore
+from .types import ExecutionOptions, StepOutcome, StopMode
+from .wait import LoopFacts, decide_wait
 
 logger = logging.getLogger("tasklite")
 
@@ -93,8 +78,7 @@ class EngineRuntime:
         )
 
         # 构造期即建 StateStore（enqueue 与管理写操作在 run 前可用）。
-        # backend 所有权唯一锚定 StateStore（RunConfig.backend 仅为构造
-        # 期装配快照的搬运通道），运行期一切读写经 store.backend 派生。
+        # backend 所有权唯一锚定 StateStore，运行期一切读写经 store.backend 派生。
         self.store: StateStore = StateStore(
             config.backend,
             tasks=config.tasks,
@@ -107,19 +91,25 @@ class EngineRuntime:
         self.channel: ExecutionChannel = config.channel
         self._in_flight: InFlightTracker = InFlightTracker()
         self._notifier: RunNotifier = RunNotifier()
+        self._authorization = AuthorizationCoordinator(
+            store=self.store,
+            channel=self.channel,
+            in_flight=self._in_flight,
+            session=self._session,
+        )
 
-        # 构建机器依赖拓扑（recovery 依赖 completion）
+        # 构建机器依赖拓扑（recovery 依赖 completion，三者共享授权协调器）
         self._completion = CompletionMachine(
             store=self.store,
             channel=self.channel,
             resources=config.resources,
             in_flight=self._in_flight,
             session=self._session,
+            authorization=self._authorization,
         )
         self._recovery = RecoveryOrchestrator(
             store=self.store,
             channel=self.channel,
-            resources=config.resources,
             in_flight=self._in_flight,
             completion=self._completion,
         )
@@ -134,360 +124,30 @@ class EngineRuntime:
             session=self._session,
             completion=self._completion,
             tasks=config.tasks,
+            authorization=self._authorization,
             dispatch_start_lock=self._dispatch_start_lock,
         )
 
         self._is_running: bool = False
-        self.selection_machine: SelectionMachine = SelectionMachine(
-            self.store, session=self._session
+        self.channel.set_declaration_handler(self._authorization.handle_declaration)
+        self.channel.set_authorization_queries(
+            is_timeout_paused=self._authorization.is_timeout_paused,
+            get_outcome=self._authorization.get_declaration_outcome,
         )
-        self.channel.set_declaration_handler(self._handle_declaration)
         self.channel.set_wakeup_callback(self._notifier.notify)
-
-    def _handle_declaration(
-        self, handle: JobHandle, payload: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        """主进程动态文件声明仲裁出口：验证引用、授权检查、前置清理并回送路径。"""
-        raw_req_id = payload.get("request_id")
-        if not isinstance(raw_req_id, str) or not raw_req_id:
-            return {
-                "request_id": "",
-                "status": "error",
-                "error": "request_id must be a non-empty str",
-            }
-        req_id = raw_req_id
-        name = payload.get("name", "")
-        spec_data = payload.get("spec", {})
-        entry = self._in_flight.get(handle.job_uid)
-        if entry is None or not self._declaration_identity_matches(handle, entry):
-            return {
-                "request_id": req_id,
-                "status": "error",
-                "error": f"Job {handle.job_uid} not in flight",
-            }
-        if handle.authorization_outcome is not None:
-            return {
-                "request_id": req_id,
-                "status": "error",
-                "error": f"Job {handle.job_uid} execution is no longer accepting declarations",
-            }
-        if handle.pending_declaration is not None:
-            return {
-                "request_id": req_id,
-                "status": "error",
-                "error": f"Job {handle.job_uid} already has a pending declaration",
-            }
-
-        try:
-            spec = FileSpec.from_dict(spec_data)
-            validated_name = validate_file_name(name)
-        except Exception as exc:
-            return {"request_id": req_id, "status": "error", "error": str(exc)}
-
-        # 1. 幂等与冲突检查
-        try:
-            merged, is_new = merge_named_file_spec(
-                entry.active_file_sources,
-                validated_name,
-                spec,
-                base_dir=self.store.base_dir,
-                depends_on=handle.job.depends_on,
-            )
-        except Exception as exc:
-            return {"request_id": req_id, "status": "error", "error": str(exc)}
-        source_spec = merged[validated_name]
-        if not is_new:
-            existing = entry.active_files.get(validated_name)
-            if existing is None or existing.path is None:
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": f"File declaration {validated_name!r} has no resolved path",
-                }
-            return {
-                "request_id": req_id,
-                "status": "ok",
-                "resolved_path": existing.path,
-            }
-
-        # 2. 单次原子解析（上游引用、安全边界、存在性判定与路径绑定）
-        needs_authorization = (
-            source_spec.delete_existing
-            or source_spec.delete_on_success
-            or source_spec.delete_on_failure
-        )
-        if not needs_authorization:
-            try:
-                bound_spec = self.store.resolve_file_spec(
-                    source_spec,
-                    depends_on=handle.job.depends_on,
-                    enforce_safety=False,
-                )
-            except Exception as exc:
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": str(exc),
-                }
-            assert bound_spec.path is not None
-            resolved_path = bound_spec.path
-            logger.info(
-                f"FILE DECLARATION: {handle.job_uid} requested "
-                f"{validated_name!r} at {resolved_path}"
-            )
-            request = PendingDeclaration(
-                request_id=req_id,
-                name=validated_name,
-                source=source_spec,
-                bound=bound_spec,
-                resolved_path=resolved_path,
-            )
-            self._record_declaration(entry, request)
-            request.status = AuthorizationStatus.APPROVED
-            logger.info(
-                f"FILE DECLARATION APPROVED: {handle.job_uid} {resolved_path}"
-            )
-            return self._declaration_reply(request)
-
-        try:
-            bound_spec = self.store.resolve_file_spec(
-                source_spec,
-                depends_on=handle.job.depends_on,
-                enforce_safety=True,
-            )
-        except (TaskLiteError, FileNotFoundError) as exc:
-            return {
-                "request_id": req_id,
-                "status": "error",
-                "error": str(exc),
-            }
-        except (OSError, ValueError, NotImplementedError) as exc:
-            error = {
-                "type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            }
-            if source_spec.is_output_ref and source_spec.producer_uid and source_spec.output_name:
-                desc = (
-                    self.store.state.successes.get(source_spec.producer_uid, {})
-                    .get("artifacts", {})
-                    .get(source_spec.output_name, {})
-                )
-                fallback_path = str(desc.get("path", "")) if isinstance(desc, dict) else ""
-            else:
-                fallback_path = source_spec.path or ""
-            fallback_bound = source_spec
-            if fallback_path:
-                try:
-                    fallback_path = self.store.path_policy.inspect(
-                        fallback_path, mode="lookup"
-                    ).canonical_path
-                except (OSError, ValueError, NotImplementedError):
-                    pass
-                try:
-                    fallback_bound = source_spec._bind_output_path(fallback_path)
-                except (TaskLiteError, ValueError):
-                    fallback_bound = source_spec
-            request = PendingDeclaration(
-                request_id=req_id,
-                name=validated_name,
-                source=source_spec,
-                bound=fallback_bound,
-                resolved_path=fallback_path,
-            )
-            handle.pending_declaration = request
-            handle.pause_timeout()
-            return self._finish_authorization(
-                handle,
-                entry,
-                request,
-                AuthorizationStatus.PREPARATION_FAILED,
-                error["message"],
-                error,
-            )
-
-        assert bound_spec.path is not None
-        validated_path = bound_spec.path
-        logger.info(
-            f"FILE DECLARATION: {handle.job_uid} requested "
-            f"{validated_name!r} at {validated_path}"
-        )
-        request = PendingDeclaration(
-            request_id=req_id,
-            name=validated_name,
-            source=source_spec,
-            bound=bound_spec,
-            resolved_path=validated_path,
-        )
-        handle.pending_declaration = request
-        handle.pause_timeout()
-        if self._session.stop_mode is not StopMode.NONE:
-            self._finish_authorization(
-                handle,
-                entry,
-                request,
-                AuthorizationStatus.STOPPED,
-                f"authorization wait stopped for {validated_path}",
-            )
-            return None
-        logger.info(
-            f"FILE AUTHORIZATION WAIT: {handle.job_uid} {validated_path}"
-        )
-        authorized = self.store.check_or_request_authorization(validated_path)
-        if authorized is None:
-            return None
-        return self._apply_authorization_decision(handle, entry, request, authorized)
-
-    def _declaration_identity_matches(self, handle: JobHandle, entry: Any) -> bool:
-        """请求句柄必须与当前在飞执行使用同一 job、run、attempt 与 execution 身份。"""
-        if entry.handle is not handle or entry.job_uid != handle.job_uid:
-            return False
-        if not handle.execution_id or entry.execution_id != handle.execution_id:
-            return False
-        if handle.run_id is not None and entry.run_id != handle.run_id:
-            return False
-        if handle.attempt_no is not None and entry.attempt_no != handle.attempt_no:
-            return False
-        if self._session.run_id is not None and entry.run_id != self._session.run_id:
-            return False
-        return True
-
-    def _record_declaration(self, entry: Any, request: PendingDeclaration) -> None:
-        entry.active_file_sources[request.name] = request.source
-        entry.active_files[request.name] = request.bound
-
-    def _validate_declaration_target(
-        self, request: PendingDeclaration
-    ) -> tuple[str, dict[str, str] | None]:
-        try:
-            return self.store.path_policy.inspect(
-                request.resolved_path,
-                mode="pre_delete" if request.bound.delete_existing else "strict",
-            ).canonical_path, None
-        except (OSError, ValueError, NotImplementedError) as exc:
-            return request.resolved_path, {
-                "type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            }
-
-    def _apply_authorization_decision(
-        self,
-        handle: JobHandle,
-        entry: Any,
-        request: PendingDeclaration,
-        authorized: bool,
-    ) -> dict[str, Any] | None:
-        if (
-            handle.pending_declaration is not request
-            or request.status is not AuthorizationStatus.PENDING
-            or handle.authorization_outcome is not None
-        ):
-            return None
-        if self._session.stop_mode is not StopMode.NONE:
-            message = f"authorization wait stopped for {request.resolved_path}"
-            self._finish_authorization(
-                handle, entry, request, AuthorizationStatus.STOPPED, message
-            )
-            return {
-                "request_id": request.request_id,
-                "status": "stopped",
-                "error": message,
-            }
-        if authorized is False:
-            message = f"authorization denied for {request.resolved_path}"
-            self._finish_authorization(
-                handle, entry, request, AuthorizationStatus.DENIED, message
-            )
-            return {
-                "request_id": request.request_id,
-                "status": "denied",
-                "error": message,
-            }
-
-        if request.bound.delete_existing:
-            try:
-                self.store.path_policy.delete(
-                    request.resolved_path,
-                    allow_broken_leaf_symlink=True,
-                    authorize=self.store.backend.is_path_authorized,
-                )
-            except (OSError, ValueError, NotImplementedError) as exc:
-                error = {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "traceback": traceback.format_exc(),
-                }
-                message = f"Artifact preparation failed for {request.resolved_path}: {exc}"
-                self._finish_authorization(
-                    handle,
-                    entry,
-                    request,
-                    AuthorizationStatus.PREPARATION_FAILED,
-                    message,
-                    error,
-                )
-                return None
-
-        request.status = AuthorizationStatus.APPROVED
-        handle.pending_declaration = None
-        handle.resume_timeout()
-        self._record_declaration(entry, request)
-        logger.info(
-            f"FILE AUTHORIZATION APPROVED: {handle.job_uid} {request.resolved_path}"
-        )
-        return self._declaration_reply(request)
-
-    def _finish_authorization(
-        self,
-        handle: JobHandle,
-        entry: Any,
-        request: PendingDeclaration,
-        status: AuthorizationStatus,
-        message: str,
-        exception: dict[str, str] | None = None,
-    ) -> dict[str, Any] | None:
-        if (
-            handle.pending_declaration is not request
-            or handle.authorization_outcome is not None
-        ):
-            return None
-        request.status = status
-        handle.pending_declaration = None
-        handle.authorization_outcome = AuthorizationOutcome(
-            status=status,
-            message=message,
-            path=request.resolved_path,
-            exception=exception,
-        )
-        handle.resume_timeout()
-        self._record_declaration(entry, request)
-        logger.info(
-            f"FILE AUTHORIZATION {status.value.upper()}: "
-            f"{handle.job_uid} {request.resolved_path} ({message})"
-        )
-        self.channel.terminate_process(handle)
-        return None
-
-    @staticmethod
-    def _declaration_reply(request: PendingDeclaration) -> dict[str, Any]:
-        return {
-            "request_id": request.request_id,
-            "status": "ok",
-            "resolved_path": request.resolved_path,
-        }
 
     @property
     def session(self) -> RunSession:
         return self._session
 
     @property
-    def backend(self) -> AbstractStateBackend:
-        """持久化后端只读派生引用（所有权唯一锚定 StateStore）。
+    def authorization(self) -> AuthorizationCoordinator:
+        """主进程文件声明与三类授权等待的统一协调器。"""
+        return self._authorization
 
-        换库唯一经 ``store.set_backend`` 单点，本属性每次读取实时派生，
-        不持有独立可变引用——新增需要后端的机器一律经本接缝取用。
-        """
+    @property
+    def backend(self) -> AbstractStateBackend:
+        """持久化后端只读派生引用（所有权唯一锚定 StateStore）。"""
         return self.store.backend
 
     @property
@@ -550,17 +210,7 @@ class EngineRuntime:
                 return self._session.stop_mode
             mode = self._session.request_stop()
         self.channel.cancel_pending_launches()
-        for handle in self._in_flight.active_handles():
-            request = handle.pending_declaration
-            entry = self._in_flight.get(handle.job_uid)
-            if request is not None and entry is not None:
-                self._finish_authorization(
-                    handle,
-                    entry,
-                    request,
-                    AuthorizationStatus.STOPPED,
-                    f"authorization wait stopped for {request.resolved_path}",
-                )
+        self._authorization.notify_stop()
         self._notifier.notify()
         return mode
 
@@ -572,11 +222,12 @@ class EngineRuntime:
         with self._dispatch_start_lock:
             if self._is_running:
                 raise TaskLiteError("Pipeline run() already in progress on this instance.")
-            self._session.begin()
+            self._session.begin(exclude=opts.exclude)
             self._is_running = True
 
         try:
-            self.scheduler.reset_run(opts.exclude)
+            self._authorization.clear_all()
+            self.scheduler.begin_round()
 
             with self.store.exclusive_access():
                 try:
@@ -598,8 +249,7 @@ class EngineRuntime:
     # ── 四相事件泵 ────────────────────────────────────────────────────
 
     def _terminal_outcome(self) -> StepOutcome:
-        """三个终态早退（ABORTING / 排空完毕 / 空闲完成）的统一形状：
-        全零计数 + should_terminate=True + 当前停机态与退出原因透传。"""
+        """终态早退（排空完毕 / 空闲完成）的统一形状。"""
         return StepOutcome(
             dispatched_count=0,
             settled_count=0,
@@ -615,21 +265,12 @@ class EngineRuntime:
     def _fill_dispatch_pool(
         self, limit: int, draining: bool
     ) -> tuple[DispatchOutcome | None, float, int]:
-        """相一·填池派发（仅非 DRAINING 且未超单步上限）：逐个 dispatch_next，
-        SPAWNED / HANDLED_NO_SUBPROCESS 继续填池，WORKER_SATURATED /
-        NO_CANDIDATE 断流即停；worker_wait 聚合取 min（多次资源挂起恢复
-        取最早者）。
-
-        Returns:
-            (最后一次派发结果或 None, worker_wait 最小值或 0, 实派发计数)
-        """
+        """相二·填池派发（仅非 DRAINING、无在途授权等待且未超单步上限）。"""
         last_outcome: DispatchOutcome | None = None
         worker_wait = 0.0
         dispatched = 0
         if not draining:
-            if self._completion.waiting_authorization or any(
-                h.waiting_auth for h in self._in_flight.active_handles()
-            ):
+            if self._authorization.has_in_flight_authorization_wait:
                 return last_outcome, worker_wait, dispatched
             while dispatched < limit and self._session.stop_mode is StopMode.NONE:
                 outcome = self._dispatch.dispatch_next()
@@ -651,7 +292,7 @@ class EngineRuntime:
     def _arbitrate_deadlock(
         self, last_outcome: DispatchOutcome | None, store: StateStore
     ) -> DeadlockArbitration:
-        """相二·无可运行候选时的死锁归因（委托 DeadlockGovernor 自闭环仲裁）。"""
+        """相三·无可运行候选时的死锁归因（委托 DeadlockGovernor 自闭环仲裁）。"""
         deadlock_detected = False
         should_terminate = False
         wait_seconds = 0.0
@@ -659,23 +300,10 @@ class EngineRuntime:
             if store.state.is_empty and not self._in_flight:
                 should_terminate = True
             elif not self._in_flight:
-                if self.selection_machine is not None:
-                    try:
-                        decision = self.governor.arbitrate(
-                            last_outcome.standstill,
-                            store=self.store,
-                            selection_machine=self.selection_machine,
-                        )
-                    except TypeError:
-                        decision = self.governor.arbitrate(
-                            last_outcome.standstill,
-                            store=self.store,
-                        )
-                else:
-                    decision = self.governor.arbitrate(
-                        last_outcome.standstill,
-                        store=self.store,
-                    )
+                decision = self.governor.arbitrate(
+                    last_outcome.standstill,
+                    store=self.store,
+                )
                 if decision.action in ("resolved", "selection_blocked"):
                     if decision.action == "selection_blocked":
                         if decision.standstill is not None:
@@ -684,7 +312,7 @@ class EngineRuntime:
                         deadlock_detected = True
                     if decision.should_terminate:
                         should_terminate = True
-                elif decision.action in ("grace_waiting", "gap_retrying"):
+                elif decision.action == "gap_retrying":
                     if decision.wait_time > 0:
                         wait_seconds = decision.wait_time
         return DeadlockArbitration(
@@ -707,63 +335,14 @@ class EngineRuntime:
             "completed with the queue preserved."
         )
 
-    def _poll_pending_authorizations(self) -> None:
-        """轮询处于等待中的文件声明授权；若已决策则恢复执行或终止。"""
-        is_stopping = self._session.stop_mode is not StopMode.NONE
-        for handle in self._in_flight.active_handles():
-            request = handle.pending_declaration
-            if request is None or not handle.waiting_auth:
-                continue
-            entry = self._in_flight.get(handle.job_uid)
-            if entry is None or not self._declaration_identity_matches(handle, entry):
-                continue
-
-            if is_stopping:
-                self._finish_authorization(
-                    handle,
-                    entry,
-                    request,
-                    AuthorizationStatus.STOPPED,
-                    f"authorization wait stopped for {request.resolved_path}",
-                )
-                continue
-
-            validated_path, error = self._validate_declaration_target(request)
-            if error is not None:
-                self._finish_authorization(
-                    handle,
-                    entry,
-                    request,
-                    AuthorizationStatus.PREPARATION_FAILED,
-                    error["message"],
-                    error,
-                )
-                continue
-            if validated_path != request.resolved_path:
-                request.bound = request.bound._bind_output_path(validated_path)
-                request.resolved_path = validated_path
-
-            authorized = self.store.check_or_request_authorization(validated_path)
-            if authorized is not None:
-                reply = self._apply_authorization_decision(
-                    handle, entry, request, authorized
-                )
-                if reply is None:
-                    continue
-                reply_sender = self.channel.get_reply_sender(handle.execution_id)
-                if reply_sender is not None:
-                    try:
-                        reply_sender.send_reply(reply)
-                    except OSError:
-                        pass
-
     def _drain_and_settle(self) -> int:
-        """相三·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
+        """相一·回收在途结果并统一结算，返回本轮完成计数（无在途为 0）。"""
         if not self._in_flight:
             return 0
         handles = [
-            h for h in self._in_flight.active_handles()
-            if not self._completion.has_pending_result(h)
+            h
+            for h in self._in_flight.active_handles()
+            if not self._authorization.has_pending_cleanup(h.job_uid)
         ]
         completed = self.channel.reap_completed(handles)
         return self._completion.settle_reaped(completed)
@@ -773,19 +352,15 @@ class EngineRuntime:
         deadlines = [
             handle.timeout_at_monotonic
             for handle in self._in_flight.active_handles()
-            if not handle.waiting_auth and not self._completion.has_pending_result(handle)
+            if not self._authorization.is_timeout_paused(handle)
+            and not self._authorization.has_pending_cleanup(handle.job_uid)
         ]
         if not deadlines:
             return None
         return max(0.0, min(deadlines) - time.monotonic())
 
     def step(self, max_dispatch: int | None = None) -> StepOutcome:
-        """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。
-
-        run 身份（run_id/空态装载）唯一负责者是 prepare_run_state（execute()
-        启动屏障）——store.state 恒非 None（构造与 set_state 双点归一化），
-        经 run() 外直达 step 的路径由测试显式 set_state 装载，无需惰性引导。
-        """
+        """非阻塞单步推进事件泵（主循环与单步测试共用的统一事件泵）。"""
         store = self.store
 
         # 0. 停机门：DRAINING 排空完毕与空闲完成早退
@@ -797,7 +372,7 @@ class EngineRuntime:
                 logger.info("Pipeline drained.")
                 return self._terminal_outcome()
 
-        self._poll_pending_authorizations()
+        self._authorization.poll_pending_declarations()
 
         if store.state.is_empty and not self._in_flight:
             return self._terminal_outcome()
@@ -818,32 +393,43 @@ class EngineRuntime:
 
         # 4. 等待/空闲决策（唯一实现见 wait.decide_wait）
         is_idle = store.state.is_empty and not self._in_flight
-        authorization_wait = self._completion.waiting_authorization or any(
-            handle.waiting_auth
-            for handle in self._in_flight.active_handles()
+        decision = decide_wait(
+            LoopFacts(
+                stop_mode=self._session.stop_mode,
+                has_in_flight=bool(self._in_flight),
+                store_empty=store.state.is_empty,
+                dispatched=dispatched,
+                settled=settled_count,
+                has_runnable=(
+                    last_outcome.kind is not DispatchKind.NO_CANDIDATE
+                    if last_outcome is not None
+                    else True
+                ),
+                min_wait=(
+                    last_outcome.standstill.min_wait
+                    if last_outcome is not None
+                    else float("inf")
+                ),
+                in_flight_wait=self._next_in_flight_wait(),
+                authorization_wait=self._authorization.has_pending_authorization,
+                worker_wait=worker_wait,
+                deadlock_wait=arbitration.wait_seconds,
+                should_terminate=arbitration.should_terminate,
+                deadlock_detected=arbitration.deadlock_detected,
+            )
         )
-        decision = decide_wait(LoopFacts(
-            stop_mode=self._session.stop_mode, has_in_flight=bool(self._in_flight),
-            store_empty=store.state.is_empty, dispatched=dispatched, settled=settled_count,
-            has_runnable=(last_outcome.kind is not DispatchKind.NO_CANDIDATE
-                          if last_outcome is not None else True),
-            min_wait=(last_outcome.standstill.min_wait
-                      if last_outcome is not None else float("inf")),
-            in_flight_wait=self._next_in_flight_wait(),
-            authorization_wait=authorization_wait,
-            worker_wait=worker_wait, deadlock_wait=arbitration.wait_seconds,
-            should_terminate=arbitration.should_terminate,
-            deadlock_detected=arbitration.deadlock_detected,
-        ))
 
         exit_reason = (
-            self._session.exit_reason().value if (is_idle or arbitration.should_terminate)
+            self._session.exit_reason().value
+            if (is_idle or arbitration.should_terminate)
             else None
         )
 
         return StepOutcome(
-            dispatched_count=dispatched, settled_count=settled_count,
-            is_idle=is_idle, should_wait=decision.should_wait,
+            dispatched_count=dispatched,
+            settled_count=settled_count,
+            is_idle=is_idle,
+            should_wait=decision.should_wait,
             wait_time=decision.wait_time,
             deadlock_detected=arbitration.deadlock_detected,
             stop_mode=self._session.stop_mode,
@@ -866,7 +452,8 @@ class EngineRuntime:
     def run_loop(self) -> None:
         """事件驱动主循环：以 step() 统一驱动填池、回收与等待（裸循环）。"""
         store = self.store
-        self._in_flight.clear()
+        self._in_flight.clear_all(state=store.state)
+        self._authorization.clear_all()
         self._notifier.clear()
         while not store.state.is_empty or self._in_flight:
             last_seq = self._notifier.snapshot()
@@ -882,9 +469,10 @@ class EngineRuntime:
             elif store.state.is_empty and not self._in_flight:
                 break
 
-        logger.info(f"Pipeline {self.config.name} finished.")
+        logger.info("Pipeline finished.")
         self.channel.wait_for_lingering_workers()
-        self._in_flight.clear()
+        self._in_flight.clear_all(state=store.state)
+        self._authorization.clear_all()
 
     def prepare_run_state(self) -> PipelineState:
         """恢复持久化状态，再登记本次 Run 身份。"""
@@ -908,8 +496,7 @@ class EngineRuntime:
             self.run_loop()
         except BaseException as e:
             # 单点崩溃网：所有异常同构处理（在途清扫并原样上抛）；
-            # KI 与非 Exception（如 SystemExit）
-            # 不附 traceback，其余附。
+            # KI 与非 Exception（如 SystemExit）不附 traceback，其余附。
             self._crash_log(e)
             try:
                 self._recovery.abort_in_flight()
@@ -933,7 +520,6 @@ class EngineRuntime:
     def _run_body(self) -> None:
         """主执行体：启动屏障（装载 + fencing）→ 带承重网的主循环。"""
         self.prepare_run_state()
-        self._skip_dirty = True
         self._run_with_crash_net()
 
     def _handle_signal(self, signum: int, frame: Any) -> None:

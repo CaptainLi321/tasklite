@@ -37,7 +37,6 @@ def _make_runtime() -> EngineRuntime:
     resources[WORKER_RESOURCE] = CapacityResource(WORKER_RESOURCE, max_capacity=2.0)
     return EngineRuntime(
         config=RunConfig.resolve(
-            name="testing_helper",
             backend=InMemoryStateBackend(),
             resources=resources,
             tasks=TaskRegistry(),

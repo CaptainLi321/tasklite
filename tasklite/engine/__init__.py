@@ -7,11 +7,10 @@
   admission（trigger 准入与 RequeuePolicy 重入队策略）；
 - 调度与资源：scheduler（只读扫描选择点，OrderingPolicy seam）、
   resource（资源体系与两阶段租约）、wait（等待决策）；
-- 机器群：dispatch（五关预检派发）、channel（子进程执行通道）、
-  in_flight（在飞追踪）、completion（完成机器）、recovery（恢复编排）、
-  store（状态仓库）、governor（死锁治理）；
-- 运行期：session（run 生命周期）、runtime（EngineRuntime 事件泵）、
-  ops（Run 外管理接缝）。
+- 机器群：authorization（文件声明与三类授权等待协调）、dispatch（预检与派发）、
+  channel（子进程执行通道）、in_flight（在飞追踪）、completion（完成机器）、
+  recovery（恢复编排）、store（状态仓库）、governor（死锁治理与排除停摆）；
+- 运行期：session（run 生命周期与排除真相源）、runtime（EngineRuntime 事件泵）。
 
 调度逻辑仅留 seam：选择点收敛在 scheduler 的 scan_next_runnable（访问
 序经 OrderingPolicy），重试节奏收敛在 RequeuePolicy（默认立即重入队）。

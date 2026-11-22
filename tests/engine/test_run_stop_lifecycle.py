@@ -68,7 +68,7 @@ def test_stop_during_initialization_is_preserved(tmp_path, monkeypatch, stage):
         target, name = {
             "preflight": (runtime, "_preflight_picklable_handlers"),
             "governor": (runtime.governor, "reset"),
-            "exclusions": (runtime.scheduler, "reset_run"),
+            "exclusions": (runtime.scheduler, "begin_round"),
         }[stage]
         original = getattr(target, name)
 
@@ -162,7 +162,7 @@ def test_initialization_failure_releases_run_for_retry(monkeypatch, stage):
         target, name = {
             "preflight": (runtime, "_preflight_picklable_handlers"),
             "governor": (runtime.governor, "reset"),
-            "exclusions": (runtime.scheduler, "reset_run"),
+            "exclusions": (runtime.scheduler, "begin_round"),
             "unbind": (runtime.config.resources, "unbind_notifier"),
         }[stage]
         error = RuntimeError("initialization failed")

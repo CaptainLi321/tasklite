@@ -228,7 +228,6 @@ class RuntimeEnv:
         self,
         tmp_path,
         *,
-        name: str = "test_runtime",
         capacity: float = 2.0,
         persistent: bool = False,
     ):
@@ -242,7 +241,6 @@ class RuntimeEnv:
         self.tasks = TaskRegistry()
         self.runtime = EngineRuntime(
             config=RunConfig.resolve(
-                name=name,
                 backend=self.backend,
                 resources=self.resources,
                 tasks=self.tasks,
@@ -252,7 +250,7 @@ class RuntimeEnv:
                     functions=BUILTIN_TRIGGER_FUNCTIONS,
                 ),
                 requeue_policy=ImmediateRequeuePolicy(),
-                    ),
+            ),
         )
 
     def register(self, task_type: str, handler=ok_handler) -> None:
@@ -266,10 +264,9 @@ class TestEngineRuntimeConfiguration:
     """测试 EngineRuntime 构造与静态配置装配。"""
 
     def test_default_assembly_and_wiring(self, tmp_path):
-        env = RuntimeEnv(tmp_path, name="test_runtime")
+        env = RuntimeEnv(tmp_path)
         runtime = env.runtime
 
-        assert runtime.config.name == "test_runtime"
         assert runtime.stop_mode == StopMode.NONE
         assert not runtime.is_running
         assert isinstance(runtime.session, RunSession)
@@ -319,7 +316,7 @@ class TestEngineRuntimeExecutionLifecycle:
     """测试 EngineRuntime 完整生命周期 execute() 与安全网。"""
 
     def test_execute_empty_queue_completed(self, tmp_path):
-        env = RuntimeEnv(tmp_path, name="test_exec")
+        env = RuntimeEnv(tmp_path)
         assert env.runtime.execute() is None
         assert not env.runtime.is_running
 
@@ -370,7 +367,7 @@ class TestEngineRuntimeExecutionLifecycle:
     def test_unpicklable_handler_fails(self, tmp_path):
         """不可序列化 handler 在派发前明确拒绝。"""
         local_fn = lambda j, c: True  # noqa: E731
-        env = RuntimeEnv(tmp_path, name="test_picklable")
+        env = RuntimeEnv(tmp_path)
         env.tasks.register(Task(task_type="unpicklable", handler=local_fn))
 
         with pytest.raises(TaskLiteError, match="not picklable"):
@@ -385,14 +382,14 @@ class TestEngineRuntimeExecutionLifecycle:
         assert not env.runtime.is_running
 
         # 对照：可 pickle handler 的装配正常完成
-        env_ok = RuntimeEnv(tmp_path / "ok", name="test_picklable_ok")
+        env_ok = RuntimeEnv(tmp_path / "ok")
         env_ok.register("dummy")
         assert env_ok.runtime.execute() is None
 
 
     @pytest.mark.parametrize("persistent", [False, True])
     def test_concurrent_run_lock_rejection(self, tmp_path, persistent):
-        env = RuntimeEnv(tmp_path, name="test_lock", persistent=persistent)
+        env = RuntimeEnv(tmp_path, persistent=persistent)
         with env.backend.exclusive_access():
             with pytest.raises(TaskLiteError, match="Another run.*in progress"):
                 env.runtime.execute()
@@ -413,9 +410,7 @@ class TestEngineRuntimeInitFailureSafety:
         泄漏、可复跑。"""
         import tasklite.backend.sqlite_backend as sqlite_backend_module
 
-        env = RuntimeEnv(
-            tmp_path, name="test_env_failure", persistent=True,
-        )
+        env = RuntimeEnv(tmp_path, persistent=True)
 
         def _raise_env_failure(state_path, *, timeout=0):
             raise OSError(13, "Permission denied")
@@ -464,7 +459,7 @@ class TestEngineRuntimeInitFailureSafety:
 
         import tasklite.engine.runtime as runtime_module
 
-        env = RuntimeEnv(tmp_path, name="test_init_interrupt", persistent=True)
+        env = RuntimeEnv(tmp_path, persistent=True)
 
         class _InstallSignalInterrupt:
             """信号陷阱安装点抛 KeyboardInterrupt 的确定性故障注入。

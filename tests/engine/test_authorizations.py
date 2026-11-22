@@ -267,7 +267,10 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
 
     def tracked_fill(limit, draining):
         result = original_fill(limit, draining)
-        if any(handle.waiting_auth for handle in p._runtime.in_flight.active_handles()):
+        if any(
+            p._runtime.authorization.is_waiting_declaration(handle)
+            for handle in p._runtime.in_flight.active_handles()
+        ):
             gate_observed.set()
         return result
 
@@ -295,7 +298,10 @@ def test_worker_wait_authorization_pauses_dispatch_while_other_worker_settles(
             _wait_for(lambda: "quick::q1" in _jobs_by_status(p, "succeeded"))
             assert "slow_decl::s1" not in _jobs_by_status(p, "succeeded")
             assert not third_marker.exists()
-            assert any(handle.waiting_auth for handle in p._runtime.in_flight.active_handles())
+            assert any(
+                p._runtime.authorization.is_waiting_declaration(handle)
+                for handle in p._runtime.in_flight.active_handles()
+            )
             gate_observed.clear()
             assert gate_observed.wait(10.0)
             assert not third_spawned.is_set()
@@ -350,9 +356,15 @@ def test_authorization_wait_does_not_consume_execution_timeout(tmp_path, monkeyp
         runner.start()
         try:
             assert auth.first_call.wait(10.0)
-            _wait_for(lambda: any(h.waiting_auth for h in p._runtime.in_flight.active_handles()))
-            handle = next(h for h in p._runtime.in_flight.active_handles() if h.waiting_auth)
-            assert handle.paused_remaining is not None
+            _wait_for(lambda: any(
+                p._runtime.authorization.is_waiting_declaration(h)
+                for h in p._runtime.in_flight.active_handles()
+            ))
+            handle = next(
+                h for h in p._runtime.in_flight.active_handles()
+                if p._runtime.authorization.is_waiting_declaration(h)
+            )
+            assert p._runtime.authorization.get_paused_remaining(handle) is not None
             handle.timeout_at_monotonic = time.monotonic() - 1.0
             deadline_passed = True
             auth.release.set()
@@ -562,7 +574,10 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
         try:
             assert auth.first_call.wait(10.0)
             quick_gate.write_text("go", encoding="utf-8")
-            _wait_for(lambda: any(h.waiting_auth for h in p._runtime.in_flight.active_handles()))
+            _wait_for(lambda: any(
+                p._runtime.authorization.is_waiting_declaration(h)
+                for h in p._runtime.in_flight.active_handles()
+            ))
             p.stop()
             assert "waiting::w1" in _jobs_by_status(p, "running")
             auth.release.set()
@@ -1027,7 +1042,7 @@ def test_worker_target_type_change_requires_cleanup_scope_confirmation(
         try:
             if initial != "directory" and (decision.startswith("wait") or decision == "stop"):
                 assert waiting.wait(10)
-                _wait_for(lambda: p._runtime._completion.waiting_authorization)
+                _wait_for(lambda: p._runtime.authorization.has_pending_authorization)
                 assert target.joinpath("child").read_text(encoding="utf-8") == "business data"
                 assert _attempts_for(p, "replace::one") == []
                 assert "replace::one" in _jobs_by_status(p, "running")
@@ -1143,7 +1158,7 @@ def test_cleanup_wait_preserves_result_and_settles_other_worker_before_single_co
         runner.start()
         try:
             assert requested.wait(10)
-            _wait_for(lambda: p._runtime._completion.waiting_authorization)
+            _wait_for(lambda: p._runtime.authorization.has_pending_authorization)
             entry = p._runtime.in_flight["replace::one"]
             assert entry.handle.process.is_alive()
             entry.handle.timeout_at_monotonic = time.monotonic() - 1
@@ -1327,7 +1342,7 @@ def test_run_fault_leaves_uncommitted_cleanup_result_running_for_recovery(
 
         def faulty_step(*args, **kwargs):
             outcome = original_step(*args, **kwargs)
-            if runtime._completion.waiting_authorization:
+            if runtime.authorization.has_pending_authorization:
                 final_decision[0] = decision
                 raise fault
             return outcome
@@ -1358,7 +1373,7 @@ def test_run_fault_leaves_uncommitted_cleanup_result_running_for_recovery(
         assert snap.get_job("committed::one") == committed
     assert _jobs_by_status(p, "failed") == set()
     assert p.get_cursor("tree-result") is None
-    assert not runtime._completion.waiting_authorization
+    assert not runtime.authorization.has_pending_authorization
     assert not runtime.in_flight
 
     monkeypatch.undo()
@@ -1577,3 +1592,127 @@ def test_runtime_forbids_deleting_sqlite_sidecar_and_lock_files(tmp_path, monkey
             p.run(install_signals=False)
         assert "work::one" in _jobs_by_status(p, "failed")
         assert p.list_authorizations() == []
+
+
+def test_cross_thread_stop_during_dispatch_authorization_leaves_no_ghost_pending(
+    tmp_path, monkeypatch,
+):
+    """跨线程停机与派发前授权并发时，严禁残留幽灵派发等待或触发空转。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
+    target = tmp_path / "ghost_dispatch.txt"
+    target.write_text("stale", encoding="utf-8")
+
+    with TaskLite(backend="memory", max_workers=1) as p:
+        p.register_task("work", _quick_handler)
+        p.enqueue(Job(
+            "work",
+            "one",
+            files={"target": FileSpec(target, role="output", delete_existing=True)},
+        ))
+        auth_entered = threading.Event()
+        stop_done = threading.Event()
+        errors: list[BaseException] = []
+
+        def concurrent_stop_authorizer(path: str, kind: str) -> bool | None:
+            auth_entered.set()
+            assert stop_done.wait(10.0)
+            return None
+
+        def run_pipeline() -> None:
+            try:
+                p.run(install_signals=False)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with in_process_workers(p), inject_authorizer(p, concurrent_stop_authorizer):
+            runner = threading.Thread(target=run_pipeline)
+            runner.start()
+            try:
+                assert auth_entered.wait(10.0)
+                p.stop()
+                stop_done.set()
+                runner.join(timeout=15.0)
+                assert not runner.is_alive()
+                assert errors == []
+            finally:
+                stop_done.set()
+                p.stop()
+                runner.join(timeout=5.0)
+
+        assert not p._runtime.authorization.has_dispatch_pending
+        assert not p._runtime.authorization.has_pending_authorization
+        assert _jobs_by_status(p, "pending") == {"work::one"}
+        assert _attempts_for(p, "work::one") == []
+        assert target.read_text(encoding="utf-8") == "stale"
+
+
+def test_cross_thread_stop_during_declaration_pre_delete_does_not_overwrite_stopped(
+    tmp_path, monkeypatch,
+):
+    """动态声明批准后执行锁外前删期间遭遇跨线程停机，不得将 STOPPED 覆写为 APPROVED。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
+    target = tmp_path / "race_declare.txt"
+    target.write_text("old", encoding="utf-8")
+
+    with TaskLite(backend="memory", max_workers=1) as p:
+        p.register_task("work", _declare_then_write_handler)
+        p.enqueue(Job(
+            "work",
+            "one",
+            payload={"path": str(target), "content": "overwritten"},
+        ))
+
+        delete_entered = threading.Event()
+        stop_completed = threading.Event()
+        observed_replies: list[dict | None] = []
+        errors: list[BaseException] = []
+
+        coord = p._runtime.authorization
+        original_apply = coord._apply_declaration_decision
+        original_delete = p._runtime.store.path_policy.delete
+
+        def tracked_delete(path, **kwargs):
+            delete_entered.set()
+            assert stop_completed.wait(10.0)
+            return original_delete(path, **kwargs)
+
+        def tracked_apply(handle, entry, request, authorized):
+            reply = original_apply(handle, entry, request, authorized)
+            observed_replies.append(reply)
+            return reply
+
+        monkeypatch.setattr(p._runtime.store.path_policy, "delete", tracked_delete)
+        monkeypatch.setattr(coord, "_apply_declaration_decision", tracked_apply)
+
+        def run_pipeline() -> None:
+            try:
+                p.run(install_signals=False)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with inject_authorizer(p, lambda *_args: True):
+            runner = threading.Thread(target=run_pipeline)
+            runner.start()
+            try:
+                assert delete_entered.wait(10.0)
+                p.stop()
+                stop_completed.set()
+                runner.join(timeout=20.0)
+                assert not runner.is_alive()
+                assert errors == []
+            finally:
+                stop_completed.set()
+                p.stop()
+                runner.join(timeout=5.0)
+
+        assert observed_replies == [None]
+        assert not coord.has_pending_authorization
+        assert _jobs_by_status(p, "pending") == {"work::one"}
+        assert _jobs_by_status(p, "succeeded") == set()
+        attempt, = _attempts_for(p, "work::one")
+        assert attempt["outcome"] == "failure"
+        assert attempt["result"]["annotations"]["authorization_status"] == "stopped"
+        assert not target.exists()
+

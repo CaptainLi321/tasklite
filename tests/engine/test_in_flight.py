@@ -1,12 +1,13 @@
-"""v2 在途作业追踪器测试：登记/结算、句柄提取与资源安全释放。"""
+"""v2 在途作业追踪器测试：只读视图、状态同步写口、句柄提取与资源安全释放。"""
 
 from __future__ import annotations
 
+from collections.abc import Mapping, MutableMapping
+
+import pytest
+
 from tasklite.engine.in_flight import InFlightJob, InFlightTracker
-from tasklite.engine.resource import (
-    CapacityResource,
-    ResourceManager,
-)
+from tasklite.engine.resource import CapacityResource, ResourceManager
 from tasklite.engine.types import JobHandle
 from tasklite.models.job import Job
 from tasklite.models.state import PipelineState
@@ -17,31 +18,30 @@ class FakeProcess:
         self.pid = pid
 
 
-class TestInFlightTrackerBasicMapping:
-    def test_dict_like_operations(self):
+class TestInFlightTrackerReadOnlyMapping:
+    def test_read_only_mapping_rejects_raw_mutations(self):
         tracker = InFlightTracker()
+        assert isinstance(tracker, Mapping)
+        assert not isinstance(tracker, MutableMapping)
+        assert not hasattr(tracker, "pop")
+        assert not hasattr(tracker, "clear")
+
         job = Job("t", "j1")
         entry = InFlightJob("t::j1", job.to_dict(), job, [], None, None)
 
-        tracker["t::j1"] = entry
+        with pytest.raises(TypeError):
+            tracker["t::j1"] = entry  # type: ignore[index]
+
+        tracker.track(entry)
         assert "t::j1" in tracker
         assert len(tracker) == 1
         assert tracker["t::j1"] is entry
+        assert tracker.get("t::missing") is None
         assert list(tracker.keys()) == ["t::j1"]
         assert list(tracker.values()) == [entry]
 
-        del tracker["t::j1"]
-        assert "t::j1" not in tracker
-        assert len(tracker) == 0
-
-    def test_get_and_pop_defaults(self):
-        tracker = InFlightTracker()
-        job = Job("t", "j1")
-        entry = InFlightJob("t::j1", job.to_dict(), job)
-        tracker.track(entry)
-        assert tracker.get("t::missing") is None
-        assert tracker.pop("t::j1") is entry
-        assert tracker.pop("t::j1") is None
+        with pytest.raises(TypeError):
+            del tracker["t::j1"]  # type: ignore[attr-defined]
 
 
 class TestInFlightTrackerLifecycleAndStateSync:
@@ -101,19 +101,23 @@ class TestInFlightTrackerLifecycleAndStateSync:
         assert tracker.settle("t::ghost", state=state) is None
         assert state.in_flight_uids == frozenset()
 
-    def test_clear_drops_all_entries(self):
+    def test_clear_all_drops_all_entries_and_syncs_state(self):
         tracker = InFlightTracker()
+        state = PipelineState(successes={}, failed={}, cursors={}, queue=[])
         job_a = Job("t", "ja")
         job_b = Job("t", "jb")
-        tracker.track(InFlightJob("t::ja", job_a.to_dict(), job_a))
-        tracker.track(InFlightJob("t::jb", job_b.to_dict(), job_b))
-        tracker.clear()
+        tracker.track(InFlightJob("t::ja", job_a.to_dict(), job_a), state=state)
+        tracker.track(InFlightJob("t::jb", job_b.to_dict(), job_b), state=state)
+        assert state.in_flight_uids == frozenset({"t::ja", "t::jb"})
+
+        tracker.clear_all(state=state)
         assert tracker.uids == frozenset()
         assert tracker.active_handles() == []
+        assert state.in_flight_uids == frozenset()
 
 
-class TestInFlightTrackerHandlesAndPseudo:
-    def test_active_handles_filters_pseudo_entries(self):
+class TestInFlightTrackerHandles:
+    def test_active_handles_filters_entries_without_worker_handle(self):
         tracker = InFlightTracker()
         job_real = Job("t", "j1")
         handle = JobHandle(
@@ -126,18 +130,17 @@ class TestInFlightTrackerHandlesAndPseudo:
         )
         entry_real = InFlightJob("t::j1", job_real.to_dict(), job_real, [], handle, None)
 
-        job_ghost = Job("t", "j2")
-        entry_ghost = InFlightTracker.create_pseudo_entry("t::j2", job_ghost.to_dict(), job_ghost)
+        job_no_worker = Job("t", "j2")
+        entry_no_worker = InFlightJob("t::j2", job_no_worker.to_dict(), job_no_worker)
 
         tracker.track(entry_real)
-        tracker.track(entry_ghost)
+        tracker.track(entry_no_worker)
 
-        assert not entry_real.is_pseudo
-        assert entry_ghost.is_pseudo
         assert tracker.active_handles() == [handle]
+        assert set(tracker.active_uids()) == {"t::j1", "t::j2"}
 
     def test_watchdog_fields_carried_on_handle(self):
-        """看门狗字段（timeout_at_monotonic/timeout/started_monotonic）随条目透传，timeout 语义原样。"""
+        """看门狗字段（timeout_at_monotonic/timeout/started_monotonic）随条目透传。"""
         job = Job("t", "jw")
         handle = JobHandle(
             job_uid="t::jw",
@@ -195,30 +198,3 @@ class TestInFlightTrackerResourceRelease:
         entry.release_resources(rm)
         assert gpu.used == 0.0
         assert gpu.release_overruns == 0, "二次释放不得记为超量（幂等归还）"
-
-    def test_pseudo_entry_safe_release(self):
-        job = Job("t", "j1")
-        pseudo = InFlightTracker.create_pseudo_entry("t::j1", job.to_dict(), job)
-        assert pseudo.is_pseudo
-        assert pseudo.acquired == []
-        pseudo.release_resources()
-        assert pseudo.acquired == []
-
-    def test_active_uids_and_classify_aborted(self):
-        tracker = InFlightTracker()
-        job_a = Job("t", "ja")
-        entry_a = InFlightJob("t::ja", job_a.to_dict(), job_a, [], None, None)
-        job_b = Job("t", "jb")
-        entry_b = InFlightJob("t::jb", job_b.to_dict(), job_b, [], None, None)
-
-        tracker.track(entry_a)
-        tracker.track(entry_b)
-
-        assert set(tracker.active_uids()) == {"t::ja", "t::jb"}
-
-        cancelled, done = tracker.classify_aborted({"t::ja": {"status": "ok"}})
-        assert len(cancelled) == 1
-        assert cancelled[0].job_uid == "t::jb"
-        assert len(done) == 1
-        assert done[0][0].job_uid == "t::ja"
-        assert done[0][1] == {"status": "ok"}

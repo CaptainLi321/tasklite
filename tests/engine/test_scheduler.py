@@ -261,7 +261,7 @@ class TestScanAttribution:
 
     def test_excluded_missing_dependency_remains_queued(self):
         scheduler = JobScheduler(resources={})
-        scheduler.reset_run(Exclude(task_type="t"))
+        scheduler.session.clear_exclusions(Exclude(task_type="t"))
         state = _state([
             Job("t", "a", depends_on=["t::missing"]).to_dict(),
             Job("other", "downstream", depends_on=["t::a"]).to_dict(),

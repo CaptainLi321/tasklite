@@ -58,6 +58,11 @@ class RunSession:
         for down_uid in state.find_all_downstream(job_uid):
             self.temporarily_exclude(down_uid)
 
+    @property
+    def has_exclusions(self) -> bool:
+        """当前 Run 是否启用了用户排除规则或运行期临时排除。"""
+        return self.exclude is not None or bool(self.temporary_excluded_uids)
+
     def clear_exclusions(self, exclude: Exclude | None = None) -> None:
         """重置本 Run 的排除规则并清空临时排除集合。"""
         self.exclude = exclude

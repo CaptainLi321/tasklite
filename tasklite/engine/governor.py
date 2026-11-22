@@ -1,9 +1,9 @@
-"""v2 死锁治理深模块：死锁归因与缺口升级。
+"""v2 死锁治理深模块：死锁归因、排除停摆剥离与缺口升级。
 
 统一内敛：
-1. 死锁分类缺口连续轮次升级治理；
-2. 细粒度死锁归因分析与批量事务熔断（环检测、
-   未知/超容资源、畸形条目）。
+1. Kahn 入度消减排除停摆拓扑分析（``SelectionStandstill`` / ``partition_standstill``）；
+2. 死锁分类缺口连续轮次升级治理；
+3. 细粒度死锁归因分析与批量事务熔断（环检测、未知/超容资源、畸形条目）。
 
 术语口径：死锁熔断的终态落点是失败档案（failed）——按 uid 唯一
 终态、与 successes 全局互斥，由 store 的批量失败出口收敛。
@@ -11,55 +11,140 @@
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, TYPE_CHECKING
 
 from ..exceptions import TaskLiteError
 from ..models.job import Job
 from ..models.state import PipelineState, job_uid_from_snapshot
 from .scheduler import StandstillFacts
-from .selection import SelectionStandstill
+
+if TYPE_CHECKING:
+    from .session import RunSession
+    from .store import StateStore
 
 logger = logging.getLogger("tasklite")
 
 DEADLOCK_GAP_MAX_ROUNDS = 5
 
 
-class BulkFailureOutcome(Protocol):
-    """批量失败转移结果的鸭子形状（失败与级联 UID 列表）。"""
+@dataclass(frozen=True)
+class SelectionStandstill:
+    """排除规则与临时排除下的停摆拓扑判定（Kahn 入度消减结果）。
 
-    @property
-    def failed_uids(self) -> list[str]: ...
+    以 ``deferred_uids``（Exclude 命中行 + 运行期临时排除行）为延迟波前，
+    对剩余「允许执行」作业做入度消减：
 
-    @property
-    def cascaded_uids(self) -> list[str]: ...
+    - ``stuck_uids``：入度无法消减为 0 的允许作业，可能包含环成员、缺口
+      及其下游；
+    - ``cycle_uids``：仅从 stuck 子图中由 PipelineState 的依赖环检测器识别
+      的真实环成员，供 governor 沿用既有环归因；
+    - ``blocked_uids``：入度可消减、且传递依赖最终落在 deferred 波前上的
+      允许作业——本次仅因上游被排除而无法完成，必须留队等待下次 run；
+    - ``unblocked_uids``：入度可消减但仍有余量（如资源等待）的允许作业，
+      存在本 run 继续推进的可能，不得据此终止运行。
 
-
-class ArbitrationStore(Protocol):
-    """死锁仲裁所需的 store 契约。
-
-    ``state`` 提供只读事实（queue / successes / 环检测）；
-    ``apply_bulk_failure`` 是批量失败档案写入的单一出口（原子提交
-    失败档案行、按 uid 删除队列行并级联下游，返回转移结果）。
+    结论 ``only_blocked_by_exclusion`` 为真当且仅当没有任何允许作业可能
+    在本 run 完成（无 stuck、无 unblocked）：此时本 run 干净终止，队列保留。
     """
 
-    @property
-    def state(self) -> PipelineState: ...
-
-    def apply_bulk_failure(
-        self, uids_metas: Sequence[tuple[str, dict[str, Any]]]
-    ) -> BulkFailureOutcome: ...
-
-
-class SelectionStandstillSource(Protocol):
-    """死锁仲裁消费的执行选择停摆事实源契约（SelectionMachine 自动满足）。"""
+    excluded_uids: tuple[str, ...] = ()
+    blocked_uids: tuple[str, ...] = ()
+    unblocked_uids: tuple[str, ...] = ()
+    stuck_uids: tuple[str, ...] = ()
+    cycle_uids: tuple[str, ...] = ()
+    blocked_by: tuple[tuple[str, str], ...] = ()
 
     @property
-    def is_active(self) -> bool: ...
+    def only_blocked_by_exclusion(self) -> bool:
+        """剩余队列是否全部为「排除 + 仅被其阻塞」的作业。"""
+        return not self.stuck_uids and not self.unblocked_uids
 
-    def partition_standstill(self) -> SelectionStandstill | None: ...
+
+def partition_standstill(
+    state: PipelineState,
+    session: "RunSession",
+) -> SelectionStandstill | None:
+    """以 Kahn 入度消减剥离选择停摆：区分真死锁与「仅被排除阻塞」。
+
+    返回 None 表示未启用排除或队列存在畸形行（无可信拓扑事实），交既有
+    配置无效归因。纯计算、无状态变更。
+    """
+    if not session.has_exclusions:
+        return None
+    queue = state.queue
+    if not queue:
+        return SelectionStandstill()
+    facts: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for job_snapshot in queue:
+        try:
+            parsed = Job.from_dict(job_snapshot)
+            uid, task_type, depends_on = (
+                parsed.uid,
+                parsed.task_type,
+                tuple(parsed.depends_on),
+            )
+        except (KeyError, TypeError, ValueError, TaskLiteError):
+            return None
+        facts[uid] = (task_type, tuple(depends_on))
+
+    deferred = {
+        uid
+        for uid, (task_type, _deps) in facts.items()
+        if session.is_excluded(uid, task_type)
+    }
+    excluded = set(deferred)
+    allowed = set(facts) - deferred
+
+    # Kahn：只有允许作业参与消减；deferred 与 successes 同为已满足波前。
+    indegree: dict[str, int] = {}
+    dependents: dict[str, list[str]] = {}
+    for uid in allowed:
+        count = 0
+        for dep in facts[uid][1]:
+            if dep in deferred or state.dependency_ready(dep):
+                continue
+            count += 1
+            dependents.setdefault(dep, []).append(uid)
+        indegree[uid] = count
+    ready = [uid for uid, count in indegree.items() if count == 0]
+    reduced: set[str] = set()
+    while ready:
+        uid = ready.pop()
+        reduced.add(uid)
+        for child in dependents.get(uid, ()):
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+    stuck = allowed - reduced
+    cycle_uids = state.find_dependency_cycles(node_uids=stuck) if stuck else []
+
+    # 仅因排除受阻：从 deferred 沿依赖边反向闭包，再与可消减集求交。
+    children: dict[str, list[str]] = {}
+    for uid in allowed:
+        for dep in facts[uid][1]:
+            children.setdefault(dep, []).append(uid)
+    root_of: dict[str, str] = {}
+    blocked: set[str] = set()
+    stack: list[str] = list(deferred)
+    while stack:
+        cur = stack.pop()
+        for child in children.get(cur, ()):
+            if child in deferred or child in blocked:
+                continue
+            blocked.add(child)
+            root_of.setdefault(child, root_of.get(cur, cur))
+            stack.append(child)
+    blocked &= reduced
+    return SelectionStandstill(
+        excluded_uids=tuple(sorted(excluded)),
+        blocked_uids=tuple(sorted(blocked)),
+        unblocked_uids=tuple(sorted(reduced - blocked)),
+        stuck_uids=tuple(sorted(stuck)),
+        cycle_uids=tuple(cycle_uids),
+        blocked_by=tuple(sorted((uid, root_of.get(uid, "")) for uid in blocked)),
+    )
 
 
 @dataclass(frozen=True)
@@ -146,14 +231,12 @@ class DeadlockGovernor:
     def arbitrate(
         self,
         facts: StandstillFacts | None,
-        store: ArbitrationStore,
-        *,
-        selection_machine: SelectionStandstillSource | None = None,
+        store: "StateStore",
     ) -> DeadlockDecision:
         """自闭环死锁仲裁单一入口。
 
         评估停摆事实：
-        0. 若传入 selection_machine 且激活，且无已知死锁成因，先做 Kahn 拓扑消减；
+        0. 若当前会话启用排除且无已知死锁成因，先做 Kahn 拓扑消减；
            若判定为「仅因 Exclude 阻塞」，闭环返回 action="selection_blocked"；
         1. 若 min_wait == inf，直接触发 resolve_deadlock 进行细粒度归因与批量熔断；
         2. 若 min_wait 为有限值，但处于 waiting_for_dependency 且存在拓扑成环
@@ -164,19 +247,14 @@ class DeadlockGovernor:
             self.deadlock_gap_rounds = 0
             return DeadlockDecision(action="none", should_terminate=False, wait_time=0.0)
 
-        selection_active = selection_machine is not None and selection_machine.is_active
+        session = store.session
+        selection_active = session.has_exclusions
         selection_standstill = (
-            selection_machine.partition_standstill()
-            if selection_active and selection_machine is not None
-            else None
+            partition_standstill(store.state, session) if selection_active else None
         )
 
         # 0. 执行选择先验判定：无明确死锁成因时先检查是否仅因 Exclude 阻塞
-        if (
-            selection_active
-            and selection_machine is not None
-            and not facts.attribution.has_deadlock_causes
-        ):
+        if selection_active and not facts.attribution.has_deadlock_causes:
             if (
                 selection_standstill is not None
                 and selection_standstill.only_blocked_by_exclusion
@@ -193,11 +271,10 @@ class DeadlockGovernor:
             return self._resolve_deadlock(
                 facts,
                 store=store,
-                selection_machine=selection_machine,
                 selection_standstill=selection_standstill,
             )
 
-        if facts.waiting_for_dependency and store.state is not None:
+        if facts.waiting_for_dependency:
             cycle_uids: Sequence[str]
             if selection_active:
                 cycle_uids = (
@@ -216,10 +293,8 @@ class DeadlockGovernor:
                 return self._resolve_deadlock(
                     facts,
                     store=store,
-                    selection_machine=selection_machine,
                     selection_standstill=selection_standstill,
                 )
-
 
         # 3. 资源等待（包含有限时间等待与未知时长通知等待）：不视为死锁缺口
         if facts.has_resource_waiters:
@@ -231,7 +306,6 @@ class DeadlockGovernor:
             return self._resolve_deadlock(
                 facts,
                 store=store,
-                selection_machine=selection_machine,
                 selection_standstill=selection_standstill,
             )
 
@@ -243,35 +317,31 @@ class DeadlockGovernor:
     def resolve_deadlock(
         self,
         facts: StandstillFacts,
-        store: ArbitrationStore,
-        *,
-        selection_machine: SelectionStandstillSource | None = None,
+        store: "StateStore",
     ) -> DeadlockDecision:
         """直接执行死锁归因，并在入口读取当前选择停摆事实。"""
+        session = store.session
         selection_standstill = (
-            selection_machine.partition_standstill()
-            if selection_machine is not None and selection_machine.is_active
-            else None
+            partition_standstill(store.state, session) if session.has_exclusions else None
         )
         return self._resolve_deadlock(
             facts,
             store=store,
-            selection_machine=selection_machine,
             selection_standstill=selection_standstill,
         )
 
     def _resolve_deadlock(
         self,
         facts: StandstillFacts,
-        store: ArbitrationStore,
+        store: "StateStore",
         *,
-        selection_machine: SelectionStandstillSource | None,
         selection_standstill: SelectionStandstill | None,
     ) -> DeadlockDecision:
         """以同一停摆快照完成归因与状态提交。"""
         effective_state = store.state
+        session = store.session
         effective_gap_max = self.deadlock_gap_max_rounds
-        selection_active = selection_machine is not None and selection_machine.is_active
+        selection_active = session.has_exclusions
 
         attr = facts.attribution
         malformed_uids = set(attr.malformed_uids)
@@ -344,13 +414,9 @@ class DeadlockGovernor:
         self.deadlock_gap_rounds = 0
 
         # resolved 但零归档时的选择收敛闭环（如归档全部被选择过滤）
-        if (
-            not outcome.failed_uids
-            and selection_machine is not None
-            and selection_machine.is_active
-        ):
+        if not outcome.failed_uids and selection_active:
             # 批量写入可能改变队列；归档为零时再基于当前队列收敛。
-            standstill = selection_machine.partition_standstill()
+            standstill = partition_standstill(effective_state, session)
             if standstill is not None and standstill.only_blocked_by_exclusion:
                 return DeadlockDecision(
                     action="selection_blocked",
@@ -399,10 +465,9 @@ class DeadlockGovernor:
 
 
 __all__ = [
-    "ArbitrationStore",
-    "BulkFailureOutcome",
     "DEADLOCK_GAP_MAX_ROUNDS",
     "DeadlockDecision",
     "DeadlockGovernor",
     "SelectionStandstill",
+    "partition_standstill",
 ]

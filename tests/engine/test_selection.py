@@ -16,9 +16,9 @@ import pytest
 
 from tasklite import Job, TaskLite
 from tasklite.selection import Exclude
+from tasklite.engine.governor import SelectionStandstill, partition_standstill
 from tasklite.engine.resource import Resource
-from tasklite.engine.scheduler import JobScheduler
-from tasklite.engine.selection import SelectionMachine, SelectionStandstill
+from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
 from tasklite.exceptions import TaskLiteError
 from tasklite.models.context import JobContext
@@ -550,55 +550,55 @@ def test_uid_reuse_cycle_detection(fake_process, tmp_path):
 
 
 def test_temporary_exclude_and_check_contract():
-    """验证调度器与运行时内部临时排除机制（供授权拒绝等复用）。"""
-    scheduler = JobScheduler(resources={})
-    assert scheduler.is_job_excluded("t::1", "t") is False
+    """验证 RunSession 运行期排除与临时排除唯一接口契约。"""
+    session = RunSession()
+    assert session.is_excluded("t::1", "t") is False
 
     # 单次临时排除
-    scheduler.temporarily_exclude("t::1")
-    assert scheduler.is_job_excluded("t::1", "t") is True
-    assert scheduler.is_job_excluded("t::2", "t") is False
+    session.temporarily_exclude("t::1")
+    assert session.is_excluded("t::1", "t") is True
+    assert session.is_excluded("t::2", "t") is False
 
     # Exclude 规则全局匹配
-    scheduler.exclude = Exclude(task_type="t")
-    assert scheduler.is_job_excluded("t::2", "t") is True
-    assert scheduler.is_job_excluded("other::1", "other") is False
+    session.exclude = Exclude(task_type="t")
+    assert session.is_excluded("t::2", "t") is True
+    assert session.is_excluded("other::1", "other") is False
 
-    # reset_run 清理临时排除
-    scheduler.reset_run()
-    assert scheduler.is_job_excluded_by_uid("t::1") is False
+    # clear_exclusions 清理临时排除并重置规则
+    session.clear_exclusions()
+    assert session.is_excluded_by_uid("t::1") is False
 
 
 @pytest.mark.parametrize("special_task_type", ["ns:fetch", "rate%50", "ns:rate%50"])
 def test_is_job_excluded_by_uid_decodes_colon_and_percent_task_type(special_task_type):
-    """task_type 含 ':' 或 '%' 时，is_job_excluded_by_uid 须经 parse_job_uid 解码后匹配。"""
-    scheduler = JobScheduler(resources={})
-    scheduler.reset_run(Exclude(task_type=special_task_type))
+    """task_type 含 ':' 或 '%' 时，is_excluded_by_uid 须经 parse_job_uid 解码后匹配。"""
+    session = RunSession()
+    session.clear_exclusions(Exclude(task_type=special_task_type))
     uid = Job(special_task_type, "j1").uid
-    assert scheduler.is_job_excluded_by_uid(uid) is True
-    assert scheduler.is_job_excluded_by_uid(Job("other:type%1", "j1").uid) is False
-    assert scheduler.is_job_excluded_by_uid("malformed-uid") is False
+    assert session.is_excluded_by_uid(uid) is True
+    assert session.is_excluded_by_uid(Job("other:type%1", "j1").uid) is False
+    assert session.is_excluded_by_uid("malformed-uid") is False
 
 
-def test_selection_machine_kahn_partition(tmp_path):
-    """SelectionMachine 仅保留 Exclude 停摆分析。"""
+def test_partition_standstill_kahn_analysis(tmp_path):
+    """partition_standstill 基于 PipelineState 与 RunSession 执行 Kahn 停摆剥离。"""
     backend = _pipeline(tmp_path, name="test")._runtime.store.backend
-    store = StateStore(backend)
+    session = RunSession()
+    store = StateStore(backend, session=session)
 
     # 无排除规则
-    sm_inactive = SelectionMachine(store)
-    assert sm_inactive.is_active is False
-    assert sm_inactive.partition_standstill() is None
+    assert session.has_exclusions is False
+    assert partition_standstill(store.state, session) is None
 
     # 有 Exclude 规则
-    sm_active = SelectionMachine(store, exclude=Exclude(task_type="blocked_type"))
-    assert sm_active.is_active is True
+    session.clear_exclusions(Exclude(task_type="blocked_type"))
+    assert session.has_exclusions is True
 
     store.state.replace_queue([
         Job("blocked_type", "b1").to_dict(),
         Job("normal", "n1", depends_on=["blocked_type::b1"]).to_dict(),
     ])
-    standstill = sm_active.partition_standstill()
+    standstill = partition_standstill(store.state, session)
     assert isinstance(standstill, SelectionStandstill)
     assert standstill.excluded_uids == ("blocked_type::b1",)
     assert standstill.blocked_uids == ("normal::n1",)

@@ -33,7 +33,6 @@ from ..models.records import (
 )
 from ..models.state import PipelineState, job_uid_from_snapshot
 from ..models.task import TaskRegistry
-from ..selection import Exclude
 from ..utils.artifact import InspectedPath, PathPolicy
 from ..utils.clock import parse_utc_iso_to_us, utc_now_iso
 from .admission import (
@@ -181,21 +180,6 @@ class StateStore:
     def session(self) -> RunSession:
         """当前关联的运行期会话（单次 Run 排除规则与生命周期状态真相源）。"""
         return self._session
-
-    def set_run_exclusions(
-        self,
-        exclude: Exclude | None,
-        temporary_uids: set[str] | None = None,
-    ) -> None:
-        """内部注入面：设置本 Run 排除规则与临时排除集合。"""
-        self._session.exclude = exclude
-        self._session.temporary_excluded_uids = (
-            set(temporary_uids) if temporary_uids is not None else set()
-        )
-
-    def temporarily_exclude(self, job_uid: str) -> None:
-        """登记单个临时排除 UID。"""
-        self._session.temporarily_exclude(job_uid)
 
     def _selection_excluded_uids(self) -> frozenset[str]:
         """当前队列中被排除拦截（Exclude 或临时排除）的合法作业 UID 集合。"""

@@ -46,7 +46,6 @@ class ConfigEnv:
 
     def resolve(self, **overrides) -> RunConfig:
         base = dict(
-            name="test_config",
             backend=self.backend,
             resources=self.resources,
             tasks=self.tasks,
@@ -54,7 +53,7 @@ class ConfigEnv:
             governor=self.governor,
             trigger_registry=self.trigger_registry,
             requeue_policy=self.requeue_policy,
-            )
+        )
         base.update(overrides)
         return RunConfig.resolve(**base)
 
@@ -72,7 +71,6 @@ class TestRunConfigResolve:
         assert config.governor is env.governor
         assert config.trigger_registry is env.trigger_registry
         assert config.requeue_policy is env.requeue_policy
-        assert config.name == "test_config"
 
 
     @pytest.mark.parametrize("field", [
@@ -85,7 +83,7 @@ class TestRunConfigResolve:
     def test_config_is_frozen(self, tmp_path):
         config = ConfigEnv(tmp_path).resolve()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            config.name = "mutated"  # type: ignore[misc]
+            config.backend = InMemoryStateBackend()  # type: ignore[misc]
 
     def test_seam_policies_none_resolved_to_defaults(self, tmp_path):
         """调度策略可空透传：None → FIFO / 立即重入队（唯一解析点）。"""

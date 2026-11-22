@@ -5,7 +5,10 @@ import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..models.state import PipelineState
 
 from ..exceptions import TaskLiteError
 from ..models.job import Job
@@ -44,16 +47,6 @@ def extract_trusted_metadata_timestamp_us(
         return None
 
 
-class TerminalHistory(Protocol):
-    """准入判定消费的终态历史契约（PipelineState 满足）。"""
-
-    @property
-    def successes(self) -> Mapping[str, dict]: ...
-
-    @property
-    def failed(self) -> Mapping[str, dict]: ...
-
-
 class TriggerRegistry:
     """触发器名称注册与主进程 ``TriggerContext`` 求值的唯一出口。"""
 
@@ -86,7 +79,7 @@ class TriggerRegistry:
     def admit(
         self,
         job_snapshot: dict,
-        history: TerminalHistory,
+        history: "PipelineState",
         *,
         baseline_lookup: Callable[[str], int | None] | None = None,
     ) -> bool:
@@ -149,7 +142,6 @@ __all__ = [
     "ImmediateRequeuePolicy",
     "RequeuePlan",
     "RequeuePolicy",
-    "TerminalHistory",
     "TriggerRegistry",
     "extract_trusted_metadata_timestamp_us",
 ]

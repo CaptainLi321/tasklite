@@ -188,7 +188,6 @@ class TaskLite:
     ) -> RunConfig:
         """RunConfig 静态装配快照。"""
         return RunConfig.resolve(
-            name="tasklite",
             path_policy=self._path_policy,
             backend=backend,
             resources=self._resources,

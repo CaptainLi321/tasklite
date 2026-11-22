@@ -259,7 +259,7 @@ def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_pa
 
     def step(*args, **kwargs):
         result = original_step(*args, **kwargs)
-        if runtime._completion.waiting_authorization and not waiting:
+        if runtime.authorization.has_pending_authorization and not waiting:
             waiting.append(True)
             assert completed == []
             assert runtime.in_flight["work::one"].handle is None
@@ -284,7 +284,7 @@ def test_pre_delete_failure_defers_completion_until_cleanup_authorization(tmp_pa
     assert attempt["outcome"] == "failure"
     assert attempt["attempt_no"] == 1
     assert attempt["run_id"] == completed[0].run_id
-    assert not runtime._completion.waiting_authorization
+    assert not runtime.authorization.has_pending_authorization
     assert not runtime.in_flight
     if decision is True:
         assert not target.exists()
@@ -538,7 +538,7 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
         assert sorted(releases) == ["work::committed", "work::fault", "work::later"]
         assert capacity.used == 0
         assert not runtime.in_flight
-        assert not completion.waiting_authorization
+        assert not runtime.authorization.has_pending_authorization
         monkeypatch.undo()
         pipeline.run(install_signals=False)
     with StateSnapshot.open(pipeline) as snap:

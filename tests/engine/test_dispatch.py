@@ -34,19 +34,6 @@ from tasklite.models.state import PipelineState
 from tasklite.models.task import Task, TaskRegistry
 
 
-class RecordingCompletion:
-    """完成机器结构契约桩：记录伪 entry 提交（stale-restore 门消费）。"""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, Any]] = []
-
-    def complete_job(self, entry, result) -> None:
-        self.calls.append((entry.job_uid, result))
-
-    def settle_aborted(self, cancelled, done) -> None:
-        pass
-
-
 class FakeProcess:
     def __init__(self, pid: int = 12345):
         self.pid = pid
@@ -202,7 +189,9 @@ class TestDispatchOutcomeKind:
             second = env.dispatch.dispatch_next()
 
         assert first.kind is DispatchKind.AUTHORIZATION_PENDING
+        assert first.worker_wait == 0.0
         assert second.kind is DispatchKind.AUTHORIZATION_PENDING
+        assert second.worker_wait == 0.0
         assert set(env.store.state.queue_uids) == {"t::authorized", "t::gap"}
         assert env.backend.load_failed() == {}
         assert env.backend.load_settled_attempts("t::gap") == []

@@ -1,12 +1,9 @@
-"""v2 派发机器：四关预检、两阶段资源租约与子进程 spawn 编排。
+"""v2 派发机器：预检、两阶段资源租约、阶段回滚守卫与子进程 spawn 编排。
 
-预检顺序即契约（顺序即时序约束）：dep-failed → admit/dedup → no-handler →
-pre-submit-cleanup。依赖以显式窄清单注入（无共享袋），经
-``store`` 复用状态仓库深模块，不反向引用门面。
-
-``session`` 直接使用内部 RunSession；``tasks`` 按具名 Protocol
-``TaskSource`` 消费（TaskRegistry 自动满足）。``output_roots`` 与 config 声明同型
-（``Path | Sequence[Path] | None``，多根输出场景）。
+预检顺序即契约（顺序即时序约束）：dep-failed/dep-missing → 预声明解析 →
+admit/dedup → no-handler → 预授权 → 资源重检 → 落 running → 获取资源 →
+前置清理 → 锁外冷启动 → 锁内微秒放行。依赖以显式窄清单注入，经 ``store``
+复用状态仓库深模块，不反向引用门面。
 
 进入 running 时分配编号，结算时追加 Attempt：execution_id
 （``run_id.dispatch_no``）在本模块生成并随行落表——dispatch_no 每次派发递增，
@@ -20,40 +17,32 @@ import logging
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..models.state import PipelineState
-    from ..models.task import Task
+    from ..models.task import TaskRegistry
     from .admission import TriggerRegistry
-    from .channel import ExecutionChannel
+    from .channel import ExecutionChannel, PreparedLaunch
     from .completion import CompletionMachine
     from .in_flight import InFlightTracker
     from .resource import ResourceManager
     from .scheduler import JobScheduler
-    from .store import StateStore
     from .session import RunSession
-
-    class TaskSource(Protocol):
-        """派发机器消费的任务规格来源契约（TaskRegistry 自动满足）。"""
-
-        def lookup(self, task_type: str) -> "Task": ...
-
-        def __contains__(self, task_type: object) -> bool: ...
-
-from collections.abc import Mapping
+    from .store import StateStore
 
 from ..models.artifact import FileSpec
 from ..models.context import JobContext
 from ..models.job import Job
-from .channel import ExecutionResult, WorkerLaunchSpec
-from .launcher import _WorkerLaunchCancelled
-from .in_flight import InFlightJob
-from .scheduler import ScheduleResult, StandstillFacts
-from .types import StopMode
-from .wait import AUTHORIZATION_RECHECK_SECONDS
 from ..utils.clock import utc_now_iso
+from .authorization import AuthorizationCoordinator
+from .channel import ExecutionResult, WorkerLaunchSpec
+from .in_flight import InFlightJob
+from .launcher import _WorkerLaunchCancelled
+from .scheduler import ScheduleResult, StandstillFacts
+from .types import AuthorizationStatus, JobHandle, StopMode
 
 logger = logging.getLogger("tasklite")
 
@@ -61,11 +50,11 @@ logger = logging.getLogger("tasklite")
 class DispatchKind(enum.Enum):
     """一次调度派发周期的结局分类（单一事实，无交叠布尔）。"""
 
-    SPAWNED = "spawned"                    # 子进程已启动并登记在飞
-    HANDLED_NO_SUBPROCESS = "handled_no_subprocess"  # 五关/校验拦截，无需子进程即终结
-    AUTHORIZATION_PENDING = "authorization_pending"
-    WORKER_SATURATED = "worker_saturated"  # 工人槽位耗尽，退出填池等待
-    NO_CANDIDATE = "no_candidate"          # 队列无可运行候选（停摆事实随附）
+    SPAWNED = "spawned"                              # 子进程已启动并登记在飞
+    HANDLED_NO_SUBPROCESS = "handled_no_subprocess"  # 预检/校验拦截，无需子进程即终结
+    AUTHORIZATION_PENDING = "authorization_pending"  # 派发前路径授权待决
+    WORKER_SATURATED = "worker_saturated"            # 工人槽位耗尽，退出填池等待
+    NO_CANDIDATE = "no_candidate"                    # 队列无可运行候选（停摆事实随附）
 
 
 @dataclass(frozen=True)
@@ -83,6 +72,88 @@ class DispatchOutcome:
     standstill: StandstillFacts = field(default_factory=StandstillFacts)
 
 
+class _DispatchStopped(Exception):
+    """派发阶段内检测到停机请求，触发未启动状态回退的内部信号。"""
+
+
+class _DispatchStageGuard:
+    """派发阶段回滚守卫：按已越过阶段精确回退。
+
+    - 停机路径（``rollback_for_stop``）：中止未放行启动、释放资源，若已落 running
+      则回退 pending 且不写 Attempt，否则原位插回队首；
+    - 故障路径（``cleanup_on_fault``）：回收未放行启动/已提交句柄/已占资源；未落
+      running 前回队，已落 running 后保留磁盘 running 供下次启动恢复。
+    """
+
+    def __init__(
+        self,
+        machine: "DispatchMachine",
+        *,
+        job_uid: str,
+        job_snapshot: dict[str, Any],
+    ) -> None:
+        self._machine = machine
+        self.job_uid = job_uid
+        self.job_snapshot = job_snapshot
+        self.execution_id: str | None = None
+        self.attempt_no: int | None = None
+        self.acquired: list[tuple[str, float]] = []
+        self.prepared: "PreparedLaunch | None" = None
+        self.committed_handle: JobHandle | None = None
+        self._finalized: bool = False
+
+    def ensure_allowed(self) -> None:
+        """停机语义屏障：若已请求停机则立即退出本次派发并触发阶段回退。"""
+        if not self._machine._dispatch_allowed():
+            raise _DispatchStopped
+
+    def commit(self) -> None:
+        """移交在飞追踪或完成机器接管，后续退出不再触发回滚。"""
+        self._finalized = True
+
+    def rollback_for_stop(self) -> None:
+        """停机回退：按已越过阶段逆序清理并将未启动作业退回 pending（不写 Attempt）。"""
+        if self._finalized:
+            return
+        self._finalized = True
+        if self.prepared is not None:
+            self._machine._channel.abort_spawn(self.prepared)
+            self.prepared = None
+        if self.acquired:
+            acquired, self.acquired = self.acquired, []
+            self._machine._resources.release_all(acquired, job_uid=self.job_uid)
+        if self.execution_id is not None and self.attempt_no is not None:
+            self._machine._store.apply_pending(
+                self.job_uid,
+                self.job_snapshot,
+                execution_id=self.execution_id,
+                attempt_no=self.attempt_no,
+                run_id=self._machine._session.run_id or "run",
+                started_at=None,
+                error_message="stop requested before worker launch",
+                record_attempt=False,
+            )
+        else:
+            self._machine._store.state.requeue_jobs([self.job_snapshot], front=True)
+
+    def cleanup_on_fault(self) -> None:
+        """框架故障清理：回收启动/通道/资源；未入 running 前回队，已入 running 留待恢复。"""
+        if self._finalized:
+            return
+        self._finalized = True
+        if self.prepared is not None:
+            self._machine._channel.abort_spawn(self.prepared)
+            self.prepared = None
+        if self.committed_handle is not None:
+            self._machine._channel.cleanup_in_flight([self.committed_handle])
+            self.committed_handle = None
+        if self.acquired:
+            acquired, self.acquired = self.acquired, []
+            self._machine._resources.release_all(acquired, job_uid=self.job_uid)
+        if self.execution_id is None:
+            self._machine._store.state.requeue_jobs([self.job_snapshot], front=True)
+
+
 class DispatchMachine:
     """派发预检 + 资源租约 + running 编号 + 子进程 spawn 的编排器。"""
 
@@ -97,7 +168,8 @@ class DispatchMachine:
         in_flight: "InFlightTracker",
         session: "RunSession",
         completion: "CompletionMachine",
-        tasks: "TaskSource",
+        tasks: "TaskRegistry",
+        authorization: AuthorizationCoordinator | None = None,
         dispatch_start_lock: Any | None = None,
     ) -> None:
         self._store = store
@@ -109,7 +181,16 @@ class DispatchMachine:
         self._session = session
         self._completion = completion
         self._tasks = tasks
-        self._authorization_pending: tuple[str | None, str, str] | None = None
+        self._authorization = (
+            authorization
+            if authorization is not None
+            else AuthorizationCoordinator(
+                store=store,
+                channel=channel,
+                in_flight=in_flight,
+                session=session,
+            )
+        )
         self._dispatch_start_lock = dispatch_start_lock or threading.RLock()
 
     # ── 扫描与派发接缝 ────────────────────────────────────────────────
@@ -119,62 +200,27 @@ class DispatchMachine:
         return self._session.stop_mode is StopMode.NONE
 
     def dispatch_next(self) -> DispatchOutcome:
-        """统一扫描与派发接缝：工人槽位预检 → 队列扫描 → 五关预检 →
-        资源租约 → 子进程派发。
+        """统一扫描与派发接缝：派发前授权复查 → 队列扫描 → 工人槽位预检 →
+        预检关卡 → 资源租约 → 子进程派发。
 
         返回 DispatchOutcome（kind 单一判据）：
         - SPAWNED：entry 携带在飞条目，调用方继续收割；
-        - HANDLED_NO_SUBPROCESS：作业被五关/校验拦截并已终结（跳过/
-          依赖失败/无 handler/校验失败/孤儿延迟/残留恢复），调用方可
-          继续填池；
-        - WORKER_SATURATED：工人槽位耗尽（worker_wait 为建议等待），
-          调用方应退出填池循环；
+        - HANDLED_NO_SUBPROCESS：作业被预检/校验拦截并已终结，调用方可继续填池；
+        - AUTHORIZATION_PENDING：派发前授权待决，由 LoopFacts.authorization_wait 驱动复查；
+        - WORKER_SATURATED：工人槽位耗尽（worker_wait 为建议等待），调用方退出填池；
         - NO_CANDIDATE：无可运行作业，停摆事实随 standstill 供仲裁。
         """
         store = self._store
-        if not self._dispatch_allowed():
-            self._authorization_pending = None
+        auth_status = self._authorization.poll_dispatch_authorization()
+        if auth_status is AuthorizationStatus.STOPPED:
             return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
-
-        pending = self._authorization_pending
-        if pending is not None:
-            run_id, pending_uid, name = pending
-            self._authorization_pending = None
-            if run_id == self._session.run_id and pending_uid in store.state.queue_uids:
-                pending_idx = next(
-                    index for index, snapshot in enumerate(store.state.queue)
-                    if Job.from_dict(snapshot).uid == pending_uid
-                )
-                try:
-                    pending_files = self._resolve_job_files(
-                        Job.from_dict(store.state.queue[pending_idx])
-                    )
-                    path = pending_files[name].path
-                    assert path is not None
-                except Exception as exc:
-                    snapshot = store.state.pop_job(pending_idx)
-                    self._reject_and_commit(
-                        pending_uid, snapshot, {
-                            "error_message": str(exc),
-                            "exception": {
-                                "type": type(exc).__name__, "message": str(exc),
-                                "traceback": traceback.format_exc(),
-                            },
-                        },
-                    )
-                    return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
-                authorized = store.check_or_request_authorization(path)
-                if not self._dispatch_allowed():
-                    return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
-                if authorized is None:
-                    self._authorization_pending = pending
-                    return DispatchOutcome(
-                        kind=DispatchKind.AUTHORIZATION_PENDING,
-                        worker_wait=AUTHORIZATION_RECHECK_SECONDS,
-                    )
-                if authorized is False:
-                    self._session.temporarily_exclude_chain(pending_uid, store.state)
-                    return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
+        if auth_status is AuthorizationStatus.PENDING:
+            return DispatchOutcome(kind=DispatchKind.AUTHORIZATION_PENDING)
+        if auth_status in (
+            AuthorizationStatus.DENIED,
+            AuthorizationStatus.PREPARATION_FAILED,
+        ):
+            return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
 
         sched = self._scheduler.scan_next_runnable(store.state, store.state.in_flight_uids)
         if sched.runnable_idx is None:
@@ -195,18 +241,15 @@ class DispatchMachine:
         if not self._dispatch_allowed():
             return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
         entry = self.dispatch_job(sched)
-        if self._authorization_pending:
-            return DispatchOutcome(
-                kind=DispatchKind.AUTHORIZATION_PENDING,
-                worker_wait=AUTHORIZATION_RECHECK_SECONDS,
-            )
+        if self._authorization.has_dispatch_pending:
+            return DispatchOutcome(kind=DispatchKind.AUTHORIZATION_PENDING)
         if entry is None:
             return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
         return DispatchOutcome(kind=DispatchKind.SPAWNED, entry=entry)
 
     def dispatch_job(self, sched: ScheduleResult) -> InFlightJob | None:
         """统一派发单个作业：依赖失败处理 / 统一准入求值 → 出队 → running 编号 →
-        两阶段资源租约 → 子进程启动 → 在飞原子登记。
+        两阶段资源租约 → 前置清理 → 锁外冷启动 → 锁内放行与在飞原子登记。
 
         返回 InFlightJob 条目；被预检拦截（已终结/跳过/已回队）时返回 None。
         """
@@ -216,22 +259,14 @@ class DispatchMachine:
 
         # 1. 依赖终态分支：优先于去重/准入求值（失败或缺失阻断下游）。
         if sched.kind == "dep_failed":
-            pending_dep_failure = sched.pending_dep_failure
             job_snapshot = store.state.pop_job(sched.runnable_idx)
-            job = Job.from_dict(job_snapshot)
-            job_uid = job.uid
-            self.dispatch_dep_failed(
-                job_uid, job_snapshot, pending_dep_failure
-            )
+            job_uid = Job.from_dict(job_snapshot).uid
+            self.dispatch_dep_failed(job_uid, job_snapshot, sched.pending_dep_failure)
             return None
         if sched.kind == "dep_missing":
             job_snapshot = store.state.pop_job(sched.runnable_idx)
             job_uid = Job.from_dict(job_snapshot).uid
-            self.dispatch_dep_missing(
-                job_uid,
-                job_snapshot,
-                sched.pending_dep_missing,
-            )
+            self.dispatch_dep_missing(job_uid, job_snapshot, sched.pending_dep_missing)
             return None
 
         # 2. 候选就绪：求值前不 pop 丢队，异常原位留队
@@ -241,7 +276,7 @@ class DispatchMachine:
         job = Job.from_dict(peek_snapshot)
         job_uid = job.uid
 
-        # 依赖就绪后、Trigger判断前解析预声明文件
+        # 依赖就绪后、Trigger 判断前解析预声明文件
         resolved_files: dict[str, FileSpec] = {}
         if job.files:
             try:
@@ -254,7 +289,8 @@ class DispatchMachine:
                     {
                         "error_message": str(err),
                         "exception": {
-                            "type": type(err).__name__, "message": str(err),
+                            "type": type(err).__name__,
+                            "message": str(err),
                             "traceback": traceback.format_exc(),
                         },
                     },
@@ -262,36 +298,23 @@ class DispatchMachine:
                 return None
 
         # 准入求值（仅显式 retry 登记的同 Run 候选跳过触发器）
-        is_session_retry = self._session.is_retry_candidate(job_uid)
-        if not is_session_retry:
+        if not self._session.is_retry_candidate(job_uid):
             should_run = self._trigger_registry.admit(
                 peek_snapshot, store.state, baseline_lookup=store.trusted_last_succeeded_at_us
             )
             if not should_run:
-                job_snapshot = peek_snapshot
-                store.apply_skip(job_uid, job_snapshot=job_snapshot)
+                store.apply_skip(job_uid, job_snapshot=peek_snapshot)
                 return None
 
         if job.task_type not in self._tasks:
             job_snapshot = store.state.pop_job(sched.runnable_idx)
-            if self.dispatch_no_handler(
-                job_uid, job_snapshot, job.task_type
-            ):
+            if self.dispatch_no_handler(job_uid, job_snapshot, job.task_type):
                 return None
 
         # 必要路径授权（未 running 不造 Attempt，授权拒绝本 Run 临时排除该作业及下游）
-        for fname, fspec in resolved_files.items():
-            if fspec.delete_existing or fspec.delete_on_success or fspec.delete_on_failure:
-                assert fspec.path is not None
-                authorized = store.check_or_request_authorization(fspec.path)
-                if not self._dispatch_allowed():
-                    return None
-                if authorized is None:
-                    self._authorization_pending = (self._session.run_id, job_uid, fname)
-                    return None
-                if authorized is False:
-                    self._session.temporarily_exclude_chain(job_uid, store.state)
-                    return None
+        auth_status = self._authorization.authorize_dispatch_files(job_uid, resolved_files)
+        if auth_status is not AuthorizationStatus.APPROVED:
+            return None
 
         # 再次检查全部资源（授权后的全部资源检查到连续获取完成之间，不插入其他分配或回收）
         eval_res = self._resources.evaluate(job.task_type, job.resources)
@@ -302,7 +325,10 @@ class DispatchMachine:
             self._reject_and_commit(
                 job_uid,
                 job_snapshot,
-                {"error_message": 'Resource requirements cannot be satisfied', "error_details": eval_res.reason},
+                {
+                    "error_message": "Resource requirements cannot be satisfied",
+                    "error_details": eval_res.reason,
+                },
             )
             return None
         if not eval_res.is_available:
@@ -311,135 +337,100 @@ class DispatchMachine:
         if not self._dispatch_allowed():
             return None
         job_snapshot = store.state.pop_job(sched.runnable_idx)
-        if not self._dispatch_allowed():
-            store.state.requeue_jobs([job_snapshot], front=True)
-            return None
-        running_at = utc_now_iso()
-        attempt_no = 1
-
-        effective_run_id = self._session.run_id or "run"
-        execution_id = f"{effective_run_id}.{self._session.next_dispatch_no()}"
-        if not self._dispatch_allowed():
-            store.state.requeue_jobs([job_snapshot], front=True)
-            return None
+        guard = _DispatchStageGuard(self, job_uid=job_uid, job_snapshot=job_snapshot)
         try:
-            attempt_no = store.mark_job_running(
-                job_uid,
-                execution_id=execution_id,
-                run_id=effective_run_id,
-                started_at=running_at,
-            )
+            # 屏障 1：出队后、落 running 前
+            guard.ensure_allowed()
+
+            running_at = utc_now_iso()
+            effective_run_id = self._session.run_id or "run"
+            execution_id = f"{effective_run_id}.{self._session.next_dispatch_no()}"
+            try:
+                attempt_no = store.mark_job_running(
+                    job_uid,
+                    execution_id=execution_id,
+                    run_id=effective_run_id,
+                    started_at=running_at,
+                )
+            except Exception as e:
+                logger.critical(
+                    f"Failed to mark job running for {job_uid}: {e}; "
+                    f"requeueing and aborting dispatch without starting handler."
+                )
+                raise
+            guard.execution_id = execution_id
+            guard.attempt_no = attempt_no
             job._attempt_no = attempt_no
             job_snapshot["attempt_no"] = attempt_no
             job_snapshot["run_id"] = effective_run_id
             job_snapshot["started_at"] = running_at
-        except Exception as e:
-            logger.critical(
-                f"Failed to mark job running for {job_uid}: {e}; "
-                f"requeueing and aborting dispatch without starting handler."
-            )
-            store.state.requeue_jobs([job_snapshot], front=True)
-            raise
 
-        if not self._dispatch_allowed():
-            self._rollback_unstarted_running(
-                job_uid=job_uid,
-                job_snapshot=job_snapshot,
-                execution_id=execution_id,
-                attempt_no=attempt_no,
-            )
-            return None
+            # 屏障 2：落 running 后、获取资源前
+            guard.ensure_allowed()
 
-        # 逐项获取资源（串行连续获取，异常属 Run 级框架故障直接上抛）
-        acquired = self._resources.acquire_all(job.task_type, job.resources, job_uid=job_uid)
-        if not self._dispatch_allowed():
-            self._resources.release_all(acquired)
-            self._rollback_unstarted_running(
-                job_uid=job_uid,
-                job_snapshot=job_snapshot,
-                execution_id=execution_id,
-                attempt_no=attempt_no,
+            # 逐项获取资源（串行连续获取，异常属 Run 级框架故障直接上抛）
+            guard.acquired = self._resources.acquire_all(
+                job.task_type, job.resources, job_uid=job_uid
             )
-            return None
 
-        policy = self._store.path_policy
-        authorize_cb = self._store.backend.is_path_authorized
-        try:
-            for fspec in resolved_files.values():
-                if fspec.delete_existing and fspec.path:
-                    policy.delete(
-                        fspec.path,
-                        allow_broken_leaf_symlink=True,
-                        authorize=authorize_cb,
-                    )
-        except (OSError, ValueError, NotImplementedError) as exc:
-            entry = InFlightJob(
-                job_uid=job_uid,
-                job_snapshot=job_snapshot,
-                job=job,
-                acquired=acquired,
-                execution_id=execution_id,
-                attempt_no=attempt_no,
-                run_id=self._session.run_id or "run",
-                active_files=dict(resolved_files),
-                active_file_sources=dict(job.files),
-            )
-            self._in_flight.track(entry, state=store.state)
-            self._completion.settle_reaped([(entry, ExecutionResult(
-                message=f"Pre-deletion failed: {exc}",
-                exception={
-                    "type": type(exc).__name__, "message": str(exc),
-                    "traceback": traceback.format_exc(),
-                },
-            ))])
-            return None
-        except BaseException:
-            self._resources.release_all(acquired)
-            raise
+            # 屏障 3：获取资源后、前置删除与启动准备前
+            guard.ensure_allowed()
 
-        if not self._dispatch_allowed():
-            self._resources.release_all(acquired)
-            self._rollback_unstarted_running(
-                job_uid=job_uid,
-                job_snapshot=job_snapshot,
-                execution_id=execution_id,
-                attempt_no=attempt_no,
-            )
-            return None
+            policy = self._store.path_policy
+            authorize_cb = self._store.backend.is_path_authorized
+            try:
+                for fspec in resolved_files.values():
+                    if fspec.delete_existing and fspec.path:
+                        policy.delete(
+                            fspec.path,
+                            allow_broken_leaf_symlink=True,
+                            authorize=authorize_cb,
+                        )
+            except (OSError, ValueError, NotImplementedError) as exc:
+                acquired = guard.acquired
+                guard.acquired = []
+                guard.commit()
+                entry = InFlightJob(
+                    job_uid=job_uid,
+                    job_snapshot=job_snapshot,
+                    job=job,
+                    acquired=acquired,
+                    execution_id=execution_id,
+                    attempt_no=attempt_no,
+                    run_id=effective_run_id,
+                    active_files=dict(resolved_files),
+                    active_file_sources=dict(job.files),
+                )
+                self._in_flight.track(entry, state=store.state)
+                self._completion.settle_reaped(
+                    [
+                        (
+                            entry,
+                            ExecutionResult(
+                                message=f"Pre-deletion failed: {exc}",
+                                exception={
+                                    "type": type(exc).__name__,
+                                    "message": str(exc),
+                                    "traceback": traceback.format_exc(),
+                                },
+                            ),
+                        )
+                    ]
+                )
+                return None
 
-        try:
             return self._spawn_entry(
-                job_uid,
-                job,
-                job_snapshot,
-                execution_id,
-                acquired,
-                attempt_no=attempt_no,
+                guard,
+                job=job,
+                effective_run_id=effective_run_id,
                 resolved_files=resolved_files,
             )
+        except (_DispatchStopped, _WorkerLaunchCancelled):
+            guard.rollback_for_stop()
+            return None
         except BaseException:
-            self._resources.release_all(acquired)
+            guard.cleanup_on_fault()
             raise
-
-    def _rollback_unstarted_running(
-        self,
-        *,
-        job_uid: str,
-        job_snapshot: dict,
-        execution_id: str,
-        attempt_no: int,
-    ) -> None:
-        """停止门越过 running 提交时，将未启动执行回退为 pending 且不写 Attempt。"""
-        self._store.apply_pending(
-            job_uid,
-            job_snapshot,
-            execution_id=execution_id,
-            attempt_no=attempt_no,
-            run_id=self._session.run_id or "run",
-            started_at=None,
-            error_message="stop requested before worker launch",
-            record_attempt=False,
-        )
 
     # ── 预检关卡 ──────────────────────────────────────────────────────
 
@@ -451,21 +442,17 @@ class DispatchMachine:
     ) -> bool:
         """派发预检关 2——依赖失败（父任务已进失败档案 → 本任务依赖失败）。
 
-        返回 True = 已处理（依赖失败直接 commit，含级联下游 + 钩子）；
+        返回 True = 已处理（依赖失败直接 commit，含级联下游）；
         仅当 pending_dep_failure 非空时调用。事务异常原样传播。
         """
         if pending_dep_failure is None:
             return False
         logger.warning(f"SKIP: {job_uid} (Dependency {pending_dep_failure} failed)")
         failure_metadata: dict[str, Any] = {
-            "error_message": 'Dependency failed or has no record',
+            "error_message": "Dependency failed or has no record",
             "failed_dependency": pending_dep_failure,
         }
-        # 依赖父失败的级联下游计入 cascade_failed 而非 failed——
-        # 「真实业务失败率」统计不被级联稀释。
-        self._reject_and_commit(
-            job_uid, job_snapshot, failure_metadata
-        )
+        self._reject_and_commit(job_uid, job_snapshot, failure_metadata)
         return True
 
     def dispatch_dep_missing(
@@ -481,15 +468,11 @@ class DispatchMachine:
             f"SKIP: {job_uid} (Dependency {pending_dep_missing} has no record)"
         )
         failure_metadata: dict[str, Any] = {
-            "error_message": 'Dependency failed or has no record',
+            "error_message": "Dependency failed or has no record",
             "failed_dependency": pending_dep_missing,
             "missing_dependency": pending_dep_missing,
         }
-        self._reject_and_commit(
-            job_uid,
-            job_snapshot,
-            failure_metadata,
-        )
+        self._reject_and_commit(job_uid, job_snapshot, failure_metadata)
         return True
 
     def dispatch_no_handler(
@@ -504,7 +487,7 @@ class DispatchMachine:
         task_type not in tasks 时调用。事务异常原样传播。
         """
         logger.error(f"SKIP: {job_uid} (No handler for task_type '{task_type}')")
-        failure_metadata = {"error_message": 'No registered handler for task type'}
+        failure_metadata = {"error_message": "No registered handler for task type"}
         self._reject_and_commit(job_uid, job_snapshot, failure_metadata)
         return True
 
@@ -512,113 +495,65 @@ class DispatchMachine:
 
     def _spawn_entry(
         self,
-        job_uid: str,
-        job: Job,
-        job_snapshot: dict,
-        execution_id: str,
-        acquired: list[tuple[str, float]],
+        guard: _DispatchStageGuard,
         *,
-        attempt_no: int = 1,
-        resolved_files: dict[str, FileSpec] | None = None,
-    ) -> InFlightJob | None:
-        """载荷校验 → 锁外冷启动准备（停在放行门前）→ 微秒级锁内放行与在飞登记。
-
-        Popen、双连接握手、进程树绑定及载荷预送均在 ``_dispatch_start_lock``
-        之外完成，避免冷启动阻塞并发 ``stop()``；最终仅微秒级短持锁完成停机
-        二次校验、发送放行门与原子在飞登记。任意未放行异常/取消路径显式调用
-        ``abort_spawn`` 立即回收进程树与双工连接。
-        """
+        job: Job,
+        effective_run_id: str,
+        resolved_files: dict[str, FileSpec],
+    ) -> InFlightJob:
+        """锁外冷启动准备（停在放行门前）→ 微秒级锁内放行与在飞原子登记。"""
         store = self._store
-        effective_run_id = self._session.run_id or "run"
-        prepared = None
-        committed_handle = None
-        try:
-            task = self._tasks.lookup(job.task_type)
-            ctx = self._build_context(job, store.state, files=resolved_files)
-            if not self._dispatch_allowed():
-                self._resources.release_all(acquired)
-                self._rollback_unstarted_running(
-                    job_uid=job_uid,
-                    job_snapshot=job_snapshot,
-                    execution_id=execution_id,
-                    attempt_no=attempt_no,
-                )
-                return None
-            logger.info(f"RUN: {job_uid}")
-            if not self._dispatch_allowed():
-                self._resources.release_all(acquired)
-                self._rollback_unstarted_running(
-                    job_uid=job_uid,
-                    job_snapshot=job_snapshot,
-                    execution_id=execution_id,
-                    attempt_no=attempt_no,
-                )
-                return None
+        assert guard.execution_id is not None and guard.attempt_no is not None
+        task = self._tasks.lookup(job.task_type)
+        ctx = self._build_context(job, store.state, files=resolved_files)
+        logger.info(f"RUN: {guard.job_uid}")
+        guard.ensure_allowed()
 
-            spec = WorkerLaunchSpec(
-                handler=task.handler,
+        spec = WorkerLaunchSpec(
+            handler=task.handler,
+            job=job,
+            job_context=ctx,
+            execution_id=guard.execution_id,
+            timeout_seconds=float(
+                job.timeout_seconds if job.timeout_seconds is not None else 3600.0
+            ),
+            run_id=effective_run_id,
+            attempt_no=guard.attempt_no,
+        )
+
+        # 阶段一（锁外）：冷启动子进程、握手与进程树绑定，停在 b"GO" 栅栏前
+        guard.prepared = self._channel.prepare_spawn(spec)
+
+        # 屏障 4（微秒级短持锁）：与 stop() 同步二次校验，放行并原子登记在飞
+        with self._dispatch_start_lock:
+            guard.ensure_allowed()
+            started_monotonic = time.monotonic()
+            handle = self._channel.release_spawn(guard.prepared)
+            guard.prepared = None
+            guard.committed_handle = handle
+            entry = InFlightJob(
+                job_uid=guard.job_uid,
+                job_snapshot=guard.job_snapshot,
                 job=job,
-                job_context=ctx,
-                execution_id=execution_id,
-                timeout_seconds=float(
-                    job.timeout_seconds if job.timeout_seconds is not None else 3600.0
-                ),
+                handle=handle,
+                started_monotonic=started_monotonic,
+                acquired=guard.acquired,
+                execution_id=guard.execution_id,
+                attempt_no=guard.attempt_no,
                 run_id=effective_run_id,
-                attempt_no=attempt_no,
+                started_at=handle.started_at,
+                known_job_uids=frozenset(
+                    store.state.queue_uids
+                    | store.state.in_flight_uids
+                    | store.state.success_uids
+                    | store.state.failed_uids
+                ),
+                active_files=dict(resolved_files),
+                active_file_sources=dict(job.files),
             )
-
-            # 阶段一（锁外）：冷启动子进程、握手与进程树绑定，停在 b"GO" 栅栏前
-            prepared = self._channel.prepare_spawn(spec)
-
-            # 阶段二（微秒级短持锁）：与 stop() 同步二次校验，放行并原子登记在飞
-            with self._dispatch_start_lock:
-                if not self._dispatch_allowed():
-                    raise _WorkerLaunchCancelled(
-                        f"stop requested before worker commit for {job_uid}"
-                    )
-                started_monotonic = time.monotonic()
-                handle = self._channel.release_spawn(prepared)
-                prepared = None
-                committed_handle = handle
-                entry = InFlightJob(
-                    job_uid=job_uid,
-                    job_snapshot=job_snapshot,
-                    job=job,
-                    handle=handle,
-                    started_monotonic=started_monotonic,
-                    acquired=acquired,
-                    execution_id=execution_id,
-                    attempt_no=attempt_no,
-                    run_id=effective_run_id,
-                    started_at=handle.started_at,
-                    known_job_uids=frozenset(
-                        store.state.queue_uids
-                        | store.state.in_flight_uids
-                        | store.state.success_uids
-                        | store.state.failed_uids
-                    ),
-                    active_files=dict(resolved_files or {}),
-                    active_file_sources=dict(job.files),
-                )
-                self._in_flight.track(entry, state=store.state)
-                return entry
-        except _WorkerLaunchCancelled:
-            if prepared is not None:
-                self._channel.abort_spawn(prepared)
-            self._resources.release_all(acquired)
-            self._rollback_unstarted_running(
-                job_uid=job_uid,
-                job_snapshot=job_snapshot,
-                execution_id=execution_id,
-                attempt_no=attempt_no,
-            )
-            return None
-        except BaseException:
-            if prepared is not None:
-                self._channel.abort_spawn(prepared)
-            if committed_handle is not None:
-                self._channel.cleanup_in_flight([committed_handle])
-            raise
+            self._in_flight.track(entry, state=store.state)
+            guard.commit()
+            return entry
 
     def _build_context(
         self,
@@ -644,7 +579,8 @@ class DispatchMachine:
             ),
             artifact_descriptions={
                 uid: state.successes[uid].get("artifacts", {})
-                for uid in job.depends_on if uid in state.success_uids
+                for uid in job.depends_on
+                if uid in state.success_uids
             },
             files=files,
         )
@@ -666,7 +602,10 @@ class DispatchMachine:
     ) -> None:
         """执行前拒绝统一登记失败；事务异常原样传播。"""
         self._store.apply_failure(
-            job_uid, meta, job_snapshot=job_snapshot, cascade=True,
+            job_uid,
+            meta,
+            job_snapshot=job_snapshot,
+            cascade=True,
         )
 
 

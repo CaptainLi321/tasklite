@@ -3,7 +3,7 @@
 覆盖：complete_job 成功/失败/重试生命周期（资源释放、清理模式、收尾
 钩子恰好一次）、显式重试预算判定与零预算显式重试、动态子任务去重与坏
 子作业拒绝、
-settle_reaped / settle_aborted 批量结算。
+settle_reaped / discard_in_flight 批量结算与异常清扫。
 """
 
 from __future__ import annotations
@@ -529,17 +529,15 @@ class TestSettleReaped:
         ) == 0
 
 
-class TestSettleAborted:
-    """中止分类结算。"""
+class TestDiscardInFlight:
+    """异常退出单口径清扫。"""
 
     def test_abort_releases_entries_without_committing_results(self, tmp_path):
         env = CompletionEnv(tmp_path)
         j1, j2 = Job("t", "j1"), Job("t", "j2")
-        e1, e2 = env.track_entry(j1), env.track_entry(j2)
-        env.completion.settle_aborted(
-            cancelled_entries=[e1],
-            done_entries=[(e2, ExecutionResult(success=True))],
-        )
+        env.track_entry(j1)
+        env.track_entry(j2)
+        env.completion.discard_in_flight()
         assert not env.store.state.queue
         assert not env.store.state.successes
         assert not env.store.state.failed
@@ -558,7 +556,7 @@ class TestSettleAborted:
 
         monkeypatch.setattr(first, "release_resources", fail_release)
         with pytest.raises(OSError) as caught:
-            env.completion.settle_aborted([first], [(second, ExecutionResult(success=True))])
+            env.completion.discard_in_flight()
         assert caught.value is fault
         assert not env.in_flight
         assert not env.store.state.in_flight_uids
@@ -698,7 +696,7 @@ def test_abort_does_not_request_or_execute_cleanup(tmp_path, monkeypatch):
 
     monkeypatch.setattr(env.store.path_policy.adapter, "delete_target", denied)
     with authorizer(env.store, lambda *_args: pytest.fail("异常退出不能发起授权")):
-        env.completion.settle_aborted(entries, [])
+        env.completion.discard_in_flight()
     assert not env.in_flight
     assert not env.store.state.in_flight_uids
     assert not env.store.state.queue

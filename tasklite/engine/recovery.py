@@ -5,46 +5,13 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Set as AbstractSet
 import copy
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from ..backend.base import AbstractStateBackend
-    from .channel import ExecutionChannel, ExecutionResult
-    from .in_flight import InFlightJob, InFlightTracker
-    from .resource import ResourceManager
-
-    class RecoveryStore(Protocol):
-        """装载状态和登记恢复失败所需的仓库接口。"""
-
-        @property
-        def backend(self) -> AbstractStateBackend: ...
-
-        @property
-        def state(self) -> PipelineState: ...
-
-        def set_state(self, state: PipelineState | None) -> None: ...
-
-        def apply_failure(
-            self, job_uid: str, failure_metadata: dict[str, Any], *,
-            job_snapshot: dict[str, Any] | None = None,
-            cascade: bool = True, attempt_no: int | None = None,
-            execution_id: str | None = None,
-            run_id: str | None = None, started_at: str | None = None,
-        ) -> Any: ...
-
-    class RecoveryCompletion(Protocol):
-        """恢复编排消费的完成机器契约（CompletionMachine 自动满足）。
-
-        异常中止只清除内存在途归属，持久化 running 留给下次恢复。
-        """
-
-        def settle_aborted(
-            self,
-            cancelled_entries: Sequence[InFlightJob],
-            done_entries: Sequence[tuple[InFlightJob, ExecutionResult]],
-        ) -> None: ...
+    from .channel import ExecutionChannel
+    from .completion import CompletionMachine
+    from .in_flight import InFlightTracker
+    from .store import StateStore
 
 from ..backend.base import RunningAttemptRecovery, execution_id_matches_run
 from ..exceptions import TaskLiteError
@@ -134,20 +101,18 @@ def build_unsettled_running_recovery(
 
 
 class RecoveryOrchestrator:
-    """按数据库事实恢复遗留执行。"""
+    """按数据库事实恢复遗留执行，并在框架异常退出时单口径清扫内存与进程归属。"""
 
     def __init__(
         self,
         *,
-        store: "RecoveryStore",
+        store: "StateStore",
         channel: "ExecutionChannel",
-        resources: "ResourceManager",
         in_flight: "InFlightTracker",
-        completion: "RecoveryCompletion",
+        completion: "CompletionMachine",
     ) -> None:
         self._store = store
         self._channel = channel
-        self._resources = resources
         self._in_flight = in_flight
         self._completion = completion
 
@@ -201,23 +166,23 @@ class RecoveryOrchestrator:
         return state
 
     def abort_in_flight(self) -> None:
-        """框架异常退出时取消半初始化启动、结束 worker 并清除内存在途归属，不补提交结果。"""
+        """框架异常退出单口径清扫：取消待启动 → 终止通道在途 → 统一释放资源、注销在途与清空授权等待。
+
+        未提交的持久化 running 记录原样保留，留待下次启动按原执行身份恢复，绝不补提交结果。
+        """
         self._channel.cancel_pending_launches()
-        if not self._in_flight:
-            return
-
-        # 1. 释放已占用的资源（务必在 clear 前）
-        self._in_flight.release_all_resources(self._resources)
-
-        # 2. 委托 channel 执行底层 TOCTOU 闭环中止（kill、重查、清理）
         handles = self._in_flight.active_handles()
-        outcome = self._channel.abort_in_flight(handles)
-
-        completed_map = {h.job_uid: res for h, res in outcome.completed}
-        cancelled_entries, done_entries = self._in_flight.classify_aborted(completed_map)
-
-        # 未提交记录保持 running，不把收到结果等同于已经结算。
-        self._completion.settle_aborted(cancelled_entries, done_entries)
+        cleanup_error: BaseException | None = None
+        try:
+            self._channel.cleanup_in_flight(handles)
+        except BaseException as error:
+            cleanup_error = cleanup_error or error
+        try:
+            self._completion.discard_in_flight()
+        except BaseException as error:
+            cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 __all__ = [

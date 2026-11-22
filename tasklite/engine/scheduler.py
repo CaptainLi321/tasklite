@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from ..exceptions import TaskLiteError
 from ..models.job import Job
 from ..models.state import DependencyStatus, PipelineState, job_uid_from_snapshot
-from ..selection import Exclude
 from .resource import Resource, ResourceManager
 from .session import RunSession
 
@@ -110,7 +109,6 @@ class ScheduleResult:
     # 死锁归因值对象（UID 集合）
     attribution: DeadlockAttribution = field(default_factory=DeadlockAttribution)
     candidate_uid: str | None = None
-    impossible_reason: str | None = None
     has_resource_waiters: bool = False
 
     @property
@@ -190,33 +188,9 @@ class JobScheduler:
         self._JOB_CACHE_MAX = 100_000
 
     @property
-    def exclude(self) -> Exclude | None:
-        return self._session.exclude
-
-    @exclude.setter
-    def exclude(self, value: Exclude | None) -> None:
-        self._session.exclude = value
-
-    def temporarily_exclude(self, job_uid: str) -> None:
-        """内部排除入口：登记单个临时排除 UID（供授权拒绝等复用）。"""
-        self._session.temporarily_exclude(job_uid)
-
-    def clear_temporary_exclusions(self) -> None:
-        """清空临时排除 UID 集合（每次 Run 启动时重置）。"""
-        self._session.temporary_excluded_uids.clear()
-
-    def is_job_excluded(self, job_uid: str, task_type: str) -> bool:
-        """统一判断作业是否被排除（用户 exclude 规则或运行期临时排除）。"""
-        return self._session.is_excluded(job_uid, task_type)
-
-    def is_job_excluded_by_uid(self, job_uid: str) -> bool:
-        """按 UID 查询是否被排除（临时排除或根据解码后的 task_type 比对 exclude 规则）。"""
-        return self._session.is_excluded_by_uid(job_uid)
-
-    def reset_run(self, exclude: Exclude | None = None) -> None:
-        """Run 生命周期重置：固化排除规则并清空临时排除与调度缓存。"""
-        self._session.clear_exclusions(exclude)
-        self.begin_round()
+    def session(self) -> RunSession:
+        """当前关联的运行期会话（运行期排除状态唯一接口）。"""
+        return self._session
 
     def begin_round(self) -> None:
         """清空调度缓存（**run 生命周期**，由运行主循环加载期调用）。
@@ -282,14 +256,6 @@ class JobScheduler:
         cached_res = dict(job.resources or {}) if not isinstance(job.resources, dict) else job.resources
         return list(job.depends_on) == job_dep and cached_res == job_res
 
-    def _effective_resources(self, job) -> dict[str, float]:
-        """job 实际会 acquire 的资源集（委托给 ResourceManager 单点真相源）。"""
-        if isinstance(job, JobFacts):
-            job_resources = job.resource_map()
-        else:
-            job_resources = dict(job.resources)
-        return self.resource_mgr.effective_resources(job.task_type, job_resources)
-
     def scan_next_runnable(
         self,
         state: PipelineState,
@@ -329,7 +295,7 @@ class JobScheduler:
                 continue
 
             # 排除规则与临时排除：命中排除的作业在依赖/资源评估之前整体跳过。
-            if self.is_job_excluded(job.uid, job.task_type):
+            if self._session.is_excluded(job.uid, job.task_type):
                 continue
 
             # 依赖屏障与就绪判定：统一调用 state.check_dependency_status
@@ -344,7 +310,7 @@ class JobScheduler:
                     status = state.check_dependency_status(
                         dep_uid,
                         in_flight_uids=in_flight_uids,
-                        is_dep_excluded=self.is_job_excluded_by_uid,
+                        is_dep_excluded=self._session.is_excluded_by_uid,
                     )
                     if status == DependencyStatus.ACTIVE or status == DependencyStatus.EXCLUDED:
                         waiting_for_dep = True

@@ -4,8 +4,8 @@
 retry/success/failure 三态事务提交。重试预算只统计本 Run 中显式
 ``TaskResult.retry`` 的消耗；候选来源与累计数量分开登记。
 
-``session`` 直接使用内部 RunSession，统一持有候选来源和累计重试预算；
-``run_id`` 是 successes meta 的 last_run_id 事实源。
+收尾清理期授权等待由 ``AuthorizationCoordinator`` 统一承接，本模块不自建
+暂挂队列或控制流异常，亦不穿透访问底层进程句柄。
 """
 
 from __future__ import annotations
@@ -19,19 +19,18 @@ from typing import Any, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .channel import ExecutionChannel
-    from .session import RunSession
     from .resource import ResourceManager
+    from .session import RunSession
     from .store import StateStore
 
 from ..exceptions import TaskLiteError, _ArtifactIOError
-from ..models.job import Job
 from ..models.artifact import FileSpec
+from ..models.job import Job
 from ..models.records import build_result_record, extract_effective_job_config
-from ..utils.clock import utc_now_iso
+from .authorization import AuthorizationCoordinator, CleanupAuthorizationDecision
 from .channel import ExecutionResult, JobHandle
-
 from .in_flight import InFlightJob, InFlightTracker
-from .types import AuthorizationOutcome, AuthorizationStatus, StopMode
+from .types import AuthorizationStatus
 
 logger = logging.getLogger("tasklite")
 _CLEANUP_ERRORS = (OSError, ValueError, NotImplementedError)
@@ -41,10 +40,6 @@ _CLEANUP_ERRORS = (OSError, ValueError, NotImplementedError)
 class _PreparedCompletion:
     active_files: dict[str, FileSpec]
     spawned_job_snapshots: list[dict[str, Any]]
-
-
-class _CleanupAuthorizationPending(Exception):
-    """清理尚待授权，保留有效结果及在途归属。"""
 
 
 class CompletionMachine:
@@ -58,13 +53,23 @@ class CompletionMachine:
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
         session: "RunSession",
+        authorization: AuthorizationCoordinator | None = None,
     ) -> None:
         self._store = store
         self._channel = channel
         self._resources = resources
         self._in_flight = in_flight
         self._session = session
-        self._pending_cleanup: dict[str, tuple[InFlightJob, ExecutionResult, _PreparedCompletion]] = {}
+        self._authorization = (
+            authorization
+            if authorization is not None
+            else AuthorizationCoordinator(
+                store=store,
+                channel=channel,
+                in_flight=in_flight,
+                session=session,
+            )
+        )
 
     @staticmethod
     def _cleanup_exception(exc: BaseException) -> dict[str, str]:
@@ -109,101 +114,52 @@ class CompletionMachine:
 
     # ── 唯一收尾出口 ──────────────────────────────────────────────────
 
-    @property
-    def waiting_authorization(self) -> bool:
-        return bool(self._pending_cleanup)
-
-    def has_pending_result(self, handle: JobHandle) -> bool:
-        return handle.job_uid in self._pending_cleanup
-
-    def _authorize_cleanup(
-        self, entry: InFlightJob | None, result: ExecutionResult,
-        active_files: dict[str, FileSpec],
-    ) -> None:
-        policy = self._store.path_policy
-        for spec in active_files.values():
-            requested = spec.delete_on_success if result.success else spec.delete_on_failure
-            if not requested or spec.path is None:
-                continue
-            try:
-                if not policy.inspect(spec.path, mode="strict", verify_unchanged=True).exists:
-                    continue
-            except _CLEANUP_ERRORS:
-                continue
-            stopped = self._session.stop_mode is not StopMode.NONE
-            waiting = entry is not None and entry.job_uid in self._pending_cleanup
-            if stopped and waiting:
-                status = AuthorizationStatus.STOPPED
-                message = f"authorization wait stopped for {spec.path}"
-            else:
-                decision = self._store.check_or_request_authorization(spec.path)
-                stopped = self._session.stop_mode is not StopMode.NONE
-                if stopped and (waiting or decision is None):
-                    status = AuthorizationStatus.STOPPED
-                    message = f"authorization wait stopped for {spec.path}"
-                else:
-                    if decision is True:
-                        continue
-                    if decision is None:
-                        raise _CleanupAuthorizationPending
-                    status = AuthorizationStatus.DENIED
-                    message = f"authorization denied for {spec.path}"
-            result.authorization_outcome = AuthorizationOutcome(status, message, spec.path)
-            if entry is not None and entry.handle is not None:
-                self._channel.terminate_process(entry.handle)
-            raise _CleanupAuthorizationPending
-        # 后续询问回调可能改变此前目标，整组通过后再交付实际清理。
-        for spec in active_files.values():
-            requested = spec.delete_on_success if result.success else spec.delete_on_failure
-            if requested and spec.path and not self._store.is_path_authorized(spec.path):
-                try:
-                    present = policy.inspect(spec.path, mode="strict", verify_unchanged=True).exists
-                except _CLEANUP_ERRORS:
-                    continue
-                if present:
-                    raise _CleanupAuthorizationPending
-
     def complete_job(
-        self, entry: InFlightJob, result: ExecutionResult,
-        *, prepared: _PreparedCompletion | None = None,
+        self,
+        entry: InFlightJob,
+        result: ExecutionResult,
+        *,
+        prepared: _PreparedCompletion | None = None,
     ) -> None:
         """处理一个在飞作业的完成结果（唯一收尾出口）。
 
         事务性提交与内存 apply 见 ``apply_result``（两条提交路径共用）；
-        本方法在提交成功后注销在途条目，资源释放在 ``apply_result``
+        本方法在提交成功后注销在途条目并清除授权状态，资源释放在 ``apply_result``
         内部恰好执行一次（提交前或异常兜底）。
 
-        身份非真空：在飞注销**不在本方法开头**统一执行——那会造成
-        「四集合真空」窗口（uid 不在 successes/failed/queue/in-flight 任一
-        集合），使 handler 自 spawn 同 uid 子任务时被 ``is_known`` 漏判。
-        注销时机下推到 ``apply_result`` 内部分支（retry 在重入队前、
+        身份非真空：在飞注销下推到 ``apply_result`` 内部分支（retry 在重入队前、
         success 在 mark_success 后、failure 在 mark_failed 后），保证
         uid 在 ``is_known`` 可达的代码段内始终属于至少一个集合。
-
-        声明只在业务结算完成后删除；提交前异常保留声明以便诊断。
         """
         uid = entry.job_uid
-        self.apply_result(
+        exec_id = (
+            entry.execution_id
+            if entry.execution_id is not None
+            else (entry.handle.execution_id if entry.handle is not None else None)
+        )
+        settled = self.apply_result(
             uid,
             entry.job,
             entry.job_snapshot,
             result,
             started_monotonic=entry.started_monotonic,
             expect_in_flight=(entry.handle is not None),
-            execution_id=entry.execution_id if entry.execution_id is not None else (
-                entry.handle.execution_id if entry.handle is not None else None
-            ),
+            execution_id=exec_id,
             attempt_no=entry.attempt_no,
             run_id=entry.run_id or self._session.run_id,
             started_at=entry.started_at,
             entry=entry,
             prepared=prepared,
         )
-        self._in_flight.settle(uid, state=self._store.state)
-
+        if settled:
+            self._in_flight.settle(uid, state=self._store.state)
+            self._authorization.clear_execution(exec_id, job_uid=uid)
 
     def _prepare_completion(
-        self, uid: str, job: Job, result: ExecutionResult,
+        self,
+        uid: str,
+        job: Job,
+        result: ExecutionResult,
         entry: InFlightJob | None,
     ) -> _PreparedCompletion:
         store = self._store
@@ -282,8 +238,8 @@ class CompletionMachine:
         started_at: str | None = None,
         entry: InFlightJob | None = None,
         prepared: _PreparedCompletion | None = None,
-    ) -> None:
-        """事务性提交一个执行结果到后端并同步内存。
+    ) -> bool:
+        """事务性提交一个执行结果到后端并同步内存；若清理授权仍待决返回 False。
 
         先提交后端（唯一真相源），commit 成功后才 apply 到内存 state。
         三态分发：
@@ -302,8 +258,13 @@ class CompletionMachine:
         try:
             if prepared is None:
                 prepared = self._prepare_completion(uid, job, result, entry)
-                if result.authorization_outcome is None:
-                    self._authorize_cleanup(entry, result, prepared.active_files)
+                decision = self._authorization.evaluate_cleanup(
+                    entry, result, prepared.active_files
+                )
+                if decision is CleanupAuthorizationDecision.PENDING:
+                    if entry is not None:
+                        self._authorization.defer_cleanup(entry, result, prepared)
+                    return False
             active_files = prepared.active_files
 
             authorization_outcome = result.authorization_outcome
@@ -336,7 +297,7 @@ class CompletionMachine:
                 if authorization_outcome.status is AuthorizationStatus.DENIED:
                     self._session.temporarily_exclude_chain(uid, store.state)
                 result.will_retry = False
-                return
+                return True
 
             spawned_job_snapshots = prepared.spawned_job_snapshots
 
@@ -345,7 +306,7 @@ class CompletionMachine:
                 policy = self._store.path_policy
                 authorize_cb = self._store.backend.is_path_authorized
                 if result.success:
-                    for fname, spec in active_files.items():
+                    for _fname, spec in active_files.items():
                         if not (spec.delete_on_success and spec.path):
                             continue
                         try:
@@ -359,7 +320,7 @@ class CompletionMachine:
                         spawned_job_snapshots = []
                         result.cursor_updates = {}
                 else:
-                    for fname, spec in active_files.items():
+                    for _fname, spec in active_files.items():
                         if not (spec.delete_on_failure and spec.path):
                             continue
                         try:
@@ -371,8 +332,6 @@ class CompletionMachine:
             if entry is not None:
                 released = True
                 entry.release_resources(self._resources)
-        except _CleanupAuthorizationPending:
-            raise
         except BaseException:
             if entry is not None and not released:
                 entry.release_resources(self._resources)
@@ -416,6 +375,7 @@ class CompletionMachine:
                 started_at=started_at,
                 active_files=active_files,
             )
+        return True
 
     # ── 三态分支 ──────────────────────────────────────────────────────
 
@@ -449,7 +409,7 @@ class CompletionMachine:
                     f"Sent to failure archive."
                 )
                 failure_metadata: dict[str, Any] = {
-                    "error_message": 'Retry budget exhausted',
+                    "error_message": "Retry budget exhausted",
                 }
                 if result.message is not None:
                     failure_metadata["message"] = result.message
@@ -626,10 +586,13 @@ class CompletionMachine:
             f"FAIL: {uid} (duration {duration:.2f}s, sent to failure archive). "
             f"Message: {result.message}, Meta: {result.result_metadata}"
         )
-        failure_record: dict[str, Any] = copy.deepcopy(failure_record_override) if failure_record_override is not None else {}
-        if failure_record_override is None:
-            if result.message is not None:
-                failure_record["error_message"] = result.message
+        failure_record: dict[str, Any] = (
+            copy.deepcopy(failure_record_override)
+            if failure_record_override is not None
+            else {}
+        )
+        if failure_record_override is None and result.message is not None:
+            failure_record["error_message"] = result.message
 
         files_dict = (
             {k: v.to_dict() for k, v in active_files.items()}
@@ -657,69 +620,55 @@ class CompletionMachine:
         result.will_retry = False
         self._session.clear_retry_candidate(uid)
 
-    # ── 批量结算 ──────────────────────────────────────────────────────
+    # ── 批量结算与异常清扫 ────────────────────────────────────────────
 
     def settle_reaped(
-        self, reaped: Sequence[tuple[JobHandle | InFlightJob, ExecutionResult]]
+        self,
+        reaped: Sequence[tuple[JobHandle | InFlightJob, ExecutionResult]],
     ) -> int:
         """统一结算通道结果与未启动 worker 的执行失败。
 
         无 worker 的条目直接携带执行身份，不制造句柄或启动超时计时。
-
-        为每个已完成作业原子执行：
-        1. 提取在飞条目；
-        2. 经 complete_job 清理产物、释放资源并原子提交；
-        3. 提交后注销在途归属；框架异常交由 Run 异常回收；
-        返回成功结算的作业数。
+        清理授权待决或受阻进程待退出时统一交由 ``AuthorizationCoordinator`` 暂挂，
+        待放行或进程退出后仅执行一次收尾提交。
         """
-        store = self._store
         settled_count = 0
-        pending_results = list(self._pending_cleanup.values())
-        candidates = [*pending_results, *((h, r, None) for h, r in reaped)]
+        pending_results = [
+            (item.entry, item.result, item.prepared)
+            for item in self._authorization.pending_cleanups()
+        ]
+        candidates: list[tuple[JobHandle | InFlightJob, ExecutionResult, _PreparedCompletion | None]] = [
+            *pending_results,
+            *((h, r, None) for h, r in reaped),
+        ]
         for source, result, prepared in candidates:
             entry = self._in_flight.get(source.job_uid)
             if entry is None:
                 continue
-            handle = entry.handle
             if prepared is None:
                 prepared = self._prepare_completion(entry.job_uid, entry.job, result, entry)
-            if result.authorization_outcome is None:
-                try:
-                    self._authorize_cleanup(entry, result, prepared.active_files)
-                except _CleanupAuthorizationPending:
-                    self._pending_cleanup[entry.job_uid] = (entry, result, prepared)
-                    if handle is not None:
-                        handle.pause_timeout()
-                    continue
-            elif handle is not None and entry.job_uid in self._pending_cleanup:
-                try:
-                    if handle.process.is_alive():
-                        continue
-                except ValueError:
-                    # 有效结果交付后，非阻塞回收可能已关闭进程句柄。
-                    pass
+            decision = self._authorization.evaluate_cleanup(
+                entry, result, prepared.active_files
+            )
+            if decision is CleanupAuthorizationDecision.PENDING:
+                self._authorization.defer_cleanup(entry, result, prepared)
+                continue
             # 框架异常立即上抛，未提交条目保留归属，由异常回收统一处理。
             self.complete_job(entry, result, prepared=prepared)
             settled_count += 1
-            self._pending_cleanup.pop(entry.job_uid, None)
         return settled_count
 
-    def settle_aborted(
-        self,
-        cancelled_entries: Sequence[InFlightJob],
-        done_entries: Sequence[tuple[InFlightJob, ExecutionResult]],
-    ) -> None:
-        """异常退出只释放内存归属，未提交的 running 留待下次恢复。"""
+    def discard_in_flight(self) -> None:
+        """异常退出单口径清扫：统一释放资源、同步注销在途并清空授权队列，不补提交结果。"""
         cleanup_error: BaseException | None = None
-        entries = [*cancelled_entries, *(entry for entry, _ in done_entries)]
-        for entry in entries:
+        for entry in list(self._in_flight.values()):
             try:
                 entry.release_resources(self._resources)
             except BaseException as error:
                 cleanup_error = cleanup_error or error
             finally:
                 self._in_flight.settle(entry.job_uid, state=self._store.state)
-        self._pending_cleanup.clear()
+        self._authorization.clear_all()
         if cleanup_error is not None:
             raise cleanup_error
 

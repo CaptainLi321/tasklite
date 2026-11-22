@@ -341,6 +341,8 @@ class ExecutionChannel:
         self._sessions_lock = threading.RLock()
         self._sessions: dict[str, _ExecutionSession] = {}
         self._declaration_handler: Callable[[JobHandle, dict[str, Any]], dict[str, Any] | None] | None = None
+        self._is_timeout_paused_cb: Callable[[JobHandle], bool] | None = None
+        self._get_authorization_outcome_cb: Callable[[JobHandle], AuthorizationOutcome | None] | None = None
         self._wakeup_callback: Callable[[], None] | None = None
 
     def _find_session(self, handle: JobHandle) -> _ExecutionSession | None:
@@ -744,6 +746,24 @@ class ExecutionChannel:
     ) -> None:
         self._declaration_handler = handler
 
+    def set_authorization_queries(
+        self,
+        *,
+        is_timeout_paused: Callable[[JobHandle], bool] | None = None,
+        get_outcome: Callable[[JobHandle], AuthorizationOutcome | None] | None = None,
+    ) -> None:
+        """绑定运行期授权状态只读查询回调（超时暂停判定与终态授权结果）。"""
+        self._is_timeout_paused_cb = is_timeout_paused
+        self._get_authorization_outcome_cb = get_outcome
+
+    def _is_timeout_paused(self, handle: JobHandle) -> bool:
+        cb = self._is_timeout_paused_cb
+        return bool(cb(handle)) if cb is not None else False
+
+    def _get_authorization_outcome(self, handle: JobHandle) -> AuthorizationOutcome | None:
+        cb = self._get_authorization_outcome_cb
+        return cb(handle) if cb is not None else None
+
     def set_wakeup_callback(self, callback: Callable[[], None] | None) -> None:
         """绑定 IPC 消息到达时的主循环唤醒入口。"""
         self._wakeup_callback = callback
@@ -752,6 +772,19 @@ class ExecutionChannel:
         callback = self._wakeup_callback
         if callback is not None:
             callback()
+
+    def is_handle_alive(self, handle: JobHandle) -> bool:
+        """受控判定在途句柄对应子进程是否仍在运行（屏蔽已关闭句柄的 ValueError）。"""
+        p = handle.process
+        if p is None or getattr(p, "_closed", False):
+            return False
+        is_alive_fn = getattr(p, "is_alive", None)
+        if not callable(is_alive_fn):
+            return False
+        try:
+            return bool(is_alive_fn())
+        except (ValueError, OSError):
+            return False
 
     def terminate_process(self, handle: JobHandle) -> None:
         """终止指定作业的子进程树。"""
@@ -848,14 +881,9 @@ class ExecutionChannel:
             session = self._find_session(handle)
             self._receive_available(handle)
 
-            authorization_outcome = handle.authorization_outcome
+            authorization_outcome = self._get_authorization_outcome(handle)
             if authorization_outcome is not None:
-                is_alive = False
-                try:
-                    is_alive = p.is_alive()
-                except Exception:
-                    pass
-                if not is_alive:
+                if not self.is_handle_alive(handle):
                     if session is not None:
                         self._close_session(session, finalize_process=True, receiver_timeout=0.2)
                     else:
@@ -875,13 +903,7 @@ class ExecutionChannel:
                 session.result = None
                 decoded = _decode_ipc_result(raw_res, handle.job)
 
-                is_alive = False
-                try:
-                    is_alive = p.is_alive()
-                except Exception:
-                    pass
-
-                if not is_alive:
+                if not self.is_handle_alive(handle):
                     self._close_session(session, finalize_process=True, receiver_timeout=0.2)
                 else:
                     # 结果后不再回复声明；会话转入 lingering，保活进程句柄与接收端。
@@ -901,7 +923,7 @@ class ExecutionChannel:
                 continue
 
             # 4. 超时：从启动到结果到达计单次超时（等待授权期间暂停不计）
-            if not handle.waiting_auth and now > handle.timeout_at_monotonic:
+            if not self._is_timeout_paused(handle) and now > handle.timeout_at_monotonic:
                 p.join(timeout=0.5)
                 if p.is_alive():
                     try:
@@ -920,7 +942,7 @@ class ExecutionChannel:
         """收敛收割尾部：终止并收割子进程 → 排空管道至 EOF → 解码结果 → 关闭会话。"""
         p = handle.process
         session = self._find_session(handle)
-        authorization_outcome = handle.authorization_outcome
+        authorization_outcome = self._get_authorization_outcome(handle)
         if authorization_outcome is not None:
             try:
                 self._terminate_and_join_process(p)

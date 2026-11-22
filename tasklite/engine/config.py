@@ -34,7 +34,6 @@ class RunConfig:
     trigger_registry: TriggerRegistry
     requeue_policy: RequeuePolicy
     ordering_policy: OrderingPolicy
-    name: str = "tasklite"
     path_policy: PathPolicy | None = None
 
     @classmethod
@@ -47,14 +46,12 @@ class RunConfig:
         channel: "ExecutionChannel",
         governor: DeadlockGovernor,
         trigger_registry: TriggerRegistry,
-        name: str = "tasklite",
         requeue_policy: RequeuePolicy | None = None,
         ordering_policy: OrderingPolicy | None = None,
         path_policy: PathPolicy | None = None,
     ) -> "RunConfig":
         """按引用装配依赖，并解析内部策略默认值。"""
         return cls(
-            name=name,
             path_policy=path_policy,
             backend=backend,
             resources=resources,
