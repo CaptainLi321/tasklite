@@ -26,7 +26,7 @@ from tasklite import (
 )
 from tasklite.resource import CapacityResource
 from tasklite.testing import authorizer as inject_authorizer
-from tasklite.testing import in_process_workers, running
+from tasklite.testing import cleanup_hook, in_process_workers, observe_wait, running
 
 
 def _quick_handler(job, ctx):
@@ -195,15 +195,6 @@ def test_worker_declaration_wakes_main_loop_wait(tmp_path, monkeypatch, caplog):
     p.enqueue(Job("follow", "f1"))
 
     wait_observed = threading.Event()
-    wait_timeouts: list[float | None] = []
-    original_wait = p._runtime._wait
-
-    def tracked_wait(timeout, last_seq=None):
-        wait_timeouts.append(timeout)
-        wait_observed.set()
-        return original_wait(timeout, last_seq=last_seq)
-
-    monkeypatch.setattr(p._runtime, "_wait", tracked_wait)
     errors: list[BaseException] = []
 
     def run_pipeline():
@@ -212,7 +203,11 @@ def test_worker_declaration_wakes_main_loop_wait(tmp_path, monkeypatch, caplog):
         except BaseException as exc:
             errors.append(exc)
 
-    with in_process_workers(p), inject_authorizer(p, auth):
+    with (
+        in_process_workers(p),
+        inject_authorizer(p, auth),
+        observe_wait(p, lambda _timeout: wait_observed.set()) as wait_timeouts,
+    ):
         runner = threading.Thread(target=run_pipeline)
         runner.start()
         try:
@@ -427,11 +422,7 @@ def test_cleanup_failure_vs_authorization_denial_destinations(tmp_path, monkeypa
     p.register_task("clean_task", _cleanup_fail_handler)
     p.enqueue(Job("clean_task", "c1"))
 
-    with in_process_workers(p), patch.object(
-        p._runtime.store.path_policy.adapter,
-        "delete_target",
-        side_effect=OSError("Read-only file system"),
-    ):
+    with in_process_workers(p), cleanup_hook(p, OSError("Read-only file system")):
         p.run(install_signals=False)
 
     rec = _failed_record(p, "clean_task::c1")
@@ -792,11 +783,6 @@ def test_forbidden_file_operations_never_request_or_persist_authorization(
         if forbidden == "protected":
             # 确保 memory/sqlite 均覆盖到
             assert p._state_path == state_path
-        monkeypatch.setattr(
-            p._runtime.store.path_policy.adapter,
-            "delete_target",
-            lambda *args, **kwargs: removals.append(args),
-        )
         spec = FileSpec(target, role="output", **{operation: True})
         p.register_task("work", _declare_spec_handler if declaration == "dynamic" else _quick_handler)
         p.enqueue(Job(
@@ -804,12 +790,13 @@ def test_forbidden_file_operations_never_request_or_persist_authorization(
             files={"target": spec} if declaration == "static" else {},
         ))
         # dynamic 入口会触发主进程强制终止阻塞在 wait_reply 的 worker，需真实子进程
-        if declaration == "dynamic":
-            with inject_authorizer(p, lambda *args: calls.append(args) or True):
-                p.run(install_signals=False)
-        else:
-            with in_process_workers(p), inject_authorizer(p, lambda *args: calls.append(args) or True):
-                p.run(install_signals=False)
+        with cleanup_hook(p, lambda _orig, *args, **kwargs: removals.append(args)):
+            if declaration == "dynamic":
+                with inject_authorizer(p, lambda *args: calls.append(args) or True):
+                    p.run(install_signals=False)
+            else:
+                with in_process_workers(p), inject_authorizer(p, lambda *args: calls.append(args) or True):
+                    p.run(install_signals=False)
         assert calls == []
         assert p.list_authorizations() == []
         assert removals == []
@@ -1287,18 +1274,18 @@ def test_type_change_at_deletion_snapshot_fails_without_directory_permission(
     p.enqueue(Job("work", "one", files={
         "target": FileSpec(target, role="cache", **{timing: True}),
     }))
-    adapter = p._runtime.store.path_policy.adapter
-    original_delete = adapter.delete_target
-
-    def replace_before_snapshot(path, **kwargs):
+    def replace_before_snapshot(original_delete, path, **kwargs):
         if Path(path) == target:
             target.unlink()
             target.mkdir()
             (target / "child").write_text("preserve", encoding="utf-8")
         return original_delete(path, **kwargs)
 
-    monkeypatch.setattr(adapter, "delete_target", replace_before_snapshot)
-    with in_process_workers(p), inject_authorizer(p, lambda *args: calls.append(args) or True):
+    with (
+        in_process_workers(p),
+        cleanup_hook(p, replace_before_snapshot),
+        inject_authorizer(p, lambda *args: calls.append(args) or True),
+    ):
         p.run(install_signals=False)
     assert target.joinpath("child").read_text(encoding="utf-8") == "preserve"
     assert calls == [(str(target), "file")]
@@ -1406,13 +1393,16 @@ def test_success_cleanup_error_does_not_run_unapproved_failure_cleanup(tmp_path,
         "second": FileSpec(second, role="cache", delete_on_failure=True),
     }))
 
-    def fail_cleanup(path, *, allow_broken_leaf_symlink, **kwargs):
+    def fail_cleanup(_original_delete, path, *, allow_broken_leaf_symlink, **kwargs):
         assert path == str(first)
         assert not allow_broken_leaf_symlink
         raise OSError("cleanup write failure")
 
-    monkeypatch.setattr(p._runtime.store.path_policy.adapter, "delete_target", fail_cleanup)
-    with in_process_workers(p), inject_authorizer(p, lambda *args: calls.append(args) or True):
+    with (
+        in_process_workers(p),
+        cleanup_hook(p, fail_cleanup),
+        inject_authorizer(p, lambda *args: calls.append(args) or True),
+    ):
         p.run(install_signals=False)
     assert first.read_text(encoding="utf-8") == "initial"
     assert second.joinpath("child").read_text(encoding="utf-8") == "second data"

@@ -54,18 +54,6 @@ _TRUNC_MARKER = "%_"
 # 上限的前提下完成
 _TRUNC_FIXED_LEN = len(_TRUNC_MARKER) + _TRUNC_DIGEST_HEX
 
-# 文件系统危险字符映射（POSIX /、Windows \、NUL、glob *?[]、冒号 :）
-FS_ESCAPE_CHARS: dict[str, str] = {
-    "/": "%2F",
-    "\\": "%5C",
-    "\x00": "%00",
-    "*": "%2A",
-    "?": "%3F",
-    "[": "%5B",
-    "]": "%5D",
-    ":": "%3A",
-}
-
 
 def percent_encode(
     text: str,
@@ -258,6 +246,25 @@ def _encode_uid_component(value: str, field_name: str) -> str:
         ) from exc
 
 
+def _flush_uid_bytes(buf: bytearray, chars: list[str], field_name: str) -> None:
+    """将累积的百分号转义字节按 UTF-8 解码、校验无过度转义并冲刷到字符列表。"""
+    if not buf:
+        return
+    try:
+        decoded_run = buf.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise TaskLiteError(
+            f"invalid job uid: invalid UTF-8 byte sequence in {field_name}"
+        ) from exc
+    for dch in decoded_run:
+        if dch.isprintable() and dch not in (":", "%"):
+            raise TaskLiteError(
+                f"invalid job uid: over-escaped character {dch!r} in {field_name}"
+            )
+    chars.append(decoded_run)
+    buf.clear()
+
+
 def _decode_uid_component(encoded: str, field_name: str) -> str:
     """严格解析规范 UID 组成部分并还原原始字符串。"""
     if not encoded:
@@ -282,39 +289,14 @@ def _decode_uid_component(encoded: str, field_name: str) -> str:
             buf.append(byte_val)
             i += 3
         else:
-            if buf:
-                try:
-                    decoded_run = buf.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise TaskLiteError(
-                        f"invalid job uid: invalid UTF-8 byte sequence in {field_name}"
-                    ) from exc
-                for dch in decoded_run:
-                    if dch.isprintable() and dch not in (":", "%"):
-                        raise TaskLiteError(
-                            f"invalid job uid: over-escaped character {dch!r} in {field_name}"
-                        )
-                chars.append(decoded_run)
-                buf.clear()
+            _flush_uid_bytes(buf, chars, field_name)
             if ch == ":" or not ch.isprintable():
                 raise TaskLiteError(
                     f"invalid job uid: unescaped character {ch!r} in {field_name}"
                 )
             chars.append(ch)
             i += 1
-    if buf:
-        try:
-            decoded_run = buf.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise TaskLiteError(
-                f"invalid job uid: invalid UTF-8 byte sequence in {field_name}"
-            ) from exc
-        for dch in decoded_run:
-            if dch.isprintable() and dch not in (":", "%"):
-                raise TaskLiteError(
-                    f"invalid job uid: over-escaped character {dch!r} in {field_name}"
-                )
-        chars.append(decoded_run)
+    _flush_uid_bytes(buf, chars, field_name)
     return "".join(chars)
 
 
@@ -346,7 +328,6 @@ __all__ = [
     "CONTENT_ID_ALLOWED",
     "DEFAULT_FORBIDDEN",
     "EMPTY_SENTINEL",
-    "FS_ESCAPE_CHARS",
     "content_fingerprint",
     "encode_content_id",
     "encode_identifier",

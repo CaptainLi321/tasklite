@@ -39,7 +39,6 @@ class _PipeConnection(Protocol):
 
 
 # 管道消息种类常量
-PIPE_MSG_INPUT = "input"
 PIPE_MSG_RESULT = "result"
 PIPE_MSG_DECLARE = "declare"
 VALID_PIPE_MESSAGE_KINDS = frozenset(
@@ -48,7 +47,49 @@ VALID_PIPE_MESSAGE_KINDS = frozenset(
         PIPE_MSG_DECLARE,
     }
 )
+# 子进程两阶段握手角色常量
+HANDSHAKE_ROLE_UPLINK = "uplink"
+HANDSHAKE_ROLE_DOWNLINK = "downlink"
+HANDSHAKE_ROLE_CANCEL = "cancel"
 _PIPE_EOF = object()
+
+
+def encode_json_frame(payload: Any) -> bytes:
+    """将对象经统一严格 JSON 序列化编码为 UTF-8 帧字节。"""
+    return dumps(payload).encode("utf-8")
+
+
+def decode_json_object_frame(raw: bytes, *, context: str = "JSON frame") -> dict[str, Any]:
+    """经统一严格 JSON 反序列化解析单帧对象字节。"""
+    try:
+        decoded = loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {context}: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError(f"{context} must decode to a JSON object")
+    return decoded
+
+
+def encode_handshake_frame(role: str, *, pid: int | None = None) -> bytes:
+    """构造子进程握手角色帧（经统一 jsonutil 编码）。"""
+    frame: dict[str, Any] = {"role": role}
+    if pid is not None:
+        frame["pid"] = pid
+    return encode_json_frame(frame)
+
+
+def decode_handshake_frame(raw: bytes) -> tuple[str | None, int | None]:
+    """解析子进程握手角色帧，返回 (role, pid)。"""
+    frame = decode_json_object_frame(raw, context="worker handshake frame")
+    raw_role = frame.get("role")
+    role = raw_role if isinstance(raw_role, str) else None
+    raw_pid = frame.get("pid")
+    pid = (
+        raw_pid
+        if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0
+        else None
+    )
+    return role, pid
 
 
 @dataclass(frozen=True)
@@ -616,6 +657,9 @@ def create_worker_reply_pipe(
 
 
 __all__ = [
+    "HANDSHAKE_ROLE_CANCEL",
+    "HANDSHAKE_ROLE_DOWNLINK",
+    "HANDSHAKE_ROLE_UPLINK",
     "PIPE_MSG_DECLARE",
     "PIPE_MSG_RESULT",
     "VALID_PIPE_MESSAGE_KINDS",
@@ -626,5 +670,9 @@ __all__ = [
     "WorkerReplySender",
     "create_worker_pipe",
     "create_worker_reply_pipe",
+    "decode_handshake_frame",
+    "decode_json_object_frame",
     "decode_worker_pipe_message",
+    "encode_handshake_frame",
+    "encode_json_frame",
 ]

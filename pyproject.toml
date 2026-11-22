@@ -74,7 +74,7 @@ show_missing = true
 skip_covered = false
 
 [tool.mutmut]
-# 变异测试目标：核心层与门面（contrib 不参与）
+# 变异测试目标：核心层与门面
 source_paths = [
     "tasklite/backend/",
     "tasklite/engine/",

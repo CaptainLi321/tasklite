@@ -222,19 +222,15 @@ class _ScriptedLauncher(WorkerLauncher):
             if self._close_sender_on_release and not handle.is_alive():
                 handle._close_pipes()
 
-        def _abort() -> None:
+        def _record_abort() -> None:
             self.abort_count += 1
-            handle.kill_tree()
-            handle.close()
-            reply_sender.close()
-            receiver.close(timeout=2.0)
 
         return PreparedWorker(
             handle=handle,
             receiver=receiver,
             reply_sender=reply_sender,
             on_release=_release,
-            on_abort=_abort,
+            on_abort=_record_abort,
         )
 
 
@@ -846,111 +842,6 @@ class TestFinalizeProcessKillRace:
         assert p.closed, "close must still be called after kill race"
 
 
-class TestAbortInFlight:
-    def test_abort_with_completed_and_cancelled(self, tmp_path):
-        unfinished = tmp_path / "unfinished"
-        unfinished.write_text("partial output")
-
-        def send_for_done(spec, sender, _handle):
-            if spec.execution_id == "inc_done":
-                sender.send_result({"status": "success", "metadata": {"done": 1}})
-
-        launcher = _ScriptedLauncher(
-            on_release=send_for_done,
-            alive=False,
-            exitcode=0,
-            close_sender_on_release=True,
-        )
-        channel = ExecutionChannel(launcher=launcher)
-        try:
-            h_done = channel.spawn(
-                make_spec(Job("task", "done"), lambda j, c: TaskResult.success(), execution_id="inc_done")
-            )
-            h_pending = channel.spawn(
-                make_spec(Job("task", "pending"), lambda j, c: TaskResult.success(), execution_id="inc_pending")
-            )
-            # 等待 done 的结果帧入队
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                channel._receive_available(h_done)
-                if channel.has_received_result("inc_done"):
-                    break
-                time.sleep(0.005)
-
-            outcome = channel.abort_in_flight([h_done, h_pending])
-            assert len(outcome.completed) == 1
-            assert outcome.completed[0][0].job_uid == "task::done"
-            assert outcome.completed[0][1].success is True
-            assert outcome.completed[0][1].result_metadata == {"done": 1}
-
-            assert len(outcome.cancelled) == 1
-            assert outcome.cancelled[0].job_uid == "task::pending"
-            assert unfinished.exists()
-            assert not channel.has_active_workers
-        finally:
-            channel.close()
-
-    def test_abort_reprobe_consumes_result_written_on_kill(self):
-        """重探测完成分支：终前写入的结果仍被消费。"""
-        job = Job("task", "reprobe")
-
-        def write_on_kill(sender: WorkerPipeSender, _handle: _ControlledWorkerHandle) -> None:
-            sender.send_result({"status": "success", "metadata": {"done": 1}})
-
-        launcher = _ScriptedLauncher(
-            alive=True,
-            exitcode=0,
-            on_kill=write_on_kill,
-            close_sender_on_release=False,
-        )
-        channel = ExecutionChannel(launcher=launcher)
-        try:
-            h = channel.spawn(
-                make_spec(job, lambda j, c: TaskResult.success(), execution_id="inc_reprobe")
-            )
-            outcome = channel.abort_in_flight([h])
-            assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
-            assert outcome.completed[0][1].success is True
-            assert outcome.completed[0][1].result_metadata == {"done": 1}
-            assert not channel.has_active_workers
-        finally:
-            channel.close()
-
-    def test_abort_interrupted_status_settles_failure(self):
-        """不支持的 interrupted 状态按一次损坏结果失败结算。"""
-        job = Job("task", "interrupted")
-        launcher = _ScriptedLauncher(
-            on_release=lambda _spec, sender, _handle: sender.send_result({
-                "status": "interrupted",
-                "error_message": "WORKER_INTERRUPTED: KeyboardInterrupt",
-            }),
-            alive=False,
-            exitcode=0,
-        )
-        channel = ExecutionChannel(launcher=launcher)
-        try:
-            h = channel.spawn(
-                make_spec(job, lambda j, c: TaskResult.success(), execution_id="inc_interrupted")
-            )
-            outcome = channel.abort_in_flight([h])
-            assert [handle.job_uid for handle, _ in outcome.completed] == [job.uid]
-            result = outcome.completed[0][1]
-            assert result.success is False
-            assert result.retry_requested is False
-            assert result.result_metadata == {}
-            assert "unknown status 'interrupted'" in (result.message or "")
-            assert outcome.cancelled == []
-            assert not channel.has_active_workers
-        finally:
-            channel.close()
-
-    def test_abort_empty_handles_returns_empty_outcome(self):
-        channel = ExecutionChannel()
-        outcome = channel.abort_in_flight([])
-        assert outcome.completed == []
-        assert outcome.cancelled == []
-
-
 class TestCleanupInFlight:
     def test_cleanup_in_flight_kills_and_clears_channel_state(self):
         job = Job("task", "residual")
@@ -1060,7 +951,7 @@ def test_result_releases_reply_pipe_before_worker_exit(status, alive):
         channel.close()
 
 
-@pytest.mark.parametrize("route", ["crash", "timeout", "error", "authorization", "abort", "cleanup", "close"])
+@pytest.mark.parametrize("route", ["crash", "timeout", "error", "authorization", "cleanup", "close"])
 def test_terminal_paths_release_reply_pipe_and_session(route):
     def emit_corrupt_frame(_spec, sender, _handle):
         sender._conn.send_bytes(b"{corrupt-json-frame")
@@ -1095,8 +986,6 @@ def test_terminal_paths_release_reply_pipe_and_session(route):
             )
             result, = channel.reap_completed([handle])
             assert result[1].authorization_outcome is expected_outcome
-        elif route == "abort":
-            assert channel.abort_in_flight([handle]).cancelled == [handle]
         elif route == "cleanup":
             channel.cleanup_in_flight([handle])
         elif route == "close":

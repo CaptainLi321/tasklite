@@ -17,10 +17,15 @@ from tasklite.engine.runtime import EngineRuntime
 from tasklite.models.job import WORKER_RESOURCE
 from tasklite.models.task import TaskRegistry
 from tasklite.testing import (
+    FakeClock,
+    InProcessWorkerLauncher,
     authorizer,
+    cleanup_hook,
     cursor_updates,
     fake_ctx,
     in_process_workers,
+    monotonic_clock,
+    observe_wait,
     running,
     spawned_jobs,
 )
@@ -265,29 +270,99 @@ class TestAuthorizerAndInProcessWorkersHandles:
         with TaskLite(backend="memory", max_workers=1) as pipeline:
             assert not hasattr(pipeline, "_process_context")
             assert not hasattr(pipeline._channel, "_process_context")
-            orig_launcher = pipeline._channel._launcher
+            orig_launcher = pipeline._channel.launcher
             pipeline.register_task("echo", _echo_worker_handler)
             pipeline.enqueue(Job("echo", "item"))
             with in_process_workers(pipeline):
-                assert pipeline._channel._launcher is not orig_launcher
+                assert pipeline._channel.launcher is not orig_launcher
                 pipeline.run(install_signals=False)
-            assert pipeline._channel._launcher is orig_launcher
+            assert pipeline._channel.launcher is orig_launcher
             with StateSnapshot.open(pipeline) as snap:
                 record = snap.get_job("echo::item")
                 assert record is not None
                 assert record["status"] == "succeeded"
 
     def test_in_process_workers_accepts_custom_launcher_and_rejects_non_launcher(self):
-        from tasklite.testing import InProcessWorkerLauncher
-
         with TaskLite(backend="memory", max_workers=1) as pipeline:
-            orig_launcher = pipeline._channel._launcher
+            orig_launcher = pipeline._channel.launcher
             custom = InProcessWorkerLauncher()
             with in_process_workers(pipeline, custom):
-                assert pipeline._channel._launcher is custom
-            assert pipeline._channel._launcher is orig_launcher
+                assert pipeline._channel.launcher is custom
+            assert pipeline._channel.launcher is orig_launcher
 
             with pytest.raises(TypeError, match="WorkerLauncher"):
                 with in_process_workers(pipeline, object):  # type: ignore[arg-type]
                     pass
-            assert pipeline._channel._launcher is orig_launcher
+            assert pipeline._channel.launcher is orig_launcher
+
+    def test_in_process_launcher_prepare_does_not_bind_pipe_sender_before_release(self):
+        """prepare 阶段不得提前变异 job_context 绑定，保持与子进程启动器两阶段对称。"""
+        import threading
+        from tasklite.engine._worker_runtime import WorkerLaunchSpec
+
+        job = Job("echo", "prepared")
+        ctx = fake_ctx(job)
+        assert ctx._pipe_sender is None
+        spec = WorkerLaunchSpec(
+            handler=_echo_worker_handler,
+            job=job,
+            job_context=ctx,
+            execution_id="run.1",
+            timeout_seconds=10.0,
+            run_id="run",
+            attempt_no=1,
+        )
+        launcher = InProcessWorkerLauncher()
+        prepared = launcher.prepare(spec, on_message=None, cancel_event=threading.Event())
+        try:
+            assert ctx._pipe_sender is None
+            assert ctx._reply_receiver is None
+        finally:
+            prepared.abort()
+
+    def test_cleanup_hook_observes_and_restores_adapter(self, tmp_path):
+        target = tmp_path / "temp.txt"
+        target.write_text("data", encoding="utf-8")
+        with TaskLite(backend="memory") as pipeline:
+            seen: list[str] = []
+
+            def intercept(original, path, **kwargs):
+                seen.append(path)
+                return original(path, **kwargs)
+
+            with cleanup_hook(pipeline, intercept):
+                assert pipeline._runtime.store.path_policy.delete(target) is True
+            assert seen == [str(target)]
+            assert not target.exists()
+
+            second = tmp_path / "second.txt"
+            second.write_text("keep", encoding="utf-8")
+            with cleanup_hook(pipeline, OSError("disk read-only")):
+                with pytest.raises(OSError, match="disk read-only"):
+                    pipeline._runtime.store.path_policy.delete(second)
+            assert second.exists()
+            assert pipeline._runtime.store.path_policy.delete(second) is True
+            assert not second.exists()
+
+    def test_observe_wait_and_monotonic_clock_restore_on_exit(self):
+        import time
+
+        rt = _make_runtime()
+        original_wait = rt._wait
+        events: list[float | None] = []
+        with observe_wait(rt, events.append) as timeouts:
+            rt._notifier.notify()
+            rt._wait(0.01, last_seq=0)
+        assert events == [0.01]
+        assert timeouts == [0.01]
+        assert rt._wait == original_wait
+
+        before = time.monotonic()
+        with monotonic_clock(start=500.0) as clock:
+            assert isinstance(clock, FakeClock)
+            assert time.monotonic() == 500.0
+            assert clock.advance(2.5) == 502.5
+            assert time.monotonic() == 502.5
+            clock.set(600.0)
+            assert time.monotonic() == 600.0
+        assert time.monotonic() >= before

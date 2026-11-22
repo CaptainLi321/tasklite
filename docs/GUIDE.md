@@ -37,7 +37,7 @@ HTTP 工具返回 `HttpResponse`，4xx／5xx 响应保留状态、响应头和�
 - **分层单向依赖**：
   - `tasklite/models/` 严禁反向 import `tasklite/engine/`（IPC 声明读写下沉 `tasklite/utils/ipc.py`）；
   - `tasklite/utils/` 严禁反向 import `tasklite/wrappers/`；
-  - 核心层（`tasklite/engine/`, `tasklite/backend/`, `tasklite/models/`, `tasklite/utils/`）严禁依赖 `tasklite/contrib/` 与 `tasklite/wrappers/`。
+  - 核心层（`tasklite/engine/`, `tasklite/backend/`, `tasklite/models/`, `tasklite/utils/`）严禁依赖 `tasklite/wrappers/`。
 - **单射编码红线**：所有业务标识与复合 UID 派生，一律使用可逆单射编码（`make_job_uid` / `parse_job_uid`），禁止丢弃式净化。
 - **单一出口原则**：Job 终结唯一经由 `CompletionMachine.complete_job` 收尾；失败终态登记唯一经由 `StateStore.apply_failure` 收敛。
 - **数据库严格版本边界**：当前状态库格式为 Schema 6（`user_version=6`）。旧库（Schema ≤ 5、非空版本 0 库或异形库）在只读预检阶段 **fail-loud 拒绝启动**，不提供自动原地迁移。

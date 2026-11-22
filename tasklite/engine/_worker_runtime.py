@@ -64,6 +64,74 @@ class WorkerLaunchSpec:
     attempt_no: int = 1
 
 
+def build_exception_dict(
+    exc: BaseException,
+    *,
+    tb: str | None = None,
+) -> dict[str, str]:
+    """构造跨进程传递的结构化异常字典（type / message / traceback）。"""
+    return {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": traceback.format_exc() if tb is None else tb,
+    }
+
+
+def build_success_result_frame(
+    *,
+    message: str | None,
+    metadata: dict[str, Any],
+    spawned_jobs: list[dict[str, Any]],
+    cursor_updates: dict[str, str | None],
+) -> dict[str, Any]:
+    """构造 worker 成功结果帧。"""
+    return {
+        "status": "success",
+        "message": message,
+        "metadata": metadata,
+        "spawned_jobs": spawned_jobs,
+        "cursor_updates": cursor_updates,
+    }
+
+
+def build_failure_result_frame(
+    message: str | None,
+    *,
+    metadata: dict[str, Any] | None = None,
+    exception: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """构造 worker 失败结果帧（供执行失败与引导失败共用）。"""
+    return {
+        "status": "failure",
+        "message": message,
+        "metadata": {} if metadata is None else metadata,
+        "exception": exception,
+    }
+
+
+def build_retry_result_frame(
+    *,
+    message: str | None,
+    metadata: dict[str, Any],
+    consume_budget: bool,
+) -> dict[str, Any]:
+    """构造 worker 重试结果帧。"""
+    return {
+        "status": "retry",
+        "message": message,
+        "metadata": metadata,
+        "consume_budget": consume_budget,
+    }
+
+
+def build_artifact_error_frame(error_message: str) -> dict[str, Any]:
+    """构造产物 IO 失败结果帧。"""
+    return {
+        "status": "artifact_error",
+        "error_message": error_message,
+    }
+
+
 def run_worker_entry(spec: WorkerLaunchSpec) -> None:
     """Worker 执行体入口：隔离信号、执行 handler 并经瞬时管道单向回传结果。
 
@@ -102,53 +170,45 @@ def run_worker_entry(spec: WorkerLaunchSpec) -> None:
             raw_result = handler_func(job, ctx)
             if isinstance(raw_result, TaskResult):
                 if raw_result.status == "success":
-                    _write_result({
-                        "status": "success",
-                        "message": raw_result.message,
-                        "metadata": raw_result.metadata,
-                        "spawned_jobs": [j.to_dict() for j in ctx._spawned_jobs],
-                        "cursor_updates": dict(ctx._cursor_updates),
-                    })
+                    _write_result(
+                        build_success_result_frame(
+                            message=raw_result.message,
+                            metadata=raw_result.metadata,
+                            spawned_jobs=[j.to_dict() for j in ctx._spawned_jobs],
+                            cursor_updates=dict(ctx._cursor_updates),
+                        )
+                    )
                 elif raw_result.status == "failure":
-                    _write_result({
-                        "status": "failure",
-                        "message": raw_result.message,
-                        "metadata": raw_result.metadata,
-                        "exception": None,
-                    })
+                    _write_result(
+                        build_failure_result_frame(
+                            raw_result.message,
+                            metadata=raw_result.metadata,
+                        )
+                    )
                 else:
-                    _write_result({
-                        "status": "retry",
-                        "message": raw_result.message,
-                        "metadata": raw_result.metadata,
-                        "consume_budget": raw_result.consume_budget,
-                    })
+                    _write_result(
+                        build_retry_result_frame(
+                            message=raw_result.message,
+                            metadata=raw_result.metadata,
+                            consume_budget=raw_result.consume_budget,
+                        )
+                    )
             else:
-                _write_result({
-                    "status": "failure",
-                    "message": (
+                _write_result(
+                    build_failure_result_frame(
                         f"invalid handler return type: expected TaskResult, "
-                        f"got {type(raw_result).__name__}"
-                    ),
-                    "metadata": {},
-                    "exception": None,
-                })
+                        f"got {type(raw_result).__name__}",
+                    )
+                )
         except _ArtifactIOError as e:
-            _write_result({"status": "artifact_error", "error_message": str(e)})
+            _write_result(build_artifact_error_frame(str(e)))
         except BaseException as e:
-            _write_result({
-                "status": "failure",
-                "message": (
-                    type(e).__name__ if not str(e)
-                    else f"{type(e).__name__}: {e}"
-                ),
-                "metadata": {},
-                "exception": {
-                    "type": type(e).__name__,
-                    "message": str(e),
-                    "traceback": traceback.format_exc(),
-                },
-            })
+            _write_result(
+                build_failure_result_frame(
+                    type(e).__name__ if not str(e) else f"{type(e).__name__}: {e}",
+                    exception=build_exception_dict(e),
+                )
+            )
     finally:
         if pipe_sender is not None:
             pipe_sender.close()
@@ -158,6 +218,11 @@ def run_worker_entry(spec: WorkerLaunchSpec) -> None:
 
 __all__ = [
     "WorkerLaunchSpec",
+    "build_artifact_error_frame",
+    "build_exception_dict",
+    "build_failure_result_frame",
+    "build_retry_result_frame",
+    "build_success_result_frame",
     "ignore_worker_stop_signals",
     "run_worker_entry",
     "stop_signals",

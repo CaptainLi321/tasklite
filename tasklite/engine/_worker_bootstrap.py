@@ -13,19 +13,26 @@
 
 from __future__ import annotations
 
-import json
 import os
 import pickle
 import runpy
 import sys
-import traceback
 import types
 from multiprocessing.connection import Client
 from typing import Any
 
-from ..utils.ipc import WorkerPipeSender, WorkerReplyReceiver
+from ..utils.ipc import (
+    HANDSHAKE_ROLE_DOWNLINK,
+    HANDSHAKE_ROLE_UPLINK,
+    WorkerPipeSender,
+    WorkerReplyReceiver,
+    decode_json_object_frame,
+    encode_handshake_frame,
+)
 from ._worker_runtime import (
     WorkerLaunchSpec,
+    build_exception_dict,
+    build_failure_result_frame,
     ignore_worker_stop_signals,
     run_worker_entry,
 )
@@ -88,16 +95,10 @@ def _send_bootstrap_failure(
     """将引导或反序列化失败封装为结构化 failure 帧回传主进程。"""
     hint = "Task handler 须定义在模块顶层，不得置于 `if __name__ == '__main__':` 内"
     message = f"Worker bootstrap failed ({type(exc).__name__}: {exc}). {hint}"
-    payload: dict[str, Any] = {
-        "status": "failure",
-        "message": message,
-        "metadata": {},
-        "exception": {
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "traceback": traceback.format_exc(),
-        },
-    }
+    payload = build_failure_result_frame(
+        message,
+        exception=build_exception_dict(exc),
+    )
     try:
         pipe_sender.send_result(payload)
     except OSError:
@@ -126,12 +127,12 @@ def _bootstrap_main() -> None:
     try:
         uplink = Client(address=addr, family=family, authkey=authkey)
         uplink.send_bytes(
-            json.dumps({"role": "uplink", "pid": os.getpid()}).encode("utf-8")
+            encode_handshake_frame(HANDSHAKE_ROLE_UPLINK, pid=os.getpid())
         )
 
         downlink = Client(address=addr, family=family, authkey=authkey)
         downlink.send_bytes(
-            json.dumps({"role": "downlink", "pid": os.getpid()}).encode("utf-8")
+            encode_handshake_frame(HANDSHAKE_ROLE_DOWNLINK, pid=os.getpid())
         )
 
         # 第一阶段：仅缓存预序列化字节，等待父进程完成进程树绑定与放行门校验
@@ -156,9 +157,7 @@ def _bootstrap_main() -> None:
         sys.exit(0)
 
     try:
-        prep_data = json.loads(prep_bytes.decode("utf-8"))
-        if not isinstance(prep_data, dict):
-            raise ValueError("bootstrap prep_data must be a JSON object")
+        prep_data = decode_json_object_frame(prep_bytes, context="bootstrap prep_data")
     except Exception as exc:
         sys.stderr.write(f"tasklite worker bootstrap failed to decode prep_data: {exc}\n")
         for conn in (downlink, uplink):

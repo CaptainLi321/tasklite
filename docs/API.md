@@ -47,7 +47,6 @@
    - [9.1 tasklite.testing 单元测试工具](#91-tasklitetesting-单元测试工具)
    - [9.2 tasklite.wrappers.http HTTP 工具集](#92-tasklitewrappershttp-http-工具集)
    - [9.3 tasklite.wrappers.discovery 增量发现组件](#93-tasklitewrappersdiscovery-增量发现组件)
-   - [9.4 tasklite.hooks 辅助工具](#94-tasklitehooks-辅助工具)
 
 ---
 
@@ -89,7 +88,7 @@ from tasklite.selection import Exclude
 ```
 
 > [!IMPORTANT]
-> **主包隔离保证**：执行 `import tasklite` 保证**不隐式加载**任何可选适配层（`tasklite.wrappers` 或 `tasklite.contrib`）。`tasklite.__all__` 仅含上述 10 个顶层名称。
+> **主包隔离保证**：执行 `import tasklite` 保证**不隐式加载**任何可选适配层（`tasklite.wrappers`）。`tasklite.__all__` 仅含上述 10 个顶层名称。
 
 #### 可选辅助面（显式声明：本版不作稳定兼容承诺）
 
@@ -97,8 +96,7 @@ from tasklite.selection import Exclude
 - `pipeline.register_trigger` 与 `TriggerContext`：自定义触发器扩展接口与判定回调上下文对象；
 - `tasklite.wrappers.http`：HTTP 请求、响应与快照存储工具；
 - `tasklite.wrappers.discovery`：基于游标去重的增量分页扫描器；
-- `tasklite.testing`：单元测试辅助工具（`fake_ctx`, `running`, `authorizer`, `in_process_workers`, `spawned_jobs`, `cursor_updates`）；
-- `tasklite.hooks`：业务展示切片工具（`job_ref`, `slice_list`）。
+- `tasklite.testing`：单元测试辅助工具（`fake_ctx`, `running`, `authorizer`, `in_process_workers`, `cleanup_hook`, `observe_wait`, `monotonic_clock`, `FakeClock`, `spawned_jobs`, `cursor_updates`）。
 
 ---
 
@@ -1135,18 +1133,3 @@ register_discovery(
   - `DiscoveryHost` 协议：要求提供 `register_task(task_type, handler, *, resources=..., trigger=...)`；
   - `DiscoveryHandler`：扫描核心 handler 类，框架无关；
   - `encode_content_id(content_id: str | None, *, max_len: int = 120) -> str`：内容 ID 确定性单射编码工具。
-
----
-
-### 9.4 tasklite.hooks 辅助工具
-
-位于 [`tasklite/hooks.py`](../tasklite/hooks.py)。
-
-```python
-from tasklite.hooks import job_ref, slice_list
-```
-
-- **`job_ref(metadata: Any) -> str`**：
-  - 从结果元数据中提取人类可读标识（若包含 `post_id` 返回 `f"#{post_id}"`，否则依次尝试 `artist`、`id` 并转为字符串；未找到或非字典返回 `""`）；
-- **`slice_list(items: list[Any], *, start: int | None = None, count: int | None = None, limit: int | None = None) -> list[Any]`**：
-  - 仅关键字参数。分批切片工具：先按 `limit` 截断总量，再按 `[start : start + count]` 截取窗口。

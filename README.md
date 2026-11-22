@@ -271,7 +271,6 @@ tasklite/
 ├── backend/             # SQLite WAL 强一致事务持久化后端与内存后端
 ├── models/              # Task / Job / Attempt / JobContext / TaskResult / FileSpec 数据模型
 ├── wrappers/            # 可选工具：discovery.py（增量扫描）/ http.py（网络守卫与快照）
-├── contrib/             # 生态扩展套件与参考实现（核心不反向依赖）
 └── utils/               # 单射编码 (%XX 转义) / 瞬时 Pipe 通道 / 跨平台路径策略 / 文件锁 / 时钟 / JSON 校验
 ```
 

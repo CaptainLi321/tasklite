@@ -17,14 +17,18 @@ import pytest
 
 from tasklite.models.artifact import FileSpec
 from tasklite.utils.ipc import (
+    HANDSHAKE_ROLE_CANCEL,
+    HANDSHAKE_ROLE_DOWNLINK,
+    HANDSHAKE_ROLE_UPLINK,
     PIPE_MSG_DECLARE,
-    PIPE_MSG_INPUT,
     PIPE_MSG_RESULT,
     VALID_PIPE_MESSAGE_KINDS,
     WorkerPipeMessage,
     create_worker_pipe,
     create_worker_reply_pipe,
+    decode_handshake_frame,
     decode_worker_pipe_message,
+    encode_handshake_frame,
 )
 
 
@@ -121,13 +125,13 @@ class TestWorkerPipeWireProtocol:
             receiver.close()
 
     def test_legacy_input_and_suspend_kinds_not_in_wire_protocol(self):
-        assert PIPE_MSG_INPUT not in VALID_PIPE_MESSAGE_KINDS
+        assert "input" not in VALID_PIPE_MESSAGE_KINDS
         assert "suspend" not in VALID_PIPE_MESSAGE_KINDS
         receiver, sender = create_worker_pipe(job_uid="build::one", execution_id="run.1")
         try:
             assert not hasattr(sender, "send_input")
             assert not hasattr(sender, "send_suspend")
-            for bad_kind in (PIPE_MSG_INPUT, "suspend", "bogus"):
+            for bad_kind in ("input", "suspend", "bogus"):
                 with pytest.raises(ValueError, match="unknown worker pipe message kind"):
                     sender.send_message(bad_kind, {"path": "/work/input.txt"})
                 raw = json.dumps(
@@ -147,6 +151,19 @@ class TestWorkerPipeWireProtocol:
         finally:
             sender.close()
             receiver.close()
+
+    def test_handshake_frame_roundtrip_and_strict_json(self):
+        uplink_raw = encode_handshake_frame(HANDSHAKE_ROLE_UPLINK, pid=1234)
+        assert decode_handshake_frame(uplink_raw) == (HANDSHAKE_ROLE_UPLINK, 1234)
+
+        downlink_raw = encode_handshake_frame(HANDSHAKE_ROLE_DOWNLINK, pid=5678)
+        assert decode_handshake_frame(downlink_raw) == (HANDSHAKE_ROLE_DOWNLINK, 5678)
+
+        cancel_raw = encode_handshake_frame(HANDSHAKE_ROLE_CANCEL)
+        assert decode_handshake_frame(cancel_raw) == (HANDSHAKE_ROLE_CANCEL, None)
+
+        with pytest.raises(ValueError, match="worker handshake frame"):
+            decode_handshake_frame(b'{"role":"uplink","pid":NaN}')
 
     def test_decode_rejects_bad_frames_and_identity_mismatches(self):
         with pytest.raises(ValueError, match="invalid worker pipe JSON frame"):

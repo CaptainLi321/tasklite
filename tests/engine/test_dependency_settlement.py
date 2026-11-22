@@ -64,11 +64,13 @@ def test_cleared_manual_success_settles_dependency_as_missing(tmp_path):
     with StateSnapshot.open(pipeline) as snap:
         assert len(list(snap.iter_attempts(job_uid="source::prior"))) == 1
     from tasklite.backend.base import GraphEditCommit
+    from tasklite.backend.sqlite_backend import SQLiteStateBackend
 
     with pipeline.edit(dry_run=False) as tx:
         tx.add(Job("source", "up"), status="succeeded")
     assert pipeline.enqueue(Job("dependent", "down", depends_on=["source::up"])) is True
-    pipeline._runtime.store.backend.commit_graph_edit(
+    raw_backend = SQLiteStateBackend(tmp_path / "dependency.db")
+    raw_backend.commit_graph_edit(
         GraphEditCommit(success_writes={"source::up": None})
     )
 
@@ -80,7 +82,7 @@ def test_cleared_manual_success_settles_dependency_as_missing(tmp_path):
         assert {r["job_uid"] for r in snap.iter_jobs(status="failed")} == {"dependent::down"}
         failure = snap.get_job("dependent::down")
         assert failure["result"]["message"] == "Dependency failed or has no record"
-        assert pipeline._runtime.store.backend.load_failed()["dependent::down"]["missing_dependency"] == "source::up"
+        assert raw_backend.load_failed()["dependent::down"]["missing_dependency"] == "source::up"
         assert list(snap.iter_attempts(job_uid="dependent::down")) == []
         assert list(snap.iter_attempts(job_uid="source::up")) == []
         assert len(list(snap.iter_attempts(job_uid="control::baseline"))) == 1
@@ -96,12 +98,13 @@ def test_missing_dependency_settles_while_unrelated_worker_is_in_flight(tmp_path
     pipeline.register_task("dependent", _succeed)
     pipeline.enqueue(Job("blocking", "unrelated", payload={"output_dir": str(output)}))
     from tasklite.backend.base import GraphEditCommit
+    from tasklite.backend.sqlite_backend import SQLiteStateBackend
 
     with pipeline.edit(dry_run=False) as tx:
         tx.add(Job("source", "up"), status="succeeded")
     pipeline.enqueue(Job("dependent", "gap", depends_on=["source::up"]))
     pipeline.enqueue(Job("dependent", "down", depends_on=["dependent::gap"]))
-    pipeline._runtime.store.backend.commit_graph_edit(
+    SQLiteStateBackend(tmp_path / "dependency.db").commit_graph_edit(
         GraphEditCommit(success_writes={"source::up": None})
     )
 

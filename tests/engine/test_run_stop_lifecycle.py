@@ -26,7 +26,7 @@ from tasklite.engine.types import ExecutionOptions, StopMode
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.pipeline import TaskLite
-from tasklite.testing import authorizer, in_process_workers, running
+from tasklite.testing import authorizer, in_process_workers, observe_wait, running
 
 
 # ── 模块级 handler（真实跨进程协作）─────────────────────────────────────
@@ -547,7 +547,8 @@ def test_stop_when_idle_is_noop_and_idempotent(tmp_path):
     # 后续 run 正常执行完毕
     with in_process_workers(p):
         p.run(install_signals=False)
-    assert "t::j1" in p._runtime.store.backend.load_successes()
+    with StateSnapshot.open(p) as snap:
+        assert (snap.get_job("t::j1") or {}).get("status") == "succeeded"
 
 
 def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
@@ -583,9 +584,10 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
         t.join(timeout=5.0)
 
         # 第 1 次 Run 结束：因 stop() 停止新派发，且单次 retry 在预算内（1 <= 1），保持 pending
-        assert "t_retry::j1" not in p._runtime.store.backend.load_successes()
-        assert len(p._runtime.store.backend.load_failed()) == 0
-        assert any(row["job"]["job_id"] == "j1" for row in p._runtime.store.backend.load_queue_jobs(status="pending"))
+        with StateSnapshot.open(p) as snap:
+            assert list(snap.iter_jobs(status="succeeded")) == []
+            assert list(snap.iter_jobs(status="failed")) == []
+            assert any(rec["job"]["job_id"] == "j1" for rec in snap.iter_jobs(status="pending"))
         assert _TRIGGER_CALLS[0] == 1
 
         # 第 2 次 Run：新 Run 重新评估 Trigger，且重试预算重置
@@ -596,9 +598,9 @@ def test_stop_with_retry_budget_reset_and_trigger_rearm(tmp_path):
         p.run(install_signals=False)
     assert _TRIGGER_CALLS[0] == 2
     # 预算耗尽后转为失败档案
-    failures = p._runtime.store.backend.load_failed()
-    assert len(failures) == 1
-    assert "t_retry::j1" in failures
+    with StateSnapshot.open(p) as snap:
+        failed_uids = [rec["job_uid"] for rec in snap.iter_jobs(status="failed")]
+    assert failed_uids == ["t_retry::j1"]
 
 
 def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
@@ -629,17 +631,18 @@ def test_stop_failure_cascades_and_undispatched_remain_pending(tmp_path):
         p.run(install_signals=False)
         t.join(timeout=5.0)
 
-    failures = p._runtime.store.backend.load_failed()
+    with StateSnapshot.open(p) as snap:
+        failures = {rec["job_uid"] for rec in snap.iter_jobs(status="failed")}
+        queue = [rec["job"]["job_id"] for rec in snap.iter_jobs(status="pending")]
+        succeeded = {rec["job_uid"] for rec in snap.iter_jobs(status="succeeded")}
     assert "t_fail::j_fail" in failures
     assert "t_downstream::j_down" in failures
-
-    queue = [row["job"]["job_id"] for row in p._runtime.store.backend.load_queue_jobs(status="pending")]
     assert "j_other" in queue
-    assert "t_other::j_other" not in p._runtime.store.backend.load_successes()
+    assert "t_other::j_other" not in succeeded
     assert "t_other::j_other" not in failures
 
 
-def test_stop_from_another_thread_wakes_scheduler_wait(monkeypatch):
+def test_stop_from_another_thread_wakes_scheduler_wait():
     """另线程调用 stop() 能立即解除主循环等待。"""
     p = TaskLite(backend="memory")
 
@@ -649,16 +652,10 @@ def test_stop_from_another_thread_wakes_scheduler_wait(monkeypatch):
 
     wait_entered = threading.Event()
     run_finished = threading.Event()
-    original_wait = p._runtime._wait
-
-    def tracked_wait(timeout, last_seq=None):
-        wait_entered.set()
-        return original_wait(timeout, last_seq=last_seq)
-
-    monkeypatch.setattr(p._runtime, "_wait", tracked_wait)
 
     def run_worker():
-        p.run(install_signals=False)
+        with observe_wait(p, lambda _timeout: wait_entered.set()):
+            p.run(install_signals=False)
         run_finished.set()
 
     t = threading.Thread(target=run_worker)
@@ -698,9 +695,15 @@ def test_run_waits_for_settled_worker_process_exit(tmp_path):
     runner = threading.Thread(target=run_pipeline)
     runner.start()
     deadline = time.monotonic() + 10.0
-    while "lingering::j1" not in p._runtime.store.backend.load_successes() and time.monotonic() < deadline:
+
+    def _is_succeeded() -> bool:
+        with StateSnapshot.open(p) as snap:
+            rec = snap.get_job("lingering::j1")
+            return rec is not None and rec["status"] == "succeeded"
+
+    while not _is_succeeded() and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert "lingering::j1" in p._runtime.store.backend.load_successes()
+    assert _is_succeeded()
     assert not finished.is_set(), "有效结果已结算，但 Run 必须等待 worker 进程退出"
 
     release_path.write_text("release", encoding="utf-8")
@@ -909,7 +912,8 @@ def test_install_signals_in_child_thread_fails_loud_and_false_succeeds(tmp_path)
     t2.join(timeout=5.0)
 
     assert success_captured[0] is True
-    assert "t::j1" in p._runtime.store.backend.load_successes()
+    with StateSnapshot.open(p) as snap:
+        assert (snap.get_job("t::j1") or {}).get("status") == "succeeded"
 
 
 def test_main_thread_install_signals_restores_original_handler(tmp_path):

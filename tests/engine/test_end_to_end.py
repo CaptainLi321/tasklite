@@ -191,15 +191,17 @@ class TestEndToEnd:
         p.enqueue(Job("work", "item_eta", payload={"output_dir": out_dir}, trigger="always"))
         with in_process_workers(p):
             assert p.run(install_signals=False) is None
-        assert p._runtime.store.backend.load_successes()["work::item_eta"]["success_count"] == 1
+        with StateSnapshot.open(p) as snap:
+            assert (snap.get_job("work::item_eta") or {}).get("status") == "succeeded"
+            assert [a["outcome"] for a in snap.iter_attempts(job_uid="work::item_eta")] == ["success"]
 
         p.enqueue(Job("work", "item_eta", payload={"output_dir": out_dir}, trigger="always"))
         with in_process_workers(p):
             assert p.run(install_signals=False) is None
         p.stop()
 
-        assert p._runtime.store.backend.load_successes()["work::item_eta"]["success_count"] == 2
         with StateSnapshot.open(p) as snap:
+            assert (snap.get_job("work::item_eta") or {}).get("status") == "succeeded"
             attempts = list(snap.iter_attempts(job_uid="work::item_eta"))
             assert [a["outcome"] for a in attempts] == ["success", "success"]
             assert [a["attempt_no"] for a in attempts] == [1, 2]

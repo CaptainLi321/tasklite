@@ -30,7 +30,7 @@ from tasklite.resource import (
     CapacityResource,
     IntervalResource,
 )
-from tasklite.testing import in_process_workers
+from tasklite.testing import in_process_workers, observe_wait
 
 
 def _fast_handler(job, ctx):
@@ -187,28 +187,25 @@ def test_long_wait_uses_single_deadline_without_resource_polling(tmp_path):
 
     wait_entered = threading.Event()
     wait_timeouts: list[float | None] = []
-    original_wait = p._runtime._wait
 
-    def tracked_wait(timeout, last_seq=None):
-        wait_timeouts.append(timeout)
-        wait_entered.set()
-        return original_wait(timeout, last_seq=last_seq)
+    def _run():
+        with observe_wait(p, lambda _timeout: wait_entered.set()) as observed:
+            p.run(install_signals=False)
+            wait_timeouts.extend(observed)
 
-    p._runtime._wait = tracked_wait  # type: ignore[assignment]
-
-    run_thread = threading.Thread(target=p.run, kwargs={"install_signals": False})
+    run_thread = threading.Thread(target=_run)
     run_thread.start()
     try:
         assert res.queried.wait(5.0)
         assert wait_entered.wait(5.0)
         assert res.queries == 1
-        assert wait_timeouts and wait_timeouts[-1] is not None
-        assert wait_timeouts[-1] > 3000.0
     finally:
         p.stop()
     run_thread.join(timeout=5.0)
 
     assert not run_thread.is_alive()
+    assert wait_timeouts and wait_timeouts[-1] is not None
+    assert wait_timeouts[-1] > 3000.0
     assert res.queries == 1
 
 
@@ -241,16 +238,13 @@ def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
     p.enqueue(Job("fast", "j1"))
 
     wait_entered = threading.Event()
-    original_wait = p._runtime._wait
 
-    def tracked_wait(timeout, last_seq=None):
+    def _on_wait(timeout: float | None) -> None:
         if timeout is None or timeout > 5.0:
             wait_entered.set()
-        return original_wait(timeout, last_seq=last_seq)
 
-    p._runtime._wait = tracked_wait  # type: ignore[assignment]
     def _run():
-        with in_process_workers(p):
+        with in_process_workers(p), observe_wait(p, _on_wait):
             p.run(install_signals=False)
 
     run_thread = threading.Thread(target=_run)
@@ -287,13 +281,14 @@ def test_impossible_resource_fails_job_without_unexecuted_attempt(tmp_path):
 
     p.run(install_signals=False)
 
-    failed = p._runtime.store.backend.load_failed()
-    assert "fast::j1" in failed
-    assert "fast::j2" in failed
+    with StateSnapshot.open(p) as snap:
+        failed = {rec["job_uid"] for rec in snap.iter_jobs(status="failed")}
+        assert "fast::j1" in failed
+        assert "fast::j2" in failed
 
-    # 未执行不制造 Attempt
-    attempts = p._runtime.store.backend.load_settled_attempts("fast::j1")
-    assert attempts == [], f"明确不可满足的作业不得创建 Attempt 记录，实测: {attempts}"
+        # 未执行不制造 Attempt
+        attempts = list(snap.iter_attempts(job_uid="fast::j1"))
+        assert attempts == [], f"明确不可满足的作业不得创建 Attempt 记录，实测: {attempts}"
 
 
 def test_resource_exception_fails_run(tmp_path):
@@ -367,11 +362,11 @@ def test_release_prior_to_final_commit_and_no_dispatch_between(tmp_path):
         orig_release(amount)
     cap.release = hooked_release  # type: ignore[assignment]
 
-    orig_settle = p._runtime.store.backend.commit_job_settlement
+    orig_settle = p._runtime.store.apply_success
     def hooked_settle(*args, **kwargs):
         events.append("committed")
         return orig_settle(*args, **kwargs)
-    p._runtime.store.backend.commit_job_settlement = hooked_settle  # type: ignore[assignment]
+    p._runtime.store.apply_success = hooked_settle  # type: ignore[assignment]
 
     orig_spawn = p._runtime._dispatch.dispatch_next
     def hooked_dispatch(*args, **kwargs):

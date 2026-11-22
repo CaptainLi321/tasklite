@@ -186,7 +186,7 @@ class TestAbstractContractLock:
     def test_backend_sources_respect_layering(self):
         assert BACKEND_PACKAGE_DIR.is_dir()
         offenders: list[str] = []
-        banned_heads = ("engine", "wrappers", "contrib")
+        banned_heads = ("engine", "wrappers")
         for source in sorted(BACKEND_PACKAGE_DIR.glob("*.py")):
             tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
             roots: list[str] = []

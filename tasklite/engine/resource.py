@@ -29,8 +29,6 @@ from ..resource import (
 
 logger = logging.getLogger("tasklite")
 
-_REAL_SLEEP = time.sleep
-
 
 @dataclass(frozen=True)
 class ResourceQueryResult:
@@ -230,8 +228,6 @@ class RunNotifier:
             if self._seq != last_seq:
                 return True
             self._event.clear()
-        if time.sleep is not _REAL_SLEEP and timeout is not None and timeout > 0:
-            time.sleep(timeout)
         if os.name != "nt" or (timeout is not None and timeout <= self._WIN_WAIT_SLICE_SECONDS):
             return self._event.wait(timeout=timeout)
         if timeout is None:

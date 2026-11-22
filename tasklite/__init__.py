@@ -14,30 +14,40 @@ StateSnapshot, TaskLiteError, make_job_uid, parse_job_uid。
 分层单向依赖红线：``tasklite/models/`` 严禁 import
 ``tasklite/engine/``（IPC 声明读写一律下沉 ``tasklite/utils/ipc.py``），
 ``tasklite/utils/`` 严禁 import ``tasklite/wrappers/``，核心层
-（engine/backend/models/utils）严禁依赖 ``tasklite/contrib/``。
+（engine/backend/models/utils）严禁依赖 ``tasklite/wrappers/``。
 """
 from __future__ import annotations
 
+import importlib
+from typing import TYPE_CHECKING, Any
+
 __version__ = "3.0.0.dev0"
 
-# ── 门面与执行核心 ────────────────────────────────────────────────────
-from .pipeline import TaskLite
+if TYPE_CHECKING:
+    from .exceptions import TaskLiteError
+    from .models.artifact import FileSpec
+    from .models.context import JobContext
+    from .models.job import Job
+    from .models.result import TaskResult
+    from .models.task import Task
+    from .pipeline import TaskLite
+    from .snapshot import StateSnapshot
+    from .utils.encoding import make_job_uid, parse_job_uid
 
-# ── 模型层：规格 / 实例 / 结果 / 上下文 / 文件 ────────────────────────
-from .models.task import Task
-from .models.job import Job
-from .models.context import JobContext
-from .models.result import TaskResult
-from .models.artifact import FileSpec
-
-# ── 只读观察快照 ───────────────────────────────────────────────────────
-from .snapshot import StateSnapshot
-
-# ── 异常族 ───────────────────────────────────────────────────────────
-from .exceptions import TaskLiteError
-
-# ── 身份工具 ─────────────────────────────────────────────────────────
-from .utils.encoding import make_job_uid, parse_job_uid
+# 根包延迟导出表（PEP 562）：避免子进程引导导入 ``tasklite.engine._worker_bootstrap``
+# 时连带拉起父进程门面、快照与持久化树。
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "TaskLite": (".pipeline", "TaskLite"),
+    "Task": (".models.task", "Task"),
+    "Job": (".models.job", "Job"),
+    "JobContext": (".models.context", "JobContext"),
+    "TaskResult": (".models.result", "TaskResult"),
+    "FileSpec": (".models.artifact", "FileSpec"),
+    "StateSnapshot": (".snapshot", "StateSnapshot"),
+    "TaskLiteError": (".exceptions", "TaskLiteError"),
+    "make_job_uid": (".utils.encoding", "make_job_uid"),
+    "parse_job_uid": (".utils.encoding", "parse_job_uid"),
+}
 
 __all__ = [
     "TaskLite",
@@ -51,3 +61,17 @@ __all__ = [
     "make_job_uid",
     "parse_job_uid",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = target
+    value = getattr(importlib.import_module(module_name, __name__), attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

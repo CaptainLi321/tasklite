@@ -73,17 +73,19 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
         with in_process_workers(first):
             assert first.run(install_signals=False) is None
         first.stop()
-        first_produce_run_id = first._runtime.store.backend.load_successes()["produce::source"]["last_success_run_id"]
-        old_meta = first._runtime.store.backend.load_successes()["consume::result"]
-        baseline_us = parse_utc_iso_to_us(old_meta["last_succeeded_at"])
+        with StateSnapshot.open(first) as first_snap:
+            first_produce_run_id = first_snap.get_job("produce::source")["run_id"]
+            old_consume = first_snap.get_job("consume::result")
+            baseline_us = parse_utc_iso_to_us(old_consume["settled_at"])
 
     with _pipeline(tmp_path) as second:
         evaluated = []
 
         def observe_input(ctx):
             evaluated.append(Path(ctx.success_metadata["inputs"][0]).read_text(encoding="utf-8"))
-            parent = second._runtime.store.backend.load_successes()["produce::source"]
-            assert parent["last_success_run_id"] != first_produce_run_id
+            with StateSnapshot.open(second) as snap:
+                parent = snap.get_job("produce::source")
+            assert parent["run_id"] != first_produce_run_id
             return on_input_change(ctx)
 
         second.register_trigger("observe", observe_input)
@@ -115,11 +117,12 @@ def test_reverse_batch_evaluates_input_after_upstream_settles(tmp_path, mode):
                 current = snap.get_job("consume::result")
                 assert current["result"]["metadata"]["content"] == evaluated[0]
                 assert list(snap.iter_jobs(status="failed")) == []
+                success_attempts = [
+                    a for a in snap.iter_attempts(job_uid="consume::result")
+                    if a["outcome"] == "success"
+                ]
+                assert len(success_attempts) == (2 if mode == "write" else 1)
             assert list(snap.iter_jobs(status="pending")) == []
-        if mode != "fail":
-            assert second._runtime.store.backend.load_successes()["consume::result"]["success_count"] == (
-                2 if mode == "write" else 1
-            )
 
 
 def always_retry(job, ctx):
@@ -266,18 +269,17 @@ def test_zero_budget_retry_skips_gate_without_resetting_ordinary_candidate(tmp_p
 def _run_until_retry_committed(root, ready, release):
     """队列重试已提交的屏障供监督进程精确终止主引擎。"""
     with _pipeline(Path(root)) as pipeline:
-        backend = pipeline._runtime.store.backend
-        original_commit = backend.commit_job_settlement
+        store = pipeline._runtime.store
+        original_apply_retry = store.apply_retry
 
-        def commit_then_park(**kwargs):
-            original_commit(**kwargs)
-            if kwargs["outcome"] == "retry":
-                queued = [row["job"] for row in backend.load_queue_jobs(status="pending")]
-                assert queued[0]["attempt_no"] == 1
-                ready.set()
-                release.wait(timeout=30)
+        def retry_then_park(job_uid, job_snapshot, retry_job_snapshot, **kwargs):
+            outcome = original_apply_retry(job_uid, job_snapshot, retry_job_snapshot, **kwargs)
+            assert retry_job_snapshot["attempt_no"] == 1
+            ready.set()
+            release.wait(timeout=30)
+            return outcome
 
-        backend.commit_job_settlement = commit_then_park
+        store.apply_retry = retry_then_park  # type: ignore[method-assign]
         pipeline.register_trigger("gated", lambda ctx: True)
         pipeline.register_task("retry", always_retry, max_retries_per_run=1, trigger="gated")
         pipeline.enqueue(Job("retry", "item"))
@@ -376,8 +378,8 @@ def test_untrusted_success_reexecutes_without_reusing_old_attempt_baseline(tmp_p
             res = second.run(install_signals=False)
         second.stop()
         assert res is None
-        assert second._runtime.store.backend.load_successes()["consume::result"]["success_count"] == 1
         with StateSnapshot.open(second) as snap:
+            assert (snap.get_job("consume::result") or {}).get("status") == "succeeded"
             records = list(snap.iter_attempts(job_uid="consume::result"))
             assert [row["attempt_no"] for row in records] == [1, 2]
             assert all(row["outcome"] == "success" for row in records)
@@ -419,7 +421,9 @@ def test_discovery_defaults_always_and_job_once_override_across_runs(tmp_path):
             pipeline.run(install_signals=False)
         calls = Path(scan_calls).read_text(encoding="utf-8").splitlines()
         assert calls == ["1", "2", "1"]
-        assert pipeline._runtime.store.backend.load_successes()["discover::root"]["success_count"] == 2
+        with StateSnapshot.open(pipeline) as snap:
+            assert (snap.get_job("discover::root") or {}).get("status") == "succeeded"
+            assert len(list(snap.iter_attempts(job_uid="discover::root"))) == 2
         pipeline.enqueue(Job("discover", "root", payload={"scan_calls": scan_calls}, trigger="once"))
         with in_process_workers(pipeline):
             res = pipeline.run(install_signals=False)
@@ -569,20 +573,27 @@ def test_until_success_retries_after_real_failure(tmp_path):
 
 
 def test_legacy_trigger_pending_is_preserved_and_rejected_on_use(tmp_path):
+    from tasklite.backend.sqlite_backend import SQLiteStateBackend
+
+    legacy = Job("work", "legacy", trigger="on_failure").to_dict()
     with _pipeline(tmp_path) as pipeline:
-        legacy = Job("work", "legacy", trigger="on_failure").to_dict()
-        pipeline._runtime.store.backend.enqueue_jobs([legacy])
         pipeline.close()
+    SQLiteStateBackend(tmp_path / "trigger_lifecycle.db").enqueue_jobs([legacy])
 
     with _pipeline(tmp_path) as reopened:
         reopened.register_task("work", _record_until_success_call)
-        assert [row["job"] for row in reopened._runtime.store.backend.load_queue_jobs(status="pending")] == [legacy]
+        with StateSnapshot.open(reopened) as snap:
+            before_pending = list(snap.iter_jobs(status="pending"))
+            assert [r["job_uid"] for r in before_pending] == ["work::legacy"]
+            assert before_pending[0]["job"]["trigger"] == "on_failure"
         with pytest.raises(TaskLiteError, match="unregistered trigger 'on_failure'"):
             reopened.run(install_signals=False)
         reopened.stop()
 
-        assert [row["job"] for row in reopened._runtime.store.backend.load_queue_jobs(status="pending")] == [legacy]
         with StateSnapshot.open(reopened) as snap:
+            after_pending = list(snap.iter_jobs(status="pending"))
+            assert [r["job_uid"] for r in after_pending] == ["work::legacy"]
+            assert after_pending[0]["job"]["trigger"] == "on_failure"
             assert list(snap.iter_attempts(job_uid="work::legacy")) == []
             assert list(snap.iter_jobs(status="failed")) == []
 

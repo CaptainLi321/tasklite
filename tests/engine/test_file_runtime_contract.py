@@ -22,7 +22,7 @@ from tasklite import (
     TaskResult,
 )
 from tasklite.resource import CapacityResource
-from tasklite.testing import authorizer, in_process_workers
+from tasklite.testing import authorizer, cleanup_hook, in_process_workers
 
 
 def _producer_handler(job, ctx):
@@ -231,11 +231,7 @@ def test_success_cleanup_failure_blocks_success_spawn_and_cursor(tmp_path, monke
     p.register_task("spawned", _noop_handler)
     p.enqueue(Job("fail_clean", "fc1"))
 
-    with in_process_workers(p), patch.object(
-        p._runtime.store.path_policy.adapter,
-        "delete_target",
-        side_effect=cleanup_error("清理故障"),
-    ):
+    with in_process_workers(p), cleanup_hook(p, cleanup_error("清理故障")):
         target = tmp_path / "undeletable.txt"
         target.write_text("data", encoding="utf-8")
         p.run(install_signals=False)
@@ -271,11 +267,7 @@ def test_failure_cleanup_failure_preserves_original_cause(tmp_path, monkeypatch,
     p.register_task("failing", _failing_handler)
     p.enqueue(Job("failing", "f1"))
 
-    with in_process_workers(p), patch.object(
-        p._runtime.store.path_policy.adapter,
-        "delete_target",
-        side_effect=cleanup_error("I/O error during cleanup"),
-    ):
+    with in_process_workers(p), cleanup_hook(p, cleanup_error("I/O error during cleanup")):
         p.run(install_signals=False)
 
     rec = _snapshot_map(p)["failing::f1"]
@@ -385,13 +377,8 @@ def test_approved_waiting_declaration_cleanup_error_fails_job(
     decisions = iter([None, True] if wait else [True])
     p.register_task("work", _dynamic_delete_handler)
     p.enqueue(Job("work", "one", payload={"path": str(target)}))
-    with authorizer(p, lambda *args: next(decisions)):
-        with patch.object(
-            p._runtime.store.path_policy.adapter,
-            "delete_target",
-            side_effect=cleanup_error("清理磁盘拒绝写入"),
-        ):
-            p.run(install_signals=False)
+    with authorizer(p, lambda *args: next(decisions)), cleanup_hook(p, cleanup_error("清理磁盘拒绝写入")):
+        p.run(install_signals=False)
     rec = _snapshot_map(p)["work::one"]
     assert rec["status"] == "failed"
     assert "清理磁盘拒绝写入" in (rec["result"]["message"] or "")
@@ -423,11 +410,7 @@ def test_pre_dispatch_cleanup_failure_settles_without_starting_worker(
         files={"target": FileSpec(target, role="output", delete_existing=True)},
     ))
 
-    with in_process_workers(p), patch.object(
-        p._runtime.store.path_policy.adapter,
-        "delete_target",
-        side_effect=cleanup_error("静态前删故障"),
-    ):
+    with in_process_workers(p), cleanup_hook(p, cleanup_error("静态前删故障")):
         p.run(install_signals=False)
 
     assert not marker.exists()
@@ -557,11 +540,7 @@ def test_retry_cleanup_failure_settles_once_without_retry(tmp_path, monkeypatch,
     p.register_task("retry", _retry_cleanup_handler)
     p.enqueue(Job("retry", "one", max_retries_per_run=3))
 
-    with in_process_workers(p), patch.object(
-        p._runtime.store.path_policy.adapter,
-        "delete_target",
-        side_effect=cleanup_error("重试清理故障"),
-    ):
+    with in_process_workers(p), cleanup_hook(p, cleanup_error("重试清理故障")):
         p.run(install_signals=False)
 
     rec = _snapshot_map(p)["retry::one"]

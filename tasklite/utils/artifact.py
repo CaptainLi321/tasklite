@@ -925,7 +925,7 @@ class PathPolicy:
         protected_parts: list[tuple[str, ...]] = []
         seen_keys: set[str] = set()
         for item in raw_protected:
-            inspected = self._canonicalize_path(item)
+            inspected, _ = self._canonicalize_path(item)
             if inspected.comparison_key not in seen_keys:
                 seen_keys.add(inspected.comparison_key)
                 canonical_protected.append(Path(inspected.canonical_path))
@@ -971,8 +971,12 @@ class PathPolicy:
             norm = _join_platform_path(self._effective_base_dir(), (norm,), is_windows=self._is_windows)
         return _comparison_key_for_path(norm, is_windows=self._is_windows)
 
-    def _canonicalize_path(self, path: str | Path) -> InspectedPath:
-        """词法校验 + 锚定 base_dir + 展开最长已存在父前缀（绝不跟随叶链接）。"""
+    def _canonicalize_path(self, path: str | Path) -> tuple[InspectedPath, EntryInspection]:
+        """词法校验 + 锚定 base_dir + 展开最长已存在父前缀（绝不跟随叶链接）。
+
+        向内部同时返回 ``(InspectedPath, EntryInspection)``，供 ``inspect()`` 与
+        ``is_protected()`` 直接复用叶节点探测结果，避免重复 ``lstat``。
+        """
         norm = validate_and_normalize_lexical(path, is_windows=self._is_windows)
         if not self._is_absolute(norm):
             abs_str = _join_platform_path(
@@ -985,10 +989,13 @@ class PathPolicy:
             canonical = abs_str
             entry = self._adapter.inspect_entry(canonical)
             kind: PathKind = "directory" if entry.entry_class == "directory" else "missing"
-            return InspectedPath(
-                canonical_path=canonical,
-                comparison_key=_comparison_key_for_path(canonical, is_windows=self._is_windows),
-                kind=kind,
+            return (
+                InspectedPath(
+                    canonical_path=canonical,
+                    comparison_key=_comparison_key_for_path(canonical, is_windows=self._is_windows),
+                    kind=kind,
+                ),
+                entry,
             )
 
         parent, leaf_name = _split_parent_and_name(abs_str, is_windows=self._is_windows)
@@ -1034,10 +1041,13 @@ class PathPolicy:
             "unsafe_reparse": "file",
             "unsupported": "file",
         }
-        return InspectedPath(
-            canonical_path=canonical,
-            comparison_key=_comparison_key_for_path(canonical, is_windows=self._is_windows),
-            kind=kind_map[entry.entry_class],
+        return (
+            InspectedPath(
+                canonical_path=canonical,
+                comparison_key=_comparison_key_for_path(canonical, is_windows=self._is_windows),
+                kind=kind_map[entry.entry_class],
+            ),
+            entry,
         )
 
     def _overlaps_protected(self, comparison_key: str) -> bool:
@@ -1047,10 +1057,9 @@ class PathPolicy:
     def is_protected(self, path: str | Path) -> bool:
         """判断路径是否与已配置的受保护路径双向重叠（含叶链接/重解析点目标，异常时 fail-closed 返回 True）。"""
         try:
-            inspected = self.inspect(path, mode="lookup")
+            inspected, entry = self._canonicalize_path(path)
             if self._overlaps_protected(inspected.comparison_key):
                 return True
-            entry = self._adapter.inspect_entry(inspected.canonical_path)
             if entry.entry_class in ("live_symlink", "mount_point", "unsafe_reparse"):
                 resolved = self._adapter.realpath(inspected.canonical_path)
                 resolved_key = _comparison_key_for_path(resolved, is_windows=self._is_windows)
@@ -1071,7 +1080,7 @@ class PathPolicy:
         if mode not in ("strict", "pre_delete", "lookup"):
             raise ValueError(f"Unsupported inspect mode: {mode!r}")
 
-        inspected = self._canonicalize_path(path)
+        inspected, entry = self._canonicalize_path(path)
         if verify_unchanged and inspected.comparison_key != self.comparison_key_for(path):
             raise ValueError(f"artifact parent path changed: {path}")
         if mode == "lookup":
@@ -1083,7 +1092,6 @@ class PathPolicy:
         if self._overlaps_protected(inspected.comparison_key):
             raise ValueError(f"artifact overlaps a protected root: {inspected.canonical_path}")
 
-        entry = self._adapter.inspect_entry(inspected.canonical_path)
         if entry.entry_class == "live_symlink":
             raise ValueError(f"artifact leaf must not be a symlink: {inspected.canonical_path}")
         if entry.entry_class == "broken_symlink":

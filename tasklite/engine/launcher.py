@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import ctypes
-import json
 import logging
 import os
 import pickle
@@ -33,7 +32,16 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..utils.clock import utc_now_iso
-from ..utils.ipc import WorkerPipeReceiver, WorkerReplySender
+from ..utils.ipc import (
+    HANDSHAKE_ROLE_CANCEL,
+    HANDSHAKE_ROLE_DOWNLINK,
+    HANDSHAKE_ROLE_UPLINK,
+    WorkerPipeReceiver,
+    WorkerReplySender,
+    decode_handshake_frame,
+    encode_handshake_frame,
+    encode_json_frame,
+)
 from ._worker_runtime import WorkerLaunchSpec
 from .types import (
     ENV_IPC_ADDR,
@@ -117,7 +125,7 @@ class PreparedWorker:
         receiver: WorkerPipeReceiver,
         reply_sender: WorkerReplySender,
         on_release: Callable[[], None],
-        on_abort: Callable[[], None],
+        on_abort: Callable[[], None] | None = None,
     ) -> None:
         self.handle = handle
         self.receiver = receiver
@@ -150,12 +158,37 @@ class PreparedWorker:
         )
 
     def abort(self) -> None:
-        """幂等中止未放行的 worker 并回收进程树、句柄与双工连接。"""
+        """幂等中止未放行的 worker 并回收进程树、句柄与双工连接。
+
+        内置标准 5 步清理（kill_tree -> join -> reply_sender.close ->
+        receiver.close -> handle.close），若提供可选 ``on_abort`` 额外钩子则在其后执行。
+        """
         with self._lock:
             if self._aborted:
                 return
             self._aborted = True
-        self._on_abort()
+        try:
+            self.handle.kill_tree()
+        except Exception:
+            pass
+        try:
+            self.handle.join(timeout=5.0)
+        except Exception:
+            pass
+        try:
+            self.reply_sender.close()
+        except Exception:
+            pass
+        try:
+            self.receiver.close(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            self.handle.close()
+        except Exception:
+            pass
+        if self._on_abort is not None:
+            self._on_abort()
 
 
 class WorkerLauncher(ABC):
@@ -725,9 +758,7 @@ class _HandshakeAcceptor:
 
                 try:
                     raw = conn.recv_bytes()
-                    frame = json.loads(raw.decode("utf-8"))
-                    role = frame.get("role") if isinstance(frame, dict) else None
-                    raw_pid = frame.get("pid") if isinstance(frame, dict) else None
+                    role, raw_pid = decode_handshake_frame(raw)
                 except BaseException as exc:
                     try:
                         conn.close()
@@ -737,7 +768,7 @@ class _HandshakeAcceptor:
                         self.error = exc
                     return
 
-                if role == "cancel":
+                if role == HANDSHAKE_ROLE_CANCEL:
                     try:
                         conn.close()
                     except OSError:
@@ -751,11 +782,11 @@ class _HandshakeAcceptor:
                         except OSError:
                             pass
                         return
-                    if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0:
+                    if raw_pid is not None:
                         self.worker_pid = raw_pid
-                    if role == "uplink" and self.uplink is None:
+                    if role == HANDSHAKE_ROLE_UPLINK and self.uplink is None:
                         self.uplink = conn
-                    elif role == "downlink" and self.downlink is None:
+                    elif role == HANDSHAKE_ROLE_DOWNLINK and self.downlink is None:
                         self.downlink = conn
                     else:
                         try:
@@ -786,7 +817,7 @@ class _HandshakeAcceptor:
                     authkey=self._authkey,
                 )
                 try:
-                    wake_conn.send_bytes(b'{"role":"cancel"}')
+                    wake_conn.send_bytes(encode_handshake_frame(HANDSHAKE_ROLE_CANCEL))
                 finally:
                     wake_conn.close()
             except BaseException:
@@ -905,34 +936,6 @@ class SubprocessWorkerLauncher(WorkerLauncher):
             except OSError:
                 pass
 
-    @staticmethod
-    def _abort_prepared_resources(
-        managed_handle: ManagedWorkerHandle,
-        reply_sender: WorkerReplySender,
-        receiver: WorkerPipeReceiver,
-    ) -> None:
-        """中止已绑定进程树但尚未放行的子进程，确保进程树、Job 句柄与双工连接零泄漏。"""
-        try:
-            managed_handle.kill_tree()
-        except Exception:
-            pass
-        try:
-            managed_handle.join(timeout=5.0)
-        except Exception:
-            pass
-        try:
-            reply_sender.close()
-        except Exception:
-            pass
-        try:
-            receiver.close(timeout=2.0)
-        except Exception:
-            pass
-        try:
-            managed_handle.close()
-        except Exception:
-            pass
-
     def prepare(
         self,
         spec: WorkerLaunchSpec,
@@ -945,7 +948,7 @@ class SubprocessWorkerLauncher(WorkerLauncher):
                 f"stop requested before worker launch for {spec.job.uid}"
             )
 
-        prep_bytes = json.dumps(_build_prep_data(spec)).encode("utf-8")
+        prep_bytes = encode_json_frame(_build_prep_data(spec))
         payload_bytes = pickle.dumps(
             {
                 "handler": spec.handler,
@@ -1076,11 +1079,6 @@ class SubprocessWorkerLauncher(WorkerLauncher):
                 receiver=bound_receiver,
                 reply_sender=bound_reply_sender,
                 on_release=_release_subprocess,
-                on_abort=lambda: self._abort_prepared_resources(
-                    bound_handle,
-                    bound_reply_sender,
-                    bound_receiver,
-                ),
             )
         except BaseException:
             # 清理顺序红线：先非阻塞唤醒 acceptor 并尽快关 listener（打断任何未接通的

@@ -25,7 +25,7 @@ import pytest
 
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
 from tasklite.resource import CapacityResource, IntervalResource
-from tasklite.testing import authorizer
+from tasklite.testing import authorizer, cleanup_hook
 from tasklite.utils.jsonutil import dumps, loads
 
 
@@ -376,11 +376,7 @@ def test_cleanup_error_fails_without_publishing_success(pipelines, monkeypatch, 
     pipeline.register_task("work", cleanup_handler)
     pipeline.enqueue(Job("work", "cleanup", max_retries_per_run=3))
 
-    def unavailable(*args, **kwargs):
-        raise PermissionError("授权清理不可用")
-
-    with monkeypatch.context() as failure:
-        failure.setattr(pipeline._runtime.store.path_policy.adapter, "delete_target", unavailable)
+    with cleanup_hook(pipeline, PermissionError("授权清理不可用")):
         pipeline.run(install_signals=False)
     with StateSnapshot.open(pipeline) as snap:
         assert list(snap.iter_jobs(status="succeeded")) == []

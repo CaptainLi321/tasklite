@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -41,11 +42,15 @@ from .utils.ipc import (
 )
 
 __all__ = [
+    "FakeClock",
     "InProcessWorkerLauncher",
     "authorizer",
+    "cleanup_hook",
     "cursor_updates",
     "fake_ctx",
     "in_process_workers",
+    "monotonic_clock",
+    "observe_wait",
     "running",
     "spawned_jobs",
 ]
@@ -200,7 +205,6 @@ class InProcessWorkerLauncher(WorkerLauncher):
             run_id=spec.run_id or None,
             attempt_no=spec.attempt_no,
         )
-        spec.job_context._bind_pipe_sender(sender, reply_receiver)
         launch_spec = dataclasses.replace(
             spec,
             pipe_sender=sender,
@@ -219,56 +223,37 @@ class InProcessWorkerLauncher(WorkerLauncher):
                 )
             handle.start()
 
-        def _abort() -> None:
-            try:
-                if handle.is_alive():
-                    handle.kill_tree()
-            except Exception:
-                pass
-            try:
-                handle.join(timeout=5.0)
-            except Exception:
-                pass
-            try:
-                handle.close()
-            except Exception:
-                pass
-            try:
-                reply_sender.close()
-            except Exception:
-                pass
-            try:
-                receiver.close(timeout=2.0)
-            except Exception:
-                pass
-
         return PreparedWorker(
             handle=handle,
             receiver=receiver,
             reply_sender=reply_sender,
             on_release=_release,
-            on_abort=_abort,
         )
 
 
-def _resolve_launcher_holders(target: Any) -> list[Any]:
-    holders: list[Any] = []
-    if hasattr(target, "_launcher"):
-        holders.append(target)
+def _resolve_launcher_channels(target: Any) -> list[Any]:
+    channels: list[Any] = []
+    if callable(getattr(target, "set_launcher", None)):
+        channels.append(target)
     channel = getattr(target, "_channel", getattr(target, "channel", None))
-    if channel is not None and hasattr(channel, "_launcher") and channel not in holders:
-        holders.append(channel)
-    if not holders:
+    if (
+        channel is not None
+        and callable(getattr(channel, "set_launcher", None))
+        and channel not in channels
+    ):
+        channels.append(channel)
+    if not channels:
         raise TypeError(
-            f"in_process_workers target has no _launcher: {type(target).__name__}"
+            f"in_process_workers target has no ExecutionChannel with set_launcher: "
+            f"{type(target).__name__}"
         )
-    return holders
+    return channels
 
 
 def _install_launcher(
     target: Any,
     launcher: WorkerLauncher | None = None,
-) -> list[tuple[Any, Any]]:
+) -> list[tuple[Any, WorkerLauncher]]:
     if launcher is not None and not isinstance(launcher, WorkerLauncher):
         raise TypeError(
             f"in_process_workers expects a WorkerLauncher instance or None, "
@@ -277,10 +262,8 @@ def _install_launcher(
     effective_launcher: WorkerLauncher = (
         launcher if launcher is not None else InProcessWorkerLauncher()
     )
-    holders = _resolve_launcher_holders(target)
-    previous = [(holder, holder._launcher) for holder in holders]
-    for holder in holders:
-        holder._launcher = effective_launcher
+    channels = _resolve_launcher_channels(target)
+    previous = [(channel, channel.set_launcher(effective_launcher)) for channel in channels]
     return previous
 
 
@@ -329,8 +312,125 @@ def in_process_workers(
     try:
         yield target
     finally:
-        for holder, orig in previous:
-            holder._launcher = orig
+        for channel, orig in previous:
+            channel.set_launcher(orig)
+
+
+def _resolve_filesystem_adapter(target: Any) -> Any:
+    """从 TaskLite / EngineRuntime / StateStore / PathPolicy / FilesystemAdapter 解析文件适配器。"""
+    current = getattr(target, "_runtime", target)
+    current = getattr(current, "store", current)
+    current = getattr(current, "path_policy", current)
+    adapter = getattr(current, "adapter", current)
+    if not callable(getattr(adapter, "delete_target", None)):
+        raise TypeError(
+            f"cleanup_hook target has no filesystem adapter delete_target: {type(target).__name__}"
+        )
+    return adapter
+
+
+@contextmanager
+def cleanup_hook(
+    target: Any,
+    handler: Callable[..., Any] | BaseException,
+) -> Iterator[Any]:
+    """受控注入产物清理故障或拦截钩子，退出时自动恢复原文件系统适配器。
+
+    Args:
+        target: TaskLite、EngineRuntime、StateStore、PathPolicy 或 FilesystemAdapter。
+        handler:
+            - 若传入 ``BaseException`` 实例，每次调用 ``delete_target`` 时直接抛出该异常；
+            - 若传入可调用对象，以 ``handler(original_delete, *args, **kwargs)`` 调用，
+              支持先执行观察/故障/篡改逻辑再按需委托原始 ``original_delete``。
+    """
+    adapter = _resolve_filesystem_adapter(target)
+    had_instance_attr = "delete_target" in getattr(adapter, "__dict__", {})
+    original_delete = adapter.delete_target
+
+    if isinstance(handler, BaseException):
+        exc = handler
+
+        def _patched_delete(*args: Any, **kwargs: Any) -> Any:
+            raise exc
+    else:
+        def _patched_delete(*args: Any, **kwargs: Any) -> Any:
+            return handler(original_delete, *args, **kwargs)
+
+    adapter.delete_target = _patched_delete
+    try:
+        yield original_delete
+    finally:
+        if had_instance_attr:
+            adapter.delete_target = original_delete
+        else:
+            delattr(adapter, "delete_target")
+
+
+@contextmanager
+def observe_wait(
+    target: Any,
+    on_wait: Callable[[float | None], None] | None = None,
+) -> Iterator[list[float | None]]:
+    """受控观察主循环调度等待，记录每次等待超时并在进入等待时触发回调。
+
+    退出上下文时自动恢复 ``EngineRuntime._wait``，避免测试直接反射篡改运行期方法。
+    """
+    rt = getattr(target, "_runtime", target)
+    had_instance_attr = "_wait" in getattr(rt, "__dict__", {})
+    original_wait = getattr(rt, "_wait", None)
+    if not callable(original_wait):
+        raise TypeError(
+            f"observe_wait target has no EngineRuntime._wait: {type(target).__name__}"
+        )
+    observed: list[float | None] = []
+
+    def _tracked_wait(timeout: float | None, last_seq: int | None = None) -> None:
+        observed.append(timeout)
+        if on_wait is not None:
+            on_wait(timeout)
+        original_wait(timeout, last_seq=last_seq)
+
+    rt._wait = _tracked_wait
+    try:
+        yield observed
+    finally:
+        if had_instance_attr:
+            rt._wait = original_wait
+        else:
+            delattr(rt, "_wait")
+
+
+class FakeClock:
+    """可控单调时钟（供资源节流、超时等确定性测试使用）。"""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self._now = float(start)
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> float:
+        """向前推进单调时钟并返回新时间。"""
+        if seconds < 0:
+            raise ValueError(f"FakeClock.advance requires non-negative seconds, got {seconds}")
+        self._now += float(seconds)
+        return self._now
+
+    def set(self, value: float) -> None:
+        """直接设置当前单调时钟读数。"""
+        self._now = float(value)
+
+
+@contextmanager
+def monotonic_clock(start: float = 0.0) -> Iterator[FakeClock]:
+    """在测试上下文内替换 ``time.monotonic`` 为可控 ``FakeClock``，退出自动恢复。"""
+    clock = FakeClock(start=start)
+    original_monotonic = time.monotonic
+    time.monotonic = clock
+    try:
+        yield clock
+    finally:
+        time.monotonic = original_monotonic
 
 
 def spawned_jobs(ctx: JobContext) -> list[Job]:

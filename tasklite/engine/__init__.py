@@ -15,6 +15,6 @@
 调度逻辑仅留 seam：选择点收敛在 scheduler 的 scan_next_runnable（访问
 序经 OrderingPolicy），重试节奏收敛在 RequeuePolicy（默认立即重入队）。
 
-分层红线：本包属核心层，严禁 import ``tasklite/wrappers/`` 与
-``tasklite/contrib/``；可依赖 ``tasklite/{models,utils,backend}``。
+分层红线：本包属核心层，严禁 import ``tasklite/wrappers/``；
+可依赖 ``tasklite/{models,utils,backend}``。
 """

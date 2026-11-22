@@ -10,7 +10,7 @@
 
 分层红线：本包是公开面之上的适配层，可依赖
 ``tasklite/{models,utils,engine}`` 公开面；``tasklite/utils/`` 严禁反向
-import 本包，核心层严禁依赖本包与 ``tasklite/contrib/``。本子包不进
+import 本包，核心层严禁依赖本包。本子包不进
 ``tasklite`` 主 ``__all__``——经 ``tasklite.wrappers.*`` 子包路径导入。
 """
 

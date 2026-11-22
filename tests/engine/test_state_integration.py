@@ -252,23 +252,25 @@ def test_leftover_running_recovery_and_idempotence(tmp_path: Path):
     # 启动时恢复
     pipeline.run()
 
-    failed = pipeline._runtime.store.backend.load_failed()
-    assert "work::orphan" in failed
-    assert failed["work::orphan"]["error_message"] == "上次执行未完成结算，实际结果未知"
-    assert failed["work::orphan"]["run_id"] == "run_crash"
+    with StateSnapshot.open(pipeline) as snap:
+        failed_rec = snap.get_job("work::orphan")
+        assert failed_rec is not None and failed_rec["status"] == "failed"
+        assert failed_rec["result"]["message"] == "上次执行未完成结算，实际结果未知"
+        assert failed_rec["run_id"] == "run_crash"
 
-    attempts = pipeline._runtime.store.backend.load_settled_attempts("work::orphan")
-    assert len(attempts) == 1
-    assert attempts[0]["outcome"] == "failure"
-    assert attempts[0]["attempt_no"] == 1
-    assert attempts[0]["run_id"] == "run_crash"
-    assert pipeline._runtime.store.backend.load_queue_jobs(status="pending") == []
+        attempts = list(snap.iter_attempts(job_uid="work::orphan"))
+        assert len(attempts) == 1
+        assert attempts[0]["outcome"] == "failure"
+        assert attempts[0]["attempt_no"] == 1
+        assert attempts[0]["run_id"] == "run_crash"
+        assert list(snap.iter_jobs(status="pending")) == []
 
     # 再次启动，幂等不产生重复 attempts
     pipeline2 = TaskLite(backend="sqlite", state_path=db_path)
     pipeline2.run()
-    attempts2 = pipeline2._runtime.store.backend.load_settled_attempts("work::orphan")
-    assert len(attempts2) == 1
+    with StateSnapshot.open(pipeline2) as snap2:
+        attempts2 = list(snap2.iter_attempts(job_uid="work::orphan"))
+        assert len(attempts2) == 1
 
 
 def parent_spawn_and_cursor_handler(job, ctx):
@@ -289,9 +291,10 @@ def test_parent_success_atomic_with_spawned_and_cursor(tmp_path: Path):
     pipeline.enqueue(Job("parent", "p1"))
     pipeline.run()
 
-    assert "parent::p1" in pipeline._runtime.store.backend.load_successes()
-    assert "child::c1" in pipeline._runtime.store.backend.load_successes()
-    assert pipeline._runtime.store.backend.load_cursors().get("offset") == "100"
+    with StateSnapshot.open(pipeline) as snap:
+        assert (snap.get_job("parent::p1") or {}).get("status") == "succeeded"
+        assert (snap.get_job("child::c1") or {}).get("status") == "succeeded"
+    assert pipeline.get_cursor("offset") == "100"
 
 
 def bad_parent_handler(job, ctx):
@@ -317,13 +320,14 @@ def test_invalid_spawned_job_rejects_parent_and_discards_effects(tmp_path: Path,
     pipeline.enqueue(Job("parent", "p1", payload={"bad_kind": bad_kind}))
     pipeline.run()
 
-    assert "parent::p1" not in pipeline._runtime.store.backend.load_successes()
-    assert "parent::p1" in pipeline._runtime.store.backend.load_failed()
-    assert "payload" in pipeline._runtime.store.backend.load_failed()["parent::p1"]["error_message"]
-    assert "child::valid" not in pipeline._runtime.store.backend.load_successes()
-    assert pipeline._runtime.store.backend.load_settled_attempts("child::valid") == []
-    assert "offset" not in pipeline._runtime.store.backend.load_cursors()
-    assert pipeline._runtime.store.backend.load_queue_jobs(status="pending") == []
+    with StateSnapshot.open(pipeline) as snap:
+        parent_rec = snap.get_job("parent::p1")
+        assert parent_rec is not None and parent_rec["status"] == "failed"
+        assert "payload" in (parent_rec["result"]["message"] or "")
+        assert snap.get_job("child::valid") is None
+        assert list(snap.iter_attempts(job_uid="child::valid")) == []
+        assert list(snap.iter_jobs(status="pending")) == []
+    assert pipeline.get_cursor("offset") is None
 
 
 def file_counter_retry_handler(job, ctx):
@@ -347,7 +351,8 @@ def test_attempt_no_monotonic_advance_including_zero_budget_retry(tmp_path: Path
     pipeline.enqueue(Job("worker", "m1", payload={"counter_file": str(counter_file)}))
     pipeline.run()
 
-    attempts = pipeline._runtime.store.backend.load_settled_attempts("worker::m1")
+    with StateSnapshot.open(pipeline) as snap:
+        attempts = list(snap.iter_attempts(job_uid="worker::m1"))
     assert len(attempts) == 2
     assert [a["attempt_no"] for a in attempts] == [1, 2]
     assert [a["outcome"] for a in attempts] == ["retry", "success"]
@@ -356,30 +361,33 @@ def test_attempt_no_monotonic_advance_including_zero_budget_retry(tmp_path: Path
 @pytest.mark.parametrize("error_type", [OSError, sqlite3.OperationalError])
 def test_recovery_settlement_fault_preserves_running(tmp_path, monkeypatch, error_type):
     """恢复提交失败时保留 running 与完整快照，不登记内存失败。"""
-    pipeline = TaskLite(backend="sqlite", state_path=tmp_path / "state.db")
-    backend = pipeline._runtime.store.backend
+    db_path = tmp_path / "state.db"
+    setup_backend = SQLiteStateBackend(db_path)
     snapshot = {"task_type": "work", "job_id": "orphan", "payload": {"key": "value"}}
-    backend.enqueue_jobs([snapshot])
-    backend.mark_job_running(
+    setup_backend.enqueue_jobs([snapshot])
+    setup_backend.mark_job_running(
         "work::orphan",
         execution_id="old.1",
         run_id="old",
         started_at="2026-01-01T00:00:00+00:00",
     )
 
+    pipeline = TaskLite(backend="sqlite", state_path=db_path)
     original = error_type("无法写入结算")
 
-    def fail_settlement(**kwargs):
+    def fail_settlement(self, **kwargs):
         raise original
 
-    monkeypatch.setattr(backend, "commit_job_settlement", fail_settlement)
+    monkeypatch.setattr(SQLiteStateBackend, "commit_job_settlement", fail_settlement)
     with pytest.raises(error_type, match="无法写入结算") as error:
         pipeline.run()
     assert error.value is original
-    assert backend.load_queue_jobs()[0]["status"] == "running"
-    assert backend.load_queue_jobs()[0]["job"] == snapshot
-    assert backend.load_failed() == {}
-    assert backend.load_settled_attempts("work::orphan") == []
+    with StateSnapshot.open(pipeline) as snap:
+        running_rec = snap.get_job("work::orphan")
+        assert running_rec is not None and running_rec["status"] == "running"
+        assert running_rec["job"]["payload"] == {"key": "value"}
+        assert list(snap.iter_jobs(status="failed")) == []
+        assert list(snap.iter_attempts(job_uid="work::orphan")) == []
     assert pipeline._runtime.store.state.failed == {}
     pipeline.close()
 
@@ -413,21 +421,22 @@ def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypat
 
     original = error_type("结算失败")
 
-    def fail_settlement(**kwargs):
+    def fail_settlement(self, **kwargs):
         raise original
 
     with monkeypatch.context() as patch:
         patch.setattr(
-            pipeline._runtime.store.backend,
+            SQLiteStateBackend,
             "commit_job_settlement",
             fail_settlement,
         )
         with pytest.raises(error_type, match="结算失败") as error:
             pipeline.run()
         assert error.value is original
-    rows = pipeline._runtime.store.backend.load_queue_jobs()
-    assert rows[0]["status"] == "running"
-    assert pipeline._runtime.store.backend.load_settled_attempts("work::one") == []
+    with StateSnapshot.open(pipeline) as snap:
+        running_rec = snap.get_job("work::one")
+        assert running_rec is not None and running_rec["status"] == "running"
+        assert list(snap.iter_attempts(job_uid="work::one")) == []
     assert effect.read_text() == "effect\n"
     pipeline.close()
 
@@ -435,10 +444,11 @@ def test_uncommitted_execution_is_not_automatically_replayed(tmp_path, monkeypat
         reopened.register_task("work", unsettled_effect_handler)
         reopened.register_task("pending", pending_after_effect_handler)
         reopened.run()
-        attempts = reopened._runtime.store.backend.load_settled_attempts("work::one")
-        assert len(attempts) == 1
-        assert attempts[0]["outcome"] == "failure"
-        assert "work::one" in reopened._runtime.store.backend.load_failed()
+        with StateSnapshot.open(reopened) as snap:
+            attempts = list(snap.iter_attempts(job_uid="work::one"))
+            assert len(attempts) == 1
+            assert attempts[0]["outcome"] == "failure"
+            assert (snap.get_job("work::one") or {}).get("status") == "failed"
         assert effect.read_text() == "effect\n"
 
 
@@ -472,17 +482,19 @@ def test_spawn_duplicate_configuration_checked_before_atomic_publication(tmp_pat
         if mode == "pending":
             p.enqueue(Job("child", "same", payload={"version": 1}))
         p.run()
-        successes = p._runtime.store.backend.load_successes()
-        if conflict:
-            assert "parent::one" in p._runtime.store.backend.load_failed()
-            assert "configuration" in p._runtime.store.backend.load_failed()["parent::one"]["error_message"]
-            assert "child::fresh" not in successes
-            assert p.get_cursor("offset") is None
-            assert ("child::same" in successes) == (mode == "pending")
-        else:
-            assert {"parent::one", "child::same", "child::fresh"} <= successes.keys()
-            assert len(p._runtime.store.backend.load_settled_attempts("child::same")) == 1
-            assert p.get_cursor("offset") == "unpublished"
+        with StateSnapshot.open(p) as snap:
+            succeeded = {rec["job_uid"] for rec in snap.iter_jobs(status="succeeded")}
+            if conflict:
+                parent_rec = snap.get_job("parent::one")
+                assert parent_rec is not None and parent_rec["status"] == "failed"
+                assert "configuration" in (parent_rec["result"]["message"] or "")
+                assert "child::fresh" not in succeeded
+                assert p.get_cursor("offset") is None
+                assert ("child::same" in succeeded) == (mode == "pending")
+            else:
+                assert {"parent::one", "child::same", "child::fresh"} <= succeeded
+                assert len(list(snap.iter_attempts(job_uid="child::same"))) == 1
+                assert p.get_cursor("offset") == "unpublished"
 
 
 @pytest.mark.parametrize("template_changed", [False, True])
@@ -573,9 +585,10 @@ def test_spawn_unregistered_task_fails_parent_atomically_and_survives_reopen(tmp
         reopened.register_task("parent", unknown_spawn_handler)
         reopened.register_task("child", child_consumer_handler)
         reopened.run()
-        assert len(reopened._runtime.store.backend.load_settled_attempts("parent::one")) == 1
-        assert reopened._runtime.store.backend.load_settled_attempts("child::sibling") == []
-        assert reopened._runtime.store.backend.load_settled_attempts("missing::unknown") == []
+        with StateSnapshot.open(reopened) as snap:
+            assert len(list(snap.iter_attempts(job_uid="parent::one"))) == 1
+            assert list(snap.iter_attempts(job_uid="child::sibling")) == []
+            assert list(snap.iter_attempts(job_uid="missing::unknown")) == []
         assert reopened.get_cursor("offset") == "original"
 
 
@@ -663,19 +676,20 @@ def test_inflight_duplicate_spawn_uses_real_process_barrier(tmp_path, conflict):
 
         assert not controller.is_alive()
         assert errors == []
-        parent_attempts = list(pipeline._runtime.store.backend.load_settled_attempts("parent::one"))
-        assert len(parent_attempts) == 1
-        child_attempts = list(pipeline._runtime.store.backend.load_settled_attempts("child::same"))
-        assert len(child_attempts) == 1
-        assert child_attempts[0]["outcome"] == "success"
-        assert child_attempts[0]["job"]["payload"] == child_payload
-        if conflict:
-            assert parent_attempts[0]["outcome"] == "failure"
-            assert "configuration" in parent_attempts[0]["error_message"]
-            assert pipeline.get_cursor("offset") == "original"
-        else:
-            assert parent_attempts[0]["outcome"] == "success"
-            assert pipeline.get_cursor("offset") == "published"
+        with StateSnapshot.open(pipeline) as snap:
+            parent_attempts = list(snap.iter_attempts(job_uid="parent::one"))
+            assert len(parent_attempts) == 1
+            child_attempts = list(snap.iter_attempts(job_uid="child::same"))
+            assert len(child_attempts) == 1
+            assert child_attempts[0]["outcome"] == "success"
+            assert child_attempts[0]["job"]["payload"] == child_payload
+            if conflict:
+                assert parent_attempts[0]["outcome"] == "failure"
+                assert "configuration" in (parent_attempts[0]["result"]["message"] or "")
+                assert pipeline.get_cursor("offset") == "original"
+            else:
+                assert parent_attempts[0]["outcome"] == "success"
+                assert pipeline.get_cursor("offset") == "published"
 
 
 def late_child_handler(job, ctx):
@@ -729,8 +743,9 @@ def test_dependency_on_job_published_after_parent_dispatch_is_rejected(tmp_path)
         ))
         pipeline.run()
 
-        assert "late_child::target" in pipeline._runtime.store.backend.load_successes()
-        assert "parent::one" in pipeline._runtime.store.backend.load_failed()
-        assert len(pipeline._runtime.store.backend.load_settled_attempts("parent::one")) == 1
-        assert pipeline._runtime.store.backend.load_settled_attempts("summary::one") == []
+        with StateSnapshot.open(pipeline) as snap:
+            assert (snap.get_job("late_child::target") or {}).get("status") == "succeeded"
+            assert (snap.get_job("parent::one") or {}).get("status") == "failed"
+            assert len(list(snap.iter_attempts(job_uid="parent::one"))) == 1
+            assert list(snap.iter_attempts(job_uid="summary::one")) == []
         assert pipeline.get_cursor("offset") == "original"

@@ -1,13 +1,11 @@
 """包面静态契约与发布元数据测试：主公开面导出、分层单向依赖红线与 pyproject 一致性。
 
 锁定契约：
-1. ``tasklite`` 主公开面不吞并 wrappers/contrib（wrappers 经子包路径导入）；
+1. ``tasklite`` 主公开面不吞并 wrappers（wrappers 经子包路径导入）；
 2. 核心层源码（models/utils/backend/engine + 顶层模块）严禁 import
-   ``tasklite/wrappers`` 与 ``tasklite/contrib``，且 models 严禁 import
-   engine、utils 严禁 import wrappers；
-3. contrib 空导出面且不被核心依赖；
-4. GUIDE 代码块中的 tasklite 导入语句逐条可导入；
-5. pyproject.toml 元数据（支持版本、SPDX 许可证、动态版本）与运行期一致。
+   ``tasklite/wrappers``，且 models 严禁 import engine、utils 严禁 import wrappers；
+3. GUIDE 代码块中的 tasklite 导入语句逐条可导入；
+4. pyproject.toml 元数据（支持版本、SPDX 许可证、动态版本）与运行期一致。
 """
 from __future__ import annotations
 
@@ -25,7 +23,6 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
-import tasklite.contrib as contrib
 import tasklite.wrappers as wrappers_pkg
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -33,7 +30,7 @@ PACKAGE_ROOT = PROJECT_ROOT / "tasklite"
 PYPROJECT = PROJECT_ROOT / "pyproject.toml"
 SUPPORTED_PYTHONS = ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
-# 核心层源文件：顶层模块 + 四个核心子包（不含 wrappers/contrib 自身）
+# 核心层源文件：顶层模块 + 四个核心子包（不含 wrappers 自身）
 CORE_FILES = sorted(
     list(PACKAGE_ROOT.glob("*.py"))
     + list((PACKAGE_ROOT / "models").glob("*.py"))
@@ -42,10 +39,7 @@ CORE_FILES = sorted(
     + list((PACKAGE_ROOT / "engine").glob("*.py"))
 )
 
-ADAPTER_FILES = sorted(
-    list((PACKAGE_ROOT / "wrappers").glob("*.py"))
-    + list((PACKAGE_ROOT / "contrib").glob("*.py"))
-)
+ADAPTER_FILES = sorted(list((PACKAGE_ROOT / "wrappers").glob("*.py")))
 
 
 def _imported_module_names(path: pathlib.Path) -> set[str]:
@@ -95,23 +89,16 @@ class TestWrappersExportFace:
         assert wrapper_only.isdisjoint(tasklite_pkg.__all__)
 
 
-class TestContribEntry:
-    """contrib 生态入口：可导入、空导出面、不被核心依赖。"""
-
-    def test_contrib_importable_with_empty_all(self):
-        assert contrib.__all__ == []
-
-
 class TestLayeringRedLine:
     """分层单向依赖红线（AST 静态锁定）。"""
 
-    def test_core_never_imports_wrappers_or_contrib(self):
+    def test_core_never_imports_wrappers(self):
         offenders = {}
         for path in CORE_FILES:
             banned = {
                 name
                 for name in _imported_module_names(path)
-                if name.startswith(("tasklite.wrappers", "tasklite.contrib"))
+                if name.startswith("tasklite.wrappers")
             }
             if banned:
                 offenders[path.name] = sorted(banned)
@@ -136,7 +123,6 @@ class TestLayeringRedLine:
             "tasklite.engine",
             "tasklite.backend",
             "tasklite.wrappers",
-            "tasklite.contrib",
         )
         for path in sorted((PACKAGE_ROOT / "utils").glob("*.py")):
             banned = {
@@ -377,13 +363,13 @@ class TestGuideImportContract:
 
 
 class TestMainSurfaceIsolation:
-    """import tasklite 不触发 wrappers/contrib 加载（子进程净 env 验证）。"""
+    """import tasklite 不触发 wrappers 加载（子进程净 env 验证）。"""
 
-    def test_main_import_skips_wrappers_and_contrib(self):
+    def test_main_import_skips_wrappers(self):
         code = (
             "import sys; import tasklite; "
             "leaked = [m for m in sys.modules "
-            "if m.startswith(('tasklite.wrappers', 'tasklite.contrib'))]; "
+            "if m.startswith('tasklite.wrappers')]; "
             "sys.exit(1 if leaked else 0)"
         )
         env = dict(os.environ)
@@ -396,7 +382,7 @@ class TestMainSurfaceIsolation:
             timeout=60,
         )
         assert result.returncode == 0, (
-            f"import tasklite 不应加载 wrappers/contrib: {result.stderr}"
+            f"import tasklite 不应加载 wrappers: {result.stderr}"
         )
 
     def test_wrappers_subpackage_importable_standalone(self):
@@ -446,7 +432,7 @@ class TestPackagingMetadata:
 
 
 def test_no_banned_vocabulary_in_adapter_layer():
-    """适配层（wrappers/contrib）禁用词零出现。"""
+    """适配层（wrappers）禁用词零出现。"""
     banned = ["sani" + "tize", "tax" + "onomy", "D" + "LQ", "back" + "off"]
     for path in ADAPTER_FILES:
         content = path.read_text(encoding="utf-8").lower()

@@ -40,8 +40,6 @@ from .wait import LoopFacts, decide_wait
 
 logger = logging.getLogger("tasklite")
 
-_REAL_SLEEP = time.sleep
-
 # step() 单步派发上限缺省（显式上限由调用方传入）
 _UNBOUNDED_DISPATCH_LIMIT = 1_000_000
 
@@ -440,14 +438,9 @@ class EngineRuntime:
     # ── 主循环与承重网 ────────────────────────────────────────────────
 
     def _wait(self, timeout: float | None, last_seq: int | None = None) -> None:
-        """运行循环调度等待：支持测试 monkeypatch 捕获，同时由 _notifier 实现跨线程与 check-to-wait 唤醒。"""
-        if last_seq is not None:
-            self._notifier.wait(last_seq, timeout=timeout)
-        else:
-            if time.sleep is not _REAL_SLEEP and timeout is not None and timeout > 0:
-                time.sleep(timeout)
-            self._notifier._event.wait(timeout=timeout)
-            self._notifier._event.clear()
+        """运行循环调度等待：统一经 _notifier 实现跨线程与 check-to-wait 唤醒。"""
+        seq = self._notifier.snapshot() if last_seq is None else last_seq
+        self._notifier.wait(seq, timeout=timeout)
 
     def run_loop(self) -> None:
         """事件驱动主循环：以 step() 统一驱动填池、回收与等待（裸循环）。"""

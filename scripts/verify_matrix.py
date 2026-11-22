@@ -13,7 +13,6 @@ from tasklite import (
     TaskLite, Task, Job, JobContext, FileSpec, TaskResult, StateSnapshot, TaskLiteError,
 )
 from tasklite.resource import CapacityResource, IntervalResource
-from tasklite.hooks import job_ref, slice_list
 from tasklite.utils.encoding import (
     content_fingerprint,
     encode_job_component,

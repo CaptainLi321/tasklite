@@ -284,14 +284,6 @@ class ExecutionResult:
 
 
 @dataclass(frozen=True)
-class AbortOutcome:
-    """强制终止/异常停机时的收尾结果。"""
-
-    completed: list[tuple[JobHandle, ExecutionResult]]
-    cancelled: list[JobHandle]
-
-
-@dataclass(frozen=True)
 class PreparedLaunch:
     """已完成冷启动准备、等待主进程放行或中止的执行令牌。"""
 
@@ -344,6 +336,21 @@ class ExecutionChannel:
         self._is_timeout_paused_cb: Callable[[JobHandle], bool] | None = None
         self._get_authorization_outcome_cb: Callable[[JobHandle], AuthorizationOutcome | None] | None = None
         self._wakeup_callback: Callable[[], None] | None = None
+
+    @property
+    def launcher(self) -> WorkerLauncher:
+        """返回当前绑定的 worker 启动器（供内部与测试 seam 只读观察）。"""
+        return self._launcher
+
+    def set_launcher(self, launcher: WorkerLauncher) -> WorkerLauncher:
+        """受控替换底层 worker 启动器并返回先前启动器（供测试 seam 使用）。"""
+        if not isinstance(launcher, WorkerLauncher):
+            raise TypeError(
+                f"launcher must be a WorkerLauncher instance, got {type(launcher).__name__}"
+            )
+        previous = self._launcher
+        self._launcher = launcher
+        return previous
 
     def _find_session(self, handle: JobHandle) -> _ExecutionSession | None:
         exec_id = handle.execution_id
@@ -815,14 +822,35 @@ class ExecutionChannel:
         session.result = None
         return _decode_ipc_result(raw_res, handle.job)
 
-    def _reap_lingering_workers(self) -> None:
-        """非阻塞轮询已结算但残留的 lingering 会话，进程死亡后回收句柄与接收端。"""
+    def _lingering_sessions(self) -> list[_ExecutionSession]:
+        """返回当前处于 ``lingering`` 状态的全部会话快照。"""
         with self._sessions_lock:
-            lingering = [
+            return [
                 s for s in self._sessions.values()
                 if s.state is _SessionState.LINGERING
             ]
-        for session in lingering:
+
+    def _cleanup_lingering_sessions(
+        self,
+        *,
+        receiver_timeout: float = 0.5,
+        log_errors: bool = True,
+    ) -> None:
+        """回收全部处于 ``lingering`` 状态的会话，异常收敛不阻断后续清理。"""
+        for session in self._lingering_sessions():
+            try:
+                self._close_session(
+                    session,
+                    finalize_process=True,
+                    receiver_timeout=receiver_timeout,
+                )
+            except Exception as e:
+                if log_errors:
+                    logger.error(f"Error cleaning up lingering worker {session.session_key}: {e}")
+
+    def _reap_lingering_workers(self) -> None:
+        """非阻塞轮询已结算但残留的 lingering 会话，进程死亡后回收句柄与接收端。"""
+        for session in self._lingering_sessions():
             p = session.process
             try:
                 alive = p is not None and p.is_alive()
@@ -835,11 +863,7 @@ class ExecutionChannel:
 
     def wait_for_lingering_workers(self) -> None:
         """正常 Run 收口前等待已结算 lingering 会话退出，超时后回收残留进程。"""
-        with self._sessions_lock:
-            lingering = [
-                s for s in self._sessions.values()
-                if s.state is _SessionState.LINGERING
-            ]
+        lingering = self._lingering_sessions()
         if not lingering:
             return
         deadline = time.monotonic() + self._JOIN_REAP_TIMEOUT
@@ -1023,59 +1047,10 @@ class ExecutionChannel:
             annotations=annotations,
         )
 
-    def abort_in_flight(self, handles: Sequence[JobHandle]) -> AbortOutcome:
-        """TOCTOU 闭环中止：取消未放行启动 → 初查分类 → 进程树终止 → 排空管道至 EOF → 重探测闭环 → 关闭会话。"""
-        self.cancel_pending_launches()
-        if not handles:
-            return AbortOutcome(completed=[], cancelled=[])
-
-        done_pairs: list[tuple[JobHandle, ExecutionResult]] = []
-        pending_handles: list[JobHandle] = []
-
-        for handle in handles:
-            self._receive_available(handle)
-            decoded = self._consume_result_if_present(handle)
-            if decoded is not None:
-                done_pairs.append((handle, decoded))
-                continue
-            pending_handles.append(handle)
-
-        for handle, _ in done_pairs:
-            try:
-                handle.process.join(timeout=self._JOIN_REAP_TIMEOUT)
-            except Exception as error:
-                logger.warning(f"Completed process join failed: {error}")
-        self.finalize_processes(handles)
-
-        for handle, _ in done_pairs:
-            self._drain_finished(handle)
-            self._close_session(self._find_session(handle), finalize_process=False)
-
-        truly_cancelled: list[JobHandle] = []
-        for handle in pending_handles:
-            self._drain_finished(handle)
-            decoded = self._consume_result_if_present(handle)
-            if decoded is not None:
-                done_pairs.append((handle, decoded))
-            else:
-                truly_cancelled.append(handle)
-            self._close_session(self._find_session(handle), finalize_process=False)
-
-        return AbortOutcome(completed=done_pairs, cancelled=truly_cancelled)
-
     def cleanup_in_flight(self, handles: Sequence[JobHandle]) -> None:
         """主循环异常退出时取消未放行启动、终止并回收所有残留与在途会话。"""
         self.cancel_pending_launches()
-        with self._sessions_lock:
-            lingering = [
-                s for s in self._sessions.values()
-                if s.state is _SessionState.LINGERING
-            ]
-        for session in lingering:
-            try:
-                self._close_session(session, finalize_process=True, receiver_timeout=0.5)
-            except Exception as e:
-                logger.error(f"Error cleaning up lingering worker {session.session_key}: {e}")
+        self._cleanup_lingering_sessions(receiver_timeout=0.5, log_errors=True)
 
         for handle in handles:
             try:
@@ -1086,25 +1061,6 @@ class ExecutionChannel:
                     self._finalize_process(handle.process)
             except Exception as e:
                 logger.error(f"Error cleaning up in-flight job {handle.job_uid}: {e}")
-
-    def finalize_processes(self, handles: Sequence[JobHandle]) -> None:
-        """清理全部 lingering 会话，并对指定在途句柄执行 kill_tree + join + close。"""
-        with self._sessions_lock:
-            lingering = [
-                s for s in self._sessions.values()
-                if s.state is _SessionState.LINGERING
-            ]
-        for session in lingering:
-            try:
-                self._close_session(session, finalize_process=True, receiver_timeout=0.5)
-            except Exception:
-                pass
-
-        for handle in handles:
-            try:
-                self._finalize_process(handle.process)
-            except Exception as e:
-                logger.error(f"Error finalizing in-flight job {handle.job_uid}: {e}")
 
     def close(self) -> None:
         """关闭通道并回收所有准备中、在途与残留会话的进程和管道资源。"""
@@ -1120,7 +1076,6 @@ class ExecutionChannel:
 
 
 __all__ = [
-    "AbortOutcome",
     "ExecutionChannel",
     "ExecutionResult",
     "JobHandle",
