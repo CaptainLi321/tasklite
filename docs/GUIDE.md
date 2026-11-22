@@ -1,6 +1,6 @@
 # TaskLite 使用手册
 
-> 本文档是 TaskLite 3.0.0.dev0 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、Trigger 与恢复边界、`JobContext` 与统一文件声明授权、原子图修整运维（`TaskLite.edit()`），以及只读一致状态快照（`StateSnapshot`）与极简运维 CLI。项目概览与快速上手见 [`README.md`](../README.md)，公开 API 权威参考手册见 [`docs/API.md`](API.md)，架构决策记录见 [`docs/adr/`](adr/)。
+> 本文档是 TaskLite 3.0.0.dev1 的官方使用手册，系统定义公开导入面、Task / Job / Attempt 三层模型与数据库 Schema 6、Trigger 与恢复边界、`JobContext` 与统一文件声明授权、原子图修整运维（`TaskLite.edit()`），以及只读一致状态快照（`StateSnapshot`）与极简运维 CLI。项目概览与快速上手见 [`README.md`](../README.md)，公开 API 权威参考手册见 [`docs/API.md`](API.md)，架构决策记录见 [`docs/adr/`](adr/)。
 
 ---
 

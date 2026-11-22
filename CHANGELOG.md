@@ -6,6 +6,37 @@
 
 ## [Unreleased]
 
+## [3.0.0.dev1] - 2026-11-22
+
+3.0.0 的第二个开发预览版，完整落地 [ADR-0012](docs/adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md) 并完成核心引擎、跨平台进程树与存储层的深度架构收敛。
+
+### 新增
+
+- **原子图修整事务 `TaskLite.edit()`（ADR-0012）**：
+  - 提供 Run 外唯一的状态图增、删、演进替换与状态流转上下文管理器 `with pipeline.edit(dry_run=True, note=None) as tx:`，支持 `uid in tx`、`add`、`replace`、`replace_many`、`set_status`、`remove`、`tx.before`、`tx.after` 与 `tx.diff()`；
+  - 退出时执行单次全量攒错 4 项闭环校验（防删出新孤儿、活跃/成功/触碰节点零悬空依赖与迭代式无环、`from_output` 契约闭合、非执行 `"succeeded"` 物理产出在场）与 4 类只读 Warning，并在单写事务内原子落盘；
+  - 事务期间锁定同实例编辑态（拒绝块内重入 `enqueue`/`set_cursor`/`grant_authorization`/`run`/`close` 等操作）。
+- **Run 外显式路径预授权 `TaskLite.grant_authorization`**：与 `list_authorizations` / `revoke_authorization` 构成对称管理面，自动保护 `state_path` 及其 `-wal`/`-shm`/`-journal`/`.lock` 全部 5 项内部路径，拦截重复授权与父子类型冲突。
+- **`StateSnapshot` 拷贝模式与可读报告**：
+  - 扩展 `StateSnapshot.open(source, *, mode="lazy"|"copy")`（`"copy"` 模式于单一只读事务加载后立即释放 SQLite 句柄）；
+  - 新增 `StateSnapshot.report(first, second=None)` 输出四态计数、任务类型耗时统计、在途 ETA 及双快照增量对比。
+- **极简运维 CLI（`python -m tasklite`）**：新增 `status`、`set-status`、`remove` 三个子命令（`state_path` 必填、修改类命令默认 `dry_run` 预览并显式 `--apply` 落盘，前置只读探活拦截 0 字节空文件防建空库）。
+- **跨平台信号隔离与子进程树原子回收**：
+  - Windows 下支持 `SIGBREAK` 优雅排空、`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` 隐藏控制台隔离与零竞态绑定匿名 Job Object（`KILL_ON_JOB_CLOSE`，兼容 `venvlauncher.exe` 跳板）；POSIX 采用 `start_new_session=True` 与严格先 `killpg` 后 `wait`；
+  - 统一 `PathPolicy` 与 `WindowsFilesystemAdapter`（内核级钉锁父目录 + 原生重解析点/Junction 防护），修复 Windows `lockfile.py` 偏移与锁争用判定。
+
+### 变更（向后不兼容）
+
+- **移除旧管理接口与 `attempts` 删除路径**：从 `TaskLite` 移除 `set_job_status` 与 `clear_history`，彻底移除后端删除 `attempts` 行的一切路径（`attempts` 严格 append-only）。
+- **移除 `output_roots` 与零深度历史模块**：移除 `TaskLite(output_roots=...)`、空包 `tasklite/contrib/`、`tasklite/hooks.py`、`StateSnapshot.is_closed` 同义属性（保留 `.closed`），并将 `tasklite/triggers.py` 合并至 `tasklite/models/trigger.py`。
+- **测试辅助与环境变量调整**：自动授权环境变量更名为 `TASKLITE_DANGEROUS_AUTO_APPROVE`；`tasklite.testing.in_process_workers(target, launcher=None)` 升级为标准 `WorkerLauncher` 接缝（移除 `process_class` 兼容参数），并新增受控测试接缝 `cleanup_hook`、`observe_wait`、`FakeClock`、`monotonic_clock`。
+
+### 架构深化与修复
+
+- **轻量化子进程冷启动**：`tasklite/__init__.py` 改为 PEP 562 延迟导出（保持 `__all__` 10 项不变），子进程引导 `_worker_bootstrap` 零加载父进程调度与持久化树。
+- **核心引擎与存储层深化**：新增 `AuthorizationCoordinator` 收敛派发前/运行期/清理期三类授权等待状态机；新增 `models/records.py` 与 `models/graph.py` 建立快照档案与图算法单一事实源；收缩 `AbstractStateBackend` 并下沉双后端独占锁与共享前置校验；将 `ExecutionChannel` 整合为单一 `_ExecutionSession` 状态机与线性两阶段启动；清算引擎内 8 个单实现假想 `Protocol` 与退化的 `SelectionMachine` 转发壳（保留 `Exclude`、局部临时排除与 Kahn 停摆剥离）。
+- **修复**：修复 `StateStore.enqueue_job` 漏看遗留 `running` 作业导致的同 UID 配置冲突漏判与下游依赖误拒；修复 `StateSnapshot` 队列 `started_at` 投影缺失；收敛 `wrappers/http.py` 内部重复原语与纯读 WAL pragma，并将 `wrappers/discovery.py` 游标切换至 `jsonutil` 并落地全仓裸 `json` AST 静态门禁。
+
 ## [3.0.0.dev0] - 2026-11-12
 
 3.0.0 的首个开发预览版，尚非稳定正式版。

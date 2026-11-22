@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/CaptainLi321/tasklite/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/CaptainLi321/tasklite/actions/workflows/ci.yml)
 
-当前开发版本为 **3.0.0.dev0**，公开接口与兼容性说明见 [API 参考手册](docs/API.md)。
+当前开发版本为 **3.0.0.dev1**，公开接口与兼容性说明见 [API 参考手册](docs/API.md)。
 
 ---
 
