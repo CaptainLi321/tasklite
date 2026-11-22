@@ -35,7 +35,7 @@ from .resource import RunNotifier
 from .scheduler import JobScheduler
 from .session import RunSession
 from .store import StateStore
-from .types import ExecutionOptions, StepOutcome, StopMode
+from .types import ExecutionOptions, JobHandle, StepOutcome, StopMode
 from .wait import LoopFacts, decide_wait
 
 logger = logging.getLogger("tasklite")
@@ -91,7 +91,6 @@ class EngineRuntime:
         self._notifier: RunNotifier = RunNotifier()
         self._authorization = AuthorizationCoordinator(
             store=self.store,
-            channel=self.channel,
             in_flight=self._in_flight,
             session=self._session,
         )
@@ -127,12 +126,22 @@ class EngineRuntime:
         )
 
         self._is_running: bool = False
-        self.channel.set_declaration_handler(self._authorization.handle_declaration)
+        self.channel.set_declaration_handler(self._handle_declaration)
         self.channel.set_authorization_queries(
             is_timeout_paused=self._authorization.is_timeout_paused,
             get_outcome=self._authorization.get_declaration_outcome,
+            get_timeout_at=self._authorization.effective_timeout_at,
         )
         self.channel.set_wakeup_callback(self._notifier.notify)
+
+    def _handle_declaration(
+        self, handle: JobHandle, payload: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """驱动动态声明仲裁并将终止/回复指令交由执行通道落地。"""
+        action = self._authorization.handle_declaration(handle, payload)
+        if action.terminate:
+            self.channel.terminate_process(action.handle)
+        return action.reply
 
     @property
     def session(self) -> RunSession:
@@ -208,7 +217,8 @@ class EngineRuntime:
                 return self._session.stop_mode
             mode = self._session.request_stop()
         self.channel.cancel_pending_launches()
-        self._authorization.notify_stop()
+        for handle in self._authorization.notify_stop():
+            self.channel.terminate_process(handle)
         self._notifier.notify()
         return mode
 
@@ -348,7 +358,7 @@ class EngineRuntime:
     def _next_in_flight_wait(self) -> float | None:
         """返回最近执行超时；授权等待已暂停计时，不计入截止点。"""
         deadlines = [
-            handle.timeout_at_monotonic
+            self._authorization.effective_timeout_at(handle)
             for handle in self._in_flight.active_handles()
             if not self._authorization.is_timeout_paused(handle)
             and not self._authorization.has_pending_cleanup(handle.job_uid)
@@ -370,7 +380,13 @@ class EngineRuntime:
                 logger.info("Pipeline drained.")
                 return self._terminal_outcome()
 
-        self._authorization.poll_pending_declarations()
+        for action in self._authorization.poll_pending_declarations():
+            if action.terminate:
+                self.channel.terminate_process(action.handle)
+            if action.reply is not None:
+                self.channel.send_declaration_reply(
+                    action.handle.execution_id, action.reply
+                )
 
         if store.state.is_empty and not self._in_flight:
             return self._terminal_outcome()

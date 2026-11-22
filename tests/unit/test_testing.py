@@ -23,10 +23,13 @@ from tasklite.testing import (
     cleanup_hook,
     cursor_updates,
     fake_ctx,
+    get_resource,
     in_process_workers,
+    inject_resource,
     monotonic_clock,
     observe_wait,
     running,
+    seed_running_job,
     spawned_jobs,
 )
 from tasklite.models.trigger import BUILTIN_TRIGGER_FUNCTIONS
@@ -366,3 +369,39 @@ class TestAuthorizerAndInProcessWorkersHandles:
             clock.set(600.0)
             assert time.monotonic() == 600.0
         assert time.monotonic() >= before
+
+    def test_resource_and_seed_running_job_helpers(self):
+        from tasklite.resource import CapacityResource as PublicCapacity
+
+        with TaskLite(backend="memory") as pipeline:
+            pipeline.register_resource(PublicCapacity("disk", max_capacity=2.0))
+            disk = get_resource(pipeline, "disk")
+            assert disk.max_capacity == 2.0
+
+            replacement = CapacityResource("disk", max_capacity=5.0)
+            with inject_resource(pipeline, "disk", replacement) as injected:
+                assert injected is replacement
+                assert get_resource(pipeline, "disk") is replacement
+            assert get_resource(pipeline, "disk") is disk
+
+            extra = CapacityResource("ephemeral", max_capacity=1.0)
+            with inject_resource(pipeline, "ephemeral", extra):
+                assert get_resource(pipeline, "ephemeral") is extra
+            with pytest.raises(KeyError):
+                get_resource(pipeline, "ephemeral")
+
+            pipeline.register_task("echo", _echo_worker_handler)
+            pipeline.enqueue(Job("echo", "r1"))
+            attempt_no = seed_running_job(
+                pipeline,
+                "echo::r1",
+                execution_id="run_seed.1",
+                run_id="run_seed",
+                started_at="2026-09-01T00:00:00Z",
+            )
+            assert attempt_no == 1
+            with StateSnapshot.open(pipeline) as snap:
+                row = snap.get_job("echo::r1")
+                assert row is not None and row["status"] == "running"
+                assert row["run_id"] == "run_seed"
+                assert row["attempt_no"] == 1

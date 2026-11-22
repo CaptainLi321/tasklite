@@ -253,7 +253,6 @@ class TestAbortInFlight:
         in_flight = InFlightTracker()
         authorization = AuthorizationCoordinator(
             store=store,
-            channel=channel,
             in_flight=in_flight,
             session=session,
         )

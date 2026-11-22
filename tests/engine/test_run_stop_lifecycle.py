@@ -26,7 +26,14 @@ from tasklite.engine.types import ExecutionOptions, StopMode
 from tasklite.models.job import Job
 from tasklite.models.result import TaskResult
 from tasklite.pipeline import TaskLite
-from tasklite.testing import authorizer, in_process_workers, observe_wait, running
+from tasklite.testing import (
+    authorizer,
+    get_resource,
+    in_process_workers,
+    inject_resource,
+    observe_wait,
+    running,
+)
 
 
 # ── 模块级 handler（真实跨进程协作）─────────────────────────────────────
@@ -284,7 +291,7 @@ def test_stop_in_initial_authorizer_keeps_job_pending(tmp_path, monkeypatch):
     effect = tmp_path / "effect.txt"
     with TaskLite(backend="sqlite", state_path=tmp_path / "state.db") as pipeline:
         pipeline.register_resource(CapacityResource("disk", max_capacity=1))
-        capacity = pipeline._resources["disk"]
+        capacity = get_resource(pipeline, "disk")
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job(
             "work", "one", payload={"effect": str(effect)},
@@ -314,7 +321,7 @@ def test_stop_between_pop_and_running_mark_requeues_without_attempt(
         backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
     ) as pipeline:
         pipeline.register_resource(CapacityResource("disk", max_capacity=1))
-        capacity = pipeline._resources["disk"]
+        capacity = get_resource(pipeline, "disk")
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
 
@@ -348,7 +355,7 @@ def test_stop_after_running_mark_rolls_back_without_spawning(
         backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
     ) as pipeline:
         pipeline.register_resource(CapacityResource("disk", max_capacity=1))
-        capacity = pipeline._resources["disk"]
+        capacity = get_resource(pipeline, "disk")
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
 
@@ -381,24 +388,31 @@ def test_stop_inside_dispatch_log_prevents_worker_launch(tmp_path, monkeypatch):
         backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
     ) as pipeline:
         pipeline.register_resource(CapacityResource("disk", max_capacity=1))
-        capacity = pipeline._resources["disk"]
+        capacity = get_resource(pipeline, "disk")
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
 
-        import tasklite.engine.dispatch as dispatch_module
+        import logging
 
-        original_info = dispatch_module.logger.info
         stop_fired = False
+        tasklite_logger = logging.getLogger("tasklite")
 
-        def stop_during_run_log(message, *args, **kwargs):
-            nonlocal stop_fired
-            if message == "RUN: work::one" and not stop_fired:
-                stop_fired = True
-                pipeline.stop()
-            return original_info(message, *args, **kwargs)
+        class _StopOnRunLogHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                nonlocal stop_fired
+                if record.getMessage() == "RUN: work::one" and not stop_fired:
+                    stop_fired = True
+                    pipeline.stop()
 
-        monkeypatch.setattr(dispatch_module.logger, "info", stop_during_run_log)
-        pipeline.run()
+        handler = _StopOnRunLogHandler(level=logging.INFO)
+        previous_level = tasklite_logger.level
+        tasklite_logger.setLevel(logging.INFO)
+        tasklite_logger.addHandler(handler)
+        try:
+            pipeline.run()
+        finally:
+            tasklite_logger.removeHandler(handler)
+            tasklite_logger.setLevel(previous_level)
 
         assert stop_fired
         with StateSnapshot.open(pipeline) as snapshot:
@@ -418,7 +432,7 @@ def test_stop_before_process_start_prevents_worker_launch(tmp_path):
         backend="sqlite", state_path=tmp_path / "state.db", max_workers=1
     ) as pipeline:
         pipeline.register_resource(CapacityResource("disk", max_capacity=1))
-        capacity = pipeline._resources["disk"]
+        capacity = get_resource(pipeline, "disk")
         pipeline.register_task("work", write_effect_handler, resources={"disk": 1})
         pipeline.enqueue(Job("work", "one", payload={"effect": str(effect)}))
 
@@ -646,7 +660,6 @@ def test_stop_from_another_thread_wakes_scheduler_wait():
     """另线程调用 stop() 能立即解除主循环等待。"""
     p = TaskLite(backend="memory")
 
-    p._resources["gate"] = NeverAvailableResource("gate", max_capacity=1.0)
     p.register_task("t_wait", success_handler, resources={"gate": 1.0})
     p.enqueue(Job("t_wait", "j1", resources={"gate": 1.0}))
 
@@ -658,16 +671,17 @@ def test_stop_from_another_thread_wakes_scheduler_wait():
             p.run(install_signals=False)
         run_finished.set()
 
-    t = threading.Thread(target=run_worker)
-    t.start()
-    assert wait_entered.wait(5.0)
+    with inject_resource(p, "gate", NeverAvailableResource("gate", max_capacity=1.0)):
+        t = threading.Thread(target=run_worker)
+        t.start()
+        assert wait_entered.wait(5.0)
 
-    t0 = time.monotonic()
-    p.stop()
-    assert run_finished.wait(2.0)
-    elapsed = time.monotonic() - t0
-    assert elapsed < 1.0
-    t.join(timeout=2.0)
+        t0 = time.monotonic()
+        p.stop()
+        assert run_finished.wait(2.0)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0
+        t.join(timeout=2.0)
 
 
 def test_run_waits_for_settled_worker_process_exit(tmp_path):

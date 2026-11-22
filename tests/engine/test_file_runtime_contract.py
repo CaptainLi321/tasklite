@@ -22,7 +22,7 @@ from tasklite import (
     TaskResult,
 )
 from tasklite.resource import CapacityResource
-from tasklite.testing import authorizer, cleanup_hook, in_process_workers
+from tasklite.testing import authorizer, cleanup_hook, get_resource, in_process_workers
 
 
 def _producer_handler(job, ctx):
@@ -495,7 +495,7 @@ def test_mark_running_failure_keeps_file_and_worker_unstarted(tmp_path, monkeypa
     assert target.read_text(encoding="utf-8") == "valuable"
     assert _snapshot_map(p)["work::one"]["status"] == "pending"
     assert _attempts(p, "work::one") == []
-    assert p._resources["__workers__"].used == 0.0
+    assert get_resource(p, "__workers__").used == 0.0
     p.close()
 
 
@@ -515,8 +515,8 @@ def test_worker_start_failure_releases_resources_after_running_commit(tmp_path, 
             p.run(install_signals=False)
 
     assert not marker.exists()
-    assert p._resources["slot"].used == 0.0
-    assert p._resources["__workers__"].used == 0.0
+    assert get_resource(p, "slot").used == 0.0
+    assert get_resource(p, "__workers__").used == 0.0
     assert _snapshot_map(p)["work::one"]["status"] == "running"
     assert _attempts(p, "work::one") == []
     p.close()
@@ -562,7 +562,7 @@ def test_pre_dispatch_authorization_waits_without_holding_resources(tmp_path, mo
     target.write_text("valuable")
     p = TaskLite(backend="memory", max_workers=2)
     p.register_resource(CapacityResource("disk", max_capacity=1))
-    resource = p._resources["disk"]
+    resource = get_resource(p, "disk")
     p.register_task("independent", _noop_handler)
     p.register_task("protected", _noop_handler, resources={"disk": 1})
     calls = []

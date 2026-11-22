@@ -26,7 +26,7 @@ from tasklite.exceptions import TaskLiteError
 from tasklite.models.context import JobContext
 from tasklite.models.result import TaskResult
 from tasklite.models.state import DependencyStatus, PipelineState
-from tasklite.testing import in_process_workers
+from tasklite.testing import in_process_workers, inject_resource
 
 
 def ok_handler(job, ctx):
@@ -277,13 +277,13 @@ def test_exclude_validation_and_rejection_of_multiple_rules(tmp_path):
 def test_excluded_job_does_not_consume_resources(fake_process, tmp_path):
     pipeline = _pipeline(tmp_path)
     gpu = CountingResource()
-    pipeline._resources["gpu"] = gpu
     pipeline.register_task("heavy", ok_handler, resources={"gpu": 1.0})
     pipeline.register_task("light", ok_handler)
     pipeline.enqueue(Job("heavy", "h"))
     pipeline.enqueue(Job("light", "l"))
 
-    pipeline.run(exclude=Exclude(task_type="heavy"))
+    with inject_resource(pipeline, "gpu", gpu):
+        pipeline.run(exclude=Exclude(task_type="heavy"))
 
     assert len(_succeeded_uids(pipeline)) == 1
     assert gpu.acquires == 0 and gpu.used == 0.0

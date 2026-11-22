@@ -13,7 +13,9 @@
 """
 from __future__ import annotations
 
+from contextlib import closing
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,7 @@ import pytest
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskLiteError, TaskResult
 from tasklite.backend.base import GraphEditCommit
 from tasklite.edit import EditTransaction
-from tasklite.testing import in_process_workers, running
+from tasklite.testing import in_process_workers, running, seed_running_job
 from tasklite.utils.lockfile import release_lock, try_acquire_lock
 
 
@@ -703,9 +705,8 @@ class TestLegacyRunningRecoveryInEdit:
             p.register_task("t", _ok_handler)
             p.enqueue(Job("t", "target"))
             p.enqueue(Job("t", "untouched"))
-            backend = p._runtime.store.backend
-            backend.mark_job_running("t::target", execution_id="r_old.1", run_id="r_old", started_at="2026-01-01T00:00:00Z")
-            backend.mark_job_running("t::untouched", execution_id="r_old.2", run_id="r_old", started_at="2026-01-01T00:00:01Z")
+            seed_running_job(p, "t::target", execution_id="r_old.1", run_id="r_old", started_at="2026-01-01T00:00:00Z")
+            seed_running_job(p, "t::untouched", execution_id="r_old.2", run_id="r_old", started_at="2026-01-01T00:00:01Z")
 
             with p.edit(dry_run=False, note="recover running") as tx:
                 if op == "set_pending":
@@ -747,8 +748,8 @@ class TestLegacyRunningRecoveryInEdit:
         with _make_pipeline(backend_kind, tmp_path) as p:
             p.register_task("t", _ok_handler)
             p.enqueue(Job("t", "multi"))
-            p._runtime.store.backend.mark_job_running(
-                "t::multi", execution_id="r1.1", run_id="r1", started_at="2026-01-01T00:00:00Z"
+            seed_running_job(
+                p, "t::multi", execution_id="r1.1", run_id="r1", started_at="2026-01-01T00:00:00Z"
             )
 
             with p.edit(dry_run=False) as tx:
@@ -769,10 +770,10 @@ class TestLegacyRunningRecoveryInEdit:
         with TaskLite(backend="sqlite", state_path=db_path) as p:
             p.register_task("t", _ok_handler)
             p.enqueue(Job("t", "bad"))
-            backend = p._runtime.store.backend
-            backend.mark_job_running("t::bad", execution_id="r1.1", run_id="r1", started_at="2026-01-01T00:00:00Z")
-            with backend._get_conn() as conn:  # type: ignore[attr-defined]
-                conn.execute("UPDATE job_sequences SET last_attempt_no = 99 WHERE job_uid = 't::bad'")
+            seed_running_job(p, "t::bad", execution_id="r1.1", run_id="r1", started_at="2026-01-01T00:00:00Z")
+            with closing(sqlite3.connect(db_path)) as conn:
+                with conn:
+                    conn.execute("UPDATE job_sequences SET last_attempt_no = 99 WHERE job_uid = 't::bad'")
 
             with p.edit(dry_run=False) as tx:
                 with pytest.raises(TaskLiteError, match="Invariant conflict"):
@@ -934,8 +935,9 @@ class TestSnapshotsDiffLifecycleAndMutex:
             p2.register_task("t", _ok_handler)
             with p2.edit(dry_run=False) as tx:
                 tx.add(Job("t", "dup"), status="succeeded")
-            with p2._runtime.store.backend._get_conn() as conn:  # type: ignore[attr-defined]
-                conn.execute("INSERT INTO failed (job_uid, metadata) VALUES ('t::dup', '{}')")
+            with closing(sqlite3.connect(overlap_db)) as conn:
+                with conn:
+                    conn.execute("INSERT INTO failed (job_uid, metadata) VALUES ('t::dup', '{}')")
             with pytest.raises(TaskLiteError, match="Invariant conflict"):
                 with p2.edit(dry_run=True):
                     pass

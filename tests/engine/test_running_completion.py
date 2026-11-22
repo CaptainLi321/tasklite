@@ -7,7 +7,13 @@ import pytest
 
 from tasklite import FileSpec, Job, StateSnapshot, TaskLite, TaskResult
 from tasklite.resource import CapacityResource
-from tasklite.testing import authorizer, cleanup_hook, in_process_workers
+from tasklite.testing import (
+    authorizer,
+    cleanup_hook,
+    get_resource,
+    in_process_workers,
+    inject_resource,
+)
 
 
 def _success(job, ctx):
@@ -22,7 +28,7 @@ def test_pre_delete_failure_uses_one_completion(tmp_path, monkeypatch, fault):
     target.write_text("business", encoding="utf-8")
     pipeline = TaskLite(backend="memory")
     pipeline.register_resource(CapacityResource("disk", max_capacity=1))
-    capacity = pipeline._resources["disk"]
+    capacity = get_resource(pipeline, "disk")
     pipeline.register_task("work", _success, resources={"disk": 1})
     job = Job("work", "one", files={
         "target": FileSpec(target, role="cache", delete_existing=True, delete_on_failure=True),
@@ -111,7 +117,7 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
     target.write_text("business", encoding="utf-8")
     pipeline = TaskLite(backend="memory")
     pipeline.register_resource(CapacityResource("disk", max_capacity=1))
-    capacity = pipeline._resources["disk"]
+    capacity = get_resource(pipeline, "disk")
     pipeline.register_task("work", _success, resources={"disk": 1})
     pipeline.enqueue(Job("work", "one", files={
         "target": FileSpec(target, role="cache", delete_existing=stage == "pre_delete_framework", delete_on_failure=True),
@@ -177,25 +183,42 @@ def test_launch_framework_fault_preserves_running_without_completion(tmp_path, m
                 on_abort=_abort,
             )
 
+    class _FailingPrepareLauncher(WorkerLauncher):
+        def prepare(self, spec, *, on_message, cancel_event):
+            if stage == "context":
+                # 验证冷启动中途建立管道后出错也能完整回收并返回原始异常
+                receiver, sender = create_worker_pipe(
+                    job_uid=spec.job.uid,
+                    execution_id=spec.execution_id,
+                    run_id=spec.run_id or None,
+                    attempt_no=spec.attempt_no,
+                    on_message=on_message,
+                )
+                try:
+                    raise error
+                finally:
+                    sender.close()
+                    receiver.close(timeout=2.0)
+            raise error
+
     def guarded_delete(_orig, *args, allow_broken_leaf_symlink=False, **kwargs):
         if stage == "pre_delete_framework" and allow_broken_leaf_symlink:
             raise error
         cleanup.append(args)
 
     monkeypatch.setattr(runtime._completion, "complete_job", lambda *args, **kwargs: completed.append(args))
-    launcher = _FailingReleaseLauncher() if stage == "process_start" else None
+    launcher = (
+        _FailingReleaseLauncher()
+        if stage == "process_start"
+        else (_FailingPrepareLauncher() if stage in ("context", "spawn", "interrupt") else None)
+    )
     with (
         in_process_workers(pipeline, launcher),
         authorizer(pipeline, lambda path, kind: True),
+        cleanup_hook(pipeline, guarded_delete),
     ):
-        if stage in ("context", "interrupt"):
-            monkeypatch.setattr(runtime._dispatch, "_build_context", fail)
-        elif stage == "spawn":
-            monkeypatch.setattr(runtime.channel, "prepare_spawn", fail)
-
-        with cleanup_hook(pipeline, guarded_delete):
-            with pytest.raises(type(error)) as caught:
-                pipeline.run(install_signals=False)
+        with pytest.raises(type(error)) as caught:
+            pipeline.run(install_signals=False)
         assert caught.value is error
         with StateSnapshot.open(pipeline) as snap:
             running_row = snap.get_job("work::one")
@@ -308,7 +331,7 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
     target.write_text("business", encoding="utf-8")
     pipeline = TaskLite(backend="memory")
     pipeline.register_resource(CapacityResource("disk", max_capacity=1))
-    capacity = pipeline._resources["disk"]
+    capacity = get_resource(pipeline, "disk")
     pipeline.register_task("work", _success, resources={"disk": 1})
     pipeline.enqueue(Job("work", "one", files={
         "target": FileSpec(target, role="cache", delete_existing=True, delete_on_failure=True),
@@ -324,14 +347,7 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
             pipeline.stop()
         return res
 
-    original_context = runtime._dispatch._build_context
-
-    def context(*args, **kwargs):
-        result = original_context(*args, **kwargs)
-        pipeline.stop()
-        return result
-
-    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher
+    from tasklite.engine.launcher import PreparedWorker, WorkerLauncher, _WorkerLaunchCancelled
     from tasklite.utils.ipc import create_worker_pipe, create_worker_reply_pipe
 
     class _NoopHandle:
@@ -354,6 +370,8 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
     class _StopOnPrepareLauncher(WorkerLauncher):
         def prepare(self, spec, *, on_message, cancel_event):
             pipeline.stop()
+            if stage == "context":
+                raise _WorkerLaunchCancelled("stop requested during worker preparation")
             receiver, sender = create_worker_pipe(
                 job_uid=spec.job.uid,
                 execution_id=spec.execution_id,
@@ -386,11 +404,9 @@ def test_stop_before_worker_start_rolls_back_without_result(tmp_path, monkeypatc
         releases.append(amount)
         return original_release(amount)
 
-    if stage == "context":
-        monkeypatch.setattr(runtime._dispatch, "_build_context", context)
     monkeypatch.setattr(runtime._completion, "complete_job", lambda *args, **kwargs: completed.append(args))
     monkeypatch.setattr(capacity, "release", release)
-    launcher = _StopOnPrepareLauncher() if stage == "process" else None
+    launcher = _StopOnPrepareLauncher() if stage in ("context", "process") else None
     with (
         in_process_workers(pipeline, launcher),
         cleanup_hook(pipeline, delete_then_stop),
@@ -435,21 +451,21 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
     later_name = "later" if fault_name == "fault" else "fault"
     pipeline = TaskLite(backend="memory", max_workers=3)
     pipeline.register_resource(CapacityResource("disk", max_capacity=3))
-    capacity = pipeline._resources["disk"]
+    capacity = get_resource(pipeline, "disk")
     pipeline.register_task("work", _replace_cache_with_directory, resources={"disk": 1})
     pipeline.enqueue(Job("work", "committed"))
     for name in ("fault", "later"):
         target = tmp_path / name
         target.write_text("initial", encoding="utf-8")
         pipeline.enqueue(Job("work", name, files={
-            "cache": FileSpec(target, role="cache", delete_on_success=True),
+            "cache": FileSpec(target, role="output", delete_on_success=True),
         }))
     runtime = pipeline._runtime
     completion = runtime._completion
     store = runtime.store.backend
     original_reap = runtime.channel.reap_completed
     original_settle = completion.settle_reaped
-    original_prepare = completion._prepare_completion
+    original_inspect = runtime.store.path_policy.adapter.inspect_entry
     original_release = runtime.config.resources.release_all
     original_commit = store.commit_job_settlement
     held = {}
@@ -491,10 +507,10 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
         armed.append(True)
         return original_settle([pairs[name] for name in ("fault", "later") if name not in cached])
 
-    def prepare(uid, *args, **kwargs):
-        if armed and stage == "prepare" and uid == "work::" + fault_name:
+    def inspect_entry(path):
+        if armed and stage == "prepare" and Path(path).name == fault_name:
             fail()
-        return original_prepare(uid, *args, **kwargs)
+        return original_inspect(path)
 
     def release(*args, **kwargs):
         uid = kwargs["job_uid"]
@@ -518,7 +534,7 @@ def test_completion_framework_fault_stops_batch_and_cached_results(
 
     monkeypatch.setattr(runtime.channel, "reap_completed", reap)
     monkeypatch.setattr(completion, "settle_reaped", settle)
-    monkeypatch.setattr(completion, "_prepare_completion", prepare)
+    monkeypatch.setattr(runtime.store.path_policy.adapter, "inspect_entry", inspect_entry)
     monkeypatch.setattr(runtime.config.resources, "release_all", release)
     monkeypatch.setattr(store, "commit_job_settlement", commit)
     with in_process_workers(pipeline), authorizer(pipeline, authorize):
@@ -573,7 +589,7 @@ def test_running_snapshot_projects_queue_started_at_until_settlement(tmp_path, m
     backend = "sqlite" if stage in ("resource", "pre_delete") else "memory"
     with TaskLite(backend=backend, state_path=db_path if backend == "sqlite" else None) as pipeline, ExitStack() as snapshots:
         pipeline.register_resource(CapacityResource("disk", max_capacity=1))
-        capacity = pipeline._resources["disk"]
+        capacity = get_resource(pipeline, "disk")
         pipeline.register_task("work", _replace_cache_with_directory, resources={"disk": 1})
         pipeline.enqueue(Job("work", "committed", files={
             "cache": FileSpec(target, role="cache", delete_existing=True),
@@ -614,15 +630,22 @@ def test_running_snapshot_projects_queue_started_at_until_settlement(tmp_path, m
                 running_snapshots.append((snapshot, current))
 
         from tasklite.engine.launcher import PreparedWorker
+        from tasklite.engine.resource import CapacityResource as InternalCapacityResource
         from tasklite.testing import InProcessWorkerLauncher
 
         class _TrackingLauncher(InProcessWorkerLauncher):
             def prepare(self, spec, *, on_message, cancel_event):
+                if stage == "context":
+                    record_running_snapshot()
+                    clock[0] = launch_time
                 prepared = super().prepare(
                     spec,
                     on_message=on_message,
                     cancel_event=cancel_event,
                 )
+                if stage == "process":
+                    record_running_snapshot()
+                    clock[0] = launch_time
                 orig_release = prepared._on_release
 
                 def tracked_release():
@@ -638,22 +661,27 @@ def test_running_snapshot_projects_queue_started_at_until_settlement(tmp_path, m
                     on_abort=prepared.abort,
                 )
 
-        tracking_launcher = _TrackingLauncher()
-        with in_process_workers(pipeline, tracking_launcher):
-            owner, name = {
-                "resource": (capacity, "acquire"),
-                "pre_delete": (runtime.store.path_policy.adapter, "delete_target"),
-                "context": (runtime._dispatch, "_build_context"),
-                "process": (tracking_launcher, "prepare"),
-            }[stage]
-            original = getattr(owner, name)
-
-            def prepare(*args, **kwargs):
+        class _ObservingCapacity(InternalCapacityResource):
+            def acquire(self, amount: float) -> None:
                 record_running_snapshot()
-                result = original(*args, **kwargs)
+                super().acquire(amount)
                 clock[0] = launch_time
-                return result
 
+        def tracked_delete(original_delete, path, *args, **kwargs):
+            if stage == "pre_delete":
+                record_running_snapshot()
+            result = original_delete(path, *args, **kwargs)
+            if stage == "pre_delete":
+                clock[0] = launch_time
+            return result
+
+        tracking_launcher = _TrackingLauncher()
+        observed_capacity = _ObservingCapacity("disk", max_capacity=1) if stage == "resource" else capacity
+        with (
+            in_process_workers(pipeline, tracking_launcher),
+            inject_resource(pipeline, "disk", observed_capacity),
+            cleanup_hook(pipeline, tracked_delete),
+        ):
             original_commit = runtime.store.backend.commit_job_settlement
 
             def commit(*args, **kwargs):
@@ -661,7 +689,6 @@ def test_running_snapshot_projects_queue_started_at_until_settlement(tmp_path, m
                 return original_commit(*args, **kwargs)
 
             monkeypatch.setattr(runtime.store.backend, "commit_job_settlement", commit)
-            monkeypatch.setattr(owner, name, prepare)
             monkeypatch.setattr(dispatch, "utc_now_iso", lambda: clock[0])
             monkeypatch.setattr("tasklite.engine.launcher.utc_now_iso", lambda: clock[0])
             with authorizer(pipeline, lambda path, kind: True):
@@ -669,7 +696,7 @@ def test_running_snapshot_projects_queue_started_at_until_settlement(tmp_path, m
 
         assert starts == [launch_time]
         assert not target.exists()
-        assert capacity.used == 0
+        assert observed_capacity.used == 0
         row, = identities
         assert row["started_at"] == "2026-11-10T00:00:00Z"
         for source in sources:

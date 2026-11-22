@@ -16,6 +16,7 @@ import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import TriggerRegistry
+from tasklite.engine.authorization import AuthorizationCoordinator
 from tasklite.engine.channel import ExecutionChannel, ExecutionResult
 from tasklite.engine.completion import CompletionMachine
 
@@ -27,7 +28,7 @@ from tasklite.engine.resource import (
 )
 from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
-from tasklite.testing import authorizer
+from tasklite.testing import authorizer, cleanup_hook
 from tasklite.engine.types import JobHandle
 from tasklite.models.artifact import FileSpec
 from tasklite.models.job import Job
@@ -70,12 +71,18 @@ class CompletionEnv:
         self.session.begin("b" * 32)
         self.in_flight = InFlightTracker()
         self.channel = ExecutionChannel()
+        self.authorization = AuthorizationCoordinator(
+            store=self.store,
+            in_flight=self.in_flight,
+            session=self.session,
+        )
         self.completion = CompletionMachine(
             store=self.store,
             channel=self.channel,
             resources=self.resources,
             in_flight=self.in_flight,
             session=self.session,
+            authorization=self.authorization,
         )
 
     def register_task(self, task_type: str) -> None:
@@ -172,7 +179,7 @@ class TestCompleteJobSuccess:
         assert env.resources["gpu"].used == 2.0
 
         result = ExecutionResult(success=True, result_metadata={"score": 100})
-        with authorizer(env.store, lambda *_args: True):
+        with authorizer(env.authorization, lambda *_args: True):
             env.completion.complete_job(entry, result)
 
         assert env.resources["gpu"].used == 0.0
@@ -224,7 +231,7 @@ class TestCompleteJobFailure:
         identity = env.start_execution(job)
         entry = env.track_entry(job, **identity)
 
-        with authorizer(env.store, lambda *_args: True):
+        with authorizer(env.authorization, lambda *_args: True):
             env.completion.complete_job(
                 entry, ExecutionResult(success=False, message="boom", result_metadata={"error_message": "业务错误"})
             )
@@ -642,7 +649,7 @@ def test_successful_directory_cleanup_precedes_success_transaction(tmp_path, mon
         return commit(*args, **kwargs)
 
     monkeypatch.setattr(env.backend, "commit_job_settlement", commit_after_cleanup)
-    with authorizer(env.store, lambda *_args: True):
+    with authorizer(env.authorization, lambda *_args: True):
         env.completion.complete_job(entry, ExecutionResult(success=True))
     assert job.uid in env.backend.load_successes()
     assert env.backend.load_successes()[job.uid]["artifacts"] == {
@@ -669,11 +676,9 @@ def test_cleanup_failure_settles_attempt_failure(tmp_path, monkeypatch, success)
     )
     entry = env.track_entry(job, **env.start_execution(job))
 
-    def fail_cleanup(*args, **kwargs):
-        raise PermissionError("cleanup unavailable")
-
-    monkeypatch.setattr(env.store.path_policy.adapter, "delete_target", fail_cleanup)
-    with authorizer(env.store, lambda *_args: True):
+    with cleanup_hook(env.store, PermissionError("cleanup unavailable")), authorizer(
+        env.authorization, lambda *_args: True
+    ):
         env.completion.complete_job(entry, ExecutionResult(success=success))
     assert env.backend.load_successes() == {}
     assert "cleanup unavailable" in env.backend.load_failed()[job.uid]["error_message"]
@@ -697,11 +702,12 @@ def test_abort_does_not_request_or_execute_cleanup(tmp_path, monkeypatch):
         for name in ("one", "two")
     ]
 
-    def denied(*args, **kwargs):
+    def denied(*_args, **_kwargs):
         pytest.fail("异常退出不能补执行文件清理")
 
-    monkeypatch.setattr(env.store.path_policy.adapter, "delete_target", denied)
-    with authorizer(env.store, lambda *_args: pytest.fail("异常退出不能发起授权")):
+    with cleanup_hook(env.store, denied), authorizer(
+        env.authorization, lambda *_args: pytest.fail("异常退出不能发起授权")
+    ):
         env.completion.discard_in_flight()
     assert not env.in_flight
     assert not env.store.state.in_flight_uids
@@ -772,16 +778,14 @@ def test_retry_cleanup_failure_settles_failure_without_retry(tmp_path, monkeypat
     )
     entry = env.track_entry(job, **env.start_execution(job))
 
-    def denied(*args, **kwargs):
-        raise PermissionError("cleanup denied")
-
-    monkeypatch.setattr(env.store.path_policy.adapter, "delete_target", denied)
     result = ExecutionResult(
         retry_requested=True,
         message="business failure",
         consume_budget=True,
     )
-    with authorizer(env.store, lambda *_args: True):
+    with cleanup_hook(env.store, PermissionError("cleanup denied")), authorizer(
+        env.authorization, lambda *_args: True
+    ):
         env.completion.complete_job(entry, result)
     assert result.will_retry is False
     assert env.store.state.queue == []
@@ -812,11 +816,9 @@ def test_reaped_batch_finishes_other_result_after_cleanup_error(tmp_path, monkey
     for job in (first, second):
         env.track_entry(job, **env.start_execution(job))
 
-    def denied(*args, **kwargs):
-        raise PermissionError("cleanup denied")
-
-    monkeypatch.setattr(env.store.path_policy.adapter, "delete_target", denied)
-    with authorizer(env.store, lambda *_args: True):
+    with cleanup_hook(env.store, PermissionError("cleanup denied")), authorizer(
+        env.authorization, lambda *_args: True
+    ):
         settled = env.completion.settle_reaped([
                 (env.make_handle(first.uid), ExecutionResult(success=False)),
                 (env.make_handle(second.uid), ExecutionResult(success=True)),

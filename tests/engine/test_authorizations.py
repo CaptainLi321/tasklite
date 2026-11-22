@@ -26,7 +26,13 @@ from tasklite import (
 )
 from tasklite.resource import CapacityResource
 from tasklite.testing import authorizer as inject_authorizer
-from tasklite.testing import cleanup_hook, in_process_workers, observe_wait, running
+from tasklite.testing import (
+    cleanup_hook,
+    in_process_workers,
+    inject_resource,
+    observe_wait,
+    running,
+)
 
 
 def _quick_handler(job, ctx):
@@ -392,24 +398,23 @@ def test_directory_authorization_reusable_and_subpath_revocation(tmp_path, monke
     p.register_task("dir_task", _dir_handler)
     p.enqueue(Job("dir_task", "d1"))
 
-    with in_process_workers(p), inject_authorizer(p, None) as store:
+    with in_process_workers(p), inject_authorizer(p, None):
         p.run(install_signals=False)
         assert "dir_task::d1" not in _jobs_by_status(p, "succeeded")
-        store.record_authorization(dir_path, "directory")
+    p.grant_authorization(dir_path, target_type="directory")
     assert any(a["path"] == str(dir_path) and a["target_type"] == "directory" for a in p.list_authorizations())
     p.close()
 
     reopened = TaskLite(backend="sqlite", state_path=tmp_path / "t_dir_auth.db")
     reopened.register_task("dir_task", _dir_handler)
     assert reopened.revoke_authorization(sub_file) is False
-    with in_process_workers(reopened), inject_authorizer(reopened, None) as store:
-        assert store.is_path_authorized(sub_file) is True
+    with in_process_workers(reopened), inject_authorizer(reopened, None):
+        assert reopened._runtime.store.is_path_authorized(sub_file) is True
         reopened.run(install_signals=False)
     assert "dir_task::d1" in _jobs_by_status(reopened, "succeeded")
 
     assert reopened.revoke_authorization(dir_path) is True
-    with inject_authorizer(reopened, None) as store:
-        assert store.is_path_authorized(sub_file) is False
+    assert reopened._runtime.store.is_path_authorized(sub_file) is False
     reopened.close()
 
 
@@ -538,7 +543,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
             ))
             super().release(amount)
 
-    p._resources["slot"] = ObservingCapacity("slot", max_capacity=1.0)
+    slot_resource = ObservingCapacity("slot", max_capacity=1.0)
     auth = _BlockingAuthorizer()
     p.register_task("waiting", _declare_then_write_handler)
     p.register_task("quick", _wait_for_gate_then_quick_handler)
@@ -559,7 +564,7 @@ def test_stop_during_authorization_wait_records_stopped_reason_without_exclusion
         except BaseException as exc:
             errors.append(exc)
 
-    with inject_authorizer(p, auth):
+    with inject_resource(p, "slot", slot_resource), inject_authorizer(p, auth):
         runner = threading.Thread(target=run_pipeline)
         runner.start()
         try:
@@ -694,8 +699,7 @@ def test_auto_approve_persists_actual_path_and_forbids_protected_roots(tmp_path,
     # bad_task 动态声明受保护路径会被强制终止，需真实子进程
     reopened.run(install_signals=False)
     assert "bad_task::b1" not in _jobs_by_status(reopened, "succeeded")
-    with inject_authorizer(reopened, None) as store:
-        assert not store.is_path_authorized(state_path)
+    assert not reopened._runtime.store.is_path_authorized(state_path)
     reopened.close()
 
 
@@ -709,8 +713,7 @@ def test_list_and_revoke_authorizations_surface_and_run_guard(tmp_path, monkeypa
 
     assert p.list_authorizations() == []
 
-    with inject_authorizer(p, None) as store:
-        store.record_authorization(f1, "file")
+    p.grant_authorization(f1, target_type="file")
     records = p.list_authorizations()
     assert len(records) == 1
     rec = records[0]
@@ -888,9 +891,9 @@ def test_broken_symlink_preparation_authorizes_and_removes_only_the_link(
             "work", "one", payload={"spec": spec.to_dict()},
             files={"target": spec} if declaration == "static" else {},
         ))
-        with in_process_workers(p), inject_authorizer(p, lambda *args: calls.append(args) or True) as store:
+        with in_process_workers(p), inject_authorizer(p, lambda *args: calls.append(args) or True):
             p.run(install_signals=False)
-            assert not store.is_path_authorized(missing)
+            assert not p._runtime.store.is_path_authorized(missing)
         assert calls == [(str(link), "file")]
         authorization, = p.list_authorizations()
         assert authorization["path"] == str(link)
@@ -1656,25 +1659,14 @@ def test_cross_thread_stop_during_declaration_pre_delete_does_not_overwrite_stop
 
         delete_entered = threading.Event()
         stop_completed = threading.Event()
-        observed_replies: list[dict | None] = []
         errors: list[BaseException] = []
 
         coord = p._runtime.authorization
-        original_apply = coord._apply_declaration_decision
-        original_delete = p._runtime.store.path_policy.delete
 
-        def tracked_delete(path, **kwargs):
+        def tracked_delete(original_delete, path, **kwargs):
             delete_entered.set()
             assert stop_completed.wait(10.0)
             return original_delete(path, **kwargs)
-
-        def tracked_apply(handle, entry, request, authorized):
-            reply = original_apply(handle, entry, request, authorized)
-            observed_replies.append(reply)
-            return reply
-
-        monkeypatch.setattr(p._runtime.store.path_policy, "delete", tracked_delete)
-        monkeypatch.setattr(coord, "_apply_declaration_decision", tracked_apply)
 
         def run_pipeline() -> None:
             try:
@@ -1682,7 +1674,7 @@ def test_cross_thread_stop_during_declaration_pre_delete_does_not_overwrite_stop
             except BaseException as exc:
                 errors.append(exc)
 
-        with inject_authorizer(p, lambda *_args: True):
+        with cleanup_hook(p, tracked_delete), inject_authorizer(p, lambda *_args: True):
             runner = threading.Thread(target=run_pipeline)
             runner.start()
             try:
@@ -1697,7 +1689,6 @@ def test_cross_thread_stop_during_declaration_pre_delete_does_not_overwrite_stop
                 p.stop()
                 runner.join(timeout=5.0)
 
-        assert observed_replies == [None]
         assert not coord.has_pending_authorization
         assert _jobs_by_status(p, "pending") == {"work::one"}
         assert _jobs_by_status(p, "succeeded") == set()

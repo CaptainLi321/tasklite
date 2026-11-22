@@ -10,6 +10,7 @@ import pytest
 
 from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.engine.admission import TriggerRegistry
+from tasklite.engine.authorization import AuthorizationCoordinator
 from tasklite.engine.channel import ExecutionChannel, WorkerLaunchSpec
 from tasklite.engine.completion import CompletionMachine
 from tasklite.engine.dispatch import (
@@ -60,6 +61,11 @@ class DispatchEnv:
         self.in_flight = InFlightTracker()
         self.channel = ExecutionChannel()
         self.tasks = TaskRegistry()
+        self.authorization = AuthorizationCoordinator(
+            store=self.store,
+            in_flight=self.in_flight,
+            session=self.session,
+        )
         spawn_jobs = self.store.state.spawn_jobs
         def enqueue_pending(snapshots, *, front=False):
             snapshots = list(snapshots)
@@ -77,8 +83,10 @@ class DispatchEnv:
             completion=CompletionMachine(
                 store=self.store, channel=self.channel, resources=self.resources,
                 in_flight=self.in_flight, session=self.session,
+                authorization=self.authorization,
             ),
             tasks=self.tasks,
+            authorization=self.authorization,
         )
 
     def register(self, task_type: str) -> None:
@@ -183,7 +191,7 @@ class TestDispatchOutcomeKind:
             Job("t", "gap", depends_on=["t::missing"]).to_dict(),
         ])
 
-        with authorizer(env.store, lambda *_args: None):
+        with authorizer(env.authorization, lambda *_args: None):
             first = env.dispatch.dispatch_next()
             second = env.dispatch.dispatch_next()
 
@@ -325,7 +333,7 @@ class TestPreSubmitCleanupAndActiveSignals:
             or env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
-        with authorizer(env.store, approve_after_consuming_slot):
+        with authorizer(env.authorization, approve_after_consuming_slot):
             outcome = env.dispatch.dispatch_next()
 
         assert outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS
@@ -361,7 +369,7 @@ class TestPreSubmitCleanupAndActiveSignals:
             or env.spawn_handle(spec.job.uid, spec.execution_id),
         )
 
-        with authorizer(env.store, lambda *_args: True):
+        with authorizer(env.authorization, lambda *_args: True):
             outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.SPAWNED
         assert spawn_observed == [False]

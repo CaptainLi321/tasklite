@@ -953,33 +953,38 @@ class TestAuthorizationParity:
         assert b.revoke_authorization(f1) is False
 
     def test_store_check_or_request_authorization(self, dual_backend, tmp_path, monkeypatch):
+        from tasklite.engine.authorization import AuthorizationCoordinator
+
         store = StateStore(backend=dual_backend, base_dir=tmp_path)
+        coord = AuthorizationCoordinator(store=store)
         target = str((tmp_path / "work" / "out.txt").resolve())
 
         monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
-        assert store.check_or_request_authorization(target) is False
+        assert coord.check_or_request_authorization(target) is False
         assert not store.is_path_authorized(target)
 
-        with authorizer(store, lambda p, t: False):
-            assert store.check_or_request_authorization(target) is False
+        with authorizer(coord, lambda p, t: False):
+            assert coord.check_or_request_authorization(target) is False
             assert not store.is_path_authorized(target)
 
-        with authorizer(store, lambda p, t: True):
-            assert store.check_or_request_authorization(target) is True
+        with authorizer(coord, lambda p, t: True):
+            assert coord.check_or_request_authorization(target) is True
             assert store.is_path_authorized(target)
 
-        with authorizer(store, None):
-            assert store.check_or_request_authorization(target) is True
+        with authorizer(coord, None):
+            assert coord.check_or_request_authorization(target) is True
 
         target2 = str((tmp_path / "work" / "out2.txt").resolve())
         monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
-        assert store.check_or_request_authorization(target2) is True
+        assert coord.check_or_request_authorization(target2) is True
         assert store.is_path_authorized(target2)
 
     @pytest.mark.parametrize("path_form", ["relative", "parent-link", "broken-link", "current", "parent", "root"])
     def test_store_authorization_paths_share_fixed_base_normalization(
         self, dual_backend, tmp_path, monkeypatch, path_form
     ):
+        from tasklite.engine.authorization import AuthorizationCoordinator
+
         monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
         base = tmp_path / "base"
         other = tmp_path / "other"
@@ -998,11 +1003,12 @@ class TestAuthorizationParity:
         }
         path, expected = cases[path_form]
         store = StateStore(backend=dual_backend, base_dir=base)
+        coord = AuthorizationCoordinator(store=store)
         monkeypatch.chdir(other)
         calls: list[tuple[str, str]] = []
         target_type = "directory" if expected.is_dir() else "file"
-        with authorizer(store, lambda *args: calls.append(args) or True):
-            assert store.check_or_request_authorization(path) is True
+        with authorizer(coord, lambda *args: calls.append(args) or True):
+            assert coord.check_or_request_authorization(path) is True
         assert calls == [(str(expected), target_type)]
         assert store.is_path_authorized(path)
         store.record_authorization(path, target_type)
@@ -1015,31 +1021,36 @@ class TestAuthorizationParity:
     def test_file_scope_requires_new_authorization_for_directory(
         self, dual_backend, tmp_path, monkeypatch, initial
     ):
+        from tasklite.engine.authorization import AuthorizationCoordinator
+
         monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
         target = tmp_path / "target"
         if initial == "file":
             target.write_text("file", encoding="utf-8")
         store = StateStore(backend=dual_backend, base_dir=tmp_path)
+        coord = AuthorizationCoordinator(store=store)
         calls: list[tuple[str, str]] = []
-        with authorizer(store, lambda *args: calls.append(args) or True):
-            assert store.check_or_request_authorization(target) is True
+        with authorizer(coord, lambda *args: calls.append(args) or True):
+            assert coord.check_or_request_authorization(target) is True
         if target.exists():
             target.unlink()
         target.mkdir()
         (target / "child").write_text("preserve", encoding="utf-8")
         assert not dual_backend.is_path_authorized(str(target), "directory")
         assert not store.is_path_authorized(target)
-        with authorizer(store, lambda *args: calls.append(args) or None):
-            assert store.check_or_request_authorization(target) is None
+        with authorizer(coord, lambda *args: calls.append(args) or None):
+            assert coord.check_or_request_authorization(target) is None
         assert dual_backend.list_authorizations()[0]["target_type"] == "file"
-        with authorizer(store, lambda *args: calls.append(args) or True):
-            assert store.check_or_request_authorization(target) is True
+        with authorizer(coord, lambda *args: calls.append(args) or True):
+            assert coord.check_or_request_authorization(target) is True
         assert [kind for _, kind in calls] == ["file", "directory", "directory"]
         assert store.is_path_authorized(target / "child")
 
     def test_parent_link_change_does_not_reuse_previous_target_authorization(
         self, dual_backend, tmp_path, monkeypatch
     ):
+        from tasklite.engine.authorization import AuthorizationCoordinator
+
         monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
         first, second = tmp_path / "first", tmp_path / "second"
         first.mkdir()
@@ -1047,21 +1058,25 @@ class TestAuthorizationParity:
         alias = tmp_path / "alias"
         alias.symlink_to(first, target_is_directory=True)
         store = StateStore(backend=dual_backend, base_dir=tmp_path)
+        coord = AuthorizationCoordinator(store=store)
         calls: list[tuple[str, str]] = []
-        with authorizer(store, lambda *args: calls.append(args) or True):
-            assert store.check_or_request_authorization(alias / "item") is True
+        with authorizer(coord, lambda *args: calls.append(args) or True):
+            assert coord.check_or_request_authorization(alias / "item") is True
             alias.unlink()
             alias.symlink_to(second, target_is_directory=True)
             assert not store.is_path_authorized(alias / "item")
-            assert store.check_or_request_authorization(alias / "item") is True
+            assert coord.check_or_request_authorization(alias / "item") is True
         assert calls == [(str(first / "item"), "file"), (str(second / "item"), "file")]
 
     def test_type_change_inside_authorizer_cannot_expand_recorded_file_scope(
         self, dual_backend, tmp_path, monkeypatch
     ):
+        from tasklite.engine.authorization import AuthorizationCoordinator
+
         monkeypatch.delenv("TASKLITE_DANGEROUS_AUTO_APPROVE", raising=False)
         target = tmp_path / "target"
         store = StateStore(backend=dual_backend, base_dir=tmp_path)
+        coord = AuthorizationCoordinator(store=store)
         calls: list[tuple[str, str]] = []
 
         def authorize(path, kind):
@@ -1071,8 +1086,8 @@ class TestAuthorizationParity:
                 return True
             return None
 
-        with authorizer(store, authorize):
-            assert store.check_or_request_authorization(target) is None
+        with authorizer(coord, authorize):
+            assert coord.check_or_request_authorization(target) is None
         assert calls == [(str(target), "file"), (str(target), "directory")]
         assert not store.is_path_authorized(target)
         assert store.list_authorizations()[0]["target_type"] == "file"
@@ -1080,15 +1095,18 @@ class TestAuthorizationParity:
     def test_auto_approval_records_directory_scope_after_file_replacement(
         self, dual_backend, tmp_path, monkeypatch
     ):
+        from tasklite.engine.authorization import AuthorizationCoordinator
+
         monkeypatch.setenv("TASKLITE_DANGEROUS_AUTO_APPROVE", "1")
         target = tmp_path / "target"
         target.write_text("file", encoding="utf-8")
         store = StateStore(backend=dual_backend, base_dir=tmp_path)
-        assert store.check_or_request_authorization(target) is True
+        coord = AuthorizationCoordinator(store=store)
+        assert coord.check_or_request_authorization(target) is True
         assert store.list_authorizations()[0]["target_type"] == "file"
         target.unlink()
         target.mkdir()
-        assert store.check_or_request_authorization(target) is True
+        assert coord.check_or_request_authorization(target) is True
         assert store.list_authorizations()[0]["target_type"] == "directory"
 
     def test_grant_authorization_parity_conflicts_and_nested_directories(

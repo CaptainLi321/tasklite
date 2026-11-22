@@ -18,7 +18,7 @@ import os
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from ..backend.base import AbstractStateBackend, GraphEditCommit
 from ..exceptions import TaskLiteError
@@ -138,7 +138,6 @@ class StateStore:
                 state_path=state_path,
                 protected_roots=protected_roots,
             )
-        self.authorizer: Callable[[str, str], bool | None] | None = None
 
     @property
     def protected_roots(self) -> tuple[Path, ...]:
@@ -385,9 +384,9 @@ class StateStore:
         """换库唯一锚点：backend 所有权归 StateStore 单持。"""
         self._backend = backend
 
-    # ── 路径授权管理与判定 ──────────────────────────────────────────
+    # ── 路径授权记录持久化存取 ───────────────────────────────────────
 
-    def _inspect_lookup(self, path: str | Path) -> InspectedPath:
+    def inspect_lookup(self, path: str | Path) -> InspectedPath:
         """经统一 PathPolicy 以 lookup 模式解析路径（保留叶目录项不跟随）。"""
         try:
             return self._path_policy.inspect(path, mode="lookup")
@@ -400,7 +399,7 @@ class StateStore:
 
     def is_path_authorized(self, path: str | Path) -> bool:
         """检查指定规范绝对路径是否命中已有授权。"""
-        inspected = self._inspect_lookup(path)
+        inspected = self.inspect_lookup(path)
         return self._backend.is_path_authorized(inspected.canonical_path, inspected.target_type)
 
     def grant_authorization(
@@ -428,7 +427,7 @@ class StateStore:
         authorized_at: str | None = None,
     ) -> None:
         """持久化记录一条文件系统路径授权（运行期支持 file -> directory 升级）。"""
-        inspected = self._inspect_lookup(path)
+        inspected = self.inspect_lookup(path)
         self._backend.record_authorization(
             inspected.canonical_path, target_type, authorized_at=authorized_at
         )
@@ -439,32 +438,8 @@ class StateStore:
 
     def revoke_authorization(self, path: str | Path) -> bool:
         """按规范绝对路径精确撤销授权。"""
-        inspected = self._inspect_lookup(path)
+        inspected = self.inspect_lookup(path)
         return self._backend.revoke_authorization(inspected.canonical_path)
-
-    def check_or_request_authorization(self, path: str | Path) -> bool | None:
-        """按实际目标范围查询、询问并持久化授权；None 表示等待决策。"""
-        if self.is_path_protected(path):
-            return False
-        while True:
-            inspected = self._inspect_lookup(path)
-            norm_path = inspected.canonical_path
-            effective_type = inspected.target_type
-            if self._backend.is_path_authorized(norm_path, effective_type):
-                return True
-            if os.environ.get("TASKLITE_DANGEROUS_AUTO_APPROVE") == "1":
-                decision: bool | None = True
-            elif self.authorizer is not None:
-                decision = self.authorizer(norm_path, effective_type)
-            else:
-                return False
-            if decision is not True:
-                return None if decision is None else False
-            self._backend.record_authorization(norm_path, effective_type)
-            # 询问期间文件可能变成目录，保存的文件授权不能扩大为目录树。
-            after = self._inspect_lookup(path)
-            if effective_type == "directory" or after.target_type != "directory":
-                return True
 
     # ── 事务性原子终态转移（apply_* 出口族）──────────────────────────
 

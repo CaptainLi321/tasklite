@@ -335,6 +335,7 @@ class ExecutionChannel:
         self._declaration_handler: Callable[[JobHandle, dict[str, Any]], dict[str, Any] | None] | None = None
         self._is_timeout_paused_cb: Callable[[JobHandle], bool] | None = None
         self._get_authorization_outcome_cb: Callable[[JobHandle], AuthorizationOutcome | None] | None = None
+        self._get_timeout_at_cb: Callable[[JobHandle], float] | None = None
         self._wakeup_callback: Callable[[], None] | None = None
 
     @property
@@ -758,10 +759,12 @@ class ExecutionChannel:
         *,
         is_timeout_paused: Callable[[JobHandle], bool] | None = None,
         get_outcome: Callable[[JobHandle], AuthorizationOutcome | None] | None = None,
+        get_timeout_at: Callable[[JobHandle], float] | None = None,
     ) -> None:
-        """绑定运行期授权状态只读查询回调（超时暂停判定与终态授权结果）。"""
+        """绑定运行期授权状态只读查询回调（超时暂停判定、终态授权结果与有效截止时刻）。"""
         self._is_timeout_paused_cb = is_timeout_paused
         self._get_authorization_outcome_cb = get_outcome
+        self._get_timeout_at_cb = get_timeout_at
 
     def _is_timeout_paused(self, handle: JobHandle) -> bool:
         cb = self._is_timeout_paused_cb
@@ -770,6 +773,10 @@ class ExecutionChannel:
     def _get_authorization_outcome(self, handle: JobHandle) -> AuthorizationOutcome | None:
         cb = self._get_authorization_outcome_cb
         return cb(handle) if cb is not None else None
+
+    def _get_timeout_at(self, handle: JobHandle) -> float:
+        cb = self._get_timeout_at_cb
+        return cb(handle) if cb is not None else handle.timeout_at_monotonic
 
     def set_wakeup_callback(self, callback: Callable[[], None] | None) -> None:
         """绑定 IPC 消息到达时的主循环唤醒入口。"""
@@ -810,6 +817,20 @@ class ExecutionChannel:
         if session is None or session.state is not _SessionState.ACTIVE:
             return None
         return session.reply_sender
+
+    def send_declaration_reply(
+        self,
+        execution_id: str | None,
+        reply: dict[str, Any],
+    ) -> None:
+        """向指定活跃执行会话发送动态声明回复帧（对端已关闭时静默收敛 OSError）。"""
+        reply_sender = self.get_reply_sender(execution_id)
+        if reply_sender is None:
+            return
+        try:
+            reply_sender.send_reply(reply)
+        except OSError:
+            pass
 
     def _consume_result_if_present(self, handle: JobHandle) -> ExecutionResult | None:
         """读取已收到的结果负载 → 守卫过滤 → 解码。"""
@@ -947,7 +968,7 @@ class ExecutionChannel:
                 continue
 
             # 4. 超时：从启动到结果到达计单次超时（等待授权期间暂停不计）
-            if not self._is_timeout_paused(handle) and now > handle.timeout_at_monotonic:
+            if not self._is_timeout_paused(handle) and now > self._get_timeout_at(handle):
                 p.join(timeout=0.5)
                 if p.is_alive():
                     try:

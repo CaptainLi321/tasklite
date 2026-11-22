@@ -1,14 +1,16 @@
-"""主进程文件声明与三类授权等待统一协调器。
+"""主进程文件声明、交互授权策略、受控清理与三类授权等待统一协调器。
 
-统一收敛主进程侧全部三类文件授权等待生命周期：
-1. 派发前预声明文件授权等待；
-2. 运行期子进程动态文件声明校验、授权等待、前置清理与回复；
-3. 执行收尾清理期（成功/失败/重试清理）授权等待与受阻进程退出等待。
+统一收敛主进程侧全部文件授权与清理职责：
+1. 运行期交互授权策略（authorizer 回调、自动同意环境变量与 TOCTOU 范围复核）；
+2. 主进程预声明文件解析与受授权删除（单点归集清理错误族）；
+3. 三类授权等待生命周期：派发前等待、运行期动态声明、收尾清理等待。
 
 核心不变式：
-- ``StopMode != NONE`` → ``AuthorizationStatus.STOPPED`` 在本模块单点收敛；
-- ``has_pending_authorization`` 为事件泵等待决策提供唯一授权等待查询；
-- 动态声明与收尾等待期间的超时暂停/恢复按执行身份追踪，不污染 ``JobHandle`` 值对象；
+- 不持有 ``ExecutionChannel`` 引用，所有进程终止与管道回复以显式决策/动作对象返回，
+  由 ``EngineRuntime`` / ``CompletionMachine`` 统一驱动通道；
+- 不跨 seam 原地篡改 ``JobHandle.timeout_at_monotonic``、``ExecutionResult.authorization_outcome``
+  或 ``store.state.queue``；
+- ``StopMode != NONE`` -> ``AuthorizationStatus.STOPPED`` 在本模块单点收敛；
 - 内部短临界区锁（``self._lock``）仅保护内存状态跃迁与停机态二次复核，严禁持锁执行
   外部 authorizer 回调、文件系统 I/O、进程终止或管道回复，避免跨线程 ``request_stop()`` 死锁。
 """
@@ -17,11 +19,13 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import threading
 import time
 import traceback
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from ..exceptions import TaskLiteError
@@ -31,12 +35,11 @@ from ..models.artifact import (
     validate_file_name,
 )
 from ..models.job import Job
+from .in_flight import InFlightJob, InFlightTracker
+from .session import RunSession
 from .types import AuthorizationOutcome, AuthorizationStatus, JobHandle, StopMode
 
 if TYPE_CHECKING:
-    from .channel import ExecutionChannel, ExecutionResult
-    from .in_flight import InFlightJob, InFlightTracker
-    from .session import RunSession
     from .store import StateStore
 
 logger = logging.getLogger("tasklite")
@@ -49,6 +52,33 @@ class CleanupAuthorizationDecision(str, enum.Enum):
 
     READY = "ready"
     PENDING = "pending"
+
+
+@dataclass(frozen=True)
+class DispatchAuthorizationPoll:
+    """派发前挂起授权复查决策（队列出队、失败提交与链排除由调用方执行）。"""
+
+    status: AuthorizationStatus
+    job_uid: str | None = None
+    error: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class DeclarationAction:
+    """动态文件声明仲裁或轮询产出的一条通道执行指令。"""
+
+    handle: JobHandle
+    reply: dict[str, Any] | None = None
+    terminate: bool = False
+
+
+@dataclass(frozen=True)
+class CleanupEvaluation:
+    """收尾清理授权评估的不可变决策（不原地改写结果对象，不直接操作通道）。"""
+
+    decision: CleanupAuthorizationDecision
+    outcome: AuthorizationOutcome | None = None
+    terminate_handle: JobHandle | None = None
 
 
 @dataclass
@@ -76,26 +106,25 @@ class _PendingDispatchAuthorization:
 class PendingCleanup:
     """一次收尾清理待决授权（或等待受阻进程退出）的暂挂项。"""
 
-    entry: "InFlightJob"
-    result: "ExecutionResult"
+    entry: InFlightJob
+    result: Any
     prepared: Any
 
 
 class AuthorizationCoordinator:
-    """统一承接三类主进程文件授权等待的登记、复查、停机解除与超时暂挂。"""
+    """统一承接交互授权策略、受授权清理与三类授权等待协调器。"""
 
     def __init__(
         self,
         *,
         store: "StateStore",
-        channel: "ExecutionChannel",
-        in_flight: "InFlightTracker",
-        session: "RunSession",
+        in_flight: InFlightTracker | None = None,
+        session: RunSession | None = None,
     ) -> None:
         self._store = store
-        self._channel = channel
-        self._in_flight = in_flight
-        self._session = session
+        self._in_flight = in_flight if in_flight is not None else InFlightTracker()
+        self._session = session if session is not None else RunSession()
+        self.authorizer: Callable[[str, str], bool | None] | None = None
         # 短临界区锁：仅保护状态字段原子跃迁与停机复核，绝不包裹外部回调或 I/O。
         self._lock = threading.RLock()
 
@@ -104,9 +133,70 @@ class AuthorizationCoordinator:
         self._pending_declarations: dict[str, tuple[JobHandle, PendingDeclaration]] = {}
         self._declaration_outcomes: dict[str, AuthorizationOutcome] = {}
         self._paused_remaining: dict[str, float] = {}
+        self._effective_deadlines: dict[str, float] = {}
         self._pending_cleanups: dict[str, PendingCleanup] = {}
 
-    # ── 统一查询与状态清理 ────────────────────────────────────────────
+    # ── 统一查询、交互策略与受控清理 ─────────────────────────────────
+
+    @staticmethod
+    def format_error(exc: BaseException) -> dict[str, str]:
+        """将异常打包为可持久化的结构化异常字典。"""
+        return {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+    def check_or_request_authorization(self, path: str | Path) -> bool | None:
+        """按实际目标范围查询、询问并持久化授权；None 表示等待决策。
+
+        不变式：不得在持有 ``self._lock`` 期间调用，避免外部 ``authorizer`` 回调阻塞停机。
+        """
+        if self._store.is_path_protected(path):
+            return False
+        while True:
+            inspected = self._store.inspect_lookup(path)
+            norm_path = inspected.canonical_path
+            effective_type = inspected.target_type
+            if self._store.backend.is_path_authorized(norm_path, effective_type):
+                return True
+            if os.environ.get("TASKLITE_DANGEROUS_AUTO_APPROVE") == "1":
+                decision: bool | None = True
+            elif self.authorizer is not None:
+                decision = self.authorizer(norm_path, effective_type)
+            else:
+                return False
+            if decision is not True:
+                return None if decision is None else False
+            self._store.backend.record_authorization(norm_path, effective_type)
+            # 询问期间文件可能变成目录，保存的文件授权不能扩大为目录树。
+            after = self._store.inspect_lookup(path)
+            if effective_type == "directory" or after.target_type != "directory":
+                return True
+
+    def resolve_job_files(self, job: Job) -> dict[str, FileSpec]:
+        """按统一 PathPolicy 单次原子解析作业的全部预声明文件。"""
+        return {
+            name: self._store.resolve_file_spec(spec, depends_on=job.depends_on)
+            for name, spec in job.files.items()
+        }
+
+    def delete_authorized_path(
+        self,
+        path: str,
+        *,
+        allow_broken_leaf_symlink: bool = False,
+    ) -> dict[str, str] | None:
+        """主进程受授权删除的单一受控出口；命中清理错误族返回结构化异常字典，成功返回 None。"""
+        try:
+            self._store.path_policy.delete(
+                path,
+                allow_broken_leaf_symlink=allow_broken_leaf_symlink,
+                authorize=self._store.backend.is_path_authorized,
+            )
+        except _CLEANUP_ERRORS as exc:
+            return self.format_error(exc)
+        return None
 
     @property
     def has_pending_authorization(self) -> bool:
@@ -161,33 +251,25 @@ class AuthorizationCoordinator:
         with self._lock:
             return self._paused_remaining.get(self._execution_key(handle))
 
+    def effective_timeout_at(self, handle: JobHandle) -> float:
+        """查询指定句柄扣除授权暂停补偿后的有效超时截止时刻（不原地篡改 JobHandle）。"""
+        with self._lock:
+            key = self._execution_key(handle)
+            return self._effective_deadlines.get(key, handle.timeout_at_monotonic)
+
     def _pause_timeout_locked(self, handle: JobHandle) -> None:
         key = self._execution_key(handle)
         if key not in self._paused_remaining:
-            self._paused_remaining[key] = max(
-                0.0, handle.timeout_at_monotonic - time.monotonic()
+            current_deadline = self._effective_deadlines.get(
+                key, handle.timeout_at_monotonic
             )
+            self._paused_remaining[key] = max(0.0, current_deadline - time.monotonic())
 
     def _resume_timeout_locked(self, handle: JobHandle) -> None:
         key = self._execution_key(handle)
         remaining = self._paused_remaining.pop(key, None)
         if remaining is not None:
-            handle.timeout_at_monotonic = time.monotonic() + remaining
-
-    def pause_timeout(self, handle: JobHandle) -> None:
-        """等待授权期间按执行身份暂停超时计时（幂等）。"""
-        with self._lock:
-            self._pause_timeout_locked(handle)
-
-    def resume_timeout(self, handle: JobHandle) -> None:
-        """授权解除后恢复执行超时计时（幂等）。"""
-        with self._lock:
-            self._resume_timeout_locked(handle)
-
-    def clear_dispatch_pending(self) -> None:
-        """清除派发前授权等待记录。"""
-        with self._lock:
-            self._dispatch_pending = None
+            self._effective_deadlines[key] = time.monotonic() + remaining
 
     def clear_execution(
         self,
@@ -202,6 +284,7 @@ class AuthorizationCoordinator:
                     self._pending_declarations.pop(key, None)
                     self._declaration_outcomes.pop(key, None)
                     self._paused_remaining.pop(key, None)
+                    self._effective_deadlines.pop(key, None)
             if job_uid:
                 self._pending_cleanups.pop(job_uid, None)
 
@@ -212,10 +295,11 @@ class AuthorizationCoordinator:
             self._pending_declarations.clear()
             self._declaration_outcomes.clear()
             self._paused_remaining.clear()
+            self._effective_deadlines.clear()
             self._pending_cleanups.clear()
 
-    def notify_stop(self) -> None:
-        """停机请求到达时在短锁内原子清零派发前等待并收敛动态声明为 STOPPED，锁外终止进程。"""
+    def notify_stop(self) -> list[JobHandle]:
+        """停机请求到达时在短锁内原子清零派发前等待并收敛动态声明为 STOPPED，返回待终止句柄列表。"""
         to_terminate: list[tuple[JobHandle, str, str]] = []
         with self._lock:
             self._dispatch_pending = None
@@ -232,11 +316,13 @@ class AuthorizationCoordinator:
                     message,
                 ):
                     to_terminate.append((handle, request.resolved_path, message))
+        handles: list[JobHandle] = []
         for handle, path, message in to_terminate:
             logger.info(
                 f"FILE AUTHORIZATION STOPPED: {handle.job_uid} {path} ({message})"
             )
-            self._channel.terminate_process(handle)
+            handles.append(handle)
+        return handles
 
     @staticmethod
     def _execution_key(handle: JobHandle) -> str:
@@ -282,74 +368,60 @@ class AuthorizationCoordinator:
 
     # ── 类型 1：派发前清理授权等待 ────────────────────────────────────
 
-    def _resolve_job_files(self, job: Job) -> dict[str, FileSpec]:
-        """按统一 PathPolicy 单次原子解析作业的全部预声明文件。"""
-        return {
-            name: self._store.resolve_file_spec(spec, depends_on=job.depends_on)
-            for name, spec in job.files.items()
-        }
+    def poll_dispatch_authorization(
+        self,
+        *,
+        resolve_job: Callable[[str], Job | None],
+    ) -> DispatchAuthorizationPoll:
+        """复查上拍挂起的派发前授权（只返回决策，不越权修改队列或提交失败）。
 
-    def poll_dispatch_authorization(self) -> AuthorizationStatus:
-        """复查上拍挂起的派发前授权。
-
-        返回：
+        返回 ``DispatchAuthorizationPoll``：
         - ``APPROVED``：无挂起或已放行，可继续扫描派发；
         - ``PENDING``：仍在等待外部决策；
-        - ``DENIED``：拒绝并已将作业及其下游临时排除；
-        - ``PREPARATION_FAILED``：重校验失败并已拒绝提交；
+        - ``DENIED``：已拒绝，携带 ``job_uid`` 供派发器执行本 Run 链排除；
+        - ``PREPARATION_FAILED``：重校验失败，携带 ``job_uid`` 与结构化 ``error`` 供派发器出队提交失败；
         - ``STOPPED``：已进入停机态，结束派发。
         """
         with self._lock:
             if self._is_stopping():
                 self._dispatch_pending = None
-                return AuthorizationStatus.STOPPED
+                return DispatchAuthorizationPoll(status=AuthorizationStatus.STOPPED)
             pending = self._dispatch_pending
             if pending is None:
-                return AuthorizationStatus.APPROVED
+                return DispatchAuthorizationPoll(status=AuthorizationStatus.APPROVED)
             self._dispatch_pending = None
 
-        store = self._store
-        if pending.run_id != self._session.run_id or pending.job_uid not in store.state.queue_uids:
-            return AuthorizationStatus.APPROVED
+        if pending.run_id != self._session.run_id:
+            return DispatchAuthorizationPoll(status=AuthorizationStatus.APPROVED)
 
-        pending_idx = next(
-            index
-            for index, snapshot in enumerate(store.state.queue)
-            if Job.from_dict(snapshot).uid == pending.job_uid
-        )
+        job = resolve_job(pending.job_uid)
+        if job is None:
+            return DispatchAuthorizationPoll(status=AuthorizationStatus.APPROVED)
+
         try:
-            job = Job.from_dict(store.state.queue[pending_idx])
-            pending_files = self._resolve_job_files(job)
+            pending_files = self.resolve_job_files(job)
             path = pending_files[pending.file_name].path
             assert path is not None
         except Exception as exc:
-            snapshot = store.state.pop_job(pending_idx)
-            store.apply_failure(
-                pending.job_uid,
-                {
-                    "error_message": str(exc),
-                    "exception": {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                        "traceback": traceback.format_exc(),
-                    },
-                },
-                job_snapshot=snapshot,
-                cascade=True,
+            return DispatchAuthorizationPoll(
+                status=AuthorizationStatus.PREPARATION_FAILED,
+                job_uid=pending.job_uid,
+                error=self.format_error(exc),
             )
-            return AuthorizationStatus.PREPARATION_FAILED
 
-        authorized = store.check_or_request_authorization(path)
+        authorized = self.check_or_request_authorization(path)
         if authorized is None:
             if self._set_dispatch_pending_if_allowed(pending):
-                return AuthorizationStatus.PENDING
-            return AuthorizationStatus.STOPPED
+                return DispatchAuthorizationPoll(status=AuthorizationStatus.PENDING)
+            return DispatchAuthorizationPoll(status=AuthorizationStatus.STOPPED)
         if self._is_stopping():
-            return AuthorizationStatus.STOPPED
+            return DispatchAuthorizationPoll(status=AuthorizationStatus.STOPPED)
         if authorized is False:
-            self._session.temporarily_exclude_chain(pending.job_uid, store.state)
-            return AuthorizationStatus.DENIED
-        return AuthorizationStatus.APPROVED
+            return DispatchAuthorizationPoll(
+                status=AuthorizationStatus.DENIED,
+                job_uid=pending.job_uid,
+            )
+        return DispatchAuthorizationPoll(status=AuthorizationStatus.APPROVED)
 
     def authorize_dispatch_files(
         self,
@@ -357,12 +429,11 @@ class AuthorizationCoordinator:
         resolved_files: Mapping[str, FileSpec],
     ) -> AuthorizationStatus:
         """派发前逐项检查预声明文件的删除授权，未决则在短锁停机复核后登记等待槽。"""
-        store = self._store
         for fname, fspec in resolved_files.items():
             if not (fspec.delete_existing or fspec.delete_on_success or fspec.delete_on_failure):
                 continue
             assert fspec.path is not None
-            authorized = store.check_or_request_authorization(fspec.path)
+            authorized = self.check_or_request_authorization(fspec.path)
             if authorized is None:
                 pending = _PendingDispatchAuthorization(
                     run_id=self._session.run_id,
@@ -375,7 +446,6 @@ class AuthorizationCoordinator:
             if self._is_stopping():
                 return AuthorizationStatus.STOPPED
             if authorized is False:
-                self._session.temporarily_exclude_chain(job_uid, store.state)
                 return AuthorizationStatus.DENIED
         return AuthorizationStatus.APPROVED
 
@@ -385,45 +455,60 @@ class AuthorizationCoordinator:
         self,
         handle: JobHandle,
         payload: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """主进程动态文件声明仲裁出口：验证引用、授权检查、前置清理并回送路径。"""
+    ) -> DeclarationAction:
+        """主进程动态文件声明仲裁出口：验证引用、授权检查、前置清理并返回通道执行指令。"""
         raw_req_id = payload.get("request_id")
         if not isinstance(raw_req_id, str) or not raw_req_id:
-            return {
-                "request_id": "",
-                "status": "error",
-                "error": "request_id must be a non-empty str",
-            }
+            return DeclarationAction(
+                handle=handle,
+                reply={
+                    "request_id": "",
+                    "status": "error",
+                    "error": "request_id must be a non-empty str",
+                },
+            )
         req_id = raw_req_id
         name = payload.get("name", "")
         spec_data = payload.get("spec", {})
         entry = self._in_flight.get(handle.job_uid)
         if entry is None or not self._declaration_identity_matches(handle, entry):
-            return {
-                "request_id": req_id,
-                "status": "error",
-                "error": f"Job {handle.job_uid} not in flight",
-            }
+            return DeclarationAction(
+                handle=handle,
+                reply={
+                    "request_id": req_id,
+                    "status": "error",
+                    "error": f"Job {handle.job_uid} not in flight",
+                },
+            )
         exec_key = self._execution_key(handle)
         with self._lock:
             if exec_key in self._declaration_outcomes:
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": f"Job {handle.job_uid} execution is no longer accepting declarations",
-                }
+                return DeclarationAction(
+                    handle=handle,
+                    reply={
+                        "request_id": req_id,
+                        "status": "error",
+                        "error": f"Job {handle.job_uid} execution is no longer accepting declarations",
+                    },
+                )
             if exec_key in self._pending_declarations:
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": f"Job {handle.job_uid} already has a pending declaration",
-                }
+                return DeclarationAction(
+                    handle=handle,
+                    reply={
+                        "request_id": req_id,
+                        "status": "error",
+                        "error": f"Job {handle.job_uid} already has a pending declaration",
+                    },
+                )
 
         try:
             spec = FileSpec.from_dict(spec_data)
             validated_name = validate_file_name(name)
         except Exception as exc:
-            return {"request_id": req_id, "status": "error", "error": str(exc)}
+            return DeclarationAction(
+                handle=handle,
+                reply={"request_id": req_id, "status": "error", "error": str(exc)},
+            )
 
         # 1. 幂等与冲突检查
         try:
@@ -438,21 +523,30 @@ class AuthorizationCoordinator:
                 depends_on=handle.job.depends_on,
             )
         except Exception as exc:
-            return {"request_id": req_id, "status": "error", "error": str(exc)}
+            return DeclarationAction(
+                handle=handle,
+                reply={"request_id": req_id, "status": "error", "error": str(exc)},
+            )
         source_spec = merged[validated_name]
         if not is_new:
             existing = existing_files.get(validated_name)
             if existing is None or existing.path is None:
-                return {
+                return DeclarationAction(
+                    handle=handle,
+                    reply={
+                        "request_id": req_id,
+                        "status": "error",
+                        "error": f"File declaration {validated_name!r} has no resolved path",
+                    },
+                )
+            return DeclarationAction(
+                handle=handle,
+                reply={
                     "request_id": req_id,
-                    "status": "error",
-                    "error": f"File declaration {validated_name!r} has no resolved path",
-                }
-            return {
-                "request_id": req_id,
-                "status": "ok",
-                "resolved_path": existing.path,
-            }
+                    "status": "ok",
+                    "resolved_path": existing.path,
+                },
+            )
 
         # 2. 单次原子解析（上游引用、安全边界、存在性判定与路径绑定）
         needs_authorization = (
@@ -468,11 +562,14 @@ class AuthorizationCoordinator:
                     enforce_safety=False,
                 )
             except Exception as exc:
-                return {
-                    "request_id": req_id,
-                    "status": "error",
-                    "error": str(exc),
-                }
+                return DeclarationAction(
+                    handle=handle,
+                    reply={
+                        "request_id": req_id,
+                        "status": "error",
+                        "error": str(exc),
+                    },
+                )
             assert bound_spec.path is not None
             resolved_path = bound_spec.path
             logger.info(
@@ -492,7 +589,7 @@ class AuthorizationCoordinator:
             logger.info(
                 f"FILE DECLARATION APPROVED: {handle.job_uid} {resolved_path}"
             )
-            return self._declaration_reply(request)
+            return DeclarationAction(handle=handle, reply=self._declaration_reply(request))
 
         try:
             bound_spec = self._store.resolve_file_spec(
@@ -501,17 +598,16 @@ class AuthorizationCoordinator:
                 enforce_safety=True,
             )
         except (TaskLiteError, FileNotFoundError) as exc:
-            return {
-                "request_id": req_id,
-                "status": "error",
-                "error": str(exc),
-            }
+            return DeclarationAction(
+                handle=handle,
+                reply={
+                    "request_id": req_id,
+                    "status": "error",
+                    "error": str(exc),
+                },
+            )
         except _CLEANUP_ERRORS as exc:
-            error = {
-                "type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            }
+            error = self.format_error(exc)
             fallback_path, fallback_bound = self._resolve_fallback_declaration_target(source_spec)
             request = PendingDeclaration(
                 request_id=req_id,
@@ -522,10 +618,10 @@ class AuthorizationCoordinator:
             )
             with self._lock:
                 if exec_key in self._declaration_outcomes or exec_key in self._pending_declarations:
-                    return None
+                    return DeclarationAction(handle=handle)
                 self._pending_declarations[exec_key] = (handle, request)
                 self._pause_timeout_locked(handle)
-            self._finish_declaration(
+            terminated = self._finish_declaration(
                 handle,
                 entry,
                 request,
@@ -533,7 +629,7 @@ class AuthorizationCoordinator:
                 error["message"],
                 error,
             )
-            return None
+            return DeclarationAction(handle=handle, terminate=terminated)
 
         assert bound_spec.path is not None
         validated_path = bound_spec.path
@@ -550,37 +646,39 @@ class AuthorizationCoordinator:
         )
         with self._lock:
             if exec_key in self._declaration_outcomes or exec_key in self._pending_declarations:
-                return None
+                return DeclarationAction(handle=handle)
             self._pending_declarations[exec_key] = (handle, request)
             self._pause_timeout_locked(handle)
             stopping = self._is_stopping()
         if stopping:
-            self._finish_declaration(
+            terminated = self._finish_declaration(
                 handle,
                 entry,
                 request,
                 AuthorizationStatus.STOPPED,
                 self._stopped_message(validated_path),
             )
-            return None
+            return DeclarationAction(handle=handle, terminate=terminated)
         logger.info(
             f"FILE AUTHORIZATION WAIT: {handle.job_uid} {validated_path}"
         )
-        authorized = self._store.check_or_request_authorization(validated_path)
+        authorized = self.check_or_request_authorization(validated_path)
         if authorized is None:
             if self._is_stopping():
-                self._finish_declaration(
+                terminated = self._finish_declaration(
                     handle,
                     entry,
                     request,
                     AuthorizationStatus.STOPPED,
                     self._stopped_message(validated_path),
                 )
-            return None
+                return DeclarationAction(handle=handle, terminate=terminated)
+            return DeclarationAction(handle=handle)
         return self._apply_declaration_decision(handle, entry, request, authorized)
 
-    def poll_pending_declarations(self) -> None:
-        """轮询处于等待中的动态文件声明授权；若已决策则恢复执行或终止。"""
+    def poll_pending_declarations(self) -> list[DeclarationAction]:
+        """轮询处于等待中的动态文件声明授权，返回需由通道执行的指令列表。"""
+        actions: list[DeclarationAction] = []
         with self._lock:
             snapshot = list(self._pending_declarations.items())
         for exec_key, (handle, request) in snapshot:
@@ -601,27 +699,29 @@ class AuthorizationCoordinator:
                 delete_existing = request.bound.delete_existing
 
             if stopping:
-                self._finish_declaration(
+                if self._finish_declaration(
                     handle,
                     entry,
                     request,
                     AuthorizationStatus.STOPPED,
                     self._stopped_message(current_path),
-                )
+                ):
+                    actions.append(DeclarationAction(handle=handle, terminate=True))
                 continue
 
             validated_path, error = self._validate_declaration_target(
                 current_path, delete_existing=delete_existing
             )
             if error is not None:
-                self._finish_declaration(
+                if self._finish_declaration(
                     handle,
                     entry,
                     request,
                     AuthorizationStatus.PREPARATION_FAILED,
                     error["message"],
                     error,
-                )
+                ):
+                    actions.append(DeclarationAction(handle=handle, terminate=True))
                 continue
             if validated_path != current_path:
                 rebound = request.bound._bind_output_path(validated_path)
@@ -636,27 +736,23 @@ class AuthorizationCoordinator:
                     request.bound = rebound
                     request.resolved_path = validated_path
 
-            authorized = self._store.check_or_request_authorization(validated_path)
+            authorized = self.check_or_request_authorization(validated_path)
             if authorized is not None:
-                reply = self._apply_declaration_decision(
+                action = self._apply_declaration_decision(
                     handle, entry, request, authorized
                 )
-                if reply is None:
-                    continue
-                reply_sender = self._channel.get_reply_sender(handle.execution_id)
-                if reply_sender is not None:
-                    try:
-                        reply_sender.send_reply(reply)
-                    except OSError:
-                        pass
+                if action.terminate or action.reply is not None:
+                    actions.append(action)
             elif self._is_stopping():
-                self._finish_declaration(
+                if self._finish_declaration(
                     handle,
                     entry,
                     request,
                     AuthorizationStatus.STOPPED,
                     self._stopped_message(validated_path),
-                )
+                ):
+                    actions.append(DeclarationAction(handle=handle, terminate=True))
+        return actions
 
     def _resolve_fallback_declaration_target(
         self,
@@ -685,7 +781,7 @@ class AuthorizationCoordinator:
                 fallback_bound = source_spec
         return fallback_path, fallback_bound
 
-    def _declaration_identity_matches(self, handle: JobHandle, entry: "InFlightJob") -> bool:
+    def _declaration_identity_matches(self, handle: JobHandle, entry: InFlightJob) -> bool:
         """请求句柄必须与当前在飞执行使用同一 job、run、attempt 与 execution 身份。"""
         if entry.handle is not handle or entry.job_uid != handle.job_uid:
             return False
@@ -700,7 +796,7 @@ class AuthorizationCoordinator:
         return True
 
     @staticmethod
-    def _record_declaration(entry: "InFlightJob", request: PendingDeclaration) -> None:
+    def _record_declaration(entry: InFlightJob, request: PendingDeclaration) -> None:
         entry.active_file_sources[request.name] = request.source
         entry.active_files[request.name] = request.bound
 
@@ -719,19 +815,15 @@ class AuthorizationCoordinator:
                 None,
             )
         except _CLEANUP_ERRORS as exc:
-            return resolved_path, {
-                "type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            }
+            return resolved_path, self.format_error(exc)
 
     def _apply_declaration_decision(
         self,
         handle: JobHandle,
-        entry: "InFlightJob",
+        entry: InFlightJob,
         request: PendingDeclaration,
         authorized: bool,
-    ) -> dict[str, Any] | None:
+    ) -> DeclarationAction:
         exec_key = self._execution_key(handle)
         with self._lock:
             pending = self._pending_declarations.get(exec_key)
@@ -741,7 +833,7 @@ class AuthorizationCoordinator:
                 or request.status is not AuthorizationStatus.PENDING
                 or exec_key in self._declaration_outcomes
             ):
-                return None
+                return DeclarationAction(handle=handle)
             stopping = self._is_stopping()
             resolved_path = request.resolved_path
             delete_existing = request.bound.delete_existing
@@ -751,40 +843,40 @@ class AuthorizationCoordinator:
             if self._finish_declaration(
                 handle, entry, request, AuthorizationStatus.STOPPED, message
             ):
-                return {
-                    "request_id": request.request_id,
-                    "status": "stopped",
-                    "error": message,
-                }
-            return None
+                return DeclarationAction(
+                    handle=handle,
+                    reply={
+                        "request_id": request.request_id,
+                        "status": "stopped",
+                        "error": message,
+                    },
+                    terminate=True,
+                )
+            return DeclarationAction(handle=handle)
 
         if authorized is False:
             message = self._denied_message(resolved_path)
             if self._finish_declaration(
                 handle, entry, request, AuthorizationStatus.DENIED, message
             ):
-                return {
-                    "request_id": request.request_id,
-                    "status": "denied",
-                    "error": message,
-                }
-            return None
+                return DeclarationAction(
+                    handle=handle,
+                    reply={
+                        "request_id": request.request_id,
+                        "status": "denied",
+                        "error": message,
+                    },
+                    terminate=True,
+                )
+            return DeclarationAction(handle=handle)
 
         if delete_existing:
-            try:
-                self._store.path_policy.delete(
-                    resolved_path,
-                    allow_broken_leaf_symlink=True,
-                    authorize=self._store.backend.is_path_authorized,
-                )
-            except _CLEANUP_ERRORS as exc:
-                error = {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "traceback": traceback.format_exc(),
-                }
-                message = f"Artifact preparation failed for {resolved_path}: {exc}"
-                self._finish_declaration(
+            error = self.delete_authorized_path(
+                resolved_path, allow_broken_leaf_symlink=True
+            )
+            if error is not None:
+                message = f"Artifact preparation failed for {resolved_path}: {error['message']}"
+                terminated = self._finish_declaration(
                     handle,
                     entry,
                     request,
@@ -792,7 +884,7 @@ class AuthorizationCoordinator:
                     message,
                     error,
                 )
-                return None
+                return DeclarationAction(handle=handle, terminate=terminated)
 
         # 短锁内二次复核：若锁外 I/O 期间 notify_stop() 已中止或已进入停机态，绝不覆盖为 APPROVED。
         approved_reply: dict[str, Any] | None = None
@@ -808,7 +900,7 @@ class AuthorizationCoordinator:
                 or request.status is not AuthorizationStatus.PENDING
                 or exec_key in self._declaration_outcomes
             ):
-                return None
+                return DeclarationAction(handle=handle)
             if self._is_stopping():
                 stopped_path = request.resolved_path
                 stopped_msg = self._stopped_message(stopped_path)
@@ -831,19 +923,19 @@ class AuthorizationCoordinator:
             logger.info(
                 f"FILE AUTHORIZATION APPROVED: {handle.job_uid} {approved_path}"
             )
-            return approved_reply
+            return DeclarationAction(handle=handle, reply=approved_reply)
         if stopped_transition:
             logger.info(
                 f"FILE AUTHORIZATION STOPPED: "
                 f"{handle.job_uid} {stopped_path} ({stopped_msg})"
             )
-            self._channel.terminate_process(handle)
-        return None
+            return DeclarationAction(handle=handle, terminate=True)
+        return DeclarationAction(handle=handle)
 
     def _transition_declaration_terminal_locked(
         self,
         handle: JobHandle,
-        entry: "InFlightJob",
+        entry: InFlightJob,
         request: PendingDeclaration,
         status: AuthorizationStatus,
         message: str,
@@ -874,7 +966,7 @@ class AuthorizationCoordinator:
     def _finish_declaration(
         self,
         handle: JobHandle,
-        entry: "InFlightJob",
+        entry: InFlightJob,
         request: PendingDeclaration,
         status: AuthorizationStatus,
         message: str,
@@ -891,7 +983,6 @@ class AuthorizationCoordinator:
             f"FILE AUTHORIZATION {status.value.upper()}: "
             f"{handle.job_uid} {resolved_path} ({message})"
         )
-        self._channel.terminate_process(handle)
         return True
 
     @staticmethod
@@ -906,25 +997,35 @@ class AuthorizationCoordinator:
 
     def evaluate_cleanup(
         self,
-        entry: "InFlightJob | None",
-        result: "ExecutionResult",
+        entry: InFlightJob | None,
+        *,
+        result_success: bool,
+        existing_outcome: AuthorizationOutcome | None,
         active_files: Mapping[str, FileSpec],
-    ) -> CleanupAuthorizationDecision:
-        """评估执行收尾清理所需的全部路径授权；若待决或受阻进程仍在运行则返回 PENDING。"""
+        is_handle_alive: Callable[[JobHandle], bool] | None = None,
+    ) -> CleanupEvaluation:
+        """评估执行收尾清理所需的全部路径授权；返回不可变决策，不原地改写结果或操作通道。"""
         handle = entry.handle if entry is not None else None
         waiting = entry is not None and self.has_pending_cleanup(entry.job_uid)
-        if result.authorization_outcome is not None:
+        if existing_outcome is not None:
             if (
                 waiting
                 and handle is not None
-                and self._channel.is_handle_alive(handle)
+                and is_handle_alive is not None
+                and is_handle_alive(handle)
             ):
-                return CleanupAuthorizationDecision.PENDING
-            return CleanupAuthorizationDecision.READY
+                return CleanupEvaluation(
+                    decision=CleanupAuthorizationDecision.PENDING,
+                    outcome=existing_outcome,
+                )
+            return CleanupEvaluation(
+                decision=CleanupAuthorizationDecision.READY,
+                outcome=existing_outcome,
+            )
 
         policy = self._store.path_policy
         for spec in active_files.values():
-            requested = spec.delete_on_success if result.success else spec.delete_on_failure
+            requested = spec.delete_on_success if result_success else spec.delete_on_failure
             if not requested or spec.path is None:
                 continue
             try:
@@ -934,40 +1035,40 @@ class AuthorizationCoordinator:
                 continue
 
             if self._is_stopping() and waiting:
-                result.authorization_outcome = self._stopped_outcome(spec.path)
+                outcome = self._stopped_outcome(spec.path)
             else:
-                decision = self._store.check_or_request_authorization(spec.path)
+                decision = self.check_or_request_authorization(spec.path)
                 if self._is_stopping() and (waiting or decision is None):
-                    result.authorization_outcome = self._stopped_outcome(spec.path)
+                    outcome = self._stopped_outcome(spec.path)
                 elif decision is True:
                     continue
                 elif decision is None:
-                    return CleanupAuthorizationDecision.PENDING
+                    return CleanupEvaluation(decision=CleanupAuthorizationDecision.PENDING)
                 else:
-                    result.authorization_outcome = self._denied_outcome(spec.path)
+                    outcome = self._denied_outcome(spec.path)
 
-            if handle is not None:
-                self._channel.terminate_process(handle)
-                if self._channel.is_handle_alive(handle):
-                    return CleanupAuthorizationDecision.PENDING
-            return CleanupAuthorizationDecision.READY
+            return CleanupEvaluation(
+                decision=CleanupAuthorizationDecision.READY,
+                outcome=outcome,
+                terminate_handle=handle,
+            )
 
         # 后续询问回调可能改变此前目标，整组复核通过后再交付实际清理。
         for spec in active_files.values():
-            requested = spec.delete_on_success if result.success else spec.delete_on_failure
+            requested = spec.delete_on_success if result_success else spec.delete_on_failure
             if requested and spec.path and not self._store.is_path_authorized(spec.path):
                 try:
                     present = policy.inspect(spec.path, mode="strict", verify_unchanged=True).exists
                 except _CLEANUP_ERRORS:
                     continue
                 if present:
-                    return CleanupAuthorizationDecision.PENDING
-        return CleanupAuthorizationDecision.READY
+                    return CleanupEvaluation(decision=CleanupAuthorizationDecision.PENDING)
+        return CleanupEvaluation(decision=CleanupAuthorizationDecision.READY)
 
     def defer_cleanup(
         self,
-        entry: "InFlightJob",
-        result: "ExecutionResult",
+        entry: InFlightJob,
+        result: Any,
         prepared: Any,
     ) -> None:
         """将尚未完成授权或待进程退出的收尾项暂挂，并暂停其执行超时计时。"""
@@ -984,6 +1085,9 @@ class AuthorizationCoordinator:
 __all__ = [
     "AuthorizationCoordinator",
     "CleanupAuthorizationDecision",
+    "CleanupEvaluation",
+    "DeclarationAction",
+    "DispatchAuthorizationPoll",
     "PendingCleanup",
     "PendingDeclaration",
 ]

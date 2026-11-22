@@ -30,7 +30,7 @@ from tasklite.resource import (
     CapacityResource,
     IntervalResource,
 )
-from tasklite.testing import in_process_workers, observe_wait
+from tasklite.testing import get_resource, in_process_workers, inject_resource, observe_wait
 
 
 def _fast_handler(job, ctx):
@@ -58,7 +58,7 @@ def test_capacity_two_concurrency_and_third_starts_on_release(tmp_path):
         max_workers=4,
     )
     p.register_resource(CapacityResource("slots", max_capacity=2.0))
-    cap = p._resources["slots"]
+    cap = get_resource(p, "slots")
 
     p.register_task("sync", _sync_capacity_handler, resources={"slots": 1.0})
     payload = {"dir": str(sync_dir)}
@@ -127,7 +127,7 @@ def test_extra_notification_wakes_earlier_than_timer(tmp_path):
         max_workers=2,
     )
     p.register_resource(IntervalResource("gate", interval_seconds=100.0))
-    res = p._resources["gate"]
+    res = get_resource(p, "gate")
     p.register_task("fast", _fast_handler, resources={"gate": 1.0})
 
     p.enqueue(Job("fast", "j1"))
@@ -180,7 +180,6 @@ def test_long_wait_uses_single_deadline_without_resource_polling(tmp_path):
         max_workers=2,
     )
     res = CountingIntervalResource()
-    p._resources["long_wait"] = res
     res.acquire(1.0)  # 消费时间片使其需等待 3600s
     p.register_task("fast", _fast_handler, resources={"long_wait": 1.0})
     p.enqueue(Job("fast", "j1"))
@@ -193,15 +192,16 @@ def test_long_wait_uses_single_deadline_without_resource_polling(tmp_path):
             p.run(install_signals=False)
             wait_timeouts.extend(observed)
 
-    run_thread = threading.Thread(target=_run)
-    run_thread.start()
-    try:
-        assert res.queried.wait(5.0)
-        assert wait_entered.wait(5.0)
-        assert res.queries == 1
-    finally:
-        p.stop()
-    run_thread.join(timeout=5.0)
+    with inject_resource(p, "long_wait", res):
+        run_thread = threading.Thread(target=_run)
+        run_thread.start()
+        try:
+            assert res.queried.wait(5.0)
+            assert wait_entered.wait(5.0)
+            assert res.queries == 1
+        finally:
+            p.stop()
+        run_thread.join(timeout=5.0)
 
     assert not run_thread.is_alive()
     assert wait_timeouts and wait_timeouts[-1] is not None
@@ -233,7 +233,6 @@ def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
         max_workers=2,
     )
     ext_res = ExternalNotifierResource("ext")
-    p._resources["ext"] = ext_res
     p.register_task("fast", _fast_handler, resources={"ext": 1.0})
     p.enqueue(Job("fast", "j1"))
 
@@ -247,22 +246,23 @@ def test_unknown_wait_time_not_treated_as_impossible(tmp_path):
         with in_process_workers(p), observe_wait(p, _on_wait):
             p.run(install_signals=False)
 
-    run_thread = threading.Thread(target=_run)
-    run_thread.start()
+    with inject_resource(p, "ext", ext_res):
+        run_thread = threading.Thread(target=_run)
+        run_thread.start()
 
-    # 处于暂不可用且无恢复时间，不能被推断为死锁或失败
-    assert wait_entered.wait(5.0)
-    assert (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") != "failed"
+        # 处于暂不可用且无恢复时间，不能被推断为死锁或失败
+        assert wait_entered.wait(5.0)
+        assert (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") != "failed"
 
-    # 外部状态就绪并触发通知
-    ext_res.ready = True
-    ext_res.notify()
+        # 外部状态就绪并触发通知
+        ext_res.ready = True
+        ext_res.notify()
 
-    deadline = time.monotonic() + 5.0
-    while (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") != "succeeded" and time.monotonic() < deadline:
-        time.sleep(0.01)
+        deadline = time.monotonic() + 5.0
+        while (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") != "succeeded" and time.monotonic() < deadline:
+            time.sleep(0.01)
 
-    run_thread.join(timeout=5.0)
+        run_thread.join(timeout=5.0)
     assert (StateSnapshot.open(p).get_job("fast::j1") or {}).get("status") == "succeeded"
 
 
@@ -304,12 +304,12 @@ def test_resource_exception_fails_run(tmp_path):
             pass
 
     p = TaskLite(backend="memory")
-    p._resources["bad_q"] = BadQueryResource("bad_q")
     p.register_task("fast", _fast_handler, resources={"bad_q": 1.0})
     p.enqueue(Job("fast", "j1"))
 
-    with pytest.raises(RuntimeError, match="query exploded"):
-        p.run(install_signals=False)
+    with inject_resource(p, "bad_q", BadQueryResource("bad_q")):
+        with pytest.raises(RuntimeError, match="query exploded"):
+            p.run(install_signals=False)
 
     class BadAcquireResource(Resource):
         def can_acquire(self, amount: float) -> ResourceQueryResult:
@@ -322,12 +322,12 @@ def test_resource_exception_fails_run(tmp_path):
             pass
 
     p2 = TaskLite(backend="memory")
-    p2._resources["bad_acq"] = BadAcquireResource("bad_acq")
     p2.register_task("fast", _fast_handler, resources={"bad_acq": 1.0})
     p2.enqueue(Job("fast", "j2"))
 
-    with pytest.raises(RuntimeError, match="acquire exploded"):
-        p2.run(install_signals=False)
+    with inject_resource(p2, "bad_acq", BadAcquireResource("bad_acq")):
+        with pytest.raises(RuntimeError, match="acquire exploded"):
+            p2.run(install_signals=False)
 
     class BadReleaseResource(Resource):
         def can_acquire(self, amount: float) -> ResourceQueryResult:
@@ -340,19 +340,19 @@ def test_resource_exception_fails_run(tmp_path):
             raise RuntimeError("release exploded")
 
     p3 = TaskLite(backend="memory")
-    p3._resources["bad_rel"] = BadReleaseResource("bad_rel")
     p3.register_task("fast", _fast_handler, resources={"bad_rel": 1.0})
     p3.enqueue(Job("fast", "j3"))
 
-    with pytest.raises(RuntimeError, match="release exploded"):
-        p3.run(install_signals=False)
+    with inject_resource(p3, "bad_rel", BadReleaseResource("bad_rel")):
+        with pytest.raises(RuntimeError, match="release exploded"):
+            p3.run(install_signals=False)
 
 
 def test_release_prior_to_final_commit_and_no_dispatch_between(tmp_path):
     """释放先于最终提交且不在两者间派发。"""
     p = TaskLite(backend="memory")
     p.register_resource(CapacityResource("slots", max_capacity=1.0))
-    cap = p._resources["slots"]
+    cap = get_resource(p, "slots")
 
     events: list[str] = []
 

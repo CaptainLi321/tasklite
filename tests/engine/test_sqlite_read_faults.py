@@ -1,12 +1,13 @@
 """SQLite 初始化与读取故障在公开入口保留原始证据。"""
 from __future__ import annotations
 
+from contextlib import closing
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from tasklite import Job, TaskLite, TaskResult
+from tasklite import Job, StateSnapshot, TaskLite, TaskResult
 from tasklite.backend import SQLiteStateBackend
 
 
@@ -117,9 +118,9 @@ def test_public_read_fault_is_original_without_task_failure(tmp_path, monkeypatc
             pipeline.enqueue(job)
             pipeline.run(install_signals=False)
             pipeline.enqueue(job)
-        backend = pipeline._runtime.store.backend
-        before_queue = backend.load_queue_jobs()
-        before_successes = backend.load_successes()
+        with StateSnapshot.open(pipeline) as snap:
+            before_pending = list(snap.iter_jobs(status='pending'))
+            before_succeeded = list(snap.iter_jobs(status='succeeded'))
         errors, _ = _observe_sqlite(
             monkeypatch,
             lambda action, first, second: action == sqlite3.SQLITE_READ and first == table,
@@ -133,10 +134,11 @@ def test_public_read_fault_is_original_without_task_failure(tmp_path, monkeypatc
                 pipeline.enqueue(Job('work', 'child', depends_on=['work::parent']))
         _assert_original(caught, errors)
         monkeypatch.undo()
-        assert backend.load_queue_jobs() == before_queue
-        assert backend.load_successes() == before_successes
-        assert backend.load_failed() == {}
-        assert len([a for a in backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == job.uid]) == (1 if entry == 'trusted_baseline' else 0)
+        with StateSnapshot.open(pipeline) as snap:
+            assert list(snap.iter_jobs(status='pending')) == before_pending
+            assert list(snap.iter_jobs(status='succeeded')) == before_succeeded
+            assert list(snap.iter_jobs(status='failed')) == []
+            assert len(list(snap.iter_attempts(job_uid=job.uid))) == (1 if entry == 'trusted_baseline' else 0)
 
 
 @pytest.mark.parametrize('reader,table', [
@@ -204,14 +206,16 @@ def test_corrupt_json_read_preserves_decoder_error(tmp_path, monkeypatch, reader
     import json
     import tasklite.backend.sqlite_backend as sqlite_backend
 
-    backend = SQLiteStateBackend(tmp_path / 'state.db')
+    db_path = tmp_path / 'state.db'
+    backend = SQLiteStateBackend(db_path)
     backend.enqueue_jobs([Job('work', 'one').to_dict()])
     backend.commit_job_failures([('work::failed', {'message': '业务失败'}, {'key': 'value'})])
-    with backend._get_conn() as connection:
-        if table == 'successes':
-            connection.execute("INSERT INTO successes VALUES ('work::success', 'broken')")
-        else:
-            connection.execute(f"UPDATE {table} SET {column} = 'broken'")
+    with closing(sqlite3.connect(db_path)) as connection:
+        with connection:
+            if table == 'successes':
+                connection.execute("INSERT INTO successes VALUES ('work::success', 'broken')")
+            else:
+                connection.execute(f"UPDATE {table} SET {column} = 'broken'")
     loads = sqlite_backend.loads
     errors = []
 

@@ -541,10 +541,13 @@ class TestWindowsFilesystemAdapter:
             policy = PathPolicy(base_dir=work_dir, state_path=state_db)
             assert policy.is_protected(junc) is True
 
+            from tasklite.engine.authorization import AuthorizationCoordinator
+
             store = StateStore(backend=InMemoryStateBackend(), base_dir=work_dir, path_policy=policy)
+            coord = AuthorizationCoordinator(store=store)
             calls: list[tuple[str, str]] = []
-            with authorizer(store, lambda p, t: calls.append((p, t)) or True):
-                assert store.check_or_request_authorization(junc) is False
+            with authorizer(coord, lambda p, t: calls.append((p, t)) or True):
+                assert coord.check_or_request_authorization(junc) is False
             assert calls == []
             assert store.list_authorizations() == []
         finally:

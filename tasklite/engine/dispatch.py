@@ -16,7 +16,6 @@ import enum
 import logging
 import threading
 import time
-import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
@@ -169,7 +168,7 @@ class DispatchMachine:
         session: "RunSession",
         completion: "CompletionMachine",
         tasks: "TaskRegistry",
-        authorization: AuthorizationCoordinator | None = None,
+        authorization: AuthorizationCoordinator,
         dispatch_start_lock: Any | None = None,
     ) -> None:
         self._store = store
@@ -181,16 +180,7 @@ class DispatchMachine:
         self._session = session
         self._completion = completion
         self._tasks = tasks
-        self._authorization = (
-            authorization
-            if authorization is not None
-            else AuthorizationCoordinator(
-                store=store,
-                channel=channel,
-                in_flight=in_flight,
-                session=session,
-            )
-        )
+        self._authorization = authorization
         self._dispatch_start_lock = dispatch_start_lock or threading.RLock()
 
     # ── 扫描与派发接缝 ────────────────────────────────────────────────
@@ -211,15 +201,20 @@ class DispatchMachine:
         - NO_CANDIDATE：无可运行作业，停摆事实随 standstill 供仲裁。
         """
         store = self._store
-        auth_status = self._authorization.poll_dispatch_authorization()
-        if auth_status is AuthorizationStatus.STOPPED:
+        poll = self._authorization.poll_dispatch_authorization(
+            resolve_job=self._lookup_queued_job
+        )
+        if poll.status is AuthorizationStatus.STOPPED:
             return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
-        if auth_status is AuthorizationStatus.PENDING:
+        if poll.status is AuthorizationStatus.PENDING:
             return DispatchOutcome(kind=DispatchKind.AUTHORIZATION_PENDING)
-        if auth_status in (
-            AuthorizationStatus.DENIED,
-            AuthorizationStatus.PREPARATION_FAILED,
-        ):
+        if poll.status is AuthorizationStatus.PREPARATION_FAILED:
+            if poll.job_uid is not None and poll.error is not None:
+                self._fail_queued_job_preparation(poll.job_uid, poll.error)
+            return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
+        if poll.status is AuthorizationStatus.DENIED:
+            if poll.job_uid is not None:
+                self._session.temporarily_exclude_chain(poll.job_uid, store.state)
             return DispatchOutcome(kind=DispatchKind.HANDLED_NO_SUBPROCESS)
 
         sched = self._scheduler.scan_next_runnable(store.state, store.state.in_flight_uids)
@@ -280,7 +275,7 @@ class DispatchMachine:
         resolved_files: dict[str, FileSpec] = {}
         if job.files:
             try:
-                resolved_files = self._resolve_job_files(job)
+                resolved_files = self._authorization.resolve_job_files(job)
             except Exception as err:
                 job_snapshot = store.state.pop_job(sched.runnable_idx)
                 self._reject_and_commit(
@@ -288,11 +283,7 @@ class DispatchMachine:
                     job_snapshot,
                     {
                         "error_message": str(err),
-                        "exception": {
-                            "type": type(err).__name__,
-                            "message": str(err),
-                            "traceback": traceback.format_exc(),
-                        },
+                        "exception": AuthorizationCoordinator.format_error(err),
                     },
                 )
                 return None
@@ -313,6 +304,8 @@ class DispatchMachine:
 
         # 必要路径授权（未 running 不造 Attempt，授权拒绝本 Run 临时排除该作业及下游）
         auth_status = self._authorization.authorize_dispatch_files(job_uid, resolved_files)
+        if auth_status is AuthorizationStatus.DENIED:
+            self._session.temporarily_exclude_chain(job_uid, store.state)
         if auth_status is not AuthorizationStatus.APPROVED:
             return None
 
@@ -376,17 +369,16 @@ class DispatchMachine:
             # 屏障 3：获取资源后、前置删除与启动准备前
             guard.ensure_allowed()
 
-            policy = self._store.path_policy
-            authorize_cb = self._store.backend.is_path_authorized
-            try:
-                for fspec in resolved_files.values():
-                    if fspec.delete_existing and fspec.path:
-                        policy.delete(
-                            fspec.path,
-                            allow_broken_leaf_symlink=True,
-                            authorize=authorize_cb,
-                        )
-            except (OSError, ValueError, NotImplementedError) as exc:
+            pre_delete_error: dict[str, str] | None = None
+            for fspec in resolved_files.values():
+                if fspec.delete_existing and fspec.path:
+                    pre_delete_error = self._authorization.delete_authorized_path(
+                        fspec.path,
+                        allow_broken_leaf_symlink=True,
+                    )
+                    if pre_delete_error is not None:
+                        break
+            if pre_delete_error is not None:
                 acquired = guard.acquired
                 guard.acquired = []
                 guard.commit()
@@ -407,12 +399,8 @@ class DispatchMachine:
                         (
                             entry,
                             ExecutionResult(
-                                message=f"Pre-deletion failed: {exc}",
-                                exception={
-                                    "type": type(exc).__name__,
-                                    "message": str(exc),
-                                    "traceback": traceback.format_exc(),
-                                },
+                                message=f"Pre-deletion failed: {pre_delete_error['message']}",
+                                exception=pre_delete_error,
                             ),
                         )
                     ]
@@ -585,12 +573,45 @@ class DispatchMachine:
             files=files,
         )
 
-    def _resolve_job_files(self, job: Job) -> dict[str, FileSpec]:
-        """准入前基于统一 PathPolicy 单次原子解析预声明文件。"""
-        return {
-            name: self._store.resolve_file_spec(spec, depends_on=job.depends_on)
-            for name, spec in job.files.items()
-        }
+    def _lookup_queued_job(self, job_uid: str) -> Job | None:
+        """从当前队列查找指定 UID 对应的 Job 实例（只读查询，不出队）。"""
+        state = self._store.state
+        if job_uid not in state.queue_uids:
+            return None
+        for snapshot in state.queue:
+            job = Job.from_dict(snapshot)
+            if job.uid == job_uid:
+                return job
+        return None
+
+    def _fail_queued_job_preparation(
+        self,
+        job_uid: str,
+        error: dict[str, str],
+    ) -> None:
+        """派发前重校验失败时由派发机器自行出队并原子提交失败。"""
+        state = self._store.state
+        if job_uid not in state.queue_uids:
+            return
+        idx = next(
+            (
+                index
+                for index, snapshot in enumerate(state.queue)
+                if Job.from_dict(snapshot).uid == job_uid
+            ),
+            None,
+        )
+        if idx is None:
+            return
+        snapshot = state.pop_job(idx)
+        self._reject_and_commit(
+            job_uid,
+            snapshot,
+            {
+                "error_message": error["message"],
+                "exception": error,
+            },
+        )
 
     # ── 拒绝与异常分支 ────────────────────────────────────────────────
 

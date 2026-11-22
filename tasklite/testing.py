@@ -48,10 +48,13 @@ __all__ = [
     "cleanup_hook",
     "cursor_updates",
     "fake_ctx",
+    "get_resource",
     "in_process_workers",
+    "inject_resource",
     "monotonic_clock",
     "observe_wait",
     "running",
+    "seed_running_job",
     "spawned_jobs",
 ]
 
@@ -272,26 +275,89 @@ def authorizer(
     target: Any,
     fn: Callable[[str, str], bool | None] | None,
 ) -> Iterator[Any]:
-    """临时为 TaskLite / EngineRuntime / StateStore 注入授权回调。
+    """临时为 TaskLite / EngineRuntime / AuthorizationCoordinator 注入授权回调。
 
     进入上下文时保存原 ``authorizer`` 并替换为 ``fn``，退出时自动恢复原值，
-    避免测试直接修改 ``_runtime.store.authorizer`` 导致跨用例污染。
+    避免测试直接修改运行期协调器私有属性导致跨用例污染。
 
     Yields:
-        被注入授权回调的底层 ``StateStore`` 实例。
+        被注入授权回调的 ``AuthorizationCoordinator`` 实例。
     """
     rt = getattr(target, "_runtime", target)
-    store = getattr(rt, "store", rt)
-    if not hasattr(store, "authorizer"):
+    coord = getattr(rt, "authorization", rt)
+    if not hasattr(coord, "authorizer"):
         raise TypeError(
-            f"authorizer target has no store.authorizer attribute: {type(target).__name__}"
+            f"authorizer target has no authorization.authorizer attribute: {type(target).__name__}"
         )
-    previous = store.authorizer
-    store.authorizer = fn
+    previous = coord.authorizer
+    coord.authorizer = fn
     try:
-        yield store
+        yield coord
     finally:
-        store.authorizer = previous
+        coord.authorizer = previous
+
+
+def _resolve_resource_manager(target: Any) -> Any:
+    """从 TaskLite / EngineRuntime / ResourceManager 解析内部资源管理器。"""
+    manager = getattr(target, "_resources", None)
+    if manager is None:
+        rt = getattr(target, "_runtime", target)
+        config = getattr(rt, "config", None)
+        manager = getattr(config, "resources", rt)
+    if not (hasattr(manager, "__getitem__") and hasattr(manager, "__setitem__")):
+        raise TypeError(
+            f"target has no ResourceManager: {type(target).__name__}"
+        )
+    return manager
+
+
+def get_resource(target: Any, name: str) -> Any:
+    """受控获取 TaskLite / EngineRuntime / ResourceManager 中的内部资源实例。"""
+    manager = _resolve_resource_manager(target)
+    return manager[name]
+
+
+@contextmanager
+def inject_resource(target: Any, name: str, resource: Any) -> Iterator[Any]:
+    """受控注入测试用内部资源并在退出上下文时自动恢复原状态。"""
+    manager = _resolve_resource_manager(target)
+    existed = name in manager
+    previous = manager[name] if existed else None
+    manager[name] = resource
+    try:
+        yield resource
+    finally:
+        if existed:
+            manager[name] = previous
+        elif name in manager:
+            del manager[name]
+
+
+def seed_running_job(
+    target: Any,
+    job_uid: str,
+    *,
+    execution_id: str,
+    run_id: str,
+    started_at: str,
+) -> int:
+    """受控将已入队作业标记为遗留 running 状态（供恢复、编辑与快照测试复用）。"""
+    rt = getattr(target, "_runtime", target)
+    store = getattr(rt, "store", rt)
+    backend = getattr(store, "backend", store)
+    mark_running = getattr(backend, "mark_job_running", None)
+    if not callable(mark_running):
+        raise TypeError(
+            f"seed_running_job target has no backend.mark_job_running: {type(target).__name__}"
+        )
+    return int(
+        mark_running(
+            job_uid,
+            execution_id=execution_id,
+            run_id=run_id,
+            started_at=started_at,
+        )
+    )
 
 
 @contextmanager

@@ -15,7 +15,7 @@ from tasklite import (
     TaskResult,
 )
 from tasklite.backend.sqlite_backend import SQLiteStateBackend, TARGET_SCHEMA_VERSION
-from tasklite.testing import authorizer, in_process_workers
+from tasklite.testing import authorizer, in_process_workers, seed_running_job
 
 
 def dummy_handler(job, ctx):
@@ -516,7 +516,7 @@ def test_predispatch_failure_owns_current_result_and_configuration(
         assert current["result"]["metadata"] == {}
         exception = current["result"]["exception"]
         assert exception["type"] == "FileNotFoundError"
-        assert "_resolve_job_files" in exception["traceback"]
+        assert "resolve_job_files" in exception["traceback"]
         assert all(current[key] is None for key in ("run_id", "attempt_no", "started_at"))
         assert current["settled_at"] == "2030-01-02T03:04:05Z"
         assert current["job"]["payload"] == {"mode": "current"}
@@ -615,8 +615,8 @@ def test_running_recovery_current_failure_is_self_contained(tmp_path, backend):
         job = Job("process", "one", payload={"mode": "success"},
                   files={"out": FileSpec(tmp_path / "out", role="output")})
         p.enqueue(job)
-        p._runtime.store.backend.mark_job_running(
-            job.uid, execution_id="old.1", run_id="old", started_at="2026-01-01T00:00:00Z",
+        seed_running_job(
+            p, job.uid, execution_id="old.1", run_id="old", started_at="2026-01-01T00:00:00Z",
         )
         with in_process_workers(p):
             p.run(install_signals=False)
@@ -782,7 +782,8 @@ class TestQueueStartedAtProjection:
             j_pend = Job("process", "pending_one")
             p.enqueue(j_run)
             p.enqueue(j_pend)
-            p._runtime.store.backend.mark_job_running(
+            seed_running_job(
+                p,
                 j_run.uid,
                 execution_id="run_x.1",
                 run_id="run_x",
@@ -953,7 +954,8 @@ class TestStateSnapshotCopyMode:
                 p.run(install_signals=False)
             p.enqueue(Job("process", "pend"))
             p.enqueue(Job("generate", "run_item"))
-            p._runtime.store.backend.mark_job_running(
+            seed_running_job(
+                p,
                 "generate::run_item",
                 execution_id="run_live.1",
                 run_id="run_live",
@@ -1276,11 +1278,11 @@ class TestStateSnapshotReport:
             j_run_unknown = Job("fresh_type", "r_unknown")
             p.enqueue(j_run_known)
             p.enqueue(j_run_unknown)
-            backend.mark_job_running(
-                j_run_known.uid, execution_id="r_live.1", run_id="r_live", started_at="2026-08-01T01:00:00Z",
+            seed_running_job(
+                p, j_run_known.uid, execution_id="r_live.1", run_id="r_live", started_at="2026-08-01T01:00:00Z",
             )
-            backend.mark_job_running(
-                j_run_unknown.uid, execution_id="r_live.2", run_id="r_live", started_at="2026-08-01T01:00:02Z",
+            seed_running_job(
+                p, j_run_unknown.uid, execution_id="r_live.2", run_id="r_live", started_at="2026-08-01T01:00:02Z",
             )
 
             # 5) 失败作业（带超长多行错误信息测试单行截断）

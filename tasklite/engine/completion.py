@@ -13,7 +13,6 @@ from __future__ import annotations
 import copy
 import logging
 import time
-import traceback
 from dataclasses import dataclass
 from typing import Any, Sequence, TYPE_CHECKING
 
@@ -30,7 +29,7 @@ from ..models.records import build_result_record, extract_effective_job_config
 from .authorization import AuthorizationCoordinator, CleanupAuthorizationDecision
 from .channel import ExecutionResult, JobHandle
 from .in_flight import InFlightJob, InFlightTracker
-from .types import AuthorizationStatus
+from .types import AuthorizationOutcome, AuthorizationStatus
 
 logger = logging.getLogger("tasklite")
 _CLEANUP_ERRORS = (OSError, ValueError, NotImplementedError)
@@ -40,6 +39,8 @@ _CLEANUP_ERRORS = (OSError, ValueError, NotImplementedError)
 class _PreparedCompletion:
     active_files: dict[str, FileSpec]
     spawned_job_snapshots: list[dict[str, Any]]
+    authorization_outcome: AuthorizationOutcome | None = None
+    cleanup_authorized: bool = False
 
 
 class CompletionMachine:
@@ -53,40 +54,21 @@ class CompletionMachine:
         resources: "ResourceManager",
         in_flight: "InFlightTracker",
         session: "RunSession",
-        authorization: AuthorizationCoordinator | None = None,
+        authorization: AuthorizationCoordinator,
     ) -> None:
         self._store = store
         self._channel = channel
         self._resources = resources
         self._in_flight = in_flight
         self._session = session
-        self._authorization = (
-            authorization
-            if authorization is not None
-            else AuthorizationCoordinator(
-                store=store,
-                channel=channel,
-                in_flight=in_flight,
-                session=session,
-            )
-        )
+        self._authorization = authorization
 
     @staticmethod
-    def _cleanup_exception(exc: BaseException) -> dict[str, str]:
-        return {
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "traceback": traceback.format_exc(),
-        }
-
-    @classmethod
     def _attach_cleanup_failure(
-        cls,
         result: ExecutionResult,
-        exc: BaseException,
+        details: dict[str, str],
     ) -> None:
-        details = cls._cleanup_exception(exc)
-        result.annotations["cleanup_error"] = str(exc)
+        result.annotations["cleanup_error"] = details["message"]
         result.annotations["cleanup_exception"] = details
         if result.exception is None:
             result.exception = details
@@ -95,22 +77,23 @@ class CompletionMachine:
     def _record_failure_cleanup_error(
         cls,
         result: ExecutionResult,
-        exc: BaseException,
+        details: dict[str, str],
     ) -> None:
-        cls._attach_cleanup_failure(result, exc)
+        cls._attach_cleanup_failure(result, details)
+        err_msg = details["message"]
         if result.retry_requested:
             original_message = result.message
             if original_message:
                 result.annotations["cleanup_original_message"] = original_message
             result.retry_requested = False
-            result.message = f"Retry cleanup failed: {exc}"
+            result.message = f"Retry cleanup failed: {err_msg}"
             if original_message:
                 result.message = f"{result.message} (original: {original_message})"
             return
         if result.message:
-            result.message = f"{result.message} (cleanup failed: {exc})"
+            result.message = f"{result.message} (cleanup failed: {err_msg})"
         else:
-            result.message = f"Cleanup failed: {exc}"
+            result.message = f"Cleanup failed: {err_msg}"
 
     # ── 唯一收尾出口 ──────────────────────────────────────────────────
 
@@ -173,7 +156,11 @@ class CompletionMachine:
             }
 
         if result.authorization_outcome is not None:
-            return _PreparedCompletion(active_files, [])
+            return _PreparedCompletion(
+                active_files,
+                [],
+                authorization_outcome=result.authorization_outcome,
+            )
         if result.artifact_error is not None:
             raise _ArtifactIOError(result.artifact_error)
         if result.success:
@@ -192,7 +179,9 @@ class CompletionMachine:
                 except _CLEANUP_ERRORS as exc:
                     result.success = False
                     result.message = f"Output verification failed: {exc}"
-                    self._attach_cleanup_failure(result, exc)
+                    self._attach_cleanup_failure(
+                        result, AuthorizationCoordinator.format_error(exc)
+                    )
                     break
                 if not present:
                     # strict inspect 已执行根、受保护路径与符号链接边界防护。若声明了成功删除，
@@ -221,7 +210,52 @@ class CompletionMachine:
                     result.message = f"Invalid cursor update: {k!r}={v!r}"
                     break
 
-        return _PreparedCompletion(active_files, spawned_job_snapshots)
+        return _PreparedCompletion(
+            active_files,
+            spawned_job_snapshots,
+            authorization_outcome=result.authorization_outcome,
+        )
+
+    def _prepare_for_settlement(
+        self,
+        uid: str,
+        job: Job,
+        result: ExecutionResult,
+        entry: InFlightJob | None,
+        *,
+        prepared: _PreparedCompletion | None = None,
+    ) -> _PreparedCompletion | None:
+        """统一收尾准备与清理授权评估（settle_reaped 与 apply_result 共用单一路径）。
+
+        清理授权待决或受阻进程待退出时暂挂并返回 None；就绪时标记 ``cleanup_authorized=True`` 返回。
+        """
+        if prepared is None:
+            prepared = self._prepare_completion(uid, job, result, entry)
+        if prepared.cleanup_authorized:
+            return prepared
+
+        evaluation = self._authorization.evaluate_cleanup(
+            entry,
+            result_success=result.success,
+            existing_outcome=prepared.authorization_outcome,
+            active_files=prepared.active_files,
+            is_handle_alive=self._channel.is_handle_alive,
+        )
+        if evaluation.outcome is not None:
+            prepared.authorization_outcome = evaluation.outcome
+        if evaluation.terminate_handle is not None:
+            self._channel.terminate_process(evaluation.terminate_handle)
+            if self._channel.is_handle_alive(evaluation.terminate_handle):
+                if entry is not None:
+                    self._authorization.defer_cleanup(entry, result, prepared)
+                return None
+        elif evaluation.decision is CleanupAuthorizationDecision.PENDING:
+            if entry is not None:
+                self._authorization.defer_cleanup(entry, result, prepared)
+            return None
+
+        prepared.cleanup_authorized = True
+        return prepared
 
     def apply_result(
         self,
@@ -256,18 +290,14 @@ class CompletionMachine:
 
         released = False
         try:
-            if prepared is None:
-                prepared = self._prepare_completion(uid, job, result, entry)
-                decision = self._authorization.evaluate_cleanup(
-                    entry, result, prepared.active_files
-                )
-                if decision is CleanupAuthorizationDecision.PENDING:
-                    if entry is not None:
-                        self._authorization.defer_cleanup(entry, result, prepared)
-                    return False
-            active_files = prepared.active_files
+            ready = self._prepare_for_settlement(
+                uid, job, result, entry, prepared=prepared
+            )
+            if ready is None:
+                return False
+            active_files = ready.active_files
 
-            authorization_outcome = result.authorization_outcome
+            authorization_outcome = ready.authorization_outcome
             if (
                 authorization_outcome is not None
                 and authorization_outcome.status
@@ -299,22 +329,19 @@ class CompletionMachine:
                 result.will_retry = False
                 return True
 
-            spawned_job_snapshots = prepared.spawned_job_snapshots
+            spawned_job_snapshots = ready.spawned_job_snapshots
 
-            # 声明式产物主进程清理
+            # 声明式产物主进程清理（经 AuthorizationCoordinator 单一受控删除出口）
             if active_files:
-                policy = self._store.path_policy
-                authorize_cb = self._store.backend.is_path_authorized
                 if result.success:
                     for _fname, spec in active_files.items():
                         if not (spec.delete_on_success and spec.path):
                             continue
-                        try:
-                            policy.delete(spec.path, authorize=authorize_cb)
-                        except _CLEANUP_ERRORS as exc:
+                        err = self._authorization.delete_authorized_path(spec.path)
+                        if err is not None:
                             result.success = False
-                            result.message = f"Success cleanup failed: {exc}"
-                            self._attach_cleanup_failure(result, exc)
+                            result.message = f"Success cleanup failed: {err['message']}"
+                            self._attach_cleanup_failure(result, err)
                             break
                     if not result.success:
                         spawned_job_snapshots = []
@@ -323,10 +350,9 @@ class CompletionMachine:
                     for _fname, spec in active_files.items():
                         if not (spec.delete_on_failure and spec.path):
                             continue
-                        try:
-                            policy.delete(spec.path, authorize=authorize_cb)
-                        except _CLEANUP_ERRORS as exc:
-                            self._record_failure_cleanup_error(result, exc)
+                        err = self._authorization.delete_authorized_path(spec.path)
+                        if err is not None:
+                            self._record_failure_cleanup_error(result, err)
 
             # 释放资源（必须在事务提交之前完成）
             if entry is not None:
@@ -645,16 +671,13 @@ class CompletionMachine:
             entry = self._in_flight.get(source.job_uid)
             if entry is None:
                 continue
-            if prepared is None:
-                prepared = self._prepare_completion(entry.job_uid, entry.job, result, entry)
-            decision = self._authorization.evaluate_cleanup(
-                entry, result, prepared.active_files
+            ready = self._prepare_for_settlement(
+                entry.job_uid, entry.job, result, entry, prepared=prepared
             )
-            if decision is CleanupAuthorizationDecision.PENDING:
-                self._authorization.defer_cleanup(entry, result, prepared)
+            if ready is None:
                 continue
             # 框架异常立即上抛，未提交条目保留归属，由异常回收统一处理。
-            self.complete_job(entry, result, prepared=prepared)
+            self.complete_job(entry, result, prepared=ready)
             settled_count += 1
         return settled_count
 
