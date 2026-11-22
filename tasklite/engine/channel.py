@@ -1,4 +1,4 @@
-"""v2 执行通道：线性两阶段启动、单一会话状态机、阶梯看门狗、瞬时 Pipe 收割与 TOCTOU 中止。
+"""执行通道：线性两阶段启动、单一会话状态机、阶梯看门狗、瞬时 Pipe 收割与 TOCTOU 中止。
 
 ExecutionChannel 以每执行单一会话对象（``_ExecutionSession``）统一管理
 ``prepared -> active -> lingering -> closed`` 全生命周期状态，通过
@@ -34,7 +34,7 @@ from .launcher import (
     WorkerLauncher,
     _WorkerLaunchCancelled,
 )
-from .types import AuthorizationOutcome, JobHandle, is_importing_mp_main
+from .types import JobHandle, is_importing_mp_main
 
 logger = logging.getLogger("tasklite")
 
@@ -262,7 +262,6 @@ class ExecutionResult:
     cursor_updates: dict[str, str | None] = field(default_factory=dict)
     will_retry: bool = False
     artifact_error: str | None = None
-    authorization_outcome: AuthorizationOutcome | None = None
     annotations: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -334,7 +333,7 @@ class ExecutionChannel:
         self._sessions: dict[str, _ExecutionSession] = {}
         self._declaration_handler: Callable[[JobHandle, dict[str, Any]], dict[str, Any] | None] | None = None
         self._is_timeout_paused_cb: Callable[[JobHandle], bool] | None = None
-        self._get_authorization_outcome_cb: Callable[[JobHandle], AuthorizationOutcome | None] | None = None
+        self._is_aborted_cb: Callable[[JobHandle], bool] | None = None
         self._get_timeout_at_cb: Callable[[JobHandle], float] | None = None
         self._wakeup_callback: Callable[[], None] | None = None
 
@@ -418,9 +417,14 @@ class ExecutionChannel:
             kill()
 
     @staticmethod
+    def _is_process_closed(p: Any) -> bool:
+        """经 ManagedWorkerHandle 公开属性查询句柄是否已关闭。"""
+        return bool(getattr(p, "is_closed", False))
+
+    @staticmethod
     def _terminate_and_join_process(p: Any) -> None:
         """终止并等待子进程退出（不调用 close，保留 exitcode 供解码读取）。"""
-        if getattr(p, "_closed", False):
+        if ExecutionChannel._is_process_closed(p):
             return
         try:
             is_alive_fn = getattr(p, "is_alive", None)
@@ -438,7 +442,7 @@ class ExecutionChannel:
     @staticmethod
     def _finalize_process(p: Any) -> None:
         """清理单个子进程：kill_tree + join + close（各步失败降级但留痕，不阻断收割）。"""
-        if getattr(p, "_closed", False):
+        if ExecutionChannel._is_process_closed(p):
             return
         ExecutionChannel._terminate_and_join_process(p)
         try:
@@ -758,21 +762,21 @@ class ExecutionChannel:
         self,
         *,
         is_timeout_paused: Callable[[JobHandle], bool] | None = None,
-        get_outcome: Callable[[JobHandle], AuthorizationOutcome | None] | None = None,
+        is_aborted: Callable[[JobHandle], bool] | None = None,
         get_timeout_at: Callable[[JobHandle], float] | None = None,
     ) -> None:
-        """绑定运行期授权状态只读查询回调（超时暂停判定、终态授权结果与有效截止时刻）。"""
+        """绑定运行期授权状态只读查询回调（超时暂停判定、中止判定与有效截止时刻）。"""
         self._is_timeout_paused_cb = is_timeout_paused
-        self._get_authorization_outcome_cb = get_outcome
+        self._is_aborted_cb = is_aborted
         self._get_timeout_at_cb = get_timeout_at
 
     def _is_timeout_paused(self, handle: JobHandle) -> bool:
         cb = self._is_timeout_paused_cb
         return bool(cb(handle)) if cb is not None else False
 
-    def _get_authorization_outcome(self, handle: JobHandle) -> AuthorizationOutcome | None:
-        cb = self._get_authorization_outcome_cb
-        return cb(handle) if cb is not None else None
+    def _is_aborted(self, handle: JobHandle) -> bool:
+        cb = self._is_aborted_cb
+        return bool(cb(handle)) if cb is not None else False
 
     def _get_timeout_at(self, handle: JobHandle) -> float:
         cb = self._get_timeout_at_cb
@@ -790,7 +794,7 @@ class ExecutionChannel:
     def is_handle_alive(self, handle: JobHandle) -> bool:
         """受控判定在途句柄对应子进程是否仍在运行（屏蔽已关闭句柄的 ValueError）。"""
         p = handle.process
-        if p is None or getattr(p, "_closed", False):
+        if p is None or self._is_process_closed(p):
             return False
         is_alive_fn = getattr(p, "is_alive", None)
         if not callable(is_alive_fn):
@@ -831,17 +835,6 @@ class ExecutionChannel:
             reply_sender.send_reply(reply)
         except OSError:
             pass
-
-    def _consume_result_if_present(self, handle: JobHandle) -> ExecutionResult | None:
-        """读取已收到的结果负载 → 守卫过滤 → 解码。"""
-        session = self._find_session(handle)
-        if session is None or session.error is not None:
-            return None
-        raw_res = session.result
-        if not isinstance(raw_res, dict):
-            return None
-        session.result = None
-        return _decode_ipc_result(raw_res, handle.job)
 
     def _lingering_sessions(self) -> list[_ExecutionSession]:
         """返回当前处于 ``lingering`` 状态的全部会话快照。"""
@@ -926,20 +919,21 @@ class ExecutionChannel:
             session = self._find_session(handle)
             self._receive_available(handle)
 
-            authorization_outcome = self._get_authorization_outcome(handle)
-            if authorization_outcome is not None:
+            if self._is_aborted(handle):
                 if not self.is_handle_alive(handle):
                     if session is not None:
                         self._close_session(session, finalize_process=True, receiver_timeout=0.2)
                     else:
                         self._finalize_process(p)
-                    decoded = ExecutionResult(
-                        success=False,
-                        message=authorization_outcome.message,
-                        exception=authorization_outcome.exception,
-                        authorization_outcome=authorization_outcome,
+                    completed.append(
+                        (
+                            handle,
+                            ExecutionResult(
+                                success=False,
+                                message="Execution aborted by authorization",
+                            ),
+                        )
                     )
-                    completed.append((handle, decoded))
                 continue
 
             # 1. 有效结果已到达：立即收割结果，不阻塞等待子进程退出
@@ -987,8 +981,7 @@ class ExecutionChannel:
         """收敛收割尾部：终止并收割子进程 → 排空管道至 EOF → 解码结果 → 关闭会话。"""
         p = handle.process
         session = self._find_session(handle)
-        authorization_outcome = self._get_authorization_outcome(handle)
-        if authorization_outcome is not None:
+        if self._is_aborted(handle):
             try:
                 self._terminate_and_join_process(p)
             finally:
@@ -998,9 +991,7 @@ class ExecutionChannel:
                     self._finalize_process(p)
             return ExecutionResult(
                 success=False,
-                message=authorization_outcome.message,
-                exception=authorization_outcome.exception,
-                authorization_outcome=authorization_outcome,
+                message="Execution aborted by authorization",
             )
 
         result: ExecutionResult | None = None

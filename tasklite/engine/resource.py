@@ -1,4 +1,4 @@
-"""v2 资源体系：CapacityResource / IntervalResource / ResourceManager 与事件等待。
+"""内部资源体系：CapacityResource / IntervalResource / ResourceManager 与事件等待。
 
 ResourceManager 是统一资源管理器深模块：资源注册表（Dict-like）、
 Task 默认资源单点合并、三态可用性评估（可用、暂不可用、明确不可满足）、
@@ -44,11 +44,6 @@ class ResourceQueryResult:
     wait_seconds: float | None = None
     is_impossible: bool = False
     reason: str | None = None
-
-    def __iter__(self) -> Iterator[Any]:
-        """兼容 (is_available, wait_time) 解包语法。"""
-        yield self.is_available
-        yield self.wait_seconds if self.wait_seconds is not None else float("inf")
 
 
 class Resource(ABC):
@@ -289,7 +284,7 @@ class ResourceManager(MutableMapping[str, Resource]):
         for res in self._resources.values():
             res.unbind_notifier()
 
-    def notify(self, name: str | None = None) -> None:
+    def notify(self) -> None:
         """主动触发主进程唤醒。"""
         if self._notifier is not None:
             self._notifier.notify()
@@ -373,11 +368,6 @@ class ResourceManager(MutableMapping[str, Resource]):
                     reason=f"Resource '{res_name}' is not registered",
                 )
             query = res.can_acquire(amount)
-            if isinstance(query, tuple):
-                query = ResourceQueryResult(
-                    is_available=bool(query[0]),
-                    wait_seconds=query[1] if len(query) > 1 else None,
-                )
             if query.is_impossible:
                 return ResourceEvaluation(
                     is_available=False,

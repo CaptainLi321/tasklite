@@ -155,11 +155,19 @@ class CompletionMachine:
                 for k, v in job.files.items()
             }
 
-        if result.authorization_outcome is not None:
+        declaration_outcome = (
+            self._authorization.get_declaration_outcome(entry.handle)
+            if entry is not None and entry.handle is not None
+            else None
+        )
+        if declaration_outcome is not None:
+            result.success = False
+            result.message = declaration_outcome.message
+            result.exception = declaration_outcome.exception
             return _PreparedCompletion(
                 active_files,
                 [],
-                authorization_outcome=result.authorization_outcome,
+                authorization_outcome=declaration_outcome,
             )
         if result.artifact_error is not None:
             raise _ArtifactIOError(result.artifact_error)
@@ -213,7 +221,7 @@ class CompletionMachine:
         return _PreparedCompletion(
             active_files,
             spawned_job_snapshots,
-            authorization_outcome=result.authorization_outcome,
+            authorization_outcome=None,
         )
 
     def _prepare_for_settlement(

@@ -90,6 +90,9 @@ class ManagedWorkerHandle(Protocol):
     @property
     def was_force_killed(self) -> bool: ...
 
+    @property
+    def is_closed(self) -> bool: ...
+
     def is_alive(self) -> bool: ...
 
     def join(self, timeout: float | None = None) -> None: ...
@@ -278,6 +281,11 @@ class _BasePopenWorkerHandle(ABC):
     def was_force_killed(self) -> bool:
         with self._lock:
             return self._was_force_killed
+
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
     def is_alive(self) -> bool:
         with self._lock:

@@ -275,7 +275,7 @@ class TestApplySkip:
         if dispatched:
             state.pop_job(0)
 
-        outcome = store.apply_skip("t::1", job_snapshot={"task_type": "t", "job_id": "1"})
+        outcome = store.apply_skip("t::1")
 
         assert isinstance(outcome, SkipOutcome)
         assert outcome.was_known is True
@@ -291,7 +291,7 @@ class TestApplySkip:
         state.spawn_jobs([pending])
         backend.enqueue_jobs([pending])
 
-        store.apply_skip("t::skip", job_snapshot=pending)
+        store.apply_skip("t::skip")
 
         assert state.is_empty
         assert state.in_flight_uids == {"t::running"}

@@ -158,7 +158,7 @@ class AuthorizationCoordinator:
             inspected = self._store.inspect_lookup(path)
             norm_path = inspected.canonical_path
             effective_type = inspected.target_type
-            if self._store.backend.is_path_authorized(norm_path, effective_type):
+            if self._store.is_path_authorized(norm_path, effective_type, canonical=True):
                 return True
             if os.environ.get("TASKLITE_DANGEROUS_AUTO_APPROVE") == "1":
                 decision: bool | None = True
@@ -168,7 +168,7 @@ class AuthorizationCoordinator:
                 return False
             if decision is not True:
                 return None if decision is None else False
-            self._store.backend.record_authorization(norm_path, effective_type)
+            self._store.record_authorization(norm_path, effective_type, canonical=True)
             # 询问期间文件可能变成目录，保存的文件授权不能扩大为目录树。
             after = self._store.inspect_lookup(path)
             if effective_type == "directory" or after.target_type != "directory":
@@ -240,6 +240,10 @@ class AuthorizationCoordinator:
         """查询指定在途句柄是否已产出动态声明终态授权结果。"""
         with self._lock:
             return self._declaration_outcomes.get(self._execution_key(handle))
+
+    def has_declaration_outcome(self, handle: JobHandle) -> bool:
+        """判断指定在途句柄是否已因动态声明授权失败/停止而进入中止态。"""
+        return self.get_declaration_outcome(handle) is not None
 
     def is_timeout_paused(self, handle: JobHandle) -> bool:
         """指定在途句柄是否因授权等待而暂停执行超时计时。"""

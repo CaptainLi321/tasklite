@@ -1,10 +1,9 @@
-"""v2 运行循环等待决策纯函数。
+"""运行循环等待决策纯函数。
 
 事件泵每拍把现场收敛为 LoopFacts 快照，经 decide_wait 求得
 WaitDecision——等待/空闲语义的唯一实现（单一真相源），表驱动单测锁定。
-等待来源包括授权决策复查、在途超时、死锁缺口等待、候选资源
-等待与 worker 槽位等待。除授权决策外均按已知截止点或通知推进，不做
-固定周期扫描。
+等待来源包括授权决策复查、在途超时、死锁缺口等待与候选资源等待。
+除授权决策外均按已知截止点或通知推进，不做固定周期扫描。
 """
 from __future__ import annotations
 
@@ -35,8 +34,6 @@ class LoopFacts:
     in_flight_wait: float | None = None
     # 存在等待外部 authorizer 再次决策的执行
     authorization_wait: bool = False
-    # 资源挂起最早恢复时刻，按 min 聚合各次派发结果中的正值
-    worker_wait: float = 0.0
     # governor gap 裁决等待
     deadlock_wait: float = 0.0
     # governor 仲裁的独立终止信号（区别于 is_idle）
@@ -66,8 +63,6 @@ def decide_wait(facts: LoopFacts) -> WaitDecision:
         deadlines.append(facts.deadlock_wait)
     if not facts.has_runnable and facts.min_wait != float("inf"):
         deadlines.append(facts.min_wait)
-    if facts.worker_wait > 0:
-        deadlines.append(facts.worker_wait)
     if facts.in_flight_wait is not None:
         deadlines.append(max(0.0, facts.in_flight_wait))
     if facts.authorization_wait:

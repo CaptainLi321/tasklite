@@ -978,14 +978,12 @@ def test_terminal_paths_release_reply_pipe_and_session(route):
             with pytest.raises(ValueError):
                 _wait_for_reap(channel, [handle])
         elif route == "authorization":
-            expected_outcome = AuthorizationOutcome(
-                status=AuthorizationStatus.DENIED, message="未获授权", path="output",
-            )
             channel.set_authorization_queries(
-                get_outcome=lambda h: expected_outcome if h is handle else None
+                is_aborted=lambda h: h is handle
             )
             result, = channel.reap_completed([handle])
-            assert result[1].authorization_outcome is expected_outcome
+            assert result[1].success is False
+            assert result[1].message == "Execution aborted by authorization"
         elif route == "cleanup":
             channel.cleanup_in_flight([handle])
         elif route == "close":
@@ -1006,19 +1004,17 @@ def test_terminal_paths_release_reply_pipe_and_session(route):
 
 
 def test_collect_outcome_authorization_clears_active_session():
-    """直接经 _collect_outcome 处理 authorization_outcome 时不得遗留活跃会话或句柄引用。"""
+    """直接经 _collect_outcome 处理中止执行时不得遗留活跃会话或句柄引用。"""
     launcher = _ScriptedLauncher(alive=True, exitcode=None, close_sender_on_release=False)
     channel = ExecutionChannel(launcher=launcher)
     try:
         handle = channel.spawn(make_spec(Job("task", "auth_collect"), lambda j, c: TaskResult.success()))
-        expected_outcome = AuthorizationOutcome(
-            status=AuthorizationStatus.STOPPED, message="stopped", path="out",
-        )
         channel.set_authorization_queries(
-            get_outcome=lambda h: expected_outcome if h is handle else None
+            is_aborted=lambda h: h is handle
         )
         outcome = channel._collect_outcome(handle)
-        assert outcome.authorization_outcome is expected_outcome
+        assert outcome.success is False
+        assert outcome.message == "Execution aborted by authorization"
         assert channel.active_handles() == []
         assert channel.get_reply_sender(_EXECUTION_ID) is None
         assert channel.has_active_workers is False

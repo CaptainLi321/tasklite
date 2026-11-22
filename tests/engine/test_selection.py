@@ -19,7 +19,7 @@ from tasklite.backend.memory import InMemoryStateBackend
 from tasklite.backend.sqlite_backend import SQLiteStateBackend
 from tasklite.selection import Exclude
 from tasklite.engine.governor import SelectionStandstill, partition_standstill
-from tasklite.engine.resource import Resource
+from tasklite.engine.resource import Resource, ResourceQueryResult
 from tasklite.engine.session import RunSession
 from tasklite.engine.store import StateStore
 from tasklite.exceptions import TaskLiteError
@@ -41,8 +41,8 @@ class CountingResource(Resource):
         self.acquires = 0
         self.used = 0.0
 
-    def can_acquire(self, amount: float) -> tuple[bool, float]:
-        return True, 0.0
+    def can_acquire(self, amount: float) -> ResourceQueryResult:
+        return ResourceQueryResult(is_available=True, wait_seconds=0.0)
 
     def acquire(self, amount: float) -> None:
         self.acquires += 1
@@ -50,9 +50,6 @@ class CountingResource(Resource):
 
     def release(self, amount: float) -> None:
         self.used -= amount
-
-    def suspend(self, seconds: float) -> None:
-        return None
 
 
 def _make_stub_launcher(*, fail_uid=None, spawn_jobs=(), seen=None):

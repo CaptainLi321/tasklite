@@ -141,7 +141,6 @@ class TestDispatchOutcomeKind:
         env.store.state.spawn_jobs([Job("t", "j1").to_dict()])
         outcome = env.dispatch.dispatch_next()
         assert outcome.kind is DispatchKind.WORKER_SATURATED
-        assert outcome.worker_wait > 0
         assert outcome.entry is None
 
     def test_missing_dependency_settles_without_worker_slot(self, tmp_path):
@@ -196,9 +195,7 @@ class TestDispatchOutcomeKind:
             second = env.dispatch.dispatch_next()
 
         assert first.kind is DispatchKind.AUTHORIZATION_PENDING
-        assert first.worker_wait == 0.0
         assert second.kind is DispatchKind.AUTHORIZATION_PENDING
-        assert second.worker_wait == 0.0
         assert set(env.store.state.queue_uids) == {"t::authorized", "t::gap"}
         assert env.backend.load_failed() == {}
         assert [a for a in env.backend.load_consistent_snapshot()["attempts"] if a["job_uid"] == "t::gap"] == []

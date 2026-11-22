@@ -1,4 +1,4 @@
-"""v2 派发机器：预检、两阶段资源租约、阶段回滚守卫与子进程 spawn 编排。
+"""派发机器：预检、两阶段资源租约、阶段回滚守卫与子进程 spawn 编排。
 
 预检顺序即契约（顺序即时序约束）：dep-failed/dep-missing → 预声明解析 →
 admit/dedup → no-handler → 预授权 → 资源重检 → 落 running → 获取资源 →
@@ -67,7 +67,6 @@ class DispatchOutcome:
 
     kind: DispatchKind
     entry: InFlightJob | None = None
-    worker_wait: float = 0.0
     standstill: StandstillFacts = field(default_factory=StandstillFacts)
 
 
@@ -225,11 +224,9 @@ class DispatchMachine:
             )
 
         if sched.kind not in ("dep_failed", "dep_missing"):
-            ok, worker_wait = self._resources.can_acquire_worker(1.0)
-            if not ok:
+            if not self._resources.can_acquire_worker(1.0).is_available:
                 return DispatchOutcome(
                     kind=DispatchKind.WORKER_SATURATED,
-                    worker_wait=worker_wait,
                     standstill=StandstillFacts(min_wait=0.0),
                 )
 
@@ -294,7 +291,7 @@ class DispatchMachine:
                 peek_snapshot, store.state, baseline_lookup=store.trusted_last_succeeded_at_us
             )
             if not should_run:
-                store.apply_skip(job_uid, job_snapshot=peek_snapshot)
+                store.apply_skip(job_uid)
                 return None
 
         if job.task_type not in self._tasks:

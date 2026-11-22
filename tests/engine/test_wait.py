@@ -26,7 +26,6 @@ def facts(**overrides) -> LoopFacts:
         min_wait=INF,
         in_flight_wait=None,
         authorization_wait=False,
-        worker_wait=0.0,
         deadlock_wait=0.0,
         should_terminate=False,
     )
@@ -45,11 +44,8 @@ TABLE = [
     ("死锁缺口等待 → 使用完整截止点", facts(deadlock_wait=7.0), (True, 7.0)),
     ("死锁缺口短等待 → 原值", facts(deadlock_wait=0.4), (True, 0.4)),
     ("无候选且有限 min_wait → 等待", facts(has_runnable=False, min_wait=0.3), (True, 0.3)),
-    ("无候选且 min_wait=inf（无候选语义）→ 跳过该分支",
-     facts(has_runnable=False, min_wait=INF, worker_wait=0.2), (True, 0.2)),
-    ("死锁成因强制 inf：has_runnable=False+inf → 落到 worker_wait",
-     facts(has_runnable=False, min_wait=INF, worker_wait=5.0), (True, 5.0)),
-    ("资源挂起恢复等待 → 使用完整截止点", facts(worker_wait=30.0), (True, 30.0)),
+    ("无候选且 min_wait=inf（无候选语义）→ 等通知",
+     facts(has_runnable=False, min_wait=INF), (True, INF)),
     ("DRAINING 无扫描且未知 → 等通知",
      facts(stop_mode=StopMode.DRAINING, dispatched=0, settled=0), (True, INF)),
     ("本拍有派发且无截止点 → 立即下一拍", facts(dispatched=3), (False, 0.0)),
@@ -76,5 +72,5 @@ class TestDecideWaitTable:
 
     def test_idle_wins_even_with_wait_sources(self):
         # 空闲判定优先于一切等待源：无在途且队列空 → 不等待
-        decision = decide_wait(facts(store_empty=True, worker_wait=9.0, deadlock_wait=0.6))
+        decision = decide_wait(facts(store_empty=True, deadlock_wait=0.6))
         assert (decision.should_wait, decision.wait_time) == (False, 0.0)

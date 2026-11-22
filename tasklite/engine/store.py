@@ -317,20 +317,12 @@ class StateStore:
     ) -> int:
         """记录作业进入 running 状态并推进编号（事务性单一出口）。"""
         try:
-            next_no = self._backend.mark_job_running(
+            return self._backend.mark_job_running(
                 job_uid,
                 execution_id=execution_id,
                 run_id=run_id,
                 started_at=started_at,
             )
-            for item in self._state.queue:
-                if job_uid_from_snapshot(item) == job_uid:
-                    item["status"] = "running"
-                    item["run_id"] = run_id
-                    item["attempt_no"] = next_no
-                    item["started_at"] = started_at
-                    break
-            return next_no
         except Exception as e:
             logger.critical(f"Failed to mark job running for {job_uid}: {e}")
             raise
@@ -397,10 +389,21 @@ class StateStore:
         """检查路径是否与受保护路径集合（含 state_path 5 项）双向重叠。"""
         return self._path_policy.is_protected(path)
 
-    def is_path_authorized(self, path: str | Path) -> bool:
-        """检查指定规范绝对路径是否命中已有授权。"""
+    def is_path_authorized(
+        self,
+        path: str | Path,
+        target_type: str | None = None,
+        *,
+        canonical: bool = False,
+    ) -> bool:
+        """检查指定路径是否命中已有授权；``canonical=True`` 复用调用方已解析结果。"""
+        if canonical:
+            if not isinstance(path, str) or target_type is None:
+                raise TaskLiteError("canonical authorization check requires str path and target_type")
+            return self._backend.is_path_authorized(path, target_type)
         inspected = self.inspect_lookup(path)
-        return self._backend.is_path_authorized(inspected.canonical_path, inspected.target_type)
+        effective_type = target_type if target_type is not None else inspected.target_type
+        return self._backend.is_path_authorized(inspected.canonical_path, effective_type)
 
     def grant_authorization(
         self,
@@ -425,11 +428,12 @@ class StateStore:
         target_type: str,
         *,
         authorized_at: str | None = None,
+        canonical: bool = False,
     ) -> None:
         """持久化记录一条文件系统路径授权（运行期支持 file -> directory 升级）。"""
-        inspected = self.inspect_lookup(path)
+        norm_path = path if canonical and isinstance(path, str) else self.inspect_lookup(path).canonical_path
         self._backend.record_authorization(
-            inspected.canonical_path, target_type, authorized_at=authorized_at
+            norm_path, target_type, authorized_at=authorized_at
         )
 
     def list_authorizations(self) -> list[dict[str, Any]]:
@@ -626,12 +630,7 @@ class StateStore:
         self._state.requeue_jobs([job_snapshot], front=True)
         return True
 
-    def apply_skip(
-        self,
-        job_uid: str,
-        *,
-        job_snapshot: dict[str, Any] | None = None,
-    ) -> SkipOutcome:
+    def apply_skip(self, job_uid: str) -> SkipOutcome:
         """原子移除候选（清除磁盘与内存队列，不写 successes/failed）。"""
         self._backend.commit_skip(job_uid)
         self._state.remove_queued_uid(job_uid)

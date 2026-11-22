@@ -101,11 +101,6 @@ class TestIntervalResource:
         assert query.wait_seconds is not None
         assert abs(query.wait_seconds - 2.0) < 0.01
 
-        # 解包兼容测试
-        ok, wait = query
-        assert ok is False
-        assert abs(wait - 2.0) < 0.01
-
         clock.advance(2.0)
         query = res.can_acquire(1.0)
         assert query.is_available is True
@@ -207,11 +202,6 @@ class TestCapacityResource:
         assert query.is_impossible is False
         assert query.wait_seconds is None  # 无周期轮询，等待释放通知
 
-        # 解包兼容测试：未知等待解包为 inf
-        ok, wait = query
-        assert ok is False
-        assert wait == float("inf")
-
         # 释放 3.0
         res.release(3.0)
         query = res.can_acquire(5.0)
@@ -224,11 +214,6 @@ class TestCapacityResource:
         assert query.is_available is False
         assert query.is_impossible is True
         assert query.reason is not None
-
-        # 解包为 (False, inf)
-        ok, wait = query
-        assert ok is False
-        assert wait == float("inf")
 
     def test_acquire_exceeds_capacity_raises(self):
         res = CapacityResource("test", max_capacity=5.0)

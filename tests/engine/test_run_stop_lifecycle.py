@@ -537,12 +537,15 @@ def broken_trigger(ctx):
     raise RuntimeError("framework trigger crashed")
 
 
-from tasklite.engine.resource import CapacityResource as _InternalCapacityResource
+from tasklite.engine.resource import (
+    CapacityResource as _InternalCapacityResource,
+    ResourceQueryResult as _ResourceQueryResult,
+)
 
 
 class NeverAvailableResource(_InternalCapacityResource):
-    def can_acquire(self, amount: float) -> tuple[bool, float]:
-        return False, 5.0
+    def can_acquire(self, amount: float) -> _ResourceQueryResult:
+        return _ResourceQueryResult(is_available=False, wait_seconds=5.0)
 
 
 # ── 测试用例 ──────────────────────────────────────────────────────────

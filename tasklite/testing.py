@@ -137,6 +137,11 @@ class _ThreadWorkerHandle:
         with self._lock:
             return self._was_force_killed
 
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
     def is_alive(self) -> bool:
         with self._lock:
             if self._closed:

@@ -1,4 +1,4 @@
-"""EngineRuntime：v2 核心运行期深模块（装配 + 薄四相事件泵）。
+"""EngineRuntime：核心运行期深模块（装配 + 薄四相事件泵）。
 
 统一聚合主循环事件泵（四相：回收结算 → 填池派发 → 死锁仲裁 → 等待决策）、
 机器群装配、停机信号管理与异常承重网。主进程文件声明与三类授权等待统一
@@ -59,7 +59,7 @@ class DeadlockArbitration:
 
 
 class EngineRuntime:
-    """v2 核心运行期深模块：装配机器群并驱动四相事件泵。"""
+    """核心运行期深模块：装配机器群并驱动四相事件泵。"""
 
     def __init__(self, config: RunConfig) -> None:
         self.config = config
@@ -129,7 +129,7 @@ class EngineRuntime:
         self.channel.set_declaration_handler(self._handle_declaration)
         self.channel.set_authorization_queries(
             is_timeout_paused=self._authorization.is_timeout_paused,
-            get_outcome=self._authorization.get_declaration_outcome,
+            is_aborted=self._authorization.has_declaration_outcome,
             get_timeout_at=self._authorization.effective_timeout_at,
         )
         self.channel.set_wakeup_callback(self._notifier.notify)
@@ -272,30 +272,23 @@ class EngineRuntime:
 
     def _fill_dispatch_pool(
         self, limit: int, draining: bool
-    ) -> tuple[DispatchOutcome | None, float, int]:
+    ) -> tuple[DispatchOutcome | None, int]:
         """相二·填池派发（仅非 DRAINING、无在途授权等待且未超单步上限）。"""
         last_outcome: DispatchOutcome | None = None
-        worker_wait = 0.0
         dispatched = 0
         if not draining:
             if self._authorization.has_in_flight_authorization_wait:
-                return last_outcome, worker_wait, dispatched
+                return last_outcome, dispatched
             while dispatched < limit and self._session.stop_mode is StopMode.NONE:
                 outcome = self._dispatch.dispatch_next()
                 last_outcome = outcome
-                if outcome.worker_wait > 0:
-                    worker_wait = (
-                        outcome.worker_wait
-                        if worker_wait <= 0
-                        else min(worker_wait, outcome.worker_wait)
-                    )
                 if outcome.kind is DispatchKind.SPAWNED:
                     dispatched += 1
                     continue
                 if outcome.kind is DispatchKind.HANDLED_NO_SUBPROCESS:
                     continue
                 break
-        return last_outcome, worker_wait, dispatched
+        return last_outcome, dispatched
 
     def _arbitrate_deadlock(
         self, last_outcome: DispatchOutcome | None, store: StateStore
@@ -396,7 +389,7 @@ class EngineRuntime:
 
         # 2. 填池派发（仅非 DRAINING 状态且未超过单步限制）
         limit = max_dispatch if max_dispatch is not None else _UNBOUNDED_DISPATCH_LIMIT
-        last_outcome, worker_wait, dispatched = self._fill_dispatch_pool(limit, draining)
+        last_outcome, dispatched = self._fill_dispatch_pool(limit, draining)
 
         # 前进信号终结缺口 episode（须先于死锁仲裁）。
         if dispatched > 0:
@@ -426,7 +419,6 @@ class EngineRuntime:
                 ),
                 in_flight_wait=self._next_in_flight_wait(),
                 authorization_wait=self._authorization.has_pending_authorization,
-                worker_wait=worker_wait,
                 deadlock_wait=arbitration.wait_seconds,
                 should_terminate=arbitration.should_terminate,
                 deadlock_detected=arbitration.deadlock_detected,
