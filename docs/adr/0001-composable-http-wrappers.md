@@ -1,5 +1,7 @@
 # 0001 组合式轻量 HTTP 工具与正交快照守卫设计
 
+> **后续演进说明**：本记录反映初版组合式 HTTP 工具的设计背景。自 [ADR-0011](0011-stable-interface-baseline.md) 起，已移除 `http_guard` / `HttpPolicy`、三分类异常（`RateLimitHit` / `RetryError` / `FatalError`）及 `RateLimitResource`，现行实现收敛为 `HttpResponse.to_task_result()`、`HttpExecutor` 与 `SnapshotStore`，由 handler 显式返回 `TaskResult` 与调度器交互。下文保留历史裁决原文。
+
 ## 上下文与业务痛点
 在 TaskLite 下游众多批处理与采集生态仓库中，网络请求与 API 交互是最高频的操作。长期以来，各项目在网络层存在如下痛点与重复劳动：
 1. **429 速率限制退避逻辑碎片化**：不同下游各自手写 `time.sleep`、`Retry-After` 解析与异常抛出，容易误烧重试预算或造成子进程占死 worker 槽位；

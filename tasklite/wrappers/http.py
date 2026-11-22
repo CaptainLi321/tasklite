@@ -31,6 +31,55 @@ from ..utils.jsonutil import dumps as _json_dumps, loads as _json_loads
 # 节奏唯一出口是 RequeuePolicy seam）。
 _LOCAL_RETRY_WAIT_MAX_SECONDS = 300.0
 
+# 默认绕过环境变量代理的本机回环主机名集合（精确匹配主机名，避免子串误判）。
+_LOCAL_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _merge_query_items(
+    raw_query: str,
+    params: Mapping[str, Any] | None,
+    *,
+    sort: bool = False,
+) -> list[tuple[str, str]]:
+    """合并 URL 内嵌 query 与显式 params（None 值统一丢弃，与 requests 语义对齐）。"""
+    items: list[tuple[str, str]] = (
+        urllib.parse.parse_qsl(raw_query, keep_blank_values=True) if raw_query else []
+    )
+    if params:
+        for k, v in params.items():
+            if v is None:
+                continue
+            items.append((str(k), str(v)))
+    if sort:
+        items.sort()
+    return items
+
+
+def _encode_body_bytes(body: bytes | str | Mapping[str, Any]) -> bytes:
+    """请求体统一字节序列化：dict/list 走 JSON、str 编码 UTF-8、其余按字节。"""
+    if isinstance(body, (dict, list)):
+        return _json_dumps(body).encode("utf-8")
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    return bytes(body)  # type: ignore[arg-type]
+
+
+def _extract_status_code(res: Any) -> int | None:
+    """从任意响应形态提取 HTTP 状态码（优先 status_code，其次 getcode()；无状态语义返回 None）。"""
+    status: int | None = getattr(res, "status_code", None)
+    if status is None and hasattr(res, "getcode"):
+        status = res.getcode()
+    return int(status) if status is not None else None
+
+
+def _is_local_url(url: str) -> bool:
+    """判断 URL 目标主机是否为本机回环地址（精确匹配主机名，避免子串误判）。"""
+    try:
+        hostname = urllib.parse.urlparse(url).hostname
+    except ValueError:
+        return False
+    return hostname is not None and hostname.lower() in _LOCAL_LOOPBACK_HOSTS
+
 
 # ==============================================================================
 # 1. 基础容器与 Cookie 转换工具
@@ -296,16 +345,7 @@ class SnapshotStore:
         params: Mapping[str, Any] | None,
     ) -> list[tuple[str, str]]:
         """合并 URL 内嵌 query 与显式 params 并排序（同语义请求同键）。"""
-        query_items: list[tuple[str, str]] = []
-        if parsed.query:
-            query_items.extend(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-        if params:
-            for k, v in params.items():
-                if v is None:
-                    continue
-                query_items.append((str(k), str(v)))
-        query_items.sort()
-        return query_items
+        return _merge_query_items(parsed.query, params, sort=True)
 
     # 纳入快照 key 的身份头白名单：仅取真正改变响应语义的凭证/协商头。
     # 取舍：不纳入全量 headers——User-Agent/Accept-Encoding/Date 等易变头会把
@@ -420,11 +460,7 @@ class SnapshotStore:
     @staticmethod
     def _body_bytes(body: bytes | str | Mapping[str, Any]) -> bytes:
         """请求体统一序列化：dict/list 走 JSON、str 编码 UTF-8、其余按字节。"""
-        if isinstance(body, (dict, list)):
-            return _json_dumps(body).encode("utf-8")
-        if isinstance(body, str):
-            return body.encode("utf-8")
-        return bytes(body)  # type: ignore[arg-type]
+        return _encode_body_bytes(body)
 
     @staticmethod
     def _extract_response_fields(res: Any) -> tuple[int, dict[str, str], bytes]:
@@ -438,9 +474,7 @@ class SnapshotStore:
         """
         if isinstance(res, HttpResponse):
             return res.status_code, res.headers, res.body
-        status_code: int | None = getattr(res, "status_code", None)
-        if status_code is None and hasattr(res, "getcode"):
-            status_code = res.getcode()
+        status_code = _extract_status_code(res)
         if status_code is None:
             status_code = 200
         headers = dict(getattr(res, "headers", {}))
@@ -452,7 +486,7 @@ class SnapshotStore:
             raw_body = _json_dumps(res).encode("utf-8")
         else:
             raw_body = str(res).encode("utf-8")
-        return int(status_code), headers, bytes(raw_body)
+        return status_code, headers, bytes(raw_body)
 
     def has(self, key: str) -> bool:
         """检查是否存在有效快照。"""
@@ -548,7 +582,6 @@ class SQLiteSnapshotStore(SnapshotStore):
     @contextmanager
     def _get_conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         try:
             yield conn
@@ -557,6 +590,8 @@ class SQLiteSnapshotStore(SnapshotStore):
 
     def _init_db(self) -> None:
         with self._get_conn() as conn:
+            # WAL 模式为数据库文件级持久属性，仅在初始化时设置一次，避免纯读路径重复执行。
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS http_snapshots (
@@ -666,13 +701,22 @@ class HttpExecutor:
         snapshot_store: SnapshotStore | None = None,
         max_retries: int = 0,
         retry_delay_base: float = 1.0,
+        *,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        jitter_fn: Callable[[float, float], float] = random.uniform,
     ) -> None:
         self.snapshot_store = snapshot_store
         self.max_retries = max_retries
         self.retry_delay_base = retry_delay_base
+        self._sleep_fn = sleep_fn
+        self._jitter_fn = jitter_fn
 
     @staticmethod
-    def _retry_wait(attempt: int, base: float) -> float:
+    def _retry_wait(
+        attempt: int,
+        base: float,
+        jitter_fn: Callable[[float, float], float] = random.uniform,
+    ) -> float:
         """本地重试第 attempt 次的等待秒数（指数递增封顶 + 抖动）。
 
         形状：min(base, 封顶) × 2^(attempt-1) 再封顶，±25% 抖动——
@@ -682,7 +726,7 @@ class HttpExecutor:
             return 0.0
         exp = min(attempt - 1, 60)
         delay = min(min(base, _LOCAL_RETRY_WAIT_MAX_SECONDS) * (2 ** exp), _LOCAL_RETRY_WAIT_MAX_SECONDS)
-        jitter = random.uniform(-0.25, 0.25) * delay
+        jitter = jitter_fn(-0.25, 0.25) * delay
         return max(0.0, delay + jitter)
 
     def execute(
@@ -697,7 +741,7 @@ class HttpExecutor:
             target_fn = self.snapshot_store.cached(target_fn)
         for attempt in range(max(0, self.max_retries) + 1):
             if attempt > 0:
-                time.sleep(self._retry_wait(attempt, self.retry_delay_base))
+                self._sleep_fn(self._retry_wait(attempt, self.retry_delay_base, self._jitter_fn))
             try:
                 response = target_fn(*args, **kwargs)
             except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
@@ -706,9 +750,7 @@ class HttpExecutor:
                 if attempt >= self.max_retries:
                     raise
                 continue
-            status = getattr(response, "status_code", None)
-            if status is None and hasattr(response, "getcode"):
-                status = response.getcode()
+            status = _extract_status_code(response)
             if status is None or status < 500 or attempt >= self.max_retries:
                 return response
         raise AssertionError("request loop must return or raise")
@@ -733,22 +775,17 @@ def _merge_params_into_url(url: str, params: Mapping[str, Any] | None) -> str:
     if not params:
         return url
     parsed = urllib.parse.urlparse(url)
-    q = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    for k, v in params.items():
-        if v is None:
-            continue
-        q.append((str(k), str(v)))
-    new_query = urllib.parse.urlencode(q)
+    new_query = urllib.parse.urlencode(_merge_query_items(parsed.query, params, sort=False))
     return urllib.parse.urlunparse(
         (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
     )
 
 
 def _build_urllib_opener(final_url: str, proxies: Mapping[str, str] | None):
-    """构造 opener：显式代理优先；localhost/127.0.0.1 默认不走环境代理。"""
+    """构造 opener：显式代理优先；本机回环地址默认不走环境代理。"""
     if proxies is not None:
         return urllib.request.build_opener(urllib.request.ProxyHandler(dict(proxies)))
-    if "127.0.0.1" in final_url or "localhost" in final_url:
+    if _is_local_url(final_url):
         return urllib.request.build_opener(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener()
 
@@ -783,14 +820,11 @@ def urllib_fetch(
     req_headers = dict(headers) if headers else {}
 
     if data is not None:
-        if isinstance(data, (dict, list)):
-            req_body = _json_dumps(data).encode("utf-8")
-            if "content-type" not in {k.lower(): v for k, v in req_headers.items()}:
-                req_headers["Content-Type"] = "application/json"
-        elif isinstance(data, str):
-            req_body = data.encode("utf-8")
-        else:
-            req_body = bytes(data)  # type: ignore[arg-type]
+        req_body = _encode_body_bytes(data)
+        if isinstance(data, (dict, list)) and "content-type" not in {
+            k.lower(): v for k, v in req_headers.items()
+        }:
+            req_headers["Content-Type"] = "application/json"
 
     req = urllib.request.Request(
         url=final_url,
@@ -828,7 +862,7 @@ def _prepare_requests_session(
     sess = requests_mod.Session()
     if trust_env is not None:
         sess.trust_env = trust_env
-    elif "127.0.0.1" in url or "localhost" in url:
+    elif _is_local_url(url):
         sess.trust_env = False
     if proxies is not None:
         sess.proxies = dict(proxies)

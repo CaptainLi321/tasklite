@@ -648,6 +648,8 @@ class TestDefenseAndValidation:
             '{"version":2,"seen":[]}',
             '{"version":true,"seen":[]}',
             '{"version":1,"seen":[1]}',
+            '{"version":NaN,"seen":[]}',
+            '{"version":1,"seen":[],"extra":1e400}',
         ],
     )
     def test_invalid_seen_cursor_rejected(self, raw):

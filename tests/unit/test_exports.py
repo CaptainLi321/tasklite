@@ -85,7 +85,7 @@ class TestWrappersExportFace:
     def test_main_all_excludes_wrappers_symbols(self):
         import tasklite as tasklite_pkg
 
-        wrapper_only = {"register_discovery", "http_guard", "urllib_fetch", "requests_fetch"}
+        wrapper_only = {"register_discovery", "HttpExecutor", "urllib_fetch", "requests_fetch"}
         assert wrapper_only.isdisjoint(tasklite_pkg.__all__)
 
 

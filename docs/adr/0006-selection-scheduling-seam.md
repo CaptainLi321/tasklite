@@ -1,5 +1,7 @@
 # 0006 Selection：第三类调度扩展 seam（候选准入/选择）
 
+> **后续演进说明**：本记录反映 v2 时期 `Exclude` / `Skip` 与 `TaskLite.selection(...)` 的设计。自 [ADR-0011](0011-stable-interface-baseline.md) 起，已移除 `Skip` 终态跳过与 `TaskLite.selection(...)` 入口，保留 `tasklite.selection.Exclude(task_type=...)` 作为 `TaskLite.run(exclude=...)` 参数（延迟留队语义）；Run 外状态修整由 `TaskLite.edit()`（[ADR-0012](0012-graph-edit-snapshot-preauth-and-platform-parity.md)）统一承接。下文保留历史裁决原文。
+
 ## 上下文与决策动因
 
 v2 需要「本 run 只消费队列的一个子集」的单机能力：同一持久化队列可能被不同运行窗口 / 宿主进程先后消费，本机需要声明「某些 task_type 本轮不执行」。候选排序（谁先执行）

@@ -632,41 +632,40 @@ class TestHttpExecutorRetryWaitShape:
     正确形状为 base×2^(n-1)（封顶 + ±25% 抖动）。
     """
 
-
-    def _run_with_capture(self, monkeypatch, max_retries, retry_delay_base):
-        import tasklite.wrappers.http as http_mod
-
-        sleeps: list = []
-
-        def _fake_sleep(secs):
-            sleeps.append(secs)
-
-        monkeypatch.setattr(http_mod.time, "sleep", _fake_sleep)
-        # 抖动归零以锁定确定性形状（jitter 行为单独验证）
-        monkeypatch.setattr(http_mod.random, "uniform", lambda a, b: 0.0)
-
+    def _run_with_capture(self, max_retries: int, retry_delay_base: float, *, jitter: float = 0.0) -> list[float]:
+        sleeps: list[float] = []
         calls = {"n": 0}
 
-        def _flaky(*args, **kwargs):
+        def _flaky(*args: Any, **kwargs: Any) -> Any:
             calls["n"] += 1
             raise ConnectionError(f"transient #{calls['n']}")
 
-        executor = http_mod.HttpExecutor(max_retries=max_retries, retry_delay_base=retry_delay_base)
+        executor = HttpExecutor(
+            max_retries=max_retries,
+            retry_delay_base=retry_delay_base,
+            sleep_fn=sleeps.append,
+            jitter_fn=lambda a, b: jitter,
+        )
         with pytest.raises(ConnectionError):
             executor.execute(_flaky)
         return sleeps
 
-    def test_retry_waits_follow_exponential_shape(self, monkeypatch):
+    def test_retry_waits_follow_exponential_shape(self):
         """第 n 次重试等待 base×2^(n-1)（指数），而非线性 base×n。"""
-        sleeps = self._run_with_capture(monkeypatch, max_retries=4, retry_delay_base=1.0)
+        sleeps = self._run_with_capture(max_retries=4, retry_delay_base=1.0)
         assert sleeps == [1.0, 2.0, 4.0, 8.0]
 
-    def test_retry_wait_capped(self, monkeypatch):
+    def test_retry_wait_capped(self):
         """单次等待封顶，大 base/大 max_retries 不再产生巨量睡眠。"""
-        sleeps = self._run_with_capture(monkeypatch, max_retries=30, retry_delay_base=1000.0)
+        sleeps = self._run_with_capture(max_retries=30, retry_delay_base=1000.0)
         assert sleeps
         assert all(s <= 300.0 for s in sleeps)
         assert len(sleeps) == 30
+
+    def test_retry_wait_respects_injected_jitter(self):
+        """注入的 jitter_fn 精确作用于每次重试等待。"""
+        sleeps = self._run_with_capture(max_retries=3, retry_delay_base=2.0, jitter=0.25)
+        assert sleeps == [2.5, 5.0, 10.0]
 
 
 # ==============================================================================
@@ -737,10 +736,7 @@ def test_fetch_returns_error_response(local_http_server, fetch_name, code):
 
 
 @pytest.mark.parametrize("code,calls", [(429, 1), (404, 1), (503, 3)])
-def test_executor_returns_last_response_without_implicit_task_result(monkeypatch, code, calls):
-    import tasklite.wrappers.http as http_mod
-
-    monkeypatch.setattr(http_mod.time, "sleep", lambda _: None)
+def test_executor_returns_last_response_without_implicit_task_result(code, calls):
     count = 0
     response = HttpResponse(status_code=code, headers={}, body=b"last")
 
@@ -749,14 +745,14 @@ def test_executor_returns_last_response_without_implicit_task_result(monkeypatch
         count += 1
         return response
 
-    assert HttpExecutor(max_retries=2, retry_delay_base=0.5).execute(fetch) is response
+    assert (
+        HttpExecutor(max_retries=2, retry_delay_base=0.5, sleep_fn=lambda _: None).execute(fetch)
+        is response
+    )
     assert count == calls
 
 
-def test_executor_network_recovery_and_original_exhausted_exception(monkeypatch):
-    import tasklite.wrappers.http as http_mod
-
-    monkeypatch.setattr(http_mod.time, "sleep", lambda _: None)
+def test_executor_network_recovery_and_original_exhausted_exception():
     error = ConnectionError("断线")
     response = HttpResponse(status_code=200, headers={}, body=b"ok")
     count = 0
@@ -768,14 +764,17 @@ def test_executor_network_recovery_and_original_exhausted_exception(monkeypatch)
             raise error
         return response
 
-    assert HttpExecutor(max_retries=1, retry_delay_base=0.5).execute(fetch) is response
+    assert (
+        HttpExecutor(max_retries=1, retry_delay_base=0.5, sleep_fn=lambda _: None).execute(fetch)
+        is response
+    )
     assert count == 2
 
     def fail():
         raise error
 
     with pytest.raises(ConnectionError) as caught:
-        HttpExecutor(max_retries=2, retry_delay_base=0.5).execute(fail)
+        HttpExecutor(max_retries=2, retry_delay_base=0.5, sleep_fn=lambda _: None).execute(fail)
     assert caught.value is error
 
 
@@ -827,3 +826,80 @@ def test_handler_explicitly_returns_http_result(local_http_server, code, count):
         assert record["result"]["message"] == f"HTTP {code}"
         assert record["result"]["metadata"]["status_code"] == code
         assert record["result"]["exception"] is None
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("http://localhost/api", True),
+        ("http://LOCALHOST:8080/api", True),
+        ("http://127.0.0.1:8000/api", True),
+        ("http://[::1]:8000/api", True),
+        ("https://notlocalhost.example/", False),
+        ("https://localhost.example.com/", False),
+        ("https://example.com/localhost", False),
+        ("https://example.com/?redirect=127.0.0.1", False),
+        ("https://127.0.0.1.evil.example/", False),
+    ],
+)
+def test_local_url_exact_hostname_matching(url: str, expected: bool) -> None:
+    """本机回环判定须按解析后的 hostname 精确匹配，非本机域名含子串不得误绕过代理。"""
+    import tasklite.wrappers.http as http_mod
+
+    assert http_mod._is_local_url(url) is expected
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.trust_env = True
+            self.proxies: dict[str, str] = {}
+
+    class _FakeRequests:
+        Session = _FakeSession
+
+    sess, created = http_mod._prepare_requests_session(_FakeRequests, url, None, None, None)
+    assert created is True
+    assert sess.trust_env is (not expected)
+
+
+def test_http_shared_primitives_consistency() -> None:
+    """内部单点原语：query 合并丢弃 None、请求体字节化、状态码提取在全链路行为一致。"""
+    import tasklite.wrappers.http as http_mod
+
+    assert http_mod._merge_query_items("b=2&a=1", {"c": None, "d": 3}, sort=False) == [
+        ("b", "2"),
+        ("a", "1"),
+        ("d", "3"),
+    ]
+    assert http_mod._merge_query_items("b=2&a=1", {"c": None, "d": 3}, sort=True) == [
+        ("a", "1"),
+        ("b", "2"),
+        ("d", "3"),
+    ]
+    assert http_mod._encode_body_bytes({"a": 1}) == b'{"a": 1}'
+    assert http_mod._encode_body_bytes("你好") == "你好".encode("utf-8")
+    assert http_mod._encode_body_bytes(b"raw") == b"raw"
+
+    class _UrllibLike:
+        def getcode(self) -> int:
+            return 503
+
+    assert http_mod._extract_status_code(HttpResponse(201, {}, b"")) == 201
+    assert http_mod._extract_status_code(_UrllibLike()) == 503
+    assert http_mod._extract_status_code({"data": 1}) is None
+
+
+def test_sqlite_snapshot_store_wal_set_only_at_init(tmp_path: Path) -> None:
+    """SQLiteSnapshotStore 仅在初始化阶段设置 WAL pragma，纯读路径不重复触发。"""
+    import sqlite3
+
+    db_file = tmp_path / "wal_check.db"
+    store = SQLiteSnapshotStore(db_file)
+    with sqlite3.connect(str(db_file)) as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "wal"
+
+    key = store.make_key("https://api.example.com/wal")
+    store.put(key, "https://api.example.com/wal", 200, {"X-Test": "1"}, b"ok")
+    assert store.has(key) is True
+    resp = store.get(key)
+    assert resp is not None and resp.body == b"ok"

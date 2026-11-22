@@ -84,6 +84,10 @@ _Avoid_: Submitter, Launcher, DispatcherService
 负责接收子进程 Pipe 结果、执行主进程授权文件清理与准备、释放资源并触发原子写事务提交。执行收尾的唯一收口出口。
 _Avoid_: Collector, ResultHandler, Finalizer
 
+**AuthorizationCoordinator**:
+主进程文件声明与三类授权等待的统一协调器（派发前预声明授权、运行期子进程动态文件声明授权与收尾清理期授权）：负责授权等待登记、停机态收敛、超时暂挂与恢复，并向事件泵提供唯一授权等待查询。
+_Avoid_: AuthManager, PermissionService, CleanupWaiter
+
 **StateStore**:
 统一内存状态转移与数据库持久化事务的核心模块，负责四态与成功/失败档案互斥，收敛失败登记（`apply_failure`）。
 _Avoid_: ErrorManager, DeadlockResolver, StateRepository

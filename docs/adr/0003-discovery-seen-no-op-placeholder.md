@@ -1,5 +1,7 @@
 # 0003 Discovery 已见语义维持现状:不引入 mark_seen,以占位任务表达「已见不处理」
 
+> **后续演进说明**：本记录反映早期复用 `wall/failed` 快照作为已见集合时的裁决。后续演进（[ADR-0011](0011-stable-interface-baseline.md)）已将 `wrappers/discovery.py` 的已见集合改为通过公开游标（`get_cursor` / `set_cursor`）独立持久化，不再读取框架成败集合，也不再存在 `clear_history`。下文保留历史裁决原文。
+
 ## 上下文与决策动因
 
 Discovery 的已见集合严格定义为 wall/failed 快照（`wrappers/discovery.py` 契约 S3/S4），

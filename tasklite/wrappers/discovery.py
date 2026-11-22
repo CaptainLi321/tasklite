@@ -3,11 +3,12 @@
 注意：本模块为可选工具，本版本暂不承诺向后兼容与冻结扩展协议。
 增量发现通过任务派生与框架核心状态事务整体相容，不因坏子项而允许父任务成功或部分发布。
 
-架构性质：**扫描核心框架无关**——``DiscoveryHandler`` 只依赖
-``DiscoveryJob``/``DiscoveryContext`` 两个最小协议，运行时**不 import
-任何框架模块**；``register_discovery`` 是框架提供的默认封装函数，只通过
-``DiscoveryHost`` 公开协议把扫描器挂到宿主上（TaskLite 是其默认实现）。
-任何实现该协议的宿主/测试桩均可直接复用。
+架构性质：本模块是依赖核心公开模型与工具面（``TaskResult``、``TaskLiteError``、
+``validate_trigger``、``encode_content_id``、``jsonutil``）的可选适配器；
+``DiscoveryHandler`` 的扫描循环只通过 ``DiscoveryJob`` / ``DiscoveryContext``
+两个最小协议与运行时交互，``register_discovery`` 只通过 ``DiscoveryHost``
+公开协议把扫描器挂到宿主上（TaskLite 是其默认实现），不直接依赖引擎内部实现。
+任何实现对应协议的宿主或测试桩均可直接复用。
 
 「已见集合」由 discovery 自己通过公开游标持久化：每个
 ``(discovery task_type, process task_type, group key)`` 使用独立游标，
@@ -120,7 +121,6 @@ V1. 契约正确性必须由回归测试固定，至少覆盖：首次全量扫�
 """
 from __future__ import annotations
 
-import json
 import logging
 import pickle
 from collections.abc import Callable
@@ -130,6 +130,7 @@ from ..exceptions import TaskLiteError
 from ..models.result import TaskResult
 from ..models.task import validate_trigger
 from ..utils.encoding import encode_content_id
+from ..utils.jsonutil import dumps as _json_dumps, loads as _json_loads
 
 logger = logging.getLogger("tasklite")
 
@@ -137,7 +138,7 @@ _SEEN_CURSOR_VERSION = 1
 _SEEN_CURSOR_PREFIX = "__tasklite_discovery_seen_v1__:"
 
 
-# 框架无关协议（G-DISCOVERY）：本模块的扫描核心**不 import 任何框架模块**。
+# 宿主解耦协议：本模块仅依赖核心公开模型与工具面，不直接依赖引擎内部实现。
 #
 # ``DiscoveryJob`` / ``DiscoveryContext`` 是扫描循环对运行时的全部要求；
 # ``DiscoveryHost`` 是注册适配器对宿主框架的全部要求。
@@ -185,10 +186,9 @@ class DiscoveryHost(Protocol):
 class DiscoveryHandler:
     """按 REQUIREMENTS CONTRACT 实现的增量发现 handler（纯任务模型）。
 
-    **框架无关**：本类及其扫描循环只依赖 ``DiscoveryJob`` / ``DiscoveryContext``
-    两个最小协议（payload + get_cursor/set_cursor），运行时
-    **不 import 任何框架模块**，可被任何实现这两个协议的宿主直接复用；
-    TaskLite 只是框架默认宿主。
+    **宿主协议解耦**：本类及其扫描循环只依赖 ``DiscoveryJob`` / ``DiscoveryContext``
+    两个最小协议（payload + get_cursor/set_cursor），不直接依赖引擎内部实现，
+    可被任何实现这两个协议的宿主直接复用；TaskLite 只是框架默认宿主。
 
     框架负责契约规定的全部语义：
       - 从第 1 页起逐页扫描，page 由框架传入，用户 fetch_func 只拉一页；
@@ -272,7 +272,7 @@ class DiscoveryHandler:
         if raw is None:
             return set()
         try:
-            payload = json.loads(raw)
+            payload = _json_loads(raw)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid discovery seen cursor {key!r}: {exc}") from exc
         version = payload.get("version") if isinstance(payload, dict) else None
@@ -298,10 +298,7 @@ class DiscoveryHandler:
             "version": _SEEN_CURSOR_VERSION,
             "seen": sorted(seen),
         }
-        ctx.set_cursor(
-            key,
-            json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
-        )
+        ctx.set_cursor(key, _json_dumps(payload))
 
     def _resolve_scan_options(self, job: DiscoveryJob) -> tuple[str, int]:
         """扫描模式与页数上限：job.payload 动态指定优先，否则用构造默认值。"""

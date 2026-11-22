@@ -258,6 +258,7 @@ tasklite/
 │   ├── store.py         # 状态事务与失败写入隔离 (StateStore)
 │   ├── dispatch.py      # 任务派发状态机 (DispatchMachine)
 │   ├── completion.py    # 任务完成与提交单一收口 (CompletionMachine)
+│   ├── authorization.py # 主进程文件声明与三类授权等待协调器 (AuthorizationCoordinator)
 │   ├── recovery.py      # 遗留 running 收敛与在途中止编排 (RecoveryOrchestrator)
 │   ├── channel.py       # IPC 与子进程执行通道 (ExecutionChannel)
 │   ├── launcher.py      # 跨平台 Worker 启动器与进程树原子回收 (WorkerLauncher / ProcessTreeAdapter)
@@ -270,7 +271,7 @@ tasklite/
 │   └── resource.py      # 内置资源实现
 ├── backend/             # SQLite WAL 强一致事务持久化后端与内存后端
 ├── models/              # Task / Job / Attempt / JobContext / TaskResult / FileSpec 数据模型
-├── wrappers/            # 可选工具：discovery.py（增量扫描）/ http.py（网络守卫与快照）
+├── wrappers/            # 可选工具：discovery.py（增量扫描）/ http.py（HTTP 请求、重试与快照）
 └── utils/               # 单射编码 (%XX 转义) / 瞬时 Pipe 通道 / 跨平台路径策略 / 文件锁 / 时钟 / JSON 校验
 ```
 
