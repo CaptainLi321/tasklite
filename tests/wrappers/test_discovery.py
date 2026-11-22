@@ -600,8 +600,11 @@ class TestDefenseAndValidation:
         host = _FakeHost()
         with pytest.raises(TaskLiteError, match="process_task_type"):
             register_discovery(host, "d", _pipeline_fetch, _pipeline_id, _pipeline_process, "")
-        with pytest.raises(TaskLiteError, match="::"):
-            register_discovery(host, "d", _pipeline_fetch, _pipeline_id, _pipeline_process, "bad::type")
+        # 核心单射编码允许 task_type / process_task_type 含 '::'（与 models/task.py 单点一致）
+        register_discovery(
+            host, "ns::disc", _pipeline_fetch, _pipeline_id, _pipeline_process, "ns::child"
+        )
+        assert [entry[0] for entry in host.registered] == ["ns::disc"]
         with pytest.raises(TaskLiteError, match="max_pages"):
             register_discovery(host, "d", _pipeline_fetch, _pipeline_id, _pipeline_process, "child", max_pages=0)
         with pytest.raises(TaskLiteError, match="scan_mode"):

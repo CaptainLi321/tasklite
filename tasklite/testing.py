@@ -1,4 +1,4 @@
-"""v2 官方测试工具（单测 JobContext 构造器、进程内 WorkerLauncher 与运行状态模拟）。
+"""官方测试工具（单测 JobContext 构造器、进程内 WorkerLauncher 与运行状态模拟）。
 
 注意：本模块为测试辅助工具，本版本暂不承诺向后兼容与冻结扩展协议。
 handler 单测构造 JobContext，提供对文件声明、游标、依赖引用与派生的隔离测试支持。

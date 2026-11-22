@@ -144,13 +144,14 @@ def _run_self_demo() -> int:
         register_all_tasks(p)
         try:
             for sid in sample_ids:
+                upstream_uid = Job("preprocess", sid).uid
                 p.enqueue(
                     Job(
                         "evaluate",
                         sid,
-                        depends_on=[f"preprocess::{sid}"],
+                        depends_on=[upstream_uid],
                         files={
-                            "cleaned": FileSpec.from_output(f"preprocess::{sid}", "cleaned", role="input"),
+                            "cleaned": FileSpec.from_output(upstream_uid, "cleaned", role="input"),
                             "report": FileSpec(report_dir / f"{sid}.txt", role="output"),
                         },
                     )

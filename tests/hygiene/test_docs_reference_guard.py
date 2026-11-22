@@ -32,11 +32,11 @@ SCANNED_DOCS = (
     ROOT / "docs" / "API.md",
 )
 
-# 路径引用提取模式：三种前缀之一开头，后接常规路径字符。
+# 路径引用提取模式：四种前缀之一开头，后接常规路径字符。
 # 前置的负向断言拒绝「更长标识符的尾部」被误认成引用（如 xxxtests/）；
 # 路径字符集不含反引号与标点，因此反引号包裹的引用天然截断。
 _DOC_REF_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_./-])(?:tests|tasklite|scripts)/[A-Za-z0-9_./-]+"
+    r"(?<![A-Za-z0-9_./-])(?:tests|tasklite|scripts|examples)/[A-Za-z0-9_./-]+"
 )
 
 

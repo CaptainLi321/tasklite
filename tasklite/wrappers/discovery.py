@@ -128,7 +128,7 @@ from typing import Any, Protocol
 
 from ..exceptions import TaskLiteError
 from ..models.result import TaskResult
-from ..models.task import validate_trigger
+from ..models.task import validate_task_type, validate_trigger
 from ..utils.encoding import encode_content_id
 from ..utils.jsonutil import dumps as _json_dumps, loads as _json_loads
 
@@ -565,26 +565,11 @@ def register_discovery(
     回调必须为模块级可 pickle 函数（spawn 进程隔离约束，与普通 handler
     一致——lambda/闭包在子进程 import 时失败）。
     """
-    if not isinstance(task_type, str) or not task_type:
-        raise TaskLiteError(
-            f"task_type must be a non-empty str, "
-            f"got {type(task_type).__name__} ({task_type!r})"
-        )
-    if "::" in task_type:
-        raise TaskLiteError(
-            f"task_type must not contain '::' (Job.uid separator), "
-            f"got {task_type!r}"
-        )
-    if not isinstance(process_task_type, str) or not process_task_type:
-        raise TaskLiteError(
-            f"process_task_type must be a non-empty str, "
-            f"got {type(process_task_type).__name__} ({process_task_type!r})"
-        )
-    if "::" in process_task_type:
-        raise TaskLiteError(
-            f"process_task_type must not contain '::' (Job.uid separator), "
-            f"got {process_task_type!r}"
-        )
+    validate_task_type(task_type)
+    try:
+        validate_task_type(process_task_type)
+    except TaskLiteError as exc:
+        raise TaskLiteError(str(exc).replace("task_type", "process_task_type", 1)) from exc
     for name, fn in (
         ("fetch_func", fetch_func),
         ("id_func", id_func),

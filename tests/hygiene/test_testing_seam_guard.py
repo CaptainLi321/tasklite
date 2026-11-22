@@ -77,16 +77,24 @@ def _find_guarded_mutations(attr_name: str) -> list[str]:
                     offenders.append(f"{rel}:{node.lineno}")
             if isinstance(node, ast.Call):
                 func = node.func
-                is_setattr = (
+                is_mutation_call = (
                     (isinstance(func, ast.Name) and func.id == "setattr")
-                    or (isinstance(func, ast.Attribute) and func.attr == "setattr")
+                    or (
+                        isinstance(func, ast.Attribute)
+                        and func.attr in ("setattr", "object")
+                    )
                 )
-                if (
-                    is_setattr
-                    and len(node.args) >= 2
-                    and isinstance(node.args[1], ast.Constant)
-                    and node.args[1].value == attr_name
-                ):
+                if not is_mutation_call:
+                    continue
+                target_attr = None
+                if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                    target_attr = node.args[1].value
+                else:
+                    for kw in node.keywords:
+                        if kw.arg in ("attribute", "name") and isinstance(kw.value, ast.Constant):
+                            target_attr = kw.value.value
+                            break
+                if target_attr == attr_name:
                     offenders.append(f"{rel}:{node.lineno}")
     return offenders
 

@@ -11,30 +11,11 @@ import pathlib
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
-CORE_PACKAGE_DIRS = (
-    ROOT / "tasklite" / "utils",
-    ROOT / "tasklite" / "models",
-    ROOT / "tasklite" / "backend",
-    ROOT / "tasklite" / "engine",
-)
-TOP_LEVEL_MODULES = (
-    ROOT / "tasklite" / "pipeline.py",
-    ROOT / "tasklite" / "edit.py",
-    ROOT / "tasklite" / "snapshot.py",
-    ROOT / "tasklite" / "_report.py",
-    ROOT / "tasklite" / "resource.py",
-    ROOT / "tasklite" / "selection.py",
-    ROOT / "tasklite" / "__main__.py",
-    ROOT / "tasklite" / "testing.py",
-)
 
 
 def _iter_core_python_files() -> tuple[pathlib.Path, ...]:
-    files: list[pathlib.Path] = []
-    for base in CORE_PACKAGE_DIRS:
-        files.extend(sorted(base.rglob("*.py")))
-    files.extend(TOP_LEVEL_MODULES)
-    return tuple(files)
+    """自动发现 tasklite/ 下全部源码文件，防止新增模块或子包逃逸检查。"""
+    return tuple(sorted((ROOT / "tasklite").rglob("*.py")))
 
 
 def _duplicate_members(class_node: ast.ClassDef) -> list:

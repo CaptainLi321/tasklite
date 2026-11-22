@@ -66,8 +66,8 @@ flowchart TD
 - 已提交终态不会因之后异常退出被改写；遗留 `running` 以“上次执行未完成结算，实际结果未知”登记失败，不根据残留产物或迟到结果补造成功。
 
 ### 3. 🔍 函数式增量探索 (Functional Discovery)
-- 针对数据同步、采集与拉取场景的无游标 (Cursor-less) 增量扫描；
-- 直接复用成功档案 (`successes`) 即时判定已见内容，整页命中自动刹车，天然免疫上游记录删除、插入导致的游标漂移。
+- 面向时间倒序、非单调 ID 分页源的增量扫描工具（`tasklite.wrappers.discovery`），通过独立公开游标维护完整已见集合并在发现任务成功时原子提交；
+- 不依赖单调高水位游标，也不窥视框架成败档案；整页命中自动刹车，天然免疫上游记录删除、插入导致的分页漂移。
 
 ### 4. ⏸️ 内置容量与限速控制 (Resource Control)
 - 内置 `IntervalResource`（调用间隔限速）与 `CapacityResource`（并发量限制）；
@@ -128,7 +128,7 @@ if __name__ == "__main__":
 
 ### Recipe 1: 增量分页扫描器 (Discovery)
 
-无需游标，增量同步时只要发现整页内容已全部处理过，自动刹车停止扫描：
+由 `register_discovery` 通过独立公开游标持久化已见集合，增量同步时只要发现整页内容均已见过，自动刹车停止扫描：
 
 ```python
 from tasklite import TaskResult

@@ -102,8 +102,8 @@ def migrate_insert_middle_layer(
     pipeline = TaskLite(backend="sqlite", state_path=state_path)
     register_all_tasks(pipeline)
     try:
-        l1_uid = f"l1_ingest::{item_id}"
-        l2_uid = f"l2_clean::{item_id}"
+        l1_uid = Job("l1_ingest", item_id).uid
+        l2_uid = Job("l2_clean", item_id).uid
 
         mid_job = Job(
             "l1b_calibrate",

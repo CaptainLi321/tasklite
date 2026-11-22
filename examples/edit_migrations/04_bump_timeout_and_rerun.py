@@ -26,6 +26,7 @@ import tempfile
 from pathlib import Path
 
 from tasklite import (
+    FileSpec,
     Job,
     StateSnapshot,
     Task,
@@ -57,6 +58,32 @@ def register_all_tasks(pipeline: TaskLite) -> None:
 # ── 2. 原子调参重排核心逻辑 ──────────────────────────────────────────
 
 
+def _rebuild_file_specs(raw_files: dict[str, dict]) -> dict[str, FileSpec] | None:
+    """从快照 job.files 完整还原 FileSpec（保留普通路径与 from_output 上游引用）。"""
+    if not raw_files:
+        return None
+    rebuilt: dict[str, FileSpec] = {}
+    for name, spec in raw_files.items():
+        if spec.get("producer_uid") is not None:
+            rebuilt[name] = FileSpec.from_output(
+                spec["producer_uid"],
+                spec["output_name"],
+                role=spec["role"],
+                delete_existing=bool(spec.get("delete_existing", False)),
+                delete_on_failure=bool(spec.get("delete_on_failure", False)),
+                delete_on_success=bool(spec.get("delete_on_success", False)),
+            )
+        else:
+            rebuilt[name] = FileSpec(
+                spec["path"],
+                role=spec["role"],
+                delete_existing=bool(spec.get("delete_existing", False)),
+                delete_on_failure=bool(spec.get("delete_on_failure", False)),
+                delete_on_success=bool(spec.get("delete_on_success", False)),
+            )
+    return rebuilt
+
+
 def migrate_bump_timeout_and_rerun(
     state_path: Path,
     *,
@@ -74,7 +101,7 @@ def migrate_bump_timeout_and_rerun(
             if upstream_uid not in tx:
                 raise TaskLiteError(f"目标节点不存在：{upstream_uid}")
 
-            # 从基准快照读出原上游配置，只修改 timeout_seconds
+            # 从基准快照读出原上游配置（含 files），只修改 timeout_seconds
             orig = tx.before.get_job(upstream_uid)
             assert orig is not None
             old_cfg = orig["job"]
@@ -83,6 +110,7 @@ def migrate_bump_timeout_and_rerun(
                 old_cfg["job_id"],
                 payload=old_cfg["payload"],
                 depends_on=old_cfg["depends_on"],
+                files=_rebuild_file_specs(old_cfg.get("files") or {}),
                 resources={k: v for k, v in old_cfg["resources"].items() if k != "worker"} or None,
                 max_retries_per_run=old_cfg["max_retries_per_run"],
                 timeout_seconds=new_timeout_seconds,
