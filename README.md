@@ -83,7 +83,7 @@ flowchart TD
 
 ### 7. 🎛️ 原子图修整、只读快照与运维 CLI
 - Run 外通过 `pipeline.edit(dry_run=True)` 原子执行作业增、删、替换与状态流转，提交前全图闭环校验并支持 `tx.diff()` 预览；`attempts` 物理轨迹永不可删；
-- 只读 `StateSnapshot.open(..., mode="lazy"|"copy")` 与 `StateSnapshot.report()` 提供零句柄运行前后对比与耗时/ETA 报告；并内置极简运维 CLI（`python -m tasklite status | set-status | remove`）；
+- 只读 `StateSnapshot.open(..., mode="lazy"|"copy")` 与 `StateSnapshot.report()` 提供零句柄运行前后对比与耗时/ETA 报告；并内置极简运维 CLI（`tasklite` / `python -m tasklite status | set-status | remove`）；
 - `pipeline.run(exclude=Exclude(task_type="..."))` 支持按任务类型将作业安全留队至下次运行。
 
 ---
@@ -257,7 +257,7 @@ tasklite/
 ├── edit.py              # EditTransaction：Run 外原子图修整事务与闭环校验
 ├── snapshot.py          # StateSnapshot：只读一致状态快照、copy 模式与 JSON 查询
 ├── _report.py           # StateSnapshot.report 状态/耗时/ETA 与前后对比渲染
-├── __main__.py          # 极简运维 CLI（python -m tasklite status / set-status / remove）
+├── __main__.py          # 极简运维 CLI（tasklite / python -m tasklite status / set-status / remove）
 ├── selection.py         # 执行选择规则值对象 Exclude（候选准入 seam）
 ├── resource.py          # 内置资源公共导出门面 (CapacityResource, IntervalResource)
 ├── exceptions.py        # 异常族 (TaskLiteError)

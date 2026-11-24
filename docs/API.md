@@ -735,9 +735,10 @@ StateSnapshot.report(
 
 - **入参校验**：`first` 必须为未关闭的 `StateSnapshot` 实例；`second` 为 `None` 或未关闭的 `StateSnapshot` 实例；传入非 `StateSnapshot` 或已关闭快照均抛出 `TaskLiteError`。
 - **单快照模式（`second=None`）**：
-  - 输出四态计数总览（含 `succeeded` 中 `execution` / `manual` 构成）；
+  - 输出四态计数总览（含 `succeeded` 中 `execution` / `manual` 构成）及基于各 `task_type` 历史成功 `P50` 的串行总剩余耗时估算（`estimated remaining`）；
   - 按 `task_type` 分组展示完成进度及历史成功 `Attempt` 耗时统计（`Avg` / `P50` / `Max`）；
-  - 展示当前在途 `running` 作业已运行秒数与基于历史成功基线的预估剩余时间（ETA）；
+  - 展示当前在途 `running` 作业已运行秒数与基于历史成功基线的预估剩余时间（ETA；超过 `P50` 时附带历史 `Max` 参考）；
+  - 展示当前排队中 `pending` 作业明细（保持队列顺序，超默认上限截断）；
   - 展示当前 `failed` 作业摘要。
 - **双快照对比模式（`first=before, second=after`）**：
   - 以 `second`（`after`）为主干结构，叠加 `first -> second` 区间四态计数增减、状态流转汇总、新增 `Attempt` 次数/耗时统计以及本次区间新增失败明细。
@@ -847,19 +848,19 @@ Exclude(*, task_type: str)
 
 ## 7. 极简运维命令行入口
 
-位于 [`tasklite/__main__.py`](../tasklite/__main__.py)，通过 `python -m tasklite` 调用。严格定位于**只读观测与纯 `uid` 驱动的轻量状态运维**，不引入任何引擎调度语义，不提供需构造 `Job` 的 `add` / `replace`。
+位于 [`tasklite/__main__.py`](../tasklite/__main__.py)，安装后可通过 `tasklite`（由 `pyproject.toml` `[project.scripts]` 声明）或 `python -m tasklite` 调用，双入口行为完全一致。严格定位于**只读观测与纯 `uid` 驱动的轻量状态运维**，不引入任何引擎调度语义，不提供需构造 `Job` 的 `add` / `replace`。
 
 ### 7.1 子命令语法与行为契约
 
 ```bash
-# 1. 只读状态报告（薄封装 StateSnapshot.open + StateSnapshot.report）
-python -m tasklite status <state_path>
+# 1. 只读状态报告（薄封装 StateSnapshot.open + StateSnapshot.report；亦可用 python -m tasklite）
+tasklite status <state_path>
 
 # 2. 纯状态流转（底层委托 TaskLite.edit().set_status）
-python -m tasklite set-status <state_path> <uid> <pending|failed> (--recursive | --no-recursive) [--note TEXT] [--apply]
+tasklite set-status <state_path> <uid> <pending|failed> (--recursive | --no-recursive) [--note TEXT] [--apply]
 
 # 3. 移除状态条目（底层委托 TaskLite.edit().remove）
-python -m tasklite remove <state_path> <uid> [--entries queue,successes,failures] (--recursive | --no-recursive) [--note TEXT] [--apply]
+tasklite remove <state_path> <uid> [--entries queue,successes,failures] (--recursive | --no-recursive) [--note TEXT] [--apply]
 ```
 
 - **`status <state_path>`**：以只读模式打开 SQLite 状态库并输出 `StateSnapshot.report(snap)`；绝不创建或修改数据库文件。

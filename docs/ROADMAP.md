@@ -8,7 +8,7 @@
 
 ## 1. 单任务直达 CLI —— `分析完备，待立项 ADR`
 
-> **状态更新（ADR-0012）**：只读状态报告与纯 UID 级轻量运维 CLI（`python -m tasklite status` / `set-status` / `remove`）已由 [ADR-0012](adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md) 落地实现；本节仍待立项的是**单任务直达执行 CLI**（`python -m tasklite run --app ...`）。
+> **状态更新（ADR-0012）**：只读状态报告与纯 UID 级轻量运维 CLI（`tasklite` / `python -m tasklite status` / `set-status` / `remove`）已由 [ADR-0012](adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md) 落地实现；本节仍待立项的是**单任务直达执行 CLI**（`tasklite run --app ...`）。
 
 **动机**：单目标走「收集→分发→执行」全链路不便（补跑/调试/ad-hoc 场景）；本质是 aperiodic
 作业的直接准入（绕过 discovery 的 release 通道），与链路跑**共享同一 successes 去重与 attempts
@@ -29,7 +29,7 @@ argparse 标准库（零依赖红线无虞）；薄驱动器 = 六步调用顺�
 **红线**：CLI 不新增任何引擎语义（仅门面驱动 + ops 文本呈现）；`--input/--output` 快捷
 方式仅适用单输入单输出型 task，上下文型任务走 `--set` 或链路。
 
-**备注**：纯只读与 UID 级运维子命令（`status` / `set-status` / `remove`）已由 [ADR-0012](adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md) 独立落地，不依赖本节 `--app` 装配入口。
+**备注**：纯只读与 UID 级运维子命令（`status` / `set-status` / `remove`）已由 [ADR-0012](adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md) 独立落地，不依赖本节 `--app` 装配入口。其中 `status` 当前保持零额外参数设计，后续如确有自动化消费或超大规模状态库按需筛选需求，可将可选过滤参数或 `--json` 输出作为按需候选单独评估。
 
 ## 2. 调度策略族 —— `已搁置（库主 2026-10-02 裁决），解禁后逐策略小 ADR`
 

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 _STATUS_ORDER = ("pending", "running", "succeeded", "failed")
 _OUTCOME_ORDER = ("success", "failure", "retry")
 _DEFAULT_ERROR_MAX_LEN = 120
+_DEFAULT_PENDING_LIST_LIMIT = 50
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,14 @@ class _DurationStats:
     avg_s: float
     p50_s: float
     max_s: float
+
+
+@dataclass(frozen=True)
+class _PendingJobInfo:
+    """当前排队中 pending 作业摘要（保持队列产出顺序）。"""
+
+    job_uid: str
+    task_type: str
 
 
 @dataclass(frozen=True)
@@ -91,6 +100,7 @@ class _SnapshotSummary:
     by_task_type: dict[str, _TaskTypeCounts] = field(default_factory=dict)
     durations_by_task_type: dict[str, list[float]] = field(default_factory=dict)
     duration_stats_by_task_type: dict[str, _DurationStats] = field(default_factory=dict)
+    pending_jobs: list[_PendingJobInfo] = field(default_factory=list)
     running_jobs: list[_RunningJobInfo] = field(default_factory=list)
     failed_jobs: list[_FailedJobInfo] = field(default_factory=list)
     job_statuses: dict[str, str] = field(default_factory=dict)
@@ -243,6 +253,9 @@ def _summarize_snapshot(snapshot: StateSnapshot) -> _SnapshotSummary:
         tt_counts = summary.by_task_type.setdefault(task_type, _TaskTypeCounts())
         if status == "pending":
             tt_counts.pending += 1
+            summary.pending_jobs.append(
+                _PendingJobInfo(job_uid=uid, task_type=task_type)
+            )
         elif status == "running":
             tt_counts.running += 1
             summary.running_jobs.append(
@@ -366,6 +379,17 @@ def _compute_delta(
     )
 
 
+def _compute_elapsed_seconds(started_at: str | None, now_us: int) -> float | None:
+    """计算在途 running 作业距 now_us 的已运行秒数；缺失或非法时间戳返回 None。"""
+    if not started_at:
+        return None
+    try:
+        started_us = parse_utc_iso_to_us(started_at)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (now_us - started_us) / 1_000_000.0)
+
+
 def _format_running_line(
     item: _RunningJobInfo,
     now_us: int,
@@ -373,13 +397,7 @@ def _format_running_line(
 ) -> str:
     """格式化单条在途 running 作业的已运行时间与 ETA。"""
     attempt_part = f", attempt={item.attempt_no}" if item.attempt_no is not None else ""
-    elapsed_s: float | None = None
-    if item.started_at:
-        try:
-            started_us = parse_utc_iso_to_us(item.started_at)
-            elapsed_s = max(0.0, (now_us - started_us) / 1_000_000.0)
-        except (TypeError, ValueError):
-            elapsed_s = None
+    elapsed_s = _compute_elapsed_seconds(item.started_at, now_us)
 
     if elapsed_s is None:
         return (
@@ -400,11 +418,59 @@ def _format_running_line(
         eta_text = f"~{remaining_text} (P50={p50_text})"
     else:
         overrun_text = _format_duration(elapsed_s - baseline.p50_s)
-        eta_text = f"~0.00s (+{overrun_text} over P50={p50_text})"
+        max_text = _format_duration(baseline.max_s)
+        eta_text = f"~0.00s (+{overrun_text} over P50={p50_text}, Max={max_text})"
 
     return (
         f"  - {item.job_uid} (task_type={item.task_type}{attempt_part}): "
         f"elapsed={elapsed_text}, ETA={eta_text}"
+    )
+
+
+def _format_remaining_eta(summary: _SnapshotSummary, now_us: int) -> str:
+    """基于各 task_type 历史成功 P50 估算串行总剩余耗时。
+
+    - running 作业：有基线时若 started_at 可解析则贡献 max(0.0, p50 - elapsed)，
+      缺失或非法 started_at 时保守按完整 p50 计入；无基线计入未估算项。
+    - pending 作业：有基线时贡献 p50；无基线计入未估算项。
+    """
+    active_count = len(summary.running_jobs) + len(summary.pending_jobs)
+    if active_count == 0:
+        return "0.00s"
+
+    total_remaining_s = 0.0
+    estimated_count = 0
+    unestimated_count = 0
+
+    for running_item in summary.running_jobs:
+        baseline = summary.duration_stats_by_task_type.get(running_item.task_type)
+        if baseline is None:
+            unestimated_count += 1
+            continue
+        elapsed_s = _compute_elapsed_seconds(running_item.started_at, now_us)
+        if elapsed_s is None:
+            total_remaining_s += baseline.p50_s
+        else:
+            total_remaining_s += max(0.0, baseline.p50_s - elapsed_s)
+        estimated_count += 1
+
+    for pending_item in summary.pending_jobs:
+        baseline = summary.duration_stats_by_task_type.get(pending_item.task_type)
+        if baseline is None:
+            unestimated_count += 1
+            continue
+        total_remaining_s += baseline.p50_s
+        estimated_count += 1
+
+    if estimated_count == 0:
+        return f"N/A (no history for {unestimated_count} remaining jobs)"
+
+    eta_text = _format_duration(total_remaining_s)
+    if unestimated_count == 0:
+        return f"~{eta_text} (serial, P50-based)"
+    return (
+        f"~{eta_text} (serial, P50-based; "
+        f"excludes {unestimated_count} without history)"
     )
 
 
@@ -465,6 +531,7 @@ def render_snapshot_report(
             f"  failed:    {main.status_counts['failed']} "
             f"({_format_signed(delta.status_deltas['failed'])})"
         )
+    lines.append(f"  estimated remaining: {_format_remaining_eta(main, now_us)}")
 
     # 2. 双快照区间增量块（仅对比模式叠加）
     if delta is not None:
@@ -550,7 +617,21 @@ def render_snapshot_report(
             baseline = main.duration_stats_by_task_type.get(running_item.task_type)
             lines.append(_format_running_line(running_item, now_us, baseline))
 
-    # 5. 当前 failed 作业摘要
+    # 5. 排队中 pending 作业明细（保持队列顺序，超上限截断）
+    lines.append("")
+    lines.append(f"Pending Jobs ({len(main.pending_jobs)}):")
+    if not main.pending_jobs:
+        lines.append("  (none)")
+    else:
+        for pending_item in main.pending_jobs[:_DEFAULT_PENDING_LIST_LIMIT]:
+            lines.append(
+                f"  - {pending_item.job_uid} (task_type={pending_item.task_type})"
+            )
+        omitted = len(main.pending_jobs) - _DEFAULT_PENDING_LIST_LIMIT
+        if omitted > 0:
+            lines.append(f"  ... and {omitted} more pending jobs")
+
+    # 6. 当前 failed 作业摘要
     lines.append("")
     lines.append(f"Failed Jobs ({len(main.failed_jobs)}):")
     if not main.failed_jobs:

@@ -1165,8 +1165,10 @@ class TestStateSnapshotReport:
                 assert "running:   0" in text
                 assert "succeeded: 0 (execution: 0, manual: 0)" in text
                 assert "failed:    0" in text
+                assert "estimated remaining: 0.00s" in text
                 assert "By Task Type:\n  (none)" in text
                 assert "Running Jobs (0):\n  (none)" in text
+                assert "Pending Jobs (0):\n  (none)" in text
                 assert "Failed Jobs (0):\n  (none)" in text
 
     def test_single_snapshot_report_metrics_eta_manual_and_truncation(self, tmp_path, monkeypatch):
@@ -1303,6 +1305,10 @@ class TestStateSnapshotReport:
             assert "running:   2" in report
             assert "succeeded: 6 (execution: 5, manual: 1)" in report
             assert "failed:    1" in report
+            assert (
+                "estimated remaining: ~35.0s (serial, P50-based; excludes 1 without history)"
+                in report
+            )
             # train 历史耗时（n=3, Avg=30.0s, P50=20.0s, Max=1m 00.0s）
             assert "train: pending=1, running=1, succeeded=4, failed=1 (total=7)" in report
             assert "success duration (n=3): Avg=30.0s, P50=20.0s, Max=1m 00.0s" in report
@@ -1314,6 +1320,8 @@ class TestStateSnapshotReport:
             # running ETA
             assert "train::r_known (task_type=train, attempt=1): elapsed=5.00s, ETA=~15.0s (P50=20.0s)" in report
             assert "fresh_type::r_unknown (task_type=fresh_type, attempt=1): elapsed=3.00s, ETA=N/A (no history)" in report
+            # pending 明细列表
+            assert "Pending Jobs (1):\n  - train::p1 (task_type=train)" in report
             # failed 截断摘要
             assert "train::f1:" in report
             assert "..." in report
@@ -1382,6 +1390,9 @@ class TestStateSnapshotReport:
                     all_failed_section = diff_report.split("Failed Jobs (2):")[1]
                     assert "worker::old_fail" in all_failed_section
                     assert "worker::will_fail" in all_failed_section
+                    # 双快照对比同样展示当前剩余 ETA 与 Pending Jobs 明细
+                    assert "estimated remaining: ~" in diff_report
+                    assert "Pending Jobs (1):\n  - worker::new_pending (task_type=worker)" in diff_report
 
                     # 自对比报告应全为零增量
                     same_report = StateSnapshot.report(after, after)
@@ -1393,4 +1404,121 @@ class TestStateSnapshotReport:
                     after.close()
             finally:
                 before.close()
+
+    def test_report_running_overrun_includes_max_and_remaining_eta_branches(
+        self, tmp_path, monkeypatch
+    ):
+        """验证单节点超 P50 附带 Max 参考，以及总剩余 ETA 全有样本/超 P50 归零/全无样本分支。"""
+        import tasklite._report as report_mod
+
+        monkeypatch.setattr(report_mod, "utc_now_iso", lambda: "2026-08-01T01:00:30Z")
+
+        # 场景 A：全部活跃作业均有基线，且 running 已超 P50（贡献归零）
+        db_all = tmp_path / "eta_all_known.db"
+        with TaskLite(backend="sqlite", state_path=db_all) as p:
+            p.register_task("train", dummy_handler)
+            backend = p._runtime.store.backend
+            for job_id, start_ts, end_ts in (
+                ("h1", "2026-08-01T00:00:00Z", "2026-08-01T00:00:10Z"),
+                ("h2", "2026-08-01T00:01:00Z", "2026-08-01T00:01:20Z"),
+                ("h3", "2026-08-01T00:02:00Z", "2026-08-01T00:03:00Z"),
+            ):
+                job = Job("train", job_id)
+                p.enqueue(job)
+                attempt_no = backend.mark_job_running(
+                    job.uid,
+                    execution_id=f"r_{job_id}.1",
+                    run_id=f"r_{job_id}",
+                    started_at=start_ts,
+                )
+                backend.commit_job_settlement(
+                    job_uid=job.uid,
+                    outcome="success",
+                    attempt_no=attempt_no,
+                    execution_id=f"r_{job_id}.1",
+                    run_id=f"r_{job_id}",
+                    started_at=start_ts,
+                    settled_at=end_ts,
+                    job_snapshot=job.to_dict(),
+                    result={"message": None, "exception": None, "metadata": {}, "annotations": {}},
+                    success_metadata={
+                        "job_snapshot": job.to_dict(),
+                        "result": {"message": None, "exception": None, "metadata": {}, "annotations": {}},
+                        "run_id": f"r_{job_id}",
+                        "attempt_no": attempt_no,
+                        "started_at": start_ts,
+                        "settled_at": end_ts,
+                    },
+                )
+
+            # running 已跑 30s，超过 P50=20.0s（overrun=10.0s, Max=1m 00.0s），剩余贡献归零
+            j_over = Job("train", "over_run")
+            j_pend = Job("train", "queued_next")
+            p.enqueue(j_over)
+            p.enqueue(j_pend)
+            seed_running_job(
+                p,
+                j_over.uid,
+                execution_id="r_over.1",
+                run_id="r_over",
+                started_at="2026-08-01T01:00:00Z",
+            )
+
+            with StateSnapshot.open(db_all, mode="copy") as snap:
+                report_all = StateSnapshot.report(snap)
+
+            assert (
+                "train::over_run (task_type=train, attempt=1): elapsed=30.0s, "
+                "ETA=~0.00s (+10.0s over P50=20.0s, Max=1m 00.0s)"
+                in report_all
+            )
+            # 总剩余仅来自 pending 的 20.0s（running 超 P50 已归零）
+            assert "estimated remaining: ~20.0s (serial, P50-based)" in report_all
+
+        # 场景 B：全部活跃作业均无历史基线
+        db_none = tmp_path / "eta_no_history.db"
+        with TaskLite(backend="sqlite", state_path=db_none) as p:
+            p.register_task("fresh", dummy_handler)
+            p.enqueue(Job("fresh", "j1"))
+            p.enqueue(Job("fresh", "j2"))
+            with StateSnapshot.open(db_none, mode="copy") as snap:
+                report_none = StateSnapshot.report(snap)
+            assert "estimated remaining: N/A (no history for 2 remaining jobs)" in report_none
+
+        # 场景 C：仅终态作业（无 running / pending）
+        db_done = tmp_path / "eta_done.db"
+        with TaskLite(backend="sqlite", state_path=db_done) as p:
+            p.register_task("worker", dummy_handler)
+            p.enqueue(Job("worker", "done_item"))
+            with in_process_workers(p):
+                p.run(install_signals=False)
+            with StateSnapshot.open(db_done, mode="copy") as snap:
+                report_done = StateSnapshot.report(snap)
+            assert "estimated remaining: 0.00s" in report_done
+            assert "Pending Jobs (0):\n  (none)" in report_done
+
+    def test_report_pending_jobs_order_and_truncation(self, tmp_path):
+        """验证 Pending Jobs 明细保持队列顺序，且超过展示上限时截断并标注剩余数量。"""
+        import tasklite._report as report_mod
+
+        limit = report_mod._DEFAULT_PENDING_LIST_LIMIT
+        total_pending = limit + 5
+        db_path = tmp_path / "pending_many.db"
+        with TaskLite(backend="sqlite", state_path=db_path) as p:
+            p.register_task("batch", dummy_handler)
+            for idx in range(total_pending):
+                p.enqueue(Job("batch", f"item_{idx:03d}"))
+
+            with StateSnapshot.open(db_path, mode="copy") as snap:
+                report = StateSnapshot.report(snap)
+
+        pending_section = report.split(f"Pending Jobs ({total_pending}):\n")[1].split(
+            "\n\nFailed Jobs ("
+        )[0]
+        pending_lines = pending_section.splitlines()
+        assert len(pending_lines) == limit + 1
+        assert pending_lines[0] == "  - batch::item_000 (task_type=batch)"
+        assert pending_lines[limit - 1] == f"  - batch::item_{limit - 1:03d} (task_type=batch)"
+        assert pending_lines[-1] == "  ... and 5 more pending jobs"
+        assert f"batch::item_{limit:03d}" not in pending_section
 

@@ -217,19 +217,19 @@ StateSnapshot.report(
 
 ---
 
-### 3.4 命令行运维入口：`python -m tasklite`
+### 3.4 命令行运维入口：`tasklite` / `python -m tasklite`
 
-CLI 严格定位于**只读观测与纯 `uid` 驱动的轻量状态运维**（`state_path` 均必填无默认值；不提供 `--json` 选项，不新增任何引擎调度语义；修改类命令底层 100% 薄封装委托给 `TaskLite.edit()`，默认预览不落盘）：
+CLI 通过 `pyproject.toml` `[project.scripts]` 暴露 `tasklite = "tasklite.__main__:main"`，与 `python -m tasklite` 双入口完全等价；严格定位于**只读观测与纯 `uid` 驱动的轻量状态运维**（`state_path` 均必填无默认值；不提供 `--json` 选项，不新增任何引擎调度语义；修改类命令底层 100% 薄封装委托给 `TaskLite.edit()`，默认预览不落盘）：
 
 ```bash
-# 1. 只读状态报告（薄封装 StateSnapshot.open + StateSnapshot.report）
-python -m tasklite status <state_path>
+# 1. 只读状态报告（薄封装 StateSnapshot.open + StateSnapshot.report；亦可用 python -m tasklite）
+tasklite status <state_path>
 
 # 2. 纯状态流转（默认 dry_run 打印 diff，传 --apply 才落盘；--recursive / --no-recursive 必选其一）
-python -m tasklite set-status <state_path> <uid> <pending|failed> (--recursive | --no-recursive) [--note TEXT] [--apply]
+tasklite set-status <state_path> <uid> <pending|failed> (--recursive | --no-recursive) [--note TEXT] [--apply]
 
 # 3. 移除状态条目（默认清理三表、默认 dry_run 打印 diff，传 --apply 才落盘）
-python -m tasklite remove <state_path> <uid> [--entries queue,successes,failures] (--recursive | --no-recursive) [--note TEXT] [--apply]
+tasklite remove <state_path> <uid> [--entries queue,successes,failures] (--recursive | --no-recursive) [--note TEXT] [--apply]
 ```
 
 ---

@@ -359,20 +359,20 @@ after.close()
 
 ### 极简运维 CLI 速览
 
-终端排障与纯 `uid` 级轻量运维可直接调用 `python -m tasklite`（所有子命令强制必填 `<state_path>`，修改类命令默认 dry-run 仅打印 `diff`，显式传入 `--apply` 才原子落盘）：
+终端排障与纯 `uid` 级轻量运维可直接调用 `tasklite`（安装后由 `console_scripts` 提供，亦等价于 `python -m tasklite`；所有子命令强制必填 `<state_path>`，修改类命令默认 dry-run 仅打印 `diff`，显式传入 `--apply` 才原子落盘）：
 
 ```bash
-# 查看只读状态、各 task_type 耗时统计与在途 ETA 报告
-python -m tasklite status ./state.db
+# 查看只读状态、各 task_type 耗时统计、总剩余 ETA 与在途/排队/失败明细（亦可用 python -m tasklite status）
+tasklite status ./state.db
 
 # 预览将指定作业及其下游重置为 pending（不写盘）
-python -m tasklite set-status ./state.db fetch::item_1 pending --recursive
+tasklite set-status ./state.db fetch::item_1 pending --recursive
 
 # 确认 diff 后显式提交落盘
-python -m tasklite set-status ./state.db fetch::item_1 pending --recursive --apply
+tasklite set-status ./state.db fetch::item_1 pending --recursive --apply
 
 # 移除指定作业条目（默认清理 queue,successes,failures，永不删 attempts）
-python -m tasklite remove ./state.db fetch::item_2 --no-recursive --apply
+tasklite remove ./state.db fetch::item_2 --no-recursive --apply
 ```
 
 完整 CLI 参数与退出码契约见 [`docs/API.md`](API.md#7-极简运维命令行入口)。
