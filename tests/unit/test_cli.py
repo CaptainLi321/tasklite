@@ -1,6 +1,7 @@
 """极简运维 CLI（``python -m tasklite``）单元测试与真实子进程端到端测试。"""
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 import sqlite3
@@ -8,6 +9,11 @@ import subprocess
 import sys
 
 import pytest
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib  # type: ignore[no-redef]
 
 import tasklite
 from tasklite import Job, StateSnapshot, TaskLite, TaskResult
@@ -90,6 +96,29 @@ class TestCliSurfaceContract:
         with pytest.raises(SystemExit) as exc_info:
             main(["status", str(db_path), "--json"])
         assert exc_info.value.code == 2
+
+    def test_pyproject_declares_console_script_entry_point(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        pyproject_path = PROJECT_ROOT / "pyproject.toml"
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        scripts = data.get("project", {}).get("scripts", {})
+        assert scripts.get("tasklite") == "tasklite.__main__:main"
+
+        module_name, attr_name = scripts["tasklite"].split(":", 1)
+        entry_callable = getattr(importlib.import_module(module_name), attr_name)
+        assert entry_callable is main
+        assert callable(entry_callable)
+
+        db_path = tmp_path / "script_entry.db"
+        _create_empty_db(db_path)
+        rc = entry_callable(["status", str(db_path)])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert captured.err == ""
+        assert "Summary (total: 0):" in captured.out
 
 
 class TestCliStatus:

@@ -29,6 +29,9 @@ classifiers = [
 Homepage = "https://github.com/CaptainLi321/tasklite"
 Repository = "https://github.com/CaptainLi321/tasklite"
 
+[project.scripts]
+tasklite = "tasklite.__main__:main"
+
 [project.optional-dependencies]
 dev = ["pytest", "hypothesis>=6.0", "mutmut>=3.0", "pytest-timeout>=2.0", "pytest-cov>=4.0", "requests>=2.28", "mypy>=1.0", "tomli>=2.0; python_version < '3.11'"]
 

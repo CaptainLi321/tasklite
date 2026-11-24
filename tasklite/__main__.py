@@ -1,4 +1,4 @@
-"""TaskLite 极简运维命令行入口（``python -m tasklite``，ADR-0012 §3.4）。
+"""TaskLite 极简运维命令行入口（``tasklite`` / ``python -m tasklite``，ADR-0012 §3.4）。
 
 严格定位于只读观测与纯 ``uid`` 驱动的轻量状态运维：
 - ``status``：薄封装 ``StateSnapshot.open`` 与 ``StateSnapshot.report``；
@@ -66,7 +66,7 @@ def _add_recursive_group(subparser: argparse.ArgumentParser) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m tasklite",
+        prog="tasklite",
         description="TaskLite 运维命令行工具（只读观测与纯 UID 级状态修整）。",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
