@@ -1,6 +1,6 @@
 # TaskLite 公开 API 参考手册
 
-> 本文档是 TaskLite 3.0.0.dev2（Schema 6 稳定接口基线版本）的权威公开 API 参考手册。系统定义所有公开类、构造器、方法、属性、参数约束、默认值、状态转移规则、精确异常边界、命令行运维契约以及数据字典结构。  
+> 本文档是 TaskLite 3.0.0.dev3（Schema 6 稳定接口基线版本）的权威公开 API 参考手册。系统定义所有公开类、构造器、方法、属性、参数约束、默认值、状态转移规则、精确异常边界、命令行运维契约以及数据字典结构。  
 > 概念架构、核心模型与使用指南参见 [`docs/GUIDE.md`](GUIDE.md)，架构决策背景参见 [`docs/adr/0011-stable-interface-baseline.md`](adr/0011-stable-interface-baseline.md) 与 [`docs/adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md`](adr/0012-graph-edit-snapshot-preauth-and-platform-parity.md)，领域术语规范参见 [`CONTEXT.md`](../CONTEXT.md)。
 
 ---

@@ -21,7 +21,7 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any
 
-__version__ = "3.0.0.dev2"
+__version__ = "3.0.0.dev3"
 
 if TYPE_CHECKING:
     from .exceptions import TaskLiteError

@@ -6,6 +6,22 @@
 
 ## [Unreleased]
 
+## [3.0.0.dev3] - 2026-11-26
+
+3.0.0 的第四个开发预览版：增强默认状态报告与运维 CLI 入口，补齐常用场景示例，并完成双后端投影/结算对等与核心引擎边界收口。
+
+### 新增
+
+- **默认状态报告增强（`StateSnapshot.report`）**：新增基于各 `task_type` 历史成功 `P50` 的串行总剩余耗时估算（`estimated remaining`）、排队中 `pending` 作业明细展示，以及在途 `running` 作业超过 `P50` 时的历史 `Max` 参考。
+- **运维 CLI `console_scripts` 入口**：在 `pyproject.toml` 注册 `tasklite = "tasklite.__main__:main"` 命令行入口，与 `python -m tasklite` 行为一致并对齐命令行提示。
+- **常用场景示例与卫生门禁**：重写 `examples/trigger_chain.py`，新增动态派生与游标（`examples/dynamic_spawn_and_cursor.py`）、限速与重试（`examples/rate_limit_and_retry.py`）、快照报告与执行排除（`examples/snapshot_report_and_exclude.py`）示例，并扩展示例、顶层模块与测试接缝卫生门禁。
+
+### 架构深化与修复
+
+- **双后端严格对等与 `EditTransaction.diff()` 纯只读**：实现内存与 SQLite 后端队列行与 `Attempt` 投影严格对等、失败结算与派生入队语义对齐，并确保 `EditTransaction.diff()` 不产生任何副作用。
+- **授权与执行通道收口**：收口 `AuthorizationCoordinator` 所有权消除双向耦合，收口执行通道授权回流与句柄只读属性，清理旧元组资源协议、死抽象、`worker_wait` 残影与 `StateStore` 空转路径。
+- **跨平台类型与工具契约修复**：修复 Linux `mypy` 平台类型收窄、Python 3.10–3.13 联合注解与路径适配器隔离；对齐 `wrappers/discovery.py` 游标与任务类型契约并修整迁移示例。
+
 ## [3.0.0.dev2] - 2026-11-22
 
 3.0.0 的第三个开发预览版：补充 5 种常见 `TaskLite.edit()` 原子图迁移可运行参考脚本，并同步至使用手册与项目导航。

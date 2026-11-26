@@ -156,7 +156,7 @@ class TestMainSurfaceExports:
     def test_package_version(self):
         import tasklite
 
-        assert tasklite.__version__ == "3.0.0.dev2"
+        assert tasklite.__version__ == "3.0.0.dev3"
 
     def test_export_names_in_all(self):
         import tasklite as tasklite_pkg
@@ -425,7 +425,7 @@ class TestPackagingMetadata:
     def test_runtime_version_matches_naming_contract(self):
         import tasklite
 
-        assert tasklite.__version__ == "3.0.0.dev2"
+        assert tasklite.__version__ == "3.0.0.dev3"
         assert _load_pyproject()["tool"]["setuptools"]["dynamic"]["version"] == {
             "attr": "tasklite.__version__"
         }
